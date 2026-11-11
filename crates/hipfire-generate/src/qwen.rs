@@ -513,6 +513,24 @@ fn dense_tp_mesh_epoch(
     Ok(())
 }
 
+/// The single prefill→decode seal of a TP/EP prompt: every rank's DeltaNet
+/// stream transitions to Sealed at `position`. Mesh-TP ranks own their state
+/// behind the mesh program and are not reached here.
+fn seal_ep_dn_states(m: &mut LoadedModel, position: usize) -> Result<(), String> {
+    let Some(EpState { gpus, inner }) = m.ep.as_mut() else {
+        return Ok(());
+    };
+    let dn_states = match inner {
+        EpArch::Qwen35DenseTp { dn_states, .. } | EpArch::Qwen35 { dn_states, .. } => dn_states,
+        _ => return Ok(()),
+    };
+    for (rank, dn) in dn_states.iter_mut().enumerate() {
+        dn.seal_streams(&mut gpus.devices[rank], position)
+            .map_err(|e| format!("GDN stream seal rank {rank}: {e}"))?;
+    }
+    Ok(())
+}
+
 /// One dense-TP prefill chunk written at absolute position `start_pos`.
 pub fn dense_tp_prefill_chunk(
     m: &mut LoadedModel,
@@ -907,6 +925,11 @@ pub fn ep_serve_qwen35_dense_tp(
     }
     // Bookkeeping matches the fully replayed prompt so decode commits extend
     // the same conversation/stream positions the single-GPU path would.
+    if let Err(message) = seal_ep_dn_states(m, prompt_n) {
+        dense_tp_fail_closed_error(m, stdout, id, &message, "validation", false);
+        let _ = stdout.flush();
+        return;
+    }
     m.conversation_tokens.extend_from_slice(prompt_ids);
     m.seq_pos = prompt_n;
     let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
@@ -1270,6 +1293,11 @@ pub fn ep_serve_qwen35_moe(
     }
     // Bookkeeping matches the fully replayed prompt so decode commits extend
     // the same conversation/stream positions the single-GPU path would.
+    if let Err(message) = seal_ep_dn_states(m, prompt_n) {
+        qwen35_moe_fail_closed_error(m, stdout, id, &message, "validation", false);
+        let _ = stdout.flush();
+        return;
+    }
     m.conversation_tokens.extend_from_slice(prompt_ids);
     m.seq_pos = prompt_n;
     let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
@@ -6824,6 +6852,21 @@ pub fn generate_multi(
             stdout,
             Some(id),
             &format!("forward_prefill_batch_multi: {}", e),
+            "validation",
+            false,
+            &ep,
+        );
+        let _ = stdout.flush();
+        return;
+    }
+    // The PP prompt ends ordinary prefill: one seal before decode.
+    if let Err(e) = dn.seal_streams(&mut gpus.devices[0], m.seq_pos + new_tokens.len()) {
+        let ep = crate::common::reset_mesh_request_state(m, Some(gpu));
+        emit_fail_closed_error_for_route(
+            crate::ar::GenerationRoute::PipelineParallel,
+            stdout,
+            Some(id),
+            &format!("GDN stream seal: {e}"),
             "validation",
             false,
             &ep,

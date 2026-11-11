@@ -1749,6 +1749,23 @@ pub fn generate_vl(
             );
             return;
         }
+        // The batched VL prompt ends ordinary prefill: one seal before decode.
+        if let Err(e) = dn.seal_streams(gpu, m.seq_pos) {
+            vl_forward_fail(
+                stdout,
+                id,
+                "vl_prefill seal",
+                e,
+                gpu,
+                dn,
+                kv,
+                &mut m.kv_adaptive,
+                &mut m.seq_pos,
+                &mut m.conversation_tokens,
+                &mut m.prefill_checkpoints,
+            );
+            return;
+        }
     }
 
     // Per-token prefill with vision token embedding for image_pad positions

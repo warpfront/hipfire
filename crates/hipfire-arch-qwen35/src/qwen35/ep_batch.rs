@@ -2160,6 +2160,15 @@ impl Qwen35DecodeBatchEpState {
                 let rot = &self.scratches[0].x_rot;
                 lm_head_batched(gpu, &weights_per_rank[0].output, tmp, rot, &logits_lane, 1)?;
             }
+            // Lane prompt seed ends ordinary prefill: seal each rank's lane view once
+            // and publish its cursors to the owning rank state.
+            for rank in 0..n {
+                dn_lanes[rank].seal_streams(&mut gpus.devices[rank], tokens.len())?;
+                self.ranks[rank]
+                    .dn_state
+                    .stream
+                    .adopt_lane_meta(lane, &dn_lanes[rank].stream)?;
+            }
             for rank in 0..n {
                 gpus.devices[rank].bind_thread()?;
                 gpus.devices[rank].hip.device_synchronize()?;

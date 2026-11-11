@@ -18,6 +18,7 @@ use crate::pipeline::hybrid::HybridDims;
 use hip_bridge::{HipError, HipResult};
 use rdna_compute::norm::GdnScanOut;
 use rdna_compute::{DType, Gpu, GpuTensor};
+use rdna_compute::gdn_stream::{GdnCarryGeometry, GdnStreamMeta};
 
 /// Resident weights of one gated DeltaNet sublayer.
 #[derive(Clone, Copy)]
@@ -37,6 +38,32 @@ pub struct DeltaNetLayerView<'a> {
     pub w_gate: WeightRef<'a>,
 }
 
+/// Borrowed per-layer GDN stream carry buffers (CHUNK-CANONICAL §3.2): FP32
+/// tile-entry state, tile-entry conv history, and the raw pre-conv QKV and
+/// raw alpha/beta of the incomplete microtile. One tensor per DeltaNet layer,
+/// each lane-major (`lanes` × per-lane extent of `geometry`).
+#[derive(Clone, Copy)]
+pub struct GdnCarryView<'a> {
+    pub geometry: GdnCarryGeometry,
+    pub tile_state: &'a [GpuTensor],
+    pub tile_conv: &'a [GpuTensor],
+    pub raw_qkv: &'a [GpuTensor],
+    pub raw_ab: &'a [GpuTensor],
+}
+
+/// Borrowed absolute-position stream state of every DeltaNet layer: recipe,
+/// owner generation, per-layer and per-lane host cursors
+/// (`meta[layer * lanes + lane]`), and the carry buffers when the resolved scan
+/// algorithm needs a microtile larger than one row (`None` otherwise).
+#[derive(Clone, Copy)]
+pub struct GdnStreamView<'a> {
+    pub recipe_id: u64,
+    pub generation: u64,
+    pub lanes: usize,
+    pub meta: &'a [GdnStreamMeta],
+    pub carry: Option<GdnCarryView<'a>>,
+}
+
 /// Recurrent state of every DeltaNet layer.
 #[derive(Clone, Copy)]
 pub struct DeltaNetStateView<'a> {
@@ -45,6 +72,7 @@ pub struct DeltaNetStateView<'a> {
     pub conv_states: &'a [GpuTensor],
     pub s_ef_residual: &'a [GpuTensor],
     pub quant: StateQuant,
+    pub stream: GdnStreamView<'a>,
 }
 
 impl DeltaNetStateView<'_> {
