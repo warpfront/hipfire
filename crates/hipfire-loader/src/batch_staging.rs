@@ -283,6 +283,34 @@ pub fn stage_continuous_batch(
                     }
                 }
             }
+            Some(crate::ContinuousBatchRoute::MuseGlimmer) => match m.muse_glimmer_mut() {
+                // The lanes share the singleton's verify scratch, so a DFlash
+                // drafter (which owns that path) keeps the sequential route.
+                Some(b) if b.drafter.is_none() => {
+                    use hipfire_arch_muse_glimmer::lanes::GlimmerLanes;
+                    let cap = b
+                        .state
+                        .max_seq
+                        .min(GlimmerLanes::max_lane_capacity(gpu, &b.config));
+                    match GlimmerLanes::new(gpu, &b.config, requested, cap) {
+                        Ok(lanes) => {
+                            b.lanes = Some(lanes);
+                            out.slots = requested;
+                            out.lane_capacity = cap;
+                            out.capable = true;
+                            eprintln!(
+                                "[daemon] continuous batch staged: slots={requested} lane_cap={cap}"
+                            );
+                        }
+                        Err(e) => eprintln!(
+                            "[daemon] continuous batch allocation failed: {e} — fallback to sequential"
+                        ),
+                    }
+                }
+                _ => eprintln!(
+                    "[daemon] continuous batch requested but glimmer has a DFlash drafter or no bundle — fallback to sequential"
+                ),
+            },
             None => {
                 eprintln!("[daemon] continuous batch requested but not capable (arch_id={} pp={} ep={:?}) — fallback to sequential", m.arch_id, m.pp, m.ep.is_some());
             }

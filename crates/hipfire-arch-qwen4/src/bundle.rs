@@ -4766,11 +4766,10 @@ impl Qwen4Bundle {
         Some(result)
     }
 
-    /// [`ArchModel::session_plan`](hipfire_runtime::arch_model::ArchModel::session_plan)
-    /// restricted to reuse points `<= cap` ([`SessionDriver::plan_capped`]).
-    /// With `cap = prompt.len()` it is the plain plan; the EP mesh lowers `cap`
-    /// until every rank agrees on one reuse point.
-    pub(crate) fn session_plan_capped(
+    /// This rank's own session-driver plan restricted to reuse points `<= cap`
+    /// ([`SessionDriver::plan_capped`]), ignoring any PP/EP mesh; the EP mesh
+    /// lowers `cap` until every rank agrees on one reuse point.
+    pub(crate) fn rank_session_plan(
         &self,
         prompt: &[u32],
         route: SessionRoute,
@@ -4779,14 +4778,6 @@ impl Qwen4Bundle {
         self.session
             .as_ref()
             .map_or(0, |session| session.plan_capped(self, prompt, route, cap))
-    }
-
-    /// Whether a planned reuse continues current or parked live state rather
-    /// than a pool/resident boundary. Used by request-source tracing.
-    pub fn session_plan_is_live(&self, prompt: &[u32], route: SessionRoute, reused: usize) -> bool {
-        self.session
-            .as_ref()
-            .is_some_and(|session| session.plan_is_live(self, prompt, route, reused))
     }
 
     /// The host-visible request configuration every EP rank must share.
@@ -5048,7 +5039,7 @@ impl Qwen4Bundle {
             reused,
             |bundle, start| bundle.prefill_final_from(gpu, prompt, start, logits),
             |bundle| bundle.take_npu_trunk_fault(),
-            |bundle| bundle.session_plan_capped(prompt, SessionRoute::Ar, prompt.len()),
+            |bundle| bundle.rank_session_plan(prompt, SessionRoute::Ar, prompt.len()),
         )
     }
 
@@ -6228,22 +6219,30 @@ impl hipfire_runtime::arch_model::ArchModel for Qwen4Bundle {
         }
     }
 
+    fn session_plan_is_live(&self, prompt: &[u32], route: SessionRoute, reused: usize) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|session| session.plan_is_live(self, prompt, route, reused))
+    }
+
+    fn spec_session_reuse(&self) -> bool {
+        true
+    }
+
     fn session_request_write_limit(&mut self, through: usize) {
         Qwen4Bundle::session_request_write_limit(self, through);
     }
 
-    fn session_plan(&self, prompt: &[u32], route: SessionRoute) -> usize {
+    fn session_plan_capped(&self, prompt: &[u32], route: SessionRoute, cap: usize) -> usize {
         // Under an attached PP mesh only the aggregate record plans
         // (`pp_session_plan`); a root-only plan would restore one band.
         if self.pp.is_some() {
             return 0;
         }
         if self.ep.is_some() {
-            return self.ep_session_plan(prompt, route);
+            return self.ep_session_plan(prompt, route, cap);
         }
-        self.session
-            .as_ref()
-            .map_or(0, |session| session.plan(self, prompt, route))
+        self.rank_session_plan(prompt, route, cap)
     }
 
     fn session_commit(&mut self) {
@@ -6275,6 +6274,17 @@ impl hipfire_runtime::arch_model::ArchModel for Qwen4Bundle {
             session.commit_live(self, consumed);
             self.session = Some(session);
         }
+    }
+
+    fn session_commit_live_mesh(
+        &mut self,
+        gpus: &mut hipfire_runtime::multi_gpu::Gpus,
+        consumed: &[u32],
+    ) {
+        if self.pp.is_some() {
+            return self.pp_session_commit_live(gpus, consumed);
+        }
+        hipfire_runtime::arch_model::ArchModel::session_commit_live(self, consumed)
     }
 
     fn map_ahead_for_decode(

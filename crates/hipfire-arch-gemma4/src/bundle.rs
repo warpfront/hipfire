@@ -377,10 +377,15 @@ impl hipfire_runtime::arch_model::ArchModel for Gemma4Bundle {
     fn session_cache_attached(&self) -> bool {
         self.session.is_some()
     }
-    fn session_plan(&self, prompt: &[u32], route: SessionRoute) -> usize {
+    fn session_plan_capped(&self, prompt: &[u32], route: SessionRoute, cap: usize) -> usize {
         self.session
             .as_ref()
-            .map_or(0, |session| session.plan(self, prompt, route))
+            .map_or(0, |session| session.plan_capped(self, prompt, route, cap))
+    }
+    fn session_plan_is_live(&self, prompt: &[u32], route: SessionRoute, reused: usize) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|session| session.plan_is_live(self, prompt, route, reused))
     }
     fn session_commit(&mut self) {
         if let Some(session) = self.session.as_mut() {

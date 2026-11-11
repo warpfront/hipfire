@@ -48,12 +48,18 @@ impl ArchModel for RaonBundle {
         self.session_cache().is_some()
     }
 
-    /// Prompt tokens the next prefill can restore (cold-exact: a snapshot on
-    /// the prefill chunk grid); 0 without a cache.
-    fn session_plan(&self, prompt: &[u32], route: SessionRoute) -> usize {
+    /// Prompt tokens up to `cap` the next prefill can restore (cold-exact: a
+    /// snapshot on the prefill chunk grid); 0 without a cache.
+    fn session_plan_capped(&self, prompt: &[u32], route: SessionRoute, cap: usize) -> usize {
         self.session
             .as_ref()
-            .map_or(0, |session| session.plan(self, prompt, route))
+            .map_or(0, |session| session.plan_capped(self, prompt, route, cap))
+    }
+
+    fn session_plan_is_live(&self, prompt: &[u32], route: SessionRoute, reused: usize) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|session| session.plan_is_live(self, prompt, route, reused))
     }
 
     fn session_commit(&mut self) {

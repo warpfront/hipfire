@@ -205,6 +205,23 @@ pub trait SpecTarget {
     /// Downcast hook: `target.as_any_mut().downcast_mut::<ModelSlot>()`.
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
 
+    /// Begin a speculative prefill of `prompt` on session `route` that skips
+    /// the `reused` tokens the session plan returned (a live continuation, a
+    /// snapshot restore, or a cold start at 0), arming the snapshot
+    /// boundaries the prefill publishes. The engine calls it for a planned
+    /// route whose drafter does not begin the session itself
+    /// (`SessionRoute::Ar`). `Ok(false)` (default): the target keeps no
+    /// session.
+    fn session_begin(
+        &mut self,
+        _gpu: &mut Gpu,
+        _prompt: &[u32],
+        _reused: usize,
+        _route: crate::session_cache::SessionRoute,
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
+
     /// Zero the target's recurrent (DeltaNet) state and reset the KV eviction
     /// offset — used by the daemon's mid-generation abort path in place of its
     /// current inline memset loop. Returns `Err` when any HIP memset/bind fails
@@ -1101,10 +1118,19 @@ pub trait Speculator {
     }
 
     /// Whether the drafter can continue a target restored or continued live
-    /// at `start` of `prompt` (a prompt-cache hit). Default `true`. The Qwen4
-    /// session planner prefills cold when it cannot.
+    /// at `start` of `prompt` (a prompt-cache hit). Default `true`. The
+    /// session planner falls back to the deepest reuse point it can resume
+    /// ([`crate::session_cache::plan_resumable`]).
     fn can_resume_at(&self, _prompt: &[u32], _start: usize) -> bool {
         true
+    }
+
+    /// The target session route this drafter resumes on a session-cache hit
+    /// (`Ar` for a target-only draft context, `Mtp` when the target's
+    /// session state carries the drafter's head). `None` (default): the
+    /// drafter does not resume from the target's session cache.
+    fn session_route(&self) -> Option<crate::session_cache::SessionRoute> {
+        None
     }
 
     /// Release all GPU buffers the drafter owns. Called from `unload_model`,
@@ -1508,6 +1534,11 @@ pub trait MtpDrafter {
         "mtp"
     }
 
+    /// [`Speculator::session_route`] for an MTP drafter. Default `None`.
+    fn session_route(&self) -> Option<crate::session_cache::SessionRoute> {
+        None
+    }
+
     /// Install the per-request sampling contract. [`MtpSpeculator`] forwards
     /// [`Speculator::configure_request`] here exactly once per request so a
     /// temp>0-capable drafter (DSpark) can drive a sampled verify. Default
@@ -1683,6 +1714,10 @@ impl<A: MtpDrafter + 'static> Speculator for MtpSpeculator<A> {
 
     fn checkpoint_positions(&self) -> Vec<usize> {
         self.arch.mtp_checkpoint_positions()
+    }
+
+    fn session_route(&self) -> Option<crate::session_cache::SessionRoute> {
+        self.arch.session_route()
     }
 
     fn rewind_to(

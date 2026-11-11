@@ -1772,19 +1772,7 @@ pub fn ep_emit_abort(
     completion_tokens: usize,
 ) {
     let epilogue = ep_reset_after_abort(m);
-    if !epilogue.rolled_back {
-        emit_fail_closed_error_for_route(
-            route,
-            stdout,
-            Some(id),
-            "client cancelled; fail-closed EP rollback could not be attested",
-            "validation",
-            false,
-            &epilogue,
-        );
-        return;
-    }
-    crate::ar::emit_generation_cancel(route, stdout, id, completion_tokens);
+    emit_cancel_after_rollback_for_route(route, stdout, id, completion_tokens, &epilogue);
 }
 
 /// ds4 EP prefill + greedy decode.
@@ -2190,7 +2178,7 @@ pub fn ep_serve_ds4(
     stage_terminal_tool_calls(&mut pending_done, finish_reason, &wire_tool_calls);
     // Two-phase commit before cache / done. No post-commit tool_calls event.
     let decision = await_client_terminal_commit(stdout, id, &pending_done);
-    let effects = ds4_client_commit_effects(decision, finish_reason == "tool_calls", store_cache);
+    let effects = decision.commit_effects(finish_reason == "tool_calls", store_cache);
     if !effects.emit_done {
         ep_emit_abort(
             crate::ar::GenerationRoute::Deepseek4Ep,
@@ -2598,10 +2586,11 @@ pub fn qwen_history_tool_render(model_path: &str) -> hipfire_runtime::prompt_fra
     )
 }
 
-/// Native Qwen4 MTP plans reuse through the session cache, not the shared
+/// A model whose speculative target keeps sessions (`spec_session_reuse`,
+/// e.g. Qwen4) plans reuse through the session cache, not the shared
 /// conversation/checkpoint planner. Environment disabling applies elsewhere.
-pub fn spec_cache_disabled_for(native_qwen4_mtp: bool, env_disabled: bool) -> bool {
-    env_disabled || native_qwen4_mtp
+pub fn spec_cache_disabled_for(spec_session_reuse: bool, env_disabled: bool) -> bool {
+    env_disabled || spec_session_reuse
 }
 
 /// Where a Qwen4 session entry (plan, commit) runs, from whether the bundle's
@@ -2658,38 +2647,64 @@ pub(crate) fn plan_qwen4_session(
     state.session_plan(prompt, route)
 }
 
-/// Publishes pending Qwen4 session snapshots after a committed terminal and
-/// keeps the live state for an in-conversation continuation.
+/// The session route a speculative request on `model` plans and begins on:
+/// `None` unless the model's speculative target restores session reuse
+/// points ([`ArchModel::spec_session_reuse`]) and the speculator names the
+/// route it resumes on ([`Speculator::session_route`]).
+///
+/// [`ArchModel::spec_session_reuse`]: hipfire_runtime::arch_model::ArchModel::spec_session_reuse
+/// [`Speculator::session_route`]: hipfire_runtime::spec::Speculator::session_route
+fn spec_session_route(
+    model: &dyn hipfire_runtime::arch_model::ArchModel,
+    spec: &dyn hipfire_runtime::spec::Speculator,
+) -> Option<SessionRoute> {
+    spec.session_route().filter(|_| model.spec_session_reuse())
+}
+
+/// The session route ([`spec_session_route`]) and reuse start a speculative
+/// request plans: the deepest reuse point the speculator can resume
+/// ([`plan_resumable`]), 0 = cold. Host-only.
+///
+/// [`plan_resumable`]: hipfire_runtime::session_cache::plan_resumable
+fn plan_spec_session(
+    model: &dyn hipfire_runtime::arch_model::ArchModel,
+    spec: &dyn hipfire_runtime::spec::Speculator,
+    prompt: &[u32],
+) -> Option<(SessionRoute, usize)> {
+    let route = spec_session_route(model, spec)?;
+    let start = hipfire_runtime::session_cache::plan_resumable(
+        prompt.len(),
+        |cap| model.session_plan_capped(prompt, route, cap),
+        |start| spec.can_resume_at(prompt, start),
+    );
+    Some((route, start))
+}
+
+/// Publishes pending session snapshots after a committed terminal and keeps
+/// the live state for an in-conversation continuation, for a model whose
+/// speculative target keeps sessions ([`ArchModel::spec_session_reuse`]).
 /// `conversation_tokens` is the consumed host history (prompt plus emitted
-/// tokens, empty after an unrepaired terminal); the bundle validates it
-/// against its device state. Takes the fields, not the whole model, so the
-/// borrows stay disjoint. A pipeline-parallel model commits every band
-/// through the mesh with its `Gpus`; an active mesh without `Gpus` commits
-/// nothing (the root alone would publish a partial record). No-op for other
-/// families.
-fn commit_qwen4_session(model: &mut LoadedModel) {
+/// tokens, empty after an unrepaired terminal); the model validates it
+/// against its device state. With the daemon's mesh `Gpus` the model commits
+/// through [`ArchModel::session_commit_live_mesh`] (a pipeline-parallel model
+/// publishes every band; its root alone publishes nothing). Takes the fields,
+/// not the whole model, so the borrows stay disjoint. No-op for other models.
+///
+/// [`ArchModel::spec_session_reuse`]: hipfire_runtime::arch_model::ArchModel::spec_session_reuse
+/// [`ArchModel::session_commit_live_mesh`]: hipfire_runtime::arch_model::ArchModel::session_commit_live_mesh
+fn commit_session(model: &mut LoadedModel) {
     let LoadedModel {
         state,
         pp_gpus,
         conversation_tokens,
         ..
     } = model;
-    let Some(state) = state.as_deref_mut() else {
+    let Some(state) = state.as_deref_mut().filter(|s| s.spec_session_reuse()) else {
         return;
     };
-    let Some(bundle) =
-        (&mut *state as &mut dyn Any).downcast_mut::<hipfire_arch_qwen4::bundle::Qwen4Bundle>()
-    else {
-        return;
-    };
-    match qwen4_session_target(bundle.pp_mesh_active(), pp_gpus.is_some()) {
-        Qwen4SessionTarget::Root => state.session_commit_live(conversation_tokens),
-        Qwen4SessionTarget::Mesh => {
-            if let Some(gpus) = pp_gpus.as_mut() {
-                bundle.pp_session_commit_live(gpus, conversation_tokens);
-            }
-        }
-        Qwen4SessionTarget::Unreachable => {}
+    match pp_gpus.as_mut() {
+        Some(gpus) => state.session_commit_live_mesh(gpus, conversation_tokens),
+        None => state.session_commit_live(conversation_tokens),
     }
 }
 
@@ -3618,19 +3633,13 @@ pub fn generate_dflash(
     // spliced stream byte-matches the end-of-turn bake. Divergence (edited
     // history, roundtrip-unstable text) lands on the checkpoint-resume path —
     // worst case equals today's cold prefill, never wrong tokens.
-    // Qwen4's shared history planner only renders; its speculators plan reuse
-    // separately through the session cache: native MTP on its own route,
-    // DFlash2 (no device head state) on the target-only AR route.
-    let qwen4_session_route = if is_qwen4 && spec_name == "mtp" {
-        Some(SessionRoute::Mtp)
-    } else if is_qwen4 && spec_name == "dflash2" {
-        Some(SessionRoute::Ar)
-    } else {
-        None
-    };
+    // A model whose speculative target keeps sessions renders here but plans
+    // device reuse only through its session cache (`plan_spec_session`
+    // below); every other model keeps the conversation/checkpoint plan.
+    let session_reuse = m.state.as_deref().is_some_and(|s| s.spec_session_reuse());
     let cache_disabled = spec_cache_disabled_for(
-        is_qwen4,
-        !is_qwen4
+        session_reuse,
+        !session_reuse
             && hipfire_config::developer_var("HIPFIRE_QWEN_PROMPT_CACHE")
                 .ok()
                 .as_deref()
@@ -3673,9 +3682,7 @@ pub fn generate_dflash(
     } else {
         prompt_tokens
     };
-    // Qwen4 renders canonical history here, but only the session cache plans
-    // device reuse. Other families retain their conversation/checkpoint plan.
-    let (conversation_tokens, dflash_ckpt_positions): (&[u32], Vec<usize>) = if is_qwen4 {
+    let (conversation_tokens, dflash_ckpt_positions): (&[u32], Vec<usize>) = if session_reuse {
         (&[][..], Vec::new())
     } else {
         (
@@ -3691,7 +3698,7 @@ pub fn generate_dflash(
         && m.eviction.is_none()
         && pflash_bypass_reason.is_none()
         && !conversation_tokens.is_empty();
-    let cache_plan: Option<PromptCachePlan> = if is_qwen4 {
+    let cache_plan: Option<PromptCachePlan> = if session_reuse {
         None
     } else if try_jinja {
         if let Some(hist) = messages_history {
@@ -3772,13 +3779,6 @@ pub fn generate_dflash(
             )
         })
     };
-    // Qwen4 restores a session snapshot in its prefill, not through the
-    // generic `spec.rewind_to` hook.
-    let resume_from: Option<usize> = if m.qwen4().is_some() {
-        None
-    } else {
-        cache_plan.as_ref().and_then(|p| p.resume_from)
-    };
     // `prompt_tokens` becomes the full canonical conversation when the cache
     // plan rendered it (keeps the end-of-turn `conversation_tokens` bake and the
     // next turn's LCP byte-consistent). Otherwise keep the jinja/ChatFrame build.
@@ -3800,24 +3800,18 @@ pub fn generate_dflash(
         ),
         None => (prompt_tokens.clone(), 0, false, 0),
     };
-    // Qwen4 speculators plan against the full canonical prompt. A hit is the
-    // longest of the live state (this conversation's previous turn) and a
-    // cold-exact session snapshot.
-    if let Some(route) = qwen4_session_route {
-        // Native MTP never reuses a session under pipeline parallelism (its
-        // sessions are not distributed); `plan_qwen4_session` returns 0 for a
-        // mesh on the MTP route. DFlash2 never runs on a mesh.
-        let mut start = plan_qwen4_session(m, &prompt_tokens, route);
-        // DFlash2 resumes only where its draft context can restart.
-        if m.speculator
-            .as_ref()
-            .is_some_and(|s| !s.can_resume_at(&prompt_tokens, start))
-        {
-            start = 0;
-        }
+    // A speculator that resumes from the target's session cache plans against
+    // the full canonical prompt: the deepest reuse point (live state of this
+    // conversation's previous turn, or a cold-exact snapshot) it can resume.
+    let spec_session = match (m.state.as_deref(), m.speculator.as_deref()) {
+        (Some(model), Some(spec)) => plan_spec_session(model, spec, &prompt_tokens),
+        _ => None,
+    };
+    if let Some((route, start)) = spec_session {
         let start_is_live = m
-            .qwen4()
-            .is_some_and(|b| b.session_plan_is_live(&prompt_tokens, route, start));
+            .state
+            .as_deref()
+            .is_some_and(|s| s.session_plan_is_live(&prompt_tokens, route, start));
         trace_qwen4_session_plan(
             route,
             &m.conversation_tokens,
@@ -3829,14 +3823,21 @@ pub fn generate_dflash(
         prefill_tokens = prompt_tokens[start..].to_vec();
         cache_hit = start > 0;
         cached_tokens_dflash = start;
+        // Host mirrors match the reused prefix; the model owns device state.
+        if start > 0 {
+            m.seq_pos = start;
+            m.conversation_tokens.clear();
+            m.conversation_tokens
+                .extend_from_slice(&prompt_tokens[..start]);
+        }
     }
-    // Host mirrors match the snapshot prefix; the bundle owns device state.
-    if m.qwen4().is_some() && cache_hit && prefill_start > 0 {
-        m.seq_pos = prefill_start;
-        m.conversation_tokens.clear();
-        m.conversation_tokens
-            .extend_from_slice(&prompt_tokens[..prefill_start]);
-    }
+    // A session-planned prefill restores inside the model, not through the
+    // generic `spec.rewind_to` hook.
+    let resume_from: Option<usize> = if spec_session.is_some() {
+        None
+    } else {
+        cache_plan.as_ref().and_then(|p| p.resume_from)
+    };
 
     // ── Grammar-guided decoding setup (dflash path) ─────────────
     //
@@ -4132,8 +4133,7 @@ pub fn generate_dflash(
                 // terminals are complete at commit_ready. Final done is identical.
                 stage_terminal_tool_calls(&mut pending_done, finish_reason, wire_tool_calls);
                 let decision = await_client_terminal_commit(stdout, id, &pending_done);
-                let effects = qwen_client_commit_effects(
-                    decision,
+                let effects = decision.commit_effects(
                     *release_tool_calls && !wire_tool_calls.is_empty(),
                     *store_cache,
                 );
@@ -4142,7 +4142,7 @@ pub fn generate_dflash(
                     emit_spec_cancel_after_rollback(stdout, id, run.generated, &ep);
                     return true;
                 }
-                commit_qwen4_session(m);
+                commit_session(m);
                 // No post-commit tool_calls event; calls live on staged terminal.
                 let mut action = qwen_dflash_cache_action(&terminal);
                 action.store = effects.store_cache && action.store;
@@ -4287,44 +4287,24 @@ pub fn generate_dflash(
         stage_terminal_tool_calls(&mut pending_done, finish_reason, &wire_calls);
         let decision = await_client_terminal_commit(stdout, id, &pending_done);
         let intended_release = finish_reason == "tool_calls" && !wire_calls.is_empty();
-        let intended_store = !hit_length_cap && !open_think && !cached_seq.is_empty();
-        let effects = qwen_client_commit_effects(decision, intended_release, intended_store);
+        let cache_action = legacy_asst_turn_action(
+            hit_length_cap,
+            open_think,
+            started_in_think,
+            &decoded_full,
+            &wire_calls,
+        );
+        let intended_store = cache_action.store && !cached_seq.is_empty();
+        let effects = decision.commit_effects(intended_release, intended_store);
         if !effects.emit_done {
             let ep = production_fail_closed_rollback(m, gpu, None, None);
             emit_spec_cancel_after_rollback(stdout, id, run.generated, &ep);
             return true;
         }
-        commit_qwen4_session(m);
-        // Safe stop/tool_calls only — length never stores; Abort suppressed above.
+        commit_session(m);
+        // Safe stop/tool_calls only (see legacy_asst_turn_action); Abort suppressed above.
         if effects.store_cache {
-            let stripped = strip_think_for_fingerprint(&decoded_full);
-            let emit_text =
-                hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped).into_owned();
-            let fp = asst_turn_fingerprint(&emit_text, &wire_calls);
-            if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
-                .ok()
-                .as_deref()
-                == Some("1")
-            {
-                eprintln!(
-                    "[qwen-cache store dflash] fp={:#018x} cached_seq={} emit_text.len={} tool_calls={} preview={:?}",
-                    fp, cached_seq.len(), emit_text.len(), wire_calls.len(),
-                    emit_text.chars().take(60).collect::<String>(),
-                );
-            }
-            // Legacy (non-qwen-semantic-v2) arches: content-only full body store.
-            // Rich whole-envelope reasoning text is the qwen semantic-v2 path above.
-            m.asst_turn_cache.insert(
-                fp,
-                hipfire_runtime::prompt_frame::CachedAssistantTurn {
-                    reasoning: None,
-                    tools: Vec::new(),
-                    content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
-                        token_ids: cached_seq,
-                        text: String::new(),
-                    }),
-                },
-            );
+            store_legacy_asst_turn(m, &cache_action, cached_seq);
         }
         crate::ar::emit_active_route_done_value(stdout, &pending_done);
     }
@@ -4462,6 +4442,8 @@ pub fn generate_spec(
     // arch-matches for spec-decode). `&'static dyn Carrier` borrows nothing from
     // `m`, so it coexists with the `tokenizer`/`&mut m.state` borrows below.
     let arch_id = m.arch_id;
+    // Read before the slot guard takes `m.state`.
+    let qwen4_target = m.qwen4().is_some();
     let carrier = match hipfire_loader::carrier_for(arch_id) {
         Some(c) => c,
         None => {
@@ -4515,6 +4497,12 @@ pub fn generate_spec(
             return None;
         }
     }
+    // The session route a speculative prefill begins on (the route
+    // `plan_spec_session` planned), read before the guard borrows the target.
+    let session_route = match (m.state.as_deref(), m.speculator.as_deref()) {
+        (Some(model), Some(spec)) => spec_session_route(model, spec),
+        _ => None,
+    };
     // Arch-dispatched target borrow via `Carrier::spec_target_guard()`
     // (`m.model_path` is a disjoint field → no borrow conflict with the
     // `&mut m.state` the guard takes). qwen35 moves the bundle out + reopens its
@@ -4708,6 +4696,7 @@ pub fn generate_spec(
             gpu,
             spec.as_mut(),
             slot,
+            session_route,
             &prompt_tokens,
             &prefill_tokens,
             prefill_start,
@@ -4867,19 +4856,23 @@ pub fn generate_spec(
             return None;
         }
     };
-    // Native Qwen4 MTP commits a whole window before the emitter observes it,
-    // so an emitter intervention (think-budget force-close or think-cap stop)
-    // that lands strictly inside a window would leave committed state past the
-    // intervention. Inside a think span (or over a queued close) the loop
-    // clamps each window to the emitter's `window_cap()` for this speculator
-    // so the intervention only ever falls on a window's last token — no
-    // Realign re-prefill, no window repair. Outside a span the cap is `None`
-    // (thinking off is `max_think_tokens == 1`, so capping there would stop
+    // Native Qwen4 MTP and Qwen4 DFlash2 commit a whole window before the
+    // emitter observes it, so an emitter intervention (think-budget
+    // force-close or think-cap stop) that lands strictly inside a window would
+    // leave committed state past the intervention. Inside a think span (or
+    // over a queued close) the loop clamps each window to the emitter's
+    // `window_cap()` for these speculators so the intervention only ever falls
+    // on a window's last token — no Realign re-prefill (whose numerics differ
+    // from AR), no window repair. Outside a span the cap is `None` (thinking
+    // off is `max_think_tokens == 1`, so capping there would stop
     // speculation): a span opened and tripped inside one window takes the
     // window repair below. Other speculators keep their own handling.
-    let native_qwen4_mtp = spec
-        .drafter_any_mut()
-        .is_some_and(|a| a.is::<hipfire_arch_qwen4::mtp_spec::Qwen4MtpDrafter>());
+    let qwen4_window_capped = spec_qwen4_window_capped(
+        qwen4_target,
+        spec.name(),
+        spec.drafter_any_mut()
+            .is_some_and(|a| a.is::<hipfire_arch_qwen4::mtp_spec::Qwen4MtpDrafter>()),
+    );
 
     // Decode loop — spec.step returns one acceptance window (SpecStep) per cycle.
     // `emitted` is the speculator's repeat / n-gram context (NOT emission state);
@@ -5392,7 +5385,7 @@ pub fn generate_spec(
         // borrow ends when `step` returns, before the per-token `emit.observe`.
         let max_emit = spec_window_emit_budget(
             max_tokens.saturating_sub(generated),
-            native_qwen4_mtp,
+            qwen4_window_capped,
             emit.window_cap(),
         );
         let window_seed = seed_token;
@@ -5581,8 +5574,9 @@ pub fn generate_spec(
         }
 
         // Strict-prefix semantic stop: drop unobserved speculative tail from
-        // target + drafter. Native Qwen4 MTP first tries a window-local repair
-        // (restore the pre-window target/head, replay only the consumed prefix)
+        // target + drafter. Qwen4 MTP and Qwen4 DFlash2 first try a
+        // window-local repair (restore the pre-window target, replay only the
+        // consumed prefix)
         // for both a terminal strict prefix and a non-terminal one (a forced
         // intervention the window cap did not absorb), so neither pays a
         // full-history re-prefill nor drops live cache metadata. Other
@@ -5600,7 +5594,7 @@ pub fn generate_spec(
         let keep = consumed.min(committed_tail.len());
         let mut strict_prefix_action =
             spec_strict_prefix_action(keep, committed_tail.len(), hit_eos || think_cap_hit);
-        if spec_window_repair_attempt(strict_prefix_action, native_qwen4_mtp, ar_step) {
+        if spec_window_repair_attempt(strict_prefix_action, qwen4_window_capped, ar_step) {
             // Must run right after the window is observed and before any
             // further step / forced advance / prefill / reset on the
             // speculator: the retained pre-window snapshot is only valid until
@@ -5749,6 +5743,7 @@ pub fn generate_spec(
                 gpu,
                 spec.as_mut(),
                 slot,
+                session_route,
                 &plan.replay,
                 &plan.replay,
                 0,
@@ -6223,32 +6218,6 @@ pub fn attach_mtp_window_timings(
 ) {
     if host_timing {
         pending_done["mtp_window_timings"] = serde_json::Value::Array(timings);
-    }
-}
-
-fn emit_pipeline_cancel_after_rollback(
-    stdout: &mut impl Write,
-    id: &str,
-    completion_tokens: usize,
-    epilogue: &RollbackEpilogue,
-) {
-    if epilogue.rolled_back {
-        crate::ar::emit_generation_cancel(
-            crate::ar::GenerationRoute::PipelineParallel,
-            stdout,
-            id,
-            completion_tokens,
-        );
-    } else {
-        emit_fail_closed_error_for_route(
-            crate::ar::GenerationRoute::PipelineParallel,
-            stdout,
-            Some(id),
-            "client cancelled; fail-closed rollback could not be attested",
-            "validation",
-            false,
-            epilogue,
-        );
     }
 }
 
@@ -6820,7 +6789,13 @@ pub fn generate_multi(
         // G4.9: the mesh dispatcher resets recurrent state and attests
         // graph invalidation + synchronization on every PP device.
         let ep = crate::common::reset_mesh_request_state(m, Some(gpu));
-        emit_pipeline_cancel_after_rollback(stdout, id, 0, &ep);
+        crate::common::emit_cancel_after_rollback_for_route(
+            crate::ar::GenerationRoute::PipelineParallel,
+            stdout,
+            id,
+            0,
+            &ep,
+        );
         return;
     }
 
@@ -6921,7 +6896,13 @@ pub fn generate_multi(
             // G4.9: the mesh dispatcher resets recurrent state and attests
             // graph invalidation + synchronization on every PP device.
             let ep = crate::common::reset_mesh_request_state(m, Some(gpu));
-            emit_pipeline_cancel_after_rollback(stdout, id, generated, &ep);
+            crate::common::emit_cancel_after_rollback_for_route(
+                crate::ar::GenerationRoute::PipelineParallel,
+                stdout,
+                id,
+                generated,
+                &ep,
+            );
             return;
         }
         // Commit the sampled token only after its device/KV mutation succeeds.
@@ -7485,7 +7466,13 @@ pub fn generate_multi(
         // G4.9: the mesh dispatcher resets recurrent state and attests graph
         // invalidation + synchronization on every PP device.
         let ep = crate::common::reset_mesh_request_state(m, Some(gpu));
-        emit_pipeline_cancel_after_rollback(stdout, id, generated, &ep);
+        crate::common::emit_cancel_after_rollback_for_route(
+            crate::ar::GenerationRoute::PipelineParallel,
+            stdout,
+            id,
+            generated,
+            &ep,
+        );
         return;
     }
     crate::ar::emit_generation_done_value(
@@ -7559,31 +7546,6 @@ pub fn generate_mesh_carrier(
 }
 
 // --- Auto-appended shared helpers (shared-temp, dedup at merge) ---
-
-/// Walk a [`serde_json::Value`] and produce a canonical-key
-/// representation: objects emit keys in lexical order (recursively),
-/// arrays preserve order. Used by [`asst_turn_fingerprint`] so two
-/// messages with the same logical tool args hash identically
-/// regardless of source-side insertion order.
-
-pub fn qwen_client_commit_effects(
-    decision: ClientTerminalDecision,
-    intended_release: bool,
-    intended_store: bool,
-) -> QwenClientCommitEffects {
-    match decision {
-        ClientTerminalDecision::Commit => QwenClientCommitEffects {
-            release_tool_calls: intended_release,
-            store_cache: intended_store,
-            emit_done: true,
-        },
-        ClientTerminalDecision::Abort => QwenClientCommitEffects {
-            release_tool_calls: false,
-            store_cache: false,
-            emit_done: false,
-        },
-    }
-}
 
 /// Open the DS4 EP wire contract before prefill can eventually emit tokens.
 ///
@@ -7728,6 +7690,66 @@ pub fn qwen_dflash_wire_terminal(
             wire_tool_calls: Vec::new(),
         }
     }
+}
+
+/// Store decision for the legacy (non-semantic-v2) assistant-turn cache,
+/// shared by the DFlash/DSpark spec route and llama AR. The legacy entry is
+/// keyed on the visible text only, so a body that carries a think span
+/// (or started inside one) is never stored: its reasoning would splice into
+/// another conversation with the same visible answer, or into a think-off
+/// turn after the `<think></think>` primer (HIPF-227).
+pub fn legacy_asst_turn_action(
+    hit_length: bool,
+    open_think: bool,
+    started_in_think: bool,
+    decoded_full: &str,
+    wire_calls: &[hipfire_runtime::prompt_frame::ToolCall],
+) -> TurnCacheAction {
+    let has_think =
+        started_in_think || decoded_full.contains("<think>") || decoded_full.contains("</think>");
+    if hit_length || open_think || has_think {
+        return TurnCacheAction::skip();
+    }
+    // Strips the literal `<|im_end|>` the client never echoes back.
+    let visible = strip_think_for_fingerprint(decoded_full);
+    TurnCacheAction {
+        store: true,
+        fingerprint_text: hipfire_runtime::tokenizer::maybe_normalize_prompt(&visible).into_owned(),
+        tool_calls: wire_calls.to_vec(),
+    }
+}
+
+/// Publish a legacy turn: content-only full body under the action's fingerprint.
+pub fn store_legacy_asst_turn(m: &mut LoadedModel, action: &TurnCacheAction, cached_seq: Vec<u32>) {
+    let _ = apply_turn_cache_action(
+        |fp, seq| {
+            if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
+                .ok()
+                .as_deref()
+                == Some("1")
+            {
+                eprintln!(
+                    "[qwen-cache store legacy] fp={:#018x} cached_seq={} tool_calls={}",
+                    fp,
+                    seq.len(),
+                    action.tool_calls.len(),
+                );
+            }
+            m.asst_turn_cache.insert(
+                fp,
+                hipfire_runtime::prompt_frame::CachedAssistantTurn {
+                    reasoning: None,
+                    tools: Vec::new(),
+                    content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
+                        token_ids: seq,
+                        text: String::new(),
+                    }),
+                },
+            );
+        },
+        action,
+        cached_seq,
+    );
 }
 
 pub fn qwen_dflash_cache_action(terminal: &QwenDflashWireTerminal) -> TurnCacheAction {
@@ -8065,8 +8087,9 @@ pub fn spec_strict_prefix_action(
 /// window before any reset or re-prefill. A terminal strict prefix always
 /// tries (the speculator answers `false` when it cannot repair); a
 /// non-terminal one (`Realign`, a forced intervention inside the window) tries
-/// only on native Qwen4 MTP, which restores its retained pre-window target and
-/// head and replays the consumed prefix instead of re-prefilling history.
+/// only on a Qwen4 window-capped speculator ([`spec_qwen4_window_capped`]),
+/// which restores its retained pre-window target state and replays the
+/// consumed prefix instead of re-prefilling history.
 ///
 /// A retired request's AR step is not a speculative window and leaves none
 /// retained (DFlash clears it), so it never tries: asking would fail the
@@ -8074,7 +8097,7 @@ pub fn spec_strict_prefix_action(
 /// violation on the AR token end as the validation error it is.
 pub fn spec_window_repair_attempt(
     action: SpecStrictPrefixAction,
-    native_qwen4_mtp: bool,
+    qwen4_window_capped: bool,
     ar_step: bool,
 ) -> bool {
     if ar_step {
@@ -8083,35 +8106,44 @@ pub fn spec_window_repair_attempt(
     match action {
         SpecStrictPrefixAction::None => false,
         SpecStrictPrefixAction::RepairForTerminal => true,
-        SpecStrictPrefixAction::Realign => native_qwen4_mtp,
+        SpecStrictPrefixAction::Realign => qwen4_window_capped,
     }
 }
 
 /// Output budget for the next speculative window. `remaining` is what
-/// `max_tokens` still allows; native Qwen4 MTP additionally clamps it to the
-/// emitter's [`SpecEmit::window_cap`] (always `>= 1` when `Some`) so a
-/// think-budget force-close or think-cap stop only lands on the window's last
-/// token. Other speculators ignore the cap.
+/// `max_tokens` still allows; a Qwen4 window-capped speculator
+/// ([`spec_qwen4_window_capped`]) additionally clamps it to the emitter's
+/// [`SpecEmit::window_cap`] (always `>= 1` when `Some`) so a think-budget
+/// force-close or think-cap stop only lands on the window's last token. Other
+/// speculators ignore the cap.
 pub fn spec_window_emit_budget(
     remaining: usize,
-    native_qwen4_mtp: bool,
+    qwen4_window_capped: bool,
     cap: Option<usize>,
 ) -> usize {
     match cap {
-        Some(cap) if native_qwen4_mtp => remaining.min(cap.max(1)),
+        Some(cap) if qwen4_window_capped => remaining.min(cap.max(1)),
         _ => remaining,
     }
+}
+
+/// Speculators that commit a whole window on a Qwen4 target before the
+/// emitter observes it: native Qwen4 MTP and DFlash2. Raon DFlash2 shares the
+/// `dflash2` name but has no target-side committed-prefix repair, so it keeps
+/// Realign.
+pub fn spec_qwen4_window_capped(qwen4_target: bool, spec_name: &str, mtp_drafter: bool) -> bool {
+    qwen4_target && (mtp_drafter || spec_name == "dflash2")
 }
 
 #[cfg(test)]
 mod spec_window_repair_tests {
     use super::{
-        spec_strict_prefix_action, spec_window_emit_budget, spec_window_repair_attempt,
-        SpecStrictPrefixAction,
+        spec_qwen4_window_capped, spec_strict_prefix_action, spec_window_emit_budget,
+        spec_window_repair_attempt, SpecStrictPrefixAction,
     };
 
     #[test]
-    fn window_cap_clamps_only_native_qwen4_and_never_to_zero() {
+    fn window_cap_clamps_only_qwen4_capped_and_never_to_zero() {
         assert_eq!(spec_window_emit_budget(9, true, Some(3)), 3);
         assert_eq!(spec_window_emit_budget(2, true, Some(3)), 2);
         assert_eq!(spec_window_emit_budget(9, true, Some(0)), 1);
@@ -8120,7 +8152,15 @@ mod spec_window_repair_tests {
     }
 
     #[test]
-    fn window_repair_precedes_reset_and_realign_on_native_qwen4() {
+    fn window_cap_covers_qwen4_mtp_and_dflash2_not_raon() {
+        assert!(spec_qwen4_window_capped(true, "mtp", true));
+        assert!(spec_qwen4_window_capped(true, "dflash2", false));
+        assert!(!spec_qwen4_window_capped(false, "dflash2", false));
+        assert!(!spec_qwen4_window_capped(true, "dflash", false));
+    }
+
+    #[test]
+    fn window_repair_precedes_reset_and_realign_on_qwen4_capped() {
         // Full window: nothing to repair.
         let full = spec_strict_prefix_action(4, 4, true);
         assert!(!spec_window_repair_attempt(full, true, false));
@@ -8129,8 +8169,8 @@ mod spec_window_repair_tests {
         assert_eq!(terminal, SpecStrictPrefixAction::RepairForTerminal);
         assert!(spec_window_repair_attempt(terminal, false, false));
         assert!(spec_window_repair_attempt(terminal, true, false));
-        // Non-terminal strict prefix (forced intervention): only native Qwen4
-        // skips the full re-prefill; others keep Realign.
+        // Non-terminal strict prefix (forced intervention): only a Qwen4
+        // window-capped speculator skips the full re-prefill; others keep Realign.
         let forced = spec_strict_prefix_action(2, 4, false);
         assert_eq!(forced, SpecStrictPrefixAction::Realign);
         assert!(spec_window_repair_attempt(forced, true, false));
@@ -8639,16 +8679,6 @@ pub fn classify_evict_failure_wire() -> SpecFailClosedWire {
 }
 
 // --- iter appended ---
-
-/// Pure Commit/Abort side-effect gate for Qwen AR + DFlash successful terminals.
-/// Commit preserves the intended release/store/done flags; Abort suppresses all
-/// three so producers never store or release after a client cancel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct QwenClientCommitEffects {
-    pub release_tool_calls: bool,
-    pub store_cache: bool,
-    pub emit_done: bool,
-}
 
 /// Host-side bookkeeping after one SpecStep is consumed by the semantic loop.
 ///
@@ -10914,8 +10944,9 @@ pub fn generate_qwen4_ar(
     // Prefill restores into the live buffers, then runs the remaining suffix.
     let reused = plan_qwen4_session(m, &prompt_tokens, SessionRoute::Ar);
     let reused_is_live = m
-        .qwen4()
-        .is_some_and(|b| b.session_plan_is_live(&prompt_tokens, SessionRoute::Ar, reused));
+        .state
+        .as_deref()
+        .is_some_and(|s| s.session_plan_is_live(&prompt_tokens, SessionRoute::Ar, reused));
     trace_qwen4_session_plan(
         SessionRoute::Ar,
         &m.conversation_tokens,
@@ -11027,7 +11058,7 @@ pub fn generate_qwen4_ar(
                 .forward_token_or_argmax(device, token, logits)
                 .map_err(|error| error.to_string())
         },
-        commit_qwen4_session,
+        commit_session,
     );
 }
 
@@ -11280,6 +11311,7 @@ fn spec_prefill(
     gpu: &mut rdna_compute::Gpu,
     spec: &mut dyn Speculator,
     slot: &mut dyn SpecTarget,
+    session_route: Option<SessionRoute>,
     prompt_tokens: &[u32],
     prefill_tokens: &[u32],
     prefill_start: usize,
@@ -11288,31 +11320,29 @@ fn spec_prefill(
     abort: &dyn Fn() -> bool,
 ) -> Result<PrefillOutcome, String> {
     let Some(gpus) = pp else {
-        // Qwen4 DFlash2 prefills inside an AR-route session turn: the begin
-        // restores the planned prefix (or cold-starts) and arms the snapshot
-        // boundaries `spec_advance` publishes, so the speculator continues
-        // the target in place rather than resetting it (which would drop the
-        // turn).
-        if spec.name() == "dflash2" {
-            if let Some(bundle) = slot
-                .as_any_mut()
-                .downcast_mut::<hipfire_arch_qwen4::bundle::Qwen4Bundle>()
-            {
-                let start = if cache_hit { prefill_start } else { 0 };
-                bundle
-                    .session_begin(gpu, prompt_tokens, start, SessionRoute::Ar)
-                    .map_err(|e| e.to_string())?;
-                return spec.prefill(
-                    gpu,
-                    slot,
-                    prompt_tokens,
-                    &prompt_tokens[start..],
-                    start,
-                    true,
-                    None,
-                    abort,
+        // A target-only (`Ar`) session route: the drafter does not begin the
+        // session itself (an `Mtp` drafter does, in its prefill), so the
+        // target's begin restores the planned prefix (or cold-starts) and
+        // arms the snapshot boundaries the prefill publishes; the speculator
+        // then continues the target in place rather than resetting it
+        // (which would drop the turn).
+        if session_route == Some(SessionRoute::Ar) {
+            let start = if cache_hit { prefill_start } else { 0 };
+            if !slot.session_begin(gpu, prompt_tokens, start, SessionRoute::Ar)? {
+                return Err(
+                    "speculative target declares session reuse but keeps no session".into(),
                 );
             }
+            return spec.prefill(
+                gpu,
+                slot,
+                prompt_tokens,
+                &prompt_tokens[start..],
+                start,
+                true,
+                None,
+                abort,
+            );
         }
         return spec.prefill(
             gpu,
@@ -11490,6 +11520,158 @@ mod qwen4_session_target_tests {
 }
 
 #[cfg(test)]
+mod plan_spec_session_tests {
+    use super::plan_spec_session;
+    use hipfire_runtime::arch_model::ArchModel;
+    use hipfire_runtime::llama::KvCache;
+    use hipfire_runtime::session_cache::SessionRoute;
+    use hipfire_runtime::spec::{PrefillOutcome, SpecGrammar, SpecStep, SpecTarget, Speculator};
+    use rdna_compute::Gpu;
+
+    /// `Ar` reuse points at 4096 and 8192 plus a live hit at 10000; `Mtp`
+    /// keeps only the 4096 snapshot.
+    struct Model {
+        spec_reuse: bool,
+    }
+
+    impl ArchModel for Model {
+        fn dim(&self) -> usize {
+            8
+        }
+        fn n_layers(&self) -> usize {
+            1
+        }
+        fn vocab_size(&self) -> usize {
+            8
+        }
+        fn arch_key(&self) -> &'static str {
+            "mock"
+        }
+        fn kv_cache_mut(&mut self) -> Option<&mut KvCache> {
+            None
+        }
+        fn session_plan_capped(&self, prompt: &[u32], route: SessionRoute, cap: usize) -> usize {
+            let top = cap.min(prompt.len() - 1);
+            let points: &[usize] = match route {
+                SessionRoute::Ar => &[10000, 8192, 4096],
+                SessionRoute::Mtp => &[4096],
+            };
+            points.iter().copied().find(|&p| p <= top).unwrap_or(0)
+        }
+        fn spec_session_reuse(&self) -> bool {
+            self.spec_reuse
+        }
+        fn free_gpu(self: Box<Self>, _gpu: &mut Gpu) {}
+    }
+
+    /// Resumes on `route` only with at least `window` rows left to prefill.
+    struct Spec {
+        route: Option<SessionRoute>,
+        window: usize,
+    }
+
+    impl Speculator for Spec {
+        fn prefill(
+            &mut self,
+            _: &mut Gpu,
+            _: &mut dyn SpecTarget,
+            _: &[u32],
+            _: &[u32],
+            _: usize,
+            _: bool,
+            _: Option<usize>,
+            _: &dyn Fn() -> bool,
+        ) -> Result<PrefillOutcome, String> {
+            unreachable!()
+        }
+        fn step(
+            &mut self,
+            _: &mut Gpu,
+            _: &mut dyn SpecTarget,
+            _: usize,
+            _: u32,
+            _: &[u32],
+            _: Option<&mut dyn SpecGrammar>,
+            _: f32,
+            _: usize,
+        ) -> Result<SpecStep, String> {
+            unreachable!()
+        }
+        fn reset(&mut self, _: &mut Gpu) -> Result<(), String> {
+            unreachable!()
+        }
+        fn block_size(&self) -> usize {
+            4
+        }
+        fn ctx_capacity(&self) -> usize {
+            1 << 20
+        }
+        fn can_resume_at(&self, prompt: &[u32], start: usize) -> bool {
+            prompt.len() - start >= self.window
+        }
+        fn session_route(&self) -> Option<SessionRoute> {
+            self.route
+        }
+        fn free(self: Box<Self>, _: &mut Gpu) {}
+    }
+
+    #[test]
+    fn a_speculative_request_plans_the_deepest_resumable_reuse_point() {
+        let prompt = vec![0u32; 11_000];
+        let model = Model { spec_reuse: true };
+        let spec = |window| Spec {
+            route: Some(SessionRoute::Ar),
+            window,
+        };
+        // Top hit resumable: kept.
+        assert_eq!(
+            plan_spec_session(&model, &spec(0), &prompt),
+            Some((SessionRoute::Ar, 10000))
+        );
+        // Top hit leaves fewer rows than a draft window: the next lower one.
+        assert_eq!(
+            plan_spec_session(&model, &spec(2048), &prompt),
+            Some((SessionRoute::Ar, 8192))
+        );
+        // Nothing resumable: cold.
+        assert_eq!(
+            plan_spec_session(&model, &spec(20_000), &prompt),
+            Some((SessionRoute::Ar, 0))
+        );
+        // The speculator's own route is the one planned.
+        let mtp = Spec {
+            route: Some(SessionRoute::Mtp),
+            window: 0,
+        };
+        assert_eq!(
+            plan_spec_session(&model, &mtp, &prompt),
+            Some((SessionRoute::Mtp, 4096))
+        );
+    }
+
+    #[test]
+    fn no_session_plan_without_both_opt_ins() {
+        let prompt = vec![0u32; 11_000];
+        let ar = Spec {
+            route: Some(SessionRoute::Ar),
+            window: 0,
+        };
+        let none = Spec {
+            route: None,
+            window: 0,
+        };
+        assert_eq!(
+            plan_spec_session(&Model { spec_reuse: false }, &ar, &prompt),
+            None
+        );
+        assert_eq!(
+            plan_spec_session(&Model { spec_reuse: true }, &none, &prompt),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
 mod qwen_ep_sample_tests {
     use super::{qwen_ep_sample, EpSampling};
     use hipfire_runtime::sampler::{sample_cpu, SamplerConfig};
@@ -11579,5 +11761,114 @@ mod qwen_ep_sample_tests {
             2
         );
         assert_eq!(qwen_ep_sample(&mut logits, &[2], &greedy(1.0, 1.0, 0.0)), 5);
+    }
+}
+
+#[cfg(test)]
+mod legacy_asst_turn_store_tests {
+    use super::{legacy_asst_turn_action, TurnCacheAction};
+    use hipfire_engine::turn_cache::apply_turn_cache_action;
+    use std::collections::HashMap;
+
+    fn action(hit_length: bool, open_think: bool, started: bool, body: &str) -> TurnCacheAction {
+        legacy_asst_turn_action(hit_length, open_think, started, body, &[])
+    }
+
+    /// Publish through the production seam; returns the stored key.
+    fn store(
+        cache: &mut HashMap<u64, Vec<u32>>,
+        a: &TurnCacheAction,
+        seq: Vec<u32>,
+    ) -> Option<u64> {
+        apply_turn_cache_action(|fp, s| drop(cache.insert(fp, s)), a, seq)
+    }
+
+    #[test]
+    fn same_visible_text_with_different_think_bodies_never_splices() {
+        let mut cache = HashMap::new();
+        let x = action(
+            false,
+            false,
+            false,
+            "<think>\nsecret is apple\n</think>\n\nOK",
+        );
+        let y = action(
+            false,
+            false,
+            false,
+            "<think>\nsecret is pear\n</think>\n\nOK",
+        );
+        assert!(store(&mut cache, &x, vec![1, 2]).is_none());
+        assert!(store(&mut cache, &y, vec![3, 4]).is_none());
+        // Body that started inside think (prompt ended with `<think>\n`).
+        let z = action(false, false, true, "secret is plum\n</think>\n\nOK");
+        assert!(store(&mut cache, &z, vec![5]).is_none());
+        assert!(
+            cache.is_empty(),
+            "a think body must not be reachable by visible text"
+        );
+    }
+
+    #[test]
+    fn think_on_turn_cannot_be_spliced_after_a_think_off_primer() {
+        let mut cache = HashMap::new();
+        let on = action(false, false, false, "<think>\n17*3 is 51\n</think>\n\n51");
+        assert!(store(&mut cache, &on, vec![9]).is_none());
+        // Turn 2 (thinking off) looks up "51": nothing to prepend its primer to.
+        let fp = hipfire_engine::turn_cache::asst_turn_fingerprint("51", &[]);
+        assert!(!cache.contains_key(&fp));
+    }
+
+    #[test]
+    fn thinking_off_stop_stores_under_the_visible_text() {
+        let mut cache = HashMap::new();
+        let a = action(false, false, false, "Hello there.<|im_end|>");
+        assert!(a.store);
+        assert_eq!(a.fingerprint_text, "Hello there.");
+        let fp = store(&mut cache, &a, vec![7, 8]).expect("clean stop stores");
+        assert_eq!(cache[&fp], vec![7, 8]);
+        // A client echoing the visible text hits the same key.
+        assert_eq!(
+            fp,
+            hipfire_engine::turn_cache::asst_turn_fingerprint("Hello there.", &[])
+        );
+    }
+
+    #[test]
+    fn length_and_open_think_skip() {
+        assert!(!action(true, false, false, "Hello").store);
+        assert!(!action(false, true, false, "Hello").store);
+        assert!(!action(false, true, false, "<think>\nstill thinking").store);
+    }
+
+    #[test]
+    fn ar_routing_splits_reasoning_from_content() {
+        use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig};
+        let mut out = Vec::new();
+        let mut filter = EosFilter::new(EosFilterConfig::default());
+        let mut think = hipfire_runtime::emit_text::ThinkOutputRouter::new(false);
+        for piece in ["<think>", "\nplan", "\n</think>", "\n\nAnswer"] {
+            crate::vision::vl_route_decode_text(
+                &mut out,
+                "r",
+                &mut filter,
+                &mut think,
+                piece.as_bytes(),
+            );
+        }
+        crate::vision::vl_finish_think_routing(&mut out, "r", &mut filter, &mut think);
+        let (mut reasoning, mut content) = (String::new(), String::new());
+        for line in String::from_utf8(out).unwrap().lines() {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            let t = v["text"].as_str().unwrap();
+            match v["type"].as_str().unwrap() {
+                "reasoning" => reasoning.push_str(t),
+                "token" => content.push_str(t),
+                other => panic!("unexpected event {other}"),
+            }
+        }
+        assert!(reasoning.contains("plan") && !reasoning.contains("Answer"));
+        assert_eq!(content.trim(), "Answer");
+        assert!(!think.in_think());
     }
 }
