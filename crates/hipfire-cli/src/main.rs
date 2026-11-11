@@ -23516,6 +23516,13 @@ effort = "high"
         assert_eq!(hash_invocations(), 1, "second check hits the proof");
 
         // Same size, new bytes: the stat moves, the old proof no longer applies,
+        // and wrong bytes never earn one. The ext4 coarse clock stamps whole
+        // jiffies (~4 ms here): on a fast host both writes land in the same
+        // jiffy and the old proof stays satisfiable. Cross a jiffy first.
+        let old_mtime = fs::metadata(&path).unwrap().modified().unwrap();
+        while fs::metadata(&path).unwrap().modified().unwrap() == old_mtime {
+            std::thread::sleep(Duration::from_millis(2));
+        }
         // and wrong bytes never earn one.
         fs::write(&path, b"synthetic split BASE").unwrap();
         assert!(!existing_artifact_valid(
