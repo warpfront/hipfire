@@ -1,13 +1,14 @@
 # gdn_canon_* — S0 kill oracles (CHUNK-CANONICAL-DESIGN §6 S0)
 
 Four independently runnable examples, one shared support module (`#[path = "gdn_canon_common/mod.rs"] mod canon;`).
-All need `--features lab,deltanet`; kills 1/2 and the device legs of 3/4 need a gfx1201 card
+All need `--features lab,deltanet`; `gdn_canon_scan_prefix_kill` also runs on gfx1100/gfx1151 (hv 48; built on hiptrx, binary copied to hipx, run via `fabric-run.sh --card xtx|halo` with `HOME=…/home-C HIPFIRE_KERNEL_CACHE=…/kc-C-<arch>`); kills 1/2 and the device legs of 3/4 need a gfx1201 card
 (run through `/home/kaden/qcal/locks/fabric/fabric-run.sh`). The CPU legs of 3/4 run with `--no-gpu`.
 
 | example | design item | subject |
 |---|---|---|
 | `gdn_canon_producer_kill` | S0.1 | QKVZA prepared-IU4 route vs short-call route, per field, n = 1/25/63/64/537 (+ extras) |
 | `gdn_canon_scan_prefix_kill` | S0.2 | C64 scan prefix stability for every r = 1..63 (heads 0/64/512, nonzero Q8+EF+conv, zero/NaN/huge padding) |
+| `gdn_canon_wy_prefix_kill` | S0.2 (C16) | Qwen4 WY chunk kernel prefix stability, r = 1..15, heads 0/16/512, Q8Ef+F32 nonzero state, gfx1100/gfx1151 only |
 | `gdn_canon_reference_kill` | S0.3 | retained-512 reference vs bounded-tile replay (CPU) and current production vs single call (device) |
 | `gdn_canon_snapshot_kill` | S0.4 | snapshot Open at p = 1/25/63/64/65/511/512/513/521, clobber, restore, continue, seal |
 
