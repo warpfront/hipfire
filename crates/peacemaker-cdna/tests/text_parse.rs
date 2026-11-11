@@ -1200,6 +1200,12 @@ fn decoded_instructions_print_text_that_parses_back() {
                 let Ok((inst, _)) = Inst::decode(ARCH, &words) else {
                     continue;
                 };
+                // This is the typed assembler's roundtrip contract. Generated
+                // forms preserve bytes but deliberately have no typed semantics.
+                if let Inst::Xml(x) = &inst {
+                    assert!(x.unsupported().contains(x.form().mnemonic));
+                    continue;
+                }
                 let text = inst.assembly().to_string();
                 let back = parse_line(&text, ARCH).unwrap_or_else(|e| {
                     panic!("{label}: `{text}` ({words:08x?}) did not parse: {e}")

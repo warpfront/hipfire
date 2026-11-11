@@ -1122,7 +1122,9 @@ fn illegal_forms_rejected() {
                     panic!("typed instruction decoded from unmodelled {words:#010x?}: {inst:?}")
                 };
                 assert_eq!(n, words.len(), "{words:#010x?} decoded as {inst:?}");
-                let why = inst.unsupported().expect("generated instruction is unsupported");
+                let why = inst
+                    .unsupported()
+                    .expect("generated instruction is unsupported");
                 assert!(
                     why.contains(x.name()) && why.contains("no hand-written model"),
                     "{words:#010x?}: unsupported text {why:?}"
@@ -1142,7 +1144,9 @@ fn illegal_forms_rejected() {
     assert_eq!(x.name(), "v_mov_b32");
     assert_eq!(x.encoding(), "VOP1_VOP_DPP");
     assert_eq!(x.field("DPP_CTRL"), Some(0x150));
-    let why = inst.unsupported().expect("generated instruction is unsupported");
+    let why = inst
+        .unsupported()
+        .expect("generated instruction is unsupported");
     assert!(
         why.contains("v_mov_b32") && why.contains("no hand-written model"),
         "unsupported text {why:?}"

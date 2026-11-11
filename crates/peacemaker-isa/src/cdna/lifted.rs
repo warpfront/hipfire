@@ -811,8 +811,8 @@ mod generated_encoding_tests {
 
     #[test]
     fn verified_generated_samples_refuse_simulation_and_certification_by_name() {
-        use model::sim::{self, Config, Memory, Wave};
-        use model::xml::{self, Isa};
+        use peacemaker_cdna::sim::{self, Config, Memory, Wave};
+        use peacemaker_cdna::xml::{self, Isa};
         let mut generated = 0;
         for form in xml::forms(Isa::Cdna3) {
             if !form.verification.is_verified() {

@@ -399,7 +399,12 @@ fn illegal_words_rejected() {
         bad_codes.extend([124, 126, 127]); // m0, exec
         bad_codes.extend(235..=238); // apertures
         bad_codes.extend([251, 252, 253]); // vccz, execz, scc
-        bad_codes.push(255); // literal marker
+        // code 255 (a second literal) is refused by the typed model and only
+        // preserved as a named-unsupported generated instruction.
+        assert!(Vop2K::decode(A, &[w(op, 255), lit]).is_err());
+        let (x, n) = Inst::decode(A, &[w(op, 255), lit]).unwrap();
+        assert_eq!(n, 2);
+        assert!(x.unsupported().is_some_and(|u| u.contains("no hand-written model")));
                              // 249/250 are the SDWA/DPP markers (no such forms), 254 is
                              // src_lds_direct; neither is a legal operand here.
         bad_codes.extend([249, 250, 254]);

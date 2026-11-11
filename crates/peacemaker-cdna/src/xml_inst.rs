@@ -733,6 +733,7 @@ impl Cx<'_> {
     fn legal(&self, vals: &[Val]) -> Result<()> {
         crate::xml_legality::selectors(self.d)?;
         self.unused_operand_fields()?;
+        self.sopp_legal()?;
         for (op, val) in self.form.operands.iter().zip(vals) {
             if op.field.is_none() {
                 continue;
@@ -745,6 +746,21 @@ impl Cx<'_> {
             }
         }
         self.constant_bus(vals)
+    }
+
+    /// Known SOPP opcodes keep the typed decoder's SIMM16 rules (waitcnt
+    /// unused bits, barrier / icache_inv take none, sendmsg printability).
+    fn sopp_legal(&self) -> Result<()> {
+        use crate::enc::sop::{Sopp, SoppOp};
+        if !self.is("ENC_SOPP") {
+            return Ok(());
+        }
+        let arch = self.arch();
+        if SoppOp::from_opcode(arch, self.form.opcode as u8).is_none() {
+            return Ok(());
+        }
+        let (words, n) = self.d.assemble()?;
+        Sopp::decode(arch, &words[..n]).map(|_| ())
     }
 
     /// An operand field the form does not use must be zero in the scalar and
@@ -827,7 +843,7 @@ impl Cx<'_> {
                     },
                     None => continue,
                 },
-                Val::Literal(v) => (if op.kind == K::Simm32 { 2 } else { 1 }, *v),
+                Val::Literal(v) => (1, *v),
                 Val::LdsDirect => (3, 0),
                 _ => continue,
             };
