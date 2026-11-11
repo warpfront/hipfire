@@ -1040,6 +1040,10 @@ impl V {
                     (opt!(s.s16(w, 1, l)) << (opt!(s.u(w, 0, l)) & 15)) & 0xffff,
                 ))
             }),
+            LshrrevB16 => self.ires(w, Out::None, 0, NONE, |s, w, l| {
+                let value = opt!(s.s16(w, 1, l)) as u16;
+                Ok(Some(u32::from(value) >> (opt!(s.u(w, 0, l)) & 15)))
+            }),
             // V_ASHRREV_I16: D.i16 = S1.i16 >> S0.u[3:0] (arithmetic; CDNA3 ISA VOP2 opcode 44).
             AshrrevI16 => self.ires(w, Out::None, 0, NONE, |s, w, l| {
                 let v = opt!(s.s16(w, 1, l)) as u16 as i16;

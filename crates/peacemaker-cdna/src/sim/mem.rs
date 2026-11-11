@@ -162,6 +162,12 @@ fn store_data(w: &Wave, src: Src, lane: usize, size: usize) -> SimResult<[u8; 16
     Ok(data)
 }
 
+fn store_hi16_data(w: &Wave, src: Src, lane: usize) -> SimResult<[u8; 16]> {
+    let mut data = store_data(w, src, lane, 4)?;
+    data.copy_within(2..4, 0);
+    Ok(data)
+}
+
 fn lds_range(addr: u64, size: usize, len: usize) -> SimResult<std::ops::Range<usize>> {
     let start =
         usize::try_from(addr).map_err(|_| SimError::Fault("LDS address overflow".into()))?;
@@ -489,11 +495,7 @@ fn ds(w: &Wave, i: &Ds) -> SimResult<Prepared> {
                 } else {
                     let src = required(if part == 0 { i.data0 } else { i.data1 }, "DS store data")?;
                     if i.op == WriteB16D16Hi {
-                        // Upper 16 bits of the data dword, stored as two LDS bytes.
-                        let hi = w.read_v(src, lane, Ty::B32)?.to_le_bytes();
-                        let mut data = [0; 16];
-                        data[..2].copy_from_slice(&hi[2..]);
-                        Action::Store(data)
+                        Action::Store(store_hi16_data(w, src, lane)?)
                     } else {
                         Action::Store(store_data(w, src, lane, size)?)
                     }
@@ -526,7 +528,7 @@ fn global(w: &Wave, i: &Flat) -> SimResult<Prepared> {
         LoadDwordx3 => (12, true, false, None),
         LoadDwordx4 => (16, true, false, None),
         StoreByte => (1, false, false, None),
-        StoreShort => (2, false, false, None),
+        StoreShort | StoreShortD16Hi => (2, false, false, None),
         StoreDword => (4, false, false, None),
         StoreDwordx2 => (8, false, false, None),
         StoreDwordx3 => (12, false, false, None),
@@ -568,6 +570,12 @@ fn global(w: &Wave, i: &Flat) -> SimResult<Prepared> {
                     operand: w.read_v(required(i.data, "GLOBAL atomic data")?, lane, Ty::B32)?,
                     dst,
                 }
+            } else if i.op == StoreShortD16Hi {
+                Action::Store(store_hi16_data(
+                    w,
+                    required(i.data, "GLOBAL store data")?,
+                    lane,
+                )?)
             } else {
                 Action::Store(store_data(
                     w,

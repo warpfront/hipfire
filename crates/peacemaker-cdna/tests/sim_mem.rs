@@ -966,6 +966,48 @@ fn global_store_every_width_with_snapshot() {
 }
 
 #[test]
+fn global_store_short_d16_hi_snapshots_upper_half_and_exec() {
+    let mask = 0xa5a5_5a5a_0f0f_f0f0u64;
+    for offset in [-2i16, 0, 4094] {
+        let mut r = Rig::global(0x4000);
+        r.m.unmap("g");
+        r.map_fill("g", G, 0x4000, 0xee);
+        r.w.exec = mask;
+        r.set_v64(2, |lane| {
+            if mask >> lane & 1 != 0 {
+                G + 0x100 + lane as u64 * 4
+            } else {
+                0
+            }
+        });
+        let value = |lane: usize| ((lane as u32 * 997) << 16) | (0x1234 ^ lane as u32);
+        r.set_v(6, value);
+        r.ok(&gl(
+            FlatOp::StoreShortD16Hi,
+            None,
+            2,
+            Some(6),
+            offset,
+            false,
+        ));
+        assert!(r.bytes("g").iter().all(|&b| b == 0xee));
+        r.w.exec = u64::MAX;
+        r.fill_v(2, 2, 0);
+        r.fill_v(6, 1, 0);
+        r.drain().unwrap();
+        let mut want = vec![0xeeu8; 0x4000];
+        for lane in 0..WAVE {
+            if mask >> lane & 1 != 0 {
+                let start = (0x100 + lane * 4) as i64 + i64::from(offset);
+                let start = start as usize;
+                want[start..start + 2].copy_from_slice(&value(lane).to_le_bytes()[2..]);
+            }
+        }
+        assert_eq!(r.bytes("g"), want.as_slice());
+    }
+}
+
+#[test]
 fn global_load_samples_memory_at_retire() {
     let mut r = Rig::global(0x100);
     r.set_v64(2, |_| G + 0x20);

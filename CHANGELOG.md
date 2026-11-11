@@ -34,6 +34,10 @@
   - Speed (land build, `qwen4_kld speed --product-prompt`, TTFT median of reps 1-2 over 2 fresh processes per arm, `=0` -> default): 57 tokens 235.8 -> 62.0 ms (x0.263), 145 tokens 287.1 -> 124.0 ms (x0.432), 456 tokens 437.6 -> 399.1 ms (x0.912), 1,536 tokens 1,067.6 -> 994.0 ms (x0.931). A rocprofv3 trace of the 57-token prefill on the pre-rebase build counted 772 tile launches (204 ms) -> 97 (4.1 ms).
   - Served A/B (land build, `hipfire serve --spec off --continuous-batch-size 8`, closed-loop client, 16 requests per cell, ~51-token chat prompts with per-run nonces, greedy, 128 tokens, runs 2-4 of 4 per load; one discarded throwaway load, then 4 default + 4 `=0` fresh loads interleaved over two GPU holds; host loadavg 1.0-7.6; 95 % bootstrap CI over loads): C1 TTFT 249.3 -> 73.8 ms (x0.296 [0.2956, 0.2962]), aggregate 59.95 -> 65.25 tok/s (x1.088 [1.087, 1.091]); C8 TTFT 1,903 -> 498 ms (x0.262 [0.261, 0.262]), aggregate 150.85 -> 190.30 tok/s (x1.262 [1.259, 1.264]). 768 of 768 measured requests ok; every (run, request) text byte-identical across all loads, both arms and C1 / C8.
 
+## Unreleased
+
+- **Added (gfx942 typed 16-bit lowering): lossless sign-extended I16 literals, `v_lshrrev_b16`, and `flat/global/scratch_store_short_d16_hi`.** The existing codec preserves signed literal dwords rather than normalizing them to a different encoding; LLVM byte-oracle tests cover the new shift and high-half store. The CDNA simulator models the logical low-half shift and GLOBAL upper-half store with source/address/EXEC snapshots and untouched neighbor bytes. FLAT and SCRATCH simulation/certification remain fail-closed under their existing unsupported-segment rules.
+
 ## v0.4.5 — 2026-11-11 (re-cut)
 
 The v0.4.5 tag first pointed at `b30b46c1e2` (2026-10-30); that GitHub release was never published. v0.4.5 was re-cut at `7f7cf7f50f` and now includes everything below. If you fetched the October tag, run `git fetch --tags --force`.
