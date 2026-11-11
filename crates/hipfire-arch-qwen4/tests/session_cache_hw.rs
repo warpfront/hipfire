@@ -34,7 +34,8 @@
 //! `dflash2_terminal_stop_inside_window_repairs_on_flash_next` checks the same
 //! repair on the DFlash2 route (draft named by
 //! `HIPFIRE_SESSION_CACHE_DFLASH2_DRAFT`): every keep inside a fully accepted
-//! window leaves the state byte-equal to the same rows teacher-forced.
+//! window leaves the state byte-equal to the same rows forced in the repair's
+//! grouping (the replay as one block, then the flush row).
 //!
 //! Each test loads Flash-Next (tens of GiB of pinned host memory), so run them
 //! one per process thread and only inside a fabric hold that declares that
@@ -75,7 +76,7 @@ use hipfire_runtime::hfq::{HfqFile, HfqModelSource};
 use hipfire_runtime::model_source::SourcePayload;
 use hipfire_runtime::serve_contract::CacheDomain;
 use hipfire_runtime::session_cache::{SessionCache, SessionRoute, SessionState, SnapshotParts};
-use hipfire_runtime::spec::{MtpDrafter, SpecStep, Speculator};
+use hipfire_runtime::spec::{MtpDrafter, SpecStep, SpecTarget, Speculator};
 use hipfire_runtime::tokenizer::Tokenizer;
 use hipfire_runtime::weight_store::{fulfill_manifest_from_payloads, WeightOrigin};
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -1368,11 +1369,13 @@ fn dflash2_window(
 /// (`Speculator::repair_terminal_prefix`: the target restores the retained
 /// pre-window ticket and replays the seed plus the first `n - 1` consumed
 /// tokens; the caller flushes the `n`-th) leaves the target state
-/// byte-identical to the same history teacher-forced row by row, for every
-/// keep `n` from the first row to the whole window, and the live
-/// continuation of the next turn (seed and first window) matches. It also
-/// checks the ticket's lifetime: a repair at the wrong start refuses and
-/// keeps it, a repair runs once, and the next window replaces it.
+/// byte-identical to the same history forced in the repair's grouping (the
+/// pre-window rows one at a time, the replay as one block, then the flush
+/// row), for every keep `n` from the first row to the whole window, and the
+/// live continuation of the next turn (seed and first window) matches. It
+/// also checks the ticket's lifetime: a drafter refusal keeps it, a repair
+/// runs once, a forced advance or a target reset ends it (the target refuses
+/// and is unchanged), and the next window replaces it.
 ///
 /// `cargo test -p hipfire-arch-qwen4 --release --test session_cache_hw --
 /// --ignored dflash2_terminal_stop_inside_window_repairs_on_flash_next`
@@ -1398,8 +1401,10 @@ fn dflash2_terminal_stop_inside_window_repairs_on_flash_next() {
     .expect("DFlash2 speculator");
     let spec = speculator.as_mut();
     let never = || false;
-    // Counting text: the draft accepts whole windows.
-    let text: Vec<String> = (1..=300).map(|i| i.to_string()).collect();
+    // Counting text: the draft accepts whole windows. About 9.1K tokens, long
+    // enough that the windowed draft has trimmed its leading feature rows
+    // (`host_base` 6144) when the repair truncates them.
+    let text: Vec<String> = (1..=1700).map(|i| i.to_string()).collect();
     let a = tokenizer.encode(&text.join(", "));
     let suffix = tokenizer.encode(" And now count backwards from 50:");
 
@@ -1427,9 +1432,62 @@ fn dflash2_terminal_stop_inside_window_repairs_on_flash_next() {
         "a wrong start repairs nothing"
     );
     let once = spec.repair_terminal_prefix(&mut gpu, &mut bundle, start, seed, &emit[..1]);
-    assert!(once.expect("repair"), "a refused repair keeps the ticket");
+    assert!(once.expect("repair"), "a drafter refusal keeps the ticket");
     let twice = spec.repair_terminal_prefix(&mut gpu, &mut bundle, start, seed, &emit[..1]);
     assert!(!twice.expect("second repair"), "a repair runs once");
+    // `SpecTarget::repair_committed_prefix` is valid only before the next
+    // advance or reset: the target refuses and is left unchanged. Both pass
+    // the drafter's host-token check, so only the target guards them.
+    let target_state = |bundle: &mut Qwen4Bundle, gpu: &mut Gpu| {
+        let position =
+            SessionState::live_position(bundle, SessionRoute::Ar).expect("live position");
+        (
+            position,
+            state_digests(bundle, gpu, SessionRoute::Ar, position),
+        )
+    };
+    let end = start + emit.len();
+    rerun(spec, &mut bundle, &mut gpu);
+    assert!(spec
+        .on_forced_advance(&mut gpu, &mut bundle, &emit[emit.len() - 1..], end, &never)
+        .expect("advance past the window"));
+    let advanced = target_state(&mut bundle, &mut gpu);
+    let after_advance = spec.repair_terminal_prefix(&mut gpu, &mut bundle, start, seed, &emit[..1]);
+    assert!(
+        !after_advance.expect("repair after an advance"),
+        "a forced advance ends the window"
+    );
+    assert!(
+        target_state(&mut bundle, &mut gpu) == advanced,
+        "a refused repair leaves the target unchanged (advance)"
+    );
+    rerun(spec, &mut bundle, &mut gpu);
+    let window_history: Vec<u32> = a
+        .iter()
+        .chain(&before)
+        .chain(&emit[..emit.len() - 1])
+        .copied()
+        .collect();
+    SpecTarget::spec_advance(
+        &mut bundle,
+        &mut gpu,
+        &window_history,
+        0,
+        true,
+        &never,
+        None,
+    )
+    .expect("target reset to the window end");
+    let reset = target_state(&mut bundle, &mut gpu);
+    let after_reset = spec.repair_terminal_prefix(&mut gpu, &mut bundle, start, seed, &emit[..1]);
+    assert!(
+        !after_reset.expect("repair after a target reset"),
+        "a target reset ends the window"
+    );
+    assert!(
+        target_state(&mut bundle, &mut gpu) == reset,
+        "a refused repair leaves the target unchanged (reset)"
+    );
     dflash2_window(spec, &mut bundle, &mut gpu, &a, |i, _| i == k + 1);
     let stale = spec.repair_terminal_prefix(&mut gpu, &mut bundle, start, seed, &emit[..1]);
     assert!(
@@ -1485,12 +1543,14 @@ fn dflash2_terminal_stop_inside_window_repairs_on_flash_next() {
         let got = state_digests(&mut bundle, &mut gpu, SessionRoute::Ar, history.len());
         let got_next = continue_live(spec, &mut bundle, &mut gpu, &history);
 
-        // Reference: the same history teacher-forced one row at a time.
+        // Reference: the same history forced in the repair's grouping. Single
+        // rows are the DFlash2 verify's own rounding (row capture), so the
+        // pre-window rows go one at a time.
         spec.prefill(&mut gpu, &mut bundle, &a, &a, 0, false, None, &never)
             .expect("reference prefill");
         // The window's rows go through as the repair runs them: the replay as
-        // one block (a multi-row block rounds unlike single rows), then the
-        // flush.
+        // one block (an unarmed multi-row block rounds unlike single rows),
+        // then the flush.
         let replay: Vec<u32> = std::iter::once(seed)
             .chain(emit[..n - 1].iter().copied())
             .collect();
