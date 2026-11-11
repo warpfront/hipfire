@@ -1186,7 +1186,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1932
+**Count:** 1933
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -2018,7 +2018,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_HFQ6_REAL_X_ROW_DIV` | crates/rdna-compute/examples/test_moe_grouped_wmma_hfq6.rs | harness |
 | `HIPFIRE_HFQ_READER_CHUNK_MIB` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/src/hfq_parallel.rs | developer |
 | `HIPFIRE_HFQ_READER_LANES` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/src/hfq_parallel.rs | developer |
-| `HIPFIRE_HF_BASE` | crates/hipfire-cli/src/main.rs, crates/hipfire-config/src/lib.rs | stable |
+| `HIPFIRE_HF_BASE` | crates/hipfire-cli/src/main.rs, crates/hipfire-cli/src/pull_count.rs | stable |
 | `HIPFIRE_HIDDEN_SCATTER_FUSE_OFF` | crates/hipfire-arch-qwen35/examples/test_dflash_hidden_scatter_gfx1100.rs, crates/rdna-compute/src/feature_flags.rs | developer |
 | `HIPFIRE_HIPCC` | crates/hipfire-cli/src/main.rs, crates/hipfire-cli/src/setup.rs | developer |
 | `HIPFIRE_HIPCC_EXTRA_FLAGS` | .agents/skills/hipfire-autoheal/triage.sh, benchmarks/scripts/mq4v2_k5120_gfx1201_validate.sh | experimental |
@@ -2607,7 +2607,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_QWEN4_MOE_SCATTER_SCAN` | crates/rdna-compute/examples/moe_scatter_scan_oracle.rs, crates/rdna-compute/src/feature_flags.rs | developer |
 | `HIPFIRE_QWEN4_MOE_SYM_DOWN_RR` | crates/hipfire-kernel-abi/src/families/qwen4_moe_sym.rs, crates/rdna-compute/examples/pm_loop/moe.rs | developer |
 | `HIPFIRE_QWEN4_MOE_SYM_IU4` | crates/hipfire-arch-qwen4/src/gpu_forward.rs, crates/hipfire-arch-qwen4/src/gpu_forward/moe_down_a8.rs | developer |
-| `HIPFIRE_QWEN4_MOE_SYM_PM` | crates/hipfire-kernel-abi/src/families/qwen4_moe_sym.rs, crates/rdna-compute/examples/pm_loop/moe.rs | developer |
+| `HIPFIRE_QWEN4_MOE_SYM_PM` | crates/hipfire-arch-qwen35/src/qwen35/load.rs, crates/hipfire-kernel-abi/src/families/qwen4_moe_sym.rs | developer |
 | `HIPFIRE_QWEN4_MOE_X_LDS` | crates/rdna-compute/examples/qwen4_moe_f16_lds_oracle.rs, crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_QWEN4_MQ4_ROWS_PM` | crates/hipfire-arch-qwen4/examples/qwen4_gdn_in_probe.rs, crates/rdna-compute/src/gemv.rs | developer |
 | `HIPFIRE_QWEN4_MQ4_X4_PM` | crates/hipfire-arch-qwen4/tests/lm_head_long_output_hw.rs, crates/railgun-cert/src/recording.rs | developer |
@@ -2665,6 +2665,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_QWEN4_QSA_NORM_EPI` | crates/rdna-compute/src/gemm_mq6_i8.rs | developer |
 | `HIPFIRE_QWEN4_QSA_PM` | crates/peacemaker-isa/src/kernels/qsa_gather.rip.rs, crates/rdna-compute/examples/qsa_pm_check.rs | developer |
 | `HIPFIRE_QWEN4_QSA_POOLED_BF16` | crates/hipfire-arch-qwen4/examples/qwen4_qsa_arena_check.rs, crates/hipfire-arch-qwen4/src/state.rs | developer |
+| `HIPFIRE_QWEN4_QSA_Q8_GATHER_GFX1201` | crates/rdna-compute/src/tensor_ops.rs | developer |
 | `HIPFIRE_QWEN4_QSA_SCORES_RESERVE` | crates/rdna-compute/src/feature_flags.rs | developer |
 | `HIPFIRE_QWEN4_QSA_SCORE_PM` | crates/rdna-compute/examples/qsa_select_pm_check.rs, crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_QWEN4_QSA_SCORE_ROWS32` | crates/rdna-compute/src/tensor_ops.rs | developer |

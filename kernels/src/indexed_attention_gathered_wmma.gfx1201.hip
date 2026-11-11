@@ -4,8 +4,8 @@
 
 #include <hip/hip_runtime.h>
 
-// gfx12 twin of indexed_attention_gathered_wmma.gfx1151.hip for the fp8 QSA
-// state (the gfx1201 default): same algorithm, tiles and LDS layout; see that
+// gfx12 twin of indexed_attention_gathered_wmma.gfx1151.hip for the fp8 and
+// q8 QSA states: same algorithm, tiles and LDS layout; see that
 // file for the design.  Differences:
 //   * indexed_attention_kv_f16vb_fp8_gfx1201 decodes the fp8 rows (E4M3 code
 //     times the row's per-head f16 scale, as qsa_kv_value in tensor_ops.hip)
@@ -13,8 +13,11 @@
 //   * the gfx12 WMMA operand layout: a lane holds 8 K elements (lanes 0..15
 //     elements 0..7, lanes 16..31 elements 8..15) and accumulator element i
 //     of lane (l16, half) is matrix row i + 8 * half.
-// Not bit-exact against indexed_attention_attention_fp8_batched_hg4 (opt-in
-// until a KLD reference exists).
+// Not bit-exact against the hg4 references
+// (indexed_attention_attention_{fp8,q8}_batched_hg4). The q8 route is the
+// gfx1201 default (HIPFIRE_QWEN4_QSA_Q8_GATHER_GFX1201=0 keeps hg4): KLD 0.104
+// against q8 hg4 (2 x 2048 ctx, top-256), the same divergence as the gfx1151
+// default, which already is the gathered route.
 
 typedef _Float16 __attribute__((ext_vector_type(8))) qg_h8_t;
 typedef _Float16 __attribute__((ext_vector_type(4))) qg_h4_t;
@@ -51,6 +54,27 @@ extern "C" __global__ void indexed_attention_kv_f16vb_fp8_gfx1201(
     const qg_f2_t vp = __builtin_amdgcn_cvt_pk_f32_fp8((unsigned int)vr[c], false);
     k16[(size_t)tok * width + c] = (_Float16)(kp.x * ks);
     vb16[((size_t)(tok >> 2) * width + c) * 4 + (tok & 3)] = (_Float16)(vp.x * vs);
+}
+
+// Q8 twin for gfx12 (the gfx1151 indexed_attention_kv_f16vb_q8 arithmetic):
+// the cache rows are Q8_0 blocks (f16 scale + 32 int8 codes, 34 bytes;
+// kv_heads * 8 blocks per row, head-major), each element dequantized as
+// code * scale before the F16 rounding.  Grid [tokens, kv_heads], block 256.
+extern "C" __global__ void indexed_attention_kv_f16vb_q8_gfx1201(
+    const unsigned char* __restrict__ k, const unsigned char* __restrict__ v,
+    _Float16* __restrict__ k16, _Float16* __restrict__ vb16, int tokens, int kv_heads) {
+    const int tok = blockIdx.x;
+    const int head = blockIdx.y;
+    const int d = threadIdx.x;
+    const int width = kv_heads * 256;
+    if (tok >= tokens || head >= kv_heads) return;
+    const size_t block = (size_t)tok * kv_heads * 8 * 34 + (size_t)(head * 8 + (d >> 5)) * 34;
+    const float ks = (float)*reinterpret_cast<const _Float16*>(k + block);
+    const float vs = (float)*reinterpret_cast<const _Float16*>(v + block);
+    const int c = head * 256 + d;
+    k16[(size_t)tok * width + c] = (_Float16)((float)(signed char)k[block + 2 + (d & 31)] * ks);
+    vb16[((size_t)(tok >> 2) * width + c) * 4 + (tok & 3)] =
+        (_Float16)((float)(signed char)v[block + 2 + (d & 31)] * vs);
 }
 
 #define QG_TILE 128
