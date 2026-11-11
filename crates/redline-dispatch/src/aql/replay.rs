@@ -4100,4 +4100,87 @@ mod tests {
             CancelEvidence::InactivatedOnly
         );
     }
+
+    /// HIPF-347: every retained gfx10/gfx11 queue owns its lane's scratch ring
+    /// in `amd_queue_t`, which the command processor restores after a KFD
+    /// eviction; a queue without a ring keeps ROCr's zeros. Live GPU, opt-in:
+    /// `REDLINE_TEST_AQL=1` on a gfx10/gfx11 device.
+    #[test]
+    fn legacy_pm4_graphs_publish_each_lane_scratch_ring_when_enabled() {
+        use redline_rocr::{
+            Gfx10ScratchFamily, Gfx10ScratchPlan, GpuSelector, Runtime, load_symbols,
+        };
+        if std::env::var_os("REDLINE_TEST_AQL").is_none() {
+            return;
+        }
+        let runtime = Runtime::initialize(load_symbols().unwrap()).unwrap();
+        let device = runtime.select_gpu(GpuSelector::Ordinal(0)).unwrap();
+        let family = match &device.name()[..5] {
+            "gfx10" => Gfx10ScratchFamily::Gfx10,
+            "gfx11" => Gfx10ScratchFamily::Gfx11,
+            _ => return,
+        };
+        let pool = KernargPool::discover(&device).unwrap();
+        let local = KernargPool::discover_device_local(&device).unwrap();
+        let plan =
+            Gfx10ScratchPlan::new(family, device.scratch_topology().unwrap(), 512, 256 << 20)
+                .unwrap();
+        let backings = [(); 2].map(|()| {
+            local
+                .allocate_scratch_backing(plan.backing_bytes() as usize)
+                .unwrap()
+        });
+        let [a, b] = [0, 1].map(|i| plan.bind(backings[i].address() as u64).unwrap());
+        let stream = |ring: Option<Gfx10Scratch>| {
+            let mut commands = Gfx10Pm4CommandBuffer::new();
+            if let Some(ring) = ring {
+                commands = commands.with_scratch(ring);
+            }
+            commands.wait_compute_idle();
+            commands
+        };
+        let bound = |ring: &Gfx10Scratch| Some((ring.tmpring_size(), ring.base_address()));
+
+        let single =
+            SingleQueuePm4Ib::create_profiled_gfx11(&device, &pool, &stream(Some(a))).unwrap();
+        assert_eq!(single.queues.scratch_binding(0), bound(&a));
+        let with_ib_pool = SingleQueuePm4Ib::create_profiled_legacy_with_ib_pool(
+            &device,
+            &pool,
+            &local,
+            &stream(Some(b)),
+        )
+        .unwrap();
+        assert_eq!(with_ib_pool.queues.scratch_binding(0), bound(&b));
+        let ringless =
+            SingleQueuePm4Ib::create_profiled_gfx11(&device, &pool, &stream(None)).unwrap();
+        assert_eq!(ringless.queues.scratch_binding(0), Some((0, 0)));
+
+        let lanes = vec![stream(Some(a)), stream(Some(b))];
+        let phased = PhasedMultiQueuePm4Ib::create_profiled_gfx11(
+            &device,
+            &pool,
+            std::slice::from_ref(&lanes),
+        )
+        .unwrap();
+        let native = PhasedMultiQueuePm4Ib::create_profiled_native_gfx11(
+            &device,
+            &pool,
+            &[lanes.clone(), lanes],
+        )
+        .unwrap();
+        for graph in [&phased, &native] {
+            assert_eq!(graph.queues.scratch_binding(0), bound(&a));
+            assert_eq!(graph.queues.scratch_binding(1), bound(&b));
+        }
+        // Lane 0 cannot own two rings across phases.
+        assert!(matches!(
+            PhasedMultiQueuePm4Ib::create_profiled_gfx11(
+                &device,
+                &pool,
+                &[vec![stream(Some(a))], vec![stream(Some(b))]],
+            ),
+            Err(ReplayError::PolicyShapeMismatch { .. })
+        ));
+    }
 }
