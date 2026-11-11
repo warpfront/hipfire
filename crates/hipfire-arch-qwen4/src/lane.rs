@@ -2480,14 +2480,7 @@ impl Qwen4LaneStore {
         // A head owner (the single scope, every EP rank, the PP output band)
         // holds the MTP head; any other band that owns target layers holds
         // only its lanes' verify rings (target-only ownership).
-        let mut proto = LaneProto::new(copy.map(|c| c.ngram))?;
-        // G12 input: executor-local adapter, no scheduler interface changes. Exact gfx942 binds
-        // its lane cost profile (static drafting depth, `LaneCostProfile::gfx942`) through the
-        // existing `MeshRoot::bind_cost_arch` before the first lane is admitted; every other
-        // arch keeps the pooled legacy floor of this store.
-        if gpu.arch_caps.is_gfx942() {
-            proto.bind_cost_arch(&gpu.arch);
-        }
+        let proto = LaneProto::new(copy.map(|c| c.ngram), &gpu.arch)?;
         if let Some(spec) = spec {
             let verify_rows = if bundle.has_cpu_deferred_experts() {
                 crate::program::QWEN4_CPU_SPLICE_MAX_ROWS
