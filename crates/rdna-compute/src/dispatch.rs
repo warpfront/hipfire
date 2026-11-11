@@ -1742,6 +1742,8 @@ pub struct Gpu {
     pub flags: Arc<FeatureFlags>,
     pub arch_caps: crate::arch_caps::ArchCaps,
     pub device_id: i32,
+    /// Sticky across replay reset, model unload, and successful HIP waits.
+    retained_quarantine: crate::railgun_quarantine::RetainedReplayQuarantine,
     /// Memory the admitted context still needs, set by the loader after a
     /// measured post-load fit so optional per-request allocations (DeltaNet
     /// checkpoints beyond the charged one) yield to it. `None` = no floor.
@@ -2969,13 +2971,106 @@ impl Gpu {
     /// `crate::graph::bind_thread`.
     #[inline]
     pub fn bind_thread(&self) -> HipResult<()> {
+        self.refuse_retained_quarantine()?;
         crate::graph::bind_thread(&self.hip, self.device_id)
+    }
+
+    /// Refuse reuse after an independent retained queue lost retirement proof.
+    /// This does not wait or reset the device. Detach and retain owners now,
+    /// before a caller can replace public replay/graph fields. Drop repeats the
+    /// retention defensively. Repeated calls keep the first reason and safely
+    /// retain empty replacements or any subsequently installed owners.
+    pub fn quarantine_retained_replay_owners(&mut self, reason: impl Into<String>) {
+        // bind_thread: skip — host-only owner quarantine must not invoke HIP.
+        self.retained_quarantine.mark(reason);
+        self.retain_unknown_replay_owners();
+    }
+
+    #[inline]
+    fn refuse_retained_quarantine(&self) -> HipResult<()> {
+        self.retained_quarantine
+            .check()
+            .map_err(|reason| HipError::new(0, &reason))
+    }
+
+    fn retain_unknown_replay_owners(&mut self) {
+        // No bind, sync, unregister, unmap, or release is valid here. In
+        // particular, a successful HIP wait says nothing about PM4 retirement.
+        self.hip.retain_library_on_quarantine();
+        let owners = RetainedReplayOwnerBag {
+            pinned: self
+                .steady_readback_pinned
+                .get_mut()
+                .unwrap_or_else(|e| e.into_inner())
+                .take(),
+            host_leases: std::mem::replace(&mut self.host_leases, HostLeaseTable::new()),
+            mapped: self.slowlink_count_host.take(),
+            rocblas: self.rocblas.take(),
+            // Preserve prepared queues, HSA executable/kernarg owners, checks.
+            // Constructing the empty HIP controller makes no GPU call.
+            replay: std::mem::replace(
+                &mut self.replay,
+                crate::replay::ReplayController::new(crate::replay::ReplayBackendRequest::Hip),
+            ),
+            // hipGraphs retain pointers into these host-owned kernarg blobs.
+            graph_kernargs: (
+                std::mem::take(&mut self.graphs.capture_blobs),
+                std::mem::take(&mut self.graphs.ar_forward_blobs),
+                std::mem::take(&mut self.graphs.ar_segments),
+                std::mem::take(&mut self.graphs.verify.cache),
+                std::mem::take(&mut self.graphs.replay.cache),
+            ),
+        };
+        owners.retain();
+        #[cfg(feature = "kernel-timing")]
+        retain_taken(&mut self.kernel_timing_pool);
+        #[cfg(feature = "flash-attn-ck")]
+        {
+            retain_taken(&mut self.flash_attn_ck);
+            retain_taken(&mut self.flash_attn_ck_workspace);
+        }
+        // These descriptors have no HIP-free Drop today. Retain their owner
+        // registries too, so future metadata Drop cannot change the contract.
+        retain_taken(&mut self.modules);
+        retain_taken(&mut self.functions);
+        retain_taken(&mut self.vmm_arenas);
+        retain_taken(&mut self.orphan_vmm_arenas);
+        retain_taken(&mut self.host_mapped);
+        retain_taken(&mut self.device_wait);
+        retain_taken(&mut self.router_fault);
+        retain_taken(&mut self.active_stream);
+        retain_taken(&mut self.dflash_gdn_replay_scratch);
+        retain_taken(&mut self.fp16_shadow_cache);
+        retain_taken(&mut self.shared_i8_shadows);
+        retain_taken(&mut self.f16_shadow_arena);
+        std::mem::forget(std::mem::replace(
+            &mut self.pool,
+            crate::pool::GpuPool::new(),
+        ));
+        // Scratch's DeviceBuffer/GpuTensor/LaneWmmaScratch/GgmlScratch are
+        // explicit-free descriptors, with no physical-free Drop. Skipping the
+        // normal Drop body retains every scratch allocation, including AWQ.
+        // RouteLoad can own CPU compilation workers; do not join those while
+        // abandoning unknown GPU execution either.
+        retain_taken(&mut self.scratch.route_load);
+        // Opaque capture implementations may own more than host metadata.
+        retain_taken(&mut self.active_capture);
+        #[cfg(feature = "lab")]
+        {
+            retain_taken(&mut self.lab_projection_observer);
+            retain_taken(&mut self.lab_launch_observer);
+            retain_taken(&mut self.lab_g1_observer);
+        }
     }
 
     /// `bind_thread` for `&mut self -> ()` and `Drop` contexts. Delegates to
     /// `crate::graph::bind_thread_or_warn`.
     #[inline]
     pub fn bind_thread_or_warn(&self) {
+        if let Err(error) = self.refuse_retained_quarantine() {
+            eprintln!("[rdna-compute] {error}");
+            return;
+        }
         crate::graph::bind_thread_or_warn(&self.hip, self.device_id)
     }
 
@@ -3049,6 +3144,10 @@ impl Gpu {
                 ));
             }
         }
+        crate::railgun_quarantine::refuse_if_quarantined(
+            &crate::railgun_quarantine::DeviceKey::from_ordinal(id),
+        )
+        .map_err(|reason| HipError::new(0, &reason))?;
         let hip = HipRuntime::load()?;
         let count = hip.device_count()?;
         if count == 0 {
@@ -3060,6 +3159,13 @@ impl Gpu {
                 &format!("device id {id} out of range (count={count})"),
             ));
         }
+        let quarantine_device = hip
+            .device_pci_bus_id(id)
+            .map(|address| crate::railgun_quarantine::DeviceKey::from_pci(&address))
+            .unwrap_or_else(|_| crate::railgun_quarantine::DeviceKey::from_ordinal(id));
+        let retained_quarantine =
+            crate::railgun_quarantine::RetainedReplayQuarantine::for_device(quarantine_device, id)
+                .map_err(|reason| HipError::new(0, &reason))?;
         if let Ok(mode) = hipfire_config::developer_var("HIPFIRE_HIP_WAIT") {
             let mode_lc = mode.to_ascii_lowercase();
             let flags = match mode_lc.as_str() {
@@ -3214,6 +3320,7 @@ impl Gpu {
             flags,
             arch_caps,
             device_id: id,
+            retained_quarantine,
             moe_route_census: crate::gemm::MoeRouteLaunchCensus::default(),
             steady_readback_pinned: std::sync::Mutex::new(None),
             steady_readback_pinned_on: hipfire_config::developer_bool(
@@ -3466,6 +3573,11 @@ impl Gpu {
     /// symbol missing, handle init fail), logs once and leaves `None`.
     /// Callers always fall back to the non-rocBLAS path.
     pub fn try_init_rocblas(&mut self) {
+        // bind_thread: skip — reject quarantine before the existing device-binding path.
+        if let Err(error) = self.refuse_retained_quarantine() {
+            eprintln!("[rdna-compute] {error}");
+            return;
+        }
         self.bind_thread_or_warn();
         if self.rocblas.is_some() {
             return;
@@ -4536,6 +4648,7 @@ impl Gpu {
         railgun_words: &[railgun::kernel::DeclaredWord],
         blob_builder: impl FnOnce() -> hip_bridge::KernargBlob,
     ) -> HipResult<()> {
+        self.refuse_retained_quarantine()?;
         self.ensure_route_modules_preloaded()?;
         // Fail closed before the recorder / capture tapes see the launch: an
         // oversized grid.y/grid.z must never be recorded, captured, or clamped.
@@ -6289,6 +6402,10 @@ impl Gpu {
     /// Returns `true` if MMQ is safe for this weight, `false` if it should
     /// fall back to WMMA.
     pub fn mmq_screen_weight(&mut self, a_raw: &GpuTensor, m: usize, k: usize) -> bool {
+        // bind_thread: skip — reject quarantine before the existing device-binding path.
+        if self.refuse_retained_quarantine().is_err() {
+            return false;
+        }
         self.bind_thread_or_warn();
         let key = a_raw.buf.as_ptr() as usize;
         if let Some(&safe) = self.mmq_screen.cache.get(&key) {
@@ -8546,6 +8663,11 @@ impl Gpu {
     /// Release every lease of `prefix` and free its slab. Attempts everything and
     /// returns the first error.
     pub fn free_vmm_prefixes(&mut self, prefix: VmmPrefixSet) -> HipResult<()> {
+        // bind_thread: skip — reject quarantine before the existing device-binding path.
+        if let Err(error) = self.refuse_retained_quarantine() {
+            std::mem::forget(prefix);
+            return Err(error);
+        }
         // Release must run even when the thread bind fails, or the leases leak.
         self.bind_thread_or_warn();
         let VmmPrefixSet { entries, slab, .. } = prefix;
@@ -9869,6 +9991,11 @@ impl Gpu {
     /// Drain the GPU memory pool. Actually calls hipFree on all pooled buffers.
     /// Call after model unload to return VRAM to the system.
     pub fn drain_pool(&mut self) {
+        // bind_thread: skip — reject quarantine before the existing device-binding path.
+        if let Err(error) = self.refuse_retained_quarantine() {
+            eprintln!("[rdna-compute] {error}");
+            return;
+        }
         self.bind_thread_or_warn();
         self.pool.drain(&self.hip);
         self.hip.slab_flush();
@@ -9891,6 +10018,11 @@ impl Gpu {
     ///     entry returns to the pool, so a model swap never inherits one; a
     ///     tape that outlived the unload fails loudly at its next replay.
     pub fn invalidate_weight_caches(&mut self) {
+        // bind_thread: skip — reject quarantine before the existing device-binding path.
+        if let Err(error) = self.refuse_retained_quarantine() {
+            eprintln!("[rdna-compute] {error}");
+            return;
+        }
         self.bind_thread_or_warn();
         self.clear_shadow_borrow();
         self.mmq_screen.cache.clear();
@@ -10021,6 +10153,11 @@ impl Gpu {
     ///   * replay_graph_cache + replay_warmed_up + replay_capturing_n:
     ///     DFlash per-n_steps tape-replay graphs.
     pub fn invalidate_graph_state(&mut self) {
+        // bind_thread: skip — reject quarantine before the existing device-binding path.
+        if let Err(error) = self.refuse_retained_quarantine() {
+            eprintln!("[rdna-compute] {error}");
+            return;
+        }
         self.bind_thread_or_warn();
         self.graphs.graph_destroy(&self.hip, self.device_id);
         self.graphs
@@ -10537,6 +10674,11 @@ impl Gpu {
     /// layout switch so the next forward cannot replay stale K/V modes, base
     /// pointers, or kernarg blobs baked under the prior tier.
     pub fn invalidate_for_kv_mode_switch(&mut self) {
+        // bind_thread: skip — reject quarantine before the existing device-binding path.
+        if let Err(error) = self.refuse_retained_quarantine() {
+            eprintln!("[rdna-compute] {error}");
+            return;
+        }
         // bind_thread: skip — invalidate_graph_state binds; replay.poison is CPU.
         self.invalidate_graph_state();
         // Retained AQL/PM4 tapes capture KV base pointers and tier-dependent
@@ -10551,6 +10693,11 @@ impl Gpu {
     /// bucket grows. The allocation change is intentional and recoverable, so
     /// retained replay is re-armed rather than placed in sticky fallback.
     pub fn invalidate_for_layout_growth(&mut self) {
+        // bind_thread: skip — reject quarantine before the existing device-binding path.
+        if let Err(error) = self.refuse_retained_quarantine() {
+            eprintln!("[rdna-compute] {error}");
+            return;
+        }
         // bind_thread: skip — invalidate_graph_state binds; rearm is CPU.
         self.invalidate_graph_state();
         self.replay.rearm_after_layout_growth();
@@ -10577,6 +10724,10 @@ impl Gpu {
     /// Growth inside a capture keeps the historical behaviour (warmup-first
     /// flows size scratch before capturing, so this is not expected).
     pub fn invalidate_for_scratch_growth(&mut self) {
+        if let Err(error) = self.refuse_retained_quarantine() {
+            eprintln!("[rdna-compute] {error}");
+            return;
+        }
         // Every growth is announced here first: cached railgun skeletons key on
         // this epoch (pointers into a replaced scratch buffer go stale).
         crate::scratch::note_scratch_growth();
@@ -10754,6 +10905,16 @@ impl Gpu {
         crate::profiler::GpuCapability,
         Vec<crate::profiler::KernelProfile>,
     ) {
+        // bind_thread: skip — reject quarantine before the existing device-binding path.
+        if let Err(error) = self.refuse_retained_quarantine() {
+            eprintln!("[rdna-compute] {error}; profiling cached code without GPU queries");
+            return crate::profiler::profile_kernels_with_hint(
+                &self.arch,
+                0,
+                self.compiler.compiled_kernels(),
+                None,
+            );
+        }
         self.bind_thread_or_warn();
         let vram = self.hip.get_vram_info().map(|(_, t)| t as u64).unwrap_or(0);
         let cu_hint = self
@@ -10861,11 +11022,111 @@ pub fn lab_extract_device_bytes<'a>(image: &'a [u8], arch: &str) -> Option<&'a [
     crate::scratch::device_code_object(image, arch)
 }
 
+/// Owner roles whose automatic Drop can release execution resources or host
+/// kernargs. Real GPU fields populate this bag before Gpu's fields auto-drop.
+/// CPU tests check all roles together; hardware retirement still needs the
+/// source audit and a GPU oracle, not a fake or uninitialized Gpu.
+#[allow(dead_code)]
+struct RetainedReplayOwnerBag<P, H, M, B, R, G> {
+    pinned: P,
+    host_leases: H,
+    mapped: M,
+    rocblas: B,
+    replay: R,
+    graph_kernargs: G,
+}
+
+impl<P, H, M, B, R, G> RetainedReplayOwnerBag<P, H, M, B, R, G> {
+    fn retain(self) {
+        std::mem::forget(self);
+    }
+}
+
+/// Replace a quarantined owner with its genuine empty value before automatic
+/// field drop. Forgetting only `&mut owner` would still drop its fields.
+fn retain_taken<T: Default>(owner: &mut T) {
+    std::mem::forget(std::mem::take(owner));
+}
+
+#[cfg(test)]
+mod retained_replay_owner_tests {
+    use super::RetainedReplayOwnerBag;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    struct DropProbe(Arc<AtomicUsize>);
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn quarantine_bag_preserves_every_owned_role_after_outer_drop() {
+        let counts: Vec<_> = (0..7).map(|_| Arc::new(AtomicUsize::new(0))).collect();
+        let mut owners = Some(RetainedReplayOwnerBag {
+            pinned: DropProbe(Arc::clone(&counts[0])),
+            host_leases: std::collections::HashMap::from([(
+                7,
+                Arc::new(DropProbe(Arc::clone(&counts[1]))),
+            )]),
+            mapped: DropProbe(Arc::clone(&counts[2])),
+            rocblas: DropProbe(Arc::clone(&counts[3])),
+            replay: vec![DropProbe(Arc::clone(&counts[4]))],
+            graph_kernargs: vec![
+                vec![DropProbe(Arc::clone(&counts[5]))],
+                vec![DropProbe(Arc::clone(&counts[6]))],
+            ],
+        });
+        owners.take().unwrap().retain();
+        drop(owners);
+        for count in &counts {
+            assert_eq!(count.load(Ordering::SeqCst), 0);
+            assert_eq!(Arc::strong_count(count), 2);
+        }
+    }
+
+    #[test]
+    fn normal_bag_drop_releases_every_role_once() {
+        let counts: Vec<_> = (0..6).map(|_| Arc::new(AtomicUsize::new(0))).collect();
+        let owners = RetainedReplayOwnerBag {
+            pinned: DropProbe(Arc::clone(&counts[0])),
+            host_leases: DropProbe(Arc::clone(&counts[1])),
+            mapped: DropProbe(Arc::clone(&counts[2])),
+            rocblas: DropProbe(Arc::clone(&counts[3])),
+            replay: DropProbe(Arc::clone(&counts[4])),
+            graph_kernargs: DropProbe(Arc::clone(&counts[5])),
+        };
+        drop(owners);
+        for count in &counts {
+            assert_eq!(count.load(Ordering::SeqCst), 1);
+            assert_eq!(Arc::strong_count(count), 1);
+        }
+    }
+
+    #[test]
+    fn raw_hip_handles_have_no_automatic_release() {
+        // The quarantine branch skips their explicit release sites. If these
+        // wrappers gain RAII, the inventory must be revisited.
+        assert!(!std::mem::needs_drop::<hip_bridge::Module>());
+        assert!(!std::mem::needs_drop::<hip_bridge::Function>());
+        assert!(!std::mem::needs_drop::<hip_bridge::Stream>());
+        assert!(!std::mem::needs_drop::<hip_bridge::Graph>());
+        assert!(!std::mem::needs_drop::<hip_bridge::GraphExec>());
+    }
+}
+
 impl Drop for Gpu {
     /// Defensive: bind owning device before any future per-field `Drop`
     /// impls call `hipFree` etc. Uses `bind_thread_or_warn` to avoid
     /// panic-in-Drop from `bind_thread`'s `debug_assert!`.
     fn drop(&mut self) {
+        if self.refuse_retained_quarantine().is_err() {
+            self.retain_unknown_replay_owners();
+            return;
+        }
         // Before any bind/free: drop every registered module handle while the
         // runtime and `self.modules` are still alive (no-op unless flagged).
         crate::scratch::qsa_code_check_unregister_all(&self.modules);

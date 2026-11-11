@@ -13,12 +13,18 @@
 //! registration on that device is refused with
 //! `railgun::window::FailureKind::DeviceQuarantined`.
 //!
+//! A retained replay with unknown quiescence also quarantines its owning
+//! `Gpu`: HIP stream/device synchronization is not retirement evidence for an
+//! independent PM4/AQL queue. Its owners are retained and later GPU use/init is
+//! refused through this same registry.
+//!
 //! Quarantine is cleared only by restarting the process: no device-reset API
 //! exists in `hip-bridge` or `redline-rocr` (a search for `hipDeviceReset` /
 //! `device_reset` found nothing). The first recorded reason for a device wins.
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 /// Identity of a device for quarantine: `pci:<domain:bus:dev.fn>` when the PCI
@@ -44,6 +50,54 @@ impl fmt::Display for DeviceKey {
 
 /// Device key -> first quarantine reason.
 static REGISTRY: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
+/// Keep the ordinary GPU bind path lock-free before the first quarantine.
+static ANY_QUARANTINED: AtomicBool = AtomicBool::new(false);
+
+/// Per-GPU sticky refusal and the device identities used at re-initialization.
+/// CPU-testable without constructing a GPU or invoking HIP.
+pub(crate) struct RetainedReplayQuarantine {
+    device: DeviceKey,
+    ordinal: DeviceKey,
+    reason: Option<String>,
+}
+
+impl RetainedReplayQuarantine {
+    pub(crate) fn for_device(device: DeviceKey, ordinal: i32) -> Result<Self, String> {
+        let ordinal = DeviceKey::from_ordinal(ordinal);
+        refuse_if_quarantined(&device)?;
+        refuse_if_quarantined(&ordinal)?;
+        Ok(Self {
+            device,
+            ordinal,
+            reason: None,
+        })
+    }
+
+    pub(crate) fn mark(&mut self, reason: impl Into<String>) {
+        if self.reason.is_some() {
+            return;
+        }
+        let reason = reason.into();
+        quarantine(&self.device, reason.clone());
+        quarantine(&self.ordinal, reason.clone());
+        self.reason = quarantine_reason(&self.device).or(Some(reason));
+    }
+
+    #[inline]
+    pub(crate) fn check(&self) -> Result<(), String> {
+        if let Some(reason) = self.reason.as_ref() {
+            return Err(format!(
+                "device {} retained replay quiescence is unknown; GPU owners retained and reuse refused until process restart: {reason}",
+                self.device
+            ));
+        }
+        if ANY_QUARANTINED.load(Ordering::Acquire) {
+            refuse_if_quarantined(&self.device)?;
+            refuse_if_quarantined(&self.ordinal)?;
+        }
+        Ok(())
+    }
+}
 
 /// Quarantine `key` until process restart. The first reason wins.
 pub(crate) fn quarantine(key: &DeviceKey, reason: impl Into<String>) {
@@ -54,6 +108,7 @@ pub(crate) fn quarantine(key: &DeviceKey, reason: impl Into<String>) {
     }
     eprintln!("[railgun] device {key} quarantined until process restart: {reason}");
     registry.insert(key.0.clone(), reason);
+    ANY_QUARANTINED.store(true, Ordering::Release);
 }
 
 /// Why `key` is quarantined, or `None` when it is not.
@@ -70,22 +125,59 @@ pub(crate) fn refuse_if_quarantined(key: &DeviceKey) -> Result<(), String> {
     match quarantine_reason(key) {
         None => Ok(()),
         Some(reason) => Err(format!(
-            "device {key} is quarantined for railgun submits until process restart (no device reset API exists in hip-bridge/redline-rocr): {reason}"
+            "device {key} is quarantined for GPU work until process restart (no device reset API exists in hip-bridge/redline-rocr): {reason}"
         )),
     }
 }
 
 #[cfg(test)]
 pub(crate) fn clear_for_test(key: &DeviceKey) {
-    REGISTRY
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&key.0);
+    let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    registry.remove(&key.0);
+    ANY_QUARANTINED.store(!registry.is_empty(), Ordering::Release);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_replay_refuses_reuse_and_reinit_with_first_reason() {
+        let device = DeviceKey::from_pci("test:retained-gpu");
+        let ordinal = DeviceKey::from_ordinal(19001);
+        let mut state = RetainedReplayQuarantine::for_device(device.clone(), 19001).unwrap();
+        assert!(state.check().is_ok());
+        state.mark("independent PM4 wait lost retirement evidence");
+        state.mark("later HIP sync succeeded");
+        let error = state.check().unwrap_err();
+        assert!(error.contains("independent PM4 wait lost retirement evidence"));
+        assert!(!error.contains("later HIP sync succeeded"));
+        // This is the exact admission policy used by Gpu::init_with_device.
+        let replacement = RetainedReplayQuarantine::for_device(device.clone(), 19001);
+        assert!(replacement.is_err());
+        assert!(refuse_if_quarantined(&ordinal).is_err());
+        clear_for_test(&device);
+        clear_for_test(&ordinal);
+        // Registry clearing exists only under cfg(test). Even that does not
+        // reset the already-marked object's sticky refusal.
+        assert!(state.check().is_err());
+    }
+
+    #[test]
+    fn retained_replay_quarantine_blocks_other_live_owner_of_same_device() {
+        let device = DeviceKey::from_pci("test:retained-alias");
+        let ordinal = DeviceKey::from_ordinal(19002);
+        let mut first = RetainedReplayQuarantine::for_device(device.clone(), 19002).unwrap();
+        let second = RetainedReplayQuarantine::for_device(device.clone(), 19002).unwrap();
+        let healthy_key = DeviceKey::from_pci("test:retained-healthy");
+        let healthy = RetainedReplayQuarantine::for_device(healthy_key, 19003).unwrap();
+        first.mark("unknown AQL completion");
+        assert!(first.check().is_err());
+        assert!(second.check().is_err());
+        assert!(healthy.check().is_ok());
+        clear_for_test(&device);
+        clear_for_test(&ordinal);
+    }
 
     #[test]
     fn quarantine_then_refuse_carries_reason() {
