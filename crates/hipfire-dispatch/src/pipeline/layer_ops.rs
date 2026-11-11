@@ -1258,14 +1258,14 @@ fn project_rotated(
     hip(result)
 }
 
-/// `HIPFIRE_QWEN4_G942_FOLD_ELEM` (read once; default off until the Route-A twin of
-/// `kernels/src/qwen4_g942_glue_elem.hip` is sealed, `=1` on, `=0` off): the gfx942 C1
+/// `HIPFIRE_QWEN4_G942_FOLD_ELEM` (read once; default on, the Route-A twin of
+/// `kernels/src/qwen4_g942_glue_elem.hip` is sealed; `=0` off): the gfx942 C1
 /// elementwise folds. Today: the HC read's few-row down GEMM carries its activation
 /// chain (`bf16_roundtrip_f32`, `scale_f32`, `bf16_roundtrip_f32`, `silu_f32`,
 /// `bf16_roundtrip_f32`) as its output epilogue, six launches to one, bitwise.
 fn g942_fold_elem() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        hipfire_config::developer_bool("HIPFIRE_QWEN4_G942_FOLD_ELEM", false)
+        hipfire_config::developer_bool("HIPFIRE_QWEN4_G942_FOLD_ELEM", true)
     });
     *ON
 }
