@@ -1021,7 +1021,12 @@ mod tests {
             let stats = unsafe { read_ranges_into_host(&source, &copies, tuning) }.unwrap();
             assert_eq!(&dst, &bytes[..dst.len()]);
             #[cfg(target_os = "linux")]
-            if cold && source.is_direct_available() {
+            // Chunks that do not tile the residency boundary straddle it, so
+            // the direct/buffered split is only defined for tilings.
+            if cold
+                && source.is_direct_available()
+                && DIRECT_CHUNK_BYTES.is_multiple_of(tuning.chunk_bytes)
+            {
                 assert!(stats.bytes_direct >= DIRECT_CHUNK_BYTES as u64);
                 assert!(stats.bytes_buffered >= DIRECT_CHUNK_BYTES as u64);
             }
