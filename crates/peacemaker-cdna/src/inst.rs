@@ -298,10 +298,7 @@ impl Inst {
             Err(e) => return RowStatus::Unknown(e),
         };
         match crate::xml::decode(crate::xml_inst::isa(arch), &words) {
-            Ok((d, _)) => status(match d.form.verification {
-                crate::xml::Verification::Verified => Ok(()),
-                crate::xml::Verification::Unverified(why) => Err(why),
-            }),
+            Ok((d, _)) => status(XmlInst::verification_of(&d)),
             Err(e) => RowStatus::Unknown(format!("no XML row for the encoding: {e}")),
         }
     }

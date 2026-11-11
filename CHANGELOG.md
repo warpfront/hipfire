@@ -33,6 +33,7 @@
 ## Unreleased
 
 - PeaceMaker CDNA: generate complete gfx942 encoding/operand tables and gfx950 decode-only tables from AMD's ISA XML. Preserve hand-written simulator semantics; newly decoded instructions refuse unsupported simulation by name. Record every LLVM row cross-check; unverified XML/LLVM disagreements cannot be emitted or sealed.
+- CDNA XML decoding preserves verified forms outside the typed model without granting simulator or sealing support; FP8 MoE's exact SDWA WORD_1 conversion fields are verified by the bound 109-case MI300X oracle, while other unverified combinations remain blocked.
 
 ## v0.4.6 — 2026-11-11
 

@@ -93,8 +93,8 @@ mod generated_cdna4;
 
 pub use arch::{Arch, Caps};
 pub use inst::{decode_all, encode_all, Format, Inst, RowStatus};
-pub use xml_inst::XmlInst;
 pub use operand::Src;
+pub use xml_inst::{FieldReceipt, XmlInst, FIELD_RECEIPTS, V_CVT_PK_F32_FP8_SDWA_WORD1};
 
 pub type Result<T, E = String> = std::result::Result<T, E>;
 

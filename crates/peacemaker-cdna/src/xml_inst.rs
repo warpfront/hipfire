@@ -31,7 +31,10 @@
 //! The emulator never executes an [`XmlInst`] (no hand-written semantics) and
 //! refuses it by name ([`XmlInst::unsupported`]); a row the LLVM cross-check
 //! could not confirm is *unverified* ([`XmlInst::verification`]): it decodes
-//! but [`XmlInst::encode`] refuses it. gfx950 is decode-only.
+//! but [`XmlInst::encode`] refuses it. A [`FieldReceipt`] promotes only the
+//! instances inside one hardware-proven field combination of such a row
+//! ([`XmlInst::verification_of`]); the row itself stays unverified. gfx950 is
+//! decode-only.
 use crate::arch::Arch;
 use crate::inst::{Footprint, Format, MemKind, RegFile};
 use crate::operand::Src;
@@ -57,6 +60,96 @@ pub(crate) fn isa(arch: Arch) -> Isa {
         Arch::Gfx950 => Isa::Cdna4,
     }
 }
+
+/// A hardware receipt that confirms one field combination of an XML row the
+/// LLVM cross-check left unverified. It never confirms the row: an instance
+/// is covered only when every field of its encoding, except the `free`
+/// register-number fields, equals the value in `fixed` (a field named in
+/// neither is not covered).
+#[derive(Debug)]
+pub struct FieldReceipt {
+    pub isa: Isa,
+    /// XML `InstructionName` of the row.
+    pub name: &'static str,
+    /// XML encoding name of the row.
+    pub encoding: &'static str,
+    /// Proven value of every non-register field.
+    pub fixed: &'static [(&'static str, u64)],
+    /// Register-number fields that may take any value.
+    pub free: &'static [&'static str],
+    /// The committed twin receipt carrying the `gpu_oracle` block.
+    pub twin_receipt: &'static str,
+    /// The hardware oracle receipt (`moe-twin-oracle.json`, on `mi300x`:
+    /// `/scratch/quant/fn-fp8/beat/moe-twin-oracle.json`) and its sha256.
+    pub oracle_receipt: &'static str,
+    pub oracle_sha256: &'static str,
+    /// The anchor (hipcc image) and the twin `.hxaco` it was compared with.
+    pub anchor_sha256: &'static str,
+    pub twin_sha256: &'static str,
+    /// What the receipt proved, and where the combination occurs.
+    pub evidence: &'static str,
+}
+
+impl FieldReceipt {
+    /// Whether `d` is exactly inside the proven combination.
+    pub fn covers(&self, d: &Decoded) -> bool {
+        d.form.isa == self.isa
+            && d.form.name == self.name
+            && d.form.encoding == self.encoding
+            && d.form.fields.iter().all(|fl| {
+                self.free.contains(&fl.name)
+                    || self
+                        .fixed
+                        .iter()
+                        .find(|(n, _)| *n == fl.name)
+                        .is_some_and(|&(n, v)| d.field(n) == Some(v))
+            })
+    }
+}
+
+/// Every hardware receipt that promotes an instance of an unverified row.
+pub static FIELD_RECEIPTS: &[&FieldReceipt] = &[&V_CVT_PK_F32_FP8_SDWA_WORD1];
+
+/// `v_cvt_pk_f32_fp8_sdwa vdst[2], vsrc0 src0_sel:WORD_1` (dst_sel DWORD,
+/// dst_unused PAD, no clamp/omod/sext/neg/abs, src1 fields zero), the 32 SDWA
+/// instructions (words `0x7e??acf9, 0x000506??`) of the gfx942 FP8 grouped MoE
+/// anchor `gemm_fp8b128_moe_grouped_bf16mfma`. The twin `.hxaco` carries the
+/// anchor's device ELF byte for byte (sha256 8359a935...), and the oracle
+/// executed both through the full `test_fp8_moe_gfx942` matrix.
+pub static V_CVT_PK_F32_FP8_SDWA_WORD1: FieldReceipt = FieldReceipt {
+    isa: Isa::Cdna3,
+    name: "V_CVT_PK_F32_FP8",
+    encoding: "VOP1_VOP_SDWA",
+    fixed: &[
+        ("ENCODING", 0x3f),
+        ("OP", 86),
+        ("SRC0", 0xf9),
+        ("S0", 0),
+        ("S1", 0),
+        ("DST_SEL", 6),
+        ("DST_UNUSED", 0),
+        ("CLAMP", 0),
+        ("OMOD", 0),
+        ("SRC0_SEL", 5),
+        ("SRC0_SEXT", 0),
+        ("SRC0_NEG", 0),
+        ("SRC0_ABS", 0),
+        ("SRC1_SEL", 0),
+        ("SRC1_SEXT", 0),
+        ("SRC1_NEG", 0),
+        ("SRC1_ABS", 0),
+    ],
+    free: &["VDST", "VSRC0"],
+    twin_receipt: "kernels/gemm_fp8b128_moe_grouped_bf16mfma_pm_gfx942.twin.json#gpu_oracle",
+    oracle_receipt: "mi300x/beat/Twin/moe-twin-oracle.json",
+    oracle_sha256: "2b6842e984b63540443e9f11efdf15744c8f90cbf69c2fad0879f06a2878456c",
+    anchor_sha256: "08ebe4036da4c71b2c5d685af77a6a3692b975a2a28839c3683200dca2de10c0",
+    twin_sha256: "fc16c27637517e54f078c25f3f9166d2663df10a840badda4f83ecc69008ea44",
+    evidence: "gfx942 device 0: 109/109 cases PASS, 12828 launches each of \
+gemm_fp8b128_moe_grouped_bf16mfma and _xbf16 bitwise equal anchor vs twin \
+(device ELF sha256 8359a935d4dc453a76f4856d8dbba5d2230e4957c3a966de982c6308b549ea65 \
+identical); 32 SDWA instances in the device ELF, all WORD_1",
+};
 
 impl XmlInst {
     /// Decode the instruction at `words[0]` for `arch` from the generated
@@ -107,7 +200,11 @@ impl XmlInst {
         }
         self.verification()
             .map_err(|why| format!("unverified encoding: {}: {why}", self.name()))?;
-        xml::encode(&self.decoded, out)
+        // `xml::encode` refuses every row the LLVM cross-check left
+        // unverified; the per-instance gate above is the finer one.
+        let (words, n) = self.decoded.assemble()?;
+        out.extend_from_slice(&words[..n]);
+        Ok(())
     }
 
     /// The decoded row and field values.
@@ -139,16 +236,43 @@ impl XmlInst {
     pub fn field(&self, name: &str) -> Option<u64> {
         self.decoded.field(name)
     }
-    /// `Ok` for a row the LLVM cross-check confirmed; `Err(reason)` for an
-    /// unverified row (recognized by decode, refused by encode and by seals).
+    /// `Ok` for an instruction the LLVM cross-check or a field-specific
+    /// hardware receipt confirmed; `Err(reason)` for an unverified one
+    /// (recognized by decode, refused by encode and by seals). Per instance:
+    /// see [`XmlInst::verification_of`].
     pub fn verification(&self) -> std::result::Result<(), &'static str> {
-        match self.decoded.form.verification {
-            Verification::Verified => Ok(()),
-            Verification::Unverified(why) => Err(why),
-        }
+        Self::verification_of(&self.decoded)
     }
     pub fn verified(&self) -> bool {
         self.verification().is_ok()
+    }
+    /// Per-instance verification of a decoded XML value (also the one the
+    /// words of a typed instruction decode to through [`xml::decode`]). A row
+    /// the LLVM cross-check confirmed is `Ok` for every instance. An
+    /// unverified row is `Ok` only for an instance whose every field outside
+    /// a [`FieldReceipt`]'s free (register-number) fields equals the
+    /// combination that receipt proved on hardware; every other instance
+    /// keeps the row's refusal.
+    pub fn verification_of(d: &Decoded) -> std::result::Result<(), &'static str> {
+        match d.form.verification {
+            Verification::Verified => Ok(()),
+            Verification::Unverified(why) => match Self::receipt_of(d) {
+                Some(_) => Ok(()),
+                None => Err(why),
+            },
+        }
+    }
+    /// The hardware receipt that promotes this instruction, if one does.
+    pub fn receipt(&self) -> Option<&'static FieldReceipt> {
+        Self::receipt_of(&self.decoded)
+    }
+    /// [`XmlInst::receipt`] for a decoded value: `Some` only when `d`'s row is
+    /// unverified and `d` is inside a receipt's proven field combination.
+    pub fn receipt_of(d: &Decoded) -> Option<&'static FieldReceipt> {
+        if d.form.verification.is_verified() {
+            return None;
+        }
+        FIELD_RECEIPTS.iter().copied().find(|r| r.covers(d))
     }
     /// Registers read and written, explicit and implicit, from the XML row.
     pub fn footprint(&self) -> Footprint {
@@ -198,7 +322,10 @@ fn format_of(encoding: &str) -> Option<Format> {
         "ENC_SOPP" => Format::Sopp,
         "ENC_SMEM" => Format::Smem,
         "ENC_VOP1" | "VOP1_INST_LITERAL" | "VOP1_VOP_DPP" | "VOP1_VOP_SDWA" => Format::Vop1,
-        "ENC_VOP2" | "VOP2_INST_LITERAL" | "VOP2_VOP_DPP" | "VOP2_VOP_SDWA"
+        "ENC_VOP2"
+        | "VOP2_INST_LITERAL"
+        | "VOP2_VOP_DPP"
+        | "VOP2_VOP_SDWA"
         | "VOP2_VOP_SDWA_SDST_ENC" => Format::Vop2,
         "ENC_VOPC" | "VOPC_INST_LITERAL" | "VOPC_VOP_SDWA_SDST_ENC" => Format::Vopc,
         "ENC_VOP3" | "VOP3_SDST_ENC" => Format::Vop3,
@@ -309,7 +436,8 @@ impl Cx<'_> {
         if code == 254 && lds_ok {
             return Ok(Val::LdsDirect);
         }
-        let code16 = u16::try_from(code).map_err(|_| format!("operand code {code} out of range"))?;
+        let code16 =
+            u16::try_from(code).map_err(|_| format!("operand code {code} out of range"))?;
         let mut src = Src::from_code(code16, self.d.literal())?;
         if acc {
             if let Src::Vgpr(r) = src {
@@ -335,7 +463,13 @@ impl Cx<'_> {
             .field(name)
             .ok_or_else(|| format!("operand field {name} is absent from the decoded row"))?;
         match op.kind {
-            K::Simm16 | K::Simm32 | K::Simm4 | K::Simm8 | K::Label | K::Hwreg | K::Sendmsg
+            K::Simm16
+            | K::Simm32
+            | K::Simm4
+            | K::Simm8
+            | K::Label
+            | K::Hwreg
+            | K::Sendmsg
             | K::Waitcnt => Ok(Val::Imm(code)),
             K::SmemOffset => self.smem_offset(),
             K::Vgpr => {
@@ -387,13 +521,26 @@ impl Cx<'_> {
             K::SrcVgprOrAccvgpr | K::SrcVgprOrAccvgprOrConst => {
                 self.source(op.kind, code, n, self.acc(name))
             }
-            K::Vcc | K::SdstExec | K::SdstM0 | K::SsrcSpecialScc | K::FlatScratch | K::Pc
-            | K::Dsmem | K::Gpumem => Err(format!(
+            K::Vcc
+            | K::SdstExec
+            | K::SdstM0
+            | K::SsrcSpecialScc
+            | K::FlatScratch
+            | K::Pc
+            | K::Dsmem
+            | K::Gpumem => Err(format!(
                 "operand {name} of kind {:?} carries a field but is an implicit register",
                 op.kind
             )),
-            K::Src | K::SrcSimple | K::SrcNolit | K::SrcNolds | K::Ssrc | K::SsrcNolit
-            | K::SsrcLanesel | K::SrcVgpr | K::VgprOrLds => {
+            K::Src
+            | K::SrcSimple
+            | K::SrcNolit
+            | K::SrcNolds
+            | K::Ssrc
+            | K::SsrcNolit
+            | K::SsrcLanesel
+            | K::SrcVgpr
+            | K::VgprOrLds => {
                 // SDWA / DPP: VSRC0 / VSRC1 are 8-bit; S0 / S1 pick scalar
                 // (code below 256) or VGPR.
                 let code = match name {
@@ -452,7 +599,9 @@ impl Cx<'_> {
 
     fn memory_kind(&self, lds_direct: bool) -> Option<MemKind> {
         let ret_vdata = self.form.operands.iter().any(|o| {
-            o.output && o.field.is_some_and(|f| matches!(f, "VDST" | "VDATA" | "SDATA"))
+            o.output
+                && o.field
+                    .is_some_and(|f| matches!(f, "VDST" | "VDATA" | "SDATA"))
         });
         let atomic = self.form.subgroups.contains(&"ATOMIC");
         match self.form.encoding {
@@ -585,7 +734,9 @@ impl Cx<'_> {
             "ENC_VOP1" | "VOP1_INST_LITERAL" | "ENC_VOP2" | "VOP2_INST_LITERAL" | "ENC_VOPC"
             | "VOPC_INST_LITERAL" => "_e32",
             "VOP1_VOP_DPP" | "VOP2_VOP_DPP" => "_dpp",
-            "VOP1_VOP_SDWA" | "VOP2_VOP_SDWA" | "VOP2_VOP_SDWA_SDST_ENC"
+            "VOP1_VOP_SDWA"
+            | "VOP2_VOP_SDWA"
+            | "VOP2_VOP_SDWA_SDST_ENC"
             | "VOPC_VOP_SDWA_SDST_ENC" => "_sdwa",
             "ENC_VOP3" | "VOP3_SDST_ENC" if self.form.opcode < 0x1c0 => "_e64",
             _ => "",
@@ -610,7 +761,8 @@ impl Cx<'_> {
                     ((code >> 11) & 0x1f) + 1
                 ),
                 K::Waitcnt => {
-                    let (vm, exp, lgkm) = crate::enc::sop::waitcnt_fields(self.arch(), *code as u16);
+                    let (vm, exp, lgkm) =
+                        crate::enc::sop::waitcnt_fields(self.arch(), *code as u16);
                     format!("vmcnt({vm}) expcnt({exp}) lgkmcnt({lgkm})")
                 }
                 _ => format!("{code:#x}"),
@@ -732,13 +884,19 @@ impl Cx<'_> {
                 if v == 6 {
                     return None;
                 }
-                format!("{lower}:{}", SEL.get(v as usize).copied().unwrap_or("RESERVED"))
+                format!(
+                    "{lower}:{}",
+                    SEL.get(v as usize).copied().unwrap_or("RESERVED")
+                )
             }
             "DST_UNUSED" => {
                 if v == 0 {
                     return None;
                 }
-                format!("dst_unused:{}", UNUSED.get(v as usize).copied().unwrap_or("RESERVED"))
+                format!(
+                    "dst_unused:{}",
+                    UNUSED.get(v as usize).copied().unwrap_or("RESERVED")
+                )
             }
             "ROW_MASK" | "BANK_MASK" => {
                 if v == 0xf {
@@ -751,7 +909,11 @@ impl Cx<'_> {
                 if v == 0 && name != "OP_SEL_HI" {
                     return None;
                 }
-                let n = if name == "OP_SEL" && self.is("ENC_VOP3") { 4 } else { 3 };
+                let n = if name == "OP_SEL" && self.is("ENC_VOP3") {
+                    4
+                } else {
+                    3
+                };
                 let bits: Vec<String> = (0..n).map(|i| (v >> i & 1).to_string()).collect();
                 format!("{lower}:[{}]", bits.join(","))
             }

@@ -303,9 +303,7 @@ pub fn waitcnt_imm(arch: Arch, vm: u8, exp: u8, lgkm: u8) -> Result<u16> {
     }
     let (vm, exp, lgkm) = (u16::from(vm), u16::from(exp), u16::from(lgkm));
     Ok(match arch {
-        Arch::Gfx942 | Arch::Gfx950 => {
-            (vm & 0xf) | (vm >> 4) << 14 | exp << 4 | lgkm << 8
-        }
+        Arch::Gfx942 | Arch::Gfx950 => (vm & 0xf) | (vm >> 4) << 14 | exp << 4 | lgkm << 8,
     })
 }
 /// Inverse of [`waitcnt_imm`]: `(vm, exp, lgkm)`. Unused SIMM16 bits are
