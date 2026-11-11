@@ -21953,7 +21953,7 @@ impl Gpu {
         c16_alpha: [u32; 4],
     ) -> HipResult<()> {
         self.lloyd_mmq_family_gate("gemm_qkvza_mq4g256v2_mmq_lloyd", k, batch_size)?;
-        if batch_size < 64 {
+        if batch_size < 64 && !self.ordinary_prefill_active() {
             self.lloyd_mmq_set_gemv_rows(a_qkv, x, y_qkv, qkv_m, k, batch_size, c16_qkv)?;
             self.lloyd_mmq_set_gemv_rows(a_z, x, y_z, z_m, k, batch_size, c16_z)?;
             self.lloyd_mmq_set_gemv_rows(a_beta, x, y_beta, beta_m, k, batch_size, c16_beta)?;
@@ -22029,7 +22029,7 @@ impl Gpu {
         c16_v: [u32; 4],
     ) -> HipResult<()> {
         self.lloyd_mmq_family_gate("gemm_qkv_mq4g256v2_mmq_lloyd", k, batch_size)?;
-        if batch_size < 64 {
+        if batch_size < 64 && !self.ordinary_prefill_active() {
             self.lloyd_mmq_set_gemv_rows(a_q, x, y_q, q_m, k, batch_size, c16_q)?;
             self.lloyd_mmq_set_gemv_rows(a_k, x, y_k, k_m, k, batch_size, c16_k)?;
             self.lloyd_mmq_set_gemv_rows(a_v, x, y_v, v_m, k, batch_size, c16_v)?;
@@ -22079,7 +22079,7 @@ impl Gpu {
         c16_up: [u32; 4],
     ) -> HipResult<()> {
         self.lloyd_mmq_family_gate("gemm_gate_up_mq4g256v2_mmq_lloyd", k, batch_size)?;
-        if batch_size < 64 {
+        if batch_size < 64 && !self.ordinary_prefill_active() {
             self.lloyd_mmq_set_gemv_rows(a_gate, x, y_gate, gate_m, k, batch_size, c16_gate)?;
             self.lloyd_mmq_set_gemv_rows(a_up, x, y_up, up_m, k, batch_size, c16_up)?;
             return Ok(());
@@ -22128,7 +22128,7 @@ impl Gpu {
         c16: [u32; 4],
     ) -> HipResult<()> {
         self.lloyd_mmq_family_gate("gemm_hfq4g256_residual_mmq_lloyd", k, batch_size)?;
-        if batch_size < 64 {
+        if batch_size < 64 && !self.ordinary_prefill_active() {
             return self.lloyd_mmq_add_gemv_rows(a_raw, x, y, m, k, batch_size, c16);
         }
         if batch_size % 128 == 0 {
