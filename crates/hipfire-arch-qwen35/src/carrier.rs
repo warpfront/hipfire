@@ -62,6 +62,31 @@ pub(crate) fn draft_file_reserve_bytes(path: &std::path::Path) -> u64 {
     reserve_for_bytes(meta.len())
 }
 
+/// Legacy KV contiguity margin: the legacy backend allocates the full admitted
+/// context contiguously at load while VMM grows on demand, so the post-weight
+/// free figure overstates what one allocation can take. Start 512 MiB; tune
+/// from the live test.
+const QWEN35_LEGACY_CONTIGUITY_MARGIN_BYTES: usize = 512 << 20;
+
+/// Post-weight legacy card cap: the VMM bound's parts (free after weights,
+/// minimum prefill, vision reserve, page rounding, draft reserve) minus the
+/// single-allocation contiguity margin. Pure for testing; the carrier charges
+/// the same draft/vision reserves the admission projection omits.
+fn legacy_card_cap(
+    free: usize,
+    minimum: usize,
+    reserve: usize,
+    draft_reserve: u64,
+    stride: usize,
+) -> usize {
+    free.saturating_sub(minimum)
+        .saturating_sub(reserve)
+        .saturating_sub(128 << 20)
+        .saturating_sub(usize::try_from(draft_reserve).unwrap_or(usize::MAX))
+        .saturating_sub(QWEN35_LEGACY_CONTIGUITY_MARGIN_BYTES)
+        / stride
+}
+
 /// The `draft_file_reserve_bytes` formula for a known byte count: file bytes +
 /// 1/8 for the expanded/AWQ tensors + 512 MiB of scratch. Split out so the
 /// bundled-trailer arm (which knows its section size without a file of its
@@ -556,10 +581,24 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
             128 << 20,
         );
         if sequence.automatic {
+            // Deferred legacy fit charges the contiguity margin on top of
+            // the VMM parts (vision and draft reserves included); admission
+            // deliberately did not refuse on the pre-teardown figure, so
+            // this post-weight cap is the effective bound.
+            let card_cap = if ctx.kv_backend == KvBackend::Legacy {
+                legacy_card_cap(free, minimum, reserve, draft_reserve, stride)
+            } else {
+                card_cap
+            };
             if card_cap < 512 {
                 weights.free_gpu(ctx.gpu);
                 return Err(release_after_failed_load(
-                    "Qwen VMM load refused: measured post-weight VRAM cannot hold minimum PBS and KV".into(),
+                    if ctx.kv_backend == KvBackend::Legacy {
+                        "Qwen legacy load refused: measured post-weight VRAM cannot hold minimum PBS and KV"
+                    } else {
+                        "Qwen VMM load refused: measured post-weight VRAM cannot hold minimum PBS and KV"
+                    }
+                    .into(),
                     weight_lease.take(),
                     ctx.gpu,
                 ));
@@ -1705,6 +1744,48 @@ mod tests {
                 .unwrap_err()
                 .contains("exceeds max_seq")
         );
+    }
+
+    /// Post-weight legacy card cap: exact fit, margin, floor, and the
+    /// draft/vision charges. Pure (no GPU): the carrier calls it with the
+    /// measured post-weight parts.
+    #[test]
+    fn legacy_card_cap_charges_every_part_and_floors() {
+        // Exact fit: free minus every part, over the stride.
+        // parts: minimum 1 GiB, reserve 2 GiB, page 128 MiB, draft 3 GiB,
+        // margin 512 MiB; stride 1 MiB/token; room for exactly 9000 tokens.
+        let free =
+            (1 << 30) + (2 << 30) + (128 << 20) + (3 << 30) + (512 << 20) + 9_000 * (1 << 20);
+        assert_eq!(
+            legacy_card_cap(free, 1 << 30, 2 << 30, 3 << 30, 1 << 20),
+            9_000
+        );
+        // Removing the draft reserve costs exactly its tokens.
+        assert_eq!(
+            legacy_card_cap(free, 1 << 30, 2 << 30, 0, 1 << 20),
+            9_000 + 3 * 1024
+        );
+        // Removing the vision reserve costs exactly its tokens.
+        assert_eq!(
+            legacy_card_cap(free, 1 << 30, 0, 3 << 30, 1 << 20),
+            9_000 + 2 * 1024
+        );
+        // The margin is charged: without it the cap would be 512 higher.
+        let room_no_margin = free - (1 << 30) - (2 << 30) - (128 << 20) - (3 << 30);
+        assert_eq!(room_no_margin / (1 << 20) - 9_000, 512);
+        // Floor boundary, pinned exactly: 511 refuses, 512 admits.
+        let tight = (1 << 30) + (2 << 30) + (128 << 20) + (3 << 30) + (512 << 20) + 511 * (1 << 20);
+        assert_eq!(
+            legacy_card_cap(tight, 1 << 30, 2 << 30, 3 << 30, 1 << 20),
+            511
+        );
+        let fits = tight + (1 << 20);
+        assert_eq!(
+            legacy_card_cap(fits, 1 << 30, 2 << 30, 3 << 30, 1 << 20),
+            512
+        );
+        // Zero free saturates, never underflows.
+        assert_eq!(legacy_card_cap(0, 1 << 30, 2 << 30, 3 << 30, 1 << 20), 0);
     }
 
     #[test]
