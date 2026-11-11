@@ -2418,7 +2418,8 @@ fn decode_rejects_malformed_words() {
     assert!(Mai::decode(ARCH, &[0xd100_0001, 0]).is_err());
     assert!(Vop3p::decode(ARCH, &good_m).is_err());
     assert!(Mai::decode(ARCH, &good_p).is_err());
-    // Every opcode outside the tables.
+    // Opcodes outside the typed tables may now have a generated XML row,
+    // but must never decode as a different typed instruction.
     for code in 0..0x40u8 {
         if Vop3pOp::from_opcode(ARCH, code).is_none() {
             assert!(
@@ -2426,7 +2427,10 @@ fn decode_rejects_malformed_words() {
                 "VOP3P opcode {code:#x}"
             );
             assert!(
-                Inst::decode(ARCH, &[vop3p_word0(code), 0x1c12_0702]).is_err(),
+                matches!(
+                    Inst::decode(ARCH, &[vop3p_word0(code), 0x1c12_0702]),
+                    Err(_) | Ok((Inst::Xml(_), _))
+                ),
                 "Inst VOP3P opcode {code:#x}"
             );
         }
@@ -2438,7 +2442,10 @@ fn decode_rejects_malformed_words() {
                 "MAI opcode {code:#x}"
             );
             assert!(
-                Inst::decode(ARCH, &[vop3p_word0(code), 0x0402_0902]).is_err(),
+                matches!(
+                    Inst::decode(ARCH, &[vop3p_word0(code), 0x0402_0902]),
+                    Err(_) | Ok((Inst::Xml(_), _))
+                ),
                 "Inst MAI opcode {code:#x}"
             );
         }

@@ -266,7 +266,7 @@ pub struct DataComponent {
 pub struct DataField {
     pub name: &'static str,
     pub signedness: &'static str,
-    pub ranges: &'static [(u8, u8)],
+    pub ranges: &'static [(u32, u32)],
 }
 
 /// One `FunctionalGroup` (with the generator recording only the groups and
@@ -750,11 +750,7 @@ fn assemble_inner(form: &Form, values: &[u64; 24]) -> Result<([u32; 4], usize)> 
             rest >>= count;
         }
     }
-    if !enc
-        .id_values
-        .iter()
-        .any(|id| word & enc.id_mask == *id)
-    {
+    if !enc.id_values.iter().any(|id| word & enc.id_mask == *id) {
         return Err(format!(
             "{} assembled word {word:#x} matches no {:?} identifier",
             form.name, enc.name
@@ -821,17 +817,13 @@ pub fn decode(isa: Isa, words: &[u32]) -> Result<(Decoded, usize)> {
     }
     let mut hit: Option<(&'static Form, usize)> = None;
     for enc in table.encodings {
-        if !enc
-            .id_values
-            .iter()
-            .any(|id| (word & enc.id_mask) == *id)
-        {
+        if !enc.id_values.iter().any(|id| (word & enc.id_mask) == *id) {
             continue;
         }
         // A short slice still matches the identifier (missing words read
         // zero); conditions decide before length does.
         let n = usize::from(enc.dwords);
-        let masked = word & ((1u128 << enc.bit_count) - 1);
+        let masked = word & (u128::MAX >> (128 - enc.bit_count));
         let mut values = [0u64; 24];
         for (i, fl) in enc.fields.iter().enumerate() {
             values[i] = fl.extract(masked);
@@ -902,10 +894,7 @@ pub fn encode(d: &Decoded, out: &mut Vec<u32>) -> Result<()> {
         return Err(format!("{isa} is decode-only"));
     }
     if let Verification::Unverified(reason) = d.form.verification {
-        return Err(format!(
-            "unverified encoding {}: {reason}",
-            d.form.name
-        ));
+        return Err(format!("unverified encoding {}: {reason}", d.form.name));
     }
     let (words, n) = d.assemble()?;
     out.extend_from_slice(&words[..n]);
@@ -915,8 +904,5 @@ pub fn encode(d: &Decoded, out: &mut Vec<u32>) -> Result<()> {
 /// Is `isa`'s [`Form`] `row` receipt-verified? (`row` = index in
 /// [`forms`].)
 pub fn verified(isa: Isa, row: usize) -> bool {
-    isa.table()
-        .forms
-        .get(row)
-        .is_some_and(|f| f.is_verified())
+    isa.table().forms.get(row).is_some_and(|f| f.is_verified())
 }

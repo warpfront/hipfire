@@ -124,18 +124,10 @@ fn user_sgpr_count_must_be_the_kernarg_pointer() {
 }
 
 #[test]
-fn end_label_and_explicit_vop3_nop_round_trip_losslessly() {
+fn explicit_vop3_nop_without_an_encoding_receipt_is_refused() {
     let mut b = Builder::new(spec(false), plan());
     b.label(".Lend").unwrap();
-    b.push(insn("v_nop_e64")).unwrap();
-    b.control(insn("s_endpgm")).unwrap();
-    let emitted = b.finish().unwrap();
-    assert!(emitted.s_text.contains("v_nop_e64"));
-    let elf = native::assemble(&emitted.s_text, Arch::Gfx942).unwrap();
-    let lifted = peacemaker_lift::cdna::lift_object(&elf).unwrap();
-    assert_eq!(lifted.kernels[0].image.code.len(), 12);
-    assert!(matches!(
-        lifted.kernels[0].instructions[0].inst,
-        peacemaker_cdna::Inst::Vop3(_)
-    ));
+    let error = b.push(insn("v_nop_e64")).unwrap_err();
+    assert!(error.contains("v_nop"), "{error}");
+    assert!(error.contains("unverified encoding"), "{error}");
 }

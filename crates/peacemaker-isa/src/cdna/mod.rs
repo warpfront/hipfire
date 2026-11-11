@@ -41,9 +41,7 @@ pub(crate) fn require_verified(arch: model::Arch, inst: &Inst) -> Result<(), Str
         model::RowStatus::Unverified(reason) => {
             Err(format!("{inst}: unverified encoding: {reason}"))
         }
-        model::RowStatus::Unknown(reason) => {
-            Err(format!("{inst}: unverified encoding: {reason}"))
-        }
+        model::RowStatus::Unknown(reason) => Err(format!("{inst}: unverified encoding: {reason}")),
     }
 }
 

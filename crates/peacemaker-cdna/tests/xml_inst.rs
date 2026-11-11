@@ -117,7 +117,12 @@ fn every_cdna3_verified_form_decodes_typed_or_generated() {
         }
     }
     assert_eq!((verified, unverified), (2435, 30));
-    assert!(failures.is_empty(), "{} failures:\n{}", failures.len(), failures.join("\n"));
+    assert!(
+        failures.is_empty(),
+        "{} failures:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
 }
 
 #[test]
@@ -145,7 +150,12 @@ fn gfx950_verified_forms_are_decode_only_and_never_typed() {
         }
     }
     assert_eq!((verified, unverified), (2536, 32));
-    assert!(failures.is_empty(), "{} failures:\n{}", failures.len(), failures.join("\n"));
+    assert!(
+        failures.is_empty(),
+        "{} failures:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
 }
 
 #[test]
@@ -189,8 +199,12 @@ fn unverified_rows_decode_but_never_encode() {
             continue;
         }
         let d = Decoded::new(Isa::Cdna3, form);
-        let Ok((words, n)) = d.assemble() else { continue };
-        let Ok((inst, _)) = Inst::decode(Arch::Gfx942, &words[..n]) else { continue };
+        let Ok((words, n)) = d.assemble() else {
+            continue;
+        };
+        let Ok((inst, _)) = Inst::decode(Arch::Gfx942, &words[..n]) else {
+            continue;
+        };
         seen += 1;
         match inst.verification(Arch::Gfx942) {
             RowStatus::Verified => panic!("{}: unverified row reported verified", form.name),

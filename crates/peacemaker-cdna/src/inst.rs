@@ -354,19 +354,13 @@ impl Inst {
         };
         match Self::decode_typed(arch, words, format) {
             Ok(decoded) => Ok(decoded),
-            // The typed table keeps every opcode it knows, with its own
-            // legality rules: only an opcode it lacks falls back to the
-            // generated tables.
-            Err(e) if Self::typed_claims(arch, format, first) => Err(e),
+            // A generated decode preserves forms the typed model cannot
+            // represent, without granting them execution or seal semantics.
             Err(e) => Self::decode_xml(arch, words, Some(e)),
         }
     }
 
-    fn decode_xml(
-        arch: Arch,
-        words: &[u32],
-        typed_error: Option<String>,
-    ) -> Result<(Self, usize)> {
+    fn decode_xml(arch: Arch, words: &[u32], typed_error: Option<String>) -> Result<(Self, usize)> {
         match XmlInst::decode(arch, words) {
             Ok((x, n)) => Ok((Self::Xml(x), n)),
             Err(e) => Err(match typed_error {
@@ -376,43 +370,6 @@ impl Inst {
         }
     }
 
-    /// Whether the typed table has an entry for the opcode of the `format`
-    /// instruction whose first dword is `w` (the typed decoder owns it, and
-    /// its refusal stands).
-    fn typed_claims(arch: Arch, format: Format, w: u32) -> bool {
-        use crate::enc::{
-            ds::DsOp,
-            flat::FlatOp,
-            mubuf::MubufOp,
-            smem::SmemOp,
-            sop::{Sop1Op, Sop2Op, SopcOp, SopkOp, SoppOp},
-            vop::{Vop1Op, Vop2Op, VopcOp},
-            vop3::Vop3Op,
-            vop3p::{MaiOp, Vop3pOp},
-        };
-        match format {
-            Format::Sop1 => Sop1Op::from_opcode(arch, (w >> 8 & 0xff) as u8).is_some(),
-            Format::Sop2 => Sop2Op::from_opcode(arch, (w >> 23 & 0x7f) as u8).is_some(),
-            Format::Sopk => SopkOp::from_opcode(arch, (w >> 23 & 0x1f) as u8).is_some(),
-            Format::Sopc => SopcOp::from_opcode(arch, (w >> 16 & 0x7f) as u8).is_some(),
-            Format::Sopp => SoppOp::from_opcode(arch, (w >> 16 & 0x7f) as u8).is_some(),
-            Format::Smem => SmemOp::from_opcode(arch, (w >> 18 & 0xff) as u8).is_some(),
-            Format::Vop1 => Vop1Op::from_opcode(arch, (w >> 9 & 0xff) as u8).is_some(),
-            Format::Vop2 => {
-                let opcode = (w >> 25) as u8;
-                Vop2Op::from_opcode(arch, opcode).is_some()
-                    || Vop2KOp::from_opcode(arch, opcode).is_some()
-            }
-            Format::Vopc => VopcOp::from_opcode(arch, (w >> 17 & 0xff) as u8).is_some(),
-            Format::Vop3 => Vop3Op::from_opcode(arch, (w >> 16 & 0x3ff) as u16).is_some(),
-            Format::Vop3p => Vop3pOp::from_opcode(arch, (w >> 16 & 0x7f) as u8).is_some(),
-            Format::Mai => MaiOp::from_opcode(arch, (w >> 16 & 0x7f) as u8).is_some(),
-            Format::Ds => DsOp::from_opcode(arch, (w >> 17 & 0xff) as u8).is_some(),
-            Format::Flat => FlatOp::from_opcode(arch, (w >> 18 & 0x7f) as u8).is_some(),
-            Format::Mubuf => MubufOp::from_opcode(arch, (w >> 18 & 0x7f) as u8).is_some(),
-            Format::Mtbuf | Format::Mimg | Format::Exp => false,
-        }
-    }
 
     fn decode_typed(arch: Arch, words: &[u32], format: Format) -> Result<(Self, usize)> {
         let first = words[0];

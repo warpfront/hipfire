@@ -305,15 +305,17 @@ mod xml_refusal_tests {
                 assert!(error.contains(name), "{error}");
                 assert!(error.contains("no hand-written model"), "{error}");
                 let hazards = super::super::hazard::check(arch, &[inst]);
-                assert!(hazards.iter().any(|error| error.contains(name)), "{hazards:?}");
+                assert!(
+                    hazards.iter().any(|error| error.contains(name)),
+                    "{hazards:?}"
+                );
             }
         }
     }
 
     #[test]
     fn unverified_encoding_refuses_emission_and_shadow_by_name() {
-        let (inst, _) =
-            Inst::decode(peacemaker_cdna::Arch::Gfx942, &[0xbf9f_0000]).unwrap();
+        let (inst, _) = Inst::decode(peacemaker_cdna::Arch::Gfx942, &[0xbf9f_0000]).unwrap();
         let error = inst.words(peacemaker_cdna::Arch::Gfx942).unwrap_err();
         assert!(error.contains("s_set_valu_coexec_mode"), "{error}");
         assert!(error.contains("unverified encoding"), "{error}");
@@ -329,9 +331,11 @@ mod typed_unverified_tests {
 
     #[test]
     fn typed_decoder_cannot_bypass_unverified_encoding_gate() {
-        let (inst, _) =
-            Inst::decode(peacemaker_cdna::Arch::Gfx942, &[0xd140_0000, 0]).unwrap();
-        assert!(inst.xml().is_none(), "the legacy typed path is the regression");
+        let (inst, _) = Inst::decode(peacemaker_cdna::Arch::Gfx942, &[0xd140_0000, 0]).unwrap();
+        assert!(
+            inst.xml().is_none(),
+            "the legacy typed path is the regression"
+        );
         let error = shadow(&inst).unwrap_err();
         assert!(error.contains("v_nop"), "{error}");
         assert!(error.contains("unverified encoding"), "{error}");

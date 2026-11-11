@@ -810,6 +810,32 @@ mod generated_encoding_tests {
     use super::*;
 
     #[test]
+    fn verified_generated_samples_refuse_simulation_and_certification_by_name() {
+        use model::sim::{self, Config, Memory, Wave};
+        use model::xml::{self, Isa};
+        let mut generated = 0;
+        for form in xml::forms(Isa::Cdna3) {
+            if !form.verification.is_verified() {
+                continue;
+            }
+            let (inst, _) = Inst::decode(CDNA, form.sample).expect(form.name);
+            let Inst::Xml(x) = &inst else { continue };
+            generated += 1;
+            let mnemonic = x.decoded().form.mnemonic;
+            let mut wave = Wave::new(CDNA, 0, 0);
+            let error = sim::exec_one(
+                &mut wave, &inst, &mut [], &mut Memory::default(), &Config::default(),
+            ).unwrap_err().to_string();
+            assert!(error.contains(mnemonic), "{error}");
+            let error = certify_stream(
+                "generated", &[Typed { dword_offset: 0, inst }],
+            ).unwrap_err();
+            assert!(error.contains(mnemonic), "{error}");
+        }
+        assert!(generated >= 88, "missing generated form coverage: {generated}");
+    }
+
+    #[test]
     fn seal_refuses_unverified_encoding_by_name() {
         let (inst, _) = Inst::decode(CDNA, &[0xbf9f_0000]).unwrap();
         let error = certify_stream(
