@@ -2586,8 +2586,10 @@ impl Catalog {
                 // enumerate individual opcodes, so the base identifier need not
                 // match the extended half's opcode. Resolve the peer from a
                 // physically identical prefix, never from a different layout.
+                let needs_peer = xs.best.is_some() || ys.best.is_some();
                 for base in self.encodings.iter().filter(|base| {
-                    base.is_pair()
+                    needs_peer
+                        && base.is_pair()
                         && base.bits < encoding.bits
                         && base
                             .fields

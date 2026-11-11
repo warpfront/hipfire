@@ -218,7 +218,17 @@ fn decode_operand(
                 len: ((spec.size + 31) / 32).max(1) as u8,
             }));
         }
-        return operand(arch, name, bits, code, None, row, words);
+        // DPP moves the first VGPR source into VSRC0. Its true16 e32
+        // register/half packing is the same as the ordinary VSRC1 field.
+        let selector = if name == "VSRC0"
+            && bits == 16
+            && matches!(row.form, Form::Vop1 | Form::Vop2 | Form::Vopc)
+        {
+            "VSRC1"
+        } else {
+            name
+        };
+        return operand(arch, selector, bits, code, None, row, words);
     }
     if name == "SRSRC" {
         return Ok(Operand::Reg(RegRef {
@@ -315,7 +325,15 @@ fn encode_operand(
                 }
                 return Ok(u32::from(r.base / 2));
             }
-            return encoded_operand(arch, name, spec.size as u16, value, row.form);
+            let selector = if name == "VSRC0"
+                && spec.size == 16
+                && matches!(row.form, Form::Vop1 | Form::Vop2 | Form::Vopc)
+            {
+                "VSRC1"
+            } else {
+                name
+            };
+            return encoded_operand(arch, selector, spec.size as u16, value, row.form);
         }
         if name == "SRSRC" || name == "SBASE" {
             let scale = if name == "SBASE" { 2 } else { 4 };
@@ -673,6 +691,49 @@ mod tests {
             }
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn true16_dpp_footprints_match_llvm_half_register_oracles() {
+        use crate::operand::Half;
+        // llvm-mc -triple=amdgcn-amd-amdhsa -mcpu=<each arch> -show-encoding:
+        // v_mov_b16 v3.h, v5.h dpp8:[0,1,2,3,4,5,6,7]
+        // v_mov_b16 v3.h, v5.h quad_perm:[0,1,2,3]
+        for arch in [Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1201] {
+            for extension in [0xfac6_8885, 0xff00_e485] {
+                let data = [
+                    if extension == 0xfac6_8885 {
+                        0x7f06_38e9
+                    } else {
+                        0x7f06_38fa
+                    },
+                    extension,
+                ];
+                let (inst, count) = decode(arch, &data).unwrap();
+                assert_eq!(count, 2);
+                let dst = RegRef {
+                    kind: Kind::V,
+                    base: 3,
+                    len: 1,
+                };
+                let src = RegRef {
+                    kind: Kind::V,
+                    base: 5,
+                    len: 1,
+                };
+                assert_eq!(
+                    inst.operands.as_slice(),
+                    [Operand::Half(dst, Half::Hi), Operand::Half(src, Half::Hi)]
+                );
+                assert_eq!(inst.effects.defs.as_slice(), [dst]);
+                assert!(inst.effects.uses.contains(&src));
+                assert!(
+                    inst.effects.uses.contains(&dst),
+                    "partial write preserves the other half"
+                );
+                assert_eq!(encode(arch, &inst).unwrap().as_slice(), data);
+            }
+        }
     }
 
     #[test]
