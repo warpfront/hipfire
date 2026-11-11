@@ -55,7 +55,7 @@ use rdna_compute::tensor_ops::{
     gated_delta_step_gate_wmma_qknormed_arena, indexed_attention_cache_append_batch_arena,
     indexed_attention_index_key_append_batch_arena, indexed_attention_norm_rope_batch_arena,
     indexed_attention_rope_table, qsa_core_lanes, qsa_lanes_fuse_enabled, Bf16Arena, GdnCoreLane,
-    GdnCoreRowsLane, QsaCoreLane, QsaOutRotate, QSA_CORE_LANES_MAX, QSA_CORE_LANE_ROWS,
+    GdnCoreRowsLane, QsaCoreLane, QsaOutRotate, QSA_CORE_LANE_ROWS,
 };
 use rdna_compute::{
     DType, Gpu, GpuTensor, TrunkFamily, QSA_NORM_EPI_HEAD_DIM, QSA_NORM_EPI_ROTARY_DIM,
