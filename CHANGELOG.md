@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **Fixed (gfx10/gfx11 retained PM4 with a scratch ring): no stall after KFD queue eviction (HIPF-347).** When KFD maps a queue again after an eviction, the command processor reloads `COMPUTE_TMPRING_SIZE` and the scratch base from the queue's `amd_queue_t` fields, not from what the PM4 IB wrote. Retained queues left ROCr's empty fields in place, so the next scratch dispatch got no scratch slots and hung (5 s `HIPFIRE_REDLINE_QUEUE_TIMEOUT`, no kernel log). Each queue lane now publishes its ring there (`QueueSet::bind_scratch`, the same fields ROCr's `InitScratchSRD` fills). halo gfx1151 (`cwsr_enable=0`), `pm4_scratch_probe --only evict` (16 x plain+scratch IB, eviction every 10 ms, 3000 submits): the unbound ring stalled in 6 of 7 runs, the bound ring passed in 8 of 8. Served Flash-Next gptq3 `.mq4r` (retained tape with the scratch LM head) under `HIPFIRE_DEBUG_FORCE_EVICT_MS=10` (#1028): before, a queue timeout on an early replay and a HIP fallback; after, 3 of 3 runs with 40/40 requests on PM4, digests equal to the run without eviction.
+
 ## v0.4.5 — 2026-11-11 (re-cut)
 
 The v0.4.5 tag first pointed at `b30b46c1e2` (2026-10-30); that GitHub release was never published. v0.4.5 was re-cut at `7f7cf7f50f` and now includes everything below. If you fetched the October tag, run `git fetch --tags --force`.
