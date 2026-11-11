@@ -824,15 +824,29 @@ mod generated_encoding_tests {
             let mnemonic = x.decoded().form.mnemonic;
             let mut wave = Wave::new(CDNA, 0, 0);
             let error = sim::exec_one(
-                &mut wave, &inst, &mut [], &mut Memory::default(), &Config::default(),
-            ).unwrap_err().to_string();
+                &mut wave,
+                &inst,
+                &mut [],
+                &mut Memory::default(),
+                &Config::default(),
+            )
+            .unwrap_err()
+            .to_string();
             assert!(error.contains(mnemonic), "{error}");
             let error = certify_stream(
-                "generated", &[Typed { dword_offset: 0, inst }],
-            ).unwrap_err();
+                "generated",
+                &[Typed {
+                    dword_offset: 0,
+                    inst,
+                }],
+            )
+            .unwrap_err();
             assert!(error.contains(mnemonic), "{error}");
         }
-        assert!(generated >= 88, "missing generated form coverage: {generated}");
+        assert!(
+            generated >= 88,
+            "missing generated form coverage: {generated}"
+        );
     }
 
     #[test]

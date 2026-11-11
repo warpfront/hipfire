@@ -12,7 +12,9 @@
 //! any register numbers, is promoted per instance. The row itself and every
 //! other selector / flag combination stay unverified.
 use peacemaker_cdna::xml::{self, Decoded, Isa};
-use peacemaker_cdna::{Arch, Inst, RowStatus, XmlInst, FIELD_RECEIPTS, V_CVT_PK_F32_FP8_SDWA_WORD1};
+use peacemaker_cdna::{
+    Arch, Inst, RowStatus, XmlInst, FIELD_RECEIPTS, V_CVT_PK_F32_FP8_SDWA_WORD1,
+};
 
 /// First dword of `v_cvt_pk_f32_fp8_sdwa v[vdst:vdst+1], v? ...`.
 fn w0(vdst: u32) -> u32 {
@@ -69,7 +71,10 @@ fn anchor_words_are_the_receipt_row_and_the_row_stays_unverified() {
         assert_eq!(d.form.name, "V_CVT_PK_F32_FP8");
         assert_eq!(d.form.encoding, "VOP1_VOP_SDWA");
         // Row level: still unverified, the whole-row policy is untouched.
-        assert!(!d.form.verification.is_verified(), "row must stay unverified");
+        assert!(
+            !d.form.verification.is_verified(),
+            "row must stay unverified"
+        );
         assert!(d.form.sample.is_empty());
         // Instance level: promoted by exactly the anchor receipt.
         assert_eq!(XmlInst::verification_of(&d), Ok(()));
@@ -91,9 +96,14 @@ fn anchor_instances_are_verified_and_encode_back() {
         assert_eq!(x.verification(), Ok(()));
         assert!(x.receipt().is_some());
         // The row-level refusal does not leak into the promoted instance.
-        assert!(!x.unsupported().contains("unverified encoding"), "{}", x.unsupported());
+        assert!(
+            !x.unsupported().contains("unverified encoding"),
+            "{}",
+            x.unsupported()
+        );
         let mut out = Vec::new();
-        x.encode(Arch::Gfx942, &mut out).expect("promoted instance encodes");
+        x.encode(Arch::Gfx942, &mut out)
+            .expect("promoted instance encodes");
         assert_eq!(out, words);
         // gfx950 stays decode-only.
         let mut out = Vec::new();
@@ -155,7 +165,10 @@ fn every_neighbouring_selector_and_flag_is_refused() {
             };
             assert_eq!(d.form.name, "V_CVT_PK_F32_FP8", "{name}={value}");
             assert_eq!(d.field(name), Some(u64::from(value)), "{name}");
-            assert!(XmlInst::verification_of(&d).is_err(), "{name}={value} was promoted");
+            assert!(
+                XmlInst::verification_of(&d).is_err(),
+                "{name}={value} was promoted"
+            );
             assert!(XmlInst::receipt_of(&d).is_none(), "{name}={value}");
             checked += 1;
         }
@@ -185,7 +198,11 @@ fn a_refused_neighbour_decodes_but_never_encodes() {
         let (x, _) = XmlInst::decode(Arch::Gfx942, &words).expect("decodes");
         assert!(!x.verified());
         assert!(x.receipt().is_none());
-        assert!(x.unsupported().contains("unverified encoding"), "{}", x.unsupported());
+        assert!(
+            x.unsupported().contains("unverified encoding"),
+            "{}",
+            x.unsupported()
+        );
         let mut out = Vec::new();
         let e = x.encode(Arch::Gfx942, &mut out).unwrap_err();
         assert!(e.contains("unverified encoding"), "{e}");
@@ -228,12 +245,19 @@ fn receipt_names_every_field_of_its_row_and_cites_provenance() {
         .iter()
         .find(|f| f.name == r.name && f.encoding == r.encoding)
         .expect("receipt row");
-    assert!(!form.verification.is_verified(), "the row itself stays unverified");
+    assert!(
+        !form.verification.is_verified(),
+        "the row itself stays unverified"
+    );
     // Every field of the row is either free (a register number) or pinned.
     for fl in form.fields {
         let free = r.free.contains(&fl.name);
         let fixed = r.fixed.iter().filter(|(n, _)| *n == fl.name).count();
-        assert!(free ^ (fixed == 1), "{} must be free xor pinned once", fl.name);
+        assert!(
+            free ^ (fixed == 1),
+            "{} must be free xor pinned once",
+            fl.name
+        );
     }
     for (n, _) in r.fixed {
         assert!(form.fields.iter().any(|fl| fl.name == *n), "{n}");
@@ -257,7 +281,10 @@ fn inst_verification_reports_the_instance_status() {
     let neighbour = [w0(66), mutate(w1(54), 16, 3, 4)];
     let (neighbour, _) = Inst::decode(Arch::Gfx942, &neighbour).expect("neighbour decodes");
     assert!(
-        matches!(neighbour.verification(Arch::Gfx942), RowStatus::Unverified(_)),
+        matches!(
+            neighbour.verification(Arch::Gfx942),
+            RowStatus::Unverified(_)
+        ),
         "{:?}",
         neighbour.verification(Arch::Gfx942)
     );

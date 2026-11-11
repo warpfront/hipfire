@@ -716,6 +716,7 @@ impl Cx<'_> {
         } else {
             None
         };
+        self.legal(&vals)?;
         let text = self.text(&vals)?;
         Ok(Facts {
             footprint: fp,
@@ -723,6 +724,125 @@ impl Cx<'_> {
             branch,
             text,
         })
+    }
+
+    // -----------------------------------------------------------------------
+    // Operand legality: the refusals the typed encoders make, derived from the
+    // operand rules rather than per-word.
+
+    fn legal(&self, vals: &[Val]) -> Result<()> {
+        crate::xml_legality::selectors(self.d)?;
+        self.unused_operand_fields()?;
+        for (op, val) in self.form.operands.iter().zip(vals) {
+            if op.field.is_none() {
+                continue;
+            }
+            if let Val::Srcs(list) | Val::SmemOffset(list, _) = val {
+                for &(src, n) in list {
+                    Self::check_register_span(src, n)
+                        .map_err(|e| format!("{}: {e}", op.field.unwrap_or("operand")))?;
+                }
+            }
+        }
+        self.constant_bus(vals)
+    }
+
+    /// An operand field the form does not use must be zero in the scalar and
+    /// VOP3 encodings (an unused SSRC1 / SRC2 carries no meaning, so a
+    /// nonzero value is a different, unmodelled encoding).
+    fn unused_operand_fields(&self) -> Result<()> {
+        let names: &[&str] = match self.form.encoding {
+            "ENC_SOP1" | "SOP1_INST_LITERAL" | "ENC_SOP2" | "SOP2_INST_LITERAL" | "ENC_SOPC"
+            | "SOPC_INST_LITERAL" | "ENC_SOPK" | "SOPK_INST_LITERAL" => &["SDST", "SSRC0", "SSRC1"],
+            "ENC_VOP3" | "VOP3_SDST_ENC" | "ENC_VOP3P" => &["SRC0", "SRC1", "SRC2"],
+            "ENC_SOPP" => &["SIMM16"],
+            _ => return Ok(()),
+        };
+        for f in self.form.fields {
+            if !names.contains(&f.name)
+                || self.form.operands.iter().any(|o| o.field == Some(f.name))
+            {
+                continue;
+            }
+            let marker = self.form.encoding.ends_with("_INST_LITERAL");
+            if let Some(v) = self
+                .field(f.name)
+                .filter(|&v| v != 0 && !(marker && v == 255))
+            {
+                return Err(format!("unused field {}={v} must be zero", f.name));
+            }
+        }
+        Ok(())
+    }
+
+    /// A multi-dword scalar register operand starts at a register aligned to
+    /// min(dwords, 4) and lies inside its file; a 64-bit special-register
+    /// operand must start at the low half.
+    fn check_register_span(src: Src, n: u8) -> Result<()> {
+        if n < 2 {
+            return Ok(());
+        }
+        let align = u32::from(n.min(4));
+        match src {
+            Src::Sgpr(r) => {
+                let r = u32::from(r);
+                if r % align != 0 || r + u32::from(n) > 102 {
+                    return Err(format!("s{r} is not a valid {n}-dword SGPR start"));
+                }
+            }
+            Src::Ttmp(r) => {
+                let r = u32::from(r);
+                if r % align != 0 || r + u32::from(n) > 16 {
+                    return Err(format!("ttmp{r} is not a valid {n}-dword ttmp start"));
+                }
+            }
+            Src::FlatScratchHi | Src::XnackMaskHi | Src::VccHi | Src::ExecHi | Src::M0 => {
+                return Err(format!("{src:?} cannot start a {n}-dword operand"));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// CDNA VALU instructions read at most one scalar register, special
+    /// register or literal through the constant bus (inline constants are
+    /// free; one register read twice is one use).
+    fn constant_bus(&self, vals: &[Val]) -> Result<()> {
+        if self.form.group != "VALU" || self.is_mfma() {
+            return Ok(());
+        }
+        // (kind, value): 0 = register code, 1 = literal source, 2 = instruction literal,
+        // 3 = lds_direct.
+        let mut uses: Vec<(u8, u32)> = Vec::new();
+        for (op, val) in self.form.operands.iter().zip(vals) {
+            if op.field.is_none() || !op.input {
+                continue;
+            }
+            let key = match val {
+                Val::Srcs(list) => match list.first() {
+                    Some(&(src, _)) => match src {
+                        Src::Vgpr(_) | Src::Agpr(_) | Src::Int(_) | Src::Float(_) => continue,
+                        Src::Lit(v) => (1, v),
+                        other => (0, u32::from(other.code())),
+                    },
+                    None => continue,
+                },
+                Val::Literal(v) => (if op.kind == K::Simm32 { 2 } else { 1 }, *v),
+                Val::LdsDirect => (3, 0),
+                _ => continue,
+            };
+            if !uses.contains(&key) {
+                uses.push(key);
+            }
+        }
+        if uses.len() > 1 {
+            return Err(
+                "more than one constant-bus operand (scalar register, special \
+                register or literal)"
+                    .into(),
+            );
+        }
+        Ok(())
     }
 
     // -----------------------------------------------------------------------

@@ -367,7 +367,6 @@ impl Inst {
         }
     }
 
-
     fn decode_typed(arch: Arch, words: &[u32], format: Format) -> Result<(Self, usize)> {
         let first = words[0];
         Ok(match format {

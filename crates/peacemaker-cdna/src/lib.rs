@@ -86,6 +86,7 @@ pub mod sim;
 pub mod text;
 pub mod xml;
 mod xml_inst;
+mod xml_legality;
 #[rustfmt::skip]
 mod generated_cdna3;
 #[rustfmt::skip]

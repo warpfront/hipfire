@@ -874,7 +874,7 @@ pub fn decode(isa: Isa, words: &[u32]) -> Result<(Decoded, usize)> {
             word & form.enc.reserved
         ));
     }
-    let masked = word & ((1u128 << form.enc.bit_count) - 1);
+    let masked = word & (u128::MAX >> (128 - form.enc.bit_count));
     let mut d = Decoded {
         form,
         values: [0; 24],
