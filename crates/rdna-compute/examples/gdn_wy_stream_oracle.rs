@@ -330,6 +330,21 @@ fn main() {
     for format in [GdnStateFormat::F32, GdnStateFormat::Q8, GdnStateFormat::Q8Ef] {
         let initial = initial_state(&mut rng, format);
         let rig = Rig::new(&mut gpu, format, n, &inp, &mut rng);
+        if let Some(spec) = arg(&args, "--sweep") {
+            // --sweep START,ROW,L0,L1 (F32): row ROW of a single call of L rows, L0..=L1.
+            let v: Vec<usize> = spec.split(',').map(|v| v.parse().unwrap()).collect();
+            let (st, row, l0, l1) = (v[0], v[1], v[2], v[3]);
+            let base = run(&mut gpu, &rig, st, &[l0], &initial, false);
+            let pick = |r: &Result| r.out[row * VALUE * 4..(row + 1) * VALUE * 4].to_vec();
+            let b0 = pick(&base);
+            for l in l0..=l1 {
+                let r = run(&mut gpu, &rig, st, &[l], &initial, false);
+                let rb = pick(&r);
+                let d: Vec<usize> = (0..VALUE).filter(|e| rb[e * 4..e * 4 + 4] != b0[e * 4..e * 4 + 4]).collect();
+                println!("SWEEP L={l} nn={} diff_elems={d:?}", l - (l / 16) * 16);
+            }
+            std::process::exit(0);
+        }
         if let Some(spec) = arg(&args, "--probe") {
             // --probe START:p1,p2,..  (F32 only): reference [sum] vs the partition.
             let (s, ps) = spec.split_once(':').unwrap();
