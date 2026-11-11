@@ -22,6 +22,9 @@ if [[ "${1:-}" == "--self-check" ]]; then
     exit 0
 fi
 
+echo "== QSA pooling positions (host C++, no HIP) =="
+python3 scripts/test_qsa_mrope_position.py
+
 echo "== Rust check =="
 cargo check --workspace --examples
 

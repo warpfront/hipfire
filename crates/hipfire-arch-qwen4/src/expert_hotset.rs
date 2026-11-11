@@ -141,7 +141,13 @@ pub fn hotset_reserve_bytes_with(
     }
     let runtime =
         crate::slowlink_admission::S1_RUNTIME_OVERHEAD_BYTES.saturating_sub(reserve.census.runtime);
-    reserve.census_total.saturating_add(runtime).min(default)
+    // This knob selects only the text reserve. The independently priced
+    // resident vision tower and image scratch stay reserved in either arm.
+    reserve
+        .census_total
+        .saturating_add(runtime)
+        .saturating_add(reserve.vision_reserve_bytes)
+        .min(default)
 }
 
 /// Log prefix of every hotset line.
@@ -1938,6 +1944,36 @@ mod tests {
                 reserve.bytes(),
                 "{arch}"
             );
+        }
+    }
+
+    #[test]
+    fn census_reserve_keeps_the_vision_quote_when_the_text_floor_is_lowered() {
+        let mib = 1u64 << 20;
+        let vision = 2_158_224_320;
+        // Exercise both the historical-floor winner and the census winner;
+        // on gfx1100 the opt-in can change the text term in the first case.
+        for historical in [Some(15806 * mib), None] {
+            let text = xtx_reserve(historical);
+            let image = text.with_vision_reserve(vision).unwrap();
+            for arch in ["gfx1100", "gfx1201", "gfx1151"] {
+                for enabled in [false, true] {
+                    let text_bytes = hotset_reserve_bytes_with(arch, enabled, &text);
+                    assert_eq!(
+                        hotset_reserve_bytes_with(arch, enabled, &image) - text_bytes,
+                        vision,
+                        "{arch}, census={enabled}, historical={historical:?}"
+                    );
+                    assert_eq!(
+                        hotset_reserve_bytes_with(
+                            arch,
+                            enabled,
+                            &text.with_vision_reserve(0).unwrap()
+                        ),
+                        text_bytes
+                    );
+                }
+            }
         }
     }
 }

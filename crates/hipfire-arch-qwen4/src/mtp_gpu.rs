@@ -2804,6 +2804,7 @@ fn head_attention_op<'a>(
         head_dim: config.head_dim,
         rotary_dim: config.rotary_dim(),
         rope: config.rope(),
+        mrope: None,
         input_width: hidden,
         rotation: &scratch.rotation,
         mode,

@@ -33,6 +33,7 @@ run() {
 run bash scripts/leanup-ratchets.sh
 run python3 scripts/check-crate-maps.py --check
 run python3 scripts/check-scratch-growth.py
+run python3 scripts/test_qsa_mrope_position.py
 run python3 scripts/check-changelog.py
 run python3 scripts/check-conflict-markers.py
 run bash scripts/ratchet-diff.sh ${1:+"$1"}

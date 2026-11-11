@@ -2280,6 +2280,7 @@ pub fn native_mtp_granule_slack(
 /// overhead ([`runtime_overhead_bytes`]: a single-device load, or an exact gfx1201 EP2 load
 /// under `HIPFIRE_EP_RESERVE_CENSUS`, [`runtime_overhead_bytes_ep`]) the floor is retired
 /// (`historical` is `None`) and the census alone is the reserve. The
+/// independent vision reservation is added after that decision; the
 /// whole-layer stage buffers and safety margin ([`PlacementCharges`]) are
 /// added on top of [`Self::bytes`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2287,6 +2288,10 @@ pub struct AutoReserve {
     pub historical: Option<u64>,
     pub census: ReserveCensus,
     pub census_total: u64,
+    /// Device bytes reserved for a vision tower loaded after text placement:
+    /// resident weights (including row padding), activation scratch and
+    /// projected image rows. Added after the text floor/census decision.
+    pub vision_reserve_bytes: u64,
     /// `Some(S)` when a decode-share load charged only its dedicated forward:
     /// `S` bytes of prefill scratch are borrowed from the donor tail instead
     /// of reserved ([`DecodeShareForward`]).
@@ -2315,11 +2320,28 @@ impl AutoReserve {
             historical,
             census,
             census_total,
+            vision_reserve_bytes: 0,
             decode_share_borrowed: None,
             decode_share_shadows: 0,
             ep_reserve_forward: None,
             ep_reserve_shadows: 0,
             ep_census: false,
+        })
+    }
+
+    /// Set the independent vision reserve, checking the combined bound before
+    /// it can be used for placement. Zero preserves the text-only reserve.
+    pub fn with_vision_reserve(mut self, bytes: u64) -> Result<Self, String> {
+        self.text_bytes()
+            .checked_add(bytes)
+            .ok_or("qwen4: vision reserve overflows the placement budget")?;
+        self.vision_reserve_bytes = bytes;
+        Ok(self)
+    }
+
+    fn text_bytes(&self) -> u64 {
+        self.historical.map_or(self.census_total, |historical| {
+            historical.max(self.census_total)
         })
     }
 
@@ -2392,13 +2414,13 @@ impl AutoReserve {
         }
     }
 
-    /// The bytes `auto` reserves: `max(historical, census)`, or the census
-    /// alone once the floor is retired.
+    /// The bytes `auto` reserves: `max(historical, census) + vision`, or
+    /// `census + vision` once the text floor is retired. The vision term
+    /// cannot be swallowed by the historical floor.
     pub fn bytes(&self) -> u64 {
-        match self.historical {
-            Some(historical) => historical.max(self.census_total),
-            None => self.census_total,
-        }
+        self.text_bytes()
+            .checked_add(self.vision_reserve_bytes)
+            .expect("vision reserve was checked before placement")
     }
 
     /// The base reserve a whole-layer placement is sized from. Every load that
@@ -2410,16 +2432,19 @@ impl AutoReserve {
     /// census) that would put even the preferred ten resident layers out of reach, and the S1
     /// profile adds its own explicit terms and the safety margin on top
     /// ([`PlacementCharges`]); the Hold 1 gate verifies the measured peak
-    /// against census + safety + allowance.
+    /// against census + safety + allowance. Both routes retain the independent
+    /// vision reservation in addition to their selected text reserve.
     pub fn placement_bytes(&self, slowlink: bool) -> u64 {
         if slowlink {
             self.census_total
+                .checked_add(self.vision_reserve_bytes)
+                .expect("vision reserve was checked before placement")
         } else {
             self.bytes()
         }
     }
 
-    /// Which formula set [`Self::bytes`].
+    /// Which text formula won before the independent vision reservation.
     pub fn winner(&self) -> &'static str {
         match self.historical {
             None => "census (historical floor retired)",
@@ -2432,10 +2457,10 @@ impl AutoReserve {
     /// ([`Self::with_ep_census`]) states its runtime term and that the single-device floor is
     /// retired (or, where the runtime was not measured, kept).
     pub fn describe(&self) -> String {
-        match (self.historical, self.ep_census) {
+        let text = match (self.historical, self.ep_census) {
             (Some(historical), false) => format!(
                 "{} MiB = max({} MiB historical floor, {} MiB census [{}]): {} wins",
-                self.bytes() >> 20,
+                self.text_bytes() >> 20,
                 historical >> 20,
                 self.census_total >> 20,
                 self.census_text(),
@@ -2446,7 +2471,7 @@ impl AutoReserve {
                  (EP census: rank-local state / MTP ring / INT8 shared shadows where the trunk is \
                  sharded; the per-rank HIP runtime overhead is not measured on this device or \
                  rank count, so the floor stays)",
-                self.bytes() >> 20,
+                self.text_bytes() >> 20,
                 historical >> 20,
                 self.census_total >> 20,
                 self.census_text(),
@@ -2455,7 +2480,7 @@ impl AutoReserve {
             (None, false) => format!(
                 "{} MiB = census [{}] (historical floor retired: the census carries the \
                  measured HIP runtime overhead)",
-                self.bytes() >> 20,
+                self.text_bytes() >> 20,
                 self.census_text()
             ),
             (None, true) => format!(
@@ -2463,10 +2488,19 @@ impl AutoReserve {
                  carries the measured per-rank HIP runtime overhead, {} MiB; rank-local state / \
                  MTP ring / INT8 shared shadows where the trunk is sharded; \
                  HIPFIRE_EP_RESERVE_CENSUS=0 restores the floor)",
-                self.bytes() >> 20,
+                self.text_bytes() >> 20,
                 self.census_text(),
                 self.census.runtime >> 20
             ),
+        };
+        if self.vision_reserve_bytes == 0 {
+            text
+        } else {
+            format!(
+                "{} MiB = text ({text}) + {} MiB vision (resident weights + activation/projected rows)",
+                self.bytes() >> 20,
+                self.vision_reserve_bytes >> 20,
+            )
         }
     }
 }
@@ -2700,6 +2734,7 @@ pub fn incumbent_auto_resident_layers(
         scratch_mode,
         ranks: 1,
         chunk_rows: crate::gpu_forward::qwen4_prefill_chunk_requested(gpu, max_seq, scratch_mode),
+        vision_reserve_bytes: 0,
     })?;
     let (free, _) = gpu
         .device_mem_info()
@@ -4417,6 +4452,10 @@ pub struct PlacementInputsArgs<'a> {
     pub ranks: usize,
     /// The chunk the reserve is sized from; never probes the host link here.
     pub chunk_rows: usize,
+    /// Independent device reserve for the deferred vision tower and image
+    /// scratch; zero for a text-only load. The capacity quote must precede
+    /// the tower's upload so these bytes are charged exactly once.
+    pub vision_reserve_bytes: u64,
 }
 
 /// What the expert placement is sized from, for one rank of a `ranks`-way load.
@@ -4657,6 +4696,7 @@ fn placement_inputs_charged(
         scratch_mode,
         ranks,
         chunk_rows,
+        vision_reserve_bytes,
     } = *args;
     let qsa_format = state_format.qsa;
     let trunk = crate::weights::trunk_shard::census_trunk(config, ranks);
@@ -4864,8 +4904,9 @@ fn placement_inputs_charged(
         gather: gather_for(&census_context)?.unwrap_or(0),
         runtime: runtime.unwrap_or(0),
     };
-    let reserve =
-        AutoReserve::new(historical, census).map_err(|error| format!("qwen4: {error}"))?;
+    let reserve = AutoReserve::new(historical, census)
+        .and_then(|reserve| reserve.with_vision_reserve(vision_reserve_bytes))
+        .map_err(|error| format!("qwen4: {error}"))?;
     let reserve = if ep_census {
         reserve.with_ep_census()
     } else {
@@ -6419,6 +6460,105 @@ mod tests {
             shadow / MIB,
             tail.class_donors
         );
+    }
+
+    #[test]
+    fn vision_reserve_is_independent_of_ep_floor_census_and_forward_modes() {
+        const MIB: u64 = 1 << 20;
+        let config = crate::config::compact_test_config();
+        let census = census_at(&config, 16384, 4096, Full, 700 * MIB);
+        let total = census.total().unwrap();
+        let vision = 2_158_224_320;
+        // Exercise all four describe arms, including a historical floor large
+        // enough to hide the vision term if it were folded into the census.
+        for historical in [None, Some(total + 2 * vision)] {
+            for ep in [false, true] {
+                let mut baseline = AutoReserve::new(historical, census).unwrap();
+                if ep {
+                    baseline = baseline.with_ep_census();
+                }
+                let variants = [
+                    baseline,
+                    baseline
+                        .with_decode_share(17 * MIB)
+                        .with_decode_share_shadows(3 * MIB),
+                    baseline.with_ep_reserve(123 * MIB),
+                    baseline
+                        .with_ep_reserve(123 * MIB)
+                        .with_ep_reserve_shadows(3 * MIB),
+                ];
+                for text in variants {
+                    let reserved = text.with_vision_reserve(vision).unwrap();
+                    assert_eq!(reserved.bytes() - text.bytes(), vision);
+                    assert_eq!(
+                        reserved.placement_bytes(true) - text.placement_bytes(true),
+                        vision
+                    );
+                    assert_eq!(reserved.census, text.census);
+                    assert_eq!(reserved.census_total, text.census_total);
+                    assert_eq!(reserved.ep_census, text.ep_census);
+                    // Describing the vision quote must retain beta's exact
+                    // text calculation, including EP census / donor notes.
+                    assert!(reserved.describe().contains(&text.describe()));
+                    assert_eq!(text.with_vision_reserve(0).unwrap(), text);
+                    assert_eq!(
+                        text.with_vision_reserve(0).unwrap().describe(),
+                        text.describe()
+                    );
+                    // A quote is a set operation, never cumulative charging.
+                    assert_eq!(reserved.with_vision_reserve(vision).unwrap(), reserved);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn vision_reserve_survives_ep_donor_shadow_removal_and_checks_overflow() {
+        const MIB: u64 = 1 << 20;
+        let config = crate::config::compact_test_config();
+        let mut census = census_at(&config, 16384, 4096, Full, 700 * MIB);
+        census.f16_shadows = 31 * MIB;
+        census.shared_i8_shadows = 7 * MIB;
+        let vision = 2_158_224_320;
+        let (f16, i8, hosted) = charged_shadow_terms(
+            ForwardCharge::EpReserveShadowsInDonors { charged: 123 * MIB },
+            census.f16_shadows,
+            census.shared_i8_shadows,
+        );
+        let ordinary = AutoReserve::new(None, census)
+            .unwrap()
+            .with_ep_census()
+            .with_ep_reserve(123 * MIB)
+            .with_vision_reserve(vision)
+            .unwrap();
+        let donor = AutoReserve::new(
+            None,
+            ReserveCensus {
+                f16_shadows: f16,
+                shared_i8_shadows: i8,
+                ..census
+            },
+        )
+        .unwrap()
+        .with_ep_census()
+        .with_ep_reserve(123 * MIB)
+        .with_ep_reserve_shadows(hosted)
+        .with_vision_reserve(vision)
+        .unwrap();
+        // Hosting shadows removes those owners alone; the resident tower and
+        // image scratch cannot become donor bytes or disappear from the quote.
+        assert_eq!(ordinary.bytes() - donor.bytes(), hosted);
+        assert_eq!(donor.vision_reserve_bytes, vision);
+        assert_eq!(
+            donor.bytes() - donor.with_vision_reserve(0).unwrap().bytes(),
+            vision
+        );
+        let text = AutoReserve::new(Some(u64::MAX), census).unwrap();
+        assert!(text
+            .with_vision_reserve(1)
+            .unwrap_err()
+            .contains("overflows"));
+        assert_eq!(text.with_vision_reserve(0).unwrap().bytes(), u64::MAX);
     }
 
     /// An EP reserve that hosts the weight shadows in its donor segments drops exactly the

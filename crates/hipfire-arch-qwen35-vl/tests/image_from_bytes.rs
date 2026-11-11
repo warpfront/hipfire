@@ -292,3 +292,56 @@ fn zero_dimension_floors_to_factor() {
     assert!(h >= 32, "zero-dimension input should floor to factor");
     assert!(w >= 32, "zero-dimension input should floor to factor");
 }
+
+#[test]
+fn extreme_aspect_ratio_preserves_shared_bytes_and_path_compatibility() {
+    // The shared WMMA route has no naive score-row LDS cap. The Flash-Next
+    // adapter enforces its own reserve; this existing 27B input remains valid.
+    let bytes = solid_png_bytes(30, 40, 50, 1, 1_048_576);
+    let (_, height, width) = load_and_preprocess_from_bytes(&bytes, 16, 2).unwrap();
+    assert_eq!((height, width), (262_144, 32));
+    let path = std::env::temp_dir().join(format!(
+        "hipfire-vision-aspect-{}-{}.png",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    std::fs::write(&path, bytes).unwrap();
+    let result = hipfire_arch_qwen35_vl::image::load_and_preprocess(&path, 16, 2);
+    std::fs::remove_file(path).unwrap();
+    let (_, height, width) = result.unwrap();
+    assert_eq!((height, width), (262_144, 32));
+}
+
+#[test]
+fn large_local_path_preserves_downscale_while_bytes_keep_header_guard() {
+    // A complete valid image, rather than a header-only malformed fixture:
+    // the historical path route accepts it, decodes and downsizes it.
+    let bytes = solid_png_bytes(255, 0, 0, 4097, 4097);
+    let err = load_and_preprocess_from_bytes(&bytes, 16, 2).unwrap_err();
+    assert!(err.contains("exceed maximum"), "{err}");
+    let dir = std::env::temp_dir().join(format!(
+        "hipfire-img-large-path-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("large.png");
+    std::fs::write(&path, &bytes).unwrap();
+    let result = hipfire_arch_qwen35_vl::image::load_and_preprocess(&path, 16, 2);
+    let _ = std::fs::remove_dir_all(&dir);
+    let (pixels, height, width) =
+        result.expect("large path must downscale, not hit byte-input cap");
+    // Historical default-budget grid. This test runs with stock config, as
+    // do the existing processor tests; no process-wide env mutation needed.
+    assert_eq!((height, width), (1408, 1408));
+    assert_eq!(pixels.len(), 3 * 1408 * 1408);
+    let plane = height * width;
+    assert!(pixels[..plane].iter().all(|&value| value == 1.0));
+    assert!(pixels[plane..].iter().all(|&value| value == -1.0));
+}

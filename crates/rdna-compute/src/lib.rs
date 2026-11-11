@@ -135,6 +135,7 @@ pub mod prefill_route_capabilities;
 pub mod profile;
 pub mod profile_rocprof;
 pub mod profiler;
+pub mod qsa_mrope;
 pub mod qsa_pooled_mirror;
 pub mod qsa_sp_select;
 pub mod qwen35_fa_batch;

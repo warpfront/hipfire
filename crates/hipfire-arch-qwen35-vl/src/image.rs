@@ -122,6 +122,55 @@ pub fn smart_resize(
     }
 }
 
+/// Validate resize arithmetic without imposing a model-specific patch cap.
+/// WMMA vision attention can serve extreme aspect ratios whose rounded grid
+/// exceeds the naive attention LDS bound. Resource admission belongs to the
+/// caller that prices the tower scratch reserve.
+fn checked_resized_dimensions(
+    height: usize,
+    width: usize,
+    factor: usize,
+    max_pixels: usize,
+) -> Result<(usize, usize), String> {
+    if height == 0 || width == 0 || factor == 0 || height.checked_mul(width).is_none() {
+        return Err("image dimensions or patch/merge factor are zero or overflow".into());
+    }
+    let (h, w) = smart_resize(height, width, factor, VISION_MIN_PIXELS, max_pixels);
+    let pixels = h
+        .checked_mul(w)
+        .ok_or("resized image dimensions overflow")?;
+    if h == 0
+        || w == 0
+        || h > u32::MAX as usize
+        || w > u32::MAX as usize
+        || pixels
+            .checked_mul(3 * std::mem::size_of::<f32>())
+            .is_none_or(|bytes| bytes > isize::MAX as usize)
+    {
+        return Err(format!(
+            "resized image dimensions ({w}x{h}) exceed addressable image storage"
+        ));
+    }
+    Ok((h, w))
+}
+
+/// Resolve the exact dimensions used by the shared Qwen image processor.
+///
+/// This validates arithmetic and honours the resolved pixel budget. It does
+/// not impose a model-specific scratch reserve: callers such as Flash-Next
+/// must admit the resulting patch grid before decoding/allocating pixels.
+pub fn resized_dimensions(
+    height: usize,
+    width: usize,
+    patch_size: usize,
+    spatial_merge_size: usize,
+) -> Result<(usize, usize), String> {
+    let factor = patch_size
+        .checked_mul(spatial_merge_size)
+        .ok_or("image patch/merge factor overflow")?;
+    checked_resized_dimensions(height, width, factor, vision_max_pixels())
+}
+
 /// Shared preprocessing logic that takes an already-loaded `DynamicImage`.
 /// Returns (CHW data, height, width) where height and width are multiples of
 /// `patch_size * spatial_merge_size`.
@@ -129,13 +178,10 @@ fn preprocess_dynamic_image(
     img: image::DynamicImage,
     patch_size: usize,
     spatial_merge_size: usize,
-) -> (Vec<f32>, usize, usize) {
+) -> Result<(Vec<f32>, usize, usize), String> {
     let (orig_w, orig_h) = (img.width() as usize, img.height() as usize);
 
-    let factor = patch_size * spatial_merge_size;
-    let min_pixels = VISION_MIN_PIXELS;
-    let max_pixels = vision_max_pixels();
-    let (final_h, final_w) = smart_resize(orig_h, orig_w, factor, min_pixels, max_pixels);
+    let (final_h, final_w) = resized_dimensions(orig_h, orig_w, patch_size, spatial_merge_size)?;
 
     // HF's `Qwen2VLImageProcessorFast` uses PIL's BICUBIC (`resample=3`).
     // `FilterType::CatmullRom` is the `image` crate's bicubic filter; this
@@ -174,7 +220,7 @@ fn preprocess_dynamic_image(
             out[2 * plane + idx] = pixel[2] as f32 / 127.5 - 1.0; // channel 2 = B
         }
     }
-    (out, h, w)
+    Ok((out, h, w))
 }
 
 /// Load an image from a filesystem path, smart-resize, normalize.
@@ -188,12 +234,11 @@ pub fn load_and_preprocess(
     patch_size: usize,
     spatial_merge_size: usize,
 ) -> Result<(Vec<f32>, usize, usize), String> {
+    // Preserve the existing path-input contract: large local images are
+    // decoded and downscaled, while untrusted byte inputs retain their
+    // format-header bomb guard below. Flash-Next owns its stricter wrapper.
     let img = hipfire_runtime::imagedec::decode_dynamic_path(path)?;
-    Ok(preprocess_dynamic_image(
-        img,
-        patch_size,
-        spatial_merge_size,
-    ))
+    preprocess_dynamic_image(img, patch_size, spatial_merge_size)
 }
 
 /// Load an image from raw bytes (PNG or JPEG), smart-resize, normalize.
@@ -212,18 +257,17 @@ pub fn load_and_preprocess_from_bytes(
 ) -> Result<(Vec<f32>, usize, usize), String> {
     let (orig_w, orig_h) = hipfire_runtime::imagedec::probe_dimensions(data)?;
     let (orig_w, orig_h) = (orig_w as usize, orig_h as usize);
-    if orig_w * orig_h > MAX_DIMENSION_PIXELS {
+    if orig_w
+        .checked_mul(orig_h)
+        .is_none_or(|pixels| pixels > MAX_DIMENSION_PIXELS)
+    {
         return Err(format!(
             "image dimensions ({orig_w}x{orig_h}) exceed maximum ({MAX_DIMENSION_PIXELS} pixels)"
         ));
     }
 
     let img = hipfire_runtime::imagedec::decode_dynamic(data)?;
-    Ok(preprocess_dynamic_image(
-        img,
-        patch_size,
-        spatial_merge_size,
-    ))
+    preprocess_dynamic_image(img, patch_size, spatial_merge_size)
 }
 
 /// Extract non-overlapping patches from a CHW image.
@@ -858,6 +902,40 @@ mod tests {
             v, 10200.0,
             "patch_out_idx=2, c=1,t=0,dy=0,dx=0 should hold (1,2,0)"
         );
+    }
+
+    #[test]
+    fn resized_dimensions_preserve_existing_extreme_aspect_grids() {
+        // Fixed historical results, deliberately not recomputed via
+        // smart_resize: WMMA can serve this grid on the existing 27B route.
+        assert_eq!(
+            checked_resized_dimensions(1, 1_048_576, 32, VISION_MAX_PIXELS).unwrap(),
+            (32, 262_144)
+        );
+        assert_eq!(
+            checked_resized_dimensions(1_048_576, 1, 32, VISION_MAX_PIXELS).unwrap(),
+            (262_144, 32)
+        );
+    }
+
+    #[test]
+    fn resized_dimensions_keep_ordinary_images_unchanged() {
+        for (h, w) in [(192, 288), (720, 1280), (2160, 3840), (4096, 4096), (1, 1)] {
+            for budget in [65_536, VISION_MAX_PIXELS, VISION_LDS_MAX_PIXELS] {
+                let expected = smart_resize(h, w, 32, VISION_MIN_PIXELS, budget);
+                assert_eq!(
+                    checked_resized_dimensions(h, w, 32, budget).unwrap(),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resized_dimensions_reject_zero_and_overflow() {
+        for (h, w, factor) in [(0, 1, 32), (1, 0, 32), (1, 1, 0), (usize::MAX, 2, 32)] {
+            assert!(checked_resized_dimensions(h, w, factor, VISION_MAX_PIXELS).is_err());
+        }
     }
 
     /// 4×6 image, patch_size=2, SMS=2: ph=2, pw=3 — non-square. ph%SMS=0,

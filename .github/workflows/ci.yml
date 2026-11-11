@@ -354,6 +354,8 @@ jobs:
         run: bash scripts/leanup-ratchets.sh
       - name: Crate maps match the tree
         run: python3 scripts/check-crate-maps.py --check
+      - name: QSA image pooling positions and negative controls (host C++)
+        run: python3 scripts/test_qsa_mrope_position.py
       - name: Scratch growers invalidate captured graphs first
         run: python3 scripts/check-scratch-growth.py
       - name: Released CHANGELOG sections match their tags

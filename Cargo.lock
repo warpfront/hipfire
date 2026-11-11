@@ -1509,11 +1509,13 @@ version = "0.4.5"
 dependencies = [
  "half",
  "hip-bridge",
+ "hipfire-arch-qwen35-vl",
  "hipfire-config",
  "hipfire-cpu",
  "hipfire-dispatch",
  "hipfire-loader",
  "hipfire-runtime",
+ "image",
  "memmap2",
  "peacemaker-npu",
  "railgun",

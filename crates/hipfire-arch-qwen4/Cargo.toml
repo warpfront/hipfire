@@ -13,6 +13,7 @@ serde_json.workspace = true
 hip-bridge = { path = "../hip-bridge" }
 hipfire-config = { path = "../hipfire-config" }
 hipfire-runtime = { path = "../hipfire-runtime" }
+hipfire-arch-qwen35-vl = { path = "../hipfire-arch-qwen35-vl" }
 rdna-compute = { path = "../rdna-compute", features = ["deltanet"] }
 hipfire-dispatch = { path = "../hipfire-dispatch", features = ["deltanet"] }
 smallvec = { version = "1.15.2", features = ["const_generics"] }
@@ -30,6 +31,7 @@ railgun = { path = "../railgun", features = ["npu"] }
 railgun = { path = "../railgun" }
 
 [dev-dependencies]
+image.workspace = true
 half.workspace = true
 memmap2.workspace = true
 # `mtp_head_reference_pin_hw` decodes the artifact head tensors the HIP head reads (qt44 / qt53 experts).
@@ -174,6 +176,10 @@ required-features = ["lab", "reference-parity"]
 [[test]]
 name = "slowlink_prefill_hw"
 required-features = ["lab", "reference-parity"]
+
+[[example]]
+name = "qwen4_vision_dump"
+required-features = ["lab"]
 
 # Trunk-shard layer oracle: one real layer, unsharded vs the TP2 trunk shard on injected HC
 # streams (GPU for `run`; `plan`, `selftest` and `compare` are CPU-only).

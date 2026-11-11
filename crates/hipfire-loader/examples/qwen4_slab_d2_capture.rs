@@ -582,6 +582,7 @@ fn run() -> R<()> {
         path: path.clone(),
         max_seq: MAX_SEQ,
         sequence: None,
+        vision_reserve_bytes: 0,
         backend,
         vmm_granularity,
         kv_mode: hipfire_runtime::config::get().kv_mode.clone(),

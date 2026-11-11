@@ -489,6 +489,7 @@ fn make_op<'a>(
         head_dim: HEAD_DIM,
         rotary_dim: ROTARY_DIM,
         rope: rope(),
+        mrope: None,
         input_width: HIDDEN,
         rotation: s.rotation,
         mode: if reuse {

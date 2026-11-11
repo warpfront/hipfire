@@ -9,6 +9,11 @@
 //! hipfire-quantize <hf-dir> --vision-only --output qwen3.8-27b-vision.hfq
 //! ```
 //!
+//! Flash Next uses this same dtype policy through `--qwen4-flash-next
+//! --vision-only`. Its official source also uses `model.visual.*`, including
+//! the complete merger/projector; the native pack supports bounded remote
+//! ranges without ingesting the language or PLE payloads.
+//!
 //! Lives in the lib target (not the binary) so the contract is pinned by
 //! `cargo test -p hipfire-quantize --lib vision`. The binary's ingest loop
 //! (`pipeline.rs`) and dtype fallback call these; they must agree with

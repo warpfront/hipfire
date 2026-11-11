@@ -1,0 +1,1671 @@
+{
+  "schema": "hipfire.qwen4-vision.halo-validation.v1",
+  "date": "2026-10-27",
+  "tested_commit": "428e2e63627228cd3b5f79759ef40550979e123a",
+  "upstream_beta": "3a01cc447bceec99ec28ed81d07460a61b395f4f",
+  "scope": "Functional text/image and load-admission evidence; not throughput/TTFT, full-context execution, DFlash, NPU-executed, full-model logits/state parity or PM4 admission proof.",
+  "hardware": {
+    "arch": "gfx1151",
+    "gpu_device": "/sys/devices/pci0000:00/0000:00:08.1/0000:c5:00.0",
+    "kernel": "7.0.0-38-generic",
+    "hip_version": "7.16.26385-0000000",
+    "rocm_prefix": "/opt/rocm",
+    "vram_total_bytes": 103079215104,
+    "settled_vram_used_bytes": 302886912,
+    "settled_gtt_used_bytes": 71155712,
+    "gpu_busy_percent": 0,
+    "recorded_at": "2026-10-27T08:56:36.665678+00:00",
+    "sample_scope": "after all phase-two test services stopped; not a peak-memory measurement"
+  },
+  "fixtures": {
+    "schema": "hipfire.vision938.fixture-identity.v1",
+    "started_at": "2026-10-27T03:55:04-0400",
+    "target": {
+      "path": "/home/husrcf/.hipfire/models/qwen3.8-flash-next.mq4-xts",
+      "bytes": 125288544792,
+      "sha256": "8b15b6fede7d7c5bfed0db4720a8295bedda51bc93e545fa242bd50d0f200972"
+    },
+    "sidecar": {
+      "path": "/home/husrcf/Code/hipfire-qwen4-vision-938/.codeinsight+research/vision-938/qwen3.8-flash-next-vision.hfq",
+      "bytes": 904008640,
+      "sha256": "acef5567d9ee0f253d9f8ebde994bd9c37e285754db6d227b3f1df2fea67cc08"
+    }
+  },
+  "auxiliary_fixtures": {
+    "qwen3.8-flash-next.mq4-xts.ple-q4": {
+      "bytes": 28800142336,
+      "sha256": "b46cd87bb8bffac62d3f905a272b864c807a68d3acd5605710cd1d02c74e7a82"
+    },
+    "qwen3.8-flash-next.mq4-xts.trunk-overlay": {
+      "bytes": 305543168,
+      "sha256": "df49bc0aa601c2e26556261effd680f0be5d216804a1c5976a8a07ccd66840fd"
+    }
+  },
+  "fixture_layout": "Recorded local monolithic trunk with separately identified Q4LM row-order PLE and gfx1151-zab-v1 overlay; not a fresh split-layout pull.",
+  "fixture_verification": "Supplied fixture digests and their original source timestamp are preserved; sizes and agreement across new arm receipts checked. This generator does not claim another full model/sidecar/auxiliary rehash.",
+  "pr_binaries": {
+    "commit": "428e2e63627228cd3b5f79759ef40550979e123a",
+    "binaries": {
+      "hipfire": {
+        "bytes": 101376840,
+        "md5": "2ab92e9b4bdf3cf231f32d32d3195a9b",
+        "sha256": "95f5a2a3b6fcab8001d629a80190bef523ad0d0d967e33d6c62e801530dd5d63"
+      },
+      "daemon": {
+        "bytes": 110797576,
+        "md5": "f1c9286c4f73ccc788dbe9c28eb04bfe",
+        "sha256": "ceb5c5399e73aaefa15dab3f3b6042e596c472094208f01ece86340fc1dcf21e"
+      }
+    }
+  },
+  "beta_binaries": {
+    "commit": "3a01cc447bceec99ec28ed81d07460a61b395f4f",
+    "source_worktree": "/tmp/hipfire-970-beta-3a01cc44",
+    "source_status_before": "",
+    "target_dir": "/home/husrcf/Code/hipfire-qwen4-vision-938/target",
+    "metadata_command": [
+      "/home/husrcf/.cargo/bin/cargo",
+      "metadata",
+      "--format-version",
+      "1",
+      "--no-deps",
+      "--locked"
+    ],
+    "workspace_package_count": 63,
+    "clean_command": [
+      "/home/husrcf/.cargo/bin/cargo",
+      "clean",
+      "--release",
+      "-p",
+      "hip-bridge@0.4.4",
+      "-p",
+      "hipfire-arch-cohere2moe@0.4.4",
+      "-p",
+      "hipfire-arch-deepseek4@0.4.4",
+      "-p",
+      "hipfire-arch-diffusion@0.4.4",
+      "-p",
+      "hipfire-arch-dots-ocr@0.4.4",
+      "-p",
+      "hipfire-arch-embeddinggemma2@0.4.4",
+      "-p",
+      "hipfire-arch-gemma4@0.4.4",
+      "-p",
+      "hipfire-arch-lfm2-vl@0.4.4",
+      "-p",
+      "hipfire-arch-lfm2moe@0.1.0",
+      "-p",
+      "hipfire-arch-llama@0.4.4",
+      "-p",
+      "hipfire-arch-maple@0.4.4",
+      "-p",
+      "hipfire-arch-minimax@0.4.4",
+      "-p",
+      "hipfire-arch-muse-glimmer@0.4.4",
+      "-p",
+      "hipfire-arch-qwen2@0.4.4",
+      "-p",
+      "hipfire-arch-qwen35@0.4.4",
+      "-p",
+      "hipfire-arch-qwen35-embed@0.4.4",
+      "-p",
+      "hipfire-arch-qwen35-vl@0.4.4",
+      "-p",
+      "hipfire-arch-qwen4@0.4.4",
+      "-p",
+      "hipfire-arch-toy@0.4.4",
+      "-p",
+      "hipfire-atlas@0.4.4",
+      "-p",
+      "hipfire-cli@0.4.4",
+      "-p",
+      "hipfire-client@0.4.4",
+      "-p",
+      "hipfire-config@0.4.4",
+      "-p",
+      "hipfire-cpu@0.4.4",
+      "-p",
+      "hipfire-daemon@0.4.4",
+      "-p",
+      "hipfire-detect@0.4.4",
+      "-p",
+      "hipfire-dispatch@0.4.4",
+      "-p",
+      "hipfire-dispatch-tests@0.4.4",
+      "-p",
+      "hipfire-ds4-parent@0.4.4",
+      "-p",
+      "hipfire-engine@0.4.4",
+      "-p",
+      "hipfire-generate@0.4.4",
+      "-p",
+      "hipfire-kernel-abi@0.4.4",
+      "-p",
+      "hipfire-loader@0.4.4",
+      "-p",
+      "hipfire-pflash@0.4.4",
+      "-p",
+      "hipfire-quantize@0.4.4",
+      "-p",
+      "hipfire-reap@0.4.4",
+      "-p",
+      "hipfire-registry@0.4.4",
+      "-p",
+      "hipfire-runtime@0.4.4",
+      "-p",
+      "hipfire-tui@0.4.4",
+      "-p",
+      "hipfire-xdna@0.4.4",
+      "-p",
+      "hsa-bridge@0.4.4",
+      "-p",
+      "npu-tools@0.4.4",
+      "-p",
+      "peacemaker-author@0.4.4",
+      "-p",
+      "peacemaker-cdna@0.4.4",
+      "-p",
+      "peacemaker-ir@0.4.4",
+      "-p",
+      "peacemaker-isa@0.4.1",
+      "-p",
+      "peacemaker-lift@0.4.4",
+      "-p",
+      "peacemaker-npu@0.4.4",
+      "-p",
+      "peacemaker-rip@0.4.4",
+      "-p",
+      "pm-census@0.4.4",
+      "-p",
+      "radiowave@0.4.4",
+      "-p",
+      "railgun@0.4.4",
+      "-p",
+      "railgun-cert@0.4.4",
+      "-p",
+      "railgun-corpus@0.4.4",
+      "-p",
+      "railgun-jitcorpus@0.4.4",
+      "-p",
+      "rdna-compute@0.4.4",
+      "-p",
+      "redline@0.4.4",
+      "-p",
+      "redline-dispatch@0.4.4",
+      "-p",
+      "redline-rocr@0.4.4",
+      "-p",
+      "saddle-core@0.4.4",
+      "-p",
+      "saddle-lab@0.4.4",
+      "-p",
+      "saddle-quant@0.4.4",
+      "-p",
+      "va-bridge@0.1.0"
+    ],
+    "clean_scope": "release outputs of metadata workspace_members only; crates.io dependencies retained",
+    "build_command": [
+      "/home/husrcf/.cargo/bin/cargo",
+      "build",
+      "--release",
+      "--locked",
+      "-p",
+      "hipfire-cli",
+      "-p",
+      "hipfire-daemon",
+      "--jobs",
+      "4"
+    ],
+    "environment": {
+      "CARGO_TARGET_DIR": "/home/husrcf/Code/hipfire-qwen4-vision-938/target",
+      "CARGO_BUILD_JOBS": "4",
+      "CARGO_TERM_COLOR": "never",
+      "HIP_VISIBLE_DEVICES": "-1",
+      "ROCR_VISIBLE_DEVICES": "-1",
+      "CUDA_VISIBLE_DEVICES": "-1",
+      "RUSTFLAGS": null,
+      "CARGO_ENCODED_RUSTFLAGS": null,
+      "RUSTUP_TOOLCHAIN": null,
+      "CC": null,
+      "CXX": null,
+      "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER": null
+    },
+    "started_utc": "2026-10-27T08:33:05.690509+00:00",
+    "status": "complete",
+    "gpu_or_inference_commands_run": false,
+    "clean_exit_code": 0,
+    "clean_elapsed_seconds": 0.205,
+    "finished_utc": "2026-10-27T08:35:17.601238+00:00",
+    "build_elapsed_seconds": 131.706,
+    "build_exit_code": 0,
+    "source_commit_after": "3a01cc447bceec99ec28ed81d07460a61b395f4f",
+    "source_status_after": "",
+    "binaries": {
+      "hipfire": {
+        "bytes": 101109624,
+        "md5": "fe34a1c29e982f55df184b38c50bac85",
+        "sha256": "12b3967528682fcc6de9f582a30d69a37cbeb40f39c165226b8dfd9275ad11bb"
+      },
+      "daemon": {
+        "bytes": 110605776,
+        "md5": "9ac9197ce3e644b815e9d9ad95bf79d5",
+        "sha256": "e187275f630982e4757b19b61d7324cd8b60dcc1fc19a1811d38bdf6169adb89"
+      }
+    }
+  },
+  "stock_beta": {
+    "status": "load_refused",
+    "oom_guard": "product default; no override",
+    "failure": "[hipfire] pre-warm failed: daemon error: [gpu retryable=false rolled_back=false attempt=0] load failed: qwen4: planned RAM/GTT upper bound: routed experts need 80.7 GiB of pinned host RAM plus 4 GiB headroom, but MemAvailable - CMA is 22.5 GiB (plus 0.0 GiB estimated in TTM's page pool); free host memory or keep more expert layers in VRAM (HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS). GPU: gfx1151 (98148 MB free / 98304 MB total); no model loaded (the prior model was unloaded before this load); serving lazily",
+    "strict_stock_default_comparison": "not achieved: BIOS-carveout device weights counted against remaining host RAM"
+  },
+  "reference_override": {
+    "binary_commit": "3a01cc447bceec99ec28ed81d07460a61b395f4f",
+    "environment": {
+      "HIPFIRE_OOM_GUARD": "0"
+    },
+    "scope": "Non-default reference only. Disables additional host-headroom checks, not merely this refusal. Recorded fully-resident q8 placement and native-MTP/GPU-only request routes match; PR guard remains at its default."
+  },
+  "text_comparison": {
+    "rows": 5,
+    "arms": [
+      "beta-guard-off",
+      "pr-default",
+      "pr-auto-sidecar"
+    ],
+    "all_three_transcripts_byte_identical": true,
+    "transcript_md5": "578a6f19180b6e65e95a36eb0fe6bd32",
+    "fields": [
+      "content",
+      "reasoning_content",
+      "tool_calls",
+      "finish",
+      "request_md5",
+      "prompt_md5",
+      "gen",
+      "ctx"
+    ]
+  },
+  "arms": {
+    "beta-guard-off": {
+      "commit": "3a01cc447bceec99ec28ed81d07460a61b395f4f",
+      "settings": {
+        "vision_mode": "omitted; schema default auto",
+        "sidecar": false,
+        "max_seq": "automatic; omitted",
+        "speculation": "product default; no --spec",
+        "npu_trunk": "product default; no override",
+        "graph": "product default; no override",
+        "oom_guard": "off; non-stock reference for BIOS-carveout host-accounting bug"
+      },
+      "command": [
+        "/home/husrcf/Code/hipfire-qwen4-vision-938/.codeinsight+research/vision-938/halo-gate-20261027-beta3a01/beta-bin/hipfire",
+        "serve",
+        "--model",
+        "/home/husrcf/.hipfire/models/qwen3.8-flash-next.mq4-xts",
+        "--idle-timeout",
+        "0",
+        "127.0.0.1:11538"
+      ],
+      "status": "pass",
+      "harnesses": [
+        {
+          "name": "battery",
+          "command": [
+            "python3",
+            "scripts/serve_harness.py",
+            "--model",
+            "/home/husrcf/.hipfire/models/qwen3.8-flash-next.mq4-xts",
+            "--port",
+            "11538",
+            "--mode",
+            "battery",
+            "--no-spawn",
+            "--mtp",
+            "auto",
+            "--sampling",
+            "greedy",
+            "--seed",
+            "0",
+            "--thinking",
+            "off",
+            "--thinking-effort",
+            "none",
+            "--max-tokens",
+            "512",
+            "--serve-log",
+            "/home/husrcf/Code/hipfire-qwen4-vision-938/.codeinsight+research/vision-938/halo-gate-20261027-beta3a01/beta-guard-off.serve.log",
+            "--out",
+            "/home/husrcf/Code/hipfire-qwen4-vision-938/.codeinsight+research/vision-938/halo-gate-20261027-beta3a01/beta-guard-off.battery.json"
+          ],
+          "exit_code": 0
+        }
+      ],
+      "load_evidence": [
+        "  qwen4 ple rows: q4 from /home/husrcf/.hipfire/models/qwen3.8-flash-next.mq4-xts.ple-q4 (Q4LM, row order, 28.8 GB)",
+        "  qwen4 state: QSA q8 (Q8_0 blocks of 32) K/V (vmm context storage), GDN f32 recurrent",
+        "  qwen4 expert placement: HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS unset, fully resident (62475 MiB routed experts + 5115 MiB non-expert weights + 15045 MiB reserve (15045 MiB = max(12126 MiB historical floor, 15045 MiB census [QSA context 4224 MiB, state 225 MiB, forward 8603 MiB, F16 weight shadows 1238 MiB, INT8 shared-expert shadows 0 MiB, QSA selector 0 MiB, native MTP 0 MiB, QSA gather 512 MiB, HIP runtime 0 MiB, fp16_x 160 MiB, ksplit_det 40 MiB, int4_xq 11 MiB, moe_group 1 MiB, down_i4q 28 MiB, slab_tiles 0 MiB, slab_union 0 MiB, mq_fixed 0 MiB, gdn_dense_a 0 MiB, gdn_dense_ef 0 MiB, gdn_pair_counters 0 MiB]): census wins) fit in 98148 MiB free device memory)",
+        "  qwen4 trunk overlay: applied 108 QT44 tensors from /home/husrcf/.hipfire/models/qwen3.8-flash-next.mq4-xts.trunk-overlay (default gfx1151-zab-v1; bound to base 125288544792 B, index sha256 8703bb1626ff, file sha256 8b15b6fede7d; 449280000 -> 305510400 bytes)",
+        "  qwen4 prefill chunk: 8192 rows (requested 8192)",
+        "  qwen4 memory admission: 18864 MiB free after load; a 262144-token context commits 8238 MiB more (5408 MiB QSA context incl. any F16 arena + 512 MiB gather workspace + 2318 MiB MTP request) + 5590 MiB resident PLE + 2048 MiB headroom; card_cap 262144 tokens (with the current free host memory the context fits up to 262144 tokens; this limit moves with free host memory)",
+        "  qwen4 native MTP speculator enabled (K=7)",
+        "  qwen4 native MTP n-gram: on (n_match=5 n_min=3 n_max=3)",
+        "max_seq: 262144 (bound=model; model_ctx=262144, card_cap=262144, kv=q8)"
+      ],
+      "admission": {
+        "free_before_tower_mib": 18864,
+        "max_seq": 262144,
+        "growth_mib": 8238,
+        "qsa_context_mib": 5408,
+        "gather_mib": 512,
+        "mtp_request_mib": 2318,
+        "resident_ple_mib": 5590,
+        "headroom_mib": 2048,
+        "card_cap": 262144,
+        "vision_reserve_bytes": 0,
+        "native_mtp_k": 7
+      },
+      "npu_plan_lines": [
+        "npu-trunk: built-in Halo calibration (measured on kernel 7.3.0-rc7-perfopt+, NPU firmware 1.1.2.65, GPU 0000:c0:00.0) applies by arch/model/route; this host kernel 7.0.0-38-generic, NPU firmware 1.1.2.65, GPU 0000:c5:00.0",
+        "npu-trunk: mode=auto contract=bf16 families=qkv,zab,q,kvidx cal_key={\"device\":{\"arch\":\"gfx1151\",\"pci_bdf\":\"0000:c5:00.0\",\"npu_fw_version\":\"1.1.2.65\"},\"build\":\"hipfire-0.4.2:npu-trunk-bf16-rowmajor-v1\",\"kernel\":{\"uname_release\":\"7.0.0-38-generic\"},\"model_trunk_index_sha256\":\"098bd75fd3a6a5174d06033f2b3ec7febeb7777e7eba4696b64cecca5e3418b6\",\"epilogue\":\"bf16\",\"trunk_route\":\"overlay:gfx1151-zab-v1\"} cal_sha256=8b92970df383fd524f1c432a05634468d165515e9047433f48a4db4a517b8b72 n*=8256 T(16384)=6945.452445/7886.368000 T(65536)=29092.209779/32855.872000 cal_source=builtin host=[kernel=7.0.0-38-generic iommu=gpu:identity,npu:identity amdxdna=in-tree npu_fw=1.1.2.65]",
+        "npu-trunk: mode=auto families=0xff contract=bf16_direct trunk_route=overlay:gfx1151-zab-v1 zab_source=stock-MQ6-DtoH-before-overlay pack_ms=952.052 download_ms=334.673 resident_bytes=2113536000 npu_panels_bytes=2113536000 gpu_twin_bytes=0 bank_b_bytes=503447552 runtime=open raw=DtoH(no-retained-host-copy)",
+        "npu-trunk: rows=44 families=none plan=[gpu 0..44] predicted=+0.0% rates=gen0 gpu_x1.000 npu_x1.000",
+        "npu-trunk: rows=55 families=none plan=[gpu 0..55] predicted=+0.0% rates=gen0 gpu_x1.000 npu_x1.000",
+        "npu-trunk: rows=25 families=none plan=[gpu 0..25] predicted=+0.0% rates=gen0 gpu_x1.000 npu_x1.000",
+        "npu-trunk: rows=33 families=none plan=[gpu 0..33] predicted=+0.0% rates=gen0 gpu_x1.000 npu_x1.000",
+        "npu-trunk: rows=31 families=none plan=[gpu 0..31] predicted=+0.0% rates=gen0 gpu_x1.000 npu_x1.000"
+      ],
+      "memory_snapshots": {
+        "before_start": {
+          "time": 1793090435.3600109,
+          "mem_info_vram_total": 103079215104,
+          "mem_info_vram_used": 302886912,
+          "mem_info_gtt_total": 16630665216,
+          "mem_info_gtt_used": 71155712,
+          "gpu_busy_percent": 0,
+          "host_kib": {
+            "MemTotal": 32481768,
+            "MemAvailable": 25641104,
+            "SwapFree": 7602024
+          }
+        },
+        "after_prewarm": {
+          "time": 1793090476.7096097,
+          "mem_info_vram_total": 103079215104,
+          "mem_info_vram_used": 83466125312,
+          "mem_info_gtt_total": 16630665216,
+          "mem_info_gtt_used": 77516800,
+          "gpu_busy_percent": 27,
+          "host_kib": {
+            "MemTotal": 32481768,
+            "MemAvailable": 17027520,
+            "SwapFree": 7599136
+          }
+        },
+        "after_battery": {
+          "time": 1793090488.7539935,
+          "mem_info_vram_total": 103079215104,
+          "mem_info_vram_used": 87933820928,
+          "mem_info_gtt_total": 16630665216,
+          "mem_info_gtt_used": 77516800,
+          "gpu_busy_percent": 82,
+          "host_kib": {
+            "MemTotal": 32481768,
+            "MemAvailable": 16990088,
+            "SwapFree": 7446996
+          }
+        },
+        "after_requests": {
+          "time": 1793090488.7543893,
+          "mem_info_vram_total": 103079215104,
+          "mem_info_vram_used": 87933820928,
+          "mem_info_gtt_total": 16630665216,
+          "mem_info_gtt_used": 77516800,
+          "gpu_busy_percent": 82,
+          "host_kib": {
+            "MemTotal": 32481768,
+            "MemAvailable": 16990088,
+            "SwapFree": 7446996
+          }
+        },
+        "after_stop": {
+          "time": 1793090490.1703246,
+          "mem_info_vram_total": 103079215104,
+          "mem_info_vram_used": 302886912,
+          "mem_info_gtt_total": 16630665216,
+          "mem_info_gtt_used": 71155712,
+          "gpu_busy_percent": 76,
+          "host_kib": {
+            "MemTotal": 32481768,
+            "MemAvailable": 24049480,
+            "SwapFree": 7446996
+          }
+        }
+      }
+    },
+    "pr-default": {
+      "commit": "428e2e63627228cd3b5f79759ef40550979e123a",
+      "settings": {
+        "vision_mode": "omitted; schema default auto",
+        "sidecar": false,
+        "max_seq": "automatic; omitted",
+        "speculation": "product default; no --spec",
+        "npu_trunk": "product default; no override",
+        "graph": "product default; no override",
+        "oom_guard": "product default; no override"
+      },
+      "command": [
+        "/home/husrcf/Code/hipfire-qwen4-vision-938/.codeinsight+research/vision-938/halo-gate-20261027-beta3a01/pr-bin/hipfire",
+        "serve",
+        "--model",
+        "/home/husrcf/.hipfire/models/qwen3.8-flash-next.mq4-xts",
+        "--idle-timeout",
+        "0",
+        "127.0.0.1:11538"
+      ],
+      "status": "pass",
+      "harnesses": [
+        {
+          "name": "battery",
+          "command": [
+            "python3",
+            "scripts/serve_harness.py",
+            "--model",
+            "/home/husrcf/.hipfire/models/qwen3.8-flash-next.mq4-xts",
+            "--port",
+            "11538",
+            "--mode",
+            "battery",
+            "--no-spawn",
+            "--mtp",
+            "auto",
+            "--sampling",
+            "greedy",
+            "--seed",
+            "0",
+            "--thinking",
+            "off",
+            "--thinking-effort",
+            "none",
+            "--max-tokens",
+            "512",
+            "--serve-log",
+            "/home/husrcf/Code/hipfire-qwen4-vision-938/.codeinsight+research/vision-938/halo-gate-20261027-beta3a01/pr-default.serve.log",
+            "--out",
+            "/home/husrcf/Code/hipfire-qwen4-vision-938/.codeinsight+research/vision-938/halo-gate-20261027-beta3a01/pr-default.battery.json",
+            "--compare-transcript",
+            "/home/husrcf/Code/hipfire-qwen4-vision-938/.codeinsight+research/vision-938/halo-gate-20261027-beta3a01/beta-guard-off.battery.json"
+          ],
+          "exit_code": 0
+        },
+        {
+          "name": "image",
+          "command": [
+            "python3",
+            "scripts/check_qwen4_vision.py",
+            "--base-url",
+            "http://127.0.0.1:11538",
+            "--model",
+            "/home/husrcf/.hipfire/models/qwen3.8-flash-next.mq4-xts",
+            "--expect-vision",
+            "off",
+            "--timeout",
+            "300",
+            "--identity-json",
+            "/home/husrcf/Code/hipfire-qwen4-vision-938/.codeinsight+research/vision-938/halo-gate-20261027-beta3a01/pr-default.identity.json",
+            "--output",
+            "/home/husrcf/Code/hipfire-qwen4-vision-938/.codeinsight+research/vision-938/halo-gate-20261027-beta3a01/pr-default.images.json"
+          ],
+          "exit_code": 0
+        }
+      ],
+      "load_evidence": [
+        "  qwen4 ple rows: q4 from /home/husrcf/.hipfire/models/qwen3.8-flash-next.mq4-xts.ple-q4 (Q4LM, row order, 28.8 GB)",
+        "  qwen4 state: QSA q8 (Q8_0 blocks of 32) K/V (vmm context storage), GDN f32 recurrent",
+        "  qwen4 expert placement: HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS unset, fully resident (62475 MiB routed experts + 5115 MiB non-expert weights + 15045 MiB reserve (15045 MiB = max(12126 MiB historical floor, 15045 MiB census [QSA context 4224 MiB, state 225 MiB, forward 8603 MiB, F16 weight shadows 1238 MiB, INT8 shared-expert shadows 0 MiB, QSA selector 0 MiB, native MTP 0 MiB, QSA gather 512 MiB, HIP runtime 0 MiB, fp16_x 160 MiB, ksplit_det 40 MiB, int4_xq 11 MiB, moe_group 1 MiB, down_i4q 28 MiB, slab_tiles 0 MiB, slab_union 0 MiB, mq_fixed 0 MiB, gdn_dense_a 0 MiB, gdn_dense_ef 0 MiB, gdn_pair_counters 0 MiB]): census wins) fit in 98148 MiB free device memory)",
+        "  qwen4 trunk overlay: applied 108 QT44 tensors from /home/husrcf/.hipfire/models/qwen3.8-flash-next.mq4-xts.trunk-overlay (default gfx1151-zab-v1; bound to base 125288544792 B, index sha256 8703bb1626ff, file sha256 8b15b6fede7d; 449280000 -> 305510400 bytes)",
+        "  qwen4 prefill chunk: 8192 rows (requested 8192)",
+        "  qwen4 memory admission: 18864 MiB free after load; a 262144-token context commits 8238 MiB more (5408 MiB QSA context incl. any F16 arena + 512 MiB gather workspace + 2318 MiB MTP request) + 8162 MiB resident PLE + 2048 MiB headroom; card_cap 262144 tokens (with the current free host memory the context fits up to 262144 tokens; this limit moves with free host memory)",
+        "  qwen4 native MTP speculator enabled (K=7)",
+        "  qwen4 native MTP n-gram: on (n_match=5 n_min=3 n_max=3)",
+        "max_seq: 262144 (bound=model; model_ctx=262144, card_cap=262144, kv=q8)"
+      ],
+      "admission": {
+        "free_before_tower_mib": 18864,
+        "max_seq": 262144,
+        "growth_mib": 8238,
+        "qsa_context_mib": 5408,
+        "gather_mib": 512,
+        "mtp_request_mib": 2318,
+        "resident_ple_mib": 8162,
+        "headroom_mib": 2048,
+        "card_cap": 262144,
+        "vision_reserve_bytes": 0,
+        "native_mtp_k": 7
+      },
+      "npu_plan_lines": [
+        "npu-trunk: built-in Halo calibration (measured on kernel 7.3.0-rc7-perfopt+, NPU firmware 1.1.2.65, GPU 0000:c0:00.0) applies by arch/model/route; this host kernel 7.0.0-38-generic, NPU firmware 1.1.2.65, GPU 0000:c5:00.0",
+        "npu-trunk: mode=auto contract=bf16 families=qkv,zab,q,kvidx cal_key={\"device\":{\"arch\":\"gfx1151\",\"pci_bdf\":\"0000:c5:00.0\",\"npu_fw_version\":\"1.1.2.65\"},\"build\":\"hipfire-0.4.2:npu-trunk-bf16-rowmajor-v1\",\"kernel\":{\"uname_release\":\"7.0.0-38-generic\"},\"model_trunk_index_sha256\":\"098bd75fd3a6a5174d06033f2b3ec7febeb7777e7eba4696b64cecca5e3418b6\",\"epilogue\":\"bf16\",\"trunk_route\":\"overlay:gfx1151-zab-v1\"} cal_sha256=8b92970df383fd524f1c432a05634468d165515e9047433f48a4db4a517b8b72 n*=8256 T(16384)=6945.452445/7886.368000 T(65536)=29092.209779/32855.872000 cal_source=builtin host=[kernel=7.0.0-38-generic iommu=gpu:identity,npu:identity amdxdna=in-tree npu_fw=1.1.2.65]",
+        "npu-trunk: mode=auto families=0xff contract=bf16_direct trunk_route=overlay:gfx1151-zab-v1 zab_source=stock-MQ6-DtoH-before-overlay pack_ms=909.566 download_ms=329.730 resident_bytes=2113536000 npu_panels_bytes=2113536000 gpu_twin_bytes=0 bank_b_bytes=503447552 runtime=open raw=DtoH(no-retained-host-copy)",
+        "npu-trunk: rows=44 families=none plan=[gpu 0..44] predicted=+0.0% rates=gen0 gpu_x1.000 npu_x1.000",
+        "npu-trunk: rows=55 families=none plan=[gpu 0..55] predicted=+0.0% rates=gen0 gpu_x1.000 npu_x1.000",
+        "npu-trunk: rows=25 families=none plan=[gpu 0..25] predicted=+0.0% rates=gen0 gpu_x1.000 npu_x1.000",
+        "npu-trunk: rows=33 families=none plan=[gpu 0..33] predicted=+0.0% rates=gen0 gpu_x1.000 npu_x1.000",
+        "npu-trunk: rows=31 families=none plan=[gpu 0..31] predicted=+0.0% rates=gen0 gpu_x1.000 npu_x1.000"
+      ],
+      "memory_snapshots": {
+        "before_start": {
+          "time": 1793090968.46419,
+          "mem_info_vram_total": 103079215104,
+          "mem_info_vram_used": 302886912,
+          "mem_info_gtt_total": 16630665216,
+          "mem_info_gtt_used": 71155712,
+          "gpu_busy_percent": 0,
+          "host_kib": {
+            "MemTotal": 32481768,
+            "MemAvailable": 26926632,
+            "SwapFree": 7337128
+          }
+        },
+        "after_prewarm": {
+          "time": 1793091004.6348403,
+          "mem_info_vram_total": 103079215104,
+          "mem_info_vram_used": 83466027008,
+          "mem_info_gtt_total": 16630665216,
+          "mem_info_gtt_used": 77516800,
+          "gpu_busy_percent": 29,
+          "host_kib": {
+            "MemTotal": 32481768,
+            "MemAvailable": 19935592,
+            "SwapFree": 7315292
+          }
+        },
+        "after_battery": {
+          "time": 1793091017.23428,
+          "mem_info_vram_total": 103079215104,
+          "mem_info_vram_used": 87933722624,
+          "mem_info_gtt_total": 16630665216,
+          "mem_info_gtt_used": 77516800,
+          "gpu_busy_percent": 71,
+          "host_kib": {
+            "MemTotal": 32481768,
+            "MemAvailable": 19842156,
+            "SwapFree": 7311832
+          }
+        },
+        "after_requests": {
+          "time": 1793091017.6516476,
+          "mem_info_vram_total": 103079215104,
+          "mem_info_vram_used": 88055361536,
+          "mem_info_gtt_total": 16630665216,
+          "mem_info_gtt_used": 77516800,
+          "gpu_busy_percent": 71,
+          "host_kib": {
+            "MemTotal": 32481768,
+            "MemAvailable": 19843952,
+            "SwapFree": 7311832
+          }
+        },
+        "after_stop": {
+          "time": 1793091019.0671024,
+          "mem_info_vram_total": 103079215104,
+          "mem_info_vram_used": 302886912,
+          "mem_info_gtt_total": 16630665216,
+          "mem_info_gtt_used": 71155712,
+          "gpu_busy_percent": 70,
+          "host_kib": {
+            "MemTotal": 32481768,
+            "MemAvailable": 26992124,
+            "SwapFree": 7311832
+          }
+        }
+      },
+      "image_cases": [
+        {
+          "name": "red",
+          "stream": false,
+          "http_status": 400,
+          "text": "",
+          "finish_reason": null,
+          "pass": true,
+          "error": "{\"error\":{\"message\":\"daemon error: [unsupported retryable=false rolled_back=false attempt=6] model has no vision encoder\",\"type\":\"invalid_request_error\"}}",
+          "image_sha256": "f6a996480096b673a0b79ff45d7d2c95e3962ce3c4a5d4a3a5532736beede47d",
+          "prompt_md5": "915874213f8bec59f1b12cd689c58e0a",
+          "request_sha256": "c8ef5b0e1f3efed8a0e37bb8c71b4923cf690fdb752e27d3756a2258b16d33c6"
+        },
+        {
+          "name": "red",
+          "stream": true,
+          "http_status": 400,
+          "text": "",
+          "finish_reason": null,
+          "pass": true,
+          "error": "{\"error\":{\"message\":\"daemon error: [unsupported retryable=false rolled_back=false attempt=7] model has no vision encoder\",\"type\":\"invalid_request_error\"}}",
+          "image_sha256": "f6a996480096b673a0b79ff45d7d2c95e3962ce3c4a5d4a3a5532736beede47d",
+          "prompt_md5": "915874213f8bec59f1b12cd689c58e0a",
+          "request_sha256": "8388d5fb64ec04734ca8dd7a98a2e456ea032939d27c8672710332cc19118fc9"
+        },
+        {
+          "name": "green",
+          "stream": false,
+          "http_status": 400,
+          "text": "",
+          "finish_reason": null,
+          "pass": true,
+          "error": "{\"error\":{\"message\":\"daemon error: [unsupported retryable=false rolled_back=false attempt=8] model has no vision encoder\",\"type\":\"invalid_request_error\"}}",
+          "image_sha256": "92d968e460439c1581080225214a42c684873f0f9cdd2cc4c6942fbb35b10820",
+          "prompt_md5": "915874213f8bec59f1b12cd689c58e0a",
+          "request_sha256": "a447aa6c7d5e2ffda4f6b188b36a0e86a42a21d19415ebef2f9bc3a46ff9e56b"
+        },
+        {
+          "name": "green",
+          "stream": true,
+          "http_status": 400,
+          "text": "",
+          "finish_reason": null,
+          "pass": true,
+          "error": "{\"error\":{\"message\":\"daemon error: [unsupported retryable=false rolled_back=false attempt=9] model has no vision encoder\",\"type\":\"invalid_request_error\"}}",
+          "image_sha256": "92d968e460439c1581080225214a42c684873f0f9cdd2cc4c6942fbb35b10820",
+          "prompt_md5": "915874213f8bec59f1b12cd689c58e0a",
+          "request_sha256": "ad45a65bf7db4b9bbf4bdee781650d9be5e566f9c6a901535f78c103eaa9faf0"
+        },
+        {
+          "name": "blue",
+          "stream": false,
+          "http_status": 400,
+          "text": "",
+          "finish_reason": null,
+          "pass": true,
+          "error": "{\"error\":{\"message\":\"daemon error: [unsupported retryable=false rolled_back=false attempt=10] model has no vision encoder\",\"type\":\"invalid_request_error\"}}",
+          "image_sha256": "67333ec71f010da7777c075f1d9a196f2c2a0dd8cc7ed22e2619c81e9f45e3e4",
+          "prompt_md5": "915874213f8bec59f1b12cd689c58e0a",
+          "request_sha256": "1a55d014ffa87bf8e439ee2ce10bd14031c93193983814ed152c7960f5f6cfe6"
+        },
+        {
+          "name": "blue",
+          "stream": true,
+          "http_status": 400,
+          "text": "",
+          "finish_reason": null,
+          "pass": true,
+          "error": "{\"error\":{\"message\":\"daemon error: [unsupported retryable=false rolled_back=false attempt=11] model has no vision encoder\",\"type\":\"invalid_request_error\"}}",
+          "image_sha256": "67333ec71f010da7777c075f1d9a196f2c2a0dd8cc7ed22e2619c81e9f45e3e4",
+          "prompt_md5": "915874213f8bec59f1b12cd689c58e0a",
+          "request_sha256": "4f5d0c142295c039fa3732cabddc50e5bdef36069e4c8e967af621d8f3bd6f4d"
+        },
+        {
+          "name": "ocr_signs",
+          "stream": false,
+          "http_status": 400,
+          "text": "",
+          "finish_reason": null,
+          "pass": true,
+          "error": "{\"error\":{\"message\":\"daemon error: [unsupported retryable=false rolled_back=false attempt=12] model has no vision encoder\",\"type\":\"invalid_request_error\"}}",
+          "image_sha256": "549784c349af8a87d53e2fec897d03aa800ed73a64bb9d8de60485cdd71d1e98",
+          "prompt_md5": "793f9508d7de2b3d73b0a80d1d723514",
+          "request_sha256": "587564724fb17af1982f2cc6304b120edd753a9d3eee7c8ae085ee65549d62ac"
+        },
+        {
+          "name": "ocr_signs",
+          "stream": true,
+          "http_status": 400,
+          "text": "",
+          "finish_reason": null,
+          "pass": true,
+          "error": "{\"error\":{\"message\":\"daemon error: [unsupported retryable=false rolled_back=false attempt=13] model has no vision encoder\",\"type\":\"invalid_request_error\"}}",
+          "image_sha256": "549784c349af8a87d53e2fec897d03aa800ed73a64bb9d8de60485cdd71d1e98",
+          "prompt_md5": "793f9508d7de2b3d73b0a80d1d723514",
+          "request_sha256": "8678ac075195d40b29f9c1207f387099e56dfb0286e0ffda4df2a9355a1e01bb"
+        },
+        {
+          "name": "description_dog",
+          "stream": false,
+          "http_status": 400,
+          "text": "",
+          "finish_reason": null,
+          "pass": true,
+          "error": "{\"error\":{\"message\":\"daemon error: [unsupported retryable=false rolled_back=false attempt=14] model has no vision encoder\",\"type\":\"invalid_request_error\"}}",
+          "image_sha256": "7c114d46d0433c64f69a7e9b7424688c8a54db6ac80d7034df544feb2808d23a",
+          "prompt_md5": "ec45be2013a4befac36598e7926981fd",
+          "request_sha256": "778bb12a845d8ba5c381e36df10a641991d2cd9bad3d7fe94badfd4cf7b57795"
+        },
+        {
+          "name": "description_dog",
+          "stream": true,
+          "http_status": 400,
+          "text": "",
+          "finish_reason": null,
+          "pass": true,
+          "error": "{\"error\":{\"message\":\"daemon error: [unsupported retryable=false rolled_back=false attempt=15] model has no vision encoder\",\"type\":\"invalid_request_error\"}}",
+          "image_sha256": "7c114d46d0433c64f69a7e9b7424688c8a54db6ac80d7034df544feb2808d23a",
+          "prompt_md5": "ec45be2013a4befac36598e7926981fd",
+          "request_sha256": "c055a78a203d3b01df3a1f3e773bf1a03d81115ef683a5a07bf9166a9697d616"
+        },
+        {
+          "name": "text_after_image_or_cancel",
+          "stream": false,
+          "http_status": 200,
+          "text": "12",
+          "finish_reason": "stop",
+          "pass": true,
+          "request_sha256": "107060ca25fcf278a1fdf78218727db68ac9eb8438af1ee71cc30a65ecc6ffeb"
+        }
+      ],
+      "discovery_pass": true
+    },
+    "pr-auto-sidecar": {
+      "commit": "428e2e63627228cd3b5f79759ef40550979e123a",
+      "settings": {
+        "vision_mode": "omitted; schema default auto",
+        "sidecar": true,
+        "max_seq": "automatic; omitted",
+        "speculation": "product default; no --spec",
+        "npu_trunk": "product default; no override",
+        "graph": "product default; no override",
+        "oom_guard": "product default; no override"
+      },
+      "command": [
+        "/home/husrcf/Code/hipfire-qwen4-vision-938/.codeinsight+research/vision-938/halo-gate-20261027-beta3a01/pr-bin/hipfire",
+        "serve",
+        "--model",
+        "/home/husrcf/.hipfire/models/qwen3.8-flash-next.mq4-xts",
+        "--idle-timeout",
+        "0",
+        "--vision",
+        "/home/husrcf/Code/hipfire-qwen4-vision-938/.codeinsight+research/vision-938/qwen3.8-flash-next-vision.hfq",
+        "127.0.0.1:11538"
+      ],
+      "status": "pass",
+      "harnesses": [
+        {
+          "name": "battery",
+          "command": [
+            "python3",
+            "scripts/serve_harness.py",
+            "--model",
+            "/home/husrcf/.hipfire/models/qwen3.8-flash-next.mq4-xts",
+            "--port",
+            "11538",
+            "--mode",
+            "battery",
+            "--no-spawn",
+            "--mtp",
+            "auto",
+            "--sampling",
+            "greedy",
+            "--seed",
+            "0",
+            "--thinking",
+            "off",
+            "--thinking-effort",
+            "none",
+            "--max-tokens",
+            "512",
+            "--serve-log",
+            "/home/husrcf/Code/hipfire-qwen4-vision-938/.codeinsight+research/vision-938/halo-gate-20261027-beta3a01/pr-auto-sidecar.serve.log",
+            "--out",
+            "/home/husrcf/Code/hipfire-qwen4-vision-938/.codeinsight+research/vision-938/halo-gate-20261027-beta3a01/pr-auto-sidecar.battery.json",
+            "--compare-transcript",
+            "/home/husrcf/Code/hipfire-qwen4-vision-938/.codeinsight+research/vision-938/halo-gate-20261027-beta3a01/beta-guard-off.battery.json"
+          ],
+          "exit_code": 0
+        },
+        {
+          "name": "image",
+          "command": [
+            "python3",
+            "scripts/check_qwen4_vision.py",
+            "--base-url",
+            "http://127.0.0.1:11538",
+            "--model",
+            "/home/husrcf/.hipfire/models/qwen3.8-flash-next.mq4-xts",
+            "--expect-vision",
+            "on",
+            "--timeout",
+            "300",
+            "--identity-json",
+            "/home/husrcf/Code/hipfire-qwen4-vision-938/.codeinsight+research/vision-938/halo-gate-20261027-beta3a01/pr-auto-sidecar.identity.json",
+            "--output",
+            "/home/husrcf/Code/hipfire-qwen4-vision-938/.codeinsight+research/vision-938/halo-gate-20261027-beta3a01/pr-auto-sidecar.images.json"
+          ],
+          "exit_code": 0
+        },
+        {
+          "name": "chain",
+          "command": [
+            "python3",
+            "scripts/serve_harness.py",
+            "--model",
+            "/home/husrcf/.hipfire/models/qwen3.8-flash-next.mq4-xts",
+            "--port",
+            "11538",
+            "--mode",
+            "chain",
+            "--no-spawn",
+            "--mtp",
+            "auto",
+            "--sampling",
+            "greedy",
+            "--seed",
+            "0",
+            "--thinking",
+            "off",
+            "--thinking-effort",
+            "none",
+            "--max-tokens",
+            "512",
+            "--serve-log",
+            "/home/husrcf/Code/hipfire-qwen4-vision-938/.codeinsight+research/vision-938/halo-gate-20261027-beta3a01/pr-auto-sidecar.serve.log",
+            "--out",
+            "/home/husrcf/Code/hipfire-qwen4-vision-938/.codeinsight+research/vision-938/halo-gate-20261027-beta3a01/pr-auto-sidecar.chain.json"
+          ],
+          "exit_code": 0
+        }
+      ],
+      "load_evidence": [
+        "qwen4 vision: mode=auto -> resident; vision_reserve=2158224320 bytes (896353216 resident weights incl. row padding + 1261871104 largest-image scratch incl. projected rows)",
+        "  qwen4 ple rows: q4 from /home/husrcf/.hipfire/models/qwen3.8-flash-next.mq4-xts.ple-q4 (Q4LM, row order, 28.8 GB)",
+        "  qwen4 state: QSA q8 (Q8_0 blocks of 32) K/V (vmm context storage), GDN f32 recurrent",
+        "  qwen4 expert placement: HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS unset, fully resident (62475 MiB routed experts + 5115 MiB non-expert weights + 17103 MiB reserve (17103 MiB = text (15045 MiB = max(12126 MiB historical floor, 15045 MiB census [QSA context 4224 MiB, state 225 MiB, forward 8603 MiB, F16 weight shadows 1238 MiB, INT8 shared-expert shadows 0 MiB, QSA selector 0 MiB, native MTP 0 MiB, QSA gather 512 MiB, HIP runtime 0 MiB, fp16_x 160 MiB, ksplit_det 40 MiB, int4_xq 11 MiB, moe_group 1 MiB, down_i4q 28 MiB, slab_tiles 0 MiB, slab_union 0 MiB, mq_fixed 0 MiB, gdn_dense_a 0 MiB, gdn_dense_ef 0 MiB, gdn_pair_counters 0 MiB]): census wins) + 2058 MiB vision (resident weights + activation/projected rows)) fit in 98148 MiB free device memory)",
+        "  qwen4 trunk overlay: applied 108 QT44 tensors from /home/husrcf/.hipfire/models/qwen3.8-flash-next.mq4-xts.trunk-overlay (default gfx1151-zab-v1; bound to base 125288544792 B, index sha256 8703bb1626ff, file sha256 8b15b6fede7d; 449280000 -> 305510400 bytes)",
+        "  qwen4 prefill chunk: 8192 rows (requested 8192)",
+        "  qwen4 memory admission: 18864 MiB free after load; a 262144-token context commits 8238 MiB more (5408 MiB QSA context incl. any F16 arena + 512 MiB gather workspace + 2318 MiB MTP request) + 6519 MiB resident PLE + 2048 MiB headroom; card_cap 262144 tokens (with the current free host memory the context fits up to 262144 tokens; this limit moves with free host memory)",
+        "  qwen4 memory admission: vision_reserve=2158224320 bytes (tower weights plus maximum image scratch; excluded from automatic context capacity)",
+        "  qwen4 ple budget: 6519 MiB of 8454 MiB kept resident so the 262144-token context fits (the context takes precedence over the reclaimable PLE page cache)",
+        "  qwen4 native MTP speculator enabled (K=7)",
+        "  qwen4 native MTP n-gram: on (n_match=5 n_min=3 n_max=3)",
+        "max_seq: 262144 (bound=model; model_ctx=262144, card_cap=262144, kv=q8)"
+      ],
+      "admission": {
+        "free_before_tower_mib": 18864,
+        "max_seq": 262144,
+        "growth_mib": 8238,
+        "qsa_context_mib": 5408,
+        "gather_mib": 512,
+        "mtp_request_mib": 2318,
+        "resident_ple_mib": 6519,
+        "headroom_mib": 2048,
+        "card_cap": 262144,
+        "vision_reserve_bytes": 2158224320,
+        "vision_weights_bytes": 896353216,
+        "vision_scratch_bytes": 1261871104,
+        "vision_reserve_mib": 2058.2431030273438,
+        "native_mtp_k": 7
+      },
+      "npu_plan_lines": [
+        "npu-trunk: built-in Halo calibration (measured on kernel 7.3.0-rc7-perfopt+, NPU firmware 1.1.2.65, GPU 0000:c0:00.0) applies by arch/model/route; this host kernel 7.0.0-38-generic, NPU firmware 1.1.2.65, GPU 0000:c5:00.0",
+        "npu-trunk: mode=auto contract=bf16 families=qkv,zab,q,kvidx cal_key={\"device\":{\"arch\":\"gfx1151\",\"pci_bdf\":\"0000:c5:00.0\",\"npu_fw_version\":\"1.1.2.65\"},\"build\":\"hipfire-0.4.2:npu-trunk-bf16-rowmajor-v1\",\"kernel\":{\"uname_release\":\"7.0.0-38-generic\"},\"model_trunk_index_sha256\":\"098bd75fd3a6a5174d06033f2b3ec7febeb7777e7eba4696b64cecca5e3418b6\",\"epilogue\":\"bf16\",\"trunk_route\":\"overlay:gfx1151-zab-v1\"} cal_sha256=8b92970df383fd524f1c432a05634468d165515e9047433f48a4db4a517b8b72 n*=8256 T(16384)=6945.452445/7886.368000 T(65536)=29092.209779/32855.872000 cal_source=builtin host=[kernel=7.0.0-38-generic iommu=gpu:identity,npu:identity amdxdna=in-tree npu_fw=1.1.2.65]",
+        "npu-trunk: mode=auto families=0xff contract=bf16_direct trunk_route=overlay:gfx1151-zab-v1 zab_source=stock-MQ6-DtoH-before-overlay pack_ms=881.069 download_ms=365.701 resident_bytes=2113536000 npu_panels_bytes=2113536000 gpu_twin_bytes=0 bank_b_bytes=503447552 runtime=open raw=DtoH(no-retained-host-copy)",
+        "npu-trunk: rows=44 families=none plan=[gpu 0..44] predicted=+0.0% rates=gen0 gpu_x1.000 npu_x1.000",
+        "npu-trunk: rows=55 families=none plan=[gpu 0..55] predicted=+0.0% rates=gen0 gpu_x1.000 npu_x1.000",
+        "npu-trunk: rows=25 families=none plan=[gpu 0..25] predicted=+0.0% rates=gen0 gpu_x1.000 npu_x1.000",
+        "npu-trunk: rows=33 families=none plan=[gpu 0..33] predicted=+0.0% rates=gen0 gpu_x1.000 npu_x1.000",
+        "npu-trunk: rows=31 families=none plan=[gpu 0..31] predicted=+0.0% rates=gen0 gpu_x1.000 npu_x1.000",
+        "npu-trunk: route=gpu (image embeddings and three-axis positions)",
+        "npu-trunk: rows=56 families=none plan=[gpu 0..56] predicted=+0.0% rates=gen0 gpu_x1.000 npu_x1.000",
+        "npu-trunk: rows=26 families=none plan=[gpu 0..26] predicted=+0.0% rates=gen0 gpu_x1.000 npu_x1.000",
+        "npu-trunk: rows=34 families=none plan=[gpu 0..34] predicted=+0.0% rates=gen0 gpu_x1.000 npu_x1.000",
+        "npu-trunk: rows=32 families=none plan=[gpu 0..32] predicted=+0.0% rates=gen0 gpu_x1.000 npu_x1.000"
+      ],
+      "memory_snapshots": {
+        "before_start": {
+          "time": 1793091275.4557066,
+          "mem_info_vram_total": 103079215104,
+          "mem_info_vram_used": 302886912,
+          "mem_info_gtt_total": 16630665216,
+          "mem_info_gtt_used": 71155712,
+          "gpu_busy_percent": 0,
+          "host_kib": {
+            "MemTotal": 32481768,
+            "MemAvailable": 26992328,
+            "SwapFree": 7312996
+          }
+        },
+        "after_prewarm": {
+          "time": 1793091316.5566063,
+          "mem_info_vram_total": 103079215104,
+          "mem_info_vram_used": 84444434432,
+          "mem_info_gtt_total": 16630665216,
+          "mem_info_gtt_used": 77516800,
+          "gpu_busy_percent": 11,
+          "host_kib": {
+            "MemTotal": 32481768,
+            "MemAvailable": 20072360,
+            "SwapFree": 7249908
+          }
+        },
+        "after_battery": {
+          "time": 1793091328.7430725,
+          "mem_info_vram_total": 103079215104,
+          "mem_info_vram_used": 88912125952,
+          "mem_info_gtt_total": 16630665216,
+          "mem_info_gtt_used": 77516800,
+          "gpu_busy_percent": 78,
+          "host_kib": {
+            "MemTotal": 32481768,
+            "MemAvailable": 19964912,
+            "SwapFree": 7249908
+          }
+        },
+        "after_requests": {
+          "time": 1793091352.017933,
+          "mem_info_vram_total": 103079215104,
+          "mem_info_vram_used": 89114963968,
+          "mem_info_gtt_total": 16630665216,
+          "mem_info_gtt_used": 77529088,
+          "gpu_busy_percent": 74,
+          "host_kib": {
+            "MemTotal": 32481768,
+            "MemAvailable": 19904156,
+            "SwapFree": 7249944
+          }
+        },
+        "after_stop": {
+          "time": 1793091353.438886,
+          "mem_info_vram_total": 103079215104,
+          "mem_info_vram_used": 302886912,
+          "mem_info_gtt_total": 16630665216,
+          "mem_info_gtt_used": 71155712,
+          "gpu_busy_percent": 73,
+          "host_kib": {
+            "MemTotal": 32481768,
+            "MemAvailable": 27032812,
+            "SwapFree": 7249944
+          }
+        }
+      },
+      "image_cases": [
+        {
+          "name": "red",
+          "stream": false,
+          "http_status": 200,
+          "text": " Red",
+          "finish_reason": "stop",
+          "pass": true,
+          "image_sha256": "f6a996480096b673a0b79ff45d7d2c95e3962ce3c4a5d4a3a5532736beede47d",
+          "prompt_md5": "915874213f8bec59f1b12cd689c58e0a",
+          "request_sha256": "c8ef5b0e1f3efed8a0e37bb8c71b4923cf690fdb752e27d3756a2258b16d33c6"
+        },
+        {
+          "name": "red",
+          "stream": true,
+          "http_status": 200,
+          "text": " Red",
+          "finish_reason": "stop",
+          "pass": true,
+          "done": true,
+          "image_sha256": "f6a996480096b673a0b79ff45d7d2c95e3962ce3c4a5d4a3a5532736beede47d",
+          "prompt_md5": "915874213f8bec59f1b12cd689c58e0a",
+          "request_sha256": "8388d5fb64ec04734ca8dd7a98a2e456ea032939d27c8672710332cc19118fc9"
+        },
+        {
+          "name": "green",
+          "stream": false,
+          "http_status": 200,
+          "text": " Green",
+          "finish_reason": "stop",
+          "pass": true,
+          "image_sha256": "92d968e460439c1581080225214a42c684873f0f9cdd2cc4c6942fbb35b10820",
+          "prompt_md5": "915874213f8bec59f1b12cd689c58e0a",
+          "request_sha256": "a447aa6c7d5e2ffda4f6b188b36a0e86a42a21d19415ebef2f9bc3a46ff9e56b"
+        },
+        {
+          "name": "green",
+          "stream": true,
+          "http_status": 200,
+          "text": " Green",
+          "finish_reason": "stop",
+          "pass": true,
+          "done": true,
+          "image_sha256": "92d968e460439c1581080225214a42c684873f0f9cdd2cc4c6942fbb35b10820",
+          "prompt_md5": "915874213f8bec59f1b12cd689c58e0a",
+          "request_sha256": "ad45a65bf7db4b9bbf4bdee781650d9be5e566f9c6a901535f78c103eaa9faf0"
+        },
+        {
+          "name": "blue",
+          "stream": false,
+          "http_status": 200,
+          "text": " Blue",
+          "finish_reason": "stop",
+          "pass": true,
+          "image_sha256": "67333ec71f010da7777c075f1d9a196f2c2a0dd8cc7ed22e2619c81e9f45e3e4",
+          "prompt_md5": "915874213f8bec59f1b12cd689c58e0a",
+          "request_sha256": "1a55d014ffa87bf8e439ee2ce10bd14031c93193983814ed152c7960f5f6cfe6"
+        },
+        {
+          "name": "blue",
+          "stream": true,
+          "http_status": 200,
+          "text": " Blue",
+          "finish_reason": "stop",
+          "pass": true,
+          "done": true,
+          "image_sha256": "67333ec71f010da7777c075f1d9a196f2c2a0dd8cc7ed22e2619c81e9f45e3e4",
+          "prompt_md5": "915874213f8bec59f1b12cd689c58e0a",
+          "request_sha256": "4f5d0c142295c039fa3732cabddc50e5bdef36069e4c8e967af621d8f3bd6f4d"
+        },
+        {
+          "name": "ocr_signs",
+          "stream": false,
+          "http_status": 200,
+          "text": "Mairie du 1er\nPalais du LOUVRE\nLES ARTS DÉCORATIFS\nMusée du LOUVRE\nThéâtre du PALAIS-ROYAL",
+          "finish_reason": "stop",
+          "pass": true,
+          "image_sha256": "549784c349af8a87d53e2fec897d03aa800ed73a64bb9d8de60485cdd71d1e98",
+          "prompt_md5": "793f9508d7de2b3d73b0a80d1d723514",
+          "request_sha256": "587564724fb17af1982f2cc6304b120edd753a9d3eee7c8ae085ee65549d62ac"
+        },
+        {
+          "name": "ocr_signs",
+          "stream": true,
+          "http_status": 200,
+          "text": "Mairie du 1er\nPalais du LOUVRE\nLES ARTS DÉCORATIFS\nMusée du LOUVRE\nThéâtre du PALAIS-ROYAL",
+          "finish_reason": "stop",
+          "pass": true,
+          "done": true,
+          "image_sha256": "549784c349af8a87d53e2fec897d03aa800ed73a64bb9d8de60485cdd71d1e98",
+          "prompt_md5": "793f9508d7de2b3d73b0a80d1d723514",
+          "request_sha256": "8678ac075195d40b29f9c1207f387099e56dfb0286e0ffda4df2a9355a1e01bb"
+        },
+        {
+          "name": "description_dog",
+          "stream": false,
+          "http_status": 200,
+          "text": "The dog is sleeping on its back.",
+          "finish_reason": "stop",
+          "pass": true,
+          "image_sha256": "7c114d46d0433c64f69a7e9b7424688c8a54db6ac80d7034df544feb2808d23a",
+          "prompt_md5": "ec45be2013a4befac36598e7926981fd",
+          "request_sha256": "778bb12a845d8ba5c381e36df10a641991d2cd9bad3d7fe94badfd4cf7b57795"
+        },
+        {
+          "name": "description_dog",
+          "stream": true,
+          "http_status": 200,
+          "text": "The dog is sleeping on its back.",
+          "finish_reason": "stop",
+          "pass": true,
+          "done": true,
+          "image_sha256": "7c114d46d0433c64f69a7e9b7424688c8a54db6ac80d7034df544feb2808d23a",
+          "prompt_md5": "ec45be2013a4befac36598e7926981fd",
+          "request_sha256": "c055a78a203d3b01df3a1f3e773bf1a03d81115ef683a5a07bf9166a9697d616"
+        },
+        {
+          "name": "image_stop_control",
+          "stream": false,
+          "http_status": 200,
+          "text": " ",
+          "finish_reason": "stop",
+          "pass": true,
+          "image_sha256": "f6a996480096b673a0b79ff45d7d2c95e3962ce3c4a5d4a3a5532736beede47d",
+          "prompt_md5": "915874213f8bec59f1b12cd689c58e0a",
+          "request_sha256": "f4aa06a0735b992ab148fdf3e8263d6e4e36bd7970d13d36bfcfde06cf95a609"
+        },
+        {
+          "name": "image_stop_control",
+          "stream": true,
+          "http_status": 200,
+          "text": " ",
+          "finish_reason": "stop",
+          "pass": true,
+          "done": true,
+          "image_sha256": "f6a996480096b673a0b79ff45d7d2c95e3962ce3c4a5d4a3a5532736beede47d",
+          "prompt_md5": "915874213f8bec59f1b12cd689c58e0a",
+          "request_sha256": "8e011eafee39f499ad60e20901d7241e2e576a299a4df9c919468d3160bc7c6c"
+        },
+        {
+          "name": "image_reasoning_control",
+          "stream": false,
+          "http_status": 200,
+          "text": "Red",
+          "finish_reason": "stop",
+          "pass": true,
+          "image_sha256": "f6a996480096b673a0b79ff45d7d2c95e3962ce3c4a5d4a3a5532736beede47d",
+          "prompt_md5": "915874213f8bec59f1b12cd689c58e0a",
+          "request_sha256": "0b95c124f2b988d3b621f3076b3d300d8621caa6b2aa75cf6ecb5129b17da9c8"
+        },
+        {
+          "name": "extreme_aspect_ratio_refused",
+          "stream": false,
+          "http_status": 400,
+          "text": "",
+          "finish_reason": null,
+          "pass": true,
+          "error": "{\"error\":{\"message\":\"daemon error: [validation retryable=false rolled_back=false attempt=19] resized image dimensions (262144x32) exceed the vision limit (4128768 pixels); reduce the aspect ratio\",\"type\":\"invalid_request_error\"}}",
+          "image_sha256": "51140b88e42da246f7516b9a35ebc28e70941dec7b8381f68a3bb4c43046b72a",
+          "prompt_md5": "915874213f8bec59f1b12cd689c58e0a",
+          "request_sha256": "88daa920e497cf55acb2109dd86fd6f099453a5fa501854e80dec01c3a4732ae"
+        },
+        {
+          "name": "cancel_image_stream",
+          "stream": true,
+          "http_status": 200,
+          "text": "Here",
+          "finish_reason": null,
+          "pass": true,
+          "client_disconnected_before_terminal": true,
+          "request_sha256": "5dd9f8d3dc250f16bf040e18614d9cf15b601aa62b7b1179df435751ba7595fc"
+        },
+        {
+          "name": "text_after_image_or_cancel",
+          "stream": false,
+          "http_status": 200,
+          "text": "12",
+          "finish_reason": "stop",
+          "pass": true,
+          "request_sha256": "107060ca25fcf278a1fdf78218727db68ac9eb8438af1ee71cc30a65ecc6ffeb"
+        },
+        {
+          "name": "blue_after_cancel_and_text",
+          "stream": true,
+          "http_status": 200,
+          "text": " Blue",
+          "finish_reason": "stop",
+          "pass": true,
+          "done": true,
+          "request_sha256": "d65a7b0957a8495be2ecb5477fda6c701a8583f8dc1a6a7a9bd88cb53714ebb5"
+        }
+      ],
+      "discovery_pass": true
+    }
+  },
+  "common_battery": [
+    {
+      "genre": "code",
+      "prompt": "Write a Python function `merge_sorted(a, b)` that merges two already-sorted lists into one sorted list without using sorted(). Include a short docstring.",
+      "content": "```python\ndef merge_sorted(a, b):\n    \"\"\"Merge two already-sorted lists into one sorted list.\"\"\"\n    result = []\n    i, j = 0, 0\n    while i < len(a) and j < len(b):\n        if a[i] <= b[j]:\n            result.append(a[i])\n            i += 1\n        else:\n            result.append(b[j])\n            j += 1\n    # Append remaining elements\n    while i < len(a):\n        result.append(a[i])\n        i += 1\n    while j < len(b):\n        result.append(b[j])\n        j += 1\n    return result\n```",
+      "reasoning_content": "",
+      "tool_calls": [],
+      "finish": "stop",
+      "request_md5": "7689e4006f9739d380b54b1f335620be",
+      "prompt_md5": "43ca0d15712d3dfb777b51ae76d8fd5f",
+      "gen": 149,
+      "ctx": 44
+    },
+    {
+      "genre": "reason",
+      "prompt": "A train goes 60 mph for 2.5 hours, then 40 mph for 1.5 hours. How far did it travel in total? Show your steps and give the final number.",
+      "content": "To find the total distance traveled, we need to calculate the distance covered in each segment of the trip and then add them together. The formula for distance is:\n\n$$ \\text{Distance} = \\text{Speed} \\times \\text{Time} $$\n\n**Step 1: Calculate the distance for the first segment**\n*   Speed: $60 \\text{ mph}$\n*   Time: $2.5 \\text{ hours}$\n\n$$ \\text{Distance}_1 = 60 \\times 2.5 = 150 \\text{ miles} $$\n\n**Step 2: Calculate the distance for the second segment**\n*   Speed: $40 \\text{ mph}$\n*   Time: $1.5 \\text{ hours}$\n\n$$ \\text{Distance}_2 = 40 \\times 1.5 = 60 \\text{ miles} $$\n\n**Step 3: Calculate the total distance**\nAdd the distances from both segments together:\n\n$$ \\text{Total Distance} = \\text{Distance}_1 + \\text{Distance}_2 $$\n$$ \\text{Total Distance} = 150 + 60 = 210 \\text{ miles} $$\n\n**Final Answer:**\nThe train traveled a total of **210** miles.",
+      "reasoning_content": "",
+      "tool_calls": [],
+      "finish": "stop",
+      "request_md5": "e3ea2cddf2f7a2c921b0f89089ff5301",
+      "prompt_md5": "640e0fd4f55996cb175a422f0a12cef5",
+      "gen": 283,
+      "ctx": 55
+    },
+    {
+      "genre": "factual",
+      "prompt": "What causes the seasons on Earth? Answer in exactly three sentences.",
+      "content": "The seasons are primarily caused by the tilt of Earth's rotational axis relative to its orbital plane around the Sun. This axial tilt means that different hemispheres receive varying amounts of direct sunlight and daylight hours throughout the year. Consequently, when a hemisphere is tilted toward the Sun, it experiences summer, while the opposite hemisphere experiences winter.",
+      "reasoning_content": "",
+      "tool_calls": [],
+      "finish": "stop",
+      "request_md5": "fd125e8b0bb89acd061f4b1b4619f692",
+      "prompt_md5": "8f66b4c97988825bd8e7840aaf44357e",
+      "gen": 67,
+      "ctx": 25
+    },
+    {
+      "genre": "prose",
+      "prompt": "Write a four-sentence story about a lighthouse keeper who finds something unexpected washed up on the rocks.",
+      "content": "Elias had spent forty years watching the horizon, expecting nothing but storms and silence from the churning sea. One foggy morning, however, a small, intricately carved wooden box rested precariously on the jagged rocks below his tower. He descended the winding stairs with trembling hands, his heart pounding against his ribs as he approached the strange artifact. Inside, he found not treasure or tragedy, but a single, fresh flower that had no business surviving the ocean’s wrath.",
+      "reasoning_content": "",
+      "tool_calls": [],
+      "finish": "stop",
+      "request_md5": "9599a794eb3c004f1c70979d89df6087",
+      "prompt_md5": "8fe0ad36f61bcf4992cc9df81cdf3817",
+      "gen": 98,
+      "ctx": 33
+    },
+    {
+      "genre": "instruct",
+      "prompt": "List exactly five tips for writing maintainable code, as a numbered list, one line each.",
+      "content": "1. Use clear, descriptive names for variables, functions, and classes to make code self-documenting.\n2. Keep functions and methods small and focused on a single responsibility to enhance readability and testability.\n3. Write comprehensive unit tests to ensure changes do not break existing functionality.\n4. Adhere to consistent coding standards and style guides across the entire project to reduce cognitive load.\n5. Document complex logic and architectural decisions with comments or external documentation to aid future maintainers.",
+      "reasoning_content": "",
+      "tool_calls": [],
+      "finish": "stop",
+      "request_md5": "b0b950d1d8cbb521918fd18f819e1be3",
+      "prompt_md5": "8bed8e2d056dc1d47dccae9d32dbecf4",
+      "gen": 100,
+      "ctx": 31
+    }
+  ],
+  "cpu_tests": {
+    "vision_filter_run": 8,
+    "image_context": 3,
+    "measured_resources": 22,
+    "loader_vision": 18,
+    "qwen4_memory": 8,
+    "generation_vision": 2,
+    "total": 61,
+    "vision_filter_scope": "6 vision-related tests plus 2 division/provisioned substring matches; all are counted in this filter run.",
+    "test_names": {
+      "vision_filter_run": [
+        "npu_trunk::packing::tests::pack_matrix_scale_is_f64_division_then_f32",
+        "lane_exec::tests::the_phase_machine_pins_forward_and_commit_to_the_provisioned_plan",
+        "vision::tests::scratch_admission_includes_pool_retention_and_refuses_unbounded_images",
+        "vision::tests::official_flash_next_tower_matches_shared_tower_contract",
+        "config::tests::strict_runtime_classifier_accepts_conditional_config_with_vision_marker",
+        "vision::tests::refuses_wrong_model_projector_or_image_contract",
+        "vision::tests::refuses_truncated_or_unadmitted_quant_payload_before_upload",
+        "vision::tests::refuses_missing_or_foreign_or_wrong_shape_tensor_before_upload"
+      ],
+      "image_context": [
+        "bundle::image_context::tests::pooled_key_position_uses_original_block_start",
+        "bundle::image_context::tests::rectangular_image_positions_and_decode_cursor",
+        "bundle::image_context::tests::malformed_image_spans_fail_before_allocation"
+      ],
+      "measured_resources": [
+        "measured_resources::tests::preload_native_union_extra_agrees_with_native_mtp_granule_slack_on_max",
+        "measured_resources::tests::preload_native_union_extra_rejects_overflow_and_short_backing",
+        "measured_resources::tests::preload_native_union_extra_charges_both_phases_over_logical_peak",
+        "measured_resources::tests::preload_native_union_extra_has_no_duplicate_cold_recurrent_charge",
+        "measured_resources::tests::carveout_snapshot_keeps_device_owners_out_of_host_plan",
+        "measured_resources::tests::nonzero_parked_union_always_exceeds_base",
+        "measured_resources::tests::new_capture_is_never_added_to_device_plan_twice",
+        "measured_resources::tests::rejects_direct_with_old_bytes_and_retained_without",
+        "measured_resources::tests::positive_direct_snapshot_freezes_schema_and_plans",
+        "measured_resources::tests::rejects_census_total_mismatch",
+        "measured_resources::tests::positive_retained_snapshot_charges_old_capture",
+        "measured_resources::tests::rejects_device_plan_overflow",
+        "measured_resources::tests::rejects_non_row_exact_capture_rows",
+        "measured_resources::tests::rejects_mtp_shortfall_with_exact_mismatch",
+        "measured_resources::tests::rejects_parked_pool_overflow",
+        "measured_resources::tests::alias_contract_tokens_and_overlap_policy_are_exact",
+        "measured_resources::tests::rejects_uma_host_addition_overflow",
+        "measured_resources::tests::positive_uma_snapshot_adds_device_plan_to_host_once",
+        "measured_resources::tests::rejects_non_single_rank_and_empty_context",
+        "measured_resources::tests::provenance_reference_matches_identity_canonical",
+        "measured_resources::tests::preload_scratch_union_extra_refuses_overflow_like_the_inventory",
+        "measured_resources::tests::preload_scratch_union_extra_covers_both_modes_without_summing"
+      ],
+      "loader_vision": [
+        "admission::tests::qwen4_conditional_generation_without_vision_is_text_capable",
+        "admission::tests::non_vision_archs_are_never_vl",
+        "admission::tests::vision_sidecar::sidecar_for_a_non_vl_arch_refuses",
+        "registry_tests::arch_label_names_vision_and_slot_arches",
+        "registry_tests::vision_caps_declare_images",
+        "admission::tests::vision_sidecar::flash_next_modes_preserve_optional_tower_and_require_on",
+        "admission::tests::vision_sidecar::flash_next_rejects_27b_and_incomplete_towers",
+        "admission::tests::vision_sidecar::sidecar_with_wrong_arch_refuses",
+        "admission::tests::vision_sidecar::embed_gemma_sidecar_without_tower_refuses",
+        "admission::tests::vision_sidecar::sidecar_without_tower_refuses",
+        "admission::tests::vision_sidecar::embed_gemma_sidecar_promotes_tower_less_trunk",
+        "admission::tests::vision_sidecar::sidecar_promotes_tower_less_trunk_to_vl",
+        "admission::tests::vision_sidecar::sidecar_families_do_not_interchange",
+        "admission::tests::vision_sidecar::safetensors_dir_skips_automatic_vmm_sizing",
+        "admission::tests::vision_sidecar::moe_pins_legacy_context_on_discrete_and_sizes_itself_on_uma",
+        "admission::tests::vision_sidecar::kv_v_resolves_once_for_admission_and_carrier",
+        "admission::tests::vision_sidecar::automatic_backend_resolves_by_capability_not_source_spelling",
+        "admission::tests::vision_sidecar::gfx1151_fwht_k_override_refuses_instead_of_legacy_fallback"
+      ],
+      "qwen4_memory": [
+        "admission::tests::qwen4_memory::automatic_context_caps_at_the_largest_fit",
+        "admission::tests::qwen4_memory::automatic_context_refuses_when_nothing_fits",
+        "admission::tests::qwen4_memory::explicit_context_that_cannot_grow_refuses_at_load",
+        "admission::tests::qwen4_memory::explicit_context_is_honored_when_it_fits",
+        "admission::tests::qwen4_memory::halo_256k::halo_256k_keeps_the_full_ple_when_everything_fits",
+        "admission::tests::qwen4_memory::halo_256k::halo_256k_serve_fits_by_shrinking_ple",
+        "admission::tests::qwen4_memory::halo_default_admits_the_whole_model_context",
+        "admission::tests::qwen4_memory::halo_256k::halo_256k_refuses_when_the_context_itself_does_not_fit"
+      ],
+      "generation_vision": [
+        "qwen4_vision::tests::ambiguous_or_unframed_images_are_refused",
+        "qwen4_vision::tests::expansion_preserves_framing_and_following_text"
+      ]
+    }
+  },
+  "kernel_pack_gates": {
+    "flagship_pack": {
+      "passed": 5,
+      "failed": 0,
+      "skipped": 0,
+      "receipt": "pack-tests-after-split.log",
+      "test_names": [
+        "fixture_holds_complete_measured_sets_for_all_six_routes",
+        "embedded_native_images_are_recorded_but_not_registry_sources",
+        "formerly_missing_modules_are_measured_and_registered",
+        "portable_flagship_subset_is_registered_on_every_release_arch",
+        "every_measured_flagship_hip_module_is_registered_exactly_on_gfx1201"
+      ]
+    },
+    "registry": {
+      "passed": 61,
+      "failed": 0,
+      "skipped": 0,
+      "receipt": "registry-tests-after-split-fixed.log",
+      "test_names": [
+        "kernel_registry::tests::gfx1100_mq4_rowtile_image_is_the_scalar_only_recipe",
+        "kernel_registry::tests::kernel_scanner_handles_guards_macros_and_generators",
+        "kernel_registry::tests::legacy_mq4_rowtile_images_pin_each_projection_abi",
+        "kernel_registry::tests::gfx1100_mq6_and_bf16_rowtile_images_pin_their_actual_abis",
+        "kernel_registry::tests::native_qwen4_gfx1151_route_entries_refuses_partial_closed_plan",
+        "kernel_registry::tests::gfx1100_slab_serving_inventory_is_complete_and_acc_free",
+        "kernel_registry::tests::a3b_qresident_q8_has_isolated_exports_and_shared_dense_body",
+        "kernel_registry::tests::first_request_discovery_is_packaged",
+        "kernel_registry::tests::q8_rowtile_images_preserve_all_five_recipe_abis",
+        "kernel_registry::tests::kernel_registry_p0_inventory_membership",
+        "kernel_registry::tests::mq4v2_k5120_inventory_preserves_generic_and_limits_arch",
+        "kernel_registry::tests::corpus_entries_name_each_module_once_per_arch",
+        "kernel_registry::tests::rowtile_family_prewarm_keeps_arch_and_family_boundaries",
+        "kernel_registry::tests::gfx1100_fa2_split_verifier_is_compiler_free_packaged",
+        "kernel_registry::tests::rowtile_planner_images_pin_logical36_segment40_and_geometry",
+        "kernel_registry::tests::rowtile_projection_images_pin_abi_exports_and_physical_geometry",
+        "kernel_registry::tests::gfx1100_sym_check_is_the_gfx1201_source_with_two_exact_edits",
+        "kernel_registry::tests::rowtile_symbol_merge_preserves_narrow_exports",
+        "kernel_registry::tests::mq4v2_k5120_gfx1201_inventory_preserves_cache_policy",
+        "kernel_registry::tests::k640_registry_matches_gfx1151_only_launcher_admission",
+        "kernel_registry::tests::slab_k1_images_carry_the_96_byte_n_experts_kernarg",
+        "kernel_registry::tests::slab_k2_images_carry_the_64_byte_n_experts_kernarg",
+        "kernel_registry::tests::rowtile_images_match_bare_sha256_sidecars",
+        "kernel_registry::tests::slab_e8p_image_matrix_is_arch_keyed_conflict_free_and_admission_gated",
+        "kernel_registry::tests::closed_route_plan_symbols_are_registry_indexed",
+        "kernel_registry::tests::gfx1100_slab_planner_is_the_gfx1201_source_under_an_arch_key",
+        "kernel_registry::tests::generic_walked_plan_matches_layout_heads_axes_max_seq_and_seal",
+        "kernel_registry::tests::every_walked_plan_row_resolves_with_its_walked_identity",
+        "kernel_registry::tests::gfx11_residual_mmq_fallback_preserves_runtime_identity",
+        "kernel_registry::tests::walked_plan_directives_reject_unknown_seal_routes_and_bad_heads",
+        "kernel_registry::tests::qwen35_trace_is_packaged",
+        "kernel_registry::tests::bf16_round_trip_matches_launcher_and_compiler",
+        "kernel_registry::tests::qsa_gathered_wmma_is_packaged_on_gfx1151",
+        "kernel_registry::tests::hyper_q8_chunk_module_is_exact_gfx1151_only",
+        "kernel_registry::tests::corpus_entries_cover_the_dflash_window_node_kernels_on_gfx1201",
+        "kernel_registry::tests::qwen4_flash_next_trace_is_packaged",
+        "kernel_registry::tests::image_mrope_has_an_independent_packaged_module_and_preserves_text_source",
+        "kernel_registry::tests::predicted_binds_never_collide_with_the_route_plan",
+        "kernel_registry::tests::source_export_evaluator_reproduces_the_sealed_gfx1100_object_and_index_gap",
+        "kernel_registry::tests::predicted_family_includes_walked_hip_rows",
+        "kernel_registry::tests::kernel_registry_explicit_arch_and_module_rejection",
+        "kernel_registry::tests::traced_family_without_arch_rows_compiles_whole_inventory_without_borrowing",
+        "kernel_registry::tests::tensor_ops_declares_exactly_the_kernels_its_source_defines",
+        "kernel_registry::tests::walked_arch_images_are_exact_arch_and_sha_unique",
+        "kernel_registry::tests::walked_embedded_rows_resolve_only_on_their_own_arch",
+        "kernel_registry::tests::unknown_family_is_conservative_compile_only",
+        "kernel_registry::tests::native_mtp_plans_pm_fill_before_ready",
+        "kernel_registry::tests::gdn_q8ef_twins_are_inventoried",
+        "kernel_registry::tests::predicted_set_skips_accepted_pm_decode_twins",
+        "kernel_registry::tests::s1_d_kernels_are_in_their_own_packaged_module_on_every_qwen4_arch",
+        "kernel_registry::tests::gfx1201_draft_overwrite_twins_are_packaged",
+        "kernel_registry::tests::rowtile_route_prewarm_is_pm_only_closed_and_idempotent",
+        "kernel_registry::tests::tensor_ops_index_is_the_source_export_closure_per_arch",
+        "kernel_registry::tests::pack_carries_every_shared_launcher_module_on_every_arch",
+        "kernel_registry::tests::exact_open_plan_compiles_whole_inventory_and_binds_only_proven",
+        "kernel_registry::tests::dflash_tape_copy_and_lane_conv_match_launchers_and_compiler",
+        "kernel_registry::tests::predicted_binds_are_conflict_free",
+        "kernel_registry::tests::every_defined_kernel_is_declared_by_its_entry",
+        "kernel_registry::tests::every_declared_kernel_is_defined_by_its_source",
+        "kernel_registry::tests::no_exact_plan_is_whole_inventory_for_every_family",
+        "kernel_registry::tests::dense_dflash_cold_helpers_preserve_runtime_identity"
+      ]
+    },
+    "compiler": {
+      "passed": 1,
+      "failed": 0,
+      "skipped": 0,
+      "receipt": "sealed-compiler-tests-after-split.log",
+      "test_names": [
+        "compiler::tests::indexed_package_names_unindexed_symbol_and_accepts_repaired_arch_inventory"
+      ]
+    }
+  },
+  "gpu_channel": {
+    "passed": 18,
+    "failed": 0,
+    "skipped": 0
+  },
+  "qsa_mrope": {
+    "arch": "gfx1151",
+    "cases": [
+      {
+        "chunk_error": 0.0,
+        "dim": 256,
+        "gate_stride": true,
+        "heads": 2,
+        "max_abs_error": 8.940696716308594e-07,
+        "op": "norm_mrope"
+      },
+      {
+        "chunk_error": 0.0,
+        "dim": 256,
+        "gate_stride": false,
+        "heads": 2,
+        "max_abs_error": 8.940696716308594e-07,
+        "op": "norm_mrope"
+      },
+      {
+        "chunk_error": 0.0,
+        "dim": 128,
+        "gate_stride": false,
+        "heads": 4,
+        "max_abs_error": 8.344650268554688e-07,
+        "op": "norm_mrope"
+      },
+      {
+        "dtype": "F32",
+        "incremental_error": 0.0,
+        "max_abs_error": 0.0,
+        "op": "pool_mrope"
+      },
+      {
+        "dtype": "BF16",
+        "incremental_error": 0.0,
+        "max_abs_error": 0.0,
+        "op": "pool_mrope"
+      }
+    ],
+    "status": "pass"
+  },
+  "request_settings": {
+    "sampling": "greedy",
+    "temperature": 0,
+    "seed": 0,
+    "thinking": false,
+    "reasoning_effort": "none",
+    "max_think_tokens": 1,
+    "max_tokens": 512,
+    "scope": "Identical fixed greedy/non-thinking requests; load/runtime policies are defaults except beta OOM guard.",
+    "harness_source_sha256": "67018ceb208a83f43f7ed044d82a31dc5c6dbeabf4eaeee36d88ffffeeaf81ab"
+  },
+  "review": {
+    "decoded_battery_and_chain": "Read complete five-genre battery and post-image/cancellation chain. Merge-sort code is coherent; distance calculation is 210 miles; seasons explanation, lighthouse story and five-item advice are coherent; all finish with one stop, no detector failures. Three battery arms match content, reasoning, tools, request/prompt MD5, generated/input token counts and finish byte for byte.",
+    "ocr_signs": "Viewed committed scene_1.jpg and read both new stream-mode answers: all five signs match, including LES ARTS DÉCORATIFS, Musée du LOUVRE and Théâtre du PALAIS-ROYAL with accents.",
+    "dog": "Viewed committed doge_napping.png; both new answers say The dog is sleeping on its back. Animal and pose match the image.",
+    "semantic_review_pending": false,
+    "npu": "Default auto evaluated GPU-only plans (families=none); no NPU-executed claim.",
+    "memory": "Admission quotes free device memory after the text rank, before tower upload. Sysfs values are snapshots, not peaks. 262144 is admitted capacity, not a fully executed prompt.",
+    "reviewer": "coding agent; manual semantic and source-image inspection, not an external human review",
+    "reviewed_at": "2026-10-27T08:59:50.430958+00:00"
+  },
+  "post_image_chain": [
+    {
+      "content": "```python\ndef merge_sorted(a, b):\n    \"\"\"Merge two already-sorted lists into one sorted list.\"\"\"\n    result = []\n    i, j = 0, 0\n    while i < len(a) and j < len(b):\n        if a[i] <= b[j]:\n            result.append(a[i])\n            i += 1\n        else:\n            result.append(b[j])\n            j += 1\n    # Append remaining elements\n    while i < len(a):\n        result.append(a[i])\n        i += 1\n    while j < len(b):\n        result.append(b[j])\n        j += 1\n    return result\n```",
+      "reasoning_content": "",
+      "tool_calls": [],
+      "finish": "stop",
+      "request_md5": "7689e4006f9739d380b54b1f335620be",
+      "prompt_md5": "43ca0d15712d3dfb777b51ae76d8fd5f",
+      "gen": 149,
+      "ctx": 44
+    },
+    {
+      "content": "To find the total distance traveled, we can use the formula:\n\n$$ \\text{Distance} = \\text{Speed} \\times \\text{Time} $$\n\nWe will calculate the distance for each part of the trip separately and then add them together.\n\n**Step 1: Calculate the distance for the first part of the trip**\n*   Speed = 60 mph\n*   Time = 2.5 hours\n*   Distance₁ = $60 \\times 2.5 = 150$ miles\n\n**Step 2: Calculate the distance for the second part of the trip**\n*   Speed = 40 mph\n*   Time = 1.5 hours\n*   Distance₂ = $40 \\times 1.5 = 60$ miles\n\n**Step 3: Calculate the total distance**\n*   Total Distance = Distance₁ + Distance₂\n*   Total Distance = $150 + 60 = 210$ miles\n\n**Final Answer:**\nThe train traveled a total of **210** miles.",
+      "reasoning_content": "",
+      "tool_calls": [],
+      "finish": "stop",
+      "request_md5": "3382cc79e22f904c91b0ce23768ab928",
+      "prompt_md5": "640e0fd4f55996cb175a422f0a12cef5",
+      "gen": 231,
+      "ctx": 249
+    },
+    {
+      "content": "The seasons are primarily caused by the tilt of Earth's rotational axis relative to its orbital plane around the Sun. This axial tilt means that different hemispheres receive varying amounts of direct sunlight and daylight hours throughout the year. As Earth orbits the Sun, these changing angles of illumination result in the cyclical patterns of spring, summer, autumn, and winter.",
+      "reasoning_content": "",
+      "tool_calls": [],
+      "finish": "stop",
+      "request_md5": "d9509c3d41d088c5226dd20c5182f8bc",
+      "prompt_md5": "8f66b4c97988825bd8e7840aaf44357e",
+      "gen": 72,
+      "ctx": 506
+    },
+    {
+      "content": "Elias had spent thirty years watching the horizon, expecting nothing but storms and ships. One foggy morning, he found a small, ornate wooden box wedged between the jagged rocks below his tower. Inside, instead of treasure or messages, lay a single, still-winding pocket watch that ticked in perfect rhythm with his own heartbeat. He realized then that the sea had not brought him a relic, but a reminder of the time he had lost to solitude.",
+      "reasoning_content": "",
+      "tool_calls": [],
+      "finish": "stop",
+      "request_md5": "ea26015cbd08a886dafa96e2ebefd15b",
+      "prompt_md5": "8fe0ad36f61bcf4992cc9df81cdf3817",
+      "gen": 96,
+      "ctx": 612
+    },
+    {
+      "content": "1. Use clear, descriptive names for variables and functions to make intent obvious.\n2. Keep functions small and focused on a single responsibility.\n3. Write meaningful comments that explain why, not just what.\n4. Follow consistent style guidelines and automate formatting with linters.\n5. Write comprehensive unit tests to catch regressions early.",
+      "reasoning_content": "",
+      "tool_calls": [],
+      "finish": "stop",
+      "request_md5": "2bc20ddf7b9272dd7c94b96a08e62c09",
+      "prompt_md5": "8bed8e2d056dc1d47dccae9d32dbecf4",
+      "gen": 71,
+      "ctx": 740
+    }
+  ],
+  "raw_receipts": {
+    "fixtures.json": {
+      "bytes": 544,
+      "sha256": "58000867fa009154e3aa10ed31283c7e1b4b0ab259764a610fe9b3de971f9fcc"
+    },
+    "auxiliary-fixtures.json": {
+      "bytes": 314,
+      "sha256": "de68cf050a94b6bf8fabdfbf4f8fa4ee79ed50b5cede45cb28f97ae6703c7c90"
+    },
+    "hardware.json": {
+      "bytes": 480,
+      "sha256": "b05f1a363b061ee0976d39d21e8026b21cabb916ec2af2ee9c524a1e08c2b8c8"
+    },
+    "pr-bin/build-info.json": {
+      "bytes": 442,
+      "sha256": "c030c17846bc968d84df9488159ef0a2fbb3d0f79058b90afa2e8ec0ecad5908"
+    },
+    "beta-bin/identity.json": {
+      "bytes": 4476,
+      "sha256": "f3bfc6bf42c27f590e5bc0b54ea0fae632c0c735d9b7a6e358c3823cb532325e"
+    },
+    "beta-default.identity.json": {
+      "bytes": 4513,
+      "sha256": "9a47482cae1d8b75dcb707460f2973b27c8fee25d6d12a4ff0679f495cd0e326"
+    },
+    "beta-default.serve.log": {
+      "bytes": 2904,
+      "sha256": "db902b34669686f55b9a880562191b0f8a239bc486a5544eef07d8fa96c6c0ce"
+    },
+    "beta-guard-off.identity.json": {
+      "bytes": 7791,
+      "sha256": "49e77e4b9a44c1917599c3830808a766ecf1cbc8442d07f5d7b9971d43a5a4e0"
+    },
+    "beta-guard-off.battery.json": {
+      "bytes": 11531,
+      "sha256": "288ba3bab59142a5366a9f8ea0e367630f12a1ee1d5a0b3242c226b86f0c808c"
+    },
+    "beta-guard-off.battery.log": {
+      "bytes": 3902,
+      "sha256": "5f43cadebd231232097cafb8920b7f9cbd518091c1ff0bcfecfc0b0afcc88603"
+    },
+    "beta-guard-off.serve.log": {
+      "bytes": 44065,
+      "sha256": "5d16bd83623e6d5cce89f41a40d479d351fbad242b88c7fd170747a139916fa1"
+    },
+    "pr-default.identity.json": {
+      "bytes": 8611,
+      "sha256": "0715c8d2b6a2ba8bb8bdef3554be0727a9efa00c3ccf79f788605d6fcb61c544"
+    },
+    "pr-default.battery.json": {
+      "bytes": 11535,
+      "sha256": "c53b9953c6f9b97c728217860ae57b53aa85da3248e3f70ce5da0712b74c9468"
+    },
+    "pr-default.battery.log": {
+      "bytes": 3981,
+      "sha256": "dc010cabf6eef473aa57168f7839701b14e1441d08449abe9019f85ab90dd556"
+    },
+    "pr-default.serve.log": {
+      "bytes": 45596,
+      "sha256": "6ec1463922ac0f12e816b9f8821ffbe3a42611563851a54cde97d9173c487bde"
+    },
+    "pr-auto-sidecar.identity.json": {
+      "bytes": 10064,
+      "sha256": "5e1f0defe0b63d23d8136edc87bb2a4a9d614fba362c018c0222513ab96e87f3"
+    },
+    "pr-auto-sidecar.battery.json": {
+      "bytes": 11528,
+      "sha256": "8e4f6f81576c4fab8ba855889b691ab31949b02694eaac05e97f2bf23f4dfa12"
+    },
+    "pr-auto-sidecar.battery.log": {
+      "bytes": 3978,
+      "sha256": "f4c7d630138d6f0408cde9b88b87726445fe51957f9f273d8fac69e5bb33c72b"
+    },
+    "pr-auto-sidecar.serve.log": {
+      "bytes": 58956,
+      "sha256": "09d8d1625e1712f2d23c0999d82e5d78034165f6e5f99778d6fee77d7b726ace"
+    },
+    "pr-default.images.json": {
+      "bytes": 17030,
+      "sha256": "9a39fa4e0ce4694972328f82c06023b4434b5f7396f292d4d0d43235fa2c4d6d"
+    },
+    "pr-default.image.log": {
+      "bytes": 430,
+      "sha256": "8e8d64aaac254a372b3e2e3a2ae20ab52bfe4351f72b1bc540bf611c41838418"
+    },
+    "pr-auto-sidecar.images.json": {
+      "bytes": 68594,
+      "sha256": "d342fc68d5f47b0e4909c0b6f3d88f7da43d877dd9311f713bb258665e2c2cf3"
+    },
+    "pr-auto-sidecar.image.log": {
+      "bytes": 725,
+      "sha256": "b981d69ad55759154efe1fdfd13f4abf37b04b465ce60adeb58bccfed0916dbf"
+    },
+    "pr-auto-sidecar.chain.json": {
+      "bytes": 10805,
+      "sha256": "e4b2115bdc4e69c8b2ecd5001f78f6b4e31901bce9e0cfbc1335dd7c6d1e4c75"
+    },
+    "pr-auto-sidecar.chain.log": {
+      "bytes": 3900,
+      "sha256": "3ef6efd86f0e0145e043bcbcd4afe9183e5bc5e424188d78c09896b056f77dfd"
+    },
+    "cpu-and-oracle-build.log": {
+      "bytes": 622300,
+      "sha256": "8996349a28b38a3472d308ca0713fe182c29940858abbcdc6c44ce4d5d17c392"
+    },
+    "pack-tests-after-split.log": {
+      "bytes": 13579,
+      "sha256": "cf4deb98cdebf3cacdb1be21ee382ba8d36b908e1b34d8de26db70a5b7443fe8"
+    },
+    "registry-tests-after-split-fixed.log": {
+      "bytes": 19717,
+      "sha256": "0432a8a3a7cc926248b959be2012d418e90e417bcb09e76b123d578fb7a59ac0"
+    },
+    "sealed-compiler-tests-after-split.log": {
+      "bytes": 14281,
+      "sha256": "f60e1e53283d04871e30602ec7f9ec05cc647a79e9c4a20b2250d6d2c103f0da"
+    },
+    "test-kernels.log": {
+      "bytes": 1610,
+      "sha256": "c2e74d9d2a8f44ba81cead0fa9452b82b5da19b240378d0c29f8355356a2a3e0"
+    },
+    "qsa-mrope.json": {
+      "bytes": 820,
+      "sha256": "38ddb79fb2e9c1e51cd2f5ff78fa3e26eb82919b494e3598c33723cf44d4c6df"
+    },
+    "qsa-mrope.log": {
+      "bytes": 258,
+      "sha256": "f1447bd57e508d7cd3153fa26be40cef2a44091b8480e67cd7a59227d45ca25c"
+    },
+    "pre-commit-ci-candidate.log": {
+      "bytes": 5484266,
+      "sha256": "c1b6c0135472c0ee16c5d5e125991c9bb36dafe66fa8490dbd3e505c6382b8ec"
+    },
+    "manual-review.json": {
+      "bytes": 973,
+      "sha256": "75337cdc1d3940a0e468b08afa144f8dce3c3963a492ef508d6879438a283d40"
+    }
+  },
+  "report_generator_sha256": "5ce30490223cc01785b73d126756a138c0a58fab2182e9592ef94520373cf059"
+}

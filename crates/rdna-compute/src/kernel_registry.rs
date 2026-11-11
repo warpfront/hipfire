@@ -204,6 +204,15 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
 
     if matches!(arch, "gfx1100" | "gfx1151" | "gfx1201") {
         add!(
+            "qsa_mrope",
+            kernels::QSA_MROPE_SRC,
+            [
+                "indexed_attention_norm_mrope_f32_batched",
+                "indexed_attention_pool_mrope_bf16",
+                "indexed_attention_pool_mrope_f32"
+            ]
+        );
+        add!(
             "gemm_f16_skinny_xf32",
             kernels::GEMM_F16_SKINNY_XF32_SRC,
             ["gemm_f16_skinny_xf32"]
@@ -11744,6 +11753,20 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
+        // Image-only QSA rotations are isolated from the measured text module.
+        const IMAGE_MROPE_ADDED_MODULES: [&str; 1] = ["qsa_mrope"];
+        for module in IMAGE_MROPE_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing image module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
         // The gfx1201 Z/beta/alpha fold split of the non-fused IU4 verify GDN projection
         // (`gemm_zba_fold_g12_iu4_prepared`) is its own module on gfx1201 (the gfx1100/gfx1151
         // halo split of the same name is a P0 module there).
@@ -12161,6 +12184,7 @@ mod tests {
         assert_eq!(
             registry.len(),
             count
+                + IMAGE_MROPE_ADDED_MODULES.len()
                 + MQ3V25_ADDED_MODULES.len()
                 + GDN_LANES_ADDED_MODULES.len()
                 + PRE_S1_ADDED_SINCE_P0
@@ -12676,6 +12700,39 @@ mod tests {
         source_exports(crate::tensor_ops::TENSOR_OPS_SRC, arch)
     }
 
+    /// Image mRoPE has its own source and complete pack index. Loading images
+    /// must not mutate the measured text-only tensor_ops module identity.
+    #[test]
+    fn image_mrope_has_an_independent_packaged_module_and_preserves_text_source() {
+        use std::collections::BTreeSet;
+        let expected: BTreeSet<String> = [
+            "indexed_attention_norm_mrope_f32_batched",
+            "indexed_attention_pool_mrope_bf16",
+            "indexed_attention_pool_mrope_f32",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+            let text = lookup(arch, "tensor_ops", "").unwrap();
+            let image = lookup(arch, "qsa_mrope", "").unwrap();
+            let index: BTreeSet<String> = image.symbols.iter().map(|s| (*s).to_owned()).collect();
+            assert_eq!(index, expected, "{arch}: image index");
+            assert_eq!(
+                source_exports(image.source(), arch),
+                expected,
+                "{arch}: image exports"
+            );
+            assert_eq!(image.source(), kernels::QSA_MROPE_SRC);
+            assert_ne!(
+                text.source(),
+                image.source(),
+                "{arch}: image/text module alias"
+            );
+            assert!(text.symbols.iter().all(|s| !expected.contains(*s)));
+        }
+    }
+
     /// The legacy `moe_down_combine_grouped_top10` source is byte-for-byte the
     /// one the G0 fixtures and the walked gfx1201 plans recorded, and the S1
     /// slow-link kernels live in a module of their own, `slowlink_prefill`.
@@ -12804,7 +12861,7 @@ mod tests {
                 "indexed_attention_decode_prologue_q8",
             ]
         );
-        // The current gfx11 registry contains exactly the measured source exports.
+        // The current gfx11 registry contains the sealed exports and later additions.
         for arch in ["gfx1100", "gfx1151"] {
             let registered: BTreeSet<String> = lookup(arch, "tensor_ops", "")
                 .unwrap()

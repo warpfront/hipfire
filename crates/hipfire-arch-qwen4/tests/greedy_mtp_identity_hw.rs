@@ -2342,6 +2342,7 @@ fn run_arm(arm: Arm, case: Case, model: &Path, dir: &Path) -> Result<(), String>
         path: model_str.to_string(),
         max_seq: MAX_SEQ,
         sequence: None,
+        vision_reserve_bytes: 0,
         backend,
         vmm_granularity,
         kv_mode: hipfire_runtime::config::get().kv_mode.clone(),

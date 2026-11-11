@@ -73,6 +73,7 @@ pub mod gpu_forward_lanes;
 pub mod hc8_sidecar;
 /// Measured host-to-device link class (narrow-link G2 and chunk defaults).
 pub mod host_link;
+pub mod image;
 pub mod kv_backend;
 #[cfg(feature = "lab")]
 pub(crate) mod lab_draft_rounds;
@@ -128,6 +129,7 @@ pub mod sym_verdict_cache;
 pub(crate) mod trunk_a8;
 pub mod trunk_overlay;
 pub(crate) mod trunk_route;
+pub mod vision;
 pub mod weights;
 #[cfg(feature = "reference-parity")]
 pub mod wide_verify_oracle;

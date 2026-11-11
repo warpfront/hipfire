@@ -788,6 +788,10 @@ pub struct Qwen4MemoryAdmission {
     /// context; this is 0 when only the context itself fits.
     pub resident_ple: u64,
     pub headroom: u64,
+    /// Additional device bytes left for a vision tower and its largest image.
+    /// The tower is uploaded after the text rank is admitted, so this includes
+    /// its resident weights once, as well as image activation scratch.
+    pub vision_reserve: u64,
     /// Largest context whose growth fits with no PLE page cache resident
     /// (at most the assembled capacity).
     pub card_cap: usize,
@@ -809,6 +813,7 @@ impl Qwen4MemoryAdmission {
         self.growth()
             .saturating_add(self.resident_ple)
             .saturating_add(self.headroom)
+            .saturating_add(self.vision_reserve)
     }
 
     /// Whether the context took part of the requested PLE page cache budget
@@ -839,7 +844,34 @@ pub fn qwen4_memory_admission(
     headroom: u64,
     growth: impl Fn(usize) -> (u64, u64),
 ) -> Result<Qwen4MemoryAdmission, String> {
-    let fixed = mtp_request.saturating_add(headroom);
+    qwen4_memory_admission_with_reserve(
+        capacity,
+        requested,
+        free,
+        mtp_request,
+        resident_ple,
+        headroom,
+        0,
+        growth,
+    )
+}
+
+/// The same admission with an explicit per-load vision reserve. A zero
+/// reserve follows the text-only arithmetic and diagnostics unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn qwen4_memory_admission_with_reserve(
+    capacity: usize,
+    requested: Option<usize>,
+    free: u64,
+    mtp_request: u64,
+    resident_ple: u64,
+    headroom: u64,
+    vision_reserve: u64,
+    growth: impl Fn(usize) -> (u64, u64),
+) -> Result<Qwen4MemoryAdmission, String> {
+    let fixed = mtp_request
+        .saturating_add(headroom)
+        .saturating_add(vision_reserve);
     let fits = |tokens: usize| {
         let (context, gather) = growth(tokens);
         context.saturating_add(gather).saturating_add(fixed) <= free
@@ -873,13 +905,19 @@ pub fn qwen4_memory_admission(
         ple_budget: resident_ple,
         resident_ple: resident_ple.min(left_for_ple),
         headroom,
+        vision_reserve,
         card_cap,
         max_seq,
     };
     let detail = || {
+        let vision = if vision_reserve == 0 {
+            String::new()
+        } else {
+            format!(" + {vision_reserve} bytes vision reserve")
+        };
         format!(
-            "a {max_seq}-token context needs {} bytes free after load even with no resident PLE page cache ({context_growth} bytes QSA context incl. any F16 arena + {gather_growth} bytes QSA gather workspace + {mtp_request} bytes native MTP request buffers = {} bytes growth, + {headroom} bytes headroom), and {free} bytes is free after load",
-            admission.growth().saturating_add(headroom),
+            "a {max_seq}-token context needs {} bytes free after load even with no resident PLE page cache ({context_growth} bytes QSA context incl. any F16 arena + {gather_growth} bytes QSA gather workspace + {mtp_request} bytes native MTP request buffers = {} bytes growth, + {headroom} bytes headroom{vision}), and {free} bytes is free after load",
+            admission.growth().saturating_add(headroom).saturating_add(vision_reserve),
             admission.growth(),
         )
     };
@@ -1272,34 +1310,70 @@ const VISION_PROBE_TENSOR: &str = "model.visual.patch_embed.proj.weight";
 /// two families must not share one probe.
 const EMBED_GEMMA_VISION_PROBE_TENSOR: &str = "vision_tower.patch_embedder.input_proj.weight";
 
-/// The `.vl` sidecar contract of one VL family:
-/// `(sidecar arch ids the quantizer stamps on the pack, their spelling in
-/// refusals, the probe tensor proving the tower shipped, the pack remedy)`.
-/// The trunk-side gate and the sidecar-side gate share it, so a pack stamped
-/// by another family — whose tower names never resolve against this trunk —
-/// is refused instead of being opened as the wrong tower.
-fn vision_sidecar_family(
-    arch_id: u32,
-) -> Option<(&'static [u32], &'static str, &'static str, &'static str)> {
+/// The sidecar family owns validation and optional load policy. Keep these
+/// together so front-door admission does not redispatch on architecture ids.
+struct VisionSidecarFamily {
+    archs: &'static [u32],
+    expected: &'static str,
+    probe: &'static str,
+    remedy: &'static str,
+    validate: Option<fn(&hipfire_runtime::hfq::HfqFile) -> Result<(), String>>,
+    resolve: Option<VisionSidecarResolver>,
+}
+
+type VisionSidecarResolver =
+    fn(&str, Option<&str>, bool, EffectiveTopology) -> Result<Option<std::path::PathBuf>, String>;
+
+fn validate_qwen4_vision_sidecar(sidecar: &hipfire_runtime::hfq::HfqFile) -> Result<(), String> {
+    let config = hipfire_arch_qwen4::vision::config_from_hfq(sidecar)?;
+    hipfire_arch_qwen4::vision::validate_hfq(sidecar, &config)
+}
+
+fn resolve_qwen4_vision_load(
+    mode: &str,
+    path: Option<&str>,
+    is_dir: bool,
+    topology: EffectiveTopology,
+) -> Result<Option<std::path::PathBuf>, String> {
+    let resolved = resolve_qwen4_vision_mode(mode, path, is_dir)?;
+    if resolved.is_some()
+        && (topology != EffectiveTopology::Single || hipfire_config::topology::qwen4_ep()? > 1)
+    {
+        return Err(
+            "qwen4: image input currently requires a single-device load (tp=pp=ep=1)".into(),
+        );
+    }
+    Ok(resolved)
+}
+
+fn vision_sidecar_family(arch_id: u32) -> Option<VisionSidecarFamily> {
     match arch_id {
-        // Qwen3.5-VL dense (5) / MoE (6): the `--vision-only` pack of
-        // `model.visual.*`; either trunk accepts either family stamp.
-        5 | 6 => Some((
-            &[5, 6],
-            "5|6",
-            VISION_PROBE_TENSOR,
-            "pack the tower with `hipfire-quantize <hf-dir> --include-vision \
-             --include-prefix model.visual.`",
-        )),
-        // EmbeddingGemma-2 (18): the trunk is tower-less by construction and
-        // ships its own arch-18 `.vl` pack of the `vision_tower.*` group.
-        18 => Some((
-            &[18],
-            "18",
-            EMBED_GEMMA_VISION_PROBE_TENSOR,
-            "requantize with `hipfire-quantize <hf-dir>` (the EmbeddingGemma-2 \
-             pack writes the `.vl` tower sidecar beside the trunk)",
-        )),
+        // Qwen3.5 dense and MoE accept either shared tower family stamp.
+        5 | 6 => Some(VisionSidecarFamily {
+            archs: &[5, 6],
+            expected: "5|6",
+            probe: VISION_PROBE_TENSOR,
+            remedy: "pack the tower with `hipfire-quantize <hf-dir> --include-vision --include-prefix model.visual.`",
+            validate: None,
+            resolve: None,
+        }),
+        // Same visual.* names; different projector width and token ids.
+        QWEN4_ARCH_ID => Some(VisionSidecarFamily {
+            archs: &[QWEN4_ARCH_ID],
+            expected: "16",
+            probe: VISION_PROBE_TENSOR,
+            remedy: "pack the tower with `hipfire-quantize --qwen4-flash-next --vision-only --input hf://Qwen/Qwen3.8-Flash-Next@<40-hex-revision> --output <sidecar.hfq>`",
+            validate: Some(validate_qwen4_vision_sidecar),
+            resolve: Some(resolve_qwen4_vision_load),
+        }),
+        18 => Some(VisionSidecarFamily {
+            archs: &[18],
+            expected: "18",
+            probe: EMBED_GEMMA_VISION_PROBE_TENSOR,
+            remedy: "requantize with `hipfire-quantize <hf-dir>` (the EmbeddingGemma-2 pack writes the `.vl` tower sidecar beside the trunk)",
+            validate: None,
+            resolve: None,
+        }),
         _ => None,
     }
 }
@@ -1325,15 +1399,23 @@ fn resolve_vision_sidecar(
              sources cannot carry a sidecar tower"
         ));
     }
-    let Some((sidecar_archs, expected, probe, remedy)) = vision_sidecar_family(arch_id) else {
+    let Some(family) = vision_sidecar_family(arch_id) else {
         return Err(format!(
             "vision sidecar '{path}' requested for arch_id={arch_id}: vision sidecars \
-             only serve Qwen3.5-VL (arch_id 5|6) and EmbeddingGemma-2 (arch_id 18) trunks"
+             only serve Qwen3.5-VL (arch_id 5|6), Flash-Next (arch_id 16), and EmbeddingGemma-2 (arch_id 18) trunks"
         ));
     };
     let sidecar = hipfire_runtime::hfq::HfqFile::open(std::path::Path::new(path))
         .map_err(|e| format!("vision sidecar '{path}': open failed: {e}"))?;
-    if !sidecar_archs.contains(&sidecar.arch_id) {
+    let VisionSidecarFamily {
+        archs,
+        expected,
+        probe,
+        remedy,
+        validate,
+        ..
+    } = family;
+    if !archs.contains(&sidecar.arch_id) {
         return Err(format!(
             "vision sidecar '{path}' has arch_id={} (expected {expected}): {remedy}",
             sidecar.arch_id
@@ -1344,7 +1426,32 @@ fn resolve_vision_sidecar(
             "vision sidecar '{path}' carries no vision tower tensor '{probe}': {remedy}"
         ));
     }
+    if let Some(validate) = validate {
+        validate(&sidecar)?;
+    }
     Ok(Some(std::path::PathBuf::from(path)))
+}
+
+/// Match beta's four modes. Auto/resident allow a missing tower, on requires
+/// one, and off does not open a path. Flash Next maps every loaded tower to
+/// resident storage; the shared streamed route remains available to other arches.
+fn resolve_qwen4_vision_mode(
+    mode: &str,
+    path: Option<&str>,
+    is_dir: bool,
+) -> Result<Option<std::path::PathBuf>, String> {
+    let mode = if mode.is_empty() {
+        hipfire_config::vision_mode_default()
+    } else {
+        mode
+    };
+    match mode {
+        "off" => Ok(None),
+        "auto" | "resident" => resolve_vision_sidecar(path, QWEN4_ARCH_ID, is_dir),
+        "on" => resolve_vision_sidecar(path, QWEN4_ARCH_ID, is_dir)?.map(Some).ok_or_else(||
+            "qwen4: vision_mode=on requires the Flash-Next vision sidecar; provide --vision <qwen3.8-flash-next-vision.hfq>".into()),
+        _ => Err(format!("qwen4: invalid vision_mode '{mode}'; expected auto, resident, on or off")),
+    }
 }
 
 /// Maple head-overlay arch id (`hipfire-quantize --head-only` carriers).
@@ -2957,7 +3064,10 @@ pub fn admit_source_with_options(
     // Shared tower sidecar (registry `vision` slot / `params.vision` /
     // `HIPFIRE_VISION_SIDECAR`), validated fail-closed; a tower-bearing
     // sidecar promotes a tower-less trunk to VL.
-    let vision_path = resolve_vision_sidecar(vision, arch_id, is_dir)?;
+    let vision_path = match vision_sidecar_family(arch_id).and_then(|family| family.resolve) {
+        Some(resolve) => resolve(vision_mode, vision, is_dir, topology)?,
+        None => resolve_vision_sidecar(vision, arch_id, is_dir)?,
+    };
     if vision_path.is_some() {
         has_vision = true;
     }
@@ -4827,6 +4937,50 @@ mod tests {
             assert!(err.contains("expected 5|6"), "names the family: {err}");
             cleanup(&qwen_trunk);
             cleanup(&eg2_sidecar);
+        }
+
+        #[test]
+        fn flash_next_modes_preserve_optional_tower_and_require_on() {
+            let missing = "/does-not-exist/flash-next-vision.hfq";
+            assert!(
+                super::super::resolve_qwen4_vision_mode("off", Some(missing), false)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(super::super::resolve_qwen4_vision_mode("auto", None, false)
+                .unwrap()
+                .is_none());
+            assert!(
+                super::super::resolve_qwen4_vision_mode("resident", None, false)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(super::super::resolve_qwen4_vision_mode("", None, false)
+                .unwrap()
+                .is_none());
+            assert!(super::super::resolve_qwen4_vision_mode("on", None, false)
+                .unwrap_err()
+                .contains("requires"));
+            assert!(
+                super::super::resolve_qwen4_vision_mode("auto", Some(missing), false)
+                    .unwrap_err()
+                    .contains("open failed")
+            );
+            assert!(super::super::resolve_qwen4_vision_mode("invalid", None, false).is_err());
+        }
+
+        #[test]
+        fn flash_next_rejects_27b_and_incomplete_towers() {
+            let wrong = write_hfq("flash-next-wrong-family", 5, true);
+            let err =
+                super::super::resolve_qwen4_vision_mode("on", wrong.to_str(), false).unwrap_err();
+            assert!(err.contains("expected 16"), "{err}");
+            cleanup(&wrong);
+            let incomplete = write_hfq("flash-next-incomplete", 16, true);
+            assert!(
+                super::super::resolve_qwen4_vision_mode("on", incomplete.to_str(), false).is_err()
+            );
+            cleanup(&incomplete);
         }
 
         /// A sidecar requested for any arch outside the two VL families is
