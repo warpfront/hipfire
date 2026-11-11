@@ -2499,6 +2499,13 @@ fn forward_wave_with(
         .execution
         .take()
         .ok_or_else(|| invalid("Qwen4 forward resources are not attached"))?;
+    // gfx942 single device (P2): the lane tile's canonical prefill routing and F16 clamp.
+    let g942 = crate::lane_exec::g942_wave::wave_applies(gpu, bundle);
+    if g942 {
+        lanes
+            .iter_mut()
+            .for_each(|lane| lane.state.clamp_f16_valid());
+    }
     let mut rows: Vec<LaneRows<'_>> = lanes
         .iter_mut()
         .map(|lane| LaneRows {
@@ -2511,8 +2518,9 @@ fn forward_wave_with(
         })
         .collect();
     let scope = std::mem::replace(&mut gpu.qwen4_scope, true);
-    let invariant =
-        rdna_compute::prefill_invariant::prefill_pm_invariant_enabled() && gpu.arch == "gfx1151";
+    let invariant = (rdna_compute::prefill_invariant::prefill_pm_invariant_enabled()
+        && gpu.arch == "gfx1151")
+        || g942;
     let invariant = std::mem::replace(&mut gpu.prefill_invariant_scope, invariant);
     let result = if forward.ep.is_some() {
         forward_wave_ep(gpu, &mut forward, bundle, &mut rows, out)
