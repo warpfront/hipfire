@@ -6023,13 +6023,28 @@ fn gdn_moe_chunk_scan_on(arch: &str) -> bool {
     )
 }
 
-/// Row admission of the chunk scan, shared by the dense and MoE routes: at
-/// least one 64-row chunk, and either one segment of at most 512 rows or
-/// 512-row commit segments whose tail is a whole chunk or empty.
-fn gdn_chunk_scan_rows_admitted(n: usize, commit_stride: Option<usize>) -> bool {
-    n >= 64
-        && (n <= 512
-            || (commit_stride == Some(512) && (n % 512 == 0 || (64..512).contains(&(n % 512)))))
+/// Row admission of the chunk scan, shared by the dense and MoE routes. The
+/// scan's 64-row microtiles and 512-row state commits sit on absolute 512-row
+/// segment seams that do not depend on how a prompt is split into outer chunks, so
+/// the admission must not depend on it either:
+///
+/// * `n <= 512` (one segment): `n >= 64`; a shorter call is the final tail of an
+///   ordinary chunked prefill only when it resumes exactly on a nonzero 512-row
+///   seam (`start_pos > 0 && start_pos % 512 == 0`), where the larger outer chunks
+///   of the same prompt scan it inside their last commit segment. A short call
+///   anywhere else (a whole short prompt, a follow-up turn, a decode-adjacent
+///   batch) has no chunk-dependent counterpart and keeps its recurrence;
+/// * `n > 512`: the 512-row commit stride, with any final tail of 0..=511 rows.
+///   The kernels mask the padded rows of a partial 64-row tile
+///   (`gdn_chunk_tail_kill` receipts), so a short tail never forces the whole outer
+///   chunk onto the sequential recurrence.
+fn gdn_chunk_scan_rows_admitted(n: usize, commit_stride: Option<usize>, start_pos: usize) -> bool {
+    if n <= WIDENED_COMMIT_ROWS {
+        n >= 64
+            || (n >= MIN_BATCH && start_pos > 0 && start_pos % WIDENED_COMMIT_ROWS == 0)
+    } else {
+        commit_stride == Some(WIDENED_COMMIT_ROWS)
+    }
 }
 
 /// Layer-independent inputs of the MoE GDN chunk-scan admission.
@@ -7487,10 +7502,7 @@ pub(crate) fn forward_batch_chunk_impl(
         && max_layer.is_none()
         && routed_out.is_none()
         && mask_override.is_none()
-        && n >= 64
-        && (n <= 512
-            || (commit_stride == Some(512)
-                && (n % 512 == 0 || (64..512).contains(&(n % 512)))));
+        && gdn_chunk_scan_rows_admitted(n, commit_stride, start_pos);
     // Default-resolved MoE route (explicit `HIPFIRE_GDN_MOE_CHUNK_SCAN` wins,
     // unset follows qualification): the dense chunk-scan clauses that apply to
     // a MoE LA layer (no KV-cache or iu4-prefill clause: the MoE projection
@@ -7525,7 +7537,7 @@ pub(crate) fn forward_batch_chunk_impl(
             && max_layer.is_none()
             && routed_out.is_none()
             && mask_override.is_none(),
-        rows: gdn_chunk_scan_rows_admitted(n, commit_stride),
+        rows: gdn_chunk_scan_rows_admitted(n, commit_stride, start_pos),
     }
     .admitted();
     let ctx = DispatchCtx::new(gpu)
@@ -7950,38 +7962,66 @@ mod tests {
         }
     }
 
-    /// The shared row admission is the dense route's historical inline clause:
-    /// widened rows above 512 admit only with the 512-row commit stride and a
-    /// whole-chunk (or empty) tail.
+    /// The shared row admission is independent of how a prompt is split into outer
+    /// chunks: any widened chunk (> 512 rows, 512-row commit stride) admits whatever
+    /// its final tail (0..=511 rows, including 1..63), and a short final call admits
+    /// only when it resumes on a nonzero 512-row seam.
     #[test]
-    fn gdn_chunk_scan_rows_admission_matches_the_dense_clause() {
-        let dense = |n: usize, stride: Option<usize>| {
-            n >= 64
-                && (n <= 512
-                    || (stride == Some(512) && (n % 512 == 0 || (64..512).contains(&(n % 512)))))
+    fn gdn_chunk_scan_rows_admission_is_independent_of_the_outer_chunk_split() {
+        let want = |n: usize, stride: Option<usize>, start: usize| {
+            if n <= 512 {
+                n >= 64 || (n >= 2 && start > 0 && start % 512 == 0)
+            } else {
+                stride == Some(512)
+            }
         };
         for stride in [None, Some(256), Some(512)] {
-            for n in 0..=4096usize {
-                assert_eq!(
-                    gdn_chunk_scan_rows_admitted(n, stride),
-                    dense(n, stride),
-                    "n={n} stride={stride:?}"
-                );
+            for start in [0usize, 1, 63, 64, 256, 512, 513, 1024, 19968, 19969] {
+                for n in 0..=4096usize {
+                    assert_eq!(
+                        gdn_chunk_scan_rows_admitted(n, stride, start),
+                        want(n, stride, start),
+                        "n={n} stride={stride:?} start={start}"
+                    );
+                }
             }
         }
-        for (n, stride, want) in [
-            (63, None, false),
-            (64, None, true),
-            (512, None, true),
-            (513, None, false),
-            (513, Some(512), false),
-            (575, Some(512), false),
-            (576, Some(512), true),
-            (1024, Some(512), true),
-            (1025, Some(512), false),
-            (1088, Some(512), true),
+        for (n, stride, start, admitted) in [
+            (63, None, 0, false),
+            (63, None, 19969, false),
+            (1, None, 512, false),
+            (2, None, 512, true),
+            (25, None, 19968, true),
+            (64, None, 0, true),
+            (512, None, 0, true),
+            (513, None, 0, false),
+            (513, Some(512), 0, true),
+            (537, Some(512), 19456, true),
+            (575, Some(512), 0, true),
+            (3609, Some(512), 16384, true),
+            (1025, Some(512), 0, true),
+            (1025, Some(256), 0, false),
         ] {
-            assert_eq!(gdn_chunk_scan_rows_admitted(n, stride), want, "n={n}");
+            assert_eq!(
+                gdn_chunk_scan_rows_admitted(n, stride, start),
+                admitted,
+                "n={n} stride={stride:?} start={start}"
+            );
+        }
+        // The X2 prompt: 19993 tokens, 25 mod 512. Every outer chunk ceiling scans every
+        // chunk, including the 25-row final tail that used to force the whole last chunk
+        // onto the sequential recurrence.
+        for ceiling in [512usize, 1024, 4096, 8192, 16384, 20480] {
+            let mut at = 0usize;
+            while at < 19993 {
+                let c = next_exact_prefill_chunk_len(19993 - at, ceiling).unwrap();
+                let stride = widened_commit_stride(ceiling > 512, c);
+                assert!(
+                    gdn_chunk_scan_rows_admitted(c, stride, at),
+                    "ceiling={ceiling} chunk at {at} rows {c}"
+                );
+                at += c;
+            }
         }
     }
 
@@ -8090,14 +8130,11 @@ mod tests {
                                 tree: false,
                                 tape: false,
                                 plain_forward: !verify_capture,
-                                rows: gdn_chunk_scan_rows_admitted(rows, stride),
+                                rows: gdn_chunk_scan_rows_admitted(rows, stride, 0),
                             }
                             .admitted();
                             let want_flag = explicit.unwrap_or(qualified);
-                            let want_rows = rows >= 64
-                                && (rows <= 512
-                                    || (stride == Some(512)
-                                        && (rows % 512 == 0 || (64..512).contains(&(rows % 512)))));
+                            let want_rows = rows >= 64 && (rows <= 512 || stride == Some(512));
                             let want =
                                 want_flag && value_heads <= 48 && want_rows && !verify_capture;
                             assert_eq!(

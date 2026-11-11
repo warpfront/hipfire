@@ -1897,10 +1897,12 @@ pub fn gdn_chunk_scan_prepare_views(
         ));
     }
     let segment_rows = commit_stride.unwrap_or(n);
-    let tail_rows = n % segment_rows;
-    if !(64..=512).contains(&segment_rows)
-        || (tail_rows != 0 && !(64..segment_rows).contains(&tail_rows))
-    {
+    // A commit segment may end with any 1..63-row microtile, including a
+    // segment containing only that tail. KKT clamps K and guards G/beta; the
+    // scan clamps Q/K/V, zeroes padded controls and masks output stores. The
+    // gdn_chunk_tail_kill oracle poisons every padded plane and checks these
+    // segments against 512+tail combined calls on gfx1100/1151/1201.
+    if n == 0 || !(1..=512).contains(&segment_rows) {
         return Err(HipError::new(
             0,
             "invalid admitted GDN chunk scan segment geometry",

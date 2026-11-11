@@ -128,10 +128,11 @@ fn gate_i8_entry(value_heads: usize, value_dim: usize) -> Option<&'static str> {
     }
 }
 
-/// The row-count part of [`applies`]: at least [`MIN_ROWS`] rows, and a final 512-row commit
-/// segment of 64..512 rows or none (the mseg segment geometry).
+/// The row-count part of [`applies`]: at least [`MIN_ROWS`] rows. Every final
+/// 512-row segment, including a 1..63-row tail, stays on the scan route:
+/// KKT and scan mask the partial C64 microtile (`gdn_chunk_tail_kill`).
 fn rows_admitted(n: usize) -> bool {
-    n >= MIN_ROWS && (n % 512 == 0 || (64..512).contains(&(n % 512)))
+    n >= MIN_ROWS
 }
 
 /// The geometry part of [`applies`]: an admitted head geometry
@@ -763,8 +764,8 @@ mod tests {
         }
     }
 
-    /// `applies`' row-count part is unchanged: at least 64 rows, a final partial 512-row
-    /// segment of 64..512 rows or none.
+    /// A short final segment must not change the algorithm for all preceding
+    /// rows of an outer staging chunk.
     #[test]
     fn row_admission_is_the_mseg_segment_geometry() {
         for (rows, want) in [
@@ -774,13 +775,13 @@ mod tests {
             (65, true),
             (511, true),
             (512, true),
-            (513, false),
-            (575, false),
+            (513, true),
+            (575, true),
             (576, true),
             (1024, true),
-            (1025, false),
+            (1025, true),
             (4096, true),
-            (4096 + 63, false),
+            (4096 + 63, true),
             (4096 + 64, true),
         ] {
             assert_eq!(rows_admitted(rows), want, "{rows} rows");

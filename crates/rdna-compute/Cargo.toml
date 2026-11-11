@@ -554,6 +554,10 @@ name = "gdn_chunk_generalized_oracle"
 required-features = ["lab", "deltanet"]
 
 [[example]]
+name = "gdn_chunk_tail_kill"
+required-features = ["lab", "deltanet"]
+
+[[example]]
 name = "gdn_state_precision_oracle"
 required-features = ["lab"]
 
