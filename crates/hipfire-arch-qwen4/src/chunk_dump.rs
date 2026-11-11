@@ -212,6 +212,22 @@ impl ChunkDump {
                 _ => &scratch.qsa_output,
             };
             write("mixer-pre.bin", &read(gpu, pre, rows_bytes(pre, rows, capacity))?)?;
+            if config.layer_types.get(layer) == Some(&crate::config::LayerType::LinearAttention) {
+                // GDN intermediates of this layer, in dataflow order: raw projections, the
+                // convolution output, gate/beta, the scan output (dead after the gate).
+                for (name, t) in [
+                    ("gdn-proj.bin", &scratch.projection),
+                    ("gdn-conv.bin", &scratch.projection2),
+                    ("gdn-a.bin", &scratch.gdn_a),
+                    ("gdn-b.bin", &scratch.gdn_b),
+                    ("gdn-z.bin", &scratch.gdn_z),
+                    ("gdn-gate.bin", &scratch.gdn_gate),
+                    ("gdn-beta.bin", &scratch.gdn_beta),
+                    ("gdn-scan.bin", &scratch.gdn_recurrent_output),
+                ] {
+                    write(name, &read(gpu, t, rows_bytes(t, rows, capacity))?)?;
+                }
+            }
             let post = &scratch.attention_output;
             write("mixer-output.bin", &read(gpu, post, rows_bytes(post, rows, capacity))?)?;
             write(
