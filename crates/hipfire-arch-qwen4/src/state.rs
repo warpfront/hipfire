@@ -34,11 +34,7 @@ use hipfire_runtime::session_cache::{RowStream, StateLayout, StatePart};
 use rdna_compute::qsa_pooled_mirror::{
     qsa_pooled_bf16_mirror_enabled, QsaPooledBf16MirrorRef, QsaPooledBf16ValidBlocks,
 };
-use rdna_compute::gdn_stream::{
-    GdnCarryView as GdnScanCarryView, GdnLiveState, GdnPrefillPlan, GdnQ8Planes, GdnStreamConsts,
-    GdnStreamMeta, GdnStreamPhase, GdnStreamWorkspace,
-};
-use rdna_compute::norm::GdnScanOut;
+use rdna_compute::gdn_stream::{GdnPrefillPlan, GdnStreamMeta, GdnStreamPhase};
 use rdna_compute::tensor_ops::gdn_wy_stream::{
     gdn_wy_stream_seal, GdnWyCarry, GdnWyEdge, GdnWySeal, WY_TILE_ROWS,
 };
@@ -2460,9 +2456,6 @@ pub struct Qwen4State {
     gdn_stream: Option<GdnPrefillPlan>,
     /// Shared output/Z staging of a replayed tile, charged once per state.
     gdn_edge: Option<GdnEdge>,
-    /// The Scan64 executor's fixed 64-row edge workspace (dense C64 route), charged once per
-    /// state, never copied by a snapshot.
-    gdn_scan_ws: Option<GdnStreamWorkspace>,
     /// Successful full-owner EF reset dispatch sequences, never serialized.
     gdn_residual_resets: u64,
     /// Set only around a speculative verify forward.
@@ -2757,7 +2750,6 @@ impl Qwen4State {
             .then(|| gdn_carry::resolve_gdn_stream(gpu, config, format.gdn))
             .flatten();
         let mut edge: Option<GdnEdge> = None;
-        let mut scan_ws: Option<GdnStreamWorkspace> = None;
         let snapshot_arena = match (|| {
             for layer in &gdn {
                 if let Some(residual) = &layer.ef_residual {
@@ -2765,13 +2757,8 @@ impl Qwen4State {
                 }
             }
             if let Some(plan) = &stream_plan {
-                let kind = gdn_carry::StreamKind::of_plan(plan);
-                let layer_specs = gdn_carry::carry_layer_specs(config, kind);
-                // Scan64's edge staging is the executor's own workspace (allocated below).
-                let edge_specs = match kind {
-                    gdn_carry::StreamKind::Wy16 => gdn_carry::edge_specs(config, kind),
-                    gdn_carry::StreamKind::Scan64 => Vec::new(),
-                };
+                let layer_specs = gdn_carry::carry_layer_specs(config);
+                let edge_specs = gdn_carry::edge_specs(config);
                 let mut staged: Vec<GpuTensor> = Vec::new();
                 let allocated = (|| -> Result<(), StateError> {
                     for _ in &gdn {
@@ -2801,25 +2788,11 @@ impl Qwen4State {
                         meta: Cell::new(gdn_carry::sealed_cursor(plan, 0, 0)),
                     });
                 }
-                match kind {
-                    gdn_carry::StreamKind::Wy16 => {
-                        edge = Some(GdnEdge {
-                            z: take(),
-                            out: take(),
-                            norm: take(),
-                        });
-                    }
-                    gdn_carry::StreamKind::Scan64 => {
-                        scan_ws = Some(
-                            gpu.gdn_stream_workspace_alloc(
-                                config.linear_num_key_heads,
-                                config.linear_num_value_heads,
-                                GdnScanOut::Bf16,
-                            )
-                            .map_err(StateError::Hip)?,
-                        );
-                    }
-                }
+                edge = Some(GdnEdge {
+                    z: take(),
+                    out: take(),
+                    norm: take(),
+                });
             }
             match mirror {
                 StateMirror::Snapshot => Qwen4StateSnapshotArena::new(
@@ -2842,9 +2815,6 @@ impl Qwen4State {
                     for tensor in [edge.norm, edge.out, edge.z] {
                         let _ = gpu.free_tensor(tensor);
                     }
-                }
-                if let Some(ws) = scan_ws.take() {
-                    let _ = gpu.gdn_stream_workspace_free(ws);
                 }
                 if let Some(hyper_feedback) = hyper_feedback {
                     let _ = gpu.free_tensor(hyper_feedback);
@@ -2909,7 +2879,6 @@ impl Qwen4State {
             gdn_key_heads: config.linear_num_key_heads,
             gdn_stream: stream_plan,
             gdn_edge: edge,
-            gdn_scan_ws: scan_ws,
             gdn_residual_resets: u64::from(format.gdn.has_residual() && map.gdn_count() != 0),
             row_capture_armed: false,
             #[cfg(feature = "lab")]
@@ -4466,12 +4435,6 @@ impl Qwen4State {
             free(edge.z);
             free(edge.out);
             free(edge.norm);
-        }
-        if let Some(ws) = self.gdn_scan_ws {
-            let GdnStreamWorkspace { x, alpha, beta, q, k, v, a, out, conv, .. } = ws;
-            for tensor in [x, alpha, beta, q, k, v, a, out, conv] {
-                free(tensor);
-            }
         }
         // With a shared pool the per-layer rings are views of it.
         let pooled = self.row_capture_pool.is_some();
@@ -7049,7 +7012,6 @@ mod tests {
             gdn_key_heads: config.linear_num_key_heads,
             gdn_stream: None,
             gdn_edge: None,
-            gdn_scan_ws: None,
             gdn_residual_resets: 0,
             row_capture_armed: false,
             #[cfg(feature = "lab")]
