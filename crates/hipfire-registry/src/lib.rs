@@ -2104,6 +2104,7 @@ mod tests {
         }
         // The MQ3 and MQ2 bases are split-only on the same shared pair.
         let split_tags = [
+            "qwen3.8:flash-next-mq4-xts-symtrunk",
             "qwen3.8:flash-next-mq3-xts",
             "qwen3.8:flash-next-mq2-xts",
             "qwen3.8:flash-next-mq2-xts-4500",
