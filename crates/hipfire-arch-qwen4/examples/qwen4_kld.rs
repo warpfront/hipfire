@@ -2200,7 +2200,9 @@ fn chunklogits(
     drop(tok);
     drop(hfq);
     std::fs::create_dir_all(output).map_err(|e| e.to_string())?;
-    let mut m = Model::load(model, max_prompt + 8, 1, None, pin)?;
+    // The admitted prefill chunk follows `n_ctx`: round it up to a whole number of 256-row V2B
+    // tiles so a ragged (padded) projection of the longest call has its dedicated extent.
+    let mut m = Model::load(model, (max_prompt + 8).next_multiple_of(256), 1, None, pin)?;
     let row = m.logits.sub_offset(0, m.vocab);
     let mut cells = Vec::new();
     let mut worst_kl = 0f64;

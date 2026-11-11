@@ -265,6 +265,53 @@ pub fn applies_edge(gpu: &Gpu, p: &GatedDeltaStepBatched<'_>) -> bool {
         && !gpu.graphs.capture_mode
 }
 
+/// Static admission of the dense C64 stream (Scan64 executor) for a state in `format` on
+/// `arch`: the dense scan's architecture / format / geometry admission with the chain-fusion
+/// producer entry, no row count and no device handle (the census of an admission decision has
+/// none). The stream carries a Q8-family state only (F32 has no seam).
+pub fn stream_geometry_admitted(
+    arch: &str,
+    format: GdnStateFormat,
+    key_heads: usize,
+    value_heads: usize,
+    key_dim: usize,
+    value_dim: usize,
+    chain_fuse: bool,
+) -> bool {
+    matches!(format, GdnStateFormat::Q8 | GdnStateFormat::Q8Ef)
+        && crate::scratch::qwen4_dense_gdn_admits(arch, format)
+        && geometry_runs(
+            key_heads,
+            value_heads,
+            key_dim,
+            value_dim,
+            (2 * key_heads + value_heads) * key_dim,
+            chain_fuse,
+        )
+}
+
+/// [`stream_geometry_admitted`] under this device's flags (`HIPFIRE_FN_GDN_DENSE_SCAN`,
+/// `HIPFIRE_QWEN4_GDN_CHAIN_FUSE`).
+pub fn stream_admitted(
+    gpu: &Gpu,
+    format: GdnStateFormat,
+    key_heads: usize,
+    value_heads: usize,
+    key_dim: usize,
+    value_dim: usize,
+) -> bool {
+    gpu.flags.fn_gdn_dense_scan
+        && stream_geometry_admitted(
+            &gpu.arch,
+            format,
+            key_heads,
+            value_heads,
+            key_dim,
+            value_dim,
+            gpu.flags.qwen4_gdn_chain_fuse_enabled(),
+        )
+}
+
 thread_local! {
     /// One scratch per device id: a single submission thread can drive several
     /// devices (pipeline-parallel bands), and a buffer allocated on one device

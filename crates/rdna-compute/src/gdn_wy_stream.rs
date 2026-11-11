@@ -105,8 +105,22 @@ pub fn wy_stream_admitted(
     key_dim: usize,
     value_dim: usize,
 ) -> bool {
-    gpu.arch_caps.has_wmma_w32()
-        && qwen4_gdn_prefill() == Qwen4GdnPrefill::Wy
+    wy_stream_admitted_arch(&gpu.arch, key_heads, value_heads, key_dim, value_dim)
+}
+
+/// [`wy_stream_admitted`] for an architecture name: the byte accounting of an admission census
+/// has no device handle but must make the same decision.
+pub fn wy_stream_admitted_arch(
+    arch: &str,
+    key_heads: usize,
+    value_heads: usize,
+    key_dim: usize,
+    value_dim: usize,
+) -> bool {
+    matches!(
+        arch,
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1103" | "gfx1150" | "gfx1151" | "gfx1152"
+    ) && qwen4_gdn_prefill() == Qwen4GdnPrefill::Wy
         && *crate::gemm::QWEN4_F16_WMMA
         && key_dim == 128
         && value_dim == 128
