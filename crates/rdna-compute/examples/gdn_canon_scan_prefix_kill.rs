@@ -22,8 +22,8 @@
 //! not gated. If prefix identity fails, the bounded-replay design cannot make
 //! consumed later-layer activations exact and promotion must stop (design §8).
 //!
-//! Only the C64 gfx1201 family is exercisable on hiptrx; the C16 WY family needs
-//! gfx1100/gfx1151 hardware and is reported as `not_run`.
+//! Runs on gfx1201 (hv 32|48) and on gfx1100 / gfx1151 (hv 48; the gfx11 prep/KKT/scan route:
+//! F32 scan output, no batched KKT or mseg). The C16 WY family is `gdn_canon_wy_prefix_kill`.
 //!
 //! Build: cargo build --release -p rdna-compute --features lab,deltanet --example gdn_canon_scan_prefix_kill
 //! Run:   HIPFIRE_GRAPH=0 gdn_canon_scan_prefix_kill --json <receipt.json> [--hv 48|32] [--heads 0,64,512]
@@ -123,9 +123,11 @@ fn run() -> R<i32> {
             return Ok(EXIT_ENV);
         }
     };
-    if gpu.arch != "gfx1201" {
+    if !matches!(gpu.arch.as_str(), "gfx1201" | "gfx1100" | "gfx1151")
+        || (hv != 48 && gpu.arch != "gfx1201")
+    {
         eprintln!(
-            "gdn_canon_scan_prefix_kill: needs gfx1201 (got {})",
+            "gdn_canon_scan_prefix_kill: needs gfx1201 (hv 32|48), gfx1100 or gfx1151 (hv 48); got {} hv {hv}",
             gpu.arch
         );
         return Ok(EXIT_ENV);
@@ -266,8 +268,8 @@ fn run() -> R<i32> {
         verdict,
         json!({
             "kill": 2,
-            "family": "C64 gfx1201 chunk scan (production prep -> KKT -> scan route)",
-            "c16_wy_family": "not_run: needs gfx1100/gfx1151 hardware",
+            "family": format!("C64 chunk scan on {} (production prep -> KKT -> scan route)", gpu.arch),
+            "c16_wy_family": "see gdn_canon_wy_prefix_kill",
             "hv": hv,
             "scan_out": format!("{out_fmt:?}"),
             "incoming_state": "nonzero Q8 codes + scales + F16 EF + conv history (pinned lcg seeds 9..12)",
