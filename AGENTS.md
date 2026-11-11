@@ -688,6 +688,30 @@ are the expected re-pins, including the repaired native-FP8 producer route.
 | gfx1100 | A4 (default), `--kv-mode q8 --kv-v q8` | code24 | 0.052757 | `27d837f388f3294d645b825d1cff7d1b06d219595f4459e9efc3fc4af2f93311` |
 | gfx1151 | A4 (default), `--kv-mode q8 --kv-v q8`, warm kernel cache | WT2 | 0.070054 | `2355f76cfd730cae26cdad027b3de00aeb14b0af8bb666eef934680bd14ca225` |
 | gfx1151 | A4 (default), `--kv-mode q8 --kv-v q8`, warm kernel cache | code24 | 0.050338 | `9caca85b4bf9c4049c921d85afc372ffcbb4698642313d5ce605eb1b2bb8feb0` |
+| gfx942 | Flash-Next stock FP8 AR (default route, `qwen4_kld eval --decode`), BF16 teacher | WT2 | 0.018734 | `d4b4d4adaa338cf4d738394b8fcaa2c481b2895d56753a4b35710c5d32d3be68` |
+| gfx942 | Flash-Next stock FP8 AR (default route, `qwen4_kld eval --decode`), BF16 teacher | code24 | 0.023527 | `5255454e0c638d46443ceabd1b316a5daf28ecf387a8293def6c6da46019327f` |
+
+The gfx942 (MI300X) rows are not `eval_hipfire` runs and not the 27B model.
+Model: `qwen3.8-flash-next.stock-fp8.hfq` (sha256
+`650e7f43f9293110f1ab789c256f13a5043e8523da3f05834dcc681b5203c592`,
+181924966424 bytes). Evaluator: `qwen4_kld eval --model MODEL --ref REF
+--output OUT.kldseq --decode` with `HIPFIRE_GRAPH=0` and
+`HIPFIRE_NORMALIZE_PROMPT=0`, all other `HIPFIRE_*` unset, scoring the
+production AR n=1 route, 24 chunks. References are BF16-teacher
+`.kldref` files: WT2 `fn-bf16-wt2-24x2048.v3.kldref` (24 x 2048, sha256
+`fafb91dc8d9636a49335ce8a89738a7ec9181f925914240debb8f0c9d56fd569`), code24
+`fn-bf16-code24-24x512.v3.kldref` (24 x 512, sha256
+`0d6c6a8cf00062cfeafc4be206a44b3cb68622f9174fe852ff1d2bea99b1f28b`). Pinned at
+evaluator build commit `165cf0e962` (v0.4.6), evaluator binary md5
+`bf9f63552f3c18aae0bb203eae6ed6ef` (sha256
+`0e7d566d41da9a5d8aa827c0b01a2e232fe6fcba9df3309c763819225cf4fd90`), ROCm 10.1 /
+HIP 7.16.26385 / clang 24. Each cell was reproduced in two fresh processes with
+separate HOME and empty `HIPFIRE_KERNEL_CACHE` (byte-identical), and once more
+on a warm cache (byte-identical to the cold pair). v0.4.6 already contains the
+HC quarters-gates route (`HIPFIRE_QWEN4_G942_HC_QUARTERS_GATES`, default on), so
+these are its numerics. Planted control: `HIPFIRE_G942_TRUNK_GEMV=1` moves the
+code24 hash (`f3acb89b…`, KLD 0.023089). Receipt:
+`/home/kaden/qcal/release-0.5.0/s0/PIN-GFX942.md`.
 
 Cold-cache gfx1151 discriminator (not pins): WT2 measured 0.070054
 (`2355f76c…`) and 0.069878 (`a2f550a9…`); code24 measured 0.050417
