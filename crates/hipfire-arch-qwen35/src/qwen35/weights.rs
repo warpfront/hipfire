@@ -21,7 +21,7 @@ use rdna_compute::DType;
 use rdna_compute::Gpu;
 use rdna_compute::GpuTensor;
 use rdna_compute::gdn_stream::{
-    GdnCarryGeometry, GdnStreamMeta, GdnStreamPhase, GDN_STREAM_SCHEMA_VERSION,
+    GdnCarryGeometry, GdnPrefillPlan, GdnStreamMeta, GdnStreamPhase, GDN_STREAM_SCHEMA_VERSION,
 };
 
 /// Refuse the author-disclosed native-MTP verify corruption, not AR or graded MQ4/MQ6.
@@ -3452,11 +3452,13 @@ pub struct DeltaNetCarry {
 }
 
 impl DeltaNetCarry {
-    /// Carry geometry for `config` and a resolved scan microtile. `None` when
-    /// the algorithm needs no raw-tile replay (`micro_rows <= 1`): a
-    /// sequential route reuses its owned accumulator and allocates no carry.
+    /// Carry geometry for `config` and a resolved scan microtile (`micro_rows >= 1`).
+    /// `Scan64` (64) retains a raw-tile replay; the `Sequential` algorithm (1)
+    /// needs only the FP32 accumulator `tile_state` between calls inside a
+    /// 512-row frame (its raw rows are one row). States without a Q8 plan
+    /// (F32/Q4) own no carry: `None` for `micro_rows == 0`.
     pub fn geometry_for(config: &Qwen35Config, micro_rows: usize) -> Option<GdnCarryGeometry> {
-        (micro_rows > 1).then(|| GdnCarryGeometry {
+        (micro_rows >= 1).then(|| GdnCarryGeometry {
             hk: config.linear_num_key_heads,
             hv: config.linear_num_value_heads,
             head_dim: config.linear_key_head_dim,
@@ -3548,6 +3550,62 @@ pub struct GdnStreamImage {
     pub meta: Vec<GdnStreamMeta>,
 }
 
+/// Model constants and edge workspaces the stream executor needs beyond the
+/// per-layer plan: shallow (non-owning) views of each LA layer's conv weight,
+/// `dt_bias` and `A_log` (the weights outlive the state they serve), the prep
+/// scalars, and one fixed 64-row edge workspace per distinct scan-output
+/// format (charged once per owner, never per layer, never snapshotted).
+pub struct GdnStreamBinding {
+    pub q_scale: f32,
+    pub eps: f32,
+    pub conv_weight: Vec<GpuTensor>,
+    pub dt_bias: Vec<GpuTensor>,
+    pub a_log: Vec<GpuTensor>,
+    pub workspaces: Vec<rdna_compute::gdn_stream::GdnStreamWorkspace>,
+}
+
+impl GdnStreamBinding {
+    /// Workspace for the scan-output format `fmt`.
+    pub fn workspace(
+        &self,
+        fmt: rdna_compute::norm::GdnScanOut,
+    ) -> Option<&rdna_compute::gdn_stream::GdnStreamWorkspace> {
+        self.workspaces.iter().find(|w| w.out_fmt == fmt)
+    }
+
+    /// Non-owning copy (for a lane view); must not be freed.
+    pub(crate) fn view(&self) -> Self {
+        use rdna_compute::gdn_stream::GdnStreamWorkspace;
+        let shallow = |v: &Vec<GpuTensor>| v.iter().map(GpuTensor::shallow_clone).collect::<Vec<_>>();
+        Self {
+            q_scale: self.q_scale,
+            eps: self.eps,
+            conv_weight: shallow(&self.conv_weight),
+            dt_bias: shallow(&self.dt_bias),
+            a_log: shallow(&self.a_log),
+            workspaces: self
+                .workspaces
+                .iter()
+                .map(|w| GdnStreamWorkspace {
+                    hk: w.hk,
+                    hv: w.hv,
+                    out_fmt: w.out_fmt,
+                    x: w.x.shallow_clone(),
+                    alpha: w.alpha.shallow_clone(),
+                    beta: w.beta.shallow_clone(),
+                    q: w.q.shallow_clone(),
+                    k: w.k.shallow_clone(),
+                    v: w.v.shallow_clone(),
+                    a: w.a.shallow_clone(),
+                    out: w.out.shallow_clone(),
+                    conv: w.conv.shallow_clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
+
 /// Per-state stream owner: host cursors (one [`GdnStreamMeta`] per LA layer and
 /// lane, `meta[layer * lanes + lane]`) plus the optional GPU carry. Owned by
 /// exactly one `DeltaNetState`; snapshots copy it, never alias it.
@@ -3560,6 +3618,15 @@ pub struct GdnStreamOwner {
     pub lanes: usize,
     pub meta: Vec<GdnStreamMeta>,
     pub carry: Option<DeltaNetCarry>,
+    /// Resolved canonical prefill plan of every LA layer (`plans[layer]`), all
+    /// carrying the model recipe id; empty while unbound (F32/Q4 states, or no
+    /// ordinary prefill yet).
+    pub plans: Vec<GdnPrefillPlan>,
+    /// Model constants (non-owning views of the layer weights) and the edge
+    /// workspace the stream executor needs, bound when the plans are
+    /// provisioned so the genuine predecode seal (which only sees the state)
+    /// can finish an Open phase. `None` while unprovisioned.
+    pub binding: Option<GdnStreamBinding>,
 }
 
 impl GdnStreamOwner {
@@ -3571,7 +3638,121 @@ impl GdnStreamOwner {
             lanes,
             meta: vec![GdnStreamMeta::sealed_at(0, generation); layers * lanes],
             carry,
+            plans: Vec::new(),
+            binding: None,
         }
+    }
+
+    /// Bind the resolved per-layer plans (one per LA layer, one shared model
+    /// recipe id) and the owner's recipe. Idempotent for equal plans; a bound
+    /// owner holding a prefix refuses a different recipe.
+    pub fn bind_plans(&mut self, plans: &[GdnPrefillPlan]) -> HipResult<()> {
+        if plans.len() != self.layers() || plans.is_empty() {
+            return Err(HipError::new(0, "GDN stream bind_plans: plan count != LA layers"));
+        }
+        let recipe = plans[0].recipe_id;
+        if plans.iter().any(|p| p.recipe_id != recipe) {
+            return Err(HipError::new(0, "GDN stream bind_plans: plans disagree on the model recipe"));
+        }
+        if self.plans == plans {
+            return Ok(());
+        }
+        self.bind_recipe(recipe)?;
+        self.plans = plans.to_vec();
+        Ok(())
+    }
+
+    /// Allocate the per-layer carry of `geometry` on `gpu` for an owner that has
+    /// none (lazy provisioning of a state built without a model). A Sealed
+    /// owner needs no carry content, so this is legal at any position; the
+    /// identity changes, so snapshots of the carry-less state no longer match.
+    pub fn attach_carry(&mut self, gpu: &mut Gpu, geometry: GdnCarryGeometry) -> HipResult<()> {
+        if let Some(c) = &self.carry {
+            return if c.geometry == geometry {
+                Ok(())
+            } else {
+                Err(HipError::new(0, "GDN stream attach_carry: a different carry geometry is already attached"))
+            };
+        }
+        if self.is_open() {
+            return Err(HipError::new(0, "GDN stream attach_carry on an Open stream"));
+        }
+        let layers = self.layers();
+        let mut bufs: [Vec<GpuTensor>; 4] = Default::default();
+        for _ in 0..layers {
+            match DeltaNetCarry::alloc_layer(gpu, &geometry, self.lanes) {
+                Ok(layer) => {
+                    for (fam, t) in bufs.iter_mut().zip(layer) {
+                        fam.push(t);
+                    }
+                }
+                Err(e) => {
+                    for t in bufs.iter_mut().flat_map(|v| v.drain(..)) {
+                        let _ = gpu.free_tensor(t);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        let [tile_state, tile_conv, raw_qkv, raw_ab] = bufs;
+        self.carry = Some(DeltaNetCarry {
+            geometry,
+            lanes: self.lanes,
+            tile_state,
+            tile_conv,
+            raw_qkv,
+            raw_ab,
+        });
+        Ok(())
+    }
+
+    /// Start of one ordinary-prefill forward at absolute `start_pos` (host only,
+    /// no device access). A Sealed layer-lane is owned by decode/verify, which
+    /// does not maintain the cursors: it is restamped at `start_pos` (a genuine
+    /// decode/seal -> prefill boundary, `phase_start = start_pos`). An Open one
+    /// must already be at `start_pos`; anything else is refused before any
+    /// mutation (KV and recurrent prefix disagree).
+    pub fn begin_append(&mut self, start_pos: u64) -> HipResult<()> {
+        if let Some((i, m)) = self
+            .meta
+            .iter()
+            .enumerate()
+            .find(|(_, m)| m.phase == GdnStreamPhase::Open && m.position != start_pos)
+        {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "GDN stream: layer-lane {i} is Open at {} but the forward starts at {start_pos}",
+                    m.position
+                ),
+            ));
+        }
+        let generation = self.generation;
+        for m in &mut self.meta {
+            if m.phase == GdnStreamPhase::Sealed {
+                m.position = start_pos;
+                m.phase_start = start_pos;
+                m.frame_base = start_pos;
+                m.tile_base = start_pos;
+                m.pending_rows = 0;
+                m.owner_generation = generation;
+            }
+        }
+        Ok(())
+    }
+
+    /// Publish the candidate cursors of a forward that succeeded on every layer
+    /// (`candidates[layer]`, lane 0 of a single-lane owner).
+    pub fn commit_candidates(&mut self, candidates: &[Option<GdnStreamMeta>]) -> HipResult<()> {
+        if self.lanes != 1 || candidates.len() != self.meta.len() || candidates.iter().any(Option::is_none) {
+            return Err(HipError::new(0, "GDN stream commit: incomplete candidate set"));
+        }
+        let generation = self.generation;
+        for (slot, cand) in self.meta.iter_mut().zip(candidates) {
+            *slot = cand.expect("checked above");
+            slot.owner_generation = generation;
+        }
+        Ok(())
     }
 
     pub fn layers(&self) -> usize {
@@ -3761,6 +3942,8 @@ impl GdnStreamOwner {
             lanes: 1,
             meta: (0..layers).map(|l| self.meta[l * self.lanes + lane]).collect(),
             carry,
+            plans: self.plans.clone(),
+            binding: self.binding.as_ref().map(GdnStreamBinding::view),
         })
     }
 
@@ -3785,7 +3968,7 @@ impl GdnStreamOwner {
         Ok(())
     }
 
-    /// Free the carry tensors on `gpu` (single-device owner).
+    /// Free the carry tensors and the bound edge workspace on `gpu` (single-device owner).
     fn free_carry(carry: Option<DeltaNetCarry>, gpu: &mut Gpu) {
         if let Some(c) = carry {
             for t in c
@@ -3796,6 +3979,14 @@ impl GdnStreamOwner {
                 .chain(c.raw_ab)
             {
                 let _ = gpu.free_tensor(t);
+            }
+        }
+    }
+
+    fn free_binding(binding: Option<GdnStreamBinding>, gpu: &mut Gpu) {
+        if let Some(b) = binding {
+            for ws in b.workspaces {
+                let _ = gpu.gdn_stream_workspace_free(ws);
             }
         }
     }
@@ -4143,6 +4334,7 @@ impl DeltaNetState {
             let _ = gpu.free_tensor(t);
         }
         GdnStreamOwner::free_carry(self.stream.carry, gpu);
+        GdnStreamOwner::free_binding(self.stream.binding, gpu);
     }
 
     /// Reset all DeltaNet recurrent buffers to zero in place. Lets callers

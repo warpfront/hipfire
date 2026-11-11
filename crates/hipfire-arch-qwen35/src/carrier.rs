@@ -592,7 +592,17 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
     // ── DeltaNet state (free kv + weights on fail) ───────────────────
     let dn_started = std::time::Instant::now();
     let dn = match DeltaNetState::new_with_quant(ctx.gpu, &config, dn_quant) {
-        Ok(v) => v,
+        // Canonical GDN stream (CHUNK-CANONICAL-DESIGN §5): plans, recipe, carry and the
+        // edge workspace are reserved with the state, before the prefill ceiling is chosen.
+        Ok(mut v) => match crate::qwen35::provision_gdn_stream(ctx.gpu, &weights, &config, &mut v) {
+            Ok(()) => v,
+            Err(e) => {
+                v.free_gpu(ctx.gpu);
+                let cleanup = free_kv_and_weights(kv, weights, ctx.gpu);
+                let e = append_cleanup_context(format!("{e}"), cleanup);
+                return Err(release_after_failed_load(e, weight_lease.take(), ctx.gpu));
+            }
+        },
         Err(e) => {
             let cleanup = free_kv_and_weights(kv, weights, ctx.gpu);
             let e = append_cleanup_context(format!("{e}"), cleanup);

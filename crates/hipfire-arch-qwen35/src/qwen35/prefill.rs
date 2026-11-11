@@ -22,6 +22,8 @@ use super::program::{
     batched_attention_tap, deltanet_state_view, flash_scratch, gdn_tape_view, hybrid_dims, kv_view,
 };
 use super::weights::DeltaNetState;
+use super::weights::DeltaNetCarry;
+use super::weights::GdnStreamBinding;
 use super::weights::DeltaNetStateGeometry;
 use super::weights::LayerWeights;
 use super::weights::MoeFfnWeights;
@@ -57,7 +59,7 @@ use hipfire_dispatch::pipeline::batched_deltanet::{
     batch_chunk_delta_net_attn, batch_chunk_delta_net_input_projection,
     batch_chunk_delta_net_output_projection, batch_chunk_delta_net_pre_gdn,
     gdn_chunk_head_geometry_supported, gdn_qk_norm_interleave, gdn_sigmoid_alpha_gate,
-    push_gdn_tape_copies,
+    push_gdn_tape_copies, GdnPrefillRoute, GdnStreamCall,
 };
 use hipfire_dispatch::pipeline::batched_moe::{
     attention_moe_finish_batched, attention_moe_prep_batched, execute_attention_moe_layer_batched,
@@ -70,6 +72,9 @@ use hipfire_dispatch::pipeline::GemvInput;
 use hipfire_dispatch::pipeline::Step;
 use hipfire_runtime::llama;
 use rdna_compute::norm::GdnScanOut;
+use rdna_compute::gdn_stream::{GdnPrefillPlan, GdnScanAlgorithm, GdnStateQuant, GdnStreamMeta, GdnTensorFormat};
+use rdna_compute::prefill_invariant::{GdnLayerDesc, GdnProjDesc};
+use std::cell::{Cell, RefCell};
 use rdna_compute::prefill_route_capabilities;
 use rdna_compute::prefill_route_capabilities::PrefillRoute;
 
@@ -3271,6 +3276,72 @@ pub fn forward_prefill_batch(
     gdn_tape: Option<&mut crate::speculative::GdnTape>,
     tree_verify: Option<TreeVerifyCtx<'_>>,
 ) -> HipResult<()> {
+    forward_prefill_batch_intent(
+        gpu,
+        weights,
+        config,
+        tokens,
+        start_pos,
+        kv_cache,
+        dn_state,
+        scratch,
+        hidden_rb,
+        per_token_hidden_out,
+        gdn_tape,
+        tree_verify,
+        PrefillIntent::Inferred,
+    )
+}
+
+/// Ordinary prompt prefill with an explicit intent (CHUNK-CANONICAL-DESIGN §1.1): every
+/// row count, a one-row outer tail included, runs the canonical prefill producers and the
+/// absolute-position GDN stream; a singleton is a prefill continuation, never plain AR
+/// decode through `forward_scratch`. Carries no verify, tape, tree, hidden-ring or
+/// mask machinery. The caller seals the stream once at the actual prompt end
+/// (`DeltaNetState::seal_streams`) before decode/verify.
+pub fn forward_prefill_batch_ordinary(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    tokens: &[u32],
+    start_pos: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+    scratch: &Qwen35Scratch,
+) -> HipResult<()> {
+    forward_prefill_batch_intent(
+        gpu,
+        weights,
+        config,
+        tokens,
+        start_pos,
+        kv_cache,
+        dn_state,
+        scratch,
+        None,
+        None,
+        None,
+        None,
+        PrefillIntent::Ordinary,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn forward_prefill_batch_intent(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    tokens: &[u32],
+    start_pos: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+    scratch: &Qwen35Scratch,
+    hidden_rb: Option<&mut HiddenStateRingBuffer>,
+    per_token_hidden_out: Option<&GpuTensor>,
+    gdn_tape: Option<&mut crate::speculative::GdnTape>,
+    tree_verify: Option<TreeVerifyCtx<'_>>,
+    intent: PrefillIntent,
+) -> HipResult<()> {
     // Wrapper PBS plan (`plan_wrapper_pbs`): the dense widened route drops the
     // implicit ≤512 cache; an eligible, memory-admitted DEFAULT resident-MoE
     // request runs as a virtual explicit `HIPFIRE_PREFILL_MAX_BATCH=8192`
@@ -3322,6 +3393,7 @@ pub fn forward_prefill_batch(
         None,
         wrapper.max_batch_override,
         DflashFusionCtx::Off,
+        intent,
     );
     result
 }
@@ -3384,6 +3456,7 @@ pub fn forward_prefill_batch_capture_hidden(
         None,
         wrapper.max_batch_override,
         DflashFusionCtx::Off,
+        PrefillIntent::Inferred,
     );
     result
 }
@@ -3434,6 +3507,46 @@ pub fn forward_prefill_batch_capped(
         Some(max_batch_cap),
         None,
         DflashFusionCtx::Off,
+        PrefillIntent::Inferred,
+    )
+}
+
+/// [`forward_prefill_batch_capped`] with the explicit ordinary-prefill intent of
+/// [`forward_prefill_batch_ordinary`].
+#[allow(clippy::too_many_arguments)]
+pub fn forward_prefill_batch_ordinary_capped(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    tokens: &[u32],
+    start_pos: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+    scratch: &Qwen35Scratch,
+    max_batch_cap: usize,
+) -> HipResult<()> {
+    forward_prefill_batch_with_pbs_opts_inner(
+        gpu,
+        weights,
+        config,
+        tokens,
+        start_pos,
+        kv_cache,
+        dn_state,
+        scratch,
+        None,
+        None,
+        HiddenCapture::Verify,
+        None,
+        None,
+        scratch.prefill_batch.as_ref(),
+        None,
+        None,
+        true,
+        Some(max_batch_cap),
+        None,
+        DflashFusionCtx::Off,
+        PrefillIntent::Ordinary,
     )
 }
 
@@ -3537,6 +3650,7 @@ pub fn forward_prefill_batch_with_pbs_opts(
         None,
         None,
         fusion,
+        PrefillIntent::Inferred,
     )
 }
 
@@ -3564,6 +3678,7 @@ fn forward_prefill_batch_with_pbs_opts_inner(
     // wrapper (`plan_wrapper_pbs`); replaces the arch/env default ceiling.
     max_batch_override: Option<usize>,
     fusion: DflashFusionCtx,
+    intent: PrefillIntent,
 ) -> HipResult<()> {
     // Plain single-token AR decode? Only then is the per-token `forward_scratch`
     // call below eligible for the AR-forward hipGraph (capture/replay). Any spec
@@ -3575,7 +3690,8 @@ fn forward_prefill_batch_with_pbs_opts_inner(
         && gdn_tape.is_none()
         && per_token_hidden_out.is_none()
         && hidden_rb.is_none()
-        && tokens.len() == 1;
+        && tokens.len() == 1
+        && intent != PrefillIntent::Ordinary;
     // Upper bound on the PrefillBatchScratch — large prompts get split
     // into chunks of this size and processed in a loop.
     //
@@ -3603,6 +3719,15 @@ fn forward_prefill_batch_with_pbs_opts_inner(
     if n == 0 {
         return Ok(());
     }
+    // Explicit ordinary prefill: a one-row call is a prefill continuation, not decode.
+    let ordinary_intent = intent == PrefillIntent::Ordinary
+        && tree_verify.is_none()
+        && gdn_tape.is_none()
+        && hidden_rb.is_none()
+        && per_token_hidden_out.is_none()
+        && max_layer.is_none()
+        && mask_override.is_none()
+        && matches!(fusion, DflashFusionCtx::Off);
     let required_tokens = checked_kv_end(start_pos, n, "forward_prefill_batch")?;
     release_widened_pbs_for_kv_growth(gpu, kv_cache, config, scratch, required_tokens)?;
     kv_cache.ensure_mapped_capacity(gpu, required_tokens)?;
@@ -3694,7 +3819,7 @@ fn forward_prefill_batch_with_pbs_opts_inner(
         weights,
         config,
         dn_state,
-        n,
+        if ordinary_intent { n.max(MIN_BATCH) } else { n },
         arch,
         moe_router_logits_present,
     );
@@ -3837,6 +3962,20 @@ fn forward_prefill_batch_with_pbs_opts_inner(
         gdn_tape.is_some(),
         tree_verify.is_some(),
     );
+    // Canonical GDN stream (CHUNK-CANONICAL-DESIGN §1.1, §5): resolve the frozen per-layer
+    // plans, bind the owner's recipe and reserve the persistent carry and the edge workspace
+    // BEFORE the VRAM-dependent outer ceiling below is chosen. An allocation failure is a
+    // typed error, never a precision change.
+    if tree_verify.is_none()
+        && gdn_tape.is_none()
+        && max_layer.is_none()
+        && mask_override.is_none()
+        && matches!(fusion, DflashFusionCtx::Off)
+        && (per_token_hidden_out.is_none() || hidden_capture == HiddenCapture::PromptFill)
+        && (hidden_rb.is_none() || ring_seed)
+    {
+        provision_gdn_stream(gpu, weights, config, dn_state)?;
+    }
     // Widened ordinary admission. Decided here, after required KV mapping, so
     // the per-device byte admission charges mapped KV. Only the whole-stack
     // sequential ordinary entry with no caller PBS/cap can widen: captured,
@@ -4030,13 +4169,20 @@ fn forward_prefill_batch_with_pbs_opts_inner(
             let remaining = n - chunk_start;
             // Widened grouping keeps an odd tail attached to the largest
             // admitted chunk so its GEMMs use the padded multi-row route.
-            let chunk_n = next_ordinary_chunk_len(wide, packed_mq4, remaining, chunk_batch)
-                .ok_or_else(|| {
-                    hip_bridge::HipError::new(
-                        0,
-                        "forward_prefill_batch: chunk plan cannot satisfy the two-token minimum",
-                    )
-                })?;
+            let chunk_n = if ordinary_intent && !packed_mq4 {
+                // Outer chunk boundaries carry no numerical meaning on the canonical
+                // route (the stream owns the absolute schedule), so a one-row tail is
+                // a legal chunk.
+                Some(remaining.min(chunk_batch))
+            } else {
+                next_ordinary_chunk_len(wide, packed_mq4, remaining, chunk_batch)
+            }
+            .ok_or_else(|| {
+                hip_bridge::HipError::new(
+                    0,
+                    "forward_prefill_batch: chunk plan cannot satisfy the two-token minimum",
+                )
+            })?;
             if pbs.lean {
                 if !matches!(fusion, DflashFusionCtx::Off) || tree_verify.is_some() {
                     return Err(hip_bridge::HipError::new(
@@ -5578,6 +5724,15 @@ pub(crate) enum HiddenCapture {
     PromptFill,
 }
 
+/// Explicit numerical intent of a prefill forward. `Ordinary` is a prompt prefill phase
+/// (a one-row call included); `Inferred` keeps the structural classification, in which a
+/// single token is plain AR decode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PrefillIntent {
+    Inferred,
+    Ordinary,
+}
+
 /// Per-token hidden destination: buffer, first destination row, capture kind.
 pub(crate) type HiddenRowsOut<'a> = (&'a GpuTensor, usize, HiddenCapture);
 
@@ -6023,29 +6178,8 @@ fn gdn_moe_chunk_scan_on(arch: &str) -> bool {
     )
 }
 
-/// Row admission of the chunk scan, shared by the dense and MoE routes. For
-/// calls already aligned to 512-row commit seams, the final tail must not
-/// select a different recurrence for the preceding rows:
-///
-/// * `n <= 512` (one segment): `n >= 64`; a shorter call is the final tail of an
-///   ordinary chunked prefill only when it resumes exactly on a nonzero 512-row
-///   seam (`start_pos > 0 && start_pos % 512 == 0`), where the larger outer chunks
-///   of the same prompt scan it inside their last commit segment. Other short
-///   calls retain their incumbent recurrence.
-/// * `n > 512`: the 512-row commit stride, with any final tail of 0..=511 rows.
-///   The kernels mask the padded rows of a partial 64-row tile
-///   (`gdn_chunk_tail_kill` receipts), so a short tail never forces the whole outer
-///   chunk onto the sequential recurrence.
-fn gdn_chunk_scan_rows_admitted(n: usize, commit_stride: Option<usize>, start_pos: usize) -> bool {
-    if n <= WIDENED_COMMIT_ROWS {
-        n >= 64
-            || (n >= MIN_BATCH && start_pos > 0 && start_pos % WIDENED_COMMIT_ROWS == 0)
-    } else {
-        commit_stride == Some(WIDENED_COMMIT_ROWS)
-    }
-}
-
-/// Layer-independent inputs of the MoE GDN chunk-scan admission.
+/// Layer-independent, row-independent inputs of the MoE GDN chunk-scan admission. The outer
+/// call's rows, tape, tree and intent are never inputs (CHUNK-CANONICAL-DESIGN §1.1).
 #[derive(Clone, Copy)]
 struct GdnMoeChunkScanInputs {
     /// Resolved `HIPFIRE_GDN_MOE_CHUNK_SCAN` ([`gdn_moe_chunk_scan_on`]).
@@ -6057,27 +6191,11 @@ struct GdnMoeChunkScanInputs {
     geometry: bool,
     /// Q8 DeltaNet state with complete scale, conv and EF vectors.
     q8_state: bool,
-    sequential: bool,
-    tree: bool,
-    tape: bool,
-    /// No DFlash fusion, hidden-state capture, verify capture, band, layer cap,
-    /// routed-out or mask override (the dense route's plain-forward clauses).
-    plain_forward: bool,
-    /// [`gdn_chunk_scan_rows_admitted`].
-    rows: bool,
 }
 
 impl GdnMoeChunkScanInputs {
     fn admitted(self) -> bool {
-        self.enabled
-            && self.capable
-            && self.geometry
-            && self.q8_state
-            && self.sequential
-            && !self.tree
-            && !self.tape
-            && self.plain_forward
-            && self.rows
+        self.enabled && self.capable && self.geometry && self.q8_state
     }
 }
 
@@ -6090,6 +6208,337 @@ fn gdn_moe_chunk_scan_layer_admitted(
     ef_layer: bool,
 ) -> bool {
     common && projection_dtypes == [DType::MQ4G256V2; 4] && ef_layer
+}
+
+/// Q8 DeltaNet state with complete scale, conv and EF vectors.
+fn gdn_q8_state_complete(dn_state: &DeltaNetState) -> bool {
+    dn_state.quant == StateQuant::Q8
+        && !dn_state.s_matrices.is_empty()
+        && dn_state.s_matrices.len() == dn_state.s_scales.len()
+        && dn_state.s_matrices.len() == dn_state.conv_states.len()
+        && dn_state.s_matrices.len() == dn_state.s_ef_residual.len()
+}
+
+/// Row-independent chunk-scan admission of the dense route: device, geometry, projection
+/// dtypes/route and Q8 state. Evaluated once per prefix when the plan is resolved. The KV
+/// tier is not an input: the scan never reads KV, and an adaptive-KV tier change must never
+/// change the numerical recipe of a running prefix.
+fn gdn_dense_scan_static_admitted(
+    gpu: &Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    dn_state: &DeltaNetState,
+) -> bool {
+    let mq3_scan = mq3_wide_route(gpu, weights);
+    let mq4_scan = dense_layers_are_all_mq4v2(weights);
+    gpu.flags.gfx12_gdn_chunk_scan
+        && !gpu.fp8_verify_scope
+        && matches!(gpu.arch.as_str(), "gfx1100" | "gfx1151" | "gfx1201")
+        && config.num_experts == 0
+        && config.linear_num_key_heads == 16
+        && config.linear_num_value_heads == 48
+        && config.linear_key_head_dim == 128
+        && config.linear_value_head_dim == 128
+        && config.conv_kernel_dim == 4
+        // Each dtype must have its own admitted qkvza producer; the A4/A8 flags cannot
+        // enable a qt44 scan when the MQ4 projection route is off. gfx1201 admits both
+        // MQ4V2 projection routes (iu4-direct, or the FP8-WMMA qkvza `IU4=0` arm).
+        && (mq3_scan
+            || (mq4_scan
+                && (gpu.flags.iu4_prefill_enabled()
+                    || (gpu.arch == "gfx1201" && gpu.flags.gfx12_mq4v2_fp8_qkvza))))
+        && gdn_q8_state_complete(dn_state)
+        && !gpu.graphs.capture_mode
+        && !gpu.replay.is_recording()
+}
+
+/// Resolve the canonical prefill plan of every LA layer from static facts: device, weight
+/// headers, configured Q8/EF state and precision flags. Never from an outer call's rows or
+/// free VRAM. `None`: this state has no stream (FP32/Q4 quantization, or a lane-batched
+/// owner) and ordinary prefill keeps the per-call recurrence. All plans carry one model
+/// recipe id (the shared id, or a fold of the per-layer ids).
+pub(crate) fn resolve_gdn_stream_plans(
+    gpu: &Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    dn_state: &DeltaNetState,
+) -> HipResult<Option<Vec<GdnPrefillPlan>>> {
+    if dn_state.quant != StateQuant::Q8
+        || dn_state.stream.lanes != 1
+        || dn_state.s_matrices.is_empty()
+    {
+        return Ok(None);
+    }
+    let state = if dn_state.s_ef_residual.is_empty() {
+        GdnStateQuant::Q8
+    } else {
+        GdnStateQuant::Q8Ef
+    };
+    let dense_static = gdn_dense_scan_static_admitted(gpu, weights, config, dn_state);
+    let moe_common = GdnMoeChunkScanInputs {
+        enabled: gdn_moe_chunk_scan_on(&gpu.arch),
+        capable: gpu.flags.gfx12_gdn_chunk_scan
+            && gpu.arch_caps.is_gfx1201()
+            && !gpu.fp8_verify_scope
+            && !gpu.graphs.capture_mode
+            && !gpu.replay.is_recording(),
+        geometry: gdn_chunk_head_geometry_supported(
+            config.linear_num_key_heads,
+            config.linear_num_value_heads,
+            config.linear_key_head_dim,
+            config.linear_value_head_dim,
+            config.conv_kernel_dim,
+        ),
+        q8_state: gdn_q8_state_complete(dn_state),
+    }
+    .admitted();
+    let qkvza_dense = if mq3_wide_route(gpu, weights) {
+        DType::MQ3G256V2
+    } else {
+        DType::MQ4G256V2
+    };
+    let proj = |w: &llama::WeightTensor| GdnProjDesc {
+        dtype: w.gpu_dtype,
+        m: w.m,
+    };
+    let mut plans: Vec<GdnPrefillPlan> = Vec::with_capacity(dn_state.s_matrices.len());
+    for (layer_idx, lw) in weights.layers.iter().enumerate() {
+        if config.layer_types[layer_idx] != LayerType::LinearAttention {
+            continue;
+        }
+        let ef_slot = plans.len() < dn_state.s_ef_residual.len();
+        let desc = match lw {
+            LayerWeights::DeltaNet(l) => {
+                let dtypes = [l.wqkv.gpu_dtype, l.wz.gpu_dtype, l.w_beta.gpu_dtype, l.w_alpha.gpu_dtype];
+                let z_folded = dtypes == [DType::MQ4G256V2; 4]
+                    && l.wz.buf.byte_size()
+                        == gpu.mq4v2_fold_betaalpha_padded_m(l.wz.m)
+                            * (l.wz.k / 256)
+                            * rdna_compute::MQ4V2_GROUP_BYTES;
+                GdnLayerDesc {
+                    dim: config.dim,
+                    key_heads: config.linear_num_key_heads,
+                    value_heads: config.linear_num_value_heads,
+                    head_dim: config.linear_key_head_dim,
+                    qkv: proj(&l.wqkv),
+                    z: proj(&l.wz),
+                    beta: proj(&l.w_beta),
+                    alpha: proj(&l.w_alpha),
+                    out_dtype: l.wo.gpu_dtype,
+                    out_residual: true,
+                    z_folded,
+                    moe: false,
+                    state,
+                    scan64_admitted: dense_static && dtypes == [qkvza_dense; 4] && ef_slot,
+                }
+            }
+            LayerWeights::DeltaNetMoe(l) => {
+                let dtypes = [l.wqkv.gpu_dtype, l.wz.gpu_dtype, l.w_beta.gpu_dtype, l.w_alpha.gpu_dtype];
+                GdnLayerDesc {
+                    dim: config.dim,
+                    key_heads: config.linear_num_key_heads,
+                    value_heads: config.linear_num_value_heads,
+                    head_dim: config.linear_key_head_dim,
+                    qkv: proj(&l.wqkv),
+                    z: proj(&l.wz),
+                    beta: proj(&l.w_beta),
+                    alpha: proj(&l.w_alpha),
+                    out_dtype: l.wo.gpu_dtype,
+                    out_residual: true,
+                    z_folded: false,
+                    moe: true,
+                    state,
+                    scan64_admitted: gdn_moe_chunk_scan_layer_admitted(moe_common, dtypes, ef_slot),
+                }
+            }
+            _ => {
+                return Err(HipError::new(
+                    0,
+                    "resolve_gdn_stream_plans: LinearAttention layer without DeltaNet weights",
+                ))
+            }
+        };
+        plans.push(gpu.resolve_gdn_prefill_plan(&desc)?);
+    }
+    if plans.len() != dn_state.s_matrices.len() {
+        return Err(HipError::new(
+            0,
+            "resolve_gdn_stream_plans: LA layer count != DeltaNet state layers",
+        ));
+    }
+    // One recipe id per model: the shared id when every layer agrees, else a fold of all.
+    let model_recipe = if plans.iter().all(|p| p.recipe_id == plans[0].recipe_id) {
+        plans[0].recipe_id
+    } else {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for p in &plans {
+            for b in p.recipe_id.to_le_bytes() {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x0100_0000_01b3);
+            }
+        }
+        h
+    };
+    for p in &mut plans {
+        p.recipe_id = model_recipe;
+    }
+    Ok(Some(plans))
+}
+
+/// Reserve and bind everything the canonical GDN stream of `dn_state` needs for ordinary
+/// prefill: resolved plans (recipe bound into the owner), persistent carry sized for the
+/// plans' microtile, the per-layer model constants and the 64-row edge workspace of the
+/// Scan64 executor (once per owner, never per layer). Idempotent; a recipe cannot change on
+/// a non-empty prefix. A state without a stream (FP32/Q4, lane-batched) is left untouched.
+pub fn provision_gdn_stream(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    dn_state: &mut DeltaNetState,
+) -> HipResult<()> {
+    let Some(plans) = resolve_gdn_stream_plans(gpu, weights, config, dn_state)? else {
+        return Ok(());
+    };
+    let micro = plans.iter().map(|p| p.micro_rows).max().unwrap_or(1).max(1);
+    let geometry = DeltaNetCarry::geometry_for(config, micro).expect("micro_rows >= 1");
+    match dn_state.stream.carry.as_ref() {
+        Some(c)
+            if c.geometry.hk == geometry.hk
+                && c.geometry.hv == geometry.hv
+                && c.geometry.head_dim == geometry.head_dim
+                && c.geometry.conv_hist_rows == geometry.conv_hist_rows
+                && c.geometry.micro_rows >= micro => {}
+        Some(c) => {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "GDN stream: the state's carry {:?} cannot serve plans needing microtile {micro}",
+                    c.geometry
+                ),
+            ))
+        }
+        None => dn_state.stream.attach_carry(gpu, geometry)?,
+    }
+    if dn_state.stream.binding.is_none() {
+        let (mut conv_weight, mut dt_bias, mut a_log) = (Vec::new(), Vec::new(), Vec::new());
+        for (layer_idx, lw) in weights.layers.iter().enumerate() {
+            if config.layer_types[layer_idx] != LayerType::LinearAttention {
+                continue;
+            }
+            let (c, d, a) = match lw {
+                LayerWeights::DeltaNet(l) => (&l.conv_weight, &l.dt_bias, &l.a_log),
+                LayerWeights::DeltaNetMoe(l) => (&l.conv_weight, &l.dt_bias, &l.a_log),
+                _ => continue,
+            };
+            conv_weight.push(c.shallow_clone());
+            dt_bias.push(d.shallow_clone());
+            a_log.push(a.shallow_clone());
+        }
+        dn_state.stream.binding = Some(GdnStreamBinding {
+            q_scale: 1.0 / (config.linear_key_head_dim as f32).sqrt(),
+            eps: config.norm_eps,
+            conv_weight,
+            dt_bias,
+            a_log,
+            workspaces: Vec::new(),
+        });
+    }
+    let mut formats: Vec<GdnScanOut> = Vec::new();
+    for p in plans.iter().filter(|p| p.algorithm == GdnScanAlgorithm::Scan64) {
+        let f = match p.scan_output_format {
+            GdnTensorFormat::Bf16 => GdnScanOut::Bf16,
+            _ => GdnScanOut::F32,
+        };
+        if !formats.contains(&f) {
+            formats.push(f);
+        }
+    }
+    if let Some(binding) = dn_state.stream.binding.as_mut() {
+        for f in formats {
+            if binding.workspace(f).is_none() {
+                binding.workspaces.push(gpu.gdn_stream_workspace_alloc(
+                    config.linear_num_key_heads,
+                    config.linear_num_value_heads,
+                    f,
+                )?);
+            }
+        }
+    }
+    dn_state.stream.bind_plans(&plans)
+}
+
+/// Host bookkeeping of one ordinary-prefill forward on a bound GDN stream: the candidate
+/// cursor of every LA layer (published only after the whole forward succeeded) and whether
+/// any device-mutating append was attempted.
+struct GdnForwardStream {
+    start_pos: u64,
+    candidates: RefCell<Vec<Option<GdnStreamMeta>>>,
+    attempted: Cell<bool>,
+}
+
+/// Run `body` as one forward of absolute start `start_pos`. `plain` marks an ordinary
+/// prefill forward (sequential, no tree/tape/verify capture/band/layer cap/mask override,
+/// eager): it opens the ordinary-prefill numerical intent, and on a state with a bound
+/// stream it runs the layers through the absolute-position GDN stream, publishing the
+/// candidate cursors of every layer only after the whole body succeeded. A failure after
+/// the first stream append fails closed (full state reset). Every other forward keeps the
+/// per-call recurrence and refuses an Open stream (decode/verify must follow the seal).
+fn with_gdn_forward<T>(
+    gpu: &mut Gpu,
+    dn_state: &mut DeltaNetState,
+    plain: bool,
+    start_pos: usize,
+    body: impl FnOnce(&mut Gpu, &mut DeltaNetState, GdnPrefillRoute<'_>) -> HipResult<T>,
+) -> HipResult<T> {
+    let bound = plain
+        && dn_state.quant == StateQuant::Q8
+        && dn_state.stream.lanes == 1
+        && !dn_state.stream.plans.is_empty()
+        && dn_state.stream.plans.len() == dn_state.s_matrices.len()
+        && dn_state.stream.carry.is_some();
+    if !bound && dn_state.stream.is_open() {
+        return Err(HipError::new(
+            0,
+            "GDN stream is Open: only an ordinary prefill forward on a provisioned state may \
+             consume it; seal it at the actual prompt end before decode/verify",
+        ));
+    }
+    let session = if bound {
+        dn_state.stream.begin_append(start_pos as u64)?;
+        Some(GdnForwardStream {
+            start_pos: start_pos as u64,
+            candidates: RefCell::new(vec![None; dn_state.s_matrices.len()]),
+            attempted: Cell::new(false),
+        })
+    } else {
+        None
+    };
+    let prev_intent = plain.then(|| gpu.ordinary_prefill_enter());
+    let route = match &session {
+        Some(s) => GdnPrefillRoute::Stream(GdnStreamCall {
+            start_pos: s.start_pos,
+            candidates: &s.candidates,
+            attempted: &s.attempted,
+        }),
+        None => GdnPrefillRoute::Legacy,
+    };
+    let result = body(gpu, dn_state, route);
+    if let Some(prev) = prev_intent {
+        gpu.ordinary_prefill_exit(prev);
+    }
+    match (session, result) {
+        (Some(s), Ok(v)) => {
+            dn_state.stream.commit_candidates(&s.candidates.into_inner())?;
+            Ok(v)
+        }
+        (Some(s), Err(e)) => {
+            if s.attempted.get() {
+                let _ = dn_state.reset(gpu);
+            }
+            Err(e)
+        }
+        (None, r) => r,
+    }
 }
 
 /// [`hipfire_dispatch::pipeline::batched_attention::gfx1100_split_verify_min_ctx`]
@@ -6445,6 +6894,38 @@ fn fa_pair_env_admitted(
     }
 }
 
+/// Whether a forward is an ordinary prefill phase: sequential, no tree/tape/verify-hidden
+/// capture, DFlash fusion, hidden ring other than the ordinary prompt seed, band, layer cap,
+/// routed output or mask override, eager, outside any verify scope.
+fn ordinary_prefill_forward(
+    gpu: &Gpu,
+    hidden_rb: Option<&HiddenStateRingBuffer>,
+    per_token_hidden_out: Option<HiddenRowsOut<'_>>,
+    sequential: bool,
+    tree: bool,
+    tape: bool,
+    fusion: DflashFusionCtx,
+    band: bool,
+    max_layer: bool,
+    routed_out: bool,
+    mask_override: bool,
+) -> bool {
+    sequential
+        && !tree
+        && !tape
+        && fusion == DflashFusionCtx::Off
+        && !gpu.graphs.capture_mode
+        && !gpu.replay.is_recording()
+        && !gpu.fp8_verify_scope
+        && !gpu.iu4_verify_scope
+        && hidden_rb.map_or(true, |rb| rb.rides_ordinary_prefill(gpu))
+        && !captures_verify_hidden(per_token_hidden_out)
+        && !band
+        && !max_layer
+        && !routed_out
+        && !mask_override
+}
+
 /// F2 pair chunk: run two complete consecutive 512-row chunks of one request
 /// through the layer stack lockstep, merging only the FA layers' attention
 /// call into one 1024-row FA2 launch per FA layer.
@@ -6481,6 +6962,64 @@ fn forward_prefill_chunk_pair(
     mask_override: Option<MaskEmbedOverride<'_>>,
     needs_last_token_logits: bool,
     fusion: DflashFusionCtx,
+) -> HipResult<()> {
+    let plain = ordinary_prefill_forward(
+        gpu,
+        None,
+        per_token_hidden_out.map(|(t, capture)| (t, 0, capture)),
+        true,
+        false,
+        false,
+        fusion,
+        false,
+        false,
+        false,
+        mask_override.is_some(),
+    );
+    with_gdn_forward(gpu, dn_state, plain, start_pos + chunk_start_c, |gpu, dn_state, route| {
+        forward_prefill_chunk_pair_body(
+            gpu,
+            weights,
+            config,
+            tokens_c,
+            tokens_n,
+            start_pos,
+            chunk_start_c,
+            kv_cache,
+            dn_state,
+            s,
+            pbs_c,
+            pbs_n,
+            stage,
+            per_token_hidden_out,
+            mask_override,
+            needs_last_token_logits,
+            fusion,
+            route,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn forward_prefill_chunk_pair_body(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    tokens_c: &[u32],
+    tokens_n: &[u32],
+    start_pos: usize,
+    chunk_start_c: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+    s: &Qwen35Scratch,
+    pbs_c: &PrefillBatchScratch,
+    pbs_n: &PrefillBatchScratch,
+    stage: &FaPairStage,
+    per_token_hidden_out: Option<(&GpuTensor, HiddenCapture)>,
+    mask_override: Option<MaskEmbedOverride<'_>>,
+    needs_last_token_logits: bool,
+    fusion: DflashFusionCtx,
+    route: GdnPrefillRoute<'_>,
 ) -> HipResult<()> {
     let n = FA_PAIR_ROWS;
     debug_assert!(tokens_c.len() == n && tokens_n.len() == n);
@@ -6697,8 +7236,7 @@ fn forward_prefill_chunk_pair(
                         arch_has_wmma,
                         BatchEpilogue::Residual,
                         fusion,
-                        None,  // commit_stride: pair halves keep legacy cadence
-                        false, // Paired halves retain the incumbent route
+                        route,
                     )?;
                     layer.ffn_rows(
                         gpu,
@@ -6983,8 +7521,7 @@ fn forward_prefill_chunk_pair(
                         delta_layer_idx,
                         half_start,
                         layer_idx,
-                        None, // commit_stride pair halves keep legacy cadence
-                        false,
+                        route,
                         |gpu: &mut Gpu| {
                             prefill_moe_ffn_body_batched_with_route_layered(
                                 gpu,
@@ -7218,6 +7755,78 @@ pub(crate) fn forward_batch_chunk_impl(
     fusion: DflashFusionCtx,
     commit_stride: Option<usize>,
 ) -> HipResult<()> {
+    let plain = ordinary_prefill_forward(
+        gpu,
+        hidden_rb,
+        per_token_hidden_out,
+        matches!(batch_semantics, BatchSemantics::Sequential),
+        tree_verify.is_some(),
+        gdn_tape.is_some(),
+        fusion,
+        band.is_some(),
+        max_layer.is_some(),
+        routed_out.is_some(),
+        mask_override.is_some(),
+    );
+    with_gdn_forward(gpu, dn_state, plain, start_pos, |gpu, dn_state, route| {
+        forward_batch_chunk_body(
+            gpu,
+            weights,
+            config,
+            tokens,
+            start_pos,
+            kv_cache,
+            dn_state,
+            s,
+            pbs,
+            hidden_rb,
+            per_token_hidden_out,
+            gdn_tape,
+            tape_offset,
+            tree_verify,
+            pre_uploaded,
+            pre_embedded,
+            band,
+            mask_override,
+            needs_last_token_logits,
+            max_layer,
+            routed_out,
+            batch_semantics,
+            fusion,
+            commit_stride,
+            route,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn forward_batch_chunk_body(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    tokens: &[u32],
+    start_pos: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+    s: &Qwen35Scratch,
+    pbs: &PrefillBatchScratch,
+    hidden_rb: Option<&HiddenStateRingBuffer>,
+    per_token_hidden_out: Option<HiddenRowsOut<'_>>,
+    gdn_tape: Option<&mut crate::speculative::GdnTape>,
+    tape_offset: usize,
+    tree_verify: Option<TreeVerifyCtx<'_>>,
+    pre_uploaded: bool,
+    pre_embedded: bool,
+    band: Option<&PrefillBandCtx<'_>>,
+    mask_override: Option<MaskEmbedOverride<'_>>,
+    needs_last_token_logits: bool,
+    max_layer: Option<usize>,
+    routed_out: Option<&GpuTensor>,
+    batch_semantics: BatchSemantics<'_>,
+    fusion: DflashFusionCtx,
+    commit_stride: Option<usize>,
+    gdn_route: GdnPrefillRoute<'_>,
+) -> HipResult<()> {
     let n = tokens.len();
     debug_assert!(n > 0);
     debug_assert!(n <= pbs.max_batch);
@@ -7447,97 +8056,6 @@ pub(crate) fn forward_batch_chunk_impl(
             "forward_batch_chunk: fp8 verify scope needs dense batched DeltaNet/FullAttention layers",
         ));
     }
-    let mq3_scan = mq3_wide_route(gpu, weights);
-    let mq4_scan = dense_layers_are_all_mq4v2(weights);
-    let gdn_chunk_scan_common_admitted = gpu.flags.gfx12_gdn_chunk_scan
-        // The GDN chunk-scan arm has no `SingletonWmma` producer.
-        && !gpu.fp8_verify_scope
-        && matches!(gpu.arch.as_str(), "gfx1100" | "gfx1151" | "gfx1201")
-        && config.num_experts == 0
-        && config.linear_num_key_heads == 16
-        && config.linear_num_value_heads == 48
-        && config.linear_key_head_dim == 128
-        && config.linear_value_head_dim == 128
-        && config.conv_kernel_dim == 4
-        // Each dtype must have its own admitted qkvza producer; the A4/A8
-        // flags cannot enable a qt44 scan when the MQ4 projection route is off.
-        // gfx1201 admits both MQ4V2 projection routes: iu4-direct (default) or
-        // FP8-WMMA qkvza (HIPFIRE_IU4_PREFILL=0 arm). Every qkvza dispatch arm
-        // writes the same f32 dn_qkv/dn_z/dn_beta/dn_alpha scratch the scan
-        // consumes, so the scan is route-agnostic. gfx11 keeps the iu4 gate.
-        && (mq3_scan
-            || (mq4_scan
-                && (gpu.flags.iu4_prefill_enabled()
-                    || (gpu.arch == "gfx1201" && gpu.flags.gfx12_mq4v2_fp8_qkvza))))
-        // The scan never reads KV, so the clause only names qualified tiers:
-        // native FP8 (gfx1201-only), Q8 on gfx11, and the fwht4/fwht3 4/3-bit
-        // K tiers (`quant_asym4`/`quant_asym3`, any V) on every scan arch.
-        && (kv_cache.quant_fp8
-            || (gpu.arch != "gfx1201" && kv_cache.quant_q8)
-            || kv_cache.quant_asym4
-            || kv_cache.quant_asym3)
-        && dn_state.quant == StateQuant::Q8
-        && !dn_state.s_matrices.is_empty()
-        && dn_state.s_matrices.len() == dn_state.s_scales.len()
-        && dn_state.s_matrices.len() == dn_state.conv_states.len()
-        && dn_state.s_matrices.len() == dn_state.s_ef_residual.len()
-        && matches!(batch_semantics, BatchSemantics::Sequential)
-        && tree_verify.is_none()
-        && gdn_tape.is_none()
-        && fusion == DflashFusionCtx::Off
-        && !gpu.graphs.capture_mode
-        // Only a forward being recorded into a Redline tape must stay off the
-        // chunk scan; prefill never records, so a Redline-enabled process
-        // prefills exactly like the HIP-graph default.
-        && !gpu.replay.is_recording()
-        // A DFlash prompt seed's ring copies each layer's finished residual
-        // rows, whichever recurrence kernel produced them.
-        && hidden_rb.map_or(true, |rb| rb.rides_ordinary_prefill(gpu))
-        // A prompt fill that hands its hidden rows to a draft head runs the
-        // same scan plain AR prefill runs; verify captures stay sequential.
-        && !captures_verify_hidden(per_token_hidden_out)
-        && band.is_none()
-        && max_layer.is_none()
-        && routed_out.is_none()
-        && mask_override.is_none()
-        && gdn_chunk_scan_rows_admitted(n, commit_stride, start_pos);
-    // Default-resolved MoE route (explicit `HIPFIRE_GDN_MOE_CHUNK_SCAN` wins,
-    // unset follows qualification): the dense chunk-scan clauses that apply to
-    // a MoE LA layer (no KV-cache or iu4-prefill clause: the MoE projection
-    // arms all write the same f32 scratch and the KV cache is not read by this
-    // layer).
-    let gdn_moe_chunk_scan_common_admitted = GdnMoeChunkScanInputs {
-        enabled: gdn_moe_chunk_scan_on(&gpu.arch),
-        capable: gpu.flags.gfx12_gdn_chunk_scan
-            && gpu.arch_caps.is_gfx1201()
-            && !gpu.fp8_verify_scope
-            && !gpu.graphs.capture_mode
-            && !gpu.replay.is_recording(),
-        geometry: gdn_chunk_head_geometry_supported(
-            config.linear_num_key_heads,
-            config.linear_num_value_heads,
-            config.linear_key_head_dim,
-            config.linear_value_head_dim,
-            config.conv_kernel_dim,
-        ),
-        q8_state: dn_state.quant == StateQuant::Q8
-            && !dn_state.s_matrices.is_empty()
-            && dn_state.s_matrices.len() == dn_state.s_scales.len()
-            && dn_state.s_matrices.len() == dn_state.conv_states.len()
-            && dn_state.s_matrices.len() == dn_state.s_ef_residual.len(),
-        sequential: matches!(batch_semantics, BatchSemantics::Sequential),
-        tree: tree_verify.is_some(),
-        tape: gdn_tape.is_some(),
-        plain_forward: fusion == DflashFusionCtx::Off
-            && hidden_rb.map_or(true, |rb| rb.rides_ordinary_prefill(gpu))
-            && !captures_verify_hidden(per_token_hidden_out)
-            && band.is_none()
-            && max_layer.is_none()
-            && routed_out.is_none()
-            && mask_override.is_none(),
-        rows: gdn_chunk_scan_rows_admitted(n, commit_stride, start_pos),
-    }
-    .admitted();
     let ctx = DispatchCtx::new(gpu)
         .with_workload(dispatch_workload)
         .with_verify_tile_attend(fusion.is_chain_verify())
@@ -7560,17 +8078,6 @@ pub(crate) fn forward_batch_chunk_impl(
         hipfire_dispatch::pipeline::moe_capture::set_site(layer_idx, start_pos);
         match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
             (LayerWeights::DeltaNet(layer), LayerType::LinearAttention) => {
-                let qkvza_dtype = if mq3_scan {
-                    DType::MQ3G256V2
-                } else {
-                    DType::MQ4G256V2
-                };
-                let gdn_chunk_scan_admitted = gdn_chunk_scan_common_admitted
-                    && layer.wqkv.gpu_dtype == qkvza_dtype
-                    && layer.wz.gpu_dtype == qkvza_dtype
-                    && layer.w_beta.gpu_dtype == qkvza_dtype
-                    && layer.w_alpha.gpu_dtype == qkvza_dtype
-                    && delta_layer_idx < dn_state.s_ef_residual.len();
                 batch_chunk_delta_net_attn(
                     gpu,
                     &layer.mixer_view(),
@@ -7592,8 +8099,7 @@ pub(crate) fn forward_batch_chunk_impl(
                     arch_has_wmma,
                     BatchEpilogue::Residual,
                     fusion,
-                    commit_stride,
-                    gdn_chunk_scan_admitted,
+                    gdn_route,
                 )?;
                 layer.ffn_rows(
                     gpu,
@@ -7683,16 +8189,6 @@ pub(crate) fn forward_batch_chunk_impl(
                 dump_hidden_localize(gpu, &pbs.x_batch, n, start_pos, dim, layer_idx, "batched");
             }
             (LayerWeights::DeltaNetMoe(layer), LayerType::LinearAttention) => {
-                let gdn_chunk_scan_admitted = gdn_moe_chunk_scan_layer_admitted(
-                    gdn_moe_chunk_scan_common_admitted,
-                    [
-                        layer.wqkv.gpu_dtype,
-                        layer.wz.gpu_dtype,
-                        layer.w_beta.gpu_dtype,
-                        layer.w_alpha.gpu_dtype,
-                    ],
-                    delta_layer_idx < dn_state.s_ef_residual.len(),
-                );
                 execute_deltanet_moe_layer_batched(
                     gpu,
                     &layer.mixer_view(),
@@ -7712,8 +8208,7 @@ pub(crate) fn forward_batch_chunk_impl(
                     delta_layer_idx,
                     start_pos,
                     layer_idx,
-                    commit_stride,
-                    gdn_chunk_scan_admitted,
+                    gdn_route,
                     |gpu: &mut Gpu| {
                         prefill_moe_ffn_body_batched_with_route_layered(
                             gpu,
@@ -7960,68 +8455,6 @@ mod tests {
         }
     }
 
-    /// Aligned-512-seam tail admission only: widened chunks (> 512 rows,
-    /// 512-row commit stride) admit every final tail, including 1..63 rows;
-    /// standalone short final calls admit at a nonzero 512-row seam.
-    #[test]
-    fn gdn_chunk_scan_rows_admission_keeps_aligned_512_seam_tails() {
-        let want = |n: usize, stride: Option<usize>, start: usize| {
-            if n <= 512 {
-                n >= 64 || (n >= 2 && start > 0 && start % 512 == 0)
-            } else {
-                stride == Some(512)
-            }
-        };
-        for stride in [None, Some(256), Some(512)] {
-            for start in [0usize, 1, 63, 64, 256, 512, 513, 1024, 19968, 19969] {
-                for n in 0..=4096usize {
-                    assert_eq!(
-                        gdn_chunk_scan_rows_admitted(n, stride, start),
-                        want(n, stride, start),
-                        "n={n} stride={stride:?} start={start}"
-                    );
-                }
-            }
-        }
-        for (n, stride, start, admitted) in [
-            (63, None, 0, false),
-            (63, None, 19969, false),
-            (1, None, 512, false),
-            (2, None, 512, true),
-            (25, None, 19968, true),
-            (64, None, 0, true),
-            (512, None, 0, true),
-            (513, None, 0, false),
-            (513, Some(512), 0, true),
-            (537, Some(512), 19456, true),
-            (575, Some(512), 0, true),
-            (3609, Some(512), 16384, true),
-            (1025, Some(512), 0, true),
-            (1025, Some(256), 0, false),
-        ] {
-            assert_eq!(
-                gdn_chunk_scan_rows_admitted(n, stride, start),
-                admitted,
-                "n={n} stride={stride:?} start={start}"
-            );
-        }
-        // The X2 prompt: 19993 tokens, 25 mod 512. These ceilings place outer
-        // boundaries on 512-row seams; every chunk stays on the scan, including
-        // its final 25-row tail. This does not exercise off-grid caller boundaries.
-        for ceiling in [512usize, 1024, 4096, 8192, 16384, 20480] {
-            let mut at = 0usize;
-            while at < 19993 {
-                let c = next_exact_prefill_chunk_len(19993 - at, ceiling).unwrap();
-                let stride = widened_commit_stride(ceiling > 512, c);
-                assert!(
-                    gdn_chunk_scan_rows_admitted(c, stride, at),
-                    "ceiling={ceiling} chunk at {at} rows {c}"
-                );
-                at += c;
-            }
-        }
-    }
-
     /// `HIPFIRE_GDN_MOE_CHUNK_SCAN` resolution: an explicit `1`/`0` wins on any
     /// architecture; unset follows qualification.
     #[test]
@@ -8063,84 +8496,43 @@ mod tests {
     }
 
     /// `HIPFIRE_GDN_MOE_CHUNK_SCAN` admission: the flag, the chunk-scan
-    /// capability, head geometry, a complete Q8 state, a sequential batch, no
-    /// tree, no tape, a plain forward and row admission must all hold.
+    /// capability, head geometry and a complete Q8 state must all hold. The outer
+    /// call's rows, tape, tree and intent are not inputs.
     #[test]
     fn gdn_moe_chunk_scan_admission_truth_table() {
-        for mask in 0u16..512 {
+        for mask in 0u16..16 {
             let bit = |i: u16| mask & (1 << i) != 0;
             let inputs = GdnMoeChunkScanInputs {
                 enabled: bit(0),
                 capable: bit(1),
                 geometry: bit(2),
                 q8_state: bit(3),
-                sequential: bit(4),
-                tree: bit(5),
-                tape: bit(6),
-                plain_forward: bit(7),
-                rows: bit(8),
             };
-            let want = bit(0)
-                && bit(1)
-                && bit(2)
-                && bit(3)
-                && bit(4)
-                && !bit(5)
-                && !bit(6)
-                && bit(7)
-                && bit(8);
-            assert_eq!(inputs.admitted(), want, "mask={mask:09b}");
+            let want = bit(0) && bit(1) && bit(2) && bit(3);
+            assert_eq!(inputs.admitted(), want, "mask={mask:04b}");
         }
     }
 
     /// End to end over the pure pieces: flag unset / `1` / `0` x qualified /
-    /// unqualified architecture x 32 / 48 value heads x single-segment rows
-    /// (<= 512) / widened rows (> 512, stride 512) x plain forward / verify
-    /// capture. Verify capture never admits; widened rows without the 512
-    /// stride and a 64-value-head model never admit.
+    /// unqualified architecture x 32 / 48 / 64 value heads. A 64-value-head
+    /// model never admits.
     #[test]
-    fn gdn_moe_chunk_scan_flag_arch_geometry_rows_capture_truth_table() {
+    fn gdn_moe_chunk_scan_flag_arch_geometry_truth_table() {
         for explicit in [None, Some(true), Some(false)] {
             for qualified in [false, true] {
                 for value_heads in [32usize, 48, 64] {
-                    for (rows, stride) in [
-                        (256usize, None),
-                        (512, None),
-                        (1024, Some(512)),
-                        (1088, Some(512)),
-                        (1024, None),
-                        (1025, Some(512)),
-                    ] {
-                        for verify_capture in [false, true] {
-                            let admitted = GdnMoeChunkScanInputs {
-                                enabled: gdn_moe_chunk_scan_resolve(explicit, qualified),
-                                capable: true,
-                                geometry: gdn_chunk_head_geometry_supported(
-                                    16,
-                                    value_heads,
-                                    128,
-                                    128,
-                                    4,
-                                ),
-                                q8_state: true,
-                                sequential: true,
-                                tree: false,
-                                tape: false,
-                                plain_forward: !verify_capture,
-                                rows: gdn_chunk_scan_rows_admitted(rows, stride, 0),
-                            }
-                            .admitted();
-                            let want_flag = explicit.unwrap_or(qualified);
-                            let want_rows = rows >= 64 && (rows <= 512 || stride == Some(512));
-                            let want =
-                                want_flag && value_heads <= 48 && want_rows && !verify_capture;
-                            assert_eq!(
-                                admitted, want,
-                                "explicit={explicit:?} qualified={qualified} vh={value_heads} \
-                                 rows={rows} stride={stride:?} verify_capture={verify_capture}"
-                            );
-                        }
+                    let admitted = GdnMoeChunkScanInputs {
+                        enabled: gdn_moe_chunk_scan_resolve(explicit, qualified),
+                        capable: true,
+                        geometry: gdn_chunk_head_geometry_supported(16, value_heads, 128, 128, 4),
+                        q8_state: true,
                     }
+                    .admitted();
+                    let want = explicit.unwrap_or(qualified) && value_heads <= 48;
+                    assert_eq!(
+                        admitted, want,
+                        "explicit={explicit:?} qualified={qualified} vh={value_heads}"
+                    );
                 }
             }
         }

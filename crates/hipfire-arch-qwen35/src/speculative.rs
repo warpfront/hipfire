@@ -1128,7 +1128,9 @@ impl ModelSlot {
             }
         };
 
-        let dn_state = DeltaNetState::new_with_quant(gpu, &config, slot_config.state_quant)?;
+        let mut dn_state = DeltaNetState::new_with_quant(gpu, &config, slot_config.state_quant)?;
+        // Canonical GDN stream: plans, recipe, carry and edge workspace with the state.
+        qwen35::provision_gdn_stream(gpu, &weights, &config, &mut dn_state)?;
         // Size flash partials for the slot's real KV capacity (as the carrier
         // path does). `Qwen35Scratch::new` assumes 8192, which at long context
         // leaves room for one verify row, so VerifyAttn re-scans the whole KV

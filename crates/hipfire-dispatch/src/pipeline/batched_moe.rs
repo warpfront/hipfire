@@ -27,6 +27,7 @@ use crate::pipeline::dump_hidden_localize;
 use crate::pipeline::hybrid::HybridDims;
 use hip_bridge::{HipError, HipResult};
 use rdna_compute::norm::GdnScanOut;
+use rdna_compute::gdn_stream::GdnScanAlgorithm;
 use rdna_compute::prefill_route_capabilities::{self, PrefillRoute};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -366,32 +367,6 @@ fn gdn_moe_route(
     }
 }
 
-/// Storage of the chunk-scan `out` plane of a MoE LA layer: BF16 only when the
-/// gfx1201 IU4 gated-norm producer (the one with an `_xbf16` twin) is admitted
-/// for `wo` (`HIPFIRE_GDN_SCAN_OUT` may still force F32), else F32.
-fn gdn_moe_chunk_scan_out(
-    gpu: &Gpu,
-    layer: &DeltaNetMoeLayerView<'_>,
-    config: &HybridDims,
-    n: usize,
-    n_v_heads: usize,
-) -> HipResult<GdnScanOut> {
-    if !gpu.iu4_verify_scope
-        && gfx12_gdn_quant_fused_admitted(
-            gpu,
-            &layer.wo,
-            n_v_heads,
-            config.linear_value_dim,
-            layer.wo.k,
-            n,
-            &BatchEpilogue::Residual,
-        )
-    {
-        gpu.gdn_scan_out(GdnScanOut::Bf16)
-    } else {
-        Ok(GdnScanOut::F32)
-    }
-}
 
 /// Batched gated DeltaNet mixer of a MoE layer, then the layer's MoE FFN
 /// (`moe_ffn`, which reads and accumulates into `pbs.x_batch`).
@@ -416,8 +391,7 @@ pub fn execute_deltanet_moe_layer_batched(
     delta_layer_idx: usize,
     start_pos: usize,
     layer_idx: usize,
-    commit_stride: Option<usize>,
-    gdn_chunk_scan_admitted: bool,
+    route: GdnPrefillRoute<'_>,
     moe_ffn: impl FnOnce(&mut Gpu) -> HipResult<()>,
 ) -> HipResult<()> {
     // Layer span (opt-in trace only): attention half vs MoE FFN body. Host
@@ -489,35 +463,15 @@ pub fn execute_deltanet_moe_layer_batched(
 
     // JIT/load failure and extent errors must precede the projection and the
     // persistent conv-ring mutation; no legacy retry is valid afterwards.
-    let gdn_chunk_views = if gdn_chunk_scan_admitted {
-        let scan_out = gdn_moe_chunk_scan_out(gpu, layer, config, n, n_v_heads)?;
-        // `HIPFIRE_GDN_CHUNK_PREP_PM` (typed; unset follows the exact-gfx1201 qualification, `0` kills) is nested
-        // beneath this admitted chunk-scan layer. `gdn_chunk_prep_pm_admitted` adds the raw
-        // exact-gfx1201 inventory and the fixed 16/32-head, 1..=8192-row shape; anything
-        // else keeps the incumbent `gdn_chunk_prep`. The MoE projection never writes q/k/v
-        // targets, so the PM twin replaces exactly the plain prep.
-        let prep = if gpu.gdn_chunk_prep_pm_admitted(n, config.linear_key_heads, n_v_heads) {
-            GdnChunkPrepModule::Pm
-        } else {
-            GdnChunkPrepModule::Incumbent
-        };
-        Some(gdn_chunk_scan_prepare_views(
-            gpu,
-            pbs,
-            dn_state,
-            config,
-            delta_layer_idx,
-            n,
-            k_dim,
-            v_dim,
-            config.linear_key_heads,
-            n_v_heads,
-            commit_stride,
-            scan_out,
-            prep,
-        )?)
-    } else {
-        None
+    // Canonical ordinary prefill: the layer's frozen plan decides the algorithm
+    // before any projection or persistent mutation; there is no per-call row gate.
+    let stream_call = match route {
+        GdnPrefillRoute::Stream(call) => Some(call),
+        GdnPrefillRoute::Legacy => None,
+    };
+    let stream_algo = match stream_call {
+        Some(_) => Some(gdn_stream_algorithm(dn_state, delta_layer_idx)?),
+        None => None,
     };
     let moe_qkvza_uniform_mq4v2 = [
         layer.wqkv.dtype,
@@ -822,7 +776,7 @@ pub fn execute_deltanet_moe_layer_batched(
     );
     // The fused preamble already materializes value-head Q/K. It wins over
     // QK_INDEXED, which otherwise consumes the normalized raw key-head planes.
-    let qk_indexed_ratio = gdn_qk_indexed_ratio(
+    let qk_indexed_ratio = if stream_call.is_some() { None } else { gdn_qk_indexed_ratio(
         gdn_qk_indexed_on(&gpu.arch),
         pre_fused_ratio.is_some(),
         dn_state.quant,
@@ -832,15 +786,15 @@ pub fn execute_deltanet_moe_layer_batched(
         n_v_heads,
         hd,
         config.linear_value_dim,
-    );
-    let chunk_scan = gdn_chunk_views.is_some();
+    ) };
+    let chunk_scan = stream_algo == Some(GdnScanAlgorithm::Scan64);
     let moe_route = gdn_moe_route(chunk_scan, pre_fused_ratio, qk_indexed_ratio);
-    if let (GdnMoeRoute::ChunkScan, Some(views)) = (moe_route, gdn_chunk_views.as_ref()) {
-        // The MoE projection never writes q/k/v targets, so the plain prep runs
-        // (`prep_fused = false`); then KKT -> BF16 mseg/segment scan -> gated norm.
-        gdn_chunk_scan_layer(
+    if let (GdnMoeRoute::ChunkScan, Some(call)) = (moe_route, stream_call.as_ref()) {
+        // The MoE projection stores the raw rows; the stream owns prep, KKT and scan.
+        let out_fmt = gdn_stream_scan_layer(
             gpu,
-            views,
+            call,
+            config,
             pbs,
             dn_state,
             delta_layer_idx,
@@ -849,8 +803,6 @@ pub fn execute_deltanet_moe_layer_batched(
             layer.a_log,
             n,
             1.0 / (hd as f32).sqrt(),
-            config.norm_eps,
-            false,
             config.linear_key_heads,
             n_v_heads,
         )?;
@@ -863,7 +815,7 @@ pub fn execute_deltanet_moe_layer_batched(
             n_v_heads,
             q8_wmma_arch,
             layer_idx,
-            views.scan_out,
+            out_fmt,
             t_layer,
             t_attn,
             moe_ffn,
@@ -1169,6 +1121,11 @@ pub fn execute_deltanet_moe_layer_batched(
                             active_mask,
                         )?
                     }
+                } else if let Some(call) = stream_call
+                    .as_ref()
+                    .filter(|_| stream_algo == Some(GdnScanAlgorithm::Sequential))
+                {
+                    gdn_stream_sequential_layer(gpu, call, pbs, dn_state, delta_layer_idx, n, n_v_heads)?
                 } else if let Some(ratio) = qk_indexed_ratio {
                     // Raw (un-repeated) Q/K: the kernel maps value head h to
                     // key head h / ratio. `qk_indexed_ratio` is Some only for

@@ -1643,7 +1643,7 @@ pub fn generate_vl(
                 break;
             };
             let end = start + outer;
-            if let Err(e) = qwen35::forward_prefill_batch(
+            if let Err(e) = qwen35::forward_prefill_batch_ordinary(
                 gpu,
                 weights,
                 config,
@@ -1652,10 +1652,6 @@ pub fn generate_vl(
                 kv,
                 dn,
                 scratch,
-                None,
-                None,
-                None,
-                None,
             ) {
                 stop = Some(VlBatchedStop::Forward(
                     "forward_prefill_batch (vl)",

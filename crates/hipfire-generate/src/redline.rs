@@ -842,7 +842,7 @@ fn redline_prime_qwen_tokens(
     bundle: &mut Qwen35Bundle,
     tokens: &[u32],
 ) -> Result<(), String> {
-    qwen35::forward_prefill_batch(
+    qwen35::forward_prefill_batch_ordinary(
         gpu,
         &bundle.weights,
         &bundle.config,
@@ -851,10 +851,6 @@ fn redline_prime_qwen_tokens(
         &mut bundle.kv_cache,
         &mut bundle.dn_state,
         &bundle.scratch,
-        None,
-        None,
-        None,
-        None,
     )
     .map_err(|error| error.to_string())?;
     bundle
@@ -2501,7 +2497,7 @@ fn redline_prime_qwen_slot(
         return Ok(());
     }
     let synthetic: Vec<u32> = (0..context as u32).map(|i| 10 + (i % 1000)).collect();
-    qwen35::forward_prefill_batch(
+    qwen35::forward_prefill_batch_ordinary(
         gpu,
         &slot.weights,
         &slot.config,
@@ -2510,10 +2506,6 @@ fn redline_prime_qwen_slot(
         &mut slot.kv_cache,
         &mut slot.dn_state,
         &slot.scratch,
-        None,
-        None,
-        None,
-        None,
     )
     .map_err(|error| error.to_string())?;
     slot.dn_state

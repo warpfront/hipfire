@@ -4514,8 +4514,7 @@ fn forward_prefill_dense_tp_batched(
                                 q8_flags[rank],
                                 BatchEpilogue::Partial(partials[rank]),
                                 DflashFusionCtx::Off,
-                                None,  // commit_stride: TP ranks keep legacy cadence
-                                false, // Chunk scan is single-GPU ordinary prefill only
+                                hipfire_dispatch::pipeline::batched_deltanet::GdnPrefillRoute::Legacy, // TP ranks keep the per-call recurrence
                             ) {
                                 process_res = Err(e);
                                 break;

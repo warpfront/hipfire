@@ -5154,7 +5154,7 @@ pub fn generate(
                 // Outer eviction-window / maybe_evict cadence is unchanged;
                 // only internal temporary PBS/chunks stay at the historical
                 // memory-safe ceiling (PREFILL_MAX_BATCH=256).
-                if let Err(e) = qwen35::forward_prefill_batch_capped(
+                if let Err(e) = qwen35::forward_prefill_batch_ordinary_capped(
                     gpu,
                     weights,
                     config,
@@ -5163,10 +5163,6 @@ pub fn generate(
                     kv,
                     dn,
                     scratch,
-                    None,
-                    None,
-                    None,
-                    None,
                     qwen35::PREFILL_MAX_BATCH,
                 ) {
                     // G4.7 fail-closed: attested rollback + correlated error
@@ -5295,8 +5291,8 @@ pub fn generate(
                 }
                 let end = (start + outer).min(new_tokens.len());
                 let chunk = &new_tokens[start..end];
-                if let Err(e) = qwen35::forward_prefill_batch(
-                    gpu, weights, config, chunk, m.seq_pos, kv, dn, scratch, None, None, None, None,
+                if let Err(e) = qwen35::forward_prefill_batch_ordinary(
+                    gpu, weights, config, chunk, m.seq_pos, kv, dn, scratch,
                 ) {
                     // G4.7 fail-closed: attested rollback + correlated error
                     // (no done, no cache store). Terminal identical except

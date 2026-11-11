@@ -51,8 +51,9 @@ pub use load::{
 };
 pub use prefill::{
     forward_prefill_batch, forward_prefill_batch_capped, forward_prefill_batch_capture_hidden,
+    forward_prefill_batch_ordinary, forward_prefill_batch_ordinary_capped,
     forward_prefill_batch_single_chunk_captured, forward_prefill_batch_single_chunk_captured_opts,
-    forward_prefill_batch_with_pbs, forward_prefill_batch_with_pbs_opts,
+    forward_prefill_batch_with_pbs, forward_prefill_batch_with_pbs_opts, provision_gdn_stream,
     ordinary_prefill_chunk_limit, prefill_batch_pbs_eligible, prefill_max_batch,
     prefill_max_batch_ep, prefill_max_batch_tp, qwen35_layer_batch_admissible,
     upload_prefill_batch_inputs, PREFILL_MAX_BATCH,

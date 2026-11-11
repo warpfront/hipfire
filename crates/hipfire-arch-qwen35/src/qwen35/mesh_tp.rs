@@ -48,7 +48,7 @@ use hipfire_dispatch::pipeline::batched::{
     q8_prefill_wmma_enabled, BatchEpilogue, BatchSemantics, DenseBatchMath, DflashFusionCtx,
 };
 use hipfire_dispatch::pipeline::batched_attention::batch_chunk_full_attn_attn;
-use hipfire_dispatch::pipeline::batched_deltanet::batch_chunk_delta_net_attn;
+use hipfire_dispatch::pipeline::batched_deltanet::{batch_chunk_delta_net_attn, GdnPrefillRoute};
 use hipfire_dispatch::pipeline::gated_mlp::{MlpLadder, MlpOutput};
 use hipfire_dispatch::pipeline::hybrid::MixerOutput;
 use hipfire_dispatch::pipeline::step_graph::{
@@ -1084,8 +1084,7 @@ impl<'a> Qwen35TpBindings<'a> {
                         q8,
                         BatchEpilogue::Partial(&rank.partial),
                         DflashFusionCtx::Off,
-                        None,
-                        false,
+                        GdnPrefillRoute::Legacy,
                     )
                     .map_err(hip)
                 }

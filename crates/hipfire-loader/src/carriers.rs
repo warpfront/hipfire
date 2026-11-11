@@ -11929,7 +11929,22 @@ impl Carrier for Qwen35Carrier {
                 let dn_state = match hipfire_arch_qwen35::qwen35::DeltaNetState::new_with_quant(
                     ctx.gpu, &config, dn_quant,
                 ) {
-                    Ok(d) => d,
+                    Ok(mut d) => {
+                        // Canonical GDN stream: plans, recipe, carry and edge workspace
+                        // are reserved with the state, before the prefill ceiling is chosen.
+                        if let Err(e) = hipfire_arch_qwen35::qwen35::provision_gdn_stream(
+                            ctx.gpu, &weights, &config, &mut d,
+                        ) {
+                            d.free_gpu(ctx.gpu);
+                            let mut note = format!("provision_gdn_stream: {e:?}");
+                            if let Err(fe) = kv_cache.free_gpu(ctx.gpu) {
+                                note = format!("{note}; cleanup also failed: {fe}");
+                            }
+                            weights.free_gpu(ctx.gpu);
+                            return Err(note);
+                        }
+                        d
+                    }
                     Err(e) => {
                         let mut note = format!("DeltaNetState::new_with_quant: {e:?}");
                         if let Err(fe) = kv_cache.free_gpu(ctx.gpu) {
