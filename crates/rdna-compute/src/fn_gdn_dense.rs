@@ -128,9 +128,10 @@ fn gate_i8_entry(value_heads: usize, value_dim: usize) -> Option<&'static str> {
     }
 }
 
-/// The row-count part of [`applies`]: at least [`MIN_ROWS`] rows. Every final
-/// 512-row segment, including a 1..63-row tail, stays on the scan route:
-/// KKT and scan mask the partial C64 microtile (`gdn_chunk_tail_kill`).
+/// The row-count part of [`applies`]: at least [`MIN_ROWS`] rows. For callers
+/// aligned to 512-row seams, every final segment, including 1..63 rows, stays
+/// on the scan route. KKT and scan mask its partial C64 microtile
+/// (`gdn_chunk_tail_kill`); this does not change the call-local tile origin.
 fn rows_admitted(n: usize) -> bool {
     n >= MIN_ROWS
 }

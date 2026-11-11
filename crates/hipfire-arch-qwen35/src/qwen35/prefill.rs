@@ -6023,17 +6023,15 @@ fn gdn_moe_chunk_scan_on(arch: &str) -> bool {
     )
 }
 
-/// Row admission of the chunk scan, shared by the dense and MoE routes. The
-/// scan's 64-row microtiles and 512-row state commits sit on absolute 512-row
-/// segment seams that do not depend on how a prompt is split into outer chunks, so
-/// the admission must not depend on it either:
+/// Row admission of the chunk scan, shared by the dense and MoE routes. For
+/// calls already aligned to 512-row commit seams, the final tail must not
+/// select a different recurrence for the preceding rows:
 ///
 /// * `n <= 512` (one segment): `n >= 64`; a shorter call is the final tail of an
 ///   ordinary chunked prefill only when it resumes exactly on a nonzero 512-row
 ///   seam (`start_pos > 0 && start_pos % 512 == 0`), where the larger outer chunks
-///   of the same prompt scan it inside their last commit segment. A short call
-///   anywhere else (a whole short prompt, a follow-up turn, a decode-adjacent
-///   batch) has no chunk-dependent counterpart and keeps its recurrence;
+///   of the same prompt scan it inside their last commit segment. Other short
+///   calls retain their incumbent recurrence.
 /// * `n > 512`: the 512-row commit stride, with any final tail of 0..=511 rows.
 ///   The kernels mask the padded rows of a partial 64-row tile
 ///   (`gdn_chunk_tail_kill` receipts), so a short tail never forces the whole outer
@@ -7962,12 +7960,11 @@ mod tests {
         }
     }
 
-    /// The shared row admission is independent of how a prompt is split into outer
-    /// chunks: any widened chunk (> 512 rows, 512-row commit stride) admits whatever
-    /// its final tail (0..=511 rows, including 1..63), and a short final call admits
-    /// only when it resumes on a nonzero 512-row seam.
+    /// Aligned-512-seam tail admission only: widened chunks (> 512 rows,
+    /// 512-row commit stride) admit every final tail, including 1..63 rows;
+    /// standalone short final calls admit at a nonzero 512-row seam.
     #[test]
-    fn gdn_chunk_scan_rows_admission_is_independent_of_the_outer_chunk_split() {
+    fn gdn_chunk_scan_rows_admission_keeps_aligned_512_seam_tails() {
         let want = |n: usize, stride: Option<usize>, start: usize| {
             if n <= 512 {
                 n >= 64 || (n >= 2 && start > 0 && start % 512 == 0)
@@ -8008,9 +8005,9 @@ mod tests {
                 "n={n} stride={stride:?} start={start}"
             );
         }
-        // The X2 prompt: 19993 tokens, 25 mod 512. Every outer chunk ceiling scans every
-        // chunk, including the 25-row final tail that used to force the whole last chunk
-        // onto the sequential recurrence.
+        // The X2 prompt: 19993 tokens, 25 mod 512. These ceilings place outer
+        // boundaries on 512-row seams; every chunk stays on the scan, including
+        // its final 25-row tail. This does not exercise off-grid caller boundaries.
         for ceiling in [512usize, 1024, 4096, 8192, 16384, 20480] {
             let mut at = 0usize;
             while at < 19993 {
