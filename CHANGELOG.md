@@ -1,6 +1,9 @@
 # Changelog
 
 ## Unreleased
+- **Fixed: automatic `max_seq` is no longer stuck at 4096 on legacy-KV loads.** The no-sequence fallback (`KvBackend::Legacy`, explicit or automatic-with-VMM-refusal) now resolves the trained window with a `pending` bound and no pre-teardown refusal — measuring against pre-teardown free VRAM misfires on serve model swaps, where the resident model is still counted. The Qwen35 carrier clamps to its post-weight card cap at the same site as the VMM bound (vision and draft reserves included), minus a 512 MiB contiguity margin for the single upfront allocation, and refuses below the 512 floor there. The load summary reports the measured bound (`card`/`model`) with the legacy KV label instead of `legacy`. On unified-memory APUs the resolved context is committed at load (host RAM pinned at idle), unlike VMM's on-demand growth; the margin does not cap UMA loads. Backend-gated, not OS-gated: explicit `--kv-backend legacy` on any OS measures, and Qwen4/MoE/directory loads keep their existing behavior. `hipfire fit` is unchanged (still advisory for these loads).
+
+## v0.4.5 — 2026-10-30
 
 ### Fixes: CI and platform builds
 
