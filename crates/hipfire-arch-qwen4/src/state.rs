@@ -8836,3 +8836,7 @@ mod tests {
 #[cfg(test)]
 #[path = "state_precision_accounting_tests.rs"]
 mod precision_accounting_tests;
+
+#[cfg(test)]
+#[path = "state_ef_oracle.rs"]
+mod ef_oracle;
