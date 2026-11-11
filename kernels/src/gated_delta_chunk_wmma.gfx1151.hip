@@ -62,34 +62,30 @@ static __device__ __forceinline__ gc_h16 gc_c_to_b(const gc_f8 c, int hi) {
     }
     return __builtin_bit_cast(gc_h16, out);
 }
-// C-layout tile (lane: column l16, rows 2r + hi) -> every row of this lane's column, each rounded
-// to F16 and widened (the B-operand value the WMMA form consumed), by swapping half-waves.
-static __device__ __forceinline__ void gc_c_to_col(const gc_f8 c, int hi, float (&col)[16]) {
+// Lower-triangular product R[2r + hi] = sum_{m <= 2r + hi} A[2r + hi][m] * x[m] in the C layout,
+// with x the column (this lane's) of the C-layout tile `c` rounded to F16: F32 fma, m ascending,
+// per-row accumulators (the column values are formed pair by pair by swapping half-waves).  A WMMA
+// product over the full 16-row K also sums A == 0 terms whose B operand rows lie past the row's own,
+// and the hardware sum is not neutral to them (one F32 ulp): a row's value would depend on later
+// rows, so the tile's rows could not be published before the tile is complete.  Here row i reads
+// columns m <= i only; the m = 2q + 1 term of the even row 2q is selected out, not multiplied by
+// a zero.
+static __device__ __forceinline__ gc_f8 gc_tri(const _Float16 (*A)[16], const gc_f8 c, int hi) {
+    gc_f8 R = {0, 0, 0, 0, 0, 0, 0, 0};
 #pragma unroll
-    for (int r = 0; r < 8; ++r) {
-        const float own = (float)(_Float16)c[r];
+    for (int q = 0; q < 8; ++q) {
+        const float own = (float)(_Float16)c[q];
         const float oth = __builtin_bit_cast(float, __builtin_amdgcn_permlanex16(
             __builtin_bit_cast(unsigned int, own), __builtin_bit_cast(unsigned int, own), 0x76543210u, 0xfedcba98u, false, false));
-        col[2 * r] = hi ? oth : own;
-        col[2 * r + 1] = hi ? own : oth;
-    }
-}
-// Lower-triangular product R[2r + hi] = sum_{m <= 2r + hi} A[2r + hi][m] * col[m] in the C layout
-// (F32 fma, m ascending).  A WMMA product over the full 16-row K also sums A == 0 terms whose
-// B operand rows lie past the row's own, and the hardware sum is not neutral to them (one F32 ulp):
-// a row's value would depend on later rows, so the tile's rows could not be published before the
-// tile is complete.  Here row i reads columns m <= i only; the m = 2r + 1 term is selected out for
-// the even row, not multiplied by a zero.
-static __device__ __forceinline__ gc_f8 gc_tri(const float (*A)[16], const float (&col)[16], int hi) {
-    gc_f8 R;
+        const float x0 = hi ? oth : own;  // row 2q
+        const float x1 = hi ? own : oth;  // row 2q + 1
 #pragma unroll
-    for (int r = 0; r < 8; ++r) {
-        const float* ar = &A[2 * r + hi][0];
-        float acc = 0.f;
-#pragma unroll
-        for (int m = 0; m <= 2 * r; ++m) acc = fmaf(ar[m], col[m], acc);
-        const float last = fmaf(ar[2 * r + 1], col[2 * r + 1], acc);
-        R[r] = hi ? last : acc;
+        for (int r = q; r < 8; ++r) {
+            const gc_h2 a = *(const gc_h2*)&A[2 * r + hi][2 * q];
+            R[r] = fmaf((float)a[0], x0, R[r]);
+            if (r > q) R[r] = fmaf((float)a[1], x1, R[r]);
+            else R[r] = hi ? fmaf((float)a[1], x1, R[r]) : R[r];
+        }
     }
     return R;
 }
@@ -121,8 +117,8 @@ extern "C" __global__ void gated_delta_chunk_gate_wmma(
     __shared__ __align__(16) _Float16 kb_s[16][136];   // k beta e^G rows
     __shared__ __align__(16) _Float16 kdT[128][16];    // (k e^{GL-G})^T
     __shared__ float vb_s[16][132];                    // v beta rows (F32)
-    __shared__ __align__(16) float t_f[16][16];      // T, rounded to F16
-    __shared__ __align__(16) float p_f[16][16];      // P, rounded to F16
+    __shared__ __align__(16) _Float16 t_s[16][16];
+    __shared__ __align__(16) _Float16 p_s[16][16];
     __shared__ float g_s[16], bt_s[16], inv_s[16];
     __shared__ __align__(16) unsigned short out_s[16][136];
     const int dv0 = wave * 16;
@@ -263,7 +259,7 @@ extern "C" __global__ void gated_delta_chunk_gate_wmma(
                 Tc[i] = acc;
                 // Rows 0..14 round F32 then F16; row 15's last fma has no other use and rounds
                 // straight to F16 (v_fma_mix), exactly as the landed per-row-store kernel did.
-                t_f[i][l16] = (float)(_Float16)(i < 15 ? gc_opaque(acc) : acc);
+                t_s[i][l16] = (_Float16)(i < 15 ? gc_opaque(acc) : acc);
             }
         } else if (wave == 1) {
             gc_f8 c = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -273,7 +269,7 @@ extern "C" __global__ void gated_delta_chunk_gate_wmma(
 #pragma unroll
             for (int r = 0; r < 8; ++r) {
                 const int i = 2 * r + hi, j = l16;
-                p_f[i][j] = (float)(_Float16)(j <= i ? c[r] * expf(g_s[i] - g_s[j]) : 0.f);
+                p_s[i][j] = (_Float16)(j <= i ? c[r] * expf(g_s[i] - g_s[j]) : 0.f);
             }
         }
         // K' = (k beta e^G) S and O_inter = Q S on this wave's slice (S as B from registers).
@@ -288,12 +284,9 @@ extern "C" __global__ void gated_delta_chunk_gate_wmma(
 #pragma unroll
         for (int r = 0; r < 8; ++r) Dm[r] = vb_s[2 * r + hi][dv0 + l16] - Ks[r];
         GC_BARRIER();  // T, P ready
-        float dmc[16], vbc[16];
-        gc_c_to_col(Dm, hi, dmc);
-        const gc_f8 Vn = gc_tri(t_f, dmc, hi);
+        const gc_f8 Vn = gc_tri(t_s, Dm, hi);
+        const gc_f8 O = gc_tri(p_s, Vn, hi);
         const gc_h16 vb = gc_c_to_b(Vn, hi);
-        gc_c_to_col(Vn, hi, vbc);
-        const gc_f8 O = gc_tri(p_f, vbc, hi);
 #pragma unroll
         for (int r = 0; r < 8; ++r) {
             const int i = 2 * r + hi;

@@ -126,13 +126,13 @@
           }
         ],
         "compared_to_incumbent": true,
-        "incumbent_sha256": "dc982814e4104cc9ddd636791be9330c771f71ce3cb95a9f651607bad96c0594",
+        "incumbent_sha256": "b09950a40da7c3f5fdd986da33260df93b3c9dcab67ed00ca7a38bf5d0f00483",
         "incumbent_symbol": "gated_delta_chunk_gate_q8_wmma",
         "kernarg_segment_size": 104
       },
       "arch": "gfx1151",
-      "elf_bytes": 36880,
-      "elf_sha256": "72406b2c7f1f206cfdc050241f1817d43b969149f3858d2c973ebc9ac9f72954",
+      "elf_bytes": 38928,
+      "elf_sha256": "aa7c20367fc249649f9a4876fe2151c04591409c3797180334ea31fe9db9b046",
       "hazards": {
         "advisory": 200,
         "blocking": 0,
@@ -140,16 +140,16 @@
         "findings": 200,
         "pm_ir_obligations": 0
       },
-      "hxaco_bytes": 40976,
-      "hxaco_sha256": "69c2bcf31bb00756d250ff2c0356e17d294e9bdccdefd5879dc1dd78ed91fe35",
+      "hxaco_bytes": 43024,
+      "hxaco_sha256": "a4e745e88de7b461e569e34bc24acfae6432a5a2c496d6e6a6977658b961e738",
       "kernel": "gated_delta_chunk_gate_q8_wmma_pm_gfx1151",
       "lds": 31168,
       "lift_identity": "emit::checked ok; emitted bytes == input ELF",
       "rsrc2": 132,
       "scratch": 0,
       "sgprs": 87,
-      "text_bytes": 31748,
-      "text_sha256": "fcf325f7752ddf5168149ac276cc72d229b8a1377ecd78849f8662b09c1019c7",
+      "text_bytes": 33888,
+      "text_sha256": "d7e31e0c8a93c961d0381e447a07c955b0f1d867ea11532d694fbaa6f474900e",
       "user_sgprs": 2,
       "vgprs": 240,
       "wavefront_size": 32
@@ -159,8 +159,8 @@
     {
       "symbol": "gated_delta_chunk_gate_q8_wmma_pm_gfx1151",
       "judged_candidate": "incumbent-hipcc",
-      "judged_code_sha256": "fcf325f7752ddf5168149ac276cc72d229b8a1377ecd78849f8662b09c1019c7",
-      "twin_text_sha256": "fcf325f7752ddf5168149ac276cc72d229b8a1377ecd78849f8662b09c1019c7",
+      "judged_code_sha256": "d7e31e0c8a93c961d0381e447a07c955b0f1d867ea11532d694fbaa6f474900e",
+      "twin_text_sha256": "d7e31e0c8a93c961d0381e447a07c955b0f1d867ea11532d694fbaa6f474900e",
       "equal": true
     }
   ]
