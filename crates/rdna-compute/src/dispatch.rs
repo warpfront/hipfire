@@ -9908,6 +9908,23 @@ impl Gpu {
         self.pool.pooled_bytes()
     }
 
+    /// Test seam (the daemon's `serve-fault-inject` build): the pool allocation
+    /// after `after_allocs` further ones is forced to miss the free lists and fail
+    /// as an injected `hipErrorOutOfMemory`, so the production out-of-memory retry
+    /// (drain every pooled buffer, allocate again once) runs at a chosen moment.
+    /// `None` disarms. Inert unless a test arms it.
+    pub fn inject_pool_oom(&mut self, after_allocs: Option<u32>) {
+        // bind_thread: skip — arms a host-side counter, no HIP call.
+        self.pool.inject_oom(after_allocs);
+    }
+
+    /// `(drains, injected_oom)`: times a drain returned pooled buffers to HIP, and
+    /// injected out-of-memory failures consumed ([`Self::inject_pool_oom`]).
+    pub fn pool_drain_counters(&self) -> (u64, u64) {
+        // bind_thread: skip — pure read of host-side counters, no HIP call.
+        (self.pool.drains, self.pool.injected_oom)
+    }
+
     /// Drain the GPU memory pool. Actually calls hipFree on all pooled buffers.
     /// Call after model unload to return VRAM to the system.
     pub fn drain_pool(&mut self) {

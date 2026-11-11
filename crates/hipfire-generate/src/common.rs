@@ -2157,6 +2157,18 @@ impl Drop for RequestFaultGuard {
     }
 }
 
+/// Test-only: pool allocations to let through before the buffer pool's injected
+/// out-of-memory fires, from a `generate` request's `test_fault_pool_oom_after`
+/// (`rdna_compute::Gpu::inject_pool_oom`). `None` when the field is absent or not
+/// a non-negative integer, so an unarmed request disarms.
+#[cfg(feature = "serve-fault-inject")]
+#[doc(hidden)]
+pub fn pool_oom_after_from_request(msg: &serde_json::Value) -> Option<u32> {
+    msg.get("test_fault_pool_oom_after")
+        .and_then(|v| v.as_u64())
+        .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
+}
+
 // ── test-support helpers, moved with the daemon test modules ──
 
 /// Pure attestation combiner for unit tests / failure injection: every required

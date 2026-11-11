@@ -63,3 +63,35 @@ fn retry_eligible_only_qwen35() {
     assert!(!model_retry_reset_eligible(9)); // deepseek4
     assert!(!model_retry_reset_eligible(0)); // llama
 }
+
+#[cfg(feature = "serve-fault-inject")]
+#[test]
+fn pool_oom_arm_parses_only_a_non_negative_integer() {
+    let arm = |v: serde_json::Value| pool_oom_after_from_request(&v);
+    assert_eq!(arm(serde_json::json!({})), None, "absent field disarms");
+    assert_eq!(
+        arm(serde_json::json!({"test_fault_pool_oom_after": 0})),
+        Some(0)
+    );
+    assert_eq!(
+        arm(serde_json::json!({"test_fault_pool_oom_after": 37})),
+        Some(37)
+    );
+    assert_eq!(
+        arm(serde_json::json!({"test_fault_pool_oom_after": u64::MAX})),
+        Some(u32::MAX),
+        "an oversized count saturates instead of wrapping to an early arm"
+    );
+    assert_eq!(
+        arm(serde_json::json!({"test_fault_pool_oom_after": -1})),
+        None
+    );
+    assert_eq!(
+        arm(serde_json::json!({"test_fault_pool_oom_after": true})),
+        None
+    );
+    assert_eq!(
+        arm(serde_json::json!({"test_fault_pool_oom_after": "3"})),
+        None
+    );
+}

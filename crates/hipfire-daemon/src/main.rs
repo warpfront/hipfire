@@ -359,6 +359,52 @@ fn write_test_state_snapshot(
     let _ = stdout.flush();
 }
 
+/// `test_pool_stats`: the buffer pool's drain evidence and the daemon thread's
+/// graph-launch tally, for the pool-drain parity harness.
+#[cfg(feature = "serve-fault-inject")]
+fn write_test_pool_stats(stdout: &mut impl std::io::Write, gpu: &rdna_compute::Gpu) {
+    let (drains, injected_oom) = gpu.pool_drain_counters();
+    let (pool_new, pool_reused, _) = gpu.pool_stats();
+    let payload = serde_json::json!({
+        "type": "test_pool_stats",
+        "pooled_bytes": gpu.pool_parked_bytes(),
+        "drains": drains,
+        "injected_oom": injected_oom,
+        "pool_new": pool_new,
+        "pool_reused": pool_reused,
+        "graph_launches": hip_bridge::launch_counters::graph_launch::count(),
+    });
+    let _ = writeln!(stdout, "{payload}");
+    let _ = stdout.flush();
+}
+
+/// `test_pool_oom_drain`: run the production out-of-memory retry on demand. One
+/// small pool allocation is forced to miss and fail as `hipErrorOutOfMemory`; the
+/// pool then returns every parked buffer to HIP and allocates again once, exactly
+/// as a real out-of-memory does. The armed failure never outlives this command.
+#[cfg(feature = "serve-fault-inject")]
+fn run_test_pool_oom_drain(stdout: &mut impl std::io::Write, gpu: &mut rdna_compute::Gpu) {
+    let pooled_before = gpu.pool_parked_bytes();
+    let (drains_before, _) = gpu.pool_drain_counters();
+    gpu.inject_pool_oom(Some(0));
+    let probe = gpu.alloc_tensor(&[64], rdna_compute::DType::F32);
+    gpu.inject_pool_oom(None);
+    let pooled_after_alloc = gpu.pool_parked_bytes();
+    let (drains_after, _) = gpu.pool_drain_counters();
+    let outcome = probe.and_then(|tensor| gpu.free_tensor(tensor));
+    let payload = serde_json::json!({
+        "type": "test_pool_oom_drain",
+        "ok": outcome.is_ok(),
+        "error": outcome.err().map(|e| e.to_string()),
+        "pooled_before": pooled_before,
+        "pooled_after_alloc": pooled_after_alloc,
+        "drains_before": drains_before,
+        "drains_after": drains_after,
+    });
+    let _ = writeln!(stdout, "{payload}");
+    let _ = stdout.flush();
+}
+
 /// Pure `gen_start.contract_version` selection used by the live generate path.
 /// Qwen AR (5/6) and Muse Glimmer (14) advertise v2; DS4 (9) and every other
 /// arch stay unset.
@@ -1257,6 +1303,10 @@ fn main() {
         };
 
         let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        // An injected pool out-of-memory (`test_pool_oom_drain`,
+        // `test_fault_pool_oom_after`) never outlives the message that armed it.
+        #[cfg(feature = "serve-fault-inject")]
+        gpu.inject_pool_oom(None);
         let idle = !batch_scheduler
             .as_ref()
             .is_some_and(|s| s.active_count() > 0);
@@ -3147,6 +3197,11 @@ fn main() {
                 #[cfg(feature = "serve-fault-inject")]
                 let _fault_guard =
                     hipfire_generate::common::RequestFaultGuard::arm_from_request(&msg);
+                // Test-only: the pool allocation after `test_fault_pool_oom_after`
+                // further ones fails as hipErrorOutOfMemory, so the production
+                // drain-and-retry runs mid-request (see `Gpu::inject_pool_oom`).
+                #[cfg(feature = "serve-fault-inject")]
+                gpu.inject_pool_oom(hipfire_generate::common::pool_oom_after_from_request(&msg));
                 // Experimental slot backend dispatches before the ordinary model path.
                 // This preserves byte-for-byte default behavior when absent, and in experimental
                 // mode owns exactly one SlotEngine/weight set with no ordinary-model fallback.
@@ -5104,6 +5159,16 @@ fn main() {
             #[cfg(feature = "serve-fault-inject")]
             "test_state_snapshot" => {
                 write_test_state_snapshot(&mut stdout, model.as_ref(), &gpu, state_epoch);
+            }
+
+            #[cfg(feature = "serve-fault-inject")]
+            "test_pool_stats" => {
+                write_test_pool_stats(&mut stdout, &gpu);
+            }
+
+            #[cfg(feature = "serve-fault-inject")]
+            "test_pool_oom_drain" => {
+                run_test_pool_oom_drain(&mut stdout, &mut gpu);
             }
 
             _ => {
