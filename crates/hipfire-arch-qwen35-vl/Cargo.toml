@@ -27,6 +27,8 @@ hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }
 va-bridge = { path = "../va-bridge", optional = true }
 serde_json.workspace = true
+# image content fingerprint (`image::image_fingerprint`)
+sha2.workspace = true
 # image preprocessing (PNG decode + resize) for the vision encoder input
 # pipeline lives in this crate (`crate::image`); JPEG decode is
 # `hipfire_runtime::imagedec` (libjpeg-turbo-rs). Same default-feature
@@ -38,7 +40,6 @@ image.workspace = true
 # Encodes the synthetic JPEG fixtures in `tests/image_from_bytes.rs`
 # (the `image` crate's JPEG encoder left with its `jpeg` feature).
 libjpeg-turbo-rs.workspace = true
-sha2.workspace = true
 
 [[example]]
 name = "vl_tower_dump"

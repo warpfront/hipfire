@@ -357,21 +357,21 @@ fn resume_from_checkpoint(
     Ok(())
 }
 
-/// Cold start that keeps the assistant-turn cache: the attested rollback
-/// (which clears it) with the cache moved out and back. The chat path's own
-/// cold start keeps it too (ar.rs:3391-3434); entries are keyed by turn
-/// content, not position, so they stay valid.
+/// Cold start that keeps the assistant-turn cache — the one shared
+/// [`crate::common::cold_reset_keep_turn_cache`], mapped to a decide error.
 fn cold_reset_keep_turn_cache(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
 ) -> Result<(), DecideError> {
-    let turns = std::mem::replace(
-        &mut m.asst_turn_cache,
-        hipfire_loader::AsstTurnCache::new_from_env(),
-    );
-    let r = rollback(m, gpu);
-    m.asst_turn_cache = turns;
-    r
+    let ep = crate::common::cold_reset_keep_turn_cache(m, gpu);
+    if ep.rolled_back {
+        Ok(())
+    } else {
+        Err(DecideError::new(
+            500,
+            format!("decide rollback failed: {}", ep.context.unwrap_or_default()),
+        ))
+    }
 }
 
 /// Bring the model to the conversation end E, snapshot there, answer every

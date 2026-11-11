@@ -1261,6 +1261,12 @@ pub struct LoadedModel {
     pub prefill_checkpoints: Vec<(usize, DeltaNetSnapshot)>,
     pub dflash_checkpoints: Vec<(usize, DeltaNetSnapshot)>,
     pub asst_turn_cache: AsstTurnCache,
+    /// Content fingerprints (sha256 of the image bytes, in order) of the images
+    /// resident in `conversation_tokens`. Every image's rows carry the same
+    /// `<|image_pad|>` id, so token equality alone cannot tell a replaced
+    /// same-size image from the resident one; a vision turn reuses the resident
+    /// conversation only when these match the prompt's images.
+    pub vl_image_fingerprints: Vec<[u8; 32]>,
     pub decoded_vocab: Option<std::sync::Arc<Vec<String>>>,
     pub model_path: String,
     /// The model's speculative-decode drafter+verifier, when a draft model is
@@ -1324,6 +1330,7 @@ impl LoadedModel {
             kv_adaptive: None,
             conversation_tokens: Vec::new(),
             asst_turn_cache: AsstTurnCache::new_from_env(),
+            vl_image_fingerprints: Vec::new(),
             prefill_checkpoints: Vec::new(),
             dflash_checkpoints: Vec::new(),
             decoded_vocab: None,
