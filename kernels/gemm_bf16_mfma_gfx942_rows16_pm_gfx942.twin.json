@@ -305,7 +305,7 @@
           "ledger": {
             "barriers": 18,
             "branches": 100,
-            "label_states": 670,
+            "label_states": 337,
             "labels": 69,
             "memory": {
               "ds_load": 24,
@@ -315,7 +315,7 @@
               "vmem_load": 32,
               "vmem_store": 8
             },
-            "steps": 15793,
+            "steps": 12232,
             "verifier": "peacemaker_isa::ledger_cfg::verify",
             "waitcnt": 63,
             "waitcnt_lgkmcnt_partial": 1,
@@ -490,7 +490,7 @@
           "ledger": {
             "barriers": 18,
             "branches": 148,
-            "label_states": 1205,
+            "label_states": 616,
             "labels": 101,
             "memory": {
               "ds_load": 24,
@@ -500,7 +500,7 @@
               "vmem_load": 48,
               "vmem_store": 8
             },
-            "steps": 42581,
+            "steps": 26543,
             "verifier": "peacemaker_isa::ledger_cfg::verify",
             "waitcnt": 77,
             "waitcnt_lgkmcnt_partial": 1,
