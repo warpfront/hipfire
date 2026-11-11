@@ -3,7 +3,10 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! The EXACT expert-parallel prefill wave: one joint forward of several lanes' prompt tiles on an
-//! EP rank, byte-identical per lane to the serial lane tiles it replaces (BEAT-PAITON S1).
+//! EP rank, byte-identical per lane to the serial lane tiles it replaces for lanes of 65+ rows
+//! (BEAT-PAITON S1). A small lane (9..=64 rows) is only distribution-equivalent to its serial
+//! tile by default and skips the wave under `serve.batch_exact`
+//! ([`QWEN4_EP_WAVE_SMALL_LANES_ENV`]).
 //!
 //! A sub-512-row lane tile runs the EP FULL-TABLE MoE: every rank computes every expert of the
 //! layer (peer tables over P2P, host-mapped arenas), no gather, no tile exchange, so its cost is
@@ -141,9 +144,13 @@ pub(crate) fn exact_wave_min_lane_rows() -> usize {
 /// the REAL rows, not bitwise the SIMT arm), which a joint call over the wave's rows would not;
 /// the wave therefore runs those projections once per lane (`Gpu::qwen4_wave_lane_rows`) and, when
 /// a small lane is in the wave, every other row-local stage per lane too
-/// ([`ep_wave_joint_for_lanes`]). Exact `0` restores the floor of [`EXACT_WAVE_MIN_LANE_ROWS`]
-/// (65): such lanes run serial singleton tiles. An explicit `HIPFIRE_EP_LANE_PREFILL_WAVE_MIN_ROWS`
-/// overrides either.
+/// ([`ep_wave_joint_for_lanes`]). That is NOT enough for byte identity: served C1-vs-C8 identity
+/// (R9700 EP2, D1 check) found a small lane's wave output differs from its solo prefill (exactly
+/// the 57/60/64-token prompts), so by default a small lane is distribution-equivalent, not
+/// byte-identical, to its serial tile. Under `serve.batch_exact` small lanes keep their serial
+/// tile (byte-identical by construction). Exact `0` restores the floor of
+/// [`EXACT_WAVE_MIN_LANE_ROWS`] (65): such lanes run serial singleton tiles. An explicit
+/// `HIPFIRE_EP_LANE_PREFILL_WAVE_MIN_ROWS` overrides either.
 pub const QWEN4_EP_WAVE_SMALL_LANES_ENV: &str = "HIPFIRE_EP_LANE_PREFILL_WAVE_SMALL_LANES";
 
 /// [`QWEN4_EP_WAVE_SMALL_LANES_ENV`] parsed: on unless exact `0`.

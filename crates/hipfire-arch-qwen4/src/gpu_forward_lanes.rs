@@ -85,10 +85,12 @@
 //! projections) run once over all rows too (`HIPFIRE_EP_LANE_PREFILL_WAVE_JOINT`, default
 //! on; `0` runs them per lane, each launch the lane tile's by construction) and the
 //! stateful cores run per lane on the lane's own rows and state. The caller's policy is replaced
-//! by the EP wave policy ([`crate::gpu_forward::ep_wave::ep_wave_policy`]). A lane's
-//! committed state and head are byte-equal to its serial tile because every kernel of
+//! by the EP wave policy ([`crate::gpu_forward::ep_wave::ep_wave_policy`]). A lane of 65+
+//! rows has committed state and head byte-equal to its serial tile because every kernel of
 //! the wave's MoE call (router, shared expert, grouped expert GEMMs, combine) computes
-//! each row independently of the other rows of its launch; the card oracle proves it.
+//! each row independently of the other rows of its launch; the card oracle proves it. A
+//! small lane (9..=64 rows) is NOT: by default it is distribution-equivalent to its serial
+//! tile (served C1-vs-C8 identity differs), and under `serve.batch_exact` it skips the wave.
 //!
 //! # Pipeline-parallel bands
 //!
