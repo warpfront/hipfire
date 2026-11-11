@@ -249,6 +249,20 @@ const CDNA_CERTIFIED: [(&str, &[&str]); 6] = [
             "gemm_fp8b128_moe_tile_desc_pad16",
         ],
     ),
+    (
+        "qwen4_g942_glue_elem_hipcc_gfx942.co",
+        &[
+            "qwen4_g942_gemm_bf16_rows16_hc_act",
+            "qwen4_g942_gemm_bf16_rows16_hc_act_x2",
+        ],
+    ),
+    (
+        "qwen4_g942_glue_elem_pm_gfx942.hxaco",
+        &[
+            "qwen4_g942_gemm_bf16_rows16_hc_act",
+            "qwen4_g942_gemm_bf16_rows16_hc_act_x2",
+        ],
+    ),
 ];
 
 /// The gfx942 device ELF of `bytes`: itself when raw, else the single native
