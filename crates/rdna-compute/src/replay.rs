@@ -3502,7 +3502,8 @@ fn gfx11_cwsr_priv(architecture: Pm4Architecture) -> bool {
 /// write). Each drop fires the userptr MMU notifier, so KFD evicts (preempts,
 /// CWSR-saves) and later restores every queue of the process. It drives the
 /// queue-preemption path without a profiler; it is a repro aid, not a
-/// production setting.
+/// production setting. Linux-only (KFD userptr notifier, libc `mmap`/`madvise`/`dlopen`):
+/// elsewhere the knob is reported once and ignored.
 fn debug_force_evict_start() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     let Some(ms) = hipfire_config::process_value("HIPFIRE_DEBUG_FORCE_EVICT_MS")
@@ -3511,6 +3512,11 @@ fn debug_force_evict_start() {
     else {
         return;
     };
+    #[cfg(not(target_os = "linux"))]
+    ONCE.call_once(|| {
+        eprintln!("[force-evict] HIPFIRE_DEBUG_FORCE_EVICT_MS={ms} ignored: Linux (KFD) only")
+    });
+    #[cfg(target_os = "linux")]
     ONCE.call_once(move || {
         unsafe extern "C" {
             fn dlopen(name: *const std::ffi::c_char, flags: i32) -> *mut std::ffi::c_void;

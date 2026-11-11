@@ -982,6 +982,7 @@ impl SkewLog {
 }
 
 /// CLOCK_MONOTONIC in ns (the clock rocprofv3 timestamps use).
+#[cfg(target_os = "linux")]
 fn monotonic_ns() -> u64 {
     #[repr(C)]
     struct Timespec {
@@ -997,6 +998,15 @@ fn monotonic_ns() -> u64 {
         return 0;
     }
     ts.sec as u64 * 1_000_000_000 + ts.nsec as u64
+}
+
+/// No CLOCK_MONOTONIC (and no rocprofv3) off Linux; the libc constant differs per OS, so a
+/// process-local monotonic clock keeps the log lines ordered instead.
+#[cfg(not(target_os = "linux"))]
+fn monotonic_ns() -> u64 {
+    static START: std::sync::LazyLock<std::time::Instant> =
+        std::sync::LazyLock::new(std::time::Instant::now);
+    START.elapsed().as_nanos() as u64
 }
 
 /// The rank's tail (installed in the row-gather hook).

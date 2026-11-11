@@ -715,6 +715,10 @@ fn daemon_commit_from_version_line(line: &str) -> Option<&str> {
     }
 }
 
+/// How long [`check_daemon_build_matches`] waits for the daemon's `--version`
+/// to exit before treating it as a fixture that ignores the flag.
+const DAEMON_VERSION_PROBE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Refuse a daemon binary from a different build before speaking to it.
 ///
 /// A mixed install (a CLI from one tree driving a daemon from another) used to
@@ -723,29 +727,37 @@ fn daemon_commit_from_version_line(line: &str) -> Option<&str> {
 /// with `FATAL: failed to resolve startup configuration: unknown
 /// configuration key`, naming neither the cause nor the fix. The probe runs
 /// the daemon's `--version` (answered before process init) and fails only on
-/// a positive mismatch: an unparseable answer, a spawn failure, or an
-/// `unknown` stamp on either side passes, so dev fixtures and override-built
-/// binaries are unaffected.
-fn check_daemon_build_matches(daemon: &Path) -> Result<()> {
+/// a positive mismatch: an unparseable answer, a spawn failure, an answer
+/// later than `deadline`, or an `unknown` stamp on either side passes, so dev
+/// fixtures and override-built binaries are unaffected.
+fn check_daemon_build_matches(daemon: &Path, deadline: std::time::Duration) -> Result<()> {
     if CLIENT_BUILD_COMMIT == "unknown" {
         return Ok(());
     }
-    let mut child = match std::process::Command::new(daemon)
+    let mut command = std::process::Command::new(daemon);
+    command
         .arg("--version")
         // A daemon fixture that reads stdin must see EOF, not this caller's
         // pipes; the real daemon answers before touching stdin anyway.
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
+        .stderr(std::process::Stdio::null());
+    // Like the daemon spawn below: a fork here must not inherit another
+    // test's writable fixture FD (that test's exec would fail ETXTBSY), and
+    // this exec must not race a fixture write either.
+    #[cfg(test)]
+    let fixture_process_guard = FIXTURE_PROCESS_GATE.lock().unwrap();
+    let spawned = command.spawn();
+    #[cfg(test)]
+    drop(fixture_process_guard);
+    let mut child = match spawned {
         Ok(child) => child,
         Err(_) => return Ok(()),
     };
     // The real daemon answers --version before any process init. Anything
     // still running after the deadline is not a version answer (a fixture
     // that ignores the flag), not evidence of skew: kill it and pass.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = std::time::Instant::now() + deadline;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -833,7 +845,7 @@ impl Engine {
         if !daemon.is_file() {
             return Err(ClientError::MissingDaemon(daemon.to_owned()));
         }
-        check_daemon_build_matches(daemon)?;
+        check_daemon_build_matches(daemon, DAEMON_VERSION_PROBE_DEADLINE)?;
         let mut command = Command::new(daemon);
         command
             .stdin(Stdio::piped())
@@ -3110,6 +3122,9 @@ done
     /// mixed-install state; the spawn must name it instead of surfacing the
     /// daemon's own startup failure later. Skipped when the client itself was
     /// built outside a repo (`unknown` stamp passes everything by design).
+    /// The probe runs with a deadline the exiting fixture cannot miss: under
+    /// the 2 s spawn deadline a loaded host could time the answer out, and a
+    /// timed-out probe passes by design, so this would flake (#1002).
     #[cfg(unix)]
     #[test]
     fn mixed_build_daemon_is_refused_with_a_named_cause() {
@@ -3126,9 +3141,10 @@ done
             &root,
             "#!/bin/sh\nprintf 'hipfire-daemon 0.0.0 deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\\n'\n",
         );
-        let err = match Engine::spawn(&daemon, &BTreeMap::new()) {
+        let err = match check_daemon_build_matches(&daemon, std::time::Duration::from_secs(86_400))
+        {
             Err(err) => err,
-            Ok(_) => panic!("a daemon from a different build must be refused"),
+            Ok(()) => panic!("a daemon from a different build must be refused"),
         };
         let rendered = err.to_string();
         assert!(rendered.contains("mixed install"), "{rendered}");
