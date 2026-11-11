@@ -5,6 +5,10 @@
 - PeaceMaker RDNA: pin a named SOP1 XML-condition override table to all three source hashes, with per-row LLVM register, inline and literal byte-round-trip evidence. Preserve the malformed source condition; exhaustively prove all 256 selectors for restricted operand domains instead of disabling valid register forms along with invalid inline/literal forms.
 - PeaceMaker RDNA: carry full instruction/encoding/condition/ordinal keys through IR construction and RDNA consumers, and add an XML-layout field codec backed by generated runtime rows. Preserve named graphics refusals and refuse unqualified XML variants in the numeric emulator.
 
+### Fixes: Flash-Next EP
+
+- **Fixed: on an EP load, rank 0's long-prefill expert staging (G2 stage) no longer takes the host RAM a later rank's routed experts need (HIPF-214).** The stage admitted its restore mirrors against live MemAvailable without the later ranks' expert pins, which land after rank 0's forward attaches. In a window the size of one rank's mirrors (1279 MiB at EP2), rank 0 staged and the next rank's load then failed with "routed experts need … pinned host RAM". The stage now uses the loader's placement ledger: its own pending mirrors plus the later ranks' pending pins, which already include their lent-layer restore copies. Earlier ranks' mirrors are no longer re-charged. On a host with room, staging is unchanged.
+
 ### Fixes: CI and platform builds
 
 - **Fixed: the Windows MSVC build links again.** The EP skew log's `clock_gettime` (hipfire-arch-qwen4) and the `HIPFIRE_DEBUG_FORCE_EVICT_MS` repro knob's `mmap`/`madvise`/`dlopen`/`dlsym` (rdna-compute PM4 replay) were declared as libc externs on every OS, so `link.exe` failed with LNK1120. Both are Linux-only now: off Linux the skew log timestamps from a process-local monotonic clock, and the force-evict knob is reported once and ignored. The hipfire-config hot-units sidecar test, hidden behind the link failure, now uses a path that is absolute on Windows too.

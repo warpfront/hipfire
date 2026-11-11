@@ -2768,6 +2768,10 @@ pub struct Qwen4Weights {
     /// `Some` on a per-expert EP load (`HIPFIRE_QWEN4_EP_EXPERT_HOTSET`): the
     /// mesh's plan, this rank and the slot maps of its mixed layers.
     ep_units: Option<EpUnitState>,
+    /// Pinned host bytes the later EP ranks' placements still take after this
+    /// rank's forward attaches (the loader's host ledger over `rank + 1..`);
+    /// charged by the G2 stage's restore-mirror admission. `0` off EP.
+    pub ep_later_host_bytes: u64,
     scope: Qwen4BandScope,
     device: usize,
     /// `Some((rank, parts))` once [`Self::shard_dense_ffn`] kept that slice.
@@ -3076,6 +3080,7 @@ impl Qwen4Weights {
             device,
             tp_shard: None,
             ep_units,
+            ep_later_host_bytes: 0,
             trunk_shard: None,
         })
     }

@@ -5028,6 +5028,20 @@ fn qwen4_ep_host_check_bytes(rank_host_bytes: &[u64], own_rank: usize, reserve_m
     experts.saturating_add(reserve_mirror.saturating_mul((rank_host_bytes.len() - own_rank) as u64))
 }
 
+/// `(check, later)`: this rank's host check and the later ranks' share of it,
+/// which they pin after this rank's forward (and its G2 stage) attaches
+/// (`Qwen4Weights::ep_later_host_bytes`).
+fn qwen4_ep_host_ledger(
+    rank_host_bytes: &[u64],
+    own_rank: usize,
+    reserve_mirror: u64,
+) -> (u64, u64) {
+    (
+        qwen4_ep_host_check_bytes(rank_host_bytes, own_rank, reserve_mirror),
+        qwen4_ep_host_check_bytes(rank_host_bytes, own_rank + 1, reserve_mirror),
+    )
+}
+
 /// Phase one and the capacity plan of one requested load. `Ok(Ordinary)` keeps
 /// the untouched path (admission refused, or every trunk layer already fits);
 /// `Err` refuses the load before any allocation (the opt-in contract cannot be
@@ -8384,6 +8398,9 @@ fn load_qwen4_rank_unscoped(
         )
         && ep.is_none();
 
+    // The later ranks' share of this rank's placement host check: they pin after this
+    // rank's forward (and its G2 stage) attaches, so the stage admits its mirrors against it.
+    let mut ep_later_host_bytes = 0u64;
     let mut applied_layers = moe_layers;
     if let Some(policy) = placement {
         if use_ranges {
@@ -8566,8 +8583,9 @@ fn load_qwen4_rank_unscoped(
         // The experts' share of it: the embedding table (when host-mapped) is
         // reported on its own load line.
         let expert_host_bytes = host_bytes.saturating_sub(embed_pinned_bytes);
-        let host_check_bytes =
-            qwen4_ep_host_check_bytes(&rank_host_bytes, own_rank, ep_reserve_mirror_bytes);
+        let host_check_bytes;
+        (host_check_bytes, ep_later_host_bytes) =
+            qwen4_ep_host_ledger(&rank_host_bytes, own_rank, ep_reserve_mirror_bytes);
         let mem_available = preallocation_mem_available;
         let ttm_pool = preallocation_ttm_pool;
         residency::check_host_ram(host_check_bytes, mem_available, ttm_pool)
@@ -8663,11 +8681,10 @@ fn load_qwen4_rank_unscoped(
         let rank_host_bytes =
             residency::host_mapped_bytes_ranks(&manifest.weights, bytes_of, ep_ranks)
                 .map_err(|error| format!("qwen4: {error}"))?;
-        let host_check_bytes = qwen4_ep_host_check_bytes(
-            &rank_host_bytes,
-            ep.map_or(0, |placement| placement.rank),
-            ep_reserve_mirror_bytes,
-        );
+        let own_rank = ep.map_or(0, |placement| placement.rank);
+        let host_check_bytes;
+        (host_check_bytes, ep_later_host_bytes) =
+            qwen4_ep_host_ledger(&rank_host_bytes, own_rank, ep_reserve_mirror_bytes);
         residency::check_host_ram(
             host_check_bytes,
             preallocation_mem_available,
@@ -9456,6 +9473,7 @@ fn load_qwen4_rank_unscoped(
         rdna_compute::load_phases::ns_since(assemble_started),
         0,
     );
+    bundle.weights.ep_later_host_bytes = ep_later_host_bytes;
     let forward_started = std::time::Instant::now();
     // The immutable S1 profile the placement above was charged for: the forward
     // allocates its prompt arena and expert page store from it.
@@ -18006,6 +18024,9 @@ mod qwen4_ep_reserve_loader_tests {
         assert!(split.reserve.is_none() && split.reserve_note.is_none());
         // Host charge and placement-forward term off: exactly the ordinary fold.
         assert_eq!(qwen4_ep_host_check_bytes(&[7, 11, 13], 1, 0), 24);
+        // The later ranks' share: what rank `own + 1` checks, and nothing after the last rank.
+        assert_eq!(qwen4_ep_host_ledger(&[7, 11, 13], 0, 5), (46, 34));
+        assert_eq!(qwen4_ep_host_ledger(&[7, 11, 13], 2, 5), (18, 0));
     }
 
     #[test]
