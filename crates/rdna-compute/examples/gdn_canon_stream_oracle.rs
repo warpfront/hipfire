@@ -37,7 +37,7 @@
 
 use rdna_compute::gdn_stream::{
     GdnCarryView, GdnLiveState, GdnPrefillPlan, GdnProjectionRecipe, GdnQ8Planes,
-    GdnScanAlgorithm, GdnScanEntry, GdnScanExit, GdnStateQuant, GdnStreamConsts,
+    GdnScanAlgorithm, GdnScanEntry, GdnScanExit, GdnSeqInputs, GdnStateQuant, GdnStreamConsts,
     GdnStreamMeta, GdnStreamPhase, GdnStreamRaw, GdnStreamScratch, GdnTensorFormat,
 };
 use rdna_compute::norm::GdnScanOut;
@@ -809,6 +809,131 @@ fn random_parts(rng: &mut Rng, total: usize) -> Vec<usize> {
     parts
 }
 
+/// Prepared (post-conv, post-gate) inputs of the sequential algorithm: q/k expanded to the value
+/// heads (`qk_head_ratio` 1, the legacy fast-kernel layout).
+struct SeqFx {
+    hv: usize,
+    q: Vec<f32>,
+    k: Vec<f32>,
+    v: Vec<f32>,
+    gate: Vec<f32>,
+    beta: Vec<f32>,
+}
+
+impl SeqFx {
+    fn new(hv: usize, rows: usize) -> Self {
+        Self {
+            hv,
+            q: lcg(21, rows * hv * HD, -0.2, 0.2),
+            k: lcg(22, rows * hv * HD, -0.2, 0.2),
+            v: lcg(23, rows * hv * HD, -1.0, 1.0),
+            gate: lcg(24, rows * hv, -0.5, -0.01),
+            beta: lcg(25, rows * hv, 0.1, 0.9),
+        }
+    }
+}
+
+fn seq_plan(quant: Quant) -> GdnPrefillPlan {
+    let mut p = GdnPrefillPlan {
+        recipe_id: 0,
+        algorithm: GdnScanAlgorithm::Sequential,
+        micro_rows: 1,
+        commit_rows: 512,
+        projection_recipe: GdnProjectionRecipe { qkv: 0, z: 0, alpha: 0, beta: 0, out: 0 },
+        scan_operand_format: GdnTensorFormat::F32,
+        scan_output_format: GdnTensorFormat::F32,
+        state_quant: match quant {
+            Quant::Q8 => GdnStateQuant::Q8,
+            Quant::Q8Ef => GdnStateQuant::Q8Ef,
+        },
+        producer_tile_rows: 1,
+    };
+    p.recipe_id = p.compute_recipe_id();
+    p
+}
+
+/// `parts` appended in order through `gdn_stream_append_sequential` (poisoned FP32 carry), then
+/// sealed. `corrupt`: negate the first state rows of the FP32 carry after that append.
+#[allow(clippy::too_many_arguments)]
+fn seq_run(
+    gpu: &mut Gpu,
+    fx: &Fixture,
+    sf: &SeqFx,
+    quant: Quant,
+    s: u64,
+    parts: &[usize],
+    seal: bool,
+    corrupt: Option<usize>,
+) -> Result<(Vec<u8>, StateBytes)> {
+    let hv = sf.hv;
+    let plan = seq_plan(quant);
+    let live = Live::new(gpu, fx, quant)?;
+    let carry = raw(gpu, hv * HD * HD * 4)?;
+    fill(gpu, &carry, 0xff)?;
+    let mut meta = GdnStreamMeta::sealed_at(s, 1);
+    let mut out = Vec::new();
+    let mut done = 0usize;
+    for (i, &n) in parts.iter().enumerate() {
+        let w = hv * HD;
+        let q = upload(gpu, &f32_bytes(&sf.q[done * w..(done + n) * w]))?;
+        let k = upload(gpu, &f32_bytes(&sf.k[done * w..(done + n) * w]))?;
+        let v = upload(gpu, &f32_bytes(&sf.v[done * w..(done + n) * w]))?;
+        let g = upload(gpu, &f32_bytes(&sf.gate[done * hv..(done + n) * hv]))?;
+        let b = upload(gpu, &f32_bytes(&sf.beta[done * hv..(done + n) * hv]))?;
+        let o = raw(gpu, n * w * 4)?;
+        let inp = GdnSeqInputs { q: &q, k: &k, v: &v, gate: &g, beta: &b, qk_head_ratio: 1 };
+        meta = gpu.gdn_stream_append_sequential(&plan, &meta, s + done as u64, n, &inp, &o, &live.planes(), &carry, hv)?;
+        out.extend_from_slice(&download(gpu, &o)?[..n * w * 4]);
+        done += n;
+        if corrupt == Some(i) {
+            let mut d = download(gpu, &carry)?;
+            for x in 0..512 {
+                d[x * 4 + 3] ^= 0x80;
+            }
+            gpu.memcpy_htod_auto(&carry.buf, &d)?;
+        }
+        for t in [q, k, v, g, b, o] {
+            gpu.free_tensor(t)?;
+        }
+    }
+    if seal {
+        gpu.gdn_stream_seal_sequential(&plan, &meta, &live.planes(), &carry, hv)?;
+    }
+    let st = live.snap(gpu)?;
+    live.free(gpu)?;
+    gpu.free_tensor(carry)?;
+    Ok((out, st))
+}
+
+/// Incumbent sequential route for Q8Ef: `gated_delta_net_q8` (fast kernel) per absolute 512-row
+/// segment.
+fn seq_legacy(gpu: &mut Gpu, fx: &Fixture, sf: &SeqFx, s: u64, n: usize) -> Result<(Vec<u8>, StateBytes)> {
+    let hv = sf.hv;
+    let live = Live::new(gpu, fx, Quant::Q8Ef)?;
+    let w = hv * HD;
+    let mut out = Vec::new();
+    let (mut pos, end) = (s, s + n as u64);
+    while pos < end {
+        let e = end.min((pos / 512 + 1) * 512);
+        let (off, len) = ((pos - s) as usize, (e - pos) as usize);
+        let q = upload(gpu, &f32_bytes(&sf.q[off * w..(off + len) * w]))?;
+        let k = upload(gpu, &f32_bytes(&sf.k[off * w..(off + len) * w]))?;
+        let v = upload(gpu, &f32_bytes(&sf.v[off * w..(off + len) * w]))?;
+        let g = upload(gpu, &f32_bytes(&sf.gate[off * hv..(off + len) * hv]))?;
+        let b = upload(gpu, &f32_bytes(&sf.beta[off * hv..(off + len) * hv]))?;
+        let o = raw(gpu, len * w * 4)?;
+        gpu.gated_delta_net_q8(&q, &k, &v, &g, &b, &live.codes, &live.scales, &o, len, hv, HD, live.ef.as_ref())?;
+        out.extend_from_slice(&download(gpu, &o)?[..len * w * 4]);
+        for t in [q, k, v, g, b, o] {
+            gpu.free_tensor(t)?;
+        }
+        pos = e;
+    }
+    let st = live.snap(gpu)?;
+    live.free(gpu)?;
+    Ok((out, st))
+}
+
 fn run() -> Result<()> {
     let mut json_path: Option<String> = None;
     let mut hv = 48usize;
@@ -951,6 +1076,51 @@ fn run() -> Result<()> {
                     rep.cmp(&ctx, "pre_corruption_rows_unchanged", &run.out[..10 * orow], &tref.out[..10 * orow]);
                 }
             }
+        }
+    }
+
+    // ---- Sequential (C = 1) algorithm: FP32 continuation, quantize only at absolute seams ----
+    for quant in [Quant::Q8Ef, Quant::Q8] {
+        let cname = format!("seq/{quant:?}");
+        let sf = SeqFx::new(hv, total_rows);
+        for &s in &[0u64, 25, 511, 512, 513, 45979] {
+            let n_total = if s == 45979 { 700 } else { total_rows };
+            let ctx0 = format!("{cname}/s{s}");
+            let (whole_out, whole_state) = seq_run(&mut gpu, &fx, &sf, quant, s, &[n_total], true, None)?;
+            rep.check(&ctx0, "nonvacuous_out", whole_out.iter().any(|b| *b != 0));
+            rep.check(&ctx0, "state_moved", whole_state.codes != fx.q80);
+            if quant == Quant::Q8Ef {
+                // Incumbent route: one fast-kernel launch per absolute 512-row segment, Q8+EF
+                // round trip between them and at the call end.
+                let (lo, ls) = seq_legacy(&mut gpu, &fx, &sf, s, n_total)?;
+                rep.cmp(&ctx0, "whole_vs_legacy.out", &whole_out, &lo);
+                cmp_state(&mut rep, &format!("{ctx0}/whole_vs_legacy"), &whole_state, &ls);
+            }
+            let d_seam = (512 - (s % 512)) as usize;
+            let mut partitions: Vec<(String, Vec<usize>)> = Vec::new();
+            for dd in [d_seam - 1, d_seam, d_seam + 1, 1, 63, 64] {
+                if dd >= 1 && dd < n_total {
+                    partitions.push((format!("cut{dd}"), vec![dd, n_total - dd]));
+                }
+            }
+            let mut p = vec![1usize; 140];
+            p.push(n_total - 140);
+            partitions.push(("singletons140+rest".into(), p));
+            for i in 0..(if quick { 3 } else { 8 }) {
+                partitions.push((format!("rand{i}"), random_parts(&mut rng, n_total)));
+            }
+            for (name, parts) in &partitions {
+                let ctx = format!("{ctx0}/{name}");
+                let (o, st) = seq_run(&mut gpu, &fx, &sf, quant, s, parts, true, None)?;
+                rep.cmp(&ctx, "out_rows", &o, &whole_out);
+                cmp_state(&mut rep, &format!("{ctx}/sealed"), &st, &whole_state);
+            }
+            // Negative control: a corrupted FP32 carry must change a later output.
+            let (co, _) = seq_run(&mut gpu, &fx, &sf, quant, s, &[10, n_total - 10], true, Some(0))?;
+            let orow = hv * HD * 4;
+            rep.check(&ctx0, "control_corruption_detected", co != whole_out);
+            rep.cmp(&ctx0, "control_pre_rows_unchanged", &co[..10 * orow], &whole_out[..10 * orow]);
+            cells.push(json!({"cfg": cname, "start": s, "rows": n_total, "partitions": partitions.len()}));
         }
     }
 
