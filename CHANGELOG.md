@@ -7,8 +7,8 @@
 
 ### Fixes: LLaMA RoPE inputs
 
-- **Fixed: LLaMA/Mistral/Qwen3 configs in the transformers 5 layout get their `rope_theta` again (HIPF-206).** transformers 5 nests `rope_theta` inside `rope_parameters`; the LLaMA carrier read only the top-level key and ran theta 10000. It now falls back to `rope_parameters.rope_theta`. On gfx1151, a Llama-3.2-1B q8 HFQ with the v5 layout gives logits bitwise identical to the v4 layout over 60 positions (beta: KL 0.042, top-1 38/60).
-- **Fixed: `hipfire-quantize` refuses a llama GGUF that carries `rope_freqs.weight` (llama3 RoPE scaling) (HIPF-206).** The GGUF path cannot carry that scaling into the HFQ config, so the model loaded with plain RoPE. Quantize the HF safetensors checkpoint instead.
+- **Fixed: LLaMA/Mistral/Qwen3 configs in the transformers 5 layout get their `rope_theta` again (HIPF-206).** transformers 5 nests `rope_theta` inside `rope_parameters`; the LLaMA carrier read only the top-level key and ran theta 10000. It now reads `rope_parameters.rope_theta` first (as transformers does), then the top-level key. On gfx1151, a Llama-3.2-1B q8 HFQ with the v5 layout gives logits bitwise identical to the v4 layout over 60 positions (beta: KL 0.042, top-1 38/60).
+- **Fixed: `hipfire-quantize` refuses a llama GGUF with RoPE scaling (HIPF-206).** A llama3 GGUF carries it as `rope_freqs.weight`, a linear or YaRN one as `rope.scaling.type`. The GGUF path cannot carry either into the HFQ config, so the model loaded with plain RoPE. Quantize the HF safetensors checkpoint instead.
 
 ### Fixes: CI and platform builds
 

@@ -176,20 +176,31 @@ pub(crate) fn gguf_arch_is_moe_like(arch_id: u32) -> bool {
     matches!(arch_id, 6 | 9 | 10 | 11 | 12 | 13)
 }
 
-/// The LLaMA carrier (arch 0/1) takes its llama3 RoPE remap from config
-/// `rope_scaling`, which `config_json_from_gguf` cannot rebuild; a llama3 GGUF
-/// carries it only as `rope_freqs.weight`, so refuse rather than run plain RoPE.
+/// The LLaMA carrier (arch 0/1) takes its RoPE scaling from config
+/// `rope_scaling`, which `config_json_from_gguf` cannot rebuild: a llama3 GGUF
+/// carries it as `rope_freqs.weight`, a linear/yarn one as `rope.scaling.type`.
+/// Refuse rather than run plain RoPE.
 pub(crate) fn refuse_llama3_rope_freqs<'a>(
     arch_id: u32,
+    scaling_type: Option<&str>,
     mut names: impl Iterator<Item = &'a str>,
 ) -> Result<(), String> {
-    if arch_id <= 1 && names.any(|n| n == "rope_freqs.weight") {
+    if arch_id > 1 {
+        return Ok(());
+    }
+    if names.any(|n| n == "rope_freqs.weight") {
         return Err(
             "this llama GGUF carries rope_freqs.weight (llama3 RoPE scaling), which \
                     the GGUF path cannot carry into the HFQ config; quantize the HF \
                     safetensors checkpoint instead"
                 .to_string(),
         );
+    }
+    if let Some(t) = scaling_type.filter(|t| *t != "none") {
+        return Err(format!(
+            "this llama GGUF declares rope.scaling.type {t:?}, which the GGUF path \
+             cannot carry into the HFQ config; quantize the HF safetensors checkpoint instead"
+        ));
     }
     Ok(())
 }
@@ -265,8 +276,12 @@ pub(crate) fn run_gguf_pipeline(
     // dots-ocr-devlog.md §7 (R1) for the bring-up context.
     let arch_id: u32 = arch_id_override.unwrap_or(auto_arch_id);
     guard_qwen3_arch_override(auto_arch_id, arch_id, force_arch_id);
-    refuse_llama3_rope_freqs(arch_id, gguf.tensors.iter().map(|t| t.name.as_str()))
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    refuse_llama3_rope_freqs(
+        arch_id,
+        gguf.meta_str(&format!("{arch_str}.rope.scaling.type")),
+        gguf.tensors.iter().map(|t| t.name.as_str()),
+    )
+    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     if arch_id != auto_arch_id {
         eprintln!(
             "Architecture: {arch_str} (auto id={auto_arch_id}, overridden via --arch-id to {arch_id})"
@@ -1069,10 +1084,14 @@ mod tests {
     fn llama_rope_freqs_gguf_refused() {
         use super::refuse_llama3_rope_freqs;
         let llama3 = ["token_embd.weight", "rope_freqs.weight"];
-        assert!(refuse_llama3_rope_freqs(0, llama3.into_iter()).is_err());
-        assert!(refuse_llama3_rope_freqs(1, llama3.into_iter()).is_err());
-        assert!(refuse_llama3_rope_freqs(1, ["token_embd.weight"].into_iter()).is_ok());
-        assert!(refuse_llama3_rope_freqs(5, llama3.into_iter()).is_ok());
+        assert!(refuse_llama3_rope_freqs(0, None, llama3.into_iter()).is_err());
+        assert!(refuse_llama3_rope_freqs(1, None, llama3.into_iter()).is_err());
+        assert!(refuse_llama3_rope_freqs(1, None, ["token_embd.weight"].into_iter()).is_ok());
+        assert!(refuse_llama3_rope_freqs(5, None, llama3.into_iter()).is_ok());
+        let plain = ["token_embd.weight"];
+        assert!(refuse_llama3_rope_freqs(0, Some("linear"), plain.into_iter()).is_err());
+        assert!(refuse_llama3_rope_freqs(0, Some("yarn"), plain.into_iter()).is_err());
+        assert!(refuse_llama3_rope_freqs(0, Some("none"), plain.into_iter()).is_ok());
     }
 
     #[test]

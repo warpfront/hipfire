@@ -2488,14 +2488,12 @@ fn llama_config_from_value(
         head_dim,
         norm_eps: raw.rms_norm_eps,
         max_seq_len: raw.max_position_embeddings,
-        // transformers >= 5 nests theta inside `rope_parameters`.
-        rope_freq_base: raw
-            .rope_theta
-            .or_else(|| {
-                config["rope_parameters"]["rope_theta"]
-                    .as_f64()
-                    .map(|t| t as f32)
-            })
+        // transformers >= 5 nests theta inside `rope_parameters` and prefers it
+        // over a top-level key (`convert_rope_params_to_dict`).
+        rope_freq_base: config["rope_parameters"]["rope_theta"]
+            .as_f64()
+            .map(|t| t as f32)
+            .or(raw.rope_theta)
             .unwrap_or_else(default_llama_rope),
         rope_llama3: llama3_rope(config)?,
         bos_token: first_token_or(raw.bos_token_id.as_ref(), 1),
@@ -3647,6 +3645,12 @@ mod llama_config_tests {
         let c = llama_config_from_value(&config, false).unwrap();
         assert_eq!(c.rope_freq_base, 500000.0);
         assert_eq!(c.rope_llama3, RopeLlama3::new(32.0, 1.0, 4.0, 8192));
+        config["rope_theta"] = serde_json::json!(10000.0);
+        let c = llama_config_from_value(&config, false).unwrap();
+        assert_eq!(
+            c.rope_freq_base, 500000.0,
+            "rope_parameters wins, as in HF 5.x"
+        );
     }
 
     #[test]
