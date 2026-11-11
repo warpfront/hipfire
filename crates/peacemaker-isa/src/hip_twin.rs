@@ -48,6 +48,52 @@ fn hex(b: &[u8]) -> String {
     format!("{:x}", Sha256::digest(b))
 }
 
+/// Keys of `hazards.ledger` that record what the typed CFG wait-ledger replay explored
+/// (instruction visits, distinct label states). They are informational diagnostics of the
+/// verifier's search, not claims about the kernel: they may change when the verifier explores
+/// differently, and are never part of a twin's pinned identity. Findings, hazards, bytes and
+/// the structural counts of the report (`labels`, `branches`, `barriers`, `waitcnt*`, `memory`,
+/// ...) stay pinned.
+pub const LEDGER_DIAGNOSTIC_FIELDS: [&str; 2] = ["steps", "label_states"];
+
+/// The exploration statistics of one sealed report's ledger replay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LedgerDiagnostics {
+    pub steps: u64,
+    pub label_states: u64,
+}
+
+/// The informational exploration statistics recorded in `report["hazards"]["ledger"]`, if both
+/// are present as non-negative integers.
+pub fn ledger_diagnostics(report: &Value) -> Option<LedgerDiagnostics> {
+    let ledger = &report["hazards"]["ledger"];
+    Some(LedgerDiagnostics {
+        steps: ledger["steps"].as_u64()?,
+        label_states: ledger["label_states"].as_u64()?,
+    })
+}
+
+/// `report` with the exploration-only [`LEDGER_DIAGNOSTIC_FIELDS`] removed from
+/// `hazards.ledger`: the claims a seal pins. Compare this, never the raw report, when checking
+/// that a fresh seal reproduces a recorded one. Legacy reports that carry the counters as part
+/// of the recorded evidence normalize the same way as fresh ones; a counter that is not an
+/// integer is not a known diagnostic and is left in place so it still has to match.
+pub fn pinned_report(report: &Value) -> Value {
+    let mut pinned = report.clone();
+    if let Some(ledger) = pinned
+        .get_mut("hazards")
+        .and_then(|h| h.get_mut("ledger"))
+        .and_then(Value::as_object_mut)
+    {
+        for field in LEDGER_DIAGNOSTIC_FIELDS {
+            if ledger.get(field).is_some_and(Value::is_u64) {
+                ledger.remove(field);
+            }
+        }
+    }
+    pinned
+}
+
 fn ir_arch(arch: Arch) -> Result<IrArch, String> {
     match arch {
         Arch::Gfx1100 => Ok(IrArch::Gfx1100),
@@ -794,5 +840,133 @@ mod helper_tests {
         }
         let e = certify_helpers(&env, &elf, IrArch::Gfx1100).unwrap_err();
         assert!(e.contains("helper `"), "{e}");
+    }
+}
+
+#[cfg(test)]
+mod diagnostics_tests {
+    use super::*;
+
+    fn report() -> Value {
+        json!({
+            "kernel": "k",
+            "text_sha256": "aa",
+            "hazards": {
+                "checked": true,
+                "findings": 0,
+                "blocking": 0,
+                "bypasses": 0,
+                "hazard": {"violations": 0, "inserted_nops": 0, "s_nop": 3},
+                "ledger": {
+                    "verifier": "peacemaker_isa::ledger_cfg::verify_with_branch_proofs",
+                    "steps": 12308,
+                    "label_states": 288,
+                    "labels": 60,
+                    "branches": 84,
+                    "barriers": 18,
+                    "waitcnt": 61,
+                    "memory": {"vmem_load": 32},
+                },
+            },
+            "abi": {"kernarg_segment_size": 8},
+        })
+    }
+
+    #[test]
+    fn exploration_counters_may_differ_without_changing_the_pinned_claims() {
+        let recorded = report();
+        let mut fresh = report();
+        fresh["hazards"]["ledger"]["steps"] = json!(9000);
+        fresh["hazards"]["ledger"]["label_states"] = json!(1);
+        assert_ne!(fresh, recorded, "raw reports differ");
+        assert_eq!(pinned_report(&fresh), pinned_report(&recorded));
+        assert_eq!(
+            ledger_diagnostics(&fresh),
+            Some(LedgerDiagnostics {
+                steps: 9000,
+                label_states: 1
+            })
+        );
+        assert_eq!(
+            ledger_diagnostics(&recorded),
+            Some(LedgerDiagnostics {
+                steps: 12308,
+                label_states: 288
+            })
+        );
+    }
+
+    #[test]
+    fn a_report_without_counters_matches_a_legacy_report_that_records_them() {
+        let legacy = report();
+        let mut bare = report();
+        let ledger = bare["hazards"]["ledger"].as_object_mut().unwrap();
+        for field in LEDGER_DIAGNOSTIC_FIELDS {
+            ledger.remove(field);
+        }
+        assert_eq!(pinned_report(&legacy), pinned_report(&bare));
+        assert_eq!(ledger_diagnostics(&bare), None);
+    }
+
+    #[test]
+    fn normalization_removes_only_the_known_counters() {
+        let pinned = pinned_report(&report());
+        let ledger = pinned["hazards"]["ledger"].as_object().unwrap();
+        for field in LEDGER_DIAGNOSTIC_FIELDS {
+            assert!(!ledger.contains_key(field), "{field}");
+        }
+        let mut keys: Vec<_> = ledger.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["barriers", "branches", "labels", "memory", "verifier", "waitcnt"]
+        );
+        assert_eq!(pinned["hazards"]["findings"], 0);
+        assert_eq!(pinned["text_sha256"], "aa");
+        // The input is untouched.
+        assert_eq!(report()["hazards"]["ledger"]["steps"], 12308);
+    }
+
+    #[test]
+    fn findings_hazards_bytes_and_structural_counts_stay_pinned() {
+        let base = pinned_report(&report());
+        let mutations: [(&str, &[&str], Value); 12] = [
+            ("findings", &["hazards", "findings"], json!(1)),
+            ("blocking", &["hazards", "blocking"], json!(1)),
+            ("bypasses", &["hazards", "bypasses"], json!(1)),
+            ("checked", &["hazards", "checked"], json!(false)),
+            ("violations", &["hazards", "hazard", "violations"], json!(1)),
+            ("s_nop", &["hazards", "hazard", "s_nop"], json!(4)),
+            ("labels", &["hazards", "ledger", "labels"], json!(61)),
+            ("branches", &["hazards", "ledger", "branches"], json!(85)),
+            ("waitcnt", &["hazards", "ledger", "waitcnt"], json!(62)),
+            (
+                "memory",
+                &["hazards", "ledger", "memory", "vmem_load"],
+                json!(33),
+            ),
+            ("text bytes", &["text_sha256"], json!("bb")),
+            ("abi", &["abi", "kernarg_segment_size"], json!(16)),
+        ];
+        for (name, path, value) in mutations {
+            let mut changed = report();
+            // Counters moving as well must not mask the claim that changed.
+            changed["hazards"]["ledger"]["steps"] = json!(1);
+            changed["hazards"]["ledger"]["label_states"] = json!(1);
+            let mut at = &mut changed;
+            for key in path {
+                at = &mut at[*key];
+            }
+            *at = value;
+            assert_ne!(pinned_report(&changed), base, "{name} must stay pinned");
+        }
+    }
+
+    #[test]
+    fn a_non_integer_counter_is_not_a_known_diagnostic() {
+        let mut odd = report();
+        odd["hazards"]["ledger"]["steps"] = json!("many");
+        assert_ne!(pinned_report(&odd), pinned_report(&report()));
+        assert_eq!(ledger_diagnostics(&odd), None);
     }
 }

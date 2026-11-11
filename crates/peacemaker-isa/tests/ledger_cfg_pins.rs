@@ -15,8 +15,8 @@
 //!   converted kernel of its blockDim. Every pool must pass the dispatcher-only verifier
 //!   (`verify_dispatcher_emitted`: any hazard outside the exact body spans is fatal, no
 //!   allowance) and then the strict one (`verify_emitted`): a strict report is accepted only
-//!   inside a body span and only through an exact `POOL_BODY` entry (template id, body pc,
-//!   category).
+//!   inside a body span and only through an exact `POOL_BODY` entry (module/symbol,
+//!   body pc, category, instruction and need), never a scan-position template id.
 //!
 //! Every outcome lands in exactly one bucket: verified, finding (a real missing wait on a
 //! feasible path) or unsupported (an input the verifier refuses rather than skips). A finding
@@ -395,10 +395,44 @@ fn error_pc(error: &str) -> Option<usize> {
         .ok()
 }
 
-/// The `POOL_BODY` entry a strict report of a pool is, by template id, body pc and the exact
-/// instruction and need, or why it is none. A pc outside every body span (a dispatcher pc,
-/// a region's entry or exit label) has no entry by construction.
-fn classify_body(emitted: &Emitted, error: &str) -> Result<usize, String> {
+/// Match a finding by stable module/symbol, body pc, instruction and need. The category
+/// is checked against the corresponding standalone finding by the exhaustive pool test.
+fn body_entry(target: &str, body_pc: usize, error: &str) -> Result<usize, String> {
+    let i = POOL_BODY
+        .iter()
+        .position(|a| a.target == target && a.body_pc == body_pc)
+        .ok_or_else(|| format!("unlisted body finding: {target}, body pc {body_pc}"))?;
+    let a = &POOL_BODY[i];
+    if !error.contains(a.insn) || !error.contains(a.need) {
+        return Err(format!(
+            "{target} body pc {body_pc} is listed for {} {} but the report differs",
+            a.insn, a.need
+        ));
+    }
+    Ok(i)
+}
+
+/// Resolve the emission-local template id before looking up a stable body key.
+/// A dispatcher pc or a region's entry/exit label has no entry by construction.
+fn body_entry_for_template(
+    tid_targets: &[(u32, String)],
+    tid: u32,
+    body_pc: usize,
+    error: &str,
+) -> Result<usize, String> {
+    let target = tid_targets
+        .iter()
+        .find(|(id, _)| *id == tid)
+        .map(|(_, target)| target.as_str())
+        .ok_or_else(|| format!("template {tid} is not a converted region"))?;
+    body_entry(target, body_pc, error)
+}
+
+fn classify_body(
+    emitted: &Emitted,
+    tid_targets: &[(u32, String)],
+    error: &str,
+) -> Result<usize, String> {
     let pc = error_pc(error).ok_or("not a hazard report")?;
     let region = emitted
         .proof
@@ -415,18 +449,7 @@ fn classify_body(emitted: &Emitted, error: &str) -> Result<usize, String> {
     let body_pc = pc
         .checked_sub(region.entry_pc + 2)
         .ok_or_else(|| format!("pc {pc} is the region entry of template {tid}"))?;
-    let i = POOL_BODY
-        .iter()
-        .position(|a| a.tid == tid && a.body_pc == body_pc)
-        .ok_or_else(|| format!("unlisted body finding: template {tid}, body pc {body_pc}"))?;
-    let a = &POOL_BODY[i];
-    if !error.contains(a.insn) || !error.contains(a.need) {
-        return Err(format!(
-            "template {tid} body pc {body_pc} is listed for {} {} but the report differs",
-            a.insn, a.need
-        ));
-    }
-    Ok(i)
+    body_entry_for_template(tid_targets, tid, body_pc, error)
 }
 
 #[derive(Default)]
@@ -606,7 +629,11 @@ fn check_pool(
             let listed: Vec<u32> = hosted
                 .iter()
                 .copied()
-                .filter(|t| POOL_BODY.iter().any(|a| a.tid == *t))
+                .filter(|t| {
+                    tid_targets.iter().any(|(id, target)| {
+                        *id == *t && POOL_BODY.iter().any(|a| a.target == target)
+                    })
+                })
                 .collect();
             if dispatcher.suppressed != 0 || !listed.is_empty() {
                 report.unmatched.push(format!(
@@ -636,7 +663,7 @@ fn check_pool(
                     .push(format!("[POOL STATE CAP] {target}: {why}: {e}")),
             }
         }
-        Err(e) => match classify_body(emitted, &e) {
+        Err(e) => match classify_body(emitted, tid_targets, &e) {
             // A summarized region is not walked by the dispatcher-only verifier, so whether
             // it counted this body finding as suppressed depends on the summary; the strict
             // walk is what finds it and the exact entry is what accepts it.
@@ -706,18 +733,19 @@ fn lifted_pools_dispatcher_is_fatal_and_bodies_match_exact_entries() {
         }
     }
     assert!(!by_block.is_empty(), "no kernel converts to a region");
-    // The body entries are literal: each names a template id of this scan and the `pins`
-    // finding it is the pool-hosted copy of (same target, instruction, need and category),
-    // and each template has at most one.
+    // Every stable key names exactly one converted module/symbol and the `pins`
+    // finding it is the hosted copy of (same instruction, need and category).
     for a in POOL_BODY {
-        if !by_block
+        if by_block
             .values()
             .flatten()
-            .any(|r| r.tid == a.tid && r.target == a.target)
+            .filter(|r| r.target == a.target)
+            .count()
+            != 1
         {
             report.unmatched.push(format!(
-                "[POOL BODY ENTRY] template {} is not {} in this scan",
-                a.tid, a.target
+                "[POOL BODY ENTRY] {} is not exactly one region in this scan",
+                a.target
             ));
         }
         let prefix = match a.category {
@@ -732,14 +760,14 @@ fn lifted_pools_dispatcher_is_fatal_and_bodies_match_exact_entries() {
                 && f.why.starts_with(prefix)
         }) {
             report.unmatched.push(format!(
-                "[POOL BODY ENTRY] template {}: no `pins` finding of {} with {} {} and category {:?}",
-                a.tid, a.target, a.insn, a.need, a.category
+                "[POOL BODY ENTRY] {}: no `pins` finding with {} {} and category {:?}",
+                a.target, a.insn, a.need, a.category
             ));
         }
-        if POOL_BODY.iter().filter(|b| b.tid == a.tid).count() != 1 {
+        if POOL_BODY.iter().filter(|b| b.target == a.target).count() != 1 {
             report.unmatched.push(format!(
-                "[POOL BODY ENTRY] template {} has more than one entry",
-                a.tid
+                "[POOL BODY ENTRY] {} has more than one entry",
+                a.target
             ));
         }
     }
@@ -844,8 +872,8 @@ fn lifted_pools_dispatcher_is_fatal_and_bodies_match_exact_entries() {
     for (i, a) in POOL_BODY.iter().enumerate() {
         if !used.contains(&i) {
             report.unmatched.push(format!(
-                "[STALE POOL BODY] template {} body pc {} ({}) no longer occurs",
-                a.tid, a.body_pc, a.target
+                "[STALE POOL BODY] {} body pc {} no longer occurs",
+                a.target, a.body_pc
             ));
         }
     }
@@ -974,4 +1002,76 @@ fn state_cap_table_is_pinned_to_standalone_unsupported_rows() {
         why: "test",
     }];
     assert!(check_state_cap_table(&bogus, UNSUPPORTED).is_err());
+}
+
+/// Frozen mechanically from af76fde0b1's complete positional table, before removing tids.
+/// Equality of all predicate fields proves equality of the accepted finding sets, not
+/// merely equality of the findings the current verifier happens to emit.
+#[test]
+fn stable_body_keys_accept_exactly_the_legacy_finding_set() {
+    let legacy: Vec<serde_json::Value> =
+        serde_json::from_str(include_str!("ledger_cfg_pins/legacy_pool_body.json")).unwrap();
+    assert_eq!(
+        POOL_BODY
+            .iter()
+            .filter(|row| legacy.iter().any(|old| old["target"] == row.target))
+            .count(),
+        legacy.len()
+    );
+    let tids: Vec<(u32, String)> = legacy
+        .iter()
+        .map(|r| {
+            (
+                r["tid"].as_u64().unwrap() as u32,
+                r["target"].as_str().unwrap().into(),
+            )
+        })
+        .collect();
+    let mut shifted: Vec<(u32, String)> = tids
+        .iter()
+        .map(|(tid, target)| (tid + 1, target.clone()))
+        .collect();
+    // A new image sorting before every existing template. It has no finding entry.
+    shifted.push((16, "a_new_image.hxaco#new_kernel".into()));
+    for old in &legacy {
+        let tid = old["tid"].as_u64().unwrap() as u32;
+        let target = old["target"].as_str().unwrap();
+        let pc = old["body_pc"].as_u64().unwrap() as usize;
+        let insn = old["insn"].as_str().unwrap();
+        let need = old["need"].as_str().unwrap();
+        let category = match old["category"].as_str().unwrap() {
+            "ModelLimit" => Category::ModelLimit,
+            "Candidate" => Category::Candidate,
+            other => panic!("unknown legacy category {other}"),
+        };
+        let i = POOL_BODY
+            .iter()
+            .position(|row| row.target == target)
+            .unwrap();
+        let row = &POOL_BODY[i];
+        // Every field of the old acceptance predicate survives unchanged, and there is
+        // exactly one old tid and one new target for each predicate.
+        assert_eq!(
+            (row.target, row.body_pc, row.category, row.insn, row.need),
+            (target, pc, category, insn, need)
+        );
+        assert_eq!(tids.iter().filter(|(t, _)| *t == tid).count(), 1);
+        assert_eq!(tids.iter().filter(|(_, t)| t == target).count(), 1);
+        let error = format!("pc {pc} {insn} (after label `.Lt{tid}b_0`): {need}");
+        assert_eq!(body_entry_for_template(&tids, tid, pc, &error), Ok(i));
+        let shifted_error = error.replace(&format!(".Lt{tid}b_"), &format!(".Lt{}b_", tid + 1));
+        assert_eq!(
+            body_entry_for_template(&shifted, tid + 1, pc, &shifted_error),
+            Ok(i)
+        );
+        // Counterexamples remain rejected; renumbering is the only allowed difference.
+        assert!(body_entry_for_template(&tids, tid, pc + 1, &error).is_err());
+        assert!(
+            body_entry_for_template(&tids, tid, pc, &error.replace(insn, "`changed`")).is_err()
+        );
+        assert!(
+            body_entry_for_template(&tids, tid, pc, &error.replace(need, "needs changed")).is_err()
+        );
+        assert!(body_entry_for_template(&shifted, 16, pc, &error).is_err());
+    }
 }

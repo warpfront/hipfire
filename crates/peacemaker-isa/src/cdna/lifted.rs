@@ -151,6 +151,9 @@ pub fn certify_stream(name: &str, instructions: &[Typed]) -> Result<Value, Strin
         },
         "ledger": {
             "verifier": "peacemaker_isa::ledger_cfg::verify_with_branch_proofs",
+            // `steps` and `label_states` are informational exploration diagnostics
+            // (`hip_twin::LEDGER_DIAGNOSTIC_FIELDS`), excluded from the pinned claims by
+            // `hip_twin::pinned_report`; every other field here is pinned.
             "steps": stats.steps,
             "label_states": stats.label_states,
             "labels": cfg.targets.len(),

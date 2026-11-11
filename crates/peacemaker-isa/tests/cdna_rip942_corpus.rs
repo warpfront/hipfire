@@ -28,7 +28,9 @@
 
 use peacemaker_ir::envelope::Bundle;
 use peacemaker_isa::arch::Arch;
-use peacemaker_isa::hip_twin::{seal, seal_many, verify_hxaco_many, KernelSpec, Sealed};
+use peacemaker_isa::hip_twin::{
+    ledger_diagnostics, seal, seal_many, verify_hxaco_many, KernelSpec, Sealed,
+};
 use peacemaker_lift::bundle::BundleCodec;
 use sha2::{Digest, Sha256};
 
@@ -398,15 +400,16 @@ fn recorded_sealing_positives_still_seal_all_three_entries_bit_identically() {
                 case.name
             );
             assert_eq!(s.hxaco.len(), hxaco_bytes, "{} {symbol}", case.name);
-            // Exploration statistics may legitimately change; report, never weaken silently.
-            let steps = h["ledger"]["steps"].as_u64().unwrap();
-            let states = h["ledger"]["label_states"].as_u64().unwrap();
-            if (steps, states) != old_stats[i] {
+            // Informational diagnostics (`hip_twin::LEDGER_DIAGNOSTIC_FIELDS`): never compared
+            // as a pin, only reported when they move.
+            let d = ledger_diagnostics(&s.report)
+                .unwrap_or_else(|| panic!("{} {symbol}: ledger diagnostics missing", case.name));
+            if (d.steps, d.label_states) != old_stats[i] {
                 eprintln!(
                     "rip942 {} {symbol}: ledger (steps, label_states) {:?} -> {:?}",
                     case.name,
                     old_stats[i],
-                    (steps, states)
+                    (d.steps, d.label_states)
                 );
             }
         }

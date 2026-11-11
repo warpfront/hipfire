@@ -14,7 +14,9 @@
 
 use peacemaker_ir::envelope::Bundle;
 use peacemaker_isa::arch::Arch;
-use peacemaker_isa::hip_twin::{seal_many, verify_hxaco_many, KernelSpec};
+use peacemaker_isa::hip_twin::{
+    ledger_diagnostics, pinned_report, seal_many, verify_hxaco_many, KernelSpec,
+};
 use peacemaker_lift::bundle::BundleCodec;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -232,12 +234,68 @@ fn gfx942_checked_evidence_is_recorded_reproduced_and_clean() {
         assert_eq!(h["bypasses"], 0, "{symbol}");
         assert_eq!(h["hazard"]["violations"], 0, "{symbol}");
         assert_eq!(h["unreachable_instructions"], 0, "{symbol}");
-        assert_eq!(fresh[i].report["hazards"], *h, "{symbol}");
+        assert_eq!(
+            pinned_report(&fresh[i].report)["hazards"],
+            pinned_report(r)["hazards"],
+            "{symbol}"
+        );
         assert_eq!(
             fresh[i].report["lift_identity"], r["lift_identity"],
             "{symbol}"
         );
         assert_eq!(fresh[i].report["abi"], r["abi"], "{symbol}");
+    }
+}
+
+/// The ledger's exploration counters (`steps`, `label_states`) are recorded diagnostics, not
+/// pinned claims: the committed legacy reports still carry them, they may drift without
+/// breaking the pin, while hazards, findings, structural counts and the other claims may not.
+#[test]
+fn exploration_counters_are_diagnostics_but_hazards_findings_and_claims_stay_pinned() {
+    let m = manifest();
+    let reports = m["seal"]["reports"].as_array().expect("seal.reports");
+    let fresh = verify_hxaco_many(HXACO, arch(), &SYMBOLS).expect("verify");
+    for (i, symbol) in SYMBOLS.iter().enumerate() {
+        let r = &reports[i];
+        let fresh = &fresh[i].report;
+        assert!(
+            ledger_diagnostics(r).is_some(),
+            "{symbol}: the legacy report records its exploration counters"
+        );
+        assert_eq!(pinned_report(fresh), pinned_report(r), "{symbol}");
+
+        let mut drifted = r.clone();
+        drifted["hazards"]["ledger"]["steps"] = serde_json::json!(1);
+        drifted["hazards"]["ledger"]["label_states"] = serde_json::json!(1);
+        assert_ne!(&drifted, r, "{symbol}");
+        assert_eq!(pinned_report(fresh), pinned_report(&drifted), "{symbol}");
+
+        let mutations: [(&str, &[&str], Value); 7] = [
+            ("findings", &["hazards", "findings"], 1.into()),
+            ("blocking", &["hazards", "blocking"], 1.into()),
+            ("violations", &["hazards", "hazard", "violations"], 1.into()),
+            (
+                "branches",
+                &["hazards", "ledger", "branches"],
+                10_000.into(),
+            ),
+            ("waitcnt", &["hazards", "ledger", "waitcnt"], 10_000.into()),
+            ("text_sha256", &["text_sha256"], "00".into()),
+            ("lift_identity", &["lift_identity"], "none".into()),
+        ];
+        for (name, path, value) in mutations {
+            let mut changed = drifted.clone();
+            let mut at = &mut changed;
+            for key in path {
+                at = &mut at[*key];
+            }
+            *at = value;
+            assert_ne!(
+                pinned_report(fresh),
+                pinned_report(&changed),
+                "{symbol}: {name} must stay pinned"
+            );
+        }
     }
 }
 

@@ -18,6 +18,10 @@
 
 - **Docs: `AGENTS.md` §5 now pins the gfx942 (MI300X) Flash-Next quality.** Stock-FP8 `qwen3.8-flash-next` (sha256 `650e7f43…`), `qwen4_kld eval --decode` against the BF16-teacher WT2 and code24 references, built at v0.4.6: KLD 0.018734 / 0.023527, `.kldseq` SHA-256 `d4b4d4ad…` / `5255454e…`. Two fresh processes with separate HOME and empty kernel caches agree byte for byte per corpus, and a warm-cache run agrees with the cold pair. A planted numerics change (`HIPFIRE_G942_TRUNK_GEMV=1`) moves the code24 hash.
 
+### Fixes: PeaceMaker evidence
+
+- **Fixed: PM ledger pool findings use stable module/symbol, body-pc and finding keys instead of scan-position template ids.** A frozen migration oracle preserves every existing allowance exactly; adding an image no longer renumbers other rows. Twin exploration counters are informational diagnostics, while bytes, hazards, findings and certification claims remain pinned.
+
 ## v0.4.6 — 2026-11-11
 
 0.4.6 is the freeze baseline for the 0.5.0 consolidation (#666). Entries are grouped by area.

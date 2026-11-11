@@ -13,7 +13,7 @@
 
 use peacemaker_ir::envelope::Bundle;
 use peacemaker_isa::arch::Arch;
-use peacemaker_isa::hip_twin::{seal_many, verify_hxaco_many, KernelSpec};
+use peacemaker_isa::hip_twin::{pinned_report, seal_many, verify_hxaco_many, KernelSpec};
 use peacemaker_lift::bundle::BundleCodec;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -272,7 +272,11 @@ fn gfx942_checked_evidence_is_recorded_and_reproduced() {
         );
         assert_eq!(r["hazards"]["blocking"], 0, "{symbol}");
         assert_eq!(r["hazards"]["findings"], 0, "{symbol}");
-        assert_eq!(fresh[i].report["hazards"], r["hazards"], "{symbol}");
+        assert_eq!(
+            pinned_report(&fresh[i].report)["hazards"],
+            pinned_report(r)["hazards"],
+            "{symbol}"
+        );
         assert_eq!(
             fresh[i].report["lift_identity"], r["lift_identity"],
             "{symbol}"

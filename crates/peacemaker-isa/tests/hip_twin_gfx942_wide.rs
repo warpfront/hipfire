@@ -8,7 +8,7 @@
 
 use peacemaker_ir::envelope::Bundle;
 use peacemaker_isa::arch::Arch;
-use peacemaker_isa::hip_twin::{seal_many, verify_hxaco_many, KernelSpec};
+use peacemaker_isa::hip_twin::{pinned_report, seal_many, verify_hxaco_many, KernelSpec};
 use peacemaker_lift::bundle::BundleCodec;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -126,9 +126,14 @@ fn all_three_entries_reproduce_the_full_image_reports_and_rows16_abi() {
         assert_eq!(a.hxaco, HXACO, "{symbol}");
         assert_eq!(a.elf_sha256, ELF_SHA, "{symbol}");
         assert_eq!(a.text_sha256, v.text_sha256, "{symbol}");
-        assert_eq!(&a.report, r, "{symbol}: fresh seal evidence must not drift");
         assert_eq!(
-            &v.report, r,
+            pinned_report(&a.report),
+            pinned_report(r),
+            "{symbol}: fresh seal evidence must not drift"
+        );
+        assert_eq!(
+            pinned_report(&v.report),
+            pinned_report(r),
             "{symbol}: fresh verification evidence must not drift"
         );
         assert_eq!(r["kernel"], *symbol);
