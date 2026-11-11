@@ -22,6 +22,36 @@ pub(crate) const GUARD: usize = 64;
 pub(crate) const POISON: u32 = 0x7fc0_1234;
 pub(crate) const GU_SYMBOL: &str = "gemv_mq4g256v2_moe_gate_up_k2560_rows8_indexed_batched";
 pub(crate) const DN_SYMBOL: &str = "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded";
+pub(crate) const DN_R4_SYMBOL: &str =
+    "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded_k640_r4";
+pub(crate) const DN_DNI_SYMBOL: &str = "gemv_mq4g128v2_moe_down_top10_dni_k640";
+
+// Exact gfx1201, shipped qt53, M=2560, K=640, rows=1, topk=10.
+// Match the production launcher admission in moe.rs; capture modes suppress
+// r4 (and therefore DNI), while eager must exercise the enabled default.
+fn expected_down_symbol_for_scope(
+    r4_enabled: bool,
+    dni_enabled: bool,
+    recording: bool,
+    graph_capture: bool,
+) -> &'static str {
+    if !r4_enabled || recording || graph_capture {
+        DN_SYMBOL
+    } else if dni_enabled {
+        DN_DNI_SYMBOL
+    } else {
+        DN_R4_SYMBOL
+    }
+}
+
+pub(crate) fn expected_down_symbol(gpu: &Gpu) -> &'static str {
+    expected_down_symbol_for_scope(
+        gpu.flags.qwen4_moe_down_r4_enabled(),
+        gpu.moe_down_dni(),
+        gpu.replay.is_recording(),
+        gpu.graphs.capture_mode,
+    )
+}
 
 pub(crate) fn check(ok: bool, message: impl Into<String>) -> R<()> {
     if ok {
@@ -162,6 +192,10 @@ pub(crate) struct Fixture {
 }
 impl Fixture {
     pub(crate) fn build(gpu: &mut Gpu, arena: &mut Arena, report: &mut Value) -> R<Self> {
+        check(
+            gpu.arch == "gfx1201" && !gpu.mq4_experts_planar(),
+            "fixture requires exact gfx1201 and shipped (non-planar) MQ4 experts",
+        )?;
         let gu = packed_weights(GU_STRIDE, 136);
         let dn = packed_weights(DN_STRIDE, 68);
         let gu_device = arena.raw(gpu, &gu)?;
@@ -293,6 +327,7 @@ impl Fixture {
         hip(gpu.hip.device_synchronize())
     }
     pub(crate) fn launch(&self, gpu: &mut Gpu) -> R<()> {
+        let expected_down = expected_down_symbol(gpu);
         hip(gpu.gemv_mq4g256v2_moe_gate_up_top10_indexed_batched(
             &self.gu_table,
             &self.ids,
@@ -322,8 +357,11 @@ impl Fixture {
             TOP,
         ))?;
         check(
-            gpu.last_launched_kernel() == Some(DN_SYMBOL),
-            format!("unexpected down kernel: {:?}", gpu.last_launched_kernel()),
+            gpu.last_launched_kernel() == Some(expected_down),
+            format!(
+                "unexpected down kernel: {:?}; expected {expected_down}",
+                gpu.last_launched_kernel()
+            ),
         )
     }
     pub(crate) fn read(&self, gpu: &Gpu, arena: &Arena) -> R<Snapshot> {
@@ -527,7 +565,13 @@ pub(crate) fn arm(
     tape.verify(gpu, f)?;
     let output = f.read(gpu, arena)?;
     let proof = json!({
-        "arm": which.name(), "hip_kernel_launches": launches,
+        "arm": which.name(),
+        "expected_down_kernel": if matches!(which, Arm::Eager) {
+            expected_down_symbol(gpu)
+        } else {
+            DN_SYMBOL
+        },
+        "hip_kernel_launches": launches,
         "hip_graph_launches": graph_launches,
         "pm4_replays": observation.count, "pm4_failed": observation.failed,
         "outputs_reinitialized_to_nan_before_submit": true,
