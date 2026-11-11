@@ -5,6 +5,11 @@
 - PeaceMaker RDNA: pin a named SOP1 XML-condition override table to all three source hashes, with per-row LLVM register, inline and literal byte-round-trip evidence. Preserve the malformed source condition; exhaustively prove all 256 selectors for restricted operand domains instead of disabling valid register forms along with invalid inline/literal forms.
 - PeaceMaker RDNA: carry full instruction/encoding/condition/ordinal keys through IR construction and RDNA consumers, and add an XML-layout field codec backed by generated runtime rows. Preserve named graphics refusals and refuse unqualified XML variants in the numeric emulator.
 
+### Fixes: LLaMA RoPE inputs
+
+- **Fixed: LLaMA/Mistral/Qwen3 configs in the transformers 5 layout get their `rope_theta` again (HIPF-206).** transformers 5 nests `rope_theta` inside `rope_parameters`; the LLaMA carrier read only the top-level key and ran theta 10000. It now falls back to `rope_parameters.rope_theta`. On gfx1151, a Llama-3.2-1B q8 HFQ with the v5 layout gives logits bitwise identical to the v4 layout over 60 positions (beta: KL 0.042, top-1 38/60).
+- **Fixed: `hipfire-quantize` refuses a llama GGUF that carries `rope_freqs.weight` (llama3 RoPE scaling) (HIPF-206).** The GGUF path cannot carry that scaling into the HFQ config, so the model loaded with plain RoPE. Quantize the HF safetensors checkpoint instead.
+
 ### Fixes: CI and platform builds
 
 - **Fixed: the Windows MSVC build links again.** The EP skew log's `clock_gettime` (hipfire-arch-qwen4) and the `HIPFIRE_DEBUG_FORCE_EVICT_MS` repro knob's `mmap`/`madvise`/`dlopen`/`dlsym` (rdna-compute PM4 replay) were declared as libc externs on every OS, so `link.exe` failed with LNK1120. Both are Linux-only now: off Linux the skew log timestamps from a process-local monotonic clock, and the force-evict knob is reported once and ignored. The hipfire-config hot-units sidecar test, hidden behind the link failure, now uses a path that is absolute on Windows too.
