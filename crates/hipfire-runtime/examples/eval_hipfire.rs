@@ -768,6 +768,17 @@ fn main() {
             "lloyd4" => VMode::Lloyd4,
             other => panic!("unknown --kv-v: {other}"),
         };
+        // A non-Q8 V is only meaningful on an FWHT K mode: without the
+        // fwht2/3/4 arms below, the parsed mode would be silently ignored
+        // and every KxV sweep cell past the first would record q8/q8
+        // numbers under a lloyd label.
+        if v_mode != VMode::Q8 && !matches!(args.kv_mode.as_str(), "fwht2" | "fwht3" | "fwht4") {
+            eprintln!(
+                "eval_hipfire: --kv-v {} requires --kv-mode fwht2|fwht3|fwht4 (got {})",
+                args.kv_v, args.kv_mode
+            );
+            std::process::exit(1);
+        }
         let mut kv_cache = match args.kv_mode.as_str() {
             "q8" => KvCache::new_gpu_q8(
                 &mut gpu,
