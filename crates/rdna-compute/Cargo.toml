@@ -1387,3 +1387,7 @@ required-features = ["lab"]
 [[example]]
 name = "qwen4_g942_moe_gemm_oracle"
 required-features = ["lab"]
+
+[[example]]
+name = "fn_expert_table_indirection"
+required-features = ["lab"]
