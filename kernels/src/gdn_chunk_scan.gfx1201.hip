@@ -103,6 +103,23 @@ __device__ __forceinline__ gs_bfrag gs_frag_g(const unsigned short*p,unsigned st
  for(int e=0;e<16;++e)u.h[e]=p[(unsigned)r*stride+k0+e];
 #endif
  return u.v;}
+// gfx11 WMMA accumulates its 16 products so that the SIGN of a zero product changes the rounding of the
+// sum (v_wmma_f32_16x16x16_f16 on gfx1100/gfx1151; measured: a lone nonzero product plus a zero partner
+// in its k pair rounds differently for +0 and -0). The two WMMAs whose operand holds structural zeros
+// (D = A.z: A's upper triangle; O += D.score: the causal mask) multiply them with values that depend on
+// later rows, so a call that ends mid-tile saw different zero signs than the completed tile and its last
+// valid row rounded differently. Splitting that second operand by sign (x+ = x with sign bit clear, x- =
+// x with sign bit set, the other half +0 / -0) makes every masked product a constant-signed zero.
+// gfx12 WMMA is sign-insensitive (measured byte-stable), so its arithmetic is unchanged.
+#if !GDN_CHUNK_GFX12
+#define GS_SIGN_SPLIT 1
+__device__ __forceinline__ void gs_split(gs_bfrag x,gs_bfrag&pos,gs_bfrag&neg){union{unsigned short h[16];gs_bfrag v;}u,p,n;u.v=x;
+#pragma unroll
+ for(int e=0;e<16;++e){const unsigned b=u.h[e];const bool s=(b>>15)!=0;p.h[e]=s?0:(unsigned short)b;n.h[e]=s?(unsigned short)b:(unsigned short)0x8000u;}
+ pos=p.v;neg=n.v;}
+#else
+#define GS_SIGN_SPLIT 0
+#endif
 // Exact gfx1201 runs a latency-hiding copy of the chunk loop (GS_G12_PIPE).
 // It keeps every LDS byte, WMMA operand, accumulation order and rounding of
 // the original loop, which every other target still compiles.
@@ -358,7 +375,13 @@ __global__ void GDN_CHUNK_SCAN_KERNEL(
 #pragma unroll
   for(int kk=0;kk<4;++kk){gs_bfrag aa=gs_frag_g(abase,hv*GS_C,mt*16,last,kk*16,lane);
 #pragma unroll
-   for(int j=0;j<2;++j)Dacc[j]=gs_mma(aa,gs_frag(&sm.state[half][0][0],GS_KP,(ntb+j)*16,kk*16,lane),Dacc[j]);}
+   for(int j=0;j<2;++j){gs_bfrag zf=gs_frag(&sm.state[half][0][0],GS_KP,(ntb+j)*16,kk*16,lane);
+#if GS_SIGN_SPLIT
+    gs_bfrag zp,zn;gs_split(zf,zp,zn);Dacc[j]=gs_mma(aa,zn,Dacc[j]);Dacc[j]=gs_mma(aa,zp,Dacc[j]);
+#else
+    Dacc[j]=gs_mma(aa,zf,Dacc[j]);
+#endif
+   }}
 #pragma unroll
   for(int j=0;j<2;++j)for(int e=0;e<8;++e){int tok=mt*16+gs_acc_row(lane,e);sm.d[half][(ntb+j)*16+lo][tok]=gs_b16(Dacc[j][e]);}
   GS_BAR();
@@ -366,7 +389,17 @@ __global__ void GDN_CHUNK_SCAN_KERNEL(
 #pragma unroll
   for(int kk=0;kk<4;++kk){gs_bfrag score=gs_frag(&sm.score[0][0],GS_AP,mt*16,kk*16,lane);
 #pragma unroll
-   for(int j=0;j<2;++j)O[j]=gs_mma(gs_frag(&sm.d[half][0][0],GS_AP,(ntb+j)*16,kk*16,lane),score,O[j]);}
+   for(int j=0;j<2;++j){gs_bfrag df=gs_frag(&sm.d[half][0][0],GS_AP,(ntb+j)*16,kk*16,lane);
+#if GS_SIGN_SPLIT
+    gs_bfrag dp,dn;gs_split(df,dp,dn);O[j]=gs_mma(dn,score,O[j]);O[j]=gs_mma(dp,score,O[j]);
+#else
+    O[j]=gs_mma(df,score,O[j]);
+#endif
+   }}
+#if GS_SIGN_SPLIT
+  // WMMA needs every lane active (see gdn_chunk_scan.gfx1151.hip): keep the O products out of the store branch.
+  asm volatile("" : "+v"(O[0]), "+v"(O[1]));
+#endif
   const int tok=mt*16+lo;
   if(tok<rows){
 #pragma unroll
@@ -452,6 +485,9 @@ __global__ void GDN_CHUNK_SCAN_KERNEL(
 #pragma unroll
    for(int e=0;e<8;++e){const unsigned long long off=((unsigned long long)head*GS_D+vv)*GS_D+(kt0+ki)*16+gs_acc_row(lane,e);float qf=fminf(fmaxf(rintf(St[t][e]*inv),-128.0f),127.0f);sq[off]=(signed char)qf;
     const float qs=qf*scale;
-    if(gs_wef)ef[off]=(_Float16)(St[t][e]-qs);
-    if(gs_seam)ht[off]=qs+(float)(_Float16)(St[t][e]-qs);}}}
+    // `ht` is what the next launch's entry would reconstruct from the stored code (an int-converted
+    // code, so a negative-zero rounded value reloads as +0: gfx11 WMMA is zero-sign sensitive) and EF.
+    const _Float16 eh=(_Float16)(St[t][e]-qs);
+    if(gs_wef)ef[off]=eh;
+    if(gs_seam)ht[off]=(float)(signed char)qf*scale+(float)eh;}}}
 }
