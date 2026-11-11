@@ -753,6 +753,7 @@ fn plan_qwen35_gpu_stages(config: &Qwen35Config, ctx: &LoadCtx) -> Result<Qwen35
                     )
             ),
         ctx.kv_backend,
+        ctx.gpu.vmm_runtime_refusal().is_some(),
     )?;
 
     // Adaptive DFlash is out of scope: refuse explicit adaptive + DFlash draft.
@@ -958,13 +959,19 @@ fn validate_adaptive_cask_handoff(
 /// H24/KV4/D256, parent `kernel.verify_attn` on) and the cache is plain Q8,
 /// a legacy backend is refused before any upload rather than serving the
 /// split route from a legacy cache or silently dropping the opt-in.
+///
+/// `vmm_runtime_refused`: this device's runtime cannot back VMM at all
+/// (`Gpu::vmm_runtime_refusal`), so automatic selection resolved legacy and
+/// the load is not the operator's choice to refuse. The route admits VMM
+/// caches only and stays off on the legacy one.
 #[doc(hidden)]
 pub fn validate_gfx1100_split_verify_kv(
     split_envelope: bool,
     plain_q8: bool,
     backend: KvBackend,
+    vmm_runtime_refused: bool,
 ) -> Result<(), String> {
-    if split_envelope && plain_q8 && backend != KvBackend::Vmm {
+    if split_envelope && plain_q8 && backend != KvBackend::Vmm && !vmm_runtime_refused {
         return Err(
             "kernel.gfx1100_fa2_split_verify admits VMM KV only, but this load resolved \
              memory.kv_backend=legacy; use memory.kv_backend=vmm or set \
@@ -1709,16 +1716,19 @@ mod tests {
 
     #[test]
     fn gfx1100_split_verify_refuses_legacy_kv() {
-        assert!(validate_gfx1100_split_verify_kv(true, true, KvBackend::Vmm).is_ok());
+        assert!(validate_gfx1100_split_verify_kv(true, true, KvBackend::Vmm, false).is_ok());
         assert!(
-            validate_gfx1100_split_verify_kv(true, true, KvBackend::Legacy)
+            validate_gfx1100_split_verify_kv(true, true, KvBackend::Legacy, false)
                 .unwrap_err()
                 .contains("admits VMM KV only")
         );
         // Outside the opt-in envelope or off plain Q8 the route never runs,
         // so the backend is not this check's concern.
-        assert!(validate_gfx1100_split_verify_kv(false, true, KvBackend::Legacy).is_ok());
-        assert!(validate_gfx1100_split_verify_kv(true, false, KvBackend::Legacy).is_ok());
+        assert!(validate_gfx1100_split_verify_kv(false, true, KvBackend::Legacy, false).is_ok());
+        assert!(validate_gfx1100_split_verify_kv(true, false, KvBackend::Legacy, false).is_ok());
+        // A runtime that cannot back VMM resolves legacy automatically: the
+        // route (VMM caches only) stays off instead of refusing the load.
+        assert!(validate_gfx1100_split_verify_kv(true, true, KvBackend::Legacy, true).is_ok());
     }
 
     #[test]

@@ -2333,6 +2333,9 @@ fn main() {
                         }
                     };
                 let open_admission_started = std::time::Instant::now();
+                // Cached per device after the first load: a VMM KV backend is
+                // only automatic where this runtime can reserve address space.
+                let vmm_runtime_refusal = gpu.vmm_runtime_refusal();
                 let mut admission = match hipfire_loader::admission::admit_source_with_options(
                     path,
                     tp,
@@ -2354,7 +2357,7 @@ fn main() {
                             deepseek4_compute_placement,
                             hipfire_config::Deepseek4ComputePlacement::Single
                         ),
-                        vmm_runtime_available: gpu.vmm_recommended_granularity().is_ok(),
+                        vmm_runtime_refusal: vmm_runtime_refusal.as_deref(),
                         free_vram_bytes: gpu.device_mem_info().ok().map(|(free, _)| free),
                         qwen_default_q8: hipfire_loader::admission::qwen_default_q8_enabled(),
                     },

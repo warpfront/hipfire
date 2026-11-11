@@ -180,6 +180,19 @@ pub fn retired_va_bytes() -> usize {
     retired_va().bytes
 }
 
+/// Prove that the runtime can reserve virtual address space on `owner_device`
+/// before a load commits to the VMM KV backend.
+///
+/// Granularity queries are pure lookups and succeed on stacks where
+/// `hipMemAddressReserve` itself returns `hipErrorOutOfMemory` (a runtime/kernel
+/// pairing whose KFD cannot hand out the range), so they cannot predict a
+/// failed reservation. This performs the real call once, at the smallest size
+/// the arena rounds to (one granule), and retires the range like any released
+/// arena: nothing is ever mapped, so no later mapping can alias it.
+pub fn probe_va_reservation(hip: &impl VmmDriver, owner_device: i32) -> HipResult<()> {
+    VmmArena::reserve(hip, owner_device, 1)?.release(hip)
+}
+
 /// Physical granule granularity floor: handles are at least this large so a
 /// 2 MiB-granularity device and a 4 KiB-granularity device share one policy.
 const GRANULE_MIN_BYTES: usize = 2 << 20;
@@ -2376,6 +2389,9 @@ mod tests {
         next_base: Cell<usize>,
         bases: std::cell::RefCell<Vec<usize>>,
         fail_map: Cell<bool>,
+        /// Every `hipMemAddressReserve` fails with `hipErrorOutOfMemory`, as on
+        /// a runtime whose KFD cannot hand out a virtual range (#1058).
+        fail_reserve: Cell<bool>,
         next_handle: Cell<usize>,
     }
 
@@ -2387,6 +2403,7 @@ mod tests {
                 next_base: Cell::new(0x7f00_0000_0000),
                 bases: Default::default(),
                 fail_map: Cell::new(false),
+                fail_reserve: Cell::new(false),
                 next_handle: Cell::new(0x100),
             }
         }
@@ -2432,6 +2449,12 @@ mod tests {
         }
         fn mem_address_reserve(&self, size: usize, _: usize) -> HipResult<*mut c_void> {
             self.log(DriverOp::Reserve { size });
+            if self.fail_reserve.get() {
+                return Err(HipError::new(
+                    crate::HIP_ERROR_OUT_OF_MEMORY,
+                    "hipMemAddressReserve: out of memory",
+                ));
+            }
             let base = self.next_base.get();
             self.next_base.set(base + size.next_multiple_of(1 << 30));
             self.bases.borrow_mut().push(base);
@@ -2539,6 +2562,40 @@ mod tests {
 
     fn reserve_recorded(driver: &RecordingDriver, bytes: usize) -> VmmArena {
         VmmArena::reserve(driver, 0, bytes).expect("reserve on the recording driver")
+    }
+
+    /// #1058: admission asks the runtime for a real reservation before it picks
+    /// the VMM KV backend. A healthy runtime reserves one granule, maps nothing
+    /// and retires the range (a probe VA is never handed back).
+    #[test]
+    fn va_probe_reserves_one_granule_and_retires_it_without_mapping() {
+        const MIB: usize = 1 << 20;
+        let driver = RecordingDriver::new(2 * MIB);
+        let retired_before = retired_va_bytes();
+        probe_va_reservation(&driver, 0).expect("healthy runtime");
+        assert!(retired_va_bytes() >= retired_before + 2 * MIB);
+        let ops = driver.take_ops();
+        assert_eq!(ops.first(), Some(&DriverOp::Reserve { size: 2 * MIB }));
+        assert!(
+            ops.iter()
+                .all(|op| matches!(op, DriverOp::Reserve { .. } | DriverOp::Sync)),
+            "the probe only reserves; it never creates, maps or unmaps: {ops:?}"
+        );
+    }
+
+    /// A runtime that cannot reserve a range reports the driver's own error
+    /// from the probe, and the probe leaves nothing reserved or retired.
+    #[test]
+    fn va_probe_reports_a_refused_reservation() {
+        const MIB: usize = 1 << 20;
+        let driver = RecordingDriver::new(2 * MIB);
+        driver.fail_reserve.set(true);
+        let err = probe_va_reservation(&driver, 0).expect_err("refused reservation");
+        assert_eq!(err.code, crate::HIP_ERROR_OUT_OF_MEMORY);
+        assert!(err.to_string().contains("hipMemAddressReserve"), "{err}");
+        // Only the refused reserve reached the driver: no arena exists to
+        // synchronize, unmap or retire.
+        assert_eq!(driver.take_ops(), vec![DriverOp::Reserve { size: 2 * MIB }]);
     }
 
     /// QSA arena growth (`grow_context_arena` -> `grow_vmm_tensor` ->

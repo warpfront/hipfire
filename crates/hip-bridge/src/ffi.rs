@@ -5,7 +5,7 @@
 //! FFI bindings to libamdhip64.so via dlopen.
 //! No link-time dependency — runtime loads the shared library.
 
-use crate::error::{HipError, HipResult};
+use crate::error::{HipError, HipResult, HIP_ERROR_OUT_OF_MEMORY};
 use crate::plan_tape::{PlanEvent, PlanGate, PlanTape};
 use crate::site_ledger::{self as sites, Api as SiteApi, Dir as SiteDir};
 use crate::{DeviceBuffer, MemcpyKind};
@@ -372,7 +372,9 @@ pub type HipMemGenericAllocationHandle = *mut c_void;
 // ── A19 HIP fault injection (oracle only) ──────────────────────────────
 // HIPFIRE_FAULT_HIP=<class>[:<count>][,...] makes the FIRST `count` calls
 // of the chosen class (`upload` = H2D memcpy, `launch` = kernel launch,
-// `sync` = stream synchronize) fail with an injected error. This exercises
+// `sync` = stream synchronize, `reserve` = `hipMemAddressReserve`, which fails
+// exactly like a runtime that cannot reserve virtual address space:
+// `hipErrorOutOfMemory`) fail with an injected error. This exercises
 // the engine's fail-closed path for device faults — typed rejection,
 // poisoned resources not reused, no same-forward fallback execution
 // (spec §5.4 S4, oracle cell A19). Inert unless the variable is set by the
@@ -382,6 +384,7 @@ const HIP_FAULT_UNSET: usize = usize::MAX;
 static HIP_FAULT_UPLOAD: AtomicUsize = AtomicUsize::new(HIP_FAULT_UNSET);
 static HIP_FAULT_LAUNCH: AtomicUsize = AtomicUsize::new(HIP_FAULT_UNSET);
 static HIP_FAULT_SYNC: AtomicUsize = AtomicUsize::new(HIP_FAULT_UNSET);
+static HIP_FAULT_RESERVE: AtomicUsize = AtomicUsize::new(HIP_FAULT_UNSET);
 
 /// The process environment is read EXACTLY ONCE (POSIX forbids mutating it
 /// under concurrent readers, and the decode-hot path must not pay a getenv
@@ -418,7 +421,7 @@ fn module_image_fnv64(image: &[u8]) -> u64 {
 }
 
 /// Arm `count` injected failures for one fault class (`upload`, `launch`,
-/// `sync`), or disarm with `count == 0`. This is the test-facing arming API:
+/// `sync`, `reserve`), or disarm with `count == 0`. This is the test-facing arming API:
 /// it writes the atomics directly, so no process-global environment state is
 /// mutated from a running engine.
 pub fn arm_hip_fault(class: &str, count: usize) {
@@ -426,6 +429,7 @@ pub fn arm_hip_fault(class: &str, count: usize) {
         "upload" => &HIP_FAULT_UPLOAD,
         "launch" => &HIP_FAULT_LAUNCH,
         "sync" => &HIP_FAULT_SYNC,
+        "reserve" => &HIP_FAULT_RESERVE,
         other => {
             eprintln!("[hip-bridge] arm_hip_fault: unknown fault class '{other}'");
             return;
@@ -435,7 +439,12 @@ pub fn arm_hip_fault(class: &str, count: usize) {
 }
 
 fn hip_fault_consume(class_idx: usize, class: &'static str) -> bool {
-    let cells = [&HIP_FAULT_UPLOAD, &HIP_FAULT_LAUNCH, &HIP_FAULT_SYNC];
+    let cells = [
+        &HIP_FAULT_UPLOAD,
+        &HIP_FAULT_LAUNCH,
+        &HIP_FAULT_SYNC,
+        &HIP_FAULT_RESERVE,
+    ];
     let cell = cells[class_idx];
     let mut cur = cell.load(Ordering::Acquire);
     if cur == HIP_FAULT_UNSET {
@@ -2641,6 +2650,13 @@ impl HipRuntime {
     pub fn mem_address_reserve(&self, size: usize, alignment: usize) -> HipResult<*mut c_void> {
         self.plan_deny("hipMemAddressReserve")?;
         let func = self.missing_vmm_symbol("hipMemAddressReserve", self.fn_mem_address_reserve)?;
+        if hip_fault_consume(3, "reserve") {
+            return Err(HipError::from_code(
+                HIP_ERROR_OUT_OF_MEMORY,
+                "hipMemAddressReserve",
+                Some(&self.fn_get_error_string),
+            ));
+        }
         let mut ptr: *mut c_void = ptr::null_mut();
         // SAFETY: resolved VMM/host HIP symbol; pointer/handle args meet the method's
         // # Safety or documented preconditions; out-params are stack locals.
