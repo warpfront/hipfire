@@ -32,6 +32,15 @@ fn exercise(
     report["arch"] = json!(gpu.arch);
     report["device_id"] = json!(gpu.device_id);
     hip(gpu.ensure_capture_stream())?;
+    report["kernel_selection"] = json!({
+        "r4_enabled": gpu.flags.qwen4_moe_down_r4_enabled(),
+        "dni_enabled": gpu.moe_down_dni(),
+        "eager_down_expected": expected_down_symbol(gpu),
+        "recorded_down_expected": DN_SYMBOL,
+        "hip_graph_down_expected": DN_SYMBOL,
+        "default_kernel_feature_flags_modified": false,
+        "hip_graph_capture_selector": "scoped GraphState.capture_mode=true during capture body"
+    });
     let f = Fixture::build(gpu, arena, report)?;
     f.publish(gpu, arena, cases()[0])?;
     f.reset(gpu, arena)?;
@@ -107,8 +116,15 @@ fn exercise(
         let before = launch_count();
         // This helper is the existing stream-capture API used in moe_few.rs.
         // The resulting graph captures these two warmed kernels only.
+        check(!gpu.graphs.capture_mode, "nested graph capture mode")?;
         hip(gpu.begin_stream_capture())?;
-        if let Err(error) = f.launch(gpu) {
+        // This low-level API opens HIP capture without setting GraphState.
+        // Mirror the production capture selector only for the capture body;
+        // restore it before either the success or error path closes HIP capture.
+        let prior_capture_mode = std::mem::replace(&mut gpu.graphs.capture_mode, true);
+        let capture_body = f.launch(gpu);
+        gpu.graphs.capture_mode = prior_capture_mode;
+        if let Err(error) = capture_body {
             if let Ok(g) = gpu.end_stream_capture() {
                 *graph = Some(g);
             }
