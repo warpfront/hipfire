@@ -29,6 +29,7 @@ pub mod lds;
 pub mod ledger;
 /// CFG-aware wait verification of an emitted program (`Builder::finish` runs it).
 pub mod ledger_cfg;
+mod ledger_control;
 pub mod libm;
 pub mod native;
 #[path = "kernels/npu_trunk.rs"]

@@ -20,7 +20,9 @@
 //! - [`ops`]: instruction constructors with assembler-style e32/e64 choice.
 //! - [`hazard`]: CDNA3 wait-state insertion and checking.
 //! - [`emit`]: descriptor directives, metadata, code object, `.s` oracle text.
+//! - `control`: block-local typed scalar proofs for strict lifted certification only.
 pub mod builder;
+pub(crate) mod control;
 pub mod emit;
 pub mod hazard;
 pub mod lifted;

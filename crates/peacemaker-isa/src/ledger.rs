@@ -75,6 +75,13 @@
 //!   GDS/GWS operations are rejected by the lifted certification, so the EXP_CNT rule is
 //!   never needed. [UNVERIFIED: confirm on MI300X] the ISA gives no wait-state row for DS
 //!   store data; none is modelled.
+//!
+//! Strict typed CDNA CFG replay may exclude a branch edge using a universal,
+//! block-local scalar proof (`cdna::control`). Its immutable choice depends on
+//! the Program pc, not on a pending operation or dynamic predecessor fact.
+//! Equal replay keys therefore retain identical successors and wait obligations;
+//! neither the canonical key nor any counter/retirement rule needs predicate state.
+//! Dispatcher and unadapted replay paths consume no such scalar assumptions.
 
 use crate::{
     arch::Arch,
