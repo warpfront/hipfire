@@ -123,6 +123,29 @@ const QWEN4_G942_HC_DOWN_ACT_X2_KERNEL: &str = "qwen4_g942_gemm_bf16_rows16_hc_a
 /// 4-element pad (`R16_LD` in `qwen4_g942_glue_elem.hip`).
 const QWEN4_G942_ROWS16_LDS_PITCH: usize = 256 + 4;
 
+/// Bind `func` of the elementwise-fold module: the hipcc source (the anchor object), or, only when
+/// `HIPFIRE_QWEN4_G942_FOLD_ELEM_IMAGE=/absolute/device.elf` names one, that explicitly supplied
+/// code object (the Route-A twin proof: same module, same entry names, loaded through
+/// `ensure_embedded_kernel`). Unset: the source, unchanged.
+fn g942_fold_elem_ensure(gpu: &mut Gpu, func: &str) -> HipResult<()> {
+    match hipfire_config::developer_var("HIPFIRE_QWEN4_G942_FOLD_ELEM_IMAGE") {
+        Ok(path) if !path.is_empty() => {
+            let bytes = std::fs::read(&path).map_err(|error| {
+                hip_bridge::HipError::new(
+                    0,
+                    &format!("HIPFIRE_QWEN4_G942_FOLD_ELEM_IMAGE {path}: {error}"),
+                )
+            })?;
+            gpu.ensure_embedded_kernel(
+                QWEN4_G942_GLUE_ELEM_MODULE,
+                std::sync::Arc::<[u8]>::from(bytes),
+                func,
+            )
+        }
+        _ => gpu.ensure_kernel(QWEN4_G942_GLUE_ELEM_MODULE, QWEN4_G942_GLUE_ELEM_SRC, func),
+    }
+}
+
 impl Gfx942Device<'_> {
     /// The HC read's down projection and its activation as ONE launch (C1 fold,
     /// kill switch `HIPFIRE_QWEN4_G942_FOLD_ELEM`):
@@ -198,8 +221,7 @@ impl Gfx942Device<'_> {
             QWEN4_G942_HC_DOWN_ACT_KERNEL
         };
         self.gpu.bind_thread()?;
-        self.gpu
-            .ensure_kernel(QWEN4_G942_GLUE_ELEM_MODULE, QWEN4_G942_GLUE_ELEM_SRC, kernel)?;
+        g942_fold_elem_ensure(&mut *self.gpu, kernel)?;
         let (x_ptr, a_ptr, d_ptr) = (x.buf.as_ptr(), a.as_ptr(), out.buf.as_ptr());
         let (m_i32, k_i32, batch_i32, x_f32_i32) =
             (m as i32, k as i32, batch as i32, i32::from(x_f32));
