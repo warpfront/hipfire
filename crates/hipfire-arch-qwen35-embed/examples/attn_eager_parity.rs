@@ -116,7 +116,7 @@ fn main() -> Result<(), String> {
                            ldx: usize,
                            qk: bool,
                            gpu: &mut Gpu| {
-        hipfire_arch_qwen35_embed::forward::attention_gemm_ld(
+        hipfire_dispatch::pipeline::encoder::attention_gemm_ld(
             gpu, a, x, y, m, k, batch, lda, ldx, qk,
         )
     };

@@ -72,8 +72,9 @@ pub enum Step<'a> {
         q: &'a GpuTensor,
         k: &'a GpuTensor,
         pos_buf: &'a hip_bridge::DeviceBuffer,
-        /// `Some`: one I32 position per row (`rows` = its length), the batched
-        /// kernels; `pos_buf` is then unread. `None`: one row at `pos_buf`.
+        /// `Some`: `rope.positions_per_row()` I32 positions per row (rows =
+        /// its length divided by that), the batched kernels; `pos_buf` is then
+        /// unread. `None`: one row at `pos_buf`.
         positions: Option<&'a GpuTensor>,
         n_heads: usize,
         n_kv_heads: usize,
@@ -206,6 +207,23 @@ pub enum Step<'a> {
     BlockStage(crate::pipeline::mla::rows::BlockStageOp<'a>),
     /// Row-batched sliding-window KV staging of each row's visible window.
     SwaStage(crate::pipeline::mla::rows::SwaStageOp<'a>),
+    /// One mHC stream-mixing stage (Raon: route+aggregate, postmix, mean, broadcast, capture).
+    StreamMix(crate::pipeline::stream_mix::StreamMixOp<'a>),
+    /// One latent (NoPE MLA) attention stage over the latent cache / expanded mirror.
+    LatentAttention(crate::pipeline::latent_attention::LatentAttentionOp<'a>),
+    /// Raon RDA layer stage: the vector-decay gated delta core over projected
+    /// rows, or the partial-accept rollback (recurrence + conv-history rebuild).
+    #[cfg(feature = "deltanet")]
+    Rda(crate::pipeline::rda::RdaStage<'a>),
+    /// Sigmoid top-k grouped MoE with a shared expert and SiTU activation.
+    GroupedMoe(crate::pipeline::moe_program::GroupedMoeOp<'a>),
+    /// Dense gated FFN on the grouped-MoE arithmetic (one slot, no router).
+    GatedFfn(crate::pipeline::moe_program::GatedFfnOp<'a>),
+    /// Projections of one input plane with a BF16 output boundary and a tiered activation.
+    BoundaryProject(crate::pipeline::boundary_project::BoundaryProjectOp<'a>),
+    /// One stage of a bidirectional encoder trunk over segmented rows.
+    #[cfg(feature = "deltanet")]
+    Encoder(crate::pipeline::encoder::EncoderOp<'a>),
 }
 
 /// Op-kind for fusion matching. Composite and opaque MoE operations are
@@ -268,9 +286,16 @@ fn op_kind(step: &Step) -> Option<PipelineOp> {
         | Step::RingKv(_)
         | Step::BlockStage(_)
         | Step::SwaStage(_)
+        | Step::StreamMix(_)
+        | Step::LatentAttention(_)
+        | Step::GroupedMoe(_)
+        | Step::GatedFfn(_)
+        | Step::BoundaryProject(_)
         | Step::CompressorProject(_) => None,
         #[cfg(feature = "deltanet")]
         Step::DeltaNetMixer(_) | Step::GatedAttention(_) => None,
+        #[cfg(feature = "deltanet")]
+        Step::Rda(_) | Step::Encoder(_) => None,
     }
 }
 
@@ -898,6 +923,16 @@ pub fn validate_steps<'a>(gpu: &Gpu, steps: &[Step<'a>]) -> Result<(), DispatchE
             Step::Project(op) => op.validate_for_gpu(gpu)?,
             Step::BroadcastAdd(op) => op.validate_for_gpu(gpu)?,
             Step::GatedMlp(op) => op.validate_for_gpu(gpu)?,
+            Step::Rope {
+                q,
+                k,
+                positions,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                rope,
+                ..
+            } => rope.validate_step(*positions, q, k, *n_heads, *n_kv_heads, *head_dim)?,
             Step::SandwichAttention(op) => op.validate_for_gpu(gpu)?,
             Step::SandwichMlp(op) => op.validate_for_gpu(gpu)?,
             Step::ParallelMoeMlp(op) => op.validate_for_gpu(gpu)?,
@@ -933,6 +968,15 @@ pub fn validate_steps<'a>(gpu: &Gpu, steps: &[Step<'a>]) -> Result<(), DispatchE
             Step::SparseAttention(op) => op.validate_for_gpu(gpu)?,
             Step::OLora(op) => op.validate_for_gpu(gpu)?,
             Step::CompressorProject(op) => op.validate_for_gpu(gpu)?,
+            Step::StreamMix(op) => op.validate()?,
+            Step::LatentAttention(op) => op.validate_for_gpu(gpu)?,
+            #[cfg(feature = "deltanet")]
+            Step::Rda(op) => op.validate_for_gpu(gpu)?,
+            Step::GroupedMoe(op) => op.validate_for_gpu(gpu)?,
+            Step::GatedFfn(op) => op.validate_for_gpu(gpu)?,
+            Step::BoundaryProject(op) => op.validate_for_gpu(gpu)?,
+            #[cfg(feature = "deltanet")]
+            Step::Encoder(op) => op.validate_for_gpu(gpu)?,
             // Rows-only DS4 operations have one route; a window holds rows.
             Step::EmbedStreams(crate::pipeline::mla::rows::EmbedStreamsOp { rows: 0, .. })
             | Step::SwaStage(crate::pipeline::mla::rows::SwaStageOp { rows: 0, .. })
@@ -2012,7 +2056,7 @@ pub(crate) fn launch_op_rows(
                 *n_heads,
                 *n_kv_heads,
                 *head_dim,
-                positions.numel(),
+                positions.numel() / rope.positions_per_row(),
             ),
             None => rope.apply_row(gpu, q, k, pos_buf, *n_heads, *n_kv_heads, *head_dim),
         },
@@ -2100,6 +2144,19 @@ pub(crate) fn launch_op_rows(
         Step::RingKv(op) => crate::pipeline::mla::rows::execute_ring_kv(gpu, op),
         Step::BlockStage(op) => crate::pipeline::mla::rows::execute_block_stage(gpu, op),
         Step::SwaStage(op) => crate::pipeline::mla::rows::execute_swa_stage(gpu, op),
+        Step::StreamMix(op) => crate::pipeline::stream_mix::execute_stream_mix(gpu, op),
+        Step::LatentAttention(op) => {
+            crate::pipeline::latent_attention::execute_latent_attention(gpu, op)
+        }
+        #[cfg(feature = "deltanet")]
+        Step::Rda(stage) => crate::pipeline::rda::execute_rda_stage(gpu, stage),
+        Step::GroupedMoe(op) => crate::pipeline::moe_program::execute_grouped_moe(gpu, op),
+        Step::GatedFfn(op) => crate::pipeline::moe_program::execute_gated_ffn(gpu, op),
+        Step::BoundaryProject(op) => {
+            crate::pipeline::boundary_project::execute_boundary_project(gpu, op)
+        }
+        #[cfg(feature = "deltanet")]
+        Step::Encoder(op) => crate::pipeline::encoder::execute_encoder(gpu, op),
     }
 }
 fn rmsnorm_out<'a>(step: &Step<'a>) -> &'a rdna_compute::GpuTensor {

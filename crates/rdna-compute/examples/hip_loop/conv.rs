@@ -235,7 +235,7 @@ impl Node for ConvRows {
             symbol: SYMBOL.to_owned(),
             extra_flags: String::new(),
             selection: "crates/rdna-compute/src/gated_delta_vector.rs causal_conv_depthwise_rows \
-                        (Raon: crates/hipfire-arch-raon/src/rda.rs)"
+                        (Raon: crates/hipfire-dispatch/src/pipeline/rda.rs)"
                 .to_owned(),
         })
     }

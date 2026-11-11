@@ -82,6 +82,7 @@ pub mod config;
 pub mod forward;
 pub mod names;
 pub mod post;
+pub(crate) mod program;
 pub mod slot_engine;
 pub mod state;
 pub mod vision;

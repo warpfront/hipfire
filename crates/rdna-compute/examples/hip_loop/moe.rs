@@ -15,10 +15,10 @@
 //! `(expert_weight_ptrs, expert_tile_ids, sorted_slot_index, X_f16, Y_f32, M, K, x_row_div, m_total,
 //! n_experts)` = 5 pointers (0..40) + 5 i32 (40..60); `n_experts = moe_expert_table_len(table) = table bytes / 8`.
 //!
-//! Raon reaches it from `hipfire-arch-raon/src/forward.rs:529` (`ffn_block`) -> `moe.rs:436` `forward_moe` ->
-//! `hipfire-dispatch/src/pipeline/moe_program.rs:7287` `execute_grouped_moe` (rows > 1 resolves
-//! `GroupedMoeProtocol::Auto` to the Grouped core, `:6598-6608`) and, for the dense layer and the shared
-//! expert, `moe.rs:504` `forward_dense` / `moe_program.rs:7086` `gated_ffn_from_basis` (qt44 weights + rows >= 2
+//! Raon reaches it from `hipfire-arch-raon/src/program.rs` (`ffn_step`, a `Step::GroupedMoe`) ->
+//! `hipfire-dispatch/src/pipeline/moe_program.rs` `execute_grouped_moe` (prefill rows take the
+//! `GroupedMoeProtocol::Grouped` core) and, for the dense layer and the shared
+//! expert, `Step::GatedFfn` / `moe_program.rs` `gated_ffn_from_basis` (qt44 weights + rows >= 2
 //! + BF16 policy + WMMA arch -> single-expert grouping tables, `:7111-7139`). Raon dims (`moe.rs:61`):
 //! 128 experts, top-6, hidden 2560, logical expert width 1088 (down K padded to 1280), dense width 12032,
 //! 25 layers of which layer 0 is dense (`config.rs:460`, `first_k_dense_replace = 1`) = 24 MoE layers.

@@ -123,6 +123,7 @@ impl<'a> Bufs<'a> {
                 rotation: Some(rotation),
                 ladder: ProjectLadder::Gemm,
                 residual: None,
+                grouped: None,
             }),
         }
     }
@@ -145,6 +146,7 @@ impl<'a> Bufs<'a> {
                 rotation: Some(rotation),
                 ladder: ProjectLadder::Gemm,
                 residual: Some(self.h),
+                grouped: None,
             }),
         }
     }
@@ -470,6 +472,7 @@ pub(crate) fn head_steps<'a>(
             rotation: Some(lm_rotation),
             ladder: ProjectLadder::GemmLmHead,
             residual: None,
+            grouped: None,
         }),
     };
     vec![b.norm(&weights.embedding_norm, b.head_in, cfg), head]

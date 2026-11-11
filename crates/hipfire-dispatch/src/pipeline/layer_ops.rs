@@ -6538,6 +6538,7 @@ enum EmbeddingPath {
     Mq4V2,
     Bf16,
     Q8,
+    F32,
     Hfq4G256,
     Hfq4G128,
 }
@@ -6547,6 +6548,7 @@ fn embedding_path(dtype: DType) -> Option<EmbeddingPath> {
         DType::MQ4G256V2 | DType::MQ4G128V2 => Some(EmbeddingPath::Mq4V2),
         DType::BF16 => Some(EmbeddingPath::Bf16),
         DType::Q8_0 => Some(EmbeddingPath::Q8),
+        DType::F32 => Some(EmbeddingPath::F32),
         DType::HFQ4G256 => Some(EmbeddingPath::Hfq4G256),
         DType::HFQ4G128 => Some(EmbeddingPath::Hfq4G128),
         _ => None,
@@ -6594,6 +6596,7 @@ pub fn execute_embedding(gpu: &mut Gpu, op: &EmbeddingOp<'_>) -> Result<(), Disp
             gpu.embedding_lookup_bf16_batched(table, output, ids, op.rows, op.dim)
         }
         EmbeddingPath::Q8 => gpu.embedding_lookup_q8_batched(table, output, ids, op.rows, op.dim),
+        EmbeddingPath::F32 => gpu.embedding_lookup_f32_batched(table, output, ids, op.rows, op.dim),
         EmbeddingPath::Hfq4G256 => {
             gpu.embedding_lookup_hfq4g256_batched(table, output, ids, op.rows, op.dim)
         }
@@ -6670,6 +6673,21 @@ pub enum ProjectLadder {
     /// HFQ6 / HFQ3 payloads and their MQ rotations). Q8, F32 and BF16 keep
     /// the `Gemm` arms. No calibration tap, except the BF16 MFMA arm's.
     GemmLmHead,
+    /// Q8_0 only: on WMMA archs with `k % 32 == 0` the activation is converted
+    /// to F16 into the op's `rotation` scratch (`rows * k` F16), then
+    /// `gemm_q8_0_wmma`; otherwise the [`Self::Gemm`] Q8 arm. No calibration
+    /// tap (`run_q8_projection_fresh`). Cohere2-MoE prefill.
+    GemmQ8Fp16,
+    /// MQ2G256LloydU only: the activation is converted to F16 into the op's
+    /// `rotation` scratch (`rows * k` F16), then the grouped MoE WMMA GEMM runs
+    /// the weight as one dense expert over [`ProjectOp::grouped`]. Maple prefill.
+    GroupedLloydF16,
+    /// F16 weight, F32 activation and output (the Qwen3.5 embedding encoder). On
+    /// wave32 WMMA with `k % 64 == 0 && m >= 256` (unless `HIPFIRE_EMBED_GEMM=f32`)
+    /// the activation is converted to F16 into the op's `rotation` scratch
+    /// (`rows * k` F16) for the LDS-tiled GEMM (gfx1201: split-K 1); other shapes
+    /// run `gemm_f16_wmma_mb8`, non-WMMA archs naive `gemm_f16` + a transpose.
+    EncoderF16,
 }
 
 /// One projection over `rows` row-major input rows on its [`ProjectLadder`],
@@ -6680,11 +6698,27 @@ pub struct ProjectOp<'a> {
     pub input: &'a GpuTensor,
     pub output: &'a GpuTensor,
     pub rows: usize,
-    /// FWHT basis scratch (`rows * k`), required by the rotated payloads.
+    /// Ladder scratch of `rows * k`: the F32 FWHT basis of the rotated
+    /// payloads, or the F16 activation copy of [`ProjectLadder::GemmQ8Fp16`]
+    /// and [`ProjectLadder::GroupedLloydF16`].
     pub rotation: Option<&'a GpuTensor>,
     pub ladder: ProjectLadder,
     /// F32 `[rows, m]`, distinct from `output`.
     pub residual: Option<&'a GpuTensor>,
+    /// The one-expert grouped tables of [`ProjectLadder::GroupedLloydF16`];
+    /// `None` on every other ladder.
+    pub grouped: Option<DenseGroupedTables<'a>>,
+}
+
+/// A dense projection driven through the grouped MoE GEMM as a single expert.
+#[derive(Clone, Copy)]
+pub struct DenseGroupedTables<'a> {
+    /// `[2]` F32 holding the weight's device pointer (a one-entry table).
+    pub expert_ptrs: &'a GpuTensor,
+    /// I32 expert id per 16-row tile, all zero, for `align16(rows)` rows.
+    pub tile_ids: &'a GpuTensor,
+    /// I32 slot per padded row: the row index for live rows, -1 on the tail.
+    pub slot_index: &'a GpuTensor,
 }
 
 impl ProjectOp<'_> {
@@ -6700,6 +6734,35 @@ impl ProjectOp<'_> {
         ) {
             require_weight(&self.weight, m, k, "projection")?;
         }
+        if self.ladder == ProjectLadder::EncoderF16
+            && (self.weight.dtype != DType::F16
+                || self.weight.buf.dtype != DType::F16
+                || self.weight.buf.numel() < checked_mul(m, k, "F16 weight")?
+                || k == 0
+                || k % 16 != 0)
+        {
+            return Err(DispatchError::Hip(format!(
+                "EncoderF16 projection takes an F16 [{m}, {k}] weight with k % 16 == 0, got {:?} over a {:?} buffer",
+                self.weight.dtype, self.weight.buf.dtype
+            )));
+        }
+        if self.ladder == ProjectLadder::GemmQ8Fp16 && self.weight.dtype != DType::Q8_0 {
+            return Err(DispatchError::Hip(format!(
+                "GemmQ8Fp16 projection refuses a {:?} weight",
+                self.weight.dtype
+            )));
+        }
+        // The grouped tables belong to exactly the grouped ladder, which
+        // decodes only the unrotated MQ2-Lloyd payload.
+        let grouped_ladder = self.ladder == ProjectLadder::GroupedLloydF16;
+        if grouped_ladder != self.grouped.is_some()
+            || (grouped_ladder && self.weight.dtype != DType::MQ2G256LloydU)
+        {
+            return Err(DispatchError::Hip(format!(
+                "GroupedLloydF16 projection takes exactly an MQ2G256LloydU weight with grouped tables ({:?} {:?})",
+                self.ladder, self.weight.dtype
+            )));
+        }
         let input = checked_mul(self.rows, k, "projection input")?;
         require_tensor(self.input, input, DType::F32, "projection input")?;
         let output = checked_mul(self.rows, m, "projection output")?;
@@ -6710,6 +6773,36 @@ impl ProjectOp<'_> {
         let rotated = match self.ladder {
             ProjectLadder::Trunk | ProjectLadder::TrunkRowExact => {
                 !matches!(self.weight.dtype, DType::BF16 | DType::Q8_0)
+            }
+            ProjectLadder::GemmQ8Fp16 | ProjectLadder::EncoderF16 => {
+                let scratch = self.rotation.ok_or_else(|| {
+                    DispatchError::Hip(format!("{:?} projection needs F16 scratch", self.ladder))
+                })?;
+                require_tensor(scratch, input, DType::F16, "projection F16 scratch")?;
+                false
+            }
+            ProjectLadder::GroupedLloydF16 => {
+                let scratch = self.rotation.ok_or_else(|| {
+                    DispatchError::Hip("GroupedLloydF16 projection needs F16 scratch".into())
+                })?;
+                require_tensor(scratch, input, DType::F16, "projection F16 scratch")?;
+                let tables = self.grouped.as_ref().expect("checked above");
+                let padded = self.rows.div_ceil(16) * 16;
+                require_tensor(
+                    self.output,
+                    padded * m,
+                    DType::F32,
+                    "grouped projection output",
+                )?;
+                require_tensor(tables.expert_ptrs, 2, DType::F32, "grouped expert pointer")?;
+                if tables.tile_ids.buf.size() < padded / 16 * 4
+                    || tables.slot_index.buf.size() < padded * 4
+                {
+                    return Err(DispatchError::Hip(format!(
+                        "grouped projection tables are below {padded} padded rows"
+                    )));
+                }
+                false
             }
             ladder => gemm_ladder_rotation(self.weight.dtype, ladder == ProjectLadder::GemmLmHead)?,
         };
@@ -6750,6 +6843,40 @@ pub fn execute_project(gpu: &mut Gpu, op: &ProjectOp<'_>) -> Result<(), Dispatch
             }
         }
         ProjectLadder::Gemm | ProjectLadder::GemmLmHead => project_gemm(gpu, op)?,
+        ProjectLadder::EncoderF16 => project_f16(gpu, op)?,
+        ProjectLadder::GemmQ8Fp16 => {
+            let w = &op.weight;
+            let scratch = op.rotation.ok_or_else(|| {
+                DispatchError::Hip("GemmQ8Fp16 projection needs F16 scratch".into())
+            })?;
+            hip(crate::families::gemm::run_q8_projection_fresh(
+                gpu, w.buf, op.input, op.output, w.m, w.k, op.rows, scratch, true,
+            ))?
+        }
+        ProjectLadder::GroupedLloydF16 => {
+            let (w, rows) = (&op.weight, op.rows);
+            let tables = op.grouped.as_ref().ok_or_else(|| {
+                DispatchError::Hip("GroupedLloydF16 projection needs grouped tables".into())
+            })?;
+            let scratch = op.rotation.ok_or_else(|| {
+                DispatchError::Hip("GroupedLloydF16 projection needs F16 scratch".into())
+            })?;
+            // An F32 X would take the grouped entry's pointer-keyed FP16 cache,
+            // which serves a stale layer when one buffer is reused per layer.
+            hip(gpu.deepseek4_convert_f32_to_f16(op.input, scratch, (rows * w.k) as i64))?;
+            hip(gpu.gemm_mq2g256_lloyd_moe_grouped_wmma(
+                tables.expert_ptrs,
+                tables.tile_ids,
+                tables.slot_index,
+                scratch,
+                op.output,
+                w.m,
+                w.k,
+                1,
+                rows.div_ceil(16) * 16,
+                rows,
+            ))?
+        }
     }
     match op.residual {
         Some(residual) => hip(gpu.add_inplace_f32(residual, op.output)),
@@ -6816,6 +6943,60 @@ fn project_gemm(gpu: &mut Gpu, op: &ProjectOp<'_>) -> Result<(), DispatchError> 
         _ => unreachable!("gemm_ladder_rotation admits only the arms above"),
     })
 }
+
+/// The [`ProjectLadder::EncoderF16`] arm of [`execute_project`].
+///
+/// The LDS-tiled macro-tile kernel takes the large shapes; mb8 is a
+/// register-blocked 32-thread block with no LDS staging (measured on gfx1101
+/// at n=4096: ~1.6 TFLOP/s, 2% of the f16 peak), right for small ones.
+fn project_f16(gpu: &mut Gpu, op: &ProjectOp<'_>) -> Result<(), DispatchError> {
+    let (w, rows, y) = (&op.weight, op.rows, op.output);
+    let (m, k) = (w.m, w.k);
+    let wmma = gpu.arch_caps.has_wmma_w32() || gpu.arch_caps.has_wmma_w32_gfx12();
+    if !wmma {
+        let yt = hip(gpu.alloc_tensor(&[m * rows], DType::F32))?;
+        let r = gpu
+            .gemm_f16(w.buf, op.input, &yt, m, k, rows)
+            .and_then(|_| gpu.transpose_f32(&yt, y, m, rows));
+        hip(gpu.free_tensor(yt))?;
+        return hip(r);
+    }
+    let tiled = k % 64 == 0
+        && m >= 256
+        && !*EMBED_GEMM_F32
+        && (gpu.arch_caps.has_wmma_w32() || gpu.arch == "gfx1201");
+    if !tiled {
+        return hip(gpu.gemm_f16_wmma_mb8(w.buf, op.input, y, m, k, rows));
+    }
+    let n = checked_mul(rows, k, "F16 activation")?;
+    let scratch = op
+        .rotation
+        .ok_or_else(|| DispatchError::Hip("EncoderF16 projection needs F16 scratch".into()))?;
+    let x16 = view(scratch, 0, n);
+    hip(gpu.cast_f32_to_f16(&view(op.input, 0, n), &x16))?;
+    hip(if gpu.arch == "gfx1201" {
+        gpu.gemm_f16_x_f16_wmma_lds_splitk(w.buf, &x16, y, m, k, rows, encoder_gfx1201_tile(m))
+    } else {
+        gpu.gemm_f16_x_f16_wmma_lds_auto(w.buf, &x16, y, None, m, k, rows)
+    })
+}
+
+fn encoder_gfx1201_tile(m: usize) -> rdna_compute::gemm::LdsTileSplitK {
+    use rdna_compute::gemm::LdsTileSplitK;
+    match m {
+        0..512 => LdsTileSplitK::new(64, 128, 32, 64, true, 1),
+        512..1024 => LdsTileSplitK::new(128, 128, 32, 64, false, 1),
+        _ => LdsTileSplitK::new(128, 256, 32, 64, false, 1),
+    }
+}
+
+/// `HIPFIRE_EMBED_GEMM=f32|mb8`: every [`ProjectLadder::EncoderF16`] projection on
+/// `gemm_f16_wmma_mb8`.
+static EMBED_GEMM_F32: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_EMBED_GEMM")
+        .ok()
+        .is_some_and(|v| matches!(v.as_str(), "f32" | "mb8"))
+});
 
 /// Largest causal window the gated short-convolution kernel holds per thread.
 pub const GATED_SHORT_CONV_MAX_KERNEL: usize = 8;
@@ -7128,6 +7309,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn encoder_gfx1201_projection_tiles_are_supported_unsplit_entries() {
+        for (m, entry) in [
+            (256, "qwen4_wmma_lds_64_128_32_64_k64_p"),
+            (511, "qwen4_wmma_lds_64_128_32_64_k64_p"),
+            (512, "qwen4_wmma_lds_128_128_32_64_k64"),
+            (1023, "qwen4_wmma_lds_128_128_32_64_k64"),
+            (1024, "qwen4_wmma_lds_128_256_32_64_k64"),
+            (4096, "qwen4_wmma_lds_128_256_32_64_k64"),
+        ] {
+            let tile = encoder_gfx1201_tile(m);
+            assert_eq!(tile.split, 1);
+            assert_eq!(tile.ks, 64);
+            assert_eq!(tile.entry(), entry);
+        }
+    }
+
+    #[test]
     fn exact_route_uses_the_admitted_eager_limit_not_storage_capacity() {
         for limit in [8, 9, 16, 32, 63, 64] {
             for rows in 1..=65 {
@@ -7309,7 +7507,8 @@ mod tests {
 
     #[test]
     fn embedding_dispatch_rejects_unadmitted_dtype() {
-        assert!(embedding_path(DType::F32).is_none());
+        assert!(embedding_path(DType::F16).is_none());
+        assert_eq!(embedding_path(DType::F32), Some(EmbeddingPath::F32));
     }
 
     #[test]

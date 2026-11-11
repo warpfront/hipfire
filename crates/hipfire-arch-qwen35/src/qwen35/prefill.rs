@@ -5241,6 +5241,7 @@ fn build_moe_prefill_params<'a>(
         ep_layer_idx: 0,
         ep_tile_exchange: None,
         expert_iu4: ffn.expert_iu4,
+        mq2_lloyd: None,
     };
     Ok((bound, moe_prefill_params))
 }

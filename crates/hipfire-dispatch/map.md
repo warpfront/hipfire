@@ -34,12 +34,14 @@ Conventions for the `Step` program a model family declares. Decided in HIPF-86 a
    - No `*Rows` twin steps, no per-family rows sub-enum, and no decode-only composite next to a rows decomposition of the same sublayer: decode and prefill of a layer expose the same `OpKind` set.
    - Rows projection of sandwich models is `sandwich::gemm_rows` (one definition; `Ladder::Wide` or a `RowsRoute`).
 3. **RoPE** is described by `sandwich::Rope { kind, theta }`, and `Step::Rope` carries it as `rope` (#884).
-4. **MoE routing** goes through sealed MoE (`Step::Moe`). The biased sigmoid selection (`MoeSelectionBias`, `src/families/moe.rs`) is defined once.
+4. **MoE routing** goes through sealed MoE (`Step::Moe`). The routing math is the `MoeRecipe` (`SoftmaxGatedShared`, `SigmoidRoutedNoShared`, `SoftmaxRoutedNoShared`); the biased sigmoid selection (`MoeSelectionBias`, `src/families/moe.rs`) is defined once; model-owned MQ2-Lloyd experts (DS4 qt19, Maple qt51) are declared by `MoeMq2Lloyd` (SwiGLU clamp, down-combine policy) on both `MoeParams` and `MoePrefillParams`.
 5. **Existing families come first.** DFlash draft attention uses `AttentionFamily::run_full_attention` (or `run_full_attention_on` to pin a tile). Fused SiLU·up + FWHT uses `RotationFamily` with `RotationVariant::WithSwiGLU`. Device copies are recorded launches (`copy_f32_buffer`), never `hip.memcpy_dtod`.
-6. **Standard pre-norm decoders** (LFM2, MiniMax) keep the llama-style primitive steps (`RmsnormAutomatic`, `Gemv`, `QkNorm`, `Rope`, `Attend`, `GemvResidual`). A dense gated FFN is `Step::GatedMlp` (#929).
+6. **Standard pre-norm decoders** (LFM2, MiniMax, Maple) keep the llama-style primitive steps (`RmsnormAutomatic`, `Gemv`, `QkNorm`, `Rope`, `Attend`, `GemvResidual`; batched rows use `Step::Project` on a `ProjectLadder`). A dense gated FFN is `Step::GatedMlp` (#929).
 7. **Row norms are row norms.** A hidden-width RMSNorm over `rows` rows uses `Step::RmsnormAutomatic` with `rows` (`OpKind::RmsnormAutomatic`, `SplitRule::RowComplete`), never `Step::QkNorm`, which is `HeadLocal`.
 8. **Every new `Step` variant gets an appended `OpKind` ID** in `src/pipeline/step_graph.rs`, and `op_kind_ids_frozen` is extended. IDs are never renumbered or reused: `18` (`DenseFfn`) and `20` (the first `SandwichMlp`) were retired when those ops folded into `GatedMlp = 28`, and the later `Step::SandwichMlp` took the appended ID `31`, not `20`. A hand-route ID that already exists (e.g. `OpKind::SiluMul = 1001`) is reused for its op rather than given a second ID.
 9. **Every op validates.** Each `Step` operand has `validate_for_gpu` (geometry, route/rows consistency, cache bounds, scratch sizes), and `validate_steps` (`src/pipeline/steps.rs`) calls it.
+10. **Hyper-connected hybrids (Raon-1-mini, #666 G18)** declare their sites with ops of their own, because no existing step launches the same kernels: mHC stages are `Step::StreamMix` (bounded-Helmert route+aggregate, postmix, mean, broadcast, carrier capture; DS4 `HcPre`/`HcPost`/`HcHead` are the Sinkhorn chart and stay separate), NoPE MLA stages are `Step::LatentAttention` (latent cache + expanded K/V mirror; DS4's MLA steps carry RoPE, an SWA ring and compressed rows), the vector-decay RDA core and its partial-accept rollback are `Step::Rda` (`RdaStage::{Layer, Rollback}`; per-key-channel decay, three separate convs; `Step::GatedDeltaNet` is the scalar-gate Qwen35 mixer), the SiTU FFNs are `Step::GroupedMoe` / `Step::GatedFfn` (sealed `Step::Moe` has no fused sigmoid+bias+renorm top-6 router with a shared expert and no SiTU activation), and BF16-boundary projections are `Step::BoundaryProject` on an explicit `RowsRoute`. Inside `Rda`, `StreamMix`, `LatentAttention` and `GatedFfn` the row count still picks kernels (wave/segment floors, the fused-mHC and tiled floors, the `rows == 1` split-KV decode and decode GEMVs); those thresholds are receipted selectors, the documented exception to rule 2.
+11. **Bidirectional encoders (Qwen3.5 multi-vector embedding, #666 G19; EmbeddingGemma 2, G20)** run one encode pass over a row block of back-to-back sequences (`encoder::EncoderSegment`), so they have no decode route, no KV cache and no rows ladder. The standard steps carry the row-independent parts: row norms `RmsnormAutomatic`, per-head QK norms `QkNorm`, SiLU·up `SiluMul`, every projection `Step::Project` on `ProjectLadder::EncoderF16` (F16 weight, F32 activation, the F16 activation copy in the op's `rotation` scratch; `HIPFIRE_EMBED_GEMM=f32` forces mb8), and interleaved mRoPE `Step::Rope` with `RopeKind::Mrope { rot_dim, section }` (`[rows][3]` positions, batched only). The stages with no shared kernel are `Step::Encoder(EncoderOp)`: per-segment bidirectional attention with masked padding keys (`Attention`), the output gate, and the GDN stages (`AlphaGate`, `ConvSplit`, `QkL2`, `Scan`, `GatedNorm`), where conv and scan zero their state at each segment's start. The Qwen35 decoder ops (`DeltaNetMixer`, `GatedAttention`, the batched prefill views) assume quantized weight ladders, a causal KV cache and one sequence per call, so the encoder does not share them. Inside `Attention` the shape still picks kernels (eager GEMM attention at `rows % 64 == 0 && rows >= 256`, see `encoder::padded_rows`), and inside `EncoderF16` the LDS projection takes `k % 64 == 0 && m >= 256`: the same receipted-selector exception as rule 10. The EmbeddingGemma 2 sandwich trunk is the same steps with fields, not Gemma 4's `SandwichAttention` / `GatedMlp` / `PerLayerInput` (those take quantized `WeightRef` ladders and a causal KV cache): the branch post-norm before the residual add is `EncoderOp::PostNormResidual` after the projection, the attention scale (1.0 behind QK norms; the Q-tiled kernel serves only `1/sqrt(head_dim)`) and the sliding radius are `Attention { scale, window }` (decided by `encoder::attention_path`: the band mask exists only on the eager route, every other route refuses a window that restricts the padded segment), the gated gelu-tanh is `GeluMul`, the PLE gate `PerLayerGate`, RoPE `Step::Rope` with `RopeKind::PartialHalved`, and `layer_scalar` / the PLE scale `Step::Scale`.
 
 ## Crate map
 
@@ -606,6 +608,14 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `DeltaNetMoeLayerView`
   - `execute_attention_moe_layer_batched`
   - `execute_deltanet_moe_layer_batched`
+- [`src/pipeline/boundary_project.rs`](src/pipeline/boundary_project.rs)
+  - `BoundaryProjection`
+  - `BoundaryProjectOp`
+  - `execute_boundary_project`
+  - `OutRound`
+  - `ProjectShare`
+  - `validate`
+  - `validate_for_gpu`
 - [`src/pipeline/draft_head.rs`](src/pipeline/draft_head.rs)
   - `allocation_sizes`
   - `device_bytes`
@@ -633,6 +643,18 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `rows`
   - `set_request_state`
   - `set_shard`
+- [`src/pipeline/encoder.rs`](src/pipeline/encoder.rs)
+  - `attention_gemm_ld`
+  - `attention_lds_tile`
+  - `attention_pv_tiles`
+  - `attention_qk_tiles`
+  - `AttnScale`
+  - `EncoderHeads`
+  - `EncoderOp`
+  - `EncoderSegment`
+  - `execute_encoder`
+  - `padded_rows`
+  - `validate_for_gpu`
 - [`src/pipeline/gated_mlp.rs`](src/pipeline/gated_mlp.rs)
   - `Activation`
   - `down`
@@ -695,10 +717,13 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `row_width`
   - `RowRange`
   - `rows_route`
+  - `validate`
+  - `validate_for_gpu`
 - [`src/pipeline/layer_ops.rs`](src/pipeline/layer_ops.rs)
   - `BroadcastAddOp`
   - `ClearOp`
   - `CoreWindow`
+  - `DenseGroupedTables`
   - `EmbeddingOp`
   - `execute_argmax`
   - `execute_broadcast_add`
@@ -891,12 +916,14 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `batched_attention`
   - `batched_deltanet`
   - `batched_moe`
+  - `boundary_project`
   - `can_satisfy`
   - `check_moe_decode_batch_size`
   - `check_moe_decode_supported`
   - `dispatch_fused`
   - `draft_head`
   - `dump_hidden_localize`
+  - `encoder`
   - `execute_pipeline`
   - `gated_mlp`
   - `hybrid`
@@ -913,6 +940,7 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `PipelineParams`
   - `projection_split`
   - `q8_prefill`
+  - `rda`
   - `routed_down_rotation`
   - `RoutedDownRotation`
   - `router_observer`
@@ -998,6 +1026,7 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `SharedExpertPolicy`
   - `SingleExpertTableCache`
   - `validate`
+  - `validate_for_gpu`
   - `with_tier`
 - [`src/pipeline/mq8_attn.rs`](src/pipeline/mq8_attn.rs)
   - `mq8_acts_current`
@@ -1028,6 +1057,34 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `q8_0_weight_admits`
   - `Q8PrefillRun`
 - [`src/pipeline/qt44_qt53_prefill.rs`](src/pipeline/qt44_qt53_prefill.rs)
+- [`src/pipeline/rda.rs`](src/pipeline/rda.rs)
+  - `execute_rda`
+  - `execute_rda_recurrence`
+  - `execute_rda_rollback`
+  - `execute_rda_stage`
+  - `new`
+  - `proj`
+  - `raon`
+  - `RDA_CHUNK_SCRATCH_ROWS`
+  - `rda_forward_rows`
+  - `rda_forward_rows_taped`
+  - `RDA_SEGMENT_ROWS`
+  - `RDA_WAVE_MIN_ROWS`
+  - `RdaGeometry`
+  - `RdaHistoryRebuild`
+  - `RdaLayer`
+  - `RdaLayerState`
+  - `RdaOp`
+  - `RdaProjected`
+  - `RdaRecurrenceOp`
+  - `RdaRollbackOp`
+  - `RdaScratch`
+  - `RdaStage`
+  - `RdaTape`
+  - `required_bytes`
+  - `state_elems`
+  - `validate`
+  - `validate_for_gpu`
 - [`src/pipeline/router_observer.rs`](src/pipeline/router_observer.rs)
   - `clear`
   - `RouterRouteObservation`
@@ -1573,6 +1630,7 @@ Workspace crates with a path dependency on this crate:
 
 - `hipfire-arch-cohere2moe`
 - `hipfire-arch-deepseek4`
+- `hipfire-arch-embeddinggemma2`
 - `hipfire-arch-gemma4`
 - `hipfire-arch-lfm2moe`
 - `hipfire-arch-llama`
@@ -1581,6 +1639,7 @@ Workspace crates with a path dependency on this crate:
 - `hipfire-arch-muse-glimmer`
 - `hipfire-arch-qwen2`
 - `hipfire-arch-qwen35`
+- `hipfire-arch-qwen35-embed`
 - `hipfire-arch-qwen4`
 - `hipfire-arch-raon`
 - `hipfire-cli`

@@ -672,6 +672,13 @@ pub enum RopeKind {
     /// Rotate-half over the first `rot_dim` channels of each head (pair
     /// `(i, i + rot_dim / 2)`); channels `rot_dim..` pass through.
     PrefixHalfSplit { rot_dim: usize },
+    /// GPT-J pairing `(2i, 2i + 1)` over the first `rot_dim` channels of each
+    /// head; channels `rot_dim..` pass through (Cohere2).
+    Interleaved { rot_dim: usize },
+    /// Interleaved (t, h, w) multimodal RoPE, rotate-half over the first
+    /// `rot_dim` channels of each head with the frequency bands split by
+    /// `section`; positions are `[rows][3]` I32 (Qwen3.5). Batched rows only.
+    Mrope { rot_dim: usize, section: [usize; 3] },
     /// No rotation (NoPE layers).
     NoPe,
 }
@@ -683,14 +690,105 @@ pub struct Rope {
 }
 
 impl Rope {
+    /// The rotated channel span must be an even, non-zero prefix of the head
+    /// (the prefix kernels divide by it and index pairs below it);
+    /// `PartialHalved` may rotate zero pairs.
+    pub(crate) fn validate(&self, head_dim: usize) -> Result<(), DispatchError> {
+        let span = match self.kind {
+            RopeKind::RotateHalf | RopeKind::NoPe => return Ok(()),
+            // Batched rows only; `validate_rows` checks its `rot_dim` and `section`.
+            RopeKind::Mrope { .. } => return Ok(()),
+            RopeKind::PartialHalved { rot_pairs } if 2 * rot_pairs <= head_dim => return Ok(()),
+            RopeKind::PartialHalved { rot_pairs } => 2 * rot_pairs,
+            RopeKind::PrefixHalfSplit { rot_dim } | RopeKind::Interleaved { rot_dim } => rot_dim,
+        };
+        if span == 0 || span % 2 != 0 || span > head_dim {
+            return Err(DispatchError::Hip(format!(
+                "rope {:?}: rotated span {span} must be even and in 2..={head_dim}",
+                self.kind
+            )));
+        }
+        Ok(())
+    }
+
     /// Rotated pairs in the whole-head rotate-half pairing; `None` when the
     /// pairing is a prefix of the head.
     fn halved_pairs(&self, head_dim: usize) -> Option<usize> {
         match self.kind {
             RopeKind::RotateHalf => Some(head_dim / 2),
             RopeKind::PartialHalved { rot_pairs } => Some(rot_pairs),
-            RopeKind::PrefixHalfSplit { .. } => None,
+            RopeKind::PrefixHalfSplit { .. }
+            | RopeKind::Interleaved { .. }
+            | RopeKind::Mrope { .. } => None,
             RopeKind::NoPe => Some(0),
+        }
+    }
+
+    /// Position entries per row: 3 for [`RopeKind::Mrope`], else 1.
+    pub(crate) fn positions_per_row(&self) -> usize {
+        match self.kind {
+            RopeKind::Mrope { .. } => 3,
+            _ => 1,
+        }
+    }
+
+    /// Launch-free checks of a batched RoPE: whole rows of positions, Q/K
+    /// holding those rows, and an mRoPE `rot_dim`/`section` the kernel reads.
+    pub(crate) fn validate_rows(
+        &self,
+        positions: &GpuTensor,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<(), DispatchError> {
+        let per_row = self.positions_per_row();
+        let rows = positions.numel() / per_row;
+        let elems = |heads: usize| rows.checked_mul(heads)?.checked_mul(head_dim);
+        let fits = |t: &GpuTensor, heads: usize| elems(heads).is_some_and(|n| t.numel() >= n);
+        if positions.numel() % per_row != 0
+            || !fits(q, n_heads)
+            || (n_kv_heads > 0 && !fits(k, n_kv_heads))
+        {
+            return Err(DispatchError::Hip(format!(
+                "rope: {} positions ({per_row}/row), q {} / k {} elements for {n_heads}/{n_kv_heads} heads of {head_dim}",
+                positions.numel(),
+                q.numel(),
+                k.numel()
+            )));
+        }
+        if let RopeKind::Mrope { rot_dim, section } = self.kind {
+            if rot_dim > head_dim
+                || rot_dim % 2 != 0
+                || section.iter().sum::<usize>() != rot_dim / 2
+            {
+                return Err(DispatchError::Hip(format!(
+                    "rope: mRoPE rot_dim {rot_dim} / section {section:?} invalid for head_dim {head_dim}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Every launch-free check of a `Step::Rope`: the rotated span on both
+    /// routes, the row extents when batched; mRoPE has no single-row route.
+    pub(crate) fn validate_step(
+        &self,
+        positions: Option<&GpuTensor>,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<(), DispatchError> {
+        self.validate(head_dim)?;
+        match positions {
+            Some(p) => self.validate_rows(p, q, k, n_heads, n_kv_heads, head_dim),
+            None if matches!(self.kind, RopeKind::Mrope { .. }) => Err(DispatchError::Hip(
+                "mRoPE has no single-row route; pass per-row positions".into(),
+            )),
+            None => Ok(()),
         }
     }
 
@@ -710,6 +808,11 @@ impl Rope {
         let theta = self.theta;
         match self.kind {
             RopeKind::NoPe => Ok(()),
+            RopeKind::Mrope { .. } => {
+                return Err(DispatchError::Hip(
+                    "mRoPE has no single-row route; pass per-row positions".into(),
+                ))
+            }
             RopeKind::RotateHalf => {
                 gpu.rope_f32(q, k, pos_buf, n_heads, n_kv_heads, head_dim, theta)
             }
@@ -741,6 +844,11 @@ impl Rope {
                     });
                 }
             }
+            #[cfg(feature = "deltanet")]
+            RopeKind::Interleaved { rot_dim } => gpu
+                .rope_interleaved_f32(q, k, pos_buf, n_heads, n_kv_heads, head_dim, rot_dim, theta),
+            #[cfg(not(feature = "deltanet"))]
+            RopeKind::Interleaved { .. } => return Err(interleaved_needs_deltanet()),
         }
         .map_err(hip)
     }
@@ -767,14 +875,65 @@ impl Rope {
             RopeKind::PartialHalved { rot_pairs } => gpu.rope_partial_halved_f32_batched(
                 q, k, positions, n_heads, n_kv_heads, head_dim, rot_pairs, theta, rows,
             ),
-            RopeKind::PrefixHalfSplit { .. } => {
-                return Err(DispatchError::Hip(
-                    "prefix half-split RoPE is single-row only".into(),
-                ))
+            RopeKind::PrefixHalfSplit { rot_dim } => {
+                if gpu.flags.rope_interleaved_legacy {
+                    return Err(DispatchError::Hip(
+                        "prefix half-split RoPE refuses HIPFIRE_ROPE_INTERLEAVED_LEGACY".into(),
+                    ));
+                }
+                // Positions are absolute, so no compacted-KV phase offset.
+                #[cfg(feature = "deltanet")]
+                {
+                    gpu.rope_partial_interleaved_f32_batched(
+                        q, k, positions, n_heads, n_kv_heads, head_dim, rot_dim, theta, rows, 0,
+                    )
+                }
+                #[cfg(not(feature = "deltanet"))]
+                {
+                    let _ = rot_dim;
+                    return Err(DispatchError::UnsupportedVariant {
+                        family: "rope",
+                        variant: "prefix-half-split-requires-deltanet",
+                        arch: "",
+                        quant: "",
+                    });
+                }
             }
+            #[cfg(feature = "deltanet")]
+            RopeKind::Interleaved { rot_dim } => gpu.rope_interleaved_f32_batched(
+                q, k, positions, n_heads, n_kv_heads, head_dim, rot_dim, theta, rows,
+            ),
+            #[cfg(not(feature = "deltanet"))]
+            RopeKind::Interleaved { .. } => return Err(interleaved_needs_deltanet()),
+            #[cfg(feature = "deltanet")]
+            RopeKind::Mrope { rot_dim, section } => gpu.rope_mrope_halfsplit_f32_batched(
+                q,
+                k,
+                &positions.buf,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                rot_dim,
+                theta,
+                rows,
+                0,
+                section,
+            ),
+            #[cfg(not(feature = "deltanet"))]
+            RopeKind::Mrope { .. } => return Err(interleaved_needs_deltanet()),
             RopeKind::NoPe => return Ok(()),
         }
         .map_err(hip)
+    }
+}
+
+#[cfg(not(feature = "deltanet"))]
+fn interleaved_needs_deltanet() -> DispatchError {
+    DispatchError::UnsupportedVariant {
+        family: "rope",
+        variant: "interleaved-requires-deltanet",
+        arch: "",
+        quant: "",
     }
 }
 
@@ -994,6 +1153,9 @@ impl SandwichAttentionOp<'_> {
         if self.kv_proj.is_some() {
             need(self.k, kv_len, L, "k")?;
             need(self.v, kv_len, L, "v")?;
+        }
+        if matches!(self.rope.kind, RopeKind::Mrope { .. }) {
+            return Err(invalid(format!("{L}: mRoPE is an encoder-only RoPE")));
         }
         if s.batched() {
             let positions = self
@@ -2638,6 +2800,36 @@ pub fn execute_softcap(gpu: &mut Gpu, op: &SoftcapOp<'_>) -> Result<(), Dispatch
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rope_span_must_be_an_even_nonzero_head_prefix() {
+        let rope = |kind| Rope { kind, theta: 1e4 };
+        for rot_dim in [0, 3, 130, 256] {
+            assert!(
+                rope(RopeKind::Interleaved { rot_dim })
+                    .validate(128)
+                    .is_err(),
+                "{rot_dim}"
+            );
+            assert!(
+                rope(RopeKind::PrefixHalfSplit { rot_dim })
+                    .validate(128)
+                    .is_err(),
+                "{rot_dim}"
+            );
+        }
+        for rot_dim in [2, 64, 128] {
+            assert!(rope(RopeKind::Interleaved { rot_dim })
+                .validate(128)
+                .is_ok());
+        }
+        assert!(rope(RopeKind::PartialHalved { rot_pairs: 0 })
+            .validate(128)
+            .is_ok());
+        assert!(rope(RopeKind::PartialHalved { rot_pairs: 65 })
+            .validate(128)
+            .is_err());
+    }
     use crate::pipeline::gated_mlp::{Activation, GatedMlpScratch, MlpLadder, MlpStorage, RmsNorm};
 
     /// A launch-free F32 tensor of `elements` at `addr` (never dereferenced).
@@ -2900,6 +3092,16 @@ mod validation_tests {
         position: usize,
         rows: usize,
     ) -> Result<(), DispatchError> {
+        check_rope(route, kernels, position, rows, RopeKind::NoPe)
+    }
+
+    fn check_rope(
+        route: RowsRoute,
+        kernels: SandwichRoute,
+        position: usize,
+        rows: usize,
+        rope: RopeKind,
+    ) -> Result<(), DispatchError> {
         let big = tensor(16 * DIM * CAP);
         let pos_buf = unsafe { DeviceBuffer::from_raw(std::ptr::dangling_mut(), 4) };
         let op = SandwichAttentionOp {
@@ -2931,7 +3133,7 @@ mod validation_tests {
             }),
             q_scale: 1.0,
             rope: Rope {
-                kind: RopeKind::NoPe,
+                kind: rope,
                 theta: 1.0,
             },
             kv: SandwichKv {
@@ -2997,5 +3199,106 @@ mod validation_tests {
             check(RowsRoute::Decode, SandwichRoute::Wide, 8, 1),
             "windowed Q8 KV needs the steps route",
         );
+    }
+
+    #[test]
+    fn sandwich_attention_refuses_mrope() {
+        let mrope = RopeKind::Mrope {
+            rot_dim: DIM,
+            section: [DIM / 4, DIM / 8, DIM / 8],
+        };
+        refused(
+            check_rope(RowsRoute::Prefill, STEPS, 8, 4, mrope),
+            "encoder-only",
+        );
+    }
+
+    /// Batched RoPE of 4 rows, 2 Q heads of 8 and `n_kv` K heads.
+    fn rope_rows(
+        kind: RopeKind,
+        positions: usize,
+        q: usize,
+        k: usize,
+        n_kv: usize,
+    ) -> Result<(), DispatchError> {
+        Rope { kind, theta: 1.0 }.validate_rows(
+            &tensor(positions),
+            &tensor(q),
+            &tensor(k),
+            2,
+            n_kv,
+            8,
+        )
+    }
+
+    #[test]
+    fn batched_rope_takes_whole_rows_and_a_readable_mrope() {
+        let full = 4 * 2 * 8;
+        let m = RopeKind::Mrope {
+            rot_dim: 8,
+            section: [2, 1, 1],
+        };
+        assert!(rope_rows(m, 12, full, full, 2).is_ok());
+        assert!(rope_rows(m, 11, full, full, 2).is_err(), "partial row");
+        assert!(rope_rows(m, 12, full - 1, full, 2).is_err(), "short q");
+        assert!(rope_rows(m, 12, full, full - 1, 2).is_err(), "short k");
+        assert!(rope_rows(m, 12, full, 0, 0).is_ok(), "no K heads: k unread");
+        let partial = RopeKind::Mrope {
+            rot_dim: 4,
+            section: [1, 1, 0],
+        };
+        assert!(rope_rows(partial, 12, full, full, 2).is_ok());
+        for (rot_dim, section) in [
+            (16, [4, 2, 2]),
+            (7, [2, 1, 0]),
+            (8, [2, 2, 1]),
+            (8, [1, 1, 1]),
+        ] {
+            let kind = RopeKind::Mrope { rot_dim, section };
+            assert!(rope_rows(kind, 12, full, full, 2).is_err(), "{kind:?}");
+        }
+        assert!(rope_rows(RopeKind::RotateHalf, 4, full, full, 2).is_ok());
+        assert!(rope_rows(RopeKind::RotateHalf, 5, full, full, 2).is_err());
+        // A head count whose element bound overflows must be refused, not wrap to 0.
+        let rope = Rope {
+            kind: RopeKind::RotateHalf,
+            theta: 1.0,
+        };
+        let (p, t) = (tensor(4), tensor(full));
+        assert!(rope
+            .validate_rows(&p, &t, &t, usize::MAX / 4 + 1, 0, 8)
+            .is_err());
+    }
+
+    #[test]
+    fn rope_step_checks_the_span_on_both_routes() {
+        let full = 4 * 2 * 8;
+        let (p, t) = (tensor(4), tensor(full));
+        for kind in [
+            RopeKind::Interleaved { rot_dim: 10 },
+            RopeKind::Interleaved { rot_dim: 0 },
+            RopeKind::PrefixHalfSplit { rot_dim: 3 },
+            RopeKind::PartialHalved { rot_pairs: 5 },
+        ] {
+            let rope = Rope { kind, theta: 1.0 };
+            for positions in [None, Some(&p)] {
+                let r = rope.validate_step(positions, &t, &t, 2, 2, 8);
+                assert!(r.is_err(), "{kind:?} batched={}", positions.is_some());
+            }
+        }
+        let ok = Rope {
+            kind: RopeKind::Interleaved { rot_dim: 8 },
+            theta: 1.0,
+        };
+        assert!(ok.validate_step(Some(&p), &t, &t, 2, 2, 8).is_ok());
+        assert!(ok.validate_step(None, &t, &t, 2, 2, 8).is_ok());
+        let mrope = Rope {
+            kind: RopeKind::Mrope {
+                rot_dim: 8,
+                section: [2, 1, 1],
+            },
+            theta: 1.0,
+        };
+        assert!(mrope.validate_step(None, &t, &t, 2, 2, 8).is_err());
     }
 }

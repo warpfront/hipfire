@@ -1533,10 +1533,12 @@ fn load_pool_item(
             return Ok(None)
         }
         TensorClass::Embedding => {
-            let (buf, fmt) = read_bytes(hfq, name, |info, data| {
+            let (mut buf, fmt) = read_bytes(hfq, name, |info, data| {
                 load_embedding(gpu, info.quant_type, data, cfg.vocab, cfg.hidden)
                     .map_err(|e| format!("raon1_mini weights: upload {name}: {e:?}"))
             })?;
+            // `Step::Embed` routes on the resident dtype; the raw upload carries none.
+            buf.dtype = hipfire_runtime::weight_backend::embedding_format_dtype(fmt);
             Loaded::Embed(buf, fmt)
         }
         TensorClass::Proj => match load_proj(hfq, gpu, name, spec.shape[0], spec.shape[1])? {

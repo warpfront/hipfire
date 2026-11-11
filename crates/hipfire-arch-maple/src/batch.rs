@@ -69,60 +69,6 @@ pub fn dense_tile_ids_host(b: usize) -> Vec<i32> {
     vec![0i32; dense_m_total(b) / MOE_GROUPED_BLOCK_M]
 }
 
-/// Dense `Y[b × m] = X[b × k] @ W[m × k]^T` for an `MQ2G256LloydU` weight,
-/// by driving the grouped MoE WMMA kernel as a SINGLE-EXPERT case.
-///
-/// `w_ptrs` is a 1-entry `[2] f32` table holding the weight's device pointer,
-/// `tile_ids` is all-zero, `slot_index` is identity+(-1) padding, and
-/// `x_row_div = 1` because for a dense call the slot index IS the row index
-/// (the MoE case divides by `k_top`).
-///
-/// `x_f16_src` MUST be an **F16** tensor the caller converted itself, laid out
-/// `[b × k]` row-major. The grouped entry hands an F16 `x_src` straight to the
-/// kernel (whose `X_src` is `_Float16*`) and never touches the shared FP16
-/// scratch.
-///
-/// Passing an F32 tensor here still "works" but routes through the kernel's
-/// `ensure_fp16_x`, whose conversion is cached keyed on the SOURCE POINTER. A
-/// caller that reuses one F32 scratch buffer across layers with new contents
-/// would then get the FIRST layer's activations for every later layer —
-/// silently, with no error. Maple converts explicitly for exactly that reason.
-#[allow(clippy::too_many_arguments)]
-pub fn dense_qt51_gemm(
-    gpu: &mut Gpu,
-    w_ptrs: &GpuTensor,
-    tile_ids: &GpuTensor,
-    slot_index: &GpuTensor,
-    x_f16_src: &GpuTensor,
-    y: &GpuTensor,
-    m: usize,
-    k: usize,
-    b: usize,
-) -> Result<(), String> {
-    // Enforce the contract documented above. Passing F32 here does not fail —
-    // it quietly routes through the kernel's pointer-keyed `ensure_fp16_x` and
-    // serves the FIRST layer's activations for every later layer. Debug-only,
-    // so release pays nothing.
-    debug_assert_eq!(
-        x_f16_src.dtype,
-        DType::F16,
-        "dense_qt51_gemm: x must be pre-converted F16"
-    );
-    gpu.gemm_mq2g256_lloyd_moe_grouped_wmma(
-        w_ptrs,
-        tile_ids,
-        slot_index,
-        x_f16_src,
-        y,
-        m,
-        k,
-        1, // x_row_div: slot index IS the row index for a dense call
-        dense_m_total(b),
-        b,
-    )
-    .map_err(|e| format!("maple: dense qt51 gemm (m={m} k={k} b={b}): {e:?}"))
-}
-
 /// Upload a 1-entry device-pointer table for one weight, in the `[2] f32`
 /// (8-byte) layout the indexed kernels expect.
 pub fn upload_single_expert_ptr_table(

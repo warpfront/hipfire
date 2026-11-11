@@ -1,0 +1,1095 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+//! `EncoderOp` / `execute_encoder`: the stages of a bidirectional encoder
+//! trunk over a row block of independent, back-to-back sequences (Qwen3.5
+//! multi-vector embedding, #666 G19; EmbeddingGemma 2, G20). F32 activations.
+//!
+//! ```text
+//! Qwen3.5 full attn  [RmsnormAutomatic] -> [Project(q, gate, k, v)] -> [QkNorm(q, k)] -> [Rope(Mrope)]
+//!                    -> Attention (bidirectional, per segment) -> SigmoidGate -> [Project(o, +residual)]
+//! Qwen3.5 GDN        [RmsnormAutomatic] -> [Project(qkv, z, a, b)] -> AlphaGate -> ConvSplit (per segment)
+//!                    -> QkL2 -> Scan (per segment) -> GatedNorm -> [Project(out, +residual)]
+//! Gemma sandwich     ... -> [Project(o | down | ple)] -> PostNormResidual
+//!                    GeluMul (gated gelu-tanh MLP), PerLayerGate (PLE branch)
+//! ```
+//!
+//! Bracketed steps are the shared ones (projections on
+//! `ProjectLadder::EncoderF16`). Row-independent stages run once over the
+//! whole block. The two stateful ones run per [`EncoderSegment`] with their
+//! state zeroed at each segment's start, and attention never reads keys
+//! outside its own segment, so a block of sequences is equivalent to encoding
+//! each alone. Stages borrow every operand; the only allocations are the eager
+//! attention route's per-call transients.
+
+use rdna_compute::gemm::{LdsTile, LdsTileSplitK};
+use rdna_compute::{DType, Gpu, GpuTensor};
+
+use crate::types::DispatchError;
+
+fn hip(e: impl std::fmt::Debug) -> DispatchError {
+    DispatchError::Hip(format!("{e:?}"))
+}
+
+/// Rows a sequence of `n` tokens occupies, after padding it up to a multiple
+/// of 64 so the eager attention's PV GEMM meets its `k % 64 == 0` contract
+/// (the eager route needs `rows % 64 == 0 && rows >= 256`, see [`EncoderOp::Attention`]).
+///
+/// Padding is at the END, which the architecture tolerates: GDN is causal, so
+/// the padded rows cannot influence a real row's state, and the full-attention
+/// layers mask the padded keys in the softmax. The padded rows' own outputs are
+/// garbage and are dropped by the caller. Below 256 tokens no padding is taken
+/// and the Q-tiled kernel runs instead — its cost is O(n^2), so it is cheap
+/// there and it needs no mask.
+pub fn padded_rows(n: usize) -> usize {
+    if n < 256 {
+        n
+    } else {
+        n.div_ceil(64) * 64
+    }
+}
+
+/// One sequence's row block inside the concatenated batch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EncoderSegment {
+    /// First row of this segment in the `[T, hidden]` row block.
+    pub row_offset: usize,
+    /// Rows it occupies, its own padding included.
+    pub rows: usize,
+    /// Real token count: the attention key bound (padding keys are masked).
+    pub n_valid: usize,
+}
+
+/// Full-attention head geometry.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EncoderHeads {
+    pub n_heads: usize,
+    pub n_kv_heads: usize,
+    pub head_dim: usize,
+}
+
+impl EncoderHeads {
+    fn q_dim(&self) -> usize {
+        self.n_heads * self.head_dim
+    }
+    fn kv_dim(&self) -> usize {
+        self.n_kv_heads * self.head_dim
+    }
+}
+
+pub enum EncoderOp<'a> {
+    /// `x = rmsnorm(x)·w` per row of `width`, then `residual += x`: the
+    /// sandwich norm on a branch output before its residual add.
+    PostNormResidual {
+        x: &'a GpuTensor,
+        w: &'a GpuTensor,
+        residual: &'a GpuTensor,
+        rows: usize,
+        width: usize,
+        eps: f32,
+    },
+    /// Bidirectional attention within each segment, `softmax(scale·QKᵀ)·V`.
+    /// `window` is a sliding layer's radius: keys with `|i − j| > window` are
+    /// masked wherever that restricts a segment's padded rows
+    /// (`rows > window + 1`), and a route without a band mask refuses such a
+    /// segment (see [`attention_path`]). Scales `q` in place on the
+    /// eager-GEMM route.
+    Attention {
+        q: &'a GpuTensor,
+        k: &'a GpuTensor,
+        v: &'a GpuTensor,
+        ctx: &'a GpuTensor,
+        segments: &'a [EncoderSegment],
+        heads: EncoderHeads,
+        scale: AttnScale,
+        window: Option<usize>,
+    },
+    /// `gate[..len] = gelu_tanh(gate) ⊙ up`.
+    GeluMul {
+        gate: &'a GpuTensor,
+        up: &'a GpuTensor,
+        len: usize,
+    },
+    /// Per-layer-input gate in place: `gate[r] = gelu_tanh(gate[r]) ⊙
+    /// inputs[r, layer·width ..][..width]`, `inputs` packing `n_layers` slices
+    /// of `width` per row.
+    PerLayerGate {
+        gate: &'a GpuTensor,
+        inputs: &'a GpuTensor,
+        rows: usize,
+        width: usize,
+        n_layers: usize,
+        layer: usize,
+    },
+    /// `out *= σ(gate)`.
+    SigmoidGate {
+        out: &'a GpuTensor,
+        gate: &'a GpuTensor,
+    },
+    /// In place: `beta = σ(beta)`, `alpha = −exp(a_log)·softplus(alpha + dt_bias)`.
+    AlphaGate {
+        beta: &'a GpuTensor,
+        alpha: &'a GpuTensor,
+        dt_bias: &'a GpuTensor,
+        a_log: &'a GpuTensor,
+        heads: usize,
+        rows: usize,
+    },
+    /// Causal conv + SiLU split of `qkv` into Q|K|V, per segment from a zeroed ring.
+    ConvSplit {
+        qkv: &'a GpuTensor,
+        weight: &'a GpuTensor,
+        ring: &'a GpuTensor,
+        q: &'a GpuTensor,
+        k: &'a GpuTensor,
+        v: &'a GpuTensor,
+        key_dim: usize,
+        value_dim: usize,
+        segments: &'a [EncoderSegment],
+    },
+    /// Per-head L2 norm of Q (times `1/sqrt(head_dim)`) and K, in place.
+    QkL2 {
+        q: &'a GpuTensor,
+        k: &'a GpuTensor,
+        heads: usize,
+        head_dim: usize,
+        eps: f32,
+        rows: usize,
+    },
+    /// FP32 delta-rule scan, per segment from a zeroed state. Key heads equal
+    /// value heads.
+    Scan {
+        q: &'a GpuTensor,
+        k: &'a GpuTensor,
+        v: &'a GpuTensor,
+        gate: &'a GpuTensor,
+        beta: &'a GpuTensor,
+        state: &'a GpuTensor,
+        out: &'a GpuTensor,
+        key_dim: usize,
+        heads: usize,
+        head_dim: usize,
+        segments: &'a [EncoderSegment],
+    },
+    /// `out = rmsnorm(x)·w·silu(z)` per value head.
+    GatedNorm {
+        x: &'a GpuTensor,
+        z: &'a GpuTensor,
+        w: &'a GpuTensor,
+        out: &'a GpuTensor,
+        heads: usize,
+        head_dim: usize,
+        eps: f32,
+        rows: usize,
+    },
+}
+
+fn fits(t: &GpuTensor, elems: usize, what: &str) -> Result<(), DispatchError> {
+    if t.numel() < elems {
+        return Err(DispatchError::Hip(format!(
+            "encoder: {what} holds {} elements, needs {elems}",
+            t.numel()
+        )));
+    }
+    Ok(())
+}
+
+fn segments_rows(segments: &[EncoderSegment]) -> usize {
+    segments.last().map_or(0, |s| s.row_offset + s.rows)
+}
+
+impl EncoderOp<'_> {
+    /// Geometry and operand sizes; launch-free.
+    pub fn validate_for_gpu(&self, _gpu: &Gpu) -> Result<(), DispatchError> {
+        match self {
+            EncoderOp::PostNormResidual {
+                x,
+                w,
+                residual,
+                rows,
+                width,
+                ..
+            } => {
+                fits(x, rows * width, "post-norm input")?;
+                fits(w, *width, "post-norm weight")?;
+                fits(residual, rows * width, "post-norm residual")?;
+            }
+            EncoderOp::Attention {
+                q,
+                k,
+                v,
+                ctx,
+                segments,
+                heads,
+                ..
+            } => {
+                if heads.n_kv_heads == 0 || heads.n_heads % heads.n_kv_heads != 0 {
+                    return Err(DispatchError::Hip(
+                        "encoder: heads not a GQA multiple".into(),
+                    ));
+                }
+                check_segments(segments)?;
+                let n = segments_rows(segments);
+                fits(q, n * heads.q_dim(), "attention q")?;
+                fits(k, n * heads.kv_dim(), "attention k")?;
+                fits(v, n * heads.kv_dim(), "attention v")?;
+                fits(ctx, n * heads.q_dim(), "attention ctx")?;
+            }
+            EncoderOp::GeluMul { gate, up, len } => {
+                fits(gate, *len, "gelu gate")?;
+                fits(up, *len, "gelu up")?;
+            }
+            EncoderOp::PerLayerGate {
+                gate,
+                inputs,
+                rows,
+                width,
+                n_layers,
+                layer,
+            } => {
+                if layer >= n_layers {
+                    return Err(DispatchError::Hip(format!(
+                        "encoder: per-layer gate layer {layer} of {n_layers}"
+                    )));
+                }
+                fits(gate, rows * width, "per-layer gate")?;
+                fits(inputs, rows * n_layers * width, "per-layer inputs")?;
+            }
+            EncoderOp::SigmoidGate { out, gate } => fits(gate, out.numel(), "sigmoid gate")?,
+            EncoderOp::AlphaGate {
+                beta,
+                alpha,
+                dt_bias,
+                a_log,
+                heads,
+                rows,
+            } => {
+                fits(beta, rows * heads, "beta")?;
+                fits(alpha, rows * heads, "alpha")?;
+                fits(dt_bias, *heads, "dt_bias")?;
+                fits(a_log, *heads, "a_log")?;
+            }
+            EncoderOp::ConvSplit {
+                qkv,
+                weight,
+                ring,
+                q,
+                k,
+                v,
+                key_dim,
+                value_dim,
+                segments,
+            } => {
+                check_segments(segments)?;
+                let n = segments_rows(segments);
+                let ch = 2 * key_dim + value_dim;
+                // The kernel is a width-4 causal conv over a 3-row ring.
+                if weight.numel() != ch * 4 || ring.numel() != ch * 3 {
+                    return Err(DispatchError::Hip(format!(
+                        "encoder: conv takes a [{ch}, 4] weight and a [{ch}, 3] ring, got {} and {}",
+                        weight.numel(),
+                        ring.numel()
+                    )));
+                }
+                fits(qkv, n * ch, "conv input")?;
+                fits(q, n * key_dim, "conv q")?;
+                fits(k, n * key_dim, "conv k")?;
+                fits(v, n * value_dim, "conv v")?;
+            }
+            EncoderOp::QkL2 {
+                q,
+                k,
+                heads,
+                head_dim,
+                rows,
+                ..
+            } => {
+                fits(q, rows * heads * head_dim, "l2 q")?;
+                fits(k, rows * heads * head_dim, "l2 k")?;
+            }
+            EncoderOp::Scan {
+                q,
+                k,
+                v,
+                gate,
+                beta,
+                state,
+                out,
+                key_dim,
+                heads,
+                head_dim,
+                segments,
+            } => {
+                // Key heads equal value heads: the kernel reads Q/K as heads x head_dim.
+                if *key_dim != heads * head_dim {
+                    return Err(DispatchError::Hip(format!(
+                        "encoder: scan key_dim {key_dim} != {heads} heads x {head_dim}"
+                    )));
+                }
+                check_segments(segments)?;
+                let n = segments_rows(segments);
+                fits(q, n * key_dim, "scan q")?;
+                fits(k, n * key_dim, "scan k")?;
+                fits(v, n * heads * head_dim, "scan v")?;
+                fits(gate, n * heads, "scan gate")?;
+                fits(beta, n * heads, "scan beta")?;
+                fits(state, heads * head_dim * head_dim, "scan state")?;
+                fits(out, n * heads * head_dim, "scan out")?;
+            }
+            EncoderOp::GatedNorm {
+                x,
+                z,
+                w,
+                out,
+                heads,
+                head_dim,
+                rows,
+                ..
+            } => {
+                fits(x, rows * heads * head_dim, "gated norm x")?;
+                fits(z, rows * heads * head_dim, "gated norm z")?;
+                fits(w, *head_dim, "gated norm weight")?;
+                fits(out, rows * heads * head_dim, "gated norm out")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Segments must tile the block contiguously from row 0 with `n_valid <= rows`.
+fn check_segments(segments: &[EncoderSegment]) -> Result<(), DispatchError> {
+    let mut next = 0;
+    for s in segments {
+        if s.row_offset != next || s.rows == 0 || s.n_valid == 0 || s.n_valid > s.rows {
+            return Err(DispatchError::Hip(format!("encoder: bad segment {s:?}")));
+        }
+        next += s.rows;
+    }
+    if segments.is_empty() {
+        return Err(DispatchError::Hip("encoder: no segments".into()));
+    }
+    Ok(())
+}
+
+pub fn execute_encoder(gpu: &mut Gpu, op: &EncoderOp<'_>) -> Result<(), DispatchError> {
+    match op {
+        EncoderOp::PostNormResidual {
+            x,
+            w,
+            residual,
+            rows,
+            width,
+            eps,
+        } => {
+            let n = rows * width;
+            let x = x.sub_offset(0, n);
+            gpu.rmsnorm_batched(&x, w, &x, *rows, *width, *eps)
+                .map_err(hip)?;
+            gpu.add_inplace_f32(&residual.sub_offset(0, n), &x)
+                .map_err(hip)
+        }
+        EncoderOp::Attention {
+            q,
+            k,
+            v,
+            ctx,
+            segments,
+            heads,
+            scale,
+            window,
+        } => {
+            let (qd, kvd) = (heads.q_dim(), heads.kv_dim());
+            let wmma = gpu.arch_caps.has_wmma_w32() || gpu.arch == "gfx1201";
+            for seg in segments.iter() {
+                let q_s = q.sub_offset(seg.row_offset * qd, seg.rows * qd);
+                let k_s = k.sub_offset(seg.row_offset * kvd, seg.rows * kvd);
+                let v_s = v.sub_offset(seg.row_offset * kvd, seg.rows * kvd);
+                let c_s = ctx.sub_offset(seg.row_offset * qd, seg.rows * qd);
+                let knobs = (embed_attn_naive(), embed_attn_no_gemm());
+                let (path, band) =
+                    attention_path(seg.rows, heads.head_dim, *window, *scale, wmma, knobs)
+                        .map_err(DispatchError::Hip)?;
+                let s = scale.value(heads.head_dim);
+                attention(
+                    gpu,
+                    path,
+                    &q_s,
+                    &k_s,
+                    &v_s,
+                    &c_s,
+                    seg.rows,
+                    seg.n_valid,
+                    heads,
+                    s,
+                    band,
+                )?;
+            }
+            Ok(())
+        }
+        EncoderOp::GeluMul { gate, up, len } => {
+            let g = gate.sub_offset(0, *len);
+            gpu.gelu_tanh_f32(&g, &g, *len).map_err(hip)?;
+            gpu.mul_f32(&g, up, &g).map_err(hip)
+        }
+        EncoderOp::PerLayerGate {
+            gate,
+            inputs,
+            rows,
+            width,
+            n_layers,
+            layer,
+        } => gpu
+            .gemma4_ple_gelu_mul_strided_f32(
+                gate,
+                inputs,
+                gate,
+                *rows,
+                *width,
+                n_layers * width,
+                *layer,
+            )
+            .map_err(hip),
+        EncoderOp::SigmoidGate { out, gate } => gpu.sigmoid_mul_f32(out, gate).map_err(hip),
+        EncoderOp::AlphaGate {
+            beta,
+            alpha,
+            dt_bias,
+            a_log,
+            heads,
+            rows,
+        } => gpu
+            .fused_sigmoid_alpha_gate_f32_batched(beta, alpha, dt_bias, a_log, *heads, *rows)
+            .map_err(hip),
+        EncoderOp::ConvSplit {
+            qkv,
+            weight,
+            ring,
+            q,
+            k,
+            v,
+            key_dim,
+            value_dim,
+            segments,
+        } => {
+            let (kd, vd) = (*key_dim, *value_dim);
+            let ch = 2 * kd + vd;
+            for seg in segments.iter() {
+                gpu.zero_f32(ring).map_err(hip)?;
+                let (o, r) = (seg.row_offset, seg.rows);
+                gpu.conv1d_silu_split_f32_n(
+                    &q.sub_offset(o * kd, r * kd),
+                    &k.sub_offset(o * kd, r * kd),
+                    &v.sub_offset(o * vd, r * vd),
+                    &qkv.sub_offset(o * ch, r * ch),
+                    weight,
+                    ring,
+                    kd,
+                    vd,
+                    r,
+                )
+                .map_err(hip)?;
+            }
+            Ok(())
+        }
+        EncoderOp::QkL2 {
+            q,
+            k,
+            heads,
+            head_dim,
+            eps,
+            rows,
+        } => gpu
+            .fused_qk_l2_norm_scale_f32_batched(
+                q,
+                k,
+                *heads,
+                *head_dim,
+                1.0 / (*head_dim as f32).sqrt(),
+                *eps,
+                *rows,
+            )
+            .map_err(hip),
+        EncoderOp::Scan {
+            q,
+            k,
+            v,
+            gate,
+            beta,
+            state,
+            out,
+            key_dim,
+            heads,
+            head_dim,
+            segments,
+        } => {
+            let (kd, vd, nh) = (*key_dim, heads * head_dim, *heads);
+            for seg in segments.iter() {
+                gpu.zero_f32(state).map_err(hip)?;
+                let (o, n) = (seg.row_offset, seg.rows);
+                let (q, k, v) = (
+                    q.sub_offset(o * kd, n * kd),
+                    k.sub_offset(o * kd, n * kd),
+                    v.sub_offset(o * vd, n * vd),
+                );
+                let (g, b) = (
+                    gate.sub_offset(o * nh, n * nh),
+                    beta.sub_offset(o * nh, n * nh),
+                );
+                let y = out.sub_offset(o * vd, n * vd);
+                if rdna_compute::norm::gdn_chunked() && n > 1 {
+                    gpu.gated_delta_net_f32_chunked(
+                        &q,
+                        &k,
+                        &v,
+                        &g,
+                        &b,
+                        state,
+                        &y,
+                        n,
+                        nh,
+                        *head_dim,
+                        rdna_compute::norm::gdn_chunk_size(),
+                    )
+                } else {
+                    gpu.gated_delta_net_f32_batch_seq(
+                        &q, &k, &v, &g, &b, state, &y, n, nh, *head_dim,
+                    )
+                }
+                .map_err(hip)?;
+            }
+            Ok(())
+        }
+        EncoderOp::GatedNorm {
+            x,
+            z,
+            w,
+            out,
+            heads,
+            head_dim,
+            eps,
+            rows,
+        } => gpu
+            .gated_norm_f32_batched(x, z, w, out, *heads, *head_dim, *eps, *rows)
+            .map_err(hip),
+    }
+}
+
+fn cast_f16(gpu: &mut Gpu, x: &GpuTensor, n: usize) -> Result<GpuTensor, DispatchError> {
+    let dst = gpu.alloc_tensor(&[n], DType::F16).map_err(hip)?;
+    gpu.cast_f32_to_f16(x, &dst).map_err(hip)?;
+    Ok(dst)
+}
+
+// ── attention ───────────────────────────────────────────────────────────
+
+/// gfx11 LDS-tile selection for eager attention — `cands` is the caller's
+/// preference order, `m`/`batch` the GEMM's M/N. Retained for tile-sweep labs;
+/// production and parity use [`attention_gemm_ld`] for architecture dispatch.
+pub fn attention_lds_tile(cands: &[LdsTile], m: usize, batch: usize) -> Option<LdsTile> {
+    cands
+        .iter()
+        .copied()
+        .find(|t| t.bm <= m && t.bn <= batch && Gpu::LDS_TILE_VARIANTS.contains(t))
+}
+
+/// The QK^T tile preference list (contract dim is small head_dim).
+pub fn attention_qk_tiles() -> [LdsTile; 3] {
+    [
+        LdsTile::new(128, 128, 32, 64, 64, false).pipelined(),
+        LdsTile::new(128, 128, 64, 64, 64, false),
+        LdsTile::new(64, 64, 32, 64, 64, false),
+    ]
+}
+
+/// The PV tile preference list (contract dim is the row count).
+pub fn attention_pv_tiles() -> [LdsTile; 3] {
+    [
+        LdsTile::new(128, 128, 64, 64, 64, false),
+        LdsTile::new(128, 128, 32, 64, 64, false),
+        LdsTile::new(64, 64, 32, 64, 64, false),
+    ]
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AttentionRoute {
+    Gfx1201(LdsTileSplitK),
+    Gfx11(Option<LdsTile>),
+}
+
+fn attention_route(arch: &str, m: usize, batch: usize, qk: bool) -> AttentionRoute {
+    if arch == "gfx1201" {
+        let tile = if qk && m >= 128 && batch >= 128 {
+            LdsTileSplitK::new(128, 128, 32, 64, false, 1)
+        } else if !qk && m >= 64 && batch >= 128 {
+            LdsTileSplitK::new(64, 128, 32, 64, true, 1)
+        } else {
+            LdsTileSplitK::new(64, 64, 32, 64, true, 1)
+        };
+        AttentionRoute::Gfx1201(tile)
+    } else {
+        let cands = if qk {
+            attention_qk_tiles()
+        } else {
+            attention_pv_tiles()
+        };
+        AttentionRoute::Gfx11(attention_lds_tile(&cands, m, batch))
+    }
+}
+
+/// Production eager-attention GEMM: F16 A/X (possibly pitched), F32 `[batch, m]`
+/// output. gfx1201 uses optimized split1 LDS with ascending K; gfx11 preserves
+/// its measured QK/PV candidate order and automatic fallback.
+#[allow(clippy::too_many_arguments)]
+pub fn attention_gemm_ld(
+    gpu: &mut Gpu,
+    a: &GpuTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    m: usize,
+    k: usize,
+    batch: usize,
+    lda: usize,
+    ldx: usize,
+    qk: bool,
+) -> rdna_compute::HipResult<()> {
+    if !gpu.arch_caps.has_wmma_w32() && gpu.arch != "gfx1201" {
+        return Err(rdna_compute::HipError::new(
+            0,
+            "encoder: attention LDS requires gfx11 WMMA or exact gfx1201",
+        ));
+    }
+    match attention_route(&gpu.arch, m, batch, qk) {
+        AttentionRoute::Gfx1201(tile) => {
+            gpu.gemm_f16_x_f16_wmma_lds_splitk_ld(a, x, y, m, k, batch, tile, lda, ldx)
+        }
+        AttentionRoute::Gfx11(Some(tile)) => {
+            gpu.gemm_f16_x_f16_wmma_lds_tiled_ld(a, x, y, None, m, k, batch, tile, lda, ldx)
+        }
+        AttentionRoute::Gfx11(None) => {
+            gpu.gemm_f16_x_f16_wmma_lds_auto_ld(a, x, y, None, m, k, batch, lda, ldx)
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AttentionPath {
+    /// `attention_text_f32`, one block per (query, head); any scale.
+    Reference,
+    /// Two WMMA GEMMs and a masked row softmax per head; band mask capable.
+    Eager,
+    /// `attention_encoder_qtiled_f32`, which bakes in `1/sqrt(head_dim)`.
+    QTiled,
+}
+
+/// The attention logit scale. Typed rather than compared as a float: only
+/// [`AttnScale::InvSqrtHeadDim`] may take the Q-tiled kernel, which bakes it in.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum AttnScale {
+    /// `1/sqrt(head_dim)` (Qwen3.5).
+    InvSqrtHeadDim,
+    /// Any other scale (EmbeddingGemma 2: 1.0 behind its QK norms).
+    Fixed(f32),
+}
+
+impl AttnScale {
+    fn value(self, head_dim: usize) -> f32 {
+        match self {
+            AttnScale::InvSqrtHeadDim => 1.0 / (head_dim as f32).sqrt(),
+            AttnScale::Fixed(s) => s,
+        }
+    }
+}
+
+/// The route and band one segment of `rows` (padded) rows takes. `wmma`: gfx11
+/// WMMA or exact gfx1201; `knobs`: `HIPFIRE_EMBED_ATTN=naive` / `=no-gemm`.
+/// The band is `window` where it restricts the segment (`rows > window + 1`);
+/// only the eager route masks it, so a band elsewhere is refused, never
+/// mis-masked. `no-gemm` vetoes the eager route only where the Q-tiled kernel
+/// can take over (its scale).
+fn attention_path(
+    rows: usize,
+    head_dim: usize,
+    window: Option<usize>,
+    scale: AttnScale,
+    wmma: bool,
+    (naive, no_gemm): (bool, bool),
+) -> Result<(AttentionPath, Option<usize>), String> {
+    let band = window.filter(|w| rows > w + 1);
+    let qtiled = scale == AttnScale::InvSqrtHeadDim;
+    let eager_fits = !(no_gemm && qtiled)
+        && rows.is_multiple_of(64)
+        && rows >= 256
+        && head_dim.is_multiple_of(64)
+        && wmma;
+    let path = if naive {
+        AttentionPath::Reference
+    } else if eager_fits {
+        AttentionPath::Eager
+    } else if qtiled {
+        AttentionPath::QTiled
+    } else {
+        AttentionPath::Reference
+    };
+    if band.is_some() && path != AttentionPath::Eager {
+        return Err(format!(
+            "encoder: sliding window {window:?} restricts a {rows}-row segment, but only the \
+             eager GEMM route has a band mask (WMMA, rows >= 256, rows % 64 == 0, \
+             head_dim % 64 == 0, not HIPFIRE_EMBED_ATTN=naive)"
+        ));
+    }
+    Ok((path, band))
+}
+
+/// One segment's bidirectional attention, `softmax(scale·QKᵀ)·V`, on the
+/// route [`attention_path`] picked. Padding keys (rows past `n_valid`) are
+/// masked on every route; `band` (a sliding window radius) only on the eager
+/// one.
+#[allow(clippy::too_many_arguments)]
+fn attention(
+    gpu: &mut Gpu,
+    path: AttentionPath,
+    q: &GpuTensor,
+    k: &GpuTensor,
+    v: &GpuTensor,
+    ctx: &GpuTensor,
+    n: usize,
+    n_valid: usize,
+    h: &EncoderHeads,
+    scale: f32,
+    band: Option<usize>,
+) -> Result<(), DispatchError> {
+    match path {
+        AttentionPath::Eager => attention_eager(gpu, q, k, v, ctx, n, n_valid, h, scale, band),
+        AttentionPath::QTiled => gpu
+            .attention_encoder_qtiled_f32(
+                q,
+                k,
+                v,
+                ctx,
+                n,
+                n_valid,
+                h.n_heads,
+                h.n_kv_heads,
+                h.head_dim,
+            )
+            .map_err(hip),
+        AttentionPath::Reference if n == n_valid => gpu
+            .attention_text_f32(
+                q,
+                k,
+                v,
+                None,
+                None,
+                ctx,
+                n,
+                h.n_heads,
+                h.n_kv_heads,
+                h.head_dim,
+                scale,
+                false,
+            )
+            .map_err(hip),
+        AttentionPath::Reference => {
+            // f32 key mask: 1.0 over the real tokens, 0.0 over the padding rows.
+            let mut host = vec![0f32; n];
+            for x in host.iter_mut().take(n_valid.min(n)) {
+                *x = 1.0;
+            }
+            let mask = gpu.upload_f32(&host, &[n]).map_err(hip)?;
+            let r = gpu.attention_text_f32(
+                q,
+                k,
+                v,
+                None,
+                Some(&mask),
+                ctx,
+                n,
+                h.n_heads,
+                h.n_kv_heads,
+                h.head_dim,
+                scale,
+                false,
+            );
+            gpu.free_tensor(mask).map_err(hip)?;
+            r.map_err(hip)
+        }
+    }
+}
+
+/// Bidirectional attention as two batched GEMMs plus a row softmax, per head
+/// (the WMMA GEMM runs this shape ~2.6x faster than the scalar tiled kernel).
+///
+/// The q/gate split at load puts each head's columns contiguously, so head
+/// `h` is a `sub_offset` view with an explicit row pitch (the `_ld` GEMMs);
+/// only V needs a real transpose. The PV GEMM contracts over `n`, hence the
+/// `n % 64 == 0` contract. `scale` is folded into Q in f32 before the f16 cast
+/// (n·q_dim elements, not n² scores); a scale of 1.0 launches nothing. `band`
+/// masks the scores of keys further than that from the query.
+#[allow(clippy::too_many_arguments)]
+fn attention_eager(
+    gpu: &mut Gpu,
+    q: &GpuTensor,
+    k: &GpuTensor,
+    v: &GpuTensor,
+    ctx: &GpuTensor,
+    n: usize,
+    n_valid: usize,
+    h: &EncoderHeads,
+    scale: f32,
+    band: Option<usize>,
+) -> Result<(), DispatchError> {
+    let hd = h.head_dim;
+    let (qd, kvd) = (h.q_dim(), h.kv_dim());
+    let rep = h.n_heads / h.n_kv_heads;
+
+    if scale != 1.0 {
+        gpu.scale_f32(q, scale).map_err(hip)?;
+    }
+    let q16 = cast_f16(gpu, q, n * qd)?;
+    let k16 = cast_f16(gpu, k, n * kvd)?;
+    // 2-D: `softmax` takes rows from shape[0] and width from shape.last().
+    let s = gpu.alloc_tensor(&[n, n], DType::F32).map_err(hip)?;
+    let p16 = gpu.alloc_tensor(&[n * n], DType::F16).map_err(hip)?;
+    let vh = gpu.alloc_tensor(&[n * hd], DType::F32).map_err(hip)?;
+    let vht = gpu.alloc_tensor(&[hd * n], DType::F32).map_err(hip)?;
+    let vht16 = gpu.alloc_tensor(&[hd * n], DType::F16).map_err(hip)?;
+    let o = gpu.alloc_tensor(&[n * hd], DType::F32).map_err(hip)?;
+
+    let mut result = Ok(());
+    for head in 0..h.n_heads {
+        let kh = head / rep;
+        // Head views: (rows - 1) * pitch + k elements, as the GEMM bounds want.
+        let q_h = q16.sub_offset(head * hd, (n - 1) * qd + hd);
+        let k_h = k16.sub_offset(kh * hd, (n - 1) * kvd + hd);
+        let v_h = v.sub_offset(kh * hd, (n - 1) * kvd + hd);
+        let step = (|| -> rdna_compute::HipResult<()> {
+            // S = Q_h · K_hᵀ
+            attention_gemm_ld(gpu, &k_h, &q_h, &s, n, hd, n, kvd, qd, true)?;
+            if let Some(w) = band {
+                gpu.attention_scores_band_mask_f32(&s, n, n, w)?;
+            }
+            // Masked softmax to f16; columns past n_valid are padding.
+            gpu.attention_rows_softmax_f16(&s, &p16, n, n, 0, n_valid)?;
+            // V_h -> [hd, n] f16 (the source view carries the column offset).
+            gpu.copy_rows_strided_f32(&v_h, &vh, n, hd, kvd, hd, 0, None)?;
+            gpu.transpose_f32(&vh, &vht, n, hd)?;
+            gpu.cast_f32_to_f16(&vht, &vht16)?;
+            // O_h = P · V_h, scattered into the head-interleaved ctx columns.
+            attention_gemm_ld(gpu, &vht16, &p16, &o, hd, n, n, n, n, false)?;
+            gpu.copy_rows_strided_f32(&o, ctx, n, hd, hd, qd, head * hd, None)
+        })();
+        if let Err(e) = step {
+            result = Err(DispatchError::Hip(format!(
+                "encoder: attention head {head}: {e:?}"
+            )));
+            break;
+        }
+    }
+    for t in [q16, k16, s, p16, vh, vht, vht16, o] {
+        gpu.free_tensor(t).map_err(hip)?;
+    }
+    result
+}
+
+// ── developer knobs (read once) ─────────────────────────────────────────
+
+fn knob(name: &str, values: &[&str]) -> bool {
+    hipfire_config::developer_var(name)
+        .ok()
+        .is_some_and(|v| values.contains(&v.as_str()))
+}
+
+use std::sync::LazyLock;
+
+/// `HIPFIRE_EMBED_ATTN=no-gemm|tiled`: keep the tiled kernel where eager applies.
+static EMBED_ATTN_NO_GEMM: LazyLock<bool> =
+    LazyLock::new(|| knob("HIPFIRE_EMBED_ATTN", &["no-gemm", "tiled"]));
+/// `HIPFIRE_EMBED_ATTN=naive`: the per-(query, head) reference kernel.
+static EMBED_ATTN_NAIVE: LazyLock<bool> = LazyLock::new(|| knob("HIPFIRE_EMBED_ATTN", &["naive"]));
+
+fn embed_attn_no_gemm() -> bool {
+    *EMBED_ATTN_NO_GEMM
+}
+fn embed_attn_naive() -> bool {
+    *EMBED_ATTN_NAIVE
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        attention_route, check_segments, AttentionRoute, EncoderSegment, LdsTile, LdsTileSplitK,
+    };
+
+    #[test]
+    fn gfx1201_attention_tiles_are_supported_unsplit_entries() {
+        for (m, batch, qk, tile, entry) in [
+            (
+                128,
+                128,
+                true,
+                LdsTileSplitK::new(128, 128, 32, 64, false, 1),
+                "qwen4_wmma_lds_128_128_32_64_k64",
+            ),
+            (
+                127,
+                128,
+                true,
+                LdsTileSplitK::new(64, 64, 32, 64, true, 1),
+                "qwen4_wmma_lds_64_64_32_64_k64_p",
+            ),
+            (
+                128,
+                127,
+                true,
+                LdsTileSplitK::new(64, 64, 32, 64, true, 1),
+                "qwen4_wmma_lds_64_64_32_64_k64_p",
+            ),
+            (
+                64,
+                128,
+                false,
+                LdsTileSplitK::new(64, 128, 32, 64, true, 1),
+                "qwen4_wmma_lds_64_128_32_64_k64_p",
+            ),
+            (
+                63,
+                128,
+                false,
+                LdsTileSplitK::new(64, 64, 32, 64, true, 1),
+                "qwen4_wmma_lds_64_64_32_64_k64_p",
+            ),
+            (
+                64,
+                127,
+                false,
+                LdsTileSplitK::new(64, 64, 32, 64, true, 1),
+                "qwen4_wmma_lds_64_64_32_64_k64_p",
+            ),
+        ] {
+            assert_eq!(
+                attention_route("gfx1201", m, batch, qk),
+                AttentionRoute::Gfx1201(tile)
+            );
+            assert_eq!(tile.split, 1);
+            assert_eq!(tile.ks, 64);
+            assert_eq!(tile.entry(), entry);
+        }
+    }
+
+    #[test]
+    fn gfx11_attention_preserves_candidate_order_and_auto_fallback() {
+        for arch in ["gfx1100", "gfx1151"] {
+            for qk in [true, false] {
+                let large = if qk {
+                    LdsTile::new(128, 128, 32, 64, 64, false).pipelined()
+                } else {
+                    LdsTile::new(128, 128, 64, 64, 64, false)
+                };
+                assert_eq!(
+                    attention_route(arch, 256, 256, qk),
+                    AttentionRoute::Gfx11(Some(large))
+                );
+                let small = LdsTile::new(64, 64, 32, 64, 64, false);
+                assert_eq!(
+                    attention_route(arch, 64, 128, qk),
+                    AttentionRoute::Gfx11(Some(small))
+                );
+                assert_eq!(
+                    attention_route(arch, 128, 64, qk),
+                    AttentionRoute::Gfx11(Some(small))
+                );
+                assert_eq!(
+                    attention_route(arch, 63, 128, qk),
+                    AttentionRoute::Gfx11(None)
+                );
+                assert_eq!(
+                    attention_route(arch, 128, 63, qk),
+                    AttentionRoute::Gfx11(None)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn segments_must_tile_the_block_from_row_zero() {
+        let s = |row_offset, rows, n_valid| EncoderSegment {
+            row_offset,
+            rows,
+            n_valid,
+        };
+        assert!(check_segments(&[s(0, 7, 7), s(7, 320, 302)]).is_ok());
+        // A gap would leave a stale row block; an overlap a cross-sequence read.
+        assert!(check_segments(&[s(0, 7, 7), s(8, 320, 302)]).is_err());
+        assert!(check_segments(&[s(0, 7, 7), s(6, 320, 302)]).is_err());
+        assert!(check_segments(&[s(1, 7, 7)]).is_err());
+        assert!(check_segments(&[s(0, 7, 8)]).is_err());
+        assert!(check_segments(&[]).is_err());
+    }
+
+    #[test]
+    fn only_the_eager_route_serves_a_biting_window_and_qtiled_needs_its_scale() {
+        use super::{attention_path, AttentionPath::*, AttnScale};
+        let gemma = AttnScale::Fixed(1.0);
+        let qwen = AttnScale::InvSqrtHeadDim;
+        let w = Some(512);
+        let (off, naive, no_gemm) = ((false, false), (true, false), (false, true));
+        let ok = |r: Result<_, String>| r.expect("route");
+        // EmbeddingGemma 2 (head_dim 256, window 512): the band bites past 513
+        // padded rows, and only the eager route may serve it.
+        assert_eq!(
+            ok(attention_path(512, 256, w, gemma, true, off)),
+            (Eager, None)
+        );
+        assert_eq!(
+            ok(attention_path(576, 256, w, gemma, true, off)),
+            (Eager, w)
+        );
+        assert_eq!(
+            ok(attention_path(200, 256, w, gemma, true, off)),
+            (Reference, None)
+        );
+        // no-gemm cannot hand a scale-1.0 family to the Q-tiled kernel.
+        assert_eq!(
+            ok(attention_path(640, 256, w, gemma, true, no_gemm)),
+            (Eager, w)
+        );
+        assert_eq!(
+            ok(attention_path(300, 256, None, gemma, true, no_gemm)),
+            (Reference, None)
+        );
+        // A 512 radius cannot restrict 513 rows.
+        assert_eq!(
+            ok(attention_path(513, 256, w, gemma, true, off)),
+            (Reference, None)
+        );
+        for refused in [
+            attention_path(514, 256, w, gemma, true, off), // unpadded rows: no eager shape
+            attention_path(576, 256, w, gemma, true, naive),
+            attention_path(576, 256, w, gemma, false, off),
+        ] {
+            assert!(refused.is_err());
+        }
+        // Qwen3.5 (1/sqrt(head_dim), no window).
+        assert_eq!(
+            ok(attention_path(576, 256, None, qwen, true, off)),
+            (Eager, None)
+        );
+        assert_eq!(
+            ok(attention_path(576, 256, None, qwen, true, no_gemm)),
+            (QTiled, None)
+        );
+        assert_eq!(
+            ok(attention_path(576, 256, None, qwen, false, off)),
+            (QTiled, None)
+        );
+        assert_eq!(
+            ok(attention_path(576, 96, None, qwen, true, off)),
+            (QTiled, None)
+        );
+        assert_eq!(
+            ok(attention_path(576, 256, None, qwen, true, naive)),
+            (Reference, None)
+        );
+    }
+}

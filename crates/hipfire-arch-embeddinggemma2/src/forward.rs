@@ -2,8 +2,8 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! The GPU encoder forward: tokens → `[n, 768]` per-token projected
-//! embeddings (pooling/normalization are host-side in [`crate::post`]).
+//! The encoder forward: tokens → `[n, 768]` per-token projected embeddings
+//! (pooling/normalization are host-side in [`crate::post`]).
 //!
 //! Layer loop mirrors HF `EmbeddingGemma2TextModel`:
 //!
@@ -19,20 +19,27 @@
 //!   `× layer_scalar`.
 //! - Final norm → `embedding_projection` (768).
 //!
+//! The layers are the typed step program in [`crate::program`]; this module
+//! stages host input, sequences the programs and drops the padding rows.
+//!
 //! Sliding window: a sliding layer attends to `|i-j| <= 512`. For
 //! `n <= window+1` that is vacuous — no mask anywhere. Longer sequences run
-//! the eager-attention path (they are ≥ 256 rows, so `padded_rows` has
-//! already made `n % 64 == 0`), where the materialized score matrix takes an
-//! additive band mask before the softmax. The small-`n` fallback kernel
-//! (`attention_text_f32`, one block per query row) is only reached below 256
-//! rows where no window can bite, and it takes the scale explicitly (1.0)
-//! — the Q-tiled encoder kernel bakes in 1/√d and cannot serve this arch.
+//! the eager-attention route (they are ≥ 256 rows, so `padded_rows` has
+//! already made `n % 64 == 0`), which takes an additive band mask before the
+//! softmax; a route without one refuses rather than mis-masks.
 //!
 //! Weights are f16 GEMM operands, activations and norms f32 — the
-//! qwen35-embed numerics contract.
+//! qwen35-embed numerics contract. [`Enc`] is the media towers' launch
+//! wrapper; the text trunk does not use it.
 
 use crate::config::EmbedConfig;
+use crate::program::{
+    attention_steps, head_steps, mlp_steps, ple_block_steps, ple_steps, EncodeScratch,
+};
 use crate::weights::EmbedWeights;
+use hipfire_dispatch::context::DispatchCtx;
+use hipfire_dispatch::pipeline::encoder::{padded_rows, EncoderSegment};
+use hipfire_dispatch::pipeline::{execute_steps, Step};
 use rdna_compute::gemm::LdsTile;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -312,7 +319,6 @@ impl<'a> Enc<'a> {
                 hd,
                 qd,
                 kvd,
-                None,
             );
         }
         if n != n_valid {
@@ -414,19 +420,9 @@ fn trace(
     Ok(())
 }
 
-/// One sequence's row block inside the concatenated batch.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct EncodeSegment {
-    /// First row of this segment in the `[T, hidden]` row block.
-    pub row_offset: usize,
-    /// Rows it occupies: its own `padded_rows(n)`.
-    pub rows: usize,
-    /// Real token count — the attention key bound.
-    pub n_valid: usize,
-}
-
-/// Validate the inputs and lay their row blocks out back to back.
-fn segment_layout(inputs: &[EncodeInput<'_>]) -> Result<Vec<EncodeSegment>, String> {
+/// Validate the inputs and lay their row blocks out back to back, each its
+/// own `padded_rows(n)` with the real token count as the attention key bound.
+fn segment_layout(inputs: &[EncodeInput<'_>]) -> Result<Vec<EncoderSegment>, String> {
     let mut segs = Vec::with_capacity(inputs.len());
     let mut row_offset = 0usize;
     for input in inputs {
@@ -435,7 +431,7 @@ fn segment_layout(inputs: &[EncodeInput<'_>]) -> Result<Vec<EncodeSegment>, Stri
             return Err("embeddinggemma2: empty input".into());
         }
         let rows = padded_rows(n);
-        segs.push(EncodeSegment {
+        segs.push(EncoderSegment {
             row_offset,
             rows,
             n_valid: n,
@@ -491,19 +487,6 @@ fn splice_media(
     Ok(())
 }
 
-/// Rows the encoder actually runs: ≥ 256 sequences are padded up to a
-/// multiple of 64 so the eager attention's PV GEMM meets its `k % 64`
-/// contract. Padding is at the END and every real query row masks the
-/// padded keys in the softmax (`n_valid` bound); the padded rows' own
-/// outputs are garbage and dropped by the caller.
-pub(crate) fn padded_rows(n: usize) -> usize {
-    if n < 256 {
-        n
-    } else {
-        n.div_ceil(64) * 64
-    }
-}
-
 /// Run the full encoder and the 768-d projection; returns `[n, embedding_dim]`
 /// row-major per-token projected embeddings, unpool­ed and unnormalized
 /// (mean pooling + L2 run host-side in [`crate::bundle`]).
@@ -533,29 +516,17 @@ pub fn encode_embeddings_batch(
     }
     let segs = segment_layout(inputs)?;
     let t_rows: usize = segs.iter().map(|s| s.rows).sum();
-    let hidden = encode_hidden_segments(gpu, w, cfg, inputs, &segs, t_rows)?;
+    let s = encode_trunk(gpu, w, cfg, inputs, &segs, t_rows)?;
 
     // Final norm + embedding projection, row-independent over the block.
-    let dim = cfg.embedding_dim;
-    let mut e = Enc::new(gpu);
-    let projected = {
-        let fin = e.alloc(t_rows * cfg.hidden_size)?;
-        e.rmsnorm(
-            &hidden,
-            &w.final_norm,
-            &fin,
-            t_rows,
-            cfg.hidden_size,
-            cfg.rms_norm_eps,
-        )?;
-        let emb = e.gemm(&w.embedding_projection, &fin, dim, cfg.hidden_size, t_rows)?;
-        e.free(fin)?;
-        emb
-    };
-    let all = e.download(&projected)?;
-    e.free(projected)?;
-    e.free(hidden)?;
+    let all = run(gpu, &head_steps(cfg, w, &s)).and_then(|()| {
+        gpu.download_f32(&s.embedding)
+            .map_err(|e| format!("embeddinggemma2: download: {e:?}"))
+    });
+    s.free_gpu(gpu)?;
+    let all = all?;
 
+    let dim = cfg.embedding_dim;
     let mut out = Vec::with_capacity(inputs.len());
     for (input, seg) in inputs.iter().zip(&segs) {
         let n = input.ids.len();
@@ -565,8 +536,9 @@ pub fn encode_embeddings_batch(
     Ok(out)
 }
 
-/// The trunk only: final-normed hidden states `[T, hidden]` as a device
-/// tensor (freed by the caller). Inspection entry point, not the serving one.
+/// The trunk only: the residual stream `[T, hidden]` after the last layer, as
+/// a device tensor (freed by the caller). Inspection entry point, not the
+/// serving one.
 pub fn encode_hidden(
     gpu: &mut Gpu,
     w: &EmbedWeights,
@@ -577,28 +549,35 @@ pub fn encode_hidden(
     if n == 0 {
         return Err("embeddinggemma2: empty input".into());
     }
-    let segs = [EncodeSegment {
+    let segs = [EncoderSegment {
         row_offset: 0,
         rows: n,
         n_valid: n,
     }];
-    encode_hidden_segments(gpu, w, cfg, std::slice::from_ref(input), &segs, n)
+    encode_trunk(gpu, w, cfg, std::slice::from_ref(input), &segs, n)?.into_hidden(gpu)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn encode_hidden_segments(
+fn run(gpu: &mut Gpu, steps: &[Step<'_>]) -> Result<(), String> {
+    let ctx = DispatchCtx::new(gpu);
+    execute_steps(gpu, &ctx, steps).map_err(|e| format!("embeddinggemma2: {e}"))
+}
+
+/// Stage the input rows and positions, then run every layer's program. The
+/// returned scratch holds the trunk output in `hidden`; it is freed on error.
+fn encode_trunk(
     gpu: &mut Gpu,
     w: &EmbedWeights,
     cfg: &EmbedConfig,
     inputs: &[EncodeInput<'_>],
-    segs: &[EncodeSegment],
+    segs: &[EncoderSegment],
     n: usize,
-) -> Result<GpuTensor, String> {
+) -> Result<EncodeScratch, String> {
     let h = cfg.hidden_size;
-    let eps = cfg.rms_norm_eps;
-    let inter = cfg.intermediate_size;
+    if cfg.ple_dim == 0 {
+        return Err("embeddinggemma2: PLE block but no PLE projection".into());
+    }
 
-    // ── prologue: host gather (× embed scale), one upload ──────────────
+    // Host gather (× embed scale), one upload.
     let scale = cfg.embed_scale();
     let mut host_hidden: Vec<f32> = Vec::with_capacity(n * h);
     for (input, seg) in inputs.iter().zip(segs) {
@@ -617,262 +596,63 @@ fn encode_hidden_segments(
         }
         host_hidden.extend_from_slice(&rows);
     }
-    let mut e = Enc::new(gpu);
-    let hidden = e.upload(&host_hidden, n * h)?;
-    trace(&mut e, || "embed (×√512)".into(), &hidden, n * h)?;
-
     // Positions: one per row, restarting per segment — padding rows continue
     // the count (their queries are dropped and their keys masked, so the
     // value never reaches an output). The rope kernel reads this buffer as
-    // i32 (see gemma4's forward_batch positions upload); the tensor stays
-    // F32-typed with the i32 bits memcpy'd in, the same DeviceBuffer
-    // contract the arch-17 encoder's pos3 upload uses.
-    let mut pos_host: Vec<i32> = Vec::with_capacity(n);
-    for seg in segs {
-        for p in 0..seg.rows {
-            pos_host.push(p as i32);
-        }
-    }
-    let pos_bytes: Vec<u8> = pos_host.iter().flat_map(|v| v.to_ne_bytes()).collect();
-    let positions = e.alloc(n)?;
-    e.gpu
-        .hip
+    // i32; the tensor stays F32-typed with the i32 bits memcpy'd in.
+    let pos_bytes: Vec<u8> = segs
+        .iter()
+        .flat_map(|seg| 0..seg.rows as i32)
+        .flat_map(|p| p.to_ne_bytes())
+        .collect();
+    let hidden = gpu
+        .upload_f32(&host_hidden, &[n * h])
+        .map_err(|e| format!("embeddinggemma2: upload: {e:?}"))?;
+    let positions = gpu
+        .alloc_tensor(&[n], DType::F32)
+        .map_err(|e| format!("embeddinggemma2: alloc: {e:?}"))?;
+    gpu.hip
         .memcpy_htod(&positions.buf, &pos_bytes)
-        .map_err(|err| format!("embeddinggemma2: positions upload: {err:?}"))?;
+        .map_err(|e| format!("embeddinggemma2: positions upload: {e:?}"))?;
 
-    // ── PLE: one projection, normed slices for every layer ────────────
-    // ple_all [n, layers*ple]: gemm → ×hidden^-0.5 → RMSNorm over each
-    // [layers, ple] slice row (batched over n*layers rows of width ple).
-    let ple_all = if cfg.ple_dim > 0 {
-        let raw = e.gemm(
-            &w.ple_projection,
-            &hidden,
-            cfg.num_layers * cfg.ple_dim,
-            h,
-            n,
-        )?;
-        e.gpu
-            .scale_f32(&raw, cfg.ple_scale())
-            .map_err(|err| format!("embeddinggemma2: ple scale: {err:?}"))?;
-        e.rmsnorm(
-            &raw,
-            &w.ple_norm,
-            &raw,
-            n * cfg.num_layers,
-            cfg.ple_dim,
-            eps,
-        )?;
-        Some(raw)
-    } else {
-        None
-    };
-
-    for (li, layer) in w.layers.iter().enumerate() {
-        let attn_cfg = cfg.attn(li);
-        let hd = attn_cfg.head_dim;
-        let heads = cfg.n_heads;
-        let kv_heads = attn_cfg.n_kv_heads;
-        let rep = heads / kv_heads;
-        let qd = cfg.q_dim(li);
-        let kvd = cfg.kv_dim(li);
-
-        // ── attention block ────────────────────────────────────────────
-        let normed = e.alloc(n * h)?;
-        e.rmsnorm(&hidden, &layer.input_ln, &normed, n, h, eps)?;
-        let q = e.gemm(&layer.q_proj, &normed, qd, h, n)?;
-        let k = e.gemm(&layer.k_proj, &normed, kvd, h, n)?;
-        let v = e.gemm(&layer.v_proj, &normed, kvd, h, n)?;
-        e.free(normed)?;
-
-        // Per-head Q/K norm (learned weight) and scale-less V norm, in place.
-        e.rmsnorm(&q, &layer.q_norm, &q, n * heads, hd, eps)?;
-        e.rmsnorm(&k, &layer.k_norm, &k, n * kv_heads, hd, eps)?;
-        e.rmsnorm(&v, &layer.v_ones, &v, n * kv_heads, hd, eps)?;
-
-        // Half-split RoPE over the full head_dim, this layer type's θ.
-        e.gpu
-            .rope_partial_halved_f32_batched(
-                &q,
-                &k,
-                &positions,
-                heads,
-                kv_heads,
-                hd,
-                hd / 2,
-                cfg.rope_theta(li),
-                n,
-            )
-            .map_err(|err| format!("embeddinggemma2: rope (layer {li}): {err:?}"))?;
-
-        let ctx = e.alloc(n * qd)?;
-        for seg in segs {
-            let mut q_s = q.sub_offset(seg.row_offset * qd, seg.rows * qd);
-            let k_s = k.sub_offset(seg.row_offset * kvd, seg.rows * kvd);
-            let v_s = v.sub_offset(seg.row_offset * kvd, seg.rows * kvd);
-            let c_s = ctx.sub_offset(seg.row_offset * qd, seg.rows * qd);
-            attention(
-                &mut e,
-                &mut q_s,
-                &k_s,
-                &v_s,
-                &c_s,
-                seg.rows,
-                seg.n_valid,
-                heads,
-                kv_heads,
-                rep,
-                hd,
-                qd,
-                kvd,
-                if cfg.window_bites(li, seg.rows) {
-                    Some(cfg.sliding_window)
-                } else {
-                    None
-                },
-            )
-            .map_err(|err| format!("embeddinggemma2: attention (layer {li}): {err:?}"))?;
+    let s = EncodeScratch::new(gpu, cfg, n, hidden, positions)?;
+    match run_layers(gpu, w, cfg, segs, &s) {
+        Ok(()) => Ok(s),
+        Err(e) => {
+            s.free_gpu(gpu)?;
+            Err(e)
         }
-        e.free(q)?;
-        e.free(k)?;
-        e.free(v)?;
-
-        let o = e.gemm(&layer.o_proj, &ctx, h, qd, n)?;
-        e.free(ctx)?;
-        // Sandwich norm on the branch output, then residual.
-        e.rmsnorm(&o, &layer.post_attn_ln, &o, n, h, eps)?;
-        e.add_inplace(&hidden, &o, "residual attn")?;
-        e.free(o)?;
-        trace(
-            &mut e,
-            || format!("layer {li} post-attn").into(),
-            &hidden,
-            n * h,
-        )?;
-
-        // ── gated gelu-tanh MLP ────────────────────────────────────────
-        let normed2 = e.alloc(n * h)?;
-        e.rmsnorm(&hidden, &layer.pre_ff_ln, &normed2, n, h, eps)?;
-        let g = e.gemm(&layer.gate_proj, &normed2, inter, h, n)?;
-        let u = e.gemm(&layer.up_proj, &normed2, inter, h, n)?;
-        e.free(normed2)?;
-        e.gpu
-            .gelu_tanh_f32(&g, &g, n * inter)
-            .map_err(|err| format!("embeddinggemma2: gelu (layer {li}): {err:?}"))?;
-        e.gpu
-            .mul_f32(&g, &u, &g)
-            .map_err(|err| format!("embeddinggemma2: gelu·up (layer {li}): {err:?}"))?;
-        e.free(u)?;
-        let d = e.gemm(&layer.down_proj, &g, h, inter, n)?;
-        e.free(g)?;
-        e.rmsnorm(&d, &layer.post_ff_ln, &d, n, h, eps)?;
-        e.add_inplace(&hidden, &d, "residual mlp")?;
-        e.free(d)?;
-        trace(
-            &mut e,
-            || format!("layer {li} post-mlp").into(),
-            &hidden,
-            n * h,
-        )?;
-
-        // ── PLE block ──────────────────────────────────────────────────
-        let ple_all = ple_all
-            .as_ref()
-            .ok_or_else(|| "embeddinggemma2: PLE block but no PLE projection".to_string())?;
-        let t = e.gemm(&layer.ple_gate, &hidden, h, h, n)?;
-        // t = gelu_tanh(t) ⊙ ple_all[:, li] (the gemma4 fused strided kernel:
-        // identical op — gelu-tanh of the gate times the layer's packed PLE
-        // slice; here ple_dim == hidden == 512).
-        e.gpu
-            .gemma4_ple_gelu_mul_strided_f32(
-                &t,
-                ple_all,
-                &t,
-                n,
-                cfg.ple_dim,
-                cfg.num_layers * cfg.ple_dim,
-                li,
-            )
-            .map_err(|err| format!("embeddinggemma2: ple gate·mul (layer {li}): {err:?}"))?;
-        let p = e.gemm(&layer.ple_proj, &t, h, cfg.ple_dim, n)?;
-        e.free(t)?;
-        e.rmsnorm(&p, &layer.ple_post_norm, &p, n, h, eps)?;
-        e.add_inplace(&hidden, &p, "residual ple")?;
-        e.free(p)?;
-
-        // ── layer_scalar on the whole residual stream ──────────────────
-        e.gpu
-            .scale_f32(&hidden, layer.layer_scalar)
-            .map_err(|err| format!("embeddinggemma2: layer_scalar (layer {li}): {err:?}"))?;
-        trace(&mut e, || format!("layer {li} end").into(), &hidden, n * h)?;
     }
-
-    if let Some(p) = ple_all {
-        e.free(p)?;
-    }
-    e.free(positions)?;
-    Ok(hidden)
 }
 
-/// One layer's bidirectional attention over one segment.
-///
-/// Eager path (WMMA arch, `n >= 256` — `padded_rows` guarantees `n % 64 == 0`
-/// there — and `hd % 64 == 0`): `S = Q·Kᵀ` per head → additive band mask on
-/// sliding layers whose window actually restricts at this length → row
-/// softmax over `[0, n_valid)` with a direct f16 store → `O = P·V`, scatter
-/// back per head. **No 1/√d**: this family scales attention by 1.0.
-///
-/// Fallback (`attention_text_f32`, one block per query row): any `n < 256`,
-/// non-WMMA arches, or `HIPFIRE_EMBED_ATTN=naive`. It takes the scale
-/// explicitly and needs no window there: below 256 rows a 512-radius window
-/// can never bite (a config with a window smaller than 255 whose sequence
-/// outruns it on the fallback is refused instead of mis-masked).
-#[allow(clippy::too_many_arguments)]
-fn attention(
-    e: &mut Enc<'_>,
-    q: &mut GpuTensor,
-    k: &GpuTensor,
-    v: &GpuTensor,
-    ctx: &GpuTensor,
-    n: usize,
-    n_valid: usize,
-    heads: usize,
-    kv_heads: usize,
-    rep: usize,
-    hd: usize,
-    qd: usize,
-    kvd: usize,
-    window: Option<usize>,
+fn run_layers(
+    gpu: &mut Gpu,
+    w: &EmbedWeights,
+    cfg: &EmbedConfig,
+    segs: &[EncoderSegment],
+    s: &EncodeScratch,
 ) -> Result<(), String> {
-    if let Some(w) = window {
-        // The eager path is masked below; every other path must refuse a
-        // window that actually restricts at this length.
-        let eager = n >= 256
-            && n % 64 == 0
-            && hd % 64 == 0
-            && (e.gpu.arch_caps.has_wmma_w32() || e.gpu.arch_caps.has_wmma_w32_gfx12())
-            && !embed_attn_naive();
-        if !eager {
-            return Err(format!(
-                "embeddinggemma2: sliding window {w} restricts at {n} rows but this \
-                 path (small-n / non-WMMA) has no band mask — refusing rather than \
-                 mis-masking"
-            ));
-        }
+    let len = s.hidden.numel();
+    let tr = |gpu: &mut Gpu, label: &dyn Fn() -> String| {
+        trace(&mut Enc::new(gpu), label, &s.hidden, len)
+    };
+    tr(gpu, &|| "embed (×√512)".into())?;
+    run(gpu, &ple_steps(cfg, w, s)).map_err(|e| format!("{e} (ple)"))?;
+    for (li, layer) in w.layers.iter().enumerate() {
+        run(gpu, &attention_steps(cfg, li, layer, s, segs))
+            .map_err(|e| format!("{e} (layer {li} attention)"))?;
+        tr(gpu, &|| format!("layer {li} post-attn"))?;
+        run(gpu, &mlp_steps(cfg, layer, s)).map_err(|e| format!("{e} (layer {li} mlp)"))?;
+        tr(gpu, &|| format!("layer {li} post-mlp"))?;
+        run(gpu, &ple_block_steps(cfg, li, layer, s))
+            .map_err(|e| format!("{e} (layer {li} ple)"))?;
+        tr(gpu, &|| format!("layer {li} end"))?;
     }
-    let wmma = e.gpu.arch_caps.has_wmma_w32() || e.gpu.arch_caps.has_wmma_w32_gfx12();
-    if !embed_attn_naive() && n >= 256 && n % 64 == 0 && hd % 64 == 0 && wmma {
-        return attention_gemm(e, q, k, v, ctx, n, n_valid, heads, rep, hd, qd, kvd, window);
-    }
-    let r = e.gpu.attention_text_f32(
-        q, k, v, None, None, ctx, n, heads, kv_heads, hd,
-        1.0, // this family scales attention by 1.0 (QK norms replace 1/√d)
-        false,
-    );
-    r.map_err(|err| format!("attention_text_f32: {err:?}"))
+    Ok(())
 }
 
-/// `HIPFIRE_EMBED_ATTN=naive` keeps the reference kernel everywhere it is
-/// correct (it has no band mask — see [`attention`]). Read once.
+/// `HIPFIRE_EMBED_ATTN=naive` keeps the towers on the reference kernel
+/// (see [`Enc::attention`]). Read once.
 fn embed_attn_naive() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
@@ -886,8 +666,8 @@ fn embed_attn_naive() -> bool {
     })
 }
 
-/// The eager decomposition (see [`attention`]). Layout identical to the
-/// qwen35-embed encoder: per-head `sub_offset` views with row pitch, V
+/// The towers' eager decomposition (see [`Enc::attention`]). Layout identical
+/// to the qwen35-embed encoder: per-head `sub_offset` views with row pitch, V
 /// transposed once per head for the second GEMM's A operand.
 #[allow(clippy::too_many_arguments)]
 fn attention_gemm(
@@ -903,7 +683,6 @@ fn attention_gemm(
     hd: usize,
     qd: usize,
     kvd: usize,
-    window: Option<usize>,
 ) -> Result<(), String> {
     let q16 = e.cast_f16(q, n * qd)?;
     let k16 = e.cast_f16(k, n * kvd)?;
@@ -923,11 +702,6 @@ fn attention_gemm(
             // S = Q_h · K_hᵀ   ([n, hd] · [hd, n] -> [n, n]) — no 1/√d fold.
             e.gemm_ld(&k_h, &q_h, &s, n, hd, n, kvd, qd, true)
                 .map_err(|err| format!("attn QK^T (head {h}): {err:?}"))?;
-            if let Some(w) = window {
-                e.gpu
-                    .attention_scores_band_mask_f32(&s, n, n, w)
-                    .map_err(|err| format!("attn band mask (head {h}): {err:?}"))?;
-            }
             // Softmax over [0, n_valid): padding keys contribute nothing.
             e.gpu
                 .attention_rows_softmax_f16(&s, &p16, n, n, 0, n_valid)
@@ -964,21 +738,10 @@ fn attention_gemm(
 
 #[cfg(test)]
 mod tests {
-    use super::{padded_rows, segment_layout, splice_media, EncodeInput, MediaRows};
+    use super::{segment_layout, splice_media, EncodeInput, MediaRows};
 
     fn input(len: usize) -> Vec<u32> {
         vec![0; len]
-    }
-
-    #[test]
-    fn padded_rows_skips_padding_below_the_eager_threshold() {
-        assert_eq!(padded_rows(0), 0);
-        assert_eq!(padded_rows(1), 1);
-        assert_eq!(padded_rows(255), 255);
-        assert_eq!(padded_rows(256), 256);
-        assert_eq!(padded_rows(257), 320);
-        assert_eq!(padded_rows(302), 320);
-        assert_eq!(padded_rows(321), 384);
     }
 
     #[test]

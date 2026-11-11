@@ -1123,7 +1123,9 @@ impl DType {
             DType::FP8E4M3PT => Some(k),
             DType::HFQ6G256 | DType::MQ6G256 | DType::MQ6G256V2 => grouped(256, 200),
             DType::MQ3G256 => grouped(256, 104),
-            DType::MQ2G256 | DType::MQ2G256Lloyd | DType::MQ2G256V2 => grouped(256, 72),
+            DType::MQ2G256 | DType::MQ2G256Lloyd | DType::MQ2G256V2 | DType::MQ2G256LloydU => {
+                grouped(256, 72)
+            }
             DType::MQ3G256Lloyd => grouped(256, 112),
             DType::MQ4G256Lloyd => grouped(256, 160),
             // HFQ4-G128 layout, see the variant.
@@ -11550,6 +11552,9 @@ mod tests {
         assert_eq!(DType::MQ4G128V2.row_bytes(129), Some(2 * 68));
         assert_eq!(DType::MQ6G256V2.row_bytes(2560), Some(10 * 200));
         assert_eq!(DType::ParoQ4G128.row_bytes(128), Some(72));
+        // qt51 is the unrotated sibling of qt19: the same 72-byte groups.
+        assert_eq!(DType::MQ2G256LloydU.row_bytes(2048), Some(8 * 72));
+        assert_eq!(DType::MQ2G256Lloyd.row_bytes(2048), Some(8 * 72));
         // SmolLM2-360M: K=960 is 15 G64 groups; it is not a whole number of G128 groups.
         assert_eq!(DType::ParoQ4G64.row_bytes(960), Some(15 * 40));
         assert_eq!(DType::ParoQ4G64.row_bytes(64), Some(40));

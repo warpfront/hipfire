@@ -22,9 +22,9 @@
 //!
 //! Conv history is stored raw/pre-conv, `[K-1, P]`, oldest -> newest.
 
-use hipfire_dispatch::ops::delta_net::{
-    execute_gated_delta, DecayAxis, GatedDeltaOp, GatedDeltaStrides,
-};
+use super::layer_ops::{checked_mul, require_tensor};
+use crate::ops::delta_net::{execute_gated_delta, DecayAxis, GatedDeltaOp, GatedDeltaStrides};
+use crate::types::DispatchError;
 use rdna_compute::gated_delta_vector::{
     rda_conv_prepare_rows_per_wave, CausalConvRowsGeom, GatedRmsnormRowsGeom, RdaConvPrepareLaunch,
     RdaPrepareLaunch, GATED_DELTA_VECTOR_HEAD_DIM,
@@ -77,7 +77,8 @@ impl RdaGeometry {
 }
 
 /// Immutable per-layer weights (F32 device tensors; BF16-origin values widened).
-pub struct RaonRdaLayer<'a> {
+#[derive(Clone, Copy)]
+pub struct RdaLayer<'a> {
     /// Depthwise conv weights `[P, K]` for q, k, v.
     pub conv_w_q: &'a GpuTensor,
     pub conv_w_k: &'a GpuTensor,
@@ -92,6 +93,7 @@ pub struct RaonRdaLayer<'a> {
 
 /// Mutable per-slot layer state: FP32 `[H,V,K]` recurrent matrix and the three
 /// raw conv histories `[K-1, P]` (oldest -> newest).
+#[derive(Clone, Copy)]
 pub struct RdaLayerState<'a> {
     pub state: &'a GpuTensor,
     pub hist_q: &'a GpuTensor,
@@ -105,6 +107,7 @@ pub struct RdaLayerState<'a> {
 }
 
 /// Projected activations, row-major, BF16-rounded FP32 planes.
+#[derive(Clone, Copy)]
 pub struct RdaProjected<'a> {
     pub q_raw: &'a GpuTensor,
     pub k_raw: &'a GpuTensor,
@@ -197,7 +200,7 @@ impl RdaScratch {
 
 /// Per-layer recurrence-input tape: non-owning `[max_rows, *]` plane views the
 /// verify forward writes INSTEAD of the scratch planes, so a partial accept can
-/// rerun the recurrence of the kept prefix ([`crate::rollback`]). `q`, `k`,
+/// rerun the recurrence of the kept prefix (the speculative rollback replay). `q`, `k`,
 /// `vprime`, `log_alpha` are `raon_rda_prepare`'s outputs (`[rows, P]`) and
 /// `beta` its `[rows, H]` output, exactly what [`execute_gated_delta`] consumes;
 /// `q_raw`/`k_raw`/`v_raw` are the pre-conv projections (`[rows, P]`) whose last
@@ -271,7 +274,7 @@ pub(crate) fn rda_recurrence(
 pub fn rda_forward_rows(
     gpu: &mut Gpu,
     geom: &RdaGeometry,
-    layer: &RaonRdaLayer<'_>,
+    layer: &RdaLayer<'_>,
     st: &RdaLayerState<'_>,
     x: &RdaProjected<'_>,
     scratch: &RdaScratch,
@@ -290,7 +293,7 @@ pub fn rda_forward_rows(
 pub fn rda_forward_rows_taped(
     gpu: &mut Gpu,
     geom: &RdaGeometry,
-    layer: &RaonRdaLayer<'_>,
+    layer: &RdaLayer<'_>,
     st: &RdaLayerState<'_>,
     x: &RdaProjected<'_>,
     scratch: &RdaScratch,
@@ -493,7 +496,7 @@ struct RowsIo<'a> {
 fn rda_rows(
     gpu: &mut Gpu,
     geom: &RdaGeometry,
-    layer: &RaonRdaLayer<'_>,
+    layer: &RdaLayer<'_>,
     st: &RdaLayerState<'_>,
     io: &RowsIo<'_>,
     chunk: Option<&GatedDeltaVectorChunkScratch>,
@@ -629,4 +632,480 @@ fn rda_rows(
         gpu.gated_rmsnorm_sigmoid_rows_f32(io.gated, io.y, io.z, layer.o_norm_gamma, &norm)
     }
     .map_err(|e| err("output gate", format!("{e:?}")))
+}
+
+/// One RDA layer core over `rows` rows (the projections around it are their
+/// own steps). The arch crate declares a layer with this typed struct and never
+/// touches a `Gpu`; dispatch checks every extent in `validate_for_gpu` before
+/// the first launch. The wave/segment kernels are picked from `rows` inside
+/// (prefill chunks of >= [`RDA_WAVE_MIN_ROWS`] rows), all bit-identical to the
+/// per-row chain except the gfx1201 chunked core.
+pub struct RdaOp<'a> {
+    pub geom: RdaGeometry,
+    pub layer: RdaLayer<'a>,
+    pub state: RdaLayerState<'a>,
+    pub x: RdaProjected<'a>,
+    pub scratch: &'a RdaScratch,
+    pub gated: &'a GpuTensor,
+    pub rows: usize,
+    /// Armed verify: the prepare outputs land in these planes (rollback source).
+    pub tape: Option<&'a RdaTape>,
+}
+
+/// The recurrence of one RDA layer over `rows` rows, without the projection and
+/// gate steps. The rollback replay reruns it over a kept prefix of a tape, where
+/// those steps have already run.
+pub struct RdaRecurrenceOp<'a> {
+    pub geom: &'a RdaGeometry,
+    pub state: &'a RdaLayerState<'a>,
+    pub q: &'a GpuTensor,
+    pub k: &'a GpuTensor,
+    pub vprime: &'a GpuTensor,
+    pub log_alpha: &'a GpuTensor,
+    pub beta: &'a GpuTensor,
+    pub output: &'a GpuTensor,
+    pub rows: usize,
+    pub chunk: Option<&'a GatedDeltaVectorChunkScratch>,
+}
+
+impl RdaOp<'_> {
+    /// Launch-free checks for [`execute_rda`]: rows against the scratch
+    /// capacity, then the F32 extent of every plane the forward reads or writes.
+    pub fn validate_for_gpu(&self, _gpu: &Gpu) -> Result<(), DispatchError> {
+        self.validate()
+    }
+
+    /// [`Self::validate_for_gpu`] without a device (host tests).
+    pub fn validate(&self) -> Result<(), DispatchError> {
+        if self.rows == 0 {
+            return Ok(());
+        }
+        let (geom, s, x, l) = (&self.geom, self.scratch, &self.x, &self.layer);
+        if self.rows > s.max_rows {
+            return Err(DispatchError::Hip(format!(
+                "rda_forward_rows: {} rows exceed scratch capacity {}",
+                self.rows, s.max_rows
+            )));
+        }
+        let (p, h) = (geom.proj(), geom.n_heads);
+        let rp = checked_mul(self.rows, p, "rda rows x P")?;
+        let rh = checked_mul(self.rows, h, "rda rows x H")?;
+        let sp = checked_mul(s.max_rows, p, "rda scratch rows x P")?;
+        let sh = checked_mul(s.max_rows, h, "rda scratch rows x H")?;
+        let conv = checked_mul(p, geom.conv_kernel, "rda conv weights")?;
+        require_f32_planes(&[
+            (x.q_raw, rp, "rda q_raw"),
+            (x.k_raw, rp, "rda k_raw"),
+            (x.v_raw, rp, "rda v_raw"),
+            (x.z, rp, "rda z"),
+            (x.f, rp, "rda f"),
+            (x.b, rh, "rda b"),
+            (x.delta, rh, "rda delta"),
+            (self.gated, rp, "rda gated"),
+            (l.conv_w_q, conv, "rda conv_w_q"),
+            (l.conv_w_k, conv, "rda conv_w_k"),
+            (l.conv_w_v, conv, "rda conv_w_v"),
+            (l.a_log, h, "rda a_log"),
+            (l.dt_bias, p, "rda dt_bias"),
+            (l.o_norm_gamma, geom.head_dim, "rda o_norm_gamma"),
+            (&s.qconv, sp, "rda scratch qconv"),
+            (&s.kconv, sp, "rda scratch kconv"),
+            (&s.vconv, sp, "rda scratch vconv"),
+            (&s.q, sp, "rda scratch q"),
+            (&s.k, sp, "rda scratch k"),
+            (&s.vprime, sp, "rda scratch vprime"),
+            (&s.log_alpha, sp, "rda scratch log_alpha"),
+            (&s.y, sp, "rda scratch y"),
+            (&s.beta, sh, "rda scratch beta"),
+        ])?;
+        if let Some(t) = self.tape {
+            require_f32_planes(&[
+                (&t.q_raw, rp, "rda tape q_raw"),
+                (&t.k_raw, rp, "rda tape k_raw"),
+                (&t.v_raw, rp, "rda tape v_raw"),
+                (&t.q, rp, "rda tape q"),
+                (&t.k, rp, "rda tape k"),
+                (&t.vprime, rp, "rda tape vprime"),
+                (&t.log_alpha, rp, "rda tape log_alpha"),
+                (&t.beta, rh, "rda tape beta"),
+            ])?;
+            // An armed verify projects straight into the tape: the rollback replays
+            // these planes, so projections landing elsewhere would replay stale rows.
+            let same = |a: &GpuTensor, b: &GpuTensor| a.buf.as_ptr() == b.buf.as_ptr();
+            if !(same(x.q_raw, &t.q_raw) && same(x.k_raw, &t.k_raw) && same(x.v_raw, &t.v_raw)) {
+                return Err(DispatchError::Hip(
+                    "rda: an armed verify must project q/k/v into the tape's raw planes".into(),
+                ));
+            }
+        }
+        require_layer_state(geom, &self.state)
+    }
+}
+
+impl RdaRecurrenceOp<'_> {
+    /// Launch-free checks for [`execute_rda_recurrence`]: the F32 extent of the
+    /// per-row planes and of the layer state.
+    pub fn validate_for_gpu(&self, _gpu: &Gpu) -> Result<(), DispatchError> {
+        self.validate()
+    }
+
+    /// [`Self::validate_for_gpu`] without a device (host tests).
+    pub fn validate(&self) -> Result<(), DispatchError> {
+        if self.rows == 0 {
+            return Ok(());
+        }
+        let rp = checked_mul(self.rows, self.geom.proj(), "rda rows x P")?;
+        let rh = checked_mul(self.rows, self.geom.n_heads, "rda rows x H")?;
+        require_f32_planes(&[
+            (self.q, rp, "rda recurrence q"),
+            (self.k, rp, "rda recurrence k"),
+            (self.vprime, rp, "rda recurrence vprime"),
+            (self.log_alpha, rp, "rda recurrence log_alpha"),
+            (self.beta, rh, "rda recurrence beta"),
+            (self.output, rp, "rda recurrence output"),
+        ])?;
+        require_layer_state(self.geom, self.state)
+    }
+}
+
+/// Each `(tensor, elements, label)` must be F32 with at least `elements` values.
+fn require_f32_planes(planes: &[(&GpuTensor, usize, &'static str)]) -> Result<(), DispatchError> {
+    for &(tensor, elements, label) in planes {
+        require_tensor(tensor, elements, DType::F32, label)?;
+    }
+    Ok(())
+}
+
+/// The slot's recurrent state and conv histories. The state tensor holds every
+/// slot, so its extent includes the slot offset.
+fn require_layer_state(geom: &RdaGeometry, st: &RdaLayerState<'_>) -> Result<(), DispatchError> {
+    let base = checked_mul(st.slot, st.state_slot_stride, "rda state slot")?;
+    let hist = checked_mul(
+        geom.conv_kernel.saturating_sub(1),
+        geom.proj(),
+        "rda conv history",
+    )?;
+    require_f32_planes(&[
+        (
+            st.state,
+            base.saturating_add(geom.state_elems()),
+            "rda state",
+        ),
+        (st.hist_q, hist, "rda conv history q"),
+        (st.hist_k, hist, "rda conv history k"),
+        (st.hist_v, hist, "rda conv history v"),
+    ])
+}
+
+/// Validates the op, then issues the forward launches of [`rda_forward_rows_taped`].
+pub fn execute_rda(gpu: &mut Gpu, op: &RdaOp<'_>) -> Result<(), DispatchError> {
+    op.validate_for_gpu(gpu)?;
+    rda_forward_rows_taped(
+        gpu, &op.geom, &op.layer, &op.state, &op.x, op.scratch, op.gated, op.rows, op.tape,
+    )
+    .map_err(DispatchError::Hip)
+}
+
+/// Validates the op, then issues the recurrence launch of [`rda_recurrence`].
+pub fn execute_rda_recurrence(
+    gpu: &mut Gpu,
+    op: &RdaRecurrenceOp<'_>,
+) -> Result<(), DispatchError> {
+    op.validate_for_gpu(gpu)?;
+    rda_recurrence(
+        gpu,
+        op.geom,
+        op.state,
+        op.q,
+        op.k,
+        op.vprime,
+        op.log_alpha,
+        op.beta,
+        op.output,
+        op.rows,
+        op.chunk,
+    )
+    .map_err(DispatchError::Hip)
+}
+
+/// The rebuild of one RDA layer's conv history after a partial accept: the
+/// last `K - 1` rows of `snapshot_history ++ raw_inputs[..keep]`, all three
+/// planes (q, k, v) at once.
+pub struct RdaHistoryRebuild<'a> {
+    /// Tensor holding the live histories: the q plane at byte `offset`, k and v
+    /// `plane_pitch` bytes after each other, `[K - 1, P]` F32 rows each.
+    pub slab: &'a GpuTensor,
+    pub offset: usize,
+    pub plane_pitch: usize,
+    /// The pre-verify copy of `slab` (same layout).
+    pub snapshot: &'a GpuTensor,
+    /// The verify's raw q/k/v projections (`raw_pitch` bytes apart, `[rows, P]`
+    /// F32 each, q first).
+    pub raw: &'a GpuTensor,
+    pub raw_pitch: usize,
+}
+
+/// Partial-accept rollback of one RDA layer whose state was restored from the
+/// pre-verify snapshot: the recurrence over the `recurrence.rows` kept rows of
+/// the tape, then the conv-history rebuild.
+pub struct RdaRollbackOp<'a> {
+    pub recurrence: RdaRecurrenceOp<'a>,
+    pub history: RdaHistoryRebuild<'a>,
+}
+
+impl RdaRollbackOp<'_> {
+    /// Launch-free checks: the recurrence's, a kept-row count, and the byte
+    /// extents both history copies read and write.
+    pub fn validate_for_gpu(&self, _gpu: &Gpu) -> Result<(), DispatchError> {
+        self.validate()
+    }
+
+    /// [`Self::validate_for_gpu`] without a device (host tests).
+    pub fn validate(&self) -> Result<(), DispatchError> {
+        self.recurrence.validate()?;
+        let (keep, h) = (self.recurrence.rows, &self.history);
+        let geom = self.recurrence.geom;
+        let hist = geom.conv_kernel.saturating_sub(1);
+        let row = geom.proj() * 4;
+        let span = |base: usize, pitch: usize, width: usize| base + 2 * pitch + width;
+        if keep == 0
+            || h.plane_pitch < hist * row
+            || h.slab.buf.size() < span(h.offset, h.plane_pitch, hist * row)
+            || h.snapshot.buf.size() < span(h.offset, h.plane_pitch, hist * row)
+            || h.raw_pitch < keep * row
+            || h.raw.buf.size() < span(0, h.raw_pitch, keep * row)
+        {
+            return Err(DispatchError::Hip(format!(
+                "rda rollback: {keep} kept rows of a [{hist}, {}] history do not fit the slab \
+                 ({} B at {} + 2 x {}), snapshot ({} B) or raw planes ({} B, pitch {})",
+                geom.proj(),
+                h.slab.buf.size(),
+                h.offset,
+                h.plane_pitch,
+                h.snapshot.buf.size(),
+                h.raw.buf.size(),
+                h.raw_pitch
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Validates the op, then reruns the recurrence and rebuilds the history: the
+/// old rows `[keep, K - 1)` of the snapshot (only when `keep < K - 1`), then
+/// the last `min(keep, K - 1)` kept raw rows, as pitched copies over the three
+/// planes on the ordered stream.
+pub fn execute_rda_rollback(gpu: &mut Gpu, op: &RdaRollbackOp<'_>) -> Result<(), DispatchError> {
+    op.validate_for_gpu(gpu)?;
+    execute_rda_recurrence(gpu, &op.recurrence)?;
+    let (keep, h) = (op.recurrence.rows, &op.history);
+    let hist = op.recurrence.geom.conv_kernel - 1;
+    let row = op.recurrence.geom.proj() * 4;
+    let m = keep.min(hist);
+    let copy_err = |what: &str, e: hip_bridge::HipError| {
+        DispatchError::Hip(format!("rda rollback conv {what}: {e:?}"))
+    };
+    if keep < hist {
+        gpu.memcpy_dtod_2d_at_ordered_async(
+            &h.slab.buf,
+            h.offset,
+            h.plane_pitch,
+            &h.snapshot.buf,
+            h.offset + keep * row,
+            h.plane_pitch,
+            (hist - keep) * row,
+            3,
+        )
+        .map_err(|e| copy_err("old rows", e))?;
+    }
+    gpu.memcpy_dtod_2d_at_ordered_async(
+        &h.slab.buf,
+        h.offset + (hist - m) * row,
+        h.plane_pitch,
+        &h.raw.buf,
+        (keep - m) * row,
+        h.raw_pitch,
+        m * row,
+        3,
+    )
+    .map_err(|e| copy_err("raw rows", e))
+}
+
+/// One stage of an RDA layer: the forward core, or the partial-accept rollback.
+pub enum RdaStage<'a> {
+    Layer(RdaOp<'a>),
+    Rollback(RdaRollbackOp<'a>),
+}
+
+impl RdaStage<'_> {
+    pub fn validate_for_gpu(&self, gpu: &Gpu) -> Result<(), DispatchError> {
+        match self {
+            RdaStage::Layer(op) => op.validate_for_gpu(gpu),
+            RdaStage::Rollback(op) => op.validate_for_gpu(gpu),
+        }
+    }
+}
+
+/// Execute one [`RdaStage`].
+pub fn execute_rda_stage(gpu: &mut Gpu, stage: &RdaStage<'_>) -> Result<(), DispatchError> {
+    match stage {
+        RdaStage::Layer(op) => execute_rda(gpu, op),
+        RdaStage::Rollback(op) => execute_rda_rollback(gpu, op),
+    }
+}
+
+#[cfg(test)]
+mod validate_tests {
+    use super::*;
+
+    /// An F32 tensor of `elems` values over a never-dereferenced buffer at a
+    /// fresh address (the tape check compares addresses).
+    fn f32(elems: usize) -> GpuTensor {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+        let addr = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) << 32;
+        GpuTensor {
+            buf: unsafe {
+                hip_bridge::DeviceBuffer::from_raw(
+                    std::ptr::without_provenance_mut(addr),
+                    elems * 4,
+                )
+            },
+            shape: vec![elems],
+            dtype: DType::F32,
+        }
+    }
+
+    struct Planes {
+        geom: RdaGeometry,
+        wide: GpuTensor,
+        state: GpuTensor,
+        scratch: RdaScratch,
+    }
+
+    /// Every plane sized for `max_rows` rows of a 2-head x 128 layer.
+    fn planes(max_rows: usize) -> Planes {
+        let geom = RdaGeometry {
+            n_heads: 2,
+            ..RdaGeometry::raon()
+        };
+        let p = max_rows * geom.proj().max(geom.conv_kernel * geom.proj());
+        Planes {
+            geom,
+            wide: f32(p),
+            state: f32(geom.state_elems()),
+            scratch: RdaScratch {
+                max_rows,
+                qconv: f32(p),
+                kconv: f32(p),
+                vconv: f32(p),
+                q: f32(p),
+                k: f32(p),
+                vprime: f32(p),
+                log_alpha: f32(p),
+                beta: f32(p),
+                y: f32(p),
+                chunk: None,
+            },
+        }
+    }
+
+    fn op<'a>(p: &'a Planes, rows: usize, x_raw: &'a GpuTensor) -> RdaOp<'a> {
+        let w = &p.wide;
+        RdaOp {
+            geom: p.geom,
+            layer: RdaLayer {
+                conv_w_q: w,
+                conv_w_k: w,
+                conv_w_v: w,
+                a_log: w,
+                dt_bias: w,
+                o_norm_gamma: w,
+            },
+            state: RdaLayerState {
+                state: &p.state,
+                hist_q: w,
+                hist_k: w,
+                hist_v: w,
+                slot: 0,
+                state_slot_stride: p.geom.state_elems(),
+            },
+            x: RdaProjected {
+                q_raw: x_raw,
+                k_raw: x_raw,
+                v_raw: x_raw,
+                z: w,
+                b: w,
+                delta: w,
+                f: w,
+            },
+            scratch: &p.scratch,
+            gated: w,
+            rows,
+            tape: None,
+        }
+    }
+
+    #[test]
+    fn layer_refuses_rows_past_the_scratch() {
+        let p = planes(4);
+        assert!(op(&p, 4, &p.wide).validate().is_ok());
+        assert!(op(&p, 5, &p.wide).validate().is_err());
+    }
+
+    /// An armed verify must project into the tape it records, or the rollback
+    /// replays rows the forward never wrote.
+    #[test]
+    fn armed_layer_projects_into_its_tape() {
+        let p = planes(4);
+        let tape_raw = f32(p.wide.numel());
+        let tape = RdaTape {
+            q_raw: tape_raw.sub_offset(0, tape_raw.numel()),
+            k_raw: tape_raw.sub_offset(0, tape_raw.numel()),
+            v_raw: tape_raw.sub_offset(0, tape_raw.numel()),
+            q: f32(p.wide.numel()),
+            k: f32(p.wide.numel()),
+            vprime: f32(p.wide.numel()),
+            log_alpha: f32(p.wide.numel()),
+            beta: f32(p.wide.numel()),
+        };
+        let armed = |x_raw| RdaOp {
+            tape: Some(&tape),
+            ..op(&p, 4, x_raw)
+        };
+        assert!(armed(&tape_raw).validate().is_ok());
+        assert!(armed(&p.wide).validate().is_err());
+    }
+
+    #[test]
+    fn rollback_needs_kept_rows_inside_the_raw_planes() {
+        let p = planes(4);
+        let w = &p.wide;
+        let row = p.geom.proj() * 4;
+        let st = op(&p, 1, w).state;
+        let rollback = |keep, raw_pitch| RdaRollbackOp {
+            recurrence: RdaRecurrenceOp {
+                geom: &p.geom,
+                state: &st,
+                q: w,
+                k: w,
+                vprime: w,
+                log_alpha: w,
+                beta: w,
+                output: w,
+                rows: keep,
+                chunk: None,
+            },
+            history: RdaHistoryRebuild {
+                slab: w,
+                offset: 0,
+                plane_pitch: 3 * row,
+                snapshot: w,
+                raw: w,
+                raw_pitch,
+            },
+        };
+        assert!(rollback(2, 4 * row).validate().is_ok());
+        assert!(rollback(0, 4 * row).validate().is_err());
+        assert!(rollback(3, 2 * row).validate().is_err());
+    }
 }

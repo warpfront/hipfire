@@ -15,10 +15,11 @@
 //!    scratch ones, see [`crate::forward::RdaRing`]);
 //! 2. [`RaonBundle::rollback_rows`] restores the persistent-slab snapshot
 //!    (RDA matrices, conv histories, device `seq_len`; the mirror watermark is
-//!    clamped by [`crate::state::RaonState::restore`]), reruns the layer's
+//!    clamped by [`crate::state::RaonState::restore`]), then runs one
+//!    `Step::Rda(RdaStage::Rollback)` per RDA layer: the layer's
 //!    `execute_gated_delta` over the first `keep` recorded rows with the same
-//!    geometry, strides and slot as `rda_forward_rows` (output discarded), and
-//!    rebuilds the conv history as the last `K - 1 = 3` rows of
+//!    geometry, strides and slot as the forward (output discarded), and the
+//!    conv history rebuilt as the last `K - 1 = 3` rows of
 //!    `snapshot_history ++ raw_inputs[..keep]` with pitched device copies;
 //! 3. the length is set to `position + keep`. The MLA latent rows past it are
 //!    dead and rewritten by the next forward; mHC carries no state.
@@ -29,7 +30,7 @@
 //! `:84-90`) forms `padded = [hist[0..K-2] (oldest -> newest), in[0..N-1]]` and
 //! stores `hist_out[j, c] = padded[N + j, c]` for `j < K - 1`, with `hist_out`
 //! rows `hist_tap_stride` apart (`rdna-compute/src/gated_delta_vector.rs:270-272`,
-//! `:294`; `rda.rs` passes `hist_tap_stride = P`). `padded[i]` is a raw input
+//! `:294`; `hipfire_dispatch::pipeline::rda` passes `hist_tap_stride = P`). `padded[i]` is a raw input
 //! row (never a post-conv value, `:84-90` read `in[]` not `out[]`), so after
 //! `keep` rows the history is `padded[keep .. keep + 3]`, the layout
 //! `[conv_hist = 3, channels]` oldest -> newest of [`crate::state::RaonState::conv_q`].
@@ -48,9 +49,13 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 
 use crate::bundle::RaonBundle;
 use crate::forward::{forward_rows_verify_tapped, RdaRing};
-use crate::rda::{rda_recurrence, RdaGeometry, RdaLayerState};
 use crate::spec_impl::RaonSpecState;
 use crate::state::RaonStateSnapshot;
+use hipfire_dispatch::context::DispatchCtx;
+use hipfire_dispatch::pipeline::rda::{
+    RdaGeometry, RdaHistoryRebuild, RdaLayerState, RdaRecurrenceOp, RdaRollbackOp, RdaStage,
+};
+use hipfire_dispatch::pipeline::Step;
 
 /// Environment variable selecting the partial-accept rollback ([`RollbackMode`]).
 pub const ROLLBACK_ENV: &str = "HIPFIRE_RAON_DFLASH_ROLLBACK";
@@ -299,68 +304,55 @@ impl RaonBundle {
         self.state.restore(gpu, snapshot)?;
 
         let ring = self.spec.ring().expect("ring ticket implies a ring");
-        let row_bytes = proj * 4;
-        let ring_plane_bytes = ring.max_rows * row_bytes;
-        // Rows of the kept inputs that enter the new history.
-        let m = keep.min(hist);
+        let ring_plane_bytes = ring.max_rows * proj * 4;
         let discard = self.work.rda_discard();
-        for ri in 0..self.config.n_rda() {
-            let tape = ring.tape(ri, &geom);
-            let st = RdaLayerState {
+        let tapes: Vec<_> = (0..self.config.n_rda())
+            .map(|ri| ring.tape(ri, &geom))
+            .collect();
+        let states: Vec<_> = (0..self.config.n_rda())
+            .map(|ri| RdaLayerState {
                 state: &self.state.rda[ri],
                 hist_q: &self.state.conv_q[ri],
                 hist_k: &self.state.conv_k[ri],
                 hist_v: &self.state.conv_v[ri],
                 slot: 0,
                 state_slot_stride: geom.state_elems(),
-            };
-            rda_recurrence(
-                gpu,
-                &geom,
-                &st,
-                &tape.q,
-                &tape.k,
-                &tape.vprime,
-                &tape.log_alpha,
-                &tape.beta,
-                discard,
-                keep,
-                None,
-            )
-            .map_err(|e| format!("raon1_mini rollback L-rda{ri} recurrence: {e}"))?;
-
-            // New history rows [0, hist) = padded[keep .. keep + hist] with
-            // padded = snapshot_history ++ raw_inputs: the old rows [keep, hist)
-            // (only when keep < hist) then the last `m` kept raw rows.
-            let base = layout.conv_off + ri * layout.layer_stride;
-            let copy_err = |what: &str, e: rdna_compute::HipError| {
-                format!("raon1_mini rollback RDA layer {ri} conv {what}: {e:?}")
-            };
-            if keep < hist {
-                gpu.memcpy_dtod_2d_at_ordered_async(
-                    &self.state.persist_tensor().buf,
-                    base,
-                    layout.plane_pitch,
-                    &snapshot.tensor().buf,
-                    base + keep * row_bytes,
-                    layout.plane_pitch,
-                    (hist - keep) * row_bytes,
-                    3,
-                )
-                .map_err(|e| copy_err("old rows", e))?;
-            }
-            gpu.memcpy_dtod_2d_at_ordered_async(
-                &self.state.persist_tensor().buf,
-                base + (hist - m) * row_bytes,
-                layout.plane_pitch,
-                &ring.layers[ri].buf,
-                (keep - m) * row_bytes,
-                ring_plane_bytes,
-                m * row_bytes,
-                3,
-            )
-            .map_err(|e| copy_err("raw rows", e))?;
-        }
+            })
+            .collect();
+        // Per RDA layer: the recurrence over the kept recorded rows, then the new
+        // history rows [0, hist) = padded[keep .. keep + hist] with padded =
+        // snapshot_history ++ raw_inputs.
+        let program: Vec<Step<'_>> = (0..self.config.n_rda())
+            .map(|ri| {
+                let tape = &tapes[ri];
+                Step::Rda(RdaStage::Rollback(RdaRollbackOp {
+                    recurrence: RdaRecurrenceOp {
+                        geom: &geom,
+                        state: &states[ri],
+                        q: &tape.q,
+                        k: &tape.k,
+                        vprime: &tape.vprime,
+                        log_alpha: &tape.log_alpha,
+                        beta: &tape.beta,
+                        output: discard,
+                        rows: keep,
+                        chunk: None,
+                    },
+                    history: RdaHistoryRebuild {
+                        slab: self.state.persist_tensor(),
+                        offset: layout.conv_off + ri * layout.layer_stride,
+                        plane_pitch: layout.plane_pitch,
+                        snapshot: snapshot.tensor(),
+                        raw: &ring.layers[ri],
+                        raw_pitch: ring_plane_bytes,
+                    },
+                }))
+            })
+            .collect();
+        let ctx = DispatchCtx::new(gpu);
+        crate::forward::run(gpu, &ctx, &program)
+            .map_err(|e| format!("raon1_mini rollback: {e}"))?;
+        drop(program);
         self.state.set_n_tokens(gpu, position + keep)
     }
 }

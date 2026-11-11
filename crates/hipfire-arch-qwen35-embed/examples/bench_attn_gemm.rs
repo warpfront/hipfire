@@ -15,7 +15,7 @@
 //! Usage: cargo run --release -p hipfire-arch-qwen35-embed \
 //!          --example bench_attn_gemm --features lab -- [n] [hd] [iters]
 
-use hipfire_arch_qwen35_embed::forward::attention_gemm_ld;
+use hipfire_dispatch::pipeline::encoder::attention_gemm_ld;
 use rdna_compute::{DType, Gpu};
 use std::time::Instant;
 

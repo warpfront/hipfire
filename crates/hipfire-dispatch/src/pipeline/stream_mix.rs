@@ -147,6 +147,17 @@ pub enum StreamMixStage<'a> {
         /// `[rows, width]` (written).
         out: &'a GpuTensor,
     },
+    /// Copy the `rows` stream rows (`n * width` wide) into an F32 plane at row
+    /// stride `dst_row_stride`, column `dst_col` (a speculative drafter's
+    /// carrier capture, or an observer's F32 view of BF16 streams). BF16
+    /// streams are widened exactly; F32 streams are copied.
+    Capture {
+        streams: &'a GpuTensor,
+        /// F32, written at `[r * dst_row_stride + dst_col, +n * width)`.
+        dst: &'a GpuTensor,
+        dst_row_stride: usize,
+        dst_col: usize,
+    },
 }
 
 /// One stream-mix stage over `rows` rows of `streams` streams of `width`.
@@ -188,6 +199,28 @@ impl StreamMixOp<'_> {
                     return Err(geometry("HelmertBounded chart needs at least 2 streams"));
                 }
                 StreamChart::HelmertBounded { .. } => {}
+            }
+        }
+        if let StreamMixStage::Capture {
+            dst,
+            dst_row_stride,
+            dst_col,
+            ..
+        } = &self.stage
+        {
+            let row = self.streams * self.width;
+            let need = (self.rows - 1)
+                .checked_mul(*dst_row_stride)
+                .and_then(|n| n.checked_add(*dst_col + row))
+                .ok_or_else(|| geometry("capture extent overflows"))?;
+            if dst.dtype != DType::F32 || *dst_row_stride < row || dst.numel() < need {
+                return Err(geometry(format!(
+                    "capture of {} rows x {row} needs an F32 destination of {need} elements at \
+                     row stride >= {row} (got {:?} x {}, stride {dst_row_stride})",
+                    self.rows,
+                    dst.dtype,
+                    dst.numel()
+                )));
             }
         }
         Ok(())
@@ -645,6 +678,29 @@ pub fn execute_stream_mix(gpu: &mut Gpu, op: &StreamMixOp<'_>) -> Result<(), Dis
                 rounding,
             })
             .map_err(|e| hip_err("stream_mix mean", e)),
+        StreamMixStage::Capture {
+            streams,
+            dst,
+            dst_row_stride,
+            dst_col,
+        } => {
+            let row = n * width;
+            if streams.dtype == DType::BF16 {
+                gpu.stream_mix_widen_rows(streams, dst, rows, row, *dst_row_stride, *dst_col)
+            } else {
+                gpu.copy_rows_strided_f32(
+                    streams,
+                    dst,
+                    rows,
+                    row,
+                    row,
+                    *dst_row_stride,
+                    *dst_col,
+                    None,
+                )
+            }
+            .map_err(|e| hip_err("stream_mix capture", e))
+        }
     }
 }
 

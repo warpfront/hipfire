@@ -246,6 +246,17 @@ pub enum LatentAttentionOp<'a> {
         out: &'a GpuTensor,
         elements: usize,
     },
+    /// `*pos += rows` on the device: the cache length advance after the last
+    /// stage of a call that read it (graph-recordable, no host write).
+    Advance { pos: &'a GpuTensor, rows: usize },
+    /// Pack a layer's expanded `kv_b` operator (`[latent, n_heads * (nope +
+    /// v_dim)]` F32: the projector applied to the identity) into the absorbed
+    /// route's BF16 weight. Load time.
+    PackAbsorbed {
+        geometry: LatentGeometry,
+        expanded: &'a GpuTensor,
+        packed: &'a GpuTensor,
+    },
 }
 
 fn refuse(msg: String) -> DispatchError {
@@ -320,11 +331,98 @@ fn resolve_range(
     }
 }
 
+impl LatentAttentionOp<'_> {
+    /// The host checks [`execute_latent_attention`] runs before a stage
+    /// launches (geometry, cache bounds, mirror admission, the attention
+    /// route's operands); launch-free. `execute_latent_attention` runs it first.
+    pub fn validate_for_gpu(&self, _gpu: &Gpu) -> Result<(), DispatchError> {
+        self.validate()
+    }
+
+    /// [`Self::validate_for_gpu`] without a device (host tests).
+    pub fn validate(&self) -> Result<(), DispatchError> {
+        match self {
+            LatentAttentionOp::NormRows { rows, width, .. } => {
+                if *rows == 0 || *width == 0 {
+                    return Err(refuse("norm rows with empty geometry".into()));
+                }
+            }
+            LatentAttentionOp::SplitKv {
+                geometry,
+                cache,
+                rows,
+                ..
+            } => {
+                check_geometry(geometry)?;
+                check_cache(cache, *rows)?;
+            }
+            LatentAttentionOp::Attention {
+                geometry,
+                cache,
+                mirror,
+                rows,
+                route,
+                ..
+            } => {
+                check_geometry(geometry)?;
+                check_cache(cache, *rows)?;
+                attention_preflight(geometry, cache, mirror.as_ref(), *rows, route)?;
+            }
+            LatentAttentionOp::GatherLatent {
+                geometry,
+                cache,
+                range,
+                ..
+            } => {
+                check_geometry(geometry)?;
+                resolve_range(cache, *range)?;
+            }
+            LatentAttentionOp::Decompress {
+                geometry,
+                cache,
+                mirror,
+                expansion,
+                range,
+            } => {
+                check_geometry(geometry)?;
+                let mirror_end = match range {
+                    RowRange::Absolute { start, count } => start.checked_add(*count),
+                    RowRange::NewRows { count } => cache.host_pos.map(|p| p + *count),
+                };
+                check_mirror(mirror, mirror_end)?;
+                resolve_range(cache, *range)?;
+                if mirror.q8 && matches!(expansion, KvExpansion::Dense { .. }) {
+                    return Err(refuse(
+                        "the dense expansion writes BF16 mirrors only; a Q8 mirror takes the \
+                         external expansion"
+                            .into(),
+                    ));
+                }
+            }
+            LatentAttentionOp::Gate { elements, .. } => {
+                if *elements == 0 {
+                    return Err(refuse("gate with no elements".into()));
+                }
+            }
+            LatentAttentionOp::Advance { pos, rows } => {
+                if *rows == 0 || pos.buf.size() < 4 {
+                    return Err(refuse(
+                        "position advance needs rows and an i32 counter".into(),
+                    ));
+                }
+            }
+            LatentAttentionOp::PackAbsorbed { geometry, .. } => check_geometry(geometry)?,
+        }
+        Ok(())
+    }
+}
+
 /// Execute one latent-attention stage.
 pub fn execute_latent_attention(
     gpu: &mut Gpu,
     op: &LatentAttentionOp<'_>,
 ) -> Result<(), DispatchError> {
+    op.validate()?;
     match op {
         LatentAttentionOp::NormRows {
             x,
@@ -480,6 +578,23 @@ pub fn execute_latent_attention(
             out,
             elements,
         } => gpu.latent_attention_gate(y, g, out, *elements).map_err(hip),
+        LatentAttentionOp::Advance { pos, rows } => {
+            gpu.device_counter_add_i32(pos, *rows as i32).map_err(hip)
+        }
+        LatentAttentionOp::PackAbsorbed {
+            geometry,
+            expanded,
+            packed,
+        } => gpu
+            .latent_attention_absorb_pack(
+                expanded,
+                packed,
+                geometry.n_heads,
+                geometry.nope,
+                geometry.v_dim,
+                geometry.latent,
+            )
+            .map_err(hip),
     }
 }
 
@@ -498,6 +613,44 @@ fn need_mirror<'m, 'a>(
     Ok(m)
 }
 
+/// The refusals of [`attention`] that need no device: the mirror a route
+/// reads (present, admitted for `host_pos + rows`, BF16 for the reference
+/// kernel) and the absorbed route's packed weight. [`attention`] runs it
+/// before its first launch and `validate_for_gpu` runs it as preflight.
+fn attention_preflight(
+    g: &LatentGeometry,
+    cache: &LatentCache<'_>,
+    mirror: Option<&ExpandedMirror<'_>>,
+    rows: usize,
+    route: &AttentionRoute<'_>,
+) -> Result<(), DispatchError> {
+    match route {
+        AttentionRoute::Reference => {
+            if need_mirror(mirror, cache, rows, "reference")?.q8 {
+                return Err(refuse(
+                    "the reference attention route does not read a Q8 expanded mirror".into(),
+                ));
+            }
+        }
+        AttentionRoute::Tiled { .. } | AttentionRoute::TiledRows { .. } => {
+            need_mirror(mirror, cache, rows, "tiled")?;
+        }
+        AttentionRoute::Absorbed { ops, .. } | AttentionRoute::AbsorbedRows { ops, .. } => {
+            let packed_ok = ops.packed.dtype == rdna_compute::DType::BF16
+                && ops.packed.numel()
+                    >= rdna_compute::latent_attention_absorb::latent_attention_absorb_packed_elems(
+                        g.n_heads, g.nope, g.v_dim, g.latent,
+                    );
+            if !packed_ok {
+                return Err(refuse(
+                    "absorbed route: packed expansion weight is missing or undersized".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Run the selected attention route for one stage.
 #[allow(clippy::too_many_arguments)]
 fn attention(
@@ -511,15 +664,11 @@ fn attention(
     scale: f32,
     route: &AttentionRoute<'_>,
 ) -> Result<(), DispatchError> {
+    attention_preflight(g, cache, mirror, rows, route)?;
     let width = g.row_width();
     match route {
         AttentionRoute::Reference => {
             let m = need_mirror(mirror, cache, rows, "reference")?;
-            if m.q8 {
-                return Err(refuse(
-                    "the reference attention route does not read a Q8 expanded mirror".into(),
-                ));
-            }
             gpu.latent_attention_serial(
                 q,
                 cache.rows,
@@ -603,16 +752,7 @@ fn attention(
         AttentionRoute::Absorbed { ops, workspace }
         | AttentionRoute::AbsorbedRows { ops, workspace, .. } => {
             let rows_route = route.rows_route();
-            let packed_ok = ops.packed.dtype == rdna_compute::DType::BF16
-                && ops.packed.numel()
-                    >= rdna_compute::latent_attention_absorb::latent_attention_absorb_packed_elems(
-                        g.n_heads, g.nope, g.v_dim, g.latent,
-                    );
-            if !packed_ok {
-                return Err(refuse(
-                    "absorbed route: packed expansion weight is missing or undersized".into(),
-                ));
-            }
+            // The packed weight was admitted by `attention_preflight`.
             gpu.latent_attention_absorb_q(
                 q, ops.packed, ops.q_abs, rows, g.n_heads, g.nope, g.tail, g.v_dim, g.latent,
             )
@@ -722,5 +862,119 @@ mod rows_route_tests {
             .rows_route(),
             MlaRowsRoute::Flash
         );
+    }
+}
+
+#[cfg(test)]
+mod validate_tests {
+    use super::*;
+
+    fn t(elements: usize, dtype: rdna_compute::DType) -> GpuTensor {
+        let mut t = GpuTensor::null_for_test();
+        t.shape = vec![elements];
+        t.dtype = dtype;
+        t
+    }
+
+    const G: LatentGeometry = LatentGeometry {
+        n_heads: 2,
+        nope: 8,
+        tail: 4,
+        v_dim: 8,
+        latent: 16,
+    };
+
+    fn attention<'a>(
+        cache: LatentCache<'a>,
+        mirror: Option<ExpandedMirror<'a>>,
+        x: &'a GpuTensor,
+        rows: usize,
+        route: AttentionRoute<'a>,
+    ) -> LatentAttentionOp<'a> {
+        LatentAttentionOp::Attention {
+            geometry: G,
+            cache,
+            mirror,
+            q: x,
+            y: x,
+            rows,
+            scale: 1.0,
+            route,
+        }
+    }
+
+    /// Preflight refuses every attention operand the launch path would refuse,
+    /// before the projections and the cache write of the layer ran.
+    #[test]
+    fn attention_preflight_matches_the_launch_refusals() {
+        use rdna_compute::DType::{BF16, F32};
+        let (x, pos) = (t(64, F32), t(1, F32));
+        let cache = LatentCache {
+            rows: &x,
+            capacity_rows: 8,
+            pos: &pos,
+            host_pos: Some(4),
+        };
+        let mirror = |capacity_rows, q8| ExpandedMirror {
+            knope: &x,
+            vmir: &x,
+            capacity_rows,
+            q8,
+        };
+        let tiled = AttentionRoute::Tiled { workspace: None };
+        assert!(attention(cache, Some(mirror(8, false)), &x, 4, tiled)
+            .validate()
+            .is_ok());
+        // The cache, then the mirror, must hold host_pos + rows.
+        assert!(attention(cache, Some(mirror(8, false)), &x, 5, tiled)
+            .validate()
+            .is_err());
+        assert!(attention(cache, Some(mirror(7, false)), &x, 4, tiled)
+            .validate()
+            .is_err());
+        assert!(attention(cache, None, &x, 1, tiled).validate().is_err());
+        let reference = AttentionRoute::Reference;
+        assert!(attention(cache, Some(mirror(8, true)), &x, 1, reference)
+            .validate()
+            .is_err());
+        let elems = rdna_compute::latent_attention_absorb::latent_attention_absorb_packed_elems(
+            2, 8, 8, 16,
+        );
+        let packed = t(elems, BF16);
+        let short = t(16, BF16);
+        let absorbed = |p| AttentionRoute::Absorbed {
+            ops: AbsorbOperands {
+                packed: p,
+                q_abs: &x,
+                z: &x,
+            },
+            workspace: None,
+        };
+        assert!(attention(cache, None, &x, 1, absorbed(&packed))
+            .validate()
+            .is_ok());
+        assert!(attention(cache, None, &x, 1, absorbed(&short))
+            .validate()
+            .is_err());
+    }
+
+    #[test]
+    fn advance_needs_rows_and_a_counter() {
+        // A 4-byte counter (never dereferenced: validation is host-only).
+        let mut pos = t(1, rdna_compute::DType::F32);
+        pos.buf = unsafe { hip_bridge::DeviceBuffer::from_raw(std::ptr::dangling_mut(), 4) };
+        let empty = t(0, rdna_compute::DType::F32);
+        assert!(LatentAttentionOp::Advance { pos: &pos, rows: 1 }
+            .validate()
+            .is_ok());
+        assert!(LatentAttentionOp::Advance { pos: &pos, rows: 0 }
+            .validate()
+            .is_err());
+        assert!(LatentAttentionOp::Advance {
+            pos: &empty,
+            rows: 1
+        }
+        .validate()
+        .is_err());
     }
 }
