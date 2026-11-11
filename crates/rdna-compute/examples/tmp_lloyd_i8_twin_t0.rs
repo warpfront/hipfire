@@ -139,8 +139,14 @@ fn oracle_lloyd_i8(x: &[f32], w: &[u8], m: usize, k: usize, n: usize, codes: [i8
                 // Weight half + codes.
                 let (g, h) = (kb / 2, kb % 2);
                 let o = r * row_bytes + g * 136;
-                let sc = f32::from(half::f16::from_bits(u16::from_le_bytes([w[o + 4 * h], w[o + 4 * h + 1]])));
-                let zp = f32::from(half::f16::from_bits(u16::from_le_bytes([w[o + 4 * h + 2], w[o + 4 * h + 3]])));
+                let sc = f32::from(half::f16::from_bits(u16::from_le_bytes([
+                    w[o + 4 * h],
+                    w[o + 4 * h + 1],
+                ])));
+                let zp = f32::from(half::f16::from_bits(u16::from_le_bytes([
+                    w[o + 4 * h + 2],
+                    w[o + 4 * h + 3],
+                ])));
                 let scp = sc * 0.0625;
                 let mut dot = 0i32;
                 let mut s = 0i32;
@@ -180,14 +186,7 @@ fn oracle_lloyd_i8_gateup(
     codes_g: [i8; 16],
     codes_u: [i8; 16],
 ) -> Vec<f32> {
-    fn arm(
-        x: &[f32],
-        w: &[u8],
-        m: usize,
-        k: usize,
-        n: usize,
-        codes: [i8; 16],
-    ) -> Vec<f32> {
+    fn arm(x: &[f32], w: &[u8], m: usize, k: usize, n: usize, codes: [i8; 16]) -> Vec<f32> {
         oracle_lloyd_i8(x, w, m, k, n, codes)
     }
     let g = arm(x, wg, m, k, n, codes_g);
@@ -400,8 +399,17 @@ fn main() {
             }
             eprintln!("qs mismatches: {mism}/128");
         }
-        let v_to = if rel_to <= 1e-5 { "TWIN-PASS" } else { fails += 1; "TWIN-CHECK" };
-        let v_tx = if rel_tx < 5e-2 { "BAND-PASS" } else { "BAND-CHECK" };
+        let v_to = if rel_to <= 1e-5 {
+            "TWIN-PASS"
+        } else {
+            fails += 1;
+            "TWIN-CHECK"
+        };
+        let v_tx = if rel_tx < 5e-2 {
+            "BAND-PASS"
+        } else {
+            "BAND-CHECK"
+        };
         eprintln!(
             "residual N={n}: twin {tt:.6}s x128 {tx:.6}s delta {:+.1}% | twin-vs-oracle max_abs={max_to:.3e} rel_l2={rel_to:.3e} {v_to} | twin-vs-x128 rel_l2={rel_tx:.3e} {v_tx}",
             (tt / tx - 1.0) * 100.0
@@ -472,8 +480,10 @@ fn main() {
                 } else {
                     gpu.hip.memset(&hg.buf, 0, n * G * 4).expect("zero g");
                     gpu.hip.memset(&hu.buf, 0, n * G * 4).expect("zero u");
-                    gpu.gemm_gate_up_mq4g256v2_mmq_lloyd(&wg, &wu, &x, &hg, &hu, G, G, K, n, c16, c16u)
-                        .expect("x128");
+                    gpu.gemm_gate_up_mq4g256v2_mmq_lloyd(
+                        &wg, &wu, &x, &hg, &hu, G, G, K, n, c16, c16u,
+                    )
+                    .expect("x128");
                     gpu.hip.device_synchronize().expect("iter sync");
                 }
             });
@@ -488,7 +498,12 @@ fn main() {
             let o = oracle_lloyd_i8_gateup(&xh, &whost_g, &whost_u, G, K, n, codes, codes_u);
             let (max_to, rel_to) = rel_l2(&b, &o);
             let (max_tx, rel_tx) = rel_l2(&b, &a);
-            let v_to = if rel_to <= 1e-5 { "TWIN-PASS" } else { fails += 1; "TWIN-CHECK" };
+            let v_to = if rel_to <= 1e-5 {
+                "TWIN-PASS"
+            } else {
+                fails += 1;
+                "TWIN-CHECK"
+            };
             eprintln!(
                 "gate_up N={n}: twin {tt:.6}s x128 {tx:.6}s delta {:+.1}% | twin-vs-oracle max_abs={max_to:.3e} rel_l2={rel_to:.3e} {v_to} | twin-vs-x128 rel_l2={rel_tx:.3e}",
                 (tt / tx - 1.0) * 100.0

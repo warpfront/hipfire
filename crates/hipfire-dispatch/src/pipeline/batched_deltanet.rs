@@ -997,7 +997,7 @@ pub fn batch_chunk_delta_net_input_projection(
         )?;
     } else if is_mq4v2_lloyd {
         // qt=52: all four projections Lloyd. Small-N gfx1100 → F16-BT-LUT;
-        // N>=128 or other gfx11 → MMQ-LUT; gfx12 FP8-LUT.
+        // N>=64 or other gfx11 → MMQ-LUT; gfx12 FP8-LUT.
         if lloyd_f16_bt_route(gpu, n) {
             gpu.gemm_qkvza_mq4g256v2_wmma_gfx11_lloyd(
                 &layer.wqkv.buf,
