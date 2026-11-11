@@ -7641,9 +7641,15 @@ mod tests {
         assert_eq!(parse(Some("0")), Ok(EpHotUnits::Off));
         assert_eq!(parse(Some(" 0 ")), Ok(EpHotUnits::Off));
         assert_eq!(parse(Some("")), Ok(EpHotUnits::Off));
+        // Absolute on this platform (`/m/...` has no drive, so it is relative on Windows).
+        let sidecar = if cfg!(windows) {
+            r"C:\m\q.mq4.ep.hot-units"
+        } else {
+            "/m/q.mq4.ep.hot-units"
+        };
         assert_eq!(
-            parse(Some(" /m/q.mq4.ep.hot-units ")),
-            Ok(EpHotUnits::Explicit("/m/q.mq4.ep.hot-units".into()))
+            parse(Some(&format!(" {sidecar} "))),
+            Ok(EpHotUnits::Explicit(sidecar.into()))
         );
         for bad in ["1", "on", "q.ep.hot-units", "./q.ep.hot-units"] {
             let error = parse(Some(bad)).unwrap_err();
