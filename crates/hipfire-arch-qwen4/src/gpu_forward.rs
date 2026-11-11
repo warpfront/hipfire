@@ -10104,6 +10104,13 @@ impl<'a> LayerPhaseEnv<'a> {
                     zba_fold: self.trunk_zba.get(layer_index).and_then(Option::as_ref),
                     trunk_a4: self.trunk_a4.get(layer_index).copied().unwrap_or(0),
                     phase: MixerPhase::Whole,
+                    // Ordinary prefill (the explicit intent, singleton tails
+                    // included) appends to the layer's WY stream at absolute tile
+                    // and seam positions; decode and verify are consumers of
+                    // the live slot and seal an open stream first.
+                    carry: bundle
+                        .state
+                        .gdn_carry_view(gdn_slot, self.prefill_scope),
                 }));
             }
             LayerType::FullAttention => {

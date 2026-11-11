@@ -17,6 +17,12 @@ use crate::{DType, Gpu, GpuTensor};
 pub(crate) mod npu_arena;
 pub use npu_arena::*;
 
+// Absolute-position WY (C16) chunk-scan stream with F32 continuation and
+// replay of the incomplete tile: a child module so it shares the chunk
+// launchers' private validators and state converters.
+#[path = "gdn_wy_stream.rs"]
+pub mod gdn_wy_stream;
+
 // Multi-lane QSA decode core (fn-lanes, exact gfx1201): a child module so it
 // shares the singleton launchers' private validators and route predicates.
 #[path = "qsa_core_lanes.rs"]
@@ -1087,13 +1093,14 @@ pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) ->
     )
 }
 
-/// Rollback kernel of a state's STORAGE format (`format.storage()`): the Q8Ef
-/// rollback is the plain-Q8 replay (the ring is plain Q8); the Q8Ef entry set
-/// has no rollback kernel.
-fn gdn_rollback_kernel(storage: GdnStateFormat) -> &'static str {
-    match storage.storage() {
-        GdnStateFormat::F32 => "gated_delta_rollback_layers_f32",
-        GdnStateFormat::Q8 | GdnStateFormat::Q8Ef => "gated_delta_rollback_layers_q8",
+/// Single-launch rollback kernel of a state's STORAGE format. Q8Ef has no
+/// single-launch kernel: its rollback must carry the residual and runs
+/// [`gated_delta_rollback_layers_ef`] instead.
+fn gdn_rollback_kernel(storage: GdnStateFormat) -> Option<&'static str> {
+    match storage {
+        GdnStateFormat::F32 => Some("gated_delta_rollback_layers_f32"),
+        GdnStateFormat::Q8 => Some("gated_delta_rollback_layers_q8"),
+        GdnStateFormat::Q8Ef => None,
     }
 }
 
@@ -1104,11 +1111,9 @@ fn gdn_rollback_kernel(storage: GdnStateFormat) -> &'static str {
 /// ring slot `from` and leaves the last kept row's state in slot
 /// `to + keep - 1`. 128-wide heads.
 ///
-/// Rollback is storage-based: there is no EF rollback kernel.  A
-/// [`GdnStateFormat::Q8Ef`] rollback replays the plain-Q8 ring with
-/// `gated_delta_rollback_layers_q8` (the ring holds no residual), and the
-/// CALLER then zeroes every rolled-back layer's live residual with
-/// [`gdn_q8ef_residual_zero`] in stream order.
+/// A [`GdnStateFormat::Q8Ef`] state is refused: replaying only its plain-Q8
+/// ring would discard the residual. Its rollback is
+/// [`gated_delta_rollback_layers_ef`].
 pub struct GatedDeltaRollbackLayers<'a> {
     pub table: &'a GpuTensor,
     pub discard: &'a GpuTensor,
@@ -1142,7 +1147,12 @@ pub fn gated_delta_rollback_layers(
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
     }
     let storage = p.format.storage();
-    let kernel = gdn_rollback_kernel(storage);
+    let Some(kernel) = gdn_rollback_kernel(p.format) else {
+        return Err(HipError::new(
+            0,
+            "GDN rollback: a Q8Ef state rolls back with its residual (gated_delta_rollback_layers_ef)",
+        ));
+    };
     gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
     let mut args = KernargBlob::new();
     args.push_ptr(p.table.buf.as_ptr());
@@ -1175,6 +1185,101 @@ pub fn gated_delta_rollback_layers(
         args.as_mut_slice(),
         crate::dispatch::ReplayLaunchBindings::NONE,
     )
+}
+
+/// One layer of a Q8Ef verify rollback ([`gated_delta_rollback_layers_ef`]).
+pub struct GatedDeltaRollbackEfLayer<'a> {
+    /// The captured recurrence input of the verify: the `rows`-row convolution
+    /// output `[rows, qkv]`, then gate and beta `[rows, value_heads]` each
+    /// (F32).
+    pub recurrence: &'a GpuTensor,
+    /// The layer's plain-Q8 slot ring (`Raw`, `slot_units` bytes per slot).
+    pub ring: &'a GpuTensor,
+    /// The layer's live F16 residual. The caller first restores the ENTRY
+    /// residual (the residual before the verify) into it; the replay leaves
+    /// the last kept row's residual in it.
+    pub residual: &'a GpuTensor,
+}
+
+/// Q8Ef partial verify rollback: re-run the first `keep` of `rows` captured
+/// rows of every layer from ring slot `from` and the entry residual with the
+/// capture kernel (`gated_delta_step_*_capture_q8ef`: the single-row AR step's
+/// residual-fed per-row boundary), leaving the last kept row's slot in ring
+/// slot `to + keep - 1` and its residual in the live plane. Unlike the plain-Q8
+/// replay this is the AR chain's own state, so nothing is zeroed and no
+/// stochastic surrogate runs. One capture launch per layer.
+pub struct GatedDeltaRollbackEf<'a> {
+    pub layers: &'a [GatedDeltaRollbackEfLayer<'a>],
+    pub discard: &'a GpuTensor,
+    pub rows: usize,
+    pub keep: usize,
+    pub from: usize,
+    pub to: usize,
+    pub qkv_width: usize,
+    pub key_heads: usize,
+    pub value_heads: usize,
+    /// Absolute position of the last kept row.
+    pub position: usize,
+}
+
+pub fn gated_delta_rollback_layers_ef(
+    gpu: &mut Gpu,
+    p: &GatedDeltaRollbackEf<'_>,
+) -> HipResult<()> {
+    let value = checked_product(p.value_heads, 128, "GDN EF rollback value width")?;
+    if p.keep == 0
+        || p.keep > p.rows
+        || p.key_heads == 0
+        || !p.value_heads.is_multiple_of(p.key_heads)
+        || p.qkv_width != 2 * 128 * p.key_heads + value
+        || p.discard.numel() < checked_product(p.keep, value, "GDN EF rollback output")?
+    {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    let format = GdnStateFormat::Q8Ef;
+    let slot = format.storage().state_units(p.value_heads, 128, 128);
+    let qkv_rows = checked_product(p.rows, p.qkv_width, "GDN EF rollback input rows")?;
+    let head_rows = checked_product(p.rows, p.value_heads, "GDN EF rollback parameter rows")?;
+    let kept_qkv = checked_product(p.keep, p.qkv_width, "GDN EF rollback kept rows")?;
+    let kept_heads = checked_product(p.keep, p.value_heads, "GDN EF rollback kept parameters")?;
+    let output = p.discard.sub_offset(0, checked_product(p.keep, value, "GDN EF rollback output")?);
+    for layer in p.layers {
+        if layer.recurrence.numel()
+            < checked_add(
+                qkv_rows,
+                checked_product(2, head_rows, "GDN EF rollback parameters")?,
+                "GDN EF rollback input",
+            )?
+        {
+            return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+        }
+        let projection = layer.recurrence.sub_offset(0, kept_qkv);
+        let gate = layer.recurrence.sub_offset(qkv_rows, kept_heads);
+        let beta = layer.recurrence.sub_offset(qkv_rows + head_rows, kept_heads);
+        let state = layer.ring.sub_offset(p.from * slot, slot);
+        let ring = layer.ring.sub_offset(p.to * slot, p.keep * slot);
+        gated_delta_step_batched(
+            gpu,
+            &GatedDeltaStepBatched {
+                projection: &projection,
+                gate: &gate,
+                beta: &beta,
+                state: &state,
+                format,
+                residual: Some(layer.residual),
+                output: &output,
+                row_states: Some(&ring),
+                rows: p.keep,
+                qkv_width: p.qkv_width,
+                key_heads: p.key_heads,
+                value_heads: p.value_heads,
+                key_dim: 128,
+                value_dim: 128,
+                position: p.position + 1 - p.keep,
+            },
+        )?;
+    }
+    Ok(())
 }
 /// Whether [`gated_delta_step_gate_wmma`] applies: the Qwen4 F16 prefill
 /// route (gfx11 WMMA, >= QWEN4_F16_WMMA_MIN_TOKENS rows, no recorder or capture,
@@ -22730,14 +22835,17 @@ mod gdn_q8ef_tests {
 
     #[test]
     fn gdn_q8ef_live_layout_rollback_converters_and_chunk_selection() {
-        // Storage-based rollback: no EF rollback kernel.
-        assert_eq!(gdn_rollback_kernel(F32), "gated_delta_rollback_layers_f32");
-        assert_eq!(gdn_rollback_kernel(Q8), "gated_delta_rollback_layers_q8");
+        // The single-launch rollback has no Q8Ef kernel: a Q8Ef state rolls
+        // back with its residual (`gated_delta_rollback_layers_ef`).
         assert_eq!(
-            gdn_rollback_kernel(EF.storage()),
-            "gated_delta_rollback_layers_q8"
+            gdn_rollback_kernel(F32),
+            Some("gated_delta_rollback_layers_f32")
         );
-        assert_eq!(gdn_rollback_kernel(EF), "gated_delta_rollback_layers_q8");
+        assert_eq!(
+            gdn_rollback_kernel(Q8),
+            Some("gated_delta_rollback_layers_q8")
+        );
+        assert_eq!(gdn_rollback_kernel(EF), None);
         assert!(EF.storage().has_frame_kernarg());
         // Frames: plain Q8 only.
         assert!(Q8.has_frame_kernarg());

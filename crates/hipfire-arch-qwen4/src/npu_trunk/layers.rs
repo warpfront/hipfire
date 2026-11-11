@@ -196,6 +196,7 @@ pub(super) fn build_program<'a>(
                     zba_fold: owner.trunk_zba.get(layer_index).and_then(Option::as_ref),
                     trunk_a4: owner.trunk_a4.get(layer_index).copied().unwrap_or(0),
                     phase: MixerPhase::Whole,
+                    carry: None,
                 }));
             }
             LayerType::FullAttention => {
