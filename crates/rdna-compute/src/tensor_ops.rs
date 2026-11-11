@@ -35,6 +35,12 @@ pub use qsa_core_lanes::{
 };
 pub(crate) use qsa_core_lanes::{QSA_LANES_FUSE_SRC, QSA_LANES_SRC};
 
+// The same core on exact gfx942 (F32 / E4M3-FNUZ K/V, F32 index keys): admission only, the
+// kernels and launcher live in `cdna/gfx942_qsa_lanes.rs`.
+#[path = "qsa_core_lanes_gfx942.rs"]
+mod qsa_core_lanes_gfx942;
+pub use qsa_core_lanes_gfx942::{qsa_core_lanes_gfx942, qsa_core_lanes_gfx942_min};
+
 pub(crate) const TENSOR_OPS_SRC: &str = concat!(
     include_str!("../../../kernels/src/mq_fwht256.h"),
     include_str!("../../../kernels/src/rope_yarn.h"),

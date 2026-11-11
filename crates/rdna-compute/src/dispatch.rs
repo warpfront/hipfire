@@ -1858,6 +1858,10 @@ pub struct Gpu {
     pub(crate) gdn_lanes_f32_tables: crate::cdna::gfx942::GdnLanesTableCache,
     /// Model-scoped Redline warmup recorder and fail-closed backend gate.
     pub replay: crate::replay::ReplayController,
+    /// Device lane tables of the gfx942 batched QSA decode core
+    /// ([`crate::cdna::gfx942::Gfx942Device::qwen4_qsa_lanes_core`]), keyed by their content:
+    /// built once per layer and lane set, never rewritten.
+    pub(crate) qsa_lanes_gfx942_tables: crate::cdna::gfx942::QsaLanesTableCache,
     /// Artifact-level MQ4V2 grid contract. Set by the model loader from HFQ
     /// metadata; false for legacy/asymmetric artifacts.
     pub mq4v2_symmetric: bool,
@@ -3352,6 +3356,7 @@ impl Gpu {
                 pm_decode,
             },
             replay: crate::replay::ReplayController::from_config(),
+            qsa_lanes_gfx942_tables: Default::default(),
             mq4v2_symmetric: false,
             fp8_verify_scope: false,
             iu4_verify_scope: false,

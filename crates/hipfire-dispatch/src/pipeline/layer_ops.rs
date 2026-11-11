@@ -5554,7 +5554,10 @@ pub fn execute_indexed_attention_core_lanes(
     out_proj: Option<&IndexedAttentionOp<'_>>,
     before_launch: impl FnOnce(&mut Gpu) -> Result<(), DispatchError>,
 ) -> Result<bool, DispatchError> {
-    if ops.len() < 2 || ops.len() > QSA_CORE_LANES_MAX || !gpu.flags.qwen4_qsa_lanes_enabled() {
+    if ops.len() < 2
+        || ops.len() > super::qsa::core_lanes_group_max(gpu)
+        || !gpu.flags.qwen4_qsa_lanes_enabled()
+    {
         return Ok(false);
     }
     let i32_bytes = std::mem::size_of::<i32>();
@@ -5713,6 +5716,11 @@ pub fn execute_indexed_attention_core_lanes(
             }
         })
         .collect();
+    // Exact gfx942 (`HIPFIRE_QWEN4_QSA_LANES`, default off): five launches over every lane
+    // (`pipeline/qsa.rs`); the gfx1201 kernels below are not admitted there.
+    if gpu.arch_caps.is_gfx942() {
+        return super::qsa::execute_core_lanes_gfx942(gpu, &lanes, before_launch);
+    }
     let Some(plan) = hip(qsa_core_lanes(gpu, &lanes))? else {
         return Ok(false);
     };

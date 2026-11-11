@@ -249,19 +249,21 @@ pub(crate) fn qsa_lanes_gpu_refusal(
 
 /// What a lane's pool launch must agree with: the lane's prologue / select
 /// scalars and key arenas.
-struct PoolExpect {
-    position: usize,
-    rows: usize,
-    compress: usize,
-    blocks: usize,
-    index_kv_width: usize,
-    raw_keys: *mut std::ffi::c_void,
-    pooled: *mut std::ffi::c_void,
+pub(super) struct PoolExpect {
+    pub(super) position: usize,
+    pub(super) rows: usize,
+    pub(super) compress: usize,
+    pub(super) blocks: usize,
+    pub(super) index_kv_width: usize,
+    pub(super) raw_keys: *mut std::ffi::c_void,
+    pub(super) pooled: *mut std::ffi::c_void,
+    /// Dtype of the raw and pooled index-key arenas (`QsaKvFormat::index_dtype`).
+    pub(super) index_dtype: DType,
 }
 
 /// Why a lane's pool launch (as the interpreter issues it) is not the one the
 /// lane kernels twin, or `None`.
-fn pool_refusal(
+pub(super) fn pool_refusal(
     pool: Option<&IndexedAttentionPoolRope<'_>>,
     expect: &PoolExpect,
 ) -> Option<&'static str> {
@@ -273,6 +275,7 @@ fn pool_refusal(
         index_kv_width,
         raw_keys,
         pooled,
+        index_dtype,
     } = *expect;
     let Some(p) = pool else {
         return (blocks != 0).then_some("no pool launch for a lane that completes blocks");
@@ -292,8 +295,8 @@ fn pool_refusal(
         || p.index_dim != index_kv_width
         || p.raw_keys.buf.as_ptr() != raw_keys
         || p.pooled.buf.as_ptr() != pooled
-        || p.raw_keys.dtype != DType::BF16
-        || p.pooled.dtype != DType::BF16
+        || p.raw_keys.dtype != index_dtype
+        || p.pooled.dtype != index_dtype
         || p.grid_bound < p.block_count
         || p.block_count == 0
         || p.index_dim == 0
@@ -317,12 +320,12 @@ fn pool_refusal(
 }
 
 /// Half-open byte ranges must be pairwise disjoint.
-fn disjoint(mut ranges: Vec<(usize, usize)>) -> bool {
+pub(super) fn disjoint(mut ranges: Vec<(usize, usize)>) -> bool {
     ranges.sort_unstable();
     ranges.windows(2).all(|w| w[0].1 <= w[1].0)
 }
 
-fn ptr(t: &GpuTensor) -> u64 {
+pub(super) fn ptr(t: &GpuTensor) -> u64 {
     t.buf.as_ptr() as usize as u64
 }
 
@@ -524,6 +527,7 @@ fn admit(gpu: &Gpu, lanes: &[QsaCoreLane<'_>]) -> HipResult<Option<QsaCoreLanesP
             index_kv_width: p.index_kv_width,
             raw_keys: p.raw_index_keys.buf.as_ptr(),
             pooled: s.pooled.buf.as_ptr(),
+            index_dtype: DType::BF16,
         };
         if pool_refusal(lane.pool.as_ref(), &expect).is_some() {
             return Ok(None);
@@ -946,18 +950,20 @@ mod tests {
     }
 
     #[test]
-    fn flag_is_off_by_default_and_exact_gfx1201_only() {
+    fn flag_is_off_by_default_and_exact_gfx1201_and_gfx942_only() {
         for arch in ["gfx1100", "gfx1151", "gfx1201", "gfx942"] {
             let flags = crate::feature_flags::FeatureFlags::for_test(arch);
             assert!(!flags.qwen4_qsa_lanes_enabled(), "{arch}: default off");
         }
-        let mut flags = crate::feature_flags::FeatureFlags::for_test("gfx1201");
-        flags.qwen4_qsa_lanes = true;
-        assert!(flags.qwen4_qsa_lanes_enabled());
-        for arch in ["gfx1100", "gfx1151", "gfx942"] {
+        for arch in ["gfx1201", "gfx942"] {
             let mut flags = crate::feature_flags::FeatureFlags::for_test(arch);
             flags.qwen4_qsa_lanes = true;
-            assert!(!flags.qwen4_qsa_lanes_enabled(), "{arch}: gfx1201 only");
+            assert!(flags.qwen4_qsa_lanes_enabled(), "{arch}");
+        }
+        for arch in ["gfx1100", "gfx1151"] {
+            let mut flags = crate::feature_flags::FeatureFlags::for_test(arch);
+            flags.qwen4_qsa_lanes = true;
+            assert!(!flags.qwen4_qsa_lanes_enabled(), "{arch}: gfx1201 and gfx942 only");
         }
     }
 
@@ -1057,6 +1063,7 @@ mod tests {
             index_kv_width: 128,
             raw_keys: std::ptr::null_mut(),
             pooled: std::ptr::null_mut(),
+            index_dtype: DType::BF16,
         };
         // A lane that completes a block must launch the pool; one that
         // completes none launches none.

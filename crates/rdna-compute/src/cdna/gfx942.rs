@@ -15,6 +15,18 @@ use hip_bridge::{DeviceBuffer, HipResult, KernargBlob};
 
 use crate::{DType, Gpu, GpuTensor};
 
+// Batched QSA decode core of many lanes (`HIPFIRE_QWEN4_QSA_LANES`): a child module so it
+// reaches the private `Gfx942Device` borrow.
+#[path = "gfx942_qsa_lanes.rs"]
+mod qsa_lanes;
+pub use qsa_lanes::{
+    Qwen4QsaLanesPlan, QWEN4_QSA_LANES_ATTENTION_F32, QWEN4_QSA_LANES_ATTENTION_FP8_FNUZ,
+    QWEN4_QSA_LANES_MAX, QWEN4_QSA_LANES_MODULE, QWEN4_QSA_LANES_POOL, QWEN4_QSA_LANES_PROLOGUE_F32,
+    QWEN4_QSA_LANES_PROLOGUE_FP8_FNUZ, QWEN4_QSA_LANES_SCORES, QWEN4_QSA_LANES_SELECT,
+    QWEN4_QSA_LANE_ROWS,
+};
+pub(crate) use qsa_lanes::{Qwen4QsaLaneDesc, Qwen4QsaLanesShape, QsaLanesTableCache};
+
 const GROUPED_OLORA_E8_SRC: &str =
     include_str!("../../../../kernels/src/gemv_mfp4g32_e8_soa_grouped.gfx942.hip");
 const GROUPED_OLORA_E8_KERNEL: &str = "gemv_mfp4g32_e8_soa_grouped_gfx942";
