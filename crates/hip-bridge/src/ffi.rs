@@ -561,6 +561,61 @@ impl Default for HipPointerAttribute {
     }
 }
 
+/// `HIPFIRE_VMM_TLB_POKE` (developer): `1` forces and `0` disables the TLB
+/// flush after every VMM map ([`HipRuntime::mem_set_access`]). Unset: on when
+/// the loaded amdgpu is the in-tree module (no `/sys/module/amdgpu/version`;
+/// AMD's amdgpu-dkms declares one and flushes in the kernel), for the cards
+/// of [`VMM_TLB_POKE_ARCHS`] only (or every card when the process's cards
+/// cannot be told before the runtime loads). Forced on, it pokes every card.
+pub const VMM_TLB_POKE_ENV: &str = "HIPFIRE_VMM_TLB_POKE";
+
+/// Archs the default poke covers: where the in-tree fault was reproduced and
+/// the poke measured (gfx1201). Other cards keep ROCm's behaviour unless
+/// `HIPFIRE_VMM_TLB_POKE=1`.
+pub const VMM_TLB_POKE_ARCHS: &[&str] = &["gfx1201"];
+
+/// The poke's throwaway allocation: large enough that HIP allocates and frees
+/// it through KFD (a 64 KiB block is cached by HIP and issues no ioctl).
+const VMM_TLB_POKE_BYTES: usize = 4 << 20;
+
+/// Which HIP logical devices the poke covers: `None` = none, `Some(None)` =
+/// every device, `Some(Some(ids))` = those.
+fn vmm_tlb_poke_devices() -> Option<&'static Option<Vec<i32>>> {
+    static ON: std::sync::OnceLock<Option<Option<Vec<i32>>>> = std::sync::OnceLock::new();
+    ON.get_or_init(|| {
+        let in_tree = !std::path::Path::new("/sys/module/amdgpu/version").exists();
+        let forced = hipfire_config::developer_var(VMM_TLB_POKE_ENV).ok();
+        let on = hipfire_config::developer_bool(VMM_TLB_POKE_ENV, in_tree);
+        if !on {
+            return None;
+        }
+        // Logical HIP order is the startup card order (`hardware.devices`).
+        let cards = (forced.is_none())
+            .then(hipfire_config::devices::startup_devices)
+            .flatten();
+        let devices = cards.map(|cards| {
+            cards
+                .iter()
+                .enumerate()
+                .filter(|(_, card)| VMM_TLB_POKE_ARCHS.contains(&card.arch.as_str()))
+                .map(|(i, _)| i as i32)
+                .collect::<Vec<_>>()
+        });
+        if devices.as_ref().is_some_and(Vec::is_empty) {
+            return None;
+        }
+        eprintln!(
+            "  hip-bridge: VMM TLB flush poke on ({}; devices {}; one 4 MiB hipMalloc+hipFree per VMM map, {VMM_TLB_POKE_ENV}=0 disables)",
+            if forced.is_some() { "forced" } else { "in-tree amdgpu" },
+            devices
+                .as_ref()
+                .map_or_else(|| "all".to_owned(), |d| format!("{d:?}"))
+        );
+        Some(devices)
+    })
+    .as_ref()
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct HipMemLocation {
@@ -2752,7 +2807,60 @@ impl HipRuntime {
         // SAFETY: resolved VMM/host HIP symbol; pointer/handle args meet the method's
         // # Safety or documented preconditions; out-params are stack locals.
         let code = unsafe { func(ptr, size, descs.as_ptr(), descs.len()) };
-        self.check(code, "hipMemSetAccess")
+        self.check(code, "hipMemSetAccess")?;
+        if let Some(covered) = vmm_tlb_poke_devices() {
+            self.vmm_tlb_poke(descs, covered.as_deref())?;
+        }
+        Ok(())
+    }
+
+    /// Force a GPU TLB flush on every device `descs` grants access to, after a
+    /// VMM map. The in-tree amdgpu (mainline through at least 7.0) maps a HIP
+    /// VMM range through the DRM GEM VA ioctl, whose compute-context path neither
+    /// waits for the page-table update nor flushes the TLB
+    /// (ROCm/rocm-systems#11693; AMD's amdgpu-dkms adds both in
+    /// `amdgpu_gem_va_update_vm`). Work touching the new pages straight away then
+    /// page-faults (gfx1201: within ~10-50 fresh 1-2 MiB maps). KFD's unmap
+    /// ioctl does both, waits for its page-table update (queued behind the map's
+    /// on the same VM) and flushes the VM's TLB, so a throwaway `hipMalloc` +
+    /// `hipFree` large enough to bypass HIP's small-block cache (each call issues
+    /// the KFD alloc/map/unmap/free ioctls) flushes for us. Measured on gfx1201
+    /// (kernel 7.0.1, ROCm 7.2.2): 0 faults in 76,800 grow-and-touch maps
+    /// against a fault within ~50 without it; a 64 KiB poke (served from HIP's
+    /// cache, no ioctl) and a 500 us sleep both still fault.
+    /// `covered`: the devices the poke runs on (`None` = every device).
+    fn vmm_tlb_poke(&self, descs: &[HipMemAccessDesc], covered: Option<&[i32]>) -> HipResult<()> {
+        let mut devices: Vec<i32> = descs
+            .iter()
+            .filter(|desc| desc.location.type_ == HIP_MEM_LOCATION_TYPE_DEVICE)
+            .map(|desc| desc.location.id)
+            .filter(|id| covered.is_none_or(|c| c.contains(id)))
+            .collect();
+        devices.sort_unstable();
+        devices.dedup();
+        if devices.is_empty() {
+            return Ok(());
+        }
+        let current = self.current_device()?;
+        let poked = devices.iter().try_for_each(|&device| {
+            self.set_device(device)?;
+            let mut ptr: *mut c_void = ptr::null_mut();
+            // SAFETY: resolved HIP symbols; the out-param is a stack local and the
+            // buffer is freed unused right away.
+            let code = unsafe { (self.fn_malloc)(&mut ptr, VMM_TLB_POKE_BYTES) };
+            self.check(code, "hipMalloc (VMM TLB flush poke)")?;
+            // SAFETY: `ptr` came from the hipMalloc above and is not used again.
+            let code = unsafe { (self.fn_free)(ptr) };
+            self.check(code, "hipFree (VMM TLB flush poke)")
+        });
+        let restored = self.set_device(current);
+        poked.and(restored).map_err(|err| HipError {
+            message: format!(
+                "{}; VMM TLB flush poke on devices {devices:?} ({VMM_TLB_POKE_ENV}=0 disables it)",
+                err.message
+            ),
+            ..err
+        })
     }
 
     /// # Safety
