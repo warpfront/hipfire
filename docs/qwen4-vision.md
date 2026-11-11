@@ -7,15 +7,77 @@ The registry has **no published, paired Flash Next vision sidecar**. Export one
 and pass its path explicitly. The current validation route is
 [Flash-Next image pathway in VALIDATION.md](VALIDATION.md).
 
-Post-merge Halo validation is recorded below for source
-`428e2e63627228cd3b5f79759ef40550979e123a` and the exact binaries in the
-[2026-10-27 receipt](../benchmarks/vision/halo-gate-20261027-beta3a01.json). Default
-`auto` loads with and without the tower have identical text; image serving and
-automatic admission passed. **Stock beta could not load on this 96 GiB BIOS
-carve-out configuration**; its separate text reference required
-`HIPFIRE_OOM_GUARD=0`. That comparison is explicitly non-default. The earlier
-2026-10-23 CPU tower reference and historical capture diagnostic remain scoped
-to their original artifacts.
+Current review-update validation uses runtime source
+`8d53a84e473e6b5246bcb7b738f992fdd8939fbe`, based on beta
+`f453d10da0346d1935f7cc6488ef4aea958b7022`. The source-pinned
+[2026-11-11 receipt](../benchmarks/vision/review-update-20261111.json)
+records fresh-process text comparisons, image serving, admission, binary
+identities and the remaining baseline check limitation. Older results below
+remain historical evidence for their named sources.
+
+## Review update validation — 2026-11-11
+
+Hardware: Strix Halo gfx1151, 96 GiB BIOS VRAM carve-out, kernel
+`7.0.0-42-generic`. The CLI and daemon are separately built and frozen for
+beta and the PR. Each arm has a fresh process and isolated `HIPFIRE_HOME`,
+automatic context, and default vision/MTP/NPU/graph policies. The tower arm
+adds `--vision`. Greedy text uses the same committed five-genre battery and
+five-turn chain, seed 0, thinking off, with a 512-token limit.
+
+**Stock beta again refuses to load on this carve-out:** it charges 80.7 GiB
+of pinned host RAM plus 4 GiB headroom against about 24 GiB available. Only
+the separate beta reference sets `HIPFIRE_OOM_GUARD=0`; both PR arms retain
+the default guard. This is not a stock-default beta parity pass.
+
+| Check | Current-source result |
+| --- | --- |
+| Text battery, no tower and auto-loaded tower vs beta reference | 5/5 identical per PR arm |
+| Multi-turn chain, including after image/cancellation | 5/5 identical per PR arm |
+| No-tower refusal and recovery | 11/11 |
+| Tower image serving, stop/reasoning/cancel and recovery | 17/17 |
+| Independent GPU QSA mRoPE reference | 5 cases pass; maximum norm/rotation error `8.9407e-7`, chunk and F32/BF16 pooling exact |
+| Production host position helper | Pass; wrong-block-index and last-token mutants rejected |
+| Shared VL image-path compatibility / Flash Next image limits | 18 / 5 tests pass |
+| Exporter / loader vision / kernel registry | 5 / 18 / 74 tests pass |
+| `railgun-cert` | All 90 package tests pass on the final Rust source |
+
+Transcript comparison includes content, reasoning, tool fields, finish,
+request/prompt hashes, input/output usage and stream terminal fields. Decoded
+answers were read against the committed images: red/green/blue, all five
+French signs with accents, and a dog sleeping on its back. The chain after
+image/cancellation matches the reference, rather than just passing a detector.
+
+Admission records an independent **2,158,224,320-byte** vision reserve:
+896,353,216 bytes of resident weights including padding and 1,261,871,104
+bytes of maximum-image scratch/projected rows. Both PR arms admit a
+262,144-token card cap. The rank-stage log reports 18,866 MiB free,
+6,747 MiB context/gather/MTP growth and 2,048 MiB headroom, with resident PLE
+9,835 MiB without the tower and 8,012 MiB with it. PLE residency also depends
+on available memory. Short requests do not stress the full context or the
+maximum admitted image's peak memory.
+
+Text uses native MTP K=7 with the current n-gram policy; short-prompt NPU
+plans select `families=none`. Image requests use eager AR. No speed/TTFT,
+NPU-executed inference, full-model quality or PM4 admission is claimed.
+The monolithic trunk, external Q4LM PLE and gfx1151-zab-v1 overlay are the
+existing fixture. Large text-artifact hashes are inherited from the previous
+receipt; current sizes and the loader's overlay binding were checked. The
+sidecar and frozen binaries were rehashed for this run.
+
+Both machine-wide GPU locks are inherited by the actual daemon and verified
+by descriptor/inode/FLOCK evidence. A job-local native lock directory avoids
+the daemon reopening its already-inherited physical lock; neither global
+reservation is dropped. All test services stopped; settled VRAM returned to
+417,579,008 bytes, the measured desktop baseline.
+
+Release CLI/daemon builds, whole-workspace formatting, all 47 PR-relative Rust
+file checks, ratchets/maps, host/mutant coverage and the other local pre-commit
+checks pass. Workspace clippy remains failed on an unchanged beta lab test's
+private absolute kernel include; a clean archive of the pinned beta reproduces
+the same failure. The earlier pending-merge direct-format failure also
+reproduces on beta's unchanged generated fixture; it does not occur after
+integration. The remaining failure is retained as a failure, not a green CI
+claim. Hosted required CI and maintainer review remain authoritative.
 
 ## Checkpoint and artifact
 
