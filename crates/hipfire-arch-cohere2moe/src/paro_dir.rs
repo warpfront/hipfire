@@ -108,21 +108,17 @@ pub fn load_from_source(
     let mut tx = LoadTransaction::new(gpu);
 
     let embed_name = format!("{mp}.embed_tokens.weight");
-    let (_, embed_bytes) = source
-        .tensor_data(&embed_name)
-        .ok_or_else(|| "cohere2moe Dir: embed_tokens.weight not found".to_string())?;
+    // Tied embedding: decode looks up F32 rows, so convert like lm_head (raw F16 bytes misread, HIPF-273).
     let embed_slot = tx.hold_tensor(
-        gpu.upload_raw(embed_bytes, &[embed_bytes.len()])
-            .map_err(e("upload embed"))?,
+        load_fp16_weight_from_source(source, gpu, &embed_name, cfg.vocab_size, hidden)
+            .map_err(e("embed"))?
+            .buf,
     );
     let lm_head_slot = tx.hold_weight(
         load_fp16_weight_from_source(source, gpu, &embed_name, cfg.vocab_size, hidden)
             .map_err(e("lm_head"))?,
     );
-    let embed_dtype = tx
-        .weight_ref(lm_head_slot)
-        .map(|weight| weight.gpu_dtype)
-        .ok_or_else(|| "cohere2moe Dir: lm_head transaction slot is not a weight".to_string())?;
+    let embed_dtype = DType::F32;
     let final_norm_slot =
         tx.hold_tensor(paro_load_f32(source, gpu, "norm.weight", hidden).map_err(e("final norm"))?);
 
