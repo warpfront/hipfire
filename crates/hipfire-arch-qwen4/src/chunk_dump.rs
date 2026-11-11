@@ -204,6 +204,21 @@ impl ChunkDump {
         if self.raw {
             write("fold-output.bin", &fold)?;
             write("hc-streams.bin", &streams)?;
+            // Row-major per-row mixer tensors (pre-projection gated-norm / QSA output and the
+            // mixer output the hyper write consumes), router logits and routed expert ids:
+            // the per-op localization of a chunk-dependent row.
+            let pre = match config.layer_types.get(layer) {
+                Some(crate::config::LayerType::LinearAttention) => &scratch.gdn_output,
+                _ => &scratch.qsa_output,
+            };
+            write("mixer-pre.bin", &read(gpu, pre, rows_bytes(pre, rows, capacity))?)?;
+            let post = &scratch.attention_output;
+            write("mixer-output.bin", &read(gpu, post, rows_bytes(post, rows, capacity))?)?;
+            write(
+                "router-logits.bin",
+                &read(gpu, &scratch.router_logits, rows_bytes(&scratch.router_logits, rows, capacity))?,
+            )?;
+            write("topk.bin", &route)?;
             if !live_rows.is_empty() {
                 write("y-down-grouped.live.bin", &live_rows)?;
             }
