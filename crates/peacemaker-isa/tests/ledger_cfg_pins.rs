@@ -194,13 +194,13 @@ impl Report {
     }
 }
 
-/// The gfx942 anchors (hipcc) and twins (PM) with typed coverage: the rows16 BF16 MFMA object
-/// and the FP8 grouped MoE object. Each is lifted by `peacemaker_lift::cdna` and every kernel is
+/// The gfx942 anchors (hipcc) and twins (PM) with typed coverage: the rows16 and P1b wide
+/// BF16 MFMA objects and the FP8 grouped MoE object. Each is lifted and every kernel is
 /// certified by `peacemaker_isa::cdna::lifted::certify` (CDNA hazards + typed CFG wait ledger).
 /// Their absence fails the gate. Every other gfx942 image stays an explicit not-verified entry.
 /// Each entry is the committed file and the exact kernel symbols it must contain, and nothing
 /// else.
-const CDNA_CERTIFIED: [(&str, &[&str]); 4] = [
+const CDNA_CERTIFIED: [(&str, &[&str]); 6] = [
     (
         "gemm_bf16_mfma_gfx942_rows16_hipcc_gfx942.co",
         &[
@@ -215,6 +215,22 @@ const CDNA_CERTIFIED: [(&str, &[&str]); 4] = [
             "gemm_bf16_mfma_gfx942",
             "gemm_bf16_mfma_gfx942_rows16",
             "gemm_bf16_mfma_gfx942_rows16_x2",
+        ],
+    ),
+    (
+        "gemm_bf16_mfma_wide_gfx942_hipcc_gfx942.co",
+        &[
+            "gemm_bf16_mfma_gfx942_wide64",
+            "gemm_bf16_mfma_gfx942_wide64_m32",
+            "gemm_bf16_mfma_gfx942_wide64_m64",
+        ],
+    ),
+    (
+        "gemm_bf16_mfma_wide_gfx942_pm_gfx942.hxaco",
+        &[
+            "gemm_bf16_mfma_gfx942_wide64",
+            "gemm_bf16_mfma_gfx942_wide64_m32",
+            "gemm_bf16_mfma_gfx942_wide64_m64",
         ],
     ),
     (
