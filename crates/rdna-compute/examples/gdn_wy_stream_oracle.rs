@@ -375,8 +375,8 @@ fn main() {
                         .zip(&reference.out)
                         .position(|(a, b)| a != b);
                     eprintln!(
-                        "MISMATCH {format:?} start={start} {name} parts={} out_first_diff={first:?} slot_eq={} ef_eq={} meta_eq={}",
-                        parts.len(),
+                        "MISMATCH {format:?} start={start} {name} parts={parts:?} out_first_diff_row={:?} slot_eq={} ef_eq={} meta_eq={}",
+                        first.map(|b| b / (VALUE * 4)),
                         got.slot == reference.slot,
                         got.ef == reference.ef,
                         got.meta == reference.meta
