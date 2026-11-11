@@ -32,7 +32,8 @@ use peacemaker_cdna::enc::{
     smem::{Smem, SmemOffset, SmemOp},
     sop::{Sop1, Sop1Op, Sop2, Sop2Op, Sopc, SopcOp, Sopk, SopkOp, Sopp, SoppOp},
     vop::{
-        Dpp, DppCtrl, Sdwa, SdwaSel, SdwaUnused, Vop1, Vop1Op, Vop2, Vop2Op, VopExt, Vopc, VopcOp,
+        Dpp, DppCtrl, Sdwa, SdwaSel, SdwaUnused, Vop1, Vop1Op, Vop2, Vop2K, Vop2KOp, Vop2Op,
+        VopExt, Vopc, VopcOp,
     },
     vop3::{Vop3, Vop3OnlyOp, Vop3Op},
     vop3p::{Mai, MaiOp, Vop3p, Vop3pOp},
@@ -179,6 +180,19 @@ pub fn v2(op: Vop2Op, dst: Src, a: Src, b: Src) -> Inst {
     } else {
         vop3(Vop3Op::V2(op), dst, None, &[a, b], Mods::default())
     }
+}
+
+/// `v_fmamk_f32` (`dst = fma(a, k, b)`) / `v_fmaak_f32` (`dst = fma(a, b, k)`):
+/// VOP2 with a mandatory literal. `a` must be a VGPR or inline constant, `b` a
+/// VGPR; the encoder rejects anything else.
+pub fn v2k(op: Vop2KOp, dst: Src, a: Src, b: Src, k: u32) -> Inst {
+    Inst::Vop2K(Vop2K {
+        op,
+        vdst: dst,
+        src0: a,
+        src1: b,
+        literal: k,
+    })
 }
 
 /// Carry-out VOP2 (`v_add_co_u32` ...): `sdst` VCC → e32 when legal, else VOP3B.

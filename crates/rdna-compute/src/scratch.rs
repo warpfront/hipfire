@@ -380,6 +380,10 @@ pub struct ScratchState {
     /// Fixed-size split-K scratch of the lane WMMA route (`crate::lane_wmma`): allocated lazily on
     /// first use, zeroed once, never grown or replaced.
     pub lane_wmma_scratch: Option<crate::lane_wmma::LaneWmmaScratch>,
+    /// Multi-part split-K scratch of the lane WMMA route (`HIPFIRE_QWEN4_LWMMA_MULTI_PART`):
+    /// disjoint partial slices for up to four parts of one launch; lazily allocated, zeroed once,
+    /// never grown.
+    pub lane_wmma_multi_scratch: Option<crate::lane_wmma::LaneWmmaScratch>,
     /// Reused exact-BF16 expansions of the HC8 sidecar weights (`crate::hc8_weight`): slot 0 the HC
     /// down, slot 1 the HC up. Allocated lazily on first prefill-class use, never regrown.
     pub hc8_bf16: [Option<GpuTensor>; 2],
@@ -461,6 +465,15 @@ pub struct ScratchState {
     pub int8_mmq_x_scratch: Option<DeviceBuffer>,
     pub int8_mmq_x_scratch_bytes: usize,
     pub int8_mmq_generation: u64,
+    /// X8c: the flat-slot down sidecar `[K_down/128, total_slots]` of 136-byte `block_i8_128` records that the
+    /// gate/up GEMM with the rotate128 epilogue (`qwen4_moe_ep_a8_gate_up_rot_planar_nt{1,2}`) writes. A buffer of
+    /// its own, never the shared `int8_mmq_x_scratch`: that one holds the gate sidecar the same launch is still
+    /// reading. Eager-only, like the unfused chain.
+    pub int8_mmq_down_x_scratch: Option<DeviceBuffer>,
+    pub int8_mmq_down_x_scratch_bytes: usize,
+    pub int8_mmq_down_generation: u64,
+    /// The sidecar the last fused gate/up launch left for the down GEMM of the same call (taken by it).
+    pub int8_mmq_down_pending: Option<Int8MmqPrepared>,
     /// Qwen4 symmetric IU4 MoE stable-grouping scratch: `[L]` local ranks,
     /// `[E, C]` per-chunk counts and `[E, C + 1]` chunk prefixes (`C =
     /// ceil(L / 256)`), one allocation laid out by [`qwen4_moe_group_layout`].
@@ -3698,6 +3711,47 @@ impl ScratchState {
         (
             self.int8_mmq_generation,
             self.int8_mmq_x_scratch
+                .as_ref()
+                .map_or(std::ptr::null_mut(), |b| b.as_ptr()),
+        )
+    }
+
+    /// Reserve the dedicated flat-slot down sidecar `[k / 128, n]` of the gate/up GEMM with the rotate128
+    /// epilogue ([`Self::int8_mmq_down_x_scratch`]); bumps its own generation. `k % 128 == 0`.
+    pub fn reserve_int8_mmq_down(
+        &mut self,
+        hip: &HipRuntime,
+        k: usize,
+        n: usize,
+    ) -> HipResult<Int8MmqReservation> {
+        if k == 0 || n == 0 || k % 128 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "reserve_int8_mmq_down: need k%128==0 and n>0",
+            ));
+        }
+        let needed = int8_mmq_x_needed(k, n);
+        grow_scratch_buffer(
+            hip,
+            &mut self.int8_mmq_down_x_scratch,
+            &mut self.int8_mmq_down_x_scratch_bytes,
+            needed,
+        )?;
+        self.int8_mmq_down_generation = self.int8_mmq_down_generation.wrapping_add(1);
+        Ok(Int8MmqReservation {
+            ptr: self.int8_mmq_down_x_scratch.as_ref().unwrap().as_ptr(),
+            k,
+            n,
+            generation: self.int8_mmq_down_generation,
+        })
+    }
+
+    /// `(generation, pointer)` of the dedicated down sidecar, the staleness key of its
+    /// [`Int8MmqPrepared`] handles.
+    pub fn int8_mmq_down_live(&self) -> (u64, *mut c_void) {
+        (
+            self.int8_mmq_down_generation,
+            self.int8_mmq_down_x_scratch
                 .as_ref()
                 .map_or(std::ptr::null_mut(), |b| b.as_ptr()),
         )

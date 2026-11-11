@@ -1235,6 +1235,7 @@ mod tests {
             role: ArgRole::Pointer {
                 classes: classes.to_vec(),
                 read_cache: ReadCache::VmemOnly,
+                atomic_ops: Vec::new(),
             },
         }
     }

@@ -375,7 +375,7 @@ fn scan_module(
                     // gfx11 objdump can elide the optional e64 spelling on a VOP3,
                     // but the form and full instruction words must still agree.
                     let rendered_matches = decoded_name == Some(spelling.as_str())
-                        || (arch != Arch::Gfx1201
+                        || (!arch.is_gfx12()
                             && inst.form == peacemaker_ir::inst::Form::Vop3
                             && decoded_name.and_then(|name| name.strip_suffix("_e64"))
                                 == Some(spelling.as_str()));

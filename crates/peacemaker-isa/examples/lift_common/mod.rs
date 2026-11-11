@@ -15,6 +15,8 @@ use std::path::Path;
 
 /// MegaM0's COPY template id.
 pub const COPY_TMPL: u32 = 2;
+/// MegaM0's EXPAND_LIVE template id (o4's live tile list).
+pub const EXPAND_TMPL: u32 = peacemaker_isa::kernels::p0_expand_gfx1201::TEMPLATE_ID;
 
 /// One template: its id, MegaM0 name, eager symbol, blockDim, conversion (or the
 /// refused obligation) and the object it came from.
@@ -137,8 +139,14 @@ pub fn build_pools(
                 })
                 .collect();
             // COPY (tmpl 2, M0CopyArgs) is hosted by the 256-thread pool
-            let copy = (b == 256).then_some(COPY_TMPL);
-            let elf = ld::pool(&symbol, b, &hosted, copy)
+            // MegaM0's PM-emitted templates: COPY in the 256-thread pool, EXPAND_LIVE
+            // beside o4 in the 128-thread pool
+            let natives: Vec<ld::Native> = match b {
+                256 => vec![ld::Native::Copy(COPY_TMPL)],
+                128 => vec![ld::Native::Expand(EXPAND_TMPL)],
+                _ => vec![],
+            };
+            let elf = ld::pool(&symbol, b, &hosted, &natives)
                 .and_then(|e| {
                     native::assemble_with_regions(&e.s_text, Arch::Gfx1201, &e.proof.regions)
                 })

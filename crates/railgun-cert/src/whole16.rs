@@ -989,6 +989,8 @@ mod tests {
             read_cache: String::new(),
             sinks: vec![],
             loaded: true,
+            null_guarded: false,
+            atomic_ops: vec![],
         }
     }
 
@@ -1037,6 +1039,8 @@ mod tests {
             required_witnesses: vec![],
             case_digest: String::new(),
             guard_flag: None,
+            task_protocol: None,
+            wg_footprints: Vec::new(),
         }
     }
 

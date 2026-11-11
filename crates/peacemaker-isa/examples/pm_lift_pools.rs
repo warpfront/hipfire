@@ -66,6 +66,22 @@ fn main() {
                 row["kernel"] = json!(file);
             }
         }
+        if tid == lift_common::EXPAND_TMPL {
+            if let Some((pool, symbol, file)) = pool_of.values().find(|(p, _, _)| p == "b128") {
+                use peacemaker_isa::kernels::p0_expand_gfx1201 as expand;
+                row["name"] = json!("expand_live");
+                row["mode"] = json!("PM_NATIVE");
+                row["legal"] = json!(true);
+                row["reason"] = json!(
+                    "PM-emitted EXPAND_LIVE region (o4 live tile list; 64-byte args, docs/peacemaker-expand-live.md)"
+                );
+                row["kernarg_bytes"] = json!(expand::KERNARG_BYTES);
+                row["card_verified"] = json!(verified.contains(&tid));
+                row["pool"] = json!(pool);
+                row["pool_symbol"] = json!(symbol);
+                row["kernel"] = json!(file);
+            }
+        }
         let Some(c) = converted.iter().find(|c| c.tid == tid) else {
             rows.push(row);
             continue;

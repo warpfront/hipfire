@@ -513,6 +513,24 @@ fn ds_write_every_width_with_snapshot() {
 }
 
 #[test]
+fn ds_write_b16_d16_hi_stores_upper_half_only() {
+    let mut r = Rig::new();
+    r.lds.fill(0xEE);
+    r.set_v(1, |l| (l * 16) as u32);
+    r.set_v(4, |l| val(l, 0));
+    r.w.exec = 0x5555_5555_5555_5555; // odd lanes inactive
+    r.ok(&ds_off(DsOp::WriteB16D16Hi, None, 1, Some(4), 0x0104));
+    r.drain().unwrap();
+    let mut want = vec![0xEEu8; LDS_BYTES];
+    for l in (0..WAVE).step_by(2) {
+        let b = val(l, 0).to_le_bytes();
+        want[l * 16 + 260] = b[2];
+        want[l * 16 + 261] = b[3];
+    }
+    assert!(r.lds == want, "only bytes 2..4 of active lanes are written");
+}
+
+#[test]
 fn ds_two_address_write2_and_st64() {
     // (op, byte multiplier of one offset unit, dwords per element, lane stride, offset0, offset1)
     let cases: [(DsOp, usize, usize, usize, u8, u8); 5] = [

@@ -5,7 +5,9 @@
 //! Lane WMMA: purpose-built gfx1201 WMMA kernels for the Qwen3.8 Flash-Next HC mixers and the
 //! dense BF16 `[rows, k]` projections at 16..=64 rows (the decode / lane / verify window),
 //! for BF16 weights and planar W8 weights (int8 widened to BF16 exactly, the per-32 scale
-//! applied in the f32 epilogue).
+//! applied in the f32 epilogue). The same kernels also serve the sub-512-row prefill forward above
+//! 64 rows ([`Gpu::lane_wmma_gemm_prefill`], `HIPFIRE_QWEN4_PREFILL_LWMMA_DENSE` / `_HC`) with a
+//! split-K pinned per `(m, k)`, so each row's bytes do not depend on the call's row count.
 //!
 //! Kernels: `kernels/src/qwen4_lane_wmma.gfx1201.hip`.
 //! * [`lane_wmma_gemm`]: `Y[rows, M] = epi(X . W^T)`, optional `hc_act` epilogue, split-K with a
@@ -42,6 +44,25 @@ const LANE_WMMA_MODULE: &str = "qwen4_lane_wmma";
 pub const LANE_WMMA_SCRATCH_PARTIAL_FLOATS: usize = 320 * 16 * 64;
 /// Counter capacity of the [`Gpu`]-owned split-K scratch.
 pub const LANE_WMMA_SCRATCH_COUNTERS: usize = 320;
+/// Fixed row count the prefill (> 64 rows) split-K is derived from.
+pub const LANE_WMMA_PREFILL_SPLIT_ROWS: usize = 256;
+
+/// Prefill plan for a lane WMMA call of `rows` rows: `(split_k, chunk rows)`. `split_k` is
+/// [`lane_wmma_auto_split_k`] at the fixed `split_rows` (so it does not depend on `rows`); the rows
+/// run in one call when `split_k == 1`, else in `split_rows`-row chunks. Capacity: the auto rule
+/// gives `ceil(m/16) * ceil(split_rows/64) * split_k <= 320`, hence for a chunk of `split_rows`
+/// rows (a multiple of 64) `split_k * split_rows * m <= LANE_WMMA_SCRATCH_PARTIAL_FLOATS` and
+/// `grid_x * grid_z <= LANE_WMMA_SCRATCH_COUNTERS`.
+pub fn lane_wmma_prefill_plan(
+    m: usize,
+    k: usize,
+    rows: usize,
+    split_rows: usize,
+) -> (usize, usize) {
+    let split_k = lane_wmma_auto_split_k(m, k, split_rows, 1);
+    let chunk = if split_k == 1 { rows } else { split_rows };
+    (split_k, chunk)
+}
 
 /// A GEMM weight operand.
 pub enum LaneWmmaWeight<'a> {
@@ -374,11 +395,382 @@ impl Gpu {
         self.scratch.lane_wmma_scratch = Some(scratch);
         out
     }
+
+    /// [`lane_wmma_gemm`] for MORE than 64 rows (the sub-512-row prefill forward), with the
+    /// split-K pinned by [`lane_wmma_prefill_plan`] at [`LANE_WMMA_PREFILL_SPLIT_ROWS`] and the rows run in
+    /// `LANE_WMMA_PREFILL_SPLIT_ROWS`-row chunks
+    /// when it is above 1. Per output row the arithmetic depends only on `split_k` (K partition
+    /// `kz * kc + wave * kq`, wave fold `(w0 + w1) + (w2 + w3)`, split fold ascending `kz`), not on
+    /// the kernel's row tile, the grid, the chunking or the total rows, so a row is bitwise the
+    /// same in a joint call and in its own singleton call. Same scratch take/put as
+    /// [`Gpu::lane_wmma_gemm_fixed`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn lane_wmma_gemm_prefill(
+        &mut self,
+        w: &LaneWmmaWeight<'_>,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        rows: usize,
+        terms: usize,
+        hc_act: Option<f32>,
+    ) -> HipResult<()> {
+        let scratch = match self.scratch.lane_wmma_scratch.take() {
+            Some(s) => s,
+            None => LaneWmmaScratch::new(
+                self,
+                LANE_WMMA_SCRATCH_PARTIAL_FLOATS,
+                LANE_WMMA_SCRATCH_COUNTERS,
+            )?,
+        };
+        let (split_k, chunk) = lane_wmma_prefill_plan(m, k, rows, LANE_WMMA_PREFILL_SPLIT_ROWS);
+        let mut out = Ok(());
+        for r0 in (0..rows).step_by(chunk.max(1)) {
+            let c = chunk.min(rows - r0);
+            let xs = x.sub_offset(r0 * k, c * k);
+            let ys = y.sub_offset(r0 * m, c * m);
+            if let Err(e) = lane_wmma_gemm(
+                self,
+                w,
+                &xs,
+                &ys,
+                m,
+                k,
+                c,
+                terms,
+                hc_act,
+                LaneWmmaCfg { nn: 1, split_k },
+                &scratch,
+            ) {
+                out = Err(e);
+                break;
+            }
+        }
+        self.scratch.lane_wmma_scratch = Some(scratch);
+        out
+    }
+}
+
+/// Most parts one [`lane_wmma_gemm_multi`] launch carries.
+pub const LANE_WMMA_MULTI_PARTS: usize = 4;
+/// Split-K partial capacity of the [`Gpu`]-owned multi-part scratch: every part may need the
+/// single-launch scratch's worth ([`LANE_WMMA_SCRATCH_PARTIAL_FLOATS`]), and the parts of one
+/// launch need disjoint slices.
+pub const LANE_WMMA_MULTI_SCRATCH_PARTIAL_FLOATS: usize =
+    LANE_WMMA_MULTI_PARTS * LANE_WMMA_SCRATCH_PARTIAL_FLOATS;
+/// Counter capacity of the multi-part scratch (one slot per flat column tile and token block).
+pub const LANE_WMMA_MULTI_SCRATCH_COUNTERS: usize =
+    LANE_WMMA_MULTI_PARTS * LANE_WMMA_SCRATCH_COUNTERS;
+
+/// One part of a [`lane_wmma_gemm_multi`] launch: `y[rows, m] = x . w[m, k]^T`.
+#[derive(Clone, Copy)]
+pub struct LaneWmmaMultiPart<'a> {
+    pub w: &'a GpuTensor,
+    pub y: &'a GpuTensor,
+    pub m: usize,
+}
+
+/// The launch geometry of a multi-part launch: each part's own auto split-K (exactly what a
+/// launch of that part alone picks), the summed column tiles and the scratch they need.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LaneWmmaMultiPlan {
+    /// Per part; unused slots are 1.
+    pub split_k: [usize; LANE_WMMA_MULTI_PARTS],
+    /// Sum of the parts' column tiles of 16 (grid x).
+    pub tiles: usize,
+    /// Largest part split-K (grid y).
+    pub grid_y: usize,
+    /// Token blocks of 64 (grid z).
+    pub grid_z: usize,
+    /// Partial floats the parts with `split_k > 1` take, back to back.
+    pub partial_floats: usize,
+}
+
+/// [`LaneWmmaMultiPlan`] for parts of `ms` output columns over `k` and `rows`, or `None` when the
+/// parts do not form a multi launch: 2..=[`LANE_WMMA_MULTI_PARTS`] non-empty parts, `k` a multiple
+/// of 128, at least one row, and the partials / counters inside the multi scratch. Pure.
+pub fn lane_wmma_multi_plan(ms: &[usize], k: usize, rows: usize) -> Option<LaneWmmaMultiPlan> {
+    if !(2..=LANE_WMMA_MULTI_PARTS).contains(&ms.len())
+        || ms.contains(&0)
+        || k == 0
+        || !k.is_multiple_of(128)
+        || rows == 0
+    {
+        return None;
+    }
+    let mut split_k = [1usize; LANE_WMMA_MULTI_PARTS];
+    let (mut tiles, mut grid_y, mut partial_floats) = (0usize, 1usize, 0usize);
+    for (p, &m) in ms.iter().enumerate() {
+        let s = lane_wmma_auto_split_k(m, k, rows, 1);
+        split_k[p] = s;
+        tiles += m.div_ceil(16);
+        grid_y = grid_y.max(s);
+        if s > 1 {
+            partial_floats += s * rows * m;
+        }
+    }
+    let grid_z = rows.div_ceil(64);
+    (partial_floats <= LANE_WMMA_MULTI_SCRATCH_PARTIAL_FLOATS
+        && tiles * grid_z <= LANE_WMMA_MULTI_SCRATCH_COUNTERS)
+        .then_some(LaneWmmaMultiPlan {
+            split_k,
+            tiles,
+            grid_y,
+            grid_z,
+            partial_floats,
+        })
+}
+
+/// Several A1 projections of the SAME `x [rows, k]` (BF16 weights, two activation terms, one
+/// n-tile, each part's own auto split-K) in ONE launch (`lwmma_gemm_bf16_t2_m<MT>_n1_multi`).
+/// Every output word is bitwise what [`lane_wmma_gemm`] of that part alone writes: the blocks run
+/// the same body with the part's own split-K and fold. `scratch` is the multi-part scratch
+/// ([`LANE_WMMA_MULTI_SCRATCH_PARTIAL_FLOATS`] / [`LANE_WMMA_MULTI_SCRATCH_COUNTERS`]).
+pub fn lane_wmma_gemm_multi(
+    gpu: &mut Gpu,
+    parts: &[LaneWmmaMultiPart<'_>],
+    x: &GpuTensor,
+    k: usize,
+    rows: usize,
+    scratch: &LaneWmmaScratch,
+) -> HipResult<LaneWmmaLaunch> {
+    let ms: Vec<usize> = parts.iter().map(|p| p.m).collect();
+    let plan = lane_wmma_multi_plan(&ms, k, rows).ok_or_else(|| {
+        err(format!(
+            "multi-part launch does not fit: ms {ms:?} k {k} rows {rows}"
+        ))
+    })?;
+    need_f32(x, rows * k, "x")?;
+    for p in parts {
+        need_bytes(p.w, p.m * k * 2, "bf16 weight")?;
+        need_f32(p.y, rows * p.m, "y")?;
+    }
+    need_f32(
+        &scratch.partial,
+        LANE_WMMA_MULTI_SCRATCH_PARTIAL_FLOATS,
+        "multi scratch.partial",
+    )?;
+    need_bytes(
+        &scratch.counters,
+        LANE_WMMA_MULTI_SCRATCH_COUNTERS * 4,
+        "multi scratch.counters",
+    )?;
+    let mt = rows.div_ceil(16).min(4);
+    let grid = [
+        u32_of(plan.tiles, "grid x")?,
+        u32_of(plan.grid_y, "grid y")?,
+        u32_of(plan.grid_z, "grid z")?,
+    ];
+    let block = [128u32, 1, 1];
+    let kernel = format!("lwmma_gemm_bf16_t2_m{mt}_n1_multi");
+    gpu.ensure_kernel_public(LANE_WMMA_MODULE, LANE_WMMA_SRC, &kernel)?;
+    let slot = |i: usize| parts[i.min(parts.len() - 1)];
+    let mut args = KernargBlob::new();
+    for i in 0..LANE_WMMA_MULTI_PARTS {
+        args.push_ptr(slot(i).w.buf.as_ptr() as *const _);
+    }
+    for i in 0..LANE_WMMA_MULTI_PARTS {
+        args.push_ptr(slot(i).y.buf.as_ptr());
+    }
+    args.push_ptr(x.buf.as_ptr());
+    args.push_ptr(scratch.partial.buf.as_ptr());
+    args.push_ptr(scratch.counters.buf.as_ptr());
+    for i in 0..LANE_WMMA_MULTI_PARTS {
+        args.push_i32(if i < parts.len() {
+            i32_of(parts[i].m, "m")?
+        } else {
+            0
+        });
+    }
+    for s in plan.split_k {
+        args.push_i32(i32_of(s, "split_k")?);
+    }
+    args.push_i32(i32_of(k, "k")?);
+    args.push_i32(i32_of(rows, "rows")?);
+    args.pad_to(16);
+    gpu.launch_blob_recorded(
+        &kernel,
+        grid,
+        block,
+        0,
+        args.as_mut_slice(),
+        ReplayLaunchBindings::NONE,
+    )?;
+    Ok(LaneWmmaLaunch {
+        kernel,
+        grid,
+        block,
+    })
+}
+
+impl Gpu {
+    /// Whether `parts` of `ms` output columns over `k` and `rows` run as ONE
+    /// [`Gpu::lane_wmma_gemm_multi_fixed`] launch: `HIPFIRE_QWEN4_LWMMA_MULTI_PART` on top of
+    /// [`Gpu::lane_wmma_applies`] and a [`lane_wmma_multi_plan`]. Pure.
+    pub fn lane_wmma_multi_part_applies(&self, ms: &[usize], k: usize, rows: usize) -> bool {
+        self.flags.qwen4_lwmma_multi_part_enabled()
+            && self.lane_wmma_applies(rows)
+            && lane_wmma_multi_plan(ms, k, rows).is_some()
+    }
+
+    /// [`lane_wmma_gemm_multi`] with the `Gpu`-owned multi-part scratch: allocated lazily on first
+    /// use at the fixed [`LANE_WMMA_MULTI_SCRATCH_PARTIAL_FLOATS`] /
+    /// [`LANE_WMMA_MULTI_SCRATCH_COUNTERS`] size, zeroed once, never grown (a recorded launch's
+    /// pointers never go stale). Each part's output is bitwise the per-part
+    /// [`Gpu::lane_wmma_gemm_fixed`] (two terms) of that part alone.
+    pub fn lane_wmma_gemm_multi_fixed(
+        &mut self,
+        parts: &[LaneWmmaMultiPart<'_>],
+        x: &GpuTensor,
+        k: usize,
+        rows: usize,
+    ) -> HipResult<LaneWmmaLaunch> {
+        let scratch = match self.scratch.lane_wmma_multi_scratch.take() {
+            Some(s) => s,
+            None => LaneWmmaScratch::new(
+                self,
+                LANE_WMMA_MULTI_SCRATCH_PARTIAL_FLOATS,
+                LANE_WMMA_MULTI_SCRATCH_COUNTERS,
+            )?,
+        };
+        let out = lane_wmma_gemm_multi(self, parts, x, k, rows, &scratch);
+        self.scratch.lane_wmma_multi_scratch = Some(scratch);
+        out
+    }
+}
+
+/// How a BF16 multirow call over `total` rows of an EP prefill wave is split into per-lane calls
+/// (`None`: one call over all rows, the ordinary route). `table` is [`Gpu::qwen4_wave_lane_rows`],
+/// the wave's lanes' rows in order. A lane's own singleton takes the 16..=64-row lane WMMA arm
+/// (`wmma(rows)`, keyed on the call's REAL rows and not bitwise the SIMT arm), so every such lane
+/// is its own call; a lane of at most 15 rows is its own call too (it keeps its singleton's
+/// few-row arms), while consecutive lanes of `wide_from` rows or more stay one call
+/// (`wide_from` = `WIDE_VERIFY_MAX_ROWS + 1` by default: the SIMT multirow arm is row-count
+/// invariant there, and so is the prefill lane WMMA arm ([`Gpu::lane_wmma_gemm_prefill`], split-K
+/// pinned), and one wide call is the wave's gain; the lowered prefill floor
+/// [`Gpu::qwen4_prefill_lwmma_floor`] moves the 49..=64-row lanes into those wide runs, where
+/// their singleton takes the same prefill arm at the same pinned split-K).
+/// Split only when the table is the call's (`sum == total`) and some lane takes the lane WMMA arm,
+/// or a lane below `wide_from` shares the wave with a lane within `wide_from..=64` (which is
+/// not WMMA-keyed any more, but whose neighbour keeps its own arm).
+pub fn wave_lane_groups(
+    table: &[usize],
+    total: usize,
+    wide_from: usize,
+    wmma: impl Fn(usize) -> bool,
+) -> Option<Vec<usize>> {
+    let wide = crate::prefill_invariant::WIDE_VERIFY_MAX_ROWS;
+    let floor_lane = |rows: usize| (wide_from..=wide).contains(&rows);
+    if table.is_empty()
+        || table.iter().sum::<usize>() != total
+        || !(table.iter().any(|&rows| wmma(rows))
+            || (table.iter().any(|&rows| rows < wide_from)
+                && table.iter().any(|&rows| floor_lane(rows))))
+    {
+        return None;
+    }
+    let mut groups = Vec::with_capacity(table.len());
+    let mut run = 0usize;
+    for &rows in table {
+        if rows >= wide_from {
+            run += rows;
+        } else {
+            if run > 0 {
+                groups.push(run);
+                run = 0;
+            }
+            groups.push(rows);
+        }
+    }
+    if run > 0 {
+        groups.push(run);
+    }
+    Some(groups)
+}
+
+impl Gpu {
+    /// [`wave_lane_groups`] for a call of `rows` rows under this device's lane WMMA admission and
+    /// prefill floor ([`Gpu::qwen4_prefill_lwmma_floor`]).
+    pub fn wave_lane_groups(&self, rows: usize) -> Option<Vec<usize>> {
+        wave_lane_groups(
+            &self.qwen4_wave_lane_rows,
+            rows,
+            self.qwen4_prefill_lwmma_floor,
+            |r| self.lane_wmma_applies(r),
+        )
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn wmma(rows: usize) -> bool {
+        (crate::gemv::LANE_WMMA_MIN_ROWS..=64).contains(&rows)
+    }
+
+    #[test]
+    fn wave_lane_groups_split_only_when_a_lane_takes_the_lane_wmma_arm() {
+        let w = 65;
+        // The story C8 burst: eight 60-row lanes, each its own call.
+        assert_eq!(wave_lane_groups(&[60; 8], 480, w, wmma), Some(vec![60; 8]));
+        // Small lanes split, consecutive wide lanes stay one call.
+        assert_eq!(
+            wave_lane_groups(&[60, 60, 149, 149, 256, 511], 1185, w, wmma),
+            Some(vec![60, 60, 149 + 149 + 256 + 511])
+        );
+        // A small lane between wide lanes cuts the wide run.
+        assert_eq!(
+            wave_lane_groups(&[149, 60, 149, 149], 507, w, wmma),
+            Some(vec![149, 60, 298])
+        );
+        // Lanes of 9..=15 rows keep their few-row arms: their own calls, but only with a WMMA lane.
+        assert_eq!(wave_lane_groups(&[12, 12], 24, w, wmma), None);
+        assert_eq!(wave_lane_groups(&[12, 40], 52, w, wmma), Some(vec![12, 40]));
+        // No small lane, no table, or a table that is not this call's rows: one call.
+        assert_eq!(wave_lane_groups(&[149, 256], 405, w, wmma), None);
+        assert_eq!(wave_lane_groups(&[], 0, w, wmma), None);
+        assert_eq!(wave_lane_groups(&[60, 60], 480, w, wmma), None);
+        // The groups always cover the call exactly.
+        for table in [vec![60; 8], vec![9, 16, 64, 65, 200], vec![65, 64, 65]] {
+            let total: usize = table.iter().sum();
+            if let Some(groups) = wave_lane_groups(&table, total, w, wmma) {
+                assert_eq!(groups.iter().sum::<usize>(), total);
+            }
+        }
+    }
+
+    /// The lowered prefill floor (49): lanes of 49..=64 rows leave the WMMA-keyed per-lane split
+    /// (`wmma` is then false for them) and join the wide runs.
+    #[test]
+    fn wave_lane_groups_with_a_lowered_prefill_floor_run_floor_lanes_jointly() {
+        let w = 49;
+        let wmma_below = |rows: usize| wmma(rows) && rows < w;
+        // The story C8 burst joins into one call.
+        assert_eq!(wave_lane_groups(&[60; 8], 480, w, wmma_below), None);
+        assert_eq!(wave_lane_groups(&[49, 64, 149], 262, w, wmma_below), None);
+        // A lane below the floor still runs its own arm; the floor lanes join the wide run.
+        assert_eq!(
+            wave_lane_groups(&[40, 60, 60, 149], 309, w, wmma_below),
+            Some(vec![40, 60 + 60 + 149])
+        );
+        assert_eq!(
+            wave_lane_groups(&[60, 40, 60, 149], 309, w, wmma_below),
+            Some(vec![60, 40, 60 + 149])
+        );
+        // A sub-16 lane next to a floor lane keeps its own call although nothing is WMMA-keyed.
+        assert_eq!(
+            wave_lane_groups(&[12, 60], 72, w, wmma_below),
+            Some(vec![12, 60])
+        );
+        for table in [vec![60; 8], vec![9, 16, 48, 49, 64, 65, 200]] {
+            let total: usize = table.iter().sum();
+            if let Some(groups) = wave_lane_groups(&table, total, w, wmma_below) {
+                assert_eq!(groups.iter().sum::<usize>(), total);
+            }
+        }
+    }
 
     #[test]
     fn product_cfg_is_one_ntile_auto_split() {
@@ -442,5 +834,61 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The prefill plan's pinned split-K is independent of `rows` and its chunks fit the fixed
+    /// scratch, for the Flash-Next dense / HC shapes.
+    #[test]
+    fn prefill_plan_fits_fixed_scratch_and_pins_split_k() {
+        let sr = LANE_WMMA_PREFILL_SPLIT_ROWS;
+        for (m, k) in [
+            (512usize, 2560usize),
+            (640, 2560),
+            (320, 10240),
+            (2560, 640),
+            (2560, 320),
+        ] {
+            let pinned = lane_wmma_auto_split_k(m, k, sr, 1);
+            for rows in [65usize, 149, 511, 1043] {
+                let (s, chunk) = lane_wmma_prefill_plan(m, k, rows, sr);
+                assert_eq!(s, pinned, "m {m} k {k} rows {rows}");
+                if s > 1 {
+                    assert_eq!(chunk, sr);
+                    assert!(
+                        chunk * s * m <= LANE_WMMA_SCRATCH_PARTIAL_FLOATS,
+                        "m {m} k {k} rows {rows}"
+                    );
+                    assert!(
+                        m.div_ceil(16) * chunk.div_ceil(64) <= LANE_WMMA_SCRATCH_COUNTERS,
+                        "m {m} k {k} rows {rows}"
+                    );
+                } else {
+                    assert_eq!(chunk, rows);
+                }
+            }
+        }
+    }
+
+    /// The multi plan keeps each part's own single-launch split-K, fits the Flash-Next front at
+    /// every wide row count, and refuses what is not a multi launch.
+    #[test]
+    fn multi_plan_is_the_per_part_split_k() {
+        for rows in 9..=64usize {
+            for ms in [[512usize, 1, 384, 384], [512, 1, 256, 256]] {
+                let plan = lane_wmma_multi_plan(&ms, 2560, rows).expect("front fits");
+                for (p, &m) in ms.iter().enumerate() {
+                    assert_eq!(plan.split_k[p], lane_wmma_auto_split_k(m, 2560, rows, 1));
+                }
+                assert_eq!(plan.tiles, ms.iter().map(|m| m.div_ceil(16)).sum::<usize>());
+                assert_eq!(plan.grid_y, *plan.split_k.iter().max().unwrap());
+                assert_eq!(plan.grid_z, 1);
+            }
+        }
+        // One part, five parts, an empty part, K not a multiple of 128, no rows: not a multi launch.
+        assert!(lane_wmma_multi_plan(&[384], 2560, 32).is_none());
+        assert!(lane_wmma_multi_plan(&[1, 2, 3, 4, 5], 2560, 32).is_none());
+        assert!(lane_wmma_multi_plan(&[384, 0], 2560, 32).is_none());
+        assert!(lane_wmma_multi_plan(&[384, 384], 2500, 32).is_none());
+        assert!(lane_wmma_multi_plan(&[384, 384], 2560, 0).is_none());
     }
 }

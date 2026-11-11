@@ -210,61 +210,115 @@ fn raw_srd_word3(word3: u32) -> Result<()> {
     }
     Ok(())
 }
-/// `global_atomic_add_u32 [vdst,] vaddr, vdata, saddr|off`: per active lane `tmp = MEM[addr]; MEM[addr] = tmp + DATA.u32
-/// (wrapping); RETURN_DATA = tmp` (RDNA3 ISA `GLOBAL_ATOMIC_ADD_U32`). `glc` selects the returning form, which decodes
-/// with a leading VDST. The ISA does not say how lanes of one wave that hit the same dword are ordered: the integer
-/// adds commute, so the non-returning form applies them lane by lane, but a returning form with two active lanes on one
-/// dword (each would observe a different intermediate value) is an error. Memory is written with `Memory::write` and the
-/// returned dword lands through `State::put`, like the generic loads and stores.
+/// `global_atomic_add_u32 [vdst,] vaddr, vdata, saddr|off` and `flat_atomic_add_u32 [vdst,] vaddr, vdata`: per active
+/// lane `tmp = MEM[addr]; MEM[addr] = tmp + DATA.u32 (wrapping); RETURN_DATA = tmp` (RDNA3 ISA `GLOBAL_ATOMIC_ADD_U32`).
+/// `glc` (gfx11) / `th:TH_ATOMIC_RETURN` (gfx12) selects the returning form, which decodes with a leading VDST. The ISA
+/// does not say how lanes of one wave that hit the same dword are ordered: the integer adds commute, so the
+/// non-returning form applies them lane by lane, but a returning form with two active lanes on one dword (each would
+/// observe a different intermediate value) is an error. Memory is written with `Memory::write` and the returned dword
+/// lands through `State::put`, like the generic loads and stores.
 ///
 /// `global_atomic_or_b32` (`MEM[addr] |= DATA`) commutes like the add. `global_atomic_swap_b32` (`MEM[addr] = DATA`)
 /// does not: two active lanes swapping different values into one dword leave an unspecified winner, an error too.
-fn global_atomic_u32(i: &Inst, s: &mut State, mem: &mut Memory, name: &str) -> Result<()> {
+///
+/// FLAT (`flat: true`) has no SADDR (the gfx12 encoding's SADDR slot decodes as `off`, anything else is an error): the
+/// generic address is a 64-bit VGPR pair plus the signed immediate. The returning shape must agree with the cache policy
+/// (`th` bit 0 or `glc`). A generic address in the shared (LDS) or private aperture is an error (not modeled); any other
+/// address is global memory (an unmapped one is an error).
+fn vmem_atomic_u32(
+    i: &Inst,
+    s: &mut State,
+    mem: &mut Memory,
+    name: &str,
+    flat: bool,
+) -> Result<()> {
     let swap = name == "global_atomic_swap_b32";
-    let regs: Vec<&Operand> = i
+    let mut regs: Vec<&Operand> = i
         .operands
         .iter()
         .filter(|o| !matches!(o, Operand::Imm(_)))
         .collect();
-    let ret = match regs.len() {
-        4 => true,
-        3 => false,
-        _ => return Err(format!("{name}: unexpected operand shape").into()),
+    if flat {
+        match regs.last() {
+            Some(
+                Operand::Vmem(crate::operand::VmemToken::Off)
+                | Operand::Special(crate::operand::Special::Null),
+            ) => {
+                regs.pop();
+            }
+            Some(Operand::Reg(r)) if r.kind != crate::reg::Kind::V => {
+                return Err(format!(
+                    "{name}: FLAT has no SADDR, got {}",
+                    regs[regs.len() - 1]
+                ));
+            }
+            _ => {}
+        }
+    }
+    let ret = match (flat, regs.len()) {
+        (false, 4) | (true, 3) => true,
+        (false, 3) | (true, 2) => false,
+        _ => return Err(format!("{name}: unexpected operand shape {:?}", i.operands)),
     };
-    let (vaddr, vdata, saddr) = (
-        regs[usize::from(ret)],
-        regs[1 + usize::from(ret)],
-        regs[2 + usize::from(ret)],
-    );
+    if flat && ret != (i.mods.cpol.th & 1 != 0 || i.mods.cpol.glc) {
+        return Err(format!(
+            "{name}: the operand shape ({}returning) disagrees with the cache policy (th {}, glc {})",
+            if ret { "" } else { "non-" },
+            i.mods.cpol.th,
+            i.mods.cpol.glc
+        ));
+    }
+    let (vaddr, vdata) = (regs[usize::from(ret)], regs[1 + usize::from(ret)]);
+    let saddr = if flat {
+        None
+    } else {
+        Some(regs[2 + usize::from(ret)])
+    };
     let mut offset = 0i64;
     for op in &i.operands {
         if let Operand::Imm(ImmField::VmemOffset(n)) = op {
             offset += i64::from(*n);
         }
     }
+    if flat && !matches!(vaddr, Operand::Reg(r) if r.kind == crate::reg::Kind::V && r.len == 2) {
+        return Err(format!("{name}: FLAT address must be a 64-bit VGPR pair"));
+    }
     // SADDR form: a 32-bit VGPR byte offset added to the SGPR-pair base; `off`: a 64-bit VGPR address.
-    let saddr_pair =
-        matches!(saddr, Operand::Reg(r) if r.kind == crate::reg::Kind::S && r.len == 2);
+    let saddr_pair = saddr.is_some_and(
+        |o| matches!(o, Operand::Reg(r) if r.kind == crate::reg::Kind::S && r.len == 2),
+    );
     let mut lanes: Vec<(usize, u64)> = Vec::new();
     for lane in 0..s.lanes {
         if s.exec & (1u64 << lane) == 0 {
             continue;
         }
-        let addr = if saddr_pair {
+        let addr = if let (true, Some(saddr)) = (saddr_pair, saddr) {
             s.read64(saddr, 0)?
                 .wrapping_add(u64::from(s.read(vaddr, lane, 0)?))
         } else {
             s.read64(vaddr, lane)?
         }
         .wrapping_add_signed(offset);
+        if flat {
+            match (addr >> 32) as u32 {
+                super::SHARED_APERTURE_HI => {
+                    return Err(format!("{name}: LDS-aperture flat atomic is not modeled"))
+                }
+                super::PRIVATE_APERTURE_HI => {
+                    return Err(format!(
+                        "{name}: private-aperture flat atomic is not modeled"
+                    ))
+                }
+                _ => {}
+            }
+        }
         if lanes.iter().any(|&(other, a)| {
             a == addr
                 && (ret || (swap && s.read(vdata, other, 0).ok() != s.read(vdata, lane, 0).ok()))
         }) {
             return Err(format!(
                 "{name}: two active lanes meet in one dword where the order is observable and not specified"
-            )
-            .into());
+            ));
         }
         lanes.push((lane, addr));
     }
@@ -481,6 +535,26 @@ pub(super) fn execute_tracked(
             .map(|_| ())
             .map_err(|_| format!("s_prefetch_data: prefetched range {addr:#x}+{len} is not inside a mapped buffer (unmapped memory access)"));
     }
+    // VMEM atomics: only the modeled read-modify-write forms execute; every other atomic is refused here so the
+    // generic load/store path below can never treat one as a plain store.
+    match name {
+        "global_atomic_add_u32" | "global_atomic_swap_b32" | "global_atomic_or_b32" => {
+            return vmem_atomic_u32(i, s, mem, name, false);
+        }
+        "flat_atomic_add_u32" => return vmem_atomic_u32(i, s, mem, name, true),
+        _ if [
+            "flat_atomic_",
+            "global_atomic_",
+            "buffer_atomic_",
+            "scratch_atomic_",
+        ]
+        .iter()
+        .any(|p| name.starts_with(p)) =>
+        {
+            return Err(format!("{name}: atomic has no read-modify-write model"));
+        }
+        _ => {}
+    }
     let n = width(name)?;
     if name.starts_with("s_load_") {
         let mut off = 0u64;
@@ -563,12 +637,6 @@ pub(super) fn execute_tracked(
     }
     if name.starts_with("scratch_") {
         return scratch_access(name, i, s);
-    }
-    if matches!(
-        name,
-        "global_atomic_add_u32" | "global_atomic_swap_b32" | "global_atomic_or_b32"
-    ) {
-        return global_atomic_u32(i, s, mem, name);
     }
     if name == "global_load_tr_b64" {
         return global_load_tr_b64(i, s, mem);
@@ -1790,5 +1858,140 @@ mod tests {
         println!(
             "global_load_tr_b64 replay: {waves} waves identical ({skipped} EXEC==0 waves skipped)"
         );
+    }
+    // `flat_atomic_add_u32 v6, v[10:11], v6 th:TH_ATOMIC_RETURN scope:SCOPE_DEV` (gfx12 table sample).
+    fn flat_atomic_rtn() -> Inst {
+        crate::codec::gfx12::decode(&[0xEC0D_407C, 0x0318_0006, 0x0000_000A])
+            .unwrap()
+            .0
+    }
+    fn flat_atomic_nortn() -> Inst {
+        insn_on(
+            Arch::Gfx1201,
+            "flat_atomic_add_u32",
+            vec![reg(Kind::V, 10, 2), reg(Kind::V, 6, 1)],
+        )
+    }
+    /// Lanes 0..3 active; lane `l` adds `data[l]` at `addrs[l]` (VGPRs v[10:11] address, v6 data).
+    fn flat_atomic_lanes(addrs: [u64; 3], data: [u32; 3]) -> (State, Memory) {
+        let mut st = state();
+        st.exec = 0b111;
+        for l in 0..3 {
+            st.v[10][l] = addrs[l] as u32;
+            st.v[11][l] = (addrs[l] >> 32) as u32;
+            st.v[6][l] = data[l];
+        }
+        let mut mem = Memory::default();
+        let mut bytes = Vec::new();
+        for word in [10u32, 20, 30, 40] {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+        mem.map("m".into(), 0x1000, bytes).unwrap();
+        (st, mem)
+    }
+    fn run_flat_atomic(inst: &Inst, st: &mut State, mem: &mut Memory) -> Result<()> {
+        execute("flat_atomic_add_u32", inst, st, mem, &mut [])
+    }
+    fn dword(mem: &Memory, addr: u64) -> u32 {
+        u32::from_le_bytes(mem.read(addr, 4).unwrap().try_into().unwrap())
+    }
+    #[test]
+    fn flat_atomic_add_returning_returns_old_values_and_updates_memory() {
+        let (mut st, mut mem) = flat_atomic_lanes([0x1000, 0x1004, 0x1008], [1, 2, 3]);
+        run_flat_atomic(&flat_atomic_rtn(), &mut st, &mut mem).unwrap();
+        assert_eq!([st.v[6][0], st.v[6][1], st.v[6][2]], [10, 20, 30]);
+        assert_eq!(
+            [
+                dword(&mem, 0x1000),
+                dword(&mem, 0x1004),
+                dword(&mem, 0x1008),
+                dword(&mem, 0x100c)
+            ],
+            [11, 22, 33, 40]
+        );
+        // Inactive lanes touch nothing; the add wraps.
+        let (mut st, mut mem) = flat_atomic_lanes([0x1000, 0x1004, 0x1008], [u32::MAX, 0, 0]);
+        st.exec = 0b001;
+        run_flat_atomic(&flat_atomic_rtn(), &mut st, &mut mem).unwrap();
+        assert_eq!(st.v[6][0], 10);
+        assert_eq!(dword(&mem, 0x1000), 9);
+        assert_eq!(dword(&mem, 0x1004), 20);
+    }
+    #[test]
+    fn flat_atomic_add_non_returning_accumulates_lanes_on_one_dword() {
+        let (mut st, mut mem) = flat_atomic_lanes([0x1004; 3], [1, 2, 3]);
+        run_flat_atomic(&flat_atomic_nortn(), &mut st, &mut mem).unwrap();
+        assert_eq!(dword(&mem, 0x1004), 26);
+        assert_eq!(
+            [st.v[6][0], st.v[6][1], st.v[6][2]],
+            [1, 2, 3],
+            "no return value is written"
+        );
+    }
+    #[test]
+    fn flat_atomic_add_returning_same_dword_collision_is_an_error() {
+        let (mut st, mut mem) = flat_atomic_lanes([0x1000, 0x1000, 0x1008], [1, 2, 3]);
+        let err = run_flat_atomic(&flat_atomic_rtn(), &mut st, &mut mem).unwrap_err();
+        assert!(err.contains("order is observable"), "{err}");
+        assert_eq!(dword(&mem, 0x1000), 10, "nothing is applied on error");
+    }
+    #[test]
+    fn flat_atomic_add_applies_the_signed_immediate_offset() {
+        let (mut st, mut mem) = flat_atomic_lanes([0x1008, 0x1008, 0x1008], [1, 1, 1]);
+        st.exec = 1;
+        let mut inst = flat_atomic_nortn();
+        inst.operands.push(Operand::Imm(ImmField::VmemOffset(-4)));
+        run_flat_atomic(&inst, &mut st, &mut mem).unwrap();
+        assert_eq!(dword(&mem, 0x1004), 21);
+        assert_eq!(dword(&mem, 0x1008), 30);
+    }
+    #[test]
+    fn flat_atomic_add_outside_global_memory_is_an_error() {
+        for (hi, needle) in [
+            (crate::emu::SHARED_APERTURE_HI, "LDS-aperture"),
+            (crate::emu::PRIVATE_APERTURE_HI, "private-aperture"),
+        ] {
+            let (mut st, mut mem) = flat_atomic_lanes([(u64::from(hi) << 32) | 0x10; 3], [1; 3]);
+            let err = run_flat_atomic(&flat_atomic_nortn(), &mut st, &mut mem).unwrap_err();
+            assert!(err.contains(needle), "{err}");
+        }
+        let (mut st, mut mem) = flat_atomic_lanes([0x9000; 3], [1; 3]);
+        assert!(run_flat_atomic(&flat_atomic_nortn(), &mut st, &mut mem).is_err());
+        assert!(run_flat_atomic(&flat_atomic_rtn(), &mut st, &mut mem).is_err());
+    }
+    #[test]
+    fn flat_atomic_add_shape_and_cache_policy_must_agree() {
+        // Returning shape (leading VDST) with th = 0.
+        let mut inst = flat_atomic_rtn();
+        inst.mods.cpol.th = 0;
+        let (mut st, mut mem) = flat_atomic_lanes([0x1000; 3], [1; 3]);
+        let err = run_flat_atomic(&inst, &mut st, &mut mem).unwrap_err();
+        assert!(err.contains("disagrees"), "{err}");
+        // Non-returning shape with TH_ATOMIC_RETURN.
+        let mut inst = flat_atomic_nortn();
+        inst.mods.cpol.th = 1;
+        let err = run_flat_atomic(&inst, &mut st, &mut mem).unwrap_err();
+        assert!(err.contains("disagrees"), "{err}");
+        assert_eq!(dword(&mem, 0x1000), 10);
+    }
+    #[test]
+    fn unmodeled_atomics_are_refused_not_executed_as_stores() {
+        let (mut st, mut mem) = flat_atomic_lanes([0x1000; 3], [1; 3]);
+        // Any decoded atomic instruction under an unmodeled name hits the refusal before the generic store path.
+        let inst = flat_atomic_nortn();
+        for name in [
+            "flat_atomic_swap_b32",
+            "flat_atomic_add_u64",
+            "global_atomic_add_u64",
+            "buffer_atomic_add_u32",
+            "scratch_atomic_add_u32",
+        ] {
+            let err = execute(name, &inst, &mut st, &mut mem, &mut []).unwrap_err();
+            assert_eq!(
+                err,
+                format!("{name}: atomic has no read-modify-write model")
+            );
+        }
+        assert_eq!(dword(&mem, 0x1000), 10);
     }
 }

@@ -302,7 +302,7 @@ fn opcode_table_is_complete_unique_and_round_trips() {
         count(|op| matches!(op, Vop3Op::Only(_))),
         Vop3OnlyOp::ALL.len()
     );
-    assert_eq!(ops.len(), 32 + 41 + 39 + 55);
+    assert_eq!(ops.len(), 36 + 42 + 39 + 55);
 
     let mut opcodes = HashSet::new();
     let mut names = HashSet::new();
@@ -443,6 +443,8 @@ fn operand_widths() {
     assert_eq!(Vop3Op::V1(Vop1Op::CvtF32F64).widths(), (1, 2, 0, 0));
     assert_eq!(Vop3Op::C(VopcOp::CmpLtF32).widths(), (2, 1, 1, 0));
     assert_eq!(Vop3Op::C(VopcOp::CmpEqU64).widths(), (2, 2, 2, 0));
+    assert_eq!(Vop3Op::C(VopcOp::CmpGtI64).widths(), (2, 2, 2, 0));
+    assert_eq!(Vop3Op::C(VopcOp::CmpGeI64).widths(), (2, 2, 2, 0));
     assert_eq!(Vop3Op::V2(Vop2Op::CndmaskB32).widths(), (1, 1, 1, 2));
     assert_eq!(Vop3Op::V2(Vop2Op::AddcCoU32).widths(), (1, 1, 1, 2));
     assert_eq!(Vop3Op::V2(Vop2Op::AddCoU32).widths(), (1, 1, 1, 0));
@@ -556,6 +558,18 @@ fn bit_layout_matches_llvm_mc() {
         0xd010_0104,
         0x2002_3114,
     );
+    // v_cmp_gt_i64_e64 s[4:5], v[0:1], v[2:3] / v_cmp_ge_i64_e64 (opcodes 228 / 230)
+    for (op, name, w0) in [
+        (VopcOp::CmpGtI64, "v_cmp_gt_i64_e64", 0xd0e4_0004),
+        (VopcOp::CmpGeI64, "v_cmp_ge_i64_e64", 0xd0e6_0004),
+    ] {
+        assert_layout(
+            &bin(Vop3Op::C(op), sg(4), v(0), v(2)),
+            &format!("{name} s[4:5], v[0:1], v[2:3]"),
+            w0,
+            0x0002_0500,
+        );
+    }
     // v_cvt_pk_fp8_f32 v4, v20, v24 op_sel:[0,0,1] (OP_SEL[3] = destination half)
     let pk = Vop3 {
         op_sel: 0b1000,

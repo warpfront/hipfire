@@ -112,6 +112,7 @@ fn e_flags(arch: Arch) -> u32 {
     match arch {
         Arch::Gfx1100 => 0x41,
         Arch::Gfx1151 => 0x4a,
+        Arch::Gfx1200 => 0x48,
         Arch::Gfx1201 => 0x4e,
         Arch::Gfx942 => MACH_GFX942 | XNACK_ANY | SRAMECC_ANY,
     }

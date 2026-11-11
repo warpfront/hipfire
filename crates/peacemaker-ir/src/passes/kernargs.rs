@@ -61,6 +61,18 @@
 //! base argument. Every other unresolved base keeps its refusal, and the
 //! unguarded [`analyze`] is unchanged. A `Conditional` result is void
 //! without bind witnesses for each guard and indexed effect.
+//!
+//! Complexity and work bound. The forward dataflow is a worklist over blocks: each popped
+//! block replays its instructions and clones/joins the state into every successor, so the
+//! cost is the sum over pops of `block length + 1`. No termination argument is relied on:
+//! that sum is capped at [`A1Budget::fixpoint_work_per_inst`] times the kernel's instruction
+//! count (default 512; the largest ratio over every kernel of the repository's certifier
+//! fixtures is 63, and the task-graph pools and bodies stay under 22). A
+//! kernel that exceeds it is `Unknown` with the single reason [`RULE_FIXPOINT_BUDGET`] and the
+//! measured counts (no access fact of a half-computed result is reported), for the plain,
+//! excluding, guarded, sealed and workgroup-footprint runs alike; the sealed variant runs the
+//! fixpoint twice, each run under the bound. The sealed-table entry and guard replays keep
+//! their own bounds (`GUARD_PATHS`, `GUARD_STEPS`: rule `sealed-guard-path-budget`).
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -92,6 +104,38 @@ use super::kernarg_ix::{
 /// segment fall back to the overflow flags: an overflowing pointer root is
 /// `Unknown`, an overflowing taint is reported as `taint_overflow`.
 const MAX_DW: u32 = 128;
+
+/// Rule of the `Unresolved` an analysis that exceeded its [`A1Budget`] reports.
+pub const RULE_FIXPOINT_BUDGET: &str = "a1-fixpoint-budget";
+
+/// Work bound of one A1 analysis (see "Complexity" in the module docs). An analysis that
+/// exceeds it stops at once and returns `Unknown` carrying [`RULE_FIXPOINT_BUDGET`] with the
+/// measured counts: a refusal, never a partial result, so exceeding the bound admits
+/// nothing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct A1Budget {
+    /// Work of one dataflow fixpoint run, per instruction of the kernel: every block visit
+    /// costs the block's instruction count (each is replayed through the transfer function)
+    /// plus one (the state joined into each successor).
+    pub fixpoint_work_per_inst: u32,
+}
+
+impl Default for A1Budget {
+    fn default() -> Self {
+        A1Budget {
+            fixpoint_work_per_inst: 512,
+        }
+    }
+}
+
+/// A fixpoint that ran past its bound.
+struct FixpointOverrun {
+    work: u64,
+    limit: u64,
+    visits: u64,
+    blocks: usize,
+    insts: usize,
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 struct DwSet(u128);
@@ -366,10 +410,20 @@ struct State {
     exec: [Val; 2],
     m0: Val,
     scc: Val,
-    /// Sealed analysis: EXEC is known nonzero (a decided EXECZ/EXECNZ edge
-    /// set it; any EXEC write but a superset `s_or_b32 exec_lo, exec_lo, x`
-    /// clears it; joins keep it only when both sides know it).
+    /// Sealed analysis: EXEC is known nonzero (the wave launch state, or a
+    /// decided EXECZ/EXECNZ edge set it; any EXEC write but a superset
+    /// `s_or_b32 exec_lo, exec_lo, x` clears it; joins keep it only when both
+    /// sides know it).
     exec_nz: bool,
+    /// Position (+1) of the last instruction that wrote EXEC; `u32::MAX` after a
+    /// join of different ones. Names the EXEC value of VALU carry witnesses.
+    epoch: u32,
+    /// Workgroup-footprint analysis: scalar compare facts `(atom, polarity)`
+    /// that hold on every path to here (dominating branch edges); joins keep the
+    /// facts both sides know.
+    facts: Vec<(Ix, bool)>,
+    /// Lane predicates every active lane satisfies (the EXEC conjunction).
+    lane_facts: Vec<(Ix, bool)>,
 }
 
 impl State {
@@ -386,6 +440,9 @@ impl State {
             m0: Val::default(),
             scc: Val::default(),
             exec_nz: false,
+            epoch: 0,
+            facts: Vec::new(),
+            lane_facts: Vec::new(),
         }
     }
     fn top(&self) -> u8 {
@@ -460,6 +517,11 @@ impl State {
         self.m0 = self.m0.join(o.m0);
         self.scc = self.scc.join(o.scc);
         self.exec_nz &= o.exec_nz;
+        if self.epoch != o.epoch {
+            self.epoch = u32::MAX;
+        }
+        self.facts.retain(|f| o.facts.contains(f));
+        self.lane_facts.retain(|f| o.lane_facts.contains(f));
     }
     /// EXEC ⊆ its old value: lanes being disabled keep their current values.
     fn exec_narrow(&mut self) {
@@ -960,7 +1022,7 @@ fn acquired_after(arch: Arch, body: &Body, block_of: &[usize], pos: usize, scope
 /// the stream proves one. gfx12 (`Gfx1201`) only; empty elsewhere.
 fn sync_classes(arch: Arch, body: &Body) -> Vec<Option<AccessClass>> {
     let mut out = vec![None; body.layout.len()];
-    if arch != Arch::Gfx1201 {
+    if !arch.is_gfx12() {
         return out;
     }
     let mut block_of = vec![0usize; body.layout.len()];
@@ -1177,6 +1239,12 @@ struct Rec {
     guards_used: BTreeSet<usize>,
     sealed_entries: BTreeMap<InstId, EntryRec>,
     sealed_accesses: Vec<TableAccessRec>,
+    /// Write accesses attributed to an argument, with their address witnesses.
+    wsites: BTreeMap<InstId, WriteSite>,
+    /// Must-facts (scalar, lane) at every attributed access (workgroup replay).
+    nfacts: BTreeMap<InstId, (Vec<(Ix, bool)>, Vec<(Ix, bool)>)>,
+    /// Declared arguments proved `null_guarded`.
+    null_args: BTreeSet<Target>,
 }
 impl Rec {
     fn new(loaded: DwSet) -> Self {
@@ -1194,6 +1262,9 @@ impl Rec {
             guards_used: BTreeSet::new(),
             sealed_entries: BTreeMap::new(),
             sealed_accesses: Vec::new(),
+            wsites: BTreeMap::new(),
+            nfacts: BTreeMap::new(),
+            null_args: BTreeSet::new(),
         }
     }
     fn sink(&mut self, taint: DwSet, tf: u8, bit: u8) {
@@ -1237,6 +1308,9 @@ struct Analyzer<'k> {
     pos_cyclic: Vec<bool>,
     /// gfx12 release/acquire refinement per layout position ([`sync_classes`]).
     sync_class: Vec<Option<AccessClass>>,
+    /// Per layout position: attribution is skipped (the dataflow still runs through the
+    /// instruction). Empty when nothing is excluded ([`analyze_excluding`]).
+    excluded: Vec<bool>,
     decoded: Vec<Option<Dec<'k>>>,
     /// Integer/address witness nodes (`kernarg_ix`).
     ix: RefCell<Interner>,
@@ -1250,13 +1324,50 @@ struct Analyzer<'k> {
     /// The access the null-guard replay watches and the table bits its base
     /// carried when it was replayed.
     probe: RefCell<(Option<InstId>, u8)>,
+    /// The scalar flag/constant semantics of the sealed analysis (SCC compare
+    /// witnesses, decided selects, EXEC-nonzero tracking, branch pruning) are
+    /// on: the sealed analysis and the workgroup-footprint analysis.
+    flags: bool,
+    /// The workgroup-footprint analysis: branch edges add compare facts and
+    /// EXEC predicates are tracked ([`State::facts`], [`State::lane_facts`]).
+    wgf: bool,
 }
 
 /// A1/A3/A4 facts for `kernel`. Never fails: an unsupported arch or ABI, or
 /// an instruction the pass does not model, yields `KernelStatus::Unknown`
 /// with the reason in `unresolved`.
 pub fn analyze(kernel: &Kernel, arch: Arch) -> KernargFacts {
-    analyze_impl(kernel, arch, None, false)
+    analyze_budgeted(kernel, arch, &A1Budget::default())
+}
+
+/// [`analyze`] under an explicit work bound.
+pub fn analyze_budgeted(kernel: &Kernel, arch: Arch, budget: &A1Budget) -> KernargFacts {
+    analyze_impl(kernel, arch, None, false, &[], budget)
+}
+
+/// The unguarded analysis with the instructions whose lifted byte offset
+/// (`Provenance::pc`, relative to the kernel symbol) lies in one of `excluded`
+/// (`[lo, hi)` ranges) left out of refusal and side-read attribution: the pass
+/// still runs through them for their register effects, and an access of theirs
+/// that resolves to an argument is still credited to it (with its kernarg
+/// sinks), but an access that does not resolve (a pointer loaded from the
+/// argument's pointee), a side read or any other refusal there adds nothing.
+/// For a persistent dispatcher whose hosted task bodies are certified
+/// separately: the facts are the dispatcher shell's own plus what the bodies
+/// read of their argument block. An instruction without a recorded offset is
+/// never excluded.
+pub fn analyze_excluding(kernel: &Kernel, arch: Arch, excluded: &[(u32, u32)]) -> KernargFacts {
+    analyze_excluding_budgeted(kernel, arch, excluded, &A1Budget::default())
+}
+
+/// [`analyze_excluding`] under an explicit work bound.
+pub fn analyze_excluding_budgeted(
+    kernel: &Kernel,
+    arch: Arch,
+    excluded: &[(u32, u32)],
+    budget: &A1Budget,
+) -> KernargFacts {
+    analyze_impl(kernel, arch, None, false, excluded, budget)
 }
 
 /// The guarded analysis of amendment 2026-10-25 §A9.1/§A9.3: the same pass
@@ -1272,7 +1383,17 @@ pub fn analyze(kernel: &Kernel, arch: Arch) -> KernargFacts {
 /// (guards cleared), `Unknown` otherwise. The unguarded [`analyze`] result is
 /// unaffected and stays the diagnostic baseline.
 pub fn analyze_guarded(kernel: &Kernel, arch: Arch, guards: &[Guard]) -> KernargFacts {
-    analyze_impl(kernel, arch, Some(guards), false)
+    analyze_guarded_budgeted(kernel, arch, guards, &A1Budget::default())
+}
+
+/// [`analyze_guarded`] under an explicit work bound.
+pub fn analyze_guarded_budgeted(
+    kernel: &Kernel,
+    arch: Arch,
+    guards: &[Guard],
+    budget: &A1Budget,
+) -> KernargFacts {
+    analyze_impl(kernel, arch, Some(guards), false, &[], budget)
 }
 
 /// The sealed-table analysis (design: `SealedTable` certificate). The same
@@ -1299,7 +1420,12 @@ pub fn analyze_guarded(kernel: &Kernel, arch: Arch, guards: &[Guard]) -> Kernarg
 /// `sealed-*` rules. The result is void without a matching `sealed_table`
 /// runtime witness.
 pub fn analyze_sealed(kernel: &Kernel, arch: Arch) -> KernargFacts {
-    analyze_impl(kernel, arch, None, true)
+    analyze_sealed_budgeted(kernel, arch, &A1Budget::default())
+}
+
+/// [`analyze_sealed`] under an explicit work bound.
+pub fn analyze_sealed_budgeted(kernel: &Kernel, arch: Arch, budget: &A1Budget) -> KernargFacts {
+    analyze_impl(kernel, arch, None, true, &[], budget)
 }
 
 fn analyze_impl(
@@ -1307,7 +1433,53 @@ fn analyze_impl(
     arch: Arch,
     guards: Option<&[Guard]>,
     sealed: bool,
+    excluded: &[(u32, u32)],
+    budget: &A1Budget,
 ) -> KernargFacts {
+    analyze_core(kernel, arch, guards, sealed, excluded, false, budget).0
+}
+
+/// The unguarded analysis (`sealed` = [`analyze_sealed`]) together with the
+/// exact address witnesses of every write it attributed to an argument, for
+/// the workgroup-footprint analysis (`passes::wg_footprint`).
+pub(super) fn analyze_for_wg(
+    kernel: &Kernel,
+    arch: Arch,
+    sealed: bool,
+    budget: &A1Budget,
+) -> (KernargFacts, Option<WgInput>) {
+    analyze_core(kernel, arch, None, sealed, &[], true, budget)
+}
+
+/// One write access attributed to an argument and its exact address witness.
+pub(super) struct WriteSite {
+    pub pos: u32,
+    /// The 64-bit address witness (global VMEM only; otherwise `Ix::NONE`).
+    pub addr: Ix,
+    pub width: Option<u8>,
+    /// Inside a CFG cycle: such an access executes many times per workgroup.
+    pub cyclic: bool,
+    /// Scalar compare facts holding on every path to the access.
+    pub facts: Vec<(Ix, bool)>,
+    /// Lane predicates every active lane of the access satisfies.
+    pub lane_facts: Vec<(Ix, bool)>,
+}
+
+/// What the workgroup-footprint analysis needs of the replay.
+pub(super) struct WgInput {
+    pub it: Interner,
+    pub sites: BTreeMap<InstId, WriteSite>,
+}
+
+fn analyze_core(
+    kernel: &Kernel,
+    arch: Arch,
+    guards: Option<&[Guard]>,
+    sealed: bool,
+    excluded: &[(u32, u32)],
+    wg: bool,
+    budget: &A1Budget,
+) -> (KernargFacts, Option<WgInput>) {
     let (args, size) = match &kernel.abi {
         Abi::Hsa {
             metadata,
@@ -1327,13 +1499,16 @@ fn analyze_impl(
         kernarg_size: size,
         ..KernargFacts::default()
     };
-    if !matches!(arch, Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1201) {
+    if !matches!(
+        arch,
+        Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1200 | Arch::Gfx1201
+    ) {
         facts.unresolved.push(Unresolved {
             inst: None,
             rule: "unsupported-arch",
             detail: format!("{arch:?}"),
         });
-        return finish(facts, &layout, None, &[], Vec::new());
+        return (finish(facts, &layout, None, &[], Vec::new()), None);
     }
     let body = &kernel.body;
     if body.blocks.is_empty() {
@@ -1342,7 +1517,7 @@ fn analyze_impl(
             rule: "blocks-not-built",
             detail: String::new(),
         });
-        return finish(facts, &layout, None, &[], Vec::new());
+        return (finish(facts, &layout, None, &[], Vec::new()), None);
     }
     let mut decoded = Vec::with_capacity(body.layout.len());
     for (pos, &id) in body.layout.iter().enumerate() {
@@ -1354,8 +1529,14 @@ fn analyze_impl(
         );
     }
     let (mut entry, entry_loaded) = entry_state(kernel, arch);
+    // Sealed analysis: a wave is only launched with at least one enabled lane,
+    // so EXEC is nonzero at the kernel entry. It stays known only while no
+    // instruction writes EXEC (but a superset OR), which `step` enforces; this
+    // is what lets `exec_lo & mask == 0` prove `mask == 0` for a guard that is
+    // not preceded by an EXECZ branch.
+    entry.exec_nz = sealed || wg;
     let mut interner = Interner::default();
-    if arch == Arch::Gfx1201 && matches!(kernel.abi, Abi::Hsa { .. }) {
+    if arch.is_gfx12() && matches!(kernel.abi, Abi::Hsa { .. }) {
         entry.t[9].ix = interner.entry(EntryReg::WorkgroupIdX);
         entry.t[7].ix = interner.entry(EntryReg::WorkgroupIdYZ);
         entry.v[0].ix = interner.entry(EntryReg::WorkitemIdPacked);
@@ -1411,14 +1592,35 @@ fn analyze_impl(
         cyclic,
         pos_cyclic,
         sync_class,
+        excluded: if excluded.is_empty() {
+            Vec::new()
+        } else {
+            body.layout
+                .iter()
+                .map(|&id| {
+                    body.insts
+                        .get(id)
+                        .and_then(|i| i.prov.pc)
+                        .is_some_and(|pc| excluded.iter().any(|&(lo, hi)| (lo..hi).contains(&pc)))
+                })
+                .collect()
+        },
         decoded,
         ix: RefCell::new(interner),
         guard,
         sealed: sealed.then(SealedCtx::default),
         atom_pc: RefCell::new(BTreeMap::new()),
         probe: RefCell::new((None, 0)),
+        flags: sealed || wg,
+        wgf: wg,
     };
-    let ins = an.fixpoint();
+    let ins = match an.fixpoint(budget) {
+        Ok(ins) => ins,
+        Err(over) => {
+            facts.unresolved.append(&mut rec.unresolved);
+            return (overrun_facts(facts, &mut an.layout, &over), None);
+        }
+    };
     an.record(&ins, &mut rec);
     let mut rejected: Vec<Unresolved> = Vec::new();
     let mut sealed_uses: Vec<SealedTableUse> = Vec::new();
@@ -1435,12 +1637,33 @@ fn analyze_impl(
             }
             // Second run: the qualified entry loads now carry their table
             // provenance, so every access through them is attributed.
-            let ins = an.fixpoint();
+            let ins = match an.fixpoint(budget) {
+                Ok(ins) => ins,
+                Err(over) => {
+                    facts.unresolved.append(&mut rejected);
+                    return (overrun_facts(facts, &mut an.layout, &over), None);
+                }
+            };
             rec = Rec::new(entry_loaded);
             an.record(&ins, &mut rec);
             sealed_uses = an.assemble_sealed(&rec);
         }
     }
+    if wg {
+        rec.null_args = an.null_guarded_args(&rec);
+    }
+    // The plain analysis has no must-facts: a kernel that tests a 64-bit
+    // kernarg against zero is replayed once more with them for `null_guarded`.
+    let probe_null = !wg
+        && !sealed
+        && guards.is_none()
+        && an.decoded.iter().flatten().any(|d| {
+            d.parts.len() == 1
+                && matches!(
+                    norm_name(d.parts[0].name).as_str(),
+                    "s_cmp_lg_u64" | "s_cmp_eq_u64"
+                )
+        });
     rejected.append(&mut rec.unresolved);
     facts.unresolved = rejected;
     let supplied = an.guard.take().map(|g| g.supplied).unwrap_or_default();
@@ -1451,7 +1674,53 @@ fn analyze_impl(
             size: 0,
         },
     );
-    finish(facts, &layout, Some(rec), &supplied, sealed_uses)
+    let wg = WgInput {
+        it: an.ix.take(),
+        sites: std::mem::take(&mut rec.wsites),
+    };
+    let mut out = finish(facts, &layout, Some(rec), &supplied, sealed_uses);
+    if probe_null && out.status != KernelStatus::Unknown {
+        let (replay, _) = analyze_core(kernel, arch, None, false, excluded, true, budget);
+        for a in &mut out.args {
+            a.null_guarded = replay.args.iter().any(|b| {
+                b.null_guarded
+                    && b.offset == a.offset
+                    && b.index == a.index
+                    && b.accesses == a.accesses
+            });
+        }
+    }
+    (out, Some(wg))
+}
+
+/// The result of an analysis stopped by its work bound: `Unknown`, with the measured counts
+/// as the only reason (no access facts of a half-computed fixpoint are ever reported).
+fn overrun_facts(
+    mut facts: KernargFacts,
+    layout: &mut Layout,
+    over: &FixpointOverrun,
+) -> KernargFacts {
+    facts.unresolved.push(Unresolved {
+        inst: None,
+        rule: RULE_FIXPOINT_BUDGET,
+        detail: format!(
+            "the dataflow fixpoint did {} units of work ({} block visits over {} blocks, {} instructions), past its bound of {} ({} per instruction)",
+            over.work,
+            over.visits,
+            over.blocks,
+            over.insts,
+            over.limit,
+            over.limit / over.insts.max(1) as u64
+        ),
+    });
+    let layout = std::mem::replace(
+        layout,
+        Layout {
+            args: Vec::new(),
+            size: 0,
+        },
+    );
+    finish(facts, &layout, None, &[], Vec::new())
 }
 
 fn cyclic_blocks(body: &Body) -> Vec<bool> {
@@ -1585,7 +1854,7 @@ fn entry_state(kernel: &Kernel, arch: Arch) -> (State, DwSet) {
         }
         next += 1;
     }
-    if arch == Arch::Gfx1201 {
+    if arch.is_gfx12() {
         st.t[9] = Val::flags(WG);
         st.t[7] = Val::flags(WG);
     } else {
@@ -1644,14 +1913,33 @@ enum ExecPlan {
 }
 
 impl<'k> Analyzer<'k> {
-    fn fixpoint(&self) -> Vec<Option<State>> {
+    /// The forward dataflow to a fixpoint: a worklist of blocks, each popped block replays
+    /// its instructions and joins its out-state into its successors. A pop costs the block's
+    /// instruction count plus one; the sum may not pass `budget.fixpoint_work_per_inst`
+    /// times the kernel's instruction count, else [`FixpointOverrun`].
+    fn fixpoint(&self, budget: &A1Budget) -> Result<Vec<Option<State>>, FixpointOverrun> {
         let n = self.body.blocks.len();
         let mut ins: Vec<Option<State>> = vec![None; n];
         ins[0] = Some(self.entry.clone());
         let mut work: Vec<usize> = vec![0];
         let mut queued = vec![false; n];
         queued[0] = true;
+        let insts = self.body.layout.len();
+        let limit = u64::from(budget.fixpoint_work_per_inst) * insts.max(1) as u64;
+        let (mut spent, mut visits) = (0u64, 0u64);
         while let Some(b) = work.pop() {
+            visits += 1;
+            let range = self.body.blocks[b].range;
+            spent += (range.1 - range.0) as u64 + 1;
+            if spent > limit {
+                return Err(FixpointOverrun {
+                    work: spent,
+                    limit,
+                    visits,
+                    blocks: n,
+                    insts,
+                });
+            }
             queued[b] = false;
             let Some(mut st) = ins[b].clone() else {
                 continue;
@@ -1661,14 +1949,16 @@ impl<'k> Analyzer<'k> {
                 self.step(&mut st, pos, None, false);
             }
             for target in self.live_succs(block, &st) {
+                let edge = self.edge_state(block, target, &st);
+                let src = edge.as_ref().unwrap_or(&st);
                 let changed = match &mut ins[target] {
                     Some(existing) => {
                         let before = existing.clone();
-                        existing.join_from(&st);
+                        existing.join_from(src);
                         *existing != before
                     }
                     slot @ None => {
-                        *slot = Some(st.clone());
+                        *slot = Some(src.clone());
                         true
                     }
                 };
@@ -1678,7 +1968,47 @@ impl<'k> Analyzer<'k> {
                 }
             }
         }
-        ins
+        Ok(ins)
+    }
+
+    /// Workgroup-footprint analysis: the state flowing along the branch edge
+    /// `block -> target` with the compare facts that edge implies added
+    /// (`None`: no change).
+    fn edge_state(&self, block: &crate::cfg::Block, target: usize, st: &State) -> Option<State> {
+        use crate::cfg::{Cond, Terminator};
+        if !self.wgf {
+            return None;
+        }
+        let Terminator::Branch {
+            cond,
+            taken,
+            fallthrough,
+        } = &block.term
+        else {
+            return None;
+        };
+        if taken == fallthrough {
+            return None;
+        }
+        let is_taken = target == taken.0;
+        let mut facts = Vec::new();
+        self.edge_facts(*cond, is_taken, st, &mut facts);
+        let nz = self.wave == Wave::Wave32
+            && matches!(
+                (cond, is_taken),
+                (Cond::Execz, false) | (Cond::Execnz, true)
+            );
+        if facts.is_empty() && !nz {
+            return None;
+        }
+        let mut out = st.clone();
+        out.facts.extend(facts);
+        out.facts.sort();
+        out.facts.dedup();
+        if nz {
+            out.exec_nz = true;
+        }
+        Some(out)
     }
 
     /// Which edge of a conditional branch `st` decides: `Some(true)` the taken
@@ -1689,7 +2019,7 @@ impl<'k> Analyzer<'k> {
     /// which the compiler relies on). EXEC branches are never decided.
     fn branch_outcome(&self, cond: crate::cfg::Cond, st: &State) -> Option<bool> {
         use crate::cfg::Cond;
-        if self.guard.is_none() && self.sealed.is_none() {
+        if self.guard.is_none() && !self.flags {
             return None;
         }
         match cond {
@@ -1697,7 +2027,7 @@ impl<'k> Analyzer<'k> {
                 let scc = st.scc.konst?;
                 Some((scc != 0) == (cond == Cond::Scc1))
             }
-            Cond::Vccz | Cond::Vccnz if self.sealed.is_some() && self.wave == Wave::Wave32 => {
+            Cond::Vccz | Cond::Vccnz if self.flags && self.wave == Wave::Wave32 => {
                 let vcc = st.s[VCC_LO].konst?;
                 Some((vcc == 0) == (cond == Cond::Vccz))
             }
@@ -1903,6 +2233,7 @@ impl<'k> Analyzer<'k> {
         if let Some(rec) = rec.as_deref_mut() {
             self.record_sinks(st, dec, rec, cyclic);
         }
+        let lane_upd = self.lane_pre(st, dec);
 
         if name == "s_setpc_b64"
             || name == "s_swappc_b64"
@@ -1913,7 +2244,7 @@ impl<'k> Analyzer<'k> {
                 rec.fail(self.arch, dec, "call");
             }
         }
-        let fx = if self.sealed.is_some() {
+        let fx = if self.flags {
             self.sealed_scalar(st, dec)
         } else {
             SealedFx::default()
@@ -1929,8 +2260,9 @@ impl<'k> Analyzer<'k> {
             let mut lane_writes: SmallVec<[(u16, Option<u8>, Val); 1]> = SmallVec::new();
             scc_konst = self.cmp_konst(st, dec);
             for part in &dec.parts {
-                self.eval(st, part, &mut writes, &mut lane_writes, &mut carry);
+                self.eval(st, part, &mut writes, &mut lane_writes, &mut carry, pos);
             }
+            self.opaque_defs(st, dec, &mut writes);
             let plan = self.exec_plan(st, dec);
             let valu = matches!(
                 inst.form,
@@ -2035,7 +2367,7 @@ impl<'k> Analyzer<'k> {
                 st.s[i].ix = ix;
             }
         }
-        if self.sealed.is_some() && st.exec_nz {
+        if self.flags && st.exec_nz {
             let writes_exec = inst.effects.implicit.writes & ImplicitSet::EXEC != 0
                 || dec.parts.iter().any(|p| {
                     p.fields.iter().any(|f| {
@@ -2060,11 +2392,158 @@ impl<'k> Analyzer<'k> {
                 st.exec_nz = false;
             }
         }
+        // EXEC epoch: the position (+1) of the last instruction that wrote EXEC.
+        if inst.effects.implicit.writes & ImplicitSet::EXEC != 0
+            || dec.parts.iter().any(|p| {
+                p.fields.iter().any(|f| {
+                    f.def
+                        && matches!(
+                            f.op,
+                            Operand::Special(Special::Exec | Special::ExecLo | Special::ExecHi)
+                        )
+                })
+            })
+        {
+            st.epoch = pos as u32 + 1;
+        }
         if fx.exec_nz {
             st.exec_nz = true;
         }
+        for (tgt, ix) in lane_upd {
+            match tgt {
+                LaneTgt::S(i) if i < NS => st.s[i].ix = ix,
+                LaneTgt::Exec => st.exec[0].ix = ix,
+                LaneTgt::S(_) => {}
+            }
+        }
     }
 
+    /// Workgroup-footprint analysis: lane-mask witnesses. A vector compare of
+    /// exact 32-bit operands writes the mask whose set lanes satisfy the
+    /// compare; ANDs of masks keep every operand's facts; the EXEC register's
+    /// witness is then the mask every active lane belongs to, whose facts are
+    /// the lane predicates of a store. Computed from the pre-state.
+    fn lane_pre(&self, st: &State, dec: &Dec) -> SmallVec<[(LaneTgt, Ix); 2]> {
+        let mut out = SmallVec::new();
+        if !self.wgf || self.wave != Wave::Wave32 || dec.parts.len() != 1 {
+            return out;
+        }
+        let part = &dec.parts[0];
+        let name = norm_name(part.name);
+        let tgt_of = |op: &Operand| -> Option<LaneTgt> {
+            match op {
+                Operand::Reg(r) if r.kind == Kind::S => Some(LaneTgt::S(usize::from(r.base))),
+                Operand::Special(Special::Vcc | Special::VccLo) => Some(LaneTgt::S(VCC_LO)),
+                Operand::Special(Special::Exec | Special::ExecLo) => Some(LaneTgt::Exec),
+                _ => None,
+            }
+        };
+        let srcs: SmallVec<[&Field; 4]> = part.sources().collect();
+        let mut it = self.ix.borrow_mut();
+        let it = &mut *it;
+        let exec_ix = st.exec[0].ix.live();
+        let mut src_ix = |i: usize, it: &mut Interner| -> Ix {
+            srcs.get(i)
+                .map(|f| ixof(it, self.vals(st, f).first().copied().unwrap_or_default()))
+                .unwrap_or(Ix::NONE)
+        };
+        if let Some(rest) = name
+            .strip_prefix("v_cmpx_")
+            .or_else(|| name.strip_prefix("v_cmp_"))
+        {
+            let cmpx = name.starts_with("v_cmpx_");
+            let Some((rel, ty)) = rest.split_once('_') else {
+                return out;
+            };
+            if ty != "u32" && ty != "i32" {
+                return out;
+            }
+            let (a, b) = (src_ix(0, it), src_ix(1, it));
+            if a.is_none() || b.is_none() {
+                return out;
+            }
+            let lt = |it: &mut Interner, x: Ix, y: Ix| {
+                if ty == "u32" {
+                    it.ltu(x, y)
+                } else {
+                    it.lts(x, y)
+                }
+            };
+            let (atom, holds) = match rel {
+                "lt" => (lt(it, a, b), true),
+                "gt" => (lt(it, b, a), true),
+                "le" => (lt(it, b, a), false),
+                "ge" => (lt(it, a, b), false),
+                "eq" => (it.eq32(a, b), true),
+                "ne" => (it.eq32(a, b), false),
+                _ => return out,
+            };
+            if atom.is_none() {
+                return out;
+            }
+            // Exact while EXEC keeps this generation: an active lane's bit is
+            // set exactly when the compare holds.
+            let exact =
+                (!cmpx && st.epoch != u32::MAX && !self.pos_cyclic[dec.pos]).then_some(st.epoch);
+            let mask = it.lane_mask(vec![(atom, holds)], exact);
+            if cmpx {
+                out.push((LaneTgt::Exec, it.mask_and(exec_ix, mask)));
+            } else if let Some(t) = part
+                .fields
+                .iter()
+                .filter(|f| f.def)
+                .find_map(|f| tgt_of(f.op))
+                .or_else(|| part.name.ends_with("_e32").then_some(LaneTgt::S(VCC_LO)))
+            {
+                out.push((t, mask));
+            }
+            return out;
+        }
+        match name.as_str() {
+            "s_and_b32" | "s_or_b32" => {
+                let (a0, b0) = (src_ix(0, it), src_ix(1, it));
+                let (a, b) = (null_lane_mask(it, a0), null_lane_mask(it, b0));
+                let r = if name == "s_and_b32" {
+                    it.mask_and(a, b)
+                } else {
+                    it.mask_or(a, b)
+                };
+                if !r.is_none() {
+                    if let Some(t) = part
+                        .fields
+                        .iter()
+                        .filter(|f| f.def)
+                        .find_map(|f| tgt_of(f.op))
+                    {
+                        out.push((t, r));
+                    }
+                }
+            }
+            "s_and_saveexec_b32" => {
+                let x0 = src_ix(0, it);
+                let x = null_lane_mask(it, x0);
+                out.push((LaneTgt::Exec, it.mask_and(exec_ix, x)));
+                if let Some(LaneTgt::S(i)) = part
+                    .fields
+                    .iter()
+                    .filter(|f| f.def)
+                    .find_map(|f| tgt_of(f.op))
+                {
+                    out.push((LaneTgt::S(i), exec_ix));
+                }
+            }
+            _ => {}
+        }
+        out
+    }
+
+    /// The lane predicates every active lane satisfies (see [`Self::lane_pre`]).
+    fn lane_facts_of(&self, st: &State) -> Vec<(Ix, bool)> {
+        if !self.wgf || self.wave != Wave::Wave32 {
+            return Vec::new();
+        }
+        self.ix.borrow().mask_facts(st.exec[0].ix.live())
+    }
     /// The mask value of an operand (for EXEC and saved-mask arithmetic).
     fn mask_of(&self, st: &State, op: &Operand) -> Mask {
         let sgprs = |base: usize, len: usize| -> Mask {
@@ -2266,6 +2745,82 @@ impl<'k> Analyzer<'k> {
         }
     }
 
+    /// A pure scalar instruction outside every CFG cycle whose sources are all
+    /// witnessed uniform values (constants, kernarg dwords and pure functions of
+    /// them) computes a uniform value the witness has no expression for
+    /// (compiler division sequences, float conversions): name it as the
+    /// opaque result of this instruction so equal uses stay equal. Anything
+    /// that reads lane or wave state (EXEC, VCC, M0, hardware registers), a
+    /// lane mask, or a value without a uniform witness gets none.
+    fn opaque_defs(&self, st: &State, dec: &Dec, writes: &mut [(&Operand, SmallVec<[Val; 4]>)]) {
+        if self.pos_cyclic[dec.pos] || dec.parts.len() != 1 {
+            return;
+        }
+        let part = &dec.parts[0];
+        let name = part.name;
+        let pure = match dec.inst.form {
+            Form::Sop1 | Form::Sop2 | Form::Sopk => {
+                const IMPURE: &[&str] = &[
+                    "getreg",
+                    "setreg",
+                    "getpc",
+                    "setpc",
+                    "swappc",
+                    "movrel",
+                    "saveexec",
+                    "sendmsg",
+                    "rtn",
+                    "memtime",
+                    "memrealtime",
+                    "ttrace",
+                    "barrier",
+                    "wait",
+                    "sleep",
+                    "prefetch",
+                    "rfe",
+                    "alloc",
+                    "wqm",
+                    "quadmask",
+                    "bitreplicate",
+                ];
+                !IMPURE.iter().any(|p| name.contains(p))
+            }
+            _ => name.starts_with("v_s_"),
+        };
+        if !pure
+            || dec.inst.effects.implicit.reads
+                & (ImplicitSet::SCC | ImplicitSet::VCC | ImplicitSet::EXEC | ImplicitSet::M0)
+                != 0
+            || part
+                .fields
+                .iter()
+                .any(|f| f.used && !f.def && is_mask(part.name, f.name))
+        {
+            return;
+        }
+        let mut it = self.ix.borrow_mut();
+        for f in part.fields.iter().filter(|f| f.used) {
+            for v in self.vals(st, f) {
+                let ix = ixof(&mut it, v);
+                if !it.uniform(ix) {
+                    return;
+                }
+            }
+        }
+        for (k, (op, vals)) in writes.iter_mut().enumerate() {
+            if let Operand::Reg(r) = op {
+                if matches!(r.kind, Kind::S | Kind::Ttmp)
+                    && r.len == 1
+                    && vals.len() == 1
+                    && vals[0].ix.live().is_none()
+                    && vals[0].konst.is_none()
+                {
+                    vals[0].ix = it.opaque(dec.id, k as u8);
+                }
+            }
+        }
+    }
+
     /// Values written by one opcode half. Every explicit destination gets a
     /// value: a destination the semantic rules below do not cover receives
     /// the provenance-free combination of the sources.
@@ -2276,6 +2831,7 @@ impl<'k> Analyzer<'k> {
         writes: &mut SmallVec<[(&'a Operand, SmallVec<[Val; 4]>); 4]>,
         lanes: &mut SmallVec<[(u16, Option<u8>, Val); 1]>,
         carry: &mut Option<(CarryTo, Ix)>,
+        pos: usize,
     ) {
         let start = writes.len();
         let lane_start = lanes.len();
@@ -2290,7 +2846,7 @@ impl<'k> Analyzer<'k> {
                 writes.push((d.op, smallvec::smallvec![Val::kill(uses.iter())]));
             }
         }
-        self.eval_ix(st, part, &mut writes[start..], carry);
+        self.eval_ix(st, part, &mut writes[start..], carry, pos);
     }
 
     /// The integer/address witness of this part's results (§A9.3 rule 2): exact
@@ -2303,22 +2859,48 @@ impl<'k> Analyzer<'k> {
         part: &Part<'a>,
         writes: &mut [(&'a Operand, SmallVec<[Val; 4]>)],
         carry: &mut Option<(CarryTo, Ix)>,
+        pos: usize,
     ) {
         enum Res {
             One(Ix),
             Two(Ix),
+            /// Explicit `(lo, hi)` witnesses of a 64-bit destination.
+            Pair(Ix, Ix),
         }
         let name = norm_name(part.name);
         let srcs: SmallVec<[&Field; 4]> = part.sources().collect();
+        let s2 = srcs.get(2).copied();
         let (Some(&s0), Some(&s1)) = (srcs.first(), srcs.get(1)) else {
             if matches!(name.as_str(), "v_readfirstlane_b32" | "v_mov_b32_dpp") {
                 if let Some(d) = part.fields.iter().find(|f| f.def) {
-                    patch_ix(writes, d.op, &[Ix::NONE]);
+                    // Under the entry EXEC lane 0 of the wave is active: the
+                    // result is the source's lane-0 value.
+                    let x = match srcs.first() {
+                        Some(&s) if name == "v_readfirstlane_b32" && st.exec_exact == Some(0) => {
+                            let mut it = self.ix.borrow_mut();
+                            let src = ixof(
+                                &mut it,
+                                self.vals(st, s).first().copied().unwrap_or_default(),
+                            );
+                            it.first_lane(src)
+                        }
+                        _ => Ix::NONE,
+                    };
+                    patch_ix(writes, d.op, &[x]);
                 }
             }
             return;
         };
-        let lvl = st.exec_exact.unwrap_or(EXEC_UNKNOWN);
+        // The EXEC level a VALU carry names: the saved-mask level EXEC equals,
+        // or, with EXEC narrowed to an unnamed mask, the last instruction that
+        // wrote EXEC (outside every CFG cycle, where one dynamic instance of it
+        // reaches both halves of the add), so a carry-out and its carry-in
+        // under one unchanged mask still match.
+        let lvl: u32 = match st.exec_exact {
+            Some(k) => u32::from(k),
+            None if st.epoch != u32::MAX && !self.pos_cyclic[pos] => 0x1_0000 + st.epoch,
+            None => EXEC_UNKNOWN,
+        };
         let mut it = self.ix.borrow_mut();
         let it = &mut *it;
         let one = |it: &mut Interner, f: &Field| -> Ix {
@@ -2340,7 +2922,7 @@ impl<'k> Analyzer<'k> {
             .or_else(|| part.fields.iter().find(|f| f.def && f.name == "SDST"));
         let sdst = part.fields.iter().find(|f| f.def && f.name == "SDST");
         // High half of `A + B` given the matched carry and the high words.
-        let hi_sum = |it: &mut Interner, cin: Ix, lvl: u8, ha: Ix, hb: Ix| -> Ix {
+        let hi_sum = |it: &mut Interner, cin: Ix, lvl: u32, ha: Ix, hb: Ix| -> Ix {
             let Some((ca, cb)) = it.carry_parts(cin, lvl) else {
                 return Ix::NONE;
             };
@@ -2425,17 +3007,19 @@ impl<'k> Analyzer<'k> {
                 }
                 None => Ix::NONE,
             })),
-            "s_ashr_i32" => Some(Res::One(if kon(s1).map(|k| k & 31) == Some(31) {
-                let x = one(it, s0);
-                it.sra31(x)
-            } else {
-                Ix::NONE
+            "s_ashr_i32" => Some(Res::One(match kon(s1) {
+                Some(k) => {
+                    let x = one(it, s0);
+                    it.sra32(x, k & 31)
+                }
+                None => Ix::NONE,
             })),
-            "v_ashrrev_i32" => Some(Res::One(if kon(s0).map(|k| k & 31) == Some(31) {
-                let x = one(it, s1);
-                it.sra31(x)
-            } else {
-                Ix::NONE
+            "v_ashrrev_i32" => Some(Res::One(match kon(s0) {
+                Some(k) => {
+                    let x = one(it, s1);
+                    it.sra32(x, k & 31)
+                }
+                None => Ix::NONE,
             })),
             "s_add_nc_u64" | "s_add_u64" => {
                 let (x, y) = (wide(it, s0), wide(it, s1));
@@ -2459,6 +3043,157 @@ impl<'k> Analyzer<'k> {
                 }
                 None => Ix::NONE,
             })),
+            "s_and_b32" | "v_and_b32" => {
+                let (x, y) = (one(it, s0), one(it, s1));
+                Some(Res::One(it.and32(x, y)))
+            }
+            "s_or_b32" | "v_or_b32" => {
+                let (x, y) = (one(it, s0), one(it, s1));
+                Some(Res::One(it.or32(x, y)))
+            }
+            "s_lshr_b32" => Some(Res::One(match kon(s1) {
+                Some(k) => {
+                    let x = one(it, s0);
+                    it.shr32(x, k & 31)
+                }
+                None => Ix::NONE,
+            })),
+            "v_lshrrev_b32" => Some(Res::One(match kon(s0) {
+                Some(k) => {
+                    let x = one(it, s1);
+                    it.shr32(x, k & 31)
+                }
+                None => Ix::NONE,
+            })),
+            "s_min_i32" | "s_max_i32" | "s_min_u32" | "s_max_u32" | "v_min_i32" | "v_max_i32"
+            | "v_min_u32" | "v_max_u32" => {
+                let (x, y) = (one(it, s0), one(it, s1));
+                Some(Res::One(it.minmax32(
+                    x,
+                    y,
+                    name.contains("_max_"),
+                    name.ends_with("_i32"),
+                )))
+            }
+            "v_mul_u32_u24" => {
+                let (x, y) = (one(it, s0), one(it, s1));
+                let m = it.c32(0x00ff_ffff);
+                let (x, y) = (it.and32(x, m), it.and32(y, m));
+                Some(Res::One(it.mul32(x, y)))
+            }
+            "v_mad_u32_u24" => {
+                let (x, y) = (one(it, s0), one(it, s1));
+                let z = s2.map_or(Ix::NONE, |f| one(it, f));
+                let m = it.c32(0x00ff_ffff);
+                let (x, y) = (it.and32(x, m), it.and32(y, m));
+                let p = it.mul32(x, y);
+                Some(Res::One(it.add32(p, z)))
+            }
+            "v_add3_u32" => {
+                let (x, y) = (one(it, s0), one(it, s1));
+                let z = s2.map_or(Ix::NONE, |f| one(it, f));
+                let p = it.add32(x, y);
+                Some(Res::One(it.add32(p, z)))
+            }
+            "v_lshl_add_u32" => Some(Res::One(match kon(s1) {
+                Some(k) => {
+                    let x = one(it, s0);
+                    let z = s2.map_or(Ix::NONE, |f| one(it, f));
+                    let sh = it.shl32(x, k & 31);
+                    it.add32(sh, z)
+                }
+                None => Ix::NONE,
+            })),
+            "v_lshl_or_b32" => Some(Res::One(match kon(s1) {
+                Some(k) => {
+                    let x = one(it, s0);
+                    let z = s2.map_or(Ix::NONE, |f| one(it, f));
+                    let sh = it.shl32(x, k & 31);
+                    it.or32(sh, z)
+                }
+                None => Ix::NONE,
+            })),
+            "v_add_lshl_u32" => Some(Res::One(match s2.and_then(|f| kon(f)) {
+                Some(k) => {
+                    let (x, y) = (one(it, s0), one(it, s1));
+                    let sum = it.add32(x, y);
+                    it.shl32(sum, k & 31)
+                }
+                None => Ix::NONE,
+            })),
+            "v_and_or_b32" => {
+                let (x, y) = (one(it, s0), one(it, s1));
+                let z = s2.map_or(Ix::NONE, |f| one(it, f));
+                let a = it.and32(x, y);
+                Some(Res::One(it.or32(a, z)))
+            }
+            "v_or3_b32" => {
+                let (x, y) = (one(it, s0), one(it, s1));
+                let z = s2.map_or(Ix::NONE, |f| one(it, f));
+                let a = it.or32(x, y);
+                Some(Res::One(it.or32(a, z)))
+            }
+            "v_bfe_u32" => Some(Res::One(
+                match (kon(s1).map(|k| k & 31), s2.and_then(|f| kon(f))) {
+                    (Some(off), Some(w)) if (1..=32).contains(&(w & 63)) && (w & 63) <= 32 => {
+                        let x = one(it, s0);
+                        let w = w & 63;
+                        let shifted = it.shr32(x, off);
+                        if w == 32 {
+                            shifted
+                        } else {
+                            let m = it.c32((1u32 << w) - 1);
+                            it.and32(shifted, m)
+                        }
+                    }
+                    _ => Ix::NONE,
+                },
+            )),
+            "v_mad_co_u64_u32" | "v_mad_co_i64_i32" => {
+                let (x, y) = (one(it, s0), one(it, s1));
+                let cl = s2.map_or(Ix::NONE, |f| one(it, f));
+                let p = it.mul32(x, y);
+                let lo = it.add32(p, cl);
+                if name == "v_mad_co_u64_u32" {
+                    let c = s2.map_or(Ix::NONE, |f| wide(it, f));
+                    let (zx, zy) = (it.zext(x), it.zext(y));
+                    let m = it.mul64(zx, zy);
+                    let w = it.add64(m, c);
+                    if w.is_none() {
+                        Some(Res::Pair(lo, Ix::NONE))
+                    } else {
+                        Some(Res::Two(w))
+                    }
+                } else {
+                    Some(Res::Pair(lo, Ix::NONE))
+                }
+            }
+            // `mask ? src1 : src0` under an exact single-fact lane mask formed
+            // under the current EXEC (no neg/abs modifiers).
+            "v_cndmask_b32"
+                if self.wgf
+                    && !self.pos_cyclic[pos]
+                    && self.decoded[pos]
+                        .as_ref()
+                        .is_some_and(|d| d.inst.mods.neg == 0 && d.inst.mods.abs == 0) =>
+            {
+                let (x0, x1) = (one(it, s0), one(it, s1));
+                let m = part
+                    .field("SRC2")
+                    .map(|f| one(it, f))
+                    .unwrap_or_else(|| st.s[VCC_LO].ix.live());
+                let single = match it.lane_mask_facts(m) {
+                    Some(([f], Some(g))) if st.epoch != u32::MAX && g == st.epoch => Some(*f),
+                    _ => None,
+                };
+                Some(Res::One(match single {
+                    Some((atom, holds)) => {
+                        let flag = if holds { atom } else { it.flag_not(atom) };
+                        it.sel(flag, x1, x0)
+                    }
+                    None => Ix::NONE,
+                }))
+            }
             "v_readfirstlane_b32" | "v_mov_b32_dpp" => Some(Res::One(Ix::NONE)),
             _ => None,
         };
@@ -2469,6 +3204,7 @@ impl<'k> Analyzer<'k> {
                     let (lo, hi) = (it.lo_of(w), it.hi_of(w));
                     patch_ix(writes, d.op, &[lo, hi]);
                 }
+                Res::Pair(lo, hi) => patch_ix(writes, d.op, &[lo, hi]),
             }
         }
     }
@@ -2982,6 +3718,7 @@ impl<'k> Analyzer<'k> {
                         addr,
                         access_width(name),
                     );
+                    self.note_facts(st, dec, rec);
                 }
                 if let Some(d) = dst {
                     self.write(st, d.op, &vals);
@@ -3162,6 +3899,11 @@ impl<'k> Analyzer<'k> {
                         addr,
                         access_width(name),
                     );
+                    self.note_facts(st, dec, rec);
+                    if let Some(site) = rec.wsites.get_mut(&dec.id) {
+                        site.facts = st.facts.clone();
+                        site.lane_facts = self.lane_facts_of(st);
+                    }
                 }
                 if let Some(d) = dst {
                     self.write(st, d.op, &out);
@@ -3377,7 +4119,22 @@ impl<'k> Analyzer<'k> {
                         path,
                         cache,
                         shared,
+                        atomic_op: matches!(class, AccessClass::Atomic { commutative: false })
+                            .then(|| dec.parts[0].name.to_owned()),
                     });
+                }
+                if writes {
+                    rec.wsites.insert(
+                        dec.id,
+                        WriteSite {
+                            pos: dec.pos as u32,
+                            addr,
+                            width,
+                            cyclic: self.pos_cyclic[dec.pos],
+                            facts: Vec::new(),
+                            lane_facts: Vec::new(),
+                        },
+                    );
                 }
                 rec.sink(base_dws, 0, Sinks::ADDRESS_BASE);
                 rec.sink(
@@ -3567,7 +4324,23 @@ impl<'k> Analyzer<'k> {
                 continue;
             };
             for pos in block.range.0..block.range.1 {
-                self.step(&mut st, pos, Some(&mut *rec), self.cyclic[b]);
+                if self.excluded.get(pos).copied().unwrap_or(false) {
+                    // Run the instruction for its register effects and keep only what
+                    // resolves to an argument (its access and its kernarg sinks: a
+                    // pointer loaded from the record and dereferenced is unresolved
+                    // here, and a refusal or side read belongs to the body's own proof).
+                    let mut scratch = Rec::new(DwSet::default());
+                    self.step(&mut st, pos, Some(&mut scratch), self.cyclic[b]);
+                    for (sink, extra) in rec.sinks.iter_mut().zip(&scratch.sinks) {
+                        *sink |= *extra;
+                    }
+                    rec.taint_overflow |= scratch.taint_overflow;
+                    for (target, accesses) in scratch.accesses {
+                        rec.accesses.entry(target).or_default().extend(accesses);
+                    }
+                } else {
+                    self.step(&mut st, pos, Some(&mut *rec), self.cyclic[b]);
+                }
             }
         }
     }
@@ -4312,6 +5085,63 @@ impl<'k> Analyzer<'k> {
     }
 }
 
+impl<'k> Analyzer<'k> {
+    /// A1 `null_guarded` (workgroup-footprint replay only: it needs the
+    /// must-facts of [`State::facts`]/[`State::lane_facts`], which add the
+    /// facts of every branch edge and drop them at a join the guard does not
+    /// dominate). A declared 8-byte pointer argument is `null_guarded` when it
+    /// has at least one access and, at every one, the facts holding on every
+    /// path to it include "the 64-bit kernarg value is nonzero" (the edge of
+    /// an exact `s_cmp_lg/eq_u64 w, 0` that is taken only for `w != 0`,
+    /// possibly through an SCC mask copy and an EXEC mask). The facts are over
+    /// the immutable witness `K64(offset)`, so a register redefined after the
+    /// test cannot carry the guard to another value; a base derived from another
+    /// argument is attributed to that argument, not this one.
+    fn null_guarded_args(&self, rec: &Rec) -> BTreeSet<Target> {
+        let mut out = BTreeSet::new();
+        for (target, accesses) in &rec.accesses {
+            let Target::Declared(i) = *target else {
+                continue;
+            };
+            let arg = &self.layout.args[i];
+            if accesses.is_empty() || arg.size != 8 || arg.offset % 8 != 0 {
+                continue;
+            }
+            let w = {
+                let mut it = self.ix.borrow_mut();
+                let (lo, hi) = (it.k32(arg.offset), it.k32(arg.offset + 4));
+                it.as64(lo, hi)
+            };
+            if w.is_none() {
+                continue;
+            }
+            let it = self.ix.borrow();
+            let nonzero = |&(f, pol): &(Ix, bool)| match it.node(f) {
+                Some(Node::Zero64(x)) => !pol && x == w,
+                Some(Node::Not(g)) => pol && matches!(it.node(g), Some(Node::Zero64(x)) if x == w),
+                _ => false,
+            };
+            let all = accesses.iter().all(|a| {
+                rec.nfacts
+                    .get(&a.inst)
+                    .is_some_and(|(s, l)| s.iter().any(nonzero) || l.iter().any(nonzero))
+            });
+            if all {
+                out.insert(*target);
+            }
+        }
+        out
+    }
+
+    /// Record the must-facts holding at an attributed access.
+    fn note_facts(&self, st: &State, dec: &Dec, rec: &mut Rec) {
+        if self.wgf {
+            rec.nfacts
+                .insert(dec.id, (st.facts.clone(), self.lane_facts_of(st)));
+        }
+    }
+}
+
 /// The exact scalar results the sealed analysis adds to one instruction's
 /// ordinary transfer (see [`Analyzer::sealed_scalar`]).
 #[derive(Default)]
@@ -4357,8 +5187,34 @@ struct GuardWalk {
     goal: Goal,
 }
 
+/// A uniform all-ones/zero mask of "a 64-bit kernarg value is nonzero"
+/// (`s_cmp_lg_u64 w, 0; s_cselect_b32 m, -1, 0`) as the lane mask whose set
+/// lanes satisfy that fact (`null_guarded`); any other value is unchanged.
+fn null_lane_mask(it: &mut Interner, ix: Ix) -> Ix {
+    let Some(Node::Mask(f)) = it.node(ix) else {
+        return ix;
+    };
+    let mut facts = Vec::new();
+    it.assume(f, true, &mut facts);
+    if facts
+        .iter()
+        .any(|&(a, _)| matches!(it.node(a), Some(Node::Zero64(_))))
+    {
+        it.lane_mask(facts, None)
+    } else {
+        ix
+    }
+}
+
 fn other_is_negative(op: &Operand) -> bool {
     matches!(op, Operand::Inline(InlineConst::Integer(n)) if *n < 0)
+}
+
+/// A register a lane-mask witness is written to.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LaneTgt {
+    S(usize),
+    Exec,
 }
 
 /// Where an implicit carry-out lane mask is written.
@@ -4368,7 +5224,7 @@ enum CarryTo {
     Vcc,
 }
 /// `State::exec_exact` unknown: a VALU carry then names no EXEC level.
-const EXEC_UNKNOWN: u8 = 0xfe;
+const EXEC_UNKNOWN: u32 = u32::MAX - 1;
 
 /// Mnemonic without the encoding suffix, VOPD halves as their plain opcode.
 fn norm_name(name: &str) -> String {
@@ -4638,6 +5494,7 @@ fn finish(
             accesses,
             sinks,
             loaded: was_loaded,
+            null_guarded: rec.null_args.contains(&target),
         }
     };
     let mut args: Vec<ArgFacts> = layout
@@ -4997,6 +5854,90 @@ mod tests {
         );
         assert_eq!(f.arg_at(20).unwrap().role, ArgRole::NotLoaded);
         assert!(f.arg_at(0).unwrap().sinks.has(Sinks::ADDRESS_BASE));
+    }
+
+    /// The loop kernel of the test above, built as a [`Kernel`] for the budgeted entry points.
+    fn loop_kernel() -> Kernel {
+        kernel(
+            &[
+                0xf4000080, 0xf8000010, 0xf4002100, 0xf8000000, 0xf4000200, 0xf8000008, 0xbfc70000,
+                0xbe830080, 0x81038103, 0xbf0a0203, 0xbfa2fffd, 0x96067508, 0x7e000206, 0x7e020203,
+                0xee068004, 0x00800000, 0x00000000, 0xbfb00000,
+            ],
+            &[
+                ("out", 0, 8, "global_buffer"),
+                ("n", 8, 4, "by_value"),
+                ("bcx", 16, 4, "hidden_block_count_x"),
+                ("bcy", 20, 4, "hidden_block_count_y"),
+                ("bcz", 24, 4, "hidden_block_count_z"),
+                ("gsx", 28, 2, "hidden_group_size_x"),
+            ],
+        )
+    }
+
+    /// A fixpoint that runs past its work bound is `Unknown` with the budget rule and the
+    /// measured counts, reports no access fact of a half-computed result, and does so for
+    /// every entry point (unguarded, excluding, sealed, guarded and the workgroup-footprint
+    /// replay); the default bound proves the same kernel.
+    #[test]
+    fn a_fixpoint_past_its_work_bound_is_unknown_with_the_measured_counts() {
+        let k = loop_kernel();
+        assert_eq!(analyze(&k, Arch::Gfx1201).status, KernelStatus::Proven);
+        for per_inst in [0, 1] {
+            let tight = A1Budget {
+                fixpoint_work_per_inst: per_inst,
+            };
+            let runs = [
+                analyze_budgeted(&k, Arch::Gfx1201, &tight),
+                analyze_excluding_budgeted(&k, Arch::Gfx1201, &[(0, 4)], &tight),
+                analyze_sealed_budgeted(&k, Arch::Gfx1201, &tight),
+                analyze_guarded_budgeted(&k, Arch::Gfx1201, &[], &tight),
+            ];
+            for f in runs {
+                assert_eq!(f.status, KernelStatus::Unknown, "{per_inst}");
+                let rules: Vec<&str> = f.unresolved.iter().map(|u| u.rule).collect();
+                assert_eq!(rules, [RULE_FIXPOINT_BUDGET], "{per_inst}");
+                let detail = &f.unresolved[0].detail;
+                assert!(
+                    detail.contains("units of work")
+                        && detail.contains("block visits")
+                        && detail.contains(&format!("({per_inst} per instruction)")),
+                    "{detail}"
+                );
+                assert!(
+                    f.args.iter().all(|a| a.accesses.is_empty() && !a.loaded)
+                        && f.indexed.is_empty()
+                        && f.sealed.is_empty(),
+                    "an overrun reports no fact"
+                );
+            }
+            let wg = crate::passes::wg_footprint::analyze_budgeted(
+                &k,
+                Arch::Gfx1201,
+                false,
+                crate::passes::wg_footprint::WgLaunch { block_x: 32 },
+                &tight,
+            );
+            let why = wg.applicable.expect_err("withheld");
+            assert!(why.contains(RULE_FIXPOINT_BUDGET), "{why}");
+            assert!(wg.args.is_empty());
+        }
+        // the loop settles within a few units per instruction: a bound just above what it
+        // uses admits it, so the bound is the only thing that changed
+        let used = (1..=64)
+            .find(|&n| {
+                analyze_budgeted(
+                    &k,
+                    Arch::Gfx1201,
+                    &A1Budget {
+                        fixpoint_work_per_inst: n,
+                    },
+                )
+                .status
+                    == KernelStatus::Proven
+            })
+            .expect("the loop settles");
+        assert!(used >= 2 && used < 16, "{used}");
     }
 
     #[test]
@@ -5635,6 +6576,79 @@ mod tests {
         0x7e020280, 0xee05000e, 0x00000002, 0x00000001, 0xbfc00000, 0xee068008, 0x01000000,
         0x00000001, 0xbfb00000,
     ];
+    /// `SIGNED_NO_EXEC_FACT` with `s_mov_b32 exec_lo, n` before the guard.
+    const SIGNED_EXEC_CLOBBERED: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbefe000a, 0xbf04800b, 0x981480c1, 0xbf030a0b, 0x981580c1, 0x8c141514, 0x8b6a147e,
+        0xbfa4000f, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04, 0xf4002389, 0xf8000000,
+        0xbfc70000, 0x7e020280, 0xee05000e, 0x00000002, 0x00000001, 0xbfc00000, 0xee068008,
+        0x01000000, 0x00000001, 0xbfb00000,
+    ];
+    // The shape the compiler emits for `if (e < 0 || e >= n) return; ptrs[e]`
+    // with `e` zero-extended by a separate `s_mov_b32 s13, 0` into `s[12:13]`,
+    // no EXECZ branch anywhere. Variants below break one thing each.
+    const ZEXT_SIGNED_PAIR: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf4000303, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf04800c, 0x981480c1, 0xbf030a0c, 0x981580c1, 0x8c141514, 0x8b6a147e, 0xbe8d0080,
+        0xbfa4000d, 0x848c830c, 0xa9920c04, 0xf4002389, 0xf8000000, 0xbfc70000, 0x7e020280,
+        0xee05000e, 0x00000002, 0x00000001, 0xbfc00000, 0xee068008, 0x01000000, 0x00000001,
+        0xbfb00000,
+    ];
+    /// `s_mov_b32 exec_lo, n` before the guard: EXEC is no longer known nonzero.
+    const ZEXT_EXEC_CLOBBERED: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf4000303, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbefe000a, 0xbf04800c, 0x981480c1, 0xbf030a0c, 0x981580c1, 0x8c141514, 0x8b6a147e,
+        0xbe8d0080, 0xbfa4000d, 0x848c830c, 0xa9920c04, 0xf4002389, 0xf8000000, 0xbfc70000,
+        0x7e020280, 0xee05000e, 0x00000002, 0x00000001, 0xbfc00000, 0xee068008, 0x01000000,
+        0x00000001, 0xbfb00000,
+    ];
+    /// The index register is reloaded from another word after the guard.
+    const ZEXT_RELOADED_INDEX: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf4000303, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf04800c, 0x981480c1, 0xbf030a0c, 0x981580c1, 0x8c141514, 0x8b6a147e, 0xbe8d0080,
+        0xbfa40010, 0xf4000303, 0xf8000004, 0xbfc70000, 0x848c830c, 0xa9920c04, 0xf4002389,
+        0xf8000000, 0xbfc70000, 0x7e020280, 0xee05000e, 0x00000002, 0x00000001, 0xbfc00000,
+        0xee068008, 0x01000000, 0x00000001, 0xbfb00000,
+    ];
+    /// Both compares test a different loaded word than the one that indexes.
+    const ZEXT_GUARD_OTHER_REGISTER: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf4000303, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf048011, 0x981480c1, 0xbf030a11, 0x981580c1, 0x8c141514, 0x8b6a147e, 0xbe8d0080,
+        0xbfa4000d, 0x848c830c, 0xa9920c04, 0xf4002389, 0xf8000000, 0xbfc70000, 0x7e020280,
+        0xee05000e, 0x00000002, 0x00000001, 0xbfc00000, 0xee068008, 0x01000000, 0x00000001,
+        0xbfb00000,
+    ];
+    /// The `e < 0` half is replaced by a constant-false flag.
+    const ZEXT_NO_LOWER_BOUND: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf4000303, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbe940080, 0xbf030a0c, 0x981580c1, 0x8c141514, 0x8b6a147e, 0xbe8d0080, 0xbfa4000d,
+        0x848c830c, 0xa9920c04, 0xf4002389, 0xf8000000, 0xbfc70000, 0x7e020280, 0xee05000e,
+        0x00000002, 0x00000001, 0xbfc00000, 0xee068008, 0x01000000, 0x00000001, 0xbfb00000,
+    ];
+    /// The upper bound is another loaded word, not a kernarg or a constant.
+    const ZEXT_BOUND_NOT_KERNARG: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf4000303, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf04800c, 0x981480c1, 0xbf03110c, 0x981580c1, 0x8c141514, 0x8b6a147e, 0xbe8d0080,
+        0xbfa4000d, 0x848c830c, 0xa9920c04, 0xf4002389, 0xf8000000, 0xbfc70000, 0x7e020280,
+        0xee05000e, 0x00000002, 0x00000001, 0xbfc00000, 0xee068008, 0x01000000, 0x00000001,
+        0xbfb00000,
+    ];
+    /// `if (flag == 0) goto entry_load;` jumps over the whole guard.
+    const ZEXT_PATH_SKIPS_GUARD: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf4000303, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbe8d0080, 0xbf068010, 0xbfa20008, 0xbf04800c, 0x981480c1, 0xbf030a0c, 0x981580c1,
+        0x8c141514, 0x8b6a147e, 0xbe8d0080, 0xbfa4000d, 0x848c830c, 0xa9920c04, 0xf4002389,
+        0xf8000000, 0xbfc70000, 0x7e020280, 0xee05000e, 0x00000002, 0x00000001, 0xbfc00000,
+        0xee068008, 0x01000000, 0x00000001, 0xbfb00000,
+    ];
     const SIGNED_MISSING_NONNEG: &[u32] = &[
         0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
         0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
@@ -5688,6 +6702,15 @@ mod tests {
         0x98158081, 0xbf078115, 0xbfa20007, 0xee05000e, 0x00000002, 0x00000001, 0xbfc00000,
         0xee068008, 0x01000000, 0x00000001, 0xbfb00000,
     ];
+    /// `NULL_CHECK_FLAGS_NO_EXEC_FACT` with `s_mov_b32 exec_lo, n` first.
+    const NULL_CHECK_FLAGS_EXEC_CLOBBERED: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbefe000a, 0xbf0a0a0b, 0xbfa10015, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04,
+        0xf4002389, 0xf8000000, 0xbfc70000, 0x7e020280, 0xbf11800e, 0x981480c1, 0x8b157e14,
+        0x98158081, 0xbf078115, 0xbfa20007, 0xee05000e, 0x00000002, 0x00000001, 0xbfc00000,
+        0xee068008, 0x01000000, 0x00000001, 0xbfb00000,
+    ];
     const NULL_CHECK_FLAGS_NO_EXEC_FACT: &[u32] = &[
         0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
         0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
@@ -5708,15 +6731,58 @@ mod tests {
     fn a_signed_pair_guard_through_flags_and_exec_is_followed() {
         // `if (e < 0 || e >= n) return;` as the compiler writes it: two
         // compares into masks, `or`, `exec & mask`, `vccnz`. It proves `e < n`
-        // only because EXEC is known nonzero (the EXECZ edge before it).
+        // only because EXEC is known nonzero (the EXECZ edge before it, or the
+        // launch state).
         let f = sealed(SIGNED_GUARD_FLAGS);
         assert_eq!(f.status, KernelStatus::Conditional, "{:?}", f.unresolved);
         let [t] = &f.sealed[..] else { panic!() };
         assert_eq!(t.bound, SealedBound::Kernarg { offset: 24 });
         assert_eq!(t.entries[0].guard_pcs.len(), 2, "both signed compares");
-        refuses(SIGNED_NO_EXEC_FACT, "sealed-index-unguarded");
+        // No EXECZ edge is needed: the launch EXEC is known nonzero, and stays
+        // so until an instruction writes EXEC.
+        let f = sealed(SIGNED_NO_EXEC_FACT);
+        assert_eq!(f.status, KernelStatus::Conditional, "{:?}", f.unresolved);
+        refuses(SIGNED_EXEC_CLOBBERED, "sealed-index-unguarded");
         refuses(SIGNED_MISSING_NONNEG, "sealed-index-unguarded");
         refuses(SIGNED_NONNEG_OF_OTHER, "sealed-index-unguarded");
+    }
+
+    #[test]
+    fn a_zero_extended_signed_pair_guard_without_an_execz_edge_is_followed() {
+        // The compiler's shape for `if (e < 0 || e >= n) return; ptrs[e]`:
+        // `e` zero-extended by a separate `s_mov_b32 s13, 0`, both compares
+        // into masks, `or`, `exec & mask`, `vccnz`, and no EXECZ branch.
+        let f = sealed(ZEXT_SIGNED_PAIR);
+        assert_eq!(f.status, KernelStatus::Conditional, "{:?}", f.unresolved);
+        let [t] = &f.sealed[..] else { panic!() };
+        assert_eq!(t.table_arg_offset, 0);
+        assert_eq!(t.bound, SealedBound::Kernarg { offset: 24 });
+        let [e] = &t.entries[..] else { panic!() };
+        assert_eq!(e.index, SealedIndex::Load { pc: 5 });
+        assert_eq!(
+            e.guard_pcs.len(),
+            2,
+            "both signed compares: {:?}",
+            e.guard_pcs
+        );
+        assert_eq!(t.accesses.len(), 1);
+    }
+
+    #[test]
+    fn near_misses_of_the_zero_extended_signed_guard_stay_unguarded() {
+        // EXEC rewritten before the guard: `exec & mask == 0` no longer says
+        // `mask == 0`.
+        refuses(ZEXT_EXEC_CLOBBERED, "sealed-index-unguarded");
+        // The index is reloaded between the guard and the entry load.
+        refuses(ZEXT_RELOADED_INDEX, "sealed-index-unguarded");
+        // The guard tests another register than the one that indexes.
+        refuses(ZEXT_GUARD_OTHER_REGISTER, "sealed-index-unguarded");
+        // Upper bound only: a negative `e` would index below the table.
+        refuses(ZEXT_NO_LOWER_BOUND, "sealed-index-unguarded");
+        // The bound is a loaded value, not a kernarg or a constant.
+        refuses(ZEXT_BOUND_NOT_KERNARG, "sealed-index-unguarded");
+        // One feasible path reaches the entry load without the guard.
+        refuses(ZEXT_PATH_SKIPS_GUARD, "sealed-index-unguarded");
     }
 
     #[test]
@@ -5733,8 +6799,13 @@ mod tests {
             ),
             ("check bypassed on a path", NULL_CHECK_BYPASSED, false),
             (
-                "flag check without the exec fact",
+                "flag null check from the launch exec fact",
                 NULL_CHECK_FLAGS_NO_EXEC_FACT,
+                true,
+            ),
+            (
+                "flag check after exec is rewritten",
+                NULL_CHECK_FLAGS_EXEC_CLOBBERED,
                 false,
             ),
         ] {
@@ -5762,5 +6833,103 @@ mod tests {
             .accesses
             .iter()
             .any(|a| a.class == AccessClass::VmemLoad));
+    }
+
+    // `null_guarded` (declared pointer arguments). Kernels assembled with
+    // llvm-mc (gfx1201, wave32): `dbg` at +8 and `other` at +16 are loaded into
+    // s[4:5] / s[6:7]; stores go through `global_store_b32 v0, v1, s[4:5]`.
+    const NG_ARGS: &[(&str, u32, u32, &str)] = &[
+        ("out", 0, 8, "global_buffer"),
+        ("dbg", 8, 8, "global_buffer"),
+        ("other", 16, 8, "global_buffer"),
+    ];
+    const NG_LOADS: [u32; 5] = [0xf4002100, 0xf8000008, 0xf4002180, 0xf8000010, 0xbfc70000];
+    const NG_STORE: [u32; 3] = [0xee068004, 0x00800000, 0x00000000];
+    const NG_STORE_4: [u32; 3] = [0xee068004, 0x00800000, 0x00000400];
+    const NG_END: u32 = 0xbfb00000;
+    fn ng(parts: &[&[u32]]) -> Vec<u32> {
+        let mut w = NG_LOADS.to_vec();
+        for p in parts {
+            w.extend_from_slice(p);
+        }
+        w.push(NG_END);
+        w
+    }
+    fn null_guarded(words: &[u32], offset: u32) -> bool {
+        let f = analyze(&kernel(words, NG_ARGS), Arch::Gfx1201);
+        assert_eq!(f.status, KernelStatus::Proven, "{:?}", f.unresolved);
+        f.arg_at(offset).expect("argument").null_guarded
+    }
+
+    #[test]
+    fn an_access_dominated_by_the_nonzero_edge_of_the_argument_test_is_null_guarded() {
+        // s_cmp_lg_u64 s[4:5], 0; s_cbranch_scc0 over the store.
+        let lg = ng(&[&[0xbf118004, 0xbfa10003], &NG_STORE]);
+        assert!(null_guarded(&lg, 8));
+        // s_cmp_eq_u64 s[4:5], 0; s_cbranch_scc1 over the store.
+        let eq = ng(&[&[0xbf108004, 0xbfa20003], &NG_STORE]);
+        assert!(null_guarded(&eq, 8));
+        // The other arguments carry no access, so no property.
+        assert!(!null_guarded(&lg, 0) && !null_guarded(&lg, 16));
+        // A load and a store under the same guard.
+        let both = ng(&[
+            &[0xbf118004, 0xbfa10006],
+            &[0xee050004, 0x00000002, 0x00000000],
+            &NG_STORE,
+        ]);
+        assert!(null_guarded(&both, 8));
+    }
+
+    #[test]
+    fn near_misses_of_the_null_guard_are_not_null_guarded() {
+        // No test at all.
+        assert!(!null_guarded(&ng(&[&NG_STORE]), 8));
+        // The test is of another argument.
+        let other = ng(&[&[0xbf118006, 0xbfa10003], &NG_STORE]);
+        assert!(!null_guarded(&other, 8));
+        // The guard dominates the first store only: the NULL path rejoins and
+        // reaches the second store without passing the nonzero edge.
+        let join = ng(&[&[0xbf118004, 0xbfa10003], &NG_STORE, &NG_STORE_4]);
+        assert!(!null_guarded(&join, 8));
+        // The branch jumps the wrong way: the store is reached on the NULL edge.
+        let inverted = ng(&[&[0xbf118004, 0xbfa20003], &NG_STORE]);
+        assert!(!null_guarded(&inverted, 8));
+        // The register is redefined (another argument's value) after the test:
+        // the store is an access of that argument, which was never tested.
+        let redef = ng(&[&[0xbf118004, 0xbfa10004, 0xbe840106], &NG_STORE]);
+        assert!(!null_guarded(&redef, 8));
+        assert!(!null_guarded(&redef, 16));
+    }
+
+    #[test]
+    fn a_kernel_without_a_u64_zero_test_replays_nothing_and_stays_unguarded() {
+        let f = analyze(&kernel(&ng(&[&NG_STORE]), NG_ARGS), Arch::Gfx1201);
+        assert!(f.args.iter().all(|a| !a.null_guarded));
+    }
+
+    #[test]
+    fn non_commutative_atomics_record_their_mnemonics() {
+        let swap = [0xee0cc004, 0x00900002, 0x00000000];
+        let cmpswap = [0xee0d0004, 0x00900002, 0x00000000];
+        let add = [0xee0d4004, 0x00800000, 0x00000000];
+        let ops = |words: &[u32]| -> Vec<Option<String>> {
+            let f = analyze(&kernel(words, NG_ARGS), Arch::Gfx1201);
+            assert_eq!(f.status, KernelStatus::Proven, "{:?}", f.unresolved);
+            f.arg_at(8)
+                .expect("argument")
+                .accesses
+                .iter()
+                .map(|a| a.atomic_op.clone())
+                .collect()
+        };
+        assert_eq!(
+            ops(&ng(&[&swap, &cmpswap])),
+            [
+                Some("global_atomic_swap_b32".to_owned()),
+                Some("global_atomic_cmpswap_b32".to_owned())
+            ]
+        );
+        // A commutative atomic and a plain store record none.
+        assert_eq!(ops(&ng(&[&add, &NG_STORE])), [None, None]);
     }
 }

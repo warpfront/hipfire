@@ -21,7 +21,7 @@ use crate::enc::{
     mubuf::Mubuf,
     smem::Smem,
     sop::{Sop1, Sop2, Sopc, Sopk, Sopp},
-    vop::{Vop1, Vop2, Vopc},
+    vop::{Vop1, Vop2, Vop2K, Vop2KOp, Vopc},
     vop3::Vop3,
     vop3p::{Mai, Vop3p},
 };
@@ -39,6 +39,7 @@ pub enum Inst {
     Smem(Smem),
     Vop1(Vop1),
     Vop2(Vop2),
+    Vop2K(Vop2K),
     Vopc(Vopc),
     Vop3(Vop3),
     Vop3p(Vop3p),
@@ -230,7 +231,7 @@ impl Inst {
             Self::Sopp(_) => Format::Sopp,
             Self::Smem(_) => Format::Smem,
             Self::Vop1(_) => Format::Vop1,
-            Self::Vop2(_) => Format::Vop2,
+            Self::Vop2(_) | Self::Vop2K(_) => Format::Vop2,
             Self::Vopc(_) => Format::Vopc,
             Self::Vop3(_) => Format::Vop3,
             Self::Vop3p(_) => Format::Vop3p,
@@ -252,6 +253,7 @@ impl Inst {
             Self::Smem(i) => i.encode(arch, out),
             Self::Vop1(i) => i.encode(arch, out),
             Self::Vop2(i) => i.encode(arch, out),
+            Self::Vop2K(i) => i.encode(arch, out),
             Self::Vopc(i) => i.encode(arch, out),
             Self::Vop3(i) => i.encode(arch, out),
             Self::Vop3p(i) => i.encode(arch, out),
@@ -303,8 +305,13 @@ impl Inst {
                 (Self::Vop1(i), n)
             }
             Format::Vop2 => {
-                let (i, n) = Vop2::decode(arch, words)?;
-                (Self::Vop2(i), n)
+                if Vop2KOp::from_opcode(arch, (first >> 25) as u8).is_some() {
+                    let (i, n) = Vop2K::decode(arch, words)?;
+                    (Self::Vop2K(i), n)
+                } else {
+                    let (i, n) = Vop2::decode(arch, words)?;
+                    (Self::Vop2(i), n)
+                }
             }
             Format::Vopc => {
                 let (i, n) = Vopc::decode(arch, words)?;
@@ -352,6 +359,7 @@ impl Inst {
             Self::Smem(i) => i.footprint(),
             Self::Vop1(i) => i.footprint(),
             Self::Vop2(i) => i.footprint(),
+            Self::Vop2K(i) => i.footprint(),
             Self::Vopc(i) => i.footprint(),
             Self::Vop3(i) => i.footprint(),
             Self::Vop3p(i) => i.footprint(),
@@ -394,6 +402,7 @@ impl fmt::Display for Inst {
             Self::Smem(i) => i.fmt(f),
             Self::Vop1(i) => i.fmt(f),
             Self::Vop2(i) => i.fmt(f),
+            Self::Vop2K(i) => i.fmt(f),
             Self::Vopc(i) => i.fmt(f),
             Self::Vop3(i) => i.fmt(f),
             Self::Vop3p(i) => i.fmt(f),

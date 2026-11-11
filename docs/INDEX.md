@@ -88,6 +88,7 @@ Exactly one canonical owner (or explicit `BLOCKED`) per concern.
 | Container install / run | [`docs/CONTAINER.md`](CONTAINER.md) | shipped / ref-pinned | |
 | NixOS notes | [`docs/NIXOS.md`](NIXOS.md) | shipped / ref-pinned | |
 | Perf claim protocol (warmup, fresh-process, noise) | [`docs/methodology/perf-benchmarking.md`](methodology/perf-benchmarking.md) | shipped / ref-pinned | Numbers live in measured owners, not here. |
+| Engineering lessons, 0.4.5 cycle (lever selection, measurement hygiene, gate discipline) | [`docs/methodology/lessons-0.4.5.md`](methodology/lessons-0.4.5.md) | shipped / ref-pinned | Authoritative over older rules in `AGENTS.md` / `CLAUDE.md`; quoted numbers are fixture-bound examples. |
 | Bench-suite layout | [`docs/methodology/bench-suite.md`](methodology/bench-suite.md) | shipped / ref-pinned | |
 | CPU-exec offload benchmark handoff (`memory.offload_exec`) | [`docs/methodology/cpu-exec-offload-benchmark-handoff.md`](methodology/cpu-exec-offload-benchmark-handoff.md) | shipped / ref-pinned | Method, fixture identity and gotchas for the pcie-vs-cpu A/B; results live in `docs/perf-checkpoints/`. |
 | Arch-port validation procedure (channel / speed) | [`docs/methodology/arch-port-validation.md`](methodology/arch-port-validation.md) | shipped / ref-pinned | Does not restore retired coherence-gate batteries. |

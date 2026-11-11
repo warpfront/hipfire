@@ -471,3 +471,115 @@ fn lane_wmma_gemm_split_k_deterministic_hw() {
         "split-K counters not left at zero"
     );
 }
+
+/// Rows `[r0, r0 + c)` of a `[rows, cols]` tensor as a view.
+fn row_view(t: &GpuTensor, r0: usize, c: usize, cols: usize) -> GpuTensor {
+    t.sub_offset(r0 * cols, c * cols)
+}
+
+#[test]
+#[ignore = "needs an exact gfx1201 GPU"]
+fn prefill_rows_bitwise_across_call_sizes() {
+    let Some(mut gpu) = gpu_1201() else { return };
+    let total = 1043usize;
+    let r0 = 7usize;
+    // (m, k, terms, hc_act)
+    for (m, k, terms, act) in [
+        (512usize, 2560usize, 2usize, None),
+        (320, 10240, 2, None),
+        (320, 10240, 1, Some(0.25f32)),
+    ] {
+        let mut rng = Lcg(0x1A4E_6000 + (m + terms) as u64);
+        let (w_bits, w_vals) = rand_bf16(&mut rng, m * k, 0.05);
+        let w_t = upload_bf16(&mut gpu, &w_bits);
+        let w64: Vec<f64> = w_vals.iter().map(|&v| v as f64).collect();
+        let x: Vec<f32> = if terms == 1 {
+            bf16_exact_x(&mut rng, total * k)
+        } else {
+            (0..total * k).map(|_| rng.normal()).collect()
+        };
+        let x_t = upload_f32(&mut gpu, &x);
+        let w = LaneWmmaWeight::Bf16(&w_t);
+        let run = |gpu: &mut Gpu, r0: usize, c: usize| -> Vec<f32> {
+            let xs = row_view(&x_t, r0, c, k);
+            let y_t = gpu.zeros(&[c * m], DType::F32).expect("y");
+            gpu.lane_wmma_gemm_prefill(&w, &xs, &y_t, m, k, c, terms, act)
+                .expect("lane_wmma_gemm_prefill");
+            gpu.hip.device_synchronize().expect("sync");
+            download_f32(gpu, &y_t, c * m)
+        };
+        let all = run(&mut gpu, 0, total);
+        for c in [149usize, 65] {
+            let part = run(&mut gpu, r0, c);
+            assert_eq!(
+                bits_of(&part),
+                bits_of(&all[r0 * m..(r0 + c) * m]),
+                "m={m} k={k} terms={terms}: {c}-row call differs from the {total}-row call"
+            );
+        }
+        let want = ref_gemm(&w64, &x, m, k, total);
+        if let Some(scale) = act {
+            // 1043 x 320 outputs (the 16..=64-row test checks at most 64 x 320) at a different pinned
+            // split-K; measured worst 3 BF16 ulps on gfx1201. Bound: the 16..=64-row test's 1% rule on
+            // differing outputs plus a small worst-case ulp distance.
+            let mut worst = 0u32;
+            let mut diff_bits = 0usize;
+            for (g, s) in all.iter().zip(&want) {
+                let w = hc_act_ref(*s, scale);
+                if bf16_bits(*g) != bf16_bits(w) {
+                    diff_bits += 1;
+                }
+                worst = worst.max(bf16_ulps(*g, w));
+            }
+            eprintln!(
+                "prefill m={m} k={k} hc_act: worst {worst} ulp, {diff_bits}/{} differ",
+                all.len()
+            );
+            assert!(worst <= 4, "m={m} k={k}: worst {worst} BF16 ulps");
+            assert!(
+                diff_bits * 100 <= all.len(),
+                "m={m} k={k}: {diff_bits}/{} outputs differ in bits",
+                all.len()
+            );
+        } else {
+            let e = max_rel_err(&all, &want);
+            eprintln!("prefill m={m} k={k} terms={terms}: rel err {e:.3e}");
+            assert!(e <= 2e-5, "m={m} k={k}: rel err {e:.3e}");
+        }
+    }
+
+    // The read-up kernel is row-count invariant above 64 rows.
+    let (hidden, low_rank) = (2560usize, 320usize);
+    let wide = 4 * hidden;
+    let mut rng = Lcg(0x1A4E_7000);
+    let (w_bits, _) = rand_bf16(&mut rng, wide * low_rank, 0.05);
+    let w_t = upload_bf16(&mut gpu, &w_bits);
+    let low_t = upload_f32(&mut gpu, &bf16_exact_x(&mut rng, total * low_rank));
+    let norm_t = upload_f32(&mut gpu, &bf16_exact_x(&mut rng, total * wide));
+    let run = |gpu: &mut Gpu, r0: usize, c: usize| -> Vec<f32> {
+        let low = row_view(&low_t, r0, c, low_rank);
+        let norm = row_view(&norm_t, r0, c, wide);
+        let mixed = gpu.zeros(&[c * hidden], DType::F32).expect("mixed");
+        lane_wmma_read_up(
+            gpu,
+            &LaneWmmaWeight::Bf16(&w_t),
+            &low,
+            &norm,
+            &mixed,
+            c,
+            hidden,
+            low_rank,
+            1,
+        )
+        .expect("lane_wmma_read_up");
+        gpu.hip.device_synchronize().expect("sync");
+        download_f32(gpu, &mixed, c * hidden)
+    };
+    let all = run(&mut gpu, 0, total);
+    let part = run(&mut gpu, r0, 149);
+    assert_eq!(
+        bits_of(&part),
+        bits_of(&all[r0 * hidden..(r0 + 149) * hidden]),
+        "read_up: 149-row call differs from the {total}-row call"
+    );
+}

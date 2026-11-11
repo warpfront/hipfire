@@ -19,7 +19,11 @@ pub mod ggml_mmvq_fused;
 pub mod iu4_gdn;
 pub mod mq6_i8;
 pub mod mq6sym_i8;
+pub mod qwen4_lane_wmma;
+pub mod qwen4_lwmma_tile;
+pub mod qwen4_moe_glue_fold;
 pub mod qwen4_moe_sym;
+pub mod qwen4_topk8_rows;
 
 use crate::work::WorkSpecV1;
 use crate::{Arch, ExportV1, KernelAbiV1};
@@ -31,6 +35,7 @@ pub fn all() -> impl Iterator<Item = &'static KernelAbiV1> {
         .iter()
         .chain(mq6sym_i8::ABIS.iter())
         .chain(qwen4_moe_sym::ABIS.iter())
+        .chain(qwen4_moe_glue_fold::ABIS.iter())
         .chain(ggml_mmvq::ABIS.iter())
         .chain(ggml_mmvq_fused::ABIS.iter())
         .chain(ggml_convert::ABIS.iter())
@@ -42,6 +47,9 @@ pub fn all() -> impl Iterator<Item = &'static KernelAbiV1> {
         .chain(generic_rda::ABIS.iter())
         .chain(generic_fused::ABIS.iter())
         .chain(iu4_gdn::ABIS.iter())
+        .chain(qwen4_topk8_rows::ABIS.iter())
+        .chain(qwen4_lane_wmma::ABIS.iter())
+        .chain(qwen4_lwmma_tile::ABIS.iter())
         .copied()
 }
 
@@ -90,7 +98,7 @@ mod tests {
         }
         assert_eq!(
             ids.len(),
-            60 + super::generic_gemm::ABIS.len()
+            68 + super::generic_gemm::ABIS.len()
                 + super::generic_seq::ABIS.len()
                 + super::generic_elem::ABIS.len()
                 + super::generic_mmq::ABIS.len()

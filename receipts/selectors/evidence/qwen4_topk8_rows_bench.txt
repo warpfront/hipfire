@@ -1,0 +1,14 @@
+[devices] HIPFIRE_DEVICES -> index 1 gfx1201 0000:13:00.0 (ROCR_VISIBLE_DEVICES=GPU-e475645fe0200397 HIP_VISIBLE_DEVICES=0)
+[hip-bridge] GPU_PINNED_MIN_XFER_SIZE=100000: pageable weight copies staged out of reclaim
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.16)
+  pre-compiled kernels: /home/kaden/.hipfire_kernels/gfx1201
+n rows | per-row gpu med/min | rows gpu med/min | saved gpu | per-row wall med/min | rows wall med/min | saved wall   (us per round, 200 reps interleaved)
+248320 2 | 49.28/48.80 | 32.04/31.72 | 17.24 | 66.14/63.99 | 48.80/46.83 | 17.34
+248320 3 | 64.96/64.12 | 38.80/37.68 | 26.16 | 81.66/79.04 | 55.45/53.13 | 26.21
+248320 4 | 85.00/84.72 | 42.08/40.92 | 42.92 | 101.62/99.63 | 58.79/55.91 | 42.84
+248320 8 | 164.52/163.12 | 62.36/61.16 | 102.16 | 180.73/178.17 | 79.16/75.95 | 101.57
+100276 2 | 44.16/43.88 | 28.76/28.44 | 15.40 | 60.47/58.68 | 45.36/43.46 | 15.11
+100276 3 | 64.04/63.64 | 37.52/37.08 | 26.52 | 80.58/78.49 | 54.07/51.93 | 26.51
+100276 4 | 83.92/83.52 | 40.76/40.36 | 43.16 | 100.56/98.65 | 57.38/55.27 | 43.19
+100276 8 | 162.48/161.64 | 60.80/60.32 | 101.68 | 178.16/176.64 | 76.68/75.07 | 101.48
+rc=0

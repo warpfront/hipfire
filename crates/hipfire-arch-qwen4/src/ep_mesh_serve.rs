@@ -38,8 +38,11 @@ use std::time::{Duration, Instant};
 /// only kind a batch-sampled lane carries.
 /// Whether a lane may verify in the wide pass: only an UNSEEDED SAMPLED lane. A greedy
 /// lane (no sampling) and a sampled lane whose request carried an explicit seed keep
-/// the row-exact groups, so they reproduce across batch compositions
-/// (`HIPFIRE_QWEN4_EP_SAMPLED_WIDE_VERIFY` still gates the wide pass itself).
+/// the row-exact groups (`HIPFIRE_QWEN4_EP_SAMPLED_WIDE_VERIFY` still gates the wide pass
+/// itself). Row-exact groups alone do not make output batch-invariant: by default the
+/// all-rows lane step (>= 9 rows, >= 3 MTP lanes) takes non-row-exact routes, so greedy and
+/// seeded output may depend on batch composition; `HIPFIRE_QWEN4_LANE_ROW_EXACT=greedy|seeded`
+/// opts those classes into batch-invariant rows (C1 / AR steps of <= 8 rows are always exact).
 pub(crate) fn lane_wide_eligible(sampling: Option<&LaneSampling>) -> bool {
     sampling.is_some_and(|s| !s.seeded)
 }
@@ -176,6 +179,20 @@ impl Qwen4Bundle {
         } else {
             Ok(())
         };
+        self.mesh_lanes = Some(mesh);
+        result
+    }
+
+    /// Pay the fault check an unchecked async prepare owes (`HIPFIRE_QWEN4_LANE_PREPARE_ASYNC`) on
+    /// every rank, before the non-mesh work that would sync under another label or drop the
+    /// fault (`at` names it): admission, a prefill tile, the elastic reserve's frees and loans
+    /// ([`EpMeshLanes::settle_prepare`]). A no-op when the lanes are not armed or nothing is owed.
+    /// On a fault the mesh is quarantined and the error names the prepare.
+    pub(crate) fn ep_mesh_settle_prepare(&mut self, gpu: &mut Gpu, at: &str) -> Result<(), String> {
+        let Some(mut mesh) = self.mesh_lanes.take() else {
+            return Ok(());
+        };
+        let result = mesh.settle_prepare(self, gpu, at);
         self.mesh_lanes = Some(mesh);
         result
     }

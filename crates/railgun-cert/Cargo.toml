@@ -10,6 +10,7 @@ publish = false
 # peacemaker-ir's `runtime_dependency_graph_does_not_include_peacemaker`).
 [dependencies]
 peacemaker-ir = { path = "../peacemaker-ir" }
+object = { version = "0.38", default-features = false, features = ["read"] }
 peacemaker-lift = { path = "../peacemaker-lift" }
 radiowave = { path = "../radiowave" }
 railgun-corpus = { path = "../railgun-corpus" }
@@ -17,7 +18,7 @@ rmpv = "1"
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true
+smallvec = "1"
 thiserror.workspace = true
 
 [dev-dependencies]
-smallvec = "1"

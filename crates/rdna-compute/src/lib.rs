@@ -90,6 +90,7 @@ pub mod lane_proj;
 pub mod lane_rows_pm;
 pub mod lane_wmma;
 pub mod lane_wmma_lab;
+pub mod lane_wmma_tile;
 pub mod latent_attention;
 pub mod latent_attention_absorb;
 pub mod latent_attention_decode;
@@ -141,6 +142,7 @@ pub mod qsa_sp_select;
 pub mod qwen35_fa_batch;
 pub mod qwen4_moe_down_a8;
 pub mod railgun_check;
+pub mod railgun_quarantine;
 pub mod railgun_window;
 pub mod rdna;
 pub mod replay;
@@ -193,8 +195,8 @@ pub use compiler::KernelCompiler;
 pub use dispatch::LabKernelFaultReceipt;
 pub use dispatch::{
     gen_fwht_signs, ActivationCapture, BlockHessianAcc, DType, Gpu, GpuTensor, HessianCapture,
-    HostAllocLease, KvFitFloor, PlannedCapacity, QsaExtentDepth, VmmPrefixSet, VmmPrefixSpec,
-    VmmResourceMove, GL_CB2, GL_CB3, GL_GROUP_SCALE_BYTES, GL_MQ2_GROUP_IDX_BYTES,
+    HostAllocLease, KvFitFloor, MemsetBatch, PlannedCapacity, QsaExtentDepth, VmmPrefixSet,
+    VmmPrefixSpec, VmmResourceMove, GL_CB2, GL_CB3, GL_GROUP_SCALE_BYTES, GL_MQ2_GROUP_IDX_BYTES,
     GL_MQ3_GROUP_IDX_BYTES, HIP_RING_BYTES, LLOYD_MQ3_GROUP_BYTES, LLOYD_MQ4_GROUP_BYTES,
     MMQ_CURRENT_LAYER, MQ2G256V2_GROUP_BYTES, MQ3G256V2_GROUP_BYTES, MQ4C_GROUP_BYTES,
     MQ4G128V2_GROUP_BYTES, MQ4V2_GROUP_BYTES, MQ5G256V2_GROUP_BYTES, MQ6G256V2_GROUP_BYTES,

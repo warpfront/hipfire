@@ -45,6 +45,12 @@ impl Qwen4Hc8Sidecar {
     pub fn tensor_count(&self) -> usize {
         self.bound.tensor_count()
     }
+
+    /// Per sidecar tensor `(name, BF16 bytes replaced, E4M3 payload bytes)`: the input of
+    /// `expert_residency::ep_hc8_plan_saving`.
+    pub fn plan_tensors(&self) -> Vec<(String, u64, u64)> {
+        self.bound.tensor_sizes()
+    }
 }
 
 /// `  qwen4 hc8: REFUSED <path>: <reason>; BF16 base weights`.
@@ -82,6 +88,17 @@ pub fn resolve_hc8_sidecar(
     resolve(hfq, model_path, enabled, config, true)
 }
 
+/// [`resolve_hc8_sidecar`] without the log line, for a plan-time census that must see exactly
+/// the sidecar every rank will resolve (the load's own resolve logs the outcome once).
+pub fn peek_hc8_sidecar(
+    hfq: &HfqFile,
+    model_path: &Path,
+    enabled: bool,
+    config: &Qwen4Config,
+) -> Result<Option<Qwen4Hc8Sidecar>, String> {
+    resolve(hfq, model_path, enabled, config, false)
+}
+
 /// Device bytes the sidecar next to `model_path` SAVES once applied:
 /// `replaced - payload` of the sidecar [`resolve_hc8_sidecar`] would accept
 /// for this load, `0` when none applies.  Silent (the load's own resolve logs
@@ -95,6 +112,12 @@ pub fn resolve_hc8_sidecar(
 /// weight).  The saving counts every sidecar tensor, including ones a
 /// pipeline band or a disabled MTP leaves unloaded, so it is an upper bound
 /// and must never be subtracted from a budget.
+///
+/// The one exception is an expert-parallel load (`HIPFIRE_EP_HC8_PLAN_CHARGE`,
+/// default on): there the plan and every rank's fit charge the tensors at the
+/// E4M3 size, from [`Qwen4Hc8Sidecar::plan_tensors`] filtered by
+/// `expert_residency::ep_hc8_plan_saving` to the tensors actually charged in
+/// the rank's non-expert census (never this upper bound).
 pub fn hc8_sidecar_saved_bytes(
     hfq: &HfqFile,
     model_path: &Path,

@@ -27,6 +27,7 @@ fn ir_arch(arch: &str) -> Result<peacemaker_ir::Arch> {
     match arch {
         "gfx1100" => Ok(peacemaker_ir::Arch::Gfx1100),
         "gfx1151" => Ok(peacemaker_ir::Arch::Gfx1151),
+        "gfx1200" => Ok(peacemaker_ir::Arch::Gfx1200),
         "gfx1201" => Ok(peacemaker_ir::Arch::Gfx1201),
         _ => Err(format!("M7 certification does not cover {arch}")),
     }

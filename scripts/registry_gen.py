@@ -365,8 +365,9 @@ def quant_for(file: str) -> str | None:
     if m and m.group(1) in KNOWN_QUANTS:
         return m.group(1)
     # Product ladder files: model.mq4 / model.mq4-xt / model.mq4-xts / model.mq4-pro → quant mq4;
-    # an -xts suffix may carry a hot-expert count (model.mq2-xts-4500 → quant mq2)
-    m = re.search(r"\.(mq\d)(?:-(?:xts?(?:-\d+)?|pro))?$", file)
+    # an -xts suffix may carry a hot-expert count (model.mq2-xts-4500 → quant mq2) or the
+    # symmetric-trunk marker (model.mq4-xts-symtrunk → quant mq4)
+    m = re.search(r"\.(mq\d)(?:-(?:xts?(?:-\d+|-symtrunk)?|pro))?$", file)
     if m and m.group(1) in KNOWN_QUANTS:
         return m.group(1)
     ext = file.rsplit(".", 1)[-1]

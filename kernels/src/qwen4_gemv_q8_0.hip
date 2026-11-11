@@ -466,6 +466,48 @@ extern "C" __global__ void topk8_partial_f32(
     }
 }
 
+// `topk8_partial_f32` for a sub-range of its 128 groups (the vocab-sharded draft head):
+// grid = number of blocks, block b of this launch is group `b + block0` of the full
+// launch, so `begin` and the pv/pi slot are exactly the full launch's. `v` is indexed
+// from layout row 0 as in the full launch; only rows of groups [block0, block0 + grid)
+// are read. Body identical to `topk8_partial_f32`.
+__launch_bounds__(256)
+extern "C" __global__ void topk8_partial_f32_blocks(
+    const float* __restrict__ v, int n, int chunk, float* __restrict__ pv, int* __restrict__ pi,
+    int front, int special, int tail, int block0
+) {
+    __shared__ float sv[8];
+    __shared__ int si[8];
+    const int group = blockIdx.x + block0;
+    const int begin = group * chunk;
+    const int end = min(n, begin + chunk);
+    float val[8];
+    int idx[8];
+#pragma unroll
+    for (int u = 0; u < 8; ++u) {
+        const int j = begin + threadIdx.x + u * 256;
+        const bool ok = j < end;
+        val[u] = ok ? v[j] : -INFINITY;
+        idx[u] = ok ? j : 0x7fffffff;
+    }
+    for (int round = 0; round < 8; ++round) {
+        float bv = -INFINITY;
+        int bi = 0x7fffffff;
+#pragma unroll
+        for (int u = 0; u < 8; ++u)
+            if (topk8_better(val[u], idx[u], bv, bi)) { bv = val[u]; bi = idx[u]; }
+        topk8_block_best(bv, bi, sv, si);
+#pragma unroll
+        for (int u = 0; u < 8; ++u)
+            if (idx[u] == bi) { val[u] = -INFINITY; idx[u] = 0x7fffffff; }
+        if (threadIdx.x == 0) {
+            const int token = bi < front ? bi : (bi < front + tail ? bi - front + special : bi - tail);
+            pv[group * 8 + round] = bv;
+            pi[group * 8 + round] = token;
+        }
+    }
+}
+
 // One block of 256: the top 8 of m <= 2048 partial candidates, each scored
 // exactly against its Q8_0 row (K = 2560, the staged decode kernel's dot),
 // the best written to out[0].

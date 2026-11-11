@@ -12,11 +12,21 @@
 //!   reads the target picks and decides the accepted prefix. Nothing else
 //!   chooses: a follower owns no RNG, no chooser and no cost model.
 //! * **Every rank** is a [`LaneMeshExecutor`] ([`RankLane`] over a
-//!   [`RankExec`]): it replays the root's messages on its own replicated lane
-//!   store, in the same order, with the same op lists, so every row gather
-//!   (target and head) has a matched crossing on both ranks. A follower's
-//!   answers are receipts only (state positions, the operation ledger it
-//!   actually executed, evidence): `proposals`/`sampler` stay `None`.
+//!   [`RankExec`]): it validates the root's messages on its own lane store,
+//!   in the same order, and runs the head work of **the lanes it heads**
+//!   ([`heads_lane`]). A replicated lane (`LanePlan::head_rank == None`: every
+//!   lane of a window with fewer than two head lanes) is replayed by every
+//!   rank with the same op lists, so every row gather (target and head) has a
+//!   matched crossing on both ranks. An owned lane (`Some(rank)`: the X2 draft
+//!   split, promoted by the root once a window carries two or more head lanes,
+//!   split evenly) is drafted, caught up, probed and head-repaired by its owner
+//!   alone: the owner runs the head MoE lane-local (full expert table, no
+//!   crossing), the peer keeps only the target side of the lane (a head-free
+//!   [`rank_view`]). A rank answers the ops of its owned lanes (and, if it is
+//!   the sampler owner, the replicated ones): `proposals` carry exactly the
+//!   answered ops, the root merges them in round order. Receipts (state
+//!   positions, the operation ledger the rank actually executed, evidence)
+//!   are per rank; `sampler` output stays the sampler owner's.
 //! * Each phase is dispatched to every rank **concurrently**
 //!   ([`Qwen4EpMesh::run`] over the existing [`RankPool`]): rank 0 runs on the
 //!   caller's thread, peers on their workers. A phase that contains a
@@ -30,9 +40,11 @@
 //!
 //! `begin_window` validates the lane tables against the plan, maps capacity
 //! (trunk and head arenas) and, for every native lane, takes the head ticket
-//! and arms the GDN ring and takes the target ticket. `run_draft_round` runs
-//! the root's ordered head `Draft` ops (one deferred head step per op, then
-//! one download; only the root reads proposals). `run_verify` runs the one
+//! and arms the GDN ring and takes the target ticket (a lane a peer owns takes
+//! no head ticket here). `run_draft_round` runs
+//! the root's ordered head `Draft` ops of the lanes the rank heads (one
+//! deferred head step per op, or one batched call over them, then one
+//! download; only the answering rank reads a proposal). `run_verify` runs the one
 //! trunk forward over the sealed rows of every lane (`forward_lanes`, row
 //! groups of whole lanes) and returns the executed ledger. `prepare_commit`
 //! repairs the rank's own target and head to the root's decision with
@@ -77,38 +89,48 @@
 //! tokens, exactly as for greedy lanes.
 
 use crate::bundle::{BundleError, Qwen4Bundle};
-use crate::ep::{gather_tally, GatherTally};
+use crate::ep::{gather_tally, GatherTally, PeerMirrors};
+use crate::ep_vocab_shard::{VocabExchange, SLOT_CAND, SLOT_LOGITS, SLOT_PARTIAL, SLOT_TOP1};
 use crate::gpu_forward_lanes::{
     forward_lanes, row_group_count, LaneAllRowsRule, LaneOutputs, LaneRowKind, LaneRows, StageName,
-    StageShare,
+    StageShare, VocabShardView,
 };
 use crate::lane::download_lane_rows;
 use crate::lane::{LabRoutes, LaneSpec, LaneStatus, Qwen4LaneState, Qwen4LaneStore, StepParts};
 use crate::lane_exec::pick_at;
 use crate::mesh_lane_protocol::SamplingMode;
+use crate::mesh_lane_protocol::{ep_draft_split_enabled, heads_lane};
 use crate::mesh_lane_protocol::{
-    AbortRecord, AcceptRule, CommitDecision, ControllerInterval, DevicePick, DraftProposal,
-    DraftRound, EvidenceError, HeadState, LaneAdmission, LaneAdmit, LaneKind, LaneMeshExecutor,
-    LanePlan, LaneRequest, LaneWindowKey, MergedCostEvidence, MeshRoot, MeshStepKey, OpCounts,
-    OpLedger, PhaseTiming, PreparedReceipt, ProposalSource, ProtocolError, RankCostEvidence,
-    RankDraftResult, RankError, RankOwnership, RankReady, RankSession, RankVerifyResult,
-    ReadyStatus, RootConfig, SamplerOutput, StagePolicy, StepOutput, StepPhase, TimedPhase,
-    VerifyPlan, WindowBudgets, WindowStart,
+    AbortRecord, AcceptRule, CommitDecision, ControllerInterval, DevicePick, DraftOp,
+    DraftProposal, DraftRound, EvidenceError, HeadAppend, HeadEnd, HeadState, LaneAdmission,
+    LaneAdmit, LaneDecision, LaneKind, LaneMeshExecutor, LanePlan, LaneRequest, LaneWindowKey,
+    MergedCostEvidence, MeshRoot, MeshStepKey, OpCounts, OpLedger, PhaseTiming, PreparedReceipt,
+    ProposalSource, ProtocolError, RankCostEvidence, RankDraftResult, RankError, RankOwnership,
+    RankReady, RankSession, RankVerifyResult, ReadyStatus, RootConfig, SamplerOutput, StagePolicy,
+    StepOutput, StepPhase, TimedPhase, VerifyPlan, WindowBudgets, WindowStart,
 };
 use crate::mesh_rank_copy::{
     arm_lane_verify, begin_lane_window, catch_up_lane, head_ticket_point, is_probe_op,
     native_keep_cap, prepare_rank_lane, probe_outcome, publish_rank_lane, save_probe_state,
     settle_probe, take_head_ticket, HeadTicketPoint, RankPrepare,
 };
+use crate::mtp_gpu::S4Round;
 use crate::mtp_lanes::lane_call;
 use crate::mtp_spec::{
     draft_accept_estimate, HeadTicket, TargetTicket, DRAFT_ACCEPT_MAX, MTP_ROW_WORTH,
 };
 use crate::sampled_lane::{DraftRead, LaneSampler, RowBuf, RowHandle, TargetRowSource};
-use hipfire_runtime::lane_draw::{lane_draws, LaneDraw, LaneDrawArena, LaneDrawJob};
+use hipfire_dispatch::pipeline::DraftShard;
+use hipfire_dispatch::types::DispatchError;
+use hipfire_runtime::lane_draw::{
+    lane_draws, LaneDraw, LaneDrawArena, LaneDrawJob, LaneDrawStaged,
+};
 use hipfire_runtime::slot_batch::RequestEpoch;
 use hipfire_runtime::spec::SpecRequestConfig;
+use rdna_compute::tensor_ops::ArgmaxPairMerge;
 use rdna_compute::{Gpu, GpuTensor};
+use smallvec::SmallVec;
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -121,6 +143,141 @@ fn rank_err(rank: usize, reason: impl Into<String>) -> RankError {
         rank,
         reason: reason.into(),
     }
+}
+
+/// Prefix of every error that reports a fault of an unchecked async prepare
+/// (`HIPFIRE_QWEN4_LANE_PREPARE_ASYNC`) at a later device wait.
+const DEFERRED_PREPARE: &str = "prepare (deferred)";
+
+/// The text of a failed device wait that is the first one after an unchecked prepare: the device
+/// cannot say whether the prepare's kernels or this phase's own faulted, so the text names both.
+fn deferred_wait_failure(e: impl std::fmt::Display, at: &str) -> String {
+    format!(
+        "{DEFERRED_PREPARE}: {e} (the first device wait after an unchecked prepare, {at}: the \
+         fault is that prepare's or this phase's own)"
+    )
+}
+
+/// The fault check an async window prepare owes on one rank
+/// (`HIPFIRE_QWEN4_LANE_PREPARE_ASYNC`).
+///
+/// The incumbent `prepare_commit` ends with a device wait and the wait-error read, so a device
+/// fault of the phase is that call's error and aborts the step before it publishes. Without the
+/// wait the check is OWED: [`Self::owe`] at the prepare, [`Self::paid`] by the first device wait
+/// that completes without a fault (a draft round's or the verify's readback),
+/// [`Self::settle`] where a wait is forced before something that would carry the fault under
+/// another label or drop it, [`Self::waive`] by an abort. While it is owed, the first failed wait
+/// names the prepare.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PrepareCheck {
+    owed: bool,
+}
+
+impl PrepareCheck {
+    fn is_owed(self) -> bool {
+        self.owed
+    }
+
+    /// The prepare was enqueued without its end-of-phase wait.
+    fn owe(&mut self) {
+        self.owed = true;
+    }
+
+    /// A device wait completed and the wait-error words were clean: everything enqueued before
+    /// it, the prepare included, ran without a fault.
+    fn paid(&mut self) {
+        self.owed = false;
+    }
+
+    /// The step aborted: the mesh is quarantined and nothing is attributed to the prepare.
+    fn waive(&mut self) {
+        self.owed = false;
+    }
+
+    /// Run `wait` (the device wait and the wait-error read) when the check is owed, and only
+    /// then. The check is cleared first: a fault `wait` reports is reported once, as the
+    /// prepare's (`prepare (deferred): ..`).
+    fn settle(&mut self, wait: impl FnOnce() -> R<()>) -> R<()> {
+        if !self.owed {
+            return Ok(());
+        }
+        self.owed = false;
+        wait().map_err(|e| format!("{DEFERRED_PREPARE}: {e}"))
+    }
+
+    /// The error of a failed readback of a draft round: `draft download: {e}`, or, while the
+    /// check is owed, attributed to the prepare.
+    fn draft_wait_failure(self, e: impl std::fmt::Display) -> String {
+        if self.owed {
+            deferred_wait_failure(e, "the draft download")
+        } else {
+            format!("draft download: {e}")
+        }
+    }
+
+    /// The error of a failed verify readback: `{e}`, or, while the check is owed, attributed to
+    /// the prepare.
+    fn verify_wait_failure(self, e: impl std::fmt::Display) -> String {
+        if self.owed {
+            deferred_wait_failure(e, "the verify readback")
+        } else {
+            e.to_string()
+        }
+    }
+}
+
+/// Whether a preflight failure is a deferred prepare fault ([`PrepareCheck::settle`] ran before an
+/// arena growth): that one is fatal to the mesh, not a capacity condition of the step.
+fn deferred_preflight_fatal(capacity: &R<()>) -> Option<String> {
+    match capacity {
+        Err(reason) if reason.starts_with(DEFERRED_PREPARE) => Some(reason.clone()),
+        _ => None,
+    }
+}
+
+/// The ranks' answers to `begin_window` with each rank's `fatal` (taken right after the call):
+/// a rank that found a deferred prepare fault turns the begin into a mesh failure (the step
+/// aborts and the mesh is quarantined), anything else is every rank's [`RankReady`] in rank order.
+fn begin_outcome(all: Vec<(RankReady, Option<String>)>) -> Result<Vec<RankReady>, RankError> {
+    if let Some((rank, reason)) = all
+        .iter()
+        .enumerate()
+        .find_map(|(rank, (_, fatal))| fatal.clone().map(|reason| (rank, reason)))
+    {
+        return Err(rank_err(rank, reason));
+    }
+    Ok(all.into_iter().map(|(ready, _)| ready).collect())
+}
+
+/// Quarantine the mesh after a settle ([`EpMeshLanes::settle_prepare`]) found a deferred prepare
+/// fault: every failing rank is named in the root's abort record, every rank follows
+/// (`MeshFanout::abort`) and the error names the prepare and `at`. `Ok` when every rank was clean.
+fn quarantine_unchecked<F: MeshFanout>(
+    root: &mut MeshRoot,
+    fan: &mut F,
+    key: &MeshStepKey,
+    at: &str,
+    outcomes: Result<Vec<R<()>>, RankError>,
+) -> Result<(), String> {
+    let failures: Vec<String> = match outcomes {
+        Ok(all) => all
+            .into_iter()
+            .enumerate()
+            .filter_map(|(rank, outcome)| outcome.err().map(|e| format!("rank {rank}: {e}")))
+            .collect(),
+        Err(e) => vec![format!("rank {}: {}", e.rank, e.reason)],
+    };
+    if failures.is_empty() {
+        return Ok(());
+    }
+    let reason = format!("{} (found before {at})", failures.join("; "));
+    let phase = root.phase();
+    if let Ok(record) = root.abort_step(None, phase, &reason) {
+        fan.abort(key, record.phase, &record.reason);
+    }
+    Err(format!(
+        "EP mesh lane step aborted (mesh quarantined, reload to recover): {reason}"
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -163,9 +320,10 @@ struct LaneWin {
 }
 
 impl LaneWin {
-    fn new(plan: &LanePlan) -> Self {
+    /// `own`'s window of `plan` ([`rank_view`]).
+    fn new(plan: &LanePlan, own: &RankOwnership) -> Self {
         Self {
-            plan: plan.clone(),
+            plan: rank_view(own, plan).into_owned(),
             prefix: 1.0,
             local_drafts: Vec::new(),
             rows: Vec::new(),
@@ -175,12 +333,142 @@ impl LaneWin {
     }
 }
 
+/// This rank's view of a lane's plan. A lane whose head a peer owns
+/// ([`heads_lane`] is false though the window touches the head) is head-free
+/// here: no head arena mapping, ticket, catch-up, append or owed row (the same
+/// treatment as a head-free lane, which already runs target-only). Every other
+/// lane's plan is unchanged.
+fn rank_view<'a>(own: &RankOwnership, plan: &'a LanePlan) -> Cow<'a, LanePlan> {
+    if plan.head == HeadState::Free || heads_lane(own, plan) {
+        Cow::Borrowed(plan)
+    } else {
+        Cow::Owned(LanePlan {
+            head: HeadState::Free,
+            catch_up: None,
+            ..plan.clone()
+        })
+    }
+}
+
+/// The decision as this rank repairs it: a head-free view of a lane
+/// ([`rank_view`]) carries no head schedule.
+fn rank_decision<'a>(d: &'a LaneDecision, view: &LanePlan) -> Cow<'a, LaneDecision> {
+    if view.head == HeadState::Free
+        && (d.head_append != HeadAppend::default() || d.head_end != HeadEnd::Free)
+    {
+        Cow::Owned(LaneDecision {
+            head_append: HeadAppend::default(),
+            head_end: HeadEnd::Free,
+            ..d.clone()
+        })
+    } else {
+        Cow::Borrowed(d)
+    }
+}
+
+/// Whether the rank that executes an op of `plan` answers it (reads its
+/// proposal): the owner of an owned lane, the sampler owner for a replicated
+/// one.
+fn answers_op(plan: &LanePlan, sampler: bool) -> bool {
+    plan.head_rank.is_some() || sampler
+}
+
+/// Whether beginning `start` may grow a lane's trunk or head context arena (the one host sync of
+/// a window's begin): some lane's mapped coverage is below the rows its window reaches. An
+/// over-estimate (a head-free view maps no head arena) only costs a settle; legacy arenas are
+/// mapped whole, so they never read as short.
+fn window_needs_growth(bundle: &Qwen4Bundle, start: &WindowStart) -> bool {
+    let Some(store) = bundle.lanes.as_ref() else {
+        return false;
+    };
+    start.lanes.iter().any(|plan| {
+        let Some(lane) = store.lane(&plan.key.request_epoch) else {
+            return false;
+        };
+        let rows = plan
+            .max_rows()
+            .max(crate::mesh_rank_copy::mapped_rows(plan));
+        let end = lane.state.position.saturating_add(rows);
+        lane.state.mapped_context_tokens() < end
+            || lane
+                .spec
+                .as_ref()
+                .is_some_and(|spec| spec.head.mapped_tokens() < end)
+    })
+}
+
+/// The sharded-MoE pass (S4, `HIPFIRE_QWEN4_DRAFT_SHARDED_MOE`) of a draft
+/// round, decided from the root's whole round and the plan alone so every rank
+/// decides alike (`rank` only names this rank's share): the switch and the S4
+/// head tables are on, the round holds two to eight ops, every op is a lane one
+/// of two ranks owns (X2), and the round is one batched head call
+/// ([`crate::mtp_lanes::draft_round_batchable`] over the whole round). Any other
+/// round (a lone op, replicated lanes) keeps its X2 / replicated path unchanged.
+fn s4_round_for<'a>(
+    bundle: &Qwen4Bundle,
+    ops: &[DraftOp],
+    plan_of: impl Fn(&LaneWindowKey) -> Option<&'a LanePlan>,
+    rank: usize,
+) -> R<Option<S4Round>> {
+    if !crate::mtp_gpu::draft_sharded_moe_enabled()
+        || !bundle.mtp_s4_ready()
+        || !(2..=crate::mtp_gpu::MTP_DRAFT_LANES_MAX).contains(&ops.len())
+    {
+        return Ok(None);
+    }
+    let mut lanes: SmallVec<[(Option<usize>, bool); crate::mtp_gpu::MTP_DRAFT_LANES_MAX]> =
+        SmallVec::new();
+    for op in ops {
+        let plan =
+            plan_of(&op.key).ok_or_else(|| "draft op for a lane outside the plan".to_string())?;
+        lanes.push((plan.head_rank, plan.wants_candidate_read()));
+    }
+    Ok(s4_round_shape(&lanes, rank, |any_read| {
+        crate::mtp_lanes::draft_round_batchable(bundle, lanes.len(), any_read)
+    }))
+}
+
+/// The host-only part of [`s4_round_for`]: `lanes` holds each op's
+/// `(head_rank, wants_candidate_read)` in the root's op order. `None` unless the
+/// round holds two to eight ops, every op has an X2 owner (`head_rank` 0 or 1;
+/// a replicated lane, `None`, keeps the round on its unchanged path) and
+/// `batchable(any_candidate_read)` holds. Otherwise `owners` carries op `s`'s
+/// owner in bit `s`.
+fn s4_round_shape(
+    lanes: &[(Option<usize>, bool)],
+    rank: usize,
+    batchable: impl FnOnce(bool) -> bool,
+) -> Option<S4Round> {
+    if !(2..=crate::mtp_gpu::MTP_DRAFT_LANES_MAX).contains(&lanes.len()) {
+        return None;
+    }
+    let (mut owners, mut any_read) = (0u8, false);
+    for (slot, &(head_rank, wants_read)) in lanes.iter().enumerate() {
+        match head_rank {
+            Some(owner) if owner < 2 => owners |= (owner as u8) << slot,
+            _ => return None,
+        }
+        any_read |= wants_read;
+    }
+    batchable(any_read).then_some(S4Round {
+        g: lanes.len(),
+        owners,
+        rank,
+    })
+}
+
 struct ExecStep {
     key: MeshStepKey,
     lanes: Vec<LaneWin>,
     draft_us: f64,
     verify_us: f64,
+    /// Host time of the prepare phase. With `HIPFIRE_QWEN4_LANE_PREPARE_ASYNC` this is the ENQUEUE
+    /// time (the phase's device tail is not waited, [`Self::prepare_synced`] is false). Stats only:
+    /// no policy reads it (the chooser, floor and pricing read `wall_us`).
     prepare_us: f64,
+    /// Whether `prepare_us` ends at the device's completion of the phase (the incumbent
+    /// `device_synchronize` at the end of `prepare_commit`); false under the async prepare.
+    prepare_synced: bool,
     draft_tally: GatherTally,
     verify_tally: GatherTally,
     head_calls: usize,
@@ -209,11 +497,18 @@ pub struct RankExec {
     stepped: bool,
     stats: RankLaneStats,
     /// A failure after the all-prepared boundary (publish is infallible by
-    /// construction; this records the impossible case).
+    /// construction; this records the impossible case), or a fault of an unchecked prepare found
+    /// at the next window's preflight ([`RankLane::begin_window`]).
     fatal: Option<String>,
+    /// The fault check an async prepare owes on this rank (`HIPFIRE_QWEN4_LANE_PREPARE_ASYNC`):
+    /// owed from the prepare until the first device wait that completes cleanly, a settle or an
+    /// abort ([`PrepareCheck`]).
+    prepare: PrepareCheck,
     abort_reason: Option<String>,
     /// Validity flag of the row source the last verify handed out.
     rows_valid: Option<Arc<AtomicBool>>,
+    /// The vocabulary-shard exchange of this rank's mesh, when attached.
+    vocab: Option<Arc<VocabExchange>>,
 }
 
 impl RankExec {
@@ -230,9 +525,18 @@ impl RankExec {
                 ..RankLaneStats::default()
             },
             fatal: None,
+            prepare: PrepareCheck::default(),
             abort_reason: None,
             rows_valid: None,
+            vocab: None,
         }
+    }
+
+    /// This rank's vocabulary-shard exchange (`HIPFIRE_QWEN4_EP_VOCAB_SHARD`; `None`: the switch
+    /// is off or the load declined it, so a sharded plan is refused).
+    pub(crate) fn with_vocab(mut self, vocab: Option<Arc<VocabExchange>>) -> Self {
+        self.vocab = vocab;
+        self
     }
 
     pub fn stats(&self) -> RankLaneStats {
@@ -334,6 +638,9 @@ struct OpRead {
     abandoned: bool,
     /// The head's rescored candidates (rank 0, native Leviathan lane only).
     read: Option<DraftRead>,
+    /// FNV-1a of the op's `draft_top1` slot (lab draft trace).
+    #[cfg(feature = "lab")]
+    top1_fnv: u64,
 }
 
 /// The sampler owner's resident verify logits, read one row at a time by the
@@ -436,6 +743,24 @@ impl RankLane<'_> {
         self.exec.session.ownership()
     }
 
+    /// Pay the fault check an async prepare owes ([`RankExec::prepare`]): wait for the device and
+    /// read the wait-error words, exactly the pair the incumbent `prepare_commit` ends with. A
+    /// no-op when nothing is owed. Reached only from the points that would otherwise issue their
+    /// own host sync under a different label, or drop the fault (arena growth in the preflight,
+    /// [`EpMeshLanes::settle_prepare`]); the draft round and the verify pay it with their own
+    /// readback instead.
+    fn settle_prepare(&mut self) -> R<()> {
+        let Self { exec, gpu, .. } = self;
+        exec.prepare.settle(|| {
+            // Between steps the thread's current HIP device is whatever the last call left: bind it.
+            gpu.bind_thread().map_err(|e| e.to_string())?;
+            gpu.hip
+                .device_synchronize()
+                .map_err(|e| format!("synchronize: {e}"))?;
+            gpu.take_device_wait_error().map_err(|e| e.to_string())
+        })
+    }
+
     /// The host-and-mapping checks of a plan and the device half of every
     /// lane's `begin_window` ([`begin_lane_window`]: the pending window, the
     /// head's position, arenas and the head ticket where the plan wants it).
@@ -454,6 +779,15 @@ impl RankLane<'_> {
                 self.exec.rank, start.stage.all_rows
             ));
         }
+        // The only host sync inside a window's begin is a VMM arena growth (its zero-fill waits the
+        // stream). With an unchecked prepare that wait would hand the prepare's fault back as a
+        // capacity refusal (a soft rejection that leaves the mesh usable and drops the fault
+        // record): settle first, so the fault is reported as the prepare's and fatally
+        // ([`Self::begin_window`]).
+        if self.exec.prepare.is_owed() && window_needs_growth(&*self.bundle, start) {
+            self.settle_prepare()?;
+        }
+        let own = self.own();
         let Self { bundle, gpu, .. } = self;
         let (spec_k, rows_cap, max_lanes) = {
             let store = bundle
@@ -535,7 +869,8 @@ impl RankLane<'_> {
                         crate::lane_exec::PROVISION_MAP_REFUSED
                     )
                 })?;
-                begin_lane_window(bundle, gpu, lane, plan)?;
+                let view = rank_view(&own, plan);
+                begin_lane_window(bundle, gpu, lane, &view)?;
             }
             Ok(())
         })
@@ -558,7 +893,12 @@ impl RankLane<'_> {
     /// Draft op), then every op's deferred head step in the root's order, one
     /// download for all of them and the head's own parse of each. Returns the
     /// catch-up rows appended and the reads per op.
-    fn draft_round_device(&mut self, round: &DraftRound, sampler: bool) -> R<(usize, Vec<OpRead>)> {
+    fn draft_round_device(
+        &mut self,
+        round: &DraftRound,
+        sampler: bool,
+        s4: Option<S4Round>,
+    ) -> R<(usize, Vec<OpRead>)> {
         let Self {
             exec, bundle, gpu, ..
         } = self;
@@ -573,7 +913,21 @@ impl RankLane<'_> {
                 .map(|w| &w.plan)
                 .ok_or_else(|| "draft op for a lane outside the plan".to_string())
         };
-        with_store(bundle, |store, bundle| {
+        // A vocabulary-sharded head round (`DraftRound::vocab_shard`): every draft of the round
+        // splits its ranked rows with the peer rank ([`draft_shard`]). The root decided it from
+        // the plan alone, so both ranks make the same number of exchange calls in the same order
+        // (the same replicated ops, the same batched / serial branch).
+        let shard_round = round.vocab_shard && !round.ops.is_empty();
+        if shard_round {
+            let shard = draft_shard(exec)?;
+            bundle
+                .mtp_set_draft_shard(Some(shard))
+                .map_err(|e| e.to_string())?;
+        }
+        // An unchecked async prepare is paid by this round's first readback (the one wait of the
+        // round that follows every launch of the prepare on the stream).
+        let mut check = exec.prepare;
+        let result = with_store(bundle, |store, bundle| {
             // Round 0: owed-row catch-ups, then the head tickets that follow one.
             let mut catch_rows = 0usize;
             if !round.catch_up.is_empty() {
@@ -591,91 +945,190 @@ impl RankLane<'_> {
                 }
             }
             if round.ops.is_empty() {
+                // A sharded-MoE pass (S4) is a collective: a rank that owns none of
+                // its rows still runs the activation all-gather and the global MoE
+                // call, in lockstep with the peer.
+                if let Some(s4) = s4 {
+                    bundle
+                        .mtp_set_s4_round(Some(s4))
+                        .map_err(|e| format!("sharded MoE mode: {e}"))?;
+                    let ran = bundle
+                        .mtp_s4_participate(gpu)
+                        .map_err(|e| format!("sharded MoE participant: {e}"));
+                    let off = bundle
+                        .mtp_set_s4_round(None)
+                        .map_err(|e| format!("sharded MoE mode off: {e}"));
+                    ran?;
+                    off?;
+                }
                 return Ok((catch_rows, Vec::new()));
             }
-            let epochs: Vec<RequestEpoch> = round.ops.iter().map(|o| o.key.request_epoch).collect();
-            let (mut lanes, spec_store) = store.draft_parts(&epochs)?;
-            let spec_store =
-                spec_store.ok_or_else(|| "head draft in a store without MTP lanes".to_string())?;
-            let slot_bytes = Gpu::TOPK8_OUT_BYTES;
-            let bytes = round.ops.len() * slot_bytes;
-            if bytes > spec_store.draft_top1_host.len() {
-                return Err(format!(
-                    "{} draft ops exceed the {} draft slots",
-                    round.ops.len(),
-                    spec_store.draft_top1_host.len() / slot_bytes
-                ));
+            // The round's ops are every op this rank executes: all owned by this
+            // rank's lanes, or all replicated (the protocol refuses a mix). An
+            // owned round runs the head lane-local (the full-table MoE runtime:
+            // no crossing, no `moe_steps` advance); the mode is restored on every
+            // path out.
+            let lane_local = s4.is_none()
+                && round.ops.iter().try_fold(false, |any, op| {
+                    Ok::<_, String>(any || plan_of(&op.key)?.head_rank.is_some())
+                })?;
+            if lane_local {
+                bundle
+                    .mtp_set_lane_local(true)
+                    .map_err(|e| format!("head lane-local mode: {e}"))?;
             }
-            // Lab settling test of the draft-history mask (PARITY.md 4.3): head
-            // arena rows beyond each lane's valid lengths are overwritten
-            // (`HIPFIRE_LAB_MTP_STALE_FILL`); every output must stay identical.
-            #[cfg(feature = "lab")]
-            crate::lab_draft_rounds::fill_stale(gpu, &lanes)?;
-            // Lab oracle of the batched head round: compare this round's lanes'
-            // serial and batched head steps on scratch twins of their states
-            // (no effect on the lanes; armed by env only, `lab` builds only).
-            #[cfg(feature = "lab")]
-            if crate::lab_draft_rounds::probe_enabled()
-                && round.ops.len() >= 2
-                && !round.ops.iter().try_fold(false, |any, op| {
-                    Ok::<_, String>(any || is_probe_op(plan_of(&op.key)?, op.position))
-                })?
-            {
-                let ops: Vec<(u32, usize)> =
-                    round.ops.iter().map(|op| (op.input, op.position)).collect();
-                crate::lab_draft_rounds::probe_round(
-                    bundle,
-                    gpu,
-                    &mut lanes,
-                    &ops,
-                    exec.rank,
-                    round.round,
-                )?;
+            if let Some(s4) = s4 {
+                bundle
+                    .mtp_set_s4_round(Some(s4))
+                    .map_err(|e| format!("sharded MoE mode: {e}"))?;
             }
-            // The draft head's logit row is one shared buffer: a sampled lane's
-            // read of a head without re-scoring is that whole row, so with
-            // more than one op in the round each op must be enqueued, finished
-            // and read before the next op's enqueue overwrites it. Candidate
-            // reads are host-resident after each finish and keep the one
-            // batched download. Ops of a round are distinct lanes, so the
-            // order of finishing does not move any lane's state.
-            let want_read_any = round.ops.iter().try_fold(false, |any, op| {
-                let plan = plan_of(&op.key)?;
-                Ok::<_, String>(any || (sampler && plan.wants_candidate_read()))
-            })?;
-            // One batched head call per round (`HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS=1`):
-            // decided from the root's plan alone (every rank takes the same
-            // branch: the head's gather parity advances once per batched call).
-            let any_distribution_read = round.ops.iter().try_fold(false, |any, op| {
-                let plan = plan_of(&op.key)?;
-                Ok::<_, String>(any || plan.wants_candidate_read())
-            })?;
-            let batched = crate::mtp_lanes::draft_round_batchable(
-                bundle,
-                round.ops.len(),
-                any_distribution_read,
-            );
-            let chunks =
-                draft_read_plan(want_read_any, bundle.mtp_draft_rescored(), round.ops.len())
-                    .chunks(round.ops.len());
-            let mut reads = Vec::with_capacity(round.ops.len());
-            for chunk in chunks {
-                if batched {
-                    let mut inputs = Vec::with_capacity(round.ops.len());
-                    for (slot, op) in round.ops.iter().enumerate() {
-                        if is_probe_op(plan_of(&op.key)?, op.position) {
-                            save_probe_state(&mut *lanes[slot]);
-                        }
-                        inputs.push((op.input, op.position));
-                    }
-                    crate::mtp_lanes::enqueue_batched_draft(
+            let ran = (|| -> R<Vec<OpRead>> {
+                let epochs: Vec<RequestEpoch> =
+                    round.ops.iter().map(|o| o.key.request_epoch).collect();
+                let (mut lanes, spec_store) = store.draft_parts(&epochs)?;
+                let spec_store = spec_store
+                    .ok_or_else(|| "head draft in a store without MTP lanes".to_string())?;
+                let slot_bytes = Gpu::TOPK8_OUT_BYTES;
+                let bytes = round.ops.len() * slot_bytes;
+                if bytes > spec_store.draft_top1_host.len() {
+                    return Err(format!(
+                        "{} draft ops exceed the {} draft slots",
+                        round.ops.len(),
+                        spec_store.draft_top1_host.len() / slot_bytes
+                    ));
+                }
+                // Lab settling test of the draft-history mask (PARITY.md 4.3): head
+                // arena rows beyond each lane's valid lengths are overwritten
+                // (`HIPFIRE_LAB_MTP_STALE_FILL`); every output must stay identical.
+                #[cfg(feature = "lab")]
+                crate::lab_draft_rounds::fill_stale(gpu, &lanes)?;
+                // Lab oracle of the batched head round: compare this round's lanes'
+                // serial and batched head steps on scratch twins of their states
+                // (no effect on the lanes; armed by env only, `lab` builds only).
+                #[cfg(feature = "lab")]
+                if crate::lab_draft_rounds::probe_enabled()
+                    && s4.is_none()
+                    && round.ops.len() >= 2
+                    && !round.ops.iter().try_fold(false, |any, op| {
+                        Ok::<_, String>(any || is_probe_op(plan_of(&op.key)?, op.position))
+                    })?
+                {
+                    let ops: Vec<(u32, usize)> =
+                        round.ops.iter().map(|op| (op.input, op.position)).collect();
+                    crate::lab_draft_rounds::probe_round(
                         bundle,
                         gpu,
                         &mut lanes,
-                        &inputs,
-                        &spec_store.draft_top1,
+                        &ops,
+                        exec.rank,
+                        round.round,
                     )?;
-                } else {
+                }
+                // The draft head's logit row is one shared buffer: a sampled lane's
+                // read of a head without re-scoring is that whole row, so with
+                // more than one op in the round each op must be enqueued, finished
+                // and read before the next op's enqueue overwrites it. Candidate
+                // reads are host-resident after each finish and keep the one
+                // batched download. Ops of a round are distinct lanes, so the
+                // order of finishing does not move any lane's state.
+                let want_read_any = round.ops.iter().try_fold(false, |any, op| {
+                    let plan = plan_of(&op.key)?;
+                    Ok::<_, String>(
+                        any || (answers_op(plan, sampler) && plan.wants_candidate_read()),
+                    )
+                })?;
+                // One batched head call per round (`HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS=1`):
+                // decided from the root's plan alone over the ops this rank executes
+                // (a replicated round: every rank takes the same branch, the head's
+                // gather parity advances once per batched call).
+                let any_distribution_read = round.ops.iter().try_fold(false, |any, op| {
+                    let plan = plan_of(&op.key)?;
+                    Ok::<_, String>(any || plan.wants_candidate_read())
+                })?;
+                let batched = s4.is_some()
+                    || crate::mtp_lanes::draft_round_batchable(
+                        bundle,
+                        round.ops.len(),
+                        any_distribution_read,
+                    );
+                let chunks =
+                    draft_read_plan(want_read_any, bundle.mtp_draft_rescored(), round.ops.len())
+                        .chunks(round.ops.len());
+                let mut reads = Vec::with_capacity(round.ops.len());
+                for chunk in chunks {
+                    if batched {
+                        let mut inputs = Vec::with_capacity(round.ops.len());
+                        for (slot, op) in round.ops.iter().enumerate() {
+                            if is_probe_op(plan_of(&op.key)?, op.position) {
+                                save_probe_state(&mut *lanes[slot]);
+                            }
+                            inputs.push((op.input, op.position));
+                        }
+                        crate::mtp_lanes::enqueue_batched_draft(
+                            bundle,
+                            gpu,
+                            &mut lanes,
+                            &inputs,
+                            &spec_store.draft_top1,
+                        )?;
+                    } else {
+                        for (slot, op) in round
+                            .ops
+                            .iter()
+                            .enumerate()
+                            .skip(chunk.start)
+                            .take(chunk.len())
+                        {
+                            // The confirmation probe's Draft is abandoned on a hit: save
+                            // the head's request state it is about to move.
+                            if is_probe_op(plan_of(&op.key)?, op.position) {
+                                save_probe_state(&mut *lanes[slot]);
+                            }
+                            let Qwen4LaneState { state, spec, .. } = &mut *lanes[slot];
+                            let spec = spec
+                                .as_mut()
+                                .ok_or_else(|| "drafting lane lost its MTP state".to_string())?;
+                            let LaneSpec {
+                                head,
+                                draft,
+                                pending_hidden,
+                                window,
+                                ..
+                            } = spec;
+                            let window_position = window
+                                .as_ref()
+                                .ok_or_else(|| "draft op without a pending window".to_string())?
+                                .position;
+                            let top1 = spec_store
+                                .draft_top1
+                                .sub_offset(slot * slot_bytes, slot_bytes);
+                            let j = op.position - window_position;
+                            let hidden = (j == 0).then_some(&*pending_hidden);
+                            lane_call(bundle.with_lane(state, Some((head, draft)), |b| {
+                                b.mtp_forward_token_deferred(
+                                    gpu,
+                                    op.input,
+                                    hidden,
+                                    op.position,
+                                    j == 0,
+                                    &top1,
+                                )
+                            }))
+                            .map_err(|e| format!("draft step {j}: {e}"))?;
+                        }
+                    }
+                    let (from, to) = (chunk.start * slot_bytes, chunk.end * slot_bytes);
+                    let chunk_top1 = spec_store.draft_top1.sub_offset(from, to - from);
+                    gpu.dtoh_stream_ordered(
+                        &mut spec_store.draft_top1_host[from..to],
+                        &chunk_top1.buf,
+                    )
+                    .map_err(|e| check.draft_wait_failure(e))?;
+                    gpu.take_device_wait_error()
+                        .map_err(|e| check.draft_wait_failure(e))?;
+                    // The device completed everything enqueued so far, the prepare included, and
+                    // no fault was recorded: its check is paid.
+                    check.paid();
                     for (slot, op) in round
                         .ops
                         .iter()
@@ -683,126 +1136,108 @@ impl RankLane<'_> {
                         .skip(chunk.start)
                         .take(chunk.len())
                     {
-                        // The confirmation probe's Draft is abandoned on a hit: save
-                        // the head's request state it is about to move.
-                        if is_probe_op(plan_of(&op.key)?, op.position) {
-                            save_probe_state(&mut *lanes[slot]);
-                        }
-                        let Qwen4LaneState { state, spec, .. } = &mut *lanes[slot];
-                        let spec = spec
-                            .as_mut()
-                            .ok_or_else(|| "drafting lane lost its MTP state".to_string())?;
-                        let LaneSpec {
-                            head,
-                            draft,
-                            pending_hidden,
-                            window,
-                            ..
-                        } = spec;
-                        let window_position = window
-                            .as_ref()
-                            .ok_or_else(|| "draft op without a pending window".to_string())?
-                            .position;
-                        let top1 = spec_store
-                            .draft_top1
-                            .sub_offset(slot * slot_bytes, slot_bytes);
-                        let j = op.position - window_position;
-                        let hidden = (j == 0).then_some(&*pending_hidden);
-                        lane_call(bundle.with_lane(state, Some((head, draft)), |b| {
-                            b.mtp_forward_token_deferred(
-                                gpu,
-                                op.input,
-                                hidden,
-                                op.position,
-                                j == 0,
-                                &top1,
+                        let top =
+                            &spec_store.draft_top1_host[slot * slot_bytes..(slot + 1) * slot_bytes];
+                        let plan = plan_of(&op.key)?;
+                        let want_read = answers_op(plan, sampler) && plan.wants_candidate_read();
+                        let (token, margin, read) = if batched {
+                            let (token, margin) = crate::mtp_lanes::finish_batched_draft(
+                                bundle,
+                                &mut *lanes[slot],
+                                top,
                             )
-                        }))
-                        .map_err(|e| format!("draft step {j}: {e}"))?;
-                    }
-                }
-                let (from, to) = (chunk.start * slot_bytes, chunk.end * slot_bytes);
-                let chunk_top1 = spec_store.draft_top1.sub_offset(from, to - from);
-                gpu.dtoh_stream_ordered(&mut spec_store.draft_top1_host[from..to], &chunk_top1.buf)
-                    .map_err(|e| format!("draft download: {e}"))?;
-                gpu.take_device_wait_error()
-                    .map_err(|e| format!("draft download: {e}"))?;
-                for (slot, op) in round
-                    .ops
-                    .iter()
-                    .enumerate()
-                    .skip(chunk.start)
-                    .take(chunk.len())
-                {
-                    let top =
-                        &spec_store.draft_top1_host[slot * slot_bytes..(slot + 1) * slot_bytes];
-                    let plan = plan_of(&op.key)?;
-                    let want_read = sampler && plan.wants_candidate_read();
-                    let (token, margin, read) = if batched {
-                        let (token, margin) =
-                            crate::mtp_lanes::finish_batched_draft(bundle, &mut *lanes[slot], top)
-                                .map_err(|e| format!("draft finish: {e}"))?;
-                        let read = if want_read {
-                            Some(
-                                bundle
-                                    .mtp_draft_read(gpu)
-                                    .map_err(|e| format!("draft finish: {e}"))?,
-                            )
-                        } else {
-                            None
-                        };
-                        (token, margin, read)
-                    } else {
-                        let Qwen4LaneState { state, spec, .. } = &mut *lanes[slot];
-                        let spec = spec
-                            .as_mut()
-                            .ok_or_else(|| "drafting lane lost its MTP state".to_string())?;
-                        let LaneSpec { head, draft, .. } = spec;
-                        lane_call(bundle.with_lane(state, Some((head, draft)), |b| {
-                            let token = b.mtp_draft_finish(top)?;
+                            .map_err(|e| format!("draft finish: {e}"))?;
                             let read = if want_read {
-                                Some(b.mtp_draft_read(gpu)?)
+                                Some(
+                                    bundle
+                                        .mtp_draft_read(gpu)
+                                        .map_err(|e| format!("draft finish: {e}"))?,
+                                )
                             } else {
                                 None
                             };
-                            Ok::<_, BundleError>((token, b.mtp_draft_margin(), read))
-                        }))
-                        .map_err(|e| format!("draft finish: {e}"))?
-                    };
-                    let j = {
-                        let w = lanes[slot]
-                            .spec
-                            .as_ref()
-                            .and_then(|s| s.window.as_ref())
-                            .ok_or_else(|| "draft op without a pending window".to_string())?;
-                        op.position - w.position
-                    };
-                    // The probe: the head's argmax at the seed against the first
-                    // candidate (the root's own rule, evaluated on this rank's
-                    // read; the verify rows the root seals validate it). A hit,
-                    // or a miss with no native route, abandons the probe's step.
-                    let mut abandoned = false;
-                    if is_probe_op(plan, op.position) {
-                        let outcome = probe_outcome(&plan.copy_drafts, token, plan.native_depth);
-                        settle_probe(bundle, gpu, &mut *lanes[slot], outcome)?;
-                        abandoned = outcome.restores_head();
-                    }
-                    if !abandoned {
-                        if let Some(w) = lanes[slot].spec.as_mut().and_then(|s| s.window.as_mut()) {
-                            w.steps += 1;
+                            (token, margin, read)
+                        } else {
+                            let Qwen4LaneState { state, spec, .. } = &mut *lanes[slot];
+                            let spec = spec
+                                .as_mut()
+                                .ok_or_else(|| "drafting lane lost its MTP state".to_string())?;
+                            let LaneSpec { head, draft, .. } = spec;
+                            lane_call(bundle.with_lane(state, Some((head, draft)), |b| {
+                                let token = b.mtp_draft_finish(top)?;
+                                let read = if want_read {
+                                    Some(b.mtp_draft_read(gpu)?)
+                                } else {
+                                    None
+                                };
+                                Ok::<_, BundleError>((token, b.mtp_draft_margin(), read))
+                            }))
+                            .map_err(|e| format!("draft finish: {e}"))?
+                        };
+                        let j = {
+                            let w = lanes[slot]
+                                .spec
+                                .as_ref()
+                                .and_then(|s| s.window.as_ref())
+                                .ok_or_else(|| "draft op without a pending window".to_string())?;
+                            op.position - w.position
+                        };
+                        // The probe: the head's argmax at the seed against the first
+                        // candidate (the root's own rule, evaluated on this rank's
+                        // read; the verify rows the root seals validate it). A hit,
+                        // or a miss with no native route, abandons the probe's step.
+                        let mut abandoned = false;
+                        if is_probe_op(plan, op.position) {
+                            let outcome =
+                                probe_outcome(&plan.copy_drafts, token, plan.native_depth);
+                            settle_probe(bundle, gpu, &mut *lanes[slot], outcome)?;
+                            abandoned = outcome.restores_head();
                         }
+                        if !abandoned {
+                            if let Some(w) =
+                                lanes[slot].spec.as_mut().and_then(|s| s.window.as_mut())
+                            {
+                                w.steps += 1;
+                            }
+                        }
+                        reads.push(OpRead {
+                            token,
+                            margin,
+                            j,
+                            abandoned,
+                            read: if abandoned { None } else { read },
+                            #[cfg(feature = "lab")]
+                            top1_fnv: lab_trace::fnv1a(top),
+                        });
                     }
-                    reads.push(OpRead {
-                        token,
-                        margin,
-                        j,
-                        abandoned,
-                        read: if abandoned { None } else { read },
-                    });
                 }
+                Ok(reads)
+            })();
+            if s4.is_some() {
+                let off = bundle
+                    .mtp_set_s4_round(None)
+                    .map_err(|e| format!("sharded MoE mode off: {e}"));
+                let reads = ran?;
+                off?;
+                return Ok((catch_rows, reads));
             }
-            Ok((catch_rows, reads))
-        })
+            if lane_local {
+                let off = bundle
+                    .mtp_set_lane_local(false)
+                    .map_err(|e| format!("head lane-local mode off: {e}"));
+                let reads = ran?;
+                off?;
+                return Ok((catch_rows, reads));
+            }
+            ran.map(|reads| (catch_rows, reads))
+        });
+        exec.prepare = check;
+        if shard_round {
+            // Removed on every path out of the round (an error aborts the mesh anyway).
+            let removed = bundle.mtp_set_draft_shard(None).map_err(|e| e.to_string());
+            return result.and_then(|ok| removed.map(|()| ok));
+        }
+        result
     }
 
     /// The one trunk forward over every lane's sealed rows (arming the ring and
@@ -811,12 +1246,30 @@ impl RankLane<'_> {
     /// right after the forward on the same stream, every lane the root lent a
     /// [`crate::mesh_lane_protocol::DeviceSampleSpec`] is drawn on device
     /// ([`device_draws`]): only ids, accept counts and RNG states come back.
+    ///
+    /// With [`VerifyPlan::vocab_shard`] every rank runs only its half of the LM head
+    /// (`LaneOutputs::vocab_shard`) and the sampler owner merges the two halves into the whole
+    /// head's picks and draws ([`sharded_tail`]; the ordering and its reuse-safety argument are
+    /// in [`crate::ep_vocab_shard`]). The non-sampler rank's picks are then shard-local ids.
     fn verify_device(&mut self, plan: &VerifyPlan) -> R<VerifyOut> {
         let sampler = self.own().sampler;
-        let Self { bundle, gpu, .. } = self;
+        let rank = self.rank();
+        // A sharded plan runs only where the mesh attached its exchange (the rank refuses a plan
+        // it cannot run: never a fallback to the whole head, the ranks' halves would not meet).
+        let shard_exchange: Option<Arc<VocabExchange>> = if plan.vocab_shard {
+            Some(self.exec.vocab.clone().ok_or_else(|| {
+                "a vocabulary-sharded verify on a rank without the shard exchange".to_string()
+            })?)
+        } else {
+            None
+        };
+        // An unchecked async prepare is paid by this verify's readback when no draft round paid
+        // it first (an AR / copy step, or a rank that owns no op of the round).
+        let check = self.exec.prepare;
+        let Self { exec, bundle, gpu } = self;
         let vocab = bundle.lane_vocab();
         let epochs: Vec<RequestEpoch> = plan.lanes.iter().map(|l| l.key.request_epoch).collect();
-        with_store(bundle, |store, bundle| {
+        let out = with_store(bundle, |store, bundle| {
             let StepParts {
                 mut lanes,
                 logits,
@@ -835,6 +1288,11 @@ impl RankLane<'_> {
                     "{n_dec} decode rows exceed the step buffers ({rows_cap})"
                 ));
             }
+            // A vocabulary-sharded verify (`VerifyPlan::vocab_shard`): this rank's head buffers.
+            let shard = match &shard_exchange {
+                Some(exchange) => Some(shard_head(exchange, rank, sampler, n_dec, logits, top1)?),
+                None => None,
+            };
             for (vl, lane) in plan.lanes.iter().zip(lanes.iter_mut()) {
                 if vl.rows.len() > 1 && lane.spec.is_some() {
                     // The sealed rows are the window's proposals (the root's
@@ -852,6 +1310,7 @@ impl RankLane<'_> {
                         state: &mut lane.state,
                         tokens: &v.rows,
                         wide: v.wide,
+                        exact: v.exact,
                         kind: if v.rows.len() == 1 {
                             LaneRowKind::Ar
                         } else {
@@ -861,10 +1320,13 @@ impl RankLane<'_> {
                         },
                     });
                 }
+                let full_logits = logits.sub_offset(0, n_dec * vocab);
+                let full_top1 = top1.sub_offset(0, n_dec * std::mem::size_of::<i32>());
                 let out = LaneOutputs {
-                    logits: &logits.sub_offset(0, n_dec * vocab),
-                    top1: &top1.sub_offset(0, n_dec * std::mem::size_of::<i32>()),
+                    logits: shard.as_ref().map_or(&full_logits, |s| &s.logits),
+                    top1: shard.as_ref().map_or(&full_top1, |s| &s.top1),
                     wide_hidden: hidden,
+                    vocab_shard: shard.as_ref().map(|s| s.view),
                 };
                 forward_lanes(gpu, bundle, &mut rows, &out, &policy).map_err(|e| e.to_string())
             };
@@ -874,18 +1336,27 @@ impl RankLane<'_> {
             }
             forwarded?;
             // The sampled lanes' device draws, enqueued right behind the
-            // forward on its stream (the sampler owner only).
-            let device = if sampler {
-                device_draws(gpu, sample_arena, plan, logits, vocab)?
-            } else {
-                vec![None; plan.lanes.len()]
+            // forward on its stream (the sampler owner only); a vocabulary-
+            // sharded verify instead runs its select / exchange / merge
+            // ([`sharded_tail`]) on every rank.
+            let device = match &shard {
+                Some(s) => sharded_tail(gpu, sample_arena, plan, s, sampler)?,
+                None if sampler => device_draws(gpu, sample_arena, plan, logits, vocab)?,
+                None => vec![None; plan.lanes.len()],
+            };
+            // The top-1 ids the host reads: the lane store's (the whole head's, or the sampler
+            // owner's merged ids), or a shard-local rank's own (evidence only).
+            let top1_src: &GpuTensor = match &shard {
+                Some(s) => &s.top1,
+                None => top1,
             };
             gpu.dtoh_stream_ordered(
                 &mut top1_host[..n_dec * std::mem::size_of::<i32>()],
-                &top1.buf,
+                &top1_src.buf,
             )
-            .map_err(|e| e.to_string())?;
-            gpu.take_device_wait_error().map_err(|e| e.to_string())?;
+            .map_err(|e| check.verify_wait_failure(e))?;
+            gpu.take_device_wait_error()
+                .map_err(|e| check.verify_wait_failure(e))?;
             // The window's forward is retired on this rank: the D2 expert tail (when installed)
             // judges it and rewrites its decode tables before the next window launches.
             if let Some(gather) = bundle
@@ -914,7 +1385,12 @@ impl RankLane<'_> {
                 logits: logits.sub_offset(0, n_dec * vocab),
                 device,
             })
-        })
+        });
+        if out.is_ok() {
+            // The readback completed everything enqueued before it, the prepare included.
+            exec.prepare.paid();
+        }
+        out
     }
 
     /// Repair every lane to the decision ([`prepare_rank_lane`]: a window's
@@ -933,6 +1409,9 @@ impl RankLane<'_> {
             .verify
             .as_ref()
             .ok_or_else(|| "prepare: the verify was never sealed".to_string())?;
+        // A non-sampler rank of a vocabulary-sharded verify holds shard-local picks: its greedy
+        // windows replay the root's decision as a sampled window does.
+        let shard_local_picks = verify.vocab_shard && !exec.session.ownership().sampler;
         let epochs: Vec<RequestEpoch> = verify.lanes.iter().map(|l| l.key.request_epoch).collect();
         let mut head_rows = step.catch_up_rows;
         with_store(bundle, |store, bundle| {
@@ -954,6 +1433,8 @@ impl RankLane<'_> {
                     continue;
                 }
                 let win = &step.lanes[i];
+                // A lane a peer owns repairs target-only here (no head schedule).
+                let local_decision = rank_decision(d, &win.plan);
                 let config = spec_config
                     .ok_or_else(|| "MTP lane in a store without MTP lanes".to_string())?;
                 let hidden =
@@ -964,12 +1445,13 @@ impl RankLane<'_> {
                     &mut **lane,
                     RankPrepare {
                         plan: &win.plan,
-                        decision: d,
+                        decision: &local_decision,
                         verify: &verify.lanes[i],
                         config,
                         hidden,
                         row_begin: win.row_begin,
                         picks: &win.picks,
+                        shard_local_picks,
                         skip_rollback,
                         fill: fill.as_deref_mut(),
                     },
@@ -1108,6 +1590,11 @@ impl LaneMeshExecutor for RankLane<'_> {
             Ok(())
         };
         let failed_preflight = capacity.is_err();
+        // A fault of an unchecked prepare found at the preflight is not a capacity condition: it
+        // is fatal ([`EpFanout::begin`] turns it into the step's abort and the mesh's quarantine).
+        if let Some(reason) = deferred_preflight_fatal(&capacity) {
+            self.exec.fatal = Some(reason);
+        }
         let ready = self.exec.session.begin(start, capacity);
         if !matches!(ready.status, ReadyStatus::Ready { .. }) {
             // Windows opened for lanes before the failing one (or before the
@@ -1117,7 +1604,12 @@ impl LaneMeshExecutor for RankLane<'_> {
             }
             return ready;
         }
-        let lanes: Vec<LaneWin> = start.lanes.iter().map(LaneWin::new).collect();
+        let own = self.own();
+        let lanes: Vec<LaneWin> = start
+            .lanes
+            .iter()
+            .map(|plan| LaneWin::new(plan, &own))
+            .collect();
         let unpriced = !self.exec.stepped
             || lanes
                 .iter()
@@ -1129,6 +1621,7 @@ impl LaneMeshExecutor for RankLane<'_> {
             draft_us: 0.0,
             verify_us: 0.0,
             prepare_us: 0.0,
+            prepare_synced: true,
             draft_tally: GatherTally::default(),
             verify_tally: GatherTally::default(),
             head_calls: 0,
@@ -1157,12 +1650,77 @@ impl LaneMeshExecutor for RankLane<'_> {
 
     fn run_draft_round(&mut self, round: &DraftRound) -> Result<RankDraftResult, RankError> {
         let rank = self.rank();
-        let sampler = self.own().sampler;
+        let own = self.own();
+        let sampler = own.sampler;
         let mut result = self.exec.session.on_draft_round(round)?;
+        // This rank's slice of the round: the catch-ups and ops of the lanes it
+        // heads (every replicated lane's, and its own lanes'). The reducer
+        // validated the whole round and counted the same slice.
+        let exec_round = {
+            let step = self
+                .exec
+                .step
+                .as_ref()
+                .ok_or_else(|| rank_err(rank, "draft round without a begun window"))?;
+            let heads = |key: &LaneWindowKey| {
+                step.lanes
+                    .iter()
+                    .find(|w| w.plan.key == *key)
+                    .is_some_and(|w| heads_lane(&own, &w.plan))
+            };
+            DraftRound {
+                key: round.key.clone(),
+                round: round.round,
+                ops: round
+                    .ops
+                    .iter()
+                    .filter(|op| heads(&op.key))
+                    .copied()
+                    .collect(),
+                catch_up: round
+                    .catch_up
+                    .iter()
+                    .filter(|(key, _)| heads(key))
+                    .cloned()
+                    .collect(),
+                // A sharded round holds replicated ops only (`draft_vocab_shard_decision`), so
+                // the filter keeps every op on both ranks and the halves line up.
+                vocab_shard: round.vocab_shard,
+            }
+        };
+        if exec_round.ops.len() != result.ops_executed {
+            return Err(rank_err(
+                rank,
+                format!(
+                    "the rank's window heads {} ops of the round, the reducer counted {}",
+                    exec_round.ops.len(),
+                    result.ops_executed
+                ),
+            ));
+        }
+        let s4 = {
+            let step = self
+                .exec
+                .step
+                .as_ref()
+                .ok_or_else(|| rank_err(rank, "draft round without a begun window"))?;
+            s4_round_for(
+                &*self.bundle,
+                &round.ops,
+                |key| {
+                    step.lanes
+                        .iter()
+                        .find(|w| w.plan.key == *key)
+                        .map(|w| &w.plan)
+                },
+                rank,
+            )
+            .map_err(|e| rank_err(rank, e))?
+        };
         let before = gather_tally();
         let t0 = Instant::now();
         let (catch_rows, reads) = self
-            .draft_round_device(round, sampler)
+            .draft_round_device(&exec_round, sampler, s4)
             .map_err(|e| rank_err(rank, e))?;
         let tally = gather_tally().since(before);
         if catch_rows != result.catch_up_rows {
@@ -1183,48 +1741,73 @@ impl LaneMeshExecutor for RankLane<'_> {
             head: step.draft_tally.head + tally.head,
             bytes: step.draft_tally.bytes + tally.bytes,
         };
-        step.head_calls += round.ops.len();
+        step.head_calls += exec_round.ops.len();
         step.catch_up_rows += catch_rows;
-        result.head_gathers = tally.head as usize;
-        let mut proposals = Vec::with_capacity(round.ops.len());
-        for (op, read) in round.ops.iter().zip(reads) {
+        // A sharded-MoE pass crosses twice per pass (activation rows, then the
+        // MoE's own slot rows) for an owned op; the reducer's head-gather count
+        // is of replicated ops, of which an owned round has none.
+        result.head_gathers = if s4.is_some() { 0 } else { tally.head as usize };
+        let mut proposals = Vec::with_capacity(exec_round.ops.len());
+        #[cfg(feature = "lab")]
+        let mut traced: Vec<serde_json::Value> = Vec::new();
+        for (op, read) in exec_round.ops.iter().zip(reads) {
             let win = step
                 .lanes
                 .iter_mut()
                 .find(|w| w.plan.key == op.key)
                 .ok_or_else(|| rank_err(rank, "draft op for a lane outside the plan"))?;
-            if read.abandoned {
+            let (keep_going, drop_last) = if read.abandoned {
                 // The probe's head step was abandoned: the root confirms (or
                 // falls back) from this token; no draft step stays.
-                proposals.push(DraftProposal {
-                    key: op.key,
-                    token: read.token,
-                    keep_going: false,
-                    drop_last: false,
-                    read: None,
-                });
+                (false, false)
+            } else {
+                win.local_drafts.push(read.token);
+                // The singleton's early stop, statement for statement: a token
+                // after the first whose prefix acceptance fell below the row worth
+                // is drafted but not kept; deeper drafting stops once even the
+                // best per-draft acceptance cannot make the next row worth it.
+                win.prefix *= draft_accept_estimate(read.margin);
+                let drop_last = read.j > 0 && win.prefix < MTP_ROW_WORTH;
+                let done = win.prefix * DRAFT_ACCEPT_MAX < MTP_ROW_WORTH
+                    || read.j + 1 >= native_keep_cap(&win.plan);
+                (!drop_last && !done, drop_last)
+            };
+            // The ops this rank answers: its own lanes', and the replicated
+            // ones on the sampler owner (every other rank only keeps its own
+            // head state in step).
+            if !answers_op(&win.plan, sampler) {
                 continue;
             }
-            win.local_drafts.push(read.token);
-            // The singleton's early stop, statement for statement: a token
-            // after the first whose prefix acceptance fell below the row worth
-            // is drafted but not kept; deeper drafting stops once even the
-            // best per-draft acceptance cannot make the next row worth it.
-            win.prefix *= draft_accept_estimate(read.margin);
-            let drop_last = read.j > 0 && win.prefix < MTP_ROW_WORTH;
-            let done = win.prefix * DRAFT_ACCEPT_MAX < MTP_ROW_WORTH
-                || read.j + 1 >= native_keep_cap(&win.plan);
+            #[cfg(feature = "lab")]
+            traced.push(serde_json::json!({
+                "step_seq": round.key.step_seq,
+                "round": round.round,
+                "request_tag": op.key.request_epoch.request_tag,
+                "position": op.position,
+                "input": op.input,
+                "token": read.token,
+                "margin_bits": read.margin.to_bits(),
+                "top1_fnv": format!("{:016x}", read.top1_fnv),
+                "keep_going": keep_going,
+                "drop_last": drop_last,
+                "owned": win.plan.head_rank.is_some(),
+                "s4": s4.is_some(),
+            }));
             proposals.push(DraftProposal {
                 key: op.key,
                 token: read.token,
-                keep_going: !drop_last && !done,
+                keep_going,
                 drop_last,
                 // Greedy lanes propose the head's argmax; a sampled lane's
-                // distribution read (S4) is the sampler owner's alone.
+                // distribution read (S4) is the answering rank's alone.
                 read: read.read,
             });
         }
-        if sampler {
+        #[cfg(feature = "lab")]
+        if let Some(dir) = lab_trace::dir() {
+            lab_trace::append(&dir, rank, &traced).map_err(|e| rank_err(rank, e))?;
+        }
+        if !proposals.is_empty() {
             result.proposals = Some(proposals);
         }
         Ok(result)
@@ -1284,6 +1867,7 @@ impl LaneMeshExecutor for RankLane<'_> {
             target_exchanges: tally.trunk as usize,
             microbatches: 0,
             head_draft_calls: plan.ledger.head_draft_calls,
+            head_draft_calls_by_rank: plan.ledger.head_draft_calls_by_rank.clone(),
         };
         if sampler {
             let mut out = SamplerOutput::picks_only(
@@ -1301,6 +1885,13 @@ impl LaneMeshExecutor for RankLane<'_> {
                     .zip(&device)
                     .any(|(w, d)| w.plan.sampling != SamplingMode::Greedy && d.is_none())
             });
+            if host_rows && plan.vocab_shard {
+                // Unreachable by the root's decision; refused rather than run on half a head.
+                return Err(rank_err(
+                    rank,
+                    "a vocabulary-sharded verify left a sampled lane without a device draw",
+                ));
+            }
             if host_rows {
                 out.rows = Some(self.rows_handle(plan, logits));
             }
@@ -1329,7 +1920,15 @@ impl LaneMeshExecutor for RankLane<'_> {
         }
         // Evidence only: the emitted tokens against this rank's own picks.
         let mut mismatches = 0u64;
-        if let Some(step) = self.exec.step.as_ref() {
+        // The emitted-vs-own-picks evidence needs this rank's picks to be target picks: a
+        // non-sampler rank of a vocabulary-sharded verify holds shard-local ids, so it skips it.
+        let sampler = self.own().sampler;
+        if let Some(step) = self
+            .exec
+            .step
+            .as_ref()
+            .filter(|s| sampler || !s.verify.as_ref().is_some_and(|v| v.vocab_shard))
+        {
             for (win, d) in step.lanes.iter().zip(&decision.lanes) {
                 if d.forced {
                     continue;
@@ -1341,19 +1940,31 @@ impl LaneMeshExecutor for RankLane<'_> {
                 }
             }
         }
-        // Every fallible device operation completes (and is attributed) here.
-        self.gpu
-            .hip
-            .device_synchronize()
-            .map_err(|e| rank_err(rank, format!("prepare synchronize: {e}")))?;
-        self.gpu
-            .take_device_wait_error()
-            .map_err(|e| rank_err(rank, format!("prepare: {e}")))?;
+        let async_prepare = self.gpu.flags.qwen4_lane_prepare_async_enabled();
+        if async_prepare {
+            // `HIPFIRE_QWEN4_LANE_PREPARE_ASYNC` (PLAN-cp16 L5 (b)): the phase's launches are
+            // queued on this rank's stream, in the order the next window's launches follow, so
+            // the host does not wait for their completion here. The fault check this wait carries
+            // is owed: paid by the first readback of the next draft round or verify, or settled
+            // before anything that syncs under another label or drops the fault
+            // ([`RankLane::settle_prepare`], [`EpMeshLanes::settle_prepare`]).
+            self.exec.prepare.owe();
+        } else {
+            // Every fallible device operation completes (and is attributed) here.
+            self.gpu
+                .hip
+                .device_synchronize()
+                .map_err(|e| rank_err(rank, format!("prepare synchronize: {e}")))?;
+            self.gpu
+                .take_device_wait_error()
+                .map_err(|e| rank_err(rank, format!("prepare: {e}")))?;
+        }
         self.exec.stats.pick_mismatches += mismatches;
         let Some(step) = self.exec.step.as_mut() else {
             return Err(rank_err(rank, "prepare without a begun window"));
         };
         step.prepare_us = t0.elapsed().as_secs_f64() * 1e6;
+        step.prepare_synced = !async_prepare;
         step.totals = Some((
             decision.lanes.iter().map(|l| l.source.offered).sum(),
             decision.lanes.iter().map(|l| l.source.accepted).sum(),
@@ -1426,7 +2037,7 @@ impl LaneMeshExecutor for RankLane<'_> {
             PhaseTiming {
                 phase: TimedPhase::Prepare,
                 us: step.prepare_us as f32,
-                synchronized: true,
+                synchronized: step.prepare_synced,
             },
         ];
         if step.head_calls > 0 {
@@ -1452,6 +2063,7 @@ impl LaneMeshExecutor for RankLane<'_> {
 
     fn abort_step(&mut self, _key: &MeshStepKey, _phase: StepPhase, reason: &str) {
         self.exec.drop_rows();
+        self.exec.prepare.waive();
         if self.exec.abort_reason.is_none() {
             self.exec.abort_reason = Some(reason.to_string());
         }
@@ -1675,6 +2287,15 @@ fn peer_rank(bundle: &Qwen4Bundle) -> usize {
         .map_or(0, |placement| placement.rank)
 }
 
+/// A peer's lane executor state, built on its first call (holding the mesh's vocabulary-shard
+/// exchange).
+fn peer_exec(mirrors: &mut PeerMirrors, rank: usize) -> &mut RankExec {
+    let vocab = mirrors.vocab.clone();
+    mirrors
+        .mesh_lanes
+        .get_or_insert_with(|| RankExec::new(RankOwnership::ep(rank)).with_vocab(vocab))
+}
+
 impl EpFanout<'_> {
     /// Run `local` (rank 0) and `job` (every peer) concurrently, results in
     /// rank order. The mesh is detached from the bundle for the call so the
@@ -1702,9 +2323,7 @@ impl EpFanout<'_> {
                 },
                 &|peer_bundle, peer_gpu, mirrors| {
                     let rank = peer_rank(peer_bundle);
-                    let exec = mirrors
-                        .mesh_lanes
-                        .get_or_insert_with(|| RankExec::new(RankOwnership::ep(rank)));
+                    let exec = peer_exec(mirrors, rank);
                     job(&mut RankLane {
                         exec,
                         bundle: peer_bundle,
@@ -1764,7 +2383,10 @@ impl MeshFanout for EpFanout<'_> {
     }
 
     fn begin(&mut self, start: &WindowStart) -> Result<Vec<RankReady>, RankError> {
-        self.soft(&|lane| lane.begin_window(start))
+        let all = self.soft(&|lane| (lane.begin_window(start), lane.exec.take_fatal()))?;
+        // A fault of an unchecked prepare found while beginning (`RankLane::begin_window`) is a
+        // mesh failure, not a rank's refusal: the step aborts and the mesh is quarantined.
+        begin_outcome(all)
     }
 
     fn reject(&mut self, key: &MeshStepKey) {
@@ -1825,9 +2447,7 @@ impl MeshFanout for EpFanout<'_> {
             },
             &|peer_bundle, peer_gpu, mirrors| {
                 let rank = peer_rank(peer_bundle);
-                let exec = mirrors
-                    .mesh_lanes
-                    .get_or_insert_with(|| RankExec::new(RankOwnership::ep(rank)));
+                let exec = peer_exec(mirrors, rank);
                 RankLane {
                     exec,
                     bundle: peer_bundle,
@@ -1883,6 +2503,13 @@ pub struct EpMeshLanes {
     last_merged: Option<MergedCostEvidence>,
     steps: u64,
     sampler: Option<LaneSampler>,
+    /// Whether the root's draft-split setting has been decided from every
+    /// rank's head ([`Self::decide_draft_split`]); done once, at the first step.
+    draft_split_decided: bool,
+    /// The key of the last published step when its prepare ran without its end-of-phase device wait
+    /// (`HIPFIRE_QWEN4_LANE_PREPARE_ASYNC`) and no later step has paid the fault check yet
+    /// ([`Self::settle_prepare`]). `None` whenever the flag is off.
+    unchecked: Option<MeshStepKey>,
 }
 
 /// What [`EpMeshLanes::step`] reports besides the output.
@@ -1993,10 +2620,25 @@ impl EpMeshLanes {
             }
             None => false,
         };
+        // The vocabulary-sharded verify (`HIPFIRE_QWEN4_EP_VOCAB_SHARD`): armed when the mesh
+        // attached its exchange and the forward is eager (no replay recording or graph capture:
+        // the exchange is host-ordered and never replayed); the root then seals
+        // `VerifyPlan::vocab_shard` for every step the exchange's buffers hold whose sampled
+        // lanes are all device-drawn.
+        let vocab = bundle
+            .ep_mesh()
+            .and_then(|mesh| mesh.vocab_exchange().cloned());
+        if let Some(exchange) = vocab.as_ref().filter(|_| all_rows.eager) {
+            root = root
+                .with_vocab_shard_rows(exchange.rows())
+                // The MQ2 draft head's shard (`HIPFIRE_QWEN4_EP_DRAFT_VOCAB_SHARD`): the exchange
+                // carries its partial scratch only when that switch is on (0 rows: never sharded).
+                .with_draft_vocab_shard_rows(exchange.draft_rows());
+        }
         Ok(Self {
             copy_armed,
             root,
-            rank0: RankExec::new(RankOwnership::ep(0)),
+            rank0: RankExec::new(RankOwnership::ep(0)).with_vocab(vocab),
             ranks,
             pending: None,
             interval_start: None,
@@ -2004,6 +2646,8 @@ impl EpMeshLanes {
             last_merged: None,
             steps: 0,
             sampler: Some(LaneSampler::new(bundle.lane_vocab())),
+            draft_split_decided: false,
+            unchecked: None,
         })
     }
 
@@ -2049,6 +2693,48 @@ impl EpMeshLanes {
         self.prefill_ran = true;
     }
 
+    /// Decide the X2 draft split once, at the first step: the root may give a
+    /// window's head lanes owners only while `HIPFIRE_QWEN4_EP_DRAFT_SPLIT` is not
+    /// `0` and every rank's MTP head can run lane-local
+    /// ([`Qwen4Bundle::mtp_lane_local_ready`]: rank 0 and every peer, asked
+    /// through the pool). Logs the decision once.
+    fn decide_draft_split(
+        &mut self,
+        bundle: &mut Qwen4Bundle,
+        gpu: &mut Gpu,
+    ) -> Result<(), MeshStepError> {
+        let ready = {
+            let (mut fan, _) = self.fan(bundle, gpu);
+            fan.soft(&|lane| lane.bundle.mtp_lane_local_ready())
+        }
+        .map_err(|e| {
+            MeshStepError::Protocol(ProtocolError::Config(format!(
+                "draft split readiness, rank {}: {}",
+                e.rank, e.reason
+            )))
+        })?;
+        let (want, reason) = if !ep_draft_split_enabled() {
+            (false, "HIPFIRE_QWEN4_EP_DRAFT_SPLIT=0".to_string())
+        } else if let Some(rank) = ready.iter().position(|ready| !ready) {
+            (
+                false,
+                format!("rank {rank}'s MTP head has no lane-local MoE"),
+            )
+        } else {
+            (
+                true,
+                format!("every one of {} ranks is lane-local ready", ready.len()),
+            )
+        };
+        let on = self.root.set_draft_split(want);
+        eprintln!(
+            "qwen4 EP draft split: {} ({reason})",
+            if on { "on" } else { "off" }
+        );
+        self.draft_split_decided = true;
+        Ok(())
+    }
+
     fn fan<'a>(
         &'a mut self,
         bundle: &'a mut Qwen4Bundle,
@@ -2062,6 +2748,30 @@ impl EpMeshLanes {
             },
             &mut self.root,
         )
+    }
+
+    /// Pay the fault check an async prepare owes, on every rank, before work that would sync under
+    /// another label or drop the fault: admission, a prefill tile, the elastic reserve's frees and
+    /// loans. A no-op unless the last published step's prepare is unchecked. The wait and the
+    /// wait-error read are the pair the incumbent `prepare_commit` ends with. A fault here is a
+    /// fault of an already published step's device state: the root and every rank are aborted
+    /// (mesh quarantined, reload to recover, exactly as a failed prepare quarantines it) and the
+    /// error names the prepare, `at` and the rank.
+    pub(crate) fn settle_prepare(
+        &mut self,
+        bundle: &mut Qwen4Bundle,
+        gpu: &mut Gpu,
+        at: &str,
+    ) -> Result<(), String> {
+        let Some(key) = self.unchecked.take() else {
+            return Ok(());
+        };
+        if self.root.quarantined().is_some() {
+            return Ok(());
+        }
+        let (mut fan, root) = self.fan(bundle, gpu);
+        let outcomes = fan.soft(&|lane| lane.settle_prepare());
+        quarantine_unchecked(root, &mut fan, &key, at, outcomes)
     }
 
     /// Admit a lane whose prompt is done to the root and mirror it on every
@@ -2150,10 +2860,16 @@ impl EpMeshLanes {
         self.interval_start = Some(now);
         let prior_priced = prior.as_ref().map(|m| m.priced);
         self.last_merged = prior.clone().or(self.last_merged.take());
+        if !self.draft_split_decided {
+            self.decide_draft_split(bundle, gpu)?;
+        }
         let (mut fan, root) = self.fan(bundle, gpu);
         let driven = drive_step(root, &mut fan, prior.as_ref(), requests, budgets, rule)?;
         self.steps += 1;
         self.pending = Some((driven.key.clone(), driven.receipts));
+        // Every rank paid the previous step's check at its verify; this step's own prepare may
+        // owe one ([`RankExec::prepare`]; the flag is rank-uniform: same arch, same env).
+        self.unchecked = self.rank0.prepare.is_owed().then(|| driven.key.clone());
         Ok(MeshStepReport {
             output: driven.output,
             key: driven.key,
@@ -2222,9 +2938,7 @@ impl EpMeshLanes {
             },
             &|peer_bundle, _, mirrors| {
                 let rank = peer_rank(peer_bundle);
-                let exec = mirrors
-                    .mesh_lanes
-                    .get_or_insert_with(|| RankExec::new(RankOwnership::ep(rank)));
+                let exec = peer_exec(mirrors, rank);
                 exec.session
                     .release(&epoch)
                     .map_err(|e| format!("rank {}: {}", e.rank, e.reason))
@@ -2335,6 +3049,7 @@ fn device_draws(
                 logits: view,
                 rows: vl.rows.len(),
                 vocab,
+                base: 0,
                 drafts: &vl.rows[1..],
                 q: &spec.q,
                 history: &spec.history,
@@ -2363,5 +3078,294 @@ fn device_draws(
     Ok(device)
 }
 
+/// Lab draft trace (`HIPFIRE_LAB_MTP_DRAFT_TRACE=<dir>`): one JSON line per
+/// answered draft op per rank, appended to `<dir>/rank<r>.jsonl`, so the ops of
+/// a split run merge into the incumbent's (`HIPFIRE_QWEN4_EP_DRAFT_SPLIT=0`) rank 0
+/// trace op for op.
+#[cfg(feature = "lab")]
+mod lab_trace {
+    use std::io::Write;
+
+    /// Directory the per-rank trace files are written to.
+    const TRACE_DIR_ENV: &str = "HIPFIRE_LAB_MTP_DRAFT_TRACE";
+
+    pub(super) fn dir() -> Option<String> {
+        hipfire_config::developer_var(TRACE_DIR_ENV)
+            .ok()
+            .filter(|dir| !dir.is_empty())
+    }
+
+    pub(super) fn fnv1a(bytes: &[u8]) -> u64 {
+        let mut hash = 0xcbf29ce484222325u64;
+        for &byte in bytes {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash
+    }
+
+    pub(super) fn append(
+        dir: &str,
+        rank: usize,
+        lines: &[serde_json::Value],
+    ) -> Result<(), String> {
+        if lines.is_empty() {
+            return Ok(());
+        }
+        std::fs::create_dir_all(dir).map_err(|e| format!("draft trace dir {dir}: {e}"))?;
+        let path = std::path::Path::new(dir).join(format!("rank{rank}.jsonl"));
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|e| format!("draft trace {}: {e}", path.display()))?;
+        for line in lines {
+            writeln!(file, "{line}").map_err(|e| format!("draft trace: {e}"))?;
+        }
+        Ok(())
+    }
+}
+
+/// This rank's side of a vocabulary-sharded head round: its partial scratch (a view of the
+/// exchange's), the peer's scratch address and device, and the exchange of one draft call —
+/// publish this rank's event on its stream, meet the peer's host at the barrier, make the stream
+/// wait for the peer's event on the device. `Err` when the rank has no exchange (the mesh did
+/// not attach one, or its draft scratch is off): a sharded round is refused, never run unsharded.
+fn draft_shard(exec: &RankExec) -> R<DraftShard> {
+    let exchange = exec.vocab.clone().ok_or_else(|| {
+        "a vocabulary-sharded head round on a rank without the shard exchange".to_string()
+    })?;
+    let rank = exec.rank;
+    if exchange.draft_rows() == 0 {
+        return Err("a vocabulary-sharded head round without the exchange's draft scratch".into());
+    }
+    let partial = exchange.own_view(rank, SLOT_PARTIAL)?;
+    let peer_partial = exchange.peer_slot(rank, SLOT_PARTIAL)?;
+    let peer_device = exchange
+        .device_of(1 - rank)
+        .ok_or_else(|| "the peer rank registered no device".to_string())?;
+    let gate = exchange.clone();
+    let hip = |e: hip_bridge::HipError| DispatchError::Hip(e.to_string());
+    DraftShard::new(
+        rank,
+        partial,
+        peer_partial,
+        peer_device,
+        Box::new(move |gpu: &mut Gpu| {
+            gate.publish(rank, gpu).map_err(hip)?;
+            gate.barrier().map_err(DispatchError::Hip)?;
+            gate.wait_peer(rank, gpu).map_err(hip)
+        }),
+    )
+    .map_err(|e| format!("{e:?}"))
+}
+
+/// One rank's head buffers of a vocabulary-sharded verify ([`VerifyPlan::vocab_shard`]).
+struct ShardHead<'a> {
+    exchange: &'a VocabExchange,
+    rank: usize,
+    /// The head rows this rank projects and scans.
+    view: VocabShardView,
+    /// Packed `[n_dec][width]` shard logits and `n_dec` shard-local top-1 ids, as the head and
+    /// the argmax write them: the lane store's own buffers on the sampler owner (nobody reads
+    /// its half), the exchange's peer-readable ones on the other rank.
+    logits: GpuTensor,
+    top1: GpuTensor,
+    /// Decode rows of the step.
+    rows: usize,
+}
+
+/// [`ShardHead`] of `rank` for a step of `n_dec` rows; `store_*` are the lane store's step
+/// buffers (the sampler owner's head destination). `Err` when the rank is not one of the two
+/// shard ranks, the sampler owner is not rank 0, or the exchange's buffers cannot hold the rows.
+fn shard_head<'a>(
+    exchange: &'a VocabExchange,
+    rank: usize,
+    sampler: bool,
+    n_dec: usize,
+    store_logits: &GpuTensor,
+    store_top1: &GpuTensor,
+) -> R<ShardHead<'a>> {
+    if rank >= crate::ep_vocab_shard::VOCAB_SHARD_RANKS || sampler != (rank == 0) {
+        return Err(format!(
+            "a vocabulary-sharded verify needs the sampler owner to be rank 0 of two ranks \
+             (rank {rank}, sampler owner: {sampler})"
+        ));
+    }
+    if n_dec == 0 || n_dec > exchange.rows() {
+        return Err(format!(
+            "{n_dec} decode rows do not fit the vocabulary-shard exchange ({} rows)",
+            exchange.rows()
+        ));
+    }
+    let width = exchange.width();
+    let int = std::mem::size_of::<i32>();
+    let (logits, top1) = if sampler {
+        (
+            store_logits.sub_offset(0, n_dec * width),
+            store_top1.sub_offset(0, n_dec * int),
+        )
+    } else {
+        (
+            exchange
+                .own_view(rank, SLOT_LOGITS)?
+                .sub_offset(0, n_dec * width),
+            exchange
+                .own_view(rank, SLOT_TOP1)?
+                .sub_offset(0, n_dec * int),
+        )
+    };
+    Ok(ShardHead {
+        exchange,
+        rank,
+        view: exchange.view(rank),
+        logits,
+        top1,
+        rows: n_dec,
+    })
+}
+
+/// Stage every sampled lane's draw on THIS rank's shard and run the select mode over it: the
+/// jobs' row pointers are views of the rank's packed shard logits, `base` is the shard's first
+/// global id and `vocab` its width, and each row's sorted top-g lands in row `r` of the rank's
+/// candidate table (`r` counts sampled rows in plan order, the same on both ranks). `None` when
+/// no lane is sampled. Returns the staged jobs (for the merged launch and the readback) and the
+/// sampled lanes' plan indices.
+fn shard_select(
+    gpu: &mut Gpu,
+    arena: &mut Option<LaneDrawArena>,
+    plan: &VerifyPlan,
+    shard: &ShardHead<'_>,
+) -> R<Option<(LaneDrawStaged, Vec<usize>)>> {
+    if plan.samples.iter().all(Option::is_none) {
+        return Ok(None);
+    }
+    if plan.samples.len() != plan.lanes.len() {
+        return Err(format!(
+            "{} device-sample entries for {} lanes",
+            plan.samples.len(),
+            plan.lanes.len()
+        ));
+    }
+    let arena = arena.get_or_insert_with(LaneDrawArena::new);
+    let width = shard.view.width;
+    let mut views: Vec<(usize, GpuTensor)> = Vec::new();
+    let mut first = 0usize;
+    for (i, vl) in plan.lanes.iter().enumerate() {
+        if plan.samples[i].is_some() {
+            views.push((
+                i,
+                shard
+                    .logits
+                    .sub_offset(first * width, vl.rows.len() * width),
+            ));
+        }
+        first += vl.rows.len();
+    }
+    let jobs: Vec<LaneDrawJob<'_>> = views
+        .iter()
+        .map(|(i, view)| {
+            let vl = &plan.lanes[*i];
+            let spec = plan.samples[*i].as_ref().expect("view of a sampled lane");
+            LaneDrawJob {
+                logits: view,
+                rows: vl.rows.len(),
+                vocab: width,
+                base: shard.view.base,
+                drafts: &vl.rows[1..],
+                q: &spec.q,
+                history: &spec.history,
+                cfg: &spec.cfg,
+                rng_state: spec.rng_state,
+                eos: spec.eos,
+            }
+        })
+        .collect();
+    let staged = arena
+        .stage(gpu, &jobs)
+        .map_err(|e| format!("vocab-shard lane select: {e}"))?;
+    let cand = shard.exchange.own_view(shard.rank, SLOT_CAND)?;
+    arena
+        .launch_select(gpu, &staged, &cand)
+        .map_err(|e| format!("vocab-shard lane select: {e}"))?;
+    Ok(Some((staged, views.into_iter().map(|(i, _)| i).collect())))
+}
+
+/// What a vocabulary-sharded verify does after the shard head on one rank, in the order the
+/// exchange's module docs prove ([`crate::ep_vocab_shard`]):
+///
+/// 1. Both ranks stage and launch the select mode over their shard for every sampled lane.
+/// 2. A rank other than the sampler owner records its event on its stream, meets the barrier
+///    and is done: its top-1 ids stay shard-local (evidence only) and it returns no draws.
+/// 3. The sampler owner meets the barrier, makes its stream wait on the peer's event on the
+///    device, merges the two shards' per-row argmax into the whole head's picks
+///    (`argmax_f32_pair_merge`, written over its top-1 ids) and, for the sampled lanes, merges
+///    the two candidate tables, runs the verdicts and reads the draws back.
+///
+/// Every rank reaches the barrier exactly once whatever the lanes (an error before it aborts
+/// the mesh, which releases the other rank).
+fn sharded_tail(
+    gpu: &mut Gpu,
+    arena: &mut Option<LaneDrawArena>,
+    plan: &VerifyPlan,
+    shard: &ShardHead<'_>,
+    sampler: bool,
+) -> R<Vec<Option<DevicePick>>> {
+    let exchange = shard.exchange;
+    let rank = shard.rank;
+    let mut device: Vec<Option<DevicePick>> = vec![None; plan.lanes.len()];
+    let selected = shard_select(gpu, arena, plan, shard)?;
+    if !sampler {
+        exchange
+            .publish(rank, gpu)
+            .map_err(|e| format!("vocab-shard publish: {e}"))?;
+        exchange.barrier()?;
+        return Ok(device);
+    }
+    exchange.barrier()?;
+    exchange
+        .wait_peer(rank, gpu)
+        .map_err(|e| format!("vocab-shard peer wait: {e}"))?;
+    let peer = exchange.peer(rank)?;
+    let width = shard.view.width;
+    gpu.argmax_f32_pair_merge(&ArgmaxPairMerge {
+        local_logits: &shard.logits,
+        local_top1: &shard.top1,
+        peer_logits: peer.logits,
+        peer_top1: peer.top1,
+        out_top1: &shard.top1,
+        rows: shard.rows,
+        w0: width,
+        w1: width,
+    })
+    .map_err(|e| format!("vocab-shard argmax merge: {e}"))?;
+    if let Some((staged, lanes)) = selected {
+        let arena = arena
+            .as_mut()
+            .ok_or_else(|| "vocab-shard select left no draw arena".to_string())?;
+        let cand = exchange.own_view(rank, SLOT_CAND)?;
+        arena
+            .launch_merged(gpu, &staged, &cand, peer.cand)
+            .map_err(|e| format!("vocab-shard lane verdict: {e}"))?;
+        let draws = arena
+            .readback(gpu, &staged)
+            .map_err(|e| format!("vocab-shard lane verdict: {e}"))?;
+        if draws.len() != lanes.len() {
+            return Err(format!(
+                "vocab-shard lane verdict returned {} draws for {} lanes",
+                draws.len(),
+                lanes.len()
+            ));
+        }
+        for (i, draw) in lanes.into_iter().zip(draws) {
+            device[i] = Some(DevicePick {
+                tokens: draw.tokens,
+                accepted: draw.accepted,
+                advanced_rng: draw.advanced_rng,
+            });
+        }
+    }
+    Ok(device)
+}
 #[cfg(test)]
 mod tests;

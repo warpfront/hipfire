@@ -398,8 +398,11 @@ pub fn copy_budget(
         LaneSpecBudget::new(lanes, native_k, take_cap, 0, context, owner_mask)?
             // Copy windows (up to `1 + take cap` rows) run in steps of at most
             // `wide_lanes` lanes and every other window is native, so the step
-            // buffers keep the native `k + 1` rows per lane.
-            .with_step_rows_per_lane(native_k + 1)
+            // buffers hold the larger of the native `k + 1` rows per lane and
+            // the widest copy step (`LaneSpecBudget::with_copy_steps`): a store
+            // of fewer lanes than that native step spans still fits its copy
+            // steps.
+            .with_copy_steps(copy.wide_lanes)
             .with_head_lag_rows(copy.head_lag_rows),
     )
 }
@@ -800,6 +803,9 @@ pub(crate) struct RankPrepare<'a> {
     pub row_begin: usize,
     /// The lane's target pick at every verify row.
     pub picks: &'a [u32],
+    /// `picks` are shard-local ids of a vocabulary-sharded head (not target picks): no window
+    /// acceptance may be computed from them, the decision is replayed instead.
+    pub shard_local_picks: bool,
     /// Lab negative control (rejected verify keeps its rows).
     pub skip_rollback: bool,
     /// The store's Append scratch when the lane commit fill is on
@@ -904,11 +910,19 @@ pub(crate) fn prepare_rank_lane(
                 LaneKind::Forced(t) => Some(forced_acceptance(t)),
                 // A sampled window's tokens are the root's draws: the rank
                 // replays the decision (its own argmax picks are evidence only).
-                LaneKind::Decode if p.plan.sampling != SamplingMode::Greedy => Some(GreedyAccept {
-                    committed: d.emitted.clone(),
-                    accepted: d.accepted,
-                    hit_eos: d.hit_eos,
-                }),
+                // A rank whose head ran a vocabulary shard (`HIPFIRE_QWEN4_EP_VOCAB_SHARD`,
+                // a non-sampler rank of a `VerifyPlan::vocab_shard` step) holds shard-local
+                // picks that are no acceptance input at all: a greedy window replays the
+                // root's decision the same way.
+                LaneKind::Decode
+                    if p.plan.sampling != SamplingMode::Greedy || p.shard_local_picks =>
+                {
+                    Some(GreedyAccept {
+                        committed: d.emitted.clone(),
+                        accepted: d.accepted,
+                        hit_eos: d.hit_eos,
+                    })
+                }
                 LaneKind::Decode => None,
             };
             let prepared = prepare_lane_window_with(
@@ -1144,6 +1158,7 @@ mod tests {
             remaining: 100,
             budget: 0,
             head: HeadState::Aligned,
+            head_rank: None,
         }
     }
 
@@ -1552,6 +1567,87 @@ mod tests {
             ..ok
         };
         assert!(copy_budget(2, 1, &none, 8, context, 1).is_err());
+    }
+
+    /// The store's step buffers hold the widest step the root can plan: the
+    /// larger of the native step (`lanes * (k + 1)`) and a full copy step
+    /// (`wide_lanes` lanes of `1 + take cap` rows). Before this a store of
+    /// fewer lanes than the native step covers (2 lanes at the serve's K=5,
+    /// 5 lanes at K=2) sized its buffers for the native step alone and the
+    /// ranks refused the first two-lane copy takeover ("verify rows exceed the
+    /// store's step rows").
+    #[test]
+    fn mesh_rank_copy_step_rows_hold_the_widest_copy_step() {
+        let context = Qwen4ContextCommit::legacy(64);
+        let ngram = hipfire_runtime::ngram_mod::NgramModConfig {
+            n_max: 7,
+            n_min: 1,
+            n_match: 4,
+            ..Default::default()
+        };
+        for wide_lanes in [1usize, 2, 3, usize::MAX] {
+            let copy = LaneCopyConfig {
+                ngram,
+                head_lag_rows: 2,
+                wide_lanes,
+            };
+            for lanes in 1..=8usize {
+                for k in 1..=7usize {
+                    let b = copy_budget(lanes, k, &copy, 8, context, 1).unwrap();
+                    assert_eq!(b.verify_rows_per_lane, 8, "take cap 7 on 8 row-exact rows");
+                    // The rows of the widest step of `n` lanes: a copy step (at
+                    // most `wide_lanes` lanes) of full copy windows, any other
+                    // step native windows.
+                    let widest = (1..=lanes)
+                        .map(|n| {
+                            if n <= wide_lanes {
+                                n * b.verify_rows_per_lane
+                            } else {
+                                n * (k + 1)
+                            }
+                        })
+                        .max()
+                        .unwrap();
+                    assert_eq!(
+                        b.step_rows(),
+                        widest,
+                        "lanes={lanes} k={k} wide_lanes={wide_lanes}"
+                    );
+                }
+            }
+        }
+        // Eight lanes (the serve default) at K=2 and K=5, two copy lanes: the
+        // native step is the larger, so the buffers are the native `k + 1`
+        // rows per lane exactly as before.
+        let copy = LaneCopyConfig {
+            ngram,
+            head_lag_rows: 8,
+            wide_lanes: 2,
+        };
+        for k in [2usize, 5] {
+            let b = copy_budget(8, k, &copy, 8, context, 1).unwrap();
+            assert_eq!(b.step_rows(), 8 * (k + 1), "k={k}");
+        }
+        // The small stores the guard exists for.
+        assert_eq!(
+            copy_budget(2, 5, &copy, 8, context, 1).unwrap().step_rows(),
+            16
+        );
+        assert_eq!(
+            copy_budget(4, 2, &copy, 8, context, 1).unwrap().step_rows(),
+            16
+        );
+        assert_eq!(
+            copy_budget(2, 2, &copy, 8, context, 1).unwrap().step_rows(),
+            16
+        );
+        // No copy lane: the legacy `lanes * (k + 1)`.
+        assert_eq!(
+            LaneSpecBudget::legacy(2, 5, context, 1)
+                .unwrap()
+                .step_rows(),
+            12
+        );
     }
 
     // The device glue cannot be built host-only (`Qwen4Bundle`/`Gpu`); these

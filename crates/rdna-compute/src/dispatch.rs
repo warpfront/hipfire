@@ -447,6 +447,14 @@ pub struct GpuTensor {
     pub dtype: DType,
 }
 
+/// Zero-fills enqueued on the steady copy stream that still await their one wait
+/// (see [`Gpu::memset_batched`]). Plain bookkeeping: it borrows no buffer, so a reset can
+/// keep mutating its owner between enqueues.
+#[derive(Debug, Default)]
+pub struct MemsetBatch {
+    pending: bool,
+}
+
 /// Host-visible QSA depth associated with a checked kernel launch.
 #[derive(Clone, Copy, Debug)]
 pub struct QsaExtentDepth {
@@ -1115,7 +1123,7 @@ impl DType {
             DType::FP8E4M3PT => Some(k),
             DType::HFQ6G256 | DType::MQ6G256 | DType::MQ6G256V2 => grouped(256, 200),
             DType::MQ3G256 => grouped(256, 104),
-            DType::MQ2G256 | DType::MQ2G256Lloyd => grouped(256, 72),
+            DType::MQ2G256 | DType::MQ2G256Lloyd | DType::MQ2G256V2 => grouped(256, 72),
             DType::MQ3G256Lloyd => grouped(256, 112),
             DType::MQ4G256Lloyd => grouped(256, 160),
             // HFQ4-G128 layout, see the variant.
@@ -1745,6 +1753,10 @@ pub struct Gpu {
     /// (HIPFIRE_QWEN4_HC_PAIR_DECODE), allocated and zeroed on first use; the kernel's last
     /// block of a row resets its counter, so it stays zero between launches.
     pub(crate) hc_pair_sync: Option<GpuTensor>,
+    /// Arrival counter of `moe_route_scatter_top10_wide_f32` (HIPFIRE_QWEN4_MOE_GLUE_FOLD b),
+    /// allocated and zeroed on first use; the launch's last workgroup resets it, so it stays zero
+    /// between launches. Eager launches only.
+    pub(crate) moe_route_sync: Option<GpuTensor>,
     /// The routed-expert weights this device reads through the Qwen4 MQ4 MoE
     /// launchers are in the drop-zero planar layout (`DType::MQ4G256V2P` /
     /// `MQ4G128V2P`, DESIGN F1) instead of the shipped qt44/qt53 layout. Set
@@ -2021,6 +2033,14 @@ pub struct Gpu {
     /// n-row verify is bitwise the sequential decode rows; prefill and every
     /// non-verify forward keep it `0`.
     pub wide_verify_rows: usize,
+    /// True while a Flash-Next lane step runs its all-rows segment for a row-exact lane class
+    /// (`HIPFIRE_QWEN4_LANE_ROW_EXACT`, set and restored by hipfire-arch-qwen4's lane step); the
+    /// 9..=64-row arms that are NOT bitwise the <=8-row route (lane WMMA, the trunk A8 projections,
+    /// the MoE int8 gate/up chain, the int8 down) refuse while it is set.
+    pub lane_row_exact_scope: bool,
+    /// Set by the HC read around its SIMT down/up projections so the dense prefill lane WMMA knob
+    /// (`HIPFIRE_QWEN4_PREFILL_LWMMA_DENSE`) never takes the HC mixers (the HC knob owns them).
+    pub prefill_lwmma_dense_hold: bool,
     /// Actual singleton AR arithmetic for an eager verify window. The forward
     /// owner restores this host scope binding after success or error; it never
     /// changes recorder/graph state.
@@ -2044,12 +2064,26 @@ pub struct Gpu {
     /// so the wave's route / shared-expert / grouped-expert kernels are the sub-512 ones every
     /// lane's own singleton takes.
     pub qwen4_route_rows_cap: usize,
+    /// The lanes' rows of the EP prefill wave in flight when a lane of at most 64 rows is in it
+    /// (empty otherwise; set by the Qwen4 wave and cleared on every return path). A BF16
+    /// multirow projection over exactly their total rows is split into per-lane calls
+    /// ([`Gpu::wave_lane_groups`], [`crate::lane_wmma::wave_lane_groups`]): a lane's singleton
+    /// selects the lane WMMA arm on its own real rows, which one call over the wave's rows would
+    /// not.
+    pub qwen4_wave_lane_rows: Vec<usize>,
     /// Routing-row floor of the aggregate symmetric IU4 MoE route for the forward in scope:
     /// [`crate::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS`] (512) unless an expert-parallel PREFILL
     /// forward lowered it (`HIPFIRE_EP_PREFILL_TILE_MIN_ROWS`, set and restored by the Qwen4
     /// forward's tile scopes; the route also never takes a call of at most `few_row_limit`
     /// rows, see [`Gpu::qwen4_moe_sym_iu4_applies`]).
     pub qwen4_moe_sym_iu4_floor: usize,
+    /// `HIPFIRE_QWEN4_PREFILL_LWMMA_WAVE_FLOOR` in scope: the fewest rows of a call that takes the
+    /// prefill lane WMMA entries ([`Gpu::prefill_lwmma_dense_applies`] /
+    /// [`Gpu::prefill_lwmma_hc_applies`]) instead of the 16..=64-row decode-shaped arms
+    /// ([`Gpu::lane_wmma_applies`], the HC8 decode route). `WIDE_VERIFY_MAX_ROWS + 1` (65: no
+    /// call at or below 64 rows moves) unless a Qwen4 PREFILL forward's tile scopes lowered it;
+    /// decode, verify, lane AR steps and the MTP head never do (they have no prefill scope).
+    pub qwen4_prefill_lwmma_floor: usize,
 }
 
 /// Developer kill switch for the pinned landing buffer of [`Gpu::dtoh_stream_ordered`]
@@ -3187,6 +3221,7 @@ impl Gpu {
                 true,
             ),
             hc_pair_sync: None,
+            moe_route_sync: None,
             mq4_experts_planar: false,
             moe32_gu: match hipfire_config::developer_var("HIPFIRE_QWEN4_MOE32_GU").as_deref() {
                 Ok("0") => 0,
@@ -3257,6 +3292,7 @@ impl Gpu {
                 fp16_x_scratch: None,
                 fp16_x_scratch_bytes: 0,
                 lane_wmma_scratch: None,
+                lane_wmma_multi_scratch: None,
                 hc8_bf16: [None, None],
                 qsa_select_scores: None,
                 qsa_select_scores_bytes: 0,
@@ -3289,6 +3325,10 @@ impl Gpu {
                 int8_mmq_x_scratch: None,
                 int8_mmq_x_scratch_bytes: 0,
                 int8_mmq_generation: 0,
+                int8_mmq_down_x_scratch: None,
+                int8_mmq_down_x_scratch_bytes: 0,
+                int8_mmq_down_generation: 0,
+                int8_mmq_down_pending: None,
                 qwen4_moe_group_scratch: None,
                 qwen4_moe_group_scratch_bytes: 0,
                 qwen4_moe_down_i4_scratch: None,
@@ -3388,12 +3428,16 @@ impl Gpu {
             lane_rows_scope: false,
             prefill_invariant_scope: false,
             wide_verify_rows: 0,
+            lane_row_exact_scope: false,
+            prefill_lwmma_dense_hold: false,
             qwen4_verify_reference: None,
             emu,
             qwen4_append_f16_moe_scope: false,
             qwen4_ep_a8_scope: false,
             qwen4_route_rows_cap: 0,
+            qwen4_wave_lane_rows: Vec::new(),
             qwen4_moe_sym_iu4_floor: crate::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS,
+            qwen4_prefill_lwmma_floor: crate::prefill_invariant::WIDE_VERIFY_MAX_ROWS + 1,
         })
         .and_then(|mut gpu| {
             if gpu.flags.force_blob_path {
@@ -5967,6 +6011,26 @@ impl Gpu {
             }
         }
         self.scratch.reserve_int8_mmq(&self.hip, k, n)
+    }
+
+    /// [`Self::reserve_int8_mmq`] for the dedicated flat-slot down sidecar of the gate/up GEMM with the
+    /// rotate128 epilogue (`k % 128 == 0`): same graph-invalidation discipline on growth.
+    pub fn reserve_int8_mmq_down(
+        &mut self,
+        k: usize,
+        n: usize,
+    ) -> HipResult<crate::scratch::Int8MmqReservation> {
+        if k != 0 && n != 0 && k % 128 == 0 {
+            let needed = crate::scratch::int8_mmq_x_needed(k, n);
+            if crate::scratch::scratch_will_grow(
+                self.scratch.int8_mmq_down_x_scratch_bytes,
+                self.scratch.int8_mmq_down_x_scratch.is_some(),
+                needed,
+            ) {
+                self.invalidate_for_scratch_growth();
+            }
+        }
+        self.scratch.reserve_int8_mmq_down(&self.hip, k, n)
     }
 
     pub fn int8_mmq_prepared_ptr(
@@ -9229,6 +9293,52 @@ impl Gpu {
         }
     }
 
+    /// [`Self::memset_stream_ordered`] without the per-call wait: with a steady copy stream
+    /// and `flags.lane_reset_batch` the fill is only enqueued and recorded in `batch`, and
+    /// [`Self::memset_batch_sync`] waits for the whole run once. With no steady stream or with
+    /// the kill switch (`HIPFIRE_LANE_RESET_BATCH=0`) it is exactly the blocking
+    /// [`Self::memset_stream_ordered`]. The caller keeps `buf` alive until the batch is
+    /// synced. A failed enqueue waits for the fills already in flight before returning, so
+    /// no write outlives the error.
+    #[track_caller]
+    pub fn memset_batched(
+        &self,
+        batch: &mut MemsetBatch,
+        buf: &hip_bridge::DeviceBuffer,
+        value: i32,
+        size: usize,
+    ) -> HipResult<()> {
+        if !self.flags.lane_reset_batch {
+            return self.memset_stream_ordered(buf, value, size);
+        }
+        self.bind_thread()?;
+        match self.steady_copy_stream() {
+            Some(stream) => {
+                if let Err(error) = self.hip.memset_async(buf, value, size, stream) {
+                    let _ = self.memset_batch_sync(batch);
+                    return Err(error);
+                }
+                batch.pending = true;
+                Ok(())
+            }
+            None => self.hip.memset(buf, value, size),
+        }
+    }
+
+    /// One wait on the steady copy stream for every fill [`Self::memset_batched`] enqueued
+    /// into `batch` (nothing when none is pending); `batch` is empty afterwards.
+    #[track_caller]
+    pub fn memset_batch_sync(&self, batch: &mut MemsetBatch) -> HipResult<()> {
+        if !std::mem::take(&mut batch.pending) {
+            return Ok(());
+        }
+        self.bind_thread()?;
+        match self.steady_copy_stream() {
+            Some(stream) => self.hip.stream_synchronize(stream),
+            None => Ok(()),
+        }
+    }
+
     /// Read a `DType::Raw` tensor back as raw bytes — no widening and no dtype
     /// reinterpretation, so a caller can compare code blobs bit-for-bit.
     ///
@@ -9799,6 +9909,88 @@ impl Gpu {
         // and report.
         let _ = self.release_qsa_gather_workspace();
         self.drain_dflash_gdn_replay_scratch();
+    }
+
+    /// Whether any lazily built weight shadow is resident: an F16 shadow cache entry
+    /// (owning or an S1 arena view), an allocated S1 arena root (or one quarantined by a
+    /// failed release), or a shared-expert INT8 shadow. A decode-share borrow's shadows
+    /// live in the caller's region and never count. Pure host read.
+    pub fn long_prefill_caches_resident(&self) -> bool {
+        // bind_thread: skip — pure host metadata read.
+        !self.fp16_shadow_cache.is_empty()
+            || !self.shared_i8_shadows.is_empty()
+            || self.f16_shadow_arena.live_roots() > 0
+            || self.f16_shadow_arena.quarantined_roots() > 0
+    }
+
+    /// Give back the weight shadows a >= 512-row prefill builds lazily: the F16 shadow
+    /// cache (owning entries to the pool, S1 arena views dropped and their roots
+    /// released) and the shared-expert INT8 shadows, then drain the pool. Every reader
+    /// resolves its shadow through its `ensure_*` path on each call (no shadow pointer is
+    /// kept across calls, and the replay recorder and graph capture never reach a shadow
+    /// route), so the next >= 512-row GEMM re-creates the shadow with the same conversion
+    /// kernel, into the same planned span (S1 arena) or a fresh pooled buffer:
+    /// byte-identical. The S1 arena plan and its source bindings are kept (only the roots
+    /// are released). Weights, the QSA gather workspace, the MQ screen cache, scratch
+    /// slots and kernel modules are untouched.
+    ///
+    /// Refuses (`Err`, nothing freed) while a decode-share `shadow_borrow` is installed
+    /// (its shadows live in a region this `Gpu` does not own), while the replay recorder
+    /// or graph capture is active, or when a borrowed cache entry has no arena behind it.
+    /// The device is synchronized first so no queued kernel can still read a freed shadow.
+    /// Returns the device bytes released: S1 arena roots plus every pooled byte drained
+    /// (the freed owning shadows included).
+    pub fn release_long_prefill_caches(&mut self) -> HipResult<u64> {
+        let err = |msg: &str| HipError::new(0, &format!("release_long_prefill_caches: {msg}"));
+        if self.shadow_borrow.is_some() {
+            return Err(err(
+                "a decode-share shadow borrow is installed (its shadows are not owned here)",
+            ));
+        }
+        if self.replay.is_recording() || self.graphs.capture_mode {
+            return Err(err("replay recording or graph capture is active"));
+        }
+        if !self.f16_shadow_arena.is_active()
+            && self.fp16_shadow_cache.values().any(|t| t.buf.is_borrowed())
+        {
+            return Err(err("a borrowed F16 shadow view has no arena behind it"));
+        }
+        self.bind_thread()?;
+        self.hip.device_synchronize()?;
+
+        let arena_bytes: usize = self
+            .f16_shadow_arena
+            .root_capacities(DeviceBuffer::size)
+            .into_iter()
+            .flatten()
+            .sum();
+        let binding = self
+            .f16_shadow_arena
+            .plan()
+            .cloned()
+            .map(|plan| (plan, self.f16_shadow_arena.source_ptrs().to_vec()));
+
+        // Views are non-owning (dropped); owning shadows go to the pool.
+        let cached: Vec<GpuTensor> = self.fp16_shadow_cache.drain().map(|(_, t)| t).collect();
+        for t in cached.into_iter().filter(|t| !t.buf.is_borrowed()) {
+            if let Err(e) = self.free_tensor(t) {
+                eprintln!("[rdna-compute] release_long_prefill_caches: {e}");
+            }
+        }
+        // The cache holds no view now; release the roots, then restore the plan binding
+        // so the next shadow build exact-allocates its root again.
+        self.clear_f16_shadow_arena()
+            .map_err(|e| err(&e.to_string()))?;
+        if let Some((plan, source_ptrs)) = binding {
+            self.f16_shadow_arena
+                .bind(plan, &source_ptrs)
+                .map_err(|e| err(&format!("re-binding the F16 shadow arena: {e}")))?;
+        }
+        self.drain_shared_i8_shadows();
+
+        let pooled = self.pool.pooled_bytes();
+        self.drain_pool();
+        Ok((arena_bytes + pooled) as u64)
     }
 
     /// Invalidate the pointer-keyed F16 conversion cache. Must be called

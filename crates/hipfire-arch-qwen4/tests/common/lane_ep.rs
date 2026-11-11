@@ -16,6 +16,7 @@
 //! |---|---|---|
 //! | `lane_ar` | AR lanes (no spec), sampled | lane executor AR rows; each row's token drawn from the lane's own RNG (device launch or host sampler, see below) |
 //! | `lane_batched` / `lane_adaptive` | native-MTP lanes, every lane MTP (`spec_lanes: None`), no copy lane | `Qwen4Bundle::ep_mesh_decode_step` (Leviathan acceptance against each draft's q) |
+//! | `lane_copy` | the same lanes with the copy lane the serve stages by default (`ep::ep_default_copy_config`, `stage_lanes_with_copy`); at most `lane_suite::EP2_COPY_LANES` lanes | the same mesh step: pool-hit windows are copy takeovers verified against the point-mass draft distribution; run on the primed copied-span fixture (`HIPFIRE_SAMPLED_MTP_PROMPT=copy`), its coverage needs copy windows from the counters |
 //! | `lane_cross` | native-MTP lanes as above, `HIPFIRE_EP_MTP_LANE_MAX_ACTIVE=3` (the shipped `lane_switch::DEFAULT_MAX_ACTIVE`, pinned) | the same mesh step under the native<->AR switch at 3; 8 lanes only, staggered admission |
 //!
 //! # Draw route
@@ -91,9 +92,16 @@ const EP_DEGREE: usize = 2;
 pub(super) enum ArmKind {
     /// Target-only AR lanes (the reference).
     Ar,
-    /// Native-MTP mesh lanes (no copy lane: it is off by default on EP serve)
-    /// with the fixed-count pin: native windows at every lane count.
+    /// Native-MTP mesh lanes (no copy lane staged: the store the serve builds
+    /// with `HIPFIRE_EP_MTP_LANE_COPY=0`) with the fixed-count pin: native
+    /// windows at every lane count.
     Mtp,
+    /// Native-MTP mesh lanes with the copy lane the serve stages by default
+    /// (`ep::ep_default_copy_config`, steps of at most `COPY_WIDE_LANES`
+    /// lanes), driven by the same mesh step: pool-hit windows are copy
+    /// takeovers verified against the point-mass draft distribution. At most
+    /// `lane_suite::EP2_COPY_LANES` lanes.
+    Copy,
     /// Native-MTP mesh lanes under the product step switch
     /// (`lane_suite::CROSS_MAX_ACTIVE`) with staggered admission.
     Cross,
@@ -105,25 +113,34 @@ impl ArmKind {
             "lane_ar" => Ok(Self::Ar),
             "lane_batched" | "lane_adaptive" => Ok(Self::Mtp),
             "lane_cross" => Ok(Self::Cross),
-            "lane_copy" => Err(
-                "lane_copy has no ep2 executor: the copy lane is off by default on EP serve and no ep2 cohort covers it"
-                    .to_string(),
-            ),
+            "lane_copy" => Ok(Self::Copy),
             other => Err(format!("{other} is not a lane arm")),
         }
     }
 
     fn mesh(self) -> bool {
-        matches!(self, Self::Mtp | Self::Cross)
+        matches!(self, Self::Mtp | Self::Copy | Self::Cross)
     }
 }
 
 /// The lane store's slot count: the serve never stages fewer than two lanes
 /// (`BatchLoadRequest::lanes`), so a one-request arm still runs on a two-slot
-/// store.
-pub(super) fn store_lanes(lanes: usize) -> usize {
-    lanes.max(2)
+/// store. The copy arm runs on the serve's eight-lane store
+/// ([`COPY_STORE_LANES`]): the copy lane keeps the native `k + 1` step rows per
+/// lane (`mesh_rank_copy::copy_budget`) and a step of `COPY_WIDE_LANES` copy
+/// windows verifies up to `1 + take cap` rows each, so a store of fewer than
+/// six lanes (`k` = 2) rejects such a step on the ranks ("verify rows exceed
+/// the store's step rows"); the serve's default concurrency (8) never does.
+pub(super) fn store_lanes(kind: ArmKind, lanes: usize) -> usize {
+    match kind {
+        ArmKind::Copy => COPY_STORE_LANES.max(lanes),
+        _ => lanes.max(2),
+    }
 }
+
+/// Slots of the copy arm's lane store: the serve's default `serve.continuous_batch_size`
+/// (the shipped C8 lane count, `lane_suite::CROSS_LANES`).
+pub(super) const COPY_STORE_LANES: usize = lane_suite::CROSS_LANES;
 
 /// Host-only environment check of an EP2 lane arm. `max_active` is
 /// `HIPFIRE_EP_MTP_LANE_MAX_ACTIVE` as the runtime resolves it.
@@ -131,6 +148,9 @@ pub(super) fn store_lanes(lanes: usize) -> usize {
 /// * Fixed-count native arms (`Mtp`): at least the lane count; below it the
 ///   mesh step would switch to AR windows and the arm would not run the native
 ///   windows its name claims.
+/// * The copy arm (`Copy`): the fixed-count rule, and at most
+///   `lane_suite::EP2_COPY_LANES` lanes (the copy lane takes windows only in
+///   steps of at most that many lanes).
 /// * The crossing arm: exactly 8 lanes and exactly `lane_suite::CROSS_MAX_ACTIVE`
 ///   (pinned explicitly): any other value changes which steps run native.
 pub(super) fn check_ep_env(
@@ -147,7 +167,13 @@ pub(super) fn check_ep_env(
     }
     match kind {
         ArmKind::Ar => {}
-        ArmKind::Mtp => {
+        ArmKind::Mtp | ArmKind::Copy => {
+            if kind == ArmKind::Copy && lanes > lane_suite::EP2_COPY_LANES {
+                return Err(format!(
+                    "lane_copy runs at most {} lanes (the serve's copy lane takes windows only in steps of at most that many); the process has {lanes}",
+                    lane_suite::EP2_COPY_LANES
+                ));
+            }
             if max_active < lanes {
                 return Err(format!(
                     "HIPFIRE_EP_MTP_LANE_MAX_ACTIVE={max_active} is below the {lanes} lanes: the mesh step would run AR windows instead of native ones; pin it to at least {lanes}"
@@ -813,7 +839,9 @@ fn load_ep(
         continuous_batch_size: store_lanes,
         row_budget: store_lanes,
         spec_k: kind.mesh().then_some(spec_k),
-        spec_copy: false,
+        // The reservation the serve makes for the copy lane it stages by
+        // default; the other arms stage none, so reserve none.
+        spec_copy: kind == ArmKind::Copy,
     };
     let warning = legacy_warning(admission.kv_backend, admission.kv_backend_reason.as_deref());
     let loaded = hipfire_loader::load_admitted_with_gemma4_drafter(
@@ -846,7 +874,7 @@ fn load_ep(
 impl EpLanes {
     fn load(model: &Path, arm: &str, lanes: usize, lane_k: usize) -> Result<Self, String> {
         let kind = ArmKind::of(arm)?;
-        let store_lanes = store_lanes(lanes);
+        let store_lanes = store_lanes(kind, lanes);
         // The daemon's host-memory residency preamble (pinned experts stay out
         // of reclaim); before the device initialises.
         if let Some(devices) = hipfire_config::devices::startup_devices() {
@@ -897,7 +925,7 @@ impl EpLanes {
     /// Stage the lane store (once per process) and, for the MTP arms, arm the
     /// mesh lane transaction; mark the store sampled.
     fn stage(&mut self, spec_k: usize) -> Result<(), String> {
-        let (kind, store_lanes) = (self.kind, self.store_lanes);
+        let (kind, store_lanes, lanes) = (self.kind, self.store_lanes, self.lanes);
         self.gpu.bind_thread().map_err(|e| e.to_string())?;
         let Self { model, gpu, .. } = self;
         let bundle = model
@@ -914,9 +942,25 @@ impl EpLanes {
             end_of_turn: None,
             spec_lanes: None,
         });
+        // The copy arm stages exactly what the serve stages by default; a
+        // policy that resolves to no copy lane (or fewer wide lanes than the
+        // arm runs) is an error, never a silent copy-off arm.
+        let copy = if kind == ArmKind::Copy {
+            let copy = hipfire_arch_qwen4::ep::ep_default_copy_config(gpu.arch.as_str())
+                .ok_or("lane_copy: the default EP copy lane resolves to off (HIPFIRE_EP_MTP_LANE_COPY, HIPFIRE_MTP_NGRAM_COPY or HIPFIRE_QWEN4_LANE_COPY_LANES=0)")?;
+            if copy.wide_lanes < lanes {
+                return Err(format!(
+                    "lane_copy: {} lanes but only {} copy-wide lanes (HIPFIRE_QWEN4_LANE_COPY_LANES)",
+                    lanes, copy.wide_lanes
+                ));
+            }
+            Some(copy)
+        } else {
+            None
+        };
         let before = gpu.device_mem_info().map(|(free, _)| free).unwrap_or(0);
         bundle
-            .stage_lanes(gpu, store_lanes, store_lanes, spec)
+            .stage_lanes_with_copy(gpu, store_lanes, store_lanes, spec, copy)
             .map_err(|e| e.to_string())?;
         let after = gpu.device_mem_info().map(|(free, _)| free).unwrap_or(0);
         eprintln!(
@@ -1359,13 +1403,23 @@ pub(super) fn run_ep_arm(
     if ids_path.exists() {
         check_config(&ids_path, &config)?;
     }
-    let prompt = render_prompt(
+    let rendered = render_prompt(
         &run.tokenizer,
         &run.template,
         &settings.fixture.text(),
         false,
     )?;
-    settings.fixture.check_prompt(prompt.len(), &settings.pen)?;
+    // The copy fixture primes the assistant turn so the copy pool proposes on
+    // the first window (its CPU pool check is in `lane_copy_prompt`); every arm
+    // of the cohort, the AR reference included, runs the same prompt.
+    let prompt = if settings.fixture == Fixture::Copy {
+        lane_copy_prompt(&run.tokenizer, rendered)?
+    } else {
+        settings
+            .fixture
+            .check_prompt(rendered.len(), &settings.pen)?;
+        rendered
+    };
     let env = own_env(&lane_run::LANE_CONTROL_ENV);
     println!(
         "ARM {arm} arch={} lane_draw_route={route} prompt_tokens={} trials {}..{} lanes={lanes} temp={} top_p={} top_k={:?} min_p={} fixture={} state={} route_class={}",
@@ -1545,17 +1599,40 @@ mod tests {
         assert_eq!(ArmKind::of("lane_adaptive"), Ok(ArmKind::Mtp));
         assert_eq!(ArmKind::of("lane_cross"), Ok(ArmKind::Cross));
         assert!(ArmKind::Cross.mesh() && ArmKind::Mtp.mesh() && !ArmKind::Ar.mesh());
-        assert!(ArmKind::of("lane_copy")
-            .unwrap_err()
-            .contains("no ep2 executor"));
+        assert_eq!(ArmKind::of("lane_copy"), Ok(ArmKind::Copy));
+        assert!(ArmKind::Copy.mesh());
+        for arm in lane_suite::EP2_COPY_ARMS {
+            assert!(ArmKind::of(arm).is_ok(), "{arm}");
+        }
+        // The cohort's lane bound is the serve's copy-lane step cap.
+        assert_eq!(
+            lane_suite::EP2_COPY_LANES,
+            hipfire_arch_qwen4::ep::COPY_WIDE_LANES
+        );
         assert!(ArmKind::of("ar").is_err());
         assert!(ArmKind::of("lane_interleaved").is_err());
     }
 
     #[test]
+    fn the_copy_arm_runs_at_the_serves_copy_step_cap_or_fewer_lanes() {
+        for lanes in 1..=lane_suite::EP2_COPY_LANES {
+            assert!(check_ep_env(ArmKind::Copy, lanes, 8, 2).is_ok(), "{lanes}");
+        }
+        let wide = check_ep_env(ArmKind::Copy, lane_suite::EP2_COPY_LANES + 1, 8, 2).unwrap_err();
+        assert!(wide.contains("lane_copy"), "{wide}");
+        assert!(check_ep_env(ArmKind::Copy, 2, 1, 2).is_err());
+        assert!(check_ep_env(ArmKind::Copy, 2, 8, 1).is_err());
+        assert!(check_lane_k(ArmKind::Copy, 3, 2).is_err());
+        assert!(check_lane_k(ArmKind::Copy, 2, 2).is_ok());
+    }
+
+    #[test]
     fn a_one_request_arm_still_runs_on_a_two_slot_store() {
-        assert_eq!(store_lanes(1), 2);
-        assert_eq!(store_lanes(8), 8);
+        assert_eq!(store_lanes(ArmKind::Mtp, 1), 2);
+        assert_eq!(store_lanes(ArmKind::Mtp, 8), 8);
+        // The copy arm's store holds the serve's eight lanes at any lane count.
+        assert_eq!(store_lanes(ArmKind::Copy, 1), 8);
+        assert_eq!(store_lanes(ArmKind::Copy, 2), 8);
     }
 
     #[test]
@@ -1599,7 +1676,7 @@ mod tests {
             // The fixed-count pin is the largest lane count: native windows at every N.
             assert!(check_ep_env(ArmKind::Mtp, lanes, 8, 2).is_ok(), "{lanes}");
             // A store is never smaller than the serve's two-lane minimum.
-            assert_eq!(store_lanes(lanes), lanes.max(2));
+            assert_eq!(store_lanes(ArmKind::Mtp, lanes), lanes.max(2));
             // Native windows need at least as many active slots as lanes.
             let below = check_ep_env(ArmKind::Mtp, lanes, lanes - 1, 2);
             assert!(below.is_err(), "{lanes}");

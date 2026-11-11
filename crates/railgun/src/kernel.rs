@@ -117,6 +117,10 @@ pub enum ArgRole {
     /// A1: a resolved access base. `classes` is empty when the kernel never
     /// dereferences it.
     Pointer {
+        /// Mnemonics of the non-commutative atomics (`MemClass::Atomic`)
+        /// issued through it (the receipt's `atomic_ops`, sorted); empty
+        /// without one.
+        atomic_ops: Vec<String>,
         classes: Vec<MemClass>,
         read_cache: ReadCache,
     },
@@ -124,6 +128,10 @@ pub enum ArgRole {
     Integer,
     NotLoaded,
 }
+
+/// The `Lowering::Graph` reason of a node with a non-commutative atomic and
+/// no commutativity certificate.
+pub const ATOMIC_UNCERTIFIED: &str = "atomic without a commutativity certificate";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArgFact {
@@ -240,6 +248,72 @@ pub struct ArenaPointerLoad {
     /// Sorted, deduplicated; empty when the pointer is loaded and never
     /// dereferenced.
     pub classes: Vec<MemClass>,
+    /// A1 proved every access through this pointer is control-dependent on a
+    /// test of the same record field against zero (the receipt's
+    /// `null_guarded`): the field may be a declared null
+    /// ([`crate::BindingRecord::nulls`]).
+    pub null_guarded: bool,
+    /// Mnemonics of the non-commutative atomics issued through this pointer
+    /// (the receipt's `atomic_ops`, sorted); empty without one.
+    pub atomic_ops: Vec<String>,
+}
+
+/// Writes through the pointer at `record_offset` by two workgroups `w != w'`
+/// are disjoint whenever they differ on some axis in `axes` (a mask: bit 0 x,
+/// bit 1 y, bit 2 z; never zero).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WgFootprint {
+    pub record_offset: u32,
+    pub axes: u8,
+    /// Work-items per tile on x the proof assumes (0: none).
+    pub block_x: u32,
+    /// Exclusive per-axis tile-id bounds (`None`: unbounded); the host
+    /// requires the virtual grid extents `gx, gy, gz` within them.
+    pub bounds: [Option<u64>; 3],
+    /// Record dwords the proof used; every one must hold of the record's
+    /// declared scalar.
+    pub requires: Vec<WgRequire>,
+}
+
+/// One record-dword relation a footprint's proof assumed (receipt
+/// `WgRequirementRecord`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WgRequire {
+    pub offset: u32,
+    pub op: railgun_corpus::receipt::RequireOp,
+    pub mask: u32,
+    pub value: u32,
+}
+
+impl WgRequire {
+    /// `(offset & mask) == value`.
+    pub fn mask_eq(offset: u32, mask: u32, value: u32) -> Self {
+        Self {
+            offset,
+            op: railgun_corpus::receipt::RequireOp::MaskEq,
+            mask,
+            value,
+        }
+    }
+
+    /// Whether the record scalar `d` satisfies the relation for a task whose
+    /// virtual grid extents are `grid`.
+    pub fn holds(&self, d: u32, grid: [u32; 3]) -> bool {
+        self.op.holds(d, self.mask, self.value, grid)
+    }
+}
+
+impl WgFootprint {
+    /// A footprint over the axis mask with no assumptions.
+    pub fn plain(record_offset: u32, axes: u8) -> Self {
+        Self {
+            record_offset,
+            axes,
+            block_x: 0,
+            bounds: [None; 3],
+            requires: Vec::new(),
+        }
+    }
 }
 
 /// One record template of a descriptor arena: the pointer fields a kernel
@@ -249,6 +323,22 @@ pub struct ArenaPointerLoad {
 pub struct ArenaTemplate {
     pub template: u32,
     pub pointer_loads: Vec<ArenaPointerLoad>,
+    /// The sealed pointer tables the body reads through (receipt
+    /// `ArenaTemplateRecord::sealed_tables`). `table_arg_offset` is the
+    /// record offset of the table pointer field; a [`TableBound::Kernarg`]
+    /// bound is the record offset of a declared `u32` scalar
+    /// ([`crate::BindingRecord::scalars`]). Discharged by
+    /// [`KernelProgram::bind_records`] for every record of the template.
+    pub sealed: Vec<SealedTableFact>,
+    /// Certified per-workgroup write footprints (receipt
+    /// `ArenaTemplateRecord::wg_footprints`).
+    pub wg_footprints: Vec<WgFootprint>,
+    /// Hidden grid arguments the body loads, `(record offset, kind)` (receipt
+    /// `ArenaTemplateRecord::hidden_grid`; `kind` is `block_count_x|y|z`,
+    /// `group_size_*`, `remainder_*`, `grid_dims`). `prove` requires every
+    /// record of the template to declare each offset as a railgun scalar and
+    /// every task header grid to equal the record's `block_count_*`.
+    pub hidden_grid: Vec<(u32, String)>,
 }
 
 /// One descriptor arena of a `Conditional` kernel (receipt
@@ -277,6 +367,9 @@ pub struct ConditionalFacts {
     /// Descriptor arenas (the `descriptor_arena` case): discharged by
     /// [`KernelProgram::bind_records`], not by a window witness.
     pub arenas: Vec<ArenaFact>,
+    /// The dispatcher protocol the task-graph certificate proved (see
+    /// [`crate::task_graph`]); only with `arenas`.
+    pub task_protocol: Option<crate::task_graph::TaskProtocolFact>,
     pub witnesses: Vec<String>,
     pub case_digest: String,
 }
@@ -418,56 +511,7 @@ fn conditional_from_record(record: &KernelRecord) -> Result<ConditionalFacts, St
                 t.table_arg_offset
             ));
         }
-        let bound = match t.bound_kind.as_str() {
-            railgun_corpus::receipt::SEALED_BOUND_KERNARG => {
-                let at = u32::try_from(t.bound_value)
-                    .ok()
-                    .filter(|at| at.checked_add(4).is_some_and(|end| end <= record.kernarg_size))
-                    .ok_or_else(|| {
-                        format!(
-                            "{sym}: sealed table bound +{} lies outside the {}-byte kernarg segment",
-                            t.bound_value, record.kernarg_size
-                        )
-                    })?;
-                TableBound::Kernarg(at)
-            }
-            railgun_corpus::receipt::SEALED_BOUND_CONST => TableBound::Const(
-                u32::try_from(t.bound_value)
-                    .map_err(|_| format!("{sym}: sealed table constant bound exceeds u32"))?,
-            ),
-            other => return Err(format!("{sym}: unknown sealed table bound kind {other:?}")),
-        };
-        let mut entries = Vec::with_capacity(t.entries.len());
-        for e in &t.entries {
-            entries.push(TableEntryLoad {
-                pc: e.pc,
-                class: MemClass::parse(&e.class).map_err(|m| format!("{sym}: {m}"))?,
-                path: e.path.clone(),
-                cache: e.cache.clone(),
-                width: e.width,
-                index_expr: e.index_expr.clone(),
-                guard_pcs: e.guard_pcs.clone(),
-            });
-        }
-        let mut accesses = Vec::with_capacity(t.accesses.len());
-        for a in &t.accesses {
-            accesses.push(TableAccess {
-                pc: a.pc,
-                class: MemClass::parse(&a.class).map_err(|m| format!("{sym}: {m}"))?,
-                path: a.path.clone(),
-                cache: a.cache.clone(),
-                width: a.width,
-                entry_pcs: a.entry_pcs.clone(),
-            });
-        }
-        tables.push(SealedTableFact {
-            table_arg_offset: t.table_arg_offset,
-            bound,
-            entry_bytes: t.entry_bytes,
-            entries,
-            accesses,
-            null_guarded: t.null_guarded,
-        });
+        tables.push(sealed_fact(sym, t, Some(record.kernarg_size))?);
     }
     let mut indexed = Vec::with_capacity(record.indexed_effects.len());
     for e in &record.indexed_effects {
@@ -516,6 +560,11 @@ fn conditional_from_record(record: &KernelRecord) -> Result<ConditionalFacts, St
         }
         let mut templates = Vec::with_capacity(a.templates.len());
         for t in &a.templates {
+            let sealed = t
+                .sealed_tables
+                .iter()
+                .map(|s| sealed_fact(sym, s, None))
+                .collect::<Result<Vec<_>, _>>()?;
             let mut pointer_loads = Vec::with_capacity(t.pointer_loads.len());
             for p in &t.pointer_loads {
                 let mut classes = p
@@ -528,17 +577,85 @@ fn conditional_from_record(record: &KernelRecord) -> Result<ConditionalFacts, St
                 pointer_loads.push(ArenaPointerLoad {
                     record_offset: p.record_offset,
                     classes,
+                    null_guarded: p.null_guarded,
+                    atomic_ops: p.atomic_ops.clone(),
                 });
             }
             templates.push(ArenaTemplate {
                 template: t.template,
                 pointer_loads,
+                sealed,
+                wg_footprints: t
+                    .wg_footprints
+                    .iter()
+                    .map(|f| {
+                        let mut axes = 0u8;
+                        for a in &f.axes {
+                            axes |= match a.as_str() {
+                                "x" => 1,
+                                "y" => 2,
+                                "z" => 4,
+                                other => {
+                                    return Err(format!("{sym}: unknown workgroup axis {other:?}"))
+                                }
+                            };
+                        }
+                        if axes == 0 {
+                            return Err(format!("{sym}: workgroup footprint has no axes"));
+                        }
+                        let mut bounds = [None; 3];
+                        for b in &f.bounds {
+                            let i = match b.axis.as_str() {
+                                "x" => 0,
+                                "y" => 1,
+                                "z" => 2,
+                                other => {
+                                    return Err(format!("{sym}: unknown workgroup axis {other:?}"))
+                                }
+                            };
+                            if b.bound == 0 || bounds[i].replace(b.bound).is_some() {
+                                return Err(format!("{sym}: bad workgroup bound on {}", b.axis));
+                            }
+                        }
+                        Ok(WgFootprint {
+                            record_offset: f.record_offset,
+                            axes,
+                            block_x: f.block_x,
+                            bounds,
+                            requires: f
+                                .requires
+                                .iter()
+                                .map(|r| WgRequire {
+                                    offset: r.offset,
+                                    op: r.op,
+                                    mask: r.mask,
+                                    value: r.value,
+                                })
+                                .collect(),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()?,
+                hidden_grid: t
+                    .hidden_grid
+                    .iter()
+                    .map(|h| (h.record_offset, h.kind.clone()))
+                    .collect(),
             });
         }
         arenas.push(ArenaFact {
             arena_arg_offset: a.arena_arg_offset,
             templates,
         });
+    }
+    let task_protocol = record
+        .task_protocol
+        .as_ref()
+        .map(|p| crate::task_graph::TaskProtocolFact::from_record(p, &record.args, sym))
+        .transpose()?;
+    if task_protocol.is_some() && arenas.is_empty() {
+        return Err(format!(
+            "{sym}: a task protocol needs the descriptor arena its tasks' records live in"
+        ));
     }
     Ok(ConditionalFacts {
         guards: record
@@ -554,8 +671,72 @@ fn conditional_from_record(record: &KernelRecord) -> Result<ConditionalFacts, St
         indexed,
         tables,
         arenas,
+        task_protocol,
         witnesses: record.required_witnesses.clone(),
         case_digest: record.case_digest.clone(),
+    })
+}
+
+/// A receipt sealed table as a fact. `kernarg_size` bounds a kernarg-bound
+/// offset (a standalone record's own segment); an arena template's bound is a
+/// record offset, checked against the records when they are bound.
+fn sealed_fact(
+    sym: &str,
+    t: &railgun_corpus::receipt::SealedTableRecord,
+    kernarg_size: Option<u32>,
+) -> Result<SealedTableFact, String> {
+    let bound = match t.bound_kind.as_str() {
+        railgun_corpus::receipt::SEALED_BOUND_KERNARG => {
+            let at = u32::try_from(t.bound_value)
+                .ok()
+                .filter(|at| {
+                    at.checked_add(4)
+                        .is_some_and(|end| kernarg_size.is_none_or(|size| end <= size))
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "{sym}: sealed table bound +{} lies outside the {:?}-byte kernarg segment",
+                        t.bound_value, kernarg_size
+                    )
+                })?;
+            TableBound::Kernarg(at)
+        }
+        railgun_corpus::receipt::SEALED_BOUND_CONST => TableBound::Const(
+            u32::try_from(t.bound_value)
+                .map_err(|_| format!("{sym}: sealed table constant bound exceeds u32"))?,
+        ),
+        other => return Err(format!("{sym}: unknown sealed table bound kind {other:?}")),
+    };
+    let mut entries = Vec::with_capacity(t.entries.len());
+    for e in &t.entries {
+        entries.push(TableEntryLoad {
+            pc: e.pc,
+            class: MemClass::parse(&e.class).map_err(|m| format!("{sym}: {m}"))?,
+            path: e.path.clone(),
+            cache: e.cache.clone(),
+            width: e.width,
+            index_expr: e.index_expr.clone(),
+            guard_pcs: e.guard_pcs.clone(),
+        });
+    }
+    let mut accesses = Vec::with_capacity(t.accesses.len());
+    for a in &t.accesses {
+        accesses.push(TableAccess {
+            pc: a.pc,
+            class: MemClass::parse(&a.class).map_err(|m| format!("{sym}: {m}"))?,
+            path: a.path.clone(),
+            cache: a.cache.clone(),
+            width: a.width,
+            entry_pcs: a.entry_pcs.clone(),
+        });
+    }
+    Ok(SealedTableFact {
+        table_arg_offset: t.table_arg_offset,
+        bound,
+        entry_bytes: t.entry_bytes,
+        entries,
+        accesses,
+        null_guarded: t.null_guarded,
     })
 }
 
@@ -598,6 +779,7 @@ impl KernelFacts {
                     ArgRole::Pointer {
                         classes,
                         read_cache: ReadCache::parse(&arg.read_cache)?,
+                        atomic_ops: arg.atomic_ops.clone(),
                     }
                 }
                 "integer" => ArgRole::Integer,
@@ -1103,6 +1285,10 @@ pub struct KernelNode {
     /// [`KernelProgram::kernarg_image`]; every other hidden byte is zero.
     pub hidden: Vec<HiddenArg>,
     pub effects: Vec<RegionEffect>,
+    /// The mnemonics of the non-commutative atomics each explicit pointer
+    /// argument issues, `(argument offset, sorted mnemonics)` (empty when the
+    /// receipt records none): what a lab-pending admission names.
+    pub atomic_ops: Vec<(u32, Vec<String>)>,
     pub read_cache: ReadCache,
     pub lowering: Lowering,
     /// The guarded case of a `Conditional` kernel (a copy of the receipt's
@@ -1156,15 +1342,82 @@ pub(crate) const ARENA_UNBOUND: &str = "descriptor_arena records not bound";
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArenaNode {
     pub arenas: Vec<ArenaFact>,
+    /// The proven dispatcher protocol of a persistent pool kernel; the node
+    /// is only admitted to a group together with a task-graph proof
+    /// ([`crate::task_graph::TaskGraph::check`]).
+    pub task_protocol: Option<crate::task_graph::TaskProtocolFact>,
     /// Parallel to `arenas`: the arena's records were bound and the
     /// resulting effects added to the node.
     pub bound: Vec<bool>,
+    /// The sealed tables `bind_records` discharged for the records of the
+    /// arena templates (empty until bound, and for a template whose records
+    /// all carry a zero bound). A node with any needs the `sealed_table`
+    /// witness of a window bind ([`KernelNode::needs_sealed_table_witness`]).
+    pub sealed: Vec<ArenaSealedBinding>,
+    /// The null-guarded pointer loads `bind_records` admitted at declared
+    /// null record fields: the evidence that no access goes through them
+    /// without a nonzero test (sorted, deduplicated).
+    pub null_guarded: Vec<ArenaNullLoad>,
+    /// The receipt's required witness kinds (digest-bound).
+    pub witnesses: Vec<String>,
     pub case_digest: String,
 }
 
 impl ArenaNode {
     pub fn all_bound(&self) -> bool {
         self.bound.iter().all(|b| *b)
+    }
+}
+
+/// A pointer load at a declared null field ([`crate::BindingRecord::nulls`])
+/// that `bind_records` admitted with no effect because the template's facts
+/// prove it `null_guarded`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ArenaNullLoad {
+    /// Index into [`ArenaNode::arenas`].
+    pub arena: usize,
+    pub template: u32,
+    pub record_offset: u32,
+}
+
+/// One sealed pointer table of an arena template, as
+/// [`KernelProgram::bind_records`] discharged it: the table resource the
+/// records' table field names, the sealed identity the registry held for it
+/// and the program resources its entries' pointees are. The window bind
+/// re-verifies the identity against the live allocation, generation and
+/// content ([`crate::sealed_table::SealedTableRegistry::bind_sealed_table`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArenaSealedBinding {
+    /// Index into [`ArenaNode::arenas`].
+    pub arena: usize,
+    pub template: u32,
+    /// Record offset of the table pointer field.
+    pub table_arg_offset: u32,
+    /// The program resource the table field names (interior 0).
+    pub resource: ResourceId,
+    /// The largest nonzero declared bound over the records naming `resource`
+    /// (each is `<= entries`).
+    pub bound: u32,
+    pub null_guarded: bool,
+    /// The sealed table's identity at bind time.
+    pub allocation: Binding,
+    pub entries: u32,
+    pub generation: u64,
+    pub content_sha256: [u8; 32],
+    /// Program resources equal to a pointee allocation of the sealed table
+    /// (a pointee that is no program resource is read by no node's effects
+    /// and cannot be written by any program node).
+    pub pointees: Vec<ResourceId>,
+    /// The read classes the certified body applies through an entry.
+    pub accesses: Vec<MemClass>,
+}
+
+impl KernelNode {
+    /// The node carries sealed tables a window must discharge with a
+    /// [`crate::sealed_table::SealedTableWitness`]: its own `table` case, or
+    /// tables of its bound arena templates.
+    pub fn needs_sealed_table_witness(&self) -> bool {
+        self.table.is_some() || self.arena.as_ref().is_some_and(|a| !a.sealed.is_empty())
     }
 }
 
@@ -1296,6 +1549,7 @@ pub fn author(arch: &str, launches: &[LaunchRecord]) -> KernelProgram {
         let mut effects = Vec::new();
         let mut cursor = 0usize;
         let mut non_commutative_atomic = false;
+        let mut atomic_ops: Vec<(u32, Vec<String>)> = Vec::new();
         for arg in &f.args {
             let (start, end) = (arg.offset as usize, (arg.offset + arg.size) as usize);
             if start > cursor {
@@ -1326,7 +1580,12 @@ pub fn author(arch: &str, launches: &[LaunchRecord]) -> KernelProgram {
                 }
                 continue;
             }
-            let ArgRole::Pointer { classes, .. } = &arg.role else {
+            let ArgRole::Pointer {
+                classes,
+                atomic_ops: arg_ops,
+                ..
+            } = &arg.role
+            else {
                 args.push((arg.offset, Arg::Const(bytes.to_vec())));
                 continue;
             };
@@ -1427,6 +1686,9 @@ pub fn author(arch: &str, launches: &[LaunchRecord]) -> KernelProgram {
             ));
             if !classes.is_empty() {
                 non_commutative_atomic |= classes.contains(&MemClass::Atomic);
+                if classes.contains(&MemClass::Atomic) {
+                    atomic_ops.push((arg.offset, arg_ops.clone()));
+                }
                 effects.push(RegionEffect {
                     arg_offset: arg.offset,
                     resource,
@@ -1510,7 +1772,7 @@ pub fn author(arch: &str, launches: &[LaunchRecord]) -> KernelProgram {
             }
         } else if non_commutative_atomic {
             Lowering::Graph {
-                reason: "atomic without a commutativity certificate".to_owned(),
+                reason: ATOMIC_UNCERTIFIED.to_owned(),
             }
         } else {
             Lowering::Pm4
@@ -1535,6 +1797,7 @@ pub fn author(arch: &str, launches: &[LaunchRecord]) -> KernelProgram {
             args,
             hidden: f.hidden.clone(),
             effects,
+            atomic_ops,
             read_cache: f.read_cache,
             lowering,
             indexed: conditional
@@ -1558,7 +1821,11 @@ pub fn author(arch: &str, launches: &[LaunchRecord]) -> KernelProgram {
                 .filter(|c| !c.arenas.is_empty())
                 .map(|c| ArenaNode {
                     arenas: c.arenas.clone(),
+                    task_protocol: c.task_protocol.clone(),
                     bound: vec![false; c.arenas.len()],
+                    sealed: Vec::new(),
+                    null_guarded: Vec::new(),
+                    witnesses: c.witnesses.clone(),
                     case_digest: c.case_digest.clone(),
                 }),
             guard,
@@ -1670,6 +1937,7 @@ fn uncertified_node(launch: &LaunchRecord, reason: String) -> KernelNode {
         args: vec![(0, Arg::Const(launch.kernarg.clone()))],
         hidden: Vec::new(),
         effects: Vec::new(),
+        atomic_ops: Vec::new(),
         read_cache: ReadCache::Unknown,
         lowering: Lowering::HipDirect { reason },
         indexed: None,
@@ -1963,7 +2231,7 @@ impl KernelProgram {
         self.nodes
             .iter()
             .enumerate()
-            .filter(|(_, n)| n.table.is_some())
+            .filter(|(_, n)| n.needs_sealed_table_witness())
             .map(|(i, _)| i)
             .collect()
     }
@@ -1979,15 +2247,17 @@ impl KernelProgram {
     pub fn assume_witnesses(&self, kinds: &[&str]) -> KernelProgram {
         let mut p = self.clone();
         for n in &mut p.nodes {
-            if (n.indexed.is_none() && n.table.is_none())
+            if (n.indexed.is_none() && n.table.is_none() && !n.needs_sealed_table_witness())
                 || !matches!(n.lowering, Lowering::Conditional { .. })
             {
                 continue;
             }
             // A descriptor arena is discharged by `bind_records` alone; no
-            // window witness stands in for it.
+            // window witness stands in for it. The sealed tables its records
+            // carry are the `sealed_table` kind.
             let covered = (n.indexed.is_none() || kinds.contains(&WITNESS_INDEXED_BIND))
-                && (n.table.is_none() || kinds.contains(&WITNESS_SEALED_TABLE))
+                && ((n.table.is_none() && !n.needs_sealed_table_witness())
+                    || kinds.contains(&WITNESS_SEALED_TABLE))
                 && n.arena.as_ref().is_none_or(ArenaNode::all_bound);
             if covered {
                 n.lowering = Lowering::Pm4;
@@ -2056,6 +2326,7 @@ pub(crate) mod tests {
             role: ArgRole::Pointer {
                 classes: classes.to_vec(),
                 read_cache: ReadCache::VmemOnly,
+                atomic_ops: Vec::new(),
             },
         }
     }

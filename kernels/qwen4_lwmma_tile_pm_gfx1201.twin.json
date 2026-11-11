@@ -1,0 +1,993 @@
+{
+  "anchor": {
+    "bytes": 232168,
+    "file": "qwen4_lwmma_tile_hipcc_gfx1201.co",
+    "sha256": "aac57cde433f4e8d9fb2be78d65d1a35b4119e3aff5bfbbf543eea9b8c37c747"
+  },
+  "arch": "gfx1201",
+  "compiler": {
+    "flags": [
+      "--genco",
+      "--offload-arch=gfx1201",
+      "-O3",
+      "--no-offload-compress",
+      "-fuse-cuid=none",
+      "-mcode-object-version=6"
+    ],
+    "invocation": "hipcc <flags> -o <anchor.co> kernels/src/qwen4_lwmma_tile.gfx1201.hip",
+    "version": [
+      "HIP version: 7.16.26385-0000000",
+      "AMD clang version 24.0.0git (https://github.com/ROCm/llvm-project.git d6f6cb691863e9258034ab48c1dfce21689d5606)",
+      "Target: x86_64-unknown-linux-gnu",
+      "Thread model: posix"
+    ]
+  },
+  "hxaco": {
+    "bytes": 232168,
+    "file": "qwen4_lwmma_tile_pm_gfx1201.hxaco",
+    "sha256": "6160b53cb59c46e8a90ac068cdaf75d2c3bb2daddef085e02cbbfc37923ca309"
+  },
+  "module": "qwen4_lwmma_tile_pm_gfx1201",
+  "seal": {
+    "reports": [
+      {
+        "abi": {
+          "args": [
+            {
+              "name": "",
+              "offset": 0,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 8,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 16,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 24,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 28,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 32,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 36,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 40,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 44,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            }
+          ],
+          "compared_to_incumbent": false,
+          "kernarg_segment_size": 48
+        },
+        "arch": "gfx1201",
+        "elf_bytes": 228072,
+        "elf_sha256": "cabbcdc60def8995550c0cddbe70ae85e0aa0f5ccea6c2ba2efdded73b089dd0",
+        "hazards": {
+          "advisory": 0,
+          "blocking": 0,
+          "checked": true,
+          "findings": 0,
+          "pm_ir_obligations": 0
+        },
+        "hxaco_bytes": 232168,
+        "hxaco_sha256": "6160b53cb59c46e8a90ac068cdaf75d2c3bb2daddef085e02cbbfc37923ca309",
+        "kernel": "lwmma_tile_bf16_t1_b32x32w2x1g4",
+        "lds": 53248,
+        "lift_identity": "emit::checked ok; emitted bytes == input ELF",
+        "rsrc2": 388,
+        "scratch": 0,
+        "sgprs": 31,
+        "text_bytes": 14732,
+        "text_sha256": "58d2351cb14653471a933fe872de938d191db88af13f4d50ab14720ed866ba43",
+        "user_sgprs": 2,
+        "vgprs": 248,
+        "wavefront_size": 32
+      },
+      {
+        "abi": {
+          "args": [
+            {
+              "name": "",
+              "offset": 0,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 8,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 16,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 24,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 28,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 32,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 36,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 40,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 44,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            }
+          ],
+          "compared_to_incumbent": false,
+          "kernarg_segment_size": 48
+        },
+        "arch": "gfx1201",
+        "elf_bytes": 228072,
+        "elf_sha256": "cabbcdc60def8995550c0cddbe70ae85e0aa0f5ccea6c2ba2efdded73b089dd0",
+        "hazards": {
+          "advisory": 0,
+          "blocking": 0,
+          "checked": true,
+          "findings": 0,
+          "pm_ir_obligations": 0
+        },
+        "hxaco_bytes": 232168,
+        "hxaco_sha256": "6160b53cb59c46e8a90ac068cdaf75d2c3bb2daddef085e02cbbfc37923ca309",
+        "kernel": "lwmma_tile_bf16_t1_b32x64w2x2",
+        "lds": 15360,
+        "lift_identity": "emit::checked ok; emitted bytes == input ELF",
+        "rsrc2": 388,
+        "scratch": 0,
+        "sgprs": 24,
+        "text_bytes": 14088,
+        "text_sha256": "05e71d24daf914f0ccd5f9cd782d2cfed800916769b564b9ae3ee4f7a9037238",
+        "user_sgprs": 2,
+        "vgprs": 176,
+        "wavefront_size": 32
+      },
+      {
+        "abi": {
+          "args": [
+            {
+              "name": "",
+              "offset": 0,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 8,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 16,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 24,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 28,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 32,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 36,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 40,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 44,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            }
+          ],
+          "compared_to_incumbent": false,
+          "kernarg_segment_size": 48
+        },
+        "arch": "gfx1201",
+        "elf_bytes": 228072,
+        "elf_sha256": "cabbcdc60def8995550c0cddbe70ae85e0aa0f5ccea6c2ba2efdded73b089dd0",
+        "hazards": {
+          "advisory": 0,
+          "blocking": 0,
+          "checked": true,
+          "findings": 0,
+          "pm_ir_obligations": 0
+        },
+        "hxaco_bytes": 232168,
+        "hxaco_sha256": "6160b53cb59c46e8a90ac068cdaf75d2c3bb2daddef085e02cbbfc37923ca309",
+        "kernel": "lwmma_tile_bf16_t1_b64x64w4x1",
+        "lds": 20480,
+        "lift_identity": "emit::checked ok; emitted bytes == input ELF",
+        "rsrc2": 388,
+        "scratch": 0,
+        "sgprs": 24,
+        "text_bytes": 27072,
+        "text_sha256": "3458b0be11c862fc58c111f9f537bae7a03cf8de0514a53ba637ef6913744377",
+        "user_sgprs": 2,
+        "vgprs": 232,
+        "wavefront_size": 32
+      },
+      {
+        "abi": {
+          "args": [
+            {
+              "name": "",
+              "offset": 0,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 8,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 16,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 24,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 28,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 32,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 36,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 40,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 44,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            }
+          ],
+          "compared_to_incumbent": false,
+          "kernarg_segment_size": 48
+        },
+        "arch": "gfx1201",
+        "elf_bytes": 228072,
+        "elf_sha256": "cabbcdc60def8995550c0cddbe70ae85e0aa0f5ccea6c2ba2efdded73b089dd0",
+        "hazards": {
+          "advisory": 0,
+          "blocking": 0,
+          "checked": true,
+          "findings": 0,
+          "pm_ir_obligations": 0
+        },
+        "hxaco_bytes": 232168,
+        "hxaco_sha256": "6160b53cb59c46e8a90ac068cdaf75d2c3bb2daddef085e02cbbfc37923ca309",
+        "kernel": "lwmma_tile_bf16_t2_b16x32w1x1g4",
+        "lds": 47104,
+        "lift_identity": "emit::checked ok; emitted bytes == input ELF",
+        "rsrc2": 388,
+        "scratch": 0,
+        "sgprs": 31,
+        "text_bytes": 16020,
+        "text_sha256": "9724fd2975ce9a3bc06246d6bc93b77cd360c5e8b5dc2620e75264da3cd430f9",
+        "user_sgprs": 2,
+        "vgprs": 248,
+        "wavefront_size": 32
+      },
+      {
+        "abi": {
+          "args": [
+            {
+              "name": "",
+              "offset": 0,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 8,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 16,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 24,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 28,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 32,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 36,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 40,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 44,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            }
+          ],
+          "compared_to_incumbent": false,
+          "kernarg_segment_size": 48
+        },
+        "arch": "gfx1201",
+        "elf_bytes": 228072,
+        "elf_sha256": "cabbcdc60def8995550c0cddbe70ae85e0aa0f5ccea6c2ba2efdded73b089dd0",
+        "hazards": {
+          "advisory": 0,
+          "blocking": 0,
+          "checked": true,
+          "findings": 0,
+          "pm_ir_obligations": 0
+        },
+        "hxaco_bytes": 232168,
+        "hxaco_sha256": "6160b53cb59c46e8a90ac068cdaf75d2c3bb2daddef085e02cbbfc37923ca309",
+        "kernel": "lwmma_tile_bf16_t2_b32x64w2x2",
+        "lds": 20480,
+        "lift_identity": "emit::checked ok; emitted bytes == input ELF",
+        "rsrc2": 388,
+        "scratch": 0,
+        "sgprs": 24,
+        "text_bytes": 14752,
+        "text_sha256": "b8210b9183e5860830ba4ff1503ddc32f798d919c83374d53380b2af4c2a3e22",
+        "user_sgprs": 2,
+        "vgprs": 224,
+        "wavefront_size": 32
+      },
+      {
+        "abi": {
+          "args": [
+            {
+              "name": "",
+              "offset": 0,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 8,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 16,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 24,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 28,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 32,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 36,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 40,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 44,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            }
+          ],
+          "compared_to_incumbent": false,
+          "kernarg_segment_size": 48
+        },
+        "arch": "gfx1201",
+        "elf_bytes": 228072,
+        "elf_sha256": "cabbcdc60def8995550c0cddbe70ae85e0aa0f5ccea6c2ba2efdded73b089dd0",
+        "hazards": {
+          "advisory": 0,
+          "blocking": 0,
+          "checked": true,
+          "findings": 0,
+          "pm_ir_obligations": 0
+        },
+        "hxaco_bytes": 232168,
+        "hxaco_sha256": "6160b53cb59c46e8a90ac068cdaf75d2c3bb2daddef085e02cbbfc37923ca309",
+        "kernel": "lwmma_tile_bf16_t2_b64x64w4x1",
+        "lds": 30720,
+        "lift_identity": "emit::checked ok; emitted bytes == input ELF",
+        "rsrc2": 388,
+        "scratch": 0,
+        "sgprs": 24,
+        "text_bytes": 28380,
+        "text_sha256": "907aafed0a8a3d394c30260bf698809fb58923cad2f070d6421c3b4d14a303c7",
+        "user_sgprs": 2,
+        "vgprs": 248,
+        "wavefront_size": 32
+      },
+      {
+        "abi": {
+          "args": [
+            {
+              "name": "",
+              "offset": 0,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 8,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 16,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 24,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 28,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 32,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 36,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 40,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 44,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            }
+          ],
+          "compared_to_incumbent": false,
+          "kernarg_segment_size": 48
+        },
+        "arch": "gfx1201",
+        "elf_bytes": 228072,
+        "elf_sha256": "cabbcdc60def8995550c0cddbe70ae85e0aa0f5ccea6c2ba2efdded73b089dd0",
+        "hazards": {
+          "advisory": 0,
+          "blocking": 0,
+          "checked": true,
+          "findings": 0,
+          "pm_ir_obligations": 0
+        },
+        "hxaco_bytes": 232168,
+        "hxaco_sha256": "6160b53cb59c46e8a90ac068cdaf75d2c3bb2daddef085e02cbbfc37923ca309",
+        "kernel": "lwmma_tile_bf16_t2_b64x64w4x2",
+        "lds": 30720,
+        "lift_identity": "emit::checked ok; emitted bytes == input ELF",
+        "rsrc2": 388,
+        "scratch": 0,
+        "sgprs": 24,
+        "text_bytes": 14496,
+        "text_sha256": "8934e3fd08b15b5924d585b7b2a0c0d86352f8a5a207be641dfdc36607d83e60",
+        "user_sgprs": 2,
+        "vgprs": 176,
+        "wavefront_size": 32
+      },
+      {
+        "abi": {
+          "args": [
+            {
+              "name": "",
+              "offset": 0,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 8,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 16,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 24,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 28,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 32,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 36,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 40,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 44,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            }
+          ],
+          "compared_to_incumbent": false,
+          "kernarg_segment_size": 48
+        },
+        "arch": "gfx1201",
+        "elf_bytes": 228072,
+        "elf_sha256": "cabbcdc60def8995550c0cddbe70ae85e0aa0f5ccea6c2ba2efdded73b089dd0",
+        "hazards": {
+          "advisory": 0,
+          "blocking": 0,
+          "checked": true,
+          "findings": 0,
+          "pm_ir_obligations": 0
+        },
+        "hxaco_bytes": 232168,
+        "hxaco_sha256": "6160b53cb59c46e8a90ac068cdaf75d2c3bb2daddef085e02cbbfc37923ca309",
+        "kernel": "lwmma_tile_bf16_t2_b32x128w2x2",
+        "lds": 30720,
+        "lift_identity": "emit::checked ok; emitted bytes == input ELF",
+        "rsrc2": 388,
+        "scratch": 0,
+        "sgprs": 24,
+        "text_bytes": 27468,
+        "text_sha256": "b36c964ffa26c326a1e0cb1df0b26544bf241f616bfb0194fb1c3bd9166d0c16",
+        "user_sgprs": 2,
+        "vgprs": 248,
+        "wavefront_size": 32
+      },
+      {
+        "abi": {
+          "args": [
+            {
+              "name": "",
+              "offset": 0,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 8,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 16,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 24,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 28,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 32,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 36,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 40,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 44,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            }
+          ],
+          "compared_to_incumbent": false,
+          "kernarg_segment_size": 48
+        },
+        "arch": "gfx1201",
+        "elf_bytes": 228072,
+        "elf_sha256": "cabbcdc60def8995550c0cddbe70ae85e0aa0f5ccea6c2ba2efdded73b089dd0",
+        "hazards": {
+          "advisory": 0,
+          "blocking": 0,
+          "checked": true,
+          "findings": 0,
+          "pm_ir_obligations": 0
+        },
+        "hxaco_bytes": 232168,
+        "hxaco_sha256": "6160b53cb59c46e8a90ac068cdaf75d2c3bb2daddef085e02cbbfc37923ca309",
+        "kernel": "lwmma_tile_bf16_t2_b64x128w4x2",
+        "lds": 40960,
+        "lift_identity": "emit::checked ok; emitted bytes == input ELF",
+        "rsrc2": 388,
+        "scratch": 0,
+        "sgprs": 24,
+        "text_bytes": 27220,
+        "text_sha256": "3447ed57a70f4a3872df87ff1bf8abac771b2f62e7891c9857812e96c5203478",
+        "user_sgprs": 2,
+        "vgprs": 224,
+        "wavefront_size": 32
+      },
+      {
+        "abi": {
+          "args": [
+            {
+              "name": "",
+              "offset": 0,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 8,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 16,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 24,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 28,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 32,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 36,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 40,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 44,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            }
+          ],
+          "compared_to_incumbent": false,
+          "kernarg_segment_size": 48
+        },
+        "arch": "gfx1201",
+        "elf_bytes": 228072,
+        "elf_sha256": "cabbcdc60def8995550c0cddbe70ae85e0aa0f5ccea6c2ba2efdded73b089dd0",
+        "hazards": {
+          "advisory": 0,
+          "blocking": 0,
+          "checked": true,
+          "findings": 0,
+          "pm_ir_obligations": 0
+        },
+        "hxaco_bytes": 232168,
+        "hxaco_sha256": "6160b53cb59c46e8a90ac068cdaf75d2c3bb2daddef085e02cbbfc37923ca309",
+        "kernel": "lwmma_tile_bf16_t2_b64x128w2x4",
+        "lds": 40960,
+        "lift_identity": "emit::checked ok; emitted bytes == input ELF",
+        "rsrc2": 388,
+        "scratch": 0,
+        "sgprs": 24,
+        "text_bytes": 26940,
+        "text_sha256": "79d2336fb048b33aee2d4255115f2f2f4525d4e480b37dd9bdb3146c3cf2806d",
+        "user_sgprs": 2,
+        "vgprs": 224,
+        "wavefront_size": 32
+      }
+    ],
+    "tool": "peacemaker-isa example hip_twin (Route A: lift, emit::checked, bundle)"
+  },
+  "source": {
+    "bytes": 15806,
+    "path": "kernels/src/qwen4_lwmma_tile.gfx1201.hip",
+    "sha256": "7b454af51f1dd06812d946d083e53bab94c4347e317db7888ddbfadbc87a88c6"
+  },
+  "symbols": [
+    "lwmma_tile_bf16_t1_b32x32w2x1g4",
+    "lwmma_tile_bf16_t1_b32x64w2x2",
+    "lwmma_tile_bf16_t1_b64x64w4x1",
+    "lwmma_tile_bf16_t2_b16x32w1x1g4",
+    "lwmma_tile_bf16_t2_b32x64w2x2",
+    "lwmma_tile_bf16_t2_b64x64w4x1",
+    "lwmma_tile_bf16_t2_b64x64w4x2",
+    "lwmma_tile_bf16_t2_b32x128w2x2",
+    "lwmma_tile_bf16_t2_b64x128w4x2",
+    "lwmma_tile_bf16_t2_b64x128w2x4"
+  ]
+}

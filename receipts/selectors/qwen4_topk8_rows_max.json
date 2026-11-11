@@ -1,0 +1,24 @@
+{
+  "schema": "pm.selector_receipt.v1",
+  "constant": "TOPK8_ROWS_MAX",
+  "value": 8,
+  "row_key": "rows",
+  "covers": true,
+  "arch": "gfx1201",
+  "card": "R9700; fabric j8698 bench, j8707 oracle, j8718 served profile",
+  "summary": "8 is the largest consecutive run formed by the served C8 draft path, not an extrapolated crossover. n=248320 per-row vs batched GPU us per round (200 interleaved reps): rows 2 49.28 vs 32.04; 3 64.96 vs 38.80; 4 85.00 vs 42.08; 8 164.52 vs 62.36. n=100276 also wins at rows 2/3/4/8. Oracle PASS 1154 cells, 0 mismatches, controls 18/18. The cap keeps each row independent; larger runs are partitioned into at-most-eight-row pairs. Served profiled code C8 wall about -1.0 ms and launches about -29 per step; story C8 wall about +0.52 ms. The supplied profile summary reports zero topk8 in its in-loop family regex, so it is contextual evidence, not a family-specific timing or universal served-speedup claim.",
+  "records": [
+    {
+      "path": "receipts/selectors/evidence/qwen4_topk8_rows_bench.txt",
+      "sha256": "27264116498308f9c4363bd3428888fa67cbcc659ac5814125c7b2b17834f180"
+    },
+    {
+      "path": "receipts/selectors/evidence/qwen4_topk8_rows_oracle.txt",
+      "sha256": "b6a25cde30b642d9897d1742d280964e87fd89cd023a9f6d698be5f636c52081"
+    },
+    {
+      "path": "receipts/selectors/evidence/qwen4_topk8_rows_prof.txt",
+      "sha256": "c108f0e7ed30c6f12c6425779a21f8485795757751909062a2567a66df037497"
+    }
+  ]
+}

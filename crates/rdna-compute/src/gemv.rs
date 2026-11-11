@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 use crate::dispatch::{DType, Gpu, GpuTensor, FP8_GEMV_MIN_M};
 use crate::kernels;
-use crate::lane_wmma::LaneWmmaWeight;
+use crate::lane_wmma::{LaneWmmaMultiPart, LaneWmmaWeight};
 use crate::prefill_invariant::{few_row_groups, FEW_ROW_ROUTE_ROWS, WIDE_VERIFY_MAX_ROWS};
 use hip_bridge::HipResult;
 use std::ffi::c_void;
@@ -14,6 +14,15 @@ use std::sync::LazyLock;
 /// SIMT all-rows kernels from 16 rows; <= 8-row decode/verify keeps the bitwise SIMT path.
 // selector-receipt: receipts/selectors/qwen4_lane_wmma_min_rows.json
 pub const LANE_WMMA_MIN_ROWS: usize = 16;
+
+/// Groups (partial blocks) of the draft-head top-8 reduction: `topk8_partial_f32` always
+/// runs 128 blocks of `ceil(n / 128)` layout rows, whichever launches produce them.
+pub const TOPK8_GROUPS: usize = 128;
+/// Most rows one [`Gpu::topk8_rescore_k2560_rows`] launch pair covers.
+// selector-receipt: receipts/selectors/qwen4_topk8_rows_max.json
+pub const TOPK8_ROWS_MAX: usize = 8;
+/// Module of the row-batched draft-head re-score kernels.
+const TOPK8_ROWS_MODULE: &str = "topk8_rows_mq6g256v2";
 
 // The hybrid-buffer MoE gate/up kernel stays compiled but is never selected:
 // see `crate::gemm::miscompiled_optin_decision`.
@@ -22089,12 +22098,50 @@ impl Gpu {
         )
     }
 
+    /// Whether a PREFILL call of `rows` rows sits at or above the lane WMMA prefill floor
+    /// ([`Gpu::qwen4_prefill_lwmma_floor`], `HIPFIRE_QWEN4_PREFILL_LWMMA_WAVE_FLOOR`) but within the
+    /// 16..=64-row decode-shaped window: such calls step off the decode-shaped lane WMMA / HC8
+    /// arms onto the row-count-invariant prefill entries. Pure. The floor is
+    /// `WIDE_VERIFY_MAX_ROWS + 1` (so this is never true) outside a Qwen4 prefill forward's tile
+    /// scopes: decode, verify, lane AR steps and MTP drafting never see a lowered floor.
+    pub fn prefill_small_lane_rows(&self, rows: usize) -> bool {
+        (self.qwen4_prefill_lwmma_floor..=WIDE_VERIFY_MAX_ROWS).contains(&rows)
+    }
+
     /// Whether a lane WMMA projection of `rows` activation rows is taken: the
     /// `HIPFIRE_QWEN4_LANE_WMMA` flag (exact gfx1201) and [`LANE_WMMA_MIN_ROWS`]..=[`WIDE_VERIFY_MAX_ROWS`] rows. Pure; outputs are NOT bitwise the SIMT
-    /// route's (f32 summation order differs), but are deterministic.
+    /// route's (f32 summation order differs), but are deterministic. Refused inside the lane row-exact
+    /// scope ([`Gpu::lane_row_exact_scope`]) and for a prefill call at or above the lowered prefill
+    /// floor ([`Gpu::prefill_small_lane_rows`]), which takes the prefill entries instead.
     pub fn lane_wmma_applies(&self, rows: usize) -> bool {
         self.flags.qwen4_lane_wmma_enabled()
+            && !self.lane_row_exact_scope
             && (LANE_WMMA_MIN_ROWS..=WIDE_VERIFY_MAX_ROWS).contains(&rows)
+            && !self.prefill_small_lane_rows(rows)
+    }
+
+    /// Whether a dense BF16 prefill GEMM of `rows` rows takes the lane WMMA kernel above
+    /// [`WIDE_VERIFY_MAX_ROWS`] (or from the lowered prefill floor,
+    /// [`Gpu::qwen4_prefill_lwmma_floor`]; `HIPFIRE_QWEN4_PREFILL_LWMMA_DENSE`, default on) while the route is
+    /// below the F16 WMMA prefill threshold ([`crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS`]). Not
+    /// bitwise the SIMT route; deterministic; each row is bitwise the same across call sizes
+    /// (pinned split-K). Refused in the lane row-exact scope and under the HC hold
+    /// ([`Gpu::prefill_lwmma_dense_hold`]).
+    pub fn prefill_lwmma_dense_applies(&self, rows: usize) -> bool {
+        self.flags.qwen4_prefill_lwmma_dense_enabled()
+            && !self.lane_row_exact_scope
+            && !self.prefill_lwmma_dense_hold
+            && (rows > WIDE_VERIFY_MAX_ROWS || self.prefill_small_lane_rows(rows))
+            && self.route_rows(rows) < crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS
+    }
+
+    /// Same as [`Gpu::prefill_lwmma_dense_applies`] for the HC read projections
+    /// (`HIPFIRE_QWEN4_PREFILL_LWMMA_HC`, default on), without the HC hold.
+    pub fn prefill_lwmma_hc_applies(&self, rows: usize) -> bool {
+        self.flags.qwen4_prefill_lwmma_hc_enabled()
+            && !self.lane_row_exact_scope
+            && (rows > WIDE_VERIFY_MAX_ROWS || self.prefill_small_lane_rows(rows))
+            && self.route_rows(rows) < crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS
     }
 
     /// Whether the HC k4 projection of `rows` activation rows takes the one-launch all-rows arm
@@ -22376,26 +22423,8 @@ impl Gpu {
         partial: &GpuTensor,
         out: &GpuTensor,
     ) -> HipResult<()> {
-        const GROUPS: usize = 128;
-        let chunk = n.div_ceil(GROUPS);
-        let (module, src, rescore) = match head.dtype {
-            DType::Q8_0 => (
-                "qwen4_gemv_q8_0",
-                kernels::QWEN4_GEMV_Q8_0_SRC,
-                "topk8_rescore_q8_0_k2560",
-            ),
-            DType::MQ6G256V2 => (
-                "topk8_rescore_mq6g256v2",
-                kernels::TOPK8_RESCORE_MQ6G256V2_SRC,
-                "topk8_rescore_mq6g256v2_k2560",
-            ),
-            _ => {
-                return Err(hip_bridge::HipError::new(
-                    1,
-                    "topk8_rescore_k2560 head dtype",
-                ));
-            }
-        };
+        let chunk = n.div_ceil(TOPK8_GROUPS);
+        let (module, src, rescore) = Self::topk8_rescore_target(head)?;
         if chunk > 2048
             || partial.buf.size() < Self::TOPK8_PARTIAL_BYTES
             || out.buf.size() < Self::TOPK8_OUT_BYTES
@@ -22413,7 +22442,7 @@ impl Gpu {
         let v_ptr = logits.buf.as_ptr();
         let pv_ptr = partial.buf.as_ptr();
         let pi_ptr =
-            unsafe { (partial.buf.as_ptr() as *mut u8).add(GROUPS * 8 * 4) as *mut c_void };
+            unsafe { (partial.buf.as_ptr() as *mut u8).add(TOPK8_GROUPS * 8 * 4) as *mut c_void };
         let n_val = n as i32;
         let chunk_val = chunk as i32;
         let (front, special, tail) = (order.0 as i32, order.1 as i32, order.2 as i32);
@@ -22429,7 +22458,7 @@ impl Gpu {
         ];
         self.launch_maybe_blob(
             "topk8_partial_f32",
-            [GROUPS as u32, 1, 1],
+            [TOPK8_GROUPS as u32, 1, 1],
             [256, 1, 1],
             0,
             &mut params,
@@ -22446,7 +22475,302 @@ impl Gpu {
                 b
             },
         )?;
-        let m_val = (GROUPS * 8) as i32;
+        self.topk8_rescore_only(partial, head, x, out)
+    }
+
+    /// The first launch of [`Gpu::topk8_rescore_k2560_rows`] alone: `topk8_partial_f32_rows` over
+    /// `rows` logits rows (`logits_rows[r * v_stride ..][..n]`), row `r`'s pv / pi into slot `r`
+    /// of `partial_rows` ([`Gpu::TOPK8_PARTIAL_BYTES`] each), byte for byte the slot
+    /// `topk8_partial_f32` leaves for that row. No re-score runs (a row with fewer than 8 non-NaN
+    /// logits leaves sentinel token ids no re-score may consume).
+    pub fn topk8_partial_rows(
+        &mut self,
+        logits_rows: &GpuTensor,
+        v_stride: usize,
+        rows: usize,
+        n: usize,
+        order: (usize, usize, usize),
+        partial_rows: &GpuTensor,
+    ) -> HipResult<()> {
+        let chunk = n.div_ceil(TOPK8_GROUPS);
+        let last = rows.saturating_sub(1);
+        if rows == 0
+            || rows > TOPK8_ROWS_MAX
+            || chunk > 2048
+            || v_stride > i32::MAX as usize
+            || logits_rows.numel() < last * v_stride + n
+            || partial_rows.buf.size() < rows * Self::TOPK8_PARTIAL_BYTES
+        {
+            return Err(hip_bridge::HipError::new(1, "topk8_partial_rows shape"));
+        }
+        self.bind_thread()?;
+        self.ensure_kernel(
+            TOPK8_ROWS_MODULE,
+            kernels::TOPK8_ROWS_MQ6G256V2_SRC,
+            "topk8_partial_f32_rows",
+        )?;
+        let v_ptr = logits_rows.buf.as_ptr();
+        let part_ptr = partial_rows.buf.as_ptr();
+        let n_val = n as i32;
+        let chunk_val = chunk as i32;
+        let (front, special, tail) = (order.0 as i32, order.1 as i32, order.2 as i32);
+        let v_stride_val = v_stride as i32;
+        let mut params = [
+            &v_ptr as *const _ as *mut c_void,
+            &n_val as *const _ as *mut c_void,
+            &chunk_val as *const _ as *mut c_void,
+            &part_ptr as *const _ as *mut c_void,
+            &front as *const _ as *mut c_void,
+            &special as *const _ as *mut c_void,
+            &tail as *const _ as *mut c_void,
+            &v_stride_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "topk8_partial_f32_rows",
+            [TOPK8_GROUPS as u32, rows as u32, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(v_ptr);
+                b.push_i32(n_val);
+                b.push_i32(chunk_val);
+                b.push_ptr(part_ptr);
+                b.push_i32(front);
+                b.push_i32(special);
+                b.push_i32(tail);
+                b.push_i32(v_stride_val);
+                b
+            },
+        )
+    }
+
+    /// [`Gpu::topk8_rescore_k2560`] for `rows` rows in two launches (`HIPFIRE_QWEN4_DRAFT_TOPK8_ROWS`):
+    /// `topk8_partial_f32_rows` (grid `(128, rows)`) then `topk8_rescore_mq6g256v2_k2560_rows` (grid
+    /// `rows`), each row bytewise the one-row pair's on that row. Row `r` ranks
+    /// `logits_rows[r * v_stride ..][..n]` (same `n`, `order` for every row) through its own
+    /// [`Gpu::TOPK8_PARTIAL_BYTES`] slot `r` of `partial_rows`, re-scores against `head` (MQ6G256V2 only)
+    /// with `x_rows[r * x_stride ..][..2560]` and writes the [`Gpu::TOPK8_OUT_BYTES`] slot at byte
+    /// `r * out_stride` of `out`. Strides: `v_stride`, `x_stride` in f32 elements, `out_stride` in bytes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn topk8_rescore_k2560_rows(
+        &mut self,
+        logits_rows: &GpuTensor,
+        v_stride: usize,
+        rows: usize,
+        n: usize,
+        order: (usize, usize, usize),
+        head: &GpuTensor,
+        x_rows: &GpuTensor,
+        x_stride: usize,
+        partial_rows: &GpuTensor,
+        out: &GpuTensor,
+        out_stride: usize,
+    ) -> HipResult<()> {
+        if head.dtype != DType::MQ6G256V2 {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "topk8_rescore_k2560_rows head dtype",
+            ));
+        }
+        let chunk = n.div_ceil(TOPK8_GROUPS);
+        let last = rows.saturating_sub(1);
+        if rows == 0
+            || rows > TOPK8_ROWS_MAX
+            || chunk > 2048
+            || v_stride > i32::MAX as usize
+            || x_stride > i32::MAX as usize
+            || out_stride % 4 != 0
+            || out_stride < Self::TOPK8_OUT_BYTES
+            || out_stride / 4 > i32::MAX as usize
+            || logits_rows.numel() < last * v_stride + n
+            || x_rows.numel() < last * x_stride + 2560
+            || partial_rows.buf.size() < rows * Self::TOPK8_PARTIAL_BYTES
+            || out.buf.size() < last * out_stride + Self::TOPK8_OUT_BYTES
+        {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "topk8_rescore_k2560_rows shape",
+            ));
+        }
+        self.topk8_partial_rows(logits_rows, v_stride, rows, n, order, partial_rows)?;
+        self.bind_thread()?;
+        self.ensure_kernel(
+            TOPK8_ROWS_MODULE,
+            kernels::TOPK8_ROWS_MQ6G256V2_SRC,
+            "topk8_rescore_mq6g256v2_k2560_rows",
+        )?;
+        let part_ptr = partial_rows.buf.as_ptr();
+        let a_ptr = head.buf.as_ptr();
+        let x_ptr = x_rows.buf.as_ptr();
+        let o_ptr = out.buf.as_ptr();
+        let x_stride_val = x_stride as i32;
+        let out_stride_val = (out_stride / 4) as i32;
+        let mut params = [
+            &part_ptr as *const _ as *mut c_void,
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &o_ptr as *const _ as *mut c_void,
+            &x_stride_val as *const _ as *mut c_void,
+            &out_stride_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "topk8_rescore_mq6g256v2_k2560_rows",
+            [rows as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(part_ptr);
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(o_ptr);
+                b.push_i32(x_stride_val);
+                b.push_i32(out_stride_val);
+                b
+            },
+        )
+    }
+
+    /// (module, source, entry) of the exact re-score kernel for `head`'s dtype.
+    fn topk8_rescore_target(
+        head: &GpuTensor,
+    ) -> HipResult<(&'static str, &'static str, &'static str)> {
+        match head.dtype {
+            DType::Q8_0 => Ok((
+                "qwen4_gemv_q8_0",
+                kernels::QWEN4_GEMV_Q8_0_SRC,
+                "topk8_rescore_q8_0_k2560",
+            )),
+            DType::MQ6G256V2 => Ok((
+                "topk8_rescore_mq6g256v2",
+                kernels::TOPK8_RESCORE_MQ6G256V2_SRC,
+                "topk8_rescore_mq6g256v2_k2560",
+            )),
+            _ => Err(hip_bridge::HipError::new(
+                1,
+                "topk8_rescore_k2560 head dtype",
+            )),
+        }
+    }
+
+    /// Blocks `block0 .. block0 + blocks` of [`Gpu::topk8_rescore_k2560`]'s 128-group
+    /// partial reduction: launches `topk8_partial_f32_blocks`, whose block `b` is group
+    /// `block0 + b` of the full launch (same `chunk = ceil(n / 128)`, same `begin`, same
+    /// pv/pi slot), so two launches covering `[0, 64)` and `[64, 128)` leave `partial`
+    /// byte-identical to one `topk8_partial_f32` of grid 128. `logits[0]` is layout row
+    /// `row0` (`0`: the whole ranked row; a vocabulary shard's packed half passes the layout
+    /// row its first logit is): only the rows of the launched groups,
+    /// `[block0 * chunk, min(n, (block0 + blocks) * chunk))`, are read, and they must lie inside
+    /// `[row0, row0 + logits.numel())`. `partial` is [`Gpu::TOPK8_PARTIAL_BYTES`] of scratch
+    /// laid out as the full launch's.
+    #[allow(clippy::too_many_arguments)]
+    pub fn topk8_partial_blocks(
+        &mut self,
+        logits: &GpuTensor,
+        row0: usize,
+        n: usize,
+        order: (usize, usize, usize),
+        partial: &GpuTensor,
+        block0: usize,
+        blocks: usize,
+    ) -> HipResult<()> {
+        let chunk = n.div_ceil(TOPK8_GROUPS);
+        // Rows the launched groups read (empty when the groups lie past `n`).
+        let first_row = (block0 * chunk).min(n);
+        let end_row = ((block0 + blocks) * chunk).min(n);
+        if n == 0
+            || blocks == 0
+            || block0 + blocks > TOPK8_GROUPS
+            || chunk > 2048
+            || (end_row > first_row && (first_row < row0 || end_row > row0 + logits.numel()))
+            || partial.buf.size() < Self::TOPK8_PARTIAL_BYTES
+        {
+            return Err(hip_bridge::HipError::new(
+                1,
+                &format!(
+                    "topk8_partial_blocks shape: n {n} block0 {block0} blocks {blocks} logits {} partial {}B",
+                    logits.numel(),
+                    partial.buf.size()
+                ),
+            ));
+        }
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "qwen4_gemv_q8_0",
+            kernels::QWEN4_GEMV_Q8_0_SRC,
+            "topk8_partial_f32_blocks",
+        )?;
+        // The kernel indexes `v` from layout row 0; `logits[0]` is layout row `row0`, so the
+        // pointer is rebased by `row0` floats. Only the launched groups' rows are dereferenced,
+        // and those are validated above to lie inside the view.
+        let v_ptr = (logits.buf.as_ptr() as *mut u8).wrapping_sub(row0 * std::mem::size_of::<f32>())
+            as *mut c_void;
+        let pv_ptr = partial.buf.as_ptr();
+        let pi_ptr =
+            unsafe { (partial.buf.as_ptr() as *mut u8).add(TOPK8_GROUPS * 8 * 4) as *mut c_void };
+        let n_val = n as i32;
+        let chunk_val = chunk as i32;
+        let (front, special, tail) = (order.0 as i32, order.1 as i32, order.2 as i32);
+        let block0_val = block0 as i32;
+        let mut params = [
+            &v_ptr as *const _ as *mut c_void,
+            &n_val as *const _ as *mut c_void,
+            &chunk_val as *const _ as *mut c_void,
+            &pv_ptr as *const _ as *mut c_void,
+            &pi_ptr as *const _ as *mut c_void,
+            &front as *const _ as *mut c_void,
+            &special as *const _ as *mut c_void,
+            &tail as *const _ as *mut c_void,
+            &block0_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "topk8_partial_f32_blocks",
+            [blocks as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(v_ptr);
+                b.push_i32(n_val);
+                b.push_i32(chunk_val);
+                b.push_ptr(pv_ptr);
+                b.push_ptr(pi_ptr);
+                b.push_i32(front);
+                b.push_i32(special);
+                b.push_i32(tail);
+                b.push_i32(block0_val);
+                b
+            },
+        )
+    }
+
+    /// The exact re-score of [`Gpu::topk8_rescore_k2560`] over an already filled
+    /// `partial` (all 128 groups' pv/pi): one block of 256 scores the best 8 of the
+    /// 1,024 pairs against `head`'s rows and writes `out`.
+    pub fn topk8_rescore_only(
+        &mut self,
+        partial: &GpuTensor,
+        head: &GpuTensor,
+        x: &GpuTensor,
+        out: &GpuTensor,
+    ) -> HipResult<()> {
+        let (module, src, rescore) = Self::topk8_rescore_target(head)?;
+        if partial.buf.size() < Self::TOPK8_PARTIAL_BYTES
+            || out.buf.size() < Self::TOPK8_OUT_BYTES
+            || x.numel() < 2560
+        {
+            return Err(hip_bridge::HipError::new(1, "topk8_rescore_only shape"));
+        }
+        self.bind_thread()?;
+        self.ensure_kernel(module, src, rescore)?;
+        let pv_ptr = partial.buf.as_ptr();
+        let pi_ptr =
+            unsafe { (partial.buf.as_ptr() as *mut u8).add(TOPK8_GROUPS * 8 * 4) as *mut c_void };
+        let m_val = (TOPK8_GROUPS * 8) as i32;
         let a_ptr = head.buf.as_ptr();
         let x_ptr = x.buf.as_ptr();
         let o_ptr = out.buf.as_ptr();
@@ -24337,13 +24661,39 @@ impl Gpu {
         k: usize,
         rows: usize,
     ) -> HipResult<()> {
-        self.gemv_bf16_xf32_x4_rows_route(parts, x, k, rows, true)
+        self.gemv_bf16_xf32_x4_rows_route(parts, x, k, rows, true, true)
+    }
+
+    /// [`Gpu::gemv_bf16_xf32_x4_rows`] for 2..=[`WIDE_VERIFY_MAX_ROWS`] rows that is never the
+    /// lane-WMMA route (f32 summation order differs) and never the lab row-tile twin: rows <= 8
+    /// take today's route (otile when enabled, else `r<R>`); rows 9..=64 take the one-launch
+    /// [`Gpu::gemv_bf16_xf32_x4_rows_allrows`] when [`Gpu::bf16_allrows_applies`], else the
+    /// existing eight-row-group loop with `otile = false` (exactly the incumbent fallback).
+    /// Every output word is bitwise the single-row `gemv_bf16_xf32` value: the row-group
+    /// launches are the singleton per row (CHANGELOG.md:224) and the all-rows arm is bitwise
+    /// the singleton / row-group value (see its header), so the call is interchangeable with
+    /// any split of its rows into smaller exact calls.
+    pub fn gemv_bf16_xf32_x4_rows_exact(
+        &mut self,
+        parts: [(&GpuTensor, &GpuTensor, usize); 4],
+        x: &GpuTensor,
+        k: usize,
+        rows: usize,
+    ) -> HipResult<()> {
+        self.gemv_bf16_xf32_x4_rows_route(parts, x, k, rows, true, false)
+    }
+
+    /// Whether [`Gpu::gemv_bf16_xf32_x4_rows_exact`] runs `rows` as ONE launch: at most
+    /// [`FEW_ROW_ROUTE_ROWS`] rows, or [`Gpu::bf16_allrows_applies`]. Pure.
+    pub fn bf16_rows_exact_one_launch(&self, rows: usize) -> bool {
+        rows <= FEW_ROW_ROUTE_ROWS || self.bf16_allrows_applies(rows)
     }
 
     /// Body of [`Gpu::gemv_bf16_xf32_x4_rows`]; `otile` admits the output-tiled
     /// entries (`HIPFIRE_QWEN4_BF16_ROWS_OTILE`) for 2..=[`FEW_ROW_ROUTE_ROWS`]
     /// rows. The eight-row groups of a wider call pass `false`, so rows above
-    /// eight stay on the incumbent route.
+    /// eight stay on the incumbent route. `lane_wmma` admits the (non-bitwise) lane-WMMA and
+    /// lab row-tile routes above eight rows; the `_exact` entry passes `false`.
     fn gemv_bf16_xf32_x4_rows_route(
         &mut self,
         parts: [(&GpuTensor, &GpuTensor, usize); 4],
@@ -24351,6 +24701,7 @@ impl Gpu {
         k: usize,
         rows: usize,
         otile: bool,
+        lane_wmma: bool,
     ) -> HipResult<()> {
         const FUNCS: [&str; 7] = [
             "gemv_bf16_xf32_x4_rows_r2",
@@ -24374,19 +24725,37 @@ impl Gpu {
                     "gemv_bf16_xf32_x4_rows x / y views too small for the rows",
                 ));
             }
-            if self.lane_wmma_applies(rows)
+            if lane_wmma
+                && self.lane_wmma_applies(rows)
                 && x.dtype == DType::F32
                 && parts
                     .iter()
                     .all(|&(_, y, m)| m == 0 || (y.dtype == DType::F32 && k.is_multiple_of(128)))
             {
                 // Terms 2: general f32 activations, no `hc_act`. Parts with m == 0 are padding.
+                // `HIPFIRE_QWEN4_LWMMA_MULTI_PART`: two or more live parts are ONE launch, each
+                // part's bytes the per-part launch's.
+                let mut live = [LaneWmmaMultiPart {
+                    w: parts[0].0,
+                    y: parts[0].1,
+                    m: 0,
+                }; 4];
+                let mut n = 0usize;
+                for &(w, y, m) in parts.iter().filter(|p| p.2 > 0) {
+                    live[n] = LaneWmmaMultiPart { w, y, m };
+                    n += 1;
+                }
+                let ms: [usize; 4] = std::array::from_fn(|i| live[i].m);
+                if n >= 2 && self.lane_wmma_multi_part_applies(&ms[..n], k, rows) {
+                    self.lane_wmma_gemm_multi_fixed(&live[..n], x, k, rows)?;
+                    return Ok(());
+                }
                 for &(w, y, m) in parts.iter().filter(|p| p.2 > 0) {
                     self.lane_wmma_gemm_fixed(&LaneWmmaWeight::Bf16(w), x, y, m, k, rows, 2, None)?;
                 }
                 return Ok(());
             }
-            if self.row_tile_twin_enabled(WideTwinFamily::Bf16, rows) {
+            if lane_wmma && self.row_tile_twin_enabled(WideTwinFamily::Bf16, rows) {
                 return self.lab_gemv_bf16_xf32_rows_x4_t8(parts, x, k, rows);
             }
             if self.bf16_allrows_applies(rows) {
@@ -24399,7 +24768,7 @@ impl Gpu {
                 if n == 1 {
                     self.gemv_bf16_xf32_x4(pg, &xg, k)?;
                 } else {
-                    self.gemv_bf16_xf32_x4_rows_route(pg, &xg, k, n, false)?;
+                    self.gemv_bf16_xf32_x4_rows_route(pg, &xg, k, n, false, lane_wmma)?;
                 }
             }
             return Ok(());

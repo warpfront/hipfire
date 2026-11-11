@@ -389,15 +389,44 @@ pub(crate) fn ep_lane_stage_min_rows(
     }
 }
 
+/// The MoE route of one EP lane prefill tile or wave on this rank (the `route=` of the
+/// `HIPFIRE_CB_PHASES` per-tile line).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LaneTileRoute {
+    /// The EP full table: every expert of both ranks read through this rank's links.
+    FullTable,
+    /// The owner-routed compact route with the tile exchange (`ep_tile_active`).
+    Tile,
+    /// The trunk shard's partial chunk route (`ep_trunk_partial_chunk`): this rank's compact
+    /// table, non-owned experts run on the zero dummy, the all-reduce completes the FFN.
+    Partial,
+    /// [`Self::Partial`] with the partial tile mask (`HIPFIRE_QWEN4_EP_TRUNK_SHARD_PMASK`): the
+    /// non-owned tiles are masked out of the grouped launches, so the rank computes only its
+    /// owned experts.
+    PartialMask,
+}
+
+impl LaneTileRoute {
+    /// The route a chunk bound: the trunk shard's partial route takes precedence over the tile
+    /// exchange (`forward_chunk_scoped`), the mask applies only on the partial route.
+    pub(crate) fn of(tile_active: bool, trunk_partial: bool, partial_mask: bool) -> Self {
+        match (trunk_partial, partial_mask, tile_active) {
+            (true, true, _) => Self::PartialMask,
+            (true, false, _) => Self::Partial,
+            (false, _, true) => Self::Tile,
+            (false, _, false) => Self::FullTable,
+        }
+    }
+}
+
 /// The route one EP lane prefill tile took on this rank, kept for the `HIPFIRE_CB_PHASES`
 /// per-tile line (`[fn-lane-tile]`); it never feeds a decision.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct LaneTileNote {
     /// Rows of the tile.
     pub(crate) rows: usize,
-    /// The tile ran the owner-routed compact route (tile exchange); `false`: the EP full table
-    /// (every expert of both ranks read through this rank's links).
-    pub(crate) tile_exchange: bool,
+    /// The MoE route the tile bound.
+    pub(crate) route: LaneTileRoute,
     /// The tile staged the host experts through the expert stage.
     pub(crate) staged: bool,
     /// The row threshold the tile compared with (`None`: this load has no expert stage).
@@ -407,10 +436,14 @@ pub(crate) struct LaneTileNote {
 impl LaneTileNote {
     /// Short route label of the per-tile line.
     pub(crate) fn label(&self) -> &'static str {
-        match (self.tile_exchange, self.staged) {
-            (_, true) => "tile+stage",
-            (true, false) => "tile",
-            (false, false) => "full-table",
+        match (self.route, self.staged) {
+            (LaneTileRoute::FullTable, _) => "full-table",
+            (LaneTileRoute::Tile, false) => "tile",
+            (LaneTileRoute::Tile, true) => "tile+stage",
+            (LaneTileRoute::Partial, false) => "partial",
+            (LaneTileRoute::Partial, true) => "partial+stage",
+            (LaneTileRoute::PartialMask, false) => "partial-mask",
+            (LaneTileRoute::PartialMask, true) => "partial-mask+stage",
         }
     }
 }
@@ -2963,16 +2996,26 @@ mod tests {
     }
 
     #[test]
-    fn lane_tile_note_labels_the_three_routes() {
-        let note = |tile_exchange, staged| LaneTileNote {
+    fn lane_tile_note_labels_every_route() {
+        let note = |route, staged| LaneTileNote {
             rows: 149,
-            tile_exchange,
+            route,
             staged,
             stage_min_rows: Some(2048),
         };
-        assert_eq!(note(false, false).label(), "full-table");
-        assert_eq!(note(true, false).label(), "tile");
-        assert_eq!(note(true, true).label(), "tile+stage");
+        use LaneTileRoute::*;
+        assert_eq!(note(FullTable, false).label(), "full-table");
+        assert_eq!(note(Tile, false).label(), "tile");
+        assert_eq!(note(Tile, true).label(), "tile+stage");
+        assert_eq!(note(Partial, false).label(), "partial");
+        assert_eq!(note(Partial, true).label(), "partial+stage");
+        assert_eq!(note(PartialMask, false).label(), "partial-mask");
+        assert_eq!(note(PartialMask, true).label(), "partial-mask+stage");
+        // The trunk shard's partial route wins over the tile exchange; the mask only applies there.
+        assert_eq!(LaneTileRoute::of(true, true, true), PartialMask);
+        assert_eq!(LaneTileRoute::of(false, true, false), Partial);
+        assert_eq!(LaneTileRoute::of(true, false, false), Tile);
+        assert_eq!(LaneTileRoute::of(false, false, false), FullTable);
     }
 
     #[test]

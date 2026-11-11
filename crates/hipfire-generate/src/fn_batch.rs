@@ -66,7 +66,10 @@
 //! decides, every rank replays the ordered messages) whose advance feeds the
 //! same emission path (`forwarded_tokens` from the window's seed). The two
 //! halves fail independently: an error in one errors only its own lanes and
-//! the other half's committed tokens are still emitted. Route mix by step
+//! the other half's committed tokens are still emitted. The executor half's
+//! prefill ticks (first tokens) are emitted between the halves, before the
+//! mesh window (`HIPFIRE_LANE_FIRST_TOKEN_BEFORE_MESH`; `emit_tick` is the one
+//! per-tick emission both positions use). Route mix by step
 //! concurrency is logged once per drive (`[fn-lane-mesh-mix]`). An AR EP store
 //! (kill switch `HIPFIRE_EP_MTP_LANES=0`) keeps the executor
 //! path unchanged.
@@ -80,7 +83,8 @@ use crate::common::{emit_committed_event, fit_max_tokens_if};
 use hipfire_arch_qwen4::bundle::{Qwen4Bundle, Qwen4PpLaneExecutor};
 use hipfire_arch_qwen4::ep_mesh_serve::{MeshDecodeRequest, MeshStepFacts};
 use hipfire_arch_qwen4::lane::pages::{
-    page_budget_enabled, reservation_rows, PageDecision, PageVerdict, LANE_PAGE_BUDGET_REFUSED,
+    long_prefill_route_rows, page_budget_enabled, reservation_rows, PageDecision, PageVerdict,
+    LANE_PAGE_BUDGET_REFUSED,
 };
 use hipfire_arch_qwen4::lane::{LaneSampling, LaneSpecStats, LaneStatus};
 use hipfire_arch_qwen4::lane_exec::{
@@ -260,6 +264,18 @@ impl<'a> Owner<'a> {
         self.bundle.lane_page_decision(&mut *self.gpu, rows)
     }
 
+    /// The elastic reserve is on for this owner (an EP load with the D2 tail and a positive cap;
+    /// never on a pipeline-parallel mesh).
+    fn elastic_active(&self) -> bool {
+        self.gpus.is_none() && self.bundle.elastic_active()
+    }
+
+    /// Reclaim the elastic bank on every rank; whether any rank freed one. `false` without the
+    /// reserve.
+    fn elastic_reclaim(&mut self, why: &str) -> bool {
+        self.elastic_active() && self.bundle.elastic_reclaim_all(&mut *self.gpu, why)
+    }
+
     /// Reserve `rows` context rows for the just-admitted lane of `epoch` (host-only; a pipeline
     /// parallel mesh keeps none).
     fn reserve_pages(&mut self, epoch: &RequestEpoch, rows: usize) -> Result<(), String> {
@@ -387,6 +403,135 @@ fn forwarded_tokens(seed: u32, committed: &[u32], skip_seed: bool) -> Vec<u32> {
             .chain(window.iter().copied())
             .collect()
     }
+}
+
+/// `HIPFIRE_LANE_EARLY_FIRST_TOKEN`: unset / anything but exact `0` streams a lane's
+/// prompt-completing pick in the step whose prefill committed it; `0` (kill switch) defers it
+/// to the lane's first decode advance (as its plan seed, after that step's window).
+pub const LANE_EARLY_FIRST_TOKEN_ENV: &str = "HIPFIRE_LANE_EARLY_FIRST_TOKEN";
+
+fn early_first_token_from(value: Option<&str>) -> bool {
+    value.map(str::trim) != Some("0")
+}
+
+static LANE_EARLY_FIRST_TOKEN: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    early_first_token_from(
+        hipfire_config::developer_var(LANE_EARLY_FIRST_TOKEN_ENV)
+            .ok()
+            .as_deref(),
+    )
+});
+
+fn early_first_token_enabled() -> bool {
+    *LANE_EARLY_FIRST_TOKEN
+}
+
+/// `HIPFIRE_LANE_FIRST_TOKEN_BEFORE_MESH`: unset / anything but exact `0` streams the executor
+/// half's prefill ticks (the early first tokens, abort / stop / EOS / length finishes and the
+/// `prefill_progress` events of the lanes whose prompt chunk this step ran) right after the
+/// executor commits and BEFORE the step's EP mesh decode window runs; `0` (kill switch)
+/// emits them after that window, with the rest of the tick. Meaningful only with
+/// `HIPFIRE_LANE_EARLY_FIRST_TOKEN` on, and only on a step that carries a mesh window.
+pub const LANE_FIRST_TOKEN_BEFORE_MESH_ENV: &str = "HIPFIRE_LANE_FIRST_TOKEN_BEFORE_MESH";
+
+/// `early`: the resolved `HIPFIRE_LANE_EARLY_FIRST_TOKEN` (off: nothing to move, today's order).
+fn first_token_before_mesh_from(early: bool, value: Option<&str>) -> bool {
+    early && value.map(str::trim) != Some("0")
+}
+
+static LANE_FIRST_TOKEN_BEFORE_MESH: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    first_token_before_mesh_from(
+        early_first_token_enabled(),
+        hipfire_config::developer_var(LANE_FIRST_TOKEN_BEFORE_MESH_ENV)
+            .ok()
+            .as_deref(),
+    )
+});
+
+fn first_token_before_mesh_enabled() -> bool {
+    *LANE_FIRST_TOKEN_BEFORE_MESH
+}
+
+/// `HIPFIRE_LANE_ADMIT_COALESCE_MS`: the quiet gap (ms) a lane-admission tick waits for one
+/// more arrival before its new prompts prefill (unset: [`ADMIT_COALESCE_DEFAULT_MS`]; `0`
+/// is the kill switch; values above [`ADMIT_COALESCE_MAX_MS`] are clamped). The whole wait of
+/// one tick is at most [`ADMIT_COALESCE_GAPS`] gaps.
+pub const LANE_ADMIT_COALESCE_ENV: &str = "HIPFIRE_LANE_ADMIT_COALESCE_MS";
+const ADMIT_COALESCE_DEFAULT_MS: u64 = 2;
+const ADMIT_COALESCE_MAX_MS: u64 = 20;
+const ADMIT_COALESCE_GAPS: u32 = 5;
+/// Queued requests that make a tick a burst on their own; below it only a lone fresh request
+/// that stays a lane arms the wait ([`coalesce_arms`], `HIPFIRE_LANE_ADMIT_COALESCE_FIRST`).
+const ADMIT_COALESCE_MIN_QUEUED: usize = 2;
+
+fn admit_coalesce_from(value: Option<&str>) -> Option<Duration> {
+    let ms = match value.map(str::trim).filter(|v| !v.is_empty()) {
+        None => ADMIT_COALESCE_DEFAULT_MS,
+        Some(v) => v.parse::<u64>().unwrap_or(ADMIT_COALESCE_DEFAULT_MS),
+    };
+    (ms > 0).then(|| Duration::from_millis(ms.min(ADMIT_COALESCE_MAX_MS)))
+}
+
+static LANE_ADMIT_COALESCE: std::sync::LazyLock<Option<Duration>> =
+    std::sync::LazyLock::new(|| {
+        admit_coalesce_from(
+            hipfire_config::developer_var(LANE_ADMIT_COALESCE_ENV)
+                .ok()
+                .as_deref(),
+        )
+    });
+
+fn admit_coalesce_gap() -> Option<Duration> {
+    *LANE_ADMIT_COALESCE
+}
+
+/// `HIPFIRE_LANE_ADMIT_COALESCE_FIRST`: unset / anything but exact `0` also arms the admission
+/// wait on a single queued request whose front can take a free lane now, where a lone request
+/// stays a lane (`qwen4_lone_request_takes_lane`: EP / PP lanes): the first arrival waits one
+/// gap for a second (a gap with no arrival ends the wait), re-armed per arrival within the
+/// tick's whole budget. `0` (kill switch) arms it from [`ADMIT_COALESCE_MIN_QUEUED`] queued
+/// requests only, as before. A topology that hands a lone request to the singleton route
+/// (single device, PP with a speculator) never waits for it, whatever this says;
+/// `HIPFIRE_LANE_ADMIT_COALESCE_MS=0` still turns the whole wait off.
+pub const LANE_ADMIT_COALESCE_FIRST_ENV: &str = "HIPFIRE_LANE_ADMIT_COALESCE_FIRST";
+
+fn admit_coalesce_first_from(value: Option<&str>) -> bool {
+    value.map(str::trim) != Some("0")
+}
+
+static LANE_ADMIT_COALESCE_FIRST: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    admit_coalesce_first_from(
+        hipfire_config::developer_var(LANE_ADMIT_COALESCE_FIRST_ENV)
+            .ok()
+            .as_deref(),
+    )
+});
+
+fn admit_coalesce_first_enabled() -> bool {
+    *LANE_ADMIT_COALESCE_FIRST
+}
+
+/// Whether a tick's admission waits for stragglers (the caller also needs the queue front to
+/// be assignable and a gap configured): a burst of [`ADMIT_COALESCE_MIN_QUEUED`] or more
+/// queued requests always does; a lone one only with `first` on, not already held by the page
+/// budget (`held_by_pages`: a wait cannot admit it sooner) and where it stays a lane
+/// (`lone_takes_lane`, consulted only then).
+fn coalesce_arms(
+    first: bool,
+    queued: usize,
+    held_by_pages: bool,
+    lone_takes_lane: impl FnOnce() -> bool,
+) -> bool {
+    queued >= ADMIT_COALESCE_MIN_QUEUED
+        || (first && queued == 1 && !held_by_pages && lone_takes_lane())
+}
+
+/// The timeout of the tick's next straggler wait, `elapsed` into it: one `gap`, never past
+/// the whole budget of [`ADMIT_COALESCE_GAPS`] gaps, and none once no free lane is left for
+/// one more (`room`). The wait ends at the first gap that brings no arrival.
+fn coalesce_next_wait(gap: Duration, elapsed: Duration, room: bool) -> Option<Duration> {
+    let left = (gap * ADMIT_COALESCE_GAPS).saturating_sub(elapsed);
+    (room && !left.is_zero()).then(|| gap.min(left))
 }
 
 /// A promoted request that cannot continue anywhere (its singleton state
@@ -768,6 +913,23 @@ impl PageGate {
     }
 }
 
+/// The page budget's decision for the queue front reserving `rows` rows. `None`: the budget could
+/// not be measured, which the gate answers by admitting `id` without it (logged here).
+fn gate_page_decision(
+    m: &mut LoadedModel,
+    gpu: &mut Gpu,
+    rows: usize,
+    id: &str,
+) -> Result<Option<PageDecision>, String> {
+    match Owner::of(m, gpu)?.page_decision(rows) {
+        Ok(decision) => Ok(Some(decision)),
+        Err(error) => {
+            eprintln!("  qwen4 lane page budget: {error}; admitting {id} without the budget");
+            Ok(None)
+        }
+    }
+}
+
 /// The lane page budget at the queue front (see `hipfire_arch_qwen4::lane::pages`): before the
 /// front request takes a lane, reserve-check its worst-case context growth against every rank's
 /// free device pages. `Proceed` with nothing when the kill switch is set
@@ -843,16 +1005,28 @@ fn page_budget_gate(
         Owner::of(m, gpu)?.bundle.lane_page_draft_rows(),
         m.max_seq,
     );
-    let decision = match Owner::of(m, gpu)?.page_decision(rows) {
-        Ok(decision) => decision,
-        Err(error) => {
-            eprintln!(
-                "  qwen4 lane page budget: {error}; admitting {} without the budget",
-                key.id
-            );
-            return Ok(PageGate::proceed(Some(rendered), None, None));
+    // The elastic reserve (PLAN-cp15 L2): a first prefill tile of >= 512 route rows builds the F16
+    // weight shadows out of the memory the bank holds, so every rank gives the bank back before
+    // the budget is read (the page numbers then see the freed bytes).
+    {
+        let mut owner = Owner::of(m, gpu)?;
+        if owner.elastic_active()
+            && long_prefill_route_rows(owner.bundle.lane_prefill_tile_len(prompt, 0))
+        {
+            owner.elastic_reclaim("admit");
         }
+    }
+    let Some(mut decision) = gate_page_decision(m, gpu, rows, &key.id)? else {
+        return Ok(PageGate::proceed(Some(rendered), None, None));
     };
+    // A request the budget cannot admit while a bank is lent decides again once it is back.
+    if !matches!(decision.verdict, PageVerdict::Fit) && Owner::of(m, gpu)?.elastic_reclaim("pages")
+    {
+        let Some(again) = gate_page_decision(m, gpu, rows, &key.id)? else {
+            return Ok(PageGate::proceed(Some(rendered), None, None));
+        };
+        decision = again;
+    }
     let slot = decision.slot;
     match gate_decision(decision.verdict, sched.active_count()) {
         GateDecision::Admit => {
@@ -896,6 +1070,50 @@ fn page_budget_gate(
     }
 }
 
+/// Step-boundary housekeeping of the elastic reserve; a no-op without it. `step` is
+/// `Some(long_prefill)` after a step (`long_prefill`: it held a tile of >= 512 route rows) and
+/// `None` on an idle iteration (the loop's 2 ms idle sleep with lanes active but nothing planned),
+/// which counts like a step. The idle count lives in the bundle (`Qwen4Bundle::elastic_idle_boundary`)
+/// because this loop returns when no lane is active and nothing is queued: it spans busy periods
+/// and restarts after a long prefill or any reclaim (a gate, backstop or borrow reclaim all move
+/// the bundle's reclaim count); the tick runs only while no request is queued and no lane
+/// prefills. Never fails the loop: a failed tick is logged by the bundle and the next one asks
+/// again.
+fn elastic_boundary(
+    sched: &ContinuousBatchScheduler,
+    m: &mut LoadedModel,
+    gpu: &mut Gpu,
+    controls: &[Option<LaneCtl>],
+    step: Option<bool>,
+) {
+    match Owner::of(m, gpu) {
+        Ok(owner) if owner.elastic_active() => {}
+        _ => return,
+    }
+    let prefilling = m
+        .qwen4()
+        .and_then(|bundle| bundle.lanes())
+        .is_some_and(|store| {
+            controls
+                .iter()
+                .flatten()
+                .filter(|ctl| ctl.epoch.is_admitted())
+                .any(|ctl| {
+                    store
+                        .lane(&ctl.epoch)
+                        .is_some_and(|lane| lane.host.status == LaneStatus::Prefilling)
+                })
+        });
+    let Ok(mut owner) = Owner::of(m, gpu) else {
+        return;
+    };
+    let idle_steps = owner.bundle.elastic_idle_boundary(step == Some(true));
+    if prefilling || !sched.inbox.is_empty() {
+        return;
+    }
+    owner.bundle.elastic_tick(&mut *owner.gpu, idle_steps);
+}
+
 /// A failed `draft_step`: its error and every lane it named.
 struct DraftFailure {
     error: String,
@@ -914,7 +1132,9 @@ struct PlannedStep {
 /// line per lane step. `host` is the wall time from the previous step's end
 /// to this plan (terminal decisions, inbox, admission); `plan` holds the
 /// batched draft (one D2H per draft step); `fwd` is provision + forward
-/// (synchronized by the pick download); then `commit` and `emit`. Rows by
+/// (synchronized by the pick download); then `commit` (the executor's commit and the
+/// mesh decode window) and `emit`, which also holds the prefill ticks emitted before the
+/// mesh window (`HIPFIRE_LANE_FIRST_TOKEN_BEFORE_MESH`). Rows by
 /// kind, decoding/active lanes, the queue and the committed tokens follow.
 struct StepTrace {
     origin: Instant,
@@ -934,7 +1154,10 @@ impl StepTrace {
             })
     }
 
-    /// `marks`: plan start, forward start, commit start, commit end.
+    /// `marks`: plan start, forward start, commit start, commit end. `early_emit`: the
+    /// emit time spent inside the commit window (prefill ticks before the mesh window),
+    /// reported under `emit` and not `commit`.
+    #[allow(clippy::too_many_arguments)]
     fn line(
         &mut self,
         marks: [Instant; 4],
@@ -944,9 +1167,11 @@ impl StepTrace {
         accepted: usize,
         active: usize,
         queued: usize,
+        early_emit: Duration,
     ) {
         let now = Instant::now();
         let ms = |a: Instant, b: Instant| b.saturating_duration_since(a).as_secs_f64() * 1000.0;
+        let early_ms = early_emit.as_secs_f64() * 1000.0;
         let (mut pf, mut pf_rows, mut ar, mut ver, mut ver_rows) = (0, 0, 0, 0, 0);
         for r in &plan.requests {
             match r.kind {
@@ -965,7 +1190,7 @@ impl StepTrace {
         eprintln!("[fn-lane-step] n={} t={:.1} host={:.2} plan={:.2} fwd={:.2} commit={:.2} emit={:.2} active={active} queued={queued} \
             pf={pf} pf_rows={pf_rows} ar={ar} ver={ver} ver_rows={ver_rows} mesh_lanes={} mesh_native={} mesh_copy={} mesh_ar={} tokens={tokens} accepted={accepted}",
             self.step, ms(self.origin, marks[0]), ms(self.last, marks[0]), ms(marks[0], marks[1]), ms(marks[1], marks[2]),
-            ms(marks[2], marks[3]), ms(marks[3], now), mesh.lanes, mesh.native_windows, mesh.copy_windows, mesh.ar_windows);
+            (ms(marks[2], marks[3]) - early_ms).max(0.0), ms(marks[3], now) + early_ms, mesh.lanes, mesh.native_windows, mesh.copy_windows, mesh.ar_windows);
         hip_bridge::site_ledger::mark_step(self.step, mesh.lanes, pf_rows, tokens);
         self.step += 1;
         self.last = now;
@@ -1397,6 +1622,186 @@ fn finish_lane(
         .map_err(|e| e.to_string())
 }
 
+/// Whether `advance` is the executor's tick of a lane whose prompt chunk this step ran: not a
+/// decode advance and not an EP mesh window (which carries its seed).
+fn is_prefill_tick(
+    plan: &BatchStepPlan,
+    advance: &RequestAdvance,
+    decode_seed: Option<u32>,
+) -> bool {
+    decode_seed.is_none()
+        && plan
+            .requests
+            .iter()
+            .find(|r| r.epoch == advance.epoch)
+            .is_some_and(|r| r.kind == RequestStepKind::Prefill)
+}
+
+/// Emit one lane's committed tick: a prefill tick streams `prefill_progress`, stamps the
+/// prefill timers and (early first token) the lane's first committed token; any other tick
+/// streams its forwarded window (`forwarded_tokens`). `decode_seed` is the mesh window's
+/// pending seed, `None` for the executor's own ticks. Terminal finishes and per-lane errors
+/// are handled here; `Err` is a driver-level failure.
+#[allow(clippy::too_many_arguments)]
+fn emit_tick(
+    sched: &mut ContinuousBatchScheduler,
+    m: &mut LoadedModel,
+    gpu: &mut Gpu,
+    controls: &mut [Option<LaneCtl>],
+    stdout: &mut Stdout,
+    plan: &BatchStepPlan,
+    eos: u32,
+    advance: RequestAdvance,
+    decode_seed: Option<u32>,
+) -> Result<(), String> {
+    let idx = controls
+        .iter()
+        .position(|c| c.as_ref().is_some_and(|c| c.epoch == advance.epoch))
+        .ok_or("qwen4 advance has no request owner")?;
+    let request = plan.requests.iter().find(|r| r.epoch == advance.epoch);
+    let is_prefill = is_prefill_tick(plan, &advance, decode_seed);
+    let plan_seed = match (decode_seed, request) {
+        (Some(seed), _) => seed,
+        (None, Some(r)) => plan.batch.tokens[r.rows.begin],
+        (None, None) => return Err("qwen4 advance not in plan".into()),
+    };
+    if is_prefill {
+        // `prefill_progress` for the lane's prompt chunk (the
+        // last chunk is silent: `done < total` only).
+        if let BatchLane::Running(lane) | BatchLane::Seeding(lane) = &sched.lanes[idx] {
+            let progress = Owner::of(m, gpu).ok().and_then(|owner| {
+                let cell = owner.bundle.lanes()?.lane(&advance.epoch)?;
+                Some((cell.host.prefilled, cell.host.prompt.len()))
+            });
+            if let Some((done, total)) = progress {
+                crate::common::emit_prefill_progress(
+                    stdout,
+                    &lane.key.id,
+                    Some(lane.key.attempt_id),
+                    done,
+                    total,
+                );
+            }
+        }
+        if !advance.committed_ids.is_empty() {
+            let ctl = controls[idx].as_mut().ok_or("lane control missing")?;
+            ctl.prefill_ms = ctl.start.elapsed().as_secs_f64() * 1000.0;
+            ctl.decode_start = Some(Instant::now());
+            if let BatchLane::Running(lane) = &mut sched.lanes[idx] {
+                lane.prefill_done_at = ctl.decode_start;
+            }
+        }
+        let length_finish = advance.finish.as_deref() == Some("length");
+        // The prompt-completing pick streams in THIS step (it is the lane's
+        // committed first token; its next decode advance then skips it as the
+        // plan seed), not one decode step later with that step's window.
+        // `HIPFIRE_LANE_EARLY_FIRST_TOKEN=0` restores the deferred emission.
+        let early = early_first_token_enabled()
+            && !advance.committed_ids.is_empty()
+            && matches!(sched.lanes[idx], BatchLane::Running(_))
+            && controls[idx]
+                .as_ref()
+                .is_some_and(|c| !c.skip_first_forward);
+        if early {
+            if let BatchLane::Running(lane) = &sched.lanes[idx] {
+                if batch_check_abort(&lane.key.id, lane.key.attempt_id, lane.ticket.admission) {
+                    return cancel_lane(sched, m, controls, idx, stdout);
+                }
+            }
+            let BatchLane::Running(lane) = &mut sched.lanes[idx] else {
+                return Err("prefilled lane is not running".into());
+            };
+            let _scope = BatchAttemptScope::enter_for_generation(
+                &lane.key.id,
+                lane.key.attempt_id,
+                lane.ticket.admission,
+            );
+            let tokenizer = m.tokenizer.as_ref().ok_or("tokenizer disappeared")?;
+            let ctl = controls[idx].as_mut().ok_or("lane control missing")?;
+            ctl.skip_first_forward = true;
+            let emitted = emit_forwarded(
+                stdout,
+                tokenizer,
+                lane,
+                ctl,
+                advance.committed_ids[0],
+                eos,
+                length_finish,
+            );
+            return match emitted {
+                Ok(Some(length)) => match finish_lane(sched, m, controls, idx, stdout, length) {
+                    Ok(()) => Ok(()),
+                    Err(error) => lane_error(sched, m, controls, idx, stdout, &error, "validation"),
+                },
+                Ok(None) => Ok(()),
+                Err(error) => lane_error(sched, m, controls, idx, stdout, &error, "validation"),
+            };
+        }
+        if length_finish {
+            finish_lane(sched, m, controls, idx, stdout, true)?;
+        }
+        return Ok(());
+    }
+    // All step participants committed before any bytes are published.
+    if let BatchLane::Running(lane) = &sched.lanes[idx] {
+        if batch_check_abort(&lane.key.id, lane.key.attempt_id, lane.ticket.admission) {
+            return cancel_lane(sched, m, controls, idx, stdout);
+        }
+    }
+    // Forwarded tokens: the plan seed, then every committed id but
+    // the last (the next pending seed). One entry for an AR row. A
+    // promoted lane's first plan seed was streamed by the singleton.
+    let skip_seed = controls[idx]
+        .as_mut()
+        .is_some_and(|c| std::mem::take(&mut c.skip_first_forward));
+    let forwarded = forwarded_tokens(plan_seed, &advance.committed_ids, skip_seed);
+    let length_finish = advance.finish.as_deref() == Some("length");
+    let _scope = match &sched.lanes[idx] {
+        BatchLane::Running(lane) => BatchAttemptScope::enter_for_generation(
+            &lane.key.id,
+            lane.key.attempt_id,
+            lane.ticket.admission,
+        ),
+        _ => return Err("advanced lane is not running".into()),
+    };
+    if forwarded.is_empty() && length_finish {
+        // The already-streamed promoted seed was the only forwarded token.
+        return match finish_lane(sched, m, controls, idx, stdout, true) {
+            Ok(()) => Ok(()),
+            Err(error) => lane_error(sched, m, controls, idx, stdout, &error, "validation"),
+        };
+    }
+    for (i, &token) in forwarded.iter().enumerate() {
+        let BatchLane::Running(lane) = &mut sched.lanes[idx] else {
+            return Err("advanced lane is not running".into());
+        };
+        let tokenizer = m.tokenizer.as_ref().ok_or("tokenizer disappeared")?;
+        let emitted = emit_forwarded(
+            stdout,
+            tokenizer,
+            lane,
+            controls[idx].as_mut().ok_or("lane control missing")?,
+            token,
+            eos,
+            length_finish && i + 1 == forwarded.len(),
+        );
+        match emitted {
+            Ok(Some(length)) => {
+                if let Err(error) = finish_lane(sched, m, controls, idx, stdout, length) {
+                    lane_error(sched, m, controls, idx, stdout, &error, "validation")?;
+                }
+                break;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                lane_error(sched, m, controls, idx, stdout, &error, "validation")?;
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Serve concurrently admitted Qwen4 requests (greedy, or sampled with
 /// neutral penalties when the lane store is sampled) using the exact lane
 /// executor. All terminal ownership remains in `ContinuousBatchScheduler`.
@@ -1561,7 +1966,7 @@ pub fn drive_qwen4_lane_batch(
                 }
             }
             let tokenizer = m.tokenizer.as_ref().ok_or("tokenizer missing")?;
-            if let Some(barrier) = drain_qwen_batch_inbox(
+            let mut barrier = drain_qwen_batch_inbox(
                 sched,
                 m,
                 batch_size,
@@ -1572,7 +1977,49 @@ pub fn drive_qwen4_lane_batch(
                 stdout,
                 inbox,
                 true,
-            )? {
+            )?;
+            // Burst coalescing: a tick that already holds a burst (two or more queued requests
+            // whose front can take a free lane now), or a lone fresh request where it stays a
+            // lane (EP / PP lanes: `coalesce_arms`), waits while arrivals keep coming (each at
+            // most `gap` after the last, the whole wait capped at `ADMIT_COALESCE_GAPS` gaps,
+            // and only while a free lane is left for one more), so a burst's stragglers
+            // prefill in the SAME wave instead of one wave later. A lone request waits one gap
+            // at most (a gap with no arrival ends the wait); a queue behind a full lane set and
+            // a lone request a single device hands back to the singleton route never wait.
+            if let Some(gap) = admit_coalesce_gap().filter(|_| barrier.is_none()) {
+                if coalesce_arms(
+                    admit_coalesce_first_enabled(),
+                    sched.inbox.len(),
+                    page_wait.is_some(),
+                    || qwen4_lone_request_takes_lane(m),
+                ) && sched.assignable_front().is_some()
+                {
+                    let started = Instant::now();
+                    while barrier.is_none() {
+                        let room = sched.inbox.len() < sched.empty_lanes().len();
+                        let Some(wait) = coalesce_next_wait(gap, started.elapsed(), room) else {
+                            break;
+                        };
+                        match inbox.recv_timeout(wait) {
+                            Ok(msg) => inbox.push_front(msg),
+                            Err(_) => break,
+                        }
+                        barrier = drain_qwen_batch_inbox(
+                            sched,
+                            m,
+                            batch_size,
+                            is_vmm_batch_request_eligible,
+                            tokenizer,
+                            m.chat_template.as_ref(),
+                            ROUTE,
+                            stdout,
+                            inbox,
+                            true,
+                        )?;
+                    }
+                }
+            }
+            if let Some(barrier) = barrier {
                 inbox.push_front(barrier);
             }
             // The page budget gates the queue front before it takes a lane: a request
@@ -1862,6 +2309,7 @@ pub fn drive_qwen4_lane_batch(
                 }
             };
             if plan.requests.is_empty() && mesh_requests.is_empty() {
+                elastic_boundary(sched, m, gpu, &controls, None);
                 std::thread::sleep(Duration::from_millis(2));
                 continue;
             }
@@ -1909,6 +2357,34 @@ pub fn drive_qwen4_lane_batch(
                         }
                     }
                 }
+            }
+            // First tokens before the mesh window: on a step that carries one, the executor
+            // half's prefill ticks (a lane's committed first token with its abort / stop / EOS /
+            // length finish, `prefill_progress`) go out now rather than after the mesh decode
+            // window (14-21 ms) that would hold them. The mesh window carries only lanes that
+            // were Decoding when the step was planned, never a lane this step prefilled, so a
+            // lane finished here is not in it. Every other tick keeps its place below.
+            let mut early_emit = Duration::ZERO;
+            if first_token_before_mesh_enabled() && !mesh_requests.is_empty() {
+                let t_early = Instant::now();
+                let (prefill, rest): (Vec<_>, Vec<_>) = ticks
+                    .into_iter()
+                    .partition(|(advance, seed)| is_prefill_tick(&plan, advance, *seed));
+                ticks = rest;
+                for (advance, seed) in prefill {
+                    emit_tick(
+                        sched,
+                        m,
+                        gpu,
+                        &mut controls,
+                        stdout,
+                        &plan,
+                        eos,
+                        advance,
+                        seed,
+                    )?;
+                }
+                early_emit = t_early.elapsed();
             }
             let mut mesh_facts = MeshStepFacts::default();
             if !mesh_requests.is_empty() {
@@ -1960,117 +2436,17 @@ pub fn drive_qwen4_lane_batch(
                     })
             });
             for (advance, decode_seed) in ticks {
-                let idx = controls
-                    .iter()
-                    .position(|c| c.as_ref().is_some_and(|c| c.epoch == advance.epoch))
-                    .ok_or("qwen4 advance has no request owner")?;
-                let request = plan.requests.iter().find(|r| r.epoch == advance.epoch);
-                let is_prefill = decode_seed.is_none()
-                    && request.is_some_and(|r| r.kind == RequestStepKind::Prefill);
-                let plan_seed = match (decode_seed, request) {
-                    (Some(seed), _) => seed,
-                    (None, Some(r)) => plan.batch.tokens[r.rows.begin],
-                    (None, None) => return Err("qwen4 advance not in plan".into()),
-                };
-                if is_prefill {
-                    // `prefill_progress` for the lane's prompt chunk (the
-                    // last chunk is silent: `done < total` only).
-                    if let BatchLane::Running(lane) | BatchLane::Seeding(lane) = &sched.lanes[idx] {
-                        let progress = Owner::of(m, gpu).ok().and_then(|owner| {
-                            let cell = owner.bundle.lanes()?.lane(&advance.epoch)?;
-                            Some((cell.host.prefilled, cell.host.prompt.len()))
-                        });
-                        if let Some((done, total)) = progress {
-                            crate::common::emit_prefill_progress(
-                                stdout,
-                                &lane.key.id,
-                                Some(lane.key.attempt_id),
-                                done,
-                                total,
-                            );
-                        }
-                    }
-                    if !advance.committed_ids.is_empty() {
-                        let ctl = controls[idx].as_mut().ok_or("lane control missing")?;
-                        ctl.prefill_ms = ctl.start.elapsed().as_secs_f64() * 1000.0;
-                        ctl.decode_start = Some(Instant::now());
-                        if let BatchLane::Running(lane) = &mut sched.lanes[idx] {
-                            lane.prefill_done_at = ctl.decode_start;
-                        }
-                    }
-                    if advance.finish.as_deref() == Some("length") {
-                        finish_lane(sched, m, &mut controls, idx, stdout, true)?;
-                    }
-                    continue;
-                }
-                // All step participants committed before any bytes are published.
-                if let BatchLane::Running(lane) = &sched.lanes[idx] {
-                    if batch_check_abort(&lane.key.id, lane.key.attempt_id, lane.ticket.admission) {
-                        cancel_lane(sched, m, &mut controls, idx, stdout)?;
-                        continue;
-                    }
-                }
-                // Forwarded tokens: the plan seed, then every committed id but
-                // the last (the next pending seed). One entry for an AR row. A
-                // promoted lane's first plan seed was streamed by the singleton.
-                let skip_seed = controls[idx]
-                    .as_mut()
-                    .is_some_and(|c| std::mem::take(&mut c.skip_first_forward));
-                let forwarded = forwarded_tokens(plan_seed, &advance.committed_ids, skip_seed);
-                let length_finish = advance.finish.as_deref() == Some("length");
-                let _scope = match &sched.lanes[idx] {
-                    BatchLane::Running(lane) => BatchAttemptScope::enter_for_generation(
-                        &lane.key.id,
-                        lane.key.attempt_id,
-                        lane.ticket.admission,
-                    ),
-                    _ => return Err("advanced lane is not running".into()),
-                };
-                if forwarded.is_empty() && length_finish {
-                    // The already-streamed promoted seed was the only forwarded token.
-                    if let Err(error) = finish_lane(sched, m, &mut controls, idx, stdout, true) {
-                        lane_error(sched, m, &mut controls, idx, stdout, &error, "validation")?;
-                    }
-                    continue;
-                }
-                for (i, &token) in forwarded.iter().enumerate() {
-                    let BatchLane::Running(lane) = &mut sched.lanes[idx] else {
-                        return Err("advanced lane is not running".into());
-                    };
-                    let tokenizer = m.tokenizer.as_ref().ok_or("tokenizer disappeared")?;
-                    let emitted = emit_forwarded(
-                        stdout,
-                        tokenizer,
-                        lane,
-                        controls[idx].as_mut().ok_or("lane control missing")?,
-                        token,
-                        eos,
-                        length_finish && i + 1 == forwarded.len(),
-                    );
-                    match emitted {
-                        Ok(Some(length)) => {
-                            if let Err(error) =
-                                finish_lane(sched, m, &mut controls, idx, stdout, length)
-                            {
-                                lane_error(
-                                    sched,
-                                    m,
-                                    &mut controls,
-                                    idx,
-                                    stdout,
-                                    &error,
-                                    "validation",
-                                )?;
-                            }
-                            break;
-                        }
-                        Ok(None) => {}
-                        Err(error) => {
-                            lane_error(sched, m, &mut controls, idx, stdout, &error, "validation")?;
-                            break;
-                        }
-                    }
-                }
+                emit_tick(
+                    sched,
+                    m,
+                    gpu,
+                    &mut controls,
+                    stdout,
+                    &plan,
+                    eos,
+                    advance,
+                    decode_seed,
+                )?;
             }
             if let (Some(trace), Some((tokens, accepted))) = (trace.as_mut(), decoded) {
                 let active = controls
@@ -2086,8 +2462,15 @@ pub fn drive_qwen4_lane_batch(
                     accepted,
                     active,
                     sched.inbox.len(),
+                    early_emit,
                 );
             }
+            // The elastic reserve's step boundary (idle count, cache give-back, re-lend).
+            let long_prefill = plan
+                .requests
+                .iter()
+                .any(|r| r.kind == RequestStepKind::Prefill && long_prefill_route_rows(r.rows.len));
+            elastic_boundary(sched, m, gpu, &controls, Some(long_prefill));
         }
     })();
     mix.report();
@@ -2316,6 +2699,43 @@ mod tests {
         );
     }
 
+    /// The elastic reserve gives its bank back before the page numbers are read: the `admit`
+    /// reclaim precedes the first page decision, and a non-Fit verdict reclaims and decides again;
+    /// the loop ticks the reserve only after the step's commit.
+    #[test]
+    fn the_elastic_reclaim_precedes_the_page_decision() {
+        let src = include_str!("fn_batch.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("test module")];
+        let gate_fn = prod.find("fn page_budget_gate(").expect("gate fn");
+        let gate_src = &prod[gate_fn..];
+        let admit = gate_src
+            .find("elastic_reclaim(\"admit\")")
+            .expect("admit reclaim");
+        let first = gate_src
+            .find("gate_page_decision(")
+            .expect("first page decision");
+        let pages = gate_src
+            .find("elastic_reclaim(\"pages\")")
+            .expect("retry reclaim");
+        assert!(
+            admit < first && first < pages,
+            "reclaim, decide, reclaim again on a non-Fit verdict"
+        );
+        assert!(
+            gate_src[pages..].contains("gate_page_decision("),
+            "a retry decision follows the retry reclaim"
+        );
+        let drive = prod.find("pub fn drive_qwen4_lane_batch").expect("drive");
+        let body = &prod[drive..];
+        let commit = body
+            .find("executor.commit_step(&plan, out)")
+            .expect("commit");
+        let tick = body
+            .find("elastic_boundary(sched, m, gpu, &controls, Some(long_prefill))")
+            .expect("tick");
+        assert!(commit < tick, "the elastic tick follows the step's commit");
+    }
+
     use super::{attach_mtp_lane_stats, forwarded_tokens, LaneCtl, LaneSpecStats};
     use hipfire_runtime::emit_text::ThinkBudget;
     use hipfire_runtime::external_rows::FetchActivity;
@@ -2496,6 +2916,233 @@ mod tests {
     }
 
     #[test]
+    fn early_first_token_is_on_unless_exact_zero() {
+        use super::early_first_token_from;
+        for on in [None, Some(""), Some("1"), Some("on"), Some(" 1 ")] {
+            assert!(early_first_token_from(on), "{on:?}");
+        }
+        for off in [Some("0"), Some(" 0\n")] {
+            assert!(!early_first_token_from(off), "{off:?}");
+        }
+    }
+
+    #[test]
+    fn first_token_before_mesh_is_on_unless_exact_zero_and_needs_the_early_first_token() {
+        use super::first_token_before_mesh_from;
+        for on in [None, Some(""), Some("1"), Some("on"), Some(" 1 ")] {
+            assert!(first_token_before_mesh_from(true, on), "{on:?}");
+        }
+        for off in [Some("0"), Some(" 0\n")] {
+            assert!(!first_token_before_mesh_from(true, off), "{off:?}");
+        }
+        // With the early first token off there is no first token to move: today's order.
+        for any in [None, Some("1"), Some("0")] {
+            assert!(!first_token_before_mesh_from(false, any), "{any:?}");
+        }
+    }
+
+    #[test]
+    fn only_the_executors_prefill_rows_are_prefill_ticks() {
+        use super::is_prefill_tick;
+        use hipfire_runtime::slot_batch::{
+            BatchStepPlan, RequestAdvance, RequestRows, RequestStepKind, RowRange,
+        };
+        let epoch = |tag| RequestEpoch {
+            request_tag: tag,
+            owner_generation: 1,
+        };
+        let rows = |tag, begin, kind| RequestRows {
+            epoch: epoch(tag),
+            rows: RowRange { begin, len: 1 },
+            kind,
+        };
+        let advance = |tag| RequestAdvance {
+            epoch: epoch(tag),
+            committed_ids: vec![5],
+            committed_position: 1,
+            accepted_drafts: 0,
+            verified_rows: 0,
+            finish: None,
+        };
+        let plan = BatchStepPlan {
+            requests: vec![
+                rows(1, 0, RequestStepKind::Prefill),
+                rows(2, 1, RequestStepKind::Ar),
+                rows(3, 2, RequestStepKind::Verify { draft_len: 1 }),
+            ],
+            ..Default::default()
+        };
+        assert!(is_prefill_tick(&plan, &advance(1), None));
+        assert!(!is_prefill_tick(&plan, &advance(2), None));
+        assert!(!is_prefill_tick(&plan, &advance(3), None));
+        // A mesh window carries its seed and is never in the executor's plan.
+        assert!(!is_prefill_tick(&plan, &advance(1), Some(9)));
+        assert!(!is_prefill_tick(&plan, &advance(4), None));
+    }
+
+    /// The order is the point: the executor's prefill ticks leave between the executor's
+    /// commit and the mesh decode window, behind the kill switch and only on a step that
+    /// carries a mesh window; every other tick keeps the single emission loop after it. The
+    /// mesh window's requests derive from lanes that were already Decoding at plan time,
+    /// so a lane a step prefilled (and may finish by its first token) is never in it.
+    #[test]
+    fn prefill_ticks_are_emitted_before_the_mesh_decode_step() {
+        let src = include_str!("fn_batch.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("test module")];
+        let drive = prod.find("pub fn drive_qwen4_lane_batch").expect("drive");
+        let body = &prod[drive..];
+        let commit = body
+            .find("executor.commit_step(&plan, out)")
+            .expect("executor commit");
+        let early = body
+            .find("if first_token_before_mesh_enabled() && !mesh_requests.is_empty()")
+            .expect("before-mesh emission");
+        let mesh = body.find("ep_mesh_decode_step").expect("mesh half");
+        let rest = body
+            .find("for (advance, decode_seed) in ticks")
+            .expect("remaining emission");
+        assert!(
+            commit < early && early < mesh && mesh < rest,
+            "commit, prefill ticks, mesh window, then every other tick"
+        );
+        let block = &body[early..mesh];
+        assert!(block.contains("is_prefill_tick(&plan, advance, *seed)"));
+        assert!(block.contains("emit_tick("));
+        // Both positions share one per-tick emission; the loop body is not duplicated.
+        assert_eq!(prod.matches("fn emit_tick(").count(), 1);
+        assert_eq!(body.matches("emit_tick(").count(), 2);
+        assert_eq!(
+            prod.matches("emit_forwarded(").count(),
+            3,
+            "decl + 2 in emit_tick"
+        );
+        // The emit time spent ahead of the mesh window is reported under `emit`.
+        assert!(body.contains("early_emit = t_early.elapsed();"));
+        assert!(body[body.find("trace.line(").expect("trace")..].contains("early_emit,"));
+        // plan_step: mesh requests come from `chosen`, which come from Decoding lanes;
+        // prefill rows come from Prefilling lanes only.
+        let plan_fn = prod.find("fn plan_step(").expect("plan_step");
+        let plan_src = &prod[plan_fn..drive];
+        let decoding = plan_src.find("let decoding: Vec<_>").expect("decoding set");
+        assert!(plan_src[decoding..].contains("l.host.status == LaneStatus::Decoding"));
+        assert!(plan_src.contains("let chosen: Vec<_> = (0..count.min(row_budget))"));
+        assert!(plan_src.contains("decoding[(*cursor + j) % count]"));
+        let mesh_build = plan_src
+            .find("mesh_requests = controls")
+            .expect("mesh requests");
+        assert!(plan_src[mesh_build..].contains("chosen.contains(&c.slot)"));
+        assert!(plan_src.contains("LaneStatus::Prefilling => rows.push(("));
+    }
+
+    #[test]
+    fn admit_coalesce_gap_defaults_to_2ms_and_zero_kills_it() {
+        use super::{admit_coalesce_from, coalesce_next_wait};
+        use std::time::Duration;
+        let ms = Duration::from_millis;
+        assert_eq!(admit_coalesce_from(None), Some(ms(2)));
+        assert_eq!(admit_coalesce_from(Some("")), Some(ms(2)));
+        assert_eq!(admit_coalesce_from(Some("x")), Some(ms(2)));
+        assert_eq!(admit_coalesce_from(Some(" 5 ")), Some(ms(5)));
+        assert_eq!(admit_coalesce_from(Some("500")), Some(ms(20)));
+        assert_eq!(admit_coalesce_from(Some("0")), None);
+        // A lone request's whole wait is its first gap (the timeout is the gap itself, at the
+        // default and at the clamp), and a gap that brings no arrival ends it.
+        for gap in [1, 2, 5, 20].map(ms) {
+            assert_eq!(coalesce_next_wait(gap, Duration::ZERO, true), Some(gap));
+        }
+    }
+
+    #[test]
+    fn admit_coalesce_first_is_on_unless_exact_zero() {
+        use super::admit_coalesce_first_from;
+        for on in [None, Some(""), Some("1"), Some("on"), Some(" 1 ")] {
+            assert!(admit_coalesce_first_from(on), "{on:?}");
+        }
+        for off in [Some("0"), Some(" 0\n")] {
+            assert!(!admit_coalesce_first_from(off), "{off:?}");
+        }
+    }
+
+    #[test]
+    fn the_wait_budget_is_five_gaps_with_a_free_lane_left() {
+        use super::{coalesce_next_wait, ADMIT_COALESCE_GAPS};
+        let gap = Duration::from_millis(2);
+        // One gap at a time, the last one trimmed to the budget, none past it.
+        assert_eq!(
+            coalesce_next_wait(gap, Duration::from_millis(9), true),
+            Some(Duration::from_millis(1))
+        );
+        assert_eq!(
+            coalesce_next_wait(gap, gap * ADMIT_COALESCE_GAPS, true),
+            None
+        );
+        assert_eq!(
+            coalesce_next_wait(gap, gap * (ADMIT_COALESCE_GAPS + 3), true),
+            None
+        );
+        // No free lane left for one more: no wait at any point.
+        assert_eq!(coalesce_next_wait(gap, Duration::ZERO, false), None);
+    }
+
+    /// The drive's wait is the pure rules plus the inbox: armed by `coalesce_arms` (the front
+    /// assignable, a gap configured, no barrier), one `recv_timeout` per gap, drained after
+    /// each arrival, ended by the first gap with none. A lone request is only asked about its
+    /// topology after the switch and the page hold.
+    #[test]
+    fn the_drive_waits_with_the_arming_and_timeout_rules() {
+        let src = include_str!("fn_batch.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("test module")];
+        let drive = prod.find("pub fn drive_qwen4_lane_batch").expect("drive");
+        let body = &prod[drive..];
+        let at = body
+            .find("if let Some(gap) = admit_coalesce_gap()")
+            .expect("coalescing block");
+        let end = at
+            + body[at..]
+                .find("if let Some(barrier) = barrier")
+                .expect("block end");
+        let block = &body[at..end];
+        assert!(block.contains(".filter(|_| barrier.is_none())"));
+        let arms = block.find("coalesce_arms(").expect("arming rule");
+        let rest = &block[arms..];
+        let first = rest.find("admit_coalesce_first_enabled()").expect("switch");
+        let held = rest.find("page_wait.is_some()").expect("page hold");
+        let topology = rest
+            .find("|| qwen4_lone_request_takes_lane(m)")
+            .expect("lone topology");
+        let front = rest
+            .find("sched.assignable_front().is_some()")
+            .expect("assignable front");
+        assert!(first < held && held < topology && topology < front);
+        assert!(rest.contains("coalesce_next_wait(gap, started.elapsed(), room)"));
+        let recv = rest.find("inbox.recv_timeout(wait)").expect("one gap");
+        let none = rest.find("Err(_) => break").expect("empty gap ends");
+        let drain = rest.find("drain_qwen_batch_inbox(").expect("drain");
+        assert!(recv < none && none < drain);
+        assert_eq!(block.matches("recv_timeout(").count(), 1);
+    }
+
+    #[test]
+    fn an_early_first_token_is_skipped_as_the_next_plan_seed() {
+        // The prefill step streams the pick and sets `skip_first_forward`; the source keeps
+        // that order (flag before the emit) and only for a running lane not already skipping.
+        let src = include_str!("fn_batch.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("test module")];
+        let at = prod
+            .find("let early = early_first_token_enabled()")
+            .expect("early emit");
+        let body = &prod[at..];
+        let flag = body
+            .find("ctl.skip_first_forward = true;")
+            .expect("skip flag");
+        let emit = body
+            .find("advance.committed_ids[0]")
+            .expect("emit the pick");
+        assert!(flag < emit);
+        assert!(body[..flag].contains("!c.skip_first_forward"));
+    }
+
+    #[test]
     fn mesh_mix_sums_windows_by_the_lanes_a_step_carried() {
         use super::{MeshMix, MeshStepFacts};
         let mut mix = MeshMix::default();
@@ -2584,6 +3231,56 @@ mod tests {
         }
     }
 
+    /// The lone-request wait follows the hand-back policy: it is armed exactly where a lone
+    /// request stays a lane (EP / PP lanes), never where the singleton route takes it (single
+    /// device, PP with a speculator: a post-entry lone arrival is handed back, so a wait would
+    /// only delay its singleton start). On a lane topology a session-reuse hand-back still
+    /// waited its one gap: the probe runs at assignment, after the wait.
+    #[test]
+    fn a_lone_request_waits_only_where_it_stays_a_lane_and_the_switch_is_on() {
+        use super::{coalesce_arms, lone_arrival_hands_back};
+        // A burst arms whatever the switch and topology, without asking the topology.
+        for first in [true, false] {
+            for queued in [2usize, 3, 8] {
+                assert!(coalesce_arms(first, queued, false, || {
+                    panic!("burst: no topology probe")
+                }));
+            }
+            assert!(!coalesce_arms(first, 0, false, || panic!("empty queue")));
+        }
+        // A lone fresh request: on where it stays a lane, off with the kill switch (today's
+        // `>= 2` rule), never when the page budget already holds it.
+        assert!(coalesce_arms(true, 1, false, || true));
+        assert!(!coalesce_arms(true, 1, false, || false));
+        assert!(!coalesce_arms(false, 1, false, || {
+            panic!("kill switch: no topology probe")
+        }));
+        assert!(!coalesce_arms(true, 1, true, || {
+            panic!("page-held: no topology probe")
+        }));
+        for (topology, speculator, armed) in [
+            ("single", false, false),
+            ("single", true, false),
+            ("pp", true, false),
+            ("pp", false, true),
+            ("ep", false, true),
+            ("ep", true, true),
+        ] {
+            let lone_lane = crate::batch::qwen4_lone_lane(topology, speculator);
+            assert_eq!(
+                coalesce_arms(true, 1, false, || lone_lane),
+                armed,
+                "{topology} speculator={speculator}"
+            );
+            if !armed {
+                assert!(
+                    lone_arrival_hands_back(true, lone_lane, false, || panic!("no probe")),
+                    "{topology} speculator={speculator}: a lone arrival without a wait takes the singleton route"
+                );
+            }
+        }
+    }
+
     /// Scripted lane model: a lane's next id is a pure function of its own
     /// prompt and position (greedy), never of the cohort it runs in.
     fn scripted_next(prompt: &[u32], generated: usize) -> u32 {
@@ -2593,19 +3290,49 @@ mod tests {
         h.wrapping_add((generated as u32).wrapping_mul(2_654_435_761)) % 50_000
     }
 
-    /// Daemon + driver admission for `n` requests that reach an idle server at
-    /// once, as `daemon dispatch -> enqueue -> drive_qwen4_lane_batch` does it:
-    /// the daemon sees the FIRST request with no peer visible yet; `late`
-    /// requests arrive only after that first decision (during the first lane
-    /// step); the rest are already in the inbox when the driver first drains.
-    /// Returns the per-step active lane counts (None when the first request
-    /// would have run as a singleton) and every lane's scripted ids.
+    /// The coalescing configuration a simulated driver runs with.
+    #[derive(Clone, Copy)]
+    struct Coalesce {
+        /// `HIPFIRE_LANE_ADMIT_COALESCE_MS` (`0`: the whole wait is off).
+        gap_ms: u64,
+        /// `HIPFIRE_LANE_ADMIT_COALESCE_FIRST`.
+        first: bool,
+    }
+
+    const COALESCE_DEFAULT: Coalesce = Coalesce {
+        gap_ms: 2,
+        first: true,
+    };
+
+    /// [`simulate_burst_at`] for `n` requests of which the last `late` land during the first
+    /// lane step (50 ms in, long past the coalescing budget) and the rest are in the inbox when
+    /// the driver first drains.
     fn simulate_burst(
         topology: &str,
         n: usize,
         late: usize,
         steps: usize,
     ) -> Option<(Vec<usize>, Vec<Vec<u32>>)> {
+        let arrivals: Vec<u64> = (0..n).map(|i| if i < n - late { 0 } else { 50 }).collect();
+        simulate_burst_at(topology, COALESCE_DEFAULT, &arrivals, steps)
+            .map(|(active, ids, _)| (active, ids))
+    }
+
+    /// Daemon + driver admission for requests that reach an idle server, as
+    /// `daemon dispatch -> enqueue -> drive_qwen4_lane_batch` does it: the
+    /// daemon sees the FIRST request with no peer visible yet; request `i` reaches the
+    /// driver `arrivals_ms[i]` ms after its first drain (`0`: already in the inbox then;
+    /// non-decreasing). The first tick runs the driver's coalescing wait with its own arming
+    /// rule and timeouts (`coalesce_arms`, `coalesce_next_wait`); whatever lands after it joins
+    /// at the next step. Returns the per-step active lane counts (None when the first request
+    /// would have run as a singleton), every lane's scripted ids and the first tick's wait in
+    /// ms.
+    fn simulate_burst_at(
+        topology: &str,
+        coalesce: Coalesce,
+        arrivals_ms: &[u64],
+        steps: usize,
+    ) -> Option<(Vec<usize>, Vec<Vec<u32>>, u64)> {
         // The terminal registry is process-global and other lib tests clear it
         // wholesale: hold the crate's generation test lock for the whole run.
         let _registry = crate::ar::generation_test_lock();
@@ -2615,6 +3342,8 @@ mod tests {
         use hipfire_engine::terminal::{
             batch_announce_terminal, batch_clear_terminal, batch_terminal_generation, AttemptKey,
         };
+        let n = arrivals_ms.len();
+        assert!(n >= 1 && arrivals_ms[0] == 0 && arrivals_ms.windows(2).all(|w| w[0] <= w[1]));
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(7000);
         let base = NEXT.fetch_add(n as u64, std::sync::atomic::Ordering::SeqCst);
         let make = |i: usize| {
@@ -2666,13 +3395,46 @@ mod tests {
         let mut lanes: Vec<(usize, Vec<u32>)> = Vec::new();
         let mut ids = vec![Vec::new(); n];
         let mut active_per_step = Vec::new();
+        let mut waited_ms = 0u64;
         for step in 0..steps {
-            // Drain: everything but the `late` tail is in the inbox at the first
-            // drain; the late ones show up after the first step.
-            let due = if step == 0 { n - late } else { n };
+            // Drain: what is already there at the first drain, then everything that landed
+            // since (the late ones show up after the first step).
+            let due = if step == 0 {
+                arrivals_ms.iter().take_while(|&&at| at == 0).count()
+            } else {
+                n
+            };
             while arrived < due {
                 assert!(sched.enqueue(requests[arrived].clone()));
                 arrived += 1;
+            }
+            // The driver's coalescing wait (first tick only: later ticks have nothing queued).
+            if step == 0
+                && coalesce.gap_ms > 0
+                && super::coalesce_arms(coalesce.first, sched.inbox.len(), false, || lone_lane)
+                && sched.assignable_front().is_some()
+            {
+                let gap = Duration::from_millis(coalesce.gap_ms);
+                loop {
+                    let room = sched.inbox.len() < sched.empty_lanes().len();
+                    let Some(wait) =
+                        super::coalesce_next_wait(gap, Duration::from_millis(waited_ms), room)
+                    else {
+                        break;
+                    };
+                    let wait = wait.as_millis() as u64;
+                    match arrivals_ms.get(arrived) {
+                        Some(&at) if at - waited_ms <= wait => {
+                            waited_ms = at;
+                            assert!(sched.enqueue(requests[arrived].clone()));
+                            arrived += 1;
+                        }
+                        _ => {
+                            waited_ms += wait;
+                            break;
+                        }
+                    }
+                }
             }
             while let Some((key, ticket)) = sched.try_assign_one() {
                 let i = keys.iter().position(|k| *k == key).unwrap();
@@ -2700,21 +3462,35 @@ mod tests {
         for (i, r) in requests.iter().enumerate() {
             batch_clear_terminal(&r.key.id, base + i as u64);
         }
-        Some((active_per_step, ids))
+        Some((active_per_step, ids, waited_ms))
     }
 
     #[test]
     fn simultaneous_arrivals_on_ep_and_pp_decode_as_lanes_from_the_first_step() {
         for topology in ["ep", "pp"] {
             for n in [1usize, 4, 8] {
-                let (active, ids) =
-                    simulate_burst(topology, n, 0, 6).expect("EP/PP lone request takes a lane");
-                assert_eq!(active, vec![n; 6], "{topology} C{n}: active from step 0");
-                for (i, lane_ids) in ids.iter().enumerate() {
-                    let solo = (0..6)
-                        .map(|g| scripted_next(&[i as u32 + 1, 7, 11], g))
-                        .collect::<Vec<_>>();
-                    assert_eq!(lane_ids, &solo, "{topology} C{n} lane {i}: ids unchanged");
+                // Simultaneous arrivals are lanes from step 0 with the lone-first wait on or
+                // killed, and with the whole wait off: nothing to join, same ids.
+                for coalesce in [
+                    COALESCE_DEFAULT,
+                    Coalesce {
+                        first: false,
+                        ..COALESCE_DEFAULT
+                    },
+                    Coalesce {
+                        gap_ms: 0,
+                        ..COALESCE_DEFAULT
+                    },
+                ] {
+                    let (active, ids, _) = simulate_burst_at(topology, coalesce, &vec![0; n], 6)
+                        .expect("EP/PP lone request takes a lane");
+                    assert_eq!(active, vec![n; 6], "{topology} C{n}: active from step 0");
+                    for (i, lane_ids) in ids.iter().enumerate() {
+                        let solo = (0..6)
+                            .map(|g| scripted_next(&[i as u32 + 1, 7, 11], g))
+                            .collect::<Vec<_>>();
+                        assert_eq!(lane_ids, &solo, "{topology} C{n} lane {i}: ids unchanged");
+                    }
                 }
             }
         }
@@ -2723,19 +3499,113 @@ mod tests {
     #[test]
     fn late_arrivals_join_the_lone_ep_lane_at_the_next_step() {
         // The daemon dispatched request 0 alone; 7 more land during its first
-        // step: they are lanes at step 1 (active 8), not a queue behind a
-        // singleton, and every lane's ids are the solo ids.
-        let (active, ids) = simulate_burst("ep", 8, 7, 6).expect("lane");
-        assert_eq!(active, vec![1, 8, 8, 8, 8, 8]);
-        // A late lane starts at its own position 0 at the step it joins.
-        for (i, lane_ids) in ids.iter().enumerate() {
-            let expect = if i == 0 { 6 } else { 5 };
-            assert_eq!(lane_ids.len(), expect, "lane {i}");
-            let solo = (0..lane_ids.len())
-                .map(|g| scripted_next(&[i as u32 + 1, 7, 11], g))
-                .collect::<Vec<_>>();
-            assert_eq!(lane_ids, &solo);
+        // step (past the coalescing wait): they are lanes at step 1 (active 8), not a
+        // queue behind a singleton, and every lane's ids are the solo ids.
+        for first in [true, false] {
+            let arrivals = [0, 50, 50, 50, 50, 50, 50, 50];
+            let coalesce = Coalesce {
+                first,
+                ..COALESCE_DEFAULT
+            };
+            let (active, ids, _) = simulate_burst_at("ep", coalesce, &arrivals, 6).expect("lane");
+            assert_eq!(active, vec![1, 8, 8, 8, 8, 8], "first={first}");
+            // A late lane starts at its own position 0 at the step it joins.
+            for (i, lane_ids) in ids.iter().enumerate() {
+                let expect = if i == 0 { 6 } else { 5 };
+                assert_eq!(lane_ids.len(), expect, "lane {i}");
+                let solo = (0..lane_ids.len())
+                    .map(|g| scripted_next(&[i as u32 + 1, 7, 11], g))
+                    .collect::<Vec<_>>();
+                assert_eq!(lane_ids, &solo);
+            }
         }
+        assert_eq!(
+            simulate_burst("ep", 8, 7, 6).expect("lane").0,
+            vec![1, 8, 8, 8, 8, 8]
+        );
+    }
+
+    #[test]
+    fn a_lone_first_request_waits_exactly_one_gap_and_the_kill_switch_restores_no_wait() {
+        for topology in ["ep", "pp"] {
+            let run = |coalesce| {
+                simulate_burst_at(topology, coalesce, &[0], 3).expect("EP/PP lone request lane")
+            };
+            // A lone request with no second arrival: one gap, not more (<= 2 ms by default).
+            let (active, _, waited) = run(COALESCE_DEFAULT);
+            assert_eq!((active, waited), (vec![1, 1, 1], 2), "{topology}");
+            let (_, _, waited) = run(Coalesce {
+                gap_ms: 20,
+                ..COALESCE_DEFAULT
+            });
+            assert_eq!(waited, 20, "{topology}: one gap at the clamp");
+            // `HIPFIRE_LANE_ADMIT_COALESCE_FIRST=0`: today's `>= 2` rule, no wait for a lone one.
+            let (_, _, waited) = run(Coalesce {
+                first: false,
+                ..COALESCE_DEFAULT
+            });
+            assert_eq!(waited, 0, "{topology}: kill switch");
+            // `HIPFIRE_LANE_ADMIT_COALESCE_MS=0`: the whole wait is off.
+            let (_, _, waited) = run(Coalesce {
+                gap_ms: 0,
+                ..COALESCE_DEFAULT
+            });
+            assert_eq!(waited, 0, "{topology}: gap off");
+        }
+    }
+
+    #[test]
+    fn an_arrival_inside_the_first_gap_joins_the_first_step() {
+        for topology in ["ep", "pp"] {
+            let at = |arrivals: &[u64], coalesce| {
+                simulate_burst_at(topology, coalesce, arrivals, 5).expect("lane")
+            };
+            let off = Coalesce {
+                first: false,
+                ..COALESCE_DEFAULT
+            };
+            // Two arrivals 1 ms after the first: the lone first request waits for them (each
+            // re-arms the gap; one empty gap ends it) and all three prefill in step 0. With the
+            // kill switch the first request runs alone and they join one step later.
+            let (active, ids, waited) = at(&[0, 1, 1], COALESCE_DEFAULT);
+            assert_eq!((active, waited), (vec![3; 5], 3), "{topology}");
+            let solo = |i: usize, len: usize| {
+                (0..len)
+                    .map(|g| scripted_next(&[i as u32 + 1, 7, 11], g))
+                    .collect::<Vec<_>>()
+            };
+            for (i, lane_ids) in ids.iter().enumerate() {
+                assert_eq!(lane_ids, &solo(i, 5), "{topology} lane {i}");
+            }
+            let (active, ids, waited) = at(&[0, 1, 1], off);
+            assert_eq!((active, waited), (vec![1, 3, 3, 3, 3], 0), "{topology}");
+            for (i, lane_ids) in ids.iter().enumerate() {
+                let len = if i == 0 { 5 } else { 4 };
+                assert_eq!(lane_ids, &solo(i, len), "{topology} lane {i}");
+            }
+            // A burst (two queued at the first drain) waits under either switch.
+            for coalesce in [COALESCE_DEFAULT, off] {
+                let (active, _, waited) = at(&[0, 0, 1], coalesce);
+                assert_eq!((active, waited), (vec![3; 5], 3), "{topology}");
+            }
+            // An arrival past the gap is one step later; it never extends the wait.
+            let (active, _, waited) = at(&[0, 3], COALESCE_DEFAULT);
+            assert_eq!((active, waited), (vec![1, 2, 2, 2, 2], 2), "{topology}");
+        }
+    }
+
+    #[test]
+    fn the_first_wait_is_capped_at_five_gaps_and_by_free_lanes() {
+        // Arrivals every 2 ms keep re-arming the 2 ms gap, but the tick's whole wait stops at
+        // 5 gaps (10 ms): the sixth arrival (12 ms) joins one step later.
+        let (active, _, waited) =
+            simulate_burst_at("ep", COALESCE_DEFAULT, &[0, 2, 4, 6, 8, 10, 12], 4).expect("lane");
+        assert_eq!((active, waited), (vec![6, 7, 7, 7], 10));
+        // Seven arrivals 1 ms after the first fill all 8 lanes: no gap is spent past the
+        // last free lane.
+        let (active, _, waited) =
+            simulate_burst_at("ep", COALESCE_DEFAULT, &[0, 1, 1, 1, 1, 1, 1, 1], 3).expect("lane");
+        assert_eq!((active, waited), (vec![8, 8, 8], 1));
     }
 
     #[test]
@@ -2746,5 +3616,14 @@ mod tests {
         assert!(simulate_burst("single", 8, 0, 3).is_none());
         assert!(crate::batch::qwen4_lone_lane("ep", true));
         assert!(!crate::batch::qwen4_lone_lane("pp", true));
+        // Neither singleton-route topology waits for a lone request, with the new switch on.
+        for (topology, speculator) in [("single", false), ("single", true), ("pp", true)] {
+            let lone_lane = crate::batch::qwen4_lone_lane(topology, speculator);
+            assert!(!lone_lane, "{topology} speculator={speculator}");
+            assert!(
+                !super::coalesce_arms(true, 1, false, || lone_lane),
+                "{topology} speculator={speculator}"
+            );
+        }
     }
 }

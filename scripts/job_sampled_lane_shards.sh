@@ -5,7 +5,7 @@
 # job_sampled_lane_shards.sh SPEC... -- inside ONE fabric `correct` job on cards C,B (EP2): runs
 # EP2 sampled lane-suite shards one after another, each in its own fresh process
 # (`scripts/sampled_lane_suite.sh shard`, topology ep2). A SPEC is ARM:LANES:START..END, e.g.
-#   lane_ar:8:0..8 lane_ar:1:0..8 lane_batched:8:0..8 lane_batched:1:0..8 lane_cross:8:0..8 (lanes 1..8; lane_cross at 8 only)
+#   lane_ar:8:0..8 lane_ar:1:0..8 lane_batched:8:0..8 lane_batched:1:0..8 lane_cross:8:0..8 lane_copy:2:0..8 (lanes 1..8; lane_cross at 8 only; lane_copy at 1 or 2 only, PROMPT=copy, own RUNROOT, cohort lane_ar+lane_copy)
 # LANE_K (2 default, or 3) is part of every shard's identity: use the same value for every shard, the merge and the verdict.
 #
 # job_sampled_lane_shards.sh merge|verdict LANES -- CPU only, no fabric job and no GPU: the shard merge /
@@ -27,6 +27,7 @@
 #                mgfn/kcache-hiptrx), VHOME (HIPFIRE_HOME with cache/verified-artifacts.json holding the model,
 #                .ple-q4 and .expert-hotset hashes; default $RUNROOT/hipfire-home), TRIALS (default 2000, the
 #                cohort total, identical for every shard), PROMPT (default prose, identical for every arm),
+#                SAMPLED_TEMP, SAMPLED_TOP_P (sampler, default unset = the test's 1.0 / 0.95),
 #                BUDGET_SECS (default 1440: the job's own clock; a shard that cannot finish in what is left
 #                is not started), EPLANE_DRY=1 (print the environment and commands, run nothing).
 #
@@ -55,7 +56,8 @@ DRY=${EPLANE_DRY:-0}
 specs=()
 for spec in "$@"; do
   [[ $MODE != shard ]] && { specs+=("$spec"); continue; }
-  [[ $spec =~ ^(lane_ar|lane_batched|lane_adaptive|lane_cross):[1-8]:[0-9]+\.\.[0-9]+$ ]] || { echo "bad SPEC '$spec' (ARM:LANES:START..END)" >&2; exit 2; }
+  [[ $spec =~ ^(lane_ar|lane_batched|lane_adaptive|lane_copy|lane_cross):[1-8]:[0-9]+\.\.[0-9]+$ ]] || { echo "bad SPEC '$spec' (ARM:LANES:START..END)" >&2; exit 2; }
+  [[ $spec != lane_copy:* || $spec =~ ^lane_copy:[12]: ]] || { echo "lane_copy runs at 1 or 2 lanes only ('$spec')" >&2; exit 2; }
   [[ $spec != lane_cross:* || $spec == lane_cross:8:* ]] || { echo "lane_cross runs at 8 lanes only ('$spec')" >&2; exit 2; }
   specs+=("$spec")
 done
@@ -91,6 +93,11 @@ done
 [[ $MODE == shard ]] || EV+=(HIPFIRE_DEVICES="$HIPFIRE_DEVICES" ROCR_VISIBLE_DEVICES="${ROCR_VISIBLE_DEVICES:-}")
 EV+=(HOME="$RUNROOT/home" HIPFIRE_HOME="$VHOME" HIPFIRE_LOCK_DIR="$RUNROOT/lockdir" HIPFIRE_KERNEL_CACHE="$KCACHE"
      HIPFIRE_NO_REGISTRY_FETCH=1 HIPFIRE_PLE_FORMAT=q4 HIPFIRE_SESSION_CACHE_BYTES=0)
+# Optional sampler settings (identical for every shard, the merge and the verdict): SAMPLED_TEMP / SAMPLED_TOP_P
+# reach the test as HIPFIRE_SAMPLED_MTP_TEMP / _TOP_P (default 1.0 / 0.95, the neutral product sampler). A flatter
+# sampler (e.g. 2.0 / 1.0) spreads a near-deterministic fixture over many ids, so a wrong copy-window law has mass to show in.
+[[ -z ${SAMPLED_TEMP:-} ]] || EV+=(HIPFIRE_SAMPLED_MTP_TEMP="$SAMPLED_TEMP")
+[[ -z ${SAMPLED_TOP_P:-} ]] || EV+=(HIPFIRE_SAMPLED_MTP_TOP_P="$SAMPLED_TOP_P")
 if [[ $DRY != 1 ]]; then mkdir -p "$O/logs" "$RUNROOT/home" "$RUNROOT/lockdir" || exit 2; fi
 [[ $DRY == 1 || $MODE == shard ]] || rmdir "$O/logs"
 

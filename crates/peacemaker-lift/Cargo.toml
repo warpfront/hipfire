@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 peacemaker-ir = { path = "../peacemaker-ir" }
+peacemaker-cdna = { path = "../peacemaker-cdna" }
 object = { version = "0.38", default-features = false, features = ["read", "write"] }
 smallvec = "1"
 rmpv = "1"

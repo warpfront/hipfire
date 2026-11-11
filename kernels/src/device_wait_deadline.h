@@ -14,9 +14,9 @@
 // s_sendmsg_rtn_b64 MSG_RTN_GET_REALTIME on gfx11/gfx12, s_memrealtime on
 // older targets). The first poll and the loop body match the unbounded wait,
 // including the s_sleep. Every HF_WAIT_CHECK_INTERVAL polls the waiter reads
-// the counter. A healthy wait ends within microseconds, so it pays only that
-// read. Once the wait passes HF_WAIT_QUIET_TICKS, the waiter also reads the
-// host-mapped error block at each check, a PCIe round trip:
+// the counter. A short wait pays only that read. Once the wait passes
+// HF_WAIT_QUIET_TICKS, the waiter also reads the host-mapped error block, a
+// PCIe round trip, at most once per HF_WAIT_HOST_CHECK_TICKS:
 //   - The error block's code is nonzero. An earlier wait on this device timed
 //     out in this step, so the waiter stops rather than spending its own full
 //     deadline.
@@ -65,12 +65,25 @@ struct hf_device_wait_block {
 // reads the counter.
 #define HF_WAIT_CHECK_INTERVAL 16u
 
-// Elapsed ticks before a waiter reads the host-mapped error block: 100 us at
-// the 100 MHz realtime counter of RDNA3/RDNA4. Below this, a check costs one
-// counter read and no PCIe round trip, so a healthy rendezvous does not slow
-// down. Above it, a stale or fresh timeout stops the waiter within the next
-// check.
-#define HF_WAIT_QUIET_TICKS 10000ull
+// Elapsed ticks before a waiter first reads the host-mapped error block: 1 ms
+// at the 100 MHz realtime counter of RDNA3/RDNA4. Below this, a check costs one
+// counter read and no PCIe round trip. Healthy waits do pass 100 us: an EP2
+// decode all-reduce waits out the peer's routed-expert skew, 100-630 us on
+// some layers of most steps (rocprof j8299: p99.9 281-511 us, 3 of ~27k waits
+// over 1 ms). The previous 100 us quiet period with a read at EVERY check
+// (every 16 polls) made each waiting wave issue two host reads per
+// microsecond; with 256-960 waves polling, the reads queued at the root
+// complex and a waiter noticed the peer's data 30-120 us late instead of
+// ~8-15 us (j8299 served: the waiting rank left the all-reduce 40 / 77 us after
+// the peer's arrival on waits over 100 us, 8.3 / 8.8 us below, story / code C1;
+// lab bench j8304). Even one read per wave per 100 us still cost 20-50 us when
+// the arrival met the synchronized burst of every wave's read.
+#define HF_WAIT_QUIET_TICKS 100000ull
+
+// Ticks between two reads of the host-mapped error block by one waiter after
+// HF_WAIT_QUIET_TICKS (1 ms). Stopping on a timeout recorded by another wait
+// takes at most this long; the 500 ms deadline is checked at the same cadence.
+#define HF_WAIT_HOST_CHECK_TICKS 100000ull
 
 // True when the waiter must stop: either another wait already recorded a
 // timeout on this device, or this wait has passed its deadline (recorded here).
@@ -104,7 +117,8 @@ __device__ __forceinline__ bool hf_wait_expired(
 // with an early return) compiled to extra SALU per poll and slowed the
 // gfx1100 rendezvous kernels by 1-3% on gfx1201. The deadline runs from the
 // first counter read, HF_WAIT_CHECK_INTERVAL polls in. The polls before it
-// add microseconds to a 500 ms bound.
+// add microseconds to a 500 ms bound. The host block is read first at
+// HF_WAIT_QUIET_TICKS, then every HF_WAIT_HOST_CHECK_TICKS.
 template <typename Ready>
 __device__ __forceinline__ bool hf_bounded_wait(
     Ready ready,
@@ -115,6 +129,7 @@ __device__ __forceinline__ bool hf_bounded_wait(
         return true;
     }
     unsigned long long start = 0ull;
+    unsigned long long next_host = HF_WAIT_QUIET_TICKS;
     for (bool first_check = true;; first_check = false) {
         unsigned int budget = HF_WAIT_CHECK_INTERVAL;
         bool done;
@@ -128,8 +143,11 @@ __device__ __forceinline__ bool hf_bounded_wait(
         const unsigned long long now = wall_clock64();
         if (first_check) {
             start = now;
-        } else if (hf_wait_expired(block, now - start, site, detail)) {
-            return false;
+        } else if (now - start >= next_host) {
+            if (hf_wait_expired(block, now - start, site, detail)) {
+                return false;
+            }
+            next_host = now - start + HF_WAIT_HOST_CHECK_TICKS;
         }
     }
 }

@@ -49,7 +49,7 @@
 //!   pseudocode leaves the high half unspecified. `[UNVERIFIED: confirm on MI300X]`
 use super::xlane::{dpp_lane_enabled, dpp_read, sdwa_dst, sdwa_src};
 use super::{fault, unsupported, Flow, SimError, SimResult, Ty, Wave};
-use crate::enc::vop::{Dpp, Sdwa, SdwaSel, Vop1Op, Vop2Op, VopExt, VopcOp};
+use crate::enc::vop::{Dpp, Sdwa, SdwaSel, Vop1Op, Vop2KOp, Vop2Op, VopExt, VopcOp};
 use crate::enc::vop3::{Vop3OnlyOp, Vop3Op};
 use crate::float::{self, F8};
 use crate::inst::Inst;
@@ -73,6 +73,29 @@ pub fn exec(w: &mut Wave, inst: &Inst) -> SimResult<Flow> {
             ),
             Vop3Op::V2(i.op),
         ),
+        Inst::Vop2K(i) => {
+            let lit = Src::Lit(i.literal);
+            let src = match i.op {
+                Vop2KOp::FmamkF32 => [Some(i.src0), Some(lit), Some(i.src1)],
+                Vop2KOp::FmaakF32 => [Some(i.src0), Some(i.src1), Some(lit)],
+            };
+            let v = V::short(i.op.name(), &VopExt::None, i.vdst, src);
+            // Fused f32 multiply-add under the wave's FP mode (same path as v_fma_f32).
+            v.fres(w, Wd::F32, 7, (true, false), |s, w, l| {
+                let (Some(a), Some(b), Some(c)) = (s.f(w, 0, l)?, s.f(w, 1, l)?, s.f(w, 2, l)?)
+                else {
+                    return Ok(None);
+                };
+                // MI300X: invalid zero*infinity takes precedence even over
+                // a NaN addend (the mandatory-literal FMA hardware oracle).
+                let (aa, bb) = (a & 0x7fff_ffff, b & 0x7fff_ffff);
+                if (aa == 0 && bb == 0x7f80_0000) || (bb == 0 && aa == 0x7f80_0000) {
+                    return Ok(Some(QNAN32));
+                }
+                Ok(Some(arith32(&[a, b, c], || f(a).mul_add(f(b), f(c)))))
+            })?;
+            return Ok(Flow::Next);
+        }
         Inst::Vopc(i) => (
             V::short(
                 i.op.name(),
@@ -1017,6 +1040,11 @@ impl V {
                     (opt!(s.s16(w, 1, l)) << (opt!(s.u(w, 0, l)) & 15)) & 0xffff,
                 ))
             }),
+            // V_ASHRREV_I16: D.i16 = S1.i16 >> S0.u[3:0] (arithmetic; CDNA3 ISA VOP2 opcode 44).
+            AshrrevI16 => self.ires(w, Out::None, 0, NONE, |s, w, l| {
+                let v = opt!(s.s16(w, 1, l)) as u16 as i16;
+                Ok(Some(((v >> (opt!(s.u(w, 0, l)) & 15)) as u16) as u32))
+            }),
         }
     }
 
@@ -1057,7 +1085,7 @@ impl V {
                 }
             }
             CmpLtF32 | CmpEqF32 | CmpLeF32 | CmpGtF32 | CmpLgF32 | CmpGeF32 | CmpOF32 | CmpUF32
-            | CmpNeqF32 | CmpxGtF32 | CmpxLtF32 => {
+            | CmpNeqF32 | CmpNgtF32 | CmpNltF32 | CmpxGtF32 | CmpxLtF32 => {
                 self.check(w, 3, Out::Ignore, 0)?;
                 self.fmode(w, true, false)?;
                 for l in self.lanes(w) {
@@ -1073,6 +1101,9 @@ impl V {
                         // LG = ordered and not equal.
                         CmpLgF32 => x < y || x > y,
                         CmpGeF32 => x >= y,
+                        // NGT / NLT = unordered or (le / ge).
+                        CmpNgtF32 => !(x > y),
+                        CmpNltF32 => !(x < y),
                         CmpOF32 => !x.is_nan() && !y.is_nan(),
                         // Table 58 prints `!isNaN(S0) || !isNaN(S1)` for U, which
                         // contradicts its name and O; unordered = either is NaN
@@ -1083,12 +1114,19 @@ impl V {
                     mask |= u64::from(r) << l;
                 }
             }
-            CmpEqU64 | CmpNeU64 => {
+            CmpEqU64 | CmpNeU64 | CmpGtI64 | CmpGeI64 => {
                 self.plain()?;
                 self.check(w, 0, Out::Ignore, 0)?;
                 for l in self.lanes(w) {
                     let (a, b) = (self.q(w, 0, l)?, self.q(w, 1, l)?);
-                    mask |= u64::from(if op == CmpEqU64 { a == b } else { a != b }) << l;
+                    let (sa, sb) = (a as i64, b as i64);
+                    let t = match op {
+                        CmpEqU64 => a == b,
+                        CmpNeU64 => a != b,
+                        CmpGtI64 => sa > sb,
+                        _ => sa >= sb,
+                    };
+                    mask |= u64::from(t) << l;
                 }
             }
             _ => {

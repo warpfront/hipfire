@@ -1,0 +1,1203 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+// The HC8 compressed-weight W8A16 GEMM family on gfx1201 (R9700), E4M3 weights, transliterated from
+// `kernels/hc8_wmma_gfx1201.rs` (+ `hc8_wmma_gfx1201/read_up.rs`) onto the raw `Builder` vocabulary. The six
+// served entries of the module `kernels/hc8_wmma_pm_gfx1201.hxaco` (86 exports):
+//
+//   VARIANT    shipped symbol                    generator call
+//   down_n1    hc8_gemm_e4m3_mw1_kw16_n1_act     emit_geos(Geo { E4M3, mw 1, kw 16, nt 1, act })
+//   down_n2    hc8_gemm_e4m3_mw1_kw16_n2_act     (nt 2)
+//   down_n3    hc8_gemm_e4m3_mw1_kw16_n3_act     (nt 3)
+//   up_n1      hc8_read_up_e4m3_n1               emit_read_up(1)   (fused read-up, mw 4 / kw 1, branches 4)
+//   up_n2      hc8_read_up_e4m3_n2               emit_read_up(2)
+//   up_n3      hc8_read_up_e4m3_n3               emit_read_up(3)
+//
+// The declared axis values retain the original search reference. Production now uses
+// (UNROLL, LOADORDER, EPIPRE) = (2,2,false) for down_n2, (1,2,false) for down_n3,
+// and (4,1,true) for up_n1; the other three retain the reference point.
+// `tests/hc8_wmma_twin.rs` pins each served point against the Rust generator and committed
+// `.hxaco`. The int8 format, set epilogue, other geometries, NT 4 and dequant entries are not transliterated.
+//
+// ABI. down: 48-byte kernarg `q@0 s@8 x@16 y@24` (u64), `M@32 K@36 rows@40` (u32), `act_scale@44` (f32); block
+// 32*MW*KW = 512, grid M/16 (`M % 16 == 0`, `K % 512 == 0`, `M*K < 2^32`). up: 56-byte kernarg
+// `q@0 s@8 low@16 normalized@24 mixed@32` (u64), `hidden@40 low_rank@44 rows@48` (u32), `pad@52`; block 128 (four
+// waves, one per HC branch), grid hidden/16. `rows` outside `1..=16*NT` returns before any barrier or store.
+// `s` is f32 `[M]`, `x` / `low` f32 `[rows][K]` (BF16-exact). Every weight is exactly a BF16: it is decoded to
+// BF16 and multiplied by `v_wmma_f32_16x16x16_bf16` (f32 accumulate), the scale `s[m]` is applied once in the
+// epilogue. The register map is the generator's (`Lay::new`): decoded A fragments (double buffered), raw x
+// registers (16 per tile per column tile), raw weight dwords (4 per tile); the epilogue reuses the raw x registers.
+//
+// Certification. The generator spells the `v_perm_b32` selector `0x07060302` and writes `offset:0`, which
+// `llvm-objdump` never prints back; the declared text keeps both (it is the generator's, byte for byte) and
+// `peacemaker_rip::certify` assembles it through `objdump_spelling` so the toolchain's parse-back accepts it
+// (the same ELF, pinned by the twin test).
+//
+// Four `schedule` axes. The arithmetic DAG of every output (same operations, operands, accumulation order,
+// rounding) is the same for every tuple; only the order and placement of instructions, the register assignment
+// and issue hints change.
+//
+//   UNROLL     K32 tiles per main K-loop batch {0,1,2,3,4,5,6,8,10}; 0 is the original search reference
+//              (8 / 4 / 2 for NT 1 / 2 / 3). The remainder batches halve (`u, u/2, ..., 1`, integer division)
+//              exactly like `Geo::batches()`. Every batch computes the same tiles in the same ascending order,
+//              so each accumulator sees the same WMMA chain; only the loop trip grouping and the number of
+//              registers the batch holds change. A value whose register layout does not fit (`Lay::new`: top
+//              > 256 VGPRs or the raw weight base > 255) is refused. down_n1 / up_n1 fit up to 10, n2 up to 5,
+//              n3 up to 3.
+//   LOADORDER  load issue order inside one batch {0,1,2}: 0 = shipped (per tile: its weight b128, then that
+//              tile's x loads), 1 = all U weight loads first, then all x loads (tile order), 2 = all x loads
+//              first, then all U weight loads. The same loads at the same addresses with the same exec masks
+//              (the per-tile exec restore is kept); only their issue order differs.
+//   EPIPRE     true issues the epilogue's global loads (down: the scales `s[m]`; up: the scales and every
+//              `normalized` value the epilogue reads, the masked column tiles under the same exec masks) in
+//              front of the K loops into dedicated VGPRs above the layout, so the epilogue consumes registers
+//              instead of waiting on memory. The loads are exactly the epilogue's (same base, same offsets,
+//              same live lanes): nothing outside what the shipped kernel reads is read. The up address set-up
+//              (normalized pointer in `NP`, per-column offsets in the dedicated block) moves in front of the
+//              loops with it. The Builder admits a loop only when its back-edge ledger equals its entry
+//              ledger, and the hoisted loads are pending at the first loop's entry, so every K loop issues
+//              the same loads again (identical bytes into the same registers) after each iteration that is
+//              followed by another one and branches out before that re-issue after the last: no load is
+//              pending on any exit path and the epilogue never waits. The cost is one extra copy of those
+//              loads per loop iteration. Refused when the dedicated registers do not fit in 256 VGPRs.
+//   DELAY_ALU  false omits `b.enable_delay_alu()` (`s_delay_alu` issue hints only).
+//
+// The epilogue reuses the raw x registers; when UNROLL is small the raw x block is smaller than the epilogue
+// scratch (the generator's `Lay` is only defined for its own unroll), so the script declares the missing
+// registers right after the layout. That is a plan extension, absent at every shipped point.
+//
+// gfx1201 only.
+
+const ARCHES: &[&str] = &["gfx1201"];
+
+const VARIANTS: &[&str] = &["down_n1", "down_n2", "down_n3", "up_n1", "up_n2", "up_n3"];
+
+const SEARCH_AXES: &[(&str, &str, &[&str])] = &[
+    ("UNROLL", "schedule", &["0", "1", "2", "3", "4", "5", "6", "8", "10"]),
+    ("LOADORDER", "schedule", &["0", "1", "2"]),
+    ("EPIPRE", "schedule", &["false", "true"]),
+    ("DELAY_ALU", "schedule", &["true", "false"]),
+];
+const UNROLL: u8 = 0;
+const LOADORDER: u8 = 0;
+const EPIPRE: bool = false;
+const DELAY_ALU: bool = true;
+
+// SGPRs.
+const KARG: u8 = 0;
+const KQ: u8 = 8;
+const QP: u8 = 8;
+const SP: u8 = 10;
+const XQ: u8 = 12;
+const YP: u8 = 14;
+const MK: u8 = 16;
+const SM: u8 = 16;
+const SK: u8 = 17;
+const ROWS: u8 = 18;
+const ASC: u8 = 19;
+const WP: u8 = 20;
+const XP: u8 = 22;
+const WG: u8 = 26;
+const WAVE: u8 = 27;
+const MI: u8 = 28;
+const KI: u8 = 29;
+const KT: u8 = 30;
+const REM: u8 = 31;
+const TMP: u8 = 32;
+const TMP2: u8 = 33;
+const MT: u8 = 34;
+const KB: u8 = 35;
+const MASK: u8 = 36;
+const YN: u8 = 40;
+const TMP3: u8 = 44;
+const TMP4: u8 = 45;
+const SGPR_BUDGET: u16 = 48;
+// Read-up only: the normalized base pair and the output pointer pair.
+const NP: u8 = 24;
+const OP: u8 = 46;
+const BRANCHES: u32 = 4;
+
+// VGPRs.
+const TID: u8 = 0;
+const LANE: u8 = 1;
+const WOFF: u8 = 2;
+const XOFF: u8 = 3;
+const YA: u8 = 7;
+const LB: u8 = 11;
+const LR: u8 = 12;
+const VT: u8 = 13;
+const SO: u8 = 14;
+const VT2: u8 = 15;
+const DEC: u8 = 16;
+const ACC: u8 = 24;
+
+// ------------------------------------------------------------------------------------------------ geometry
+
+// One export: `up` selects the fused read-up (mw 4, kw 1, `set` epilogue), otherwise the `act` GEMM (mw 1,
+// kw 16); `u` is the main-loop batch size (the UNROLL axis resolved against the generator default).
+struct Geo {
+    up: bool,
+    mw: u32,
+    kw: u32,
+    nt: u32,
+    act: bool,
+    u: u32,
+    order: u8,
+    epipre: bool,
+}
+
+impl Geo {
+    fn symbol(&self) -> String {
+        if self.up {
+            return format!("hc8_read_up_e4m3_n{}", self.nt);
+        }
+        let epi = if self.act { "act" } else { "set" };
+        format!("hc8_gemm_e4m3_mw{}_kw{}_n{}_{}", self.mw, self.kw, self.nt, epi)
+    }
+
+    fn variant(&self) -> String {
+        if self.up {
+            return format!("e4m3_n{}", self.nt);
+        }
+        let epi = if self.act { "act" } else { "set" };
+        format!("e4m3_mw{}_kw{}_n{}_{}", self.mw, self.kw, self.nt, epi)
+    }
+
+    fn block(&self) -> u32 {
+        if self.up {
+            return 128;
+        }
+        32 * self.mw * self.kw
+    }
+
+    // Accumulator VGPRs per lane, `8 * NT`.
+    fn nr(&self) -> u32 {
+        8 * self.nt
+    }
+
+    fn lds_bytes(&self) -> u32 {
+        if self.up {
+            return BRANCHES * 8 * self.nt * 128;
+        }
+        if self.kw == 1 {
+            return 0;
+        }
+        self.mw * self.kw * self.nr() * 128
+    }
+
+    // `log2(kw)`: kw is a power of two.
+    fn lg(&self) -> u32 {
+        let mut lg = 0u32;
+        let mut k = self.kw;
+        while k > 1 {
+            k = k / 2;
+            lg = lg + 1;
+        }
+        lg
+    }
+
+    // Tiles per batch of the main K loop, then the halving remainder batches.
+    fn batches(&self) -> Vec<u32> {
+        let mut out = Vec::new();
+        let mut u = self.u;
+        while u >= 1 {
+            out.push(u);
+            u = u / 2;
+        }
+        out
+    }
+}
+
+// The original search reference's unroll (not the selected production winners).
+fn default_unroll(nt: u32) -> u32 {
+    if nt == 1 {
+        return 8;
+    }
+    if nt == 2 {
+        return 4;
+    }
+    2
+}
+
+// The variant's geometry at the declared axis values.
+fn geo_of(variant: &str) -> Result<Geo, String> {
+    let (up, nt) = if variant == "down_n1" {
+        (false, 1u32)
+    } else if variant == "down_n2" {
+        (false, 2u32)
+    } else if variant == "down_n3" {
+        (false, 3u32)
+    } else if variant == "up_n1" {
+        (true, 1u32)
+    } else if variant == "up_n2" {
+        (true, 2u32)
+    } else if variant == "up_n3" {
+        (true, 3u32)
+    } else {
+        return Err(format!("variant `{}`: expected down_n1..3 or up_n1..3", variant));
+    };
+    if LOADORDER > 2 {
+        return Err(format!("LOADORDER {} not in {{0,1,2}}", LOADORDER));
+    }
+    let mut u = UNROLL as u32;
+    if u == 0 {
+        u = default_unroll(nt);
+    }
+    if u == 7 || u == 9 || u > 10 {
+        return Err(format!("UNROLL {} not in {{0,1,2,3,4,5,6,8,10}}", UNROLL));
+    }
+    Ok(Geo {
+        up: up,
+        mw: if up { BRANCHES } else { 1 },
+        kw: if up { 1 } else { 16 },
+        nt: nt,
+        act: !up,
+        u: u,
+        order: LOADORDER,
+        epipre: EPIPRE,
+    })
+}
+
+// Resource layout of one geometry.
+struct Lay {
+    u: u32,
+    nt: u32,
+    // Double-buffered decoded A fragments (2 x 8 VGPRs).
+    da: u8,
+    // Raw x registers (16 per tile per column tile).
+    xb: u8,
+    // Raw weight dwords (4 per tile).
+    wr: u8,
+    top: u32,
+}
+
+impl Lay {
+    fn new(g: &Geo) -> Result<Lay, String> {
+        let u = g.u;
+        let nt = g.nt;
+        let da = 24 + 8 * nt;
+        let xb = da + 16;
+        let wr = xb + 16 * u * nt;
+        let top = wr + 4 * u;
+        if top > 256 || wr > 255 {
+            return Err(format!("{}: needs {} VGPRs (> 256)", g.symbol(), top));
+        }
+        Ok(Lay { u: u, nt: nt, da: da as u8, xb: xb as u8, wr: wr as u8, top: top })
+    }
+
+    fn acc(&self, nt: u32) -> u8 {
+        ACC + 8 * nt as u8
+    }
+
+    // Raw x registers (8) of tile `t`, column tile `nt`, K16 step `st`.
+    fn x(&self, t: u32, nt: u32, st: u32) -> u8 {
+        self.xb + (((t * self.nt + nt) * 2 + st) * 8) as u8
+    }
+
+    fn w(&self, t: u32) -> u8 {
+        self.wr + 4 * t as u8
+    }
+}
+
+// Epilogue register map. The raw x block doubles as the epilogue scratch; `scratch` is its end, `pre` the
+// dedicated EPIPRE block (8-aligned above the scratch) of `pre_len` VGPRs, `top` the VGPR total.
+struct Epi {
+    // Scales (8), then for up the normalized values (8 per column tile).
+    sv: u32,
+    nrm: u32,
+    // Six temporaries, the result, the fold partials (4 for up, KW for down), up's address offsets.
+    t0: u32,
+    val: u32,
+    p: u32,
+    noff: u32,
+    scratch: u32,
+    pre: u32,
+    pre_len: u32,
+    top: u32,
+}
+
+fn epi_layout(g: &Geo, l: &Lay) -> Result<Epi, String> {
+    let xb = l.xb as u32;
+    let nr = g.nr();
+    let mut t0 = xb + 8;
+    let mut val = xb + 14;
+    let mut p = xb + 16;
+    let mut scratch = xb + 15;
+    let mut pre_len = 0u32;
+    if g.up {
+        t0 = if g.epipre { xb } else { xb + 8 + nr };
+        val = t0 + 6;
+        p = t0 + 7;
+        scratch = if g.epipre { p + 4 } else { p + 4 + g.nt };
+        if g.epipre {
+            // Scales, normalized values, then the persistent per-column address offsets.
+            pre_len = 8 + nr + g.nt;
+        }
+    } else {
+        if g.kw > 1 {
+            scratch = xb + 16 + g.kw;
+        }
+        if g.epipre {
+            pre_len = 8;
+        }
+    }
+    let mut top = l.top;
+    if scratch > top {
+        top = scratch;
+    }
+    let pre = (top + 7) / 8 * 8;
+    let total = if g.epipre { pre + pre_len } else { top };
+    if total > 256 {
+        return Err(format!("{}: the epilogue needs {} VGPRs (> 256)", g.symbol(), total));
+    }
+    let sv = if g.epipre { pre } else { xb };
+    let noff = if g.epipre { pre + 8 + nr } else { p + 4 };
+    Ok(Epi { sv: sv, nrm: sv + 8, t0: t0, val: val, p: p, noff: noff, scratch: scratch, pre: pre, pre_len: pre_len, top: total })
+}
+
+fn lbl(g: &Geo, name: &str) -> String {
+    format!(".Lhc8_{}_{}", g.symbol(), name)
+}
+
+// ------------------------------------------------------------------------------------------------ plan
+
+// Declare `[base, base+len)` as the fewest aligned ranges of legal widths (1, 2, 4, 8).
+fn add_split(regs: &mut RegPlan, name: &str, kind: &str, base: u8, len: u8) -> Result<(), String> {
+    let mut at = base as u32;
+    let end = base as u32 + len as u32;
+    while at < end {
+        let mut w = 8u32;
+        while !(at % w == 0 && at + w <= end) {
+            w = w / 2;
+        }
+        regs.add_range(&format!("{}@{}", name, at), kind, at as u8, w as u8, Live::Whole)?;
+        at = at + w;
+    }
+    Ok(())
+}
+
+fn plan(g: &Geo, l: &Lay, e: &Epi) -> Result<RegPlan, String> {
+    let mut regs = RegPlan::new(e.top as u16, SGPR_BUDGET)?;
+    let nt = g.nt as u8;
+    let sranges = [
+        ("kernarg", KARG, 2u8),
+        ("kernarg_ptrs", KQ, 8u8),
+        ("kernarg_mkra", MK, 4u8),
+        ("weight_ptr", WP, 2u8),
+        ("x_ptr", XP, 2u8),
+        ("workgroup", WG, 1u8),
+        ("wave", WAVE, 1u8),
+        ("m_tile_in_wg", MI, 1u8),
+        ("k_slice", KI, 1u8),
+        ("k_tiles", KT, 1u8),
+        ("k_remaining", REM, 1u8),
+        ("temp", TMP, 1u8),
+        ("temp2", TMP2, 1u8),
+        ("m_tile", MT, 1u8),
+        ("k_bytes", KB, 1u8),
+        ("col_masks", MASK, nt),
+        ("y_col_offsets", YN, nt),
+        ("temp3", TMP3, 1u8),
+        ("temp4", TMP4, 1u8),
+    ];
+    for (name, base, len) in sranges {
+        add_split(&mut regs, name, "s", base, len)?;
+    }
+    let vranges = [
+        ("tid", TID, 1u8),
+        ("lane", LANE, 1u8),
+        ("weight_offset", WOFF, 1u8),
+        ("x_offsets", XOFF, nt),
+        ("y_offsets", YA, nt),
+        ("lds_store", LB, 1u8),
+        ("lds_read", LR, 1u8),
+        ("temp", VT, 1u8),
+        ("scale_offset", SO, 1u8),
+        ("temp2", VT2, 1u8),
+        ("decode_temps", DEC, 8u8),
+        ("acc", ACC, 8 * nt),
+        ("a_frags", l.da, 16u8),
+        ("x_raw", l.xb, (16 * l.u * g.nt) as u8),
+        ("w_raw", l.wr, (4 * l.u) as u8),
+    ];
+    for (name, base, len) in vranges {
+        add_split(&mut regs, name, "v", base, len)?;
+    }
+    if e.scratch > l.top {
+        add_split(&mut regs, "epi_scratch", "v", l.top as u8, (e.scratch - l.top) as u8)?;
+    }
+    if g.epipre {
+        add_split(&mut regs, "epi_pre", "v", e.pre as u8, e.pre_len as u8)?;
+    }
+    if g.up {
+        regs.add_range("norm_base", "s", NP, 2, Live::Whole)?;
+        regs.add_range("out_ptr", "s", OP, 2, Live::Whole)?;
+    }
+    Ok(regs)
+}
+
+// ------------------------------------------------------------------------------------------------ glue
+
+fn branch(b: &mut Builder, text: &str) -> Result<(), String> {
+    b.control(Instruction::new(text, vec![], vec![]))
+}
+
+fn exec_mask(b: &mut Builder, nt: u32) -> Result<(), String> {
+    op(b, format!("s_mov_b32 exec_lo, s{}", MASK + nt as u8), &[], &[s(MASK + nt as u8)])
+}
+
+fn exec_all(b: &mut Builder) -> Result<(), String> {
+    op(b, "s_mov_b32 exec_lo, -1", &[], &[])
+}
+
+fn vload128(b: &mut Builder, dst: u8, voff: u8, ptr: u8, imm: u32) -> Result<(), String> {
+    let off = if imm == 0 { String::new() } else { format!(" offset:{}", imm) };
+    b.push(
+        Instruction::new(
+            format!("global_load_b128 v[{}:{}], v{}, s[{}:{}]{}", dst, dst + 3, voff, ptr, ptr + 1, off),
+            vec![v(dst), v(dst + 1), v(dst + 2), v(dst + 3)],
+            vec![v(voff), s(ptr), s(ptr + 1)],
+        )
+        .memory(MemoryClass::VmemLoad),
+    )
+}
+
+// {hi16(hi) : hi16(lo)}; S0 = hi (selectors 4..7), S1 = lo (selectors 0..3).
+fn perm_pack(b: &mut Builder, dst: u8, hi: u8, lo: u8) -> Result<(), String> {
+    let mut uses = vec![v(hi), v(lo)];
+    if hi == lo {
+        uses = vec![v(hi)];
+    }
+    op(b, format!("v_perm_b32 v{}, v{}, v{}, 0x07060302", dst, hi, lo), &[v(dst)], &uses)
+}
+
+fn vregs(xs: &[u8]) -> Vec<RegRef> {
+    let mut out = Vec::new();
+    for i in 0..xs.len() {
+        out.push(v(xs[i]));
+    }
+    out
+}
+
+fn valu(b: &mut Builder, text: String, defs: &[u8], uses: &[u8]) -> Result<(), String> {
+    b.push(Instruction::new(text, vregs(defs), vregs(uses)))
+}
+
+// A VALU op that also reads one SGPR.
+fn valus(b: &mut Builder, text: String, defs: &[u8], uses: &[u8], sgpr: u8) -> Result<(), String> {
+    let mut inputs = vregs(uses);
+    inputs.push(s(sgpr));
+    b.push(Instruction::new(text, vregs(defs), inputs))
+}
+
+fn alu_wait(b: &mut Builder) -> Result<(), String> {
+    b.push(Instruction::new("s_wait_alu depctr_va_vcc(0)", vec![], vec![]))
+}
+
+fn cat(a: &[u8], x: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for i in 0..a.len() {
+        out.push(a[i]);
+    }
+    for i in 0..x.len() {
+        out.push(x[i]);
+    }
+    out
+}
+
+// HIP `bf16_to_f32(bf16_round(x))` in place on `val`; `t0..t2` scratch.
+fn round_trip(b: &mut Builder, val: u8, t0: u8, t1: u8, t2: u8) -> Result<(), String> {
+    valu(b, format!("v_bfe_u32 v{}, v{}, 16, 1", t0, val), &[t0], &[val])?;
+    valu(b, format!("v_add_nc_u32_e32 v{}, v{}, v{}", t0, val, t0), &[t0], &[val, t0])?;
+    valu(b, format!("v_add_nc_u32_e32 v{}, 0x7fff, v{}", t0, t0), &[t0], &[t0])?;
+    valu(b, format!("v_and_b32_e32 v{}, 0xffff, v{}", t1, val), &[t1], &[val])?;
+    valu(b, format!("v_or_b32_e32 v{}, 0x10000, v{}", t2, val), &[t2], &[val])?;
+    valu(b, format!("v_cmp_eq_u32_e32 vcc_lo, 0, v{}", t1), &[], &[t1])?;
+    alu_wait(b)?;
+    valu(b, format!("v_cndmask_b32_e32 v{}, v{}, v{}, vcc_lo", t1, t2, val), &[t1], &[t2, val])?;
+    valu(b, format!("v_and_b32_e32 v{}, 0x7f800000, v{}", t2, val), &[t2], &[val])?;
+    valu(b, format!("v_cmp_eq_u32_e32 vcc_lo, 0x7f800000, v{}", t2), &[], &[t2])?;
+    alu_wait(b)?;
+    valu(b, format!("v_cndmask_b32_e32 v{}, v{}, v{}, vcc_lo", t0, t0, t1), &[t0], &[t0, t1])?;
+    valu(b, format!("v_and_b32_e32 v{}, 0xffff0000, v{}", val, t0), &[val], &[t0])
+}
+
+// The act epilogue tail on the f32 in `v{vout}`: `rt(rt(scale * rt(x)) / (1 + exp(-x)))`, result in `v{vout}`;
+// `t` six scratch VGPRs, `scale` the SGPR holding the f32 scale (`lane_rows_bf16_gfx1201::hc_act_tail`).
+fn hc_act_tail(b: &mut Builder, vout: u8, t: &[u8], scale: u8) -> Result<(), String> {
+    let t0 = t[0];
+    let t1 = t[1];
+    let t2 = t[2];
+    let t3 = t[3];
+    let t4 = t[4];
+    let t5 = t[5];
+    round_trip(b, vout, t0, t1, t2)?;
+    valus(b, format!("v_mul_f32_e32 v{}, s{}, v{}", vout, scale, vout), &[vout], &[vout], scale)?;
+    round_trip(b, vout, t0, t1, t2)?;
+    valu(b, format!("v_mul_f32_e32 v{}, 0xbfb8aa3b, v{}", t0, vout), &[t0], &[vout])?;
+    valu(b, format!("v_xor_b32_e32 v{}, 0x80000000, v{}", t1, t0), &[t1], &[t0])?;
+    valu(b, format!("v_rndne_f32_e32 v{}, v{}", t2, t0), &[t2], &[t0])?;
+    valu(b, format!("v_fma_f32 v{}, v{}, 0xbfb8aa3b, v{}", t1, vout, t1), &[t1], &[vout, t1])?;
+    valu(b, format!("v_sub_f32_e32 v{}, v{}, v{}", t0, t0, t2), &[t0], &[t0, t2])?;
+    valu(b, format!("v_fma_f32 v{}, v{}, 0xb2a5705f, v{}", t1, vout, t1), &[t1], &[vout, t1])?;
+    valu(b, format!("v_add_f32_e32 v{}, v{}, v{}", t0, t0, t1), &[t0], &[t0, t1])?;
+    valu(b, format!("v_cvt_i32_f32_e32 v{}, v{}", t3, t2), &[t3], &[t2])?;
+    valu(b, format!("v_exp_f32_e32 v{}, v{}", t0, t0), &[t0], &[t0])?;
+    valu(b, format!("v_ldexp_f32 v{}, v{}, v{}", t0, t0, t3), &[t0], &[t0, t3])?;
+    valu(b, format!("v_cmp_nlt_f32_e32 vcc_lo, 0x42ce8ed0, v{}", vout), &[], &[vout])?;
+    alu_wait(b)?;
+    valu(b, format!("v_cndmask_b32_e32 v{}, 0, v{}, vcc_lo", t0, t0), &[t0], &[t0])?;
+    valu(b, format!("v_cmp_ngt_f32_e32 vcc_lo, 0xc2b17218, v{}", vout), &[], &[vout])?;
+    alu_wait(b)?;
+    valu(b, format!("v_cndmask_b32_e32 v{}, 0x7f800000, v{}, vcc_lo", t0, t0), &[t0], &[t0])?;
+    valu(b, format!("v_add_f32_e32 v{}, 1.0, v{}", t0, t0), &[t0], &[t0])?;
+    valu(b, format!("v_div_scale_f32 v{}, null, v{}, v{}, v{}", t1, t0, t0, vout), &[t1], &[t0, vout])?;
+    valu(b, format!("v_rcp_f32_e32 v{}, v{}", t2, t1), &[t2], &[t1])?;
+    valu(b, format!("v_xor_b32_e32 v{}, 0x80000000, v{}", t1, t1), &[t1], &[t1])?;
+    valu(b, format!("v_fma_f32 v{}, v{}, v{}, 1.0", t3, t1, t2), &[t3], &[t1, t2])?;
+    valu(b, format!("v_fmac_f32_e32 v{}, v{}, v{}", t2, t3, t2), &[t2], &[t2, t3])?;
+    valu(b, format!("v_div_scale_f32 v{}, vcc_lo, v{}, v{}, v{}", t3, vout, t0, vout), &[t3], &[vout, t0])?;
+    valu(b, format!("v_mul_f32_e32 v{}, v{}, v{}", t4, t3, t2), &[t4], &[t3, t2])?;
+    valu(b, format!("v_fma_f32 v{}, v{}, v{}, v{}", t5, t1, t4, t3), &[t5], &[t1, t4, t3])?;
+    valu(b, format!("v_fmac_f32_e32 v{}, v{}, v{}", t4, t5, t2), &[t4], &[t4, t5, t2])?;
+    valu(b, format!("v_fmac_f32_e32 v{}, v{}, v{}", t3, t1, t4), &[t3], &[t3, t1, t4])?;
+    alu_wait(b)?;
+    valu(b, format!("v_div_fmas_f32 v{}, v{}, v{}, v{}", t1, t3, t2, t4), &[t1], &[t3, t2, t4])?;
+    valu(b, format!("v_div_fixup_f32 v{}, v{}, v{}, v{}", t0, t1, t0, vout), &[t0], &[t1, t0, vout])?;
+    valu(b, format!("v_mov_b32_e32 v{}, v{}", vout, t0), &[vout], &[t0])?;
+    round_trip(b, vout, t0, t1, t2)
+}
+
+// ------------------------------------------------------------------------------------------------ prologue
+
+// `up`: the fused read-up kernel's kernarg (`hidden K rows` at 40, in the `M K rows` SGPRs) and its
+// `mt = wave*(hidden/16) + wg` tile map.
+fn prologue(b: &mut Builder, g: &Geo, end: &str, arch: Arch) -> Result<(), String> {
+    let ru = g.up;
+    let lg = g.lg();
+    let nt = g.nt;
+    let moff: u32 = if ru { 40 } else { 32 };
+    smem(b, KQ, 8, KARG, 0)?;
+    smem(b, MK, 4, KARG, moff)?;
+    op(b, format!("v_lshrrev_b32_e32 v{}, 5, v{}", VT, TID), &[v(VT)], &[v(TID)])?;
+    op(b, format!("v_readfirstlane_b32 s{}, v{}", WAVE, VT), &[s(WAVE)], &[v(VT)])?;
+    op(b, format!("v_and_b32_e32 v{}, 31, v{}", LANE, TID), &[v(LANE)], &[v(TID)])?;
+    sop(b, format!("s_mov_b32 s{}, ttmp9", WG), &[WG], &[])?;
+    b.wait_all()?;
+    // Out-of-range rows: return before any barrier or store.
+    sop(b, format!("s_cmp_eq_u32 s{}, 0", ROWS), &[], &[ROWS])?;
+    branch(b, &format!("s_cbranch_scc1 {}", end))?;
+    sop(b, format!("s_cmp_gt_u32 s{}, {}", ROWS, 16 * nt), &[], &[ROWS])?;
+    branch(b, &format!("s_cbranch_scc1 {}", end))?;
+    // Wave roles.
+    if lg == 0 {
+        sop(b, format!("s_mov_b32 s{}, 0", KI), &[KI], &[])?;
+        sop(b, format!("s_mov_b32 s{}, s{}", MI, WAVE), &[MI], &[WAVE])?;
+    } else {
+        sop(b, format!("s_and_b32 s{}, s{}, {}", KI, WAVE, g.kw - 1), &[KI], &[WAVE])?;
+        sop(b, format!("s_lshr_b32 s{}, s{}, {}", MI, WAVE, lg), &[MI], &[WAVE])?;
+    }
+    sop(b, format!("s_lshr_b32 s{}, s{}, {}", KT, SK, 5 + lg), &[KT], &[SK])?;
+    sop(b, format!("s_mov_b32 s{}, s{}", REM, KT), &[REM], &[KT])?;
+    sop(b, format!("s_lshl_b32 s{}, s{}, 2", KB, SK), &[KB], &[SK])?;
+    // M tile = wg*MW + mi.
+    if ru {
+        sop(b, format!("s_lshr_b32 s{}, s{}, 4", TMP, SM), &[TMP], &[SM])?;
+        sop(b, format!("s_mul_i32 s{}, s{}, s{}", MT, TMP, MI), &[MT], &[TMP, MI])?;
+        sop(b, format!("{} s{}, s{}, s{}", s_add_i32(arch), MT, MT, WG), &[MT], &[MT, WG])?;
+    } else if g.mw == 1 {
+        sop(b, format!("{} s{}, s{}, s{}", s_add_i32(arch), MT, WG, MI), &[MT], &[WG, MI])?;
+    } else {
+        sop(b, format!("s_mul_i32 s{}, s{}, {}", MT, WG, g.mw), &[MT], &[WG])?;
+        sop(b, format!("{} s{}, s{}, s{}", s_add_i32(arch), MT, MT, MI), &[MT], &[MT, MI])?;
+    }
+    // Weight pointer: q + ((mt*(K/32) + ki*KT) * 512).
+    sop(b, format!("s_lshr_b32 s{}, s{}, 5", TMP, SK), &[TMP], &[SK])?;
+    sop(b, format!("s_mul_i32 s{}, s{}, s{}", TMP2, MT, TMP), &[TMP2], &[MT, TMP])?;
+    sop(b, format!("s_mul_i32 s{}, s{}, s{}", TMP3, KI, KT), &[TMP3], &[KI, KT])?;
+    sop(b, format!("{} s{}, s{}, s{}", s_add_i32(arch), TMP2, TMP2, TMP3), &[TMP2], &[TMP2, TMP3])?;
+    sop(b, format!("s_lshl_b32 s{}, s{}, 9", TMP2, TMP2), &[TMP2], &[TMP2])?;
+    add64(b, WP, QP, TMP2)?;
+    // X pointer: x + ki*KT*128.
+    sop(b, format!("s_lshl_b32 s{}, s{}, 7", TMP4, TMP3), &[TMP4], &[TMP3])?;
+    add64(b, XP, XQ, TMP4)?;
+    // Column live-lane masks: ((1 << clamp(rows-16nt, 0, 16)) - 1) * 0x10001.
+    for c in 0..nt {
+        let m = MASK + c as u8;
+        if c == 0 {
+            sop(b, format!("s_mov_b32 s{}, s{}", TMP, ROWS), &[TMP], &[ROWS])?;
+        } else {
+            sop(b, format!("s_sub_co_i32 s{}, s{}, {}", TMP, ROWS, 16 * c), &[TMP], &[ROWS])?;
+        }
+        sop(b, format!("s_max_i32 s{}, s{}, 0", TMP, TMP), &[TMP], &[TMP])?;
+        sop(b, format!("s_min_u32 s{}, s{}, 16", TMP, TMP), &[TMP], &[TMP])?;
+        sop(b, format!("s_bfm_b32 s{}, s{}, 0", m, TMP), &[m], &[TMP])?;
+        sop(b, format!("s_lshl_b32 s{}, s{}, 16", TMP, m), &[TMP], &[m])?;
+        sop(b, format!("s_or_b32 s{}, s{}, s{}", m, m, TMP), &[m], &[m, TMP])?;
+    }
+    // Per-lane vectors. r = lane & 15 (v13), h = lane >> 4 (v14).
+    op(b, format!("v_and_b32_e32 v{}, 15, v{}", VT, LANE), &[v(VT)], &[v(LANE)])?;
+    op(b, format!("v_lshrrev_b32_e32 v{}, 4, v{}", SO, LANE), &[v(SO)], &[v(LANE)])?;
+    op(b, format!("v_lshlrev_b32_e32 v{}, 4, v{}", WOFF, LANE), &[v(WOFF)], &[v(LANE)])?;
+    // x offset of column tile 0: r*K*4 + h*16.
+    op(b, format!("v_mul_lo_u32 v{}, s{}, v{}", XOFF, KB, VT), &[v(XOFF)], &[v(VT), s(KB)])?;
+    op(b, format!("v_lshlrev_b32_e32 v{}, 4, v{}", VT2, SO), &[v(VT2)], &[v(SO)])?;
+    op(b, format!("v_add_nc_u32_e32 v{}, v{}, v{}", XOFF, XOFF, VT2), &[v(XOFF)], &[v(XOFF), v(VT2)])?;
+    if nt > 1 {
+        sop(b, format!("s_lshl_b32 s{}, s{}, 4", TMP, KB), &[TMP], &[KB])?;
+        for c in 1..nt {
+            sop(b, format!("s_mul_i32 s{}, s{}, {}", TMP2, TMP, c), &[TMP2], &[TMP])?;
+            op(
+                b,
+                format!("v_add_nc_u32_e32 v{}, s{}, v{}", XOFF + c as u8, TMP2, XOFF),
+                &[v(XOFF + c as u8)],
+                &[v(XOFF), s(TMP2)],
+            )?;
+        }
+    }
+    // y offset of column tile 0: r*M*4 + (mt*16 + h*8)*4.
+    sop(b, format!("s_lshl_b32 s{}, s{}, 2", TMP, SM), &[TMP], &[SM])?;
+    op(b, format!("v_mul_lo_u32 v{}, s{}, v{}", YA, TMP, VT), &[v(YA)], &[v(VT), s(TMP)])?;
+    sop(b, format!("s_lshl_b32 s{}, s{}, 6", TMP2, MT), &[TMP2], &[MT])?;
+    // h*32 (same offset indexes the scale vector `s`).
+    op(b, format!("v_lshlrev_b32_e32 v{}, 1, v{}", VT2, VT2), &[v(VT2)], &[v(VT2)])?;
+    op(b, format!("v_add_nc_u32_e32 v{}, v{}, v{}", YA, YA, VT2), &[v(YA)], &[v(YA), v(VT2)])?;
+    if ru {
+        // Read-up output rows index hidden columns: the workgroup, not the M tile.
+        sop(b, format!("s_lshl_b32 s{}, s{}, 6", TMP3, WG), &[TMP3], &[WG])?;
+        op(b, format!("v_add_nc_u32_e32 v{}, s{}, v{}", YA, TMP3, YA), &[v(YA)], &[v(YA), s(TMP3)])?;
+    } else {
+        op(b, format!("v_add_nc_u32_e32 v{}, s{}, v{}", YA, TMP2, YA), &[v(YA)], &[v(YA), s(TMP2)])?;
+    }
+    op(b, format!("v_add_nc_u32_e32 v{}, s{}, v{}", SO, TMP2, VT2), &[v(SO)], &[v(VT2), s(TMP2)])?;
+    for c in 1..nt {
+        sop(b, format!("s_mul_i32 s{}, s{}, {}", YN + c as u8, TMP, 16 * c), &[YN + c as u8], &[TMP])?;
+        op(
+            b,
+            format!("v_add_nc_u32_e32 v{}, s{}, v{}", YA + c as u8, YN + c as u8, YA),
+            &[v(YA + c as u8)],
+            &[v(YA), s(YN + c as u8)],
+        )?;
+    }
+    Ok(())
+}
+
+fn zero_regs(b: &mut Builder, base: u8, count: u32) -> Result<(), String> {
+    for i in 0..count {
+        op(b, format!("v_mov_b32_e32 v{}, 0", base as u32 + i), &[v(base + i as u8)], &[])?;
+    }
+    Ok(())
+}
+
+// ------------------------------------------------------------------------------------------------ K loop
+
+// Decode the raw weight dwords of tile `t` into the (double-buffered) A fragments.
+fn decode(b: &mut Builder, l: &Lay, t: u32) -> Result<(), String> {
+    let da = l.da + 8 * (t % 2) as u8;
+    for d in 0..4u8 {
+        let w = l.w(t) + d;
+        let tb = DEC + 4 * (d & 1);
+        op(b, format!("v_cvt_pk_f32_fp8_e64 {}, v{}.l op_sel:[0,0]", vr(tb, 2), w), &[vr(tb, 2)], &[v(w)])?;
+        op(b, format!("v_cvt_pk_f32_fp8_e64 {}, v{}.h op_sel:[1,0]", vr(tb + 2, 2), w), &[vr(tb + 2, 2)], &[v(w)])?;
+        let dst = da + (d >> 1) * 4 + (d & 1) * 2;
+        perm_pack(b, dst, tb + 1, tb)?;
+        perm_pack(b, dst + 1, tb + 3, tb + 2)?;
+    }
+    Ok(())
+}
+
+// Pack the raw f32 x of tile `t` / column tile `c` / step `st` into its B fragment (VGPRs 0..3 of the
+// 8-register block, in place; each destination is consumed first).
+fn pack_b(b: &mut Builder, l: &Lay, t: u32, c: u32, st: u32) -> Result<(), String> {
+    let x = l.x(t, c, st);
+    for i in 0..4u8 {
+        perm_pack(b, x + i, x + 2 * i + 1, x + 2 * i)?;
+    }
+    Ok(())
+}
+
+fn wmma(b: &mut Builder, l: &Lay, t: u32, c: u32, st: u32) -> Result<(), String> {
+    let da = l.da + 8 * (t % 2) as u8 + 4 * st as u8;
+    let x = l.x(t, c, st);
+    let acc = l.acc(c);
+    b.push(Instruction::new(
+        format!("v_wmma_f32_16x16x16_bf16 {}, {}, {}, {}", vr(acc, 8), vr(da, 4), vr(x, 4), vr(acc, 8)),
+        vec![vr(acc, 8)],
+        vec![vr(da, 4), vr(x, 4), vr(acc, 8)],
+    ))
+}
+
+// The weight b128 of tile `t`.
+fn load_weight(b: &mut Builder, l: &Lay, t: u32) -> Result<(), String> {
+    vload128(b, l.w(t), WOFF, WP, 512 * t)
+}
+
+// The x loads of tile `t`: per column tile under its live-lane mask, then exec restored.
+fn load_x(b: &mut Builder, g: &Geo, l: &Lay, t: u32) -> Result<(), String> {
+    for c in 0..g.nt {
+        exec_mask(b, c)?;
+        for st in 0..2u32 {
+            for h in 0..2u32 {
+                vload128(b, l.x(t, c, st) + 4 * h as u8, XOFF + c as u8, XP, 128 * t + 64 * st + 32 * h)?;
+            }
+        }
+    }
+    exec_all(b)
+}
+
+// One batch of `u` K32 tiles: issue every load, advance the pointers, then consume.
+fn batch(b: &mut Builder, g: &Geo, l: &Lay, u: u32) -> Result<(), String> {
+    if g.order == 0 {
+        for t in 0..u {
+            load_weight(b, l, t)?;
+            load_x(b, g, l, t)?;
+        }
+    } else if g.order == 1 {
+        for t in 0..u {
+            load_weight(b, l, t)?;
+        }
+        for t in 0..u {
+            load_x(b, g, l, t)?;
+        }
+    } else {
+        for t in 0..u {
+            load_x(b, g, l, t)?;
+        }
+        for t in 0..u {
+            load_weight(b, l, t)?;
+        }
+    }
+    add64_imm(b, WP, 512 * u)?;
+    add64_imm(b, XP, 128 * u)?;
+    for t in 0..u {
+        decode(b, l, t)?;
+        for c in 0..g.nt {
+            for st in 0..2u32 {
+                pack_b(b, l, t, c, st)?;
+            }
+        }
+        for st in 0..2u32 {
+            for c in 0..g.nt {
+                wmma(b, l, t, c, st)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+// The K loops: batches of `u` tiles, then the halving remainder batches. EPIPRE: the Builder admits a loop
+// only when its back-edge ledger equals its entry ledger, and the hoisted epilogue loads are pending at the
+// first loop's entry. Every loop therefore re-issues them (the same loads again, identical bytes into the
+// same registers) after each iteration that is followed by another one, and leaves before the re-issue after
+// the last, so nothing is pending on any exit path and the epilogue reads settled registers.
+fn k_loops(b: &mut Builder, g: &Geo, l: &Lay, e: &Epi, tag: &str) -> Result<(), String> {
+    for u in g.batches() {
+        let skip = format!(".Lhc8_{}_skip{}", tag, u);
+        let head = format!(".Lhc8_{}_loop{}", tag, u);
+        let done = format!(".Lhc8_{}_done{}", tag, u);
+        sop(b, format!("s_cmp_lt_u32 s{}, {}", REM, u), &[], &[REM])?;
+        branch(b, &format!("s_cbranch_scc1 {}", skip))?;
+        b.loop_(&head, |b| {
+            batch(b, g, l, u)?;
+            sop(b, format!("s_sub_co_i32 s{}, s{}, {}", REM, REM, u), &[REM], &[REM])?;
+            sop(b, format!("s_cmp_ge_u32 s{}, {}", REM, u), &[], &[REM])?;
+            if g.epipre {
+                branch(b, &format!("s_cbranch_scc0 {}", done))?;
+                epi_loads(b, g, e)?;
+                branch(b, &format!("s_branch {}", head))
+            } else {
+                branch(b, &format!("s_cbranch_scc1 {}", head))
+            }
+        })?;
+        if g.epipre {
+            b.label(&done)?;
+        }
+        b.label(&skip)?;
+    }
+    Ok(())
+}
+
+// ------------------------------------------------------------------------------------------------ epilogue
+
+// Down: the scales of this lane's eight rows `s[mt*16 + h*8 .. +8]`, two b128 loads into `sv..sv+7`.
+fn down_scale_loads(b: &mut Builder, sv: u8) -> Result<(), String> {
+    vload128(b, sv, SO, SP, 0)?;
+    vload128(b, sv + 4, SO, SP, 16)
+}
+
+// Up: the normalized pointer `normalized + (wave*hidden + wg*16)*4` and the byte offsets of column tile c
+// `r*16*hidden + h*32 + c*256*hidden` in `noff..noff+nt`.
+fn up_address(b: &mut Builder, g: &Geo, noff: u8, arch: Arch) -> Result<(), String> {
+    let nt = g.nt;
+    sop(b, format!("s_mul_i32 s{}, s{}, s{}", TMP, SM, WAVE), &[TMP], &[SM, WAVE])?;
+    sop(b, format!("s_lshl_b32 s{}, s{}, 2", TMP, TMP), &[TMP], &[TMP])?;
+    sop(b, format!("s_lshl_b32 s{}, s{}, 6", TMP2, WG), &[TMP2], &[WG])?;
+    sop(b, format!("{} s{}, s{}, s{}", s_add_i32(arch), TMP, TMP, TMP2), &[TMP], &[TMP, TMP2])?;
+    add64(b, NP, YP, TMP)?;
+    sop(b, format!("s_lshl_b32 s{}, s{}, 4", TMP, SM), &[TMP], &[SM])?;
+    op(b, format!("v_and_b32_e32 v{}, 15, v{}", VT, LANE), &[v(VT)], &[v(LANE)])?;
+    op(b, format!("v_mul_lo_u32 v{}, s{}, v{}", noff, TMP, VT), &[v(noff)], &[v(VT), s(TMP)])?;
+    op(b, format!("v_lshrrev_b32_e32 v{}, 4, v{}", VT2, LANE), &[v(VT2)], &[v(LANE)])?;
+    op(b, format!("v_lshlrev_b32_e32 v{}, 5, v{}", VT2, VT2), &[v(VT2)], &[v(VT2)])?;
+    op(b, format!("v_add_nc_u32_e32 v{}, v{}, v{}", noff, noff, VT2), &[v(noff)], &[v(noff), v(VT2)])?;
+    for c in 1..nt {
+        sop(b, format!("s_mul_i32 s{}, s{}, {}", TMP2, TMP, 16 * c), &[TMP2], &[TMP])?;
+        op(
+            b,
+            format!("v_add_nc_u32_e32 v{}, s{}, v{}", noff + c as u8, TMP2, noff),
+            &[v(noff + c as u8)],
+            &[v(noff), s(TMP2)],
+        )?;
+    }
+    Ok(())
+}
+
+// Up: the scales, then the normalized values of the live columns (exec-masked per column tile).
+fn up_loads(b: &mut Builder, g: &Geo, sv: u8, nrm: u8, noff: u8) -> Result<(), String> {
+    down_scale_loads(b, sv)?;
+    for c in 0..g.nt {
+        exec_mask(b, c)?;
+        vload128(b, nrm + 8 * c as u8, noff + c as u8, NP, 0)?;
+        vload128(b, nrm + 8 * c as u8 + 4, noff + c as u8, NP, 16)?;
+    }
+    exec_all(b)
+}
+
+// EPIPRE: the epilogue's global loads (the same loads, the same addresses and live lanes as the epilogue's).
+fn epi_loads(b: &mut Builder, g: &Geo, e: &Epi) -> Result<(), String> {
+    if g.up {
+        return up_loads(b, g, e.sv as u8, e.nrm as u8, e.noff as u8);
+    }
+    down_scale_loads(b, e.sv as u8)
+}
+
+// EPIPRE, in front of the K loops: the up address set-up (it persists in the dedicated block and in
+// `NP`), then the loads.
+fn epi_preload(b: &mut Builder, g: &Geo, e: &Epi, arch: Arch) -> Result<(), String> {
+    if g.up {
+        up_address(b, g, e.noff as u8, arch)?;
+    }
+    epi_loads(b, g, e)
+}
+
+// `y[col][m] = act(val * s[m])` for accumulator index `j` (column tile `j/8`, row `j%8`) of the value in
+// `val`; the scales are in `sv..sv+7`.
+fn emit_store(b: &mut Builder, g: &Geo, l: &Lay, val: u8, j: u32, sv: u8) -> Result<(), String> {
+    let c = j / 8;
+    let r = (j % 8) as u8;
+    let vout = l.xb + 14;
+    op(b, format!("v_mul_f32_e32 v{}, v{}, v{}", vout, val, sv + r), &[v(vout)], &[v(val), v(sv + r)])?;
+    if g.act {
+        let t = [l.xb + 8, l.xb + 9, l.xb + 10, l.xb + 11, l.xb + 12, l.xb + 13];
+        hc_act_tail(b, vout, &t, ASC)?;
+    }
+    exec_mask(b, c)?;
+    b.push(
+        Instruction::new(
+            format!("global_store_b32 v{}, v{}, s[{}:{}] offset:{}", YA + c as u8, vout, YP, YP + 1, 4 * r),
+            vec![],
+            vec![v(YA + c as u8), v(vout), s(YP), s(YP + 1)],
+        )
+        .memory(MemoryClass::VmemStore),
+    )?;
+    exec_all(b)?;
+    b.release_store_sources()
+}
+
+fn down_epilogue(b: &mut Builder, g: &Geo, l: &Lay, e: &Epi, slot: usize, end: &str) -> Result<(), String> {
+    let nr = g.nr();
+    let sv = e.sv as u8;
+    if !g.epipre {
+        down_scale_loads(b, sv)?;
+    }
+    // Partials to LDS: ((wave*NR + j)*32 + lane)*4.
+    op(b, format!("v_lshlrev_b32_e32 v{}, 2, v{}", LB, LANE), &[v(LB)], &[v(LANE)])?;
+    sop(b, format!("s_mul_i32 s{}, s{}, {}", TMP, WAVE, lit(nr * 128)), &[TMP], &[WAVE])?;
+    op(b, format!("v_add_nc_u32_e32 v{}, s{}, v{}", LB, TMP, LB), &[v(LB)], &[v(LB), s(TMP)])?;
+    op(b, format!("v_lshlrev_b32_e32 v{}, 2, v{}", LR, LANE), &[v(LR)], &[v(LANE)])?;
+    sop(b, format!("s_mul_i32 s{}, s{}, {}", TMP, MI, lit(g.kw * nr * 128)), &[TMP], &[MI])?;
+    op(b, format!("v_add_nc_u32_e32 v{}, s{}, v{}", LR, TMP, LR), &[v(LR)], &[v(LR), s(TMP)])?;
+    for j in 0..nr {
+        let a = ACC + j as u8;
+        b.ds_store(
+            slot,
+            Instruction::new(
+                format!("ds_store_b32 v{}, v{} offset:{}", LB, a, j * 128),
+                vec![],
+                vec![v(LB), v(a)],
+            )
+            .memory(MemoryClass::DsStore),
+        )?;
+    }
+    b.wait_all()?;
+    b.barrier_with_scope([ready(slot)], "lds_only")?;
+    // Wave `ki` folds accumulator indices j with j % KW == ki, partials in ascending ki.
+    let p = e.p as u8;
+    for ki in 0..g.kw {
+        let mut js: Vec<u32> = Vec::new();
+        for j in 0..nr {
+            if j % g.kw == ki {
+                js.push(j);
+            }
+        }
+        if js.len() == 0 {
+            continue;
+        }
+        let next = lbl(g, &format!("fold{}_next", ki));
+        sop(b, format!("s_cmp_eq_u32 s{}, {}", KI, ki), &[], &[KI])?;
+        branch(b, &format!("s_cbranch_scc0 {}", next))?;
+        for j in js {
+            for k2 in 0..g.kw {
+                b.ds_load(
+                    slot,
+                    Instruction::new(
+                        format!("ds_load_b32 v{}, v{} offset:{}", p + k2 as u8, LR, (k2 * nr + j) * 128),
+                        vec![v(p + k2 as u8)],
+                        vec![v(LR)],
+                    )
+                    .memory(MemoryClass::DsLoad),
+                )?;
+            }
+            for k2 in 1..g.kw {
+                op(
+                    b,
+                    format!("v_add_f32_e32 v{}, v{}, v{}", p, p, p + k2 as u8),
+                    &[v(p)],
+                    &[v(p), v(p + k2 as u8)],
+                )?;
+            }
+            emit_store(b, g, l, p, j, sv)?;
+        }
+        b.wait_all()?;
+        branch(b, &format!("s_branch {}", end))?;
+        b.label(&next)?;
+    }
+    b.wait_all()
+}
+
+// ---- read-up epilogue
+
+// Full IEEE division `n / d` as compiled in the product object; `n`/`d` are operand texts (a `v{r}` or an
+// inline constant), `ext` the VGPRs among them (denominator first). Result in `w[0]`; clobbers `w[1..6]`.
+fn divide(b: &mut Builder, n: &str, d: &str, ext: &[u8], w: &[u8]) -> Result<(), String> {
+    let w0 = w[0];
+    let w1 = w[1];
+    let w2 = w[2];
+    let w3 = w[3];
+    let w4 = w[4];
+    let w5 = w[5];
+    valu(b, format!("v_div_scale_f32 v{}, null, {}, {}, {}", w1, d, d, n), &[w1], ext)?;
+    valu(b, format!("v_rcp_f32_e32 v{}, v{}", w2, w1), &[w2], &[w1])?;
+    valu(b, format!("v_fma_f32 v{}, -v{}, v{}, 1.0", w3, w1, w2), &[w3], &[w1, w2])?;
+    valu(b, format!("v_fmac_f32_e32 v{}, v{}, v{}", w2, w3, w2), &[w2], &[w2, w3])?;
+    valu(b, format!("v_div_scale_f32 v{}, vcc_lo, {}, {}, {}", w3, n, d, n), &[w3], ext)?;
+    valu(b, format!("v_mul_f32_e32 v{}, v{}, v{}", w4, w3, w2), &[w4], &[w3, w2])?;
+    valu(b, format!("v_fma_f32 v{}, -v{}, v{}, v{}", w5, w1, w4, w3), &[w5], &[w1, w4, w3])?;
+    valu(b, format!("v_fmac_f32_e32 v{}, v{}, v{}", w4, w5, w2), &[w4], &[w4, w5, w2])?;
+    valu(b, format!("v_fma_f32 v{}, -v{}, v{}, v{}", w1, w1, w4, w3), &[w1], &[w1, w4, w3])?;
+    alu_wait(b)?;
+    valu(b, format!("v_div_fmas_f32 v{}, v{}, v{}, v{}", w1, w1, w2, w4), &[w1], &[w1, w2, w4])?;
+    valu(b, format!("v_div_fixup_f32 v{}, v{}, {}, {}", w0, w1, d, n), &[w0], &cat(ext, &[w1]))
+}
+
+// `gate_pre = 1.0 / (1.0 + expf(-x))` (not yet BF16-rounded) in `t[0]`; `x` preserved.
+fn sigmoid(b: &mut Builder, x: u8, t: &[u8]) -> Result<(), String> {
+    let t0 = t[0];
+    let t1 = t[1];
+    let t2 = t[2];
+    let t3 = t[3];
+    valu(b, format!("v_mul_f32_e32 v{}, 0xbfb8aa3b, v{}", t0, x), &[t0], &[x])?;
+    valu(b, format!("v_fma_f32 v{}, 0xbfb8aa3b, v{}, -v{}", t1, x, t0), &[t1], &[x, t0])?;
+    valu(b, format!("v_rndne_f32_e32 v{}, v{}", t2, t0), &[t2], &[t0])?;
+    valu(b, format!("v_sub_f32_e32 v{}, v{}, v{}", t0, t0, t2), &[t0], &[t0, t2])?;
+    valu(b, format!("v_fmac_f32_e32 v{}, 0xb2a5705f, v{}", t1, x), &[t1], &[t1, x])?;
+    valu(b, format!("v_add_f32_e32 v{}, v{}, v{}", t0, t0, t1), &[t0], &[t0, t1])?;
+    valu(b, format!("v_cvt_i32_f32_e32 v{}, v{}", t3, t2), &[t3], &[t2])?;
+    valu(b, format!("v_exp_f32_e32 v{}, v{}", t0, t0), &[t0], &[t0])?;
+    valu(b, format!("v_ldexp_f32 v{}, v{}, v{}", t0, t0, t3), &[t0], &[t0, t3])?;
+    valu(b, format!("v_cmp_nlt_f32_e32 vcc_lo, 0x42ce8ed0, v{}", x), &[], &[x])?;
+    alu_wait(b)?;
+    valu(b, format!("v_cndmask_b32_e32 v{}, 0, v{}, vcc_lo", t0, t0), &[t0], &[t0])?;
+    valu(b, format!("v_cmp_ngt_f32_e32 vcc_lo, 0xc2b17218, v{}", x), &[], &[x])?;
+    alu_wait(b)?;
+    valu(b, format!("v_cndmask_b32_e32 v{}, 0x7f800000, v{}, vcc_lo", t0, t0), &[t0], &[t0])?;
+    valu(b, format!("v_add_f32_e32 v{}, 1.0, v{}", t0, t0), &[t0], &[t0])?;
+    // t0 = 1.0 / t0.
+    divide(b, "1.0", &format!("v{}", t0), &[t0], t)
+}
+
+fn store_out(b: &mut Builder, c: u32, r: u32, val: u8) -> Result<(), String> {
+    exec_mask(b, c)?;
+    b.push(
+        Instruction::new(
+            format!("global_store_b32 v{}, v{}, s[{}:{}] offset:{}", YA + c as u8, val, OP, OP + 1, 4 * r),
+            vec![],
+            vec![v(YA + c as u8), v(val), s(OP), s(OP + 1)],
+        )
+        .memory(MemoryClass::VmemStore),
+    )?;
+    exec_all(b)?;
+    b.release_store_sources()
+}
+
+fn up_epilogue(b: &mut Builder, g: &Geo, e: &Epi, slot: usize, end: &str, arch: Arch) -> Result<(), String> {
+    let nt = g.nt;
+    let nr = 8 * nt;
+    let sv = e.sv as u8;
+    let nrm = e.nrm as u8;
+    let t0 = e.t0 as u8;
+    let t = [t0, t0 + 1, t0 + 2, t0 + 3, t0 + 4, t0 + 5];
+    let val = e.val as u8;
+    let p = e.p as u8;
+    let noff = e.noff as u8;
+
+    smem(b, OP, 2, KARG, 32)?;
+    if !g.epipre {
+        up_address(b, g, noff, arch)?;
+        up_loads(b, g, sv, nrm, noff)?;
+    }
+    // LDS store base: ((wave*NR)*32 + lane)*4; fold read base: lane*4.
+    op(b, format!("v_lshlrev_b32_e32 v{}, 2, v{}", LB, LANE), &[v(LB)], &[v(LANE)])?;
+    sop(b, format!("s_mul_i32 s{}, s{}, {}", TMP, WAVE, lit(nr * 128)), &[TMP], &[WAVE])?;
+    op(b, format!("v_add_nc_u32_e32 v{}, s{}, v{}", LB, TMP, LB), &[v(LB)], &[v(LB), s(TMP)])?;
+    op(b, format!("v_lshlrev_b32_e32 v{}, 2, v{}", LR, LANE), &[v(LR)], &[v(LANE)])?;
+    for j in 0..nr {
+        let c = (j / 8) as u8;
+        let r = (j % 8) as u8;
+        let n = nrm + 8 * c + r;
+        op(
+            b,
+            format!("v_mul_f32_e32 v{}, v{}, v{}", val, ACC + j as u8, sv + r),
+            &[v(val)],
+            &[v(ACC + j as u8), v(sv + r)],
+        )?;
+        round_trip(b, val, t[1], t[2], t[3])?;
+        sigmoid(b, val, &t)?;
+        // gate = rt(1/den) in t0; normed = rt(normalized).
+        round_trip(b, t[0], t[1], t[2], t[3])?;
+        round_trip(b, n, t[1], t[2], t[3])?;
+        op(b, format!("v_mul_f32_e32 v{}, v{}, v{}", val, t[0], n), &[v(val)], &[v(t[0]), v(n)])?;
+        round_trip(b, val, t[1], t[2], t[3])?;
+        b.ds_store(
+            slot,
+            Instruction::new(
+                format!("ds_store_b32 v{}, v{} offset:{}", LB, val, j * 128),
+                vec![],
+                vec![v(LB), v(val)],
+            )
+            .memory(MemoryClass::DsStore),
+        )?;
+    }
+    b.wait_all()?;
+    b.barrier_with_scope([ready(slot)], "lds_only")?;
+    // Wave w folds j % 4 == w: value = +0 + term0 + term1 + term2 + term3, / 4.0.
+    for w in 0..BRANCHES {
+        let next = format!(".Lhc8_{}_fold{}", g.symbol(), w);
+        sop(b, format!("s_cmp_eq_u32 s{}, {}", WAVE, w), &[], &[WAVE])?;
+        branch(b, &format!("s_cbranch_scc0 {}", next))?;
+        for j in 0..nr {
+            if j % BRANCHES != w {
+                continue;
+            }
+            for k in 0..BRANCHES {
+                b.ds_load(
+                    slot,
+                    Instruction::new(
+                        format!("ds_load_b32 v{}, v{} offset:{}", p + k as u8, LR, (k * nr + j) * 128),
+                        vec![v(p + k as u8)],
+                        vec![v(LR)],
+                    )
+                    .memory(MemoryClass::DsLoad),
+                )?;
+            }
+            op(b, format!("v_add_f32_e32 v{}, 0, v{}", val, p), &[v(val)], &[v(p)])?;
+            for k in 1..BRANCHES {
+                op(
+                    b,
+                    format!("v_add_f32_e32 v{}, v{}, v{}", val, val, p + k as u8),
+                    &[v(val)],
+                    &[v(val), v(p + k as u8)],
+                )?;
+            }
+            divide(b, &format!("v{}", val), "4.0", &[val], &t)?;
+            round_trip(b, t[0], t[1], t[2], t[3])?;
+            store_out(b, j / 8, j % 8, t[0])?;
+        }
+        b.wait_all()?;
+        branch(b, &format!("s_branch {}", end))?;
+        b.label(&next)?;
+    }
+    b.wait_all()
+}
+
+// ------------------------------------------------------------------------------------------------ kernel
+
+fn kernel_spec(g: &Geo, arch: Arch) -> KernelSpec {
+    let kernargs = if g.up {
+        KernargLayout::new(56)
+            .pointer_access("q", 0, "read_only")
+            .pointer_access("s", 8, "read_only")
+            .pointer_access("low", 16, "read_only")
+            .pointer_access("normalized", 24, "read_only")
+            .pointer_access("mixed", 32, "write_only")
+            .hidden("hidden", 40, 4, "by_value")
+            .hidden("low_rank", 44, 4, "by_value")
+            .hidden("rows", 48, 4, "by_value")
+            .hidden("pad", 52, 4, "by_value")
+    } else {
+        KernargLayout::new(48)
+            .pointer_access("q", 0, "read_only")
+            .pointer_access("s", 8, "read_only")
+            .pointer_access("x", 16, "read_only")
+            .pointer_access("y", 24, "write_only")
+            .hidden("M", 32, 4, "by_value")
+            .hidden("K", 36, 4, "by_value")
+            .hidden("rows", 40, 4, "by_value")
+            .hidden("act_scale", 44, 4, "by_value")
+    };
+    KernelSpec {
+        kernel_id: (if g.up { "hc8_read_up" } else { "hc8_wmma" }).into(),
+        variant: g.variant(),
+        arch: arch,
+        symbol: g.symbol(),
+        kernargs: kernargs,
+        user_sgpr_count: 2,
+        system_sgpr_workgroup_id_y: false,
+        workgroup_size: g.block() as u16,
+        group_segment_fixed_size: g.lds_bytes(),
+        wave32: true,
+        cu_mode: false,
+    }
+}
+
+fn emit(spec: Spec) -> Result<Emitted, String> {
+    let arch = spec.arch;
+    let g = geo_of(&spec.variant)?;
+    let l = Lay::new(&g)?;
+    let e = epi_layout(&g, &l)?;
+    let regs = plan(&g, &l, &e)?;
+    let mut b = Builder::new(kernel_spec(&g, arch), regs);
+    if DELAY_ALU {
+        b.enable_delay_alu();
+    }
+    let slot = b.lds_slot(if g.up { "terms" } else { "partials" }, 0, g.lds_bytes())?;
+    let tag = g.symbol();
+    let end = lbl(&g, "end");
+    prologue(&mut b, &g, &end, arch)?;
+    if g.epipre {
+        epi_preload(&mut b, &g, &e, arch)?;
+    }
+    zero_regs(&mut b, ACC, g.nr())?;
+    zero_regs(&mut b, l.xb, 16 * l.u * g.nt)?;
+    k_loops(&mut b, &g, &l, &e, &tag)?;
+    if g.up {
+        up_epilogue(&mut b, &g, &e, slot, &end, arch)?;
+    } else {
+        down_epilogue(&mut b, &g, &l, &e, slot, &end)?;
+    }
+    b.wait_all()?;
+    b.label(&end)?;
+    branch(&mut b, "s_endpgm")?;
+    b.finish()
+}

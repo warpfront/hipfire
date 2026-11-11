@@ -23,6 +23,19 @@
 //!   `LabPending` admission without a [`DifferentialWitness`], the
 //!   byte-identity of the node's output against Eager on the same fixture.
 //!
+//! # Completeness of GPU-generated task spans
+//!
+//! A task-graph proof with span lists ([`crate::task_graph`], span mode)
+//! proves **safety** only: no out-of-grid or duplicate tile runs, the count
+//! never overflows, the GPU writes no authority. It does not prove that the
+//! producer's live list holds every live tile; that is a functional property
+//! of EXPAND_LIVE. So the admission of such a program is
+//! [`Admission::Spans`] (over whatever its certificates say), and it renders
+//! a receipt only through [`Admission::receipt_with_completeness`] with the
+//! harness-attached [`CompletenessEvidence`] (producer, byte oracle, P0 vs
+//! eager), as `"completeness": ` [`COMPLETENESS_FUNCTIONAL`]; without it
+//! (or via [`Admission::receipt`]) the receipt refuses.
+//!
 //! # What `admit_lab_pending` accepts
 //!
 //! The node must be a registered, receipted kernel (it has a `kref`) whose
@@ -32,6 +45,17 @@
 //! hidden arguments railgun does not supply, an unconsumed declared word, a
 //! non-allocation sealed table...) is a refusal that no lab state may
 //! override.
+//!
+//! One `Graph` lowering is also a pending certificate: exactly
+//! [`crate::kernel::ATOMIC_UNCERTIFIED`] ("atomic without a commutativity
+//! certificate"; a `Graph` for any other reason is refused). The node is
+//! admitted with its conservative effects (`Atomic` reads and writes), and
+//! every non-commutative atomic source is named in its pending reason as
+//! `atomic protocol unproven: template <t>, +<record offset>, <opcode>` (an
+//! arena pointer load) or `atomic protocol unproven: arg +<offset>, <opcode>`
+//! (an explicit argument), sorted and deduplicated. A source whose receipt
+//! records no opcode is refused: no reason without it. The certified path
+//! still refuses the node (`Graph`).
 
 use std::ops::Range;
 
@@ -83,6 +107,12 @@ pub fn is_pending_certificate_reason(fragment: &str) -> bool {
     })
 }
 
+/// What the receipt says about a program with GPU-generated task spans: the
+/// certificate proves **safety** (no out-of-grid or duplicate tile, no count
+/// overflow, no GPU-written authority), never that the producer's live list
+/// holds every live tile.
+pub const COMPLETENESS_FUNCTIONAL: &str = "functional (EXPAND_LIVE), not certified";
+
 /// Whether a program (or plan, or group) is certified, or lab-pending.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub enum Admission {
@@ -91,6 +121,12 @@ pub enum Admission {
     /// At least one node or group ordering awaits its certificate; `reasons`
     /// names each (the exact refusals the certificate would discharge).
     LabPending { reasons: Vec<String> },
+    /// `base`, for a program with `lists` GPU-generated task span lists
+    /// ([`crate::task_graph::TaskGraphProof::spans`]). Whatever `base` says,
+    /// the receipt also names the completeness of the live lists, which no
+    /// certificate covers: it needs harness evidence
+    /// ([`CompletenessEvidence`], [`Admission::receipt_with_completeness`]).
+    Spans { base: Box<Admission>, lists: usize },
 }
 
 impl Admission {
@@ -103,25 +139,88 @@ impl Admission {
         }
     }
 
+    /// This admission for a program with `lists` span lists (itself for
+    /// none).
+    pub fn with_spans(self, lists: usize) -> Self {
+        match self {
+            _ if lists == 0 => self,
+            Self::Spans { base, lists: have } => Self::Spans {
+                base,
+                lists: have + lists,
+            },
+            base => Self::Spans {
+                base: Box::new(base),
+                lists,
+            },
+        }
+    }
+
+    /// The number of span lists whose completeness the receipt must name.
+    pub fn spans(&self) -> usize {
+        match self {
+            Self::Spans { lists, .. } => *lists,
+            _ => 0,
+        }
+    }
+
+    /// Safety rests on certificates only. (Completeness of span lists never
+    /// does: [`Admission::spans`].)
     pub fn is_certified(&self) -> bool {
-        matches!(self, Self::Certified)
+        match self {
+            Self::Certified => true,
+            Self::LabPending { .. } => false,
+            Self::Spans { base, .. } => base.is_certified(),
+        }
     }
 
     /// The receipt record the harness logs. `Certified` is
     /// `{"admission":"proven"}`. `LabPending` needs the eager byte-identity
     /// `witness` ("lab-pending results need the eager byte-identity witness"
     /// otherwise) and renders [`LAB_PENDING`], `"certified": false`, the
-    /// pending reasons and the differential digests.
+    /// pending reasons and the differential digests. An admission with span
+    /// lists never renders here: it needs
+    /// [`Admission::receipt_with_completeness`].
     pub fn receipt(
         &self,
         witness: Option<&DifferentialWitness>,
     ) -> Result<AdmissionReceipt, String> {
+        self.receipt_with_completeness(witness, None)
+    }
+
+    /// [`Admission::receipt`] with the harness-attached completeness
+    /// `evidence`. A program with span lists renders only with it
+    /// (`"completeness": ` [`COMPLETENESS_FUNCTIONAL`] and the evidence next
+    /// to the base admission); evidence for a program without spans is
+    /// refused, so a receipt never claims evidence it has nothing to say
+    /// about.
+    pub fn receipt_with_completeness(
+        &self,
+        witness: Option<&DifferentialWitness>,
+        evidence: Option<&CompletenessEvidence>,
+    ) -> Result<AdmissionReceipt, String> {
         match self {
+            Self::Spans { base, lists } => {
+                let evidence = evidence.ok_or_else(|| {
+                    format!(
+                        "{lists} span list(s): completeness is {COMPLETENESS_FUNCTIONAL} and needs the producer, oracle and P0-vs-eager evidence"
+                    )
+                })?;
+                evidence.validate()?;
+                let mut receipt = base.receipt_with_completeness(witness, None)?;
+                receipt.completeness = Some(COMPLETENESS_FUNCTIONAL);
+                receipt.completeness_evidence = Some(evidence.clone());
+                Ok(receipt)
+            }
+            _ if evidence.is_some() => {
+                Err("completeness evidence given for a program without GPU-generated spans".into())
+            }
             Self::Certified => Ok(AdmissionReceipt {
                 admission: "proven",
                 certified: None,
                 pending: None,
                 differential: None,
+                completeness: None,
+                completeness_evidence: None,
             }),
             Self::LabPending { reasons } => {
                 let witness = witness.ok_or_else(|| {
@@ -132,6 +231,8 @@ impl Admission {
                     certified: Some(false),
                     pending: Some(reasons.clone()),
                     differential: Some(witness.clone()),
+                    completeness: None,
+                    completeness_evidence: None,
                 })
             }
         }
@@ -153,6 +254,43 @@ pub struct AdmissionReceipt {
     /// The eager byte-identity witness; absent when proven.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub differential: Option<DifferentialWitness>,
+    /// [`COMPLETENESS_FUNCTIONAL`] for a program with span lists; absent
+    /// otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completeness: Option<&'static str>,
+    /// The evidence behind `completeness`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completeness_evidence: Option<CompletenessEvidence>,
+}
+
+/// The harness-attached evidence that a span producer's live list is the
+/// eager live set (the one thing the certificate does not prove). Railgun
+/// cannot check it; it only refuses to render without it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct CompletenessEvidence {
+    /// The producer (EXPAND_LIVE) the evidence is about: template, object
+    /// digest or job id.
+    pub producer: String,
+    /// The byte oracle that checked the live list (job id or digest).
+    pub oracle: String,
+    /// The P0 (railgun, spans) vs eager byte-identity run (job id or digest).
+    pub p0_vs_eager: String,
+}
+
+impl CompletenessEvidence {
+    /// Every field names something.
+    fn validate(&self) -> Result<(), String> {
+        for (name, value) in [
+            ("producer", &self.producer),
+            ("oracle", &self.oracle),
+            ("p0_vs_eager", &self.p0_vs_eager),
+        ] {
+            if value.trim().is_empty() {
+                return Err(format!("completeness evidence {name} is empty"));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The railgun output was compared with Eager's on the same fixture and the
@@ -233,14 +371,23 @@ pub(crate) fn node_pending(program: &KernelProgram, range: Range<usize>) -> Vec<
     out
 }
 
-/// The reason a group's ordering is uncertified (`None` when certified).
-pub(crate) fn ordering_pending(index: usize, g: &CoResidentGroup) -> Option<String> {
-    g.ordering.is_pending().then(|| {
-        format!(
-            "group {index} {:?}: ordering edges are not from a task-graph certificate",
-            g.nodes
-        )
-    })
+/// The reasons a group's ordering is uncertified (empty when certified): the
+/// generic one, then each named reason the ordering carries.
+pub(crate) fn ordering_pending(index: usize, g: &CoResidentGroup) -> Vec<String> {
+    if !g.ordering.is_pending() {
+        return Vec::new();
+    }
+    let mut out = vec![format!(
+        "group {index} {:?}: ordering edges are not from a task-graph certificate",
+        g.nodes
+    )];
+    out.extend(
+        g.ordering
+            .pending_reasons()
+            .iter()
+            .map(|r| format!("group {index} {:?}: {r}", g.nodes)),
+    );
+    out
 }
 
 /// Every pending reason of `program`: its `LabPending` nodes, then its
@@ -252,16 +399,22 @@ pub(crate) fn program_pending(program: &KernelProgram) -> Vec<String> {
             .groups
             .iter()
             .enumerate()
-            .filter_map(|(i, g)| ordering_pending(i, g)),
+            .flat_map(|(i, g)| ordering_pending(i, g)),
     );
     out
 }
 
 impl KernelProgram {
     /// [`Admission::Certified`], or [`Admission::LabPending`] naming every
-    /// `LabPending` node and uncertified group ordering.
+    /// `LabPending` node and uncertified group ordering; with span lists, an
+    /// [`Admission::Spans`] over it.
     pub fn admission(&self) -> Admission {
-        Admission::from_reasons(program_pending(self))
+        Admission::from_reasons(program_pending(self)).with_spans(
+            self.groups
+                .iter()
+                .map(|g| g.ordering.spans())
+                .sum::<usize>(),
+        )
     }
 }
 
@@ -270,13 +423,14 @@ impl Pm4Plan {
     /// [`crate::plan::plan`]).
     pub fn admission(&self) -> Admission {
         Admission::from_reasons(self.pending.clone())
+            .with_spans(self.groups.iter().map(|g| g.spans).sum::<usize>())
     }
 }
 
 impl crate::coresident::GroupPlan {
     /// The admission of this group: its `LabPending` members and its ordering.
     pub fn admission(&self) -> Admission {
-        Admission::from_reasons(self.pending.clone())
+        Admission::from_reasons(self.pending.clone()).with_spans(self.spans)
     }
 }
 
@@ -284,7 +438,7 @@ impl crate::coresident::GroupPlan {
 mod lab {
     use std::collections::BTreeSet;
 
-    use crate::kernel::{Arg, KernelProgram, Lowering, MemClass, RegionEffect};
+    use crate::kernel::{Arg, KernelProgram, Lowering, MemClass, RegionEffect, ATOMIC_UNCERTIFIED};
     use crate::{ResourceId, ResourceKind};
 
     use super::is_pending_certificate_reason;
@@ -362,8 +516,16 @@ mod lab {
                 .get(node)
                 .ok_or_else(|| format!("lab-pending: no node {node}"))?;
             let who = format!("lab-pending: node {node} ({})", n.symbol);
+            let mut atomic = false;
             let reason = match &n.lowering {
                 Lowering::HipDirect { reason } | Lowering::Conditional { reason } => reason,
+                // Exactly one certified-but-not-PM4 case is a pending certificate:
+                // a non-commutative atomic with no commutativity certificate. Its
+                // sources are named below; any other Graph reason stays refused.
+                Lowering::Graph { reason } if reason == ATOMIC_UNCERTIFIED => {
+                    atomic = true;
+                    reason
+                }
                 Lowering::Pm4 => return Err(format!("{who} is already PM4: nothing is pending")),
                 Lowering::Graph { reason } => {
                     return Err(format!(
@@ -382,13 +544,56 @@ mod lab {
             }
             if let Some(bad) = reason
                 .split("; ")
-                .find(|fragment| !is_pending_certificate_reason(fragment))
+                .find(|fragment| !atomic && !is_pending_certificate_reason(fragment))
             {
                 return Err(format!(
                     "{who}: {bad:?} is not a pending certificate (allow-list: A1 Unknown, \
                      descriptor_arena records not bound, indexed_bind/sealed_table witness \
                      not consumed); full reason: {reason}"
                 ));
+            }
+            // Each non-commutative atomic source, by template and record offset
+            // (arena pointer loads) or argument offset, with its opcode; a
+            // source without a recorded opcode is refused.
+            let mut named: BTreeSet<String> = BTreeSet::new();
+            if atomic {
+                for fact in n.arena.iter().flat_map(|a| a.arenas.iter()) {
+                    for t in &fact.templates {
+                        for load in t
+                            .pointer_loads
+                            .iter()
+                            .filter(|l| l.classes.contains(&MemClass::Atomic))
+                        {
+                            if load.atomic_ops.is_empty() {
+                                return Err(format!(
+                                    "{who}: template {} +{} issues a non-commutative atomic with no recorded opcode",
+                                    t.template, load.record_offset
+                                ));
+                            }
+                            for op in &load.atomic_ops {
+                                named.insert(format!(
+                                    "atomic protocol unproven: template {}, +{}, {op}",
+                                    t.template, load.record_offset
+                                ));
+                            }
+                        }
+                    }
+                }
+                for (offset, ops) in &n.atomic_ops {
+                    if ops.is_empty() {
+                        return Err(format!(
+                            "{who}: arg +{offset} issues a non-commutative atomic with no recorded opcode"
+                        ));
+                    }
+                    for op in ops {
+                        named.insert(format!("atomic protocol unproven: arg +{offset}, {op}"));
+                    }
+                }
+                if named.is_empty() {
+                    return Err(format!(
+                        "{who}: {reason}, but no atomic source is recorded to name"
+                    ));
+                }
             }
 
             let mut effects = n.effects.clone();
@@ -469,7 +674,11 @@ mod lab {
                 }
             }
 
-            let pending = reason.clone();
+            let mut pending = reason.clone();
+            for source in &named {
+                pending.push_str("; ");
+                pending.push_str(source);
+            }
             let n = &mut self.nodes[node];
             n.effects = effects;
             n.lowering = Lowering::LabPending { pending };
@@ -483,8 +692,9 @@ mod lab_tests {
     use super::*;
     use crate::coresident::{GroupOrdering, OrderedEdge, WHY_ORDERED_EDGE};
     use crate::kernel::tests::{facts, launch, ptr};
-    use crate::kernel::{author, FactStatus, MemClass::*};
+    use crate::kernel::{author, FactStatus, MemClass::*, ATOMIC_UNCERTIFIED};
     use crate::plan::{plan, CacheTable, RowPolicy};
+    use crate::sealed_table::SealedTableRegistry;
     use crate::{BindingField, BindingRecord, ResourceId, ResourceKind};
 
     const A: u64 = 0x7000_0000;
@@ -622,6 +832,188 @@ mod lab_tests {
             .contains("already lab-pending"));
     }
 
+    /// An explicit pointer argument issuing a non-commutative atomic.
+    fn atomic_ptr(offset: u32, ops: &[&str]) -> crate::kernel::ArgFact {
+        crate::kernel::ArgFact {
+            offset,
+            size: 8,
+            role: crate::kernel::ArgRole::Pointer {
+                classes: vec![Atomic],
+                read_cache: crate::kernel::ReadCache::VmemOnly,
+                atomic_ops: ops.iter().map(|s| (*s).to_owned()).collect(),
+            },
+        }
+    }
+
+    #[test]
+    fn a_graph_by_atomic_node_is_admitted_lab_pending_naming_each_arg_and_opcode() {
+        let mut p = author(
+            "gfx1201",
+            &[launch(
+                &[(0, A), (8, D)],
+                16,
+                vec![
+                    atomic_ptr(0, &["global_atomic_swap_b32", "global_atomic_cmpswap_b32"]),
+                    atomic_ptr(8, &["global_atomic_swap_b32"]),
+                ],
+            )],
+        );
+        let want = ATOMIC_UNCERTIFIED;
+        assert!(matches!(&p.nodes[0].lowering, Lowering::Graph { reason } if reason == want));
+        // Certified: not PM4, not lowerable, the admission is Certified only
+        // because nothing is lab-pending, and `admit` is the only way out.
+        assert!(!p.nodes[0].lowering.is_pm4() && !p.nodes[0].lowering.is_pm4_lowerable());
+        let before = p.nodes[0].effects.clone();
+        p.admit_lab_pending(0, None).unwrap();
+        let n = &p.nodes[0];
+        // Effects stay conservative: the atomics (reads and writes) are kept.
+        assert!(before.iter().all(|e| n
+            .effects
+            .iter()
+            .any(|m| m.resource == e.resource && m.has(Atomic))));
+        let Lowering::LabPending { pending } = &n.lowering else {
+            panic!("{:?}", n.lowering)
+        };
+        assert_eq!(
+            pending,
+            &format!(
+                "{want}; atomic protocol unproven: arg +0, global_atomic_cmpswap_b32; \
+                 atomic protocol unproven: arg +0, global_atomic_swap_b32; \
+                 atomic protocol unproven: arg +8, global_atomic_swap_b32"
+            )
+        );
+        assert!(n.lowering.is_pm4_lowerable() && !n.lowering.is_pm4());
+        // It flows into the admission and its receipt, which needs the witness.
+        let admission = p.admission();
+        let Admission::LabPending { reasons } = &admission else {
+            panic!("{admission:?}")
+        };
+        assert!(
+            reasons[0].starts_with("node 0 (k): atomic without"),
+            "{reasons:?}"
+        );
+        assert!(admission.receipt(None).is_err());
+        let w = DifferentialWitness::compare(b"f", b"a", b"a").unwrap();
+        assert_eq!(
+            admission.receipt(Some(&w)).unwrap().pending.as_ref(),
+            Some(reasons)
+        );
+    }
+
+    #[test]
+    fn an_arena_atomic_load_is_named_by_template_and_record_offset() {
+        use crate::kernel::{ArenaFact, ArenaPointerLoad, ArenaTemplate, ConditionalFacts};
+        let load =
+            |record_offset, classes: Vec<crate::kernel::MemClass>, ops: &[&str]| ArenaPointerLoad {
+                record_offset,
+                classes,
+                null_guarded: false,
+                atomic_ops: ops.iter().map(|s| (*s).to_owned()).collect(),
+            };
+        let program = |ops: &[&str]| {
+            let args = vec![ptr(0, &[SmemLoad])];
+            let mut arena = launch(&[(0, A)], 8, args.clone());
+            let mut f = (*facts(args, 8)).clone();
+            f.facts.status = FactStatus::Conditional(ConditionalFacts {
+                guards: Vec::new(),
+                indexed: Vec::new(),
+                tables: Vec::new(),
+                arenas: vec![ArenaFact {
+                    arena_arg_offset: 0,
+                    templates: vec![ArenaTemplate {
+                        template: 3,
+                        pointer_loads: vec![
+                            load(0, vec![VmemLoad], &[]),
+                            load(16, vec![Atomic], ops),
+                            load(8, vec![Atomic], &["global_atomic_swap_b32"]),
+                        ],
+                        sealed: Vec::new(),
+                        wg_footprints: Vec::new(),
+                        hidden_grid: Vec::new(),
+                    }],
+                }],
+                task_protocol: None,
+                witnesses: vec!["descriptor_arena".into()],
+                case_digest: "ab".repeat(32),
+            });
+            arena.facts = Ok(std::sync::Arc::new(f));
+            let toucher = launch(&[(0, D)], 8, vec![ptr(0, &[VmemLoad])]);
+            let mut p = author("gfx1201", &[arena, toucher]);
+            let field = |offset| BindingField {
+                offset,
+                resource: ResourceId(1),
+                interior: 0,
+            };
+            p.bind_records(
+                ResourceId(0),
+                vec![BindingRecord {
+                    base: 0,
+                    template: 3,
+                    fields: vec![field(0), field(8), field(16)],
+                    ..Default::default()
+                }],
+                &SealedTableRegistry::new(),
+            )
+            .unwrap();
+            p
+        };
+        let mut p = program(&["global_atomic_cmpswap_b32", "global_atomic_swap_b32"]);
+        assert!(matches!(&p.nodes[0].lowering, Lowering::Graph { .. }));
+        p.admit_lab_pending(0, None).unwrap();
+        let Lowering::LabPending { pending } = &p.nodes[0].lowering else {
+            panic!("{:?}", p.nodes[0].lowering)
+        };
+        // Sorted by name, deduplicated (the swap at +16 and +8 differ by offset).
+        assert_eq!(
+            pending,
+            &format!(
+                "{ATOMIC_UNCERTIFIED}; atomic protocol unproven: template 3, +16, global_atomic_cmpswap_b32; \
+                 atomic protocol unproven: template 3, +16, global_atomic_swap_b32; \
+                 atomic protocol unproven: template 3, +8, global_atomic_swap_b32"
+            )
+        );
+        // A load with the Atomic class and no recorded opcode is refused.
+        let mut p = program(&[]);
+        let before = p.nodes.clone();
+        let err = p.admit_lab_pending(0, None).unwrap_err();
+        assert!(
+            err.contains("template 3 +16") && err.contains("no recorded opcode"),
+            "{err}"
+        );
+        assert_eq!(p.nodes, before, "an Err leaves the nodes unchanged");
+    }
+
+    #[test]
+    fn an_atomic_without_a_recorded_opcode_and_any_other_graph_reason_are_refused() {
+        let mut p = author("gfx1201", &[launch(&[(0, A)], 8, vec![atomic_ptr(0, &[])])]);
+        let before = p.clone();
+        let err = p.admit_lab_pending(0, None).unwrap_err();
+        assert!(
+            err.contains("arg +0") && err.contains("no recorded opcode"),
+            "{err}"
+        );
+        assert_eq!(p.nodes, before.nodes);
+
+        let mut p = author(
+            "gfx1201",
+            &[launch(
+                &[(0, A)],
+                8,
+                vec![atomic_ptr(0, &["global_atomic_swap_b32"])],
+            )],
+        );
+        p.nodes[0].lowering = Lowering::Graph {
+            reason: "something else".into(),
+        };
+        let err = p.admit_lab_pending(0, None).unwrap_err();
+        assert!(err.contains("certified but not PM4"), "{err}");
+        // The exact atomic reason plus another one is no atomic node either.
+        p.nodes[0].lowering = Lowering::Graph {
+            reason: format!("{ATOMIC_UNCERTIFIED}; something else"),
+        };
+        assert!(p.admit_lab_pending(0, None).is_err());
+    }
+
     #[test]
     fn arena_fields_get_conservative_effects_and_the_arena_stays_read_only() {
         // n0 (Unknown) reads arena resource 0 through arg 0; n1 touches X (1), Y (2), E (3).
@@ -657,8 +1049,11 @@ mod lab_tests {
                     interior: 0,
                 },
             ],
+            nulls: Vec::new(),
+            scalars: Vec::new(),
         };
-        p.bind_records(ResourceId(0), vec![rec]).unwrap();
+        p.bind_records(ResourceId(0), vec![rec], &SealedTableRegistry::new())
+            .unwrap();
 
         // The arena must be the declared kind and some argument must be bound to it.
         let mut q = p.clone();
@@ -925,5 +1320,43 @@ mod tests {
         assert_eq!(w.eager_sha256(), w.railgun_sha256());
         assert_ne!(w.fixture_sha256(), w.eager_sha256());
         assert_eq!(w.eager_sha256().len(), 64);
+    }
+
+    #[test]
+    fn span_lists_wrap_any_admission_and_never_render_without_evidence() {
+        assert_eq!(Admission::Certified.with_spans(0), Admission::Certified);
+        let once = Admission::Certified.with_spans(1);
+        assert_eq!(once.spans(), 1);
+        assert_eq!(once.clone().with_spans(2).spans(), 3, "lists add up");
+        assert!(once.is_certified());
+        let lab = Admission::LabPending {
+            reasons: vec!["r".into()],
+        }
+        .with_spans(1);
+        assert!(!lab.is_certified());
+        let evidence = CompletenessEvidence {
+            producer: "p".into(),
+            oracle: "o".into(),
+            p0_vs_eager: "e".into(),
+        };
+        let witness = DifferentialWitness::compare(b"f", b"a", b"a").unwrap();
+        for admission in [&once, &lab] {
+            assert!(admission.receipt(Some(&witness)).is_err());
+            assert!(admission
+                .receipt_with_completeness(Some(&witness), None)
+                .is_err());
+        }
+        let r = once
+            .receipt_with_completeness(None, Some(&evidence))
+            .unwrap();
+        assert_eq!(
+            serde_json::to_string(&r).unwrap(),
+            r#"{"admission":"proven","completeness":"functional (EXPAND_LIVE), not certified","completeness_evidence":{"producer":"p","oracle":"o","p0_vs_eager":"e"}}"#
+        );
+        let r = lab
+            .receipt_with_completeness(Some(&witness), Some(&evidence))
+            .unwrap();
+        assert_eq!(r.admission, LAB_PENDING);
+        assert_eq!(r.completeness, Some(COMPLETENESS_FUNCTIONAL));
     }
 }

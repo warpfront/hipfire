@@ -7,8 +7,10 @@
 //! (`release-0.4.5/megam0/p0h/m0_rt.h`); nothing here is on a product route.
 //!
 //! Kernarg: `M0Params` (72 bytes): `tasks, ticket, events, kernargs, trace, poison`
-//! pointers at 0..48, `spin_ticks` at 48 (its low dword is the poll budget of a
-//! predecessor wait), `n_tasks` at 56, `trace_on` at 60. A task is a 128-byte
+//! pointers at 0..48, `spin_ticks` at 48, `n_tasks` at 56, `trace_on` at 60.
+//! `spin_ticks` is a count of POLLS, not of clock ticks: its low dword is how many
+//! times one predecessor wait re-reads `events[pred]` (each poll is a device-scope load
+//! plus an `s_sleep`) before it gives up and sets poison; the high dword is ignored. A task is a 128-byte
 //! `M0TaskDesc`: `tmpl, vx, vy, vz, gx, gy, gz, ka_off, pred_event, expected,
 //! done_event, vcount`. Every workgroup (the hosted bodies' `blockDim`) loops:
 //!
@@ -39,7 +41,9 @@ use peacemaker_lift::rewrite::region::LiftedRegion;
 pub const KERNARG_BYTES: u32 = 72;
 pub const TASK_BYTES: u32 = 128;
 pub const TRACE_BYTES: u32 = 48;
-/// Highest SGPR count a hosted body may use (the dispatcher owns s72..s103).
+/// SGPRs a hosted body may use without spilling (the dispatcher owns s72..s103). A body
+/// using more (up to `WG_X`, the first region input above it) runs with the dispatcher
+/// SGPRs below its extent parked in the lanes of one spare VGPR.
 pub const BODY_SGPR_LIMIT: u16 = 72;
 /// The SGPRs that carry the virtual workgroup id (`ttmp9`, `ttmp7`) into a region.
 pub const WG_X: u16 = 102;
@@ -73,6 +77,34 @@ const KA_OFF: u8 = 98;
 const DONE: u8 = 99;
 const VCOUNT: u8 = 100;
 const STEP: u8 = 101;
+/// The template id a span task whose index is past the live count runs as: hosted by no
+/// pool, so the task publishes its done event without entering a region.
+pub const NOP_TMPL: u32 = 0xffff_fffe;
+/// Every dispatcher-owned SGPR range (name, base, length).
+const DISPATCHER_SGPRS: &[(&str, u8, u8)] = &[
+    // s72 = gx; s[72:73] = the span bitmap base inside the span checks (before the broadcast)
+    ("gx", GX, 2),
+    ("ptr_a", PTR_A, 2),
+    ("t_publish", T_PUBLISH, 2),
+    ("ptr_b", PTR_B, 2),
+    ("hw_wg", HW_WG, 1),
+    ("t_start", T_START, 2),
+    ("t_end", T_END, 2),
+    ("t_ready", T_READY, 2),
+    ("params", PARAMS, 2),
+    ("wavebase", WAVEBASE, 1),
+    ("temp", TEMP, 1),
+    ("n_tasks", N_TASKS, 1),
+    ("trace_on", TRACE_ON, 1),
+    ("idx", IDX, 1),
+    ("tmpl", TMPL, 1),
+    ("vx", VX, 1),
+    ("vyz", VYZ, 1),
+    ("ka_off", KA_OFF, 1),
+    ("done", DONE, 1),
+    ("vcount", VCOUNT, 1),
+    ("step", STEP, 1),
+];
 
 fn s(n: u8) -> RegRef {
     RegRef {
@@ -166,21 +198,59 @@ fn add_pieces(
     Ok(())
 }
 
-/// The pool dispatcher `symbol` of workgroup size `block` hosting `hosted`, and
-/// with `copy = Some(tmpl)` the PM-emitted COPY template (`copy_body`).
+/// A PM-emitted template a pool hosts beside its lifted bodies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Native {
+    /// COPY (`M0CopyArgs {u64 dst, u64 src, u64 bytes}`), MegaM0's tmpl 2.
+    Copy(u32),
+    /// EXPAND_LIVE (`kernels::p0_expand_gfx1201`), tmpl 1: o4's live tile list.
+    Expand(u32),
+}
+impl Native {
+    pub fn tmpl(self) -> u32 {
+        match self {
+            Native::Copy(t) | Native::Expand(t) => t,
+        }
+    }
+    /// The registers the body owns inside its region: SGPRs `[2, s)` and VGPRs `[1, v)`.
+    fn footprint(self) -> (u8, u8) {
+        use crate::kernels::p0_expand_gfx1201 as expand;
+        match self {
+            Native::Copy(_) => (16, 4),
+            Native::Expand(_) => (expand::SGPRS as u8, expand::VGPRS as u8),
+        }
+    }
+    /// The body's LDS, `[0, lds)` like a lifted body's (the dispatcher slot sits above).
+    fn lds(self) -> u32 {
+        match self {
+            Native::Copy(_) => 0,
+            Native::Expand(_) => crate::kernels::p0_expand_gfx1201::LDS_BYTES,
+        }
+    }
+    fn emit(self, b: &mut Builder, block: u32, name: &str) -> Result<(), String> {
+        match self {
+            Native::Copy(_) => copy_body(b, block, name),
+            Native::Expand(_) => crate::kernels::p0_expand_gfx1201::expand_body(b, block, name),
+        }
+    }
+}
+
+/// The pool dispatcher `symbol` of workgroup size `block` hosting the lifted bodies
+/// `hosted` and the PM-emitted templates `natives`.
 pub fn pool(
     symbol: &str,
     block: u32,
     hosted: &[Hosted],
-    copy: Option<u32>,
+    natives: &[Native],
 ) -> Result<Emitted, String> {
-    if hosted.is_empty() && copy.is_none() {
+    if hosted.is_empty() && natives.is_empty() {
         return Err("a pool hosts at least one template".into());
     }
-    if let Some(c) = copy {
-        if hosted.iter().any(|h| h.tmpl == c) {
-            return Err(format!("tmpl {c} is both COPY and a lifted body"));
-        }
+    let mut tmpls: Vec<u32> = hosted.iter().map(|h| h.tmpl).collect();
+    tmpls.extend(natives.iter().map(|n| n.tmpl()));
+    let distinct: std::collections::BTreeSet<u32> = tmpls.iter().copied().collect();
+    if distinct.len() != tmpls.len() {
+        return Err(format!("a template id is hosted twice: {tmpls:?}"));
     }
     for h in hosted {
         let r = h.region;
@@ -190,9 +260,9 @@ pub fn pool(
                 r.symbol, r.block
             ));
         }
-        if r.sgprs > BODY_SGPR_LIMIT {
+        if r.sgprs > WG_X {
             return Err(format!(
-                "{}: {} SGPRs exceed the hosted limit {BODY_SGPR_LIMIT}",
+                "{}: {} SGPRs reach the region inputs at s{WG_X}",
                 r.symbol, r.sgprs
             ));
         }
@@ -208,15 +278,16 @@ pub fn pool(
         }
     }
     let multi = block > 32;
-    let body_lds = hosted.iter().map(|h| h.region.lds_bytes).max().unwrap_or(0);
+    let body_lds = hosted
+        .iter()
+        .map(|h| h.region.lds_bytes)
+        .chain(natives.iter().map(|n| n.lds()))
+        .max()
+        .unwrap_or(0);
     let slot_base = body_lds.next_multiple_of(16);
     let lds_total = if multi { slot_base + 64 } else { body_lds };
     let step_label = |t: u32| format!(".Lt{t}_step");
-    let first_step = step_label(
-        hosted
-            .first()
-            .map_or_else(|| copy.expect("copy"), |h| h.tmpl),
-    );
+    let first_step = step_label(hosted.first().map_or_else(|| natives[0].tmpl(), |h| h.tmpl));
     let mut regs = RegPlan::new(256, 104)?;
     // entry: the hardware kernarg pointer and thread id, consumed before the loop
     regs.add_range(
@@ -233,30 +304,71 @@ pub fn pool(
         1,
         Live::Between("entry".into(), ".Lnext".into()),
     )?;
-    for (name, base, len) in [
-        ("gx", GX, 1),
-        ("ptr_a", PTR_A, 2),
-        ("t_publish", T_PUBLISH, 2),
-        ("ptr_b", PTR_B, 2),
-        ("hw_wg", HW_WG, 1),
-        ("t_start", T_START, 2),
-        ("t_end", T_END, 2),
-        ("t_ready", T_READY, 2),
-        ("params", PARAMS, 2),
-        ("wavebase", WAVEBASE, 1),
-        ("temp", TEMP, 1),
-        ("n_tasks", N_TASKS, 1),
-        ("trace_on", TRACE_ON, 1),
-        ("idx", IDX, 1),
-        ("tmpl", TMPL, 1),
-        ("vx", VX, 1),
-        ("vyz", VYZ, 1),
-        ("ka_off", KA_OFF, 1),
-        ("done", DONE, 1),
-        ("vcount", VCOUNT, 1),
-        ("step", STEP, 1),
-    ] {
-        regs.add_range(name, Kind::S, base, len, Live::Whole)?;
+    // Bodies above BODY_SGPR_LIMIT: the dispatcher SGPRs they overlap are parked in
+    // lanes of `spill_v` (above every body's and dispatcher temporary's VGPRs) from just
+    // before the region entry to just after its exit; those SGPRs' ranges exclude it.
+    let spilling: Vec<(u32, String, String, u16)> = hosted
+        .iter()
+        .filter(|h| h.region.sgprs > BODY_SGPR_LIMIT)
+        .map(|h| {
+            let name = format!("t{}", h.tmpl);
+            (
+                h.tmpl,
+                region_entry_label(&name),
+                region_exit_label(&name),
+                h.region.sgprs,
+            )
+        })
+        .collect();
+    // unused (0) when no body spills
+    let spill_v: u8 = if spilling.is_empty() {
+        0
+    } else {
+        hosted
+            .iter()
+            .map(|h| h.region.vgprs)
+            .max()
+            .unwrap_or(0)
+            .max(19)
+            .try_into()
+            .map_err(|_| "no VGPR left to park dispatcher SGPRs".to_string())?
+    };
+    for &(name, base, len) in DISPATCHER_SGPRS {
+        let parked: Vec<&(u32, String, String, u16)> = spilling
+            .iter()
+            .filter(|(_, _, _, top)| u16::from(base) < *top)
+            .collect();
+        if parked.is_empty() {
+            regs.add_range(name, Kind::S, base, len, Live::Whole)?;
+            continue;
+        }
+        let mut from = "entry".to_string();
+        for (i, (_, entry, exit, _)) in parked.iter().enumerate() {
+            regs.add_range(
+                &format!("{name}_{i}"),
+                Kind::S,
+                base,
+                len,
+                Live::Between(from, entry.clone()),
+            )?;
+            from = exit.clone();
+        }
+        regs.add_range(
+            &format!("{name}_{}", parked.len()),
+            Kind::S,
+            base,
+            len,
+            Live::Between(from, ".Ldone".into()),
+        )?;
+    }
+    for (t, ..) in &spilling {
+        regs.add_range(
+            &format!("park_t{t}"),
+            Kind::V,
+            spill_v,
+            1,
+            Live::Between(format!(".Lt{t}_park"), format!(".Lt{t}_unpark")),
+        )?;
     }
     // claim/broadcast and publish temporaries (outside every region)
     add_pieces(
@@ -264,7 +376,7 @@ pub fn pool(
         "claim_v",
         Kind::V,
         1,
-        18,
+        40,
         &Live::Between(".Lnext".into(), first_step.clone()),
     )?;
     add_pieces(
@@ -311,9 +423,10 @@ pub fn pool(
             Live::Between(step, exit),
         )?;
     }
-    if let Some(c) = copy {
-        // COPY is a PM-emitted region: its inputs stay dispatcher-owned (and unwritten)
-        // through the region; its own registers are s2..s15, v1..v3.
+    for (i, n) in natives.iter().enumerate() {
+        // A PM-emitted region: its inputs stay dispatcher-owned (and unwritten) through
+        // the region; it owns `footprint()` inside it.
+        let c = n.tmpl();
         let name = format!("t{c}");
         let (step, entry, exit) = (
             step_label(c),
@@ -321,8 +434,12 @@ pub fn pool(
             region_exit_label(&name),
         );
         let between = Live::Between(entry, exit);
-        // through the exit label (live there: the region checks its inputs at its exit)
-        let through = Live::Between(step, ".Lpublish".into());
+        // through the exit label (live there: the region checks its inputs at its exit),
+        // up to the next native template's arm
+        let end = natives
+            .get(i + 1)
+            .map_or(".Lpublish".to_string(), |m| format!(".Lt{}_go", m.tmpl()));
+        let through = Live::Between(step, end);
         regs.add_range(&format!("{name}_args"), Kind::S, 0, 2, through.clone())?;
         regs.add_range(&format!("{name}_lane"), Kind::V, 0, 1, through.clone())?;
         regs.add_range(
@@ -333,8 +450,9 @@ pub fn pool(
             through.clone(),
         )?;
         regs.add_range(&format!("{name}_wg_yz"), Kind::S, WG_YZ as u8, 1, through)?;
-        add_pieces(&mut regs, &format!("{name}_s"), Kind::S, 2, 16, &between)?;
-        add_pieces(&mut regs, &format!("{name}_v"), Kind::V, 1, 4, &between)?;
+        let (s_end, v_end) = n.footprint();
+        add_pieces(&mut regs, &format!("{name}_s"), Kind::S, 2, s_end, &between)?;
+        add_pieces(&mut regs, &format!("{name}_v"), Kind::V, 1, v_end, &between)?;
     }
     let spec = KernelSpec {
         kernel_id: "pm_lift_pool".into(),
@@ -351,7 +469,7 @@ pub fn pool(
             .hidden("spin_ticks", 48, 8, "by_value")
             .hidden("n_tasks", 56, 4, "by_value")
             .hidden("trace_on", 60, 4, "by_value")
-            .hidden("pad", 64, 8, "by_value"),
+            .pointer_access("spans", 64, Access::ReadOnly),
         user_sgpr_count: 2,
         system_sgpr_workgroup_id_y: false,
         workgroup_size: block as u16,
@@ -440,7 +558,8 @@ pub fn pool(
             &[s(IDX)],
         )?;
         vmov_s(b, 1, TEMP)?;
-        for (dst, off) in [(4u8, 0u32), (8, 16), (12, 32)] {
+        // dwords 0..11 (v4..v15) and the span words 12..15 (v18..v21: flags, k, list id)
+        for (dst, off) in [(4u8, 0u32), (8, 16), (12, 32), (18, 48)] {
             let o = if off == 0 {
                 String::new()
             } else {
@@ -461,7 +580,7 @@ pub fn pool(
         }
         readfirst(b, TEMP, 12)?;
         op(b, &format!("s_cmp_eq_u32 s{TEMP}, -1"), &[], &[s(TEMP)])?;
-        branch(b, "s_cbranch_scc1 .Lready")?;
+        branch(b, "s_cbranch_scc1 .Lspan")?;
         readfirst(b, TMPL, 13)?; // expected
         param(b, PTR_B, 0x10)?;
         op(
@@ -495,7 +614,7 @@ pub fn pool(
                 timeout: ".Ltimeout".into(),
             }),
         )?;
-        branch(b, "s_branch .Lready")?;
+        branch(b, "s_branch .Lspan")?;
         b.label(".Ltimeout")?;
         b.acquire(Scope::Dev)?;
         param(b, PTR_B, 0x28)?;
@@ -516,6 +635,8 @@ pub fn pool(
             Ordering::Release,
         )?;
         op(b, "v_mov_b32_e32 v4, -1", &[v(4)], &[])?;
+        branch(b, "s_branch .Lready")?;
+        span_entry(b)?;
         b.label(".Lready")?;
         b.realtime(S::<2>(T_READY))?;
         b.label(".Lclaimed")?;
@@ -618,7 +739,8 @@ pub fn pool(
             )?;
             branch(b, &format!("s_cbranch_scc1 .Lt{}_go", h.tmpl))?;
         }
-        if let Some(c) = copy {
+        for n in natives {
+            let c = n.tmpl();
             op(b, &format!("s_cmp_eq_u32 s{TMPL}, {c:#x}"), &[], &[s(TMPL)])?;
             branch(b, &format!("s_cbranch_scc1 .Lt{c}_go"))?;
         }
@@ -681,6 +803,23 @@ pub fn pool(
                 )?;
                 b.wait_all()?;
                 let r = h.region;
+                // the dispatcher SGPRs below the body's extent, parked lane by lane
+                let parked: Vec<u8> = DISPATCHER_SGPRS
+                    .iter()
+                    .filter(|(_, base, _)| u16::from(*base) < r.sgprs)
+                    .flat_map(|&(_, base, len)| base..base + len)
+                    .collect();
+                if !parked.is_empty() {
+                    b.label(&format!(".Lt{}_park", h.tmpl))?;
+                    for &k in &parked {
+                        op(
+                            b,
+                            &format!("v_writelane_b32 v{spill_v}, s{k}, {}", k - GX),
+                            &[v(spill_v)],
+                            &[s(k)],
+                        )?;
+                    }
+                }
                 b.foreign_region(&abi, &r.lines, r.sgprs, r.vgprs, r.lds_bytes)?;
                 // provenance for `.note.pm_regions` (railgun-cert replays the conversion)
                 let p = b
@@ -697,6 +836,17 @@ pub fn pool(
                 });
                 p.source_object_sha256 = Some(r.receipt.base_object_sha256);
                 p.source_symbol = Some(r.symbol.clone());
+                for &k in &parked {
+                    op(
+                        b,
+                        &format!("v_readlane_b32 s{k}, v{spill_v}, {}", k - GX),
+                        &[s(k)],
+                        &[v(spill_v)],
+                    )?;
+                }
+                if !parked.is_empty() {
+                    b.label(&format!(".Lt{}_unpark", h.tmpl))?;
+                }
                 exec_all(b)?;
                 op(
                     b,
@@ -716,7 +866,8 @@ pub fn pool(
             b.wait_all()?;
             branch(b, "s_branch .Lpublish")?;
         }
-        if let Some(c) = copy {
+        for &n in natives {
+            let c = n.tmpl();
             let name = format!("t{c}");
             b.label(&format!(".Lt{c}_go"))?;
             op(b, &format!("s_mov_b32 s{STEP}, 0"), &[s(STEP)], &[])?;
@@ -729,7 +880,7 @@ pub fn pool(
                     ("lane".into(), v(0)),
                     ("workgroup_x".into(), s(WG_X as u8)),
                 ],
-                lds_bytes: 0,
+                lds_bytes: n.lds(),
                 workgroup_size: block as u16,
             };
             b.loop_(&step_label(c), |b| {
@@ -770,7 +921,7 @@ pub fn pool(
                     &[v(0), s(WAVEBASE)],
                 )?;
                 b.wait_all()?;
-                b.region(&abi, |b| copy_body(b, block, &name))?;
+                b.region(&abi, |b| n.emit(b, block, &name))?;
                 b.regions
                     .last_mut()
                     .expect("region records a proof")
@@ -918,6 +1069,198 @@ pub fn pool(
 /// virtual workgroup `w` of `gx` copies dwords `w * block + t + k * gx * block` below
 /// `bytes / 4`; virtual workgroup 0 copies the `bytes % 4` tail. `src`/`dst` must not
 /// overlap; `bytes < 2^32`. The body's registers are s0..s15, v0..v3 (the region's).
+/// Span mode (railgunmega/DYNAMIC.md), on wave 0 lane 0 after the predecessor acquire,
+/// with the descriptor in v4..v15 and its span words in v18 (flags), v19 (k), v20 (list
+/// id). Static tasks (flags 0) pass straight to `.Lready`; a span task without a
+/// predecessor event poisons. A span task reads its span descriptor and live entry into
+/// VGPRs (v24..v39: the dispatcher's meaning-carrying SGPRs are not reused; the bitmap
+/// base alone is read into s[72:73], free until the broadcast defines `gx`):
+/// `list_id < n_spans`, `c = count` (after the acquire) `<= K`, `k >= c` turns the task
+/// into a NOP (template `NOP_TMPL`: no region, `done` still released), the entry
+/// `{vx, vy, vz}` must lie inside the header grid and its bit in the claim bitmap must be
+/// clear (a returning atomic OR sets it); any failed check poisons. A valid entry replaces
+/// the descriptor's `vx, vy, vz` and sets `vcount = 1`.
+fn span_entry(b: &mut Builder) -> Result<(), String> {
+    // v_cmp into TEMP, then branch to `to` when any lane (lane 0) holds
+    fn check(b: &mut Builder, cmp: &str, uses: &[RegRef], to: &str) -> Result<(), String> {
+        op(b, &format!("{cmp}"), &[s(TEMP)], uses)?;
+        op(b, &format!("s_cmp_lg_u32 s{TEMP}, 0"), &[], &[s(TEMP)])?;
+        branch(b, &format!("s_cbranch_scc1 {to}"))
+    }
+    let load = |b: &mut Builder, text: String, def: RegRef, uses: Vec<RegRef>| {
+        b.push(Instruction::new(text, vec![def], uses).memory(MemoryClass::VmemLoad))
+    };
+    let vp = |n: u8| RegRef {
+        kind: Kind::V,
+        base: n,
+        len: 2,
+    };
+    b.label(".Lspan")?;
+    // reached from the no-predecessor branch and the wait's exit: the span words' load
+    // may still be in flight on either (the linear ledger here only knows the wait path)
+    b.wait(Counter::Load, 0)?;
+    readfirst(b, TEMP, 18)?;
+    op(b, &format!("s_cmp_eq_u32 s{TEMP}, 0"), &[], &[s(TEMP)])?;
+    branch(b, "s_cbranch_scc1 .Lready")?;
+    op(b, &format!("s_cmp_lg_u32 s{TEMP}, 1"), &[], &[s(TEMP)])?;
+    branch(b, "s_cbranch_scc1 .Lspan_poison")?;
+    // a span header must name its producer's done event: the count load below is then
+    // ordered by that wait's acquire on every path (a host-filled span names an event the
+    // host leaves satisfied, e.g. `expected = 0`)
+    readfirst(b, TEMP, 12)?;
+    op(b, &format!("s_cmp_eq_u32 s{TEMP}, -1"), &[], &[s(TEMP)])?;
+    branch(b, "s_cbranch_scc1 .Lspan_poison")?;
+    // the span table: u32 n_spans at +0, descriptor i at +32 + 32 i
+    param(b, PTR_B, 0x40)?;
+    b.wait_all()?;
+    op(
+        b,
+        &format!("s_or_b32 s{TEMP}, s{PTR_B}, s{}", PTR_B + 1),
+        &[s(TEMP)],
+        &[sp(PTR_B)],
+    )?;
+    op(b, &format!("s_cmp_eq_u32 s{TEMP}, 0"), &[], &[s(TEMP)])?;
+    branch(b, "s_cbranch_scc1 .Lspan_poison")?;
+    op(b, "v_mov_b32_e32 v1, 0", &[v(1)], &[])?;
+    load(
+        b,
+        format!("global_load_b32 v28, v1, s[{PTR_B}:{}]", PTR_B + 1),
+        v(28),
+        vec![v(1), sp(PTR_B)],
+    )?;
+    b.wait_all()?;
+    check(
+        b,
+        &format!("v_cmp_ge_u32_e64 s{TEMP}, v20, v28"),
+        &[v(20), v(28)],
+        ".Lspan_poison",
+    )?;
+    // descriptor `{live_list, count_cell}` -> v[32:35], `{bitmap, K, 0}` -> v[36:39]
+    op(b, "v_lshl_add_u32 v29, v20, 5, 32", &[v(29)], &[v(20)])?;
+    for (dst, off) in [(32u8, ""), (36, " offset:16")] {
+        load(
+            b,
+            format!(
+                "global_load_b128 v[{dst}:{}], v29, s[{PTR_B}:{}]{off}",
+                dst + 3,
+                PTR_B + 1
+            ),
+            vq(dst),
+            vec![v(29), sp(PTR_B)],
+        )?;
+    }
+    b.wait_all()?;
+    // c, ordered after the predecessor acquire (the producer released entries and count)
+    load(
+        b,
+        "global_load_b32 v28, v[34:35], off".into(),
+        v(28),
+        vec![vp(34)],
+    )?;
+    b.wait_all()?;
+    check(
+        b,
+        &format!("v_cmp_gt_u32_e64 s{TEMP}, v28, v38"),
+        &[v(28), v(38)],
+        ".Lspan_poison",
+    )?;
+    check(
+        b,
+        &format!("v_cmp_ge_u32_e64 s{TEMP}, v19, v28"),
+        &[v(19), v(28)],
+        ".Lspan_nop",
+    )?;
+    op(
+        b,
+        "v_mad_co_u64_u32 v[30:31], null, v19, 16, v[32:33]",
+        &[vp(30)],
+        &[v(19), vp(32)],
+    )?;
+    load(
+        b,
+        "global_load_b128 v[24:27], v[30:31], off".into(),
+        vq(24),
+        vec![vp(30)],
+    )?;
+    b.wait_all()?;
+    // inside the header grid (v8..v10 = gx, gy, gz)
+    for (e, g) in [(24u8, 8u8), (25, 9), (26, 10)] {
+        check(
+            b,
+            &format!("v_cmp_ge_u32_e64 s{TEMP}, v{e}, v{g}"),
+            &[v(e), v(g)],
+            ".Lspan_poison",
+        )?;
+    }
+    // bit = vx + gx * (vy + gy * vz); claim it in the bitmap
+    op(b, "v_mul_lo_u32 v27, v26, v9", &[v(27)], &[v(26), v(9)])?;
+    op(
+        b,
+        "v_add_nc_u32_e32 v27, v27, v25",
+        &[v(27)],
+        &[v(27), v(25)],
+    )?;
+    op(b, "v_mul_lo_u32 v27, v27, v8", &[v(27)], &[v(27), v(8)])?;
+    op(
+        b,
+        "v_add_nc_u32_e32 v27, v27, v24",
+        &[v(27)],
+        &[v(27), v(24)],
+    )?;
+    op(b, "v_lshrrev_b32_e32 v1, 5, v27", &[v(1)], &[v(27)])?;
+    op(b, "v_lshlrev_b32_e32 v1, 2, v1", &[v(1)], &[v(1)])?;
+    op(b, "v_and_b32_e32 v2, 31, v27", &[v(2)], &[v(27)])?;
+    op(b, "v_lshlrev_b32_e64 v2, v2, 1", &[v(2)], &[v(2)])?;
+    readfirst(b, GX, 36)?;
+    readfirst(b, GX + 1, 37)?;
+    b.event_rmw(
+        AtomicOp::OrB32,
+        Some(V::<1>(3)),
+        v(2),
+        GlobalAddr {
+            vaddr: V::<1>(1),
+            base: S::<2>(GX),
+            offset: 0,
+        },
+        Scope::Dev,
+        Ordering::Relaxed,
+    )?;
+    b.wait_all()?;
+    op(b, "v_and_b32_e32 v3, v3, v2", &[v(3)], &[v(3), v(2)])?;
+    check(
+        b,
+        &format!("v_cmp_ne_u32_e64 s{TEMP}, 0, v3"),
+        &[v(3)],
+        ".Lspan_poison",
+    )?;
+    for (d, e) in [(5u8, 24u8), (6, 25), (7, 26)] {
+        op(b, &format!("v_mov_b32_e32 v{d}, v{e}"), &[v(d)], &[v(e)])?;
+    }
+    op(b, "v_mov_b32_e32 v15, 1", &[v(15)], &[])?;
+    branch(b, "s_branch .Lready")?;
+    b.label(".Lspan_nop")?;
+    op(b, &format!("v_mov_b32_e32 v4, {NOP_TMPL:#x}"), &[v(4)], &[])?;
+    branch(b, "s_branch .Lready")?;
+    b.label(".Lspan_poison")?;
+    b.acquire(Scope::Dev)?;
+    param(b, PTR_B, 0x28)?;
+    op(b, "v_mov_b32_e32 v1, 0", &[v(1)], &[])?;
+    op(b, "v_mov_b32_e32 v2, 1", &[v(2)], &[])?;
+    b.event_rmw(
+        AtomicOp::OrB32,
+        None,
+        v(2),
+        GlobalAddr {
+            vaddr: V::<1>(1),
+            base: S::<2>(PTR_B),
+            offset: 0,
+        },
+        Scope::Dev,
+        Ordering::Release,
+    )?;
+    op(b, "v_mov_b32_e32 v4, -1", &[v(4)], &[])
+}
+
 fn copy_body(b: &mut Builder, block: u32, name: &str) -> Result<(), String> {
     let (wx, nb) = (WG_X as u8, block);
     smem(

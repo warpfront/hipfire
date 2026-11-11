@@ -30,14 +30,7 @@ pub fn operand_register(
         Operand::Reg(r) | Operand::Half(r, _) => *r,
         _ => return None,
     };
-    let name = inst.op.name(arch).unwrap_or("");
-    let mask_output = (name.starts_with("v_cmp") && index == 0)
-        || ((name.starts_with("v_div_scale_") || name.starts_with("v_") && name.contains("_co_"))
-            && index == 1);
-    let mask_input = (name.starts_with("v_cndmask_")
-        || name.starts_with("v_") && name.contains("_co_ci_"))
-        && index + 1 == inst.operands.len();
-    if reg.kind == Kind::S && (mask_output || mask_input) {
+    if reg.kind == Kind::S && crate::effects::lane_mask_role(arch, inst, index).is_some() {
         reg.len = if wave == crate::inst::Wave::Wave32 {
             1
         } else {
@@ -236,7 +229,7 @@ fn operand(
     if name == "RSRC" {
         return Ok(reg(
             Kind::S,
-            code * if arch == Arch::Gfx1201 { 1 } else { 4 },
+            code * if arch.is_gfx12() { 1 } else { 4 },
             bits,
         ));
     }
@@ -398,14 +391,8 @@ fn encoded_operand(
         {
             Ok(0)
         }
-        ("RSRC", Operand::Reg(r))
-            if r.kind == Kind::S && (arch == Arch::Gfx1201 || r.base % 4 == 0) =>
-        {
-            Ok(u32::from(if arch == Arch::Gfx1201 {
-                r.base
-            } else {
-                r.base / 4
-            }))
+        ("RSRC", Operand::Reg(r)) if r.kind == Kind::S && (arch.is_gfx12() || r.base % 4 == 0) => {
+            Ok(u32::from(if arch.is_gfx12() { r.base } else { r.base / 4 }))
         }
         ("SRC0", Operand::Reg(r))
             if matches!(form, Form::Vop1Dpp | Form::Vop1Dpp8 | Form::Vop2Dpp)
@@ -472,7 +459,7 @@ fn width(arch: Arch, row: &OpRow, words: &[u32]) -> Result<usize, DecodeError> {
         | Form::Vop1
         | Form::Vop2
         | Form::Vopc => 1,
-        Form::Vmem(_) if arch == Arch::Gfx1201 => 3,
+        Form::Vmem(_) if arch.is_gfx12() => 3,
         _ => 2,
     };
     if words.len() < base {
@@ -554,7 +541,7 @@ fn cache_policy(arch: Arch, row: &OpRow, words: &[u32]) -> CachePolicy {
     if row.form != Form::Smem && !matches!(row.form, Form::Vmem(_)) {
         return CachePolicy::default();
     }
-    if arch == Arch::Gfx1201 {
+    if arch.is_gfx12() {
         CachePolicy {
             th: field_value(arch, "TH", row, words) as u8,
             scope: field_value(arch, "SCOPE", row, words) as u8,
@@ -628,7 +615,7 @@ fn special_mods(arch: Arch, row: &OpRow, words: &[u32], mods: &mut Modifiers) {
         }
         mods.wait = Some(wait);
     }
-    if arch == Arch::Gfx1201
+    if arch.is_gfx12()
         && row.form == Form::Sopp
         && row.name.starts_with("s_wait_")
         && row.name != "s_wait_alu"
@@ -671,7 +658,7 @@ fn special_mods(arch: Arch, row: &OpRow, words: &[u32], mods: &mut Modifiers) {
         mods.delay = Some(DelayAluHint {
             instid0: (imm & 15) as u8,
             instskip: ((imm >> 4) & 7) as u8,
-            instid1: ((imm >> 7) & if arch == Arch::Gfx1201 { 0x1ff } else { 0xf }) as u8,
+            instid1: ((imm >> 7) & if arch.is_gfx12() { 0x1ff } else { 0xf }) as u8,
         });
     }
 }
@@ -826,7 +813,7 @@ pub fn decode_for(arch: Arch, words: &[u32]) -> Result<(Inst, usize), DecodeErro
         | Form::Vop1
         | Form::Vop2
         | Form::Vopc => 1,
-        Form::Vmem(_) if arch == Arch::Gfx1201 => 3,
+        Form::Vmem(_) if arch.is_gfx12() => 3,
         _ => 2,
     } {
         Some(words[n - 1])
@@ -921,10 +908,10 @@ pub fn decode_for(arch: Arch, words: &[u32]) -> Result<(Inst, usize), DecodeErro
         if off != 0 {
             // gfx11 MUBUF OFFSET is an unsigned 12-bit byte offset (0..=4095);
             // FLAT/GLOBAL/SCRATCH (13-bit) and gfx12 (24-bit) offsets are signed.
-            if arch != Arch::Gfx1201 && row.form == Form::Vmem(crate::inst::VmemForm::Buffer) {
+            if !arch.is_gfx12() && row.form == Form::Vmem(crate::inst::VmemForm::Buffer) {
                 operands.push(Operand::Imm(ImmField::VmemOffset(off as i32)));
             } else {
-                let bits = if arch == Arch::Gfx1201 { 24 } else { 13 };
+                let bits = if arch.is_gfx12() { 24 } else { 13 };
                 operands.push(Operand::Imm(ImmField::VmemOffset(
                     ((off << (32 - bits)) as i32) >> (32 - bits),
                 )));
@@ -935,13 +922,13 @@ pub fn decode_for(arch: Arch, words: &[u32]) -> Result<(Inst, usize), DecodeErro
         {
             operands.push(Operand::Vmem(VmemToken::Offen));
         }
-        if arch != Arch::Gfx1201 && row.form == Form::Vmem(crate::inst::VmemForm::Buffer) {
+        if !arch.is_gfx12() && row.form == Form::Vmem(crate::inst::VmemForm::Buffer) {
             for name in ["OFFEN", "IDXEN", "TFE"] {
                 let field = forms::field_for(arch, row.form, name).expect("gfx11 buffer flag");
                 consumed[usize::from(field.bit / 32)] |= field.mask();
             }
         }
-        if arch == Arch::Gfx1201 {
+        if arch.is_gfx12() {
             if row.form == Form::Vmem(crate::inst::VmemForm::Buffer) {
                 if let th @ 1..=7 = field_value(arch, "TH", row, words) {
                     operands.push(Operand::CacheTh(th as u8));
@@ -1054,7 +1041,7 @@ pub fn decode_for(arch: Arch, words: &[u32]) -> Result<(Inst, usize), DecodeErro
         }
     }
     if row.form == Form::Smem || matches!(row.form, Form::Vmem(_)) {
-        for name in if arch == Arch::Gfx1201 {
+        for name in if arch.is_gfx12() {
             &["TH", "SCOPE", "NV"][..]
         } else {
             &["GLC", "SLC", "DLC"][..]
@@ -1390,7 +1377,7 @@ pub fn encode_for(arch: Arch, inst: &Inst) -> Result<SmallVec<[u32; 3]>, DecodeE
         }
     }
     if row.form == Form::Smem || matches!(row.form, Form::Vmem(_)) {
-        if arch == Arch::Gfx1201 {
+        if arch.is_gfx12() {
             encode_field(arch, "TH", row, &mut words, inst.mods.cpol.th.into())?;
             encode_field(arch, "SCOPE", row, &mut words, inst.mods.cpol.scope.into())?;
             encode_field(arch, "NV", row, &mut words, u32::from(inst.mods.cpol.nv))?;
@@ -1442,7 +1429,7 @@ pub fn encode_for(arch: Arch, inst: &Inst) -> Result<SmallVec<[u32; 3]>, DecodeE
         | Form::Vop1
         | Form::Vop2
         | Form::Vopc => 1,
-        Form::Vmem(_) if arch == Arch::Gfx1201 => 3,
+        Form::Vmem(_) if arch.is_gfx12() => 3,
         _ => 2,
     };
     if let Some(lit) = inst.literal {
@@ -1652,6 +1639,7 @@ mod tests {
         (Arch::Gfx1201, "v_cmpx_le_u64_e32", &[0x7db6_0416]), // v_cmpx_le_u64_e32 s[22:23], v[2:3]
         (Arch::Gfx1201, "v_cmpx_eq_f32_e32", &[0x7d24_0d04]), // v_cmpx_eq_f32_e32 v4, v6
         (Arch::Gfx1201, "v_cmpx_eq_u16_e32", &[0x7d74_1281]), // v_cmpx_eq_u16_e32 1, v9.l
+        (Arch::Gfx1201, "v_cmp_eq_u16_e32", &[0x7c74_6081]), // v_cmp_eq_u16_e32 vcc_lo, 1, v48.l
         (
             Arch::Gfx1201,
             "v_cmp_eq_u16_e64",
@@ -2319,7 +2307,7 @@ mod tests {
             (Arch::Gfx1201, "gfx1201"),
         ] {
             for (saddr, width) in [(4u32, 1u8), (124, 2)] {
-                let words = if arch == Arch::Gfx1201 {
+                let words = if arch.is_gfx12() {
                     vec![0xee050000 | saddr, 10, 20]
                 } else {
                     vec![0xdc520000, 0x0a000014 | saddr << 16]

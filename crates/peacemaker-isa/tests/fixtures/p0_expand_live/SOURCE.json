@@ -1,0 +1,60 @@
+{
+  "job": "j8284",
+  "dump_root": "/home/kaden/qcal/release-0.4.5/megam0/job/runs/20261106T142943Z-915896_196559496_A_C/r6/lab/dumps/",
+  "description": "gfx1201 M0 seq19 gemm_mq4g256v2p_moe_grouped_top10_o4_r2_x4 route inputs, captured as seq18 moe_route_scatter_top10_f32 post windows",
+  "seq19_kernarg": {
+    "file": "r6_launches.json",
+    "sha256": "aa60ee1499cbec50640e49c3ac2cd4b8cf1225d802dc4753f5be6da522c40562",
+    "pointers": {
+      "+8 expert_tile_ids": "0x780abf192000",
+      "+16 sorted_slot_index": "0x780abf185000"
+    },
+    "M": 1280,
+    "grouped_rows": 960,
+    "n_experts": 512,
+    "grid": [
+      80,
+      480,
+      1
+    ]
+  },
+  "launch_json": {
+    "file": "18_moe_route_scatter_top10_f32/launch.json",
+    "sha256": "0ebb5fa6f33d12a54de99ff35a9e179dc7300065cc004ac3b3d3030ce28f9a49"
+  },
+  "manifest": {
+    "file": "MANIFEST.sha256",
+    "sha256": "51b99560b4c3a85fe8e6d3a6af796f0d3b11ba34758fe3b597f2da48e57e8e60",
+    "entries": 155
+  },
+  "arrays": [
+    {
+      "fixture": "expert_tile_ids.i32le.bin",
+      "fixture_sha256": "e3727e7ba965da41e11a10bb971acd6fc34b4de25a919eb7f688734716343491",
+      "source_file": "18_moe_route_scatter_top10_f32/post_0000780abf192000.bin",
+      "source_sha256": "b71dfeee0713b3f6f0b962a7f2734ac33972d8f90820a4fea51485ec5de2e50b",
+      "manifest_sha256": "b71dfeee0713b3f6f0b962a7f2734ac33972d8f90820a4fea51485ec5de2e50b",
+      "window_va": "0x780abf192000",
+      "window_len": 3200,
+      "byte_range": [
+        0,
+        240
+      ],
+      "i32_count": 60
+    },
+    {
+      "fixture": "sorted_slot_index.i32le.bin",
+      "fixture_sha256": "0e3f8f73f20f85528505152949442172f17d44549ce48b4f29c472142760ac8c",
+      "source_file": "18_moe_route_scatter_top10_f32/post_0000780abf185000.bin",
+      "source_sha256": "ded48300c87e60a98e9dfaa6c5c0dfb5aca6aff08de27de6cbbd85a2a4d6bcc0",
+      "manifest_sha256": "ded48300c87e60a98e9dfaa6c5c0dfb5aca6aff08de27de6cbbd85a2a4d6bcc0",
+      "window_va": "0x780abf185000",
+      "window_len": 51200,
+      "byte_range": [
+        0,
+        3840
+      ],
+      "i32_count": 960
+    }
+  ]
+}

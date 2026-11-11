@@ -353,6 +353,7 @@ impl LocalLaneRank<'_> {
                     state: &mut lane.state,
                     tokens: &vl.rows,
                     wide: vl.wide,
+                    exact: vl.exact,
                     kind: if vl.rows.len() == 1 {
                         LaneRowKind::Ar
                     } else {
@@ -366,6 +367,7 @@ impl LocalLaneRank<'_> {
                 logits: &logits.sub_offset(0, n_dec * vocab),
                 top1: &top1.sub_offset(0, n_dec * std::mem::size_of::<i32>()),
                 wide_hidden: hidden,
+                vocab_shard: None,
             };
             let forwarded =
                 forward_lanes(gpu, bundle, &mut rows, &out, &policy).map_err(|e| e.to_string());
@@ -829,6 +831,7 @@ impl LaneMeshExecutor for LocalLaneRank<'_> {
                         hidden,
                         row_begin: first,
                         picks: lane_picks,
+                        shard_local_picks: false,
                         skip_rollback,
                         fill: fill.as_deref_mut(),
                     },
@@ -1315,7 +1318,7 @@ mod tests {
                     .policies
                     .entry(tag)
                     .or_insert_with(|| LaneSpecPolicy::with_floor(K, true));
-                let route = policy.route(budget, self.lab);
+                let route = policy.route(budget, self.lab, None);
                 let s = &script.windows[&(tag, seq[&tag])];
                 let drafts: Vec<u32> = match route {
                     LaneRoute::Batched { k_max } => s.drafts[..k_max].to_vec(),

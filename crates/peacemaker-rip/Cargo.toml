@@ -43,3 +43,9 @@ required-features = ["hw-diff"]
 name = "rip_l1"
 path = "examples/rip_l1.rs"
 required-features = ["l1"]
+
+# Verified kernel-variant search (S0-S4 on the CPU). Certification needs the toolchain.
+[[bin]]
+name = "rip-search"
+path = "src/bin/rip-search.rs"
+required-features = ["certify"]

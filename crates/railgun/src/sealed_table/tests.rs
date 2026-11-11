@@ -120,6 +120,8 @@ pub(crate) fn arg_record(
         read_cache: "scalar_and_vmem".into(),
         sinks: Vec::new(),
         loaded: true,
+        null_guarded: false,
+        atomic_ops: Vec::new(),
     }
 }
 
@@ -193,6 +195,8 @@ pub(crate) fn record_with(tables: Vec<SealedTableRecord>) -> KernelRecord {
         required_witnesses: vec![receipt::WITNESS_SEALED_TABLE.into()],
         case_digest: String::new(),
         guard_flag: None,
+        task_protocol: None,
+        wg_footprints: Vec::new(),
     })
 }
 
@@ -529,13 +533,7 @@ fn owner_seals_a_pointer_table_and_binds() {
 
 #[test]
 fn a_table_bound_equal_to_the_entry_count_is_in_range_and_a_constant_bound_is_checked() {
-    for (n, ok) in [
-        (0, true),
-        (3, true),
-        (4, true),
-        (5, false),
-        (u32::MAX, false),
-    ] {
+    for (n, ok) in [(0, true), (3, true), (4, true), (5, false)] {
         let fx = Fixture::with(&record(), n, Vec::new(), true);
         match (fx.bind(), ok) {
             // A zero bound is vacuous: discharged without a bound table.

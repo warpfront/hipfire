@@ -10908,9 +10908,37 @@ pub fn native_mtp_device_bytes(
     row_capture: Option<(crate::GdnStateFormat, usize)>,
     batched_fill: bool,
 ) -> Option<u64> {
-    let config = config.mtp_geometry();
-    let request = native_mtp_request_bytes(
+    native_mtp_device_bytes_ring(
         config,
+        config.mtp_geometry(),
+        context,
+        chunk_rows,
+        max_k,
+        head_dtype,
+        row_capture,
+        batched_fill,
+    )
+}
+
+/// [`native_mtp_device_bytes`] with the GDN capture ring sized under `ring_config` instead of
+/// the head's geometry: the EP reserve census passes the trunk shard's rank-local config
+/// (`HIPFIRE_EP_RESERVE_CENSUS`: 24 value heads, half of the global ring), since the rank
+/// allocates the ring on its own trunk's state.
+#[allow(clippy::too_many_arguments)]
+pub fn native_mtp_device_bytes_ring(
+    config: &crate::Qwen4Config,
+    ring_config: &crate::Qwen4Config,
+    context: &crate::Qwen4ContextCommit,
+    chunk_rows: usize,
+    max_k: usize,
+    head_dtype: rdna_compute::DType,
+    row_capture: Option<(crate::GdnStateFormat, usize)>,
+    batched_fill: bool,
+) -> Option<u64> {
+    let config = config.mtp_geometry();
+    let request = native_mtp_request_bytes_ring(
+        config,
+        ring_config,
         context.max_seq,
         chunk_rows,
         max_k,
@@ -10948,8 +10976,31 @@ pub fn native_mtp_request_bytes(
     row_capture: Option<(crate::GdnStateFormat, usize)>,
     batched_fill: bool,
 ) -> Option<u64> {
-    native_mtp_request_allocation_sizes(
+    native_mtp_request_bytes_ring(
         config,
+        config,
+        max_seq,
+        chunk_rows,
+        max_k,
+        row_capture,
+        batched_fill,
+    )
+}
+
+/// [`native_mtp_request_bytes`] with the GDN capture ring sized under `ring_config`
+/// ([`native_mtp_request_allocation_sizes_ring`]).
+pub fn native_mtp_request_bytes_ring(
+    config: &crate::Qwen4Config,
+    ring_config: &crate::Qwen4Config,
+    max_seq: usize,
+    chunk_rows: usize,
+    max_k: usize,
+    row_capture: Option<(crate::GdnStateFormat, usize)>,
+    batched_fill: bool,
+) -> Option<u64> {
+    native_mtp_request_allocation_sizes_ring(
+        config,
+        ring_config,
         max_seq,
         chunk_rows,
         max_k,
@@ -10975,6 +11026,30 @@ pub(crate) fn native_mtp_request_allocation_sizes(
     row_capture: Option<(crate::GdnStateFormat, usize)>,
     batched_fill: bool,
 ) -> Option<Vec<u64>> {
+    native_mtp_request_allocation_sizes_ring(
+        config,
+        config,
+        max_seq,
+        chunk_rows,
+        max_k,
+        row_capture,
+        batched_fill,
+    )
+}
+
+/// [`native_mtp_request_allocation_sizes`] with the GDN capture ring sized under `ring_config`
+/// (the trunk's own config) while the carries and the prompt-fill scratch stay under `config`.
+/// `ring_config` is `config` everywhere but an EP trunk-shard census, where the ring is the
+/// rank-local (half the value heads) one.
+pub(crate) fn native_mtp_request_allocation_sizes_ring(
+    config: &crate::Qwen4Config,
+    ring_config: &crate::Qwen4Config,
+    max_seq: usize,
+    chunk_rows: usize,
+    max_k: usize,
+    row_capture: Option<(crate::GdnStateFormat, usize)>,
+    batched_fill: bool,
+) -> Option<Vec<u64>> {
     let rows = native_mtp_window_rows(max_k);
     let hidden_row = config
         .hc_count
@@ -10994,10 +11069,10 @@ pub(crate) fn native_mtp_request_allocation_sizes(
     if let Some((gdn, ring_rows)) = row_capture {
         sizes.extend(
             crate::state::Qwen4State::row_capture_allocation_sizes_scoped(
-                config,
+                ring_config,
                 gdn,
                 ring_rows.max(rows),
-                config.n_linear_layers(),
+                ring_config.n_linear_layers(),
             )?,
         );
     }

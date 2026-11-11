@@ -289,6 +289,14 @@ pub(crate) struct OwnedReplayFailure {
     pub quiescence: ReplayQuiescence,
 }
 
+/// Outcome of a bounded wait on an in-flight replay.
+#[derive(Debug)]
+pub(crate) enum OwnedBoundedWait {
+    Complete,
+    Pending,
+    Failed(OwnedReplayFailure),
+}
+
 /// railgun's lowering of a directly authored program, with every object the
 /// queue reads owned. Field order is drop order: the indirect buffer first,
 /// then the kernels it dispatches, then the kernarg buffers it points at
@@ -902,6 +910,27 @@ impl OwnedWindowLowering {
         self.graph
             .wait_replay_checked()
             .map_err(Self::replay_failure)
+    }
+
+    /// Like [`Self::wait_replay`] with a caller `timeout`; a plain timeout is
+    /// `Pending` (nothing inactivated, replay still in flight).
+    pub(crate) fn wait_replay_bounded(&mut self, timeout: std::time::Duration) -> OwnedBoundedWait {
+        match self.graph.wait_replay_bounded_checked(timeout) {
+            Ok(redline_dispatch::aql::ReplayWait::Complete) => OwnedBoundedWait::Complete,
+            Ok(redline_dispatch::aql::ReplayWait::Pending) => OwnedBoundedWait::Pending,
+            Err(e) => OwnedBoundedWait::Failed(Self::replay_failure(e)),
+        }
+    }
+
+    /// Cancel the in-flight replay (queue inactivation) and observe up to
+    /// `observe` for retirement evidence.
+    pub(crate) fn cancel_replay(
+        &mut self,
+        observe: std::time::Duration,
+    ) -> Result<redline_dispatch::aql::CancelEvidence, String> {
+        self.graph
+            .cancel_replay_observed(observe)
+            .map_err(|e| e.to_string())
     }
 
     fn replay_failure(

@@ -131,7 +131,10 @@ pub enum DescriptorReject {
 /// Applies LLVM's per-architecture kernel-descriptor tables (AMDGPUUsage.rst,
 /// compute_pgm_rsrc3-gfx10-gfx11 and compute_pgm_rsrc3-gfx12).
 pub fn validate(kd: &KernelDescriptor, arch: Arch) -> Result<(), DescriptorReject> {
-    if !matches!(arch, Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1201) {
+    if !matches!(
+        arch,
+        Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1200 | Arch::Gfx1201
+    ) {
         return Err(DescriptorReject::UnsupportedArch(arch));
     }
     let reserved_bytes = RESERVED
@@ -172,7 +175,7 @@ pub fn validate(kd: &KernelDescriptor, arch: Arch) -> Result<(), DescriptorRejec
     reserved(
         "compute_pgm_rsrc1",
         kd.compute_pgm_rsrc1.0
-            & if arch == Arch::Gfx1201 {
+            & if arch.is_gfx12() {
                 GFX120_RSRC1_MUST_BE_ZERO
             } else {
                 GFX11_RSRC1_MUST_BE_ZERO
@@ -187,7 +190,7 @@ pub fn validate(kd: &KernelDescriptor, arch: Arch) -> Result<(), DescriptorRejec
     }
     reserved("compute_pgm_rsrc2", rsrc2 & RSRC2_MUST_BE_ZERO)?;
     let rsrc3 = kd.compute_pgm_rsrc3.0;
-    let mask = if arch == Arch::Gfx1201 {
+    let mask = if arch.is_gfx12() {
         GFX120_RSRC3_MUST_BE_ZERO
     } else {
         GFX11_RSRC3_MUST_BE_ZERO

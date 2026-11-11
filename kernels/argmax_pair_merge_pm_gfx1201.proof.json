@@ -1,0 +1,222 @@
+{
+  "module": "argmax_pair_merge_pm_gfx1201",
+  "arch": "gfx1201",
+  "builder_crate_version": "0.4.1",
+  "builder_git_sha": "unknown",
+  "s_text_sha256": "9d039a2f3be204078598d0e263bafa50d1e0ad8abdebf9e8ef7bf16653b02488",
+  "kernels": [
+    {
+      "kernel_id": "argmax_pair_merge_pm",
+      "variant": "twin",
+      "arch": "gfx1201",
+      "builder_crate_version": "0.4.1",
+      "builder_git_sha": "unknown",
+      "reg_plan": [
+        {
+          "name": "kernarg_ptr",
+          "kind": "s",
+          "base": 0,
+          "len": 2,
+          "live": "Whole"
+        },
+        {
+          "name": "s_blk8",
+          "kind": "s",
+          "base": 8,
+          "len": 8,
+          "live": "Whole"
+        },
+        {
+          "name": "s_blk16",
+          "kind": "s",
+          "base": 16,
+          "len": 8,
+          "live": "Whole"
+        },
+        {
+          "name": "s_blk24",
+          "kind": "s",
+          "base": 24,
+          "len": 8,
+          "live": "Whole"
+        },
+        {
+          "name": "s_blk32",
+          "kind": "s",
+          "base": 32,
+          "len": 8,
+          "live": "Whole"
+        },
+        {
+          "name": "v_blk0",
+          "kind": "v",
+          "base": 0,
+          "len": 8,
+          "live": "Whole"
+        },
+        {
+          "name": "v_blk8",
+          "kind": "v",
+          "base": 8,
+          "len": 8,
+          "live": "Whole"
+        },
+        {
+          "name": "v_blk16",
+          "kind": "v",
+          "base": 16,
+          "len": 8,
+          "live": "Whole"
+        }
+      ],
+      "next_free_vgpr": 24,
+      "next_free_sgpr": 40,
+      "waits": [
+        {
+          "pc_index": 5,
+          "insn": "s_wait_kmcnt 0x0",
+          "counter": "Km",
+          "count": 0,
+          "reason": {
+            "Use": {
+              "reg": "s[16:19]"
+            }
+          }
+        },
+        {
+          "pc_index": 15,
+          "insn": "s_wait_loadcnt 0x1",
+          "counter": "Load",
+          "count": 1,
+          "reason": {
+            "Use": {
+              "reg": "v4"
+            }
+          }
+        },
+        {
+          "pc_index": 26,
+          "insn": "s_wait_loadcnt 0x0",
+          "counter": "Load",
+          "count": 0,
+          "reason": {
+            "Use": {
+              "reg": "v8"
+            }
+          }
+        },
+        {
+          "pc_index": 40,
+          "insn": "s_wait_loadcnt 0x1",
+          "counter": "Load",
+          "count": 1,
+          "reason": {
+            "Use": {
+              "reg": "v14"
+            }
+          }
+        },
+        {
+          "pc_index": 42,
+          "insn": "s_wait_loadcnt 0x0",
+          "counter": "Load",
+          "count": 0,
+          "reason": {
+            "Use": {
+              "reg": "v15"
+            }
+          }
+        },
+        {
+          "pc_index": 55,
+          "insn": "s_wait_storecnt 0x0",
+          "counter": "Store",
+          "count": 0,
+          "reason": "Barrier"
+        }
+      ],
+      "hazards": [
+        {
+          "pc_index": 6,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 9,
+          "insn": "s_delay_alu instid0(VALU_DEP_2)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 11,
+          "insn": "s_delay_alu instid0(VALU_DEP_3)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 18,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 20,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 22,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 24,
+          "insn": "s_delay_alu instid0(VALU_DEP_2)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 29,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 31,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 33,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 35,
+          "insn": "s_wait_alu depctr_va_sdst(0)",
+          "rule": "gfx12 SGPR read-after-write"
+        },
+        {
+          "pc_index": 36,
+          "insn": "s_delay_alu instid0(VALU_DEP_2)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 49,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 51,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        }
+      ],
+      "clauses": [],
+      "vopd_pairs": 0,
+      "lds_slots": [],
+      "barriers": [],
+      "loop_fixpoints": [],
+      "forbidden_mnemonics_checked": [
+        "s_waitcnt (gfx12)",
+        "scratch_*"
+      ],
+      "s_text_sha256": "9d039a2f3be204078598d0e263bafa50d1e0ad8abdebf9e8ef7bf16653b02488"
+    }
+  ]
+}

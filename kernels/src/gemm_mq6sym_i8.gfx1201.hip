@@ -38,6 +38,11 @@
 //       [ceil(M/ROWS), 1, 1], block ROWS/16*32, static LDS only. The `y` twin is
 //       token-split: grid [ceil(M/64), ceil(N/16), 1], each CTA a 16-token slice
 //       (small-M shapes, M ~ 2560, N 17..48).
+//   gemm_mq6sym_i8_set_m64n16_x4 / m32n32_x4 / m64n48_x4 / m64n16y_x4 _gfx1201 (F32 only): the same
+//       tiles over up to FOUR same-K matrices in one launch (kernargs W0..W3, Y0..Y3, Xq, M0..M3,
+//       K, N: 96 explicit bytes, a part with M_i = 0 owns no CTA); grid.x = sum ceil(M_i/ROWS), a
+//       CTA runs the shared body with its part's W/Y/M and part-local block index, so each output
+//       word is the single-matrix entry's, bit for bit (HIPFIRE_QWEN4_TRUNK_A8_X4).
 //   Measured launcher rule (card C, receipts parity/kernel-runs/t1/time-6): N<=16 m64n16
 //   (m32n16 for M<=2560), N 17..32 m64n32 (m32n32 for M 6144..12288), N 33..48 m64n48,
 //   M<=2560 and N>=24 m64n16y, lm_head-sized M m64n48 at every N.
@@ -142,7 +147,8 @@ static __device__ __forceinline__ void sym_narrow_body(
     const unsigned char*  __restrict__ W,
     const block_i8_128*   __restrict__ Xq,
     void*                 __restrict__ Yv,
-    int M, int K, int N
+    int M, int K, int N,
+    int bx   // CTA row-block index within this matrix (blockIdx.x for the single-matrix entries)
 ) {
     constexpr int NT = NW * 32;
     constexpr int TOK = TG * 16;
@@ -158,7 +164,7 @@ static __device__ __forceinline__ void sym_narrow_body(
     const int lane = tid & 31;
     const int lo = lane & 15;
     const int kg = lane >> 4;
-    const int rs = blockIdx.x * (NW * RG * 16);
+    const int rs = bx * (NW * RG * 16);
     const int gpr = K / 256;
     const int nkb = K / 128;
     const unsigned row_stride = (unsigned)gpr * SYM_GROUP_BYTES;
@@ -341,12 +347,48 @@ static __device__ __forceinline__ void sym_narrow_body(
     extern "C" __global__ __launch_bounds__((NW) * 32) void NAME(                        \
         const unsigned char* __restrict__ W, const block_i8_128* __restrict__ Xq,        \
         void* __restrict__ Y, int M, int K, int N) {                                     \
-        sym_narrow_body<NW, RG, TG, YS, BF>(W, Xq, Y, M, K, N);                          \
+        sym_narrow_body<NW, RG, TG, YS, BF>(W, Xq, Y, M, K, N, (int)blockIdx.x);         \
+    }
+// Multi-part (x4) F32 entries: up to four matrices that share K, the A8 activations Xq and the
+// token count N, each with its own weights W_i, output Y_i ([N][M_i], overwrite) and row count
+// M_i (a part with M_i = 0 owns no CTAs). grid.x = sum_i ceil(M_i / ROWS), ROWS = NW*RG*16
+// (grid.y as the single-matrix entry of the same tile); CTA bx belongs to the first part whose
+// prefix sum of ceil(M_i / ROWS) exceeds it and runs the SAME body with that part's W/Y/M and the
+// part-local block index, so every output word is the single-matrix entry's word bit for bit.
+// Explicit kernargs (96 B): W0..W3 @0, Y0..Y3 @32, Xq @64, M0..M3 @72, K @88, N @92.
+#define SYM_NARROW_X4_ENTRY(NAME, NW, RG, TG, YS)                                        \
+    extern "C" __global__ __launch_bounds__((NW) * 32) void NAME(                        \
+        const unsigned char* __restrict__ W0, const unsigned char* __restrict__ W1,      \
+        const unsigned char* __restrict__ W2, const unsigned char* __restrict__ W3,      \
+        void* __restrict__ Y0, void* __restrict__ Y1,                                    \
+        void* __restrict__ Y2, void* __restrict__ Y3,                                    \
+        const block_i8_128* __restrict__ Xq,                                             \
+        int M0, int M1, int M2, int M3, int K, int N) {                                  \
+        constexpr int ROWS = (NW) * (RG) * 16;                                           \
+        const unsigned char* W = W0;                                                     \
+        void* Y = Y0;                                                                    \
+        int M = M0;                                                                      \
+        int bx = (int)blockIdx.x;                                                        \
+        int nb = (M0 + ROWS - 1) / ROWS;                                                 \
+        if (bx >= nb) {                                                                  \
+            bx -= nb;                                                                    \
+            W = W1; Y = Y1; M = M1;                                                      \
+            nb = (M1 + ROWS - 1) / ROWS;                                                 \
+            if (bx >= nb) {                                                              \
+                bx -= nb;                                                                \
+                W = W2; Y = Y2; M = M2;                                                  \
+                nb = (M2 + ROWS - 1) / ROWS;                                             \
+                if (bx >= nb) {                                                          \
+                    bx -= nb;                                                            \
+                    W = W3; Y = Y3; M = M3;                                              \
+                }                                                                        \
+            }                                                                            \
+        }                                                                                \
+        sym_narrow_body<NW, RG, TG, YS, false>(W, Xq, Y, M, K, N, bx);                   \
     }
 #define SYM_ROW(R, NW, TGN, TG, SUF, YS)                                                 \
     SYM_NARROW_ENTRY(gemm_mq6sym_i8_set_m##R##n##TGN##SUF##_gfx1201, NW, 1, TG, YS, false)   \
     SYM_NARROW_ENTRY(gemm_mq6sym_i8_set_bf16_m##R##n##TGN##SUF##_gfx1201, NW, 1, TG, YS, true)
-
 SYM_ROW(32, 2, 16, 1, , false)
 SYM_ROW(32, 2, 32, 2, , false)
 SYM_ROW(64, 4, 16, 1, , false)
@@ -354,6 +396,14 @@ SYM_ROW(64, 4, 32, 2, , false)
 SYM_ROW(64, 4, 48, 3, , false)
 // token-split twins of the 16-token tiles (grid [ceil(M/rows), ceil(N/16)])
 SYM_ROW(64, 4, 16, 1, y, true)
+// Multi-part (x4) F32 twins of the tiles the wide-verify launcher rule picks for the Flash-Next
+// trunk groups (largest member M 10240 / 12288): n <= 16 m64n16, 17..32 m32n32, 33..48 m64n48,
+// and the token-split m64n16y for n 49..64 (grid.y = ceil(N/16)).
+#define SYM_X4(NAME, NW, TG, YS) SYM_NARROW_X4_ENTRY(NAME, NW, 1, TG, YS)
+SYM_X4(gemm_mq6sym_i8_set_m64n16_x4_gfx1201, 4, 1, false)
+SYM_X4(gemm_mq6sym_i8_set_m32n32_x4_gfx1201, 2, 2, false)
+SYM_X4(gemm_mq6sym_i8_set_m64n48_x4_gfx1201, 4, 3, false)
+SYM_X4(gemm_mq6sym_i8_set_m64n16y_x4_gfx1201, 4, 1, true)
 // KILLED on card C (receipts parity/kernel-runs/t1/time-6): m32n48, m32n16y, m32n32y, m64n32y, the
 // m{32,64,128}n*p{2,3} deeper-prefetch tiles, m128 tiles, an LDS-only-barrier prefill, a
 // 192-VGPR-capped prefill: each lost to the kept tiles in every cell.

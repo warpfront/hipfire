@@ -422,6 +422,158 @@ pub fn build_pm(root: &Path, images: &[String], syms: &mut Symbols) -> Result<()
     Ok(())
 }
 
+/// One kernel of a gfx942 device code object as its HSA metadata declares it.
+pub struct Gfx942Kernel {
+    /// Explicit (non-hidden) arguments; `Arg.text` is `name:value_kind`.
+    pub decl: Decl,
+    /// Explicit argument names, in order.
+    pub names: Vec<String>,
+    pub segment: u32,
+    /// Lowest offset of a `hidden_*` argument, if any.
+    pub hidden_start: Option<u32>,
+}
+
+/// Kernels (symbol -> declared ABI) of a gfx942 device code object: a bare ELF, or the
+/// single `hipv4-amdgcn-amd-amdhsa--gfx942` entry of a clang offload bundle. The
+/// `Source::read` path of `build_pm` has no gfx942 architecture, so the shared
+/// envelope reader (architecture independent) is used instead.
+pub fn read_gfx942_object(bytes: &[u8]) -> Result<BTreeMap<String, Gfx942Kernel>, String> {
+    use peacemaker_ir::envelope::{Bundle, Envelope};
+    use peacemaker_lift::bundle::BundleCodec;
+    use peacemaker_lift::elf::EnvelopeCodec;
+    const TRIPLE: &str = "hipv4-amdgcn-amd-amdhsa--gfx942";
+    let elf: &[u8] = if Bundle::is_bundle(bytes) {
+        let (bundle, payloads) = Bundle::read(bytes).map_err(|e| format!("bundle: {e}"))?;
+        let hits: Vec<usize> = bundle
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| {
+                e.triple
+                    .strip_prefix(TRIPLE)
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with(':'))
+            })
+            .map(|(i, _)| i)
+            .collect();
+        match hits[..] {
+            [i] => payloads[i],
+            _ => {
+                return Err(format!(
+                    "bundle has {} `{TRIPLE}` entries (want 1)",
+                    hits.len()
+                ))
+            }
+        }
+    } else {
+        bytes
+    };
+    let (_, kernels) = Envelope::read(elf).map_err(|e| format!("code object: {e:?}"))?;
+    let mut out: BTreeMap<String, Gfx942Kernel> = BTreeMap::new();
+    for k in kernels {
+        let m = &k.metadata.parsed;
+        let mut args: Vec<Arg> = Vec::new();
+        let mut names: Vec<String> = Vec::new();
+        let mut hidden_start: Option<u32> = None;
+        for a in &m.args {
+            if a.value_kind.starts_with("hidden_") {
+                let off = a.offset as u32;
+                hidden_start = Some(hidden_start.map_or(off, |h: u32| h.min(off)));
+                continue;
+            }
+            names.push(a.name.clone());
+            args.push(Arg {
+                offset: a.offset as u32,
+                size: a.size as u32,
+                kind: if a.value_kind == "global_buffer" {
+                    'p'
+                } else {
+                    'v'
+                },
+                text: format!("{}:{}", a.name, a.value_kind),
+            });
+        }
+        let end = args.iter().map(|a| a.offset + a.size).max().unwrap_or(0);
+        let kernel = Gfx942Kernel {
+            decl: Decl { args, end },
+            names,
+            segment: m.kernarg_segment_size as u32,
+            hidden_start,
+        };
+        if out.insert(k.name.clone(), kernel).is_some() {
+            return Err(format!("duplicate kernel `{}`", k.name));
+        }
+    }
+    Ok(out)
+}
+
+fn hip_arg_name(a: &Arg) -> String {
+    a.text
+        .rsplit(|c: char| c.is_whitespace() || c == '*' || c == '&')
+        .next()
+        .unwrap_or("")
+        .to_string()
+}
+
+fn layout_brief(d: &Decl) -> Vec<(u32, u32, char)> {
+    d.args.iter().map(|a| (a.offset, a.size, a.kind)).collect()
+}
+
+/// Problems of a gfx942 object's declared ABI against the HIP source declaration of
+/// the same symbols: argument count, offset, size, pointer/scalar class, explicit
+/// extent, argument names, and a kernarg segment that holds the explicit bytes with
+/// every hidden argument after them. Names the object does not export, or HIP does not
+/// declare, are problems.
+pub fn twin_problems(
+    object: &str,
+    kernels: &BTreeMap<String, Gfx942Kernel>,
+    hip: &BTreeMap<String, Decl>,
+    symbols: &[String],
+) -> Vec<String> {
+    let mut probs = Vec::new();
+    for s in symbols {
+        let Some(h) = hip.get(s) else {
+            probs.push(format!("{object}: `{s}` has no HIP declaration"));
+            continue;
+        };
+        let Some(k) = kernels.get(s) else {
+            probs.push(format!("{object}: exports no `{s}`"));
+            continue;
+        };
+        if !crate::hip::same_layout(h, &k.decl) {
+            probs.push(format!(
+                "{object}: `{s}` metadata layout {:?} (end {}) differs from its HIP declaration {:?} (end {})",
+                layout_brief(&k.decl),
+                k.decl.end,
+                layout_brief(h),
+                h.end
+            ));
+        }
+        let hip_names: Vec<String> = h.args.iter().map(hip_arg_name).collect();
+        // Compilers strip argument names without debug info: names are checked only
+        // when the object actually carries them for every explicit argument.
+        let names_present = !k.names.is_empty() && k.names.iter().all(|n| !n.is_empty());
+        if names_present && hip_names != k.names {
+            probs.push(format!(
+                "{object}: `{s}` argument names {:?} differ from the HIP parameter names {:?}",
+                k.names, hip_names
+            ));
+        }
+        if k.segment < k.decl.end {
+            probs.push(format!(
+                "{object}: `{s}` kernarg segment {} does not hold its {} explicit bytes",
+                k.segment, k.decl.end
+            ));
+        }
+        if k.hidden_start.map_or(false, |hs| hs < k.decl.end) {
+            probs.push(format!(
+                "{object}: `{s}` has a hidden argument at {:?} inside its {} explicit bytes",
+                k.hidden_start, k.decl.end
+            ));
+        }
+    }
+    probs
+}
+
 /// Expected 17-argument layout of one external tiled `_t8` candidate symbol:
 /// seven 8-byte `global_buffer` pointers at 0..56, ten 4-byte `by_value`
 /// scalars at 56..96. `Arg.text` carries `name:value_kind`; both halves are

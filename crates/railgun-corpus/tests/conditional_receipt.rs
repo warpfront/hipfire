@@ -76,6 +76,8 @@ fn arg(offset: u32, size: u32, role: &str, mode: Option<&str>) -> ArgRecord {
         read_cache: "not_read".into(),
         sinks: vec![],
         loaded: true,
+        null_guarded: false,
+        atomic_ops: vec![],
     }
 }
 
@@ -121,6 +123,8 @@ fn conditional(object: &str, elf: &str) -> KernelRecord {
         required_witnesses: vec!["indexed_bind".into()],
         case_digest: String::new(),
         guard_flag: None,
+        task_protocol: None,
+        wg_footprints: Vec::new(),
     };
     k.case_digest = case_digest(object, elf, "gfx1201", &k);
     k

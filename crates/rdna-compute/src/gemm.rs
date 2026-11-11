@@ -14,6 +14,27 @@ use hip_bridge::{DeviceBuffer, HipResult};
 use std::ffi::c_void;
 use std::sync::{LazyLock, OnceLock};
 
+/// LDS row pitch (BF16 elements) of `gemm_bf16_mfma_gfx942_rows16`: a 256-K
+/// chunk plus a 4-element pad (`R16_LD` in `kernels/src/gemm_bf16_mfma.gfx942.hip`).
+const GEMM_BF16_MFMA_ROWS16_LDS_PITCH: usize = 256 + 4;
+
+/// Most weights one `gemm_bf16_mfma_gfx942_rows16` launch takes (its four
+/// `A` / `D` / `M` argument slots).
+pub const GEMM_BF16_MFMA_ROWS16_MAX_MEMBERS: usize = 4;
+
+/// Whether a BF16 MFMA GEMM launch takes the few-row entry
+/// `gemm_bf16_mfma_gfx942_rows16`: 1..=16 batch rows, `K % 8 == 0` (every
+/// row starts on a 16-byte boundary) and 16-byte aligned weight and activation
+/// bases (the entry's 16-byte loads).
+fn gemm_bf16_mfma_rows16_admits(
+    a: *const c_void,
+    x: *const c_void,
+    k: usize,
+    batch: usize,
+) -> bool {
+    (1..=16).contains(&batch) && k % 8 == 0 && (a as usize) % 16 == 0 && (x as usize) % 16 == 0
+}
+
 /// Most activation rows one `gemm_q8_0_batched` kernel launch takes: the
 /// kernel keeps one accumulator per row. `gemm_q8_0_batched` launches once per
 /// [`q8_0_batched_chunks`] chunk above this.
@@ -158,8 +179,17 @@ static MQ2_XBATCH_PM_VERIFIED: LazyLock<Result<(), String>> = LazyLock::new(|| {
     }
 });
 
+/// x-batch capacity of the gfx1201 PeaceMaker MQ2 module: B = 1..=8 rows run in
+/// one launch. The hipcc MQ2 kernel stays at 4 ([`XBATCH_HIP_CAP`]).
+const MQ2_XBATCH_PM_CAP: usize = 8;
+
+/// x-batch capacity of every hipcc x-batch source
+/// (`HIPFIRE_MQ{4,6}G256V2_XBATCH_MAX`).
+const XBATCH_HIP_CAP: usize = 4;
+
 /// Code of an x-batched V2 GEMV launch: a hipcc source (one output row per
-/// wave) or an embedded PeaceMaker module (`rows_per_block` rows per wave).
+/// wave, x-batch chunks of at most 4 rows) or an embedded PeaceMaker module
+/// (`rows_per_block` rows per wave, chunks of at most `cap` x-batch rows).
 #[derive(Clone, Copy)]
 enum XbatchCode {
     Hip(&'static str),
@@ -167,6 +197,7 @@ enum XbatchCode {
         module: &'static str,
         image: &'static [u8],
         rows_per_block: usize,
+        cap: usize,
     },
 }
 
@@ -32212,6 +32243,26 @@ impl Gpu {
                 "gemm_bf16_xf32_multirow buffer capacity is too small",
             ));
         }
+        // An EP prefill wave with a lane of at most 64 rows: one call per lane (see
+        // `Gpu::qwen4_wave_lane_rows`), each lane's rows choosing their own arm below.
+        if let Some(groups) = self.wave_lane_groups(batch_size) {
+            let mut row0 = 0usize;
+            for rows in groups {
+                let xs = x.sub_offset(row0 * k, rows * k);
+                let ys = y.sub_offset(row0 * m, rows * m);
+                // Group calls must not split again: the table is lifted for them.
+                let table = std::mem::take(&mut self.qwen4_wave_lane_rows);
+                let result = if rows > 1 {
+                    self.gemm_bf16_xf32_multirow(weight, &xs, &ys, m, k, rows)
+                } else {
+                    self.gemv_bf16_xf32(weight, &xs, &ys, m, k)
+                };
+                self.qwen4_wave_lane_rows = table;
+                result?;
+                row0 += rows;
+            }
+            return Ok(());
+        }
         // `HIPFIRE_QWEN4_LANE_WMMA` (exact gfx1201, 16..=64 rows): the MoE call's BF16 router /
         // shared-expert projections on the lane WMMA kernel, two BF16 activation terms (hi + lo:
         // the f32 input is not BF16-exact). Not bitwise the arms below (f32 summation order).
@@ -32232,6 +32283,27 @@ impl Gpu {
                     None,
                 )
                 .map(|_| ());
+        }
+        // `HIPFIRE_QWEN4_PREFILL_LWMMA_DENSE` (default on, exact gfx1201, > 64 rows below the F16
+        // WMMA route): the same kernel with two BF16 activation terms (hi + lo) and a split-K
+        // pinned to a fixed row count, so each row is bitwise its singleton's whatever the call size.
+        // `HIPFIRE_QWEN4_PREFILL_LWMMA_TILE` (default on) runs the tuned shapes on the staged-tile
+        // kernel (`lwmma_tile_bf16_*`), every output word the same as the shipped kernel's.
+        if self.prefill_lwmma_dense_applies(batch_size)
+            && k.is_multiple_of(128)
+            && x.dtype == DType::F32
+            && y.dtype == DType::F32
+        {
+            return self.lane_wmma_prefill_gemm(
+                &crate::lane_wmma::LaneWmmaWeight::Bf16(weight),
+                x,
+                y,
+                m,
+                k,
+                batch_size,
+                2,
+                None,
+            );
         }
         // `HIPFIRE_QWEN4_BF16_ALLROWS` (exact gfx1201): 9..=64 rows in one launch that loads
         // each weight once per output tile; every output word is bitwise the arms below'.
@@ -34742,9 +34814,14 @@ impl Gpu {
     /// - `b`: row-major BF16 activations `[batch, K]`
     /// - `d`: row-major FP32 output `[batch, M]` (overwritten)
     ///
-    /// Launch geometry (fixed by the HIP source): block `[256,1,1]`,
-    /// grid `[(M+31)/32, (batch+31)/32, 1]`, static LDS B-tile
-    /// (`32 × 128 × 2 B`). Fail-closed on non-gfx942 and undersized buffers.
+    /// Two entries of one module, the same bytes: `batch <= 16` (with `K % 8
+    /// == 0` and 16-byte aligned `a` / `b`) runs the few-row entry
+    /// `gemm_bf16_mfma_gfx942_rows16` ([`Self::gemm_bf16_mfma_gfx942_rows16`]),
+    /// every other launch the 32×32-tile entry
+    /// ([`Self::gemm_bf16_mfma_gfx942_tiled`]). Both run each output element as
+    /// the identical ascending-K `v_mfma_f32_16x16x16bf16_1k` chain, so the
+    /// route choice never changes a byte. Fail-closed on non-gfx942 and
+    /// undersized buffers.
     pub fn gemm_bf16_mfma_gfx942(
         &mut self,
         a: &DeviceBuffer,
@@ -34754,6 +34831,110 @@ impl Gpu {
         k: usize,
         batch: usize,
     ) -> HipResult<()> {
+        let bytes = self.gemm_bf16_mfma_gfx942_check(a, b, 2, d, 4, m, k, batch)?;
+        if gemm_bf16_mfma_rows16_admits(a.as_ptr(), b.as_ptr(), k, batch) {
+            let member = [(a.as_ptr(), d.as_ptr(), m, false)];
+            return self.launch_gemm_bf16_mfma_rows16(b.as_ptr(), false, &member, k, batch, bytes);
+        }
+        self.launch_gemm_bf16_mfma_tiled(a, b, d, m, k, batch, bytes)
+    }
+
+    /// [`Self::gemm_bf16_mfma_gfx942`] forced onto the 32×32-tile entry at
+    /// every batch: the reference the few-row entry is bit-compared against.
+    pub fn gemm_bf16_mfma_gfx942_tiled(
+        &mut self,
+        a: &DeviceBuffer,
+        b: &DeviceBuffer,
+        d: &DeviceBuffer,
+        m: usize,
+        k: usize,
+        batch: usize,
+    ) -> HipResult<()> {
+        let bytes = self.gemm_bf16_mfma_gfx942_check(a, b, 2, d, 4, m, k, batch)?;
+        self.launch_gemm_bf16_mfma_tiled(a, b, d, m, k, batch, bytes)
+    }
+
+    /// The few-row entry for a projection group with the route's activation
+    /// staging and output rounding folded in: up to
+    /// [`GEMM_BF16_MFMA_ROWS16_MAX_MEMBERS`] BF16 weights `[m_j, K]` that read
+    /// the same `x` (F32 or BF16 `[batch, K]`) run as ONE launch, member j
+    /// writing its `y_j` (F32 or BF16 `[batch, m_j]`). An F32 `x` is rounded
+    /// to BF16 in-kernel and a BF16 `y_j` is rounded from the F32 accumulator,
+    /// both by `convert_f32_to_bf16`'s RNE rule, so each member's bytes equal
+    /// `convert_f32_to_bf16` → [`Self::gemm_bf16_mfma_gfx942`] (→
+    /// `convert_f32_to_bf16` for a BF16 `y_j`). Returns `Ok(false)` without
+    /// launching when the entry does not apply (no member or more than four,
+    /// `batch` outside 1..=16, `K % 8 != 0`, an operand not 16-byte aligned,
+    /// a dtype outside F32 / BF16, or an output overlapping `x`); the caller
+    /// then stages and takes
+    /// [`Self::gemm_bf16_mfma_gfx942`] per member.
+    pub fn gemm_bf16_mfma_gfx942_rows16(
+        &mut self,
+        x: &GpuTensor,
+        members: &[(&DeviceBuffer, &GpuTensor, usize)],
+        k: usize,
+        batch: usize,
+    ) -> HipResult<bool> {
+        let (x_f32, x_size) = match x.dtype {
+            DType::F32 => (true, 4),
+            DType::BF16 => (false, 2),
+            _ => return Ok(false),
+        };
+        if members.is_empty() || members.len() > GEMM_BF16_MFMA_ROWS16_MAX_MEMBERS {
+            return Ok(false);
+        }
+        let x_start = x.buf.as_ptr() as usize;
+        let x_end = x_start + batch * k * x_size;
+        let mut launch = [(std::ptr::null_mut(), std::ptr::null_mut(), 0usize, false);
+            GEMM_BF16_MFMA_ROWS16_MAX_MEMBERS];
+        for (slot, &(a, y, m)) in launch.iter_mut().zip(members) {
+            // Every workgroup reads x for the whole launch: an output that
+            // overlaps it keeps the staged route (which reads a staged copy).
+            let y_start = y.buf.as_ptr() as usize;
+            if y_start < x_end && x_start < y_start + batch * m * y.dtype.size() {
+                return Ok(false);
+            }
+            let (d_bf16, d_size) = match y.dtype {
+                DType::F32 => (false, 4),
+                DType::BF16 => (true, 2),
+                _ => return Ok(false),
+            };
+            if !gemm_bf16_mfma_rows16_admits(a.as_ptr(), x.buf.as_ptr(), k, batch) {
+                return Ok(false);
+            }
+            self.gemm_bf16_mfma_gfx942_check(a, &x.buf, x_size, &y.buf, d_size, m, k, batch)?;
+            *slot = (a.as_ptr(), y.buf.as_ptr(), m, d_bf16);
+        }
+        let bytes = members
+            .iter()
+            .map(|&(_, y, m)| m * k * 2 + batch * m * y.dtype.size())
+            .sum::<usize>()
+            + batch * k * x_size;
+        self.launch_gemm_bf16_mfma_rows16(
+            x.buf.as_ptr(),
+            x_f32,
+            &launch[..members.len()],
+            k,
+            batch,
+            bytes,
+        )?;
+        Ok(true)
+    }
+
+    /// Arch, extent and buffer-size checks shared by the BF16 MFMA entries;
+    /// returns the bytes the launch touches (for the profile timer).
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_bf16_mfma_gfx942_check(
+        &mut self,
+        a: &DeviceBuffer,
+        b: &DeviceBuffer,
+        b_elem: usize,
+        d: &DeviceBuffer,
+        d_elem: usize,
+        m: usize,
+        k: usize,
+        batch: usize,
+    ) -> HipResult<usize> {
         self.bind_thread()?;
         if !self.arch_caps.is_gfx942() {
             return Err(hip_bridge::HipError::new(
@@ -34777,13 +34958,13 @@ impl Gpu {
             })?;
         let b_bytes = batch
             .checked_mul(k)
-            .and_then(|e| e.checked_mul(2))
+            .and_then(|e| e.checked_mul(b_elem))
             .ok_or_else(|| {
                 hip_bridge::HipError::new(0, "gemm_bf16_mfma_gfx942: B size overflow")
             })?;
         let d_bytes = batch
             .checked_mul(m)
-            .and_then(|e| e.checked_mul(4))
+            .and_then(|e| e.checked_mul(d_elem))
             .ok_or_else(|| {
                 hip_bridge::HipError::new(0, "gemm_bf16_mfma_gfx942: D size overflow")
             })?;
@@ -34814,7 +34995,22 @@ impl Gpu {
                 ),
             ));
         }
+        Ok(a_bytes + b_bytes + d_bytes)
+    }
 
+    /// The 32×32-tile entry: block `[256,1,1]`, grid
+    /// `[(M+31)/32, (batch+31)/32, 1]`, static LDS B-tile (`32 × 128 × 2 B`).
+    #[allow(clippy::too_many_arguments)]
+    fn launch_gemm_bf16_mfma_tiled(
+        &mut self,
+        a: &DeviceBuffer,
+        b: &DeviceBuffer,
+        d: &DeviceBuffer,
+        m: usize,
+        k: usize,
+        batch: usize,
+        bytes: usize,
+    ) -> HipResult<()> {
         const KERNEL: &str = "gemm_bf16_mfma_gfx942";
         self.ensure_kernel(KERNEL, kernels::GEMM_BF16_MFMA_GFX942_SRC, KERNEL)?;
 
@@ -34834,7 +35030,6 @@ impl Gpu {
         ];
         let grid_x = ((m + 31) / 32) as u32;
         let grid_y = ((batch + 31) / 32) as u32;
-        let bytes = a_bytes + b_bytes + d_bytes;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", KERNEL, bytes);
         let result = self.launch_maybe_blob(
             KERNEL,
@@ -34850,6 +35045,84 @@ impl Gpu {
                 blob.push_i32(m_i32);
                 blob.push_i32(k_i32);
                 blob.push_i32(batch_i32);
+                blob
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// The few-row entries `gemm_bf16_mfma_gfx942_rows16` / `_rows16_x2`
+    /// (same module; `_x2` for an F32 `x` of more than 8 rows): block
+    /// `[576,1,1]`, grid `[sum_j ceil(m_j/16), 1, 1]`, dynamic LDS
+    /// `2 × (16 + batch) × 260 × 2 B` (two chunk buffers of 16 A rows plus
+    /// `batch` X rows, 256 K each with a 4-element pitch pad). `members` are
+    /// `(a, d, m, d_bf16)`, 1..=4 of them, already checked.
+    fn launch_gemm_bf16_mfma_rows16(
+        &mut self,
+        x_ptr: *mut c_void,
+        x_f32: bool,
+        members: &[(*mut c_void, *mut c_void, usize, bool)],
+        k: usize,
+        batch: usize,
+        bytes: usize,
+    ) -> HipResult<()> {
+        const MODULE: &str = "gemm_bf16_mfma_gfx942";
+        let kernel = if x_f32 && batch > 8 {
+            "gemm_bf16_mfma_gfx942_rows16_x2"
+        } else {
+            "gemm_bf16_mfma_gfx942_rows16"
+        };
+        self.ensure_kernel(MODULE, kernels::GEMM_BF16_MFMA_GFX942_SRC, kernel)?;
+
+        let mut a_ptr = [std::ptr::null_mut::<c_void>(); GEMM_BF16_MFMA_ROWS16_MAX_MEMBERS];
+        let mut d_ptr = [std::ptr::null_mut::<c_void>(); GEMM_BF16_MFMA_ROWS16_MAX_MEMBERS];
+        let mut m_i32 = [0i32; GEMM_BF16_MFMA_ROWS16_MAX_MEMBERS];
+        let mut d_bf16_mask = 0i32;
+        let mut tiles = 0usize;
+        for (j, &(a, d, m, d_bf16)) in members.iter().enumerate() {
+            a_ptr[j] = a;
+            d_ptr[j] = d;
+            m_i32[j] = m as i32;
+            d_bf16_mask |= i32::from(d_bf16) << j;
+            tiles += m.div_ceil(16);
+        }
+        let k_i32 = k as i32;
+        let batch_i32 = batch as i32;
+        let x_f32_i32 = i32::from(x_f32);
+        let mut params: Vec<*mut c_void> = vec![&x_ptr as *const _ as *mut c_void];
+        params.extend(a_ptr.iter().map(|p| p as *const _ as *mut c_void));
+        params.extend(d_ptr.iter().map(|p| p as *const _ as *mut c_void));
+        params.extend(m_i32.iter().map(|v| v as *const _ as *mut c_void));
+        params.extend([
+            &k_i32 as *const _ as *mut c_void,
+            &batch_i32 as *const _ as *mut c_void,
+            &x_f32_i32 as *const _ as *mut c_void,
+            &d_bf16_mask as *const _ as *mut c_void,
+        ]);
+        let lds = (2 * (16 + batch) * GEMM_BF16_MFMA_ROWS16_LDS_PITCH * 2) as u32;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel, bytes);
+        let result = self.launch_maybe_blob(
+            kernel,
+            [tiles as u32, 1, 1],
+            [576, 1, 1],
+            lds,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(x_ptr);
+                for p in a_ptr.iter().chain(d_ptr.iter()) {
+                    blob.push_ptr(*p);
+                }
+                for v in m_i32 {
+                    blob.push_i32(v);
+                }
+                blob.push_i32(k_i32);
+                blob.push_i32(batch_i32);
+                blob.push_i32(x_f32_i32);
+                blob.push_i32(d_bf16_mask);
                 blob
             },
         );
@@ -42594,10 +42867,11 @@ impl Gpu {
     }
 
     /// Plain `Y = W·X` over `batch_size` rows of an MQ2G256V2 weight with the
-    /// x-batched scalar GEMV (chunks of 4): each row is byte-identical to the
-    /// singleton `gemv_mq2g256v2` on that row (same per-row accumulation
-    /// order), and every weight row is read once per chunk. `x` holds the rows
-    /// already in the weight's FWHT basis, `y` is `[batch_size, m]`.
+    /// x-batched scalar GEMV (chunks of 8 on the gfx1201 PeaceMaker module, 4 on
+    /// hipcc): each row is byte-identical to the singleton `gemv_mq2g256v2` on
+    /// that row (same per-row accumulation order), and every weight row is read
+    /// once per chunk. `x` holds the rows already in the weight's FWHT basis,
+    /// `y` is `[batch_size, m]`.
     pub fn gemv_mq2g256v2_xbatch(
         &mut self,
         a_raw: &GpuTensor,
@@ -42619,7 +42893,7 @@ impl Gpu {
     }
 
     /// Whether the gfx1201 PeaceMaker x-batched MQ2 module covers this shape:
-    /// exact gfx1201, `K % 256 == 0`, and every buffer of a four-row chunk
+    /// exact gfx1201, `K % 256 == 0`, and every buffer of an eight-row chunk
     /// within the module's 32-bit buffer offsets.
     pub fn mq2_xbatch_pm_covers(&self, m: usize, k: usize) -> bool {
         const LIMIT: usize = i32::MAX as usize;
@@ -42631,8 +42905,8 @@ impl Gpu {
                 .checked_mul(72)
                 .and_then(|row| row.checked_mul(m))
                 .is_some_and(|bytes| bytes <= LIMIT)
-            && m.checked_mul(16).is_some_and(|bytes| bytes <= LIMIT)
-            && k.checked_mul(16).is_some_and(|bytes| bytes <= LIMIT)
+            && m.checked_mul(32).is_some_and(|bytes| bytes <= LIMIT)
+            && k.checked_mul(32).is_some_and(|bytes| bytes <= LIMIT)
     }
 
     /// [`Self::gemv_mq2g256v2_xbatch`] on an explicit kernel: `pm` runs the
@@ -42672,6 +42946,7 @@ impl Gpu {
                 module: "gemv_mq2_xbatch_pm_gfx1201",
                 image: kernels::GEMV_MQ2_XBATCH_PM_GFX1201,
                 rows_per_block: 4,
+                cap: MQ2_XBATCH_PM_CAP,
             }
         } else {
             XbatchCode::Hip(kernels::GEMV_MQ2G256V2_XBATCH_SRC)
@@ -42715,8 +42990,10 @@ impl Gpu {
     }
 
     /// Launch an x-batched V2 GEMV (`A, x, y, M, K, B` ABI) over `batch_size`
-    /// rows in chunks of `XBATCH_MAX`, the accumulator width of every x-batch
-    /// source (`HIPFIRE_MQ{4,6}G256V2_XBATCH_MAX`).
+    /// rows in chunks of the kernel's x-batch capacity: [`XBATCH_HIP_CAP`] (4,
+    /// the accumulator width of every hipcc x-batch source,
+    /// `HIPFIRE_MQ{4,6}G256V2_XBATCH_MAX`) or the PeaceMaker module's `cap`
+    /// ([`MQ2_XBATCH_PM_CAP`], 8).
     #[allow(clippy::too_many_arguments)]
     fn gemv_v2_xbatch_rows(
         &mut self,
@@ -42729,32 +43006,32 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        const XBATCH_MAX: usize = 4;
         assert!(
             k.is_multiple_of(256),
             "{func}: x-batch V2 GEMV requires K%256==0"
         );
         self.bind_thread()?;
-        let rows_per_block = match code {
+        let (rows_per_block, xbatch_max) = match code {
             XbatchCode::Hip(source) => {
                 self.ensure_kernel(func, source, func)?;
-                1
+                (1, XBATCH_HIP_CAP)
             }
             XbatchCode::Pm {
                 module,
                 image,
                 rows_per_block,
+                cap,
             } => {
                 self.ensure_embedded_kernel(module, image, func)?;
-                rows_per_block
+                (rows_per_block, cap)
             }
         };
         let grid_x = m.div_ceil(rows_per_block) as u32;
         let a_ptr = a_raw.buf.as_ptr();
         let m_val = m as i32;
         let k_val = k as i32;
-        for start in (0..batch_size).step_by(XBATCH_MAX) {
-            let rows = XBATCH_MAX.min(batch_size - start);
+        for start in (0..batch_size).step_by(xbatch_max) {
+            let rows = xbatch_max.min(batch_size - start);
             let x_rows = x.sub_offset(start * k, rows * k);
             let y_rows = y.sub_offset(start * m, rows * m);
             let x_ptr = x_rows.buf.as_ptr();
@@ -51057,12 +51334,20 @@ impl Gpu {
         )
     }
 
+    /// The verify window the wide gfx1201 MoE routes serve: more than eight source rows, up to
+    /// [`crate::prefill_invariant::WIDE_VERIFY_MAX_ROWS`]. One definition for the `g32` gate/up family
+    /// ([`Gpu::moe32_gu_applies`]) and the int8 gate/up + down chain (`HIPFIRE_QWEN4_MOE_GU_A8`,
+    /// [`Gpu::qwen4_moe_gu_a8_applies`]).
+    pub(crate) fn moe_wide_verify_rows(rows: usize) -> bool {
+        rows > 8 && rows <= crate::prefill_invariant::WIDE_VERIFY_MAX_ROWS
+    }
+
     /// Whether the gfx1201 `g32` gate/up family serves a call of `rows` source rows
     /// (`HIPFIRE_QWEN4_MOE32_GU` not `0`): 9..=[`crate::prefill_invariant::WIDE_VERIFY_MAX_ROWS`] rows,
     /// the verify window. The family is bit-identical to `o4_r8_x4` (same ABI and arithmetic), so the bound
     /// is a performance choice: rows 49..=64 take it too (the wide verify pass reaches them).
     pub(crate) fn moe32_gu_applies(mode: u8, rows: usize, gfx1201: bool) -> bool {
-        mode != 0 && gfx1201 && rows > 8 && rows <= crate::prefill_invariant::WIDE_VERIFY_MAX_ROWS
+        mode != 0 && gfx1201 && Self::moe_wide_verify_rows(rows)
     }
 
     /// `(module, source, entry)` of the `g32` gate/up family for `rows` source rows (`g32_r8` above 16

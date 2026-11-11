@@ -1,0 +1,18 @@
+{
+  "topk8_partial_f32_blocks_pm_gfx1201": {
+    "ambiguous_delays": 0,
+    "barrier_pairs": 16,
+    "clauses": 0,
+    "delays": 627,
+    "instructions": 2708,
+    "lds_accesses": 40,
+    "lds_max_known_end": 1073741824,
+    "lds_unknown_addresses": 0,
+    "lift": "byte-exact",
+    "obligations": {},
+    "sgpr_high_water": 53,
+    "table": "gfx1201",
+    "vgpr_high_water": 64,
+    "wait_facts": 50
+  }
+}

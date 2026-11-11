@@ -31,6 +31,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::RangeInclusive;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use crate::index_bind::{
     abi as writer_abi, BindInputs, IndexBindError, IndexedBindWitness, SealedPositions,
@@ -38,11 +39,16 @@ use crate::index_bind::{
 };
 use crate::kernel::{Arg, Expr, ExprError, ImageOverrides, KernelProgram, PatchKind, WordRole};
 use crate::plan::Pm4Plan;
+use crate::sealed_table::generation::{FencedWindow, WindowReadLease};
 use crate::sealed_table::{
     SealedTableError, SealedTableRegistry, SealedTableWitness, TableBindInputs, TableContent,
     TableLease,
 };
 use crate::{Binding, ResourceId, WordId};
+
+pub use crate::watchdog::{
+    run_watchdog, FailureKind, PersistentWatchdog, PoisonCell, ResolvedWatchdog, Teardown,
+};
 
 /// Prepared topology skeletons retained per owner (§2: "one bounded cache of
 /// **32 prepared topology skeletons** per owner").
@@ -96,7 +102,7 @@ pub enum Refusal {
     StaleBound,
     #[error("the prepared window is in flight: patching is refused")]
     InFlight,
-    #[error("the prepared window is quarantined after an unknown-quiescence failure")]
+    #[error("the prepared window is quarantined (unknown-quiescence failure, or its queue was torn down)")]
     Quarantined,
     #[error("invalid window shape: {0}")]
     Shape(String),
@@ -104,10 +110,11 @@ pub enum Refusal {
     Inputs(String),
     #[error("kernarg encode failed: {0}")]
     Encode(String),
-    #[error("submit failed ({quiescence:?}): {message}")]
+    #[error("submit failed ({quiescence:?}, {kind:?}): {message}")]
     SubmitFailed {
         message: String,
         quiescence: Quiescence,
+        kind: FailureKind,
     },
     #[error("all 32 prepared skeletons are in flight or quarantined")]
     CacheFull,
@@ -480,6 +487,9 @@ pub struct WindowPlan {
     /// The one sealed-positions resource every conditional node indexes
     /// (`None` when the plan has no conditional node).
     indexed_positions: Option<ResourceId>,
+    /// The persistent completion budget ([`Self::with_persistent_watchdog`]);
+    /// `None` keeps today's non-persistent semantics.
+    persistent: Option<PersistentWatchdog>,
 }
 
 impl WindowPlan {
@@ -735,6 +745,7 @@ impl WindowPlan {
             hip_graph_certified,
             tape_populated,
             indexed_positions,
+            persistent: None,
         })
     }
 
@@ -782,6 +793,29 @@ impl WindowPlan {
     pub fn indexed_positions(&self) -> Option<ResourceId> {
         self.indexed_positions
     }
+
+    /// Declare this plan persistent: its completion lease runs `watchdog`
+    /// (wait, poison, tear down — see [`crate::watchdog`]) instead of the
+    /// queue's global wait. The poison cell must be a 4-byte-aligned cell of
+    /// a resource of the program declared `EventCells` (set-only for the
+    /// device by the event contract); it is validated against the program
+    /// here and resolved to an address at [`PreparedWindow::new`], which also
+    /// refuses a queue that cannot cancel.
+    pub fn with_persistent_watchdog(
+        mut self,
+        watchdog: PersistentWatchdog,
+    ) -> Result<Self, Refusal> {
+        watchdog
+            .validate(&self.program)
+            .map_err(Refusal::Malformed)?;
+        self.persistent = Some(watchdog);
+        Ok(self)
+    }
+
+    /// The persistent completion budget, when the plan declares one.
+    pub fn persistent_watchdog(&self) -> Option<&PersistentWatchdog> {
+        self.persistent.as_ref()
+    }
 }
 
 // ----------------------------------------------------------------- queue
@@ -791,6 +825,36 @@ impl WindowPlan {
 pub struct QueueFailure {
     pub message: String,
     pub quiescence: Quiescence,
+    /// What the failure means, typed ([`FailureKind::Queue`] for every
+    /// failure that is not a persistent-cancel or quarantine outcome).
+    pub kind: FailureKind,
+}
+
+impl QueueFailure {
+    /// An ordinary ([`FailureKind::Queue`]) failure.
+    pub fn new(message: impl Into<String>, quiescence: Quiescence) -> Self {
+        Self {
+            message: message.into(),
+            quiescence,
+            kind: FailureKind::Queue,
+        }
+    }
+
+    pub fn with_kind(mut self, kind: FailureKind) -> Self {
+        self.kind = kind;
+        self
+    }
+}
+
+/// The result of [`WindowQueue::wait_timeout`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TimedWait {
+    /// The work finished (or failed) within the timeout: exactly what
+    /// [`WindowQueue::wait`] would return.
+    Done(Result<(), QueueFailure>),
+    /// The timeout elapsed with the work still in flight. Nothing was torn
+    /// down; the queue state is untouched.
+    Pending,
 }
 
 /// One node's bound inputs, handed to the queue at submit.
@@ -835,6 +899,52 @@ pub trait WindowQueue: Send {
         self.submit(nodes, steps)
     }
 
+    /// Whether this queue implements the persistent-cancel contract
+    /// ([`Self::wait_timeout`], [`Self::raise_poison`], [`Self::teardown`]).
+    /// A persistent window (or a watched raw submit) is refused on a queue
+    /// that does not.
+    fn supports_persistent_cancel(&self) -> bool {
+        false
+    }
+
+    /// Wait up to `timeout` for the in-flight work to retire. It MUST NOT
+    /// tear anything down on timeout: it returns [`TimedWait::Pending`] with
+    /// the work in flight and the queue state untouched. `Done` is exactly
+    /// what [`Self::wait`] would return, and a call with nothing in flight
+    /// is `Done` at once. The default has no bounded wait and reports an
+    /// unknown-quiescence failure.
+    fn wait_timeout(&mut self, timeout: Duration) -> TimedWait {
+        let _ = timeout;
+        TimedWait::Done(Err(QueueFailure::new(
+            "queue has no bounded wait",
+            Quiescence::Unknown,
+        )))
+    }
+
+    /// Store the non-zero `value` at device `address` (a persistent
+    /// window's poison cell). It MUST NOT wait on, or submit to, the stuck
+    /// queue; `Err` means the poison was not delivered. The default cannot
+    /// write.
+    fn raise_poison(&mut self, address: u64, value: u32) -> Result<(), QueueFailure> {
+        let _ = (address, value);
+        Err(QueueFailure::new(
+            "queue has no queue-independent poison write",
+            Quiescence::Proven,
+        ))
+    }
+
+    /// Cancel the in-flight work (queue inactivation or destruction), then
+    /// observe up to `observe` for retirement evidence, and return what is
+    /// *proven*. After a teardown the queue refuses every further submit
+    /// ([`FailureKind::TornDown`]). Idempotent. The default proves nothing.
+    fn teardown(&mut self, observe: Duration) -> Teardown {
+        let _ = observe;
+        Teardown {
+            quiescence: Quiescence::Unknown,
+            message: "queue has no teardown".into(),
+        }
+    }
+
     /// Prove queue quiescence (blocking).
     fn wait(&mut self) -> Result<(), QueueFailure>;
 }
@@ -852,20 +962,32 @@ pub trait WindowQueue: Send {
 pub struct QueueCompletion<'q, Q: WindowQueue + ?Sized> {
     queue: &'q mut Q,
     waited: bool,
+    /// `Some` for a persistent submit ([`submit_queue_nowait_watched`]).
+    watchdog: Option<ResolvedWatchdog>,
 }
 
 impl<Q: WindowQueue + ?Sized> QueueCompletion<'_, Q> {
-    /// Prove queue quiescence (blocking) and return the submit's outcome.
+    /// Prove queue quiescence (blocking) and return the submit's outcome. A
+    /// watched (persistent) completion runs [`run_watchdog`]: it returns only
+    /// when the program completed, was poisoned and retired, or was torn down
+    /// — never claiming quiescence it has not proven.
     pub fn wait(mut self) -> Result<(), QueueFailure> {
         self.waited = true;
-        self.queue.wait()
+        self.finish()
+    }
+
+    fn finish(&mut self) -> Result<(), QueueFailure> {
+        match &self.watchdog {
+            Some(w) => run_watchdog(&mut *self.queue, w),
+            None => self.queue.wait(),
+        }
     }
 }
 
 impl<Q: WindowQueue + ?Sized> Drop for QueueCompletion<'_, Q> {
     fn drop(&mut self) {
         if !self.waited {
-            let _ = self.queue.wait();
+            let _ = self.finish();
         }
     }
 }
@@ -882,6 +1004,31 @@ pub fn submit_queue_nowait<'q, Q: WindowQueue + ?Sized>(
     Ok(QueueCompletion {
         queue,
         waited: false,
+        watchdog: None,
+    })
+}
+
+/// [`submit_queue_nowait`] for a persistent program: the returned handle's
+/// [`QueueCompletion::wait`] (and its drop) run the persistent watchdog
+/// instead of the queue's global wait. Refused (`Proven`, nothing written)
+/// on a queue that does not implement the persistent-cancel contract.
+pub fn submit_queue_nowait_watched<'q, Q: WindowQueue + ?Sized>(
+    queue: &'q mut Q,
+    nodes: &[NodeImage<'_>],
+    steps: &[ResolvedStep],
+    watchdog: &ResolvedWatchdog,
+) -> Result<QueueCompletion<'q, Q>, QueueFailure> {
+    if !queue.supports_persistent_cancel() {
+        return Err(QueueFailure::new(
+            "queue does not implement persistent cancel (wait_timeout/raise_poison/teardown)",
+            Quiescence::Proven,
+        ));
+    }
+    queue.submit_nowait(nodes, steps)?;
+    Ok(QueueCompletion {
+        queue,
+        waited: false,
+        watchdog: Some(*watchdog),
     })
 }
 
@@ -923,6 +1070,9 @@ pub struct PreparedWindow {
     grids: Vec<[u32; 3]>,
     interiors: Vec<Vec<(u32, u64)>>,
     resolved: Vec<ResolvedStep>,
+    /// The persistent completion budget with its poison cell resolved to this
+    /// window's allocations; `None` for a non-persistent plan.
+    watchdog: Option<ResolvedWatchdog>,
 }
 
 /// `BoundWindow` (§2): the proof that one generation's patches validated.
@@ -938,6 +1088,11 @@ pub struct BoundWindow {
     /// The consumed-at-submit sealed-table witness of a plan with
     /// sealed-table nodes, with the registry it was bound against.
     tables: Option<(SealedTableWitness, SealedTableRegistry)>,
+    /// Generation read leases attached by
+    /// [`PreparedWindow::attach_generation_lease`]; moved into the
+    /// [`Submission`] by submit. Dropped unsubmitted = released unused
+    /// (nothing was enqueued through them).
+    leases: AttachedLeases,
     /// A certified exact route for **this** window: the manifest admitted the
     /// plan with this bind's witnesses ([`PreparedWindow::certify_exact`]).
     exact: bool,
@@ -973,6 +1128,34 @@ pub struct WindowVerifyReceipt {
     pub generation: u64,
 }
 
+/// The generation read leases attached to a [`BoundWindow`]. Unlike a
+/// submitted lease, one dropped before submit was never enqueued: released
+/// unused (no quarantine).
+#[derive(Default)]
+struct AttachedLeases(Vec<WindowReadLease<'static>>);
+
+impl AttachedLeases {
+    fn take(&mut self) -> Vec<WindowReadLease<'static>> {
+        std::mem::take(&mut self.0)
+    }
+}
+
+impl Drop for AttachedLeases {
+    fn drop(&mut self) {
+        for lease in self.0.drain(..) {
+            lease.discard_unused();
+        }
+    }
+}
+
+impl std::fmt::Debug for AttachedLeases {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AttachedLeases")
+            .field("count", &self.0.len())
+            .finish()
+    }
+}
+
 /// `CompleteWindow` (§2): queue quiescence is proven; the host delta may now
 /// be committed once.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -986,10 +1169,13 @@ pub struct CompleteWindow {
 /// A completion that did not prove success; `quiescence` says whether the
 /// queue is known idle (storage reusable) or unknown (quarantined).
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("window generation {generation} failed to complete ({quiescence:?}): {message}")]
+#[error("window generation {generation} failed to complete ({quiescence:?}, {kind:?}): {message}")]
 pub struct CompletionFailure {
     pub generation: u64,
     pub quiescence: Quiescence,
+    /// [`FailureKind::Poisoned`] / [`FailureKind::TornDown`] for a persistent
+    /// window's watchdog outcomes; [`FailureKind::Queue`] otherwise.
+    pub kind: FailureKind,
     pub message: String,
 }
 
@@ -1008,16 +1194,65 @@ pub struct Submission {
     host_delta: WindowHostDelta,
     sealed: Option<SealedPositions>,
     tables: Option<TableLease>,
+    /// Generation read leases of this window: fenced on a proven completion,
+    /// quarantined on an unknown one, quarantined if the submission is dropped.
+    leases: Vec<WindowReadLease<'static>>,
+    /// `Some` for a persistent window: its completion runs the watchdog.
+    watchdog: Option<ResolvedWatchdog>,
 }
 
 impl Submission {
     /// Prove queue quiescence. Success retires the prepared window and
     /// returns the host delta for its single commit; a failure with
     /// [`Quiescence::Proven`] retires it, [`Quiescence::Unknown`] quarantines
-    /// it (§6).
-    pub fn complete(mut self) -> Result<CompleteWindow, CompletionFailure> {
+    /// it (§6). A persistent window runs its watchdog here
+    /// ([`run_watchdog`]): a [`FailureKind::Poisoned`] failure is `Proven`
+    /// (retired, outputs invalid); a [`FailureKind::TornDown`] one always
+    /// quarantines the window (its queue is gone) and carries the
+    /// quiescence the teardown proved.
+    pub fn complete(self) -> Result<CompleteWindow, CompletionFailure> {
+        // The fenced windows are dropped here, so no `FencedWindow` escapes
+        // (no trust in the queue's quiescence report is extended): a dropped
+        // owned-form window keeps its generation's slot references leaked
+        // (never an early release).
+        self.complete_inner().map(|(complete, _fenced)| complete)
+    }
+
+    /// [`Self::complete`] that also returns the generation read leases as
+    /// [`FencedWindow`]s (a proven completion is what fences them). A failure
+    /// with [`Quiescence::Proven`] fences them too, but only the failure is
+    /// returned (they are dropped: the generations stay leaked, never
+    /// released early); with [`Quiescence::Unknown`] they are quarantined.
+    /// `Quiescence::Proven` and [`CompleteWindow`] are ordinary values: no
+    /// generation API accepts either as a permit.
+    ///
+    /// This is the third trust root of the generation API (after the
+    /// `unsafe` traits `FenceBackend` and `PeerReaderFence`): the returned
+    /// [`FencedWindow`]s are minted from the safe [`WindowQueue`]'s report.
+    ///
+    /// # Safety
+    ///
+    /// The window's [`WindowQueue`] must honour the quiescence contract: its
+    /// `wait` (or the watchdog's) returns `Ok(())`, or a failure with
+    /// [`Quiescence::Proven`], only once **every** dispatch it enqueued for
+    /// this submission has finished executing on the device (no kernel of the
+    /// window can still read the leased generations' tables or slots). A
+    /// queue that reports completion early lets the caller retire and reclaim
+    /// slots a running kernel still reads.
+    pub unsafe fn complete_fenced(
+        self,
+    ) -> Result<(CompleteWindow, Vec<FencedWindow>), CompletionFailure> {
+        self.complete_inner()
+    }
+
+    fn complete_inner(mut self) -> Result<(CompleteWindow, Vec<FencedWindow>), CompletionFailure> {
+        let leases = std::mem::take(&mut self.leases);
         let mut shared = lock(&self.shared);
-        match shared.queue.wait() {
+        let waited = match &self.watchdog {
+            Some(w) => run_watchdog(&mut *shared.queue, w),
+            None => shared.queue.wait(),
+        };
+        match waited {
             Ok(()) => {
                 shared.phase = Phase::Retired;
                 if let Some(s) = &self.sealed {
@@ -1026,21 +1261,29 @@ impl Submission {
                 if let Some(l) = self.tables.take() {
                     l.release(Quiescence::Proven);
                 }
-                Ok(CompleteWindow {
-                    generation: self.generation,
-                    execution: self.execution,
-                    receipt: WindowVerifyReceipt {
-                        same_as_hip_graph: self.receipt_hip,
-                        tape_populated: self.receipt_tape,
+                let fenced: Vec<FencedWindow> = leases
+                    .into_iter()
+                    .map(WindowReadLease::into_fenced)
+                    .collect();
+                Ok((
+                    CompleteWindow {
                         generation: self.generation,
+                        execution: self.execution,
+                        receipt: WindowVerifyReceipt {
+                            same_as_hip_graph: self.receipt_hip,
+                            tape_populated: self.receipt_tape,
+                            generation: self.generation,
+                        },
+                        host_delta: self.host_delta,
                     },
-                    host_delta: self.host_delta,
-                })
+                    fenced,
+                ))
             }
             Err(f) => {
-                shared.phase = match f.quiescence {
-                    Quiescence::Proven => Phase::Retired,
-                    Quiescence::Unknown => Phase::Quarantined,
+                shared.phase = match (f.kind, f.quiescence) {
+                    (FailureKind::TornDown, _) => Phase::Quarantined,
+                    (_, Quiescence::Proven) => Phase::Retired,
+                    (_, Quiescence::Unknown) => Phase::Quarantined,
                 };
                 if let Some(s) = &self.sealed {
                     s.finish(f.quiescence);
@@ -1048,9 +1291,20 @@ impl Submission {
                 if let Some(l) = self.tables.take() {
                     l.release(f.quiescence);
                 }
+                match f.quiescence {
+                    Quiescence::Proven => drop(
+                        leases
+                            .into_iter()
+                            .map(WindowReadLease::into_fenced)
+                            .collect::<Vec<_>>(),
+                    ),
+                    // Dropped unfinished leases quarantine their generations.
+                    Quiescence::Unknown => drop(leases),
+                }
                 Err(CompletionFailure {
                     generation: self.generation,
                     quiescence: f.quiescence,
+                    kind: f.kind,
                     message: f.message,
                 })
             }
@@ -1168,6 +1422,21 @@ impl PreparedWindow {
                 }
             }
         }
+        // A persistent plan needs a queue that can cancel, and its poison
+        // cell resolved to this key's allocation.
+        let watchdog = match &plan.persistent {
+            Some(w) => {
+                if !queue.supports_persistent_cancel() {
+                    return Err(Refusal::Malformed(
+                        "persistent window on a queue without persistent cancel \
+                         (wait_timeout/raise_poison/teardown)"
+                            .into(),
+                    ));
+                }
+                Some(w.resolve(&bindings).map_err(Refusal::Malformed)?)
+            }
+            None => None,
+        };
         let images = program
             .nodes
             .iter()
@@ -1192,6 +1461,7 @@ impl PreparedWindow {
             grids,
             interiors,
             resolved: Vec::new(),
+            watchdog,
         })
     }
 
@@ -1467,6 +1737,7 @@ impl PreparedWindow {
             host_delta,
             indexed: None,
             tables: None,
+            leases: AttachedLeases::default(),
             exact: false,
         })
     }
@@ -1560,6 +1831,33 @@ impl PreparedWindow {
         Ok(())
     }
 
+    /// Attach a read lease on a published table generation to this bound
+    /// window ([`crate::sealed_table::generation::acquire_window_owned`]).
+    /// The lease travels with the [`Submission`]: a proven completion fences
+    /// it ([`Submission::complete_fenced`]), an unknown one quarantines the
+    /// generation, dropping the submission quarantines it. A stale `bound` is
+    /// refused and the lease is released unused (an owned generation is then
+    /// kept alive and leaked, never released early). This adds no witness and
+    /// widens no certification: it is not consulted by `submit`'s checks.
+    pub fn attach_generation_lease(
+        &self,
+        bound: &mut BoundWindow,
+        lease: WindowReadLease<'static>,
+    ) -> Result<(), Refusal> {
+        {
+            let shared = lock(&self.shared);
+            if bound.prepared != self.id
+                || bound.epoch != shared.epoch
+                || shared.phase != Phase::Bound
+            {
+                lease.discard_unused();
+                return Err(Refusal::StaleBound);
+            }
+        }
+        bound.leases.0.push(lease);
+        Ok(())
+    }
+
     /// Record that the window manifest admitted this plan **together with
     /// this bind's witnesses** (a plan with conditional nodes is not
     /// certified exact by its plan alone). The owner calls it after
@@ -1619,7 +1917,7 @@ impl PreparedWindow {
         self.submit_with(bound, true)
     }
 
-    fn submit_with(&mut self, bound: BoundWindow, nowait: bool) -> Result<Submission, Refusal> {
+    fn submit_with(&mut self, mut bound: BoundWindow, nowait: bool) -> Result<Submission, Refusal> {
         let mut shared = lock(&self.shared);
         if bound.prepared != self.id || bound.epoch != shared.epoch {
             return Err(Refusal::StaleBound);
@@ -1713,7 +2011,14 @@ impl PreparedWindow {
                 grid: *grid,
             })
             .collect();
-        let queued = if nowait {
+        // Every refusal above returned before the queue was touched: the
+        // attached leases were released unused with `bound`. From here the
+        // queue may run the window, so they travel with its completion.
+        let leases = bound.leases.take();
+        // A persistent window never uses the queue's blocking `submit`: that
+        // would wait under the queue's own global timeout, outside the
+        // watchdog. Its completion lease is `Submission::complete`.
+        let queued = if nowait || self.watchdog.is_some() {
             shared.queue.submit_nowait(&nodes, &self.resolved)
         } else {
             shared.queue.submit(&nodes, &self.resolved)
@@ -1731,6 +2036,8 @@ impl PreparedWindow {
                     host_delta: bound.host_delta,
                     sealed,
                     tables: lease,
+                    leases,
+                    watchdog: self.watchdog,
                 })
             }
             Err(f) => {
@@ -1744,9 +2051,23 @@ impl PreparedWindow {
                 if let Some(l) = lease {
                     l.release(f.quiescence);
                 }
+                // Fenced on a Proven report, but dropped here: no
+                // `FencedWindow` escapes this path (the generations stay
+                // leaked, never released early).
+                match f.quiescence {
+                    Quiescence::Proven => drop(
+                        leases
+                            .into_iter()
+                            .map(WindowReadLease::into_fenced)
+                            .collect::<Vec<_>>(),
+                    ),
+                    // Dropped unfinished leases quarantine their generations.
+                    Quiescence::Unknown => drop(leases),
+                }
                 Err(Refusal::SubmitFailed {
                     message: f.message,
                     quiescence: f.quiescence,
+                    kind: f.kind,
                 })
             }
         }
@@ -2025,10 +2346,7 @@ mod tests {
         ) -> Result<(), QueueFailure> {
             let mut log = self.0.lock().unwrap();
             if let Some(q) = log.submit_failure {
-                return Err(QueueFailure {
-                    message: "submit".into(),
-                    quiescence: q,
-                });
+                return Err(QueueFailure::new("submit", q));
             }
             log.submits += 1;
             log.last_kernarg = nodes[0].kernarg.to_vec();
@@ -2040,10 +2358,7 @@ mod tests {
             let mut log = self.0.lock().unwrap();
             log.waits += 1;
             match log.wait_failure {
-                Some(q) => Err(QueueFailure {
-                    message: "wait".into(),
-                    quiescence: q,
-                }),
+                Some(q) => Err(QueueFailure::new("wait", q)),
                 None => Ok(()),
             }
         }
@@ -2078,10 +2393,10 @@ mod tests {
     impl AsyncQueue {
         fn refuse_in_flight(log: &AsyncLog) -> Result<(), QueueFailure> {
             if log.in_flight {
-                return Err(QueueFailure {
-                    message: "submit without completion".into(),
-                    quiescence: Quiescence::Proven,
-                });
+                return Err(QueueFailure::new(
+                    "submit without completion",
+                    Quiescence::Proven,
+                ));
             }
             Ok(())
         }
@@ -2116,10 +2431,7 @@ mod tests {
             log.waits += 1;
             log.in_flight = false;
             match log.wait_failure {
-                Some(q) => Err(QueueFailure {
-                    message: "wait".into(),
-                    quiescence: q,
-                }),
+                Some(q) => Err(QueueFailure::new("wait", q)),
                 None => Ok(()),
             }
         }
@@ -2495,6 +2807,206 @@ mod tests {
         assert_eq!(log_b.lock().unwrap().submits, 0);
     }
 
+    // ------------------------------------------- generation lease hookup
+
+    mod lease {
+        use super::*;
+        use crate::sealed_table::generation::{
+            acquire_window_owned, BlockRegistry, Expert, FenceBackend, FenceFailure, FenceState,
+            GenerationId, OwnedTableGeneration, SlotBank, SlotSpan,
+        };
+
+        struct Ready(u64);
+        // SAFETY: nothing is ever enqueued on this CPU stream, so every fence is complete.
+        unsafe impl FenceBackend for Ready {
+            fn incarnation(&self) -> u64 {
+                1
+            }
+            fn record(&mut self) -> Result<u64, FenceFailure> {
+                self.0 += 1;
+                Ok(self.0)
+            }
+            fn poll(&mut self, _: u64) -> FenceState {
+                FenceState::Complete
+            }
+            fn wait(&mut self, _: u64) -> FenceState {
+                FenceState::Complete
+            }
+        }
+
+        /// A bank with one resident slot named by one sealed generation, and
+        /// a probe of the generation's quarantine flag that outlives it.
+        fn generation() -> (SlotBank, OwnedTableGeneration, impl Fn() -> bool) {
+            let mut dev = Ready(0);
+            let reg = BlockRegistry::new(0);
+            let block = reg.adopt::<Expert>(0x10_0000, 256, 1).unwrap();
+            let (mut bank, mut free) = SlotBank::new(
+                block,
+                vec![vec![SlotSpan {
+                    offset: 0,
+                    bytes: 256,
+                }]],
+                false,
+            )
+            .map_err(|(_, e)| e)
+            .unwrap();
+            let backing = bank
+                .register_table_backing(vec![Binding {
+                    base: 0x20_0000,
+                    bytes: 64,
+                }])
+                .unwrap();
+            let mut staging = bank.staging();
+            let (s, t) = bank
+                .start_fill(free.pop().unwrap(), 1)
+                .map_err(|(_, e)| e)
+                .unwrap();
+            let p = bank
+                .issue_fills(vec![t], &mut dev, &mut |_| Ok(()))
+                .unwrap();
+            let mut done = bank.complete_fills(p, &mut dev, true).ok().unwrap();
+            let s = bank
+                .finish_fill(s, done.pop().unwrap())
+                .map_err(|(_, _, e)| e)
+                .unwrap();
+            bank.publish(&mut staging, &s).unwrap();
+            let g = bank
+                .seal(&staging, backing, GenerationId { epoch: 0, sub: 0 })
+                .map_err(|(_, e)| e)
+                .unwrap();
+            std::mem::forget(s);
+            let probe = g.quarantine_probe();
+            (bank, g, probe)
+        }
+
+        fn owned(
+            g: OwnedTableGeneration,
+        ) -> crate::sealed_table::generation::WindowReadLease<'static> {
+            acquire_window_owned(g).map_err(|(_, e)| e).unwrap()
+        }
+
+        #[test]
+        fn proven_completion_fences_the_leases_and_complete_fenced_returns_them() {
+            let (mut bank, g, _) = generation();
+            let id = g.id();
+            let (mut w, log) = prepared();
+            let mut bound = w.bind(&shape(300, 1), &bindings(), &inputs()).unwrap();
+            w.attach_generation_lease(&mut bound, owned(g)).unwrap();
+            let sub = w.submit(bound).unwrap();
+            // SAFETY: the test queue reports completion only after its
+            // (synchronous, host-side) dispatches ran.
+            let (done, fenced) = unsafe { sub.complete_fenced() }.unwrap();
+            assert_eq!(done.generation, 1);
+            assert_eq!(log.lock().unwrap().waits, 1);
+            assert_eq!(fenced.len(), 1);
+            assert_eq!(fenced[0].generation(), id);
+            let g = fenced
+                .into_iter()
+                .next()
+                .unwrap()
+                .into_generation()
+                .unwrap();
+            // the Proven completion is NOT a retire permit: the owner still retires through the bank
+            assert_eq!(bank.refs(0), 1);
+            bank.retire(g, None).map_err(|(_, e)| e).unwrap();
+            assert_eq!(bank.refs(0), 0);
+        }
+
+        #[test]
+        fn plain_complete_keeps_the_generation_alive_and_never_releases_it() {
+            let (bank, g, quarantined) = generation();
+            let (mut w, _log) = prepared();
+            let mut bound = w.bind(&shape(300, 1), &bindings(), &inputs()).unwrap();
+            w.attach_generation_lease(&mut bound, owned(g)).unwrap();
+            w.submit(bound).unwrap().complete().unwrap();
+            // the fenced window was dropped: the references leak (capacity), never release early
+            assert_eq!(bank.refs(0), 1);
+            assert_eq!(bank.live_generations(), 1);
+            assert!(!quarantined());
+        }
+
+        #[test]
+        fn unknown_completion_quarantines_the_generation() {
+            let (_bank, g, quarantined) = generation();
+            let (mut w, log) = prepared();
+            let mut bound = w.bind(&shape(300, 1), &bindings(), &inputs()).unwrap();
+            w.attach_generation_lease(&mut bound, owned(g)).unwrap();
+            log.lock().unwrap().wait_failure = Some(Quiescence::Unknown);
+            let sub = w.submit(bound).unwrap();
+            // SAFETY: the test queue runs nothing on a device.
+            let f = unsafe { sub.complete_fenced() }.unwrap_err();
+            assert_eq!(f.quiescence, Quiescence::Unknown);
+            assert!(quarantined());
+        }
+
+        #[test]
+        fn proven_failure_fences_without_quarantine() {
+            let (_bank, g, quarantined) = generation();
+            let (mut w, log) = prepared();
+            let mut bound = w.bind(&shape(300, 1), &bindings(), &inputs()).unwrap();
+            w.attach_generation_lease(&mut bound, owned(g)).unwrap();
+            log.lock().unwrap().wait_failure = Some(Quiescence::Proven);
+            let sub = w.submit(bound).unwrap();
+            // SAFETY: the test queue runs nothing on a device.
+            let f = unsafe { sub.complete_fenced() }.unwrap_err();
+            assert_eq!(f.quiescence, Quiescence::Proven);
+            assert!(!quarantined());
+        }
+
+        #[test]
+        fn dropping_the_submission_quarantines_the_generation() {
+            let (_bank, g, quarantined) = generation();
+            let (mut w, _log) = prepared();
+            let mut bound = w.bind(&shape(300, 1), &bindings(), &inputs()).unwrap();
+            w.attach_generation_lease(&mut bound, owned(g)).unwrap();
+            let sub = w.submit(bound).unwrap();
+            assert!(!quarantined());
+            drop(sub);
+            assert!(quarantined());
+        }
+
+        #[test]
+        fn submit_failures_follow_the_existing_quiescence_semantics() {
+            for (q, expect) in [(Quiescence::Proven, false), (Quiescence::Unknown, true)] {
+                let (_bank, g, quarantined) = generation();
+                let (mut w, log) = prepared();
+                let mut bound = w.bind(&shape(300, 1), &bindings(), &inputs()).unwrap();
+                w.attach_generation_lease(&mut bound, owned(g)).unwrap();
+                log.lock().unwrap().submit_failure = Some(q);
+                let e = w.submit(bound).err().unwrap();
+                assert!(matches!(e, Refusal::SubmitFailed { quiescence, .. } if quiescence == q));
+                assert_eq!(quarantined(), expect, "{q:?}");
+            }
+        }
+
+        #[test]
+        fn leases_that_never_reached_the_queue_are_released_unused() {
+            let (_bank, g, quarantined) = generation();
+            let (mut w, log) = prepared();
+            // refused before the queue: a superseded bound window
+            let mut first = w.bind(&shape(300, 6), &bindings(), &inputs()).unwrap();
+            w.attach_generation_lease(&mut first, owned(g)).unwrap();
+            let mut second = w.bind(&shape(300, 7), &bindings(), &inputs()).unwrap();
+            assert_eq!(w.submit(first).err(), Some(Refusal::StaleBound));
+            assert!(!quarantined());
+            // attaching to a stale bound window is refused, the lease released unused
+            let (_bank2, g2, quarantined2) = generation();
+            let _third = w.bind(&shape(300, 8), &bindings(), &inputs()).unwrap();
+            assert_eq!(
+                w.attach_generation_lease(&mut second, owned(g2)),
+                Err(Refusal::StaleBound)
+            );
+            assert!(!quarantined2());
+            // a bound window dropped unsubmitted
+            let (_bank3, g3, quarantined3) = generation();
+            let mut fresh = w.bind(&shape(300, 9), &bindings(), &inputs()).unwrap();
+            w.attach_generation_lease(&mut fresh, owned(g3)).unwrap();
+            drop(fresh);
+            assert!(!quarantined3());
+            assert_eq!(log.lock().unwrap().submits, 0);
+        }
+    }
+
     #[test]
     fn patching_an_in_flight_window_is_refused() {
         let (mut w, log) = prepared();
@@ -2626,6 +3138,7 @@ mod tests {
             host_delta: bound.host_delta,
             indexed: None,
             tables: None,
+            leases: AttachedLeases::default(),
             exact: false,
         };
         let (second_nowait, second_blocking) = (forge(2), forge(3));
@@ -2657,6 +3170,7 @@ mod tests {
             CompletionFailure {
                 generation: 1,
                 quiescence: Quiescence::Unknown,
+                kind: FailureKind::Queue,
                 message: "wait".into(),
             }
         );
@@ -2700,10 +3214,7 @@ mod tests {
         let completion = submit_queue_nowait(&mut queue, &[], &[]).unwrap();
         assert_eq!(
             completion.wait().unwrap_err(),
-            QueueFailure {
-                message: "wait".into(),
-                quiescence: Quiescence::Unknown,
-            }
+            QueueFailure::new("wait", Quiescence::Unknown)
         );
         assert_eq!(log.lock().unwrap().waits, 2);
 
@@ -3588,5 +4099,483 @@ mod tests {
         assert!(matches!(w.submit(second), Err(Refusal::StaleBound)));
         assert_eq!(log.lock().unwrap().submits, 0);
         w.submit(third).unwrap().complete().unwrap();
+    }
+
+    // ------------------------------------------------ persistent cancel
+
+    type FakeDevice = Arc<Mutex<Option<String>>>;
+
+    #[derive(Default)]
+    struct CancelLog {
+        blocking_submits: usize,
+        nowait_submits: usize,
+        waits: usize,
+        in_flight: bool,
+        timeouts: Vec<Duration>,
+        poison_writes: Vec<(u64, u32)>,
+        teardowns: Vec<Duration>,
+        poisoned: bool,
+        torn_down: bool,
+        /// The program retires on its own at the first bounded wait.
+        completes_on_own: bool,
+        /// A worker that polls the poison cell and exits.
+        exits_on_poison: bool,
+        /// The poison write itself fails.
+        poison_fails: bool,
+        /// What the teardown proves (default `Unknown`).
+        teardown_proves: Option<Quiescence>,
+    }
+
+    /// A persistent program that never completes on its own: only the poison
+    /// (when `exits_on_poison`) or a teardown ends it.
+    struct CancelQueue {
+        log: Arc<Mutex<CancelLog>>,
+        device: FakeDevice,
+    }
+
+    impl CancelQueue {
+        fn refuse(&self, log: &CancelLog) -> Result<(), QueueFailure> {
+            if let Some(reason) = self.device.lock().unwrap().clone() {
+                return Err(QueueFailure::new(reason, Quiescence::Proven)
+                    .with_kind(FailureKind::DeviceQuarantined));
+            }
+            if log.torn_down {
+                return Err(QueueFailure::new("queue torn down", Quiescence::Proven)
+                    .with_kind(FailureKind::TornDown));
+            }
+            if log.in_flight {
+                return Err(QueueFailure::new(
+                    "submit without completion",
+                    Quiescence::Proven,
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    impl WindowQueue for CancelQueue {
+        fn submit(
+            &mut self,
+            _nodes: &[NodeImage<'_>],
+            _steps: &[ResolvedStep],
+        ) -> Result<(), QueueFailure> {
+            let mut log = self.log.lock().unwrap();
+            self.refuse(&log)?;
+            log.blocking_submits += 1;
+            Ok(())
+        }
+
+        fn submit_nowait(
+            &mut self,
+            _nodes: &[NodeImage<'_>],
+            _steps: &[ResolvedStep],
+        ) -> Result<(), QueueFailure> {
+            let mut log = self.log.lock().unwrap();
+            self.refuse(&log)?;
+            log.nowait_submits += 1;
+            log.in_flight = true;
+            log.poisoned = false;
+            Ok(())
+        }
+
+        fn wait(&mut self) -> Result<(), QueueFailure> {
+            let mut log = self.log.lock().unwrap();
+            log.waits += 1;
+            log.in_flight = false;
+            Ok(())
+        }
+
+        fn supports_persistent_cancel(&self) -> bool {
+            true
+        }
+
+        fn wait_timeout(&mut self, timeout: Duration) -> TimedWait {
+            let mut log = self.log.lock().unwrap();
+            log.timeouts.push(timeout);
+            if !log.in_flight {
+                return TimedWait::Done(Ok(()));
+            }
+            if log.completes_on_own || (log.poisoned && log.exits_on_poison) {
+                log.in_flight = false;
+                return TimedWait::Done(Ok(()));
+            }
+            TimedWait::Pending
+        }
+
+        fn raise_poison(&mut self, address: u64, value: u32) -> Result<(), QueueFailure> {
+            let mut log = self.log.lock().unwrap();
+            if log.poison_fails {
+                return Err(QueueFailure::new(
+                    "poison write refused",
+                    Quiescence::Proven,
+                ));
+            }
+            log.poison_writes.push((address, value));
+            log.poisoned = true;
+            Ok(())
+        }
+
+        fn teardown(&mut self, observe: Duration) -> Teardown {
+            let mut log = self.log.lock().unwrap();
+            log.teardowns.push(observe);
+            log.torn_down = true;
+            log.in_flight = false;
+            let quiescence = log.teardown_proves.unwrap_or(Quiescence::Unknown);
+            if quiescence == Quiescence::Unknown {
+                // The device-level reaction of a queue that could not prove
+                // retirement (rdna-compute's registry, modelled).
+                *self.device.lock().unwrap() =
+                    Some("teardown could not prove every workgroup retired".into());
+            }
+            Teardown {
+                quiescence,
+                message: format!("fake teardown proves {quiescence:?}"),
+            }
+        }
+    }
+
+    const BUDGET: Duration = Duration::from_millis(50);
+    const GRACE: Duration = Duration::from_millis(20);
+    const ESCALATION: Duration = Duration::from_millis(30);
+
+    fn watchdog() -> PersistentWatchdog {
+        PersistentWatchdog {
+            budget: BUDGET,
+            grace: GRACE,
+            escalation_grace: ESCALATION,
+            poison: PoisonCell {
+                resource: ResourceId(0),
+                offset: 4,
+                value: 1,
+            },
+        }
+    }
+
+    fn persistent_parts() -> WindowPlanParts {
+        let mut parts = parts_with(patches());
+        parts
+            .program
+            .kinds
+            .insert(ResourceId(0), crate::ResourceKind::EventCells { cells: 2 });
+        parts
+    }
+
+    fn persistent_plan(w: PersistentWatchdog) -> Result<Arc<WindowPlan>, Refusal> {
+        let parts = persistent_parts();
+        let table = CacheTable::for_arch("gfx1201").expect("gfx1201 table");
+        let pm4 = plan(&parts.program, &table, RowPolicy::UnreceiptedSystem);
+        WindowPlan::new(parts, &pm4)?
+            .with_persistent_watchdog(w)
+            .map(Arc::new)
+    }
+
+    fn cancel_window_on(device: &FakeDevice) -> (PreparedWindow, Arc<Mutex<CancelLog>>) {
+        let log = Arc::new(Mutex::new(CancelLog::default()));
+        let queue = CancelQueue {
+            log: log.clone(),
+            device: device.clone(),
+        };
+        let w = PreparedWindow::new(
+            persistent_plan(watchdog()).expect("persistent plan"),
+            key(),
+            Box::new(queue),
+        )
+        .expect("prepared");
+        (w, log)
+    }
+
+    fn cancel_window() -> (PreparedWindow, Arc<Mutex<CancelLog>>) {
+        cancel_window_on(&FakeDevice::default())
+    }
+
+    fn submit_persistent(w: &mut PreparedWindow, generation: u64) -> Submission {
+        let bound = w
+            .bind(&shape(300, generation), &bindings(), &inputs())
+            .unwrap();
+        w.submit(bound).unwrap()
+    }
+
+    #[test]
+    fn persistent_window_that_exits_on_poison_is_poisoned_and_proven() {
+        let (mut w, log) = cancel_window();
+        log.lock().unwrap().exits_on_poison = true;
+        let submission = submit_persistent(&mut w, 1);
+        let failure = submission.complete().unwrap_err();
+        assert_eq!(failure.kind, FailureKind::Poisoned);
+        assert_eq!(failure.quiescence, Quiescence::Proven);
+        assert_eq!(failure.generation, 1);
+        assert!(w.is_retired(), "a poisoned, retired window is reusable");
+        {
+            let l = log.lock().unwrap();
+            // The poison cell is the declared cell of resource 0: base + 4.
+            assert_eq!(l.poison_writes, vec![(BASE_Q + 4, 1)]);
+            assert_eq!(l.timeouts, vec![BUDGET, GRACE]);
+            assert!(
+                l.teardowns.is_empty(),
+                "no escalation when poison retired it"
+            );
+            // The queue's global wait (and a blocking submit) are never used.
+            assert_eq!((l.waits, l.blocking_submits, l.nowait_submits), (0, 0, 1));
+        }
+        // Retired: the same window binds and submits again.
+        log.lock().unwrap().exits_on_poison = false;
+        log.lock().unwrap().completes_on_own = true;
+        let submission = submit_persistent(&mut w, 2);
+        assert_eq!(submission.complete().unwrap().generation, 2);
+    }
+
+    #[test]
+    fn persistent_window_completing_within_budget_is_never_poisoned() {
+        let (mut w, log) = cancel_window();
+        log.lock().unwrap().completes_on_own = true;
+        let done = submit_persistent(&mut w, 1).complete().unwrap();
+        assert_eq!(done.generation, 1);
+        assert!(w.is_retired());
+        let l = log.lock().unwrap();
+        assert_eq!(l.timeouts, vec![BUDGET]);
+        assert!(l.poison_writes.is_empty() && l.teardowns.is_empty());
+    }
+
+    #[test]
+    fn persistent_window_that_ignores_poison_escalates_to_teardown() {
+        // The program never completes on its own and ignores the poison; the
+        // teardown observes retirement (Proven).
+        let (mut w, log) = cancel_window();
+        log.lock().unwrap().teardown_proves = Some(Quiescence::Proven);
+        let failure = submit_persistent(&mut w, 1).complete().unwrap_err();
+        assert_eq!(failure.kind, FailureKind::TornDown);
+        assert_eq!(failure.quiescence, Quiescence::Proven);
+        {
+            let l = log.lock().unwrap();
+            assert_eq!(l.poison_writes, vec![(BASE_Q + 4, 1)]);
+            assert_eq!(l.timeouts, vec![BUDGET, GRACE]);
+            assert_eq!(l.teardowns, vec![ESCALATION]);
+            assert_eq!(l.waits, 0);
+        }
+        // The queue is gone: the window is never reusable, even though the
+        // teardown proved quiescence (its resources are released).
+        assert!(!w.is_retired());
+        assert_eq!(
+            w.bind(&shape(300, 2), &bindings(), &inputs()).unwrap_err(),
+            Refusal::Quarantined
+        );
+    }
+
+    #[test]
+    fn failed_teardown_is_unknown_and_quarantines_the_device_for_every_submit() {
+        let device = FakeDevice::default();
+        let (mut w, log) = cancel_window_on(&device);
+        // The default teardown proves nothing.
+        let failure = submit_persistent(&mut w, 1).complete().unwrap_err();
+        assert_eq!(failure.kind, FailureKind::TornDown);
+        assert_eq!(failure.quiescence, Quiescence::Unknown);
+        assert!(failure.message.contains("fake teardown proves Unknown"));
+        assert!(!w.is_retired());
+        let reason = device.lock().unwrap().clone().expect("device quarantined");
+
+        // Another window on the same device: its submit refuses with the
+        // recorded reason, before the queue launches anything.
+        let (mut other, other_log) = cancel_window_on(&device);
+        let bound = other.bind(&shape(300, 1), &bindings(), &inputs()).unwrap();
+        match other.submit(bound).err() {
+            Some(Refusal::SubmitFailed {
+                message,
+                quiescence: Quiescence::Proven,
+                kind: FailureKind::DeviceQuarantined,
+            }) => assert_eq!(message, reason),
+            other => panic!("expected a quarantine refusal, got {other:?}"),
+        }
+        assert_eq!(other_log.lock().unwrap().nowait_submits, 0);
+
+        // The raw-queue watched path refuses the same way.
+        let mut raw = CancelQueue {
+            log: Arc::new(Mutex::new(CancelLog::default())),
+            device: device.clone(),
+        };
+        let wd = watchdog().resolve(&key_bindings()).unwrap();
+        let refused = submit_queue_nowait_watched(&mut raw, &[], &[], &wd)
+            .err()
+            .expect("refused");
+        assert_eq!(refused.kind, FailureKind::DeviceQuarantined);
+        assert_eq!(refused.message, reason);
+        // So does the torn-down window's own queue.
+        assert_eq!(log.lock().unwrap().nowait_submits, 1);
+    }
+
+    #[test]
+    fn a_failed_poison_write_escalates_without_waiting_the_grace() {
+        let (mut w, log) = cancel_window();
+        log.lock().unwrap().poison_fails = true;
+        let failure = submit_persistent(&mut w, 1).complete().unwrap_err();
+        assert_eq!(failure.kind, FailureKind::TornDown);
+        assert_eq!(failure.quiescence, Quiescence::Unknown);
+        assert!(failure.message.contains("could not be raised"));
+        let l = log.lock().unwrap();
+        assert_eq!(
+            l.timeouts,
+            vec![BUDGET],
+            "no grace wait after a failed write"
+        );
+        assert!(l.poison_writes.is_empty());
+        assert_eq!(l.teardowns, vec![ESCALATION]);
+    }
+
+    #[test]
+    fn a_blocking_submit_of_a_persistent_window_is_routed_through_nowait() {
+        let (mut w, log) = cancel_window();
+        log.lock().unwrap().completes_on_own = true;
+        submit_persistent(&mut w, 1).complete().unwrap();
+        let l = log.lock().unwrap();
+        assert_eq!((l.blocking_submits, l.nowait_submits), (0, 1));
+    }
+
+    #[test]
+    fn raw_watched_completion_poisons_and_escalates() {
+        let log = Arc::new(Mutex::new(CancelLog::default()));
+        let mut queue = CancelQueue {
+            log: log.clone(),
+            device: FakeDevice::default(),
+        };
+        let wd = watchdog().resolve(&key_bindings()).unwrap();
+        assert_eq!(wd.poison_address, BASE_Q + 4);
+
+        log.lock().unwrap().exits_on_poison = true;
+        let failure = submit_queue_nowait_watched(&mut queue, &[], &[], &wd)
+            .unwrap()
+            .wait()
+            .unwrap_err();
+        assert_eq!(failure.kind, FailureKind::Poisoned);
+        assert_eq!(failure.quiescence, Quiescence::Proven);
+        assert_eq!(log.lock().unwrap().waits, 0);
+
+        // A dropped handle runs the watchdog too (and reports nothing).
+        {
+            let mut l = log.lock().unwrap();
+            l.exits_on_poison = false;
+            l.teardown_proves = Some(Quiescence::Proven);
+        }
+        let completion = submit_queue_nowait_watched(&mut queue, &[], &[], &wd).unwrap();
+        drop(completion);
+        let l = log.lock().unwrap();
+        assert!(
+            !l.in_flight,
+            "a dropped watched handle never leaves it in flight"
+        );
+        assert_eq!(l.teardowns, vec![ESCALATION]);
+    }
+
+    #[test]
+    fn watched_submit_is_refused_on_a_queue_without_persistent_cancel() {
+        let (_, log) = prepared();
+        let mut queue = MockQueue(log.clone());
+        let wd = watchdog().resolve(&key_bindings()).unwrap();
+        let refused = submit_queue_nowait_watched(&mut queue, &[], &[], &wd)
+            .err()
+            .expect("refused");
+        assert_eq!(refused.quiescence, Quiescence::Proven);
+        assert_eq!(refused.kind, FailureKind::Queue);
+        assert_eq!(log.lock().unwrap().submits, 0, "nothing was launched");
+
+        // A persistent plan on such a queue is refused at prepare time.
+        let err = PreparedWindow::new(
+            persistent_plan(watchdog()).unwrap(),
+            key(),
+            Box::new(MockQueue(log)),
+        )
+        .err()
+        .expect("refused");
+        assert!(matches!(err, Refusal::Malformed(m) if m.contains("persistent cancel")));
+    }
+
+    #[test]
+    fn non_persistent_window_keeps_todays_completion_semantics() {
+        // No watchdog: the lease is the queue's own `wait`, never a bounded
+        // wait, and its failures stay ordinary queue failures.
+        let log = Arc::new(Mutex::new(CancelLog::default()));
+        let plan = make_plan(parts_with(patches())).expect("plan");
+        assert!(plan.persistent_watchdog().is_none());
+        let queue = CancelQueue {
+            log: log.clone(),
+            device: FakeDevice::default(),
+        };
+        let mut w = PreparedWindow::new(plan, key(), Box::new(queue)).unwrap();
+        let bound = w.bind(&shape(300, 1), &bindings(), &inputs()).unwrap();
+        let submission = w.submit_nowait(bound).unwrap();
+        assert_eq!(submission.complete().unwrap().generation, 1);
+        {
+            let l = log.lock().unwrap();
+            assert_eq!(
+                (l.waits, l.timeouts.len(), l.poison_writes.len()),
+                (1, 0, 0)
+            );
+            assert_eq!(l.blocking_submits + l.nowait_submits, 1);
+        }
+        // A blocking submit stays a blocking submit.
+        let bound = w.bind(&shape(300, 2), &bindings(), &inputs()).unwrap();
+        w.submit(bound).unwrap().complete().unwrap();
+        let l = log.lock().unwrap();
+        assert_eq!((l.blocking_submits, l.nowait_submits), (1, 1));
+        assert!(l.teardowns.is_empty());
+    }
+
+    fn key_bindings() -> Vec<Binding> {
+        key()
+            .allocations
+            .iter()
+            .map(|a| Binding {
+                base: a.base,
+                bytes: a.bytes,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn persistent_declarations_are_validated() {
+        let with = |f: &dyn Fn(&mut PersistentWatchdog)| {
+            let mut w = watchdog();
+            f(&mut w);
+            persistent_plan(w).err().map(|e| e.to_string())
+        };
+        assert_eq!(with(&|_| {}), None);
+        // Not an EventCells resource.
+        let e = with(&|w| w.poison.resource = ResourceId(1)).unwrap();
+        assert!(e.contains("not declared EventCells"), "{e}");
+        let e = with(&|w| w.poison.offset = 2).unwrap();
+        assert!(e.contains("not 4-byte aligned"), "{e}");
+        // Two cells hold 32 bytes: the word at 32 is outside them.
+        let e = with(&|w| w.poison.offset = 32).unwrap();
+        assert!(e.contains("outside the 2 declared event cells"), "{e}");
+        let e = with(&|w| w.poison.value = 0).unwrap();
+        assert!(e.contains("poison value is zero"), "{e}");
+        for field in ["budget", "grace", "escalation_grace"] {
+            let e = with(&|w| match field {
+                "budget" => w.budget = Duration::ZERO,
+                "grace" => w.grace = Duration::ZERO,
+                _ => w.escalation_grace = Duration::ZERO,
+            })
+            .unwrap();
+            assert!(e.contains(&format!("{field} is zero")), "{e}");
+        }
+        // No EventCells declaration at all.
+        let parts = parts_with(patches());
+        let table = CacheTable::for_arch("gfx1201").unwrap();
+        let pm4 = plan(&parts.program, &table, RowPolicy::UnreceiptedSystem);
+        let e = WindowPlan::new(parts, &pm4)
+            .unwrap()
+            .with_persistent_watchdog(watchdog())
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(e.contains("not declared EventCells"), "{e}");
+
+        // Resolution is checked against the live allocation.
+        let mut small = key_bindings();
+        small[0].bytes = 6;
+        assert!(watchdog()
+            .resolve(&small)
+            .unwrap_err()
+            .contains("exceeds the 6-byte allocation"));
+        assert!(ResolvedWatchdog::new(BUDGET, GRACE, ESCALATION, 0x7000_0002, 1).is_err());
+        assert!(ResolvedWatchdog::new(BUDGET, GRACE, ESCALATION, 0, 1).is_err());
     }
 }

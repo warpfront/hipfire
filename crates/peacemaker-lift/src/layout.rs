@@ -64,6 +64,7 @@ const INST_PREF_MAX: u32 = 0xff;
 /// compute_pgm_rsrc3-gfx10-gfx11), so hipcc caps it at 63.
 const INST_PREF_MAX_GFX11: u32 = 0x3f;
 const GNU_HASH_SHIFT2: u32 = 26;
+const EF_AMDGPU_MACH_GFX1200: u32 = 0x48;
 const EF_AMDGPU_MACH_GFX1201: u32 = 0x4e;
 /// gfx1100 / gfx1151 (hipcc and the builder link them with the same ld.lld rules; the
 /// input-reproduction check below is the proof, not the machine number).
@@ -779,11 +780,14 @@ pub(crate) fn relayout(
     if env.header.abi_version != ABI_VERSION_V6
         || !matches!(
             env.header.e_flags & 0xff,
-            EF_AMDGPU_MACH_GFX1201 | EF_AMDGPU_MACH_GFX1100 | EF_AMDGPU_MACH_GFX1151
+            EF_AMDGPU_MACH_GFX1200
+                | EF_AMDGPU_MACH_GFX1201
+                | EF_AMDGPU_MACH_GFX1100
+                | EF_AMDGPU_MACH_GFX1151
         )
     {
         return Err(fail(
-            "re-layout is modelled for code object v6 gfx1100, gfx1151 and gfx1201 only",
+            "re-layout is modelled for code object v6 gfx1100, gfx1151, gfx1200 and gfx1201 only",
         ));
     }
     if env.gaps.iter().any(|g| !matches!(g.fill, Fill::Zero(_))) {
@@ -1160,7 +1164,10 @@ pub(crate) fn relayout(
         let mut d = part.descriptor.clone();
         let old_size = env.kernels[k].size;
         if code_sizes[k] != old_size {
-            let pref_max = if env.header.e_flags & 0xff == EF_AMDGPU_MACH_GFX1201 {
+            let pref_max = if matches!(
+                env.header.e_flags & 0xff,
+                EF_AMDGPU_MACH_GFX1200 | EF_AMDGPU_MACH_GFX1201
+            ) {
                 INST_PREF_MAX
             } else {
                 INST_PREF_MAX_GFX11

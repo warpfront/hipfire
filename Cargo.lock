@@ -2729,6 +2729,7 @@ version = "0.4.5"
 dependencies = [
  "insta",
  "object",
+ "peacemaker-cdna",
  "peacemaker-ir",
  "proptest",
  "rmpv",
@@ -3056,6 +3057,7 @@ dependencies = [
 name = "railgun-cert"
 version = "0.4.5"
 dependencies = [
+ "object",
  "peacemaker-ir",
  "peacemaker-lift",
  "radiowave",

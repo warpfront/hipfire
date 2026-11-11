@@ -43,6 +43,15 @@ pub const AR_HC_ROW_CAP: usize = 256;
 /// Default launch shape, the Gate 0b best at 8 rows (16 blocks x 256 lanes).
 pub const AR_HC_DEFAULT_BLOCKS: u32 = 16;
 pub const AR_HC_DEFAULT_LANES: u32 = 256;
+/// Block count the wide launch shape starts from ([`ar_hc_launch_geometry`],
+/// `HIPFIRE_EP_AR_WIDE_GRID`): every block of the cap.
+pub const AR_HC_WIDE_BLOCKS: u32 = AR_HC_MAX_BLOCKS as u32;
+/// Most granules per lane the wide launch shape takes (up to 153 rows at 64 x 512); a
+/// launch that would need more keeps the default shape. Lab bench j8304 (f32 streams, pipelined
+/// us, default -> 64 x 512): 13 rows 23.0 -> 13.0, 24: 25.0 -> 14.1, 48: 35.3 -> 17.4,
+/// 64 (2 per lane): 39.8 -> 22.1, 128 (3 per lane): 48.3 -> 35.0; 256 rows (5 per lane at
+/// 64 blocks against 6 at the default 54 x 512) regressed 71.6 -> 190.6.
+pub const AR_HC_WIDE_KMAX: usize = 3;
 /// Word index (u32) of the arrival ticket inside a generation block (own 64-byte line).
 pub const AR_HC_TICKET_WORD: usize = 16;
 /// Bytes of a rank's generation block; word 0 is the generation, word 16 the ticket.
@@ -219,6 +228,24 @@ fn ar_hc_geometry_exact(rows: usize, blocks0: u32, lanes0: u32) -> Option<(u32, 
 /// [`ar_hc_geometry_with`] at the default shape.
 pub fn ar_hc_geometry(rows: usize) -> Option<(u32, u32)> {
     ar_hc_geometry_with(rows, AR_HC_DEFAULT_BLOCKS, AR_HC_DEFAULT_LANES)
+}
+
+/// Launch geometry of a product launch of `rows` rows on the non-split entries. `wide`
+/// (`HIPFIRE_EP_AR_WIDE_GRID`, [`crate::feature_flags::FeatureFlags::ep_ar_wide_grid_enabled`]):
+/// [`AR_HC_WIDE_BLOCKS`] blocks of up to [`AR_HC_MAX_LANES`] lanes whenever that holds at most
+/// [`AR_HC_WIDE_KMAX`] granules per lane, so a launch of up to 51 rows runs one granule per
+/// lane (24 rows: 64 x 256, 48 rows: 64 x 480) instead of the 16-block default (24 rows: 4
+/// granules per lane, 48 rows: 20 x 256 at 6); larger launches keep the default. The
+/// decode-width launch is latency-bound in its per-lane fold/apply chain (the served C4 / C8
+/// verify step's 24 / 48-row launch took 20-36 us, rocprof j8299), so spreading the granules
+/// over 4x the waves shortens it. Byte-identical: the push, poll, fold and apply of a granule
+/// do not depend on the lane or block that runs it. Not wide: [`ar_hc_geometry`].
+pub fn ar_hc_launch_geometry(rows: usize, wide: bool) -> Option<(u32, u32)> {
+    let spread = wide
+        .then(|| ar_hc_geometry_with(rows, AR_HC_WIDE_BLOCKS, AR_HC_MAX_LANES as u32))
+        .flatten()
+        .filter(|&g| ar_hc_granules_per_lane(rows, g) <= AR_HC_WIDE_KMAX);
+    spread.or_else(|| ar_hc_geometry(rows))
 }
 
 /// Launch geometry `(blocks, lanes)` of a branch-split launch of `rows` rows (1 ..=
@@ -551,7 +578,8 @@ pub fn sp_ag_rows_per_launch(row_elems: usize, bank_stride: usize) -> usize {
 /// launches later its push reuses bank `tag & 1` while the peer still polls it (overwritten
 /// granules or a bank timeout). Chunking only changes which launch carries a row, never the
 /// per-row fold. A range empty as a whole (or shorter than `k`) cannot be non-empty in every
-/// launch; the SP route never plans one (`SP_MIN_ROWS`).
+/// launch; the SP route never plans one (its row bands keep both halves above 64 rows:
+/// `SP_SUB512_MIN_ROWS` / `SP_MIN_ROWS`).
 pub fn sp_slices(
     own_rows: usize,
     peer_rows: usize,
@@ -1063,6 +1091,38 @@ mod tests {
             ar_hc_geometry(8),
             Some((16, 256)).filter(|&(b, t)| ar_hc_granules_per_lane(8, (b, t)) <= AR_HC_KMAX)
         );
+    }
+
+    /// The wide launch shape (`HIPFIRE_EP_AR_WIDE_GRID`) covers every row count the default
+    /// covers, within the block/lane/KMAX caps, runs one granule per lane up to 51 rows (the
+    /// 24- and 48-row decode verify launches), at most AR_HC_WIDE_KMAX up to 153 rows, keeps
+    /// the default shape above, and is the default shape when not wide.
+    #[test]
+    fn wide_launch_geometry_spreads_decode_widths_one_granule_per_lane() {
+        for rows in 1..=AR_HC_ROW_CAP {
+            assert_eq!(ar_hc_launch_geometry(rows, false), ar_hc_geometry(rows));
+            let (b, t) = ar_hc_launch_geometry(rows, true).expect("wide covers every row count");
+            assert!(b as usize <= AR_HC_MAX_BLOCKS && t as usize <= AR_HC_MAX_LANES);
+            let k = ar_hc_granules_per_lane(rows, (b, t));
+            assert!(k <= AR_HC_KMAX, "rows {rows}: {b}x{t} at {k}");
+            if rows <= 51 {
+                assert_eq!(k, 1, "rows {rows}: {b}x{t}");
+            }
+            if rows <= 153 {
+                assert_eq!(
+                    Some((b, t)),
+                    ar_hc_geometry_with(rows, AR_HC_WIDE_BLOCKS, AR_HC_MAX_LANES as u32),
+                    "rows {rows}"
+                );
+                assert!(k <= AR_HC_WIDE_KMAX, "rows {rows}: {b}x{t} at {k}");
+            } else {
+                assert_eq!(Some((b, t)), ar_hc_geometry(rows), "rows {rows}");
+            }
+        }
+        assert_eq!(ar_hc_launch_geometry(24, true), Some((64, 256)));
+        assert_eq!(ar_hc_launch_geometry(48, true), Some((64, 480)));
+        assert!(ar_hc_launch_geometry(0, true).is_none());
+        assert!(ar_hc_launch_geometry(AR_HC_ROW_CAP + 1, true).is_none());
     }
 
     /// A branch-split launch gives every (granule, branch) item exactly one lane, keeps the

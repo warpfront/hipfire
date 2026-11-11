@@ -51,12 +51,13 @@ impl From<KvBackend> for Qwen4KvBackend {
 }
 
 /// The architectures whose Qwen4 QSA VMM state is certified unconditionally:
-/// gfx1151 (F32 state) and gfx1201 (fp8 state). gfx1100 is admitted too
-/// unless the `HIPFIRE_QWEN4_VMM_GFX1100=0` kill switch is set.
-const VMM_ARCHS: [&str; 2] = ["gfx1151", "gfx1201"];
+/// gfx1151 (F32 state), gfx1201 (fp8 state) and gfx942 (F32 or FNUZ fp8
+/// state). gfx1100 is admitted too unless the `HIPFIRE_QWEN4_VMM_GFX1100=0`
+/// kill switch is set.
+const VMM_ARCHS: [&str; 3] = ["gfx1151", "gfx1201", "gfx942"];
 
 /// Why Qwen4 QSA context arenas on a `gpu_arch` device cannot be VMM owners,
-/// or `None` when they can: exactly gfx1151, gfx1201 or (unless
+/// or `None` when they can: exactly gfx1151, gfx1201, gfx942 or (unless
 /// `HIPFIRE_QWEN4_VMM_GFX1100=0`) gfx1100, not Windows (whose driver needs the
 /// full-map workaround), the platform VMM KV refusal
 /// ([`hipfire_config::devices::vmm_kv_platform_refusal`]) clear, and a HIP
@@ -264,12 +265,13 @@ mod tests {
                 qwen4_vmm_refusal_with("gfx1200", true, gfx1100_enabled).is_some_and(
                     |reason| reason.contains("gfx1151")
                         && reason.contains("gfx1201")
+                        && reason.contains("gfx942")
                         && reason.contains("gfx1100")
                         && reason.contains("gfx1200")
                 )
             );
         }
-        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+        for arch in ["gfx1100", "gfx1151", "gfx1201", "gfx942"] {
             if cfg!(windows) || hipfire_config::devices::vmm_kv_platform_refusal().is_some() {
                 assert!(qwen4_vmm_refusal_with(arch, true, true).is_some());
             } else {

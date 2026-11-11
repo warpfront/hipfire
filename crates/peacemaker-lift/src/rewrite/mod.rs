@@ -19,6 +19,7 @@ pub mod build;
 pub mod definedness;
 pub mod profile;
 pub mod region;
+pub mod uniformity;
 
 use std::collections::{BTreeSet, HashMap};
 

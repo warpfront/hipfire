@@ -117,7 +117,7 @@ fn vmem_bytes(name: &str) -> u64 {
     0 // An unmodeled image/atomic byte width is not guessed.
 }
 fn vmem_pending(state: &peacemaker_ir::wait::WaitState, arch: Arch) -> u64 {
-    let counter = if arch == Arch::Gfx1201 {
+    let counter = if arch.is_gfx12() {
         Counter::Load
     } else {
         Counter::Vm

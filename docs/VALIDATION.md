@@ -693,3 +693,4 @@ blocked on purpose.
 - Admission registry: [`admissions.yml`](admissions.yml)
 - Redline policy: [`REDLINE.md`](REDLINE.md)
 - Perf protocol: [`methodology/perf-benchmarking.md`](methodology/perf-benchmarking.md)
+- Engineering lessons (bitwise-gate discipline, gate gaps, measurement rules): [`methodology/lessons-0.4.5.md`](methodology/lessons-0.4.5.md)

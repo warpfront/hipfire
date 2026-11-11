@@ -280,6 +280,7 @@ fn arch_name(arch: Arch) -> &'static str {
         Arch::Gfx1030 => "gfx1030",
         Arch::Gfx1100 => "gfx1100",
         Arch::Gfx1151 => "gfx1151",
+        Arch::Gfx1200 => "gfx1200",
         Arch::Gfx1201 => "gfx1201",
     }
 }
@@ -359,6 +360,29 @@ mod tests {
             two.device_entry(Arch::Gfx1201),
             Err(BundleError::Ambiguous { count: 2, .. })
         ));
+    }
+
+    #[test]
+    fn gfx1200_and_gfx1201_device_entries_never_alias() {
+        let entry = |triple: &str| Bundle {
+            entries: vec![BundleEntry {
+                triple: triple.into(),
+                offset: 0x1000,
+            }],
+            gaps: Vec::new(),
+        };
+        let t1200 = "hipv4-amdgcn-amd-amdhsa--gfx1200";
+        let t1201 = "hipv4-amdgcn-amd-amdhsa--gfx1201";
+        assert_eq!(entry(t1200).device_entry(Arch::Gfx1200), Ok(0));
+        assert_eq!(
+            entry(t1200).device_entry(Arch::Gfx1201),
+            Err(BundleError::NoEntry(t1201.into()))
+        );
+        assert_eq!(
+            entry(t1201).device_entry(Arch::Gfx1200),
+            Err(BundleError::NoEntry(t1200.into()))
+        );
+        assert_eq!(arch_name(Arch::Gfx1200), "gfx1200");
     }
 
     #[test]

@@ -8,11 +8,15 @@
 //!
 //! * `gemm_bf16_mfma_gfx942` (`kernels/src/gemm_bf16_mfma.gfx942.hip`) through
 //!   its public launcher [`Gpu::gemm_bf16_mfma_gfx942`] — the BF16 trunk GEMM
-//!   the gfx942 route reaches for every real row count (rows = 1 is a
-//!   32-row-tile padded launch). The activation is staged F32 → BF16 by
+//!   the gfx942 route reaches for every real row count (1..=16 rows take the
+//!   module's few-row entry `gemm_bf16_mfma_gfx942_rows16`, more rows the
+//!   32-row-tile entry). The activation is staged F32 → BF16 by
 //!   [`Gpu::convert_f32_to_bf16`] exactly as the route stages it; the staged
 //!   bits are checked against the frozen RNE rule here too (the standalone
-//!   convert case belongs to `io.rs`).
+//!   convert case belongs to `io.rs`). The few-row entry is bit-compared
+//!   against the tile entry ([`Gpu::gemm_bf16_mfma_gfx942_tiled`]) at 1..=16
+//!   rows, and its fused form ([`Gpu::gemm_bf16_mfma_gfx942_rows16`]: F32 x
+//!   staged in-kernel, F32 or BF16 output) against staging + GEMM + rounding.
 //! * `gemv_bf16_xf32` ([`Gpu::gemv_bf16_xf32`], `kernels/src/gemv_bf16_xf32.hip`
 //!   on every arch but gfx1151): the rows = 1 BF16 GEMV of the census-base
 //!   `project_rotated` and of the final-row LM head.
@@ -37,8 +41,13 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 pub const CASES: &[Q4Case] = &[
     Q4Case {
         name: "qwen4_gemm_bf16_mfma_gfx942_trunk_shapes",
-        timeout_s: 240,
+        timeout_s: 600,
         run: gemm_bf16_mfma_trunk,
+    },
+    Q4Case {
+        name: "qwen4_gemm_bf16_mfma_gfx942_rows16_group",
+        timeout_s: 300,
+        run: gemm_bf16_mfma_rows16_group,
     },
     Q4Case {
         name: "qwen4_gemv_bf16_xf32_1row",
@@ -60,7 +69,9 @@ pub const CASES: &[Q4Case] = &[
 /// Rows of every X the cases generate: `ROW_COUNTS` plus one count above two
 /// 32-row MFMA batch tiles (65 = 2 full tiles + a 1-row tail tile).
 const MAX_ROWS: usize = 65;
-const MFMA_ROWS: [usize; 4] = [1, 7, 33, MAX_ROWS];
+const MFMA_ROWS: [usize; 5] = [1, 7, 16, 33, MAX_ROWS];
+/// Row counts the few-row entry is bit-compared against the tile entry at.
+const FEW_ROWS: [usize; 5] = [1, 2, 7, 15, 16];
 /// Weight magnitude. With x in [-1, 1) the dots have |y| ~ 0.3-0.5, so F32
 /// accumulation error (~1e-7) sits two orders under `F32_ACCUM`'s atol.
 const W_RANGE: f32 = 0.02;
@@ -72,7 +83,7 @@ struct Shape {
 }
 
 /// Qwen4 trunk projection shapes the BF16 MFMA route launches.
-const MFMA_SHAPES: [Shape; 4] = [
+const MFMA_SHAPES: [Shape; 7] = [
     // GDN in-projection qkv: 2*(16*128) + 48*128.
     Shape {
         name: "gdn_qkv",
@@ -96,6 +107,26 @@ const MFMA_SHAPES: [Shape; 4] = [
         name: "hc_gate",
         m: HC_STREAMS,
         k: HC_WIDE,
+    },
+    // HC mix down: 20 M tiles over the longest K (the few-row entry's
+    // chain-bound shape).
+    Shape {
+        name: "hc_down",
+        m: 320,
+        k: HC_WIDE,
+    },
+    // HC mix up: K = 320 is not a multiple of the 128-K chunk, so both entries
+    // run 24 MFMA steps, the last 4 over the zero-filled tail.
+    Shape {
+        name: "hc_up",
+        m: HC_WIDE,
+        k: 320,
+    },
+    // Shared-expert gate: a single output row.
+    Shape {
+        name: "shared_gate",
+        m: 1,
+        k: HIDDEN,
     },
 ];
 
@@ -137,6 +168,54 @@ fn stage_bf16(gpu: &mut Gpu, x: &[f32]) -> Result<GpuTensor, String> {
     sync(gpu)?;
     gpu.free_tensor(src).map_err(e)?;
     Ok(dst)
+}
+
+/// One `gemm_bf16_mfma_gfx942_tiled` launch (the 32-row-tile entry at any
+/// row count) of `n` rows of `x` (BF16) against `w`.
+fn run_mfma_tiled(
+    gpu: &mut Gpu,
+    w: &GpuTensor,
+    x: &GpuTensor,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Vec<f32>, String> {
+    let y = sentinel_f32(gpu, n * m)?;
+    gpu.gemm_bf16_mfma_gfx942_tiled(&w.buf, &x.buf, &y.buf, m, k, n)
+        .map_err(e)?;
+    sync(gpu)?;
+    let out = down_f32(gpu, &y)?;
+    gpu.free_tensor(y).map_err(e)?;
+    Ok(out)
+}
+
+/// One fused few-row launch (`gemm_bf16_mfma_gfx942_rows16`) of `n` rows of
+/// `x` (F32 or BF16) into a fresh `out_dtype` tensor, returned as raw bytes.
+fn run_rows16_fused(
+    gpu: &mut Gpu,
+    w: &GpuTensor,
+    x: &GpuTensor,
+    m: usize,
+    k: usize,
+    n: usize,
+    out_dtype: DType,
+) -> Result<Vec<u8>, String> {
+    let y = if out_dtype == DType::F32 {
+        sentinel_f32(gpu, n * m)?
+    } else {
+        gpu.alloc_tensor(&[n * m], out_dtype).map_err(e)?
+    };
+    let ran = gpu
+        .gemm_bf16_mfma_gfx942_rows16(x, &[(&w.buf, &y, m)], k, n)
+        .map_err(e)?;
+    if !ran {
+        gpu.free_tensor(y).map_err(e)?;
+        return Err(format!("rows16 entry declined m={m} k={k} rows={n}"));
+    }
+    sync(gpu)?;
+    let out = down_bytes(gpu, &y)?;
+    gpu.free_tensor(y).map_err(e)?;
+    Ok(out)
 }
 
 /// One `gemm_bf16_mfma_gfx942` launch of `n` rows of `x` (BF16) against `w`.
@@ -235,6 +314,62 @@ fn gemm_bf16_mfma_trunk(gpu: &mut Gpu) -> Result<String, String> {
             Err(format!("{label} rows-dependent bytes: {}", bad.join("; ")))
         });
 
+        // Few-row entry == tile entry, bit for bit, at every row of 1..=16-row
+        // launches; then the fused form (F32 x rounded in-kernel; F32 and BF16
+        // output) == staging + GEMM (+ RNE rounding of the F32 result).
+        let x32 = up_f32(gpu, &x_host)?;
+        let mut few_bad = Vec::new();
+        let mut fused_bad = Vec::new();
+        for &n in &FEW_ROWS {
+            let xv = xbf.sub_offset(0, n * k);
+            let tiled = run_mfma_tiled(gpu, &w, &xv, m, k, n)?;
+            let few = run_mfma(gpu, &w, &xv, m, k, n)?;
+            let (diff, max_abs) = bit_diff(&few, &tiled);
+            if diff != 0 {
+                few_bad.push(format!("rows={n}: {diff} bit diffs, max_abs {max_abs:e}"));
+            }
+            let want_f32: Vec<u8> = tiled.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let want_bf16: Vec<u8> = tiled
+                .iter()
+                .flat_map(|&v| f32_to_bf16_bits(v).to_le_bytes())
+                .collect();
+            let x32v = x32.sub_offset(0, n * k);
+            for (xin, xname) in [(&x32v, "x_f32"), (&xv, "x_bf16")] {
+                for (dt, want, oname) in [
+                    (DType::F32, &want_f32, "y_f32"),
+                    (DType::BF16, &want_bf16, "y_bf16"),
+                ] {
+                    let got = run_rows16_fused(gpu, &w, xin, m, k, n, dt)?;
+                    if &got != want {
+                        let diff = got
+                            .chunks(dt.size())
+                            .zip(want.chunks(dt.size()))
+                            .filter(|(a, b)| a != b)
+                            .count();
+                        fused_bad.push(format!("rows={n} {xname} {oname}: {diff} elements differ"));
+                    }
+                }
+            }
+        }
+        results.push(if few_bad.is_empty() {
+            Ok(format!(
+                "{label} few-row entry == tile entry bitwise at rows {FEW_ROWS:?}"
+            ))
+        } else {
+            Err(format!(
+                "{label} few-row entry != tile entry: {}",
+                few_bad.join("; ")
+            ))
+        });
+        results.push(if fused_bad.is_empty() {
+            Ok(format!(
+                "{label} fused few-row (x F32/BF16, y F32/BF16) == staged GEMM bitwise at rows {FEW_ROWS:?}"
+            ))
+        } else {
+            Err(format!("{label} fused few-row mismatch: {}", fused_bad.join("; ")))
+        });
+        gpu.free_tensor(x32).map_err(e)?;
+
         // REPORT (never fails): the 1-row gemv on the same BF16-exact inputs
         // against the MFMA row. Expected to differ (two reduction orders).
         let xb32 = up_f32(gpu, &x_bf_host)?;
@@ -260,6 +395,86 @@ fn gemm_bf16_mfma_trunk(gpu: &mut Gpu) -> Result<String, String> {
 
         free_all(gpu, vec![w, xbf, xb32])?;
     }
+    all(results)
+}
+
+// ── Few-row entry, one launch per projection group ───────────────────────────
+// The GDN in-projection group (qkv, z, a, b: four weights over one x, K =
+// HIDDEN) as ONE `gemm_bf16_mfma_gfx942_rows16` launch with mixed output
+// dtypes (F32, BF16, F32, BF16), F32 x: each member's bytes must equal its own
+// staged tile-entry GEMM (BF16 members: + RNE rounding), at 1, 9 (the F32
+// `_x2` entry) and 16 rows.
+fn gemm_bf16_mfma_rows16_group(gpu: &mut Gpu) -> Result<String, String> {
+    if !gpu.arch_caps.is_gfx942() {
+        return Ok("skipped: gemm_bf16_mfma_gfx942 requires gfx942".to_string());
+    }
+    let k = HIDDEN;
+    let ms = [10240usize, 6144, GDN_VALUE_HEADS, GDN_VALUE_HEADS];
+    let dts = [DType::F32, DType::BF16, DType::F32, DType::BF16];
+    let mut rng = Rng::new(0x7121_0002);
+    let mut ws = Vec::new();
+    for &m in &ms {
+        let host = rng.vec_bf16_exact(m * k, -W_RANGE, W_RANGE);
+        ws.push(up_bf16(gpu, &host)?);
+    }
+    let x_host = rng.vec(16 * k, -1.0, 1.0);
+    let x32 = up_f32(gpu, &x_host)?;
+    let xbf = stage_bf16(gpu, &x_host)?;
+    let mut results = Vec::new();
+    for n in [1usize, 9, 16] {
+        let mut ys = Vec::new();
+        for (&m, &dt) in ms.iter().zip(&dts) {
+            ys.push(gpu.alloc_tensor(&[n * m], dt).map_err(e)?);
+        }
+        let x = x32.sub_offset(0, n * k);
+        let members: Vec<_> = ws
+            .iter()
+            .zip(&ys)
+            .zip(&ms)
+            .map(|((w, y), &m)| (&w.buf, y, m))
+            .collect();
+        let ran = gpu
+            .gemm_bf16_mfma_gfx942_rows16(&x, &members, k, n)
+            .map_err(e)?;
+        if !ran {
+            return Err(format!("group launch declined at rows={n}"));
+        }
+        sync(gpu)?;
+        let mut bad = Vec::new();
+        for (j, ((w, y), &m)) in ws.iter().zip(&ys).zip(&ms).enumerate() {
+            let want = run_mfma_tiled(gpu, w, &xbf.sub_offset(0, n * k), m, k, n)?;
+            let want: Vec<u8> = if dts[j] == DType::F32 {
+                want.iter().flat_map(|v| v.to_le_bytes()).collect()
+            } else {
+                want.iter()
+                    .flat_map(|&v| f32_to_bf16_bits(v).to_le_bytes())
+                    .collect()
+            };
+            let got = down_bytes(gpu, y)?;
+            if got != want {
+                let diff = got
+                    .chunks(dts[j].size())
+                    .zip(want.chunks(dts[j].size()))
+                    .filter(|(a, b)| a != b)
+                    .count();
+                bad.push(format!(
+                    "member {j} [{m}x{k} {:?}]: {diff} elements differ",
+                    dts[j]
+                ));
+            }
+        }
+        results.push(if bad.is_empty() {
+            Ok(format!(
+                "gdn_in group rows={n}: 4 members == staged tile GEMM bitwise"
+            ))
+        } else {
+            Err(format!("gdn_in group rows={n}: {}", bad.join("; ")))
+        });
+        free_all(gpu, ys)?;
+    }
+    ws.push(x32);
+    ws.push(xbf);
+    free_all(gpu, ws)?;
     all(results)
 }
 

@@ -18,6 +18,8 @@
 //! expressions produce [`Ix::NONE`]; nothing here widens to a guess.
 use std::collections::HashMap;
 
+use smallvec::SmallVec;
+
 use crate::cfg::InstId;
 use crate::kernarg::{EntryReg, IdxExpr, IndexExt};
 
@@ -53,7 +55,7 @@ impl Ix {
 }
 
 /// `lvl` of a [`Node::Carry`] produced by a scalar add (no EXEC dependency).
-pub(super) const CARRY_SCALAR: u8 = 0xff;
+pub(super) const CARRY_SCALAR: u32 = u32::MAX;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(super) enum Node {
@@ -78,7 +80,7 @@ pub(super) enum Node {
     Carry {
         a: Ix,
         b: Ix,
-        lvl: u8,
+        lvl: u32,
     },
     // 64-bit values.
     C64(u64),
@@ -121,6 +123,38 @@ pub(super) enum Node {
     Bit(Ix),
     /// Some value that is nonzero exactly when the flag holds.
     NzFlag(Ix),
+    // Extended integer witnesses (workgroup-footprint analysis,
+    // `passes::wg_footprint`). All 32-bit except where noted.
+    /// A wg/lane-independent value (a function of kernarg scalars and constants
+    /// only) the witness has no expression for: the result of the instruction
+    /// `0` in result slot `1`. Equal only to itself (dynamic instance unique:
+    /// such definitions never sit in CFG cycles). Never an address witness.
+    Opaque(InstId, u8),
+    And32(Ix, Ix),
+    Or32(Ix, Ix),
+    /// Logical shift right.
+    Shr32(Ix, u8),
+    /// Arithmetic shift right by `1..=30` (31 is [`Node::Sra31`]).
+    Sra32(Ix, u8),
+    MinS(Ix, Ix),
+    MinU(Ix, Ix),
+    MaxS(Ix, Ix),
+    MaxU(Ix, Ix),
+    /// `flag ? a : b`.
+    Sel(Ix, Ix, Ix),
+    /// 64-bit: the value the `v_mad_co_u64_u32` + `v_mad_i32_i24` pair computes
+    /// for `a * b` with `a` signed and `b` unsigned: `zext(a)*zext(b) +
+    /// ((sext24(sign(a)) * sext24(b)) << 32)`. Equal to `sext(a) * zext(b)`
+    /// exactly when `b < 2^23`.
+    MulSU24(Ix, Ix),
+    /// 32-bit lane mask (wave32): bit `l` is set only for lanes whose work-item
+    /// satisfies every `(atom, polarity)` of fact list `id` (`Interner::lane_facts`).
+    /// Atoms compare 32-bit values that may depend on the work-item id.
+    /// `v_readfirstlane_b32` under the entry EXEC: the value of the argument in
+    /// lane 0 of the executing wave (a wave32 lane-0 value: wave-uniform, not
+    /// workgroup-uniform).
+    FirstLane(Ix),
+    LaneMask(u32),
 }
 impl Node {
     fn bits(self) -> u8 {
@@ -140,19 +174,98 @@ impl Node {
             | Node::Zext(_)
             | Node::Add64(..)
             | Node::Mul64(..)
-            | Node::Shl64(..) => 64,
+            | Node::Shl64(..)
+            | Node::MulSU24(..) => 64,
             _ => 32,
         }
     }
 }
 
 const MAX_DEPTH: u16 = 40;
-const MAX_NODES: usize = 20_000;
+
+/// [`Interner::leaves`] bits.
+pub(super) const LEAF_WG: u8 = 1;
+pub(super) const LEAF_LANE: u8 = 2;
+/// A kernarg dword or opaque uniform value.
+pub(super) const LEAF_ATOM: u8 = 4;
+/// Loaded data, a sealed-table entry, a lane carry mask, or no witness.
+pub(super) const LEAF_OTHER: u8 = 8;
+const MAX_NODES: usize = 200_000;
 
 #[derive(Default)]
 pub(super) struct Interner {
     nodes: Vec<(Node, u16)>,
     map: HashMap<Node, Ix>,
+    uni: HashMap<Ix, bool>,
+    leaf: HashMap<Ix, u8>,
+    mask_tab: Vec<(Vec<(Ix, bool)>, Option<u32>)>,
+    mask_ids: HashMap<(Vec<(Ix, bool)>, Option<u32>), u32>,
+}
+
+impl Interner {
+    /// The value depends on no work-item id, workgroup id, loaded data or
+    /// lane mask: a pure function of constants and kernarg dwords, hence the
+    /// same for every lane of every workgroup of one dispatch.
+    pub fn uniform(&mut self, ix: Ix) -> bool {
+        let Some(node) = self.node(ix) else {
+            return false;
+        };
+        if let Some(&u) = self.uni.get(&ix) {
+            return u;
+        }
+        let kids: SmallVec<[Ix; 3]> = match node {
+            Node::C32(_)
+            | Node::C64(_)
+            | Node::K32(_)
+            | Node::K64(_)
+            | Node::Opaque(..)
+            | Node::True => SmallVec::new(),
+            Node::Entry(_)
+            | Node::Load(_)
+            | Node::Ent(_)
+            | Node::Carry { .. }
+            | Node::FirstLane(_)
+            | Node::LaneMask(_) => {
+                self.uni.insert(ix, false);
+                return false;
+            }
+            Node::Lo(a)
+            | Node::Hi(a)
+            | Node::Sra31(a)
+            | Node::Shl32(a, _)
+            | Node::Shr32(a, _)
+            | Node::Sra32(a, _)
+            | Node::Sext(a)
+            | Node::Zext(a)
+            | Node::Shl64(a, _)
+            | Node::Zero64(a)
+            | Node::Not(a)
+            | Node::Mask(a)
+            | Node::Bit(a)
+            | Node::NzFlag(a) => SmallVec::from_slice(&[a]),
+            Node::Add32(a, b)
+            | Node::Sub32(a, b)
+            | Node::Mul32(a, b)
+            | Node::And32(a, b)
+            | Node::Or32(a, b)
+            | Node::MinS(a, b)
+            | Node::MinU(a, b)
+            | Node::MaxS(a, b)
+            | Node::MaxU(a, b)
+            | Node::Add64(a, b)
+            | Node::Mul64(a, b)
+            | Node::MulSU24(a, b)
+            | Node::Ltu { a, b }
+            | Node::Lts { a, b }
+            | Node::Eq { a, b }
+            | Node::Or(a, b)
+            | Node::And(a, b) => SmallVec::from_slice(&[a, b]),
+            Node::Sel(f, a, b) => SmallVec::from_slice(&[f, a, b]),
+        };
+        let u = kids.into_iter().all(|k| self.uniform(k));
+        self.uni.insert(ix, u);
+        u
+    }
 }
 
 impl Interner {
@@ -283,7 +396,115 @@ impl Interner {
         }
         self.mk(Node::Sra31(a), &[a])
     }
-    pub fn carry(&mut self, a: Ix, b: Ix, lvl: u8) -> Ix {
+    /// The opaque wg/lane-independent value of `inst`'s result slot `slot`.
+    pub fn opaque(&mut self, inst: InstId, slot: u8) -> Ix {
+        self.mk(Node::Opaque(inst, slot), &[])
+    }
+    pub fn and32(&mut self, a: Ix, b: Ix) -> Ix {
+        if !self.is32(a) || !self.is32(b) {
+            return Ix::NONE;
+        }
+        match (self.const32(a), self.const32(b)) {
+            (Some(x), Some(y)) => return self.c32(x & y),
+            (Some(u32::MAX), _) => return b,
+            (_, Some(u32::MAX)) => return a,
+            (Some(0), _) | (_, Some(0)) => return self.c32(0),
+            _ => {}
+        }
+        let (a, b) = if b < a { (b, a) } else { (a, b) };
+        self.mk(Node::And32(a, b), &[a, b])
+    }
+    pub fn or32(&mut self, a: Ix, b: Ix) -> Ix {
+        if !self.is32(a) || !self.is32(b) {
+            return Ix::NONE;
+        }
+        match (self.const32(a), self.const32(b)) {
+            (Some(x), Some(y)) => return self.c32(x | y),
+            (Some(0), _) => return b,
+            (_, Some(0)) => return a,
+            _ => {}
+        }
+        let (a, b) = if b < a { (b, a) } else { (a, b) };
+        self.mk(Node::Or32(a, b), &[a, b])
+    }
+    /// Logical shift right by `k < 32`.
+    pub fn shr32(&mut self, a: Ix, k: u32) -> Ix {
+        if !self.is32(a) || k >= 32 {
+            return Ix::NONE;
+        }
+        if k == 0 {
+            return a;
+        }
+        if let Some(x) = self.const32(a) {
+            return self.c32(x >> k);
+        }
+        self.mk(Node::Shr32(a, k as u8), &[a])
+    }
+    /// Arithmetic shift right by `k < 32` (31 is the sign word).
+    pub fn sra32(&mut self, a: Ix, k: u32) -> Ix {
+        if !self.is32(a) || k >= 32 {
+            return Ix::NONE;
+        }
+        match k {
+            0 => a,
+            31 => self.sra31(a),
+            _ => match self.const32(a) {
+                Some(x) => self.c32(((x as i32) >> k) as u32),
+                None => self.mk(Node::Sra32(a, k as u8), &[a]),
+            },
+        }
+    }
+    /// `min`/`max` of two 32-bit values (signed or unsigned).
+    pub fn minmax32(&mut self, a: Ix, b: Ix, max: bool, signed: bool) -> Ix {
+        if !self.is32(a) || !self.is32(b) {
+            return Ix::NONE;
+        }
+        if let (Some(x), Some(y)) = (self.const32(a), self.const32(b)) {
+            let (sx, sy) = (x as i32, y as i32);
+            return self.c32(match (max, signed) {
+                (false, true) => sx.min(sy) as u32,
+                (true, true) => sx.max(sy) as u32,
+                (false, false) => x.min(y),
+                (true, false) => x.max(y),
+            });
+        }
+        if a == b {
+            return a;
+        }
+        let (a, b) = if b < a { (b, a) } else { (a, b) };
+        let n = match (max, signed) {
+            (false, true) => Node::MinS(a, b),
+            (true, true) => Node::MaxS(a, b),
+            (false, false) => Node::MinU(a, b),
+            (true, false) => Node::MaxU(a, b),
+        };
+        self.mk(n, &[a, b])
+    }
+    /// The lane-0 value of the executing wave (`v_readfirstlane_b32` under the
+    /// entry EXEC). A uniform argument is its own first-lane value.
+    pub fn first_lane(&mut self, a: Ix) -> Ix {
+        if !self.is32(a) {
+            return Ix::NONE;
+        }
+        if self.uniform(a) {
+            return a;
+        }
+        self.mk(Node::FirstLane(a), &[a])
+    }
+    /// `flag ? a : b`.
+    pub fn sel(&mut self, f: Ix, a: Ix, b: Ix) -> Ix {
+        if !self.is_flag(f) || !self.is32(a) || !self.is32(b) {
+            return Ix::NONE;
+        }
+        if a == b {
+            return a;
+        }
+        if matches!(self.node(f), Some(Node::True)) {
+            return a;
+        }
+        self.mk(Node::Sel(f, a, b), &[f, a, b])
+    }
+    pub fn carry(&mut self, a: Ix, b: Ix, lvl: u32) -> Ix {
         if !self.is32(a) || !self.is32(b) {
             return Ix::NONE;
         }
@@ -395,7 +616,7 @@ impl Interner {
         }
     }
 
-    fn sext(&mut self, a: Ix) -> Ix {
+    pub fn sext(&mut self, a: Ix) -> Ix {
         if !self.is32(a) {
             return Ix::NONE;
         }
@@ -468,6 +689,7 @@ impl Interner {
                 let (la, lb) = (self.lo_of(a), self.lo_of(b));
                 self.mul32(la, lb)
             }
+            Some(Node::MulSU24(a, b)) => self.mul32(a, b),
             Some(Node::Shl64(a, k)) if k < 32 => {
                 let la = self.lo_of(a);
                 self.shl32(la, u32::from(k))
@@ -507,11 +729,163 @@ impl Interner {
             (_, Some(Node::Sra31(x))) if x == lo => return self.sext(lo),
             _ => {}
         }
+        if let Some(w) = self.mulsu24_pair(lo, hi) {
+            return w;
+        }
         Ix::NONE
     }
 
+    fn sext24(&mut self, x: Ix) -> Ix {
+        let s = self.shl32(x, 8);
+        self.sra32(s, 8)
+    }
+
+    /// `(lo, hi)` as the pair `v_mad_co_u64_u32 d[2], null, a, b, 0` then
+    /// `v_mad_i32_i24 hi, sign(a), b, hi` leaves: [`Node::MulSU24`].
+    fn mulsu24_pair(&mut self, lo: Ix, hi: Ix) -> Option<Ix> {
+        let Some(Node::Add32(p, q)) = self.node(hi) else {
+            return None;
+        };
+        for (h, m) in [(p, q), (q, p)] {
+            let Some(Node::Hi(w)) = self.node(h) else {
+                continue;
+            };
+            let Some(Node::Mul64(za, zb)) = self.node(w) else {
+                continue;
+            };
+            let (Some(Node::Zext(x)), Some(Node::Zext(y))) = (self.node(za), self.node(zb)) else {
+                continue;
+            };
+            if self.lo_of(w) != lo {
+                continue;
+            }
+            for (a, b) in [(x, y), (y, x)] {
+                let sa = self.sra31(a);
+                let (s24a, s24b) = (self.sext24(sa), self.sext24(b));
+                if self.mul32(s24a, s24b) == m {
+                    return Some(self.mk(Node::MulSU24(a, b), &[a, b]));
+                }
+            }
+        }
+        None
+    }
+
+    /// The lane mask whose set lanes satisfy every fact (sorted, deduplicated).
+    /// `exact = Some(g)`: while the EXEC widening generation is `g`, an active
+    /// lane's bit is set exactly when every fact holds; otherwise only "set
+    /// implies every fact holds".
+    pub fn lane_mask(&mut self, mut facts: Vec<(Ix, bool)>, exact: Option<u32>) -> Ix {
+        facts.sort();
+        facts.dedup();
+        let key = (facts, exact);
+        let id = match self.mask_ids.get(&key) {
+            Some(&id) => id,
+            None => {
+                let id = self.mask_tab.len() as u32;
+                self.mask_tab.push(key.clone());
+                self.mask_ids.insert(key, id);
+                id
+            }
+        };
+        self.mk(Node::LaneMask(id), &[])
+    }
+    /// The `(facts, exact generation)` of a [`Node::LaneMask`] witness.
+    pub fn lane_mask_facts(&self, ix: Ix) -> Option<(&[(Ix, bool)], Option<u32>)> {
+        match self.node(ix)? {
+            Node::LaneMask(id) => self
+                .mask_tab
+                .get(id as usize)
+                .map(|(f, e)| (f.as_slice(), *e)),
+            _ => None,
+        }
+    }
+    /// The facts a lane-mask witness implies for its set lanes (none for any
+    /// other witness).
+    pub fn mask_facts(&self, ix: Ix) -> Vec<(Ix, bool)> {
+        self.lane_mask_facts(ix)
+            .map(|(f, _)| f.to_vec())
+            .unwrap_or_default()
+    }
+    /// `a & b` of two lane masks: its set lanes satisfy the facts of each
+    /// lane-mask operand (a non-mask operand adds none). `NONE` when neither
+    /// is a lane mask.
+    pub fn mask_and(&mut self, a: Ix, b: Ix) -> Ix {
+        let (ma, mb) = (
+            self.lane_mask_facts(a).is_some(),
+            self.lane_mask_facts(b).is_some(),
+        );
+        if !ma && !mb {
+            return Ix::NONE;
+        }
+        let mut f = self.mask_facts(a);
+        f.extend(self.mask_facts(b));
+        self.lane_mask(f, None)
+    }
+    /// `a | b` of two lane masks: a set lane satisfies the facts both share;
+    /// `NONE` unless both are lane masks.
+    pub fn mask_or(&mut self, a: Ix, b: Ix) -> Ix {
+        if self.lane_mask_facts(a).is_none() || self.lane_mask_facts(b).is_none() {
+            return Ix::NONE;
+        }
+        let (fa, fb) = (self.mask_facts(a), self.mask_facts(b));
+        let common: Vec<(Ix, bool)> = fa.into_iter().filter(|x| fb.contains(x)).collect();
+        self.lane_mask(common, None)
+    }
+
+    /// Which kinds of leaf the value depends on (`LEAF_*`); memoised.
+    pub fn leaves(&mut self, ix: Ix) -> u8 {
+        let Some(node) = self.node(ix) else {
+            return LEAF_OTHER;
+        };
+        if let Some(&l) = self.leaf.get(&ix) {
+            return l;
+        }
+        let l = match node {
+            Node::C32(_) | Node::C64(_) | Node::True => 0,
+            Node::K32(_) | Node::K64(_) | Node::Opaque(..) => LEAF_ATOM,
+            Node::Entry(EntryReg::WorkitemIdPacked) => LEAF_LANE,
+            Node::Entry(_) => LEAF_WG,
+            Node::Load(_) | Node::Ent(_) | Node::Carry { .. } | Node::LaneMask(_) => LEAF_OTHER,
+            Node::FirstLane(a)
+            | Node::Lo(a)
+            | Node::Hi(a)
+            | Node::Sra31(a)
+            | Node::Shl32(a, _)
+            | Node::Shr32(a, _)
+            | Node::Sra32(a, _)
+            | Node::Sext(a)
+            | Node::Zext(a)
+            | Node::Shl64(a, _)
+            | Node::Zero64(a)
+            | Node::Not(a)
+            | Node::Mask(a)
+            | Node::Bit(a)
+            | Node::NzFlag(a) => self.leaves(a),
+            Node::Add32(a, b)
+            | Node::Sub32(a, b)
+            | Node::Mul32(a, b)
+            | Node::And32(a, b)
+            | Node::Or32(a, b)
+            | Node::MinS(a, b)
+            | Node::MinU(a, b)
+            | Node::MaxS(a, b)
+            | Node::MaxU(a, b)
+            | Node::Add64(a, b)
+            | Node::Mul64(a, b)
+            | Node::MulSU24(a, b)
+            | Node::Ltu { a, b }
+            | Node::Lts { a, b }
+            | Node::Eq { a, b }
+            | Node::Or(a, b)
+            | Node::And(a, b) => self.leaves(a) | self.leaves(b),
+            Node::Sel(f, a, b) => self.leaves(f) | self.leaves(a) | self.leaves(b),
+        };
+        self.leaf.insert(ix, l);
+        l
+    }
+
     /// `(a, b)` such that `carry` is `Carry { a, b }` at EXEC level `lvl`.
-    pub fn carry_parts(&self, carry: Ix, lvl: u8) -> Option<(Ix, Ix)> {
+    pub fn carry_parts(&self, carry: Ix, lvl: u32) -> Option<(Ix, Ix)> {
         match self.node(carry)? {
             Node::Carry { a, b, lvl: l } if l == lvl => Some((a, b)),
             _ => None,
@@ -519,7 +893,7 @@ impl Interner {
     }
 
     /// Terms of the top-level `Add64` chain of `w`.
-    fn terms(&self, w: Ix, out: &mut Vec<Ix>) {
+    pub(super) fn terms(&self, w: Ix, out: &mut Vec<Ix>) {
         match self.node(w) {
             Some(Node::Add64(a, b)) => {
                 self.terms(a, out);
@@ -685,6 +1059,19 @@ fn to_expr(
         Node::Add32(x, y) | Node::Add64(x, y) => IdxExpr::Add(b(x, loads)?, b(y, loads)?),
         Node::Sub32(x, y) => IdxExpr::Sub(b(x, loads)?, b(y, loads)?),
         Node::Mul32(x, y) | Node::Mul64(x, y) => IdxExpr::Mul(b(x, loads)?, b(y, loads)?),
+        Node::Opaque(..)
+        | Node::And32(..)
+        | Node::Or32(..)
+        | Node::Shr32(..)
+        | Node::Sra32(..)
+        | Node::MinS(..)
+        | Node::MinU(..)
+        | Node::MaxS(..)
+        | Node::MaxU(..)
+        | Node::Sel(..)
+        | Node::MulSU24(..)
+        | Node::FirstLane(_)
+        | Node::LaneMask(_) => return Err("witness-unsupported-op"),
         Node::Lo(_) | Node::Hi(_) | Node::Sra31(_) | Node::Carry { .. } => {
             return Err("witness-unmatched-half")
         }

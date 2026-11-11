@@ -731,9 +731,8 @@ impl PeerBoard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::expert_unit_tail::{
-        EpUnitTailConfig, RetireCadence, TailPolicy, UnitKey, WindowUse,
-    };
+    use crate::expert_unit_tail::rig::Rig;
+    use crate::expert_unit_tail::{EpUnitTailConfig, RetireCadence, UnitKey, WindowUse};
     use std::collections::{HashMap, HashSet};
 
     const FREE: u8 = QWEN4_EP_OWNER_PIN_FREE;
@@ -974,7 +973,7 @@ mod tests {
     /// fills in flight and the table state its windows see.
     struct SimRank {
         rank: usize,
-        policy: TailPolicy,
+        policy: Rig,
         proto: PinProtocol<Vec<u8>>,
         flight: Vec<(usize, u64, u32)>,
         /// The units its tables name in a slot right now.
@@ -1035,7 +1034,7 @@ mod tests {
                     fill_per_step: f,
                     boundary_every: 1,
                 };
-                let mut policy = TailPolicy::new(config, false, priority);
+                let mut policy = Rig::new(config, false, priority);
                 let seeds = policy.seed(&owned);
                 let mut proto = PinProtocol::new(rank, board.clone(), planes());
                 proto
@@ -1043,7 +1042,7 @@ mod tests {
                         seeds
                             .iter()
                             .map(|op| PinDelta {
-                                unit: op.unit,
+                                unit: op.1,
                                 on: true,
                             })
                             .collect(),
@@ -1054,8 +1053,8 @@ mod tests {
                     policy,
                     proto,
                     flight: Vec::new(),
-                    live: seeds.iter().map(|op| op.unit).collect(),
-                    events: seeds.iter().map(|op| (0, op.unit, true)).collect(),
+                    live: seeds.iter().map(|op| op.1).collect(),
+                    events: seeds.iter().map(|op| (0, op.1, true)).collect(),
                     frozen: false,
                     planes_after: Vec::new(),
                     live_after: Vec::new(),
@@ -1133,7 +1132,7 @@ mod tests {
                 }
                 for op in &retire.fills {
                     let latency = (rand(rng) % 4) as u32;
-                    me.flight.push((op.slot, op.generation, latency));
+                    me.flight.push((op.0, op.2, latency));
                 }
                 totals.published += retire.publish.len() as u64;
                 totals.evicted += retire.unpublish.len() as u64;

@@ -490,6 +490,7 @@ pub fn plan(program: &KernelProgram, table: &CacheTable, policy: RowPolicy) -> P
                     pending.extend(crate::admission::ordering_pending(index, g));
                     pending
                 },
+                spans: g.ordering.spans(),
             }
         })
         .collect();

@@ -909,6 +909,7 @@ mod tests {
             remaining: 1_000_000,
             budget: 3,
             head: HeadState::Aligned,
+            head_rank: None,
         }
     }
 
@@ -1702,6 +1703,10 @@ mod tests {
         /// Every draw this rank made on its "device" since last taken.
         draws: Vec<DrawRecord>,
         modes: HashMap<LaneWindowKey, SamplingMode>,
+        /// The planned owner of each lane of the begun window (`None`: replicated).
+        owners: HashMap<LaneWindowKey, Option<usize>>,
+        /// Negative control: answer every op of a round, owned by a peer or not.
+        answer_all: bool,
         buffer: Vec<(u32, f32)>,
         fail: Option<Fail>,
     }
@@ -1724,6 +1729,8 @@ mod tests {
                 wrong_q: false,
                 draws: Vec::new(),
                 modes: HashMap::new(),
+                owners: HashMap::new(),
+                answer_all: false,
                 buffer: Vec::new(),
                 fail: None,
             }
@@ -1756,6 +1763,7 @@ mod tests {
 
         fn begin_window(&mut self, start: &WindowStart) -> RankReady {
             self.modes = start.lanes.iter().map(|l| (l.key, l.sampling)).collect();
+            self.owners = start.lanes.iter().map(|l| (l.key, l.head_rank)).collect();
             self.session.begin(start, Ok(()))
         }
 
@@ -1768,30 +1776,41 @@ mod tests {
                 return Err(self.err("injected head failure"));
             }
             let mut res = self.session.on_draft_round(round)?;
-            if self.session.ownership().sampler {
-                let mut props = Vec::new();
-                for op in &round.ops {
-                    let tag = op.key.request_epoch.request_tag;
-                    // The shared operator's draft buffer: the next lane's op
-                    // overwrites it.
-                    self.buffer = self.synth.head[&tag].clone();
-                    let token = self
-                        .buffer
-                        .iter()
-                        .copied()
-                        .max_by(|a, b| a.1.total_cmp(&b.1))
-                        .unwrap()
-                        .0;
-                    let read = (self.modes[&op.key] == SamplingMode::Leviathan)
-                        .then(|| DraftRead::Candidates(self.buffer.clone()));
-                    props.push(DraftProposal {
-                        key: op.key,
-                        token,
-                        keep_going: true,
-                        drop_last: false,
-                        read,
-                    });
+            let own = self.session.ownership();
+            let mut props = Vec::new();
+            for op in &round.ops {
+                // An op is answered by its lane's owner, or by the sampler
+                // owner for a replicated lane.
+                let answers = self.answer_all
+                    || match self.owners.get(&op.key).copied().flatten() {
+                        Some(r) => r == own.rank,
+                        None => own.sampler,
+                    };
+                if !answers {
+                    continue;
                 }
+                let tag = op.key.request_epoch.request_tag;
+                // The shared operator's draft buffer: the next lane's op
+                // overwrites it.
+                self.buffer = self.synth.head[&tag].clone();
+                let token = self
+                    .buffer
+                    .iter()
+                    .copied()
+                    .max_by(|a, b| a.1.total_cmp(&b.1))
+                    .unwrap()
+                    .0;
+                let read = (self.modes[&op.key] == SamplingMode::Leviathan)
+                    .then(|| DraftRead::Candidates(self.buffer.clone()));
+                props.push(DraftProposal {
+                    key: op.key,
+                    token,
+                    keep_going: true,
+                    drop_last: false,
+                    read,
+                });
+            }
+            if !props.is_empty() {
                 res.proposals = Some(props);
             }
             Ok(res)
@@ -2461,8 +2480,10 @@ mod tests {
         assert_eq!(acc.committed, vec![5, 7]);
     }
 
-    /// A follower returning a distribution read is a protocol violation:
-    /// followers neither propose nor draw.
+    /// A rank returning a distribution read for an op it does not answer is a
+    /// protocol violation: an op is answered by its lane's owner (the sampler
+    /// owner for a replicated lane), so followers neither propose nor draw
+    /// for it.
     #[test]
     fn sampled_lane_followers_cannot_propose_or_draw() {
         let arm = arms().remove(1);
@@ -2488,6 +2509,64 @@ mod tests {
         let err = m.step(&arm, &[1]).unwrap_err();
         assert!(matches!(err, ProtocolError::Aborted(_)), "{err:?}");
         assert_eq!(m.root.rng_fingerprint(epoch(1)), before);
+
+        // Split window: rank 1 answers the ops of rank 0's lanes too.
+        let mut m = Mesh::new(MeshKind::Ep, &[1, 2]);
+        assert!(m.root.set_draft_split(true));
+        for t in [1u64, 2] {
+            m.admit(t, &request_cfg(1.0, 1.0, None, 0.0, t), arm.spec_k, true);
+        }
+        m.ranks[1].answer_all = true;
+        let before: Vec<_> = [1u64, 2]
+            .iter()
+            .map(|&t| m.root.rng_fingerprint(epoch(t)))
+            .collect();
+        let err = m.step(&arm, &[1, 2]).unwrap_err();
+        assert!(matches!(err, ProtocolError::Aborted(_)), "{err:?}");
+        let after: Vec<_> = [1u64, 2]
+            .iter()
+            .map(|&t| m.root.rng_fingerprint(epoch(t)))
+            .collect();
+        assert_eq!(before, after);
+    }
+
+    /// The draft split changes who drafts, not what: the root still draws
+    /// every sampled proposal from its staged RNG, so a Leviathan stream with
+    /// owned lanes equals the replicated one token for token.
+    #[test]
+    fn sampled_lane_draft_split_streams_equal_the_replicated_lanes() {
+        let arm = arms().remove(1);
+        let tags = [1u64, 2, 3, 4];
+        let run = |split: bool| {
+            let mut m = Mesh::new(MeshKind::Ep, &tags);
+            if split {
+                assert!(m.root.set_draft_split(true));
+            }
+            for &t in &tags {
+                m.admit(
+                    t,
+                    &request_cfg(1.0, 1.0, None, 0.0, 9000 + t * 7919),
+                    arm.spec_k,
+                    true,
+                );
+            }
+            let mut emitted: HashMap<u64, Vec<u32>> = HashMap::new();
+            for _ in 0..200 {
+                let out = m.step(&arm, &tags).unwrap();
+                for l in &out.lanes {
+                    emitted
+                        .entry(l.key.request_epoch.request_tag)
+                        .or_default()
+                        .extend_from_slice(&l.emitted);
+                }
+            }
+            let fps: Vec<_> = tags
+                .iter()
+                .map(|&t| m.root.rng_fingerprint(epoch(t)).unwrap())
+                .collect();
+            (emitted, fps)
+        };
+        assert_eq!(run(false), run(true));
     }
 
     /// Greedy, naive-root and Leviathan lanes share a step: the greedy lane

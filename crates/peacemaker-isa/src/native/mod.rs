@@ -49,6 +49,7 @@ fn ir_arch(arch: Arch) -> Result<IrArch, String> {
     match arch {
         Arch::Gfx1100 => Ok(IrArch::Gfx1100),
         Arch::Gfx1151 => Ok(IrArch::Gfx1151),
+        Arch::Gfx1200 => Ok(IrArch::Gfx1200),
         Arch::Gfx1201 => Ok(IrArch::Gfx1201),
         Arch::Gfx942 => Err(
             "gfx942 code is emitted by the typed cdna builder, not the RDNA text assembler".into(),

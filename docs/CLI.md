@@ -188,6 +188,15 @@ dequantized weight is exactly a BF16 value. The format is described in
   untouched. `HIPFIRE_QWEN4_HC8=0` is the kill switch: the sidecar is ignored
   and the BF16 weights load bit for bit as without it.
 
+- **Pull.** The client carries one pin, not the registry (the trunk-overlay
+  convention): `qwen3.8-flash-next-base.mq4-xts-symtrunk.hc8` (659649536 B,
+  sha256 `2adf32e5…`) in the `hipfire-models/qwen3.8-flash-next` repo, matched
+  by the base's exact size (70888270360 B) and SHA-256 (`27dfff66…`, the
+  symmetric-trunk base). `hipfire pull <tag>` of an entry whose base matches
+  fetches it next to the base on a host with a gfx1201 GPU or no detected GPU
+  and skips it elsewhere; the stock split base (`eafaff94…`) has no pin.
+  `hipfire rm` removes it with its base.
+
 ### Flash-Next expert hotset
 
 The same four stock Flash-Next MQ4 XTS tags (one base artifact, sha256

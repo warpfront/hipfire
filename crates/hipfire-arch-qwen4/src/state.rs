@@ -30,7 +30,7 @@ use rdna_compute::tensor_ops::{
     CopyRegion, GatedDeltaRollbackLayers, GdnStateFormat, QsaF16ArenaRef, QsaF16ValidLen,
     QsaKvFormat, QsaStateLayout,
 };
-use rdna_compute::{DType, Gpu, GpuTensor};
+use rdna_compute::{DType, Gpu, GpuTensor, MemsetBatch};
 use std::fmt;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -3024,7 +3024,28 @@ impl Qwen4State {
     }
 
     pub fn reset(&mut self, gpu: &mut Gpu) -> Result<(), StateError> {
-        self.reset_inner(gpu, true)
+        self.reset_synced(gpu, true)
+    }
+
+    /// [`Self::reset`] that only enqueues its zero-fills into `batch`: the caller
+    /// owns the one wait ([`Gpu::memset_batch_sync`], also after a failed reset) and
+    /// keeps the state alive until then. A lane admission resets the trunk state, the
+    /// MTP head and the pending hidden under one wait.
+    pub(crate) fn reset_into(
+        &mut self,
+        gpu: &mut Gpu,
+        batch: &mut MemsetBatch,
+    ) -> Result<(), StateError> {
+        self.reset_inner(gpu, true, batch)
+    }
+
+    /// One reset with its own wait: every fill enqueued, then a single stream wait, and
+    /// a wait owed for fills already in flight is paid even when the reset fails.
+    fn reset_synced(&mut self, gpu: &mut Gpu, clear_rows: bool) -> Result<(), StateError> {
+        let mut batch = MemsetBatch::default();
+        let reset = self.reset_inner(gpu, clear_rows, &mut batch);
+        let synced = gpu.memset_batch_sync(&mut batch).map_err(StateError::Hip);
+        reset.and(synced)
     }
 
     /// Cold reset of a side request: every fixed byte and every metadata
@@ -3033,7 +3054,7 @@ impl Qwen4State {
     /// keys) are left untouched, so rows a main conversation wrote stay
     /// byte-exact beneath the side request's writes.
     pub(crate) fn reset_for_side(&mut self, gpu: &mut Gpu) -> Result<(), StateError> {
-        self.reset_inner(gpu, false)
+        self.reset_synced(gpu, false)
     }
 
     /// Per-stream row ends of a side request writing tokens `[0, through)`,
@@ -3048,14 +3069,19 @@ impl Qwen4State {
         rows
     }
 
-    fn reset_inner(&mut self, gpu: &mut Gpu, clear_rows: bool) -> Result<(), StateError> {
+    fn reset_inner(
+        &mut self,
+        gpu: &mut Gpu,
+        clear_rows: bool,
+        batch: &mut MemsetBatch,
+    ) -> Result<(), StateError> {
         self.reset_epoch = self.reset_epoch.wrapping_add(1);
         self.snapshot_arena.invalidate();
         self.reset_gdn_residual(gpu, GdnResidualTransition::Reset)?;
         for layer in &self.gdn {
-            gpu.memset_stream_ordered(&layer.recurrent.buf, 0, layer.recurrent.buf.size())
+            gpu.memset_batched(batch, &layer.recurrent.buf, 0, layer.recurrent.buf.size())
                 .map_err(StateError::Hip)?;
-            gpu.memset_stream_ordered(&layer.conv.buf, 0, layer.conv.buf.size())
+            gpu.memset_batched(batch, &layer.conv.buf, 0, layer.conv.buf.size())
                 .map_err(StateError::Hip)?;
         }
         // VMM context arenas expose only their mapped prefix: nothing past
@@ -3099,9 +3125,11 @@ impl Qwen4State {
                         "Qwen4State::reset",
                     );
                 }
-                gpu.memset_stream_ordered(&tensor.buf, 0, tensor.buf.size())
+                gpu.memset_batched(batch, &tensor.buf, 0, tensor.buf.size())
                     .map_err(StateError::Hip)?;
                 if gpu.flags.qwen4_qsa_extent_check {
+                    // The post-launch check reads the fill's result: wait for it here.
+                    gpu.memset_batch_sync(batch).map_err(StateError::Hip)?;
                     gpu.qsa_extent_post_launch(
                         "qsa_reset_memset",
                         tensor,
@@ -3120,11 +3148,11 @@ impl Qwen4State {
             layer.position = 0;
         }
         if let Some(ple_conv) = &self.ple_conv {
-            gpu.memset_stream_ordered(&ple_conv.buf, 0, ple_conv.buf.size())
+            gpu.memset_batched(batch, &ple_conv.buf, 0, ple_conv.buf.size())
                 .map_err(StateError::Hip)?;
         }
         if let Some(hyper_feedback) = &self.hyper_feedback {
-            gpu.memset_stream_ordered(&hyper_feedback.buf, 0, hyper_feedback.buf.size())
+            gpu.memset_batched(batch, &hyper_feedback.buf, 0, hyper_feedback.buf.size())
                 .map_err(StateError::Hip)?;
         }
         self.ple_history.reset();
@@ -6715,7 +6743,7 @@ mod tests {
 
     /// Source audit (CPU): the Qwen4 QSA arena paths never unmap, release or
     /// reallocate a live VMM owner. `reset_inner` clears in place with
-    /// `memset_stream_ordered` (a VMM owner's buffer is its mapped prefix); growth is one
+    /// `memset_batched` (a VMM owner's buffer is its mapped prefix); growth is one
     /// `grow_vmm_tensor` forward map plus a memset of exactly the new bytes;
     /// hipMemUnmap is not called anywhere in this crate.
     #[test]
@@ -6750,9 +6778,46 @@ mod tests {
             assert!(!reset.contains(token), "reset_inner contains `{token}`");
         }
         assert!(
-            reset.contains(".memset_stream_ordered("),
+            reset.contains(".memset_batched("),
             "reset clears arenas in place"
         );
+        // One lane reset enqueues every fill and waits once: no per-buffer wait between
+        // the fills (the extent check's post-launch wait is the one developer exception).
+        assert!(
+            !reset.contains(".memset_stream_ordered("),
+            "reset_inner must not wait per buffer"
+        );
+        assert_eq!(
+            reset.matches("memset_batch_sync(").count(),
+            1,
+            "reset_inner waits only for the extent post-launch check"
+        );
+        let synced = code(src, "    fn reset_synced(", "\n    }\n");
+        assert_eq!(synced.matches("memset_batch_sync(").count(), 1);
+        // The kill switch (`HIPFIRE_LANE_RESET_BATCH=0`) is today's per-buffer wait.
+        let dispatch = include_str!("../../rdna-compute/src/dispatch.rs");
+        let batched = code(dispatch, "    pub fn memset_batched(", "\n    }\n");
+        assert!(
+            batched.contains("!self.flags.lane_reset_batch")
+                && batched.contains("return self.memset_stream_ordered("),
+            "memset_batched falls back to memset_stream_ordered under the kill switch"
+        );
+        // The whole lane reset (trunk, head, pending hidden) shares one batch.
+        let lane = include_str!("lane.rs");
+        let cell = code(lane, "fn reset_cell_into(", "\n}\n");
+        assert!(cell.contains(".reset_into(gpu, batch)") && !cell.contains("memset"));
+        let spec = code(
+            lane,
+            "    fn reset_into(&mut self, gpu: &mut Gpu, batch",
+            "\n    }\n",
+        );
+        assert!(spec.contains(".memset_batched(") && !spec.contains("memset_stream_ordered"));
+        let admit = code(
+            lane,
+            "                    Some(cell) => {\n                        // Trunk state",
+            "                        Ok(None)",
+        );
+        assert_eq!(admit.matches("memset_batch_sync(").count(), 1);
 
         let ensure = code(src, "    pub fn ensure_mapped_capacity(", "\n    }\n");
         for token in forbidden.into_iter().chain(["memset", "grow_vmm_tensor"]) {

@@ -156,6 +156,12 @@ pub(super) fn run_lane_arm(
     }
 }
 
+/// Whether the output directory holds results of the copy arm: the directory
+/// is then the `ep2` copy-lane cohort ([`lane_suite::EP2_COPY_ARMS`]).
+fn dir_has_copy_arm(names: &[String]) -> bool {
+    names.iter().any(|name| name.starts_with("lane_copy."))
+}
+
 fn dir_file_names(dir: &Path) -> Result<Vec<String>, String> {
     let mut names = Vec::new();
     for entry in fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))? {
@@ -214,7 +220,8 @@ fn promote_whole_arms(
         .map(|(arm, _)| arm)
         .collect();
     let mut created: Vec<PathBuf> = Vec::new();
-    for &arm in lane_suite::cohort_arms(placement.topology, placement.lanes) {
+    let copy = dir_has_copy_arm(&names);
+    for &arm in lane_suite::cohort_arms_with_copy(placement.topology, placement.lanes, copy) {
         if ranged.contains(arm) {
             continue;
         }
@@ -347,7 +354,11 @@ pub(super) fn lane_verdict(
     }
     let trials = settings.trials;
     let model_id = hw_identity::model_identity(model, dir)?;
-    let cohort = lane_suite::cohort_arms(placement.topology, placement.lanes);
+    let cohort = lane_suite::cohort_arms_with_copy(
+        placement.topology,
+        placement.lanes,
+        dir_has_copy_arm(&dir_file_names(dir)?),
+    );
     let mut samples: BTreeMap<&str, Vec<Vec<u32>>> = BTreeMap::new();
     let mut routes: Vec<(&str, &str)> = Vec::new();
     for &arm in cohort {
@@ -384,9 +395,11 @@ pub(super) fn lane_verdict(
         judge_lane_samples(&samples, &evidence, placement, trials, lane_state_format()?)?;
     // The adaptive arm's floor-on route, from its recorded config (the identity
     // check above already compared it with this environment's).
-    let adaptive_config = read_json(&dir.join("lane_adaptive.ids.config.json"))?;
-    if let Some(failure) = lane_suite::adaptive_floor_failure(&adaptive_config) {
-        judged.coverage.push(format!("{failure}\n"));
+    if cohort.contains(&"lane_adaptive") {
+        let adaptive_config = read_json(&dir.join("lane_adaptive.ids.config.json"))?;
+        if let Some(failure) = lane_suite::adaptive_floor_failure(&adaptive_config) {
+            judged.coverage.push(format!("{failure}\n"));
+        }
     }
     // Every arm's resolved draw route is printed; a cohort that ran under
     // different routes is refused.
@@ -437,7 +450,12 @@ fn judge_lane_samples(
     };
     let reference = get(lane_suite::LANE_REFERENCE_ARM)?;
     let reference_lanes = lane_suite::per_lane_rows(reference, placement.lanes)?;
-    for &arm in lane_suite::cohort_arms(placement.topology, placement.lanes) {
+    let cohort = lane_suite::cohort_arms_with_copy(
+        placement.topology,
+        placement.lanes,
+        samples.contains_key("lane_copy"),
+    );
+    for &arm in cohort {
         let arm_evidence = evidence
             .get(arm)
             .ok_or_else(|| format!("no evidence for {arm}"))?;
@@ -932,7 +950,7 @@ mod tests {
         assert_nothing_merged(&dir);
         fs::remove_dir_all(&dir).unwrap();
 
-        // The copy lane has no ep2 cohort: its shard is foreign under ep2.
+        // The copy lane's ep2 cohort is at most EP2_COPY_LANES lanes: its shard is foreign to the 8-lane cohort.
         let dir = scratch("merge-copy");
         write_all(&dir);
         write_shard(&dir, "lane_copy", (0, 4), "ep2", "eafaff94");

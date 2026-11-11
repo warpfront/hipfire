@@ -18,7 +18,10 @@
 //!   lane's own row count; the dispatch interpreter launches consecutive GDN
 //!   and QSA Core steps of several lanes (AR rows and ragged verify windows)
 //!   as one multi-lane launch per kernel (`HIPFIRE_QWEN4_GDN_LANES`,
-//!   `HIPFIRE_QWEN4_GDN_LANES_ROWS`, `HIPFIRE_QWEN4_QSA_LANES`).
+//!   `HIPFIRE_QWEN4_GDN_LANES_ROWS`, `HIPFIRE_QWEN4_QSA_LANES`). A verify lane whose GDN
+//!   in-projection is its own launch over exactly that lane's rows writes the lane's capture
+//!   ring `inputs` in place and its Core skips the projection copy
+//!   (`HIPFIRE_QWEN4_GDN_CAPTURE_DIRECT`).
 //! - **Row-local stages** run either per lane ([`StageShare::PerLane`], the
 //!   singleton's arm by construction) or once over every lane's rows
 //!   ([`StageShare::OnceAllRows`], in groups of at most [`LANE_MAX_ROWS`];
@@ -43,6 +46,14 @@
 //! segment-major (all of a lane's per-lane ops back to back, or all of a row
 //! group's ops), so every lane sees the singleton's operation sequence, and
 //! the step interpreter's fusions apply exactly where the singleton's do.
+//!
+//! The PLE convolution splits the same way: its stateless key / value projections are the
+//! row-local stage [`StageName::PleProject`] (under `HIPFIRE_QWEN4_LANE_PLE_PROJECT`, exact
+//! gfx1201, BF16 weights and a total row count one row-exact launch covers: ONE
+//! `gemv_bf16_xf32_x4_rows_exact` launch each over every lane's rows, written in place into
+//! the lanes' own key / value slices), and only the gate / norm / convolution tail
+//! ([`StageName::PleConv`], `GroupedDepthwiseOp::projected`) runs per lane on the lane's own
+//! convolution state.
 //!
 //! Lane steps run eager HIP (no retained tape) and never touch the resident
 //! `bundle.state` / `bundle.mtp`; QSA arenas must already cover the step
@@ -70,8 +81,10 @@
 //! per layer over every lane's rows on the singleton's own FULL-TABLE route (the
 //! sub-512-row kernels, selected by capping the routing rows of the call at 511, with
 //! real launch extents), so the layer's expert weights are read once instead of once
-//! per lane tile; every other stage runs per lane on the lane's own rows and state
-//! (its launches are the lane tile's by construction). The caller's policy is replaced
+//! per lane tile; the row-local dense stages (embed, PLE rows, HC, the mixer in / out
+//! projections) run once over all rows too (`HIPFIRE_EP_LANE_PREFILL_WAVE_JOINT`, default
+//! on; `0` runs them per lane, each launch the lane tile's by construction) and the
+//! stateful cores run per lane on the lane's own rows and state. The caller's policy is replaced
 //! by the EP wave policy ([`crate::gpu_forward::ep_wave::ep_wave_policy`]). A lane's
 //! committed state and head are byte-equal to its serial tile because every kernel of
 //! the wave's MoE call (router, shared expert, grouped expert GEMMs, combine) computes
@@ -94,9 +107,9 @@
 use crate::bundle::Qwen4Bundle;
 use crate::config::LayerType;
 use crate::gpu_forward::ep_wave::{
-    ep_wave_expected_moe_calls, ep_wave_layer_moe, ep_wave_partial_mask, ep_wave_partial_mask_on,
-    ep_wave_policy, ep_wave_refusal, ep_wave_route, ep_wave_scope_rows, ep_wave_tile_exchange,
-    EpWaveRoute,
+    ep_wave_expected_moe_calls, ep_wave_joint_enabled, ep_wave_joint_for_lanes, ep_wave_layer_moe,
+    ep_wave_partial_mask, ep_wave_policy_for, ep_wave_refusal, ep_wave_route, ep_wave_scope_rows,
+    ep_wave_tile_exchange, EpWaveRoute,
 };
 use crate::gpu_forward::{
     bind_ep_lane_gather, ep_lane, ep_lane_buffer, ep_lane_check_invocations, ep_lane_moe_rows,
@@ -105,7 +118,7 @@ use crate::gpu_forward::{
 use crate::gpu_forward::{
     decode_copy, dense_ref, hyper_read_desc, invalid, layer_desc, matrix_view, ple_desc,
     program_dims, qwen4_ple_rows_f16, router_columns, view, Qwen4ForwardScratchMode,
-    Qwen4GpuForward, Qwen4GpuForwardError, Qwen4GpuForwardScratch, ScratchField,
+    Qwen4GpuForward, Qwen4GpuForwardError, Qwen4GpuForwardScratch, ScratchField, SpViews,
     DECODE_Q8_PER_LAYER, EPSILON,
 };
 use crate::mesh_lane_protocol::pack_classed_row_groups;
@@ -117,11 +130,12 @@ use crate::program::{
 };
 use crate::state::Qwen4State;
 use hipfire_dispatch::context::DispatchCtx;
+use hipfire_dispatch::families::gemv::WeightRef;
 use hipfire_dispatch::pipeline::{
     execute_embedding, execute_validated_steps, execute_validated_steps_with_moe_hooks,
     validate_steps, ClearOp, EmbeddingOp, GatedDeltaNetOp, GroupedDepthwiseOp, HyperReadOp,
     HyperWriteOp, IndexedAttentionMode, IndexedAttentionOp, IndexedAttentionState, MixerPhase,
-    MoeStepHooks, Step,
+    MoeStepHooks, ProjectLadder, ProjectOp, RowGatherOp, Step,
 };
 use hipfire_runtime::external_rows::RowFetch;
 use rdna_compute::prefill_invariant::QWEN4_EXACT_WAVE_ROUTE_ROWS_CAP;
@@ -161,10 +175,16 @@ pub enum StageName {
     Head,
     /// Greedy top-1.
     Argmax,
+    /// PLE key / value projections of every lane's rows, once per step
+    /// (stateless: the grouped gate / norm / convolution tail that consumes
+    /// them is [`StageName::PleConv`], per lane). Placed on its own all-rows
+    /// segment when the BF16 projections run one row-exact launch over every row
+    /// (`HIPFIRE_QWEN4_LANE_PLE_PROJECT`).
+    PleProject,
 }
 
 impl StageName {
-    pub const ALL: [StageName; 15] = [
+    pub const ALL: [StageName; 16] = [
         StageName::Embed,
         StageName::PleRows,
         StageName::HcRead,
@@ -180,6 +200,7 @@ impl StageName {
         StageName::FinalHyper,
         StageName::Head,
         StageName::Argmax,
+        StageName::PleProject,
     ];
 
     pub fn key(self) -> &'static str {
@@ -199,6 +220,7 @@ impl StageName {
             StageName::FinalHyper => "final_hyper",
             StageName::Head => "head",
             StageName::Argmax => "argmax",
+            StageName::PleProject => "ple_project",
         }
     }
 
@@ -271,7 +293,7 @@ pub const LANE_MAX_ROWS: usize = 8;
 /// and argmax — produced the per-lane bytes once over all rows; the stateful
 /// cores stay per lane. S0's chunk-vs-singles mismatch therefore lives in the
 /// multi-row GDN/QSA cores of consecutive positions, which a lane never runs.
-pub const STAGE_SHARE: [(StageName, StageShare); 15] = [
+pub const STAGE_SHARE: [(StageName, StageShare); 16] = [
     (StageName::Embed, StageShare::OnceAllRows),
     (StageName::PleRows, StageShare::OnceAllRows),
     (StageName::HcRead, StageShare::OnceAllRows),
@@ -287,6 +309,7 @@ pub const STAGE_SHARE: [(StageName, StageShare); 15] = [
     (StageName::FinalHyper, StageShare::OnceAllRows),
     (StageName::Head, StageShare::OnceAllRows),
     (StageName::Argmax, StageShare::OnceAllRows),
+    (StageName::PleProject, StageShare::OnceAllRows),
 ];
 
 /// G0 oracle receipt behind [`STAGE_SHARE`] (`fn-batch/S3-RESULT.md`): each
@@ -385,6 +408,35 @@ pub const GFX1201_SINGLE_MQ4XTS_RECEIPT: &str =
 pub const GFX1201_SINGLE_HETERO_MOE_RECEIPT: &str =
     "serve hetero-lanes/moe_mtp+moe_ar 2026-11-10 gfx1201+gfx1151 hetero mq4-xts 3 lanes 3x400 greedy";
 
+/// Byte-oracle receipt behind the gfx1201 PLE key / value projection row-twin proofs
+/// (`PleProject([BF16, BF16])`; PP and EP domains): the lane-wide projection is ONE
+/// `gemv_bf16_xf32_x4_rows_exact` launch over every lane's rows (all-rows arm above eight
+/// rows), each output word bitwise the per-lane incumbent's (CHANGELOG.md:224, the allrows
+/// header): `bf16_allrows_oracle --reread` on the real layer-1 key / value weights, lanes
+/// 2 / 4 / 8 x 2 / 6 rows, incumbent per-lane chunks and the one launch both 0 mismatching
+/// words against the per-row singleton.
+pub const GFX1201_PLE_PROJECT_RECEIPT: &str =
+    "g0 reread/runs/oracle1 j8313 2026-11-06 gfx1201 bf16 ple key/value lanes2-8 rows4-48";
+
+/// G0 oracle receipt behind the gfx942 single-device stock-FP8 row-twin proofs
+/// (`fn_lane_oracle --g0 --controls`, one MI300X, `qwen3.8-flash-next.stock-fp8.hfq`
+/// sha256 `650e7f43…`, contexts 512/2048, 64 steps): the combined production
+/// policy (every row-local stage once over all rows) at k=1/2/4/8 gave every
+/// lane's logits rows, ids and state checkpoints byte-identical to the
+/// singleton, and the negative controls were detected. The per-stage probes did
+/// NOT all agree: sharing HC read, HC write, the GDN in or out projection, or
+/// the MoE alone (the rest per lane) diverged, so this receipt proves the
+/// combined policy only ([`COMBINED_ONLY_RECEIPTS`]). The trunk / head
+/// projections are BF16 on the few-row MFMA entry (`gemm_bf16_mfma_gfx942_rows16`),
+/// the routed experts the FP8 grouped MFMA route ([`LaneExpertRoute::ResidentFp8`]).
+pub const GFX942_STOCK_FP8_RECEIPT: &str =
+    "g0 mi300x/headline/oracle/g0 2026-11-10 gfx942 stock-fp8 single, combined policy only";
+
+/// Receipts that evidence their rows' stages only together (the G0 oracle
+/// passed the combined policy, not every single-stage probe):
+/// [`resolve_with_proofs`] admits all of a receipt's stages or none.
+const COMBINED_ONLY_RECEIPTS: &[&str] = &[GFX942_STOCK_FP8_RECEIPT];
+
 /// Device topology a lane step runs on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum LaneTopology {
@@ -402,6 +454,12 @@ pub enum LaneExpertRoute {
     /// expert), the mq3-xts Flash-Next family.
     ResidentMq3Slab,
     ResidentPacked,
+    /// Stock-FP8 routed experts (`Qwen4TierRecipe::StockFp8`): every owned
+    /// MoE layer's gate_up / down aggregates resident qt=55 `FP8E4M3B128`
+    /// tables (no arena, no host mapping), run by the gfx942 FP8 grouped
+    /// MFMA route (`gemm_fp8b128_moe_grouped_bf16mfma`, fixed ascending K,
+    /// 1..16-row tiles, the same kernels at every row count).
+    ResidentFp8,
     HostMapped,
     CpuDeferred,
     Split,
@@ -439,6 +497,8 @@ pub enum StageRoute {
     Unclassified,
     Embed(DType),
     PleRows(DType),
+    /// PLE key / value projection weight dtypes, in that order.
+    PleProject([DType; 2]),
     /// Hyper-connection read operand dtypes.
     HyperRead([DType; 3]),
     HyperWrite(DType),
@@ -457,7 +517,7 @@ pub enum StageRoute {
 }
 
 /// The route instances a lane owns, indexed by [`StageName::index`].
-pub type LaneStageRoutes = [Vec<StageRoute>; 15];
+pub type LaneStageRoutes = [Vec<StageRoute>; 16];
 
 /// One G0 row-twin proof: on `arch`, over every topology of `domain`, a
 /// shared launch of `stage` over instances of `route` was byte-identical to
@@ -497,11 +557,14 @@ const LANE_SINGLE_ONLY: &[LaneTopology] = &[LaneTopology::Single];
 /// Row-twin proofs, one row per shared stage per arch and topology domain
 /// (gfx1201 carries a PP-only domain, a disjoint EP-only domain whose MoE
 /// row is the packed static-or-balanced expert class, and a single-card
-/// domain whose MoE row is the hetero tier class). A stage is
-/// shared only when every instance a lane owns matches a row of its arch,
-/// stage and topology; any other (arch, topology, route) keeps that stage per
-/// lane until its own G0 run (other cards bind other kernels, e.g. no Q8_0
-/// decode copies on gfx1201).
+/// domain whose MoE row is the hetero tier class; gfx942 a single-device
+/// domain whose rows are the stock-FP8 BF16 trunk and FP8 expert class). A
+/// stage is shared only when every instance a lane owns matches a row of its
+/// arch, stage and topology; any other (arch, topology, route) keeps that
+/// stage per lane until its own G0 run (other cards bind other kernels, e.g.
+/// no Q8_0 decode copies on gfx1201). The gfx1201 single-card domain has no
+/// `PleProject` row: its receipt predates that stage, so the lane-wide PLE
+/// projection stays per lane on one card until its own run.
 ///
 /// The gfx1151 rows are `Any` over every topology on purpose, for
 /// compatibility: the proof predates route classification and was applied to
@@ -921,6 +984,115 @@ pub static LANE_ROW_TWIN_PROOFS: &[RowTwinProof] = &[
         LANE_SINGLE_ONLY,
         GFX1201_SINGLE_HETERO_MOE_RECEIPT,
     ),
+    proof(
+        "gfx1201",
+        StageName::PleProject,
+        StageRoute::PleProject([DType::BF16; 2]),
+        LANE_PP_ONLY,
+        GFX1201_PLE_PROJECT_RECEIPT,
+    ),
+    proof(
+        "gfx1201",
+        StageName::PleProject,
+        StageRoute::PleProject([DType::BF16; 2]),
+        LANE_EP_ONLY,
+        GFX1201_PLE_PROJECT_RECEIPT,
+    ),
+    proof(
+        "gfx942",
+        StageName::Embed,
+        StageRoute::Embed(DType::BF16),
+        LANE_SINGLE_ONLY,
+        GFX942_STOCK_FP8_RECEIPT,
+    ),
+    proof(
+        "gfx942",
+        StageName::PleRows,
+        StageRoute::PleRows(DType::BF16),
+        LANE_SINGLE_ONLY,
+        GFX942_STOCK_FP8_RECEIPT,
+    ),
+    proof(
+        "gfx942",
+        StageName::HcRead,
+        StageRoute::HyperRead([DType::BF16; 3]),
+        LANE_SINGLE_ONLY,
+        GFX942_STOCK_FP8_RECEIPT,
+    ),
+    proof(
+        "gfx942",
+        StageName::HcWrite,
+        StageRoute::HyperWrite(DType::BF16),
+        LANE_SINGLE_ONLY,
+        GFX942_STOCK_FP8_RECEIPT,
+    ),
+    proof(
+        "gfx942",
+        StageName::GdnInProj,
+        StageRoute::GdnIn([DType::BF16; 4]),
+        LANE_SINGLE_ONLY,
+        GFX942_STOCK_FP8_RECEIPT,
+    ),
+    proof(
+        "gfx942",
+        StageName::GdnOutProj,
+        StageRoute::Projection(DType::BF16),
+        LANE_SINGLE_ONLY,
+        GFX942_STOCK_FP8_RECEIPT,
+    ),
+    proof(
+        "gfx942",
+        StageName::QsaInProj,
+        StageRoute::QsaIn([DType::BF16; 4]),
+        LANE_SINGLE_ONLY,
+        GFX942_STOCK_FP8_RECEIPT,
+    ),
+    proof(
+        "gfx942",
+        StageName::QsaOutProj,
+        StageRoute::Projection(DType::BF16),
+        LANE_SINGLE_ONLY,
+        GFX942_STOCK_FP8_RECEIPT,
+    ),
+    proof(
+        "gfx942",
+        StageName::Moe,
+        StageRoute::Moe {
+            experts: LaneExpertRoute::ResidentFp8,
+            dense: [DType::BF16; 5],
+            decode_admitted: false,
+        },
+        LANE_SINGLE_ONLY,
+        GFX942_STOCK_FP8_RECEIPT,
+    ),
+    proof(
+        "gfx942",
+        StageName::FinalHyper,
+        StageRoute::HyperRead([DType::BF16; 3]),
+        LANE_SINGLE_ONLY,
+        GFX942_STOCK_FP8_RECEIPT,
+    ),
+    proof(
+        "gfx942",
+        StageName::Head,
+        StageRoute::Projection(DType::BF16),
+        LANE_SINGLE_ONLY,
+        GFX942_STOCK_FP8_RECEIPT,
+    ),
+    proof(
+        "gfx942",
+        StageName::Argmax,
+        StageRoute::Argmax(DType::F32),
+        LANE_SINGLE_ONLY,
+        GFX942_STOCK_FP8_RECEIPT,
+    ),
+    proof(
+        "gfx942",
+        StageName::PleProject,
+        StageRoute::PleProject([DType::BF16; 2]),
+        LANE_SINGLE_ONLY,
+        GFX942_STOCK_FP8_RECEIPT,
+    ),
 ];
 
 /// A resolved lane policy: the policy, the receipts of the proofs behind
@@ -939,7 +1111,9 @@ pub struct LanePolicyResolution {
 /// non-`Unclassified` route). A stage that owns no instance is admitted
 /// vacuously once such a row exists (a band without that stage must not
 /// demote the rest), and cites no receipt. Stateful stages are always per
-/// lane.
+/// lane. A [`COMBINED_ONLY_RECEIPTS`] receipt admits its stages only
+/// together: when any stage it has a row for (on this arch and topology)
+/// stays per lane, every stage admitted under it goes back per lane.
 fn resolve_with_proofs(
     arch: &str,
     topology: LaneTopology,
@@ -947,8 +1121,8 @@ fn resolve_with_proofs(
     proofs: &[RowTwinProof],
 ) -> LanePolicyResolution {
     let mut policy = LaneStagePolicy::all_per_lane();
-    let mut receipts: Vec<&'static str> = Vec::new();
     let mut per_lane: Vec<(StageName, String)> = Vec::new();
+    let mut admitted: Vec<(StageName, Vec<&'static str>)> = Vec::new();
     for (stage, share) in STAGE_SHARE {
         if stage.stateful() {
             per_lane.push((stage, "stateful".to_string()));
@@ -1005,11 +1179,47 @@ fn resolve_with_proofs(
             Some(reason) => per_lane.push((stage, reason)),
             None => {
                 policy.shares[stage.index()] = share;
-                for receipt in stage_receipts {
-                    if !receipts.contains(&receipt) {
-                        receipts.push(receipt);
-                    }
-                }
+                admitted.push((stage, stage_receipts));
+            }
+        }
+    }
+    for &combined in COMBINED_ONLY_RECEIPTS {
+        let covers = |stage: StageName| {
+            proofs.iter().any(|row| {
+                row.receipt == combined
+                    && row.arch == arch
+                    && row.stage == stage
+                    && row.domain.contains(&topology)
+            })
+        };
+        let Some(missing) = StageName::ALL
+            .into_iter()
+            .find(|&stage| covers(stage) && policy.share(stage) != StageShare::OnceAllRows)
+        else {
+            continue;
+        };
+        for (stage, stage_receipts) in &admitted {
+            if stage_receipts.contains(&combined) || (stage_receipts.is_empty() && covers(*stage)) {
+                policy.shares[stage.index()] = StageShare::PerLane;
+                per_lane.push((
+                    *stage,
+                    format!(
+                        "arch {arch:?} topology {topology:?} stage {}: receipt {combined:?} proves only the combined policy and stage {} stays per lane",
+                        stage.key(),
+                        missing.key()
+                    ),
+                ));
+            }
+        }
+    }
+    let mut receipts: Vec<&'static str> = Vec::new();
+    for (stage, stage_receipts) in &admitted {
+        if policy.share(*stage) != StageShare::OnceAllRows {
+            continue;
+        }
+        for receipt in stage_receipts {
+            if !receipts.contains(receipt) {
+                receipts.push(receipt);
             }
         }
     }
@@ -1023,7 +1233,7 @@ fn resolve_with_proofs(
 /// One share per [`StageName`], indexed in [`StageName::ALL`] order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LaneStagePolicy {
-    shares: [StageShare; 15],
+    shares: [StageShare; 16],
 }
 
 impl LaneStagePolicy {
@@ -1040,7 +1250,7 @@ impl LaneStagePolicy {
     /// The G0-evidenced share table: every row-local stage shared. It is not
     /// route-bound; [`Self::for_bound_routes`] resolves it per stage.
     pub fn production() -> Self {
-        let mut shares = [StageShare::PerLane; 15];
+        let mut shares = [StageShare::PerLane; 16];
         for (stage, share) in STAGE_SHARE {
             shares[stage.index()] = share;
         }
@@ -1049,7 +1259,7 @@ impl LaneStagePolicy {
 
     pub fn all_per_lane() -> Self {
         Self {
-            shares: [StageShare::PerLane; 15],
+            shares: [StageShare::PerLane; 16],
         }
     }
 
@@ -1140,6 +1350,23 @@ pub struct LaneRows<'a> {
     /// The lane verifies in the wide pass (see [`lane_is_wide`]); `false` for AR-only
     /// steps' exact rows and every prefill lane.
     pub wide: bool,
+    /// The lane's request is in the row-exact class (`HIPFIRE_QWEN4_LANE_ROW_EXACT`: opt-in, default off: greedy, or
+    /// with `seeded` also sampled with an explicit seed): an all-rows step carrying it runs under the
+    /// row-exact scope, so its rows are bitwise its <=8-row rows whatever the batch composition.
+    /// `false` for every prefill lane.
+    pub exact: bool,
+}
+
+/// A vocabulary shard of the step's LM head (`HIPFIRE_QWEN4_EP_VOCAB_SHARD`): the rank projects
+/// and scans only the head rows `[base, base + width)`. The step's logits are PACKED
+/// `[rows][width]` in the first `rows * width` elements of [`LaneOutputs::logits`] and the top-1
+/// ids are LOCAL to the shard (`0..width`); the caller adds `base` where it merges.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VocabShardView {
+    /// Global id of the shard's first head row.
+    pub base: usize,
+    /// Head rows in the shard (the logits row width).
+    pub width: usize,
 }
 
 /// The step's outputs; row `r` belongs to the lanes concatenated in order.
@@ -1152,6 +1379,11 @@ pub struct LaneOutputs<'a> {
     /// final HC streams (the trunk output before the final hyper read),
     /// exactly what the singleton's wide-hidden capture writes.
     pub wide_hidden: Option<&'a GpuTensor>,
+    /// The vocabulary shard this rank's head runs ([`VocabShardView`]): `logits` then hold
+    /// `total_rows * width` packed elements and `top1` holds shard-local ids. `None`: the whole
+    /// head, today's layout. Only an AR / verify step of the output band takes a shard (refused
+    /// for prefill waves, recorded or captured steps).
+    pub vocab_shard: Option<VocabShardView>,
 }
 
 /// Which logits a prefill wave writes.
@@ -1210,6 +1442,57 @@ impl<'a> StepOutputs<'a> {
     fn prefill(&self) -> bool {
         matches!(self, Self::Wave(_) | Self::Edge { prefill: true })
     }
+}
+
+/// The head rows `[shard.base, shard.base + shard.width)` of the resident LM head as a
+/// non-owning byte sub-tensor of the same allocation (rows are contiguous, `row_stride` bytes
+/// each). Refuses any head whose allocation is not exactly `m * row_stride` bytes (a padded or
+/// sidecar-carrying layout has no per-row slice) and any slice that is not 256-byte aligned.
+fn lm_head_row_slice(
+    full: &WeightRef<'_>,
+    shard: VocabShardView,
+    vocab: usize,
+) -> Result<GpuTensor, Qwen4GpuForwardError> {
+    let overflow = || invalid("vocabulary shard byte range overflows");
+    if full.m != vocab {
+        return Err(invalid(format!(
+            "vocabulary shard: the LM head has {} rows, the vocabulary is {vocab}",
+            full.m
+        )));
+    }
+    if full.rotation.is_some() || full.awq_scale.is_some() {
+        return Err(invalid(
+            "vocabulary shard: the LM head carries a rotation / scale sidecar",
+        ));
+    }
+    let row_bytes = full.row_stride;
+    let total = full.m.checked_mul(row_bytes).ok_or_else(overflow)?;
+    if row_bytes == 0 || full.buf.buf.size() != total {
+        return Err(invalid(format!(
+            "vocabulary shard: the LM head allocation is {} bytes, {} rows of {row_bytes} bytes \
+             are {total}",
+            full.buf.buf.size(),
+            full.m
+        )));
+    }
+    let offset = shard.base.checked_mul(row_bytes).ok_or_else(overflow)?;
+    let len = shard.width.checked_mul(row_bytes).ok_or_else(overflow)?;
+    if shard
+        .base
+        .checked_add(shard.width)
+        .map_or(true, |end| end > vocab)
+        || offset % 256 != 0
+    {
+        return Err(invalid(format!(
+            "vocabulary shard [{}, +{}) is not a 256-byte aligned slice of the {vocab}-row head",
+            shard.base, shard.width
+        )));
+    }
+    Ok(GpuTensor {
+        buf: full.buf.buf.byte_view(offset, len),
+        shape: vec![len / full.dtype.size().max(1)],
+        dtype: full.dtype,
+    })
 }
 
 /// A contiguous row range of the step: one lane, or a group of lanes a
@@ -1565,7 +1848,9 @@ pub struct AllRowsDecision {
     pub hc_all: bool,
     /// Every other non-MoE once-over-all-rows stage does too ([`all_rows_stages_apply`]).
     pub all_stages: bool,
-    /// The all-rows steps run inside the wide few-row verify scope of `n` rows.
+    /// The all-rows steps run inside the wide few-row verify scope of `n` rows (and the
+    /// row-exact lane scope, `Gpu::lane_row_exact_scope`): the lab
+    /// `HIPFIRE_QWEN4_LANE_ALLROWS_EXACT` flag or any row-exact-class lane in the step.
     pub exact_scope: bool,
     /// Why a step that asked for the all-rows MoE keeps its groups ([`all_rows_moe_refusal`]).
     pub moe_refusal: Option<String>,
@@ -1656,13 +1941,16 @@ impl LaneAllRowsRule {
 
     /// The placement of every all-rows piece of a step: `ar_step` (an AR / verify step, never a
     /// prefill wave or a band edge), the once-over-all-rows `group_rows` of the packed groups
-    /// and whether any lane is wide-class. Pure: the single predicate behind the executor's
+    /// whether any lane is wide-class and whether any lane is row-exact class
+    /// (`any_exact_lane`, which alone turns on `exact_scope` for a step that takes the all-rows
+    /// stages; no other part of the decision reads it). Pure: the single predicate behind the executor's
     /// `hc_all` / `all_stages` / `exact_scope` / `moe_all` and the root's planned exchanges.
     pub fn decide(
         &self,
         ar_step: bool,
         group_rows: &[usize],
         any_wide_lane: bool,
+        any_exact_lane: bool,
     ) -> AllRowsDecision {
         let n: usize = group_rows.iter().sum();
         let hc_all = hc_all_rows_applies(
@@ -1685,7 +1973,7 @@ impl LaneAllRowsRule {
             // `qwen4_bf16_streams(n) == qwen4_bf16_streams(1)`.
             (n >= self.bf16_min_rows) == (1 >= self.bf16_min_rows),
         );
-        let exact_scope = self.exact_flag && all_stages;
+        let exact_scope = (self.exact_flag || any_exact_lane) && all_stages;
         let moe_refusal = if self.moe_flag {
             all_rows_moe_refusal(
                 all_stages,
@@ -1725,7 +2013,7 @@ impl LaneAllRowsRule {
     /// ledger plans `target_exchanges` from this; the executor's `moe_all` is the same
     /// [`Self::decide`].
     pub fn moe_all_rows(&self, group_rows: &[usize], any_wide_lane: bool) -> bool {
-        self.decide(true, group_rows, any_wide_lane).moe_all
+        self.decide(true, group_rows, any_wide_lane, false).moe_all
     }
 }
 
@@ -1758,6 +2046,9 @@ enum Placement {
     /// The routed MoE as one call over every row: the segment after the all-rows one (the
     /// same rows, bound to the descriptions of `n` rows the wide-group MoE binds).
     AllRowsMoe,
+    /// The PLE key / value projections over every row of the step: the PLE project segment
+    /// (rows `[0, n)`), or the groups when the step has none.
+    PleProject,
 }
 
 /// Split one run of consecutive once-over-all-rows operations into pieces of
@@ -1771,6 +2062,7 @@ fn run_pieces(
     all_rows: Option<AllRowsPlan>,
 ) -> Vec<(std::ops::Range<usize>, Placement)> {
     let place = |op: LaneOp, stage: StageName| match (op, all_rows) {
+        (LaneOp::PleProject, _) => Placement::PleProject,
         (_, None) => Placement::Groups,
         (LaneOp::HcRead { .. }, Some(plan)) if plan.hc => Placement::AllRows,
         (LaneOp::HcRead { .. }, Some(_)) => Placement::Groups,
@@ -1799,7 +2091,8 @@ fn run_pieces(
 /// starts at program index `start`, `segs` are the segments its share places
 /// it over (every group, or every lane), `all_rows` is `Some((all-rows segment,
 /// plan))` for a once-over-all-rows run of an all-rows step (the MoE all-rows segment, when
-/// the plan has one, is `all-rows segment + 1`). Every piece is emitted
+/// the plan has one, is `all-rows segment + 1`), `ple_seg` the PLE project segment (every
+/// row of the step) when the step projects PLE once. Every piece is emitted
 /// segment-major over its own segments, pieces in order; without `all_rows` that is the
 /// whole run over `segs` (today's emission).
 fn run_items(
@@ -1807,6 +2100,7 @@ fn run_items(
     run: &[(LaneOp, StageName)],
     segs: std::ops::Range<usize>,
     all_rows: Option<(usize, AllRowsPlan)>,
+    ple_seg: Option<usize>,
 ) -> Vec<(usize, std::ops::Range<usize>)> {
     let mut items = Vec::new();
     for (piece, placement) in run_pieces(run, all_rows.map(|(_, plan)| plan)) {
@@ -1814,6 +2108,10 @@ fn run_items(
         match (placement, all_rows) {
             (Placement::AllRows, Some((seg, _))) => items.push((seg, ops)),
             (Placement::AllRowsMoe, Some((seg, _))) => items.push((seg + 1, ops)),
+            (Placement::PleProject, _) => match ple_seg {
+                Some(seg) => items.push((seg, ops)),
+                None => items.extend(segs.clone().map(|i| (i, ops.clone()))),
+            },
             _ => items.extend(segs.clone().map(|i| (i, ops.clone()))),
         }
     }
@@ -1826,7 +2124,8 @@ fn run_items(
 /// ([`MoeStepHooks::before_step`]), and the scope is `rows` for an all-rows step and the
 /// step's prior value for every other step, so every other stage keeps the routes of its own
 /// (at most [`LANE_MAX_ROWS`]-row) groups. Without `exact` the all-rows steps are the HC
-/// read / write of `rows` rows; with `exact` (`HIPFIRE_QWEN4_LANE_ALLROWS_EXACT`) every step
+/// read / write of `rows` rows; with `exact` (`HIPFIRE_QWEN4_LANE_ALLROWS_EXACT`, or any row-exact-class
+/// lane in the step, `HIPFIRE_QWEN4_LANE_ROW_EXACT`) every step
 /// of `rows` rows is: the GDN / QSA mixer steps (a lane's own rows are at most
 /// [`LANE_MAX_ROWS`] < `rows`, so only the all-rows projections match) and, with `moe`, the
 /// all-rows MoE call.
@@ -2360,6 +2659,9 @@ enum LaneOp {
         layer: usize,
         mlp: bool,
     },
+    /// Every lane's PLE key / value projections in one row-exact launch each, ahead of the
+    /// per-lane [`LaneOp::PleConv`] tails that consume their rows (see [`with_ple_project`]).
+    PleProject,
     PleConv,
     Gdn {
         layer: usize,
@@ -2467,6 +2769,17 @@ fn layer_program(
         policy,
         ple_layer,
     ))
+}
+
+/// Split the PLE conv's key / value projections out of a lane program: a
+/// [`LaneOp::PleProject`] ([`StageName::PleProject`], once over every row) goes right before
+/// the program's [`LaneOp::PleConv`], which then runs only its per-lane gate / norm /
+/// convolution tail (`GroupedDepthwiseOp::projected`) on the rows it projected. A program
+/// without the PLE layer (a band that is not the input band) is unchanged.
+fn with_ple_project(program: &mut Vec<(LaneOp, StageName)>) {
+    if let Some(at) = program.iter().position(|&(op, _)| op == LaneOp::PleConv) {
+        program.insert(at, (LaneOp::PleProject, StageName::PleProject));
+    }
 }
 
 /// QSA lengths a lane's state commits after the step (the singleton's
@@ -2609,6 +2922,8 @@ fn forward_wave_with(
             tokens: lane.tokens,
             kind: LaneRowKind::Prefill,
             wide: false,
+            // A prefill wave never takes the all-rows segment.
+            exact: false,
         })
         .collect();
     let scope = std::mem::replace(&mut gpu.qwen4_scope, true);
@@ -2628,8 +2943,9 @@ fn forward_wave_with(
 
 /// The exact EP prefill wave ([`crate::gpu_forward::ep_wave`] has the design): the lane
 /// step over prefill lanes with the MoE ONCE per layer over every lane's rows on the
-/// singleton's FULL-TABLE route (sub-512 routing kernels), and every other stage per lane
-/// (the caller's `policy` is replaced by [`ep_wave_policy`]). Admission is decided from host
+/// singleton's FULL-TABLE route (sub-512 routing kernels), the dense row-local stages once over
+/// all rows too unless `HIPFIRE_EP_LANE_PREFILL_WAVE_JOINT=0` (every other stage per lane;
+/// the caller's `policy` is replaced by [`ep_wave_policy`]). Admission is decided from host
 /// facts before any launch, on every rank identically; a refusal is an `ep wave refused:`
 /// error and nothing ran.
 fn forward_wave_ep(
@@ -2639,8 +2955,17 @@ fn forward_wave_ep(
     lanes: &mut [LaneRows<'_>],
     out: &StepOutputs<'_>,
 ) -> Result<(), Qwen4GpuForwardError> {
-    let policy = ep_wave_policy();
     let lane_rows: Vec<usize> = lanes.iter().map(|lane| lane.tokens.len()).collect();
+    // Joint dense stages only when every lane has at least the prefill lane WMMA floor of rows
+    // (65 = every lane wider than the few-row window, or the LAB
+    // `HIPFIRE_QWEN4_PREFILL_LWMMA_WAVE_FLOOR`); lanes below it run their row-local stages per lane
+    // (`ep_wave_joint_for_lanes`). A wave is a prefill forward by construction.
+    let floor = gpu.flags.qwen4_prefill_lwmma_floor_knob();
+    let policy = ep_wave_policy_for(ep_wave_joint_for_lanes(
+        ep_wave_joint_enabled(),
+        &lane_rows,
+        floor,
+    ));
     let total: usize = lane_rows.iter().sum();
     let facts = fwd.ep_wave_facts(gpu, &bundle.config, &lane_rows);
     if let Some(why) = ep_wave_refusal(&facts) {
@@ -2655,7 +2980,7 @@ fn forward_wave_ep(
     }
     // The routing scopes are the lanes' own (the widest lane's rows), never the total's.
     let scope_rows = ep_wave_scope_rows(&lane_rows);
-    fwd.ep_wave_run(gpu, total, scope_rows, route, |fwd, gpu| {
+    fwd.ep_wave_run(gpu, total, scope_rows, &lane_rows, route, |fwd, gpu| {
         forward_lanes_scoped(gpu, fwd, bundle, lanes, out, &policy)
     })
 }
@@ -2745,6 +3070,38 @@ fn forward_lanes_scoped(
     let config = &bundle.config;
     let dims = program_dims(config);
     let vocab = config.vocab_size;
+    // The logits row width of the head stage: the vocabulary, or the rank's vocabulary shard
+    // (`LaneOutputs::vocab_shard`, packed `[rows][width]`, shard-local top-1 ids). A shard is
+    // an eager AR / verify step of the output band: a prefill wave, an edge step, a recorded
+    // or captured step refuses it (the exchange around it is host-ordered, never replayed).
+    let vocab_shard = match out {
+        StepOutputs::Ar(out) => out.vocab_shard,
+        StepOutputs::Wave(_) | StepOutputs::Edge { .. } => None,
+    };
+    if let Some(shard) = vocab_shard {
+        if out.prefill() || !band_scope.output {
+            return Err(invalid(
+                "a vocabulary shard is an AR / verify step of the output band",
+            ));
+        }
+        if gpu.replay.is_recording() || gpu.graphs.capture_mode {
+            return Err(invalid(
+                "a vocabulary shard cannot be recorded or captured (its exchange is host-ordered)",
+            ));
+        }
+        if shard.width == 0
+            || shard
+                .base
+                .checked_add(shard.width)
+                .map_or(true, |end| end > vocab)
+        {
+            return Err(invalid(format!(
+                "vocabulary shard [{}, +{}) is outside the {vocab}-row head",
+                shard.base, shard.width
+            )));
+        }
+    }
+    let head_width = vocab_shard.map_or(vocab, |shard| shard.width);
     let rows: Vec<usize> = lanes.iter().map(|lane| lane.tokens.len()).collect();
     let n: usize = rows.iter().sum();
     let prefill = out.prefill();
@@ -2872,9 +3229,9 @@ fn forward_lanes_scoped(
     fwd.scratch.note_forward_rows(n);
     match out {
         StepOutputs::Ar(out) => {
-            if out.logits.dtype != DType::F32 || out.logits.numel() < n * vocab {
+            if out.logits.dtype != DType::F32 || out.logits.numel() < n * head_width {
                 return Err(invalid(
-                    "lane logits must be F32 with total_rows * vocab elements",
+                    "lane logits must be F32 with total_rows * vocab (or shard width) elements",
                 ));
             }
             if out.top1.dtype != DType::Raw || out.top1.buf.size() < n * std::mem::size_of::<i32>()
@@ -3013,7 +3370,11 @@ fn forward_lanes_scoped(
     // verify scope of `n` rows (`HcAllRowsScope`, descriptions and decode copies bound at `n`
     // rows under that scope), so the projections take the row-exact singleton-derived 8-row
     // tiles in one launch instead of the unscoped wide routes. The scope is ours: a scope
-    // already in force no longer refuses the all-rows stages.
+    // already in force no longer refuses the all-rows stages. The same scope turns on for a step
+    // carrying any row-exact-class lane (`LaneRows::exact`, `HIPFIRE_QWEN4_LANE_ROW_EXACT`: greedy
+    // or, with `seeded`, also seeded sampled lanes; default off), and then also sets `Gpu::lane_row_exact_scope` so lane
+    // WMMA, the trunk A8 and the MoE int8 gate/up / down refuse for the step: every lane's rows are bitwise its
+    // <=8-row rows whatever the batch composition.
     let mut rule = LaneAllRowsRule::from_parts(
         gpu,
         ep_gather_cap,
@@ -3029,6 +3390,7 @@ fn forward_lanes_scoped(
         matches!(out, StepOutputs::Ar(_)),
         &group_rows,
         lanes.iter().any(|lane| lane.wide),
+        lanes.iter().any(|lane| lane.exact),
     );
     let (hc_all, all_stages, exact_scope) =
         (decision.hc_all, decision.all_stages, decision.exact_scope);
@@ -3154,6 +3516,54 @@ fn forward_lanes_scoped(
         });
         seg_desc_rows.push(n);
     }
+    // `HIPFIRE_QWEN4_LANE_PLE_PROJECT` (default on, exact gfx1201): the PLE key / value
+    // projections of every lane run ONCE over all `n` rows, on their own all-rows segment (the
+    // lane-wide `PleProject` stage), instead of once per lane. The PLE rows and the key / value
+    // scratch are laid out row after row in lane order (`SegViews`: dedicated fields address
+    // row `begin` at `begin * width`, the compact PLE arena members at a pitch equal to their
+    // width), so a projection over rows `[0, n)` writes every lane's own slice in place and each
+    // lane's tail reads it through its own views. Taken for 2+ lanes of a decode step whose `n`
+    // rows run ONE row-exact BF16 launch (`Gpu::bf16_rows_exact_one_launch`) under a policy that
+    // shares the stage; the weights' dtype and the 1-row-lane PLE batch are checked where the
+    // weights are known (`ple_project`).
+    let ple_seg: Option<usize> = (band_scope.input
+        && !prefill
+        && lanes.len() >= 2
+        && policy.share(StageName::PleProject) == StageShare::OnceAllRows
+        && gpu.flags.qwen4_lane_ple_project_enabled()
+        && (2..=rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS).contains(&n)
+        && gpu.bf16_rows_exact_one_launch(n))
+    .then(|| {
+        all_segs.push(Segment {
+            begin: 0,
+            rows: n,
+            first_lane: 0,
+        });
+        seg_desc_rows.push(seg_desc_rows[lane_segs.len()]);
+        all_segs.len() - 1
+    });
+    if vocab_shard.is_some() {
+        // The packed `[rows][width]` layout holds only if the head stages' segments tile the
+        // step's rows contiguously in order (each segment writes its rows at `begin * width`):
+        // the all-rows segment, the lanes, or the packed groups. Anything else refuses.
+        for stage in [StageName::Head, StageName::Argmax] {
+            let mut next = 0usize;
+            for i in ar_segs(policy.share(stage)) {
+                let seg = &all_segs[i];
+                if seg.begin != next {
+                    return Err(invalid(
+                        "a vocabulary shard needs head segments that tile the step's rows in order",
+                    ));
+                }
+                next += seg.rows;
+            }
+            if next != n {
+                return Err(invalid(
+                    "a vocabulary shard needs head segments that cover every row of the step",
+                ));
+            }
+        }
+    }
 
     // Token ids: one upload for every row, in lane order (the input band
     // embeds them; every other band runs from received HC streams). Outside a
@@ -3222,6 +3632,37 @@ fn forward_lanes_scoped(
         gpu.replay.set_forward_eligible(false);
     }
 
+    // `HIPFIRE_QWEN4_EP_SP_SUB512_WAVE`: a trunk-shard prefill wave of at
+    // least the sub-512 SP floor runs its joint HC reads / writes sequence-parallel, like a wide
+    // singleton chunk (`forward_chunk_scoped`'s `SpViews`): each rank reads / writes its half of the
+    // wave's rows (reduce-scatter write), a row all-gather rejoins `hc_mixed` after every read and
+    // the streams before the PLE conv and the final hyper read. The HC read of the wave and of both
+    // halves is the pinned-split-K prefill lane WMMA entry (the routing-row cap keeps all three
+    // below 512 routing rows), so a row's bytes do not depend on which half carries it.
+    let wave_sp: Option<crate::trunk_route::SpRows> = if ep_wave
+        && matches!(
+            wave_route,
+            Some(EpWaveRoute::Partial | EpWaveRoute::PartialMask)
+        )
+        && group_segs.len() == 1
+        && !bf16_state
+        && policy.share(StageName::HcRead) == StageShare::OnceAllRows
+        && policy.share(StageName::HcWrite) == StageShare::OnceAllRows
+        && crate::trunk_route::sp_wave_rows_in_band(n)
+        && gpu.prefill_lwmma_hc_applies(n / 2)
+        && gpu.prefill_lwmma_hc_applies(n)
+        && !(gpu.replay.is_recording() || gpu.graphs.capture_mode)
+    {
+        crate::trunk_route::sp_rows(n)
+    } else {
+        None
+    };
+    // A step that runs its all-rows segment row-exact also refuses the 9..=64-row arms that are
+    // not bitwise the <=8-row route (lane WMMA, trunk A8, MoE int8 gate/up / down) for its whole execution:
+    // every launch of more than 8 rows here is an all-rows-segment launch. Restored on every exit
+    // path of the closure below (success and error).
+    let row_exact_prior =
+        exact_scope.then(|| std::mem::replace(&mut gpu.lane_row_exact_scope, true));
     let attempt = (|| -> Result<Vec<QsaCommit>, Qwen4GpuForwardError> {
         let scratch = &fwd.scratch;
         let carry = use_carry.then_some(&fwd.lane_carry);
@@ -3230,7 +3671,7 @@ fn forward_lanes_scoped(
             views.push(SegViews::new(
                 scratch,
                 dims,
-                vocab,
+                head_width,
                 ar_out,
                 *seg,
                 ple_head_count * ple_row_width,
@@ -3247,6 +3688,23 @@ fn forward_lanes_scoped(
             .iter()
             .map(|view| view.layer_scratch(scratch))
             .collect();
+        // The own-row HC views of a sequence-parallel wave ([`wave_sp`]): the group segment's
+        // tensors (row 0 of every scratch field) cut at this rank's first row.
+        let sp_views: Option<SpViews> = wave_sp.and_then(|rows| {
+            crate::trunk_route::sp_route()
+                .map(|route| SpViews::new(scratch, route, rows, dims, bf16_state))
+        });
+        if sp_views.is_some() {
+            static NOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !NOTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "  qwen4 EP sequence-parallel prefill wave (HIPFIRE_QWEN4_EP_SP_SUB512_WAVE): the wave's joint HC reads / writes split its rows across the two ranks (reduce-scatter HC write, row all-gather)"
+                );
+            }
+        }
+        // The streams hold only this rank's rows current (an own-row HC write ran since the
+        // last stream gather): the PLE conv and the final hyper read gather them first.
+        let mut sp_streams_partial = false;
         // Under EP: the row gather, the two trunk gather buffers and, per
         // segment, the scratch description whose expanded-row scratch is each
         // buffer (validated before any launch). A prefill wave runs no gather:
@@ -3378,13 +3836,33 @@ fn forward_lanes_scoped(
             false
         };
         // The head descriptions exist on the output band only.
-        let head = if band_scope.output {
-            Some((
-                hyper_read_desc(&bundle.weights, &bundle.weights.root.final_hyper)?,
-                dense_ref(&bundle.weights, &bundle.weights.root.lm_head)?,
-            ))
+        // The vocabulary shard's rows of the resident head ([`LaneOutputs::vocab_shard`]): a byte
+        // sub-tensor of the same allocation, `width` rows long.
+        let lm_full = if band_scope.output {
+            Some(dense_ref(&bundle.weights, &bundle.weights.root.lm_head)?)
         } else {
             None
+        };
+        let lm_slice: Option<GpuTensor> = match (vocab_shard, lm_full.as_ref()) {
+            (Some(shard), Some(full)) => Some(lm_head_row_slice(full, shard, vocab)?),
+            _ => None,
+        };
+        let head = match lm_full {
+            Some(full) => {
+                let lm_head = match lm_slice.as_ref() {
+                    Some(slice) => WeightRef {
+                        buf: slice,
+                        m: head_width,
+                        ..full
+                    },
+                    None => full,
+                };
+                Some((
+                    hyper_read_desc(&bundle.weights, &bundle.weights.root.final_hyper)?,
+                    lm_head,
+                ))
+            }
+            None => None,
         };
         let head_ref = || {
             head.as_ref()
@@ -3471,7 +3949,7 @@ fn forward_lanes_scoped(
             DispatchCtx::new(gpu)
         };
         let band_first = band_scope.band.start;
-        let program = layer_program(bundle, policy, band_scope.input.then_some(ple_layer))?;
+        let mut program = layer_program(bundle, policy, band_scope.input.then_some(ple_layer))?;
         // `HIPFIRE_QWEN4_LANE_PLE_BATCH` (exact gfx1201, default off): AR lane
         // steps of one row per lane run the PLE chain of up to
         // `PLE_LANES_MAX` consecutive lanes as ONE op (key / value projections
@@ -3550,7 +4028,7 @@ fn forward_lanes_scoped(
                 SegViews::new(
                     scratch,
                     dims,
-                    vocab,
+                    head_width,
                     ar_out,
                     Segment {
                         begin: lane_segs[*first].begin,
@@ -3564,8 +4042,36 @@ fn forward_lanes_scoped(
                 )
             })
             .collect::<Result<_, _>>()?;
+        // The lane-wide PLE projection (`ple_seg`) runs when the weights are the BF16 pair the
+        // row-exact one-launch route covers and the 1-row-lane PLE batch took no chunk (it
+        // already runs one projection over its chunk); the program then carries `PleProject`
+        // ahead of the per-lane tails, which skip their own projections. Anything else keeps
+        // today's per-lane chain.
+        let ple_project = ple_seg.is_some()
+            && ple_chunks.is_empty()
+            && !ple_rows_f16
+            && ple_w.as_ref().is_some_and(|ple_w| {
+                ple_w.key.dtype == DType::BF16 && ple_w.value.dtype == DType::BF16
+            });
+        if ple_project {
+            with_ple_project(&mut program);
+        }
         let mut steps: Vec<Step<'_>> = Vec::with_capacity(program.len() * lanes.len() * 2);
         let mut qsa_commits: Vec<QsaCommit> = Vec::new();
+        // `HIPFIRE_QWEN4_GDN_CAPTURE_DIRECT` (exact gfx1201, default on): a verify lane's GDN
+        // qkv in-projection that runs as its own launch over exactly that lane's rows writes the
+        // lane's capture `inputs` in place, and the lane's Core skips the
+        // `copy_d2d(projection -> capture.inputs)` it otherwise issues per layer. The opt-in
+        // `HIPFIRE_QWEN4_GDN_QKV_BF16` lab prefill route decides the qkv storage dtype from the
+        // op's own row capture, which an in-projection op never carries, and a replay recorder
+        // or graph capture launches with the scratch pointers: both keep the copy.
+        let gdn_capture_direct = gpu.flags.qwen4_gdn_capture_direct_enabled()
+            && !gpu.flags.qwen4_gdn_qkv_bf16_enabled()
+            && !(gpu.replay.is_recording() || gpu.graphs.capture_mode);
+        // `(layer, lane)` of every in-projection that wrote its lane's capture directly: the
+        // InProj arm records it, the Core arm of the same layer and lane reads it, so the two
+        // phases cannot disagree (an InProj always precedes its Core in emission order).
+        let mut gdn_direct: Vec<(usize, usize)> = Vec::new();
         let mut ple_split: Option<usize> = None;
         // MoE invocations an EP prefill wave emitted (one exchange each).
         let mut wave_moe_calls = 0usize;
@@ -3598,6 +4104,7 @@ fn forward_lanes_scoped(
                 &program[start..end],
                 segs_for(share),
                 all_rows_plan.filter(|_| share == StageShare::OnceAllRows),
+                ple_seg.filter(|_| ple_project),
             );
             for (i, ops) in items {
                 let (seg, v) = (&all_segs[i], &views[i]);
@@ -3630,10 +4137,29 @@ fn forward_lanes_scoped(
                                 &descs[layer - band_first].attn_hyper.read
                             };
                             let copy = layer * DECODE_Q8_PER_LAYER + if mlp { 2 } else { 0 };
+                            let sp = sp_views.as_ref().filter(|_| i == lane_segs.len());
+                            let (streams, normalized, low, up, mixed, hc_rows) = match sp {
+                                Some(sp) => (
+                                    &sp.streams,
+                                    &sp.normalized,
+                                    &sp.low,
+                                    &sp.up,
+                                    &sp.hc_mixed,
+                                    sp.rows.own.1,
+                                ),
+                                None => (
+                                    &v.streams,
+                                    &v.hc_normalized,
+                                    &v.hc_low,
+                                    &v.hc_up,
+                                    &v.hc_mixed,
+                                    r,
+                                ),
+                            };
                             steps.push(Step::HyperRead(HyperReadOp {
                                 rotation: &scratch.rotation,
                                 state_bf16: bf16_state,
-                                input: &v.streams,
+                                input: streams,
                                 norm_weight: read.norm,
                                 input_mix_down: decode_copy(
                                     &fwd.decode_q8,
@@ -3649,15 +4175,25 @@ fn forward_lanes_scoped(
                                     row_limit,
                                     read.input_mix_up,
                                 ),
-                                normalized: &v.hc_normalized,
-                                low: &v.hc_low,
-                                up: &v.hc_up,
-                                mixed: &v.hc_mixed,
-                                rows: r,
+                                normalized,
+                                low,
+                                up,
+                                mixed,
+                                rows: hc_rows,
                                 branches: dims.hc_count,
                                 hidden: config.hidden_size,
                                 low_rank: dims.hc_lowrank,
                             }));
+                            // Sequence-parallel wave: the mixer and the MoE read every row.
+                            if let Some(sp) = sp {
+                                steps.push(Step::RowGather(RowGatherOp {
+                                    tensor: &scratch.hc_mixed,
+                                    f32_bf16: true,
+                                    row_elems: config.hidden_size,
+                                    rows: n,
+                                    exec: sp.exec,
+                                }));
+                            }
                         }
                         LaneOp::HcWrite { layer, mlp } => {
                             let write = if mlp {
@@ -3665,6 +4201,32 @@ fn forward_lanes_scoped(
                             } else {
                                 &descs[layer - band_first].attn_hyper.write
                             };
+                            let sp = sp_views.as_ref().filter(|_| i == lane_segs.len());
+                            let (streams, normalized, mixed, gates, hc_rows) = match sp {
+                                Some(sp) => (
+                                    &sp.streams,
+                                    &sp.normalized,
+                                    if mlp {
+                                        &sp.ffn_output
+                                    } else {
+                                        &sp.attention_output
+                                    },
+                                    &sp.gates,
+                                    sp.rows.own.1,
+                                ),
+                                None => (
+                                    &v.streams,
+                                    &v.hc_normalized,
+                                    if mlp {
+                                        &v.ffn_output
+                                    } else {
+                                        &v.attention_output
+                                    },
+                                    &v.hc_gates,
+                                    r,
+                                ),
+                            };
+                            sp_streams_partial |= sp.is_some();
                             steps.push(Step::HyperWrite(HyperWriteOp {
                                 ar: if mlp {
                                     crate::trunk_route::ffn_writer()
@@ -3673,26 +4235,59 @@ fn forward_lanes_scoped(
                                 },
                                 rotation: &scratch.rotation,
                                 state_bf16: bf16_state,
-                                input: &v.streams,
+                                input: streams,
                                 norm_weight: write.norm,
                                 block_inject: write.block_inject,
-                                normalized: &v.hc_normalized,
-                                mixed: if mlp {
-                                    &v.ffn_output
-                                } else {
-                                    &v.attention_output
-                                },
-                                gates: &v.hc_gates,
-                                output: &v.streams,
-                                rows: r,
+                                normalized,
+                                mixed,
+                                gates,
+                                output: streams,
+                                rows: hc_rows,
                                 branches: dims.hc_count,
                                 hidden: config.hidden_size,
                             }));
+                        }
+                        LaneOp::PleProject => {
+                            let ple_w = ple_w
+                                .as_ref()
+                                .ok_or_else(|| invalid("PLE weights missing"))?;
+                            if ple_split.is_none() {
+                                ple_split = Some(steps.len());
+                            }
+                            // Key then value, each ONE row-exact launch over this segment's
+                            // rows (`ProjectLadder::TrunkRowExact`: every output row is
+                            // bitwise the per-lane projection's); the PLE rows are converted
+                            // at the split, before these steps run.
+                            for (weight, output) in
+                                [(ple_w.key, &v.ple_key), (ple_w.value, &v.ple_value)]
+                            {
+                                steps.push(Step::Project(ProjectOp {
+                                    weight,
+                                    input: &v.ple_rows,
+                                    output,
+                                    rows: r,
+                                    rotation: Some(&scratch.rotation),
+                                    ladder: ProjectLadder::TrunkRowExact,
+                                    residual: None,
+                                }));
+                            }
                         }
                         LaneOp::PleConv => {
                             let ple_w = ple_w
                                 .as_ref()
                                 .ok_or_else(|| invalid("PLE weights missing"))?;
+                            // Sequence-parallel wave: the PLE conv reads and writes every row of
+                            // the streams (and leaves them current on both ranks).
+                            if let Some(sp) = sp_views.as_ref().filter(|_| sp_streams_partial) {
+                                steps.push(Step::RowGather(RowGatherOp {
+                                    tensor: &scratch.streams,
+                                    f32_bf16: !bf16_state,
+                                    row_elems: dims.wide(),
+                                    rows: n,
+                                    exec: sp.exec,
+                                }));
+                                sp_streams_partial = false;
+                            }
                             if ple_split.is_none() {
                                 ple_split = Some(steps.len());
                             }
@@ -3733,6 +4328,7 @@ fn forward_lanes_scoped(
                                         dilation: config.ple_conv_dilation(),
                                         epsilon: EPSILON,
                                         lane_states: chunk.as_slice(),
+                                        projected: false,
                                     }));
                                 }
                             } else {
@@ -3767,6 +4363,7 @@ fn forward_lanes_scoped(
                                     dilation: config.ple_conv_dilation(),
                                     epsilon: EPSILON,
                                     lane_states: &[],
+                                    projected: ple_project,
                                 }));
                             }
                         }
@@ -3781,6 +4378,24 @@ fn forward_lanes_scoped(
                                 .get(slot)
                                 .ok_or_else(|| invalid("GDN state slot missing"))?;
                             let stateful = matches!(phase, MixerPhase::Whole | MixerPhase::Core);
+                            let capture = state.gdn_row_capture(slot, r);
+                            let mut projection_target = &v.projection;
+                            if let (Some(capture), true) = (capture.as_ref(), gdn_capture_direct) {
+                                let lane = seg.first_lane;
+                                match phase {
+                                    MixerPhase::InProj => {
+                                        let own = lane_segs[lane];
+                                        if own.begin == seg.begin && own.rows == seg.rows {
+                                            gdn_direct.push((layer, lane));
+                                            projection_target = capture.inputs;
+                                        }
+                                    }
+                                    MixerPhase::Core if gdn_direct.contains(&(layer, lane)) => {
+                                        projection_target = capture.inputs;
+                                    }
+                                    _ => {}
+                                }
+                            }
                             steps.push(Step::GatedDeltaNet(GatedDeltaNetOp {
                                 rotation: &scratch.rotation,
                                 qkv: weights.qkv,
@@ -3798,7 +4413,7 @@ fn forward_lanes_scoped(
                                 format: state.gdn_format(),
                                 residual: gdn.ef_residual.as_ref(),
                                 conv_state: &gdn.conv,
-                                projection: &v.projection,
+                                projection: projection_target,
                                 projection2: &v.projection2,
                                 a: &v.gdn_a,
                                 b: &v.gdn_b,
@@ -3818,11 +4433,7 @@ fn forward_lanes_scoped(
                                 value_dim: dims.linear_value_head_dim,
                                 conv_kernel: dims.linear_conv_kernel_dim,
                                 input_width: dims.hidden,
-                                row_capture: if stateful {
-                                    state.gdn_row_capture(slot, r)
-                                } else {
-                                    None
-                                },
+                                row_capture: if stateful { capture } else { None },
                                 zba_fold: fwd.trunk_zba.get(layer).and_then(Option::as_ref),
                                 trunk_a4: fwd.trunk_a4.get(layer).copied().unwrap_or(0),
                                 phase,
@@ -3955,12 +4566,17 @@ fn forward_lanes_scoped(
                                         })?,
                                     );
                                 }
-                                // The Partial wave masks the non-owned tiles like the lanes' own
-                                // partial chunks do (the trunk shard's partial tile mask).
-                                if route == EpWaveRoute::Partial
-                                    && ep_wave_partial_mask_on(fwd.ep.as_ref())
-                                {
-                                    moe.tile_exchange = ep_wave_partial_mask(fwd.ep.as_ref());
+                                // The PartialMask wave masks the non-owned tiles exactly as the
+                                // lanes' own partial chunks do (the trunk shard's partial tile
+                                // mask); the Partial wave's lanes take no mask, nor does it.
+                                if route == EpWaveRoute::PartialMask {
+                                    moe.tile_exchange = Some(
+                                        ep_wave_partial_mask(fwd.ep.as_ref()).ok_or_else(|| {
+                                            invalid(
+                                                "a partial-mask EP wave needs the installed tile route's mask",
+                                            )
+                                        })?,
+                                    );
                                 }
                                 wave_moe_calls += 1;
                             } else if let Some(runtime) =
@@ -4018,6 +4634,16 @@ fn forward_lanes_scoped(
                 }
             }
             start = end;
+        }
+        // Sequence-parallel wave: the final hyper read and the wide-hidden capture read every row.
+        if let Some(sp) = sp_views.as_ref().filter(|_| sp_streams_partial) {
+            steps.push(Step::RowGather(RowGatherOp {
+                tensor: &scratch.streams,
+                f32_bf16: !bf16_state,
+                row_elems: dims.wide(),
+                rows: n,
+                exec: sp.exec,
+            }));
         }
         if ep_lane.is_some() {
             ep_lane_check_invocations(ep_invocations)?;
@@ -4208,6 +4834,18 @@ fn forward_lanes_scoped(
                 ));
             }
         };
+        // Arm the sequence-parallel split for the wave's steps (own-row HC writes take the
+        // reduce-scatter, `RowGather`s use its ranges); disarmed on every exit of this closure.
+        struct SpArm;
+        impl Drop for SpArm {
+            fn drop(&mut self) {
+                crate::trunk_route::sp_end();
+            }
+        }
+        let _sp_arm = sp_views.as_ref().map(|sp| {
+            crate::trunk_route::sp_begin(sp.rows);
+            SpArm
+        });
         execute(gpu, &steps[..split])?;
 
         // PLE rows: wait for the fetch, stage, upload, convert.
@@ -4330,7 +4968,7 @@ fn forward_lanes_scoped(
                 gpu,
                 &lm_head,
                 &hidden,
-                &view(&v.logits, 0, seg.rows * vocab),
+                &view(&v.logits, 0, seg.rows * head_width),
                 seg.rows,
                 seg.rows,
                 Some(&rotation),
@@ -4348,16 +4986,79 @@ fn forward_lanes_scoped(
             argmax_f32(
                 gpu,
                 &ArgmaxF32 {
-                    logits: &view(&v.logits, 0, seg.rows * vocab),
+                    logits: &view(&v.logits, 0, seg.rows * head_width),
                     indices: &v.top1,
                     rows: seg.rows,
-                    vocab,
+                    vocab: head_width,
                 },
             )?;
         }
         // Prefill wave head: per lane, the singleton's own LM-head / argmax
         // forms on the lane's rows (Final: `requested_rows == 1`).
+        // `HIPFIRE_QWEN4_WAVE_HEAD_ONE` (default on, `=0` kills; exact gfx1201): a Final wave of >= 2 lanes gathers
+        // every lane's final row into the first rows of `scratch.hc_mixed` (ascending, so no
+        // source row is overwritten before it is read) and runs ONE all-rows LM head and ONE
+        // argmax over them under the wide few-row scope, instead of one one-row GEMV per lane.
+        let wave_head_one = match out {
+            StepOutputs::Wave(wave)
+                if matches!(wave.head, WaveHead::Final)
+                    && lane_segs.len() >= 2
+                    && gpu.flags.qwen4_wave_head_one_enabled() =>
+            {
+                Some(wave)
+            }
+            _ => None,
+        };
+        if let Some(wave) = wave_head_one {
+            let lanes_n = lane_segs.len();
+            let hidden_n = config.hidden_size;
+            if *crate::lane_exec::LANE_TILE_PHASES {
+                eprintln!("[fn-lane-wave-head] one all-rows LM head launch for {lanes_n} lanes");
+            }
+            for (lane, seg) in lane_segs.iter().enumerate() {
+                let v = &views[lane];
+                let source = view(&v.hc_mixed, (seg.rows - 1) * hidden_n, hidden_n);
+                let destination = view(&scratch.hc_mixed, lane * hidden_n, hidden_n);
+                if seg.begin + seg.rows - 1 != lane {
+                    gpu.copy_d2d(&source, &destination, destination.byte_size())?;
+                }
+            }
+            let (_, lm_head) = head_ref()?;
+            let hidden = view(&scratch.hc_mixed, 0, lanes_n * hidden_n);
+            let rotation = view(&scratch.rotation, 0, lanes_n * hidden_n);
+            let logits = view(wave.logits, 0, lanes_n * vocab);
+            gpu.set_wide_verify_rows(lanes_n);
+            let head = execute_lm_head(
+                gpu,
+                &lm_head,
+                &hidden,
+                &logits,
+                lanes_n,
+                lanes_n,
+                Some(&rotation),
+            );
+            gpu.set_wide_verify_rows(prior_wide);
+            head.map_err(|error| {
+                Qwen4GpuForwardError::Dispatch(format!(
+                    "execute wave one-launch LM head: {error:?}"
+                ))
+            })?;
+            if let Some(top1) = wave.top1 {
+                argmax_f32(
+                    gpu,
+                    &ArgmaxF32 {
+                        logits: &logits,
+                        indices: &view(top1, 0, lanes_n * std::mem::size_of::<i32>()),
+                        rows: lanes_n,
+                        vocab,
+                    },
+                )?;
+            }
+        }
         for (lane, (head_logits, head_top1, requested)) in wave_head.iter().enumerate() {
+            if wave_head_one.is_some() {
+                break;
+            }
             let (seg, v) = (&lane_segs[lane], &views[lane]);
             let (_, lm_head) = head_ref()?;
             let hidden = view(&v.hc_mixed, 0, seg.rows * config.hidden_size);
@@ -4389,6 +5090,9 @@ fn forward_lanes_scoped(
         drop(steps);
         Ok(qsa_commits)
     })();
+    if let Some(prior) = row_exact_prior {
+        gpu.lane_row_exact_scope = prior;
+    }
 
     match attempt {
         Ok(qsa_commits) => {
@@ -4743,6 +5447,34 @@ mod tests {
         routes
     }
 
+    /// The route instances a single-device gfx942 stock-FP8 lane store
+    /// registers, written out from the artifact (BF16 embed, PLE rows and
+    /// projections, hyper-connection, GDN in/out, QSA in/out, router /
+    /// shared experts and head; resident qt=55 routed experts; F32 argmax),
+    /// NOT read from the proof table.
+    fn g942_stock_fp8_routes() -> LaneStageRoutes {
+        let bf16 = DType::BF16;
+        let mut routes = LaneStageRoutes::default();
+        routes[StageName::Embed.index()] = vec![StageRoute::Embed(bf16)];
+        routes[StageName::PleRows.index()] = vec![StageRoute::PleRows(bf16)];
+        routes[StageName::PleProject.index()] = vec![StageRoute::PleProject([bf16; 2])];
+        routes[StageName::HcRead.index()] = vec![StageRoute::HyperRead([bf16; 3])];
+        routes[StageName::HcWrite.index()] = vec![StageRoute::HyperWrite(bf16)];
+        routes[StageName::GdnInProj.index()] = vec![StageRoute::GdnIn([bf16; 4])];
+        routes[StageName::GdnOutProj.index()] = vec![StageRoute::Projection(bf16)];
+        routes[StageName::QsaInProj.index()] = vec![StageRoute::QsaIn([bf16; 4])];
+        routes[StageName::QsaOutProj.index()] = vec![StageRoute::Projection(bf16)];
+        routes[StageName::Moe.index()] = vec![StageRoute::Moe {
+            experts: LaneExpertRoute::ResidentFp8,
+            dense: [bf16; 5],
+            decode_admitted: false,
+        }];
+        routes[StageName::FinalHyper.index()] = vec![StageRoute::HyperRead([bf16; 3])];
+        routes[StageName::Head.index()] = vec![StageRoute::Projection(bf16)];
+        routes[StageName::Argmax.index()] = vec![StageRoute::Argmax(DType::F32)];
+        routes
+    }
+
     /// Stages the resolution places per lane for a reason other than state.
     fn fallback_stages(resolution: &LanePolicyResolution) -> Vec<StageName> {
         resolution
@@ -4787,15 +5519,22 @@ mod tests {
     #[test]
     fn row_twin_table_has_one_row_per_shared_stage_arch_and_domain() {
         let shared = shared_stages();
-        assert_eq!(shared.len(), 12);
+        assert_eq!(shared.len(), 13);
         // gfx1151: one all-topology row per shared stage. gfx1201: one PP row
         // and one EP row per shared stage, plus the second PP MoE row (the
         // mq3 slab class), the two EP Q8F16 QSA overlay rows (qsa_in x4,
         // qsa_out) and the three EP Q8F16 trunk rows (gdn_in x4, gdn_out,
-        // head), and the two EP HC8 rows (hc_read, final_hyper); plus one
-        // single-card row per shared stage (its MoE row the hetero tier class).
-        assert_eq!(LANE_ROW_TWIN_PROOFS.len(), 4 * shared.len() + 1 + 2 + 3 + 2);
-        for arch in ["gfx1151", "gfx1201"] {
+        // head), and the two EP HC8 rows (hc_read, final_hyper). gfx942: one
+        // single-device row per shared stage (the stock-FP8 receipt). gfx1201
+        // single card: one row per shared stage but `ple_project` (its MoE row
+        // the hetero tier class).
+        // `ple_project` (the lane-wide PLE key / value projection) has no gfx1151 row: its flag is
+        // exact-gfx1201-only, so gfx1151 carries one row per shared stage but that one.
+        assert_eq!(
+            LANE_ROW_TWIN_PROOFS.len(),
+            (shared.len() - 1) + 2 * shared.len() + 1 + 2 + 3 + 2 + shared.len() + (shared.len() - 1)
+        );
+        for arch in ["gfx1151", "gfx1201", "gfx942"] {
             for stage in StageName::ALL {
                 for topology in ALL_TOPOLOGIES {
                     let rows: Vec<_> = LANE_ROW_TWIN_PROOFS
@@ -4807,10 +5546,13 @@ mod tests {
                         })
                         .collect();
                     let expected = match (arch, topology) {
-                        ("gfx1151", _) => shared.contains(&stage),
+                        ("gfx1151", _) => shared.contains(&stage) && stage != StageName::PleProject,
                         ("gfx1201", LaneTopology::Pp) => shared.contains(&stage),
                         ("gfx1201", LaneTopology::Ep) => shared.contains(&stage),
-                        ("gfx1201", LaneTopology::Single) => shared.contains(&stage),
+                        ("gfx1201", LaneTopology::Single) => {
+                            shared.contains(&stage) && stage != StageName::PleProject
+                        }
+                        ("gfx942", LaneTopology::Single) => shared.contains(&stage),
                         _ => false,
                     };
                     // The PP MoE stage carries the mq2 and the mq3 slab rows;
@@ -4846,6 +5588,21 @@ mod tests {
                                 assert_eq!(proof.domain, ALL_TOPOLOGIES);
                                 assert_eq!(proof.receipt, GFX1151_LANE_RECEIPT);
                             }
+                            ("gfx942", _) => {
+                                assert_ne!(proof.route, StageRoute::Any);
+                                assert_ne!(proof.route, StageRoute::Unclassified);
+                                assert_eq!(proof.domain, [LaneTopology::Single]);
+                                assert_eq!(proof.receipt, GFX942_STOCK_FP8_RECEIPT);
+                                assert_eq!(
+                                    proof.route
+                                        == StageRoute::Moe {
+                                            experts: LaneExpertRoute::ResidentFp8,
+                                            dense: [DType::BF16; 5],
+                                            decode_admitted: false,
+                                        },
+                                    stage == StageName::Moe
+                                );
+                            }
                             (_, LaneTopology::Pp) => {
                                 assert_ne!(proof.route, StageRoute::Any);
                                 assert_ne!(proof.route, StageRoute::Unclassified);
@@ -4860,6 +5617,12 @@ mod tests {
                                     )
                                 {
                                     assert_eq!(proof.receipt, GFX1201_PP2_MQ3_RECEIPT);
+                                } else if stage == StageName::PleProject {
+                                    assert_eq!(
+                                        proof.route,
+                                        StageRoute::PleProject([DType::BF16; 2])
+                                    );
+                                    assert_eq!(proof.receipt, GFX1201_PLE_PROJECT_RECEIPT);
                                 } else {
                                     assert_eq!(proof.receipt, GFX1201_PP2_MQ2_RECEIPT);
                                 }
@@ -4899,6 +5662,12 @@ mod tests {
                                         }
                                     );
                                 }
+                                if stage == StageName::PleProject {
+                                    assert_eq!(
+                                        proof.route,
+                                        StageRoute::PleProject([DType::BF16; 2])
+                                    );
+                                }
                                 assert_eq!(proof.domain, [LaneTopology::Ep]);
                                 let hc8_row = proof.route
                                     == StageRoute::HyperRead([
@@ -4921,6 +5690,7 @@ mod tests {
                                     ]) | StageRoute::Projection(DType::Q8_0)
                                 );
                                 let want = match (q8_row, stage) {
+                                    (false, StageName::PleProject) => GFX1201_PLE_PROJECT_RECEIPT,
                                     (false, _) if hc8_row => GFX1201_HC8_ROWS_RECEIPT,
                                     (false, _) => GFX1201_EP2_MQ4_RECEIPT,
                                     (true, StageName::QsaInProj | StageName::QsaOutProj) => {
@@ -4939,6 +5709,7 @@ mod tests {
         assert!(GFX1201_EP2_MQ4_RECEIPT.contains("j1570"));
         assert!(GFX1201_EP2_MQ4_RECEIPT.contains("gfx1201 ep2 mq4-xts k1,2,4,8"));
         assert_ne!(GFX1201_EP2_MQ4_RECEIPT, GFX1201_PP2_MQ2_RECEIPT);
+        assert!(GFX1201_PLE_PROJECT_RECEIPT.contains("j8313"));
     }
 
     #[test]
@@ -4965,12 +5736,18 @@ mod tests {
                 (diverse.clone(), true),
             ] {
                 let resolution = LaneStagePolicy::for_bound_routes("gfx1151", topology, &routes);
+                // No gfx1151 row for the PLE project stage (exact-gfx1201 flag): the one stage
+                // that stays per lane there.
                 assert_eq!(
                     resolution.policy,
-                    LaneStagePolicy::production(),
+                    production_without(&[StageName::PleProject]),
                     "{topology:?}"
                 );
-                assert!(fallback_stages(&resolution).is_empty(), "{topology:?}");
+                assert_eq!(
+                    fallback_stages(&resolution),
+                    [StageName::PleProject],
+                    "{topology:?}"
+                );
                 assert_stateful_reasons(&resolution);
                 let expected: &[&str] = if populated {
                     &[GFX1151_LANE_RECEIPT]
@@ -4991,6 +5768,10 @@ mod tests {
         let mut table = table_routes("gfx1201", LaneTopology::Pp);
         assert_eq!(table[StageName::Moe.index()].len(), 2);
         table[StageName::Moe.index()].truncate(1);
+        // The PLE project route has its own test (`ple_project_is_shared_only_for_the_bf16_pair...`):
+        // this fixture carries the artifact header's other stages.
+        assert_eq!(table[StageName::PleProject.index()].len(), 1);
+        table[StageName::PleProject.index()].clear();
         assert_eq!(routes, table);
         assert!(matches!(
             routes[StageName::Moe.index()].as_slice(),
@@ -5016,6 +5797,101 @@ mod tests {
         assert_eq!(empty.policy, LaneStagePolicy::production());
         assert!(empty.receipts.is_empty());
         assert!(fallback_stages(&empty).is_empty());
+    }
+
+    /// The PLE key / value projections' route is the BF16 pair, on gfx1201 PP and EP only: a
+    /// differing, unclassified or foreign instance demotes only `ple_project`, the receipt is
+    /// the j8313 byte-oracle one and comes last, and Single / other arches have no row.
+    #[test]
+    fn ple_project_is_shared_only_for_the_bf16_pair_on_gfx1201_pp_and_ep() {
+        let bf16 = DType::BF16;
+        let pair = StageRoute::PleProject([bf16; 2]);
+        for (topology, base, receipt) in [
+            (LaneTopology::Pp, pp2_mq2_routes(), GFX1201_PP2_MQ2_RECEIPT),
+            (
+                LaneTopology::Ep,
+                ep_production_routes(),
+                GFX1201_EP2_MQ4_RECEIPT,
+            ),
+        ] {
+            let mut routes = base.clone();
+            routes[StageName::PleProject.index()] = vec![pair];
+            let resolution = LaneStagePolicy::for_bound_routes("gfx1201", topology, &routes);
+            assert_eq!(
+                resolution.policy,
+                LaneStagePolicy::production(),
+                "{topology:?}"
+            );
+            assert!(fallback_stages(&resolution).is_empty(), "{topology:?}");
+            assert_eq!(
+                resolution.receipts,
+                [receipt, GFX1201_PLE_PROJECT_RECEIPT],
+                "{topology:?}"
+            );
+            assert_stateful_reasons(&resolution);
+            for bad in [
+                StageRoute::PleProject([bf16, DType::F16]),
+                StageRoute::PleProject([DType::Q8_0; 2]),
+                StageRoute::Unclassified,
+                StageRoute::PleRows(bf16),
+            ] {
+                // One bad instance among proven ones refuses the stage.
+                let mut routes = base.clone();
+                routes[StageName::PleProject.index()] = vec![pair, bad];
+                let resolution = LaneStagePolicy::for_bound_routes("gfx1201", topology, &routes);
+                assert_eq!(
+                    fallback_stages(&resolution),
+                    [StageName::PleProject],
+                    "{topology:?} {bad:?}"
+                );
+                assert_eq!(
+                    resolution.policy,
+                    production_without(&[StageName::PleProject]),
+                    "{topology:?} {bad:?}"
+                );
+                assert!(!resolution.receipts.contains(&GFX1201_PLE_PROJECT_RECEIPT));
+                let reason = reason_of(&resolution, StageName::PleProject);
+                assert!(reason.contains("gfx1201"), "{reason}");
+                assert!(reason.contains(StageName::PleProject.key()), "{reason}");
+            }
+        }
+        // Single and every other arch have no PLE project row: per lane, nothing inherited.
+        let mut routes = pp2_mq2_routes();
+        routes[StageName::PleProject.index()] = vec![pair];
+        for (arch, topology) in [
+            ("gfx1201", LaneTopology::Single),
+            ("gfx1151", LaneTopology::Pp),
+            ("gfx1151", LaneTopology::Ep),
+            ("gfx1100", LaneTopology::Pp),
+        ] {
+            let resolution = LaneStagePolicy::for_bound_routes(arch, topology, &routes);
+            assert_eq!(
+                resolution.policy.share(StageName::PleProject),
+                StageShare::PerLane,
+                "{arch} {topology:?}"
+            );
+            assert!(
+                !resolution.receipts.contains(&GFX1201_PLE_PROJECT_RECEIPT),
+                "{arch} {topology:?}"
+            );
+        }
+        // The stage is stateless (only the conv tail is) and its key parses back.
+        assert!(!StageName::PleProject.stateful());
+        assert!(StageName::PleConv.stateful());
+        assert_eq!(
+            LaneStagePolicy::production().share(StageName::PleConv),
+            StageShare::PerLane
+        );
+        assert_eq!(
+            LaneStagePolicy::production().share(StageName::PleProject),
+            StageShare::OnceAllRows
+        );
+        assert_eq!(
+            LaneStagePolicy::parse("production:ple_project=lane")
+                .unwrap()
+                .share(StageName::PleProject),
+            StageShare::PerLane
+        );
     }
 
     #[test]
@@ -5065,8 +5941,8 @@ mod tests {
     }
 
     /// The route instances the single-card (one R9700) Flash-Next mq4-xts
-    /// lane store registered (oracle placement, D2 on; read from its
-    /// `HIPFIRE_TEMP_LANE_ROUTES` trace, NOT from the proof table).
+    /// lane store registered (oracle placement, D2 on; dumped by a temporary
+    /// trace on the real load, NOT read from the proof table).
     fn single_mq4xts_routes() -> LaneStageRoutes {
         let mq6 = DType::MQ6G256V2;
         let bf16 = DType::BF16;
@@ -5102,7 +5978,11 @@ mod tests {
         }];
         let resolution =
             LaneStagePolicy::for_bound_routes("gfx1201", LaneTopology::Single, &routes);
-        assert_eq!(resolution.policy, LaneStagePolicy::production());
+        // The lane-wide PLE projection has no single-card row: per lane.
+        assert_eq!(
+            resolution.policy,
+            production_without(&[StageName::PleProject])
+        );
         assert_eq!(
             resolution.receipts,
             [
@@ -5110,7 +5990,7 @@ mod tests {
                 GFX1201_SINGLE_HETERO_MOE_RECEIPT
             ]
         );
-        assert!(fallback_stages(&resolution).is_empty());
+        assert_eq!(fallback_stages(&resolution), [StageName::PleProject]);
         // The class is single-card only, and needs its exact dense dtypes.
         for topology in [LaneTopology::Pp, LaneTopology::Ep] {
             let other = LaneStagePolicy::for_bound_routes("gfx1201", topology, &routes);
@@ -5125,7 +6005,10 @@ mod tests {
             decode_admitted: true,
         }];
         let admitted = LaneStagePolicy::for_bound_routes("gfx1201", LaneTopology::Single, &routes);
-        assert_eq!(fallback_stages(&admitted), [StageName::Moe]);
+        assert_eq!(
+            fallback_stages(&admitted),
+            [StageName::Moe, StageName::PleProject]
+        );
     }
 
     #[test]
@@ -5133,10 +6016,16 @@ mod tests {
         let routes = single_mq4xts_routes();
         let resolution =
             LaneStagePolicy::for_bound_routes("gfx1201", LaneTopology::Single, &routes);
-        assert_eq!(resolution.policy, production_without(&[StageName::Moe]));
+        assert_eq!(
+            resolution.policy,
+            production_without(&[StageName::Moe, StageName::PleProject])
+        );
         assert_eq!(resolution.receipts, [GFX1201_SINGLE_MQ4XTS_RECEIPT]);
         assert_stateful_reasons(&resolution);
-        assert_eq!(fallback_stages(&resolution), [StageName::Moe]);
+        assert_eq!(
+            fallback_stages(&resolution),
+            [StageName::Moe, StageName::PleProject]
+        );
         let reason = reason_of(&resolution, StageName::Moe);
         assert!(
             reason.contains("gfx1201") && reason.contains("Single"),
@@ -5154,18 +6043,22 @@ mod tests {
         let mixed = LaneStagePolicy::for_bound_routes("gfx1201", LaneTopology::Single, &mixed);
         assert_eq!(
             fallback_stages(&mixed),
-            [StageName::GdnInProj, StageName::Moe]
+            [StageName::GdnInProj, StageName::Moe, StageName::PleProject]
         );
         assert!(reason_of(&mixed, StageName::GdnInProj).contains("has no row-twin proof"));
 
         // A stage the band never executes (no instance) is shared vacuously
-        // and cites no receipt.
+        // and cites no receipt, where the domain has a row for it at all
+        // (`PleProject` has none on a single card).
         let empty = LaneStagePolicy::for_bound_routes(
             "gfx1201",
             LaneTopology::Single,
             &LaneStageRoutes::default(),
         );
-        assert_eq!(empty.policy, LaneStagePolicy::production());
+        assert_eq!(
+            empty.policy,
+            production_without(&[StageName::PleProject])
+        );
         assert!(empty.receipts.is_empty());
         // An unclassified instance never matches a single-card row.
         let mut unclassified = LaneStageRoutes::default();
@@ -5308,7 +6201,8 @@ mod tests {
                 GFX1201_EP2_MQ4_RECEIPT,
                 GFX1201_HC8_ROWS_RECEIPT,
                 GFX1201_Q8_TRUNK_ROWS_RECEIPT,
-                GFX1201_Q8_QSA_ROWS_RECEIPT
+                GFX1201_Q8_QSA_ROWS_RECEIPT,
+                GFX1201_PLE_PROJECT_RECEIPT
             ]
         );
         let empty = LaneStagePolicy::for_bound_routes(
@@ -5547,7 +6441,10 @@ mod tests {
     fn gfx1201_ep_routes_equal_the_pp_routes_and_each_domain_binds_only_its_topology() {
         let pp = pp2_mq2_routes();
         let ep = ep_production_routes();
-        for stage in shared_stages().into_iter().filter(|s| *s != StageName::Moe) {
+        for stage in shared_stages()
+            .into_iter()
+            .filter(|s| *s != StageName::Moe && *s != StageName::PleProject)
+        {
             // EP reuses the PP row's typed route for every non-MoE stage; a
             // multi-instance EP stage repeats the PP signature.
             let pp_route = pp[stage.index()][0];
@@ -5581,11 +6478,18 @@ mod tests {
 
         // Neither domain's receipt nor MoE class leaks to Single: there the
         // same trunk routes share on the single-card rows' own receipt and the
-        // MoE (no Single row) stays per lane.
+        // MoE (no Single row) and the lane-wide PLE projection (no Single row)
+        // stay per lane.
         for routes in [&ep, &pp] {
             let single = LaneStagePolicy::for_bound_routes("gfx1201", LaneTopology::Single, routes);
-            assert_eq!(fallback_stages(&single), [StageName::Moe]);
-            assert_eq!(single.policy, production_without(&[StageName::Moe]));
+            assert_eq!(
+                fallback_stages(&single),
+                [StageName::Moe, StageName::PleProject]
+            );
+            assert_eq!(
+                single.policy,
+                production_without(&[StageName::Moe, StageName::PleProject])
+            );
             assert_eq!(single.receipts, [GFX1201_SINGLE_MQ4XTS_RECEIPT]);
         }
     }
@@ -5847,8 +6751,88 @@ mod tests {
     }
 
     #[test]
+    fn gfx942_single_stock_fp8_shares_every_row_local_stage() {
+        let resolution = LaneStagePolicy::for_bound_routes(
+            "gfx942",
+            LaneTopology::Single,
+            &g942_stock_fp8_routes(),
+        );
+        assert_eq!(resolution.policy, LaneStagePolicy::production());
+        assert_eq!(resolution.receipts, [GFX942_STOCK_FP8_RECEIPT]);
+        assert_stateful_reasons(&resolution);
+        assert!(fallback_stages(&resolution).is_empty());
+    }
+
+    #[test]
+    fn gfx942_proofs_bind_only_single_device_and_the_fp8_expert_class() {
+        // PP / EP topologies have no gfx942 row: every stage per lane.
+        for topology in [LaneTopology::Pp, LaneTopology::Ep] {
+            let resolution =
+                LaneStagePolicy::for_bound_routes("gfx942", topology, &g942_stock_fp8_routes());
+            assert_eq!(
+                resolution.policy,
+                LaneStagePolicy::all_per_lane(),
+                "{topology:?}"
+            );
+            assert!(resolution.receipts.is_empty());
+        }
+        // Any other expert class (or a decode-admitted K1 route) demotes MoE, and
+        // with it every stage of the combined-only receipt.
+        for moe in [
+            moe_route(LaneExpertRoute::Unclassified, false),
+            moe_route(LaneExpertRoute::HostMapped, false),
+            moe_route(LaneExpertRoute::ResidentPacked, true),
+            moe_route(LaneExpertRoute::ResidentFp8, true),
+        ] {
+            let mut routes = g942_stock_fp8_routes();
+            routes[StageName::Moe.index()] = vec![moe];
+            let resolution =
+                LaneStagePolicy::for_bound_routes("gfx942", LaneTopology::Single, &routes);
+            assert_eq!(
+                resolution.policy,
+                LaneStagePolicy::all_per_lane(),
+                "{moe:?}"
+            );
+            assert!(resolution.receipts.is_empty(), "{moe:?}");
+            assert_eq!(fallback_stages(&resolution)[0], StageName::Moe, "{moe:?}");
+            assert!(reason_of(&resolution, StageName::Head).contains("combined policy"));
+        }
+        // An MQ trunk on gfx942 is not the proven route: nothing is shared.
+        let resolution =
+            LaneStagePolicy::for_bound_routes("gfx942", LaneTopology::Single, &pp2_mq2_routes());
+        assert_eq!(resolution.policy, LaneStagePolicy::all_per_lane());
+        assert!(resolution.receipts.is_empty());
+    }
+
+    #[test]
+    fn combined_only_receipts_admit_all_or_nothing() {
+        // Any one gfx942 stage left unmatched demotes the rest, including a
+        // vacuously admitted stage (no instance of it owned).
+        for missing in shared_stages() {
+            let mut routes = g942_stock_fp8_routes();
+            routes[missing.index()] = vec![StageRoute::Unclassified];
+            let resolution =
+                LaneStagePolicy::for_bound_routes("gfx942", LaneTopology::Single, &routes);
+            assert_eq!(
+                resolution.policy,
+                LaneStagePolicy::all_per_lane(),
+                "{missing:?}"
+            );
+            assert!(resolution.receipts.is_empty());
+            assert_stateful_reasons(&resolution);
+        }
+        let mut routes = g942_stock_fp8_routes();
+        routes[StageName::PleProject.index()].clear();
+        let resolution = LaneStagePolicy::for_bound_routes("gfx942", LaneTopology::Single, &routes);
+        assert_eq!(resolution.policy, LaneStagePolicy::production());
+        routes[StageName::Head.index()] = vec![StageRoute::Projection(DType::Q8_0)];
+        let resolution = LaneStagePolicy::for_bound_routes("gfx942", LaneTopology::Single, &routes);
+        assert_eq!(resolution.policy, LaneStagePolicy::all_per_lane());
+    }
+
+    #[test]
     fn unknown_arch_runs_every_stage_per_lane() {
-        for arch in ["gfx1100", "gfx942", ""] {
+        for arch in ["gfx1100", "gfx90a", ""] {
             for topology in ALL_TOPOLOGIES {
                 for routes in [
                     pp2_mq2_routes(),
@@ -6311,16 +7295,19 @@ mod tests {
         assert_eq!(production.len(), config.num_hidden_layers * 8 + 1);
     }
 
-    /// The EP prefill wave's program: every stage per lane (each mixer stays the
-    /// singleton's whole op on the lane's own rows) except the MoE, which is the
-    /// only op placed once over all rows, one per layer.
+    /// The EP prefill wave's program, both arms. Incumbent (`HIPFIRE_EP_LANE_PREFILL_WAVE_JOINT=0`):
+    /// every stage per lane (each mixer stays the singleton's whole op on the lane's own rows)
+    /// except the MoE, the only op placed once over all rows, one per layer. Joint (default): the
+    /// mixers split into in-proj / core / out-proj phases (the cores stay per lane), the HC
+    /// stages and projections are placed once over all rows, and still exactly one MoE per layer.
     #[test]
     fn ep_wave_program_places_only_the_moe_once() {
-        use crate::gpu_forward::ep_wave::ep_wave_policy;
+        use crate::gpu_forward::ep_wave::ep_wave_policy_for;
         let config = crate::config::compact_test_config();
         let ple_layer = ple_layer_of(&config);
         let single = Qwen4BandScope::single(&config);
-        let policy = ep_wave_policy();
+        // Incumbent arm.
+        let policy = ep_wave_policy_for(false);
         let program = lane_program(
             band_kinds(&config, single.band.clone()),
             &policy,
@@ -6344,6 +7331,47 @@ mod tests {
         assert_eq!(once, config.num_hidden_layers);
         // Six ops per layer (the mixers stay whole) plus the PLE conv.
         assert_eq!(program.len(), config.num_hidden_layers * 6 + 1);
+
+        // Joint arm.
+        let policy = ep_wave_policy_for(true);
+        let program = lane_program(
+            band_kinds(&config, single.band.clone()),
+            &policy,
+            Some(ple_layer),
+        );
+        let (mut moe, mut hc, mut cores, mut projections) = (0usize, 0usize, 0usize, 0usize);
+        for (op, stage) in &program {
+            let share = policy.share(*stage);
+            match op {
+                LaneOp::Moe { .. } => {
+                    assert_eq!(share, StageShare::OnceAllRows);
+                    moe += 1;
+                }
+                LaneOp::HcRead { .. } | LaneOp::HcWrite { .. } => {
+                    assert_eq!(share, StageShare::OnceAllRows, "{op:?}");
+                    hc += 1;
+                }
+                LaneOp::Gdn { phase, .. } | LaneOp::Qsa { phase, .. } => match phase {
+                    MixerPhase::Whole => panic!("a joint mixer splits: {op:?}"),
+                    MixerPhase::Core => {
+                        assert!(share.per_lane(), "{op:?} runs per lane");
+                        cores += 1;
+                    }
+                    MixerPhase::InProj | MixerPhase::OutProj => {
+                        assert_eq!(share, StageShare::OnceAllRows, "{op:?}");
+                        projections += 1;
+                    }
+                },
+                _ => assert!(share.per_lane(), "{op:?} runs per lane"),
+            }
+        }
+        let layers = config.num_hidden_layers;
+        assert_eq!(moe, layers, "one MoE exchange per layer");
+        assert_eq!(hc, layers * 4);
+        assert_eq!(cores, layers);
+        assert_eq!(projections, layers * 2);
+        // Eight ops per layer (the mixer is three) plus the PLE conv.
+        assert_eq!(program.len(), layers * 8 + 1);
     }
 
     fn band_scopes(config: &crate::config::Qwen4Config, counts: &[usize]) -> Vec<Qwen4BandScope> {
@@ -6483,7 +7511,7 @@ mod tests {
                                 assert!(scope.band.contains(&layer));
                                 *op
                             }
-                            LaneOp::PleConv => *op,
+                            LaneOp::PleConv | LaneOp::PleProject => *op,
                         };
                         covered.push((global, *stage));
                     }
@@ -6556,7 +7584,7 @@ mod tests {
             let hc = all_rows
                 .filter(|_| !per_lane)
                 .map(|plan| (lanes + groups, plan));
-            for (seg, ops) in run_items(start, &program[start..end], segs, hc) {
+            for (seg, ops) in run_items(start, &program[start..end], segs, hc, None) {
                 emitted.extend(program[ops].iter().map(|&(op, _)| (seg, op)));
             }
             start = end;
@@ -6595,6 +7623,116 @@ mod tests {
 
     fn is_hc(op: LaneOp) -> bool {
         matches!(op, LaneOp::HcRead { .. } | LaneOp::HcWrite { .. })
+    }
+
+    /// `PleProject` goes right before the program's `PleConv` and nowhere else; a band without
+    /// the PLE layer keeps its program.
+    #[test]
+    fn with_ple_project_precedes_the_ple_conv_and_leaves_other_programs_alone() {
+        let config = crate::config::compact_test_config();
+        let single = Qwen4BandScope::single(&config);
+        let ple_layer = ple_layer_of(&config);
+        for policy in test_policies() {
+            let base = lane_program(
+                band_kinds(&config, single.band.clone()),
+                &policy,
+                Some(ple_layer),
+            );
+            let mut with = base.clone();
+            with_ple_project(&mut with);
+            assert_eq!(with.len(), base.len() + 1);
+            let conv = with
+                .iter()
+                .position(|&(op, _)| op == LaneOp::PleConv)
+                .unwrap();
+            assert_eq!(with[conv - 1], (LaneOp::PleProject, StageName::PleProject));
+            let mut without = with.clone();
+            without.remove(conv - 1);
+            assert_eq!(without, base, "{}", policy.describe());
+            // No PLE layer (a band that is not the input band): unchanged.
+            let band = lane_program(band_kinds(&config, single.band.clone()), &policy, None);
+            let mut same = band.clone();
+            with_ple_project(&mut same);
+            assert_eq!(same, band);
+        }
+    }
+
+    /// The PLE project piece is ONE item on its own segment (every row of the step) right
+    /// before the per-lane conv tails (stage `ple_conv`, still one per lane, in lane order);
+    /// every other `(segment, op)` item is today's emission, with and without the all-rows HC
+    /// segment. Without a PLE segment the piece falls back to the groups.
+    #[test]
+    fn ple_project_is_one_item_on_its_own_segment_ahead_of_the_per_lane_conv_tails() {
+        let config = crate::config::compact_test_config();
+        let single = Qwen4BandScope::single(&config);
+        let ple_layer = ple_layer_of(&config);
+        let policy = LaneStagePolicy::production();
+        assert_eq!(policy.share(StageName::PleProject), StageShare::OnceAllRows);
+        assert_eq!(policy.share(StageName::PleConv), StageShare::PerLane);
+        let base = lane_program(
+            band_kinds(&config, single.band.clone()),
+            &policy,
+            Some(ple_layer),
+        );
+        let mut program = base.clone();
+        with_ple_project(&mut program);
+        for (lanes, groups) in [(2, 1), (8, 4), (8, 8)] {
+            for all_rows in [None, plan([true, true], false), plan([true, true], true)] {
+                // The PLE project segment is appended after the groups and the all-rows one.
+                let ple_seg = lanes + groups + usize::from(all_rows.is_some());
+                let mut emitted: Vec<(usize, LaneOp)> = Vec::new();
+                let mut start = 0;
+                while start < program.len() {
+                    let per_lane = policy.share(program[start].1).per_lane();
+                    let mut end = start + 1;
+                    while end < program.len() && policy.share(program[end].1).per_lane() == per_lane
+                    {
+                        end += 1;
+                    }
+                    let segs = if per_lane {
+                        0..lanes
+                    } else {
+                        lanes..lanes + groups
+                    };
+                    let hc = all_rows
+                        .filter(|_| !per_lane)
+                        .map(|plan| (lanes + groups, plan));
+                    for (seg, ops) in
+                        run_items(start, &program[start..end], segs, hc, Some(ple_seg))
+                    {
+                        emitted.extend(program[ops].iter().map(|&(op, _)| (seg, op)));
+                    }
+                    start = end;
+                }
+                let tag = format!(
+                    "lanes {lanes} groups {groups} all_rows {}",
+                    all_rows.is_some()
+                );
+                let projects: Vec<usize> = (0..emitted.len())
+                    .filter(|&i| emitted[i].1 == LaneOp::PleProject)
+                    .collect();
+                assert_eq!(projects.len(), 1, "{tag}");
+                assert_eq!(emitted[projects[0]].0, ple_seg, "{tag}");
+                let convs: Vec<usize> = (0..emitted.len())
+                    .filter(|&i| emitted[i].1 == LaneOp::PleConv)
+                    .collect();
+                assert_eq!(convs.len(), lanes, "{tag}");
+                for (lane, &at) in convs.iter().enumerate() {
+                    assert_eq!(emitted[at], (lane, LaneOp::PleConv), "{tag}");
+                    assert_eq!(at, projects[0] + 1 + lane, "{tag}");
+                }
+                let mut rest = emitted.clone();
+                rest.remove(projects[0]);
+                assert_eq!(
+                    rest,
+                    program_items(&base, &policy, lanes, groups, all_rows),
+                    "{tag}"
+                );
+            }
+        }
+        let run = [(LaneOp::PleProject, StageName::PleProject)];
+        assert_eq!(run_items(0, &run, 3..5, None, None), [(3, 0..1), (4, 0..1)]);
+        assert_eq!(run_items(0, &run, 3..5, None, Some(9)), [(9, 0..1)]);
     }
 
     #[test]
@@ -6725,23 +7863,31 @@ mod tests {
         );
     }
 
-    /// The exact EP prefill wave keeps every HC stage PER LANE (each lane's HC read / write are
-    /// its singleton tile's launches at the lane's own rows and stream kind; under the trunk
-    /// shard each write is its own all-reduce at the lane's row count): the all-rows HC
-    /// placement of an AR / verify step never reaches it, by the step kind AND by the policy.
+    /// The exact EP prefill wave never takes the AR step's all-rows HC placement. Incumbent arm
+    /// (`HIPFIRE_EP_LANE_PREFILL_WAVE_JOINT=0`): every HC stage is PER LANE (each lane's HC read /
+    /// write are its singleton tile's launches at the lane's own rows and stream kind; under the
+    /// trunk shard each write is its own all-reduce at the lane's row count), refused by the step
+    /// kind AND by the policy. Joint arm (default): the HC stages are one segment over every
+    /// lane's rows by the wave's own policy, and that segment is not the AR step's placement:
+    /// `hc_all_rows_applies` stays refused for the wave's step kind.
     #[test]
     fn the_exact_wave_never_takes_the_all_rows_hc_placement() {
-        use crate::gpu_forward::ep_wave::ep_wave_policy;
-        let wave = ep_wave_policy();
-        assert_eq!(wave.share(StageName::HcRead), StageShare::PerLane);
-        assert_eq!(wave.share(StageName::HcWrite), StageShare::PerLane);
-        // Whatever the step kind, flag and row shapes, the wave policy is never admitted ...
-        for ar_step in [false, true] {
-            for groups in [&[8usize, 8][..], &[8, 8, 8, 8], &[5, 5]] {
-                assert!(!hc_all_rows_applies(
-                    true, ar_step, true, false, groups, &wave
-                ));
+        use crate::gpu_forward::ep_wave::ep_wave_policy_for;
+        let incumbent = ep_wave_policy_for(false);
+        assert_eq!(incumbent.share(StageName::HcRead), StageShare::PerLane);
+        assert_eq!(incumbent.share(StageName::HcWrite), StageShare::PerLane);
+        let joint = ep_wave_policy_for(true);
+        assert_eq!(joint.share(StageName::HcRead), StageShare::OnceAllRows);
+        assert_eq!(joint.share(StageName::HcWrite), StageShare::OnceAllRows);
+        for groups in [&[8usize, 8][..], &[8, 8, 8, 8], &[5, 5]] {
+            // The wave is a prefill step, never an AR step, whichever policy it runs.
+            for wave in [&incumbent, &joint] {
+                assert!(!hc_all_rows_applies(true, false, true, false, groups, wave));
             }
+            // Incumbent: refused by the policy even for an AR step's shape.
+            assert!(!hc_all_rows_applies(
+                true, true, true, false, groups, &incumbent
+            ));
         }
     }
 
@@ -6849,10 +7995,10 @@ mod tests {
         let mut rule = LaneAllRowsRule::never();
         rule.moe_flag = true;
         rule.eager = true;
-        let off = rule.decide(true, &[7, 6, 6], false);
+        let off = rule.decide(true, &[7, 6, 6], false, false);
         assert!(!off.moe_all && !off.hc_all && !off.all_stages);
         rule.hetero_rows = 32;
-        let on = rule.decide(true, &[7, 6, 6], false);
+        let on = rule.decide(true, &[7, 6, 6], false, false);
         assert!(on.moe_all && on.moe_refusal.is_none());
         assert!(!on.hc_all && !on.all_stages && !on.exact_scope);
     }
@@ -7421,7 +8567,7 @@ mod tests {
                         for ar in [true, false] {
                             let (hc_all, all_stages, exact_scope, moe_all) =
                                 blocks_moe_all(rule, ar, &group_rows, any_wide, true);
-                            let got = rule.decide(ar, &group_rows, any_wide);
+                            let got = rule.decide(ar, &group_rows, any_wide, false);
                             let tag = format!("{rule:?} ar={ar} {group_rows:?} wide={any_wide}");
                             assert_eq!(got.hc_all, hc_all, "{tag}");
                             assert_eq!(got.all_stages, all_stages, "{tag}");
@@ -7448,6 +8594,36 @@ mod tests {
         }
     }
 
+    /// A row-exact-class lane in the step turns `exact_scope` on exactly where the all-rows stages
+    /// apply, and changes nothing else (the root's ledger and planned exchanges read the rest).
+    #[test]
+    fn lane_all_rows_rule_any_exact_lane_only_sets_exact_scope() {
+        for rule in [ep_rule(), LaneAllRowsRule::never()] {
+            for groups in [&[8usize, 8][..], &[6; 8], &[4; 4], &[8; 8], &[4]] {
+                for any_wide in [false, true] {
+                    for ar in [true, false] {
+                        let base = rule.decide(ar, groups, any_wide, false);
+                        let exact = rule.decide(ar, groups, any_wide, true);
+                        let tag = format!("{rule:?} ar={ar} {groups:?} wide={any_wide}");
+                        assert_eq!(
+                            exact.exact_scope,
+                            base.all_stages || base.exact_scope,
+                            "{tag}"
+                        );
+                        assert_eq!(exact.exact_scope, exact.all_stages, "{tag}");
+                        assert_eq!(exact.hc_all, base.hc_all, "{tag}");
+                        assert_eq!(exact.all_stages, base.all_stages, "{tag}");
+                        assert_eq!(exact.moe_all, base.moe_all, "{tag}");
+                        assert_eq!(exact.moe_refusal, base.moe_refusal, "{tag}");
+                    }
+                }
+            }
+        }
+        let rule = ep_rule();
+        assert!(rule.decide(true, &[6; 8], false, true).exact_scope);
+        assert!(!rule.decide(true, &[6; 8], false, false).exact_scope);
+    }
+
     /// `qwen4_bf16_streams(n) == qwen4_bf16_streams(1)` as a function of `n` and the load's
     /// threshold: where `n` rows would pick another HC stream storage than the singleton's one
     /// row the all-rows stages (and so the all-rows MoE) refuse.
@@ -7459,8 +8635,8 @@ mod tests {
         // A threshold at or below 48 rows (48 rows stream BF16, one row does not).
         rule.bf16_min_rows = 48;
         assert!(!rule.moe_all_rows(&groups, false));
-        assert!(rule.decide(true, &groups, false).hc_all);
-        assert!(!rule.decide(true, &groups, false).all_stages);
+        assert!(rule.decide(true, &groups, false, false).hc_all);
+        assert!(!rule.decide(true, &groups, false, false).all_stages);
         // Above 48 rows both pick the F32 storage.
         rule.bf16_min_rows = 49;
         assert!(rule.moe_all_rows(&groups, false));
@@ -7477,7 +8653,10 @@ mod tests {
         let never = LaneAllRowsRule::never();
         for groups in [&[8usize, 8][..], &[6; 8], &[4; 4], &[8; 8]] {
             assert!(!never.moe_all_rows(groups, false), "{groups:?}");
-            assert!(never.decide(true, groups, false).moe_refusal.is_none());
+            assert!(never
+                .decide(true, groups, false, false)
+                .moe_refusal
+                .is_none());
         }
         let rule = ep_rule();
         // C1: one lane of four rows (one group); two groups of eight; C8 48 rows.
@@ -7485,12 +8664,12 @@ mod tests {
         assert!(rule.moe_all_rows(&[8, 8], false));
         assert!(rule.moe_all_rows(&[6; 8], false));
         // 64 rows exceed the 48-row gather capacity: the groups stay, with a reason.
-        let refused = rule.decide(true, &[8; 8], false);
+        let refused = rule.decide(true, &[8; 8], false, false);
         assert!(!refused.moe_all);
         assert!(refused.moe_refusal.unwrap().contains("gather capacity"));
         // A wide-class lane keeps its group.
         assert!(!rule.moe_all_rows(&[6; 8], true));
         // A prefill wave / band edge (not an AR step) never takes the segment.
-        assert!(!rule.decide(false, &[6; 8], false).moe_all);
+        assert!(!rule.decide(false, &[6; 8], false, false).moe_all);
     }
 }

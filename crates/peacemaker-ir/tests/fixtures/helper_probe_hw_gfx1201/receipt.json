@@ -1,0 +1,143 @@
+{
+  "gpu_arch": "gfx1201",
+  "gpu_name": "R9700-card-A",
+  "hardware_object": "helper_probe.gfx1201.hsaco",
+  "objects": {
+    "helper_probe.gfx1200.hsaco": "4f1e765699c1707bc0c0e9aa945bf8220d1d97d01953b13c79908c45c2c05731",
+    "helper_probe.gfx1201.hsaco": "156406a21d3efc93d894e848a46130240765167f51ed7e450cf50a135023f876"
+  },
+  "probes": {
+    "probe_atomic": {
+      "deterministic": true,
+      "kind": "Compare",
+      "output_sha256": "2b041fb74eea94b7cdb687c1fa85ef086b28b62d7d8827d7a3aa47c6eecad2d5",
+      "words": 129
+    },
+    "probe_atomic_collide": {
+      "deterministic": false,
+      "kind": "Collide",
+      "output_sha256": "e0856cd71b884220c6585b0205236da2f442b1cb00b8b0c3e6113a3ca00febb2",
+      "words": 65
+    },
+    "probe_atomic_lds": {
+      "deterministic": true,
+      "kind": "Lds",
+      "output_sha256": "4e43f0ebf65aa3318bb96c226ac6f145d4305dd892ed3ff136c8af3ddeff11e5",
+      "words": 128
+    },
+    "probe_call": {
+      "deterministic": true,
+      "kind": "Compare",
+      "output_sha256": "cda808421ccb9e15a9dc13daff2683a76a32a00b718a92c408e5b5641726fa00",
+      "words": 1536
+    },
+    "probe_salu_f32": {
+      "deterministic": true,
+      "kind": "Compare",
+      "output_sha256": "ea95b6c8d0aeb2fb2e78fdd4e68335bffbf302630d3417cce1d313c3f50f37e7",
+      "words": 387504
+    },
+    "probe_scratch": {
+      "deterministic": true,
+      "kind": "Compare",
+      "output_sha256": "f83aa5ec71d3628ee7ee68b022dc4c4bb0e5bdd7de572b5aee85f857ae31cad4",
+      "words": 128
+    },
+    "probe_v_class": {
+      "deterministic": true,
+      "kind": "Valu",
+      "output_sha256": "9cc76d55e18a75526f6c2c8b07a147b68beab6b63ce23c64f2b72457d4665d6c",
+      "words": 17088
+    },
+    "probe_v_cmp": {
+      "deterministic": true,
+      "kind": "Valu",
+      "output_sha256": "be9e55694b0da04915242dc9d182ac4472692b8d0a6aac93124ff01073bc7d19",
+      "words": 34176
+    },
+    "probe_v_cmpx": {
+      "deterministic": true,
+      "kind": "Valu",
+      "output_sha256": "7952749a7dc450be04cb286c57762c3ba91cd8b044d02db5d663c102bffdc86c",
+      "words": 17088
+    },
+    "probe_v_cndmask": {
+      "deterministic": true,
+      "kind": "Valu",
+      "output_sha256": "b4e3a9651ac758f964d09005861ba4913f01025a91d0996af5f9c9b3202c85a8",
+      "words": 136704
+    },
+    "probe_v_cvt": {
+      "deterministic": true,
+      "kind": "Valu",
+      "output_sha256": "c4b023ba0e9084faa846c3730e83c8193c0964955eee1f8d84c3aa4449a76b43",
+      "words": 130304
+    },
+    "probe_v_div": {
+      "deterministic": true,
+      "kind": "Valu",
+      "output_sha256": "480d0d95ab787c2852e9ff2572e606699086b1acd9ebf2b622dad897e8ae2c73",
+      "words": 119040
+    },
+    "probe_v_dual_fmaak": {
+      "deterministic": true,
+      "kind": "Valu",
+      "output_sha256": "48d700c631050b3735a9a0b3490268c6e1016caee33492e365c82f267715437b",
+      "words": 273408
+    },
+    "probe_v_dual_fmamk": {
+      "deterministic": true,
+      "kind": "Valu",
+      "output_sha256": "171e02866b40ef098166fbce7ec6fdf8c1dd3e8c7ad9e68dfe13b5df01aeae71",
+      "words": 273408
+    },
+    "probe_v_dual_sub": {
+      "deterministic": true,
+      "kind": "Valu",
+      "output_sha256": "ef29b9fd1aef9f0147197063df4acd2c26cc6721889e751b9d7ed5e833659868",
+      "words": 34176
+    },
+    "probe_v_exp": {
+      "deterministic": true,
+      "kind": "Valu",
+      "output_sha256": "22eebb2d61762ecd31ed7adcd6636c225bcabd1084e1cd9be8d9b4b38b949ed5",
+      "words": 32576
+    },
+    "probe_v_fma": {
+      "deterministic": true,
+      "kind": "Valu",
+      "output_sha256": "26a754d1584cb2ef7694bc0c4a725150670af2fee676da28c4f49c25d14e94a5",
+      "words": 95232
+    },
+    "probe_v_fmamk": {
+      "deterministic": true,
+      "kind": "Valu",
+      "output_sha256": "521fc20d02b3e09b5d202ecf21013497374ba8ab80718558d1e8ce428e972731",
+      "words": 136704
+    },
+    "probe_v_frexp": {
+      "deterministic": true,
+      "kind": "Valu",
+      "output_sha256": "87ba2402a54452ebbded7fb753c53c2807dee5b1e30901f23a32df513fbd37b8",
+      "words": 65152
+    },
+    "probe_v_ldexp": {
+      "deterministic": true,
+      "kind": "Valu",
+      "output_sha256": "61339592d469a6c9b391f3cf3a9e529eabfa3af51731c155864d6a062d3301ae",
+      "words": 17088
+    },
+    "probe_v_rcp": {
+      "deterministic": true,
+      "kind": "Valu",
+      "output_sha256": "4c13b0715c88df21ad45d149d38e5d656525d9080a1629afab09052dfd557b12",
+      "words": 32576
+    },
+    "probe_v_sub": {
+      "deterministic": true,
+      "kind": "Valu",
+      "output_sha256": "62aa64888245f516ce23ad34c23d030577b5ff13a69d60d83b6e62942c36d7ba",
+      "words": 34176
+    }
+  }
+}

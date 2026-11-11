@@ -131,6 +131,7 @@ op_table!(Vop2Op {
     AddU16,
     SubU16,
     LshlrevB16,
+    AshrrevI16,
     MulLoU16,
 });
 
@@ -145,6 +146,8 @@ op_table!(VopcOp {
     CmpOF32,
     CmpUF32,
     CmpNeqF32,
+    CmpNgtF32,
+    CmpNltF32,
     CmpLtI32,
     CmpEqI32,
     CmpLeI32,
@@ -167,6 +170,8 @@ op_table!(VopcOp {
     CmpxLtF32,
     CmpEqU64,
     CmpNeU64,
+    CmpGtI64,
+    CmpGeI64,
 });
 
 impl Vop1Op {
@@ -225,7 +230,10 @@ impl VopcOp {
     }
     /// Source dword width (2 for the `_u64` compares).
     pub fn src_dwords(self) -> u8 {
-        if matches!(self, Self::CmpEqU64 | Self::CmpNeU64) {
+        if matches!(
+            self,
+            Self::CmpEqU64 | Self::CmpNeU64 | Self::CmpGtI64 | Self::CmpGeI64
+        ) {
             2
         } else {
             1
@@ -545,7 +553,7 @@ impl Vop2Op {
             LitTy::F16
         } else if matches!(
             self,
-            Self::AddU16 | Self::SubU16 | Self::LshlrevB16 | Self::MulLoU16
+            Self::AddU16 | Self::SubU16 | Self::LshlrevB16 | Self::AshrrevI16 | Self::MulLoU16
         ) {
             LitTy::I16
         } else {
@@ -609,6 +617,8 @@ impl VopcOp {
             | Self::CmpOF32
             | Self::CmpUF32
             | Self::CmpNeqF32
+            | Self::CmpNgtF32
+            | Self::CmpNltF32
             | Self::CmpxGtF32
             | Self::CmpxLtF32 => (Mods::Float, Mods::Float),
             _ => (Mods::Int, Mods::Int),
@@ -1038,6 +1048,11 @@ fn dpp_text(d: &Dpp) -> String {
 /// An e32 source: `lit(…)` for a literal llvm would otherwise fold.
 fn e32_text(s: Src, dwords: u8, lit: LitTy) -> String {
     match s {
+        // Integer 64-bit operands use the f64 inline constant spelling, unlike
+        // packed pairs of f32 values, which also occupy two dwords.
+        Src::Float(crate::operand::InlineFloat::InvTwoPi) if lit == LitTy::I64 => {
+            "0.15915494309189532".into()
+        }
         Src::Lit(v) => lit.text(v),
         s => s.fmt(dwords),
     }
@@ -1860,6 +1875,7 @@ impl Vop2Op {
                 Self::AddU16 => 38,
                 Self::SubU16 => 39,
                 Self::LshlrevB16 => 42,
+                Self::AshrrevI16 => 44,
                 Self::MulLoU16 => 41,
             }),
         }
@@ -1907,6 +1923,7 @@ impl Vop2Op {
             Self::AddU16 => "v_add_u16",
             Self::SubU16 => "v_sub_u16",
             Self::LshlrevB16 => "v_lshlrev_b16",
+            Self::AshrrevI16 => "v_ashrrev_i16",
             Self::MulLoU16 => "v_mul_lo_u16",
         }
     }
@@ -1929,7 +1946,9 @@ impl VopcOp {
                 Self::CmpGeF32 => 70,
                 Self::CmpOF32 => 71,
                 Self::CmpUF32 => 72,
+                Self::CmpNgtF32 => 75,
                 Self::CmpNeqF32 => 77,
+                Self::CmpNltF32 => 78,
                 Self::CmpLtI32 => 193,
                 Self::CmpEqI32 => 194,
                 Self::CmpLeI32 => 195,
@@ -1952,6 +1971,8 @@ impl VopcOp {
                 Self::CmpxLtF32 => 81,
                 Self::CmpEqU64 => 234,
                 Self::CmpNeU64 => 237,
+                Self::CmpGtI64 => 228,
+                Self::CmpGeI64 => 230,
             }),
         }
     }
@@ -1967,6 +1988,8 @@ impl VopcOp {
             Self::CmpGeF32 => "v_cmp_ge_f32",
             Self::CmpOF32 => "v_cmp_o_f32",
             Self::CmpUF32 => "v_cmp_u_f32",
+            Self::CmpNgtF32 => "v_cmp_ngt_f32",
+            Self::CmpNltF32 => "v_cmp_nlt_f32",
             Self::CmpNeqF32 => "v_cmp_neq_f32",
             Self::CmpLtI32 => "v_cmp_lt_i32",
             Self::CmpEqI32 => "v_cmp_eq_i32",
@@ -1990,6 +2013,139 @@ impl VopcOp {
             Self::CmpxLtF32 => "v_cmpx_lt_f32",
             Self::CmpEqU64 => "v_cmp_eq_u64",
             Self::CmpNeU64 => "v_cmp_ne_u64",
+            Self::CmpGtI64 => "v_cmp_gt_i64",
+            Self::CmpGeI64 => "v_cmp_ge_i64",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// VOP2 with a mandatory literal: v_fmamk_f32 / v_fmaak_f32 (§13.3.1 p.522;
+// opcodes 23 / 24 on gfx942, checked against `llvm-mc -mcpu=gfx942`).
+//
+// The K operand is the trailing literal dword and SRC0 is an ordinary
+// operand. llvm rejects any SGPR/VCC/EXEC/M0/TTMP src0 (the literal already
+// occupies the constant bus), a second literal, an AGPR src0, DPP, SDWA,
+// clamp and omod; src1 and vdst are VGPRs.
+
+op_table!(Vop2KOp { FmamkF32, FmaakF32 });
+
+impl Vop2KOp {
+    /// VOP2 opcode field on `arch`.
+    pub fn opcode(self, arch: Arch) -> Option<u8> {
+        match arch {
+            Arch::Gfx942 => Some(match self {
+                Self::FmamkF32 => 23,
+                Self::FmaakF32 => 24,
+            }),
+        }
+    }
+    pub fn from_opcode(arch: Arch, opcode: u8) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|o| o.opcode(arch) == Some(opcode))
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::FmamkF32 => "v_fmamk_f32",
+            Self::FmaakF32 => "v_fmaak_f32",
+        }
+    }
+}
+
+/// `v_fmamk_f32`: `vdst = fma(src0, literal, src1)`; `v_fmaak_f32`:
+/// `vdst = fma(src0, src1, literal)`. `src0` is a VGPR or inline constant,
+/// `src1` a VGPR; `literal` is the trailing dword (a fused f32 multiply-add).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Vop2K {
+    pub op: Vop2KOp,
+    pub vdst: Src,
+    pub src0: Src,
+    pub src1: Src,
+    pub literal: u32,
+}
+
+impl Vop2K {
+    fn words(&self, arch: Arch) -> Result<[u32; 2]> {
+        let name = self.op.name();
+        let opcode = self
+            .op
+            .opcode(arch)
+            .ok_or_else(|| format!("{name} does not exist on {arch}"))?;
+        let vdst = vgpr(name, "vdst", self.vdst, 1)?;
+        let src1 = vgpr(name, "src1 (VSRC1)", self.src1, 1)?;
+        match self.src0 {
+            Src::Vgpr(_) | Src::Int(_) | Src::Float(_) => {}
+            other => {
+                return Err(format!(
+                    "{name}: src0 must be a VGPR or an inline constant (the literal dword occupies the constant bus), got {other:?}"
+                ))
+            }
+        }
+        let src0 = u32::from(self.src0.code());
+        Ok([
+            u32::from(opcode) << 25 | vdst << 17 | src1 << 9 | src0,
+            self.literal,
+        ])
+    }
+
+    /// Append the instruction's two dwords.
+    pub fn encode(&self, arch: Arch, out: &mut Vec<u32>) -> Result<()> {
+        out.extend_from_slice(&self.words(arch)?);
+        Ok(())
+    }
+
+    /// Decode the VOP2 mandatory-literal instruction at `words[0]`.
+    pub fn decode(arch: Arch, words: &[u32]) -> Result<(Self, usize)> {
+        let w = *words
+            .first()
+            .ok_or("VOP2 decode past the end of the code")?;
+        if w >> 31 != 0 || w >> 25 >= 0b011_1110 {
+            return Err(format!("{w:#010x} is not a VOP2 encoding"));
+        }
+        let opcode = (w >> 25) as u8;
+        let op = Vop2KOp::from_opcode(arch, opcode).ok_or_else(|| {
+            format!("VOP2 opcode {opcode} is not a mandatory-literal FMA on {arch}")
+        })?;
+        let name = op.name();
+        let inst = Vop2K {
+            op,
+            vdst: Src::Vgpr((w >> 17 & 0xff) as u8),
+            src0: Src::from_code((w & 0x1ff) as u16, None)?,
+            src1: Src::Vgpr((w >> 9 & 0xff) as u8),
+            literal: second(words, name)?,
+        };
+        let enc = inst.words(arch)?;
+        if words.get(..2) != Some(&enc[..]) {
+            return Err(format!(
+                "{name}: non-canonical encoding {:#010x?} (canonical {:#010x?})",
+                &words[..2.min(words.len())],
+                enc
+            ));
+        }
+        Ok((inst, 2))
+    }
+
+    /// EXEC, src0, src1, vdst written (not read: the addend is src1/literal).
+    pub fn footprint(&self) -> Footprint {
+        let mut f = Footprint::default();
+        f.read_file(RegFile::Exec, 0, 2);
+        f.read(self.src0, 1);
+        f.read(self.src1, 1);
+        f.write(self.vdst, 1);
+        f
+    }
+}
+
+impl fmt::Display for Vop2K {
+    /// `llvm-objdump --mcpu=gfx942` text: the literal prints as hex.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (vdst, src0, src1) = (self.vdst.fmt(1), self.src0.fmt(1), self.src1.fmt(1));
+        let k = self.literal;
+        match self.op {
+            Vop2KOp::FmamkF32 => write!(f, "{} {vdst}, {src0}, {k:#x}, {src1}", self.op.name()),
+            Vop2KOp::FmaakF32 => write!(f, "{} {vdst}, {src0}, {src1}, {k:#x}", self.op.name()),
         }
     }
 }

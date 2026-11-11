@@ -4315,6 +4315,61 @@ pub(crate) struct Qwen4BalancedPlan {
     pub(crate) slot_owner: GpuTensor,
 }
 
+/// One EP rank's owner-mask state of the wide-verify int8 chain (`HIPFIRE_QWEN4_MOE_GU_A8`, default; the
+/// trunk shard's 9..=64-row decode / verify MoE): both buffers are built once at
+/// [`Qwen4GpuForward::attach_ep`], never per step, and owned by [`Qwen4ForwardEp`] (the row-gather
+/// hook holds non-owning views, [`Qwen4GpuForward::ep_decode_owner_mask_views`]).
+pub(crate) struct Qwen4DecodeOwnerMask {
+    /// Owner rank of every expert, `i32` each: the sealed ownership (exactly `e % ranks`, the rule the
+    /// compact decode table's real-versus-dummy entries follow), read by the tile mask AND the
+    /// combine's owner mask.
+    owner_table: GpuTensor,
+    /// The masked tile ids the chain's two A8 GEMMs read, `i32` per tile of a 64-row call's padded
+    /// grouped capacity ([`ep_decode_mask_tiles`]); never aliases `expert_tile_ids`.
+    tile_ids_owned: GpuTensor,
+}
+
+/// Tiles of the wide-verify chain's masked id scratch: the padded grouped tile capacity of the
+/// widest call the chain serves (`WIDE_VERIFY_MAX_ROWS` rows at top-`k_top` of `n_experts`), the
+/// same bound the grouped scratch is sized by ([`crate::program::grouped_m_total_bound`]).
+fn ep_decode_mask_tiles(k_top: usize, n_experts: usize) -> Result<usize, Qwen4GpuForwardError> {
+    let slots = rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS
+        .checked_mul(k_top)
+        .ok_or_else(|| invalid("EP decode owner mask slot count overflows"))?;
+    let rows = crate::program::grouped_m_total_bound(slots, n_experts)
+        .map_err(|error| invalid(error.to_string()))?;
+    Ok(rows / hipfire_dispatch::families::moe::MOE_GROUPED_BLOCK_M)
+}
+
+impl Qwen4DecodeOwnerMask {
+    fn alloc(gpu: &mut Gpu, owners: &[usize], tiles: usize) -> Result<Self, Qwen4GpuForwardError> {
+        let owners = tile_owner_table_bytes(owners);
+        let owner_table = gpu.upload_raw(&owners, &[owners.len()])?;
+        let sentinels = vec![0xFFu8; tiles * std::mem::size_of::<i32>()];
+        let tile_ids_owned = match gpu.upload_raw(&sentinels, &[sentinels.len()]) {
+            Ok(tensor) => tensor,
+            Err(error) => {
+                let _ = gpu.free_tensor(owner_table);
+                return Err(error.into());
+            }
+        };
+        Ok(Self {
+            owner_table,
+            tile_ids_owned,
+        })
+    }
+
+    fn free_gpu(self, gpu: &mut Gpu) -> Option<hip_bridge::HipError> {
+        let mut first = None;
+        for tensor in [self.owner_table, self.tile_ids_owned] {
+            if let Err(error) = gpu.free_tensor(tensor) {
+                first.get_or_insert(error);
+            }
+        }
+        first
+    }
+}
+
 /// Expert-parallel state of one rank's forward (present iff the bundle's
 /// weights carry an EP placement).
 pub(crate) struct Qwen4ForwardEp {
@@ -4344,6 +4399,10 @@ pub(crate) struct Qwen4ForwardEp {
     /// Owner-routed chunk MoE state (`HIPFIRE_EP_OWNER_ROUTED_PREFILL=1`, admitted at
     /// construction); `None` when the lever is off or refused.
     tile: Option<Qwen4TileRoute>,
+    /// The wide-verify int8 chain's owner mask (`HIPFIRE_QWEN4_MOE_GU_A8` default, trunk shard):
+    /// built at [`Qwen4GpuForward::attach_ep`], `None` when the chain is off or unmasked
+    /// (`HIPFIRE_QWEN4_MOE_GU_A8=0` / `2`), off the trunk shard, or before attach.
+    decode_mask: Option<Qwen4DecodeOwnerMask>,
 }
 
 impl Qwen4ForwardEp {
@@ -4391,6 +4450,7 @@ impl Qwen4ForwardEp {
             balanced: Vec::new(),
             slot_owner: None,
             tile: None,
+            decode_mask: None,
         };
         // The zero fills are stream-ordered; peers read the buffers over P2P
         // on their own streams.
@@ -4425,6 +4485,11 @@ impl Qwen4ForwardEp {
         }
         if let Some(tensor) = self.slot_owner {
             if let Err(error) = gpu.free_tensor(tensor) {
+                first.get_or_insert(error);
+            }
+        }
+        if let Some(mask) = self.decode_mask {
+            if let Some(error) = mask.free_gpu(gpu) {
                 first.get_or_insert(error);
             }
         }
@@ -4817,8 +4882,37 @@ impl Qwen4MoeLayerRuntime {
         peers_for_layer: &[Qwen4PeerLayerSource],
         seal: &Qwen4EpRankSeal,
     ) -> Result<Self, Qwen4GpuForwardError> {
+        Self::from_moe_full_group(
+            gpu,
+            weights,
+            moe,
+            layer_label,
+            config,
+            placement,
+            peers_for_layer,
+            seal,
+            layer_label,
+        )
+    }
+
+    /// [`Self::from_moe_full`] binding the sealed plan of expert group `group`
+    /// while the runtime keeps `layer_label`. The MTP head's lane-local runtime
+    /// is `layer_label` 0 over group `num_hidden_layers`, exactly the label and
+    /// group [`Self::from_moe_ep`] gives the head's decode runtime.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_moe_full_group(
+        gpu: &mut Gpu,
+        weights: &Qwen4Weights,
+        moe: &MoeWeights,
+        layer_label: usize,
+        config: &Qwen4Config,
+        placement: Qwen4EpPlacement,
+        peers_for_layer: &[Qwen4PeerLayerSource],
+        seal: &Qwen4EpRankSeal,
+        group: usize,
+    ) -> Result<Self, Qwen4GpuForwardError> {
         let sealed = seal
-            .expert_binding(layer_label, placement, gpu.device_id)
+            .expert_binding(group, placement, gpu.device_id)
             .map_err(invalid)?;
         // Compact peers everywhere (no unit layer on any rank): today's table, unchanged.
         let table_peers: Vec<PeerLayerSource<'_>> = peers_for_layer
@@ -9772,6 +9866,7 @@ pub(crate) struct TileScopes {
     ragged: bool,
     ep_a8: bool,
     sym_floor: usize,
+    lwmma_floor: usize,
 }
 
 /// How a prefill chunk's staged PLE rows reach the device.
@@ -10060,6 +10155,7 @@ impl<'a> LayerPhaseEnv<'a> {
             dilation: config.ple_conv_dilation(),
             epsilon: EPSILON,
             lane_states: &[],
+            projected: false,
         });
         Ok((step, rows_f16))
     }
@@ -13917,6 +14013,12 @@ impl Qwen4GpuForward {
         })
     }
 
+    /// Whether the routing trace (`HIPFIRE_QWEN4_ROUTE_TRACE`) is on: it copies each layer's
+    /// top-k scratch right after the layer, so the scratch must hold the layer's ids.
+    pub(crate) fn route_trace_active(&self) -> bool {
+        self.route_trace.is_some()
+    }
+
     /// The rank's decode MoE layers the D2 tail may manage (`HIPFIRE_EP_UNIT_TAIL`): per layer
     /// the label, non-owning aliases of the two decode pointer tables and the host entries they
     /// were uploaded from. Only layers running the static `e % ranks` owners over a unit plan
@@ -14110,6 +14212,7 @@ impl Qwen4GpuForward {
         let mut full: Vec<Qwen4MoeLayerRuntime> = Vec::with_capacity(layers);
         let mut balanced: Vec<Option<Qwen4BalancedLayer>> = Vec::new();
         let mut slot_owner: Option<GpuTensor> = None;
+        let mut decode_mask: Option<Qwen4DecodeOwnerMask> = None;
         let result = (|| -> Result<(), Qwen4GpuForwardError> {
             let mut ordinal = 0usize;
             for layer in &bundle.weights.layer_refs {
@@ -14291,6 +14394,26 @@ impl Qwen4GpuForward {
                     gpu.hip.device_synchronize()?;
                 }
             }
+            // Wide-verify int8 chain owner mask: only the trunk shard's partial FFN route has a no-op
+            // gather (`MoeRowGather::gather_skipped`), and `HIPFIRE_QWEN4_MOE_GU_A8=2` / `0` run
+            // unmasked / off, so nothing is allocated there. The table is the SEALED ownership
+            // (`placement.owns(e)` is `e % ranks`, what the compact decode table's real entries
+            // follow); built once here, no per-step allocation or upload.
+            if gpu.qwen4_moe_gu_a8_masked() && crate::weights::trunk_shard::trunk_shard_requested()
+            {
+                let owners = seal.seal.owner_ranks();
+                if owners.len() != config.num_experts {
+                    return Err(invalid(
+                        "the sealed owner table does not cover every expert",
+                    ));
+                }
+                let tiles = ep_decode_mask_tiles(config.num_experts_per_tok, config.num_experts)?;
+                decode_mask = Some(Qwen4DecodeOwnerMask::alloc(gpu, &owners, tiles)?);
+                eprintln!(
+                    "qwen4 EP rank {}/{}: wide-verify owner mask built ({} experts, {tiles} tiles)",
+                    placement.rank, placement.ranks, config.num_experts
+                );
+            }
             Ok(())
         })();
         if let Err(error) = result {
@@ -14302,6 +14425,9 @@ impl Qwen4GpuForward {
             }
             if let Some(tensor) = slot_owner {
                 let _ = gpu.free_tensor(tensor);
+            }
+            if let Some(mask) = decode_mask {
+                let _ = mask.free_gpu(gpu);
             }
             return Err(error);
         }
@@ -14355,6 +14481,7 @@ impl Qwen4GpuForward {
         ep.moe_full = full;
         ep.balanced = balanced;
         ep.slot_owner = slot_owner;
+        ep.decode_mask = decode_mask;
         ep.gather = Some(gather);
         if let Some(verdicts) = partial_verdicts {
             for (layer, &verdict) in self.moe.iter_mut().flatten().zip(&verdicts) {
@@ -14411,6 +14538,21 @@ impl Qwen4GpuForward {
             shape: table.shape.clone(),
             dtype: table.dtype,
         })
+    }
+
+    /// Non-owning views of the rank's wide-verify owner mask, `(owner table, masked tile ids)`, for
+    /// the row-gather hook ([`MoeRowGather::decode_owner_mask`]); `None` without the mask. The forward
+    /// owns both until `free_gpu`; the hook that holds them lives inside this forward and is never
+    /// used after it is freed.
+    pub(crate) fn ep_decode_owner_mask_views(&self) -> Option<(GpuTensor, GpuTensor)> {
+        let mask = self.ep.as_ref()?.decode_mask.as_ref()?;
+        let view = |tensor: &GpuTensor| GpuTensor {
+            // SAFETY: a `Borrowed` alias of a buffer `Qwen4ForwardEp` owns until `free_gpu`.
+            buf: unsafe { tensor.buf.alias() },
+            shape: tensor.shape.clone(),
+            dtype: tensor.dtype,
+        };
+        Some((view(&mask.owner_table), view(&mask.tile_ids_owned)))
     }
 
     /// Install the agreed transport. On gfx1201 every layer's compact runtime takes the
@@ -16214,6 +16356,25 @@ impl Qwen4GpuForward {
             });
         }
         let sym_floor = std::mem::replace(&mut gpu.qwen4_moe_sym_iu4_floor, sym_floor_now);
+        // `HIPFIRE_QWEN4_PREFILL_LWMMA_WAVE_FLOOR`: lowered only inside an EP prefill WAVE
+        // (`ep_wave_run` sets `wave_route` before entering these scopes). Singleton prefill
+        // chunks (`forward_chunk_scoped`), non-EP lane steps, decode, verify and the MTP head
+        // always run at `WIDE_VERIFY_MAX_ROWS + 1`, where `Gpu::prefill_small_lane_rows` is never
+        // true: their arms are unchanged by construction.
+        let lwmma_floor_now = if self.prefill_scope && self.wave_route.is_some() {
+            gpu.flags.qwen4_prefill_lwmma_floor_knob()
+        } else {
+            rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS + 1
+        };
+        if lwmma_floor_now <= rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                eprintln!(
+                    "  qwen4 prefill lane WMMA wave floor: {lwmma_floor_now} rows (HIPFIRE_QWEN4_PREFILL_LWMMA_WAVE_FLOOR; EP prefill waves only, singletons, decode and verify are unchanged)"
+                );
+            });
+        }
+        let lwmma_floor = std::mem::replace(&mut gpu.qwen4_prefill_lwmma_floor, lwmma_floor_now);
         (
             TileScopes {
                 scope,
@@ -16222,6 +16383,7 @@ impl Qwen4GpuForward {
                 ragged,
                 ep_a8,
                 sym_floor,
+                lwmma_floor,
             },
             append,
         )
@@ -16235,6 +16397,7 @@ impl Qwen4GpuForward {
         gpu.qwen4_trunk_iu4_prefill_scope = saved.ragged;
         gpu.qwen4_ep_a8_scope = saved.ep_a8;
         gpu.qwen4_moe_sym_iu4_floor = saved.sym_floor;
+        gpu.qwen4_prefill_lwmma_floor = saved.lwmma_floor;
     }
 
     /// Bank and runtime selection, the only place decode-share state changes.
@@ -16274,6 +16437,10 @@ impl Qwen4GpuForward {
         if let Some(gather) = self.ep.as_ref().and_then(|ep| ep.gather.as_deref()) {
             gather.decode_step_end(gpu);
         }
+        // The elastic reserve's backstop for every singleton / promoted / non-lane prefill tile:
+        // a forward whose GEMM route rows reach the F16 shadow floor reclaims the bank before it
+        // builds the long-prefill caches (a no-op without the reserve or while nothing is lent).
+        bundle.elastic_prefill_backstop(gpu, tokens.len());
         if self.ep_reserve.is_some() {
             return self.ep_reserve_forward_chunk(
                 bundle,
@@ -16845,12 +17012,18 @@ impl Qwen4GpuForward {
         // of them. Decided on `n` and load-time facts only, so both ranks always agree; any
         // reject runs today's all-reduce route for the whole chunk. Silent per chunk: the
         // ordinary rejects (flag off, not a wide prefill chunk) log nothing, the first chunk
-        // that takes SP and the first structural reject log one line each.
+        // that takes SP and the first structural reject log one line each. Row bands
+        // (`trunk_route::sp_rows_in_band`): at least `SP_MIN_ROWS`, or the sub-512 band
+        // (`HIPFIRE_QWEN4_EP_SP_SUB512`, default on, `0` kills) of `SP_SUB512_MIN_ROWS`..=511 rows
+        // when the HC read of the whole chunk and of both halves is the row-count-invariant
+        // prefill lane WMMA entry.
         let sp_rows = crate::trunk_route::sp_rows(n).filter(|_| {
             ep.is_some()
                 && trunk_chunk_partial
                 && self.prefill_scope
-                && n >= crate::trunk_route::SP_MIN_ROWS
+                && crate::trunk_route::sp_chunk_rows_in_band(n)
+                && (n >= crate::trunk_route::SP_MIN_ROWS
+                    || (gpu.prefill_lwmma_hc_applies(n / 2) && gpu.prefill_lwmma_hc_applies(n)))
                 && route_n == n
         });
         let sp_views: Option<SpViews> = match (sp_rows, crate::trunk_route::sp_route()) {
@@ -16884,8 +17057,9 @@ impl Qwen4GpuForward {
                             std::sync::atomic::AtomicBool::new(false);
                         if !NOTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                             eprintln!(
-                                "  qwen4 EP sequence-parallel prefill (HIPFIRE_QWEN4_EP_SEQ_PARALLEL, =0 restores the all-reduce route): chunks of >= {} rows split their rows across the two ranks (reduce-scatter HC write, row all-gather)",
-                                crate::trunk_route::SP_MIN_ROWS
+                                "  qwen4 EP sequence-parallel prefill (HIPFIRE_QWEN4_EP_SEQ_PARALLEL, =0 restores the all-reduce route): chunks of >= {} rows, and of {}..=511 rows on the prefill lane WMMA HC read (HIPFIRE_QWEN4_EP_SP_SUB512, =0 keeps those on the all-reduce route), split their rows across the two ranks (reduce-scatter HC write, row all-gather)",
+                                crate::trunk_route::SP_MIN_ROWS,
+                                crate::trunk_route::SP_SUB512_MIN_ROWS
                             );
                         }
                         let views = SpViews::new(&self.scratch, route, rows, dims, bf16_state);
@@ -16982,7 +17156,11 @@ impl Qwen4GpuForward {
         if ep_lane_tile {
             self.lane_tile_note = Some(ep_reserve_forward::LaneTileNote {
                 rows: n,
-                tile_exchange: tile_active,
+                route: ep_reserve_forward::LaneTileRoute::of(
+                    tile_active,
+                    trunk_chunk_partial,
+                    partial_mask_route.is_some(),
+                ),
                 staged: expert_stage.is_some(),
                 stage_min_rows: self
                     .expert_stage
@@ -22450,6 +22628,31 @@ mod ep_rank_generic_tests {
         assert!(!trunk_partial_mask_on(false, true));
         assert!(!trunk_partial_mask_on(true, false));
         assert!(trunk_partial_mask_on(true, true));
+    }
+
+    /// The wide-verify chain's masked tile id scratch covers the padded tile capacity of its widest
+    /// call (64 rows, top-10 of 512 experts: `ceil16(640 + 15 * 512) = 8320` grouped rows, 520 tiles) and
+    /// the owner table bytes are one little-endian `i32` per expert, `e % ranks` for the static split.
+    #[test]
+    fn decode_owner_mask_capacity_and_table_follow_the_static_split() {
+        assert_eq!(ep_decode_mask_tiles(10, 512).unwrap(), 520);
+        // The bound is the grouped scratch's: every row count the chain serves fits.
+        for rows in 9..=rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS {
+            let grouped = crate::program::grouped_m_total_bound(rows * 10, 512).unwrap() / 16;
+            assert!(
+                grouped <= ep_decode_mask_tiles(10, 512).unwrap(),
+                "rows {rows}"
+            );
+        }
+        let owners: Vec<usize> = (0..8).map(|e| e % 2).collect();
+        let bytes = tile_owner_table_bytes(&owners);
+        assert_eq!(bytes.len(), 8 * 4);
+        for (e, word) in bytes.chunks_exact(4).enumerate() {
+            assert_eq!(
+                i32::from_le_bytes([word[0], word[1], word[2], word[3]]),
+                (e % 2) as i32
+            );
+        }
     }
 
     /// The G2 expert stage is built on a compact-table chunk route: the admitted tile route

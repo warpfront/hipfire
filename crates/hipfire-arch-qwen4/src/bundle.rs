@@ -15,7 +15,7 @@ use crate::ep::{Qwen4EpMesh, ReplicaFingerprint};
 use crate::gpu_forward::{
     qwen4_forward_device_bytes, qwen4_prefill_chunk_requested, qwen4_prefill_chunk_rungs,
     qwen4_spec_logit_rows, Qwen4ForwardScratchMode, Qwen4GpuForward, Qwen4GpuForwardError,
-    Qwen4OutputRows, QWEN4_FORWARD_HEADROOM_BYTES,
+    Qwen4OutputRows, Qwen4PeerExpertSource, Qwen4PeerLayerSource, QWEN4_FORWARD_HEADROOM_BYTES,
 };
 use crate::kv_backend::Qwen4KvBackend;
 use crate::mtp_gpu::{MtpAppendScratch, MtpFillContext, MtpGpuStateSnapshot, MtpStep, Qwen4MtpGpu};
@@ -260,6 +260,8 @@ pub struct Qwen4Bundle {
     /// Accepted `.hc8` sidecar (`attach_hc8_sidecar`), consumed by
     /// `attach_forward`; `None` = none pending.
     pub(crate) hc8_sidecar: Option<crate::hc8_sidecar::Qwen4Hc8Sidecar>,
+    /// The outcome of applying `hc8_sidecar` (`None` until applied, or when refused).
+    pub(crate) hc8_applied: Option<crate::weights::Hc8Applied>,
     pub(crate) npu_model_index: Option<Result<String, String>>,
     /// Actually reserved D1 CPU-owned expert window rows (logical window rows; 0 =
     /// none). Stored only by the loader after the real prewarm lands (see
@@ -268,6 +270,9 @@ pub struct Qwen4Bundle {
     /// qualification: the routing slice still gates on the per-call lab-wide scope
     /// and the caller's live thread-local capacity.
     pub(crate) cpu_d1_storage_rows: usize,
+    /// The elastic reserve of this EP rank (`install_elastic`): its D2 tail, the per-rank cap and
+    /// the log switch. `None` until attach and on a load without the tail.
+    pub(crate) elastic: Option<crate::lane::pages::ElasticRank>,
 }
 
 /// `HIPFIRE_QWEN4_PENALTY_PREPASS=0` keeps a penalized request's repeat /
@@ -1031,9 +1036,11 @@ impl Qwen4Bundle {
             ep: None,
             pp: None,
             pp_band: None,
+            elastic: None,
             ep_seal: None,
             trunk_overlay: None,
             hc8_sidecar: None,
+            hc8_applied: None,
             npu_model_index: None,
             cpu_d1_storage_rows: 0,
         })
@@ -1241,6 +1248,13 @@ impl Qwen4Bundle {
         Ok(())
     }
 
+    /// What the pending `.hc8` sidecar replaced once `attach_forward` applied it (`None`:
+    /// none attached, or it was refused: BF16 weights run). The expert-parallel loader checks
+    /// it against the saving the plan charged.
+    pub fn hc8_applied(&self) -> Option<crate::weights::Hc8Applied> {
+        self.hc8_applied
+    }
+
     /// Apply the pending hc8 sidecar, if any.  A refusal (payload digest,
     /// weight pre-check) is logged and leaves the BF16 weights; a failure
     /// after replacement started is an error.
@@ -1271,6 +1285,7 @@ impl Qwen4Bundle {
             }
             crate::weights::Hc8Outcome::Applied(applied) => {
                 eprintln!("{}", crate::hc8_sidecar::hc8_applied_line(&applied));
+                self.hc8_applied = Some(applied);
             }
         }
         Ok(())
@@ -1323,6 +1338,21 @@ impl Qwen4Bundle {
             applied.before_bytes >> 20,
             applied.after_bytes >> 20
         );
+        // `HIPFIRE_EP_RESERVE_CENSUS`: `replace_owned` freed each full pre-shard copy of the
+        // shared-expert tensors into the device pool, which hands bytes back to HIP only on a
+        // drain or an allocation that fails. The planner budgets the shard's saving, so return
+        // them now. `drain_pool` frees only the pool's free lists (buffers no tensor owns) and
+        // the slabs already fully retired, never a live buffer, and runs before the forward and
+        // the first request allocate anything.
+        if hipfire_config::memory::ep_reserve_census() {
+            let parked = gpu.pool_parked_bytes();
+            gpu.drain_pool();
+            eprintln!(
+                "  qwen4 trunk shard: rank {}: returned {} MiB of pooled pre-shard copies to HIP",
+                placement.rank,
+                parked >> 20
+            );
+        }
         Ok(())
     }
 
@@ -2105,6 +2135,141 @@ impl Qwen4Bundle {
             self.config.mtp_geometry(),
             self.mtp.as_mut().and_then(|mtp| mtp.moe.as_mut()),
             announce,
+        )
+        .map_err(|error| BundleError::Forward(error.to_string()))
+    }
+
+    /// This rank's MTP head routed-expert compact source (its `mtp.` gate/up and
+    /// down tensors: what every peer's lane-local head table names for the experts
+    /// this rank owns), exchanged at EP attach beside the trunk's
+    /// [`Qwen4GpuForward::ep_expert_sources`]. `None`: no head attached, a head that
+    /// is not EP-bound, or a dense head (no routed experts to name).
+    pub(crate) fn mtp_ep_expert_source(&self) -> Result<Option<Qwen4PeerLayerSource>, String> {
+        if !self.mtp.as_ref().is_some_and(|head| head.ep_bound) {
+            return Ok(None);
+        }
+        let Some(moe) = self.weights.mtp.as_ref().and_then(|mtp| mtp.ffn.moe()) else {
+            return Ok(None);
+        };
+        let gate_up = self
+            .weights
+            .resident(&moe.experts_gate_up)
+            .map_err(|error| format!("MTP head expert source: {error}"))?;
+        let down = self
+            .weights
+            .resident(&moe.experts_down)
+            .map_err(|error| format!("MTP head expert source: {error}"))?;
+        Ok(Some(Qwen4PeerLayerSource::Compact(Qwen4PeerExpertSource {
+            gate_up_base: gate_up.buf.as_ptr() as usize,
+            gate_up_bytes: gate_up.buf.size(),
+            down_base: down.buf.as_ptr() as usize,
+            down_bytes: down.buf.size(),
+        })))
+    }
+
+    /// Install the head's lane-local (full-table) MoE runtime once every rank's
+    /// head source (`head_sources`, rank order, from [`Self::mtp_ep_expert_source`])
+    /// is known: the EP mesh attach calls it on every rank after the forward's
+    /// tables and row gather are installed. Installs nothing (the head stays
+    /// not-ready for lane-local calls, every call keeps today's path) when
+    /// `HIPFIRE_QWEN4_EP_DRAFT_SPLIT=0`, when no EP-bound MoE head is attached, or
+    /// when any rank published no head source; that decision reads only the
+    /// gathered sources and the rank's own head, so every rank takes it alike.
+    pub(crate) fn install_mtp_lane_local_moe(
+        &mut self,
+        gpu: &mut Gpu,
+        head_sources: &[Option<Qwen4PeerLayerSource>],
+    ) -> Result<(), String> {
+        if !crate::mesh_lane_protocol::ep_draft_split_enabled() {
+            return Ok(());
+        }
+        let Some(placement) = self
+            .execution
+            .as_ref()
+            .and_then(Qwen4GpuForward::ep_placement)
+        else {
+            return Ok(());
+        };
+        let Some(head) = self.mtp.as_mut() else {
+            return Ok(());
+        };
+        if !head.ep_bound || head.moe.is_none() {
+            return Ok(());
+        }
+        let Some(peers) = head_sources
+            .iter()
+            .cloned()
+            .collect::<Option<Vec<Qwen4PeerLayerSource>>>()
+        else {
+            return Ok(());
+        };
+        if peers.len() != placement.ranks {
+            return Err(format!(
+                "MTP head sources cover {} ranks, the mesh has {}",
+                peers.len(),
+                placement.ranks
+            ));
+        }
+        let seal = self
+            .ep_seal
+            .as_ref()
+            .ok_or("the rank is not bound to an EP seal")?;
+        head.install_lane_local_moe(gpu, &self.weights, &self.config, placement, &peers, seal)
+            .map_err(|error| format!("install the lane-local MTP head MoE: {error}"))
+    }
+
+    /// Whether the attached MTP head can run lane-local MoE calls: its MoE
+    /// runtime is EP-bound and the full-table runtime was installed at EP attach
+    /// ([`Self::install_mtp_lane_local_moe`]), or it has no MoE (dense profile).
+    pub(crate) fn mtp_lane_local_ready(&self) -> bool {
+        self.mtp.as_ref().is_some_and(Qwen4MtpGpu::lane_local_ready)
+    }
+
+    /// Switch the head's lane-local mode: while on, every Predict-step MoE of the
+    /// head (serial and batched) runs on the full-table runtime with a rank-local
+    /// no-op row gather, crosses no rank and does not advance `moe_steps`. Off is
+    /// the incumbent EP head call. On is refused when [`Self::mtp_lane_local_ready`]
+    /// is false.
+    pub(crate) fn mtp_set_lane_local(&mut self, on: bool) -> Result<(), BundleError> {
+        let head = self.mtp.as_mut().ok_or_else(|| {
+            BundleError::Forward("Qwen4 MTP resources are not attached".to_string())
+        })?;
+        head.set_lane_local(on)
+            .map_err(|error| BundleError::Forward(error.to_string()))
+    }
+
+    /// Whether sharded-MoE draft passes can run ([`crate::mtp_gpu::draft_sharded_moe_enabled`]
+    /// at install, X2 active, rows scratch).
+    pub(crate) fn mtp_s4_ready(&self) -> bool {
+        self.mtp.as_ref().is_some_and(Qwen4MtpGpu::s4_ready)
+    }
+
+    /// Mark (or clear) the sharded-MoE pass the next batched head call and
+    /// participant call belong to. Cleared on every path out of the round.
+    pub(crate) fn mtp_set_s4_round(
+        &mut self,
+        round: Option<crate::mtp_gpu::S4Round>,
+    ) -> Result<(), BundleError> {
+        let head = self.mtp.as_mut().ok_or_else(|| {
+            BundleError::Forward("Qwen4 MTP resources are not attached".to_string())
+        })?;
+        head.set_s4_round(round)
+            .map_err(|error| BundleError::Forward(error.to_string()))
+    }
+
+    /// This rank's share of a sharded-MoE pass when it owns no live row: the
+    /// activation all-gather and the global MoE call with an empty own set.
+    pub(crate) fn mtp_s4_participate(&mut self, gpu: &mut Gpu) -> Result<(), BundleError> {
+        let mtp = self.mtp.as_mut().ok_or_else(|| {
+            BundleError::Forward("Qwen4 MTP resources are not attached".to_string())
+        })?;
+        mtp.s4_participate(
+            gpu,
+            &self.weights,
+            &self.config,
+            self.execution
+                .as_ref()
+                .and_then(Qwen4GpuForward::mtp_ep_gather),
         )
         .map_err(|error| BundleError::Forward(error.to_string()))
     }
@@ -3805,6 +3970,27 @@ impl Qwen4Bundle {
         self.mtp
             .as_ref()
             .is_some_and(|mtp| mtp.draft.rescored_candidates().is_some())
+    }
+
+    /// Install (or remove) the vocabulary-shard context of the MQ2 draft head's drafts
+    /// ([`hipfire_dispatch::pipeline::DraftShard`], `HIPFIRE_QWEN4_EP_DRAFT_VOCAB_SHARD`): the
+    /// drafts enqueued while it is installed split their ranked rows between the two EP ranks.
+    /// The resident head owns it (a lane swap-in leaves it in place). Without MTP resources an
+    /// install is an error and a removal a no-op.
+    pub(crate) fn mtp_set_draft_shard(
+        &mut self,
+        shard: Option<hipfire_dispatch::pipeline::DraftShard>,
+    ) -> Result<(), BundleError> {
+        match (self.mtp.as_mut(), shard) {
+            (Some(mtp), shard) => {
+                mtp.draft.set_shard(shard);
+                Ok(())
+            }
+            (None, None) => Ok(()),
+            (None, Some(_)) => Err(BundleError::Forward(
+                "Qwen4 MTP resources are not attached".to_string(),
+            )),
+        }
     }
 
     /// The batched head round's rows scratch is allocated

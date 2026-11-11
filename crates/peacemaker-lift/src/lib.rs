@@ -13,7 +13,11 @@
 //! [`lift_text`] lifts an authoritative `.s` through the object the pinned assembler made
 //! from it: the bytes are the proof, the text contributes labels and line provenance. The
 //! lifter never spawns tools; the process drivers live in `peacemaker-front`.
+//!
+//! gfx942 uses [`cdna::lift_object`] and [`cdna::checked`]: the same ELF envelope
+//! codec with the existing typed CDNA instruction model, rather than the RDNA IR.
 pub mod bundle;
+pub mod cdna;
 pub mod elf;
 pub mod hazards_gfx11;
 pub mod kd;
@@ -124,6 +128,7 @@ fn arch_of_mach(mach: u32) -> Option<Arch> {
         0x033 => Arch::Gfx1010,
         0x036 => Arch::Gfx1030,
         0x041 => Arch::Gfx1100,
+        0x048 => Arch::Gfx1200,
         0x04a => Arch::Gfx1151,
         0x04e => Arch::Gfx1201,
         _ => return None,
@@ -136,6 +141,7 @@ fn arch_of_name(name: &str) -> Option<Arch> {
         "gfx1030" => Arch::Gfx1030,
         "gfx1100" => Arch::Gfx1100,
         "gfx1151" => Arch::Gfx1151,
+        "gfx1200" => Arch::Gfx1200,
         "gfx1201" => Arch::Gfx1201,
         _ => return None,
     })
@@ -240,7 +246,10 @@ pub fn lift_object(bytes: &[u8], options: Options) -> Result<Lifted<Program>, Li
     let (source, images) =
         Source::read(bytes, arch).map_err(|e| module_error(Rule::Envelope, e))?;
     let target = target_of(&source, arch)?;
-    if !matches!(arch, Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1201) {
+    if !matches!(
+        arch,
+        Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1200 | Arch::Gfx1201
+    ) {
         return Err(module_error(
             Rule::UnsupportedArch,
             format!("{arch:?} has no opcode table"),
@@ -409,7 +418,7 @@ fn decode_body(
         let va = entry_va + 4 * at as u64;
         let (mut inst, n) = match arch {
             Arch::Gfx1100 | Arch::Gfx1151 => gfx11::decode(arch, &words[at..]),
-            _ => gfx12::decode(&words[at..]),
+            _ => gfx12::decode_for(arch, &words[at..]),
         }
         .map_err(|e| rejected(name, va, Rule::Decode, e))?;
         let original = &words[at..at + n];
@@ -803,5 +812,20 @@ pub mod emit {
             }
         }
         Ok((out, lifted))
+    }
+}
+
+#[cfg(test)]
+mod gfx1200_tests {
+    use super::*;
+
+    /// `EF_AMDGPU_MACH_AMDGCN_GFX1200` is 0x48 (LLVM `BinaryFormat/ELF.h`, ROCm); gfx1201 is 0x4e.
+    #[test]
+    fn gfx1200_machine_and_name_are_distinct_from_gfx1201() {
+        assert_eq!(arch_of_mach(0x48), Some(Arch::Gfx1200));
+        assert_eq!(arch_of_mach(0x4e), Some(Arch::Gfx1201));
+        assert_eq!(arch_of_name("gfx1200"), Some(Arch::Gfx1200));
+        assert_eq!(arch_of_name("gfx1201"), Some(Arch::Gfx1201));
+        assert_eq!(arch_of_name("gfx12000"), None);
     }
 }

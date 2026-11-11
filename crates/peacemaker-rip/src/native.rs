@@ -515,6 +515,7 @@ fn vopd_of<'a>(it: &Interp<'a>, v: &Value<'a>) -> Res<VopdOp> {
         Value::Nat(Nat::Reg(r)) if r.len == 1 => match r.kind {
             RegKind::V => Operand::V(r.base),
             RegKind::S => Operand::S(r.base),
+            RegKind::A => return Err("VopdOp.src0 does not accept an AGPR".into()),
         },
         Value::Tuple(xs) if xs.len() == 2 => {
             match str_of(it, &xs[0], "VopdOp.src0 kind")?.as_str() {
@@ -1429,6 +1430,26 @@ pub fn method<'a>(
             _ => None,
         },
         Nat::Builder(_) | Nat::Isa => match name {
+            "label" | "wait_all" => {
+                if !matches!(n, Nat::Builder(_)) {
+                    return Err(format!(
+                        "`wg.isa().{name}` is not available: use the Workgroup's own `{name}`"
+                    )
+                    .into());
+                }
+                if name == "label" {
+                    need(1)?;
+                    let label = str_of(it, &a[0], "label")?;
+                    Some(done(with_b(it, &Value::Nat(n.clone()), cx, |b| {
+                        b.label(&label)
+                    })?))
+                } else {
+                    need(0)?;
+                    Some(done(with_b(it, &Value::Nat(n.clone()), cx, |b| {
+                        b.wait_all()
+                    })?))
+                }
+            }
             "release_store_sources" | "lds_relayout" | "barrier_wait" => {
                 need(0)?;
                 Some(done(with_b(

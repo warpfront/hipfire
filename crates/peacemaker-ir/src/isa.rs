@@ -68,7 +68,7 @@ impl OpRow {
 /// Whether a VMEM atomic returns its pre-op value: `glc` on gfx11, `th` bit 0
 /// (`TH_ATOMIC_RETURN`) on gfx12. Only rows with `@rtn`/`@nortn` tags consult it.
 pub fn atomic_returns(arch: Arch, cpol: &CachePolicy) -> bool {
-    if arch == Arch::Gfx1201 {
+    if arch.is_gfx12() {
         cpol.th & 1 != 0
     } else {
         cpol.glc
@@ -267,7 +267,7 @@ pub fn table(arch: Arch) -> &'static [OpRow] {
     match arch {
         Arch::Gfx1100 => gfx1100(),
         Arch::Gfx1151 => gfx1151(),
-        Arch::Gfx1201 => gfx12(),
+        Arch::Gfx1200 | Arch::Gfx1201 => gfx12(),
         Arch::Gfx1010 | Arch::Gfx1030 => &[],
     }
 }

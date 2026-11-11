@@ -791,6 +791,12 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         kernels::LANE_LEVIATHAN_SRC,
         ["lane_leviathan_verify"]
     );
+    // Vocab-shard argmax merge (`Gpu::argmax_f32_pair_merge`).
+    add!(
+        "argmax_pair_merge",
+        kernels::ARGMAX_PAIR_MERGE_SRC,
+        ["argmax_f32_pair_merge"]
+    );
     // Qwen4 logit-policy penalty prepass (AR greedy rows, sampled-MTP verify
     // rows; `Gpu::apply_penalty_table`).
     add!(
@@ -2876,6 +2882,39 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             kernels::MOE_COMBINE_ORDER_OWNED_SRC,
             ["moe_combine_order_top10_owned"]
         );
+        // `HIPFIRE_QWEN4_MOE_COMBINE_INLINE_ORDER` (opt-in): the order computed inside the
+        // owner-masked BF16-row combine, its own module for the same reason.
+        add!(
+            "moe_combine_ordered",
+            kernels::MOE_COMBINE_ORDERED_SRC,
+            [
+                "moe_down_combine_grouped_top10_bf16in_ordered",
+                "moe_down_combine_grouped_top10_bf16in_ordered_zinit"
+            ]
+        );
+        // `HIPFIRE_QWEN4_MOE_GLUE_FOLD=c` (opt-in, exact gfx1201): the wide-verify A8 gate/up GEMM with
+        // the down producer folded into its epilogue, a module of its own over the unchanged legacy A8
+        // GEMM source. The module therefore also defines the legacy entries (never requested from it:
+        // the launchers load those from `qwen4_moe_ep_a8_gfx12`); the registry declares what the
+        // source defines.
+        if arch == "gfx1201" {
+            add!(
+                "qwen4_moe_ep_a8_rot_gfx12",
+                kernels::QWEN4_MOE_EP_A8_ROT_SRC,
+                [
+                    "qwen4_moe_ep_a8_down_nt1",
+                    "qwen4_moe_ep_a8_down_nt2",
+                    "qwen4_moe_ep_a8_down_planar_nt1",
+                    "qwen4_moe_ep_a8_down_planar_nt2",
+                    "qwen4_moe_ep_a8_gate_up_nt1",
+                    "qwen4_moe_ep_a8_gate_up_nt2",
+                    "qwen4_moe_ep_a8_gate_up_planar_nt1",
+                    "qwen4_moe_ep_a8_gate_up_planar_nt2",
+                    "qwen4_moe_ep_a8_gate_up_rot_planar_nt1",
+                    "qwen4_moe_ep_a8_gate_up_rot_planar_nt2",
+                ]
+            );
+        }
         add!(
             "moe_down_combine_top10_batched",
             kernels::MOE_DOWN_COMBINE_TOP10_BATCHED_SRC,
@@ -2987,6 +3026,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "gemv_q8_0_k8_rows_r8",
                 "quantize_bf16_q8_0",
                 "topk8_partial_f32",
+                "topk8_partial_f32_blocks",
                 "topk8_rescore_q8_0_k2560",
             ]
         );
@@ -3035,6 +3075,18 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "hetero_add_partial",
                 "hetero_f16_to_f32",
                 "hetero_f32_to_bf16"
+            ]
+        );
+    }
+    if arch == "gfx1201" {
+        add!(
+            "topk8_rows_mq6g256v2",
+            kernels::TOPK8_ROWS_MQ6G256V2_SRC,
+            [
+                "gemv_mq6g256v2",
+                "gemv_mq6g256v2_x4",
+                "topk8_partial_f32_rows",
+                "topk8_rescore_mq6g256v2_k2560_rows"
             ]
         );
     }
@@ -3124,6 +3176,19 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 [
                     // The module concatenates the fast router and the fused scatter sources.
                     "moe_route_scatter_top10_f32",
+                    "moe_router_softmax_top10_f32_fast",
+                    "moe_scatter_fused_k8"
+                ]
+            );
+            // `HIPFIRE_QWEN4_MOE_GLUE_FOLD` (opt-in): scatter + owner tile mask, and the 9..=64-row
+            // router + scatter (+ mask), one launch each.
+            add!(
+                "moe_route_scatter_wide",
+                kernels::MOE_ROUTE_SCATTER_WIDE_SRC,
+                [
+                    // The module concatenates the fast router and the scatter sources.
+                    "moe_scatter_fused_top10_pmask",
+                    "moe_route_scatter_top10_wide_f32",
                     "moe_router_softmax_top10_f32_fast",
                     "moe_scatter_fused_k8"
                 ]
@@ -4326,6 +4391,16 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "moe_shared_down_combine_rows_r6",
                 "moe_shared_down_combine_rows_r7",
                 "moe_shared_down_combine_rows_r8",
+                // `HIPFIRE_QWEN4_FFN_CLEAR_ABSORB_ROWS` (default on, exact gfx1201): the store
+                // entries that take over the FFN `zero_f32` fill.
+                "moe_shared_down_combine_rows_r1_zinit",
+                "moe_shared_down_combine_rows_r2_zinit",
+                "moe_shared_down_combine_rows_r3_zinit",
+                "moe_shared_down_combine_rows_r4_zinit",
+                "moe_shared_down_combine_rows_r5_zinit",
+                "moe_shared_down_combine_rows_r6_zinit",
+                "moe_shared_down_combine_rows_r7_zinit",
+                "moe_shared_down_combine_rows_r8_zinit",
             ]
         );
     }
@@ -11981,6 +12056,20 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
+        // `HIPFIRE_QWEN4_EP_VOCAB_SHARD` (X1): the vocab-shard argmax merge.
+        const ARGMAX_PAIR_MERGE_ADDED_MODULES: [&str; 1] = ["argmax_pair_merge"];
+        for module in ARGMAX_PAIR_MERGE_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing vocab-shard argmax merge module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
         // `HIPFIRE_QWEN4_MOE_DOWN_DNI` (default on, exact gfx1201, <=8 rows): the per-pick K=640 down kernel.
         const MOE_DOWN_DNI_ADDED_MODULES: [&str; 1] = ["gemv_mq4g128v2_moe_down_top10_dni"];
         for module in MOE_DOWN_DNI_ADDED_MODULES {
@@ -12016,6 +12105,66 @@ mod tests {
             assert!(
                 by_name.contains_key(module),
                 "missing EP implicit-zero module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
+        // `HIPFIRE_QWEN4_MOE_COMBINE_INLINE_ORDER=1` (opt-in, exact gfx1201, wide-verify int8
+        // chain): the owner-masked BF16-row combine with its rank order computed inline.
+        const COMBINE_INLINE_ORDER_ADDED_MODULES: [&str; 1] = ["moe_combine_ordered"];
+        for module in COMBINE_INLINE_ORDER_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing inline-order combine module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
+        // `HIPFIRE_QWEN4_DRAFT_TOPK8_ROWS` (default on, exact gfx1201): the row-batched MQ6G256V2
+        // draft-head re-score.
+        const TOPK8_ROWS_ADDED_MODULES: [&str; 1] = ["topk8_rows_mq6g256v2"];
+        for module in TOPK8_ROWS_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing draft top-8 rows module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
+        // `HIPFIRE_QWEN4_MOE_GLUE_FOLD` (opt-in, exact gfx1201, wide-verify int8 chain): the
+        // scatter + owner tile mask launch and the 9..=64-row router + scatter (+ mask) launch.
+        const GLUE_FOLD_ADDED_MODULES: [&str; 1] = ["moe_route_scatter_wide"];
+        for module in GLUE_FOLD_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing MoE glue fold module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
+        // `HIPFIRE_QWEN4_MOE_GLUE_FOLD=c` (opt-in, exact gfx1201, wide-verify int8 chain): the A8
+        // gate/up GEMM with the rotate128 down producer in its epilogue.
+        const GLUE_FOLD_ROTATE_ADDED_MODULES: [&str; 1] = ["qwen4_moe_ep_a8_rot_gfx12"];
+        for module in GLUE_FOLD_ROTATE_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing rotate-fold gate/up module {module}"
             );
             assert!(
                 !expected
@@ -12081,8 +12230,13 @@ mod tests {
                 + MOE_DOWN_DNI_ADDED_MODULES.len()
                 + MQ6_R8_PK_ADDED_MODULES.len()
                 + PMASK_IMPLICIT_ZERO_ADDED_MODULES.len()
+                + COMBINE_INLINE_ORDER_ADDED_MODULES.len()
+                + GLUE_FOLD_ADDED_MODULES.len()
+                + GLUE_FOLD_ROTATE_ADDED_MODULES.len()
                 + LANE_LEVIATHAN_ADDED_MODULES.len()
-                + TRUNK_REDUCTION_PARTITION_ADDED_MODULES.len(),
+                + ARGMAX_PAIR_MERGE_ADDED_MODULES.len()
+                + TRUNK_REDUCTION_PARTITION_ADDED_MODULES.len()
+                + TOPK8_ROWS_ADDED_MODULES.len(),
             "unexpected gfx1201 inventory size"
         );
         let default_prefill = by_name

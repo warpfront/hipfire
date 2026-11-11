@@ -4696,14 +4696,66 @@ pub fn developer_var(name: &str) -> std::result::Result<String, std::env::VarErr
 /// groups). The wide group runs the ordinary prefill-class routes at its width (the
 /// verify scope stays closed: no row-exact twins, grouped expert-union MoE, never IU4
 /// on verify rows); its rows are distribution-equivalent, not byte-equal, to the
-/// row-exact ones, so a sampled request's output is reproducible across batch
-/// compositions only when it carries a seed. Implies the 32-row EP gather capacity
+/// row-exact ones. A sampled request's output is reproducible across batch
+/// compositions only with a seed AND `HIPFIRE_QWEN4_LANE_ROW_EXACT=seeded` (or at C1). Implies the 32-row EP gather capacity
 /// (`HIPFIRE_QWEN4_EP_WIDE_VERIFY`).
 pub const QWEN4_EP_SAMPLED_WIDE_VERIFY_ENV: &str = "HIPFIRE_QWEN4_EP_SAMPLED_WIDE_VERIFY";
 
 /// [`QWEN4_EP_SAMPLED_WIDE_VERIFY_ENV`] read through the process snapshot.
 pub fn qwen4_ep_sampled_wide_verify() -> bool {
     developer_bool(QWEN4_EP_SAMPLED_WIDE_VERIFY_ENV, false)
+}
+
+/// `HIPFIRE_QWEN4_LANE_ROW_EXACT` (developer, default `0` = off): which Flash-Next lane
+/// classes keep every all-rows (9..=64-row) lane step bitwise their <=8-row rows, so output
+/// does not depend on batch composition. Unset, `0`, `off`, `false`: no lane is row-exact
+/// (the default: concurrent native-MTP output at >= 3 lanes may depend on batch composition;
+/// C1 and AR steps of <= 8 rows stay exact). `greedy`: greedy lanes; `seeded` (also `1`, `on`,
+/// `true`): greedy lanes and sampled lanes with an explicit request seed. Opting in costs
+/// step time on the exact steps (CHANGELOG). Unrecognised values warn once and mean `0`.
+pub const QWEN4_LANE_ROW_EXACT_ENV: &str = "HIPFIRE_QWEN4_LANE_ROW_EXACT";
+
+/// Lane classes that run their all-rows steps row-exact ([`QWEN4_LANE_ROW_EXACT_ENV`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LaneRowExact {
+    /// No lane is row-exact (default).
+    Off,
+    /// Greedy lanes only.
+    Greedy,
+    /// Greedy lanes and seeded sampled lanes.
+    GreedySeeded,
+}
+
+/// Pure parse of [`QWEN4_LANE_ROW_EXACT_ENV`]: trimmed, ASCII case-insensitive; `greedy` is
+/// `Greedy`; `seeded`, `1`, `on`, `true` are `GreedySeeded`; unset, `0`, `off`, `false` and
+/// anything unrecognised are `Off`.
+pub fn parse_lane_row_exact(raw: Option<&str>) -> LaneRowExact {
+    let Some(raw) = raw else {
+        return LaneRowExact::Off;
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "greedy" => LaneRowExact::Greedy,
+        "seeded" | "1" | "on" | "true" => LaneRowExact::GreedySeeded,
+        _ => LaneRowExact::Off,
+    }
+}
+
+/// [`QWEN4_LANE_ROW_EXACT_ENV`] read once per process through the developer snapshot.
+pub fn qwen4_lane_row_exact() -> LaneRowExact {
+    static MODE: LazyLock<LaneRowExact> = LazyLock::new(|| {
+        let raw = developer_var(QWEN4_LANE_ROW_EXACT_ENV).ok();
+        if let Some(v) = raw.as_deref() {
+            let t = v.trim().to_ascii_lowercase();
+            if !matches!(
+                t.as_str(),
+                "" | "seeded" | "1" | "on" | "true" | "greedy" | "0" | "off" | "false"
+            ) {
+                eprintln!("[WARN] {QWEN4_LANE_ROW_EXACT_ENV}={v} is not seeded|greedy|0; using 0");
+            }
+        }
+        parse_lane_row_exact(raw.as_deref())
+    });
+    *MODE
 }
 
 /// `HIPFIRE_QWEN4_LANE_RESERVE_TRIM` (developer, default ON, exact `0` is the kill
@@ -6936,6 +6988,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parse_lane_row_exact_values() {
+        use super::LaneRowExact::*;
+        assert_eq!(parse_lane_row_exact(None), Off);
+        for v in ["seeded", "1", "on", "true", " SEEDED ", "On"] {
+            assert_eq!(parse_lane_row_exact(Some(v)), GreedySeeded, "{v:?}");
+        }
+        for v in ["greedy", " Greedy "] {
+            assert_eq!(parse_lane_row_exact(Some(v)), Greedy, "{v:?}");
+        }
+        for v in ["0", "off", "FALSE", " 0 ", "bogus", ""] {
+            assert_eq!(parse_lane_row_exact(Some(v)), Off, "{v:?}");
+        }
+    }
+
+    #[test]
     fn deprecated_key_covers_cask_and_pflash_families() {
         for key in [
             "memory.cask.enabled",
@@ -7525,6 +7592,117 @@ mod tests {
         assert!(parse(None) && parse(Some("")) && parse(Some("1")) && parse(Some("off")));
         assert!(!parse(Some("0")) && !parse(Some(" 0 ")));
         assert!(memory::ep_gather_direct());
+    }
+
+    #[test]
+    fn ep_mtp_experts_resident_is_on_unless_exactly_zero() {
+        use memory::parse_ep_mtp_experts_resident as parse;
+        assert!(parse(None) && parse(Some("")) && parse(Some("1")) && parse(Some("off")));
+        assert!(parse(Some("true")) && parse(Some("00")) && parse(Some("2")));
+        assert!(!parse(Some("0")) && !parse(Some(" 0 ")));
+        // The process snapshot of a test binary carries no knob: the default is on.
+        assert!(memory::ep_mtp_experts_resident());
+        assert_eq!(
+            developer_key_for_env("HIPFIRE_EP_MTP_EXPERTS_RESIDENT").as_deref(),
+            Some("developer.ep_mtp_experts_resident")
+        );
+    }
+
+    #[test]
+    fn ep_hc8_plan_charge_is_on_unless_exactly_zero() {
+        use memory::parse_ep_hc8_plan_charge as parse;
+        assert!(parse(None) && parse(Some("")) && parse(Some("1")) && parse(Some("off")));
+        assert!(parse(Some("true")) && parse(Some("00")) && parse(Some("2")));
+        assert!(!parse(Some("0")) && !parse(Some(" 0 ")));
+        assert!(memory::ep_hc8_plan_charge());
+        assert_eq!(
+            developer_key_for_env("HIPFIRE_EP_HC8_PLAN_CHARGE").as_deref(),
+            Some("developer.ep_hc8_plan_charge")
+        );
+    }
+
+    #[test]
+    fn ep_reserve_census_is_on_unless_exactly_zero() {
+        use memory::parse_ep_reserve_census as parse;
+        assert!(parse(None) && parse(Some("")) && parse(Some("1")) && parse(Some("off")));
+        assert!(parse(Some("true")) && parse(Some("00")) && parse(Some("2")));
+        assert!(!parse(Some("0")) && !parse(Some(" 0 ")));
+        assert!(memory::ep_reserve_census());
+        assert_eq!(
+            developer_key_for_env("HIPFIRE_EP_RESERVE_CENSUS").as_deref(),
+            Some("developer.ep_reserve_census")
+        );
+    }
+
+    #[test]
+    fn ep_hot_units_policy_and_sidecar_path() {
+        use memory::{parse_ep_hot_units as parse, EpHotUnits};
+        assert_eq!(parse(None), Ok(EpHotUnits::Discover));
+        assert_eq!(parse(Some("0")), Ok(EpHotUnits::Off));
+        assert_eq!(parse(Some(" 0 ")), Ok(EpHotUnits::Off));
+        assert_eq!(parse(Some("")), Ok(EpHotUnits::Off));
+        assert_eq!(
+            parse(Some(" /m/q.mq4.ep.hot-units ")),
+            Ok(EpHotUnits::Explicit("/m/q.mq4.ep.hot-units".into()))
+        );
+        for bad in ["1", "on", "q.ep.hot-units", "./q.ep.hot-units"] {
+            let error = parse(Some(bad)).unwrap_err();
+            assert!(error.contains("HIPFIRE_EP_HOT_UNITS"), "{bad}: {error}");
+        }
+        assert_eq!(memory::ep_hot_units(), Ok(EpHotUnits::Discover));
+        assert_eq!(
+            developer_key_for_env("HIPFIRE_EP_HOT_UNITS").as_deref(),
+            Some("developer.ep_hot_units")
+        );
+        assert_eq!(
+            memory::ep_hot_units_sidecar_path(Path::new("/m/q.mq4")),
+            PathBuf::from("/m/q.mq4.ep.hot-units")
+        );
+    }
+
+    #[test]
+    fn ep_hot_loan_mib_is_measured_unless_zero_or_a_positive_integer() {
+        use memory::{parse_ep_hot_loan_mib as parse, EpHotLoanMib};
+        assert_eq!(parse(None), Ok(EpHotLoanMib::Measured));
+        assert_eq!(parse(Some("0")), Ok(EpHotLoanMib::Off));
+        assert_eq!(parse(Some("")), Ok(EpHotLoanMib::Off));
+        assert_eq!(parse(Some(" 768 ")), Ok(EpHotLoanMib::Mib(768)));
+        assert_eq!(parse(Some("4096")), Ok(EpHotLoanMib::Mib(4096)));
+        for bad in ["-1", "1.5", "1GiB", "on", "0x10"] {
+            let error = parse(Some(bad)).unwrap_err();
+            assert!(error.contains("HIPFIRE_EP_HOT_LOAN_MIB"), "{bad}: {error}");
+        }
+        assert_eq!(memory::ep_hot_loan_mib(), Ok(EpHotLoanMib::Measured));
+        assert_eq!(
+            developer_key_for_env("HIPFIRE_EP_HOT_LOAN_MIB").as_deref(),
+            Some("developer.ep_hot_loan_mib")
+        );
+    }
+
+    #[test]
+    fn ep_elastic_cap_is_default_unless_zero_or_a_positive_integer() {
+        use memory::parse_ep_elastic_cap_bytes as parse;
+        assert_eq!(parse(None), Ok(2048 << 20));
+        assert_eq!(parse(Some("0")), Ok(0));
+        assert_eq!(parse(Some("")), Ok(0));
+        assert_eq!(parse(Some(" 512 ")), Ok(512 << 20));
+        for bad in ["-1", "1.5", "lots", "0x10", "99999999999999999999"] {
+            let error = parse(Some(bad)).unwrap_err();
+            assert!(error.contains("HIPFIRE_EP_ELASTIC_MIB"), "{bad}: {error}");
+        }
+        assert!(parse(Some("18446744073709551615"))
+            .unwrap_err()
+            .contains("overflows"));
+        assert_eq!(memory::ep_elastic_cap_bytes(), Ok(2048 << 20));
+        assert!(!memory::ep_elastic_log());
+        assert_eq!(
+            developer_key_for_env("HIPFIRE_EP_ELASTIC_MIB").as_deref(),
+            Some("developer.ep_elastic_mib")
+        );
+        assert_eq!(
+            developer_key_for_env("HIPFIRE_EP_ELASTIC_LOG").as_deref(),
+            Some("developer.ep_elastic_log")
+        );
     }
 
     #[test]
@@ -10864,6 +11042,17 @@ pub mod memory {
         PathBuf::from(path)
     }
 
+    /// Suffix of the Flash-Next EP2 hot-unit loan sidecar (calibrated host-read counts of the
+    /// static placement; JSON, `hipfire.qwen4.ep_hot_units`).
+    pub const EP_HOT_UNITS_SIDECAR_SUFFIX: &str = ".ep.hot-units";
+
+    /// Path of the hot-unit loan sidecar of `model`: `<model file name>.ep.hot-units`.
+    pub fn ep_hot_units_sidecar_path(model: &Path) -> PathBuf {
+        let mut path = model.as_os_str().to_owned();
+        path.push(EP_HOT_UNITS_SIDECAR_SUFFIX);
+        PathBuf::from(path)
+    }
+
     /// THE gate of the shipped EP expert hot set (D1). `false`: nothing changes unless
     /// `HIPFIRE_QWEN4_EP_EXPERT_HOTSET=<path>` names a sidecar (the loader never discovers one,
     /// `hipfire pull` does not fetch the sidecar). `true` (shipped): an EP2 gfx1201 Flash-Next load
@@ -11362,6 +11551,164 @@ pub mod memory {
     /// Pure truth table behind [`ep_share_host`]: only a trimmed `0` is off.
     pub fn parse_ep_share_host(raw: Option<&str>) -> bool {
         raw.map(str::trim) != Some("0")
+    }
+
+    /// Developer kill switch `HIPFIRE_EP_MTP_EXPERTS_RESIDENT` for the expert-parallel
+    /// native-MTP head's routed experts: default on, each rank of an EP load (2 or more
+    /// ranks) with the head attached keeps ITS OWNED slice of them (experts `e % ranks ==
+    /// rank`, 256 of 512 on EP2) VRAM-resident, charged to the rank's expert budget before the
+    /// trunk unit ranking walk, instead of pinned host RAM read over PCIe on every decode
+    /// step. Exactly `0` restores the host-mapped head placement.
+    pub fn ep_mtp_experts_resident() -> bool {
+        parse_ep_mtp_experts_resident(process_value("HIPFIRE_EP_MTP_EXPERTS_RESIDENT").as_deref())
+    }
+
+    /// Pure truth table behind [`ep_mtp_experts_resident`]: only a trimmed `0` is off.
+    pub fn parse_ep_mtp_experts_resident(raw: Option<&str>) -> bool {
+        raw.map(str::trim) != Some("0")
+    }
+
+    /// Developer kill switch `HIPFIRE_EP_HC8_PLAN_CHARGE` for the expert-parallel plan's
+    /// charge of the `<model>.hc8` sidecar: default on, the plan and every rank's fit census
+    /// charge the replicated HC mixer tensors at their E4M3 size (the bytes the applied
+    /// sidecar leaves allocated) instead of the manifest's BF16 size. Exactly `0` restores the
+    /// BF16 charge.
+    pub fn ep_hc8_plan_charge() -> bool {
+        parse_ep_hc8_plan_charge(process_value("HIPFIRE_EP_HC8_PLAN_CHARGE").as_deref())
+    }
+
+    /// Pure truth table behind [`ep_hc8_plan_charge`]: only a trimmed `0` is off.
+    pub fn parse_ep_hc8_plan_charge(raw: Option<&str>) -> bool {
+        raw.map(str::trim) != Some("0")
+    }
+
+    /// Developer kill switch `HIPFIRE_EP_RESERVE_CENSUS` for the expert-parallel (2 or more
+    /// ranks) reserve census: default on, an EP load charges the measured HIP runtime
+    /// (`QWEN4_EP2_RUNTIME_OVERHEAD_GFX1201_BYTES` on an exact gfx1201 EP2 load) and so
+    /// retires the historical single-device floor, sizes the trunk-shard rank's GDN state,
+    /// MTP capture ring and shared-expert INT8 shadows at the rank-local width instead of the
+    /// global one, and returns the pre-shard shared-expert copies from the device pool to HIP
+    /// after the shard. Exactly `0` restores the earlier EP behaviour byte for byte (floor
+    /// kept, global census terms, no pool drain). Read once per load.
+    pub fn ep_reserve_census() -> bool {
+        parse_ep_reserve_census(process_value("HIPFIRE_EP_RESERVE_CENSUS").as_deref())
+    }
+
+    /// Pure truth table behind [`ep_reserve_census`]: only a trimmed `0` is off.
+    pub fn parse_ep_reserve_census(raw: Option<&str>) -> bool {
+        raw.map(str::trim) != Some("0")
+    }
+
+    /// Environment variable of the hot-unit loan's sidecar: [`ep_hot_units`].
+    pub const EP_HOT_UNITS_ENV: &str = "HIPFIRE_EP_HOT_UNITS";
+    /// Environment variable of the hot-unit loan's size: [`ep_hot_loan_mib`].
+    pub const EP_HOT_LOAN_MIB_ENV: &str = "HIPFIRE_EP_HOT_LOAN_MIB";
+
+    /// Which `.ep.hot-units` sidecar a Flash-Next EP2 load lends from
+    /// (`HIPFIRE_EP_HOT_UNITS`, [`ep_hot_units`]).
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum EpHotUnits {
+        /// Unset: discover the sibling `<model>.ep.hot-units`; absent is no loan, silently.
+        Discover,
+        /// `0` (or blank): no loan. The kill switch.
+        Off,
+        /// An absolute path to the sidecar; it must apply (a refusal is a load error).
+        Explicit(PathBuf),
+    }
+
+    /// Developer variable `HIPFIRE_EP_HOT_UNITS` of the Flash-Next EP2 hot-unit loan: unset
+    /// discovers `<model>.ep.hot-units` next to the model, `0` turns the loan off, an absolute path
+    /// names the sidecar. Anything else is a policy error (never silently ignored). Read once per
+    /// load.
+    pub fn ep_hot_units() -> Result<EpHotUnits, String> {
+        parse_ep_hot_units(process_value(EP_HOT_UNITS_ENV).as_deref())
+    }
+
+    /// Pure parse behind [`ep_hot_units`].
+    pub fn parse_ep_hot_units(raw: Option<&str>) -> Result<EpHotUnits, String> {
+        match raw.map(str::trim) {
+            None => Ok(EpHotUnits::Discover),
+            Some("") | Some("0") => Ok(EpHotUnits::Off),
+            Some(path) if Path::new(path).is_absolute() => {
+                Ok(EpHotUnits::Explicit(PathBuf::from(path)))
+            }
+            Some(other) => Err(format!(
+                "{EP_HOT_UNITS_ENV}={other:?} is neither 0 nor an absolute path to a \
+                 .ep.hot-units sidecar"
+            )),
+        }
+    }
+
+    /// The size of the hot-unit loan per rank (`HIPFIRE_EP_HOT_LOAN_MIB`, [`ep_hot_loan_mib`]).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum EpHotLoanMib {
+        /// Unset: the measured safe loan (`QWEN4_EP2_HOT_LOAN_GFX1201_BYTES`).
+        Measured,
+        /// `0` (or blank): no loan. The kill switch.
+        Off,
+        /// This many MiB, clamped by the loader to the measured safe loan.
+        Mib(u64),
+    }
+
+    /// Developer variable `HIPFIRE_EP_HOT_LOAN_MIB` of the Flash-Next EP2 hot-unit loan: unset is
+    /// the measured safe loan, `0` turns the loan off, a positive integer is that many MiB per
+    /// rank (the loader clamps it to the measured safe loan). A non-integer is a policy error.
+    /// Read once per load.
+    pub fn ep_hot_loan_mib() -> Result<EpHotLoanMib, String> {
+        parse_ep_hot_loan_mib(process_value(EP_HOT_LOAN_MIB_ENV).as_deref())
+    }
+
+    /// Pure parse behind [`ep_hot_loan_mib`].
+    pub fn parse_ep_hot_loan_mib(raw: Option<&str>) -> Result<EpHotLoanMib, String> {
+        match raw.map(str::trim) {
+            None => Ok(EpHotLoanMib::Measured),
+            Some("") => Ok(EpHotLoanMib::Off),
+            Some(value) => match value.parse::<u64>() {
+                Ok(0) => Ok(EpHotLoanMib::Off),
+                Ok(mib) => Ok(EpHotLoanMib::Mib(mib)),
+                Err(_) => Err(format!(
+                    "{EP_HOT_LOAN_MIB_ENV}={value:?} is not a non-negative integer (MiB per rank)"
+                )),
+            },
+        }
+    }
+
+    /// Environment variable of the elastic reserve's cap: [`ep_elastic_cap_bytes`].
+    pub const EP_ELASTIC_MIB_ENV: &str = "HIPFIRE_EP_ELASTIC_MIB";
+    /// Environment variable of the elastic reserve's stderr log: [`ep_elastic_log`].
+    pub const EP_ELASTIC_LOG_ENV: &str = "HIPFIRE_EP_ELASTIC_LOG";
+    /// Default cap of the elastic reserve per rank: 2,048 MiB (the lend is lendable-bound: about 1,620 MiB on the cp15 fixture).
+    pub const EP_ELASTIC_DEFAULT_MIB: u64 = 2048;
+
+    /// Developer variable `HIPFIRE_EP_ELASTIC_MIB` of the Flash-Next EP2 elastic reserve (the
+    /// extra resident routed experts lent from idle VRAM): unset is the default cap of
+    /// [`EP_ELASTIC_DEFAULT_MIB`] MiB per rank, `0` (or blank) turns the reserve off, a positive
+    /// integer is the cap in MiB per rank. Returns the cap in bytes, `0` = off. A non-integer is a
+    /// policy error. Read once per load.
+    pub fn ep_elastic_cap_bytes() -> Result<u64, String> {
+        parse_ep_elastic_cap_bytes(process_value(EP_ELASTIC_MIB_ENV).as_deref())
+    }
+
+    /// Pure parse behind [`ep_elastic_cap_bytes`].
+    pub fn parse_ep_elastic_cap_bytes(raw: Option<&str>) -> Result<u64, String> {
+        match raw.map(str::trim) {
+            None => Ok(EP_ELASTIC_DEFAULT_MIB << 20),
+            Some("") => Ok(0),
+            Some(value) => match value.parse::<u64>() {
+                Ok(mib) => mib.checked_mul(1 << 20).ok_or_else(|| {
+                    format!("{EP_ELASTIC_MIB_ENV}={value:?} overflows a byte count")
+                }),
+                Err(_) => Err(format!(
+                    "{EP_ELASTIC_MIB_ENV}={value:?} is not a non-negative integer (MiB per rank)"
+                )),
+            },
+        }
+    }
+
+    /// Developer bool `HIPFIRE_EP_ELASTIC_LOG` (default off): one stderr line per elastic lend,
+    /// publish, reclaim and cache release.
+    pub fn ep_elastic_log() -> bool {
+        super::developer_bool(EP_ELASTIC_LOG_ENV, false)
     }
 
     /// Developer `HIPFIRE_LOAD_WEIGHT_DIGEST=<path>`: when set and not blank,

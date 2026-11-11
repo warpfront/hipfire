@@ -23,6 +23,7 @@
 pub mod builder;
 pub mod emit;
 pub mod hazard;
+pub mod lifted;
 pub mod ops;
 
 pub use peacemaker_cdna as model;

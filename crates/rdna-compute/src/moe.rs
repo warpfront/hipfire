@@ -18,6 +18,30 @@ static QWEN4_MOE_ROUTE_SCATTER: std::sync::LazyLock<bool> = std::sync::LazyLock:
     hipfire_config::developer_bool("HIPFIRE_QWEN4_MOE_ROUTE_SCATTER", true)
 });
 
+/// Rows the wide router + scatter fold ([`Gpu::moe_route_scatter_top10_wide_f32`]) serves: the g32
+/// verify window's top.
+pub const MOE_GLUE_FOLD_MAX_ROWS: usize = crate::prefill_invariant::WIDE_VERIFY_MAX_ROWS;
+
+/// Router tokens per workgroup of the wide router + scatter launch: one wave32 per token, eight
+/// waves (256 threads), the launch shape of `moe_router_softmax_top10_f32_fast`.
+pub const MOE_GLUE_FOLD_ROUTER_TOKENS_PER_GROUP: usize = 8;
+
+/// Words of the persistent arrival-counter buffer of the wide router + scatter launch (one counter
+/// used; the allocation is padded).
+pub const MOE_ROUTE_SYNC_WORDS: usize = 16;
+
+/// The owner tile mask carried by the wave-3 glue-fold scatter launches
+/// ([`Gpu::moe_scatter_fused_top10_pmask`], [`Gpu::moe_route_scatter_top10_wide_f32`]): the operands
+/// of [`Gpu::ep_tile_mask`] (`tiles` tile ids copied to `tile_ids_owned`, `-1` where
+/// `owner_table[id] != rank`).
+#[derive(Clone, Copy)]
+pub struct TileMaskFold<'a> {
+    pub tile_ids_owned: &'a GpuTensor,
+    pub owner_table: &'a GpuTensor,
+    pub tiles: usize,
+    pub rank: usize,
+}
+
 /// The shared expert's BF16 activation carried by a fused MoE launch: the
 /// operands of [`Gpu::shared_expert_activation_bf16_f32`].
 pub struct SharedExpertActivation<'a> {
@@ -2530,6 +2554,122 @@ impl Gpu {
         )
     }
 
+    /// [`Gpu::moe_down_combine_grouped_top10_bf16in_owned`] as ONE launch
+    /// (`HIPFIRE_QWEN4_MOE_COMBINE_INLINE_ORDER`): the owner-masked rank order is resolved
+    /// inside the combine (`moe_down_combine_grouped_top10_bf16in_ordered[_zinit]`), so no
+    /// `order` scratch is written or read. Bytewise the two-launch `_owned` pair: the same ten
+    /// route ranks in ascending expert id, a foreign expert's rank keeps its place and BF16
+    /// weight but adds a +0 row (its grouped row is never read), the same multiply / add /
+    /// BF16 rounding per column.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_down_combine_grouped_top10_bf16in_ordered(
+        &mut self,
+        grouped_down: &GpuTensor,
+        inverse_perm: &GpuTensor,
+        topk_indices: &GpuTensor,
+        topk_weights: &GpuTensor,
+        residual: &GpuTensor,
+        hidden: usize,
+        grouped_rows: usize,
+        tokens: usize,
+        initial_zero: bool,
+        n_experts: usize,
+        owners: crate::hc_row_fold::CombineOwners<'_>,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if hidden % 8 != 0
+            || owners.table.buf.size() < n_experts * 4
+            || owners.rank > i32::MAX as usize
+            || n_experts >= i32::MAX as usize
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "moe_down_combine_grouped_top10_bf16in_ordered: hidden % 8 != 0, owner table holds fewer than n_experts i32 or rank exceeds i32",
+            ));
+        }
+        require_span(
+            grouped_down,
+            &[grouped_rows, hidden, 2],
+            "moe_down_combine_grouped_top10_bf16in_ordered grouped rows",
+        )?;
+        require_span(
+            inverse_perm,
+            &[tokens, 10, 4],
+            "moe_down_combine_grouped_top10_bf16in_ordered inverse permutation",
+        )?;
+        require_span(
+            topk_indices,
+            &[tokens, 10, 4],
+            "moe_down_combine_grouped_top10_bf16in_ordered expert ids",
+        )?;
+        require_span(
+            topk_weights,
+            &[tokens, 10, 4],
+            "moe_down_combine_grouped_top10_bf16in_ordered weights",
+        )?;
+        require_span(
+            residual,
+            &[tokens, hidden, 4],
+            "moe_down_combine_grouped_top10_bf16in_ordered target",
+        )?;
+        let combine: &'static str = if initial_zero {
+            "moe_down_combine_grouped_top10_bf16in_ordered_zinit"
+        } else {
+            "moe_down_combine_grouped_top10_bf16in_ordered"
+        };
+        self.ensure_kernel(
+            "moe_combine_ordered",
+            kernels::MOE_COMBINE_ORDERED_SRC,
+            combine,
+        )?;
+        let gp = grouped_down.buf.as_ptr();
+        let ip = inverse_perm.buf.as_ptr();
+        let tp = topk_indices.buf.as_ptr();
+        let wp = topk_weights.buf.as_ptr();
+        let rp = residual.buf.as_ptr();
+        let owner = owners.table.buf.as_ptr();
+        let hv = hidden as i32;
+        let gr = grouped_rows as i32;
+        let tv = tokens as i32;
+        let nx = n_experts as i32;
+        let rank = owners.rank as i32;
+        let mut params = [
+            &gp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &rp as *const _ as *mut c_void,
+            &owner as *const _ as *mut c_void,
+            &hv as *const _ as *mut c_void,
+            &gr as *const _ as *mut c_void,
+            &tv as *const _ as *mut c_void,
+            &nx as *const _ as *mut c_void,
+            &rank as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            combine,
+            [(hidden as u32 / 8).div_ceil(64), tokens as u32, 1],
+            [64, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(gp);
+                b.push_ptr(ip);
+                b.push_ptr(tp);
+                b.push_ptr(wp);
+                b.push_ptr(rp);
+                b.push_ptr(owner);
+                b.push_i32(hv);
+                b.push_i32(gr);
+                b.push_i32(tv);
+                b.push_i32(nx);
+                b.push_i32(rank);
+                b
+            },
+        )
+    }
+
     fn moe_down_combine_grouped_top10_impl(
         &mut self,
         grouped_down: &GpuTensor,
@@ -2803,6 +2943,310 @@ impl Gpu {
                 b.push_i32(bm);
                 b
             });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result.map(|()| true)
+    }
+
+    /// X8a of `HIPFIRE_QWEN4_MOE_GLUE_FOLD`: the scatter launch also writes the owner tile mask
+    /// ([`Gpu::moe_scatter_fused_top10_pmask`]). Exact gfx1201, the block-wide-scan scatter (not the
+    /// `HIPFIRE_QWEN4_MOE_SCATTER_SCAN=0` serial walk), eager launch. Pure: reads flags and
+    /// device state only.
+    pub fn moe_glue_fold_mask_admitted(&self) -> bool {
+        self.flags
+            .qwen4_moe_glue_fold_enabled(crate::feature_flags::MOE_GLUE_FOLD_MASK)
+            && !self.flags.qwen4_moe_scatter_serial_walk()
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode
+    }
+
+    /// X8b of `HIPFIRE_QWEN4_MOE_GLUE_FOLD`: the 9..=64-row router + scatter (+ mask) launch
+    /// ([`Gpu::moe_route_scatter_top10_wide_f32`]) is admitted for this call: the flag's `b` fold,
+    /// exact gfx1201, the block-wide-scan scatter, eager launch, 9..=64 rows (1..=8 rows keep the
+    /// one-workgroup [`Gpu::moe_route_scatter_top10_f32`]) and the fixed E512/top-10 grammar.
+    pub fn moe_glue_fold_route_admitted(
+        &self,
+        tokens: usize,
+        n_experts: usize,
+        k_top: usize,
+    ) -> bool {
+        self.flags
+            .qwen4_moe_glue_fold_enabled(crate::feature_flags::MOE_GLUE_FOLD_ROUTER)
+            && !self.flags.qwen4_moe_scatter_serial_walk()
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode
+            && (9..=MOE_GLUE_FOLD_MAX_ROWS).contains(&tokens)
+            && n_experts == 512
+            && k_top == 10
+    }
+
+    /// The owner tile mask operands of the glue-fold scatter launches: the contract of
+    /// [`Gpu::ep_tile_mask`] (`tile_ids_owned` is a COPY of the scatter's tile ids, never aliasing
+    /// them; one owner rank per expert in `owner_table`).
+    fn glue_fold_mask_check(
+        mask: &TileMaskFold<'_>,
+        tile_ids: &GpuTensor,
+        n_experts: usize,
+    ) -> HipResult<()> {
+        let refuse = |what: &str| {
+            Err(hip_bridge::HipError::new(
+                0,
+                &format!("moe glue fold tile mask: {what}"),
+            ))
+        };
+        let word = std::mem::size_of::<i32>();
+        if mask.tiles == 0
+            || i32::try_from(mask.tiles).is_err()
+            || i32::try_from(mask.rank).is_err()
+        {
+            return refuse("need 0 < tiles and tiles, rank within i32");
+        }
+        if tile_ids.buf.size() < mask.tiles * word
+            || mask.tile_ids_owned.buf.size() < mask.tiles * word
+        {
+            return refuse("tile id buffers hold fewer than `tiles` words");
+        }
+        if mask.owner_table.buf.size() < n_experts * word {
+            return refuse("owner table holds fewer than `n_experts` words");
+        }
+        if tile_ids.buf.as_ptr() == mask.tile_ids_owned.buf.as_ptr() {
+            return refuse("the owned copy must not alias the source tile ids");
+        }
+        Ok(())
+    }
+
+    /// X8a: [`Gpu::moe_scatter_fused_top10`] followed by [`Gpu::ep_tile_mask`] in ONE launch
+    /// (`moe_scatter_fused_top10_pmask`, module `moe_route_scatter_wide`): the same scatter tables
+    /// (the unchanged scatter body) and `tile_ids_owned[t] = owner_table[id] == rank ? id : -1`
+    /// over the final `expert_tile_ids` (`tiles = grouped_rows / 16`). Callers check
+    /// [`Gpu::moe_glue_fold_mask_admitted`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_scatter_fused_top10_pmask(
+        &mut self,
+        topk_indices: &GpuTensor,
+        expert_token_counts: &GpuTensor,
+        expert_offsets: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        inverse_perm: &GpuTensor,
+        total_slots: usize,
+        num_experts: usize,
+        grouped_rows: usize,
+        block_m: usize,
+        mask: TileMaskFold<'_>,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        Self::glue_fold_mask_check(&mask, expert_tile_ids, num_experts)?;
+        let func = "moe_scatter_fused_top10_pmask";
+        self.ensure_kernel(
+            "moe_route_scatter_wide",
+            kernels::MOE_ROUTE_SCATTER_WIDE_SRC,
+            func,
+        )?;
+        let ip = topk_indices.buf.as_ptr();
+        let cp = expert_token_counts.buf.as_ptr();
+        let op = expert_offsets.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let tp = expert_tile_ids.buf.as_ptr();
+        let invp = inverse_perm.buf.as_ptr();
+        let owned = mask.tile_ids_owned.buf.as_ptr();
+        let table = mask.owner_table.buf.as_ptr();
+        let (ts, ne, gr, bm) = (
+            total_slots as i32,
+            num_experts as i32,
+            grouped_rows as i32,
+            block_m as i32,
+        );
+        let (tiles, rank) = (mask.tiles as i32, mask.rank as i32);
+        let mut params = [
+            &ip as *const _ as *mut c_void,
+            &cp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &invp as *const _ as *mut c_void,
+            &ts as *const _ as *mut c_void,
+            &ne as *const _ as *mut c_void,
+            &gr as *const _ as *mut c_void,
+            &bm as *const _ as *mut c_void,
+            &owned as *const _ as *mut c_void,
+            &table as *const _ as *mut c_void,
+            &tiles as *const _ as *mut c_void,
+            &rank as *const _ as *mut c_void,
+        ];
+        let lds_bytes = (num_experts * 4) as u32;
+        let bytes = (total_slots + 2 * num_experts + 2 * total_slots + num_experts) * 4
+            + mask.tiles * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "elementwise", func, bytes);
+        let result =
+            self.launch_maybe_blob(func, [1, 1, 1], [256, 1, 1], lds_bytes, &mut params, || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ip);
+                b.push_ptr(cp);
+                b.push_ptr(op);
+                b.push_ptr(sp);
+                b.push_ptr(tp);
+                b.push_ptr(invp);
+                b.push_i32(ts);
+                b.push_i32(ne);
+                b.push_i32(gr);
+                b.push_i32(bm);
+                b.push_ptr(owned);
+                b.push_ptr(table);
+                b.push_i32(tiles);
+                b.push_i32(rank);
+                b
+            });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// X8b: the E512/top-10 router, the grouped scatter and (with `mask`) the owner tile mask of
+    /// 9..=[`MOE_GLUE_FOLD_MAX_ROWS`] rows as ONE launch (`moe_route_scatter_top10_wide_f32`, module
+    /// `moe_route_scatter_wide`; `ceil(rows / 8)` workgroups of 256 threads, each routing eight tokens
+    /// like the unfused router; the last workgroup to finish its rows, counted on the persistent
+    /// [`Gpu::moe_route_sync`] word, runs the scatter and the mask). Outputs are byte for byte those of
+    /// [`Gpu::moe_router_softmax_top10_f32`] + [`Gpu::moe_scatter_fused_top10`] (+
+    /// [`Gpu::ep_tile_mask`]) up to the order of the slots inside one expert's bucket (the shipped
+    /// scatter's atomic arrival race, unchanged). Returns `Ok(false)` and launches nothing when
+    /// [`Gpu::moe_glue_fold_route_admitted`] is false.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_route_scatter_top10_wide_f32(
+        &mut self,
+        logits: &GpuTensor,
+        topk_idx: &GpuTensor,
+        topk_w: &GpuTensor,
+        tokens: usize,
+        normalize_topk_prob: bool,
+        round_logits: bool,
+        layer: usize,
+        row_base: usize,
+        expert_token_counts: &GpuTensor,
+        expert_offsets: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        inverse_perm: &GpuTensor,
+        n_experts: usize,
+        k_top: usize,
+        grouped_rows: usize,
+        block_m: usize,
+        mask: Option<TileMaskFold<'_>>,
+    ) -> HipResult<bool> {
+        if !self.moe_glue_fold_route_admitted(tokens, n_experts, k_top) {
+            return Ok(false);
+        }
+        self.bind_thread()?;
+        if let Some(mask) = mask.as_ref() {
+            Self::glue_fold_mask_check(mask, expert_tile_ids, n_experts)?;
+        }
+        let func = "moe_route_scatter_top10_wide_f32";
+        self.ensure_kernel(
+            "moe_route_scatter_wide",
+            kernels::MOE_ROUTE_SCATTER_WIDE_SRC,
+            func,
+        )?;
+        let lp = logits.buf.as_ptr();
+        let ip = topk_idx.buf.as_ptr();
+        let wp = topk_w.buf.as_ptr();
+        let norm = i32::from(normalize_topk_prob);
+        let round = i32::from(round_logits);
+        let token_count = tokens as i32;
+        let fault = self.router_fault_ptr();
+        let layer_arg = layer as i32;
+        let row_base_arg = row_base as i32;
+        let cp = expert_token_counts.buf.as_ptr();
+        let op = expert_offsets.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let tp = expert_tile_ids.buf.as_ptr();
+        let invp = inverse_perm.buf.as_ptr();
+        let gr = grouped_rows as i32;
+        let bm = block_m as i32;
+        let null: *mut c_void = std::ptr::null_mut();
+        let (owned, table, tiles, rank) = match mask.as_ref() {
+            Some(m) => (
+                m.tile_ids_owned.buf.as_ptr(),
+                m.owner_table.buf.as_ptr(),
+                m.tiles as i32,
+                m.rank as i32,
+            ),
+            None => (null, null, 0, 0),
+        };
+        let mut params: Vec<*mut c_void> = vec![
+            &lp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &norm as *const _ as *mut c_void,
+            &round as *const _ as *mut c_void,
+            &token_count as *const _ as *mut c_void,
+            &fault as *const _ as *mut c_void,
+            &layer_arg as *const _ as *mut c_void,
+            &row_base_arg as *const _ as *mut c_void,
+            &cp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &invp as *const _ as *mut c_void,
+            &gr as *const _ as *mut c_void,
+            &bm as *const _ as *mut c_void,
+            &owned as *const _ as *mut c_void,
+            &table as *const _ as *mut c_void,
+            &tiles as *const _ as *mut c_void,
+            &rank as *const _ as *mut c_void,
+        ];
+        // Arrival counter of the last-workgroup scatter: one persistent word, zero between
+        // launches (the last workgroup resets it), zeroed once on first use.
+        if self.moe_route_sync.is_none() {
+            let sync = self.alloc_tensor(&[MOE_ROUTE_SYNC_WORDS], DType::F32)?;
+            self.memset_stream_ordered(&sync.buf, 0, sync.buf.size())?;
+            self.moe_route_sync = Some(sync);
+        }
+        let sync = self.moe_route_sync.as_ref().unwrap().buf.as_ptr();
+        let lds_bytes = (n_experts * 4) as u32;
+        let groups = tokens.div_ceil(MOE_GLUE_FOLD_ROUTER_TOKENS_PER_GROUP) as u32;
+        let bytes = (tokens * 512
+            + tokens * 10 * 2
+            + tokens * 10
+            + 2 * n_experts
+            + 2 * tokens * 10
+            + n_experts)
+            * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "elementwise", func, bytes);
+        params.push(&sync as *const _ as *mut c_void);
+        let result = self.launch_maybe_blob(
+            func,
+            [groups, 1, 1],
+            [256, 1, 1],
+            lds_bytes,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(lp);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_i32(norm);
+                b.push_i32(round);
+                b.push_i32(token_count);
+                b.push_ptr(fault as *const c_void);
+                b.push_i32(layer_arg);
+                b.push_i32(row_base_arg);
+                b.push_ptr(cp);
+                b.push_ptr(op);
+                b.push_ptr(sp);
+                b.push_ptr(tp);
+                b.push_ptr(invp);
+                b.push_i32(gr);
+                b.push_i32(bm);
+                b.push_ptr(owned);
+                b.push_ptr(table);
+                b.push_i32(tiles);
+                b.push_i32(rank);
+                b.push_ptr(sync);
+                b
+            },
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -5705,7 +6149,9 @@ mod tests {
             ("none_owned", |_| 1, 0),
             ("all_owned", |_| 0, 0),
         ];
-        for tokens in [1usize, 37, 530, 4096] {
+        // 3 rows: the few-row verify; 9 / 47 / 48 / 64: the wide-verify int8 chain's rows
+        // (`HIPFIRE_QWEN4_FFN_CLEAR_ABSORB`, the 9..=64-row owner-masked EP2 verify MoE).
+        for tokens in [1usize, 3, 9, 37, 47, 48, 64, 530, 4096] {
             let slots = tokens * 10;
             let mut state = 0x9E37_79B9u64 ^ tokens as u64;
             let mut next = || {
@@ -5850,6 +6296,58 @@ mod tests {
                         !b.iter().any(|v| v.is_nan()),
                         "NaN leaked: {name} tokens={tokens}"
                     );
+                    if initial_zero {
+                        // The production route today: the FFN `zero_f32`, then the owned
+                        // combine accumulating (`initial_zero = false`) over the same poisoned
+                        // foreign rows. The absorbed arm (dirty target, `_zinit`) must store the
+                        // very same words in every (token, column), owned or foreign.
+                        let zeroed_t = gpu.zeros(&[tokens * HIDDEN], DType::F32).expect("zeros");
+                        let order_prod = gpu
+                            .upload_raw(&vec![0u8; slots * 8], &[slots * 8])
+                            .expect("order");
+                        gpu.moe_down_combine_grouped_top10_bf16in_owned(
+                            &poison_t,
+                            &inverse_t,
+                            &experts_t,
+                            &weights_t,
+                            &zeroed_t,
+                            &order_prod,
+                            HIDDEN,
+                            grouped_rows,
+                            tokens,
+                            false,
+                            N_EXP,
+                            Some(crate::hc_row_fold::CombineOwners {
+                                table: &owner_t,
+                                rank,
+                            }),
+                        )
+                        .expect("production owned combine");
+                        let prod = gpu.download_f32(&zeroed_t).expect("download");
+                        let prod_differing = prod
+                            .iter()
+                            .zip(&b)
+                            .filter(|(x, y)| x.to_bits() != y.to_bits())
+                            .count();
+                        assert_eq!(
+                            prod_differing, 0,
+                            "absorbed store differs from clear + accumulate in {prod_differing} of {} words: {name} tokens={tokens}",
+                            prod.len()
+                        );
+                        if let Ok(path) = std::env::var("OWNED_COMBINE_RECEIPT") {
+                            let mut f = std::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(path)
+                                .expect("receipt");
+                            writeln!(
+                                f,
+                                "tokens={tokens} case={name} absorbed_vs_clear_accumulate words={} mismatches=0",
+                                prod.len()
+                            )
+                            .expect("receipt write");
+                        }
+                    }
                     if name != "none_owned" {
                         assert!(a.iter().any(|v| *v != 0.0), "baseline all zero: {name}");
                     }
