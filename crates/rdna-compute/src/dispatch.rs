@@ -2032,6 +2032,11 @@ pub struct Gpu {
     /// Also set for one gfx1151 Flash-Next prefill tile of fewer than 512 rows
     /// on the agent-turn append route (`HIPFIRE_QWEN4_APPEND_WMMA`).
     pub prefill_invariant_scope: bool,
+    /// True while an ordinary (non-verify, non-decode) prefill forward runs
+    /// ([`Gpu::ordinary_prefill_enter`]): GDN/FFN/attention producers take the canonical
+    /// bulk recipe for every actual row count, and the Qwen4 route rows are the canonical
+    /// chunk ([`Gpu::route_rows`]) WITHOUT the invariant profile's IU4 suppression.
+    pub ordinary_prefill_scope: bool,
     /// Row-exact rows of the verify forward in flight (`0` = not a verify
     /// forward). Widens the few-row routes (`Gpu::few_row_limit`) so an
     /// n-row verify is bitwise the sequential decode rows; prefill and every
@@ -3433,6 +3438,7 @@ impl Gpu {
             qwen4_moe_down_a8_scratch_bytes: 0,
             lane_rows_scope: false,
             prefill_invariant_scope: false,
+            ordinary_prefill_scope: false,
             wide_verify_rows: 0,
             lane_row_exact_scope: false,
             prefill_lwmma_dense_hold: false,
@@ -6049,15 +6055,55 @@ impl Gpu {
         prepared.checked_ptr(generation, ptr, k, n)
     }
 
+    /// True while an ordinary prefill forward is in flight ([`Self::ordinary_prefill_enter`])
+    /// and no verify scope is open: numerical producer policy is then the canonical
+    /// long-prefill recipe for EVERY valid row, never a function of the outer call's row
+    /// count. Verify intent ([`Self::iu4_verify_scope`], [`Self::fp8_verify_scope`], a wide
+    /// verify forward) always wins.
+    #[inline]
+    pub fn ordinary_prefill_active(&self) -> bool {
+        self.ordinary_prefill_scope
+            && !self.iu4_verify_scope
+            && !self.fp8_verify_scope
+            && self.wide_verify_rows == 0
+    }
+
+    /// Open the ordinary-prefill intent; returns the previous value for
+    /// [`Self::ordinary_prefill_exit`]. Every row-count numerical selector
+    /// (`n >= 64` producer gates, route rows of the Qwen4 policy) takes the bulk recipe
+    /// for any actual extent `n >= 1` while it is set. Actual extents still govern buffer
+    /// validation, grids, masks and token counts. Callers restore on every return path.
+    #[inline]
+    pub fn ordinary_prefill_enter(&mut self) -> bool {
+        // bind_thread: skip — host-side scope flag, no HIP call.
+        std::mem::replace(&mut self.ordinary_prefill_scope, true)
+    }
+
+    /// Restore the value [`Self::ordinary_prefill_enter`] returned.
+    #[inline]
+    pub fn ordinary_prefill_exit(&mut self, prev: bool) {
+        // bind_thread: skip — host-side scope flag, no HIP call.
+        self.ordinary_prefill_scope = prev;
+    }
+
+    /// Row admission of a bulk prefill producer: the historic `n >= 64` outside the ordinary
+    /// prefill intent; any positive actual extent inside it (the physical-extent half of the
+    /// decision stays with the callee's own bounds).
+    #[inline]
+    pub(crate) fn prefill_rows_admit(&self, n: usize) -> bool {
+        n >= 64 || (n > 0 && self.ordinary_prefill_active())
+    }
+
     /// The A8 projection route. Off inside the IU4 verify scope, whose
-    /// producers must not depend on the row count.
+    /// producers must not depend on the row count. Ordinary prefill intent keeps the route
+    /// for every row count ([`Self::prefill_rows_admit`]).
     pub fn a8_prefill_active(&self, n: usize, k: usize) -> bool {
         self.flags.a8_prefill_enabled()
             && self.mq4v2_symmetric
             && !self.iu4_verify_scope
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
-            && n >= 64
+            && self.prefill_rows_admit(n)
             && k > 0
             && k % 256 == 0
     }
@@ -6073,7 +6119,7 @@ impl Gpu {
             && !self.a8_prefill_active(batch, k)
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
-            && batch >= 64
+            && self.prefill_rows_admit(batch)
             && k > 0
             && k % 256 == 0
     }
@@ -6091,7 +6137,7 @@ impl Gpu {
             && self.flags.iu4_prefill_enabled()
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
-            && (batch >= 64 || (self.iu4_verify_scope && batch >= 1))
+            && (self.prefill_rows_admit(batch) || (self.iu4_verify_scope && batch >= 1))
             && k > 0
             && k % 256 == 0
     }
@@ -6108,7 +6154,7 @@ impl Gpu {
             && self.flags.iu4_prefill_enabled()
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
-            && (batch >= 64 || (self.iu4_verify_scope && batch >= 1))
+            && (self.prefill_rows_admit(batch) || (self.iu4_verify_scope && batch >= 1))
             && k > 0
             && k % 256 == 0
     }
@@ -6206,7 +6252,7 @@ impl Gpu {
             && !self.a8_prefill_active(batch, k)
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
-            && batch >= 64
+            && self.prefill_rows_admit(batch)
             && k > 0
             && k % 256 == 0
     }
@@ -6225,7 +6271,7 @@ impl Gpu {
             && self.arch == "gfx1201"
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
-            && batch >= 64
+            && self.prefill_rows_admit(batch)
             && k > 0
             && k % 256 == 0
     }

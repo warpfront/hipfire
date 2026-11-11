@@ -199,6 +199,8 @@ impl Gpu {
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
             && !self.fp8_verify_scope
+            // Verify-window route: ordinary prefill takes the bulk arithmetic at every extent.
+            && !self.ordinary_prefill_active()
     }
 
     /// The int8 activation scratch `(xq, dx)`: `Q8X_SCRATCH_ROWS x Q8X_MAX_K`
