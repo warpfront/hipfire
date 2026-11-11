@@ -796,6 +796,15 @@ hot set `qwen3.8-flash-next-base.mq4-xts.expert-hotset` (sha256 `91143074…`);
 the monolith-bound overlay (`df49bc0a…`) and hot set (`7f6760e1…`) serve
 grandfathered monolithic installs.
 
+**EP2 serve fixture (2x R9700).** The 0.4.5 Flash-Next EP2 serve measurements
+(cp20) use the symmetric-trunk variant `qwen3.8-flash-next-base.mq4-xts-symtrunk`
+with its `.hc8`, `.ep.hot-units` and `.ep.expert-hotset` sidecars; fixture,
+hashes, cells and method are in
+[`docs/perf-checkpoints/2026-11-11-flash-next-ep2-cp20.md`](docs/perf-checkpoints/2026-11-11-flash-next-ep2-cp20.md).
+Use that cell plan (story/code x C1/C4/C8, fresh serves, pooled medians with
+bootstrap CIs) for any EP2 serve claim, and the rules in
+[`lessons-0.4.5.md`](docs/methodology/lessons-0.4.5.md) § 4.
+
 HF preservation policy: the monolithic HF objects (`qwen3.8-flash-next.mq4-xts`,
 `qwen3.8-flash-next-gptq3.mq4` and the two retired artifacts below) must stay
 published while 0.4.2 clients exist, because their bundles reference them.
@@ -1348,26 +1357,27 @@ reach for.
 
 ## 8 · Open questions agents can investigate
 
-If you want to actively contribute findings, these are open:
+Open performance questions are tracked against the 0.4.5 Flash-Next EP2 record
+([`lessons-0.4.5.md`](docs/methodology/lessons-0.4.5.md) and the cp20
+checkpoint); read both before proposing a lever. Still open there:
 
-1. **Phase 3 prompt-shape rules** — what other rare BPE tokens depress
-   τ? Run `encode_prompt --heat` on a wide variety of prompts and look
-   for patterns.
-2. **Path C training — DEAD**: target-aligned custom DFlash draft (`feat/mtp-dflash-training`) was a failed month-1 experiment and is out of scope. Do not pursue; no recipe is forthcoming. (Historical note: prior revisions listed this as an open investigation.)
-3. **Path D engineering**: stale-context overlap pipelining — the only
-   structural lever still on the table for 27B-3.5 code beyond +8.2%.
-4. **DDTree gfx1100 fix**: linearization-slot RoPE phase delta skew
-   (commit 39aa358). Per-genre data: `feedback_dflash_per_genre`
-   memory. If you have an idea for the structural fix, the project
-   memory has the relevant context.
+1. **EP2 TTFT** — the dominant gap at every cell (0.065-0.263 s median stream
+   TTFT on 2x R9700 vs about half that for another open engine on the same host).
+2. **Story / low-τ decode** — story cells run at τ about 2.2; per-stream decode
+   is below that engine's at C1-C8.
+3. **DDTree gfx1100 fix**: linearization-slot RoPE phase delta skew
+   (commit 39aa358).
+
+Closed, do not reopen: Path C (target-aligned custom DFlash draft training) is
+dead.
 
 ---
 
-*Last updated: 2026-11-10 (0.4.5 cycle: engineering lessons made authoritative in
-[`docs/methodology/lessons-0.4.5.md`](docs/methodology/lessons-0.4.5.md); bench
-method, perf-claim rules, pre-commit/railgun-cert gate, Redline default list and
-MTP copy-lane/row-exact notes refreshed). When this doc gets stale (more than
-1-2 releases behind HEAD), update it as part of the release PR.*
+*Last updated: 2026-11-11 (0.4.5 release: EP2 serve fixture pointer and open
+questions refreshed; engineering lessons are authoritative in
+[`docs/methodology/lessons-0.4.5.md`](docs/methodology/lessons-0.4.5.md) and win
+over this file). When this doc gets stale (more than 1-2 releases behind HEAD),
+update it as part of the release PR.*
 
 
 # Code intelligence — CodeGraph
