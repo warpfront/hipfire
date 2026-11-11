@@ -86,6 +86,12 @@ When `rope_scaling` is `Yarn(_)`, DFlash and MTP are refused at load:
 the draft's position arithmetic diverges from the target's under rescaled
 RoPE. `dflash_mode=on` fails the load; `auto` logs and serves AR.
 
+The refusal lives on **both** qwen35 load paths: the serve_engine path
+and the single-GPU carrier path (`hipfire-loader::finish_qwen35_load`,
+what `hipfire run` uses). The carrier guard was added after a measured
+miss: the serve-only refusal left the carrier arming DFlash under
+`HIPFIRE_YARN_FACTOR=2.0` on qwen3.8-27b.mq4.
+
 ## Safety case: default path bit-exact
 
 `RopeYarn::OFF` (`freq_scale=1.0, corr_low=0, corr_high=0, mscale=1.0`)
