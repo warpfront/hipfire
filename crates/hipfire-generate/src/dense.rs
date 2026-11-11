@@ -4384,6 +4384,12 @@ pub fn generate_muse_glimmer(
         false,
     );
 
+    // Abort latched while parked (e.g. behind a batch barrier): no prefill, no decode.
+    if check_abort(id) {
+        crate::ar::emit_active_route_cancel(stdout, id, 0);
+        return;
+    }
+
     if m.tokenizer.is_none() {
         emit_error_with_id(stdout, id, "tokenizer not loaded");
         return;
@@ -4978,7 +4984,8 @@ pub fn generate_muse_glimmer(
                     .ok()
                     .as_deref()
                     == Some("1");
-                if generated_count >= max_tokens {
+                // Abort ends decode here; the commit handshake below resolves it.
+                if generated_count >= max_tokens || check_abort(id) {
                     break;
                 }
                 if bundle.state.n_tokens >= cache_cap {
@@ -5882,7 +5889,7 @@ pub fn generate_muse_glimmer(
         };
 
         loop {
-            if generated_count >= max_tokens {
+            if generated_count >= max_tokens || check_abort(id) {
                 break;
             }
             // eos/eot always stop; eom is handled via router text marker

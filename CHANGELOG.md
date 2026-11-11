@@ -5,6 +5,10 @@
 - PeaceMaker RDNA: pin a named SOP1 XML-condition override table to all three source hashes, with per-row LLVM register, inline and literal byte-round-trip evidence. Preserve the malformed source condition; exhaustively prove all 256 selectors for restricted operand domains instead of disabling valid register forms along with invalid inline/literal forms.
 - PeaceMaker RDNA: carry full instruction/encoding/condition/ordinal keys through IR construction and RDNA consumers, and add an XML-layout field codec backed by generated runtime rows. Preserve named graphics refusals and refuse unqualified XML variants in the numeric emulator.
 
+### Fixes: Muse Glimmer client abort (HIPF-276)
+
+- **Fixed: a client abort stops Muse Glimmer singleton decode.** `generate_muse_glimmer` never polled the terminal control during decode, so an aborted request ran to `max_tokens` or the cache cap (54 s on halo) while holding the GPU and the sequential queue. The spec window loop and the AR loop now check the abort each step and end in the existing commit handshake (`aborted`, session reset). An abort latched before the request starts produces no prefill or decode.
+
 ### Fixes: CI and platform builds
 
 - **Fixed: the Windows MSVC build links again.** The EP skew log's `clock_gettime` (hipfire-arch-qwen4) and the `HIPFIRE_DEBUG_FORCE_EVICT_MS` repro knob's `mmap`/`madvise`/`dlopen`/`dlsym` (rdna-compute PM4 replay) were declared as libc externs on every OS, so `link.exe` failed with LNK1120. Both are Linux-only now: off Linux the skew log timestamps from a process-local monotonic clock, and the force-evict knob is reported once and ignored. The hipfire-config hot-units sidecar test, hidden behind the link failure, now uses a path that is absolute on Windows too.
