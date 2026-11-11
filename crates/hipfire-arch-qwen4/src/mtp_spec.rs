@@ -36,6 +36,10 @@ use hipfire_runtime::spec::{
     SpecScratch, SpecStep, SpecTarget, Speculator,
 };
 use hipfire_runtime::spec_economics::{
+    batched_depth as economics_batched_depth, observe_agreement, observe_agreement_counts,
+    valid_us, Action, NativeWindow, WindowStats, AGREEMENT_PRIOR, DEFAULT_DECAY,
+};
+use hipfire_runtime::spec_economics::{
     derived_offer_bin, fn_measured_ar_price, fn_measured_depth_counts, fn_measured_load_identity,
     fn_measured_reference_supported, fn_measured_window_price, fn_phase1_ar_price,
     fn_phase1_window_price, native_margin_bin, CalibrationCounts, ContextBucket, DerivedAction,
@@ -44,10 +48,6 @@ use hipfire_runtime::spec_economics::{
 };
 #[cfg(test)]
 use hipfire_runtime::spec_economics::{fresh_agreement, Agreement, MAX_DEPTH};
-use hipfire_runtime::spec_economics::{
-    batched_depth as economics_batched_depth, observe_agreement, observe_agreement_counts,
-    valid_us, Action, NativeWindow, WindowStats, AGREEMENT_PRIOR, DEFAULT_DECAY,
-};
 use hipfire_runtime::spec_sampling::{
     accept_naive_prefix, accept_sampled_prefix, naive_target_sampler, verify_sampled_draft,
     DraftVerdict, PenaltyHistory, SampleSpec, SparseDist, SpecRng,
@@ -2035,12 +2035,25 @@ const G942_TRUNK_GEMV_ENV: &str = "HIPFIRE_G942_TRUNK_GEMV";
 /// Measured gfx942 window cost in milliseconds, same index as
 /// [`MTP_WINDOW_COST`]: `[0]` is one interleaved token (a single-row forward
 /// plus one head step), `[d]` a batched window drafting `d` tokens (`d` head
-/// steps, the `d + 1` row verify and the repair). `None` is unmeasured: the
-/// planner refuses that depth on gfx942 and never prices it from the
-/// gfx1151 table. Fill from `examples/qwen4_mtp_g942_cost.rs` (`lab`) on the
-/// real model; with `[0]` unset no native route is priced at all.
-pub(crate) const MTP_WINDOW_COST_MS_GFX942: [Option<f32>; MTP_WINDOW_COST.len()] =
-    [None; MTP_WINDOW_COST.len()];
+/// steps, the `d + 1` row verify and the repair). Values are mean window ms
+/// from `examples/qwen4_mtp_g942_cost.rs` on the MI300X (gfx942) with the
+/// stock-FP8 Flash-Next artifact (context 1743..2170, 24 windows per depth,
+/// AR token 18.22 ms). A width carries a cost only once greedy identity
+/// (MTP == AR) has proven it exact on gfx942; an unpublished width (`None`)
+/// is refused at route time, dropping to the deepest published width below
+/// it, else AR, and is never priced from the gfx1151 table. Depths >= 2 cost
+/// 4-20x a token (each window past depth 1 adds ~55-60 ms), so the economics
+/// never choose them today.
+pub(crate) const MTP_WINDOW_COST_MS_GFX942: [Option<f32>; MTP_WINDOW_COST.len()] = [
+    Some(18.26),
+    Some(21.50),
+    Some(87.16),
+    Some(146.07),
+    Some(200.79),
+    Some(253.09),
+    Some(309.41),
+    Some(365.34),
+];
 
 type G942CostMs = [Option<f32>; MTP_WINDOW_COST.len()];
 
@@ -6043,11 +6056,15 @@ impl Qwen4MtpDrafter {
 
     /// With no agreement evidence, start at K=3 (or the smaller budget);
     /// evidence may still grow the chooser to the unchanged configured cap.
+    /// gfx942 prices every depth from its measured table from the first
+    /// window (the prior agreement included): its depth >= 2 windows cost
+    /// several tokens, so the K=3 start would run the request's probe
+    /// windows at a measured loss.
     fn batched_depth(&self, k: usize) -> usize {
-        if self.agreement.iter().all(|&entry| entry == AGREEMENT_PRIOR) {
-            k.min(3)
-        } else if self.g942 {
+        if self.g942 {
             economics_batched_depth(&self.agreement, k, &g942_cost_ratios(&self.g942_cost_ms))
+        } else if self.agreement.iter().all(|&entry| entry == AGREEMENT_PRIOR) {
+            k.min(3)
         } else {
             self.floor.provisional_depth(&self.agreement, k)
         }
@@ -6064,10 +6081,7 @@ impl Qwen4MtpDrafter {
                 .copied()
                 .unwrap_or(f32::INFINITY)
         } else {
-            MTP_WINDOW_COST
-                .get(depth)
-                .copied()
-                .unwrap_or(f32::INFINITY)
+            MTP_WINDOW_COST.get(depth).copied().unwrap_or(f32::INFINITY)
         }
     }
 
@@ -12435,7 +12449,7 @@ mod tests {
     #[test]
     fn g942_without_a_measured_cost_refuses_native_depths_and_never_borrows_the_gfx1151_table() {
         let mut drafter = g942_drafter();
-        assert!(MTP_WINDOW_COST_MS_GFX942.iter().all(Option::is_none));
+        drafter.g942_cost_ms = [None; MTP_WINDOW_COST.len()];
         for depth in 0..MTP_WINDOW_COST.len() {
             assert!(drafter.window_cost_prior(depth).is_infinite(), "{depth}");
         }
@@ -12516,16 +12530,22 @@ mod tests {
 
     #[test]
     fn g942_measured_costs_price_only_their_own_depths() {
-        let mut drafter = g942_drafter();
+        let unmeasured = || {
+            let mut drafter = g942_drafter();
+            drafter.g942_cost_ms = [None; MTP_WINDOW_COST.len()];
+            drafter
+        };
+        let mut drafter = unmeasured();
         // Only the interleaved baseline: no batched depth is priced.
         drafter.g942_cost_ms[0] = Some(30.0);
         assert_eq!(plan_of(&mut drafter, 3, None).route, WindowRoute::ArRouted);
         // Batched depths without the baseline cannot be priced either.
-        let mut no_base = g942_drafter();
+        let mut no_base = unmeasured();
         no_base.g942_cost_ms[2] = Some(50.0);
         assert_eq!(plan_of(&mut no_base, 3, None).route, WindowRoute::ArRouted);
-        // Baseline and depth 2 measured: the prior's depth 3 drops to 2.
-        let mut priced = g942_drafter();
+        // Baseline and depth 2 measured: depth 2 is the only priced batched
+        // depth and it beats the baseline at the prior agreement.
+        let mut priced = unmeasured();
         priced.g942_cost_ms[0] = Some(30.0);
         priced.g942_cost_ms[2] = Some(60.0);
         assert_eq!(priced.window_cost_prior(0), 1.0);
@@ -12535,6 +12555,42 @@ mod tests {
         let plan = plan_of(&mut priced, 3, None);
         assert_eq!(plan.route, WindowRoute::Native { depth: 2 });
         assert!(plan.floor_active && !priced.g942_refused);
+    }
+
+    #[test]
+    fn g942_shipped_table_prices_published_depths_and_keeps_a_batched_plan_at_depth_one() {
+        let mut drafter = g942_drafter();
+        let base = MTP_WINDOW_COST_MS_GFX942[0].expect("the baseline is published");
+        assert!(base > 0.0);
+        for (depth, cost) in MTP_WINDOW_COST_MS_GFX942.iter().enumerate() {
+            if let Some(cost) = cost {
+                let prior = drafter.window_cost_prior(depth);
+                assert!(prior.is_finite(), "{depth}");
+                assert_eq!(prior, cost / base, "{depth}");
+            }
+        }
+        // An unpublished depth 2 maps to the deepest published one below it.
+        let mut table = MTP_WINDOW_COST_MS_GFX942;
+        table[2] = None;
+        assert_eq!(g942_priced_depth_at_or_below(&table, 2), Some(1));
+        assert_eq!(g942_priced_depth_at_or_below(&table, 0), Some(0));
+        // At the prior agreement (a fresh request) gfx942 already prices from
+        // its table: depth 1, never the K=3 start of the other arches.
+        assert!(drafter
+            .agreement
+            .iter()
+            .all(|&entry| entry == AGREEMENT_PRIOR));
+        assert_eq!(drafter.batched_depth(3), 1);
+        // With high agreement the measured prices (depth >= 2 costs several
+        // tokens) keep the chosen batched depth at or below 1.
+        for entry in drafter.agreement.iter_mut() {
+            *entry = (19.0, 20.0);
+        }
+        assert!(
+            drafter.batched_depth(3) <= 1,
+            "{}",
+            drafter.batched_depth(3)
+        );
     }
 
     fn plan_window_budget_error(drafter: &mut Qwen4MtpDrafter, k: usize) -> String {

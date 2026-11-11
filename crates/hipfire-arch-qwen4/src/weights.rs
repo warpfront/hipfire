@@ -5305,7 +5305,11 @@ mod tests {
         for entry in &stored {
             let expert = entry.name.ends_with(".mlp.experts.gate_up_proj")
                 || entry.name.ends_with(".mlp.experts.down_proj");
-            let want = if expert { DType::FP8E4M3B128 } else { DType::BF16 };
+            let want = if expert {
+                DType::FP8E4M3B128
+            } else {
+                DType::BF16
+            };
             assert_eq!(entry.dtype, want, "{}", entry.name);
         }
         assert_eq!(

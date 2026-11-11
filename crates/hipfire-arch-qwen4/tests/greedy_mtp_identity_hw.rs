@@ -167,8 +167,8 @@
 //!
 //! `HIPFIRE_MTP_IDENTITY_MODEL` names the stock-FP8 `.hfq`; its `<model>.mtp`
 //! sidecar next to it supplies the native head through the oracle load
-//! (`common/stock_mtp_load.rs`: the product loader refuses native MTP on that
-//! recipe until its verify is proven).
+//! (`common/stock_mtp_load.rs`, a standalone load; the product loader admits the
+//! head on gfx942 too).
 //! gfx942 has no GDN row capture, so a partial accept is repaired by restore
 //! plus replay, and the planner serves no native depth until the gfx942 window
 //! cost table is measured: run every arm under

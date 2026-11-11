@@ -716,7 +716,10 @@ fn patched_base(fixture: &Fixture, from: &str, to: &str) -> PathBuf {
 }
 
 fn sidecar_bytes_by_name(path: &Path) -> (Qwen4ReopenPlan, Vec<u8>) {
-    (reopen_stock_artifact(path).unwrap(), fs::read(path).unwrap())
+    (
+        reopen_stock_artifact(path).unwrap(),
+        fs::read(path).unwrap(),
+    )
 }
 
 #[test]
@@ -746,10 +749,7 @@ fn p1_sidecar_holds_exactly_the_mtp_entries_in_order_with_stock_geometry() {
     assert_eq!((gate_up.quant_type, gate_up.group_size), (55, 128));
     assert_eq!(gate_up.shape, vec![EXPERTS as u32, 256, 128]);
     assert_eq!(gate_up.data_len, EXPERTS as u64 * GATE_UP_STRIDE);
-    assert_eq!(
-        summary.payload_bytes,
-        8 + down.data_len + gate_up.data_len
-    );
+    assert_eq!(summary.payload_bytes, 8 + down.data_len + gate_up.data_len);
     // No trunk, PLE or vision record rides along.
     assert!(plan.entries.iter().all(|e| e.name.starts_with("mtp.")));
 }
@@ -882,7 +882,14 @@ fn p5_refusals_leave_no_output_and_name_the_cause() {
     // --base-sha256 mismatch.
     let wrong = "0".repeat(64);
     refused(
-        mtp_run(&fixture, &fixture.output(), &sidecar, Some(&pin), Some(&wrong)).unwrap_err(),
+        mtp_run(
+            &fixture,
+            &fixture.output(),
+            &sidecar,
+            Some(&pin),
+            Some(&wrong),
+        )
+        .unwrap_err(),
         "--base-sha256",
     );
     // Base recipe is not stock-fp8.
@@ -929,10 +936,16 @@ fn p5_refusals_leave_no_output_and_name_the_cause() {
         .unwrap_err()
         .to_string();
     assert!(error.contains("missing"), "{error}");
-    assert!(error.contains("mtp.layers.0.mlp.experts.1.up_proj.weight_scale_inv"), "{error}");
+    assert!(
+        error.contains("mtp.layers.0.mlp.experts.1.up_proj.weight_scale_inv"),
+        "{error}"
+    );
     // An extra mtp expert layer.
     let mut bag = fixture_bag(&[1]);
-    let mut builder = Builder { bag: Bag::new(), seed: 900 };
+    let mut builder = Builder {
+        bag: Bag::new(),
+        seed: 900,
+    };
     builder.experts("mtp.layers.1");
     bag.extend(builder.bag);
     let extra = variant(&fixture, bag);
@@ -982,9 +995,10 @@ fn p5_refusals_leave_no_output_and_name_the_cause() {
     .unwrap_err()
     .to_string();
     assert!(error.contains("--base-sha256"), "{error}");
-    let error = run_stock_fp8_mtp_sidecar_cli(fixture.src.path(), &fixture.output(), Some(&sidecar), None)
-        .unwrap_err()
-        .to_string();
+    let error =
+        run_stock_fp8_mtp_sidecar_cli(fixture.src.path(), &fixture.output(), Some(&sidecar), None)
+            .unwrap_err()
+            .to_string();
     assert!(error.contains("refused"), "{error}");
     assert!(error.contains(STOCK_FP8_PINNED_MANIFEST_SHA256), "{error}");
     let error = mtp_sidecar::write_stock_fp8_mtp_sidecar(&mtp_sidecar::StockFp8MtpOptions {
@@ -1006,7 +1020,14 @@ fn p5_refusals_leave_no_output_and_name_the_cause() {
 fn p6_written_sidecar_rebinds_and_a_flipped_payload_byte_is_named() {
     let (fixture, pin) = ar_fixture();
     let wrong = sha_hex(b"not the base");
-    assert!(mtp_run(&fixture, &fixture.output(), &sidecar_path(&fixture), Some(&pin), Some(&wrong)).is_err());
+    assert!(mtp_run(
+        &fixture,
+        &fixture.output(),
+        &sidecar_path(&fixture),
+        Some(&pin),
+        Some(&wrong)
+    )
+    .is_err());
     let good = sha_hex(&fs::read(fixture.output()).unwrap());
     mtp_run(
         &fixture,
@@ -1060,7 +1081,9 @@ fn p7_receipt_records_every_source_with_range_sha_and_count() {
     let sidecar = sidecar_path(&fixture);
     let receipt_path = receipt_path_for(&sidecar);
     assert_eq!(summary.receipt_path, receipt_path);
-    assert!(receipt_path.to_string_lossy().ends_with(".mtp.receipt.json"));
+    assert!(receipt_path
+        .to_string_lossy()
+        .ends_with(".mtp.receipt.json"));
     let receipt: Value = serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
     let bytes = fs::read(&sidecar).unwrap();
     assert_eq!(receipt["recipe"], "stock-fp8-mtp-sidecar");

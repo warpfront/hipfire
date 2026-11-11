@@ -346,7 +346,10 @@ pub(super) fn verify_sidecar_payloads(path: &Path) -> Result<Qwen4ReopenPlan, Qw
         while done < entry.data_len {
             let n = (buf.len() as u64).min(entry.data_len - done) as usize;
             read_exact_at(&file, entry.data_offset + done, &mut buf[..n]).map_err(|error| {
-                Qwen4Error::io(format!("re-read {} of {}", entry.name, path.display()), error)
+                Qwen4Error::io(
+                    format!("re-read {} of {}", entry.name, path.display()),
+                    error,
+                )
             })?;
             hasher.update(&buf[..n]);
             done += n as u64;
@@ -394,7 +397,9 @@ pub(crate) fn write_stock_fp8_mtp_sidecar(
         )
     })?;
     if options.mode == Qwen4Mode::Production && pin != STOCK_FP8_PINNED_MANIFEST_SHA256 {
-        return invalid("stock-fp8-mtp-sidecar production mode requires the pinned manifest SHA-256");
+        return invalid(
+            "stock-fp8-mtp-sidecar production mode requires the pinned manifest SHA-256",
+        );
     }
     let receipt_path = receipt_path_for(options.output);
     for path in [options.output, receipt_path.as_path()] {
@@ -414,16 +419,12 @@ pub(crate) fn write_stock_fp8_mtp_sidecar(
         ));
     }
     let manifest = verify_manifest(options.input, pin)?;
-    let config_sha256 = manifest
-        .files
-        .get("config.json")
-        .cloned()
-        .ok_or_else(|| {
-            Qwen4Error::Invalid(format!(
-                "{} does not list config.json",
-                manifest.path.display()
-            ))
-        })?;
+    let config_sha256 = manifest.files.get("config.json").cloned().ok_or_else(|| {
+        Qwen4Error::Invalid(format!(
+            "{} does not list config.json",
+            manifest.path.display()
+        ))
+    })?;
 
     let source = source_paths(options.input)?;
     let SourceSet::Local { paths, .. } = &source else {
@@ -433,7 +434,9 @@ pub(crate) fn write_stock_fp8_mtp_sidecar(
     verify_manifest_files(options.input, &manifest, paths)?;
     let tensors = load_inventory(&source)?;
     let config_value = load_optional_config(&source)?.ok_or_else(|| {
-        Qwen4Error::Invalid("stock-fp8-mtp-sidecar input is missing required config.json".to_string())
+        Qwen4Error::Invalid(
+            "stock-fp8-mtp-sidecar input is missing required config.json".to_string(),
+        )
     })?;
     let index = if options.mode == Qwen4Mode::Production {
         Some(production_index(&config_value)?)

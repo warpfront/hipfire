@@ -16,9 +16,8 @@
 //!
 //! A model with a `<model>.mtp` sidecar (the stock-FP8 artifact, whose native
 //! head lives there) loads through the oracle recipe
-//! (`common/stock_mtp_load.rs`: the sidecar bound at admission, `attach_mtp`),
-//! because the product loader refuses native MTP on that recipe until its
-//! verify is proven. On gfx942 (no GDN row capture, no cost table yet) run the
+//! (`common/stock_mtp_load.rs`: the sidecar bound at admission, `attach_mtp`;
+//! a standalone load, the product loader admits the head on gfx942 too). On gfx942 (no GDN row capture, no cost table yet) run the
 //! MTP arms under `HIPFIRE_QWEN4_MTP_G942_DEPTH=<1..7>` (a forced fixed depth;
 //! `interleaved` still takes the interleaved route) with
 //! `HIPFIRE_G942_TRUNK_GEMV` unset.
@@ -1101,8 +1100,7 @@ fn load_stock_mtp(model: &Path, max_seq: usize) -> Result<Loaded, String> {
     hipfire_loader::prepare_host_memory_for(model);
     let mut gpu = Gpu::init().map_err(|e| e.to_string())?;
     let (state_request, want_gdn) = hw_identity::gdn_test_state_quant()?;
-    let bundle =
-        stock_mtp_load::load_stock_mtp_bundle(&mut gpu, model, max_seq, state_request)?;
+    let bundle = stock_mtp_load::load_stock_mtp_bundle(&mut gpu, model, max_seq, state_request)?;
     let state_format = bundle.state_format();
     if state_format.gdn != want_gdn {
         return Err(format!(

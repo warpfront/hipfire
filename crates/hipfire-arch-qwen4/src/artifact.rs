@@ -16,6 +16,7 @@ use crate::expert_slab_table::{build_expert_slab_table_with_keep, ExpertSlabTabl
 use crate::expert_slabs::{self, parse_expert_entry_name, ExpertSlabsError};
 use crate::gpu_forward::{qwen4_forward_scratch_mode, Qwen4ForwardScratchMode};
 use crate::ple::PleHashMetadata;
+use crate::stock_mtp_sidecar::BoundStockMtpSidecar;
 use crate::weights::{
     is_ple_shard_name_within, Qwen4BandScope, Qwen4Manifest, Qwen4Placement, Qwen4TierRecipe,
     WeightError, RECIPE_METADATA_KEY,
@@ -28,7 +29,6 @@ use hipfire_runtime::ple_hot_store::HotRowStore;
 use hipfire_runtime::ple_q4::{lm4_codebook_bits, lm4_scale_grid_bits};
 use hipfire_runtime::verified_cache::StatKey;
 use hipfire_runtime::weight_manifest::{ShardPolicy, WeightEntry, WeightResidency};
-use crate::stock_mtp_sidecar::BoundStockMtpSidecar;
 use hipfire_runtime::weight_store::external_row_stride;
 use rdna_compute::{DType, Gpu};
 use std::collections::BTreeMap;
@@ -4156,7 +4156,8 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            error.contains("base recipe is") && error.contains("the MTP sidecar extends \"stock-fp8\""),
+            error.contains("base recipe is")
+                && error.contains("the MTP sidecar extends \"stock-fp8\""),
             "{error}"
         );
     }

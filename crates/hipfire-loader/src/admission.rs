@@ -342,13 +342,6 @@ pub(crate) fn qwen4_native_mtp_for_head(
     }
 }
 
-/// Until M4 lands the measured gfx942 window-cost table, `speculation.mtp = auto` never
-/// attaches the stock-FP8 head sidecar (M0 §7.1).
-pub(crate) const STOCK_MTP_AUTO_ATTACHES: bool = false;
-
-/// N1: `auto` found a stock-FP8 head sidecar but stays AR until M4.
-pub(crate) const STOCK_MTP_N1: &str = "MTP off: stock-FP8 head sidecar present; speculation.mtp=auto waits for the measured gfx942 window-cost table";
-
 /// Whether the base's metadata declares `qwen4_recipe.id == "stock-fp8"`.
 pub(crate) fn stock_fp8_base(hfq: &hipfire_runtime::hfq::HfqFile) -> bool {
     serde_json::from_str::<serde_json::Value>(&hfq.metadata_json)
@@ -365,8 +358,6 @@ pub(crate) fn stock_fp8_base(hfq: &hipfire_runtime::hfq::HfqFile) -> bool {
 pub struct StockMtpDecision<T> {
     /// The bound sidecar to attach (`None` = AR).
     pub sidecar: Option<T>,
-    /// N1 note for the load summary.
-    pub note: Option<String>,
     /// L1 `REFUSED` line (auto, bind failed).
     pub refused: Option<String>,
 }
@@ -375,29 +366,24 @@ impl<T> StockMtpDecision<T> {
     fn ar() -> Self {
         Self {
             sidecar: None,
-            note: None,
             refused: None,
         }
     }
 }
 
 /// The §7.1 table with the filesystem passed in. `off` calls neither closure (never
-/// stats, never opens); `auto` pre-M4 calls only `exists` (never opens); `on` refuses
+/// stats, never opens); `auto` stats the sidecar and, only when it exists, binds it
+/// (bound = attach, bind failed = L1 REFUSED line and AR); `on` refuses
 /// R1 (absent) or R2 (bind failed) before any allocation.
 pub(crate) fn stock_mtp_decision<T>(
     mode: hipfire_config::MtpMode,
     path: &std::path::Path,
-    auto_attaches: bool,
     exists: impl FnOnce() -> bool,
     bind: impl FnOnce() -> Result<T, String>,
 ) -> Result<StockMtpDecision<T>, String> {
     use hipfire_config::MtpMode;
     match mode {
         MtpMode::Off => Ok(StockMtpDecision::ar()),
-        MtpMode::Auto if !auto_attaches => Ok(StockMtpDecision {
-            note: exists().then(|| STOCK_MTP_N1.to_string()),
-            ..StockMtpDecision::ar()
-        }),
         MtpMode::Auto => {
             if !exists() {
                 return Ok(StockMtpDecision::ar());
@@ -408,9 +394,11 @@ pub(crate) fn stock_mtp_decision<T>(
                     ..StockMtpDecision::ar()
                 },
                 Err(reason) => StockMtpDecision {
-                    refused: Some(hipfire_arch_qwen4::stock_mtp_sidecar::stock_mtp_refusal_line(
-                        path, &reason,
-                    )),
+                    refused: Some(
+                        hipfire_arch_qwen4::stock_mtp_sidecar::stock_mtp_refusal_line(
+                            path, &reason,
+                        ),
+                    ),
                     ..StockMtpDecision::ar()
                 },
             })
@@ -444,8 +432,7 @@ pub(crate) fn stock_mtp_decision<T>(
 pub fn resolve_stock_mtp_sidecar(
     hfq: &hipfire_runtime::hfq::HfqFile,
     spec_mtp: Option<bool>,
-) -> Result<StockMtpDecision<hipfire_arch_qwen4::stock_mtp_sidecar::BoundStockMtpSidecar>, String>
-{
+) -> Result<StockMtpDecision<hipfire_arch_qwen4::stock_mtp_sidecar::BoundStockMtpSidecar>, String> {
     let mode = hipfire_config::MtpMode::from_tri_state(spec_mtp);
     if mode == hipfire_config::MtpMode::Off || !stock_fp8_base(hfq) {
         return Ok(StockMtpDecision::ar());
@@ -454,7 +441,6 @@ pub fn resolve_stock_mtp_sidecar(
     stock_mtp_decision(
         mode,
         &path,
-        STOCK_MTP_AUTO_ATTACHES,
         || std::fs::metadata(&path).is_ok(),
         || hipfire_arch_qwen4::stock_mtp_sidecar::bind_stock_mtp_sidecar(hfq, &path),
     )
@@ -516,7 +502,9 @@ pub(crate) fn stock_mtp_r7(
 
 /// The cache-domain identity of an attached head: a session or prefix snapshot taken
 /// with one head is never served under another head or under none.
-pub(crate) fn stock_mtp_domain_digest(index_sha256: &[u8; 32]) -> hipfire_runtime::serve_contract::Digest {
+pub(crate) fn stock_mtp_domain_digest(
+    index_sha256: &[u8; 32],
+) -> hipfire_runtime::serve_contract::Digest {
     hipfire_runtime::serve_contract::sha256_len_prefixed(&[
         b"qwen4-mtp-sidecar",
         index_sha256.as_slice(),
@@ -1206,9 +1194,6 @@ pub fn admit_qwen4_source(
     let decision = resolve_stock_mtp_sidecar(hfq, spec_mtp)?;
     if let Some(refused) = &decision.refused {
         eprintln!("{refused}");
-    }
-    if let Some(note) = &decision.note {
-        hipfire_config::load_summary::note(hipfire_config::load_summary::Facet::SpecOff, note);
     }
     let mtp_sidecar = decision.sidecar;
     if stock_fp8_base(hfq) {
@@ -7664,7 +7649,6 @@ mod stock_mtp_policy_tests {
     /// closure ran (`exists`, `bind`).
     fn cell(
         mode: MtpMode,
-        auto_attaches: bool,
         present: bool,
         binds: bool,
     ) -> (Result<StockMtpDecision<u8>, String>, u32, u32) {
@@ -7673,7 +7657,6 @@ mod stock_mtp_policy_tests {
         let decision = stock_mtp_decision(
             mode,
             Path::new(P),
-            auto_attaches,
             || {
                 stats.set(stats.get() + 1);
                 present
@@ -7693,9 +7676,9 @@ mod stock_mtp_policy_tests {
     #[test]
     fn off_never_stats_or_opens_even_for_an_unreadable_path() {
         for (present, binds) in [(false, false), (true, true), (true, false)] {
-            let (decision, stats, opens) = cell(MtpMode::Off, false, present, binds);
+            let (decision, stats, opens) = cell(MtpMode::Off, present, binds);
             let decision = decision.unwrap();
-            assert!(decision.sidecar.is_none() && decision.note.is_none());
+            assert!(decision.sidecar.is_none());
             assert!(decision.refused.is_none());
             assert_eq!((stats, opens), (0, 0));
         }
@@ -7708,38 +7691,32 @@ mod stock_mtp_policy_tests {
     }
 
     #[test]
-    fn auto_pre_m4_is_ar_never_opens_and_notes_n1_only_when_the_file_exists() {
-        assert!(!STOCK_MTP_AUTO_ATTACHES);
-        let (absent, stats, opens) = cell(MtpMode::Auto, STOCK_MTP_AUTO_ATTACHES, false, false);
+    fn auto_attaches_a_bound_sidecar_logs_l1_on_bind_failure_and_is_silent_when_absent() {
+        // Absent: AR, silent, stat once, never opened.
+        let (absent, stats, opens) = cell(MtpMode::Auto, false, false);
         let absent = absent.unwrap();
-        assert!(absent.sidecar.is_none() && absent.note.is_none() && absent.refused.is_none());
+        assert!(absent.sidecar.is_none() && absent.refused.is_none());
         assert_eq!((stats, opens), (1, 0));
-        for binds in [true, false] {
-            let (decision, stats, opens) = cell(MtpMode::Auto, STOCK_MTP_AUTO_ATTACHES, true, binds);
-            let decision = decision.unwrap();
-            assert!(decision.sidecar.is_none() && decision.refused.is_none());
-            assert_eq!(decision.note.as_deref(), Some(STOCK_MTP_N1));
-            assert_eq!((stats, opens), (1, 0), "auto pre-M4 never opens the sidecar");
-        }
-    }
-
-    #[test]
-    fn auto_after_m4_attaches_or_logs_l1_and_stays_ar() {
-        let (absent, _, opens) = cell(MtpMode::Auto, true, false, false);
-        assert!(absent.unwrap().sidecar.is_none());
-        assert_eq!(opens, 0);
-        let (bound, _, _) = cell(MtpMode::Auto, true, true, true);
-        assert_eq!(bound.unwrap().sidecar, Some(7));
-        let (failed, _, _) = cell(MtpMode::Auto, true, true, false);
+        // Present and binds: attach, no REFUSED line.
+        let (bound, _, opens) = cell(MtpMode::Auto, true, true);
+        let bound = bound.unwrap();
+        assert_eq!(bound.sidecar, Some(7));
+        assert!(bound.refused.is_none());
+        assert_eq!(opens, 1);
+        // Present, bind fails: AR plus the L1 REFUSED line.
+        let (failed, _, _) = cell(MtpMode::Auto, true, false);
         let failed = failed.unwrap();
         assert!(failed.sidecar.is_none());
         let line = failed.refused.unwrap();
-        assert!(line.contains("REFUSED") && line.contains(P) && line.contains("AR only"), "{line}");
+        assert!(
+            line.contains("REFUSED") && line.contains(P) && line.contains("AR only"),
+            "{line}"
+        );
     }
 
     #[test]
     fn on_refuses_r1_when_absent_and_r2_when_the_bind_fails_else_attaches() {
-        let (absent, _, opens) = cell(MtpMode::On, false, false, false);
+        let (absent, _, opens) = cell(MtpMode::On, false, false);
         let r1 = absent.unwrap_err();
         assert!(
             r1.starts_with("qwen4: native MTP (--spec mtp) needs the stock-FP8 MTP head sidecar")
@@ -7749,7 +7726,7 @@ mod stock_mtp_policy_tests {
             "{r1}"
         );
         assert_eq!(opens, 0);
-        let (failed, _, _) = cell(MtpMode::On, false, true, false);
+        let (failed, _, _) = cell(MtpMode::On, true, false);
         let r2 = failed.unwrap_err();
         assert!(
             r2.starts_with("qwen4: native MTP (--spec mtp) refused: stock-FP8 MTP sidecar")
@@ -7758,7 +7735,7 @@ mod stock_mtp_policy_tests {
                 && r2.ends_with("rebuild it against this base or leave speculation.mtp unset"),
             "{r2}"
         );
-        let (bound, _, opens) = cell(MtpMode::On, false, true, true);
+        let (bound, _, opens) = cell(MtpMode::On, true, true);
         assert_eq!(bound.unwrap().sidecar, Some(7));
         assert_eq!(opens, 1);
     }
@@ -7778,7 +7755,9 @@ mod stock_mtp_policy_tests {
                 && error.ends_with("; reload"),
             "{error}"
         );
-        assert!(stock_mtp_r7(Path::new(P), Some(a), None).unwrap_err().contains("-> none"));
+        assert!(stock_mtp_r7(Path::new(P), Some(a), None)
+            .unwrap_err()
+            .contains("-> none"));
     }
 
     #[test]
@@ -7798,6 +7777,9 @@ mod stock_mtp_policy_tests {
         );
         let mut other = Vec::new();
         push_stock_mtp_domain_digest(&mut other, Some(&[8u8; 32]));
-        assert_ne!(other[0], digests[1], "a different head is a different domain");
+        assert_ne!(
+            other[0], digests[1],
+            "a different head is a different domain"
+        );
     }
 }

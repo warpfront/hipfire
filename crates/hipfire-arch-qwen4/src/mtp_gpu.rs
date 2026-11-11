@@ -106,9 +106,9 @@ pub(crate) const MTP_DRAFT_ROUNDS_ENV: &str = "HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS";
 mod rows;
 pub(crate) use rows::{draft_rounds_enabled, DraftRow, MtpRowsScratch};
 mod fp8_moe;
-pub(crate) use fp8_moe::MtpFp8MoeScratch;
 #[cfg(feature = "lab")]
 pub use fp8_moe::LabHeadRouting;
+pub(crate) use fp8_moe::MtpFp8MoeScratch;
 #[cfg(feature = "lab")]
 mod lab;
 #[cfg(feature = "lab")]
@@ -3982,7 +3982,9 @@ impl Qwen4MtpGpu {
                             ));
                         }
                         let layer = fp8_layer.as_ref().ok_or_else(|| {
-                            invalid("a stock-FP8 MTP head step needs the head's grouped MoE scratch")
+                            invalid(
+                                "a stock-FP8 MTP head step needs the head's grouped MoE scratch",
+                            )
                         })?;
                         MtpFfnCall::Moe(seal_moe_rows(&ctx, config, 0, runtime, 1, layer, None)?)
                     }

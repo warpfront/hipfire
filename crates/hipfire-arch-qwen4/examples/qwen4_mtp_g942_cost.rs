@@ -5,8 +5,8 @@
 //! gfx942 native-MTP window cost by draft depth, on the real model.
 //!
 //! Loads MODEL plus its `<model>.mtp` head sidecar through the stock-FP8
-//! oracle recipe (`tests/common/stock_mtp_load.rs`: the product loader refuses
-//! native MTP on that recipe until its verify is proven), prefills PROMPT, then
+//! oracle recipe (`tests/common/stock_mtp_load.rs`, a standalone load that
+//! also honors a fixed `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS`), prefills PROMPT, then
 //! runs real MTP windows through
 //! `Qwen4MtpDrafter::mtp_step` with the draft budget cycling `0, 1, .., 7`
 //! window by window (so every depth sees the same text, context range and
@@ -159,8 +159,16 @@ fn main() -> Result<(), String> {
             }
             gpu.hip.device_synchronize().map_err(|e| e.to_string())?;
             let started = Instant::now();
-            let window =
-                drafter.mtp_step(&mut gpu, &mut bundle, position, seed, &ids, depth, eos, None)?;
+            let window = drafter.mtp_step(
+                &mut gpu,
+                &mut bundle,
+                position,
+                seed,
+                &ids,
+                depth,
+                eos,
+                None,
+            )?;
             gpu.hip.device_synchronize().map_err(|e| e.to_string())?;
             let ms = started.elapsed().as_secs_f64() * 1e3;
             if round >= WARMUP_ROUNDS {
@@ -205,7 +213,15 @@ fn main() -> Result<(), String> {
     );
     println!(
         "{:>5} {:>8} {:>10} {:>10} {:>7} {:>9} {:>9} {:>10} {:>8}",
-        "depth", "windows", "mean_ms", "median_ms", "drafts", "accepted", "committed", "ms/token", "vs_AR"
+        "depth",
+        "windows",
+        "mean_ms",
+        "median_ms",
+        "drafts",
+        "accepted",
+        "committed",
+        "ms/token",
+        "vs_AR"
     );
     let mut table = Vec::with_capacity(MAX_DEPTH + 1);
     for (depth, cell) in cells.iter().enumerate() {

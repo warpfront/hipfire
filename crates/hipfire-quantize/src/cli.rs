@@ -92,7 +92,12 @@ pub(crate) struct QuantizeArgs {
 
     /// Destination HFQ file.  With `--recipe stock-fp8-mtp-sidecar` it
     /// defaults to `<base file name>.mtp` beside the base.
-    #[arg(long, value_name = "PATH", required_unless_present = "base", default_value = "")]
+    #[arg(
+        long,
+        value_name = "PATH",
+        required_unless_present = "base",
+        default_value = ""
+    )]
     pub output: String,
 
     /// Quantization recipe or wire format.
@@ -920,7 +925,16 @@ mod route_tests {
             );
         }
         // --base and --base-sha256 belong to this route alone.
-        let argv = ["--recipe", "stock-fp8", "--input", "i", "--output", "o", "--base", "b"];
+        let argv = [
+            "--recipe",
+            "stock-fp8",
+            "--input",
+            "i",
+            "--output",
+            "o",
+            "--base",
+            "b",
+        ];
         let err = reject_unreachable(&matches(&argv), Qwen4StockFp8).unwrap_err();
         assert!(err.starts_with("--base has no effect"), "{err}");
         let argv = [

@@ -47,7 +47,8 @@ impl Fp8GroupedBytes {
             y_gate_up: layout.grouped_rows * 2 * intermediate * f32_bytes,
             y_down: layout.grouped_rows * dims.hidden * f32_bytes,
             rot_batch: layout.routed_rows * f32_bytes,
-            tile_descriptor: layout.grouped_rows / hipfire_dispatch::families::moe::MOE_GROUPED_BLOCK_M
+            tile_descriptor: layout.grouped_rows
+                / hipfire_dispatch::families::moe::MOE_GROUPED_BLOCK_M
                 * 16,
             sorted_slot_index: layout.grouped_rows * std::mem::size_of::<i32>(),
         })
@@ -91,7 +92,11 @@ impl Fp8GroupedBytes {
                 fields.tile_descriptor,
                 self.tile_descriptor,
             ),
-            ("sorted slot index", fields.sorted_slot_index, self.sorted_slot_index),
+            (
+                "sorted slot index",
+                fields.sorted_slot_index,
+                self.sorted_slot_index,
+            ),
         ] {
             let (elements, dtype) = shapes[index];
             let held = elements * dtype.size();
@@ -155,7 +160,9 @@ impl MtpFp8MoeScratch {
         // The tile descriptor lives in `gate_batch`: it holds the larger of
         // the routed rows and the descriptor's bytes.
         let descriptor = Fp8GroupedBytes::for_rows(dims, FP8_HEAD_MOE_ROWS)?.tile_descriptor;
-        let gate_batch = layout.routed_rows.max(descriptor.div_ceil(DType::F32.size()));
+        let gate_batch = layout
+            .routed_rows
+            .max(descriptor.div_ceil(DType::F32.size()));
         let mut shapes = [
             (num_experts, DType::F32),
             (hidden, DType::F32),

@@ -338,9 +338,7 @@ impl Qwen4Profile {
             Self::FlashNext
             | Self::FlashNextArOnly
             | Self::FlashNextStockMtp
-            | Self::FlashNextHeadless => {
-                Qwen4EquationSource::PinnedUpstream
-            }
+            | Self::FlashNextHeadless => Qwen4EquationSource::PinnedUpstream,
             Self::Synthetic(profile) => profile.equation_source,
         }
     }

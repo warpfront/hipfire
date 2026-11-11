@@ -98,7 +98,10 @@ fn parse_args() -> R<Args> {
     let mut sidecar = None;
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
-        let mut value = |name: &str| it.next().ok_or_else(|| format!("{name} needs a value\n{USAGE}"));
+        let mut value = |name: &str| {
+            it.next()
+                .ok_or_else(|| format!("{name} needs a value\n{USAGE}"))
+        };
         match flag.as_str() {
             "--model" => model = Some(PathBuf::from(value("--model")?)),
             "--prompt-file" => prompt_file = Some(PathBuf::from(value("--prompt-file")?)),
@@ -122,7 +125,9 @@ fn parse_args() -> R<Args> {
     let model = model.ok_or_else(|| format!("--model is required\n{USAGE}"))?;
     let out = out.ok_or_else(|| format!("--out is required\n{USAGE}"))?;
     if prompt_file.is_none() == ids.is_none() {
-        return Err(format!("give exactly one of --prompt-file / --ids\n{USAGE}"));
+        return Err(format!(
+            "give exactly one of --prompt-file / --ids\n{USAGE}"
+        ));
     }
     if prefix == 0 || positions == 0 {
         return Err("--prefix and --positions must be >= 1".into());
@@ -229,7 +234,8 @@ fn run() -> R<()> {
     // ── load (qwen4_rows / fn_lane_oracle loader, two-file source) ───────
     hipfire_loader::prepare_host_memory_for(&args.model);
     let mut gpu = Gpu::init().map_err(es)?;
-    let receipt = admit_hfqm_artifact_with(&hfq, Some(&gpu.arch), false, Some(&bound)).map_err(es)?;
+    let receipt =
+        admit_hfqm_artifact_with(&hfq, Some(&gpu.arch), false, Some(&bound)).map_err(es)?;
     let profile_id = receipt.config.profile.id().to_string();
     let hidden_size = receipt.config.hidden_size;
     let hc_count = receipt.config.hc_count;
@@ -245,7 +251,11 @@ fn run() -> R<()> {
         receipt
             .mtp_sidecar
             .as_ref()
-            .map(|s| format!("{} bytes, index {}", s.payload_bytes, hex(&s.index_sha256)[..12].to_string()))
+            .map(|s| format!(
+                "{} bytes, index {}",
+                s.payload_bytes,
+                hex(&s.index_sha256)[..12].to_string()
+            ))
             .unwrap_or_else(|| "none".to_string()),
     );
     if receipt.config.mtp.is_none() || receipt.mtp_sidecar.is_none() {
@@ -271,14 +281,18 @@ fn run() -> R<()> {
                 if gpu.is_uma() {
                     return Err("host-mapped experts are only for discrete GPUs".into());
                 }
-                let moved =
-                    hipfire_arch_qwen4::expert_residency::place_routed_experts(&mut weights, layers);
+                let moved = hipfire_arch_qwen4::expert_residency::place_routed_experts(
+                    &mut weights,
+                    layers,
+                );
                 eprintln!(
                     "qwen4_mtp_head_dump: routed experts: layers 0..{layers} in VRAM, {moved} tensors host-mapped"
                 );
             }
             Some(hipfire_arch_qwen4::expert_residency::ExpertVramLayers::Auto) => {
-                return Err("qwen4_mtp_head_dump takes a fixed expert layer count, not auto".into());
+                return Err(
+                    "qwen4_mtp_head_dump takes a fixed expert layer count, not auto".into(),
+                );
             }
         }
         weights
@@ -408,18 +422,20 @@ fn run() -> R<()> {
             let drafted = drafted?;
             freed?;
             gpu.hip.device_synchronize().map_err(es)?;
-            let row = match bundle.mtp_draft_read(&gpu).map_err(es)? {
-                DraftRead::FullRow(row) => row,
-                DraftRead::Candidates(_) => {
-                    return Err(
+            let row =
+                match bundle.mtp_draft_read(&gpu).map_err(es)? {
+                    DraftRead::FullRow(row) => row,
+                    DraftRead::Candidates(_) => return Err(
                         "the draft head re-scored a quantized copy (candidates only); run with \
                          HIPFIRE_MTP_DRAFT_HEAD=none"
                             .into(),
-                    )
-                }
-            };
+                    ),
+                };
             if row.len() != vocab {
-                return Err(format!("head logit row has {} entries, vocab is {vocab}", row.len()));
+                return Err(format!(
+                    "head logit row has {} entries, vocab is {vocab}",
+                    row.len()
+                ));
             }
             // The head MoE's own routing of that Predict step. Nothing but a Predict step
             // writes these buffers (the cold prefill's Append steps skip the FFN, the draft
@@ -468,13 +484,24 @@ fn run() -> R<()> {
     let rows = trunk_hidden.len() / wide;
     std::fs::write(
         args.out.join("tokens.u32.bin"),
-        tokens.iter().flat_map(|t| t.to_le_bytes()).collect::<Vec<u8>>(),
+        tokens
+            .iter()
+            .flat_map(|t| t.to_le_bytes())
+            .collect::<Vec<u8>>(),
     )
     .map_err(es)?;
     std::fs::write(args.out.join("trunk_hidden.f32.bin"), f32_le(&trunk_hidden)).map_err(es)?;
     std::fs::write(args.out.join("head_logits.f32.bin"), f32_le(&head_logits)).map_err(es)?;
-    let routing_top_k = if routing_rows > 0 { head_topk_ids.len() / routing_rows } else { 0 };
-    let routing_experts = if routing_rows > 0 { head_router.len() / routing_rows } else { 0 };
+    let routing_top_k = if routing_rows > 0 {
+        head_topk_ids.len() / routing_rows
+    } else {
+        0
+    };
+    let routing_experts = if routing_rows > 0 {
+        head_router.len() / routing_rows
+    } else {
+        0
+    };
     if routing_rows != 0 {
         if routing_rows != eval_positions.len() {
             return Err(format!(
@@ -485,7 +512,10 @@ fn run() -> R<()> {
         std::fs::write(args.out.join("head_router.f32.bin"), f32_le(&head_router)).map_err(es)?;
         std::fs::write(
             args.out.join("head_topk_ids.i32.bin"),
-            head_topk_ids.iter().flat_map(|e| e.to_le_bytes()).collect::<Vec<u8>>(),
+            head_topk_ids
+                .iter()
+                .flat_map(|e| e.to_le_bytes())
+                .collect::<Vec<u8>>(),
         )
         .map_err(es)?;
         std::fs::write(args.out.join("head_topk_w.f32.bin"), f32_le(&head_topk_w)).map_err(es)?;

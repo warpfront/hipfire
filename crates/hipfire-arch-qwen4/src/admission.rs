@@ -597,9 +597,6 @@ pub enum AdmissionError {
     },
     /// Native MTP requested for the stock-FP8 artifact admitted without its head sidecar.
     ArOnlyArtifact,
-    /// Native MTP requested with the stock-FP8 head sidecar attached on gfx942, before the
-    /// exact-verify gate (M3a) removes this arm.
-    Fp8MtpVerifyPending,
     /// The stock-FP8 artifact is admitted fully resident on one device only
     /// (P1): no expert parallelism.
     Fp8SingleDeviceOnly(EffectiveMesh),
@@ -660,12 +657,6 @@ impl fmt::Display for AdmissionError {
                 f,
                 "qwen4 admission: the stock-FP8 artifact was admitted without its MTP head \
                  sidecar (<model>.mtp); native MTP (--spec mtp) cannot be admitted"
-            ),
-            Self::Fp8MtpVerifyPending => write!(
-                f,
-                "qwen4 admission: native MTP on gfx942 has no proven exact verify rollback yet \
-                 (GDN row capture needs gfx11+ SIMT); the stock-FP8 MTP head loads for oracles \
-                 only; set speculation.mtp = off"
             ),
             Self::Fp8SingleDeviceOnly(mesh) => write!(
                 f,
@@ -784,7 +775,8 @@ impl Qwen4Admission {
 }
 
 /// The stock-FP8 artifact's device admission: FP8 expert kernels (gfx942
-/// only), AR-only, single device, every routed expert resident.
+/// only), single device, every routed expert resident; native MTP only with
+/// the head sidecar attached.
 fn check_fp8_device(
     capabilities: Qwen4Capabilities,
     gpu_arch: Option<&str>,
@@ -798,12 +790,8 @@ fn check_fp8_device(
             gpu_arch: gpu_arch.map(str::to_string),
         });
     }
-    if native_mtp {
-        return Err(if head_attached {
-            AdmissionError::Fp8MtpVerifyPending
-        } else {
-            AdmissionError::ArOnlyArtifact
-        });
+    if native_mtp && !head_attached {
+        return Err(AdmissionError::ArOnlyArtifact);
     }
     if !mesh.is_single() {
         return Err(AdmissionError::Fp8SingleDeviceOnly(mesh));
@@ -817,7 +805,8 @@ fn check_fp8_device(
 /// Loader-side device admission of an admitted artifact's `recipe`: the
 /// capabilities `gpu_arch` offers it.  A recipe without FP8 experts is
 /// device-neutral here; the stock-FP8 recipe is admitted only on
-/// [`FP8_EXPERTS_ARCH`], AR-only (`native_mtp` refused), on a single device,
+/// [`FP8_EXPERTS_ARCH`], on a single device, with `native_mtp` admitted only
+/// when the head sidecar is attached (`head_attached`; else `ArOnlyArtifact`),
 /// and with no host-mapped expert placement requested
 /// (`host_mapped_experts`: an explicit `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS`).
 pub fn admit_recipe_on_device(
@@ -1988,14 +1977,18 @@ mod tests {
             "qwen4 admission: the stock-FP8 artifact was admitted without its MTP head sidecar \
              (<model>.mtp); native MTP (--spec mtp) cannot be admitted"
         );
-        // gfx942 with the head attached: R4 until the exact-verify gate lands.
-        let r4 = admit_recipe_on_device(&stock, "gfx942", single, true, false, true);
-        assert_eq!(r4, Err(AdmissionError::Fp8MtpVerifyPending));
+        // gfx942 with the head attached: admitted with native MTP + FP8 experts.
+        let caps = admit_recipe_on_device(&stock, "gfx942", single, true, false, true).unwrap();
+        assert!(caps.native_mtp && caps.fp8_experts);
+        // The single-device and resident-expert checks still run for native MTP.
+        let mesh2 = EffectiveMesh::new(1, 1, 2);
         assert_eq!(
-            r4.unwrap_err().to_string(),
-            "qwen4 admission: native MTP on gfx942 has no proven exact verify rollback yet \
-             (GDN row capture needs gfx11+ SIMT); the stock-FP8 MTP head loads for oracles \
-             only; set speculation.mtp = off"
+            admit_recipe_on_device(&stock, "gfx942", mesh2, true, false, true),
+            Err(AdmissionError::Fp8SingleDeviceOnly(mesh2))
+        );
+        assert_eq!(
+            admit_recipe_on_device(&stock, "gfx942", single, true, true, true),
+            Err(AdmissionError::Fp8HostMappedExperts)
         );
         // Head attached without native MTP requested is device-admitted.
         assert!(admit_recipe_on_device(&stock, "gfx942", single, false, false, true).is_ok());

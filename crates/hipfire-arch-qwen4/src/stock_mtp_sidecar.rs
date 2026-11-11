@@ -246,10 +246,7 @@ fn expected_record(entry: &WeightEntry) -> Result<ExpectedRecord, String> {
 /// Opens with `HfqFile::open_at_offset(path, 0)` (never `open`: that
 /// auto-attaches a REAP overlay).  The sidecar's expected entries come from the
 /// base's own config.
-pub fn bind_stock_mtp_sidecar(
-    base: &HfqFile,
-    path: &Path,
-) -> Result<BoundStockMtpSidecar, String> {
+pub fn bind_stock_mtp_sidecar(base: &HfqFile, path: &Path) -> Result<BoundStockMtpSidecar, String> {
     bind_against(base, path, || {
         let config = crate::artifact::parse_artifact_config(&base.metadata_json)
             .map_err(|error| format!("base config: {error}"))?;
@@ -275,10 +272,8 @@ fn bind_against(
         ));
     }
     // 3
-    let envelope: StockMtpSidecarEnvelope =
-        serde_json::from_str(&hfq.metadata_json).map_err(|error| {
-            format!("metadata is not a `{STOCK_MTP_SIDECAR_KEY}` object: {error}")
-        })?;
+    let envelope: StockMtpSidecarEnvelope = serde_json::from_str(&hfq.metadata_json)
+        .map_err(|error| format!("metadata is not a `{STOCK_MTP_SIDECAR_KEY}` object: {error}"))?;
     let manifest = envelope.hipfire_qwen4_mtp_sidecar;
     // 4
     if manifest.version != STOCK_MTP_SIDECAR_VERSION {
@@ -710,7 +705,10 @@ mod tests {
         let f = Fixture::new("r2");
         let meta = serde_json::to_string(&f.envelope).unwrap();
         write_hfqm_package_mem(&f.side, ARCH_ID + 1, &meta, &f.tensors).unwrap();
-        f.refused(&format!("sidecar is arch {}, base is arch {ARCH_ID}", ARCH_ID + 1));
+        f.refused(&format!(
+            "sidecar is arch {}, base is arch {ARCH_ID}",
+            ARCH_ID + 1
+        ));
     }
 
     #[test]
@@ -743,7 +741,12 @@ mod tests {
         // A packed base (no recipe id) and a different recipe id both refuse.
         write_base(&f.base, "{}", ARCH_ID, &f.base_tensors);
         f.refused("base recipe is \"<absent>\", the sidecar extends \"stock-fp8\"");
-        write_base(&f.base, &base_meta("other", &source_pin()), ARCH_ID, &f.base_tensors);
+        write_base(
+            &f.base,
+            &base_meta("other", &source_pin()),
+            ARCH_ID,
+            &f.base_tensors,
+        );
         f.refused("base recipe is \"other\", the sidecar extends \"stock-fp8\"");
     }
 
@@ -885,7 +888,9 @@ mod tests {
             .iter()
             .filter(|entry| entry.dtype != DType::FP8E4M3B128)
             .all(|entry| entry.dtype == DType::BF16));
-        assert!(entries.iter().all(|entry| entry.name != "mtp.embed_tokens.weight"));
+        assert!(entries
+            .iter()
+            .all(|entry| entry.name != "mtp.embed_tokens.weight"));
         let sizes: Vec<u64> = experts
             .iter()
             .map(|entry| expected_record(entry).unwrap().bytes)

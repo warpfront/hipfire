@@ -6,10 +6,9 @@
 //! `<model>.mtp` head sidecar (`#[path = "common/stock_mtp_load.rs"]`; the
 //! `qwen4_mtp_g942_cost` example includes it from `../tests/common/`).
 //!
-//! The product loader refuses native MTP on the stock-FP8 recipe
-//! (`AdmissionError::Fp8MtpVerifyPending`) until its exact verify is proven, and
-//! "the stock-FP8 MTP head loads for oracles only". This is that oracle load, the
-//! recipe `qwen4_mtp_head_dump` uses: the sidecar bound by
+//! The product loader admits native MTP on the stock-FP8 recipe on gfx942 when
+//! the head sidecar is attached (`speculation.mtp = on` binds it). This is the
+//! standalone oracle load, the recipe `qwen4_mtp_head_dump` uses: the sidecar bound by
 //! `bind_stock_mtp_sidecar` and merged at admission
 //! (`admit_hfqm_artifact_with(.., Some(&bound))`), every `mtp.*` payload served
 //! `Borrowed` from the sidecar's own mapping, everything else from the base, a
@@ -60,9 +59,8 @@ pub fn load_stock_mtp_bundle(
     if receipt.config.mtp.is_none() || receipt.mtp_sidecar.is_none() {
         return Err("admission did not attach the MTP head sidecar".into());
     }
-    let scratch_mode =
-        source_forward_scratch_mode(gpu, &hfq, &receipt.config, &receipt.manifest)
-            .map_err(|e| e.to_string())?;
+    let scratch_mode = source_forward_scratch_mode(gpu, &hfq, &receipt.config, &receipt.manifest)
+        .map_err(|e| e.to_string())?;
     if gpu.is_uma() {
         hfq.drop_mmap();
     }
@@ -90,7 +88,9 @@ pub fn load_stock_mtp_bundle(
                 );
             }
             Some(hipfire_arch_qwen4::expert_residency::ExpertVramLayers::Auto) => {
-                return Err("the stock-FP8 oracle load takes a fixed expert layer count, not auto".into());
+                return Err(
+                    "the stock-FP8 oracle load takes a fixed expert layer count, not auto".into(),
+                );
             }
         }
         weights
