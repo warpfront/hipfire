@@ -145,6 +145,8 @@ pub struct HostWindow {
 
 /// Label of the decode-share donor mirror host window.
 pub const DECODE_SHARE_MIRROR_LABEL: &str = "decode-share-donor-mirror";
+/// Host backing for cache victims, distinct from the scratch-loan protocol.
+pub const EXPERT_CACHE_MIRROR_LABEL: &str = "expert-cache-donor-mirror";
 
 /// The donor tail of a decode-share plan ([`ExpertTierPlan::with_decode_share`]).
 ///
@@ -226,7 +228,7 @@ impl fmt::Display for DecodeShareError {
                 "decode-share needs {need} donor bytes but the eligible resident experts hold {available}"
             ),
             Self::Overflow => write!(f, "decode-share plan arithmetic overflowed u64"),
-            Self::AlreadyShared => write!(f, "plan already carries a decode-share donor tail"),
+            Self::AlreadyShared => write!(f, "plan already carries a decode-share or expert-cache donor tail"),
             Self::BadClasses(why) => write!(f, "decode-share class spans are invalid: {why}"),
         }
     }
@@ -243,6 +245,7 @@ pub struct ExpertTierPlan {
     device_experts: usize,
     host_windows: Vec<HostWindow>,
     decode_share: Option<DecodeShareTail>,
+    expert_cache: Option<DecodeShareTail>,
     artifact_sha256: Option<[u8; 32]>,
     digest: [u8; 32],
 }
@@ -473,12 +476,50 @@ impl ExpertTierPlan {
     /// donors, no guard, no window). Ids of `rank` that are out of range or
     /// repeat are skipped (the plan builder already rejected them).
     pub fn with_decode_share(
-        mut self,
+        self,
         rank: &[u32],
         need_bytes: u64,
     ) -> Result<(Self, DecodeShareTail), DecodeShareError> {
+        let (mut plan, tail) = self.with_donor_tail(rank, need_bytes, DECODE_SHARE_MIRROR_LABEL)?;
+        if !tail.donors.is_empty() {
+            plan.decode_share = Some(tail.clone());
+        }
+        Ok((plan, tail))
+    }
+
+    /// Reserve the coldest eligible device experts as cache slots, without
+    /// lending any payload bytes to scratch. Core experts remain device-only;
+    /// only donor payloads gain a host mirror. The frozen Resident placement
+    /// still names the original donor experts and must be restored before use.
+    /// Requested bytes round up to whole experts; fully resident layers are
+    /// excluded, matching the donor-tail staging contract.
+    pub fn with_expert_cache_tail(
+        self,
+        rank: &[u32],
+        requested_bytes: u64,
+    ) -> Result<(Self, DecodeShareTail), DecodeShareError> {
+        let (mut plan, tail) =
+            self.with_donor_tail(rank, requested_bytes, EXPERT_CACHE_MIRROR_LABEL)?;
+        if !tail.donors.is_empty() {
+            plan.expert_cache = Some(tail.clone());
+        }
+        Ok((plan, tail))
+    }
+
+    /// Cache backing only: its presence never enables decode-share claims,
+    /// classes or scratch loans. The complete borrow view is canonical.
+    pub fn expert_cache_tail(&self) -> Option<&DecodeShareTail> {
+        self.expert_cache.as_ref()
+    }
+
+    fn with_donor_tail(
+        mut self,
+        rank: &[u32],
+        need_bytes: u64,
+        mirror_label: &str,
+    ) -> Result<(Self, DecodeShareTail), DecodeShareError> {
         use DecodeShareError::{AlreadyShared, Insufficient, Overflow};
-        if self.decode_share.is_some() {
+        if self.decode_share.is_some() || self.expert_cache.is_some() {
             return Err(AlreadyShared);
         }
         if need_bytes == 0 {
@@ -576,8 +617,8 @@ impl ExpertTierPlan {
             spans.push(gu);
             spans.push(dn);
         }
-        let mut plan = self
-            .with_host_window(DECODE_SHARE_MIRROR_LABEL, &spans)
+        let plan = self
+            .with_host_window(mirror_label, &spans)
             .map_err(|_| Overflow)?;
         let window = plan.host_windows.last().expect("window just appended");
         let mirror_offset = window.spans.first().ok_or(Overflow)?.1;
@@ -616,7 +657,6 @@ impl ExpertTierPlan {
             class_donors: vec![donors_len],
             shadow_bytes: 0,
         };
-        plan.decode_share = Some(tail.clone());
         Ok((plan, tail))
     }
 
@@ -844,6 +884,7 @@ pub fn plan_expert_tiers_from_slabs(
         device_experts,
         host_windows: Vec::new(),
         decode_share: None,
+        expert_cache: None,
         artifact_sha256: None,
         digest,
     })
@@ -1747,5 +1788,85 @@ mod tests {
             plan_expert_tiers_from_slabs(&uniform(), &[1, 2, 1], u64::MAX),
             Err(ExpertTierError::RankDuplicate { id: 1 })
         );
+    }
+    #[test]
+    fn expert_cache_tail_keeps_core_device_only_and_charges_only_mirror() {
+        let rank = model_ids(0, 0..8);
+        let before = device_plan(&rank);
+        let (cache, t) = before
+            .clone()
+            .with_expert_cache_tail(&rank, 3 * PADDED - 1)
+            .unwrap();
+        assert_eq!(t.donors, vec![5, 6, 7]);
+        assert_eq!(t.donor_bytes, 3 * PADDED);
+        assert!(cache.decode_share_tail().is_none());
+        assert_eq!(cache.expert_cache_tail(), Some(&t));
+        assert_eq!(t.shadow_bytes, 0);
+        assert_eq!(t.class_spans, vec![t.donor_bytes]);
+        assert_eq!(cache.device_experts(), before.device_experts());
+        assert_eq!(
+            cache.owner_bytes(Placement::HostMapped),
+            before.owner_bytes(Placement::HostMapped) + t.donor_bytes
+        );
+        assert_eq!(
+            cache.host_windows().last().unwrap().label,
+            EXPERT_CACHE_MIRROR_LABEL
+        );
+        for id in 0..TOTAL_EXPERTS {
+            let resident = cache.entry(id / EXPERTS, id % EXPERTS).unwrap();
+            let canonical = &t.borrow_entries[id];
+            if t.donors.binary_search(&(id as u32)).is_ok() {
+                assert_eq!(resident.tier, Placement::Device);
+                assert_eq!(canonical.tier, Placement::HostMapped);
+                for (device, host, len) in [
+                    (
+                        resident.gate_up_offset,
+                        canonical.gate_up_offset,
+                        resident.gate_up_len,
+                    ),
+                    (
+                        resident.down_offset,
+                        canonical.down_offset,
+                        resident.down_len,
+                    ),
+                ] {
+                    assert_eq!(device - t.donor_offset, host - t.mirror_offset);
+                    assert!(device + len <= t.donor_offset + t.donor_bytes);
+                }
+            } else {
+                assert_eq!(resident, canonical, "core/cold expert {id} has no mirror");
+            }
+        }
+        let (share, _) = before.with_decode_share(&rank, 3 * PADDED - 1).unwrap();
+        assert_ne!(
+            share.logical_digest(),
+            cache.logical_digest(),
+            "backing purpose is identity"
+        );
+        assert_eq!(
+            cache.clone().with_decode_share(&rank, 1).map(|_| ()),
+            Err(DecodeShareError::AlreadyShared)
+        );
+        assert_eq!(
+            share.with_expert_cache_tail(&rank, 1).map(|_| ()),
+            Err(DecodeShareError::AlreadyShared)
+        );
+    }
+
+    #[test]
+    fn expert_cache_zero_is_identity_and_whole_device_layers_never_donate() {
+        let mut rank = model_ids(1, 0..3);
+        rank.extend(model_ids(0, 0..512));
+        let before = device_plan(&rank);
+        assert_eq!(
+            before.clone().with_expert_cache_tail(&rank, 0).unwrap().0,
+            before
+        );
+        let (cache, tail) = before.with_expert_cache_tail(&rank, PADDED + 1).unwrap();
+        assert_eq!(tail.donors, model_ids(1, 1..3));
+        for expert in 0..512 {
+            assert_eq!(cache.entry(0, expert).unwrap().tier, Placement::Device);
+            assert_eq!(tail.borrow_entries[expert].tier, Placement::Device);
+        }
     }
 }
