@@ -2144,6 +2144,7 @@ pub(crate) mod ep_reserve_loan;
 pub(crate) mod ep_reserve_scratch;
 pub(crate) mod ep_tail_borrow;
 pub(crate) mod ep_wave;
+pub mod g942_lanes;
 pub use ep_tail_borrow::{
     parse_ep_tail_borrow_knob, qwen4_ep_tail_borrow_forward_bytes, qwen4_ep_tail_borrow_plan,
     qwen4_set_ep_tail_borrow_plan, resolve_ep_tail_borrow, EpTailBorrowFacts, EpTailBorrowKnob,

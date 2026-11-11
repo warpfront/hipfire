@@ -28,9 +28,19 @@
 //! compared with the singleton reference (first differing byte reported).
 //!
 //! `--g0`: per-stage probe (each non-stateful stage alone at once-over-all-rows,
-//! k=2 and k=8, `min(steps, 16)` steps) and the combined policy at every k.
+//! at `--g0-probe-ks` (default 2,8), `min(steps, 16)` steps) and the combined
+//! policy at every k.
 //! `--controls`: negative controls that MUST be detected (lane swap, wrong
-//! position). `--bench N`: lane step vs singleton step wall time.
+//! position), run at every `--control-ks` (default 2; a wide k such as 16 or 64
+//! puts the swaps and the wrong position on the all-rows segment of a >8-row
+//! step). `--bench N`: lane step vs singleton step wall time.
+//!
+//! gfx942 all-rows L1 (PLAN-beat-sglang §3.L): with
+//! `HIPFIRE_QWEN4_LANE_{HC_ALLROWS,ALLROWS,ALLROWS_MOE}=1` and
+//! `HIPFIRE_QWEN4_LANE_STEP_TRACE=1`, `--ks 16,32,64 --contexts 64,512,2048
+//! --steps 64 --g0 --controls --control-ks 16,64` compares every lane step of
+//! a >8-row step (logits, ids, state checkpoints) with the singletons; the
+//! trace lines in the log show `hc_allrows=true stages_allrows=true moe=allrows`.
 //!
 //! `--spec mtp [--k 3] [--routes cycle]`: MTP lanes (fn-batch S5). Requires
 //! `HIPFIRE_MTP_INCREMENTAL=0` so the singleton reference window
@@ -179,6 +189,11 @@ struct Args {
     /// `--lag-rows N`: owed head rows a retired lane holds before the root
     /// flushes them (`LaneCopyConfig.head_lag_rows`).
     lag_rows: usize,
+    /// `--control-ks`: lane counts the negative controls run at (default 2: the plan-level swaps
+    /// and the wrong position need only two lanes; a wide k puts them on the all-rows segment).
+    control_ks: Vec<usize>,
+    /// `--g0-probe-ks`: lane counts of the `--g0` per-stage probes (default 2 and 8).
+    probe_ks: Vec<usize>,
 }
 
 fn parse_list(s: &str, what: &str) -> R<Vec<usize>> {
@@ -200,6 +215,7 @@ fn parse_args() -> R<Args> {
 fn parse_args_from(raw: &[String]) -> R<Args> {
     let usage = "usage: fn_lane_oracle MODEL.mq4 TEXT.txt OUT_DIR [--ks 1,2,4,8] [--contexts 512,2048,8192] \
                  [--steps 64] [--max-seq 16384] [--policy production|per-lane|<spec>] [--g0] [--controls] [--bench N] \
+                 [--control-ks 2] [--g0-probe-ks 2,8] \
                  [--spec ar|mtp] [--k K] [--routes floor|cycle|batched] [--promote P] [--lane-capacity N] \
                  [--copy [--repeat P] [--lag-rows N]]";
     let mut pos = Vec::new();
@@ -223,6 +239,8 @@ fn parse_args_from(raw: &[String]) -> R<Args> {
         copy: false,
         repeat: None,
         lag_rows: 8,
+        control_ks: vec![2],
+        probe_ks: vec![2, 8],
     };
     let mut i = 0;
     let value = |i: &mut usize, flag: &str| -> R<String> {
@@ -254,6 +272,12 @@ fn parse_args_from(raw: &[String]) -> R<Args> {
             }
             "--g0" => a.g0 = true,
             "--controls" => a.controls = true,
+            "--control-ks" => {
+                a.control_ks = parse_list(&value(&mut i, "--control-ks")?, "--control-ks")?
+            }
+            "--g0-probe-ks" => {
+                a.probe_ks = parse_list(&value(&mut i, "--g0-probe-ks")?, "--g0-probe-ks")?
+            }
             "--copy" => a.copy = true,
             "--repeat" => a.repeat = Some(value(&mut i, "--repeat")?.parse().map_err(e)?),
             "--lag-rows" => a.lag_rows = value(&mut i, "--lag-rows")?.parse().map_err(e)?,
@@ -270,6 +294,12 @@ fn parse_args_from(raw: &[String]) -> R<Args> {
     a.out = pos[2].clone().into();
     if a.ks.is_empty() || a.ks.contains(&0) {
         return Err("--ks must be non-empty and positive".into());
+    }
+    if a.probe_ks.is_empty() || a.probe_ks.contains(&0) {
+        return Err("--g0-probe-ks must be non-empty and positive".into());
+    }
+    if a.control_ks.is_empty() || a.control_ks.contains(&0) {
+        return Err("--control-ks must be non-empty and positive".into());
     }
     if a.contexts.is_empty() || a.contexts.contains(&0) {
         return Err("--contexts must be non-empty and positive".into());
@@ -327,10 +357,10 @@ const LANE_STORE_MAX_LANES: usize = 64;
 fn required_lanes(args: &Args) -> usize {
     let mut max_k = *args.ks.iter().max().unwrap();
     if args.g0 {
-        max_k = max_k.max(8);
+        max_k = max_k.max(*args.probe_ks.iter().max().unwrap());
     }
     if args.controls {
-        max_k = max_k.max(2);
+        max_k = max_k.max(*args.control_ks.iter().max().unwrap());
     }
     max_k
 }
@@ -3743,7 +3773,7 @@ fn real_main() -> R<bool> {
             let mut identical = true;
             let mut first: Option<String> = None;
             let mut per_k = Vec::new();
-            for k in [2usize, 8] {
+            for &k in &args.probe_ks {
                 let label = format!("g0:{}=once", stage.key());
                 let r = app.run_lanes(k, short_steps, policy, &label, Control::None, &probe);
                 if !r.pass {
@@ -3805,56 +3835,66 @@ fn real_main() -> R<bool> {
             return Err("--controls needs --steps >= 4".into());
         }
         let probe = RunOpts { prefill_ckpt: true };
-        for control in [
-            Control::SwapTokens,
-            Control::SwapRowSlot,
-            Control::SwapRows,
-            Control::WrongPosition,
-        ] {
-            let r = app.run_lanes(2, short_steps, primary, &args.policy, control, &probe);
-            let refused = r.run.refused.clone();
-            let diverged = r.run.diff.bad > 0 || r.run.error.is_some();
-            let (detected, how) = if !r.run.fired {
-                (
-                    false,
-                    "control was not exercised (no eligible step)".to_string(),
-                )
-            } else if let Some(m) = &refused {
-                (true, format!("refused at provision: {m}"))
-            } else if diverged {
-                (
-                    true,
-                    format!("comparison failed: {}", r.first.clone().unwrap_or_default()),
-                )
-            } else {
-                (false, "comparison still passed".to_string())
-            };
-            // A refused plan must leave every lane byte-exact for the rest of the run.
-            let clean_after_refusal = refused.is_none() || r.pass;
-            let ok = detected && clean_after_refusal;
-            all_pass &= ok;
-            let mut line = format!(
-                "control {}: {}",
-                control.name(),
-                if detected { "detected" } else { "MISSED" }
-            );
-            line += &format!(" ({how})");
-            if !clean_after_refusal {
-                line += &format!(
-                    "; FAIL: the refusal left lane state modified: {}",
-                    r.first.clone().unwrap_or_default()
+        for &control_k in &args.control_ks {
+            for control in [
+                Control::SwapTokens,
+                Control::SwapRowSlot,
+                Control::SwapRows,
+                Control::WrongPosition,
+            ] {
+                let r = app.run_lanes(
+                    control_k,
+                    short_steps,
+                    primary,
+                    &args.policy,
+                    control,
+                    &probe,
                 );
+                let refused = r.run.refused.clone();
+                let diverged = r.run.diff.bad > 0 || r.run.error.is_some();
+                let (detected, how) = if !r.run.fired {
+                    (
+                        false,
+                        "control was not exercised (no eligible step)".to_string(),
+                    )
+                } else if let Some(m) = &refused {
+                    (true, format!("refused at provision: {m}"))
+                } else if diverged {
+                    (
+                        true,
+                        format!("comparison failed: {}", r.first.clone().unwrap_or_default()),
+                    )
+                } else {
+                    (false, "comparison still passed".to_string())
+                };
+                // A refused plan must leave every lane byte-exact for the rest of the run.
+                let clean_after_refusal = refused.is_none() || r.pass;
+                let ok = detected && clean_after_refusal;
+                all_pass &= ok;
+                let mut line = format!(
+                    "control {} k={control_k}: {}",
+                    control.name(),
+                    if detected { "detected" } else { "MISSED" }
+                );
+                line += &format!(" ({how})");
+                if !clean_after_refusal {
+                    line += &format!(
+                        "; FAIL: the refusal left lane state modified: {}",
+                        r.first.clone().unwrap_or_default()
+                    );
+                }
+                app.log.say(line);
+                controls_json.push(json!({
+                    "control": control.name(),
+                    "k": control_k,
+                    "detected": detected,
+                    "how": how,
+                    "refused_at_provision": refused,
+                    "clean_after_refusal": clean_after_refusal,
+                    "note": r.run.control_note,
+                    "run": r.json,
+                }));
             }
-            app.log.say(line);
-            controls_json.push(json!({
-                "control": control.name(),
-                "detected": detected,
-                "how": how,
-                "refused_at_provision": refused,
-                "clean_after_refusal": clean_after_refusal,
-                "note": r.run.control_note,
-                "run": r.json,
-            }));
         }
         app.log.say(
             "control lane_swap (device level): no test-visible path exchanges two lanes' Qwen4State; \
@@ -4187,5 +4227,36 @@ mod lane_capacity_tests {
         assert_eq!(a.ks, vec![1]);
         let k4 = parse(&["--ks", "4", "--lane-capacity", "8"]).unwrap();
         assert_eq!((k4.ks.clone(), required_lanes(&k4)), (vec![4], 4));
+    }
+
+    #[test]
+    fn wide_control_and_probe_ks_set_the_reference_count() {
+        let wide = parse(&[
+            "--ks",
+            "16,32,64",
+            "--g0",
+            "--g0-probe-ks",
+            "2,8",
+            "--controls",
+            "--control-ks",
+            "16,64",
+        ])
+        .unwrap();
+        assert_eq!(
+            (wide.probe_ks.clone(), wide.control_ks.clone()),
+            (vec![2, 8], vec![16, 64])
+        );
+        assert_eq!(required_lanes(&wide), 64);
+        // A control k above the main ks still needs its own references.
+        let ctl = parse(&["--ks", "2", "--controls", "--control-ks", "32"]).unwrap();
+        assert_eq!(required_lanes(&ctl), 32);
+        // Defaults keep the historical 2-lane controls and 2 / 8 probes.
+        let default = parse(&["--ks", "2", "--g0", "--controls"]).unwrap();
+        assert_eq!(
+            (default.control_ks, default.probe_ks),
+            (vec![2], vec![2, 8])
+        );
+        assert!(parse(&["--control-ks", "0"]).is_err());
+        assert!(parse(&["--g0-probe-ks", ""]).is_err());
     }
 }
