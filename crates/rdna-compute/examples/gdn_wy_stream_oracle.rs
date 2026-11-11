@@ -219,7 +219,8 @@ fn run(
     initial: &(Vec<u8>, Vec<u8>),
     poison: bool,
 ) -> Result {
-    assert_eq!(parts.iter().sum::<usize>(), rig.n);
+    let total: usize = parts.iter().sum();
+    assert!(total <= rig.n);
     rig.reset(gpu, &initial.0, &initial.1, poison);
     let meta = Cell::new(GdnStreamMeta::sealed_at(start as u64, 0));
     let carry = GdnWyCarry {
@@ -295,7 +296,7 @@ fn run(
     .expect("seal");
     assert_eq!(sealed.phase, GdnStreamPhase::Sealed);
     Result {
-        out: down(gpu, &rig.out, rig.out.byte_size()),
+        out: down(gpu, &rig.out, total * VALUE * 4),
         slot: down(gpu, &rig.state, rig.state.byte_size()),
         ef: rig
             .ef
@@ -329,6 +330,27 @@ fn main() {
     for format in [GdnStateFormat::F32, GdnStateFormat::Q8, GdnStateFormat::Q8Ef] {
         let initial = initial_state(&mut rng, format);
         let rig = Rig::new(&mut gpu, format, n, &inp, &mut rng);
+        if let Some(spec) = arg(&args, "--probe") {
+            // --probe START:p1,p2,..  (F32 only): reference [sum] vs the partition.
+            let (s, ps) = spec.split_once(':').unwrap();
+            let st: usize = s.parse().unwrap();
+            let parts: Vec<usize> = ps.split(',').map(|v| v.parse().unwrap()).collect();
+            let total: usize = parts.iter().sum();
+            let reference = run(&mut gpu, &rig, st, &[total], &initial, false);
+            let got = run(&mut gpu, &rig, st, &parts, &initial, true);
+            let mut rows_diff = Vec::new();
+            for row in 0..total {
+                let lo = row * VALUE * 4;
+                let cnt = (0..VALUE)
+                    .filter(|e| got.out[lo + e * 4..lo + e * 4 + 4] != reference.out[lo + e * 4..lo + e * 4 + 4])
+                    .count();
+                if cnt > 0 {
+                    rows_diff.push(format!("row{row}:{cnt}"));
+                }
+            }
+            println!("PROBE start={st} parts={parts:?} slot_eq={} diffrows={}", got.slot == reference.slot, rows_diff.join(","));
+            std::process::exit(0);
+        }
         for start in [0usize, 7] {
             let reference = run(&mut gpu, &rig, start, &[n], &initial, false);
             // The seal quantized state must differ from the initial (nonzero path).
