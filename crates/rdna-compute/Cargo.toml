@@ -1193,6 +1193,16 @@ required-features = ["lab"]
 name = "lane_gdn_oracle"
 required-features = ["lab", "deltanet"]
 
+# Qwen3.5-family prefill GDN chunk/EF oracle (slice A of reliability/CHUNK-KL.md):
+# production gated_delta_net_q8_batch_seq(_indexed) vs F64 recurrence, whole-call
+# vs split-call, eager + hipGraph. Needs the deltanet-gated GDN launchers, so
+# build with `--features lab,deltanet`. `test = true` runs its CPU-only regressions
+# (`cargo test -p rdna-compute --features lab,deltanet --example qwen35_prefill_chunk_oracle`).
+[[example]]
+name = "qwen35_prefill_chunk_oracle"
+required-features = ["lab", "deltanet"]
+test = true
+
 [[example]]
 name = "lane_fa_oracle"
 required-features = ["lab", "deltanet"]
