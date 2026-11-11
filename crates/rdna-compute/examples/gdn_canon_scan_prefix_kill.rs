@@ -169,6 +169,13 @@ fn run() -> R<i32> {
         let ctl = run_call(&mut gpu, &consts, &st, &flipped, out_fmt, Pad::Zero)?;
         let control_detected = ctl.out_valid != a.out_valid;
         control_ok_all &= control_detected;
+        // Non-vacuity: the complete-tile output must be finite and nonzero.
+        let a_nonfinite = decode_out(&a.out_valid, out_fmt)
+            .iter()
+            .filter(|v| !v.is_finite())
+            .count();
+        let a_nonzero = a.out_valid.iter().any(|b| *b != 0);
+        control_ok_all &= a_nonfinite == 0 && a_nonzero;
 
         let mut per_r: Vec<Value> = Vec::new();
         let mut zero_pad_outs: Vec<Vec<u8>> = Vec::new();
