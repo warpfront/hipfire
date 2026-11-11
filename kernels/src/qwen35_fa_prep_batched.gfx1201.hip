@@ -119,7 +119,7 @@ static __device__ __forceinline__ void qwen35_fa_prep_row_gfx1201(
         const int pos = positions[b] + pos_offset;
         const float freq = 1.0f / powf(freq_base, (float)(2 * lane) / (float)NROT);
         const float angle = (float)pos * freq;
-        const float cos_a, sin_a;
+        float cos_a, sin_a;
         rope_yarn_sincos(angle, lane, yarn, &sin_a, &cos_a);
         const float x0 = o[0];
         const float x1 = o[1];

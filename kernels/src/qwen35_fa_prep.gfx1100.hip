@@ -75,7 +75,7 @@ __global__ void HIPFIRE_QWEN35_FA_PREP_KERNEL(
         const int pos = *pos_buf;
         const float freq = 1.0f / powf(freq_base, (float)(2 * tid) / (float)NROT);
         const float angle = (float)pos * freq;
-        const float cos_a, sin_a;
+        float cos_a, sin_a;
         rope_yarn_sincos(angle, tid, yarn, &sin_a, &cos_a);
         const float x0 = sdata[tid];
         const float x1 = sdata[tid + HALF];
