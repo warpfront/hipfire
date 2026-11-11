@@ -4808,6 +4808,8 @@ pub fn generate_muse_glimmer(
     let mut rng = deepseek4::sampling::Xorshift::new(seed);
 
     let mut generated_count: usize = 0;
+    // A cache-cap stop cuts the answer like max_tokens does: report `length`.
+    let mut hit_cache_cap = false;
     let decode_t0 = Instant::now();
     let mut harmony_router = GlimmerHarmonyRouter::new(max_think_tokens);
     // Multi-byte characters span tokens: decode incrementally, never per token.
@@ -4982,6 +4984,7 @@ pub fn generate_muse_glimmer(
                     break;
                 }
                 if bundle.state.n_tokens >= cache_cap {
+                    hit_cache_cap = true;
                     break;
                 }
                 // --- Draft: B-1 tokens via glimmer_drafter_forward (raw noise) ---
@@ -5210,6 +5213,7 @@ pub fn generate_muse_glimmer(
                     // `cur_pos`. Decode/capture that pending token (no re-emit/re-count), then
                     // sample a NEW prediction from the returned logits and make it the next pending seed.
                     if bundle.state.n_tokens >= cache_cap {
+                        hit_cache_cap = true;
                         break;
                     }
                     if generated_count >= max_tokens {
@@ -5909,6 +5913,11 @@ pub fn generate_muse_glimmer(
                 // Push stop token to KV? No — mirror prior break-before-push for eos.
                 break;
             }
+            // Check before emitting: a token streamed here would never be counted.
+            if bundle.state.n_tokens >= cache_cap {
+                hit_cache_cap = true;
+                break;
+            }
 
             let frag = text_stream.push(m.tokenizer.as_ref().unwrap(), next_tok);
             let (events, should_stop) = harmony_router.push(&frag);
@@ -5929,10 +5938,6 @@ pub fn generate_muse_glimmer(
             }
             glimmer_recorder.push(next_tok, &frag);
             if should_stop {
-                break;
-            }
-
-            if bundle.state.n_tokens >= cache_cap {
                 break;
             }
 
@@ -6034,7 +6039,7 @@ pub fn generate_muse_glimmer(
     } else {
         0.0
     };
-    let hit_length_cap = generated_count >= max_tokens;
+    let hit_length_cap = generated_count >= max_tokens || hit_cache_cap;
     let finish_reason = if hit_length_cap {
         "length"
     } else if !parsed_tool_calls.is_empty() {
