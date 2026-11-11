@@ -3164,6 +3164,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_SERVE_UI` | crates/hipfire-cli/src/serve/mod.rs, crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_SERVE_VMM_BATCH` | crates/hipfire-cli/src/serve/mod.rs, crates/hipfire-config/src/lib.rs | experimental |
 | `HIPFIRE_SESSION_CACHE_BYTES` | crates/hipfire-config/src/lib.rs, experiments/qwen4-yarn-longctx/niah.sh | stable |
+| `HIPFIRE_SESSION_CACHE_DFLASH2_DRAFT` | crates/hipfire-arch-qwen4/tests/session_cache_hw.rs | harness |
 | `HIPFIRE_SESSION_CACHE_DIR` | crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_SESSION_CACHE_DISK_BYTES` | crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_SESSION_CACHE_DISK_WRITE_PHASE` | crates/hipfire-arch-qwen4/tests/session_cache_hw.rs | harness |

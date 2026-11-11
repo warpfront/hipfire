@@ -31,6 +31,11 @@
 //! the retained pre-window state, replays only the consumed prefix and
 //! commits live.
 //!
+//! `dflash2_terminal_stop_inside_window_repairs_on_flash_next` checks the same
+//! repair on the DFlash2 route (draft named by
+//! `HIPFIRE_SESSION_CACHE_DFLASH2_DRAFT`): every keep inside a fully accepted
+//! window leaves the state byte-equal to the same rows teacher-forced.
+//!
 //! Each test loads Flash-Next (tens of GiB of pinned host memory), so run them
 //! one per process thread and only inside a fabric hold that declares that
 //! memory and holds the Flash-Next host lock, e.g. on an R9700:
@@ -70,7 +75,7 @@ use hipfire_runtime::hfq::{HfqFile, HfqModelSource};
 use hipfire_runtime::model_source::SourcePayload;
 use hipfire_runtime::serve_contract::CacheDomain;
 use hipfire_runtime::session_cache::{SessionCache, SessionRoute, SessionState, SnapshotParts};
-use hipfire_runtime::spec::MtpDrafter;
+use hipfire_runtime::spec::{MtpDrafter, SpecStep, Speculator};
 use hipfire_runtime::tokenizer::Tokenizer;
 use hipfire_runtime::weight_store::{fulfill_manifest_from_payloads, WeightOrigin};
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -1322,6 +1327,207 @@ fn terminal_stop_inside_window_repairs_live_on_flash_next() {
         "a repaired terminal differs from the teacher-forced reference \
          (n, differing state parts (0 = metadata), live seed, reference live seed): {mismatches:?}"
     );
+    bundle.free_gpu(&mut gpu).expect("free bundle");
+}
+
+/// The DFlash2 draft the DFlash2 terminal-repair test loads
+/// (`qwen38-flash-next-dflash2.mq4v2.hfq`).
+const DFLASH2_DRAFT_ENV: &str = "HIPFIRE_SESSION_CACHE_DFLASH2_DRAFT";
+
+/// Cold DFlash2 prefill of `prompt`, then greedy windows until `pick(index,
+/// window)` holds (at most 64). Returns the window's index, the generated
+/// tokens before it (ending with its seed) and the window.
+fn dflash2_window(
+    spec: &mut dyn Speculator,
+    bundle: &mut Qwen4Bundle,
+    gpu: &mut Gpu,
+    prompt: &[u32],
+    pick: impl Fn(usize, &SpecStep) -> bool,
+) -> (usize, Vec<u32>, SpecStep) {
+    let never = || false;
+    let first = spec
+        .prefill(gpu, bundle, prompt, prompt, 0, false, None, &never)
+        .and_then(|outcome| outcome.into_first_token())
+        .expect("DFlash2 prefill");
+    let mut stream = vec![first];
+    for index in 0..64 {
+        let position = prompt.len() + stream.len() - 1;
+        let seed = *stream.last().unwrap();
+        let window = spec
+            .step(gpu, bundle, position, seed, &stream, None, 0.0, usize::MAX)
+            .expect("DFlash2 window");
+        if pick(index, &window) {
+            return (index, stream, window);
+        }
+        stream.extend_from_slice(&window.emit);
+    }
+    panic!("no DFlash2 window in 64 matched");
+}
+
+/// A terminal stop inside a fully accepted DFlash2 window on Qwen4
+/// (`Speculator::repair_terminal_prefix`: the target restores the retained
+/// pre-window ticket and replays the seed plus the first `n - 1` consumed
+/// tokens; the caller flushes the `n`-th) leaves the target state
+/// byte-identical to the same history teacher-forced row by row, for every
+/// keep `n` from the first row to the whole window, and the live
+/// continuation of the next turn (seed and first window) matches. It also
+/// checks the ticket's lifetime: a repair at the wrong start refuses and
+/// keeps it, a repair runs once, and the next window replaces it.
+///
+/// `cargo test -p hipfire-arch-qwen4 --release --test session_cache_hw --
+/// --ignored dflash2_terminal_stop_inside_window_repairs_on_flash_next`
+/// with `HIPFIRE_SESSION_CACHE_DFLASH2_DRAFT` naming the DFlash2 draft.
+#[test]
+#[ignore = "needs a HIP GPU, HIPFIRE_SESSION_CACHE_MODEL and HIPFIRE_SESSION_CACHE_DFLASH2_DRAFT"]
+fn dflash2_terminal_stop_inside_window_repairs_on_flash_next() {
+    let draft = std::env::var(DFLASH2_DRAFT_ENV)
+        .unwrap_or_else(|_| panic!("{DFLASH2_DRAFT_ENV} must name the Flash-Next DFlash2 draft"));
+    let Loaded {
+        mut bundle,
+        mut gpu,
+        tokenizer,
+        ..
+    } = load(false, u64::MAX >> 1, None);
+    let mut speculator = hipfire_runtime::dflash2_spec::build_dflash2_speculator(
+        &mut gpu,
+        &draft,
+        &mut bundle,
+        MAX_SEQ,
+        8,
+    )
+    .expect("DFlash2 speculator");
+    let spec = speculator.as_mut();
+    let never = || false;
+    // Counting text: the draft accepts whole windows.
+    let text: Vec<String> = (1..=300).map(|i| i.to_string()).collect();
+    let a = tokenizer.encode(&text.join(", "));
+    let suffix = tokenizer.encode(" And now count backwards from 50:");
+
+    let (k, before, window) = dflash2_window(spec, &mut bundle, &mut gpu, &a, |_, w| {
+        w.proposed >= 2 && w.accepted == w.proposed
+    });
+    let start = a.len() + before.len() - 1;
+    let seed = *before.last().unwrap();
+    let emit = window.emit.to_vec();
+    println!("window {k} at {start}: seed {seed}, emit {emit:?}");
+    let rerun = |spec: &mut dyn Speculator, bundle: &mut Qwen4Bundle, gpu: &mut Gpu| {
+        let (_, again, w) = dflash2_window(spec, bundle, gpu, &a, |i, _| i == k);
+        assert_eq!(
+            (again.as_slice(), w.emit.as_slice()),
+            (before.as_slice(), emit.as_slice()),
+            "the rerun reproduces the window"
+        );
+    };
+
+    // Ticket lifetime.
+    rerun(spec, &mut bundle, &mut gpu);
+    let wrong = spec.repair_terminal_prefix(&mut gpu, &mut bundle, start + 1, seed, &emit[..1]);
+    assert!(
+        !wrong.expect("wrong-start repair"),
+        "a wrong start repairs nothing"
+    );
+    let once = spec.repair_terminal_prefix(&mut gpu, &mut bundle, start, seed, &emit[..1]);
+    assert!(once.expect("repair"), "a refused repair keeps the ticket");
+    let twice = spec.repair_terminal_prefix(&mut gpu, &mut bundle, start, seed, &emit[..1]);
+    assert!(!twice.expect("second repair"), "a repair runs once");
+    dflash2_window(spec, &mut bundle, &mut gpu, &a, |i, _| i == k + 1);
+    let stale = spec.repair_terminal_prefix(&mut gpu, &mut bundle, start, seed, &emit[..1]);
+    assert!(
+        !stale.expect("stale repair"),
+        "the next window replaces the ticket"
+    );
+
+    // Continue `history` live with `suffix`: the seed and the first window.
+    let continue_live =
+        |spec: &mut dyn Speculator, bundle: &mut Qwen4Bundle, gpu: &mut Gpu, history: &[u32]| {
+            let next: Vec<u32> = history.iter().chain(&suffix).copied().collect();
+            let seed = spec
+                .prefill(
+                    gpu,
+                    bundle,
+                    &next,
+                    &suffix,
+                    history.len(),
+                    true,
+                    None,
+                    &never,
+                )
+                .and_then(|outcome| outcome.into_first_token())
+                .expect("live continuation");
+            let w = spec
+                .step(
+                    gpu,
+                    bundle,
+                    next.len(),
+                    seed,
+                    &[seed],
+                    None,
+                    0.0,
+                    usize::MAX,
+                )
+                .expect("continuation window");
+            (seed, w.emit.to_vec())
+        };
+
+    let mut mismatches = Vec::new();
+    for n in 1..=emit.len() {
+        rerun(spec, &mut bundle, &mut gpu);
+        let repaired = spec
+            .repair_terminal_prefix(&mut gpu, &mut bundle, start, seed, &emit[..n])
+            .expect("terminal repair");
+        assert!(repaired, "n {n}: the retained window repairs the stop");
+        assert!(
+            spec.on_forced_advance(&mut gpu, &mut bundle, &emit[n - 1..n], start + n, &never)
+                .expect("terminal flush"),
+            "n {n}: the drafter advances the flush itself"
+        );
+        let history: Vec<u32> = a.iter().chain(&before).chain(&emit[..n]).copied().collect();
+        let got = state_digests(&mut bundle, &mut gpu, SessionRoute::Ar, history.len());
+        let got_next = continue_live(spec, &mut bundle, &mut gpu, &history);
+
+        // Reference: the same history teacher-forced one row at a time.
+        spec.prefill(&mut gpu, &mut bundle, &a, &a, 0, false, None, &never)
+            .expect("reference prefill");
+        // The window's rows go through as the repair runs them: the replay as
+        // one block (a multi-row block rounds unlike single rows), then the
+        // flush.
+        let replay: Vec<u32> = std::iter::once(seed)
+            .chain(emit[..n - 1].iter().copied())
+            .collect();
+        let rows = before[..before.len() - 1]
+            .iter()
+            .enumerate()
+            .map(|(i, token)| (a.len() + i, std::slice::from_ref(token)))
+            .chain([(start, replay.as_slice()), (start + n, &emit[n - 1..n])]);
+        for (position, tokens) in rows {
+            assert!(
+                spec.on_forced_advance(&mut gpu, &mut bundle, tokens, position, &never)
+                    .expect("teacher-forced rows"),
+                "n {n}: the reference advance runs on the drafter"
+            );
+        }
+        let want = state_digests(&mut bundle, &mut gpu, SessionRoute::Ar, history.len());
+        let want_next = continue_live(spec, &mut bundle, &mut gpu, &history);
+
+        let parts: Vec<usize> = (0..want.len().max(got.len()))
+            .filter(|&i| want.get(i) != got.get(i))
+            .collect();
+        println!(
+            "n {n}: history {} differing state parts {parts:?} of {}; next repaired {got_next:?} \
+             reference {want_next:?}",
+            history.len(),
+            want.len()
+        );
+        if !parts.is_empty() || got_next != want_next {
+            mismatches.push((n, parts, got_next, want_next));
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "a repaired DFlash2 terminal differs from the teacher-forced reference \
+         (n, differing state parts (0 = metadata), repaired next, reference next): {mismatches:?}"
+    );
+    speculator.free(&mut gpu);
     bundle.free_gpu(&mut gpu).expect("free bundle");
 }
 
