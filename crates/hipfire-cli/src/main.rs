@@ -588,6 +588,11 @@ struct RunArgs {
     /// bounds; overrides the configured/automatic context.
     #[arg(long, value_parser = parse_max_seq_arg, value_name = "N")]
     max_seq: Option<u64>,
+    /// Flash-Next native-MTP lane row-exactness on exact gfx1201 (`serve.batch_exact`):
+    /// `greedy` makes greedy output independent of batch composition, `seeded` also
+    /// seeded sampled requests; costs decode step time at C4/C8. Default `off`.
+    #[arg(long, value_parser = ["off", "greedy", "seeded"], value_name = "off|greedy|seeded")]
+    batch_exact: Option<String>,
     /// Select one speculative mechanism: off, auto, ngram, dflash, mtp, or dspark.
     #[arg(long = "spec", alias = "speculation")]
     speculation: Option<String>,
@@ -1024,6 +1029,11 @@ pub(crate) struct ServeArgs {
     /// Maximum concurrent eligible batched lanes; 1 preserves sequential behavior.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..=hipfire_config::MAX_CONTINUOUS_BATCH_SIZE))]
     continuous_batch_size: Option<u64>,
+    /// Flash-Next native-MTP lane row-exactness on exact gfx1201 (`serve.batch_exact`):
+    /// `greedy` makes greedy output independent of batch composition, `seeded` also
+    /// seeded sampled requests; costs decode step time at C4/C8. Default `off`.
+    #[arg(long, value_parser = ["off", "greedy", "seeded"], value_name = "off|greedy|seeded")]
+    batch_exact: Option<String>,
     /// Serve the embedded chat UI at /ui on the serve listener.
     #[arg(long)]
     ui: bool,
@@ -3027,7 +3037,10 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
     )?;
 
     let daemon = find_daemon(paths).ok_or_else(|| daemon_not_found_error(paths))?;
-    let process_config = hipfire_config::ProcessConfig::from_resolved(&resolved)?;
+    let mut process_config = hipfire_config::ProcessConfig::from_resolved(&resolved)?;
+    if let Some(mode) = &args.batch_exact {
+        process_config.values.set_cli("serve.batch_exact", mode)?;
+    }
     let mut engine = Engine::spawn_configured(
         &daemon,
         &BTreeMap::new(),
@@ -3916,6 +3929,7 @@ pub(crate) fn run_should_force_local(args: &RunArgs) -> bool {
         || args.kv_backend.is_some()
         || args.tp.is_some_and(|tp| tp > 1)
         || args.max_seq.is_some()
+        || args.batch_exact.is_some()
         || args.head.is_some()
         || args.speculation.is_some()
         || args.model_draft.is_some()
@@ -4115,6 +4129,7 @@ fn chat_command(paths: &Paths, args: ChatArgs) -> Result<()> {
             tp: None,
             speculation: None,
             max_seq: None,
+            batch_exact: None,
             swap_host_bytes: None,
             swap_disk_bytes: None,
             swap_dir: None,
@@ -15023,6 +15038,27 @@ effort = "high"
         assert_eq!(args.speculation.as_deref(), Some("off"));
         assert_eq!(args.max_seq, Some(8192));
         assert!(Cli::try_parse_from(["hipfire", "serve", "--spec", "bogus"]).is_err());
+        let parsed = Cli::try_parse_from(["hipfire", "serve", "--batch-exact", "seeded"]).unwrap();
+        let Some(Commands::Serve(args)) = parsed.command else {
+            panic!("expected serve command")
+        };
+        assert_eq!(args.batch_exact.as_deref(), Some("seeded"));
+        assert!(Cli::try_parse_from(["hipfire", "serve", "--batch-exact", "bogus"]).is_err());
+        let parsed = Cli::try_parse_from([
+            "hipfire",
+            "run",
+            "qwen3.5:4b",
+            "--batch-exact",
+            "greedy",
+            "hi",
+        ])
+        .unwrap();
+        let Some(Commands::Run(args)) = parsed.command else {
+            panic!("expected run command")
+        };
+        assert_eq!(args.batch_exact.as_deref(), Some("greedy"));
+        assert!(run_should_force_local(&args));
+        assert!(Cli::try_parse_from(["hipfire", "run", "m", "--batch-exact", "bogus"]).is_err());
         assert!(Cli::try_parse_from(["hipfire", "serve", "--max-seq", "1"]).is_err());
         let parsed =
             Cli::try_parse_from(["hipfire", "run", "qwen3.5:4b", "--max-seq", "4096", "hi"])
@@ -21218,6 +21254,7 @@ effort = "high"
             kv_backend: None,
             tp: None,
             max_seq: None,
+            batch_exact: None,
             speculation: None,
             model_draft: None,
             vision: None,

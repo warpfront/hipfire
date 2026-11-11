@@ -254,6 +254,7 @@ Flags may appear before or after the model. CLI help and the native typed schema
 | `--head <name>` | Select a published `lm_head` variant from the registry's `heads` (e.g. `--head q4k`). The overlay shadows the model's own head at load time; omitted = the head baked into the model file. |
 | `--tp <N>` | Tensor/expert-parallel degree for this load, `1..=64` (same admission as `serve --tp` / `bench --tp`). Only values above 1 are forwarded and force a local daemon. |
 | `--max-seq <n>` | KV context for this load, within the `memory.max_seq` bounds (512–1048576); sent as the load's `max_seq` and replaces any configured `memory.max_seq`, as `bench --max-seq` does. Unset: eligible growing Qwen VMM KV defaults to min(model trained context, measured card capacity); legacy and other owners retain their bounds. Forces a local daemon (see below). |
+| `--batch-exact off\|greedy\|seeded` | Flash-Next native-MTP lane row-exactness on exact gfx1201 for this local load; same as the `serve.batch_exact` config key (default `off`), overriding it. Forces a local daemon (see below). |
 | `--spec <m>` / `--speculation <m>` | Spec mechanism: `off` \| `auto` \| `ngram` \| `dflash` \| `mtp` \| `dspark` (config default `auto`). |
 | `-md, --model-draft <path>` | DFlash draft path; implies `--spec dflash` when `--spec` is not given. |
 | `--draft-max <N>` (alias `--draft`) | Draft window, `1..=32`. With `--spec ngram` it sets the n-gram window, with `--spec mtp` the MTP window, otherwise both. |
@@ -285,7 +286,7 @@ HIPFIRE_LOCAL=1 hipfire run qwen3.5:4b "..."   # skip HTTP; always local spawn
 
 While a long prompt prefills, `hipfire run` draws one self-overwriting line on stderr, only when stderr is a terminal and never with `--json`: `  prefill 512/2048 tokens (25%), ETA 6s`. It redraws at most every 500 ms, the ETA extrapolates the prefill rate since the request was sent, and the line is erased before the first token is written. Through a healthy `serve` the line follows the stream's `: prefill <done>/<total>` comments (sent only once the stream has committed, see [SERVE.md](SERVE.md)), so it can appear later than with a local daemon.
 
-Local-forcing (skip a healthy serve): `HIPFIRE_LOCAL` truthy, `--image`, `--kv-mode`, `--kv-backend`, `--kv-k`, `--kv-v`, `--max-seq`, `--head`, `--tp` above 1, `--spec`/`--speculation`, `--model-draft`, `--vision`, `--draft-max`, or `--dspark-conf-threshold` (exact list: `run_should_force_local` in `crates/hipfire-cli/src/main.rs`). JSON and non-streaming responses are supported by the native HTTP service and do not by themselves force a local daemon.
+Local-forcing (skip a healthy serve): `HIPFIRE_LOCAL` truthy, `--image`, `--kv-mode`, `--kv-backend`, `--kv-k`, `--kv-v`, `--max-seq`, `--batch-exact`, `--head`, `--tp` above 1, `--spec`/`--speculation`, `--model-draft`, `--vision`, `--draft-max`, or `--dspark-conf-threshold` (exact list: `run_should_force_local` in `crates/hipfire-cli/src/main.rs`). JSON and non-streaming responses are supported by the native HTTP service and do not by themselves force a local daemon.
 
 ### Load summary
 
@@ -347,6 +348,7 @@ Shared by `hipfire run`, `hipfire serve`, and `hipfire bench` (including `--matr
 | `--no-prewarm` | Do not load the configured default model before accepting requests (lazy-load on first request). |
 | `--tp N` | Tensor/expert-parallel degree, `1..=64` (supported paths only). |
 | `--continuous-batch-size N` | Number of eligible concurrent batched lanes, `1..=256` (`1` preserves sequential behavior), subject to memory admission; same range as the `serve.continuous_batch_size` config key. The runtime batch width is dynamic, and the 128/63 chunk sizes are not lane limits. Forwarded by `serve -d`. |
+| `--batch-exact off\|greedy\|seeded` | Flash-Next native-MTP lane row-exactness on exact gfx1201; same values and meaning as the `serve.batch_exact` config key (default `off`), overriding it (the `HIPFIRE_QWEN4_LANE_ROW_EXACT` environment variable is the compatibility override of the key). `greedy` makes greedy output independent of batch composition, `seeded` also seeded sampled requests. Costs decode step time at C4/C8 (see `docs/CONFIG.md`). Forwarded by `serve -d`. |
 | `--ui` | Serve the embedded chat UI at `/ui` on the serve listener. |
 | `--open` | Open the chat UI in the default browser once serving; implies `--ui`. With `-d` the browser launch happens in the launching process and the detached child only enables the route. |
 | `--vision <path>` | Vision-tower sidecar wired into every model load of this process. Skipped while `vision_mode=off`. **Foreground serve only:** `serve -d` does not forward it to the detached child, so set `HIPFIRE_VISION_SIDECAR` or the registry `vision` slot for a detached service. |

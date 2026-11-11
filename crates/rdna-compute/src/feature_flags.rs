@@ -1357,7 +1357,15 @@ impl FeatureFlags {
             qwen4_lane_allrows_moe: parse_bool("HIPFIRE_QWEN4_LANE_ALLROWS_MOE").unwrap_or(true),
             qwen4_lane_allrows_exact: parse_bool("HIPFIRE_QWEN4_LANE_ALLROWS_EXACT").unwrap_or(false),
             qwen4_lane_pinned_logits: parse_bool("HIPFIRE_QWEN4_LANE_PINNED_LOGITS").unwrap_or(true),
-            qwen4_lane_device_sample: parse_bool("HIPFIRE_QWEN4_LANE_DEVICE_SAMPLE").unwrap_or(true),
+            // `serve.batch_exact = seeded` (env `HIPFIRE_QWEN4_LANE_ROW_EXACT`) keeps the host
+            // row-read sampler: the lane-wide device draw was measured composition dependent
+            // for seeded lanes (D1 identity check: 2-3/8 seeded C8 replies equal to C1 with it,
+            // 6-7/8 without).
+            qwen4_lane_device_sample: parse_bool("HIPFIRE_QWEN4_LANE_DEVICE_SAMPLE")
+                .unwrap_or(true)
+                && hipfire_config::parse_lane_row_exact(
+                    value(hipfire_config::QWEN4_LANE_ROW_EXACT_ENV).ok().as_deref(),
+                ) != hipfire_config::LaneRowExact::GreedySeeded,
             qwen4_gdn_lanes_fuse: parse_bool("HIPFIRE_QWEN4_GDN_LANES_FUSE").unwrap_or(true),
             qwen4_moe_down_r4: parse_bool("HIPFIRE_QWEN4_MOE_DOWN_R4")
                 .unwrap_or(arch == "gfx1151" || is_gfx1201),
@@ -2171,7 +2179,8 @@ impl FeatureFlags {
     }
 
     /// Qwen4 EP lanes draw T>0 tokens on the device (`HIPFIRE_QWEN4_LANE_DEVICE_SAMPLE`).
-    /// Exact gfx1201 only, default on (`=0` restores the host row-read sampler exactly).
+    /// Exact gfx1201 only, default on (`=0` restores the host row-read sampler exactly); off
+    /// under `serve.batch_exact = seeded`.
     pub fn qwen4_lane_device_sample_enabled(&self) -> bool {
         self.qwen4_lane_device_sample && self.arch == "gfx1201"
     }
@@ -3977,6 +3986,27 @@ mod tests {
             );
         }
         assert!(!FeatureFlags::for_test("gfx1201").qwen4_lane_device_sample_enabled());
+    }
+
+    /// `serve.batch_exact = seeded` keeps the host lane sampler; `off` / `greedy` do not.
+    #[test]
+    fn qwen4_lane_device_sample_is_off_under_batch_exact_seeded() {
+        let with = |value: &'static str| {
+            move |n: &str| -> std::result::Result<String, ()> {
+                if n == hipfire_config::QWEN4_LANE_ROW_EXACT_ENV {
+                    Ok(value.into())
+                } else {
+                    Err(())
+                }
+            }
+        };
+        for (mode, device) in [("off", true), ("greedy", true), ("seeded", false)] {
+            assert_eq!(
+                FeatureFlags::from_lookup("gfx1201", with(mode)).qwen4_lane_device_sample_enabled(),
+                device,
+                "{mode}"
+            );
+        }
     }
 
     /// The wave-per-token router defaults on for exact gfx1151 / gfx1201; `0` turns it off.

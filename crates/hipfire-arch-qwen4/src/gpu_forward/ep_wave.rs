@@ -114,7 +114,7 @@ pub(crate) fn ep_wave_shard_enabled() -> bool {
 /// Knob (default unset: [`SMALL_LANE_MIN_ROWS`] with the small lanes on, else
 /// [`EXACT_WAVE_MIN_LANE_ROWS`]): the fewest rows of a lane the exact wave takes, 9 at the
 /// lowest (a lane of at most 8 rows runs the few-row routes and is never a wave lane). An
-/// explicit value overrides [`QWEN4_EP_WAVE_SMALL_LANES_ENV`].
+/// explicit value overrides [`QWEN4_EP_WAVE_SMALL_LANES_ENV`] and `serve.batch_exact`.
 pub const QWEN4_EP_WAVE_MIN_LANE_ROWS_ENV: &str = "HIPFIRE_EP_LANE_PREFILL_WAVE_MIN_ROWS";
 
 static EXACT_WAVE_MIN_LANE_ROWS_KNOB: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
@@ -122,7 +122,11 @@ static EXACT_WAVE_MIN_LANE_ROWS_KNOB: std::sync::LazyLock<usize> = std::sync::La
         hipfire_config::developer_var(QWEN4_EP_WAVE_MIN_LANE_ROWS_ENV)
             .ok()
             .as_deref(),
-        ep_wave_small_lanes_enabled(),
+        // `serve.batch_exact` on: 9..=64-row lanes keep their serial singleton tile. In the
+        // small-lane wave they were measured NOT byte-equal to that tile (the D1 identity check:
+        // exactly the 57/60/64-token prompts missed their C1 reply under `seeded`).
+        ep_wave_small_lanes_enabled()
+            && hipfire_config::qwen4_lane_row_exact() == hipfire_config::LaneRowExact::Off,
     )
 });
 

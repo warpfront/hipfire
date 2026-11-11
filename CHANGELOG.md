@@ -24,6 +24,12 @@
 - **Fixed: the gfx1201 ggml MMVQ Route-A twin passes the exhaustive ledger pins with only its own existing-class exceptions.** One exact `d16_hi` model-limitation finding and four exact multi-axis region refusals mirror its unchanged hipcc anchor; no existing row, category, limit or artifact changes.
 - **Added (gfx1201 GGUF-native decode GEMV; proof only, no runtime dispatch change): Route-A PeaceMaker twin of every export of `ggml_mmvq_shim`.** The generator reproduces the shipped anchor byte for byte and seals all five exports. CPU checks pin provenance, full device-ELF identity, explicit kernargs, LDS and complete export coverage; the Q4_K `d16_hi` verdict remains OPEN, with only the anchor's same-class finding and conversion refusals mirrored for the twin.
 
+### Serving
+
+- **Added: `serve.batch_exact = off|greedy|seeded` (default `off`) and `--batch-exact` on `hipfire serve` / `hipfire run` expose Flash-Next lane row-exactness on exact gfx1201 as a documented user setting.** `HIPFIRE_QWEN4_LANE_ROW_EXACT` stays as its compatibility override with every previous spelling (`1`/`on`/`true` = `seeded`, `0`/`false` = `off`). Default behaviour is unchanged: the lane oracle (8 prompts, MTP k3, EP2 R9700) gives equal ids and byte-equal verify-logit dumps against origin/beta. Opting in costs decode step time at C4/C8 (0.54-0.74x aggregate tok/s measured on R9700 EP2).
+  - Two invariance gaps are closed under the option only. Prompts of 9..=64 tokens keep their serial singleton prefill tile instead of the small-lane EP prefill wave. Served C1-vs-C8 identity found the wave not byte-identical to C1 for exactly the 57, 60 and 64-token prompts. With `seeded`, sampled lanes draw on the host row-read sampler, because the lane-wide device draw was composition dependent for seeded lanes.
+  - Served identity, R9700 EP2: 8 distinct prompts, 256 tokens, each reply at C4, C8 and C8 with fillers compared with the same prompt alone at C1. Greedy went from 5 to 8 of 8 identical in every composition, with both `--batch-exact seeded` and `greedy`. Seeded sampled went from 2 to 6 of 8 at C8. Seeded sampled output is still not fully invariant: the 57 and 60-token prompts differ, and one of them differs between two runs of the same C8 burst.
+
 ## v0.4.6 — 2026-11-11
 
 0.4.6 is the freeze baseline for the 0.5.0 consolidation (#666). Entries are grouped by area.

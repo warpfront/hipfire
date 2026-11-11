@@ -1585,6 +1585,9 @@ fn detached_serve_command(executable: &Path, args: &ServeArgs, host: &str, port:
             .arg("--continuous-batch-size")
             .arg(batch.to_string());
     }
+    if let Some(mode) = &args.batch_exact {
+        command.arg("--batch-exact").arg(mode);
+    }
     if let Some(selector) = &args.speculation {
         command.arg("--spec").arg(selector);
     }
@@ -1817,6 +1820,9 @@ pub(crate) fn serve_foreground(
         process_config
             .values
             .set_cli("serve.swap_dir", &dir.display().to_string())?;
+    }
+    if let Some(mode) = &args.batch_exact {
+        process_config.values.set_cli("serve.batch_exact", mode)?;
     }
     let spawner = EngineSpawner {
         daemon,
@@ -3512,6 +3518,8 @@ mod tests {
             "/tmp/hipfire swap dir",
             "--continuous-batch-size",
             "4",
+            "--batch-exact",
+            "seeded",
             "--open",
         ]);
         assert!(args.detach && args.open && !args.ui);
@@ -3543,6 +3551,7 @@ mod tests {
             "--swap-disk-bytes",
             "--swap-dir",
             "--continuous-batch-size",
+            "--batch-exact",
             "--spec",
             "--ui",
         ] {
@@ -3571,6 +3580,7 @@ mod tests {
         assert_eq!(child.max_seq, Some(8192));
         assert_eq!(child.swap_host_bytes, Some(1_048_576));
         assert_eq!(child.swap_disk_bytes, Some(2_097_152));
+        assert_eq!(child.batch_exact.as_deref(), Some("seeded"));
         assert_eq!(child.swap_dir, Some(PathBuf::from("/tmp/hipfire swap dir")));
         assert_eq!(child.continuous_batch_size, args.continuous_batch_size);
         assert!(child.foreground_child);

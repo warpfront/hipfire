@@ -1405,6 +1405,17 @@ pub static FIELDS: &[ConfigField] = &[
         "HIPFIRE_SERVE_BATCH_SAMPLED",
         "Default on (applies only with serve.vmm_batch). Admit sampled (temperature>0) requests to the VMM batch route only in the lane mode the singleton route selects for them, each proven byte-identical to that singleton (AR, native MTP, FAST_SAMPLE selector-chain DFlash). 0 is the kill switch: sampled requests stay on the serialized singleton route."
     ),
+    bridge_field!(
+        "serve.batch_exact",
+        "serve_batch_exact",
+        Serve,
+        Process,
+        DefaultValue::String("off"),
+        ValueRule::Enum(&["off", "greedy", "seeded"]),
+        true,
+        "HIPFIRE_QWEN4_LANE_ROW_EXACT",
+        "Opt-in (default off). Flash-Next native-MTP lanes on exact gfx1201: greedy makes greedy output independent of batch composition, seeded also seeded sampled requests. Costs decode step time at C4/C8 (0.54-0.74x tok/s measured on R9700 EP2); off is the default."
+    ),
     field!(
         "serve.queue_timeout_ms",
         "serve_queue_timeout_ms",
@@ -4694,16 +4705,18 @@ pub fn qwen4_ep_sampled_wide_verify() -> bool {
     developer_bool(QWEN4_EP_SAMPLED_WIDE_VERIFY_ENV, false)
 }
 
-/// `HIPFIRE_QWEN4_LANE_ROW_EXACT` (developer, default `0` = off): which Flash-Next lane
-/// classes keep every all-rows (9..=64-row) lane step bitwise their <=8-row rows, so output
-/// does not depend on batch composition. Unset, `0`, `off`, `false`: no lane is row-exact
-/// (the default: concurrent native-MTP output at >= 3 lanes may depend on batch composition;
-/// C1 and AR steps of <= 8 rows stay exact). `greedy`: greedy lanes; `seeded` (also `1`, `on`,
-/// `true`): greedy lanes and sampled lanes with an explicit request seed. Opting in costs
-/// step time on the exact steps (CHANGELOG). Unrecognised values warn once and mean `0`.
+/// `serve.batch_exact` (user config key, default `off`; `--batch-exact` on `hipfire serve` /
+/// `hipfire run`): which Flash-Next lane classes keep every all-rows (9..=64-row) lane step
+/// bitwise their <=8-row rows, so output does not depend on batch composition. `off`: no
+/// lane is row-exact (the default: concurrent native-MTP output at >= 3 lanes may depend on
+/// batch composition; C1 and AR steps of <= 8 rows stay exact). `greedy`: greedy lanes;
+/// `seeded`: greedy lanes and sampled lanes with an explicit request seed. Opting in costs
+/// step time on the exact steps (CHANGELOG). This environment variable is the documented
+/// compatibility override of that key; it also accepts `1`/`on`/`true` (= `seeded`) and
+/// `0`/`false` (= `off`), and an unrecognised value warns once and means `off`.
 pub const QWEN4_LANE_ROW_EXACT_ENV: &str = "HIPFIRE_QWEN4_LANE_ROW_EXACT";
 
-/// Lane classes that run their all-rows steps row-exact ([`QWEN4_LANE_ROW_EXACT_ENV`]).
+/// Lane classes that run their all-rows steps row-exact (`serve.batch_exact`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LaneRowExact {
     /// No lane is row-exact (default).
@@ -4714,8 +4727,8 @@ pub enum LaneRowExact {
     GreedySeeded,
 }
 
-/// Pure parse of [`QWEN4_LANE_ROW_EXACT_ENV`]: trimmed, ASCII case-insensitive; `greedy` is
-/// `Greedy`; `seeded`, `1`, `on`, `true` are `GreedySeeded`; unset, `0`, `off`, `false` and
+/// Pure parse of the `serve.batch_exact` value: trimmed, ASCII case-insensitive; `greedy` is
+/// `Greedy`; `seeded`, `1`, `on`, `true` are `GreedySeeded`; unset, `off`, `0`, `false` and
 /// anything unrecognised are `Off`.
 pub fn parse_lane_row_exact(raw: Option<&str>) -> LaneRowExact {
     let Some(raw) = raw else {
@@ -4728,21 +4741,12 @@ pub fn parse_lane_row_exact(raw: Option<&str>) -> LaneRowExact {
     }
 }
 
-/// [`QWEN4_LANE_ROW_EXACT_ENV`] read once per process through the developer snapshot.
+/// `serve.batch_exact` as the process snapshot renders it ([`QWEN4_LANE_ROW_EXACT_ENV`]),
+/// read once per process. Absent (the default) and `off` are [`LaneRowExact::Off`]. The
+/// env spellings are normalised and validated by the env layer ([`load_env_layer`]).
 pub fn qwen4_lane_row_exact() -> LaneRowExact {
-    static MODE: LazyLock<LaneRowExact> = LazyLock::new(|| {
-        let raw = developer_var(QWEN4_LANE_ROW_EXACT_ENV).ok();
-        if let Some(v) = raw.as_deref() {
-            let t = v.trim().to_ascii_lowercase();
-            if !matches!(
-                t.as_str(),
-                "" | "seeded" | "1" | "on" | "true" | "greedy" | "0" | "off" | "false"
-            ) {
-                eprintln!("[WARN] {QWEN4_LANE_ROW_EXACT_ENV}={v} is not seeded|greedy|0; using 0");
-            }
-        }
-        parse_lane_row_exact(raw.as_deref())
-    });
+    static MODE: LazyLock<LaneRowExact> =
+        LazyLock::new(|| parse_lane_row_exact(process_value(QWEN4_LANE_ROW_EXACT_ENV).as_deref()));
     *MODE
 }
 
@@ -6290,6 +6294,27 @@ pub fn legacy_devices_env_set() -> bool {
     env::var_os("HIPFIRE_DEVICES").is_some() || env::var_os("HIPFIRE_DEVICE").is_some()
 }
 
+/// Maps every accepted `HIPFIRE_QWEN4_LANE_ROW_EXACT` spelling onto a `serve.batch_exact`
+/// value (trimmed, ASCII case-insensitive): `greedy`; `seeded`/`1`/`on`/`true` -> `seeded`;
+/// empty/`0`/`off`/`false` -> `off`. Anything else warns once and means `off`, as before
+/// the key existed.
+fn normalize_lane_row_exact_env(raw: &str) -> &'static str {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "greedy" => "greedy",
+        "seeded" | "1" | "on" | "true" => "seeded",
+        "" | "0" | "off" | "false" => "off",
+        _ => {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                eprintln!(
+                    "[WARN] {QWEN4_LANE_ROW_EXACT_ENV}={raw} is not off|greedy|seeded; using off"
+                );
+            });
+            "off"
+        }
+    }
+}
+
 pub fn load_env_layer() -> Result<ConfigLayer> {
     let mut layer = ConfigLayer::default();
     let mut stable_names = BTreeSet::new();
@@ -6302,6 +6327,9 @@ pub fn load_env_layer() -> Result<ConfigLayer> {
             continue;
         };
         let value = match (field.legacy_key, raw.as_str()) {
+            ("serve_batch_exact", _) => {
+                ConfigValue::String(normalize_lane_row_exact_env(&raw).to_owned())
+            }
             ("default_chatml", "0") => ConfigValue::Bool(false),
             ("dflash_ngram_block", "1") => ConfigValue::Bool(true),
             ("prompt_normalize", "0" | "false" | "off" | "no") => ConfigValue::Bool(false),
@@ -6999,6 +7027,62 @@ mod tests {
         }
         for v in ["0", "off", "FALSE", " 0 ", "bogus", ""] {
             assert_eq!(parse_lane_row_exact(Some(v)), Off, "{v:?}");
+        }
+    }
+
+    #[test]
+    fn serve_batch_exact_key_and_env_override_round_trip() {
+        let f = field("serve.batch_exact").expect("serve.batch_exact schema field");
+        assert_eq!(f.env_compat, Some(QWEN4_LANE_ROW_EXACT_ENV));
+        assert!(matches!(f.default, DefaultValue::String("off")));
+        for ok in ["off", "greedy", "seeded"] {
+            assert!(f.validate(&ConfigValue::String(ok.into())).is_ok(), "{ok}");
+        }
+        assert!(f.validate(&ConfigValue::String("on".into())).is_err());
+        // Default: no value in the process snapshot, which the runtime reads as Off.
+        let process =
+            ProcessConfig::from_resolved(&resolve([]).expect("empty resolve")).expect("process");
+        assert_eq!(process.legacy_value(QWEN4_LANE_ROW_EXACT_ENV), None);
+        assert_eq!(
+            parse_lane_row_exact(process.legacy_value(QWEN4_LANE_ROW_EXACT_ENV).as_deref()),
+            LaneRowExact::Off
+        );
+        // The env layer keeps every legacy spelling's meaning (`load_env_layer` maps the
+        // variable through `normalize_lane_row_exact_env`; the ambient env is not mutated).
+        for (spelling, key_value, mode) in [
+            ("1", "seeded", LaneRowExact::GreedySeeded),
+            ("on", "seeded", LaneRowExact::GreedySeeded),
+            (" TRUE ", "seeded", LaneRowExact::GreedySeeded),
+            ("seeded", "seeded", LaneRowExact::GreedySeeded),
+            ("greedy", "greedy", LaneRowExact::Greedy),
+            ("0", "off", LaneRowExact::Off),
+            ("false", "off", LaneRowExact::Off),
+            ("junk", "off", LaneRowExact::Off),
+        ] {
+            let mut env_layer = ConfigLayer::default();
+            env_layer
+                .set(
+                    "serve.batch_exact",
+                    ConfigValue::String(normalize_lane_row_exact_env(spelling).to_owned()),
+                )
+                .expect("normalised value validates");
+            let process = ProcessConfig::from_resolved(
+                &resolve([NamedLayer {
+                    source: ConfigSource::LegacyEnv {
+                        name: QWEN4_LANE_ROW_EXACT_ENV.into(),
+                    },
+                    layer: env_layer,
+                }])
+                .expect("env resolve"),
+            )
+            .expect("process");
+            let rendered = process.legacy_value(QWEN4_LANE_ROW_EXACT_ENV);
+            assert_eq!(rendered.as_deref(), Some(key_value), "{spelling:?}");
+            assert_eq!(
+                parse_lane_row_exact(rendered.as_deref()),
+                mode,
+                "{spelling:?}"
+            );
         }
     }
 
