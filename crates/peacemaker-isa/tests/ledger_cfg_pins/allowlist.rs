@@ -184,31 +184,31 @@ pub const FINDINGS: &[Allow] = &[
     Allow {
         scope: "pins",
         target: "gated_delta_chunk_arena_pm_gfx1151.hxaco#gated_delta_chunk_gate_wmma_arena_pm_gfx1151",
-        needle: "`v_add_nc_u32_e32 v75, -2, v203` (after label `.LBB24`): needs Lgkm wait 1 (War { reg: \"v[74:77]\" })",
+        needle: "`v_add_nc_u32_e32 v75, -2, v197` (after label `.LBB24`): needs Lgkm wait 1 (War { reg: \"v[74:77]\" })",
         why: "MODEL LIMITATION, not a claimed race: the ledger keeps a pending DS store's source VGPRs locked until its LGKMcnt wait and reports the first write of one on a CFG path with no such wait. The existing text replay documents that hipcc code reuses DS store sources under a hardware interlock (`ledger_replay::replay_hazards`: \"hardware-interlocked DS-source reuse the strict replay already flags\"), so this stricter-than-hardware lock is the ledger's model; that this exact reuse is interlocked, and that the path is feasible, is not established here",
     },
     Allow {
         scope: "pins",
         target: "gated_delta_chunk_pm_gfx1100.hxaco#gated_delta_chunk_gate_wmma_pm_gfx1100",
-        needle: "`v_add_nc_u32_e32 v75, -2, v196` (after label `.LBB24`): needs Lgkm wait 1 (War { reg: \"v[74:77]\" })",
+        needle: "`v_add_nc_u32_e32 v75, -2, v189` (after label `.LBB24`): needs Lgkm wait 1 (War { reg: \"v[74:77]\" })",
         why: "MODEL LIMITATION, not a claimed race: the ledger keeps a pending DS store's source VGPRs locked until its LGKMcnt wait and reports the first write of one on a CFG path with no such wait. The existing text replay documents that hipcc code reuses DS store sources under a hardware interlock (`ledger_replay::replay_hazards`: \"hardware-interlocked DS-source reuse the strict replay already flags\"), so this stricter-than-hardware lock is the ledger's model; that this exact reuse is interlocked, and that the path is feasible, is not established here",
     },
     Allow {
         scope: "pins",
         target: "gated_delta_chunk_pm_gfx1151.hxaco#gated_delta_chunk_gate_wmma_pm_gfx1151",
-        needle: "`v_add_nc_u32_e32 v75, -2, v203` (after label `.LBB24`): needs Lgkm wait 1 (War { reg: \"v[74:77]\" })",
+        needle: "`v_add_nc_u32_e32 v75, -2, v197` (after label `.LBB24`): needs Lgkm wait 1 (War { reg: \"v[74:77]\" })",
         why: "MODEL LIMITATION, not a claimed race: the ledger keeps a pending DS store's source VGPRs locked until its LGKMcnt wait and reports the first write of one on a CFG path with no such wait. The existing text replay documents that hipcc code reuses DS store sources under a hardware interlock (`ledger_replay::replay_hazards`: \"hardware-interlocked DS-source reuse the strict replay already flags\"), so this stricter-than-hardware lock is the ledger's model; that this exact reuse is interlocked, and that the path is feasible, is not established here",
     },
     Allow {
         scope: "pins",
         target: "gated_delta_chunk_q8_arena_pm_gfx1151.hxaco#gated_delta_chunk_gate_q8_wmma_arena_pm_gfx1151",
-        needle: "`v_and_b32_e32 v74, 16, v135` (after label `.LBB29`): needs Lgkm wait 1 (War { reg: \"v[74:77]\" })",
+        needle: "`v_and_b32_e32 v74, 16, v129` (after label `.LBB29`): needs Lgkm wait 1 (War { reg: \"v[74:77]\" })",
         why: "MODEL LIMITATION, not a claimed race: the ledger keeps a pending DS store's source VGPRs locked until its LGKMcnt wait and reports the first write of one on a CFG path with no such wait. The existing text replay documents that hipcc code reuses DS store sources under a hardware interlock (`ledger_replay::replay_hazards`: \"hardware-interlocked DS-source reuse the strict replay already flags\"), so this stricter-than-hardware lock is the ledger's model; that this exact reuse is interlocked, and that the path is feasible, is not established here",
     },
     Allow {
         scope: "pins",
         target: "gated_delta_chunk_q8_pm_gfx1151.hxaco#gated_delta_chunk_gate_q8_wmma_pm_gfx1151",
-        needle: "`v_and_b32_e32 v74, 16, v135` (after label `.LBB29`): needs Lgkm wait 1 (War { reg: \"v[74:77]\" })",
+        needle: "`v_and_b32_e32 v74, 16, v129` (after label `.LBB29`): needs Lgkm wait 1 (War { reg: \"v[74:77]\" })",
         why: "MODEL LIMITATION, not a claimed race: the ledger keeps a pending DS store's source VGPRs locked until its LGKMcnt wait and reports the first write of one on a CFG path with no such wait. The existing text replay documents that hipcc code reuses DS store sources under a hardware interlock (`ledger_replay::replay_hazards`: \"hardware-interlocked DS-source reuse the strict replay already flags\"), so this stricter-than-hardware lock is the ledger's model; that this exact reuse is interlocked, and that the path is feasible, is not established here",
     },
     Allow {
