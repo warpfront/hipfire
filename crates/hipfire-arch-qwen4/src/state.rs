@@ -7396,9 +7396,11 @@ mod tests {
     #[test]
     fn row_capture_64_prefix_abort_and_continuation_match_singletons() {
         use rdna_compute::tensor_ops::{
-            gated_delta_step, gated_delta_step_batched, GatedDeltaStep, GatedDeltaStepBatched,
+            gated_delta_conv, gated_delta_step, gated_delta_step_batched, GatedDeltaConv,
+            GatedDeltaStep, GatedDeltaStepBatched,
         };
         let Some(mut gpu) = try_gpu() else { return };
+        eprintln!("GDN prefix repair test: actual GPU {}", gpu.arch);
         let config = capture_test_config();
         let rows = hipfire_config::QWEN4_VERIFY_MAX_ROWS;
         let start = 37;
@@ -7425,6 +7427,13 @@ mod tests {
         let output = gpu
             .zeros(&[(rows + 3) * value], DType::F32)
             .expect("output");
+        // The reference history is produced by the real scalar convolution,
+        // including its source BF16 boundary. Its unused output is independent
+        // of the recurrence inputs this state-repair fixture exercises.
+        let conv_kernel = gpu
+            .zeros(&[qkv * config.linear_conv_kernel_dim], DType::BF16)
+            .expect("zero convolution kernel");
+        let conv_output = gpu.zeros(&[qkv], DType::F32).expect("unused conv output");
         // No PLE owner in this fixture, so the repair never reads this view.
         let ple = gpu.zeros(&[1], DType::F32).expect("unused PLE input");
         let tokens: Vec<_> = (0..rows + 3).map(|i| 10 + i as u32).collect();
@@ -7457,18 +7466,22 @@ mod tests {
             .expect("singleton recurrence");
         };
         let advance_history = |gpu: &mut Gpu, state: &mut Qwen4State, row: usize| {
-            gpu.hip
-                .memcpy_htod(
-                    &state.gdn[0]
-                        .conv
-                        .sub_offset((start + row) % history * qkv, qkv)
-                        .buf,
-                    &projection[row * qkv..][..qkv]
-                        .iter()
-                        .flat_map(|x| x.to_ne_bytes())
-                        .collect::<Vec<_>>(),
-                )
-                .expect("conv input");
+            gated_delta_conv(
+                gpu,
+                &GatedDeltaConv {
+                    input: &proj.sub_offset(row * qkv, qkv),
+                    kernel: &conv_kernel,
+                    history: &state.gdn[0].conv,
+                    output: &conv_output,
+                    next_history: &state.gdn[0].conv,
+                    channels: qkv,
+                    history_rows: history,
+                    kernel_size: config.linear_conv_kernel_dim,
+                    cursor: (start + row) % history,
+                    row_index: row,
+                },
+            )
+            .expect("actual convolution history producer");
             state.ple_history.push(tokens[row]);
             state.position = start + row + 1;
         };
@@ -7555,9 +7568,15 @@ mod tests {
                         .expect("clear Q8 seed");
                     singleton(gpu, state, 0);
                 }
+                // Real convolution history stores BF16-expanded F32. Seed a
+                // valid nonzero history so only captured-row repair is tested.
+                let conv_seed: Vec<u8> = vec![0.25f32; state.gdn[0].conv.numel()]
+                    .iter()
+                    .flat_map(|value| value.to_ne_bytes())
+                    .collect();
                 gpu.hip
-                    .memset(&state.gdn[0].conv.buf, 0x32, state.gdn[0].conv.byte_size())
-                    .expect("seed conv");
+                    .memcpy_htod(&state.gdn[0].conv.buf, &conv_seed)
+                    .expect("seed BF16-exact conv history");
                 state.position = start;
                 state.ple_history = reference_history;
             };
@@ -7706,7 +7725,16 @@ mod tests {
             reference.free_gpu(&mut gpu).expect("free reference");
             candidate.free_gpu(&mut gpu).expect("free candidate");
         }
-        for tensor in [proj, gates, betas, initial, output, ple] {
+        for tensor in [
+            proj,
+            gates,
+            betas,
+            initial,
+            output,
+            conv_kernel,
+            conv_output,
+            ple,
+        ] {
             gpu.free_tensor(tensor).expect("free fixture");
         }
     }

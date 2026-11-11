@@ -2,6 +2,7 @@
 //! Synthetic controls below qualify these checks only, never a GPU or model.
 
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(super) type R<T> = Result<T, String>;
@@ -158,6 +159,138 @@ pub(super) fn target_projection(
         .into_iter()
         .partition(|(key, _)| !physical.contains(key)))
 }
+
+/// Target QSA owner only. Never the MTP head's persistent reuse selection.
+/// The full logical allocation is retained, including bytes past active_len.
+#[derive(Clone)]
+pub(super) struct TargetSelectionBytes {
+    pub layer: usize,
+    pub capacity: usize,
+    pub active_len: usize,
+    pub bytes: Vec<u8>,
+}
+pub(super) fn target_selection_receipt(rows: &[TargetSelectionBytes]) -> Value {
+    json!(rows.iter().map(|row| json!({
+        "layer":row.layer, "capacity":row.capacity, "active_len":row.active_len,
+        "logical_bytes":row.bytes.len(), "full_sha256":format!("{:x}",Sha256::digest(&row.bytes))
+    })).collect::<Vec<_>>())
+}
+
+/// Exact frozen plain-Q8 Flash-Next target contract. No row is dropped.
+/// Partial repair explicitly restores complete pre-verify selection buffers;
+/// all other canonical state still equals sequential AR at the kept prefix.
+/// Full acceptance has no selection exception.
+pub(super) fn target_prefix_contract(
+    actual: &[(String, String)],
+    ar_keep: &[(String, String)],
+    selections: &[TargetSelectionBytes],
+    s0: &[TargetSelectionBytes],
+    rows: usize,
+    keep: usize,
+) -> R<Value> {
+    ensure(
+        (1..=MAX_ROWS).contains(&rows) && (1..=rows).contains(&keep),
+        "prefix contract rows/keep invalid",
+    )?;
+    let unique = |values: &[(String, String)]| -> R<BTreeMap<String, String>> {
+        let mut map = BTreeMap::new();
+        for (key, value) in values {
+            ensure(
+                map.insert(key.clone(), value.clone()).is_none(),
+                "duplicate canonical row",
+            )?;
+        }
+        Ok(map)
+    };
+    let actual = unique(actual)?;
+    let ar_keep = unique(ar_keep)?;
+    ensure(
+        actual.len() == 220 && ar_keep.len() == 220 && actual.keys().eq(ar_keep.keys()),
+        "plain-Q8 target canonical row inventory differs",
+    )?;
+    ensure(
+        selections.len() == 12 && s0.len() == 12,
+        "exactly12 target selection owners required",
+    )?;
+    let mut layers = BTreeSet::new();
+    let mut selection_keys = BTreeSet::new();
+    for (got, before) in selections.iter().zip(s0) {
+        ensure(
+            got.layer == before.layer && got.layer < LAYERS && layers.insert(got.layer),
+            "target selection layer identity duplicate/different",
+        )?;
+        let extent = got
+            .capacity
+            .checked_mul(4)
+            .ok_or("selection byte overflow")?;
+        ensure(
+            got.capacity > 0
+                && got.capacity == before.capacity
+                && got.active_len <= got.capacity
+                && before.active_len <= before.capacity
+                && got.bytes.len() == extent
+                && before.bytes.len() == extent,
+            "target selection complete logical extent differs",
+        )?;
+        let key = format!("qsa[L{}].selected_indices", got.layer);
+        ensure(
+            actual.contains_key(&key) && ar_keep.contains_key(&key),
+            "typed target selection canonical key missing",
+        )?;
+        let active_bytes = got.active_len * 4;
+        let observed = format!(
+            "{:x} bytes={} rows={}",
+            Sha256::digest(&got.bytes[..active_bytes]),
+            active_bytes,
+            got.active_len
+        );
+        ensure(
+            actual.get(&key) == Some(&observed),
+            "full selection readback does not bind actual canonical active bytes",
+        )?;
+        selection_keys.insert(key);
+    }
+    ensure(
+        actual
+            .keys()
+            .filter(|key| key.ends_with(".selected_indices"))
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            == selection_keys,
+        "unexpected selection owner cannot be excluded",
+    )?;
+    let partial = keep < rows;
+    let nonselection_exact = actual
+        .iter()
+        .filter(|(key, _)| !selection_keys.contains(*key))
+        .all(|(key, value)| ar_keep.get(key) == Some(value));
+    let selection_contract_exact = if partial {
+        selections.iter().zip(s0).all(|(a, b)| a.bytes == b.bytes)
+    } else {
+        selection_keys
+            .iter()
+            .all(|key| actual.get(key) == ar_keep.get(key))
+    };
+    let differences = actual
+        .iter()
+        .filter(|(key, value)| ar_keep.get(*key) != Some(*value))
+        .map(|(key, value)| json!({"key":key,"actual":value,"ar_keep":ar_keep.get(key)}))
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "contract":"target_prefix_s0_selection_v1",
+        "rows":rows,"consumed_rows":keep,"partial":partial,
+        "selection_expected_source":if partial{"PREVERIFY_S0_FULL_LOGICAL_BYTES"}else{"AR_KEEP_CANONICAL_ACTIVE_BYTES"},
+        "canonical_rows_checked":220,"nonselection_rows_checked":208,"selection_owners_checked":12,
+        "nonselection_exact":nonselection_exact,
+        "selection_contract_exact":selection_contract_exact,
+        "observed_allcanonical_to_AR":differences.is_empty(),
+        "all_canonical_diff_rows":differences,
+        "actual_selection_full":target_selection_receipt(selections),
+        "preverify_s0_selection_full":target_selection_receipt(s0),
+        "head_state_scope":"NOT_INCLUDED_OR_EXCLUDED_BY_THIS_TARGET_ONLY_CONTRACT"
+    }))
+}
+
 fn array<'a>(v: &'a Value, key: &str, len: usize) -> R<&'a Vec<Value>> {
     let a = v
         .get(key)
@@ -549,5 +682,86 @@ mod tests {
         let mut duplicate = state;
         duplicate.push(("gdn[L0].recurrent".into(), "duplicate".into()));
         assert!(target_projection(duplicate, &[0], true).is_err());
+
+        // Synthetic checker controls only. Never GPU/model proof.
+        let before: Vec<_> = (0..12)
+            .map(|i| TargetSelectionBytes {
+                layer: i * 4 + 3,
+                capacity: 4,
+                active_len: 1,
+                bytes: vec![0; 16],
+            })
+            .collect();
+        let mut current = before.clone();
+        for row in &mut current {
+            row.active_len = 2;
+        }
+        let canonical = |values: &[TargetSelectionBytes]| -> Vec<(String, String)> {
+            let mut rows: Vec<_> = (0..208)
+                .map(|i| (format!("fixed.{i}"), "unchanged".into()))
+                .collect();
+            rows[0].0 = "gdn[L0].conv".into();
+            rows.extend(values.iter().map(|row| {
+                let n = row.active_len * 4;
+                (
+                    format!("qsa[L{}].selected_indices", row.layer),
+                    format!(
+                        "{:x} bytes={} rows={}",
+                        Sha256::digest(&row.bytes[..n]),
+                        n,
+                        row.active_len
+                    ),
+                )
+            }));
+            rows
+        };
+        let got = canonical(&current);
+        let mut ar_selection = current.clone();
+        for row in &mut ar_selection {
+            row.bytes[0] = 1;
+        }
+        let ar = canonical(&ar_selection);
+        let good = target_prefix_contract(&got, &ar, &current, &before, 2, 1).unwrap();
+        assert_eq!(good["nonselection_exact"], true);
+        assert_eq!(good["selection_contract_exact"], true);
+        assert_eq!(good["observed_allcanonical_to_AR"], false);
+        assert_eq!(
+            good["all_canonical_diff_rows"].as_array().unwrap().len(),
+            12
+        );
+        // Even a byte beyond the active extent must be restored from S0.
+        let mut bad = current.clone();
+        bad[0].bytes[15] = 9;
+        assert_eq!(
+            target_prefix_contract(&got, &ar, &bad, &before, 2, 1).unwrap()
+                ["selection_contract_exact"],
+            false
+        );
+        // The original current conv discrepancy must remain a failure.
+        let mut bad_conv = got.clone();
+        bad_conv[0].1 = "CORRUPTED".into();
+        assert_eq!(
+            target_prefix_contract(&bad_conv, &ar, &current, &before, 2, 1).unwrap()
+                ["nonselection_exact"],
+            false
+        );
+        assert_eq!(
+            target_prefix_contract(&got, &ar, &current, &before, 2, 2).unwrap()
+                ["selection_contract_exact"],
+            false
+        );
+        let full = target_prefix_contract(&ar, &ar, &ar_selection, &before, 2, 2).unwrap();
+        assert_eq!(full["selection_contract_exact"], true);
+        assert_eq!(full["observed_allcanonical_to_AR"], true);
+        assert!(target_prefix_contract(&got, &ar, &current[..11], &before, 2, 1).is_err());
+        let mut duplicate = current.clone();
+        duplicate[1].layer = duplicate[0].layer;
+        assert!(target_prefix_contract(&got, &ar, &duplicate, &before, 2, 1).is_err());
+        let mut missing = got.clone();
+        missing.pop();
+        assert!(target_prefix_contract(&missing, &ar, &current, &before, 2, 1).is_err());
+        let mut extra = got.clone();
+        extra.push(("head.selected_indices".into(), "FORBIDDEN".into()));
+        assert!(target_prefix_contract(&extra, &ar, &current, &before, 2, 1).is_err());
     }
 }

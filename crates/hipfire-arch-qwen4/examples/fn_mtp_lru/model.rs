@@ -1,9 +1,12 @@
 //! Real-model gate. Product loading and state checks reuse the contracts exercised
 //! by Kaden Schutt's greedy_mtp_identity_hw, qwen4_wide_verify and session_cache_hw.
-//! The reference is sequential AR, not a second call to the speculative program.
+//! Sequential AR is the independent logits/state reference. Partial prefix repair
+//! restores complete target QSA selection owners from S0; its other canonical
+//! state equals AR at the kept prefix. Full acceptance and next AR stay AR-exact.
 use super::receipts::{
-    ensure, number, pending as pending_tickets, published, real_native_window, target_projection,
-    ticket, turnover, R,
+    ensure, number, pending as pending_tickets, published, real_native_window,
+    target_prefix_contract, target_projection, target_selection_receipt, ticket, turnover,
+    TargetSelectionBytes, R,
 };
 use super::Args;
 use hipfire_arch_qwen4::bundle::Qwen4Bundle;
@@ -249,6 +252,49 @@ fn check_state(bundle: &mut Qwen4Bundle, gpu: &mut Gpu, want: &StateDigest, labe
         ),
     )
 }
+
+/// Read the twelve target QSA owners, never the MTP head selection. All
+/// readbacks are outside capture, at a completed oracle boundary.
+fn target_selection_full(bundle: &Qwen4Bundle, gpu: &mut Gpu) -> R<Vec<TargetSelectionBytes>> {
+    gpu.hip.device_synchronize().map_err(err)?;
+    let layers: Vec<_> = bundle
+        .config
+        .layer_types
+        .iter()
+        .enumerate()
+        .filter_map(|(layer, kind)| (*kind == LayerType::FullAttention).then_some(layer))
+        .collect();
+    ensure(layers.len() == 12, "expected12 target QSA selection owners")?;
+    let mut rows = Vec::with_capacity(12);
+    for layer in layers {
+        let state = bundle
+            .state
+            .qsa_by_layer(layer)
+            .ok_or("target QSA owner missing")?;
+        let bytes = state.selected_indices.byte_size();
+        ensure(
+            bytes
+                == state
+                    .selected_capacity
+                    .checked_mul(4)
+                    .ok_or("selection extent overflow")?
+                && bytes <= state.selected_indices.buf.size(),
+            "full logical target selection extent",
+        )?;
+        let mut host = vec![0; bytes];
+        gpu.hip
+            .memcpy_dtoh(&mut host, &state.selected_indices.buf)
+            .map_err(err)?;
+        rows.push(TargetSelectionBytes {
+            layer,
+            capacity: state.selected_capacity,
+            active_len: state.selected_len,
+            bytes: host,
+        });
+    }
+    Ok(rows)
+}
+
 fn target_transactions(
     bundle: &mut Qwen4Bundle,
     gpu: &mut Gpu,
@@ -268,6 +314,7 @@ fn target_transactions(
         let s0 = HostCheckpoint::capture(bundle, gpu)?;
         verified_complete = true;
         check_state(bundle, gpu, &ar.states[&0], "captured independent S0")?;
+        let s0_selection = target_selection_full(bundle, gpu)?;
         let mut cells = Vec::new();
         for rows in [1, 2, 4, 8] {
             verified_complete = false;
@@ -348,26 +395,76 @@ fn target_transactions(
                     let keep = accept + 1;
                     let now = digest(bundle, gpu, SessionRoute::Ar)?;
                     verified_complete = true;
+                    let actual_selection = target_selection_full(bundle, gpu)?;
+                    // Durable full observations precede every contract assertion,
+                    // including a structural refusal. No changed field is hidden.
+                    let context = json!({"rows":rows,"accepted_drafts":accept,
+                        "consumed_rows":keep,"path":if native{"native_retain"}else{"generic_commit_prefix"},
+                        "position_before":prompt.len(),"position_after":bundle.state.position,
+                        "actual_state":&now,"ar_keep_state":&ar.states[&keep],
+                        "actual_selection_full":target_selection_receipt(&actual_selection),
+                        "preverify_s0_selection_full":target_selection_receipt(&s0_selection)});
+                    eprintln!("FN_MTP_PREFIX_STATE_OBSERVATION {}", context);
                     ensure(
-                        now.same_semantic(&ar.states[&keep]),
-                        "accepted-prefix target state differs from AR",
+                        now.head_active.is_none() && ar.states[&keep].head_active.is_none(),
+                        "target-only contract cannot exclude a head owner",
+                    )?;
+                    let contract = target_prefix_contract(
+                        &now.target_semantic,
+                        &ar.states[&keep].target_semantic,
+                        &actual_selection,
+                        &s0_selection,
+                        rows,
+                        keep,
+                    )?;
+                    eprintln!("FN_MTP_PREFIX_STATE_CONTRACT {}", contract);
+                    ensure(
+                        contract["nonselection_exact"] == true
+                            && contract["selection_contract_exact"] == true,
+                        format!(
+                            "accepted-prefix state contract failed: {}",
+                            json!({
+                            "observation":&context,"contract":&contract})
+                        ),
                     )?;
                     verified_complete = false;
                     bundle
                         .forward_token(gpu, ar.ids[keep], logits, None)
                         .map_err(err)?;
-                    let now = digest(bundle, gpu, SessionRoute::Ar)?;
+                    let next_logits = gpu.download_f32(logits).map_err(err)?;
+                    let logits_exact = next_logits.len() == vocab
+                        && next_logits.iter().all(|v| v.is_finite())
+                        && next_logits
+                            .iter()
+                            .map(|v| v.to_bits())
+                            .eq(ar.logits_bits[&(keep + 1)].iter().copied());
+                    let next_state = digest(bundle, gpu, SessionRoute::Ar)?;
                     verified_complete = true;
+                    let next_state_exact = next_state.same_semantic(&ar.states[&(keep + 1)]);
+                    let next = json!({"consumed_rows":keep+1,
+                        "actual_state":&next_state,"ar_state":&ar.states[&(keep+1)],
+                        "full_logits_bitexact":logits_exact,"allcanonical_state_exact":next_state_exact,
+                        "vocab":vocab,"bytes":next_logits.len()*4,
+                        "actual_logits_sha256":format!("{:x}",Sha256::digest(
+                            next_logits.iter().flat_map(|v|v.to_bits().to_le_bytes()).collect::<Vec<_>>())),
+                        "ar_logits_sha256":format!("{:x}",Sha256::digest(
+                            ar.logits_bits[&(keep+1)].iter().flat_map(|v|v.to_le_bytes()).collect::<Vec<_>>()))});
+                    eprintln!("FN_MTP_PREFIX_NEXT_AR {}", next);
                     ensure(
-                        now.same_semantic(&ar.states[&(keep + 1)]),
-                        "post-commit AR continuation differs",
+                        logits_exact && next_state_exact,
+                        format!("post-commit AR continuation differs: {next}"),
                     )?;
-                    cells.push(json!({"rows":rows,"accepted_drafts":accept,"consumed_rows":keep,"path":if native{"native_retain"}else{"generic_commit_prefix"},"active_state_rows":now.len(),"all_live_semantic_state_exact":true,"subsequent_ar_checked":true}));
+                    cells.push(
+                        json!({"rows":rows,"accepted_drafts":accept,"consumed_rows":keep,
+                        "path":if native{"native_retain"}else{"generic_commit_prefix"},
+                        "active_state_rows":next_state.len(),"prefix_contract":contract,
+                        "prefix_observation":context,"next_ar":next}),
+                    );
                 }
             }
         }
         Ok(
-            json!({"cells":cells,"abandon_and_ticket_reuse_checked":true,"s0_checkpoint":"host-owned public SessionState layout; no nested target ticket","s0_host_bytes":s0.bytes(),"full_logits_bitwise_claim":true,"state_scope":"canonical active target semantic tensors/marks; raw physical GDN ring receipt retained separately","limits":"Full vocabulary checked against sequential AR only at qualified R1/2/4/8."}),
+            json!({"cells":cells,"abandon_and_ticket_reuse_checked":true,"s0_checkpoint":"host-owned public SessionState layout; no nested target ticket","s0_host_bytes":s0.bytes(),"full_logits_bitwise_claim":true,"prefix_state_contract":"target_prefix_s0_selection_v1","state_scope":"Partial prefix: all208 nonselection canonical rows/marks equal ARkeep; twelve complete target selection owners equal S0. Full acceptance: all220 canonical rows equal ARkeep. Next AR: full vocabulary and all220 canonical rows equal ARkeep+1. Head owners are outside this target-only proof; original projection is unchanged.","limits":"Qualified R1/2/4/8 only. This selection contract does not repair or exclude GDN conv differences; the independent production fix and strict GPU qualification remain required."}),
         )
     })();
     match result {
@@ -1136,7 +1233,7 @@ pub(super) fn run(args: &Args) -> R<Value> {
             json!({"native_mtp_attached":true,"cache_enabled":cache,"hot_budget_mib":args.hot_budget_mib,
             "source_identity":source_identity,"semantic_partition_sha256":semantic_partition_sha256,
             "physical_plan_sha256":physical_plan_sha256,"hotset_sha256":hotset_sha256,
-            "original_resident_experts":original_resident_experts,"native_k":args.k,"head_reserve_k":7,"target_rows":[1,2,4,8],"max_seq":loaded.max_seq,"state_format":format!("{:?}",bundle.state_format()),"actual_cache_census_at_load":actual_cache,"kv_backend":backend.name(),"replay_backend":format!("{:?}",gpu.replay.request()),"native_pm4_replay_qualified":false,"scope":"greedy native-MTP transactions and exact expert-cache placement","cases":cases,"performance_claim":false,"limits":["Forced native widths prove execution, not default-policy speed.","INTRUSIVE NUMERICAL ONLY: canonical state and head hashing device-synchronise and drain copy DMA; no async-overlap or timing claim.","Cross AR/verify comparison excludes exactly physical GDN live index and capture ring/inputs/recurrence; all raw physical rows are retained. Same native schedule paired arms must compare them separately.","Head proof covers active head tensors, session marks and draft policy; actual boundary_saved/boundary_restored are included; additional physical snapshot/counter/owner flags are recorded by read-only control census and not paired as semantic bytes.","No SSE terminal, sampled MTP, ngram copy, native PM4 replay or live Q8Ef qualification.","Generic commit on this product load uses captured-row repair; its no-row-capture fallback is not claimed.","Bundle state entrypoints under an intentionally busy guard are not GPU-qualified by this tool.","Manual host joint-checkpoint restore followed by zero-fill native resume is UNQUALIFIED; normal session-prefix restore plus nonempty suffix and native continuation is checked."]}),
+            "original_resident_experts":original_resident_experts,"native_k":args.k,"head_reserve_k":7,"target_rows":[1,2,4,8],"max_seq":loaded.max_seq,"state_format":format!("{:?}",bundle.state_format()),"actual_cache_census_at_load":actual_cache,"kv_backend":backend.name(),"replay_backend":format!("{:?}",gpu.replay.request()),"native_pm4_replay_qualified":false,"scope":"greedy native-MTP transactions and exact expert-cache placement","cases":cases,"performance_claim":false,"limits":["Forced native widths prove execution, not default-policy speed.","INTRUSIVE NUMERICAL ONLY: canonical state and head hashing device-synchronise and drain copy DMA; no async-overlap or timing claim.","Target projection excludes exactly physical GDN live index and capture ring/inputs/recurrence; all raw physical rows are retained. Partial-prefix comparison requires twelve complete QSA selection owners equal pre-verify S0 and all208 other canonical rows equal ARkeep. Full acceptance requires all220 canonical rows equal ARkeep; next AR requires full-vocabulary bits and all220 canonical rows equal ARkeep+1. Same native schedule paired arms must also compare raw physical rows separately.","Head proof covers active head tensors, session marks and draft policy; actual boundary_saved/boundary_restored are included; additional physical snapshot/counter/owner flags are recorded by read-only control census and not paired as semantic bytes.","No SSE terminal, sampled MTP, ngram copy, native PM4 replay or live Q8Ef qualification.","Generic commit on this product load uses captured-row repair; its no-row-capture fallback is not claimed.","Bundle state entrypoints under an intentionally busy guard are not GPU-qualified by this tool.","Manual host joint-checkpoint restore followed by zero-fill native resume is UNQUALIFIED; normal session-prefix restore plus nonempty suffix and native continuation is checked."]}),
         )
     })();
     if let Err(error) = result {
