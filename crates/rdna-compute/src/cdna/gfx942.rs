@@ -52,6 +52,9 @@ const FP8B128_MOE_GROUPED_SRC: &str =
 const FP8B128_MOE_GROUPED_MODULE: &str = "gemm_fp8b128_moe_grouped_bf16mfma";
 const FP8B128_MOE_GROUPED_KERNEL: &str = "gemm_fp8b128_moe_grouped_bf16mfma";
 const FP8B128_MOE_GROUPED_XBF16_KERNEL: &str = "gemm_fp8b128_moe_grouped_bf16mfma_xbf16";
+const GEMM_BF16_MFMA_WIDE_SRC: &str =
+    include_str!("../../../../kernels/src/gemm_bf16_mfma_wide.gfx942.hip");
+const GEMM_BF16_MFMA_WIDE_MODULE: &str = "gemm_bf16_mfma_wide_gfx942";
 /// Test-only retained P1 baseline: its own JIT module and symbols, never
 /// selected by a production route. Compiled from an immutable standalone
 /// snapshot of the P1 (cdc37659a) kernel (SHA-256 pinned by a unit test), not
@@ -1357,6 +1360,61 @@ impl Gfx942Device<'_> {
 /// launches it once per this many rows.
 const ROWS16_CHAIN_STEP: usize = 16;
 
+/// Most batch rows one `gemm_bf16_mfma_gfx942_wide` launch takes (the
+/// `gemm_bf16_mfma_gfx942_wide64` entries: four 16-column MFMA chains).
+pub const WIDE_MAX_ROWS: usize = 64;
+
+/// X rows staged in LDS per chunk (`WD_XROWS` in
+/// `gemm_bf16_mfma_wide.gfx942.hip`; a unit test pins it to the source).
+const WIDE_XROWS: usize = WIDE_MAX_ROWS;
+
+/// The gfx942 workgroup LDS limit the wide entries' dynamic LDS must fit.
+const WIDE_LDS_LIMIT: usize = 65536;
+
+/// Wide-entry variants: `(kernel, weight rows per workgroup, K elements per
+/// LDS chunk)`. The tile height is how many weight rows one workgroup streams
+/// once for all of its ≤64 batch rows; a taller tile re-reads the activation
+/// less per weight byte but launches fewer workgroups. The chunk is the
+/// kernel's `KC`: the 64-row tile stages 128 rows (64 weight + 64 X) and its
+/// double buffer at KC = 128 would be 67,584 B, so it takes KC = 64. A unit
+/// test pins the table to the `WD_ENTRY` lines of the kernel source.
+const WIDE_ENTRIES: [(&str, usize, usize); 3] = [
+    ("gemm_bf16_mfma_gfx942_wide64", 16, 128),
+    ("gemm_bf16_mfma_gfx942_wide64_m32", 32, 128),
+    ("gemm_bf16_mfma_gfx942_wide64_m64", 64, 64),
+];
+
+/// Dynamic LDS bytes of a wide entry: a double buffer of `tile_rows` weight
+/// rows plus [`WIDE_XROWS`] X rows, each `kc` K elements of BF16 plus the
+/// 4-element pad (`LD = KC + 4`).
+const fn wide_lds_bytes(tile_rows: usize, kc: usize) -> usize {
+    2 * (tile_rows + WIDE_XROWS) * (kc + 4) * 2
+}
+
+/// Bind `func` of the wide module: the hipcc source, or, only when
+/// `HIPFIRE_G942_BF16_WIDE_IMAGE=/absolute/device.elf` names one, that
+/// explicitly supplied code object (the Route-A twin proof: same module, same
+/// entry names, loaded through `ensure_embedded_kernel`). Unset: the source,
+/// unchanged.
+fn g942_wide_ensure(gpu: &mut Gpu, func: &str) -> HipResult<()> {
+    match hipfire_config::developer_var("HIPFIRE_G942_BF16_WIDE_IMAGE") {
+        Ok(path) if !path.is_empty() => {
+            let bytes = std::fs::read(&path).map_err(|error| {
+                hip_bridge::HipError::new(
+                    0,
+                    &format!("HIPFIRE_G942_BF16_WIDE_IMAGE {path}: {error}"),
+                )
+            })?;
+            gpu.ensure_embedded_kernel(
+                GEMM_BF16_MFMA_WIDE_MODULE,
+                std::sync::Arc::<[u8]>::from(bytes),
+                func,
+            )
+        }
+        _ => gpu.ensure_kernel(GEMM_BF16_MFMA_WIDE_MODULE, GEMM_BF16_MFMA_WIDE_SRC, func),
+    }
+}
+
 /// The most batch rows at which ⌈rows/16⌉ chained few-row launches of a BF16
 /// `[m, k]` weight beat one 32-row-tile launch on MI300X (P-K table,
 /// `mi300x/beat/P/P-K.md` (a), every Flash-Next trunk shape at 17 / 31 / 57 /
@@ -1385,18 +1443,77 @@ pub fn rows16_chain_max_rows(m: usize, k: usize) -> usize {
     }
 }
 
+/// The most batch rows at which ⌈rows/64⌉ launches of the wide entry beat both
+/// the 32-row-tile entry and the rows16 chain for a BF16 `[m, k]` weight with
+/// a BF16 activation on MI300X (P1b round 2, LDS-staged X and weights,
+/// `mi300x/beat/P/p1b/bench/d7.log`: every Flash-Next trunk shape at 1 / 8 /
+/// 16 / 17 / 32 / 48 / 57 / 64 / 145 / 257 / 456 / 1025 / 1536 rows; the route
+/// stages an F32 activation to BF16 once past 16 rows).
+/// - `m * k >= 2^20` (every shape but the three below: qkv, z, qsa_q, out_proj,
+///   hc_down, hc_up, sh_down, qsa_k / idx, shared gate, PLE): the wide entry
+///   is the fastest exact route at every measured row count from 17 through
+///   the prefill chunk bound (1,536 rows): 0.20-0.85x of the chain from 17
+///   rows up (0.21-0.52x at 64 and more), 0.05-0.83x of the tile entry.
+/// - smaller weights (gdn a / b 48x2560, hc_inject 4x10240, shared expert gate
+///   1x2560): the tile entry's ~85-340 µs launch is flat in `rows` while the
+///   wide entry's cost grows with the row slices; wide beats the tile entry up
+///   to ~590 rows (sh_egate), ~690 (hc_inject) and ~830 (gdn_a) (fine grid
+///   `crossover.log`), still wins at 456 rows (0.07-0.85x of the tile) and
+///   beats the chain 0.36-0.85x at 17..=456 rows, so it takes them up to 456.
+pub fn wide_max_rows(m: usize, k: usize) -> usize {
+    if m.saturating_mul(k) >= 1 << 20 {
+        usize::MAX
+    } else {
+        456
+    }
+}
+
+/// Whether the wide entry takes a launch: 1..=[`WIDE_MAX_ROWS`] batch rows,
+/// `K % 8 == 0` and 16-byte aligned weight and activation bases (the
+/// entry's 16-byte weight loads and 8/16-byte activation loads).
+fn wide_admits(a: *const c_void, x: *const c_void, k: usize, batch: usize) -> bool {
+    (1..=WIDE_MAX_ROWS).contains(&batch)
+        && k % 8 == 0
+        && (a as usize) % 16 == 0
+        && (x as usize) % 16 == 0
+}
+
+/// Workgroups below which a wide launch under-fills MI300X (304 CUs): the
+/// tallest tile that still launches this many workgroups is taken ([P1b]
+/// measured: 64-row tiles at M = 10240 / 12288 (160 / 192 workgroups), 32-row
+/// at M = 6144 (192), 16-row at M = 2560 (160) were each the fastest entry).
+const WIDE_MIN_WORKGROUPS: usize = 144;
+
+/// The wide entry for a launch whose members have the given weight rows `m`:
+/// the tallest variant (`WIDE_ENTRIES`) that still launches at least
+/// [`WIDE_MIN_WORKGROUPS`] workgroups, the shortest otherwise.
+fn wide_entry(members: &[usize]) -> (&'static str, usize, usize) {
+    WIDE_ENTRIES
+        .iter()
+        .rev()
+        .find(|&&(_, tile, _)| {
+            members.iter().map(|m| m.div_ceil(tile)).sum::<usize>() >= WIDE_MIN_WORKGROUPS
+        })
+        .copied()
+        .unwrap_or(WIDE_ENTRIES[0])
+}
+
 impl Gpu {
     /// [`Gpu::gemm_bf16_mfma_gfx942_rows16`] for any `batch`: up to 16 rows
-    /// it is that one launch; past 16 rows (with `chain` set and every
-    /// member's `batch <= `[`rows16_chain_max_rows`]) it launches the same
-    /// entry once per 16-row slice of `x` and of each `y_j`, last slice
-    /// partial. Each output element is the one ascending-K MFMA chain of its
-    /// own activation row in every entry of the module, so the bytes equal
-    /// the 32-row-tile route's (P-K: 114/114 shape × rows cells, 0 differing
-    /// words). Returns `Ok(false)` without launching when the first slice
-    /// declines or a member's shape keeps the tile entry; a later slice's
-    /// refusal (an output overlapping that slice of `x`) also returns
-    /// `Ok(false)` and the caller's tile route rewrites every row.
+    /// it is that one launch; past 16 rows, with `wide` set and any
+    /// member's `batch <= `[`wide_max_rows`] (a small member rides in the launch
+    /// of a large one at no cost), it is
+    /// [`Gpu::gemm_bf16_mfma_gfx942_wide_slices`] (one weight pass per 64
+    /// rows); otherwise, with `chain` set and every member's `batch <=
+    /// `[`rows16_chain_max_rows`], it launches the few-row entry once per
+    /// 16-row slice of `x` and of each `y_j`, last slice partial. Each output
+    /// element is the one ascending-K MFMA chain of its own activation row in
+    /// every entry of both modules, so the bytes equal the 32-row-tile
+    /// route's (P-K: 114/114 shape × rows cells, 0 differing words; P1b: see
+    /// the wide entry). Returns `Ok(false)` without launching when the first
+    /// slice declines or a member's shape keeps the tile entry; a later
+    /// slice's refusal (an output overlapping that slice of `x`) also
+    /// returns `Ok(false)` and the caller's tile route rewrites every row.
     pub fn gemm_bf16_mfma_gfx942_rows16_chain(
         &mut self,
         x: &GpuTensor,
@@ -1404,14 +1521,23 @@ impl Gpu {
         k: usize,
         batch: usize,
         chain: bool,
+        wide: bool,
     ) -> HipResult<bool> {
         const MAX: usize = crate::gemm::GEMM_BF16_MFMA_ROWS16_MAX_MEMBERS;
         if batch <= ROWS16_CHAIN_STEP {
             return self.gemm_bf16_mfma_gfx942_rows16(x, members, k, batch);
         }
+        if members.is_empty() || members.len() > MAX {
+            return Ok(false);
+        }
+        if wide
+            && members
+                .iter()
+                .any(|&(_, _, m)| batch <= wide_max_rows(m, k))
+        {
+            return self.gemm_bf16_mfma_gfx942_wide_slices(x, members, k, batch);
+        }
         if !chain
-            || members.is_empty()
-            || members.len() > MAX
             || members
                 .iter()
                 .any(|&(_, _, m)| batch > rows16_chain_max_rows(m, k))
@@ -1433,6 +1559,157 @@ impl Gpu {
                 return Ok(false);
             }
         }
+        Ok(true)
+    }
+
+    /// [`Gpu::gemm_bf16_mfma_gfx942_wide`] for any `batch`: one launch per
+    /// 64-row slice of `x` and of each `y_j`, last slice partial. No row
+    /// threshold; the route's [`wide_max_rows`] gate is the caller's. A later
+    /// slice's refusal returns `Ok(false)` as in the rows16 chain.
+    pub fn gemm_bf16_mfma_gfx942_wide_slices(
+        &mut self,
+        x: &GpuTensor,
+        members: &[(&hip_bridge::DeviceBuffer, &GpuTensor, usize)],
+        k: usize,
+        batch: usize,
+    ) -> HipResult<bool> {
+        const MAX: usize = crate::gemm::GEMM_BF16_MFMA_ROWS16_MAX_MEMBERS;
+        if members.is_empty() || members.len() > MAX {
+            return Ok(false);
+        }
+        let mut ys: [Option<GpuTensor>; MAX] = Default::default();
+        for row in (0..batch).step_by(WIDE_MAX_ROWS) {
+            let rows = (batch - row).min(WIDE_MAX_ROWS);
+            let xs = x.sub_offset(row * k, rows * k);
+            for (slot, &(_, y, m)) in ys.iter_mut().zip(members) {
+                *slot = Some(y.sub_offset(row * m, rows * m));
+            }
+            let mut slice = [(members[0].0, x, 0usize); MAX];
+            for (j, &(a, _, m)) in members.iter().enumerate() {
+                slice[j] = (a, ys[j].as_ref().expect("slice view"), m);
+            }
+            if !self.gemm_bf16_mfma_gfx942_wide(&xs, &slice[..members.len()], k, rows)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// The wide entry `gemm_bf16_mfma_gfx942_wide64*` for a projection group:
+    /// up to four BF16 weights `[m_j, K]` that read the same `x` (F32 or BF16
+    /// `[batch, K]`) as ONE launch of 1..=[`WIDE_MAX_ROWS`] batch rows, member
+    /// j writing its `y_j` (F32 or BF16 `[batch, m_j]`). Every weight is read
+    /// from HBM once for all `batch` rows (the 32-row tile entry re-reads it
+    /// per 32 rows, the rows16 chain per 16). Same contract and same bytes as
+    /// [`Gpu::gemm_bf16_mfma_gfx942_rows16`]: an F32 `x` is rounded to BF16
+    /// in-kernel and a BF16 `y_j` is rounded from the F32 accumulator, both by
+    /// `convert_f32_to_bf16`'s RNE rule, and each output element is the tile
+    /// entry's ascending-K MFMA chain. Returns `Ok(false)` without launching
+    /// when the entry does not apply (no member or more than four, `batch`
+    /// outside 1..=64, `K % 8 != 0`, an operand not 16-byte aligned, a dtype
+    /// outside F32 / BF16, or an output overlapping `x`).
+    pub fn gemm_bf16_mfma_gfx942_wide(
+        &mut self,
+        x: &GpuTensor,
+        members: &[(&hip_bridge::DeviceBuffer, &GpuTensor, usize)],
+        k: usize,
+        batch: usize,
+    ) -> HipResult<bool> {
+        const MAX: usize = crate::gemm::GEMM_BF16_MFMA_ROWS16_MAX_MEMBERS;
+        let (x_f32, x_size) = match x.dtype {
+            DType::F32 => (true, 4),
+            DType::BF16 => (false, 2),
+            _ => return Ok(false),
+        };
+        if members.is_empty() || members.len() > MAX {
+            return Ok(false);
+        }
+        let x_start = x.buf.as_ptr() as usize;
+        let x_end = x_start + batch * k * x_size;
+        let mut a_ptr = [std::ptr::null_mut::<c_void>(); MAX];
+        let mut d_ptr = [std::ptr::null_mut::<c_void>(); MAX];
+        let mut m_i32 = [0i32; MAX];
+        let mut d_bf16_mask = 0i32;
+        let mut ms = [0usize; MAX];
+        for (j, &(a, y, m)) in members.iter().enumerate() {
+            // Every workgroup reads x for the whole launch: an output that
+            // overlaps it keeps the staged route (which reads a staged copy).
+            let y_start = y.buf.as_ptr() as usize;
+            if y_start < x_end && x_start < y_start + batch * m * y.dtype.size() {
+                return Ok(false);
+            }
+            let (d_bf16, d_size) = match y.dtype {
+                DType::F32 => (false, 4),
+                DType::BF16 => (true, 2),
+                _ => return Ok(false),
+            };
+            if !wide_admits(a.as_ptr(), x.buf.as_ptr(), k, batch) {
+                return Ok(false);
+            }
+            self.gemm_bf16_mfma_gfx942_check(a, &x.buf, x_size, &y.buf, d_size, m, k, batch)?;
+            a_ptr[j] = a.as_ptr();
+            d_ptr[j] = y.buf.as_ptr();
+            m_i32[j] = m as i32;
+            d_bf16_mask |= i32::from(d_bf16) << j;
+            ms[j] = m;
+        }
+        let n = members.len();
+        let (kernel, tile_rows, kc) = wide_entry(&ms[..n]);
+        g942_wide_ensure(self, kernel)?;
+
+        let tiles: usize = ms[..n].iter().map(|m| m.div_ceil(tile_rows)).sum();
+        let bytes = members
+            .iter()
+            .map(|&(_, y, m)| m * k * 2 + batch * m * y.dtype.size())
+            .sum::<usize>()
+            + batch * k * x_size;
+        let x_ptr = x.buf.as_ptr();
+        let k_i32 = k as i32;
+        let batch_i32 = batch as i32;
+        let x_f32_i32 = i32::from(x_f32);
+        let mut params: Vec<*mut c_void> = vec![&x_ptr as *const _ as *mut c_void];
+        params.extend(a_ptr.iter().map(|p| p as *const _ as *mut c_void));
+        params.extend(d_ptr.iter().map(|p| p as *const _ as *mut c_void));
+        params.extend(m_i32.iter().map(|v| v as *const _ as *mut c_void));
+        params.extend([
+            &k_i32 as *const _ as *mut c_void,
+            &batch_i32 as *const _ as *mut c_void,
+            &x_f32_i32 as *const _ as *mut c_void,
+            &d_bf16_mask as *const _ as *mut c_void,
+        ]);
+        let lds = wide_lds_bytes(tile_rows, kc);
+        assert!(
+            lds <= WIDE_LDS_LIMIT,
+            "{kernel}: {lds} B of LDS exceeds the gfx942 workgroup limit"
+        );
+        let lds = lds as u32;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel, bytes);
+        let result = self.launch_maybe_blob(
+            kernel,
+            [tiles as u32, 1, 1],
+            [512, 1, 1],
+            lds,
+            &mut params,
+            || {
+                let mut blob = KernargBlob::new();
+                blob.push_ptr(x_ptr);
+                for p in a_ptr.iter().chain(d_ptr.iter()) {
+                    blob.push_ptr(*p);
+                }
+                for v in m_i32 {
+                    blob.push_i32(v);
+                }
+                blob.push_i32(k_i32);
+                blob.push_i32(batch_i32);
+                blob.push_i32(x_f32_i32);
+                blob.push_i32(d_bf16_mask);
+                blob
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result?;
         Ok(true)
     }
 }
@@ -1504,6 +1781,97 @@ mod tests {
         assert!(!src.contains("fp8moe_") && !src.contains("FP8MOE_"));
         assert!(!src.contains("HIPFIRE_COMPILER_FLAGS"));
         assert!(src.contains("#error"));
+    }
+
+    #[test]
+    fn wide_constants_match_kernel_source() {
+        let src = super::GEMM_BF16_MFMA_WIDE_SRC;
+        let define = |name: &str| {
+            src.lines()
+                .find_map(|l| l.strip_prefix(&format!("#define {name} ")))
+                .and_then(|v| v.split("//").next())
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or_else(|| panic!("#define {name} <integer> in the wide kernel source"))
+        };
+        assert_eq!(super::WIDE_XROWS, define("WD_XROWS"));
+        assert_eq!(super::WIDE_MAX_ROWS, define("WD_XROWS"));
+        // Each entry is `WD_ENTRY(name, MS, KC, min_blocks)`: MS 16-row groups
+        // per workgroup, KC K elements per LDS chunk.
+        for (kernel, tile_rows, kc) in super::WIDE_ENTRIES {
+            let args: Vec<usize> = src
+                .lines()
+                .find_map(|l| l.strip_prefix(&format!("WD_ENTRY({kernel}, ")))
+                .map(|r| {
+                    r.trim_end_matches(')')
+                        .split(',')
+                        .map(|v| v.trim().parse().expect("integer WD_ENTRY argument"))
+                        .collect()
+                })
+                .unwrap_or_else(|| panic!("WD_ENTRY({kernel}, ..) in the wide kernel source"));
+            assert_eq!(tile_rows, 16 * args[0], "{kernel}");
+            assert_eq!(kc, args[1], "{kernel}");
+            assert!(
+                super::wide_lds_bytes(tile_rows, kc) <= super::WIDE_LDS_LIMIT,
+                "{kernel}: {} B of LDS",
+                super::wide_lds_bytes(tile_rows, kc)
+            );
+        }
+    }
+
+    #[test]
+    fn wide_lds_sizes_fit_the_workgroup() {
+        use super::wide_lds_bytes as l;
+        assert_eq!(l(16, 128), 42_240);
+        assert_eq!(l(32, 128), 50_688);
+        assert_eq!(l(64, 64), 34_816);
+        // The 64-row tile does not fit as KC = 128 (the reason it takes KC = 64).
+        assert!(l(64, 128) > super::WIDE_LDS_LIMIT);
+    }
+
+    #[test]
+    fn wide_thresholds_follow_the_p1b_table() {
+        use super::wide_max_rows as t;
+        // m * k >= 2^20: the wide entry is the fastest exact route through the
+        // prefill chunk bound (1,536 rows), every Flash-Next trunk shape.
+        for (m, k) in [
+            (10240, 2560),
+            (6144, 2560),
+            (12288, 2560),
+            (10240, 320),
+            (2560, 640),
+            (2560, 6144),
+            (320, 10240),
+            (512, 2560),
+            (640, 2560),
+            (2560, 2560),
+        ] {
+            assert!(
+                t(m, k) >= 1536,
+                "{m}x{k} takes the wide entry through the prefill chunk"
+            );
+        }
+        // Small weights: the tile entry's flat ~85-135 us launch wins past
+        // ~480-730 rows; wide is admitted through the measured 456.
+        for (m, k) in [(48, 2560), (4, 10240), (1, 2560)] {
+            assert_eq!(t(m, k), 456, "{m}x{k} takes the wide entry up to 456 rows");
+        }
+    }
+
+    #[test]
+    fn wide_entry_takes_the_tallest_tile_that_fills_the_device() {
+        use super::wide_entry as e;
+        // (member rows, expected kernel tile rows): 160 / 192 / 192 / 160
+        // workgroups at the tallest tile with >= 144 workgroups.
+        for (ms, tile) in [
+            (&[10240usize][..], 64),
+            (&[12288][..], 64),
+            (&[6144][..], 32),
+            (&[2560][..], 16),
+            (&[48][..], 16),
+            (&[10240, 6144, 48, 48][..], 64),
+        ] {
+            assert_eq!(e(ms).1, tile, "{ms:?}");
+        }
     }
 
     #[test]

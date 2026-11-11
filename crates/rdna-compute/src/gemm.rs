@@ -34951,7 +34951,7 @@ impl Gpu {
     /// Arch, extent and buffer-size checks shared by the BF16 MFMA entries;
     /// returns the bytes the launch touches (for the profile timer).
     #[allow(clippy::too_many_arguments)]
-    fn gemm_bf16_mfma_gfx942_check(
+    pub(crate) fn gemm_bf16_mfma_gfx942_check(
         &mut self,
         a: &DeviceBuffer,
         b: &DeviceBuffer,

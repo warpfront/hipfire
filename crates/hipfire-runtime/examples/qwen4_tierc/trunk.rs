@@ -55,6 +55,11 @@ pub const CASES: &[Q4Case] = &[
         run: gemm_bf16_mfma_rows16_chain,
     },
     Q4Case {
+        name: "qwen4_gemm_bf16_mfma_gfx942_wide",
+        timeout_s: 1800,
+        run: gemm_bf16_mfma_wide,
+    },
+    Q4Case {
         name: "qwen4_gemv_bf16_xf32_1row",
         timeout_s: 120,
         run: gemv_bf16_xf32_1row,
@@ -543,7 +548,14 @@ fn gemm_bf16_mfma_rows16_chain(gpu: &mut Gpu) -> Result<String, String> {
                 .map(|((w, y), &m)| (&w.buf, y, m))
                 .collect();
             let ran = gpu
-                .gemm_bf16_mfma_gfx942_rows16_chain(&x32.sub_offset(0, n * k), &members, k, n, true)
+                .gemm_bf16_mfma_gfx942_rows16_chain(
+                    &x32.sub_offset(0, n * k),
+                    &members,
+                    k,
+                    n,
+                    true,
+                    false,
+                )
                 .map_err(e)?;
             sync(gpu)?;
             if ran != admitted {
@@ -591,6 +603,154 @@ fn gemm_bf16_mfma_rows16_chain(gpu: &mut Gpu) -> Result<String, String> {
                 Err(format!("{name} rows={n}: {}", bad.join("; ")))
             });
             free_all(gpu, ys)?;
+        }
+        ws.push(x32);
+        ws.push(xbf);
+        free_all(gpu, ws)?;
+    }
+    all(results)
+}
+
+// ── Wide entry (P1b) ─────────────────────────────────────────────────────────
+/// Row counts the wide entry is bit-compared against the tile entry at: every
+/// single-slice count 1..=64 and multi-slice counts that end on a partial
+/// slice (65 / 257 / 1025).
+fn wide_rows() -> Vec<usize> {
+    (1..=64).chain([65, 257, 1025]).collect()
+}
+
+// `Gpu::gemm_bf16_mfma_gfx942_wide_slices` (one `gemm_bf16_mfma_gfx942_wide`
+// launch per 64 rows) at every `wide_rows` count: every trunk shape alone (F32
+// and BF16 x, F32 and BF16 out) and the GDN in-projection group (four members,
+// F32 and BF16 x, mixed out). Every member's bytes must equal its staged
+// tile-entry GEMM (BF16: + RNE rounding). Then the route
+// (`gemm_bf16_mfma_gfx942_rows16_chain` with the wide switch on) at the same
+// counts and x dtypes: where it runs, the same bytes; where it declines, the
+// output keeps its sentinel.
+fn gemm_bf16_mfma_wide(gpu: &mut Gpu) -> Result<String, String> {
+    if !gpu.arch_caps.is_gfx942() {
+        return Ok("skipped: gemm_bf16_mfma_gfx942 requires gfx942".to_string());
+    }
+    let rows_list = wide_rows();
+    let max_rows = *rows_list.iter().max().unwrap();
+    let mut rng = Rng::new(0x7121_0004);
+    let mut groups: Vec<(String, usize, Vec<usize>, Vec<DType>)> = MFMA_SHAPES
+        .iter()
+        .flat_map(|s| {
+            [DType::F32, DType::BF16]
+                .into_iter()
+                .map(move |dt| (format!("{} {dt:?}", s.name), s.k, vec![s.m], vec![dt]))
+        })
+        .collect();
+    groups.push((
+        "gdn_in group".to_string(),
+        HIDDEN,
+        vec![10240, 6144, GDN_VALUE_HEADS, GDN_VALUE_HEADS],
+        vec![DType::F32, DType::BF16, DType::F32, DType::BF16],
+    ));
+    let mut results = Vec::new();
+    for (name, k, ms, dts) in &groups {
+        let k = *k;
+        let mut ws = Vec::new();
+        for &m in ms {
+            let host = rng.vec_bf16_exact(m * k, -W_RANGE, W_RANGE);
+            ws.push(up_bf16(gpu, &host)?);
+        }
+        let x_host = rng.vec(max_rows * k, -1.0, 1.0);
+        let x32 = up_f32(gpu, &x_host)?;
+        let xbf = stage_bf16(gpu, &x_host)?;
+        for &n in &rows_list {
+            // (label, expected to run, route): direct slices always run; the
+            // route runs where a few-row entry, the wide threshold (any
+            // member: a small member rides in a large one's launch) or the
+            // chain threshold (every member) admits the group.
+            let route_runs = n <= 16
+                || ms
+                    .iter()
+                    .any(|&m| n <= rdna_compute::cdna::gfx942::wide_max_rows(m, k))
+                || ms
+                    .iter()
+                    .all(|&m| n <= rdna_compute::cdna::gfx942::rows16_chain_max_rows(m, k));
+            // Each member's staged tile-entry bytes (BF16: + RNE rounding).
+            let mut tile_want: Vec<Vec<u8>> = Vec::new();
+            for (j, (w, &m)) in ws.iter().zip(ms).enumerate() {
+                let t = run_mfma_tiled(gpu, w, &xbf.sub_offset(0, n * k), m, k, n)?;
+                tile_want.push(if dts[j] == DType::F32 {
+                    t.iter().flat_map(|v| v.to_le_bytes()).collect()
+                } else {
+                    t.iter()
+                        .flat_map(|&v| f32_to_bf16_bits(v).to_le_bytes())
+                        .collect()
+                });
+            }
+            for (label, via_route, x_bf16) in [
+                ("wide", false, false),
+                ("wide xbf16", false, true),
+                ("route", true, false),
+                ("route xbf16", true, true),
+            ] {
+                let admitted = !via_route || route_runs;
+                let mut ys = Vec::new();
+                for (&m, &dt) in ms.iter().zip(dts) {
+                    let mut y = gpu
+                        .upload_raw(&vec![0xA5u8; n * m * dt.size()], &[n * m])
+                        .map_err(e)?;
+                    y.dtype = dt;
+                    ys.push(y);
+                }
+                let members: Vec<_> = ws
+                    .iter()
+                    .zip(&ys)
+                    .zip(ms)
+                    .map(|((w, y), &m)| (&w.buf, y, m))
+                    .collect();
+                let x = if x_bf16 { &xbf } else { &x32 }.sub_offset(0, n * k);
+                let ran = if via_route {
+                    gpu.gemm_bf16_mfma_gfx942_rows16_chain(&x, &members, k, n, true, true)
+                } else {
+                    gpu.gemm_bf16_mfma_gfx942_wide_slices(&x, &members, k, n)
+                }
+                .map_err(e)?;
+                sync(gpu)?;
+                if ran != admitted {
+                    results.push(Err(format!(
+                        "{name} {label} rows={n}: ran={ran}, expected {admitted}"
+                    )));
+                    free_all(gpu, ys)?;
+                    continue;
+                }
+                let mut bad = Vec::new();
+                for (j, (y, &m)) in ys.iter().zip(ms).enumerate() {
+                    let got = down_bytes(gpu, y)?;
+                    let want: Vec<u8> = if admitted {
+                        tile_want[j].clone()
+                    } else {
+                        vec![0xA5; n * m * dts[j].size()]
+                    };
+                    if got != want {
+                        let diff = got
+                            .chunks(dts[j].size())
+                            .zip(want.chunks(dts[j].size()))
+                            .filter(|(a, b)| a != b)
+                            .count();
+                        bad.push(format!(
+                            "member {j} [{m}x{k} {:?}]: {diff} elements differ",
+                            dts[j]
+                        ));
+                    }
+                }
+                let what = if admitted {
+                    "== staged tile GEMM bitwise"
+                } else {
+                    "declined, untouched"
+                };
+                results.push(if bad.is_empty() {
+                    Ok(format!("{name} {label} rows={n}: {what}"))
+                } else {
+                    Err(format!("{name} {label} rows={n}: {}", bad.join("; ")))
+                });
+                free_all(gpu, ys)?;
+            }
         }
         ws.push(x32);
         ws.push(xbf);

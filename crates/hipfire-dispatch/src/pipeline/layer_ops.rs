@@ -1279,6 +1279,19 @@ fn g942_rows16_chain() -> bool {
     *ON
 }
 
+/// `HIPFIRE_G942_BF16_WIDE` (read once, default off until the Route-A twin
+/// lands; `=1` enables): on gfx942, a BF16 projection group of 17.. rows takes
+/// the wide entry (`Gpu::gemm_bf16_mfma_gfx942_wide`, one weight pass per 64
+/// rows) while `rdna_compute::cdna::gfx942::wide_max_rows` admits any of its
+/// members, ahead of the rows16 chain. Same bytes either way (row-invariant
+/// MFMA chain).
+fn g942_bf16_wide() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        hipfire_config::developer_bool("HIPFIRE_G942_BF16_WIDE", false)
+    });
+    *ON
+}
+
 /// Whether a BF16-weight projection takes the gfx942 MFMA GEMM
 /// (`KernelKey::GemmBf16Mfma`) at `rows` batch rows.
 ///
@@ -1349,13 +1362,16 @@ fn project_g942_mfma(
         require_tensor(out, elements, out.dtype, "gfx942 trunk output")?;
         outputs.push(view(out, 0, elements));
     }
-    // Few rows (and, past 16, the per-shape rows16 chain): the whole group,
-    // four members per launch, on the fused entry. A chain stages an F32
-    // activation to BF16 once (the bytes the in-kernel staging produces):
-    // otherwise every 16-row launch re-reads its F32 rows per workgroup.
+    // Few rows (and, past 16, the wide entry or the per-shape rows16 chain):
+    // the whole group, four members per launch, on the fused entry. A wide
+    // or chain launch stages an F32 activation to BF16 once (the bytes the
+    // in-kernel staging produces): otherwise every 16-row chain launch
+    // re-reads its F32 rows per workgroup and the wide entry converts them
+    // in each workgroup.
     let chain = g942_rows16_chain();
+    let wide = g942_bf16_wide();
     let mut staged: Option<GpuTensor> = None;
-    if chain && rows > 16 && input.dtype == DType::F32 {
+    if (chain || wide) && rows > 16 && input.dtype == DType::F32 {
         let mut scratch = hip(gpu.qwen4_f16_x_scratch(n))?;
         scratch.dtype = DType::BF16;
         hip(gpu.convert_f32_to_bf16(input, &scratch, n))?;
@@ -1381,7 +1397,7 @@ fn project_g942_mfma(
                 )
             })
             .collect();
-        if hip(gpu.gemm_bf16_mfma_gfx942_rows16_chain(&x, &launch, k, rows, chain))? {
+        if hip(gpu.gemm_bf16_mfma_gfx942_rows16_chain(&x, &launch, k, rows, chain, wide))? {
             fused[base..base + members.len()].fill(true);
         }
     }
