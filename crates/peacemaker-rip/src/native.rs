@@ -515,6 +515,7 @@ fn vopd_of<'a>(it: &Interp<'a>, v: &Value<'a>) -> Res<VopdOp> {
         Value::Nat(Nat::Reg(r)) if r.len == 1 => match r.kind {
             RegKind::V => Operand::V(r.base),
             RegKind::S => Operand::S(r.base),
+            RegKind::A => return Err("VopdOp.src0 does not accept an AGPR".into()),
         },
         Value::Tuple(xs) if xs.len() == 2 => {
             match str_of(it, &xs[0], "VopdOp.src0 kind")?.as_str() {
