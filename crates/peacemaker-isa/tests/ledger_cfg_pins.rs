@@ -194,19 +194,45 @@ impl Report {
     }
 }
 
-/// The gfx942 rows16 anchor (hipcc) and twin (PM): the only gfx942 artifacts with typed
-/// coverage. Each is lifted by `peacemaker_lift::cdna` and every kernel is certified by
-/// `peacemaker_isa::cdna::lifted::certify` (CDNA hazards + typed CFG wait ledger). Their
-/// absence fails the gate. Every other gfx942 image stays an explicit not-verified entry.
-const CDNA_CERTIFIED: [&str; 2] = [
-    "gemm_bf16_mfma_gfx942_rows16_hipcc_gfx942.co",
-    "gemm_bf16_mfma_gfx942_rows16_pm_gfx942.hxaco",
-];
-/// Exact kernel symbols each certified rows16 image must contain, and nothing else.
-const CDNA_EXPECTED_KERNELS: [&str; 3] = [
-    "gemm_bf16_mfma_gfx942",
-    "gemm_bf16_mfma_gfx942_rows16",
-    "gemm_bf16_mfma_gfx942_rows16_x2",
+/// The gfx942 anchors (hipcc) and twins (PM) with typed coverage: the rows16 BF16 MFMA object
+/// and the FP8 grouped MoE object. Each is lifted by `peacemaker_lift::cdna` and every kernel is
+/// certified by `peacemaker_isa::cdna::lifted::certify` (CDNA hazards + typed CFG wait ledger).
+/// Their absence fails the gate. Every other gfx942 image stays an explicit not-verified entry.
+/// Each entry is the committed file and the exact kernel symbols it must contain, and nothing
+/// else.
+const CDNA_CERTIFIED: [(&str, &[&str]); 4] = [
+    (
+        "gemm_bf16_mfma_gfx942_rows16_hipcc_gfx942.co",
+        &[
+            "gemm_bf16_mfma_gfx942",
+            "gemm_bf16_mfma_gfx942_rows16",
+            "gemm_bf16_mfma_gfx942_rows16_x2",
+        ],
+    ),
+    (
+        "gemm_bf16_mfma_gfx942_rows16_pm_gfx942.hxaco",
+        &[
+            "gemm_bf16_mfma_gfx942",
+            "gemm_bf16_mfma_gfx942_rows16",
+            "gemm_bf16_mfma_gfx942_rows16_x2",
+        ],
+    ),
+    (
+        "gemm_fp8b128_moe_grouped_bf16mfma_hipcc_gfx942.co",
+        &[
+            "gemm_fp8b128_moe_grouped_bf16mfma",
+            "gemm_fp8b128_moe_grouped_bf16mfma_xbf16",
+            "gemm_fp8b128_moe_tile_desc_pad16",
+        ],
+    ),
+    (
+        "gemm_fp8b128_moe_grouped_bf16mfma_pm_gfx942.hxaco",
+        &[
+            "gemm_fp8b128_moe_grouped_bf16mfma",
+            "gemm_fp8b128_moe_grouped_bf16mfma_xbf16",
+            "gemm_fp8b128_moe_tile_desc_pad16",
+        ],
+    ),
 ];
 
 /// The gfx942 device ELF of `bytes`: itself when raw, else the single native
@@ -255,7 +281,7 @@ fn certify_gfx942(bytes: &[u8]) -> Result<Vec<String>, String> {
 fn every_committed_image_verifies_or_is_an_explicit_allowlist_entry() {
     let images = scan();
     assert!(!images.is_empty(), "no committed images found");
-    for required in CDNA_CERTIFIED {
+    for (required, _) in CDNA_CERTIFIED {
         assert!(
             images.iter().any(|i| i.file == required),
             "required gfx942 artifact {required} is absent from kernels/"
@@ -264,15 +290,12 @@ fn every_committed_image_verifies_or_is_an_explicit_allowlist_entry() {
     let mut report = Report::default();
     let mut gfx942 = Vec::new();
     for image in &images {
-        if CDNA_CERTIFIED.contains(&image.file.as_str()) {
+        if let Some((_, expected)) = CDNA_CERTIFIED.iter().find(|(f, _)| *f == image.file) {
             match certify_gfx942(&image.bytes) {
                 Ok(names) => {
                     let mut got = names.clone();
                     got.sort();
-                    let mut want: Vec<String> = CDNA_EXPECTED_KERNELS
-                        .iter()
-                        .map(|s| s.to_string())
-                        .collect();
+                    let mut want: Vec<String> = expected.iter().map(|s| s.to_string()).collect();
                     want.sort();
                     assert_eq!(got, want, "{}: kernel symbol set", image.file);
                     // One verified outcome per certified kernel.

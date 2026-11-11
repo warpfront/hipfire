@@ -213,9 +213,11 @@ fn cases() -> Vec<Inst> {
             Vop2Op::AddF16 | Vop2Op::SubF16 | Vop2Op::MulF16 | Vop2Op::MaxF16 | Vop2Op::MinF16 => {
                 (Lit(0x1234), Lit(0xfff0))
             }
-            Vop2Op::AddU16 | Vop2Op::SubU16 | Vop2Op::LshlrevB16 | Vop2Op::MulLoU16 => {
-                (Lit(0xfff0), Lit(0x40))
-            }
+            Vop2Op::AddU16
+            | Vop2Op::SubU16
+            | Vop2Op::LshlrevB16
+            | Vop2Op::AshrrevI16
+            | Vop2Op::MulLoU16 => (Lit(0xfff0), Lit(0x40)),
             _ => (Lit(0x1234_5678), Lit(0xffff_fff0)),
         };
         let srcs: Vec<Src> = if op.reads_vcc() {
@@ -1172,4 +1174,24 @@ fn footprints() {
             && has(&f.defs, RegFile::Exec, 0, 2)
             && !has(&f.defs, RegFile::Vcc, 0, 2)
     );
+}
+
+/// `v_cmp_ngt_f32` (opcode 75) and `v_cmp_nlt_f32` (opcode 78) as they appear
+/// in the compiled gfx942 elementwise kernel: `v_cmp_nlt_f32 vcc, s0, v0` =
+/// 0x7c9c0000, `v_cmp_ngt_f32 vcc, s0, v0` = 0x7c960000.
+#[test]
+fn unordered_float_compares_pinned() {
+    for (op, word, name) in [
+        (VopcOp::CmpNltF32, 0x7c9c_0000u32, "v_cmp_nlt_f32"),
+        (VopcOp::CmpNgtF32, 0x7c96_0000, "v_cmp_ngt_f32"),
+    ] {
+        let inst = ic(op, Sgpr(0), Vgpr(0), VopExt::None);
+        assert_eq!(inst.words(A).unwrap(), [word], "{name}");
+        assert_eq!(
+            Inst::decode(A, &[word]).unwrap(),
+            (inst.clone(), 1),
+            "{name}"
+        );
+        assert_eq!(inst.to_string(), format!("{name}_e32 vcc, s0, v0"));
+    }
 }

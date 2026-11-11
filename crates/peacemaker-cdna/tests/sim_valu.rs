@@ -667,6 +667,9 @@ fn cases() -> Vec<Case> {
         c2(B::LshlrevB16, &[U, U], |s, _| {
             ((s[1] as u16) << (s[0] & 15)) as u32
         }),
+        c2(B::AshrrevI16, &[U, U], |s, _| {
+            ((s[1] as u16 as i16) >> (s[0] & 15)) as u16 as u32
+        }),
         c2(B::MulLoU16, &[U, U], |s, _| {
             (s[0] as u16).wrapping_mul(s[1] as u16) as u32
         }),
@@ -931,6 +934,9 @@ fn cmp_cases() -> Vec<(VopcOp, G, CmpRef)> {
         (CmpOF32, G::F, |a, b| !nan(a) && !nan(b)),
         (CmpUF32, G::F, |a, b| nan(a) || nan(b)),
         (CmpNeqF32, G::F, |a, b| !(fv(a) == fv(b))),
+        // Unordered-or-le / unordered-or-ge: true on NaN, otherwise a <= b / a >= b.
+        (CmpNgtF32, G::F, |a, b| !(fv(a) > fv(b))),
+        (CmpNltF32, G::F, |a, b| !(fv(a) < fv(b))),
         (CmpLtI32, G::U, |a, b| (a as i32) < b as i32),
         (CmpEqI32, G::U, |a, b| a == b),
         (CmpLeI32, G::U, |a, b| a as i32 <= b as i32),

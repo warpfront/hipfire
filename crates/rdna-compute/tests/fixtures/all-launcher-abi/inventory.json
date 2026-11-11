@@ -201,6 +201,16 @@
         "gemm_bf16_mfma_gfx942_rows16_x2"
       ],
       "reason": "Committed gfx942 PeaceMaker twin of the two HIP few-row entries: same symbol names and the same 104-byte kernarg ABI (nine 8-byte pointers X, A0..A3, D0..D3 at 0..72, then eight i32 M0..M3, K, batch, x_f32, d_bf16_mask at 72..104). It is NOT a production image: the production launcher Gpu::launch_gemm_bf16_mfma_rows16 builds one params array and one KernargBlob and launches the HIP entries by name, and that single launch site is what the gate checks against the HIP declaration; nothing embeds the twin (kernels.rs must not name it), so it is not in pm_images. The gate only proves that the twin's embedded HSA metadata (read with the architecture-independent envelope reader) and the portable hipcc anchor declare the identical ABI as that HIP source, argument by argument, so a launch checked against the HIP declaration is also valid for the twin."
+    },
+    "kernels/gemm_fp8b128_moe_grouped_bf16mfma_pm_gfx942.hxaco": {
+      "hip_source": "kernels/src/gemm_fp8b128_moe_grouped_bf16mfma.gfx942.hip",
+      "anchor": "kernels/gemm_fp8b128_moe_grouped_bf16mfma_hipcc_gfx942.co",
+      "symbols": [
+        "gemm_fp8b128_moe_grouped_bf16mfma",
+        "gemm_fp8b128_moe_grouped_bf16mfma_xbf16",
+        "gemm_fp8b128_moe_tile_desc_pad16"
+      ],
+      "reason": "Committed gfx942 PeaceMaker twin of the three production HIP entries of the FP8 block-128 grouped MoE BF16-MFMA GEMM: same symbol names and the same kernarg ABI as the hipcc anchor (grouped and _xbf16: 64 bytes = W ptr 0, expert_stride u64 8, tile_desc ptr 16, sorted_rows ptr 24, X ptr 32, Y ptr 40, then i32 R, K, x_row_div, n_exp at 48..64; tile_desc_pad16: 20 bytes = two pointers at 0 and 8, one i32 at 16). It is NOT a production image: nothing embeds the twin (kernels.rs must not name it), so it is not in pm_images. The gate only proves that the twin's embedded HSA metadata and the portable hipcc anchor declare the identical ABI as the HIP declarations; byte-exact behavior is proven by the hardware anchor-vs-twin oracle in crates/rdna-compute/examples/test_fp8_moe_gfx942.rs."
     }
   },
   "emitter_images": {

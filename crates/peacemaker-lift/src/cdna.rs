@@ -139,6 +139,18 @@ pub fn checked(lifted: &Lifted) -> Result<Vec<u8>, String> {
         validate_image(&kernel.image)?;
         let mut words = Vec::with_capacity(kernel.image.code.len() / 4);
         for (index, item) in kernel.instructions.iter().enumerate() {
+            let footprint = item.inst.footprint();
+            for span in footprint.uses.iter().chain(&footprint.defs) {
+                if span.file == peacemaker_cdna::inst::RegFile::Vgpr
+                    && u32::from(span.base) + u32::from(span.len)
+                        > kernel.image.metadata.parsed.vgpr_count
+                {
+                    return Err(format!(
+                        "{name}: instruction {index} references VGPR span {span:?} beyond .vgpr_count {}",
+                        kernel.image.metadata.parsed.vgpr_count
+                    ));
+                }
+            }
             if item.dword_offset != words.len() {
                 return Err(format!(
                     "{name}: instruction {index} claims dword offset {} but follows {} dwords",
@@ -267,7 +279,11 @@ fn validate_image(image: &KernelImage) -> Result<(), String> {
     // rsrc3[5:0] ACCUM_OFFSET is in units of 4 starting at 4 and cannot pass the allocation.
     let granules = (kd.compute_pgm_rsrc1.0 & 0x3f) + 1;
     let allocated = granules * 8;
-    if meta.vgpr_count == 0 || meta.vgpr_count > allocated || meta.vgpr_count + 8 <= allocated {
+    // Metadata records registers used, whereas the descriptor reserves registers.
+    // LLVM may deliberately pad the reservation to constrain occupancy (for example
+    // the 1024-thread MoE grouping kernel uses 30 but reserves 104 VGPRs).
+    // Actual typed register references are checked against the usage count in `checked`.
+    if meta.vgpr_count == 0 || meta.vgpr_count > allocated {
         return fail(format!(
             ".vgpr_count {} does not match the descriptor allocation of {allocated} VGPRs",
             meta.vgpr_count

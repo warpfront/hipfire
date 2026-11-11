@@ -302,7 +302,7 @@ fn opcode_table_is_complete_unique_and_round_trips() {
         count(|op| matches!(op, Vop3Op::Only(_))),
         Vop3OnlyOp::ALL.len()
     );
-    assert_eq!(ops.len(), 32 + 41 + 39 + 55);
+    assert_eq!(ops.len(), 34 + 42 + 39 + 55);
 
     let mut opcodes = HashSet::new();
     let mut names = HashSet::new();

@@ -13,12 +13,14 @@ use peacemaker_lift::cdna::{checked, lift_object, Instruction, Lifted};
 
 static ANCHOR: &[u8] =
     include_bytes!("../../../kernels/gemm_bf16_mfma_gfx942_rows16_hipcc_gfx942.co");
+static MOE_ANCHOR: &[u8] =
+    include_bytes!("../../../kernels/gemm_fp8b128_moe_grouped_bf16mfma_hipcc_gfx942.co");
 
-/// The committed anchor is a hipcc `--genco` offload bundle; the raw gfx942 device ELF is the
+/// The committed anchors are hipcc `--genco` offload bundles; the raw gfx942 device ELF is the
 /// single entry whose triple is exactly `hipv4-amdgcn-amd-amdhsa--gfx942` or that followed by
 /// `:feature` suffixes (the `BundleCodec::device_entry` rule, which has no gfx942 `Arch`).
-fn anchor() -> Vec<u8> {
-    let (bundle, payloads) = Bundle::read(ANCHOR).expect("anchor is a readable bundle");
+fn device_elf(bundle_bytes: &[u8]) -> Vec<u8> {
+    let (bundle, payloads) = Bundle::read(bundle_bytes).expect("anchor is a readable bundle");
     let exact = format!("{HIP_DEVICE_TRIPLE_PREFIX}gfx942");
     let hits: Vec<usize> = bundle
         .entries
@@ -34,6 +36,10 @@ fn anchor() -> Vec<u8> {
         bundle.entries
     );
     payloads[hits[0]].to_vec()
+}
+
+fn anchor() -> Vec<u8> {
+    device_elf(ANCHOR)
 }
 
 fn lifted_anchor() -> Lifted {
@@ -80,6 +86,64 @@ fn anchor_identity_and_typed_kernels() {
             kernel.image.name,
             last.inst
         );
+    }
+    assert_eq!(checked(&lifted).expect("checked"), bytes);
+}
+
+/// The FP8 grouped MoE object (FNUZ pair convert, LDS stage/read, BF16 MFMA, `ds_bpermute`,
+/// 64-bit VALU address math, helper kernel): every kernel lifts to typed instructions and
+/// re-emits byte for byte.
+#[test]
+fn moe_anchor_identity_and_typed_kernels() {
+    let bytes = device_elf(MOE_ANCHOR);
+    let lifted = lift_object(&bytes).expect("MoE anchor lifts");
+    let mut names: Vec<&str> = lifted
+        .kernels
+        .iter()
+        .map(|k| k.image.name.as_str())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        [
+            "gemm_fp8b128_moe_grouped_bf16mfma",
+            "gemm_fp8b128_moe_grouped_bf16mfma_xbf16",
+            "gemm_fp8b128_moe_tile_desc_pad16",
+        ]
+    );
+    for kernel in &lifted.kernels {
+        assert!(!kernel.instructions.is_empty(), "{}", kernel.image.name);
+        assert_eq!(kernel.instructions[0].dword_offset, 0);
+        let last = kernel.instructions.last().unwrap();
+        assert!(
+            matches!(&last.inst, Inst::Sopp(p) if matches!(p.op, SoppOp::Endpgm | SoppOp::Branch)),
+            "{}: last instruction {:?}",
+            kernel.image.name,
+            last.inst
+        );
+        if kernel.image.name.ends_with("tile_desc_pad16") {
+            continue;
+        }
+        let text: Vec<String> = kernel
+            .instructions
+            .iter()
+            .map(|i| i.inst.to_string())
+            .collect();
+        for needle in [
+            "v_cvt_pk_f32_fp8",
+            "v_mfma_f32_16x16x16_bf16",
+            "ds_write_b128",
+            "ds_read2_b64",
+            "ds_bpermute_b32",
+            "v_pk_mul_f32",
+            "v_lshl_add_u64",
+        ] {
+            assert!(
+                text.iter().any(|l| l.contains(needle)),
+                "{}: no `{needle}` in the typed instructions",
+                kernel.image.name
+            );
+        }
     }
     assert_eq!(checked(&lifted).expect("checked"), bytes);
 }
@@ -157,6 +221,24 @@ fn vgpr_allocation_mismatch_is_rejected() {
     let mut lifted = lifted_anchor();
     lifted.kernels[0].image.metadata.parsed.vgpr_count = 512;
     assert!(checked(&lifted).is_err());
+}
+
+#[test]
+fn occupancy_padded_vgpr_reservation_is_valid() {
+    let mut lifted = lifted_anchor();
+    let rsrc1 = &mut lifted.kernels[0].image.descriptor.compute_pgm_rsrc1.0;
+    let granule = *rsrc1 & 0x3f;
+    assert!(granule < 0x3f);
+    *rsrc1 = (*rsrc1 & !0x3f) | (granule + 1);
+    checked(&lifted).expect("a descriptor may reserve more VGPRs than the code uses");
+}
+
+#[test]
+fn metadata_cannot_understate_typed_vgpr_references() {
+    let mut lifted = lifted_anchor();
+    lifted.kernels[0].image.metadata.parsed.vgpr_count = 1;
+    let error = checked(&lifted).unwrap_err();
+    assert!(error.contains("beyond .vgpr_count"), "{error}");
 }
 
 #[test]

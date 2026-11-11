@@ -361,3 +361,30 @@ OPEN / UNPROVEN; the two `t2_b16x32w1x1g4` Km WAW findings are a wave32
 scalar-destination-pair MODEL LIMITATION. The new templates are 505–524;
 later pre-existing positional template ids move by 20 without changing
 their findings. No tile STATE-CAP refusal was observed in the scan.
+
+## gfx942 FP8 grouped MoE: typed CDNA Route A
+
+The same pattern seals the production object of
+`kernels/src/gemm_fp8b128_moe_grouped_bf16mfma.gfx942.hip`: its three kernels
+`gemm_fp8b128_moe_grouped_bf16mfma`, `gemm_fp8b128_moe_grouped_bf16mfma_xbf16`
+(64-byte kernarg, `W, expert_stride, tile_desc, sorted_rows, X, Y, R, K,
+x_row_div, n_exp`) and `gemm_fp8b128_moe_tile_desc_pad16` (20 bytes). The
+diagnostic `_reference` entries exist only under `FP8MOE_TEST_REFERENCE`, which
+the production build never defines, so they are in neither committed image.
+Production dispatch stays HIP. The typed lift covers the object's FP8 FNUZ pair
+convert (`v_cvt_pk_f32_fp8`, e32 and SDWA), LDS stage/read (`ds_write_b128`,
+`ds_read2_b64`, `ds_bpermute_b32`), BF16 MFMA, packed F32 multiply and 64-bit
+VALU address math; the object contains no atomic. Every kernel is decoded and
+re-encoded to the identical device ELF, and each sealed entry passes the CDNA
+hazard checker and the typed CFG wait ledger with no finding.
+
+Artifacts under `kernels/`: `gemm_fp8b128_moe_grouped_bf16mfma_hipcc_gfx942.co`,
+`gemm_fp8b128_moe_grouped_bf16mfma_pm_gfx942.hxaco`, its `.hxaco.sha256`, and
+`.twin.json`. Regenerate explicitly with `scripts/pm-gfx942-moe-grouped-twin.py`
+(options as the rows16 script). `hip_twin_gfx942_moe_grouped` checks source
+staleness, artifact pins, ELF/text identity, ABI, typed instruction classes and
+checked evidence without invoking a compiler; `ledger_cfg_pins` and
+`peacemaker-lift`'s `cdna_lift` certify both images. A hardware byte-oracle
+receipt is not yet recorded: `twin.json` carries a `gpu_oracle` entry only after
+an MI300X run bound to both image hashes, and the test fails a committed
+receipt that is partial or stale.
