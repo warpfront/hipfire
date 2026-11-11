@@ -2429,7 +2429,12 @@ mod tests {
         // The S2 redirect keeps non-owned entries and rewrites owned ones to the stage donor.
         let entries: Vec<usize> = borrowed.iter().map(|e| e.gate_up_ptr).collect();
         let donor = 0x50_0000_0000;
-        let redirected = redirect_owned_entries(placement, donor, 1_740_800, &entries);
+        let slots: Vec<Option<usize>> = (0..entries.len())
+            .map(|expert| placement.owns(expert).then(|| expert / placement.ranks))
+            .collect();
+        let capacity = placement.local_count(entries.len());
+        let redirected =
+            redirect_owned_entries(&slots, capacity, donor, 1_740_800, &entries).unwrap();
         for (expert, chunk) in redirected.chunks_exact(8).enumerate() {
             let pointer = usize::from_ne_bytes(chunk.try_into().unwrap());
             if placement.owns(expert) {

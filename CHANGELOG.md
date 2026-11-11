@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **Changed: Flash-Next expert parallelism (#861 slice 4) reads each rank's expert spans from the load's seal for residency and donor staging, instead of recomputing the `e % ranks` stride.** `Qwen4EpSeal::expert_spans` (every routed group must give each rank the same count) feeds `expert_residency::{routed_expert_bytes_ranks, resident_split_ranks, host_mapped_bytes_ranks}` and `PlacementInputsArgs::spans` through the new `EpExpertSpans`; the loader passes it to the EP VRAM split and every rank's placement. The G2 donor stage (`Qwen4ExpertStage`, gfx1201 EP only) sizes its donor share from the seal, redirects owned table entries to `Qwen4EpRankSeal::local_slots` and refuses a slot outside the donor or two experts on one slot, refuses donor parts whose device spans overlap, and charges the restore mirrors as the sum of every rank's own share (an uneven seal is no longer charged at rank 0's share per rank). With today's stride seal all charges are unchanged; emulated EP2/EP3/EP4 on gfx1151 are byte-identical to single and to beta.
+
 ## v0.4.5 — 2026-11-11 (re-cut)
 
 The v0.4.5 tag first pointed at `b30b46c1e2` (2026-10-30); that GitHub release was never published. v0.4.5 was re-cut at `7f7cf7f50f` and now includes everything below. If you fetched the October tag, run `git fetch --tags --force`.
