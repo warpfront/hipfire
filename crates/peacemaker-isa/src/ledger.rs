@@ -167,7 +167,7 @@ pub struct WaitProof {
 }
 
 /// Per pending operation: counter, defs, source locks, in-order, family, order class, `maybe`
-/// (`Ledger::state_key`).
+/// (`Ledger::replay_state_key`).
 pub(crate) type StateKey = Vec<(
     Counter,
     Vec<RegRef>,
@@ -671,13 +671,52 @@ impl Ledger {
             .collect()
     }
 
-    /// The id-free state `required`/`wait` depend on: per pending operation its
-    /// counter, registers, source locks, order class (`shape` has no order class,
-    /// which decides the count of an in-order wait) and `maybe` flag, in issue
-    /// order. Two ledgers with equal keys require and retire identically for
-    /// every later instruction, so a CFG walk (`ledger_cfg`) keys its seen
-    /// states by it and loop iterations that only advance ids do not grow.
-    pub(crate) fn state_key(&self) -> StateKey {
+    /// The id-free state the replay (`required_replay`, `wait_replay`,
+    /// `clip_to_issue_bound`, the barrier's `shape` family check) depends on: per pending
+    /// operation its counter, registers, source locks, order class (`shape` has no order
+    /// class, which decides the count of an in-order wait) and `maybe` flag, in issue order.
+    /// Two ledgers with equal keys require and retire identically for every later
+    /// instruction, so a CFG walk (`ledger_cfg`) keys its seen states by it and loop
+    /// iterations that only advance ids do not grow.
+    ///
+    /// On gfx942 the **source locks are canonicalized away**: `required_replay` never reads
+    /// them there (`hold_sources` is false, no `Reason::War`) and nothing else the walk
+    /// calls observes them (`retire_count`, `wait`/`wait_replay`, `clip_to_issue_bound`,
+    /// `deepest_counter`, the barrier's family check use only the counter, order class,
+    /// `in_order`, `maybe`, family and defs; `release_store_sources` is a no-op; `join`,
+    /// `positional` and `pending_store*` are never called by the walk). A pending store keeps
+    /// its position, counter slot, order class and family in the key and drops only the
+    /// registers it read, so paths that differ only in which store (different data/address
+    /// registers) occupies a slot are one state. This is an exact observational
+    /// equivalence, not a join: no operation is added, dropped or made `maybe`, so every
+    /// wait and hazard outcome of every continuation is identical. Every other architecture
+    /// keeps its source locks in the key (`required_replay` there reports `Reason::War`).
+    pub(crate) fn replay_state_key(&self) -> StateKey {
+        let hold_sources = self.arch != Some(Arch::Gfx942);
+        self.pending
+            .iter()
+            .map(|p| {
+                (
+                    p.counter,
+                    p.defs.clone(),
+                    if hold_sources {
+                        p.src_locks.clone()
+                    } else {
+                        Vec::new()
+                    },
+                    p.in_order,
+                    p.family,
+                    p.order,
+                    p.maybe,
+                )
+            })
+            .collect()
+    }
+
+    /// The pre-canonicalization key (source locks kept on every architecture): the reference
+    /// the `ledger_cfg` tests compare `replay_state_key` against.
+    #[cfg(test)]
+    pub(crate) fn full_state_key(&self) -> StateKey {
         self.pending
             .iter()
             .map(|p| {

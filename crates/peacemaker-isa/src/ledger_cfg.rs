@@ -16,11 +16,13 @@
 //!
 //! * Path-sensitive: each path carries its own `Ledger`; nothing is joined, so
 //!   an operation is pending exactly on the paths that issue it (no `maybe`
-//!   ghost loads). Only states are deduplicated, by [`Ledger::state_key`]
-//!   (pending shapes without operation ids), at labels, the only join points:
-//!   a forward branch is explored as its own alternative; a backward edge is
-//!   explored until a label's state set reaches a fixed point, and ids that
-//!   merely advance per iteration do not grow it.
+//!   ghost loads). Only states are deduplicated, by [`Ledger::replay_state_key`]
+//!   (pending shapes without operation ids; on gfx942 also without the source
+//!   registers of pending stores, which the gfx942 replay never reads: an exact
+//!   observational equivalence, no operation merged or dropped), at labels, the
+//!   only join points: a forward branch is explored as its own alternative; a
+//!   backward edge is explored until a label's state set reaches a fixed point,
+//!   and ids that merely advance per iteration do not grow it.
 //! * Waits are decoded from the instruction text actually in the program, never
 //!   from the builder's `WaitProof` records: gfx12 `s_wait_loadcnt`/`storecnt`/
 //!   `dscnt`/`kmcnt` and the combined `loadcnt_dscnt`/`storecnt_dscnt`,
@@ -655,6 +657,18 @@ fn region_exit_is_drained(
 }
 
 fn walk(program: &Program, foreign: &[Range<usize>], mode: Mode) -> Result<Stats, String> {
+    walk_with(program, foreign, mode, Ledger::replay_state_key)
+}
+
+/// [`walk`] with the label-dedup key as a parameter: production always passes
+/// `Ledger::replay_state_key`; the tests pass the un-canonicalized `full_state_key` to compare
+/// outcomes against the baseline keying.
+fn walk_with(
+    program: &Program,
+    foreign: &[Range<usize>],
+    mode: Mode,
+    state_key: fn(&Ledger) -> StateKey,
+) -> Result<Stats, String> {
     let insns = &program.instructions;
     let arch = program.arch;
     let labels: HashMap<&str, usize> = insns
@@ -733,7 +747,7 @@ fn walk(program: &Program, foreign: &[Range<usize>], mode: Mode) -> Result<Stats
                     end += 1;
                 }
                 let states = seen.entry(pc).or_default();
-                if !states.insert(ledger.state_key()) {
+                if !states.insert(state_key(&ledger)) {
                     break;
                 }
                 stats.label_states += 1;
@@ -1495,6 +1509,340 @@ mod tests {
         let ds_store = Instruction::new("ds_store_b32 v0, v3", vec![], vec![v(0), v(3)])
             .memory(MemoryClass::DsStore);
         check(&gfx12(vec![ds_store, ins("s_barrier"), ins("s_endpgm")])).unwrap();
+    }
+
+    fn cdna(insns: Vec<Instruction>) -> Program {
+        program(Arch::Gfx942, insns)
+    }
+    fn ds_load(dst: u8) -> Instruction {
+        Instruction::new(format!("ds_read_b32 v{dst}, v0"), vec![v(dst)], vec![v(0)])
+            .memory(MemoryClass::DsLoad)
+    }
+    fn ds_store(src: u8) -> Instruction {
+        Instruction::new(
+            format!("ds_write_b32 v0, v{src}"),
+            vec![],
+            vec![v(0), v(src)],
+        )
+        .memory(MemoryClass::DsStore)
+    }
+    fn smem_load(dst: u8) -> Instruction {
+        Instruction::new(
+            format!("s_load_dword s{dst}, s[0:1], 0x0"),
+            vec![s(dst)],
+            vec![],
+        )
+        .memory(MemoryClass::SmemLoad)
+    }
+    /// The baseline walk: label dedup on the un-canonicalized key (`Ledger::full_state_key`).
+    fn walk_full(p: &Program) -> Result<Stats, String> {
+        walk_with(p, &[], Mode::Strict, Ledger::full_state_key)
+    }
+
+    /// gfx942 `replay_state_key` drops only the registers a pending store read, which the gfx942
+    /// replay never observes (`Ledger::required_replay`): paths that differ only in which store
+    /// occupies a slot are one state. Ten diamonds that each store a different register leave
+    /// 2^10 distinct baseline states at the last label (over the bound) and 11 canonical ones;
+    /// a scatter-shaped loop with two conditional stores grows the baseline sequence without
+    /// bound until the 63-slot issue clip while the canonical state is just the count. Every
+    /// other architecture keeps the registers in the key and still fails closed.
+    #[test]
+    fn gfx942_stores_that_differ_only_in_sources_share_one_state() {
+        let diamonds = |arch| {
+            let mut insns = Vec::new();
+            for k in 0..10u8 {
+                insns.push(ins(&format!("s_cbranch_scc1 J{k}")));
+                insns.push(store(10 + k));
+                insns.push(ins(&format!("J{k}:")));
+            }
+            insns.push(ins("s_endpgm"));
+            program(arch, insns)
+        };
+        let p = diamonds(Arch::Gfx942);
+        let baseline = walk_full(&p).unwrap_err();
+        assert!(
+            baseline.contains("state explosion") && baseline.contains("J9"),
+            "{baseline}"
+        );
+        let stats = check(&p).unwrap();
+        assert!(stats.label_states <= 100, "{stats:?}");
+        let e = check(&diamonds(Arch::Gfx1201)).unwrap_err();
+        assert!(e.contains("state explosion") && e.contains("J9"), "{e}");
+
+        let scatter = cdna(vec![
+            ins("H:"),
+            ins("s_cbranch_scc1 A"),
+            store(5),
+            ins("A:"),
+            ins("s_cbranch_scc1 B"),
+            store(6),
+            ins("B:"),
+            ins("s_cbranch_scc1 H"),
+            ins("s_endpgm"),
+        ]);
+        let baseline = walk_full(&scatter).unwrap_err();
+        assert!(baseline.contains("state explosion"), "{baseline}");
+        let stats = check(&scatter).unwrap();
+        assert!(stats.label_states <= 3 * 64 + 3, "{stats:?}");
+    }
+
+    /// What the canonical key keeps on gfx942: a pending operation's position among the
+    /// counter's operations (partial waits retire by position), the registers a load
+    /// defines, and the order class of the counter's queue (DS with SMEM never retires by
+    /// position). Each program must agree with the baseline keying.
+    #[test]
+    fn gfx942_canonical_key_keeps_position_defs_and_order_class() {
+        let agree = |p: &Program| -> Result<Stats, String> {
+            let new = check(p);
+            let old = walk_full(p);
+            assert_eq!(new.is_ok(), old.is_ok(), "{new:?} vs {old:?}");
+            new
+        };
+        // Position: [store, load] vs [load, store] merge at J; `vmcnt(1)` retires the store in
+        // the first and the load in the second, so the first still needs a wait for v1.
+        let positions = |x: Vec<Instruction>, y: Vec<Instruction>, wait: &str| {
+            let mut insns = vec![ins("s_cbranch_scc1 Y")];
+            insns.extend(x);
+            insns.push(ins("s_branch J"));
+            insns.push(ins("Y:"));
+            insns.extend(y);
+            insns.extend([ins("J:"), ins(wait), mov(3, 1), ins("s_endpgm")]);
+            cdna(insns)
+        };
+        let e = agree(&positions(
+            vec![store(5), load(1)],
+            vec![load(1), store(5)],
+            "s_waitcnt vmcnt(1)",
+        ))
+        .unwrap_err();
+        assert!(e.contains("Use"), "{e}");
+        agree(&positions(
+            vec![store(5), load(1)],
+            vec![load(1), store(5)],
+            "s_waitcnt vmcnt(0)",
+        ))
+        .unwrap();
+        agree(&positions(
+            vec![load(1), store(5)],
+            vec![load(1), store(6)],
+            "s_waitcnt vmcnt(1)",
+        ))
+        .unwrap();
+
+        // A partial wait retires only what is certain on each path: one path drained, the
+        // other did not, so `vmcnt(1)` leaves v2 pending on the path that skipped the drain.
+        let partial = |used: u8| {
+            cdna(vec![
+                load(1),
+                load(2),
+                ins("s_cbranch_scc1 J"),
+                ins("s_waitcnt vmcnt(0)"),
+                ins("J:"),
+                ins("s_waitcnt vmcnt(1)"),
+                mov(4, used),
+                ins("s_endpgm"),
+            ])
+        };
+        let e = agree(&partial(2)).unwrap_err();
+        assert!(e.contains("Use"), "{e}");
+        agree(&partial(1)).unwrap();
+
+        // A retained missing wait: the branch around the drain reaches the use.
+        let skipped = cdna(vec![
+            load(1),
+            ins("s_cbranch_scc1 J"),
+            ins("s_waitcnt vmcnt(0)"),
+            ins("J:"),
+            mov(3, 1),
+            ins("s_endpgm"),
+        ]);
+        let e = agree(&skipped).unwrap_err();
+        assert!(
+            e.contains("Use") && e.contains("s_cbranch_scc1 J` taken"),
+            "{e}"
+        );
+
+        // Defs: two paths load different registers; the merged use of v2 is a RAW on one.
+        let defs = |second: u8| {
+            cdna(vec![
+                ins("s_cbranch_scc1 Y"),
+                load(1),
+                ins("s_branch J"),
+                ins("Y:"),
+                load(second),
+                ins("J:"),
+                mov(3, 2),
+                ins("s_endpgm"),
+            ])
+        };
+        let e = agree(&defs(2)).unwrap_err();
+        assert!(e.contains("Use"), "{e}");
+        agree(&defs(1)).unwrap();
+
+        // Order class: an SMEM load on one path makes the LGKM queue mixed there, so
+        // `lgkmcnt(1)` retires nothing on that path while it retires ds_read v1 on the other.
+        let mixed = |first: Vec<Instruction>| {
+            let mut insns = vec![ins("s_cbranch_scc1 Y")];
+            insns.extend(first);
+            insns.extend([ins("s_branch J"), ins("Y:"), ins("J:")]);
+            insns.extend([
+                ds_load(1),
+                ds_load(2),
+                ins("s_waitcnt lgkmcnt(1)"),
+                mov(3, 1),
+                ins("s_endpgm"),
+            ]);
+            cdna(insns)
+        };
+        let e = agree(&mixed(vec![smem_load(10)])).unwrap_err();
+        assert!(e.contains("Use"), "{e}");
+        agree(&mixed(vec![])).unwrap();
+    }
+
+    /// The source locks stay in the key where they are observed: on gfx12 a store's data
+    /// register is a WAR on the path that stored it, on gfx942 it is not (and merging the two
+    /// stores there is exact).
+    #[test]
+    fn store_source_locks_stay_in_the_key_outside_gfx942() {
+        let two_stores = |arch| {
+            program(
+                arch,
+                vec![
+                    ins("s_cbranch_scc1 Y"),
+                    store(5),
+                    ins("s_branch J"),
+                    ins("Y:"),
+                    store(6),
+                    ins("J:"),
+                    mov(6, 9),
+                    ins("s_endpgm"),
+                ],
+            )
+        };
+        let e = check(&two_stores(Arch::Gfx1201)).unwrap_err();
+        assert!(e.contains("War"), "{e}");
+        check(&two_stores(Arch::Gfx942)).unwrap();
+        walk_full(&two_stores(Arch::Gfx942)).unwrap();
+    }
+
+    /// Fixed-seed LCG for the corpus below.
+    struct Lcg(u64);
+    impl Lcg {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 33) % n
+        }
+    }
+    fn vm_wait(cdna: bool, k: u64) -> String {
+        if cdna {
+            format!("s_waitcnt vmcnt({k})")
+        } else {
+            format!("s_wait_loadcnt {k:#x}")
+        }
+    }
+    fn ds_wait(cdna: bool, k: u64) -> String {
+        if cdna {
+            format!("s_waitcnt lgkmcnt({k})")
+        } else {
+            format!("s_wait_dscnt {k:#x}")
+        }
+    }
+    /// A small random CFG: loads, stores, DS and SMEM operations, partial waits, movs,
+    /// barriers, forward conditional branches to labels placed later and an optional back edge.
+    fn corpus_program(rng: &mut Lcg, arch: Arch) -> Program {
+        let is_cdna = arch == Arch::Gfx942;
+        let mut insns = Vec::new();
+        let looped = rng.below(4) == 0;
+        if looped {
+            insns.push(ins("H:"));
+        }
+        let mut open: Vec<u64> = Vec::new();
+        let mut labels = 0u64;
+        for _ in 0..(6 + rng.below(10)) {
+            match rng.below(14) {
+                0 | 1 => insns.push(load(1 + rng.below(4) as u8)),
+                2..=4 => insns.push(store(5 + rng.below(4) as u8)),
+                5 => {
+                    let dst = 1 + rng.below(8) as u8;
+                    let src = 1 + rng.below(8) as u8;
+                    insns.push(mov(dst, src));
+                }
+                6 => insns.push(ins(&vm_wait(is_cdna, rng.below(3)))),
+                7 => insns.push(ds_load(1 + rng.below(4) as u8)),
+                8 => insns.push(ds_store(5 + rng.below(4) as u8)),
+                9 => insns.push(ins(&ds_wait(is_cdna, rng.below(3)))),
+                10 => insns.push(smem_load(10 + rng.below(2) as u8)),
+                11 => insns.push(ins("s_barrier")),
+                12 => {
+                    insns.push(ins(&format!("s_cbranch_scc1 L{labels}")));
+                    open.push(labels);
+                    labels += 1;
+                }
+                _ => {
+                    if !open.is_empty() {
+                        let at = rng.below(open.len() as u64) as usize;
+                        insns.push(ins(&format!("L{}:", open.remove(at))));
+                    }
+                }
+            }
+        }
+        for label in open {
+            insns.push(ins(&format!("L{label}:")));
+        }
+        if looped && rng.below(2) == 0 {
+            insns.push(ins("s_cbranch_scc1 H"));
+        }
+        insns.push(ins("s_endpgm"));
+        program(arch, insns)
+    }
+
+    /// The canonical key against the baseline on a deterministic corpus of random small CFGs
+    /// (gfx942 and gfx12): wherever the baseline walk finishes within the state bound the
+    /// two keyings prove and refuse exactly the same programs, canonical states never exceed
+    /// the baseline's, and on gfx12 the state sets are identical. Programs whose baseline
+    /// exceeds the bound are the ones the canonical key may newly prove (exact equivalence).
+    #[test]
+    fn replay_state_key_matches_the_baseline_on_a_deterministic_corpus() {
+        let mut rng = Lcg(0x9e37_79b9_7f4a_7c15);
+        let (mut proven, mut refused, mut fewer) = (0u32, 0u32, 0u32);
+        for i in 0..6000u32 {
+            let arch = if i % 2 == 0 {
+                Arch::Gfx942
+            } else {
+                Arch::Gfx1201
+            };
+            let p = corpus_program(&mut rng, arch);
+            let new = check(&p);
+            let old = walk_full(&p);
+            if matches!(&old, Err(e) if e.contains("state explosion")) {
+                continue;
+            }
+            let text: Vec<&str> = p.instructions.iter().map(|i| i.text.as_str()).collect();
+            assert_eq!(
+                new.is_ok(),
+                old.is_ok(),
+                "{arch:?}: {new:?} vs {old:?}\n{text:#?}"
+            );
+            match (&new, &old) {
+                (Ok(n), Ok(o)) => {
+                    proven += 1;
+                    assert!(n.label_states <= o.label_states, "{text:#?}");
+                    if arch == Arch::Gfx942 {
+                        fewer += u32::from(n.label_states < o.label_states);
+                    } else {
+                        assert_eq!(n.label_states, o.label_states, "{text:#?}");
+                    }
+                }
+                _ => refused += 1,
+            }
+        }
+        assert!(
+            proven > 0 && refused > 0 && fewer > 0,
+            "{proven} {refused} {fewer}"
+        );
     }
 
     #[test]
