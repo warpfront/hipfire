@@ -44,6 +44,14 @@ __device__ __forceinline__ gs_bfrag gs_frag(const unsigned short*p,int pitch,int
 #pragma unroll
  for(int e=0;e<16;++e)u.h[e]=p[r*pitch+k0+e];
  return u.v;}
+// gfx11 WMMA rounds a sum differently for +0 and -0 zero products (see gdn_chunk_scan.gfx1201.hip,
+// gs_split): the two WMMAs whose operand holds structural zeros (D = A.z, O += D.score) take their
+// later-row-dependent operand split by sign (x- first, then x+), so a partial tile's last row rounds
+// exactly as inside the completed tile.
+__device__ __forceinline__ void gs_split(gs_bfrag x,gs_bfrag&pos,gs_bfrag&neg){union{unsigned short h[16];gs_bfrag v;}u,p,n;u.v=x;
+#pragma unroll
+ for(int e=0;e<16;++e){const unsigned b=u.h[e];const bool s=(b>>15)!=0;p.h[e]=s?0:(unsigned short)b;n.h[e]=s?(unsigned short)b:(unsigned short)0x8000u;}
+ pos=p.v;neg=n.v;}
 // LDS-only workgroup barrier: the "local" fences keep in-flight global
 // prefetches in flight. Each wave waits for its own LDS ops (lgkmcnt(0), vmcnt
 // and expcnt left open: gfx11 s_waitcnt 0xFC07) before it signals. The fence's
@@ -179,7 +187,7 @@ __global__ void gdn_chunk_scan_gfx1151(
 #pragma unroll
   for(int kk=0;kk<4;++kk){
 #pragma unroll
-   for(int j=0;j<2;++j)Dacc[j]=gs_mma(aa[kk],gs_frag(&sm.state[0][0],GS_KP,(ntb+j)*16,kk*16,lane),Dacc[j]);}
+   for(int j=0;j<2;++j){gs_bfrag zp,zn;gs_split(gs_frag(&sm.state[0][0],GS_KP,(ntb+j)*16,kk*16,lane),zp,zn);Dacc[j]=gs_mma(aa[kk],zn,Dacc[j]);Dacc[j]=gs_mma(aa[kk],zp,Dacc[j]);}}
 #pragma unroll
   for(int j=0;j<2;++j)for(int e=0;e<8;++e){int tok=mt*16+gs_acc_row(lane,e);sm.d[(ntb+j)*16+lo][tok]=gs_b16(Dacc[j][e]);}
   GS_BAR();
@@ -191,7 +199,7 @@ __global__ void gdn_chunk_scan_gfx1151(
 #pragma unroll
   for(int kk=0;kk<4;++kk){gs_bfrag score=gs_frag(&sm.score[0][0],GS_AP,mt*16,kk*16,lane);
 #pragma unroll
-   for(int j=0;j<2;++j)O[j]=gs_mma(gs_frag(&sm.d[0][0],GS_AP,(ntb+j)*16,kk*16,lane),score,O[j]);}
+   for(int j=0;j<2;++j){gs_bfrag dp,dn;gs_split(gs_frag(&sm.d[0][0],GS_AP,(ntb+j)*16,kk*16,lane),dp,dn);O[j]=gs_mma(dn,score,O[j]);O[j]=gs_mma(dp,score,O[j]);}}
   // WMMA needs every lane active. Without this pin, clang sinks the O
   // WMMAs (only used by the store) into `if(tok<rows)`, and on a partial
   // chunk the masked lanes' operand rows come out undefined.
@@ -254,6 +262,8 @@ __global__ void gdn_chunk_scan_gfx1151(
 #pragma unroll
    for(int e=0;e<8;++e){const unsigned long long off=((unsigned long long)head*GS_D+vv)*GS_D+(kt0+ki)*16+gs_acc_row(lane,e);float qf=fminf(fmaxf(rintf(St[t][e]*inv),-128.0f),127.0f);sq[off]=(signed char)qf;
     const float qs=qf*scale;
-    if(gs_wef)ef[off]=(_Float16)(St[t][e]-qs);
-    if(gs_seam)ht[off]=qs+(float)(_Float16)(St[t][e]-qs);}}}
+    // `ht` mirrors the next launch's entry reconstruction (int-converted code + stored EF); see gdn_chunk_scan.gfx1201.hip.
+    const _Float16 eh=(_Float16)(St[t][e]-qs);
+    if(gs_wef)ef[off]=eh;
+    if(gs_seam)ht[off]=(float)(signed char)qf*scale+(float)eh;}}}
 }

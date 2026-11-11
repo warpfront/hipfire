@@ -934,16 +934,292 @@ fn seq_legacy(gpu: &mut Gpu, fx: &Fixture, sf: &SeqFx, s: u64, n: usize) -> Resu
     Ok((out, st))
 }
 
+// ---------------------------------------------------------------------------------------------
+// hipGraph component parity (CHUNK-CANONICAL-DESIGN §4.5): one `gdn_stream_append` captured with
+// preloaded modules, stable device pointers and a fixed shape, replayed against the same device
+// state, must equal the eager call byte for byte. The executor's kernels take no absolute
+// position: the cursor enters only through the schedule class (start modulo 64 / 512, pending
+// rows, rows), so a graph captured at one absolute position replays correctly at any position of
+// the same class; the host recomputes the candidate meta with `GdnAppendSchedule`. The oracle
+// proves that by also replaying the graph (captured at `pos`) against the eager append at
+// `pos + 2048` (a different absolute cursor, same class).
+// ---------------------------------------------------------------------------------------------
+
+/// Caller buffers of one append (raw rows from fixture row `row0`, poisoned scratch).
+struct Bufs {
+    row0: usize,
+    n: usize,
+    x: GpuTensor,
+    a: GpuTensor,
+    b: GpuTensor,
+    q: GpuTensor,
+    k: GpuTensor,
+    v: GpuTensor,
+    aa: GpuTensor,
+    o: GpuTensor,
+}
+
+impl Bufs {
+    fn new(gpu: &mut Gpu, fx: &Fixture, cfg: &Cfg, row0: usize, n: usize) -> Result<Self> {
+        let alloc = n.div_ceil(64) * 64;
+        let hv = fx.hv;
+        let bufs = Self {
+            row0,
+            n,
+            x: upload(gpu, &fx.x_bytes(row0, n))?,
+            a: upload(gpu, &fx.a_bytes(row0, n))?,
+            b: upload(gpu, &fx.b_bytes(row0, n))?,
+            q: raw(gpu, alloc * HK * HD * 2)?,
+            k: raw(gpu, alloc * HK * HD * 2)?,
+            v: raw(gpu, alloc * hv * HD * 2)?,
+            aa: raw(gpu, alloc * hv * 64 * 2)?,
+            o: raw(gpu, n * hv * HD * cfg.out_elem())?,
+        };
+        bufs.reset(gpu, fx)?;
+        Ok(bufs)
+    }
+    /// Restore the inputs the executor rewrites in place and re-poison scratch/output.
+    fn reset(&self, gpu: &mut Gpu, fx: &Fixture) -> Result<()> {
+        gpu.memcpy_htod_auto(&self.x.buf, &fx.x_bytes(self.row0, self.n))?;
+        gpu.memcpy_htod_auto(&self.a.buf, &fx.a_bytes(self.row0, self.n))?;
+        gpu.memcpy_htod_auto(&self.b.buf, &fx.b_bytes(self.row0, self.n))?;
+        for t in [&self.q, &self.k, &self.v, &self.aa, &self.o] {
+            fill(gpu, t, 0xff)?;
+        }
+        Ok(())
+    }
+    fn free(self, gpu: &mut Gpu) -> Result<()> {
+        for t in [self.x, self.a, self.b, self.q, self.k, self.v, self.aa, self.o] {
+            gpu.free_tensor(t)?;
+        }
+        Ok(())
+    }
+}
+
+struct GraphRig<'a> {
+    fx: &'a Fixture,
+    plan: GdnPrefillPlan,
+    live: Live,
+    carry: Carry,
+    ws: rdna_compute::gdn_stream::GdnStreamWorkspace,
+}
+
+impl GraphRig<'_> {
+    fn append(&self, gpu: &mut Gpu, meta: &GdnStreamMeta, pos: u64, b: &Bufs) -> Result<GdnStreamMeta> {
+        let raw_in = GdnStreamRaw { qkv: &b.x, alpha: &b.a, beta: &b.b };
+        let scratch = GdnStreamScratch { q: &b.q, k: &b.k, v: &b.v, a: &b.aa };
+        Ok(gpu.gdn_stream_append(
+            &self.plan,
+            meta,
+            pos,
+            b.n,
+            &self.fx.consts(),
+            &raw_in,
+            &scratch,
+            &b.o,
+            &self.live.view(),
+            &self.carry.view(),
+            &self.ws,
+        )?)
+    }
+    fn tensors(&self) -> Vec<&GpuTensor> {
+        let mut v = vec![&self.live.conv, &self.live.codes, &self.live.scales];
+        if let Some(e) = &self.live.ef {
+            v.push(e);
+        }
+        v.extend([&self.carry.f32, &self.carry.conv, &self.carry.qkv, &self.carry.alpha, &self.carry.beta]);
+        v
+    }
+    fn snap(&self, gpu: &Gpu) -> Result<Vec<Vec<u8>>> {
+        self.tensors().into_iter().map(|t| download(gpu, t)).collect()
+    }
+    fn restore(&self, gpu: &Gpu, snap: &[Vec<u8>]) -> Result<()> {
+        for (t, d) in self.tensors().into_iter().zip(snap) {
+            gpu.memcpy_htod_auto(&t.buf, d)?;
+        }
+        Ok(())
+    }
+}
+
+fn shifted(meta: &GdnStreamMeta, by: u64) -> GdnStreamMeta {
+    GdnStreamMeta {
+        position: meta.position + by,
+        phase_start: meta.phase_start + by,
+        frame_base: meta.frame_base + by,
+        tile_base: meta.tile_base + by,
+        ..*meta
+    }
+}
+
+fn graph_main(gpu: &mut Gpu, hv: usize, fmts: &[GdnScanOut], json_path: Option<String>) -> Result<()> {
+    let stream = gpu.hip.stream_create()?;
+    gpu.active_stream = Some(stream);
+    let fx = Fixture::new(gpu, hv, 1300)?;
+    let mut rep = Report { comparisons: 0, bad: Vec::new() };
+    let mut cells = Vec::new();
+    // (start, rows appended before, rows of the captured append)
+    let cases: [(u64, &[usize], usize); 9] = [
+        (25, &[10], 300),      // pending head completes, whole tiles, incomplete tail
+        (0, &[], 1100),        // aligned multi-frame (mseg on gfx1201 bf16)
+        (64, &[63], 1),        // singleton finishing a tile... then pending
+        (500, &[], 40),        // clipped head crossing a seam
+        (25, &[1], 1),         // singleton inside a tile
+        (511, &[], 2),         // seam straddle
+        (300, &[100], 700),    // off-grid with pending, two seams
+        (0, &[], 64),          // exactly one tile, aligned
+        (130, &[], 37),        // clipped head, partial
+    ];
+    for &fmt in fmts {
+        for quant in [Quant::Q8Ef, Quant::Q8] {
+            let cfg = Cfg { quant, fmt };
+            for &(s, pre, n) in &cases {
+                let ctx = format!("graph/{}/s{s}/pre{pre:?}/n{n}", cfg.name());
+                graph_case(gpu, &fx, &cfg, s, pre, n, &ctx, &mut rep)?;
+                cells.push(json!({"cfg": cfg.name(), "start": s, "pre": pre, "rows": n}));
+            }
+        }
+    }
+    let receipt = json!({
+        "oracle": "gdn_canon_stream_oracle --graph",
+        "arch": gpu.arch,
+        "n_value_heads": hv,
+        "comparisons": rep.comparisons,
+        "all_pass": rep.bad.is_empty(),
+        "failures": rep.bad,
+        "cells": cells,
+    });
+    if let Some(p) = json_path {
+        std::fs::write(p, serde_json::to_string_pretty(&receipt)?)?;
+    }
+    println!(
+        "{}",
+        serde_json::to_string(&json!({"oracle": "gdn_canon_stream_oracle --graph", "arch": gpu.arch, "hv": hv, "comparisons": rep.comparisons, "all_pass": receipt["all_pass"], "failures": receipt["failures"].as_array().map(|a| a.len())}))?
+    );
+    if !rep.bad.is_empty() {
+        for b in rep.bad.iter().take(30) {
+            eprintln!("FAIL {b}");
+        }
+        return Err(format!("{} failing comparison(s) of {}", rep.bad.len(), rep.comparisons).into());
+    }
+    Ok(())
+}
+
+fn graph_case(gpu: &mut Gpu, fx: &Fixture, cfg: &Cfg, s: u64, pre: &[usize], n: usize, ctx: &str, rep: &mut Report) -> Result<()> {
+    let hv = fx.hv;
+    let rig = GraphRig {
+        fx,
+        plan: cfg.plan(),
+        live: Live::new(gpu, fx, cfg.quant)?,
+        carry: Carry::new(gpu, fx)?,
+        ws: gpu.gdn_stream_workspace_alloc(HK, hv, cfg.fmt)?,
+    };
+    let orow = hv * HD * cfg.out_elem();
+    // Eager prefix (also loads every module before capture).
+    let mut meta = GdnStreamMeta::sealed_at(s, 1);
+    let mut done = 0usize;
+    for &p in pre {
+        let b = Bufs::new(gpu, fx, cfg, done, p)?;
+        meta = rig.append(gpu, &meta, s + done as u64, &b)?;
+        gpu.hip.device_synchronize()?;
+        b.free(gpu)?;
+        done += p;
+    }
+    let pos = s + done as u64;
+    let snap0 = rig.snap(gpu)?;
+    let bufs = Bufs::new(gpu, fx, cfg, done, n)?;
+
+    // 1. eager reference at `pos`
+    let meta_e = rig.append(gpu, &meta, pos, &bufs)?;
+    gpu.hip.device_synchronize()?;
+    let out_e = download(gpu, &bufs.o)?;
+    let st_e = rig.snap(gpu)?;
+
+    // 2. capture the same call (nothing executes during capture)
+    rig.restore(gpu, &snap0)?;
+    bufs.reset(gpu, fx)?;
+    gpu.hip.device_synchronize()?;
+    gpu.graphs.drop_captured_graph(&gpu.hip, gpu.device_id);
+    {
+        let st = gpu.active_stream.as_ref().ok_or("no active stream")?;
+        gpu.graphs.begin_graph_capture(&gpu.hip, gpu.device_id, st)?;
+    }
+    let captured = rig.append(gpu, &meta, pos, &bufs);
+    {
+        let st = gpu.active_stream.as_ref().ok_or("no active stream")?;
+        if captured.is_err() {
+            gpu.graphs.abort_graph_capture(&gpu.hip, gpu.device_id, st);
+        } else {
+            gpu.graphs.end_graph_capture(&gpu.hip, gpu.device_id, st)?;
+        }
+    }
+    let meta_c = captured?;
+    rep.check(ctx, "capture_recorded_kernels", !gpu.graphs.ar_forward_blobs.is_empty() && gpu.graphs.graph_exec.is_some());
+    rep.check(ctx, "capture_returns_same_candidate_meta", meta_c == meta_e);
+    gpu.hip.device_synchronize()?;
+    rep.check(ctx, "capture_executed_nothing", rig.snap(gpu)? == snap0);
+
+    // 3. replay on restored state == eager
+    rig.restore(gpu, &snap0)?;
+    bufs.reset(gpu, fx)?;
+    gpu.hip.device_synchronize()?;
+    {
+        let st = gpu.active_stream.as_ref().ok_or("no active stream")?;
+        gpu.graphs.graph_launch(&gpu.hip, gpu.device_id, st)?;
+    }
+    gpu.hip.device_synchronize()?;
+    let out_r = download(gpu, &bufs.o)?;
+    rep.cmp(ctx, "replay_out_vs_eager", &out_r[..n * orow], &out_e[..n * orow]);
+    let st_r = rig.snap(gpu)?;
+    for (i, (a, b)) in st_r.iter().zip(&st_e).enumerate() {
+        rep.cmp(ctx, &format!("replay_state{i}_vs_eager"), a, b);
+    }
+    rep.check(ctx, "nonvacuous_out", out_e[..n * orow].iter().any(|b| *b != 0));
+
+    // 4. a second replay from the same state is identical (no state baked into the graph)
+    rig.restore(gpu, &snap0)?;
+    bufs.reset(gpu, fx)?;
+    gpu.hip.device_synchronize()?;
+    {
+        let st = gpu.active_stream.as_ref().ok_or("no active stream")?;
+        gpu.graphs.graph_launch(&gpu.hip, gpu.device_id, st)?;
+    }
+    gpu.hip.device_synchronize()?;
+    rep.cmp(ctx, "second_replay_out", &download(gpu, &bufs.o)?[..n * orow], &out_e[..n * orow]);
+
+    // 5. a different absolute cursor of the same class: eager there == the graph captured at `pos`
+    let by = 2048u64;
+    rig.restore(gpu, &snap0)?;
+    bufs.reset(gpu, fx)?;
+    let meta_shift = if pre.is_empty() { GdnStreamMeta::sealed_at(pos + by, 1) } else { shifted(&meta, by) };
+    let meta_e2 = rig.append(gpu, &meta_shift, pos + by, &bufs)?;
+    gpu.hip.device_synchronize()?;
+    rep.cmp(ctx, "eager_at_shifted_cursor_out", &download(gpu, &bufs.o)?[..n * orow], &out_e[..n * orow]);
+    for (i, (a, b)) in rig.snap(gpu)?.iter().zip(&st_e).enumerate() {
+        rep.cmp(ctx, &format!("eager_at_shifted_cursor_state{i}"), a, b);
+    }
+    rep.check(ctx, "shifted_meta_is_shifted_class", meta_e2.pending_rows == meta_e.pending_rows && meta_e2.tile_base == meta_e.tile_base + by && meta_e2.frame_base == meta_e.frame_base + by);
+
+    gpu.graphs.drop_captured_graph(&gpu.hip, gpu.device_id);
+    bufs.free(gpu)?;
+    let GraphRig { live, carry, ws, .. } = rig;
+    live.free(gpu)?;
+    carry.free(gpu)?;
+    gpu.gdn_stream_workspace_free(ws)?;
+    Ok(())
+}
+
 fn run() -> Result<()> {
     let mut json_path: Option<String> = None;
     let mut hv = 48usize;
     let mut quick = false;
+    let mut graph = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--json" => json_path = args.next(),
             "--hv" => hv = args.next().ok_or("--hv value")?.parse()?,
             "--quick" => quick = true,
+            "--graph" => graph = true,
             other => return Err(format!("unknown argument {other}").into()),
         }
     }
@@ -962,6 +1238,9 @@ fn run() -> Result<()> {
     } else {
         vec![GdnScanOut::F32]
     };
+    if graph {
+        return graph_main(&mut gpu, hv, &fmts, json_path);
+    }
     let starts: Vec<u64> = if quick {
         vec![0, 25, 512]
     } else {
