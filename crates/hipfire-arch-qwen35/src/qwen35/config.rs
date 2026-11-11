@@ -1000,7 +1000,9 @@ pub fn config_from_safetensors(source: &dyn ModelSource) -> Result<Qwen35Config,
 /// Positions the RoPE covers: `max_position_embeddings`, or the YaRN
 /// `factor x original` context.
 pub fn context_limit(config: &Qwen35Config) -> usize {
-    config.rope_scaling.context_limit(config.max_position_embeddings)
+    config
+        .rope_scaling
+        .context_limit(config.max_position_embeddings)
 }
 
 /// The full-attention rotary embedding.

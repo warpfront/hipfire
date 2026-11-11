@@ -1324,7 +1324,10 @@ impl Rig {
                             .to_string(),
                     );
                 }
-                eprintln!("  DFlash draft {} refused: YaRN active (v1 boundary)", path.display());
+                eprintln!(
+                    "  DFlash draft {} refused: YaRN active (v1 boundary)",
+                    path.display()
+                );
                 None
             }
             Some(path) => match crate::dflash_slot::load_dflash_shared(
