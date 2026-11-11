@@ -1906,6 +1906,16 @@ pub fn batch_chunk_fa_attend(
         );
     }
     if gfx12_fa_prep_fp8q {
+        // Ordinary prefill: one Q-resident launch over the whole call. The body
+        // computes every (row, head) from that row's own Q codes, scale and
+        // causal KV prefix, so a row's bytes do not depend on how the prompt
+        // was split into calls (CHUNK-CANONICAL-DESIGN §1.3).
+        if fa_fp8q_canonical_prefill(gpu, kv_cache, n, start_pos, max_ctx_len, tree_verify.is_some())
+        {
+            return batch_chunk_fa_attend_canonical_fp8q(
+                gpu, config, pbs, s, kv_cache, n, start_pos, layer_idx,
+            );
+        }
         // Newly admitted ragged chunks (never produced by the incumbent
         // admission: its Some(512) arm requires n % 512 == 0) take the direct
         // range route and return before the aligned/F32 segment paths.
@@ -2344,6 +2354,111 @@ pub fn batch_chunk_fa_attend_ragged_fp8q(
     Ok(())
 }
 
+/// Ordinary-prefill fp8q attention is one call-shape-independent route: any
+/// 1..=32768-row true-prefill call (`start_pos + n == max_ctx_len`, inside the
+/// physical cache) on the native fp8 tier. Verify, tree and capture keep their
+/// own admission.
+fn fa_fp8q_canonical_prefill(
+    gpu: &Gpu,
+    kv_cache: &KvView<'_>,
+    n: usize,
+    start_pos: usize,
+    max_ctx_len: usize,
+    is_tree: bool,
+) -> bool {
+    gpu.ordinary_prefill_active()
+        && !is_tree
+        && (1..=32768).contains(&n)
+        && start_pos.checked_add(n) == Some(max_ctx_len)
+        && (1..=262_144).contains(&max_ctx_len)
+        && max_ctx_len <= kv_cache.physical_cap
+}
+
+/// [`fa_fp8q_canonical_prefill`] attend: write all `n` K/V rows, then one direct
+/// Q-resident launch over the whole prepared two-plane Raw Q into the F32
+/// output. Rows past the first 512 are run in grid z by the same body.
+#[allow(clippy::too_many_arguments)]
+fn batch_chunk_fa_attend_canonical_fp8q(
+    gpu: &mut Gpu,
+    config: &HybridDims,
+    pbs: &BatchScratch<'_>,
+    s: &FlashScratch<'_>,
+    kv_cache: &KvView<'_>,
+    n: usize,
+    start_pos: usize,
+    layer_idx: usize,
+) -> HipResult<()> {
+    // Tier validation only: a one-row call resolves the same codec as any
+    // batched one, so derive the plan at the batched arity.
+    let plan = KvTierPlan::derive(KvTierInputs {
+        pos: start_pos,
+        flash_mode: s.flash_mode as usize,
+        capture_mode: gpu.graphs.capture_mode,
+        batch_size: n.max(2),
+        is_tree: false,
+        ..kv_cache.tier_inputs()
+    })
+    .map_err(|e| HipError::new(0, &e.to_string()))?;
+    if plan.write_key != crate::types::KernelKey::KvWriteFp8E4m3Batched
+        || plan.attend_key != crate::types::KernelKey::AttnFp8E4m3KvBatchedMasked
+        || plan.window > 0
+        || plan.uses_givens
+        || plan.v_mode_bits != 8
+    {
+        return Err(HipError::new(
+            0,
+            "canonical fp8q prefill requires the native fp8 batched full-causal KV tier",
+        ));
+    }
+    let q_bytes = n * config.n_heads * (config.head_dim + 4);
+    let q_raw = GpuTensor {
+        buf: unsafe { hip_bridge::DeviceBuffer::from_raw(pbs.fa_q_batch.buf.as_ptr(), q_bytes) },
+        shape: vec![q_bytes],
+        dtype: DType::Raw,
+    };
+    for (cache, src) in [
+        (&kv_cache.k_gpu[layer_idx], &pbs.fa_k_batch),
+        (&kv_cache.v_gpu[layer_idx], &pbs.fa_v_batch),
+    ] {
+        gpu.kv_cache_write_fp8_e4m3_batched(
+            cache,
+            src,
+            &pbs.positions,
+            config.n_kv_heads,
+            config.head_dim,
+            n,
+        )?;
+    }
+    let max_ctx_len = start_pos + n;
+    if (config.n_heads, config.n_kv_heads) == (16, 2) {
+        gpu.attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a3b_gfx1201(
+            &q_raw,
+            &kv_cache.k_gpu[layer_idx],
+            &kv_cache.v_gpu[layer_idx],
+            &pbs.fa_attn_out_batch,
+            &pbs.positions,
+            config.n_heads,
+            config.n_kv_heads,
+            config.head_dim,
+            max_ctx_len,
+            n,
+        )
+    } else {
+        gpu.attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_gfx1201(
+            &q_raw,
+            &kv_cache.k_gpu[layer_idx],
+            &kv_cache.v_gpu[layer_idx],
+            &pbs.fa_attn_out_batch,
+            &pbs.positions,
+            config.n_heads,
+            config.n_kv_heads,
+            config.head_dim,
+            max_ctx_len,
+            n,
+        )
+    }
+}
+
 /// Shared KV-write + flash-attention dispatch tail (F2 extraction).
 ///
 /// `batch_chunk_fa_attend` calls this with the chunk's own FA tensors; the
@@ -2653,6 +2768,11 @@ pub fn gfx12_fa_prep_fp8q_admitted(
 ) -> bool {
     let native_a3b = (config.n_heads, config.n_kv_heads) == (16, 2)
         && fa_a3b_native_prefill_rows(n, commit_stride, max_ctx_len);
+    // Ordinary prefill admits every call extent so no row changes attention
+    // arithmetic with the outer split ([`fa_fp8q_canonical_prefill`]).
+    let canonical =
+        fa_fp8q_canonical_prefill(gpu, kv_cache, n, start_pos, max_ctx_len, tree_verify.is_some());
+    let shape_free = native_a3b || canonical;
     if !gfx12_fa_prep_geometry_admitted(gpu, config, fusion, n, tap_active)
         || gpu.fp8_verify_scope
         || !gpu.flags.gfx12_fa_prep_fp8q
@@ -2661,10 +2781,10 @@ pub fn gfx12_fa_prep_fp8q_admitted(
         || multirow
         || batch_semantics.is_independent()
         || !kv_cache.quant_fp8
-        || !(native_a3b || (64..=32768).contains(&n))
-        || !(native_a3b || (64..=262_144).contains(&max_ctx_len))
+        || !(shape_free || (64..=32768).contains(&n))
+        || !(shape_free || (64..=262_144).contains(&max_ctx_len))
         || tree_verify.is_some()
-        || !(native_a3b
+        || !(shape_free
             || fa_fp8q_incumbent_shape(n, commit_stride)
             || (fa_ragged_packet_enabled()
                 && fa_ragged_packet_split(
@@ -2678,21 +2798,23 @@ pub fn gfx12_fa_prep_fp8q_admitted(
     {
         return false;
     }
-    if (config.n_heads, config.n_kv_heads) == (16, 2) {
-        if !gpu.flags.gfx12_fa2_prefill
-            || start_pos.checked_add(n) != Some(max_ctx_len)
-            || max_ctx_len > kv_cache.physical_cap
-        {
+    let h16 = (config.n_heads, config.n_kv_heads) == (16, 2);
+    if h16 && !gpu.flags.gfx12_fa2_prefill {
+        return false;
+    }
+    if h16 || canonical {
+        if start_pos.checked_add(n) != Some(max_ctx_len) || max_ctx_len > kv_cache.physical_cap {
             return false;
         }
         // Like dense qresident, this is replay-idempotent: derive the real
         // capture plan rather than imposing the eager-only PM restriction.
+        // A one-row call resolves the same codec at batched arity.
         return matches!(
             KvTierPlan::derive(KvTierInputs {
                 pos: start_pos,
                 flash_mode: s.flash_mode as usize,
                 capture_mode: gpu.graphs.capture_mode,
-                batch_size: n,
+                batch_size: n.max(2),
                 is_tree: false,
                 ..kv_cache.tier_inputs()
             }),
@@ -2762,10 +2884,13 @@ pub fn batch_chunk_full_attn_attn(
             tap.is_some(),
         );
     let gfx12_fa_prep = gfx12_fa_prep_f32 || gfx12_fa_prep_fp8q;
-    // Only the new ragged shape is admitted outside the incumbent n/commit
-    // predicate. It keeps the F32 attention output (no A4 attention epilogue:
-    // the A4 attend step cannot express the two-plane range launches).
-    let newly_admitted_ragged = gfx12_fa_prep_fp8q && !fa_fp8q_incumbent_shape(n, commit_stride);
+    // Only the new ragged shape and ordinary-prefill calls below 64 rows are
+    // admitted outside the incumbent n/commit predicate. They keep the F32
+    // attention output (no A4 attention epilogue: the A4 attend step cannot
+    // express the range or sub-64 launches); the epilogue writes the same bytes
+    // the separate sigmoid/rotate producer forms from that output.
+    let newly_admitted_ragged =
+        gfx12_fa_prep_fp8q && (n < 64 || !fa_fp8q_incumbent_shape(n, commit_stride));
     let pair_q8_writes = dflash_fa_batch_fusion_admitted(gpu, config, fusion, n, tap.is_some());
     // The fp8q prep can leave the sigmoid gate in `fa_q_full_batch` (no
     // 4·n·q_dim-byte copy, and its gate half is never read by the prep) when
