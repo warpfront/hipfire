@@ -107,11 +107,31 @@ mod sys {
         ERRNO.as_ptr()
     }
     pub unsafe fn clock_gettime(_clock_id: i32, tp: *mut [i64; 2]) -> i32 {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default();
+        // Monotonic via `Instant` (not wall `SystemTime`, which can step
+        // backwards): a process-local epoch anchor plus elapsed time, so
+        // the shared `monotonic_ns` assert holds and trace deltas stay
+        // ordered. The epoch is arbitrary, never compared across runs.
+        use std::sync::OnceLock;
+        use std::time::{Instant, SystemTime, UNIX_EPOCH};
+        struct Anchor {
+            epoch_secs: u64,
+            instant: Instant,
+        }
+        static ANCHOR: OnceLock<Anchor> = OnceLock::new();
+        let anchor = ANCHOR.get_or_init(|| Anchor {
+            epoch_secs: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            instant: Instant::now(),
+        });
+        let elapsed = anchor.instant.elapsed();
+        let (secs, nanos) = (
+            anchor.epoch_secs + elapsed.as_secs(),
+            elapsed.subsec_nanos(),
+        );
         unsafe {
-            *tp = [now.as_secs() as i64, now.subsec_nanos() as i64];
+            *tp = [secs as i64, nanos as i64];
         }
         0
     }
