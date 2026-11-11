@@ -304,15 +304,65 @@ fn control_flow_and_effects_the_checkers_cannot_follow_fail_closed() {
         f.seg = FlatSeg::Flat;
     }
     fails(&[flat, wait(0, 0), end()], "segment access");
-    // Memory data in an AccVGPR cannot be tracked by the ledger.
-    fails(
-        &[
-            ops::global_store(FlatOp::StoreDword, v(2), Src::Agpr(0), None, 0),
-            wait(0, 15),
-            end(),
-        ],
-        "plain SGPR/VGPR",
-    );
+}
+
+fn a(n: u8) -> Src {
+    Src::Agpr(n)
+}
+/// `global_load_dword aN, v[2:3], off`.
+fn load_a(dst: u8) -> Inst {
+    ops::global_load(FlatOp::LoadDword, a(dst), v(2), None, 0)
+}
+
+#[test]
+fn agpr_vmem_load_is_ledger_tracked_like_a_vgpr_load() {
+    // Drained: the wait retires the load and the AGPR read is accepted.
+    ok(&[load_a(0), wait(0, 15), ops::acc_read(v(100), a(0)), end()]);
+    // Missing wait: reading the pending AGPR destination is refused.
+    fails(&[load_a(0), ops::acc_read(v(100), a(0)), end()], "Vm wait");
+    // WAW on the same a0: overwriting a pending load destination needs the wait first.
+    fails(&[load_a(0), ops::acc_write(a(0), v(0)), end()], "Vm wait");
+    ok(&[load_a(0), wait(0, 15), ops::acc_write(a(0), v(0)), end()]);
+    // A second load to the same a0 before the first drains is also a WAW.
+    fails(&[load_a(0), load_a(0), wait(0, 15), end()], "Vm wait");
+    // AGPR as memory store data is tracked: the store needs no counter wait for its data
+    // (store sources are not counter-held) but its counter slot is still drained.
+    ok(&[
+        ops::global_store(FlatOp::StoreDword, v(2), a(0), None, 0),
+        wait(0, 15),
+        end(),
+    ]);
+}
+
+#[test]
+fn agpr_and_vgpr_banks_do_not_alias_in_the_ledger() {
+    // A pending a0 load does not poison v0 (read or write) ...
+    ok(&[
+        load_a(0),
+        use_of(0),
+        ops::v1(Vop1Op::MovB32, v(0), v(1)),
+        wait(0, 15),
+        end(),
+    ]);
+    // ... and a pending v0 load does not poison a0.
+    ok(&[
+        load(0),
+        ops::acc_read(v(100), a(0)),
+        ops::acc_write(a(0), v(1)),
+        wait(0, 15),
+        end(),
+    ]);
+}
+
+#[test]
+fn accvgpr_moves_read_and_write_are_tracked() {
+    // v_accvgpr_read_b32 reads its AGPR source: pending a1 load.
+    fails(&[load_a(1), ops::acc_read(v(100), a(1)), end()], "Vm wait");
+    // v_accvgpr_write_b32 reads its VGPR source: pending v1 load.
+    fails(&[load(1), ops::acc_write(a(0), v(1)), end()], "Vm wait");
+    // v_accvgpr_read_b32 writes its VGPR destination: pending v1 load (WAW).
+    fails(&[load(1), ops::acc_read(v(1), a(0)), end()], "Vm wait");
+    ok(&[load(1), wait(0, 15), ops::acc_read(v(1), a(0)), end()]);
 }
 
 #[test]

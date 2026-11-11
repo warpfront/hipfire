@@ -41,6 +41,9 @@ impl Serialize for RegName {
 pub enum Kind {
     V,
     S,
+    /// An accumulator register (CDNA AGPR). Tracked by the wait ledger as its own bank (never
+    /// aliasing the same-numbered VGPR) but not allocatable through [`RegPlan`].
+    A,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
 pub struct RegRef {
@@ -57,7 +60,11 @@ impl RegRef {
 }
 impl fmt::Display for RegRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let prefix = if self.kind == Kind::V { 'v' } else { 's' };
+        let prefix = match self.kind {
+            Kind::V => 'v',
+            Kind::S => 's',
+            Kind::A => 'a',
+        };
         if self.len == 1 {
             write!(f, "{prefix}{}", self.base)
         } else {
@@ -182,6 +189,11 @@ impl RegPlan {
         live: Live,
     ) -> Result<(), String> {
         let name = name.into();
+        if kind == Kind::A {
+            return Err(format!(
+                "{name}: AGPR allocation is not supported by RegPlan"
+            ));
+        }
         if !matches!(len, 1 | 2 | 4 | 8) {
             return Err("register width must be 1, 2, 4 or 8".into());
         }

@@ -30,7 +30,8 @@
 //! boundary or past the code, a reachable fall-through off the end, FLAT-segment and
 //! SCRATCH accesses (FLAT counts on VM_CNT and LGKM_CNT and may address LDS; SCRATCH needs
 //! a private segment), GDS operations, and memory operations whose data/destination
-//! registers are AGPRs or special-register files (the ledger tracks only SGPRs and VGPRs).
+//! registers are special-register files (the ledger tracks SGPRs, VGPRs and AGPRs; AGPRs
+//! are a separate bank, `Kind::A`, with the same wait/hazard accounting as VGPRs).
 //!
 //! Not modelled (reported, not hidden): global-memory visibility across a barrier,
 //! unreachable instructions are hazard-checked but not ledger-walked (their count is in
@@ -353,10 +354,10 @@ fn convert(inst: &Inst, branch: Option<usize>, counts: &mut Counts) -> Result<In
     if let Some(bad) = footprint
         .defs
         .iter()
-        .find(|d| !matches!(d.file, RegFile::Sgpr | RegFile::Vgpr))
+        .find(|d| !matches!(d.file, RegFile::Sgpr | RegFile::Vgpr | RegFile::Agpr))
     {
         return Err(format!(
-            "memory destination {bad:?} is not a plain SGPR/VGPR; the ledger cannot track it"
+            "memory destination {bad:?} is not a plain SGPR/VGPR/AGPR; the ledger cannot track it"
         ));
     }
     if let Some(bad) = footprint.uses.iter().find(|u| {
@@ -364,6 +365,7 @@ fn convert(inst: &Inst, branch: Option<usize>, counts: &mut Counts) -> Result<In
             u.file,
             RegFile::Sgpr
                 | RegFile::Vgpr
+                | RegFile::Agpr
                 | RegFile::Exec
                 | RegFile::M0
                 | RegFile::Scc
@@ -371,7 +373,7 @@ fn convert(inst: &Inst, branch: Option<usize>, counts: &mut Counts) -> Result<In
         )
     }) {
         return Err(format!(
-            "memory source {bad:?} is not a plain SGPR/VGPR; the ledger cannot track it"
+            "memory source {bad:?} is not a plain SGPR/VGPR/AGPR; the ledger cannot track it"
         ));
     }
     let class = match kind {
@@ -412,7 +414,7 @@ fn convert(inst: &Inst, branch: Option<usize>, counts: &mut Counts) -> Result<In
     .memory(class))
 }
 
-/// The SGPR/VGPR spans, as ledger registers.
+/// The SGPR/VGPR/AGPR spans, as ledger registers (AGPRs are their own bank, `Kind::A`).
 fn tracked(spans: &[RegSpan]) -> Vec<RegRef> {
     spans
         .iter()
@@ -420,6 +422,7 @@ fn tracked(spans: &[RegSpan]) -> Vec<RegRef> {
             let kind = match span.file {
                 RegFile::Sgpr => Kind::S,
                 RegFile::Vgpr => Kind::V,
+                RegFile::Agpr => Kind::A,
                 _ => return None,
             };
             Some(RegRef {

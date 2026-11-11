@@ -626,7 +626,7 @@ impl Ledger {
             .iter()
             .filter(|p| matches!(p.counter, Counter::Store | Counter::Vs))
             .flat_map(|p| p.src_locks.iter().copied())
-            .filter(|r| r.kind == crate::reg::Kind::V)
+            .filter(|r| matches!(r.kind, crate::reg::Kind::V | crate::reg::Kind::A))
             .collect()
     }
     /// An LDS store not yet retired (DScnt on gfx12, LGKMcnt on gfx11 and
