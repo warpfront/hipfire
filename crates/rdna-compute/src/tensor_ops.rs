@@ -73,6 +73,12 @@ const INDEXED_ATTENTION_SELECT_EXACT_SRC: &str =
 static QWEN4_QSA_WMMA_GATHER: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_WMMA_GATHER", true)
 });
+/// `HIPFIRE_QWEN4_QSA_Q8_GATHER_GFX1201=0` keeps q8 QSA prefill attention on
+/// gfx1201 on `indexed_attention_attention_q8_batched_hg4` instead of the gfx12
+/// gathered F16 WMMA route over the dequantized rows (not bit-exact; KLD-gated).
+static QWEN4_QSA_Q8_GATHER_GFX1201: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_Q8_GATHER_GFX1201", true)
+});
 /// `HIPFIRE_QWEN4_GDN_PIPE=0` keeps the non-capture batched GDN recurrence of
 /// gfx1201 (F32 and Q8 state) and gfx942 (F32 state) on
 /// `gated_delta_step_halves_state128_persistent256_{f32,q8}` instead of the
@@ -11740,7 +11746,12 @@ pub fn qsa_gathered_wmma_enabled(gpu: &Gpu, format: QsaKvFormat) -> bool {
         && match format {
             QsaKvFormat::F32 => gpu.arch_caps.is_gfx1151(),
             QsaKvFormat::Fp8 => gpu.arch_caps.is_gfx1201(),
-            QsaKvFormat::Q8 => gpu.arch_caps.is_gfx1151(),
+            // gfx1201: the gfx12 attention over the Q8 rows dequantized to F16
+            // (`HIPFIRE_QWEN4_QSA_Q8_GATHER_GFX1201=0` keeps the hg4 kernel).
+            QsaKvFormat::Q8 => {
+                gpu.arch_caps.is_gfx1151()
+                    || (gpu.arch_caps.is_gfx1201() && *QWEN4_QSA_Q8_GATHER_GFX1201)
+            }
             QsaKvFormat::Fp8Fnuz => false,
         }
 }
@@ -11940,6 +11951,26 @@ fn qsa_gathered_wmma_launch_with(
                 "indexed_attention_kv_f16vb_pm_gfx1151",
             ),
             attend_gfx1151,
+        ),
+        (QsaKvFormat::Q8, pm) if gpu.arch_caps.is_gfx1201() => (
+            hip(
+                GFX1201,
+                INDEXED_ATTENTION_GATHERED_WMMA_GFX1201_SRC,
+                "indexed_attention_kv_f16vb_q8_gfx1201",
+            ),
+            if pm {
+                built(
+                    PM_GFX1201,
+                    crate::kernels::QSA_GATHER_PM_GFX1201,
+                    "indexed_attention_gathered_wmma_f16_pm_gfx1201",
+                )
+            } else {
+                hip(
+                    GFX1201,
+                    INDEXED_ATTENTION_GATHERED_WMMA_GFX1201_SRC,
+                    "indexed_attention_gathered_wmma_f16_gfx1201",
+                )
+            },
         ),
         (QsaKvFormat::Q8, _) => (
             hip(

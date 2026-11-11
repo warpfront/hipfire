@@ -92,6 +92,7 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 | `HSA_USERPTR_FOR_PAGED_MEM` | ROCm (libhsakmt) host-allocation backing | Linux, in a process that sets `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS` (host-mapped Qwen4 experts), or a daemon started for a Qwen4 model whose cards are all discrete GPUs (`hipfire run`, `bench`, and `serve`'s pre-warm model; the arch of the cards comes from the KFD topology): hipfire sets `0` before the HIP runtime loads, unless it is already set, and logs it on a `[hip-bridge] … host memory out of reclaim` line. Other processes keep ROCm's default. With `0`, `hipHostMalloc` memory (the host-mapped routed experts, clr's staging buffers) is GTT, outside the kernel's reclaim. Under ROCm's default (non-zero) it is pageable userptr: when reclaim takes those pages, KFD evicts the process's GPU queues, and host-memory pressure can stall the GPU with one core spinning in `hipMemcpy` (ROCm/rocm-systems#12528). GTT is capped by TTM's `pages_limit` (`/sys/module/ttm/parameters/pages_limit`, in pages; half of RAM by default). A Qwen4 load whose host-mapped experts do not fit beside the GTT that amdgpu devices already hold is refused before it allocates. When the process exits, amdgpu keeps its freed GTT pages in TTM's page pool (up to `/sys/module/ttm/parameters/page_pool_size`, half of RAM by default). `MemAvailable` does not count the pool, but the next GTT allocation takes pages from it and memory pressure shrinks it, so the Qwen4 host-RAM check adds an estimate of it (see `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS`). Operators can return the pool to the kernel at once with `echo 2 \| sudo tee /proc/sys/vm/drop_caches`; `sudo cat /sys/kernel/debug/ttm/page_pool` shows its size (last line, in pages). Opt out with `HSA_USERPTR_FOR_PAGED_MEM=1`, which brings the stall exposure back. |
 | `GPU_PINNED_MIN_XFER_SIZE` | ROCm (clr) pageable-copy threshold; explicit values in MiB | Linux, in **every** process: hipfire sets `100000` before the HIP runtime loads, unless it is already set or `HIPFIRE_PINNED_XFER_DEFAULT=0`, so every copy to or from pageable host memory goes through clr's pinned staging buffer and the copy *source* is never registered as a reclaimable KFD userptr. That source exists on every weight load, so this is the switch that covers every model — the mapped model file, and Qwen4's per-forward PLE rows. Historical gfx1201 / Qwen3.8-27B MQ3-Pro measurements (warm cache, three reps each): the weight sweep was 1190–1198 ms armed vs 1204–1210 ms unarmed; these are not new performance evidence. At or above the threshold, clr pins a copy's pageable source in place as a userptr, which carries the queue-eviction stall under host-memory pressure (see `HSA_USERPTR_FOR_PAGED_MEM`). Set `HIPFIRE_PINNED_XFER_DEFAULT=0` before process start for the exact opt-out (see its row): hipfire then leaves `GPU_PINNED_MIN_XFER_SIZE` unset and clr keeps its own default. Setting `GPU_PINNED_MIN_XFER_SIZE=0` instead is not an opt-out: it pins every pageable copy source in place, including copies below clr's built-in threshold, so it does **not** restore the previous unset CLR default. Explicit threshold values are in **MiB**; the built-in threshold can differ by CLR version and need not be expressible in whole MiB (current CLR: 64 KiB; older CLR: 128 MiB). **Undocumented clr knob** — absent from HIP's environment-variable reference and from AMD's env-var page (checked 2026-10-03 against ROCm 7.2); the name is a string in `libamdhip64.so` next to `GPU_PINNED_XFER_SIZE`, read once at runtime initialization, with no published default. Treat it as internal, and note that on APUs it is *not* ignored the way `HSA_USERPTR_FOR_PAGED_MEM` is. |
 | `HIPFIRE_PINNED_XFER_DEFAULT` | exact opt-out from the process-wide `GPU_PINNED_MIN_XFER_SIZE` default; unset: default armed | Linux, read before the HIP runtime loads (installed process config, else the ambient environment). Exactly `0`: hipfire does **not** set `GPU_PINNED_MIN_XFER_SIZE`, so clr keeps its own unset default, and logs one `[hip-bridge] HIPFIRE_PINNED_XFER_DEFAULT=0: GPU_PINNED_MIN_XFER_SIZE left unset (clr default)` line. This is exact restoration of the pre-default behavior, unlike `GPU_PINNED_MIN_XFER_SIZE=0`, and it re-exposes the reclaim-stall exposure described on the `GPU_PINNED_MIN_XFER_SIZE` row. Any other value or unset keeps the `100000` default; a `GPU_PINNED_MIN_XFER_SIZE` already set in the environment is always respected, with or without this variable. It does not touch `HSA_USERPTR_FOR_PAGED_MEM` or the Qwen4 host-mapping tier. |
+| `AMD_DIRECT_DISPATCH` | ROCm (clr) submission mode; ROCm's Linux default `1` | Linux, in a daemon whose process configuration requests `topology.hetero_experts` (`HIPFIRE_TOPOLOGY_HETERO_EXPERTS`): hipfire sets `0` before the HIP runtime loads, unless it is already set, and logs it on a `[hip-bridge] AMD_DIRECT_DISPATCH=0 (topology.hetero_experts)` line. Other processes keep ROCm's default. With `0`, clr submits each stream's commands from a worker thread instead of the enqueueing thread. Measured on ROCm 7.2.2 (R9700 + Strix Halo iGPU, Qwen3.8 Flash-Next, same build): hetero layer-major prefill 2,282 / 2,711 / 2,719 tok/s at 2K / 8K / 16K with direct dispatch vs 2,847 / 3,862 / 3,940 without, greedy text bitwise identical; decode 35.8 vs 34.5 tok/s. The Strix alone shows no prefill difference. Opt out with `AMD_DIRECT_DISPATCH=1`. clr reads it once, at runtime initialization. |
 | `HSA_CU_MASK` / `ROC_GLOBAL_CU_MASK` | ROCm CU affinity masks; **refused on RDNA** | Linux, every process: before ROCr (`Runtime::initialize`) or the HIP runtime (`HipRuntime::load`) loads, hipfire reads the real process environment. A non-blank value is refused with an error when any KFD GPU node is RDNA (gfx10/gfx11/gfx12), or when the topology cannot be read or lists no GPU, because no RDNA device can then be ruled out. It deliberately ignores `ROCR_VISIBLE_DEVICES`. Only all-gfx9 (GCN/CDNA) hosts pass. On 2026-10-14 a CU-masked queue probe hung the R9700 (gfx1201) MES scheduler, forced mode1 resets and took the host down; the mask stays banned until a safe method is approved. The old `200× under ROC_GLOBAL_CU_MASK=0x1` stress recipes are withdrawn. The retained-PM4 queue mask entry points (`AqlQueue::create_with_cu_mask`, `QueueSet::create_with_cu_masks`/`set_cu_mask`) refuse RDNA devices too, and `HIPFIRE_GFX1151_REDLINE_CU_COUNT` accepts only `all`. |
 | `GPU_MAX_HW_QUEUES` | ROCm hardware-queue cap | hipfire never sets it. Read by ROCm before HIP loads, process-wide. With native MTP opted in over a `pcie` host-mapped expert spill on `gfx1200`/`gfx1201`, `GPU_MAX_HW_QUEUES=1` avoids a reported random decode-throughput loss; it is not measured on any other route, so it stays an operator choice. |
 | `HIPFIRE_LOCAL=1` | Skip attaching to running serve | One-shot local daemon. |
@@ -570,11 +571,11 @@ Read only by the Qwen4 carrier and its kernels; no other model reads them.
 | `HIPFIRE_QWEN4_TAIL_SNAPSHOT_MIN_GAP` | `1024` (rows) | Read once with the switch above. The tail split is taken only when the tail index lies at least this many rows above the later of the prefill start and the preceding chunk boundary (below it the replay it would save is cheaper than the extra tile). |
 | `HIPFIRE_QWEN4_TAIL_SNAPSHOT_MIN_PROMPT` | `16384` (tokens) | Read once with the switch above. Prompts shorter than this never take the tail split, so short cold prompts pay no extra tile. |
 | `HIPFIRE_QWEN4_TOKEN_READBACK_EARLY` | on unless `0` | Developer kill switch for Qwen4's next-token PLE readback: enqueue a pinned-host 4-byte token copy on the readback stream after it waits for argmax, then synchronize that stream once when staging the next token. `0` restores event synchronization followed by copy and stream synchronization. Token selection and vocabulary validation are unchanged. |
-| `HIPFIRE_QWEN4_TURN_SNAPSHOTS` | off; `1` enables | Developer switch, read once per Qwen4 bundle (needs the session cache and a tokenizer `<|im_end|>` id). Also splits every prefill (cold, snapshot-restored and live-continued turns) right after each `<|im_end|>` (every message end) and captures a session-cache snapshot there, published at client commit and reusable across sessions like the chunk snapshots. These snapshots are session-exact, not cold-exact (a live turn's state descends from decode, and the extra split changes the cold forward schedule); their scope carries `/turns`, so they never share a domain with flag-off snapshots. Off: only prefill-chunk multiples are snapshotted and a live turn captures nothing. |
+| `HIPFIRE_QWEN4_TURN_SNAPSHOTS` | off; `1` enables; **on** under `topology.hetero_experts` (`0` disables) | Developer switch, read once per Qwen4 bundle (needs the session cache and a tokenizer `<|im_end|>` id). Also splits every prefill (cold, snapshot-restored and live-continued turns) right after each `<|im_end|>` (every message end) and captures a session-cache snapshot there, published at client commit and reusable across sessions like the chunk snapshots. These snapshots are session-exact, not cold-exact (a live turn's state descends from decode, and the extra split changes the cold forward schedule); their scope carries `/turns`, so they never share a domain with flag-off snapshots. Off: only prefill-chunk multiples are snapshotted and a live turn captures nothing. Under `topology.hetero_experts` it runs in **final-turn** form: a prefill splits only at the prompt's LAST message end (where the session's next turn resumes), plus the chunk multiples; restore plans still look up every message end (an earlier turn's final one is an interior end of the next prompt). Scope `.../turns/final-turn`. Every-message-end splits cut the hetero prompt driver's tiles into slivers (a 58K-token cold prefill ran at 509 tok/s). |
 | `HIPFIRE_QWEN4_TOOL_ARG_REPLAY` | on unless `0` | Opt-out for the shared Qwen4 AR/native-MTP and dense Qwen AR/spec repair (the flag name is retained): restore original producer parameter order on the last echoed assistant tool turn of the active committed conversation, preserving typed values. Byte-identical echoes are unchanged. Accept only an exact committed-prefix extension with a nonempty suffix; parse/render doubt falls back to the original safe miss. No lexical sorting, cross-session guarantee, or retired-MTP guard change. |
 | `HIPFIRE_QWEN_PROMPT_CACHE` | on unless `0` | Conversation-reuse kill switch of the Qwen3.5/3.6 and dense generation paths (LCP prompt cache, DFlash/MTP conversation plan). **No longer affects Qwen4**: Qwen4 reuse is the session cache above (`HIPFIRE_SESSION_CACHE_BYTES`). The RC3 Qwen4 prefix cache (end-of-prompt checkpoint, multi-entry radix cache, shared-turn anchors, periodic captures) is removed; only the live continuation described above remains. |
 | `HIPFIRE_QWEN_RADIX_CACHE` | (removed) | Read by nothing. It selected the removed RC3 Qwen4 multi-entry radix cache; setting it has no effect. Use `HIPFIRE_SESSION_CACHE_BYTES=0` to turn Qwen4 prompt reuse (snapshots and live continuation) off. |
-| `HIPFIRE_QWEN_CACHE_TRACE` | unset | Set `1` to trace Qwen3.5/3.6 and dense/AR serve-path cache decisions to stderr. Qwen4 prints one `[qwen4-session] route=… prompt=… prior=… lcp=… reused=… new=… source=live\|snapshot\|cold` line per request: `prior` is the previous turn's committed history, `lcp` its common prefix with the new canonical prompt and `reused` the tokens the session cache skips; when the prompt diverges from that history a `[qwen4-session ids]` line shows the token ids around the first difference. Tail capture prints `session cache: tail resident at P`; a plan using it prints `session cache: using tail resident at P`. The RC3 `[qwen4-radix]` / `[qwen4-prefix]` lines are gone; a skipped snapshot prints `session cache: skipped N-token snapshot (reason)` regardless of this switch. |
+| `HIPFIRE_QWEN_CACHE_TRACE` | unset | Set `1` to trace Qwen3.5/3.6 and dense/AR serve-path cache decisions to stderr. Qwen4 prints one `[qwen4-session] route=… prompt=… prior=… lcp=… reused=… new=… source=live\|snapshot\|cold` line per request: `prior` is the previous turn's committed history, `lcp` its common prefix with the new canonical prompt and `reused` the tokens the session cache skips; when the prompt diverges from that history a `[qwen4-session ids]` line shows the token ids around the first difference. Tail capture prints `session cache: tail resident at P`; a plan using it prints `session cache: using tail resident at P`. The RC3 `[qwen4-radix]` / `[qwen4-prefix]` lines are gone; a skipped snapshot prints `session cache: skipped N-token snapshot (reason)` regardless of this switch. The Qwen4 session cache also prints each restore plan (`plan of N tokens -> P in X ms`), restore (`turn of N tokens restored P (...) in X ms`), published snapshot, and the Flash-Next MTP path its pre-prefill host time (`render + tokenize`). Without the switch it still always prints a planned boundary the prefill never reached and a snapshot refused at publish. |
 | `HIPFIRE_QWEN4_CACHE_QUALITY_OUT` | unset | Oracle/diagnostic only. Absolute path of a JSONL file that `hipfire_arch_qwen4::cache_quality::cache_quality_event` appends to (one compact JSON line per event, flushed per line; the variable is read once; unset or empty disables capture, a relative path warns and disables it). It is the opt-in production ID capture sink consumed by `quality_driver.py`; no daemon or generate code path calls it in this tree. |
 | `HIPFIRE_CQ_SESSION_BUDGET_BYTES` | unset: unbounded | Oracle only: `u64` byte budget of the `SessionCache` the `qwen4_parity --mode cache-quality` hit-vs-cold logits oracle builds (reference parity of the session cache; also honours `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS`). Not read by the daemon. |
 
@@ -761,6 +762,16 @@ harness exports pending their cleanup.
 | `HIPFIRE_ALLOW_MIXED_ARCH=1` | Mixed arch pairs |
 | `HIPFIRE_PP_LAYERS` | Pipeline-parallel band layer counts: `a,b,…` lists the trunk layer count of each band in **logical band order** (the first count is band 0, the first layers; the last count is the last band; it is not the card order), `pp` entries, none zero, summing to the trunk layer count. Read once at admission; unset or empty gives the uniform split (remainder on the first bands). **Flash-Next/Qwen4** (`topology.pp` 2..=8) also needs band 0 to hold at least 2 layers (the PLE layer) and runs the last band on the output card, physical card 0; a bad list is refused naming `topology.pp` and `HIPFIRE_PP_LAYERS`. **Flash-Next/Qwen4 auto-fit:** with the list unset the load keeps the uniform split at the default prefill chunk whenever every card holds it; when a card is short it steps the chunk down (2048, 1024, 512, 256; only rungs below the default) to the largest chunk at which some split fits, takes the most balanced fitting split (lowest maximum required/free, ties to the split closest to uniform) and logs `qwen4 PP auto-fit: layers a,b chunk C (uniform u,v at chunk R short by X MiB on rank r)`. Setting the list pins the split and turns the search off entirely (a short card refuses exactly as before); an explicit `HIPFIRE_PREFILL_CHUNK_ROWS` is never stepped down and only the split is searched. The chunk changes numerics, the split does not. The generic Qwen3.5/3.6 route (`params.pp`) skips the uniform free-VRAM delta check when it is set. See [multi-gpu.md](multi-gpu.md#band-placement-hipfire_pp_layers) and [Per-band memory budget](multi-gpu.md#per-band-memory-budget). |
 | `HIPFIRE_TOPOLOGY_PP` | Compat env for `topology.pp` (experimental; integer `1..=8`, default `1`): the pipeline degree `hipfire run`, `serve` and `bench` send as the load's `pp`. There is **no load-time `--pp` CLI flag** (`hipfire bench --pp` is the prompt-size list). An explicit `params.pp` above `1` on a daemon load wins and this value is not read; a request of `1` or none uses it. An invalid configured value is refused naming `1..=8` only when it is the value in effect. Flash-Next/Qwen4 admits `2..=8` with `tp = ep = 1` and host-staged edges; generic Qwen3.5/3.6 HFQ uses the same degree over peer memcpys. See [multi-gpu.md](multi-gpu.md#flash-next-pipeline-parallelism-host-staged). |
+| `HIPFIRE_TOPOLOGY_HETERO_EXPERTS` | Compat env for `topology.hetero_experts` (experimental; null or `gfx1151`, default null = off): the expert device of the Qwen4 heterogeneous expert split. Requires `hardware.allow_mixed_arch`; refused with `topology.ep`, `topology.pp` or `tp` above `1`. The gfx1151 computes the cold routed experts of decode, MTP verify windows and draft steps, and prefill; see [CONFIG.md](CONFIG.md). |
+| `HIPFIRE_HETERO_DECODE_ROWS` | developer; default `8` | Under `topology.hetero_experts`: the decode slot width (rows of one decode / MTP verify exchange), `8..=64`, read once at load. A lane step whose routed MoE over every row fits it takes one exchange per layer; the mailbox and the expert device's per-row-count graphs grow with it. |
+| `HIPFIRE_HETERO_PREFILL_ROWS` | developer; default `4096` | Under `topology.hetero_experts`: the prefill chunk (and the expert device's prefill slot), whole 256-row steps in `512..=8192`, read once at load. The load's prefill chunk is clamped to it. |
+| `HIPFIRE_HETERO_TILE_ROWS` | developer; unset = the fewest tiles of at most the chunk, never fewer than two | Layer-major hetero prompt tile rows (whole 256-row steps, at least 512). |
+| `HIPFIRE_HETERO_TILES` | developer; default `4` | Most layer-major hetero prompt tiles in flight per window (at least 2, at most the prefill slots). |
+| `HIPFIRE_HETERO_LAYER_MAJOR` | developer; on | `0` keeps the chunk-major hetero prefill (one exchange per layer per chunk, no overlap) instead of the layer-major prompt schedule. |
+| `HIPFIRE_HETERO_DECODE_TRACE` | developer; off | `1`: the gfx1151 responder prints, every 64 decode tokens, its graph-launch time, request-to-response time and the primary's time between layers, and requests by row count. Its response polling pauses serving: diagnostics only. |
+| `HIPFIRE_HETERO_PREFILL_TRACE` | developer; off | `1`: per-window device timing of the hetero prefill exchange (publish, link legs, join) and the layer-major schedule's stages. |
+| `HIPFIRE_HETERO_HOST_TRACE` | developer; off | `1`: host wall time per phase of the layer-major hetero prompt schedule (frame, steps, validate, execute, snapshot, post). |
+| `HIPFIRE_MOE_STAGE_HOST_TRACE` | developer; off | `1`: host enqueue time per sealed MoE stage. |
 | `HIPFIRE_MESH_TRANSPORT` | **Developer-only.** How the admitted pipeline mesh moves each band edge's HC streams; read once at admission, only for Flash-Next (Qwen4) `topology.pp` 2..=8: `auto` (default; also unset or empty), `host` or `peer`. `auto` and `host` are host-staged: two pinned host banks per edge, peer access is never enabled. The decision is per directed edge and made before any allocation or peer enable; there is no runtime fallback. `peer` needs pre-side-effect byte-qualification evidence for every edge; none exists yet, so `peer` is refused at admission naming `topology.pp`, and `auto` resolves to host-staged edges. Any other value is refused (`is not one of auto, peer, host`). The generic Qwen3.5/3.6 PP route does not read it: its band edges are peer memcpys. |
 | `HIPFIRE_PP_PFLASH` / `HIPFIRE_PP_DFLASH` | **Experimental, generic Qwen3.5/3.6 PP only** (`pp>1`; `HIPFIRE_PP_PFLASH` is deprecated with PFlash). `=1` makes the daemon accept a PFlash compose or a DFlash `draft` that it otherwise refuses with `pp>1` (DFlash: cross-card speculative generate is not fully implemented). Neither is an admission, and neither changes Flash-Next PP, which still refuses PFlash and DFlash. |
 | `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB` | Uniform init tolerance |
@@ -937,6 +948,7 @@ Policy owner: [`REDLINE.md`](REDLINE.md) (**shipped / ref-pinned**). Timing is n
 | `HIPFIRE_DETERMINISTIC` | Determinism toggles in dispatch |
 | `HIPFIRE_STREAM_ORDERED_COPIES` | On; `0` off (developer). The blocking copies and fills of steady-state serving (Qwen4 lane top-1 / draft / logits readbacks, head-prologue and lane token-id uploads, lane and state reset memsets, the D2 tail log readback, and the first-request FWHT sign and HC/GDN counter initializers) run on the rank's active stream with one wait on it (`Gpu::dtoh_stream_ordered` / `upload_stream_ordered` / `memset_stream_ordered`), not on the legacy null stream. A blocking null-stream copy puts a packet on the null stream's own hardware queue, and that packet waits for the work queued on the compute stream. In about 1 in 5 fresh EP2 loads the queue mapper put that queue on the same CP pipe as the compute queue. The CP then time-sliced the two queues: 43% of dispatches on that card took 15.4 us instead of 3.1 us, and decode ran 30-35% slower for the life of the process. Same values; `0` restores the null-stream copies. |
 | `HIPFIRE_STEADY_READBACK_PINNED` | On; `0` off (developer, read when the `Gpu` is built). `Gpu::dtoh_stream_ordered` (the Qwen4 lane draft and verify top-1 readbacks) lands its copy in a reusable pinned buffer (64 KiB at first use, grown only for a larger read) with one non-blocking `hipMemcpyAsync` and one stream wait, then copies out, instead of an async copy into the caller's pageable slice (which HIP makes host-blocking through its staging path) followed by a stream wait that still cost ~22 us per readback. Same bytes; kept on the old path during graph capture / replay recording. |
+| `HIPFIRE_VMM_TLB_POKE` | **Auto**: on for gfx1201 cards when the loaded amdgpu is the in-tree module (no `/sys/module/amdgpu/version`), off on other archs and under AMD's amdgpu-dkms (every card when the cards cannot be told before the runtime loads); `1` forces it on every card, `0` disables (developer). After every HIP VMM map (`hipMemSetAccess`) hip-bridge allocates and frees a 4 MiB buffer on each covered device given access. The in-tree amdgpu maps VMM ranges through the GEM VA ioctl without a TLB flush (ROCm/rocm-systems#11693), so GPU work touching new pages right away page-faults (gfx1201: within ~10-50 fresh maps); the KFD unmap of the throwaway buffer waits for the page-table update and flushes the TLB. Measured on gfx1201 (kernel 7.0.1, ROCm 7.2.2): 0 faults in 76,800 grow-and-touch maps. Cost: one KFD alloc/map/unmap/free per map. Soak: `cargo run --release -p hip-bridge --features lab --example vmm_tlb_flush_soak`. |
 | `HIPFIRE_NULL_STREAM_LEDGER=1` | Developer diagnostic. Every HIP call that submits to the legacy null stream (blocking `hipMemcpy` / `hipMemset`, the `*_default` and `stream: None` async variants, a launch, event record or stream wait without a stream) prints `[null-stream] <api> at <file:line> count N` to stderr the first time and at every power of two of its count. Use it to keep the steady-state serving path free of null-stream work. |
 | `HIPFIRE_WEIGHT_SLAB` | `off` \| `2m` \| `16m` (developer, also `[developer] weight_slab`). Packs device-resident weight tensors of at most 2 MiB / 16 MiB into shared slabs (zero-filled, 2 MiB-multiple `hipMalloc`s, 32 / 64 MiB) at their exact size on a 4 KiB boundary, instead of one `hipMalloc` each. ROCr rounds every allocation above 1 MiB up to a multiple of 2 MiB, so a model of thousands of 1-8 MiB tensors loses gigabytes (Raon on a 7900 XTX: 4,758 MiB of 21,624 MiB). Takes effect inside a weight-load scope: single-device carriers (`load_admitted`), Flash-Next ranks (single, EP rank thread, PP band), the Raon weight loader. Not packed: host-mapped/offloaded tensors, VMM/arena paths (KV, Raon mirror, S1 arenas, Flash-Next per-layer expert arenas), DFlash drafter weights, tensors above the threshold, EP/TP/PP loaders outside the Flash-Next rank funnel, and anything under `HIPFIRE_RAILGUN_CHECK`/`HIPFIRE_RAILGUN_DIGEST` recording. A freed weight view is released, never pooled; a slab is returned when its last view is gone (`drain_pool` at unload; `unload_model` reports a slab still held). Output is byte-identical to `off` (same bytes, different addresses). Default `2m` (frees 968 MiB of Raon's 4,758 MiB rounding on the XTX, more than the 550 MiB the chunk-1024 mirror needs, speed within noise on every model measured); `16m` frees 4,412 MiB on Raon but its pp4096 on the R9700 qwen3.8-27B / A3B runs showed a -17% process and a -3.9% mean (n=3, unexplained), so it is opt-in globally; a carrier may set its own unset-env default (`Carrier::weight_slab_default`): Raon loads on gfx1100 take `16m` (the XTX expanded K/V mirror then covers the reserved context instead of falling to the absorbed route past ~12K rows; `hipfire-arch-raon::weights::weight_slab_default`), and an explicit `HIPFIRE_WEIGHT_SLAB` always wins. The mode is resolved per outermost weight-load scope; `off` restores one allocation per tensor. The planned-capacity ledger charges every `hipMalloc` at its ROCr-rounded size (4 KiB up to 1 MiB, 2 MiB above, a slab at its slab bytes) plus a 140 MiB HIP-ring constant, so `own + ring + unledgered` equals the process's fdinfo `drm-memory-vram`. |
 | `HIPFIRE_DS4_DENSE_ACT_DIR` | DeepSeek4 calibration-only dump of P1 projection inputs in `collect_e8_hessian` format; direct evaluator flag `--dump-dense-acts` is preferred. |
@@ -1222,7 +1234,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 2000
+**Count:** 2094
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -1263,7 +1275,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_ALLOW_UNIT_IMATRIX` | crates/hipfire-quantize/src/pipeline.rs | developer |
 | `HIPFIRE_API_KEY` | scripts/lmx_continuous_batch.py | harness |
 | `HIPFIRE_ARCH` | scripts/kernel-tune-loop.sh | harness |
-| `HIPFIRE_ARGMAX_REGRID_PM` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/select_regrid.rs | developer |
+| `HIPFIRE_ARGMAX_REGRID_PM` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_AR_GRAPH` | crates/hipfire-arch-qwen35/examples/mq4_prefill_state_oracle.rs, crates/hipfire-arch-qwen35/examples/shared_weight_state_oracle.rs | experimental |
 | `HIPFIRE_AR_GRAPH_TRACE` | crates/hipfire-arch-qwen35/examples/mq4_prefill_state_oracle.rs, crates/hipfire-arch-qwen35/src/qwen35/forward.rs | developer |
 | `HIPFIRE_ATTENTION_REDUCE_GATED_MQ_AWQ` | crates/rdna-compute/src/kernels.rs | developer |
@@ -1305,7 +1317,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_BIN` | scripts/calibrate_multigpu.sh, scripts/install.sh | harness |
 | `HIPFIRE_BLOB_FORCE` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/dispatch.rs | experimental |
 | `HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE` | crates/rdna-compute/examples/qwen4_moe_sym.rs, crates/rdna-compute/src/kernels.rs | developer |
-| `HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE` | crates/hipfire-kernel-abi/src/families/mq6_i8.rs, crates/rdna-compute/examples/bench_mq3v25_a8.rs | developer |
+| `HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE` | crates/hipfire-kernel-abi/src/families/mq6_i8.rs, crates/peacemaker-isa/tests/hip_twin_gemm_mq6sym_i8.rs | developer |
 | `HIPFIRE_BLOCK_I8_128_QUANT_STANDALONE` | crates/rdna-compute/tests/qwen4_moe_down_a8_hw.rs | harness |
 | `HIPFIRE_BQ1G128_XBATCH` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_BQ1G128_XBATCH_KERNEL` | crates/rdna-compute/src/kernels.rs | developer |
@@ -1673,9 +1685,9 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_EMU_GTT_BYTES` | crates/hipfire-cli/src/emu.rs, crates/hipfire-config/src/emu.rs | developer |
 | `HIPFIRE_EMU_HOST_BYTES` | crates/hipfire-config/src/emu.rs | developer |
 | `HIPFIRE_EMU_HOST_RESERVE_BYTES` | crates/hipfire-config/src/emu.rs | developer |
-| `HIPFIRE_EP_AR_FAST_APPLY` | crates/rdna-compute/src/feature_flags.rs | developer |
+| `HIPFIRE_EP_AR_FAST_APPLY` | crates/rdna-compute/src/ar_hc_write.rs, crates/rdna-compute/src/feature_flags.rs | developer |
 | `HIPFIRE_EP_AR_HOST_GATE` | crates/hipfire-runtime/src/ar_hc_exchange.rs | developer |
-| `HIPFIRE_EP_AR_WIDE_GRID` | crates/rdna-compute/src/feature_flags.rs | developer |
+| `HIPFIRE_EP_AR_WIDE_GRID` | crates/rdna-compute/src/ar_hc_write.rs, crates/rdna-compute/src/feature_flags.rs | developer |
 | `HIPFIRE_EP_AR_WIRE_DENSE` | crates/hipfire-runtime/src/ar_hc_exchange.rs | developer |
 | `HIPFIRE_EP_BALANCED_OWNERS` | crates/hipfire-arch-qwen4/src/ep.rs, crates/hipfire-arch-qwen4/src/expert_ep_units.rs | developer |
 | `HIPFIRE_EP_CHUNK_AUTOFIT` | crates/hipfire-arch-qwen4/src/expert_ep_units.rs, crates/hipfire-arch-qwen4/src/expert_residency.rs | developer |
@@ -1683,15 +1695,15 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_EP_DECODE_TIMING` | crates/hipfire-arch-deepseek4/src/ep.rs, crates/hipfire-arch-minimax/src/forward.rs | developer |
 | `HIPFIRE_EP_DUMP_IDX` | crates/hipfire-arch-deepseek4/src/ep.rs | developer |
 | `HIPFIRE_EP_DUMP_POS` | crates/hipfire-arch-deepseek4/src/ep.rs | developer |
-| `HIPFIRE_EP_ELASTIC_LOG` | crates/hipfire-config/src/lib.rs | developer |
-| `HIPFIRE_EP_ELASTIC_MIB` | crates/hipfire-arch-qwen4/src/lane/pages.rs, crates/hipfire-config/src/lib.rs | developer |
+| `HIPFIRE_EP_ELASTIC_LOG` | crates/hipfire-arch-qwen4/src/expert_unit_tail_rank.rs, crates/hipfire-config/src/lib.rs | developer |
+| `HIPFIRE_EP_ELASTIC_MIB` | crates/hipfire-arch-qwen4/src/ep.rs, crates/hipfire-arch-qwen4/src/lane/pages.rs | developer |
 | `HIPFIRE_EP_EMBED_HOST` | crates/hipfire-loader/src/carriers.rs | developer |
 | `HIPFIRE_EP_EXPERT_STAGE` | crates/hipfire-arch-qwen4/src/expert_ep_units.rs, crates/hipfire-arch-qwen4/src/gpu_forward.rs | developer |
 | `HIPFIRE_EP_FAIL_RANK` | crates/hipfire-loader/src/lib.rs | developer |
 | `HIPFIRE_EP_GATHER_DIRECT` | crates/hipfire-arch-qwen4/examples/bench_ep_gather.rs, crates/hipfire-config/src/lib.rs | developer |
-| `HIPFIRE_EP_HC8_PLAN_CHARGE` | crates/hipfire-config/src/lib.rs, crates/hipfire-loader/src/carriers.rs | developer |
-| `HIPFIRE_EP_HOT_LOAN_MIB` | crates/hipfire-arch-qwen4/src/expert_residency.rs, crates/hipfire-config/src/lib.rs, crates/hipfire-loader/src/carriers.rs | developer |
-| `HIPFIRE_EP_HOT_UNITS` | crates/hipfire-arch-qwen4/src/expert_residency.rs, crates/hipfire-config/src/lib.rs, crates/hipfire-loader/src/carriers.rs | developer |
+| `HIPFIRE_EP_HC8_PLAN_CHARGE` | crates/hipfire-arch-qwen4/src/expert_residency.rs, crates/hipfire-arch-qwen4/src/hc8_sidecar.rs | developer |
+| `HIPFIRE_EP_HOT_LOAN_MIB` | crates/hipfire-arch-qwen4/src/expert_residency.rs, crates/hipfire-config/src/lib.rs | developer |
+| `HIPFIRE_EP_HOT_UNITS` | crates/hipfire-arch-qwen4/src/expert_residency.rs, crates/hipfire-config/src/lib.rs | developer |
 | `HIPFIRE_EP_KV_MODE` | crates/hipfire-runtime/examples/ep_decode_parity.rs | harness |
 | `HIPFIRE_EP_KV_SEQ` | crates/hipfire-runtime/examples/ep_decode_parity.rs | harness |
 | `HIPFIRE_EP_LAB_RESIDENT_LAYERS` | crates/hipfire-arch-qwen4/src/expert_ep_units.rs, crates/hipfire-loader/src/carriers.rs | developer |
@@ -1700,15 +1712,15 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_EP_LANE_COMMIT_TOKENS` | crates/hipfire-arch-qwen4/src/ep.rs | developer |
 | `HIPFIRE_EP_LANE_PREFILL_STAGE_MIN_ROWS` | crates/hipfire-arch-qwen4/src/gpu_forward.rs | developer |
 | `HIPFIRE_EP_LANE_PREFILL_WAVE_EXACT` | crates/hipfire-arch-qwen4/src/gpu_forward/ep_wave.rs, crates/hipfire-arch-qwen4/src/lane_exec.rs | developer |
-| `HIPFIRE_EP_LANE_PREFILL_WAVE_JOINT` | crates/hipfire-arch-qwen4/src/gpu_forward/ep_wave.rs | developer |
+| `HIPFIRE_EP_LANE_PREFILL_WAVE_JOINT` | crates/hipfire-arch-qwen4/src/gpu_forward/ep_wave.rs, crates/hipfire-arch-qwen4/src/gpu_forward_lanes.rs | developer |
 | `HIPFIRE_EP_LANE_PREFILL_WAVE_MIN_ROWS` | crates/hipfire-arch-qwen4/src/gpu_forward/ep_wave.rs | developer |
 | `HIPFIRE_EP_LANE_PREFILL_WAVE_SHARD` | crates/hipfire-arch-qwen4/src/gpu_forward/ep_wave.rs | developer |
 | `HIPFIRE_EP_LANE_PREFILL_WAVE_SMALL_LANES` | crates/hipfire-arch-qwen4/src/gpu_forward/ep_wave.rs | developer |
 | `HIPFIRE_EP_LANE_PREFILL_WAVE_TILE` | crates/hipfire-arch-qwen4/src/gpu_forward/ep_wave.rs | developer |
-| `HIPFIRE_EP_MTP_EXPERTS_RESIDENT` | crates/hipfire-config/src/lib.rs, crates/hipfire-loader/src/carriers.rs | developer |
+| `HIPFIRE_EP_MTP_EXPERTS_RESIDENT` | crates/hipfire-arch-qwen4/src/expert_ep_units.rs, crates/hipfire-arch-qwen4/src/expert_residency.rs | developer |
 | `HIPFIRE_EP_MTP_LANES` | crates/hipfire-arch-qwen4/src/ep_reserve.rs, crates/hipfire-daemon/src/main.rs | developer |
-| `HIPFIRE_EP_MTP_LANE_COPY` | crates/hipfire-arch-qwen4/src/ep.rs, crates/hipfire-arch-qwen4/tests/common/lane_suite.rs | developer |
-| `HIPFIRE_EP_MTP_LANE_K` | crates/hipfire-arch-qwen4/src/ep.rs, crates/hipfire-arch-qwen4/src/lane_switch.rs | developer |
+| `HIPFIRE_EP_MTP_LANE_COPY` | crates/hipfire-arch-qwen4/src/ep.rs, crates/hipfire-arch-qwen4/tests/common/lane_ep.rs | developer |
+| `HIPFIRE_EP_MTP_LANE_K` | crates/hipfire-arch-qwen4/src/ep.rs, crates/hipfire-arch-qwen4/src/lane.rs | developer |
 | `HIPFIRE_EP_MTP_LANE_MAX_ACTIVE` | crates/hipfire-arch-qwen4/src/lane_switch.rs, crates/hipfire-arch-qwen4/tests/common/lane_ep.rs | developer |
 | `HIPFIRE_EP_MTP_LANE_NATIVE_ALL` | crates/hipfire-arch-qwen4/src/lane_switch.rs | developer |
 | `HIPFIRE_EP_MTP_RESERVE_SHARE` | crates/hipfire-arch-qwen4/src/ep.rs, crates/hipfire-arch-qwen4/src/ep_reserve.rs | developer |
@@ -1726,10 +1738,10 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_EP_RESERVE_RECEIPT` | crates/hipfire-arch-qwen4/src/bundle.rs, crates/hipfire-arch-qwen4/src/ep.rs | developer |
 | `HIPFIRE_EP_RESERVE_RECEIPT_HASH` | crates/hipfire-arch-qwen4/src/gpu_forward/ep_reserve_forward.rs | developer |
 | `HIPFIRE_EP_SHARE_HOST` | crates/hipfire-config/src/lib.rs | developer |
-| `HIPFIRE_EP_SKEW_LOG` | crates/hipfire-arch-qwen4/src/expert_unit_tail_rank.rs | developer |
+| `HIPFIRE_EP_SKEW_LOG` | crates/hipfire-arch-qwen4/src/expert_hot_units.rs, crates/hipfire-arch-qwen4/src/expert_unit_tail_rank.rs | developer |
 | `HIPFIRE_EP_SKIP_ALLREDUCE` | crates/hipfire-arch-qwen35/src/qwen35/ep_batch.rs | developer |
-| `HIPFIRE_EP_TAIL_LOG_DIRECT` | crates/hipfire-arch-qwen4/src/expert_unit_tail.rs | developer |
-| `HIPFIRE_EP_TRUNK_BALANCED_OWNERS` | crates/hipfire-arch-qwen4/src/gpu_forward.rs, crates/hipfire-arch-qwen4/src/gpu_forward_lanes.rs | developer |
+| `HIPFIRE_EP_TAIL_LOG_DIRECT` | crates/hipfire-arch-qwen4/src/expert_unit_tail.rs, crates/hipfire-arch-qwen4/src/expert_unit_tail_rank.rs | developer |
+| `HIPFIRE_EP_TRUNK_BALANCED_OWNERS` | crates/hipfire-arch-qwen4/src/ep_mesh_lanes.rs, crates/hipfire-arch-qwen4/src/ep_mesh_lanes/tests.rs | developer |
 | `HIPFIRE_EP_TRUNK_SPLIT` | crates/hipfire-arch-qwen4/src/ep.rs, crates/hipfire-arch-qwen4/src/ep_trunk_split.rs | developer |
 | `HIPFIRE_EP_UNIT_BUDGET_DELTA_MIB` | crates/hipfire-arch-qwen4/src/expert_ep_units.rs, crates/hipfire-arch-qwen4/src/expert_unit_tail.rs | developer |
 | `HIPFIRE_EP_UNIT_DONORS` | crates/hipfire-loader/src/carriers.rs | developer |
@@ -1739,8 +1751,8 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_EP_UNIT_RESERVE_SHADOWS` | crates/hipfire-loader/src/carriers.rs | developer |
 | `HIPFIRE_EP_UNIT_STAGE_BORROW` | crates/hipfire-arch-qwen4/src/expert_ep_units.rs, crates/hipfire-arch-qwen4/src/gpu_forward/slab_stage.rs | developer |
 | `HIPFIRE_EP_UNIT_TAIL` | crates/hipfire-arch-qwen4/src/ep.rs, crates/hipfire-arch-qwen4/src/expert_unit_tail.rs | developer |
+| `HIPFIRE_EP_UNIT_TAIL_FILL_OVERLAP` | crates/hipfire-arch-qwen4/src/expert_unit_tail.rs, crates/hipfire-arch-qwen4/src/expert_unit_tail_rank.rs | developer |
 | `HIPFIRE_EP_UNIT_TAIL_FREEZE` | crates/hipfire-arch-qwen4/src/expert_unit_tail.rs | developer |
-| `HIPFIRE_EP_UNIT_TAIL_FILL_OVERLAP` | crates/hipfire-arch-qwen4/src/expert_unit_tail.rs | developer |
 | `HIPFIRE_EP_UNIT_TAIL_LOG` | crates/hipfire-arch-qwen4/src/expert_unit_tail.rs | developer |
 | `HIPFIRE_EP_UNIT_TAIL_PEER` | crates/hipfire-arch-qwen4/src/ep.rs, crates/hipfire-arch-qwen4/src/expert_unit_tail.rs | developer |
 | `HIPFIRE_EP_UNIT_TAIL_PEER_RESERVE` | crates/hipfire-arch-qwen4/src/expert_unit_tail.rs, crates/hipfire-arch-qwen4/src/expert_unit_tail/differential.rs | developer |
@@ -1765,7 +1777,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_FA2_QRESIDENT` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_FA2_QRESIDENT_V2` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_FA2_QRESIDENT_V2_Q8` | crates/rdna-compute/examples/fa_pm_fp8_oracle.rs, crates/rdna-compute/src/kernel_registry.rs | developer |
-| `HIPFIRE_FA2_QRESIDENT_V2_Q8_A3B` | crates/rdna-compute/examples/fa_pm_fp8_oracle.rs, crates/rdna-compute/src/kernel_registry.rs | developer |
+| `HIPFIRE_FA2_QRESIDENT_V2_Q8_A3B` | crates/peacemaker-isa/src/kernels/fa_qresident.rs, crates/rdna-compute/examples/fa_pm_fp8_oracle.rs | developer |
 | `HIPFIRE_FA2_SPLIT_LSE_FP8` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_FABRIC_ADMISSION` | crates/hipfire-arch-qwen35/src/carrier.rs, crates/hipfire-arch-qwen4/tests/common/lane_run.rs | developer |
 | `HIPFIRE_FAST_SAMPLE` | crates/hipfire-generate/src/ar.rs, crates/hipfire-generate/src/batch.rs | developer |
@@ -1887,7 +1899,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_GDN_BLK` | crates/rdna-compute/src/norm.rs | developer |
 | `HIPFIRE_GDN_BLOCK_SIZE` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_GDN_CHUNKED` | crates/rdna-compute/src/kernels.rs, crates/rdna-compute/src/norm.rs | developer |
-| `HIPFIRE_GDN_CHUNK_PM` | crates/rdna-compute/src/gated_delta_chunk_pm.rs | developer |
+| `HIPFIRE_GDN_CHUNK_PM` | crates/rdna-compute/src/gated_delta_chunk_pm.rs, crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_GDN_CHUNK_PREP_PM` | crates/hipfire-config/src/lib.rs, crates/hipfire-dispatch/src/pipeline/batched_deltanet.rs | developer |
 | `HIPFIRE_GDN_CHUNK_SIZE` | crates/rdna-compute/src/norm.rs | developer |
 | `HIPFIRE_GDN_COMPACT2` | crates/hipfire-dispatch/src/pipeline/hybrid.rs | developer |
@@ -2137,6 +2149,14 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_HALO_TUNE_STATE` | docker/hipfire-halo-tune.sh | harness |
 | `HIPFIRE_HAVE_2_GPU` | crates/hipfire-arch-qwen35/tests/pp_parity.rs, crates/hipfire-arch-qwen35/tests/route_oracle_mesh.rs | harness |
 | `HIPFIRE_HC_CTRL_T1024` | crates/rdna-compute/src/attention.rs, scripts/analysis/ds4-gfx1151-roofline/hcctrl.sh | developer |
+| `HIPFIRE_HETERO_DECODE_ROWS` | crates/hipfire-arch-qwen4/src/gpu_forward_lanes.rs, crates/hipfire-arch-qwen4/src/hetero.rs | developer |
+| `HIPFIRE_HETERO_DECODE_TRACE` | crates/hipfire-dispatch/src/hetero_responder.rs | developer |
+| `HIPFIRE_HETERO_HOST_TRACE` | crates/hipfire-arch-qwen4/src/slowlink_prefill.rs | developer |
+| `HIPFIRE_HETERO_LAYER_MAJOR` | crates/hipfire-arch-qwen4/src/hetero.rs | developer |
+| `HIPFIRE_HETERO_PREFILL_ROWS` | crates/hipfire-arch-qwen4/src/hetero.rs | developer |
+| `HIPFIRE_HETERO_PREFILL_TRACE` | crates/hipfire-arch-qwen4/src/slowlink_prefill.rs, crates/hipfire-dispatch/src/hetero_device.rs | developer |
+| `HIPFIRE_HETERO_TILES` | crates/hipfire-arch-qwen4/src/hetero.rs | developer |
+| `HIPFIRE_HETERO_TILE_ROWS` | crates/hipfire-arch-qwen4/src/hetero.rs | developer |
 | `HIPFIRE_HFQ` | benchmarks/vision/run_bench.sh | harness |
 | `HIPFIRE_HFQ3_DP4A` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/examples/verify_hfq3_batched.rs | experimental |
 | `HIPFIRE_HFQ3_MMQ` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/examples/bench_hfq3_mmq_sweep.rs | experimental |
@@ -2174,6 +2194,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_HOST_SITE_LEDGER` | crates/hip-bridge/src/site_ledger.rs | developer |
 | `HIPFIRE_HOST_TIMING` | crates/hipfire-generate/src/qwen.rs, crates/hipfire-runtime/examples/dflash_spec_demo.rs | developer |
 | `HIPFIRE_IDLE_TIMEOUT` | crates/hipfire-config/src/lib.rs | stable |
+| `HIPFIRE_IGPU_ARM_TRACE` | crates/hipfire-dispatch/src/igpu_split.rs | developer |
 | `HIPFIRE_IMAGE` | scripts/container-gate.sh | harness |
 | `HIPFIRE_IMAGE_DECODE` | crates/hipfire-arch-qwen35-vl/src/image.rs, crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_IMG_COND_CACHE` | crates/hipfire-arch-diffusion/src/pipeline.rs, crates/hipfire-generate/src/img.rs | developer |
@@ -2203,7 +2224,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_KLD_TEACHER` | benchmarks/quality-baselines/harness/spe_ablation.sh | harness |
 | `HIPFIRE_KV` | crates/saddle-lab/examples/oracle_xcheck.rs | harness |
 | `HIPFIRE_KV_ADAPTIVE` | crates/hipfire-arch-qwen35/src/carrier.rs, crates/hipfire-config/src/lib.rs | stable |
-| `HIPFIRE_KV_BACKEND` | crates/hipfire-loader/src/admission.rs, scripts/guard_gfx1201_baseline.py | developer |
+| `HIPFIRE_KV_BACKEND` | crates/hipfire-arch-qwen4/examples/qwen4_cpu_split_parity.rs, crates/hipfire-arch-qwen4/examples/qwen4_kld.rs | developer |
 | `HIPFIRE_KV_BF16` | crates/hipfire-dispatch/src/families/attention.rs, crates/hipfire-dispatch/src/families/kv_tier.rs | developer |
 | `HIPFIRE_KV_FP8_E4M3` | crates/hipfire-runtime/src/kv_mode.rs, crates/rdna-compute/src/attention.rs | developer |
 | `HIPFIRE_KV_MODE` | benchmarks/scripts/bench_pp_gfx906.sh, benchmarks/scripts/mq4v2_k5120_gfx1201_validate.sh | stable; `asymN`/`turbo*` values deprecated, removal 0.5.0 |
@@ -2221,11 +2242,11 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_LANE_ADMIT_COALESCE_MS` | crates/hipfire-generate/src/fn_batch.rs | developer |
 | `HIPFIRE_LANE_EARLY_FIRST_TOKEN` | crates/hipfire-generate/src/fn_batch.rs | developer |
 | `HIPFIRE_LANE_FIRST_TOKEN_BEFORE_MESH` | crates/hipfire-generate/src/fn_batch.rs | developer |
-| `HIPFIRE_LANE_RESET_BATCH` | crates/rdna-compute/src/feature_flags.rs | developer |
 | `HIPFIRE_LANE_PROJ_COLGROUP` | crates/rdna-compute/examples/hip_loop.rs | harness |
 | `HIPFIRE_LANE_PROJ_KERNEL` | crates/rdna-compute/src/lane_proj.rs | developer |
 | `HIPFIRE_LANE_PROJ_ROWS` | crates/rdna-compute/src/lane_proj.rs | developer |
 | `HIPFIRE_LANE_PROJ_WAVES` | crates/rdna-compute/src/lane_proj.rs | developer |
+| `HIPFIRE_LANE_RESET_BATCH` | crates/hipfire-arch-qwen4/src/state.rs, crates/rdna-compute/src/dispatch.rs | developer |
 | `HIPFIRE_LDS_EPI_DIRECT` | crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_LEV_EMU_CAPTURE` | crates/hipfire-runtime/tests/x1_lane_draw_shard_gpu.rs, crates/hipfire-runtime/tests/x1_lane_draw_twin/mod.rs | harness |
 | `HIPFIRE_LFM2_CAPTURE_POSTMIXER` | crates/hipfire-arch-lfm2moe/examples/dump_lfm2moe_hidden_states.rs, crates/hipfire-arch-lfm2moe/src/forward.rs | developer |
@@ -2370,6 +2391,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_MOE_ROUTE_DUMP` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs, crates/hipfire-arch-qwen4/src/gpu_forward.rs | developer |
 | `HIPFIRE_MOE_SHARED_DOWN_SIGMOID_EPI` | crates/hipfire-config/src/intent.rs, crates/hipfire-config/src/lib.rs | developer |
 | `HIPFIRE_MOE_SHARED_PREPARED_IU4` | crates/hipfire-config/src/intent.rs, crates/hipfire-config/src/lib.rs | developer |
+| `HIPFIRE_MOE_STAGE_HOST_TRACE` | crates/hipfire-dispatch/src/pipeline/moe_program.rs | developer |
 | `HIPFIRE_MOE_SYM_IU4` | crates/hipfire-arch-qwen35/src/qwen35/load.rs, crates/hipfire-arch-qwen35/src/qwen35/weights.rs | developer |
 | `HIPFIRE_MOE_TIER_MAP` | crates/hipfire-quantize/src/pipeline.rs | developer |
 | `HIPFIRE_MQ` | crates/rdna-compute/src/gemm.rs | developer |
@@ -2459,7 +2481,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_MTP_K` | crates/hipfire-arch-qwen4/examples/qwen4_wide_cost/production.rs, crates/hipfire-arch-qwen4/tests/mtp_takeover_fill_hw.rs | stable |
 | `HIPFIRE_MTP_MODE` | crates/hipfire-arch-qwen4/examples/qwen4_wide_cost/production.rs, crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_MTP_NGRAM` | crates/hipfire-arch-qwen35/tests/mtp_takeover_fill.rs, crates/hipfire-arch-qwen4/tests/greedy_mtp_identity_hw.rs | stable |
-| `HIPFIRE_MTP_NGRAM_COPY` | crates/hipfire-arch-qwen4/examples/qwen4_wide_verify.rs, crates/hipfire-arch-qwen4/tests/common/lane_suite.rs | stable |
+| `HIPFIRE_MTP_NGRAM_COPY` | crates/hipfire-arch-qwen4/examples/qwen4_wide_verify.rs, crates/hipfire-arch-qwen4/tests/common/lane_ep.rs | stable |
 | `HIPFIRE_MTP_NGRAM_K` | scripts/serve_harness.py | harness |
 | `HIPFIRE_MTP_OWN_PREFILL` | crates/hipfire-arch-qwen35/src/mtp_spec.rs, crates/hipfire-arch-qwen35/src/mtp_speculator.rs | developer |
 | `HIPFIRE_MTP_PHASE_TIMING` | crates/hipfire-arch-qwen35/src/mtp_cb.rs, crates/hipfire-arch-qwen35/src/mtp_spec.rs | developer |
@@ -2535,7 +2557,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_PLE_LOAD_FILL_BYTES` | crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_PLE_PREWARM_BYTES` | crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_PM4_KERNARG_POOL` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/replay.rs | experimental |
-| `HIPFIRE_PMSCRATCH_PM4_SCRATCH` | crates/rdna-compute/src/replay.rs | developer |
+| `HIPFIRE_PMSCRATCH_PM4_SCRATCH` | crates/rdna-compute/src/replay.rs, tools/redline/serve_identity_ab.py | developer |
 | `HIPFIRE_PM_DECODE` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/examples/draft_lane_rows_oracle.rs | experimental |
 | `HIPFIRE_PM_TUNE_TABLE` | crates/pm-census/src/tune/mod.rs, crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_PORT` | crates/hipfire-config/src/lib.rs | stable |
@@ -2664,30 +2686,30 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_QWEN4_DEV_REPORT` | crates/hipfire-arch-qwen4/tests/dev_mtp_hw.rs, crates/hipfire-arch-qwen4/tests/dev_profiles_hw.rs | harness |
 | `HIPFIRE_QWEN4_DIRECT_LOAD` | crates/hipfire-config/src/lib.rs, crates/hipfire-loader/src/carriers.rs | developer |
 | `HIPFIRE_QWEN4_DRAFT_GLUE_FOLD` | crates/hipfire-arch-qwen4/src/mtp_gpu.rs, crates/hipfire-arch-qwen4/src/mtp_gpu/rows.rs | developer |
-| `HIPFIRE_QWEN4_DRAFT_TOPK8_ROWS` | crates/rdna-compute/src/feature_flags.rs | developer |
-| `HIPFIRE_QWEN4_EP` | crates/hipfire-arch-qwen4/src/mtp_spec.rs, crates/hipfire-arch-qwen4/src/weights/trunk_shard.rs | developer |
 | `HIPFIRE_QWEN4_DRAFT_SHARDED_MOE` | crates/hipfire-arch-qwen4/src/ep_mesh_lanes.rs, crates/hipfire-arch-qwen4/src/mtp_gpu.rs | developer |
-| `HIPFIRE_QWEN4_EP_DRAFT_SPLIT` | crates/hipfire-arch-qwen4/src/ep_mesh_lanes.rs, crates/hipfire-arch-qwen4/src/mesh_lane_protocol.rs | developer |
-| `HIPFIRE_QWEN4_EP_DRAFT_VOCAB_SHARD` | crates/hipfire-arch-qwen4/src/ep_vocab_shard.rs | developer |
+| `HIPFIRE_QWEN4_DRAFT_TOPK8_ROWS` | crates/hipfire-dispatch/src/pipeline/draft_head.rs, crates/hipfire-kernel-abi/src/families/qwen4_topk8_rows.rs | developer |
+| `HIPFIRE_QWEN4_EP` | crates/hipfire-arch-qwen4/src/mtp_spec.rs, crates/hipfire-arch-qwen4/src/weights/trunk_shard.rs | developer |
+| `HIPFIRE_QWEN4_EP_DRAFT_SPLIT` | crates/hipfire-arch-qwen4/src/bundle.rs, crates/hipfire-arch-qwen4/src/ep.rs | developer |
+| `HIPFIRE_QWEN4_EP_DRAFT_VOCAB_SHARD` | crates/hipfire-arch-qwen4/src/bundle.rs, crates/hipfire-arch-qwen4/src/ep.rs | developer |
 | `HIPFIRE_QWEN4_EP_EXPERT_HOTSET` | crates/hipfire-arch-qwen4/src/artifact.rs, crates/hipfire-arch-qwen4/src/bundle.rs | developer |
 | `HIPFIRE_QWEN4_EP_GATHER_DEVICE_WAIT` | crates/hipfire-arch-qwen4/src/ep.rs | developer |
 | `HIPFIRE_QWEN4_EP_LANE_AR_FLOOR` | crates/hipfire-arch-qwen4/src/mtp_lanes.rs | developer |
 | `HIPFIRE_QWEN4_EP_LONE_MTP_LANE` | crates/hipfire-generate/src/batch.rs | developer |
-| `HIPFIRE_QWEN4_EP_PMASK_IMPLICIT_ZERO` | crates/rdna-compute/src/feature_flags.rs | developer |
+| `HIPFIRE_QWEN4_EP_PMASK_IMPLICIT_ZERO` | crates/hipfire-dispatch/src/pipeline/qt44_qt53_prefill.rs, crates/rdna-compute/src/feature_flags.rs | developer |
 | `HIPFIRE_QWEN4_EP_PMASK_IMPLICIT_ZERO_POISON` | crates/rdna-compute/src/feature_flags.rs | developer |
 | `HIPFIRE_QWEN4_EP_SAMPLED_WIDE_VERIFY` | crates/hipfire-arch-qwen4/src/ep_mesh_serve.rs, crates/hipfire-arch-qwen4/src/gpu_forward.rs | developer |
 | `HIPFIRE_QWEN4_EP_SEQ_PARALLEL` | crates/hipfire-arch-qwen4/src/ep.rs, crates/hipfire-arch-qwen4/src/gpu_forward.rs | developer |
 | `HIPFIRE_QWEN4_EP_SP_INDEXER` | crates/hipfire-arch-qwen4/src/gpu_forward.rs, crates/hipfire-arch-qwen4/src/trunk_route.rs | developer |
 | `HIPFIRE_QWEN4_EP_SP_SUB512` | crates/hipfire-arch-qwen4/src/gpu_forward.rs, crates/hipfire-arch-qwen4/src/trunk_route.rs | developer |
 | `HIPFIRE_QWEN4_EP_SP_SUB512_WAVE` | crates/hipfire-arch-qwen4/src/gpu_forward_lanes.rs, crates/hipfire-arch-qwen4/src/trunk_route.rs | developer |
-| `HIPFIRE_QWEN4_EP_TAIL_BORROW` | crates/hipfire-arch-qwen4/src/gpu_forward/ep_tail_borrow.rs, crates/hipfire-loader/src/carriers.rs | developer |
+| `HIPFIRE_QWEN4_EP_TAIL_BORROW` | crates/hipfire-arch-qwen4/src/bundle.rs, crates/hipfire-arch-qwen4/src/ep.rs | developer |
 | `HIPFIRE_QWEN4_EP_TAIL_BORROW_LOG` | crates/hipfire-arch-qwen4/src/gpu_forward/ep_tail_borrow.rs | developer |
 | `HIPFIRE_QWEN4_EP_TAIL_BORROW_VERIFY` | crates/hipfire-arch-qwen4/src/gpu_forward/ep_tail_borrow.rs | developer |
 | `HIPFIRE_QWEN4_EP_TRANSPORT` | crates/hipfire-runtime/examples/ep_transport_oracle.rs | harness |
 | `HIPFIRE_QWEN4_EP_TRUNK_SHARD` | crates/hipfire-arch-qwen4/examples/qwen4_ep_kld.rs, crates/hipfire-arch-qwen4/examples/trunk_shard_layer_oracle.rs | developer |
 | `HIPFIRE_QWEN4_EP_TRUNK_SHARD_MTP` | crates/hipfire-arch-qwen4/src/weights/trunk_shard.rs | developer |
-| `HIPFIRE_QWEN4_EP_TRUNK_SHARD_PMASK` | crates/hipfire-arch-qwen4/src/gpu_forward.rs, crates/hipfire-arch-qwen4/src/gpu_forward/ep_wave.rs | developer |
-| `HIPFIRE_QWEN4_EP_VOCAB_SHARD` | crates/hipfire-arch-qwen4/src/ep_vocab_shard.rs | developer |
+| `HIPFIRE_QWEN4_EP_TRUNK_SHARD_PMASK` | crates/hipfire-arch-qwen4/src/gpu_forward.rs, crates/hipfire-arch-qwen4/src/gpu_forward/ep_reserve_forward.rs | developer |
+| `HIPFIRE_QWEN4_EP_VOCAB_SHARD` | crates/hipfire-arch-qwen4/src/ep.rs, crates/hipfire-arch-qwen4/src/ep_mesh_lanes.rs | developer |
 | `HIPFIRE_QWEN4_EP_WIDE_VERIFY` | crates/hipfire-arch-qwen4/examples/qwen4_ep_kld.rs, crates/hipfire-arch-qwen4/src/gpu_forward.rs | developer |
 | `HIPFIRE_QWEN4_EP_WIDE_VERIFY_ALL_LANES` | crates/hipfire-config/src/lib.rs, crates/hipfire-loader/examples/fn_wide_kl_oracle.rs | developer |
 | `HIPFIRE_QWEN4_EP_WIDE_VERIFY_ROWS` | crates/hipfire-arch-qwen4/examples/qwen4_ep_kld.rs, crates/hipfire-arch-qwen4/src/gpu_forward.rs | developer |
@@ -2703,8 +2725,8 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS` | crates/hip-bridge/src/ffi.rs, crates/hipfire-arch-qwen4/examples/fn_lane_oracle.rs | developer |
 | `HIPFIRE_QWEN4_F16_WMMA` | crates/hipfire-arch-qwen4/examples/qwen4_qsa_arena_check.rs, crates/hipfire-arch-qwen4/examples/qwen4_qsa_ctx.rs | developer |
 | `HIPFIRE_QWEN4_F16_WMMA_GFX1201` | crates/hipfire-arch-qwen4/examples/qwen4_placement_receipt.rs, crates/rdna-compute/examples/bench_qwen4_hc_wmma.rs | developer |
-| `HIPFIRE_QWEN4_FFN_CLEAR_ABSORB` | crates/rdna-compute/src/feature_flags.rs | developer |
-| `HIPFIRE_QWEN4_FFN_CLEAR_ABSORB_ROWS` | crates/rdna-compute/src/feature_flags.rs | developer |
+| `HIPFIRE_QWEN4_FFN_CLEAR_ABSORB` | crates/hipfire-dispatch/src/pipeline/moe_program.rs, crates/hipfire-dispatch/src/pipeline/qt44_qt53_prefill.rs | developer |
+| `HIPFIRE_QWEN4_FFN_CLEAR_ABSORB_ROWS` | crates/hipfire-dispatch/src/pipeline/moe_program.rs, crates/hipfire-dispatch/src/pipeline/qt44_qt53_prefill.rs | developer |
 | `HIPFIRE_QWEN4_GDN_CAPTURE_DIRECT` | crates/hipfire-arch-qwen4/src/gpu_forward_lanes.rs, crates/hipfire-dispatch/src/pipeline/layer_ops.rs | developer |
 | `HIPFIRE_QWEN4_GDN_CHAIN_FUSE` | crates/hipfire-dispatch/src/pipeline/layer_ops.rs, crates/rdna-compute/src/feature_flags.rs | developer |
 | `HIPFIRE_QWEN4_GDN_CONV_QKNORM` | crates/hipfire-dispatch/src/pipeline/layer_ops.rs, crates/rdna-compute/src/feature_flags.rs | developer |
@@ -2716,15 +2738,15 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_QWEN4_GDN_PREFILL` | crates/hipfire-arch-qwen4/examples/fn_prefill_g0.rs, crates/rdna-compute/examples/gdn_wy_repeat_check.rs | developer |
 | `HIPFIRE_QWEN4_GDN_Q8_INLINE` | crates/hipfire-arch-qwen4/src/state.rs, crates/rdna-compute/src/feature_flags.rs | developer |
 | `HIPFIRE_QWEN4_GDN_QKV_BF16` | crates/hipfire-arch-qwen4/src/gpu_forward_lanes.rs, crates/hipfire-dispatch/src/pipeline/layer_ops.rs | developer |
-| `HIPFIRE_QWEN4_HC8` | crates/hipfire-arch-qwen4/examples/qwen4_kld.rs, crates/rdna-compute/src/dispatch.rs | developer |
+| `HIPFIRE_QWEN4_HC8` | crates/hipfire-arch-qwen4/examples/qwen4_kld.rs, crates/hipfire-arch-qwen4/src/hc8_sidecar.rs | developer |
 | `HIPFIRE_QWEN4_HC_DOWN_FUSED` | crates/railgun-cert/src/recording.rs, crates/rdna-compute/examples/hc_down_fused_bench.rs | developer |
 | `HIPFIRE_QWEN4_HC_DOWN_TILE` | crates/railgun-cert/src/recording.rs, crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_QWEN4_HC_FUSE` | crates/hipfire-arch-qwen4/examples/trunk_shard_layer_oracle.rs, crates/hipfire-arch-qwen4/src/lab_trunk_oracle.rs | developer |
-| `HIPFIRE_QWEN4_HC_K4_ALLROWS` | crates/rdna-compute/examples/bf16_allrows_oracle.rs, crates/rdna-compute/src/feature_flags.rs | developer |
+| `HIPFIRE_QWEN4_HC_K4_ALLROWS` | crates/hipfire-arch-qwen4/examples/hc_pair_decode_oracle.rs, crates/rdna-compute/examples/bf16_allrows_oracle.rs | developer |
 | `HIPFIRE_QWEN4_HC_MIX_FILL80_GFX1100` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemm.rs | developer |
-| `HIPFIRE_QWEN4_HC_PAIR_ALLROWS` | crates/rdna-compute/src/feature_flags.rs | developer |
-| `HIPFIRE_QWEN4_HC_PAIR_WIDE` | crates/rdna-compute/src/feature_flags.rs | developer |
+| `HIPFIRE_QWEN4_HC_PAIR_ALLROWS` | crates/hipfire-dispatch/src/pipeline/layer_ops.rs, crates/rdna-compute/src/feature_flags.rs | developer |
 | `HIPFIRE_QWEN4_HC_PAIR_DECODE` | crates/hipfire-arch-qwen4/examples/hc_pair_decode_oracle.rs, crates/hipfire-dispatch/src/pipeline/layer_ops.rs | developer |
+| `HIPFIRE_QWEN4_HC_PAIR_WIDE` | crates/hipfire-arch-qwen4/examples/hc_pair_decode_oracle.rs, crates/hipfire-dispatch/src/pipeline/layer_ops.rs | developer |
 | `HIPFIRE_QWEN4_HC_ROW_FOLD` | crates/hipfire-dispatch/src/pipeline/layer_ops.rs, crates/hipfire-dispatch/src/pipeline/moe_program.rs | developer |
 | `HIPFIRE_QWEN4_HC_UP_ROT` | crates/railgun-cert/src/recording.rs, crates/rdna-compute/src/tensor_ops.rs | developer |
 | `HIPFIRE_QWEN4_HC_UP_T1` | crates/rdna-compute/src/tensor_ops.rs | developer |
@@ -2737,49 +2759,49 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_QWEN4_LANE_ALLROWS_EXACT` | crates/hipfire-arch-qwen4/src/gpu_forward_lanes.rs, crates/rdna-compute/src/feature_flags.rs | developer |
 | `HIPFIRE_QWEN4_LANE_ALLROWS_MOE` | crates/hipfire-arch-qwen4/src/gpu_forward.rs, crates/hipfire-arch-qwen4/src/gpu_forward_lanes.rs | developer |
 | `HIPFIRE_QWEN4_LANE_APPEND_SHARE` | crates/hipfire-arch-qwen4/src/expert_residency.rs, crates/hipfire-arch-qwen4/src/lane.rs | developer |
-| `HIPFIRE_QWEN4_LANE_COMMIT_FILL` | crates/hipfire-arch-qwen4/src/mtp_lanes.rs | developer |
-| `HIPFIRE_QWEN4_LANE_COPY_LANES` | crates/hipfire-arch-qwen4/src/ep.rs | developer |
+| `HIPFIRE_QWEN4_LANE_COMMIT_FILL` | crates/hipfire-arch-qwen4/src/mtp_lanes.rs, crates/hipfire-arch-qwen4/src/mtp_spec.rs | developer |
+| `HIPFIRE_QWEN4_LANE_COPY_LANES` | crates/hipfire-arch-qwen4/src/ep.rs, crates/hipfire-arch-qwen4/tests/common/lane_ep.rs | developer |
 | `HIPFIRE_QWEN4_LANE_COST` | crates/hipfire-arch-qwen4/src/lane_switch.rs, crates/hipfire-arch-qwen4/src/mtp_lanes.rs | developer |
 | `HIPFIRE_QWEN4_LANE_COST_TRACE` | crates/hipfire-arch-qwen4/src/mtp_lanes.rs | developer |
-| `HIPFIRE_QWEN4_LANE_DEVICE_SAMPLE` | crates/rdna-compute/src/feature_flags.rs | developer |
-| `HIPFIRE_QWEN4_LANE_HC_ALLROWS` | crates/hipfire-arch-qwen4/src/gpu_forward_lanes.rs, crates/hipfire-dispatch/examples/hc_allrows_oracle.rs | developer |
+| `HIPFIRE_QWEN4_LANE_DEVICE_SAMPLE` | crates/hipfire-arch-qwen4/src/ep_mesh_lanes.rs, crates/hipfire-arch-qwen4/src/ep_mesh_lanes/tests.rs | developer |
+| `HIPFIRE_QWEN4_LANE_HC_ALLROWS` | crates/hipfire-arch-qwen4/examples/lane_hc8_rows_oracle.rs, crates/hipfire-arch-qwen4/src/gpu_forward_lanes.rs | developer |
 | `HIPFIRE_QWEN4_LANE_LAB_ROUTES` | crates/hipfire-arch-qwen4/src/lane.rs | developer |
 | `HIPFIRE_QWEN4_LANE_MEASURED_DEPTH` | crates/hipfire-arch-qwen4/src/mtp_lanes.rs | developer |
 | `HIPFIRE_QWEN4_LANE_PAGE_BUDGET` | crates/hipfire-arch-qwen4/src/lane/pages.rs, crates/hipfire-config/src/lib.rs | developer |
 | `HIPFIRE_QWEN4_LANE_PAGE_BUDGET_COLD_MIB` | crates/hipfire-config/src/lib.rs | developer |
 | `HIPFIRE_QWEN4_LANE_PAGE_BUDGET_MARGIN_MIB` | crates/hipfire-arch-qwen4/src/lane/pages.rs, crates/hipfire-config/src/lib.rs | developer |
 | `HIPFIRE_QWEN4_LANE_PAGE_TRACE` | crates/hipfire-arch-qwen4/src/lane/pages.rs, crates/hipfire-arch-qwen4/src/lane_exec.rs | developer |
-| `HIPFIRE_QWEN4_LANE_PINNED_LOGITS` | crates/rdna-compute/src/feature_flags.rs | developer |
+| `HIPFIRE_QWEN4_LANE_PINNED_LOGITS` | crates/hipfire-arch-qwen4/src/lane.rs, crates/hipfire-arch-qwen4/src/sampled_lane.rs | developer |
 | `HIPFIRE_QWEN4_LANE_PLE_BATCH` | crates/hipfire-arch-qwen4/examples/ple_lanes_oracle.rs, crates/hipfire-arch-qwen4/src/gpu_forward_lanes.rs | developer |
-| `HIPFIRE_QWEN4_LANE_PLE_PROJECT` | crates/rdna-compute/src/feature_flags.rs | developer |
-| `HIPFIRE_QWEN4_LANE_PREPARE_ASYNC` | crates/hipfire-arch-qwen4/src/ep_mesh_lanes.rs, crates/hipfire-arch-qwen4/src/ep_mesh_serve.rs | developer |
+| `HIPFIRE_QWEN4_LANE_PLE_PROJECT` | crates/hipfire-arch-qwen4/src/gpu_forward_lanes.rs, crates/rdna-compute/src/feature_flags.rs | developer |
+| `HIPFIRE_QWEN4_LANE_PREPARE_ASYNC` | crates/hipfire-arch-qwen4/src/ep_mesh_lanes.rs, crates/hipfire-arch-qwen4/src/ep_mesh_lanes/tests.rs | developer |
 | `HIPFIRE_QWEN4_LANE_RESERVE_TRIM` | crates/hipfire-arch-qwen4/src/lane/census.rs, crates/hipfire-arch-qwen4/src/state.rs | developer |
 | `HIPFIRE_QWEN4_LANE_ROW_CAP` | crates/hipfire-arch-qwen4/src/mesh_lane_protocol.rs, crates/hipfire-arch-qwen4/src/mtp_lanes.rs | developer |
-| `HIPFIRE_QWEN4_LANE_ROW_EXACT` | crates/hipfire-config/src/lib.rs | developer |
-| `HIPFIRE_QWEN4_LANE_STEP_TRACE` | crates/hipfire-arch-qwen4/src/gpu_forward_lanes.rs | developer |
-| `HIPFIRE_QWEN4_LANE_WMMA` | crates/rdna-compute/src/feature_flags.rs | developer |
-| `HIPFIRE_QWEN4_LWMMA_MULTI_PART` | crates/rdna-compute/src/feature_flags.rs | developer |
+| `HIPFIRE_QWEN4_LANE_ROW_EXACT` | crates/hipfire-arch-qwen4/src/ep_mesh_serve.rs, crates/hipfire-arch-qwen4/src/gpu_forward_lanes.rs | developer |
+| `HIPFIRE_QWEN4_LANE_STEP_TRACE` | crates/hipfire-arch-qwen4/src/gpu_forward_lanes.rs, crates/hipfire-arch-qwen4/src/lane_exec.rs | developer |
+| `HIPFIRE_QWEN4_LANE_WMMA` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemm.rs | developer |
+| `HIPFIRE_QWEN4_LWMMA_MULTI_PART` | crates/hipfire-dispatch/examples/lwmma_multi_front_oracle.rs, crates/hipfire-dispatch/src/pipeline/layer_ops.rs | developer |
 | `HIPFIRE_QWEN4_MOE32_GU` | crates/hipfire-runtime/examples/moe_wide_oracle.rs, crates/rdna-compute/src/dispatch.rs | developer |
-| `HIPFIRE_QWEN4_MOE_COMBINE_INLINE_ORDER` | crates/hipfire-dispatch/src/pipeline/qt44_qt53_prefill.rs, crates/rdna-compute/src/feature_flags.rs | developer |
+| `HIPFIRE_QWEN4_MOE_COMBINE_INLINE_ORDER` | crates/hipfire-dispatch/src/pipeline/qt44_qt53_prefill.rs, crates/rdna-compute/examples/qwen4_moe_combine_ordered.rs | developer |
 | `HIPFIRE_QWEN4_MOE_COMBINE_ZINIT` | crates/hipfire-dispatch/src/pipeline/moe_program.rs, crates/hipfire-dispatch/src/pipeline/qt44_qt53_prefill.rs | developer |
 | `HIPFIRE_QWEN4_MOE_DEAD_POISON` | crates/hipfire-runtime/examples/moe_dead_rows_oracle.rs, crates/rdna-compute/src/dispatch.rs | developer |
 | `HIPFIRE_QWEN4_MOE_DEAD_STORES` | crates/hipfire-runtime/examples/moe_dead_rows_oracle.rs, crates/rdna-compute/src/dispatch.rs | developer |
 | `HIPFIRE_QWEN4_MOE_DOWN_A8` | crates/hipfire-arch-qwen4/src/bundle.rs, crates/hipfire-arch-qwen4/src/gpu_forward.rs | developer |
 | `HIPFIRE_QWEN4_MOE_DOWN_A8_INDEXED` | crates/rdna-compute/src/qwen4_moe_down_a8.rs | developer |
+| `HIPFIRE_QWEN4_MOE_DOWN_C8_PM` | crates/rdna-compute/src/qwen4_moe_down_a8.rs | developer |
+| `HIPFIRE_QWEN4_MOE_DOWN_C8_PM_BLOCKS` | crates/rdna-compute/src/qwen4_moe_down_a8.rs | developer |
 | `HIPFIRE_QWEN4_MOE_DOWN_DNI` | crates/hipfire-runtime/examples/moe_down_oracle.rs, crates/rdna-compute/src/dispatch.rs | developer |
 | `HIPFIRE_QWEN4_MOE_DOWN_R4` | crates/peacemaker-isa/tests/legacy_mq4_rowtiles.rs, crates/railgun-cert/src/recording.rs | developer |
 | `HIPFIRE_QWEN4_MOE_DOWN_TWIN` | crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_QWEN4_MOE_EPILOGUE_FUSE` | crates/hipfire-dispatch/src/pipeline/moe_program.rs, crates/hipfire-dispatch/src/pipeline/qt44_qt53_prefill.rs | developer |
-| `HIPFIRE_QWEN4_MOE_EP_A8` | crates/hipfire-arch-qwen4/src/gpu_forward.rs, crates/hipfire-dispatch/src/pipeline/qt44_qt53_prefill.rs | developer |
-| `HIPFIRE_QWEN4_MOE_EP_A8_NT` | crates/rdna-compute/src/qwen4_moe_ep_a8.rs, crates/rdna-compute/tests/qwen4_moe_ep_a8_time_hw.rs | developer |
+| `HIPFIRE_QWEN4_MOE_EP_A8` | crates/hipfire-arch-qwen4/src/gpu_forward.rs, crates/hipfire-arch-qwen4/src/gpu_forward/ep_wave.rs | developer |
+| `HIPFIRE_QWEN4_MOE_EP_A8_NT` | crates/rdna-compute/examples/qwen4_moe_gu_rot_fold.rs, crates/rdna-compute/src/qwen4_moe_ep_a8.rs | developer |
 | `HIPFIRE_QWEN4_MOE_FRONT_FUSE` | crates/hipfire-dispatch/src/pipeline/moe_program.rs, crates/hipfire-dispatch/src/pipeline/qt44_qt53_prefill.rs | developer |
 | `HIPFIRE_QWEN4_MOE_GATEUP_TWIN` | crates/rdna-compute/src/gemm.rs | developer |
-| `HIPFIRE_QWEN4_MOE_DOWN_C8_PM` | crates/hipfire-runtime/examples/moe_down_c8_pm_oracle.rs, crates/rdna-compute/src/qwen4_moe_down_a8.rs | developer |
-| `HIPFIRE_QWEN4_MOE_DOWN_C8_PM_BLOCKS` | crates/hipfire-runtime/examples/moe_down_c8_pm_oracle.rs, crates/rdna-compute/src/qwen4_moe_down_a8.rs | developer |
-| `HIPFIRE_QWEN4_MOE_GLUE_FOLD` | crates/hipfire-dispatch/src/pipeline/qt44_qt53_prefill.rs, crates/rdna-compute/examples/qwen4_moe_gu_rot_fold.rs | developer |
-| `HIPFIRE_QWEN4_MOE_GU_A8` | crates/hipfire-dispatch/src/pipeline/qt44_qt53_prefill.rs, crates/railgun-cert/src/recording.rs | developer |
-| `HIPFIRE_QWEN4_MOE_GU_C8_PM` | crates/hipfire-runtime/examples/moe_gu_c8_pm_oracle.rs, crates/rdna-compute/src/gemm.rs | developer |
-| `HIPFIRE_QWEN4_MOE_GU_C8_PM_BLOCKS` | crates/hipfire-runtime/examples/moe_gu_c8_pm_oracle.rs, crates/rdna-compute/src/gemm.rs | developer |
+| `HIPFIRE_QWEN4_MOE_GLUE_FOLD` | crates/hipfire-dispatch/src/pipeline/moe_program.rs, crates/hipfire-dispatch/src/pipeline/qt44_qt53_prefill.rs | developer |
+| `HIPFIRE_QWEN4_MOE_GU_A8` | crates/hipfire-arch-qwen4/src/ep.rs, crates/hipfire-arch-qwen4/src/gpu_forward.rs | developer |
+| `HIPFIRE_QWEN4_MOE_GU_C8_PM` | crates/rdna-compute/src/gemm.rs | developer |
+| `HIPFIRE_QWEN4_MOE_GU_C8_PM_BLOCKS` | crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_QWEN4_MOE_GU_FEW_PM` | crates/hipfire-runtime/examples/moe_gu_few_pm_oracle.rs, crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_QWEN4_MOE_ROUTE_SCATTER` | crates/hipfire-dispatch/src/pipeline/moe_program.rs, crates/hipfire-dispatch/src/pipeline/qt44_qt53_prefill.rs | developer |
 | `HIPFIRE_QWEN4_MOE_SCATTER_SCAN` | crates/rdna-compute/examples/moe_scatter_scan_oracle.rs, crates/rdna-compute/src/feature_flags.rs | developer |
@@ -2802,14 +2824,14 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_QWEN4_MTP_DRAFT_PROJ_BATCH` | crates/hipfire-arch-qwen4/src/mtp_gpu/rows.rs | developer |
 | `HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS` | crates/hipfire-arch-qwen4/src/bundle.rs, crates/hipfire-arch-qwen4/src/ep_mesh_lanes.rs | developer |
 | `HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS_XBATCH` | crates/hipfire-arch-qwen4/src/mtp_gpu/rows.rs | developer |
-| `HIPFIRE_QWEN4_MTP_FC_ONE_LAUNCH` | crates/rdna-compute/src/feature_flags.rs | developer |
+| `HIPFIRE_QWEN4_MTP_FC_ONE_LAUNCH` | crates/hipfire-arch-qwen4/src/mtp_gpu.rs, crates/rdna-compute/src/feature_flags.rs | developer |
 | `HIPFIRE_QWEN4_MTP_HEAD_D2` | crates/hipfire-arch-qwen4/src/mtp_gpu.rs, crates/hipfire-arch-qwen4/src/state_parity.rs | developer |
 | `HIPFIRE_QWEN4_MTP_HEAD_RESIDENT` | crates/hipfire-arch-qwen4/src/bundle.rs, crates/hipfire-arch-qwen4/src/expert_residency.rs | developer |
 | `HIPFIRE_QWEN4_MTP_REUSE_PREFILL_IDS` | crates/hipfire-arch-qwen4/src/mtp_spec.rs, crates/railgun-cert/src/recording.rs | developer |
 | `HIPFIRE_QWEN4_MTP_SAMPLED_PICKS` | crates/hipfire-arch-qwen4/src/mtp_spec.rs | developer |
 | `HIPFIRE_QWEN4_MTP_SKIP_INTERMEDIATE_PICK` | crates/hipfire-arch-qwen4/src/mtp_spec.rs | developer |
 | `HIPFIRE_QWEN4_MTP_TIER` | crates/hipfire-arch-qwen4/src/weights.rs | developer |
-| `HIPFIRE_QWEN4_MTP_TOKEN_RING` | crates/hipfire-arch-qwen4/src/mtp_gpu.rs | developer |
+| `HIPFIRE_QWEN4_MTP_TOKEN_RING` | crates/hipfire-arch-qwen4/src/mtp_gpu.rs, crates/railgun-cert/src/recording.rs | developer |
 | `HIPFIRE_QWEN4_NPU_TRUNK` | crates/hipfire-arch-qwen4/src/npu_trunk/config.rs, crates/hipfire-arch-qwen4/src/slowlink_admission.rs | experimental |
 | `HIPFIRE_QWEN4_NPU_TRUNK_CAL` | crates/hipfire-config/src/lib.rs, scripts/perf_config_receipt.py | experimental |
 | `HIPFIRE_QWEN4_NPU_TRUNK_FAMILIES` | crates/hipfire-arch-qwen4/src/npu_trunk/forward.rs | developer |
@@ -2821,11 +2843,10 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_QWEN4_PLE_ASYNC_UPLOAD` | crates/hipfire-arch-qwen4/src/gpu_forward.rs, crates/hipfire-arch-qwen4/src/ple_stage.rs | developer |
 | `HIPFIRE_QWEN4_PLE_FUSE` | crates/hipfire-arch-qwen4/src/gpu_forward.rs, crates/hipfire-dispatch/src/pipeline/layer_ops.rs | developer |
 | `HIPFIRE_QWEN4_PLE_WIDE_READERS` | crates/hipfire-arch-qwen4/src/bundle.rs | developer |
-| `HIPFIRE_QWEN4_PREFILL_LWMMA_DENSE` | crates/rdna-compute/src/feature_flags.rs | developer |
-| `HIPFIRE_QWEN4_PREFILL_LWMMA_HC` | crates/rdna-compute/src/feature_flags.rs | developer |
-| `HIPFIRE_QWEN4_PREFILL_LWMMA_TILE` | crates/rdna-compute/src/feature_flags.rs | developer |
-| `HIPFIRE_QWEN4_PREFILL_LWMMA_WAVE_FLOOR` | crates/rdna-compute/src/feature_flags.rs | developer |
-| `HIPFIRE_QWEN4_WAVE_HEAD_ONE` | crates/rdna-compute/src/feature_flags.rs | developer |
+| `HIPFIRE_QWEN4_PREFILL_LWMMA_DENSE` | crates/rdna-compute/src/dispatch.rs, crates/rdna-compute/src/feature_flags.rs | developer |
+| `HIPFIRE_QWEN4_PREFILL_LWMMA_HC` | crates/hipfire-dispatch/src/pipeline/layer_ops.rs, crates/rdna-compute/src/feature_flags.rs | developer |
+| `HIPFIRE_QWEN4_PREFILL_LWMMA_TILE` | crates/hipfire-dispatch/src/pipeline/layer_ops.rs, crates/rdna-compute/src/feature_flags.rs | developer |
+| `HIPFIRE_QWEN4_PREFILL_LWMMA_WAVE_FLOOR` | crates/hipfire-arch-qwen4/src/gpu_forward.rs, crates/hipfire-arch-qwen4/src/gpu_forward/ep_wave.rs | developer |
 | `HIPFIRE_QWEN4_PROFILE_CHECKPOINT` | crates/hipfire-arch-qwen4/src/state_parity.rs | developer |
 | `HIPFIRE_QWEN4_PROFILE_SOURCE_CALLBACK` | crates/hipfire-arch-qwen4/src/state_parity.rs | developer |
 | `HIPFIRE_QWEN4_PROJ_REGIONS` | crates/rdna-compute/src/gemm.rs | developer |
@@ -2843,7 +2864,8 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_QWEN4_QSA_NORM_EPI` | crates/rdna-compute/src/gemm_mq6_i8.rs | developer |
 | `HIPFIRE_QWEN4_QSA_PM` | crates/peacemaker-isa/src/kernels/qsa_gather.rip.rs, crates/rdna-compute/examples/qsa_pm_check.rs | developer |
 | `HIPFIRE_QWEN4_QSA_POOLED_BF16` | crates/hipfire-arch-qwen4/examples/qwen4_qsa_arena_check.rs, crates/hipfire-arch-qwen4/src/state.rs | developer |
-| `HIPFIRE_QWEN4_QSA_SCORES_RESERVE` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/tensor_ops.rs | developer |
+| `HIPFIRE_QWEN4_QSA_Q8_GATHER_GFX1201` | crates/rdna-compute/src/tensor_ops.rs | developer |
+| `HIPFIRE_QWEN4_QSA_SCORES_RESERVE` | crates/rdna-compute/src/feature_flags.rs | developer |
 | `HIPFIRE_QWEN4_QSA_SCORE_PM` | crates/rdna-compute/examples/qsa_select_pm_check.rs, crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_QWEN4_QSA_SCORE_ROWS32` | crates/rdna-compute/src/tensor_ops.rs | developer |
 | `HIPFIRE_QWEN4_QSA_SELECT_EXACT` | crates/hipfire-runtime/examples/qwen4_tierc/qsa.rs, crates/railgun-cert/src/recording.rs | developer |
@@ -2884,6 +2906,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_QWEN4_TRUNK_TIER` | crates/hipfire-arch-qwen4/src/weights.rs | developer |
 | `HIPFIRE_QWEN4_TURN_SNAPSHOTS` | crates/hipfire-arch-qwen4/src/bundle.rs, crates/hipfire-arch-qwen4/src/bundle/pp.rs | developer |
 | `HIPFIRE_QWEN4_VMM_GFX1100` | crates/hipfire-arch-qwen4/src/kv_backend.rs, crates/hipfire-config/src/devices.rs | developer |
+| `HIPFIRE_QWEN4_WAVE_HEAD_ONE` | crates/hipfire-arch-qwen4/src/gpu_forward_lanes.rs, crates/rdna-compute/src/feature_flags.rs | developer |
 | `HIPFIRE_QWEN4_WIDE_GROUPED_DOWN` | crates/hipfire-dispatch/src/pipeline/qt44_qt53_prefill.rs, crates/rdna-compute/src/prefill_invariant.rs | developer |
 | `HIPFIRE_QWEN4_WIDE_GROUPED_MOE` | crates/hipfire-arch-qwen4/examples/qwen4_wide_grouped_moe_oracle.rs, crates/hipfire-dispatch/src/pipeline/layer_ops.rs | developer |
 | `HIPFIRE_QWEN4_WIDE_TWIN_BF16` | crates/rdna-compute/examples/bf16_rows_oracle.rs, crates/rdna-compute/examples/bf16_rows_pm_oracle.rs | developer |
@@ -3085,7 +3108,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_SAMPLED_MTP_MIN_P` | crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs, crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |
 | `HIPFIRE_SAMPLED_MTP_OUT` | crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs, crates/hipfire-arch-qwen4/tests/common/lane_run.rs | harness |
 | `HIPFIRE_SAMPLED_MTP_PRESENCE_PENALTY` | crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs, crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |
-| `HIPFIRE_SAMPLED_MTP_PROMPT` | crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs, crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |
+| `HIPFIRE_SAMPLED_MTP_PROMPT` | crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs, crates/hipfire-arch-qwen4/tests/common/lane_ep.rs | harness |
 | `HIPFIRE_SAMPLED_MTP_Q8EF_STAGE` | crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |
 | `HIPFIRE_SAMPLED_MTP_RENDER` | crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs | harness |
 | `HIPFIRE_SAMPLED_MTP_REPEAT_PENALTY` | crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs, crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |
@@ -3177,8 +3200,8 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_SPE_OUT_ROOT` | benchmarks/quality-baselines/harness/spe_ablation.sh | harness |
 | `HIPFIRE_SPILL_DIR` | crates/hipfire-config/src/lib.rs, crates/hipfire-quantize/src/pipeline.rs | stable |
 | `HIPFIRE_STATE_QUANT` | crates/hipfire-arch-qwen4/examples/fn_lane_oracle.rs, crates/hipfire-arch-qwen4/examples/fn_prefill_g0.rs | stable |
-| `HIPFIRE_STEADY_READBACK_PINNED` | crates/rdna-compute/src/dispatch.rs | developer |
-| `HIPFIRE_STREAM_ORDERED_COPIES` | crates/rdna-compute/src/feature_flags.rs | developer |
+| `HIPFIRE_STEADY_READBACK_PINNED` | crates/railgun-cert/src/recording.rs, crates/rdna-compute/src/dispatch.rs | developer |
+| `HIPFIRE_STREAM_ORDERED_COPIES` | crates/railgun-cert/src/recording.rs, crates/rdna-compute/src/dispatch.rs | developer |
 | `HIPFIRE_SWAP_DIR` | crates/hipfire-config/src/lib.rs | experimental |
 | `HIPFIRE_SWAP_DISK_BYTES` | crates/hipfire-config/src/lib.rs | experimental |
 | `HIPFIRE_SWAP_HOST_BYTES` | crates/hipfire-config/src/lib.rs | experimental |
@@ -3208,6 +3231,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_TOPK8_RESCORE` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_TOPK_FIXUP_MARKED` | crates/rdna-compute/src/select_regrid.rs | developer |
 | `HIPFIRE_TOPOLOGY_EP` | crates/hipfire-arch-qwen4/examples/qwen4_ep_kld.rs, crates/hipfire-arch-qwen4/tests/common/lane_ep.rs | experimental |
+| `HIPFIRE_TOPOLOGY_HETERO_EXPERTS` | crates/hipfire-config/src/lib.rs, tools/hetero/bench_decode.sh | experimental |
 | `HIPFIRE_TOPOLOGY_PP` | crates/hipfire-config/src/lib.rs, scripts/fn-ep-gate.sh | experimental |
 | `HIPFIRE_TP` | crates/hipfire-arch-qwen35/examples/qwen_dense_tp2_parity.rs | harness |
 | `HIPFIRE_TP2_GRAPH_REPLAYS` | crates/hipfire-runtime/examples/tp2_cross_device_graph_reduce.rs | harness |
@@ -3282,7 +3306,8 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_VMM_FIRST_BYTES` | crates/hip-bridge/examples/vmm_arena_smoke.rs | harness |
 | `HIPFIRE_VMM_PROMOTE_AT` | crates/hipfire-generate/src/batch.rs | developer |
 | `HIPFIRE_VMM_SECOND_BYTES` | crates/hip-bridge/examples/vmm_arena_smoke.rs | harness |
-| `HIPFIRE_VMM_SMOKE_DEVICE` | crates/hip-bridge/examples/vmm_arena_smoke.rs, crates/rdna-compute/examples/vmm_tensor_smoke.rs | harness |
+| `HIPFIRE_VMM_SMOKE_DEVICE` | crates/hip-bridge/examples/vmm_arena_smoke.rs, crates/hip-bridge/examples/vmm_tlb_flush_soak.rs | harness |
+| `HIPFIRE_VMM_TLB_POKE` | crates/hip-bridge/examples/vmm_tlb_flush_soak.rs, crates/hip-bridge/src/ffi.rs | developer |
 | `HIPFIRE_VQ_BOOKS_JSON` | crates/hipfire-runtime/src/e8p_i4_reference.rs | developer |
 | `HIPFIRE_VRAM_BUDGET_BYTES` | crates/rdna-compute/examples/q8_batched_attn_microbench.rs | harness |
 | `HIPFIRE_WEIGHT_BUFFER_LOADS_FLAT_GEMV_OPT_IN` | crates/rdna-compute/src/kernels.rs | developer |

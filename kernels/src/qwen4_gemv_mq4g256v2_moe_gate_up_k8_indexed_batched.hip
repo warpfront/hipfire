@@ -275,15 +275,14 @@ extern "C" __global__ void gemv_mq4g256v2_moe_gate_up_k2560_rows8_indexed_batche
     __shared__ __align__(16) float xs[2560];
     const int krank = blockIdx.y;
     const int bid = blockIdx.z;
-    const float4* x4 = reinterpret_cast<const float4*>(x + (long long)bid * 2560);
-    for (int i = threadIdx.x; i < 640; i += 256) reinterpret_cast<float4*>(xs)[i] = x4[i];
-    __syncthreads();
     const int row = blockIdx.x * 8 + (threadIdx.x >> 5);
-    if (row >= M) return;
     const int tid = threadIdx.x & 31;
+    // The slot's expert is uniform across the block: a masked slot (-1, the
+    // hetero/D2 split's other device) stores its zero rows and leaves before
+    // the x fill, which it never reads.
     const int expert_id = topk_indices[bid * K_TOP + krank];
     if ((unsigned)expert_id >= (unsigned)n_experts) {
-        if (tid == 0) {
+        if (row < M && tid == 0) {
             const int mi_inv = M >> 1;
             const long long base_inv = (long long)bid * K_TOP * mi_inv + (long long)krank * mi_inv;
             if (row < mi_inv) y_gate[base_inv + row] = 0.0f;
@@ -291,6 +290,10 @@ extern "C" __global__ void gemv_mq4g256v2_moe_gate_up_k2560_rows8_indexed_batche
         }
         return;
     }
+    const float4* x4 = reinterpret_cast<const float4*>(x + (long long)bid * 2560);
+    for (int i = threadIdx.x; i < 640; i += 256) reinterpret_cast<float4*>(xs)[i] = x4[i];
+    __syncthreads();
+    if (row >= M) return;
     const char* __restrict__ row_ptr =
         reinterpret_cast<const char*>(expert_ptrs[expert_id]) + (long long)row * 10 * 136;
     float acc = mq4v2_gate_up_row10(row_ptr, xs, tid);

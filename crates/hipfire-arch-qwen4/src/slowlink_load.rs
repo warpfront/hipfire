@@ -205,7 +205,14 @@ fn load_inner(
         gpu,
         &receipt.config,
     )?;
-    let backend = Qwen4KvBackend::automatic(gpu);
+    // `HIPFIRE_KV_BACKEND=legacy` keeps the QSA context out of VMM, e.g. on a
+    // gfx1201 whose in-tree driver drops fresh VMM mappings (rocm-systems#11693).
+    let backend =
+        if hipfire_config::process_value("HIPFIRE_KV_BACKEND").as_deref() == Some("legacy") {
+            Qwen4KvBackend::Legacy
+        } else {
+            Qwen4KvBackend::automatic(gpu)
+        };
     let vmm_granularity = match backend {
         Qwen4KvBackend::Vmm => gpu
             .vmm_recommended_granularity()

@@ -116,10 +116,12 @@ pub use slab_admission::{
     qwen4_slab_codec_admitted, qwen4_slab_codec_prefill_admitted, qwen4_slab_default_cold_codec,
     qwen4_slab_layer_cold_codec, qwen4_slab_layer_prefills, SlabLayerCodecError,
 };
+pub mod hetero;
 pub mod mq6_railgun;
 pub mod mq_f16_producers;
 pub mod mq_f16_residual_producers;
 pub mod norm;
+pub use hetero::HeteroSlotPtrs;
 pub mod npu_trunk;
 mod packed_mq4;
 pub mod page_pool;

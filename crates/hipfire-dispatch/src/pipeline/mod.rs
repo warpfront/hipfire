@@ -378,6 +378,57 @@ fn select_grouped_route(
     )
 }
 
+/// [`select_grouped_route`] for a routed-only call (the hetero split's
+/// `PrefillRouteMode::HeteroCold`), which binds no shared expert: the call is
+/// checked against the policy's routed half, and the shared half is the
+/// policy's own declaration (still subject to the route's format admission).
+#[allow(clippy::too_many_arguments)]
+fn select_grouped_route_routed_only(
+    dtypes: &crate::families::moe::MoeDtypes<'_>,
+    n_exp: usize,
+    k_top: usize,
+    hidden: usize,
+    intermediate: usize,
+    gate_up_k: usize,
+    down_m: usize,
+    down_k: usize,
+    dtype_tags: Option<&GpuTensor>,
+    has_sidecars: bool,
+    route_policy: Option<crate::families::moe::MoeRoutePolicy>,
+    arch: &str,
+) -> Option<crate::families::moe::MoeRouteCapability> {
+    let policy = route_policy?;
+    if dtypes.shared.is_some() {
+        return None;
+    }
+    let f = policy.formats;
+    let declared = crate::families::moe::MoeDtypes {
+        router: f.router,
+        shared: Some(crate::families::moe::MoeSharedDtypes {
+            selector: f.shared_selector,
+            gate: f.shared_gate,
+            up: f.shared_up,
+            down: f.shared_down,
+        }),
+        ..*dtypes
+    };
+    select_grouped_route(
+        &declared,
+        n_exp,
+        k_top,
+        hidden,
+        intermediate,
+        policy.geometry.shared_intermediate,
+        gate_up_k,
+        down_m,
+        down_k,
+        dtype_tags,
+        has_sidecars,
+        route_policy,
+        arch,
+    )
+}
+
 /// [`select_grouped_route`] with the sealed slab route's per-codec admission given as a
 /// predicate (the architecture's `rdna_compute::slab_admission::qwen4_slab_codec_admitted_with`),
 /// so the pure decision is testable for both states of the gfx1151 E8P receipts switch.
@@ -1152,6 +1203,31 @@ mod qwen4_route_tests {
         let mut dtypes = canonical_dtypes();
         dtypes.shared.as_mut().unwrap().gate = DType::MQ4G256V2;
         assert!(!is_canonical_qwen4(&dtypes));
+    }
+
+    #[test]
+    fn routed_only_route_checks_the_routed_half_and_binds_no_shared() {
+        let routed_only = |dtypes: &MoeDtypes<'_>, policy: Option<MoeRoutePolicy>| {
+            select_grouped_route_routed_only(
+                dtypes, 512, 10, 2560, 640, 2560, 2560, 640, None, false, policy, "gfx1151",
+            )
+        };
+        let mut dtypes = canonical_dtypes();
+        dtypes.shared = None;
+        let admitted = cfg!(feature = "deltanet").then_some(MoeRouteCapability::Qt44Qt53Grouped);
+        assert_eq!(
+            routed_only(&dtypes, Some(policy(DType::MQ4G128V2))),
+            admitted
+        );
+        // No policy, a bound shared expert, or a routed format off the policy: refused.
+        assert_eq!(routed_only(&dtypes, None), None);
+        assert_eq!(
+            routed_only(&canonical_dtypes(), Some(policy(DType::MQ4G128V2))),
+            None
+        );
+        let mut off = dtypes;
+        off.routed_down = DType::MQ4G256V2;
+        assert_eq!(routed_only(&off, Some(policy(DType::MQ4G128V2))), None);
     }
 
     #[test]
@@ -5549,6 +5625,77 @@ fn decode_route_gpu_stage(
         }
     } // end `if !skip_routing` (top-k)
     Ok(())
+}
+
+/// Under the hetero device split the one-row BF16 shared down runs inside the
+/// cold wait: [`decode_shared_down_deferred`] (activation + plain GEMV into
+/// `ffn_out`) before `AwaitCold`, [`decode_shared_add`] (the BF16 scaled add)
+/// after the canonical combine. Bitwise the fused
+/// `gemv_bf16_xf32_bf16_scaled_add` (same row body, same rounded expression)
+/// in the same accumulation order: routed first, shared second.
+pub(super) fn decode_shared_down_defers(
+    p: &crate::families::moe::MoeParams<'_>,
+    route: Option<MoeRouteCapability>,
+) -> bool {
+    cfg!(feature = "deltanet")
+        && route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped)
+        && !p.skip_shared
+        && p.recipe.bf16_round_trip()
+        && p.recipe.shared_after_combine()
+        && p.shared.as_ref().is_some_and(|s| {
+            s.weights.down.dtype == DType::BF16 && s.weights.down.awq_scale.is_none()
+        })
+}
+
+/// The deferred shared down's first half (see [`decode_shared_down_defers`]):
+/// the shared activation (unless the routed launch ran it) and the BF16 GEMV
+/// into `ffn_out`; the residual is not touched.
+pub(super) fn decode_shared_down_deferred(
+    gpu: &mut Gpu,
+    p: &crate::families::moe::MoeParams<'_>,
+    shared_gate: &GpuTensor,
+    shared_up: &GpuTensor,
+    route: Option<MoeRouteCapability>,
+) -> Result<(), DispatchError> {
+    let shared = p
+        .shared
+        .as_ref()
+        .ok_or_else(|| DispatchError::Hip("shared down stage requires shared weights".into()))?;
+    let w = &shared.weights.down;
+    let scalar_live = slice_moe_f32_view(shared.scalar, 0, 1);
+    let shared_hid = slice_moe_f32_view(p.ffn_hidden, 0, shared.intermediate);
+    if !qt44_shared_activation_in_routed(p, route) {
+        hip!(gpu.shared_expert_activation_bf16_f32(
+            shared_gate,
+            shared_up,
+            &shared_hid,
+            &scalar_live,
+            1
+        ))?;
+    }
+    hip!(gpu.gemv_bf16_xf32(w.buf, &shared_hid, p.ffn_out, w.m, w.k))
+}
+
+/// The deferred shared down's second half: `target = bf16(bf16(target) +
+/// bf16(bf16(scalar) * bf16(ffn_out)))`, after the canonical combine.
+pub(super) fn decode_shared_add(
+    gpu: &mut Gpu,
+    p: &crate::families::moe::MoeParams<'_>,
+    target: &GpuTensor,
+) -> Result<(), DispatchError> {
+    let shared = p
+        .shared
+        .as_ref()
+        .ok_or_else(|| DispatchError::Hip("shared add stage requires shared weights".into()))?;
+    hip!(bf16_scaled_add(
+        gpu,
+        &Bf16ScaledAdd {
+            residual: target,
+            value: p.ffn_out,
+            scalar: shared.scalar,
+            elements: p.hidden
+        },
+    ))
 }
 
 fn decode_shared_down_stage(

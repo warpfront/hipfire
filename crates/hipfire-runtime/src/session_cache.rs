@@ -149,6 +149,14 @@ pub trait SessionState {
     /// prompt materializes state: chunk multiples, and whatever token-
     /// dependent split points (message ends) the architecture adds.
     fn snapshot_boundaries(&self, prompt: &[u32], after: usize, up_to: usize) -> Vec<usize>;
+    /// Positions of `prompt` in `(after, up_to]` where a snapshot captured by
+    /// an EARLIER turn may sit: what a restore plan and a capture's parent
+    /// search look up. A superset of [`Self::snapshot_boundaries`] when this
+    /// turn captures fewer points than earlier turns did (a prompt's last
+    /// message end is an interior one in the next turn's prompt).
+    fn lookup_boundaries(&self, prompt: &[u32], after: usize, up_to: usize) -> Vec<usize> {
+        self.snapshot_boundaries(prompt, after, up_to)
+    }
     /// One additional split before `up_to`, reusable only by this live row
     /// lineage, never by the shared snapshot pool.
     fn lineage_boundary(&self, _prompt: &[u32], _after: usize, _up_to: usize) -> Option<usize> {
@@ -1544,6 +1552,20 @@ impl SessionCache {
     /// snapshot the state refuses to restore is skipped like a miss, so the
     /// plan falls back to the deepest restorable boundary below it (or 0).
     pub fn plan(&self, state: &dyn SessionState, prompt: &[u32], route: SessionRoute) -> usize {
+        if !trace_enabled() {
+            return self.plan_inner(state, prompt, route);
+        }
+        let t = std::time::Instant::now();
+        let planned = self.plan_inner(state, prompt, route);
+        eprintln!(
+            "  session cache: plan of {} tokens -> {planned} in {:.1} ms",
+            prompt.len(),
+            t.elapsed().as_secs_f64() * 1e3
+        );
+        planned
+    }
+
+    fn plan_inner(&self, state: &dyn SessionState, prompt: &[u32], route: SessionRoute) -> usize {
         let Some(scope) = state.snapshot_scope(route) else {
             return 0;
         };
@@ -1569,7 +1591,7 @@ impl SessionCache {
         // copy, see `begin`); each probe hashes its whole prefix.
         let exact = session_exact_domain(&domain);
         let planned = state
-            .snapshot_boundaries(prompt, resident, prompt.len() - 1)
+            .lookup_boundaries(prompt, resident, prompt.len() - 1)
             .into_iter()
             .rev()
             .find(|&p| {
@@ -2163,6 +2185,7 @@ impl SessionCache {
         );
         let mut cold_exact = true;
         let mut tail_hit = false;
+        let mut restore_started: Option<std::time::Instant> = None;
         let restored = if reused > 0
             && self
                 .tail
@@ -2211,6 +2234,7 @@ impl SessionCache {
                 // The cold-exact snapshot wins a tie with a session-exact one.
                 let (from, exact) = self.restore_domain(state, route, &domain, key.1, key.2);
                 cold_exact = exact;
+                restore_started = Some(std::time::Instant::now());
                 self.restore(gpu, state, route, &from, &prompt[..reused], prompt.len())
             }
         };
@@ -2223,6 +2247,13 @@ impl SessionCache {
             return Err(error);
         }
         self.live_cold_exact = cold_exact;
+        if trace_enabled() {
+            let ms = restore_started.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e3);
+            eprintln!(
+                "  session cache: turn of {} tokens restored {reused} (cold-exact {cold_exact}) in {ms:.1} ms",
+                prompt.len()
+            );
+        }
         // A turn restored from the tail does not split at its own tail: that
         // extra small tile would land on every chained append, and a retry of
         // this turn still restores the earlier tail (it stays valid below).
@@ -2764,7 +2795,7 @@ impl SessionCache {
             Vec::new()
         } else {
             state
-                .snapshot_boundaries(prefix, 0, p - 1)
+                .lookup_boundaries(prefix, 0, p - 1)
                 .into_iter()
                 .rev()
                 .map(|b| {
@@ -3015,6 +3046,21 @@ impl SessionCache {
     /// snapshots are dropped by the next [`Self::begin`], so a failed turn
     /// never publishes state.
     pub fn commit(&mut self) {
+        // A boundary the turn planned but the prefill never reported means
+        // every later boundary of the turn waited behind it uncaptured.
+        if let Some(turn) = self
+            .turn
+            .as_ref()
+            .filter(|turn| !turn.boundaries.is_empty())
+        {
+            eprintln!(
+                "  session cache: {} planned snapshot boundaries not reached this turn (first {:?}, prompt {})",
+                turn.boundaries.len(),
+                turn.boundaries.front(),
+                turn.end
+            );
+        }
+        let trace = trace_enabled();
         let mut refused = HashSet::new();
         for (key, snapshot) in std::mem::take(&mut self.pending) {
             if snapshot
@@ -3036,8 +3082,17 @@ impl SessionCache {
                 self.pool.insert_unaligned(domain, p, fp, snapshot)
             };
             if id == CheckpointId::NONE {
+                eprintln!(
+                    "  session cache: publishing the {p}-token snapshot was refused (pool full)"
+                );
                 refused.insert(key);
             } else {
+                if trace {
+                    eprintln!(
+                        "  session cache: published {p}-token snapshot ({})",
+                        if host { "host" } else { "device" }
+                    );
+                }
                 if host && !self.host_index.contains(&key) {
                     self.host_index.push(key.clone());
                 }
@@ -3499,6 +3554,12 @@ impl SessionCache {
         self.begin_live(gpu, state, prompt, route, reused, capture);
         Ok(())
     }
+}
+
+/// `HIPFIRE_QWEN_CACHE_TRACE=1`: log every restore point and published
+/// snapshot (refusals and unreached boundaries always log).
+fn trace_enabled() -> bool {
+    hipfire_config::developer_bool("HIPFIRE_QWEN_CACHE_TRACE", false)
 }
 
 /// Ascending snapshot boundaries in `(after, up_to]`: multiples of `stride`,

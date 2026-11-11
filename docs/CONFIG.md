@@ -228,6 +228,7 @@ Stable/default-on and safety controls:
 | `hardware.allow_mixed_arch` | `false` | Permit heterogeneous multi-GPU topology. |
 | `topology.ep` | `1` | Expert-parallel degree for models whose carrier declares expert parallelism (today: Qwen4 / Flash-Next on gfx1100 or gfx1201); opt-in, experimental. Env `HIPFIRE_TOPOLOGY_EP`. The schema validates an integer 1–8 and a load accepts the same range (an N that does not divide 512 gives uneven per-rank expert counts). Routed experts shard `e % N` across N visible cards of one exact arch (gfx1100 or gfx1201, no mixing) with peer access between every pair. The declaring carrier owns the kill switch (`HIPFIRE_QWEN4_EP=0` forces `1` for Qwen4). Admission rules and the support matrix live with the owner, [multi-gpu.md](multi-gpu.md#which-carriers-declare-which-axis); the config-exposed EP and NPU controls are listed in [Qwen4 expert-parallel and NPU controls](#qwen4-expert-parallel-and-npu-controls). A model whose carrier does not declare `ep` is refused at load admission, before the resident model is unloaded, with `<family>: this model family cannot be split across GPUs in expert-parallel mode (topology.ep = N). Set topology.ep = 1 to load it on one GPU`. |
 | `topology.pp` | `1` | Pipeline-parallel degree: 1 (single device) or an integer 2–8; opt-in, experimental. Env `HIPFIRE_TOPOLOGY_PP`. An explicit load request with `pp` above 1 overrides it; otherwise this value applies. Only carriers that declare `pp` accept it above 1 (see [multi-gpu.md](multi-gpu.md#which-carriers-declare-which-axis)); any other model is refused with the uniform pipeline sentence. Details and the combination rules are in [Qwen4 expert-parallel and NPU controls](#qwen4-expert-parallel-and-npu-controls) and [multi-gpu.md](multi-gpu.md). |
+| `topology.hetero_experts` | null | Qwen4 (Flash-Next) heterogeneous expert split: the arch of the device that holds and computes the cold routed experts (v1: `gfx1151` only), beside a gfx1201 primary that runs the trunk and the hot experts; opt-in, experimental. Env `HIPFIRE_TOPOLOGY_HETERO_EXPERTS`. The gfx1151 computes the cold experts of decode, MTP verify and draft steps, and prefill (layer-major prompt schedule); the primary keeps the trunk and the hot set. Requires `hardware.devices = "gfx1201,gfx1151"` (gfx1201 first) and `hardware.allow_mixed_arch`. A daemon whose process configuration requests it submits through clr worker threads (`AMD_DIRECT_DISPATCH=0`, see [env-vars.md](env-vars.md)). |
 | `hardware.tp_use_rccl` | `true` | RCCL tensor-parallel all-reduce. |
 | `kernel.prefill_batched` | `true` | Batched prefill kernels. |
 | `speculation.draft_f16` | `true` | FP16 DFlash draft activations. |
@@ -353,6 +354,7 @@ Typed schema keys (process-scoped):
 |---|---|---|---|
 | `topology.ep` | `1` | integer 1–8 in the schema; a load accepts the same range | Env `HIPFIRE_TOPOLOGY_EP`. The declaring carrier's kill switch (`HIPFIRE_QWEN4_EP=0` for Qwen4) forces `1` and wins over any configured value, even an invalid one. A load needs pp = tp = 1, N visible devices that are all the same exact arch (gfx1100 or gfx1201; a mixed set is refused) and peer access between every pair of ranks, or it is refused naming the missing requirement. Under the developer-only `HIPFIRE_EMULATE_GPUS` the ranks alias physical devices instead (one visible device is enough). Only carriers that declare `ep` serve `topology.ep` above 1 ([declaring carriers](multi-gpu.md#which-carriers-declare-which-axis)): any other model is refused at load admission, before the resident model is unloaded, with `<family>: this model family cannot be split across GPUs in expert-parallel mode (topology.ep = N). Set topology.ep = 1 to load it on one GPU`. |
 | `topology.pp` | `1` | integer 1–8 | Env `HIPFIRE_TOPOLOGY_PP`. Pipeline-parallel degree: the model's layers split into N contiguous stages across the first N visible devices (`hardware.devices` / `HIPFIRE_DEVICES`). An explicit load request with `pp` above 1 wins and the configured value is not read; a request of 1 or none uses `topology.pp`. An invalid configured value is refused naming `1..=8` only when it is the value in effect. PP does not combine with `tp` > 1 or with `topology.ep` > 1. |
+| `topology.hetero_experts` | null | null or `gfx1151` | Env `HIPFIRE_TOPOLOGY_HETERO_EXPERTS`. Unset, empty or blank is off. Requires `hardware.allow_mixed_arch`; refused with `topology.ep` > 1, `topology.pp` > 1 or `tp` > 1. The split is wired for decode, MTP (verify windows and the draft head) and prefill; see the `topology.hetero_experts` row above. |
 | `fusions.npu_trunk` | `"auto"` | `off` \| `auto` \| `on` \| `emulate` | gfx1151, single device only; see the stable-controls table above. |
 | `fusions.npu_trunk_calibration` | `""` | path string | See the stable-controls table above. |
 | `kernel.npu_spillover` | `false` | bool; env `HIPFIRE_NPU_SPILLOVER` | Opt-in, gfx1151-only XDNA NPU spillover sidecar. Needs a pulled, verified `.xdna.zip` sidecar declared by the registry entry: with the flag on and no declared sidecar the load stays GPU-only (one log line); a declared sidecar that is missing or fails verification fails the load with a `hipfire pull` hint. Never active on other architectures. |
@@ -2305,7 +2307,7 @@ misspelled key is unknown and fails the load with
 
 <!-- lifecycle-table:begin (generated by scripts/check-lifecycle.py --write) -->
 
-**Count:** 310 schema keys, plus the `developer.<name>` namespace.
+**Count:** 311 schema keys, plus the `developer.<name>` namespace.
 
 | Key | Legacy key | Env | Lifecycle |
 |---|---|---|---|
@@ -2617,6 +2619,7 @@ misspelled key is unknown and fails the load with
 | `speculation.prefill.sparse_threshold` | `prefill_sparse_threshold` |  | deprecated |
 | `speculation.prefill.threshold` | `prefill_threshold` |  | deprecated |
 | `topology.ep` | `ep` | `HIPFIRE_TOPOLOGY_EP` | experimental |
+| `topology.hetero_experts` | `hetero_experts` | `HIPFIRE_TOPOLOGY_HETERO_EXPERTS` | experimental |
 | `topology.pp` | `pp` | `HIPFIRE_TOPOLOGY_PP` | experimental |
 | `vision.mode` | `vision_mode` | `HIPFIRE_VISION_MODE` | stable |
 | `developer.<name>` | | `HIPFIRE_<NAME>` | developer |

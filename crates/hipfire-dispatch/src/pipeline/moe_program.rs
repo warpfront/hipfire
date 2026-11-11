@@ -83,6 +83,33 @@ pub enum MoeStage {
     /// the same stream. Lowered only after the routed `Down` and before the
     /// canonical `Combine`; it never completes or synchronizes the stream.
     JoinSplit,
+    /// Device-side hetero split ([`MoeDecodeSelection::hetero_device`]): publish
+    /// the route into the layer's mailbox slot and write the device-masked ids
+    /// the routed GPU tail reads. Lowered before `GateUp`; a device kernel.
+    PublishCold,
+    /// Bounded device wait for the expert device's cold rows. After
+    /// `MutationFence`, before `InstallCold`.
+    AwaitCold,
+    /// Cold slot rows into the expanded down buffer, before `Combine`.
+    InstallCold,
+    /// Hetero prefill ([`MoePrefillSelection::hetero_prefill`]): publish the
+    /// chunk's rows and route to the expert device and queue the side-stream
+    /// exchange (copies out + releases, bounded awaits + copies back), then
+    /// write the device-masked ids the hot routed tail reads. After `Route`,
+    /// before the first routed table read. Never synchronizes the host.
+    PublishColdRows,
+    /// Hetero prefill: enqueue the side-stream exchange `PublishColdRows`
+    /// staged (copies out + releases, waits + copies back). After `GateUp`, so
+    /// the host enqueue overlaps queued device work; no device wait.
+    SendColdRows,
+    /// Hetero prefill: the main stream waits for the exchange, then adds the
+    /// expert device's BF16 cold partial into the residual (skipped after a
+    /// timed-out wait). Last: after the hot `Combine` and `SharedDown`.
+    JoinColdRows,
+    /// Hetero decode with the BF16 shared down deferred
+    /// (`decode_shared_down_defers`): `SharedDown` ran its GEMV inside the
+    /// cold wait; this folds it into the residual after the routed combine.
+    SharedAdd,
 }
 
 fn router_shared_fuse_allowed(
@@ -214,6 +241,10 @@ pub(super) struct MoeDecodeSelection {
     /// a command-processor wait before the CPU arithmetic, and `JoinSplit`
     /// (last) releases it. Implies `cpu_split`.
     pub(super) cpwait: bool,
+    /// Device-side hetero split of the one-row decode
+    /// ([`crate::families::moe::RoutedExpertWeights::hetero_split`]): every
+    /// split stage is a device kernel. Exclusive with `cpu_split`.
+    pub(super) hetero_device: bool,
     /// A3B decode norm fold admitted for this layer (exact gfx1201, MQ4G256V2
     /// hidden-2048 router + shared quartet after a plain norm, rows == 1, kill
     /// switch `HIPFIRE_A3B_NORM_FOLD` not `0`); see [`a3b_norm_fold_admitted`].
@@ -241,6 +272,20 @@ pub(super) struct MoePrefillSelection {
     /// a command-processor wait before the CPU arithmetic, and `JoinSplit`
     /// (last) releases it. Implies `cpu_split`.
     pub(super) cpwait: bool,
+    /// The routed experts expose a hetero prefill split
+    /// (`RoutedExpertWeights::hetero_prefill`) and the chunk fits its slot:
+    /// the cold experts run on the expert device while the hot routed tail
+    /// runs here on device-masked ids. Exclusive with every CPU mode.
+    pub(super) hetero_prefill: bool,
+    /// The routed experts expose a hetero device split
+    /// (`RoutedExpertWeights::hetero_split`) and this few-row window (an MTP
+    /// verify) fits its decode slot: the decode exchange (`PublishCold` ..
+    /// `InstallCold`) on the per-slot route, whose down writes the F32 slot
+    /// rows the canonical combine folds. Exclusive with every other split.
+    pub(super) hetero_rows: bool,
+    /// The caller runs the join (`HeteroPrefillSplit::join_slot`) after other
+    /// work: `JoinColdRows` is not lowered (the layer-major hetero schedule).
+    pub(super) hetero_defer_join: bool,
 }
 
 impl MoePrefillSelection {
@@ -835,6 +880,13 @@ impl<'a> MoeStepState<'a> {
         params: &MoeParams<'p>,
         selection: &MoeDecodeSelection,
     ) -> Result<Option<MoeParams<'p>>, DispatchError> {
+        if selection.hetero_device {
+            let experts: &'p dyn crate::families::moe::RoutedExpertWeights = params.routed_experts;
+            let split = experts.hetero_split().ok_or_else(|| {
+                split_error("the hetero device split sealed into this call is no longer attached")
+            })?;
+            return Ok(Some(params.with_topk_indices(&split.masked_ids)));
+        }
         if !selection.cpu_split {
             return Ok(None);
         }
@@ -857,6 +909,20 @@ impl<'a> MoeStepState<'a> {
         params: &MoePrefillParams<'p>,
         selection: &MoePrefillSelection,
     ) -> Result<Option<MoePrefillParams<'p>>, DispatchError> {
+        if selection.hetero_prefill {
+            let experts: &'p dyn crate::families::moe::RoutedExpertWeights = params.routed_experts;
+            let split = experts.hetero_prefill().ok_or_else(|| {
+                split_error("the hetero prefill split sealed into this call is no longer attached")
+            })?;
+            return Ok(Some(params.with_topk_indices(&split.masked_ids)));
+        }
+        if selection.hetero_rows {
+            let experts: &'p dyn crate::families::moe::RoutedExpertWeights = params.routed_experts;
+            let split = experts.hetero_split().ok_or_else(|| {
+                split_error("the hetero device split sealed into this call is no longer attached")
+            })?;
+            return Ok(Some(params.with_topk_indices(&split.masked_ids)));
+        }
         if !selection.cpu_split {
             return Ok(None);
         }
@@ -868,6 +934,45 @@ impl<'a> MoeStepState<'a> {
         self.require_split_phase(SplitPhase::Prepared, "the routed GPU tail")?;
         let executor = prefill_split_executor(params)?;
         Ok(Some(params.with_topk_indices(executor.masked_indices())))
+    }
+}
+
+/// `HIPFIRE_MOE_STAGE_HOST_TRACE=1`: host wall time per sealed-MoE stage,
+/// summed and printed every 4096 stages (diagnosis only).
+static STAGE_HOST_TRACE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_MOE_STAGE_HOST_TRACE").is_ok_and(|v| v == "1")
+});
+
+static STAGE_HOST: std::sync::Mutex<Vec<(String, std::time::Duration, u64)>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn stage_host_record(stage: MoeStage, took: std::time::Duration) {
+    let Ok(mut v) = STAGE_HOST.lock() else { return };
+    let name = format!("{stage:?}");
+    match v.iter_mut().find(|(n, _, _)| *n == name) {
+        Some(e) => {
+            e.1 += took;
+            e.2 += 1;
+        }
+        None => v.push((name, took, 1)),
+    }
+    let total: u64 = v.iter().map(|e| e.2).sum();
+    if total % 4096 == 0 {
+        let mut sorted = v.clone();
+        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        let line: Vec<String> = sorted
+            .iter()
+            .take(10)
+            .map(|(n, d, c)| {
+                format!(
+                    "{n} {:.1} ms/{c} ({:.0} us)",
+                    d.as_secs_f64() * 1e3,
+                    d.as_secs_f64() * 1e6 / *c as f64
+                )
+            })
+            .collect();
+        eprintln!("moe stage host time: {}", line.join(", "));
+        v.clear();
     }
 }
 
@@ -896,6 +1001,16 @@ impl<'a> SealedMoeOp<'a> {
         gpu: &mut Gpu,
         stage: MoeStage,
     ) -> Result<(), DispatchError> {
+        if !*STAGE_HOST_TRACE {
+            return self.execute_stage_inner(gpu, stage);
+        }
+        let t = std::time::Instant::now();
+        let out = self.execute_stage_inner(gpu, stage);
+        stage_host_record(stage, t.elapsed());
+        out
+    }
+
+    fn execute_stage_inner(&self, gpu: &mut Gpu, stage: MoeStage) -> Result<(), DispatchError> {
         match stage {
             MoeStage::Normalize => self.normalize(gpu),
             MoeStage::InputBasis => self.input_basis(gpu),
@@ -920,7 +1035,128 @@ impl<'a> SealedMoeOp<'a> {
             MoeStage::CpuSplice => self.cpu_splice(gpu),
             MoeStage::PrepareSplit => self.prepare_split(gpu),
             MoeStage::JoinSplit => self.join_split(gpu),
+            MoeStage::PublishCold => self.publish_cold(gpu),
+            MoeStage::AwaitCold => self.await_cold(gpu),
+            MoeStage::InstallCold => self.install_cold(gpu),
+            MoeStage::PublishColdRows => self.publish_cold_rows(gpu),
+            MoeStage::SendColdRows => self.send_cold_rows(gpu),
+            MoeStage::JoinColdRows => self.join_cold_rows(gpu),
+            MoeStage::SharedAdd => self.shared_add(gpu),
         }
+    }
+
+    fn hetero_split<'p>(
+        params: &MoeParams<'p>,
+    ) -> Result<&'p crate::hetero_device::HeteroDeviceSplit, DispatchError> {
+        let experts: &'p dyn crate::families::moe::RoutedExpertWeights = params.routed_experts;
+        experts.hetero_split().ok_or_else(|| {
+            split_error("the hetero device split sealed into this call is no longer attached")
+        })
+    }
+
+    /// `PublishCold`: the layer's route into its mailbox slot plus the
+    /// device-masked ids (cold -> -1) the routed GPU tail reads.
+    pub(super) fn publish_cold(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
+        if let Ok((params, _)) = self.state.decode_parts() {
+            return Self::hetero_split(params)?.publish(
+                gpu,
+                params.batch_size,
+                params.k,
+                params.hidden,
+                params.x_rot_local,
+                params.topk_indices,
+                params.topk_weights,
+            );
+        }
+        let (params, _) = self.state.prefill_parts()?;
+        Self::hetero_rows_split(&params)?.publish(
+            gpu,
+            params.batch_size,
+            params.k_top,
+            params.gate_up_k,
+            params.x_rot_batch,
+            params.topk_indices,
+            params.topk_weights,
+        )
+    }
+
+    fn hetero_rows_split<'p>(
+        params: &MoePrefillParams<'p>,
+    ) -> Result<&'p crate::hetero_device::HeteroDeviceSplit, DispatchError> {
+        let experts: &'p dyn crate::families::moe::RoutedExpertWeights = params.routed_experts;
+        experts.hetero_split().ok_or_else(|| {
+            split_error("the hetero device split sealed into this call is no longer attached")
+        })
+    }
+
+    fn hetero_prefill_split<'p>(
+        params: &MoePrefillParams<'p>,
+    ) -> Result<&'p crate::hetero_device::HeteroPrefillSplit, DispatchError> {
+        let experts: &'p dyn crate::families::moe::RoutedExpertWeights = params.routed_experts;
+        experts.hetero_prefill().ok_or_else(|| {
+            split_error("the hetero prefill split sealed into this call is no longer attached")
+        })
+    }
+
+    /// `PublishColdRows`: the chunk's exchange with the expert device. The
+    /// fused front's int4 sidecar (this call's own gate/up activation) is
+    /// shipped when it exists; otherwise F16 rows.
+    pub(super) fn publish_cold_rows(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
+        let (params, _) = self.state.prefill_parts()?;
+        let xq = self.state.front.borrow().as_ref().and_then(|front| {
+            super::qt44_qt53_prefill::front_xq_ptr(gpu, front, params.gate_up_k, params.batch_size)
+        });
+        Self::hetero_prefill_split(&params)?.publish(
+            gpu,
+            params.batch_size,
+            params.k_top,
+            params.x_norm_batch,
+            params.topk_indices,
+            params.topk_weights,
+            xq,
+        )
+    }
+
+    /// `SendColdRows`: the staged exchange onto the side streams.
+    pub(super) fn send_cold_rows(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
+        let (params, _) = self.state.prefill_parts()?;
+        Self::hetero_prefill_split(&params)?.send(gpu)
+    }
+
+    /// `JoinColdRows`: wait for the exchange and add the cold partial.
+    pub(super) fn join_cold_rows(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
+        let (params, _) = self.state.prefill_parts()?;
+        Self::hetero_prefill_split(&params)?.join(gpu, params.batch_size, params.x_batch)
+    }
+
+    /// `AwaitCold`: bounded device wait for the expert device's response.
+    pub(super) fn await_cold(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
+        if let Ok((params, _)) = self.state.decode_parts() {
+            return Self::hetero_split(params)?.await_cold(gpu);
+        }
+        let (params, _) = self.state.prefill_parts()?;
+        Self::hetero_rows_split(&params)?.await_cold(gpu)
+    }
+
+    /// `InstallCold`: cold slot rows into the expanded down buffer.
+    pub(super) fn install_cold(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
+        if let Ok((params, _)) = self.state.decode_parts() {
+            return Self::hetero_split(params)?.install(
+                gpu,
+                params.batch_size * params.k,
+                params.hidden,
+                params.topk_indices,
+                params.down_expanded,
+            );
+        }
+        let (params, _) = self.state.prefill_parts()?;
+        Self::hetero_rows_split(&params)?.install(
+            gpu,
+            params.batch_size * params.k_top,
+            params.down_m,
+            params.topk_indices,
+            params.down_expanded,
+        )
     }
 
     pub(super) fn normalize(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
@@ -1066,8 +1302,9 @@ impl<'a> SealedMoeOp<'a> {
             // The normalize stage produced the F32 basis and the token (L4 fold).
             return Ok(());
         }
-        if selection.cpu_split {
-            // The CPU computes from the F32 rotated basis. The grouped stage may
+        if selection.cpu_split || selection.hetero_rows {
+            // The CPU (or the hetero expert device) computes from the F32
+            // rotated basis. The grouped stage may
             // skip it when the GPU gate/up rotates to F16 itself, so the split
             // always writes it (the same rotation the stage would have run).
             return gpu
@@ -1085,6 +1322,10 @@ impl<'a> SealedMoeOp<'a> {
         {
             if self.state.front_allowed.get()
                 && !selection.cpu_deferred_experts
+                && !matches!(
+                    params.prelude.route,
+                    super::sealed_moe::PrefillRouteMode::HeteroCold { .. }
+                )
                 && super::qt44_qt53_prefill::front_applies(
                     gpu,
                     params,
@@ -1671,9 +1912,29 @@ impl<'a> SealedMoeOp<'a> {
         Ok(())
     }
 
+    /// `SharedAdd`: the deferred shared down's BF16 fold into the residual.
+    pub(super) fn shared_add(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
+        let (params, selection) = self.state.decode_parts()?;
+        if !decode_shared_deferred(params, selection) {
+            return Err(split_error(
+                "SharedAdd lowered without a deferred shared down",
+            ));
+        }
+        super::decode_shared_add(gpu, params, params.routed_out.unwrap_or(params.x_residual))
+    }
+
     pub(super) fn shared_down(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
         if let Ok((params, selection)) = self.state.decode_parts() {
             let (shared_gate, shared_up) = self.state.shared_views()?;
+            if decode_shared_deferred(params, selection) {
+                return super::decode_shared_down_deferred(
+                    gpu,
+                    params,
+                    shared_gate,
+                    shared_up,
+                    selection.route,
+                );
+            }
             let target = if params.ep_mode == crate::families::moe::MoeEpMode::RootRoutedPartial {
                 params.x_residual
             } else {
@@ -2051,6 +2312,14 @@ impl<'a> SealedMoeOp<'a> {
         if selection.cpu_split {
             return self.split_combine_prefill(gpu, params, selection);
         }
+        // Hetero prefill: the hot combine reads the masked ids (cold slots are
+        // the expert device's, added by `JoinColdRows`).
+        let masked = if selection.hetero_prefill {
+            self.state.masked_prefill(params, selection)?
+        } else {
+            None
+        };
+        let params = masked.as_ref().unwrap_or(params);
         if selection
             .route
             .is_some_and(MoeRouteCapability::is_sealed_grouped)
@@ -2648,10 +2917,25 @@ fn append_step<'a>(
     Ok(())
 }
 
+/// Whether a hetero decode call runs its shared down inside the cold wait
+/// (`SharedDown` before `AwaitCold`, `SharedAdd` after `Combine`): one
+/// predicate for the lowering and both stages.
+fn decode_shared_deferred(params: &MoeParams<'_>, selection: &MoeDecodeSelection) -> bool {
+    selection.hetero_device
+        && params.ep_mode == crate::families::moe::MoeEpMode::None
+        && params.routed_out.is_none()
+        && super::decode_shared_down_defers(params, selection.route)
+}
+
 fn lower_decode<'a>(
     state: &'a MoeStepState<'a>,
 ) -> Result<SmallVec<[Step<'a>; INLINE_STEP_CAPACITY]>, DispatchError> {
     let (params, selection) = state.decode_parts()?;
+    if selection.hetero_device && selection.cpu_split {
+        return Err(split_error(
+            "the hetero device split and the CPU split are exclusive",
+        ));
+    }
     if selection.cpu_split {
         if let Some(reason) = cpu_split_decode_conflict(
             params,
@@ -2738,6 +3022,11 @@ fn lower_decode<'a>(
                 Step::MoeStage(op(state), MoeStage::PrepareSplit),
             )?;
         }
+        if selection.hetero_device {
+            // Device publish of the route and the device-masked ids, strictly
+            // before the routed GPU tail that reads them.
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::PublishCold))?;
+        }
         if !selection.cpu_deferred_experts {
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::GateUp))?;
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Activation))?;
@@ -2747,6 +3036,18 @@ fn lower_decode<'a>(
             &mut steps,
             Step::MoeStage(op(state), MoeStage::MutationFence),
         )?;
+        let shared_deferred = decode_shared_deferred(params, selection);
+        if selection.hetero_device {
+            // The shared down's GEMV runs while the expert device answers;
+            // its fold waits for the routed combine (`SharedAdd`).
+            if shared_deferred {
+                append_step(&mut steps, Step::MoeStage(op(state), MoeStage::SharedDown))?;
+            }
+            // The expert device's cold rows join the expanded rows the
+            // canonical combine folds.
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::AwaitCold))?;
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::InstallCold))?;
+        }
         if selection.cpu_split && !selection.cpwait {
             // The cold slot rows are queued behind the GPU down (same stream)
             // and before the canonical combine of the original route.
@@ -2798,7 +3099,9 @@ fn lower_decode<'a>(
         if combine_after_down {
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Combine))?;
         }
-        if params.recipe.shared_after_combine() && !params.skip_shared {
+        if shared_deferred {
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::SharedAdd))?;
+        } else if params.recipe.shared_after_combine() && !params.skip_shared {
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::SharedDown))?;
         }
         if selection.cpu_deferred_experts && !splice_first {
@@ -2847,6 +3150,45 @@ fn lower_prefill<'a>(
     let mut steps = SmallVec::new();
     let op = |state: &'a MoeStepState<'a>| SealedMoeOp::new(state);
     append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Normalize))?;
+    if matches!(
+        params.prelude.route,
+        super::sealed_moe::PrefillRouteMode::HeteroCold { .. }
+    ) {
+        // The hetero expert device: the primary's route is already in the
+        // top-k buffers, so no router, route or shared stage runs; only the
+        // routed tail over the cold slots, combined into the zeroed partial.
+        if selection.cpu_split || selection.cpu_deferred_experts || selection.resolution.paro_mode {
+            return Err(DispatchError::Hip(
+                "sealed moe: HeteroCold prefill admits no CPU split, CPU deferral or Paro basis"
+                    .into(),
+            ));
+        }
+        // A shipped int4 sidecar is the gate/up's activation: no basis runs.
+        let shipped_xq = matches!(
+            params.prelude.route,
+            super::sealed_moe::PrefillRouteMode::HeteroCold { xq: Some(_) }
+        );
+        if !shipped_xq {
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::InputBasis))?;
+        }
+        if selection.uses_grouped_rows() {
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Scatter))?;
+        }
+        append_step(&mut steps, Step::MoeStage(op(state), MoeStage::GateUp))?;
+        if selection.uses_grouped_rows() {
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Unscatter))?;
+        }
+        append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Activation))?;
+        append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Down))?;
+        append_step(
+            &mut steps,
+            Step::MoeStage(op(state), MoeStage::MutationFence),
+        )?;
+        if selection.uses_grouped_rows() || !selection.resolution.down_path0 {
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Combine))?;
+        }
+        return Ok(steps);
+    }
     if params.ep_row_gather.is_some()
         && (!selection
             .route
@@ -2908,13 +3250,89 @@ fn lower_prefill<'a>(
         }
         // `HIPFIRE_QWEN4_MOE_ROUTE_SCATTER`: only the lowering whose very next routed stage is
         // `Scatter` (no owner assignment, no CPU split / deferral) lets the route stage launch
-        // the scatter with the router.
+        // the scatter with the router. Never under a hetero exchange: its publish
+        // writes the masked ids the scatter reads, between the route and the scatter.
         state.route_scatter_allowed.set(
             !owner_assign
                 && !selection.cpu_split
                 && !selection.cpu_deferred_experts
+                && !selection.hetero_prefill
+                && !selection.hetero_rows
                 && selection.uses_grouped_rows(),
         );
+        if selection.hetero_rows {
+            if selection.cpu_split || selection.hetero_prefill || selection.uses_grouped_rows() {
+                return Err(DispatchError::Hip(
+                    "sealed moe: the hetero rows exchange needs the per-slot route alone (no CPU split, prefill exchange or grouped rows)".into(),
+                ));
+            }
+            // The decode exchange over a few rows: publish the route and the
+            // rotated rows, run the hot tail on masked ids (cold slots store
+            // zero), then install the expert device's cold slot rows ahead of
+            // the canonical combine of the original route.
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::PublishCold))?;
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::GateUp))?;
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Activation))?;
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Down))?;
+            append_step(
+                &mut steps,
+                Step::MoeStage(op(state), MoeStage::MutationFence),
+            )?;
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::AwaitCold))?;
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::InstallCold))?;
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Combine))?;
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::SharedDown))?;
+            return Ok(steps);
+        }
+        if selection.hetero_prefill {
+            if selection.cpu_split
+                || selection.cpu_deferred_experts
+                || params.ep_row_gather.is_some()
+                || params.ep_tile_exchange.is_some()
+                || params.routed_out.is_some()
+            {
+                return Err(DispatchError::Hip(
+                    "sealed moe: the hetero prefill exchange is exclusive with the CPU split, CPU deferral, EP exchanges and routed_out".into(),
+                ));
+            }
+            // The cold exchange starts as soon as the route exists and runs
+            // on side streams under the hot routed tail; the join adds the
+            // cold partial after the hot combine.
+            append_step(
+                &mut steps,
+                Step::MoeStage(op(state), MoeStage::PublishColdRows),
+            )?;
+            if selection.uses_grouped_rows() {
+                append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Scatter))?;
+            }
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::GateUp))?;
+            append_step(
+                &mut steps,
+                Step::MoeStage(op(state), MoeStage::SendColdRows),
+            )?;
+            if selection.uses_grouped_rows() {
+                append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Unscatter))?;
+            }
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Activation))?;
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Down))?;
+            append_step(
+                &mut steps,
+                Step::MoeStage(op(state), MoeStage::MutationFence),
+            )?;
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Combine))?;
+            if params.recipe.shared_after_combine() {
+                append_step(&mut steps, Step::MoeStage(op(state), MoeStage::SharedDown))?;
+            }
+            // Last: hot, then shared, then cold, the order the layer-major
+            // schedule's deferred join has, so the two schedules agree bitwise.
+            if !selection.hetero_defer_join {
+                append_step(
+                    &mut steps,
+                    Step::MoeStage(op(state), MoeStage::JoinColdRows),
+                )?;
+            }
+            return Ok(steps);
+        }
         if selection.cpu_split {
             // Distinct eager CPU-cold/GPU-hot split. The original route feeds
             // the unchanged canonical combine and the shared expert; only the
@@ -3387,7 +3805,12 @@ pub(super) fn execute_after_clear(
     let state = MoeStepState::new(call);
     state.front_allowed.set(true);
     state.epilogue_fuse_allowed.set(true);
-    if let Some(write) = hc {
+    // Hetero prefill: the cold partial is added after the shared down, so an
+    // HC write folded into the shared down's epilogue would miss it.
+    let hetero_prefill = state
+        .prefill_parts()
+        .is_ok_and(|(_, selection)| selection.hetero_prefill);
+    if let Some(write) = hc.filter(|_| !hetero_prefill) {
         let mut offered = super::qt44_qt53_prefill::HcSharedDown::offer(write);
         if let (Some(offered), Some((read, next_write))) = (offered.as_mut(), next) {
             if let Ok((params, selection)) = state.prefill_parts() {
@@ -3396,6 +3819,11 @@ pub(super) fn execute_after_clear(
                     .route
                     .is_some_and(MoeRouteCapability::is_sealed_grouped)
                     && !selection.cpu_split
+                    && !selection.hetero_rows
+                    // The row fold rebuilds the result from the routed rows and
+                    // never reads the target, so it would drop the hetero
+                    // prefill's cold partial (added to the target by JoinColdRows).
+                    && !selection.hetero_prefill
                     && super::qt44_qt53_prefill::row_fold_applies(
                         gpu,
                         params,
@@ -3689,6 +4117,23 @@ pub(super) fn select_decode(
             }
             None => false,
         };
+    let hetero_device = params.batch_size == 1 && params.routed_experts.hetero_split().is_some();
+    if hetero_device {
+        if cpu_split {
+            return Err(DispatchError::Hip(
+                "sealed moe: hetero device split and the CPU tier split are exclusive".into(),
+            ));
+        }
+        if !resolution.use_gpu_topk
+            || !resolution.needs_x_rot_local
+            || !params.down_writes_expanded()
+        {
+            return Err(DispatchError::Hip(
+                "sealed moe: hetero device split requires the GPU top-K path, a rotated local activation and an expanded down".into(),
+            ));
+        }
+    }
+    let no_fuse = cpu_split || hetero_device;
     if params.ep_mode == crate::families::moe::MoeEpMode::RootRoutedPartial {
         if !resolution.use_gpu_topk {
             return Err(DispatchError::Hip(
@@ -3848,25 +4293,24 @@ pub(super) fn select_decode(
     resolution.check_generic_route(route)?;
     Ok(MoeDecodeSelection {
         resolution,
-        router_shared_fuse: router_shared_fuse && !cpu_split,
+        router_shared_fuse: router_shared_fuse && !no_fuse,
         exact_wave64_router,
         wave64_router,
-        down_last_combine: down_last_combine && !cpu_split,
+        down_last_combine: down_last_combine && !no_fuse,
         route,
         // The split's routed down always writes the expanded F32 slot rows the
         // canonical combine folds: no fused or self-combining down arm exists.
-        ninepath_d3: !cpu_split && ninepath_hfq4 && matches!(ninepath_mode, "1" | "d3" | "on"),
-        ninepath_d4: !cpu_split
-            && ninepath_eligible
-            && !matches!(ninepath_mode, "0" | "off" | "d3"),
-        ninepath_mq3l: ninepath_mq3l && !cpu_split,
-        ninepath_mq4v2: ninepath_mq4v2 && !cpu_split,
+        ninepath_d3: !no_fuse && ninepath_hfq4 && matches!(ninepath_mode, "1" | "d3" | "on"),
+        ninepath_d4: !no_fuse && ninepath_eligible && !matches!(ninepath_mode, "0" | "off" | "d3"),
+        ninepath_mq3l: ninepath_mq3l && !no_fuse,
+        ninepath_mq4v2: ninepath_mq4v2 && !no_fuse,
         ninepath_mq4g128v2: ninepath_mq4g128v2
-            && !cpu_split
+            && !no_fuse
             && !matches!(ninepath_mode, "0" | "off" | "d3"),
-        ninepath_mq6v2: ninepath_mq6v2 && !cpu_split,
+        ninepath_mq6v2: ninepath_mq6v2 && !no_fuse,
         cpu_deferred_experts: params.cpu_deferred_experts,
         cpu_split,
+        hetero_device,
         cpwait: cpu_split
             && crate::families::moe::cpu_split_executor(params.routed_experts, params.batch_size)
                 .is_some_and(CpuSplitExecutor::cpwait_active),
@@ -3875,9 +4319,9 @@ pub(super) fn select_decode(
             params,
             &resolution,
             route,
-            router_shared_fuse && !cpu_split,
+            router_shared_fuse && !no_fuse,
             skip_routing,
-            cpu_split,
+            no_fuse,
         ),
     })
 }
@@ -4497,6 +4941,9 @@ pub(super) fn select_prefill(
             cpu_deferred_experts: false,
             cpu_split: false,
             cpwait: false,
+            hetero_prefill: false,
+            hetero_rows: false,
+            hetero_defer_join: false,
         });
     }
     let route = (matches!(params.recipe, MoeRecipe::SoftmaxGatedShared { .. })
@@ -4506,8 +4953,28 @@ pub(super) fn select_prefill(
         && matches!(
             params.prelude.route,
             super::sealed_moe::PrefillRouteMode::Replicated
+                | super::sealed_moe::PrefillRouteMode::HeteroCold { .. }
         ))
     .then(|| {
+        if matches!(
+            params.prelude.route,
+            super::sealed_moe::PrefillRouteMode::HeteroCold { .. }
+        ) {
+            return super::select_grouped_route_routed_only(
+                &params.dtypes,
+                params.n_exp,
+                params.k_top,
+                params.gate_up_k,
+                params.mi,
+                params.gate_up_k,
+                params.down_m,
+                params.down_k,
+                params.expert_dtype_tags,
+                params.expert_down_awq_ptrs.is_some() || params.down_awq_scale.is_some(),
+                params.route_policy,
+                ctx.arch.arch(),
+            );
+        }
         super::select_grouped_route(
             &params.dtypes,
             params.n_exp,
@@ -4549,7 +5016,7 @@ pub(super) fn select_prefill(
     }
     let (host_gate_up, host_down) =
         crate::families::moe::routed_host_mapped_projections(params.routed_experts);
-    let resolution = MoePrefillResolution::resolve_with_batch_ctx(
+    let mut resolution = MoePrefillResolution::resolve_with_batch_ctx(
         &params.dtypes,
         &ctx.arch,
         &ctx.flags,
@@ -4558,6 +5025,38 @@ pub(super) fn select_prefill(
         host_gate_up || host_down,
     );
     resolution.check_generic_route(route)?;
+    // The hetero rows exchange: a few-row window (an MTP verify, a short
+    // prompt) whose layer exposes the device split takes the decode slot on
+    // the per-slot route (Path 1), whose down writes the F32 slot rows the
+    // expert device's cold rows are installed into before the canonical
+    // combine. Graded-mixed experts keep Path 2: their all-indexed narrow
+    // verify is known-bad (see `MoePrefillResolution::resolve_with_batch_ctx`).
+    let hetero_rows = params.batch_size >= 2
+        && !params.dtypes.routed_has_mixed_experts
+        && route.is_some_and(|r| r.is_qt44_qt53_grouped() && !r.is_slab())
+        && !matches!(
+            params.prelude.route,
+            super::sealed_moe::PrefillRouteMode::HeteroCold { .. }
+        )
+        && !params.cpu_deferred_experts
+        && params.routed_out.is_none()
+        && params.ep_row_gather.is_none()
+        && params.ep_tile_exchange.is_none()
+        && matches!(
+            params.recipe,
+            MoeRecipe::SoftmaxGatedShared {
+                bf16_round_trip: true,
+                shared_after_combine: true
+            }
+        )
+        && matches!(params.prelude.normalization, MoeNormalization::Provided)
+        && params
+            .routed_experts
+            .hetero_split()
+            .is_some_and(|split| params.batch_size <= split.max_rows);
+    if hetero_rows {
+        resolution.use_path2 = false;
+    }
     if route.is_some_and(MoeRouteCapability::is_slab) {
         // The slab route is a replicated, single-device lowering (resident or staged experts)
         // lowering whose K2 arm is the grouped protocol: nothing else may
@@ -4617,80 +5116,93 @@ pub(super) fn select_prefill(
             && params.batch_size >= 2,
         rdna_compute::prefill_invariant::qwen4_row_exact_verify_rows(ctx.arch.arch()),
     );
-    let cpu_split = match crate::families::moe::cpu_split_executor(
-        params.routed_experts,
-        params.batch_size,
-    ) {
-        Some(executor) => {
-            if let Some(reason) = cpu_split_prefill_conflict(
-                params,
-                route,
-                params.cpu_deferred_experts,
-                Some(executor),
-            ) {
-                return Err(DispatchError::Hip(format!(
-                    "sealed moe: CPU tier split: {reason}"
-                )));
-            }
-            true
-        }
-        None => {
-            // Storage-plus-scope gate for the actual CPU-owned expert window:
-            // armed whole-routing-window calls only (tails keep the GPU route),
-            // qualified width only, allocated capacity only. Ordinary prefill
-            // and lanes observe the default scope (`<= 8`) and stay `None`
-            // here, exactly as before.
-            let capacity = params
-                .routed_experts
-                .cpu_split()
-                .map(|executor| executor.capacity_rows())
-                .unwrap_or(0);
-            // `ctx.batch_size == 0` (unknown: lanes, S1, tests, non-FN seals)
-            // never qualifies wide: only the FN forward loop threads real
-            // route rows. `route_rows` below falls back to `params.batch_size`
-            // only to keep the whole-window predicate total; an unknown route
-            // with a default scope still refuses via the scope gate.
-            let route_rows = if ctx.batch_size == 0 {
-                usize::MAX
-            } else {
-                ctx.batch_size
-            };
-            if !crate::families::moe::cpu_wide_window_qualified(
-                true,
-                params.batch_size,
-                route_rows,
-                cpu_wide_scope,
-                capacity,
-            ) {
-                false
-            } else {
-                match crate::families::moe::cpu_split_executor_wide(
-                    params.routed_experts,
-                    params.batch_size,
+    // The hetero prefill split: a QT44/QT53 grouped chunk that fits the
+    // expert device's slot, never on the expert device's own HeteroCold call.
+    let hetero_prefill = !hetero_rows
+        && params.batch_size >= 2
+        && route.is_some_and(|r| r.is_qt44_qt53_grouped() && !r.is_slab())
+        && !matches!(
+            params.prelude.route,
+            super::sealed_moe::PrefillRouteMode::HeteroCold { .. }
+        )
+        && params
+            .routed_experts
+            .hetero_prefill()
+            .is_some_and(|split| params.batch_size <= split.max_rows());
+    let cpu_split = !hetero_prefill
+        && !hetero_rows
+        && match crate::families::moe::cpu_split_executor(params.routed_experts, params.batch_size)
+        {
+            Some(executor) => {
+                if let Some(reason) = cpu_split_prefill_conflict(
+                    params,
+                    route,
+                    params.cpu_deferred_experts,
+                    Some(executor),
                 ) {
-                    Some(executor) => {
-                        if let Some(reason) = cpu_split_prefill_conflict(
-                            params,
-                            route,
-                            params.cpu_deferred_experts,
-                            Some(executor),
-                        ) {
-                            return Err(DispatchError::Hip(format!(
-                                "sealed moe: CPU tier split: {reason}"
-                            )));
-                        }
-                        if ctx.batch_size != params.batch_size {
-                            return Err(DispatchError::Hip(
+                    return Err(DispatchError::Hip(format!(
+                        "sealed moe: CPU tier split: {reason}"
+                    )));
+                }
+                true
+            }
+            None => {
+                // Storage-plus-scope gate for the actual CPU-owned expert window:
+                // armed whole-routing-window calls only (tails keep the GPU route),
+                // qualified width only, allocated capacity only. Ordinary prefill
+                // and lanes observe the default scope (`<= 8`) and stay `None`
+                // here, exactly as before.
+                let capacity = params
+                    .routed_experts
+                    .cpu_split()
+                    .map(|executor| executor.capacity_rows())
+                    .unwrap_or(0);
+                // `ctx.batch_size == 0` (unknown: lanes, S1, tests, non-FN seals)
+                // never qualifies wide: only the FN forward loop threads real
+                // route rows. `route_rows` below falls back to `params.batch_size`
+                // only to keep the whole-window predicate total; an unknown route
+                // with a default scope still refuses via the scope gate.
+                let route_rows = if ctx.batch_size == 0 {
+                    usize::MAX
+                } else {
+                    ctx.batch_size
+                };
+                if !crate::families::moe::cpu_wide_window_qualified(
+                    true,
+                    params.batch_size,
+                    route_rows,
+                    cpu_wide_scope,
+                    capacity,
+                ) {
+                    false
+                } else {
+                    match crate::families::moe::cpu_split_executor_wide(
+                        params.routed_experts,
+                        params.batch_size,
+                    ) {
+                        Some(executor) => {
+                            if let Some(reason) = cpu_split_prefill_conflict(
+                                params,
+                                route,
+                                params.cpu_deferred_experts,
+                                Some(executor),
+                            ) {
+                                return Err(DispatchError::Hip(format!(
+                                    "sealed moe: CPU tier split: {reason}"
+                                )));
+                            }
+                            if ctx.batch_size != params.batch_size {
+                                return Err(DispatchError::Hip(
                                 "sealed moe: CPU tier split: requires route rows equal to the window rows (prefill-invariant scope is refused)".into(),
                             ));
+                            }
+                            true
                         }
-                        true
+                        None => false,
                     }
-                    None => false,
                 }
             }
-        }
-    };
+        };
     let _total_slots = params
         .batch_size
         .checked_mul(params.k_top)
@@ -4787,6 +5299,13 @@ pub(super) fn select_prefill(
         route,
         cpu_deferred_experts: params.cpu_deferred_experts,
         cpu_split,
+        hetero_prefill,
+        hetero_rows,
+        hetero_defer_join: hetero_prefill
+            && params
+                .routed_experts
+                .hetero_prefill()
+                .is_some_and(|split| split.shared.defer_join()),
         cpwait: cpu_split
             && cpu_split_executor_for_join(
                 params.routed_experts,

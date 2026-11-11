@@ -204,8 +204,17 @@ pub struct Qwen4Bundle {
     /// boundary stages, the open window, receipt and failure injection.
     pub(crate) slowlink: SlowlinkOwner,
     /// `HIPFIRE_QWEN4_TURN_SNAPSHOTS` (read once at assembly): also snapshot
-    /// at message ends. Active only with `turn_end_token`.
+    /// at message ends. Active only with `turn_end_token`. Default on under
+    /// `topology.hetero_experts` (in its final-turn form below).
     turn_snapshots: bool,
+    /// `topology.hetero_experts`: the message-end boundary is only the
+    /// prompt's LAST message end (where the session's next turn resumes),
+    /// never every one. Each boundary is a prefill split, and the hetero
+    /// prompt driver turns a split into a tile edge: an agent prompt's
+    /// hundreds of message ends cut a 58K-token cold prefill into slivers
+    /// (509 tok/s), and its snapshots into chains whose restore copied each
+    /// link across the link. One extra split per prompt keeps the tiles.
+    final_turn_only: bool,
     tail_snapshot: bool,
     tail_snapshot_min_gap: usize,
     tail_snapshot_min_prompt: usize,
@@ -414,6 +423,27 @@ pub(crate) fn session_scope(
     scope
 }
 
+/// [`stride_boundaries`] with only the prompt's LAST message end added (when
+/// `turn_end` is known and that end lies in `(after, up_to]` off the stride):
+/// the point a session's next turn resumes from, one extra prefill split.
+pub(crate) fn final_turn_boundaries(
+    stride: usize,
+    prompt: &[u32],
+    turn_end: Option<u32>,
+    after: usize,
+    up_to: usize,
+) -> Vec<usize> {
+    let mut boundaries = stride_boundaries(stride, prompt, None, after, up_to);
+    let last_end = turn_end
+        .and_then(|token| prompt.iter().rposition(|&id| id == token))
+        .map(|i| i + 1);
+    if let Some(p) = last_end.filter(|&p| after < p && p <= up_to && p % stride != 0) {
+        boundaries.push(p);
+        boundaries.sort_unstable();
+    }
+    boundaries
+}
+
 impl SessionState for Qwen4Bundle {
     fn snapshot_scope(&self, route: SessionRoute) -> Option<String> {
         // An attached root is not a band: its aggregate scope is the mesh
@@ -438,6 +468,11 @@ impl SessionState for Qwen4Bundle {
         // own cadence (`checkpoint_stride_rows`): the pair is a distinct
         // numeric/cache identity, never aliasing an explicit chunk-1536
         // cadence or the incumbent chunk-8192 math.
+        // Final-turn-only splits a different schedule from every-message-end:
+        // never the same session-exact domain.
+        if self.final_turn_only && self.turn_snapshots_active() {
+            scope.push_str("/final-turn");
+        }
         scope.push_str(&session_pair::slowlink_scope_tag(
             self.slowlink
                 .profile
@@ -460,6 +495,24 @@ impl SessionState for Qwen4Bundle {
         let Some(chunk) = self.session_cadence_rows() else {
             return Vec::new();
         };
+        if self.final_turn_only {
+            return final_turn_boundaries(
+                chunk,
+                prompt,
+                self.turn_end_token_active(),
+                after,
+                up_to,
+            );
+        }
+        stride_boundaries(chunk, prompt, self.turn_end_token_active(), after, up_to)
+    }
+
+    fn lookup_boundaries(&self, prompt: &[u32], after: usize, up_to: usize) -> Vec<usize> {
+        let Some(chunk) = self.session_cadence_rows() else {
+            return Vec::new();
+        };
+        // Final-turn mode captures one message end per turn, but every message
+        // end of this prompt may be an earlier turn's final one.
         stride_boundaries(chunk, prompt, self.turn_end_token_active(), after, up_to)
     }
 
@@ -960,7 +1013,11 @@ impl Qwen4Bundle {
             session: None,
             pair_session_stage: None,
             slowlink: SlowlinkOwner::default(),
-            turn_snapshots: hipfire_config::developer_bool(TURN_SNAPSHOTS_ENV, false),
+            turn_snapshots: hipfire_config::developer_bool(
+                TURN_SNAPSHOTS_ENV,
+                crate::hetero::split_requested(),
+            ),
+            final_turn_only: crate::hetero::split_requested(),
             tail_snapshot: hipfire_config::developer_bool(TAIL_SNAPSHOT_ENV, true),
             tail_snapshot_min_gap: hipfire_config::developer_var(TAIL_SNAPSHOT_MIN_GAP_ENV)
                 .ok()
@@ -2005,9 +2062,12 @@ impl Qwen4Bundle {
             .and_then(Qwen4GpuForward::ep_binding);
         let decision = crate::mtp_gpu::head_d2_decision(
             hipfire_config::memory::qwen4_mtp_head_d2(),
+            // Under `topology.hetero_experts` the trunk has no D2 layer, but
+            // the head follows the trunk's device split instead.
             self.execution
                 .as_ref()
-                .is_some_and(|forward| !forward.split_layers().is_empty()),
+                .is_some_and(|forward| !forward.split_layers().is_empty())
+                || crate::hetero::split_requested(),
             ep_binding.is_some(),
             // `HIPFIRE_QWEN4_MTP_HEAD_RESIDENT`: VRAM-resident head experts have
             // no host copy for the CPU arm.
@@ -2032,6 +2092,9 @@ impl Qwen4Bundle {
         )
         .map_err(|error| BundleError::Forward(error.to_string()))?;
         match (decision, mtp.head_d2_modes(), mtp.head_d2_host_bytes()) {
+            (crate::mtp_gpu::HeadD2Decision::Armed, _, _) if mtp.head_hetero() => {
+                eprintln!("  qwen4 MTP head: experts on the hetero device split (gfx1151)")
+            }
             (
                 crate::mtp_gpu::HeadD2Decision::Armed,
                 Some(modes),
@@ -2550,6 +2613,12 @@ impl Qwen4Bundle {
     /// on and the `<|im_end|>` token known).
     pub fn turn_snapshots_active(&self) -> bool {
         self.turn_end_token_active().is_some()
+    }
+
+    /// Whether the message-end boundary is the prompt's last one only
+    /// (`topology.hetero_experts`).
+    pub fn final_turn_snapshots(&self) -> bool {
+        self.final_turn_only
     }
 
     /// Set the tokenizer's `<|im_end|>` id: with `HIPFIRE_QWEN4_TURN_SNAPSHOTS`
@@ -4723,12 +4792,19 @@ impl Qwen4Bundle {
     /// Attach the session cache (`hipfire_runtime::session_cache`): prefill
     /// then restores and captures whole-chunk snapshots through it.
     pub fn attach_session_cache(&mut self, mut cache: SessionCache) {
-        if let Some(policy) = session_pair::pressure_host_snapshot_policy(
-            self.slowlink
-                .profile
-                .map(|profile| profile.device_snapshot_budget_bytes),
-            || cache.usage().budget_bytes,
-        ) {
+        // `topology.hetero_experts`: the primary's VRAM holds the trunk and the
+        // hot expert set to the last expert that fits, so the cache gets no
+        // device credit (budget 0) and every snapshot lives in pinned host
+        // memory beside the cold experts; a restore is one host-to-device copy
+        // (~0.5 s for 25K tokens over USB4) instead of a re-prefill.
+        let device_budget = self
+            .slowlink
+            .profile
+            .map(|profile| profile.device_snapshot_budget_bytes)
+            .or_else(|| crate::hetero::split_requested().then_some(0));
+        if let Some(policy) = session_pair::pressure_host_snapshot_policy(device_budget, || {
+            cache.usage().budget_bytes
+        }) {
             cache.enable_pressure_host_snapshots(policy);
         }
         self.session = Some(SessionDriver::new(cache));
@@ -7697,5 +7773,52 @@ pub(crate) fn spec_hidden_capacity_rows(
         Some(rows.max(chunk.checked_mul(2)?))
     } else {
         Some(rows)
+    }
+}
+
+#[cfg(test)]
+mod final_turn_boundaries_tests {
+    use super::final_turn_boundaries;
+
+    const END: u32 = 7;
+
+    #[test]
+    fn adds_only_the_last_message_end() {
+        // Message ends after indices 2, 5 and 9 -> positions 3, 6, 10; stride 4.
+        let mut prompt = vec![1u32; 12];
+        for i in [2, 5, 9] {
+            prompt[i] = END;
+        }
+        assert_eq!(
+            final_turn_boundaries(4, &prompt, Some(END), 0, 12),
+            vec![4, 8, 10, 12]
+        );
+        // No turn-end token known: stride multiples only.
+        assert_eq!(
+            final_turn_boundaries(4, &prompt, None, 0, 12),
+            vec![4, 8, 12]
+        );
+    }
+
+    #[test]
+    fn the_last_end_must_lie_in_the_window_and_off_the_stride() {
+        let mut prompt = vec![1u32; 12];
+        prompt[9] = END; // position 10
+        assert_eq!(
+            final_turn_boundaries(4, &prompt, Some(END), 10, 12),
+            vec![12],
+            "at `after`: excluded"
+        );
+        assert_eq!(
+            final_turn_boundaries(4, &prompt, Some(END), 0, 9),
+            vec![4, 8],
+            "past `up_to`: excluded"
+        );
+        prompt[9] = 1;
+        prompt[7] = END; // position 8, a stride multiple: no duplicate
+        assert_eq!(
+            final_turn_boundaries(4, &prompt, Some(END), 0, 12),
+            vec![4, 8, 12]
+        );
     }
 }

@@ -44,6 +44,12 @@ required-features = ["lab"]
 name = "bench_moe_grouped_qt44_iu4"
 required-features = ["lab"]
 [[example]]
+name = "hetero_split_kernels_oracle"
+required-features = ["lab"]
+[[example]]
+name = "hetero_iu4_xarch_probe"
+required-features = ["lab"]
+[[example]]
 name = "npu_trunk_glue_check"
 required-features = ["lab"]
 [[example]]

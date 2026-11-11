@@ -3254,6 +3254,15 @@ impl Qwen4MtpGpu {
         })
     }
 
+    /// Whether the head's experts run on the hetero device split
+    /// (`topology.hetero_experts`).
+    pub(crate) fn head_hetero(&self) -> bool {
+        use hipfire_dispatch::families::moe::RoutedExpertWeights;
+        self.moe
+            .as_ref()
+            .is_some_and(|moe| moe.hetero_split().is_some())
+    }
+
     /// Whether the head's experts run on a rows=1 D2 split executor.
     pub(crate) fn head_d2_armed(&self) -> bool {
         self.head_d2_executor().is_some()

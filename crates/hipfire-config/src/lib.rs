@@ -2390,6 +2390,18 @@ pub static FIELDS: &[ConfigField] = &[
         Some("HIPFIRE_TOPOLOGY_PP"),
         "Pipeline-parallel degree: 1 (default, single device) or 2..=8, for models whose carrier declares pipeline parallelism (today: Qwen3.5 and Qwen4 / Flash-Next, HFQ files only). Layers split into N contiguous stages across the first N visible devices (hardware.devices / HIPFIRE_DEVICES). An explicit load request with pp > 1 overrides this value; a request of 1 or no request uses it. Cannot combine with tensor parallelism (tp) or expert parallelism (topology.ep)."
     ),
+    field!(
+        "topology.hetero_experts",
+        "hetero_experts",
+        Hardware,
+        ModelLoad,
+        DefaultValue::Null,
+        ValueRule::NullableString,
+        false,
+        true,
+        Some("HIPFIRE_TOPOLOGY_HETERO_EXPERTS"),
+        "Qwen4 (Flash-Next) heterogeneous expert split: the gfx arch of the device that holds and computes cold routed experts (v1: \"gfx1151\" only), beside a gfx1201 primary that runs the trunk and hot experts. Needs hardware.devices = \"gfx1201,gfx1151\" (the gfx1201 first) and hardware.allow_mixed_arch; cannot combine with topology.ep or topology.pp (Qwen4 admits no tp > 1). A key on any other device set refuses the load. Opt-in; null = off."
+    ),
     process_field!(
         "hardware.uniform_vram_tolerance_gb",
         "uniform_vram_tolerance_gb",
@@ -10355,6 +10367,45 @@ pub mod topology {
     pub const PP_ENV: &str = "HIPFIRE_TOPOLOGY_PP";
     /// Largest pipeline-parallel degree the schema admits.
     pub const PP_MAX_DEGREE: usize = 8;
+    /// Compatibility spelling of `topology.hetero_experts`.
+    pub const HETERO_EXPERTS_ENV: &str = "HIPFIRE_TOPOLOGY_HETERO_EXPERTS";
+    /// Expert-device archs the heterogeneous expert split is tested with.
+    const HETERO_EXPERT_ARCHS: &[&str] = &["gfx1151"];
+
+    /// Pure resolver behind `topology.hetero_experts`: unset, empty or blank is
+    /// off (`None`); otherwise the expert device's arch, which must be a tested
+    /// one, needs `hardware.allow_mixed_arch`, and cannot combine with
+    /// `topology.ep`, `topology.pp` or tensor parallelism.
+    pub fn resolve_hetero_experts(
+        value: Option<&str>,
+        allow_mixed_arch: bool,
+        ep: usize,
+        pp: usize,
+        tp: usize,
+    ) -> Result<Option<String>, String> {
+        let Some(arch) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+            return Ok(None);
+        };
+        if !HETERO_EXPERT_ARCHS.contains(&arch) {
+            return Err(format!(
+                "topology.hetero_experts={arch:?}: the expert device must be one of {HETERO_EXPERT_ARCHS:?} (gfx1151 is the tested pair with a gfx1201 primary)"
+            ));
+        }
+        if !allow_mixed_arch {
+            return Err(
+                "topology.hetero_experts pairs different GPU architectures; set hardware.allow_mixed_arch = true"
+                    .to_owned(),
+            );
+        }
+        for (key, degree) in [("topology.ep", ep), ("topology.pp", pp), ("tp", tp)] {
+            if degree > 1 {
+                return Err(format!(
+                    "topology.hetero_experts cannot combine with {key} = {degree}"
+                ));
+            }
+        }
+        Ok(Some(arch.to_owned()))
+    }
 
     /// Pure parser behind [`ep`]: unset or empty is 1 (the default); an
     /// integer outside `1..=`[`EP_MAX_DEGREE`] is a refusal naming the range.
@@ -10487,6 +10538,57 @@ pub mod topology {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn hetero_unset_is_off() {
+            assert_eq!(resolve_hetero_experts(None, false, 1, 1, 1), Ok(None));
+        }
+
+        #[test]
+        fn hetero_empty_is_off() {
+            assert_eq!(resolve_hetero_experts(Some("  "), false, 1, 1, 1), Ok(None));
+        }
+
+        #[test]
+        fn hetero_needs_mixed_arch() {
+            let e = resolve_hetero_experts(Some("gfx1151"), false, 1, 1, 1).unwrap_err();
+            assert!(
+                e.contains("topology.hetero_experts") && e.contains("hardware.allow_mixed_arch"),
+                "{e}"
+            );
+        }
+
+        #[test]
+        fn hetero_refuses_other_parallelism() {
+            for (ep, pp, tp, key) in [
+                (2, 1, 1, "topology.ep"),
+                (1, 2, 1, "topology.pp"),
+                (1, 1, 2, "tp"),
+            ] {
+                let e = resolve_hetero_experts(Some("gfx1151"), true, ep, pp, tp).unwrap_err();
+                assert!(e.contains(key), "{e}");
+            }
+        }
+
+        #[test]
+        fn hetero_v1_accepts_only_gfx1151() {
+            assert_eq!(
+                resolve_hetero_experts(Some("gfx1151"), true, 1, 1, 1),
+                Ok(Some("gfx1151".into()))
+            );
+            assert!(resolve_hetero_experts(Some("gfx1100"), true, 1, 1, 1)
+                .unwrap_err()
+                .contains("gfx1151"));
+        }
+
+        #[test]
+        fn hetero_key_is_in_the_schema() {
+            let field = crate::FIELDS
+                .iter()
+                .find(|field| field.key == "topology.hetero_experts")
+                .expect("topology.hetero_experts is in the schema");
+            assert_eq!(field.env_compat, Some(HETERO_EXPERTS_ENV));
+        }
 
         #[test]
         fn parse_ep_defaults_and_allowed_set() {

@@ -625,6 +625,25 @@ pub fn prepare_host_memory_for(model: &std::path::Path) {
     }
 }
 
+/// The HIP runtime switches a process that requests `topology.hetero_experts`
+/// needs, set before the runtime loads: it keeps two devices' streams fed at
+/// once and submits through per-stream worker threads
+/// (`hip_bridge::dispatch_on_worker_threads`), and it host-maps the cold
+/// routed experts through the gfx1201 primary, so host memory stays out of
+/// reclaim (`hip_bridge::keep_host_memory_out_of_reclaim`) although the device
+/// list also names the unified-memory expert device, which
+/// [`prepare_host_memory_for`] alone leaves at ROCm's defaults. The daemon
+/// calls it once the process configuration is installed and before its first
+/// HIP call.
+pub fn prepare_dispatch() {
+    if hipfire_arch_qwen4::hetero_split_requested() {
+        hip_bridge::dispatch_on_worker_threads("topology.hetero_experts");
+        hip_bridge::keep_host_memory_out_of_reclaim(
+            "topology.hetero_experts: experts host-mapped through gfx1201",
+        );
+    }
+}
+
 /// Executable local-path Qwen4 carrier.  Distribution/product admission stays
 /// outside this registry; this route only makes an already admitted HFQM
 /// artifact loadable.
@@ -10084,8 +10103,13 @@ fn load_qwen4_rank_unscoped(
         );
         bundle.set_turn_end_token(seed.tokenizer.special_token_id("<|im_end|>"));
         if bundle.turn_snapshots_active() {
+            let which = if bundle.final_turn_snapshots() {
+                "final message end"
+            } else {
+                "every message end"
+            };
             eprintln!(
-                "  qwen4 session cache{band_tag}: message-end snapshots on (HIPFIRE_QWEN4_TURN_SNAPSHOTS)"
+                "  qwen4 session cache{band_tag}: message-end snapshots on ({which}; HIPFIRE_QWEN4_TURN_SNAPSHOTS)"
             );
         }
     }

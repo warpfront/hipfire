@@ -1490,6 +1490,7 @@ pub fn ep_emit_done(
         "prefill_ms": (prefill_ms * 10.0).round() / 10.0,
         "prefill_tok_s": (prefill_tok_s * 10.0).round() / 10.0,
         "decode_tok_s": (decode_tok_s * 10.0).round() / 10.0,
+        "decode_ms": (decode_ms * 10.0).round() / 10.0,
         "ttft_ms": (prefill_ms * 10.0).round() / 10.0,
         "finish_reason": finish_reason,
         "attempt_id": active_attempt_id(),
@@ -2181,6 +2182,7 @@ pub fn ep_serve_ds4(
         "prefill_ms": prefill_ms,
         "prefill_tok_s": prefill_tok_s,
         "decode_tok_s": decode_tok_s,
+        "decode_ms": (decode_ms * 10.0).round() / 10.0,
         "ttft_ms": prefill_ms,
         "finish_reason": finish_reason,
         "attempt_id": active_attempt_id(),
@@ -3333,6 +3335,7 @@ pub fn generate_dflash(
     // so the caller must fall through to the arch's AR path. Every other exit
     // (success, abort, error) has already written its envelope → true.
 ) -> bool {
+    let t_request = Instant::now();
     // Zero-budget reject before Jinja/render, configure_request, gen_start, or any
     // GPU/host mutation. Handled (true) so the caller does not fall through to AR.
     // Inner generate_spec keeps the same guard as defense-in-depth.
@@ -3913,6 +3916,13 @@ pub fn generate_dflash(
         id,
         started_in_think,
     );
+    if hipfire_config::developer_bool("HIPFIRE_QWEN_CACHE_TRACE", false) {
+        eprintln!(
+            "  request {id}: {:.1} ms render + tokenize before prefill ({} prompt tokens)",
+            t_request.elapsed().as_secs_f64() * 1e3,
+            prompt_tokens.len()
+        );
+    }
     let run = match generate_spec(
         m,
         gpu,
@@ -4107,6 +4117,7 @@ pub fn generate_dflash(
                     (run.prefill_s * 1000.0 * 10.0).round() / 10.0,
                     (prefill_tok_s * 10.0).round() / 10.0,
                     (decode_tok_s * 10.0).round() / 10.0,
+                    (run.decode_s * 1000.0 * 10.0).round() / 10.0,
                     (run.prefill_s * 1000.0 * 10.0).round() / 10.0,
                     (tau * 100.0).round() / 100.0,
                     run.spec_cycles,
@@ -4258,6 +4269,7 @@ pub fn generate_dflash(
             "prefill_ms": ((run.prefill_s * 1000.0) * 10.0).round() / 10.0,
             "prefill_tok_s": (prefill_tok_s * 10.0).round() / 10.0,
             "decode_tok_s": (decode_tok_s * 10.0).round() / 10.0,
+            "decode_ms": ((run.decode_s * 1000.0) * 10.0).round() / 10.0,
             "ttft_ms": ((run.prefill_s * 1000.0) * 10.0).round() / 10.0,
             "dflash": true,
             "tau": (tau * 100.0).round() / 100.0,
@@ -4808,12 +4820,12 @@ pub fn generate_spec(
     // `SpecEmitRequest`; the arch's carrier turns it into the concrete
     // `Box<dyn SpecEmit>` (extracting its own grammar schema from `tools`).
     // VMM promotion needs a request whose spec emitter state an AR producer
-    // can reproduce: no tools/grammar, no stop strings, no `min_tokens`, no
-    // think budget.
+    // can reproduce: no tools/grammar, no stop strings, no `min_tokens`. A
+    // think budget moves as a replayed `ThinkCtl` while it has not acted.
     let promo_shape_ok = emit_req.tools.is_none()
         && emit_req.stop.is_empty()
-        && emit_req.min_tokens == 0
-        && emit_req.max_think == 0;
+        && emit_req.min_tokens == 0;
+    let promo_max_think = emit_req.max_think;
     let logprobs_top_k = emit_req.logprobs_top_k;
     // Logprob fields of emission token `index` (`tok`), from the target row
     // the speculator kept for it.
@@ -5227,7 +5239,23 @@ pub fn generate_spec(
             {
                 let attempt = hipfire_engine::terminal::active_attempt_id();
                 let rng_state = request_seed_for(&AttemptKey::new(id, attempt), permit.client_seed);
-                let promoted = crate::batch::replay_ar_producer(id, promo_started_in_think, tokenizer, &emitted)
+                // The lane enforces the AR loop's think budget from here; it
+                // takes over only while the spec emitter's budget (the same
+                // span count) has not acted, so the text so far matches.
+                let think = (permit.max_think_tokens == promo_max_think)
+                    .then(|| {
+                        crate::vmm_conv::ThinkCtl::replay(
+                            promo_max_think,
+                            promo_started_in_think,
+                            tokenizer,
+                            &emitted,
+                        )
+                    })
+                    .flatten();
+                let promoted = think
+                    .as_ref()
+                    .ok_or_else(|| "think budget already acted".to_string())
+                    .and_then(|_| crate::batch::replay_ar_producer(id, promo_started_in_think, tokenizer, &emitted))
                     .and_then(|(producer, bytes_fed)| {
                         let s = &permit.sampling;
                         let sampler = SamplerConfig {
@@ -5332,8 +5360,12 @@ pub fn generate_spec(
                         // was already moved out before the transfer.
                         let kind = if let Some(snap) = df_snap {
                             crate::batch::PromotedDecode::Dflash(snap)
-                        } else if permit.dflash_lane && spec.name() == "dflash" {
-                            eprintln!("[vmm-promote] id={id} DFlash lane state unavailable; continues as AR");
+                        } else if spec.name() == "dflash" {
+                            // Without a staged DFlash lane engine
+                            // (`serve.batch_spec = false`) the lane is AR by design.
+                            if permit.dflash_lane {
+                                eprintln!("[vmm-promote] id={id} DFlash lane state unavailable; continues as AR");
+                            }
                             crate::batch::PromotedDecode::Ar
                         } else {
                             match hipfire_arch_qwen35::forward_slots::vmm::spec::MtpLaneSnapshot::capture(
@@ -5366,7 +5398,10 @@ pub fn generate_spec(
                             ),
                             kind,
                             seed_emitted: true,
-                            conv: Default::default(),
+                            conv: crate::vmm_conv::PromotedConv {
+                                think,
+                                ..Default::default()
+                            },
                         });
                         drop(guard);
                         return None;
@@ -7471,6 +7506,7 @@ pub fn generate_multi(
         "prefill_ms": (prefill_s * 1000.0 * 10.0).round() / 10.0,
         "prefill_tok_s": (prefill_tok_s * 10.0).round() / 10.0,
         "decode_tok_s": (decode_tok_s * 10.0).round() / 10.0,
+        "decode_ms": ((decode_s * 1000.0) * 10.0).round() / 10.0,
         "ttft_ms": (prefill_s * 1000.0 * 10.0).round() / 10.0,
         "attempt_id": active_attempt_id(),
         "finish_reason": finish.finish_reason,
@@ -7847,6 +7883,7 @@ pub fn qwen_dflash_done_value(
     prefill_ms: f64,
     prefill_tok_s: f64,
     decode_tok_s: f64,
+    decode_ms: f64,
     ttft_ms: f64,
     tau: f64,
     cycles: usize,
@@ -7863,6 +7900,7 @@ pub fn qwen_dflash_done_value(
         "prefill_ms": prefill_ms,
         "prefill_tok_s": prefill_tok_s,
         "decode_tok_s": decode_tok_s,
+        "decode_ms": decode_ms,
         "ttft_ms": ttft_ms,
         "dflash": true,
         "tau": tau,
@@ -8894,7 +8932,7 @@ mod mtp_done_fields_tests {
 
     fn done(tau: f64, cycles: usize) -> serde_json::Value {
         qwen_dflash_done_value(
-            "r", 177, 3.7, 134, 9600.0, 13.9, 4.7, 9600.0, tau, cycles, 0, "length", 1,
+            "r", 177, 3.7, 134, 9600.0, 13.9, 4.7, 37659.6, 9600.0, tau, cycles, 0, "length", 1,
         )
     }
 
