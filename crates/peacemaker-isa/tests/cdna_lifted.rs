@@ -1136,8 +1136,7 @@ fn l867_text_program() -> Program {
         len: 1,
     };
     let load = || {
-        Text::new("global_load_b32 v1, v0, s[0:1]", vec![v1], vec![])
-            .memory(MemoryClass::VmemLoad)
+        Text::new("global_load_b32 v1, v0, s[0:1]", vec![v1], vec![]).memory(MemoryClass::VmemLoad)
     };
     let ctl = |t: &str| Text::new(t, vec![], vec![]);
     Program {

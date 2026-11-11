@@ -191,7 +191,9 @@ mod tests {
         assert_eq!(f.read64(1), [Const(7), Unknown]);
         f.write32(99, Const(1));
         f.write64(usize::MAX, [Const(1), Const(1)]);
-        f.kill_defs([5..9, usize::MAX - 1..usize::MAX, 3..1], false);
+        // Deliberately malformed span from an external footprint, not an iterator.
+        let reversed = core::ops::Range { start: 3, end: 1 };
+        f.kill_defs([5..9, usize::MAX - 1..usize::MAX, reversed], false);
         assert_eq!(f.read32(1), Const(7));
     }
 
