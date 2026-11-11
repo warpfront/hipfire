@@ -36,6 +36,7 @@
 
 ## Unreleased
 
+- **Proof status (gfx942 P1b wide anchor): OPEN, not a landable twin.** The owner-pinned three-entry image re-emits byte-for-byte, but wait certification refuses the `wide64` VMEM WAW at pc975 (`v[34:37]`, after `L872`). A negative regression pins the source, bundle/device-ELF hashes, and exact refusal; it is not an obligation exemption. The anchor and scheduler remain unchanged pending a sound path/EXEC-correlated verifier proof.
 - **Added (gfx942 typed 16-bit lowering): lossless sign-extended I16 literals, `v_lshrrev_b16`, and `flat/global/scratch_store_short_d16_hi`.** The existing codec preserves signed literal dwords rather than normalizing them to a different encoding; LLVM byte-oracle tests cover the new shift and high-half store. The CDNA simulator models the logical low-half shift and GLOBAL upper-half store with source/address/EXEC snapshots and untouched neighbor bytes. FLAT and SCRATCH simulation/certification remain fail-closed under their existing unsupported-segment rules.
 
 ## v0.4.5 — 2026-11-11 (re-cut)
