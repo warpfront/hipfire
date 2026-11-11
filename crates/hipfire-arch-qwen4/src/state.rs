@@ -4575,6 +4575,13 @@ impl Qwen4State {
             }
         }
         copy_regions(gpu, &copies).map_err(StateError::Hip)?;
+        // Captured projection inputs are F32, but the convolution producer
+        // stores BF16-expanded F32 history. Match that storage boundary after
+        // repairing the kept slots; unmodified BF16-exact slots are unchanged.
+        for layer in &self.gdn {
+            gpu.bf16_round_trip_f32(&layer.conv)
+                .map_err(StateError::Hip)?;
+        }
         for (index, layer) in self.qsa.iter_mut().enumerate() {
             let mark = arena.qsa_marks[index];
             let position = mark.position + keep;
