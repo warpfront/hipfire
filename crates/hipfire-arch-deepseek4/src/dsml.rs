@@ -551,15 +551,12 @@ impl StreamParser {
             let body: String = self.buf.drain(..idx).collect();
             let _: String = self.buf.drain(..TOOL_CALLS_CLOSE.len()).collect();
             self.state = State::Normal;
-            let calls = parse_tool_calls_body(&body);
-            // A closed block with no parseable invoke (e.g. a misspelled
-            // `</｜DSML｜invinoke>` close) is a failed call, not a plain stop.
-            if calls.is_empty() {
-                events.push(StreamEvent::Malformed {
-                    detail: "DSML tool_calls block without a parseable invoke".to_string(),
-                });
-            } else {
-                events.push(StreamEvent::ToolCalls(calls));
+            // Any invoke or parameter that does not parse cleanly (misspelled
+            // close, missing quote, empty block) fails the whole call: a partial
+            // parse would merge, drop or empty calls (HIPF-262, HIPF-320).
+            match parse_tool_calls_body(&body) {
+                Ok(calls) => events.push(StreamEvent::ToolCalls(calls)),
+                Err(detail) => events.push(StreamEvent::Malformed { detail }),
             }
             return true;
         }
@@ -574,187 +571,111 @@ impl StreamParser {
 /// Parse the body of a `<｜DSML｜tool_calls>…</｜DSML｜tool_calls>` block
 /// (without the wrapper tags themselves) into a vector of [`ToolCall`].
 ///
-/// Best-effort: malformed invocations are skipped; well-formed ones are
-/// returned in document order. The recovery model is "skip past the
-/// broken invoke and keep parsing" rather than "abort the whole block"
-/// — V4F MQ2-Lloyd has been observed emitting bare `</｜DSML｜>` closes
-/// (truncated close marker, neither `</｜DSML｜invoke>` nor
-/// `</｜DSML｜tool>`); without explicit recovery the first such
-/// invocation would discard every subsequent tool call in the same
-/// block.
-pub fn parse_tool_calls_body(body: &str) -> Vec<ToolCall> {
+/// Strict: every invoke must carry a clean `name="…">` attr and its own
+/// close before the next invoke open; every parameter must close before
+/// the next parameter open. Any violation, or a block with no invoke,
+/// returns `Err` so the caller fails the turn instead of releasing merged,
+/// dropped or empty calls. Two observed V4F MQ2-Lloyd variants stay
+/// accepted: the bare `</｜DSML｜>` invoke close and a parameter without
+/// the `string="…"` attr.
+pub fn parse_tool_calls_body(body: &str) -> Result<Vec<ToolCall>, String> {
     /// Generic short close — observed in V4F MQ2-Lloyd output when the
-    /// model truncates the canonical close. Treated as a fallback close
-    /// only when we can't find the matched form; the matched form takes
-    /// precedence so a well-formed `</｜DSML｜invoke>` ends an invoke
-    /// even if `</｜DSML｜>` appears later in a parameter value.
+    /// model truncates the canonical close. The matched close wins when
+    /// it comes first.
     const GENERIC_CLOSE: &str = "</｜DSML｜>";
-    let mut out = Vec::new();
-    let mut cursor = 0;
-    loop {
-        // Find the next inner tag. Accept either `<｜DSML｜invoke name="`
-        // (canonical, per HF encoder) or `<｜DSML｜tool name="` (variant
-        // observed from the V4F MQ2-Lloyd checkpoint — see comment on
-        // TOOL_OPEN_PREFIX_ALT). Whichever appears first wins.
-        let invoke_hit = body[cursor..]
+    let next_open = |s: &str| -> Option<(usize, usize, &'static str)> {
+        let invoke_hit = s
             .find(INVOKE_OPEN_PREFIX)
             .map(|i| (i, INVOKE_OPEN_PREFIX.len(), INVOKE_CLOSE));
-        let tool_hit = body[cursor..]
+        let tool_hit = s
             .find(TOOL_OPEN_PREFIX_ALT)
             .map(|i| (i, TOOL_OPEN_PREFIX_ALT.len(), TOOL_CLOSE_ALT));
-        let (open_rel, open_len, close_marker) = match (invoke_hit, tool_hit) {
-            (Some(a), Some(b)) if a.0 <= b.0 => a,
-            (Some(_), Some(b)) => b,
-            (Some(a), None) => a,
-            (None, Some(b)) => b,
-            (None, None) => break,
-        };
+        match (invoke_hit, tool_hit) {
+            (Some(a), Some(b)) => Some(if a.0 <= b.0 { a } else { b }),
+            (a, b) => a.or(b),
+        }
+    };
+    let mut out = Vec::new();
+    let mut cursor = 0;
+    while let Some((open_rel, open_len, close_marker)) = next_open(&body[cursor..]) {
         let abs = cursor + open_rel + open_len;
-        let close_attr = match body[abs..].find("\">") {
-            Some(i) => abs + i,
-            // No `">` after the open: this invoke is truncated. Skip
-            // past the open marker and let the loop pick up any
-            // subsequent well-formed invoke.
-            None => {
-                cursor = abs;
-                continue;
-            }
-        };
-        let name = body[abs..close_attr].to_string();
+        let close_attr = body[abs..]
+            .find("\">")
+            .map(|i| abs + i)
+            .ok_or("DSML invoke without a closed name attr")?;
+        let name = &body[abs..close_attr];
+        if name.is_empty() || name.contains(['"', '<', '>', '\n']) {
+            return Err(format!("DSML invoke with a malformed name attr: {name:?}"));
+        }
         let body_start = close_attr + 2;
-        // Prefer the matched close; fall back to the generic short
-        // close (`</｜DSML｜>`) when the matched form isn't present —
-        // V4F MQ2-Lloyd has been observed truncating to that form.
-        // Whichever appears FIRST in the body wins so a generic close
-        // inside a string param value can't terminate the invoke
-        // prematurely if the matched form precedes it.
-        let matched_at = body[body_start..]
-            .find(close_marker)
-            .map(|i| (i, close_marker.len()));
-        let generic_at = body[body_start..]
-            .find(GENERIC_CLOSE)
-            .map(|i| (i, GENERIC_CLOSE.len()));
-        let (rel_off, used_close_len) = match (matched_at, generic_at) {
-            (Some(a), Some(b)) if a.0 <= b.0 => a,
-            (Some(_), Some(b)) => b,
-            (Some(a), None) => a,
-            (None, Some(b)) => b,
-            // Neither close found — invoke is truncated. Skip past the
-            // open marker (already past the name attr) and continue;
-            // any later well-formed invoke is still recoverable.
-            (None, None) => {
-                cursor = body_start;
-                continue;
-            }
+        let rest = &body[body_start..];
+        let close = [
+            rest.find(close_marker).map(|i| (i, close_marker.len())),
+            rest.find(GENERIC_CLOSE).map(|i| (i, GENERIC_CLOSE.len())),
+        ]
+        .into_iter()
+        .flatten()
+        .min_by_key(|c| c.0);
+        let (rel_off, used_close_len) = match close {
+            Some(c) if next_open(rest).is_none_or(|o| c.0 < o.0) => c,
+            _ => return Err(format!("DSML invoke {name:?} without its own close")),
         };
         let invoke_close = body_start + rel_off;
-        let invoke_body = &body[body_start..invoke_close];
-        let args = parse_parameters(invoke_body);
         out.push(ToolCall {
-            name,
-            arguments: args,
+            name: name.to_string(),
+            arguments: parse_parameters(&body[body_start..invoke_close])?,
         });
         cursor = invoke_close + used_close_len;
     }
-    out
+    if out.is_empty() {
+        return Err("DSML tool_calls block without a parseable invoke".to_string());
+    }
+    Ok(out)
 }
 
-/// Parse the parameters inside a single invoke block. Returns a JSON
-/// object whose keys are parameter names.
-///
-/// Recovery policy: a single malformed `<｜DSML｜parameter>` (missing
-/// `string="..."` attr, missing close, etc.) advances the cursor past
-/// the broken open and continues scanning so that well-formed params
-/// AFTER it are still collected. Prior to this fix the function broke
-/// out on first error and discarded every subsequent param, which made
-/// "model emits `edits=[]` with no string-attr followed by a correct
-/// `path` param" lose the path entirely.
-fn parse_parameters(body: &str) -> Value {
+/// Parse the parameters inside a single invoke block into a JSON object
+/// keyed by parameter name. A parameter without the `string="…"` attr is
+/// read as a plain string; any other malformed parameter is an `Err`.
+fn parse_parameters(body: &str) -> Result<Value, String> {
     let mut map = serde_json::Map::new();
     let mut cursor = 0;
     while let Some(param_start) = body[cursor..].find(PARAMETER_OPEN_PREFIX) {
-        let open_abs = cursor + param_start;
-        let abs = open_abs + PARAMETER_OPEN_PREFIX.len();
-        // Skip past at least the open marker so we don't loop on the
-        // same broken param if any of the inner finds fail.
-        let next_cursor_on_break = abs;
-        // name="..." string="true|false">
-        let name_end = match body[abs..].find('"') {
-            Some(i) => abs + i,
-            None => {
-                cursor = next_cursor_on_break;
-                continue;
-            }
+        let abs = cursor + param_start + PARAMETER_OPEN_PREFIX.len();
+        let bad = || format!("malformed DSML parameter at {:?}", &body[abs..]);
+        // name="..." [string="true|false"]>
+        let tag_end = abs + body[abs..].find('>').ok_or_else(bad)?;
+        let tag = &body[abs..tag_end];
+        let name_end = tag.find('"').ok_or_else(bad)?;
+        let name = &tag[..name_end];
+        let attrs = &tag[name_end + 1..];
+        if name.is_empty() || name.contains(['<', '\n']) {
+            return Err(bad());
+        }
+        let is_string = match attrs.trim() {
+            "" => true,
+            "string=\"true\"" => true,
+            "string=\"false\"" => false,
+            _ => return Err(bad()),
         };
-        let name = body[abs..name_end].to_string();
-        // Find ` string="...">`. Bound the search to the CURRENT
-        // parameter tag (everything before the first `>` after the
-        // name's closing `"`) so that a missing-attr param doesn't
-        // grab the next param's `string="..."` and capture its value.
-        // If absent, treat the body up to the next PARAMETER_CLOSE as
-        // a raw string value (defensive: V4F MQ2-Lloyd has been
-        // observed emitting parameters without the string-attr —
-        // `<｜DSML｜parameter name="X">val</｜DSML｜parameter>` — and
-        // dropping those silently loses information).
-        let after_name = name_end + 1;
-        let tag_end = body[after_name..].find('>').map(|i| after_name + i);
-        let string_attr_present = tag_end.and_then(|end| {
-            body[after_name..end]
-                .find("string=\"")
-                .map(|i| after_name + i)
-        });
-        let (is_string, content_start, content_end_search_from) = match string_attr_present {
-            Some(string_attr_open) => {
-                let string_attr_idx = string_attr_open + "string=\"".len();
-                let string_attr_end = match body[string_attr_idx..].find('"') {
-                    Some(i) => string_attr_idx + i,
-                    None => {
-                        cursor = next_cursor_on_break;
-                        continue;
-                    }
-                };
-                let is_string = &body[string_attr_idx..string_attr_end] == "true";
-                let content_start = match body[string_attr_end..].find("\">") {
-                    Some(i) => string_attr_end + i + 2,
-                    None => {
-                        cursor = next_cursor_on_break;
-                        continue;
-                    }
-                };
-                (is_string, content_start, content_start)
-            }
-            // No string attr — assume legacy/garbled form. Find the
-            // closing `>` immediately after the name's `"` (best
-            // effort) and treat the value as a plain string.
-            None => {
-                let content_start = match body[name_end..].find('>') {
-                    Some(i) => name_end + i + 1,
-                    None => {
-                        cursor = next_cursor_on_break;
-                        continue;
-                    }
-                };
-                (true, content_start, content_start)
-            }
-        };
-        let content_end = match body[content_end_search_from..].find(PARAMETER_CLOSE) {
-            Some(i) => content_end_search_from + i,
-            None => {
-                cursor = next_cursor_on_break;
-                continue;
-            }
-        };
+        let content_start = tag_end + 1;
+        let content_end = content_start
+            + body[content_start..]
+                .find(PARAMETER_CLOSE)
+                .ok_or_else(bad)?;
         let raw_value = &body[content_start..content_end];
+        if raw_value.contains(PARAMETER_OPEN_PREFIX) {
+            return Err(bad());
+        }
         let value: Value = if is_string {
             Value::String(raw_value.to_string())
         } else {
             serde_json::from_str(raw_value.trim())
                 .unwrap_or_else(|_| Value::String(raw_value.to_string()))
         };
-        map.insert(name, value);
+        map.insert(name.to_string(), value);
         cursor = content_end + PARAMETER_CLOSE.len();
     }
-    Value::Object(map)
+    Ok(Value::Object(map))
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -1113,7 +1034,8 @@ mod tests {
                 .unwrap()
                 .strip_suffix("</｜DSML｜tool_calls>")
                 .unwrap(),
-        );
+        )
+        .unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "edit");
         assert_eq!(calls[0].arguments["path"], json!("/tmp/x"));
@@ -1129,12 +1051,97 @@ mod tests {
 <｜DSML｜parameter name=\"a\">raw</｜DSML｜parameter>\n\
 <｜DSML｜parameter name=\"b\" string=\"false\">42</｜DSML｜parameter>\n\
 </｜DSML｜invoke>";
-        let calls = parse_tool_calls_body(body);
+        let calls = parse_tool_calls_body(body).unwrap();
         assert_eq!(calls.len(), 1);
         // First param recovered as a plain string.
         assert_eq!(calls[0].arguments["a"], json!("raw"));
         // Second param parses as JSON int — proving the loop didn't bail.
         assert_eq!(calls[0].arguments["b"], json!(42));
+    }
+
+    fn feed_block(inner: &str) -> Vec<StreamEvent> {
+        let mut p = StreamParser::new();
+        let mut events = p.feed(&format!("{TOOL_CALLS_OPEN}\n{inner}{TOOL_CALLS_CLOSE}"));
+        events.extend(p.finish());
+        events
+    }
+
+    fn assert_malformed(inner: &str) {
+        let events = feed_block(inner);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::Malformed { .. }))
+                && !events
+                    .iter()
+                    .any(|e| matches!(e, StreamEvent::ToolCalls(_))),
+            "expected Malformed only, events={events:?}"
+        );
+    }
+
+    const WEATHER: &str =
+        "<｜DSML｜parameter name=\"city\" string=\"true\">Paris</｜DSML｜parameter>\n";
+    const TIME: &str = "<｜DSML｜parameter name=\"tz\" string=\"true\">CET</｜DSML｜parameter>\n";
+
+    #[test]
+    fn first_invoke_close_misspelled_is_malformed_not_merged() {
+        // HIPF-320 case B: was one get_weather with merged {city, tz}.
+        assert_malformed(&format!(
+            "<｜DSML｜invoke name=\"get_weather\">\n{WEATHER}</｜DSML｜invinoke>\n\
+             <｜DSML｜invoke name=\"get_time\">\n{TIME}</｜DSML｜invoke>\n"
+        ));
+    }
+
+    #[test]
+    fn second_invoke_close_misspelled_is_malformed_not_dropped() {
+        // HIPF-320 case C: was get_weather only, get_time silently dropped.
+        assert_malformed(&format!(
+            "<｜DSML｜invoke name=\"get_weather\">\n{WEATHER}</｜DSML｜invoke>\n\
+             <｜DSML｜invoke name=\"get_time\">\n{TIME}</｜DSML｜invinoke>\n"
+        ));
+    }
+
+    #[test]
+    fn parameter_close_misspelled_is_malformed_not_empty_args() {
+        // HIPF-320 case D: was get_weather with {} args.
+        assert_malformed(
+            "<｜DSML｜invoke name=\"get_weather\">\n\
+             <｜DSML｜parameter name=\"city\" string=\"true\">Paris</｜DSML｜paramter>\n\
+             </｜DSML｜invoke>\n",
+        );
+        // A misspelled close followed by a good param must not merge values.
+        assert_malformed(&format!(
+            "<｜DSML｜invoke name=\"get_weather\">\n\
+             <｜DSML｜parameter name=\"city\" string=\"true\">Paris</｜DSML｜paramter>\n\
+             {TIME}</｜DSML｜invoke>\n"
+        ));
+    }
+
+    #[test]
+    fn invoke_name_attr_missing_quote_is_malformed() {
+        // HIPF-320 case F: name swallowed the next invoke open.
+        assert_malformed(&format!(
+            "<｜DSML｜invoke name=\"get_weather>\n{WEATHER}</｜DSML｜invoke>\n\
+             <｜DSML｜invoke name=\"get_time\">\n{TIME}</｜DSML｜invoke>\n"
+        ));
+    }
+
+    #[test]
+    fn well_formed_two_invokes_still_parse() {
+        let events = feed_block(&format!(
+            "<｜DSML｜invoke name=\"get_weather\">\n{WEATHER}</｜DSML｜invoke>\n\
+             <｜DSML｜invoke name=\"get_time\">\n{TIME}</｜DSML｜invoke>\n"
+        ));
+        let calls = events
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::ToolCalls(c) => Some(c),
+                _ => None,
+            })
+            .expect("tool calls");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].arguments, json!({"city": "Paris"}));
+        assert_eq!(calls[1].arguments, json!({"tz": "CET"}));
     }
 
     #[test]
