@@ -2223,6 +2223,8 @@ fn chunklogits(
         };
         let reference = run(&mut m, "single")?;
         let repeat = run(&mut m, "single")?;
+        let repeat2 = run(&mut m, "single")?;
+        println!("CHUNKLOGITS prompt={pi} single_repeat2_identical_to_repeat1={}", repeat2 == repeat);
         let bytes = |v: &[f32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
         let ref_bytes = bytes(&reference);
         std::fs::write(output.join(format!("p{pi}-single.f32")), &ref_bytes).map_err(|e| e.to_string())?;

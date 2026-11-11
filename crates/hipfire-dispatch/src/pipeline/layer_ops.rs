@@ -984,9 +984,19 @@ fn project_trunk_masked_inner(
                         .filter(|&j| a4[j] && !done[j])
                         .collect();
                     if !rest.is_empty() {
+                        // The Z|beta|alpha members project into the fold's full-capacity padded
+                        // planes (their row views hold only `rows`); the rest into their own.
+                        let padded_out = |j: usize| -> &GpuTensor {
+                            match zba.as_ref().and_then(|f| f.padded_outputs.map(|p| (f, p))) {
+                                Some((f, [y_z, y_beta, y_alpha])) if j == f.z => y_z,
+                                Some((f, [y_z, y_beta, y_alpha])) if j == f.beta => y_beta,
+                                Some((f, [y_z, y_beta, y_alpha])) if j == f.alpha => y_alpha,
+                                _ => projections[j].1,
+                            }
+                        };
                         let padded: SmallVec<[(&GpuTensor, usize, &GpuTensor); 4]> = rest
                             .iter()
-                            .map(|&j| (projections[j].0.buf, projections[j].0.m, projections[j].1))
+                            .map(|&j| (projections[j].0.buf, projections[j].0.m, padded_out(j)))
                             .collect();
                         if !hip(gpu.qwen4_trunk_set_ragged(input, rows, n_pad, k, &padded))? {
                             return Err(DispatchError::Hip(format!(
