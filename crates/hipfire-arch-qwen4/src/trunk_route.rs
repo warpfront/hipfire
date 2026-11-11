@@ -24,7 +24,8 @@ use std::sync::{Arc, Mutex};
 /// `false` is the kill switch (the all-reduce route); any other value is off (fail safe).
 pub(crate) const SP_ENV: &str = "HIPFIRE_QWEN4_EP_SEQ_PARALLEL";
 
-/// Smallest chunk (rows) that runs sequence-parallel: both halves (`n / 2` rows, floored) must
+/// Smallest chunk (rows) of the wide sequence-parallel band (any HC route; the sub-512 band is
+/// [`SP_SUB512_MIN_ROWS`]..=511 on the prefill lane WMMA HC read): both halves (`n / 2` rows, floored) must
 /// sit on the same side of every HC read / write kernel-route threshold as the whole chunk
 /// (`wide_exact_rows` / the few-row limit up to `WIDE_VERIFY_MAX_ROWS`, the F16 WMMA and BF16
 /// stream floor `QWEN4_F16_WMMA_MIN_TOKENS`, the HC up `_v2` floor, the HC down fused floors), so
@@ -41,6 +42,65 @@ pub(crate) fn sp_switch(raw: Option<&str>) -> bool {
 /// Whether the process asks for the sequence-parallel prefill route ([`SP_ENV`], [`sp_switch`]).
 pub(crate) fn sp_requested() -> bool {
     sp_switch(hipfire_config::developer_var(SP_ENV).ok().as_deref())
+}
+
+/// Switch of the sub-512 sequence-parallel band: unset (or `1` / `on` / `true`) = ON wherever the
+/// sequence-parallel prefill route runs ([`SP_ENV`]); `0` / `off` / `false` is the kill switch
+/// (chunks below [`SP_MIN_ROWS`] keep the all-reduce route); any other value is off (fail safe).
+/// A trunk-shard prefill chunk of [`SP_SUB512_MIN_ROWS`]..=511 rows then also runs
+/// sequence-parallel, provided its HC read is the pinned-split-K prefill lane WMMA entry for the
+/// whole chunk AND for both halves (`Gpu::prefill_lwmma_hc_applies`, checked by the forward):
+/// that entry is row-count invariant, so a row's bytes do not depend on which half carries it.
+pub(crate) const SP_SUB512_ENV: &str = "HIPFIRE_QWEN4_EP_SP_SUB512";
+
+/// Fewest rows of a sub-512 sequence-parallel chunk: both halves (the smaller is `n / 2`) above
+/// the few-row window (`WIDE_VERIFY_MAX_ROWS`, 64), where the HC read leaves the lane WMMA
+/// decode arm and the HC8 decode route for the prefill lane WMMA entry. Pinned by a unit test.
+pub(crate) const SP_SUB512_MIN_ROWS: usize =
+    2 * (rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS + 1);
+
+static SP_SUB512_ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    sp_switch(hipfire_config::developer_var(SP_SUB512_ENV).ok().as_deref())
+});
+
+/// Whether an `n`-row chunk is inside a sequence-parallel row band: at least [`SP_MIN_ROWS`], or
+/// (`sub512`, [`SP_SUB512_ENV`]) [`SP_SUB512_MIN_ROWS`]..=511 rows. The forward adds the HC route
+/// check of the sub-512 band.
+pub(crate) fn sp_rows_in_band(n: usize, sub512: bool) -> bool {
+    n >= SP_MIN_ROWS
+        || (sub512
+            && (SP_SUB512_MIN_ROWS..rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS).contains(&n))
+}
+
+/// [`sp_rows_in_band`] with this process's [`SP_SUB512_ENV`].
+pub(crate) fn sp_chunk_rows_in_band(n: usize) -> bool {
+    sp_rows_in_band(n, *SP_SUB512_ON)
+}
+
+/// Switch of sequence-parallel HC for EP prefill WAVES (`forward_lanes_scoped`) of at least
+/// [`SP_SUB512_MIN_ROWS`] rows, on top of [`SP_SUB512_ENV`]: unset / `1` / `on` / `true` is on,
+/// `0` / `off` / `false` is the kill switch, any other value is off.
+pub(crate) const SP_SUB512_WAVE_ENV: &str = "HIPFIRE_QWEN4_EP_SP_SUB512_WAVE";
+
+static SP_SUB512_WAVE_ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    sp_switch(
+        hipfire_config::developer_var(SP_SUB512_WAVE_ENV)
+            .ok()
+            .as_deref(),
+    )
+});
+
+/// Whether an `n`-row EP prefill wave runs its joint HC sequence-parallel: the sub-512 switch
+/// (`sub512`, [`SP_SUB512_ENV`]) and the wave switch (`wave`, [`SP_SUB512_WAVE_ENV`]) are both on
+/// and `n >= `[`SP_SUB512_MIN_ROWS`]. The wave's routing-row cap of 511 keeps every launch and
+/// both halves on sub-512 routes (waves are capped at 2048 rows).
+pub(crate) fn sp_wave_rows_in_band_from(n: usize, sub512: bool, wave: bool) -> bool {
+    sub512 && wave && n >= SP_SUB512_MIN_ROWS
+}
+
+/// [`sp_wave_rows_in_band_from`] with this process's switches.
+pub(crate) fn sp_wave_rows_in_band(n: usize) -> bool {
+    sp_wave_rows_in_band_from(n, *SP_SUB512_ON, *SP_SUB512_WAVE_ON)
 }
 
 /// Switch of the sequence-parallel QSA indexer inside a sequence-parallel chunk (each rank selects
@@ -352,7 +412,7 @@ pub(crate) fn sp_qsa_gather() -> Option<(usize, &'static dyn QsaSelectGather)> {
 /// leaves the later rows' rank with more work. The cut `s` is the smallest in `[1, n - 1]` whose
 /// left side (rows `0..s`) costs at least the right side, or the one before it when that makes
 /// the larger side smaller (ties go to the smaller `s`). Needs `n >= 2` (both ranks own a row);
-/// the SP route only runs chunks of at least [`SP_MIN_ROWS`].
+/// the SP route only runs chunks of at least [`SP_SUB512_MIN_ROWS`].
 pub(crate) fn qsa_select_split(n: usize, position_start: usize) -> [(usize, usize); 2] {
     debug_assert!(n >= 2, "a QSA select split needs two rows, got {n}");
     let n = n.max(2);
@@ -456,6 +516,77 @@ mod tests {
         assert!(SP_MIN_ROWS.is_multiple_of(2));
     }
 
+    /// The sub-512 band ([`SP_SUB512_MIN_ROWS`]..=511 rows): both halves and the whole chunk sit
+    /// above every few-row route (the few-row window, the lane WMMA decode arm and the HC8 decode
+    /// route all end at 64 rows) and below every >= T route of the HC read / write (the F16 WMMA
+    /// read at 512, the HC down fused floors, the BF16 streams), so with the prefill lane WMMA HC
+    /// entry in force (the forward's `prefill_lwmma_hc_applies` check, which also covers the HC up
+    /// `_v2` floor at 128 that the halves would otherwise straddle) the own-row launches pick the
+    /// whole chunk's routes. One row less and the smaller half drops into the few-row window.
+    #[test]
+    fn sp_sub512_band_keeps_both_halves_on_the_prefill_hc_routes() {
+        use rdna_compute::gemm::{
+            HC_DOWN_FUSED_GFX1151_MIN_ROWS, HC_DOWN_FUSED_MIN_ROWS, QWEN4_F16_WMMA_MIN_TOKENS,
+        };
+        use rdna_compute::prefill_invariant::{FEW_ROW_ROUTE_ROWS, WIDE_VERIFY_MAX_ROWS};
+        assert_eq!(SP_SUB512_MIN_ROWS, 130);
+        assert_eq!(rdna_compute::hc8::MAX_ROWS, WIDE_VERIFY_MAX_ROWS);
+        assert!(rdna_compute::gemv::LANE_WMMA_MIN_ROWS <= WIDE_VERIFY_MAX_ROWS);
+        for n in SP_SUB512_MIN_ROWS..QWEN4_F16_WMMA_MIN_TOKENS {
+            assert!(sp_rows_in_band(n, true), "{n}");
+            let [a, b] = sp_even_split(n);
+            for half in [a.1, b.1] {
+                assert!(half > WIDE_VERIFY_MAX_ROWS, "{n}: {half}");
+                assert!(half > FEW_ROW_ROUTE_ROWS, "{n}: {half}");
+                assert!(half >= 16, "{n}: row fold floor");
+            }
+            for rows in [a.1, b.1, n] {
+                assert!(rows < QWEN4_F16_WMMA_MIN_TOKENS, "{n}");
+                assert!(rows < HC_DOWN_FUSED_MIN_ROWS, "{n}");
+                assert!(rows < HC_DOWN_FUSED_GFX1151_MIN_ROWS, "{n}");
+            }
+        }
+        let below = SP_SUB512_MIN_ROWS - 1;
+        assert!(sp_even_split(below)[1].1 <= WIDE_VERIFY_MAX_ROWS);
+        assert!(!sp_rows_in_band(below, true));
+    }
+
+    #[test]
+    fn sp_bands_follow_the_sub512_switch() {
+        for (n, on, off) in [
+            (64, false, false),
+            (129, false, false),
+            (130, true, false),
+            (149, true, false),
+            (511, true, false),
+            (512, false, false),
+            (1192, false, false),
+            (3071, false, false),
+            (SP_MIN_ROWS, true, true),
+            (16384, true, true),
+        ] {
+            assert_eq!(sp_rows_in_band(n, true), on, "{n} on");
+            assert_eq!(sp_rows_in_band(n, false), off, "{n} off");
+        }
+        assert_ne!(SP_SUB512_ENV, SP_ENV);
+    }
+
+    #[test]
+    fn sp_wave_band_needs_both_switches_and_the_floor() {
+        for n in [129usize, 130, 596, 1192, 2048] {
+            for sub512 in [false, true] {
+                for wave in [false, true] {
+                    assert_eq!(
+                        sp_wave_rows_in_band_from(n, sub512, wave),
+                        sub512 && wave && n >= 130,
+                        "{n} {sub512} {wave}"
+                    );
+                }
+            }
+        }
+        assert_ne!(SP_SUB512_WAVE_ENV, SP_SUB512_ENV);
+    }
+
     #[test]
     fn sp_switch_is_default_on_with_a_kill_switch() {
         for on in [
@@ -481,13 +612,26 @@ mod tests {
 
     #[test]
     fn sp_split_mirrors_between_ranks() {
-        for n in [SP_MIN_ROWS, SP_MIN_ROWS + 1, 4096, 4097] {
+        for n in [
+            SP_SUB512_MIN_ROWS,
+            SP_SUB512_MIN_ROWS + 1,
+            511,
+            SP_MIN_ROWS,
+            SP_MIN_ROWS + 1,
+            4096,
+            4097,
+        ] {
             let (a, b) = (SpRows::of(0, n), SpRows::of(1, n));
             assert_eq!((a.own, a.peer), (b.peer, b.own));
             assert_eq!(a.own.0, 0);
             assert_eq!(a.own.0 + a.own.1, a.peer.0);
             assert_eq!(a.own.1 + a.peer.1, n);
-            assert!(a.own.1 >= SP_MIN_ROWS / 2 && b.own.1 >= SP_MIN_ROWS / 2);
+            let floor = if n >= SP_MIN_ROWS {
+                SP_MIN_ROWS / 2
+            } else {
+                SP_SUB512_MIN_ROWS / 2
+            };
+            assert!(a.own.1 >= floor && b.own.1 >= floor);
         }
     }
 

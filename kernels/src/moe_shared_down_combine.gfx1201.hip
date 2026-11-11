@@ -43,11 +43,16 @@ static __device__ __forceinline__ float msc_bf16_exact(float v) {
     return __uint_as_float((u + 0x7fffu + ((u >> 16) & 1u)) & 0xffff0000u);
 }
 
-template <int R>
+// ZINIT (`HIPFIRE_QWEN4_FFN_CLEAR_ABSORB_ROWS`, the `_zinit` entries): the combine's accumulator
+// seed is +0.0 instead of bf16(target), `target` is never read, and its dirty / poisoned contents
+// are fully overwritten: every (token < R, column = 8 * blockIdx.x + c < M) is stored by exactly
+// one lane below (grid M / 8, M % 8 == 0; unrouted slots are skipped inside the accumulate, never
+// around the store).  Bitwise `zero_f32(target)` + the non-ZINIT entry, since bf16(+0.0) == +0.0.
+template <int R, bool ZINIT>
 __device__ __forceinline__ void moe_shared_down_combine_body(
     const unsigned short* __restrict__ W,      // [M, K] bf16 shared down
     const float* __restrict__ x,               // [R, K] F32 shared hidden
-    float* __restrict__ target,                // [R, M] combine target: seed in, result out
+    float* __restrict__ target,                // [R, M] combine target: seed in (not ZINIT), result out
     const float* __restrict__ expert_outputs,  // [R * 10 * M] unweighted expanded down rows
     const int* __restrict__ topk_indices,      // [R * 10]
     const float* __restrict__ topk_weights,    // [R * 10]
@@ -146,7 +151,7 @@ __device__ __forceinline__ void moe_shared_down_combine_body(
     const int id_b = topk_indices[slot + own_b];
     const float w_a = topk_weights[slot + c];
     const float w_b = topk_weights[slot + own_b];
-    const float seed = target[(slot / 10) * M + col];
+    const float seed = ZINIT ? 0.0f : target[(slot / 10) * M + col];
     const float gate_in = scalar[slot / 10];
     // Sort keys: (expert id, rank), unique; ids outside [0, n_experts) (unrouted: never
     // selected) sort after every routed one.
@@ -196,15 +201,18 @@ __device__ __forceinline__ void moe_shared_down_combine_body(
     target[(size_t)token * M + col] = msc_bf16_exact(acc + product);
 }
 
-#define MOE_SHARED_DOWN_COMBINE_ROWS(R)                                                       \
-    __launch_bounds__(320) extern "C" __global__ void moe_shared_down_combine_rows_r##R(      \
+#define MOE_SHARED_DOWN_COMBINE_ROWS_NAMED(NAME, R, ZINIT)                                    \
+    __launch_bounds__(320) extern "C" __global__ void NAME(                                   \
         const unsigned short* __restrict__ W, const float* __restrict__ x,                    \
         float* __restrict__ target, const float* __restrict__ expert_outputs,                 \
         const int* __restrict__ topk_indices, const float* __restrict__ topk_weights,         \
         const float* __restrict__ scalar, int M, int K, int n_experts) {                      \
-        moe_shared_down_combine_body<R>(W, x, target, expert_outputs, topk_indices,           \
-                                        topk_weights, scalar, M, K, n_experts);               \
+        moe_shared_down_combine_body<R, ZINIT>(W, x, target, expert_outputs, topk_indices,    \
+                                               topk_weights, scalar, M, K, n_experts);        \
     }
+#define MOE_SHARED_DOWN_COMBINE_ROWS(R)                                                       \
+    MOE_SHARED_DOWN_COMBINE_ROWS_NAMED(moe_shared_down_combine_rows_r##R, R, false)           \
+    MOE_SHARED_DOWN_COMBINE_ROWS_NAMED(moe_shared_down_combine_rows_r##R##_zinit, R, true)
 MOE_SHARED_DOWN_COMBINE_ROWS(1)
 MOE_SHARED_DOWN_COMBINE_ROWS(2)
 MOE_SHARED_DOWN_COMBINE_ROWS(3)
@@ -214,3 +222,4 @@ MOE_SHARED_DOWN_COMBINE_ROWS(6)
 MOE_SHARED_DOWN_COMBINE_ROWS(7)
 MOE_SHARED_DOWN_COMBINE_ROWS(8)
 #undef MOE_SHARED_DOWN_COMBINE_ROWS
+#undef MOE_SHARED_DOWN_COMBINE_ROWS_NAMED

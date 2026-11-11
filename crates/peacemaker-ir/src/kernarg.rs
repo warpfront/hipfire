@@ -126,6 +126,9 @@ pub struct ArgAccess {
     /// The base also resolved to other arguments (e.g. `s_cselect_b64` of two
     /// kernarg pointers); every candidate gets the access.
     pub shared: bool,
+    /// The mnemonic of a non-commutative atomic (`Atomic { commutative: false }`,
+    /// e.g. `global_atomic_swap_b32`); `None` for every other access.
+    pub atomic_op: Option<String>,
 }
 
 /// A3: which read caches can hold data this kernel read from an argument.
@@ -222,6 +225,10 @@ pub struct ArgFacts {
     /// A4: union over the argument's dwords.
     pub sinks: Sinks,
     pub loaded: bool,
+    /// Every access attributed to this argument executes only on a path where
+    /// the argument's 64-bit value was tested nonzero (a NULL argument reaches
+    /// none of them). False when the argument has no access.
+    pub null_guarded: bool,
 }
 impl ArgFacts {
     pub fn classes(&self) -> Vec<AccessClass> {

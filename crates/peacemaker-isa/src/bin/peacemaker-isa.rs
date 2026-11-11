@@ -117,6 +117,7 @@ const USAGE: &str = "usage: peacemaker-isa emit --kernel fold_magic --arch gfx12
        peacemaker-isa emit --kernel spec_sampling_rows_pm|spec_accept_pm --arch gfx1151|gfx1201 --out FILE --proof FILE
        peacemaker-isa emit --kernel qwen4_ep_owner_assign_pm --arch gfx1201 --out FILE --proof FILE
        peacemaker-isa emit --kernel qwen4_ep_owner_assign_pinned_pm --arch gfx1201 --out FILE --proof FILE
+       peacemaker-isa emit --kernel argmax_pair_merge_pm|topk8_partial_blocks_pm --arch gfx1201 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape FILE.shape.json] [--m7 FILE.m7.json]
        peacemaker-isa emit --kernel qwen4_mq6_x4 [--epi w4|w8|all] --arch gfx1201 --out FILE --proof FILE
        peacemaker-isa emit --kernel qwen4_mq6_x4_gfx11 [--epi w4|w8|w4_bf16out|w8_bf16out|w8_regions|w8_hcw|all] --arch gfx1151 --out FILE --proof FILE
        peacemaker-isa emit --kernel qwen4_mq4_x4_gfx11 [--epi w4|w8|w4_bf16out|w8_bf16out|w8_regions|w8_hcw|all] --arch gfx1151 --out FILE --proof FILE
@@ -516,6 +517,22 @@ fn qwen4_ep_owner_assign_pinned(arch: Arch) -> Result<(String, Vec<u8>), String>
 /// The PM row argmax twin of `argmax_f32_batched_regrid` (`argmax_f32_batched_regrid_pm_gfx1201`), one symbol per module.
 fn argmax_regrid(arch: Arch) -> Result<(String, Vec<u8>), String> {
     let (_, text, proof) = peacemaker_isa::kernels::argmax_regrid_pm::emit_module(arch)?;
+    Ok((
+        text,
+        serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?,
+    ))
+}
+/// The PM finite-value argmax merge for two vocabulary shards.
+fn argmax_pair_merge(arch: Arch) -> Result<(String, Vec<u8>), String> {
+    let (_, text, proof) = peacemaker_isa::kernels::argmax_pair_merge_pm::emit_module(arch)?;
+    Ok((
+        text,
+        serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?,
+    ))
+}
+/// The PM top-eight partial selection for a vocabulary block subrange.
+fn topk8_partial_blocks(arch: Arch) -> Result<(String, Vec<u8>), String> {
+    let (_, text, proof) = peacemaker_isa::kernels::topk8_partial_blocks_pm::emit_module(arch)?;
     Ok((
         text,
         serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?,
@@ -1954,6 +1971,8 @@ fn run() -> Result<(), String> {
             "qwen4_ep_owner_assign_pm" => qwen4_ep_owner_assign(arch)?,
             "qwen4_ep_owner_assign_pinned_pm" => qwen4_ep_owner_assign_pinned(arch)?,
             "argmax_regrid_pm" => argmax_regrid(arch)?,
+            "argmax_pair_merge_pm" => argmax_pair_merge(arch)?,
+            "topk8_partial_blocks_pm" => topk8_partial_blocks(arch)?,
             "ep_tile_mask_pm" => ep_tile_mask(arch)?,
             "moe_slot_ops_pm" => moe_slot_ops(arch)?,
             "qwen4_moe_down_gp_pm" => qwen4_moe_down_gp(arch)?,
@@ -2050,6 +2069,8 @@ fn run() -> Result<(), String> {
         || kernel == "qwen4_ep_owner_assign_pinned_pm"
         || kernel == "ep_tile_mask_pm"
         || kernel == "argmax_regrid_pm"
+        || kernel == "argmax_pair_merge_pm"
+        || kernel == "topk8_partial_blocks_pm"
         || kernel == "ep_gather_grouped_rows_by_tile_owner_pm"
         || kernel == "ep_gather_grouped_rows_by_tile_owner_n8_pm"
         || kernel == "moe_slot_ops_pm"
@@ -2348,6 +2369,18 @@ fn run() -> Result<(), String> {
             (
                 peacemaker_isa::kernels::argmax_regrid_pm::symbol(arch),
                 peacemaker_isa::kernels::argmax_regrid_pm::contract(arch, &e),
+            )
+        } else if kernel == "argmax_pair_merge_pm" {
+            let e = peacemaker_isa::kernels::argmax_pair_merge_pm::emit(arch)?;
+            (
+                peacemaker_isa::kernels::argmax_pair_merge_pm::symbol(arch),
+                peacemaker_isa::kernels::argmax_pair_merge_pm::contract(arch, &e),
+            )
+        } else if kernel == "topk8_partial_blocks_pm" {
+            let e = peacemaker_isa::kernels::topk8_partial_blocks_pm::emit(arch)?;
+            (
+                peacemaker_isa::kernels::topk8_partial_blocks_pm::symbol(arch),
+                peacemaker_isa::kernels::topk8_partial_blocks_pm::contract(arch, &e),
             )
         } else if kernel == "ep_tile_mask_pm" {
             let e = peacemaker_isa::kernels::ep_tile_mask::emit(arch)?;

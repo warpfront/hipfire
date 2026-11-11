@@ -133,6 +133,13 @@ pub(super) fn view(source: &GpuTensor, offset: usize, len: usize) -> GpuTensor {
     source.sub_offset(offset, len)
 }
 
+/// Whether two views cover the same device bytes: same base address and same byte size
+/// (so a copy from one to the other is the identity).
+#[inline]
+fn is_same_extent(a: &GpuTensor, b: &GpuTensor) -> bool {
+    a.buf.as_ptr() == b.buf.as_ptr() && a.byte_size() == b.byte_size()
+}
+
 /// Weight projection used by the stateful operations.  Multi-row calls use the
 /// batched GEMM launcher and decode uses the GEMV launcher, for whichever of
 /// the admissible payloads the tensor carries.
@@ -252,6 +259,43 @@ fn mq6_a8_route(gpu: &Gpu, weight: &WeightRef<'_>, rows: usize) -> bool {
     weight.dtype == DType::MQ6G256V2 && gpu.qwen4_trunk_a8_applies(weight.m, weight.k, rows)
 }
 
+/// Launch the F32 members `chunk` (indices into `projections`, one K, all admitted by the A8
+/// route) of one prepared activation `xq`: one multi-part launch when the x4 route takes the shape
+/// (two or more members, 9..=64 rows, a tile with an x4 entry), else one launch per member.
+fn a8_launch_f32_chunk(
+    gpu: &mut Gpu,
+    xq: *mut std::ffi::c_void,
+    projections: &[(&WeightRef<'_>, &GpuTensor)],
+    chunk: &[usize],
+    rows: usize,
+) -> Result<(), DispatchError> {
+    let Some(&first) = chunk.first() else {
+        return Ok(());
+    };
+    let k = projections[first].0.k;
+    let ms: [usize; 4] = std::array::from_fn(|t| chunk.get(t).map_or(0, |&j| projections[j].0.m));
+    for &j in chunk {
+        let (w, _) = projections[j];
+        a8_first_launch_receipt(gpu, w.m, w.k, rows, false);
+    }
+    if chunk.len() >= 2
+        && gpu
+            .gemm_mq6sym_i8_x4_kernel_name(&ms[..chunk.len()], rows)
+            .is_some()
+    {
+        let parts: [(&GpuTensor, &GpuTensor, usize); 4] = std::array::from_fn(|t| {
+            let (w, out) = projections[chunk[t.min(chunk.len() - 1)]];
+            (w.buf, out, w.m)
+        });
+        return hip(gpu.gemm_mq6sym_i8_prequant_x4(&parts[..chunk.len()], xq, k, rows));
+    }
+    for &j in chunk {
+        let (w, out) = projections[j];
+        hip(gpu.gemm_mq6sym_i8_prequant(w.buf, xq, out, w.m, w.k, rows))?;
+    }
+    Ok(())
+}
+
 /// One-time-per-process receipt of the A8 trunk route per row class (1,
 /// 2..=8, 9..=64): proof in served-job logs that the route actually ran.
 fn a8_first_launch_receipt(gpu: &Gpu, m: usize, k: usize, rows: usize, bf16: bool) {
@@ -361,13 +405,31 @@ fn project_weights_inner(
                 continue;
             }
             let xq = hip(gpu.mq6_i8_prepare_x(input, weight.k, rows))?;
+            // `HIPFIRE_QWEN4_TRUNK_A8_X4`: the F32 members of this K gather into chunks of up to
+            // four and launch as one multi-part GEMM (`gemm_mq6sym_i8_prequant_x4`); BF16 members
+            // (the chunked GDN qkv) and shapes without an x4 entry launch per member as before.
+            let x4 = gpu.qwen4_trunk_a8_x4_enabled();
+            let mut chunk = [0usize; 4];
+            let mut chunked = 0usize;
             for j in i..projections.len() {
                 let (w, out) = projections[j];
                 if !done[j] && w.k == weight.k && take(gpu, w, out) {
-                    a8_first_launch_receipt(gpu, w.m, w.k, rows, out.dtype == DType::BF16);
-                    hip(gpu.gemm_mq6sym_i8_prequant(w.buf, xq, out, w.m, w.k, rows))?;
                     done[j] = true;
+                    if x4 && out.dtype == DType::F32 {
+                        chunk[chunked] = j;
+                        chunked += 1;
+                        if chunked == chunk.len() {
+                            a8_launch_f32_chunk(gpu, xq, projections, &chunk[..chunked], rows)?;
+                            chunked = 0;
+                        }
+                    } else {
+                        a8_first_launch_receipt(gpu, w.m, w.k, rows, out.dtype == DType::BF16);
+                        hip(gpu.gemm_mq6sym_i8_prequant(w.buf, xq, out, w.m, w.k, rows))?;
+                    }
                 }
+            }
+            if chunked > 0 {
+                a8_launch_f32_chunk(gpu, xq, projections, &chunk[..chunked], rows)?;
             }
         }
         // The exact-INT8 route (gfx1201 / gfx1151) goes next: one FWHT + A8
@@ -574,6 +636,55 @@ fn project_weights_inner(
                 for &j in chunk {
                     done[j] = true;
                 }
+            }
+        }
+    }
+    // `HIPFIRE_QWEN4_LWMMA_MULTI_PART` (exact gfx1201, 16..=64 rows past the few-row window): BF16
+    // members of one K that each decline the F16 WMMA route take, one by one, the lane-WMMA arm of
+    // `gemm_bf16_xf32_multirow` (`project_rotated`); two to four of them run as ONE multi-part
+    // launch instead, each member's bytes that launch's. Not inside an EP prefill wave split
+    // (`Gpu::wave_lane_groups`: the one-call-per-lane arm owns those).
+    if !wide_exact
+        && input.dtype == DType::F32
+        && gpu.flags.qwen4_lwmma_multi_part_enabled()
+        && gpu.wave_lane_groups(rows).is_none()
+    {
+        for i in 0..projections.len() {
+            let (weight, _) = projections[i];
+            if done[i] || weight.dtype != DType::BF16 {
+                continue;
+            }
+            let group: SmallVec<[usize; 4]> = (i..projections.len())
+                .filter(|&j| {
+                    let (w, out) = projections[j];
+                    !done[j]
+                        && w.dtype == DType::BF16
+                        && w.k == weight.k
+                        && out.dtype == DType::F32
+                        && !gpu.qwen4_f16_wmma_applies(w.buf, w.k, rows)
+                })
+                .take(4)
+                .collect();
+            let ms: SmallVec<[usize; 4]> = group.iter().map(|&j| projections[j].0.m).collect();
+            if group.len() < 2 || !gpu.lane_wmma_multi_part_applies(&ms, weight.k, rows) {
+                continue;
+            }
+            let parts: SmallVec<[rdna_compute::lane_wmma::LaneWmmaMultiPart<'_>; 4]> = group
+                .iter()
+                .map(|&j| {
+                    let (w, out) = projections[j];
+                    rdna_compute::lane_wmma::LaneWmmaMultiPart {
+                        w: w.buf,
+                        y: out,
+                        m: w.m,
+                    }
+                })
+                .collect();
+            hip(gpu
+                .lane_wmma_gemm_multi_fixed(&parts, input, weight.k, rows)
+                .map(|_| ()))?;
+            for j in group {
+                done[j] = true;
             }
         }
     }
@@ -1157,14 +1268,14 @@ fn g942_trunk_gemv() -> bool {
 /// Whether a BF16-weight projection takes the gfx942 MFMA GEMM
 /// (`KernelKey::GemmBf16Mfma`) at `rows` batch rows.
 ///
-/// gfx942 only, at every row count including one: the kernel's 32-row batch
-/// tile masks the tail, each output element is one fixed-order K walk of its
-/// own activation row (128-wide K chunks ascending, MFMA 16-wide steps
-/// ascending, no split-K, no atomics), so a row's bytes do not depend on
-/// `rows`. The activation is F32 (staged to BF16) or already BF16; the output
-/// is F32, or BF16 via an F32 landing in the op's rotation scratch. The one
+/// gfx942 only, at every row count including one: each output element is one
+/// fixed-order K walk of its own activation row (128-wide K chunks ascending,
+/// MFMA 16-wide steps ascending, no split-K, no atomics) in both the 32-row
+/// tile entry and the 1..=16-row entry decode takes, so a row's bytes do not
+/// depend on `rows`. The activation is F32 (staged to BF16, in-kernel on the
+/// few-row entry) or already BF16; the output is F32 or BF16. The one
 /// exception is `gemv_opt_out` (`HIPFIRE_G942_TRUNK_GEMV=1`) at `rows == 1`,
-/// which keeps the legacy GEMV arm.
+/// which keeps the legacy GEMV arm (F32 activation, its own reduction order).
 fn g942_trunk_mfma_route(
     gfx942: bool,
     gemv_opt_out: bool,
@@ -1182,9 +1293,17 @@ fn g942_trunk_mfma_route(
 }
 
 /// The gfx942 MFMA arm of [`project_weights_inner`] for the `group` (indices
-/// into `projections`) of BF16 weights sharing `input` and `k`: one F32 -> BF16
-/// staging of the activation in the shared 2-byte activation scratch (no
-/// per-call allocation; none when `input` is BF16), then one
+/// into `projections`) of BF16 weights sharing `input` and `k`.
+///
+/// 1..=16 rows (decode, few-row tails): one `Gpu::gemm_bf16_mfma_gfx942_rows16`
+/// launch per four members reads the F32 (or BF16) `input` and writes each
+/// F32 or BF16 output directly. It folds in the staging and the output
+/// rounding below with the same RNE rule and runs the same per-element MFMA
+/// chain as the 32-row-tile GEMM, so every byte equals the staged route's.
+///
+/// Otherwise, and for any member that entry declines (alignment / K % 8): one
+/// F32 -> BF16 staging of the activation in the shared 2-byte activation
+/// scratch (no per-call allocation; none when `input` is BF16), then one
 /// `gemm_bf16_mfma_gfx942` per member. The launch extent is the real `rows`;
 /// the kernel pads its batch tile internally, so nothing is padded or copied
 /// here. A BF16 output lands as F32 in `rotation` (`rows * m` elements; BF16
@@ -1209,21 +1328,56 @@ fn project_g942_mfma(
             gpu.maybe_capture_activation(projections[j].0.buf, input, rows, k);
         }
     }
-    let staged = if input.dtype == DType::BF16 {
-        view(input, 0, n)
-    } else {
-        let mut staged = hip(gpu.qwen4_f16_x_scratch(n))?;
-        staged.dtype = DType::BF16;
-        hip(gpu.convert_f32_to_bf16(input, &staged, n))?;
-        staged
-    };
-    // The registered `KernelKey::GemmBf16Mfma` entry (arch-gated to gfx942 by
-    // the registry; refuses a non-BF16 activation), not a direct launch.
-    let ctx = DispatchCtx::new(gpu);
+    let mut outputs: SmallVec<[GpuTensor; 4]> = SmallVec::new();
     for &j in group {
         let (w, out) = projections[j];
         let elements = checked_mul(rows, w.m, "gfx942 trunk output")?;
         require_tensor(out, elements, out.dtype, "gfx942 trunk output")?;
+        outputs.push(view(out, 0, elements));
+    }
+    // Few rows: the whole group, four members per launch, on the fused entry.
+    let x = view(input, 0, n);
+    let mut fused: SmallVec<[bool; 4]> = SmallVec::from_elem(false, group.len());
+    for (chunk, members) in group
+        .chunks(rdna_compute::gemm::GEMM_BF16_MFMA_ROWS16_MAX_MEMBERS)
+        .enumerate()
+    {
+        let base = chunk * rdna_compute::gemm::GEMM_BF16_MFMA_ROWS16_MAX_MEMBERS;
+        let launch: SmallVec<[_; 4]> = members
+            .iter()
+            .enumerate()
+            .map(|(i, &j)| {
+                (
+                    &projections[j].0.buf.buf,
+                    &outputs[base + i],
+                    projections[j].0.m,
+                )
+            })
+            .collect();
+        if hip(gpu.gemm_bf16_mfma_gfx942_rows16(&x, &launch, k, rows))? {
+            fused[base..base + members.len()].fill(true);
+        }
+    }
+    let mut staged: Option<GpuTensor> = None;
+    // The registered `KernelKey::GemmBf16Mfma` entry (arch-gated to gfx942 by
+    // the registry; refuses a non-BF16 activation), not a direct launch.
+    let ctx = DispatchCtx::new(gpu);
+    for (i, &j) in group.iter().enumerate() {
+        if fused[i] {
+            continue;
+        }
+        let (w, out) = projections[j];
+        let elements = outputs[i].numel();
+        let staged = match &staged {
+            Some(staged) => staged,
+            None if input.dtype == DType::BF16 => staged.insert(view(input, 0, n)),
+            None => {
+                let mut scratch = hip(gpu.qwen4_f16_x_scratch(n))?;
+                scratch.dtype = DType::BF16;
+                hip(gpu.convert_f32_to_bf16(input, &scratch, n))?;
+                staged.insert(scratch)
+            }
+        };
         if out.dtype == DType::BF16 {
             let landing = rotation
                 .filter(|r| r.dtype == DType::F32 && r.numel() >= elements)
@@ -1234,10 +1388,10 @@ fn project_g942_mfma(
                     quant: "BF16",
                 })?;
             let landing = view(landing, 0, elements);
-            g942_gemm_bf16_mfma(gpu, &ctx, w, &staged, &landing, rows)?;
+            g942_gemm_bf16_mfma(gpu, &ctx, w, staged, &landing, rows)?;
             hip(gpu.convert_f32_to_bf16(&landing, out, elements))?;
         } else {
-            g942_gemm_bf16_mfma(gpu, &ctx, w, &staged, out, rows)?;
+            g942_gemm_bf16_mfma(gpu, &ctx, w, staged, out, rows)?;
         }
     }
     Ok(())
@@ -1463,7 +1617,9 @@ fn require_hyper_mixer(
 }
 
 /// The decode / verify HC8 route: both mixers are HC8 weights of a launchable shape and the
-/// routed row count is within the kernel's `1..=hc8::MAX_ROWS`.
+/// routed row count is within the kernel's `1..=hc8::MAX_ROWS`. A PREFILL call at or above the
+/// lowered prefill lane WMMA floor ([`Gpu::prefill_small_lane_rows`]) takes the expanded BF16 read
+/// and the prefill entries instead, exactly like the same rows inside a wider call.
 fn hc8_decode_applies(gpu: &Gpu, op: &HyperReadOp<'_>) -> bool {
     let wide = op.branches * op.hidden;
     let (down, up) = (&op.input_mix_down, &op.input_mix_up);
@@ -1471,6 +1627,7 @@ fn hc8_decode_applies(gpu: &Gpu, op: &HyperReadOp<'_>) -> bool {
         && is_hc8(up)
         && op.rows <= rdna_compute::hc8::MAX_ROWS
         && gpu.route_rows(op.rows) <= rdna_compute::hc8::MAX_ROWS
+        && !gpu.prefill_small_lane_rows(op.rows)
         && (down.m, down.k) == (op.low_rank, wide)
         && (up.m, up.k) == (wide, op.low_rank)
         && rdna_compute::hc8_weight::hc8_decode_shape_supported(down.m, down.k)
@@ -1945,18 +2102,45 @@ fn execute_hyper_read_inner(
             split_projections(gpu, op.rows, &[(down, &low)], launch)?;
         }
         activated = true;
+    } else if gpu.arch_caps.has_gfx11_plus_simt()
+        && gpu.prefill_lwmma_hc_applies(op.rows)
+        && op.input_mix_down.dtype == DType::BF16
+        && op.input_mix_down.awq_scale.is_none()
+        && op.input_mix_down.k % 128 == 0
+    {
+        // HIPFIRE_QWEN4_PREFILL_LWMMA_HC (default on): lane WMMA down + hc_act epilogue above 64 rows
+        // below the F16 WMMA route. One BF16 term is exact: `normalized` is `hyper_norm`'s
+        // BF16-rounded output and the weight is BF16. HIPFIRE_QWEN4_PREFILL_LWMMA_TILE (default on)
+        // runs the tuned shape on the staged-tile kernel, every output word the same.
+        if !normalized_ready {
+            hip(hyper_norm(gpu, &norm))?;
+        }
+        hip(gpu.lane_wmma_prefill_gemm(
+            &rdna_compute::lane_wmma::LaneWmmaWeight::Bf16(op.input_mix_down.buf),
+            &normalized,
+            &low,
+            op.input_mix_down.m,
+            op.input_mix_down.k,
+            op.rows,
+            1,
+            Some(1.0 / op.branches as f32),
+        ))?;
+        activated = true;
     } else {
         if !normalized_ready {
             hip(hyper_norm(gpu, &norm))?;
         }
-        project_weight(
+        let held = std::mem::replace(&mut gpu.prefill_lwmma_dense_hold, true);
+        let projected = project_weight(
             gpu,
             &op.input_mix_down,
             &normalized,
             &low,
             op.rows,
             Some(op.rotation),
-        )?;
+        );
+        gpu.prefill_lwmma_dense_hold = held;
+        projected?;
     }
     // `activated` implies the gfx11+ route: the down GEMV already applied it.
     if gpu.arch_caps.has_gfx11_plus_simt() {
@@ -2050,9 +2234,38 @@ fn execute_hyper_read_inner(
             )
             .map(|_| ()));
         }
+        // HIPFIRE_QWEN4_PREFILL_LWMMA_HC (default on): the same lane WMMA up read above 64 rows below
+        // the F16 WMMA route, split-K-free (the read-up kernel is row-count invariant there).
+        if gpu.arch_caps.has_gfx11_plus_simt()
+            && gpu.prefill_lwmma_hc_applies(op.rows)
+            && !read.normalized_bf16
+            && read.low.dtype == DType::F32
+            && read.normalized.dtype == DType::F32
+            && read.mixed.dtype == DType::F32
+            && op.input_mix_up.dtype == DType::BF16
+            && op.input_mix_up.awq_scale.is_none()
+            && op.low_rank % 32 == 0
+            && op.hidden % 16 == 0
+        {
+            return hip(rdna_compute::lane_wmma::lane_wmma_read_up(
+                gpu,
+                &rdna_compute::lane_wmma::LaneWmmaWeight::Bf16(op.input_mix_up.buf),
+                read.low,
+                read.normalized,
+                read.mixed,
+                op.rows,
+                op.hidden,
+                op.low_rank,
+                1,
+            )
+            .map(|_| ()));
+        }
         return hip(hyper_read_up_fused(gpu, &read));
     }
-    project_weight(gpu, &op.input_mix_up, &low, &up, op.rows, Some(op.rotation))?;
+    let held = std::mem::replace(&mut gpu.prefill_lwmma_dense_hold, true);
+    let projected = project_weight(gpu, &op.input_mix_up, &low, &up, op.rows, Some(op.rotation));
+    gpu.prefill_lwmma_dense_hold = held;
+    projected?;
     if let Some(rotated) = rotate_into.filter(|r| {
         op.branches == 4 && op.hidden.is_multiple_of(256) && r.numel() >= op.rows * op.hidden
     }) {
@@ -2530,15 +2743,27 @@ fn hyper_write_gates_k4(gpu: &Gpu, op: &HyperWriteOp<'_>) -> bool {
         ) == Some(4)
 }
 
+/// Whether the read's row count takes the fused `hyper_norm_gate_k4_outputs_f32` launch: 1..=8
+/// rows with `HIPFIRE_QWEN4_HC_PAIR_DECODE`, 9..=64 rows (wide verify) additionally with
+/// `HIPFIRE_QWEN4_HC_PAIR_WIDE` and only eagerly (the kernel's persistent counter buffer is
+/// refused under replay recording / graph capture, where the allrows pair runs instead).
+fn hyper_pair_fused_rows(gpu: &Gpu, read: &HyperReadOp<'_>) -> bool {
+    HyperNormGateK4Outputs::supports(read.branches, read.hidden, read.rows)
+        && gpu.flags.qwen4_hc_pair_decode_enabled()
+        && (read.rows <= 8
+            || (gpu.flags.qwen4_hc_pair_wide_enabled()
+                && !gpu.replay.is_recording()
+                && !gpu.graphs.capture_mode))
+}
+
 /// Whether the decode read `read` also produces its paired write's gates in the same launch
 /// (`HIPFIRE_QWEN4_HC_PAIR_DECODE`, exact gfx1201): the write's gate route is the k4 route and
 /// the geometry is the kernel's (four branches, hidden 2560, 1..=8 rows, BF16 `block_inject`
 /// `[4, 4 * hidden]` without AWQ scale, F32 gates). `hyper_norm_gate_k4_outputs_f32` is bitwise
 /// `hyper_norm` followed by that k4 gate GEMV, so the write then runs pregated.
 fn hyper_pair_decode_applies(gpu: &Gpu, read: &HyperReadOp<'_>, write: &HyperWriteOp<'_>) -> bool {
-    gpu.flags.qwen4_hc_pair_decode_enabled()
+    hyper_pair_fused_rows(gpu, read)
         && hyper_write_gates_k4(gpu, write)
-        && HyperNormGateK4Outputs::supports(read.branches, read.hidden, read.rows)
         && write.rows == read.rows
         && write.branches == read.branches
         && write.hidden == read.hidden
@@ -2551,14 +2776,16 @@ fn hyper_pair_decode_applies(gpu: &Gpu, read: &HyperReadOp<'_>, write: &HyperWri
         && write.gates.numel() >= write.rows * write.branches
 }
 
-/// Whether the k4-route read `read` (past [`hyper_pair_decode_applies`]'s 1..=8 rows) hands its
+/// Whether the k4-route read `read` (every wide row count [`hyper_pair_fused_rows`] does not take) hands its
 /// paired write the gates (`HIPFIRE_QWEN4_HC_PAIR_ALLROWS`, exact gfx1201): the write's gate
 /// route is the k4 GEMV over its own `hyper_norm` of the same streams with the same norm weight
 /// ([`hyper_read_pairs_write`]), so running that GEMV on the read's `normalized` is the write's
 /// launch on the same bytes, and the write skips its norm (`hyper_write` never reads it).
 fn hyper_pair_allrows_applies(gpu: &Gpu, read: &HyperReadOp<'_>, write: &HyperWriteOp<'_>) -> bool {
     gpu.flags.qwen4_hc_pair_allrows_enabled()
-        && !HyperNormGateK4Outputs::supports(read.branches, read.hidden, read.rows)
+        && !(read.rows <= 8
+            && HyperNormGateK4Outputs::supports(read.branches, read.hidden, read.rows))
+        && !hyper_pair_fused_rows(gpu, read)
         && hyper_write_gates_k4(gpu, write)
         && write.rows == read.rows
         && write.branches == read.branches
@@ -2763,8 +2990,11 @@ impl GatedDeltaNetOp<'_> {
 
     /// A row capture spans the stateful part of the op: the whole mixer, or
     /// its core when the input projections ran in an earlier call (the core
-    /// then copies the qkv projection rows into the capture's `inputs`). The
-    /// projection-only phases cannot honor one.
+    /// then copies the qkv projection rows into the capture's `inputs`, or
+    /// skips the copy when `projection` already is those `inputs`: the input
+    /// phase wrote the capture in place). The projection-only phases cannot
+    /// honor one (their op carries the capture's `inputs` as `projection`,
+    /// never as a `row_capture`).
     fn check_phase(&self) -> Result<(), DispatchError> {
         if matches!(self.phase, MixerPhase::InProj | MixerPhase::OutProj)
             && self.row_capture.is_some()
@@ -3322,6 +3552,11 @@ pub fn execute_grouped_depthwise_rows(
             "lane-batched PLE has no row window".into(),
         ));
     }
+    if op.projected {
+        return Err(DispatchError::Hip(
+            "projected PLE key / value have no row window".into(),
+        ));
+    }
     let CoreWindow { lo, rows } = window;
     let channels = op.branches * op.hidden;
     if channels % 2 != 0 || op.embed_dim % 2 != 0 {
@@ -3375,6 +3610,7 @@ pub fn execute_grouped_depthwise_rows(
         dilation: op.dilation,
         epsilon: op.epsilon,
         lane_states: &[],
+        projected: false,
         rotation: op.rotation,
     };
     if window.lo == 0 && window.rows == op.rows {
@@ -3754,11 +3990,14 @@ fn execute_gated_delta_net_hc_impl(
     // A row capture keeps the qkv projection and the recurrence inputs:
     // write them straight into it. A split core receives the projection
     // the input phase left in `op.projection`, copied into the capture
-    // unchanged (the convolution reads the same values either way).
+    // unchanged (the convolution reads the same values either way), unless
+    // the input phase already wrote the capture: `op.projection` then IS the
+    // capture's `inputs` (`HIPFIRE_QWEN4_GDN_CAPTURE_DIRECT`, handed to both
+    // phases by the lane builder) and there is nothing to copy.
     let mut conv_output = view(op.projection2, 0, rows * qkv);
     if let Some(capture) = capture {
         let inputs = view(capture.inputs, 0, op.rows * qkv);
-        if phase == MixerPhase::Core {
+        if phase == MixerPhase::Core && !is_same_extent(&projection, &inputs) {
             hip(gpu.copy_d2d(&projection, &inputs, inputs.byte_size()))?;
         }
         projection = inputs;
@@ -5832,6 +6071,12 @@ pub struct GroupedDepthwiseOp<'a> {
     /// lane rows) with its own convolution state `lane_states[i]` (`state` is
     /// then unused). Bitwise the per-lane steps in lane order.
     pub lane_states: &'a [&'a GpuTensor],
+    /// The key / value projections already ran: `key_scratch` / `value_scratch` hold this
+    /// op's `rows` rows of them (one row-exact `ProjectOp` over a superset of rows, e.g. every
+    /// lane of a lane step, wrote them in place, each row bitwise this op's own projection),
+    /// so the op runs only its gate / norm / convolution / stream-add tail. Needs F32-staged
+    /// rows (`rows_f16 == false`) and the ordinary single-stream form (empty `lane_states`).
+    pub projected: bool,
 }
 
 impl GroupedDepthwiseOp<'_> {
@@ -5906,6 +6151,11 @@ impl GroupedDepthwiseOp<'_> {
                 require_tensor(state, state_elements, DType::F32, "grouped lane state")?;
             }
         }
+        if self.projected && (self.rows_f16 || !self.lane_states.is_empty()) {
+            return Err(DispatchError::Hip(
+                "projected PLE key / value need F32 rows and the single-stream form".into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -5946,7 +6196,9 @@ pub fn execute_grouped_depthwise(
             "PLE rows were staged as F16 but the fused PLE tail is not admitted".into(),
         ));
     }
-    if op.rows_f16 {
+    if op.projected {
+        // The caller's row-exact projection already wrote `key` / `value`.
+    } else if op.rows_f16 {
         // SAFETY: `rows_tensor` holds `rows * embed_dim` F32 elements
         // (`embed_dim == hidden`, validated), so its first
         // `rows * embed_dim * 2` bytes hold the F16 rows; the view is non-owning.
@@ -6405,6 +6657,11 @@ pub enum ProjectLadder {
     /// [`project_weights`]: shared F16 rotation, few-row verify GEMVs, gfx942
     /// BF16 MFMA. Qwen4.
     Trunk,
+    /// [`Self::Trunk`] except a BF16 weight of 2..=`WIDE_VERIFY_MAX_ROWS` rows on gfx11+ SIMT
+    /// runs `Gpu::gemv_bf16_xf32_x4_rows_exact` (one launch when
+    /// `Gpu::bf16_rows_exact_one_launch`, never lane WMMA): every output row is bitwise the
+    /// one-row GEMV's. Other payloads and row counts take the `Trunk` path.
+    TrunkRowExact,
     /// The dispatcher-entry batched GEMMs, each keeping its own arch routing:
     /// `gemm_q8_0_batched_chunked`, `gemm_hfq4g256` (MQ4G256 after its batched
     /// FWHT), `gemm_f32_batched`, gfx942 BF16 MFMA. LFM2 decode lanes.
@@ -6437,7 +6694,10 @@ impl ProjectOp<'_> {
             return Err(DispatchError::Hip("projection has no rows".into()));
         }
         // The `Gemm` ladders admit their payloads in `gemm_ladder_rotation` below.
-        if self.ladder == ProjectLadder::Trunk {
+        if matches!(
+            self.ladder,
+            ProjectLadder::Trunk | ProjectLadder::TrunkRowExact
+        ) {
             require_weight(&self.weight, m, k, "projection")?;
         }
         let input = checked_mul(self.rows, k, "projection input")?;
@@ -6448,7 +6708,9 @@ impl ProjectOp<'_> {
             require_tensor(residual, output, DType::F32, "projection residual")?;
         }
         let rotated = match self.ladder {
-            ProjectLadder::Trunk => !matches!(self.weight.dtype, DType::BF16 | DType::Q8_0),
+            ProjectLadder::Trunk | ProjectLadder::TrunkRowExact => {
+                !matches!(self.weight.dtype, DType::BF16 | DType::Q8_0)
+            }
             ladder => gemm_ladder_rotation(self.weight.dtype, ladder == ProjectLadder::GemmLmHead)?,
         };
         if rotated {
@@ -6465,6 +6727,27 @@ pub fn execute_project(gpu: &mut Gpu, op: &ProjectOp<'_>) -> Result<(), Dispatch
     match op.ladder {
         ProjectLadder::Trunk => {
             project_weight(gpu, &op.weight, op.input, op.output, op.rows, op.rotation)?
+        }
+        ProjectLadder::TrunkRowExact => {
+            let w = &op.weight;
+            if w.dtype == DType::BF16
+                && (2..=rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS).contains(&op.rows)
+                && gpu.arch_caps.has_gfx11_plus_simt()
+                && gpu.bf16_rows_exact_one_launch(op.rows)
+                // A rank-banded weight keeps the Trunk entry, which owns the band exchange.
+                && !is_split(gpu, w, op.rows)
+            {
+                let part = (w.buf, op.output, w.m);
+                let none = (w.buf, op.output, 0);
+                hip(gpu.gemv_bf16_xf32_x4_rows_exact(
+                    [part, none, none, none],
+                    op.input,
+                    w.k,
+                    op.rows,
+                ))?
+            } else {
+                project_weight(gpu, w, op.input, op.output, op.rows, op.rotation)?
+            }
         }
         ProjectLadder::Gemm | ProjectLadder::GemmLmHead => project_gemm(gpu, op)?,
     }
@@ -6686,38 +6969,58 @@ pub fn execute_lane_attention(
     ))
 }
 
-/// `output[r] = rows_input[r] + row` for every one of `rows` rows of `width`.
+/// `output[l * rows + r] = rows_input[l * rows + r] + row[l]` for every one of `rows` branch rows
+/// of `width` of each of `lanes` lane rows (`row` holds `lanes` rows of `width`; `lanes == 1` is
+/// one lane's `rows` branch rows plus its single `row`).
 pub struct BroadcastAddOp<'a> {
     pub rows_input: &'a GpuTensor,
     pub row: &'a GpuTensor,
     pub output: &'a GpuTensor,
     pub rows: usize,
     pub width: usize,
+    pub lanes: usize,
 }
 
 impl BroadcastAddOp<'_> {
     pub fn validate_for_gpu(&self, _gpu: &Gpu) -> Result<(), DispatchError> {
-        if self.rows == 0 || self.width == 0 {
+        if self.rows == 0 || self.width == 0 || self.lanes == 0 {
             return Err(DispatchError::Hip(
                 "broadcast add has empty geometry".into(),
             ));
         }
-        let elements = checked_mul(self.rows, self.width, "broadcast add rows")?;
+        let lane_elements = checked_mul(self.rows, self.width, "broadcast add rows")?;
+        let elements = checked_mul(lane_elements, self.lanes, "broadcast add lanes")?;
+        let row_elements = checked_mul(self.width, self.lanes, "broadcast add row lanes")?;
         require_tensor(self.rows_input, elements, DType::F32, "broadcast add input")?;
         require_tensor(self.output, elements, DType::F32, "broadcast add output")?;
-        require_tensor(self.row, self.width, DType::F32, "broadcast add row")
+        require_tensor(self.row, row_elements, DType::F32, "broadcast add row")
     }
 }
 
+/// One `broadcast_add_rows_f32` launch (`HIPFIRE_QWEN4_DRAFT_GLUE_FOLD`: the launch is one IEEE add per
+/// element, the same operand pairs as the per-branch `add_f32` launches, so the bytes are
+/// identical) or one `add_f32` per branch row.
 pub fn execute_broadcast_add(gpu: &mut Gpu, op: &BroadcastAddOp<'_>) -> Result<(), DispatchError> {
-    let row = view(op.row, 0, op.width);
-    for r in 0..op.rows {
-        let offset = r * op.width;
-        hip(gpu.add_f32(
-            &view(op.rows_input, offset, op.width),
-            &row,
-            &view(op.output, offset, op.width),
-        ))?;
+    if gpu.flags.qwen4_draft_glue_fold_enabled() {
+        return hip(gpu.broadcast_add_rows_f32(
+            op.rows_input,
+            op.row,
+            op.output,
+            op.rows,
+            op.width,
+            op.lanes,
+        ));
+    }
+    for l in 0..op.lanes {
+        let row = view(op.row, l * op.width, op.width);
+        for r in 0..op.rows {
+            let offset = (l * op.rows + r) * op.width;
+            hip(gpu.add_f32(
+                &view(op.rows_input, offset, op.width),
+                &row,
+                &view(op.output, offset, op.width),
+            ))?;
+        }
     }
     Ok(())
 }
@@ -7562,6 +7865,7 @@ mod tests {
             epsilon: 1e-6,
             rotation: &rotation,
             lane_states: &[],
+            projected: false,
         };
         assert!(op().validate_layout().is_ok());
 
@@ -7600,6 +7904,204 @@ mod tests {
         assert!(fn_like.validate_layout().is_ok());
         fn_like.rows_f16 = true;
         assert!(fn_like.validate_layout().is_ok());
+        // A projected op (the key / value rows were written by a lane-wide projection) is the
+        // ordinary F32-rows single-stream form: F16 staging and lane batching refuse it.
+        let mut projected = op();
+        projected.projected = true;
+        assert!(projected.validate_layout().is_ok());
+        let mut bad = op();
+        bad.projected = true;
+        bad.rows_f16 = true;
+        assert!(refusal(&bad).contains("single-stream form") || refusal(&bad).contains("F16 rows"));
+        let lane_state = f32s(state.numel());
+        let lane_states = [&lane_state, &lane_state, &lane_state];
+        let mut bad = op();
+        bad.projected = true;
+        bad.lane_states = &lane_states;
+        assert!(refusal(&bad).contains("single-stream form"));
+    }
+
+    /// `HIPFIRE_QWEN4_GDN_CAPTURE_DIRECT`: a split GDN mixer (`InProj` then `Core`) under an armed
+    /// row capture whose in-projection writes the capture's `inputs` in place (both phases carry
+    /// that tensor as `projection`, so the Core issues no `copy_d2d`) leaves the capture inputs,
+    /// the recurrence inputs, the state ring, the live state, the convolution history and every
+    /// scratch output bytewise as the in-projection into scratch followed by the Core's copy.
+    #[test]
+    fn split_gdn_capture_in_place_is_bytewise_the_copy() {
+        let Ok(mut gpu) = Gpu::init() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        if gpu.arch != "gfx1201" || !gpu.arch_caps.has_qwen4_parallel_qsa_gdn() {
+            eprintln!("skip: needs exact gfx1201");
+            return;
+        }
+        let gpu = &mut gpu;
+        // The same-extent predicate the Core's elision rests on.
+        let probe = gpu.zeros(&[16], DType::F32).expect("probe");
+        assert!(is_same_extent(&view(&probe, 0, 8), &view(&probe, 0, 8)));
+        assert!(!is_same_extent(&view(&probe, 0, 8), &view(&probe, 8, 8)));
+        assert!(!is_same_extent(&view(&probe, 0, 8), &view(&probe, 0, 4)));
+
+        let (rows, ring_rows) = (3usize, 4usize);
+        let (key_heads, value_heads, dim, k) = (2usize, 6usize, 128usize, 256usize);
+        let (qk, value) = (key_heads * dim, value_heads * dim);
+        let qkv = 2 * qk + value;
+        let format = GdnStateFormat::Q8;
+        let units = format.state_units(value_heads, dim, dim);
+        let wave = |seed: usize, n: usize, scale: f32| -> Vec<f32> {
+            (0..n)
+                .map(|i| {
+                    let h = i.wrapping_mul(2_654_435_761).wrapping_add(seed * 97) % 10007;
+                    (h as f32 - 5003.0) / 5003.0 * scale
+                })
+                .collect()
+        };
+        let bf16 = |gpu: &mut Gpu, values: &[f32]| -> GpuTensor {
+            let bytes: Vec<u8> = values
+                .iter()
+                .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes())
+                .collect();
+            let mut t = gpu.upload_raw(&bytes, &[bytes.len()]).expect("bf16");
+            t.dtype = DType::BF16;
+            t.shape = vec![values.len()];
+            t
+        };
+        let input = gpu
+            .upload_f32(&wave(1, rows * k, 1.0), &[rows * k])
+            .expect("input");
+        let qkv_w = bf16(gpu, &wave(2, qkv * k, 0.1));
+        let z_w = bf16(gpu, &wave(3, value * k, 0.1));
+        let a_w = bf16(gpu, &wave(4, value_heads * k, 0.1));
+        let b_w = bf16(gpu, &wave(5, value_heads * k, 0.1));
+        let out_w = bf16(gpu, &wave(6, k * value, 0.1));
+        let conv = bf16(gpu, &wave(7, qkv * 4, 0.5));
+        let a_log = bf16(gpu, &wave(8, value_heads, 0.5));
+        let dt_bias = bf16(gpu, &wave(9, value_heads, 0.5));
+        let norm = bf16(gpu, &wave(10, dim, 1.0));
+
+        let run = |gpu: &mut Gpu, in_proj_in_place: bool, core_in_place: bool| -> Vec<Vec<u8>> {
+            let f32s = |gpu: &mut Gpu, n: usize| gpu.zeros(&[n], DType::F32).expect("scratch");
+            let recurrent = gpu.zeros(&[units], format.dtype()).expect("state");
+            let conv_state = gpu
+                .upload_f32(&wave(11, 3 * qkv, 0.7), &[3 * qkv])
+                .expect("history");
+            let projection = f32s(gpu, rows * qkv);
+            let projection2 = f32s(gpu, rows * qkv);
+            let (a, b) = (f32s(gpu, rows * value_heads), f32s(gpu, rows * value_heads));
+            let (gate, beta) = (f32s(gpu, rows * value_heads), f32s(gpu, rows * value_heads));
+            let recurrent_output = f32s(gpu, rows * value);
+            let z_output = f32s(gpu, rows * value);
+            let output_scratch = f32s(gpu, rows * value);
+            let rotation = f32s(gpu, rows * k);
+            let output_tensor = f32s(gpu, rows * k);
+            let bf16_scratch = gpu
+                .zeros(&[value.max(k)], DType::BF16)
+                .expect("bf16 scratch");
+            let ring = gpu
+                .zeros(&[ring_rows * units], format.dtype())
+                .expect("ring");
+            let inputs = f32s(gpu, ring_rows * qkv);
+            let recurrence = f32s(gpu, ring_rows * (qkv + 2 * value_heads));
+            let in_target = if in_proj_in_place {
+                &inputs
+            } else {
+                &projection
+            };
+            let core_target = if core_in_place { &inputs } else { &projection };
+            macro_rules! op {
+                ($phase:expr, $capture:expr, $target:expr) => {
+                    GatedDeltaNetOp {
+                        qkv: plain_weight(&qkv_w, DType::BF16, qkv, k),
+                        conv: &conv,
+                        in_proj_a: plain_weight(&a_w, DType::BF16, value_heads, k),
+                        in_proj_b: plain_weight(&b_w, DType::BF16, value_heads, k),
+                        a_log: &a_log,
+                        dt_bias: &dt_bias,
+                        z: plain_weight(&z_w, DType::BF16, value, k),
+                        norm: &norm,
+                        output: plain_weight(&out_w, DType::BF16, k, value),
+                        recurrent: &recurrent,
+                        format,
+                        residual: None,
+                        conv_state: &conv_state,
+                        projection: $target,
+                        projection2: &projection2,
+                        a: &a,
+                        b: &b,
+                        gate: &gate,
+                        beta: &beta,
+                        recurrent_output: &recurrent_output,
+                        bf16_scratch: &bf16_scratch,
+                        rotation: &rotation,
+                        z_output: &z_output,
+                        output_scratch: &output_scratch,
+                        input: &input,
+                        output_tensor: &output_tensor,
+                        rows,
+                        start_position: 5,
+                        key_heads,
+                        value_heads,
+                        key_dim: dim,
+                        value_dim: dim,
+                        conv_kernel: 4,
+                        input_width: k,
+                        row_capture: $capture,
+                        zba_fold: None,
+                        trunk_a4: 0,
+                        phase: $phase,
+                    }
+                };
+            }
+            execute_gated_delta_net(gpu, &op!(MixerPhase::InProj, None, in_target))
+                .expect("in-projection");
+            let capture = GdnRowCapture {
+                states: ring.sub_offset(0, rows * units),
+                inputs: &inputs,
+                recurrence: &recurrence,
+            };
+            execute_gated_delta_net(gpu, &op!(MixerPhase::Core, Some(capture), core_target))
+                .expect("core");
+            gpu.hip.device_synchronize().expect("sync");
+            [
+                &inputs,
+                &recurrence,
+                &ring,
+                &recurrent,
+                &conv_state,
+                &z_output,
+                &a,
+                &b,
+                &recurrent_output,
+                &output_scratch,
+            ]
+            .iter()
+            .map(|t| {
+                let mut out = vec![0u8; t.byte_size()];
+                gpu.hip.memcpy_dtoh(&mut out, &t.buf).expect("download");
+                out
+            })
+            .collect()
+        };
+        let copied = run(gpu, false, false);
+        let in_place = run(gpu, true, true);
+        for (i, (c, d)) in copied.iter().zip(&in_place).enumerate() {
+            assert_eq!(
+                c, d,
+                "tensor {i} differs between the copy and the in-place capture"
+            );
+        }
+        for i in [0usize, 1, 2, 5, 8, 9] {
+            assert!(copied[i].iter().any(|b| *b != 0), "tensor {i} stayed zero");
+        }
+        // Negative control: a Core handed the capture while its in-projection wrote scratch
+        // skips the copy, so it convolves the (zero) capture rows: the comparison is sensitive
+        // to the copy being skipped and to the input phase writing the capture.
+        let torn = run(gpu, false, true);
+        assert!(
+            torn.iter().zip(&copied).any(|(t, c)| t != c),
+            "a Core over an unwritten capture matched the copy: the oracle cannot see a skipped copy"
+        );
     }
 }
 

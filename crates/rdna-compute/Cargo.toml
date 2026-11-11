@@ -172,6 +172,34 @@ name = "qwen4_mq6_rows"
 required-features = ["lab"]
 
 [[example]]
+name = "qwen4_mq6_x4_sym"
+required-features = ["lab"]
+
+[[example]]
+name = "qwen4_moe_combine_ordered"
+required-features = ["lab"]
+
+[[example]]
+name = "qwen4_draft_glue"
+required-features = ["lab"]
+
+[[example]]
+name = "qwen4_topk8_rows"
+required-features = ["lab"]
+
+[[example]]
+name = "qwen4_lwmma_multi_part"
+required-features = ["lab"]
+
+[[example]]
+name = "qwen4_moe_glue_fold"
+required-features = ["lab"]
+
+[[example]]
+name = "qwen4_moe_gu_rot_fold"
+required-features = ["lab"]
+
+[[example]]
 name = "mtp_dense_det_pm"
 required-features = ["lab"]
 
@@ -1104,6 +1132,10 @@ name = "mq2_xbatch_oracle"
 required-features = ["lab"]
 
 [[example]]
+name = "hc8_rip_oracle"
+required-features = ["lab"]
+
+[[example]]
 name = "lane_rows_pm_oracle"
 required-features = ["lab"]
 
@@ -1285,6 +1317,12 @@ required-features = ["lab"]
 # SHA-256 (one gfx1201 card); `--features lab`.
 [[example]]
 name = "railgun_pm_persistent_smoke"
+required-features = ["lab"]
+
+# Persistent-program completion cancel on one gfx1201 card (poison cell,
+# teardown escalation, device quarantine); `--features lab`.
+[[example]]
+name = "railgun_persistent_cancel_smoke"
 required-features = ["lab"]
 
 # Peer-VRAM push + flag collective vs the incumbent TP2 graph collective

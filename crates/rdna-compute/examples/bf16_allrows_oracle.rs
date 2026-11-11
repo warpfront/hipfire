@@ -27,6 +27,19 @@
 //!   cargo run --release -p rdna-compute --features lab --example bf16_allrows_oracle -- \
 //!     [--model PATH] [--layers 0,23,47] [--seeds N] [--synthetic] \
 //!     [--bench] [--bench-reps N] [--no-oracle]
+//!
+//! ReRead section (`--reread`): PLE key_proj [10240,2560] / value_proj [2560,2560] and MTP
+//! fc_hidden / fc_embedding [2560,2560] (found by tensor-name suffix `ple.key_proj.weight`,
+//! `ple.value_proj.weight`, `mtp.fc_hidden.weight`, `mtp.fc_embedding.weight`; a missing/misshapen
+//! tensor falls back to synthetic for that shape, printed). Cases: PLE lanes L in {2,4,8} x per-lane
+//! rows r in {2,6}; fc total rows 4*L with 8-row chunks. Arms vs the per-row singleton:
+//! `incumbent_chunks` (one x4_rows call per chunk), `exact_one` (one x4_rows_exact call), `lwmma_one`
+//! (x4_rows over all rows; mismatch EXPECTED, reported with max abs/rel error). Exit nonzero only on
+//! incumbent/exact mismatch, launch error or an undetected row-offset control. `--bench` adds median
+//! us/call per arm (graph replay, CALLS_PER_SAMPLE) and ratios; `--out FILE.json` writes the cases.
+//! `--no-default` (with `--reread`) skips all the older sections:
+//!   cargo run --release -p rdna-compute --features lab --example bf16_allrows_oracle -- \
+//!     --reread --no-default [--model PATH] [--synthetic] [--bench] [--bench-reps N] [--out rr.json]
 //! Exit nonzero on any mismatch, launch error, undetected control, or non-gfx1201 device.
 
 use rdna_compute::gemv::{Bf16AllRowsTile, HcK4AllRowsTile};
@@ -1344,11 +1357,299 @@ fn hc_bench(gpu: &mut Gpu, down: &[u8], reps: usize, rng: &mut Rng) {
     }
 }
 
+// ---- ReRead section (--reread): PLE / MTP fc lane-chunk arms -----------------------
+
+/// Finds the tensor whose name ends with `suffix` (first in name order) and reads it as `[m, k]`
+/// BF16; any failure falls back to synthetic weights for that shape, printed.
+fn reread_weight(
+    h: &Option<Hfq>,
+    suffix: &str,
+    m: usize,
+    k: usize,
+    rng: &mut Rng,
+) -> (Vec<u8>, bool) {
+    if let Some(h) = h {
+        match h.tensors.keys().find(|n| n.ends_with(suffix)).cloned() {
+            Some(name) => match h.bf16(&name, m, k) {
+                Ok(b) => {
+                    println!("bf16_allrows_oracle: reread {suffix}: real tensor {name}");
+                    return (b, true);
+                }
+                Err(e) => println!("FALLBACK --synthetic for {suffix} [{m},{k}]: {e}"),
+            },
+            None => println!("FALLBACK --synthetic for {suffix} [{m},{k}]: no tensor ends with it"),
+        }
+    }
+    (synth_bf16(rng, m * k), false)
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum RrArm {
+    Incumbent,
+    ExactOne,
+    LwmmaOne,
+}
+
+impl RrArm {
+    const ALL: [RrArm; 3] = [RrArm::Incumbent, RrArm::ExactOne, RrArm::LwmmaOne];
+    fn name(self) -> &'static str {
+        match self {
+            RrArm::Incumbent => "incumbent_chunks",
+            RrArm::ExactOne => "exact_one",
+            RrArm::LwmmaOne => "lwmma_one",
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rr_run(
+    gpu: &mut Gpu,
+    arm: RrArm,
+    w: &GpuTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    m: usize,
+    k: usize,
+    total: usize,
+    chunk: usize,
+) {
+    match arm {
+        RrArm::Incumbent => {
+            for c in 0..total / chunk {
+                let xs = x.sub_offset(c * chunk * k, chunk * k);
+                let ys = y.sub_offset(c * chunk * m, chunk * m);
+                hip(
+                    gpu.gemv_bf16_xf32_x4_rows(parts4(&[w], &[&ys], &[m]), &xs, k, chunk),
+                    "reread incumbent chunk",
+                );
+            }
+        }
+        RrArm::ExactOne => hip(
+            gpu.gemv_bf16_xf32_x4_rows_exact(parts4(&[w], &[y], &[m]), x, k, total),
+            "reread exact_one",
+        ),
+        RrArm::LwmmaOne => hip(
+            gpu.gemv_bf16_xf32_x4_rows(parts4(&[w], &[y], &[m]), x, k, total),
+            "reread lwmma_one",
+        ),
+    }
+}
+
+fn median(mut s: Vec<f64>) -> f64 {
+    s.sort_by(f64::total_cmp);
+    s[s.len() / 2]
+}
+
+/// Runs every arm of one (weight, lanes, per-lane rows) case; returns (JSON object, failures).
+#[allow(clippy::too_many_arguments)]
+fn rr_case(
+    gpu: &mut Gpu,
+    label: &str,
+    w: &GpuTensor,
+    m: usize,
+    k: usize,
+    lanes: usize,
+    total: usize,
+    chunk: usize,
+    do_bench: bool,
+    reps: usize,
+    rng: &mut Rng,
+) -> (String, usize) {
+    let mut fails = 0usize;
+    // [arm] -> (mismatching words, max abs err, max rel err), summed over x families.
+    let mut st = [(0usize, 0f64, 0f64); 3];
+    let mut last_x = None;
+    for family in 0..4 {
+        let hx = gen_x(k, family, total, rng);
+        let x = upload_f32(gpu, &hx);
+        let want = reference(gpu, std::slice::from_ref(w), &[m], &x, k, total).remove(0);
+        for (ai, arm) in RrArm::ALL.into_iter().enumerate() {
+            let o = alloc_out(gpu, total * m);
+            rr_run(gpu, arm, w, &x, &o.live, m, k, total, chunk);
+            let got = fetch(gpu, &o);
+            let bad = mismatches(&got, &expected(&want, 0));
+            st[ai].0 += bad;
+            for (g, r) in got[GUARD..GUARD + total * m].iter().zip(&want) {
+                let (g, r) = (f32::from_bits(*g) as f64, f32::from_bits(*r) as f64);
+                let d = (g - r).abs();
+                let d = if d.is_nan() { f64::INFINITY } else { d };
+                st[ai].1 = st[ai].1.max(d);
+                if r != 0.0 {
+                    st[ai].2 = st[ai].2.max(d / r.abs());
+                }
+            }
+            free_outs(gpu, vec![o]);
+        }
+        if let Some(old) = last_x.replace(x) {
+            let _ = gpu.free_tensor(old);
+        }
+    }
+    for (ai, arm) in RrArm::ALL.into_iter().enumerate() {
+        if arm != RrArm::LwmmaOne && st[ai].0 != 0 {
+            fails += 1;
+            eprintln!("MISMATCH {label} {}: {} words", arm.name(), st[ai].0);
+        }
+    }
+    let mut us = [f64::NAN; 3];
+    if do_bench {
+        let x = last_x.as_ref().unwrap();
+        let o = alloc_out(gpu, total * m);
+        for (ai, arm) in RrArm::ALL.into_iter().enumerate() {
+            us[ai] = time_us(gpu, reps, |g| {
+                rr_run(g, arm, w, x, &o.live, m, k, total, chunk)
+            });
+        }
+        free_outs(gpu, vec![o]);
+    }
+    if let Some(x) = last_x {
+        let _ = gpu.free_tensor(x);
+    }
+    let one = gpu.bf16_rows_exact_one_launch(total);
+    println!(
+        "  {label:<26} L={lanes} rows={total:<2} chunk={chunk} one_launch={one} | \
+         incumbent bad={} | exact bad={} | lwmma bad={} maxabs={:.3e} maxrel={:.3e}{}",
+        st[0].0,
+        st[1].0,
+        st[2].0,
+        st[2].1,
+        st[2].2,
+        if do_bench {
+            format!(
+                " | us inc={:.2} exact={:.2} lwmma={:.2} exact/inc={:.3} lwmma/inc={:.3}",
+                us[0],
+                us[1],
+                us[2],
+                us[1] / us[0],
+                us[2] / us[0]
+            )
+        } else {
+            String::new()
+        }
+    );
+    let json = format!(
+        "{{\"case\":\"{label}\",\"m\":{m},\"k\":{k},\"lanes\":{lanes},\"rows\":{total},\"chunk\":{chunk},\
+         \"one_launch\":{one},\"incumbent_chunks\":{{\"bad\":{},\"us\":{}}},\"exact_one\":{{\"bad\":{},\"us\":{}}},\
+         \"lwmma_one\":{{\"bad\":{},\"max_abs\":{:e},\"max_rel\":{:e},\"us\":{}}}}}",
+        st[0].0,
+        jnum(us[0]),
+        st[1].0,
+        jnum(us[1]),
+        st[2].0,
+        st[2].1,
+        st[2].2,
+        jnum(us[2])
+    );
+    (json, fails)
+}
+
+fn jnum(v: f64) -> String {
+    if v.is_finite() {
+        format!("{v:.4}")
+    } else {
+        "null".into()
+    }
+}
+
+/// Returns the number of failures (arm (a)/(b) mismatches, undetected controls).
+fn reread(
+    gpu: &mut Gpu,
+    hfq: &Option<Hfq>,
+    do_bench: bool,
+    reps: usize,
+    out: Option<&str>,
+    rng: &mut Rng,
+) -> usize {
+    set_allrows(gpu, true);
+    println!(
+        "bf16_allrows_oracle: --reread arms incumbent_chunks / exact_one / lwmma_one (lwmma mismatch is EXPECTED, reported only)"
+    );
+    // (display name, tensor suffix, m, k, lane rows r (None = 8-row chunks, total 4*L))
+    let weights: [(&str, &str, usize, usize, Option<[usize; 2]>); 4] = [
+        ("ple_key", "ple.key_proj.weight", 10240, 2560, Some([2, 6])),
+        (
+            "ple_value",
+            "ple.value_proj.weight",
+            2560,
+            2560,
+            Some([2, 6]),
+        ),
+        ("mtp_fc_hidden", "mtp.fc_hidden.weight", 2560, 2560, None),
+        (
+            "mtp_fc_embedding",
+            "mtp.fc_embedding.weight",
+            2560,
+            2560,
+            None,
+        ),
+    ];
+    let mut fails = 0usize;
+    let mut cases = Vec::new();
+    let mut control_done = false;
+    for (name, suffix, m, k, rs) in weights {
+        let (bytes, real) = reread_weight(hfq, suffix, m, k, rng);
+        let w = upload_bf16(gpu, &bytes, m, k);
+        if !control_done {
+            // Row-offset control on exact_one: x shifted one row must differ from the reference.
+            let total = 16;
+            let hx = gen_x(k, 1, total + 1, rng);
+            let x = upload_f32(gpu, &hx);
+            let want = reference(gpu, std::slice::from_ref(&w), &[m], &x, k, total).remove(0);
+            let o = alloc_out(gpu, total * m);
+            hip(
+                gpu.gemv_bf16_xf32_x4_rows_exact(
+                    parts4(&[&w], &[&o.live], &[m]),
+                    &x.sub_offset(k, total * k),
+                    k,
+                    total,
+                ),
+                "reread control",
+            );
+            let n = mismatches(&fetch(gpu, &o)[GUARD..GUARD + total * m], &want);
+            if n > 0 {
+                println!("control row offset (exact_one): detected ({n} words)");
+            } else {
+                println!("CONTROL NOT DETECTED: row offset (exact_one)");
+                fails += 1;
+            }
+            free_outs(gpu, vec![o]);
+            let _ = gpu.free_tensor(x);
+            control_done = true;
+        }
+        for lanes in [2usize, 4, 8] {
+            let shapes: Vec<(usize, usize)> = match rs {
+                Some(rs) => rs.iter().map(|&r| (lanes * r, r)).collect(),
+                None => vec![(4 * lanes, 8)],
+            };
+            for (total, chunk) in shapes {
+                assert!(total <= MAXR && total % chunk == 0);
+                let label = format!("{name}{} r{}", if real { "" } else { "(synth)" }, chunk);
+                let (j, f) = rr_case(
+                    gpu, &label, &w, m, k, lanes, total, chunk, do_bench, reps, rng,
+                );
+                cases.push(j);
+                fails += f;
+            }
+        }
+        let _ = gpu.free_tensor(w);
+    }
+    if let Some(path) = out {
+        let body = format!(
+            "{{\"bench\":{do_bench},\"reps\":{reps},\"calls_per_sample\":{CALLS_PER_SAMPLE},\"cases\":[\n{}\n]}}\n",
+            cases.join(",\n")
+        );
+        std::fs::write(path, body).expect("write --out");
+        println!("bf16_allrows_oracle: wrote {path}");
+    }
+    println!("bf16_allrows_oracle: --reread failures = {fails}");
+    fails
+}
+
 fn main() {
     let mut model = DEFAULT_MODEL.to_string();
     let mut layers: Vec<usize> = vec![0, 23, 47];
     let (mut seeds, mut synthetic, mut do_bench, mut oracle, mut reps) =
         (1usize, false, false, true, 7usize);
+    let (mut do_reread, mut no_default, mut out_path) = (false, false, None::<String>);
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -1366,11 +1667,22 @@ fn main() {
             "--bench" => do_bench = true,
             "--bench-reps" => reps = args.next().expect("--bench-reps N").parse().expect("N"),
             "--no-oracle" => oracle = false,
+            "--reread" => do_reread = true,
+            "--no-default" => no_default = true,
+            "--out" => out_path = Some(args.next().expect("--out FILE.json")),
             other => panic!("unknown argument {other}"),
         }
     }
     assert!(reps >= 5, "--bench-reps must be >= 5");
     assert!(!layers.is_empty(), "--layers needs at least one layer");
+    assert!(!no_default || do_reread, "--no-default needs --reread");
+    let reread_bench = do_bench && do_reread;
+    if no_default {
+        // --reread only: skip every pre-existing oracle/bench section.
+        oracle = false;
+        do_bench = false;
+        layers.clear();
+    }
     let mut gpu = Gpu::init().expect("Gpu::init");
     println!(
         "bf16_allrows_oracle: arch={} model={} layers={layers:?} seeds={seeds} synthetic={synthetic} \
@@ -1574,7 +1886,22 @@ fn main() {
         let (down, _) = hc_tensor(&hfq, layers[0], "attn", "down", HC_RANK, HC_K, &mut rng);
         hc_bench(&mut gpu, &down, reps, &mut rng);
     }
-    if oracle {
+    if do_reread {
+        let f = reread(
+            &mut gpu,
+            &hfq,
+            reread_bench,
+            reps,
+            out_path.as_deref(),
+            &mut rng,
+        );
+        if f != 0 {
+            println!("bf16_allrows_oracle: FAIL (--reread)");
+            std::io::stdout().flush().expect("flush");
+            std::process::exit(1);
+        }
+    }
+    if oracle || do_reread {
         println!("bf16_allrows_oracle: PASS");
     }
     std::io::stdout().flush().expect("flush");

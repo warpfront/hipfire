@@ -88,6 +88,7 @@ pub(super) fn build_program<'a>(
                 dilation: config.ple_conv_dilation(),
                 epsilon: EPSILON,
                 lane_states: &[],
+                projected: false,
             }));
         }
 

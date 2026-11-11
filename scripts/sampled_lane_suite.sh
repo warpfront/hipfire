@@ -46,12 +46,14 @@
 # admits 3 of a trial's 8 requests at tick 0 and 5 more once the first group
 # has prefilled, so early lanes' first window runs native (3 active) and later
 # ones AR (8 active; 4 active is the hold case). The native arms (lane_batched,
-# lane_adaptive, lane_cross) also pin HIPFIRE_EP_MTP_LANE_K=$LANE_K; lane_ar
+# lane_adaptive, lane_cross, lane_copy) also pin HIPFIRE_EP_MTP_LANE_K=$LANE_K; lane_ar
 # pins nothing.
 # Give `merge` and `verdict` the same job environment as the shards (the config
 # identity compares every HIPFIRE_* variable). The ep2 cohort is lane_ar
-# lane_batched lane_adaptive, plus lane_cross when LANES=8 (`lane_copy` is
-# refused under ep2). The single and pp2 topologies validate their
+# lane_batched lane_adaptive, plus lane_cross when LANES=8. The ep2 COPY cohort
+# (LANES=1 or 2, PROMPT=copy, its own OUT directory) is lane_ar lane_copy:
+# lane_copy stages the serve's default copy lane and its coverage requires copy
+# windows (takeovers) in the lane counters. The single and pp2 topologies validate their
 # configuration and refuse ("ep2 only"); `selftest` is the host-only part.
 #
 # Draw route: with HIPFIRE_QWEN4_LANE_DEVICE_SAMPLE on (the default on gfx1201)
@@ -124,7 +126,9 @@ case "${1:-}" in
     case "$arm" in
       lane_batched) export HIPFIRE_MTP_INCREMENTAL=0 HIPFIRE_MTP_AR_FLOOR=0 HIPFIRE_EP_MTP_LANE_MAX_ACTIVE=8 HIPFIRE_EP_MTP_LANE_K="$LANE_K" ;;
       lane_adaptive) export HIPFIRE_EP_MTP_LANE_MAX_ACTIVE=8 HIPFIRE_EP_MTP_LANE_K="$LANE_K" ;;
-      lane_copy) export HIPFIRE_MTP_NGRAM_COPY=on HIPFIRE_EP_MTP_LANE_MAX_ACTIVE=8 ;;
+      lane_copy)
+        [ "$TOPOLOGY" != ep2 ] || [ "$LANES" -le 2 ] || die "lane_copy under ep2 needs LANES=1 or 2 (the copy lane's step cap)"
+        export HIPFIRE_MTP_NGRAM_COPY=on HIPFIRE_EP_MTP_LANE_MAX_ACTIVE=8 HIPFIRE_EP_MTP_LANE_K="$LANE_K" ;;
       lane_cross)
         [ "$TOPOLOGY" = ep2 ] || die "lane_cross runs under TOPOLOGY=ep2 only"
         [ "$LANES" = 8 ] || die "lane_cross needs LANES=8"

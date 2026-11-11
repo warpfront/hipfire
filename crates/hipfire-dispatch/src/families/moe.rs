@@ -1595,6 +1595,25 @@ pub trait MoeRowGather {
         None
     }
 
+    /// Whether [`Self::gather_rows`] of this layer is a no-op for the call: the trunk shard's partial FFN
+    /// route, where the all-reduce of the HC write completes the routed FFN and this rank's combine folds
+    /// its own owned-slot partial (non-owned experts ran on the zero dummy tables). The slot-ordered
+    /// expanded rows a gather would exchange are then never read by a peer, so a down that writes BF16
+    /// grouped rows instead (the int8 wide-verify chain) is exact. `false` by default (every call
+    /// gathers); implementations decide it exactly as `gather_rows` does.
+    fn gather_skipped(&self, _layer_idx: u16) -> bool {
+        false
+    }
+
+    /// The owner mask of the wide-verify int8 chain (`HIPFIRE_QWEN4_MOE_GU_A8`, `ep_a8_wide`) of this
+    /// layer's call: `Some` only where [`Self::gather_skipped`] holds and the rank built its owner table
+    /// at EP attach, so the chain masks the tiles of every expert another rank owns out of both A8
+    /// GEMMs and folds only owned rows. `None` (default): the chain runs over unmasked tiles, the
+    /// non-owned experts on the zero dummy tables, byte-identical.
+    fn decode_owner_mask(&self, _layer_idx: u16) -> Option<MoeDecodeOwnerMask<'_>> {
+        None
+    }
+
     /// Rewrite the layer's live expert tables and slot owners from
     /// `topk_indices` (`slots = rows * k`). Runs after routing, before the
     /// first routed-table reader of the same call.
@@ -1608,6 +1627,49 @@ pub trait MoeRowGather {
         Err("owner assignment not supported".into())
     }
 
+    /// Pre-route reservation of a few-row grouped prefill call's routed-id destination: the
+    /// hook that logs the call's ids ([`Self::gather_rows`] sees them) may name a device view of
+    /// `slots * 4` bytes that the route producer then writes DIRECTLY instead of `scratch`, so
+    /// the usage log needs no later device copy. Called once per call, before the router
+    /// launches, only for a replicated-route prefill call that will reach its row gather
+    /// (never under a graph capture or replay record); `scratch` is the call's own top-k
+    /// buffer. `Some(view)`: the route kernels write `view` and every later reader of the call's
+    /// ids (owner assignment, scatter, gate/up, down, combine, [`Self::gather_rows`]) reads it,
+    /// the bytes exactly those the scratch would have held; the view stays valid until the
+    /// window's retirement. `None` (default): the call routes into `scratch`.
+    fn reserve_topk(
+        &self,
+        _gpu: &mut rdna_compute::Gpu,
+        _layer_idx: u16,
+        _slots: usize,
+        _scratch: &GpuTensor,
+    ) -> Option<GpuTensor> {
+        None
+    }
+
+    /// A rank-local MoE call that replaces this hook's row gather (an X2 owned
+    /// MTP draft lane computes every slot itself and crosses nothing) reports
+    /// itself here at the point the gather would run, so per-call bookkeeping
+    /// that rides on the gather (the D2 expert tail's deferred fill issue) keeps
+    /// its timing. Must not touch the call's rows. No-op by default.
+    fn note_local_call(
+        &self,
+        _gpu: &mut rdna_compute::Gpu,
+        _layer_idx: u16,
+        _slots: usize,
+        _topk_indices: &GpuTensor,
+    ) {
+    }
+
+    /// Buffer index (of the transport's registered gather buffers) of this
+    /// rank's most recent row-gather invocation, `None` before the first or
+    /// when the hook has no such notion. The sharded draft-head MoE pass (S4)
+    /// picks its activation-exchange buffer to differ from it, so the
+    /// transport's no-same-buffer-twice hazard rule holds. `None` by default.
+    fn last_gather_buffer(&self) -> Option<usize> {
+        None
+    }
+
     /// End of one decode window (a trunk forward over every lane's rows) on this
     /// rank, after its D2H sync and before the next window's launches: the D2
     /// expert tail retires the window here. No-op by default.
@@ -1616,6 +1678,19 @@ pub trait MoeRowGather {
     /// The forward is freed: release any device state the hook owns. No-op by
     /// default.
     fn release_gpu(&self, _gpu: &mut rdna_compute::Gpu) {}
+}
+
+/// The wide-verify int8 chain's owner mask ([`MoeRowGather::decode_owner_mask`]): the device table of the
+/// owner rank of every expert (`i32` per expert, at least `n_experts` words: the combine's owner mask
+/// and the tile mask read the SAME table, so their ownership predicate cannot differ), this rank, and
+/// the masked tile id scratch (`i32` per tile, never aliasing `expert_tile_ids`; at least the padded
+/// tile capacity of a 64-row call).
+#[derive(Clone, Copy)]
+pub struct MoeDecodeOwnerMask<'a> {
+    pub owner_table: &'a GpuTensor,
+    pub tile_ids_owned: &'a GpuTensor,
+    pub rank: usize,
+    pub n_experts: usize,
 }
 
 /// Expert-parallel owner-routed chunk exchange of the grouped symmetric IU4

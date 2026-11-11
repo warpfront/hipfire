@@ -53,10 +53,11 @@
 //!   for the low / high byte pairs; raw weights occupy VGPRs above the e32 true16
 //!   limit), then `v_perm_b32 0x07060302` packs the f32 high halves; int8 via
 //!   `v_bfe_i32` + `v_cvt_f32_i32` + the same pack. Both are exact.
-//! * K loop: batches of `U` tiles (`U = 8/4/2/2` for `NT = 1/2/3/4`), then halving
-//!   batches `U/2 .. 1` for the remainder; all loads of a batch are issued before its
-//!   first use so the builder's ledger waits only for what is needed. No scratch, no
-//!   spills.
+//! * K loop: batches of `U` tiles (reference `U = 8/4/2/2` for `NT = 1/2/3/4`),
+//!   then halving batches for the remainder. The production E4M3 mw1/kw16 `act`
+//!   entries use x-first loads and `U = 2/1` for NT 2/3. Read-up NT 1 uses `U = 4`,
+//!   weights-first loads and early epilogue loads. All other schedules are unchanged.
+//!   Every batch issues its loads before first use; no scratch or spills.
 mod dequant;
 mod read_up;
 use super::iu4_gemm::ModuleProof;
@@ -75,6 +76,35 @@ pub use read_up::{
 };
 
 type R = Result<(), String>;
+
+#[derive(Clone, Copy)]
+enum LoadOrder {
+    PerTile,
+    WeightsFirst,
+    XFirst,
+}
+
+/// Scheduling changes never alter the ascending WMMA accumulation chain.
+#[derive(Clone, Copy)]
+struct Schedule {
+    unroll: u32,
+    load_order: LoadOrder,
+    early_epilogue_loads: bool,
+}
+
+impl Schedule {
+    fn reference(nt: u32) -> Self {
+        Self {
+            unroll: match nt {
+                1 => 8,
+                2 => 4,
+                _ => 2,
+            },
+            load_order: LoadOrder::PerTile,
+            early_epilogue_loads: false,
+        }
+    }
+}
 
 /// Module name; the embedded image is `kernels/hc8_wmma_pm_gfx1201.hxaco`.
 pub const MODULE: &str = "hc8_wmma_pm_gfx1201";
@@ -191,11 +221,20 @@ impl Geo {
     }
     /// Tiles per batch of the main K loop.
     fn unroll(&self) -> u32 {
-        match self.nt {
-            1 => 8,
-            2 => 4,
-            _ => 2,
+        self.schedule().unroll
+    }
+    fn schedule(&self) -> Schedule {
+        let mut schedule = Schedule::reference(self.nt);
+        if self.fmt == Fmt::E4M3
+            && self.mw == 1
+            && self.kw == 16
+            && self.act
+            && matches!(self.nt, 2 | 3)
+        {
+            schedule.unroll = if self.nt == 2 { 2 } else { 1 };
+            schedule.load_order = LoadOrder::XFirst;
         }
+        schedule
     }
     fn batches(&self) -> Vec<u32> {
         let mut out = Vec::new();
@@ -330,7 +369,10 @@ struct Lay {
 
 impl Lay {
     fn new(g: &Geo) -> Result<Lay, String> {
-        let (u, nt) = (g.unroll(), g.nt);
+        Self::with_unroll(g, g.unroll())
+    }
+    fn with_unroll(g: &Geo, u: u32) -> Result<Lay, String> {
+        let nt = g.nt;
         let da = 24 + 8 * nt;
         let xb = da + 16;
         let wr = xb + 16 * u * nt;
@@ -848,23 +890,29 @@ fn wmma(b: &mut Builder, l: &Lay, t: u32, c: u32, st: u32) -> R {
 
 /// One batch of `u` K32 tiles: issue every load, advance the pointers, then consume.
 fn batch(b: &mut Builder, g: &Geo, l: &Lay, u: u32) -> R {
-    for t in 0..u {
-        vload128(b, l.w(t), WOFF, WP, 512 * t)?;
-        for c in 0..g.nt {
-            exec_mask(b, c)?;
-            for st in 0..2u32 {
-                for h in 0..2u32 {
-                    vload128(
-                        b,
-                        l.x(t, c, st) + 4 * h as u8,
-                        XOFF + c as u8,
-                        XP,
-                        128 * t + 64 * st + 32 * h,
-                    )?;
-                }
-            }
+    batch_ordered(b, g, l, u, g.schedule().load_order)
+}
+
+fn batch_ordered(b: &mut Builder, g: &Geo, l: &Lay, u: u32, order: LoadOrder) -> R {
+    if matches!(order, LoadOrder::XFirst) {
+        for t in 0..u {
+            load_x(b, g, l, t)?;
         }
-        exec_all(b)?;
+        for t in 0..u {
+            vload128(b, l.w(t), WOFF, WP, 512 * t)?;
+        }
+    } else if matches!(order, LoadOrder::WeightsFirst) {
+        for t in 0..u {
+            vload128(b, l.w(t), WOFF, WP, 512 * t)?;
+        }
+        for t in 0..u {
+            load_x(b, g, l, t)?;
+        }
+    } else {
+        for t in 0..u {
+            vload128(b, l.w(t), WOFF, WP, 512 * t)?;
+            load_x(b, g, l, t)?;
+        }
     }
     add64_imm(b, WP, 512 * u)?;
     add64_imm(b, XP, 128 * u)?;
@@ -881,6 +929,25 @@ fn batch(b: &mut Builder, g: &Geo, l: &Lay, u: u32) -> R {
             }
         }
     }
+    Ok(())
+}
+
+fn load_x(b: &mut Builder, g: &Geo, l: &Lay, t: u32) -> R {
+    for c in 0..g.nt {
+        exec_mask(b, c)?;
+        for st in 0..2u32 {
+            for h in 0..2u32 {
+                vload128(
+                    b,
+                    l.x(t, c, st) + 4 * h as u8,
+                    XOFF + c as u8,
+                    XP,
+                    128 * t + 64 * st + 32 * h,
+                )?;
+            }
+        }
+    }
+    exec_all(b)?;
     Ok(())
 }
 

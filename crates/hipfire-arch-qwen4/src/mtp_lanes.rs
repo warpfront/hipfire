@@ -49,8 +49,8 @@ use crate::mtp_spec::{
 use hipfire_dispatch::pipeline::DraftHeadRequestState;
 use hipfire_runtime::spec::{GreedyAccept, MtpWindow};
 use hipfire_runtime::spec_economics::{
-    observe_agreement, Action, NativeWindow, WindowStats, AGREEMENT_PRIOR, DEFAULT_DECAY,
-    FLOOR_PROBE_WINDOWS,
+    batched_depth, observe_agreement, Action, NativeWindow, WindowStats, AGREEMENT_PRIOR,
+    DEFAULT_DECAY, FLOOR_PROBE_WINDOWS,
 };
 use rdna_compute::{Gpu, GpuTensor};
 
@@ -224,6 +224,127 @@ impl LaneCostModel {
     }
 }
 
+/// Prior `[F, a, r, q]` (µs) of [`LaneDepthCost`] on the EP2 R9700 mesh
+/// (gfx1201). Fitted to the priced lane steps of the j8730 storyaccept
+/// `l3kill2` runs (`QWEN4_LANE_COST_TRACE` `"step"` events; base, forced-k2 and
+/// forced-k3 arms; story C1 / C4 / C8; weighted rms 0.80 ms) over
+/// `W = F + a·C + r·e + q·(e / C)`: a draft row costs about 1.55 ms at one
+/// lane (the sequential draft rounds dominate) but about 0.37 ms at C8 (the
+/// rounds amortise over the lanes).
+const DEPTH_COST_PRIOR_US: [f64; 4] = [10_920.0, 1_990.0, 200.0, 1_350.0];
+/// Per-parameter scale of [`LaneDepthCost`]'s prior weight: the squared
+/// typical regressor (`C` about 8, `e` about 3, `e / C` about 2).
+const DEPTH_COST_PRIOR_SCALE: [f64; 4] = [1.0, 64.0, 9.0, 4.0];
+
+/// Store-pooled model of a pure-decode step's wall time `W` (µs), the price
+/// of a draft depth on the gfx1201 lane store:
+///
+/// `W = F + a·C + r·e + q·(e / C)`
+///
+/// with `C` the decoding lanes of the step, `e` its verified drafts and
+/// `e / C` the mean draft depth (the step's sequential draft rounds).
+/// [`LaneCostModel`]'s `G·s` spill term, which its per-request fit prices for
+/// the floor, is absent: the all-rows lane step has no second row group. One
+/// fit is pooled over every lane and request of the store, with the same
+/// decay, ridge solve (`(XᵀX + P) θ = XᵀW + P θ₀`, `P = 8 · diag(1, 64, 9, 4)`)
+/// and non-negativity clamp (`a, r, q ≥ 0`) as [`LaneCostModel`].
+///
+/// A per-row price that does not depend on `C` (the 4-term `LaneCostModel`'s
+/// `r`, the gfx1151 `MTP_WINDOW_COST` table: a one-draft window at 1.7 AR
+/// rows) cannot represent a draft row that costs 1.55 ms at C1 but 0.37 ms at
+/// C8. The table sent 8–10 % of story windows to AR and picked depth 3 or 5
+/// where 2 wins.
+#[derive(Clone, Debug)]
+pub(crate) struct LaneDepthCost {
+    xtx: [[f64; 4]; 4],
+    xty: [f64; 4],
+}
+
+impl LaneDepthCost {
+    pub(crate) fn new() -> Self {
+        Self {
+            xtx: [[0.0; 4]; 4],
+            xty: [0.0; 4],
+        }
+    }
+
+    /// One finished pure-decode step of `lanes` decoding lanes and `verified`
+    /// verified drafts in all, `wall_us` long. An unusable wall is dropped.
+    pub(crate) fn observe(&mut self, lanes: usize, verified: usize, wall_us: f32) {
+        if !(wall_us.is_finite() && wall_us > 0.0) {
+            return;
+        }
+        let c = lanes.max(1) as f64;
+        let e = verified as f64;
+        let x = [1.0, c, e, e / c];
+        let y = f64::from(wall_us);
+        for i in 0..4 {
+            self.xty[i] = self.xty[i] * COST_DECAY + x[i] * y;
+            for j in 0..4 {
+                self.xtx[i][j] = self.xtx[i][j] * COST_DECAY + x[i] * x[j];
+            }
+        }
+    }
+
+    /// The ridge fit `[F, a, r, q]` (µs), `a, r, q` clamped at zero.
+    fn solve(&self) -> [f64; 4] {
+        let mut m = [[0.0f64; 5]; 4];
+        for i in 0..4 {
+            let prior = COST_PRIOR_WEIGHT * DEPTH_COST_PRIOR_SCALE[i];
+            m[i][..4].copy_from_slice(&self.xtx[i]);
+            m[i][i] += prior;
+            m[i][4] = self.xty[i] + prior * DEPTH_COST_PRIOR_US[i];
+        }
+        for col in 0..4 {
+            let pivot = (col..4)
+                .max_by(|&a, &b| m[a][col].abs().total_cmp(&m[b][col].abs()))
+                .unwrap_or(col);
+            m.swap(col, pivot);
+            for row in col + 1..4 {
+                let factor = m[row][col] / m[col][col];
+                for k in col..5 {
+                    m[row][k] -= factor * m[col][k];
+                }
+            }
+        }
+        let mut theta = [0.0f64; 4];
+        for i in (0..4).rev() {
+            let tail: f64 = (i + 1..4).map(|j| m[i][j] * theta[j]).sum();
+            theta[i] = (m[i][4] - tail) / m[i][i];
+        }
+        if theta.iter().any(|t| !t.is_finite()) {
+            theta = DEPTH_COST_PRIOR_US;
+        }
+        for t in &mut theta[1..] {
+            *t = t.max(0.0);
+        }
+        theta
+    }
+
+    /// The clamped `(F, a, r, q)` in µs.
+    pub(crate) fn fit(&self) -> (f64, f64, f64, f64) {
+        let [f, a, r, q] = self.solve();
+        (f, a, r, q)
+    }
+
+    /// Price of a window of every depth `0..=LANE_MAX_DRAFTS` in a step of
+    /// `lanes` decoding lanes, in AR-row units (the units of
+    /// [`MTP_WINDOW_COST`], index = drafts): `1` without drafts, else
+    /// `1 + (r·d + q·d / C) / (α(C) / C)` with `α(C) = F + a·C` (floored at
+    /// [`COST_ALPHA_FLOOR_US`]), the lane's proportional share of the AR step.
+    pub(crate) fn window_costs(&self, lanes: usize) -> [f32; LANE_MAX_DRAFTS + 1] {
+        let [f, a, r, q] = self.solve();
+        let c = lanes.max(1) as f64;
+        let share = (f + a * c).max(COST_ALPHA_FLOOR_US) / c;
+        let mut costs = [1.0f32; LANE_MAX_DRAFTS + 1];
+        for (d, cost) in costs.iter_mut().enumerate().skip(1) {
+            let d = d as f64;
+            *cost = (1.0 + (r * d + q * d / c) / share) as f32;
+        }
+        costs
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Lane floor policy
 // ---------------------------------------------------------------------------
@@ -237,7 +358,8 @@ pub(crate) fn floor_env_enabled() -> bool {
 /// `HIPFIRE_QWEN4_EP_LANE_AR_FLOOR` (developer; default off, `1` on): whether EP mesh
 /// native-MTP lanes run the AR floor (measured window pricing with sticky retirement to
 /// head-free AR). Off (the default), a mesh lane routes its draft depth from its own agreement
-/// ([`Qwen4Floor::provisional_depth`]; depth 0 is a one-token `ArSynced` window, never sticky)
+/// (priced by the measured step cost, `HIPFIRE_QWEN4_LANE_MEASURED_DEPTH`, else
+/// [`Qwen4Floor::provisional_depth`]; depth 0 is a one-token `ArSynced` window, never sticky)
 /// and the n-gram copy lane is never stopped by the floor. On, the floor runs unless
 /// `HIPFIRE_MTP_AR_FLOOR=0`.
 ///
@@ -263,6 +385,15 @@ const LANE_MAX_DRAFTS: usize = crate::gpu_forward_lanes::LANE_MAX_ROWS - 1;
 /// this module had before profiles.
 pub(crate) fn lane_cost_profile_enabled() -> bool {
     hipfire_config::developer_bool("HIPFIRE_QWEN4_LANE_COST", true)
+}
+
+/// `HIPFIRE_QWEN4_LANE_MEASURED_DEPTH` (developer; default on, `0` off): with the gfx1201
+/// lane cost profile, an EP mesh lane with the floor off ([`ep_mesh_lane_floor_enabled`])
+/// asks the store's measured step cost ([`LaneDepthCost`]) only whether a drafting window
+/// beats an AR window; every nonzero depth stays on the gfx1151 [`MTP_WINDOW_COST`] table.
+/// Off, and under the legacy profile, the static table decides AR too.
+pub(crate) fn lane_measured_depth_enabled() -> bool {
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_LANE_MEASURED_DEPTH", true)
 }
 
 /// `HIPFIRE_QWEN4_LANE_ROW_CAP` (developer; default off, `1` on): the gfx1201
@@ -342,6 +473,13 @@ impl LaneCostProfile {
     /// The profile of `arch` (a `Gpu::arch` string).
     pub(crate) fn for_arch(arch: &str) -> Self {
         Self::for_arch_with(arch, lane_cost_profile_enabled())
+    }
+
+    /// Whether this profile lets the measured step cost
+    /// ([`LaneDepthCost`], `HIPFIRE_QWEN4_LANE_MEASURED_DEPTH`) remove AR
+    /// windows where a drafting window pays (depth stays static): the gfx1201 profile only.
+    pub(crate) fn measured_depth(&self) -> bool {
+        self.name == "gfx1201" && lane_measured_depth_enabled()
     }
 
     fn for_arch_with(arch: &str, enabled: bool) -> Self {
@@ -528,8 +666,18 @@ impl LaneSpecPolicy {
     }
 
     /// Route the lane's next window; `budget` is the most drafts it may
-    /// carry (0 = AR). Retired lanes stay `ArRetired`.
-    pub(crate) fn route(&mut self, budget: usize, lab: LabRoutes) -> LaneRoute {
+    /// carry (0 = AR). Retired lanes stay `ArRetired`. With the floor off,
+    /// the gfx1151 window-cost table picks the depth; `depth_costs` (index =
+    /// drafts, AR-row units: [`LaneDepthCost::window_costs`]) prices only the
+    /// AR-vs-drafting decision: where the table says AR but the measured
+    /// cost says a drafting window pays, the window drafts at the table's
+    /// best drafting depth. The floor-enabled path and the lab modes ignore it.
+    pub(crate) fn route(
+        &mut self,
+        budget: usize,
+        lab: LabRoutes,
+        depth_costs: Option<&[f32]>,
+    ) -> LaneRoute {
         if self.promoted_retired {
             return LaneRoute::ArRetired;
         }
@@ -547,14 +695,25 @@ impl LaneSpecPolicy {
             return LaneRoute::ArSynced;
         }
         let k = budget.min(self.max_k);
-        let provisional = self.floor.provisional_depth(&self.agreement, k);
         let batched = |depth: usize| match depth.min(k) {
             0 => LaneRoute::ArSynced,
             k_max => LaneRoute::Batched { k_max },
         };
         if !self.floor_enabled {
-            return batched(provisional);
+            let static_depth = self.floor.provisional_depth(&self.agreement, k);
+            let depth = match depth_costs {
+                // The measured cost says a drafting window beats AR: take the
+                // static table's best drafting depth.
+                Some(costs)
+                    if static_depth == 0 && batched_depth(&self.agreement, k, costs) > 0 =>
+                {
+                    static_drafting_depth(&self.agreement, k)
+                }
+                _ => static_depth,
+            };
+            return batched(depth);
         }
+        let provisional = self.floor.provisional_depth(&self.agreement, k);
         match self.floor.route(&self.agreement, k, provisional) {
             Action::ArHeadFree => LaneRoute::ArRetired,
             Action::ArSynced | Action::Interleaved => LaneRoute::ArSynced,
@@ -666,17 +825,29 @@ impl LaneSpecPolicy {
     /// depth within the budget, the window's price in AR rows at this step's
     /// lane count with no spill, the tokens it emits at the lane's measured
     /// agreement and their ratio, the number the floor weighs against the AR
-    /// unit (1 per token).
+    /// unit (1 per token). `depth` is the store's measured depth cost (its
+    /// fit is `depth_fit_us`) and `depth_costs` the window prices the route
+    /// chose by (empty when the static table did).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn route_trace_line(
         &self,
         ctx: &RouteTraceCtx,
         pooled: &LaneCostModel,
+        depth: &LaneDepthCost,
+        depth_costs: Option<&[f32]>,
         budget: usize,
         lab: LabRoutes,
         route: LaneRoute,
     ) -> String {
         let model = self.cost.as_ref().unwrap_or(pooled);
         let (f, a, r, g) = model.fit();
+        let (df, da, dr, dq) = depth.fit();
+        let depth_costs = depth_costs
+            .unwrap_or_default()
+            .iter()
+            .map(|c| format!("{c:.4}"))
+            .collect::<Vec<_>>()
+            .join(",");
         let mut native = String::new();
         let depths = budget.min(self.max_k).min(self.agreement.len());
         let mut prefix = 1.0f32;
@@ -698,7 +869,7 @@ impl LaneSpecPolicy {
             .floor
             .trace_line("", &self.agreement, "route", 0.0, 0, 0);
         format!(
-            "{LANE_COST_TRACE_PREFIX} {{\"event\":\"route\",\"tag\":{},\"gen\":{},\"window_seq\":{},\"step_seq\":{},\"lanes\":{},\"profile\":\"{}\",\"fit\":\"{}\",\"obs\":{},\"fit_us\":{{\"F\":{f:.1},\"a\":{a:.1},\"r\":{r:.1},\"G\":{g:.1}}},\"budget\":{budget},\"lab\":{},\"floor_enabled\":{},\"retired\":{},\"route\":\"{}\",\"ar_units_per_token\":1.0,\"native\":[{native}],\"floor\":{}}}",
+            "{LANE_COST_TRACE_PREFIX} {{\"event\":\"route\",\"tag\":{},\"gen\":{},\"window_seq\":{},\"step_seq\":{},\"lanes\":{},\"profile\":\"{}\",\"fit\":\"{}\",\"obs\":{},\"fit_us\":{{\"F\":{f:.1},\"a\":{a:.1},\"r\":{r:.1},\"G\":{g:.1}}},\"depth_fit_us\":{{\"F\":{df:.1},\"a\":{da:.1},\"r\":{dr:.1},\"q\":{dq:.1}}},\"depth_costs\":[{depth_costs}],\"budget\":{budget},\"lab\":{},\"floor_enabled\":{},\"retired\":{},\"route\":\"{}\",\"ar_units_per_token\":1.0,\"native\":[{native}],\"floor\":{}}}",
             ctx.request_tag,
             ctx.owner_generation,
             ctx.window_seq,
@@ -716,15 +887,21 @@ impl LaneSpecPolicy {
     }
 
     /// Print the decision's trace line to stderr.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn trace_route(
         &self,
         ctx: &RouteTraceCtx,
         pooled: &LaneCostModel,
+        depth: &LaneDepthCost,
+        depth_costs: Option<&[f32]>,
         budget: usize,
         lab: LabRoutes,
         route: LaneRoute,
     ) {
-        eprintln!("{}", self.route_trace_line(ctx, pooled, budget, lab, route));
+        eprintln!(
+            "{}",
+            self.route_trace_line(ctx, pooled, depth, depth_costs, budget, lab, route)
+        );
     }
 }
 
@@ -1500,6 +1677,25 @@ pub(crate) fn fill_head_after_wave(
     .map_err(|e| format!("fill_head_after_wave: {e}"))
 }
 
+/// The depth in `1..=k` with the most expected tokens per [`MTP_WINDOW_COST`]
+/// row, the static table's best drafting depth (`batched_depth` without the AR
+/// baseline, so always `>= 1` for `k >= 1` and a non-empty agreement).
+fn static_drafting_depth(agreement: &[(f32, f32)], k: usize) -> usize {
+    let mut best = (1, 0.0f32);
+    let mut prefix = 1.0f32;
+    let mut expected = 1.0f32;
+    let depths = agreement.iter().zip(&MTP_WINDOW_COST[1..]).take(k);
+    for (i, (&(accepted, total), &cost)) in depths.enumerate() {
+        prefix *= accepted / total.max(f32::MIN_POSITIVE);
+        expected += prefix;
+        let rate = expected / cost;
+        if rate > best.1 {
+            best = (i + 1, rate);
+        }
+    }
+    best.0
+}
+
 #[cfg(test)]
 mod tests {
     // The finish split's ordering guarantee. `Qwen4Bundle`/`Gpu` cannot be built
@@ -1722,7 +1918,6 @@ mod tests {
     }
 
     use super::*;
-    use hipfire_runtime::spec_economics::batched_depth;
 
     fn window(committed: usize, accepted: usize, drafts: usize) -> MtpWindow {
         MtpWindow {
@@ -2025,13 +2220,13 @@ mod tests {
         // These three windows pay at 0.875, but not at 0.97, after the
         // lane floor's three-window probe budget.
         let mut policy = LaneSpecPolicy::with_floor(1, true);
-        policy.route(1, LabRoutes::Floor);
+        policy.route(1, LabRoutes::Floor, None);
         for units in [3.0, 0.8, 2.05] {
             policy.observe_batched(&window(2, 1, 1), units, 1, 1);
         }
         assert!(!policy.retired());
         assert_eq!(
-            policy.route(1, LabRoutes::Floor),
+            policy.route(1, LabRoutes::Floor, None),
             LaneRoute::Batched { k_max: 1 }
         );
     }
@@ -2039,9 +2234,9 @@ mod tests {
     #[test]
     fn a_zero_budget_routes_ar_synced() {
         let mut policy = LaneSpecPolicy::with_floor(3, true);
-        assert_eq!(policy.route(0, LabRoutes::Floor), LaneRoute::ArSynced);
+        assert_eq!(policy.route(0, LabRoutes::Floor, None), LaneRoute::ArSynced);
         let mut off = LaneSpecPolicy::with_floor(3, false);
-        assert_eq!(off.route(0, LabRoutes::Floor), LaneRoute::ArSynced);
+        assert_eq!(off.route(0, LabRoutes::Floor, None), LaneRoute::ArSynced);
     }
 
     #[test]
@@ -2052,26 +2247,29 @@ mod tests {
             0 => LaneRoute::ArSynced,
             d => LaneRoute::Batched { k_max: d },
         };
-        assert_eq!(policy.route(3, LabRoutes::Floor), want);
+        assert_eq!(policy.route(3, LabRoutes::Floor, None), want);
         // A smaller budget caps the depth.
         let capped = batched_depth(&policy.agreement, 1, &MTP_WINDOW_COST);
         let want = match capped {
             0 => LaneRoute::ArSynced,
             d => LaneRoute::Batched { k_max: d },
         };
-        assert_eq!(policy.route(1, LabRoutes::Floor), want);
+        assert_eq!(policy.route(1, LabRoutes::Floor, None), want);
         // Floor off never retires, whatever it observes.
         for _ in 0..8 {
             policy.observe_batched(&window(1, 0, 1), 50.0, 1, 3);
         }
         assert!(!policy.retired());
-        assert_ne!(policy.route(3, LabRoutes::Floor), LaneRoute::ArRetired);
+        assert_ne!(
+            policy.route(3, LabRoutes::Floor, None),
+            LaneRoute::ArRetired
+        );
     }
 
     #[test]
     fn a_fresh_floor_probes_batched_then_retires_stickily() {
         let mut policy = LaneSpecPolicy::with_floor(3, true);
-        let first = policy.route(3, LabRoutes::Floor);
+        let first = policy.route(3, LabRoutes::Floor, None);
         let depth = batched_depth(&policy.agreement, 3, &MTP_WINDOW_COST);
         assert_eq!(
             first,
@@ -2085,11 +2283,20 @@ mod tests {
             policy.observe_batched(&window(1, 0, 1), 6.0, 1, 3);
         }
         assert!(policy.retired());
-        assert_eq!(policy.route(3, LabRoutes::Floor), LaneRoute::ArRetired);
+        assert_eq!(
+            policy.route(3, LabRoutes::Floor, None),
+            LaneRoute::ArRetired
+        );
         // Sticky: a later cheap window changes nothing, nor does budget 0.
         policy.observe_batched(&window(4, 3, 3), 0.5, 3, 3);
-        assert_eq!(policy.route(3, LabRoutes::Floor), LaneRoute::ArRetired);
-        assert_eq!(policy.route(0, LabRoutes::Floor), LaneRoute::ArRetired);
+        assert_eq!(
+            policy.route(3, LabRoutes::Floor, None),
+            LaneRoute::ArRetired
+        );
+        assert_eq!(
+            policy.route(0, LabRoutes::Floor, None),
+            LaneRoute::ArRetired
+        );
     }
 
     #[test]
@@ -2099,7 +2306,7 @@ mod tests {
         assert_eq!(batched_depth(&policy.agreement, 3, &MTP_WINDOW_COST), 0);
         // The floor's probe budget routes the provisional depth: none is
         // interleaved, which a lane runs as one synced AR row.
-        assert_eq!(policy.route(3, LabRoutes::Floor), LaneRoute::ArSynced);
+        assert_eq!(policy.route(3, LabRoutes::Floor, None), LaneRoute::ArSynced);
         policy.observe_ar_synced(&window(1, 0, 0), 3);
         assert!(!policy.retired());
         // A zero budget observes nothing.
@@ -2114,13 +2321,16 @@ mod tests {
             assert!(policy.retired());
             for lab in [LabRoutes::Floor, LabRoutes::Batched, LabRoutes::Cycle] {
                 for budget in [0, 1, 3] {
-                    assert_eq!(policy.route(budget, lab), LaneRoute::ArRetired);
+                    assert_eq!(policy.route(budget, lab, None), LaneRoute::ArRetired);
                 }
             }
             policy.observe_batched(&window(4, 3, 3), 0.5, 3, 3);
             policy.observe_ar_synced(&window(1, 0, 0), 3);
             assert!(policy.retired());
-            assert_eq!(policy.route(3, LabRoutes::Floor), LaneRoute::ArRetired);
+            assert_eq!(
+                policy.route(3, LabRoutes::Floor, None),
+                LaneRoute::ArRetired
+            );
         }
     }
 
@@ -2134,23 +2344,32 @@ mod tests {
         let mut fresh = LaneSpecPolicy::with_floor(3, true);
         fresh.agreement = low.to_vec();
         assert_eq!(
-            promoted.route(3, LabRoutes::Floor),
-            fresh.route(3, LabRoutes::Floor)
+            promoted.route(3, LabRoutes::Floor, None),
+            fresh.route(3, LabRoutes::Floor, None)
         );
-        assert_eq!(promoted.route(0, LabRoutes::Floor), LaneRoute::ArSynced);
+        assert_eq!(
+            promoted.route(0, LabRoutes::Floor, None),
+            LaneRoute::ArSynced
+        );
         // The floor starts fresh: it still retires on costly probe windows.
         let mut probing =
             LaneSpecPolicy::promoted_with_floor(3, &[AGREEMENT_PRIOR; 63], false, true);
-        assert_ne!(probing.route(3, LabRoutes::Floor), LaneRoute::ArRetired);
+        assert_ne!(
+            probing.route(3, LabRoutes::Floor, None),
+            LaneRoute::ArRetired
+        );
         for _ in 0..3 {
             probing.observe_batched(&window(1, 0, 1), 6.0, 1, 3);
         }
         assert!(probing.retired());
-        assert_eq!(probing.route(3, LabRoutes::Floor), LaneRoute::ArRetired);
+        assert_eq!(
+            probing.route(3, LabRoutes::Floor, None),
+            LaneRoute::ArRetired
+        );
         // Lab modes still bypass the floor on a live promoted lane.
         let mut lab = LaneSpecPolicy::promoted_with_floor(3, &low, false, true);
         assert_eq!(
-            lab.route(2, LabRoutes::Batched),
+            lab.route(2, LabRoutes::Batched, None),
             LaneRoute::Batched { k_max: 2 }
         );
     }
@@ -2167,7 +2386,7 @@ mod tests {
             } else {
                 LaneRoute::Batched { k_max: max_k }
             };
-            assert_eq!(fresh.route(usize::MAX, LabRoutes::Batched), want);
+            assert_eq!(fresh.route(usize::MAX, LabRoutes::Batched, None), want);
         }
 
         let mut inherited: Vec<_> = (0..63).map(|i| (i as f32, i as f32 + 1.0)).collect();
@@ -2179,7 +2398,7 @@ mod tests {
         let storage = promoted.agreement.as_ptr();
         let capacity = promoted.agreement.capacity();
         assert_eq!(
-            promoted.route(usize::MAX, LabRoutes::Batched),
+            promoted.route(usize::MAX, LabRoutes::Batched, None),
             LaneRoute::Batched {
                 k_max: LANE_MAX_DRAFTS
             }
@@ -2196,19 +2415,22 @@ mod tests {
     fn lab_route_modes_bypass_the_floor() {
         let mut policy = LaneSpecPolicy::with_floor(3, true);
         assert_eq!(
-            policy.route(2, LabRoutes::Batched),
+            policy.route(2, LabRoutes::Batched, None),
             LaneRoute::Batched { k_max: 2 }
         );
         assert_eq!(
-            policy.route(9, LabRoutes::Batched),
+            policy.route(9, LabRoutes::Batched, None),
             LaneRoute::Batched { k_max: 3 }
         );
-        assert_eq!(policy.route(0, LabRoutes::Batched), LaneRoute::ArSynced);
+        assert_eq!(
+            policy.route(0, LabRoutes::Batched, None),
+            LaneRoute::ArSynced
+        );
 
         let mut cycle = LaneSpecPolicy::with_floor(3, true);
         let mut routes = Vec::new();
         for _ in 0..14 {
-            routes.push(cycle.route(3, LabRoutes::Cycle));
+            routes.push(cycle.route(3, LabRoutes::Cycle, None));
         }
         let pattern = [
             LaneRoute::Batched { k_max: 3 },
@@ -2224,7 +2446,7 @@ mod tests {
         // The budget caps the cycle's depths.
         let mut capped = LaneSpecPolicy::with_floor(3, true);
         assert_eq!(
-            capped.route(1, LabRoutes::Cycle),
+            capped.route(1, LabRoutes::Cycle, None),
             LaneRoute::Batched { k_max: 1 }
         );
     }
@@ -2381,7 +2603,7 @@ mod tests {
     ) -> (Vec<LaneRoute>, Vec<usize>, Vec<usize>) {
         let (mut routes, mut probe_left, mut observed) = (Vec::new(), Vec::new(), Vec::new());
         for _ in 0..windows {
-            let route = policy.route(2, LabRoutes::Floor);
+            let route = policy.route(2, LabRoutes::Floor, None);
             routes.push(route);
             match route {
                 LaneRoute::Batched { k_max } => {
@@ -2493,7 +2715,10 @@ mod tests {
             "probe_left {probe_left:?}"
         );
         // ...and the last one is followed by the sticky retirement.
-        assert_eq!(policy.route(2, LabRoutes::Floor), LaneRoute::ArRetired);
+        assert_eq!(
+            policy.route(2, LabRoutes::Floor, None),
+            LaneRoute::ArRetired
+        );
     }
 
     #[test]
@@ -2515,7 +2740,7 @@ mod tests {
     fn a_winning_gfx1201_lane_keeps_drafting_and_never_probes() {
         let mut policy = LaneSpecPolicy::with_profile(2, true, &LaneCostProfile::gfx1201());
         for _ in 0..64 {
-            let route = policy.route(2, LabRoutes::Floor);
+            let route = policy.route(2, LabRoutes::Floor, None);
             match route {
                 LaneRoute::Batched { k_max } => {
                     // 3 tokens for 1.4 AR rows.
@@ -2532,7 +2757,7 @@ mod tests {
         let profile = LaneCostProfile::gfx1201();
         let mut policy = LaneSpecPolicy::with_profile(2, true, &profile);
         let pooled = LaneCostModel::new();
-        let route = policy.route(2, LabRoutes::Floor);
+        let route = policy.route(2, LabRoutes::Floor, None);
         let ctx = RouteTraceCtx {
             request_tag: 9,
             owner_generation: 3,
@@ -2540,7 +2765,8 @@ mod tests {
             step_seq: 17,
             lanes: 1,
         };
-        let line = policy.route_trace_line(&ctx, &pooled, 2, LabRoutes::Floor, route);
+        let depth = LaneDepthCost::new();
+        let line = policy.route_trace_line(&ctx, &pooled, &depth, None, 2, LabRoutes::Floor, route);
         let json = line
             .strip_prefix(LANE_COST_TRACE_PREFIX)
             .expect("prefix")
@@ -2557,6 +2783,10 @@ mod tests {
         assert_eq!(v["fit_us"]["F"], 15_700.0);
         assert_eq!(v["fit_us"]["G"], 31_000.0);
         assert_eq!(v["route"], "batched:2");
+        // No measured prices: the static table routed; the depth fit is the prior.
+        assert_eq!(v["depth_costs"].as_array().map(Vec::len), Some(0));
+        assert_eq!(v["depth_fit_us"]["F"], 10_920.0);
+        assert_eq!(v["depth_fit_us"]["q"], 1_350.0);
         assert_eq!(v["ar_units_per_token"], 1.0);
         let native = v["native"].as_array().expect("native predictions");
         assert_eq!(native.len(), 2);
@@ -2565,7 +2795,16 @@ mod tests {
         assert!(v["floor"]["ar_us"].as_f64().unwrap() > 0.0);
         // The pooled lane says so.
         let legacy = LaneSpecPolicy::with_profile(2, true, &LaneCostProfile::LEGACY);
-        let line = legacy.route_trace_line(&ctx, &pooled, 2, LabRoutes::Floor, LaneRoute::ArSynced);
+        let costs = depth.window_costs(1);
+        let line = legacy.route_trace_line(
+            &ctx,
+            &pooled,
+            &depth,
+            Some(&costs),
+            2,
+            LabRoutes::Floor,
+            LaneRoute::ArSynced,
+        );
         let v: serde_json::Value =
             serde_json::from_str(line.strip_prefix(LANE_COST_TRACE_PREFIX).unwrap().trim())
                 .unwrap();
@@ -2574,6 +2813,9 @@ mod tests {
             (Some("legacy"), Some("pooled"))
         );
         assert_eq!(v["fit_us"]["F"], 16_900.0);
+        let traced = v["depth_costs"].as_array().expect("depth costs");
+        assert_eq!(traced.len(), costs.len());
+        assert!((traced[2].as_f64().unwrap() - f64::from(costs[2])).abs() < 1e-3);
         let step: serde_json::Value = serde_json::from_str(
             step_trace_line(17, 4, 1, 6, 77_200.0, true, [1.0, 2.0, 3.0])
                 .strip_prefix(LANE_COST_TRACE_PREFIX)
@@ -2585,5 +2827,154 @@ mod tests {
             (step["event"].as_str(), step["spill"].as_u64()),
             (Some("step"), Some(1))
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Measured depth cost (LaneDepthCost)
+    // -----------------------------------------------------------------
+
+    /// Per-depth acceptance ratios as `(accepted, total)` pairs with total 8.
+    fn ratios(ratios: &[f32]) -> Vec<(f32, f32)> {
+        ratios.iter().map(|&r| (r * 8.0, 8.0)).collect()
+    }
+
+    /// Depth the chooser picks (budget `k`) in a step of `lanes` lanes at the
+    /// prior fit, `0` for an AR window.
+    fn measured_depth_at(agreement: &[(f32, f32)], lanes: usize, k: usize) -> usize {
+        let costs = LaneDepthCost::new().window_costs(lanes);
+        route_depth_with(agreement, k, &costs)
+    }
+
+    fn route_depth_with(agreement: &[(f32, f32)], k: usize, costs: &[f32]) -> usize {
+        let mut policy = LaneSpecPolicy::with_floor(k, false);
+        policy.agreement = agreement.to_vec();
+        match policy.route(k, LabRoutes::Floor, Some(costs)) {
+            LaneRoute::ArSynced => 0,
+            LaneRoute::Batched { k_max } => k_max,
+            other => panic!("floor-off route {other:?}"),
+        }
+    }
+
+    #[test]
+    fn measured_cost_keeps_the_static_depth_when_static_drafts() {
+        for agreement in [ratios(&[0.75, 0.59, 0.45, 0.45, 0.45]), ratios(&[0.92; 5])] {
+            let want = batched_depth(&agreement, 5, &MTP_WINDOW_COST);
+            assert!(want > 0);
+            for lanes in [1, 4, 8] {
+                assert_eq!(measured_depth_at(&agreement, lanes, 5), want, "C{lanes}");
+            }
+        }
+        // Costs that would pick depth 1 do not move a static depth of 5.
+        let code = ratios(&[0.92; 5]);
+        let cheap_one = [1.0, 1.01, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0];
+        assert_eq!(batched_depth(&code, 5, &cheap_one), 1);
+        assert_eq!(route_depth_with(&code, 5, &cheap_one), 5);
+    }
+
+    #[test]
+    fn measured_cost_turns_an_ar_window_into_the_static_best_drafting_depth() {
+        let cheap = [1.0, 1.05, 1.1, 1.15, 1.2, 1.25, 1.3, 1.35];
+        let half = ratios(&[0.5; 5]);
+        assert_eq!(batched_depth(&half, 5, &MTP_WINDOW_COST), 0);
+        assert!(batched_depth(&half, 5, &cheap) > 0);
+        // Static rates 1.5/1.7, 1.75/1.87, 1.875/2.25, ...: depth 2 is best.
+        assert_eq!(route_depth_with(&half, 5, &cheap), 2);
+        let weak = ratios(&[0.1; 5]);
+        assert_eq!(route_depth_with(&weak, 5, &cheap), 1);
+        // Budget caps the drafting depth.
+        assert_eq!(route_depth_with(&half, 1, &cheap), 1);
+    }
+
+    #[test]
+    fn measured_cost_keeps_ar_where_it_does_not_pay() {
+        let half = ratios(&[0.5; 5]);
+        assert_ne!(measured_depth_at(&half, 1, 5), 0, "a1=a2=0.5 at C1");
+        let weak = ratios(&[0.1; 5]);
+        for lanes in [1, 8] {
+            assert_eq!(measured_depth_at(&weak, lanes, 5), 0, "a1=0.1 at C{lanes}");
+        }
+    }
+
+    #[test]
+    fn measured_window_costs_at_the_prior_are_the_documented_units() {
+        let model = LaneDepthCost::new();
+        let (f, a, r, q) = model.fit();
+        assert_eq!([f, a, r, q], DEPTH_COST_PRIOR_US);
+        for lanes in [1usize, 4, 8] {
+            let costs = model.window_costs(lanes);
+            assert_eq!(costs[0], 1.0);
+            let c = lanes as f64;
+            let share = (f + a * c) / c;
+            for d in 1..costs.len() {
+                let want = 1.0 + (r * d as f64 + q * d as f64 / c) / share;
+                assert!((f64::from(costs[d]) - want).abs() < 1e-5, "C{lanes} d{d}");
+            }
+            assert!(costs.windows(2).all(|w| w[0] < w[1]));
+        }
+    }
+
+    #[test]
+    fn the_depth_fit_recovers_a_known_cost_from_exact_walls() {
+        // The ridge prior (8 observations, never decaying) pulls the fit toward
+        // `DEPTH_COST_PRIOR_US` by its share of the decayed data (about 100
+        // observations), so the truth is a few percent off the prior.
+        let truth = [11_050.0, 2_020.0, 202.0, 1_370.0];
+        let mut model = LaneDepthCost::new();
+        for k in 0..800 {
+            let lanes = 1 + (k * 5) % 8;
+            let verified = (k * 7 + k / 3) % (LANE_MAX_DRAFTS * lanes + 1);
+            let wall = truth[0]
+                + truth[1] * lanes as f64
+                + truth[2] * verified as f64
+                + truth[3] * verified as f64 / lanes as f64;
+            model.observe(lanes, verified, wall as f32);
+        }
+        let (f, a, r, q) = model.fit();
+        for (got, want) in [f, a, r, q].into_iter().zip(truth) {
+            assert!(
+                (got - want).abs() < want * 0.02,
+                "{:?} vs {truth:?}",
+                [f, a, r, q]
+            );
+        }
+        // An unusable wall is dropped.
+        let before = model.fit();
+        model.observe(4, 3, f32::NAN);
+        model.observe(4, 3, 0.0);
+        model.observe(4, 3, -1.0);
+        assert_eq!(model.fit(), before);
+    }
+
+    #[test]
+    fn the_static_table_prices_the_route_when_no_depth_costs_are_passed() {
+        for agreement in [
+            ratios(&[0.75, 0.59, 0.45, 0.45, 0.45]),
+            ratios(&[0.92; 5]),
+            ratios(&[0.5; 5]),
+            ratios(&[0.1; 5]),
+        ] {
+            let mut policy = LaneSpecPolicy::with_floor(5, false);
+            policy.agreement = agreement.clone();
+            let want = match batched_depth(&agreement, 5, &MTP_WINDOW_COST) {
+                0 => LaneRoute::ArSynced,
+                k_max => LaneRoute::Batched { k_max },
+            };
+            assert_eq!(policy.route(5, LabRoutes::Floor, None), want);
+            // The floor-enabled path and the lab modes ignore the prices.
+            let costs = LaneDepthCost::new().window_costs(1);
+            let mut on = LaneSpecPolicy::with_floor(5, true);
+            let mut on_priced = LaneSpecPolicy::with_floor(5, true);
+            on.agreement = agreement.clone();
+            on_priced.agreement = agreement.clone();
+            assert_eq!(
+                on.route(5, LabRoutes::Floor, None),
+                on_priced.route(5, LabRoutes::Floor, Some(&costs))
+            );
+            let mut lab = LaneSpecPolicy::with_floor(5, false);
+            assert_eq!(
+                lab.route(5, LabRoutes::Batched, Some(&costs)),
+                LaneRoute::Batched { k_max: 5 }
+            );
+        }
     }
 }

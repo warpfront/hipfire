@@ -845,12 +845,15 @@ fn decode_run_sequential(
                     tokens: &plan.batch.tokens[r.rows.begin..r.rows.end()],
                     kind: LaneRowKind::Ar,
                     wide: false,
+                    // PP AR steps carry at most `LANE_MAX_ROWS` rows, so no all-rows segment.
+                    exact: false,
                 })
                 .collect();
             let out = LaneOutputs {
                 logits: &logits.sub_offset(0, n_dec * vocab),
                 top1: &top1.sub_offset(0, n_dec * int),
                 wide_hidden: None,
+                vocab_shard: None,
             };
             launched = true;
             let forwarded = forward_lanes(gpu, band, &mut rows, &out, &policy);
@@ -887,6 +890,8 @@ fn decode_run_sequential(
                     tokens: &plan.batch.tokens[r.rows.begin..r.rows.end()],
                     kind: LaneRowKind::Ar,
                     wide: false,
+                    // PP AR steps carry at most `LANE_MAX_ROWS` rows, so no all-rows segment.
+                    exact: false,
                 })
                 .collect();
             launched = true;
@@ -1158,6 +1163,8 @@ fn decode_run_overlap(
                     tokens: &call.plan.batch.tokens[r.rows.begin..r.rows.end()],
                     kind: LaneRowKind::Ar,
                     wide: false,
+                    // PP AR steps carry at most `LANE_MAX_ROWS` rows, so no all-rows segment.
+                    exact: false,
                 })
                 .collect();
             let out = LaneOutputs {
@@ -1168,6 +1175,7 @@ fn decode_run_overlap(
                     .top1
                     .sub_offset(batch.first_row * int, batch.rows * int),
                 wide_hidden: None,
+                vocab_shard: None,
             };
             launched = true;
             forward_lanes(gpu, band, &mut rows, &out, &policy)
@@ -1184,6 +1192,8 @@ fn decode_run_overlap(
                     tokens: &call.plan.batch.tokens[r.rows.begin..r.rows.end()],
                     kind: LaneRowKind::Ar,
                     wide: false,
+                    // PP AR steps carry at most `LANE_MAX_ROWS` rows, so no all-rows segment.
+                    exact: false,
                 })
                 .collect();
             launched = true;

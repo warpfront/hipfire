@@ -15,9 +15,10 @@ Native Qwen4 / Qwen3.8-Flash-Next (arch 16): strict config and admission, typed 
 - `MTP_MEASURED_AR_FLOOR` (`src/lib.rs`) is `true`: this crate's native MTP ships the per-request AR floor (`hipfire_runtime::spec_economics::Floor`, instantiated as `mtp_spec::Qwen4Floor` with qwen4's window-cost table; the shared module holds the arithmetic, `mtp_spec` the env knobs and the `HIPFIRE_MTP_FLOOR_TRACE=2` call-log switch), which is what lets `speculation.mtp = auto` arm it. Do not flip it without the floor, and the floor policy itself (`HIPFIRE_MTP_AR_FLOOR`) is unchanged.
 - The RC3 prefix cache (end-of-prompt checkpoint, radix store, anchors, periodic captures) is gone; `HIPFIRE_QWEN_PROMPT_CACHE` / `HIPFIRE_QWEN_RADIX_CACHE` do not affect this crate — do not reintroduce them.
 - [`src/cache_quality.rs`](src/cache_quality.rs) (`reference-parity` feature) is the hit-vs-cold logits oracle of the session cache (`qwen4_parity --mode cache-quality`, env `HIPFIRE_CQ_SESSION_BUDGET_BYTES`, `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS`) plus the opt-in capture sink `HIPFIRE_QWEN4_CACHE_QUALITY_OUT`; it is a reference-parity tool, not a production path. `state_parity.rs` no longer holds prefix/radix session parity.
-- The exact EP prefill wave (`HIPFIRE_EP_LANE_PREFILL_WAVE_EXACT=1`; `Qwen4Bundle::prefill_wave` / `prefill_wave_wide`, `gpu_forward/ep_wave.rs`): lane prefill tiles of 49..=511 rows are forwarded as ONE pass of at most 2048 rows. The MoE runs once per layer over every lane's rows on the singleton chunk's own FULL-TABLE route (no gather, no tile exchange), under a routing-row cap of 511 (`Gpu::qwen4_route_rows_cap`, `prefill_invariant::route_rows_of`) so every row-keyed route decision is the one a lane's own sub-512 tile takes; every other stage runs per lane on the lane's own state; the singleton's reserve epoch (`Qwen4GpuForward::ep_reserve_call`, `EpBankRoute::FullTable`) and prelude barriers run once per wave. Each lane == its serial tile == its singleton, byte for byte (no floor knob, no KLD change). `ep_wave_refusal` (host-only, via `Qwen4Bundle::ep_wave_admission`) refuses before any launch, identically on every rank; a refused wave means serial lane tiles. Lab env `HIPFIRE_EP_LANE_PREFILL_WAVE_MIN_ROWS` (lowest wave lane, default 49).
+- The exact EP prefill wave (`HIPFIRE_EP_LANE_PREFILL_WAVE_EXACT=1`; `Qwen4Bundle::prefill_wave` / `prefill_wave_wide`, `gpu_forward/ep_wave.rs`): lane prefill tiles of 9..=511 rows (lanes of 9..=64 rows: `HIPFIRE_EP_LANE_PREFILL_WAVE_SMALL_LANES`, per-lane BF16 projections via `Gpu::qwen4_wave_lane_rows`) are forwarded as ONE pass of at most 2048 rows. The MoE runs once per layer over every lane's rows on the singleton chunk's own FULL-TABLE route (no gather, no tile exchange), under a routing-row cap of 511 (`Gpu::qwen4_route_rows_cap`, `prefill_invariant::route_rows_of`) so every row-keyed route decision is the one a lane's own sub-512 tile takes; every other stage runs per lane on the lane's own state; the singleton's reserve epoch (`Qwen4GpuForward::ep_reserve_call`, `EpBankRoute::FullTable`) and prelude barriers run once per wave. Each lane == its serial tile == its singleton, byte for byte (no floor knob, no KLD change). `ep_wave_refusal` (host-only, via `Qwen4Bundle::ep_wave_admission`) refuses before any launch, identically on every rank; a refused wave means serial lane tiles. Lab env `HIPFIRE_EP_LANE_PREFILL_WAVE_MIN_ROWS` (lowest wave lane, default 65 = `WIDE_VERIFY_MAX_ROWS` + 1).
 - Exact AR lanes (`lane.rs`, `lane_exec.rs`, `gpu_forward_lanes.rs`; served as the `fn-lanes` route) never touch `bundle.state`/`bundle.mtp` in a lane step; a lane's prefill tile swaps its state into the bundle for one singleton chunk call with `Qwen4GpuForward::lane_scope` set, which keeps the retained tape (recorded against the resident state's pointers) out. A row-local stage may only become `OnceAllRows` in `STAGE_SHARE` when EVERY owned weight-instance route of that stage (`LaneStageRoutes`, derived from the actually bound weights) matches a `RowTwinProof` {arch, stage, route: `StageRoute`, domain: `&[LaneTopology]`, receipt} row of `LANE_ROW_TWIN_PROOFS`; an unmatched instance leaves only that stage per lane (the reason is recorded in the `LanePolicyResolution`), the evidence is the deduplicated set of receipts of the proofs used and is carried in the resolved policy, not inferred from the production shape (`examples/fn_lane_oracle --g0` produces G0 receipts). gfx1151 keeps its historical topologies and expert classes through wildcard-route rows over every topology under `GFX1151_LANE_RECEIPT`. The gfx1201 rows are route-bound and carry one receipt per proved topology. PP rows (PP domain) cover PP2 mq2 under `GFX1201_PP2_MQ2_RECEIPT` (hold j1574: lane ids and every logits row byte-identical to the serialized PP singleton at K=1..8, 8 prompts x 64 tokens): the actual all-MQ6 projection route of the PP2 artifact, Q8 embedding, BF16 HC/router/shared routes, resident MQ4/E8P MoE with per-expert `DecodeGemv` capability admission. EP rows (`[Ep]` domain; twelve: eleven non-MoE rows for embed, PLE rows, HC read, HC write, GDN in/out projections, QSA in/out projections, final HC read, head and argmax, plus one MoE row) carry `GFX1201_EP2_MQ4_RECEIPT` (hold j1570, `mcb-notes/runs/ep-diag-8e148906a-1`: production ids and logits byte-identical to the serialized EP singleton at K=1, 2, 4 and 8, 64 tokens, on one gfx1201 EP2 mq4-xts load). The bound routes a non-MoE row requires are exactly the ones that artifact binds: MQ6 for every GDN qkv/z/a/b/out and QSA indexer/q/k/v/out projection and for the head, Q8 embed, BF16 HC, BF16 PLE rows, F32 argmax. The EP MoE row requires `LaneExpertRoute::EpPackedStaticOrBalanced` plus BF16 router/shared routes and per-expert `DecodeGemv` capability admission: every owned MoE layer must be either the actual static gathered runtime over fully resident packed QT44/QT53 experts or the actual balanced-live gathered runtime over fully host-mapped packed QT44/QT53 experts, with the gather installed, no CPU (D1/D2), tier, slab, pruned or FP8 route, and dtype buffers and selected runtime in agreement; any mix of the two across layers is admitted (27 + 21, 28 + 20, ...) with no resident-count restriction. A different bound route, arch or topology, or one MoE layer outside that class, matches no row, and the fallback is stage-specific: only the affected stage (for the MoE class, the MoE stage) runs per lane. The `Ep` domain does not encode the rank count and the measured EP cells are EP2 mq4-xts at K=1, 2, 4 and 8 only; it evidences no other width, topology count or latency, and both receipts are exactness evidence, not performance. A future arch qualifies by adding a proof row alone. The store logs one `qwen4 lanes: stage policy <describe()> (proofs <receipts>; per-lane: <stage>=<reason>,...)` line. Stateful stages are always per lane.
 - The gfx1201 PP MoE stage carries two route-bound rows: `LaneExpertRoute::ResidentMq2Slab` (resident slab layers of MQ4-XTS plus at least one E8P-I4 expert, `GFX1201_PP2_MQ2_RECEIPT`) and `LaneExpertRoute::ResidentMq3Slab` (resident slab layers of MQ4-XTS plus at least one MQ3-I4 expert, `GFX1201_PP2_MQ3_RECEIPT`: PP2 mq3-xts 25/23 `fn_mesh_lane_oracle` byte-identical lane ids and logits rows vs the serialized PP singleton at K=1..8 under per-lane, MoE-only-shared and production policies, adaptive / 4 micro-batches / overlap off). `lane::slab_layer_cold_experts` classifies a layer as complete MQ4-XTS plus one cold format only (never E8P with MQ3-I4 in one layer, no W2, no absent expert); a band mixing the two cold formats stays `Unclassified`, so its MoE stage runs per lane.
+- The gfx942 single-device rows (`LaneTopology::Single` only, `GFX942_STOCK_FP8_RECEIPT`) are route-bound to the stock-FP8 artifact: BF16 embed / PLE rows / PLE projection / HC / GDN and QSA in-out / head, F32 argmax, and the MoE row `LaneExpertRoute::ResidentFp8` (`lane::classify_stock_fp8_experts`: every owned layer's gate_up / down aggregates resident qt=55 `FP8E4M3B128`, no arena, `decode_admitted` false). The receipt is in `COMBINED_ONLY_RECEIPTS`: G0 passed the combined policy but the single-stage probes of HC read/write, GDN in/out and MoE diverged, so `resolve_with_proofs` admits all of its stages or none. gfx942 is in `kv_backend::VMM_ARCHS`, so its Qwen4 QSA state is VMM-backed by default and lanes stage; the GDN / QSA cores stay one launch per lane there (the multi-lane `gdn_lanes` / `qsa_lanes` kernels are gfx11/gfx12 Q8/fp8-state only).
 - `memory.offload_exec=cpu|passback` may arm whole host-mapped trunk expert aggregates for eager CPU routed FFNs (decode and at most four verify rows); wide prefill keeps the GPU path. The splice's CPU work runs on a pinned physical-core pool (`hipfire_cpu::splice_pool`; `HIPFIRE_CPU_EXPERT_THREADS` / `HIPFIRE_CPU_EXPERT_PIN`). `gpu_forward/cpu_splice.rs` caches checked host spans from the owning aggregate tensors, never borrowed expert device aliases. EP, slab and tier/hot-set leases do not arm this D1 whole-layer splice. Hot-set (tier) layers arm the separate D2 tier split under `memory.offload_exec=cpu` with no CPU-side arch gate: it follows the tier plan the loader admitted (`expert_hotset::hotset_arch_admits`: the default sibling sidecar on gfx1201 only, an explicit absolute `HIPFIRE_QWEN4_EXPERT_HOTSET` path on any arch) when uniform QT44/QT53 and not EP/slab/AWQ/FP8; a route it has no masked ids or cold-slot installation for is refused with one `[moe-cpu-split]` log line per reason and stays on PCIe.
 
 ## Crate map
@@ -154,6 +155,7 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `ep_wave_admission`
   - `external_descriptor`
   - `f16_shadow_arena_root_capacities`
+  - `final_turn_snapshots`
   - `force_lane_seed`
   - `forward_chunk`
   - `forward_chunk_final`
@@ -162,6 +164,7 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `forward_token_or_argmax`
   - `free_gpu`
   - `has_cpu_deferred_experts`
+  - `hc8_applied`
   - `host_exec_identity`
   - `lab_observe`
   - `lab_observed`
@@ -436,6 +439,10 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `attach_ep_mesh`
   - `COPY_WIDE_LANES`
   - `device_ids`
+  - `elastic_lab_lend`
+  - `elastic_lab_reclaim`
+  - `elastic_reclaim_all`
+  - `elastic_tick`
   - `enable`
   - `ep_default_copy_config`
   - `ep_lane_budget`
@@ -469,6 +476,7 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `top1`
   - `UnitHits`
   - `used_bytes`
+  - `vocab_exchange`
   - `with_rank_mut`
 - [`src/ep_mesh_lanes.rs`](src/ep_mesh_lanes.rs)
   - `abort_reason`
@@ -579,6 +587,47 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `QWEN4_EP_TRUNK_SPLIT_ENV`
   - `SplitWeight`
   - `TrunkSplitMode`
+- [`src/ep_vocab_shard.rs`](src/ep_vocab_shard.rs)
+  - `abort`
+  - `attach_decision`
+  - `AttachDecision`
+  - `barrier`
+  - `blocker`
+  - `device_of`
+  - `draft_attach_decision`
+  - `draft_rows`
+  - `DRAFT_SHARD_ROWS`
+  - `DRAFT_VOCAB_SHARD_ENV`
+  - `draft_vocab_shard_switch`
+  - `enable_peers`
+  - `geometry_refusal`
+  - `is_aborted`
+  - `new`
+  - `own_view`
+  - `peer`
+  - `peer_slot`
+  - `PeerAddrs`
+  - `publish`
+  - `register`
+  - `register_rank`
+  - `release`
+  - `rows`
+  - `slot`
+  - `SLOT_CAND`
+  - `SLOT_LOGITS`
+  - `SLOT_PARTIAL`
+  - `SLOT_TOP1`
+  - `view`
+  - `vocab`
+  - `VOCAB_SHARD_ENV`
+  - `VOCAB_SHARD_RANKS`
+  - `vocab_shard_requested`
+  - `VOCAB_SHARD_ROWS`
+  - `vocab_shard_switch`
+  - `VocabExchange`
+  - `wait_peer`
+  - `width`
+  - `with_draft_rows`
 - [`src/expert_arena.rs`](src/expert_arena.rs)
   - `arena_name`
   - `arena_payload`
@@ -620,6 +669,7 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `ep_hotset_missing_hint`
   - `EP_HOTSET_PULL_TAG`
   - `ep_unit_apply_budget_delta`
+  - `ep_unit_apply_hot_loan`
   - `EP_UNIT_BUDGET_DELTA_ENV`
   - `ep_unit_budget_delta_mib`
   - `ep_unit_donor_layers`
@@ -671,6 +721,7 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `geometry`
   - `host_pinned_bytes`
   - `host_units`
+  - `hot_counts`
   - `is_mixed`
   - `is_mq4_planar`
   - `is_resident`
@@ -701,6 +752,7 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `receipt_lines`
   - `resident_payload_bytes`
   - `resident_units`
+  - `set_hot_counts`
   - `ShippedStack`
   - `slot`
   - `stage_borrow_buffer_bytes`
@@ -721,6 +773,18 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `whole_layer_split`
   - `whole_resident_layers`
   - `whole_resident_layers_all_ranks`
+- [`src/expert_hot_units.rs`](src/expert_hot_units.rs)
+  - `base_ranking_sha256`
+  - `capture_forwards`
+  - `corpus`
+  - `counts`
+  - `EP_HOT_UNITS_KIND`
+  - `EP_HOT_UNITS_VERSION`
+  - `from_bytes`
+  - `HotUnitsBinding`
+  - `HotUnitsSidecar`
+  - `load`
+  - `model_sha256`
 - [`src/expert_hotset.rs`](src/expert_hotset.rs)
   - `base_index_sha256`
   - `base_size`
@@ -833,8 +897,12 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `EP_CHUNK_FIT_RUNGS`
   - `ep_chunk_fit_rungs`
   - `ep_fit_rank_line`
+  - `ep_fit_rank_line_mtp`
   - `ep_fit_report`
+  - `ep_hc8_plan_saving`
   - `ep_lane_reservation_line`
+  - `ep_mtp_experts_line`
+  - `ep_mtp_resident_decision`
   - `ep_rank_layers`
   - `ep_unit_host_bytes_ranks`
   - `ep_vram_layers`
@@ -843,6 +911,7 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `EpLaneRequest`
   - `EpLaneReservation`
   - `EpLaneReservedSplit`
+  - `EpMtpResident`
   - `EpVramPlan`
   - `expert_headroom`
   - `expert_hotset_budget`
@@ -860,6 +929,7 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `f16_shadow_bytes`
   - `f16_shadow_bytes_scope`
   - `f16_shadow_charge`
+  - `f16_shadow_charge_at`
   - `f16_shadow_granule_slack`
   - `f16_shadow_route_rows`
   - `f16_shadow_route_rows_with`
@@ -907,6 +977,8 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `PlacementCharges`
   - `PlacementInputs`
   - `PlacementInputsArgs`
+  - `QWEN4_EP2_HOT_LOAN_GFX1201_BYTES`
+  - `QWEN4_EP2_RUNTIME_OVERHEAD_GFX1201_BYTES`
   - `QWEN4_RUNTIME_OVERHEAD_GFX1201_BYTES`
   - `refuse_band_with_expert_parallel`
   - `refuse_host_expert_request`
@@ -927,9 +999,13 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `routed_expert_bytes_scope`
   - `routed_layer_payload_split`
   - `runtime_overhead_bytes`
+  - `runtime_overhead_bytes_ep`
   - `shared_i8_charge`
+  - `shared_i8_charge_at`
   - `shared_i8_shadow_bytes`
+  - `shared_i8_shadow_bytes_at`
   - `shared_i8_shadow_layers`
+  - `shared_i8_shadow_layers_at`
   - `SharedI8ShadowLayer`
   - `stage_for`
   - `state_census`
@@ -951,6 +1027,7 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `winner`
   - `with_decode_share`
   - `with_decode_share_shadows`
+  - `with_ep_census`
   - `with_ep_reserve`
   - `with_ep_reserve_shadows`
   - `with_slowlink`
@@ -1071,13 +1148,17 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `with_decode_share_shadows`
   - `with_host_window`
 - [`src/expert_unit_tail.rs`](src/expert_unit_tail.rs)
+  - `abandon_fills`
   - `ack`
   - `clear`
+  - `close`
+  - `complete_fills`
   - `config`
   - `count`
   - `detach`
   - `distinct_hit`
-  - `enable_peer_quarantine`
+  - `end_scratch`
+  - `EP_TAIL_LOG_DIRECT_ENV`
   - `ep_unit_tail_blocks_pins`
   - `ep_unit_tail_budget_delta_mib`
   - `ep_unit_tail_configured`
@@ -1089,6 +1170,7 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `EP_UNIT_TAIL_FREEZE_ENV`
   - `EP_UNIT_TAIL_LOG_ENV`
   - `EP_UNIT_TAIL_PEER_ENV`
+  - `EP_UNIT_TAIL_PEER_RESERVE_ENV`
   - `EP_UNIT_TAIL_PINS_ENV`
   - `ep_unit_tail_pins_requested`
   - `ep_unit_tail_pool_bytes`
@@ -1103,10 +1185,18 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `EpUnitTailConfig`
   - `FILL_GROUP_CAP`
   - `FillOp`
+  - `finish_seed`
+  - `fn`
+  - `issue_fills`
+  - `issue_restore`
   - `kept_posts`
+  - `key`
+  - `lend_scratch`
   - `live_slot`
   - `new`
   - `newest`
+  - `next_retirement`
+  - `occupied`
   - `parse_ep_unit_tail`
   - `parse_retire_ids`
   - `parse_stage_gap`
@@ -1117,17 +1207,22 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `pins`
   - `post`
   - `QUARANTINE_WINDOWS`
+  - `quiesce`
   - `ranks`
+  - `refusals`
+  - `register_table_backing`
   - `released_through`
+  - `RESERVE_RETIREMENTS`
   - `resolve_ep_unit_tail`
   - `Retire`
-  - `retire`
+  - `retire_generation`
   - `RETIRE_MAX_WINDOWS`
-  - `retire_peer`
   - `retire_peer_windows`
   - `retire_windows`
   - `RetireCadence`
+  - `seal`
   - `seed`
+  - `set_peer_reserve`
   - `slot_evicted_at`
   - `slot_generation`
   - `slot_hit`
@@ -1146,6 +1241,31 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `UnitKey`
   - `window_end`
   - `WindowUse`
+- [`src/expert_unit_tail/beta_ref.rs`](src/expert_unit_tail/beta_ref.rs)
+  - `config`
+  - `count`
+  - `disable_slice5_reserve`
+  - `enable_peer_quarantine`
+  - `FillOp`
+  - `live_slot`
+  - `new`
+  - `QUARANTINE_WINDOWS`
+  - `Retire`
+  - `retire`
+  - `retire_peer`
+  - `retire_peer_windows`
+  - `retire_windows`
+  - `seed`
+  - `slot_evicted_at`
+  - `slot_generation`
+  - `slot_phase`
+  - `slot_unit`
+  - `SlotPhase`
+  - `slots`
+  - `stats`
+  - `TailPolicy`
+  - `UnitKey`
+- [`src/expert_unit_tail/differential.rs`](src/expert_unit_tail/differential.rs)
 - [`src/expert_unit_tail/pins.rs`](src/expert_unit_tail/pins.rs)
   - `apply`
   - `bytes`
@@ -1181,6 +1301,8 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `statics`
   - `stats`
   - `take_dirty`
+- [`src/expert_unit_tail/race.rs`](src/expert_unit_tail/race.rs)
+- [`src/expert_unit_tail/rig.rs`](src/expert_unit_tail/rig.rs)
 - [`src/expert_unit_tail_rank.rs`](src/expert_unit_tail_rank.rs)
 - [`src/gpu_forward.rs`](src/gpu_forward.rs)
   - `band_scope`
@@ -1275,10 +1397,13 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
 - [`src/gpu_forward/ep_wave.rs`](src/gpu_forward/ep_wave.rs)
   - `EXACT_WAVE_MAX_LANE_ROWS`
   - `EXACT_WAVE_MIN_LANE_ROWS`
+  - `QWEN4_EP_WAVE_JOINT_ENV`
   - `QWEN4_EP_WAVE_MIN_LANE_ROWS_ENV`
   - `QWEN4_EP_WAVE_ROW_CAP`
   - `QWEN4_EP_WAVE_SHARD_ENV`
+  - `QWEN4_EP_WAVE_SMALL_LANES_ENV`
   - `QWEN4_EP_WAVE_TILE_ENV`
+  - `SMALL_LANE_MIN_ROWS`
 - [`src/gpu_forward/moe_down_a8.rs`](src/gpu_forward/moe_down_a8.rs)
 - [`src/gpu_forward/panel_stage.rs`](src/gpu_forward/panel_stage.rs)
 - [`src/gpu_forward/slab_stage.rs`](src/gpu_forward/slab_stage.rs)
@@ -1293,10 +1418,14 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `GFX1151_LANE_RECEIPT`
   - `GFX1201_EP2_MQ4_RECEIPT`
   - `GFX1201_HC8_ROWS_RECEIPT`
+  - `GFX1201_PLE_PROJECT_RECEIPT`
   - `GFX1201_PP2_MQ2_RECEIPT`
   - `GFX1201_PP2_MQ3_RECEIPT`
   - `GFX1201_Q8_QSA_ROWS_RECEIPT`
   - `GFX1201_Q8_TRUNK_ROWS_RECEIPT`
+  - `GFX1201_SINGLE_HETERO_MOE_RECEIPT`
+  - `GFX1201_SINGLE_MQ4XTS_RECEIPT`
+  - `GFX942_STOCK_FP8_RECEIPT`
   - `key`
   - `lane_is_wide`
   - `LANE_MAX_ROWS`
@@ -1322,6 +1451,7 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `StageShare`
   - `stateful`
   - `validate`
+  - `VocabShardView`
   - `WaveHead`
   - `WaveLane`
   - `with`
@@ -1329,9 +1459,19 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `bound`
   - `hc8_sidecar_saved_bytes`
   - `path`
+  - `peek_hc8_sidecar`
+  - `plan_tensors`
   - `Qwen4Hc8Sidecar`
   - `resolve_hc8_sidecar`
   - `tensor_count`
+- [`src/hetero.rs`](src/hetero.rs)
+  - `HETERO_DECODE_ROWS`
+  - `hetero_decode_rows`
+  - `HETERO_DECODE_ROWS_MAX`
+  - `HETERO_PREFILL_MAX_ROWS`
+  - `hetero_prefill_rows`
+  - `HETERO_PREFILL_SLOTS`
+  - `split_requested`
 - [`src/host_link.rs`](src/host_link.rs)
   - `classify`
   - `describe`
@@ -1516,14 +1656,20 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `owns_head`
   - `step_rows`
   - `total`
+  - `with_copy_steps`
   - `with_head_lag_rows`
   - `with_sampling_scratch`
-  - `with_step_rows_per_lane`
 - [`src/lane/groups.rs`](src/lane/groups.rs)
 - [`src/lane/pages.rs`](src/lane/pages.rs)
+  - `elastic_active`
+  - `elastic_idle_boundary`
+  - `ELASTIC_IDLE_STEPS`
+  - `ELASTIC_MIN_LEND_BYTES`
+  - `ElasticLabRank`
   - `LANE_PAGE_BUDGET_REFUSED`
   - `lane_page_decision`
   - `lane_page_draft_rows`
+  - `long_prefill_route_rows`
   - `page_budget_enabled`
   - `page_decision`
   - `page_margin_bytes`
@@ -1583,8 +1729,10 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `ep_reserve`
   - `ep_seal`
   - `ep_trunk_split`
+  - `ep_vocab_shard`
   - `expert_arena`
   - `expert_ep_units`
+  - `expert_hot_units`
   - `expert_hotset`
   - `expert_keep`
   - `expert_residency`
@@ -1597,6 +1745,7 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `gpu_forward`
   - `gpu_forward_lanes`
   - `hc8_sidecar`
+  - `hetero`
   - `host_link`
   - `kv_backend`
   - `lab_trunk_oracle`
@@ -1708,6 +1857,9 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `DevicePick`
   - `DeviceSampleSpec`
   - `discard_step`
+  - `draft_split`
+  - `draft_vocab_shard_decision`
+  - `draft_vocab_shard_refusal`
   - `DraftOp`
   - `DraftOpKind`
   - `DraftProposal`
@@ -1731,6 +1883,7 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `is_quarantined`
   - `lane_position`
   - `lane_retired`
+  - `lane_row_exact`
   - `LaneAdmission`
   - `LaneAdmit`
   - `LaneDecision`
@@ -1795,6 +1948,7 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `ScriptedExecutor`
   - `seal_verify`
   - `seal_verify_with`
+  - `set_draft_split`
   - `set_driver_terminates`
   - `set_floor_enabled`
   - `settle_evidence`
@@ -1809,12 +1963,16 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `total_rows`
   - `VerifyLane`
   - `VerifyPlan`
+  - `vocab_shard_decision`
+  - `vocab_shard_refusal`
   - `wants_candidate_read`
   - `WindowBudgets`
   - `WindowScript`
   - `WindowStart`
   - `with_copy_lane`
   - `with_copy_max_lanes`
+  - `with_draft_vocab_shard_rows`
+  - `with_vocab_shard_rows`
   - `world`
 - [`src/mesh_rank_copy.rs`](src/mesh_rank_copy.rs)
   - `copy_budget`
@@ -1834,6 +1992,7 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `MtpGpuState`
   - `Qwen4MtpGpu`
 - [`src/mtp_gpu/lab.rs`](src/mtp_gpu/lab.rs)
+- [`src/mtp_gpu/lab_expert_trace.rs`](src/mtp_gpu/lab_expert_trace.rs)
 - [`src/mtp_gpu/rows.rs`](src/mtp_gpu/rows.rs)
 - [`src/mtp_lanes.rs`](src/mtp_lanes.rs)
 - [`src/mtp_spec.rs`](src/mtp_spec.rs)
@@ -1855,10 +2014,12 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `native_mtp_capture`
   - `native_mtp_capture_rows`
   - `native_mtp_device_bytes`
+  - `native_mtp_device_bytes_ring`
   - `native_mtp_fill_scratch`
   - `native_mtp_fill_scratch_charged`
   - `native_mtp_proposal_drafts`
   - `native_mtp_request_bytes`
+  - `native_mtp_request_bytes_ring`
   - `native_mtp_row_capture`
   - `new`
   - `pp_mtp_forced_advance`
@@ -2611,6 +2772,8 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `with_expert_units`
   - `without_ple_shards`
 - [`src/weights/trunk_shard.rs`](src/weights/trunk_shard.rs)
+  - `census_local_config`
+  - `census_local_config_for`
   - `census_trunk`
   - `census_trunk_for`
   - `Cut`
@@ -2624,6 +2787,7 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `load_local_config_for`
   - `matrix_geometry`
   - `MatrixGeometry`
+  - `max_shared_width`
   - `out_shape`
   - `parse_switch`
   - `qsa_head_ranges`

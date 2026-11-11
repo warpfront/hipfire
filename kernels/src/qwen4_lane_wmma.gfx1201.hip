@@ -115,14 +115,14 @@ static __device__ __forceinline__ void lwmma_gemm_body(
     float* __restrict__ Y,
     float* __restrict__ partial,
     unsigned int* __restrict__ counters,
-    int M, int K, int rows, int split_k, float scale, int hc_act) {
+    int M, int K, int rows, int split_k, float scale, int hc_act, int bx, size_t counter_slot) {
     constexpr int NACC = MT * NN;
     constexpr int WAVE_STRIDE = NACC * 8 * 32;  // floats per wave in the LDS fold
     __shared__ float red[4 * WAVE_STRIDE];
     __shared__ int last_flag;
     const int tid = threadIdx.x;
     const int wave = tid >> 5, lane = tid & 31, l16 = lane & 15, kh = lane >> 4;
-    const int n0 = blockIdx.x * 16 * NN;
+    const int n0 = bx * 16 * NN;
     const int t0 = blockIdx.z * 64;
     const int kz = blockIdx.y;
     const int kc = K / split_k;
@@ -245,7 +245,7 @@ static __device__ __forceinline__ void lwmma_gemm_body(
 
     __threadfence();
     __syncthreads();
-    unsigned int* const counter = counters + (size_t)blockIdx.z * gridDim.x + blockIdx.x;
+    unsigned int* const counter = counters + counter_slot;
     if (tid == 0) {
         const unsigned int old = atomicAdd(counter, 1u);
         last_flag = (old == (unsigned int)(split_k - 1)) ? 1 : 0;
@@ -295,7 +295,8 @@ static __device__ __forceinline__ void lwmma_gemm_body(
         float* __restrict__ Y, float* __restrict__ partial, unsigned int* __restrict__ counters,    \
         int M, int K, int rows, int split_k, float scale, int hc_act) {                             \
         lwmma_gemm_body<WF, NT, MT, NN>(W, D, X, Y, partial, counters, M, K, rows, split_k, scale,    \
-                                      hc_act);                                                      \
+                                      hc_act, blockIdx.x,                                          \
+                                      (size_t)blockIdx.z * gridDim.x + blockIdx.x);                 \
     }
 
 #define LWMMA_GEMM_MN(WFN, WF, NT)          \
@@ -314,6 +315,45 @@ LWMMA_GEMM_MN(bf16, 0, 3)
 LWMMA_GEMM_MN(w8, 1, 1)
 LWMMA_GEMM_MN(w8, 1, 2)
 LWMMA_GEMM_MN(w8, 1, 3)
+
+// Multi-part entries (bf16 weights, two activation terms, one n-tile: the wide MoE block's dense
+// front, router | selector | shared gate | shared up).  Up to four (W, Y, M, split_k) parts that
+// read the SAME X [rows, K] run in ONE launch.  Grid [sum_p ceil(M_p / 16), max_p split_k_p,
+// ceil(rows / 64)]: the flat x index walks the parts' column tiles in order, a block whose kz is
+// past its part's split_k exits at once, and every other block runs the plain entry's body with
+// its part's own (W, Y, M, split_k), a part-private slice of `partial` (offset = the previous
+// parts' split_k * rows * M floats; parts with split_k == 1 take none) and the counter slot of its
+// flat tile, so each output word is computed by exactly the per-part launch's code and fold.
+// W0..W3 Y0..Y3 X partial counters M0..M3 split_k0..3 K rows.  M_p == 0 parts are empty.
+#define LWMMA_GEMM_MULTI_ENTRY(MT)                                                                   \
+    extern "C" __global__ __launch_bounds__(128) void lwmma_gemm_bf16_t2_m##MT##_n1_multi(           \
+        const void* __restrict__ W0, const void* __restrict__ W1, const void* __restrict__ W2,      \
+        const void* __restrict__ W3, float* __restrict__ Y0, float* __restrict__ Y1,                \
+        float* __restrict__ Y2, float* __restrict__ Y3, const float* __restrict__ X,                \
+        float* __restrict__ partial, unsigned int* __restrict__ counters, int M0, int M1, int M2,   \
+        int M3, int S0, int S1, int S2, int S3, int K, int rows) {                                  \
+        const int t0 = (M0 + 15) >> 4, t1 = (M1 + 15) >> 4, t2 = (M2 + 15) >> 4;                    \
+        const int bx = blockIdx.x;                                                                  \
+        const int p = bx < t0 ? 0 : bx < t0 + t1 ? 1 : bx < t0 + t1 + t2 ? 2 : 3;                   \
+        const int base = p == 0 ? 0 : p == 1 ? t0 : p == 2 ? t0 + t1 : t0 + t1 + t2;               \
+        const int sk = p == 0 ? S0 : p == 1 ? S1 : p == 2 ? S2 : S3;                               \
+        if ((int)blockIdx.y >= sk) return;                                                          \
+        const int M = p == 0 ? M0 : p == 1 ? M1 : p == 2 ? M2 : M3;                                 \
+        const void* const W = p == 0 ? W0 : p == 1 ? W1 : p == 2 ? W2 : W3;                        \
+        float* const Y = p == 0 ? Y0 : p == 1 ? Y1 : p == 2 ? Y2 : Y3;                             \
+        size_t poff = 0;                                                                            \
+        if (p > 0 && S0 > 1) poff += (size_t)S0 * rows * M0;                                        \
+        if (p > 1 && S1 > 1) poff += (size_t)S1 * rows * M1;                                        \
+        if (p > 2 && S2 > 1) poff += (size_t)S2 * rows * M2;                                        \
+        lwmma_gemm_body<0, 2, MT, 1>(W, nullptr, X, Y, partial + poff, counters, M, K, rows, sk,    \
+                                     0.0f, 0, bx - base,                                            \
+                                     (size_t)blockIdx.z * gridDim.x + bx);                          \
+    }
+
+LWMMA_GEMM_MULTI_ENTRY(1)
+LWMMA_GEMM_MULTI_ENTRY(2)
+LWMMA_GEMM_MULTI_ENTRY(3)
+LWMMA_GEMM_MULTI_ENTRY(4)
 
 // ---------------------------------------------------------------------------
 // A2: HC up projection [4 * hidden, K] of `low` [rows, K] with hyper_read_projected_f32's branch

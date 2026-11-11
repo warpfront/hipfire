@@ -133,9 +133,13 @@ pub fn lane_k_str(lane_k: usize) -> &'static str {
 }
 
 /// Whether `arm` pins [`EP_LANE_K_ENV`]: the native-MTP mesh arms (the AR
-/// reference drafts nothing; `lane_copy` has no ep2 executor).
+/// reference drafts nothing). `lane_copy` pins it too: its native windows and
+/// the store's depth are the cohort's, only its copy windows may offer more.
 pub fn pins_lane_k(arm: &str) -> bool {
-    matches!(arm, "lane_batched" | "lane_adaptive" | "lane_cross")
+    matches!(
+        arm,
+        "lane_batched" | "lane_adaptive" | "lane_cross" | "lane_copy"
+    )
 }
 
 /// The lane counts the suite is declared for: every count `1..=8`.
@@ -162,20 +166,39 @@ pub const CROSS_MAX_ACTIVE: &str = "3";
 /// run native windows, steps carrying `CROSS_MAX_ACTIVE_N + 2` or more run AR
 /// (between the two, the previous step's mode holds).
 pub const CROSS_MAX_ACTIVE_N: usize = 3;
-/// The arms of an `ep2` cohort at [`CROSS_LANES`] lanes: the copy lane is on
+/// The arms of an `ep2` cohort at [`CROSS_LANES`] lanes. The copy lane is on
 /// by default on EP serve (`HIPFIRE_EP_MTP_LANE_COPY`) only for steps of at
-/// most `ep::COPY_WIDE_LANES` lanes, so no `ep2` cohort or verdict at
-/// [`CROSS_LANES`] covers it and `lane_copy` is refused under `ep2`.
+/// most `ep::COPY_WIDE_LANES` lanes ([`EP2_COPY_LANES`]), so no cohort at
+/// [`CROSS_LANES`] covers it: `lane_copy` runs in the [`EP2_COPY_ARMS`] cohort
+/// only.
 pub const EP2_ARMS: [&str; 4] = ["lane_ar", "lane_batched", "lane_adaptive", CROSS_ARM];
 /// The arms of an `ep2` cohort at any other lane count ([`CROSS_ARM`] has no
 /// such cohort).
 pub const EP2_FIXED_ARMS: [&str; 3] = ["lane_ar", "lane_batched", "lane_adaptive"];
 
+/// The most lanes a copy-lane step carries on EP serve: `ep::COPY_WIDE_LANES`
+/// (`HIPFIRE_QWEN4_LANE_COPY_LANES` default); the `ep2` copy cohort runs at
+/// this many lanes or fewer.
+pub const EP2_COPY_LANES: usize = 2;
+/// The `ep2` copy-lane cohort (at most [`EP2_COPY_LANES`] lanes, the primed
+/// copied-span fixture `HIPFIRE_SAMPLED_MTP_PROMPT=copy`): the AR reference and the default-staged copy lane.
+/// Which cohort a lane count runs is decided by the arms present
+/// ([`cohort_arms_with_copy`]).
+pub const EP2_COPY_ARMS: [&str; 2] = ["lane_ar", "lane_copy"];
+/// Every `ep2` arm a shard may be named after.
+pub const EP2_ALL_ARMS: [&str; 5] = [
+    "lane_ar",
+    "lane_batched",
+    "lane_adaptive",
+    CROSS_ARM,
+    "lane_copy",
+];
+
 /// Every arm a shard of `topology` may legitimately be named after (the union
 /// over lane counts); [`cohort_arms`] is the exact set one lane count needs.
 pub fn topology_arms(topology: Topology) -> &'static [&'static str] {
     match topology {
-        Topology::Ep2 => &EP2_ARMS,
+        Topology::Ep2 => &EP2_ALL_ARMS,
         Topology::Single | Topology::Pp2 => &LANE_ARMS,
     }
 }
@@ -184,7 +207,20 @@ pub fn topology_arms(topology: Topology) -> &'static [&'static str] {
 /// first): the whole declared set, except under `ep2` ([`EP2_ARMS`] at
 /// [`CROSS_LANES`] lanes, [`EP2_FIXED_ARMS`] otherwise).
 pub fn cohort_arms(topology: Topology, lanes: usize) -> &'static [&'static str] {
+    cohort_arms_with_copy(topology, lanes, false)
+}
+
+/// [`cohort_arms`], or the [`EP2_COPY_ARMS`] cohort when `copy` (the shards or
+/// results of a `lane_copy` arm are present) under `ep2` at
+/// [`EP2_COPY_LANES`] lanes or fewer. `copy` at any other placement is not a
+/// cohort: the result is the ordinary cohort, which does not hold `lane_copy`.
+pub fn cohort_arms_with_copy(
+    topology: Topology,
+    lanes: usize,
+    copy: bool,
+) -> &'static [&'static str] {
     match topology {
+        Topology::Ep2 if copy && lanes <= EP2_COPY_LANES => &EP2_COPY_ARMS,
         Topology::Ep2 if lanes == CROSS_LANES => &EP2_ARMS,
         Topology::Ep2 => &EP2_FIXED_ARMS,
         Topology::Single | Topology::Pp2 => &LANE_ARMS,
@@ -366,11 +402,13 @@ pub fn validate_arm(
             {
                 return Err(refusal);
             }
-            if !cohort_arms(placement.topology, placement.lanes).contains(&arm) {
+            let copy_arm = arm == "lane_copy" && placement.topology == Topology::Ep2;
+            let cohort = cohort_arms_with_copy(placement.topology, placement.lanes, copy_arm);
+            if !cohort.contains(&arm) {
                 return Err(format!(
-                    "lane arm {arm} is not part of the {} cohort {:?}: the copy lane is off by default on EP serve and no ep2 verdict covers it",
+                    "lane arm {arm} is not part of the {} cohort {cohort:?} at {} lanes (the ep2 copy cohort {EP2_COPY_ARMS:?} runs at {EP2_COPY_LANES} lanes or fewer: the copy lane takes windows only in steps of at most that many lanes)",
                     placement.topology.as_str(),
-                    cohort_arms(placement.topology, placement.lanes)
+                    placement.lanes
                 ));
             }
             Ok(())
@@ -449,6 +487,7 @@ pub fn lane_env_overrides(arm: &str, lane_k: usize) -> Vec<(&'static str, Option
         "lane_copy" => vec![
             (NGRAM_COPY_ENV, Some("on")),
             (MAX_ACTIVE_ENV, Some(LANE_MAX_ACTIVE)),
+            k,
         ],
         "lane_batched" | "lane_adaptive" => vec![(MAX_ACTIVE_ENV, Some(LANE_MAX_ACTIVE)), k],
         "lane_cross" => vec![(MAX_ACTIVE_ENV, Some(CROSS_MAX_ACTIVE)), k],
@@ -614,8 +653,8 @@ pub fn shard_files(names: &[String]) -> Vec<(String, (usize, usize))> {
 }
 
 /// Refuses a directory holding shards of any arm outside the arms of
-/// `topology` ([`topology_arms`]: singleton arms, an interleaved lane arm,
-/// `lane_copy` under `ep2`, a typo): a lane merge never silently ignores
+/// `topology` ([`topology_arms`]: singleton arms, an interleaved lane arm, a
+/// typo): a lane merge never silently ignores
 /// foreign shards. (Whether the arms present are the exact cohort of the
 /// recorded lane count is [`plan_lane_merge`]'s check.)
 pub fn reject_foreign_shards(names: &[String], topology: Topology) -> Result<(), String> {
@@ -1025,7 +1064,7 @@ pub fn plan_lane_merge(
     topology: Topology,
 ) -> Result<LaneMergePlan, String> {
     let lanes = recorded_lanes(shards)?;
-    let cohort = cohort_arms(topology, lanes);
+    let cohort = cohort_arms_with_copy(topology, lanes, shards.contains_key("lane_copy"));
     for arm in shards.keys() {
         if !cohort.contains(&arm.as_str()) {
             return Err(format!(
@@ -1337,6 +1376,11 @@ pub fn lane_k_coverage(arm: &str, lane_k: usize, evidence: &Value) -> Vec<String
             "{arm}: evidence records lane_k {other:?}, the cohort runs {lane_k}"
         )),
     }
+    // A copy arm's windows may offer a take (above K) and its first window may
+    // be a takeover: only the recorded depth is checked.
+    if arm == "lane_copy" {
+        return failures;
+    }
     match evidence["max_offered"].as_u64() {
         Some(max) if max as usize <= lane_k => {}
         Some(max) => failures.push(format!(
@@ -1623,7 +1667,8 @@ mod tests {
                 );
             }
         }
-        // The copy lane is off by default on EP serve: no ep2 cohort covers it.
+        // The copy lane takes windows only in steps of at most EP2_COPY_LANES
+        // lanes: its ep2 cohort exists there only.
         let refused = validate_arm(
             "lane_copy",
             "leviathan",
@@ -1635,6 +1680,22 @@ mod tests {
             refused.contains("lane_copy") && refused.contains("ep2"),
             "{refused}"
         );
+        for lanes in 1..=EP2_COPY_LANES {
+            validate_arm(
+                "lane_copy",
+                "leviathan",
+                placement(Topology::Ep2, lanes),
+                &SHORT,
+            )
+            .unwrap();
+        }
+        assert!(validate_arm(
+            "lane_copy",
+            "leviathan",
+            placement(Topology::Ep2, EP2_COPY_LANES + 1),
+            &SHORT,
+        )
+        .is_err());
         validate_arm(
             "lane_copy",
             "leviathan",
@@ -1752,8 +1813,25 @@ mod tests {
         }
         assert_eq!(cohort_arms(Topology::Pp2, 8), &LANE_ARMS[..]);
         assert_eq!(cohort_arms(Topology::Single, 1), &LANE_ARMS[..]);
-        assert_eq!(topology_arms(Topology::Ep2), &EP2_ARMS[..]);
+        assert_eq!(topology_arms(Topology::Ep2), &EP2_ALL_ARMS[..]);
         assert_eq!(topology_arms(Topology::Pp2), &LANE_ARMS[..]);
+        // The copy cohort: the reference and the copy lane, at EP2_COPY_LANES
+        // lanes or fewer; elsewhere `copy` does not make a cohort.
+        for lanes in 1..=EP2_COPY_LANES {
+            assert_eq!(
+                cohort_arms_with_copy(Topology::Ep2, lanes, true),
+                &EP2_COPY_ARMS[..]
+            );
+        }
+        assert_eq!(EP2_COPY_ARMS[0], LANE_REFERENCE_ARM);
+        assert_eq!(
+            cohort_arms_with_copy(Topology::Ep2, EP2_COPY_LANES + 1, true),
+            &EP2_FIXED_ARMS[..]
+        );
+        assert_eq!(cohort_arms_with_copy(Topology::Ep2, 8, true), &EP2_ARMS[..]);
+        for arm in EP2_ARMS.iter().chain(&EP2_COPY_ARMS) {
+            assert!(EP2_ALL_ARMS.contains(arm), "{arm}");
+        }
     }
 
     #[test]
@@ -1850,14 +1928,14 @@ mod tests {
     fn the_native_arms_pin_the_lane_depth_and_the_reference_pins_nothing() {
         for lane_k in LANE_K_VALUES {
             let pin = (EP_LANE_K_ENV, Some(lane_k_str(lane_k)));
-            for arm in ["lane_batched", "lane_adaptive", CROSS_ARM] {
+            for arm in ["lane_batched", "lane_adaptive", CROSS_ARM, "lane_copy"] {
                 assert!(pins_lane_k(arm), "{arm}");
                 assert!(
                     lane_env_overrides(arm, lane_k).contains(&pin),
                     "{arm} {lane_k}"
                 );
             }
-            for arm in ["lane_ar", "lane_copy"] {
+            for arm in ["lane_ar"] {
                 assert!(!pins_lane_k(arm), "{arm}");
                 assert!(
                     !lane_env_overrides(arm, lane_k)
@@ -2088,7 +2166,8 @@ mod tests {
             lane_env_overrides("lane_copy", 2),
             vec![
                 (NGRAM_COPY_ENV, Some("on")),
-                (MAX_ACTIVE_ENV, Some(LANE_MAX_ACTIVE))
+                (MAX_ACTIVE_ENV, Some(LANE_MAX_ACTIVE)),
+                (EP_LANE_K_ENV, Some("2"))
             ]
         );
         for arm in ["lane_batched", "lane_adaptive"] {
@@ -2780,10 +2859,48 @@ mod tests {
             "lane_ar.0-150.ids.json".into(),
             "lane_copy.0-150.ids.json".into(),
         ];
-        assert!(reject_foreign_shards(&names, Topology::Ep2)
-            .unwrap_err()
-            .contains("lane_copy"));
+        // The copy lane's shards belong to ep2 (its copy cohort) and pp2.
+        reject_foreign_shards(&names, Topology::Ep2).unwrap();
         reject_foreign_shards(&names, Topology::Pp2).unwrap();
+        // The copy cohort merges at EP2_COPY_LANES lanes: the reference and the
+        // copy lane, nothing else, and nothing less.
+        let copy_set = |lanes: usize| -> BTreeMap<String, Vec<LaneShard>> {
+            EP2_COPY_ARMS
+                .iter()
+                .map(|arm| {
+                    (
+                        arm.to_string(),
+                        vec![
+                            ep2_shard_at(arm, (0, 150), lanes),
+                            ep2_shard_at(arm, (150, 300), lanes),
+                        ],
+                    )
+                })
+                .collect()
+        };
+        for lanes in 1..=EP2_COPY_LANES {
+            let plan = plan_lane_merge(&copy_set(lanes), TRIALS, Topology::Ep2).unwrap();
+            assert_eq!(plan.arms.len(), 2, "{lanes} lanes");
+            assert!(plan.arms.contains_key("lane_copy"), "{lanes} lanes");
+        }
+        let mut set = copy_set(2);
+        set.remove("lane_ar");
+        assert!(plan_lane_merge(&set, TRIALS, Topology::Ep2)
+            .unwrap_err()
+            .contains("lane_ar"));
+        let mut set = copy_set(2);
+        set.insert(
+            "lane_batched".into(),
+            vec![ep2_shard_at("lane_batched", (0, 300), 2)],
+        );
+        assert!(plan_lane_merge(&set, TRIALS, Topology::Ep2)
+            .unwrap_err()
+            .contains("lane_batched"));
+        assert!(
+            plan_lane_merge(&copy_set(EP2_COPY_LANES + 1), TRIALS, Topology::Ep2)
+                .unwrap_err()
+                .contains("lane_copy")
+        );
         // The crossing arm's shards are not foreign to ep2, but they are to pp2.
         let names: Vec<String> = vec!["lane_cross.0-150.ids.json".into()];
         reject_foreign_shards(&names, Topology::Ep2).unwrap();

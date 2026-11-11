@@ -375,6 +375,10 @@ fn info(inst: &Inst) -> Info {
             srcs.extend([v.src0, v.src1]);
             ext(&mut i, v.ext, true)
         }
+        Inst::Vop2K(v) => {
+            i.valu = true;
+            srcs.extend([v.src0, v.src1]);
+        }
         Inst::Vopc(v) => {
             i.valu = true;
             srcs.extend([v.src0, v.src1]);

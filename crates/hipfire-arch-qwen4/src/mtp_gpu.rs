@@ -13,6 +13,7 @@ use crate::config::Qwen4Config;
 use crate::gpu_forward::{
     dense_ref, hyper_desc, hyper_read_desc, program_dims, qsa_desc, seal_moe_decode, MtpEpGather,
     Qwen4EpDummyExpert, Qwen4GpuForwardError, Qwen4MoeLayerRuntime, Qwen4MoeScratch,
+    Qwen4PeerLayerSource,
 };
 use crate::kv_backend::{Qwen4ContextCommit, Qwen4KvBackend};
 use crate::lane_token_ring::LaneTokenRing;
@@ -41,11 +42,12 @@ use hipfire_runtime::kv_backend::{
 use hipfire_runtime::session_cache::{RowStream, StateLayout};
 use hipfire_runtime::spec::SpecGrammar;
 use rdna_compute::tensor_ops::{
-    hc_activation_fused_f32, hyper_norm, hyper_read_projected, indexed_attention_append_prologue,
-    indexed_attention_pool_rope_incremental, HcActivationFused, HyperNorm, HyperReadProjected,
-    IndexedAttentionAppendPrologue, IndexedAttentionPoolRope, QsaKvFormat, QsaPositionBinding,
+    copy_regions, hc_activation_fused_f32, hyper_norm, hyper_read_projected,
+    indexed_attention_append_prologue, indexed_attention_pool_rope_incremental, CopyRegion,
+    HcActivationFused, HyperNorm, HyperReadProjected, IndexedAttentionAppendPrologue,
+    IndexedAttentionPoolRope, QsaKvFormat, QsaPositionBinding,
 };
-use rdna_compute::{DType, Gpu, GpuTensor};
+use rdna_compute::{DType, Gpu, GpuTensor, MemsetBatch};
 use smallvec::SmallVec;
 use std::fmt;
 
@@ -59,6 +61,42 @@ const MTP_HC_ROWS: usize = 1;
 /// (`LANE_MAX_DRAFTS` is 7).
 pub(crate) const MTP_DRAFT_LANES_MAX: usize = 8;
 
+/// `HIPFIRE_QWEN4_DRAFT_SHARDED_MOE` (developer; default on, exactly `0`
+/// disables and restores the X2 / replicated path byte for byte): with X2
+/// active, a batched draft pass (two to eight ops in the root's round, every
+/// op owned by a rank) keeps each rank's dense and attention work on its owned
+/// rows but runs the head's MoE once over ALL the round's rows on both ranks:
+/// each rank publishes its owner rows' MoE input, both all-gather it into the
+/// root's op order, and the existing replicated EP MoE call (compact tables,
+/// row-gather hook) runs over those rows; each rank keeps its own rows' FFN
+/// output. See [`S4Round`].
+pub(crate) const DRAFT_SHARDED_MOE_ENV: &str = "HIPFIRE_QWEN4_DRAFT_SHARDED_MOE";
+
+/// Whether the sharded draft MoE pass is on ([`DRAFT_SHARDED_MOE_ENV`], default
+/// on; exactly `0` disables).
+pub(crate) fn draft_sharded_moe_enabled() -> bool {
+    hipfire_config::developer_bool(DRAFT_SHARDED_MOE_ENV, true)
+}
+
+/// One sharded-MoE draft pass (S4), the same on every rank: `g` global rows
+/// (the root's ops of the round, in order) of which row `s` is owned by rank
+/// `(owners >> s) & 1` (two ranks). A rank's own rows are its ops in that order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct S4Round {
+    pub(crate) g: usize,
+    pub(crate) owners: u8,
+    pub(crate) rank: usize,
+}
+
+impl S4Round {
+    /// Global row indices of this rank's own rows, ascending.
+    pub(crate) fn own_rows(&self) -> SmallVec<[usize; MTP_DRAFT_LANES_MAX]> {
+        (0..self.g)
+            .filter(|&s| usize::from((self.owners >> s) & 1) == self.rank)
+            .collect()
+    }
+}
+
 /// Env switch of the batched head rounds: `HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS=1`.
 /// Default off; unset, `0` or anything else leaves the head's scratch and
 /// every code path exactly as without the feature. Read at load (the rows
@@ -69,6 +107,59 @@ mod rows;
 pub(crate) use rows::{draft_rounds_enabled, DraftRow, MtpRowsScratch};
 #[cfg(feature = "lab")]
 mod lab;
+#[cfg(feature = "lab")]
+mod lab_expert_trace;
+
+/// The row gather of a lane-local head MoE call (an owned draft lane, see
+/// [`Qwen4MtpGpu::set_lane_local`]). The lane-local head runtime's expert
+/// table names every expert's bytes (this rank's compact tensors, the peer's
+/// through UVA), so the rows a slot needs are computed on this rank and there
+/// is nothing to exchange: `gather_rows` does no device work and no host
+/// rendezvous. It stays an installed `row_gather` (`Some`) so the lowering
+/// keeps every stage, kernel and buffer role of the EP head call (the unfused
+/// shared down, the canonical slot-order combine).
+///
+/// The other answers are exactly `Qwen4EpRowGatherHook`'s (`ep.rs`) for a
+/// head layer index (`num_hidden_layers + parity`, at or past the trunk
+/// layers): the head is never a balanced layer (`assigns_owners` false) and
+/// has no fixed reduction partition (`None`: its HC writes are local, the
+/// combine folds every expert); `decode_step_end` and `release_gpu` are the
+/// trait's no-ops, as the hook's tail is only ever driven by trunk windows.
+pub(crate) struct LaneLocalRowGather<'a> {
+    /// The forward's EP row gather this call stands in for: told about the call
+    /// (`note_local_call`, the D2 tail's deferred-fill issue point) at the point
+    /// its gather would run. `None` only in tests.
+    pub(crate) ep: Option<&'a (dyn MoeRowGather + Send + Sync)>,
+}
+
+impl MoeRowGather for LaneLocalRowGather<'_> {
+    fn gather_rows(
+        &self,
+        gpu: &mut Gpu,
+        layer_idx: u16,
+        slots: usize,
+        _down_expanded: &GpuTensor,
+        topk_indices: &GpuTensor,
+    ) -> Result<(), String> {
+        if let Some(ep) = self.ep {
+            ep.note_local_call(gpu, layer_idx, slots, topk_indices);
+        }
+        Ok(())
+    }
+
+    fn assigns_owners(&self, _layer_idx: u16) -> bool {
+        false
+    }
+
+    fn reduction_partition(&self, _layer_idx: u16) -> Option<(usize, usize)> {
+        None
+    }
+
+    fn decode_step_end(&self, _gpu: &mut Gpu) {}
+
+    fn release_gpu(&self, _gpu: &mut Gpu) {}
+}
+
 /// Metadata words of an MTP head session snapshot: the boundary-row word
 /// (the boundary position plus one, or 0) and the state mark.
 const MTP_SESSION_WORDS: usize = 7;
@@ -190,6 +281,34 @@ fn upload_token_ids(
             ring.upload(gpu, dst, bytes.len())?;
         }
         _ => gpu.upload_stream_ordered(dst, bytes)?,
+    }
+    Ok(())
+}
+
+/// D2D copies `(source, destination, bytes)` between distinct, non-overlapping tensors. With
+/// `HIPFIRE_QWEN4_DRAFT_GLUE_FOLD` the copies are ONE `copy_regions_u32` launch (a pure word
+/// copy per region; a region that is not 4-byte aligned takes the plain copy), else one
+/// `copy_d2d` launch each. The bytes written are the same either way.
+fn copy_tensors(
+    gpu: &mut Gpu,
+    pairs: &[(&GpuTensor, &GpuTensor, usize)],
+) -> Result<(), MtpGpuError> {
+    if pairs.len() > 1 && gpu.flags.qwen4_draft_glue_fold_enabled() {
+        let regions: SmallVec<[CopyRegion<'_>; MTP_DRAFT_LANES_MAX]> = pairs
+            .iter()
+            .map(|&(source, destination, bytes)| CopyRegion {
+                dst: &destination.buf,
+                dst_offset: 0,
+                src: &source.buf,
+                src_offset: 0,
+                bytes,
+            })
+            .collect();
+        copy_regions(gpu, &regions)?;
+    } else {
+        for &(source, destination, bytes) in pairs {
+            gpu.copy_d2d(source, destination, bytes)?;
+        }
     }
     Ok(())
 }
@@ -1768,14 +1887,34 @@ impl MtpGpuState {
     }
 
     pub(crate) fn reset(&mut self, gpu: &mut Gpu) -> Result<(), MtpGpuError> {
-        self.reset_inner(gpu, true)
+        self.reset_synced(gpu, true)
+    }
+
+    /// [`Self::reset`] that only enqueues its zero-fills into `batch`: the caller owns
+    /// the one wait ([`Gpu::memset_batch_sync`], also after a failed reset) and keeps
+    /// the state alive until then.
+    pub(crate) fn reset_into(
+        &mut self,
+        gpu: &mut Gpu,
+        batch: &mut MemsetBatch,
+    ) -> Result<(), MtpGpuError> {
+        self.reset_inner(gpu, true, batch)
+    }
+
+    /// One reset with its own wait: every fill enqueued, then a single stream wait (paid
+    /// even when the reset fails part-way).
+    fn reset_synced(&mut self, gpu: &mut Gpu, clear_rows: bool) -> Result<(), MtpGpuError> {
+        let mut batch = MemsetBatch::default();
+        let reset = self.reset_inner(gpu, clear_rows, &mut batch);
+        let synced = gpu.memset_batch_sync(&mut batch).map_err(MtpGpuError::from);
+        reset.and(synced)
     }
 
     /// Cold reset of a side request: as [`Self::reset`] except the
     /// append-only row streams (full K/V, raw index keys, pooled keys) keep
     /// their bytes.
     pub(crate) fn reset_for_side(&mut self, gpu: &mut Gpu) -> Result<(), MtpGpuError> {
-        self.reset_inner(gpu, false)
+        self.reset_synced(gpu, false)
     }
 
     /// Per-stream row ends of a side request writing tokens `[0, through)`,
@@ -1785,7 +1924,12 @@ impl MtpGpuState {
         vec![through, through, through, through.div_ceil(self.compress)]
     }
 
-    fn reset_inner(&mut self, gpu: &mut Gpu, clear_rows: bool) -> Result<(), MtpGpuError> {
+    fn reset_inner(
+        &mut self,
+        gpu: &mut Gpu,
+        clear_rows: bool,
+        batch: &mut MemsetBatch,
+    ) -> Result<(), MtpGpuError> {
         self.snapshot_arena.invalidate();
         for (index, tensor) in [
             &self.full_keys,
@@ -1806,7 +1950,7 @@ impl MtpGpuState {
             }
             // An unmapped VMM arena has an empty accessible prefix.
             if tensor.buf.size() > 0 {
-                gpu.memset_stream_ordered(&tensor.buf, 0, tensor.buf.size())?;
+                gpu.memset_batched(batch, &tensor.buf, 0, tensor.buf.size())?;
             }
         }
         self.position = 0;
@@ -1846,20 +1990,25 @@ impl MtpGpuState {
         validate_mtp_mark(&mark, self)?;
         let arena_generation = self.snapshot_arena.generation;
         let result = (|| -> Result<(), MtpGpuError> {
-            gpu.copy_d2d(
-                &self.selected_indices,
-                &self.snapshot_arena.selected_indices,
-                self.selected_indices.byte_size(),
-            )?;
-            gpu.copy_d2d(
-                &self.selected_len_out,
-                &self.snapshot_arena.selected_len_out,
-                self.selected_len_out.byte_size(),
-            )?;
-            gpu.copy_d2d(
-                &self.wide_hidden,
-                &self.snapshot_arena.wide_hidden,
-                self.wide_hidden.byte_size(),
+            copy_tensors(
+                gpu,
+                &[
+                    (
+                        &self.selected_indices,
+                        &self.snapshot_arena.selected_indices,
+                        self.selected_indices.byte_size(),
+                    ),
+                    (
+                        &self.selected_len_out,
+                        &self.snapshot_arena.selected_len_out,
+                        self.selected_len_out.byte_size(),
+                    ),
+                    (
+                        &self.wide_hidden,
+                        &self.snapshot_arena.wide_hidden,
+                        self.wide_hidden.byte_size(),
+                    ),
+                ],
             )?;
             self.snapshot_arena.mark = mark;
             self.snapshot_arena.active = true;
@@ -1890,20 +2039,25 @@ impl MtpGpuState {
         }
         let mark = self.snapshot_arena.mark;
         let result = (|| -> Result<(), MtpGpuError> {
-            gpu.copy_d2d(
-                &self.snapshot_arena.selected_indices,
-                &self.selected_indices,
-                self.selected_indices.byte_size(),
-            )?;
-            gpu.copy_d2d(
-                &self.snapshot_arena.selected_len_out,
-                &self.selected_len_out,
-                self.selected_len_out.byte_size(),
-            )?;
-            gpu.copy_d2d(
-                &self.snapshot_arena.wide_hidden,
-                &self.wide_hidden,
-                self.wide_hidden.byte_size(),
+            copy_tensors(
+                gpu,
+                &[
+                    (
+                        &self.snapshot_arena.selected_indices,
+                        &self.selected_indices,
+                        self.selected_indices.byte_size(),
+                    ),
+                    (
+                        &self.snapshot_arena.selected_len_out,
+                        &self.selected_len_out,
+                        self.selected_len_out.byte_size(),
+                    ),
+                    (
+                        &self.snapshot_arena.wide_hidden,
+                        &self.wide_hidden,
+                        self.wide_hidden.byte_size(),
+                    ),
+                ],
             )?;
             self.full_len = mark.full_len;
             self.raw_len = mark.raw_len;
@@ -2373,6 +2527,25 @@ pub struct Qwen4MtpGpu {
     /// The batched head rounds' scratch (`HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS=1`,
     /// MoE head); `None` otherwise.
     pub(crate) rows: Option<MtpRowsScratch>,
+    /// The head's MoE runtime over every expert (`Some` once
+    /// [`Self::install_lane_local_moe`] ran, EP MoE head only): the same
+    /// sealed expert group as [`Self::moe`], but owned experts name this
+    /// rank's compact tensors and every other expert the peer's, so a head
+    /// step reads all of them locally and crosses no rank.
+    pub(crate) moe_full: Option<Qwen4MoeLayerRuntime>,
+    /// Lane-local mode ([`Self::set_lane_local`]): every Predict-step MoE of
+    /// this head runs on [`Self::moe_full`] with the no-op row gather and does
+    /// not advance [`Self::moe_steps`]. Off = the incumbent EP head call.
+    pub(crate) lane_local: bool,
+    /// The sharded-MoE pass the next batched head call belongs to
+    /// ([`Self::set_s4_round`]); `None` = every call is X2 / replicated as before.
+    pub(crate) s4_round: Option<S4Round>,
+    /// Device table of the sharded-MoE activation all-gather's slot owners:
+    /// 256 owner masks x 8 `i32` (slot `s` of mask `m` holds `(m >> s) & 1`),
+    /// read as the gather's `slot_experts` (expert `e` is owned by rank
+    /// `e % 2`). `Some` only with [`DRAFT_SHARDED_MOE_ENV`] on, two ranks, at
+    /// [`Self::install_lane_local_moe`].
+    pub(crate) s4_owners: Option<GpuTensor>,
 }
 
 /// Draft-head front: tokens below this id, plus EOS and the control ids
@@ -2405,12 +2578,16 @@ struct HeadRowViews {
     /// projection: (`hidden_norm` rows, `projected_hidden` rows, row count).
     /// No chunk is wider than the few-row route (`FEW_ROW_ROUTE_ROWS`) unless
     /// one lane's own `hc_count` rows are, so every projected row stays on the
-    /// route whose per-row bytes are the one-row step's.
+    /// route whose per-row bytes are the one-row step's. With `one_launch`
+    /// (`HIPFIRE_QWEN4_MTP_FC_ONE_LAUNCH`, BF16 fc_hidden, and
+    /// `Gpu::bf16_rows_exact_one_launch(rows * hc_count)`) there is ONE chunk over all
+    /// `rows * hc_count` rows: it runs `ProjectLadder::TrunkRowExact`, whose all-rows arm is
+    /// bitwise the singleton, so every projected row is still bitwise the one-row step's.
     fc_hidden: SmallVec<[(GpuTensor, GpuTensor, usize); 4]>,
 }
 
 impl HeadRowViews {
-    fn new(t: &HeadRowTensors<'_>, config: &Qwen4Config, rows: usize) -> Self {
+    fn new(t: &HeadRowTensors<'_>, config: &Qwen4Config, rows: usize, one_launch: bool) -> Self {
         let mut views = Self {
             broadcast: SmallVec::new(),
             fc_hidden: SmallVec::new(),
@@ -2429,7 +2606,11 @@ impl HeadRowViews {
             ));
         }
         let total = rows * hc;
-        let chunk = (rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS / hc).max(1) * hc;
+        let chunk = if one_launch {
+            total
+        } else {
+            (rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS / hc).max(1) * hc
+        };
         let mut first = 0;
         while first < total {
             let count = chunk.min(total - first);
@@ -2460,6 +2641,7 @@ fn push_head_rows_front<'a>(
     t: &HeadRowTensors<'a>,
     views: &'a HeadRowViews,
     rows: usize,
+    fold_broadcast: bool,
     backbone_hidden: &'a GpuTensor,
     attn_read: &Qwen4HyperReadWeights<'a>,
 ) -> Result<(), MtpGpuError> {
@@ -2514,6 +2696,7 @@ fn push_head_rows_front<'a>(
             output: t.wide,
             rows: config.hc_count,
             width: hidden,
+            lanes: 1,
         }));
     } else {
         for (input, output, count) in &views.fc_hidden {
@@ -2523,18 +2706,32 @@ fn push_head_rows_front<'a>(
                 output,
                 rows: *count,
                 rotation: Some(t.rotation),
-                ladder: ProjectLadder::Trunk,
+                ladder: ProjectLadder::TrunkRowExact,
                 residual: None,
             }));
         }
-        for (rows_input, row, output) in &views.broadcast {
+        if fold_broadcast {
+            // One launch over every lane's rows (`rows_input` / `output` hold `rows * hc_count`
+            // branch rows, `row` one embedding row per lane): the per-lane ops below, bytewise.
             steps.push(Step::BroadcastAdd(BroadcastAddOp {
-                rows_input,
-                row,
-                output,
+                rows_input: t.projected_hidden,
+                row: t.projected_embedding,
+                output: t.wide,
                 rows: config.hc_count,
                 width: hidden,
+                lanes: rows,
             }));
+        } else {
+            for (rows_input, row, output) in &views.broadcast {
+                steps.push(Step::BroadcastAdd(BroadcastAddOp {
+                    rows_input,
+                    row,
+                    output,
+                    rows: config.hc_count,
+                    width: hidden,
+                    lanes: 1,
+                }));
+            }
         }
     }
     steps.push(Step::HyperRead(hc_read(attn_read, t, config, rows)));
@@ -2634,14 +2831,7 @@ fn push_head_rows_back<'a>(
 ) {
     let hidden = config.hidden_size;
     if let Some(ffn) = ffn {
-        steps.push(Step::HyperWrite(hc_write(
-            attn_write,
-            t.projected_embedding,
-            t,
-            config,
-            rows,
-        )));
-        steps.push(Step::HyperRead(hc_read(mlp_read, t, config, rows)));
+        push_head_rows_pre_ffn(steps, config, t, rows, attn_write, mlp_read);
         match ffn {
             MtpFfnCall::Moe(moe) => {
                 steps.push(Step::Clear(ClearOp {
@@ -2652,16 +2842,50 @@ fn push_head_rows_back<'a>(
             }
             MtpFfnCall::Dense(dense) => steps.push(Step::GatedMlp(dense)),
         }
-        steps.push(Step::HyperWrite(hc_write(
-            mlp_write,
-            t.ffn_output,
-            t,
-            config,
-            rows,
-        )));
-        if predict {
-            steps.push(Step::HyperRead(hc_read(final_read, t, config, rows)));
-        }
+        push_head_rows_post_ffn(steps, config, t, rows, mlp_write, final_read, predict);
+    }
+}
+
+/// The steps of [`push_head_rows_back`] before the FFN: the attention HC
+/// write and the MLP HC read.
+fn push_head_rows_pre_ffn<'a>(
+    steps: &mut SmallVec<[Step<'a>; 16]>,
+    config: &Qwen4Config,
+    t: &HeadRowTensors<'a>,
+    rows: usize,
+    attn_write: &Qwen4HyperWriteWeights<'a>,
+    mlp_read: &Qwen4HyperReadWeights<'a>,
+) {
+    steps.push(Step::HyperWrite(hc_write(
+        attn_write,
+        t.projected_embedding,
+        t,
+        config,
+        rows,
+    )));
+    steps.push(Step::HyperRead(hc_read(mlp_read, t, config, rows)));
+}
+
+/// The steps of [`push_head_rows_back`] after the FFN: the MLP HC write and
+/// (Predict) the final HC read.
+fn push_head_rows_post_ffn<'a>(
+    steps: &mut SmallVec<[Step<'a>; 16]>,
+    config: &Qwen4Config,
+    t: &HeadRowTensors<'a>,
+    rows: usize,
+    mlp_write: &Qwen4HyperWriteWeights<'a>,
+    final_read: &Qwen4HyperReadWeights<'a>,
+    predict: bool,
+) {
+    steps.push(Step::HyperWrite(hc_write(
+        mlp_write,
+        t.ffn_output,
+        t,
+        config,
+        rows,
+    )));
+    if predict {
+        steps.push(Step::HyperRead(hc_read(final_read, t, config, rows)));
     }
 }
 
@@ -3022,6 +3246,10 @@ impl Qwen4MtpGpu {
             draft,
             ep_bound,
             moe_steps: 0,
+            moe_full: None,
+            lane_local: false,
+            s4_round: None,
+            s4_owners: None,
             rows,
         })
     }
@@ -3083,25 +3311,133 @@ impl Qwen4MtpGpu {
         ))
     }
 
+    /// Whether lane-local head MoE calls can run: the head's MoE runtime is
+    /// EP-bound and its full-table runtime was installed, or the head has no
+    /// MoE at all (a dense profile has nothing to cross).
+    pub(crate) fn lane_local_ready(&self) -> bool {
+        match self.moe.as_ref() {
+            None => true,
+            Some(_) => self.ep_bound && self.moe_full.is_some(),
+        }
+    }
+
+    /// Switch lane-local mode. On is refused for a MoE head without the
+    /// full-table runtime.
+    pub(crate) fn set_lane_local(&mut self, on: bool) -> Result<(), MtpGpuError> {
+        if on && !self.lane_local_ready() {
+            return Err(invalid(
+                "lane-local MTP head MoE needs the EP full-table head runtime (not installed)",
+            ));
+        }
+        self.lane_local = on;
+        Ok(())
+    }
+
+    /// Whether sharded-MoE draft passes can run (S4): the switch was on at
+    /// install and the head has the rows scratch, the EP MoE runtime and the
+    /// lane-local runtime (X2 active), with the slot-owner table.
+    pub(crate) fn s4_ready(&self) -> bool {
+        self.s4_owners.is_some() && self.rows.is_some() && self.ep_bound && self.lane_local_ready()
+    }
+
+    /// Mark (or clear) the sharded-MoE pass the next batched / participant
+    /// head calls belong to. Refused when [`Self::s4_ready`] is false, and
+    /// while lane-local mode is on (the S4 MoE is the replicated call).
+    pub(crate) fn set_s4_round(&mut self, round: Option<S4Round>) -> Result<(), MtpGpuError> {
+        if round.is_some() && (!self.s4_ready() || self.lane_local) {
+            return Err(invalid(
+                "sharded draft MoE needs the S4 head tables and a non-lane-local head",
+            ));
+        }
+        self.s4_round = round;
+        Ok(())
+    }
+
+    /// Build the head's full-table MoE runtime for lane-local calls (EP attach,
+    /// after every rank's head compact source is known): the head's own sealed
+    /// expert group (`num_hidden_layers`, the one [`Self::new_with_backend`]
+    /// binds for the decode table) and runtime label 0 over `peers`, one
+    /// compact source per rank (this rank's is its own head tensors).
+    pub(crate) fn install_lane_local_moe(
+        &mut self,
+        gpu: &mut Gpu,
+        weights: &Qwen4Weights,
+        config: &Qwen4Config,
+        placement: Qwen4EpPlacement,
+        peers: &[Qwen4PeerLayerSource],
+        seal: &crate::ep_seal::Qwen4EpRankSeal,
+    ) -> Result<(), MtpGpuError> {
+        if !self.ep_bound || self.moe.is_none() {
+            return Err(invalid(
+                "a lane-local head MoE runtime needs an EP-bound MoE head",
+            ));
+        }
+        if self.moe_full.is_some() {
+            return Err(invalid(
+                "the lane-local head MoE runtime is already installed",
+            ));
+        }
+        let config = config.mtp_geometry();
+        let head = bound_mtp(weights)?;
+        let moe_weights = head
+            .ffn
+            .moe()
+            .ok_or_else(|| invalid("a dense MTP head has no lane-local MoE runtime"))?;
+        let full = Qwen4MoeLayerRuntime::from_moe_full_group(
+            gpu,
+            weights,
+            moe_weights,
+            0,
+            config,
+            placement,
+            peers,
+            seal,
+            config.num_hidden_layers,
+        )?;
+        if full.tier_lease().is_some() {
+            let _ = full.free_gpu(gpu);
+            return Err(invalid(
+                "the MTP head's lane-local MoE runtime must be untiered (its experts are the `mtp.` tensors)",
+            ));
+        }
+        if draft_sharded_moe_enabled() && placement.ranks == 2 && self.rows.is_some() {
+            let mut table = Vec::with_capacity(256 * 8 * std::mem::size_of::<i32>());
+            for mask in 0u32..256 {
+                for slot in 0..8 {
+                    table.extend_from_slice(&(((mask >> slot) & 1) as i32).to_ne_bytes());
+                }
+            }
+            self.s4_owners = Some(gpu.upload_raw(&table, &[table.len()])?);
+        }
+        self.moe_full = Some(full);
+        Ok(())
+    }
+
     pub(crate) fn free_gpu(self, gpu: &mut Gpu) -> Result<(), MtpGpuError> {
         let Self {
             scratch,
             state,
             moe,
+            moe_full,
             draft,
             rows,
+            s4_owners,
             ..
         } = self;
         let draft_error = draft.free_gpu(gpu);
         let scratch_error = scratch.free_gpu(gpu);
         let state_error = state.free_gpu(gpu);
         let moe_error = moe.and_then(|moe| moe.free_gpu(gpu));
+        let moe_full_error = moe_full.and_then(|moe| moe.free_gpu(gpu));
         let rows_error = rows.and_then(|rows| rows.free_gpu(gpu));
+        let s4_error = s4_owners.and_then(|table| gpu.free_tensor(table).err());
         draft_error
             .or(scratch_error)
             .or(state_error)
             .or(moe_error)
+            .or(moe_full_error)
             .or(rows_error)
+            .or(s4_error)
             .map_or(Ok(()), |error| Err(MtpGpuError::Hip(error)))
     }
     /// Deliberately dirty the reusable MoE buffers for the bounded profile
@@ -3468,7 +3804,10 @@ impl Qwen4MtpGpu {
                     "MTP backbone hidden must be F32 with {wide} elements"
                 )));
             }
-        } else {
+        } else if !gpu.flags.qwen4_draft_glue_fold_enabled() {
+            // `HIPFIRE_QWEN4_DRAFT_GLUE_FOLD` reads the head's own carried hidden in place
+            // ([`Self::head_block`]): the stage-1 norm is its only reader and the step's
+            // `wide_hidden` write (`finish_head_step`) is stream-ordered after it.
             gpu.copy_d2d(
                 &self.state.wide_hidden,
                 &self.scratch.backbone_hidden,
@@ -3527,7 +3866,12 @@ impl Qwen4MtpGpu {
         let lengths = {
             let scratch = &self.scratch;
             let state = &self.state;
-            let backbone_hidden = backbone_hidden.unwrap_or(&scratch.backbone_hidden);
+            let backbone_hidden =
+                backbone_hidden.unwrap_or(if gpu.flags.qwen4_draft_glue_fold_enabled() {
+                    &state.wide_hidden
+                } else {
+                    &scratch.backbone_hidden
+                });
             let hidden = config.hidden_size;
             let ctx = DispatchCtx::new(gpu);
             let attn = hyper_desc(weights, &mtp.attn_hyper)?;
@@ -3556,6 +3900,13 @@ impl Qwen4MtpGpu {
             // forward's row gather: gather buffer `2 + j % 2` and layer index
             // `trunk_layers + j % 2` for the head's monotonic MoE invocation
             // counter `j` (one increment per MoE head step, never rewound).
+            // A lane-local step (`set_lane_local`: an owned draft lane) keeps
+            // the same layer index and gather buffer (the lowering and every
+            // buffer role are the EP call's) but runs on the full-table
+            // runtime with the no-op row gather, and leaves `j` alone so the
+            // replicated calls keep their parity in lockstep on every rank.
+            let lane_local = self.lane_local && self.ep_bound;
+            let mut local_hook: Option<LaneLocalRowGather<'_>> = None;
             let moe_ep: Option<(usize, &GpuTensor, &dyn MoeRowGather)> = if self.ep_bound
                 && step != MtpStep::Append
                 && matches!(&mtp.ffn, Qwen4FfnWeights::Moe(_))
@@ -3563,21 +3914,31 @@ impl Qwen4MtpGpu {
                 let ep = ep
                     .ok_or_else(|| invalid("an EP MTP head step needs the forward's row gather"))?;
                 let parity = (self.moe_steps % 2) as usize;
-                self.moe_steps = self.moe_steps.wrapping_add(1);
+                let hook: &dyn MoeRowGather = if lane_local {
+                    local_hook.insert(LaneLocalRowGather { ep: Some(ep.hook) })
+                } else {
+                    self.moe_steps = self.moe_steps.wrapping_add(1);
+                    ep.hook as &dyn MoeRowGather
+                };
                 Some((
                     config.num_hidden_layers + parity,
                     ep.buffers[2 + parity],
-                    ep.hook as &dyn MoeRowGather,
+                    hook,
                 ))
             } else {
                 None
+            };
+            let head_moe = if lane_local {
+                self.moe_full.as_ref()
+            } else {
+                self.moe.as_ref()
             };
             // The MTP layer's FFN is the trunk's kind (`attach` refuses a
             // head whose FFN weights disagree with the profile).
             let ffn = if step == MtpStep::Append {
                 None
             } else {
-                Some(match (&mtp.ffn, self.moe.as_ref()) {
+                Some(match (&mtp.ffn, head_moe) {
                     (Qwen4FfnWeights::Moe(_), Some(runtime)) => {
                         MtpFfnCall::Moe(seal_moe_decode(
                             &ctx,
@@ -3638,7 +3999,7 @@ impl Qwen4MtpGpu {
                     _ => return Err(invalid("MTP FFN weights and runtime disagree")),
                 })
             };
-            let views = HeadRowViews::new(&row_tensors, config, MTP_HC_ROWS);
+            let views = HeadRowViews::new(&row_tensors, config, MTP_HC_ROWS, false);
             let mut steps: SmallVec<[Step<'_>; 16]> = SmallVec::new();
             push_head_rows_front(
                 &mut steps,
@@ -3648,6 +4009,7 @@ impl Qwen4MtpGpu {
                 &row_tensors,
                 &views,
                 MTP_HC_ROWS,
+                gpu.flags.qwen4_draft_glue_fold_enabled(),
                 backbone_hidden,
                 &attn.read,
             )?;
@@ -3666,6 +4028,17 @@ impl Qwen4MtpGpu {
             );
             validate_steps(gpu, &steps)?;
             execute_validated_steps(gpu, &ctx, &steps)?;
+            #[cfg(feature = "lab")]
+            if moe_ep.is_some() {
+                lab_expert_trace::record(
+                    gpu,
+                    &scratch.moe_topk_indices,
+                    1,
+                    config.num_experts_per_tok,
+                    weights.ep_placement(),
+                    lane_local,
+                )?;
+            }
             lengths
         };
         Ok(lengths)

@@ -17,6 +17,10 @@ pub enum Mb4Mode {
     Pack4,
 }
 
+/// Fewest rows of an EP prefill wave lane that take the prefill lane WMMA entries and the joint
+/// dense stages (`HIPFIRE_QWEN4_PREFILL_LWMMA_WAVE_FLOOR`).
+pub const QWEN4_PREFILL_LWMMA_WAVE_FLOOR_ROWS: usize = 49;
+
 #[derive(Debug, Clone)]
 pub struct FeatureFlags {
     // ── Arch identity ──────────────────────────────────────────────
@@ -95,6 +99,18 @@ pub struct FeatureFlags {
     /// shape (M = 10240, K = 2048, 16384 rows: 5.53 vs 4.96 ms), which outweighs the 0.39 ms the
     /// producer gains.
     pub qwen4_gdn_qkv_bf16: bool,
+    /// Qwen4 gfx1201 symmetric-A8 trunk route, wide verify (`HIPFIRE_QWEN4_TRUNK_A8_X4`, 9..=64
+    /// rows): the F32 members of one K (GDN qkv|z|a|b, QSA q|k|v|idx) run as ONE multi-part
+    /// `gemm_mq6sym_i8_set_*_x4` launch instead of one launch each. Bytes identical to the
+    /// per-member launches. Default on (the PM Route-A twin is sealed); `HIPFIRE_QWEN4_TRUNK_A8_X4=0` is the kill switch.
+    pub qwen4_trunk_a8_x4: bool,
+    /// Qwen4 gfx1201 A8 trunk multi-part tile at the EP2 trunk-shard GDN group
+    /// (`HIPFIRE_QWEN4_TRUNK_A8_X4_SHARD`, default on): at 17..=32 rows a group whose largest
+    /// member has 5120..=6143 rows (qkv 5120 | z 3072 | a | b) launches `m32n32_x4` instead of
+    /// the single-matrix rule's `m64n32`, which has no x4 entry (four launches). Bytes identical
+    /// (every tile shares the per-row arithmetic); `HIPFIRE_QWEN4_TRUNK_A8_X4_SHARD=0` restores the
+    /// per-member launches.
+    pub qwen4_trunk_a8_x4_shard: bool,
     /// Qwen4 HC read/write fusion level (`HIPFIRE_QWEN4_HC_FUSE`: 0 off, 1
     /// read side, 2 + attention epilogue, 3 + shared-down epilogue). Default
     /// 3 on gfx1151, 1 on gfx1201, 0 elsewhere; see [`Self::qwen4_hc_fuse_level`].
@@ -110,6 +126,44 @@ pub struct FeatureFlags {
     /// MoE combine zero-init (`HIPFIRE_QWEN4_MOE_COMBINE_ZINIT`), default on
     /// for gfx1151 and gfx1201, off elsewhere.
     pub qwen4_moe_combine_zinit: bool,
+    /// FFN zero-fill absorb on the wide-verify int8 MoE chain
+    /// (`HIPFIRE_QWEN4_FFN_CLEAR_ABSORB`), default on for exact gfx1201, `0` is
+    /// the kill switch: the BF16-row combine of the 9..=64-row A8 route starts
+    /// from +0.0 (`_zinit`) and the FFN `zero_f32` before the call is not
+    /// launched.  Only widens the route set of [`Self::qwen4_moe_combine_zinit`].
+    pub qwen4_ffn_clear_absorb: bool,
+    /// FFN zero-fill absorb on the few-row (1..=8 rows) epilogue-fused MoE route
+    /// (`HIPFIRE_QWEN4_FFN_CLEAR_ABSORB_ROWS`), default on for exact gfx1201, `0` is the kill switch: the fused
+    /// `moe_shared_down_combine_rows_r<R>` launch takes its `_zinit` store entry (accumulator
+    /// seed +0.0, `target` never read) and the FFN `zero_f32` before the call is not launched.
+    /// The eight `_zinit` entries have a proof-only portable PeaceMaker twin; the runtime keeps
+    /// the HIP route.
+    pub qwen4_ffn_clear_absorb_rows: bool,
+    /// Wide-verify BF16-row combine with its rank order inline
+    /// (`HIPFIRE_QWEN4_MOE_COMBINE_INLINE_ORDER`): the owner-masked order kernel and the
+    /// combine run as ONE launch (`moe_down_combine_grouped_top10_bf16in_ordered[_zinit]`),
+    /// bytes identical. Default on for exact gfx1201 (Route-A PM twins); `=0` is the kill switch.
+    pub qwen4_moe_combine_inline_order: bool,
+    /// MTP draft-head launch-glue fold (`HIPFIRE_QWEN4_DRAFT_GLUE_FOLD`): the head step's
+    /// per-branch / per-lane `add_f32` broadcast adds run as one `broadcast_add_rows_f32`, the
+    /// batched draft round's per-lane D2D staging copies, the head snapshot / restore copies and
+    /// the draft ranking's per-row rotations run as one launch each (existing entries, bytes
+    /// identical). Default on for exact gfx1201, `0` is the kill switch.
+    pub qwen4_draft_glue_fold: bool,
+    /// MTP draft ranking row batch (`HIPFIRE_QWEN4_DRAFT_TOPK8_ROWS`): the MQ6G256V2 head's per-row
+    /// top-8 partial + exact re-score pairs of one batched ranking class run as one pair per run
+    /// of consecutive rows (`topk8_rescore_k2560_rows`), bytes identical. Default on for exact
+    /// gfx1201, `0` is the kill switch.
+    pub qwen4_draft_topk8_rows: bool,
+    /// Async window prepare on the EP mesh lanes (`HIPFIRE_QWEN4_LANE_PREPARE_ASYNC`, default on
+    /// for exact gfx1201, `0` is the kill switch that restores the prepare barrier):
+    /// `RankLane::prepare_commit` enqueues the prepare phase (GDN rollback, trunk restore copies,
+    /// head history commit-fill, pending-hidden copy) and returns without its end-of-phase
+    /// `device_synchronize` + wait-error read, so the host turn runs while the phase's device tail
+    /// finishes. A device fault of the phase is found one host turn late, at the next device wait
+    /// of the rank (or at a settle before work that would carry it under another label), and is
+    /// reported as `prepare (deferred)`. Same kernels in the same stream order, bytes identical.
+    pub qwen4_lane_prepare_async: bool,
     /// EP partial tile mask implicit zeros (`HIPFIRE_QWEN4_EP_PMASK_IMPLICIT_ZERO`),
     /// default on for exact gfx1201, `0` is the kill switch: the foreign experts'
     /// grouped down rows are marked `-1` in the combine order instead of being
@@ -134,6 +188,12 @@ pub struct FeatureFlags {
     /// (`HIPFIRE_QWEN4_MOE_SCATTER_SCAN`), default on for gfx1201 (`=0` keeps the serial
     /// thread-0 walk); gfx1151 always scans, every other arch always walks.
     pub qwen4_moe_scatter_scan: bool,
+    /// Wave-3 C8 MoE glue folds (`HIPFIRE_QWEN4_MOE_GLUE_FOLD`, developer, default on, all folds): a
+    /// bitmask of the sub-folds ([`MOE_GLUE_FOLD_MASK`], [`MOE_GLUE_FOLD_ROUTER`],
+    /// [`MOE_GLUE_FOLD_ROTATE`]); unset / `1` selects all, a letter list (`a`, `ab`, `c`, ...)
+    /// selects the named ones, `0` none. Exact gfx1201 only (see
+    /// [`FeatureFlags::qwen4_moe_glue_fold_enabled`]).
+    pub qwen4_moe_glue_fold: u8,
     /// Multi-lane fn-lanes GDN decode core (`HIPFIRE_QWEN4_GDN_LANES`), default
     /// on for gfx1151 and gfx1201 (`=0` kills it), off elsewhere.
     pub qwen4_gdn_lanes: bool,
@@ -144,6 +204,12 @@ pub struct FeatureFlags {
     /// default on for exact gfx1201 only (`=0` kills it), and only with
     /// `HIPFIRE_QWEN4_GDN_LANES` on.
     pub qwen4_gdn_lanes_rows: bool,
+    /// Lane-step GDN verify capture written in place (`HIPFIRE_QWEN4_GDN_CAPTURE_DIRECT`):
+    /// when a verify lane's qkv in-projection runs as its own launch (split mixer phases) over
+    /// exactly that lane's rows, it writes the lane's capture `inputs` directly and the Core
+    /// phase's `copy_d2d(projection -> capture.inputs)` is not issued. Default on for exact
+    /// gfx1201 only (`=0` kills it); never under a replay recorder or graph capture.
+    pub qwen4_gdn_capture_direct: bool,
     /// Lane-batched PLE chain of an AR lane step (`HIPFIRE_QWEN4_LANE_PLE_BATCH`):
     /// the key / value projections once over the lanes' rows and one batched
     /// tail launch instead of the per-lane chain. Default off on every arch
@@ -223,6 +289,45 @@ pub struct FeatureFlags {
     /// outputs are not bitwise the SIMT route's (f32 summation order). Default on for exact
     /// gfx1201 (`=0` kills it).
     pub qwen4_lane_wmma: bool,
+    /// Dense BF16 multirow GEMMs of the sub-512-row prefill forward above 64 rows on the lane
+    /// WMMA kernels (`HIPFIRE_QWEN4_PREFILL_LWMMA_DENSE`), split-K pinned to
+    /// `LANE_WMMA_PREFILL_SPLIT_ROWS` (row-count invariant per row). Default on for exact
+    /// gfx1201 (`=0` kills it); also gated by the lane WMMA flag.
+    pub qwen4_prefill_lwmma_dense: bool,
+    /// The HC read down / up projections of the sub-512-row prefill forward above 64 rows on the
+    /// lane WMMA kernels (`HIPFIRE_QWEN4_PREFILL_LWMMA_HC`, pinned split-K). Default on for exact
+    /// gfx1201 (`=0` kills it); also gated by the lane WMMA flag.
+    pub qwen4_prefill_lwmma_hc: bool,
+    /// `HIPFIRE_QWEN4_PREFILL_LWMMA_WAVE_FLOOR` (default on, `=0` kills): lanes of
+    /// `QWEN4_PREFILL_LWMMA_WAVE_FLOOR_ROWS`..=64 rows INSIDE an EP prefill wave take the prefill
+    /// lane WMMA entries ([`Self::qwen4_prefill_lwmma_dense`] / [`Self::qwen4_prefill_lwmma_hc`])
+    /// and the joint dense stages instead of the 16..=64-row decode-shaped arms and per-lane
+    /// launches. Read through [`Self::qwen4_prefill_lwmma_floor_knob`]; scoped to waves only by
+    /// `Gpu::qwen4_prefill_lwmma_floor` (singleton chunks, decode and verify never see it).
+    pub qwen4_prefill_lwmma_wave_floor: bool,
+    /// `HIPFIRE_QWEN4_WAVE_HEAD_ONE` (default on, `=0` kills; exact gfx1201): the final rows of an
+    /// EP prefill wave of >= 2 lanes take ONE all-rows LM head + argmax under the wide few-row
+    /// scope instead of one one-row GEMV per lane (byte-equal to the singleton, lane oracle).
+    pub qwen4_wave_head_one: bool,
+    /// The prefill lane-WMMA GEMMs above 64 rows of a BF16 weight on the staged-tile kernel
+    /// (`HIPFIRE_QWEN4_PREFILL_LWMMA_TILE`, `lwmma_tile_bf16_*`): every output word is bitwise the
+    /// shipped `lwmma_gemm_bf16_*` kernel's. Default on for exact gfx1201 (`=0` kills it, back to
+    /// the shipped kernel); also gated by the lane WMMA flag. W8 weights and the read-up stay on
+    /// the shipped kernels.
+    pub qwen4_prefill_lwmma_tile: bool,
+    /// One multi-part lane-WMMA launch (`HIPFIRE_QWEN4_LWMMA_MULTI_PART`) for the dense BF16
+    /// projections of one activation at 16..=64 rows (router | selector | shared gate | shared up
+    /// of the wide MoE block): up to four parts share one `lwmma_gemm_bf16_t2_m<MT>_n1_multi`
+    /// launch, each part's bytes identical to its own lane-WMMA launch. Default on for exact
+    /// gfx1201 with the lane-WMMA route (`=0` kills it). The PM Route-A twins of the four `_multi`
+    /// entries are proof-only (dispatch stays HIP).
+    pub qwen4_lwmma_multi_part: bool,
+    /// One `gemv_bf16_xf32_x4_rows_exact` launch for the MTP fc_hidden branch rows of all lanes
+    /// (`HIPFIRE_QWEN4_MTP_FC_ONE_LAUNCH`). Default on for exact gfx1201 (`=0` kills it).
+    pub qwen4_mtp_fc_one_launch: bool,
+    /// Lane-wide PLE projection (`HIPFIRE_QWEN4_LANE_PLE_PROJECT`). Default on for exact gfx1201
+    /// (`=0` kills it).
+    pub qwen4_lane_ple_project: bool,
     /// OCP E4M3 HC mixer sidecar (`HIPFIRE_QWEN4_HC8`): the load applies the `<model>.hc8`
     /// sidecar (per-row power-of-two scaled E4M3 HC down / up weights, dtype
     /// `DType::HC8E4M3Row`) and decode reads it through the PeaceMaker `hc8_gemm` kernel.
@@ -234,10 +339,22 @@ pub struct FeatureFlags {
     /// 2^32 inputs) and, for tagged launches of at most `AR_HC_SPLIT_MAX_ROWS` rows, one lane
     /// per (granule, branch). Byte-identical. Default on for exact gfx1201 (`=0` kills it).
     pub ep_ar_fast_apply: bool,
+    /// EP2 fused all-reduce + HC write launch grid (`HIPFIRE_EP_AR_WIDE_GRID`): launches the
+    /// non-split entries (`ar_hc_write_d8_*` / `ar_hc_write_*`, 13+ rows: wide verify and lane
+    /// steps, short prefill tiles) on up to 64 blocks of up to 512 lanes (one granule per lane up
+    /// to 51 rows, at most 3 up to 153 rows; larger launches keep it) instead of the 16-block
+    /// default shape. Byte-identical (the per-granule arithmetic
+    /// does not depend on which lane runs it). Default on for exact gfx1201 (`=0` kills it).
+    pub ep_ar_wide_grid: bool,
     /// Decode HC read norm + the paired write's k4 gate GEMV in one launch
     /// (`HIPFIRE_QWEN4_HC_PAIR_DECODE`, 1..=8 rows): bitwise the unfused `hyper_norm` +
     /// `gemv_bf16_xf32_k4` sequence. Default on for exact gfx1201 (`=0` kills it).
     pub qwen4_hc_pair_decode: bool,
+    /// The fused HC read norm + paired write gate launch also serves the wide verify's
+    /// 9..=64 rows (`HIPFIRE_QWEN4_HC_PAIR_WIDE`, needs `HIPFIRE_QWEN4_HC_PAIR_DECODE`); `=0`
+    /// keeps the two-launch `hyper_norm` + `gemv_bf16_xf32_k4_rows` pair there. Byte-identical.
+    /// Default on for exact gfx1201.
+    pub qwen4_hc_pair_wide: bool,
     /// The QSA select score scratch is reserved at the call's shape bound
     /// (`HIPFIRE_QWEN4_QSA_SCORES_RESERVE`), so a growing block count never regrows the shared
     /// F16 scratch (device sync + free + malloc). Default on for exact gfx1201.
@@ -247,6 +364,11 @@ pub struct FeatureFlags {
     /// `Gpu::ensure_mq_signs*`) run on the active stream and wait on it
     /// (`HIPFIRE_STREAM_ORDERED_COPIES`, default on; `=0` restores the null-stream copies).
     pub stream_ordered_copies: bool,
+    /// One Flash-Next lane reset (trunk state, MTP head, pending hidden) enqueues all its
+    /// zero-fills on the steady copy stream and waits on that stream once
+    /// (`HIPFIRE_LANE_RESET_BATCH`; unset or anything but exact `0` is on, `=0` restores one
+    /// `Gpu::memset_stream_ordered` wait per buffer). Same bytes either way.
+    pub lane_reset_batch: bool,
     /// Wide verify (past the 1..=8-row pair kernel) HC read hands its paired write the
     /// gates (`HIPFIRE_QWEN4_HC_PAIR_ALLROWS`): the read's `hyper_norm` output feeds the
     /// write's own k4 gate GEMV right away, so the write skips its identical norm.
@@ -967,6 +1089,43 @@ pub struct FeatureFlags {
     pub qwen4_hc_mix_fill80_gfx1100: bool,
 }
 
+/// `HIPFIRE_QWEN4_MOE_GLUE_FOLD` sub-fold X8a: the owner tile mask (`ep_tile_mask_pm`) is
+/// written by the scatter launch.
+pub const MOE_GLUE_FOLD_MASK: u8 = 0b001;
+/// Sub-fold X8b: the 9..=64-row router and the scatter (and mask) are one launch.
+pub const MOE_GLUE_FOLD_ROUTER: u8 = 0b010;
+/// Sub-fold X8c: the down producer (`qwen4_moe_rotate128_i8`) runs in the gate/up epilogue.
+pub const MOE_GLUE_FOLD_ROTATE: u8 = 0b100;
+
+/// Parse `HIPFIRE_QWEN4_MOE_GLUE_FOLD`: unset and `1` / `true` / `on` select all folds, `0` /
+/// `false` / `off` / empty and anything unrecognised select no fold, otherwise a list of the letters `a`
+/// ([`MOE_GLUE_FOLD_MASK`]), `b` ([`MOE_GLUE_FOLD_ROUTER`]) and `c` ([`MOE_GLUE_FOLD_ROTATE`])
+/// (case-insensitive, `,` / `+` / space separators ignored); any other character voids the whole
+/// value (no fold).
+pub fn parse_moe_glue_fold(raw: Option<&str>) -> u8 {
+    let Some(raw) = raw.map(str::trim) else {
+        return MOE_GLUE_FOLD_MASK | MOE_GLUE_FOLD_ROUTER | MOE_GLUE_FOLD_ROTATE;
+    };
+    match raw {
+        "1" | "true" | "TRUE" | "on" | "ON" => {
+            return MOE_GLUE_FOLD_MASK | MOE_GLUE_FOLD_ROUTER | MOE_GLUE_FOLD_ROTATE
+        }
+        "" | "0" | "false" | "FALSE" | "off" | "OFF" => return 0,
+        _ => {}
+    }
+    let mut mask = 0u8;
+    for ch in raw.chars() {
+        match ch.to_ascii_lowercase() {
+            'a' => mask |= MOE_GLUE_FOLD_MASK,
+            'b' => mask |= MOE_GLUE_FOLD_ROUTER,
+            'c' => mask |= MOE_GLUE_FOLD_ROTATE,
+            ',' | '+' | ' ' => {}
+            _ => return 0,
+        }
+    }
+    mask
+}
+
 /// Built-in default of `experimental.graph.ar` for an architecture on a host
 /// platform. On, except Windows exact gfx1100 (#655): there AR-forward graph
 /// capture/replay silently produces wrong output (token soup on an RX 7900 XTX
@@ -1138,6 +1297,8 @@ impl FeatureFlags {
             qwen4_gdn_i8_fuse: parse_bool("HIPFIRE_QWEN4_GDN_I8_FUSE").unwrap_or(is_gfx1201),
             qwen4_gdn_chain_fuse: parse_bool("HIPFIRE_QWEN4_GDN_CHAIN_FUSE").unwrap_or(is_gfx1201),
             qwen4_gdn_qkv_bf16: parse_bool("HIPFIRE_QWEN4_GDN_QKV_BF16").unwrap_or(false),
+            qwen4_trunk_a8_x4: parse_bool("HIPFIRE_QWEN4_TRUNK_A8_X4").unwrap_or(true),
+            qwen4_trunk_a8_x4_shard: parse_bool("HIPFIRE_QWEN4_TRUNK_A8_X4_SHARD").unwrap_or(true),
             qwen4_hc_fuse: value("HIPFIRE_QWEN4_HC_FUSE")
                 .ok()
                 .and_then(|v| v.trim().parse::<u8>().ok())
@@ -1153,6 +1314,16 @@ impl FeatureFlags {
             qwen4_hc_up_v2: parse_bool("HIPFIRE_QWEN4_HC_UP_V2").unwrap_or(is_gfx1201 || arch == "gfx1151"),
             qwen4_moe_combine_zinit: parse_bool("HIPFIRE_QWEN4_MOE_COMBINE_ZINIT")
                 .unwrap_or(exact_unit_default),
+            qwen4_ffn_clear_absorb: parse_bool("HIPFIRE_QWEN4_FFN_CLEAR_ABSORB")
+                .unwrap_or(is_gfx1201),
+            qwen4_ffn_clear_absorb_rows: parse_bool("HIPFIRE_QWEN4_FFN_CLEAR_ABSORB_ROWS")
+                .unwrap_or(is_gfx1201),
+            qwen4_moe_combine_inline_order: parse_bool("HIPFIRE_QWEN4_MOE_COMBINE_INLINE_ORDER")
+                .unwrap_or(is_gfx1201),
+            qwen4_draft_glue_fold: parse_bool("HIPFIRE_QWEN4_DRAFT_GLUE_FOLD").unwrap_or(is_gfx1201),
+            qwen4_draft_topk8_rows: parse_bool("HIPFIRE_QWEN4_DRAFT_TOPK8_ROWS").unwrap_or(is_gfx1201),
+            qwen4_lane_prepare_async: parse_bool("HIPFIRE_QWEN4_LANE_PREPARE_ASYNC")
+                .unwrap_or(is_gfx1201),
             qwen4_ep_pmask_implicit_zero: parse_bool("HIPFIRE_QWEN4_EP_PMASK_IMPLICIT_ZERO")
                 .unwrap_or(is_gfx1201),
             qwen4_ep_pmask_implicit_zero_poison: parse_bool(
@@ -1165,9 +1336,13 @@ impl FeatureFlags {
                 .unwrap_or(exact_unit_default),
             qwen4_moe_scatter_scan: parse_bool("HIPFIRE_QWEN4_MOE_SCATTER_SCAN")
                 .unwrap_or(is_gfx1201),
+            qwen4_moe_glue_fold: parse_moe_glue_fold(
+                value("HIPFIRE_QWEN4_MOE_GLUE_FOLD").ok().as_deref(),
+            ),
             qwen4_gdn_lanes: parse_bool("HIPFIRE_QWEN4_GDN_LANES").unwrap_or(matches!(arch, "gfx1151" | "gfx1201")),
             qwen4_qsa_lanes: parse_bool("HIPFIRE_QWEN4_QSA_LANES").unwrap_or(arch == "gfx1201"),
             qwen4_gdn_lanes_rows: parse_bool("HIPFIRE_QWEN4_GDN_LANES_ROWS").unwrap_or(true),
+            qwen4_gdn_capture_direct: parse_bool("HIPFIRE_QWEN4_GDN_CAPTURE_DIRECT").unwrap_or(true),
             qwen4_lane_ple_batch: parse_bool("HIPFIRE_QWEN4_LANE_PLE_BATCH").unwrap_or(true),
             qwen4_lane_hc_allrows: parse_bool("HIPFIRE_QWEN4_LANE_HC_ALLROWS").unwrap_or(true),
             qwen4_lane_allrows: parse_bool("HIPFIRE_QWEN4_LANE_ALLROWS").unwrap_or(true),
@@ -1188,12 +1363,25 @@ impl FeatureFlags {
             qwen4_bf16_allrows: parse_bool("HIPFIRE_QWEN4_BF16_ALLROWS").unwrap_or(true),
             qwen4_hc_k4_allrows: parse_bool("HIPFIRE_QWEN4_HC_K4_ALLROWS").unwrap_or(true),
             qwen4_lane_wmma: parse_bool("HIPFIRE_QWEN4_LANE_WMMA").unwrap_or(true),
+            qwen4_prefill_lwmma_dense: parse_bool("HIPFIRE_QWEN4_PREFILL_LWMMA_DENSE")
+                .unwrap_or(true),
+            qwen4_prefill_lwmma_hc: parse_bool("HIPFIRE_QWEN4_PREFILL_LWMMA_HC").unwrap_or(true),
+            qwen4_prefill_lwmma_wave_floor: parse_bool("HIPFIRE_QWEN4_PREFILL_LWMMA_WAVE_FLOOR")
+                .unwrap_or(true),
+            qwen4_wave_head_one: parse_bool("HIPFIRE_QWEN4_WAVE_HEAD_ONE").unwrap_or(true),
+            qwen4_prefill_lwmma_tile: parse_bool("HIPFIRE_QWEN4_PREFILL_LWMMA_TILE").unwrap_or(true),
+            qwen4_lwmma_multi_part: parse_bool("HIPFIRE_QWEN4_LWMMA_MULTI_PART").unwrap_or(true),
+            qwen4_mtp_fc_one_launch: parse_bool("HIPFIRE_QWEN4_MTP_FC_ONE_LAUNCH").unwrap_or(true),
+            qwen4_lane_ple_project: parse_bool("HIPFIRE_QWEN4_LANE_PLE_PROJECT").unwrap_or(true),
             qwen4_hc8: parse_bool("HIPFIRE_QWEN4_HC8").unwrap_or(true),
             ep_ar_fast_apply: parse_bool("HIPFIRE_EP_AR_FAST_APPLY").unwrap_or(true),
+            ep_ar_wide_grid: parse_bool("HIPFIRE_EP_AR_WIDE_GRID").unwrap_or(true),
             qwen4_hc_pair_decode: parse_bool("HIPFIRE_QWEN4_HC_PAIR_DECODE").unwrap_or(true),
+            qwen4_hc_pair_wide: parse_bool("HIPFIRE_QWEN4_HC_PAIR_WIDE").unwrap_or(true),
             qwen4_qsa_scores_reserve: parse_bool("HIPFIRE_QWEN4_QSA_SCORES_RESERVE")
                 .unwrap_or(true),
             stream_ordered_copies: parse_bool("HIPFIRE_STREAM_ORDERED_COPIES").unwrap_or(true),
+            lane_reset_batch: value("HIPFIRE_LANE_RESET_BATCH").ok().as_deref() != Some("0"),
             qwen4_hc_pair_allrows: parse_bool("HIPFIRE_QWEN4_HC_PAIR_ALLROWS").unwrap_or(true),
             qwen4_ple_fuse: parse_bool("HIPFIRE_QWEN4_PLE_FUSE").unwrap_or(exact_unit_default),
             gfx11_iu4_gridspec: parse_bool("HIPFIRE_GFX11_IU4_GRIDSPEC").unwrap_or(true),
@@ -1833,6 +2021,42 @@ impl FeatureFlags {
         self.qwen4_moe_combine_zinit && matches!(self.arch.as_str(), "gfx1151" | "gfx1201")
     }
 
+    /// FFN zero-fill absorb on the wide-verify int8 MoE chain
+    /// (`HIPFIRE_QWEN4_FFN_CLEAR_ABSORB`): exact gfx1201 only.
+    pub fn qwen4_ffn_clear_absorb_enabled(&self) -> bool {
+        self.qwen4_ffn_clear_absorb && self.arch == "gfx1201"
+    }
+
+    /// FFN zero-fill absorb on the few-row epilogue-fused MoE route
+    /// (`HIPFIRE_QWEN4_FFN_CLEAR_ABSORB_ROWS`): exact gfx1201 only.
+    pub fn qwen4_ffn_clear_absorb_rows_enabled(&self) -> bool {
+        self.qwen4_ffn_clear_absorb_rows && self.arch == "gfx1201"
+    }
+
+    /// Inline-order wide-verify combine (`HIPFIRE_QWEN4_MOE_COMBINE_INLINE_ORDER`): exact
+    /// gfx1201 only, default on, `=0` opts out.
+    pub fn qwen4_moe_combine_inline_order_enabled(&self) -> bool {
+        self.qwen4_moe_combine_inline_order && self.arch == "gfx1201"
+    }
+
+    /// MTP draft-head launch-glue fold (`HIPFIRE_QWEN4_DRAFT_GLUE_FOLD`): exact gfx1201 only,
+    /// default on, `0` is the kill switch.
+    pub fn qwen4_draft_glue_fold_enabled(&self) -> bool {
+        self.qwen4_draft_glue_fold && self.arch == "gfx1201"
+    }
+
+    /// MTP draft ranking row batch (`HIPFIRE_QWEN4_DRAFT_TOPK8_ROWS`): exact gfx1201 only,
+    /// default on, `0` is the kill switch.
+    pub fn qwen4_draft_topk8_rows_enabled(&self) -> bool {
+        self.qwen4_draft_topk8_rows && self.arch == "gfx1201"
+    }
+
+    /// Async window prepare of the EP mesh lanes (`HIPFIRE_QWEN4_LANE_PREPARE_ASYNC`): exact
+    /// gfx1201 only, default on, `0` is the kill switch.
+    pub fn qwen4_lane_prepare_async_enabled(&self) -> bool {
+        self.qwen4_lane_prepare_async && self.arch == "gfx1201"
+    }
+
     /// EP partial tile mask implicit zeros (`HIPFIRE_QWEN4_EP_PMASK_IMPLICIT_ZERO`):
     /// exact gfx1201 only.
     pub fn qwen4_ep_pmask_implicit_zero_enabled(&self) -> bool {
@@ -1887,6 +2111,12 @@ impl FeatureFlags {
         self.qwen4_gdn_lanes_rows && self.qwen4_gdn_lanes_enabled() && self.arch == "gfx1201"
     }
 
+    /// Lane-step GDN verify capture written in place (`HIPFIRE_QWEN4_GDN_CAPTURE_DIRECT`).
+    /// Exact gfx1201 only, default on (`=0` kills it).
+    pub fn qwen4_gdn_capture_direct_enabled(&self) -> bool {
+        self.qwen4_gdn_capture_direct && self.arch == "gfx1201"
+    }
+
     /// Lane-batched PLE chain of an AR lane step (`HIPFIRE_QWEN4_LANE_PLE_BATCH`).
     /// Exact gfx1201 only, default off (`=1` enables).
     pub fn qwen4_lane_ple_batch_enabled(&self) -> bool {
@@ -1917,6 +2147,12 @@ impl FeatureFlags {
     /// (`HIPFIRE_QWEN4_LANE_ALLROWS_EXACT`). Exact gfx1201 only, default off.
     pub fn qwen4_lane_allrows_exact_enabled(&self) -> bool {
         self.qwen4_lane_allrows_exact && self.arch == "gfx1201"
+    }
+
+    /// One all-rows LM head for the final rows of an EP prefill wave
+    /// (`HIPFIRE_QWEN4_WAVE_HEAD_ONE`, default on, `=0` kills). Exact gfx1201 only.
+    pub fn qwen4_wave_head_one_enabled(&self) -> bool {
+        self.qwen4_wave_head_one && self.arch == "gfx1201"
     }
 
     /// The sampled lane rows' D2H lands in pinned host memory
@@ -1965,6 +2201,13 @@ impl FeatureFlags {
         !self.qwen4_moe_scatter_scan && self.arch == "gfx1201"
     }
 
+    /// Whether the wave-3 MoE glue fold `bit` ([`MOE_GLUE_FOLD_MASK`], [`MOE_GLUE_FOLD_ROUTER`],
+    /// [`MOE_GLUE_FOLD_ROTATE`]) is selected by `HIPFIRE_QWEN4_MOE_GLUE_FOLD`: exact gfx1201 only,
+    /// default off.
+    pub fn qwen4_moe_glue_fold_enabled(&self, bit: u8) -> bool {
+        self.qwen4_moe_glue_fold & bit != 0 && self.arch == "gfx1201"
+    }
+
     pub fn qwen4_decode_zba_x3_enabled(&self) -> bool {
         self.qwen4_decode_zba_x3 && self.arch == "gfx1151"
     }
@@ -2001,6 +2244,61 @@ impl FeatureFlags {
         self.qwen4_lane_wmma && self.arch == "gfx1201"
     }
 
+    /// Dense BF16 prefill GEMMs above `WIDE_VERIFY_MAX_ROWS` (below the F16 WMMA threshold) on
+    /// the lane WMMA kernels (`HIPFIRE_QWEN4_PREFILL_LWMMA_DENSE`, default on, `=0` kills it).
+    /// Needs the lane WMMA gate ([`Self::qwen4_lane_wmma_enabled`]: exact gfx1201, not killed).
+    pub fn qwen4_prefill_lwmma_dense_enabled(&self) -> bool {
+        self.qwen4_prefill_lwmma_dense && self.qwen4_lane_wmma_enabled()
+    }
+
+    /// HC read down/up projections above `WIDE_VERIFY_MAX_ROWS` (below the F16 WMMA threshold)
+    /// on the lane WMMA kernels (`HIPFIRE_QWEN4_PREFILL_LWMMA_HC`, default on, `=0` kills it).
+    /// Same gate as [`Self::qwen4_prefill_lwmma_dense_enabled`].
+    pub fn qwen4_prefill_lwmma_hc_enabled(&self) -> bool {
+        self.qwen4_prefill_lwmma_hc && self.qwen4_lane_wmma_enabled()
+    }
+
+    /// `HIPFIRE_QWEN4_PREFILL_LWMMA_WAVE_FLOOR` as the lane WMMA prefill floor of an EP prefill
+    /// WAVE: [`QWEN4_PREFILL_LWMMA_WAVE_FLOOR_ROWS`] when the flag and both prefill lane WMMA
+    /// entries are enabled (the floor routes the call to both the dense and the HC entry), else
+    /// `WIDE_VERIFY_MAX_ROWS + 1` (no row below 65 is ever moved off its decode-shaped arm).
+    /// Singleton chunks never read it.
+    pub fn qwen4_prefill_lwmma_floor_knob(&self) -> usize {
+        if self.qwen4_prefill_lwmma_wave_floor
+            && self.qwen4_prefill_lwmma_dense_enabled()
+            && self.qwen4_prefill_lwmma_hc_enabled()
+        {
+            QWEN4_PREFILL_LWMMA_WAVE_FLOOR_ROWS
+        } else {
+            crate::prefill_invariant::WIDE_VERIFY_MAX_ROWS + 1
+        }
+    }
+
+    /// Prefill lane-WMMA GEMMs on the staged-tile kernel (`HIPFIRE_QWEN4_PREFILL_LWMMA_TILE`, default
+    /// on, `=0` kills it): bitwise the shipped kernel. Same gate as
+    /// [`Self::qwen4_prefill_lwmma_dense_enabled`].
+    pub fn qwen4_prefill_lwmma_tile_enabled(&self) -> bool {
+        self.qwen4_prefill_lwmma_tile && self.qwen4_lane_wmma_enabled()
+    }
+
+    /// Multi-part lane-WMMA launches (`HIPFIRE_QWEN4_LWMMA_MULTI_PART`, default on, `=0` kills): needs the
+    /// lane-WMMA route itself ([`Self::qwen4_lane_wmma_enabled`]), exact gfx1201.
+    pub fn qwen4_lwmma_multi_part_enabled(&self) -> bool {
+        self.qwen4_lwmma_multi_part && self.qwen4_lane_wmma_enabled()
+    }
+    /// One-launch MTP fc_hidden projection over all `lanes * hc` branch rows
+    /// (`HIPFIRE_QWEN4_MTP_FC_ONE_LAUNCH`, default on, `=0` kills it). Exact gfx1201 only. Bitwise
+    /// the eight-row-chunk launches' outputs.
+    pub fn qwen4_mtp_fc_one_launch_enabled(&self) -> bool {
+        self.qwen4_mtp_fc_one_launch && self.arch == "gfx1201"
+    }
+
+    /// Lane-wide PLE projection (`HIPFIRE_QWEN4_LANE_PLE_PROJECT`, default on, `=0` kills it).
+    /// Exact gfx1201 only.
+    pub fn qwen4_lane_ple_project_enabled(&self) -> bool {
+        self.qwen4_lane_ple_project && self.arch == "gfx1201"
+    }
+
     /// E4M3 HC mixer sidecar (`HIPFIRE_QWEN4_HC8`, default on, `=0` kills it). Exact gfx1201
     /// only: the PeaceMaker `hc8_wmma_pm_gfx1201` module has no other target.
     pub fn qwen4_hc8_enabled(&self) -> bool {
@@ -2013,10 +2311,23 @@ impl FeatureFlags {
         self.ep_ar_fast_apply && self.arch == "gfx1201"
     }
 
+    /// EP2 AR wide launch grid (`HIPFIRE_EP_AR_WIDE_GRID`, default on, `=0` kills it). Exact
+    /// gfx1201 only (the only arch with the kernel).
+    pub fn ep_ar_wide_grid_enabled(&self) -> bool {
+        self.ep_ar_wide_grid && self.arch == "gfx1201"
+    }
+
     /// Decode HC read norm + paired write k4 gate GEMV in one launch
     /// (`HIPFIRE_QWEN4_HC_PAIR_DECODE`, default on, `=0` kills it). Exact gfx1201 only.
     pub fn qwen4_hc_pair_decode_enabled(&self) -> bool {
         self.qwen4_hc_pair_decode && self.arch == "gfx1201"
+    }
+
+    /// Fused HC read norm + paired write gates at 9..=64 verify rows
+    /// (`HIPFIRE_QWEN4_HC_PAIR_WIDE`, default on, `=0` kills it); needs the decode flag.
+    /// Exact gfx1201 only.
+    pub fn qwen4_hc_pair_wide_enabled(&self) -> bool {
+        self.qwen4_hc_pair_wide && self.qwen4_hc_pair_decode_enabled()
     }
 
     /// QSA select score scratch reserved at the shape bound
@@ -2171,18 +2482,28 @@ impl FeatureFlags {
             qwen4_gdn_i8_fuse: false,
             qwen4_gdn_chain_fuse: false,
             qwen4_gdn_qkv_bf16: false,
+            qwen4_trunk_a8_x4: false,
+            qwen4_trunk_a8_x4_shard: false,
             qwen4_hc_fuse: 0,
             qwen4_hc_up_tile: false,
             qwen4_hc_up_v2: false,
             qwen4_moe_combine_zinit: false,
+            qwen4_ffn_clear_absorb: false,
+            qwen4_ffn_clear_absorb_rows: false,
+            qwen4_moe_combine_inline_order: false,
+            qwen4_draft_glue_fold: false,
+            qwen4_draft_topk8_rows: false,
+            qwen4_lane_prepare_async: false,
             qwen4_ep_pmask_implicit_zero: false,
             qwen4_ep_pmask_implicit_zero_poison: false,
             qwen4_hc_row_fold: false,
             qwen4_router_fast: false,
             qwen4_moe_scatter_scan: false,
+            qwen4_moe_glue_fold: 0,
             qwen4_gdn_lanes: false,
             qwen4_qsa_lanes: false,
             qwen4_gdn_lanes_rows: false,
+            qwen4_gdn_capture_direct: false,
             qwen4_lane_ple_batch: false,
             qwen4_lane_hc_allrows: false,
             qwen4_lane_allrows: false,
@@ -2199,11 +2520,22 @@ impl FeatureFlags {
             qwen4_bf16_allrows: false,
             qwen4_hc_k4_allrows: false,
             qwen4_lane_wmma: false,
+            qwen4_prefill_lwmma_dense: false,
+            qwen4_prefill_lwmma_hc: false,
+            qwen4_prefill_lwmma_wave_floor: false,
+            qwen4_wave_head_one: false,
+            qwen4_prefill_lwmma_tile: false,
+            qwen4_lwmma_multi_part: false,
+            qwen4_mtp_fc_one_launch: false,
+            qwen4_lane_ple_project: false,
             qwen4_hc8: false,
             ep_ar_fast_apply: false,
+            ep_ar_wide_grid: false,
             qwen4_hc_pair_decode: false,
+            qwen4_hc_pair_wide: false,
             qwen4_qsa_scores_reserve: false,
             stream_ordered_copies: false,
+            lane_reset_batch: false,
             qwen4_hc_pair_allrows: false,
             qwen4_ple_fuse: false,
             gfx11_iu4_gridspec: false,
@@ -2667,6 +2999,40 @@ mod tests {
             });
             assert_eq!(flags.fn_gdn_dense_scan, expected);
         }
+    }
+
+    #[test]
+    fn wave_head_one_defaults_on_exact_gfx1201_and_zero_kills() {
+        let on = |arch: &str, raw: Option<&'static str>| {
+            FeatureFlags::from_lookup(arch, |name| match raw {
+                Some(v) if name == "HIPFIRE_QWEN4_WAVE_HEAD_ONE" => Ok(v.into()),
+                _ => Err(()),
+            })
+            .qwen4_wave_head_one_enabled()
+        };
+        assert!(on("gfx1201", None));
+        assert!(on("gfx1201", Some("1")));
+        assert!(!on("gfx1201", Some("0")));
+        assert!(!on("gfx1100", None));
+    }
+
+    #[test]
+    fn prefill_lwmma_wave_floor_defaults_on_and_zero_kills() {
+        let off = crate::prefill_invariant::WIDE_VERIFY_MAX_ROWS + 1;
+        let knob = |wave: Option<&str>, dense: Option<&str>| {
+            FeatureFlags::from_lookup("gfx1201", |name| match (name, wave, dense) {
+                ("HIPFIRE_QWEN4_PREFILL_LWMMA_WAVE_FLOOR", Some(v), _) => Ok(v.into()),
+                ("HIPFIRE_QWEN4_PREFILL_LWMMA_DENSE", _, Some(v)) => Ok(v.into()),
+                _ => Err(()),
+            })
+            .qwen4_prefill_lwmma_floor_knob()
+        };
+        assert_eq!(knob(None, None), QWEN4_PREFILL_LWMMA_WAVE_FLOOR_ROWS);
+        assert_eq!(knob(Some("1"), None), QWEN4_PREFILL_LWMMA_WAVE_FLOOR_ROWS);
+        assert_eq!(knob(Some("0"), None), off);
+        assert_eq!(knob(None, Some("0")), off);
+        let other = FeatureFlags::from_lookup("gfx1100", |_| Err(()));
+        assert_eq!(other.qwen4_prefill_lwmma_floor_knob(), off);
     }
 
     #[test]
@@ -3241,6 +3607,149 @@ mod tests {
         }
     }
 
+    /// The FFN clear absorb is default on (`=0` kills) and reaches exact gfx1201 only.
+    #[test]
+    fn qwen4_ffn_clear_absorb_flag_is_default_on_and_exact_gfx1201() {
+        let with = |value: &'static str| {
+            move |name: &str| -> std::result::Result<String, ()> {
+                if name == "HIPFIRE_QWEN4_FFN_CLEAR_ABSORB" {
+                    Ok(value.into())
+                } else {
+                    Err(())
+                }
+            }
+        };
+        for arch in ["gfx1100", "gfx1151", "gfx1200", "gfx1201", "gfx942"] {
+            let exact = arch == "gfx1201";
+            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+            assert_eq!(unset.qwen4_ffn_clear_absorb_enabled(), exact, "{arch}");
+            let killed = FeatureFlags::from_lookup(arch, with("0"));
+            assert!(!killed.qwen4_ffn_clear_absorb_enabled(), "{arch}");
+            let forced = FeatureFlags::from_lookup(arch, with("1"));
+            assert_eq!(forced.qwen4_ffn_clear_absorb_enabled(), exact, "{arch}");
+        }
+    }
+
+    /// The few-row FFN clear absorb is opt-in (`=1` enables) and reaches exact gfx1201 only.
+    #[test]
+    fn qwen4_ffn_clear_absorb_rows_flag_is_default_on_exact_gfx1201_with_kill() {
+        let with = |value: &'static str| {
+            move |name: &str| -> std::result::Result<String, ()> {
+                if name == "HIPFIRE_QWEN4_FFN_CLEAR_ABSORB_ROWS" {
+                    Ok(value.into())
+                } else {
+                    Err(())
+                }
+            }
+        };
+        for arch in ["gfx1100", "gfx1151", "gfx1200", "gfx1201", "gfx942"] {
+            let exact = arch == "gfx1201";
+            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+            assert_eq!(unset.qwen4_ffn_clear_absorb_rows_enabled(), exact, "{arch}");
+            let off = FeatureFlags::from_lookup(arch, with("0"));
+            assert!(!off.qwen4_ffn_clear_absorb_rows_enabled(), "{arch}");
+            let on = FeatureFlags::from_lookup(arch, with("1"));
+            assert_eq!(on.qwen4_ffn_clear_absorb_rows_enabled(), exact, "{arch}");
+        }
+    }
+
+    /// The inline-order wide-verify combine is default on for exact gfx1201 only; `0` opts out
+    /// and other arches stay off even when forced with `1`.
+    #[test]
+    fn qwen4_moe_combine_inline_order_defaults_on_exact_gfx1201() {
+        let with = |value: &'static str| {
+            move |key: &str| -> std::result::Result<String, ()> {
+                if key == "HIPFIRE_QWEN4_MOE_COMBINE_INLINE_ORDER" {
+                    Ok(value.into())
+                } else {
+                    Err(())
+                }
+            }
+        };
+        for arch in ["gfx1100", "gfx1151", "gfx1200", "gfx1201", "gfx942"] {
+            let exact = arch == "gfx1201";
+            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+            assert_eq!(
+                unset.qwen4_moe_combine_inline_order_enabled(),
+                exact,
+                "{arch}"
+            );
+            let off = FeatureFlags::from_lookup(arch, with("0"));
+            assert!(!off.qwen4_moe_combine_inline_order_enabled(), "{arch}");
+            let on = FeatureFlags::from_lookup(arch, with("1"));
+            assert_eq!(on.qwen4_moe_combine_inline_order_enabled(), exact, "{arch}");
+        }
+    }
+
+    /// The MTP draft glue fold is default on (`=0` kills) and reaches exact gfx1201 only.
+    #[test]
+    fn qwen4_draft_glue_fold_is_default_on_exact_gfx1201() {
+        let with = |value: &'static str| {
+            move |key: &str| -> std::result::Result<String, ()> {
+                if key == "HIPFIRE_QWEN4_DRAFT_GLUE_FOLD" {
+                    Ok(value.into())
+                } else {
+                    Err(())
+                }
+            }
+        };
+        for arch in ["gfx1100", "gfx1151", "gfx1200", "gfx1201", "gfx942"] {
+            let exact = arch == "gfx1201";
+            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+            assert_eq!(unset.qwen4_draft_glue_fold_enabled(), exact, "{arch}");
+            let off = FeatureFlags::from_lookup(arch, with("0"));
+            assert!(!off.qwen4_draft_glue_fold_enabled(), "{arch}");
+            let on = FeatureFlags::from_lookup(arch, with("1"));
+            assert_eq!(on.qwen4_draft_glue_fold_enabled(), exact, "{arch}");
+        }
+    }
+
+    /// The draft ranking row batch is default on (`=0` kills) and reaches exact gfx1201 only.
+    #[test]
+    fn qwen4_draft_topk8_rows_is_default_on_exact_gfx1201() {
+        let with = |value: &'static str| {
+            move |key: &str| -> std::result::Result<String, ()> {
+                if key == "HIPFIRE_QWEN4_DRAFT_TOPK8_ROWS" {
+                    Ok(value.into())
+                } else {
+                    Err(())
+                }
+            }
+        };
+        for arch in ["gfx1100", "gfx1151", "gfx1200", "gfx1201", "gfx942"] {
+            let exact = arch == "gfx1201";
+            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+            assert_eq!(unset.qwen4_draft_topk8_rows_enabled(), exact, "{arch}");
+            let off = FeatureFlags::from_lookup(arch, with("0"));
+            assert!(!off.qwen4_draft_topk8_rows_enabled(), "{arch}");
+            let on = FeatureFlags::from_lookup(arch, with("1"));
+            assert_eq!(on.qwen4_draft_topk8_rows_enabled(), exact, "{arch}");
+        }
+    }
+
+    /// The async lane prepare is default on (`=0` kills) and reaches exact gfx1201 only.
+    #[test]
+    fn qwen4_lane_prepare_async_is_default_on_exact_gfx1201() {
+        let with = |value: &'static str| {
+            move |key: &str| -> std::result::Result<String, ()> {
+                if key == "HIPFIRE_QWEN4_LANE_PREPARE_ASYNC" {
+                    Ok(value.into())
+                } else {
+                    Err(())
+                }
+            }
+        };
+        for arch in ["gfx1100", "gfx1151", "gfx1200", "gfx1201", "gfx942"] {
+            let exact = arch == "gfx1201";
+            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+            assert_eq!(unset.qwen4_lane_prepare_async_enabled(), exact, "{arch}");
+            let off = FeatureFlags::from_lookup(arch, with("0"));
+            assert!(!off.qwen4_lane_prepare_async_enabled(), "{arch}");
+            let on = FeatureFlags::from_lookup(arch, with("1"));
+            assert_eq!(on.qwen4_lane_prepare_async_enabled(), exact, "{arch}");
+        }
+    }
+
     /// The lane-batched PLE chain is default on (`=0` kills) and reaches exact gfx1201 only.
     #[test]
     fn qwen4_lane_ple_batch_flag_is_default_on_and_exact_gfx1201() {
@@ -3511,6 +4020,52 @@ mod tests {
         }
     }
 
+    /// The wave-3 glue fold is default on (all of a/b/c): unset and `1` name all, letters name
+    /// subsets, `0` / empty / unrecognised kill it, and only exact gfx1201 reports any as enabled.
+    #[test]
+    fn qwen4_moe_glue_fold_defaults_on_exact_gfx1201() {
+        assert_eq!(parse_moe_glue_fold(None), 0b111);
+        assert_eq!(parse_moe_glue_fold(Some("0")), 0);
+        assert_eq!(parse_moe_glue_fold(Some("")), 0);
+        assert_eq!(parse_moe_glue_fold(Some("2")), 0);
+        assert_eq!(parse_moe_glue_fold(Some("1")), 0b111);
+        assert_eq!(parse_moe_glue_fold(Some("a")), MOE_GLUE_FOLD_MASK);
+        assert_eq!(
+            parse_moe_glue_fold(Some("a,b")),
+            MOE_GLUE_FOLD_MASK | MOE_GLUE_FOLD_ROUTER
+        );
+        assert_eq!(parse_moe_glue_fold(Some("C")), MOE_GLUE_FOLD_ROTATE);
+        assert_eq!(parse_moe_glue_fold(Some("abx")), 0);
+        for arch in ["gfx1100", "gfx1151", "gfx1200", "gfx1201", "gfx942"] {
+            let exact = arch == "gfx1201";
+            let with = |v: &'static str| {
+                FeatureFlags::from_lookup(arch, move |n| match n {
+                    "HIPFIRE_QWEN4_MOE_GLUE_FOLD" => Ok(v.into()),
+                    _ => Err(()),
+                })
+            };
+            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+            for bit in [
+                MOE_GLUE_FOLD_MASK,
+                MOE_GLUE_FOLD_ROUTER,
+                MOE_GLUE_FOLD_ROTATE,
+            ] {
+                assert_eq!(unset.qwen4_moe_glue_fold_enabled(bit), exact, "{arch}");
+                assert!(!with("0").qwen4_moe_glue_fold_enabled(bit), "{arch}");
+                assert_eq!(with("1").qwen4_moe_glue_fold_enabled(bit), exact, "{arch}");
+            }
+            assert_eq!(
+                with("a").qwen4_moe_glue_fold_enabled(MOE_GLUE_FOLD_MASK),
+                exact,
+                "{arch}"
+            );
+            assert!(
+                !with("a").qwen4_moe_glue_fold_enabled(MOE_GLUE_FOLD_ROUTER),
+                "{arch}"
+            );
+        }
+    }
+
     /// The decode MoE head fusion defaults on for exact gfx1151 only; `0` turns it off.
     #[test]
     fn qwen4_decode_head_fuse_defaults_on_exact_gfx1151() {
@@ -3668,6 +4223,170 @@ mod tests {
         assert!(!FeatureFlags::for_test("gfx1201").qwen4_lane_wmma_enabled());
     }
 
+    /// The prefill lane WMMA knobs are default on (`=0` kills each) and reach exact gfx1201
+    /// only; `HIPFIRE_QWEN4_LANE_WMMA=0` kills both too.
+    #[test]
+    fn qwen4_prefill_lwmma_flags_default_on_exact_gfx1201() {
+        let with = |name: &'static str, value: &'static str| {
+            move |n: &str| -> std::result::Result<String, ()> {
+                if n == name {
+                    Ok(value.into())
+                } else {
+                    Err(())
+                }
+            }
+        };
+        for arch in [
+            "gfx906", "gfx1100", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
+        ] {
+            let exact = arch == "gfx1201";
+            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+            assert_eq!(
+                unset.qwen4_prefill_lwmma_dense_enabled(),
+                exact,
+                "{arch}: dense unset"
+            );
+            assert_eq!(
+                unset.qwen4_prefill_lwmma_hc_enabled(),
+                exact,
+                "{arch}: hc unset"
+            );
+            let dense_off =
+                FeatureFlags::from_lookup(arch, with("HIPFIRE_QWEN4_PREFILL_LWMMA_DENSE", "0"));
+            assert!(
+                !dense_off.qwen4_prefill_lwmma_dense_enabled(),
+                "{arch}: dense 0"
+            );
+            assert_eq!(
+                dense_off.qwen4_prefill_lwmma_hc_enabled(),
+                exact,
+                "{arch}: hc kept"
+            );
+            let hc_off =
+                FeatureFlags::from_lookup(arch, with("HIPFIRE_QWEN4_PREFILL_LWMMA_HC", "0"));
+            assert!(!hc_off.qwen4_prefill_lwmma_hc_enabled(), "{arch}: hc 0");
+            assert_eq!(
+                hc_off.qwen4_prefill_lwmma_dense_enabled(),
+                exact,
+                "{arch}: dense kept"
+            );
+            let lane_off = FeatureFlags::from_lookup(arch, with("HIPFIRE_QWEN4_LANE_WMMA", "0"));
+            assert!(
+                !lane_off.qwen4_prefill_lwmma_dense_enabled(),
+                "{arch}: lane 0 dense"
+            );
+            assert!(
+                !lane_off.qwen4_prefill_lwmma_hc_enabled(),
+                "{arch}: lane 0 hc"
+            );
+        }
+        let t = FeatureFlags::for_test("gfx1201");
+        assert!(!t.qwen4_prefill_lwmma_dense_enabled());
+        assert!(!t.qwen4_prefill_lwmma_hc_enabled());
+    }
+
+    /// The prefill lwmma tile knob is default on (`=0` kills it) and reaches exact gfx1201 only;
+    /// `HIPFIRE_QWEN4_LANE_WMMA=0` kills it too and the dense / HC knobs do not.
+    #[test]
+    fn qwen4_prefill_lwmma_tile_flag_default_on_exact_gfx1201() {
+        let with = |name: &'static str, value: &'static str| {
+            move |n: &str| -> std::result::Result<String, ()> {
+                if n == name {
+                    Ok(value.into())
+                } else {
+                    Err(())
+                }
+            }
+        };
+        for arch in [
+            "gfx906", "gfx1100", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
+        ] {
+            let exact = arch == "gfx1201";
+            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+            assert_eq!(
+                unset.qwen4_prefill_lwmma_tile_enabled(),
+                exact,
+                "{arch}: unset"
+            );
+            let off =
+                FeatureFlags::from_lookup(arch, with("HIPFIRE_QWEN4_PREFILL_LWMMA_TILE", "0"));
+            assert!(!off.qwen4_prefill_lwmma_tile_enabled(), "{arch}: tile 0");
+            assert_eq!(
+                off.qwen4_prefill_lwmma_dense_enabled(),
+                exact,
+                "{arch}: dense kept"
+            );
+            assert_eq!(
+                off.qwen4_prefill_lwmma_hc_enabled(),
+                exact,
+                "{arch}: hc kept"
+            );
+            let on = FeatureFlags::from_lookup(arch, with("HIPFIRE_QWEN4_PREFILL_LWMMA_TILE", "1"));
+            assert_eq!(
+                on.qwen4_prefill_lwmma_tile_enabled(),
+                exact,
+                "{arch}: tile 1"
+            );
+            let dense_off =
+                FeatureFlags::from_lookup(arch, with("HIPFIRE_QWEN4_PREFILL_LWMMA_DENSE", "0"));
+            assert_eq!(
+                dense_off.qwen4_prefill_lwmma_tile_enabled(),
+                exact,
+                "{arch}: dense 0"
+            );
+            let lane_off = FeatureFlags::from_lookup(arch, with("HIPFIRE_QWEN4_LANE_WMMA", "0"));
+            assert!(
+                !lane_off.qwen4_prefill_lwmma_tile_enabled(),
+                "{arch}: lane 0"
+            );
+        }
+        assert!(!FeatureFlags::for_test("gfx1201").qwen4_prefill_lwmma_tile_enabled());
+    }
+
+    /// The MTP one-launch fc_hidden and lane PLE project flags are default on (`=0` kills) and
+    /// reach exact gfx1201 only.
+    #[test]
+    fn qwen4_mtp_fc_and_lane_ple_flags_default_on_exact_gfx1201() {
+        for arch in [
+            "gfx906", "gfx1100", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
+        ] {
+            for name in [
+                "HIPFIRE_QWEN4_MTP_FC_ONE_LAUNCH",
+                "HIPFIRE_QWEN4_LANE_PLE_PROJECT",
+            ] {
+                let with = |value: &'static str| {
+                    move |n: &str| -> std::result::Result<String, ()> {
+                        if n == name {
+                            Ok(value.into())
+                        } else {
+                            Err(())
+                        }
+                    }
+                };
+                let get = |f: &FeatureFlags| {
+                    if name == "HIPFIRE_QWEN4_MTP_FC_ONE_LAUNCH" {
+                        f.qwen4_mtp_fc_one_launch_enabled()
+                    } else {
+                        f.qwen4_lane_ple_project_enabled()
+                    }
+                };
+                let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+                assert_eq!(get(&unset), arch == "gfx1201", "{name} {arch}: unset");
+                assert!(
+                    !get(&FeatureFlags::from_lookup(arch, with("0"))),
+                    "{name} {arch}: 0"
+                );
+                assert_eq!(
+                    get(&FeatureFlags::from_lookup(arch, with("1"))),
+                    arch == "gfx1201",
+                    "{name} {arch}: 1"
+                );
+            }
+        }
+        let t = FeatureFlags::for_test("gfx1201");
+        assert!(!t.qwen4_mtp_fc_one_launch_enabled() && !t.qwen4_lane_ple_project_enabled());
+    }
+
     /// The HC8 sidecar route is default on (`=0` kills) and reaches exact gfx1201 only.
     #[test]
     fn qwen4_hc8_flag_is_default_on_and_exact_gfx1201() {
@@ -3730,6 +4449,33 @@ mod tests {
         assert!(!FeatureFlags::for_test("gfx1201").ep_ar_fast_apply_enabled());
     }
 
+    /// The EP2 AR wide grid is default on (`=0` kills) and reaches exact gfx1201 only.
+    #[test]
+    fn ep_ar_wide_grid_defaults_on_exact_gfx1201() {
+        let with = |value: &'static str| {
+            move |n: &str| -> std::result::Result<String, ()> {
+                if n == "HIPFIRE_EP_AR_WIDE_GRID" {
+                    Ok(value.into())
+                } else {
+                    Err(())
+                }
+            }
+        };
+        for arch in [
+            "gfx906", "gfx1100", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
+        ] {
+            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+            assert_eq!(
+                unset.ep_ar_wide_grid_enabled(),
+                arch == "gfx1201",
+                "{arch}: unset"
+            );
+            let off = FeatureFlags::from_lookup(arch, with("0"));
+            assert!(!off.ep_ar_wide_grid_enabled(), "{arch}: 0");
+        }
+        assert!(!FeatureFlags::for_test("gfx1201").ep_ar_wide_grid_enabled());
+    }
+
     /// The decode HC read/write pair fusion is default on (`=0` kills) and reaches exact gfx1201 only.
     #[test]
     fn qwen4_hc_pair_decode_defaults_on_exact_gfx1201() {
@@ -3763,6 +4509,29 @@ mod tests {
         assert!(!FeatureFlags::for_test("gfx1201").qwen4_hc_pair_decode_enabled());
     }
 
+    /// The lane reset batch is on unless the value is exactly `0`.
+    #[test]
+    fn lane_reset_batch_is_on_unless_exact_zero() {
+        let with = |value: &'static str| {
+            move |n: &str| -> std::result::Result<String, ()> {
+                if n == "HIPFIRE_LANE_RESET_BATCH" {
+                    Ok(value.into())
+                } else {
+                    Err(())
+                }
+            }
+        };
+        assert!(FeatureFlags::from_lookup("gfx1201", |_| Err(())).lane_reset_batch);
+        assert!(!FeatureFlags::from_lookup("gfx1201", with("0")).lane_reset_batch);
+        for value in ["1", "true", "off", "false", "00", " 0", ""] {
+            assert!(
+                FeatureFlags::from_lookup("gfx1201", with(value)).lane_reset_batch,
+                "{value:?}"
+            );
+        }
+        assert!(!FeatureFlags::for_test("gfx1201").lane_reset_batch);
+    }
+
     /// The QSA score reserve is default on (`=0` kills) and reaches exact gfx1201 only.
     #[test]
     fn qwen4_qsa_scores_reserve_defaults_on_exact_gfx1201() {
@@ -3794,6 +4563,33 @@ mod tests {
             );
         }
         assert!(!FeatureFlags::for_test("gfx1201").qwen4_qsa_scores_reserve_enabled());
+    }
+
+    /// The wide fused HC pair is default on (`=0` kills) and reaches exact gfx1201 only.
+    #[test]
+    fn qwen4_hc_pair_wide_defaults_on_exact_gfx1201() {
+        let with = |name: &'static str, value: &'static str| {
+            move |n: &str| -> std::result::Result<String, ()> {
+                if n == name {
+                    Ok(value.into())
+                } else {
+                    Err(())
+                }
+            }
+        };
+        for arch in ["gfx906", "gfx1100", "gfx1151", "gfx1200", "gfx1201"] {
+            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+            assert_eq!(
+                unset.qwen4_hc_pair_wide_enabled(),
+                arch == "gfx1201",
+                "{arch}"
+            );
+            let off = FeatureFlags::from_lookup(arch, with("HIPFIRE_QWEN4_HC_PAIR_WIDE", "0"));
+            assert!(!off.qwen4_hc_pair_wide_enabled(), "{arch}: 0");
+        }
+        let decode_off =
+            FeatureFlags::from_lookup("gfx1201", with("HIPFIRE_QWEN4_HC_PAIR_DECODE", "0"));
+        assert!(!decode_off.qwen4_hc_pair_wide_enabled());
     }
 
     /// The wide-verify HC read/write gate pairing is default on (`=0` kills) and reaches exact gfx1201 only.
@@ -5496,6 +6292,39 @@ mod tests {
                 flags(arch, None, Some("1")).qwen4_gdn_lanes_rows_enabled(),
                 exact
             );
+        }
+    }
+
+    /// `HIPFIRE_QWEN4_GDN_CAPTURE_DIRECT`: exact gfx1201 only, default on, `=0` kills it; no
+    /// other arch ever enables it, whatever the value.
+    #[test]
+    fn gdn_capture_direct_is_default_on_gfx1201_only() {
+        let flags = |arch: &str, value: Option<&str>| {
+            FeatureFlags::from_lookup(arch, |name| match (name, value) {
+                ("HIPFIRE_QWEN4_GDN_CAPTURE_DIRECT", Some(v)) => Ok(v.to_owned()),
+                _ => Err(()),
+            })
+        };
+        for arch in ["gfx1201", "gfx1151", "gfx1100", "gfx942", "gfx1201:xnack-"] {
+            let exact = arch == "gfx1201";
+            assert_eq!(
+                flags(arch, None).qwen4_gdn_capture_direct_enabled(),
+                exact,
+                "{arch}: unset"
+            );
+            for on in ["1", "true", "on"] {
+                assert_eq!(
+                    flags(arch, Some(on)).qwen4_gdn_capture_direct_enabled(),
+                    exact,
+                    "{arch}: {on}"
+                );
+            }
+            for off in ["0", "false", "off"] {
+                assert!(
+                    !flags(arch, Some(off)).qwen4_gdn_capture_direct_enabled(),
+                    "{arch}: {off}"
+                );
+            }
         }
     }
 

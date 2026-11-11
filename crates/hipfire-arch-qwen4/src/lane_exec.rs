@@ -31,7 +31,7 @@
 //!    every `ArSynced` lane, then each prefill tile through the singleton
 //!    chunk program on the lane's own state (an MTP lane's tile also fills
 //!    its head; under `HIPFIRE_EP_LANE_PREFILL_WAVE_EXACT=1` on an EP forward the
-//!    49..=511-row lane tiles of a burst are forwarded together as exact prefill
+//!    65..=511-row lane tiles of a burst are forwarded together as exact prefill
 //!    waves, [`plan_prefill_parts`]). A pure-decode step's wall clock (draft start to the final
 //!    sync) feeds the store's cost model, then every MTP lane's window
 //!    policy observes its window.
@@ -135,7 +135,7 @@ use std::time::Instant;
 /// `HIPFIRE_CB_PHASES=1` (developer diagnostic, read once; the serve step line of the same name
 /// lives in `hipfire-generate`): one `[fn-lane-tile]` stderr line per lane prefill tile, with the
 /// tile's synchronized wall and the route it took (`run_prefill_tiles`).
-static LANE_TILE_PHASES: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+pub(crate) static LANE_TILE_PHASES: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     hipfire_config::developer_var("HIPFIRE_CB_PHASES").is_ok_and(|v| v.trim() == "1")
 });
 
@@ -818,14 +818,14 @@ impl Qwen4LaneExecutor<'_> {
     }
 
     fn provision_step_local(&mut self, gpu: &mut Gpu, plan: &BatchStepPlan) -> Result<(), String> {
-        let ends = {
+        let (ends, reclaim) = {
             let bundle: &Qwen4Bundle = &*self.bundle;
             let store = bundle
                 .lanes
                 .as_ref()
                 .ok_or_else(|| "Qwen4 lanes are not staged".to_string())?;
             store.phase.check_idle()?;
-            validate_plan(
+            let ends = validate_plan(
                 plan,
                 PlanLimits {
                     max_lanes: store.max_lanes(),
@@ -833,8 +833,17 @@ impl Qwen4LaneExecutor<'_> {
                 },
                 |epoch| store.lane(epoch).map(view_of),
                 |host| bundle.lane_prefill_tile_len(&host.prompt, host.prefilled),
-            )?
+            )?;
+            let reclaim = bundle.elastic_active()
+                && elastic_step_needs_reclaim(bundle, gpu, store, plan, &ends);
+            (ends, reclaim)
         };
+        // The elastic reserve's rank-local backstop: a step that builds the long-prefill caches or
+        // maps lane pages past the charge needs the bank's memory back first. Ranks run the same
+        // plan, so they reclaim in lockstep; a failure is logged and the bank stays in place.
+        if reclaim {
+            self.bundle.elastic_reclaim_logged(gpu, "prefill");
+        }
         let mut store = self
             .bundle
             .lanes
@@ -1040,6 +1049,28 @@ impl Qwen4LaneExecutor<'_> {
 pub(crate) fn pick_at(host: &[u8], row: usize) -> u32 {
     let b = &host[row * 4..row * 4 + 4];
     u32::from_ne_bytes([b[0], b[1], b[2], b[3]])
+}
+
+/// Whether the step takes memory the elastic bank holds: a prefill tile whose GEMM route rows
+/// reach the F16 shadow floor (it builds the long-prefill caches; `Gpu::route_rows` honours the EP
+/// wave cap, so a sub-512-row lane wave never qualifies), or a lane mapping new context pages past
+/// the load-time charge. Plain host reads.
+fn elastic_step_needs_reclaim(
+    bundle: &Qwen4Bundle,
+    gpu: &Gpu,
+    store: &Qwen4LaneStore,
+    plan: &BatchStepPlan,
+    ends: &[usize],
+) -> bool {
+    let charge = bundle.lane_charge_rows(gpu);
+    plan.requests.iter().zip(ends).any(|(r, &end)| {
+        (r.kind == RequestStepKind::Prefill
+            && crate::lane::pages::long_prefill_route_rows(gpu.route_rows(r.rows.len)))
+            || (end > charge
+                && store
+                    .lane(&r.epoch)
+                    .is_some_and(|lane| end > lane.state.mapped_context_tokens()))
+    })
 }
 
 /// Prefix of every `provision_step` error that is a mapping (VMM commit) refusal: the lane
@@ -1291,7 +1322,7 @@ fn forward_with_proto(
 
 /// Each prefill tile of the plan through the singleton chunk program on the
 /// lane's own state (an MTP lane's tile also fills its head), or, under
-/// `HIPFIRE_EP_LANE_PREFILL_WAVE_EXACT=1` on an EP forward, the step's 49..=511-row
+/// `HIPFIRE_EP_LANE_PREFILL_WAVE_EXACT=1` on an EP forward, the step's 65..=511-row
 /// lane tiles as EXACT joint prefill waves ([`plan_prefill_parts`]: one
 /// [`Qwen4Bundle::prefill_wave`] per wave, every lane's rows forwarded together
 /// with the MoE once over all rows); the prompt-completing tile's pick lands in
@@ -2517,15 +2548,17 @@ mod wave_tests {
 
     #[test]
     fn the_exact_window_is_the_sub_512_full_table_lanes() {
-        assert_eq!(crate::gpu_forward::ep_wave::EXACT_WAVE_MIN_LANE_ROWS, 49);
+        assert_eq!(crate::gpu_forward::ep_wave::EXACT_WAVE_MIN_LANE_ROWS, 65);
         assert_eq!(
             crate::gpu_forward::ep_wave::EXACT_WAVE_MAX_LANE_ROWS,
             rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS - 1
         );
-        for rows in [0usize, 1, 8, 9, 48, 512, 513, 2048] {
+        // The default (small lanes on, no explicit floor): 9..=511 rows join; at most 8 rows are
+        // few-row tiles and 512 and up keep their own owner-routed tile.
+        for rows in [0usize, 1, 8, 512, 513, 2048] {
             assert!(!ep_wave_lane_joins(rows), "{rows}");
         }
-        for rows in [49usize, 60, 149, 256, 511] {
+        for rows in [9usize, 48, 49, 60, 64, 65, 66, 149, 256, 511] {
             assert!(ep_wave_lane_joins(rows), "{rows}");
         }
     }
@@ -2537,6 +2570,8 @@ mod wave_tests {
             // The burst: 8 code prompts of 149 rows.
             (1192, &[149; 8], true),
             // The story burst below every 512 floor.
+            (520, &[65; 8], true),
+            // Small lanes (9..=64 rows) join the wave.
             (480, &[60; 8], true),
             // One lane is its own tile.
             (300, &[300], false),
@@ -2547,8 +2582,10 @@ mod wave_tests {
             // A lane at 512 keeps its serial tile (owner-routed on its own).
             (1024, &[512, 512], false),
             (700, &[100, 600], false),
-            // A lane under 49 rows or a zero-row lane is not an exact-wave tile.
-            (97, &[48, 49], false),
+            // A few-row lane (at most 8 rows) or a zero-row lane is not an exact-wave tile.
+            (113, &[48, 65], true),
+            (16, &[8, 8], false),
+            (98, &[49, 49], true),
             (300, &[0, 300], false),
             // The total must be the lanes' sum.
             (1000, &[300, 300], false),
@@ -2588,10 +2625,17 @@ mod wave_tests {
 
     #[test]
     fn there_is_no_row_floor_on_the_total() {
-        // The story C8 burst (8 x 60 = 480 rows, below every 512 floor) is one wave, and so
-        // is the smallest legal pair.
+        // A burst of 8 x 65 = 520 rows is one wave regardless of the total, and so is the
+        // smallest legal pair.
+        assert_eq!(plan(&[65; 8]), vec![PrefillPart::Wave(0..8)]);
+        assert_eq!(plan(&[65, 65]), vec![PrefillPart::Wave(0..2)]);
+        // 9..=64-row lanes join the wave (the story C8 burst is one wave); a few-row lane of at
+        // most 8 rows keeps its serial tile.
         assert_eq!(plan(&[60; 8]), vec![PrefillPart::Wave(0..8)]);
-        assert_eq!(plan(&[49, 49]), vec![PrefillPart::Wave(0..2)]);
+        assert_eq!(
+            plan(&[8; 4]),
+            (0..4).map(PrefillPart::Serial).collect::<Vec<_>>()
+        );
         // Three 149-row lanes: 447 rows.
         assert_eq!(plan(&[149; 3]), vec![PrefillPart::Wave(0..3)]);
         assert_eq!(plan(&[200, 200]), vec![PrefillPart::Wave(0..2)]);
@@ -2601,7 +2645,7 @@ mod wave_tests {
     fn a_floor_tile_and_an_mtp_lane_split_the_runs() {
         // A 600-row tile (owner-routed on its own) keeps its serial tile; the lanes around it
         // wave separately (contiguous ordinals only, since a wave writes one contiguous head
-        // block). A lane below 49 rows keeps its serial tile the same way.
+        // block). A lane below 65 rows keeps its serial tile the same way.
         let parts = plan(&[149, 149, 600, 149, 149, 149, 149]);
         assert_eq!(
             parts,
@@ -2611,7 +2655,7 @@ mod wave_tests {
                 PrefillPart::Wave(3..7),
             ]
         );
-        let parts = plan(&[149, 48, 149, 149]);
+        let parts = plan(&[149, 8, 149, 149]);
         assert_eq!(
             parts,
             vec![
@@ -2650,17 +2694,17 @@ mod wave_tests {
     #[test]
     fn a_single_lane_tail_merges_into_the_wave_before_it() {
         // Nine 200-row lanes (1800 rows) fit one wave; a tenth lane (2000) still fits; four
-        // 511-row lanes plus a 49-row one overflow the cap (2093) and split into two balanced
+        // 511-row lanes plus a 65-row one overflow the cap (2109) and split into two balanced
         // waves rather than leaving a one-lane serial tail.
         assert_eq!(plan(&[200; 10]), vec![PrefillPart::Wave(0..10)]);
         let mut rows = vec![511; 4];
-        rows.push(49);
+        rows.push(65);
         assert_eq!(
             plan(&rows),
             vec![PrefillPart::Wave(0..3), PrefillPart::Wave(3..5)]
         );
         let mut rows = vec![300; 6];
-        rows.push(49);
+        rows.push(65);
         assert_eq!(plan(&rows), vec![PrefillPart::Wave(0..7)]);
     }
 

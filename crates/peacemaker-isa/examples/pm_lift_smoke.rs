@@ -285,6 +285,198 @@ fn down_dni(rng: &mut Lcg) -> Case {
     }
 }
 
+/// tid 3 `hyper_norm_gate_k4_outputs_f32` (kernels/src/tensor_ops.hip: `hyper_norm_gate_k4_branch<float>`,
+/// `state_bf16 == 0`). Real launch (r6_launches.json seq 0 / 12): grid [4, 6, 1], block 256,
+/// kernarg = 7 pointers, `hidden` 2560, `state_bf16` 0. blockIdx.x = branch (0..3), blockIdx.y = row
+/// (0..rows-1) with rows = 6. `hidden` is a compile-time 2560 in the body; the argument is unused by it.
+fn hyper_norm_gate(rng: &mut Lcg) -> Case {
+    let (rows, hidden, state_bf16) = (6usize, 2560usize, 0i32);
+    let wide = 4 * hidden; // 4 branches
+    let bufs = vec![
+        // input (f32 streams): index (row*4 + branch)*hidden + tid + 256*u, tid < 256, u < 10
+        //   -> max (rows*4 - 1)*hidden + 255 + 2304 < rows * 4 * hidden floats
+        (
+            "input".to_string(),
+            f32s((0..rows * wide).map(|_| rng.f32())),
+        ),
+        // norm_weight (bf16): branch*hidden + tid + 256*u < 4 * hidden elements
+        (
+            "norm_weight".into(),
+            (0..wide).flat_map(|_| rng.bf16().to_le_bytes()).collect(),
+        ),
+        // gate_weight (bf16 [4 gate rows, 4*hidden]): wave*wide + branch*hidden + lane*8 + 256*s + 7,
+        // wave < 4, lane < 32, s < 10 -> max 3*wide + 3*hidden + 248 + 2304 + 7 < 4 * wide elements
+        (
+            "gate_weight".into(),
+            (0..4 * wide)
+                .flat_map(|_| rng.bf16().to_le_bytes())
+                .collect(),
+        ),
+        // normalized (f32): the same (row*4 + branch)*hidden + tid + 256*u footprint as input
+        ("normalized".into(), vec![0xa5; rows * wide * 4]),
+        // gates (f32 [rows][4]): row*4 + tid, tid < 4, written by the row's last block
+        ("gates".into(), vec![0xa5; rows * 4 * 4]),
+        // scratch (f32 [rows][4 gate rows][4 quarters]): (row*4 + wave)*4 + branch -> rows * 16 floats;
+        // every slot is written before the last block reads it
+        ("scratch".into(), vec![0xa5; rows * 16 * 4]),
+        // counters (u32 [rows]): the contract is zero between launches (the last block resets it)
+        ("counters".into(), vec![0u8; rows * 4]),
+    ];
+    Case {
+        tid: 3,
+        name: "hyper_norm_gate",
+        symbol: String::new(),
+        block: 256,
+        grid: [4, rows as u32, 1],
+        ptr_table: None,
+        args: vec![
+            Arg::Buf(0),
+            Arg::Buf(1),
+            Arg::Buf(2),
+            Arg::Buf(3),
+            Arg::Buf(4),
+            Arg::Buf(5),
+            Arg::Buf(6),
+            Arg::I32(hidden as i32),
+            Arg::I32(state_bf16),
+        ],
+        bufs,
+        vcount: 1, // grid.x = 4
+    }
+}
+
+/// tid 5 `gated_delta_step_halves_state128_persistent256_capture_q8` (kernels/src/tensor_ops.hip:
+/// `gated_delta_step_persistent256_body<true, true>`; the symbol is not in gdn_lanes.hip, whose
+/// `_lanes` variant is a different kernel). Real launch (seq 7): grid [24, 1, 1], block 256, kernarg =
+/// 6 pointers, rows 6, qkv_width 5120, key_heads 8, value_heads 24, key_dim 128, value_dim 128,
+/// query_scale 0.0883883461356163 (f32 0x3db504f3), frame 173. blockIdx.x = value head.
+/// `float query_scale` has no `Arg` variant: it goes through `Arg::U32` as its f32 bits (same 4 bytes).
+fn gdn_step(rng: &mut Lcg) -> Case {
+    let (rows, qkv_width, key_heads, value_heads, key_dim, value_dim) =
+        (6usize, 5120usize, 8usize, 24usize, 128usize, 128usize);
+    let (query_scale, frame) = (f32::from_bits(0x3db504f3), 173u32);
+    let value_width = value_heads * 128;
+    // gdn_q8_slot_bytes: Q8 codes [value_heads][128][128] i8, then f32 scales [value_heads][128]
+    let slot_bytes = value_heads * 128 * (128 + 4);
+    // qk_width = key_heads*128 = 1024; qkv_width == 2*qk_width + value_width
+    assert_eq!(qkv_width, 2 * key_heads * 128 + value_width);
+    // state: the live Q8 slot (read only: capture leaves it intact). Codes in [-127, 127], scales > 0.
+    let mut state: Vec<u8> = (0..value_heads * 128 * 128)
+        .map(|_| ((rng.next() % 255) as i32 - 127) as i8 as u8)
+        .collect();
+    for _ in 0..value_heads * 128 {
+        state.extend((0.002 + rng.f32().abs() * 0.02).to_le_bytes());
+    }
+    assert_eq!(state.len(), slot_bytes);
+    let bufs = vec![
+        // projection (f32 [rows][qkv_width]): row*qkv_width + {q_offset, k_offset, v_offset} + 0..127
+        // (float4 q/k rows of 128), v_offset + 127 < qkv_width -> rows * qkv_width floats
+        (
+            "projection".to_string(),
+            f32s((0..rows * qkv_width).map(|_| rng.f32())),
+        ),
+        // gate (f32 [rows][value_heads]): row*value_heads + value_head, expf'd -> non-positive log decay
+        (
+            "gate".into(),
+            f32s((0..rows * value_heads).map(|_| -rng.f32().abs())),
+        ),
+        // beta (f32 [rows][value_heads]), in [0, 1]
+        (
+            "beta".into(),
+            f32s((0..rows * value_heads).map(|_| (rng.f32() + 1.0) * 0.5)),
+        ),
+        ("state".into(), state),
+        // output (f32 [rows][value_width]): row*value_width + value_head*128 + value_index
+        ("output".into(), vec![0xa5; rows * value_width * 4]),
+        // row_states: ring of Q8 slots; capture stores the final state at slot rows-1, so
+        // the written range ends at rows * slot_bytes
+        ("row_states".into(), vec![0xa5; rows * slot_bytes]),
+    ];
+    Case {
+        tid: 5,
+        name: "gdn_step",
+        symbol: String::new(),
+        block: 256,
+        grid: [value_heads as u32, 1, 1],
+        ptr_table: None,
+        args: vec![
+            Arg::Buf(0),
+            Arg::Buf(1),
+            Arg::Buf(2),
+            Arg::Buf(3),
+            Arg::Buf(4),
+            Arg::Buf(5),
+            Arg::I32(rows as i32),
+            Arg::I32(qkv_width as i32),
+            Arg::I32(key_heads as i32),
+            Arg::I32(value_heads as i32),
+            Arg::I32(key_dim as i32),
+            Arg::I32(value_dim as i32),
+            Arg::U32(query_scale.to_bits()),
+            Arg::U32(frame),
+        ],
+        bufs,
+        vcount: 1, // grid.x = 24
+    }
+}
+
+/// tid 19 `moe_shared_down_combine_rows_r6` (kernels/src/moe_shared_down_combine.gfx1201.hip,
+/// `MOE_SHARED_DOWN_COMBINE_ROWS(6)`). Real launch (seq 23): grid [320, 1, 1], block 320, kernarg =
+/// 7 pointers, M 2560, K 384, n_experts 512 (R = 6 tokens fixed by the symbol; grid.x = M / 8).
+fn moe_shared_down_combine(rng: &mut Lcg) -> Case {
+    let (r, m, k, n_experts) = (6usize, 2560usize, 384usize, 512usize);
+    let bufs = vec![
+        // W (bf16 [M][K]): row*K + i + 0..7, row < M, i + 8 <= K -> M * K elements
+        (
+            "W".to_string(),
+            (0..m * k).flat_map(|_| rng.bf16().to_le_bytes()).collect(),
+        ),
+        // x (f32 [R][K]): r*K + i + 0..7
+        ("x".into(), f32s((0..r * k).map(|_| rng.f32()))),
+        // target (f32 [R][M]): seed in, result out; token*M + col
+        ("target".into(), f32s((0..r * m).map(|_| rng.f32()))),
+        // expert_outputs (f32 [R*10*M]): (token*10 + rank)*M + col
+        (
+            "expert_outputs".into(),
+            f32s((0..r * 10 * m).map(|_| rng.f32())),
+        ),
+        // topk_indices (i32 [R*10]): token*10 + rank, expert ids in [0, n_experts)
+        (
+            "topk_indices".into(),
+            i32s((0..r * 10).map(|_| (rng.next() % n_experts as u32) as i32)),
+        ),
+        // topk_weights (f32 [R*10])
+        ("topk_weights".into(), f32s((0..r * 10).map(|_| rng.f32()))),
+        // scalar (f32 [R]): shared selector per token, finite and nonzero (0.25..0.75)
+        (
+            "scalar".into(),
+            f32s((0..r).map(|_| 0.25 + rng.f32().abs() * 0.5)),
+        ),
+    ];
+    Case {
+        tid: 19,
+        name: "moe_shared_down_combine",
+        symbol: String::new(),
+        block: 320,
+        grid: [(m / 8) as u32, 1, 1],
+        ptr_table: None,
+        args: vec![
+            Arg::Buf(0),
+            Arg::Buf(1),
+            Arg::Buf(2),
+            Arg::Buf(3),
+            Arg::Buf(4),
+            Arg::Buf(5),
+            Arg::Buf(6),
+            Arg::I32(m as i32),
+            Arg::I32(k as i32),
+            Arg::I32(n_experts as i32),
+        ],
+        bufs,
+        vcount: 4, // grid.x = 320 > 64
+    }
+}
+
 struct Card {
     rt: HipRuntime,
 }
@@ -463,10 +655,36 @@ fn run_case(card: &Card, objects: &Path, case: Case, shared: &SharedPool) -> Res
             .copy_from_slice(&value.to_le_bytes()[..h.size as usize]);
     }
     let mut tasks = Vec::new();
+    // LIFT_SPAN=1: span-mode headers (railgunmega/DYNAMIC.md) over a host-filled live
+    // list of every virtual workgroup in a shuffled order, plus two NOP headers past it
+    let span = std::env::var("LIFT_SPAN").is_ok_and(|v| v != "0");
+    let mut live: Vec<[u32; 4]> = Vec::new();
+    if span {
+        for z in 0..gz {
+            for y in 0..gy {
+                for x in 0..gx {
+                    live.push([x, y, z, 0]);
+                }
+            }
+        }
+        let mut rng = Lcg(0x5a17);
+        for i in (1..live.len()).rev() {
+            live.swap(i, rng.next() as usize % (i + 1));
+        }
+        for k in 0..live.len() as u32 + 2 {
+            let mut t = [0u32; 32];
+            t[..15].copy_from_slice(&[
+                case.tid, 0, 0, 0, gx, gy, gz, 0,
+                1, // the host-filled span names event 1, expected 0
+                0, 0, 1, 1, k, 0,
+            ]);
+            tasks.extend(t.iter().flat_map(|w| w.to_le_bytes()));
+        }
+    }
     for z in 0..gz {
         for y in 0..gy {
             let mut x = 0;
-            while x < gx {
+            while x < gx && !span {
                 let vc = std::env::var("LIFT_VCOUNT")
                     .ok()
                     .and_then(|v| v.parse().ok())
@@ -486,6 +704,24 @@ fn run_case(card: &Card, objects: &Path, case: Case, shared: &SharedPool) -> Res
     let kargs = card.upload(&ka)?;
     let trace = card.upload(&vec![0u8; n_tasks as usize * 48])?;
     let poison = card.upload(&[0u8; 4])?;
+    let cap = live.len() as u32 + 2;
+    let list = card.upload(
+        &live
+            .iter()
+            .flatten()
+            .flat_map(|w| w.to_le_bytes())
+            .chain(std::iter::repeat(0).take(32))
+            .collect::<Vec<u8>>(),
+    )?;
+    let count = card.upload(&(live.len() as u32).to_le_bytes())?;
+    let bitmap = card.upload(&vec![0u8; (live.len().div_ceil(32) * 4).max(4)])?;
+    let mut table = vec![0u8; 64];
+    table[..4].copy_from_slice(&1u32.to_le_bytes());
+    for (o, d) in [(32usize, &list), (40, &count), (48, &bitmap)] {
+        table[o..o + 8].copy_from_slice(&(d.as_ptr() as u64).to_le_bytes());
+    }
+    table[56..60].copy_from_slice(&cap.to_le_bytes());
+    let spans = card.upload(&table)?;
     let mut params = Vec::new();
     for p in [&dt, &ticket, &events, &kargs, &trace, &poison] {
         params.extend((p.as_ptr() as u64).to_le_bytes());
@@ -493,6 +729,7 @@ fn run_case(card: &Card, objects: &Path, case: Case, shared: &SharedPool) -> Res
     params.extend(1_000_000u64.to_le_bytes());
     params.extend(n_tasks.to_le_bytes());
     params.extend(u32::from(trace_on()).to_le_bytes());
+    params.extend(if span { spans.as_ptr() as u64 } else { 0 }.to_le_bytes());
     params.resize(ld::KERNARG_BYTES as usize, 0);
     let pool_fn = card.function(&pool_elf, &pool_symbol)?;
     let workers = n_tasks.min(
@@ -549,16 +786,21 @@ fn run_case(card: &Card, objects: &Path, case: Case, shared: &SharedPool) -> Res
         .filter(|((_, init), _)| init.first() == Some(&0xa5))
         .map(|(_, w)| w.chunks(4).filter(|c| *c == [0xa5; 4]).count())
         .sum();
+    // span mode: every live workgroup claimed exactly once in the bitmap
+    let claimed: usize = card
+        .read(&bitmap, (live.len().div_ceil(32) * 4).max(4))?
+        .chunks(4)
+        .map(|w| u32::from_le_bytes(w.try_into().unwrap()).count_ones() as usize)
+        .sum();
     let pass = mismatched.is_empty()
         && ev == n_tasks
         && pz == 0
         && tk == n_tasks + workers
-        && traced == if trace_on() { n_tasks as usize } else { 0 };
-    for d in d_solo
-        .into_iter()
-        .chain(d_pool)
-        .chain([dt, ticket, events, kargs, trace, poison])
-    {
+        && traced == if trace_on() { n_tasks as usize } else { 0 }
+        && claimed == live.len();
+    for d in d_solo.into_iter().chain(d_pool).chain([
+        dt, ticket, events, kargs, trace, poison, list, count, bitmap, spans,
+    ]) {
         card.rt.free(d).map_err(|e| e.to_string())?;
     }
     let r = &region.receipt;
@@ -693,6 +935,9 @@ fn main() {
         unscatter_silu(&mut rng),
         gemv_x4_otile(&mut rng),
         down_dni(&mut rng),
+        hyper_norm_gate(&mut rng),
+        gdn_step(&mut rng),
+        moe_shared_down_combine(&mut rng),
     ];
     if let Ok(only) = std::env::var("LIFT_ONLY") {
         cases.retain(|c| c.name == only);

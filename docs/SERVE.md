@@ -384,7 +384,7 @@ single-device or pipeline-parallel load (Flash-Next/Qwen4 included) unloads
 the prior model and requires clean VMM state before constructing the new
 one, so a failure after admission leaves no model loaded and the error says
 `no model loaded`. Only tp>1 expert-parallel loads stage the new model before
-retiring the prior one. Flash-Next with VMM QSA state (gfx1151/gfx1201 automatic) owns
+retiring the prior one. Flash-Next with VMM QSA state (gfx1151/gfx1201/gfx942 automatic) owns
 VMM arenas of its own: the target and MTP context arenas and the gathered
 attention workspace. All of them are released when the model unloads, so the
 next load's clean-VMM check starts from zero owners in either swap direction.
@@ -977,8 +977,16 @@ request run alone on the singleton route. **Default off, experimental.**
   stage runs once over all lanes' rows only where the G0 byte-identity oracle
   admitted it, otherwise per lane.
   On gfx1151 G0 admitted every row-local stage (embedding, HC read/write, the
-  GDN/QSA projections, the MoE, final HC read, head, argmax); other cards run
-  every stage per lane until their own G0 run.
+  GDN/QSA projections, the MoE, final HC read, head, argmax). On gfx942
+  (MI300X, the single-card stock-FP8 artifact, AR lanes: that artifact has no
+  MTP head) G0 passed the combined policy (every row-local stage plus the PLE
+  projection once over all rows, bound to the BF16 trunk and the resident FP8
+  expert class) but not every single-stage probe, so gfx942 shares all of
+  those stages or none; the GDN and QSA cores run one launch per lane there.
+  Measured on one MI300X (`hipfire bench --backend batch`, 16 prompts x 128
+  tokens, 4 fresh loads): C8 151 tok/s aggregate (TTFT 1.88 s, 208 tok/s
+  steady decode) against C1 60 tok/s, every stream's text identical to C1.
+  Other cards run every stage per lane until their own G0 run.
 - **Under `topology.pp` / `topology.ep` (2..=8 cards):** the same exact
   **AR** fn-lanes route is staged across the cards, with these differences from
   the single-card route above. The lane store is budgeted per device: every

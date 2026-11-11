@@ -43,12 +43,17 @@ pub mod ep_mesh_serve;
 pub mod ep_reserve;
 pub mod ep_seal;
 pub mod ep_trunk_split;
+/// EP2 vocabulary-sharded target LM head (`HIPFIRE_QWEN4_EP_VOCAB_SHARD`): switch, admission and
+/// the cross-rank exchange.
+pub mod ep_vocab_shard;
 pub mod expert_keep;
 pub use expert_keep::{ExpertKeep, EXPERT_KEEP_METADATA_KEY, EXPERT_KEEP_SCHEMA};
 /// Per-layer contiguous expert slab arenas (K4 loader plan + fulfillment payload).
 pub mod expert_arena;
 /// Per-expert VRAM/host unit planner of an EP rank (D1: static hot set).
 pub mod expert_ep_units;
+/// `<model>.ep.hot-units` sidecar of the Flash-Next EP2 hot-unit loan (calibrated host-read counts).
+pub mod expert_hot_units;
 /// Lever1 expert hotset sidecar parser and `HIPFIRE_QWEN4_EXPERT_HOTSET` policy.
 pub mod expert_hotset;
 pub mod expert_residency;

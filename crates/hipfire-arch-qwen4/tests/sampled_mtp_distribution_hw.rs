@@ -363,9 +363,20 @@
 //!
 //! Under `HIPFIRE_SAMPLED_MTP_TOPOLOGY=ep2` the cohort is `lane_ar`,
 //! `lane_batched` and `lane_adaptive` (`lane_suite::EP2_FIXED_ARMS`), plus
-//! `lane_cross` at 8 lanes (`lane_suite::EP2_ARMS`); the copy lane is
-//! off by default on EP serve, so `lane_copy` is refused under `ep2` and its
-//! shards are foreign to an `ep2` merge. A lane arm process (cards C,B under
+//! `lane_cross` at 8 lanes (`lane_suite::EP2_ARMS`). The copy lane is on by
+//! default on EP serve, in steps of at most `lane_suite::EP2_COPY_LANES` (2)
+//! lanes, so `lane_copy` has its own `ep2` cohort at 1 or 2 lanes
+//! (`lane_suite::EP2_COPY_ARMS`: `lane_ar` and `lane_copy`; the directory is
+//! the copy cohort when it holds `lane_copy` results). `lane_copy` stages the
+//! copy lane exactly as the serve does (`ep::ep_default_copy_config`) and runs
+//! the same mesh step; run the cohort with `HIPFIRE_SAMPLED_MTP_PROMPT=copy` (a
+//! verbatim-repetition prompt: the copied-span rewrite request with the
+//! passage's first `COPY_PRIMED` tokens already in the assistant turn, so the
+//! copy matcher proposes on the first window; `lane_copy_prompt` pre-checks
+//! that on the CPU, and every arm of the cohort runs it) and its coverage
+//! fails unless the lane counters show copy windows (takeovers, every one a
+//! point-mass `delta(candidate)` verify). At more than 2 lanes `lane_copy` is
+//! refused (no copy windows exist there). A lane arm process (cards C,B under
 //! `HIPFIRE_TOPOLOGY_EP=2`, one fresh process per arm and shard) loads the
 //! artifact once through the product loader with the serve's `serve.vmm_batch`
 //! lane reservation, stages one lane store and runs its `START..END` trials
@@ -629,6 +640,10 @@ enum Fixture {
     Prose,
     Repeat,
     Window,
+    /// The copied-span rewrite request whose assistant turn is primed with the
+    /// passage's first `COPY_PRIMED` tokens (ep2 lane arms only: the priming
+    /// and its pool check are [`lane_copy_prompt`]).
+    Copy,
 }
 
 impl Fixture {
@@ -637,8 +652,9 @@ impl Fixture {
             Err(_) | Ok("prose") => Ok(Self::Prose),
             Ok("repeat") => Ok(Self::Repeat),
             Ok("window") => Ok(Self::Window),
+            Ok("copy") => Ok(Self::Copy),
             Ok(other) => Err(format!(
-                "{PROMPT_ENV}={other}: expected prose, repeat or window"
+                "{PROMPT_ENV}={other}: expected prose, repeat, window or copy"
             )),
         }
     }
@@ -648,6 +664,7 @@ impl Fixture {
             Self::Prose => "prose",
             Self::Repeat => "repeat",
             Self::Window => "window",
+            Self::Copy => "copy",
         }
     }
 
@@ -658,6 +675,7 @@ impl Fixture {
                 "Continue this pattern for as long as you can, writing only the continuation: {}",
                 "red green blue red green blue red green blue ".repeat(24)
             ),
+            Self::Copy => format!("{COPY_INSTRUCTION}{COPY_PASSAGE}"),
             // Head (its distinctive names occur only here), filler, tail: with
             // a 128-token window the head has left the window before the first
             // generated token, and the filler drains out as tokens are added.
@@ -675,6 +693,12 @@ impl Fixture {
 
     /// The window fixture must really cross the penalty window.
     fn check_prompt(self, prompt_tokens: usize, pen: &Penalties) -> Result<(), String> {
+        if self == Self::Copy {
+            return Err(format!(
+                "{PROMPT_ENV}=copy primes the assistant turn and runs only under the ep2 lane arms ({} executor lanes)",
+                lane_suite::EXECUTOR_ENV
+            ));
+        }
         if self == Self::Window && prompt_tokens <= pen.repeat_window.max(128) + TOKENS {
             return Err(format!(
                 "window fixture has only {prompt_tokens} prompt tokens; it must exceed the {} \
@@ -3925,6 +3949,51 @@ fn copy_fixture(loaded: &Loaded, copy_lane: bool) -> Result<Vec<u32>, String> {
         Some(candidates) if candidates == want => Ok(prompt),
         other => Err(format!(
             "copy fixture: the pool proposed {other:?} after the passage's token {COPY_PRIMED}, expected {want:?}"
+        )),
+    }
+}
+
+/// The ep2 copy cohort's prompt: the rendered rewrite request plus the
+/// passage's first `COPY_PRIMED` tokens, so the request-local pool of the
+/// serve's copy lane (`MtpCopyContext`, the production copy triple) proposes
+/// the passage's continuation on the first window whenever the sampled first
+/// token is the passage's next one. Fails unless the passage occurs in the
+/// request and the pool, seeded from the returned prompt, proposes the
+/// passage's continuation after the passage's token `COPY_PRIMED`.
+fn lane_copy_prompt(tokenizer: &Tokenizer, rendered: Vec<u32>) -> Result<Vec<u32>, String> {
+    // A takeover is as deep as the window's draft room (`TOKENS` less the
+    // first token): the passage must hold that many tokens past the seed.
+    let depth = TOKENS - 1;
+    let passage = tokenizer.encode(COPY_PASSAGE);
+    let pool_config = qwen4_ngram_mod_config(hipfire_config::ngram_mod_copy_triple())?;
+    if passage.len() < COPY_PRIMED + 1 + depth {
+        return Err(format!(
+            "copy passage has {} tokens, need {}",
+            passage.len(),
+            COPY_PRIMED + 1 + depth
+        ));
+    }
+    let mut prompt = rendered;
+    if !prompt
+        .windows(passage.len())
+        .any(|window| window == passage.as_slice())
+    {
+        return Err("the passage's own tokens do not occur in the rendered request".into());
+    }
+    prompt.extend_from_slice(&passage[..COPY_PRIMED]);
+    let mut pool = MtpCopyContext::new(pool_config).map_err(|e| e.to_string())?;
+    pool.begin_request(&prompt);
+    // The proposal runs on past the passage into the request's tail; only the
+    // passage's own continuation is compared.
+    let want = &passage[COPY_PRIMED + 1..];
+    match pool.propose(&passage[COPY_PRIMED..=COPY_PRIMED], pool_config.n_max) {
+        Some(candidates)
+            if candidates.len() >= depth && candidates[..depth] == want[..depth] =>
+        {
+            Ok(prompt)
+        }
+        other => Err(format!(
+            "copy fixture: the copy pool proposed {other:?} after the passage's token {COPY_PRIMED}, expected at least {depth} tokens of {want:?}"
         )),
     }
 }

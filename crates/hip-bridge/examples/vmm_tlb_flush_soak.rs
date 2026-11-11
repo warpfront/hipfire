@@ -10,7 +10,7 @@
 //! page-faults within ~10-50 maps without the poke; with it every round
 //! passes.
 //!
-//!   HIPFIRE_VMM_SMOKE_DEVICE=1 cargo run --release -p hip-bridge --example vmm_tlb_flush_soak -- [CHUNK_BYTES] [CHUNKS] [ROUNDS]
+//!   HIPFIRE_VMM_SMOKE_DEVICE=1 cargo run --release -p hip-bridge --features lab --example vmm_tlb_flush_soak -- [CHUNK_BYTES] [CHUNKS] [ROUNDS]
 //!   HIPFIRE_VMM_TLB_POKE=0 ...   # the control: expected to fault on an affected driver
 
 use hip_bridge::{HipRuntime, VmmArena};

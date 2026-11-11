@@ -28,21 +28,19 @@
 //!    a time per workgroup); the dispatcher's LDS starts above the largest
 //!    hosted body.
 //! 4. **geometry**: the dispatcher's workgroup is the body's `blockDim`. With
-//!    more than one wave, every wave must execute the same barriers: each
-//!    branch that is not workgroup-uniform (its condition is not computed from
-//!    kernargs, workgroup ids and constants by scalar instructions) must reach
-//!    its immediate post-dominator without passing a barrier; in particular no
-//!    barrier may follow a per-wave early exit.
+//!    more than one wave, every wave must execute the same barriers
+//!    ([`super::uniformity`]): every branch that is not workgroup-uniform reaches
+//!    its immediate post-dominator with the same barrier count on all paths of the
+//!    (block, EXEC) product graph, and no barrier lies on a cycle under it; in
+//!    particular no barrier may follow a per-wave early exit.
 //!
 //! Numerics: every other instruction is carried as its canonical text (only
 //! `ttmp7`/`ttmp9` substituted, branches retargeted to labels), so its
 //! arithmetic is the original's; [`check_carried`] re-lifts the emitted module
 //! and compares instruction by instruction.
 
-use std::collections::{BTreeMap, BTreeSet};
-
-use peacemaker_ir::cfg::{BlockId, Body, Cond, Terminator};
-use peacemaker_ir::effects::{Control, ImplicitSet};
+use peacemaker_ir::cfg::{BlockId, Terminator};
+use peacemaker_ir::effects::Control;
 use peacemaker_ir::inst::{Abi, Arch, Frontend, Kernel};
 use peacemaker_ir::passes::liveness::{Liveness, Loc};
 use peacemaker_ir::reg::Kind;
@@ -172,25 +170,61 @@ fn substitute(text: &str, from: &str, to: &str) -> (String, usize) {
     (out, count)
 }
 
+/// A hipcc object lifted once (Hipcc frontend) with the digest the receipt records, so the
+/// kernels of one object convert without re-lifting and re-emitting the whole object each time.
+pub struct HipccObject {
+    program: peacemaker_ir::inst::Program,
+    sha256: [u8; 32],
+}
+
+impl HipccObject {
+    /// Lift `object`; the error is the `reason` [`lift_region`] reports for an object that
+    /// does not lift.
+    pub fn lift(object: &[u8]) -> Result<Self, String> {
+        let lifted = lift_object(
+            object,
+            Options {
+                frontend: Frontend::Hipcc,
+            },
+        )
+        .map_err(|e| format!("lift: {e}"))?;
+        Ok(Self {
+            program: lifted.program,
+            sha256: sha256(object),
+        })
+    }
+
+    /// [`lift_region_in`] on this object.
+    pub fn region(&self, symbol: &str, inputs: &RegionInputs) -> Result<LiftedRegion, RegionError> {
+        lift_region_in(&self.program, self.sha256, symbol, inputs)
+    }
+}
+
 /// Convert kernel `symbol` of the hipcc object `object` into a region.
 pub fn lift_region(
     object: &[u8],
     symbol: &str,
     inputs: &RegionInputs,
 ) -> Result<LiftedRegion, RegionError> {
-    let lifted = lift_object(
-        object,
-        Options {
-            frontend: Frontend::Hipcc,
-        },
-    )
-    .map_err(|e| RegionError {
-        symbol: symbol.into(),
-        reason: format!("lift: {e}"),
-    })?;
-    let program = lifted.program;
+    HipccObject::lift(object)
+        .map_err(|reason| RegionError {
+            symbol: symbol.into(),
+            reason,
+        })?
+        .region(symbol, inputs)
+}
+
+/// [`lift_region`] for an object already lifted: `program` is the Hipcc-frontend lift of
+/// the object whose SHA-256 is `object_sha256` (the digest the receipt records). Callers
+/// converting several kernels of one object lift it once.
+pub fn lift_region_in(
+    program: &peacemaker_ir::inst::Program,
+    object_sha256: [u8; 32],
+    symbol: &str,
+    inputs: &RegionInputs,
+) -> Result<LiftedRegion, RegionError> {
     let arch = program.target.arch;
-    if arch != Arch::Gfx1201 {
+    if !arch.is_gfx12() {
         return refuse(symbol, format!("{arch:?}: regions are gfx1201 only"));
     }
     let kernel = program
@@ -201,7 +235,7 @@ pub fn lift_region(
             symbol: symbol.into(),
             reason: "no such kernel in the object".into(),
         })?;
-    convert(kernel, arch, sha256(object), inputs)
+    convert(kernel, arch, object_sha256, inputs)
 }
 
 fn convert(
@@ -261,7 +295,7 @@ fn convert(
     }
     let body = &kernel.body;
     let entry = BlockId(0);
-    let live = Liveness::analyze(body);
+    let live = Liveness::analyze(body, arch, kernel.wave);
     let declared = |l: &Loc| {
         matches!(
             l,
@@ -299,9 +333,11 @@ fn convert(
     // ---- (4) geometry: barrier participation
     let waves = inputs.block / 32;
     let (uniform, divergent, participation) =
-        barrier_participation(body, waves).map_err(|reason| RegionError {
-            symbol: symbol.into(),
-            reason,
+        super::uniformity::barrier_participation(body, inputs.block).map_err(|reason| {
+            RegionError {
+                symbol: symbol.into(),
+                reason,
+            }
         })?;
     // ---- (1)(2) text
     let p = &inputs.prefix;
@@ -327,7 +363,9 @@ fn convert(
                 reason: format!("print: {e}"),
             })?;
             let mnemonic = text.split_whitespace().next().unwrap_or("").to_owned();
-            for r in inst.effects.defs.iter().chain(&inst.effects.uses) {
+            // wave-width lane masks, or a wave32 compare into `s5` would count `s6`
+            let fx = peacemaker_ir::effects::wave_effects(arch, kernel.wave, inst);
+            for r in fx.defs.iter().chain(&fx.uses) {
                 let end = r.base + u16::from(r.len);
                 match r.kind {
                     Kind::S if r.base < 106 => max_s = max_s.max(end),
@@ -341,8 +379,10 @@ fn convert(
                     _ => {}
                 }
             }
+            // `flat_*` stays: the region resolves flat addresses in the same global and LDS
+            // apertures (its LDS is the body's own `[0, lds_bytes)`), and it has no private
+            // segment for the scratch aperture to name (the descriptor check above).
             if mnemonic.starts_with("scratch_")
-                || mnemonic.starts_with("flat_")
                 || matches!(
                     mnemonic.as_str(),
                     "s_getpc_b64"
@@ -355,7 +395,7 @@ fn convert(
             {
                 return refuse(
                     symbol,
-                    format!("`{text}`: not convertible (PC-relative, flat, scratch or trap)"),
+                    format!("`{text}`: not convertible (PC-relative, scratch or trap)"),
                 );
             }
             if mnemonic.starts_with("s_setreg")
@@ -507,280 +547,6 @@ fn convert(
 
 fn text_has_endpgm(lines: &[String]) -> bool {
     lines.iter().any(|l| l.trim_start().starts_with("s_endpgm"))
-}
-
-/// Workgroup-uniformity of every conditional branch, then the barrier-participation
-/// check of the module docs. Returns (uniform, divergent, verdict).
-fn barrier_participation(body: &Body, waves: u32) -> Result<(usize, usize, String), String> {
-    let n = body.blocks.len();
-    let index: BTreeMap<BlockId, usize> = body
-        .blocks
-        .iter()
-        .enumerate()
-        .map(|(i, b)| (b.id, i))
-        .collect();
-    // Forward may-analysis of per-wave (non-uniform) SGPRs and SCC/VCC.
-    #[derive(Clone, Default, PartialEq)]
-    struct U {
-        sgpr: BTreeSet<u16>,
-        scc: bool,
-        vcc: bool,
-        /// EXEC differs between waves (full in every wave until a per-wave write).
-        exec: bool,
-        /// The instruction that made SCC / VCC / EXEC per-wave (diagnostics).
-        why: [Option<String>; 3],
-    }
-    let mut at: Vec<Option<U>> = vec![None; n];
-    at[0] = Some(U::default());
-    let mut work = vec![0usize];
-    let mut out: Vec<U> = vec![U::default(); n];
-    while let Some(bi) = work.pop() {
-        let mut u = at[bi].clone().unwrap_or_default();
-        let block = &body.blocks[bi];
-        for &id in &body.layout[block.range.0..block.range.1] {
-            let inst = body.insts.get(id).expect("laid out");
-            let e = &inst.effects;
-            let name = super::mnemonic(inst);
-            let valu = name.starts_with("v_");
-            let reads_varying = e.uses.iter().any(|r| {
-                r.kind == Kind::V
-                    || (r.kind == Kind::S
-                        && (r.base..r.base + u16::from(r.len)).any(|s| u.sgpr.contains(&s)))
-            }) || (e.implicit.reads & ImplicitSet::EXEC != 0 && u.exec)
-                || e.uses.iter().any(|r| {
-                    r.kind == Kind::S && r.base <= 127 && r.base + u16::from(r.len) > 126 && u.exec
-                })
-                || e.uses.iter().any(|r| {
-                    r.kind == Kind::S && r.base <= 107 && r.base + u16::from(r.len) > 106 && u.vcc
-                })
-                || (e.implicit.reads & ImplicitSet::SCC != 0 && u.scc)
-                || (e.implicit.reads & ImplicitSet::VCC != 0 && u.vcc)
-                || name.starts_with("s_getreg")
-                || name.starts_with("s_sendmsg_rtn");
-            // a scalar result is per-wave if any source is (a VALU writing an SGPR always is)
-            let varying = valu || reads_varying;
-            for r in &e.defs {
-                if r.kind == Kind::S {
-                    for s in r.base..r.base + u16::from(r.len) {
-                        if varying {
-                            u.sgpr.insert(s);
-                        } else {
-                            u.sgpr.remove(&s);
-                        }
-                    }
-                }
-            }
-            let text = || format!("{name} {:?}", e.uses);
-            if e.implicit.writes & ImplicitSet::SCC != 0 {
-                u.scc = varying;
-                u.why[0] = varying.then(text);
-            }
-            let defines = |lo: u16| {
-                e.defs.iter().any(|r| {
-                    r.kind == Kind::S && r.base <= lo + 1 && r.base + u16::from(r.len) > lo
-                })
-            };
-            if e.implicit.writes & ImplicitSet::VCC != 0 || defines(106) {
-                u.vcc = varying;
-                u.why[1] = varying.then(text);
-            }
-            if e.implicit.writes & ImplicitSet::EXEC != 0 || defines(126) {
-                // v_cmpx / saveexec from a VALU compare: per-wave from here on
-                u.exec = varying || name.starts_with("v_cmpx");
-                u.why[2] = u.exec.then(text);
-            }
-        }
-        out[bi] = u.clone();
-        for s in &block.succs {
-            let si = index[s];
-            let next = match &at[si] {
-                None => u.clone(),
-                Some(old) => U {
-                    sgpr: old.sgpr.union(&u.sgpr).copied().collect(),
-                    scc: old.scc | u.scc,
-                    vcc: old.vcc | u.vcc,
-                    exec: old.exec | u.exec,
-                    why: [0, 1, 2].map(|i| old.why[i].clone().or_else(|| u.why[i].clone())),
-                },
-            };
-            if at[si].as_ref() != Some(&next) {
-                at[si] = Some(next);
-                work.push(si);
-            }
-        }
-    }
-    let mut divergent_blocks = Vec::new();
-    let mut why_of = BTreeMap::new();
-    let (mut uniform, mut divergent) = (0, 0);
-    for (bi, block) in body.blocks.iter().enumerate() {
-        if let Terminator::Branch { cond, .. } = block.term {
-            let per_wave = match cond {
-                Cond::Scc0 | Cond::Scc1 => out[bi].scc,
-                Cond::Vccz | Cond::Vccnz => out[bi].vcc,
-                Cond::Execz | Cond::Execnz => out[bi].exec,
-            };
-            if per_wave {
-                divergent += 1;
-                divergent_blocks.push(bi);
-                let k = match cond {
-                    Cond::Scc0 | Cond::Scc1 => 0,
-                    Cond::Vccz | Cond::Vccnz => 1,
-                    Cond::Execz | Cond::Execnz => 2,
-                };
-                why_of.insert(
-                    bi,
-                    format!(
-                        "{cond:?} per-wave because of `{}`",
-                        out[bi].why[k].clone().unwrap_or_default()
-                    ),
-                );
-            } else {
-                uniform += 1;
-            }
-        }
-    }
-    let has_barrier = |bi: usize| {
-        let b = &body.blocks[bi];
-        body.layout[b.range.0..b.range.1].iter().any(|&id| {
-            matches!(
-                body.insts.get(id).expect("laid out").effects.control,
-                Control::Barrier(_)
-            )
-        })
-    };
-    let barriers = (0..n).filter(|&b| has_barrier(b)).count();
-    if waves == 1 {
-        return Ok((
-            uniform,
-            divergent,
-            "single wave: every barrier involves only this wave".into(),
-        ));
-    }
-    if barriers == 0 {
-        return Ok((uniform, divergent, "no barrier".into()));
-    }
-    // Post-dominators with a virtual exit node `n`.
-    let succs = |bi: usize| -> Vec<usize> {
-        let b = &body.blocks[bi];
-        if matches!(b.term, Terminator::EndPgm | Terminator::Unreachable) || b.succs.is_empty() {
-            vec![n]
-        } else {
-            b.succs.iter().map(|s| index[s]).collect()
-        }
-    };
-    let all: BTreeSet<usize> = (0..=n).collect();
-    let mut pdom: Vec<BTreeSet<usize>> = vec![all.clone(); n + 1];
-    pdom[n] = [n].into_iter().collect();
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for bi in (0..n).rev() {
-            let mut acc: Option<BTreeSet<usize>> = None;
-            for s in succs(bi) {
-                acc = Some(match acc {
-                    None => pdom[s].clone(),
-                    Some(a) => a.intersection(&pdom[s]).copied().collect(),
-                });
-            }
-            let mut set = acc.unwrap_or_default();
-            set.insert(bi);
-            if set != pdom[bi] {
-                pdom[bi] = set;
-                changed = true;
-            }
-        }
-    }
-    for &bi in &divergent_blocks {
-        // immediate post-dominator: the strict post-dominator post-dominated by all others
-        let strict: Vec<usize> = pdom[bi].iter().copied().filter(|&x| x != bi).collect();
-        let ipdom = strict
-            .iter()
-            .copied()
-            .find(|&c| strict.iter().all(|&o| pdom[c].contains(&o)))
-            .unwrap_or(n);
-        // The blocks between the branch and its post-dominator.
-        let mut inside = BTreeSet::new();
-        let mut stack: Vec<usize> = succs(bi);
-        while let Some(x) = stack.pop() {
-            if x == ipdom || x == n || !inside.insert(x) {
-                continue;
-            }
-            stack.extend(succs(x));
-        }
-        let weight = |x: usize| {
-            let b = &body.blocks[x];
-            body.layout[b.range.0..b.range.1]
-                .iter()
-                .filter(|&&id| {
-                    matches!(
-                        body.insts.get(id).expect("laid out").effects.control,
-                        Control::Barrier(_)
-                    )
-                })
-                .count() as i64
-        };
-        // A barrier on a cycle inside the divergent region could run a per-wave number of times.
-        for &x in inside.iter().filter(|&&x| weight(x) > 0) {
-            let mut seen = BTreeSet::new();
-            let mut st: Vec<usize> = succs(x)
-                .into_iter()
-                .filter(|s| inside.contains(s))
-                .collect();
-            while let Some(y) = st.pop() {
-                if y == x {
-                    return Err(format!(
-                        "barrier participation: block {x} repeats a barrier on a cycle under the per-wave branch of block {bi} ({})", why_of[&bi]
-                    ));
-                }
-                if seen.insert(y) {
-                    st.extend(succs(y).into_iter().filter(|s| inside.contains(s)));
-                }
-            }
-        }
-        // Every path from the branch to its post-dominator must pass the same number of
-        // barriers: then each wave, whichever way it goes, meets the same barriers (as in
-        // the original, where a wave also takes part until its s_endpgm).
-        let mut lo: BTreeMap<usize, i64> = inside.iter().map(|&x| (x, i64::MAX / 4)).collect();
-        let mut hi: BTreeMap<usize, i64> = inside.iter().map(|&x| (x, i64::MIN / 4)).collect();
-        for _ in 0..=inside.len() {
-            for &x in &inside {
-                let (mut l, mut h) = (i64::MAX / 4, i64::MIN / 4);
-                for s in succs(x) {
-                    let (sl, sh) = if inside.contains(&s) {
-                        (lo[&s], hi[&s])
-                    } else {
-                        (0, 0)
-                    };
-                    l = l.min(sl);
-                    h = h.max(sh);
-                }
-                lo.insert(x, weight(x) + l);
-                hi.insert(x, weight(x) + h);
-            }
-        }
-        let counts: BTreeSet<(i64, i64)> = succs(bi)
-            .into_iter()
-            .map(|s| {
-                if inside.contains(&s) {
-                    (lo[&s], hi[&s])
-                } else {
-                    (0, 0)
-                }
-            })
-            .collect();
-        if counts.len() != 1 || counts.iter().any(|(l, h)| l != h) {
-            return Err(format!(
-                "barrier participation: the paths from the per-wave branch of block {bi} ({}) to its post-dominator {} pass different numbers of barriers {counts:?}; a {waves}-wave region would pair a barrier with another wave's dispatcher barrier",
-                why_of[&bi],
-                if ipdom == n { "(the exit)".to_string() } else { ipdom.to_string() }
-            ));
-        }
-    }
-    Ok((
-        uniform,
-        divergent,
-        format!("{waves} waves, {barriers} barrier blocks: every per-wave branch passes the same barrier count on all its paths to its post-dominator, with no barrier on a per-wave cycle"),
-    ))
 }
 
 /// Re-lift `module` and check that kernel `symbol` carries every instruction of

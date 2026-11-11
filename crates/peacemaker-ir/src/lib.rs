@@ -10,6 +10,7 @@ pub mod edit;
 pub mod effects;
 pub mod emu;
 pub mod envelope;
+pub mod helpers;
 pub mod inst;
 pub mod isa;
 pub mod kernarg;
@@ -42,6 +43,40 @@ mod tests {
         collections::{HashMap, HashSet},
         process::Command,
     };
+    /// gfx1200 is the gfx1201 ISA family: same table, same words, same family predicate; only the
+    /// machine identity (lift/bundle layer) differs.
+    #[test]
+    fn gfx1200_shares_the_gfx12_isa_with_gfx1201() {
+        assert!(Arch::Gfx1200.is_gfx12() && Arch::Gfx1201.is_gfx12());
+        assert!(
+            ![Arch::Gfx1010, Arch::Gfx1030, Arch::Gfx1100, Arch::Gfx1151]
+                .iter()
+                .any(|a| a.is_gfx12())
+        );
+        assert_ne!(Arch::Gfx1200, Arch::Gfx1201);
+        assert!(std::ptr::eq(
+            isa::table(Arch::Gfx1200),
+            isa::table(Arch::Gfx1201)
+        ));
+        for words in [
+            &[0xd800_0000u32, 0x0000_0407][..],
+            &[0xd880_0000, 0x0100_0701],
+            &[0xbe80_1805],
+            &[0x7e08_0904],
+        ] {
+            let (a, na) = codec::gfx12::decode_for(Arch::Gfx1200, words).unwrap();
+            let (b, nb) = codec::gfx12::decode_for(Arch::Gfx1201, words).unwrap();
+            assert_eq!(na, nb);
+            assert_eq!(a.op, b.op);
+            assert_eq!(a.op.name(Arch::Gfx1200), b.op.name(Arch::Gfx1201));
+            assert_eq!(
+                codec::gfx12::encode_for(Arch::Gfx1200, &a)
+                    .unwrap()
+                    .as_slice(),
+                &words[..na]
+            );
+        }
+    }
     #[test]
     fn builder_gfx1201_golden_spellings_print_from_typed_operands() {
         use operand::{CacheScope, Depctr, ImmField, InlineConst, Msg, Operand as O, VmemToken};

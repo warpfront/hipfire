@@ -78,7 +78,7 @@ use hipfire_dispatch::pipeline::DraftHeadRequestState;
 use hipfire_runtime::ngram_mod::NgramModConfig;
 use hipfire_runtime::slot_batch::RequestEpoch;
 use rdna_compute::expert_capabilities::{self, ExpertQt, Route};
-use rdna_compute::{DType, Gpu, GpuTensor};
+use rdna_compute::{DType, Gpu, GpuTensor, MemsetBatch};
 use std::ops::{Deref, DerefMut};
 use std::time::Instant;
 
@@ -150,6 +150,7 @@ fn classify_owned_experts(weights: &Qwen4Weights, config: &Qwen4Config) -> LaneE
     let arenas = match &weights.manifest.identity.recipe {
         Qwen4TierRecipe::FlashNextSlab { arenas, .. } => Some(arenas.as_ref()),
         Qwen4TierRecipe::FlashNextPacked { .. } => None,
+        Qwen4TierRecipe::StockFp8 => return classify_stock_fp8_experts(weights, band),
         _ => return LaneExpertRoute::Unclassified,
     };
     let (mut host_mapped, mut refused, mut e8p_experts, mut mq3_experts) =
@@ -178,6 +179,41 @@ fn classify_owned_experts(weights: &Qwen4Weights, config: &Qwen4Config) -> LaneE
         LaneExpertRoute::ResidentMq3Slab
     } else {
         LaneExpertRoute::Unclassified
+    }
+}
+
+/// Stock-FP8 band: every owned layer a MoE layer whose gate_up / down
+/// aggregates are resident (device, not host-mapped) qt=55 `FP8E4M3B128`
+/// tables with no expert arena is [`LaneExpertRoute::ResidentFp8`]; any
+/// host-mapped aggregate is [`LaneExpertRoute::HostMapped`]; anything else
+/// is `Unclassified`.
+fn classify_stock_fp8_experts(
+    weights: &Qwen4Weights,
+    band: std::ops::Range<usize>,
+) -> LaneExpertRoute {
+    let mut host_mapped = false;
+    for absolute in band {
+        let Some(moe) = weights.layer(absolute).and_then(|layer| layer.ffn.moe()) else {
+            return LaneExpertRoute::Unclassified;
+        };
+        if moe.expert_arena.is_some() {
+            return LaneExpertRoute::Unclassified;
+        }
+        let (Ok(gate_up), Ok(down)) = (
+            weights.resident(&moe.experts_gate_up),
+            weights.resident(&moe.experts_down),
+        ) else {
+            return LaneExpertRoute::Unclassified;
+        };
+        if gate_up.dtype != DType::FP8E4M3B128 || down.dtype != DType::FP8E4M3B128 {
+            return LaneExpertRoute::Unclassified;
+        }
+        host_mapped |= gate_up.buf.is_host_mapped() || down.buf.is_host_mapped();
+    }
+    if host_mapped {
+        LaneExpertRoute::HostMapped
+    } else {
+        LaneExpertRoute::ResidentFp8
     }
 }
 
@@ -490,6 +526,11 @@ struct StageFacts {
     output: bool,
     embedding: Bound,
     ple_rows: StagedRows,
+    /// The input band's PLE key / value projection weight dtypes, resolved via
+    /// `weights.resident` like the other sources. `None` = the stage does not
+    /// exist (model has no PLE); a `None` dtype = the weight did not resolve
+    /// (Unclassified).
+    ple_project: Option<[Bound; 2]>,
     /// Whole-band expert class ([`lane_expert_route`]); only the MoE stage
     /// falls back to it.
     experts: LaneExpertRoute,
@@ -668,6 +709,23 @@ fn gather_stage_facts(bundle: &Qwen4Bundle) -> StageFacts {
         })
         .collect();
     let root = &weights.root;
+    // The lane forward projects PLE through the first PLE layer's key/value
+    // weights; a model without PLE has no such stage.
+    let ple_project = if scope.input && config.ple.is_some() {
+        let ple = config
+            .ple_layer_ids
+            .first()
+            .and_then(|id| id.checked_sub(1))
+            .filter(|&layer| layer < config.num_hidden_layers)
+            .and_then(|layer| weights.layer(layer))
+            .and_then(|layer| layer.ple.as_ref());
+        Some(match ple {
+            Some(ple) => [source(&ple.key), source(&ple.value)],
+            None => [None, None],
+        })
+    } else {
+        None
+    };
     StageFacts {
         topology,
         input: scope.input,
@@ -681,6 +739,7 @@ fn gather_stage_facts(bundle: &Qwen4Bundle) -> StageFacts {
             (None, Some(_)) => StagedRows::Unresolved,
             (None, None) => StagedRows::Absent,
         },
+        ple_project,
         experts,
         layers,
         final_hyper: HyperFacts {
@@ -780,6 +839,13 @@ fn derive_stage_routes(arch: &str, facts: &StageFacts) -> LaneStageRoutes {
             StagedRows::Known(dtype) => {
                 add_route(&mut routes, StageName::PleRows, StageRoute::PleRows(dtype))
             }
+        }
+        if let Some(dtypes) = facts.ple_project {
+            add_route(
+                &mut routes,
+                StageName::PleProject,
+                all_bound(dtypes).map_or(StageRoute::Unclassified, StageRoute::PleProject),
+            );
         }
     }
     for layer in &facts.layers {
@@ -927,7 +993,8 @@ pub struct LaneSampling {
     /// where `reset_cpu_sampler_rng(seed)` leaves the sampler state (0 -> 1).
     pub seed: u32,
     /// The request carried an explicit seed (the wire `seed`). A seeded sampled lane
-    /// verifies row-exact (reproducible across batch compositions); an unseeded one
+    /// keeps the row-exact groups (batch-invariant only under
+    /// `HIPFIRE_QWEN4_LANE_ROW_EXACT=seeded`, or at C1); an unseeded one
     /// may take the wide verify pass (`HIPFIRE_QWEN4_EP_SAMPLED_WIDE_VERIFY`).
     pub seeded: bool,
 }
@@ -1127,6 +1194,29 @@ pub enum LabRoutes {
     Batched,
 }
 
+impl LabRoutes {
+    /// `HIPFIRE_QWEN4_LANE_LAB_ROUTES` (developer; default `floor`): the
+    /// window router a lane store starts with. `batched` drafts every window
+    /// at its whole budget (`HIPFIRE_EP_MTP_LANE_K` caps it), `cycle` walks the
+    /// lab cycle; an unknown value keeps the floor and says so on stderr.
+    pub(crate) fn from_env() -> Self {
+        match hipfire_config::developer_var("HIPFIRE_QWEN4_LANE_LAB_ROUTES")
+            .as_deref()
+            .map(str::trim)
+        {
+            Ok("batched") => Self::Batched,
+            Ok("cycle") => Self::Cycle,
+            Ok("floor") | Ok("") | Err(_) => Self::Floor,
+            Ok(other) => {
+                eprintln!(
+                    "HIPFIRE_QWEN4_LANE_LAB_ROUTES={other:?} is not floor|batched|cycle: the lane floor routes"
+                );
+                Self::Floor
+            }
+        }
+    }
+}
+
 /// One MTP lane's device state next to its trunk state.
 pub struct LaneSpec {
     /// The lane's MTP head state (QSA arenas, selection, wide hidden).
@@ -1197,13 +1287,21 @@ impl LaneSpec {
     /// Back to a request's start: empty head, zero pending hidden, no
     /// window, no owed rows, fresh counters (the window router lives at the
     /// root).
-    fn reset(&mut self, gpu: &mut Gpu) -> Result<(), String> {
+    ///
+    /// The zero-fills (head arenas, pending hidden) are enqueued into `batch`; the
+    /// caller owns the one wait ([`Gpu::memset_batch_sync`], also after an error).
+    fn reset_into(&mut self, gpu: &mut Gpu, batch: &mut MemsetBatch) -> Result<(), String> {
         self.head
-            .reset(gpu)
+            .reset_into(gpu, batch)
             .map_err(|e| format!("lane head reset: {e}"))?;
         self.draft = DraftHeadRequestState::default();
-        gpu.memset_stream_ordered(&self.pending_hidden.buf, 0, self.pending_hidden.buf.size())
-            .map_err(|e| format!("lane pending hidden reset: {e}"))?;
+        gpu.memset_batched(
+            batch,
+            &self.pending_hidden.buf,
+            0,
+            self.pending_hidden.buf.size(),
+        )
+        .map_err(|e| format!("lane pending hidden reset: {e}"))?;
         self.window = None;
         if let Some(lag) = self.lag.as_mut() {
             lag.clear();
@@ -1280,6 +1378,31 @@ fn new_payload(
         }
     };
     Ok((state, spec))
+}
+
+/// Back an existing lane cell to a request's start: trunk state, then (when the store
+/// stages spec) the MTP head and pending hidden, every zero-fill enqueued into `batch`
+/// (the caller owns the one wait, also after an error).
+fn reset_cell_into(
+    gpu: &mut Gpu,
+    cell: &mut Qwen4LaneState,
+    store_has_spec: bool,
+    slot: usize,
+    batch: &mut MemsetBatch,
+) -> Result<(), String> {
+    cell.state
+        .reset_into(gpu, batch)
+        .map_err(|e| format!("admit: reset lane {slot}: {e}"))?;
+    cell.state.row_capture_armed = false;
+    match (store_has_spec, cell.spec.as_mut()) {
+        (true, Some(spec)) => spec
+            .reset_into(gpu, batch)
+            .map_err(|e| format!("admit: reset lane {slot}: {e}")),
+        (false, None) => Ok(()),
+        _ => Err(format!(
+            "admit: lane {slot} spec state does not match the store"
+        )),
+    }
 }
 
 /// One admitted request's whole device state.
@@ -1971,6 +2094,7 @@ pub(crate) fn lane_sample_device(
                     logits: &r.logits,
                     rows: drafts.len() + 1,
                     vocab,
+                    base: 0,
                     drafts,
                     q: &[],
                     history: &[],
@@ -2087,7 +2211,7 @@ impl SpecStore {
             draft_top1,
             draft_top1_host: vec![0; top1_bytes],
             append_scratch,
-            routes: LabRoutes::Floor,
+            routes: LabRoutes::from_env(),
             skip_rollback: false,
         })
     }
@@ -2175,7 +2299,9 @@ pub struct Qwen4LaneStore {
     /// the lane is released.
     page_reserved: Vec<usize>,
     /// A prompt tile past the first chunk has run on this store's device
-    /// ([`pages`]): sticky, never cleared.
+    /// ([`pages`]): sticky, never cleared. Only the rule without the elastic reserve reads
+    /// it; with the reserve a rank is warm exactly while the long-prefill caches are resident
+    /// ([`pages::lane_warm`]).
     pub(crate) long_prefill_seen: std::sync::atomic::AtomicBool,
 }
 
@@ -2646,21 +2772,16 @@ impl Qwen4LaneStore {
                 };
                 match existing {
                     Some(cell) => {
-                        cell.state
-                            .reset(gpu)
-                            .map_err(|e| format!("admit: reset lane {slot}: {e}"))?;
-                        cell.state.row_capture_armed = false;
-                        match (spec_cfg, cell.spec.as_mut()) {
-                            (Some(_), Some(spec)) => spec
-                                .reset(gpu)
-                                .map_err(|e| format!("admit: reset lane {slot}: {e}"))?,
-                            (None, None) => {}
-                            _ => {
-                                return Err(format!(
-                                    "admit: lane {slot} spec state does not match the store"
-                                ));
-                            }
-                        }
+                        // Trunk state, MTP head and pending hidden zero under ONE
+                        // stream wait (paid also when a reset fails part-way).
+                        let mut batch = MemsetBatch::default();
+                        let reset =
+                            reset_cell_into(gpu, cell, spec_cfg.is_some(), slot, &mut batch);
+                        let synced = gpu
+                            .memset_batch_sync(&mut batch)
+                            .map_err(|e| format!("admit: reset lane {slot}: {e}"));
+                        reset?;
+                        synced?;
                         Ok(None)
                     }
                     None => new_payload(gpu, bundle, slot, ring_rows, spec_cfg).map(Some),
@@ -3919,6 +4040,7 @@ mod tests {
             output: true,
             embedding: Some(DType::Q8_0),
             ple_rows: StagedRows::Known(DType::BF16),
+            ple_project: Some([Some(DType::BF16), Some(DType::BF16)]),
             experts: LaneExpertRoute::ResidentPacked,
             layers: vec![
                 layer_facts(gdn(), moe_ffn(qts())),
@@ -3945,6 +4067,10 @@ mod tests {
             vec![StageRoute::Embed(DType::Q8_0)]
         );
         assert_eq!(stage(StageName::PleRows), vec![StageRoute::PleRows(bf16)]);
+        assert_eq!(
+            stage(StageName::PleProject),
+            vec![StageRoute::PleProject([bf16; 2])]
+        );
         assert_eq!(
             stage(StageName::HcRead),
             vec![StageRoute::HyperRead([bf16; 3])]
@@ -4076,6 +4202,12 @@ mod tests {
                 StageName::HcWrite,
                 Box::new(|facts: &mut StageFacts| facts.layers[1].mlp_inject = None),
             ),
+            (
+                StageName::PleProject,
+                Box::new(|facts: &mut StageFacts| {
+                    facts.ple_project = Some([Some(DType::BF16), None])
+                }),
+            ),
         ];
         for (stage, mutate) in cases {
             let mut facts = stage_facts();
@@ -4123,6 +4255,7 @@ mod tests {
         for name in [
             StageName::Embed,
             StageName::PleRows,
+            StageName::PleProject,
             StageName::QsaInProj,
             StageName::QsaOutProj,
             StageName::FinalHyper,
@@ -4146,6 +4279,13 @@ mod tests {
         );
         facts.ple_rows = StagedRows::Absent;
         assert!(derive_stage_routes(ARCH, &facts)[StageName::PleRows.index()].is_empty());
+        facts.ple_project = None;
+        assert!(derive_stage_routes(ARCH, &facts)[StageName::PleProject.index()].is_empty());
+        facts.ple_project = Some([None, Some(DType::BF16)]);
+        assert_eq!(
+            derive_stage_routes(ARCH, &facts)[StageName::PleProject.index()],
+            vec![StageRoute::Unclassified]
+        );
     }
 
     #[test]
@@ -4157,6 +4297,7 @@ mod tests {
         for name in [
             StageName::Embed,
             StageName::PleRows,
+            StageName::PleProject,
             StageName::FinalHyper,
             StageName::Head,
             StageName::Argmax,

@@ -336,6 +336,7 @@ fn op<'a>(
         dilation,
         epsilon: EPS,
         lane_states,
+        projected: false,
     }
 }
 

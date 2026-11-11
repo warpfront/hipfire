@@ -8,8 +8,8 @@
 //!
 //! The ordinary plan derives a hazard edge for every RAW/WAR/WAW between
 //! nodes and answers it with a `WaitIdle` boundary: between two pools that
-//! deadlocks the window. A group changes the plan in exactly two ways and
-//! admits nothing for free:
+//! deadlocks the window. A group (of one pool, which has no inside edges, or
+//! several) changes the plan in exactly two ways and admits nothing for free:
 //!
 //! - **Outside edges** are unchanged and checked up front. Before the group's
 //!   first member the plan emits the join of *every* member's edges against
@@ -57,6 +57,21 @@ pub struct GroupOrdering {
     /// The edges are not from a certificate (`lab`: differential-verified,
     /// certificate pending).
     pending: bool,
+    /// Named lab reasons the pending ordering rests on beyond "no
+    /// certificate" (e.g. unproven inter-workgroup disjointness); each is
+    /// reported by the admission.
+    pending_reasons: Vec<String>,
+    /// The member range a task-graph check ([`crate::task_graph`]) covered:
+    /// every member's task headers were proven race-free and deadlock-free
+    /// against its dispatcher protocol. A member that carries a task protocol
+    /// is refused by the plan unless this covers it, so the node-level edges
+    /// above are never the only evidence for a persistent pool.
+    task_graph: Option<Range<usize>>,
+    /// Span lists ([`crate::task_graph::TaskGraphProof::spans`]) the check
+    /// proved: GPU-generated routed tasks whose completeness no certificate
+    /// covers, so the admission receipt must carry evidence for it
+    /// ([`crate::admission::Admission::receipt_with_completeness`]).
+    spans: usize,
 }
 
 impl GroupOrdering {
@@ -66,16 +81,44 @@ impl GroupOrdering {
         Self {
             edges: Vec::new(),
             pending: false,
+            pending_reasons: Vec::new(),
+            task_graph: None,
+            spans: 0,
         }
     }
 
     /// The ordering a task-graph certificate produced.
-    #[allow(dead_code)] // the producer, `crate::task_graph`, does not exist yet; tests build one
+    #[allow(dead_code)] // tests build one directly
     pub(crate) fn from_certificate(edges: Vec<OrderedEdge>) -> Self {
         Self {
             edges,
             pending: false,
+            pending_reasons: Vec::new(),
+            task_graph: None,
+            spans: 0,
         }
+    }
+
+    /// The ordering of a [`crate::task_graph::TaskGraphProof`] over `nodes`.
+    pub(crate) fn with_task_graph(mut self, nodes: Range<usize>) -> Self {
+        self.task_graph = Some(nodes);
+        self
+    }
+
+    /// The ordering of a proof that covers `lists` span lists.
+    pub(crate) fn with_spans(mut self, lists: usize) -> Self {
+        self.spans = lists;
+        self
+    }
+
+    /// The number of span lists the ordering's task-graph proof covered.
+    pub fn spans(&self) -> usize {
+        self.spans
+    }
+
+    /// The member range a task-graph check covered, if any.
+    pub fn task_graph(&self) -> Option<&Range<usize>> {
+        self.task_graph.as_ref()
     }
 
     /// Lab only: an ordering whose certificate is pending. Its edges get
@@ -87,7 +130,23 @@ impl GroupOrdering {
         Self {
             edges,
             pending: true,
+            pending_reasons: Vec::new(),
+            task_graph: None,
+            spans: 0,
         }
+    }
+
+    /// Lab only: name the reasons this pending ordering is admitted
+    /// uncertified; they are reported verbatim in the group's admission.
+    #[cfg(feature = "lab")]
+    pub fn with_pending_reasons(mut self, reasons: Vec<String>) -> Self {
+        self.pending_reasons = reasons;
+        self
+    }
+
+    /// The named pending reasons ([`GroupOrdering::with_pending_reasons`]).
+    pub fn pending_reasons(&self) -> &[String] {
+        &self.pending_reasons
     }
 
     pub fn edges(&self) -> &[OrderedEdge] {
@@ -130,6 +189,15 @@ pub struct GroupPlan {
     pub pending: Vec<String>,
     /// The progress proof ([`Pm4Plan::admit_residency`]); `None` until given.
     pub residency: Option<ResidencyProof>,
+    /// Span lists the group's task-graph proof covered
+    /// ([`GroupOrdering::spans`]); the admission then needs completeness
+    /// evidence.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub spans: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 /// Evidence that every member of a group can be resident at once.
@@ -205,14 +273,18 @@ pub(crate) fn check_ordered_edge(
             e.producer, e.consumer, e.consumer, e.event.0
         ));
     }
+    // The edge orders the producer's accesses before the consumer's: at least
+    // one of the two must write the resource (RAW/WAW: the producer; WAR: the
+    // consumer, after the producer's reads).
     if !program.nodes[e.producer]
         .effects
         .iter()
+        .chain(&program.nodes[e.consumer].effects)
         .any(|x| x.resource == e.resource && x.writes())
     {
         return Err(format!(
-            "ordered edge {}->{}: producer {} does not write resource {}",
-            e.producer, e.consumer, e.producer, e.resource.0
+            "ordered edge {}->{}: neither node writes resource {}",
+            e.producer, e.consumer, e.resource.0
         ));
     }
     Ok(())
@@ -231,6 +303,23 @@ pub(crate) fn classify(
         if !program.nodes[m].lowering.is_pm4_lowerable() {
             refusals.push(format!(
                 "member {m} ({}) is not PM4",
+                program.nodes[m].symbol
+            ));
+        }
+    }
+    for &m in &members {
+        let covered = group
+            .ordering
+            .task_graph()
+            .is_some_and(|covered| *covered == group.nodes);
+        if program.nodes[m]
+            .arena
+            .as_ref()
+            .is_some_and(|a| a.task_protocol.is_some())
+            && !covered
+        {
+            refusals.push(format!(
+                "member {m} ({}) carries a task protocol but no task-graph proof covers the group",
                 program.nodes[m].symbol
             ));
         }
@@ -349,21 +438,26 @@ pub(crate) fn classify(
 impl KernelProgram {
     /// Declare nodes `nodes` a co-resident group: they run concurrently, so
     /// [`crate::plan::plan`] puts no boundary between them (see the module
-    /// docs). Refused (the program is unchanged) unless there are at least
-    /// two members, in bounds, every one PM4, disjoint from every other group
+    /// docs). Refused (the program is unchanged) unless there is at least
+    /// one member, in bounds, every one PM4, disjoint from every other group
     /// and from every conditional body, and every [`OrderedEdge`] of
     /// `ordering` is real: distinct members, its `event` declared
     /// `EventCells`, the producer holds an `AtomicRelease` on the event
     /// ("missing release" otherwise), the consumer a `LoadAcquire`
     /// ("missing acquire"), and the producer writes the resource.
+    ///
+    /// A one-member group is a degenerate persistent program (a single
+    /// pool): no member-member edges, but its residency proof is still
+    /// required ([`Pm4Plan::admit_residency`]) and its ordering's task-graph
+    /// coverage, span count and pending reasons attach as for a larger group.
     pub fn add_coresident_group(
         &mut self,
         nodes: Range<usize>,
         ordering: GroupOrdering,
     ) -> Result<(), String> {
-        if nodes.len() < 2 {
+        if nodes.is_empty() {
             return Err(format!(
-                "co-resident group {nodes:?} needs at least two nodes"
+                "co-resident group {nodes:?} needs at least one node"
             ));
         }
         if nodes.end > self.nodes.len() {
@@ -371,6 +465,13 @@ impl KernelProgram {
                 "co-resident group {nodes:?} is past {} nodes",
                 self.nodes.len()
             ));
+        }
+        if let Some(covered) = ordering.task_graph() {
+            if *covered != nodes {
+                return Err(format!(
+                    "co-resident group {nodes:?}: the ordering's task-graph proof covers {covered:?}"
+                ));
+            }
         }
         for j in nodes.clone() {
             if !self.nodes[j].lowering.is_pm4_lowerable() {
@@ -825,7 +926,14 @@ mod tests {
     #[test]
     fn group_shape_is_validated() {
         let mut p = ordered_program();
-        assert!(p.add_coresident_group(0..1, GroupOrdering::none()).is_err());
+        assert!(p.add_coresident_group(0..0, GroupOrdering::none()).is_err());
+        // A one-pool group is a degenerate group (it still needs a residency
+        // proof, like any other).
+        let mut single = p.clone();
+        single
+            .add_coresident_group(0..1, GroupOrdering::none())
+            .unwrap();
+        assert_eq!(single.groups[0].nodes, 0..1);
         assert!(p.add_coresident_group(0..5, GroupOrdering::none()).is_err());
         p.nodes[1].lowering = Lowering::HipDirect { reason: "x".into() };
         assert!(p.add_coresident_group(0..2, GroupOrdering::none()).is_err());

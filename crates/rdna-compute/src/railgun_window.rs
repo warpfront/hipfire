@@ -22,17 +22,26 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use redline_dispatch::aql::CancelEvidence;
 
 use railgun::kernel::{KernelProgram, NodeFacts};
 use railgun::plan::Pm4Plan;
-use railgun::window::{NodeImage, QueueFailure, Quiescence, ResolvedStep, WindowQueue};
+use railgun::window::{
+    FailureKind, NodeImage, QueueFailure, Quiescence, ResolvedStep, Teardown, TimedWait,
+    WindowQueue,
+};
 use railgun::{Binding, ResourceId};
 use railgun_corpus::window::{ConditionalWitness, NodeRoute, RuntimeNode, WindowManifest};
 use railgun_corpus::{sha256_hex, JitCorpus};
 
+pub use crate::railgun_quarantine::DeviceKey;
+use crate::railgun_quarantine::{quarantine, quarantine_reason, refuse_if_quarantined};
 pub use crate::replay::railgun_lower::LowerTiming;
 use crate::replay::railgun_lower::{
-    DeviceSelect, LoweringContext, OwnedReplayFailure, OwnedWindowLowering, SelfCheckFailure,
+    DeviceSelect, LoweringContext, OwnedBoundedWait, OwnedReplayFailure, OwnedWindowLowering,
+    SelfCheckFailure,
 };
 use crate::replay::railgun_shadow::{arch_lowering, lookup_facts, probe};
 use crate::replay::ReplayQuiescence;
@@ -428,6 +437,7 @@ impl Gpu {
         receipt_json: &[u8],
         symbols: &[&str],
     ) -> Result<Vec<Arc<NodeFacts>>, String> {
+        refuse_if_quarantined(&self.railgun_device_key())?;
         if self.plan_mode_active() {
             return Err(format!(
                 "{module}: a pinned object cannot be registered inside plan mode"
@@ -546,7 +556,23 @@ impl Gpu {
         };
         Ok(RailgunLoweringContext {
             inner: LoweringContext::new(select)?,
+            device: self.railgun_device_key(),
         })
+    }
+
+    /// The quarantine key of this device: `pci:<address>` when the PCI
+    /// address resolves, else `hip:<ordinal>`.
+    pub fn railgun_device_key(&self) -> DeviceKey {
+        match self.railgun_device_pci_address() {
+            Ok(address) => DeviceKey::from_pci(&address),
+            Err(_) => DeviceKey::from_ordinal(self.device_id),
+        }
+    }
+
+    /// Why this device is quarantined for railgun, if it is (cleared only by
+    /// process restart).
+    pub fn railgun_device_quarantine(&self) -> Option<String> {
+        quarantine_reason(&self.railgun_device_key())
     }
 
     /// `(name, base, bytes)` of every live `Gpu` scratch slot (the lazily
@@ -600,6 +626,7 @@ impl Gpu {
             q8_a8_x_scratch,
             mq8_x_scratch,
             int8_mmq_x_scratch,
+            int8_mmq_down_x_scratch,
             mq4v2_fp8_x_scratch,
             mq4v2_fp8_half_sums_scratch,
             mq4v2_fp8_row_scales_scratch,
@@ -789,14 +816,18 @@ impl Gpu {
         Ok(())
     }
 
-    /// Write the pointer fields of binding-record arena `arena` of `program`
+    /// Write the pointer fields, declared null fields and declared `u32`
+    /// scalars of binding-record arena `arena` of `program`
     /// (`KernelProgram::binding_record_image` over the authored bindings:
-    /// each field is `base(resource) + interior`) into the arena's device
-    /// allocation, then read every field back and compare. The arena's
+    /// each pointer field is `base(resource) + interior`, each null field 8
+    /// zero bytes, each scalar its declared value) into the arena's device
+    /// allocation, then read every field back and compare (a null field must
+    /// read back as zero). The arena's
     /// binding must be exactly the live allocation HIP reports for its base.
     /// Fields are written at their arena offsets, adjacent ones in one copy;
-    /// the non-pointer bytes of the records are the caller's. Returns the
-    /// number of pointer fields written; any readback mismatch is an `Err`.
+    /// the other bytes of the records are the caller's. Returns the number
+    /// of fields (pointers, nulls and scalars) written; any readback
+    /// mismatch is an `Err`.
     /// Refused inside plan mode.
     pub fn railgun_write_binding_records(
         &self,
@@ -806,7 +837,8 @@ impl Gpu {
         if self.plan_mode_active() {
             return Err("binding records cannot be written inside plan mode".to_owned());
         }
-        let fields = program.binding_record_image(arena, &program.resources)?;
+        let image = program.binding_record_image(arena, &program.resources)?;
+        let writes = image.writes();
         let binding = *program
             .resources
             .get(arena.0 as usize)
@@ -833,10 +865,11 @@ impl Gpu {
         let mut end = 0u64;
         let mut run: Vec<u8> = Vec::new();
         let mut run_at = 0u64;
-        for &(at, value) in &fields {
+        for (at, bytes) in &writes {
+            let at = *at;
             if at < end {
                 return Err(format!(
-                    "arena {}: pointer field at +{at} overlaps the previous field ending at +{end}",
+                    "arena {}: field at +{at} overlaps the previous field ending at +{end}",
                     arena.0
                 ));
             }
@@ -849,32 +882,28 @@ impl Gpu {
             if run.is_empty() {
                 run_at = at;
             }
-            run.extend_from_slice(&value.to_le_bytes());
-            end = at + 8;
+            run.extend_from_slice(bytes);
+            end = at + bytes.len() as u64;
         }
         if !run.is_empty() {
             self.hip
                 .memcpy_htod_offset(&buf, run_at as usize, &run)
                 .map_err(|e| format!("arena {} write +{run_at}: {e}", arena.0))?;
         }
-        if fields.is_empty() {
+        if writes.is_empty() {
             return Ok(0);
         }
         let back = self.railgun_read_allocation(binding, end as usize)?;
-        for &(at, value) in &fields {
-            let got = u64::from_le_bytes(
-                back[at as usize..at as usize + 8]
-                    .try_into()
-                    .expect("an 8-byte field"),
-            );
-            if got != value {
+        for (at, bytes) in &writes {
+            let got = &back[*at as usize..*at as usize + bytes.len()];
+            if got != bytes.as_slice() {
                 return Err(format!(
-                    "arena {} field +{at}: read back {got:#x}, wrote {value:#x}",
+                    "arena {} field +{at}: read back {got:02x?}, wrote {bytes:02x?}",
                     arena.0
                 ));
             }
         }
-        Ok(fields.len())
+        Ok(image.len())
     }
 }
 
@@ -883,6 +912,7 @@ impl Gpu {
 /// lowering. Dropping it releases only what no skeleton still holds.
 pub struct RailgunLoweringContext {
     inner: LoweringContext,
+    device: DeviceKey,
 }
 
 impl RailgunLoweringContext {
@@ -902,6 +932,7 @@ impl RailgunLoweringContext {
         plan: &Pm4Plan,
         artifacts: &RailgunArtifacts,
     ) -> Result<RailgunWindowQueue, String> {
+        refuse_if_quarantined(&self.device)?;
         if artifacts.arch != arch || program.arch != arch {
             return Err(format!(
                 "program arch {}, artifacts for {}, device arch {arch}",
@@ -938,6 +969,10 @@ impl RailgunLoweringContext {
             admitted_grids,
             lowering,
             failure: None,
+            device: self.device.clone(),
+            torn_down: false,
+            teardown_report: None,
+            poison: None,
             in_flight: false,
             timing,
             admission,
@@ -971,6 +1006,17 @@ static LAST_SELF_CHECK: Mutex<Option<Vec<(usize, u64, usize)>>> = Mutex::new(Non
 /// and indirect buffer belong to the GPU until `wait` returns, so a submit
 /// (blocking or not) while one is in flight is refused before anything is
 /// written, and `wait` is what proves quiescence and reports the outcome.
+/// `wait` keeps its 5 s `DEFAULT_WAIT_TIMEOUT` semantics (inactivate on
+/// timeout) for non-persistent use.
+///
+/// Persistent cancel (`supports_persistent_cancel`): `wait_timeout` waits
+/// without tearing down, `raise_poison` stores into a host-mapped
+/// [`HostPoisonCell`] without touching this queue, and `teardown` inactivates
+/// the queue and reports `Proven` only when the completion signal reached zero
+/// afterwards; otherwise the device is quarantined
+/// (`railgun_quarantine`). A torn-down queue refuses every submit with
+/// `FailureKind::TornDown`; a quarantined device refuses with
+/// `FailureKind::DeviceQuarantined`.
 ///
 /// Dropping the queue with a replay in flight cannot free a kernarg buffer
 /// under a running dispatch: `lowering` is declared first and the indirect
@@ -1004,6 +1050,14 @@ pub struct RailgunWindowQueue {
     /// A `submit_nowait` replay is outstanding: nothing may be written or
     /// submitted until `wait` observes it.
     in_flight: bool,
+    /// Device this queue lowered on (quarantine key).
+    device: DeviceKey,
+    /// Persistent cancel tore the queue down: every submit is refused.
+    torn_down: bool,
+    /// What `teardown` reported (returned again on repeat calls).
+    teardown_report: Option<(Quiescence, String)>,
+    /// Host-mapped poison cell for `raise_poison`.
+    poison: Option<HostPoisonCell>,
     /// Where lowering this queue spent its time.
     timing: LowerTiming,
     /// What the lowered program's certificate slot is (`Certified`, or lab
@@ -1068,10 +1122,17 @@ impl RailgunWindowQueue {
     }
 
     fn proven(message: String) -> QueueFailure {
-        QueueFailure {
-            message,
-            quiescence: Quiescence::Proven,
-        }
+        QueueFailure::new(message, Quiescence::Proven)
+    }
+
+    /// Why this queue's device is quarantined, if it is.
+    pub fn device_quarantine(&self) -> Option<String> {
+        quarantine_reason(&self.device)
+    }
+
+    /// Register the host-mapped poison cell `raise_poison` writes.
+    pub fn set_poison_cell(&mut self, cell: HostPoisonCell) {
+        self.poison = Some(cell);
     }
 
     /// Write the images and grids that changed; every failure here happens
@@ -1115,6 +1176,17 @@ impl RailgunWindowQueue {
         nodes: &[NodeImage<'_>],
         steps: &[ResolvedStep],
     ) -> Result<(), QueueFailure> {
+        // Refused before anything is written or recorded: a quarantined
+        // device, then a queue already torn down by persistent cancel.
+        if let Some(failure) = quarantine_refusal(&self.device) {
+            return Err(failure);
+        }
+        if self.torn_down {
+            return Err(Self::proven(
+                "queue torn down by persistent cancel; lower a new window".into(),
+            )
+            .with_kind(FailureKind::TornDown));
+        }
         if self.in_flight {
             // Refused before any write: `prepare` rewrites kernargs, which
             // is only legal while quiescent. Not recorded in `failure`,
@@ -1196,13 +1268,13 @@ impl RailgunWindowQueue {
 
     /// Store a replay failure as what `wait` reports, and return it.
     fn record_failure(&mut self, failure: OwnedReplayFailure) -> QueueFailure {
-        let failure = QueueFailure {
-            message: failure.error,
-            quiescence: match failure.quiescence {
+        let failure = QueueFailure::new(
+            failure.error,
+            match failure.quiescence {
                 ReplayQuiescence::Proven => Quiescence::Proven,
                 ReplayQuiescence::Unknown => Quiescence::Unknown,
             },
-        };
+        );
         self.failure = Some(failure.clone());
         failure
     }
@@ -1260,6 +1332,107 @@ impl WindowQueue for RailgunWindowQueue {
         match &self.failure {
             Some(failure) => Err(failure.clone()),
             None => Ok(()),
+        }
+    }
+
+    fn supports_persistent_cancel(&self) -> bool {
+        true
+    }
+
+    fn wait_timeout(&mut self, timeout: Duration) -> TimedWait {
+        if !self.in_flight {
+            return TimedWait::Done(self.wait());
+        }
+        match self.lowering.wait_replay_bounded(timeout) {
+            OwnedBoundedWait::Complete => {
+                self.in_flight = false;
+                TimedWait::Done(self.wait())
+            }
+            // Nothing was inactivated or changed: still in flight.
+            OwnedBoundedWait::Pending => TimedWait::Pending,
+            OwnedBoundedWait::Failed(f) => {
+                self.in_flight = false;
+                let failure = self.record_failure(f);
+                // A fault whose own teardown could not be proven leaves
+                // waves possibly resident: the same device consequence as an
+                // unproven escalation.
+                if failure.quiescence == Quiescence::Unknown {
+                    quarantine(
+                        &self.device,
+                        format!(
+                            "persistent window queue fault with unproven teardown: {}",
+                            failure.message
+                        ),
+                    );
+                }
+                TimedWait::Done(Err(failure))
+            }
+        }
+    }
+
+    fn raise_poison(&mut self, address: u64, value: u32) -> Result<(), QueueFailure> {
+        let Some(cell) = &self.poison else {
+            return Err(Self::proven(
+                "poison cell is not host-mapped: there is no queue-independent write path to it"
+                    .into(),
+            ));
+        };
+        if cell.device_address() != address || value == 0 {
+            return Err(Self::proven(format!(
+                "poison cell is not host-mapped at {address:#x} (the host-mapped cell is at {:#x}) or the value is zero: there is no queue-independent write path to it",
+                cell.device_address()
+            )));
+        }
+        // Deliberately not through the lowering or its queue: the queue is
+        // the thing that is stuck.
+        cell.store(value);
+        Ok(())
+    }
+
+    fn teardown(&mut self, observe: Duration) -> Teardown {
+        if self.torn_down {
+            let (quiescence, message) = self
+                .teardown_report
+                .clone()
+                .unwrap_or((Quiescence::Unknown, "queue torn down".into()));
+            return Teardown {
+                quiescence,
+                message,
+            };
+        }
+        self.torn_down = true;
+        let (quiescence, message) = match self.lowering.cancel_replay(observe) {
+            Ok(CancelEvidence::RetirementObserved) => {
+                self.in_flight = false;
+                (
+                    Quiescence::Proven,
+                    "queue inactivated; the end-of-pipe completion signal reached zero after inactivation (retirement observed)".to_string(),
+                )
+            }
+            Ok(CancelEvidence::InactivatedOnly) => {
+                self.in_flight = false;
+                let message = "queue inactivated but no retirement evidence was observed (redline-rocr runtime.rs:1621-1626 documents only that inactivation aborts pending executions and has no wall-clock bound)".to_string();
+                quarantine(&self.device, message.clone());
+                (Quiescence::Unknown, message)
+            }
+            Err(e) => {
+                let message = format!("queue inactivation failed: {e}");
+                quarantine(&self.device, message.clone());
+                (Quiescence::Unknown, message)
+            }
+        };
+        self.teardown_report = Some((quiescence.clone(), message.clone()));
+        // Outputs of a torn-down window are invalid whatever was proven.
+        self.failure = Some(
+            QueueFailure::new(
+                format!("queue torn down by persistent cancel: {message}"),
+                quiescence.clone(),
+            )
+            .with_kind(FailureKind::TornDown),
+        );
+        Teardown {
+            quiescence,
+            message,
         }
     }
 }
@@ -1355,9 +1528,142 @@ pub struct RailgunProvisionContext {
     pub local_corpus_dir: PathBuf,
 }
 
+/// The `DeviceQuarantined` refusal of a submit on `key`, or `None` when the
+/// device is not quarantined. Nothing is written or recorded by the caller.
+fn quarantine_refusal(key: &DeviceKey) -> Option<QueueFailure> {
+    refuse_if_quarantined(key).err().map(|message| {
+        QueueFailure::new(message, Quiescence::Proven).with_kind(FailureKind::DeviceQuarantined)
+    })
+}
+
+/// Host-mapped 32-bit poison cell: the one word a persistent-window cancel
+/// writes (`WindowQueue::raise_poison`) without going through the stuck
+/// queue.
+///
+/// # Visibility argument
+///
+/// The cell lives in signal memory (`hipMallocSignalMemory`, the ROCr
+/// fine-grained system pool), which is host-coherent. The host store goes
+/// straight to that memory through a plain CPU pointer: it uses no queue,
+/// stream or copy engine, so it cannot wait behind the stuck queue. The device
+/// workers poll with device-scope acquire loads (peacemaker `event_wait`,
+/// `Scope::Dev`, `crates/peacemaker-isa/src/global_sync.rs:242`), which bypass
+/// the vector cache. Whether a device-scope load observes a host store to this
+/// memory is an on-hardware fact that is NOT proven here: the lab smoke
+/// `railgun_persistent_cancel_smoke` is the oracle.
+///
+/// Rejected alternatives: a HIP memcpy on a side stream (a blit/SDMA copy can
+/// queue behind a resident kernel or need CUs the persistent kernel holds) and
+/// `hipStreamWriteValue32` (stream-ordered, so not independent of device
+/// state).
+pub struct HostPoisonCell {
+    device_address: u64,
+    host: *mut u32,
+}
+
+// SAFETY: the cell is a pointer to fine-grained signal memory accessed only
+// through volatile loads/stores of a naturally aligned u32; no thread-affine
+// state. The creator keeps the allocation alive (`from_signal_memory`).
+unsafe impl Send for HostPoisonCell {}
+
+impl HostPoisonCell {
+    /// The cell of a `hip_bridge::SignalWord`. Signal memory's host pointer
+    /// equals its device pointer (hip-bridge `ffi.rs` `signal_word()`). The
+    /// word must outlive every queue holding the cell.
+    pub fn from_signal_word(word: &hip_bridge::SignalWord) -> Self {
+        let ptr = word.device_buffer().as_ptr();
+        Self {
+            device_address: ptr as usize as u64,
+            host: ptr as *mut u32,
+        }
+    }
+
+    /// The cell at byte `offset` of `buf`.
+    ///
+    /// # Safety
+    /// `buf` MUST come from `HipRuntime::malloc_signal` (host and device
+    /// addressable), and the caller keeps the allocation alive for as long as
+    /// any queue holds the cell.
+    pub unsafe fn from_signal_memory(
+        buf: &hip_bridge::DeviceBuffer,
+        offset: u64,
+    ) -> Result<Self, String> {
+        if offset % 4 != 0 {
+            return Err(format!("poison cell offset {offset} is not 4-aligned"));
+        }
+        let end = offset
+            .checked_add(4)
+            .ok_or_else(|| "poison cell offset overflows".to_string())?;
+        if end > buf.size() as u64 {
+            return Err(format!(
+                "poison cell at offset {offset} does not fit a {}-byte buffer",
+                buf.size()
+            ));
+        }
+        let base = buf.as_ptr() as usize as u64;
+        Ok(Self {
+            device_address: base + offset,
+            host: (base + offset) as usize as *mut u32,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_host_pointer(device_address: u64, host: *mut u32) -> Self {
+        Self {
+            device_address,
+            host,
+        }
+    }
+
+    pub fn device_address(&self) -> u64 {
+        self.device_address
+    }
+
+    /// Release fence, then a volatile store (mirrors
+    /// `hip_bridge::SignalWord::store_release`): host-side order only; device
+    /// visibility is the lab smoke's question.
+    pub fn store(&self, value: u32) {
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+        // SAFETY: `host` is a live, aligned u32 (constructor contract).
+        unsafe { self.host.write_volatile(value) };
+    }
+
+    /// Volatile load, then an acquire fence.
+    pub fn load(&self) -> u32 {
+        // SAFETY: as in `store`.
+        let v = unsafe { self.host.read_volatile() };
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+        v
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_poison_cell_round_trip_and_address() {
+        let mut word = Box::new(0u32);
+        let cell = HostPoisonCell::from_host_pointer(0x1000, &mut *word as *mut u32);
+        assert_eq!(cell.device_address(), 0x1000);
+        assert_eq!(cell.load(), 0);
+        cell.store(0xdead_beef);
+        assert_eq!(cell.load(), 0xdead_beef);
+        assert_eq!(*word, 0xdead_beef);
+    }
+
+    #[test]
+    fn quarantine_refusal_reports_kind_and_reason() {
+        let key = DeviceKey::from_pci("test:window-refusal");
+        assert!(quarantine_refusal(&key).is_none());
+        quarantine(&key, "no retirement evidence (test)");
+        let failure = quarantine_refusal(&key).expect("quarantined");
+        assert_eq!(failure.kind, FailureKind::DeviceQuarantined);
+        assert_eq!(failure.quiescence, Quiescence::Proven);
+        assert!(failure.message.contains("no retirement evidence (test)"));
+        crate::railgun_quarantine::clear_for_test(&key);
+        assert!(quarantine_refusal(&key).is_none());
+    }
     use crate::replay::railgun_lower::KernargMismatch;
     use railgun_corpus::window::{
         sequence_digest, WindowNodeRecord, WHOLE16_SHAPE, WINDOW_MANIFEST_SCHEMA,

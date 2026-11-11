@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
-//! PeaceMaker x-batched MQ2G256V2 GEMV for gfx1201 (WideNet F05 `r4_b4_u1_native_anchor`, shipped as
+//! PeaceMaker x-batched MQ2G256V2 GEMV for gfx1201 (`r4_b8_u1_native_anchor`, shipped as
 //! `kernels/gemv_mq2_xbatch_pm_gfx1201.hxaco`): byte-exact PM twin and bounded variants of `gemv_mq2g256v2_xbatch`
-//! (`kernels/src/gemv_mq2g256v2.hip`, `XBATCH_MAX = 4`; the MTP draft-head ranking GEMV).
+//! (`kernels/src/gemv_mq2g256v2.hip`; the MTP draft-head ranking GEMV). The hipcc anchor itself is fixed at
+//! `XBATCH_MAX = 4` (it clamps `B > 4` to 4); this emitter admits capacities up to [`XBATCH_MAX`] = 8.
 //!
-//! Lab only: nothing here is registered in a shipping registry or reachable from a product route.
+//! The product PM kernel is the [`SHIPPED`] tuple's committed `.hxaco`, pinned byte-for-byte by
+//! `tests/gemv_mq2_xbatch_pm.rs`. Other tuples remain lab output; shipping a different tuple requires a
+//! measured selection and re-pinning the artifact.
 //!
 //! ABI (36 B, identical to the anchor): `A` (read-only), `x[B][K]` (read-only), `y[B][M]` (write-only)
 //! pointers at 0/8/16, `M`/`K`/`B` i32 at 24/28/32. Anchor launch: wave32, block 32, grid `M`, no LDS/scratch.
@@ -17,18 +20,21 @@
 //! .. `w7*x7`; group `g` accumulates `acc[g % 4] += dot` in increasing `g` (quads, then scalar tail groups
 //! into streams 0..2); the row result is `(a0 + a1) + (a2 + a3)` followed by the frozen wave32 shfl_down
 //! tree (swizzle `1pppp`, then self-reading bpermutes 8/4/2/1, each `own + other`); lane 0 stores
-//! `y[b*M + row]`. No reassociation, no FMA-contraction change. `B > 4` computes four columns and `B <= 0`
-//! stores nothing, as the anchor does.
+//! `y[b*M + row]`. No reassociation, no FMA-contraction change. `B > cap` computes `cap` columns (the hipcc anchor
+//! is cap 4) and `B <= 0` stores nothing, as the anchor does.
 //!
-//! Grammar (`variant_grid`, 108 tuples, canonical lexicographic order of
+//! Grammar (`rows x cap x unroll x split x ilp` tuples, canonical order of
 //! `(rows, cap, unroll, load, schedule)`): rows per workgroup `{1,2,4}` (workgroup `w` owns rows
 //! `R*w..`, loads of rows past `M` clamp to `M-1`, stores only valid rows; launch grid `ceil(M/R)`);
-//! x-batch capacity `{1,2,4}` (code paths for `B = 1..=cap`; `B > cap` is host-rejected, the kernel clamps);
+//! x-batch capacity `{1,2,4,8}` (code paths for `B = 1..=cap`; the kernel clamps `B > cap`; column offsets use
+//! `s28..s35`);
 //! quads per loop trip `{1,2,4}` (main loop, then a one-quad remainder loop; tail groups unchanged);
 //! activation load decomposition `{native 2xb128, split 4xb64}` (same bytes, same registers);
 //! schedule `{anchor, quad_ILP}` (`quad_ILP` decodes group pairs `(0,1),(2,3)` into two weight sets and
 //! interleaves their dependent fmac chains term by term; each chain's own order is unchanged).
-//! The twin is `(rows 1, cap 4, unroll 1, native, anchor)`: launch-identical to the anchor.
+//! The twin of the hipcc anchor is `(rows 1, cap 4, unroll 1, native, anchor)`: launch-identical to it.
+//! Not every tuple closes: [`Params::validate`] checks the grid, then the builder rejects tuples whose ring/register
+//! plan does not fit (e.g. `r4_b8` with `quad_ILP` has 1 ring slot but needs 4; `r4_b8` anchor schedule has 6).
 //!
 //! Domain of the byte-exact claim: `K % 256 == 0`, `K >= 0`, `M >= 1`, `A` addressed by a 32-bit
 //! row/group byte offset (`< 4 GiB`), `y` offsets `B*M*4 < 4 GiB` (the real FN shape is 178.8 MB / 3.0 MB).
@@ -40,7 +46,7 @@ use crate::{Arch, Builder, KernargLayout, KernelSpec, RegPlan};
 
 pub const SYMBOL: &str = "gemv_mq2g256v2_xbatch_pm";
 pub const ANCHOR_SYMBOL: &str = "gemv_mq2g256v2_xbatch";
-pub const XBATCH_MAX: u8 = 4;
+pub const XBATCH_MAX: u8 = 8;
 pub const GROUP_BYTES: u32 = 72;
 const VGPR_BUDGET: u16 = 256;
 
@@ -48,14 +54,14 @@ const VGPR_BUDGET: u16 = 256;
 pub const ORDERED_DAG: &str = "gemv_mq2g256v2_xbatch/gfx1201/v1;\
 w_n=fma_mix(f16lo(h),f32(q_n),f16hi(h)) h=lane<16?hdr0:hdr1 q_n=(pk>>2n)&3 pk=u32@group+8+2*lane;\
 dot=mul(w1,x1);dot=fmac(w0,x0);dot=fmac(w2,x2)..fmac(w7,x7);acc[g%4]=acc[g%4]+dot;g ascending(quads then tail);\
-row=(a0+a1)+(a2+a3);reduce=swizzle(1pppp);then bpermute 8,4,2,1 each own+other;lane0 store y[b*M+row];B>4=>4";
+row=(a0+a1)+(a2+a3);reduce=swizzle(1pppp);then bpermute 8,4,2,1 each own+other;lane0 store y[b*M+row];B>8=>8";
 
 /// One point of the finite variant grid.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Params {
     /// output rows per workgroup (`1`, `2`, `4`)
     pub rows: u8,
-    /// x-batch capacity (`1`, `2`, `4`)
+    /// x-batch capacity (`1`, `2`, `4`, `8`)
     pub cap: u8,
     /// quads per main-loop trip (`1`, `2`, `4`)
     pub unroll: u8,
@@ -82,8 +88,8 @@ impl Params {
         if ![1, 2, 4].contains(&self.rows) {
             return Err(format!("rows {} not in {{1,2,4}}", self.rows));
         }
-        if ![1, 2, 4].contains(&self.cap) {
-            return Err(format!("cap {} not in {{1,2,4}}", self.cap));
+        if ![1, 2, 4, 8].contains(&self.cap) {
+            return Err(format!("cap {} not in {{1,2,4,8}}", self.cap));
         }
         if ![1, 2, 4].contains(&self.unroll) {
             return Err(format!("unroll {} not in {{1,2,4}}", self.unroll));
@@ -92,10 +98,10 @@ impl Params {
     }
 }
 
-/// The shipped tuple `r4_b4_u1_native_anchor`.
+/// The shipped tuple `r4_b8_u1_native_anchor` (measured cap-eight sweep winner).
 pub const SHIPPED: Params = Params {
     rows: 4,
-    cap: 4,
+    cap: 8,
     unroll: 1,
     split: false,
     ilp: false,
@@ -121,6 +127,12 @@ pub fn emit_bundle(params: &Params) -> Result<Vec<u8>, String> {
         Arch::Gfx1201,
         HOST_TARGET,
     ))
+}
+
+/// The CFG wait-ledger verification (`ledger_cfg::verify_emitted`) of one tuple's emitted program.
+pub fn verify_waits(params: &Params) -> Result<crate::ledger_cfg::Stats, String> {
+    params.validate()?;
+    crate::ledger_cfg::verify_emitted(&build(params)?)
 }
 
 /// The assembly text of one tuple.
@@ -447,7 +459,14 @@ pub fn emit_body(b: &mut Builder, p: &Params, wg: WgId, prefix: &str) -> Result<
     }
     b.wait_all()?;
     salu(b, "s_cmp_ge_i32 s12, s10", &[], &[S_ROW0, S_M])?;
-    branch(b, &format!("s_cbranch_scc1 {pre}_end"))?;
+    if hops(p) {
+        // `row0 >= M` leaves through the first exit hop, one section away, not a far `_end`.
+        branch(b, &format!("s_cbranch_scc0 {pre}_in"))?;
+        branch(b, &format!("s_branch {}", exit_label(p, pre, 1)))?;
+        b.label(&format!("{pre}_in"))?;
+    } else {
+        branch(b, &format!("s_cbranch_scc1 {pre}_end"))?;
+    }
     smem(b, "s_load_b128 s[4:7], s[0:1], 0x0", &[4, 5, 6, 7], &[0, 1])?;
     smem(b, "s_load_b64 s[8:9], s[0:1], 0x10", &[8, 9], &[0, 1])?;
     smem(b, "s_load_b32 s3, s[0:1], 0x20", &[S_B], &[0, 1])?;
@@ -510,8 +529,31 @@ pub fn emit_body(b: &mut Builder, p: &Params, wg: WgId, prefix: &str) -> Result<
             &[],
         )?;
     }
-    // B > cap clamps to cap (the anchor clamps B > 4 to 4); B <= 0 matches no path and stores nothing.
+    // B > cap clamps to cap (the hipcc anchor clamps B > 4 to 4); B <= 0 matches no path and stores nothing.
     salu(b, &format!("s_min_i32 s3, s3, {}", p.cap), &[S_B], &[S_B])?;
+    if hops(p) {
+        // Distributed gates: the code is larger than one `s_branch` reach (+-128 KiB), so every branch spans at
+        // most one section. Gate `nb` skips its section to gate `nb+1` (the last to `_end`) unless `B == nb`; a
+        // finished section falls into its exit hop, a chain of one-section jumps to `_end`.
+        for nb in 1..=p.cap {
+            if nb > 1 {
+                b.label(&format!("{pre}_d{nb}"))?;
+            }
+            salu(b, &format!("s_cmp_lg_u32 s3, {nb}"), &[], &[S_B])?;
+            let next = if nb < p.cap {
+                format!("{pre}_d{}", nb + 1)
+            } else {
+                format!("{pre}_end")
+            };
+            branch(b, &format!("s_cbranch_scc1 {next}"))?;
+            section(b, p, &lay, nb, pre)?;
+            if nb < p.cap {
+                b.label(&format!("{pre}_x{nb}"))?;
+                branch(b, &format!("s_branch {}", exit_label(p, pre, nb + 1)))?;
+            }
+        }
+        return b.label(&format!("{pre}_end"));
+    }
     for nb in 1..=p.cap {
         salu(b, &format!("s_cmp_eq_u32 s3, {nb}"), &[], &[S_B])?;
         branch(b, &format!("s_cbranch_scc1 {pre}_b{nb}"))?;
@@ -521,6 +563,21 @@ pub fn emit_body(b: &mut Builder, p: &Params, wg: WgId, prefix: &str) -> Result<
         section(b, p, &lay, nb, pre)?;
     }
     b.label(&format!("{pre}_end"))
+}
+
+/// Capacities above 4 outgrow one branch reach; the body uses the distributed-gate layout ([`emit_body`]).
+/// Capacities <= 4 keep the pinned shipped layout.
+fn hops(p: &Params) -> bool {
+    p.cap > 4
+}
+
+/// Entry of the exit-hop chain at section `nb`: the hop after section `nb`, or `_end` past the last section.
+fn exit_label(p: &Params, pre: &str, nb: u8) -> String {
+    if nb >= p.cap {
+        format!("{pre}_end")
+    } else {
+        format!("{pre}_x{nb}")
+    }
 }
 
 /// The complete kernel body for `nb` columns.
@@ -1053,7 +1110,11 @@ fn store(b: &mut Builder, p: &Params, lay: &Lay, nb: u8, pre: &str) -> Result<()
     }
     b.label(&format!("{pre}_b{nb}_stored"))?;
     b.wait_all()?;
-    branch(b, &format!("s_branch {pre}_end"))
+    if hops(p) {
+        Ok(()) // falls into the exit hop (`exit_label`) that follows the section
+    } else {
+        branch(b, &format!("s_branch {pre}_end"))
+    }
 }
 
 fn refs(kind: Kind, indices: &[u8]) -> Vec<crate::reg::RegRef> {

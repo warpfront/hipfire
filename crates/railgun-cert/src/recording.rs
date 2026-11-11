@@ -1485,12 +1485,12 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "qwen4-opt-in-eager-fusions",
         predicates: &[IsRecording, CaptureMode],
-        condition: "opt-in Qwen4 prefill fusions and exact-gfx1151 single-token decode fusions taken only with `!is_recording() && !capture_mode`: hyper_read_pairs_write (HIPFIRE_QWEN4_HC_FUSE >= 1, layer_ops.rs), gemm_mq6g256v2_hcw_applies (HC_FUSE >= 2, gemm.rs), absorbs_clear (HIPFIRE_QWEN4_MOE_COMBINE_ZINIT, moe_program.rs; also not under a retained body), indexed_attention_select_batch_impl (HIPFIRE_QWEN4_QSA_SELECT_EXACT, and the default rows8/rows16 scoring route for F32 pooled keys, 4 index heads, budget <= 512, tensor_ops.rs), execute_grouped_depthwise (HIPFIRE_QWEN4_PLE_FUSE, layer_ops.rs), gemm_bf16_xf16_f16_wmma's gfx1201 and gfx1151 arms through hc_down_tile_selected (HIPFIRE_QWEN4_HC_DOWN_TILE, gemm.rs; recording/capture gate the gfx1151 arm only), qwen4_trunk_iu4_applies (HIPFIRE_QWEN4_TRUNK_IU4, gemm.rs), gemm_mq4g256v2_xf16_applies (the gfx1151 MQ4G256V2 shared-F16 prefill route and, under HIPFIRE_QWEN4_MQ4_X4_PM, its BF16-out / regions / HC-write entries, gemm.rs), hc_row_fold_applies (HIPFIRE_QWEN4_HC_ROW_FOLD, hc_row_fold.rs), moe_router_softmax_top10_f32 (HIPFIRE_QWEN4_ROUTER_FAST, moe.rs), project_trunk_masked_inner (HIPFIRE_QWEN4_DECODE_ZBA_X3, layer_ops.rs: exact gfx1151, one-row F32 FN GDN decode with an MQ6G256V2 qkv and MQ4G256V2 a/b/z, no trunk IU4), decode_gate_side_stage (HIPFIRE_QWEN4_DECODE_HEAD_FUSE, pipeline/mod.rs: exact gfx1151, batch 1, K = 2560, Q8_0 shared gate/up, and additionally no active_capture, hessian_capture, MoE dump, hidden dump or EP)",
+        condition: "opt-in Qwen4 prefill fusions and exact-gfx1151 single-token decode fusions taken only with `!is_recording() && !capture_mode`: hyper_read_pairs_write (HIPFIRE_QWEN4_HC_FUSE >= 1, layer_ops.rs), hyper_pair_fused_rows (HIPFIRE_QWEN4_HC_PAIR_WIDE: the 9..=64-row read takes hyper_norm_gate_k4_outputs_f32 only eagerly; recording/capture keep the hyper_norm + k4 allrows pair, layer_ops.rs), gemm_mq6g256v2_hcw_applies (HC_FUSE >= 2, gemm.rs), absorbs_clear (HIPFIRE_QWEN4_MOE_COMBINE_ZINIT, and the few-row HIPFIRE_QWEN4_FFN_CLEAR_ABSORB_ROWS shared-down `_zinit` absorb, default on for exact gfx1201, 0 kills; moe_program.rs; also not under a retained body), indexed_attention_select_batch_impl (HIPFIRE_QWEN4_QSA_SELECT_EXACT, and the default rows8/rows16 scoring route for F32 pooled keys, 4 index heads, budget <= 512, tensor_ops.rs), execute_grouped_depthwise (HIPFIRE_QWEN4_PLE_FUSE, layer_ops.rs), gemm_bf16_xf16_f16_wmma's gfx1201 and gfx1151 arms through hc_down_tile_selected (HIPFIRE_QWEN4_HC_DOWN_TILE, gemm.rs; recording/capture gate the gfx1151 arm only), qwen4_trunk_iu4_applies (HIPFIRE_QWEN4_TRUNK_IU4, gemm.rs), gemm_mq4g256v2_xf16_applies (the gfx1151 MQ4G256V2 shared-F16 prefill route and, under HIPFIRE_QWEN4_MQ4_X4_PM, its BF16-out / regions / HC-write entries, gemm.rs), hc_row_fold_applies (HIPFIRE_QWEN4_HC_ROW_FOLD, hc_row_fold.rs), moe_router_softmax_top10_f32 (HIPFIRE_QWEN4_ROUTER_FAST, moe.rs), project_trunk_masked_inner (HIPFIRE_QWEN4_DECODE_ZBA_X3, layer_ops.rs: exact gfx1151, one-row F32 FN GDN decode with an MQ6G256V2 qkv and MQ4G256V2 a/b/z, no trunk IU4), decode_gate_side_stage (HIPFIRE_QWEN4_DECODE_HEAD_FUSE, pipeline/mod.rs: exact gfx1151, batch 1, K = 2560, Q8_0 shared gate/up, and additionally no active_capture, hessian_capture, MoE dump, hidden dump or EP)",
         effect: KernelSelection,
         switches: "eager: fused HC read/write gates, MQ6 attention-output GEMM with the HC write epilogue, zero-init grouped combine without the moe_output fill, exact tile-sort QSA selector or rows8/rows16 scoring + select_from_scores, fused PLE block, 160x64 HC-down tile, masked trunk IU4 / exact-activation MQ4 trunk GEMMs, HC row fold, fast router top-10; gfx1151 single-token decode: one gemv_mq4g256v2_multirow_r2_x3 for the three GDN a/b/z launches (ZBA_X3), one gemv_bf16_xf32_x2_q8_0_k2560_staged_pair for gemv_bf16_xf32_x4 + gemv_q8_0_k2560_staged_pair (HEAD_FUSE); recorded/captured: the incumbent unfused launches",
         kernels: &[],
         verdict: ByteExact,
-        evidence: "scoped rdna-compute tests on gfx1151 and gfx1201 compare each fused arm with the unfused launches byte for byte (CHANGELOG 0.4.1, Flash-Next performance); the QSA select tests compare the rows8/rows16 route with the serial selection sort byte for byte; HC_FUSE (level 3), HC_ROW_FOLD and the 160x64 HC_DOWN_TILE default on for exact gfx1151 only (the gfx1201 HC_DOWN_TILE split-K tile is not eager-gated: recorded and eager launches take it alike), MOE_COMBINE_ZINIT, ROUTER_FAST and PLE_FUSE for exact gfx1151 and gfx1201, QSA_SELECT_EXACT is default off, DECODE_ZBA_X3 and DECODE_HEAD_FUSE default on for exact gfx1151 only (each keeps its incumbent per-row arithmetic and reduction order verbatim; byte-exact hardware checks: rdna-compute lib mq4v2_multirow_r2_x3_tests and tests/qwen4_decode_head_fuse.rs), and no railgun default program is a qwen4 program",
+        evidence: "scoped rdna-compute tests on gfx1151 and gfx1201 compare each fused arm with the unfused launches byte for byte (CHANGELOG 0.4.1, Flash-Next performance); the QSA select tests compare the rows8/rows16 route with the serial selection sort byte for byte; HC_FUSE (level 3), HC_ROW_FOLD and the 160x64 HC_DOWN_TILE default on for exact gfx1151 only (the gfx1201 HC_DOWN_TILE split-K tile is not eager-gated: recorded and eager launches take it alike), MOE_COMBINE_ZINIT, ROUTER_FAST and PLE_FUSE for exact gfx1151 and gfx1201, FFN_CLEAR_ABSORB_ROWS for exact gfx1201 (the eight `moe_shared_down_combine_rows_r1..8_zinit` entries keep the runtime HIP route, kernels/src/moe_shared_down_combine.gfx1201.hip, unchanged; the proof-only portable PM twin kernels/moe_shared_down_combine_pm_gfx1201.hxaco is byte identical to the committed hipcc anchor kernels/moe_shared_down_combine_hipcc_gfx1201.co and is NOT selected at runtime), QSA_SELECT_EXACT is default off, DECODE_ZBA_X3 and DECODE_HEAD_FUSE default on for exact gfx1151 only (each keeps its incumbent per-row arithmetic and reduction order verbatim; byte-exact hardware checks: rdna-compute lib mq4v2_multirow_r2_x3_tests and tests/qwen4_decode_head_fuse.rs), and no railgun default program is a qwen4 program",
         reaches: &[],
     },
     Decision {
@@ -1502,6 +1502,22 @@ pub const DECISIONS: &[Decision] = &[
         kernels: &[],
         verdict: ByteExact,
         evidence: "GPU byte oracles of every output byte against the unfused kernels, random and adversarial rows (NaN/inf/zero/subnormal): HC down 14/14 (fn-10k/hc-down-fused-oracle.txt), MoE front 28/28 (fn-10k/runs/moefront/oracle-final.jsonl), row folds 32/32 (fn-10k/rowfold-receipts/oracle.txt), HC up v2 128/128 (fn-10k/hcup-receipts/hc-up-v2-oracle.txt); fn-10k/LAND-W1.md records qwen4_kld prefill .kldseq hashes of the four-lever land-w1 build (row folds, GDN i8, MoE front, HC down) identical to the prior route. HC up v2 has no such model-level hash in the cited receipts (oracle and bench only). All are eager exact-gfx1201 prefill arms; the recorded body keeps the unfused launches. No railgun default program is a qwen4 program, so nothing reaches one",
+        reaches: &[],
+    },
+    Decision {
+        id: "qwen4-moe-glue-fold-eager",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "Flash-Next exact-gfx1201 wide-verify MoE glue folds (HIPFIRE_QWEN4_MOE_GLUE_FOLD, default on for all folds, `0` kills) taken only with `!is_recording() && !capture_mode`: Gpu::qwen4_moe_gu_rot_fold_applies (fold c: the down producer folded into the planar A8 gate/up epilogue, qwen4_moe_ep_a8_gate_up_rot_planar_nt{1,2}, qwen4_moe_ep_a8.rs), Gpu::moe_glue_fold_mask_admitted (the scatter launch also writes the owner tile mask, moe_scatter_fused_top10_pmask) and Gpu::moe_glue_fold_route_admitted (9..=64-row router + scatter + mask in one launch, moe_route_scatter_top10_wide_f32 with a persistent per-Gpu arrival counter), both rdna-compute moe.rs",
+        effect: KernelSelection,
+        switches: "eager: moe_router_softmax_top10_f32_fast + moe_scatter_fused_top10 + ep_tile_mask_pm_gfx1201 replaced by moe_scatter_fused_top10_pmask (a) or moe_route_scatter_top10_wide_f32 (b); qwen4_moe_rotate128_i8 after qwen4_moe_ep_a8_gate_up_planar_nt{1,2} replaced by qwen4_moe_ep_a8_gate_up_rot_planar_nt{1,2} (c); recorded/captured: the unfused launches",
+        kernels: &[
+            "moe_scatter_fused_top10_pmask",
+            "moe_route_scatter_top10_wide_f32",
+            "qwen4_moe_ep_a8_gate_up_rot_planar_nt1",
+            "qwen4_moe_ep_a8_gate_up_rot_planar_nt2",
+        ],
+        verdict: ByteExact,
+        evidence: "GPU oracle examples/qwen4_moe_glue_fold (fusion3/runs/x8): every output word of topk_idx, topk_w, expert_token_counts, expert_offsets, expert_tile_ids, tile_ids_owned and the router fault word equal to the unfused chain, sorted_slot_index / inverse_perm equal as permutations (the shipped scatter's atomic bucket fill is a race in the unfused chain itself); eager exact-gfx1201 arms only, the recorded body keeps the unfused launches. The four entries have hipcc kernarg contracts in hipfire-kernel-abi (families/qwen4_moe_glue_fold.rs) and Route-A PeaceMaker twins (kernels/moe_route_scatter_wide_pm_gfx1201.hxaco, kernels/qwen4_moe_ep_a8_rot_pm_gfx1201.hxaco) that are whole-ELF byte-identical to the hipcc objects (peacemaker-isa tests/hip_twin_x8.rs); dispatch stays HIP, so the twins add no recorded-body difference. No railgun default program is a qwen4 program, so nothing reaches one",
         reaches: &[],
     },
     Decision {
@@ -1535,6 +1551,17 @@ pub const DECISIONS: &[Decision] = &[
         kernels: &[],
         verdict: NotEquivalent,
         evidence: "different numerics (int8 per 128 vs 4-bit per 32 activations); byte-checked against an independent CPU integer reference on card (0 mismatching bytes, 14/14 negative controls, tests/qwen4_moe_ep_a8_hw.rs); paired prefill KLD of the lowered-floor route A8 vs off: WT2 -0.0020, code24 -0.0010 (j7418)",
+        reaches: &[],
+    },
+    Decision {
+        id: "qwen4-moe-gu-a8-wide-verify",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "Gpu::qwen4_moe_gu_a8_applies (HIPFIRE_QWEN4_MOE_GU_A8, qwen4_moe_ep_a8.rs): exact gfx1201, the switch not `0` (default on; exact `2` runs the same chain over unmasked tiles, the developer byte A/B), 9..=64 source rows (the g32 window), and `!capture_mode && !is_recording()` and not inside the lane row-exact scope (`Gpu::lane_row_exact_scope`); the dispatch stage predicate `ep_a8_wide` (qt44_qt53_prefill.rs) adds the per-call conditions (EP row gather that is a no-op, symmetric planar experts, Flash-Next geometry); the owner mask (default, `MoeRowGather::decode_owner_mask`, the trunk shard's static `e % ranks` layers) is an eager launch on the same predicate",
+        effect: KernelSelection,
+        switches: "eager: the EP2 decode / verify routed MoE of 9..=64 rows runs the int8-per-128 (A8) gate/up + down GEMMs over owner-masked tiles (`ep_tile_mask` copy of the tile ids, non-owned experts' tiles `-1`, both GEMMs skip them) and the owned BF16-row grouped combine; recorded/captured: the g32 gate/up, PM A8 down, down unscatter and expanded top-10 combine (EP is eager-only: the row gather refuses under capture or record)",
+        kernels: &[],
+        verdict: NotEquivalent,
+        evidence: "different numerics in the gate/up input only (int8 per 128 vs 4-bit per 32 activations); for the same SwiGLU rows the A8 chain's down records, BF16 down rows and combine residuals are byte-identical to the incumbent's (A8DN, j8367); gate/up byte-checked against an independent CPU integer reference (tests/qwen4_moe_ep_a8_hw.rs); KLD-neutral (expsolve/RESULT.md E0); the owner mask changes no bytes by construction: a masked tile is a dummy-table tile that wrote +0 rows, and the owned combine equals the plain combine over +0 dummy rows (A8DN check c); the owner table is the sealed `e % ranks` ownership the compact decode table follows",
         reaches: &[],
     },
     Decision {
@@ -1604,6 +1631,28 @@ pub const DECISIONS: &[Decision] = &[
         reaches: &[],
     },
     Decision {
+        id: "qwen4-ep-vocab-shard-eager-only",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "hipfire-arch-qwen4 forward_lanes_scoped (gpu_forward_lanes.rs): a step carrying a Flash-Next EP2 vocabulary shard (`LaneOutputs::vocab_shard`, HIPFIRE_QWEN4_EP_VOCAB_SHARD) errors before any launch when `gpu.replay.is_recording() || gpu.graphs.capture_mode`; the shard's peer exchange is host-ordered and runs only eager",
+        effect: Refusal,
+        switches: "error before any launch vs the eager sharded head stage (half-width MQ6 projection, shard-local argmax, peer merge)",
+        kernels: &[],
+        verdict: Invariant,
+        evidence: "the refused branch launches nothing; the root plans a shard only for eager AR / verify steps, so no recorded or captured program contains the sharded head or its exchange",
+        reaches: &[],
+    },
+    Decision {
+        id: "qwen4-gdn-capture-direct-eager-only",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "hipfire-arch-qwen4 forward_lanes_scoped (gpu_forward_lanes.rs): a verify lane's GDN in-projection that runs as its own launch over exactly that lane's rows writes the lane's capture ring `inputs` in place and its Core skips the `copy_d2d(projection -> capture.inputs)` (HIPFIRE_QWEN4_GDN_CAPTURE_DIRECT, exact gfx1201, default on) only with `!(gpu.replay.is_recording() || gpu.graphs.capture_mode)`; recorded / captured steps keep the scratch projection + copy",
+        effect: LaunchShape,
+        switches: "eager: in-projection stored straight into the capture slot, no projection copy; recorded/captured: scratch projection + copyBuffer into the capture slot",
+        kernels: &[],
+        verdict: ByteExact,
+        evidence: "hipfire-dispatch split_gdn_capture_in_place_is_bytewise_the_copy (j8456: 0 mismatching bytes over 10 tensors) and gdn_lanes_rows_oracle --alias-capture (j8460: 70 cases, 0 failures); lane oracle verify dumps 32/32 identical flag on vs off",
+        reaches: &[],
+    },
+    Decision {
         id: "qwen4-lane-hc-allrows-eager-only",
         predicates: &[IsRecording, CaptureMode],
         condition: "hipfire-arch-qwen4 forward_lanes_scoped (gpu_forward_lanes.rs) via LaneAllRowsRule::from_parts (its `eager` fact, also the mesh root's plan-time rule) and hc_all_rows_applies: an AR / verify lane step of more than LANE_MAX_ROWS rows runs its HC stages (layer reads, the writes no TP2 all-reduce carries, the final read) as ONE all-rows segment under HIPFIRE_QWEN4_LANE_HC_ALLROWS (exact gfx1201, default on, `=0` kills it) only while `!(gpu.replay.is_recording() || gpu.graphs.capture_mode)` and outside the prefill-invariant scope; a recorded or captured step keeps the per <= 8-row group emission",
@@ -1639,7 +1688,7 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "qwen4-ep-seq-parallel-recorded-guard",
         predicates: &[IsRecording, CaptureMode],
-        condition: "hipfire-arch-qwen4 forward_chunk_scoped (gpu_forward.rs): the EP2 sequence-parallel prefill route (HIPFIRE_QWEN4_EP_SEQ_PARALLEL) is declined for the whole chunk when `gpu.replay.is_recording() || gpu.graphs.capture_mode`, which then runs the all-reduce route (ar_hc_write) exactly as before",
+        condition: "hipfire-arch-qwen4 forward_chunk_scoped (gpu_forward.rs): the EP2 sequence-parallel prefill route (HIPFIRE_QWEN4_EP_SEQ_PARALLEL) is declined for the whole chunk when `gpu.replay.is_recording() || gpu.graphs.capture_mode`, which then runs the all-reduce route (ar_hc_write) exactly as before; likewise forward_lanes_scoped (gpu_forward_lanes.rs) admits the sub-512 sequence-parallel EP prefill wave (HIPFIRE_QWEN4_EP_SP_SUB512_WAVE) only with `!(gpu.replay.is_recording() || gpu.graphs.capture_mode)`",
         effect: KernelSelection,
         switches: "sp_hc_rs_d8_* reduce-scatter writes + sp_ag_rows_* all-gathers over own-row HC reads vs ar_hc_write_* all-reduce writes over all-row HC reads",
         kernels: &[],
@@ -1658,6 +1707,12 @@ pub const DECISIONS: &[Decision] = &[
         evidence: "the overwrite kernels store `acc + 0.0f` once per output, bit-identical to legacy memset(+0.0f) then `Y += acc`, signed zero included (dflash_draft_fusion.rs, gemm_mq4g256v2_overwrite_gfx12_dflash documentation). rdna-compute examples/draft_overwrite_gfx12_oracle compares both arms as u32 bit patterns (5 (m, k) shapes x batch 2..63, NaN-prefilled overwrite output, N = 64 inside and outside the rows64 scope; 40/40 per CHANGELOG, with serve C8 greedy md5 equal). The separate generic verify-tile admission above 16 rows is inventoried under gfx12-mq4v2-verify-tile-route; this verdict covers eliminating the pre-zero, not certifying that independent tile-selection decision. G0 observation closes the overwrite predicate, so the G0 eager arm already takes the legacy tail; the pre-railgun default process (direct, unobserved dense draft) takes the overwrite twin, so arm3 differs",
         reaches: &[reach(Program::DflashGfx1201, "DFlash2 B=16 draft MQ4G256V2 lm_head and draft GEMMs on exact gfx1201, admitted 2..=16-row chunks, k % 256 == 0", "arm3")],
     },
+    // Row-batched draft top-8 is not a recording-sensitive decision: draft_head.rs uses the
+    // same exact-gfx1201 / MQ6G256V2 / scratch / HIPFIRE_QWEN4_DRAFT_TOPK8_ROWS admission in
+    // every mode (default on; 0 kills). Its two ledger contracts are qwen4_topk8_rows;
+    // hip_twin_topk8_rows pins both explicit 40-byte ABIs and full device-ELF identity of
+    // the proof-only portable PM twin. Dispatch remains HIP. No recording-predicate site
+    // or fictitious SITES row is added for this mode-invariant admission.
     Decision {
         id: "dflash-cb-lane-draft-batching",
         predicates: &[IsRecording, CaptureMode, G0Observing],
@@ -2319,8 +2374,14 @@ pub const SITES: &[Site] = &[
     Site {
         file: "hipfire-arch-qwen4/src/gpu_forward_lanes.rs",
         function: "forward_lanes_scoped",
-        occurrences: 2,
-        decisions: &["qwen4-ple-async-upload", "qwen4-lane-token-ids-async"],
+        occurrences: 8,
+        decisions: &[
+            "qwen4-ple-async-upload",
+            "qwen4-lane-token-ids-async",
+            "qwen4-ep-vocab-shard-eager-only",
+            "qwen4-gdn-capture-direct-eager-only",
+            "qwen4-ep-seq-parallel-recorded-guard",
+        ],
     },
     Site {
         file: "hipfire-arch-qwen4/src/gpu_forward_lanes.rs",
@@ -2498,6 +2559,12 @@ pub const SITES: &[Site] = &[
     },
     Site {
         file: "hipfire-dispatch/src/pipeline/layer_ops.rs",
+        function: "hyper_pair_fused_rows",
+        occurrences: 2,
+        decisions: &["qwen4-opt-in-eager-fusions"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/layer_ops.rs",
         function: "project_trunk_masked_inner",
         occurrences: 2,
         decisions: &["qwen4-opt-in-eager-fusions"],
@@ -2598,6 +2665,14 @@ pub const SITES: &[Site] = &[
     Site {
         file: "hipfire-dispatch/src/pipeline/moe_program.rs",
         function: "row_gather",
+        occurrences: 4,
+        decisions: &["eager-only-refusals"],
+    },
+    // The D2 tail usage-log direct route never reserves a top-k destination under recording/capture
+    // (the row gather refuses those): the call routes into its own scratch and the gather copies.
+    Site {
+        file: "hipfire-dispatch/src/pipeline/moe_program.rs",
+        function: "reserve_topk",
         occurrences: 4,
         decisions: &["eager-only-refusals"],
     },
@@ -3094,6 +3169,13 @@ pub const SITES: &[Site] = &[
     Site {
         file: "rdna-compute/src/dispatch.rs",
         function: "refuse_qsa_gather_growth_while_armed",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    // Elastic reserve reclaim refuses before freeing any shadow under recording/capture (dispatch.rs:9908).
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "release_long_prefill_caches",
         occurrences: 2,
         decisions: &["eager-only-refusals"],
     },
@@ -3931,6 +4013,24 @@ pub const SITES: &[Site] = &[
         decisions: &["qwen4-flash-next-gfx1201-eager-fusions"],
     },
     Site {
+        file: "rdna-compute/src/moe.rs",
+        function: "moe_glue_fold_mask_admitted",
+        occurrences: 2,
+        decisions: &["qwen4-moe-glue-fold-eager"],
+    },
+    Site {
+        file: "rdna-compute/src/moe.rs",
+        function: "moe_glue_fold_route_admitted",
+        occurrences: 2,
+        decisions: &["qwen4-moe-glue-fold-eager"],
+    },
+    Site {
+        file: "rdna-compute/src/qwen4_moe_ep_a8.rs",
+        function: "qwen4_moe_gu_rot_fold_applies",
+        occurrences: 2,
+        decisions: &["qwen4-moe-glue-fold-eager"],
+    },
+    Site {
         file: "rdna-compute/src/tensor_ops.rs",
         function: "applies",
         occurrences: 2,
@@ -4182,6 +4282,12 @@ pub const SITES: &[Site] = &[
         decisions: &["qwen4-moe-ep-a8-prefill"],
     },
     Site {
+        file: "rdna-compute/src/qwen4_moe_ep_a8.rs",
+        function: "qwen4_moe_gu_a8_applies",
+        occurrences: 2,
+        decisions: &["qwen4-moe-gu-a8-wide-verify"],
+    },
+    Site {
         file: "rdna-compute/src/gemm.rs",
         function: "gemm_mq6g256v2_xf16_applies",
         occurrences: 2,
@@ -4307,6 +4413,12 @@ pub const SITES: &[Site] = &[
     Site {
         file: "rdna-compute/src/gemm_mq6sym_i8.rs",
         function: "gemm_mq6sym_i8_prequant",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm_mq6sym_i8.rs",
+        function: "gemm_mq6sym_i8_prequant_x4",
         occurrences: 2,
         decisions: &["eager-only-refusals"],
     },

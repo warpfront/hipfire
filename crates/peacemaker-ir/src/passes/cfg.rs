@@ -49,7 +49,7 @@ pub fn base_dwords(form: Form, arch: crate::inst::Arch) -> usize {
         | Form::Vinterp => 2,
         Form::Ds => 2,
         Form::Vmem(_) => {
-            if arch == crate::inst::Arch::Gfx1201 {
+            if arch.is_gfx12() {
                 3
             } else {
                 2
@@ -687,6 +687,30 @@ mod tests {
     use crate::effects::{Effects, MemClass, MemEffect, OrderType, SrcRead};
     use crate::inst::{Arch, Opcode};
     use crate::isa;
+
+    /// gfx1200 shares gfx1201's instruction widths: a 3-dword gfx12 VMEM word counted as 2 shifts
+    /// every later PC and turns valid backward branches into mid-instruction targets.
+    #[test]
+    fn gfx1200_instruction_widths_equal_gfx1201() {
+        use crate::inst::VmemForm;
+        for form in [
+            Form::Sop1,
+            Form::Smem,
+            Form::Vop3,
+            Form::Ds,
+            Form::Vmem(VmemForm::Flat),
+            Form::Vmem(VmemForm::Global),
+            Form::Vmem(VmemForm::Buffer),
+        ] {
+            assert_eq!(
+                base_dwords(form, Arch::Gfx1200),
+                base_dwords(form, Arch::Gfx1201),
+                "{form:?}"
+            );
+        }
+        assert_eq!(base_dwords(Form::Vmem(VmemForm::Flat), Arch::Gfx1200), 3);
+        assert_eq!(base_dwords(Form::Vmem(VmemForm::Flat), Arch::Gfx1151), 2);
+    }
     use crate::operand::Operand;
     use crate::provenance::Provenance;
     use crate::reg::{Kind, RegRef};

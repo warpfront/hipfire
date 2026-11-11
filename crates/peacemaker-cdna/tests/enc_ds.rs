@@ -626,6 +626,21 @@ fn footprints() {
         ]
     );
 
+    // ds_write_b16_d16_hi v1, v8 (opcode 85): one data dword, no destination
+    let d = ds(DsOp::WriteB16D16Hi, (4, 1, 8, 12), 0, 0);
+    assert_eq!(DsOp::WriteB16D16Hi.name(), "ds_write_b16_d16_hi");
+    let fp = d.footprint();
+    assert!(fp.defs.is_empty());
+    assert_eq!(
+        fp.uses,
+        vec![
+            exec,
+            m0,
+            span(RegFile::Vgpr, 1, 1),
+            span(RegFile::Vgpr, 8, 1)
+        ]
+    );
+
     // ds_add_u32 (no return) and ds_add_rtn_u32
     let fp = ds(DsOp::AddU32, (4, 1, 8, 12), 0, 0).footprint();
     assert!(fp.defs.is_empty());
@@ -688,6 +703,7 @@ fn mem_kinds() {
         | DsOp::ReadI16 => MemKind::DsLoad,
         DsOp::WriteB8
         | DsOp::WriteB16
+        | DsOp::WriteB16D16Hi
         | DsOp::WriteB32
         | DsOp::WriteB64
         | DsOp::WriteB96

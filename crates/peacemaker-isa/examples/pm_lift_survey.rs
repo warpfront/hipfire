@@ -73,9 +73,7 @@ fn main() {
         };
         let line = match lift_region(bytes, symbol, &inputs) {
             Ok(r) => {
-                let pool = if u32::from(r.sgprs)
-                    <= u32::from(peacemaker_isa::kernels::lifted_dispatch_gfx1201::BODY_SGPR_LIMIT)
-                {
+                let pool = if r.sgprs <= peacemaker_isa::kernels::lifted_dispatch_gfx1201::WG_X {
                     let sym = format!("pm_lift_t{}", tmpl["tid"]);
                     let lifted = RegionInputs {
                         workgroup_x: peacemaker_isa::kernels::lifted_dispatch_gfx1201::WG_X,
@@ -92,7 +90,7 @@ fn main() {
                                     tmpl: tmpl["tid"].as_u64().unwrap_or(0) as u32,
                                     region: &r,
                                 }],
-                                None,
+                                &[],
                             )?;
                             let elf = peacemaker_isa::native::assemble_with_regions(
                                 &e.s_text,
@@ -104,7 +102,7 @@ fn main() {
                         })
                         .unwrap_or_else(|e| format!("pool failed: {e}"))
                 } else {
-                    format!("needs SGPR renaming: {} SGPRs", r.sgprs)
+                    format!("{} SGPRs reach the region inputs", r.sgprs)
                 };
                 let c = &r.receipt;
                 json!({"tid": tmpl["tid"], "symbol": symbol, "object": path, "status": "converted", "pool": pool, "B": block,

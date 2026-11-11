@@ -30,14 +30,18 @@ use peacemaker_isa::insn::{Instruction, Program};
 use peacemaker_isa::kernels::lifted_dispatch_gfx1201 as ld;
 use peacemaker_isa::ledger_cfg::{self, Stats};
 use peacemaker_isa::{Arch, Emitted};
-use peacemaker_lift::rewrite::region::{lift_region, LiftedRegion, RegionInputs};
+use peacemaker_lift::bundle::BundleCodec;
+use peacemaker_lift::rewrite::region::{HipccObject, LiftedRegion, RegionError, RegionInputs};
 use peacemaker_lift::{lift_object, Options};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 #[path = "ledger_cfg_pins/allowlist.rs"]
 mod allowlist;
-use allowlist::{Category, FINDINGS, POOL_BODY, UNSUPPORTED};
+use allowlist::{
+    Allow, Category, PoolStateCap, FINDINGS, POOL_BODY, POOL_STATE_CAP, STATE_CAP_ERROR,
+    UNSUPPORTED,
+};
 
 /// gfx942 images: `lift_object` has no opcode table for them (they are emitted by the typed
 /// `cdna` builder and encoded by `peacemaker_cdna`), so there is no instruction text to
@@ -93,6 +97,7 @@ fn isa_arch(arch: IrArch) -> Result<Arch, String> {
     match arch {
         IrArch::Gfx1100 => Ok(Arch::Gfx1100),
         IrArch::Gfx1151 => Ok(Arch::Gfx1151),
+        IrArch::Gfx1200 => Ok(Arch::Gfx1200),
         IrArch::Gfx1201 => Ok(Arch::Gfx1201),
         other => Err(format!("{other:?} is not a supported builder architecture")),
     }
@@ -189,18 +194,125 @@ impl Report {
     }
 }
 
+/// The gfx942 anchors (hipcc) and twins (PM) with typed coverage: the rows16 BF16 MFMA object
+/// and the FP8 grouped MoE object. Each is lifted by `peacemaker_lift::cdna` and every kernel is
+/// certified by `peacemaker_isa::cdna::lifted::certify` (CDNA hazards + typed CFG wait ledger).
+/// Their absence fails the gate. Every other gfx942 image stays an explicit not-verified entry.
+/// Each entry is the committed file and the exact kernel symbols it must contain, and nothing
+/// else.
+const CDNA_CERTIFIED: [(&str, &[&str]); 4] = [
+    (
+        "gemm_bf16_mfma_gfx942_rows16_hipcc_gfx942.co",
+        &[
+            "gemm_bf16_mfma_gfx942",
+            "gemm_bf16_mfma_gfx942_rows16",
+            "gemm_bf16_mfma_gfx942_rows16_x2",
+        ],
+    ),
+    (
+        "gemm_bf16_mfma_gfx942_rows16_pm_gfx942.hxaco",
+        &[
+            "gemm_bf16_mfma_gfx942",
+            "gemm_bf16_mfma_gfx942_rows16",
+            "gemm_bf16_mfma_gfx942_rows16_x2",
+        ],
+    ),
+    (
+        "gemm_fp8b128_moe_grouped_bf16mfma_hipcc_gfx942.co",
+        &[
+            "gemm_fp8b128_moe_grouped_bf16mfma",
+            "gemm_fp8b128_moe_grouped_bf16mfma_xbf16",
+            "gemm_fp8b128_moe_tile_desc_pad16",
+        ],
+    ),
+    (
+        "gemm_fp8b128_moe_grouped_bf16mfma_pm_gfx942.hxaco",
+        &[
+            "gemm_fp8b128_moe_grouped_bf16mfma",
+            "gemm_fp8b128_moe_grouped_bf16mfma_xbf16",
+            "gemm_fp8b128_moe_tile_desc_pad16",
+        ],
+    ),
+];
+
+/// The gfx942 device ELF of `bytes`: itself when raw, else the single native
+/// `hipv4-amdgcn-amd-amdhsa--gfx942` bundle entry (an optional `:feature` suffix allowed).
+fn gfx942_elf(bytes: &[u8]) -> Result<&[u8], String> {
+    use peacemaker_ir::envelope::Bundle;
+    if !Bundle::is_bundle(bytes) {
+        return Ok(bytes);
+    }
+    let (bundle, payloads) = Bundle::read(bytes).map_err(|e| format!("bundle: {e}"))?;
+    let triple = format!(
+        "{}gfx942",
+        peacemaker_lift::bundle::HIP_DEVICE_TRIPLE_PREFIX
+    );
+    let mut hits = bundle.entries.iter().enumerate().filter(|(_, e)| {
+        e.triple == triple
+            || e.triple
+                .strip_prefix(&triple)
+                .is_some_and(|s| s.starts_with(':'))
+    });
+    let idx = hits
+        .next()
+        .map(|(i, _)| i)
+        .ok_or("bundle has no gfx942 device entry")?;
+    if hits.next().is_some() {
+        return Err("bundle has multiple gfx942 device entries".into());
+    }
+    Ok(payloads[idx])
+}
+
+/// Typed lift + certify of every kernel; returns the kernel names on success.
+fn certify_gfx942(bytes: &[u8]) -> Result<Vec<String>, String> {
+    let elf = gfx942_elf(bytes)?;
+    let lifted = peacemaker_lift::cdna::lift_object(elf).map_err(|e| format!("cdna lift: {e}"))?;
+    peacemaker_lift::cdna::checked(&lifted).map_err(|e| format!("cdna checked: {e}"))?;
+    let mut names = Vec::new();
+    for kernel in &lifted.kernels {
+        peacemaker_isa::cdna::lifted::certify(kernel)
+            .map_err(|e| format!("cdna certify {}: {e}", kernel.image.name))?;
+        names.push(kernel.image.name.clone());
+    }
+    Ok(names)
+}
+
 #[test]
 fn every_committed_image_verifies_or_is_an_explicit_allowlist_entry() {
     let images = scan();
     assert!(!images.is_empty(), "no committed images found");
+    for (required, _) in CDNA_CERTIFIED {
+        assert!(
+            images.iter().any(|i| i.file == required),
+            "required gfx942 artifact {required} is absent from kernels/"
+        );
+    }
     let mut report = Report::default();
     let mut gfx942 = Vec::new();
     for image in &images {
+        if let Some((_, expected)) = CDNA_CERTIFIED.iter().find(|(f, _)| *f == image.file) {
+            match certify_gfx942(&image.bytes) {
+                Ok(names) => {
+                    let mut got = names.clone();
+                    got.sort();
+                    let mut want: Vec<String> = expected.iter().map(|s| s.to_string()).collect();
+                    want.sort();
+                    assert_eq!(got, want, "{}: kernel symbol set", image.file);
+                    // One verified outcome per certified kernel.
+                    for name in &names {
+                        report.verified += 1;
+                        println!("  certified (typed CDNA) {}#{name}", image.file);
+                    }
+                }
+                Err(e) => report.record("pins", &image.file, Err(e)),
+            }
+            continue;
+        }
         let program = match &image.lifted {
             Ok(program) => program,
             Err(_) if image.file.contains(GFX942) => {
                 gfx942.push(format!(
-                    "{}: gfx942, no opcode table (not verified)",
+                    "{}: gfx942, no typed CDNA certification wired (not verified)",
                     image.file
                 ));
                 continue;
@@ -278,15 +390,157 @@ struct PoolCounts {
     body_findings: usize,
     suppressed: usize,
     summarized: usize,
+    state_caps: usize,
+}
+
+const STATE_CAP_PREFIX: &str =
+    "wait verification: more than 512 distinct in-flight memory states reach label";
+
+/// The one error class the state-cap category takes; anything else is never routed to it.
+fn is_state_cap(error: &str) -> bool {
+    error.starts_with(STATE_CAP_PREFIX)
+}
+
+/// The entry a hosted state-cap error is, by pool, template identity, canonical label and the
+/// exact whole error. `in_body(tid, label)` says whether the pool label lies inside that
+/// template's emitted body span. OPEN: verifier state cap, not proven.
+fn classify_state_cap_with(
+    table: &[PoolStateCap],
+    tid_targets: &[(u32, String)],
+    pool_target: &str,
+    error: &str,
+    in_body: impl Fn(u32, &str) -> bool,
+) -> Result<usize, String> {
+    if !is_state_cap(error) {
+        return Err("not a state-cap error".into());
+    }
+    let label = error
+        .split('`')
+        .nth(1)
+        .ok_or("state-cap error names no label")?;
+    let rest = label
+        .strip_prefix(".Lt")
+        .ok_or_else(|| format!("label {label} is not a hosted-body label"))?;
+    let (tid, index) = rest
+        .split_once("b_")
+        .ok_or_else(|| format!("label {label} is not `.Lt<tid>b_<n>`"))?;
+    let tid: u32 = tid
+        .parse()
+        .map_err(|_| format!("label {label}: bad template id"))?;
+    let canonical = format!(".LBB{index}");
+    let template = tid_targets
+        .iter()
+        .find(|(t, _)| *t == tid)
+        .map(|(_, s)| s.as_str())
+        .ok_or_else(|| format!("label {label}: template {tid} is not a converted region"))?;
+    if !in_body(tid, label) {
+        return Err(format!(
+            "label {label} is not inside the emitted body span of template {tid}"
+        ));
+    }
+    let i = table
+        .iter()
+        .position(|c| {
+            c.pool_target == pool_target
+                && c.template_target == template
+                && c.body_label == canonical
+        })
+        .ok_or_else(|| {
+            format!(
+                "unlisted state cap: pool {pool_target}, template {template}, label {canonical}"
+            )
+        })?;
+    let expected = table[i]
+        .error
+        .replace("{tid}", &tid.to_string())
+        .replace("{n}", index);
+    if error != expected {
+        return Err(format!(
+            "state-cap error differs from the pinned text `{expected}`"
+        ));
+    }
+    Ok(i)
+}
+
+/// `classify_state_cap_with` against a real emission: the label must be an instruction
+/// strictly inside the body span (entry..exit) of the region hosting template `tid`.
+fn classify_state_cap(
+    emitted: &Emitted,
+    table: &[PoolStateCap],
+    tid_targets: &[(u32, String)],
+    pool_target: &str,
+    error: &str,
+) -> Result<usize, String> {
+    classify_state_cap_with(table, tid_targets, pool_target, error, |tid, label| {
+        let Some(region) = emitted
+            .proof
+            .regions
+            .iter()
+            .find(|r| r.template_id == Some(tid))
+        else {
+            return false;
+        };
+        let want = format!("{label}:");
+        emitted
+            .program
+            .instructions
+            .iter()
+            .position(|i| i.text.trim() == want)
+            .is_some_and(|pc| (region.entry_pc + 1..region.exit_pc).contains(&pc))
+    })
+}
+
+/// Table invariants: every entry's standalone `UNSUPPORTED` row exists exactly once with the
+/// same canonical label; pool targets are distinct; labels are canonical `.LBB<n>`.
+fn check_state_cap_table(table: &[PoolStateCap], unsupported: &[Allow]) -> Result<(), String> {
+    for (i, c) in table.iter().enumerate() {
+        if !c.body_label.starts_with(".LBB") {
+            return Err(format!(
+                "entry {i}: label {} is not `.LBB<n>`",
+                c.body_label
+            ));
+        }
+        let rows = unsupported
+            .iter()
+            .filter(|u| {
+                u.scope == "pins"
+                    && u.target == c.template_target
+                    && u.needle.contains(&format!("`{}`", c.body_label))
+                    && u.needle
+                        .contains("more than 512 distinct in-flight memory states")
+            })
+            .count();
+        if rows != 1 {
+            return Err(format!(
+                "entry {i}: {rows} standalone UNSUPPORTED `{}` row(s) for {}",
+                c.body_label, c.template_target
+            ));
+        }
+        if table
+            .iter()
+            .filter(|o| o.pool_target == c.pool_target)
+            .count()
+            != 1
+        {
+            return Err(format!(
+                "entry {i}: pool {} listed more than once",
+                c.pool_target
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// One built pool: dispatcher-only verification must pass; strict verification must be clean
 /// or report exactly one listed body finding. `hosted` are the template ids it hosts; `used`
 /// collects the entries a single-template pool reproduced.
+#[allow(clippy::too_many_arguments)]
 fn check_pool(
     report: &mut Report,
     counts: &mut PoolCounts,
     used: &mut Vec<usize>,
+    caps_used: &mut Vec<usize>,
+    tid_targets: &[(u32, String)],
     target: &str,
     emitted: &Emitted,
     hosted: &[u32],
@@ -319,6 +573,23 @@ fn check_pool(
                 counts.clean += 1;
             }
         }
+        Err(e) if is_state_cap(&e) => {
+            // OPEN: verifier state cap, not proven. Counted separately from verified.
+            match classify_state_cap(emitted, POOL_STATE_CAP, tid_targets, target, &e) {
+                Ok(i) => {
+                    counts.state_caps += 1;
+                    caps_used.push(i);
+                    let c = &POOL_STATE_CAP[i];
+                    println!(
+                        "  OPEN: verifier state cap, not proven: pool {} template {} label {}: {}",
+                        c.pool_target, c.template_target, c.body_label, c.why
+                    );
+                }
+                Err(why) => report
+                    .unmatched
+                    .push(format!("[POOL STATE CAP] {target}: {why}: {e}")),
+            }
+        }
         Err(e) => match classify_body(emitted, &e) {
             // A summarized region is not walked by the dispatcher-only verifier, so whether
             // it counted this body finding as suppressed depends on the summary; the strict
@@ -347,6 +618,9 @@ fn lifted_pools_dispatcher_is_fatal_and_bodies_match_exact_entries() {
         if program.target.arch != IrArch::Gfx1201 {
             continue;
         }
+        // The Hipcc lift of the object, once for all its kernels (`lift_region` would lift
+        // and re-emit the whole object per kernel).
+        let mut hipcc: Option<Result<HipccObject, String>> = None;
         for kernel in &program.kernels {
             let Abi::Hsa { metadata, .. } = &kernel.abi else {
                 continue;
@@ -360,7 +634,15 @@ fn lifted_pools_dispatcher_is_fatal_and_bodies_match_exact_entries() {
                 block,
                 dynamic_lds: 0,
             };
-            match lift_region(&image.bytes, &kernel.symbol.0, &inputs) {
+            let object = hipcc.get_or_insert_with(|| HipccObject::lift(&image.bytes));
+            let lifted = match object {
+                Ok(object) => object.region(&kernel.symbol.0, &inputs),
+                Err(reason) => Err(RegionError {
+                    symbol: kernel.symbol.0.clone(),
+                    reason: reason.clone(),
+                }),
+            };
+            match lifted {
                 Ok(region) => {
                     by_block.entry(block).or_default().push(Region {
                         target,
@@ -415,12 +697,39 @@ fn lifted_pools_dispatcher_is_fatal_and_bodies_match_exact_entries() {
             ));
         }
     }
+    // The OPEN state-cap entries: each template target is exactly one region of this scan
+    // and has its standalone `UNSUPPORTED` `.LBB28` row.
+    for c in POOL_STATE_CAP {
+        let n = by_block
+            .values()
+            .flatten()
+            .filter(|r| r.target == c.template_target)
+            .count();
+        if n != 1 {
+            report.unmatched.push(format!(
+                "[POOL STATE CAP ENTRY] {} is {n} region(s) in this scan, not exactly one",
+                c.template_target
+            ));
+        }
+    }
+    if let Err(why) = check_state_cap_table(POOL_STATE_CAP, UNSUPPORTED) {
+        report
+            .unmatched
+            .push(format!("[POOL STATE CAP ENTRY] {why}"));
+    }
     // `ld::pool` already verifies its own emission with the dispatcher-only verifier and
     // refuses it on any dispatcher hazard (`POOL_VERIFY_FAILED`); that is never a refusal
     // with an allowlist entry. Preconstruction refusals (blockDim, SGPR limit, ...) are not
     // verifier findings and keep their exact `UNSUPPORTED` entries.
     let mut counts = PoolCounts::default();
     let mut used: Vec<usize> = Vec::new();
+    let mut caps_used: Vec<usize> = Vec::new();
+    // The current template id -> `file#symbol` identity of every converted region.
+    let tid_targets: Vec<(u32, String)> = by_block
+        .values()
+        .flatten()
+        .map(|r| (r.tid, r.target.clone()))
+        .collect();
     let mut first_single: Option<Emitted> = None;
     for (&block, regions) in &by_block {
         let mut built = Vec::new();
@@ -432,7 +741,7 @@ fn lifted_pools_dispatcher_is_fatal_and_bodies_match_exact_entries() {
                     tmpl: r.tid,
                     region: &r.region,
                 }],
-                None,
+                &[],
             );
             let target = format!("pool:b{block}:{}", r.target);
             match single {
@@ -442,6 +751,8 @@ fn lifted_pools_dispatcher_is_fatal_and_bodies_match_exact_entries() {
                         &mut report,
                         &mut counts,
                         &mut used,
+                        &mut caps_used,
+                        &tid_targets,
                         &target,
                         &emitted,
                         &[r.tid],
@@ -464,11 +775,13 @@ fn lifted_pools_dispatcher_is_fatal_and_bodies_match_exact_entries() {
                 .collect();
             let tids: Vec<u32> = built.iter().map(|r| r.tid).collect();
             let target = format!("pool:b{block}:multi");
-            match ld::pool(&format!("pm_pool_b{block}"), block, &hosted, None) {
+            match ld::pool(&format!("pm_pool_b{block}"), block, &hosted, &[]) {
                 Ok(emitted) => check_pool(
                     &mut report,
                     &mut counts,
                     &mut used,
+                    &mut caps_used,
+                    &tid_targets,
                     &target,
                     &emitted,
                     &tids,
@@ -487,6 +800,16 @@ fn lifted_pools_dispatcher_is_fatal_and_bodies_match_exact_entries() {
             report.unmatched.push(format!(
                 "[STALE POOL BODY] template {} body pc {} ({}) no longer occurs",
                 a.tid, a.body_pc, a.target
+            ));
+        }
+    }
+    // Same for the OPEN state-cap table: every entry must occur in its own pool.
+    for (i, c) in POOL_STATE_CAP.iter().enumerate() {
+        if !caps_used.contains(&i) {
+            report.unmatched.push(format!(
+                "[STALE POOL STATE CAP] OPEN: verifier state cap, not proven: {} ({} {}) no \
+                 longer occurs",
+                c.pool_target, c.template_target, c.body_label
             ));
         }
     }
@@ -530,8 +853,79 @@ fn lifted_pools_dispatcher_is_fatal_and_bodies_match_exact_entries() {
         &[format!(
             "{} pools built, dispatcher verified fatally in all ({} region exits summarized as \
              drained, {} body hazards suppressed in the regions walked); {} strict-clean, {} with \
-             an exact body finding",
-            counts.built, counts.summarized, counts.suppressed, counts.clean, counts.body_findings
+             an exact body finding; {} hosted bodies OPEN: verifier state cap, not proven (full \
+             strict wait certification not claimed)",
+            counts.built,
+            counts.summarized,
+            counts.suppressed,
+            counts.clean,
+            counts.body_findings,
+            counts.state_caps
         )],
     );
+}
+
+#[test]
+fn state_cap_classifier_rejects_wrong_label_template_pool_and_other_errors() {
+    // OPEN: verifier state cap, not proven. Synthetic context, real classifier logic.
+    let t_a = "a.hxaco#ka".to_string();
+    let t_b = "b.hxaco#kb".to_string();
+    let tids = vec![(7u32, t_a.clone()), (8u32, t_b.clone())];
+    let entry = |pool: &'static str, tmpl: &'static str, label: &'static str| PoolStateCap {
+        pool_target: pool,
+        template_target: tmpl,
+        body_label: label,
+        error: STATE_CAP_ERROR,
+        why: "test",
+    };
+    let table = [entry("pool:b64:a.hxaco#ka", "a.hxaco#ka", ".LBB28")];
+    let err = |tid: u32, n: u32| {
+        format!(
+            "wait verification: more than 512 distinct in-flight memory states reach label \
+             `.Lt{tid}b_{n}` (path-sensitive state explosion); wait the counters before the \
+             branches that reach it"
+        )
+    };
+    let inside = |_: u32, _: &str| true;
+    let pool = "pool:b64:a.hxaco#ka";
+    // Correct pinned entry succeeds.
+    assert_eq!(
+        classify_state_cap_with(&table, &tids, pool, &err(7, 28), inside),
+        Ok(0)
+    );
+    // Wrong label index.
+    assert!(classify_state_cap_with(&table, &tids, pool, &err(7, 29), inside).is_err());
+    // Wrong template (tid maps to another target).
+    assert!(classify_state_cap_with(&table, &tids, pool, &err(8, 28), inside).is_err());
+    // Right template, wrong pool.
+    assert!(classify_state_cap_with(&table, &tids, "pool:b64:multi", &err(7, 28), inside).is_err());
+    // Label outside the template's body span (dispatcher/entry/exit).
+    assert!(classify_state_cap_with(&table, &tids, pool, &err(7, 28), |_, _| false).is_err());
+    // Fabricated entries with the wrong label or wrong template never match the real error.
+    let wrong_label = [entry(pool, "a.hxaco#ka", ".LBB29")];
+    assert!(classify_state_cap_with(&wrong_label, &tids, pool, &err(7, 28), inside).is_err());
+    let wrong_tmpl = [entry(pool, "b.hxaco#kb", ".LBB28")];
+    assert!(classify_state_cap_with(&wrong_tmpl, &tids, pool, &err(7, 28), inside).is_err());
+    // Altered text and non-state-cap errors.
+    let altered = err(7, 28).replace("512", "513");
+    assert!(classify_state_cap_with(&table, &tids, pool, &altered, inside).is_err());
+    let extended = format!("{} extra", err(7, 28));
+    assert!(classify_state_cap_with(&table, &tids, pool, &extended, inside).is_err());
+    let hazard = "pc 12 `v_add_co_u32 v1, s0, v1, s2`: needs Store wait 0";
+    assert!(!is_state_cap(hazard));
+    assert!(classify_state_cap_with(&table, &tids, pool, hazard, inside).is_err());
+}
+
+#[test]
+fn state_cap_table_is_pinned_to_standalone_unsupported_rows() {
+    assert_eq!(POOL_STATE_CAP.len(), 5);
+    check_state_cap_table(POOL_STATE_CAP, UNSUPPORTED).expect("table invariants");
+    let bogus = [PoolStateCap {
+        pool_target: "pool:b64:x#y",
+        template_target: "x#y",
+        body_label: ".LBB28",
+        error: STATE_CAP_ERROR,
+        why: "test",
+    }];
+    assert!(check_state_cap_table(&bogus, UNSUPPORTED).is_err());
 }

@@ -460,7 +460,7 @@ pub fn analyze_with(
 ) -> Result<HazardAnalysis, HazardError> {
     let mut analysis = HazardAnalysis::default();
     match arch {
-        Arch::Gfx1201 => run_sgpr_model(body, arch, wave, model, &mut analysis)?,
+        Arch::Gfx1200 | Arch::Gfx1201 => run_sgpr_model(body, arch, wave, model, &mut analysis)?,
         Arch::Gfx1100 | Arch::Gfx1151 => run_gfx11(body, arch, &mut analysis),
         _ => return Err(HazardError::Unsupported(arch, wave)),
     }
@@ -614,49 +614,13 @@ fn sgpr_block(
             }
             continue;
         }
-        // Encoding rows use 64-bit slots for lane masks in both wave sizes.
-        // Use the kernel's metadata-selected wave width, unlike genuine
-        // 64-bit scalar data operands, which remain two registers.
-        let mask_len = match wave {
-            Wave::Wave32 => 1,
-            Wave::Wave64 => 2,
-        };
+        // Encoding rows use 64-bit slots for lane masks in both wave sizes;
+        // `wave_effects` narrows them to the kernel's wave width and leaves
+        // genuine 64-bit scalar data operands as two registers.
         let name = inst.op.name(arch).unwrap_or("");
-        let mut uses = smallvec::SmallVec::<[RegRef; 4]>::new();
-        let mut defs = smallvec::SmallVec::<[RegRef; 2]>::new();
-        let mask_input =
-            name.starts_with("v_cndmask_") || (name.starts_with("v_") && name.contains("_co_ci_"));
-        let mask_output = name.starts_with("v_cmp")
-            || name.starts_with("v_div_scale_")
-            || (name.starts_with("v_") && name.contains("_co_"));
-        let use_refs = if mask_input {
-            let mask = inst.operands.last().and_then(|operand| match operand {
-                Operand::Reg(reg) => Some(*reg),
-                _ => None,
-            });
-            uses.extend(inst.effects.uses.iter().map(|reg| {
-                let mut reg = *reg;
-                if Some(reg) == mask && reg.kind == Kind::S {
-                    reg.len = mask_len;
-                }
-                reg
-            }));
-            uses.as_slice()
-        } else {
-            inst.effects.uses.as_slice()
-        };
-        let def_refs = if mask_output {
-            defs.extend(inst.effects.defs.iter().map(|reg| {
-                let mut reg = *reg;
-                if reg.kind == Kind::S {
-                    reg.len = mask_len;
-                }
-                reg
-            }));
-            defs.as_slice()
-        } else {
-            inst.effects.defs.as_slice()
-        };
+        let effects = crate::effects::wave_effects(arch, wave, inst);
+        let use_refs = effects.uses.as_slice();
+        let def_refs = effects.defs.as_slice();
         // LlvmExact replays the LLVM pass exactly (VCC tracked, FLAT does not
         // clear, IsSetPC flushes). BuilderParity keeps the historic boundary:
         // VCC is not producer-tracked and every memory access clears.
@@ -794,7 +758,7 @@ fn wmma_block(
                     .iter()
                     .take(2)
                     .any(|src| old.overlaps(*src))
-                    || (arch == Arch::Gfx1201
+                    || (arch.is_gfx12()
                         && name.starts_with("v_swmmac_")
                         && inst
                             .effects

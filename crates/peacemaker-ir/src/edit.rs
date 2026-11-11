@@ -755,7 +755,10 @@ pub fn lower_labels(body: &Body, arch: Arch) -> Result<Vec<Inst>, EditError> {
 /// Encode a kernel body (labels lowered from its current layout) with the
 /// selected target codec. Never reads `prov.bytes`.
 pub fn encode_stream(body: &Body, arch: Arch) -> Result<Vec<u32>, EditError> {
-    if !matches!(arch, Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1201) {
+    if !matches!(
+        arch,
+        Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1200 | Arch::Gfx1201
+    ) {
         return Err(EditError::Unsupported(format!("no codec for {arch:?}")));
     }
     let mut words = Vec::new();
@@ -1217,7 +1220,10 @@ fn entry_cell_dword(cell: EntryCell) -> usize {
 /// exactly the declared entry facts plus MODE (defined because the FP state is declared);
 /// nothing else, in particular no EXEC, VCC, M0, SCC, flat-scratch/aperture or hwreg state.
 fn entry_seed(kern: &Kernel, arch: Arch) -> Result<Bits, EditError> {
-    if !matches!(arch, Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1201) {
+    if !matches!(
+        arch,
+        Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1200 | Arch::Gfx1201
+    ) {
         return Err(EditError::Unsupported(format!(
             "no ABI entry table for {arch:?}"
         )));
@@ -1228,7 +1234,7 @@ fn entry_seed(kern: &Kernel, arch: Arch) -> Result<Bits, EditError> {
         // COMPUTE_PGM_RSRC2.USER_SGPR_COUNT user SGPRs in order TGID_X
         // (bit 7), TGID_Y (bit 8), TGID_Z (bit 9), TG_SIZE (bit 10); there
         // are no workgroup-id TTMPs.
-        Abi::Hsa { descriptor, .. } if arch != Arch::Gfx1201 => {
+        Abi::Hsa { descriptor, .. } if !arch.is_gfx12() => {
             let rsrc2 = descriptor.compute_pgm_rsrc2.0;
             let user = (rsrc2 >> 1 & 0x1f) as usize;
             let system = (7..=10).filter(|bit| rsrc2 >> bit & 1 != 0).count();

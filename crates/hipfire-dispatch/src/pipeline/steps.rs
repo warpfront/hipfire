@@ -126,7 +126,8 @@ pub enum Step<'a> {
     HyperNorm(crate::pipeline::layer_ops::HyperNormOp<'a>),
     /// One weight projection through the shared stateful-op contract.
     Project(crate::pipeline::layer_ops::ProjectOp<'a>),
-    /// Per-row broadcast add of one activation row.
+    /// Per-row broadcast add of one activation row per lane (one lane unless the op batches
+    /// the draft round's lanes).
     BroadcastAdd(crate::pipeline::layer_ops::BroadcastAddOp<'a>),
     /// Dense gated MLP (optional pre-norm, gate/up, activation, down, output
     /// epilogue) on its declared kernel ladder. Opaque to fusion: no HC

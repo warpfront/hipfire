@@ -47,6 +47,7 @@ pub(crate) mod test_tmp;
 pub mod valu_sched;
 pub mod vopd;
 pub mod kernels {
+    pub mod argmax_pair_merge_pm;
     pub mod argmax_regrid_pm;
     pub mod bf16;
     pub mod ceil_probe;
@@ -92,6 +93,8 @@ pub mod kernels {
     pub mod mq_i4_rows;
     pub mod mtp_dense_det_gfx11;
     pub mod mtp_q8_det_gfx11;
+    /// EXPAND_LIVE (P0 template 1) standalone wrapper around the native `expand_body` region.
+    pub mod p0_expand_gfx1201;
     /// A trivial persistent dispatcher around the MQ2 xbatch body region, and the
     /// two-workgroup event handoff smoke kernels (lab only; no product route).
     pub mod persistent_dispatch_gfx1201;
@@ -128,6 +131,7 @@ pub mod kernels {
     pub mod qwen4_slab_union_plan;
     pub mod spec_accept_pm;
     pub mod spec_sampling_rows_pm;
+    pub mod topk8_partial_blocks_pm;
     /// gfx942 (CDNA3) kernels built with `crate::cdna::builder`.
     pub mod cdna {
         pub mod fp8_act_producer;

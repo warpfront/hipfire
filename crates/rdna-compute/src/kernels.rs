@@ -4544,6 +4544,13 @@ pub const SLOWLINK_PREFILL_SRC: &str = include_str!("../../../kernels/src/slowli
 pub const MOE_COMBINE_ORDER_OWNED_SRC: &str =
     include_str!("../../../kernels/src/moe_combine_order_owned.hip");
 
+/// Owner-masked BF16-row top-10 grouped combine with the rank order computed inline
+/// (`moe_down_combine_grouped_top10_bf16in_ordered[_zinit]`,
+/// `HIPFIRE_QWEN4_MOE_COMBINE_INLINE_ORDER`): one launch in place of the order kernel and the
+/// combine. A module of its own, so the legacy sources above keep their recorded identity.
+pub const MOE_COMBINE_ORDERED_SRC: &str =
+    include_str!("../../../kernels/src/moe_combine_ordered.hip");
+
 /// Qwen4 top-10 fused indexed combine.  Route weights are applied once here,
 /// after the unweighted expanded down projection.
 pub const MOE_DOWN_COMBINE_TOP10_BATCHED_SRC: &str =
@@ -4585,6 +4592,16 @@ pub const MOE_ROUTE_SCATTER_TOP10_F32_SRC: &str = concat!(
     include_str!("../../../kernels/src/moe_router_softmax_top10_f32_fast.hip"),
     include_str!("../../../kernels/src/qwen4_moe_scatter_fused_k8.hip"),
     include_str!("../../../kernels/src/moe_route_scatter_top10_f32.gfx1201.hip")
+);
+/// Wave-3 C8 MoE glue folds (`HIPFIRE_QWEN4_MOE_GLUE_FOLD`, exact gfx1201): the scatter + owner tile
+/// mask launch (`moe_scatter_fused_top10_pmask`, X8a) and the 9..=64-row router + scatter (+ mask)
+/// launch (`moe_route_scatter_top10_wide_f32`, X8b). Same concatenation as
+/// [`MOE_ROUTE_SCATTER_TOP10_F32_SRC`] with the wide entries as the last unit; the scatter body and
+/// the router token body are the shipped text, the tile mask is the law of `ep_tile_mask_pm_gfx1201`.
+pub const MOE_ROUTE_SCATTER_WIDE_SRC: &str = concat!(
+    include_str!("../../../kernels/src/moe_router_softmax_top10_f32_fast.hip"),
+    include_str!("../../../kernels/src/qwen4_moe_scatter_fused_k8.hip"),
+    include_str!("../../../kernels/src/moe_route_scatter_wide.gfx1201.hip")
 );
 /// Opt-in Qwen4 symmetric IU4 MoE route (fn-moe-sym, gfx1151 and gfx1201),
 /// separately named modules; no incumbent module is extended.
@@ -4860,10 +4877,11 @@ pub const LANE_ROWS_BF16_PM_GFX1201: &[u8] =
 pub const LANE_ROWS_BF16_PM_GFX1201_SHA256: &str =
     include_str!("../../../kernels/lane_rows_bf16_pm_gfx1201.hxaco.sha256");
 /// gfx1201 PeaceMaker x-batched MQ2G256V2 GEMV (`gemv_mq2g256v2_xbatch_pm`,
-/// WideNet F05 `r4_b4_u1_native_anchor`, ELF sha256 `3cb0e724…eaf0`): the
+/// `r4_b8_u1_native_anchor`, ELF sha256 `0e9b63c7…1bd4`): the
 /// ABI (`A, x, y, M, K, B`, 36-byte kernarg) and per-row reduction order of
 /// [`GEMV_MQ2G256V2_XBATCH_SRC`], four output rows per 32-lane wave (grid
-/// `ceil(M/4)`). Byte-identical to the hipcc kernel on the differential and
+/// `ceil(M/4)`), up to eight input columns per launch. Byte-identical to the
+/// incumbent cap-four PM/hipcc path on the finite and NaN/Inf differential
 /// `mq2_xbatch_oracle` corpora; tested, not yet proven anchor-relative.
 pub const GEMV_MQ2_XBATCH_PM_GFX1201: &[u8] =
     include_bytes!("../../../kernels/gemv_mq2_xbatch_pm_gfx1201.hxaco");
@@ -5961,7 +5979,8 @@ pub const GEMV_MQ6SYM_I8_GFX1201_SRC: &str = concat!(
 );
 /// gfx1201 symmetric-MQ6 x A8 signed-iu8 WMMA GEMM: narrow verify tiles
 /// (`gemm_mq6sym_i8_set{,_bf16}_m{32,64}n{16,32,48}{,y}_gfx1201`) and the 128x128 prefill tile
-/// (`gemm_mq6sym_i8_set{,_bf16}_gfx1201`, dynamic LDS 36864); same prelude as the GEMV.
+/// (`gemm_mq6sym_i8_set{,_bf16}_gfx1201`, dynamic LDS 36864), plus the multi-part F32 narrow entries
+/// (`gemm_mq6sym_i8_set_{m64n16,m32n32,m64n48,m64n16y}_x4_gfx1201`); same prelude as the GEMV.
 pub const GEMM_MQ6SYM_I8_GFX1201_SRC: &str = concat!(
     "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n",
     include_str!("../../../kernels/src/block_i8_128_quant.hip"),
@@ -8213,6 +8232,15 @@ pub const TOPK8_RESCORE_MQ6G256V2_SRC: &str = concat!(
     include_str!("../../../kernels/src/topk8_select.hip"),
     include_str!("../../../kernels/src/qwen4_gemv_mq6g256v2.hip")
 );
+/// Module `topk8_rows_mq6g256v2` (`HIPFIRE_QWEN4_DRAFT_TOPK8_ROWS`, exact gfx1201): the row-batched
+/// MQ6G256V2 draft-head re-score (`Gpu::topk8_rescore_k2560_rows`), `topk8_partial_f32_rows` and
+/// `topk8_rescore_mq6g256v2_k2560_rows`, whose per-row bodies are the one-row entries'. The
+/// incumbent sources come first and unchanged, so their modules keep their recorded identity.
+pub const TOPK8_ROWS_MQ6G256V2_SRC: &str = concat!(
+    include_str!("../../../kernels/src/topk8_select.hip"),
+    include_str!("../../../kernels/src/qwen4_gemv_mq6g256v2.hip"),
+    include_str!("../../../kernels/src/topk8_rows.gfx1201.hip")
+);
 pub const REQUANT_G256_SRC: &str = include_str!("../../../kernels/src/requant_g256.hip");
 
 /// Batched Q8_0 GEMM. Same per-row math as gemv_q8_0 but holds MAX_BATCH
@@ -10236,6 +10264,10 @@ pub const SAMPLE_TOP_P_PARALLEL_SRC: &str =
 /// workgroup per verify row builds the target distribution under the shared
 /// sampler's law; the last row of each lane runs its Leviathan verdict.
 pub const LANE_LEVIATHAN_SRC: &str = include_str!("../../../kernels/src/lane_leviathan.hip");
+
+/// Vocabulary-shard argmax merge (`Gpu::argmax_f32_pair_merge`): one thread per
+/// row combines two shard argmaxes into the full-row `argmax_f32` answer.
+pub const ARGMAX_PAIR_MERGE_SRC: &str = include_str!("../../../kernels/src/argmax_pair_merge.hip");
 
 /// Penalty stage of the host logit policy (repeat, presence, frequency)
 /// applied in place to logit rows from a host-built token table
@@ -12836,4 +12868,14 @@ pub const QWEN4_MOE_ROTATE128_I8_SRC: &str = concat!(
     "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n",
     include_str!("../../../kernels/src/block_i8_128_quant.hip"),
     include_str!("../../../kernels/src/qwen4_moe_rotate128_i8.hip")
+);
+/// Gate/up A8 GEMM of the same chain with the down producer folded into its epilogue
+/// (`qwen4_moe_ep_a8_gate_up_rot_planar_nt{1,2}`, `HIPFIRE_QWEN4_MOE_GLUE_FOLD` sub-fold `c`): the legacy
+/// A8 GEMM source and the A8 quantizer in front (unchanged), so the two legacy sources above keep their
+/// recorded identity. A module of its own.
+pub const QWEN4_MOE_EP_A8_ROT_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i8_128_quant.hip"),
+    include_str!("../../../kernels/src/qwen4_moe_ep_a8.gfx12.hip"),
+    include_str!("../../../kernels/src/qwen4_moe_ep_a8_rot.gfx12.hip")
 );
