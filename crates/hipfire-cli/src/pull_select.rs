@@ -1932,45 +1932,111 @@ mod tests {
         assert!(items.iter().all(|item| item.label != "hc8"));
     }
 
-    #[test]
-    fn the_unpublished_hot_units_pin_is_not_in_any_pull_plan() {
-        assert!(!hipfire_registry::HOT_UNITS_SIDECAR_PINS[0].published);
-        let registry = symtrunk_registry();
-        for arch in ["gfx1201", "", "gfx1100"] {
-            let items = hc8_plan_labels(&registry, "symtrunk:test", arch);
-            assert!(
-                items.iter().all(|item| item.label != "EP hot-unit loan"),
-                "{arch:?}"
-            );
-        }
-        let stock = stock_registry();
-        let items = hc8_plan_labels(&stock, "qwen3.8:flash", "gfx1201");
-        assert!(items.iter().all(|item| item.label != "EP hot-unit loan"));
-    }
-
-    #[test]
-    fn the_unpublished_symtrunk_ranking_is_not_in_a_gate_on_pull_plan() {
-        let registry = symtrunk_registry();
-        let host = host_with_arch("gfx1201");
-        let (tag, entry) = registry.model("symtrunk:test").unwrap();
+    /// The plan of `registry`'s `tag` on `arch` with the shipped EP pin table, `ep_gate` and
+    /// the expert-hot-set choice `expert_hotset`.
+    fn ep_plan(
+        registry: &RegistryV1,
+        tag: &str,
+        arch: &str,
+        ep_gate: bool,
+        expert_hotset: bool,
+    ) -> Vec<PlanItem> {
+        let host = host_with_arch(arch);
+        let (tag, entry) = registry.model(tag).unwrap();
         let ctx = PullContext {
-            registry: &registry,
+            registry,
             host: &host,
             overlay_pins: hipfire_registry::TRUNK_OVERLAY_PINS,
             hotset_pins: hipfire_registry::EXPERT_HOTSET_PINS,
             grandfather_pins: hipfire_registry::GRANDFATHERED_MONOLITHICS,
             present: &absent,
         };
-        let choice = PullChoice::defaults(tag, entry, &PullFlags::default());
-        let items = plan_items_with_ep(
+        let mut choice = PullChoice::defaults(tag, entry, &PullFlags::default());
+        choice.expert_hotset = expert_hotset;
+        plan_items_with_ep(
             &ctx,
             &choice,
             false,
             hipfire_registry::EP_EXPERT_HOTSET_PINS,
-            true,
-        );
+            ep_gate,
+        )
+    }
+
+    #[test]
+    fn the_published_symtrunk_base_plans_the_ep_hot_set_and_hot_unit_loan_on_every_host() {
+        let units = &hipfire_registry::HOT_UNITS_SIDECAR_PINS[0];
+        assert!(units.published);
+        assert!(hipfire_registry::UNPUBLISHED_PIN_FILES.is_empty());
+        let registry = symtrunk_registry();
+        // Planned on every host, like the single-card hot set: the EP lanes apply them at load.
+        for arch in ["gfx1201", "", "gfx1100", "gfx1151"] {
+            let items = ep_plan(&registry, "symtrunk:test", arch, true, true);
+            let base = &items[0].file;
+            let hotset = items
+                .iter()
+                .find(|item| item.label == "EP expert hot set")
+                .unwrap_or_else(|| panic!("{arch:?}: no EP expert hot set"));
+            assert_eq!(
+                hotset.file,
+                format!(
+                    "{base}{}",
+                    hipfire_config::memory::EP_EXPERT_HOTSET_SIDECAR_SUFFIX
+                ),
+                "{arch:?}"
+            );
+            assert_eq!(hotset.size, Some(312_036), "{arch:?}");
+            let loan = items
+                .iter()
+                .find(|item| item.label == "EP hot-unit loan")
+                .unwrap_or_else(|| panic!("{arch:?}: no EP hot-unit loan"));
+            assert_eq!(
+                loan.file,
+                format!(
+                    "{base}{}",
+                    hipfire_config::memory::EP_HOT_UNITS_SIDECAR_SUFFIX
+                ),
+                "{arch:?}"
+            );
+            assert_eq!(loan.size, Some(units.size_bytes), "{arch:?}");
+            assert!(hotset.download && loan.download, "{arch:?}");
+        }
+    }
+
+    #[test]
+    fn the_stock_split_base_plans_its_own_ep_ranking_but_not_the_symtrunk_hot_unit_loan() {
+        // The stock split base is not the symtrunk artifact the hot-unit pin and the symtrunk
+        // ranking bind; it gets only the split base's own EP ranking pin.
+        let split_pin = &hipfire_registry::EP_EXPERT_HOTSET_PINS[0];
+        let stock = stock_registry();
+        for arch in ["gfx1201", "", "gfx1100"] {
+            let items = ep_plan(&stock, "qwen3.8:flash", arch, true, true);
+            assert!(
+                items.iter().all(|item| item.label != "EP hot-unit loan"),
+                "{arch:?}"
+            );
+            let hotset = items
+                .iter()
+                .find(|item| item.label == "EP expert hot set")
+                .unwrap_or_else(|| panic!("{arch:?}: no split-base EP ranking"));
+            assert_eq!(hotset.size, Some(split_pin.size_bytes), "{arch:?}");
+            assert_eq!(
+                hotset.file,
+                format!("{STOCK_BASE}.ep.expert-hotset"),
+                "{arch:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_symtrunk_ep_sidecars_are_not_planned_when_declined_or_gated_off() {
+        // Declining the expert hot set drops both EP sidecars from the symtrunk plan.
+        let registry = symtrunk_registry();
+        let items = ep_plan(&registry, "symtrunk:test", "gfx1201", true, false);
         assert!(items.iter().all(|item| item.label != "EP expert hot set"));
         assert!(items.iter().all(|item| item.label != "EP hot-unit loan"));
+        // The EP ranking is behind its gate.
+        let items = ep_plan(&registry, "symtrunk:test", "gfx1201", false, true);
+        assert!(items.iter().all(|item| item.label != "EP expert hot set"));
     }
 
     const GF_MONO: &str = "qwen3.8-flash-next.mq4-xts";
