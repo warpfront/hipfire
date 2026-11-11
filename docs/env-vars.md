@@ -1262,7 +1262,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 2081
+**Count:** 2084
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -2731,6 +2731,9 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_QWEN4_EP_WIDE_VERIFY` | crates/hipfire-arch-qwen4/examples/qwen4_ep_kld.rs, crates/hipfire-arch-qwen4/src/gpu_forward.rs | developer |
 | `HIPFIRE_QWEN4_EP_WIDE_VERIFY_ALL_LANES` | crates/hipfire-config/src/lib.rs, crates/hipfire-loader/examples/fn_wide_kl_oracle.rs | developer |
 | `HIPFIRE_QWEN4_EP_WIDE_VERIFY_ROWS` | crates/hipfire-arch-qwen4/examples/qwen4_ep_kld.rs, crates/hipfire-arch-qwen4/src/gpu_forward.rs | developer |
+| `HIPFIRE_QWEN4_EXPERT_CACHE` | crates/hipfire-arch-qwen4/src/expert_cache_config.rs | developer |
+| `HIPFIRE_QWEN4_EXPERT_CACHE_INFLIGHT` | crates/hipfire-arch-qwen4/src/expert_cache_config.rs | developer |
+| `HIPFIRE_QWEN4_EXPERT_CACHE_TAIL_PERCENT` | crates/hipfire-arch-qwen4/src/expert_cache_config.rs | developer |
 | `HIPFIRE_QWEN4_EXPERT_DROP_ZERO` | crates/hipfire-arch-qwen4/src/artifact.rs, crates/hipfire-arch-qwen4/src/weights.rs | developer |
 | `HIPFIRE_QWEN4_EXPERT_HOTSET` | crates/hipfire-arch-qwen4/examples/qwen4_cpu_split_parity.rs, crates/hipfire-arch-qwen4/src/expert_ep_units.rs | developer |
 | `HIPFIRE_QWEN4_EXPERT_HOTSET_CENSUS_RESERVE` | crates/hipfire-arch-qwen4/src/expert_hotset.rs, crates/hipfire-config/src/lib.rs | developer |
