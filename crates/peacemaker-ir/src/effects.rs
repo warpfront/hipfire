@@ -105,7 +105,7 @@ pub fn lane_mask_role(arch: Arch, inst: &Inst, index: usize) -> Option<LaneMask>
     if inst.form != Form::Vop3 {
         return None;
     }
-    let name = inst.op.name(arch)?;
+    let name = inst.name(arch)?;
     let out = (name.starts_with("v_cmp_") && index == 0)
         || (index == 1
             && (name.starts_with("v_div_scale_")
@@ -152,7 +152,7 @@ pub fn wave_effects(arch: Arch, wave: Wave, inst: &Inst) -> Effects {
 /// full-register definition: without lane-sensitive proof, an undefined old
 /// destination must remain an open obligation rather than a proved read.
 pub fn preserved_vgpr_destination(arch: Arch, inst: &Inst) -> Option<RegRef> {
-    let writelane = inst.op.name(arch) == Some("v_writelane_b32");
+    let writelane = inst.name(arch) == Some("v_writelane_b32");
     inst.operands.iter().enumerate().find_map(|(i, operand)| {
         let reg = match operand {
             Operand::Half(reg, _) => reg,
@@ -193,8 +193,17 @@ impl Effects {
         operands: &[Operand],
         cpol: &CachePolicy,
     ) -> Result<Self, ValidateError> {
-        let row =
-            crate::isa::lookup(arch, op, form).ok_or(ValidateError::UnknownOpcode { op, form })?;
+        let row = crate::isa::lookup_variant(arch, op, form, None)
+            .ok_or(ValidateError::UnknownOpcode { op, form })?;
+        Self::from_row(arch, row, operands, cpol)
+    }
+    pub fn from_row(
+        arch: Arch,
+        row: &crate::isa::OpRow,
+        operands: &[Operand],
+        cpol: &CachePolicy,
+    ) -> Result<Self, ValidateError> {
+        let form = row.form;
         let returns = crate::isa::atomic_returns(arch, cpol);
         let mut out = Self::default();
         let mut field_names = row.slots(returns).map(|(name, _)| name);
@@ -315,7 +324,76 @@ impl Effects {
                     "unsupported counter unit weight".into(),
                 ));
             }
-            let (class, order) = if name.starts_with("s_load") {
+            let (class, order) = if let Some(key) = row.variant {
+                let catalog = crate::isa::xml::catalog(arch)
+                    .ok_or_else(|| ValidateError::Operand(format!("{name}: no XML catalog")))?;
+                let source = catalog
+                    .row_by_key(
+                        name,
+                        key.encoding,
+                        key.condition,
+                        row.op.id.into(),
+                        key.ordinal.into(),
+                    )
+                    .ok_or_else(|| ValidateError::Operand(format!("{name}: missing XML row")))?;
+                let read = source.memory.iter().any(|op| op.input);
+                let write = source.memory.iter().any(|op| op.output);
+                match form {
+                    Form::Smem => (
+                        if write {
+                            MemClass::SmemStore
+                        } else {
+                            MemClass::SmemLoad
+                        },
+                        OrderType::Smem,
+                    ),
+                    Form::Ds => (
+                        if read && !write {
+                            MemClass::DsLoad
+                        } else if write && !read {
+                            MemClass::DsStore
+                        } else {
+                            MemClass::DsAtomic {
+                                returns: !out.defs.is_empty(),
+                            }
+                        },
+                        OrderType::Ds,
+                    ),
+                    Form::Vmem(segment) => {
+                        let flat = segment == crate::inst::VmemForm::Flat;
+                        let class = if read && write {
+                            if flat {
+                                MemClass::FlatAtomic { returns }
+                            } else {
+                                MemClass::VmemAtomic { returns }
+                            }
+                        } else if read {
+                            if flat {
+                                MemClass::FlatLoad
+                            } else {
+                                MemClass::VmemLoad
+                            }
+                        } else if flat {
+                            MemClass::FlatStore
+                        } else {
+                            MemClass::VmemStore
+                        };
+                        (
+                            class,
+                            if read && (!write || returns) {
+                                OrderType::Load
+                            } else {
+                                OrderType::Store
+                            },
+                        )
+                    }
+                    _ => {
+                        return Err(ValidateError::Operand(format!(
+                            "{name}: XML memory counter on non-memory form"
+                        )))
+                    }
+                }
+            } else if name.starts_with("s_load") {
                 (MemClass::SmemLoad, OrderType::Smem)
             } else if name.starts_with("s_sendmsg_rtn") {
                 (MemClass::SmemLoad, OrderType::Smem)
@@ -414,10 +492,11 @@ mod tests {
             .iter()
             .find(|row| row.name == name && row.form == Form::Vop3)
             .unwrap_or_else(|| panic!("{arch:?} {name}"));
-        Inst::from_parts(
+        Inst::from_encoding(
             arch,
             row.op,
             row.form,
+            row.variant,
             FormFields::None,
             operands.iter().map(|r| Operand::Reg(*r)).collect(),
             Modifiers::default(),
@@ -606,10 +685,11 @@ mod tests {
             .iter()
             .find(|r| r.name == "v_lshlrev_b64_e64")
             .expect("row");
-        let inst = Inst::from_parts(
+        let inst = Inst::from_encoding(
             arch,
             row.op,
             row.form,
+            row.variant,
             FormFields::None,
             [Operand::Reg(v(4, 2)), one, Operand::Reg(s(0, 2))]
                 .into_iter()

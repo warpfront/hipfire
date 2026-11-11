@@ -520,7 +520,7 @@ fn tid_threshold(name: &str, a: &Operand, b: &Operand, st: &St, ex: Ex) -> Optio
 
 /// One wave32 instruction's effect on the abstract state.
 fn step(inst: &Inst, id: u32, st: &mut St, ex: &mut Ex, block: u32) {
-    let Some(row) = peacemaker_ir::isa::lookup(Arch::Gfx1201, inst.op, inst.form) else {
+    let Some(row) = peacemaker_ir::isa::lookup_inst(Arch::Gfx1201, &inst).ok() else {
         havoc(inst, st, ex, &BTreeSet::new(), &BTreeSet::new());
         return;
     };
@@ -860,7 +860,8 @@ fn write_v(st: &mut St, ex: Ex, i: u16, val: VVal) {
 /// write becomes per-wave (fail closed).
 fn havoc(inst: &Inst, st: &mut St, ex: &mut Ex, cs: &BTreeSet<u16>, cv: &BTreeSet<u16>) {
     let e = &inst.effects;
-    let valu = peacemaker_ir::isa::lookup(Arch::Gfx1201, inst.op, inst.form)
+    let valu = peacemaker_ir::isa::lookup_inst(Arch::Gfx1201, &inst)
+        .ok()
         .is_some_and(|r| r.name.starts_with("v_"));
     for r in &e.defs {
         for i in r.base..r.base + u16::from(r.len) {

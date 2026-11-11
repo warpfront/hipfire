@@ -681,8 +681,8 @@ fn decode<'a>(arch: Arch, id: InstId, inst: &'a Inst) -> Option<Dec<'a>> {
     let returns = crate::isa::atomic_returns(arch, &inst.mods.cpol);
     if let FormFields::Vopd { y_op, x_operands } = inst.fields {
         let split = usize::from(x_operands);
-        let x = crate::isa::lookup(arch, inst.op, Form::Vopd)?;
-        let y = crate::isa::lookup(arch, y_op, Form::Vopd)?;
+        let x = crate::isa::lookup_variant(arch, inst.op, Form::Vopd, None)?;
+        let y = crate::isa::lookup_variant(arch, y_op, Form::Vopd, None)?;
         parts.push(Part {
             name: x.name,
             fields: map_fields(x, Form::Vopd, returns, &inst.operands[..split], &mut extras),
@@ -692,7 +692,7 @@ fn decode<'a>(arch: Arch, id: InstId, inst: &'a Inst) -> Option<Dec<'a>> {
             fields: map_fields(y, Form::Vopd, returns, &inst.operands[split..], &mut extras),
         });
     } else {
-        let row = crate::isa::lookup(arch, inst.op, inst.form)?;
+        let row = crate::isa::lookup_inst(arch, &inst).ok()?;
         parts.push(Part {
             name: row.name,
             fields: map_fields(row, inst.form, returns, &inst.operands, &mut extras),
@@ -892,7 +892,7 @@ const SCOPE_DEV: u8 = 2;
 const SCOPE_SYS: u8 = 3;
 
 fn inst_name(arch: Arch, inst: &Inst) -> &'static str {
-    inst.op.name(arch).unwrap_or("")
+    inst.name(arch).unwrap_or("")
 }
 
 /// Whether `inst` is a wait that drains `counter` to zero (`s_wait_loadcnt 0`,

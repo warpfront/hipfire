@@ -626,7 +626,7 @@ fn unmodeled_ops(prog: &Program, symbol: &str) -> std::collections::BTreeSet<Str
         let Some(inst) = kernel.body.insts.get(*id) else {
             continue;
         };
-        match peacemaker_ir::isa::lookup(prog.target.arch, inst.op, inst.form) {
+        match peacemaker_ir::isa::lookup_inst(prog.target.arch, &inst).ok() {
             None => {
                 set.insert("<unknown decoded opcode>".to_string());
             }

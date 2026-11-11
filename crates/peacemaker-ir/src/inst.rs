@@ -158,6 +158,7 @@ pub struct NamedField {
 pub struct Inst {
     pub op: Opcode,
     pub form: Form,
+    pub variant: Option<crate::isa::EncodingVariant>,
     pub fields: FormFields,
     pub operands: SmallVec<[Operand; 6]>,
     pub mods: Modifiers,
@@ -166,12 +167,11 @@ pub struct Inst {
     pub prov: Provenance,
 }
 impl Inst {
+    pub fn name(&self, arch: Arch) -> Option<&'static str> {
+        crate::isa::lookup_inst(arch, self).ok().map(|row| row.name)
+    }
     pub fn text(&self, arch: Arch) -> Result<String, ValidateError> {
-        let row =
-            crate::isa::lookup(arch, self.op, self.form).ok_or(ValidateError::UnknownOpcode {
-                op: self.op,
-                form: self.form,
-            })?;
+        let row = crate::isa::lookup_inst(arch, self).map_err(ValidateError::Operand)?;
         let mut text = row.name.to_owned();
         let mut previous_operand = false;
         for (index, operand) in self.operands.iter().enumerate() {
@@ -220,14 +220,50 @@ impl Inst {
         literal: Option<u32>,
         prov: Provenance,
     ) -> Result<Self, ValidateError> {
-        let effects = if let FormFields::Vopd { y_op, x_operands } = &fields {
+        Self::from_encoding(arch, op, form, None, fields, operands, mods, literal, prov)
+    }
+    /// Reconstruct an instruction without losing its selected physical encoding.
+    pub fn from_encoding(
+        arch: Arch,
+        op: Opcode,
+        form: Form,
+        variant: Option<crate::isa::EncodingVariant>,
+        fields: FormFields,
+        operands: SmallVec<[Operand; 6]>,
+        mods: Modifiers,
+        literal: Option<u32>,
+        prov: Provenance,
+    ) -> Result<Self, ValidateError> {
+        let row = crate::isa::lookup_variant(arch, op, form, variant).ok_or_else(|| {
+            ValidateError::Operand(format!(
+                "{}: unavailable encoding {variant:?}",
+                variant.map_or("census instruction", |key| key.instruction)
+            ))
+        })?;
+        Self::from_row(arch, row, fields, operands, mods, literal, prov)
+    }
+    pub fn from_row(
+        arch: Arch,
+        row: &crate::isa::OpRow,
+        fields: FormFields,
+        operands: SmallVec<[Operand; 6]>,
+        mods: Modifiers,
+        literal: Option<u32>,
+        prov: Provenance,
+    ) -> Result<Self, ValidateError> {
+        let op = row.op;
+        let form = row.form;
+        let effects = if row.variant.is_some() && matches!(&fields, FormFields::Bits { .. }) {
+            crate::codec::xml::field_effects(arch, row, &fields, &operands, &mods)
+                .map_err(|e| ValidateError::Operand(e.to_string()))?
+        } else if let FormFields::Vopd { y_op, x_operands } = &fields {
             let split = usize::from(*x_operands);
             if split == 0 || split >= operands.len() {
                 return Err(ValidateError::Operand(
                     "VOPD operand split is outside the packet".into(),
                 ));
             }
-            let mut x = Effects::from_table(arch, op, form, &operands[..split], &mods.cpol)?;
+            let mut x = Effects::from_row(arch, row, &operands[..split], &mods.cpol)?;
             let y = Effects::from_table(arch, *y_op, Form::Vopd, &operands[split..], &mods.cpol)?;
             x.defs.extend(y.defs);
             x.uses.extend(y.uses);
@@ -235,11 +271,12 @@ impl Inst {
             x.implicit.writes |= y.implicit.writes;
             x
         } else {
-            Effects::from_table(arch, op, form, &operands, &mods.cpol)?
+            Effects::from_row(arch, row, &operands, &mods.cpol)?
         };
         let inst = Self {
             op,
             form,
+            variant: row.variant,
             fields,
             operands,
             mods,
@@ -251,11 +288,7 @@ impl Inst {
         Ok(inst)
     }
     pub fn validate(&self, arch: Arch) -> Result<(), ValidateError> {
-        let row =
-            crate::isa::lookup(arch, self.op, self.form).ok_or(ValidateError::UnknownOpcode {
-                op: self.op,
-                form: self.form,
-            })?;
+        let row = crate::isa::lookup_inst(arch, self).map_err(ValidateError::Operand)?;
         for operand in &self.operands {
             operand
                 .validate()
@@ -264,7 +297,7 @@ impl Inst {
         if let FormFields::Vopd { y_op, x_operands } = self.fields {
             if self.form != Form::Vopd
                 || usize::from(x_operands) >= self.operands.len()
-                || crate::isa::lookup(arch, y_op, Form::Vopd).is_none()
+                || crate::isa::lookup_variant(arch, y_op, Form::Vopd, None).is_none()
             {
                 return Err(ValidateError::Operand(
                     "VOPD must have both typed opcode halves and operands".into(),
@@ -308,7 +341,17 @@ impl Inst {
                 });
             }
         }
+        // XML packet fields can include the literal extension required by the
+        // peer half, even when this row itself names the shorter base layout.
+        let xml_packet = self.variant.is_some() && matches!(self.fields, FormFields::Bits { .. });
+        if xml_packet {
+            crate::codec::xml::validate_packet_fields(arch, row, &self.fields)
+                .map_err(|e| ValidateError::Operand(e.to_string()))?;
+        }
         for field in self.fields.honored() {
+            if xml_packet {
+                continue;
+            }
             let rule = row
                 .fields
                 .iter()
@@ -924,7 +967,6 @@ impl Program {
                     .get(body.layout[block.range.1 - 1])
                     .expect("layout instructions were checked above");
                 let name = last
-                    .op
                     .name(self.target.arch)
                     .ok_or(ValidateError::UnknownOpcode {
                         op: last.op,

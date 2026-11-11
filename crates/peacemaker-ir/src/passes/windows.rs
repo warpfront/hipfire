@@ -176,7 +176,6 @@ pub fn is_trans(inst: &crate::inst::Inst) -> bool {
     ];
     is_valu(inst)
         && inst
-            .op
             .name(crate::inst::Arch::Gfx1201)
             .is_some_and(|n| TRANS.iter().any(|t| n.starts_with(t)))
 }
@@ -477,6 +476,7 @@ mod tests {
         Inst {
             op: row_op(name, form),
             form,
+            variant: None,
             fields: Default::default(),
             operands: Default::default(),
             mods: Default::default(),

@@ -197,7 +197,7 @@ fn run() -> Res<i32> {
             .insts
             .get(*id)
             .ok_or("layout names a missing instruction")?;
-        match peacemaker_ir::isa::lookup(program.target.arch, inst.op, inst.form) {
+        match peacemaker_ir::isa::lookup_inst(program.target.arch, &inst).ok() {
             Some(row) if peacemaker_ir::emu::semantic_class(row.name).is_some() => {}
             Some(row) => *missing.entry(row.name).or_default() += 1,
             None => *missing.entry("<undecodable>").or_default() += 1,

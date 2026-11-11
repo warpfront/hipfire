@@ -370,7 +370,7 @@ fn unsupported_ops(program: &Program, symbol: &str) -> Vec<String> {
     let mut out = BTreeSet::new();
     for id in &kernel.body.layout {
         let inst = kernel.body.insts.get(*id).expect("layout instruction");
-        match peacemaker_ir::isa::lookup(program.target.arch, inst.op, inst.form) {
+        match peacemaker_ir::isa::lookup_inst(program.target.arch, &inst).ok() {
             None => {
                 out.insert(format!("<undecodable {:?}/{:?}>", inst.op, inst.form));
             }

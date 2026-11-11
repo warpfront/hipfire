@@ -132,7 +132,7 @@ fn scalar_immediate(op: &Operand) -> Option<u32> {
 fn previous_real(body: &Body, arch: crate::inst::Arch, mut k: usize) -> Option<usize> {
     loop {
         k = k.checked_sub(1)?;
-        let name = body.insts.get(body.layout[k])?.op.name(arch)?;
+        let name = body.insts.get(body.layout[k])?.name(arch)?;
         if !matches!(name, "s_wait_alu" | "s_delay_alu") {
             return Some(k);
         }
@@ -151,7 +151,7 @@ fn far_jump_target(
     i: usize,
 ) -> Option<i64> {
     let inst = |k: usize| body.insts.get(body.layout[k]);
-    let name = |k: usize| inst(k).and_then(|x| x.op.name(arch));
+    let name = |k: usize| inst(k).and_then(|x| x.name(arch));
     let Some(Operand::Reg(pair)) = inst(i)?.operands.first() else {
         return None;
     };
@@ -255,7 +255,7 @@ pub fn build_blocks(body: &mut Body, arch: crate::inst::Arch) -> Result<LayoutIn
                     End::Branch { target_pos }
                 });
             }
-            Control::None if inst.op.name(arch) == Some("s_setpc_b64") => {
+            Control::None if inst.name(arch) == Some("s_setpc_b64") => {
                 let target = far_jump_target(body, arch, &pcs, &dwords, i)
                     .ok_or(CfgError::UnresolvedIndirectJump { index: i })?;
                 if target < 0 || target >= total as i64 {
@@ -729,6 +729,7 @@ mod tests {
         Inst {
             op,
             form,
+            variant: None,
             fields: Default::default(),
             operands: operands.into_iter().collect(),
             mods: Default::default(),
@@ -750,6 +751,7 @@ mod tests {
         Inst {
             op,
             form,
+            variant: None,
             fields: Default::default(),
             operands: Default::default(),
             mods: Default::default(),

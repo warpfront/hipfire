@@ -121,7 +121,7 @@ fn select(
         _ => return Err(reject(format!("unknown source selector {code:#x}"))),
     })
 }
-fn selector(operand: &Operand, width: u8) -> Result<u32, DecodeError> {
+pub(super) fn selector(operand: &Operand, width: u8) -> Result<u32, DecodeError> {
     match operand {
         Operand::Reg(r) | Operand::Half(r, _) => {
             if r.len != width {
@@ -176,7 +176,7 @@ fn reg(kind: Kind, base: u32, bits: u16) -> Operand {
         len: (bits / 32).max(1) as u8,
     })
 }
-fn operand(
+pub(super) fn operand(
     arch: Arch,
     name: &str,
     bits: u16,
@@ -366,7 +366,7 @@ fn operand(
     }
     Ok(src)
 }
-fn encoded_operand(
+pub(super) fn encoded_operand(
     arch: Arch,
     name: &str,
     bits: u16,
@@ -514,6 +514,12 @@ fn width(arch: Arch, row: &OpRow, words: &[u32]) -> Result<usize, DecodeError> {
     Ok(size)
 }
 fn field_value(arch: Arch, name: &str, row: &OpRow, words: &[u32]) -> u32 {
+    if let Some(variant) = row.variant {
+        return isa::xml::catalog(arch)
+            .and_then(|catalog| catalog.encoding(variant.encoding))
+            .and_then(|encoding| encoding.field(name))
+            .map_or(0, |field| field.extract(isa::xml::pack_words(words)) as u32);
+    }
     if name == "SDST" && row.form == Form::Vop3 {
         return (words[0] >> 8) & 127;
     }
@@ -801,6 +807,47 @@ pub fn decode(words: &[u32]) -> Result<(Inst, usize), DecodeError> {
 }
 /// Decode according to the target's opcode and field-layout tables.
 pub fn decode_for(arch: Arch, words: &[u32]) -> Result<(Inst, usize), DecodeError> {
+    match decode_census(arch, words) {
+        Ok(decoded) => {
+            if decoded.0.form == Form::Sop1 {
+                let catalog = isa::xml::catalog(arch).expect("RDNA target");
+                let name = decoded.0.name(arch).expect("decoded instruction has a row");
+                if catalog.has_sop1_source_rule(name) {
+                    catalog
+                        .validate_sop1_source(name, words[0] & 255)
+                        .map_err(|error| reject(format!("{arch:?}: {error}")))?;
+                }
+            }
+            Ok(decoded)
+        }
+        Err(census_error) => {
+            // Preserve the qualified census's ignored-field restrictions. A
+            // genuinely different extension (VOP3/VOPC DPP) has a separate XML
+            // encoding; it is not a way to bypass a census field rejection.
+            let census = row_for(arch, words).ok();
+            match super::xml::decode(arch, words) {
+                Ok(decoded) => {
+                    if let Some(census) = census {
+                        let extension = decoded
+                            .0
+                            .variant
+                            .is_some_and(|v| v.encoding.contains("DPP"))
+                            && !matches!(
+                                census.form,
+                                Form::Vop1Dpp | Form::Vop1Dpp8 | Form::Vop2Dpp
+                            );
+                        if !extension {
+                            return Err(census_error);
+                        }
+                    }
+                    Ok(decoded)
+                }
+                Err(_) => Err(census_error),
+            }
+        }
+    }
+}
+fn decode_census(arch: Arch, words: &[u32]) -> Result<(Inst, usize), DecodeError> {
     let row = row_for(arch, words)?;
     let n = width(arch, row, words)?;
     let words = &words[..n];
@@ -994,10 +1041,11 @@ pub fn decode_for(arch: Arch, words: &[u32]) -> Result<(Inst, usize), DecodeErro
             y_op: y.op,
             x_operands: count,
         };
-        let inst = Inst::from_parts(
+        let inst = Inst::from_encoding(
             arch,
             row.op,
             row.form,
+            row.variant,
             fields,
             operands,
             mods,
@@ -1069,10 +1117,9 @@ pub fn decode_for(arch: Arch, words: &[u32]) -> Result<(Inst, usize), DecodeErro
             return Err(reject(format!("unknown bits in word {i}: {unknown:#010x}")));
         }
     }
-    let inst = Inst::from_parts(
+    let inst = Inst::from_row(
         arch,
-        row.op,
-        row.form,
+        row,
         fields,
         operands,
         mods,
@@ -1089,7 +1136,10 @@ pub fn encode(inst: &Inst) -> Result<SmallVec<[u32; 3]>, DecodeError> {
 /// Encode from typed fields without consulting provenance bytes.
 pub fn encode_for(arch: Arch, inst: &Inst) -> Result<SmallVec<[u32; 3]>, DecodeError> {
     inst.validate(arch).map_err(|e| reject(e.to_string()))?;
-    let row = isa::lookup(arch, inst.op, inst.form).ok_or_else(|| reject("unknown opcode/form"))?;
+    if inst.variant.is_some() {
+        return super::xml::encode(arch, inst);
+    }
+    let row = isa::lookup_inst(arch, inst).map_err(reject)?;
     if row.form == Form::Vmem(crate::inst::VmemForm::Global) {
         let address = row
             .slots(isa::atomic_returns(arch, &inst.mods.cpol))
@@ -1183,7 +1233,7 @@ pub fn encode_for(arch: Arch, inst: &Inst) -> Result<SmallVec<[u32; 3]>, DecodeE
             if usize::from(*x_operands) != row.slots(false).count() {
                 return Err(reject("VOPD half boundary mismatch"));
             }
-            let y = isa::lookup(arch, *y_op, Form::Vopd)
+            let y = isa::lookup_variant(arch, *y_op, Form::Vopd, None)
                 .ok_or_else(|| reject("unknown VOPD Y opcode"))?;
             assign(Field::new("OPY", 17, 5), &mut words, y.op.id.into())?;
             for (name, bits) in y.slots(false) {
@@ -1742,7 +1792,9 @@ mod tests {
                         return Err(reject(format!("width {len} != {}", words.len())));
                     }
                     // FLAT/GLOBAL/BUFFER and e32/DPP share opcode ids; the form disambiguates.
-                    let decoded = isa::lookup(arch, inst.op, inst.form).map_or("?", |row| row.name);
+                    let decoded = isa::lookup_inst(arch, &inst)
+                        .ok()
+                        .map_or("?", |row| row.name);
                     if decoded != name {
                         return Err(reject(format!("decoded as {decoded}")));
                     }
@@ -2393,10 +2445,11 @@ mod aco_pilot_scalar_tests {
         assert_eq!(used, words.len());
         assert_eq!(encode(&inst).unwrap().as_slice(), words);
         // Re-derive from typed fields alone; no decoded provenance participates.
-        let rebuilt = Inst::from_parts(
+        let rebuilt = Inst::from_encoding(
             Arch::Gfx1201,
             inst.op,
             inst.form,
+            inst.variant,
             inst.fields.clone(),
             inst.operands.clone(),
             inst.mods.clone(),
@@ -2441,10 +2494,11 @@ mod aco_pilot_scalar_tests {
     fn scc_selector_is_a_32_bit_scalar_source_only() {
         // SCC cannot be a destination: the typed operand does not encode as SDST.
         let (mov, _) = decode(&[0xbe94_0080]).unwrap();
-        let as_dest = Inst::from_parts(
+        let as_dest = Inst::from_encoding(
             Arch::Gfx1201,
             mov.op,
             mov.form,
+            mov.variant,
             FormFields::None,
             smallvec::smallvec![Operand::Special(Special::Scc), s20()],
             Modifiers::default(),
@@ -2515,14 +2569,25 @@ mod aco_pilot_scalar_tests {
         assert_eq!(inst.effects.implicit.writes, ImplicitSet::SCC);
         assert_eq!(inst.effects.implicit.reads, 0);
     }
-    /// The new rows exist only in the gfx1201 table; targets without a row reject table-gated.
+    /// `s_bfm_b32` / `s_cmp_lg_i32` are llvm-mc verified rows of the gfx1100 and gfx1151 XML catalogs as well as
+    /// gfx1201's. Evidence (`isa/gfx1100.xml.jsonl` and `isa/gfx1151.xml.jsonl`, identical rows):
+    /// `s_bfm_b32` ENC_SOP2 opcode 42, oracle `verified` candidate `00000095` -> `s_bfm_b32 s0, s0, s0`;
+    /// `s_cmp_lg_i32` ENC_SOPC opcode 1, oracle `verified` candidate `000001bf` -> `s_cmp_lg_i32 s0, s0`.
+    /// Gfx1030 has neither a census table nor an XML catalog, so it still has no row for them.
     #[test]
     fn new_rows_are_gated_to_the_gfx1201_table() {
-        for words in [[0x956a_8090u32], [0xbf01_8014]] {
-            for arch in [Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1030] {
-                let e = decode_for(arch, &words).unwrap_err().to_string();
-                assert!(e.contains("undefined"), "{arch:?} {words:08x?}: {e}");
+        for (name, words) in [
+            ("s_bfm_b32", [0x956a_8090u32]),
+            ("s_cmp_lg_i32", [0xbf01_8014]),
+        ] {
+            for arch in [Arch::Gfx1100, Arch::Gfx1151] {
+                let (inst, used) =
+                    decode_for(arch, &words).unwrap_or_else(|e| panic!("{arch:?} {name}: {e}"));
+                assert_eq!(used, 1, "{arch:?} {name}");
+                assert_eq!(inst.name(arch), Some(name), "{arch:?} {words:08x?}");
             }
+            let e = decode_for(Arch::Gfx1030, &words).unwrap_err().to_string();
+            assert!(e.contains("undefined"), "Gfx1030 {words:08x?}: {e}");
         }
     }
 }
@@ -3037,10 +3102,12 @@ mod opcode_fill_rows_tests {
                 if used != words.len() {
                     return Err(format!("width {used} != {}", words.len()));
                 }
-                if inst.op.name(Arch::Gfx1201) != Some(name) {
+                if inst.name(Arch::Gfx1201) != Some(name) {
                     return Err(format!("decoded as {:?}", inst.op.name(Arch::Gfx1201)));
                 }
-                let row = isa::lookup(Arch::Gfx1201, inst.op, inst.form).ok_or("no table row")?;
+                let row = isa::lookup_inst(Arch::Gfx1201, &inst)
+                    .ok()
+                    .ok_or("no table row")?;
                 if check_table {
                     let table: Vec<u32> = row
                         .encoding
@@ -3070,10 +3137,11 @@ mod opcode_fill_rows_tests {
                     return Err("re-encode differs".into());
                 }
                 // Typed fields alone (no decoded provenance) rebuild the same words.
-                let rebuilt = Inst::from_parts(
+                let rebuilt = Inst::from_encoding(
                     Arch::Gfx1201,
                     inst.op,
                     inst.form,
+                    inst.variant,
                     inst.fields.clone(),
                     inst.operands.clone(),
                     inst.mods.clone(),
@@ -3195,7 +3263,7 @@ mod opcode_fill_rows_tests {
     fn filled_rows_roundtrip_all_declared_dont_care_values() {
         for &(name, words, ..) in NEW_ROWS {
             let (inst, _) = decode(words).unwrap();
-            let row = isa::lookup(Arch::Gfx1201, inst.op, inst.form).unwrap();
+            let row = isa::lookup_inst(Arch::Gfx1201, &inst).ok().unwrap();
             for rule in row.fields.iter().filter(|r| r.class == FieldClass::Ignored) {
                 let Some(placement) = (match rule.name {
                     "w0_extra" => Some((0, 0)),
@@ -3310,14 +3378,17 @@ mod rows6_gap_tests {
     fn roundtrip(name: &str, words: &[u32]) -> Inst {
         let (inst, used) = decode(words).unwrap_or_else(|e| panic!("{name} {words:08x?}: {e}"));
         assert_eq!(used, words.len(), "{name}");
-        let row = isa::lookup(Arch::Gfx1201, inst.op, inst.form).expect("table row");
+        let row = isa::lookup_inst(Arch::Gfx1201, &inst)
+            .ok()
+            .expect("table row");
         assert_eq!(row.name, name, "{words:08x?}");
         assert_eq!(encode(&inst).unwrap().as_slice(), words, "{name}");
         // Typed fields alone (no decoded provenance) rebuild the same words.
-        let rebuilt = Inst::from_parts(
+        let rebuilt = Inst::from_encoding(
             Arch::Gfx1201,
             inst.op,
             inst.form,
+            inst.variant,
             inst.fields.clone(),
             inst.operands.clone(),
             inst.mods.clone(),
@@ -3334,7 +3405,7 @@ mod rows6_gap_tests {
     fn new_rows_match_their_llvm_words_and_table_samples() {
         for &(name, words, text) in NEW_ROWS {
             let inst = roundtrip(name, words);
-            let row = isa::lookup(Arch::Gfx1201, inst.op, inst.form).unwrap();
+            let row = isa::lookup_inst(Arch::Gfx1201, &inst).ok().unwrap();
             let table: Vec<u32> = row
                 .encoding
                 .split_whitespace()
@@ -3395,10 +3466,11 @@ mod rows6_gap_tests {
         let select = inst.fields.honored().iter().find(|f| f.name == "dpp8_sel");
         assert_eq!(select.map(|f| f.value), Some(0x688f_ac00));
         // Other lane selects encode through the typed field alone.
-        let identity = Inst::from_parts(
+        let identity = Inst::from_encoding(
             Arch::Gfx1201,
             inst.op,
             inst.form,
+            inst.variant,
             FormFields::Bits {
                 ignored: SmallVec::new(),
                 honored: smallvec::smallvec![NamedField {

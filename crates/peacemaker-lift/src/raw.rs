@@ -317,7 +317,7 @@ pub fn scan_stream(code: &[u8], arch: Arch) -> StreamScan {
                     scan.decoded.push(ScanInst {
                         offset,
                         words: n,
-                        opcode: inst.op.name(arch).unwrap_or("?").to_owned(),
+                        opcode: inst.name(arch).unwrap_or("?").to_owned(),
                         form: format!("{:?}", inst.form),
                     });
                     at += n;

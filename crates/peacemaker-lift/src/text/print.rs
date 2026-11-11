@@ -52,10 +52,12 @@ pub enum PrintError {
 
 /// Canonical objdump text for one instruction.
 pub fn canonical(inst: &Inst, arch: Arch) -> Result<String, PrintError> {
-    let row = isa::lookup(arch, inst.op, inst.form).ok_or(PrintError::UnknownOpcode {
-        op: inst.op,
-        form: inst.form,
-    })?;
+    let row = isa::lookup_inst(arch, &inst)
+        .ok()
+        .ok_or(PrintError::UnknownOpcode {
+            op: inst.op,
+            form: inst.form,
+        })?;
     if inst.form == Form::Sopp && row.name == "s_delay_alu" {
         return delay_text(&inst.mods);
     }
@@ -685,10 +687,11 @@ fn vopd_text(inst: &Inst, row: &OpRow) -> Result<String, PrintError> {
     // and the T3 test fails closed on any disagreement with objdump.
     let x_row = row;
     let arch = Arch::Gfx1201;
-    let y_row = isa::lookup(arch, y_op, Form::Vopd).ok_or(PrintError::UnknownOpcode {
-        op: y_op,
-        form: Form::Vopd,
-    })?;
+    let y_row =
+        isa::lookup_variant(arch, y_op, Form::Vopd, None).ok_or(PrintError::UnknownOpcode {
+            op: y_op,
+            form: Form::Vopd,
+        })?;
     if inst.operands.len() < x_count {
         return Err(PrintError::Unspellable(format!(
             "{} has fewer operands than its X half",

@@ -6,6 +6,7 @@
 use crate::inst::{Arch, Family, Form, Opcode, VmemForm};
 use crate::operand::CachePolicy;
 use std::sync::LazyLock;
+pub mod xml;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FieldClass {
     Ignored,
@@ -18,10 +19,20 @@ pub struct FieldRule {
     pub mask: u32,
     pub allowed: Vec<u32>,
 }
+/// Instruction-local encoding identity, including conditional and extension forms.
+/// `None` on an instruction denotes the unique census encoding, not a wildcard.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct EncodingVariant {
+    pub instruction: &'static str,
+    pub encoding: &'static str,
+    pub condition: &'static str,
+    pub ordinal: u16,
+}
 #[derive(Clone, Debug)]
 pub struct OpRow {
     pub op: Opcode,
     pub form: Form,
+    pub variant: Option<EncodingVariant>,
     pub name: &'static str,
     pub grammar: &'static str,
     pub defs: &'static str,
@@ -150,8 +161,10 @@ fn parse(contents: &'static str) -> Result<Vec<OpRow>, TableError> {
             line: index + 1,
             reason: reason.into(),
         };
-        if fields.len() != 11 {
-            return Err(fail("expected 11 tab-delimited columns"));
+        if fields.len() != 11 && fields.len() != 14 {
+            return Err(fail(
+                "expected 11 census or 14 variant-keyed tab-delimited columns",
+            ));
         }
         let kind = form(fields[1]).ok_or_else(|| fail("unknown instruction form"))?;
         let id = u16::from_str_radix(fields[2].trim_start_matches("0x"), 16)
@@ -212,6 +225,18 @@ fn parse(contents: &'static str) -> Result<Vec<OpRow>, TableError> {
                 id,
             },
             form: kind,
+            variant: if fields.len() == 14 {
+                Some(EncodingVariant {
+                    instruction: fields[0],
+                    encoding: fields[11],
+                    condition: fields[12],
+                    ordinal: fields[13]
+                        .parse()
+                        .map_err(|_| fail("bad encoding ordinal"))?,
+                })
+            } else {
+                None
+            },
             name: fields[0],
             grammar: fields[3],
             defs: fields[4],
@@ -225,7 +250,7 @@ fn parse(contents: &'static str) -> Result<Vec<OpRow>, TableError> {
         };
         if rows
             .iter()
-            .any(|r: &OpRow| r.op == row.op && r.form == row.form)
+            .any(|r: &OpRow| r.op == row.op && r.form == row.form && r.variant == row.variant)
         {
             return Err(TableError::Duplicate { line: index + 1 });
         }
@@ -271,11 +296,142 @@ pub fn table(arch: Arch) -> &'static [OpRow] {
         Arch::Gfx1010 | Arch::Gfx1030 => &[],
     }
 }
-pub fn lookup(arch: Arch, opcode: Opcode, form: Form) -> Option<&'static OpRow> {
-    table(arch)
+/// Complete variant-keyed XML rows, separate from the frozen census regression set.
+pub fn runtime_table(arch: Arch) -> &'static [OpRow] {
+    static GFX1100: LazyLock<Vec<OpRow>> = LazyLock::new(|| {
+        parse(include_str!("../isa/gfx1100.runtime.tbl")).expect("gfx1100 runtime table")
+    });
+    static GFX1151: LazyLock<Vec<OpRow>> = LazyLock::new(|| {
+        parse(include_str!("../isa/gfx1151.runtime.tbl")).expect("gfx1151 runtime table")
+    });
+    static GFX12: LazyLock<Vec<OpRow>> = LazyLock::new(|| {
+        parse(include_str!("../isa/gfx12.runtime.tbl")).expect("gfx12 runtime table")
+    });
+    match arch {
+        Arch::Gfx1100 => &GFX1100,
+        Arch::Gfx1151 => &GFX1151,
+        Arch::Gfx1200 | Arch::Gfx1201 => &GFX12,
+        _ => &[],
+    }
+}
+fn variant_index(arch: Arch) -> Option<&'static std::collections::HashMap<EncodingVariant, usize>> {
+    fn build(arch: Arch) -> std::collections::HashMap<EncodingVariant, usize> {
+        let mut index = std::collections::HashMap::new();
+        for (i, row) in runtime_table(arch).iter().enumerate() {
+            assert!(
+                index.insert(row.variant.expect("XML key"), i).is_none(),
+                "duplicate XML encoding identity"
+            );
+        }
+        index
+    }
+    static GFX1100: LazyLock<std::collections::HashMap<EncodingVariant, usize>> =
+        LazyLock::new(|| build(Arch::Gfx1100));
+    static GFX1151: LazyLock<std::collections::HashMap<EncodingVariant, usize>> =
+        LazyLock::new(|| build(Arch::Gfx1151));
+    static GFX12: LazyLock<std::collections::HashMap<EncodingVariant, usize>> =
+        LazyLock::new(|| build(Arch::Gfx1201));
+    match arch {
+        Arch::Gfx1100 => Some(&GFX1100),
+        Arch::Gfx1151 => Some(&GFX1151),
+        Arch::Gfx1200 | Arch::Gfx1201 => Some(&GFX12),
+        _ => None,
+    }
+}
+pub fn lookup_xml(arch: Arch, key: EncodingVariant) -> Option<&'static OpRow> {
+    runtime_table(arch).get(*variant_index(arch)?.get(&key)?)
+}
+/// Look up an explicitly selected encoding. `None` selects a census row.
+pub fn lookup_variant(
+    arch: Arch,
+    opcode: Opcode,
+    form: Form,
+    variant: Option<EncodingVariant>,
+) -> Option<&'static OpRow> {
+    if let Some(key) = variant {
+        return lookup_xml(arch, key).filter(|row| row.op == opcode && row.form == form);
+    }
+    let rows = table(arch);
+    let mut matches = rows
         .iter()
-        .find(|row| row.op == opcode && row.form == form)
+        .filter(|row| row.op == opcode && row.form == form && row.variant == variant);
+    let row = matches.next()?;
+    matches.next().is_none().then_some(row)
+}
+pub fn lookup(arch: Arch, opcode: Opcode, form: Form) -> Option<&'static OpRow> {
+    let mut matches = table(arch)
+        .iter()
+        .chain(runtime_table(arch).iter())
+        .filter(|row| row.op == opcode && row.form == form);
+    let row = matches.next()?;
+    matches.next().is_none().then_some(row)
+}
+/// Select the exact encoding named by an instruction; never choose the first variant.
+pub fn lookup_inst(arch: Arch, inst: &crate::inst::Inst) -> Result<&'static OpRow, String> {
+    lookup_variant(arch, inst.op, inst.form, inst.variant).ok_or_else(|| {
+        let name = table(arch)
+            .iter()
+            .chain(runtime_table(arch))
+            .find(|row| row.op == inst.op && row.form == inst.form)
+            .map_or("unknown instruction", |row| row.name);
+        format!(
+            "{name}: unavailable or ambiguous encoding {:?}",
+            inst.variant
+        )
+    })
 }
 pub fn lookup_opcode(arch: Arch, opcode: Opcode) -> Option<&'static OpRow> {
     table(arch).iter().find(|row| row.op == opcode)
+}
+
+#[cfg(test)]
+mod variant_tests {
+    use super::*;
+
+    #[test]
+    fn full_key_preserves_conditional_variants() {
+        let rows = parse(concat!(
+            "s_mov_b32\tsop1\t0\tSDST:32,SSRC0:32\tSDST\tSSRC0\t-\t-\ts_mov_b32 s0, s0\tbe800000\t-\tENC_SOP1\tno_literal\t0\n",
+            "s_mov_b32\tsop1\t0\tSDST:32,LITERAL:32\tSDST\tLITERAL\t-\t-\ts_mov_b32 s0, 0x41234567\tbe8000ff 41234567\t-\tSOP1_INST_LITERAL\tliteral\t1\n",
+        )).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_ne!(rows[0].variant, rows[1].variant);
+    }
+
+    #[test]
+    fn instruction_lookup_requires_the_exact_variant() {
+        let arch = Arch::Gfx1100;
+        let row = runtime_table(arch)
+            .iter()
+            .find(|row| row.name == "s_mov_b32" && row.variant.unwrap().encoding == "ENC_SOP1")
+            .unwrap();
+        let mut inst = crate::codec::gfx12::decode_for(arch, &[0xbe80_0002])
+            .unwrap()
+            .0;
+        assert!(lookup(arch, row.op, row.form).is_none());
+        inst.variant = row.variant;
+        assert_eq!(lookup_inst(arch, &inst).unwrap().variant, row.variant);
+        inst.variant.as_mut().unwrap().ordinal = u16::MAX;
+        let error = lookup_inst(arch, &inst).unwrap_err();
+        assert!(error.contains("s_mov_b32"), "{error}");
+    }
+
+    #[test]
+    fn opcode_form_lookup_accepts_only_unambiguous_rows() {
+        let arch = Arch::Gfx1201;
+        let rows: Vec<_> = table(arch).iter().chain(runtime_table(arch)).collect();
+        let unique = rows
+            .iter()
+            .find(|candidate| {
+                rows.iter()
+                    .filter(|row| row.op == candidate.op && row.form == candidate.form)
+                    .count()
+                    == 1
+            })
+            .expect("the complete XML contains unique opcode/form keys");
+        assert_eq!(
+            lookup(arch, unique.op, unique.form).unwrap().variant,
+            unique.variant
+        );
+    }
 }

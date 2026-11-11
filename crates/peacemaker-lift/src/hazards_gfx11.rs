@@ -475,7 +475,7 @@ struct WaitFields {
 fn facts_of(inst: &Inst, arch: Arch, wave: Wave) -> Facts {
     // VALU lane masks are one SGPR in wave32: the table's 64-bit slot would invent a write of the next SGPR.
     let effects = peacemaker_ir::effects::wave_effects(arch, wave, inst);
-    let name = inst.op.name(arch).unwrap_or("?");
+    let name = inst.name(arch).unwrap_or("?");
     let base = base_name(name);
     let class = class_of(inst);
     let imm = sopp_imm(inst);
@@ -1118,7 +1118,7 @@ struct WarState {
 
 /// Data (store-source) VGPR operands of a DS/VMEM instruction, by table slot name.
 fn data_vgprs(inst: &Inst, arch: Arch) -> Vec<RegRef> {
-    let Some(row) = peacemaker_ir::isa::lookup(arch, inst.op, inst.form) else {
+    let Some(row) = peacemaker_ir::isa::lookup_inst(arch, &inst).ok() else {
         return Vec::new();
     };
     let returns = peacemaker_ir::isa::atomic_returns(arch, &inst.mods.cpol);

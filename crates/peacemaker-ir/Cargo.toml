@@ -8,11 +8,12 @@ license.workspace = true
 smallvec = "1"
 thiserror.workspace = true
 petgraph = "0.8"
+serde_json.workspace = true
+serde = { workspace = true, features = ["derive"] }
 
 [dev-dependencies]
 proptest.workspace = true
 insta = "1"
-serde_json.workspace = true
 # The real-object analyzer fixtures (tests/kernarg_indexed.rs) lift a gfx1201
 # code object; a dev-dependency cycle is fine, the runtime graph stays clean.
 peacemaker-lift = { path = "../peacemaker-lift" }

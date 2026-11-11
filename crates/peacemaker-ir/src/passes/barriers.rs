@@ -415,10 +415,11 @@ mod gfx11_tests {
                     len: 1,
                 })
             };
-            let store = Inst::from_parts(
+            let store = Inst::from_encoding(
                 arch,
                 row.op,
                 row.form,
+                row.variant,
                 FormFields::None,
                 SmallVec::from_vec(vec![v(1), v(2), Operand::Imm(ImmField::DsOffset(0))]),
                 Modifiers::default(),

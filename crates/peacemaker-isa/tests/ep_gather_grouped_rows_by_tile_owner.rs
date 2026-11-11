@@ -1034,8 +1034,9 @@ fn interpreter_covers_the_module() {
             for k in &program.kernels {
                 for id in &k.body.layout {
                     let i = k.body.insts.get(*id).unwrap();
-                    let row =
-                        peacemaker_ir::isa::lookup(program.target.arch, i.op, i.form).unwrap();
+                    let row = peacemaker_ir::isa::lookup_inst(program.target.arch, &i)
+                        .ok()
+                        .unwrap();
                     if peacemaker_ir::emu::semantic_class(row.name).is_none() {
                         missing.insert(row.name);
                     }

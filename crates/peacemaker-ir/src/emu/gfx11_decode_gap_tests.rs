@@ -52,7 +52,8 @@ fn dec(words: &[u32]) -> (Inst, &'static str) {
     let (inst, n) =
         gfx11::decode(Arch::Gfx1100, words).unwrap_or_else(|e| panic!("decode {words:08x?}: {e}"));
     assert_eq!(n, words.len(), "{words:08x?} decoded to {n} words");
-    let name = crate::isa::lookup(Arch::Gfx1100, inst.op, inst.form)
+    let name = crate::isa::lookup_inst(Arch::Gfx1100, &inst)
+        .ok()
         .unwrap_or_else(|| panic!("{words:08x?} has no gfx1100 row"))
         .name;
     (inst, name)
@@ -67,10 +68,11 @@ fn roundtrip(words: &[u32], want_name: &str) -> Inst {
         words,
         "{want_name}: re-encode differs"
     );
-    let rebuilt = Inst::from_parts(
+    let rebuilt = Inst::from_encoding(
         Arch::Gfx1100,
         inst.op,
         inst.form,
+        inst.variant,
         inst.fields.clone(),
         inst.operands.clone(),
         inst.mods.clone(),
@@ -447,7 +449,7 @@ fn new_gfx1100_rows_pin_their_llvm_text() {
     ];
     for (name, text, words) in rows {
         let inst = roundtrip(words, name);
-        let row = crate::isa::lookup(Arch::Gfx1100, inst.op, inst.form).unwrap();
+        let row = crate::isa::lookup_inst(Arch::Gfx1100, &inst).ok().unwrap();
         let table: Vec<u32> = row
             .encoding
             .split_whitespace()
@@ -459,7 +461,7 @@ fn new_gfx1100_rows_pin_their_llvm_text() {
         let (inst151, n) = gfx11::decode(Arch::Gfx1151, words).unwrap();
         assert_eq!(n, words.len(), "{name}");
         assert_eq!(
-            crate::isa::lookup(Arch::Gfx1151, inst151.op, inst151.form)
+            crate::isa::lookup_inst(Arch::Gfx1151, &inst151)
                 .unwrap()
                 .name,
             name

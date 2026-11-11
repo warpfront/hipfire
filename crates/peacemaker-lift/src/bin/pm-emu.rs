@@ -303,7 +303,9 @@ mod tests {
             for k in &p.kernels {
                 for id in &k.body.layout {
                     let i = k.body.insts.get(*id).unwrap();
-                    let row = peacemaker_ir::isa::lookup(p.target.arch, i.op, i.form).unwrap();
+                    let row = peacemaker_ir::isa::lookup_inst(p.target.arch, &i)
+                        .ok()
+                        .unwrap();
                     assert!(
                         peacemaker_ir::emu::semantic_class(row.name).is_some(),
                         "{module}: {} {:?}",

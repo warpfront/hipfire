@@ -444,6 +444,7 @@ mod tests {
         Inst {
             op: row_op(name, form),
             form,
+            variant: None,
             fields: Default::default(),
             operands: Default::default(),
             mods: Default::default(),
