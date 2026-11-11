@@ -105,6 +105,11 @@ pub const CASES: &[Q4Case] = &[
         run: case_hyper_write_norm,
     },
     Q4Case {
+        name: "qwen4_hc_g942_unfused_gates_bitwise_quarters",
+        timeout_s: 120,
+        run: case_unfused_gates_bitwise_quarters,
+    },
+    Q4Case {
         name: "qwen4_hc_read_route_execute_hyper_read",
         timeout_s: 180,
         run: case_route_read,
@@ -792,6 +797,96 @@ fn case_hyper_write_norm(gpu: &mut Gpu) -> Result<String, String> {
         free_all(
             gpu,
             vec![wnt, nnt, injt, st, mt, gt, nt, qt, clr, st2, mt2, gt2, nt2],
+        )?;
+    }
+    all(out)
+}
+
+/// `HIPFIRE_QWEN4_G942_HC_QUARTERS_GATES`: the gates an UNFUSED write computes
+/// (`execute_hyper_write` -> `hyper_write_gates`) are bitwise the gates the fused
+/// `hyper_write_norm_f32` produces as the next write's quarters, rows 1..=8 (the route's
+/// few-row range on gfx942). Per row count: `hyper_write_norm` with `next` writes the streams
+/// and the quarters for the next write (norm weight `nn`, inject `inj`); the next write then runs
+/// through `execute_hyper_write` on those streams with the same weights and its gates, a
+/// sentinel-poisoned buffer the route must fill, are compared bit for bit with the quarters'
+/// `(q0 + q1) + (q2 + q3)` fold (`hyper_write_norm` stage B's own gate expression).
+fn case_unfused_gates_bitwise_quarters(gpu: &mut Gpu) -> Result<String, String> {
+    let mut rng = Rng::new(0x4843_7B01);
+    let mut out = Vec::new();
+    for rows in 1..=8usize {
+        let wn = rng.vec_bf16_exact(HC_WIDE, -0.5, 0.5);
+        let nn = rng.vec_bf16_exact(HC_WIDE, -0.5, 0.5);
+        let inj = rng.vec_bf16_exact(4 * HC_WIDE, -0.05, 0.05);
+        let (wnt, nnt, injt) = (up_bf16(gpu, &wn)?, up_bf16(gpu, &nn)?, up_bf16(gpu, &inj)?);
+        let s0 = rng.vec(rows * HC_WIDE, -2.0, 2.0);
+        let mix = rng.vec(rows * HIDDEN, -1.0, 1.0);
+        let gl = rng.vec(rows * HC_STREAMS, -6.0, 6.0);
+        let st = up_f32(gpu, &s0)?;
+        let (mt, gt) = (up_f32(gpu, &mix)?, up_f32(gpu, &gl)?);
+        let nt = sentinel_f32(gpu, rows * HC_WIDE)?;
+        let qt = sentinel_f32(gpu, 16 * rows)?;
+        let next = HyperNextGates {
+            norm_weight: &nnt,
+            inject: &injt,
+            quarters: &qt,
+        };
+        hyper_write_norm(
+            gpu,
+            &HyperWrite {
+                input: &st,
+                normalized: &nt,
+                mixed: &mt,
+                gates: &gt,
+                output: &st,
+                branches: HC_STREAMS,
+                hidden: HIDDEN,
+                state_bf16: false,
+            },
+            &wnt,
+            &nt,
+            None,
+            Some(&next),
+            None,
+        )
+        .map_err(e)?;
+        let q_gpu = down_f32(gpu, &qt)?;
+        let mut want = vec![0.0f32; rows * HC_STREAMS];
+        for r in 0..rows {
+            for g in 0..HC_STREAMS {
+                let q = &q_gpu[r * 16 + g * 4..r * 16 + g * 4 + 4];
+                want[r * HC_STREAMS + g] = (q[0] + q[1]) + (q[2] + q[3]);
+            }
+        }
+        // The next write, unfused, on the streams the fused launch just wrote.
+        let mix2 = rng.vec(rows * HIDDEN, -1.0, 1.0);
+        let mt2 = up_f32(gpu, &mix2)?;
+        let nt2 = sentinel_f32(gpu, rows * HC_WIDE)?;
+        let gt2 = sentinel_f32(gpu, rows * HC_STREAMS)?;
+        let rot = zeros_f32(gpu, rows * HC_WIDE)?;
+        let op = HyperWriteOp {
+            state_bf16: false,
+            input: &st,
+            norm_weight: &nnt,
+            block_inject: wref(&injt, HC_STREAMS, HC_WIDE),
+            normalized: &nt2,
+            mixed: &mt2,
+            gates: &gt2,
+            output: &st,
+            rows,
+            branches: HC_STREAMS,
+            hidden: HIDDEN,
+            rotation: &rot,
+            ar: None,
+        };
+        execute_hyper_write(gpu, &op).map_err(de)?;
+        out.push(exact_f32(
+            &format!("unfused gates == fused quarters fold rows={rows}"),
+            &down_f32(gpu, &gt2)?,
+            &want,
+        ));
+        free_all(
+            gpu,
+            vec![wnt, nnt, injt, st, mt, gt, nt, qt, mt2, nt2, gt2, rot],
         )?;
     }
     all(out)
