@@ -1381,3 +1381,22 @@ required-features = ["lab"]
 [[example]]
 name = "gdn_chunk_pm_oracle"
 required-features = ["lab"]
+
+# S0 kill oracles of reliability/CHUNK-CANONICAL-DESIGN.md §6 (canonical GDN
+# prefill producers + absolute-position carry). Shared support:
+# examples/gdn_canon_common/ (included via #[path]).
+[[example]]
+name = "gdn_canon_producer_kill"
+required-features = ["lab", "deltanet"]
+
+[[example]]
+name = "gdn_canon_scan_prefix_kill"
+required-features = ["lab", "deltanet"]
+
+[[example]]
+name = "gdn_canon_reference_kill"
+required-features = ["lab", "deltanet"]
+
+[[example]]
+name = "gdn_canon_snapshot_kill"
+required-features = ["lab", "deltanet"]
