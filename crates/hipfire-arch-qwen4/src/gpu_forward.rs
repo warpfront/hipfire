@@ -4671,6 +4671,12 @@ impl Qwen4MoeLayerRuntime {
         )
     }
 
+    /// Whether the layer's routed experts are qt=55 stock-FP8 tables (the
+    /// gfx942 [`MoeRouteCapability::Fp8B128Grouped`] route).
+    pub(crate) fn is_fp8(&self) -> bool {
+        self.fp8
+    }
+
     /// The sealed expert-slab layer's cold codec for its route policy
     /// ([`MoeRoutePolicy::slab_cold_codec`]): W3 (1) or E8P (3), `None` for an
     /// MQ4-only slab layer and for every non-slab layer. Read from the layer's
@@ -7599,7 +7605,7 @@ pub(crate) struct Qwen4MoeScratch<'a> {
 /// list (the MTP head); the caller clears `output` with a preceding
 /// `Step::Clear`. A stock-FP8 runtime has no indexed decode route (its decode
 /// is the grouped prefill route, sealed by `program::seal_moe_for_layer`) and
-/// is refused here.
+/// is refused here: the MTP head seals it through [`seal_moe_rows`] at one row.
 pub(crate) fn seal_moe_decode<'a>(
     ctx: &'a DispatchCtx,
     config: &Qwen4Config,
@@ -7613,7 +7619,7 @@ pub(crate) fn seal_moe_decode<'a>(
     if runtime.fp8 {
         return Err(invalid(
             "qt=55 FP8 experts have no indexed decode route; seal them through \
-             program::seal_moe_for_layer (grouped prefill at every row count)",
+             seal_moe_rows (program::seal_moe_for_layer, grouped prefill at every row count)",
         ));
     }
     let dtypes = MoeDtypes {
@@ -7733,6 +7739,13 @@ pub(crate) fn seal_moe_decode<'a>(
 /// forward's row-gather hook with the head's shared-down output tensor
 /// (`MoeSharedPrefill`'s unfused shared down) and `layer_index` the head's
 /// gather index (`num_hidden_layers + parity`); otherwise `layer_index` is 0.
+///
+/// A stock-FP8 (qt=55) `runtime` declares [`MoeRouteCapability::Fp8B128Grouped`]
+/// and seals the grouped prefill call at every row count, one routing row
+/// (the head's decode / draft step) included, exactly as the trunk seals its
+/// qt=55 layers; `scratch` must then carry the grouped route's F32 buffers
+/// (`MtpFp8MoeScratch` for one row, the rows scratch for `rows >= 2`). Stock
+/// FP8 loads on one device, so it takes no EP row gather.
 pub(crate) fn seal_moe_rows<'a>(
     ctx: &'a DispatchCtx,
     config: &Qwen4Config,
@@ -7742,9 +7755,9 @@ pub(crate) fn seal_moe_rows<'a>(
     scratch: &'a Qwen4LayerScratch<'a>,
     row_gather: Option<(&'a dyn MoeRowGather, &'a GpuTensor)>,
 ) -> Result<SealedMoeCall<'a>, Qwen4GpuForwardError> {
-    if runtime.fp8 {
+    if runtime.fp8 && row_gather.is_some() {
         return Err(invalid(
-            "qt=55 FP8 experts have no head row route; the MTP head rows need QT44/QT53 experts",
+            "qt=55 FP8 experts load on one device; the head takes no EP row gather for them",
         ));
     }
     if row_gather.is_some() {
