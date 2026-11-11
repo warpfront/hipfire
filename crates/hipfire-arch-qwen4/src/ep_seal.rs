@@ -527,6 +527,131 @@ mod tests {
         );
     }
 
+    /// The tile launcher's owner table is the sealed ownership: expert `e` on rank `e % ranks`,
+    /// each rank owning exactly its placement's share.
+    #[test]
+    fn owner_table_is_expert_modulo_ranks_and_balanced() {
+        let manifest = Qwen4Manifest::build(&crate::config::compact_test_config()).unwrap();
+        let source = source_of(&manifest, 10);
+        for ranks in 2..=8usize {
+            let devices: Vec<i32> = (0..ranks as i32).collect();
+            let seal = Qwen4EpSeal::seal(&manifest, 48, ranks, &devices, &source, "g1").unwrap();
+            let bytes = crate::gpu_forward::tile_owner_table_bytes(&seal.owner_ranks());
+            let table: Vec<i32> = bytes
+                .chunks_exact(4)
+                .map(|b| i32::from_le_bytes(b.try_into().unwrap()))
+                .collect();
+            assert_eq!(table.len(), seal.owner_ranks().len());
+            assert!(table
+                .iter()
+                .enumerate()
+                .all(|(e, &owner)| owner == (e % ranks) as i32));
+            for rank in 0..ranks {
+                assert_eq!(
+                    table.iter().filter(|&&owner| owner == rank as i32).count(),
+                    Qwen4EpPlacement { rank, ranks }.local_count(table.len())
+                );
+            }
+        }
+    }
+
+    /// The EP runtime's tables must be the sealed (rank, contract) binding: the table each rank
+    /// builds passes the residency proof against its own sealed owners and slots, and is refused
+    /// against a binding with other owners or when its views alias one slot.
+    #[test]
+    fn ep_tables_pass_the_residency_proof_of_their_own_sealed_binding_only() {
+        use crate::gpu_forward::{
+            check_sealed_residency, qwen4_expert_table_entries, Qwen4ExpertTableLayout,
+            Qwen4PeerExpertSource,
+        };
+        const GATE_UP: usize = 512;
+        const DOWN: usize = 256;
+        let manifest = Qwen4Manifest::build(&crate::config::compact_test_config()).unwrap();
+        let source = source_of(&manifest, 10);
+        for ranks in [2usize, 4] {
+            let devices: Vec<i32> = (0..ranks as i32).collect();
+            let seal =
+                Arc::new(Qwen4EpSeal::seal(&manifest, 48, ranks, &devices, &source, "g1").unwrap());
+            let experts = seal.owner_ranks().len();
+            let compact = |rank: usize| {
+                let count = Qwen4EpPlacement { rank, ranks }.local_count(experts);
+                Qwen4PeerExpertSource {
+                    gate_up_base: 0x1000_0000 * (rank + 1),
+                    gate_up_bytes: count * GATE_UP,
+                    down_base: 0x1000_0000 * (rank + 1) + 0x800_0000,
+                    down_bytes: count * DOWN,
+                }
+            };
+            let peers: Vec<_> = (0..ranks).map(compact).collect();
+            let dummy = Qwen4PeerExpertSource {
+                gate_up_base: 0xF000_0000,
+                gate_up_bytes: GATE_UP,
+                down_base: 0xF800_0000,
+                down_bytes: DOWN,
+            };
+            let sealed_of = |rank: usize| -> Vec<(usize, usize)> {
+                let placement = seal.placement(rank).unwrap();
+                let bound = Qwen4EpRankSeal {
+                    seal: seal.clone(),
+                    rank,
+                };
+                let (table, _) = bound.expert_binding(0, placement, devices[rank]).unwrap();
+                table
+                    .experts()
+                    .iter()
+                    .map(|meta| (meta.owner_rank(), meta.local_slot()))
+                    .collect()
+            };
+            for rank in 0..ranks {
+                let placement = seal.placement(rank).unwrap();
+                let own = sealed_of(rank);
+                // The same slots sealed to the next rank: every entry's owner disagrees.
+                let other: Vec<_> = own
+                    .iter()
+                    .map(|&(owner, slot)| ((owner + 1) % ranks, slot))
+                    .collect();
+                for layout in [
+                    Qwen4ExpertTableLayout::Ep { placement, dummy },
+                    Qwen4ExpertTableLayout::Full {
+                        placement,
+                        peers: &peers,
+                    },
+                ] {
+                    let check = |entries: &[_], sealed: &[(usize, usize)]| {
+                        check_sealed_residency(&layout, peers[rank], entries, sealed, GATE_UP, DOWN)
+                    };
+                    let entries =
+                        qwen4_expert_table_entries(&layout, peers[rank], experts, GATE_UP, DOWN)
+                            .unwrap();
+                    check(&entries, &own).unwrap();
+                    let error = check(&entries, &other).unwrap_err();
+                    assert!(error.contains("not the sealed owner"), "{error}");
+                    // Every view aliasing this rank's first owned slot (the residency demo).
+                    let aliased = vec![entries[rank]; experts];
+                    let error = check(&aliased, &own).unwrap_err();
+                    assert!(error.contains("not the sealed owner"), "{error}");
+                    // Two owned experts swapping slots keep owner and origin but not the slot.
+                    let mut swapped = entries.clone();
+                    swapped.swap(rank, rank + ranks);
+                    let error = check(&swapped, &own).unwrap_err();
+                    assert!(error.contains("not the sealed owner"), "{error}");
+                    // Any one entry (owned, dummy or peer) one expert off its sealed address.
+                    for expert in 0..experts {
+                        let mut moved = entries.clone();
+                        moved[expert].down_ptr += DOWN;
+                        let error = check(&moved, &own).unwrap_err();
+                        assert!(error.contains(&format!("expert {expert} ")), "{error}");
+                    }
+                    // Another rank's slot-0 expert naming this rank's own slot 0.
+                    let mut stolen = entries.clone();
+                    stolen[(rank + 1) % ranks] = entries[rank];
+                    let error = check(&stolen, &own).unwrap_err();
+                    assert!(error.contains("not the sealed owner"), "{error}");
+                }
+            }
+        }
+    }
+
     /// The generation covers the trunk-overlay sidecar beside the model: one
     /// that appears, is rewritten, or vanishes reads as another generation.
     #[test]

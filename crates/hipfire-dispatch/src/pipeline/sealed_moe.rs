@@ -1686,7 +1686,7 @@ impl ExpertBindingCache {
     /// Bind the compact expert-parallel resources owned by this rank.
     ///
     /// This sits alongside (never replaces) [`ExpertBindingCache::bind_live`],
-    /// which remains the Single-owner API. The caller passes the owned local
+    /// which binds Single-owner and owner-routed tables. The caller passes the owned local
     /// experts **in local-slot order**, the exact host pointer entries that
     /// were uploaded to each global `[n_experts]` pointer table, descriptors
     /// for the owned zero dummies backing non-owned entries, and the GPU
@@ -1705,9 +1705,10 @@ impl ExpertBindingCache {
     ///
     /// Like [`ExpertBindingCache::bind_live`] this is one-shot and stores
     /// identities only. The mapping fingerprint is retained alongside the
-    /// tensor identities. This is the residency proof a later slice uses to
-    /// replace the Single-rank refusal; it does not itself admit EP
-    /// execution.
+    /// tensor identities. Owner-routed EP tables bound through
+    /// [`ExpertBindingCache::bind_live`] instead get their residency proof
+    /// from the model owner before the bind (Qwen4: every table entry is
+    /// checked against its sealed owner and slot in the layer runtime build).
     #[allow(clippy::too_many_arguments)]
     pub fn bind_live_compact(
         &mut self,
@@ -7145,33 +7146,43 @@ mod tests {
         .unwrap()
     }
 
+    /// An `n`-expert stride table over `ranks` ranks sealed under an owner-routed
+    /// (Flash-Next EP) contract over `devices` physical devices.
+    fn owner_routed_table(
+        n: usize,
+        ranks: usize,
+        devices: usize,
+        hint: ContractCollectiveHint,
+    ) -> ExpertTable {
+        let table = ep_table(n, ranks, DType::MQ4G256);
+        let contract = ExpertExecutionContract::new(
+            "qwen4",
+            Some(0),
+            "fp",
+            7,
+            (0..devices as i32).collect(),
+            ContractParallelism::ExpertParallel,
+            ContractAssignment::Stride,
+            table.experts().iter().map(|r| r.owner_rank()).collect(),
+            table.experts().iter().map(|r| r.local_slot()).collect(),
+            "owner-routed",
+            vec![ContractCollectiveRow {
+                name: "moe".into(),
+                layer: 0,
+                hint,
+            }],
+        )
+        .unwrap();
+        table.with_execution_contract(contract).unwrap()
+    }
+
     /// An owner-routed rank (the Flash-Next EP route) runs the None-mode
     /// sealed call; a rank without that contract, outside the sealed mesh or
     /// owning no expert is refused before launch.
     #[test]
     fn owner_routed_ep_binding_admits_only_owning_ranks_of_its_contract() {
-        let dtype = DType::MQ4G256;
         let admit = |n: usize, ranks: usize, rank: usize, devices: usize, hint| {
-            let table = ep_table(n, ranks, dtype);
-            let contract = ExpertExecutionContract::new(
-                "qwen4",
-                Some(0),
-                "fp",
-                7,
-                (0..devices as i32).collect(),
-                ContractParallelism::ExpertParallel,
-                ContractAssignment::Stride,
-                table.experts().iter().map(|r| r.owner_rank()).collect(),
-                table.experts().iter().map(|r| r.local_slot()).collect(),
-                "owner-routed",
-                vec![ContractCollectiveRow {
-                    name: "moe".into(),
-                    layer: 0,
-                    hint,
-                }],
-            )
-            .unwrap();
-            let table = table.with_execution_contract(contract).unwrap();
+            let table = owner_routed_table(n, ranks, devices, hint);
             let mut cache = table.prepare_binding(rank, ranks, 0).unwrap();
             let fixture = live_fixture(&table, 0x50_0000);
             bind_fixture(&table, &mut cache, &fixture);
@@ -7195,6 +7206,113 @@ mod tests {
         admit(3, 4, 2, 4, gather).unwrap();
         let error = admit(3, 4, 3, 4, gather).unwrap_err();
         assert!(error.contains("owns no expert"), "{error}");
+    }
+
+    /// A tile exchange that only reports its owner identity (admission tests only).
+    struct OwnerOnlyTileExchange<'a> {
+        rank: usize,
+        ids: &'a GpuTensor,
+        n_experts: usize,
+    }
+
+    impl crate::families::moe::MoeTileExchange for OwnerOnlyTileExchange<'_> {
+        fn owners(&self) -> (usize, &GpuTensor, usize) {
+            (self.rank, self.ids, self.n_experts)
+        }
+
+        fn before_down(&self, _gpu: &mut Gpu) -> Result<(), String> {
+            unreachable!("admission does not run stages")
+        }
+
+        fn host_barrier(&self, _what: u8, _epoch: u32) -> Result<(), String> {
+            unreachable!("admission does not run stages")
+        }
+
+        fn exchange(
+            &self,
+            _gpu: &mut Gpu,
+            _layer_idx: u16,
+            _tile_ids: &GpuTensor,
+            _y_down_grouped: &GpuTensor,
+            _tiles: usize,
+        ) -> Result<(), String> {
+            unreachable!("admission does not run stages")
+        }
+    }
+
+    /// Owner-routed admission through the public sealers: decode needs the EP row
+    /// gather (each rank's view names the zero dummy for non-owned experts), and a
+    /// prefill tile exchange must be this binding's rank over its expert count.
+    #[test]
+    fn owner_routed_seal_requires_row_gather_and_own_tile_exchange() {
+        use crate::families::moe::{MoeEpMode, MoeRowGather, MoeTileExchangeParams};
+        let gather_hint = ContractCollectiveHint::OwnerRowGather {
+            kind: ContractAxis::Ep,
+        };
+        let table = owner_routed_table(4, 2, 2, gather_hint);
+        let mut cache = table.prepare_binding(1, 2, 0).unwrap();
+        let fixture = live_fixture(&table, 0x58_0000);
+        bind_fixture(&table, &mut cache, &fixture);
+        let experts = BoundMoeExperts::from_cache(&table, &cache).unwrap();
+        let ctx = DispatchCtx::for_test("gfx1201");
+
+        let decode = decode_scratch(0x59_0000);
+        let decode_params = |gather: Option<&'static dyn MoeRowGather>| MoeParams {
+            ep_row_gather: gather,
+            ..ep_decode_params(
+                &decode,
+                &fixture.routed,
+                &fixture.gate_up_ptrs,
+                &fixture.down_ptrs,
+                0,
+                2,
+                4,
+                MoeEpMode::None,
+                None,
+                false,
+            )
+        };
+        let error = seal_decode(experts, &ctx, decode_params(None))
+            .err()
+            .expect("owner-routed decode without a row gather must refuse");
+        assert!(
+            format!("{error:?}").contains("requires the EP row gather"),
+            "{error:?}"
+        );
+        static GATHER: NoopGather = NoopGather;
+        seal_decode(experts, &ctx, decode_params(Some(&GATHER)))
+            .expect("owner-routed decode with a row gather is admitted");
+
+        let prefill = prefill_scratch(0x5A_0000);
+        let seal_with_exchange = |rank: usize, n_experts: usize| {
+            let exchange = OwnerOnlyTileExchange {
+                rank,
+                ids: &prefill.partial,
+                n_experts,
+            };
+            let params = MoePrefillParams {
+                ep_row_gather: Some(&GATHER),
+                ep_tile_exchange: Some(MoeTileExchangeParams {
+                    exchange: &exchange,
+                    tile_ids_owned: &prefill.partial,
+                }),
+                ..ep_prefill_params(
+                    &prefill,
+                    &fixture.routed,
+                    &fixture.gate_up_ptrs,
+                    &fixture.down_ptrs,
+                    None,
+                )
+            };
+            seal_prefill(experts, &ctx, params)
+                .map(|_| ())
+                .map_err(|error| format!("{error:?}"))
+        };
+        for (rank, n_experts) in [(0, 4), (1, 3)] {
+            let error = seal_with_exchange(rank, n_experts).unwrap_err();
+            assert!(error.contains("EP tile exchange of rank"), "{error}");
+        }
+        seal_with_exchange(1, 4).expect("this rank's own tile exchange is admitted");
     }
 
     /// `RoutedExpertWeights` mirroring one rank's compact live binding: owned
