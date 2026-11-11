@@ -11855,7 +11855,7 @@ impl Carrier for Qwen35Carrier {
 
                 // Staged GPU free on every post-weight error (VMM arenas via free_gpu).
                 // Propagate resolved VMode: VMM takes it in-constructor; legacy
-                // Q8 uses from_mode; legacy Lloyd-V post-alloc reallocs.
+                // takes it in-constructor at its logical stride (no realloc).
                 let kv_cache = match (ctx.kv_backend, pair) {
                     (KvBackend::Vmm, hipfire_runtime::kv_mode::KvPair::Native(_)) => {
                         match <hipfire_runtime::llama::KvCache as hipfire_runtime::llama::KvCacheExt>::from_mode_with_backend(

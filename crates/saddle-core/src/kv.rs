@@ -278,6 +278,17 @@ pub enum VMode {
 }
 
 impl VMode {
+    /// Log label (`Q8`, `lloyd2`…): the single spelling for the KV-cache
+    /// construction lines, so the four fwht/vmm summaries cannot drift.
+    pub fn name(self) -> &'static str {
+        match self {
+            VMode::Q8 => "Q8",
+            VMode::Lloyd2 => "lloyd2",
+            VMode::Lloyd3 => "lloyd3",
+            VMode::Lloyd4 => "lloyd4",
+        }
+    }
+
     /// Kernarg value: the per-element bit count (8 for Q8). Drives both kernel
     /// dispatch branches and byte-layout arithmetic.
     pub fn bits(self) -> i32 {
@@ -2556,8 +2567,9 @@ impl KvCache {
         Ok(())
     }
 
-    /// Reallocate the V buffers for a new V mode (used by eval/bench to set an
-    /// independent V quant after construction). Re-sizes only real KV layers
+    /// Reallocate the V buffers for a new V mode (used by the lab
+    /// `adaptive_kv_check` example to set an independent V quant after
+    /// construction). Re-sizes only real KV layers
     /// (placeholder 1-element buffers for non-KV layers are left as-is).
     /// K buffers and rotation tables are untouched except when enabling lloyd-V
     /// on fwht2/4-K caches (128-element signs → reallocated to 256; the 128-wide
@@ -3638,12 +3650,7 @@ impl KvCache {
                 return Err(err);
             }
         };
-        let v_label = match v_mode {
-            VMode::Q8 => "Q8".to_string(),
-            VMode::Lloyd2 => "lloyd2".to_string(),
-            VMode::Lloyd3 => "lloyd3".to_string(),
-            VMode::Lloyd4 => "lloyd4".to_string(),
-        };
+        let v_label = v_mode.name();
         eprintln!(
             "KV cache: {mode:?} vmm ({n_kv}/{} layers carry KV; K {}B/head + V {v_label} {}B/head; mapped_prefix={mapped} / physical_cap={physical_cap} / max_seq={max_seq_len})",
             is_kv_layer.len(),
@@ -4163,12 +4170,7 @@ impl KvCache {
         gpu.hip.memcpy_htod(&s2.buf, &s2_bytes)?;
         let v_bph = v_bpp / n_kv_heads;
         let n_kv = is_kv_layer.iter().filter(|b| **b).count();
-        let v_label = match v_mode {
-            VMode::Q8 => "Q8",
-            VMode::Lloyd2 => "lloyd2",
-            VMode::Lloyd3 => "lloyd3",
-            VMode::Lloyd4 => "lloyd4",
-        };
+        let v_label = v_mode.name();
         eprintln!(
             "KV cache: fwht4 filtered backend=legacy ({n_kv}/{} layers carry KV; K FWHT-4b {k_bph}B + V {v_label} {v_bph}B = {} B/head)",
             is_kv_layer.len(),
@@ -4661,12 +4663,7 @@ impl KvCache {
         gpu.hip.memcpy_htod(&s2.buf, &s2_bytes)?;
         let v_bph = v_bpp / n_kv_heads;
         let n_kv = is_kv_layer.iter().filter(|b| **b).count();
-        let v_label = match v_mode {
-            VMode::Q8 => "Q8",
-            VMode::Lloyd2 => "lloyd2",
-            VMode::Lloyd3 => "lloyd3",
-            VMode::Lloyd4 => "lloyd4",
-        };
+        let v_label = v_mode.name();
         eprintln!(
             "KV cache: fwht3 filtered backend=legacy ({n_kv}/{} layers carry KV; K FWHT-3b {k_bph}B + V {v_label} {v_bph}B = {} B/head)",
             is_kv_layer.len(),
@@ -5053,12 +5050,7 @@ impl KvCache {
         gpu.hip.memcpy_htod(&s2.buf, &s2_bytes)?;
         let v_bph = v_bpp / n_kv_heads;
         let n_kv = is_kv_layer.iter().filter(|b| **b).count();
-        let v_label = match v_mode {
-            VMode::Q8 => "Q8",
-            VMode::Lloyd2 => "lloyd2",
-            VMode::Lloyd3 => "lloyd3",
-            VMode::Lloyd4 => "lloyd4",
-        };
+        let v_label = v_mode.name();
         eprintln!(
             "KV cache: fwht2 filtered backend=legacy ({n_kv}/{} layers carry KV; K FWHT-2b {k_bph}B + V {v_label} {v_bph}B = {} B/head)",
             is_kv_layer.len(),
@@ -6068,29 +6060,56 @@ mod fwht_vmode_alloc_tests {
         gpu.drain_pool();
     }
 
-    /// The legacy Split helper routes each FWHT K mode at the logical V stride.
+    /// The legacy Split helper keeps each K mode's own layout, honours the
+    /// physical cap (Fwht4 has no capped variant and drops it), records the
+    /// V mode and widens the FWHT signs to 256 for every lloyd-V tier.
     #[test]
-    #[ignore = "requires an AMD GPU; asserts the Split helper sizes V logically per K mode"]
-    fn fwht_filtered_with_v_routes_each_k_mode() {
+    #[ignore = "requires an AMD GPU; asserts the Split helper per K mode and V mode"]
+    fn fwht_filtered_with_v_keeps_k_layout_cap_and_v_mode() {
+        const CAP: usize = 32;
         let mut gpu = Gpu::init().expect("GPU required for V-stride allocation");
-        let mask = vec![true; 2];
-        for mode in [KvMode::Fwht2, KvMode::Fwht3, KvMode::Fwht4] {
-            let kv = KvCache::new_gpu_fwht_filtered_with_v(
-                &mut gpu,
-                mode,
-                &mask,
-                HEADS,
-                HEAD_DIM,
-                SEQ,
-                SEQ,
-                VMode::Lloyd4,
-            )
-            .expect("Split helper construction");
-            let expect_elems = (SEQ * HEADS * 132 + 3) / 4;
-            for t in kv.v_gpu.iter().filter(|t| t.numel() > 1) {
-                assert_eq!(t.numel(), expect_elems, "V elems for {mode:?}/lloyd4");
+        let mask = vec![true, false];
+        for (mode, k_bph, rows) in [
+            (KvMode::Fwht2, 68usize, CAP),
+            (KvMode::Fwht3, 100, CAP),
+            (KvMode::Fwht4, 132, SEQ),
+        ] {
+            for (v_mode, v_bph) in [
+                (VMode::Lloyd4, 132usize),
+                (VMode::Lloyd3, 100),
+                (VMode::Lloyd2, 68),
+            ] {
+                let kv = KvCache::new_gpu_fwht_filtered_with_v(
+                    &mut gpu, mode, &mask, HEADS, HEAD_DIM, SEQ, CAP, v_mode,
+                )
+                .expect("Split helper construction");
+                let what = format!("{mode:?}/{v_mode:?}");
+                assert_eq!(kv.v_mode, v_mode, "v_mode field for {what}");
+                assert_eq!(kv.physical_cap, rows, "physical_cap for {what}");
+                assert_eq!(
+                    kv.k_gpu[0].numel(),
+                    (rows * HEADS * k_bph + 3) / 4,
+                    "K elems for {what}"
+                );
+                assert_eq!(
+                    kv.v_gpu[0].numel(),
+                    (rows * HEADS * v_bph + 3) / 4,
+                    "V elems for {what}"
+                );
+                assert_eq!(
+                    kv.v_gpu[1].numel(),
+                    1,
+                    "non-KV layer stays a placeholder for {what}"
+                );
+                for signs in [&kv.givens_cos, &kv.givens_sin] {
+                    assert_eq!(
+                        signs.as_ref().expect("fwht signs").numel(),
+                        256,
+                        "sign width for {what}"
+                    );
+                }
+                kv.free_gpu(&mut gpu).expect("release");
             }
-            kv.free_gpu(&mut gpu).expect("release");
         }
         gpu.drain_pool();
     }
