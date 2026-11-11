@@ -1400,3 +1400,7 @@ required-features = ["lab", "deltanet"]
 [[example]]
 name = "gdn_canon_snapshot_kill"
 required-features = ["lab", "deltanet"]
+
+[[example]]
+name = "gdn_canon_wy_prefix_kill"
+required-features = ["lab", "deltanet"]
