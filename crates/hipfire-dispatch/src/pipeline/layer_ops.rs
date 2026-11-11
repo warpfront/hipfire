@@ -7357,15 +7357,19 @@ mod tests {
         let gfx942 = DispatchCtx::for_test("gfx942");
         let c = &gfx942.arch;
         for rows in 1..=8 {
-            assert!(route(c, true, false, bf16, 4, 2560, false, true, rows), "{rows}");
+            assert!(
+                route(c, true, false, bf16, 4, 2560, false, true, rows),
+                "{rows}"
+            );
             // the quarters' own inject predicate agrees with the route's
-            assert!(hc_quarters_inject_ok(
-                bf16.0, bf16.1, bf16.2, bf16.3, wide
-            ));
+            assert!(hc_quarters_inject_ok(bf16.0, bf16.1, bf16.2, bf16.3, wide));
         }
         // Past the few-row limit (verify beyond 8 rows, prefill's invariant scope): MFMA route.
         for rows in [9, 16, 64, 8192] {
-            assert!(!route(c, true, false, bf16, 4, 2560, false, true, rows), "{rows}");
+            assert!(
+                !route(c, true, false, bf16, 4, 2560, false, true, rows),
+                "{rows}"
+            );
         }
         assert!(!route(c, true, false, bf16, 4, 2560, false, true, 0));
         // Kill switch, all-reduce write, BF16 state, geometry, dtype and AWQ refusals.
@@ -7375,15 +7379,57 @@ mod tests {
         assert!(!route(c, true, false, bf16, 8, 2560, false, true, 1));
         assert!(!route(c, true, false, bf16, 4, 2048, false, true, 1));
         assert!(!route(c, true, false, bf16, 4, 2560, false, false, 1));
-        assert!(!route(c, true, false, (DType::F32, 4, wide, false), 4, 2560, false, true, 1));
-        assert!(!route(c, true, false, (DType::BF16, 8, wide, false), 4, 2560, false, true, 1));
-        assert!(!route(c, true, false, (DType::BF16, 4, wide + 32, false), 4, 2560, false, true, 1));
-        assert!(!route(c, true, false, (DType::BF16, 4, wide, true), 4, 2560, false, true, 1));
+        assert!(!route(
+            c,
+            true,
+            false,
+            (DType::F32, 4, wide, false),
+            4,
+            2560,
+            false,
+            true,
+            1
+        ));
+        assert!(!route(
+            c,
+            true,
+            false,
+            (DType::BF16, 8, wide, false),
+            4,
+            2560,
+            false,
+            true,
+            1
+        ));
+        assert!(!route(
+            c,
+            true,
+            false,
+            (DType::BF16, 4, wide + 32, false),
+            4,
+            2560,
+            false,
+            true,
+            1
+        ));
+        assert!(!route(
+            c,
+            true,
+            false,
+            (DType::BF16, 4, wide, true),
+            4,
+            2560,
+            false,
+            true,
+            1
+        ));
         // Every other arch keeps its own route (the gfx11+ k4 route is already the quarters').
         for arch in ["gfx1100", "gfx1151", "gfx1201"] {
             let ctx = DispatchCtx::for_test(arch);
             for rows in 1..=8 {
-                assert!(!route(&ctx.arch, true, false, bf16, 4, 2560, false, true, rows));
+                assert!(!route(
+                    &ctx.arch, true, false, bf16, 4, 2560, false, true, rows
+                ));
             }
         }
     }

@@ -239,7 +239,9 @@ impl Gfx942Device<'_> {
             batch.checked_mul(k).and_then(|e| e.checked_mul(x_size)),
             batch.checked_mul(m).and_then(|e| e.checked_mul(4)),
         ) else {
-            return refuse(format!("{WHAT}: extent overflow (m={m} k={k} batch={batch})"));
+            return refuse(format!(
+                "{WHAT}: extent overflow (m={m} k={k} batch={batch})"
+            ));
         };
         if a.size() < a_bytes || x.buf.size() < x_bytes || out.buf.size() < out_bytes {
             return refuse(format!(
@@ -1978,8 +1980,16 @@ impl Gfx942Device<'_> {
             ));
         }
         let n_tiles = grouped_rows / 16;
-        crate::moe::require_span(topk, &[total_slots, 4], "qwen4_g942_moe_group_scatter_desc topk")?;
-        crate::moe::require_span(counts, &[experts, 4], "qwen4_g942_moe_group_scatter_desc counts")?;
+        crate::moe::require_span(
+            topk,
+            &[total_slots, 4],
+            "qwen4_g942_moe_group_scatter_desc topk",
+        )?;
+        crate::moe::require_span(
+            counts,
+            &[experts, 4],
+            "qwen4_g942_moe_group_scatter_desc counts",
+        )?;
         crate::moe::require_span(
             offsets,
             &[experts + 1, 4],
@@ -1990,7 +2000,11 @@ impl Gfx942Device<'_> {
             &[grouped_rows, 4],
             "qwen4_g942_moe_group_scatter_desc sorted",
         )?;
-        crate::moe::require_span(tiles, &[n_tiles, 4], "qwen4_g942_moe_group_scatter_desc tiles")?;
+        crate::moe::require_span(
+            tiles,
+            &[n_tiles, 4],
+            "qwen4_g942_moe_group_scatter_desc tiles",
+        )?;
         crate::moe::require_span(
             inverse,
             &[total_slots, 4],
@@ -2004,7 +2018,10 @@ impl Gfx942Device<'_> {
         self.gpu.bind_thread()?;
         g942_fold_ensure(&mut *self.gpu, QWEN4_G942_MOE_GROUP_SCATTER_DESC)?;
         static NOTE: std::sync::Once = std::sync::Once::new();
-        g942_fold_note(&NOTE, "fold 1 (ranks + prefix + scatter + tile descriptors)");
+        g942_fold_note(
+            &NOTE,
+            "fold 1 (ranks + prefix + scatter + tile descriptors)",
+        );
         let tp = topk.buf.as_ptr();
         let cp = counts.buf.as_ptr();
         let op = offsets.buf.as_ptr();
@@ -2103,7 +2120,10 @@ impl Gfx942Device<'_> {
         };
         let grid_y = mi.div_ceil(256);
         if grid_y == 0 || grid_y > u16::MAX as usize {
-            return refuse(format!("{WHAT}: mi={mi} needs grid.y={grid_y} (1..={})", u16::MAX));
+            return refuse(format!(
+                "{WHAT}: mi={mi} needs grid.y={grid_y} (1..={})",
+                u16::MAX
+            ));
         }
         let act_blocks = shared_n.div_ceil(256);
         let grid_x = n_sorted + act_blocks.div_ceil(grid_y);
@@ -2125,16 +2145,51 @@ impl Gfx942Device<'_> {
         // `sorted` is i32 data; the sealed route carries the stable scatter's index scratch as
         // `DType::Raw`, so accept a 4-byte dtype or Raw (the byte-span check bounds the read).
         if !(sorted.dtype.size() == 4 || sorted.dtype == DType::Raw) {
-            return refuse(format!("{WHAT}: sorted needs a 4-byte dtype (got {:?})", sorted.dtype));
+            return refuse(format!(
+                "{WHAT}: sorted needs a 4-byte dtype (got {:?})",
+                sorted.dtype
+            ));
         }
-        crate::moe::require_span(gate_up, &[n_sorted, 2, mi, 4], "qwen4_g942_moe_unscatter_act gate_up")?;
-        crate::moe::require_span(sorted, &[n_sorted, 4], "qwen4_g942_moe_unscatter_act sorted")?;
-        crate::moe::require_span(activation, &[slots, mi, 4], "qwen4_g942_moe_unscatter_act activation")?;
-        crate::moe::require_span(shared_gate, &[rows, shared_mi, 4], "qwen4_g942_moe_unscatter_act shared gate")?;
-        crate::moe::require_span(shared_up, &[rows, shared_mi, 4], "qwen4_g942_moe_unscatter_act shared up")?;
-        crate::moe::require_span(shared_act, &[rows, shared_mi, 4], "qwen4_g942_moe_unscatter_act shared activation")?;
-        crate::moe::require_span(selector, &[rows, 4], "qwen4_g942_moe_unscatter_act selector")?;
-        let (yp, sp, ap) = (gate_up.buf.as_ptr(), sorted.buf.as_ptr(), activation.buf.as_ptr());
+        crate::moe::require_span(
+            gate_up,
+            &[n_sorted, 2, mi, 4],
+            "qwen4_g942_moe_unscatter_act gate_up",
+        )?;
+        crate::moe::require_span(
+            sorted,
+            &[n_sorted, 4],
+            "qwen4_g942_moe_unscatter_act sorted",
+        )?;
+        crate::moe::require_span(
+            activation,
+            &[slots, mi, 4],
+            "qwen4_g942_moe_unscatter_act activation",
+        )?;
+        crate::moe::require_span(
+            shared_gate,
+            &[rows, shared_mi, 4],
+            "qwen4_g942_moe_unscatter_act shared gate",
+        )?;
+        crate::moe::require_span(
+            shared_up,
+            &[rows, shared_mi, 4],
+            "qwen4_g942_moe_unscatter_act shared up",
+        )?;
+        crate::moe::require_span(
+            shared_act,
+            &[rows, shared_mi, 4],
+            "qwen4_g942_moe_unscatter_act shared activation",
+        )?;
+        crate::moe::require_span(
+            selector,
+            &[rows, 4],
+            "qwen4_g942_moe_unscatter_act selector",
+        )?;
+        let (yp, sp, ap) = (
+            gate_up.buf.as_ptr(),
+            sorted.buf.as_ptr(),
+            activation.buf.as_ptr(),
+        );
         let (gp, up_p, hp, lp) = (
             shared_gate.buf.as_ptr(),
             shared_up.buf.as_ptr(),
@@ -2288,7 +2343,11 @@ impl Gfx942Device<'_> {
             &[tokens, hidden, 4],
             "qwen4_g942_moe_combine_shared_add shared rows",
         )?;
-        crate::moe::require_span(selector, &[tokens, 4], "qwen4_g942_moe_combine_shared_add selector")?;
+        crate::moe::require_span(
+            selector,
+            &[tokens, 4],
+            "qwen4_g942_moe_combine_shared_add selector",
+        )?;
         let (gp, ip, tp, wp, rp, hp, sp) = (
             grouped_down.buf.as_ptr(),
             inverse_perm.buf.as_ptr(),

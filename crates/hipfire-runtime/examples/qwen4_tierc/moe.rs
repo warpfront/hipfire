@@ -1837,13 +1837,28 @@ fn check_g942_scatter_desc(gpu: &mut Gpu, label: &str, topk: &[i32]) -> Result<S
         dev.fp8b128_moe_tile_desc_pad16(&unfused[3], &unfused[5], n_tiles)
             .map_err(e)?;
         dev.g942_fold_moe_group_scatter_desc(
-            &t_topk, &fused[0], &fused[1], &fused[2], &fused[3], &fused[4], &fused[5], slots, E,
+            &t_topk,
+            &fused[0],
+            &fused[1],
+            &fused[2],
+            &fused[3],
+            &fused[4],
+            &fused[5],
+            slots,
+            E,
             grouped_rows,
         )
         .map_err(e)?;
     }
     sync(gpu)?;
-    let names = ["counts", "offsets", "sorted", "tile_ids", "inverse_perm", "tile_desc"];
+    let names = [
+        "counts",
+        "offsets",
+        "sorted",
+        "tile_ids",
+        "inverse_perm",
+        "tile_desc",
+    ];
     let mut results = Vec::new();
     for (i, name) in names.iter().enumerate() {
         let want = down_i32(gpu, &unfused[i])?;
@@ -1968,8 +1983,7 @@ fn g942_fold_unscatter_act_case(gpu: &mut Gpu) -> Result<String, String> {
             free_all(
                 gpu,
                 vec![
-                    t_y, t_sorted, t_g, t_u, t_act_u, t_act_f, t_sact_u, t_sact_f, t_sel_u,
-                    t_sel_f,
+                    t_y, t_sorted, t_g, t_u, t_act_u, t_act_f, t_sact_u, t_sact_f, t_sel_u, t_sel_f,
                 ],
             )?;
         }
@@ -2045,7 +2059,9 @@ fn g942_fold_combine_shared_add_case(gpu: &mut Gpu) -> Result<String, String> {
         results.push(exact_f32(&format!("rows={rows} target"), &got, &want));
         free_all(
             gpu,
-            vec![t_grouped, t_inv, t_ids, t_w, t_res_u, t_res_f, t_shared, t_sel],
+            vec![
+                t_grouped, t_inv, t_ids, t_w, t_res_u, t_res_f, t_shared, t_sel,
+            ],
         )?;
     }
     all(results)

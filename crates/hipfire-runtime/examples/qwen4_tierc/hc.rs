@@ -999,11 +999,20 @@ fn case_fold_elem_hc_down_act(gpu: &mut Gpu) -> Result<String, String> {
                 if rows == 3 {
                     x[HC_WIDE + 5] = f32::INFINITY;
                 }
-                let xt = if x_bf16 { up_bf16(gpu, &x)? } else { up_f32(gpu, &x)? };
+                let xt = if x_bf16 {
+                    up_bf16(gpu, &x)?
+                } else {
+                    up_f32(gpu, &x)?
+                };
                 let staging = up_bf16(gpu, &vec![0.0f32; rows * HC_LOW])?;
                 let want_t = sentinel_f32(gpu, rows * HC_LOW)?;
                 let launched = gpu
-                    .gemm_bf16_mfma_gfx942_rows16(&xt, &[(&downt.buf, &want_t, HC_LOW)], HC_WIDE, rows)
+                    .gemm_bf16_mfma_gfx942_rows16(
+                        &xt,
+                        &[(&downt.buf, &want_t, HC_LOW)],
+                        HC_WIDE,
+                        rows,
+                    )
                     .map_err(e)?;
                 if !launched {
                     return Err(format!("unfused rows16 declined: {name} rows={rows}"));
@@ -1021,7 +1030,14 @@ fn case_fold_elem_hc_down_act(gpu: &mut Gpu) -> Result<String, String> {
                     .map_err(e)
                 };
                 roundtrip(gpu)?;
-                scale_f32(gpu, &ScaleF32 { values: &want_t, scale }).map_err(e)?;
+                scale_f32(
+                    gpu,
+                    &ScaleF32 {
+                        values: &want_t,
+                        scale,
+                    },
+                )
+                .map_err(e)?;
                 roundtrip(gpu)?;
                 gpu.silu_f32(&want_t, &want_t).map_err(e)?;
                 roundtrip(gpu)?;
