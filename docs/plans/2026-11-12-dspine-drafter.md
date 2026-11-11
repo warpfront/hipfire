@@ -46,6 +46,7 @@ Non-goals for this PR: no `admissions.yml` row (routing-capable, product-refused
 ## Progress
 
 - [x] Design + validation plan (this doc)
+- [x] Semantics map (docs/plans/2026-11-12-dspine-semantics-map.md)
 - [ ] `dspine_convert` (mq4 + bf16)
 - [ ] arch-24 sidecar carrier + drafter load path
 - [ ] bridge kernels (Tier C)
