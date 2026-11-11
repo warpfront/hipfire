@@ -534,7 +534,7 @@ fn has_launch_ident(ts: &[Tt]) -> bool {
     })
 }
 
-fn call_names(ts: &[Tt], out: &mut BTreeSet<String>) {
+pub(super) fn call_names(ts: &[Tt], out: &mut BTreeSet<String>) {
     for k in 0..ts.len() {
         if let Tt::Id(s, _) = &ts[k] {
             if ts.get(k + 1).map_or(false, |t| t.is_g('(')) {

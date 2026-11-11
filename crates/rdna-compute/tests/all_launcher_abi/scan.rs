@@ -639,7 +639,7 @@ impl World {
         if it.len() == 1 {
             if let Some(g) = it[0].group() {
                 if it[0].is_g('[') {
-                    return array_elems(g);
+                    return self.array_elems_in(g, ctx.file);
                 }
             }
         }
@@ -658,12 +658,9 @@ impl World {
                         if b.ty.len() == 1 && b.ty[0].is_g('[') {
                             if let Some(g) = b.ty[0].group() {
                                 if let Some(semi) = g.iter().position(|t| t.is_p(';')) {
-                                    if let Some(n) = self.eval_const_expr_in(
-                                        &g[semi + 1..],
-                                        &HashMap::new(),
-                                        ctx.file,
-                                    ) {
-                                        return Ok(vec![None; n as usize]);
+                                    if let Some(n) = self.repeat_len_at(&g[semi + 1..], ctx, &b.loc)
+                                    {
+                                        return Ok(vec![None; n]);
                                     }
                                 }
                             }
@@ -673,7 +670,7 @@ impl World {
                             init.remove(0);
                         }
                         if init.len() == 1 && init[0].is_g('[') {
-                            return self.array_elems_in(init[0].group().unwrap(), ctx.file);
+                            return self.array_elems_at(init[0].group().unwrap(), ctx, &b.loc);
                         }
                         let ids: Vec<&str> = init.iter().filter_map(|t| t.id()).collect();
                         if !ids.is_empty() && init.iter().all(|t| t.id().is_some() || t.is_p(':')) {
