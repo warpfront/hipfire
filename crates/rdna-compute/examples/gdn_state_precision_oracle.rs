@@ -90,8 +90,9 @@
 //!   kept (no reset);
 //! * `keep == 0`: candidate, then the live-residual reset
 //!   `gdn_q8ef_residual_zero` (the source slot is the restore target);
-//! * `0 < keep < rows`: candidate, `gated_delta_rollback_layers` with format
-//!   `q8_ef` (the plain-Q8 replay of the ring), then the residual reset.
+//! * `0 < keep < rows`: candidate, then `gated_delta_rollback_layers_ef` (the
+//!   residual-preserving replay; the old plain-Q8 replay + residual reset is
+//!   retired), then the residual reset of this oracle's legacy protocol.
 //!
 //! HARD checks for `q8_ef` (any failure exits 1): (a) the candidate run twice
 //! from the identical source slot and residual is byte-identical in outputs,
@@ -145,8 +146,9 @@
 use hip_bridge::KernargBlob;
 use rdna_compute::prefill_invariant::{FEW_ROW_ROUTE_ROWS, WIDE_VERIFY_MAX_ROWS};
 use rdna_compute::tensor_ops::{
-    gated_delta_rollback_layers, gated_delta_step, gated_delta_step_batched,
-    gdn_q8ef_residual_zero, GatedDeltaRollbackLayers, GatedDeltaStep, GatedDeltaStepBatched,
+    gated_delta_rollback_layers, gated_delta_rollback_layers_ef, gated_delta_step,
+    gated_delta_step_batched, gdn_q8ef_residual_zero, GatedDeltaRollbackEf,
+    GatedDeltaRollbackEfLayer, GatedDeltaRollbackLayers, GatedDeltaStep, GatedDeltaStepBatched,
     GdnStateFormat,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -1160,6 +1162,39 @@ fn launch_rollback(
     start: usize,
     kernels: &mut BTreeSet<String>,
 ) -> Res<()> {
+    if rig.format == GdnStateFormat::Q8Ef {
+        // A Q8Ef rollback replays the kept rows from the entry residual with the
+        // capture kernel's residual-fed boundary and preserves the residual; the
+        // plain-Q8 single-launch replay refuses Q8Ef. The caller owns restoring the
+        // entry residual into the candidate plane before this launch.
+        gpu.set_wide_verify_rows(rig.ring_rows);
+        let residual = rig.ef_cand_tensor()?;
+        let layers = [GatedDeltaRollbackEfLayer {
+            recurrence: &rig.recurrence,
+            ring: &rig.ring,
+            residual,
+        }];
+        ctx(
+            gated_delta_rollback_layers_ef(
+                gpu,
+                &GatedDeltaRollbackEf {
+                    layers: &layers,
+                    discard: &rig.discard.sub_offset(0, keep * VW),
+                    rows,
+                    keep,
+                    from: source,
+                    to: base,
+                    qkv_width: QKV,
+                    key_heads: KH,
+                    value_heads: VH,
+                    position: start + keep - 1,
+                },
+            ),
+            "gated_delta_rollback_layers_ef",
+        )?;
+        observe(gpu, kernels);
+        return Ok(());
+    }
     gpu.set_wide_verify_rows(rig.ring_rows);
     ctx(
         gated_delta_rollback_layers(

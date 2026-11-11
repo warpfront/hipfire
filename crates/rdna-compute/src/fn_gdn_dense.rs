@@ -214,6 +214,55 @@ struct Scratch {
     /// Zero-entry EF plane of a plain Q8 state; allocated on first plain-Q8 use and never for
     /// Q8Ef (which scans against the owner's live residual).
     ef: Option<GpuTensor>,
+    /// Dedicated Q/K/V planes of an edge step (`rows` too small for the alias into the F32
+    /// projection, see [`edge_planes_needed`]); never persistent carry.
+    planes: Option<GpuTensor>,
+}
+
+/// Whether a `rows`-row step must scan from dedicated Q/K/V planes: the planes are
+/// `round64(rows)` BF16 rows of every channel, which fits the dead F32 conv destination
+/// (`rows` F32 rows) only for `rows >= 32`. Below that an alias would overrun it.
+pub const fn edge_planes_needed(rows: usize) -> bool {
+    rows.div_ceil(64) * 64 > 2 * rows
+}
+
+/// Device bytes of the dedicated edge workspace of a `rows`-row dense step on a head geometry:
+/// the A scratch for the padded 64-row block, plus (rows < 32) the dedicated Q/K/V planes. Charged
+/// once per device by the scratch census, never per layer or per snapshot. `None` for an
+/// unadmitted geometry or on overflow.
+pub fn edge_workspace_bytes(key_heads: usize, value_heads: usize, rows: usize) -> Option<usize> {
+    let geometry = Geometry::of(key_heads, value_heads)?;
+    let n64 = rows.max(1).div_ceil(64).checked_mul(64)?;
+    let a = n64.checked_mul(A_ROW_BYTES)?;
+    let planes = if edge_planes_needed(rows.max(1)) {
+        n64.checked_mul(geometry.channels())?.checked_mul(2)?
+    } else {
+        0
+    };
+    a.checked_add(planes)
+}
+
+/// [`applies`] without the row floor: the static admission of the dense scan for the edge
+/// executor (every row count, 1..63 included), whose workspace is dedicated
+/// ([`edge_workspace_bytes`]). The caller wires the scan's edge entry/exit contract
+/// (S2: Q8/EF/F32 tile-entry state, absolute seams); this predicate never selects the route
+/// by row count.
+pub fn applies_edge(gpu: &Gpu, p: &GatedDeltaStepBatched<'_>) -> bool {
+    gpu.flags.fn_gdn_dense_scan
+        && admits_state(&gpu.arch, p.format, p.residual.is_some())
+        && p.row_states.is_none()
+        && p.rows > 0
+        && geometry_runs(
+            p.key_heads,
+            p.value_heads,
+            p.key_dim,
+            p.value_dim,
+            p.qkv_width,
+            gpu.flags.qwen4_gdn_chain_fuse_enabled(),
+        )
+        && p.projection.dtype == DType::F32
+        && !gpu.replay.is_recording()
+        && !gpu.graphs.capture_mode
 }
 
 thread_local! {
@@ -334,13 +383,10 @@ pub fn run(
     // Q/K/V loads, guards its controls, and only stores output for tok<rows.
     // Neither reads Q/K/V/G/beta pad rows. KKT DOES write a full 64-row A
     // block, so only A needs padded scratch. Q/K/V alias the dead F32 conv
-    // destination (n64 * channels * 2 <= n * channels * 4 for admitted n>=64); the producer
-    // also zeros their pad rows. G aliases gate, beta stays in its original
-    // plane, and BF16 scan output aliases the F32 recurrent destination.
-    let q_bytes = n64 * geometry.qk() * 2;
-    let q = raw(p.projection, 0, q_bytes);
-    let k = raw(p.projection, q_bytes, q_bytes);
-    let v = raw(p.projection, q_bytes * 2, n64 * geometry.value_width() * 2);
+    // destination (n64 * channels * 2 <= n * channels * 4 for n >= 32; below that they
+    // get dedicated planes); the producer also zeros their pad rows. G aliases gate,
+    // beta stays in its original plane, and BF16 scan output aliases the F32 recurrent
+    // destination.
     let out = raw(p.output, 0, n * geometry.value_width() * 2);
     let mut slot = SCRATCH.with(|s| {
         let mut slots = s.borrow_mut();
@@ -355,20 +401,45 @@ pub fn run(
         if let Some(ef) = s.ef {
             gpu.free_tensor(ef)?;
         }
+        if let Some(planes) = s.planes {
+            gpu.free_tensor(planes)?;
+        }
     }
     let mut s = match slot {
         Some(s) => s,
         None => Scratch {
             rows: n64,
             a: gpu.zeros(
-                &[workspace_a_bytes(n).ok_or_else(|| {
+                &[n64.checked_mul(A_ROW_BYTES).ok_or_else(|| {
                     hip_bridge::HipError::new(0, "fn_gdn_dense: A scratch extent overflow")
                 })?],
                 DType::Raw,
             )?,
             ef: None,
+            planes: None,
         },
     };
+    if edge_planes_needed(n) && s.planes.is_none() {
+        match gpu.zeros(&[n64 * geometry.channels() * 2], DType::Raw) {
+            Ok(planes) => s.planes = Some(planes),
+            Err(error) => {
+                SCRATCH.with(|c| c.borrow_mut().push((gpu.device_id, s)));
+                return Err(error);
+            }
+        }
+    }
+    let (plane_src, plane_off) = match (edge_planes_needed(n), s.planes.as_ref()) {
+        (true, Some(planes)) => (planes, 0),
+        _ => (p.projection, 0),
+    };
+    let q_bytes = n64 * geometry.qk() * 2;
+    let q = raw(plane_src, plane_off, q_bytes);
+    let k = raw(plane_src, plane_off + q_bytes, q_bytes);
+    let v = raw(
+        plane_src,
+        plane_off + q_bytes * 2,
+        n64 * geometry.value_width() * 2,
+    );
     if p.residual.is_none() && s.ef.is_none() {
         match gpu.zeros(&[EF_BYTES], DType::Raw) {
             Ok(ef) => s.ef = Some(ef),
