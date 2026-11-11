@@ -162,6 +162,23 @@ __global__ void HIPFIRE_GDN_KERNEL(
     ,
     int qk_head_ratio
 #endif
+#if defined(HIPFIRE_GDN_STREAM)
+    // Stream module (`gated_delta_net_q8_fast_stream`, rdna-compute `norm.rs`
+    // `gdn_stream_*`): explicit FP32 continuation. `h0`/`ht` are
+    // [n_heads][HD][HD] FP32 accumulators (one lane) and may be the same plane:
+    // each element is read and written by the same lane, all reads before the
+    // first write. `entry_mode` 0/1/2 = Q8 / Q8+EF / FP32 `h0`; `exit_mode`
+    // bits 0-1: 0 = quantize (Q8 + scales, with bit 2 the F16 EF, else the
+    // frame-keyed stochastic Q8), 1 = keep FP32 in `ht` unquantized. `frame`
+    // keys the stochastic rounding and is supplied by the caller as an absolute
+    // position, never a process-global call counter. `n_tokens == 0` is a pure
+    // state conversion (open: Q8 -> FP32, seal: FP32 -> Q8).
+    ,
+    const float* h0,
+    float* ht,
+    int entry_mode,
+    int exit_mode
+#endif
 ) {
     const int h = blockIdx.x;
     const int tile = blockIdx.y;
@@ -214,6 +231,33 @@ __global__ void HIPFIRE_GDN_KERNEL(
 #else
     const __half* ef_src = s_ef_residual;
 #endif
+#if defined(HIPFIRE_GDN_STREAM)
+    // Stream entry (`entry_mode`): 0 = Q8 plane + scales (no residual),
+    // 1 = Q8 + F16 EF, 2 = the FP32 accumulator `h0` taken unchanged.
+    for (int r = 0; r < TILE_ROWS; r++) {
+        float4 initial;
+        if (entry_mode == 2) {
+            const float* src = h0 + state_lane_base + h * HD * HD + (row_start + r) * HD;
+            initial = make_float4(src[tid], src[tid + 32], src[tid + 64], src[tid + 96]);
+        } else {
+            const float scale = HIPFIRE_GDN_SCALES_IN[lane * n_heads * HD + h * HD + row_start + r];
+            const signed char* src = HIPFIRE_GDN_SQ_IN + r * HD;
+            initial = make_float4(
+                scale * (float)src[tid],
+                scale * (float)src[tid + 32],
+                scale * (float)src[tid + 64],
+                scale * (float)src[tid + 96]);
+            if (entry_mode == 1) {
+                const __half* residual = ef_src + state_lane_base + h * HD * HD + (row_start + r) * HD;
+                initial.x += __half2float(residual[tid]);
+                initial.y += __half2float(residual[tid + 32]);
+                initial.z += __half2float(residual[tid + 64]);
+                initial.w += __half2float(residual[tid + 96]);
+            }
+        }
+        S_f4[HIPFIRE_GDN_S_INDEX(r, tid)] = initial;
+    }
+#else
     for (int r = 0; r < TILE_ROWS; r++) {
         const float scale = HIPFIRE_GDN_SCALES_IN[lane * n_heads * HD + h * HD + row_start + r];
         const signed char* src = HIPFIRE_GDN_SQ_IN + r * HD;
@@ -233,6 +277,7 @@ __global__ void HIPFIRE_GDN_KERNEL(
         }
         S_f4[HIPFIRE_GDN_S_INDEX(r, tid)] = initial;
     }
+#endif
 
 
 #if defined(HIPFIRE_GDN_PREFETCH) && (HIPFIRE_GDN_WAVES_PER_BLOCK == 1)
@@ -518,7 +563,23 @@ __global__ void HIPFIRE_GDN_KERNEL(
 
     // Requant FP32 → Q8 — OUTSIDE the token loop.
     // Only the final state is quantized (intermediate tokens stay FP32 in LDS).
+#if defined(HIPFIRE_GDN_STREAM)
+    if ((exit_mode & 3) == 1) {
+        // FP32 continuation: the accumulator leaves unquantized.
+        for (int r = 0; r < TILE_ROWS; r++) {
+            const float4 s = S_f4[HIPFIRE_GDN_S_INDEX(r, tid)];
+            float* dst = ht + state_lane_base + h * HD * HD + (row_start + r) * HD;
+            dst[tid] = s.x;
+            dst[tid + 32] = s.y;
+            dst[tid + 64] = s.z;
+            dst[tid + 96] = s.w;
+        }
+        return;
+    }
+    const bool use_ef = (exit_mode & 4) != 0;
+#else
     const bool use_ef = (s_ef_residual != nullptr);
+#endif
     for (int r = 0; r < TILE_ROWS; r++) {
         int rr = row_start + r;
         float4 s = S_f4[HIPFIRE_GDN_S_INDEX(r, tid)];
@@ -576,7 +637,7 @@ __global__ void HIPFIRE_GDN_KERNEL(
 #undef HIPFIRE_GDN_SQ_IN
 }
 
-#if !defined(HIPFIRE_GDN_LAYER_TABLE)
+#if !defined(HIPFIRE_GDN_LAYER_TABLE) && !defined(HIPFIRE_GDN_STREAM)
 // Masked independent sibling for the fast (single-end requant) path.
 // Derives lane from blockIdx.z and returns before any read/write for inactive
 // lanes. Full-mask callers use the unmasked fast kernel for exact parity.
