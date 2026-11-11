@@ -1145,7 +1145,7 @@ fn execute_window<'a>(
             {
                 let ops: Vec<_> = steps[i..end]
                     .iter()
-                    .take(rdna_compute::tensor_ops::QSA_CORE_LANES_MAX)
+                    .take(crate::pipeline::qsa::core_lanes_group_max(gpu))
                     .map_while(|s| match s {
                         Step::IndexedAttention(op)
                             if op.phase == MixerPhase::Core

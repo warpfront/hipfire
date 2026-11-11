@@ -212,7 +212,8 @@ pub struct FeatureFlags {
     /// (the batched F32 recurrence `qwen4_gdn_lanes_step_f32_gfx942`), off elsewhere.
     pub qwen4_gdn_lanes: bool,
     /// Multi-lane fn-lanes QSA decode core (`HIPFIRE_QWEN4_QSA_LANES`), default
-    /// on for exact gfx1201 (`=0` kills it), off elsewhere.
+    /// on for exact gfx1201 (`=0` kills it), opt-in (`=1`) on exact gfx942 (the batched
+    /// F32 / E4M3-FNUZ core `qwen4_qsa_lanes_*_gfx942`), off elsewhere.
     pub qwen4_qsa_lanes: bool,
     /// Multi-lane fn-lanes GDN verify-rows core (`HIPFIRE_QWEN4_GDN_LANES_ROWS`),
     /// default on for exact gfx1201 only (`=0` kills it), and only with
@@ -2209,9 +2210,9 @@ impl FeatureFlags {
     }
 
     /// Multi-lane fn-lanes QSA decode core (`HIPFIRE_QWEN4_QSA_LANES`). Exact
-    /// gfx1201 only, default on (`=0` kills it).
+    /// gfx1201 (default on, `=0` kills it) and exact gfx942 (default off, `=1` opts in).
     pub fn qwen4_qsa_lanes_enabled(&self) -> bool {
-        self.qwen4_qsa_lanes && self.arch == "gfx1201"
+        self.qwen4_qsa_lanes && matches!(self.arch.as_str(), "gfx1201" | "gfx942")
     }
 
     pub fn qwen4_moe_down_r4_enabled(&self) -> bool {
@@ -6228,8 +6229,8 @@ mod tests {
         }
     }
 
-    /// `HIPFIRE_QWEN4_QSA_LANES`: exact gfx1201 defaults on, `=0` kills it, no
-    /// other arch ever enables it.
+    /// `HIPFIRE_QWEN4_QSA_LANES`: exact gfx1201 defaults on, exact gfx942 is opt-in (`=1`),
+    /// `=0` kills it, no other arch ever enables it.
     #[test]
     fn qsa_lanes_default_and_override_by_arch() {
         let flags = |arch: &str, value: Option<&str>| {
@@ -6240,6 +6241,7 @@ mod tests {
         };
         for (arch, unset, forced_on, forced_off) in [
             ("gfx1201", true, true, false),
+            ("gfx942", false, true, false),
             ("gfx1151", false, false, false),
             ("gfx1100", false, false, false),
             ("gfx1201:xnack-", false, false, false),
