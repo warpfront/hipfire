@@ -207,15 +207,25 @@ fn run(gpu: &mut Gpu, r: &Res, arm: Arm, off: usize, n: usize) -> R {
     match arm {
         Arm::Unprep => {
             gpu.fused_rmsnorm_rotate_mq_batched(&x, &r.norm, &xr, g.k, EPS, n)?;
-            gpu.gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2(
-                &r.w[0], &r.w[1], &r.w[2], &r.w[3], &xr, &y[0], &y[1], &y[2], &y[3], g.qkv, g.z,
-                g.beta, g.alpha, g.k, n,
-            )
+            if gpu.arch == "gfx1201" {
+                gpu.gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2(
+                    &r.w[0], &r.w[1], &r.w[2], &r.w[3], &xr, &y[0], &y[1], &y[2], &y[3], g.qkv,
+                    g.z, g.beta, g.alpha, g.k, n,
+                )
+            } else {
+                gpu.gemm_qkvza_mq4g256v2_wmma(
+                    &r.w[0], &r.w[1], &r.w[2], &r.w[3], &xr, &y[0], &y[1], &y[2], &y[3], g.qkv,
+                    g.z, g.beta, g.alpha, g.k, n,
+                )
+            }
         }
         Arm::Prep => {
             let res = gpu.reserve_int4_mmq(g.k, n)?;
-            let prep =
-                gpu.fused_rmsnorm_rotate_mq_i4_gfx12_batched(&x, &r.norm, None, None, res, g.k, EPS, n)?;
+            let prep = if gpu.arch == "gfx1201" {
+                gpu.fused_rmsnorm_rotate_mq_i4_gfx12_batched(&x, &r.norm, None, None, res, g.k, EPS, n)?
+            } else {
+                gpu.fused_rmsnorm_rotate_mq_i4_batched(&x, &r.norm, None, Some(&xr), res, g.k, EPS, n)?
+            };
             gpu.gemm_qkvza_mq4g256v2_wmma_iu4_prepared(
                 &r.w[0], &r.w[1], &r.w[2], &r.w[3], &xr, &prep, &y[0], &y[1], &y[2], &y[3], g.qkv,
                 g.z, g.beta, g.alpha, g.k, n,
@@ -271,8 +281,8 @@ fn main() {
     };
     let quick = args.iter().any(|a| a == "--quick");
     let mut gpu = Gpu::init().expect("gpu init");
-    if gpu.arch != "gfx1201" {
-        eprintln!("gdn_canonical_producer_oracle: arch {} is not gfx1201", gpu.arch);
+    if gpu.arch != "gfx1201" && !gpu.arch.starts_with("gfx11") {
+        eprintln!("gdn_canonical_producer_oracle: unsupported arch {}", gpu.arch);
         std::process::exit(2);
     }
     gpu.mq4v2_symmetric = true;
@@ -355,7 +365,7 @@ fn main() {
             let mut a = vec![Arm::Unprep];
             if gpu.flags.iu4_prefill_enabled() {
                 a.push(Arm::Prep);
-                if r.z_fold.is_some() {
+                if r.z_fold.is_some() && gpu.arch == "gfx1201" {
                     a.push(Arm::Zba);
                 }
             }
@@ -467,7 +477,7 @@ fn main() {
             );
         }
         // zba vs prep cross check at a few extents, same intent.
-        if r.z_fold.is_some() && gpu.flags.iu4_prefill_enabled() {
+        if gpu.arch == "gfx1201" && r.z_fold.is_some() && gpu.flags.iu4_prefill_enabled() {
             for &n in &[1usize, 25, 63, 64, 127, 128, 129, 537] {
                 let prev = gpu.ordinary_prefill_enter();
                 run(&mut gpu, &r, Arm::Prep, 0, n).unwrap();
@@ -489,7 +499,7 @@ fn main() {
         // rows the fused kernel stores must equal the SET's rows (that is what makes the SET
         // output the exact raw carry of an incomplete tile).
         #[cfg(feature = "deltanet")]
-        if geo.name == "q27b" && r.z_fold.is_some() && gpu.flags.iu4_prefill_enabled() {
+        if geo.name == "q27b" && gpu.arch == "gfx1201" && r.z_fold.is_some() && gpu.flags.iu4_prefill_enabled() {
             let nl: Vec<usize> = N_LIST
                 .iter()
                 .copied()
@@ -584,15 +594,25 @@ fn run_site(
             }
         }
     }
-    match s {
-        Site::FaQkv => gpu.gemm_qkv_hfq4g256_wmma_gfx12_mq4v2(
+    let g11 = gpu.arch.starts_with("gfx11");
+    match (s, g11) {
+        (Site::FaQkv, false) => gpu.gemm_qkv_hfq4g256_wmma_gfx12_mq4v2(
             &w[0], &w[1], &w[2], &xv, &y[0], &y[1], &y[2], ms[0], ms[1], ms[2], k, n,
         ),
-        Site::GateUp => gpu.gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2(
+        (Site::FaQkv, true) => gpu.gemm_qkv_mq4g256v2_wmma(
+            &w[0], &w[1], &w[2], &xv, &y[0], &y[1], &y[2], ms[0], ms[1], ms[2], k, n,
+        ),
+        (Site::GateUp, false) => gpu.gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2(
             &w[0], &w[1], &xv, &y[0], &y[1], ms[0], ms[1], k, n,
         ),
-        Site::ResidualAdd => gpu.gemm_hfq4g256_residual_wmma_gfx12_mq4v2(&w[0], &xv, &y[0], ms[0], k, n),
-        Site::SharedDown => gpu.gemm_mq4g256v2(&w[0], &xv, &y[0], ms[0], k, n),
+        (Site::GateUp, true) => gpu.gemm_gate_up_mq4g256v2_wmma(
+            &w[0], &w[1], &xv, &y[0], &y[1], ms[0], ms[1], k, n,
+        ),
+        (Site::ResidualAdd, false) => {
+            gpu.gemm_hfq4g256_residual_wmma_gfx12_mq4v2(&w[0], &xv, &y[0], ms[0], k, n)
+        }
+        (Site::ResidualAdd, true) => gpu.gemm_mq4g256v2_residual_wmma(&w[0], &xv, &y[0], ms[0], k, n),
+        (Site::SharedDown, _) => gpu.gemm_mq4g256v2(&w[0], &xv, &y[0], ms[0], k, n),
     }
 }
 
