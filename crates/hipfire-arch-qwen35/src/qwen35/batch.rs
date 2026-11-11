@@ -897,6 +897,7 @@ impl Qwen35DecodeBatchState {
         kv_lane.clear_gpu(gpu)?;
         let mut dn_lane = self.dn_state.q8_lane_view(config, lane, self.max_batch)?;
         dn_lane.reset(gpu)?;
+        self.dn_state.stream.adopt_lane_meta(lane, &dn_lane.stream)?;
         // Zero the lane's row in the batched output buffers.
         let hidden_lane = self.final_hidden.sub_offset(lane * config.dim, config.dim);
         gpu.hip
@@ -983,6 +984,9 @@ impl Qwen35DecodeBatchState {
             None,
             None,
         )?;
+        // Lane prompt seed ends ordinary prefill: seal once, publish the lane's cursors.
+        dn_lane.seal_streams(gpu, tokens.len())?;
+        self.dn_state.stream.adopt_lane_meta(lane, &dn_lane.stream)?;
         gpu.memcpy_dtod_at_auto(
             &self.logits.buf,
             lane * config.vocab_size * 4,

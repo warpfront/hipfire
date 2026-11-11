@@ -2551,6 +2551,7 @@ fn mtp_accept_and_rollback(
                         None,
                     )
                 })?;
+                dn_state.seal_streams(gpu, cur_pos + advance)?;
             } else {
                 gpu.graphs.ar_graph_eligible = false;
                 qwen35::forward_scratch(
@@ -3989,6 +3990,8 @@ where
             hipfire_runtime::prefill_progress::report(end, prompt_tokens.len());
             off = end;
         }
+        // The prompt spine ends ordinary prefill: one seal before decode/verify.
+        target.dn_state.seal_streams(gpu, start_pos + prompt_tokens.len())?;
 
         let last = prompt_tokens.len() - 1;
         gpu.hip
@@ -4455,6 +4458,7 @@ pub fn spec_step_mtp(
                     None,
                 )
             })?;
+            target.dn_state.seal_streams(gpu, cur_pos + advance)?;
         } else {
             // advance == 1: only the seed (last_committed) is "replayed". This
             // happens when EOS hits with accept_count==0 AND bonus==eos
@@ -4766,6 +4770,7 @@ pub fn spec_step_mtp_compressed(
                 None,
             )
         })?;
+        target.dn_state.seal_streams(gpu, cur_pos + advance)?;
     } else {
         gpu.graphs.ar_graph_eligible = false; // spec re-seed: never the plain-AR graph
         qwen35::forward_scratch(

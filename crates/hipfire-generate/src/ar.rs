@@ -4740,6 +4740,13 @@ pub fn generate(
                 // since pos <= lcp). Newest first, so only the checkpoints that
                 // are candidates get hashed.
                 let mut rejected = 0usize;
+                let live_identity = m
+                    .state
+                    .as_ref()
+                    .and_then(|s| {
+                        (s.as_ref() as &dyn Any).downcast_ref::<hipfire_arch_qwen35::Qwen35Bundle>()
+                    })
+                    .map(|b| b.dn_state.stream.identity());
                 let found = m.prefill_checkpoints.iter().rposition(|(p, snap)| {
                     if *p > lcp || *p >= rendered.len() {
                         return false;
@@ -4748,7 +4755,7 @@ pub fn generate(
                         snap.prefix_hash,
                         *p,
                         &m.conversation_tokens,
-                    );
+                    ) && live_identity.is_some_and(|id| snap.stream_identity() == id);
                     if !attested {
                         rejected += 1;
                     }

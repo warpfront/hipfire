@@ -334,35 +334,16 @@ pub fn clear(state: &mut Option<Box<dyn ArchModel>>, gpu: &mut rdna_compute::Gpu
     }
 }
 
-/// Copy `src`'s DeltaNet state into `dst` (common buffer extent: same
-/// shapes, allocations may be pool-rounded differently). Synchronizes.
+/// Copy `src`'s complete DeltaNet state (recurrence, EF, GDN carry, cursors)
+/// into `dst` through the owner API, which validates stream identity and
+/// shapes before any byte moves. Synchronizes.
 fn copy_dn(
     gpu: &mut rdna_compute::Gpu,
-    dst: &DeltaNetState,
+    dst: &mut DeltaNetState,
     src: &DeltaNetState,
 ) -> Result<(), String> {
-    if dst.s_matrices.len() != src.s_matrices.len()
-        || dst.s_scales.len() != src.s_scales.len()
-        || dst.conv_states.len() != src.conv_states.len()
-        || dst.s_ef_residual.len() != src.s_ef_residual.len()
-    {
-        return Err("copy_dn: DeltaNet layouts differ".into());
-    }
-    let pairs = dst
-        .s_matrices
-        .iter()
-        .zip(&src.s_matrices)
-        .chain(dst.s_scales.iter().zip(&src.s_scales))
-        .chain(dst.conv_states.iter().zip(&src.conv_states))
-        .chain(dst.s_ef_residual.iter().zip(&src.s_ef_residual));
-    for (d, s) in pairs {
-        if d.shape != s.shape {
-            return Err("copy_dn: DeltaNet tensor shapes differ".into());
-        }
-        let n = d.buf.size().min(s.buf.size());
-        gpu.memcpy_dtod_at_auto(&d.buf, 0, &s.buf, 0, n)
-            .map_err(|e| format!("copy_dn: {e}"))?;
-    }
+    dst.copy_from(gpu, src)
+        .map_err(|e| format!("copy_dn: {e}"))?;
     gpu.hip
         .device_synchronize()
         .map_err(|e| format!("copy_dn: sync: {e}"))
@@ -546,7 +527,7 @@ pub fn singleton_adopt(
         checkpoints: cks,
         ..
     } = entry;
-    if let Err(e) = copy_dn(gpu, &b.dn_state, &st.dn) {
+    if let Err(e) = copy_dn(gpu, &mut b.dn_state, &st.dn) {
         // Bundle DeltaNet is undefined: zero it and serve cold.
         eprintln!("[vmm-prefix] singleton adopt: {e}; cold");
         let _ = b.dn_state.reset(gpu);

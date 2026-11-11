@@ -1822,7 +1822,7 @@ impl Rig {
                 },
                 arch_policy: ArchPolicy {
                     arch_tag: "qwen35-deltanet".to_string(),
-                    state_abi_tag: "dn-q8".to_string(),
+                    state_abi_tag: g.dn_states[0].stream.identity().state_abi_tag("dn-q8"),
                     position_attention_tag: "causal-mrope".to_string(),
                 },
                 kv_layout: KvLayout {

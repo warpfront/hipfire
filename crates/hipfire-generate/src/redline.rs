@@ -243,13 +243,7 @@ pub fn redline_qwen_snapshot(
         redline_append_mapped(gpu, &mut kv, tensor)?;
     }
     let mut recurrent = Vec::new();
-    for tensor in bundle
-        .dn_state
-        .s_matrices
-        .iter()
-        .chain(bundle.dn_state.s_scales.iter())
-        .chain(bundle.dn_state.conv_states.iter())
-        .chain(bundle.dn_state.s_ef_residual.iter())
+    for tensor in bundle.dn_state.families().into_iter().flatten()
     {
         redline_append_buffer(gpu, &mut recurrent, &tensor.buf)?;
     }
@@ -763,18 +757,10 @@ pub fn redline_reset_qwen(
         .clear_gpu(gpu)
         .map_err(|error| error.to_string())?;
     bundle.kv_cache.compact_offset = 0;
-    for tensor in bundle
+    bundle
         .dn_state
-        .s_matrices
-        .iter()
-        .chain(bundle.dn_state.s_scales.iter())
-        .chain(bundle.dn_state.conv_states.iter())
-        .chain(bundle.dn_state.s_ef_residual.iter())
-    {
-        gpu.hip
-            .memset(&tensor.buf, 0, tensor.buf.size())
-            .map_err(|error| error.to_string())?;
-    }
+        .reset(gpu)
+        .map_err(|error| error.to_string())?;
     redline_fill_qwen_scratch(gpu, bundle, 0)?;
     gpu.hip
         .device_synchronize()
@@ -871,6 +857,10 @@ fn redline_prime_qwen_tokens(
         None,
     )
     .map_err(|error| error.to_string())?;
+    bundle
+        .dn_state
+        .seal_streams(gpu, tokens.len())
+        .map_err(|error| error.to_string())?;
     gpu.hip
         .device_synchronize()
         .map_err(|error| error.to_string())
@@ -2494,18 +2484,9 @@ fn redline_reset_qwen_slot(
         .clear_gpu(gpu)
         .map_err(|error| error.to_string())?;
     slot.kv_cache.compact_offset = 0;
-    for tensor in slot
-        .dn_state
-        .s_matrices
-        .iter()
-        .chain(slot.dn_state.s_scales.iter())
-        .chain(slot.dn_state.conv_states.iter())
-        .chain(slot.dn_state.s_ef_residual.iter())
-    {
-        gpu.hip
-            .memset(&tensor.buf, 0, tensor.buf.size())
-            .map_err(|error| error.to_string())?;
-    }
+    slot.dn_state
+        .reset(gpu)
+        .map_err(|error| error.to_string())?;
     gpu.hip
         .device_synchronize()
         .map_err(|error| error.to_string())
@@ -2535,6 +2516,9 @@ fn redline_prime_qwen_slot(
         None,
     )
     .map_err(|error| error.to_string())?;
+    slot.dn_state
+        .seal_streams(gpu, synthetic.len())
+        .map_err(|error| error.to_string())?;
     gpu.hip
         .device_synchronize()
         .map_err(|error| error.to_string())
@@ -5556,11 +5540,9 @@ fn redline_trace_hash(bytes: &[u8]) -> u64 {
 fn redline_trace_dn_planes(bundle: &Qwen35Bundle) -> Vec<&rdna_compute::GpuTensor> {
     bundle
         .dn_state
-        .s_matrices
-        .iter()
-        .chain(bundle.dn_state.s_scales.iter())
-        .chain(bundle.dn_state.conv_states.iter())
-        .chain(bundle.dn_state.s_ef_residual.iter())
+        .families()
+        .into_iter()
+        .flatten()
         .collect()
 }
 

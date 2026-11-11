@@ -3525,6 +3525,20 @@ pub struct GdnStreamIdentity {
     pub layers: usize,
 }
 
+impl GdnStreamIdentity {
+    /// Cache-domain state-ABI tag: `base` plus schema, recipe and carry
+    /// microtile, so checkpoints/prefixes of another numerical recipe never
+    /// share a pool key (hash-attested tokens do not attest the representation).
+    pub fn state_abi_tag(&self, base: &str) -> String {
+        format!(
+            "{base}/gdn-s{}/r{:016x}/c{}",
+            self.schema_version,
+            self.recipe_id,
+            self.geometry.map_or(0, |g| g.micro_rows)
+        )
+    }
+}
+
 /// Host-side image of a stream owner (identity + per-layer, per-lane cursors):
 /// what a snapshot, parked session or checkpoint must carry beside its tensor
 /// bytes so a restore reproduces phase and absolute position exactly.
