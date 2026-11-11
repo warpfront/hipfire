@@ -363,6 +363,122 @@ impl MtpFp8MoeScratch {
     }
 }
 
+/// Lab-only: the last one-row FP8 head MoE routing, read back from the device
+/// ([`MtpFp8MoeScratch::lab_read_routing`]).
+///
+/// What the buffers hold after one head Predict step (the `seal_moe_rows`
+/// call at one routing row, `mtp_gpu.rs` `head_block`: `seal_moe_rows(.., 1,
+/// layer, None)`, `gpu_forward.rs:7720`), with the producing code:
+///
+/// * `router`: `[num_experts]` F32 RAW router logits `x @ W_router^T` of the
+///   head's MoE input (`hc_mixed`). Not softmax probabilities, not rounded to
+///   BF16. The `[1, num_experts]` view of this tensor is the seal's
+///   `moe_router_logits` (`fp8_moe.rs` `layer_scratch`/`router_view`), bound as
+///   both `router_logits` and `router_scores` (`program.rs:1268-1269`); the
+///   router projection writes it (`qt44_qt53_prefill.rs:698-704`,
+///   `batch_projection(router, x_norm_batch, router_logits)`; a fused x4 launch
+///   with the shared expert's projections yields the same bytes,
+///   `qt44_qt53_prefill.rs:707-720`). The route stage (`moe_program.rs:1484`,
+///   `sealed_moe::produce_prefill_route`, `sealed_moe.rs:2470`) takes the
+///   `grouped` branch (`Fp8B128Grouped` is sealed-grouped,
+///   `families/moe.rs:494-500`): the in-place BF16 round trip is skipped for a
+///   grouped route (`sealed_moe.rs:2517-2521`, "the grouped top-10 router
+///   rounds each logit it reads itself"), and on gfx942 the fused
+///   route+scatter launches are not admitted (`rdna-compute/src/moe.rs:2836-2837`
+///   gfx1201 only; glue-fold needs 9..=64 rows, `moe.rs:2979`), so
+///   `moe_router_softmax_top10_f32` runs (`sealed_moe.rs:2625-2634`). That
+///   kernel takes `logits` as `const float*`
+///   (`kernels/src/moe_router_softmax_top10_f32.hip:86`): it never writes the
+///   router buffer back. The buffer stays the raw F32 projection output.
+/// * The routing DECISION is made on the BF16-rounded logits: the kernel
+///   reads each logit through `router_bf16_rt` when `round_logits`
+///   (`.hip:113-116`), which the head's recipe sets
+///   (`MoeRecipe::SoftmaxGatedShared { bf16_round_trip: true, .. }`,
+///   `program.rs:1277-1279`, passed at `sealed_moe.rs:2625-2634`
+///   `params.recipe.bf16_round_trip()`). So a consumer reproducing the top-k
+///   from `router` must round to BF16 first (RNE, `.hip:18-22`) and break ties
+///   by (value descending, index ascending) (`.hip:134-175`).
+/// * `topk_ids`: `[num_experts_per_tok]` i32 expert ids in rank order (best
+///   first). A row with a non-finite rounded logit, or a failed softmax
+///   denominator, holds `-1` ids and `0` weights (`.hip:41-49,122-125,196-199`).
+/// * `topk_weights`: `[num_experts_per_tok]` F32 in the same rank order: the
+///   softmax over all 512 BF16-rounded logits (`.hip:182-203`), RENORMALISED
+///   over the selected 10 (`.hip:205-216`; `norm_topk_prob`, the config
+///   default `true`, `program.rs:1270`), each stored through the BF16 round
+///   trip (`.hip:218-220`).
+#[cfg(feature = "lab")]
+pub struct LabHeadRouting {
+    /// Raw F32 router logits `[num_experts]` (see above).
+    pub router: Vec<f32>,
+    /// Top-k expert ids `[num_experts_per_tok]`, best first.
+    pub topk_ids: Vec<i32>,
+    /// Top-k routing weights `[num_experts_per_tok]`, renormalised, BF16-valued.
+    pub topk_weights: Vec<f32>,
+}
+
+#[cfg(feature = "lab")]
+impl MtpFp8MoeScratch {
+    /// Download the buffers of the head's last one-row MoE call (what they
+    /// hold: [`LabHeadRouting`]). They are written by the head Predict step's
+    /// launches on the launch stream, so the copies are enqueued on the
+    /// active stream and waited once (the `lab_expert_trace` pattern); nothing
+    /// but a head Predict step writes them (an Append step skips the FFN).
+    pub(crate) fn lab_read_routing(
+        &self,
+        gpu: &Gpu,
+        config: &Qwen4Config,
+    ) -> Result<LabHeadRouting, MtpGpuError> {
+        let geometry = config.mtp_geometry();
+        let word = std::mem::size_of::<f32>();
+        let slots = FP8_HEAD_MOE_ROWS * geometry.num_experts_per_tok;
+        let mut router = vec![0u8; geometry.num_experts * word];
+        let mut ids = vec![0u8; slots * std::mem::size_of::<i32>()];
+        let mut weights = vec![0u8; slots * word];
+        let mut parts: [(&GpuTensor, &mut Vec<u8>); 3] = [
+            (&self.router_logits, &mut router),
+            (&self.moe_topk_indices, &mut ids),
+            (&self.moe_topk_weights, &mut weights),
+        ];
+        for (tensor, out) in parts.iter() {
+            if out.len() > tensor.buf.size() {
+                return Err(invalid(format!(
+                    "stock-FP8 head routing readback wants {} bytes of a {}-byte buffer",
+                    out.len(),
+                    tensor.buf.size()
+                )));
+            }
+        }
+        match gpu.active_stream.as_ref() {
+            Some(stream) => {
+                for (tensor, out) in parts.iter_mut() {
+                    gpu.hip
+                        .memcpy_dtoh_async(out.as_mut_slice(), &tensor.buf, Some(stream))?;
+                }
+                gpu.hip.stream_synchronize(stream)?;
+            }
+            None => {
+                for (tensor, out) in parts.iter_mut() {
+                    gpu.hip.memcpy_dtoh(out.as_mut_slice(), &tensor.buf)?;
+                }
+            }
+        }
+        let words = |bytes: &[u8]| -> Vec<[u8; 4]> {
+            bytes
+                .chunks_exact(4)
+                .map(|w| [w[0], w[1], w[2], w[3]])
+                .collect()
+        };
+        Ok(LabHeadRouting {
+            router: words(&router).into_iter().map(f32::from_le_bytes).collect(),
+            topk_ids: words(&ids).into_iter().map(i32::from_le_bytes).collect(),
+            topk_weights: words(&weights)
+                .into_iter()
+                .map(f32::from_le_bytes)
+                .collect(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

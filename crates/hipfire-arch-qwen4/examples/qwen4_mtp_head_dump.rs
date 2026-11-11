@@ -41,7 +41,10 @@
 //!
 //! Needs `tokens >= prefix + positions + 1` (seed token and teacher-forced
 //! next token of every evaluated position). Output files, all little endian:
-//! `index.json`, `tokens.u32.bin`, `trunk_hidden.f32.bin`, `head_logits.f32.bin`.
+//! `index.json`, `tokens.u32.bin`, `trunk_hidden.f32.bin`, `head_logits.f32.bin`, and
+//! for a stock-FP8 head `head_router.f32.bin`, `head_topk_ids.i32.bin`,
+//! `head_topk_w.f32.bin` (the head MoE's own routing at each evaluated position,
+//! read right after its Predict step; `index.json` `head_routing` says what they hold).
 
 use hipfire_arch_qwen4::artifact::{admit_hfqm_artifact_with, source_forward_scratch_mode};
 use hipfire_arch_qwen4::bundle::Qwen4Bundle;
@@ -360,6 +363,10 @@ fn run() -> R<()> {
     let mut head_logits: Vec<f32> = Vec::with_capacity(args.positions * vocab);
     let mut eval_positions = Vec::with_capacity(args.positions);
     let mut hipfire_top1 = Vec::with_capacity(args.positions);
+    let mut head_router: Vec<f32> = Vec::new();
+    let mut head_topk_ids: Vec<i32> = Vec::new();
+    let mut head_topk_w: Vec<f32> = Vec::new();
+    let mut routing_rows = 0usize;
     let body = (|| -> R<()> {
         for n in 1..=last_prefill {
             // 1. cold prefill of tokens[..n]: trunk + head rows 0..n-1, pending = h_{n-1}.
@@ -414,6 +421,25 @@ fn run() -> R<()> {
             if row.len() != vocab {
                 return Err(format!("head logit row has {} entries, vocab is {vocab}", row.len()));
             }
+            // The head MoE's own routing of that Predict step. Nothing but a Predict step
+            // writes these buffers (the cold prefill's Append steps skip the FFN, the draft
+            // read above is the lm_head only), so they are this position's.
+            if let Some(routing) = bundle.mtp_lab_fp8_head_routing(&gpu).map_err(es)? {
+                if routing.router.iter().any(|v| !v.is_finite())
+                    || routing.topk_ids.iter().any(|&e| e < 0)
+                    || routing.topk_weights.iter().any(|v| !v.is_finite())
+                {
+                    return Err(format!(
+                        "head router buffers at position {n} are not finite / hold a failed row \
+                         (ids {:?})",
+                        routing.topk_ids
+                    ));
+                }
+                head_router.extend_from_slice(&routing.router);
+                head_topk_ids.extend_from_slice(&routing.topk_ids);
+                head_topk_w.extend_from_slice(&routing.topk_weights);
+                routing_rows += 1;
+            }
             if row.iter().any(|v| !v.is_finite()) {
                 return Err(format!("head logits at position {n} are not finite"));
             }
@@ -447,7 +473,24 @@ fn run() -> R<()> {
     .map_err(es)?;
     std::fs::write(args.out.join("trunk_hidden.f32.bin"), f32_le(&trunk_hidden)).map_err(es)?;
     std::fs::write(args.out.join("head_logits.f32.bin"), f32_le(&head_logits)).map_err(es)?;
-    let index = json!({
+    let routing_top_k = if routing_rows > 0 { head_topk_ids.len() / routing_rows } else { 0 };
+    let routing_experts = if routing_rows > 0 { head_router.len() / routing_rows } else { 0 };
+    if routing_rows != 0 {
+        if routing_rows != eval_positions.len() {
+            return Err(format!(
+                "head routing was read at {routing_rows} of {} positions",
+                eval_positions.len()
+            ));
+        }
+        std::fs::write(args.out.join("head_router.f32.bin"), f32_le(&head_router)).map_err(es)?;
+        std::fs::write(
+            args.out.join("head_topk_ids.i32.bin"),
+            head_topk_ids.iter().flat_map(|e| e.to_le_bytes()).collect::<Vec<u8>>(),
+        )
+        .map_err(es)?;
+        std::fs::write(args.out.join("head_topk_w.f32.bin"), f32_le(&head_topk_w)).map_err(es)?;
+    }
+    let mut index = json!({
         "schema": "qwen4_mtp_head_dump/1",
         "model": args.model.display().to_string(),
         "sidecar": sidecar_path.display().to_string(),
@@ -480,6 +523,25 @@ fn run() -> R<()> {
             "meaning": "row i = production head logits (lm_head over the head's collapsed hidden) at eval_positions[i]"
         },
     });
+    if routing_rows != 0 {
+        index["head_routing"] = json!({
+            "files": {
+                "router": "head_router.f32.bin",
+                "topk_ids": "head_topk_ids.i32.bin",
+                "topk_w": "head_topk_w.f32.bin"
+            },
+            "dtypes": {"router": "f32", "topk_ids": "i32", "topk_w": "f32"},
+            "shapes": {
+                "router": [routing_rows, routing_experts],
+                "topk_ids": [routing_rows, routing_top_k],
+                "topk_w": [routing_rows, routing_top_k]
+            },
+            "top_k": routing_top_k,
+            "router_kind": "logits",
+            "router_selection_rounding": "bf16_rne",
+            "router_meaning": "router row i = the head MoE's RAW F32 router logits (x @ W_router^T of the head MoE input; neither softmax probabilities nor BF16-rounded; the router kernel moe_router_softmax_top10_f32 reads them const) at eval_positions[i]; the runtime selects on bf16_rne(logit), ties by (value desc, expert index asc). topk_ids row i = the 10 selected expert ids, best first. topk_w row i = softmax over all 512 BF16-rounded logits, renormalised over the selected 10 (norm_topk_prob=true), each stored BF16-rounded, in topk_ids order",
+        });
+    }
     std::fs::write(
         args.out.join("index.json"),
         serde_json::to_vec_pretty(&index).map_err(es)?,

@@ -108,6 +108,8 @@ pub(crate) use rows::{draft_rounds_enabled, DraftRow, MtpRowsScratch};
 mod fp8_moe;
 pub(crate) use fp8_moe::MtpFp8MoeScratch;
 #[cfg(feature = "lab")]
+pub use fp8_moe::LabHeadRouting;
+#[cfg(feature = "lab")]
 mod lab;
 #[cfg(feature = "lab")]
 mod lab_expert_trace;
