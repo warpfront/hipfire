@@ -575,25 +575,11 @@ pub fn encode(arch: Arch, inst: &Inst) -> Result<SmallVec<[u32; 3]>, DecodeError
     if index != inst.operands.len() {
         return Err(error(format!("{}: extra XML operands", row.name)));
     }
-    // Validate each half in its own XML layout; the physical packet can be
-    // longer than either half's declared layout when its peer needs a literal.
-    for source in std::iter::once(source).chain(y) {
-        let half = cat.encoding_of(source);
-        let fields: SmallVec<[(&str, u128); 32]> = values
-            .iter()
-            .copied()
-            .filter(|(name, _)| half.field(name).is_some())
-            .collect();
-        cat.encode_row(source, &fields).map_err(error)?;
+    let word = match selection {
+        Selection::Single(_) => cat.encode_row(source, &values),
+        Selection::Vopd(pair) => cat.encode_vopd(pair, &values),
     }
-    let mut word = 0;
-    for &(name, value) in &values {
-        word = enc
-            .field(name)
-            .unwrap()
-            .insert(word, value)
-            .map_err(error)?;
-    }
+    .map_err(error)?;
     Ok((0..enc.bits / 32)
         .map(|i| (word >> (32 * i)) as u32)
         .collect())

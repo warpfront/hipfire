@@ -2722,6 +2722,67 @@ impl Catalog {
         }
     }
 
+    /// Reconstruct both opcode halves in their shared physical packet layout.
+    /// A base-layout peer does not constrain the other half's opcode identifier.
+    pub fn encode_vopd(
+        &self,
+        pair: VopdPair<'_>,
+        fields: &[(&str, u128)],
+    ) -> Result<u128, EncodeError> {
+        let encoding = pair.encoding;
+        let mut word = 0;
+        for &(name, value) in fields {
+            let field = encoding
+                .field(name)
+                .ok_or_else(|| LayoutError::UnknownField(name.to_owned()))?;
+            word = field.insert(word, value)?;
+        }
+        for row in [pair.x, pair.y] {
+            if let Some(refusal) = row.refusal() {
+                return Err(EncodeError::Refused(refusal));
+            }
+            let own = self.encoding_of(row);
+            if !own.fields.iter().all(|f| encoding.field(f.name) == Some(f))
+                || !encoding.identifier_matches(word)
+            {
+                return Err(EncodeError::IdentifierMismatch {
+                    instruction: row.name,
+                    encoding: encoding.name,
+                    word,
+                });
+            }
+            let opcode = own.opcode_field(row.slot).expect("VOPD opcode field");
+            if opcode.extract(word) != u128::from(row.opcode) {
+                return Err(EncodeError::OpcodeField {
+                    instruction: row.name,
+                    field: opcode.name,
+                    opcode: row.opcode,
+                });
+            }
+            match own.eval_expr(
+                self.predicate_of(row).expect("non-refused predicate"),
+                word,
+                encoding.bits,
+            ) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(EncodeError::PredicateFalse {
+                        instruction: row.name,
+                        encoding: row.encoding,
+                        condition: row.condition,
+                    })
+                }
+                Err(error) => {
+                    return Err(EncodeError::Eval {
+                        instruction: row.name,
+                        error,
+                    })
+                }
+            }
+        }
+        Ok(word)
+    }
+
     /// Assemble the word of `row` from named fields. The identifier and opcode
     /// are seeded from the catalog; the assembled word must still match the
     /// encoding identifier and satisfy the row's condition. A successful

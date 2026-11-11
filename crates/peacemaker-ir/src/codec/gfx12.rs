@@ -842,7 +842,21 @@ pub fn decode_for(arch: Arch, words: &[u32]) -> Result<(Inst, usize), DecodeErro
                     }
                     Ok(decoded)
                 }
-                Err(_) => Err(census_error),
+                Err(xml_error) => {
+                    // Keep named XML refusals (graphics, restricted selectors,
+                    // unresolved semantics) when there is no census row. A
+                    // generic catalog miss must not erase the typed diagnostic.
+                    let named_xml = census.is_none()
+                        && isa::xml::catalog(arch).is_some_and(|cat| {
+                            !matches!(
+                                cat.select(&words[..words.len().min(4)]),
+                                Err(isa::xml::SelectError::NoEncoding { .. }
+                                    | isa::xml::SelectError::NoRow { .. }
+                                    | isa::xml::SelectError::Truncated { .. })
+                            )
+                        });
+                    Err(if named_xml { xml_error } else { census_error })
+                }
             }
         }
     }
