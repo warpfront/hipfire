@@ -175,6 +175,10 @@
 
 - **Fixed: LLaMA/Mistral/Qwen3 configs in the transformers 5 layout get their `rope_theta` again (HIPF-206).** transformers 5 nests `rope_theta` inside `rope_parameters`; the LLaMA carrier read only the top-level key and ran theta 10000. It now reads `rope_parameters.rope_theta` first (as transformers does), then the top-level key. On gfx1151, a Llama-3.2-1B q8 HFQ with the v5 layout gives logits bitwise identical to the v4 layout over 60 positions (beta: KL 0.042, top-1 38/60).
 
+### Fixes: Muse Glimmer client abort (HIPF-276)
+
+- **Fixed: a client abort stops Muse Glimmer singleton decode.** `generate_muse_glimmer` never polled the terminal control during decode, so an aborted request ran to `max_tokens` or the cache cap (54 s on halo) while holding the GPU and the sequential queue. The spec window loop and the AR loop now check the abort each step and end in the existing commit handshake (`aborted`, session reset). An abort latched before the request starts produces no prefill or decode.
+
 ### Fixes: CI and platform builds
 
 - **Fixed: the Windows MSVC build links again.** The EP skew log's `clock_gettime` (hipfire-arch-qwen4) and the `HIPFIRE_DEBUG_FORCE_EVICT_MS` repro knob's `mmap`/`madvise`/`dlopen`/`dlsym` (rdna-compute PM4 replay) were declared as libc externs on every OS, so `link.exe` failed with LNK1120. Both are Linux-only now: off Linux the skew log timestamps from a process-local monotonic clock, and the force-evict knob is reported once and ignored. The hipfire-config hot-units sidecar test, hidden behind the link failure, now uses a path that is absolute on Windows too.
