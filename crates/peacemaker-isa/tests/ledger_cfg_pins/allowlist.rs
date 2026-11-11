@@ -177,6 +177,12 @@ pub const FINDINGS: &[Allow] = &[
     },
     Allow {
         scope: "pins",
+        target: "ggml_mmvq_shim_pm_gfx1201.hxaco#ggml_mmvq_q4_k_gfx1201",
+        needle: "`global_load_d16_hi_b16 v10, v[16:17], off offset:12` (after label `.LBB2`): needs Load wait 0 (Use { reg: \"v10\" })",
+        why: "MODEL LIMITATION, not a claimed race: a d16_hi load whose destination VGPR is also listed as a use (the other half is preserved), so the ledger reads the pending load into the same register as a RAW on its old value; it cannot tell a d16 lo/hi pair from an overwrite, and whether the hardware returns the pair in order is not established by this verifier",
+    },
+    Allow {
+        scope: "pins",
         target: "gated_delta_chunk_arena_pm_gfx1151.hxaco#gated_delta_chunk_gate_wmma_arena_pm_gfx1151",
         needle: "`v_add_nc_u32_e32 v75, -2, v203` (after label `.LBB24`): needs Lgkm wait 1 (War { reg: \"v[74:77]\" })",
         why: "MODEL LIMITATION, not a claimed race: the ledger keeps a pending DS store's source VGPRs locked until its LGKMcnt wait and reports the first write of one on a CFG path with no such wait. The existing text replay documents that hipcc code reuses DS store sources under a hardware interlock (`ledger_replay::replay_hazards`: \"hardware-interlocked DS-source reuse the strict replay already flags\"), so this stricter-than-hardware lock is the ledger's model; that this exact reuse is interlocked, and that the path is feasible, is not established here",
@@ -1850,6 +1856,30 @@ pub const UNSUPPORTED: &[Allow] = &[
     Allow {
         scope: "pools",
         target: "region:ggml_mmvq_shim_gfx1201.co#ggml_mmvq_q8_0_gfx1201",
+        needle: "not convertible: enables more than one workitem-id axis (packed v0)",
+        why: "lift_region refuses the kernel (more than one workitem-id axis is enabled, packed v0), so no pool region exists; not a verifier finding",
+    },
+    Allow {
+        scope: "pools",
+        target: "region:ggml_mmvq_shim_pm_gfx1201.hxaco#ggml_mmvq_iq4_xs_gfx1201",
+        needle: "not convertible: enables more than one workitem-id axis (packed v0)",
+        why: "lift_region refuses the kernel (more than one workitem-id axis is enabled, packed v0), so no pool region exists; not a verifier finding",
+    },
+    Allow {
+        scope: "pools",
+        target: "region:ggml_mmvq_shim_pm_gfx1201.hxaco#ggml_mmvq_q4_k_gfx1201",
+        needle: "not convertible: enables more than one workitem-id axis (packed v0)",
+        why: "lift_region refuses the kernel (more than one workitem-id axis is enabled, packed v0), so no pool region exists; not a verifier finding",
+    },
+    Allow {
+        scope: "pools",
+        target: "region:ggml_mmvq_shim_pm_gfx1201.hxaco#ggml_mmvq_q6_k_gfx1201",
+        needle: "not convertible: enables more than one workitem-id axis (packed v0)",
+        why: "lift_region refuses the kernel (more than one workitem-id axis is enabled, packed v0), so no pool region exists; not a verifier finding",
+    },
+    Allow {
+        scope: "pools",
+        target: "region:ggml_mmvq_shim_pm_gfx1201.hxaco#ggml_mmvq_q8_0_gfx1201",
         needle: "not convertible: enables more than one workitem-id axis (packed v0)",
         why: "lift_region refuses the kernel (more than one workitem-id axis is enabled, packed v0), so no pool region exists; not a verifier finding",
     },

@@ -17,7 +17,7 @@ Explicit invocation only: no test, build script or runtime path runs this. It
 
 Tests (`crates/peacemaker-isa/tests/hip_twin_leviathan.rs`) only consume the committed files.
 
-    scripts/pm-leviathan-twin.py [--family leviathan|moe-shared-down-combine|lwmma-multi|lwmma-tile|moe-route-scatter-wide|qwen4-moe-ep-a8-rot]
+    scripts/pm-leviathan-twin.py [--family leviathan|moe-shared-down-combine|lwmma-multi|lwmma-tile|moe-route-scatter-wide|qwen4-moe-ep-a8-rot|ggml-mmvq]
         [--arch gfx1200|gfx1201|all] [--rocm-path DIR]
         [--build-wrapper 'WRAPPER ARGS'] [--seal-bin PATH] [--out-dir DIR]
 
@@ -41,6 +41,13 @@ runtime module source (`MOE_ROUTE_SCATTER_WIDE_SRC`, `QWEN4_MOE_EP_A8_ROT_SRC`; 
 `module_source`) once and seal the two wide MoE glue entries (`moe_scatter_fused_top10_pmask`,
 `moe_route_scatter_top10_wide_f32`) / the two rot planar entries (`qwen4_moe_ep_a8_gate_up_rot_planar_nt{1,2}`) into
 `moe_route_scatter_wide_pm_gfx1201.hxaco` / `qwen4_moe_ep_a8_rot_pm_gfx1201.hxaco`; whole-ELF byte identity; no math evidence.
+
+`--family ggml-mmvq` (gfx1201 only) compiles `kernels/src/ggml_mmvq_shim.hip` with the core flags plus the ggml snapshot's
+`-ffp-contract=fast-honor-pragmas -DGGML_USE_HIP -Ithird_party/ggml/{include,src,src/ggml-cuda}` (the set of
+`scripts/build-ggml-mmvq-shim.sh`) and requires the result to equal the shipped runtime object
+`kernels/ggml_mmvq_shim_gfx1201.co` byte for byte (that object is the anchor; no second copy is written). It seals all five
+exports (`ggml_q8_1_quantize_gfx1201`, `ggml_mmvq_{iq4_xs,q4_k,q6_k,q8_0}_gfx1201`) into `kernels/ggml_mmvq_shim_pm_gfx1201.hxaco`
+and records `third_party/ggml/PIN` in the manifest's `third_party`; whole-ELF byte identity; no math evidence.
 """
 import argparse
 import hashlib
@@ -105,6 +112,20 @@ FAMILIES = {
         "prefix": "qwen4_lane_wmma_multi",
         "arches": ("gfx1201",),
         "math": False,
+    },
+    "ggml-mmvq": {
+        "source": "kernels/src/ggml_mmvq_shim.hip",
+        "symbols": ("ggml_q8_1_quantize_gfx1201", "ggml_mmvq_iq4_xs_gfx1201", "ggml_mmvq_q4_k_gfx1201",
+                    "ggml_mmvq_q6_k_gfx1201", "ggml_mmvq_q8_0_gfx1201"),
+        "prefix": "ggml_mmvq_shim",
+        "arches": ("gfx1201",),
+        "math": False,
+        # Mirror of scripts/build-ggml-mmvq-shim.sh (core flags + the ggml snapshot's define and include set).
+        "extra_flags": ("-ffp-contract=fast-honor-pragmas", "-DGGML_USE_HIP", "-Ithird_party/ggml/include",
+                        "-Ithird_party/ggml/src", "-Ithird_party/ggml/src/ggml-cuda"),
+        # The runtime embeds kernels/ggml_mmvq_shim_gfx1201.co (rdna-compute ggml_mmvq.rs S1_IMAGE): it is the anchor.
+        "anchor_file": "kernels/ggml_mmvq_shim_gfx1201.co",
+        "provenance": ("third_party/ggml/PIN",),
     },
     "moe-route-scatter-wide": {
         "source": "kernels/src/moe_route_scatter_wide.gfx1201.hip",
@@ -258,10 +279,11 @@ def build_arch(args, root, hipcc, env, arch, tmp):
     symbols = fam["symbols"]
     prefix = fam["prefix"]
     out_dir = args.out_dir
-    co = out_dir / f"{prefix}_hipcc_{arch}.co"
+    anchor_file = fam.get("anchor_file")
+    co = root / anchor_file if anchor_file else out_dir / f"{prefix}_hipcc_{arch}.co"
     hxaco = out_dir / f"{prefix}_pm_{arch}.hxaco"
     manifest = out_dir / f"{prefix}_pm_{arch}.twin.json"
-    flags = core_hipcc_flags(arch)
+    flags = core_hipcc_flags(arch) + list(fam.get("extra_flags", ()))
     evidence = math_evidence(hipcc, env, root, arch, tmp, Path(env["ROCM_PATH"])) if fam["math"] else None
 
     tmp_co = Path(tmp) / f"anchor_{arch}.co"
@@ -274,7 +296,12 @@ def build_arch(args, root, hipcc, env, arch, tmp):
         run([str(hipcc), *flags, "-o", str(tmp_co), str(build_src)], cwd=root, env=env)
     else:
         run([str(hipcc), *flags, "-o", str(tmp_co), source_rel], cwd=root, env=env)
-    shutil.copyfile(tmp_co, co)
+    if anchor_file:
+        # The anchor is the shipped runtime object itself: the compile must reproduce it byte for byte.
+        if tmp_co.read_bytes() != co.read_bytes():
+            die(f"{arch}: recompiling {source_rel} with the recorded flags does not reproduce {anchor_file}")
+    else:
+        shutil.copyfile(tmp_co, co)
 
     report_path = Path(tmp) / f"report_{arch}.json"
     kernel_args = [a for s in symbols for a in ("--kernel", s)]
@@ -299,6 +326,9 @@ def build_arch(args, root, hipcc, env, arch, tmp):
         "anchor": {"file": co.name, "bytes": co.stat().st_size, "sha256": sha256_file(co)},
         "hxaco": {"file": hxaco.name, "bytes": hxaco.stat().st_size, "sha256": sha256_file(hxaco)},
     }
+    if fam.get("provenance"):
+        doc["third_party"] = [{"path": r, "bytes": (root / r).stat().st_size, "sha256": sha256_file(root / r)}
+                              for r in fam["provenance"]]
     if parts:
         doc["compiler"]["invocation"] = "hipcc <flags> -o <anchor.co> <define + parts concatenated>"
         doc["module_source"] = {
@@ -334,7 +364,7 @@ def build_arch(args, root, hipcc, env, arch, tmp):
                 if isinstance(rec, dict) and rec.get("input_hxaco_sha256") == new_sha:
                     doc[key] = rec
     manifest.write_text(json.dumps(doc, indent=2, sort_keys=True) + "\n")
-    print(f"{arch}: wrote {rel(co)} {rel(hxaco)} {rel(manifest)}")
+    print(f"{arch}: wrote {rel(co) if not anchor_file else '(anchor ' + rel(co) + ' verified unchanged)'} {rel(hxaco)} {rel(manifest)}")
 
 
 def main():

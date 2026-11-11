@@ -21,6 +21,8 @@
 ### Fixes: PeaceMaker evidence
 
 - **Fixed: PM ledger pool findings use stable module/symbol, body-pc and finding keys instead of scan-position template ids.** A frozen migration oracle preserves every existing allowance exactly; adding an image no longer renumbers other rows. Twin exploration counters are informational diagnostics, while bytes, hazards, findings and certification claims remain pinned.
+- **Fixed: the gfx1201 ggml MMVQ Route-A twin passes the exhaustive ledger pins with only its own existing-class exceptions.** One exact `d16_hi` model-limitation finding and four exact multi-axis region refusals mirror its unchanged hipcc anchor; no existing row, category, limit or artifact changes.
+- **Added (gfx1201 GGUF-native decode GEMV; proof only, no runtime dispatch change): Route-A PeaceMaker twin of every export of `ggml_mmvq_shim`.** The generator reproduces the shipped anchor byte for byte and seals all five exports. CPU checks pin provenance, full device-ELF identity, explicit kernargs, LDS and complete export coverage; the Q4_K `d16_hi` verdict remains OPEN, with only the anchor's same-class finding and conversion refusals mirrored for the twin.
 
 ## v0.4.6 — 2026-11-11
 
