@@ -58,8 +58,7 @@ fn q8ef_snapshot_restore_rollback_continue_is_byte_exact_hw() {
         return;
     };
     const R: usize = 8;
-    let mut config = crate::config::compact_test_config();
-    config.ple = None;
+    let config = crate::config::compact_test_config();
     let (kh, vh) = (config.linear_num_key_heads, config.linear_num_value_heads);
     let qkv = 2 * kh * 128 + vh * 128;
     let value = vh * 128;
@@ -148,7 +147,9 @@ fn q8ef_snapshot_restore_rollback_continue_is_byte_exact_hw() {
         }
         conv
     };
-    let ple_normed = gpu.zeros(&[1], DType::F32).unwrap();
+    let ple_rows = config.ple_conv_history_rows();
+    let ple_row_bytes = state.ple_conv.as_ref().unwrap().byte_size() / ple_rows;
+    let ple_normed = gpu.zeros(&[R * ple_row_bytes], DType::Raw).unwrap();
     let tokens = vec![1u32; R];
     let mut checked = 0;
     for keep in [0usize, 1, R / 2, R - 1, R] {
@@ -190,7 +191,7 @@ fn q8ef_snapshot_restore_rollback_continue_is_byte_exact_hw() {
                     R,
                     &tokens,
                     &ple_normed,
-                    0,
+                    ple_rows,
                     3,
                     config.indexer_compress_ratio,
                     1024,
