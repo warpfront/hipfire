@@ -1052,6 +1052,7 @@ impl Carrier for Qwen4Carrier {
                     true,
                     verify_rows,
                     loaded.bundle.state_format().gdn,
+                    loaded.bundle.expert_cache_enabled(),
                     loaded.measured_load_identity.clone(),
                 )
             }),
@@ -1326,6 +1327,8 @@ fn qwen4_dflash2_speculator(
 /// host-placed routed experts run on the CPU. `gdn` is the loaded GDN state
 /// format; under `q8_ef` sampled requests stay on AR
 /// ([`hipfire_arch_qwen4::mtp_spec::qwen4_mtp_sampled_allowed`]).
+/// `actual_cache_enabled` is the attached bundle's cache owner, not a parsed
+/// request: exact LRU keeps sampled requests on AR while greedy MTP stays armed.
 /// `measured_load_identity` is the settled descriptor composed once per rank
 /// at the return site (already `Arc`-shared, never re-hashed).
 fn qwen4_native_mtp_speculator(
@@ -1338,6 +1341,7 @@ fn qwen4_native_mtp_speculator(
     ngram_modifier: bool,
     verify_rows: usize,
     gdn: hipfire_arch_qwen4::GdnStateFormat,
+    actual_cache_enabled: bool,
     measured_load_identity: Option<
         std::sync::Arc<hipfire_arch_qwen4::measured_identity::Qwen4MeasuredLoadIdentity>,
     >,
@@ -1347,7 +1351,11 @@ fn qwen4_native_mtp_speculator(
         hipfire_config::load_summary::Facet::SpecOn,
         format!("qwen4 native mtp K={max_k}"),
     );
-    if hipfire_config::mtp_sampled_enabled()
+    if hipfire_config::mtp_sampled_enabled() && actual_cache_enabled {
+        eprintln!(
+            "  qwen4 native MTP sampled: off for exact expert cache (sampled requests use AR; greedy native MTP remains enabled)"
+        );
+    } else if hipfire_config::mtp_sampled_enabled()
         && !hipfire_arch_qwen4::mtp_spec::qwen4_mtp_sampled_allowed(gdn)
     {
         eprintln!(
@@ -1408,6 +1416,7 @@ fn qwen4_native_mtp_speculator(
         ngram,
         copy_lane,
         gdn,
+        actual_cache_enabled,
         measured_load_identity,
     )
 }
@@ -5360,6 +5369,64 @@ fn qwen4_ep_reserve_rank_terms(
     Ok(())
 }
 
+/// Only the native MTP driver has the cache's bounded mutable-window contract.
+/// Its internal n-gram takeover is already included in proposal_drafts; the
+/// independent drafter remains a different, unsupported producer.
+fn qwen4_expert_cache_unsupported_speculation(spec: SpecLoadCfg) -> bool {
+    spec.dflash == Some(true) || spec.dspark == Some(true) || spec.ngram_draft == Some(true)
+}
+
+fn qwen4_expert_cache_for_native_mtp(
+    cache: Option<hipfire_arch_qwen4::expert_cache_config::ExpertCacheConfig>,
+    spec: SpecLoadCfg,
+    native_mtp: bool,
+    proposal_drafts: usize,
+) -> Result<Option<hipfire_arch_qwen4::expert_cache_config::ExpertCacheConfig>, String> {
+    let Some(cache) = cache else {
+        return Ok(None);
+    };
+    if qwen4_expert_cache_unsupported_speculation(spec) {
+        return Err(
+            "exact expert cache does not support DFlash, DSpark or the independent n-gram drafter"
+                .into(),
+        );
+    }
+    if spec.mtp == Some(false) && native_mtp {
+        return Err(
+            "exact expert cache received native MTP on despite explicit speculation.mtp off".into(),
+        );
+    }
+    qwen4_refuse_explicit_mtp_decline(
+        true,
+        spec,
+        !native_mtp,
+        "no admitted native MTP head/route",
+    )?;
+    let rows = if native_mtp {
+        hipfire_arch_qwen4::mtp_spec::native_mtp_window_rows(proposal_drafts)
+    } else {
+        1
+    };
+    cache.with_verify_rows(rows).map(Some)
+}
+
+/// An opted-in cache's explicit native request must attach or return a named
+/// error. Cache-off loads retain their existing policy and diagnostics; auto
+/// still follows the original head and host-spill policy.
+fn qwen4_refuse_explicit_mtp_decline(
+    cache_enabled: bool,
+    spec: SpecLoadCfg,
+    declined: bool,
+    reason: &str,
+) -> Result<(), String> {
+    if cache_enabled && declined && spec.mtp == Some(true) {
+        return Err(format!(
+            "qwen4: explicit native MTP was requested but cannot be kept: {reason}"
+        ));
+    }
+    Ok(())
+}
+
 /// Metadata-only preload resource plan for one Qwen4 rank (`Unit B`).
 ///
 /// Source-planned, unmeasured, non-qualifying: admits the HFQ artifact and
@@ -5477,6 +5544,16 @@ pub fn qwen4_preload_resource_plan(
                 )
             })
             .map_err(|error| format!("qwen4 preload plan: native MTP: {error}"))?;
+    let effective_max_k = qwen4_native_mtp_k(shared.spec, &gpu.arch);
+    let capture_reserve_drafts =
+        hipfire_arch_qwen4::mtp_spec::native_mtp_proposal_drafts(effective_max_k, &gpu.arch);
+    let expert_cache = qwen4_expert_cache_for_native_mtp(
+        expert_cache,
+        shared.spec,
+        effective_native_mtp,
+        capture_reserve_drafts,
+    )
+    .map_err(|error| format!("qwen4 preload plan: {error}"))?;
     if expert_cache.is_some() {
         use hipfire_arch_qwen4::expert_cache_config::{
             admit, railgun_check_always, ExpertCacheAdmission,
@@ -5487,11 +5564,7 @@ pub fn qwen4_preload_resource_plan(
             single_device: !use_ranges,
             ranked_hotset: true,
             uniform_mq4: true,
-            speculation: effective_native_mtp
-                || shared.spec.mtp == Some(true)
-                || shared.spec.dflash == Some(true)
-                || shared.spec.ngram_draft == Some(true)
-                || shared.spec.dspark == Some(true),
+            unsupported_speculation: qwen4_expert_cache_unsupported_speculation(shared.spec),
             continuous_batch: shared.batch.lanes().is_some(),
             cpu_experts: hipfire_config::memory::offload_exec()
                 != hipfire_config::memory::OffloadExec::Pcie
@@ -5508,7 +5581,6 @@ pub fn qwen4_preload_resource_plan(
         })
         .map_err(|error| format!("qwen4 preload plan: {error}"))?;
     }
-    let effective_max_k = qwen4_native_mtp_k(shared.spec, &gpu.arch);
     // Placement census at the requested chunk (same convention as the load).
     let mtp_kept = effective_native_mtp
         && crate::admission::qwen4_mtp_with_host_mapped_experts(
@@ -5516,6 +5588,12 @@ pub fn qwen4_preload_resource_plan(
             &gpu.arch,
             usize::from(routed_experts),
         );
+    qwen4_refuse_explicit_mtp_decline(
+        expert_cache.is_some(),
+        shared.spec,
+        effective_native_mtp && !mtp_kept,
+        "host-mapped expert policy refused the native MTP head",
+    )?;
     let inputs = residency::placement_inputs(&residency::PlacementInputsArgs {
         gpu,
         config: &config,
@@ -6237,7 +6315,8 @@ pub fn qwen4_preload_resource_plan(
     if let Some(cache) = expert_cache {
         plan["expert_cache"] = serde_json::json!({
             "requested": true, "tail_percent": cache.tail_percent,
-            "max_inflight": cache.max_inflight,
+            "max_inflight": cache.max_inflight, "verify_rows": cache.verify_rows,
+            "verify_rows_basis": "pre-placement admitted capacity; retained if auto MTP later declines to AR",
             "device_tables_routes_queue_reserve_bytes": cache.device_reserve_bytes(
                 config.num_hidden_layers, config.num_experts, config.num_experts_per_tok,
             )?,
@@ -7138,6 +7217,14 @@ fn load_qwen4_rank_unscoped(
     // A dense FFN has no routed experts: its gate/up/down are ordinary
     // resident weights and the host-expert placement does not apply.
     let routed_experts = !config.ffn.is_dense();
+    let capture_reserve_drafts =
+        hipfire_arch_qwen4::mtp_spec::native_mtp_proposal_drafts(max_k, &ctx.gpu.arch);
+    let expert_cache = qwen4_expert_cache_for_native_mtp(
+        expert_cache,
+        ctx.spec,
+        native_mtp,
+        capture_reserve_drafts,
+    )?;
     if expert_cache.is_some() {
         use hipfire_arch_qwen4::expert_cache_config::{
             admit, railgun_check_always, ExpertCacheAdmission,
@@ -7153,11 +7240,7 @@ fn load_qwen4_rank_unscoped(
             // any expert materialization or full model fulfillment.
             ranked_hotset: true,
             uniform_mq4: true,
-            speculation: native_mtp
-                || ctx.spec.mtp == Some(true)
-                || ctx.spec.dflash == Some(true)
-                || ctx.spec.ngram_draft == Some(true)
-                || ctx.spec.dspark == Some(true),
+            unsupported_speculation: qwen4_expert_cache_unsupported_speculation(ctx.spec),
             continuous_batch: shared.batch.lanes().is_some(),
             cpu_experts: hipfire_config::memory::offload_exec()
                 != hipfire_config::memory::OffloadExec::Pcie
@@ -7608,8 +7691,6 @@ fn load_qwen4_rank_unscoped(
     } else {
         None
     };
-    let capture_reserve_drafts =
-        hipfire_arch_qwen4::mtp_spec::native_mtp_proposal_drafts(max_k, &ctx.gpu.arch);
     let planned_capture = placement_native_mtp
         .then(|| {
             hipfire_arch_qwen4::mtp_spec::native_mtp_capture(
@@ -8835,6 +8916,12 @@ fn load_qwen4_rank_unscoped(
         if native_mtp
             && !crate::admission::qwen4_mtp_with_host_mapped_experts(ctx.spec, &ctx.gpu.arch, moved)
         {
+            qwen4_refuse_explicit_mtp_decline(
+                expert_cache.is_some(),
+                ctx.spec,
+                true,
+                "host-mapped expert policy refused the native MTP head",
+            )?;
             native_mtp = false;
             eprintln!(
                 "{}",
@@ -8922,6 +9009,12 @@ fn load_qwen4_rank_unscoped(
                 host_projections,
             )
         {
+            qwen4_refuse_explicit_mtp_decline(
+                expert_cache.is_some(),
+                ctx.spec,
+                true,
+                "host-mapped expert policy refused the native MTP head",
+            )?;
             native_mtp = false;
             eprintln!(
                 "{}",
@@ -11345,6 +11438,7 @@ fn load_qwen4_pp_model(src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedMode
             false,
             rdna_compute::prefill_invariant::qwen4_row_exact_verify_rows(&ctx.gpu.arch),
             bundle.state_format().gdn,
+            false, // Exact expert cache is not admitted on a pipeline mesh.
             None,
         )
     });

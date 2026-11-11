@@ -168,7 +168,9 @@ pub struct ExpertCacheAdmission<'a> {
     pub single_device: bool,
     pub ranked_hotset: bool,
     pub uniform_mq4: bool,
-    pub speculation: bool,
+    /// DFlash, DSpark and the independent n-gram drafter remain unsupported.
+    /// Native MTP instead has a bounded, loader-resolved verify_rows capacity.
+    pub unsupported_speculation: bool,
     pub continuous_batch: bool,
     pub cpu_experts: bool,
     pub decode_share: bool,
@@ -189,8 +191,8 @@ pub fn admit(facts: &ExpertCacheAdmission<'_>) -> Result<(), String> {
         Some("requires an applied ranked expert hotset")
     } else if !facts.uniform_mq4 {
         Some("requires uniform QT44/QT53 experts")
-    } else if facts.speculation {
-        Some("requires speculation off")
+    } else if facts.unsupported_speculation {
+        Some("does not support DFlash, DSpark or the independent n-gram drafter")
     } else if facts.continuous_batch {
         Some("does not support continuous batching/lanes")
     } else if facts.cpu_experts {
@@ -259,7 +261,7 @@ mod tests {
             single_device: true,
             ranked_hotset: true,
             uniform_mq4: true,
-            speculation: false,
+            unsupported_speculation: false,
             continuous_batch: false,
             cpu_experts: false,
             decode_share: false,
@@ -289,7 +291,7 @@ mod tests {
         f.uniform_mq4 = false;
         assert!(admit(&f).is_err());
         let mut f = facts();
-        f.speculation = true;
+        f.unsupported_speculation = true;
         assert!(admit(&f).is_err());
         let mut f = facts();
         f.continuous_batch = true;

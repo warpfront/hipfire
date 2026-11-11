@@ -2093,10 +2093,22 @@ impl Qwen4Bundle {
     }
     /// Attach the reusable native MTP head and its bounded GPU state.
     pub fn attach_mtp(&mut self, gpu: &mut Gpu, max_seq: usize) -> Result<(), BundleError> {
-        if self.expert_cache.is_some() {
-            return Err(BundleError::Forward(
-                "exact expert cache requires native MTP off".into(),
-            ));
+        if let Some(cache) = &self.expert_cache {
+            let rows = cache.config.verify_rows;
+            if !(2..=hipfire_dispatch::families::moe::MutableExpertResidency::MAX_VERIFY_ROWS)
+                .contains(&rows)
+                || self
+                    .execution
+                    .as_ref()
+                    .and_then(Qwen4GpuForward::expert_cache_verify_rows)
+                    != Some(rows)
+            {
+                return Err(BundleError::Forward(
+                    "exact expert cache native MTP requires its resolved bounded verify owner"
+                        .into(),
+                ));
+            }
+            self.check_expert_cache_idle(gpu)?;
         }
         self.ep_refuse("native MTP")?;
         Self::require_mtp_head(self.config.profile.id(), self.weights.mtp.is_some())?;
@@ -2332,6 +2344,14 @@ impl Qwen4Bundle {
         max_k: usize,
     ) -> Result<(), BundleError> {
         self.check_expert_cache_idle(gpu)?;
+        if self.expert_cache.as_ref().is_some_and(|cache| {
+            crate::mtp_spec::native_mtp_window_rows(max_k) > cache.config.verify_rows
+        }) {
+            return Err(BundleError::Forward(
+                "native MTP capture window exceeds the admitted expert-cache verify capacity"
+                    .into(),
+            ));
+        }
         let Some((_, rows)) =
             crate::mtp_spec::native_mtp_capture(gpu, &self.config, self.state_format.gdn, max_k)
         else {
@@ -2971,8 +2991,28 @@ impl Qwen4Bundle {
         })?;
         let prior_scope = std::mem::replace(&mut forward.prefill_scope, prefill);
         forward.layer_capture = layer_capture;
-        let result = forward
-            .forward_chunk(
+        let result = if !prefill
+            && capture_hidden
+            && self.expert_cache.is_some()
+            && self.mtp.is_some()
+            && self.dflash.is_none()
+        {
+            match hidden.as_ref() {
+                Some(hidden) => forward.forward_native_mtp_verify(
+                    self,
+                    gpu,
+                    tokens,
+                    &logits,
+                    Some(&top1),
+                    hidden,
+                    output_rows,
+                ),
+                None => Err(crate::gpu_forward::Qwen4GpuForwardError::Invalid(
+                    "native MTP cache verify requires its wide hidden capture".into(),
+                )),
+            }
+        } else {
+            forward.forward_chunk(
                 self,
                 gpu,
                 tokens,
@@ -2981,7 +3021,8 @@ impl Qwen4Bundle {
                 hidden.as_ref(),
                 output_rows,
             )
-            .map_err(|error| BundleError::Forward(error.to_string()));
+        }
+        .map_err(|error| BundleError::Forward(error.to_string()));
         forward.layer_capture = None;
         forward.prefill_scope = prior_scope;
         self.execution = Some(forward);
