@@ -73,6 +73,17 @@ enum Pm4Architecture {
     Gfx12,
 }
 
+/// What a model's retained tape is known to need from the transport, declared
+/// up front so [`ReplayController::transport_refusal`] can refuse before recording.
+#[derive(Clone, Copy, Debug)]
+pub struct RetainedTapeNeeds {
+    /// Kernargs derived from the decode position (rebinding needs PM4).
+    pub position_kernargs: bool,
+    /// Not validated on GFX10/GFX11 PM4 (scratch kernels, or decode parity vs HIP
+    /// not yet shown).
+    pub gfx10_11_pm4_unvalidated: bool,
+}
+
 /// Per-stream producer/consumer visibility for legacy (gfx10/gfx11) PM4 IBs.
 ///
 /// `CsPartialFlush` retains the historical EVENT_WRITE path. `ReleaseWait` is
@@ -5517,6 +5528,10 @@ pub struct ReplayController {
     pm4_gfx12_dispatch_pacing: Gfx12DispatchPacing,
     state: ReplayState,
     recorded: Vec<RecordedHipLaunch>,
+    /// `recorded` length at the end of the retained body (before an output
+    /// head the forward runs on HIP after every replay); `None`: the whole
+    /// window is the body.
+    body_end: Option<usize>,
     certified_speedups: Vec<f64>,
     threshold: f64,
     max_recorded_launches: usize,
@@ -5641,6 +5656,7 @@ impl ReplayController {
             pm4_gfx12_dispatch_pacing: Gfx12DispatchPacing::None,
             state,
             recorded: Vec::new(),
+            body_end: None,
             certified_speedups: Vec::new(),
             threshold: 1.03,
             max_recorded_launches: 4096,
@@ -5769,6 +5785,7 @@ impl ReplayController {
             ReplayState::Armed
         };
         self.recorded.clear();
+        self.body_end = None;
         self.certified_speedups.clear();
         self.fallback_reason = None;
         self.prepared = None;
@@ -5849,6 +5866,21 @@ impl ReplayController {
 
     pub fn recorded_launches(&self) -> &[RecordedHipLaunch] {
         &self.recorded
+    }
+
+    /// Close the retained body of the open recording here: launches recorded
+    /// after this point (an output head the forward also runs on HIP after
+    /// every replay) stay out of every plan prepared from this capture.
+    pub fn mark_body_end(&mut self) {
+        if self.is_recording() {
+            self.body_end = Some(self.recorded.len());
+        }
+    }
+
+    /// The recorded launches a plan of this capture covers: the body before
+    /// [`Self::mark_body_end`], or the whole window.
+    pub fn retained_body_launches(&self) -> usize {
+        self.body_end.unwrap_or(self.recorded.len())
     }
 
     pub fn pm4_queue_policy(&self) -> QueuePolicy {
@@ -7494,6 +7526,7 @@ impl ReplayController {
             return Err("cannot capture during a G0 observation");
         }
         self.recorded.clear();
+        self.body_end = None;
         self.radiowave_effect_launches = 0;
         self.fallback_effect_launches = 0;
         self.unknown_effect_launches = 0;
@@ -8458,6 +8491,33 @@ impl ReplayController {
         self.transport == ReplayTransport::Pm4Ib
     }
 
+    /// Why this transport cannot prepare a retained tape with `needs` on `arch`,
+    /// known before anything records. A model refuses at arm time on `Some` so
+    /// the arming forward runs on plain HIP instead of on the recorded route
+    /// (a prepare that fails after recording leaves that forward's output).
+    pub fn transport_refusal(&self, arch: &str, needs: RetainedTapeNeeds) -> Option<&'static str> {
+        match self.transport {
+            ReplayTransport::AqlPackets if needs.position_kernargs => Some(
+                "linear AQL cannot rebind the position-derived kernargs of this tape (it needs PM4)",
+            ),
+            ReplayTransport::AqlPackets => None,
+            ReplayTransport::Pm4Ib => match Pm4Architecture::from_name(arch) {
+                Err(_) => Some("retained PM4 has no register map for this arch"),
+                // ponytail: lift Gfx11 with HIPF-254 (after HIPF-253 gfx11 scratch);
+                // Gfx10 stays until gfx10 PM4 scratch exists.
+                Ok(Pm4Architecture::Gfx10 | Pm4Architecture::Gfx11)
+                    if needs.gfx10_11_pm4_unvalidated =>
+                {
+                    Some(
+                        "GFX10/GFX11 PM4 replay of this tape is unvalidated (scratch dispatch: \
+                         HIPF-253; decode parity vs HIP: HIPF-254)",
+                    )
+                }
+                Ok(_) => None,
+            },
+        }
+    }
+
     /// Whether the *current forward* is inside the retained body: the controller
     /// would record this forward into the tape, or route it through a prepared
     /// plan.
@@ -8524,6 +8584,11 @@ impl ReplayController {
             }
         }
         Ok(())
+    }
+
+    /// The identity the tape latched under `key`, if any.
+    pub fn route_identity(&self, key: u64) -> Option<&str> {
+        self.route_identities.get(&key).map(String::as_str)
     }
 
     /// The identities latched for the tape being recorded or replayed.
@@ -9132,6 +9197,30 @@ mod tests {
         // The Legacy arch gate is untouched: the gfx11 flag path still
         // reports false on gfx12 even when configured.
         assert!(!pm4_vmem_acquire_arch_enabled(Pm4Architecture::Gfx12, true));
+    }
+
+    #[test]
+    fn transport_refusal_is_known_before_recording() {
+        let qwen4 = RetainedTapeNeeds {
+            position_kernargs: true,
+            gfx10_11_pm4_unvalidated: true,
+        };
+        let plain = RetainedTapeNeeds {
+            position_kernargs: false,
+            gfx10_11_pm4_unvalidated: false,
+        };
+        let mut c = ReplayController::new(ReplayBackendRequest::Auto);
+        c.transport = ReplayTransport::AqlPackets;
+        assert!(c.transport_refusal("gfx1201", qwen4).is_some());
+        assert!(c.transport_refusal("gfx1151", plain).is_none());
+        c.transport = ReplayTransport::Pm4Ib;
+        for arch in ["gfx1151", "gfx1100", "gfx1030"] {
+            assert!(c.transport_refusal(arch, qwen4).is_some(), "{arch}");
+            assert!(c.transport_refusal(arch, plain).is_none(), "{arch}");
+        }
+        assert!(c.transport_refusal("gfx1201", qwen4).is_none());
+        // No PM4 register map: prepare would fail after recording.
+        assert!(c.transport_refusal("gfx942", plain).is_some());
     }
 
     #[test]
@@ -11922,6 +12011,30 @@ mod tests {
             controller.finish_capture().unwrap().sequence_hash,
             first.sequence_hash
         );
+    }
+
+    #[test]
+    fn retained_body_end_is_scoped_to_one_capture() {
+        let mut controller = ReplayController::new_armed(ReplayBackendRequest::Shadow);
+        controller.begin_capture().unwrap();
+        controller.record_hip_launch("body", None, [1; 3], [32, 1, 1], 0, &[1]);
+        controller.mark_body_end();
+        controller.record_hip_launch("head", None, [1; 3], [32, 1, 1], 0, &[2]);
+        assert_eq!(controller.retained_body_launches(), 1);
+        controller.finish_capture().unwrap();
+        // Outside a recording window the mark is ignored.
+        controller.mark_body_end();
+        assert_eq!(controller.retained_body_launches(), 1);
+        // A new capture with no mark is its whole window.
+        controller.begin_capture().unwrap();
+        controller.record_hip_launch("a", None, [1; 3], [32, 1, 1], 0, &[1]);
+        controller.record_hip_launch("b", None, [1; 3], [32, 1, 1], 0, &[2]);
+        assert_eq!(controller.retained_body_launches(), 2);
+        controller.mark_body_end();
+        controller.record_hip_launch("c", None, [1; 3], [32, 1, 1], 0, &[3]);
+        // A model reset drops the mark with the launches.
+        controller.apply_model_default(true, ReplayTransport::AqlPackets);
+        assert_eq!(controller.retained_body_launches(), 0);
     }
 
     #[test]

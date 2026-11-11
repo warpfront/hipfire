@@ -621,6 +621,9 @@ impl Qwen4MtpGpu {
         // copies) runs as one launch each; the bytes are the per-lane launches'.
         let glue_fold = gpu.flags.qwen4_draft_glue_fold_enabled();
 
+        // Never the plain-AR retained body (see `head_prologue`).
+        gpu.replay.set_forward_eligible(false);
+
         // Stage 1 (per lane, host): the position guards and the backbone
         // hidden staging, exactly `head_prologue`'s; then the draft history
         // and ONE H2D of the `n` tokens.

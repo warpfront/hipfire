@@ -850,9 +850,14 @@ fn capture_phase(
         }),
         json!({"route_identities": identities}),
     );
+    // The plan covers the retained body only: the LM head (the capture forward's
+    // last launch) runs on HIP after every replay and must not be on the tape.
+    // ponytail: only the last launch is checked; a mark moved past the final
+    // hyper (forward-owned scratch, perf-only double run) still passes.
+    let body = gpu.replay.retained_body_launches();
     let dispatch_matches = identity
         .as_ref()
-        .is_some_and(|identity| identity.dispatch_count == recorded);
+        .is_some_and(|identity| identity.dispatch_count == body);
     gate.push(
         "capture_prepared_dispatches_equal_launches",
         dispatch_matches,
@@ -862,10 +867,30 @@ fn capture_phase(
             .then(|| "no prepared route identity after capture".to_string()),
         json!({
             "prepared_dispatches": identity.as_ref().map(|i| i.dispatch_count),
+            "body_launches": body,
+            "recorded_launches": recorded,
             "queue_id": identity.as_ref().map(|i| i.queue_id),
             "command_dwords": identity.as_ref().and_then(|i| i.command_dwords),
             "packets": identity.as_ref().and_then(|i| i.packet_count),
         }),
+    );
+    let launches = gpu.replay.recorded_launches();
+    let head = launches.last().map(|l| (l.kernel.as_str(), l.grid));
+    let planned = identity
+        .as_ref()
+        .map_or(0, |identity| identity.dispatch_count.min(launches.len()));
+    let head_on_tape = launches[..planned]
+        .iter()
+        .any(|l| Some((l.kernel.as_str(), l.grid)) == head);
+    let head_excluded = body < recorded && !head_on_tape;
+    gate.push(
+        "capture_plan_excludes_lm_head",
+        head_excluded,
+        Some(u64::from(!head_excluded)),
+        (!head_excluded).then(|| {
+            format!("the plan replays the LM head {head:?}, which runs on HIP after every replay")
+        }),
+        json!({"head": head.map(|(kernel, grid)| json!({"kernel": kernel, "grid": grid})), "body_launches": body}),
     );
     report.insert(
         "capture".into(),
@@ -1680,14 +1705,13 @@ mod tests {
 
     #[test]
     fn mq4r_default_arches_run_the_gate() {
-        for gpu_arch in ["gfx1100", "gfx1151", "gfx1201"] {
+        assert!(route("gfx1201", "/m/flash-next.mq4r", false).default_route());
+        assert!(route("gfx1201", "/m/FLASH-NEXT.MQ4R", false).default_route());
+        // HIPF-254: Qwen4 is carved out of the MQ4R default on gfx1100/gfx1151.
+        for gpu_arch in ["gfx1100", "gfx1151"] {
             assert!(
-                route(gpu_arch, "/m/flash-next.mq4r", false).default_route(),
+                !route(gpu_arch, "/m/flash-next.mq4r", false).default_route(),
                 "{gpu_arch}"
-            );
-            assert!(
-                route(gpu_arch, "/m/FLASH-NEXT.MQ4R", false).default_route(),
-                "{gpu_arch} upper-case extension"
             );
         }
     }
