@@ -381,6 +381,27 @@ fn main() {
                         got.ef == reference.ef,
                         got.meta == reference.meta
                     );
+                    let mut rows_diff: Vec<String> = Vec::new();
+                    for row in 0..n {
+                        let lo = row * VALUE * 4;
+                        let mut cnt = 0;
+                        let mut firstd = None;
+                        for e in 0..VALUE {
+                            let o = lo + e * 4;
+                            if got.out[o..o + 4] != reference.out[o..o + 4] {
+                                cnt += 1;
+                                if firstd.is_none() {
+                                    let a = f32::from_le_bytes(got.out[o..o + 4].try_into().unwrap());
+                                    let b = f32::from_le_bytes(reference.out[o..o + 4].try_into().unwrap());
+                                    firstd = Some((e, a, b));
+                                }
+                            }
+                        }
+                        if cnt > 0 && rows_diff.len() < 12 {
+                            rows_diff.push(format!("row{row}:{cnt}diff first={firstd:?}"));
+                        }
+                    }
+                    eprintln!("  DIFFROWS {}", rows_diff.join(" | "));
                 }
                 report.push(format!(
                     "{{\"format\":\"{format:?}\",\"start\":{start},\"case\":\"{name}\",\"appends\":{},\"byte_exact\":{ok}}}",
