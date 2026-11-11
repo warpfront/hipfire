@@ -1362,6 +1362,7 @@ const ROWS16_CHAIN_STEP: usize = 16;
 
 /// Most batch rows one `gemm_bf16_mfma_gfx942_wide` launch takes (the
 /// `gemm_bf16_mfma_gfx942_wide64` entries: four 16-column MFMA chains).
+// selector-receipt: receipts/selectors/gfx942_wide_max_rows.json
 pub const WIDE_MAX_ROWS: usize = 64;
 
 /// X rows staged in LDS per chunk (`WD_XROWS` in
