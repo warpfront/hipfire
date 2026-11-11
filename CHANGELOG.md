@@ -174,6 +174,10 @@
 
 - **Fixed: a client abort stops Muse Glimmer singleton decode.** `generate_muse_glimmer` never polled the terminal control during decode, so an aborted request ran to `max_tokens` or the cache cap (54 s on halo) while holding the GPU and the sequential queue. The spec window loop and the AR loop now check the abort each step and end in the existing commit handshake (`aborted`, session reset). An abort latched before the request starts produces no prefill or decode.
 
+### Fixes: Flash-Next EP
+
+- **Fixed: on an EP load, rank 0's long-prefill expert staging (G2 stage) no longer takes the host RAM a later rank's routed experts need (HIPF-214).** The stage admitted its restore mirrors against live MemAvailable without the later ranks' expert pins, which land after rank 0's forward attaches. In a window the size of one rank's mirrors (1279 MiB at EP2), rank 0 staged and the next rank's load then failed with "routed experts need … pinned host RAM". The stage now uses the loader's placement ledger: its own pending mirrors plus the later ranks' pending pins, which already include their lent-layer restore copies. Earlier ranks' mirrors are no longer re-charged. On a host with room, staging is unchanged.
+
 ### Fixes: CI and platform builds
 
 - **Fixed: the per-row extent check of the non-`decode_raw_codec` loaders now covers every row-packed raw dtype (HFQ4-G128, HFQ6-G256, HFQ4-G256, HFQ2-G128, HFQ3-G128, Q4F16-G64, Q4K, Q8_0), not only HFQ4-G128, so a stale cross-row ragged-K payload in any of them is refused at load instead of decoding to garbage (HIPF-317).** `weight_backend::validate_hfq4g128_extent` is replaced by `validate_row_extent(dtype, ..)`, the single owner of the dtype set, which `validate_raw_codec_payload` also calls. Covered: qwen35 `load_weight_tensor_raw_with` (qt 3/6/7/8/12) and the MTP head's Q8 arm, Glimmer `load_wt`, its qt 3/6/7 embedding and its drafter's Q8 arm, Gemma 4 `load_wt`, expert pools and drafter weights, and `load_embedding`. Every 2-D tensor of the 51 HFQ files on halo still passes.

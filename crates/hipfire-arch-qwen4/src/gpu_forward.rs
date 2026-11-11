@@ -7154,30 +7154,20 @@ impl Qwen4ExpertStage {
         donors.sort_by_key(|layer| layer % 2);
         let placement = bundle.weights.ep_placement();
         let ranks = placement.map_or(1, |placement| placement.ranks);
-        let bytes = stage_donor_bytes(
-            config.num_experts,
-            placement.map_or(0, |placement| placement.rank),
-            ranks,
-        );
+        let rank = placement.map_or(0, |placement| placement.rank);
+        let bytes = stage_donor_bytes(config.num_experts, rank, ranks);
         // The mirrors of all ranks share one host RAM/GTT budget: charge every rank at the
         // largest (rank 0) share so an uneven split is never under-counted.
         let layer_bytes = stage_donor_bytes(config.num_experts, 0, ranks)
             .iter()
             .sum::<usize>();
-        let mirror_bytes = crate::expert_residency::expert_stage_mirror_bytes(layer_bytes, ranks)
-            .map_err(invalid)?;
-        let admitted = crate::expert_residency::check_host_ram(
+        let mirror_bytes =
+            crate::expert_residency::pending_stage_mirror_bytes(layer_bytes, rank, ranks)
+                .map_err(invalid)?;
+        if let Err(reason) = crate::expert_residency::admit_stage_mirrors(
             mirror_bytes,
-            rdna_compute::kv_slots::mem_available_bytes(),
-            crate::expert_residency::ttm_pool_estimate(),
-        )
-        .and_then(|()| {
-            crate::expert_residency::check_gtt_cap(
-                mirror_bytes,
-                crate::expert_residency::gtt_budget(),
-            )
-        });
-        if let Err(reason) = admitted {
+            bundle.weights.ep_later_host_bytes,
+        ) {
             return off(&format!("restore copies: {reason}"));
         }
         let parts =

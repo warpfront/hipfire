@@ -1320,17 +1320,10 @@ impl Qwen4ExpertStage {
                 Ok(bytes) => bytes,
                 Err(reason) => return off(&reason),
             };
-            let admitted = crate::expert_residency::check_host_ram(
+            let admitted = crate::expert_residency::admit_stage_mirrors(
                 mirror_bytes,
-                rdna_compute::kv_slots::mem_available_bytes(),
-                crate::expert_residency::ttm_pool_estimate(),
-            )
-            .and_then(|()| {
-                crate::expert_residency::check_gtt_cap(
-                    mirror_bytes,
-                    crate::expert_residency::gtt_budget(),
-                )
-            });
+                bundle.weights.ep_later_host_bytes,
+            );
             if let Err(reason) = admitted {
                 return off(&format!("restore copies: {reason}"));
             }
@@ -2141,27 +2134,20 @@ impl Qwen4ExpertStage {
             Ok([&weights.experts_gate_up, &weights.experts_down])
         };
         // A borrowed stage's pinned restore copies of the two lent layers sit on top of the
-        // placement's pinned experts: refused here as the S2 stage refuses its own (the loader's
-        // plan-time aggregate check already counted them).
+        // placement's pinned experts: refused here as the S2 stage refuses its own. Only this
+        // rank's copies: the later ranks' are in `ep_later_host_bytes` already (the loader's
+        // `qwen4_unit_borrow_restore_bytes` per pending rank).
         if let Some(lent) = borrow {
-            let layer_bytes = (0..placement.ranks)
-                .map(|rank| plan.stage_borrow_buffer_bytes(rank).iter().sum::<u64>())
-                .max()
-                .unwrap_or(0) as usize;
-            let mirror_bytes =
-                crate::expert_residency::expert_stage_mirror_bytes(layer_bytes, placement.ranks)
-                    .map_err(invalid)?;
-            let admitted = crate::expert_residency::check_host_ram(
+            let layer_bytes = plan
+                .stage_borrow_buffer_bytes(placement.rank)
+                .iter()
+                .sum::<u64>() as usize;
+            let mirror_bytes = crate::expert_residency::expert_stage_mirror_bytes(layer_bytes, 1)
+                .map_err(invalid)?;
+            let admitted = crate::expert_residency::admit_stage_mirrors(
                 mirror_bytes,
-                rdna_compute::kv_slots::mem_available_bytes(),
-                crate::expert_residency::ttm_pool_estimate(),
-            )
-            .and_then(|()| {
-                crate::expert_residency::check_gtt_cap(
-                    mirror_bytes,
-                    crate::expert_residency::gtt_budget(),
-                )
-            });
+                bundle.weights.ep_later_host_bytes,
+            );
             if let Err(reason) = admitted {
                 return off(&format!(
                     "restore copies of the lent stage layers: {reason}"

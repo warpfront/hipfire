@@ -3750,6 +3750,43 @@ pub(crate) fn expert_stage_mirror_bytes(layer_bytes: usize, ranks: usize) -> Res
         .ok_or_else(|| "expert stage mirror host charge overflow or zero ranks".to_string())
 }
 
+/// The stage mirrors rank `rank` still has to see room for: its own and the
+/// later ranks' ([`expert_stage_mirror_bytes`] of `ranks - rank`). Earlier
+/// ranks already pinned theirs, so live MemAvailable no longer holds them.
+pub(crate) fn pending_stage_mirror_bytes(
+    layer_bytes: usize,
+    rank: usize,
+    ranks: usize,
+) -> Result<u64, String> {
+    expert_stage_mirror_bytes(layer_bytes, ranks.saturating_sub(rank))
+}
+
+/// Admit stage restore mirrors on the placement ledger: `mirror_bytes` plus
+/// `later_host_bytes`, the later ranks' placement pins that land after this
+/// rank's forward attaches (`Qwen4Weights::ep_later_host_bytes`). Without the
+/// latter, rank 0 can stage into host RAM rank 1's experts need, and the EP
+/// load fails where unstaged it would fit.
+pub(crate) fn admit_stage_mirrors(mirror_bytes: u64, later_host_bytes: u64) -> Result<(), String> {
+    admit_stage_mirrors_on(
+        mirror_bytes,
+        later_host_bytes,
+        rdna_compute::kv_slots::mem_available_bytes(),
+        ttm_pool_estimate(),
+        gtt_budget(),
+    )
+}
+
+fn admit_stage_mirrors_on(
+    mirror_bytes: u64,
+    later_host_bytes: u64,
+    mem_available: Option<u64>,
+    ttm_pool_bytes: u64,
+    gtt: Option<GttBudget>,
+) -> Result<(), String> {
+    let charge = mirror_bytes.saturating_add(later_host_bytes);
+    check_host_ram(charge, mem_available, ttm_pool_bytes).and_then(|()| check_gtt_cap(charge, gtt))
+}
+
 /// Pinned host RAM/GTT the borrowed slab stage's two donor restore copies take
 /// (`gpu_forward::slab_stage`): the overwritten arena prefix of each parity
 /// (`window`: the largest cold arena plus tail pad, or the whole donor
@@ -8170,6 +8207,47 @@ mod tests {
         );
         assert!(expert_stage_mirror_bytes(full, 0).is_err());
         assert!(expert_stage_mirror_bytes(usize::MAX, 2).is_err());
+    }
+
+    /// HIPF-214: walk an EP2 load rank by rank on one host. Rank 0 pins its
+    /// experts, attaches its forward (G2 stage), then rank 1 pins. Rank 0 may
+    /// stage only when rank 1's expert pin still fits afterwards.
+    #[test]
+    fn stage_admission_leaves_room_for_later_ranks_expert_pins() {
+        const GIB: u64 = 1 << 30;
+        let layer = 512 * (1_740_800 + 870_400) / 2;
+        let mirror = expert_stage_mirror_bytes(layer, 1).unwrap();
+        let experts = [20 * GIB, 20 * GIB];
+        // Returns (rank 0 staged, rank 1 staged), or the rank whose expert pin fails.
+        let walk = |mut available: u64| -> Result<[bool; 2], usize> {
+            let mut staged = [false; 2];
+            for rank in 0..2 {
+                // The loader's placement check: this rank and every later rank's pins.
+                check_host_ram(experts[rank..].iter().sum(), Some(available), 0)
+                    .map_err(|_| rank)?;
+                available -= experts[rank];
+                let pending = pending_stage_mirror_bytes(layer, rank, 2).unwrap();
+                let later = experts[rank + 1..].iter().sum();
+                staged[rank] =
+                    admit_stage_mirrors_on(pending, later, Some(available), 0, None).is_ok();
+                if staged[rank] {
+                    available -= mirror;
+                }
+            }
+            Ok(staged)
+        };
+        let base = experts[0] + experts[1] + HOST_RAM_HEADROOM_BYTES;
+        // Room for everything: both ranks stage.
+        assert_eq!(walk(base + 2 * mirror), Ok([true, true]));
+        // The old window (A - E0 - E1 - H < M0, both expert checks pass): no rank
+        // stages, and rank 1's experts still pin.
+        for available in [base, base + mirror / 2, base + 2 * mirror - 1] {
+            let staged = walk(available).expect("rank 1 expert pin must fit");
+            assert!(!staged[0], "rank 0 staged into rank 1's pin at {available}");
+        }
+        // Rank 1 sees only its own mirror: earlier ranks' pins are already live.
+        assert_eq!(pending_stage_mirror_bytes(layer, 1, 2).unwrap(), mirror);
+        assert_eq!(pending_stage_mirror_bytes(layer, 0, 2).unwrap(), 2 * mirror);
     }
 
     #[test]
