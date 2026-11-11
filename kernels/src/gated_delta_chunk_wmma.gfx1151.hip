@@ -12,9 +12,15 @@
 //   O    = e^G (q S) + (q k^T e^{G_i - G_j}, j <= i) Vnew
 //   S    = e^{G_last} S + (k e^{G_last - G})^T Vnew
 // T = (I - L)^-1 is computed in F32 by forward substitution (L is strictly lower), then
-// rounded to F16 for the WMMA operand.  The other products are F16 WMMA with F32
-// accumulation (q/k are BF16 values; S, T, Vnew and the decayed operands round to F16),
-// so the route is KLD-gated; the gate is gated_delta_gate_bf16_f32_batched's expression.
+// rounded to F16.  The products against the state and the Gram matrices are F16 WMMA with F32
+// accumulation (q/k are BF16 values; S, T, Vnew and the decayed operands round to F16), so the
+// route is KLD-gated; the gate is gated_delta_gate_bf16_f32_batched's expression.  The two
+// lower-triangular products (T Dm and P Vnew, over the chunk's own rows) are F32 fma in
+// ascending row order on the F16-rounded operands, not WMMA: the WMMA sum of a row whose
+// A operand is zero past the diagonal still depends (one F32 ulp) on the B rows past it, i.e. on
+// rows that arrive later, so a partial chunk's published rows would differ from the same
+// rows of the completed chunk.  Row i's output here depends only on rows <= i, so any
+// partition of the stream into calls (gdn_wy_stream) reproduces the one-call bytes.
 // Wave w owns value columns 16w .. 16w + 15 of S as eight C-layout tiles in
 // registers; a C tile becomes a B operand by swapping half-waves.  The next
 // chunk's inputs are prefetched into registers during the current one; the
@@ -56,6 +62,37 @@ static __device__ __forceinline__ gc_h16 gc_c_to_b(const gc_f8 c, int hi) {
     }
     return __builtin_bit_cast(gc_h16, out);
 }
+// C-layout tile (lane: column l16, rows 2r + hi) -> every row of this lane's column, each rounded
+// to F16 and widened (the B-operand value the WMMA form consumed), by swapping half-waves.
+static __device__ __forceinline__ void gc_c_to_col(const gc_f8 c, int hi, float (&col)[16]) {
+#pragma unroll
+    for (int r = 0; r < 8; ++r) {
+        const float own = (float)(_Float16)c[r];
+        const float oth = __builtin_bit_cast(float, __builtin_amdgcn_permlanex16(
+            __builtin_bit_cast(unsigned int, own), __builtin_bit_cast(unsigned int, own), 0x76543210u, 0xfedcba98u, false, false));
+        col[2 * r] = hi ? oth : own;
+        col[2 * r + 1] = hi ? own : oth;
+    }
+}
+// Lower-triangular product R[2r + hi] = sum_{m <= 2r + hi} A[2r + hi][m] * col[m] in the C layout
+// (F32 fma, m ascending).  A WMMA product over the full 16-row K also sums A == 0 terms whose
+// B operand rows lie past the row's own, and the hardware sum is not neutral to them (one F32 ulp):
+// a row's value would depend on later rows, so the tile's rows could not be published before the
+// tile is complete.  Here row i reads columns m <= i only; the m = 2r + 1 term is selected out for
+// the even row, not multiplied by a zero.
+static __device__ __forceinline__ gc_f8 gc_tri(const float (*A)[16], const float (&col)[16], int hi) {
+    gc_f8 R;
+#pragma unroll
+    for (int r = 0; r < 8; ++r) {
+        const float* ar = &A[2 * r + hi][0];
+        float acc = 0.f;
+#pragma unroll
+        for (int m = 0; m <= 2 * r; ++m) acc = fmaf(ar[m], col[m], acc);
+        const float last = fmaf(ar[2 * r + 1], col[2 * r + 1], acc);
+        R[r] = hi ? last : acc;
+    }
+    return R;
+}
 // gfx1151: six waves per SIMD (<= 240 VGPRs: 1536-VGPR files, 24-VGPR granules) keeps three
 // 8-wave blocks per WGP, so its 20 WGPs hold all 48 value-head blocks at once; at five waves
 // only 40 fit and the other 8 heads run as a second serial pass over every chunk.  gfx1100's
@@ -84,8 +121,8 @@ extern "C" __global__ void gated_delta_chunk_gate_wmma(
     __shared__ __align__(16) _Float16 kb_s[16][136];   // k beta e^G rows
     __shared__ __align__(16) _Float16 kdT[128][16];    // (k e^{GL-G})^T
     __shared__ float vb_s[16][132];                    // v beta rows (F32)
-    __shared__ __align__(16) _Float16 t_s[16][16];
-    __shared__ __align__(16) _Float16 p_s[16][16];
+    __shared__ __align__(16) float t_f[16][16];      // T, rounded to F16
+    __shared__ __align__(16) float p_f[16][16];      // P, rounded to F16
     __shared__ float g_s[16], bt_s[16], inv_s[16];
     __shared__ __align__(16) unsigned short out_s[16][136];
     const int dv0 = wave * 16;
@@ -226,7 +263,7 @@ extern "C" __global__ void gated_delta_chunk_gate_wmma(
                 Tc[i] = acc;
                 // Rows 0..14 round F32 then F16; row 15's last fma has no other use and rounds
                 // straight to F16 (v_fma_mix), exactly as the landed per-row-store kernel did.
-                t_s[i][l16] = (_Float16)(i < 15 ? gc_opaque(acc) : acc);
+                t_f[i][l16] = (float)(_Float16)(i < 15 ? gc_opaque(acc) : acc);
             }
         } else if (wave == 1) {
             gc_f8 c = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -236,7 +273,7 @@ extern "C" __global__ void gated_delta_chunk_gate_wmma(
 #pragma unroll
             for (int r = 0; r < 8; ++r) {
                 const int i = 2 * r + hi, j = l16;
-                p_s[i][j] = (_Float16)(j <= i ? c[r] * expf(g_s[i] - g_s[j]) : 0.f);
+                p_f[i][j] = (float)(_Float16)(j <= i ? c[r] * expf(g_s[i] - g_s[j]) : 0.f);
             }
         }
         // K' = (k beta e^G) S and O_inter = Q S on this wave's slice (S as B from registers).
@@ -251,11 +288,12 @@ extern "C" __global__ void gated_delta_chunk_gate_wmma(
 #pragma unroll
         for (int r = 0; r < 8; ++r) Dm[r] = vb_s[2 * r + hi][dv0 + l16] - Ks[r];
         GC_BARRIER();  // T, P ready
-        gc_f8 Vn = {0, 0, 0, 0, 0, 0, 0, 0};
-        Vn = GC_WMMA(*(const gc_h16*)&t_s[l16][0], gc_c_to_b(Dm, hi), Vn);
+        float dmc[16], vbc[16];
+        gc_c_to_col(Dm, hi, dmc);
+        const gc_f8 Vn = gc_tri(t_f, dmc, hi);
         const gc_h16 vb = gc_c_to_b(Vn, hi);
-        gc_f8 O = {0, 0, 0, 0, 0, 0, 0, 0};
-        O = GC_WMMA(*(const gc_h16*)&p_s[l16][0], vb, O);
+        gc_c_to_col(Vn, hi, vbc);
+        const gc_f8 O = gc_tri(p_f, vbc, hi);
 #pragma unroll
         for (int r = 0; r < 8; ++r) {
             const int i = 2 * r + hi;
