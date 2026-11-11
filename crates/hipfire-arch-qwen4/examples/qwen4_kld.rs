@@ -29,6 +29,8 @@
 //!                    [--sequence-range START:END]
 //!   qwen4_kld speed --model MODEL.hfq --prompt-file PROMPT.txt --output OUT.json \
 //!                    [--product-prompt] [--decode-tokens 128] [--speed-warmup 8] [--reps 2]
+//!   qwen4_kld chunklogits --model MODEL.hfq --prompts A.txt,B.txt[,..] --max-prompt N \
+//!                    --schedules single,c512,h25,t25,.. --output DIR   (G3 chunk invariance)
 //!   qwen4_kld pair --base BASE.npy --cand CAND.npy --corpus CORPUS.json --output OUT.json
 //! `pair` (S1 slow-link gate, CPU-only) reads two full-gate `s11ref --decode`
 //! outputs (each with its OUT.npy.json receipt) over the same reference and
@@ -223,7 +225,7 @@ impl HotsetPin {
         if self.sidecar.is_some() && self.budget_mib.is_none() {
             return Err("--hotset requires a nonzero --hot-budget-mib".into());
         }
-        if self.budget_mib.is_some() && !matches!(mode, "ref" | "eval" | "s11ref" | "speed") {
+        if self.budget_mib.is_some() && !matches!(mode, "ref" | "eval" | "s11ref" | "speed" | "chunklogits") {
             return Err("--hot-budget-mib and --hotset require ref, eval, s11ref or speed".into());
         }
         if self.untiered.is_some() {
@@ -2125,6 +2127,134 @@ fn speed(
     Ok(())
 }
 
+/// One outer-call schedule of `chunklogits`: `single` (one forward), `c<K>` (consecutive
+/// forwards of K rows), `h<K>` (a K-row forward, then the rest), `t<K>` (everything but the
+/// last K rows, then those K).
+fn chunk_schedule(name: &str, n: usize) -> Result<Vec<usize>, String> {
+    let k = |t: &str| -> Result<usize, String> {
+        let k: usize = t.parse().map_err(|_| format!("schedule {name}: bad rows"))?;
+        if k == 0 || k >= n {
+            return Err(format!("schedule {name}: rows {k} out of 1..{n}"));
+        }
+        Ok(k)
+    };
+    Ok(match name {
+        "single" => vec![n],
+        _ if name.starts_with('c') => {
+            let k = k(&name[1..])?;
+            let mut v = vec![k; n / k];
+            if n % k != 0 {
+                v.push(n % k);
+            }
+            v
+        }
+        _ if name.starts_with('h') => {
+            let k = k(&name[1..])?;
+            vec![k, n - k]
+        }
+        _ if name.starts_with('t') => {
+            let k = k(&name[1..])?;
+            vec![n - k, k]
+        }
+        _ => return Err(format!("unknown schedule {name}")),
+    })
+}
+
+/// KL(p || q) of two logit rows over the full vocabulary in f64.
+fn full_vocab_kl(p: &[f32], q: &[f32]) -> f64 {
+    fn log_softmax(x: &[f32]) -> Vec<f64> {
+        let max = x.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b)) as f64;
+        let lse = x.iter().map(|&v| (v as f64 - max).exp()).sum::<f64>().ln() + max;
+        x.iter().map(|&v| v as f64 - lse).collect()
+    }
+    let (lp, lq) = (log_softmax(p), log_softmax(q));
+    lp.iter().zip(&lq).map(|(a, b)| a.exp() * (a - b)).sum()
+}
+
+/// G3: the final-row logits of each prompt under every outer-call schedule against the
+/// single-call reference (KL over the full vocabulary, max |difference|, byte identity).
+/// Each prefill is `forward_chunk_final` calls from a freshly reset state (the ordinary
+/// prefill route). The reference is run twice to prove it repeats.
+fn chunklogits(
+    model: &Path,
+    prompts: &[PathBuf],
+    max_prompt: usize,
+    schedules: &[String],
+    output: &Path,
+    pin: &HotsetPin,
+) -> Result<(), String> {
+    let hfq = HfqFile::open(model).map_err(|e| e.to_string())?;
+    let tok =
+        Tokenizer::from_hfq_metadata(&hfq.metadata_json).map_err(|e| format!("tokenizer: {e}"))?;
+    let mut sets = Vec::new();
+    for path in prompts {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("read {}: {e}", path.display()))?;
+        let mut ids = tok.encode(&text);
+        if ids.len() < max_prompt {
+            return Err(format!("{}: {} tokens < --max-prompt {max_prompt}", path.display(), ids.len()));
+        }
+        ids.truncate(max_prompt);
+        sets.push(ids);
+    }
+    drop(tok);
+    drop(hfq);
+    std::fs::create_dir_all(output).map_err(|e| e.to_string())?;
+    let mut m = Model::load(model, max_prompt + 8, 1, None, pin)?;
+    let row = m.logits.sub_offset(0, m.vocab);
+    let mut cells = Vec::new();
+    let mut worst_kl = 0f64;
+    for (pi, ids) in sets.iter().enumerate() {
+        let mut run = |m: &mut Model, name: &str| -> Result<Vec<f32>, String> {
+            let parts = chunk_schedule(name, ids.len())?;
+            m.bundle.reset(&mut m.gpu).map_err(|e| e.to_string())?;
+            let mut at = 0;
+            for part in parts {
+                m.bundle
+                    .forward_chunk_final(&mut m.gpu, &ids[at..at + part], &row, None)
+                    .map_err(|e| format!("{name}: {e}"))?;
+                at += part;
+            }
+            let v = m.gpu.download_f32(&row).map_err(|e| e.to_string())?;
+            if v.iter().any(|x| !x.is_finite()) {
+                return Err(format!("{name}: non-finite logits"));
+            }
+            Ok(v)
+        };
+        let reference = run(&mut m, "single")?;
+        let repeat = run(&mut m, "single")?;
+        let bytes = |v: &[f32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let ref_bytes = bytes(&reference);
+        std::fs::write(output.join(format!("p{pi}-single.f32")), &ref_bytes).map_err(|e| e.to_string())?;
+        let sha = |b: &[u8]| format!("{:x}", Sha256::digest(b));
+        println!("CHUNKLOGITS prompt={pi} tokens={} schedule=single repeat_identical={} sha256={}", ids.len(), repeat == reference, sha(&ref_bytes));
+        cells.push(serde_json::json!({"prompt": pi, "schedule": "single-repeat", "identical": repeat == reference}));
+        for name in schedules.iter().filter(|s| s.as_str() != "single") {
+            let got = run(&mut m, name)?;
+            let kl = full_vocab_kl(&reference, &got);
+            let maxabs = reference.iter().zip(&got).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            let identical = got == reference;
+            worst_kl = worst_kl.max(kl);
+            let argmax = |v: &[f32]| v.iter().enumerate().fold((0, f32::MIN), |a, (i, &x)| if x > a.1 { (i, x) } else { a }).0;
+            println!("CHUNKLOGITS prompt={pi} tokens={} schedule={name} kl={kl:.3e} maxabs={maxabs:.3e} identical={identical} argmax_equal={} sha256={}", ids.len(), argmax(&got) == argmax(&reference), sha(&bytes(&got)));
+            cells.push(serde_json::json!({"prompt": pi, "tokens": ids.len(), "schedule": name, "kl": kl, "maxabs": maxabs, "identical": identical}));
+        }
+    }
+    let binary = std::env::current_exe().map_err(|e| e.to_string())?;
+    let receipt = serde_json::json!({
+        "schema": "hipfire.qwen4.chunklogits.v1",
+        "model": model.display().to_string(),
+        "binary_sha256": artifact_id(&binary)?.sha256,
+        "arch": m.gpu.arch.to_string(),
+        "prompts": prompts.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+        "max_prompt": max_prompt, "worst_kl": worst_kl, "cells": cells,
+    });
+    std::fs::write(output.join("receipt.json"), serde_json::to_string_pretty(&receipt).map_err(|e| e.to_string())? + "\n")
+        .map_err(|e| e.to_string())?;
+    println!("CHUNKLOGITS worst_kl={worst_kl:.3e}");
+    Ok(())
+}
+
 /// Little-endian f64 rows of a 1-D `.npy` as `write_kl_npy` writes them.
 fn read_kl_npy(path: &Path) -> Result<Vec<f64>, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
@@ -2288,6 +2418,7 @@ fn run_args(mut args: impl Iterator<Item = String>) -> Result<(), String> {
     let (mut decode_tokens, mut speed_warmup, mut reps, mut max_prompt) =
         (128usize, 8usize, 2usize, None::<usize>);
     let (mut tail_split, mut score_tail) = (None, None);
+    let (mut prompts, mut schedules): (Vec<PathBuf>, Vec<String>) = (Vec::new(), Vec::new());
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value"));
         let number = |v: String| v.parse::<usize>().map_err(|e| format!("{flag}: {e}"));
@@ -2325,6 +2456,8 @@ fn run_args(mut args: impl Iterator<Item = String>) -> Result<(), String> {
             "--speed-warmup" => speed_warmup = number(value()?)?,
             "--reps" => reps = number(value()?)?,
             "--max-prompt" => max_prompt = Some(number(value()?)?),
+            "--prompts" => prompts = value()?.split(',').map(PathBuf::from).collect(),
+            "--schedules" => schedules = value()?.split(',').map(str::to_owned).collect(),
             "--tail-split" => match number(value()?)? {
                 0 => return Err("--tail-split: rows must be positive".into()),
                 rows => tail_split = Some(rows),
@@ -2411,6 +2544,13 @@ fn run_args(mut args: impl Iterator<Item = String>) -> Result<(), String> {
                 product_prompt,
                 &pin,
             )
+        }
+        ("chunklogits", Some(model), None, None, Some(output)) => {
+            let max_prompt = max_prompt.ok_or("chunklogits requires --max-prompt")?;
+            if prompts.is_empty() || schedules.is_empty() {
+                return Err("chunklogits requires --prompts and --schedules".into());
+            }
+            chunklogits(&model, &prompts, max_prompt, &schedules, &output, &pin)
         }
         ("pair", None, None, None, Some(output)) => {
             // CPU-only: the paired candidate-minus-beta verdict over two

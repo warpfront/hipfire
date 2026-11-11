@@ -5108,7 +5108,14 @@ impl Qwen4Bundle {
         self.share_prompt_begin();
         let result = self.prefill_final_tiles(gpu, prompt, reused, logits);
         let finish = self.share_prompt_end(gpu, result.is_ok());
-        result.and(finish)
+        // The terminal fence of the ordinary-prefill phase: the real prompt end, once (never a
+        // tile, session boundary or checkpoint), before decode/verify reads the live slot.
+        let sealed = if result.is_ok() {
+            self.state.seal_gdn_streams(gpu).map_err(BundleError::State)
+        } else {
+            Ok(())
+        };
+        result.and(finish).and(sealed)
     }
 
     /// The chunk loop of [`Self::prefill_final_from`].

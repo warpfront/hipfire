@@ -474,6 +474,13 @@ fn native_trunk_prefill_scope(
     prefill && iu4 && arch == "gfx1151" && mode == Qwen4ForwardScratchMode::Full
 }
 
+/// Whether an ordinary prefill forward runs under the canonical-recipe intent
+/// ([`Gpu::ordinary_prefill_enter`]): every prefill forward, one-row tails included, except on
+/// gfx942, whose pinned canonical-routing scope and AR route stay as they are.
+pub(crate) fn ordinary_prefill_applies(prefill_scope: bool, arch: &str) -> bool {
+    prefill_scope && arch != "gfx942"
+}
+
 /// gfx942 pins canonical prefill routing; gfx1151 retains its opt-in profile.
 fn trunk_prefill_invariant_scope(prefill: bool, arch: &str, rdna_opt_in: bool) -> bool {
     prefill && (arch == "gfx942" || (arch == "gfx1151" && rdna_opt_in))
@@ -9710,6 +9717,8 @@ pub(crate) struct TileScopes {
     ep_a8: bool,
     sym_floor: usize,
     lwmma_floor: usize,
+    /// The ordinary-prefill intent this entry opened (`Some(previous)`), restored on leave.
+    ordinary: Option<bool>,
 }
 
 /// How a prefill chunk's staged PLE rows reach the device.
@@ -15849,11 +15858,20 @@ impl Qwen4GpuForward {
                 self.scratch.max_chunk
             )));
         }
-        let (pm_invariant, append) = Self::route_scopes(route == MeshRoute::Prefill, gpu, rows);
+        let ordinary_scope = ordinary_prefill_applies(route == MeshRoute::Prefill, &gpu.arch);
+        let ordinary = ordinary_scope.then(|| gpu.ordinary_prefill_enter());
+        let (pm_invariant, append) = if ordinary_scope {
+            (false, false)
+        } else {
+            Self::route_scopes(route == MeshRoute::Prefill, gpu, rows)
+        };
         let prior = std::mem::replace(&mut gpu.prefill_invariant_scope, pm_invariant || append);
         let route_rows = gpu.route_rows(rows);
         let bf16_streams = gpu.qwen4_bf16_streams(rows);
         gpu.prefill_invariant_scope = prior;
+        if let Some(prev) = ordinary {
+            gpu.ordinary_prefill_exit(prev);
+        }
         let stream_bytes = rows
             .checked_mul(program_dims(&bundle.config).wide())
             .and_then(|elements| elements.checked_mul(if bf16_streams { 2 } else { 4 }))
@@ -16127,7 +16145,16 @@ impl Qwen4GpuForward {
     /// every S1 layer-major tile so both see identical routing.
     pub(crate) fn enter_tile_scopes(&self, gpu: &mut Gpu, rows: usize) -> (TileScopes, bool) {
         let scope = std::mem::replace(&mut gpu.qwen4_scope, true);
-        let (pm_invariant, append) = Self::route_scopes(self.prefill_scope, gpu, rows);
+        // Ordinary prefill takes the typed intent instead of the invariant profile / agent-turn
+        // append scopes: the canonical recipe for every row, never the append route's
+        // symmetric-MoE suppression or the invariant profile's trunk IU4 exclusion.
+        let ordinary_scope = ordinary_prefill_applies(self.prefill_scope, &gpu.arch);
+        let ordinary = ordinary_scope.then(|| gpu.ordinary_prefill_enter());
+        let (pm_invariant, append) = if ordinary_scope {
+            (false, false)
+        } else {
+            Self::route_scopes(self.prefill_scope, gpu, rows)
+        };
         if append {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| {
@@ -16217,6 +16244,7 @@ impl Qwen4GpuForward {
                 ep_a8,
                 sym_floor,
                 lwmma_floor,
+                ordinary,
             },
             append,
         )
@@ -16231,6 +16259,9 @@ impl Qwen4GpuForward {
         gpu.qwen4_ep_a8_scope = saved.ep_a8;
         gpu.qwen4_moe_sym_iu4_floor = saved.sym_floor;
         gpu.qwen4_prefill_lwmma_floor = saved.lwmma_floor;
+        if let Some(prev) = saved.ordinary {
+            gpu.ordinary_prefill_exit(prev);
+        }
     }
 
     /// Bank and runtime selection, the only place decode-share state changes.

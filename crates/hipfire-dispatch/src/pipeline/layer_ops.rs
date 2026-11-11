@@ -972,6 +972,34 @@ fn project_trunk_masked_inner(
                     }
                 }
             }
+            // Ordinary prefill: EVERY IU4 trunk projection of a ragged tile (not only the
+            // Z|beta|alpha fold) takes the canonical padded tile, so a row's bytes never depend
+            // on whether it lands in a whole or a partial 128-row tile. A projection that cannot
+            // be padded (output capacity) is an error, never a silent fall to another recipe.
+            if gpu.ordinary_prefill_active() && !gpu.qwen4_trunk_iu4_applies(rows) {
+                if let Some(n_pad) = gpu.qwen4_trunk_iu4_ragged(rows) {
+                    let rest: SmallVec<[usize; 4]> = mq4
+                        .iter()
+                        .copied()
+                        .filter(|&j| a4[j] && !done[j])
+                        .collect();
+                    if !rest.is_empty() {
+                        let padded: SmallVec<[(&GpuTensor, usize, &GpuTensor); 4]> = rest
+                            .iter()
+                            .map(|&j| (projections[j].0.buf, projections[j].0.m, projections[j].1))
+                            .collect();
+                        if !hip(gpu.qwen4_trunk_set_ragged(input, rows, n_pad, k, &padded))? {
+                            return Err(DispatchError::Hip(format!(
+                                "ordinary prefill: ragged IU4 projection of {rows} rows (padded {n_pad}) \
+                                 has no dedicated padded output extent"
+                            )));
+                        }
+                        for j in rest {
+                            done[j] = true;
+                        }
+                    }
+                }
+            }
             if !dense.is_empty() {
                 let reservation = hip(gpu.reserve_int4_mmq(k, rows))?;
                 let prepared =

@@ -1544,6 +1544,10 @@ pub fn f16_shadow_route_rows_with(
     append_min_rows: usize,
     pm_invariant_enabled: bool,
 ) -> usize {
+    // Ordinary prefill runs under the typed intent (canonical routing for every row count).
+    if crate::gpu_forward::ordinary_prefill_applies(true, arch) {
+        return chunk_rows.max(rdna_compute::prefill_invariant::QWEN4_PREFILL_CANON_ROWS);
+    }
     // The batch-invariant flag does not depend on the row count, and the append
     // route is open for rows in `append_min_rows..512`: some prefill forward of
     // at most `chunk_rows` rows runs scoped iff the largest sub-512-row size does.

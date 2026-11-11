@@ -1988,16 +1988,21 @@ fn ef_capture_diags(cap: &EfSnap, reference: &Reference, rows: usize) -> Vec<Dia
     ]
 }
 
-/// AR-with-EF after row `keep - 1` against the rollback-plus-reset state
-/// (never failing; expected to differ).
+/// AR-with-EF after row `keep - 1` against the rollback state: slot, residual
+/// and their effective state (never failing).
 fn ef_rollback_diags(snap: &EfSnap, reference: &Reference, keep: usize) -> Vec<Diag> {
     let row = keep - 1;
     vec![
         diag_q8("ar_vs_rollback_slot", &snap.kept, &reference.states[row]),
         diag_effective(
             "ar_vs_rollback_effective_state",
-            &effective_state(&snap.kept, None),
+            &effective_state(&snap.kept, Some(&snap.residual)),
             &effective_state(&reference.states[row], Some(&reference.residuals[row])),
+        ),
+        diag_f16(
+            "ar_vs_rollback_residual",
+            &snap.residual,
+            &reference.residuals[row],
         ),
         diag_f32(
             "ar_vs_rollback_discard",
