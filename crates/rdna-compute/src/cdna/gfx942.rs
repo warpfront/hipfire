@@ -194,6 +194,33 @@ pub struct Qwen4GdnLanesF32Shape {
     pub value_dim: usize,
 }
 
+/// Bind the lanes kernel: the hipcc source (the anchor object), or, only when
+/// `HIPFIRE_QWEN4_G942_GDN_LANES_IMAGE=/absolute/device.elf` names one, that explicitly supplied
+/// code object (the Route-A twin proof: same module, same entry name, loaded through
+/// `ensure_embedded_kernel`). Unset: the source, unchanged.
+fn g942_gdn_lanes_ensure(gpu: &mut Gpu) -> HipResult<()> {
+    match hipfire_config::developer_var("HIPFIRE_QWEN4_G942_GDN_LANES_IMAGE") {
+        Ok(path) if !path.is_empty() => {
+            let bytes = std::fs::read(&path).map_err(|error| {
+                hip_bridge::HipError::new(
+                    0,
+                    &format!("HIPFIRE_QWEN4_G942_GDN_LANES_IMAGE {path}: {error}"),
+                )
+            })?;
+            gpu.ensure_embedded_kernel(
+                QWEN4_GDN_LANES_F32_KERNEL,
+                std::sync::Arc::<[u8]>::from(bytes),
+                QWEN4_GDN_LANES_F32_KERNEL,
+            )
+        }
+        _ => gpu.ensure_kernel(
+            QWEN4_GDN_LANES_F32_KERNEL,
+            QWEN4_GDN_LANES_F32_SRC,
+            QWEN4_GDN_LANES_F32_KERNEL,
+        ),
+    }
+}
+
 /// A mutable GPU borrow proven to target exact gfx942.
 ///
 /// The constructor is intentionally available only through Gpu::try_gfx942.
@@ -1768,11 +1795,7 @@ impl Gfx942Device<'_> {
         }
         let table = self.gpu.gdn_lanes_f32_tables.tables[&key].0.as_ptr();
         self.gpu.bind_thread()?;
-        self.gpu.ensure_kernel(
-            QWEN4_GDN_LANES_F32_KERNEL,
-            QWEN4_GDN_LANES_F32_SRC,
-            QWEN4_GDN_LANES_F32_KERNEL,
-        )?;
+        g942_gdn_lanes_ensure(&mut *self.gpu)?;
         let (rv, qv, khv, vhv, kdv, vdv) = (
             rows as i32,
             qkv as i32,
