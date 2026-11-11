@@ -37093,7 +37093,7 @@ impl Gpu {
             _ => {
                 return Err(hip_bridge::HipError::new(
                     1,
-                    "gemm_qkvza_mq4g256v2_wmma_gfx1100_bt: batch_tile must be 1, 4 or 12",
+                    "gemm_qkvza_mq4g256v2_wmma_gfx1100_bt: batch_tile must be 4 or 12",
                 ));
             }
         };
@@ -37346,7 +37346,7 @@ impl Gpu {
             _ => {
                 return Err(hip_bridge::HipError::new(
                     1,
-                    "gemm_qkvza_mq4g256v2_wmma_gfx1151_bt: batch_tile must be 1, 4 or 12",
+                    "gemm_qkvza_mq4g256v2_wmma_gfx1151_bt: batch_tile must be 4 or 12",
                 ));
             }
         };
@@ -37869,7 +37869,7 @@ impl Gpu {
             _ => {
                 return Err(hip_bridge::HipError::new(
                     1,
-                    "gemm_qkv_mq4g256v2_wmma_gfx1100_bt: batch_tile must be 1, 4 or 12",
+                    "gemm_qkv_mq4g256v2_wmma_gfx1100_bt: batch_tile must be 4 or 12",
                 ));
             }
         };
@@ -38093,7 +38093,7 @@ impl Gpu {
             _ => {
                 return Err(hip_bridge::HipError::new(
                     1,
-                    "gemm_qkv_mq4g256v2_wmma_gfx1151_bt: batch_tile must be 1, 4 or 12",
+                    "gemm_qkv_mq4g256v2_wmma_gfx1151_bt: batch_tile must be 4 or 12",
                 ));
             }
         };
@@ -39747,7 +39747,7 @@ impl Gpu {
             _ => {
                 return Err(hip_bridge::HipError::new(
                     1,
-                    "gemm_gate_up_mq4g256v2_wmma_gfx1100_bt: batch_tile must be 1, 6 or 12",
+                    "gemm_gate_up_mq4g256v2_wmma_gfx1100_bt: batch_tile must be 6 or 12",
                 ));
             }
         };
@@ -40058,7 +40058,7 @@ impl Gpu {
             _ => {
                 return Err(hip_bridge::HipError::new(
                     1,
-                    "gemm_gate_up_mq4g256v2_wmma_gfx1151_bt: batch_tile must be 1, 6 or 12",
+                    "gemm_gate_up_mq4g256v2_wmma_gfx1151_bt: batch_tile must be 6 or 12",
                 ));
             }
         };
@@ -41964,7 +41964,7 @@ impl Gpu {
             _ => {
                 return Err(hip_bridge::HipError::new(
                     1,
-                    "gemm_mq4g256v2_residual_wmma_gfx1100_bt: batch_tile must be 1,4,6,8",
+                    "gemm_mq4g256v2_residual_wmma_gfx1100_bt: batch_tile must be 4,6,8",
                 ));
             }
         };
@@ -42022,7 +42022,9 @@ impl Gpu {
     /// (no BT reuse) as the N<96 reference arm. Mirrors the dispatcher
     /// fallthrough path (`GEMM_MQ4G256V2_RESIDUAL_WMMA_SRC`, grid
     /// ceil(M/16) x ceil(N/16)). Eager-only throwaway for the T0
-    /// differential; not wired into dispatch.
+    /// differential; not wired into dispatch. Lab-only: the sole caller is
+    /// the lab-gated `tmp_lloyd_gfx11_t0` example.
+    #[cfg(feature = "lab")]
     pub fn gemm_mq4g256v2_residual_wmma_base(
         &mut self,
         a_raw: &GpuTensor,
@@ -42563,7 +42565,7 @@ impl Gpu {
             _ => {
                 return Err(hip_bridge::HipError::new(
                     1,
-                    "gemm_mq4g256v2_residual_wmma_gfx1151_bt: batch_tile must be 1,4,6,8",
+                    "gemm_mq4g256v2_residual_wmma_gfx1151_bt: batch_tile must be 4,6,8",
                 ));
             }
         };

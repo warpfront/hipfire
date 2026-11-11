@@ -844,7 +844,7 @@ pub fn batch_chunk_full_attn_input_projection(
             n,
         )?;
     } else if qkv_is_mq4v2_lloyd {
-        // qt=52: q/k/v all Lloyd. Small-N gfx1100 → F16-BT-LUT; N>=128 or
+        // qt=52: q/k/v all Lloyd. Small-N gfx1100 → F16-BT-LUT; N>=64 or
         // other gfx11 → MMQ-LUT; gfx12 FP8-LUT.
         if lloyd_f16_bt_route(gpu, n) {
             gpu.gemm_qkv_mq4g256v2_wmma_gfx11_lloyd(
@@ -3242,7 +3242,7 @@ pub fn batched_gemm_single_weight(
         }
         DType::MQ4G256V2Lloyd => {
             // qt=52 mixed-format twin of the V2 arm: zero Y then residual
-            // (== plain GEMM). Small-N gfx1100 → F16-BT-LUT; N>=128 or other
+            // (== plain GEMM). Small-N gfx1100 → F16-BT-LUT; N>=64 or other
             // gfx11 → MMQ-LUT ADD; gfx12 keeps FP8-LUT.
             let bytes = w.m * n * 4;
             if let Some(stream) = gpu.active_stream.as_ref() {

@@ -1284,7 +1284,7 @@ pub(crate) fn dispatch_batched_gemm_epilogue(
                 );
             } else if matches!(w.dtype, DType::MQ4G256V2Lloyd) {
                 // qt=52: small-N gfx1100 → F16-BT-LUT (native masking);
-                // N>=128 or other gfx11 → MMQ-LUT; gfx12 keeps FP8-LUT; else
+                // N>=64 or other gfx11 → MMQ-LUT; gfx12 keeps FP8-LUT; else
                 // fail-closed inside the FP8 launcher (never uniform).
                 if lloyd_f16_bt_route(gpu, n) {
                     let lut = lloyd_f16_or_fail(w, "dispatch_batched_gemm_epilogue")?;
@@ -1429,7 +1429,7 @@ pub(crate) fn dispatch_batched_gemm_epilogue(
                 );
             } else if matches!(w.dtype, DType::MQ4G256V2Lloyd) {
                 // qt=52 Partial: zero then residual (== plain GEMM).
-                // Small-N gfx1100 → F16-BT-LUT; N>=128 or other gfx11 →
+                // Small-N gfx1100 → F16-BT-LUT; N>=64 or other gfx11 →
                 // MMQ-LUT ADD into zeroed Y; gfx12 keeps FP8-LUT.
                 zero_partial_for_residual(gpu, out, n, m)?;
                 if lloyd_f16_bt_route(gpu, n) {
@@ -1711,13 +1711,28 @@ pub(crate) fn lloyd_mmq_lut_route(gpu: &Gpu) -> bool {
 /// `HIPFIRE_IU4_PREFILL`. qkv/qkvza/partial/single-weight ride the existing
 /// single-matrix SET/ADD entries (no new TU); only gate/up has a fused SILU
 /// twin entry.
+/// Static half of [`lloyd_mmq_a4_route`]: exact gfx1100 plus the explicit
+/// opt-in `HIPFIRE_LLOYD_MMQ_A4=1`, without the per-launch shape/capture
+/// terms. `HIPFIRE_LLOYD_MMQ_OFF=1` dominates the opt-in (fail-closed),
+/// so A8-prepared twin paths cannot bypass the kill switch. Shared with
+/// the arch-crate prefill ceiling so the two call sites cannot drift;
+/// per-launch gates still fail closed at dispatch.
 #[inline]
-pub(crate) fn lloyd_mmq_a4_route(gpu: &Gpu, n: usize, k: usize) -> bool {
+pub fn lloyd_mmq_a4_static_admitted(gpu: &Gpu) -> bool {
     gpu.arch.as_str() == "gfx1100"
         && hipfire_config::developer_var("HIPFIRE_LLOYD_MMQ_A4")
             .ok()
             .as_deref()
             == Some("1")
+        && hipfire_config::developer_var("HIPFIRE_LLOYD_MMQ_OFF")
+            .ok()
+            .as_deref()
+            != Some("1")
+}
+
+#[inline]
+pub(crate) fn lloyd_mmq_a4_route(gpu: &Gpu, n: usize, k: usize) -> bool {
+    lloyd_mmq_a4_static_admitted(gpu)
         && !gpu.graphs.capture_mode
         && !gpu.replay.is_recording()
         && n >= 64
@@ -1742,21 +1757,23 @@ pub(crate) fn lloyd_f16_or_fail(w: &WeightRef<'_>, family: &'static str) -> HipR
     })
 }
 
-/// Small-batch F16-BT-LUT route for qt=52 on exact gfx1100: the BT twins
-/// natively mask any N (no padding), beating per-row GEMV below 64 and
-/// pad-to-128 waste up to 127. N>=128 stays on the MMQ-LUT route; other
-/// arches keep their existing behavior. Kill switch
-/// `HIPFIRE_LLOYD_F16_GFX11=0` restores the MMQ/GEMV path.
-#[inline]
 /// Small-N F16-BT-LUT route for qt=52 on exact gfx1100: BT-tiled WMMA with
 /// per-tensor centered codebooks, valid at any N via masking. Covers N<64,
 /// where the MMQ path falls back to per-row GEMV; N>=64 stays on the
-/// (possibly padded) MMQ-LUT route. Kill switch `HIPFIRE_LLOYD_F16_GFX11=0`
+/// (possibly padded) MMQ-LUT route. Eager-only: the BT launchers refuse
+/// under replay/graph capture, so a capturing caller keeps the per-row GEMV
+/// it used before this route existed. Kill switch `HIPFIRE_LLOYD_F16_GFX11=0`
 /// restores the MMQ/GEMV path (default is on).
 #[inline]
 pub(crate) fn lloyd_f16_bt_route(gpu: &Gpu, n: usize) -> bool {
     gpu.arch.as_str() == "gfx1100"
         && n < 64
+        && !gpu.replay.is_recording()
+        && !gpu.graphs.capture_mode
+        && hipfire_config::developer_var("HIPFIRE_LLOYD_MMQ_OFF")
+            .ok()
+            .as_deref()
+            != Some("1")
         && hipfire_config::developer_var("HIPFIRE_LLOYD_F16_GFX11")
             .ok()
             .as_deref()
@@ -2442,7 +2459,7 @@ fn swiglu_ffn_gate_up_batched(
         )?;
     } else if ffn_is_mq4v2_lloyd {
         // qt=52: gate+up both Lloyd. Small-N gfx1100 → F16-BT-LUT;
-        // N>=128 or other gfx11 → MMQ-LUT; gfx12 FP8-LUT.
+        // N>=64 or other gfx11 → MMQ-LUT; gfx12 FP8-LUT.
         if lloyd_f16_bt_route(gpu, n) {
             gpu.gemm_gate_up_mq4g256v2_wmma_gfx11_lloyd(
                 &layer.w_gate.buf,
