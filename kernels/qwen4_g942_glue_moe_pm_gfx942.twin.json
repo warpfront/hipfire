@@ -166,7 +166,7 @@
               "vmem_store": 8
             },
             "steps": 10517,
-            "verifier": "peacemaker_isa::ledger_cfg::verify",
+            "verifier": "peacemaker_isa::ledger_cfg::verify_with_branch_proofs",
             "waitcnt": 54,
             "waitcnt_lgkmcnt_partial": 6,
             "waitcnt_vmcnt_partial": 0
@@ -414,7 +414,7 @@
               "vmem_store": 3
             },
             "steps": 485,
-            "verifier": "peacemaker_isa::ledger_cfg::verify",
+            "verifier": "peacemaker_isa::ledger_cfg::verify_with_branch_proofs",
             "waitcnt": 11,
             "waitcnt_lgkmcnt_partial": 0,
             "waitcnt_vmcnt_partial": 2
@@ -647,8 +647,8 @@
               "vmem_load": 12,
               "vmem_store": 1
             },
-            "steps": 3074,
-            "verifier": "peacemaker_isa::ledger_cfg::verify",
+            "steps": 3070,
+            "verifier": "peacemaker_isa::ledger_cfg::verify_with_branch_proofs",
             "waitcnt": 62,
             "waitcnt_lgkmcnt_partial": 0,
             "waitcnt_vmcnt_partial": 0

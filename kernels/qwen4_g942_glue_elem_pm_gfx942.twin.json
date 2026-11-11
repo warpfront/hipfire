@@ -152,7 +152,7 @@
               "vmem_store": 4
             },
             "steps": 12308,
-            "verifier": "peacemaker_isa::ledger_cfg::verify",
+            "verifier": "peacemaker_isa::ledger_cfg::verify_with_branch_proofs",
             "waitcnt": 61,
             "waitcnt_lgkmcnt_partial": 1,
             "waitcnt_vmcnt_partial": 46
@@ -274,7 +274,7 @@
               "vmem_store": 4
             },
             "steps": 26736,
-            "verifier": "peacemaker_isa::ledger_cfg::verify",
+            "verifier": "peacemaker_isa::ledger_cfg::verify_with_branch_proofs",
             "waitcnt": 78,
             "waitcnt_lgkmcnt_partial": 1,
             "waitcnt_vmcnt_partial": 63
