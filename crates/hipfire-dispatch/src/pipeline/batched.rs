@@ -1018,11 +1018,17 @@ pub enum DenseBatchMath {
 impl DenseBatchMath {
     /// The math a stage runs: `Product` inside the IU4 verify scope is
     /// `Iu4Verify`. `SingletonWmma` inside the scope and `Iu4Verify` outside
-    /// it are caller errors.
+    /// it are caller errors, and so is `SingletonWmma` inside the ordinary
+    /// prefill intent ([`Gpu::ordinary_prefill_enter`]): the canonical prefill
+    /// producers and the verify twins never share a recipe.
     pub(crate) fn resolve(self, gpu: &Gpu, site: &str) -> HipResult<Self> {
         match (self, gpu.iu4_verify_scope) {
             (Self::Product, true) | (Self::Iu4Verify, true) => Ok(Self::Iu4Verify),
             (Self::Product, false) => Ok(Self::Product),
+            (Self::SingletonWmma, false) if gpu.ordinary_prefill_active() => Err(HipError::new(
+                0,
+                &format!("{site}: SingletonWmma verify math inside the ordinary prefill intent"),
+            )),
             (Self::SingletonWmma, false) => Ok(Self::SingletonWmma),
             (Self::SingletonWmma, true) => Err(HipError::new(
                 0,
@@ -1034,6 +1040,17 @@ impl DenseBatchMath {
             )),
         }
     }
+}
+
+/// Run `body` with the ordinary prefill intent open ([`Gpu::ordinary_prefill_enter`]) and restore
+/// the previous intent on every return, `Err` included. Every ordinary prefill forward
+/// (including a one-row tail) runs its layer stack inside this; decode, tree/chain verify, row
+/// capture and rollback never do.
+pub fn with_ordinary_prefill<T>(gpu: &mut Gpu, body: impl FnOnce(&mut Gpu) -> T) -> T {
+    let prev = gpu.ordinary_prefill_enter();
+    let out = body(gpu);
+    gpu.ordinary_prefill_exit(prev);
+    out
 }
 
 /// `Iu4Verify`: the A4 producer for this projection must have run.

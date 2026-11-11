@@ -1158,6 +1158,16 @@ impl<'a> GemmEpilogue<'a> {
 /// large-batch regression.
 pub(crate) const LDSSTAGE_MAX_BATCH: usize = 96;
 
+impl Gpu {
+    /// The gfx12 small-batch LDS-staged F16 kernels (`LDSSTAGE_MAX_BATCH`) are a verify-window
+    /// optimization whose bytes need not equal the bulk kernels'. Under the ordinary prefill
+    /// intent every extent takes the bulk (BT / FP8 / IU4) route, never this one.
+    #[inline]
+    pub(crate) fn ldsstage_batch_ok(&self, n: usize) -> bool {
+        n <= LDSSTAGE_MAX_BATCH && !self.ordinary_prefill_active()
+    }
+}
+
 /// gfx11 (RDNA3 / RDNA3.5), both dGPU and iGPU. Re-measured on the PINNED 3.6
 /// trunk `86a5f80f…` (the fixture rule: measure 3.6 when it exists), which
 /// reproduced the earlier 3.5 numbers within +/-0.7 percentage points at every
@@ -11118,7 +11128,9 @@ impl Gpu {
             && !self.a8_prefill_active(n, k)
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
-            && (n >= G12_FP8_F2_MIN_N || *G12_FP8_F2_FORCE_SMALL_N)
+            && (n >= G12_FP8_F2_MIN_N
+                || *G12_FP8_F2_FORCE_SMALL_N
+                || (n > 0 && self.ordinary_prefill_active()))
             && k > 0
             && k % 256 == 0
             && !dims.is_empty()
@@ -11456,6 +11468,13 @@ impl Gpu {
             _ => (256, 64, 64, 8),
         }
     }
+    /// Row admission of the staged FP8 v2 kernels (and its symmetric fold): `n >= 256`, or
+    /// any positive extent under the ordinary prefill intent, so one row's FP8 arithmetic
+    /// (v2 + symmetric fold versus the BT/S2BT8 kernels) never depends on the call's length.
+    #[inline]
+    fn fp8_v2_rows_admit(&self, n: usize) -> bool {
+        n >= 256 || (n > 0 && self.ordinary_prefill_active())
+    }
     #[inline]
     fn fp8_v2_symfold_enabled(&self, v2: bool) -> bool {
         v2 && self.mq4v2_symmetric
@@ -11471,7 +11490,7 @@ impl Gpu {
             && self.flags.gfx12_mq4v2_fp8_gateup
             && self.fp8_v2_symfold_enabled(true)
             && Self::fp8_v2_geom(&self.arch) == (128, 128, 64, 8)
-            && n >= 256
+            && (n >= 256 || self.ordinary_prefill_active())
             && k <= 17408
             && gate_m == up_m
             && hipfire_config::developer_bool("HIPFIRE_FP8_PROD_INREG", true)
@@ -11529,7 +11548,7 @@ impl Gpu {
         // plus N>=256; the family flag stays a prerequisite and smaller
         // batches keep s2bt8/BT. Params/blob layout below is the frozen v2 ABI.
         let v2 =
-            self.flags.gfx12_mq4v2_fp8_v2 && self.flags.gfx12_mq4v2_fp8_qkvza && batch_size >= 256;
+            self.flags.gfx12_mq4v2_fp8_v2 && self.flags.gfx12_mq4v2_fp8_qkvza && self.fp8_v2_rows_admit(batch_size);
         // Balanced-aspect launch: block/LDS/grid follow the selected geometry
         // (bv = BM/16 keeps batch_tiles = ceil(N/BM)).
         let (vbm, vbn, vbk, vwaves) = Self::fp8_v2_geom(&self.arch);
@@ -11771,7 +11790,7 @@ impl Gpu {
         // plus N>=256; the family flag stays a prerequisite and smaller
         // batches keep s2bt8/BT. Params/blob layout below is the frozen v2 ABI.
         let v2 =
-            self.flags.gfx12_mq4v2_fp8_v2 && self.flags.gfx12_mq4v2_fp8_qkvza && batch_size >= 256;
+            self.flags.gfx12_mq4v2_fp8_v2 && self.flags.gfx12_mq4v2_fp8_qkvza && self.fp8_v2_rows_admit(batch_size);
         // Balanced-aspect launch: block/LDS/grid follow the selected geometry
         // (bv = BM/16 keeps batch_tiles = ceil(N/BM)).
         let (vbm, vbn, vbk, vwaves) = Self::fp8_v2_geom(&self.arch);
@@ -11991,7 +12010,7 @@ impl Gpu {
         // plus N>=256; the family flag stays a prerequisite and smaller
         // batches keep s2bt8/BT. Params/blob layout below is the frozen v2 ABI.
         let v2 =
-            self.flags.gfx12_mq4v2_fp8_v2 && self.flags.gfx12_mq4v2_fp8_qkv && batch_size >= 256;
+            self.flags.gfx12_mq4v2_fp8_v2 && self.flags.gfx12_mq4v2_fp8_qkv && self.fp8_v2_rows_admit(batch_size);
         // Balanced-aspect launch: block/LDS/grid follow the selected geometry
         // (bv = BM/16 keeps batch_tiles = ceil(N/BM)).
         let (vbm, vbn, vbk, vwaves) = Self::fp8_v2_geom(&self.arch);
@@ -12222,7 +12241,7 @@ impl Gpu {
         // plus N>=256; the family flag stays a prerequisite and smaller
         // batches keep s2bt8/BT. Params/blob layout below is the frozen v2 ABI.
         let v2 =
-            self.flags.gfx12_mq4v2_fp8_v2 && self.flags.gfx12_mq4v2_fp8_qkv && batch_size >= 256;
+            self.flags.gfx12_mq4v2_fp8_v2 && self.flags.gfx12_mq4v2_fp8_qkv && self.fp8_v2_rows_admit(batch_size);
         // Balanced-aspect launch: block/LDS/grid follow the selected geometry
         // (bv = BM/16 keeps batch_tiles = ceil(N/BM)).
         let (vbm, vbn, vbk, vwaves) = Self::fp8_v2_geom(&self.arch);
@@ -12432,7 +12451,7 @@ impl Gpu {
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
             && k % 256 == 0
-            && batch_size >= 64
+            && self.prefill_rows_admit(batch_size)
         {
             let xq = self.ensure_int4_mmq_x(x, batch_size, k)?;
             self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_qkv, xq, y_qkv, qkv_m, k, batch_size)?;
@@ -12462,7 +12481,7 @@ impl Gpu {
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
             && k % 256 == 0
-            && batch_size >= 64
+            && self.prefill_rows_admit(batch_size)
         {
             return self.gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2_fp8(
                 a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m,
@@ -14288,7 +14307,7 @@ impl Gpu {
         // A 0.8b canary is NOT valid for this decision — it measured +11..+23% at
         // batch 512-8192 where 27B measures -3.5..-5.4% (see
         // .research/round5-verify-cost.md §17).
-        if self.flags.hfq4g256_ldsstage_wmma && k % 512 == 0 && batch_size <= LDSSTAGE_MAX_BATCH {
+        if self.flags.hfq4g256_ldsstage_wmma && k % 512 == 0 && self.ldsstage_batch_ok(batch_size) {
             let kname = "gemm_gate_up_hfq4g256_wmma_gfx12_ldsstage";
             let ksrc = kernels::GEMM_GATE_UP_HFQ4G256_WMMA_GFX12_SRC;
             self.ensure_kernel(kname, ksrc, kname)?;
@@ -14464,7 +14483,7 @@ impl Gpu {
         // site serves BOTH o_proj and down_proj in dense prefill/verify
         // (`GemmHfq4G256Residual`), so an ungated enable regressed 27B prefill
         // 3.5-5.4% while the verify regime (B=16) gains ~9%.
-        if self.flags.hfq4g256_ldsstage_wmma && k % 512 == 0 && batch_size <= LDSSTAGE_MAX_BATCH {
+        if self.flags.hfq4g256_ldsstage_wmma && k % 512 == 0 && self.ldsstage_batch_ok(batch_size) {
             let kname = "gemm_hfq4g256_residual_wmma_gfx12_ldsstage";
             let ksrc = kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_SRC;
             self.ensure_kernel(kname, ksrc, kname)?;
@@ -22414,11 +22433,25 @@ impl Gpu {
         // A partial N grid can still use FULL=true for every complete column
         // tile when M itself is full. The guarded wrapper below targets only
         // the one remaining column tile while retaining the original N stride.
-        let gridspec = self.flags.gfx11_iu4_gridspec
+        let gridspec_flag = self.flags.gfx11_iu4_gridspec
             && matches!(self.arch.as_str(), "gfx1151" | "gfx1100")
             && m % 128 == 0
             && batch_size >= 128
             && batch_size % 128 != 0;
+        // Ordinary prefill: the partial column tile (and every `n < 128` call) runs as a complete
+        // zero-padded 128-column tile ([`Self::gfx11_iu4_canonical_tail`]) so its fold is the
+        // symmetric one of every complete tile; the complete tiles take the interior launch.
+        let canonical_tail = symfold_requested
+            && self.ordinary_prefill_active()
+            && matches!(self.arch.as_str(), "gfx1151" | "gfx1100")
+            && m % 128 == 0
+            && batch_size % 128 != 0
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode;
+        if canonical_tail && batch_size < 128 {
+            return self.gfx11_iu4_canonical_tail(a_raw, x_i4_ptr, y, m, k, batch_size, add);
+        }
+        let gridspec = gridspec_flag || (canonical_tail && batch_size >= 128);
         let symfold = symfold_requested && (full || gridspec);
         // gfx1151/gfx1100 + eager + unchecked tiles → column-adjacent entries.
         // A grid-specialized partial N uses the same order for its unchecked
@@ -22747,7 +22780,7 @@ impl Gpu {
             }
         };
         self.ensure_kernel(module, source, kernel_name)?;
-        if gridspec {
+        if gridspec && !canonical_tail {
             self.ensure_kernel(module, source, GRIDSPEC_TAIL)?;
         }
         let mut a_ptr = a_raw.buf.as_ptr();
@@ -22807,6 +22840,7 @@ impl Gpu {
             );
             match interior_result {
                 Err(error) => Err(error),
+                Ok(()) if canonical_tail => Ok(()),
                 Ok(()) => self.launch_maybe_blob(
                     GRIDSPEC_TAIL,
                     [row_tiles as u32, 1, 1],
@@ -22848,6 +22882,81 @@ impl Gpu {
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
+        if canonical_tail {
+            result?;
+            return self.gfx11_iu4_canonical_tail(a_raw, x_i4_ptr, y, m, k, batch_size, add);
+        }
+        result
+    }
+
+    /// gfx1100/gfx1151 canonical partial column tile of the symmetric IU4 SET/ADD (ordinary
+    /// prefill intent). A partial N tile reaches the guarded tail entry whose fold differs from
+    /// the symmetric one of a complete 128-column tile (measured: off by up to 4e-6), so a row's
+    /// bytes would depend on whether it lands in a whole or a partial tile of its call. The last
+    /// `n % 128` columns are therefore re-run as ONE complete, zero-padded 128-column tile: the
+    /// `block_i4_128` records of those tokens are copied out of the live token-layout sidecar
+    /// (`[K/128][N]`, 72 B records) into a private `[K/128][128]` sidecar (padding records are
+    /// all-zero: zero activations project to zero rows), run through the same consumer a complete
+    /// tile takes, and only the live rows are copied back. `add` preloads the live rows of `y`
+    /// into the private output first (ADD semantics); padded rows never reach `y`.
+    #[allow(clippy::too_many_arguments)]
+    fn gfx11_iu4_canonical_tail(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_i4_ptr: *mut c_void,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+        add: bool,
+    ) -> HipResult<()> {
+        const TILE: usize = 128;
+        const RECORD: usize = 72;
+        let r = n % TILE;
+        let n_full = n - r;
+        let kb = k / 128;
+        debug_assert!(r != 0 && m % 128 == 0 && k % 256 == 0);
+        let tail_x_elems = kb * TILE * RECORD / 4;
+        let tail_x = self.alloc_tensor(&[tail_x_elems], DType::F32)?;
+        let tail_y = self.alloc_tensor(&[TILE * m], DType::F32)?;
+        let result = (|| -> HipResult<()> {
+            self.hip.memset(&tail_x.buf, 0, tail_x.byte_size())?;
+            self.hip.memset(&tail_y.buf, 0, tail_y.byte_size())?;
+            for b in 0..kb {
+                // SAFETY: the sidecar scratch holds `kb * n` records of `RECORD` bytes
+                // (`int4_mmq_x_needed`); the view covers records `[b * n + n_full, b * n + n)`.
+                let src = unsafe {
+                    hip_bridge::DeviceBuffer::from_raw(
+                        (x_i4_ptr as *mut u8).add((b * n + n_full) * RECORD) as *mut c_void,
+                        r * RECORD,
+                    )
+                };
+                let dst = tail_x.buf.byte_view(b * TILE * RECORD, r * RECORD);
+                self.hip.memcpy_dtod(&dst, &src, r * RECORD)?;
+            }
+            if add {
+                let live = y.buf.byte_view(n_full * m * 4, r * m * 4);
+                let dst = tail_y.buf.byte_view(0, r * m * 4);
+                self.hip.memcpy_dtod(&dst, &live, r * m * 4)?;
+            }
+            // A complete 128-column tile: the same consumer (and symmetric fold) a whole tile of
+            // the bulk call runs.
+            self.gemm_mq4g256v2_mmq_prequant_iu4(
+                a_raw,
+                tail_x.buf.as_ptr(),
+                &tail_y,
+                m,
+                k,
+                TILE,
+                add,
+                None,
+            )?;
+            let live = tail_y.buf.byte_view(0, r * m * 4);
+            let dst = y.buf.byte_view(n_full * m * 4, r * m * 4);
+            self.hip.memcpy_dtod(&dst, &live, r * m * 4)
+        })();
+        self.free_tensor(tail_x)?;
+        self.free_tensor(tail_y)?;
         result
     }
 
@@ -35892,8 +36001,11 @@ impl Gpu {
         self.gemm_mq4g256v2_mmq_set_prequant_iu4(a, xq, y, m, k, batch_size)
     }
 
-    /// Exact symmetric MQ4V2 producer/consumer route. Only a complete IU4
-    /// column tile may omit the otherwise necessary F32 rotated X.
+    /// Exact symmetric MQ4V2 producer/consumer route. Outside the ordinary prefill intent only a
+    /// complete IU4 column tile (`n >= 128`, `n % 128 == 0`) may omit the otherwise necessary
+    /// F32 rotated X; under the intent the fold is a static weight/geometry decision for every
+    /// extent (partial tiles run the canonical padded tile,
+    /// [`Self::gfx11_iu4_canonical_tail`], from the sidecar alone).
     pub fn mq4v2_fold_betaalpha_active(
         &self,
         qkv_m: usize,
@@ -35921,8 +36033,7 @@ impl Gpu {
             && beta_m == 48
             && alpha_m == 48
             && k == 5120
-            && n >= 128
-            && n % 128 == 0
+            && ((n >= 128 && n % 128 == 0) || (n > 0 && self.ordinary_prefill_active()))
     }
     /// Z's expanded M must be a complete tile of whichever SET kernel the
     /// architecture selects (M128 for V2C/X5, M256 for Halo v2b).
@@ -35966,7 +36077,7 @@ impl Gpu {
         if !self.replay.is_recording()
             && !self.graphs.capture_mode
             && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
-            && batch_size >= 64
+            && self.prefill_rows_admit(batch_size)
         {
             if self.a8_prefill_active(batch_size, k) {
                 let xq = self.ensure_int8_mmq_x(x, batch_size, k)?;
@@ -36610,6 +36721,59 @@ impl Gpu {
         Ok(true)
     }
 
+    /// Raw (pre-convolution, pre-gate) QKV, beta and alpha rows of a `rows`-row tail, produced by
+    /// the byte-identical materializing counterpart of the fused `qkvzagdn` producer
+    /// ([`Self::gemm_qkvza_mq4g256v2_iu4_gdn_prepared`]): the same prepared A4 RMSNorm/FWHT
+    /// producer (`fused_rmsnorm_rotate_mq_i4_gfx12_batched`, no F32 plane) feeding the plain
+    /// `gemm_mq4g256v2_mmq_set_prequant_iu4` SETs of QKV, beta and alpha (Z is not carried:
+    /// it only gates the output). The fused kernel stores just the raw rows its completion pass
+    /// reads, so the exact carry of an incomplete scan tile is regenerated here, from the SAME
+    /// pre-norm hidden rows `x` (`[rows][k]` F32), as an independent `rows`-row call whose
+    /// bytes equal the fused call's rows by the canonical-producer row-independence
+    /// (`gdn_canonical_producer_oracle`: `fused_vs_plain`, G1 n-list). The fused call's
+    /// beta/alpha come from the loader's Z fold, these from the separate weights: identical bytes.
+    ///
+    /// `y_qkv` is `[rows][qkv_m]`, `y_beta` / `y_alpha` `[rows][beta_m]` / `[rows][alpha_m]` F32.
+    /// `Ok(false)` without launching unless exact gfx1201 and the ordinary prefill producer
+    /// admission ([`Self::iu4_producer_quant_fused_active`]) holds for `(rows, k)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_raw_rows_g12_iu4(
+        &mut self,
+        x: &GpuTensor,
+        norm_weight: &GpuTensor,
+        awq: Option<&GpuTensor>,
+        eps: f32,
+        a_qkv: &GpuTensor,
+        a_beta: &GpuTensor,
+        a_alpha: &GpuTensor,
+        y_qkv: &GpuTensor,
+        y_beta: &GpuTensor,
+        y_alpha: &GpuTensor,
+        dims: [usize; 3],
+        k: usize,
+        rows: usize,
+    ) -> HipResult<bool> {
+        if self.arch != "gfx1201"
+            || rows == 0
+            || !self.iu4_producer_quant_fused_active(rows, k)
+            || x.byte_size() < rows * k * 4
+            || y_qkv.byte_size() < rows * dims[0] * 4
+            || y_beta.byte_size() < rows * dims[1] * 4
+            || y_alpha.byte_size() < rows * dims[2] * 4
+        {
+            return Ok(false);
+        }
+        self.bind_thread()?;
+        let res = self.reserve_int4_mmq(k, rows)?;
+        let prep =
+            self.fused_rmsnorm_rotate_mq_i4_gfx12_batched(x, norm_weight, awq, None, res, k, eps, rows)?;
+        let xq = self.int4_mmq_prepared_ptr(&prep, k, rows)?;
+        self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_qkv, xq, y_qkv, dims[0], k, rows)?;
+        self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_beta, xq, y_beta, dims[1], k, rows)?;
+        self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_alpha, xq, y_alpha, dims[2], k, rows)?;
+        Ok(true)
+    }
+
     /// Append beta/alpha as ordinary Z weight rows. The SET selector is the
     /// same one used for QKV and Z elsewhere (V2C, X5 or future Halo v2b);
     /// the only fold-specific GPU work is deinterleaving its output.
@@ -37054,7 +37218,7 @@ impl Gpu {
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
             && k % 256 == 0
-            && batch_size >= 64
+            && self.prefill_rows_admit(batch_size)
         {
             let xq = self.ensure_int4_mmq_x(x, batch_size, k)?;
             self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_q, xq, y_q, q_m, k, batch_size)?;
@@ -37070,7 +37234,7 @@ impl Gpu {
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
             && k % 256 == 0
-            && batch_size >= 64
+            && self.prefill_rows_admit(batch_size)
         {
             return self.gemm_qkv_hfq4g256_wmma_gfx12_mq4v2_fp8(
                 a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size, 1,
@@ -37203,7 +37367,7 @@ impl Gpu {
         if !self.replay.is_recording()
             && !self.graphs.capture_mode
             && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
-            && batch_size >= 64
+            && self.prefill_rows_admit(batch_size)
         {
             if self.a8_prefill_active(batch_size, k) {
                 let xq = self.ensure_int8_mmq_x(x, batch_size, k)?;
@@ -37713,14 +37877,14 @@ impl Gpu {
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
             && k % 256 == 0
-            && batch_size >= 64
+            && self.prefill_rows_admit(batch_size)
         {
             let xq = self.ensure_int4_mmq_x(x, batch_size, k)?;
             self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_gate, xq, y_gate, gate_m, k, batch_size)?;
             self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_up, xq, y_up, up_m, k, batch_size)?;
             return Ok(());
         }
-        if self.flags.hfq4g256_ldsstage_wmma && k % 512 == 0 && batch_size <= LDSSTAGE_MAX_BATCH {
+        if self.flags.hfq4g256_ldsstage_wmma && k % 512 == 0 && self.ldsstage_batch_ok(batch_size) {
             let kname = "gemm_gate_up_hfq4g256_wmma_gfx12_ldsstage";
             let ksrc = kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_GFX12_SRC;
             let func_name = "gemm_gate_up_mq4g256v2_wmma_gfx12_ldsstage";
@@ -37790,7 +37954,7 @@ impl Gpu {
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
             && k % 256 == 0
-            && batch_size >= 64
+            && self.prefill_rows_admit(batch_size)
         {
             return self.gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2_fp8_bt12(
                 a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size, 1,
@@ -37964,7 +38128,7 @@ impl Gpu {
         // plus N>=256; the family flag stays a prerequisite and smaller
         // batches keep s2bt8/BT. Params/blob layout below is the frozen v2 ABI.
         let v2 =
-            self.flags.gfx12_mq4v2_fp8_v2 && self.flags.gfx12_mq4v2_fp8_gateup && batch_size >= 256;
+            self.flags.gfx12_mq4v2_fp8_v2 && self.flags.gfx12_mq4v2_fp8_gateup && self.fp8_v2_rows_admit(batch_size);
         // Balanced-aspect launch: block/LDS/grid follow the selected geometry
         // (bv = BM/16 keeps batch_tiles = ceil(N/BM)).
         let (vbm, vbn, vbk, vwaves) = Self::fp8_v2_geom(&self.arch);
@@ -38451,7 +38615,7 @@ impl Gpu {
         if !self.replay.is_recording()
             && !self.graphs.capture_mode
             && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
-            && batch_size >= 64
+            && self.prefill_rows_admit(batch_size)
         {
             if self.a8_prefill_active(batch_size, k) {
                 let xq = self.ensure_int8_mmq_x(x, batch_size, k)?;
@@ -40182,7 +40346,7 @@ impl Gpu {
         // smaller batches keep s2bt8/BT. Params/blob layout below is the
         // frozen v2 ABI.
         let v2 =
-            self.flags.gfx12_mq4v2_fp8_v2 && self.flags.gfx12_mq4v2_fp8_resid && batch_size >= 256;
+            self.flags.gfx12_mq4v2_fp8_v2 && self.flags.gfx12_mq4v2_fp8_resid && self.fp8_v2_rows_admit(batch_size);
         // Balanced-aspect launch: block/LDS/grid follow the selected geometry
         // (bv = BM/16 keeps batch_tiles = ceil(N/BM)).
         let (vbm, vbn, vbk, vwaves) = Self::fp8_v2_geom(&self.arch);
@@ -40354,13 +40518,13 @@ impl Gpu {
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
             && k % 256 == 0
-            && batch_size >= 64
+            && self.prefill_rows_admit(batch_size)
         {
             let xq = self.ensure_int4_mmq_x(x, batch_size, k)?;
             self.gemm_mq4g256v2_mmq_add_prequant_iu4(a_raw, xq, y, m, k, batch_size)?;
             return Ok(());
         }
-        if self.flags.hfq4g256_ldsstage_wmma && k % 512 == 0 && batch_size <= LDSSTAGE_MAX_BATCH {
+        if self.flags.hfq4g256_ldsstage_wmma && k % 512 == 0 && self.ldsstage_batch_ok(batch_size) {
             let kname = "gemm_hfq4g256_residual_wmma_gfx12_ldsstage";
             let ksrc = kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX12_SRC;
             let func_name = "gemm_mq4g256v2_residual_wmma_gfx12_ldsstage";
@@ -40422,7 +40586,7 @@ impl Gpu {
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
             && k % 256 == 0
-            && batch_size >= 64
+            && self.prefill_rows_admit(batch_size)
         {
             return self
                 .gemm_hfq4g256_residual_wmma_gfx12_mq4v2_fp8(a_raw, x, y, m, k, batch_size, 1);
@@ -40523,7 +40687,7 @@ impl Gpu {
         if !self.replay.is_recording()
             && !self.graphs.capture_mode
             && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
-            && batch_size >= 64
+            && self.prefill_rows_admit(batch_size)
         {
             if self.a8_prefill_active(batch_size, k) {
                 let xq = self.ensure_int8_mmq_x(x, batch_size, k)?;
@@ -42623,7 +42787,7 @@ impl Gpu {
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
             && k % 256 == 0
-            && batch_size >= 64
+            && self.prefill_rows_admit(batch_size)
     }
 
     /// Selector router projection `Y = W·X` (plain [`Self::gemm_mq4g256v2`]
@@ -46895,11 +47059,14 @@ impl Gpu {
 
     /// Whether the MQ4G256V2 shared-F16 prefill route applies (`HIPFIRE_QWEN4_MQ4_X4_PM`
     /// decides only which kernel runs it): exact gfx1151, at least
-    /// [`QWEN4_MQ4_X4_MIN_N_GFX1151`] tokens, `k % 256 == 0`, no replay recording or graph
-    /// capture. [`Gpu::gemm_mq4g256v2_xf16`] then writes `Y = W·X` for F32 `y`.
+    /// [`QWEN4_MQ4_X4_MIN_N_GFX1151`] tokens (any positive extent under the ordinary
+    /// prefill intent, so a short tail keeps its bulk arithmetic), `k % 256 == 0`, no
+    /// replay recording or graph capture. [`Gpu::gemm_mq4g256v2_xf16`] then writes
+    /// `Y = W·X` for F32 `y`.
     pub fn gemm_mq4g256v2_xf16_applies(&self, k: usize, batch_size: usize) -> bool {
         self.arch.as_str() == "gfx1151"
-            && batch_size >= QWEN4_MQ4_X4_MIN_N_GFX1151
+            && (batch_size >= QWEN4_MQ4_X4_MIN_N_GFX1151
+                || (batch_size > 0 && self.ordinary_prefill_active()))
             && k % 256 == 0
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
@@ -50171,7 +50338,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if self.flags.hfq4g256_ldsstage_wmma && k % 512 == 0 && batch_size <= LDSSTAGE_MAX_BATCH {
+        if self.flags.hfq4g256_ldsstage_wmma && k % 512 == 0 && self.ldsstage_batch_ok(batch_size) {
             let kname = "gemm_gate_up_mq4cg256_wmma_gfx12_ldsstage";
             let ksrc = kernels::GEMM_GATE_UP_MQ4CG256_WMMA_GFX12_SRC;
             self.ensure_kernel(kname, ksrc, kname)?;
@@ -50403,7 +50570,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if self.flags.hfq4g256_ldsstage_wmma && k % 512 == 0 && batch_size <= LDSSTAGE_MAX_BATCH {
+        if self.flags.hfq4g256_ldsstage_wmma && k % 512 == 0 && self.ldsstage_batch_ok(batch_size) {
             let kname = "gemm_mq4cg256_residual_wmma_gfx12_ldsstage";
             let ksrc = kernels::GEMM_MQ4CG256_RESIDUAL_WMMA_GFX12_SRC;
             self.ensure_kernel(kname, ksrc, kname)?;
@@ -53213,6 +53380,32 @@ pub fn qwen4_trunk_iu4_ragged_rows(rows: usize) -> Option<usize> {
     (rows >= QWEN4_F16_WMMA_MIN_TOKENS && rows % 128 != 0).then(|| rows.next_multiple_of(256))
 }
 
+/// Dense trunk IU4 admission of `rows` under `intent`: product/invariant need the 512-row
+/// prefill floor; the ordinary prefill intent admits any positive whole-128-row extent.
+pub(crate) fn qwen4_trunk_iu4_dense_rows_for(
+    intent: crate::prefill_invariant::PrefillRouteIntent,
+    rows: usize,
+) -> bool {
+    match intent {
+        crate::prefill_invariant::PrefillRouteIntent::OrdinaryPrefill => {
+            rows > 0 && rows % 128 == 0
+        }
+        _ => qwen4_trunk_iu4_dense_rows(rows),
+    }
+}
+/// Ragged padded rows of `rows` under `intent` (see [`qwen4_trunk_iu4_dense_rows_for`]).
+pub(crate) fn qwen4_trunk_iu4_ragged_rows_for(
+    intent: crate::prefill_invariant::PrefillRouteIntent,
+    rows: usize,
+) -> Option<usize> {
+    match intent {
+        crate::prefill_invariant::PrefillRouteIntent::OrdinaryPrefill => {
+            (rows > 0 && rows % 128 != 0).then(|| rows.next_multiple_of(256))
+        }
+        _ => qwen4_trunk_iu4_ragged_rows(rows),
+    }
+}
+
 #[cfg(test)]
 mod qwen4_trunk_ragged_tests {
     #[test]
@@ -53233,6 +53426,39 @@ mod qwen4_trunk_ragged_tests {
         ] {
             assert_eq!(super::qwen4_trunk_iu4_ragged_rows(rows), expected);
         }
+    }
+}
+
+#[cfg(test)]
+mod qwen4_trunk_ordinary_prefill_tests {
+    use crate::prefill_invariant::PrefillRouteIntent as I;
+
+    /// Ordinary prefill: every positive extent is exactly one of dense (whole 128-row tiles) or
+    /// ragged (padded to whole 256-row tiles), never both, never neither; product / invariant
+    /// keep the 512-row floor. The padded count always covers the live rows and is a whole V2B tile.
+    #[test]
+    fn ordinary_prefill_partitions_every_extent() {
+        for rows in (1usize..=1300).chain([4097, 8151, 8191, 8192, 8193]) {
+            let dense = super::qwen4_trunk_iu4_dense_rows_for(I::OrdinaryPrefill, rows);
+            let ragged = super::qwen4_trunk_iu4_ragged_rows_for(I::OrdinaryPrefill, rows);
+            assert_ne!(dense, ragged.is_some(), "rows {rows}: exactly one of dense/ragged");
+            assert_eq!(dense, rows % 128 == 0, "rows {rows}");
+            if let Some(pad) = ragged {
+                assert!(pad >= rows && pad % 256 == 0 && pad - rows < 256, "rows {rows} pad {pad}");
+            }
+            for product in [I::Product, I::InvariantProfile] {
+                assert_eq!(
+                    super::qwen4_trunk_iu4_dense_rows_for(product, rows),
+                    super::qwen4_trunk_iu4_dense_rows(rows)
+                );
+                assert_eq!(
+                    super::qwen4_trunk_iu4_ragged_rows_for(product, rows),
+                    super::qwen4_trunk_iu4_ragged_rows(rows)
+                );
+            }
+        }
+        assert!(!super::qwen4_trunk_iu4_dense_rows_for(I::OrdinaryPrefill, 0));
+        assert_eq!(super::qwen4_trunk_iu4_ragged_rows_for(I::OrdinaryPrefill, 0), None);
     }
 }
 
@@ -53257,39 +53483,87 @@ impl Gpu {
             && hipfire_config::developer_var("HIPFIRE_IU4_SYMFOLD").as_deref() != Ok("0")
     }
 
-    /// Whether a `rows`-row trunk projection takes the IU4 route: verified
-    /// trunk, prefill of at least [`QWEN4_F16_WMMA_MIN_TOKENS`] rows in whole
-    /// 128-row tiles, eager (no replay recording or graph capture). A partial
-    /// N tile would reach the IU4 tail entry, whose fold differs from the
-    /// symmetric one (measured: tail outputs off by up to 4e-6 vs the dense
-    /// fold at N=1131); such chunks keep exact activations instead.
+    /// Whether a `rows`-row trunk projection takes the dense IU4 route: verified
+    /// trunk, whole 128-row tiles, eager (no replay recording or graph capture), and
+    /// either a product prefill of at least [`QWEN4_F16_WMMA_MIN_TOKENS`] rows or the
+    /// ordinary prefill intent at ANY positive extent. A partial N tile would reach the
+    /// IU4 tail entry, whose fold differs from the symmetric one (measured: tail outputs
+    /// off by up to 4e-6 vs the dense fold at N=1131); under the ordinary prefill intent
+    /// such calls take [`Self::qwen4_trunk_iu4_ragged`] canonical padded tiles instead of
+    /// silently falling back to exact activations, so a row's bytes never depend on
+    /// whether it lands in a whole or a partial 128-row tile.
     ///
     /// Never under the batch-invariant prefill profile
-    /// ([`Gpu::prefill_invariant_scope`]): a row's bytes would depend on
-    /// whether it lands in a whole or a partial 128-row tile, i.e. on how many
-    /// other rows share the forward, so the profile takes the exact-activation
-    /// route at every row count.
+    /// ([`Gpu::prefill_invariant_scope`], [`PrefillRouteIntent::suppresses_trunk_iu4`]):
+    /// that profile takes the exact-activation route at every row count. The ordinary
+    /// prefill intent does NOT suppress IU4.
     pub fn qwen4_trunk_iu4_applies(&self, rows: usize) -> bool {
+        let intent = self.prefill_route_intent();
         self.qwen4_trunk_iu4
-            && !self.prefill_invariant_scope
-            && qwen4_trunk_iu4_dense_rows(rows)
+            && !intent.suppresses_trunk_iu4()
+            && qwen4_trunk_iu4_dense_rows_for(intent, rows)
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
     }
 
-    /// Ragged Z|beta|alpha only, never decode, invariant prefill or capture.
+    /// Ragged (padded to whole 256-row V2B tiles) trunk IU4 rows, never decode, invariant
+    /// profile or capture. Product prefill: `rows >= 512` (Z|beta|alpha only); ordinary
+    /// prefill: any positive `rows` not a multiple of 128, for every IU4 trunk
+    /// projection ([`Self::qwen4_trunk_set_ragged`], [`Self::qwen4_trunk_zba_ragged`]).
     pub fn qwen4_trunk_iu4_ragged(&self, rows: usize) -> Option<usize> {
+        let intent = self.prefill_route_intent();
         if self.qwen4_trunk_iu4
             && self.qwen4_trunk_iu4_prefill_scope
-            && !self.prefill_invariant_scope
+            && !intent.suppresses_trunk_iu4()
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
             && *QWEN4_TRUNK_IU4_RAGGED
         {
-            qwen4_trunk_iu4_ragged_rows(rows)
+            qwen4_trunk_iu4_ragged_rows_for(intent, rows)
         } else {
             None
         }
+    }
+
+    /// Canonical ragged plain SETs of the IU4 trunk under the ordinary prefill intent: the
+    /// F32 `input` (`rows` live rows, capacity for `n_pad`) is zero-padded to `n_pad` rows,
+    /// quantized once at `N = n_pad` (`block_i4_128` is `[K/128][N]`; a rows-strided sidecar
+    /// is never reused), and every `(weight, m, y_pad)` is projected by the same
+    /// `gemm_mq4g256v2_mmq_set_prequant_iu4` SET a whole-tile call runs. `y_pad` must hold
+    /// `n_pad * m` F32 (padded rows are dead scratch; row-major `[n_pad][m]`, so the first
+    /// `rows * m` elements are the real outputs). `Ok(false)` without launching when
+    /// [`Self::qwen4_trunk_iu4_ragged`] does not select exactly `n_pad`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen4_trunk_set_ragged(
+        &mut self,
+        input: &GpuTensor,
+        rows: usize,
+        n_pad: usize,
+        k: usize,
+        projections: &[(&GpuTensor, usize, &GpuTensor)],
+    ) -> HipResult<bool> {
+        if self.qwen4_trunk_iu4_ragged(rows) != Some(n_pad)
+            || input.dtype != DType::F32
+            || input.byte_size() < n_pad * k * 4
+            || projections.is_empty()
+            || projections
+                .iter()
+                .any(|(_, m, y)| *m == 0 || y.dtype != DType::F32 || y.byte_size() < n_pad * m * 4)
+        {
+            return Ok(false);
+        }
+        let tail = input.buf.byte_view(rows * k * 4, (n_pad - rows) * k * 4);
+        match self.active_stream.as_ref() {
+            Some(stream) => self.hip.memset_async(&tail, 0, tail.size(), stream)?,
+            None => self.hip.memset(&tail, 0, tail.size())?,
+        }
+        let reservation = self.reserve_int4_mmq(k, n_pad)?;
+        let prepared = self.rotate_x_mq_i4_batched(input, None, None, reservation, k, n_pad)?;
+        for (w, m, y_pad) in projections {
+            let xq = self.int4_mmq_prepared_ptr(&prepared, k, n_pad)?;
+            self.gemm_mq4g256v2_mmq_set_prequant_iu4(w, xq, y_pad, *m, k, n_pad)?;
+        }
+        Ok(true)
     }
 
     /// Production ragged sequence, shared with the hardware oracle. The caller
@@ -53425,9 +53699,13 @@ impl Gpu {
     /// and speculative verify stay on the incumbent). Never on the agent-turn
     /// append route (`Gpu::qwen4_append_f16_moe_scope`).
     pub fn qwen4_moe_sym_iu4_applies(&self, rows: usize) -> bool {
+        // The ordinary prefill intent never takes the append route's F16 MoE suppression: its
+        // symmetric IU4 arm is part of the canonical recipe at every row count.
+        let append_f16 = self.qwen4_append_f16_moe_scope
+            && self.prefill_route_intent() != crate::prefill_invariant::PrefillRouteIntent::OrdinaryPrefill;
         sym_iu4_rows_admit_from(
             self.route_rows(rows),
-            self.qwen4_append_f16_moe_scope,
+            append_f16,
             self.qwen4_moe_sym_iu4_floor,
             self.few_row_limit(),
         ) && self.qwen4_moe_sym_iu4_requested()
