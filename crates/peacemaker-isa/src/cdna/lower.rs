@@ -80,6 +80,10 @@ pub fn classify(text: &str, arch: peacemaker_cdna::Arch) -> Result<Source, Strin
         }
     }
     let inst = peacemaker_cdna::text::parse_line(text, arch).map_err(|e| format!("{text}: {e}"))?;
+    super::require_verified(arch, &inst)?;
+    if let Some(reason) = inst.unsupported() {
+        return Err(reason);
+    }
     Ok(match inst {
         Inst::Sopp(Sopp {
             op: SoppOp::Waitcnt,
@@ -99,15 +103,21 @@ pub fn classify(text: &str, arch: peacemaker_cdna::Arch) -> Result<Source, Strin
 /// The ledger view of a typed instruction: its register footprint (SGPR, VGPR
 /// and AGPR spans; special registers are tracked by the hazard pass, not the
 /// ledger) and memory class.
-pub fn shadow(inst: &Inst) -> Instruction {
+/// Generated instructions without a hand-written ledger/hazard model refuse
+/// by name instead of being assigned an existing instruction's memory class.
+pub fn shadow(inst: &Inst) -> Result<Instruction, String> {
+    super::require_verified(peacemaker_cdna::Arch::Gfx942, inst)?;
+    if let Some(reason) = inst.unsupported() {
+        return Err(reason);
+    }
     let footprint = inst.footprint();
     let mut shadow = Instruction::new(
         format!("{}", inst.assembly()),
         footprint.defs.iter().filter_map(ledger_reg).collect(),
         footprint.uses.iter().filter_map(ledger_reg).collect(),
     );
-    shadow.memory = inst.memory().map(memory_class);
-    shadow
+    shadow.memory = inst.memory().map(memory_class).transpose()?;
+    Ok(shadow)
 }
 
 /// An explicit wait request recorded by the generic builder.
@@ -261,7 +271,7 @@ pub fn final_program(kernel: &Kernel) -> Result<(Vec<Instruction>, Vec<usize>), 
         };
         match branch {
             Some(text) => program.push(Instruction::new(text, vec![], vec![])),
-            None => program.push(shadow(inst)),
+            None => program.push(shadow(inst)?),
         }
     }
     for (name, _) in kernel.labels.iter().filter(|(_, o)| *o == words.len()) {
@@ -276,4 +286,54 @@ pub fn is_memory(insn: &Instruction) -> bool {
         insn.memory,
         Some(MemoryClass::VmemLoad | MemoryClass::VmemStore | MemoryClass::VmemAtomic { .. })
     )
+}
+
+#[cfg(test)]
+mod xml_refusal_tests {
+    use super::*;
+
+    #[test]
+    fn scalar_store_and_atomic_refuse_by_name() {
+        for (words, name) in [
+            ([0xc040_0000, 0], "s_store_dword"),
+            ([0xc208_0000, 0], "s_atomic_add"),
+        ] {
+            for arch in [peacemaker_cdna::Arch::Gfx942, peacemaker_cdna::Arch::Gfx950] {
+                let (inst, n) = Inst::decode(arch, &words).unwrap();
+                assert_eq!(n, 2);
+                let error = shadow(&inst).unwrap_err();
+                assert!(error.contains(name), "{error}");
+                assert!(error.contains("no hand-written model"), "{error}");
+                let hazards = super::super::hazard::check(arch, &[inst]);
+                assert!(hazards.iter().any(|error| error.contains(name)), "{hazards:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn unverified_encoding_refuses_emission_and_shadow_by_name() {
+        let (inst, _) =
+            Inst::decode(peacemaker_cdna::Arch::Gfx942, &[0xbf9f_0000]).unwrap();
+        let error = inst.words(peacemaker_cdna::Arch::Gfx942).unwrap_err();
+        assert!(error.contains("s_set_valu_coexec_mode"), "{error}");
+        assert!(error.contains("unverified encoding"), "{error}");
+        let error = shadow(&inst).unwrap_err();
+        assert!(error.contains("s_set_valu_coexec_mode"), "{error}");
+        assert!(error.contains("unverified encoding"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod typed_unverified_tests {
+    use super::*;
+
+    #[test]
+    fn typed_decoder_cannot_bypass_unverified_encoding_gate() {
+        let (inst, _) =
+            Inst::decode(peacemaker_cdna::Arch::Gfx942, &[0xd140_0000, 0]).unwrap();
+        assert!(inst.xml().is_none(), "the legacy typed path is the regression");
+        let error = shadow(&inst).unwrap_err();
+        assert!(error.contains("v_nop"), "{error}");
+        assert!(error.contains("unverified encoding"), "{error}");
+    }
 }

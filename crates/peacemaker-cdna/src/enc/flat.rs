@@ -470,6 +470,7 @@ impl FlatOp {
                 Self::AtomicAdd => 66,
                 Self::AtomicAddF32 => 77,
             }),
+            Arch::Gfx950 => None,
         }
     }
     /// Mnemonic for `seg`; `None` where the segment lacks the instruction (scratch atomics).

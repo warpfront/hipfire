@@ -9,9 +9,10 @@
 //! variant of [`arch::Arch`] with a row in the capability table
 //! ([`arch::Caps`]: FP8 encoding FNUZ vs OCP, MFMA shapes and types, LDS
 //! size, register files); encoders, decoders and the emulator take the
-//! variant and consult its row instead of hard-coding gfx942. Only gfx942
-//! (CDNA3, MI300X) is populated; gfx950 (CDNA4: OCP FP8, FP4/FP6 MFMA, 160 KiB
-//! LDS) arrives as a new variant and table row, not a new crate.
+//! variant and consult its row instead of hard-coding gfx942. gfx942
+//! (CDNA3, MI300X) is the encoded and emulated variant; gfx950 (CDNA4: OCP
+//! FP8, FP4/FP6 MFMA, 160 KiB LDS) is a decode-only variant and table row
+//! (generated-table decode only), not a new crate.
 //!
 //! Layering mirrors the RDNA side, where `peacemaker-ir` owns the codec and the
 //! wave32 interpreter and `peacemaker-isa` owns the checked builder: this crate
@@ -37,6 +38,10 @@
 //!   real encoder (labels are the caller's).
 //! - [`oracle`]: ROCm `llvm-mc` / `llvm-objdump` invocation for tests (test
 //!   oracle only; nothing in the production path runs a ROCm tool).
+//! - [`xml`] and `generated_cdna3` / `generated_cdna4`: the machine-readable
+//!   AMD ISA (CDNA3 for gfx942, CDNA4 for gfx950) as generated tables and a
+//!   generic structured codec; [`XmlInst`] wraps one decoded generated
+//!   instruction (`Inst::Xml`) for every instruction the typed model lacks.
 //!
 //! Citations `CDNA3 ISA §x.y p.N` refer to "AMD Instinct MI300 Instruction Set
 //! Architecture Reference Guide", 5 August 2025 (PDF sha256
@@ -79,9 +84,16 @@ pub mod kd;
 pub mod oracle;
 pub mod sim;
 pub mod text;
+pub mod xml;
+mod xml_inst;
+#[rustfmt::skip]
+mod generated_cdna3;
+#[rustfmt::skip]
+mod generated_cdna4;
 
 pub use arch::{Arch, Caps};
-pub use inst::{decode_all, encode_all, Format, Inst};
+pub use inst::{decode_all, encode_all, Format, Inst, RowStatus};
+pub use xml_inst::XmlInst;
 pub use operand::Src;
 
 pub type Result<T, E = String> = std::result::Result<T, E>;

@@ -30,6 +30,10 @@
   - Two invariance gaps are closed under the option only. Prompts of 9..=64 tokens keep their serial singleton prefill tile instead of the small-lane EP prefill wave. Served C1-vs-C8 identity found the wave not byte-identical to C1 for exactly the 57, 60 and 64-token prompts. With `seeded`, sampled lanes draw on the host row-read sampler, because the lane-wide device draw was composition dependent for seeded lanes.
   - Served identity, R9700 EP2: 8 distinct prompts, 256 tokens, each reply at C4, C8 and C8 with fillers compared with the same prompt alone at C1. Greedy went from 5 to 8 of 8 identical in every composition, with both `--batch-exact seeded` and `greedy`. Seeded sampled went from 2 to 6 of 8 at C8. Seeded sampled output is still not fully invariant: the 57 and 60-token prompts differ, and one of them differs between two runs of the same C8 burst.
 
+## Unreleased
+
+- PeaceMaker CDNA: generate complete gfx942 encoding/operand tables and gfx950 decode-only tables from AMD's ISA XML. Preserve hand-written simulator semantics; newly decoded instructions refuse unsupported simulation by name. Record every LLVM row cross-check; unverified XML/LLVM disagreements cannot be emitted or sealed.
+
 ## v0.4.6 — 2026-11-11
 
 0.4.6 is the freeze baseline for the 0.5.0 consolidation (#666). Entries are grouped by area.

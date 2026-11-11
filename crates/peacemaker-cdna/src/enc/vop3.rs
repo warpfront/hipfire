@@ -1048,6 +1048,7 @@ impl Vop3OnlyOp {
                 Self::FmaF64 => 460,
                 Self::LshlAddU64 => 520,
             }),
+            Arch::Gfx950 => None,
         }
     }
     /// llvm-mc mnemonic (no encoding suffix).

@@ -88,6 +88,12 @@ pub fn certify(kernel: &Kernel) -> Result<Value, String> {
 /// [`certify`] for a bare typed stream: `instructions` must be the whole code of one
 /// kernel in order with their true dword offsets.
 pub fn certify_stream(name: &str, instructions: &[Typed]) -> Result<Value, String> {
+    for typed in instructions {
+        super::require_verified(CDNA, &typed.inst)?;
+        if let Some(reason) = typed.inst.unsupported() {
+            return Err(format!("{name}: dword {}: {reason}", typed.dword_offset));
+        }
+    }
     let layout = layout(name, instructions)?;
     let insts: Vec<Inst> = instructions.iter().map(|t| t.inst.clone()).collect();
     let cfg = cfg(name, &insts, &layout)?;
@@ -355,6 +361,9 @@ fn convert(
     branch: Option<usize>,
     counts: &mut Counts,
 ) -> Result<Instruction, String> {
+    if let Some(reason) = inst.unsupported() {
+        return Err(reason);
+    }
     let control = |text: String| -> Result<Instruction, String> {
         Ok(Instruction::new(text, vec![], vec![]))
     };
@@ -462,6 +471,9 @@ fn convert(
         MemKind::SmemLoad => {
             counts.smem += 1;
             MemoryClass::SmemLoad
+        }
+        MemKind::SmemStore | MemKind::SmemAtomic | MemKind::SmemAtomicRtn => {
+            return Err(format!("{inst}: {kind:?} has no CDNA ledger memory class"));
         }
     };
     Ok(Instruction::new(
@@ -790,5 +802,44 @@ mod tests {
 
     fn is_label_text(text: &str) -> bool {
         text.trim().ends_with(':')
+    }
+}
+
+#[cfg(test)]
+mod generated_encoding_tests {
+    use super::*;
+
+    #[test]
+    fn seal_refuses_unverified_encoding_by_name() {
+        let (inst, _) = Inst::decode(CDNA, &[0xbf9f_0000]).unwrap();
+        let error = certify_stream(
+            "unverified",
+            &[Typed {
+                dword_offset: 0,
+                inst,
+            }],
+        )
+        .unwrap_err();
+        assert!(error.contains("s_set_valu_coexec_mode"), "{error}");
+        assert!(error.contains("unverified encoding"), "{error}");
+    }
+
+    #[test]
+    fn seal_refuses_unmodelled_scalar_memory_by_name() {
+        for (word, mnemonic) in [
+            (0xc040_0000, "s_store_dword"),
+            (0xc208_0000, "s_atomic_add"),
+        ] {
+            let (inst, _) = Inst::decode(CDNA, &[word, 0]).unwrap();
+            let error = certify_stream(
+                "unmodelled",
+                &[Typed {
+                    dword_offset: 0,
+                    inst,
+                }],
+            )
+            .unwrap_err();
+            assert!(error.contains(mnemonic), "{error}");
+        }
     }
 }

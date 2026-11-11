@@ -516,6 +516,7 @@ impl DsOp {
                 Self::BpermuteB32 => 63,
                 Self::Nop => 20,
             }),
+            Arch::Gfx950 => None,
         }
     }
     /// llvm-mc mnemonic (no encoding suffix).

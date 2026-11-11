@@ -33,6 +33,20 @@ pub use peacemaker_cdna as model;
 use peacemaker_cdna::enc::sop::SoppOp;
 use peacemaker_cdna::Inst;
 
+/// XML rows without an independent encoding receipt cannot enter emission or
+/// certification, including rows recognized by the older typed API.
+pub(crate) fn require_verified(arch: model::Arch, inst: &Inst) -> Result<(), String> {
+    match inst.verification(arch) {
+        model::RowStatus::Verified => Ok(()),
+        model::RowStatus::Unverified(reason) => {
+            Err(format!("{inst}: unverified encoding: {reason}"))
+        }
+        model::RowStatus::Unknown(reason) => {
+            Err(format!("{inst}: unverified encoding: {reason}"))
+        }
+    }
+}
+
 /// One program item before branch resolution.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Item {

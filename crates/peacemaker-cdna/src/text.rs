@@ -69,7 +69,16 @@ use std::sync::LazyLock;
 ///
 /// See the module docs for the grammar and the error vocabulary. Symbolic
 /// branch labels are not resolved here.
+///
+/// Only instructions of the typed tables parse: an instruction that only the
+/// generated tables ([`crate::XmlInst`]) know is an `unknown mnemonic`, and
+/// a decode-only `arch` (gfx950) is an `encode` error.
 pub fn parse_line(text: &str, arch: Arch) -> Result<Inst> {
+    if !arch.encodes() {
+        return Err(format!(
+            "encode: {arch} is decode-only: the text assembler builds encodable instructions only"
+        ));
+    }
     let line = strip_comment(text);
     if line.is_empty() {
         return Err("empty instruction: the line holds no mnemonic".into());

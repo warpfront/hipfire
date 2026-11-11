@@ -1788,6 +1788,7 @@ impl Vop1Op {
                 Self::CvtF64F32 => 16,
                 Self::CvtF32F64 => 15,
             }),
+            Arch::Gfx950 => None,
         }
     }
     /// llvm-mc mnemonic (no encoding suffix).
@@ -1891,6 +1892,7 @@ impl Vop2Op {
                 Self::AshrrevI16 => 44,
                 Self::MulLoU16 => 41,
             }),
+            Arch::Gfx950 => None,
         }
     }
     /// llvm-mc mnemonic (no encoding suffix).
@@ -1988,6 +1990,7 @@ impl VopcOp {
                 Self::CmpGtI64 => 228,
                 Self::CmpGeI64 => 230,
             }),
+            Arch::Gfx950 => None,
         }
     }
     /// llvm-mc mnemonic (no encoding suffix).
@@ -2052,6 +2055,7 @@ impl Vop2KOp {
                 Self::FmamkF32 => 23,
                 Self::FmaakF32 => 24,
             }),
+            Arch::Gfx950 => None,
         }
     }
     pub fn from_opcode(arch: Arch, opcode: u8) -> Option<Self> {

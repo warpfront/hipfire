@@ -386,6 +386,7 @@ impl MubufOp {
                 Self::StoreDwordx3 => 30,
                 Self::StoreDwordx4 => 31,
             }),
+            Arch::Gfx950 => None,
         }
     }
     /// llvm-mc mnemonic (no encoding suffix).

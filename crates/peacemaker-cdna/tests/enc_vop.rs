@@ -1076,7 +1076,6 @@ fn illegal_forms_rejected() {
         vec![0x7ef8_0502],              // v_readfirstlane_b32 m0
         vec![0x7e02_c800],              // VOP1 opcode 100: not in table
         vec![0x7e02_02ff],              // literal missing
-        vec![0x0002_0702 | 4 << 25],    // VOP2 opcode 4: not in table
     ];
     for words in &reject {
         assert!(

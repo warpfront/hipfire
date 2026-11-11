@@ -846,7 +846,7 @@ impl Builder {
             // The typed instruction is the authority on registers and memory class: the caller's
             // claimed defs/uses are replaced by the footprint of what will be encoded.
             if let cdna::lower::Source::Inst(typed) = cdna::lower::classify(&insn.text, arch)? {
-                insn = cdna::lower::shadow(&typed);
+                insn = cdna::lower::shadow(&typed)?;
             }
         }
         insn.validate(self.spec.arch)?;

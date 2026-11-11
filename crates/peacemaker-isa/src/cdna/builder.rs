@@ -332,6 +332,10 @@ impl Builder {
     /// for SCRATCH (CDNA3 ISA §10.3).
     pub fn push(&mut self, inst: Inst) -> Result<(), String> {
         self.require_reachable()?;
+        super::require_verified(self.arch, &inst)?;
+        if let Some(reason) = inst.unsupported() {
+            return Err(reason);
+        }
         if matches!(&inst, Inst::Sopp(p) if matches!(p.op, SoppOp::Waitcnt | SoppOp::Barrier | SoppOp::Endpgm))
             || inst.branch_offset().is_some()
             || matches!(&inst, Inst::Sop1(p) if p.op == Sop1Op::SetpcB64)
@@ -380,7 +384,7 @@ impl Builder {
             text: inst.to_string(),
             defs: footprint.defs.iter().filter_map(ledger_reg).collect(),
             uses: footprint.uses.iter().filter_map(ledger_reg).collect(),
-            memory: memory.map(memory_class),
+            memory: memory.map(memory_class).transpose()?,
         };
         self.emit_waits(self.ledger.required(&shadow))?;
         self.ledger.record(Arch::Gfx942, &shadow);
@@ -706,14 +710,17 @@ pub(crate) fn ledger_reg(span: &RegSpan) -> Option<RegRef> {
     })
 }
 
-pub(crate) fn memory_class(memory: MemKind) -> MemoryClass {
-    match memory {
+pub(crate) fn memory_class(memory: MemKind) -> Result<MemoryClass, String> {
+    Ok(match memory {
         MemKind::VmemLoad | MemKind::VmemAtomicRtn => MemoryClass::VmemLoad,
         MemKind::VmemStore | MemKind::VmemAtomic => MemoryClass::VmemStore,
         MemKind::DsLoad | MemKind::DsAtomicRtn | MemKind::DsXlane => MemoryClass::DsLoad,
         MemKind::DsStore | MemKind::DsAtomic => MemoryClass::DsStore,
         MemKind::SmemLoad => MemoryClass::SmemLoad,
-    }
+        MemKind::SmemStore | MemKind::SmemAtomic | MemKind::SmemAtomicRtn => {
+            return Err(format!("{memory:?} has no CDNA ledger memory class"));
+        }
+    })
 }
 
 fn plain_memory_data(inst: &Inst) -> bool {

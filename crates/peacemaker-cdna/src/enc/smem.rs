@@ -434,6 +434,7 @@ impl SmemOp {
                 Self::Memrealtime => 37,
                 Self::DcacheInv => 32,
             }),
+            Arch::Gfx950 => None,
         }
     }
     /// llvm-mc mnemonic (no encoding suffix).
