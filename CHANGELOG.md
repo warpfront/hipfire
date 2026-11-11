@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **Opt-in exact Flash-Next expert LRU on one gfx1201 PCIe GPU:** immutable host experts can fill paired gate-up/down VRAM slots between AR tokens, using beta's shared SlotBank generations and reader leases. Dirty short prefills read independent core/host tables; long prefills restore the original donor bytes before staging. The fixed hot budget is preserved and mirror/queue memory is charged. Cache-off placement and reporting remain unchanged; lanes, native MTP, EP and incompatible routes are refused.
+
+- **Exact-cache failure handling:** setup, route-reset and readback errors cancel the active reader only after typed retained-queue quiescence and a HIP fence. Unknown submission retains the complete model owner set; state operations and teardown refuse an outstanding reader. Recurring cache statistics use developer DEBUG logging.
+
 - **VRAM (default on, discrete GPUs; output byte-identical): a Qwen3.5/3.6/3.8 load keeps its token embedding in pinned host RAM, not VRAM (`memory.embed_host`, `HIPFIRE_EMBED_HOST=0` restores the device copy).** On the default `qwen3.8:27b` that frees the 1,288 MiB Q8_0 table at every phase. Every reader is a row gather (the trunk, DFlash and MTP embedding lookups), so a token reads one 5,440 B row over PCIe through the pinned allocation's device alias; an 8,192-token prefill reads about 42.5 MiB. Unified-memory GPUs (by `hipDeviceAttributeIntegrated`, e.g. Strix Halo), a tied `lm_head`, a widen-to-f32 table, dense tensor-parallel loads and `hipfire-weight-host` keep the device copy. `hipfire fit`, the pre-load context projection and `HIPFIRE_EMU` charge the table to host RAM (`fit` prints `token embedding N GiB in pinned host RAM` and a `host_pinned` projection term).
 
 - **Registry: the four `qwen3.8:27b-mq3*` tiers (`mq3`, `mq3-pro`, `mq3-xt`, `mq3-xts`) set `dflash_min_vram_gb: 18`.** Below 18 GiB of VRAM (a 16 GB card) `dflash_mode auto` loads the tier without its paired DFlash draft, with one log line, as the `mq5*` tiers already do below 28 GiB; a 20 GB card and larger still pair it. An explicit `dflash_mode on` still loads the draft. `hipfire fit` reads the same floor.
