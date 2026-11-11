@@ -885,6 +885,7 @@ fn case_route_write(gpu: &mut Gpu) -> Result<String, String> {
         let gt = sentinel_f32(gpu, rows * HC_STREAMS)?;
         let rot = zeros_f32(gpu, rows * HC_WIDE)?;
         let op = HyperWriteOp {
+            ar: None,
             state_bf16: false,
             input: &st,
             norm_weight: &wnt,
@@ -974,6 +975,7 @@ fn case_step_program(gpu: &mut Gpu) -> Result<String, String> {
         let out_b = sentinel_f32(gpu, rows * HIDDEN)?;
         let rot = zeros_f32(gpu, rows * HC_WIDE)?;
         let write = |norm_weight, inject, mixed, gates| HyperWriteOp {
+            ar: None,
             state_bf16: false,
             input: &st,
             norm_weight,

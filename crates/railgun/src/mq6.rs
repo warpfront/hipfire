@@ -111,7 +111,7 @@ impl Mq6Facts {
                 && !receipt.strict
                 && digest(&record.receipt_sha256)
                 && digest(&receipt.round_trip_proof_sha256),
-            "MQ6 requires a verified schema-8 tier-D receipt",
+            "MQ6 requires a verified schema-9 tier-D receipt",
         )?;
         for (id, status) in [("roundtrip", "pass"), ("g8-metadata-differential", "pass")] {
             require(

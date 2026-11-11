@@ -3216,6 +3216,7 @@ mod tests {
         let error = refuse_lane_spec(Some(crate::lane::LaneSpecConfig {
             k: 3,
             end_of_turn: None,
+            spec_lanes: None,
         }))
         .unwrap_err()
         .to_string();

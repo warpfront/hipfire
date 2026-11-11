@@ -1708,7 +1708,7 @@ fn assert_push_rejected(inst: Inst, what: &str) {
 }
 
 /// SMEM data destinations are plain SGPRs: not VCC, EXEC, FLAT_SCRATCH,
-/// XNACK_MASK, TTMP or M0 (the ledger tracks only SGPR/VGPR spans).
+/// XNACK_MASK, TTMP or M0 (the ledger tracks SGPR/VGPR/AGPR spans).
 #[test]
 fn smem_destination_must_be_a_plain_sgpr() {
     let mut r = rig();
@@ -1743,13 +1743,12 @@ fn smem_destination_must_be_a_plain_sgpr() {
     }
 }
 
-/// Global and buffer load destinations / store data are plain VGPRs.
+/// Global and buffer memory data must use plain vector register banks.
 #[test]
-fn vmem_data_must_be_a_plain_vgpr() {
+fn vmem_data_must_be_a_plain_vector_register() {
     let r = rig();
     let (v0, ptr, rsrc) = (r.v(0), r.ptr, r.s(4));
     for (bad, what) in [
-        (Src::Agpr(0), "a0"),
         (Src::Ttmp(0), "ttmp0"),
         (Src::VccLo, "vcc_lo"),
         (Src::ExecLo, "exec_lo"),
@@ -1793,13 +1792,49 @@ fn vmem_data_must_be_a_plain_vgpr() {
     r.st(1);
 }
 
-/// DS destinations and data (including cross-lane results) are plain VGPRs.
 #[test]
-fn ds_data_must_be_a_plain_vgpr() {
+fn agpr_memory_results_insert_waits_in_the_checked_builder() {
+    let mut r = rig();
+    let a = r.b.agprs(1, 1).unwrap();
+    r.push(ops::global_load(
+        FlatOp::LoadDword,
+        a,
+        r.v(0),
+        Some(r.ptr),
+        0,
+    ));
+    r.push(ops::v1(Vop1Op::MovB32, r.v(2), Src::Vgpr(0)));
+    assert!(r.waits().is_empty(), "a0 must not alias v0");
+    r.push(ops::acc_read(r.v(3), a));
+    assert_eq!(
+        r.waits(),
+        vec![(0, NO_LGKM)],
+        "AGPR RAW needs VM retirement"
+    );
+
+    let mut r = rig();
+    let a = r.b.agprs(1, 1).unwrap();
+    r.push(ops::global_load(
+        FlatOp::LoadDword,
+        a,
+        r.v(0),
+        Some(r.ptr),
+        0,
+    ));
+    r.push(ops::acc_write(a, r.v(1)));
+    assert_eq!(
+        r.waits(),
+        vec![(0, NO_LGKM)],
+        "AGPR WAW needs VM retirement"
+    );
+}
+
+/// DS memory data must use plain vector register banks.
+#[test]
+fn ds_data_must_be_a_plain_vector_register() {
     let r = rig();
     let (v0, v1) = (r.v(0), r.v(1));
     for (bad, what) in [
-        (Src::Agpr(0), "a0"),
         (Src::Ttmp(0), "ttmp0"),
         (Src::VccLo, "vcc_lo"),
         (Src::M0, "m0"),

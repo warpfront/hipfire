@@ -47,7 +47,7 @@
 //! retire = `barrier(&[Retire])`.
 
 use crate::backend::{Auth, Backend, EventId, SlotTransition};
-use crate::lds::{Lendable, Ring, RingParts, Slots, Writing};
+use crate::lds::{check_private_layout, Lendable, Ring, RingParts, Slots, Writing};
 use crate::scope::{End, Scc, WgUniform, Workgroup};
 use crate::target::{SplitBarrier, Target, WaitModel};
 use crate::wait::{LdsWrite, Pending};
@@ -72,6 +72,13 @@ pub struct RegionId {
 /// A dynamic two-buffer ring id (from `ring`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RingId {
+    owner: u64,
+    idx: usize,
+}
+/// A dynamic wave-private LDS region id (from `lds_private`). Valid for the
+/// `Driver` that issued it only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PrivateId {
     owner: u64,
     idx: usize,
 }
@@ -113,6 +120,28 @@ impl std::fmt::Debug for Phase {
             Phase::RtFree => "Free",
             Phase::RtWriting => "Writing",
             Phase::RtPublished => "Published",
+        })
+    }
+}
+
+/// Ownership of a wave-private region, as each wave holds its own slice: no
+/// other wave ever reads or writes it, so every step is wave-local and none
+/// passes a barrier.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PrivatePhase {
+    /// The wave's slice holds nothing live; the wave may start writing.
+    RtFree,
+    /// The wave has stores into its slice; it may not read yet.
+    RtWriting,
+    /// Readable by the owning wave only; not writable until retired.
+    RtOwned,
+}
+impl std::fmt::Debug for PrivatePhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            PrivatePhase::RtFree => "Free",
+            PrivatePhase::RtWriting => "Writing",
+            PrivatePhase::RtOwned => "Owned",
         })
     }
 }
@@ -250,6 +279,16 @@ struct Region {
     hold: Hold,
 }
 #[derive(Clone, Debug)]
+struct PrivateRegion {
+    name: String,
+    slot: usize,
+    phase: PrivatePhase,
+    hold: Hold,
+    /// The wave's youngest stores into its slice (as `Region::stores`): what
+    /// `private_drain` asks the backend about.
+    stores: Stores,
+}
+#[derive(Clone, Debug)]
 struct RingBuf {
     name: String,
     bufs: Vec<Vec<usize>>,
@@ -284,6 +323,7 @@ impl RingBuf {
 struct St {
     regions: Vec<Region>,
     rings: Vec<RingBuf>,
+    privates: Vec<PrivateRegion>,
     /// The split barrier in flight: its signal serial and transitions.
     in_flight: Option<(u64, Vec<Transition>)>,
     /// Code falls through to the current point (false after `s_branch`).
@@ -316,8 +356,27 @@ fn desc(phase: Phase, undrained: bool, hold: Hold) -> String {
 /// Why two states differ in ownership, or `None` when they agree (event
 /// ids and ring physical indices are build-time values, not shape).
 fn shape_diff(a: &St, b: &St) -> Option<String> {
-    if a.regions.len() != b.regions.len() || a.rings.len() != b.rings.len() {
-        return Some("one path declares LDS regions or rings the other lacks".into());
+    if a.regions.len() != b.regions.len()
+        || a.rings.len() != b.rings.len()
+        || a.privates.len() != b.privates.len()
+    {
+        return Some(
+            "one path declares LDS regions, rings or wave-private regions the other lacks".into(),
+        );
+    }
+    for (x, y) in a.privates.iter().zip(&b.privates) {
+        if (x.phase, x.hold) != (y.phase, y.hold) {
+            let d = |r: &PrivateRegion| match r.hold {
+                Hold::Live => format!("{:?}", r.phase),
+                _ => "consumed".to_string(),
+            };
+            return Some(format!(
+                "wave-private {} is {} on one path and {} on the other",
+                x.name,
+                d(x),
+                d(y)
+            ));
+        }
     }
     if a.in_flight.is_some() != b.in_flight.is_some() {
         return Some("a split barrier is in flight on one path only".into());
@@ -381,6 +440,9 @@ fn merge(into: &mut St, other: &St) -> Result<(), String> {
         x.stores.join(&y.stores);
     }
     for (x, y) in into.rings.iter_mut().zip(&other.rings) {
+        x.stores.join(&y.stores);
+    }
+    for (x, y) in into.privates.iter_mut().zip(&other.privates) {
         x.stores.join(&y.stores);
     }
     into.wave_exit |= other.wave_exit;
@@ -519,6 +581,7 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
         let st = St {
             regions: Vec::new(),
             rings: Vec::new(),
+            privates: Vec::new(),
             in_flight: None,
             reachable: true,
             wave_exit: false,
@@ -711,6 +774,147 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
             idx: self.st.regions.len() - 1,
         })
     }
+    /// Declare one wave-private LDS region: wave `w` owns bytes `[base + w *
+    /// stride, base + (w + 1) * stride)`, for `waves` waves (`base` and
+    /// `stride` multiples of 16, the whole window inside the LDS and clear of
+    /// every other slot). Its ownership is per wave and never crosses a
+    /// barrier: `private_store`, `private_publish`, `private_load` and
+    /// `private_retire` are wave-scope operations (legal under wave-uniform
+    /// control), and no `Transition`, shared `ds_store`/`ds_load` or handoff
+    /// can name it, so no other wave can be given access to it. Which bytes
+    /// each access touches is the instruction's address; the object-level
+    /// certification (`pm_check::lds_wave_private`) proves every wave's
+    /// addresses stay in its own slice.
+    pub fn lds_private(
+        &mut self,
+        name: &str,
+        base: u32,
+        stride: u32,
+        waves: u32,
+    ) -> Result<PrivateId, String> {
+        self.wg("lds_private")?;
+        check_private_layout(name, base, stride, waves, T::LDS_BYTES, T::NAME)?;
+        let slot = self
+            .b
+            .lds_slot_private(&self.auth, name, base, stride, waves)?;
+        self.st.privates.push(PrivateRegion {
+            name: name.into(),
+            slot,
+            phase: PrivatePhase::RtFree,
+            hold: Hold::Live,
+            stores: Stores::default(),
+        });
+        Ok(PrivateId {
+            owner: self.owner,
+            idx: self.st.privates.len() - 1,
+        })
+    }
+    fn private_ix(&self, id: PrivateId) -> Result<usize, String> {
+        if id.owner != self.owner {
+            return Err("wave-private region id from another Driver".into());
+        }
+        let r = self
+            .st
+            .privates
+            .get(id.idx)
+            .ok_or("unknown wave-private LDS region")?;
+        match r.hold {
+            Hold::Live => Ok(id.idx),
+            _ => Err(format!("{} was consumed by a relayout", r.name)),
+        }
+    }
+    /// Phase of a wave-private region (each wave's own).
+    pub fn private_phase(&self, p: PrivateId) -> Result<PrivatePhase, String> {
+        Ok(self.st.privates[self.private_ix(p)?].phase)
+    }
+    /// One DS store into the issuing wave's slice: `Free | Writing ->
+    /// Writing`. Wave scope: legal under `skip_if`/`exec_if`/`if_else`/
+    /// `loop_until`.
+    pub fn private_store(&mut self, p: PrivateId, insn: B::Insn) -> Result<(), String> {
+        let i = self.private_ix(p)?;
+        let r = &self.st.privates[i];
+        if r.phase == PrivatePhase::RtOwned {
+            return Err(format!(
+                "cannot store into wave-private {}: it is Owned (published to its wave) until private_retire",
+                r.name
+            ));
+        }
+        let slot = r.slot;
+        let e = self.b.ds_store_private(&self.auth, slot, insn)?;
+        self.st.privates[i].phase = PrivatePhase::RtWriting;
+        self.st.privates[i].stores.store(e);
+        Ok(())
+    }
+    /// Wait for the wave's own stores into its slice (a `Free`-phase region
+    /// has none to wait for). Publishing and retiring never need it; a
+    /// workgroup barrier does, for any DS store still in flight (`s_barrier`
+    /// waits for no memory counter), exactly as for a shared region.
+    pub fn private_drain(&mut self, p: PrivateId) -> Result<(), String> {
+        let i = self.private_ix(p)?;
+        let r = &self.st.privates[i];
+        if !r.stores.undrained() {
+            return Err(format!(
+                "drain of wave-private {}: no store of this wave is in flight",
+                r.name
+            ));
+        }
+        if r.stores.events.iter().any(|&e| self.b.lds_store_pending(e)) {
+            self.b
+                .drain_lds_stores(&self.auth, <T::Waits as WaitModel>::LDS)?;
+        }
+        self.st.privates[i].stores.clear();
+        Ok(())
+    }
+    /// `Writing -> Owned`: make the wave's stores readable by that wave. It
+    /// emits nothing and waits for nothing: one wave's DS instructions
+    /// execute in issue order (RDNA3 ISA 12.5, RDNA4 ISA 12.5 and 5.7.1.4), so
+    /// a load issued after the store reads what it stored, with no `s_barrier`
+    /// (which other waves would have to reach) and no `lgkmcnt`/`dscnt` wait.
+    pub fn private_publish(&mut self, p: PrivateId) -> Result<(), String> {
+        let i = self.private_ix(p)?;
+        let r = &self.st.privates[i];
+        if r.phase != PrivatePhase::RtWriting {
+            return Err(format!(
+                "cannot publish wave-private {} to its wave: it is {:?}, publishing needs a store first",
+                r.name, r.phase
+            ));
+        }
+        let slot = r.slot;
+        self.b.lds_private_publish(&self.auth, slot)?;
+        self.st.privates[i].phase = PrivatePhase::RtOwned;
+        Ok(())
+    }
+    /// One DS load from the issuing wave's slice, which must be `Owned`.
+    pub fn private_load(&mut self, p: PrivateId, insn: B::Insn) -> Result<(), String> {
+        let i = self.private_ix(p)?;
+        let r = &self.st.privates[i];
+        if r.phase != PrivatePhase::RtOwned {
+            return Err(format!(
+                "wave-private {} is not published to its wave: it is {:?}",
+                r.name, r.phase
+            ));
+        }
+        self.b.ds_load_private(&self.auth, r.slot, insn)
+    }
+    /// `Owned -> Free`: the wave is done reading its slice and may rewrite
+    /// it. It emits nothing: the wave's loads are issued ahead of its own later
+    /// stores in the same in-order LDS stream, and no other wave reads the
+    /// slice (a shared region's `Retire` waits out other waves' reads, which a
+    /// private slice has none of).
+    pub fn private_retire(&mut self, p: PrivateId) -> Result<(), String> {
+        let i = self.private_ix(p)?;
+        let r = &self.st.privates[i];
+        if r.phase != PrivatePhase::RtOwned {
+            return Err(format!(
+                "cannot retire wave-private {}: it is {:?}, only an Owned slice retires",
+                r.name, r.phase
+            ));
+        }
+        let slot = r.slot;
+        self.b.lds_private_retire(&self.auth, slot)?;
+        self.st.privates[i].phase = PrivatePhase::RtFree;
+        Ok(())
+    }
     /// End the slot layout so a later phase can carve its own. Every region
     /// and ring must be `Free`; all ids are invalid afterwards.
     pub fn relayout(&mut self) -> Result<(), String> {
@@ -732,9 +936,21 @@ impl<'b, T: Target, B: Backend> Driver<'b, T, B> {
                 ));
             }
         }
+        for r in self.st.privates.iter().filter(|r| r.hold != Hold::Gone) {
+            if r.phase != PrivatePhase::RtFree {
+                return Err(format!(
+                    "wave-private {} is {:?} at relayout: its wave must retire it first",
+                    r.name, r.phase
+                ));
+            }
+        }
         self.b.lds_relayout(&self.auth)?;
         self.st.regions.iter_mut().for_each(|r| r.hold = Hold::Gone);
         self.st.rings.iter_mut().for_each(|g| g.hold = Hold::Gone);
+        self.st
+            .privates
+            .iter_mut()
+            .for_each(|r| r.hold = Hold::Gone);
         Ok(())
     }
     /// Re-carve `Free` regions into one region (a store or load then covers

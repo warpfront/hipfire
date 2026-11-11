@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "lowercase")]
 pub enum Arch {
     Gfx1201,
+    /// RDNA4 gfx1200: the gfx1201 instruction family under its own ELF machine / bundle triple.
+    Gfx1200,
     Gfx1100,
     Gfx1151,
     Gfx942,
@@ -30,6 +32,7 @@ impl Arch {
     pub fn name(self) -> &'static str {
         match self {
             Self::Gfx1201 => "gfx1201",
+            Self::Gfx1200 => "gfx1200",
             Self::Gfx1100 => "gfx1100",
             Self::Gfx1151 => "gfx1151",
             Self::Gfx942 => "gfx942",
@@ -43,7 +46,7 @@ impl Arch {
         }
     }
     pub fn gfx12(self) -> bool {
-        matches!(self, Self::Gfx1201)
+        matches!(self, Self::Gfx1200 | Self::Gfx1201)
     }
     /// Whether this architecture uses the CDNA wave64 instruction model.
     pub fn wave64(self) -> bool {
@@ -173,6 +176,7 @@ impl std::str::FromStr for Arch {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "gfx1201" => Ok(Self::Gfx1201),
+            "gfx1200" => Ok(Self::Gfx1200),
             "gfx1100" => Ok(Self::Gfx1100),
             "gfx1151" => Ok(Self::Gfx1151),
             "gfx942" => Ok(Self::Gfx942),
@@ -220,6 +224,20 @@ mod arch_tests {
             assert!(!arch.wave64());
             assert!(arch.check_mnemonic("s_nop").is_ok());
         }
+    }
+
+    #[test]
+    fn gfx1200_is_the_gfx12_family_under_its_own_name() {
+        let arch: Arch = "gfx1200".parse().unwrap();
+        assert_eq!(arch, Arch::Gfx1200);
+        assert_eq!(arch.name(), "gfx1200");
+        assert!(arch.gfx12() && !arch.wave64());
+        assert_eq!(serde_json::to_string(&arch).unwrap(), "\"gfx1200\"");
+        assert_eq!(arch.barrier(), Arch::Gfx1201.barrier());
+        assert_eq!(arch.wmma_iu4(), Arch::Gfx1201.wmma_iu4());
+        assert_eq!(arch.buffer_offset_max(), Arch::Gfx1201.buffer_offset_max());
+        assert!(arch.check_mnemonic("s_wait_alu").is_ok());
+        assert!(arch.check_mnemonic("s_waitcnt").is_err());
     }
 
     #[test]

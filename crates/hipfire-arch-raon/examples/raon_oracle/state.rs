@@ -51,10 +51,10 @@ pub fn run(_fixtures: &Path, opts: &BTreeMap<String, String>) -> Result<Value, S
     let mode = opts.get("mode").map(String::as_str).unwrap_or("state-only");
     let forward_mode = match mode {
         "state-only" | "state" => None,
-        "serial" | "batched" | "graph" => Some(mode),
+        "serial" | "batched" | "batched-fp" | "graph" => Some(mode),
         other => {
             return Err(format!(
-                "state: unknown --mode {other} (serial|batched|graph|state-only)"
+                "state: unknown --mode {other} (serial|batched|batched-fp|graph|state-only)"
             ))
         }
     };
@@ -159,6 +159,7 @@ pub fn run(_fixtures: &Path, opts: &BTreeMap<String, String>) -> Result<Value, S
 /// * `batched`: serial once, batched twice; batched determinism is bitwise,
 ///   cross-route logits must have cosine >= 0.999 and equal top-1. Cross-route
 ///   state differences are reported, never gated bitwise.
+/// * `batched-fp`: batched once, fingerprints only (A/B of the batched route across developer flags).
 /// * `graph`:   [`fwd_graph`]: `--steps` (default 256) greedy decode steps after
 ///   the same batched prefill, eager (`HIPFIRE_GRAPH=0` route) vs graph replay;
 ///   every step's logit bytes, the device `seq_len`, every RDA state / conv
@@ -172,7 +173,7 @@ pub fn run_forward_mode(
     mode: &str,
     opts: &BTreeMap<String, String>,
 ) -> Result<Value, String> {
-    if mode != "serial" && mode != "batched" && mode != "graph" {
+    if mode != "serial" && mode != "batched" && mode != "batched-fp" && mode != "graph" {
         return Err(format!("forward mode `{mode}`: serial|batched|graph"));
     }
     let model = opts
@@ -261,6 +262,15 @@ fn fwd_mode_inner(
             out["serial"] = fwd_route_json(&s1);
             out["serial_repeat_secs"] = json!(s2.secs);
             out["serial_vs_serial"] = det;
+            out["logits_finite"] = json!(finite);
+        }
+        "batched-fp" => {
+            // One batched prefill, fingerprints only (no serial reference): bit-identity A/B of the batched
+            // route across developer flags at long prompts, where the serial route is impractical.
+            let b1 = fwd_run_route(gpu, bundle, tokens, FwdRoute::Batched)?;
+            let finite = fwd_logits_finite(&b1)?;
+            pass &= finite;
+            out["batched"] = fwd_route_json(&b1);
             out["logits_finite"] = json!(finite);
         }
         _ => {

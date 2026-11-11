@@ -2376,7 +2376,7 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         true,
         Some("HIPFIRE_TOPOLOGY_EP"),
-        "Expert-parallel degree for Qwen4 (Flash-Next) on gfx1100 or gfx1201: 1 (default, single device) or 2..=8. Experts shard e % N across N visible homogeneous gfx1100 or gfx1201 cards that can access each other as peers; every card runs the unchanged single-device program. Opt-in; HIPFIRE_QWEN4_EP=0 forces 1."
+        "Expert-parallel degree (1..=8) for models whose carrier declares expert parallelism (today: Qwen4 / Flash-Next on gfx1100 or gfx1201): 1 (default, single device) or 2..=8. Experts shard e % N across N visible homogeneous cards that can access each other as peers; every card runs the unchanged single-device program. Opt-in; the declaring carrier's kill switch (HIPFIRE_QWEN4_EP=0 for Qwen4) forces 1. A model whose carrier does not declare it is refused."
     ),
     field!(
         "topology.pp",
@@ -2388,7 +2388,7 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         true,
         Some("HIPFIRE_TOPOLOGY_PP"),
-        "Pipeline-parallel degree: 1 (default, single device) or 2..=8. Layers split into N contiguous stages across the first N visible devices (hardware.devices / HIPFIRE_DEVICES). An explicit load request with pp > 1 overrides this value; a request of 1 or no request uses it. Cannot combine with tensor parallelism (tp) or Qwen4 expert parallelism."
+        "Pipeline-parallel degree: 1 (default, single device) or 2..=8, for models whose carrier declares pipeline parallelism (today: Qwen3.5 and Qwen4 / Flash-Next, HFQ files only). Layers split into N contiguous stages across the first N visible devices (hardware.devices / HIPFIRE_DEVICES). An explicit load request with pp > 1 overrides this value; a request of 1 or no request uses it. Cannot combine with tensor parallelism (tp) or expert parallelism (topology.ep)."
     ),
     process_field!(
         "hardware.uniform_vram_tolerance_gb",
@@ -2925,7 +2925,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         false,
         "HIPFIRE_GFX12_PRODUCER_QUANT_FUSED",
-        "Fuse the int4 activation quantiser into the gfx1201 RMSNorm/rotate/gated-norm producers (default on exact gfx1201; set to false or HIPFIRE_GFX12_PRODUCER_QUANT_FUSED=0 to opt out; emits block_i4_128 from the _gfx12 producer twins so the standalone quantize_int4_mmq_ds128 launch disappears at each admitted site, bit-identical)."
+        "Fuse the activation quantiser into the gfx1201 producers (default on exact gfx1201; set to false or HIPFIRE_GFX12_PRODUCER_QUANT_FUSED=0 to opt out). IU4: emits block_i4_128 from the RMSNorm/rotate/gated-norm _gfx12 producer twins so the standalone quantize_int4_mmq_ds128 launch disappears at each admitted site. A8 (grouped MoE / gated-FFN down, W4A8 tier): one launch forms the SwiGLU/SiTU activation, casts, pads, divides by the AWQ scale, rotates and emits block_i8_128, replacing the activation + mq_rotate_x + quantize_int8_mmq_ds128 chain (the F32 activation/rotation planes are never written). Bit-identical."
     ),
     process_bool_field!(
         "kernel.g12_norm",
@@ -4074,8 +4074,12 @@ pub fn is_developer_key(key: &str) -> bool {
 /// developer key keeps its free-form legacy spelling.
 const TYPED_BOOL_DEVELOPER_KEYS: &[&str] = &[
     "developer.qwen4_moe_sym_iu4",
+    "developer.qwen4_trunk_a8",
+    "developer.qwen4_moe_down_a8",
+    "developer.qwen4_moe_down_a8_indexed",
     "developer.qwen4_d2_default",
     "developer.qwen4_mtp_head_d2",
+    "developer.qwen4_mtp_head_resident",
     "developer.qwen4_sp",
     "developer.qwen4_sp_touched",
     "developer.moe_sym_iu4",
@@ -4671,6 +4675,225 @@ pub fn oom_guard_effective(arch: Option<&str>) -> bool {
 /// is being consolidated. Values come exclusively from the process snapshot.
 pub fn developer_var(name: &str) -> std::result::Result<String, std::env::VarError> {
     process_value(name).ok_or(std::env::VarError::NotPresent)
+}
+
+/// `HIPFIRE_QWEN4_EP_SAMPLED_WIDE_VERIFY` (developer, default off): EP lane verify of
+/// UNSEEDED SAMPLED lanes in one wide pass of up to 32 rows instead of
+/// `ceil(rows / 8)` row-exact groups. Greedy lanes and lanes with an explicit request
+/// seed keep the row-exact 8-row groups (a mixed step runs both kinds as separate
+/// groups). The wide group runs the ordinary prefill-class routes at its width (the
+/// verify scope stays closed: no row-exact twins, grouped expert-union MoE, never IU4
+/// on verify rows); its rows are distribution-equivalent, not byte-equal, to the
+/// row-exact ones. A sampled request's output is reproducible across batch
+/// compositions only with a seed AND `HIPFIRE_QWEN4_LANE_ROW_EXACT=seeded` (or at C1). Implies the 32-row EP gather capacity
+/// (`HIPFIRE_QWEN4_EP_WIDE_VERIFY`).
+pub const QWEN4_EP_SAMPLED_WIDE_VERIFY_ENV: &str = "HIPFIRE_QWEN4_EP_SAMPLED_WIDE_VERIFY";
+
+/// [`QWEN4_EP_SAMPLED_WIDE_VERIFY_ENV`] read through the process snapshot.
+pub fn qwen4_ep_sampled_wide_verify() -> bool {
+    developer_bool(QWEN4_EP_SAMPLED_WIDE_VERIFY_ENV, false)
+}
+
+/// `HIPFIRE_QWEN4_LANE_ROW_EXACT` (developer, default `0` = off): which Flash-Next lane
+/// classes keep every all-rows (9..=64-row) lane step bitwise their <=8-row rows, so output
+/// does not depend on batch composition. Unset, `0`, `off`, `false`: no lane is row-exact
+/// (the default: concurrent native-MTP output at >= 3 lanes may depend on batch composition;
+/// C1 and AR steps of <= 8 rows stay exact). `greedy`: greedy lanes; `seeded` (also `1`, `on`,
+/// `true`): greedy lanes and sampled lanes with an explicit request seed. Opting in costs
+/// step time on the exact steps (CHANGELOG). Unrecognised values warn once and mean `0`.
+pub const QWEN4_LANE_ROW_EXACT_ENV: &str = "HIPFIRE_QWEN4_LANE_ROW_EXACT";
+
+/// Lane classes that run their all-rows steps row-exact ([`QWEN4_LANE_ROW_EXACT_ENV`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LaneRowExact {
+    /// No lane is row-exact (default).
+    Off,
+    /// Greedy lanes only.
+    Greedy,
+    /// Greedy lanes and seeded sampled lanes.
+    GreedySeeded,
+}
+
+/// Pure parse of [`QWEN4_LANE_ROW_EXACT_ENV`]: trimmed, ASCII case-insensitive; `greedy` is
+/// `Greedy`; `seeded`, `1`, `on`, `true` are `GreedySeeded`; unset, `0`, `off`, `false` and
+/// anything unrecognised are `Off`.
+pub fn parse_lane_row_exact(raw: Option<&str>) -> LaneRowExact {
+    let Some(raw) = raw else {
+        return LaneRowExact::Off;
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "greedy" => LaneRowExact::Greedy,
+        "seeded" | "1" | "on" | "true" => LaneRowExact::GreedySeeded,
+        _ => LaneRowExact::Off,
+    }
+}
+
+/// [`QWEN4_LANE_ROW_EXACT_ENV`] read once per process through the developer snapshot.
+pub fn qwen4_lane_row_exact() -> LaneRowExact {
+    static MODE: LazyLock<LaneRowExact> = LazyLock::new(|| {
+        let raw = developer_var(QWEN4_LANE_ROW_EXACT_ENV).ok();
+        if let Some(v) = raw.as_deref() {
+            let t = v.trim().to_ascii_lowercase();
+            if !matches!(
+                t.as_str(),
+                "" | "seeded" | "1" | "on" | "true" | "greedy" | "0" | "off" | "false"
+            ) {
+                eprintln!("[WARN] {QWEN4_LANE_ROW_EXACT_ENV}={v} is not seeded|greedy|0; using 0");
+            }
+        }
+        parse_lane_row_exact(raw.as_deref())
+    });
+    *MODE
+}
+
+/// `HIPFIRE_QWEN4_LANE_RESERVE_TRIM` (developer, default ON, exact `0` is the kill
+/// switch): the Flash-Next GDN verify capture ring of every state (an MTP lane's, the
+/// singleton's) is laid out as ONE shared pool allocation whose per-layer windows overlap
+/// only in ring slots no kernel touches, instead of `rows + 1` slots per GDN layer. Same
+/// kernels, same views, same bytes written; it only removes dead allocation, which an EP2
+/// serve load turns into resident expert units (see `Qwen4State::ensure_row_capture`).
+/// `0` restores the per-layer allocation (and the old lane reservation) byte for byte.
+pub const QWEN4_LANE_RESERVE_TRIM_ENV: &str = "HIPFIRE_QWEN4_LANE_RESERVE_TRIM";
+
+/// [`QWEN4_LANE_RESERVE_TRIM_ENV`] read through the process snapshot.
+pub fn qwen4_lane_reserve_trim() -> bool {
+    developer_bool(QWEN4_LANE_RESERVE_TRIM_ENV, true)
+}
+
+/// `HIPFIRE_QWEN4_LANE_APPEND_SHARE` (developer, default ON, exact `0` is the kill switch):
+/// the native-MTP singleton drafter's prompt-fill Append scratch (`MtpAppendScratch`) is a
+/// non-owning view of the staged lane store's own scratch instead of a second allocation
+/// of the same shape, and an EP load with spec lanes does not reserve it twice. The two
+/// are never in use at the same time (one driver thread, one stream, and the lane store and
+/// the singleton already share the bundle's one forward scratch), and the scratch is
+/// rewritten by every pass before it is read (see `Qwen4MtpDrafter::ensure_resources`).
+/// `0` restores the per-drafter allocation and the old reservation byte for byte.
+pub const QWEN4_LANE_APPEND_SHARE_ENV: &str = "HIPFIRE_QWEN4_LANE_APPEND_SHARE";
+
+/// [`QWEN4_LANE_APPEND_SHARE_ENV`] read through the process snapshot.
+pub fn qwen4_lane_append_share() -> bool {
+    developer_bool(QWEN4_LANE_APPEND_SHARE_ENV, true)
+}
+
+/// `HIPFIRE_QWEN4_LANE_PAGE_BUDGET` (developer, default ON, exact `0` is the kill switch):
+/// Flash-Next Qwen4 VMM lanes (single device and EP) reserve a request's worst-case context
+/// growth when it is admitted and admit it only while the unmapped growth already promised to
+/// live lanes plus its own fits the device's free memory (minus the load-time lane charge not
+/// yet consumed and a safety margin); a request that does not fit stays queued and is retried
+/// at the next step boundary instead of failing mid-step on a mapping refusal. `0` restores the
+/// previous admission (slots and context length only) exactly.
+pub const QWEN4_LANE_PAGE_BUDGET_ENV: &str = "HIPFIRE_QWEN4_LANE_PAGE_BUDGET";
+
+/// [`QWEN4_LANE_PAGE_BUDGET_ENV`] read through the process snapshot.
+pub fn qwen4_lane_page_budget() -> bool {
+    developer_bool(QWEN4_LANE_PAGE_BUDGET_ENV, true)
+}
+
+/// `HIPFIRE_QWEN4_LANE_PAGE_BUDGET_MARGIN_MIB` (developer): free device memory, in MiB, the lane
+/// page budget keeps untouched on every rank (unmodelled transient allocations, driver slack).
+/// Unset or unparsable = [`QWEN4_LANE_PAGE_BUDGET_MARGIN_DEFAULT_MIB`].
+pub const QWEN4_LANE_PAGE_BUDGET_MARGIN_MIB_ENV: &str = "HIPFIRE_QWEN4_LANE_PAGE_BUDGET_MARGIN_MIB";
+
+/// Default lane page budget margin per rank, MiB.
+pub const QWEN4_LANE_PAGE_BUDGET_MARGIN_DEFAULT_MIB: u64 = 256;
+
+/// [`QWEN4_LANE_PAGE_BUDGET_MARGIN_MIB_ENV`] in bytes, read through the process snapshot.
+pub fn qwen4_lane_page_budget_margin_bytes() -> u64 {
+    developer_var(QWEN4_LANE_PAGE_BUDGET_MARGIN_MIB_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(QWEN4_LANE_PAGE_BUDGET_MARGIN_DEFAULT_MIB)
+        .saturating_mul(1 << 20)
+}
+
+/// `HIPFIRE_QWEN4_LANE_PAGE_BUDGET_COLD_MIB` (developer): free device memory, in MiB per rank,
+/// the lane page budget holds back for the FIRST long prompt tile of a process, while no lane has
+/// yet prefilled past the charged lane rows. That tile grows memory no lane owns (pooled tile
+/// scratch, GEMM input buffers, kernel modules); it is taken from `free` once and stays out of it,
+/// so the reservation only has to cover it until the first long tile has run. Unset or unparsable =
+/// [`QWEN4_LANE_PAGE_BUDGET_COLD_DEFAULT_MIB`]; `0` holds nothing back.
+pub const QWEN4_LANE_PAGE_BUDGET_COLD_MIB_ENV: &str = "HIPFIRE_QWEN4_LANE_PAGE_BUDGET_COLD_MIB";
+
+/// Default cold-start reserve per rank, MiB: the served card test (j7704) saw the first 4096-row tile
+/// of two lanes take more than the 1002 MiB left free per card, with the lanes' own pages under 200 MiB.
+pub const QWEN4_LANE_PAGE_BUDGET_COLD_DEFAULT_MIB: u64 = 1280;
+
+/// [`QWEN4_LANE_PAGE_BUDGET_COLD_MIB_ENV`] in bytes, read through the process snapshot.
+pub fn qwen4_lane_page_budget_cold_bytes() -> u64 {
+    developer_var(QWEN4_LANE_PAGE_BUDGET_COLD_MIB_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(QWEN4_LANE_PAGE_BUDGET_COLD_DEFAULT_MIB)
+        .saturating_mul(1 << 20)
+}
+
+/// `HIPFIRE_QWEN4_LANE_PAGE_TRACE` (developer, default off): stderr `[lane-pages]` lines with every
+/// rank's lane page numbers at each admission and the free device bytes before and after every lane
+/// context map next to the bytes the budget predicted for it, so a card test can show predicted ==
+/// actual and name whatever else took the memory.
+pub const QWEN4_LANE_PAGE_TRACE_ENV: &str = "HIPFIRE_QWEN4_LANE_PAGE_TRACE";
+
+/// [`QWEN4_LANE_PAGE_TRACE_ENV`] read through the process snapshot.
+pub fn qwen4_lane_page_trace() -> bool {
+    developer_bool(QWEN4_LANE_PAGE_TRACE_ENV, false)
+}
+
+/// `HIPFIRE_QWEN4_EP_WIDE_VERIFY_ALL_LANES` (lab, default off): with
+/// [`QWEN4_EP_SAMPLED_WIDE_VERIFY_ENV`] on, treat every lane (greedy and seeded
+/// included) as wide-class. For oracles that measure the wide pass with greedy
+/// prompts; never for serving.
+pub fn qwen4_ep_wide_verify_all_lanes() -> bool {
+    developer_bool("HIPFIRE_QWEN4_EP_WIDE_VERIFY_ALL_LANES", false)
+}
+
+/// `HIPFIRE_QWEN4_EP_WIDE_VERIFY_ROWS` (developer, default 32): the rows one wide-class
+/// verify group may carry (`pack_classed_row_groups`' wide cap) and, with it, the EP
+/// row-gather capacity of the verify scope. An unsigned integer clamped to
+/// [`QWEN4_EP_WIDE_VERIFY_DEFAULT_ROWS`]`..=`[`QWEN4_EP_WIDE_VERIFY_ROWS_MAX`]; unset or
+/// unparsable is the default (32, today's shipped width). Read when a wide verify
+/// flag is on ([`QWEN4_EP_SAMPLED_WIDE_VERIFY_ENV`] or `HIPFIRE_QWEN4_EP_WIDE_VERIFY`), and, on
+/// exact gfx1201 EP ranks with `HIPFIRE_QWEN4_EP_WIDE_VERIFY` unset, as the gather capacity (default 48);
+/// the arch forward lowers it further to the lowest hard limit of any stage that runs
+/// the wide group (`gpu_forward::qwen4_ep_wide_group_cap`). Every rank of a mesh must
+/// run with the same value (the packing rule is shared by the root's verify seal and
+/// every rank's lane forward).
+pub const QWEN4_EP_WIDE_VERIFY_ROWS_ENV: &str = "HIPFIRE_QWEN4_EP_WIDE_VERIFY_ROWS";
+/// Floor and default of [`QWEN4_EP_WIDE_VERIFY_ROWS_ENV`]: the 32-row wide pass.
+pub const QWEN4_EP_WIDE_VERIFY_DEFAULT_ROWS: usize = 32;
+/// Ceiling of [`QWEN4_EP_WIDE_VERIFY_ROWS_ENV`]: the physical verify window
+/// ([`QWEN4_VERIFY_MAX_ROWS`]).
+pub const QWEN4_EP_WIDE_VERIFY_ROWS_MAX: usize = QWEN4_VERIFY_MAX_ROWS;
+
+/// Pure parse of [`QWEN4_EP_WIDE_VERIFY_ROWS_ENV`]: trimmed unsigned integer clamped
+/// to the documented range; `None`, empty or unparsable (including negative) is
+/// [`QWEN4_EP_WIDE_VERIFY_DEFAULT_ROWS`].
+pub fn qwen4_ep_wide_verify_rows_value(raw: Option<&str>) -> usize {
+    raw.and_then(|raw| raw.trim().parse::<usize>().ok()).map_or(
+        QWEN4_EP_WIDE_VERIFY_DEFAULT_ROWS,
+        |rows| {
+            rows.clamp(
+                QWEN4_EP_WIDE_VERIFY_DEFAULT_ROWS,
+                QWEN4_EP_WIDE_VERIFY_ROWS_MAX,
+            )
+        },
+    )
+}
+
+/// [`QWEN4_EP_WIDE_VERIFY_ROWS_ENV`] read once through the process snapshot.
+pub fn qwen4_ep_wide_verify_rows() -> usize {
+    static ROWS: LazyLock<usize> = LazyLock::new(|| {
+        qwen4_ep_wide_verify_rows_value(process_value(QWEN4_EP_WIDE_VERIFY_ROWS_ENV).as_deref())
+    });
+    *ROWS
+}
+
+/// [`qwen4_ep_wide_verify_rows`] when [`QWEN4_EP_WIDE_VERIFY_ROWS_ENV`] is explicitly set to an
+/// unsigned integer, else `None` (unset or unparsable): the exact-gfx1201 EP default gather
+/// capacity (`gpu_forward::qwen4_ep_gather_rows`) sizes itself from the variable only then.
+pub fn qwen4_ep_wide_verify_rows_explicit() -> Option<usize> {
+    process_value(QWEN4_EP_WIDE_VERIFY_ROWS_ENV)
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .map(|_| qwen4_ep_wide_verify_rows())
 }
 
 pub fn developer_var_os(name: &str) -> Option<std::ffi::OsString> {
@@ -6306,22 +6529,62 @@ fn insert_toml_path(
     insert_toml_path(nested, tail, value)
 }
 
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+/// Process-wide sequence for [`stage_file`] names: every writer in a process
+/// shares the pid, so the pid alone cannot keep two threads apart.
+static STAGING_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Write `bytes` to a staging file beside `path` and return its path; the
+/// caller then [`publish_staged`]s it (or removes it). The file is private to
+/// this call (`<stem>.tmp.<pid>.<seq>`, created `O_EXCL` so a stale leftover of
+/// a reused pid is skipped, not truncated), so concurrent writers of one file,
+/// whether threads of this process or other processes, never share a staging
+/// file. A failed write removes its own staging file.
+pub(crate) fn stage_file(path: &Path, bytes: &[u8]) -> Result<PathBuf> {
+    use std::io::Write as _;
+
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| ConfigError::Write {
             path: parent.to_owned(),
             source,
         })?;
     }
-    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-    fs::write(&tmp, bytes).map_err(|source| ConfigError::Write {
-        path: tmp.clone(),
-        source,
-    })?;
-    fs::rename(&tmp, path).map_err(|source| ConfigError::Write {
-        path: path.to_owned(),
-        source,
+    let (tmp, mut staged) = loop {
+        let seq = STAGING_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = path.with_extension(format!("tmp.{}.{seq}", std::process::id()));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(file) => break (tmp, file),
+            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(source) => return Err(ConfigError::Write { path: tmp, source }),
+        }
+    };
+    if let Err(source) = staged.write_all(bytes) {
+        drop(staged);
+        let _ = fs::remove_file(&tmp);
+        return Err(ConfigError::Write { path: tmp, source });
+    }
+    Ok(tmp)
+}
+
+/// Rename a [`stage_file`] staging file over `path`; a failed rename removes
+/// the staging file.
+pub(crate) fn publish_staged(tmp: &Path, path: &Path) -> Result<()> {
+    fs::rename(tmp, path).map_err(|source| {
+        let _ = fs::remove_file(tmp);
+        ConfigError::Write {
+            path: path.to_owned(),
+            source,
+        }
     })
+}
+
+/// Replace `path` with `bytes`: stage in a sibling file, then rename over it.
+/// The last rename wins and every reader sees one whole payload.
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    publish_staged(&stage_file(path, bytes)?, path)
 }
 
 fn read_string(path: &Path) -> Result<String> {
@@ -6335,7 +6598,7 @@ fn read_string(path: &Path) -> Result<String> {
 ///
 /// Custom profiles live under `~/.hipfire/profiles/<name>.toml`. Profile names are
 /// control-plane identifiers only; they are never persisted inside `config.toml`.
-pub const CONFIG_PROFILE_NAMES: &[&str] = &["default", "dev", "hip", "redline"];
+pub const CONFIG_PROFILE_NAMES: &[&str] = &["default", "dev", "hip", "quality", "redline"];
 
 /// Origin of a selectable configuration profile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -6643,6 +6906,9 @@ fn config_profile_bundle(name: &str) -> Option<Vec<(&'static str, ConfigValue)>>
             ("developer.dspark_profile", ConfigValue::Bool(true)),
         ],
         "hip" => vec![("replay.backend", ConfigValue::String("hip".to_owned()))],
+        // Opt-in Flash-Next quality mode: F32 GDN recurrent state (no per-token
+        // requantization). Costs memory and speed; `auto` stays the default.
+        "quality" => vec![("memory.state_quant", ConfigValue::String("fp32".to_owned()))],
         "redline" => vec![
             ("replay.backend", ConfigValue::String("redline".to_owned())),
             ("replay.transport", ConfigValue::String("pm4".to_owned())),
@@ -6710,6 +6976,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parse_lane_row_exact_values() {
+        use super::LaneRowExact::*;
+        assert_eq!(parse_lane_row_exact(None), Off);
+        for v in ["seeded", "1", "on", "true", " SEEDED ", "On"] {
+            assert_eq!(parse_lane_row_exact(Some(v)), GreedySeeded, "{v:?}");
+        }
+        for v in ["greedy", " Greedy "] {
+            assert_eq!(parse_lane_row_exact(Some(v)), Greedy, "{v:?}");
+        }
+        for v in ["0", "off", "FALSE", " 0 ", "bogus", ""] {
+            assert_eq!(parse_lane_row_exact(Some(v)), Off, "{v:?}");
+        }
+    }
+
+    #[test]
     fn deprecated_key_covers_cask_and_pflash_families() {
         for key in [
             "memory.cask.enabled",
@@ -6751,6 +7032,54 @@ mod tests {
 
     fn temp_root(name: &str) -> PathBuf {
         env::temp_dir().join(format!("hipfire-config-{name}-{}", std::process::id()))
+    }
+
+    /// Every writer in one process shares the pid, so a pid-only staging name
+    /// made concurrent writes of one file race: one writer's rename took the
+    /// staging file out from under another (`No such file or directory`), or
+    /// two writers interleaved into it. Sixteen threads released together by a
+    /// barrier writing the same file must all succeed, leave exactly one whole
+    /// payload and leave no staging file behind.
+    #[test]
+    fn concurrent_atomic_writes_of_one_file_all_succeed_and_leave_one_whole_payload() {
+        const THREADS: usize = 16;
+        const ROUNDS: usize = 100;
+        let root = temp_root("atomic-write-concurrent");
+        let _ = fs::remove_dir_all(&root);
+        let path = root.join("config.toml");
+        // Distinct multi-page payloads, so overlapping writers would visibly mix.
+        let payloads: Vec<Vec<u8>> = (0..THREADS)
+            .map(|thread| format!("writer = {thread}\n").repeat(2048).into_bytes())
+            .collect();
+        let start = std::sync::Barrier::new(THREADS);
+        std::thread::scope(|scope| {
+            for payload in &payloads {
+                let (path, start) = (&path, &start);
+                scope.spawn(move || {
+                    start.wait();
+                    for round in 0..ROUNDS {
+                        atomic_write(path, payload)
+                            .unwrap_or_else(|error| panic!("round {round}: {error}"));
+                    }
+                });
+            }
+        });
+        let written = fs::read(&path).unwrap();
+        assert!(
+            payloads.contains(&written),
+            "config.toml is not one writer's whole payload ({} bytes)",
+            written.len()
+        );
+        let entries: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            entries,
+            [std::ffi::OsString::from("config.toml")],
+            "a staging file was left behind"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     fn home_env<'a>(
@@ -7111,6 +7440,257 @@ mod tests {
                 "{raw}"
             );
         }
+    }
+
+    #[test]
+    fn qwen4_mtp_head_resident_is_a_typed_bool_developer_key_default_off() {
+        const KEY: &str = "developer.qwen4_mtp_head_resident";
+        const ENV: &str = "HIPFIRE_QWEN4_MTP_HEAD_RESIDENT";
+        assert!(is_developer_key(KEY));
+        assert!(is_typed_bool_developer_key(KEY));
+        assert_eq!(developer_key_for_env(ENV).as_deref(), Some(KEY));
+        assert_eq!(typed_developer_bool_value(ENV, None), None);
+        for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            assert_eq!(
+                typed_developer_bool_value(ENV, Some(raw)),
+                Some(want),
+                "{raw}"
+            );
+        }
+        assert_eq!(memory::qwen4_mtp_head_resident(), None);
+    }
+
+    /// `memory::set_qwen4_d2_window_load_default` writes a process-global atomic that
+    /// `memory::qwen4_d2_window_rows` reads, and libtest runs tests on parallel threads: a test
+    /// that writes the load default (or reads the resolved window, which depends on it) holds
+    /// this lock for its whole body. Dropping the guard restores the default 4 even when an
+    /// assertion in the holder panics, so a failure cannot leak a wider window into the other
+    /// test.
+    struct D2WindowLoadDefaultGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for D2WindowLoadDefaultGuard {
+        // Runs before the field drops, i.e. while the lock is still held.
+        fn drop(&mut self) {
+            memory::set_qwen4_d2_window_load_default(memory::QWEN4_D2_WINDOW_ROWS_DEFAULT);
+        }
+    }
+
+    fn lock_d2_window_load_default() -> D2WindowLoadDefaultGuard {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let guard = LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        memory::set_qwen4_d2_window_load_default(memory::QWEN4_D2_WINDOW_ROWS_DEFAULT);
+        D2WindowLoadDefaultGuard { _lock: guard }
+    }
+
+    #[test]
+    fn qwen4_d2_window_rows_parses_four_to_eight_and_refuses_everything_else() {
+        use memory::parse_d2_window_rows as parse;
+        let _window = lock_d2_window_load_default();
+        assert_eq!(parse(None), Ok(4));
+        for rows in 4..=8usize {
+            assert_eq!(parse(Some(&rows.to_string())), Ok(rows));
+        }
+        for bad in ["", "0", "1", "3", "9", "64", "-5", "5.0", "eight", " 6"] {
+            let error = parse(Some(bad)).unwrap_err();
+            assert!(
+                error.contains("HIPFIRE_QWEN4_D2_WINDOW_ROWS"),
+                "{bad}: {error}"
+            );
+        }
+        // The process snapshot of a test binary carries no knob.
+        assert_eq!(memory::qwen4_d2_window_rows(), 4);
+        assert_eq!(memory::validate_qwen4_d2_window_rows(), Ok(()));
+    }
+
+    /// The default D2 window: 8 on exact gfx1100 without slab owners, 4 everywhere else (other
+    /// arches, slab owners, an unknown arch), an explicit knob always wins, an invalid one reads 4.
+    #[test]
+    fn qwen4_d2_window_default_is_eight_on_gfx1100_aggregate_only_and_explicit_wins() {
+        use memory::{
+            qwen4_d2_window_default_for as default_for, resolve_d2_window_rows as resolve,
+        };
+        let _window = lock_d2_window_load_default();
+        assert_eq!(default_for("gfx1100", false), 8);
+        assert_eq!(
+            default_for("gfx1100", true),
+            4,
+            "slab owners (mq3/mq2-xts) are unmeasured at 8"
+        );
+        for arch in [
+            "gfx1201", "gfx1151", "gfx1200", "gfx942", "gfx906", "gfx1100x", "",
+        ] {
+            for slab in [false, true] {
+                assert_eq!(default_for(arch, slab), 4, "{arch:?} slab={slab}");
+            }
+        }
+        // Unset: the load default (clamped into 4..=8); explicit valid values win over it.
+        assert_eq!(resolve(None, 8), 8);
+        assert_eq!(resolve(None, 4), 4);
+        assert_eq!(resolve(None, 99), 8);
+        assert_eq!(resolve(None, 0), 4);
+        for rows in 4..=8usize {
+            for load_default in [4usize, 8] {
+                assert_eq!(resolve(Some(&rows.to_string()), load_default), rows);
+            }
+        }
+        // `=4` is the kill on gfx1100; an invalid spelling reads as 4 (the load refuses it).
+        assert_eq!(resolve(Some("4"), 8), 4);
+        for bad in ["", "3", "9", "eight"] {
+            assert_eq!(resolve(Some(bad), 8), 4, "{bad:?}");
+        }
+        // The loader's per-load record round-trips (the guard restores it for the other tests).
+        memory::set_qwen4_d2_window_load_default(8);
+        assert_eq!(memory::qwen4_d2_window_rows(), 8);
+        memory::set_qwen4_d2_window_load_default(4);
+        assert_eq!(memory::qwen4_d2_window_rows(), 4);
+    }
+
+    #[test]
+    fn hfq_reader_knobs_parse_in_range_and_refuse_everything_else() {
+        use memory::{parse_hfq_reader_chunk_mib as chunk, parse_hfq_reader_lanes as lanes};
+        assert_eq!(lanes(None), Ok(None));
+        assert_eq!(lanes(Some("")), Ok(None));
+        assert_eq!(lanes(Some(" 16 ")), Ok(Some(16)));
+        assert_eq!(lanes(Some("1")), Ok(Some(1)));
+        assert_eq!(lanes(Some("64")), Ok(Some(64)));
+        assert_eq!(chunk(None), Ok(None));
+        assert_eq!(chunk(Some("4")), Ok(Some(4)));
+        assert_eq!(chunk(Some("16")), Ok(Some(16)));
+        for bad in ["0", "65", "-4", "4.0", "four"] {
+            let error = lanes(Some(bad)).unwrap_err();
+            assert!(error.contains("HIPFIRE_HFQ_READER_LANES"), "{bad}: {error}");
+        }
+        for bad in ["0", "17", "64", "eight"] {
+            let error = chunk(Some(bad)).unwrap_err();
+            assert!(
+                error.contains("HIPFIRE_HFQ_READER_CHUNK_MIB"),
+                "{bad}: {error}"
+            );
+        }
+        // The process snapshot of a test binary carries no knob.
+        assert_eq!(memory::hfq_reader_lanes(), Ok(None));
+        assert_eq!(memory::hfq_reader_chunk_mib(), Ok(None));
+    }
+
+    #[test]
+    fn ep_gather_direct_is_on_unless_exactly_zero() {
+        use memory::parse_ep_gather_direct as parse;
+        assert!(parse(None) && parse(Some("")) && parse(Some("1")) && parse(Some("off")));
+        assert!(!parse(Some("0")) && !parse(Some(" 0 ")));
+        assert!(memory::ep_gather_direct());
+    }
+
+    #[test]
+    fn ep_mtp_experts_resident_is_on_unless_exactly_zero() {
+        use memory::parse_ep_mtp_experts_resident as parse;
+        assert!(parse(None) && parse(Some("")) && parse(Some("1")) && parse(Some("off")));
+        assert!(parse(Some("true")) && parse(Some("00")) && parse(Some("2")));
+        assert!(!parse(Some("0")) && !parse(Some(" 0 ")));
+        // The process snapshot of a test binary carries no knob: the default is on.
+        assert!(memory::ep_mtp_experts_resident());
+        assert_eq!(
+            developer_key_for_env("HIPFIRE_EP_MTP_EXPERTS_RESIDENT").as_deref(),
+            Some("developer.ep_mtp_experts_resident")
+        );
+    }
+
+    #[test]
+    fn ep_hc8_plan_charge_is_on_unless_exactly_zero() {
+        use memory::parse_ep_hc8_plan_charge as parse;
+        assert!(parse(None) && parse(Some("")) && parse(Some("1")) && parse(Some("off")));
+        assert!(parse(Some("true")) && parse(Some("00")) && parse(Some("2")));
+        assert!(!parse(Some("0")) && !parse(Some(" 0 ")));
+        assert!(memory::ep_hc8_plan_charge());
+        assert_eq!(
+            developer_key_for_env("HIPFIRE_EP_HC8_PLAN_CHARGE").as_deref(),
+            Some("developer.ep_hc8_plan_charge")
+        );
+    }
+
+    #[test]
+    fn ep_reserve_census_is_on_unless_exactly_zero() {
+        use memory::parse_ep_reserve_census as parse;
+        assert!(parse(None) && parse(Some("")) && parse(Some("1")) && parse(Some("off")));
+        assert!(parse(Some("true")) && parse(Some("00")) && parse(Some("2")));
+        assert!(!parse(Some("0")) && !parse(Some(" 0 ")));
+        assert!(memory::ep_reserve_census());
+        assert_eq!(
+            developer_key_for_env("HIPFIRE_EP_RESERVE_CENSUS").as_deref(),
+            Some("developer.ep_reserve_census")
+        );
+    }
+
+    #[test]
+    fn ep_hot_units_policy_and_sidecar_path() {
+        use memory::{parse_ep_hot_units as parse, EpHotUnits};
+        assert_eq!(parse(None), Ok(EpHotUnits::Discover));
+        assert_eq!(parse(Some("0")), Ok(EpHotUnits::Off));
+        assert_eq!(parse(Some(" 0 ")), Ok(EpHotUnits::Off));
+        assert_eq!(parse(Some("")), Ok(EpHotUnits::Off));
+        assert_eq!(
+            parse(Some(" /m/q.mq4.ep.hot-units ")),
+            Ok(EpHotUnits::Explicit("/m/q.mq4.ep.hot-units".into()))
+        );
+        for bad in ["1", "on", "q.ep.hot-units", "./q.ep.hot-units"] {
+            let error = parse(Some(bad)).unwrap_err();
+            assert!(error.contains("HIPFIRE_EP_HOT_UNITS"), "{bad}: {error}");
+        }
+        assert_eq!(memory::ep_hot_units(), Ok(EpHotUnits::Discover));
+        assert_eq!(
+            developer_key_for_env("HIPFIRE_EP_HOT_UNITS").as_deref(),
+            Some("developer.ep_hot_units")
+        );
+        assert_eq!(
+            memory::ep_hot_units_sidecar_path(Path::new("/m/q.mq4")),
+            PathBuf::from("/m/q.mq4.ep.hot-units")
+        );
+    }
+
+    #[test]
+    fn ep_hot_loan_mib_is_measured_unless_zero_or_a_positive_integer() {
+        use memory::{parse_ep_hot_loan_mib as parse, EpHotLoanMib};
+        assert_eq!(parse(None), Ok(EpHotLoanMib::Measured));
+        assert_eq!(parse(Some("0")), Ok(EpHotLoanMib::Off));
+        assert_eq!(parse(Some("")), Ok(EpHotLoanMib::Off));
+        assert_eq!(parse(Some(" 768 ")), Ok(EpHotLoanMib::Mib(768)));
+        assert_eq!(parse(Some("4096")), Ok(EpHotLoanMib::Mib(4096)));
+        for bad in ["-1", "1.5", "1GiB", "on", "0x10"] {
+            let error = parse(Some(bad)).unwrap_err();
+            assert!(error.contains("HIPFIRE_EP_HOT_LOAN_MIB"), "{bad}: {error}");
+        }
+        assert_eq!(memory::ep_hot_loan_mib(), Ok(EpHotLoanMib::Measured));
+        assert_eq!(
+            developer_key_for_env("HIPFIRE_EP_HOT_LOAN_MIB").as_deref(),
+            Some("developer.ep_hot_loan_mib")
+        );
+    }
+
+    #[test]
+    fn ep_elastic_cap_is_default_unless_zero_or_a_positive_integer() {
+        use memory::parse_ep_elastic_cap_bytes as parse;
+        assert_eq!(parse(None), Ok(2048 << 20));
+        assert_eq!(parse(Some("0")), Ok(0));
+        assert_eq!(parse(Some("")), Ok(0));
+        assert_eq!(parse(Some(" 512 ")), Ok(512 << 20));
+        for bad in ["-1", "1.5", "lots", "0x10", "99999999999999999999"] {
+            let error = parse(Some(bad)).unwrap_err();
+            assert!(error.contains("HIPFIRE_EP_ELASTIC_MIB"), "{bad}: {error}");
+        }
+        assert!(parse(Some("18446744073709551615"))
+            .unwrap_err()
+            .contains("overflows"));
+        assert_eq!(memory::ep_elastic_cap_bytes(), Ok(2048 << 20));
+        assert!(!memory::ep_elastic_log());
+        assert_eq!(
+            developer_key_for_env("HIPFIRE_EP_ELASTIC_MIB").as_deref(),
+            Some("developer.ep_elastic_mib")
+        );
+        assert_eq!(
+            developer_key_for_env("HIPFIRE_EP_ELASTIC_LOG").as_deref(),
+            Some("developer.ep_elastic_log")
+        );
     }
 
     #[test]
@@ -8077,6 +8657,27 @@ mod tests {
         assert!(line.contains(mtp_host_spill_reason()), "{line}");
         assert!(line.contains("21 expert blobs"), "{line}");
         assert!(line.contains("offload_exec=pcie"), "{line}");
+    }
+
+    #[test]
+    fn ep_wide_verify_rows_clamps_to_32_to_64_and_defaults_to_32() {
+        assert_eq!(qwen4_ep_wide_verify_rows_value(None), 32);
+        assert_eq!(qwen4_ep_wide_verify_rows_value(Some("")), 32);
+        assert_eq!(qwen4_ep_wide_verify_rows_value(Some("x")), 32);
+        assert_eq!(qwen4_ep_wide_verify_rows_value(Some("-48")), 32);
+        assert_eq!(qwen4_ep_wide_verify_rows_value(Some("4.5")), 32);
+        assert_eq!(qwen4_ep_wide_verify_rows_value(Some("0")), 32);
+        assert_eq!(qwen4_ep_wide_verify_rows_value(Some("8")), 32);
+        assert_eq!(qwen4_ep_wide_verify_rows_value(Some("31")), 32);
+        assert_eq!(qwen4_ep_wide_verify_rows_value(Some("32")), 32);
+        assert_eq!(qwen4_ep_wide_verify_rows_value(Some(" 48 ")), 48);
+        assert_eq!(qwen4_ep_wide_verify_rows_value(Some("63")), 63);
+        assert_eq!(qwen4_ep_wide_verify_rows_value(Some("64")), 64);
+        assert_eq!(qwen4_ep_wide_verify_rows_value(Some("65")), 64);
+        assert_eq!(qwen4_ep_wide_verify_rows_value(Some("99999")), 64);
+        assert_eq!(QWEN4_EP_WIDE_VERIFY_ROWS_MAX, QWEN4_VERIFY_MAX_ROWS);
+        // The live snapshot (nothing sets it in the test process) is the default.
+        assert_eq!(qwen4_ep_wide_verify_rows(), 32);
     }
 
     #[test]
@@ -9507,6 +10108,21 @@ overrides = { decide = { calibration = { choice = 1.3, score = 2, noul = 0.7 } }
     }
 
     #[test]
+    fn quality_profile_opts_into_fp32_gdn_state_and_default_is_unchanged() {
+        let paths = ConfigPaths::under(temp_root("profile-quality"));
+        let layer = load_config_profile(&paths, "quality").unwrap();
+        assert_eq!(
+            layer.get("memory.state_quant"),
+            Some(&ConfigValue::String("fp32".to_owned()))
+        );
+        // The default profile and an empty layer never pin the state format.
+        let default = load_config_profile(&paths, "default").unwrap();
+        assert!(default.get("memory.state_quant").is_none());
+        assert!(ConfigLayer::default().get("memory.state_quant").is_none());
+        let _ = fs::remove_dir_all(paths.root);
+    }
+
+    #[test]
     fn apply_config_profile_rejects_unknown_names() {
         let root = temp_root("profile-unknown");
         let paths = ConfigPaths::under(&root);
@@ -9551,6 +10167,7 @@ overrides = { decide = { calibration = { choice = 1.3, score = 2, noul = 0.7 } }
             "dev",
             "redline",
             "hip",
+            "quality",
             "..",
             "../x",
             "a/b",
@@ -9631,6 +10248,7 @@ overrides = { decide = { calibration = { choice = 1.3, score = 2, noul = 0.7 } }
                 ("default".into(), ConfigProfileKind::Builtin),
                 ("dev".into(), ConfigProfileKind::Builtin),
                 ("hip".into(), ConfigProfileKind::Builtin),
+                ("quality".into(), ConfigProfileKind::Builtin),
                 ("redline".into(), ConfigProfileKind::Builtin),
                 ("alpha".into(), ConfigProfileKind::Custom),
                 ("zeta".into(), ConfigProfileKind::Custom),
@@ -9752,18 +10370,19 @@ pub mod topology {
         }
     }
 
-    /// True when the raw `HIPFIRE_QWEN4_EP` value is the kill switch (`0`).
-    pub fn qwen4_ep_killed(raw: Option<&str>) -> bool {
+    /// True when the raw kill-switch value (a carrier's declared
+    /// `kill_switch_env`, e.g. `HIPFIRE_QWEN4_EP`) is the kill switch (`0`).
+    pub fn ep_killed(raw: Option<&str>) -> bool {
         raw.map(str::trim) == Some("0")
     }
 
-    /// Qwen4 degree from raw inputs: the kill switch wins over any (even
-    /// invalid) configured value.
-    pub fn resolve_qwen4_ep(
+    /// Expert-parallel degree from raw inputs: the kill switch wins over any
+    /// (even invalid) configured value.
+    pub fn resolve_ep(
         configured: Option<&str>,
         kill_switch: Option<&str>,
     ) -> Result<usize, String> {
-        if qwen4_ep_killed(kill_switch) {
+        if ep_killed(kill_switch) {
             return Ok(1);
         }
         parse_ep(configured)
@@ -9774,13 +10393,20 @@ pub mod topology {
         parse_ep(process_value(EP_ENV).as_deref())
     }
 
+    /// The one generic `topology.ep` resolver: the configured degree unless the
+    /// carrier's declared kill switch (`Some(env name)`, `=0`) forces 1. A
+    /// carrier with no kill switch passes `None` and gets [`ep`].
+    pub fn ep_with_kill_switch(kill_switch_env: Option<&str>) -> Result<usize, String> {
+        resolve_ep(
+            process_value(EP_ENV).as_deref(),
+            kill_switch_env.and_then(process_value).as_deref(),
+        )
+    }
+
     /// Effective Qwen4 expert-parallel degree: `topology.ep` unless
     /// `HIPFIRE_QWEN4_EP=0` forces 1.
     pub fn qwen4_ep() -> Result<usize, String> {
-        resolve_qwen4_ep(
-            process_value(EP_ENV).as_deref(),
-            process_value(QWEN4_EP_KILL_SWITCH_ENV).as_deref(),
-        )
+        ep_with_kill_switch(Some(QWEN4_EP_KILL_SWITCH_ENV))
     }
 
     /// Pure parser behind [`pp`]: unset or empty is 1 (the default); an
@@ -9882,17 +10508,17 @@ pub mod topology {
 
         #[test]
         fn kill_switch_forces_one_regardless_of_config() {
-            assert_eq!(resolve_qwen4_ep(Some("4"), Some("0")), Ok(1));
-            assert_eq!(resolve_qwen4_ep(Some("2"), Some("0")), Ok(1));
+            assert_eq!(resolve_ep(Some("4"), Some("0")), Ok(1));
+            assert_eq!(resolve_ep(Some("2"), Some("0")), Ok(1));
             // Even an invalid configured value is moot under the kill switch.
-            assert_eq!(resolve_qwen4_ep(Some("9"), Some("0")), Ok(1));
+            assert_eq!(resolve_ep(Some("9"), Some("0")), Ok(1));
             // Any other kill-switch spelling leaves the config in charge.
-            assert_eq!(resolve_qwen4_ep(Some("4"), Some("1")), Ok(4));
-            assert_eq!(resolve_qwen4_ep(Some("4"), Some("")), Ok(4));
-            assert_eq!(resolve_qwen4_ep(Some("4"), None), Ok(4));
-            assert_eq!(resolve_qwen4_ep(None, None), Ok(1));
-            assert_eq!(resolve_qwen4_ep(Some("6"), None), Ok(6));
-            assert!(resolve_qwen4_ep(Some("9"), None).is_err());
+            assert_eq!(resolve_ep(Some("4"), Some("1")), Ok(4));
+            assert_eq!(resolve_ep(Some("4"), Some("")), Ok(4));
+            assert_eq!(resolve_ep(Some("4"), None), Ok(4));
+            assert_eq!(resolve_ep(None, None), Ok(1));
+            assert_eq!(resolve_ep(Some("6"), None), Ok(6));
+            assert!(resolve_ep(Some("9"), None).is_err());
         }
 
         #[test]
@@ -10275,6 +10901,19 @@ pub mod memory {
         PathBuf::from(path)
     }
 
+    /// Suffix of a Flash-Next HC8 sidecar: offline-requantized 8-bit (E4M3,
+    /// per-row power-of-two scale) hyper-connection mixer weights (an HFQM
+    /// container bound to its base by size and index sha256).
+    pub const HC8_SIDECAR_SUFFIX: &str = ".hc8";
+
+    /// Path of the HC8 sidecar of `model`: `<model file name>.hc8`, appended
+    /// to the full file name, the same placement as [`trunk_overlay_sidecar_path`].
+    pub fn hc8_sidecar_path(model: &Path) -> PathBuf {
+        let mut path = model.as_os_str().to_owned();
+        path.push(HC8_SIDECAR_SUFFIX);
+        PathBuf::from(path)
+    }
+
     /// Suffix of a Flash-Next expert hot set sidecar: the decode-ranked
     /// per-expert VRAM placement of a Qwen4 aggregate-MQ4 base (JSON, bound to
     /// its base by size and index sha256).
@@ -10287,6 +10926,40 @@ pub mod memory {
         path.push(EXPERT_HOTSET_SIDECAR_SUFFIX);
         PathBuf::from(path)
     }
+
+    /// Suffix of the Flash-Next expert-parallel (EP2) expert hot set sidecar: an `.expert-hotset`
+    /// v1 file whose ranking was pooled on EP lane traffic. It is a distinct sidecar from
+    /// [`EXPERT_HOTSET_SIDECAR_SUFFIX`] (the single-card decode ranking), so one base can carry
+    /// both; it still ends in `.expert-hotset`, so model listing treats it as a sidecar.
+    pub const EP_EXPERT_HOTSET_SIDECAR_SUFFIX: &str = ".ep.expert-hotset";
+
+    /// Path of the EP expert hot set sidecar of `model`: `<model file name>.ep.expert-hotset`.
+    pub fn ep_expert_hotset_sidecar_path(model: &Path) -> PathBuf {
+        let mut path = model.as_os_str().to_owned();
+        path.push(EP_EXPERT_HOTSET_SIDECAR_SUFFIX);
+        PathBuf::from(path)
+    }
+
+    /// Suffix of the Flash-Next EP2 hot-unit loan sidecar (calibrated host-read counts of the
+    /// static placement; JSON, `hipfire.qwen4.ep_hot_units`).
+    pub const EP_HOT_UNITS_SIDECAR_SUFFIX: &str = ".ep.hot-units";
+
+    /// Path of the hot-unit loan sidecar of `model`: `<model file name>.ep.hot-units`.
+    pub fn ep_hot_units_sidecar_path(model: &Path) -> PathBuf {
+        let mut path = model.as_os_str().to_owned();
+        path.push(EP_HOT_UNITS_SIDECAR_SUFFIX);
+        PathBuf::from(path)
+    }
+
+    /// THE gate of the shipped EP expert hot set (D1). `false`: nothing changes unless
+    /// `HIPFIRE_QWEN4_EP_EXPERT_HOTSET=<path>` names a sidecar (the loader never discovers one,
+    /// `hipfire pull` does not fetch the sidecar). `true` (shipped): an EP2 gfx1201 Flash-Next load
+    /// discovers `<base>.ep.expert-hotset` when the variable is unset, the drop-zero planar expert
+    /// repack (F1, `HIPFIRE_QWEN4_EXPERT_DROP_ZERO`) follows it, and `hipfire pull` fetches the
+    /// pinned sidecar. The decoupled unit reserve stays opt-in (`HIPFIRE_EP_UNIT_RESERVE=1`).
+    /// Kill switches: `HIPFIRE_QWEN4_EP_EXPERT_HOTSET=0`, `HIPFIRE_QWEN4_EXPERT_DROP_ZERO=0`,
+    /// `HIPFIRE_EP_UNIT_PINNED_OWNERS=0`.
+    pub const EP_EXPERT_HOTSET_DEFAULT_ON: bool = true;
 
     /// Optional override of the PLE hot-rank sidecar path
     /// (`HIPFIRE_PLE_HOT_RANK_FILE`); empty or unset means `<model>.plehot`.
@@ -10544,6 +11217,107 @@ pub mod memory {
         super::developer_typed_bool("HIPFIRE_QWEN4_MTP_HEAD_D2")
     }
 
+    /// `developer.qwen4_mtp_head_resident` (env `HIPFIRE_QWEN4_MTP_HEAD_RESIDENT`),
+    /// a typed boolean read once per single-card load (default off, unset ==
+    /// `0`): `Some(true)` asks the loader to keep the native MTP head's routed
+    /// experts (the `mtp.` gate/up and down tensors, all of them) in VRAM
+    /// instead of pinned host RAM, charging their bytes against the expert hot
+    /// set's budget; a load that cannot afford them refuses the request with
+    /// one log line and keeps the host-mapped head. A resident head never runs
+    /// the head's rows=1 D2 CPU split (`qwen4_mtp_head_d2`): there is no host
+    /// copy to read.
+    pub fn qwen4_mtp_head_resident() -> Option<bool> {
+        super::developer_typed_bool("HIPFIRE_QWEN4_MTP_HEAD_RESIDENT")
+    }
+
+    /// Env name of the D2 verify-window knob ([`qwen4_d2_window_rows`]).
+    pub const QWEN4_D2_WINDOW_ROWS_ENV: &str = "HIPFIRE_QWEN4_D2_WINDOW_ROWS";
+    /// Rows the D2 CPU split qualifies by default (`CPU_SPLIT_MAX_ROWS`) and the smallest window the
+    /// knob accepts; [`qwen4_d2_window_default_for`] widens the default on exact gfx1100.
+    pub const QWEN4_D2_WINDOW_ROWS_DEFAULT: usize = 4;
+    /// Most rows [`qwen4_d2_window_rows`] may raise the window to: the GPU
+    /// few-row route's proven width on every arch the D2 split runs on.
+    pub const QWEN4_D2_WINDOW_ROWS_CEILING: usize = 8;
+
+    /// Pure body of [`qwen4_d2_window_rows`]: unset is the default 4; an
+    /// integer in `4..=8` selects that window; every other spelling (empty,
+    /// non-numeric, below 4, above 8) is an error that names the accepted
+    /// values.
+    pub fn parse_d2_window_rows(raw: Option<&str>) -> std::result::Result<usize, String> {
+        let Some(raw) = raw else {
+            return Ok(QWEN4_D2_WINDOW_ROWS_DEFAULT);
+        };
+        match raw.parse::<usize>() {
+            Ok(rows)
+                if (QWEN4_D2_WINDOW_ROWS_DEFAULT..=QWEN4_D2_WINDOW_ROWS_CEILING).contains(&rows) =>
+            {
+                Ok(rows)
+            }
+            _ => Err(format!(
+                "{QWEN4_D2_WINDOW_ROWS_ENV}={raw:?} is not a D2 verify window: expected an integer \
+                 from {QWEN4_D2_WINDOW_ROWS_DEFAULT} to {QWEN4_D2_WINDOW_ROWS_CEILING} (unset: 8 on gfx1100 \
+                 without slab owners, 4 elsewhere)"
+            )),
+        }
+    }
+
+    /// Validate `developer.qwen4_d2_window_rows` for the load: an invalid value
+    /// is an `Err` the loader must propagate (the per-call reader below would
+    /// otherwise silently keep the default).
+    pub fn validate_qwen4_d2_window_rows() -> std::result::Result<(), String> {
+        parse_d2_window_rows(process_value(QWEN4_D2_WINDOW_ROWS_ENV).as_deref()).map(|_| ())
+    }
+
+    /// D2 verify window of a load on `arch` whose expert owners are (`slab_owners`) or are not
+    /// expert-slab arenas, when the knob is unset: **8 on exact gfx1100** (7900 XTX; aggregate /
+    /// tier / whole-layer owners; measured hipx XTX, n=5, native MTP K 3 -> 7: sym-calib code
+    /// 1.019 [1.011, 1.028], shipped mq4 code 1.054, story 1.021; MTP text byte-identical on 8/8
+    /// prompts), **4 everywhere else** (every other arch, and a slab owner such as mq3-xts or
+    /// mq2-xts on gfx1100, unmeasured at 8). An explicit [`QWEN4_D2_WINDOW_ROWS_ENV`] always wins.
+    pub fn qwen4_d2_window_default_for(arch: &str, slab_owners: bool) -> usize {
+        if arch == "gfx1100" && !slab_owners {
+            8
+        } else {
+            QWEN4_D2_WINDOW_ROWS_DEFAULT
+        }
+    }
+
+    /// Pure body of [`qwen4_d2_window_rows`]: an explicit valid knob wins, an unset knob is the
+    /// load's default, an invalid one reads as the default `4` (the load refuses it through
+    /// [`validate_qwen4_d2_window_rows`]).
+    pub fn resolve_d2_window_rows(raw: Option<&str>, load_default: usize) -> usize {
+        match raw {
+            None => load_default.clamp(QWEN4_D2_WINDOW_ROWS_DEFAULT, QWEN4_D2_WINDOW_ROWS_CEILING),
+            Some(_) => parse_d2_window_rows(raw).unwrap_or(QWEN4_D2_WINDOW_ROWS_DEFAULT),
+        }
+    }
+
+    static D2_WINDOW_LOAD_DEFAULT: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(QWEN4_D2_WINDOW_ROWS_DEFAULT);
+
+    /// Record the unset-knob window of the load being built ([`qwen4_d2_window_default_for`]); the
+    /// Qwen4 loader calls it once per load before any executor is sized. Every reader then sees it.
+    pub fn set_qwen4_d2_window_load_default(rows: usize) {
+        D2_WINDOW_LOAD_DEFAULT.store(
+            rows.clamp(QWEN4_D2_WINDOW_ROWS_DEFAULT, QWEN4_D2_WINDOW_ROWS_CEILING),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// `developer.qwen4_d2_window_rows` (env `HIPFIRE_QWEN4_D2_WINDOW_ROWS`, range `4..=8`; unset =
+    /// the load default [`qwen4_d2_window_default_for`]: 8 on exact gfx1100 without slab owners,
+    /// else 4; `4` is the kill value): the widest whole-window verify the D2 CPU-cold/GPU-hot
+    /// split qualifies without the lab-wide oracle override. The per-call D2 gates and the
+    /// native-MTP `auto` K cap read it on hot paths (the env snapshot is the process one; the
+    /// default part is one relaxed atomic load). An invalid value reads as 4 here and is refused
+    /// at load by [`validate_qwen4_d2_window_rows`].
+    pub fn qwen4_d2_window_rows() -> usize {
+        resolve_d2_window_rows(
+            process_value(QWEN4_D2_WINDOW_ROWS_ENV).as_deref(),
+            D2_WINDOW_LOAD_DEFAULT.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
     /// `developer.qwen4_sp` (env `HIPFIRE_QWEN4_SP`), a typed boolean read once
     /// per Qwen4 load by the S1 short-prompt prefill hook (SP: stream the
     /// top-k* experts, run the rest on the CPU, one canonical combine). `None`
@@ -10584,6 +11358,255 @@ pub mod memory {
     /// off; unset, empty and every other spelling keep the default (on).
     pub fn parse_qwen4_direct_load(raw: Option<&str>) -> bool {
         raw.map(str::trim) != Some("0")
+    }
+
+    /// Env name of the HFQ weight reader's lane count ([`hfq_reader_lanes`]).
+    pub const HFQ_READER_LANES_ENV: &str = "HIPFIRE_HFQ_READER_LANES";
+    /// Env name of the HFQ weight reader's read size ([`hfq_reader_chunk_mib`]).
+    pub const HFQ_READER_CHUNK_MIB_ENV: &str = "HIPFIRE_HFQ_READER_CHUNK_MIB";
+    /// Most reader lanes a caller may ask for.
+    pub const HFQ_READER_LANES_MAX: usize = 64;
+    /// Largest reader read size, MiB (the aligned bounce buffer's size).
+    pub const HFQ_READER_CHUNK_MIB_MAX: usize = 16;
+
+    fn parse_hfq_reader_knob(
+        env: &str,
+        raw: Option<&str>,
+        max: usize,
+        what: &str,
+    ) -> std::result::Result<Option<usize>, String> {
+        let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
+            return Ok(None);
+        };
+        match raw.parse::<usize>() {
+            Ok(value) if (1..=max).contains(&value) => Ok(Some(value)),
+            _ => Err(format!(
+                "{env}={raw:?} is not a valid {what}: expected an integer from 1 to {max}"
+            )),
+        }
+    }
+
+    /// Pure body of [`hfq_reader_lanes`]: unset or blank is `None` (the
+    /// reader's built-in default); an integer in `1..=64` selects that lane
+    /// count; every other spelling is an error naming the accepted range.
+    pub fn parse_hfq_reader_lanes(raw: Option<&str>) -> std::result::Result<Option<usize>, String> {
+        parse_hfq_reader_knob(
+            HFQ_READER_LANES_ENV,
+            raw,
+            HFQ_READER_LANES_MAX,
+            "lane count",
+        )
+    }
+
+    /// Pure body of [`hfq_reader_chunk_mib`]: unset or blank is `None`; an
+    /// integer in `1..=16` selects that read size in MiB.
+    pub fn parse_hfq_reader_chunk_mib(
+        raw: Option<&str>,
+    ) -> std::result::Result<Option<usize>, String> {
+        parse_hfq_reader_knob(
+            HFQ_READER_CHUNK_MIB_ENV,
+            raw,
+            HFQ_READER_CHUNK_MIB_MAX,
+            "read size in MiB",
+        )
+    }
+
+    /// Developer `HIPFIRE_HFQ_READER_LANES=N` (`1..=64`): concurrent reads of the
+    /// HFQ weight reader (`hfq_parallel`). Unset keeps the reader's built-in
+    /// default; `4` with `HIPFIRE_HFQ_READER_CHUNK_MIB=16` is the pre-0.4.5 shape.
+    /// The reader resolves it once per process and falls back to the default
+    /// (with one stderr line) on an invalid value.
+    pub fn hfq_reader_lanes() -> std::result::Result<Option<usize>, String> {
+        parse_hfq_reader_lanes(process_value(HFQ_READER_LANES_ENV).as_deref())
+    }
+
+    /// Developer `HIPFIRE_HFQ_READER_CHUNK_MIB=N` (`1..=16`): size of each
+    /// reader read. Unset keeps the built-in default.
+    pub fn hfq_reader_chunk_mib() -> std::result::Result<Option<usize>, String> {
+        parse_hfq_reader_chunk_mib(process_value(HFQ_READER_CHUNK_MIB_ENV).as_deref())
+    }
+
+    /// Developer kill switch `HIPFIRE_EP_GATHER_DIRECT` for the expert-parallel unit-arena
+    /// gather (`qwen4_unit_arena_payload`): default on, the owned experts' shipped spans are
+    /// read with the parallel `O_DIRECT` reader and repacked on every core. Exactly `0` keeps
+    /// the serial walk over the mapped stacks (mmap page faults + single-thread repack).
+    pub fn ep_gather_direct() -> bool {
+        parse_ep_gather_direct(process_value("HIPFIRE_EP_GATHER_DIRECT").as_deref())
+    }
+
+    /// Pure truth table behind [`ep_gather_direct`]: only a trimmed `0` is off.
+    pub fn parse_ep_gather_direct(raw: Option<&str>) -> bool {
+        raw.map(str::trim) != Some("0")
+    }
+
+    /// Developer kill switch `HIPFIRE_EP_SHARE_HOST` for sharing one pinned host copy of a
+    /// replicated host-mapped weight (the EP embedding table) between the ranks of one
+    /// process. Default on; exactly `0` pins one private copy per rank as before.
+    pub fn ep_share_host() -> bool {
+        parse_ep_share_host(process_value("HIPFIRE_EP_SHARE_HOST").as_deref())
+    }
+
+    /// Pure truth table behind [`ep_share_host`]: only a trimmed `0` is off.
+    pub fn parse_ep_share_host(raw: Option<&str>) -> bool {
+        raw.map(str::trim) != Some("0")
+    }
+
+    /// Developer kill switch `HIPFIRE_EP_MTP_EXPERTS_RESIDENT` for the expert-parallel
+    /// native-MTP head's routed experts: default on, each rank of an EP load (2 or more
+    /// ranks) with the head attached keeps ITS OWNED slice of them (experts `e % ranks ==
+    /// rank`, 256 of 512 on EP2) VRAM-resident, charged to the rank's expert budget before the
+    /// trunk unit ranking walk, instead of pinned host RAM read over PCIe on every decode
+    /// step. Exactly `0` restores the host-mapped head placement.
+    pub fn ep_mtp_experts_resident() -> bool {
+        parse_ep_mtp_experts_resident(process_value("HIPFIRE_EP_MTP_EXPERTS_RESIDENT").as_deref())
+    }
+
+    /// Pure truth table behind [`ep_mtp_experts_resident`]: only a trimmed `0` is off.
+    pub fn parse_ep_mtp_experts_resident(raw: Option<&str>) -> bool {
+        raw.map(str::trim) != Some("0")
+    }
+
+    /// Developer kill switch `HIPFIRE_EP_HC8_PLAN_CHARGE` for the expert-parallel plan's
+    /// charge of the `<model>.hc8` sidecar: default on, the plan and every rank's fit census
+    /// charge the replicated HC mixer tensors at their E4M3 size (the bytes the applied
+    /// sidecar leaves allocated) instead of the manifest's BF16 size. Exactly `0` restores the
+    /// BF16 charge.
+    pub fn ep_hc8_plan_charge() -> bool {
+        parse_ep_hc8_plan_charge(process_value("HIPFIRE_EP_HC8_PLAN_CHARGE").as_deref())
+    }
+
+    /// Pure truth table behind [`ep_hc8_plan_charge`]: only a trimmed `0` is off.
+    pub fn parse_ep_hc8_plan_charge(raw: Option<&str>) -> bool {
+        raw.map(str::trim) != Some("0")
+    }
+
+    /// Developer kill switch `HIPFIRE_EP_RESERVE_CENSUS` for the expert-parallel (2 or more
+    /// ranks) reserve census: default on, an EP load charges the measured HIP runtime
+    /// (`QWEN4_EP2_RUNTIME_OVERHEAD_GFX1201_BYTES` on an exact gfx1201 EP2 load) and so
+    /// retires the historical single-device floor, sizes the trunk-shard rank's GDN state,
+    /// MTP capture ring and shared-expert INT8 shadows at the rank-local width instead of the
+    /// global one, and returns the pre-shard shared-expert copies from the device pool to HIP
+    /// after the shard. Exactly `0` restores the earlier EP behaviour byte for byte (floor
+    /// kept, global census terms, no pool drain). Read once per load.
+    pub fn ep_reserve_census() -> bool {
+        parse_ep_reserve_census(process_value("HIPFIRE_EP_RESERVE_CENSUS").as_deref())
+    }
+
+    /// Pure truth table behind [`ep_reserve_census`]: only a trimmed `0` is off.
+    pub fn parse_ep_reserve_census(raw: Option<&str>) -> bool {
+        raw.map(str::trim) != Some("0")
+    }
+
+    /// Environment variable of the hot-unit loan's sidecar: [`ep_hot_units`].
+    pub const EP_HOT_UNITS_ENV: &str = "HIPFIRE_EP_HOT_UNITS";
+    /// Environment variable of the hot-unit loan's size: [`ep_hot_loan_mib`].
+    pub const EP_HOT_LOAN_MIB_ENV: &str = "HIPFIRE_EP_HOT_LOAN_MIB";
+
+    /// Which `.ep.hot-units` sidecar a Flash-Next EP2 load lends from
+    /// (`HIPFIRE_EP_HOT_UNITS`, [`ep_hot_units`]).
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum EpHotUnits {
+        /// Unset: discover the sibling `<model>.ep.hot-units`; absent is no loan, silently.
+        Discover,
+        /// `0` (or blank): no loan. The kill switch.
+        Off,
+        /// An absolute path to the sidecar; it must apply (a refusal is a load error).
+        Explicit(PathBuf),
+    }
+
+    /// Developer variable `HIPFIRE_EP_HOT_UNITS` of the Flash-Next EP2 hot-unit loan: unset
+    /// discovers `<model>.ep.hot-units` next to the model, `0` turns the loan off, an absolute path
+    /// names the sidecar. Anything else is a policy error (never silently ignored). Read once per
+    /// load.
+    pub fn ep_hot_units() -> Result<EpHotUnits, String> {
+        parse_ep_hot_units(process_value(EP_HOT_UNITS_ENV).as_deref())
+    }
+
+    /// Pure parse behind [`ep_hot_units`].
+    pub fn parse_ep_hot_units(raw: Option<&str>) -> Result<EpHotUnits, String> {
+        match raw.map(str::trim) {
+            None => Ok(EpHotUnits::Discover),
+            Some("") | Some("0") => Ok(EpHotUnits::Off),
+            Some(path) if Path::new(path).is_absolute() => {
+                Ok(EpHotUnits::Explicit(PathBuf::from(path)))
+            }
+            Some(other) => Err(format!(
+                "{EP_HOT_UNITS_ENV}={other:?} is neither 0 nor an absolute path to a \
+                 .ep.hot-units sidecar"
+            )),
+        }
+    }
+
+    /// The size of the hot-unit loan per rank (`HIPFIRE_EP_HOT_LOAN_MIB`, [`ep_hot_loan_mib`]).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum EpHotLoanMib {
+        /// Unset: the measured safe loan (`QWEN4_EP2_HOT_LOAN_GFX1201_BYTES`).
+        Measured,
+        /// `0` (or blank): no loan. The kill switch.
+        Off,
+        /// This many MiB, clamped by the loader to the measured safe loan.
+        Mib(u64),
+    }
+
+    /// Developer variable `HIPFIRE_EP_HOT_LOAN_MIB` of the Flash-Next EP2 hot-unit loan: unset is
+    /// the measured safe loan, `0` turns the loan off, a positive integer is that many MiB per
+    /// rank (the loader clamps it to the measured safe loan). A non-integer is a policy error.
+    /// Read once per load.
+    pub fn ep_hot_loan_mib() -> Result<EpHotLoanMib, String> {
+        parse_ep_hot_loan_mib(process_value(EP_HOT_LOAN_MIB_ENV).as_deref())
+    }
+
+    /// Pure parse behind [`ep_hot_loan_mib`].
+    pub fn parse_ep_hot_loan_mib(raw: Option<&str>) -> Result<EpHotLoanMib, String> {
+        match raw.map(str::trim) {
+            None => Ok(EpHotLoanMib::Measured),
+            Some("") => Ok(EpHotLoanMib::Off),
+            Some(value) => match value.parse::<u64>() {
+                Ok(0) => Ok(EpHotLoanMib::Off),
+                Ok(mib) => Ok(EpHotLoanMib::Mib(mib)),
+                Err(_) => Err(format!(
+                    "{EP_HOT_LOAN_MIB_ENV}={value:?} is not a non-negative integer (MiB per rank)"
+                )),
+            },
+        }
+    }
+
+    /// Environment variable of the elastic reserve's cap: [`ep_elastic_cap_bytes`].
+    pub const EP_ELASTIC_MIB_ENV: &str = "HIPFIRE_EP_ELASTIC_MIB";
+    /// Environment variable of the elastic reserve's stderr log: [`ep_elastic_log`].
+    pub const EP_ELASTIC_LOG_ENV: &str = "HIPFIRE_EP_ELASTIC_LOG";
+    /// Default cap of the elastic reserve per rank: 2,048 MiB (the lend is lendable-bound: about 1,620 MiB on the cp15 fixture).
+    pub const EP_ELASTIC_DEFAULT_MIB: u64 = 2048;
+
+    /// Developer variable `HIPFIRE_EP_ELASTIC_MIB` of the Flash-Next EP2 elastic reserve (the
+    /// extra resident routed experts lent from idle VRAM): unset is the default cap of
+    /// [`EP_ELASTIC_DEFAULT_MIB`] MiB per rank, `0` (or blank) turns the reserve off, a positive
+    /// integer is the cap in MiB per rank. Returns the cap in bytes, `0` = off. A non-integer is a
+    /// policy error. Read once per load.
+    pub fn ep_elastic_cap_bytes() -> Result<u64, String> {
+        parse_ep_elastic_cap_bytes(process_value(EP_ELASTIC_MIB_ENV).as_deref())
+    }
+
+    /// Pure parse behind [`ep_elastic_cap_bytes`].
+    pub fn parse_ep_elastic_cap_bytes(raw: Option<&str>) -> Result<u64, String> {
+        match raw.map(str::trim) {
+            None => Ok(EP_ELASTIC_DEFAULT_MIB << 20),
+            Some("") => Ok(0),
+            Some(value) => match value.parse::<u64>() {
+                Ok(mib) => mib.checked_mul(1 << 20).ok_or_else(|| {
+                    format!("{EP_ELASTIC_MIB_ENV}={value:?} overflows a byte count")
+                }),
+                Err(_) => Err(format!(
+                    "{EP_ELASTIC_MIB_ENV}={value:?} is not a non-negative integer (MiB per rank)"
+                )),
+            },
+        }
+    }
+
+    /// Developer bool `HIPFIRE_EP_ELASTIC_LOG` (default off): one stderr line per elastic lend,
+    /// publish, reclaim and cache release.
+    pub fn ep_elastic_log() -> bool {
+        super::developer_bool(EP_ELASTIC_LOG_ENV, false)
     }
 
     /// Developer `HIPFIRE_LOAD_WEIGHT_DIGEST=<path>`: when set and not blank,
@@ -10746,6 +11769,67 @@ pub mod memory {
         }
     }
 
+    /// The Qwen4 gfx1100 (7900 XTX) single-card tier package, default ON on exact `gfx1100`
+    /// and inert everywhere else: the default sibling expert hot set sidecar
+    /// (`HIPFIRE_QWEN4_EXPERT_HOTSET`), S1 slow-link prefill over its tier plan
+    /// (`HIPFIRE_QWEN4_S1_TIER`), the census hot-set reserve
+    /// (`HIPFIRE_QWEN4_EXPERT_HOTSET_CENSUS_RESERVE`), event input readiness for tier D2 splits
+    /// (`HIPFIRE_QWEN4_D2_READY`) and the mixed-layer CP-wait join
+    /// (`HIPFIRE_QWEN4_D2_MIXED_CPWAIT`). The one switch is
+    /// `HIPFIRE_QWEN4_EXPERT_HOTSET_GFX1100` (`developer.qwen4_expert_hotset_gfx1100`): `0`
+    /// turns the whole package off (every member returns to its previous default: no default
+    /// sidecar on gfx1100, S1 declines a hot set, the incumbent reserve, sync readiness, the copy
+    /// transport on mixed layers); any other value, including unset, leaves it on. Each member
+    /// keeps its own variable, which always wins over the package for that member (`=1` / `=0`).
+    pub const QWEN4_GFX1100_TIER_PACKAGE_ENV: &str = "HIPFIRE_QWEN4_EXPERT_HOTSET_GFX1100";
+
+    /// Pure body of [`qwen4_gfx1100_tier_package`]: `arch` is exact `gfx1100` and the switch
+    /// (`package_switch`, the process value; `None` unset) is not `0`.
+    pub fn gfx1100_tier_package_for(arch: &str, package_switch: Option<bool>) -> bool {
+        arch == "gfx1100" && package_switch.unwrap_or(true)
+    }
+
+    /// Whether the gfx1100 tier package defaults apply to a load on `arch` (see
+    /// [`QWEN4_GFX1100_TIER_PACKAGE_ENV`]). Read from the process snapshot.
+    pub fn qwen4_gfx1100_tier_package(arch: &str) -> bool {
+        gfx1100_tier_package_for(
+            arch,
+            match process_value(QWEN4_GFX1100_TIER_PACKAGE_ENV).as_deref() {
+                Some("1") => Some(true),
+                Some("0") => Some(false),
+                _ => None,
+            },
+        )
+    }
+
+    /// Pure body of [`qwen4_d2_ready_for`]: an explicit value (`sync` / `event`) always wins; unset
+    /// is `Event` for a tier split on a load where the gfx1100 tier package applies
+    /// (`package`), `Sync` for every other split and arch. An invalid spelling is an error.
+    pub fn resolve_d2_ready(
+        package: bool,
+        tier_split: bool,
+        raw: Option<&str>,
+    ) -> std::result::Result<D2Ready, String> {
+        match raw {
+            None if package && tier_split => Ok(D2Ready::Event),
+            other => parse_d2_ready(other),
+        }
+    }
+
+    /// [`qwen4_d2_ready`] with the per-arch default: event readiness for the D2 tier split
+    /// (`tier_split`: the layer's cold experts live in a hot-set tier owner) of a gfx1100
+    /// tier-package load. `HIPFIRE_QWEN4_D2_READY=sync` is the kill value for it.
+    pub fn qwen4_d2_ready_for(
+        arch: &str,
+        tier_split: bool,
+    ) -> std::result::Result<D2Ready, String> {
+        resolve_d2_ready(
+            qwen4_gfx1100_tier_package(arch),
+            tier_split,
+            process_value("HIPFIRE_QWEN4_D2_READY").as_deref(),
+        )
+    }
+
     /// Pure body of [`qwen4_d2_ready`]: unset is `Sync`; `sync` and `event`
     /// (exact, lower-case) select a mode; every other spelling, including the
     /// empty string, is an error that names the accepted values.
@@ -10815,6 +11899,122 @@ pub mod memory {
     /// unset is `Host`. The arch default lives in [`default_d2_transport`].
     pub fn parse_d2_join(raw: Option<&str>) -> std::result::Result<D2Join, String> {
         parse_d2_join_explicit(raw).map(Option::unwrap_or_default)
+    }
+
+    /// Parts-per-million denominator of a [`D2PcieShare`] fraction.
+    pub const D2_PCIE_SHARE_PPM_ONE: u32 = 1_000_000;
+
+    /// Which fraction of a D2 tier layer's host-mapped (cold) experts, by
+    /// routing mass, the GPU arm reads over PCIe instead of the CPU arm
+    /// computing them (`developer.qwen4_d2_pcie_share`, env
+    /// `HIPFIRE_QWEN4_D2_PCIE_SHARE`). Only reads on a hot-set tier layer whose
+    /// D2 split is armed; every other load and layer ignores it.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub enum D2PcieShare {
+        /// Unset, `off` or `0`: every cold expert is CPU-owned (today's D2).
+        #[default]
+        Off,
+        /// The fraction is sized per layer at load from the measured CPU-arm
+        /// rate, the measured zero-copy link rate and the hot-arm GPU time.
+        Auto,
+        /// A fixed fraction in parts per million, `1..=1_000_000`.
+        Fixed(u32),
+    }
+
+    /// Pure body of [`qwen4_d2_pcie_share`]: unset is `Off`; `off`, `auto` and a
+    /// decimal fraction in `[0, 1]` (exact, no sign, no whitespace) select a
+    /// mode; `0` and `off` are the same mode. Every other spelling, including
+    /// the empty string, NaN and an out-of-range number, is an error that names
+    /// the accepted values: a mistyped share must refuse the load, never run
+    /// a different split.
+    pub fn parse_d2_pcie_share(raw: Option<&str>) -> std::result::Result<D2PcieShare, String> {
+        let bad = |value: &str| {
+            format!(
+                "HIPFIRE_QWEN4_D2_PCIE_SHARE={value:?} is not a D2 PCIe share: expected `off`, `auto` or a fraction in [0, 1]"
+            )
+        };
+        match raw {
+            None | Some("off") => Ok(D2PcieShare::Off),
+            Some("auto") => Ok(D2PcieShare::Auto),
+            Some(value) => {
+                if value.is_empty()
+                    || !value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || byte == b'.')
+                {
+                    return Err(bad(value));
+                }
+                let fraction: f64 = value.parse().map_err(|_| bad(value))?;
+                if !(0.0..=1.0).contains(&fraction) {
+                    return Err(bad(value));
+                }
+                let ppm = (fraction * f64::from(D2_PCIE_SHARE_PPM_ONE)).round() as u32;
+                Ok(if ppm == 0 {
+                    D2PcieShare::Off
+                } else {
+                    D2PcieShare::Fixed(ppm)
+                })
+            }
+        }
+    }
+
+    /// `developer.qwen4_d2_pcie_share` (env `HIPFIRE_QWEN4_D2_PCIE_SHARE`) from
+    /// the process snapshot. Resolve it once per load; an invalid value is an
+    /// `Err` the loader must propagate.
+    pub fn qwen4_d2_pcie_share() -> std::result::Result<D2PcieShare, String> {
+        parse_d2_pcie_share(process_value("HIPFIRE_QWEN4_D2_PCIE_SHARE").as_deref())
+    }
+
+    /// `developer.qwen4_d2_mixed_cpwait` (env `HIPFIRE_QWEN4_D2_MIXED_CPWAIT`), a
+    /// boolean read once per load (default ON on exact gfx1100 as part of the tier package,
+    /// [`QWEN4_GFX1100_TIER_PACKAGE_ENV`]; off on every other arch; `=0` is the kill, `=1` forces
+    /// it anywhere the load requests `mapped` + `cpwait`): a MIXED hot/cold D2 tier layer
+    /// takes the mapped staging + CP-wait join instead of the copy transport +
+    /// host join, whenever the load requests `mapped` and `cpwait` (the gfx1100
+    /// default, or an explicit `HIPFIRE_QWEN4_D2_RETURN=mapped
+    /// HIPFIRE_QWEN4_D2_JOIN=cpwait`). The CPU arm computes the same bytes and the
+    /// canonical combine reads the same device rows; only the cold-row install
+    /// and the combine's enqueue move behind a command-processor wait. Off keeps
+    /// every layer's transport exactly as before.
+    pub fn qwen4_d2_mixed_cpwait(arch: &str) -> bool {
+        super::developer_bool(
+            "HIPFIRE_QWEN4_D2_MIXED_CPWAIT",
+            qwen4_gfx1100_tier_package(arch),
+        )
+    }
+
+    /// Pure body of [`qwen4_d2_pcie_contention`]: unset is `1.0` (no
+    /// contention); otherwise a plain decimal in `[1, 8]` (digits and one dot,
+    /// no sign or exponent). Anything else, including the empty string, is an
+    /// error naming the accepted range.
+    pub fn parse_d2_pcie_contention(raw: Option<&str>) -> std::result::Result<f64, String> {
+        let Some(value) = raw else { return Ok(1.0) };
+        let bad = || {
+            format!(
+                "HIPFIRE_QWEN4_D2_PCIE_CONTENTION={value:?} is not a contention factor: expected a decimal in [1, 8]"
+            )
+        };
+        if value.is_empty()
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || byte == b'.')
+        {
+            return Err(bad());
+        }
+        match value.parse::<f64>() {
+            Ok(factor) if (1.0..=8.0).contains(&factor) => Ok(factor),
+            _ => Err(bad()),
+        }
+    }
+
+    /// `developer.qwen4_d2_pcie_contention` (env
+    /// `HIPFIRE_QWEN4_D2_PCIE_CONTENTION`, lab): the factor `>= 1` by which the
+    /// `auto` PCIe share sizing slows BOTH cold arms while they overlap, for a
+    /// host whose CPU GEMV and PCIe DMA read share one DRAM (a unified-memory
+    /// APU host). Default `1.0`. Resolve it once per load; an invalid value is
+    /// an `Err` the loader must propagate.
+    pub fn qwen4_d2_pcie_contention() -> std::result::Result<f64, String> {
+        parse_d2_pcie_contention(process_value("HIPFIRE_QWEN4_D2_PCIE_CONTENTION").as_deref())
     }
 
     /// How much of a split step the GPU takes (`memory.offload_passback_share`).
@@ -10915,6 +12115,131 @@ pub mod memory {
             }
             for mode in [D2Ready::Sync, D2Ready::Event] {
                 assert_eq!(parse_d2_ready(Some(mode.as_str())), Ok(mode));
+            }
+        }
+
+        #[test]
+        fn gfx1100_tier_package_is_on_for_exact_gfx1100_only_and_one_switch_turns_it_off() {
+            // (arch, switch, package)
+            for (arch, switch, want) in [
+                ("gfx1100", None, true),
+                ("gfx1100", Some(true), true),
+                ("gfx1100", Some(false), false),
+                ("gfx1101", None, false),
+                ("gfx1102", None, false),
+                ("gfx1151", None, false),
+                ("gfx1201", None, false),
+                ("gfx1201", Some(true), false),
+                ("gfx942", None, false),
+                ("", None, false),
+            ] {
+                assert_eq!(
+                    gfx1100_tier_package_for(arch, switch),
+                    want,
+                    "{arch} {switch:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn gfx1100_tier_package_members_default_on_for_gfx1100_and_off_elsewhere() {
+            // The process snapshot of a unit test carries none of the package variables, so
+            // these are the shipped defaults.
+            for arch in ["gfx1100"] {
+                assert!(qwen4_gfx1100_tier_package(arch));
+                assert!(qwen4_d2_mixed_cpwait(arch), "{arch}");
+                assert_eq!(qwen4_d2_ready_for(arch, true), Ok(D2Ready::Event));
+                assert_eq!(qwen4_d2_ready_for(arch, false), Ok(D2Ready::Sync));
+            }
+            // gfx1201, gfx1151 and everything else: byte-unchanged defaults.
+            for arch in [
+                "gfx1201", "gfx1200", "gfx1151", "gfx1101", "gfx942", "gfx90a", "",
+            ] {
+                assert!(!qwen4_gfx1100_tier_package(arch), "{arch}");
+                assert!(!qwen4_d2_mixed_cpwait(arch), "{arch}");
+                for tier in [true, false] {
+                    assert_eq!(qwen4_d2_ready_for(arch, tier), Ok(D2Ready::Sync), "{arch}");
+                }
+            }
+        }
+
+        #[test]
+        fn d2_ready_defaults_to_event_only_for_a_tier_split_of_the_gfx1100_package() {
+            // (package, tier_split, raw) -> mode
+            for (package, tier, raw, want) in [
+                (true, true, None, D2Ready::Event),
+                (true, false, None, D2Ready::Sync),
+                (false, true, None, D2Ready::Sync),
+                (false, false, None, D2Ready::Sync),
+                // An explicit value always wins, either way.
+                (true, true, Some("sync"), D2Ready::Sync),
+                (true, true, Some("event"), D2Ready::Event),
+                (false, false, Some("event"), D2Ready::Event),
+                (false, true, Some("sync"), D2Ready::Sync),
+            ] {
+                assert_eq!(
+                    resolve_d2_ready(package, tier, raw),
+                    Ok(want),
+                    "package {package} tier {tier} raw {raw:?}"
+                );
+            }
+            // A bad spelling is still an error under the package default.
+            assert!(resolve_d2_ready(true, true, Some("spin")).is_err());
+            assert!(resolve_d2_ready(true, true, Some("")).is_err());
+        }
+
+        #[test]
+        fn d2_pcie_share_parses_off_auto_fraction_and_refuses_everything_else() {
+            assert_eq!(parse_d2_pcie_share(None), Ok(D2PcieShare::Off));
+            assert_eq!(D2PcieShare::default(), D2PcieShare::Off);
+            assert_eq!(parse_d2_pcie_share(Some("off")), Ok(D2PcieShare::Off));
+            assert_eq!(parse_d2_pcie_share(Some("auto")), Ok(D2PcieShare::Auto));
+            // `0` is the same mode as `off`: the placement stays exactly today's.
+            assert_eq!(parse_d2_pcie_share(Some("0")), Ok(D2PcieShare::Off));
+            assert_eq!(parse_d2_pcie_share(Some("0.0")), Ok(D2PcieShare::Off));
+            assert_eq!(parse_d2_pcie_share(Some("0.0000001")), Ok(D2PcieShare::Off));
+            assert_eq!(
+                parse_d2_pcie_share(Some("0.25")),
+                Ok(D2PcieShare::Fixed(250_000))
+            );
+            assert_eq!(
+                parse_d2_pcie_share(Some("1")),
+                Ok(D2PcieShare::Fixed(D2_PCIE_SHARE_PPM_ONE))
+            );
+            assert_eq!(
+                parse_d2_pcie_share(Some(".5")),
+                Ok(D2PcieShare::Fixed(500_000))
+            );
+            for bad in [
+                "", "Auto", "OFF", " auto", "auto ", "-0.1", "+0.5", "1.0001", "2", "nan", "inf",
+                "1e-1", "0.5.5", ".", "true", "on",
+            ] {
+                let error = parse_d2_pcie_share(Some(bad)).unwrap_err();
+                assert!(
+                    error.contains("HIPFIRE_QWEN4_D2_PCIE_SHARE"),
+                    "{bad:?}: {error}"
+                );
+                assert!(
+                    error.contains("`off`, `auto` or a fraction"),
+                    "{bad:?}: {error}"
+                );
+            }
+        }
+
+        #[test]
+        fn d2_pcie_contention_parses_a_factor_of_one_to_eight() {
+            assert_eq!(parse_d2_pcie_contention(None), Ok(1.0));
+            assert_eq!(parse_d2_pcie_contention(Some("1")), Ok(1.0));
+            assert_eq!(parse_d2_pcie_contention(Some("1.5")), Ok(1.5));
+            assert_eq!(parse_d2_pcie_contention(Some("8")), Ok(8.0));
+            for bad in [
+                "", "0.9", "0", "8.01", "-1", "+2", "1e0", "nan", "inf", "x", "1.2.3",
+            ] {
+                let error = parse_d2_pcie_contention(Some(bad)).unwrap_err();
+                assert!(
+                    error.contains("HIPFIRE_QWEN4_D2_PCIE_CONTENTION"),
+                    "{bad:?}: {error}"
+                );
             }
         }
 
@@ -11232,6 +12557,18 @@ pub mod memory {
         }
 
         #[test]
+        fn hc8_sidecar_path_appends_to_full_file_name() {
+            assert_eq!(
+                hc8_sidecar_path(Path::new("/m/qwen3.8-flash-next.mq4-xts")),
+                PathBuf::from("/m/qwen3.8-flash-next.mq4-xts.hc8")
+            );
+            assert_eq!(
+                hc8_sidecar_path(Path::new("model")),
+                PathBuf::from("model.hc8")
+            );
+        }
+
+        #[test]
         fn expert_hotset_sidecar_path_appends_to_full_file_name() {
             assert_eq!(
                 expert_hotset_sidecar_path(Path::new("/m/qwen3.8-flash-next.mq4-xts")),
@@ -11241,6 +12578,19 @@ pub mod memory {
                 expert_hotset_sidecar_path(Path::new("model")),
                 PathBuf::from("model.expert-hotset")
             );
+        }
+
+        #[test]
+        fn ep_expert_hotset_sidecar_is_distinct_from_the_single_card_hotset() {
+            let base = Path::new("/m/qwen3.8-flash-next-base.mq4-xts");
+            let ep = ep_expert_hotset_sidecar_path(base);
+            assert_eq!(
+                ep,
+                PathBuf::from("/m/qwen3.8-flash-next-base.mq4-xts.ep.expert-hotset")
+            );
+            assert_ne!(ep, expert_hotset_sidecar_path(base));
+            // Still a `.expert-hotset` name: model listing keeps treating it as a sidecar.
+            assert!(ep.to_string_lossy().ends_with(EXPERT_HOTSET_SIDECAR_SUFFIX));
         }
 
         #[test]

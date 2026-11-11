@@ -37,8 +37,11 @@ pub(super) fn execute(arch: Arch, name: &str, i: &Inst, s: &mut State) -> Result
     let mut out = [None::<u32>; 64];
     match name {
         "v_dot4_i32_iu8" | "v_dot8_i32_iu4" => {
-            // GFX1201 probe: NEG[2] and NEG_HI have no effect on the integer dots; unmeasured elsewhere.
-            if arch != Arch::Gfx1201 && (m.neg_lo & 4 != 0 || m.neg_hi != 0) {
+            // GFX1201 and GFX1151 probes (NEG_LO[2], NEG_HI[0] varied): they have no effect on the integer dots;
+            // unmeasured elsewhere.
+            if !matches!(arch, Arch::Gfx1151 | Arch::Gfx1201)
+                && (m.neg_lo & 4 != 0 || m.neg_hi != 0)
+            {
                 return Err(format!("{name}: NEG[2]/NEG_HI are undefined for integer dots and unmeasured on {arch:?}"));
             }
             let (bits, count) = if name == "v_dot4_i32_iu8" {
@@ -72,8 +75,8 @@ pub(super) fn execute(arch: Arch, name: &str, i: &Inst, s: &mut State) -> Result
             }
         }
         "v_dot2_f32_f16" | "v_dot2_f32_bf16" => {
-            // Only gfx1201 has a probed model (mma::dot2_f32 documents the receipt); gfx1151/gfx1100 refuse.
-            if arch != Arch::Gfx1201 {
+            // gfx1201 and gfx1151 have a probed model (mma::dot2_f32 documents the receipts); gfx1100 refuses.
+            if !matches!(arch, Arch::Gfx1151 | Arch::Gfx1201) {
                 return Err(format!("{name} on {arch:?}: no probed floating-point dot model; refusing to approximate"));
             }
             // op_sel[2] / op_sel_hi[2] (the f32 C operand) were never varied: only the defaults are modeled.
@@ -280,9 +283,48 @@ mod tests {
             run(Arch::Gfx1201, n, 0x7f80_02ff, 0xff02_fe03, 10, 7, 7, false),
             run(Arch::Gfx1201, n, 0x7f80_02ff, 0xff02_fe03, 10, 3, 0, false)
         );
-        assert!(run(Arch::Gfx1151, n, all, all, 0, 3, 0, true).is_err());
-        assert!(run(Arch::Gfx1151, n, all, all, 0, 7, 0, false).is_err());
-        assert!(run(Arch::Gfx1151, n, all, all, 0, 3, 1, false).is_err());
+    }
+
+    // GFX1151 probe (Halo receipt pmrevive/PmBf16Halo/rcpt, 72,304 words per modifier set, both integer dots): the same
+    // rule as gfx1201 (CLAMP is ONE final signed saturation, not one per product; NEG_LO[2]/NEG_HI[0] are ignored).
+    #[test]
+    fn gfx1151_clamp_saturates_once_and_ignores_neg2_and_neg_hi() {
+        let all = 0x7f7f_7f7f;
+        let n = "v_dot4_i32_iu8";
+        assert_eq!(
+            run(Arch::Gfx1151, n, all, all, i32::MAX as u32, 3, 0, true),
+            Ok(i32::MAX as u32)
+        );
+        assert_eq!(
+            run(
+                Arch::Gfx1151,
+                n,
+                0x8080_8080,
+                all,
+                i32::MIN as u32,
+                3,
+                0,
+                true
+            ),
+            Ok(i32::MIN as u32)
+        );
+        assert_eq!(
+            run(
+                Arch::Gfx1151,
+                n,
+                0x0000_807f,
+                all,
+                (i32::MAX - 100) as u32,
+                3,
+                0,
+                true
+            ),
+            Ok((i64::from(i32::MAX) - 100 + 127 * 127 - 128 * 127) as u32)
+        );
+        assert_eq!(
+            run(Arch::Gfx1151, n, 0x7f80_02ff, 0xff02_fe03, 10, 7, 7, false),
+            run(Arch::Gfx1151, n, 0x7f80_02ff, 0xff02_fe03, 10, 3, 0, false)
+        );
     }
 
     fn dot2(
@@ -602,15 +644,11 @@ mod tests {
         );
     }
 
-    // Unmeasured corners and architectures refuse instead of approximating.
+    // Unmeasured corners refuse instead of approximating (gfx1100 has no dot2 model: see the gfx1151 receipt test).
     #[test]
     fn float_dot2_refuses_unmeasured_architectures_and_modes() {
         let plain = (0, 0, 0, 7, false);
         for name in ["v_dot2_f32_f16", "v_dot2_f32_bf16"] {
-            assert!(
-                dot2(Arch::Gfx1151, name, plain, 0x3c00_3c00, 0x3c00_3c00, 0).is_err(),
-                "{name} gfx1151"
-            );
             assert!(
                 dot2(Arch::Gfx1201, name, (0, 0, 4, 7, false), 0, 0, 0).is_err(),
                 "op_sel[2]"

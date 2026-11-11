@@ -706,7 +706,10 @@ fn walk_block(
 
 /// CFG-aware wait replay with fixpoint over the block graph.
 pub fn replay(body: &Body, arch: Arch, wave: Wave) -> Result<WaitReplay, WaitError> {
-    if !matches!(arch, Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1201) {
+    if !matches!(
+        arch,
+        Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1200 | Arch::Gfx1201
+    ) {
         return Err(WaitError::UnsupportedArch(arch));
     }
     for id in &body.layout {
@@ -901,7 +904,10 @@ fn fixpoint(
 
 /// Count wait instructions by opcode for T6.
 pub fn census(body: &Body, arch: Arch) -> Result<WaitCensus, WaitError> {
-    if !matches!(arch, Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1201) {
+    if !matches!(
+        arch,
+        Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1200 | Arch::Gfx1201
+    ) {
         return Err(WaitError::UnsupportedArch(arch));
     }
     let mut out = WaitCensus::default();
@@ -1452,7 +1458,7 @@ mod c5_tests {
         use crate::inst::Wave;
         for arch in [Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1201] {
             let decode = |words: &[u32]| crate::codec::gfx12::decode_for(arch, words).unwrap().0;
-            let (low, high, wait) = if arch == Arch::Gfx1201 {
+            let (low, high, wait) = if arch.is_gfx12() {
                 (
                     decode(&[0xee07807c, 10, 2]),
                     decode(&[0xee08407c, 10, 4]),

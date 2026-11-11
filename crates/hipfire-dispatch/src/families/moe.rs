@@ -440,7 +440,7 @@ pub enum MoeRouteCapability {
     /// planar qt135/qt136; gfx1151 admits MQ4 and W3, and E8P-I4 only once
     /// `rdna_compute::slab_admission::SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED` is true (refused
     /// today; its kernels are selectable, the one constant is the admission); gfx1100 admits
-    /// MQ4 and E8P-I4 (not W3); W2 is
+    /// MQ4, E8P-I4 and, decode-only (a K1 and no K2: windows up to `few_row_limit` rows), W3; W2 is
     /// refused on every arch. A layer carries at most one cold codec (W3 or E8P); see
     /// `rdna_compute::qwen4_slab_codec_admitted`. Decode rows
     /// (`route_rows <= 8`) run the K1 lane-union GEMV over the two codec
@@ -511,6 +511,25 @@ const FIXED_ROUTE_GEOMETRY: MoeRouteGeometry = MoeRouteGeometry {
     shared_intermediate: 640,
 };
 
+/// [`FIXED_ROUTE_GEOMETRY`] but for the shared-expert width, which the QT44/QT53 and slab
+/// routes also take at a K-slice of the model's 640: a trunk shard rank
+/// (`HIPFIRE_QWEN4_EP_TRUNK_SHARD`) runs the shared expert at 384 or 256 and its FFN write
+/// all-reduces the two halves. Every kernel the shared expert reaches is generic in that
+/// width over the 128-wide activation/rotation unit (the BF16 x4 gate-side GEMV, the fused
+/// routed+shared activation and the BF16 shared-down GEMV at any K; the INT8 and F16 WMMA
+/// prefill routes at `% 128`), so any 128-multiple below the model's width is admitted.
+/// The FP8 route stays on the exact geometry.
+pub(crate) fn fixed_route_geometry_up_to_shared_width(geometry: MoeRouteGeometry) -> bool {
+    let fixed = FIXED_ROUTE_GEOMETRY;
+    MoeRouteGeometry {
+        shared_intermediate: fixed.shared_intermediate,
+        ..geometry
+    } == fixed
+        && geometry.shared_intermediate != 0
+        && geometry.shared_intermediate <= fixed.shared_intermediate
+        && geometry.shared_intermediate % 128 == 0
+}
+
 /// Exact geometry and wire-format contract of the available grouped kernels.
 /// The route also requires `admitted_on` and live operands matching the policy.
 #[allow(clippy::too_many_arguments)]
@@ -528,9 +547,8 @@ pub(crate) fn grouped_route_geometry_supported(
 ) -> bool {
     let geometry = policy.geometry;
     let formats = policy.formats;
-    let fixed_geometry = FIXED_ROUTE_GEOMETRY;
     policy.capability.is_qt44_qt53_grouped()
-        && geometry == fixed_geometry
+        && fixed_route_geometry_up_to_shared_width(geometry)
         && experts == geometry.experts
         && top_k == geometry.top_k
         && hidden == geometry.hidden
@@ -672,7 +690,7 @@ pub(crate) fn slab_route_geometry_supported(
 ) -> bool {
     let geometry = policy.geometry;
     let shape = policy.capability.is_slab()
-        && geometry == FIXED_ROUTE_GEOMETRY
+        && fixed_route_geometry_up_to_shared_width(geometry)
         && experts == geometry.experts
         && top_k == geometry.top_k
         && hidden == geometry.hidden
@@ -1558,6 +1576,31 @@ pub trait MoeRowGather {
         false
     }
 
+    /// Fixed reduction partition `(rank, ranks)` of this call's layer: the combine must fold
+    /// only experts with `e % ranks == rank` (others +0 in place). `None` (default): no partition.
+    fn reduction_partition(&self, _layer_idx: u16) -> Option<(usize, usize)> {
+        None
+    }
+
+    /// Whether [`Self::gather_rows`] of this layer is a no-op for the call: the trunk shard's partial FFN
+    /// route, where the all-reduce of the HC write completes the routed FFN and this rank's combine folds
+    /// its own owned-slot partial (non-owned experts ran on the zero dummy tables). The slot-ordered
+    /// expanded rows a gather would exchange are then never read by a peer, so a down that writes BF16
+    /// grouped rows instead (the int8 wide-verify chain) is exact. `false` by default (every call
+    /// gathers); implementations decide it exactly as `gather_rows` does.
+    fn gather_skipped(&self, _layer_idx: u16) -> bool {
+        false
+    }
+
+    /// The owner mask of the wide-verify int8 chain (`HIPFIRE_QWEN4_MOE_GU_A8`, `ep_a8_wide`) of this
+    /// layer's call: `Some` only where [`Self::gather_skipped`] holds and the rank built its owner table
+    /// at EP attach, so the chain masks the tiles of every expert another rank owns out of both A8
+    /// GEMMs and folds only owned rows. `None` (default): the chain runs over unmasked tiles, the
+    /// non-owned experts on the zero dummy tables, byte-identical.
+    fn decode_owner_mask(&self, _layer_idx: u16) -> Option<MoeDecodeOwnerMask<'_>> {
+        None
+    }
+
     /// Rewrite the layer's live expert tables and slot owners from
     /// `topk_indices` (`slots = rows * k`). Runs after routing, before the
     /// first routed-table reader of the same call.
@@ -1570,6 +1613,71 @@ pub trait MoeRowGather {
     ) -> Result<(), String> {
         Err("owner assignment not supported".into())
     }
+
+    /// Pre-route reservation of a few-row grouped prefill call's routed-id destination: the
+    /// hook that logs the call's ids ([`Self::gather_rows`] sees them) may name a device view of
+    /// `slots * 4` bytes that the route producer then writes DIRECTLY instead of `scratch`, so
+    /// the usage log needs no later device copy. Called once per call, before the router
+    /// launches, only for a replicated-route prefill call that will reach its row gather
+    /// (never under a graph capture or replay record); `scratch` is the call's own top-k
+    /// buffer. `Some(view)`: the route kernels write `view` and every later reader of the call's
+    /// ids (owner assignment, scatter, gate/up, down, combine, [`Self::gather_rows`]) reads it,
+    /// the bytes exactly those the scratch would have held; the view stays valid until the
+    /// window's retirement. `None` (default): the call routes into `scratch`.
+    fn reserve_topk(
+        &self,
+        _gpu: &mut rdna_compute::Gpu,
+        _layer_idx: u16,
+        _slots: usize,
+        _scratch: &GpuTensor,
+    ) -> Option<GpuTensor> {
+        None
+    }
+
+    /// A rank-local MoE call that replaces this hook's row gather (an X2 owned
+    /// MTP draft lane computes every slot itself and crosses nothing) reports
+    /// itself here at the point the gather would run, so per-call bookkeeping
+    /// that rides on the gather (the D2 expert tail's deferred fill issue) keeps
+    /// its timing. Must not touch the call's rows. No-op by default.
+    fn note_local_call(
+        &self,
+        _gpu: &mut rdna_compute::Gpu,
+        _layer_idx: u16,
+        _slots: usize,
+        _topk_indices: &GpuTensor,
+    ) {
+    }
+
+    /// Buffer index (of the transport's registered gather buffers) of this
+    /// rank's most recent row-gather invocation, `None` before the first or
+    /// when the hook has no such notion. The sharded draft-head MoE pass (S4)
+    /// picks its activation-exchange buffer to differ from it, so the
+    /// transport's no-same-buffer-twice hazard rule holds. `None` by default.
+    fn last_gather_buffer(&self) -> Option<usize> {
+        None
+    }
+
+    /// End of one decode window (a trunk forward over every lane's rows) on this
+    /// rank, after its D2H sync and before the next window's launches: the D2
+    /// expert tail retires the window here. No-op by default.
+    fn decode_step_end(&self, _gpu: &mut rdna_compute::Gpu) {}
+
+    /// The forward is freed: release any device state the hook owns. No-op by
+    /// default.
+    fn release_gpu(&self, _gpu: &mut rdna_compute::Gpu) {}
+}
+
+/// The wide-verify int8 chain's owner mask ([`MoeRowGather::decode_owner_mask`]): the device table of the
+/// owner rank of every expert (`i32` per expert, at least `n_experts` words: the combine's owner mask
+/// and the tile mask read the SAME table, so their ownership predicate cannot differ), this rank, and
+/// the masked tile id scratch (`i32` per tile, never aliasing `expert_tile_ids`; at least the padded
+/// tile capacity of a 64-row call).
+#[derive(Clone, Copy)]
+pub struct MoeDecodeOwnerMask<'a> {
+    pub owner_table: &'a GpuTensor,
+    pub tile_ids_owned: &'a GpuTensor,
+    pub rank: usize,
+    pub n_experts: usize,
 }
 
 /// Expert-parallel owner-routed chunk exchange of the grouped symmetric IU4
@@ -1601,6 +1709,15 @@ pub trait MoeTileExchange {
     /// the pull read them as inputs, never as constants.
     fn owners(&self) -> (usize, &GpuTensor, usize);
 
+    /// Mask-only mode (the trunk shard's partial chunk route): the lowering inserts the
+    /// [`MoeStage::TileMask`](crate::pipeline::MoeStage) stage only, zero-fills the grouped
+    /// down rows the masked tiles never write, and lowers NO `TileExchange`: every rank's
+    /// owned-slot partial is completed by the all-reduce of its HC write, not by pulling a
+    /// peer's rows. `before_down`/`exchange` are never called on a mask-only exchange.
+    fn mask_only(&self) -> bool {
+        false
+    }
+
     /// Enqueue, on the launch stream, the wait that the peer finished pulling
     /// this rank's rows of the previous invocation. Called by the routed down
     /// stage immediately before it writes `y_down_grouped`; a no-op before the
@@ -1609,8 +1726,11 @@ pub trait MoeTileExchange {
 
     /// Cross-rank host barrier (every rank calls it at the same point); used to
     /// order a rank-local drain (`ep_quiesce`) before any rank launches a chunk
-    /// that reads peer VRAM.
-    fn host_barrier(&self) -> Result<(), String>;
+    /// that reads peer VRAM, and by the EP reserve loan's acquire and restore
+    /// rendezvous. `what` names the rendezvous kind and `epoch` the caller's
+    /// epoch counter: ranks that cross at different kinds, epochs or counts
+    /// fail at once naming both crossings instead of timing out.
+    fn host_barrier(&self, what: u8, epoch: u32) -> Result<(), String>;
 
     /// Publish this rank's `y_down_grouped` and pull the peer-owned tiles into
     /// it. `tile_ids` is the UNMASKED scatter output (the pull's predicate is
@@ -2439,6 +2559,38 @@ impl CpuWideVerifyScope {
             capacity_rows
         }
     }
+
+    /// Qualified rows of the D2 CPU-cold/GPU-hot split for this call:
+    /// [`Self::qualified_max_rows`] inside an explicit lab-wide scope
+    /// (`min(capacity, STORAGE)`), otherwise the default
+    /// [`NARROW_VERIFY_MAX_ROWS`] widened to `d2_window_rows`
+    /// (`HIPFIRE_QWEN4_D2_WINDOW_ROWS`, `4..=8`) but never past the executor's
+    /// allocated `capacity_rows` and never below the default 4. Pure: the
+    /// caller passes the knob value (`hipfire_config::memory::qwen4_d2_window_rows`).
+    pub const fn d2_qualified_max_rows(
+        &self,
+        capacity_rows: usize,
+        d2_window_rows: usize,
+    ) -> usize {
+        if self.lab_armed {
+            return self.qualified_max_rows(capacity_rows);
+        }
+        let window = if d2_window_rows > CPU_SPLIT_STORAGE_MAX_ROWS {
+            CPU_SPLIT_STORAGE_MAX_ROWS
+        } else {
+            d2_window_rows
+        };
+        let covered = if capacity_rows < window {
+            capacity_rows
+        } else {
+            window
+        };
+        if covered < NARROW_VERIFY_MAX_ROWS {
+            NARROW_VERIFY_MAX_ROWS
+        } else {
+            covered
+        }
+    }
 }
 
 /// Prewarmed D1 host-slot scratch rows visible to the routing slice (the
@@ -2520,14 +2672,36 @@ pub const fn cpu_d1_wide_window_qualified(
 /// state. `capacity_rows` is the executor's allocated
 /// [`crate::cpu_split::CpuSplitExecutor::capacity_rows`]; callers MUST pass
 /// the executor's own value, never a constant.
-pub const fn cpu_wide_window_qualified(
+pub fn cpu_wide_window_qualified(
     armed: bool,
     rows: usize,
     route_rows: usize,
     scope: CpuWideVerifyScope,
     capacity_rows: usize,
 ) -> bool {
-    let qualified = scope.qualified_max_rows(capacity_rows);
+    cpu_wide_window_qualified_with(
+        armed,
+        rows,
+        route_rows,
+        scope,
+        capacity_rows,
+        hipfire_config::memory::qwen4_d2_window_rows(),
+    )
+}
+
+/// [`cpu_wide_window_qualified`] with the D2 verify window passed explicitly
+/// (`HIPFIRE_QWEN4_D2_WINDOW_ROWS`, default 4): the pure body the unit tests
+/// drive. With `d2_window_rows == 4` this is exactly the legacy default-4 /
+/// lab-wide qualification.
+pub const fn cpu_wide_window_qualified_with(
+    armed: bool,
+    rows: usize,
+    route_rows: usize,
+    scope: CpuWideVerifyScope,
+    capacity_rows: usize,
+    d2_window_rows: usize,
+) -> bool {
+    let qualified = scope.d2_qualified_max_rows(capacity_rows, d2_window_rows);
     crate::cpu_split::cpu_splice_window_qualified(armed, rows, route_rows, qualified)
 }
 
@@ -3441,6 +3615,64 @@ mod tests {
         assert!(cpu_split_executor_wide_is_none_past_storage());
     }
 
+    /// `HIPFIRE_QWEN4_D2_WINDOW_ROWS` wiring (pure, wiring only — not numeric
+    /// proof): the knob widens only the D2 qualified window of the default
+    /// (non-lab) scope, to at most the executor's allocated capacity; `4` is
+    /// exactly the legacy gate; tails, zero rows and unarmed layers never
+    /// qualify; D1 is untouched.
+    #[test]
+    fn d2_window_rows_knob_widens_only_the_default_scope_up_to_capacity() {
+        let default = CpuWideVerifyScope::default_scope();
+        let lab64 = CpuWideVerifyScope::from_lab_presence(true, 64);
+        for window in 4..=8usize {
+            for capacity in [0usize, 1, 4, 5, 6, 7, 8, 64] {
+                let expect = window.min(capacity).max(NARROW_VERIFY_MAX_ROWS);
+                assert_eq!(default.d2_qualified_max_rows(capacity, window), expect);
+                for rows in 1..=CPU_SPLIT_STORAGE_MAX_ROWS {
+                    assert_eq!(
+                        cpu_wide_window_qualified_with(true, rows, rows, default, capacity, window),
+                        rows <= expect,
+                        "window={window} capacity={capacity} rows={rows}"
+                    );
+                    // Tails never qualify, unarmed layers never qualify.
+                    assert!(!cpu_wide_window_qualified_with(
+                        true,
+                        rows,
+                        rows + 1,
+                        default,
+                        capacity,
+                        window
+                    ));
+                    assert!(!cpu_wide_window_qualified_with(
+                        false, rows, rows, default, capacity, window
+                    ));
+                }
+                assert!(!cpu_wide_window_qualified_with(
+                    true, 0, 0, default, capacity, window
+                ));
+                // The lab-wide scope is untouched by the knob.
+                assert_eq!(
+                    lab64.d2_qualified_max_rows(capacity, window),
+                    lab64.qualified_max_rows(capacity)
+                );
+                // D1 never reads the knob.
+                assert_eq!(default.qualified_max_rows(capacity), NARROW_VERIFY_MAX_ROWS);
+            }
+        }
+        // The process default (no knob in the test snapshot) is the legacy gate.
+        for rows in 1..=CPU_SPLIT_STORAGE_MAX_ROWS {
+            assert_eq!(
+                cpu_wide_window_qualified(true, rows, rows, default, 64),
+                rows <= 4
+            );
+        }
+        // A knob beyond storage clamps to storage, never past it.
+        assert_eq!(
+            default.d2_qualified_max_rows(CPU_SPLIT_STORAGE_MAX_ROWS, 1000),
+            CPU_SPLIT_STORAGE_MAX_ROWS
+        );
+    }
+
     #[test]
     fn cpu_d1_wide_truth_is_1_to_64_wiring_only() {
         // Wiring only — MUST NOT be counted as numeric proof. Default keeps the
@@ -3949,5 +4181,193 @@ mod tests {
             },
             false
         ));
+    }
+
+    fn flash_next_geometry(shared: usize) -> MoeRouteGeometry {
+        MoeRouteGeometry {
+            shared_intermediate: shared,
+            ..FIXED_ROUTE_GEOMETRY
+        }
+    }
+
+    fn flash_next_policy(capability: MoeRouteCapability, shared: usize) -> MoeRoutePolicy {
+        MoeRoutePolicy {
+            capability,
+            geometry: flash_next_geometry(shared),
+            formats: MoeRouteFormats {
+                router: DType::BF16,
+                shared_selector: DType::BF16,
+                shared_gate: DType::BF16,
+                shared_up: DType::BF16,
+                shared_down: DType::BF16,
+                routed_gate_up: DType::MQ4G256V2,
+                routed_down: DType::MQ4G128V2,
+            },
+            slab_cold_codec: None,
+            expert_keep_mask: 0,
+        }
+    }
+
+    /// The shared-expert width rule of the QT44/QT53 and slab routes: the model's 640 (pinned
+    /// before the trunk shard) and every 128-multiple below it (a trunk shard rank's K-slice:
+    /// 384 / 256), nothing else. Widths that are not a 128-multiple (320 is the split the
+    /// prefill K-admission refuses), zero, or wider than the model stay refused.
+    #[test]
+    fn shared_width_geometry_admits_the_model_width_and_its_128_multiple_slices_only() {
+        for shared in [640usize, 512, 384, 256, 128] {
+            assert!(
+                fixed_route_geometry_up_to_shared_width(flash_next_geometry(shared)),
+                "shared {shared}"
+            );
+        }
+        for shared in [0usize, 1, 64, 127, 129, 320, 641, 768, 1280] {
+            assert!(
+                !fixed_route_geometry_up_to_shared_width(flash_next_geometry(shared)),
+                "shared {shared}"
+            );
+        }
+        // Every other axis of the geometry stays pinned, whatever the shared width.
+        for shared in [640usize, 384, 256] {
+            let base = flash_next_geometry(shared);
+            for broken in [
+                MoeRouteGeometry {
+                    experts: 511,
+                    ..base
+                },
+                MoeRouteGeometry { top_k: 8, ..base },
+                MoeRouteGeometry {
+                    hidden: 2048,
+                    ..base
+                },
+                MoeRouteGeometry {
+                    routed_intermediate: 512,
+                    ..base
+                },
+            ] {
+                assert!(
+                    !fixed_route_geometry_up_to_shared_width(broken),
+                    "{broken:?}"
+                );
+            }
+        }
+    }
+
+    /// The grouped QT44/QT53 and slab route predicates apply the width rule through the
+    /// policy; the model's own 640 selects exactly as before the shard.
+    #[test]
+    fn grouped_and_slab_geometry_follow_the_shared_width() {
+        let grouped = |capability: MoeRouteCapability, shared: usize| {
+            grouped_route_geometry_supported(
+                &flash_next_policy(capability, shared),
+                512,
+                10,
+                2560,
+                640,
+                2560,
+                2560,
+                640,
+                DType::MQ4G256V2,
+                DType::MQ4G128V2,
+            )
+        };
+        let slab = |shared: usize| {
+            slab_route_geometry_supported(
+                None,
+                &flash_next_policy(MoeRouteCapability::SlabCodecGrouped, shared),
+                512,
+                10,
+                2560,
+                640,
+                2560,
+                2560,
+                640,
+                &MoeDtypes {
+                    routed_gate_up: DType::MQ4G256V2,
+                    routed_down: DType::MQ4G128V2,
+                    ..uniform_mq4()
+                },
+                false,
+            )
+        };
+        for capability in [
+            MoeRouteCapability::Qt44Qt53Grouped,
+            MoeRouteCapability::Qt44Qt53GroupedSymmetric,
+        ] {
+            for (shared, want) in [
+                (640, true),
+                (512, true),
+                (384, true),
+                (256, true),
+                (320, false),
+            ] {
+                assert_eq!(grouped(capability, shared), want, "{capability:?} {shared}");
+            }
+        }
+        for (shared, want) in [
+            (640, true),
+            (384, true),
+            (256, true),
+            (320, false),
+            (0, false),
+        ] {
+            assert_eq!(slab(shared), want, "slab {shared}");
+        }
+        // The routed side is untouched by the shard: the routed width must still be 640.
+        assert!(!grouped_route_geometry_supported(
+            &flash_next_policy(MoeRouteCapability::Qt44Qt53Grouped, 384),
+            512,
+            10,
+            2560,
+            512,
+            2560,
+            2560,
+            512,
+            DType::MQ4G256V2,
+            DType::MQ4G128V2,
+        ));
+        // The grouped shape predicate also serves the slab declaration (the same fixed-shape
+        // stages; its own predicate adds the dtype-table contract); the FP8 one is neither.
+        assert!(grouped(MoeRouteCapability::SlabCodecGrouped, 384));
+        assert!(!grouped(MoeRouteCapability::Fp8B128Grouped, 640));
+        assert!(!slab_route_geometry_supported(
+            None,
+            &flash_next_policy(MoeRouteCapability::Qt44Qt53Grouped, 384),
+            512,
+            10,
+            2560,
+            640,
+            2560,
+            2560,
+            640,
+            &uniform_mq4(),
+            false,
+        ));
+    }
+
+    /// The qt=55 FP8 route is NOT part of the shared-width relaxation: it keeps the exact
+    /// 512/10/2560/640/640 geometry.
+    #[test]
+    fn fp8_grouped_geometry_keeps_the_exact_shared_width() {
+        let fp8 = |shared: usize| {
+            let mut policy = flash_next_policy(MoeRouteCapability::Fp8B128Grouped, shared);
+            policy.formats.routed_gate_up = DType::FP8E4M3B128;
+            policy.formats.routed_down = DType::FP8E4M3B128;
+            fp8_grouped_route_geometry_supported(
+                &policy,
+                512,
+                10,
+                2560,
+                640,
+                2560,
+                2560,
+                640,
+                DType::FP8E4M3B128,
+                DType::FP8E4M3B128,
+            )
+        };
+        assert!(fp8(640));
+        for shared in [512usize, 384, 256, 128] {
+            assert!(!fp8(shared), "fp8 shared {shared}");
+        }
     }
 }

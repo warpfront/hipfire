@@ -61,12 +61,65 @@ pub const AUTO_VRAM_RESERVE_BYTES: u64 = 6656 << 20;
 /// retired on this route the census carries it as [`ReserveCensus::runtime`].
 pub const QWEN4_RUNTIME_OVERHEAD_GFX1201_BYTES: u64 = 1408 << 20;
 
+/// Device memory the HIP runtime holds per rank of a Flash-Next EP2 load on two exact gfx1201
+/// R9700s (`HIPFIRE_EP_RESERVE_CENSUS`, default on), the same quantity as
+/// [`QWEN4_RUNTIME_OVERHEAD_GFX1201_BYTES`] measured on the EP route: the device-wide sysfs
+/// `mem_info_vram_used` minus every live allocation
+/// `rocprofv3 --memory-allocation-trace` reports, at the peak after a 10,649-token prompt of
+/// `serve --spec mtp --max-seq 16384` (trunk shard + hc8 sidecar, 8 lanes): 1,080 MiB on
+/// rank 0 and 1,084 MiB on rank 1 (fabric j8320, receipt
+/// `release-0.4.5/expertplace/runs/j3`); and, on bin 246f049be0 with the MTP head experts
+/// resident, at the peak after FOUR parallel 10.6-12.4k-token prompts: 1,029 MiB on rank 0
+/// and 1,033 MiB on rank 1 (sysfs 31,228 / 31,076 MiB minus traced live 30,199 / 30,043 MiB;
+/// fabric j8353, receipt `release-0.4.5/expertplace/runs/t2`). It INCLUDES the 57 MiB idle
+/// baseline, because an EP plan budgets against the device TOTAL (`qwen4_ep_free_vram` ->
+/// `planned_capacity_for(..).before_reserve()`), not the instantaneous free figure. The
+/// larger of all receipts (1,084 MiB) rounded up to 64 MiB.
+/// Only EP2 was measured; three or more ranks keep the historical floor.
+pub const QWEN4_EP2_RUNTIME_OVERHEAD_GFX1201_BYTES: u64 = 1088 << 20;
+
+/// The hot-unit loan cap per rank of a Flash-Next EP2 load on two exact gfx1201 R9700s: the
+/// bytes of the reserve census ([`QWEN4_EP2_RUNTIME_OVERHEAD_GFX1201_BYTES`] and the other
+/// reserve terms) that `<model>.ep.hot-units` may lend to additional VRAM-resident hot units
+/// (`HIPFIRE_EP_HOT_UNITS`, `HIPFIRE_EP_HOT_LOAN_MIB`; `expert_ep_units::ep_unit_apply_hot_loan`).
+/// It is the measured safe per-rank loan on 2xR9700 EP2 (symtrunk + hc8, `serve --spec mtp
+/// --max-seq 16384`, 8 lanes, calibrated `.ep.hot-units`), swept at 512 / 768 / 1,024 / 1,536 MiB
+/// against two 16.2k-token prefills, an 8-prompt burst and W8 (8 concurrent ~16.3k-token prompts),
+/// requiring every request answered and the warm post-long-prefill lane-page headroom
+/// (`free - earmark` at the first W8 admission) to stay at or above the census margins (512 MiB
+/// placement + 256 MiB page margin). Incumbent warm headroom was about 1.6 GiB per rank, so the
+/// loan spends it MiB for MiB: 768 MiB kept about 0.9 GiB; 1,024 MiB fell under the margins; at
+/// 1,536 MiB W8 was refused (`overload`). Receipt: `release-0.4.5/dynres/statichot/STRESS.md`.
+/// An operator value (`HIPFIRE_EP_HOT_LOAN_MIB`) above it is clamped to it.
+pub const QWEN4_EP2_HOT_LOAN_GFX1201_BYTES: u64 = 768 << 20;
+
 /// The measured HIP runtime overhead the census charges: only where it was
 /// measured, an exact gfx1201 discrete (not unified-memory) single-device
-/// load. `None` elsewhere, where the historical floor still applies.
+/// load. `None` elsewhere, where the historical floor still applies. An
+/// expert-parallel load's term is [`runtime_overhead_bytes_ep`].
 pub fn runtime_overhead_bytes(arch: &str, unified_memory: bool, ranks: usize) -> Option<u64> {
-    (arch == "gfx1201" && !unified_memory && ranks == 1)
-        .then_some(QWEN4_RUNTIME_OVERHEAD_GFX1201_BYTES)
+    runtime_overhead_bytes_ep(arch, unified_memory, ranks, false)
+}
+
+/// [`runtime_overhead_bytes`] for a load that may be expert-parallel: with `ep_census`
+/// (`HIPFIRE_EP_RESERVE_CENSUS` on) an exact gfx1201 discrete two-rank load charges
+/// [`QWEN4_EP2_RUNTIME_OVERHEAD_GFX1201_BYTES`] per rank, which retires the historical floor on
+/// it. Three or more ranks stay `None` (not measured); `ep_census` off is exactly
+/// [`runtime_overhead_bytes`]'s single-device-only answer.
+pub fn runtime_overhead_bytes_ep(
+    arch: &str,
+    unified_memory: bool,
+    ranks: usize,
+    ep_census: bool,
+) -> Option<u64> {
+    if arch != "gfx1201" || unified_memory {
+        return None;
+    }
+    match ranks {
+        1 => Some(QWEN4_RUNTIME_OVERHEAD_GFX1201_BYTES),
+        2 if ep_census => Some(QWEN4_EP2_RUNTIME_OVERHEAD_GFX1201_BYTES),
+        _ => None,
+    }
 }
 
 /// Context [`AUTO_VRAM_RESERVE_BYTES`] was measured at (`hipfire run`'s
@@ -236,6 +289,7 @@ fn is_routed_expert(name: &str) -> bool {
     name.ends_with(".mlp.experts.gate_up_proj")
         || name.ends_with(".mlp.experts.down_proj")
         || name.ends_with(crate::expert_arena::ARENA_SUFFIX)
+        || crate::expert_ep_units::is_unit_arena_name(name)
 }
 
 /// Resident bytes outside the routed experts, and the routed-expert bytes of
@@ -249,8 +303,10 @@ pub fn resident_split(
 }
 
 /// [`resident_split`] for one rank of a `ranks`-way expert-parallel load: the
-/// non-expert bytes are replicated on every rank, the layer-0 routed-expert
-/// bytes are the per-expert bytes times `max_local_count` (the largest rank's
+/// non-expert bytes are replicated on every rank (a non-routed entry placed in
+/// host RAM, [`place_embedding_host`], takes no device bytes and is left out),
+/// the layer-0 routed-expert bytes are the per-expert bytes times
+/// `max_local_count` (the largest rank's
 /// share; an uneven split gives the low ranks one more expert).
 pub fn resident_split_ranks(
     weights: &[WeightEntry],
@@ -269,7 +325,12 @@ pub fn resident_split_ranks(
         let bytes =
             bytes_of(entry).ok_or_else(|| format!("no payload size for '{}'", entry.name))?;
         if !is_routed_expert(&entry.name) {
-            non_expert += bytes;
+            if takes_device_non_expert_bytes(entry) {
+                non_expert += bytes;
+            }
+        } else if crate::expert_ep_units::is_unit_arena_name(&entry.name) {
+            // A mixed layer's arena entry is a per-rank value the unit plan
+            // charges (`EpUnitPlan::vram_bytes`), never a layer-0 charge.
         } else if entry.name.ends_with(crate::expert_arena::ARENA_SUFFIX) {
             layer_arena_max = layer_arena_max.max(rank_share(entry, bytes, 0, ranks)?);
         } else if !entry.name.starts_with("mtp.") && entry.layer == Some(0) {
@@ -277,6 +338,54 @@ pub fn resident_split_ranks(
         }
     }
     Ok((non_expert, layer_experts + layer_arena_max))
+}
+
+/// [`resident_split_ranks`] for a load whose trunk projections are TP-sharded over `ranks`
+/// (`HIPFIRE_QWEN4_EP_TRUNK_SHARD`, [`crate::weights::trunk_shard`]): every non-expert tensor
+/// the shard cuts counts its BUSIEST rank's share
+/// ([`crate::weights::trunk_shard::trunk_share_bytes`]); the routed-expert bytes are
+/// unchanged. `trunk == None` is exactly [`resident_split_ranks`].
+pub fn resident_split_ranks_trunk(
+    weights: &[WeightEntry],
+    bytes_of: impl Fn(&WeightEntry) -> Option<u64>,
+    ranks: usize,
+    trunk: Option<(
+        &crate::weights::trunk_shard::TrunkDims,
+        crate::weights::trunk_shard::QsaMode,
+    )>,
+) -> Result<(u64, u64), String> {
+    let Some((dims, mode)) = trunk else {
+        return resident_split_ranks(weights, bytes_of, ranks);
+    };
+    let failure = std::cell::RefCell::new(None::<String>);
+    let split = resident_split_ranks(
+        weights,
+        |entry| {
+            let bytes = bytes_of(entry)?;
+            if is_routed_expert(&entry.name) {
+                return Some(bytes);
+            }
+            match crate::weights::trunk_shard::trunk_share_bytes(
+                dims,
+                mode,
+                &entry.name,
+                &entry.logical_shape,
+                bytes,
+                ranks,
+            ) {
+                Ok(share) => Some(share),
+                Err(error) => {
+                    failure.borrow_mut().get_or_insert(error);
+                    None
+                }
+            }
+        },
+        ranks,
+    );
+    if let Some(error) = failure.into_inner() {
+        return Err(format!("trunk shard census: {error}"));
+    }
+    split
 }
 
 /// Gate/up and down payload bytes of the largest trunk layer of a packed
@@ -1114,9 +1223,11 @@ fn band_weight_census(
         }
         let bytes = payload(entry)?;
         if !is_routed_expert(&entry.name) {
-            non_expert = non_expert
-                .checked_add(bytes)
-                .ok_or_else(|| overflow("non-expert bytes"))?;
+            if takes_device_non_expert_bytes(entry) {
+                non_expert = non_expert
+                    .checked_add(bytes)
+                    .ok_or_else(|| overflow("non-expert bytes"))?;
+            }
         } else if entry.name.starts_with("mtp.") {
             mtp = mtp
                 .checked_add(bytes)
@@ -1343,6 +1454,13 @@ pub fn native_mtp_census_scope(
 /// expert's gate/up/down and the PLE key/value projections. The direct BF16
 /// readers (`input_mix_weight_up`, `shared_expert_gate`) and every other
 /// tensor are not shadowed.
+///
+/// An applied `.hc8` sidecar replaces the BF16 `input_mix_weight_down`
+/// matrices of these (and the `input_mix_weight_up` ones) by E4M3 rows; the
+/// census does NOT shrink: the lazy F16 shadow stays `2 * rows * cols` per
+/// owner (built from the E4M3 weight, keyed on its buffer), and placement
+/// keeps the manifest's BF16 sizes (see
+/// [`crate::hc8_sidecar::hc8_sidecar_saved_bytes`]).
 const F16_SHADOW_LAYER_SUFFIXES: [&str; 8] = [
     "attn_hyper_connection.input_mix_weight_down.weight",
     "mlp_hyper_connection.input_mix_weight_down.weight",
@@ -1370,6 +1488,14 @@ const F16_SHADOW_ROOT: &str =
 /// without them (an MQ-quantized trunk) charges nothing.
 pub fn f16_shadow_bytes(weights: &[WeightEntry], num_layers: usize) -> Result<u64, String> {
     f16_shadow_bytes_owned(weights, num_layers, |_| true, true)
+}
+
+/// Resident bytes an applied `.hc8` sidecar adds after placement ran:
+/// `max(0, net)` of its `payload - replaced` (negative: E4M3 rows are
+/// smaller than the BF16 matrices they replace), so a sidecar never raises
+/// placement. Plan-time placement keeps charging the manifest's BF16 sizes.
+pub fn hc8_net_charge(net_bytes: i64) -> u64 {
+    u64::try_from(net_bytes).unwrap_or(0)
 }
 
 /// [`f16_shadow_bytes`] for one pipeline-parallel band: only the shadows of
@@ -1448,11 +1574,53 @@ pub fn f16_shadow_charge(
     weights: &[WeightEntry],
     num_layers: usize,
 ) -> Result<u64, String> {
-    if capable && route_rows >= rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS {
-        f16_shadow_bytes(weights, num_layers)
-    } else {
-        Ok(0)
+    f16_shadow_charge_at(capable, route_rows, weights, num_layers, None)
+}
+
+/// [`f16_shadow_charge`] with the shared expert's intermediate narrowed to `local_shared_width`
+/// (`Some`: the widest slice an EP trunk-shard rank keeps,
+/// [`crate::weights::trunk_shard::max_shared_width`]; `None`: the manifest's width). A trunk
+/// shard replaces each `mlp.shared_expert.{gate,up,down}_proj` with the rank's own slice, and
+/// the lazy shadow is built from the weight the forward reads, so a rank's shared-expert
+/// shadows are `2 * width * hidden` per owner; every other owner (hyper-connection down mixes,
+/// router, PLE projections) is replicated and charged at its manifest size.
+pub fn f16_shadow_charge_at(
+    capable: bool,
+    route_rows: usize,
+    weights: &[WeightEntry],
+    num_layers: usize,
+    local_shared_width: Option<usize>,
+) -> Result<u64, String> {
+    if !(capable && route_rows >= rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS) {
+        return Ok(0);
     }
+    let Some(width) = local_shared_width else {
+        return f16_shadow_bytes(weights, num_layers);
+    };
+    let owns_layer = |_: usize| true;
+    weights
+        .iter()
+        .filter(|entry| is_f16_shadow_owner(entry, num_layers, &owns_layer, true))
+        .try_fold(0u64, |total, entry| {
+            let bytes = if entry.name.contains(".mlp.shared_expert.") {
+                // gate/up are [intermediate, hidden], down is [hidden, intermediate].
+                let [rows, cols] = [entry.logical_shape[0], entry.logical_shape[1]];
+                let (rows, cols) = if entry.name.ends_with("down_proj.weight") {
+                    (rows, cols.min(width))
+                } else {
+                    (rows.min(width), cols)
+                };
+                rows.checked_mul(cols)
+                    .and_then(|elements| elements.checked_mul(2))
+                    .and_then(|bytes| u64::try_from(bytes).ok())
+                    .ok_or_else(|| format!("F16 shadow bytes of '{}' overflow", entry.name))?
+            } else {
+                f16_shadow_entry_bytes(entry)?
+            };
+            bytes
+                .checked_add(total)
+                .ok_or_else(|| format!("F16 shadow bytes of '{}' overflow", entry.name))
+        })
 }
 
 /// One trunk layer whose shared-expert triple the INT8 route shadows: the
@@ -1478,6 +1646,17 @@ pub fn shared_i8_shadow_layers(
     weights: &[WeightEntry],
     num_layers: usize,
 ) -> Result<Vec<SharedI8ShadowLayer>, String> {
+    shared_i8_shadow_layers_at(weights, num_layers, None)
+}
+
+/// [`shared_i8_shadow_layers`] with each layer's shared intermediate narrowed to
+/// `local_width` (`Some`: the widest slice a trunk-shard rank keeps,
+/// [`crate::weights::trunk_shard::max_shared_width`]; `None`: the manifest's own width).
+pub fn shared_i8_shadow_layers_at(
+    weights: &[WeightEntry],
+    num_layers: usize,
+    local_width: Option<usize>,
+) -> Result<Vec<SharedI8ShadowLayer>, String> {
     use rdna_compute::DType;
     let find = |layer: usize, proj: &str| {
         let name = format!("model.language_model.layers.{layer}.mlp.shared_expert.{proj}.weight");
@@ -1498,10 +1677,13 @@ pub fn shared_i8_shadow_layers(
         ) else {
             continue;
         };
-        let (i, k) = (gate.logical_shape[0], gate.logical_shape[1]);
-        if up.logical_shape != gate.logical_shape || down.logical_shape[1] != i {
+        let (global_i, k) = (gate.logical_shape[0], gate.logical_shape[1]);
+        if up.logical_shape != gate.logical_shape || down.logical_shape[1] != global_i {
             continue;
         }
+        // An EP trunk-shard rank builds the shadows of its own slice of the shared expert:
+        // the manifest's width is the unsharded one.
+        let i = local_width.map_or(global_i, |width| width.min(global_i));
         let Some((gate_up_bytes, down_bytes)) =
             rdna_compute::shared_i8::shared_i8_shadow_plane_bytes(i, k, down.logical_shape[0])
         else {
@@ -1526,8 +1708,17 @@ pub fn shared_i8_shadow_layers(
 /// [`rdna_compute::shared_i8::shared_i8_shadow_layer_bytes`]. A conservative cold bound, like
 /// [`f16_shadow_bytes`]. Callers gate it with [`shared_i8_charge`].
 pub fn shared_i8_shadow_bytes(weights: &[WeightEntry], num_layers: usize) -> Result<u64, String> {
+    shared_i8_shadow_bytes_at(weights, num_layers, None)
+}
+
+/// [`shared_i8_shadow_bytes`] over [`shared_i8_shadow_layers_at`].
+pub fn shared_i8_shadow_bytes_at(
+    weights: &[WeightEntry],
+    num_layers: usize,
+    local_width: Option<usize>,
+) -> Result<u64, String> {
     let mut total = 0u64;
-    for layer in shared_i8_shadow_layers(weights, num_layers)? {
+    for layer in shared_i8_shadow_layers_at(weights, num_layers, local_width)? {
         total = total
             .checked_add(layer.gate_up_bytes)
             .and_then(|bytes| bytes.checked_add(layer.down_bytes))
@@ -1551,8 +1742,20 @@ pub fn shared_i8_charge(
     weights: &[WeightEntry],
     num_layers: usize,
 ) -> Result<u64, String> {
+    shared_i8_charge_at(enabled, route_rows, weights, num_layers, None)
+}
+
+/// [`shared_i8_charge`] with the shared intermediate width the shadows are built at
+/// ([`shared_i8_shadow_layers_at`]).
+pub fn shared_i8_charge_at(
+    enabled: bool,
+    route_rows: usize,
+    weights: &[WeightEntry],
+    num_layers: usize,
+    local_width: Option<usize>,
+) -> Result<u64, String> {
     if enabled && route_rows >= rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS {
-        shared_i8_shadow_bytes(weights, num_layers)
+        shared_i8_shadow_bytes_at(weights, num_layers, local_width)
     } else {
         Ok(0)
     }
@@ -2074,7 +2277,8 @@ pub fn native_mtp_granule_slack(
 /// formula (`historical`, [`auto_vram_reserve`], the floor, no longer
 /// evidence of what a long context takes) and the bottom-up
 /// [`ReserveCensus`]; where the census carries the measured HIP runtime
-/// overhead ([`runtime_overhead_bytes`]) the floor is retired
+/// overhead ([`runtime_overhead_bytes`]: a single-device load, or an exact gfx1201 EP2 load
+/// under `HIPFIRE_EP_RESERVE_CENSUS`, [`runtime_overhead_bytes_ep`]) the floor is retired
 /// (`historical` is `None`) and the census alone is the reserve. The
 /// whole-layer stage buffers and safety margin ([`PlacementCharges`]) are
 /// added on top of [`Self::bytes`].
@@ -2091,6 +2295,17 @@ pub struct AutoReserve {
     /// of resident VRAM (their census terms are not charged); 0 when the
     /// shadows stay resident ([`DecodeShareForward::shadows_borrowed`]).
     pub decode_share_shadows: u64,
+    /// `Some(bytes)` when an EP reserve-decoupled load charged its dedicated
+    /// forward (`bytes` includes the fixed table charges); `None` otherwise.
+    pub ep_reserve_forward: Option<u64>,
+    /// Bytes of F16 + INT8 weight shadows an EP reserve-decoupled load hosts in
+    /// the donor segments instead of resident VRAM (their census terms are not
+    /// charged, [`placement_inputs_with_ep_reserve_shadows_in_donors`]); 0 when
+    /// they stay resident.
+    pub ep_reserve_shadows: u64,
+    /// Whether the census is the expert-parallel one (`HIPFIRE_EP_RESERVE_CENSUS` on, two or
+    /// more ranks); selects the [`Self::describe`] wording only.
+    pub ep_census: bool,
 }
 
 impl AutoReserve {
@@ -2102,7 +2317,17 @@ impl AutoReserve {
             census_total,
             decode_share_borrowed: None,
             decode_share_shadows: 0,
+            ep_reserve_forward: None,
+            ep_reserve_shadows: 0,
+            ep_census: false,
         })
+    }
+
+    /// Mark the census as the expert-parallel one (`HIPFIRE_EP_RESERVE_CENSUS` on, two or more
+    /// ranks): only the log text differs ([`Self::describe`]).
+    pub fn with_ep_census(mut self) -> Self {
+        self.ep_census = true;
+        self
     }
 
     /// Mark the forward term as the decode-share dedicated charge, with
@@ -2119,9 +2344,38 @@ impl AutoReserve {
         self
     }
 
+    /// Mark the forward term as the EP reserve-decoupled dedicated charge
+    /// ([`crate::ep_reserve::EpReserveForwardPlan::charged_forward_bytes`]).
+    /// Distinct from decode-share: no donor tail, no tier lease.
+    pub fn with_ep_reserve(mut self, charged_forward: u64) -> Self {
+        self.ep_reserve_forward = Some(charged_forward);
+        self
+    }
+
+    /// Record `bytes` of weight shadows hosted in the EP reserve's donor
+    /// segments (the census `f16_shadows` / `shared_i8_shadows` terms are 0).
+    pub fn with_ep_reserve_shadows(mut self, bytes: u64) -> Self {
+        self.ep_reserve_shadows = bytes;
+        self
+    }
+
     /// The census with its `forward` term annotated when decode-share charged
     /// the dedicated forward.
     fn census_text(&self) -> String {
+        if let Some(charged) = self.ep_reserve_forward {
+            let shadows = if self.ep_reserve_shadows == 0 {
+                String::new()
+            } else {
+                format!(
+                    "; {} MiB weight shadows hosted in the donor segments",
+                    self.ep_reserve_shadows >> 20
+                )
+            };
+            return self.census.describe_with(Some(&format!(
+                "EP reserve-decoupled dedicated forward; {} MiB charged{shadows}",
+                charged >> 20
+            )));
+        }
         match self.decode_share_borrowed {
             Some(borrowed) => {
                 let shadows = if self.decode_share_shadows == 0 {
@@ -2174,10 +2428,12 @@ impl AutoReserve {
         }
     }
 
-    /// The reserve and its parts for the placement log, every census term.
+    /// The reserve and its parts for the placement log, every census term. An EP census
+    /// ([`Self::with_ep_census`]) states its runtime term and that the single-device floor is
+    /// retired (or, where the runtime was not measured, kept).
     pub fn describe(&self) -> String {
-        match self.historical {
-            Some(historical) => format!(
+        match (self.historical, self.ep_census) {
+            (Some(historical), false) => format!(
                 "{} MiB = max({} MiB historical floor, {} MiB census [{}]): {} wins",
                 self.bytes() >> 20,
                 historical >> 20,
@@ -2185,11 +2441,31 @@ impl AutoReserve {
                 self.census_text(),
                 self.winner()
             ),
-            None => format!(
+            (Some(historical), true) => format!(
+                "{} MiB = max({} MiB historical floor, {} MiB EP census [{}]): {} wins \
+                 (EP census: rank-local state / MTP ring / INT8 shared shadows where the trunk is \
+                 sharded; the per-rank HIP runtime overhead is not measured on this device or \
+                 rank count, so the floor stays)",
+                self.bytes() >> 20,
+                historical >> 20,
+                self.census_total >> 20,
+                self.census_text(),
+                self.winner()
+            ),
+            (None, false) => format!(
                 "{} MiB = census [{}] (historical floor retired: the census carries the \
                  measured HIP runtime overhead)",
                 self.bytes() >> 20,
                 self.census_text()
+            ),
+            (None, true) => format!(
+                "{} MiB = EP census [{}] (EP: historical single-device floor retired, the census \
+                 carries the measured per-rank HIP runtime overhead, {} MiB; rank-local state / \
+                 MTP ring / INT8 shared shadows where the trunk is sharded; \
+                 HIPFIRE_EP_RESERVE_CENSUS=0 restores the floor)",
+                self.bytes() >> 20,
+                self.census_text(),
+                self.census.runtime >> 20
             ),
         }
     }
@@ -3034,7 +3310,10 @@ pub fn resident_routed_expert_bytes(
 pub fn place_routed_experts(weights: &mut [WeightEntry], vram_layers: usize) -> usize {
     let mut moved = 0;
     for entry in weights.iter_mut() {
-        if entry.residency != WeightResidency::Resident || !is_routed_expert(&entry.name) {
+        if entry.residency != WeightResidency::Resident
+            || !is_routed_expert(&entry.name)
+            || crate::expert_ep_units::is_unit_arena_name(&entry.name)
+        {
             continue;
         }
         let trunk_resident =
@@ -3043,6 +3322,9 @@ pub fn place_routed_experts(weights: &mut [WeightEntry], vram_layers: usize) -> 
             entry.residency = WeightResidency::HostMapped;
             moved += 1;
         }
+    }
+    if moved > 0 {
+        hip_bridge::declare_qwen4_host_mapping("Qwen4 host-mapped weights (place_routed_experts)");
     }
     moved
 }
@@ -3057,7 +3339,10 @@ pub fn place_routed_experts(weights: &mut [WeightEntry], vram_layers: usize) -> 
 pub fn place_routed_experts_set(weights: &mut [WeightEntry], resident: &[usize]) -> usize {
     let mut moved = 0;
     for entry in weights.iter_mut() {
-        if entry.residency != WeightResidency::Resident || !is_routed_expert(&entry.name) {
+        if entry.residency != WeightResidency::Resident
+            || !is_routed_expert(&entry.name)
+            || crate::expert_ep_units::is_unit_arena_name(&entry.name)
+        {
             continue;
         }
         let trunk_resident = !entry.name.starts_with("mtp.")
@@ -3067,7 +3352,263 @@ pub fn place_routed_experts_set(weights: &mut [WeightEntry], resident: &[usize])
             moved += 1;
         }
     }
+    if moved > 0 {
+        hip_bridge::declare_qwen4_host_mapping(
+            "Qwen4 host-mapped weights (place_routed_experts_set)",
+        );
+    }
     moved
+}
+
+/// The native MTP head's routed-expert entries: the `mtp.` layer's stacked
+/// gate/up and down tensors (or slab arena). [`place_routed_experts`] and
+/// [`place_routed_experts_set`] always host-map exactly these on a single card.
+fn is_mtp_head_routed(entry: &WeightEntry) -> bool {
+    entry.name.starts_with("mtp.")
+        && is_routed_expert(&entry.name)
+        && !crate::expert_ep_units::is_unit_arena_name(&entry.name)
+        && !matches!(entry.policy, ShardPolicy::Tied { .. })
+}
+
+/// What the native MTP head's routed experts weigh: entries, payload bytes (the
+/// device charge when they stay VRAM-resident) and pinned-host bytes including
+/// [`HOST_MAPPED_PAD_BYTES`] per entry (what [`hotset_host_mapped_bytes`]
+/// counts for them while they are host-mapped).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MtpHeadRoutedCensus {
+    pub entries: usize,
+    pub payload_bytes: u64,
+    pub host_charge_bytes: u64,
+}
+
+/// [`MtpHeadRoutedCensus`] of `weights`, whatever each entry's current
+/// placement. Sums are checked.
+pub fn mtp_head_routed_census(
+    weights: &[WeightEntry],
+    bytes_of: impl Fn(&WeightEntry) -> Option<u64>,
+) -> Result<MtpHeadRoutedCensus, String> {
+    let mut census = MtpHeadRoutedCensus::default();
+    for entry in weights.iter().filter(|entry| is_mtp_head_routed(entry)) {
+        let bytes =
+            bytes_of(entry).ok_or_else(|| format!("no payload size for '{}'", entry.name))?;
+        let overflow = || "MTP head routed-expert byte census overflows".to_string();
+        census.entries += 1;
+        census.payload_bytes = census
+            .payload_bytes
+            .checked_add(bytes)
+            .ok_or_else(overflow)?;
+        census.host_charge_bytes = bytes
+            .checked_add(HOST_MAPPED_PAD_BYTES)
+            .and_then(|charge| census.host_charge_bytes.checked_add(charge))
+            .ok_or_else(overflow)?;
+    }
+    Ok(census)
+}
+
+/// Keep the native MTP head's routed experts VRAM-resident
+/// (`HIPFIRE_QWEN4_MTP_HEAD_RESIDENT` on a single card, `HIPFIRE_EP_MTP_EXPERTS_RESIDENT` on an
+/// expert-parallel load): undo, for exactly those entries, the host placement
+/// [`place_routed_experts`] / [`place_routed_experts_set`] gave them (they upload through the
+/// ordinary resident tensor path, no new format; an EP-sharded entry uploads only the rank's
+/// owned experts). The caller has already charged the device bytes against the budget
+/// ([`MtpHeadRoutedCensus::payload_bytes`], or [`EpMtpResident::bytes`] on EP). Returns the
+/// number of entries restored.
+pub fn keep_mtp_head_routed_resident(weights: &mut [WeightEntry]) -> usize {
+    let mut restored = 0;
+    for entry in weights.iter_mut() {
+        if entry.residency == WeightResidency::HostMapped && is_mtp_head_routed(entry) {
+            entry.residency = WeightResidency::Resident;
+            restored += 1;
+        }
+    }
+    restored
+}
+
+/// The native MTP head's routed experts one rank of an expert-parallel load keeps
+/// VRAM-resident (`HIPFIRE_EP_MTP_EXPERTS_RESIDENT`, default on): the rank's OWNED slice only.
+/// The EP manifest declares the head's stacks `ExpertSharded` like every trunk layer's
+/// ([`crate::weights::Qwen4Manifest::with_expert_parallel`]), so a `Resident` entry uploads
+/// just the owned experts (`e % ranks == rank`, compact, planar when the load repacks), the
+/// bytes [`rank_share`] charges.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EpMtpResident {
+    /// Head routed entries (gate/up and down stacks: 2 on Flash-Next).
+    pub entries: usize,
+    /// Experts of the head the largest rank (rank 0) owns: 256 of 512 on EP2. One
+    /// "unit" is one expert's gate/up plus down payload.
+    pub owned_experts: usize,
+    /// Device bytes of those owned experts on the largest rank (gate/up + down; no per-expert
+    /// or arena pad: the entries upload as ordinary resident tensors, like a resident trunk
+    /// layer). Every rank's budget is charged this, so a layer counted resident fits every
+    /// rank of an uneven split, the way `layer_experts` is.
+    pub bytes: u64,
+}
+
+/// Whether this load keeps the head's owned experts VRAM-resident, and what it weighs:
+/// `Some` exactly when the switch is `enabled`, the load is expert-parallel (`ranks >= 2`),
+/// the native MTP head stays attached (`head_kept`) and the manifest declares head routed
+/// experts with payload. `None` is today's placement (host-mapped on every rank), also when
+/// the head is not attached (an AR load pins them without need, as before). Checked sums.
+pub fn ep_mtp_resident_decision(
+    weights: &[WeightEntry],
+    bytes_of: impl Fn(&WeightEntry) -> Option<u64>,
+    ranks: usize,
+    enabled: bool,
+    head_kept: bool,
+) -> Result<Option<EpMtpResident>, String> {
+    if !enabled || !head_kept || ranks < 2 {
+        return Ok(None);
+    }
+    let (mut entries, mut bytes, mut owned_experts) = (0usize, 0u64, 0usize);
+    for entry in weights.iter().filter(|entry| is_mtp_head_routed(entry)) {
+        let payload =
+            bytes_of(entry).ok_or_else(|| format!("no payload size for '{}'", entry.name))?;
+        // Rank 0 owns the most experts of an uneven split: the charge every rank budgets.
+        let share = rank_share(entry, payload, 0, ranks)?;
+        entries += 1;
+        bytes = bytes
+            .checked_add(share)
+            .ok_or_else(|| "MTP head owned routed-expert byte census overflows".to_string())?;
+        let experts = entry.logical_shape.first().copied().unwrap_or(0);
+        owned_experts = owned_experts.max(Qwen4EpPlacement { rank: 0, ranks }.local_count(experts));
+    }
+    Ok((entries > 0 && bytes > 0).then_some(EpMtpResident {
+        entries,
+        owned_experts,
+        bytes,
+    }))
+}
+
+/// The one load line stating where the MTP head's routed experts sit on an expert-parallel
+/// load: the owned slice VRAM-resident on every rank (`resident`), or the host-mapped
+/// placement with `why` (the kill switch, or no head attached).
+pub fn ep_mtp_experts_line(resident: Option<&EpMtpResident>, why_host: &str) -> String {
+    match resident {
+        Some(mtp) => format!(
+            "qwen4 EP expert tier: the MTP head's experts: {} owned units VRAM-resident on every rank ({} MiB, charged before the ranking walk)",
+            mtp.owned_experts,
+            mtp.bytes >> 20
+        ),
+        None => format!(
+            "qwen4 EP expert tier: the MTP head's experts stay host-mapped (today's placement, pinned on every rank; {why_host})"
+        ),
+    }
+}
+
+/// Device bytes the applied `.hc8` sidecar saves on ONE rank of an expert-parallel load, for
+/// the plan and every rank's fit census (`HIPFIRE_EP_HC8_PLAN_CHARGE`, default on). The BF16 HC
+/// mixers are replicated, charged in full in the non-expert census; the sidecar replaces each
+/// with its E4M3 payload, so the census subtracts `base - payload` per tensor.
+///
+/// `sidecar` is `(name, base BF16 bytes, E4M3 payload bytes)` per sidecar tensor
+/// (`Qwen4Hc8Sidecar::plan_tensors`). `0` (today's BF16 charge) unless `enabled`, `ranks >= 2`
+/// (the caller passes an empty `sidecar` for a pipeline band) and the native MTP head is
+/// attached (`head_kept`: every sidecar tensor, the head's own included, is loaded on every
+/// rank). A tensor counts only when it is exactly what the runtime would replace
+/// (`weights::plan_hc8_sidecar`'s checks) AND what `non_expert` charged for it on this rank:
+/// one device-resident, non-tied manifest entry of that name, BF16 `[m, k]`, whose census
+/// bytes (`bytes_of`, cut by the trunk shard when `trunk` is given) equal the sidecar's base
+/// bytes and `m*k*2`, with the payload `hc8_payload_bytes(m, k)`. A tensor the shard cuts
+/// (its rank share differs from the full bytes), or any mismatch, saves 0 rather than a
+/// guess, so the sum never exceeds what an applied sidecar frees: it is NOT the upper bound
+/// `hc8_sidecar_saved_bytes`, which also counts tensors a load leaves out.
+pub fn ep_hc8_plan_saving(
+    weights: &[WeightEntry],
+    bytes_of: impl Fn(&WeightEntry) -> Option<u64>,
+    sidecar: &[(String, u64, u64)],
+    trunk: Option<(
+        &crate::weights::trunk_shard::TrunkDims,
+        crate::weights::trunk_shard::QsaMode,
+    )>,
+    ranks: usize,
+    enabled: bool,
+    head_kept: bool,
+) -> Result<u64, String> {
+    if !enabled || !head_kept || ranks < 2 || sidecar.is_empty() {
+        return Ok(0);
+    }
+    let mut by_name = std::collections::HashMap::<&str, Vec<&WeightEntry>>::new();
+    for entry in weights {
+        by_name.entry(entry.name.as_str()).or_default().push(entry);
+    }
+    let mut saved = 0u64;
+    for (name, base, payload) in sidecar {
+        let [entry] = by_name.get(name.as_str()).map_or(&[][..], Vec::as_slice) else {
+            continue;
+        };
+        if entry.residency.is_external()
+            || entry.residency == WeightResidency::HostMapped
+            || matches!(entry.policy, ShardPolicy::Tied { .. })
+            || entry.dtype != rdna_compute::DType::BF16
+        {
+            continue;
+        }
+        let &[m, k] = entry.logical_shape.as_slice() else {
+            continue;
+        };
+        let census = bytes_of(entry).ok_or_else(|| format!("no payload size for '{name}'"))?;
+        let bf16 = (m as u64)
+            .checked_mul(k as u64)
+            .and_then(|n| n.checked_mul(2));
+        if Some(census) != bf16
+            || census != *base
+            || rdna_compute::hc8_weight::hc8_payload_bytes(m, k).map(|n| n as u64) != Some(*payload)
+        {
+            continue;
+        }
+        if let Some((dims, mode)) = trunk {
+            let share = crate::weights::trunk_shard::trunk_share_bytes(
+                dims,
+                mode,
+                &entry.name,
+                &entry.logical_shape,
+                census,
+                ranks,
+            )?;
+            if share != census {
+                continue;
+            }
+        }
+        let Some(delta) = base.checked_sub(*payload) else {
+            continue;
+        };
+        saved = saved
+            .checked_add(delta)
+            .ok_or_else(|| "hc8 saving byte census overflows".to_string())?;
+    }
+    Ok(saved)
+}
+
+/// Mark the replicated token embedding table ([`crate::weights::QWEN4_EMBED`])
+/// [`WeightResidency::HostMapped`]: an expert-parallel rank pins its own copy in
+/// host RAM and the embedding kernels read the rows they gather (one row per
+/// decoded token, one per prompt token of a prefill chunk) zero-copy over the
+/// link through the device alias, so the table takes no device bytes
+/// ([`resident_split_ranks`] leaves it out of the non-expert bytes). The tied
+/// MTP alias has no payload of its own and stays as it is, and an entry already
+/// placed (or absent) is untouched. Returns the number of entries moved (0 or 1).
+pub fn place_embedding_host(weights: &mut [WeightEntry]) -> usize {
+    let mut moved = 0;
+    for entry in weights.iter_mut() {
+        if entry.name != crate::weights::QWEN4_EMBED
+            || entry.residency != WeightResidency::Resident
+            || matches!(entry.policy, ShardPolicy::Tied { .. })
+        {
+            continue;
+        }
+        entry.residency = WeightResidency::HostMapped;
+        moved += 1;
+    }
+    if moved > 0 {
+        hip_bridge::declare_qwen4_host_mapping("Qwen4 host-mapped weights (place_embedding_host)");
+    }
+    moved
+}
+
+/// Whether `entry` takes device bytes in a non-expert census: it does unless it
+/// is a non-routed entry placed in host RAM ([`place_embedding_host`]).
+fn takes_device_non_expert_bytes(entry: &WeightEntry) -> bool {
+    entry.residency != WeightResidency::HostMapped
 }
 
 /// Pinned host bytes the [`WeightResidency::HostMapped`] entries will take.
@@ -3156,6 +3697,43 @@ pub fn host_mapped_bytes_ranks(
     Ok(per_rank)
 }
 
+/// [`host_mapped_bytes_ranks`] of a per-expert EP load (D1): the pinned host
+/// bytes of every rank, from the manifest's non-trunk-expert
+/// [`WeightResidency::HostMapped`] entries (the embedding table, the MTP
+/// head's experts: sized exactly as [`host_mapped_bytes_ranks`] sizes them)
+/// plus `plan.host_pinned_bytes(rank)` for the trunk experts. Trunk routed
+/// entries of `weights` (aggregates or unit arenas, whatever their placement)
+/// are left out: the plan owns their residency and pads. For a whole-layers
+/// plan this equals [`host_mapped_bytes_ranks`] on the manifest
+/// [`place_routed_experts`] placed.
+pub fn ep_unit_host_bytes_ranks(
+    weights: &[WeightEntry],
+    bytes_of: impl Fn(&WeightEntry) -> Option<u64>,
+    plan: &crate::expert_ep_units::EpUnitPlan,
+) -> Result<Vec<u64>, String> {
+    let ranks = plan.geometry().ranks;
+    if ranks == 0 {
+        return Err("expert-parallel rank count must be at least 1".to_string());
+    }
+    let mut per_rank: Vec<u64> = (0..ranks)
+        .map(|rank| plan.host_pinned_bytes(rank))
+        .collect();
+    for entry in weights {
+        let trunk_expert = is_routed_expert(&entry.name)
+            && !entry.name.starts_with("mtp.")
+            && entry.layer.is_some();
+        if entry.residency != WeightResidency::HostMapped || trunk_expert {
+            continue;
+        }
+        let bytes =
+            bytes_of(entry).ok_or_else(|| format!("no payload size for '{}'", entry.name))?;
+        for (rank, charge) in per_rank.iter_mut().enumerate() {
+            *charge += rank_share(entry, bytes, rank, ranks)? + HOST_MAPPED_PAD_BYTES;
+        }
+    }
+    Ok(per_rank)
+}
+
 /// Two donor mirrors per rank share one host RAM/GTT budget. Each donor has
 /// separate gate/up and down pinned allocations, including their padding.
 pub(crate) fn expert_stage_mirror_bytes(layer_bytes: usize, ranks: usize) -> Result<u64, String> {
@@ -3191,7 +3769,12 @@ fn rank_share(entry: &WeightEntry, bytes: u64, rank: usize, ranks: usize) -> Res
     if ranks == 0 {
         return Err("expert-parallel rank count must be at least 1".to_string());
     }
-    if ranks == 1 || !is_routed_expert(&entry.name) {
+    // A mixed layer's arena entry already is this rank's bytes (`[arena bytes]`,
+    // one entry per rank's own manifest): never divided by the rank count.
+    if ranks == 1
+        || !is_routed_expert(&entry.name)
+        || crate::expert_ep_units::is_unit_arena_name(&entry.name)
+    {
         return Ok(bytes);
     }
     if entry.name.ends_with(crate::expert_arena::ARENA_SUFFIX) {
@@ -3241,8 +3824,9 @@ pub fn moe_layer_count_scope(config: &Qwen4Config, scope: &Qwen4BandScope) -> us
 /// How many of the model's MoE layers (trunk first, the MTP layer last) one
 /// rank with `free_vram` keeps resident: all of them when the trunk, every
 /// layer's experts and the reserve fit, otherwise the trunk layers `auto`
-/// fits (the MTP layer is then always host-mapped, as in
-/// [`place_routed_experts`]). `layer_expert_bytes_per_rank` is one MoE
+/// fits (the MTP layer is then host-mapped, as in [`place_routed_experts`], unless the
+/// caller keeps its owned slice resident ([`ep_mtp_resident_decision`], charged into
+/// `non_expert_bytes`)). `layer_expert_bytes_per_rank` is one MoE
 /// layer's routed experts on the largest rank (`max_local_count` experts), so
 /// a layer counted resident fits every rank of an uneven split.
 pub fn ep_rank_layers(
@@ -3478,6 +4062,65 @@ pub fn ep_lane_reservation_line(max_seq: usize, plan: &EpVramPlan) -> Option<Str
     })
 }
 
+/// Prefill chunk rungs the EP auto-fit steps down through below the requested
+/// chunk, largest first (every rung is a whole 256-row GEMM tile multiple).
+/// A smaller chunk buys resident layers and costs prefill: measured on EP2
+/// mq4-xts, 2x R9700, no lanes (`mgmtp/epfit`), pp16384 / pp65536 tok/s at
+/// 4096 (the decoupled reserve) / 2048 / 1024 / 512 rows are 5133 / 4911,
+/// 4191 / 4056, 3010 / 2763, 2173 / 1994 (-18% / -41% / -58%) for 34 / 32 /
+/// 33 / 34 resident layers, which is why the auto-fit is opt-in
+/// (`HIPFIRE_EP_CHUNK_AUTOFIT=1`).
+pub const EP_CHUNK_FIT_RUNGS: [usize; 4] = [4096, 2048, 1024, 512];
+
+/// Resident layers a smaller chunk must buy, over the placement it replaces,
+/// before the auto-fit moves the chunk: a single layer is inside the noise of
+/// the prefill cost of a smaller tile.
+pub const EP_CHUNK_FIT_MIN_GAIN_LAYERS: usize = 2;
+
+/// The rungs one EP auto-fit tries: every [`EP_CHUNK_FIT_RUNGS`] entry strictly
+/// below `requested`, largest first. Empty when `requested` is already at or
+/// below the floor.
+pub fn ep_chunk_fit_rungs(requested: usize) -> Vec<usize> {
+    EP_CHUNK_FIT_RUNGS
+        .into_iter()
+        .filter(|&rows| rows < requested)
+        .collect()
+}
+
+/// The auto-fit's choice among `candidates` (`(chunk rows, split at that
+/// chunk)`, largest chunk first, every split already carrying the lane store
+/// of that chunk): the candidate with the most resident layers, the largest
+/// chunk on a tie, and only when it holds at least
+/// [`EP_CHUNK_FIT_MIN_GAIN_LAYERS`] more than `current_layers`. `None` keeps
+/// the placement being compared against.
+pub fn ep_chunk_fit_pick(
+    current_layers: usize,
+    candidates: Vec<(usize, EpVramPlan)>,
+) -> Option<(usize, EpVramPlan)> {
+    let mut best: Option<(usize, EpVramPlan)> = None;
+    for (rows, plan) in candidates {
+        if best
+            .as_ref()
+            .map_or(true, |(_, held)| plan.layers > held.layers)
+        {
+            best = Some((rows, plan));
+        }
+    }
+    best.filter(|(_, plan)| plan.layers >= current_layers + EP_CHUNK_FIT_MIN_GAIN_LAYERS)
+}
+
+/// The one load line of an auto-fit that moved the chunk.
+pub fn ep_chunk_fit_line(
+    requested: usize,
+    chosen: usize,
+    from_layers: usize,
+    to_layers: usize,
+) -> String {
+    format!(
+        "qwen4 EP auto-fit: prefill chunk {chosen} rows (requested {requested}); resident expert layers {from_layers} -> {to_layers}"
+    )
+}
+
 /// One rank's line of the expert-parallel fit table: free VRAM, the
 /// replicated trunk, the rank's routed-expert bytes (`MoE layers` of
 /// `layer_expert_bytes_per_rank` each), the split applied (`applied_layers`
@@ -3495,7 +4138,45 @@ pub fn ep_fit_rank_line(
     reserve_bytes: u64,
     applied_layers: usize,
 ) -> String {
-    let moe_layers = moe_layer_count(config);
+    ep_fit_rank_line_mtp(
+        config,
+        rank,
+        ranks,
+        free_vram,
+        non_expert_bytes,
+        layer_expert_bytes_per_rank,
+        reserve_bytes,
+        applied_layers,
+        0,
+        0,
+    )
+}
+
+/// [`ep_fit_rank_line`] for a load whose `non_expert_bytes` already carries
+/// `mtp_resident_bytes`, the rank's owned slice of the MTP head's routed experts kept
+/// VRAM-resident ([`ep_mtp_resident_decision`]), and is already net of `hc8_saved_bytes`, the
+/// device bytes the applied `.hc8` sidecar saves on this rank ([`ep_hc8_plan_saving`]): the
+/// line names both charges beside the trunk and, with the MTP charge, counts only the trunk's
+/// MoE layers in the split (the MTP layer is no longer one of the layers a split leaves in
+/// host RAM), so no byte is counted twice in the headroom. `0, 0` is exactly
+/// [`ep_fit_rank_line`].
+pub fn ep_fit_rank_line_mtp(
+    config: &Qwen4Config,
+    rank: usize,
+    ranks: usize,
+    free_vram: u64,
+    non_expert_bytes: u64,
+    layer_expert_bytes_per_rank: u64,
+    reserve_bytes: u64,
+    applied_layers: usize,
+    mtp_resident_bytes: u64,
+    hc8_saved_bytes: u64,
+) -> String {
+    let moe_layers = if mtp_resident_bytes > 0 {
+        config.num_hidden_layers
+    } else {
+        moe_layer_count(config)
+    };
     let applied = applied_layers.min(moe_layers);
     let own = ep_rank_layers(
         config,
@@ -3503,15 +4184,34 @@ pub fn ep_fit_rank_line(
         non_expert_bytes,
         layer_expert_bytes_per_rank,
         reserve_bytes,
-    );
+    )
+    .min(moe_layers);
     let resident_bytes = layer_expert_bytes_per_rank.saturating_mul(applied as u64);
     let headroom = i128::from(free_vram)
         - i128::from(non_expert_bytes)
         - i128::from(resident_bytes)
         - i128::from(reserve_bytes);
     let gib = |bytes: u64| bytes as f64 / GIB;
+    let mut charges = Vec::new();
+    if mtp_resident_bytes > 0 {
+        charges.push(format!(
+            "incl. {:.1} MiB MTP head experts, this rank's owned slice VRAM-resident",
+            mtp_resident_bytes as f64 / (1u64 << 20) as f64
+        ));
+    }
+    if hc8_saved_bytes > 0 {
+        charges.push(format!(
+            "-{} MiB hc8 sidecar applied",
+            hc8_saved_bytes >> 20
+        ));
+    }
+    let mtp_note = if charges.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", charges.join("; "))
+    };
     format!(
-        "qwen4 EP rank {rank}/{ranks}: free {:.2} GiB | trunk {:.2} GiB | experts {:.2} GiB/rank \
+        "qwen4 EP rank {rank}/{ranks}: free {:.2} GiB | trunk {:.2} GiB{mtp_note} | experts {:.2} GiB/rank \
          ({moe_layers} MoE layers x {:.1} MiB) | resident expert layers {applied} of {moe_layers} \
          ({} host-mapped; this rank alone fits {own}) | reserve {:.2} GiB | headroom {:+.2} GiB",
         gib(free_vram),
@@ -3770,11 +4470,176 @@ pub struct DecodeShareForward {
     pub shadows_borrowed: u64,
 }
 
+/// What replaces the ordinary `qwen4_forward_device_bytes` forward term of the
+/// reserve (historical floor AND bottom-up census) of one load.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ForwardCharge {
+    Ordinary,
+    DecodeShare(DecodeShareForward),
+    /// EP reserve decoupling: `charged` is
+    /// [`crate::ep_reserve::EpReserveForwardPlan::charged_forward_bytes`].
+    EpReserve {
+        charged: u64,
+    },
+    /// [`Self::EpReserve`] whose F16 + shared-INT8 weight shadows live in the
+    /// reserve's donor segments ([`crate::ep_reserve::EpReservePlan::shadow_placements`]):
+    /// the census `f16_shadows` and `shared_i8_shadows` terms are not charged.
+    EpReserveShadowsInDonors {
+        charged: u64,
+    },
+}
+
+impl ForwardCharge {
+    fn forward_override(self) -> Option<u64> {
+        match self {
+            Self::Ordinary => None,
+            Self::DecodeShare(share) => Some(share.dedicated),
+            Self::EpReserve { charged } | Self::EpReserveShadowsInDonors { charged } => {
+                Some(charged)
+            }
+        }
+    }
+
+    /// Weight-shadow bytes lent to a donor tail; EP reserve sharing never
+    /// borrows shadows (`shadows_borrowed = 0`).
+    fn shadows_borrowed(self) -> u64 {
+        match self {
+            Self::DecodeShare(share) => share.shadows_borrowed,
+            Self::Ordinary | Self::EpReserve { .. } | Self::EpReserveShadowsInDonors { .. } => 0,
+        }
+    }
+
+    /// The weight shadows are hosted in an EP reserve's donor segments, so the
+    /// census does not charge them as dedicated VRAM.
+    fn shadows_in_donors(self) -> bool {
+        matches!(self, Self::EpReserveShadowsInDonors { .. })
+    }
+}
+/// The census `(f16_shadows, shared_i8_shadows)` terms `charge` charges out of the manifest's
+/// `(f16, shared_i8)` shadow bytes, and the bytes an EP reserve hosts in its donor segments
+/// (the part not charged; 0 for every other charge).
+fn charged_shadow_terms(charge: ForwardCharge, f16: u64, shared_i8: u64) -> (u64, u64, u64) {
+    let (f16, shared_i8) = census_shadow_terms(f16, shared_i8, charge.shadows_borrowed());
+    if charge.shadows_in_donors() {
+        (0, 0, f16.saturating_add(shared_i8))
+    } else {
+        (f16, shared_i8, 0)
+    }
+}
+
 /// [`placement_inputs`] charging `share` as the forward term (`None` is
 /// byte-identical to [`placement_inputs`]).
 pub fn placement_inputs_with_forward(
     args: &PlacementInputsArgs<'_>,
     share: Option<DecodeShareForward>,
+) -> Result<PlacementInputs, String> {
+    placement_inputs_charged(
+        args,
+        share.map_or(ForwardCharge::Ordinary, ForwardCharge::DecodeShare),
+    )
+}
+
+/// [`placement_inputs`] charging an EP reserve-decoupled load's dedicated
+/// forward ([`crate::ep_reserve::EpReserveForwardPlan`]) in BOTH the historical
+/// floor and the census; every other term (context, MTP, shadows, workspace,
+/// gather, runtime) is the ordinary 4096-row-chunk charge. `args.chunk_rows`
+/// MUST be the plan's prompt rows: the reserve never shrinks the chunk.
+pub fn placement_inputs_with_ep_reserve(
+    args: &PlacementInputsArgs<'_>,
+    plan: &crate::ep_reserve::EpReserveForwardPlan,
+) -> Result<PlacementInputs, String> {
+    let charged = ep_reserve_charged(args, plan)?;
+    placement_inputs_charged(args, ForwardCharge::EpReserve { charged })
+}
+
+/// [`placement_inputs_with_ep_reserve`] for a plan that hosts the weight
+/// shadows in its donor segments
+/// ([`crate::ep_reserve::plan_ep_reserve_with_donors_and_shadows`]): the census
+/// `f16_shadows` and `shared_i8_shadows` terms (and nothing else) are 0, since
+/// the shadows occupy donor bytes the reserve already covers. A plan with no
+/// `shadow_placements` MUST use [`placement_inputs_with_ep_reserve`].
+pub fn placement_inputs_with_ep_reserve_shadows_in_donors(
+    args: &PlacementInputsArgs<'_>,
+    plan: &crate::ep_reserve::EpReserveForwardPlan,
+) -> Result<PlacementInputs, String> {
+    let charged = ep_reserve_charged(args, plan)?;
+    placement_inputs_charged(args, ForwardCharge::EpReserveShadowsInDonors { charged })
+}
+
+fn ep_reserve_charged(
+    args: &PlacementInputsArgs<'_>,
+    plan: &crate::ep_reserve::EpReserveForwardPlan,
+) -> Result<u64, String> {
+    if args.chunk_rows != plan.prompt_rows || args.scratch_mode != plan.mode {
+        return Err(format!(
+            "qwen4: EP reserve plan is for {} rows in {:?} mode, not {} rows in {:?} mode",
+            plan.prompt_rows, plan.mode, args.chunk_rows, args.scratch_mode
+        ));
+    }
+    plan.charged_forward_bytes()
+        .map_err(|error| format!("qwen4: {error}"))
+}
+
+/// The rank-local sizing of an expert-parallel reserve census (`HIPFIRE_EP_RESERVE_CENSUS`):
+/// what a trunk-shard rank allocates differs from the global config's census, which sizes the
+/// whole unsharded model. Default (no shard, switch off, single device): the global census.
+#[derive(Clone, Debug, Default)]
+struct EpCensusLocal {
+    /// Rank 0's rank-local config (24 GDN value heads of 48 on Flash-Next EP2; every rank has
+    /// the same head counts): sizes the GDN state and the native MTP capture ring.
+    config: Option<Qwen4Config>,
+    /// The widest shared-expert intermediate slice of any rank (384 of 640): the INT8 shared
+    /// shadows' width.
+    shared_width: Option<usize>,
+}
+
+/// [`EpCensusLocal`] for a `ranks`-way load whose census trunk shard is `trunk`
+/// ([`crate::weights::trunk_shard::census_trunk`]); empty unless `ep_census` and `trunk` is
+/// `Some`.
+fn ep_census_local(
+    config: &Qwen4Config,
+    trunk: Option<&(
+        crate::weights::trunk_shard::TrunkDims,
+        crate::weights::trunk_shard::QsaMode,
+    )>,
+    ranks: usize,
+    ep_census: bool,
+) -> Result<EpCensusLocal, String> {
+    let Some((dims, mode)) = trunk.filter(|_| ep_census) else {
+        return Ok(EpCensusLocal::default());
+    };
+    let shared_width = crate::weights::trunk_shard::max_shared_width(dims, *mode, ranks)
+        .map_err(|error| format!("qwen4: {error}"))?;
+    Ok(EpCensusLocal {
+        config: crate::weights::trunk_shard::census_local_config_for(true, config, ranks),
+        shared_width: Some(shared_width),
+    })
+}
+
+/// [`state_census_with_forward`] whose `state` term (the GDN recurrent state and conv history,
+/// their snapshot mirror, the QSA fixed arenas, PLE conv, hyper feedback) is sized at `local`,
+/// the trunk shard rank's own config, when given. The QSA context and the forward term stay
+/// the global config's.
+fn ep_state_census(
+    config: &Qwen4Config,
+    local: Option<&Qwen4Config>,
+    format: crate::Qwen4StateFormat,
+    context: &crate::Qwen4ContextCommit,
+    chunk_rows: usize,
+    mode: Qwen4ForwardScratchMode,
+    forward: Option<u64>,
+) -> Result<StateCensus, String> {
+    let mut census = state_census_with_forward(config, format, context, chunk_rows, mode, forward)?;
+    if let Some(local) = local {
+        census.state =
+            state_census_with_forward(local, format, context, chunk_rows, mode, Some(0))?.state;
+    }
+    Ok(census)
+}
+
+fn placement_inputs_charged(
+    args: &PlacementInputsArgs<'_>,
+    charge: ForwardCharge,
 ) -> Result<PlacementInputs, String> {
     let PlacementInputsArgs {
         gpu,
@@ -3794,8 +4659,17 @@ pub fn placement_inputs_with_forward(
         chunk_rows,
     } = *args;
     let qsa_format = state_format.qsa;
-    let (non_expert, layer_experts) = resident_split_ranks(weights, bytes_of, ranks)
-        .map_err(|error| format!("qwen4: {error}"))?;
+    let trunk = crate::weights::trunk_shard::census_trunk(config, ranks);
+    // `HIPFIRE_EP_RESERVE_CENSUS` (read once, here): the EP census terms below.
+    let ep_census = ranks >= 2 && hipfire_config::memory::ep_reserve_census();
+    let local = ep_census_local(config, trunk.as_ref(), ranks, ep_census)?;
+    let (non_expert, layer_experts) = resident_split_ranks_trunk(
+        weights,
+        bytes_of,
+        ranks,
+        trunk.as_ref().map(|(dims, mode)| (dims, *mode)),
+    )
+    .map_err(|error| format!("qwen4: {error}"))?;
     // `chunk_rows` is the caller's: it never probes the host link here.
     let context = crate::Qwen4ContextCommit::for_expert_reserve(
         backend,
@@ -3809,7 +4683,11 @@ pub fn placement_inputs_with_forward(
     // to the driver granularity), not the legacy-forced layout the historical
     // formula charges on a discrete card.
     let census_context = crate::Qwen4ContextCommit::new(backend, max_seq, max_seq, vmm_granularity);
-    let mtp_for = |context: &crate::Qwen4ContextCommit| -> Result<Option<u64>, String> {
+    // `ring_config`: the trunk's own (rank-local) config for the capture ring's size (an EP
+    // trunk-shard census), `None` for the global one.
+    let mtp_for = |context: &crate::Qwen4ContextCommit,
+                   ring_config: Option<&Qwen4Config>|
+     -> Result<Option<u64>, String> {
         if !mtp_kept {
             return Ok(None);
         }
@@ -3818,14 +4696,15 @@ pub fn placement_inputs_with_forward(
         let row_capture =
             crate::mtp_spec::native_mtp_capture(gpu, config, state_format.gdn, drafts);
         Ok(Some(
-            crate::mtp_spec::native_mtp_device_bytes(
+            crate::mtp_spec::native_mtp_device_bytes_ring(
                 config,
+                ring_config.unwrap_or_else(|| config.mtp_geometry()),
                 context,
                 chunk_rows,
                 drafts,
                 head,
                 row_capture,
-                crate::mtp_spec::native_mtp_fill_scratch(gpu),
+                crate::mtp_spec::native_mtp_fill_scratch_charged(gpu),
             )
             .ok_or("qwen4: native MTP device bytes overflow")?,
         ))
@@ -3850,12 +4729,12 @@ pub fn placement_inputs_with_forward(
         })
         .transpose()
     };
-    let mtp_bytes = mtp_for(&context)?;
+    let mtp_bytes = mtp_for(&context, None)?;
     let gather_bytes = gather_for(&context)?;
-    // The measured HIP runtime overhead (exact gfx1201, discrete,
-    // single-device): the census then carries it and the historical floor,
-    // whose stale F32 context used to cover it, is retired.
-    let runtime = runtime_overhead_bytes(&gpu.arch, use_ranges, ranks);
+    // The measured HIP runtime overhead (exact gfx1201, discrete, single-device; or, under
+    // `HIPFIRE_EP_RESERVE_CENSUS`, the EP2 per-rank term): the census then carries it and the
+    // historical floor, whose stale F32 context used to cover it, is retired.
+    let runtime = runtime_overhead_bytes_ep(&gpu.arch, use_ranges, ranks, ep_census);
     let historical = if runtime.is_some() {
         None
     } else {
@@ -3868,19 +4747,20 @@ pub fn placement_inputs_with_forward(
                 state_format.layout(),
                 mtp_bytes,
                 gather_bytes,
-                share.map(|share| share.dedicated),
+                charge.forward_override(),
             )
             .map_err(|error| format!("qwen4: {error}"))?,
         )
     };
     // The bottom-up census at the full admitted context.
-    let state = state_census_with_forward(
+    let state = ep_state_census(
         config,
+        local.config.as_ref(),
         state_format,
         &census_context,
         chunk_rows,
         scratch_mode,
-        share.map(|share| share.dedicated),
+        charge.forward_override(),
     )
     .map_err(|error| format!("qwen4: {error}"))?;
     // Lazy BF16 -> F16 weight shadows of the owners the long-prefill F16 WMMA
@@ -3888,47 +4768,60 @@ pub fn placement_inputs_with_forward(
     // capability is the runtime's own predicate (`Gpu::qwen4_f16_shadow_capable`,
     // the half of `qwen4_f16_wmma_applies` that does not depend on a call) and
     // the rows are the largest `route_rows` a prefill forward of this chunk can
-    // reach ([`f16_shadow_route_rows`]), so census and runtime cannot disagree.
-    let f16_shadows = f16_shadow_charge(
+    // reach ([`f16_shadow_route_rows`]), so census and runtime cannot disagree. The
+    // `mlp.shared_expert.*` owners stay charged even where the INT8 shared route is on: that
+    // route replaces the F16 one per CALL (`shared_int8` in `qt44_qt53_prefill.rs`: not under
+    // graph capture or replay recording, not with path 2's fused unscatter activation, only
+    // with 16-byte aligned BF16 weights), so a call it declines builds the F16 shadows. An EP
+    // trunk-shard rank builds them over its own slice of the shared expert (the busiest
+    // rank's width), like the INT8 shadows below.
+    let f16_shadows = f16_shadow_charge_at(
         gpu.qwen4_f16_shadow_capable(),
         f16_shadow_route_rows(&gpu.arch, chunk_rows),
         weights,
         config.num_hidden_layers,
+        local.shared_width,
     )
     .map_err(|error| format!("qwen4: {error}"))?;
     // The shared-expert INT8 route's pool-allocated shadows (`Gpu::qwen4_shared_i8_shadow`,
     // built on the first prefill the route takes): the runtime's own enable predicate and the
-    // same route-rows threshold as the F16 route they replace.
-    let shared_i8_shadows = shared_i8_charge(
+    // same route-rows threshold as the F16 route they replace. An EP trunk-shard rank builds
+    // them over its own slice of the shared expert: the busiest rank's width.
+    let shared_i8_shadows = shared_i8_charge_at(
         gpu.qwen4_shared_i8_enabled(),
         f16_shadow_route_rows(&gpu.arch, chunk_rows),
         weights,
         config.num_hidden_layers,
+        local.shared_width,
     )
     .map_err(|error| format!("qwen4: {error}"))?;
     // A decode-share load that keeps the shadows in the donor tail
-    // ([`DecodeShareForward::shadows_borrowed`]) never holds them resident:
-    // they are rebuilt into the donor tail per borrow epoch, so neither term
+    // ([`DecodeShareForward::shadows_borrowed`]) or an EP reserve that hosts them in its
+    // donor segments ([`ForwardCharge::EpReserveShadowsInDonors`]) never holds them
+    // resident: they are rebuilt into the donor bytes per borrow epoch, so neither term
     // is charged (the hot budget grows by that much).
-    let shadows_borrowed = share.map_or(0, |share| share.shadows_borrowed);
-    let (f16_shadows, shared_i8_shadows) =
-        census_shadow_terms(f16_shadows, shared_i8_shadows, shadows_borrowed);
+    let (f16_shadows, shared_i8_shadows, hosted_shadows) =
+        charged_shadow_terms(charge, f16_shadows, shared_i8_shadows);
     // The kernels' pool workspaces at the largest requested chunk, exactly
     // (every short-tail remainder included). The dense GDN scan's scratch is
     // charged wherever `fn_gdn_dense::applies` can hold at load: exact gfx1201,
-    // Q8 or Q8Ef GDN state (`qwen4_dense_gdn_admits`) and the pinned
-    // 16-key/48-value-head, 128-dim, 10240-wide geometry (its opt-out flag
+    // Q8 or Q8Ef GDN state (`qwen4_dense_gdn_admits`) and an admitted head
+    // geometry (`qwen4_dense_gdn_geometry_admits`, the route's own pure
+    // predicate: the pinned 16-key/48-value-head, 128-dim, 10240-wide
+    // geometry or the TP2 trunk shard's rank-local 8/24 one; the charge is
+    // the 48-head upper bound for both; the opt-out flag
     // only lowers the charge, so it is ignored). The census charges A for both
     // formats and the thread-local EF scratch only for plain Q8; a Q8Ef live
     // residual is charged once by the state owner, not here.
     let dense_gdn = rdna_compute::scratch::qwen4_dense_gdn_admits(&gpu.arch, state_format.gdn)
-        && config.linear_num_key_heads == 16
-        && config.linear_num_value_heads == 48
-        && config.linear_key_head_dim == 128
-        && config.linear_value_head_dim == 128
-        && 2 * config.linear_num_key_heads * config.linear_key_head_dim
-            + config.linear_num_value_heads * config.linear_value_head_dim
-            == 10240;
+        && rdna_compute::scratch::qwen4_dense_gdn_geometry_admits(
+            config.linear_num_key_heads,
+            config.linear_num_value_heads,
+            config.linear_key_head_dim,
+            config.linear_value_head_dim,
+            2 * config.linear_num_key_heads * config.linear_key_head_dim
+                + config.linear_num_value_heads * config.linear_value_head_dim,
+        );
     // The routed-expert I4 MoE terms exist only for a profile whose routed
     // experts run the grouped I4 route; a dense or synthetic profile
     // (no experts, or dimensions that route cannot take) charges none of
@@ -3967,17 +4860,26 @@ pub fn placement_inputs_with_forward(
             gpu,
             state_format.layout().index_dtype(),
         ) as u64,
-        mtp: mtp_for(&census_context)?.unwrap_or(0),
+        mtp: mtp_for(&census_context, local.config.as_ref())?.unwrap_or(0),
         gather: gather_for(&census_context)?.unwrap_or(0),
         runtime: runtime.unwrap_or(0),
     };
     let reserve =
         AutoReserve::new(historical, census).map_err(|error| format!("qwen4: {error}"))?;
-    let reserve = match share {
-        Some(share) => reserve
+    let reserve = if ep_census {
+        reserve.with_ep_census()
+    } else {
+        reserve
+    };
+    let reserve = match charge {
+        ForwardCharge::Ordinary => reserve,
+        ForwardCharge::DecodeShare(share) => reserve
             .with_decode_share(share.borrowed)
             .with_decode_share_shadows(share.shadows_borrowed),
-        None => reserve,
+        ForwardCharge::EpReserve { charged } => reserve.with_ep_reserve(charged),
+        ForwardCharge::EpReserveShadowsInDonors { charged } => reserve
+            .with_ep_reserve(charged)
+            .with_ep_reserve_shadows(hosted_shadows),
     };
     Ok(PlacementInputs {
         non_expert,
@@ -4113,6 +5015,348 @@ mod tests {
                 "model.language_model.layers.2.mlp.experts.gate_up_proj",
                 "mtp.layers.0.mlp.experts.down_proj"
             ]
+        );
+    }
+
+    #[test]
+    fn mtp_head_routed_census_and_resident_restore_touch_only_the_head_experts() {
+        let mut weights = vec![
+            entry("model.language_model.layers.0.mlp.experts.gate_up_proj", 0),
+            entry("model.language_model.layers.2.mlp.experts.down_proj", 2),
+            entry("mtp.layers.0.mlp.experts.gate_up_proj", 0),
+            entry("mtp.layers.0.mlp.experts.down_proj", 0),
+            entry("mtp.layers.0.mlp.shared_expert.down_proj.weight", 0),
+        ];
+        let bytes =
+            |entry: &WeightEntry| Some(entry.logical_shape.iter().product::<usize>() as u64);
+        let census = mtp_head_routed_census(&weights, bytes).unwrap();
+        assert_eq!(census.entries, 2);
+        assert_eq!(census.payload_bytes, 2 * 4 * 4 * 256);
+        assert_eq!(
+            census.host_charge_bytes,
+            census.payload_bytes + 2 * HOST_MAPPED_PAD_BYTES
+        );
+        assert_eq!(
+            mtp_head_routed_census(&weights, |_| None),
+            Err("no payload size for 'mtp.layers.0.mlp.experts.gate_up_proj'".to_string())
+        );
+        // Placement host-maps the head; the restore undoes only the head.
+        place_routed_experts(&mut weights, 3);
+        assert_eq!(weights[1].residency, WeightResidency::Resident);
+        assert_eq!(weights[2].residency, WeightResidency::HostMapped);
+        assert_eq!(keep_mtp_head_routed_resident(&mut weights), 2);
+        assert!(weights
+            .iter()
+            .all(|entry| entry.residency == WeightResidency::Resident));
+        // Idempotent: nothing left to restore.
+        assert_eq!(keep_mtp_head_routed_resident(&mut weights), 0);
+    }
+
+    /// The Flash-Next EP weights the MTP decision reads: one trunk layer and the head's two
+    /// routed stacks (512 experts each, planar MQ4 drop-zero bytes: 1,689,600 gate/up and
+    /// 844,800 down per expert), plus a head shared expert that is not a routed stack.
+    fn ep_mtp_weights() -> Vec<WeightEntry> {
+        let stack = |name: &str, layer: usize| {
+            let mut stack = entry(name, layer);
+            stack.logical_shape = vec![512, 1];
+            stack
+        };
+        vec![
+            stack("model.language_model.layers.0.mlp.experts.gate_up_proj", 0),
+            stack("model.language_model.layers.0.mlp.experts.down_proj", 0),
+            stack("mtp.layers.0.mlp.experts.gate_up_proj", 0),
+            stack("mtp.layers.0.mlp.experts.down_proj", 0),
+            entry("mtp.layers.0.mlp.shared_expert.down_proj.weight", 0),
+        ]
+    }
+
+    fn ep_mtp_bytes(entry: &WeightEntry) -> Option<u64> {
+        let per_expert = if entry.name.ends_with(".mlp.experts.gate_up_proj") {
+            1_689_600
+        } else if entry.name.ends_with(".mlp.experts.down_proj") {
+            844_800
+        } else {
+            return Some(4096);
+        };
+        Some(entry.logical_shape[0] as u64 * per_expert)
+    }
+
+    #[test]
+    fn ep_mtp_resident_decision_is_the_owned_slice_and_off_without_its_conditions() {
+        let weights = ep_mtp_weights();
+        let unit = 1_689_600 + 844_800;
+        // EP2: 256 of 512 experts, 256 x 2,534,400 B = 618.75 MiB, the trunk layers and the
+        // head's shared expert never counted.
+        let two = ep_mtp_resident_decision(&weights, ep_mtp_bytes, 2, true, true)
+            .unwrap()
+            .expect("EP2 with the head attached keeps the owned slice resident");
+        assert_eq!(two.entries, 2);
+        assert_eq!(two.owned_experts, 256);
+        assert_eq!(two.bytes, 256 * unit);
+        assert_eq!(two.bytes, 648_806_400);
+        assert_eq!(two.bytes >> 20, 618);
+        // An uneven split budgets the largest rank (rank 0: 171 of 512 over 3 ranks).
+        let three = ep_mtp_resident_decision(&weights, ep_mtp_bytes, 3, true, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!((three.owned_experts, three.bytes), (171, 171 * unit));
+        // The kill switch, no head attached and a single device are today's placement.
+        assert_eq!(
+            ep_mtp_resident_decision(&weights, ep_mtp_bytes, 2, false, true),
+            Ok(None)
+        );
+        assert_eq!(
+            ep_mtp_resident_decision(&weights, ep_mtp_bytes, 2, true, false),
+            Ok(None)
+        );
+        assert_eq!(
+            ep_mtp_resident_decision(&weights, ep_mtp_bytes, 1, true, true),
+            Ok(None)
+        );
+        // A manifest with no head experts (the trunk shard drops the head).
+        let headless: Vec<WeightEntry> = weights
+            .iter()
+            .filter(|entry| !entry.name.starts_with("mtp."))
+            .cloned()
+            .collect();
+        assert_eq!(
+            ep_mtp_resident_decision(&headless, ep_mtp_bytes, 2, true, true),
+            Ok(None)
+        );
+        // A missing payload size is an error, never a zero charge.
+        assert!(ep_mtp_resident_decision(&weights, |_| None, 2, true, true).is_err());
+    }
+
+    #[test]
+    fn ep_mtp_resident_charge_shrinks_the_trunk_unit_budget_by_exactly_the_owned_bytes() {
+        use crate::expert_ep_units::{
+            ep_unit_geometry, ep_unit_rank_budgets, place_routed_experts_units_staged, EpRanking,
+        };
+        let weights = ep_mtp_weights();
+        let mtp = ep_mtp_resident_decision(&weights, ep_mtp_bytes, 2, true, true)
+            .unwrap()
+            .unwrap();
+        // The loader adds the charge to the replicated non-expert bytes (`qwen4_placement_inputs`)
+        // that every budget subtracts, so the walk's budget drops by exactly `mtp.bytes`.
+        let (free, non_expert, reserve) = (20u64 << 30, 5u64 << 30, 4u64 << 30);
+        let without = ep_unit_rank_budgets(&[free; 2], non_expert, reserve);
+        let with = ep_unit_rank_budgets(&[free; 2], non_expert + mtp.bytes, reserve);
+        for rank in 0..2 {
+            assert_eq!(without[rank] - with[rank], mtp.bytes);
+        }
+        // The ranking walk over those budgets (3 trunk layers x 512 experts, ascending ids):
+        // the trunk keeps fewer units, and the MTP bytes plus the trunk's planned VRAM still
+        // fit the budget the trunk had without the head (nothing over-commits).
+        let layers = 3usize;
+        let geometry = ep_unit_geometry(
+            layers,
+            512,
+            2,
+            &vec![512 * 1_689_600; layers],
+            &vec![512 * 844_800; layers],
+        )
+        .unwrap();
+        let rank: Vec<u32> = (0..(layers * 512) as u32).collect();
+        let ranking = EpRanking {
+            rank: &rank,
+            counts: None,
+            sha256: None,
+        };
+        let small = [1_000_000_000u64; 2];
+        let small_with = [small[0] - mtp.bytes; 2];
+        let off = place_routed_experts_units_staged(&geometry, ranking, &small, false).unwrap();
+        let on = place_routed_experts_units_staged(&geometry, ranking, &small_with, false).unwrap();
+        for rank in 0..2 {
+            assert!(on.plan.resident_units(rank) < off.plan.resident_units(rank));
+            assert!(on.plan.vram_bytes(rank) <= small_with[rank]);
+            assert!(on.plan.vram_bytes(rank) + mtp.bytes <= small[rank]);
+        }
+    }
+
+    #[test]
+    fn ep_mtp_experts_line_states_the_actual_placement() {
+        let mtp = EpMtpResident {
+            entries: 2,
+            owned_experts: 256,
+            bytes: 648_806_400,
+        };
+        assert_eq!(
+            ep_mtp_experts_line(Some(&mtp), "unused"),
+            "qwen4 EP expert tier: the MTP head's experts: 256 owned units VRAM-resident on every rank (618 MiB, charged before the ranking walk)"
+        );
+        let host = ep_mtp_experts_line(None, "HIPFIRE_EP_MTP_EXPERTS_RESIDENT=0");
+        assert!(
+            host.contains("stay host-mapped") && host.contains("HIPFIRE_EP_MTP_EXPERTS_RESIDENT=0")
+        );
+    }
+
+    #[test]
+    fn ep_fit_rank_line_names_the_mtp_charge_without_counting_it_twice() {
+        let config = crate::config::compact_test_config();
+        assert_eq!(moe_layer_count(&config), 49);
+        let (free, trunk, layer, reserve) = (30u64 << 30, 6u64 << 30, 512u64 << 20, 4u64 << 30);
+        let mtp = layer;
+        let off = ep_fit_rank_line(&config, 0, 2, free, trunk, layer, reserve, 30);
+        let on = ep_fit_rank_line_mtp(&config, 0, 2, free, trunk + mtp, layer, reserve, 30, mtp, 0);
+        assert_eq!(
+            off,
+            ep_fit_rank_line_mtp(&config, 0, 2, free, trunk, layer, reserve, 30, 0, 0)
+        );
+        assert!(off.contains("resident expert layers 30 of 49"), "{off}");
+        assert!(on.contains("resident expert layers 30 of 48"), "{on}");
+        assert!(on.contains("incl. 512.0 MiB MTP head experts"), "{on}");
+        // The MTP bytes sit once in the trunk term (not also in a 49th expert layer): the
+        // headroom is the MTP-less one less exactly the owned bytes.
+        assert!(off.ends_with("headroom +5.00 GiB"), "{off}");
+        assert!(on.ends_with("headroom +4.50 GiB"), "{on}");
+    }
+
+    const HC_M: usize = 32;
+    const HC_K: usize = 64;
+
+    fn hc_entry(name: &str, dtype: DType) -> WeightEntry {
+        WeightEntry::model(name, vec![HC_M, HC_K], dtype, ShardPolicy::Replicate)
+    }
+
+    fn hc_names() -> [&'static str; 3] {
+        [
+            "model.language_model.layers.0.hyper_connection.input_mix_weight_down.weight",
+            "model.language_model.layers.0.hyper_connection.input_mix_weight_up.weight",
+            "mtp.layers.0.hyper_connection.input_mix_weight_up.weight",
+        ]
+    }
+
+    fn hc_weights() -> Vec<WeightEntry> {
+        let mut weights: Vec<WeightEntry> = hc_names()
+            .into_iter()
+            .map(|name| hc_entry(name, DType::BF16))
+            .collect();
+        weights.push(entry(
+            "model.language_model.layers.0.mlp.experts.down_proj",
+            0,
+        ));
+        weights
+    }
+
+    fn hc_bf16(entry: &WeightEntry) -> Option<u64> {
+        Some(entry.logical_shape.iter().product::<usize>() as u64 * 2)
+    }
+
+    fn hc_sidecar() -> Vec<(String, u64, u64)> {
+        let base = (HC_M * HC_K * 2) as u64;
+        let payload = rdna_compute::hc8_weight::hc8_payload_bytes(HC_M, HC_K).unwrap() as u64;
+        hc_names()
+            .into_iter()
+            .map(|name| (name.to_string(), base, payload))
+            .collect()
+    }
+
+    #[test]
+    fn ep_hc8_plan_saving_is_the_exact_charged_bf16_minus_e4m3_bytes() {
+        let weights = hc_weights();
+        let sidecar = hc_sidecar();
+        let each = sidecar[0].1 - sidecar[0].2;
+        assert!(each > 0);
+        let saving = |weights: &[WeightEntry], sidecar: &[(String, u64, u64)]| {
+            ep_hc8_plan_saving(weights, hc_bf16, sidecar, None, 2, true, true).unwrap()
+        };
+        // Every sidecar tensor is charged BF16 on every rank (the head's included).
+        assert_eq!(saving(&weights, &sidecar), 3 * each);
+        // The trunk shard's census agrees: the HC mixers are replicated (no cut role).
+        let config = crate::config::compact_test_config();
+        let (dims, mode) =
+            crate::weights::trunk_shard::census_trunk_for(true, &config, 2).expect("2-rank shard");
+        assert_eq!(
+            ep_hc8_plan_saving(
+                &weights,
+                hc_bf16,
+                &sidecar,
+                Some((&dims, mode)),
+                2,
+                true,
+                true
+            ),
+            Ok(3 * each)
+        );
+        // A sidecar tensor the manifest does not declare is skipped at apply time: not saved.
+        assert_eq!(saving(&weights[1..], &sidecar), 2 * each);
+        // Not device-resident BF16 as charged (host-mapped, another dtype, another census size
+        // than the sidecar binds): the runtime would not replace it, so it saves nothing.
+        let mut host = hc_weights();
+        host[0].residency = WeightResidency::HostMapped;
+        assert_eq!(saving(&host, &sidecar), 2 * each);
+        let mut f16 = hc_weights();
+        f16[1] = hc_entry(hc_names()[1], DType::F16);
+        assert_eq!(saving(&f16, &sidecar), 2 * each);
+        let mut wrong = sidecar.clone();
+        wrong[2].1 += 2;
+        assert_eq!(saving(&weights, &wrong), 2 * each);
+        let mut bad_payload = sidecar.clone();
+        bad_payload[0].2 += 1;
+        assert_eq!(saving(&weights, &bad_payload), 2 * each);
+    }
+
+    #[test]
+    fn ep_hc8_plan_saving_is_zero_without_its_conditions() {
+        let (weights, sidecar) = (hc_weights(), hc_sidecar());
+        let saving = |ranks, enabled, head_kept, sidecar: &[(String, u64, u64)]| {
+            ep_hc8_plan_saving(&weights, hc_bf16, sidecar, None, ranks, enabled, head_kept)
+        };
+        assert!(saving(2, true, true, &sidecar).unwrap() > 0);
+        // Kill switch, single device, no head attached (a head-less load does not load every
+        // sidecar tensor), no sidecar (or a pipeline band's empty one).
+        assert_eq!(saving(2, false, true, &sidecar), Ok(0));
+        assert_eq!(saving(1, true, true, &sidecar), Ok(0));
+        assert_eq!(saving(2, true, false, &sidecar), Ok(0));
+        assert_eq!(saving(2, true, true, &[]), Ok(0));
+        // A missing payload size is an error, never a guess.
+        assert!(ep_hc8_plan_saving(&weights, |_| None, &sidecar, None, 2, true, true).is_err());
+    }
+
+    #[test]
+    fn ep_hc8_saving_grows_the_unit_budget_by_exactly_the_saved_bytes_and_shows_in_the_line() {
+        use crate::expert_ep_units::ep_unit_rank_budgets;
+        let (weights, sidecar) = (hc_weights(), hc_sidecar());
+        let saved = ep_hc8_plan_saving(&weights, hc_bf16, &sidecar, None, 2, true, true).unwrap();
+        // The loader subtracts the saving from the BF16 non-expert census the walk reads.
+        let (free, non_expert, reserve) = (20u64 << 30, 5u64 << 30, 4u64 << 30);
+        let bf16 = ep_unit_rank_budgets(&[free; 2], non_expert, reserve);
+        let e4m3 = ep_unit_rank_budgets(&[free; 2], non_expert - saved, reserve);
+        for rank in 0..2 {
+            assert_eq!(e4m3[rank] - bf16[rank], saved);
+        }
+        let config = crate::config::compact_test_config();
+        let layer = 512u64 << 20;
+        let line = ep_fit_rank_line_mtp(
+            &config,
+            0,
+            2,
+            free,
+            non_expert - (621 << 20),
+            layer,
+            reserve,
+            20,
+            0,
+            621 << 20,
+        );
+        assert!(line.contains("(-621 MiB hc8 sidecar applied)"), "{line}");
+        let both = ep_fit_rank_line_mtp(
+            &config,
+            0,
+            2,
+            free,
+            non_expert,
+            layer,
+            reserve,
+            20,
+            layer,
+            621 << 20,
+        );
+        assert!(
+            both.contains(
+                "(incl. 512.0 MiB MTP head experts, this rank's owned slice VRAM-resident; -621 MiB hc8 sidecar applied)"
+            ),
+            "{both}"
         );
     }
 
@@ -5177,6 +6421,107 @@ mod tests {
         );
     }
 
+    /// An EP reserve that hosts the weight shadows in its donor segments drops exactly the
+    /// census `f16_shadows` and `shared_i8_shadows` terms (the reserve falls by their sum, no
+    /// other term moves); without hosted shadows the charge is the ordinary EP reserve's.
+    #[test]
+    fn ep_reserve_shadows_in_donors_drop_exactly_the_two_shadow_terms() {
+        const MIB: u64 = 1 << 20;
+        let config = crate::config::compact_test_config();
+        let manifest = j1778_bf16_manifest();
+        let f16 = f16_shadow_bytes(&manifest, config.num_hidden_layers).unwrap();
+        let i8 = shared_i8_shadow_bytes(&manifest, config.num_hidden_layers).unwrap();
+        assert_eq!(f16, 1_298_923_520);
+        assert!(i8 > 0);
+        let charged = 123 * MIB;
+        let ordinary = ForwardCharge::EpReserve { charged };
+        let donors = ForwardCharge::EpReserveShadowsInDonors { charged };
+        // The forward term is the same dedicated charge; only the shadow terms differ.
+        assert_eq!(ordinary.forward_override(), donors.forward_override());
+        assert_eq!(charged_shadow_terms(ordinary, f16, i8), (f16, i8, 0));
+        assert_eq!(
+            charged_shadow_terms(ForwardCharge::Ordinary, f16, i8),
+            (f16, i8, 0)
+        );
+        assert_eq!(charged_shadow_terms(donors, f16, i8), (0, 0, f16 + i8));
+        // Nothing hosted (no shadow applies on this arch/config): the ordinary EP charge.
+        assert_eq!(charged_shadow_terms(donors, 0, 0), (0, 0, 0));
+        assert_eq!(
+            charged_shadow_terms(donors, 0, 0),
+            charged_shadow_terms(ordinary, 0, 0)
+        );
+        // Decode-share borrowing is a separate charge and keeps its own accounting.
+        let share = ForwardCharge::DecodeShare(DecodeShareForward {
+            dedicated: 1 << 30,
+            borrowed: 1 << 30,
+            shadows_borrowed: f16 + i8,
+        });
+        assert_eq!(charged_shadow_terms(share, f16, i8), (0, 0, 0));
+
+        let mut census = census_at(&config, 16384, 4096, Full, 700 << 20);
+        census.f16_shadows = f16;
+        census.shared_i8_shadows = i8;
+        let (zf, zi, hosted) = charged_shadow_terms(donors, f16, i8);
+        let hosted_census = ReserveCensus {
+            f16_shadows: zf,
+            shared_i8_shadows: zi,
+            ..census
+        };
+        for historical in [None, Some(1u64)] {
+            let before = AutoReserve::new(historical, census)
+                .unwrap()
+                .with_ep_reserve(charged);
+            let after = AutoReserve::new(historical, hosted_census)
+                .unwrap()
+                .with_ep_reserve(charged)
+                .with_ep_reserve_shadows(hosted);
+            assert_eq!(before.bytes() - after.bytes(), f16 + i8, "{historical:?}");
+            assert_eq!(before.census_total - after.census_total, f16 + i8);
+            // Every other census term is untouched.
+            assert_eq!(
+                after.census,
+                ReserveCensus {
+                    f16_shadows: 0,
+                    shared_i8_shadows: 0,
+                    ..before.census
+                }
+            );
+            let text = after.describe();
+            assert!(
+                text.contains(&format!(
+                    "{} MiB weight shadows hosted in the donor segments",
+                    (f16 + i8) >> 20
+                )),
+                "{text}"
+            );
+            assert!(text.contains("F16 weight shadows 0 MiB"), "{text}");
+            assert!(!before.describe().contains("hosted in the donor segments"));
+            // Nothing hosted: byte-identical to the ordinary EP reserve.
+            let (nf, ni, none) = charged_shadow_terms(donors, 0, 0);
+            let bare = ReserveCensus {
+                f16_shadows: nf,
+                shared_i8_shadows: ni,
+                ..census
+            };
+            assert_eq!(
+                AutoReserve::new(
+                    historical,
+                    ReserveCensus {
+                        f16_shadows: 0,
+                        shared_i8_shadows: 0,
+                        ..census
+                    }
+                )
+                .unwrap()
+                .with_ep_reserve(charged),
+                AutoReserve::new(historical, bare)
+                    .unwrap()
+                    .with_ep_reserve(charged)
+                    .with_ep_reserve_shadows(none)
+            );
+        }
+    }
+
     /// Placement of the reproduction card with the real census: the layers
     /// the unfixed planner kept (`historical` alone), what stage and margin
     /// on the historical floor leave, and what the census-backed reserve
@@ -5299,14 +6644,46 @@ mod tests {
     #[test]
     fn runtime_overhead_is_charged_only_on_exact_discrete_single_device_gfx1201() {
         assert_eq!(QWEN4_RUNTIME_OVERHEAD_GFX1201_BYTES, 1408 << 20);
+        assert_eq!(QWEN4_EP2_RUNTIME_OVERHEAD_GFX1201_BYTES, 1088 << 20);
         assert_eq!(
             runtime_overhead_bytes("gfx1201", false, 1),
             Some(QWEN4_RUNTIME_OVERHEAD_GFX1201_BYTES)
         );
         assert_eq!(runtime_overhead_bytes("gfx1201", true, 1), None);
+        // The ordinary entry never charges an EP load: the cli fit, the placement receipt and
+        // the slowlink admission read it with `ranks == 1` only.
         assert_eq!(runtime_overhead_bytes("gfx1201", false, 2), None);
+        assert_eq!(runtime_overhead_bytes("gfx1201", false, 3), None);
+        // The EP entry: the EP2 constant with `HIPFIRE_EP_RESERVE_CENSUS` on, nothing with it
+        // off, nothing for 3+ ranks (not measured), single device unchanged either way.
+        for ep_census in [false, true] {
+            assert_eq!(
+                runtime_overhead_bytes_ep("gfx1201", false, 1, ep_census),
+                Some(QWEN4_RUNTIME_OVERHEAD_GFX1201_BYTES)
+            );
+            for ranks in [3, 4, 8] {
+                assert_eq!(
+                    runtime_overhead_bytes_ep("gfx1201", false, ranks, ep_census),
+                    None
+                );
+            }
+            assert_eq!(
+                runtime_overhead_bytes_ep("gfx1201", true, 2, ep_census),
+                None
+            );
+        }
+        assert_eq!(
+            runtime_overhead_bytes_ep("gfx1201", false, 2, true),
+            Some(QWEN4_EP2_RUNTIME_OVERHEAD_GFX1201_BYTES)
+        );
+        assert_eq!(runtime_overhead_bytes_ep("gfx1201", false, 2, false), None);
         for arch in ["gfx1100", "gfx1151", "gfx1200", "gfx942", "gfx12010", ""] {
             assert_eq!(runtime_overhead_bytes(arch, false, 1), None, "{arch}");
+            assert_eq!(
+                runtime_overhead_bytes_ep(arch, false, 2, true),
+                None,
+                "{arch}"
+            );
         }
     }
 
@@ -5730,6 +7107,32 @@ mod tests {
         assert_eq!(weights.len() - owners, 256);
         // Layers past the trunk own nothing; only the root mix is left.
         assert_eq!(f16_shadow_bytes(&weights, 0), Ok(6_553_600));
+    }
+
+    /// An applied `.hc8` sidecar never changes the F16 shadow census and is
+    /// a net saving the census never charges.
+    #[test]
+    fn the_hc8_sidecar_leaves_f16_shadows_unchanged_and_charges_nothing() {
+        let weights = j1778_bf16_manifest();
+        assert_eq!(f16_shadow_bytes(&weights, 48), Ok(1_298_923_520));
+        let (mut replaced, mut payload) = (0i64, 0i64);
+        for entry in weights.iter().filter(|entry| {
+            entry.name.contains("hyper_connection")
+                && (entry.name.ends_with(".input_mix_weight_down.weight")
+                    || entry.name.ends_with(".input_mix_weight_up.weight"))
+        }) {
+            let [m, k] = entry.logical_shape[..] else {
+                panic!("{}: not rank 2", entry.name)
+            };
+            replaced += (m * k * 2) as i64;
+            payload += rdna_compute::hc8_weight::hc8_payload_bytes(m, k).unwrap() as i64;
+        }
+        assert!(replaced > 0, "the manifest has HC mixer weights");
+        let net = payload - replaced;
+        assert!(net < 0, "E4M3 rows are smaller than BF16: {net}");
+        assert_eq!(hc8_net_charge(net), 0);
+        assert_eq!(hc8_net_charge(0), 0);
+        assert_eq!(hc8_net_charge(4096), 4096);
     }
 
     /// The census charges exactly when the runtime predicate can hold: every
@@ -7104,6 +8507,155 @@ mod tests {
         assert!(resident_split_ranks(&manifest.weights, |_| Some(1), 3).is_err());
     }
 
+    /// The Q8_0 embedding table of the Flash-Next artifact (248320 x 2560).
+    const FN_EMBED_Q8_BYTES: u64 = 675_430_400;
+
+    /// `element_bytes` with the real Q8 size for the embedding table.
+    fn embed_q8_bytes(entry: &WeightEntry) -> Option<u64> {
+        if entry.name == crate::weights::QWEN4_EMBED {
+            Some(FN_EMBED_Q8_BYTES)
+        } else {
+            element_bytes(entry)
+        }
+    }
+
+    #[test]
+    fn place_embedding_host_flips_exactly_the_embed_entry() {
+        let config = crate::config::compact_test_config();
+        assert!(config.mtp.is_some());
+        let mut weights = crate::weights::Qwen4Manifest::build(&config)
+            .expect("FN manifest")
+            .weights;
+        let before = weights.clone();
+        assert_eq!(place_embedding_host(&mut weights), 1);
+        for (placed, original) in weights.iter().zip(&before) {
+            if original.name == crate::weights::QWEN4_EMBED {
+                assert_eq!(original.residency, WeightResidency::Resident);
+                assert_eq!(placed.residency, WeightResidency::HostMapped);
+                assert_eq!(placed.policy, original.policy);
+            } else {
+                assert_eq!(placed, original, "{}", original.name);
+            }
+        }
+        // The MTP head's embedding is a tied alias of it: no payload of its
+        // own, never marked.
+        let alias = weights
+            .iter()
+            .find(|entry| entry.name == "mtp.embed_tokens.weight")
+            .expect("tied MTP embedding");
+        assert!(matches!(alias.policy, ShardPolicy::Tied { .. }));
+        assert_eq!(alias.residency, WeightResidency::Resident);
+        // Placed once; an entry already host-mapped (or no embed entry) is a no-op.
+        assert_eq!(place_embedding_host(&mut weights), 0);
+        weights.retain(|entry| entry.name != crate::weights::QWEN4_EMBED);
+        assert_eq!(place_embedding_host(&mut weights), 0);
+    }
+
+    #[test]
+    fn host_mapped_embed_leaves_the_device_census_and_joins_the_host_bytes() {
+        let config = crate::config::compact_test_config();
+        let single = crate::weights::Qwen4BandScope::single(&config);
+        let base = crate::weights::Qwen4Manifest::build(&config).expect("FN manifest");
+        // The single-device census agrees with the band census either way.
+        let mut local = base.weights.clone();
+        let (resident_non_expert, layer) = resident_split(&local, embed_q8_bytes).unwrap();
+        place_embedding_host(&mut local);
+        let (host_non_expert, host_layer) = resident_split(&local, embed_q8_bytes).unwrap();
+        assert_eq!(host_non_expert, resident_non_expert - FN_EMBED_Q8_BYTES);
+        assert_eq!(host_layer, layer);
+        assert_eq!(
+            band_weight_census(&local, &embed_q8_bytes, &single)
+                .unwrap()
+                .non_expert,
+            host_non_expert
+        );
+        for ranks in [2usize, 3, 4, 8] {
+            let mut ep = base
+                .clone()
+                .with_expert_parallel(Qwen4EpPlacement { rank: 0, ranks })
+                .expect("EP manifest")
+                .weights;
+            let (device0, layer0) = resident_split_ranks(&ep, embed_q8_bytes, ranks).unwrap();
+            let routed_host0 = {
+                let mut placed = ep.clone();
+                place_routed_experts(&mut placed, 7);
+                host_mapped_bytes_ranks(&placed, embed_q8_bytes, ranks).unwrap()
+            };
+            assert_eq!(place_embedding_host(&mut ep), 1);
+            // The replicated trunk drops by exactly the table; the per-layer
+            // expert bytes are untouched.
+            assert_eq!(
+                resident_split_ranks(&ep, embed_q8_bytes, ranks),
+                Ok((device0 - FN_EMBED_Q8_BYTES, layer0)),
+                "ranks={ranks}"
+            );
+            // Every rank pins its own whole copy of the table (plus one pad).
+            let embed_host = FN_EMBED_Q8_BYTES + HOST_MAPPED_PAD_BYTES;
+            assert_eq!(
+                host_mapped_bytes_ranks(&ep, embed_q8_bytes, ranks),
+                Ok(vec![embed_host; ranks]),
+                "ranks={ranks}"
+            );
+            let mut placed = ep.clone();
+            place_routed_experts(&mut placed, 7);
+            let routed_host1 = host_mapped_bytes_ranks(&placed, embed_q8_bytes, ranks).unwrap();
+            for (before, after) in routed_host0.iter().zip(&routed_host1) {
+                assert_eq!(*after, before + embed_host, "ranks={ranks}");
+            }
+            assert_eq!(
+                host_mapped_bytes(&placed, embed_q8_bytes).unwrap(),
+                {
+                    let mut unplaced = base.weights.clone();
+                    place_routed_experts(&mut unplaced, 7);
+                    host_mapped_bytes(&unplaced, embed_q8_bytes).unwrap()
+                } + embed_host
+            );
+            // The hot-set host census counts the table the same way.
+            let hotset_with = hotset_host_mapped_bytes(&ep, embed_q8_bytes, 7).unwrap();
+            let hotset_without =
+                hotset_host_mapped_bytes(&base.weights, embed_q8_bytes, 7).unwrap();
+            assert_eq!(hotset_with, hotset_without + embed_host, "ranks={ranks}");
+        }
+    }
+
+    #[test]
+    fn host_mapped_embed_buys_the_ep2_plan_a_resident_layer() {
+        let config = crate::config::compact_test_config();
+        let base = crate::weights::Qwen4Manifest::build(&config).expect("FN manifest");
+        let mut ep = base
+            .with_expert_parallel(Qwen4EpPlacement { rank: 0, ranks: 2 })
+            .expect("EP manifest")
+            .weights;
+        // The compact test manifest's census moves by exactly the table.
+        let (census, _) = resident_split_ranks(&ep, embed_q8_bytes, 2).unwrap();
+        place_embedding_host(&mut ep);
+        let (freed_census, _) = resident_split_ranks(&ep, embed_q8_bytes, 2).unwrap();
+        assert_eq!(freed_census, census - FN_EMBED_Q8_BYTES);
+        // The Flash-Next mq4 EP2 plan at its measured sizes: the replicated
+        // trunk (5_115 MiB, embed table included), one MoE layer's experts
+        // per rank (1_336_934_400 / 2 B) and the census reserve. A card that
+        // holds exactly 20 resident layers with the table on it keeps exactly
+        // one more once the 644 MiB table leaves it: the table is more than
+        // one 637 MiB layer and less than two.
+        let (non_expert, layer, reserve) = (5_115u64 << 20, 1_336_934_400u64 / 2, 6_656u64 << 20);
+        assert!(FN_EMBED_Q8_BYTES > layer && FN_EMBED_Q8_BYTES < 2 * layer);
+        let free = non_expert + reserve + 20 * layer;
+        assert_eq!(
+            ep_vram_layers(&config, &[free; 2], non_expert, layer, reserve),
+            20
+        );
+        assert_eq!(
+            ep_vram_layers(
+                &config,
+                &[free; 2],
+                non_expert - FN_EMBED_Q8_BYTES,
+                layer,
+                reserve
+            ),
+            21
+        );
+    }
+
     #[test]
     fn uneven_ep_split_uses_the_largest_rank_share() {
         let config = crate::config::compact_test_config();
@@ -7407,6 +8959,49 @@ mod tests {
                 "{line}"
             );
         }
+    }
+
+    fn fit_plan(layers: usize) -> EpVramPlan {
+        EpVramPlan {
+            layers,
+            reservation: None,
+            unreserved: None,
+        }
+    }
+
+    #[test]
+    fn ep_chunk_fit_rungs_are_the_ladder_below_the_requested_chunk() {
+        assert_eq!(ep_chunk_fit_rungs(8192), vec![4096, 2048, 1024, 512]);
+        assert_eq!(ep_chunk_fit_rungs(4096), vec![2048, 1024, 512]);
+        assert_eq!(ep_chunk_fit_rungs(2048), vec![1024, 512]);
+        assert_eq!(ep_chunk_fit_rungs(512), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn ep_chunk_fit_pick_needs_the_minimum_gain_and_prefers_the_larger_chunk() {
+        // No candidate: keep the placement.
+        assert_eq!(ep_chunk_fit_pick(27, Vec::new()), None);
+        // One layer is inside the noise: keep.
+        assert_eq!(ep_chunk_fit_pick(27, vec![(2048, fit_plan(28))]), None);
+        // The minimum gain moves the chunk.
+        assert_eq!(
+            ep_chunk_fit_pick(27, vec![(2048, fit_plan(29))]),
+            Some((2048, fit_plan(29)))
+        );
+        // The most layers wins; a tie keeps the larger chunk (listed first).
+        let picked = ep_chunk_fit_pick(
+            20,
+            vec![
+                (4096, fit_plan(24)),
+                (2048, fit_plan(26)),
+                (1024, fit_plan(26)),
+            ],
+        );
+        assert_eq!(picked, Some((2048, fit_plan(26))));
+        assert_eq!(
+            ep_chunk_fit_line(4096, 2048, 27, 30),
+            "qwen4 EP auto-fit: prefill chunk 2048 rows (requested 4096); resident expert layers 27 -> 30"
+        );
     }
 
     fn band_scopes(config: &Qwen4Config, counts: &[usize]) -> Vec<Qwen4BandScope> {
@@ -8183,10 +9778,18 @@ mod tests {
                     let (gdn_layers, _) = crate::state::scope_layer_counts(&config, &scope);
                     let q8 = census(crate::GdnStateFormat::Q8, &scope);
                     let f32 = census(crate::GdnStateFormat::F32, &scope);
-                    // The band's own 2R ring slots per local GDN layer.
+                    // The band's own ring slots across its local GDN layers: the shared
+                    // pool by default, R + 1 per layer, or 2R per layer with the kill
+                    // switches.
+                    assert_eq!(
+                        crate::state::capture_ring_slots(false, ring),
+                        Some(2 * ring)
+                    );
+                    let slots =
+                        crate::state::current_capture_ring_total_slots(ring, gdn_layers).unwrap();
                     assert_eq!(
                         f32.row_capture - q8.row_capture,
-                        gdn_layers as u64 * 2 * ring as u64 * GDN_SLOT_DELTA,
+                        slots as u64 * GDN_SLOT_DELTA,
                         "{counts:?} {:?} R={ring}",
                         scope.band
                     );
@@ -9072,6 +10675,477 @@ mod tests {
         ] {
             let error = native_mtp_granule_slack(&lists.0, &lists.1, &lists.2, g).unwrap_err();
             assert!(error.contains("overflows"), "{error}");
+        }
+    }
+
+    /// `HIPFIRE_QWEN4_LANE_APPEND_SHARE` at the shipped EP2 serve shape (8 lanes, K5, a 48-row
+    /// all-rows lane step, max_seq 16384, 4096-row chunk): the native-MTP census of the
+    /// singleton drafter drops exactly the prompt-fill Append scratch allocations while the
+    /// lane store keeps its own, so the scratch is charged once; and the one scratch still
+    /// covers every user's maximum (the drafter's `MTP_FILL_ROWS.min(chunk)` rows, the lane
+    /// tile's sub-chunks of at most its row capacity, the 8 x 6 = 48 decode rows of a lane step
+    /// in the unchanged lane step buffers).
+    #[test]
+    fn lane_append_share_charges_the_scratch_once_and_covers_every_user() {
+        use crate::lane::census::{
+            lane_spec_census, CensusComponent, CensusInputs, LaneSpecBudget,
+        };
+        use crate::mtp_gpu::{MtpAppendScratch, MTP_FILL_ROWS};
+        use crate::weights::Qwen4BandScope;
+        use crate::{GdnStateFormat, Qwen4KvBackend, Qwen4StateFormat};
+        let config = crate::config::compact_test_config();
+        let manifest = crate::weights::Qwen4Manifest::build(&config).expect("FN manifest");
+        let head = language_head_dtype(&manifest.weights).unwrap();
+        let (max_seq, chunk, granularity) = (16384usize, 4096usize, 2usize << 20);
+        let context =
+            crate::Qwen4ContextCommit::new(Qwen4KvBackend::Vmm, max_seq, max_seq, granularity);
+        let singleton = |fill: bool| {
+            crate::mtp_spec::native_mtp_device_bytes(
+                &config,
+                &context,
+                chunk,
+                7,
+                head,
+                Some((GdnStateFormat::Q8, 8)),
+                fill,
+            )
+            .unwrap()
+        };
+        // The drafter's scratch: `MTP_FILL_ROWS.min(prefill_rows)` rows, `prefill_rows` ids.
+        let drafter_rows = MTP_FILL_ROWS.min(chunk);
+        let drafter_scratch =
+            MtpAppendScratch::device_bytes(&config, drafter_rows, chunk).unwrap() as u64;
+        let (charged, shared) = (singleton(true), singleton(false));
+        assert_eq!(charged - shared, drafter_scratch);
+        // The lane store's own scratch: `MTP_FILL_ROWS.min(spec_chunk_rows)` rows, as many ids.
+        let lane_rows = MTP_FILL_ROWS.min(chunk);
+        let lane_scratch =
+            MtpAppendScratch::device_bytes(&config, lane_rows, lane_rows).unwrap() as u64;
+        let format = Qwen4StateFormat {
+            qsa: crate::QsaKvFormat::Fp8,
+            gdn: GdnStateFormat::Q8,
+            qsa_f16_arena: false,
+            qsa_pooled_bf16: true,
+        };
+        let scope = Qwen4BandScope::single(&config);
+        let lane_context =
+            crate::Qwen4ContextCommit::new(Qwen4KvBackend::Vmm, max_seq, chunk, granularity);
+        let budget = LaneSpecBudget::new(8, 5, 0, 0, lane_context, 1).unwrap();
+        assert_eq!(budget.step_rows(), 48);
+        let inputs = CensusInputs {
+            config: &config,
+            format,
+            scope: &scope,
+            rank: 0,
+            append_scratch: Some((MTP_FILL_ROWS, MTP_FILL_ROWS)),
+        };
+        let census = lane_spec_census(&budget, &inputs).unwrap();
+        assert_eq!(
+            census.bytes_of(CensusComponent::AppendScratch),
+            Some(lane_scratch),
+            "the lane store keeps charging its own scratch"
+        );
+        // The shared scratch covers the drafter's rows and every sub-chunk a lane tile or the
+        // 48-row step can ask of it (`append_rows` takes at most the scratch rows per pass).
+        assert!(lane_rows >= drafter_rows);
+        assert!(lane_rows >= budget.step_rows());
+        assert_eq!(MTP_FILL_ROWS, 1024);
+        // The two ids buffers differ only by the id-row capacity (a view of the lane's: a
+        // longer prompt chunk takes the per-sub-chunk upload).
+        assert_eq!(
+            drafter_scratch - lane_scratch,
+            4 * (chunk - lane_rows) as u64
+        );
+        // What the census frees: one scratch at the shipped shape, in resident expert units
+        // (the planar 2,534,400-byte expert unit of symtrunk).
+        assert_eq!(charged - shared, 259_792_896 + 4 * (chunk as u64 - 1024));
+        assert!((charged - shared) / 2_534_400 >= 102);
+    }
+
+    /// The shipped EP2 serve load's census (symtrunk, max_seq 16384, 4096-row compact chunk,
+    /// K7 window, QSA fp8 + BF16 pooled, GDN q8, 8 lanes sharing the Append scratch, exact
+    /// gfx1201) as `placement_inputs_charged` assembles it from its owning queries, with
+    /// `HIPFIRE_EP_RESERVE_CENSUS` `on` or exactly `0`.
+    fn ep2_census(on: bool) -> ReserveCensus {
+        use crate::{GdnStateFormat, Qwen4KvBackend, Qwen4StateFormat};
+        let config = crate::config::compact_test_config();
+        let manifest = crate::weights::Qwen4Manifest::build(&config).expect("FN manifest");
+        let weights = &manifest.weights;
+        let format = Qwen4StateFormat {
+            qsa: crate::QsaKvFormat::Fp8,
+            gdn: GdnStateFormat::Q8,
+            qsa_f16_arena: false,
+            qsa_pooled_bf16: true,
+        };
+        let (max_seq, chunk, granularity) = (16384usize, 4096usize, 2usize << 20);
+        let mode = Qwen4ForwardScratchMode::FnSymGfx1201;
+        let census_context =
+            crate::Qwen4ContextCommit::new(Qwen4KvBackend::Vmm, max_seq, max_seq, granularity);
+        let trunk = crate::weights::trunk_shard::census_trunk_for(true, &config, 2);
+        assert!(trunk.is_some(), "the shipped EP2 load shards the trunk");
+        let local = ep_census_local(&config, trunk.as_ref(), 2, on).unwrap();
+        let state = ep_state_census(
+            &config,
+            local.config.as_ref(),
+            format,
+            &census_context,
+            chunk,
+            mode,
+            None,
+        )
+        .unwrap();
+        let head = language_head_dtype(weights).unwrap();
+        let mtp = crate::mtp_spec::native_mtp_device_bytes_ring(
+            &config,
+            local
+                .config
+                .as_ref()
+                .unwrap_or_else(|| config.mtp_geometry()),
+            &census_context,
+            chunk,
+            7,
+            head,
+            Some((GdnStateFormat::Q8, 8)),
+            // The lane store carries the Append scratch (`native_mtp_fill_scratch_charged`).
+            false,
+        )
+        .unwrap();
+        let gather = rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes(
+            config.num_key_value_heads,
+            max_seq,
+        )
+        .unwrap() as u64;
+        let route_rows = f16_shadow_route_rows("gfx1201", chunk);
+        let dims = rdna_compute::scratch::Qwen4PrefillWorkspaceDims {
+            hidden_size: config.hidden_size,
+            moe_intermediate_size: config.moe_intermediate_size,
+            num_experts: config.num_experts,
+            top_k: config.num_experts_per_tok,
+            hc_count: config.hc_count,
+            hc_lowrank: config.hc_lowrank,
+            gdn_format: Some(GdnStateFormat::Q8),
+            routed_i4: true,
+            include_short_tails: true,
+        };
+        ReserveCensus {
+            qsa_context: state.qsa_context,
+            state: state.state,
+            forward: state.forward,
+            f16_shadows: f16_shadow_charge_at(
+                true,
+                route_rows,
+                weights,
+                config.num_hidden_layers,
+                local.shared_width,
+            )
+            .unwrap(),
+            shared_i8_shadows: shared_i8_charge_at(
+                true,
+                route_rows,
+                weights,
+                config.num_hidden_layers,
+                local.shared_width,
+            )
+            .unwrap(),
+            workspace: rdna_compute::scratch::qwen4_prefill_workspace_terms(chunk, &dims).unwrap(),
+            qsa_selector: rdna_compute::tensor_ops::qsa_bf16_split_capacity_bytes() as u64,
+            mtp,
+            gather,
+            runtime: runtime_overhead_bytes_ep("gfx1201", false, 2, on).unwrap_or(0),
+        }
+    }
+
+    #[test]
+    fn ep_reserve_census_switch_off_is_todays_census_and_on_carries_the_rank_local_terms() {
+        use crate::weights::trunk_shard::{
+            census_local_config_for, census_trunk_for, max_shared_width,
+        };
+        let config = crate::config::compact_test_config();
+        let off = ep2_census(false);
+        let on = ep2_census(true);
+
+        // `=0`: the global-config census, no runtime term, so the historical floor stays.
+        assert_eq!(off.runtime, 0);
+        assert_eq!(runtime_overhead_bytes_ep("gfx1201", false, 2, false), None);
+        assert!(ep_census_local(&config, None, 2, false)
+            .unwrap()
+            .config
+            .is_none());
+        let trunk = census_trunk_for(true, &config, 2);
+        let none = ep_census_local(&config, trunk.as_ref(), 2, false).unwrap();
+        assert!(none.config.is_none() && none.shared_width.is_none());
+        let weights = crate::weights::Qwen4Manifest::build(&config)
+            .unwrap()
+            .weights;
+        assert_eq!(
+            shared_i8_charge_at(true, 4096, &weights, 48, None),
+            shared_i8_charge(true, 4096, &weights, 48)
+        );
+        assert_eq!(
+            shared_i8_shadow_layers_at(&weights, 48, None),
+            shared_i8_shadow_layers(&weights, 48)
+        );
+
+        // Today's EP2 census at the shipped shape (audit census-audit.md).
+        assert_eq!(
+            off.shared_i8_shadows, 250_675_200,
+            "239.06 MiB: 48 x 640 wide"
+        );
+
+        // On: the busiest rank's shared width and rank 0's GDN heads.
+        let (dims, mode) = trunk.expect("2-rank shard");
+        assert_eq!(max_shared_width(&dims, mode, 2), Ok(384));
+        let local = census_local_config_for(true, &config, 2).expect("local config");
+        assert_eq!(local.linear_num_value_heads, 24);
+        assert_eq!(config.linear_num_value_heads, 48);
+        // INT8 shared shadows at 384 columns: 48 x (1.9922 + 0.9961) MiB = 143.44 MiB on rank 0
+        // (rank 1's 256 columns are 95.63 MiB; the census charges the larger).
+        assert_eq!(on.shared_i8_shadows, 150_405_120);
+        assert_eq!(
+            shared_i8_charge_at(true, 4096, &weights, 48, Some(256)),
+            Ok(100_270_080)
+        );
+        // The GDN state at 24 heads: 72 x 405,504 + 72 x 61,440 B = 32.06 MiB against 64.1.
+        assert_eq!(off.state - on.state, 33_619_968);
+        assert_eq!(on.qsa_context, off.qsa_context);
+        assert_eq!(on.forward, off.forward);
+        // The capture ring (Q8, 8 rows) at the local head count: exactly half of the global one.
+        let ring = |config: &Qwen4Config| -> u64 {
+            crate::state::Qwen4State::row_capture_allocation_sizes_scoped(
+                config,
+                crate::GdnStateFormat::Q8,
+                8,
+                config.n_linear_layers(),
+            )
+            .unwrap()
+            .iter()
+            .sum()
+        };
+        // 83.9 MiB globally; the local ring is half of it up to the per-ring constants.
+        assert_eq!(ring(&config), 87_970_368);
+        assert_eq!(ring(&local), 43_985_472);
+        assert_eq!(off.mtp - on.mtp, ring(&config) - ring(&local));
+        // The shared expert's F16 shadows at 384 of 640 columns: 48 layers x 3 owners x
+        // 2 B x (640 - 384) x 2560 = 180 MiB less (450 -> 270 MiB); every other F16 owner is
+        // replicated and unchanged.
+        let f16_saved = 48u64
+            * 3
+            * 2
+            * (config.shared_expert_intermediate_size as u64 - 384)
+            * config.hidden_size as u64;
+        assert_eq!(f16_saved, 188_743_680);
+        assert_eq!(off.f16_shadows - on.f16_shadows, f16_saved);
+        assert_eq!(
+            f16_shadow_charge_at(true, 4096, &weights, 48, None),
+            f16_shadow_charge(true, 4096, &weights, 48)
+        );
+        // The rest is untouched, and the runtime term is the EP2 constant.
+        assert_eq!(on.workspace, off.workspace);
+        assert_eq!(on.qsa_selector, off.qsa_selector);
+        assert_eq!(on.gather, off.gather);
+        assert_eq!(on.runtime, QWEN4_EP2_RUNTIME_OVERHEAD_GFX1201_BYTES);
+        let (off_total, on_total) = (off.total().unwrap(), on.total().unwrap());
+        assert_eq!(
+            on_total as i128 - off_total as i128,
+            on.runtime as i128
+                - (off.shared_i8_shadows - on.shared_i8_shadows) as i128
+                - f16_saved as i128
+                - 33_619_968
+                - (ring(&config) - ring(&local)) as i128
+        );
+        eprintln!(
+            "EP2 census: =0 {} MiB, on {} MiB (floor retired)",
+            off_total >> 20,
+            on_total >> 20
+        );
+
+        // The log line states the runtime term and that the floor is retired; `=0` keeps
+        // today's text.
+        let retired = AutoReserve::new(None, on).unwrap().with_ep_census();
+        let text = retired.describe();
+        assert!(text.contains("EP census ["), "{text}");
+        assert!(text.contains("HIP runtime 1088 MiB"), "{text}");
+        assert!(
+            text.contains("historical single-device floor retired"),
+            "{text}"
+        );
+        assert!(text.contains("HIPFIRE_EP_RESERVE_CENSUS=0"), "{text}");
+        let today = AutoReserve::new(Some(5490 << 20), off).unwrap();
+        let today_text = today.describe();
+        assert!(!today_text.contains("EP census"), "{today_text}");
+        assert!(today_text.contains("historical floor, "), "{today_text}");
+        assert!(today_text.contains("MiB census ["), "{today_text}");
+        assert!(
+            today_text.ends_with("historical floor wins"),
+            "{today_text}"
+        );
+        assert_eq!(today.winner(), "historical floor");
+        assert_eq!(retired.winner(), "census (historical floor retired)");
+    }
+    /// Prints the per-rank reserve census of the shipped EP2 serve load (symtrunk, max_seq 16384,
+    /// 4096-row compact chunk, K7 window, QSA fp8 + BF16 pooled, GDN q8) beside the historical
+    /// floor: the receipt of the residency inventory. Asserts nothing.
+    #[test]
+    #[ignore = "receipt generator"]
+    fn ep2_reserve_census_receipt() {
+        use crate::{GdnStateFormat, Qwen4KvBackend, Qwen4StateFormat};
+        let config = crate::config::compact_test_config();
+        let manifest = crate::weights::Qwen4Manifest::build(&config).expect("FN manifest");
+        let weights = &manifest.weights;
+        let format = Qwen4StateFormat {
+            qsa: crate::QsaKvFormat::Fp8,
+            gdn: GdnStateFormat::Q8,
+            qsa_f16_arena: false,
+            qsa_pooled_bf16: true,
+        };
+        let (max_seq, chunk, granularity) = (16384usize, 4096usize, 2usize << 20);
+        let mode = Qwen4ForwardScratchMode::FnSymGfx1201;
+        let census_context =
+            crate::Qwen4ContextCommit::new(Qwen4KvBackend::Vmm, max_seq, max_seq, granularity);
+        let context = crate::Qwen4ContextCommit::for_expert_reserve(
+            Qwen4KvBackend::Vmm,
+            false,
+            max_seq,
+            chunk,
+            granularity,
+        );
+        let mib = |bytes: u64| format!("{:.2}", bytes as f64 / 1048576.0);
+        let state = state_census(&config, format, &census_context, chunk, mode).unwrap();
+        let head = language_head_dtype(weights).unwrap();
+        let mtp = |context: &crate::Qwen4ContextCommit| {
+            crate::mtp_spec::native_mtp_device_bytes(
+                &config,
+                context,
+                chunk,
+                7,
+                head,
+                Some((GdnStateFormat::Q8, 8)),
+                true,
+            )
+            .unwrap()
+        };
+        let gather = rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes(
+            config.num_key_value_heads,
+            max_seq,
+        )
+        .unwrap() as u64;
+        let route_rows = f16_shadow_route_rows("gfx1201", chunk);
+        let f16 = f16_shadow_charge(true, route_rows, weights, config.num_hidden_layers).unwrap();
+        let i8 = shared_i8_charge(true, route_rows, weights, config.num_hidden_layers).unwrap();
+        let dims = rdna_compute::scratch::Qwen4PrefillWorkspaceDims {
+            hidden_size: config.hidden_size,
+            moe_intermediate_size: config.moe_intermediate_size,
+            num_experts: config.num_experts,
+            top_k: config.num_experts_per_tok,
+            hc_count: config.hc_count,
+            hc_lowrank: config.hc_lowrank,
+            gdn_format: Some(GdnStateFormat::Q8),
+            routed_i4: true,
+            include_short_tails: true,
+        };
+        let workspace = rdna_compute::scratch::qwen4_prefill_workspace_terms(chunk, &dims).unwrap();
+        let selector = rdna_compute::tensor_ops::qsa_bf16_split_capacity_bytes() as u64;
+        {
+            let (resident, scratch) = crate::mtp_gpu::Qwen4MtpGpu::device_bytes(
+                config.mtp_geometry(),
+                &census_context,
+                head,
+                false,
+            )
+            .unwrap();
+            println!(
+                "MTP head resident {resident} B ({} MiB), build scratch {scratch} B ({} MiB)",
+                mib(resident as u64),
+                mib(scratch as u64)
+            );
+            let sizes = crate::mtp_spec::native_mtp_request_allocation_sizes(
+                &config,
+                max_seq,
+                chunk,
+                7,
+                Some((GdnStateFormat::Q8, 8)),
+                true,
+            )
+            .unwrap();
+            println!(
+                "MTP request allocations ({} total {} MiB): {:?}",
+                sizes.len(),
+                mib(sizes.iter().sum()),
+                sizes.iter().map(|b| mib(*b)).collect::<Vec<_>>()
+            );
+            let measured_forward = crate::gpu_forward::Qwen4GpuForwardScratch::device_bytes(
+                &config,
+                AUTO_VRAM_RESERVE_CHUNK,
+                Qwen4ForwardScratchMode::Full,
+            )
+            .unwrap();
+            println!("historical measured Full forward at {AUTO_VRAM_RESERVE_CHUNK} rows: {} MiB (+ spec buffers)", mib(measured_forward));
+            let committed = context
+                .committed_layer_bytes(&config, format.layout().kv)
+                .unwrap() as u64
+                * config.n_full_layers() as u64;
+            let measured_context = config
+                .qsa_context_arena_bytes(AUTO_VRAM_RESERVE_MAX_SEQ, format.layout().kv)
+                .unwrap() as u64
+                * config.n_full_layers() as u64;
+            println!(
+                "context committed {} MiB vs measured-at-32768 {} MiB",
+                mib(committed),
+                mib(measured_context)
+            );
+        }
+        let mtp_census = mtp(&census_context);
+        let mut total = 0u64;
+        let mut line = |name: &str, bytes: u64| {
+            total += bytes;
+            println!("census {name:<32} {bytes:>14} B {:>10} MiB", mib(bytes));
+        };
+        line("QSA context (12 layers)", state.qsa_context);
+        line("state (singleton, w/o context)", state.state);
+        line("forward (scratch + spec buffers)", state.forward);
+        line("F16 weight shadows", f16);
+        line("INT8 shared-expert shadows", i8);
+        for (name, bytes) in workspace {
+            line(&format!("workspace {name}"), bytes);
+        }
+        line("QSA selector", selector);
+        line("native MTP", mtp_census);
+        line("QSA gather", gather);
+        println!("census TOTAL {total} B = {} MiB", mib(total));
+        let historical = auto_vram_reserve_with_forward(
+            &config,
+            &context,
+            chunk,
+            mode,
+            format.layout(),
+            Some(mtp(&context)),
+            Some(gather),
+            None,
+        )
+        .unwrap();
+        println!("historical floor {historical} B = {} MiB", mib(historical));
+        let base = historical.max(total);
+        println!(
+            "reserve = max(...) {} MiB + margin {} MiB = {} MiB",
+            mib(base),
+            mib(EXPERT_HOTSET_VRAM_MARGIN_BYTES),
+            mib(base + EXPERT_HOTSET_VRAM_MARGIN_BYTES)
+        );
+        // The EP census terms: `HIPFIRE_EP_RESERVE_CENSUS` off (today) and on (default).
+        for (label, on) in [("=0 (today)", false), ("on (default)", true)] {
+            let census = ep2_census(on);
+            println!("EP census {label}:");
+            for (name, bytes) in census.terms() {
+                println!("  {name:<32} {bytes:>14} B {:>10} MiB", mib(bytes));
+            }
+            let census_total = census.total().unwrap();
+            let reserve = AutoReserve::new((!on).then_some(historical), census).unwrap();
+            println!(
+                "  EP census TOTAL {census_total} B = {} MiB; reserve {} MiB ({})",
+                mib(census_total),
+                mib(reserve.bytes()),
+                reserve.winner()
+            );
         }
     }
 }

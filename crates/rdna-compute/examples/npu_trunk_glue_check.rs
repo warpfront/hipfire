@@ -145,6 +145,27 @@ fn timed(gpu: &mut Gpu, label: &str, mut f: impl FnMut(&mut Gpu)) -> f32 {
     gpu.hip.event_destroy(end).unwrap();
     ms
 }
+/// Mean per-launch event time of `n` back-to-back launches after one warm launch.
+fn loop_ms(gpu: &mut Gpu, n: usize, mut f: impl FnMut(&mut Gpu)) -> f64 {
+    f(gpu);
+    gpu.hip.device_synchronize().unwrap();
+    let start = gpu.hip.event_create().unwrap();
+    let end = gpu.hip.event_create().unwrap();
+    gpu.hip
+        .event_record(&start, gpu.active_stream.as_ref())
+        .unwrap();
+    for _ in 0..n {
+        f(gpu);
+    }
+    gpu.hip
+        .event_record(&end, gpu.active_stream.as_ref())
+        .unwrap();
+    gpu.hip.event_synchronize(&end).unwrap();
+    let ms = gpu.hip.event_elapsed_ms(&start, &end).unwrap() as f64 / n as f64;
+    gpu.hip.event_destroy(start).unwrap();
+    gpu.hip.event_destroy(end).unwrap();
+    ms
+}
 fn pack_checks(gpu: &mut Gpu, k: usize, n512: bool, xp: &[u16], ap: &[i8], dp: &[(u16, i16)]) {
     for rows in [1usize, 37, 512, 4647, 8151, 8192] {
         // Offset zero covers all mixed fixtures at large sizes; the other offsets
@@ -224,6 +245,32 @@ fn pack_checks(gpu: &mut Gpu, k: usize, n512: bool, xp: &[u16], ap: &[i8], dp: &
                 &download(gpu, "new D", &d),
                 &download(gpu, "old D", &old_d),
             );
+            // The sealed PM twin against the hipcc K2560/K5120 producer it replaces: whole arena (padding and guard included) and sidecars.
+            let h_a = arena(gpu, layout.a_bytes() + 256);
+            let h_d = arena(gpu, rows * 4 + 256);
+            let p_a = arena(gpu, layout.a_bytes() + 256);
+            let p_d = arena(gpu, rows * 4 + 256);
+            gpu.npu_trunk_pack_a_bf16_hipcc(&x, rows, layout, &h_a, &h_d)
+                .unwrap();
+            gpu.npu_trunk_pack_a_bf16_pm(&x, rows, layout, &p_a, &p_d)
+                .unwrap();
+            gpu.hip.device_synchronize().unwrap();
+            compare(
+                "pack pm/hipcc arena",
+                &download(gpu, "pm A", &p_a),
+                &download(gpu, "hipcc A", &h_a),
+            );
+            compare(
+                "pack pm/hipcc sidecars",
+                &download(gpu, "pm D", &p_d),
+                &download(gpu, "hipcc D", &h_d),
+            );
+            compare(
+                "pack pm/product arena",
+                &download(gpu, "pm A", &p_a),
+                &download(gpu, "new A", &a),
+            );
+            println!("pack_pm_exact k={k} n512={n512} rows={rows} fixture_offset={offset} pm_vs_hipcc=byte-exact (A arena incl. padding+guard, D sidecars)");
             println!("pack_exact k={k} n512={n512} cpu_ref={} rows={rows} fixture_offset={offset} old_vs_new=byte-exact padding=ok guards=ok",
                 if n512 || k <= 2560 { "peacemaker" } else { "old-scalar" });
             if offset == 0 {
@@ -240,6 +287,34 @@ fn pack_checks(gpu: &mut Gpu, k: usize, n512: bool, xp: &[u16], ap: &[i8], dp: &
                     &format!("pack-new rows={rows} k={k} n512={n512}"),
                     |g| g.npu_trunk_pack_a_bf16(&x, rows, layout, &a, &d).unwrap(),
                 );
+                // ABBA over 4 rounds of 64 back-to-back launches per arm (event mean per launch).
+                let (mut hipcc, mut pm) = (0f64, 0f64);
+                for round in 0..4 {
+                    let mut h = |g: &mut Gpu| {
+                        g.npu_trunk_pack_a_bf16_hipcc(&x, rows, layout, &h_a, &h_d)
+                            .unwrap()
+                    };
+                    let mut m = |g: &mut Gpu| {
+                        g.npu_trunk_pack_a_bf16_pm(&x, rows, layout, &p_a, &p_d)
+                            .unwrap()
+                    };
+                    if round % 2 == 0 {
+                        hipcc += loop_ms(gpu, 64, &mut h);
+                        pm += loop_ms(gpu, 64, &mut m);
+                    } else {
+                        pm += loop_ms(gpu, 64, &mut m);
+                        hipcc += loop_ms(gpu, 64, &mut h);
+                    }
+                }
+                // The product entry point (HIPFIRE_NPU_TRUNK_PACK_A_PM decides hipcc or PM): process-level A/B by running the
+                // example with and without the kill switch.
+                let product = loop_ms(gpu, 256, |g| {
+                    g.npu_trunk_pack_a_bf16(&x, rows, layout, &a, &d).unwrap()
+                });
+                println!("pack_product k={k} n512={n512} rows={rows} product_ms={product:.5} (256 launches; HIPFIRE_NPU_TRUNK_PACK_A_PM={})",
+                    std::env::var("HIPFIRE_NPU_TRUNK_PACK_A_PM").unwrap_or_else(|_| "unset".into()));
+                let (hipcc, pm) = (hipcc / 4.0, pm / 4.0);
+                println!("pack_pm_vs_hipcc k={k} n512={n512} rows={rows} hipcc_ms={hipcc:.5} pm_ms={pm:.5} pm/hipcc={:.4} (ABBA 4x64 launches)", pm / hipcc);
                 let traffic = (rows * k * 2 + layout.a_bytes() + rows * 4) as f64;
                 println!("pack_bw k={k} n512={n512} rows={rows} old_ms={old:.4} new_ms={new:.4} old_GBps={:.2} new_GBps={:.2} speedup={:.2} target_GBps=180",
                     traffic/(old as f64*1e6),traffic/(new as f64*1e6),old/new);
@@ -254,9 +329,66 @@ fn pack_checks(gpu: &mut Gpu, k: usize, n512: bool, xp: &[u16], ap: &[i8], dp: &
                     &download(gpu, "old D", &old_d),
                 );
             }
-            for t in [x, a, d, old_a, old_d] {
+            for t in [x, a, d, old_a, old_d, h_a, h_d, p_a, p_d] {
                 gpu.free_tensor(t).unwrap();
             }
+        }
+    }
+}
+/// PM twin vs hipcc producer over inputs outside the finite-F16 contract (the twin is byte-identical code, so the
+/// two must agree on every bit pattern): row r, column i = (r * k + i) mod 65536 (every F16 pattern, NaN, Inf, denormals, -0
+/// appear 40x), plus degenerate rows (all +0, all -0, all NaN, all +/-Inf, max finite, denormals only, one Inf among zeros).
+fn pattern_checks(gpu: &mut Gpu, k: usize) {
+    for n512 in [false, true] {
+        let rows = 1024usize;
+        let wave = if n512 { 512 } else { 256 };
+        let p = rows.div_ceil(wave) * wave;
+        let layout = NpuBf16Layout {
+            padded_rows: p,
+            k,
+            panels: 1,
+            n512,
+        };
+        let mut xh = vec![0u16; rows * k];
+        for r in 0..rows {
+            for i in 0..k {
+                xh[r * k + i] = ((r * k + i) % 65536) as u16;
+            }
+        }
+        for (r, f) in [
+            0u16, 0x8000, 0x7e00, 0xfe00, 0x7c00, 0xfc00, 0x7bff, 0xfbff, 0x0001, 0x8001, 0x03ff,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            xh[r * k..(r + 1) * k].fill(f);
+        }
+        xh[11 * k] = 0x7c00;
+        xh[11 * k + 1..12 * k].fill(0);
+        let xbytes: Vec<u8> = xh.iter().flat_map(|h| h.to_le_bytes()).collect();
+        let x = typed(gpu, &xbytes, &[rows, k], DType::F16);
+        let h_a = arena(gpu, layout.a_bytes() + 256);
+        let h_d = arena(gpu, rows * 4 + 256);
+        let p_a = arena(gpu, layout.a_bytes() + 256);
+        let p_d = arena(gpu, rows * 4 + 256);
+        gpu.npu_trunk_pack_a_bf16_hipcc(&x, rows, layout, &h_a, &h_d)
+            .unwrap();
+        gpu.npu_trunk_pack_a_bf16_pm(&x, rows, layout, &p_a, &p_d)
+            .unwrap();
+        gpu.hip.device_synchronize().unwrap();
+        compare(
+            "pattern pack pm/hipcc arena",
+            &download(gpu, "pm A", &p_a),
+            &download(gpu, "hipcc A", &h_a),
+        );
+        compare(
+            "pattern pack pm/hipcc sidecars",
+            &download(gpu, "pm D", &p_d),
+            &download(gpu, "hipcc D", &h_d),
+        );
+        println!("pack_pm_patterns k={k} n512={n512} rows={rows} pm_vs_hipcc=byte-exact (all 65536 F16 patterns x40, degenerate rows)");
+        for t in [x, h_a, h_d, p_a, p_d] {
+            gpu.free_tensor(t).unwrap();
         }
     }
 }
@@ -290,6 +422,7 @@ fn run_k(mut gpu: &mut Gpu, k: usize, shapes: &[(&str, &[usize])]) {
     eprintln!("PHASE CPU activation and integer-dot references k={k}");
     let (xp, ap, dp) = activations(k);
     pack_checks(gpu, k, false, &xp, &ap, &dp);
+    pattern_checks(gpu, k);
     if k > 2560 {
         pack_checks(gpu, k, true, &xp, &ap, &dp);
     }

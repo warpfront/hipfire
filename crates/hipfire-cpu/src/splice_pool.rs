@@ -12,8 +12,10 @@
 //! element as one row dot, so the same bytes come out for any worker count
 //! (see the `gemv` determinism test).
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
+use std::cell::RefCell;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 /// Splice pool configuration, resolved by the caller from its knobs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,6 +54,180 @@ pub fn par_for_each_chunk_mut<T: Send>(
     data.par_chunks_mut(chunk)
         .enumerate()
         .for_each(|(i, c)| f(i, c));
+}
+
+// ---- spin wake / spin completion -----------------------------------------------------------
+//
+// An idle rayon worker parks on a futex after a few dozen yield rounds, so a D2 layer that runs
+// the CPU arm once per ~0.7 ms pays a futex wake of every worker when `install` injects the arm,
+// and a Mutex/Condvar wake of the calling thread when it completes. [`PoolWarm`] moves the first
+// off the critical path (the workers are woken, and held hot, from the layer's input-readiness
+// wait until the arm has run) and [`install_spin`] removes the second (the caller polls an atomic
+// instead of blocking). Neither changes what runs: the arm is the same closure on the same pool,
+// so its outputs are byte-identical; only when the workers are awake differs.
+//
+// Both spins are bounded and yield: a spinner calls `sched_yield` every [`SPIN_BATCH`] pauses, so
+// a thread that shares its CPU (the calling thread can land on an SMT sibling of a pinned worker)
+// is never starved for a scheduler quantum, and each spin gives up after its budget and falls back
+// to the ordinary park/sleep.
+
+/// `spin_loop` hints between two `sched_yield` calls of a spinner.
+const SPIN_BATCH: u32 = 32;
+
+/// Longest the caller waits for the workers' spinners to report in before the arm is published.
+const WARM_START_WAIT: Duration = Duration::from_micros(150);
+
+#[inline]
+fn spin_step(n: &mut u32) {
+    *n += 1;
+    if *n % SPIN_BATCH == 0 {
+        std::thread::yield_now();
+    } else {
+        std::hint::spin_loop();
+    }
+}
+
+/// State shared by one [`PoolWarm`] and the spinner every worker runs for it.
+struct WarmCtl {
+    /// Set when the arm has finished (or the warm is dropped): spinners return.
+    stop: AtomicBool,
+    /// Set before the arm is published: a spinner that starts later does not spin. A worker
+    /// that polled the spinner job from inside the arm's own latch wait would otherwise spin
+    /// there and stall the arm it is part of until the budget ran out.
+    late: AtomicBool,
+    /// Spinners that have entered their loop.
+    started: AtomicUsize,
+    workers: usize,
+    budget: Duration,
+}
+
+/// Workers held awake for an upcoming CPU arm; dropping it (or the arm completing through
+/// [`install_spin`] after [`PoolWarm::arm_next_install`]) lets them go back to sleep.
+pub struct PoolWarm {
+    ctl: Arc<WarmCtl>,
+}
+
+impl PoolWarm {
+    /// Wake every worker of the splice pool (built from `cfg` on first use) and keep it spinning
+    /// for at most `budget`, or until this value is dropped.
+    pub fn start(cfg: SplicePoolConfig, budget: Duration) -> PoolWarm {
+        let pool = splice_pool(cfg);
+        let ctl = Arc::new(WarmCtl {
+            stop: AtomicBool::new(false),
+            late: AtomicBool::new(false),
+            started: AtomicUsize::new(0),
+            workers: pool.current_num_threads(),
+            budget,
+        });
+        let spinner = ctl.clone();
+        pool.spawn_broadcast(move |_| spin_until_stopped(&spinner));
+        PoolWarm { ctl }
+    }
+
+    /// The next [`install_spin`] on THIS thread publishes its arm only once the spinners are in,
+    /// and then lets none start. Call it immediately before the arm; [`clear_next_install`]
+    /// undoes it when the arm turns out not to install (nothing to compute).
+    pub fn arm_next_install(&self) {
+        NEXT_INSTALL.with(|c| *c.borrow_mut() = Some(self.ctl.clone()));
+    }
+}
+
+impl Drop for PoolWarm {
+    fn drop(&mut self) {
+        self.ctl.stop.store(true, Ordering::Release);
+    }
+}
+
+thread_local! {
+    static NEXT_INSTALL: RefCell<Option<Arc<WarmCtl>>> = const { RefCell::new(None) };
+}
+
+/// Forget a pending [`PoolWarm::arm_next_install`] of this thread.
+pub fn clear_next_install() {
+    NEXT_INSTALL.with(|c| *c.borrow_mut() = None);
+}
+
+fn spin_until_stopped(ctl: &WarmCtl) {
+    let skip = ctl.late.load(Ordering::Acquire) || ctl.stop.load(Ordering::Acquire);
+    ctl.started.fetch_add(1, Ordering::AcqRel);
+    if skip {
+        return;
+    }
+    let t0 = Instant::now();
+    let mut n = 0u32;
+    // `yield_now` runs pending pool jobs (the arm's root job and its stolen halves) in this
+    // loop, so a spinning worker is also an eager one.
+    while !ctl.stop.load(Ordering::Acquire) && t0.elapsed() < ctl.budget {
+        match rayon::yield_now() {
+            Some(rayon::Yield::Executed) => n = 0,
+            _ => spin_step(&mut n),
+        }
+    }
+}
+
+/// [`ThreadPool::install`] for a caller that is not a worker of `pool`, minus the Condvar wake of
+/// the caller: the closure is spawned on the pool and the caller polls for its completion for up
+/// to `spin` (with a `sched_yield` every few pauses), then parks. From inside a worker of `pool`
+/// it is plain `install`. A panic of `f` is caught on the worker and resumed on the caller, as
+/// `install` does.
+pub fn install_spin<R: Send>(
+    pool: &rayon::ThreadPool,
+    spin: Duration,
+    f: impl FnOnce() -> R + Send,
+) -> R {
+    if pool.current_thread_index().is_some() {
+        return pool.install(f);
+    }
+    if let Some(ctl) = NEXT_INSTALL.with(|c| c.borrow_mut().take()) {
+        let t0 = Instant::now();
+        let mut n = 0u32;
+        while ctl.started.load(Ordering::Acquire) < ctl.workers && t0.elapsed() < WARM_START_WAIT {
+            spin_step(&mut n);
+        }
+        ctl.late.store(true, Ordering::Release);
+    }
+    struct Slot<R> {
+        done: AtomicBool,
+        result: std::cell::UnsafeCell<Option<std::thread::Result<R>>>,
+        waiter: std::thread::Thread,
+    }
+    // SAFETY: `result` is written once by the worker before the Release store of `done` and read
+    // once by the caller after its Acquire load of `done`.
+    unsafe impl<R: Send> Sync for Slot<R> {}
+    let slot = Arc::new(Slot::<R> {
+        done: AtomicBool::new(false),
+        result: std::cell::UnsafeCell::new(None),
+        waiter: std::thread::current(),
+    });
+    let job_slot = slot.clone();
+    let job: Box<dyn FnOnce() + Send + '_> = Box::new(move || {
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        // SAFETY: sole writer, before `done` is published.
+        unsafe { *job_slot.result.get() = Some(r) };
+        job_slot.done.store(true, Ordering::Release);
+        job_slot.waiter.unpark();
+    });
+    // SAFETY: `f` (and every borrow it holds) is consumed by the job body before `done` is set,
+    // and this function does not return before it observes `done`; the job's remaining captures
+    // (the `Arc`) are `'static`. The wait loop below cannot unwind.
+    let job: Box<dyn FnOnce() + Send + 'static> = unsafe { std::mem::transmute(job) };
+    pool.spawn(job);
+    let t0 = Instant::now();
+    let mut n = 0u32;
+    while !slot.done.load(Ordering::Acquire) {
+        if t0.elapsed() < spin {
+            spin_step(&mut n);
+        } else {
+            std::thread::park_timeout(Duration::from_millis(1));
+        }
+    }
+    // SAFETY: `done` was observed with Acquire; the worker wrote `result` before it.
+    let r =
+        unsafe { (*slot.result.get()).take() }.expect("splice pool job finished without a result");
+    match r {
+        Ok(v) => v,
+        Err(p) => std::panic::resume_unwind(p),
+    }
 }
 
 fn build_pool(cfg: SplicePoolConfig) -> rayon::ThreadPool {
@@ -241,5 +417,85 @@ mod test {
         });
         assert_eq!(sum, 499_500);
         assert!(pool.current_num_threads() >= 1);
+    }
+
+    fn pool() -> &'static rayon::ThreadPool {
+        splice_pool(SplicePoolConfig {
+            threads: 0,
+            pin: true,
+        })
+    }
+
+    /// The spin install returns exactly what the plain install computes, on the pool's workers.
+    #[test]
+    fn install_spin_matches_install() {
+        use rayon::prelude::*;
+        let work = || {
+            (0..100_000u64)
+                .into_par_iter()
+                .map(|x| x.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 7)
+                .reduce(|| 0, u64::wrapping_add)
+        };
+        let want = pool().install(work);
+        for _ in 0..20 {
+            assert_eq!(install_spin(pool(), Duration::from_micros(500), work), want);
+        }
+        // Past its spin budget the caller parks and still sees the result.
+        let slow = install_spin(pool(), Duration::ZERO, || {
+            std::thread::sleep(Duration::from_millis(5));
+            7u32
+        });
+        assert_eq!(slow, 7);
+        let on_worker = install_spin(pool(), Duration::ZERO, || rayon::current_thread_index());
+        assert!(on_worker.is_some());
+    }
+
+    /// Borrowed data and a panic both cross the spin install like `install`.
+    #[test]
+    fn install_spin_borrows_and_propagates_panics() {
+        let mut v = vec![1u32, 2, 3];
+        let total = install_spin(pool(), Duration::from_micros(100), || {
+            v.push(4);
+            v.iter().sum::<u32>()
+        });
+        assert_eq!((total, v.len()), (10, 4));
+        let caught = std::panic::catch_unwind(|| {
+            install_spin(pool(), Duration::from_micros(100), || -> u32 {
+                panic!("splice arm failed")
+            })
+        });
+        assert!(caught.is_err());
+        // The pool is intact afterwards.
+        assert_eq!(install_spin(pool(), Duration::from_micros(100), || 5), 5);
+    }
+
+    /// A warm pool with a pending-arm handshake: the spinners are all in before the arm is
+    /// published, the arm runs and returns the same value, and dropping the warm releases them.
+    #[test]
+    fn warm_pool_handshake_and_release() {
+        use rayon::prelude::*;
+        let cfg = SplicePoolConfig {
+            threads: 0,
+            pin: true,
+        };
+        let work = || (0..50_000u64).into_par_iter().sum::<u64>();
+        let want = pool().install(work);
+        for _ in 0..20 {
+            let warm = PoolWarm::start(cfg, Duration::from_millis(5));
+            warm.arm_next_install();
+            assert_eq!(install_spin(pool(), Duration::from_micros(500), work), want);
+            assert_eq!(
+                warm.ctl.started.load(Ordering::Acquire) <= warm.ctl.workers,
+                true
+            );
+            drop(warm);
+        }
+        // A warm that expires unused, and a handshake that never installs, leave nothing behind.
+        let warm = PoolWarm::start(cfg, Duration::from_micros(200));
+        std::thread::sleep(Duration::from_millis(2));
+        warm.arm_next_install();
+        clear_next_install();
+        drop(warm);
+        assert_eq!(install_spin(pool(), Duration::from_micros(500), work), want);
     }
 }

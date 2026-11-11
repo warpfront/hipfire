@@ -134,6 +134,8 @@ Manual VGPR granule padding is **not required by RegPlan or the emitter**: the e
 
 `SRD_WORD3: u32 = 0x31004000` selects raw untyped 32-bit buffer accesses: offsets at/past num_records read zero without touching memory. `srd_tail` uses this constant. Buffer helpers use `offen`, zero soffset (`0` gfx11, `null` gfx12), and byte immediate offsets, limited to 4095 on gfx11 and 8388607 on gfx12. They do not construct descriptor base words 0/1. Buffer and global operations are different families of addressing instructions; do not replace one spelling with the other.
 
+On an untyped `Builder` (`let mut b = Builder::new(..)`, no `Workgroup`) `b.label(name: str) -> Result<(), String>` places a branch label at the current position (a duplicate name is the builder's refusal, `duplicate label NAME`) and `b.wait_all() -> Result<(), String>` drains every counter the wait ledger holds (the builder emits exactly the waits its ledger requires, none when nothing is outstanding). Branches to the label are `b.control(Instruction::new("s_branch NAME", vec![], vec![]))?`. Both are refused on `wg.isa()` (`` `wg.isa().label` is not available: use the Workgroup's own `label` ``): a typed kernel's labels and waits belong to the Workgroup driver.
+
 `gather_offset(b,dst:u8,index:u8,div:Option<u8>,row_bytes:u32,live:u8,t:GatherTemps) -> Result<(),String>` computes signed indexed-row byte offsets and live-lane mask. `GatherTemps { v:[u8;4], mask:u8 }` supplies four dead VGPRs and scalar mask scratch. Example: `gather_offset(wg.isa(),1,0,None,16,12,GatherTemps { v:[8,9,10,11], mask:13 })?;`. Live indices must be nonnegative and below `GATHER_MAX_INDEX = 1<<22`; negative padding indices become `GATHER_OOB = 0x7fffff00`. A supplied divisor is an SGPR index (positive uniform divisor); None means one. `row_bytes` must be below 2^24. Set the descriptor's record count to the actual byte extent; the helper emits reciprocal division plus integer corrections, offset multiplication and mask selection, not a load.
 
 `Chain::new(dst:u8,width:u8,kind:str) -> Chain` describes a WMMA accumulator; width must be 8 and kind `"f16"` or `"bf16"`. Example `let c = Chain::new(0,8,"f16");`. `c.step(b,a:u8,aw:u8,b:u8,bw:u8) -> Result<(),String>` emits the kind's `v_wmma_f32_16x16x16_*` using and redefining its accumulator; example `c.step(wg.isa(),8,8,16,8)?;` on gfx11. Operand widths must match the architecture (eight on gfx11, four on gfx12); initialize the accumulator before its first step. The item keyword `chain` merely defines a function and is unrelated to this native Chain value.
@@ -331,7 +333,7 @@ The tables are the supported PeaceMaker vocabulary, not a complete silicon ISA c
 | v_permlane16_b32 | in gfx11 tables | absent |
 | v_permlanex16_b32 | available | available |
 | DPP row_xmask / row_shl | v_mov_b32_dpp | v_mov_b32_dpp |
-| DPP quad_perm:[...] syntax | rejected by current modifier parser | rejected by current modifier parser |
+| DPP quad_perm:[...] syntax | accepted on `v_mov_b32_dpp`; still rejected on `v_max_f32_dpp` | accepted on `v_mov_b32_dpp`; still rejected on `v_max_num_f32_dpp` |
 | f16 WMMA 16x16x16 operands | dst/acc 8 VGPRs, A/B 8 each | dst/acc 8 VGPRs, A/B 4 each |
 
 Inline integer constants are -16..64. A larger integer is a literal, spelled canonically with `lit`, not a decimal inline constant. There is one literal word per instruction (reusing the same literal is different from requesting two distinct literal words). VOP2 `_e32` has VGPR-only src1: use `_e64` when that source must be scalar or constant, or commute operands if valid. Not every opcode has both encodings in the tables. DPP controls are instruction modifiers, not standalone cross-lane instructions. `row_shr` is not a supported substitute for `row_shl`.
@@ -372,8 +374,8 @@ gfx1151: v_permlanex16_b32 v1, v2, s12, 0xfedcba98
 gfx1201: v_permlanex16_b32 v1, v2, s12, 0xfedcba98
 gfx1151: v_mov_b32_dpp v1, v2 row_xmask:1 row_mask:0xf bank_mask:0xf
 gfx1201: v_mov_b32_dpp v1, v2 row_xmask:1 row_mask:0xf bank_mask:0xf
-!gfx1151: v_mov_b32_dpp v1, v2 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
-!gfx1201: v_mov_b32_dpp v1, v2 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
+gfx1151: v_mov_b32_dpp v1, v2 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
+gfx1201: v_mov_b32_dpp v1, v2 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
 gfx1151: v_mov_b32_dpp v1, v2 row_shl:1 row_mask:0xf bank_mask:0xf
 gfx1201: v_mov_b32_dpp v1, v2 row_shl:1 row_mask:0xf bank_mask:0xf
 gfx1151: v_add_nc_u32_e32 v1, 0x80, v2
@@ -779,3 +781,43 @@ The Q8_0 tile is `tile_setup`, `fill`, label `FILL_DONE`, `[ready(0), ready(1)]`
 | `gdn::conv_setup(b)?`, `gdn::conv_to_v(b)?`, `gdn::conv_to_k(b)?`, `gdn::region_setup(b, "q" \| "k" \| "v")?`, `gdn::row_body(b, region, head)?`, `gdn::to_epi(b)?`, `gdn::epilogue(b)?` | the conv unit: set-up, the unit dispatch, a region's pointers, one trip of a region's row loop, `s_branch epi`, the chunk-0 conv_state advance |
 
 Variants: `rotate`, `norm`, `sigmoid_rotate`, `norm_out` (c8), `rows`, `gp` (rotate), `chunk_prep` (gdn). gfx1201 only.
+
+## 19. Production generator on the raw `Builder` with schedule axes: `gemv_mq2_xbatch`
+
+The x-batched MQ2G256V2 GEMV (`gemv_mq2g256v2_xbatch_pm`, gfx1201; the MTP draft-head ranking GEMV; Rust generator `peacemaker_isa::kernels::gemv_mq2_xbatch_pm_gfx1201`) is written whole in [`gemv_mq2_xbatch.rip`](../../peacemaker-isa/src/kernels/gemv_mq2_xbatch.rip): no coarse natives, every instruction is a script statement over `b.push(Instruction::new(text, defs, uses))`, `b.vopd(VopdOp { op, dst, src0, src1 }, ..)`, `b.ds_crosslane`, `b.control` (branches), `b.loop_`, `b.label` and `b.wait_all` (§7). The register map (`Lay`), the ring/register `check`, the plan, the cap-gated section layout (the one-section-hop gate layout above capacity 4), the quad/tail loops, the weight decode, the VOPD row pairs, the fold, the shuffle tree and the store are script functions.
+
+The generator's grid is five consts, each one line `const NAME: TY = LITERAL;` (so a search can rewrite the literal in place). Four of them, and four script-only axes (below the first four rows), are declared in `SEARCH_AXES` with exactness class `schedule` (the arithmetic DAG of every output is the same for every point):
+
+| const | values | meaning |
+|---|---|---|
+| `ROWS: u8` | 1, 2, 4 | output rows per workgroup (grid `ceil(M/ROWS)`; a larger grid is harmless) |
+| `UNROLL: u8` | 1, 2, 4 | quads per main-loop trip |
+| `SPLIT: bool` | false, true | activation loads as 4xb64 instead of 2xb128 |
+| `ILP: bool` | false, true | two weight sets, two groups' fmac chains interleaved term by term |
+| `PREFETCH: u8` | 0, 1 | 1 refills each quad's header/payload weight registers with the next quad's loads once its activations are in flight (peeled first quad, no per-trip `wait_all`; the last quad's refill re-reads the current quad so nothing past A is read); no extra VGPRs |
+| `DELAY_ALU: bool` | false, true | `b.enable_delay_alu()` (`s_delay_alu` issue hints) |
+| `PRIO: u8` | 0, 1, 2 | nonzero: `s_setprio PRIO` over each section's dot-product phase, `s_setprio 0` before the reduction |
+| `XFIRST: bool` | false, true | first activation loads issue before the first group's weight loads |
+
+The last four rows exist only in the script (no Rust-generator twin); their declared values (0, false, 0, false) emit the generator's text byte for byte, and each keeps every output's arithmetic DAG (only load/issue order, hints and the refill placement change).
+
+`CAP: u8` (1, 2, 4, 8; `B > CAP` clamps, `B <= 0` stores nothing) is not a search axis: a `CAP < 8` object equals the `CAP = 8` one only for `B <= CAP`.
+
+The declared values are the shipped tuple `r4_b8_u1_native_anchor` (`const ROWS: u8 = 4; const CAP: u8 = 8; const UNROLL: u8 = 1; const SPLIT: bool = false; const ILP: bool = false;`); the variant is `xbatch` and the `KernelSpec` variant is the tuple tag. A tuple whose ring/register plan does not fit is refused by the script's `check` with the same verdict as the Rust generator (`r4_b8` with `ILP` has one ring slot but needs four). `tests/gemv_mq2_xbatch_twin.rs` requires, for all 144 tuples of the grid, that the script refuses exactly when `emit_text` does and otherwise emits the same `s_text` byte for byte, and that the declared point assembles to the ELF inside the committed `kernels/gemv_mq2_xbatch_pm_gfx1201.hxaco`.
+
+## 20. The HC8 compressed-weight GEMM family on the raw `Builder`: `hc8_wmma`
+
+The six served E4M3 entries of `kernels/hc8_wmma_pm_gfx1201.hxaco` (gfx1201) are written whole in [`hc8_wmma.rip`](../../peacemaker-isa/src/kernels/hc8_wmma.rip): variants `down_n1..3` (`hc8_gemm_e4m3_mw1_kw16_n{1,2,3}_act`) and `up_n1..3` (`hc8_read_up_e4m3_n{1,2,3}`). Every instruction is a script statement. `SEARCH_AXES` declares four `schedule` axes; the declared values preserve the original search baseline:
+
+| const | declared | values | meaning |
+|---|---|---|---|
+| `UNROLL: u8` | 0 | 0, 1, 2, 3, 4, 5, 6, 8, 10 | tiles per main K-loop batch; 0 is the original search reference (8 / 4 / 2 for NT 1 / 2 / 3); remainder batches halve; refused when the VGPR layout does not fit (NT 2: above 5, NT 3: above 3) |
+| `LOADORDER: u8` | 0 | 0, 1, 2 | load issue order in a batch: per tile weight then x / all weights then all x / all x then all weights |
+| `EPIPRE: bool` | false | false, true | the epilogue's global loads (scales; for the read-up also the normalized values) issued in front of the K loops into dedicated VGPRs; each loop re-issues them after every iteration that is followed by another one (the Builder admits a loop only when its back-edge ledger equals its entry ledger) and branches out before the re-issue after the last |
+| `DELAY_ALU: bool` | true | true, false | `b.enable_delay_alu()` |
+
+`tests/hc8_wmma_twin.rs` pins the six texts against the generator, the machine code and 64-byte descriptor of every symbol against the same symbol of the committed `.hxaco` (through the ELF symbol table; the descriptor's `kernel_code_entry_byte_offset` is compared as "points at the symbol's code"), the axis consts, and the compile/refuse table of the axes.
+
+The declared constants retain the original search reference. The shipped points are `(UNROLL, LOADORDER, EPIPRE) = (2, 2, false)` for down_n2, `(1, 2, false)` for down_n3, and `(4, 1, true)` for up_n1, with `DELAY_ALU=true`; the other three use the reference point. The twin test selects these served points for its Rust-generator and committed-artifact comparisons and pins the three standalone winner ELF hashes.
+
+The generator spells `v_perm_b32` selectors as `0x07060302` and writes `offset:0`; `llvm-objdump` prints `0x7060302` and omits a zero offset, so the toolchain's parse-back would reject the text as authored. `peacemaker_rip::certify` (and the `features` linked build) therefore assemble the text through `peacemaker_rip::objdump_spelling`, which rewrites exactly those two spellings on instruction lines; the assembled ELF is the same (pinned by the twin test).

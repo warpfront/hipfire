@@ -16,6 +16,16 @@ required-features = ["toolchain"]
 name = "hip_twin"
 required-features = ["lab"]
 
+# Native emit of the Builder v_ceil_f32 device probe (kernels/ceil_probe.rs); opt-in like the other probes.
+[[example]]
+name = "ceil_probe_emit"
+required-features = ["lab"]
+
+# Standalone gfx1201 EXPAND_LIVE code-object emitter (CPU only, native assemble).
+[[example]]
+name = "emit_expand_live"
+required-features = ["lab"]
+
 [[example]]
 name = "pm_r4_screen"
 required-features = ["toolchain"]
@@ -29,6 +39,55 @@ required-features = ["toolchain"]
 # by the default `cargo build --all-targets`.
 [[example]]
 name = "cdna_card_tierc"
+required-features = ["lab"]
+
+# GPU exactness harness of the exact libm lowerings against hipcc (fabric job; HIP runtime).
+[[example]]
+name = "libm_exact"
+required-features = ["lab"]
+
+# MI300X (gfx942) GPU bit oracle: PeaceMaker twin vs hipcc of the rows16 / rows16_x2 BF16 MFMA entries (fabric job; HIP runtime).
+[[example]]
+name = "gemm_bf16_rows16_oracle"
+required-features = ["lab"]
+
+# One-card gfx1201 smoke of the persistent-megakernel prerequisites (fabric job; HIP runtime).
+[[example]]
+name = "pm_persistent_smoke"
+required-features = ["lab"]
+
+# Regenerates railgun-cert's PeaceMaker release/acquire fixtures (tests/event_sync.rs).
+[[example]]
+name = "railgun_cert_event_sync_fixtures"
+required-features = ["lab"]
+
+# Region-conversion survey of lifted hipcc bodies (CPU only).
+[[example]]
+name = "pm_lift_survey"
+required-features = ["lab"]
+
+# One-card gfx1201 byte-identity of lifted hipcc bodies run as pool-dispatcher regions (fabric job).
+[[example]]
+name = "pm_lift_smoke"
+required-features = ["lab"]
+
+# CPU emulator differential of the o4 gate/up body: standalone vs pool region.
+[[example]]
+name = "pm_lift_emu"
+required-features = ["lab"]
+
+# Rows-6 pool dispatchers (one per blockDim) over every convertible template (CPU only).
+[[example]]
+name = "pm_lift_pools"
+required-features = ["lab"]
+
+[[example]]
+name = "hc8_byte_oracle"
+required-features = ["lab"]
+
+# CPU-only: single-entry HC8 objects + manifests for the rip-search hardware oracle smoke job.
+[[example]]
+name = "hc8_smoke_objects"
 required-features = ["lab"]
 
 # Native gfx1100 emitters that also run the ROCm oracle/certify path (M7, radiowave): need `--features toolchain`.
@@ -75,6 +134,11 @@ required-features = ["lab"]
 
 [[example]]
 name = "qwen4_moe_sym_gfx1100_p1"
+required-features = ["lab"]
+
+# MQ2 x-batch PM variant grid / shipped-artifact emitter (native writer only).
+[[example]]
+name = "mq2_xbatch_pm_sweep"
 required-features = ["lab"]
 
 [features]

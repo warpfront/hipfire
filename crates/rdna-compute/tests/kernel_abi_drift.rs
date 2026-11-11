@@ -31,17 +31,21 @@
 //!   [`NO_GENERATOR_PATH`] with a reason, and that list is asserted exact. Proves the contract
 //!   agrees with what the generator would emit (and, for MQ6, with the dynamic LDS the object
 //!   metadata cannot show).
-//! * **Hipcc exports** (`hipcc_exports_are_listed`): `HipccSource` exports have no offline
-//!   object, so there is no metadata evidence for them. Their `(arch, symbol)` set must equal
-//!   an explicit list, so a new unverified export cannot appear silently.
+//! * **Hipcc exports** (`hipcc_exports_are_listed`): `HipccSource` exports have no committed
+//!   object. Their `(arch, symbol)` set must equal an explicit list, so a new export cannot
+//!   appear silently.
+//! * **Hipcc compiled metadata** (`hipcc_exports_match_compiled_metadata`): each hipcc source is
+//!   compiled for its arch with the runtime `KernelCompiler` (CPU only, no device), the AMDGPU
+//!   metadata of the object is read without decoding and compared with the contract through
+//!   `check_export`. Skipped with a printed reason when no hipcc resolves.
 //! * **Deliberately broken fixtures** (`broken_*`): each corrupts one fact of real evidence or
 //!   of a leaked copy of a real contract and must fail with the named `Drift` / `AbiError`,
 //!   proving the check is live and not vacuously green. The recipe-interchange fixture runs
 //!   `validate_invocation` on the REAL contracts, i.e. the rejection happens before enqueue.
 //!
 //! What none of this proves: numeric or semantic equivalence of any kernel (the
-//! `NumericContractId`s are identities, not proofs); that a hipcc twin matches its contract
-//! (no offline object); the content of weight slabs or activation planes; or that the launcher
+//! `NumericContractId`s are identities, not proofs); that a hipcc twin's code (as opposed to its
+//! kernarg metadata) matches its contract; the content of weight slabs or activation planes; or that the launcher
 //! calls the contract (the launcher legs are tested in their own crates).
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -57,8 +61,13 @@ use hipfire_kernel_abi::{
     ExportEvidence, ExportV1, Expr, FormatId, InvocationV1, KernelAbiV1, ObjectRefV1,
     OperandBinding, Rule,
 };
+use peacemaker_ir::envelope::Source as IrSource;
 use peacemaker_ir::inst::{Abi, Arch as IrArch, Frontend};
+use peacemaker_ir::metadata::KernelMeta;
 use peacemaker_ir::Program;
+use peacemaker_isa::kernels::iu4_gemm::{
+    self as iu4_gen, ALayout as Iu4Layout, Epi as Iu4Epi, Spec as Iu4Spec,
+};
 use peacemaker_isa::kernels::mq6_i8_gemm::{
     self as mq6_gen,
     spec::{Epi, Spec as Mq6Spec, Tile},
@@ -68,6 +77,7 @@ use peacemaker_isa::kernels::qwen4_moe_sym_gfx11::{
     self as gfx11_gen, Codec as Gfx11Codec, Negative as Gfx11Negative, Spec as Gfx11Spec,
 };
 use peacemaker_isa::{Arch as IsaArch, KernargLayout};
+use peacemaker_lift::bundle::SourceCodec;
 use sha2::{Digest, Sha256};
 
 /// Embedded exports with no PeaceMaker generator path, as `(arch, symbol, reason)`. Exact: an
@@ -232,14 +242,237 @@ const GGML_CONVERT_SHIM_REASON: &str =
 
 /// Every `HipccSource` export `(arch, symbol)`: no offline object, so no metadata evidence.
 const EXPECTED_HIPCC_EXPORTS: &[(&str, &str)] = &[
+    ("gfx1100", "bf16_round_trip_f32_strided"),
+    ("gfx1100", "convert_f32_to_f16"),
+    ("gfx1100", "embedding_q8_batched"),
+    ("gfx1100", "ffn_moe_combine_f32"),
+    ("gfx1100", "ffn_moe_router_topk_f32"),
+    ("gfx1100", "ffn_round_bf16_f32"),
+    ("gfx1100", "ffn_single_expert_tables"),
+    ("gfx1100", "ffn_situ_grouped_f32"),
+    ("gfx1100", "ffn_situ_grouped_rotate_i8_gfx1201"),
+    ("gfx1100", "ffn_situ_rows_f32"),
+    ("gfx1100", "gemm_bf16_xbf16_small_rows_s1"),
+    ("gfx1100", "gemm_bf16_xbf16_small_rows_s4"),
+    ("gfx1100", "gemm_bf16_xbf16_small_rows_s8"),
+    ("gfx1100", "gemm_bf16_xf32_batched"),
+    ("gfx1100", "gemm_bf16_xf32_small_rows_r1"),
+    ("gfx1100", "gemm_bf16_xf32_small_rows_r4"),
+    ("gfx1100", "gemm_bf16_xf32_small_rows_r8"),
+    ("gfx1100", "gemm_f32_batched"),
+    ("gfx1100", "gemm_mq4g256v2_moe_grouped_wmma_k2"),
+    ("gfx1100", "gemm_mq8g256_mmq_i8_gfx11_t128x128_wa"),
+    ("gfx1100", "gemm_mq8g256_mmq_i8_gfx11_t128x128_wa_bf16"),
+    ("gfx1100", "gemm_mq8g256_mmq_i8_gfx11_t128x128_wb"),
+    ("gfx1100", "gemm_mq8g256_mmq_i8_gfx11_t128x128_wb_bf16"),
+    ("gfx1100", "gemm_mq8g256_mmq_i8_gfx11_t64x128_wa"),
+    ("gfx1100", "gemm_mq8g256_mmq_i8_gfx11_t64x128_wa_bf16"),
+    ("gfx1100", "gemm_mq8g256_mmq_i8_gfx11_t64x128_wb"),
+    ("gfx1100", "gemm_mq8g256_mmq_i8_gfx11_t64x128_wb_bf16"),
+    ("gfx1100", "gemm_mq8g256_mmq_i8_gfx11_t64x64_wa"),
+    ("gfx1100", "gemm_mq8g256_mmq_i8_gfx11_t64x64_wa_bf16"),
+    ("gfx1100", "gemm_mq8g256_mmq_i8_gfx11_t64x64_wb"),
+    ("gfx1100", "gemm_mq8g256_mmq_i8_gfx11_t64x64_wb_bf16"),
+    ("gfx1100", "gemm_q8_0_wmma"),
+    ("gfx1100", "gemv_mq8g256"),
+    ("gfx1100", "gemv_mq8g256_b_r10_u1_w4_p1"),
+    ("gfx1100", "gemv_mq8g256_b_r11_u1_w4_p1"),
+    ("gfx1100", "gemv_mq8g256_b_r12_u1_w4_p1"),
+    ("gfx1100", "gemv_mq8g256_b_r13_u1_w4_p1"),
+    ("gfx1100", "gemv_mq8g256_b_r14_u1_w4_p1"),
+    ("gfx1100", "gemv_mq8g256_b_r15_u1_w4_p1"),
+    ("gfx1100", "gemv_mq8g256_b_r16_u1_w4_p1"),
+    ("gfx1100", "gemv_mq8g256_b_r1_u1_w4_p1"),
+    ("gfx1100", "gemv_mq8g256_b_r2_u1_w4_p1"),
+    ("gfx1100", "gemv_mq8g256_b_r3_u1_w4_p1"),
+    ("gfx1100", "gemv_mq8g256_b_r4_u1_w4_p1"),
+    ("gfx1100", "gemv_mq8g256_b_r5_u1_w4_p1"),
+    ("gfx1100", "gemv_mq8g256_b_r6_u1_w4_p1"),
+    ("gfx1100", "gemv_mq8g256_b_r7_u1_w4_p1"),
+    ("gfx1100", "gemv_mq8g256_b_r8_u1_w4_p1"),
+    ("gfx1100", "gemv_mq8g256_b_r9_u1_w4_p1"),
+    ("gfx1100", "gemv_mq8g256_bx_r1_u10_w20_p1"),
+    ("gfx1100", "gemv_mq8g256_bx_r1_u1_w10_p1"),
+    ("gfx1100", "gemv_mq8g256_bx_r1_u5_w24_p1"),
+    ("gfx1100", "gemv_mq8g256_bx_r2_u10_w20_p1"),
+    ("gfx1100", "gemv_mq8g256_bx_r2_u1_w10_p1"),
+    ("gfx1100", "gemv_mq8g256_bx_r2_u5_w24_p1"),
+    ("gfx1100", "gemv_q8_0"),
+    ("gfx1100", "latent_attention_flash_prefill"),
+    ("gfx1100", "latent_attention_flash_prefill_fa2_q128w8"),
+    ("gfx1100", "latent_attention_flash_prefill_fa2_q8_q128w8"),
+    ("gfx1100", "latent_attention_flash_prefill_q8"),
+    ("gfx1100", "moe_scatter_fused_k8"),
+    ("gfx1100", "mq8_rotate_quantize_x_batched"),
+    ("gfx1100", "mq_rotate_x"),
+    ("gfx1100", "raon_rda_conv_prepare_w128_f32"),
+    ("gfx1100", "rotate_x_mq_awq"),
     ("gfx1151", "gemm_mq6g256v2_mmq_i8_set_bf16_gfx11"),
     ("gfx1151", "gemm_mq6g256v2_mmq_i8_set_bf16_gfx11_t256"),
     ("gfx1151", "gemm_mq6g256v2_mmq_i8_set_gfx11"),
     ("gfx1151", "gemm_mq6g256v2_mmq_i8_set_gfx11_t256"),
     ("gfx1151", "qwen4_moe_down_iu4_sym_gfx1151_nt4"),
     ("gfx1151", "qwen4_moe_gate_up_silu_iu4_sym_gfx1151_nt4"),
+    ("gfx1201", "bf16_round_trip_f32_strided"),
+    ("gfx1201", "causal_conv_depthwise_silu_rows_f32"),
+    ("gfx1201", "convert_f32_to_f16"),
+    ("gfx1201", "embedding_q8_batched"),
+    ("gfx1201", "ffn_moe_combine_f32"),
+    ("gfx1201", "ffn_moe_combine_f32_w2"),
+    ("gfx1201", "ffn_moe_router_topk_f32"),
+    ("gfx1201", "ffn_round_bf16_f32"),
+    ("gfx1201", "ffn_single_expert_tables"),
+    ("gfx1201", "ffn_situ_grouped_f32"),
+    ("gfx1201", "ffn_situ_grouped_rotate_i8_gfx1201"),
+    ("gfx1201", "ffn_situ_rows_f32"),
+    ("gfx1201", "ffn_situ_rows_rotate_i8_gfx1201"),
+    ("gfx1201", "gated_delta_net_vector_serial_f32"),
+    ("gfx1201", "gated_delta_vector_chunk_prep_gfx12"),
+    ("gfx1201", "gated_delta_vector_chunk_scan_gfx12"),
+    ("gfx1201", "gated_rmsnorm_sigmoid_rows_f32"),
+    ("gfx1201", "gated_rmsnorm_sigmoid_rows_w128_f32"),
+    ("gfx1201", "gemm_bf16_xbf16_small_rows_s1"),
+    ("gfx1201", "gemm_bf16_xbf16_small_rows_s4"),
+    ("gfx1201", "gemm_bf16_xbf16_small_rows_s8"),
+    ("gfx1201", "gemm_bf16_xf32_batched"),
+    ("gfx1201", "gemm_bf16_xf32_small_rows_r1"),
+    ("gfx1201", "gemm_bf16_xf32_small_rows_r4"),
+    ("gfx1201", "gemm_bf16_xf32_small_rows_r8"),
+    ("gfx1201", "gemm_bf16_xf32_tiled_rows"),
+    ("gfx1201", "gemm_bf16_xf32_tiled_rows_mp4"),
+    ("gfx1201", "gemm_f32_batched"),
+    ("gfx1201", "gemm_mq4g256v2_moe_grouped_wmma_gfx12"),
     ("gfx1201", "gemm_mq6g256v2_mmq_i8_set_bf16_gfx12"),
     ("gfx1201", "gemm_mq6g256v2_mmq_i8_set_gfx12"),
+    ("gfx1201", "gemm_mq8g256_mmq_i8_t128x128_wa"),
+    ("gfx1201", "gemm_mq8g256_mmq_i8_t128x128_wa_bf16"),
+    ("gfx1201", "gemm_mq8g256_mmq_i8_t128x128_wb"),
+    ("gfx1201", "gemm_mq8g256_mmq_i8_t128x128_wb_bf16"),
+    ("gfx1201", "gemm_mq8g256_mmq_i8_t128x64_wa"),
+    ("gfx1201", "gemm_mq8g256_mmq_i8_t128x64_wa_bf16"),
+    ("gfx1201", "gemm_mq8g256_mmq_i8_t128x64_wb"),
+    ("gfx1201", "gemm_mq8g256_mmq_i8_t128x64_wb_bf16"),
+    ("gfx1201", "gemm_mq8g256_mmq_i8_t64x64_wa"),
+    ("gfx1201", "gemm_mq8g256_mmq_i8_t64x64_wa_bf16"),
+    ("gfx1201", "gemm_mq8g256_mmq_i8_t64x64_wb"),
+    ("gfx1201", "gemm_mq8g256_mmq_i8_t64x64_wb_bf16"),
+    ("gfx1201", "gemm_q8_0_mmq_i8_t128x128_ps"),
+    ("gfx1201", "gemm_q8_0_mmq_i8_t128x128_ps_bf16"),
+    ("gfx1201", "gemm_q8_0_wmma_gfx12"),
+    ("gfx1201", "gemv_mq8g256"),
+    ("gfx1201", "gemv_mq8g256_b_r10_u1_w4_p1"),
+    ("gfx1201", "gemv_mq8g256_b_r11_u1_w4_p1"),
+    ("gfx1201", "gemv_mq8g256_b_r12_u1_w4_p1"),
+    ("gfx1201", "gemv_mq8g256_b_r13_u1_w4_p1"),
+    ("gfx1201", "gemv_mq8g256_b_r14_u1_w4_p1"),
+    ("gfx1201", "gemv_mq8g256_b_r15_u1_w4_p1"),
+    ("gfx1201", "gemv_mq8g256_b_r16_u1_w4_p1"),
+    ("gfx1201", "gemv_mq8g256_b_r1_u1_w4_p1"),
+    ("gfx1201", "gemv_mq8g256_b_r2_u1_w4_p1"),
+    ("gfx1201", "gemv_mq8g256_b_r3_u1_w4_p1"),
+    ("gfx1201", "gemv_mq8g256_b_r4_u1_w4_p1"),
+    ("gfx1201", "gemv_mq8g256_b_r5_u1_w4_p1"),
+    ("gfx1201", "gemv_mq8g256_b_r6_u1_w4_p1"),
+    ("gfx1201", "gemv_mq8g256_b_r7_u1_w4_p1"),
+    ("gfx1201", "gemv_mq8g256_b_r8_u1_w4_p1"),
+    ("gfx1201", "gemv_mq8g256_b_r9_u1_w4_p1"),
+    ("gfx1201", "gemv_mq8g256_bx_r1_u10_w20_p1"),
+    ("gfx1201", "gemv_mq8g256_bx_r1_u1_w10_p1"),
+    ("gfx1201", "gemv_mq8g256_bx_r1_u5_w24_p1"),
+    ("gfx1201", "gemv_mq8g256_bx_r2_u10_w20_p1"),
+    ("gfx1201", "gemv_mq8g256_bx_r2_u1_w10_p1"),
+    ("gfx1201", "gemv_mq8g256_bx_r2_u5_w24_p1"),
+    ("gfx1201", "gemv_q8_0"),
+    ("gfx1201", "latent_attention_absorb_pack_bf16"),
+    ("gfx1201", "latent_attention_flash_prefill"),
+    ("gfx1201", "latent_attention_flash_prefill_fa2_q128w8"),
+    ("gfx1201", "latent_attention_flash_prefill_fa2_q8_q128w8"),
+    ("gfx1201", "latent_attention_flash_prefill_q8"),
+    ("gfx1201", "latent_attention_gate_bf16"),
+    ("gfx1201", "latent_attention_gather_latent_f32"),
+    ("gfx1201", "latent_attention_rms_rows_bf16"),
+    ("gfx1201", "latent_attention_scatter_expanded_bf16"),
+    ("gfx1201", "latent_attention_scatter_expanded_q8"),
+    ("gfx1201", "latent_attention_split_kv_bf16"),
+    ("gfx1201", "lwmma_gemm_bf16_t2_m1_n1_multi"),
+    ("gfx1201", "lwmma_gemm_bf16_t2_m2_n1_multi"),
+    ("gfx1201", "lwmma_gemm_bf16_t2_m3_n1_multi"),
+    ("gfx1201", "lwmma_gemm_bf16_t2_m4_n1_multi"),
+    ("gfx1201", "lwmma_tile_bf16_t1_b32x32w2x1g4"),
+    ("gfx1201", "lwmma_tile_bf16_t1_b32x64w2x2"),
+    ("gfx1201", "lwmma_tile_bf16_t1_b64x64w4x1"),
+    ("gfx1201", "lwmma_tile_bf16_t2_b16x32w1x1g4"),
+    ("gfx1201", "lwmma_tile_bf16_t2_b32x128w2x2"),
+    ("gfx1201", "lwmma_tile_bf16_t2_b32x64w2x2"),
+    ("gfx1201", "lwmma_tile_bf16_t2_b64x128w2x4"),
+    ("gfx1201", "lwmma_tile_bf16_t2_b64x128w4x2"),
+    ("gfx1201", "lwmma_tile_bf16_t2_b64x64w4x1"),
+    ("gfx1201", "lwmma_tile_bf16_t2_b64x64w4x2"),
+    ("gfx1201", "moe_grouped_qt44_a8_sym_gfx1201_nt1r1"),
+    ("gfx1201", "moe_grouped_qt44_a8_sym_gfx1201_nt1r2"),
+    ("gfx1201", "moe_grouped_qt44_a8_sym_gfx1201_nt2r1"),
+    ("gfx1201", "moe_grouped_qt44_a8_sym_gfx1201_nt2r2"),
+    ("gfx1201", "moe_grouped_qt44_a8_sym_gfx1201_xlds_nt4r1w8"),
+    ("gfx1201", "moe_grouped_qt44_iu4_sym_gfx1201_nt1r1"),
+    ("gfx1201", "moe_grouped_qt44_iu4_sym_gfx1201_nt1r2"),
+    ("gfx1201", "moe_grouped_qt44_iu4_sym_gfx1201_nt2r1"),
+    ("gfx1201", "moe_grouped_qt44_iu4_sym_gfx1201_nt2r2"),
+    ("gfx1201", "moe_grouped_qt44_iu4_sym_gfx1201_nt4r1"),
+    ("gfx1201", "moe_route_scatter_top10_wide_f32"),
+    ("gfx1201", "moe_scatter_fused_k8"),
+    ("gfx1201", "moe_scatter_fused_top10_pmask"),
+    ("gfx1201", "mq8_rotate_quantize_x_batched"),
+    ("gfx1201", "mq_rotate_x"),
+    ("gfx1201", "quantize_int8_mmq_ds128"),
+    ("gfx1201", "quantize_x_q8_blk32"),
+    ("gfx1201", "qwen4_moe_ep_a8_gate_up_rot_planar_nt1"),
+    ("gfx1201", "qwen4_moe_ep_a8_gate_up_rot_planar_nt2"),
+    ("gfx1201", "raon_rda_conv_prepare_w128_f32"),
+    ("gfx1201", "raon_rda_prepare_f32"),
+    ("gfx1201", "rotate_x_mq_awq"),
+    ("gfx1201", "stream_mix_aggregate"),
+    ("gfx1201", "stream_mix_broadcast"),
+    ("gfx1201", "stream_mix_mean"),
+    ("gfx1201", "stream_mix_postmix"),
+    ("gfx1201", "stream_mix_postmix_bf16"),
+    ("gfx1201", "stream_mix_route_aggregate_n4_k10_bf16"),
+    ("gfx1201", "stream_mix_route_helmert"),
+    ("gfx1201", "topk8_partial_f32_rows"),
+    ("gfx1201", "topk8_rescore_mq6g256v2_k2560_rows"),
+    ("gfx1201", "gemm_mq6sym_i8_set_bf16_gfx1201"),
+    ("gfx1201", "gemm_mq6sym_i8_set_bf16_m32n16_gfx1201"),
+    ("gfx1201", "gemm_mq6sym_i8_set_bf16_m32n32_gfx1201"),
+    ("gfx1201", "gemm_mq6sym_i8_set_bf16_m64n16_gfx1201"),
+    ("gfx1201", "gemm_mq6sym_i8_set_bf16_m64n16y_gfx1201"),
+    ("gfx1201", "gemm_mq6sym_i8_set_bf16_m64n32_gfx1201"),
+    ("gfx1201", "gemm_mq6sym_i8_set_bf16_m64n48_gfx1201"),
+    ("gfx1201", "gemm_mq6sym_i8_set_gfx1201"),
+    ("gfx1201", "gemm_mq6sym_i8_set_m32n16_gfx1201"),
+    ("gfx1201", "gemm_mq6sym_i8_set_m32n32_gfx1201"),
+    ("gfx1201", "gemm_mq6sym_i8_set_m64n16_gfx1201"),
+    ("gfx1201", "gemm_mq6sym_i8_set_m64n16y_gfx1201"),
+    ("gfx1201", "gemm_mq6sym_i8_set_m32n32_x4_gfx1201"),
+    ("gfx1201", "gemm_mq6sym_i8_set_m64n16_x4_gfx1201"),
+    ("gfx1201", "gemm_mq6sym_i8_set_m64n16y_x4_gfx1201"),
+    ("gfx1201", "gemm_mq6sym_i8_set_m64n48_x4_gfx1201"),
+    ("gfx1201", "gemm_mq6sym_i8_set_m64n32_gfx1201"),
+    ("gfx1201", "gemm_mq6sym_i8_set_m64n48_gfx1201"),
+    ("gfx1201", "gemv_mq6sym_i8_rows_r1_bf16_gfx1201"),
+    ("gfx1201", "gemv_mq6sym_i8_rows_r1_gfx1201"),
+    ("gfx1201", "gemv_mq6sym_i8_rows_r2_bf16_gfx1201"),
+    ("gfx1201", "gemv_mq6sym_i8_rows_r2_gfx1201"),
+    ("gfx1201", "gemv_mq6sym_i8_rows_r3_bf16_gfx1201"),
+    ("gfx1201", "gemv_mq6sym_i8_rows_r3_gfx1201"),
+    ("gfx1201", "gemv_mq6sym_i8_rows_r4_bf16_gfx1201"),
+    ("gfx1201", "gemv_mq6sym_i8_rows_r4_gfx1201"),
+    ("gfx1201", "gemv_mq6sym_i8_rows_r5_bf16_gfx1201"),
+    ("gfx1201", "gemv_mq6sym_i8_rows_r5_gfx1201"),
+    ("gfx1201", "gemv_mq6sym_i8_rows_r6_bf16_gfx1201"),
+    ("gfx1201", "gemv_mq6sym_i8_rows_r6_gfx1201"),
+    ("gfx1201", "gemv_mq6sym_i8_rows_r7_bf16_gfx1201"),
+    ("gfx1201", "gemv_mq6sym_i8_rows_r7_gfx1201"),
+    ("gfx1201", "gemv_mq6sym_i8_rows_r8_bf16_gfx1201"),
+    ("gfx1201", "gemv_mq6sym_i8_rows_r8_gfx1201"),
 ];
 
 // ---- shared helpers ------------------------------------------------------------------
@@ -347,37 +580,72 @@ fn object_evidence(export: &ExportV1) -> Result<ExportEvidence, String> {
     let object = OBJECTS
         .get(artifact)
         .ok_or_else(|| format!("{artifact}: object was not lifted"))?;
-    let kernel = object
-        .program
+    program_evidence(
+        export,
+        &program_meta(&object.program),
+        artifact,
+        Some(object.sha256.clone()),
+    )
+}
+
+/// The per-kernel AMDGPU metadata of one code object (`None`: the entry has no HSA metadata).
+struct ObjectMeta<'a> {
+    arch: IrArch,
+    kernels: Vec<(String, Option<&'a KernelMeta>)>,
+}
+
+fn program_meta(program: &Program) -> ObjectMeta<'_> {
+    ObjectMeta {
+        arch: program.target.arch,
+        kernels: program
+            .kernels
+            .iter()
+            .map(|k| {
+                let name = k
+                    .symbol
+                    .0
+                    .strip_suffix(".kd")
+                    .unwrap_or(k.symbol.0.as_str());
+                let meta = match &k.abi {
+                    Abi::Hsa { metadata, .. } => Some(&metadata.parsed),
+                    _ => None,
+                };
+                (name.to_string(), meta)
+            })
+            .collect(),
+    }
+}
+
+/// `ExportEvidence` of `export` from the AMDGPU metadata of `object` (named `artifact` in
+/// messages); `sha256` is the object identity to attach, if any.
+fn program_evidence(
+    export: &ExportV1,
+    object: &ObjectMeta<'_>,
+    artifact: &str,
+    sha256: Option<String>,
+) -> Result<ExportEvidence, String> {
+    let (_, meta) = object
         .kernels
         .iter()
-        .find(|k| {
-            k.symbol
-                .0
-                .strip_suffix(".kd")
-                .unwrap_or(k.symbol.0.as_str())
-                == export.symbol
-        })
+        .find(|(name, _)| name == export.symbol)
         .ok_or_else(|| {
             format!(
                 "{}: symbol is missing from {artifact} (kernels: {:?})",
                 export.symbol,
                 object
-                    .program
                     .kernels
                     .iter()
-                    .map(|k| k.symbol.0.as_str())
+                    .map(|(n, _)| n.as_str())
                     .collect::<Vec<_>>()
             )
         })?;
-    let Abi::Hsa { metadata, .. } = &kernel.abi else {
+    let Some(meta) = meta else {
         return Err(format!(
             "{}: {artifact} entry carries no HSA metadata",
             export.symbol
         ));
     };
-    let meta = &metadata.parsed;
-    let arch = match object.program.target.arch {
+    let arch = match object.arch {
         IrArch::Gfx1100 => Arch::Gfx1100,
         IrArch::Gfx1151 => Arch::Gfx1151,
         IrArch::Gfx1201 => Arch::Gfx1201,
@@ -411,7 +679,7 @@ fn object_evidence(export: &ExportV1) -> Result<ExportEvidence, String> {
         dynamic_lds: None,
         group_segment_fixed: Some(meta.group_segment_fixed_size),
         wave: Some(meta.wavefront_size),
-        object_sha256: Some(object.sha256.clone()),
+        object_sha256: sha256,
     })
 }
 
@@ -672,15 +940,20 @@ static GENERATORS: LazyLock<Vec<GenEntry>> = LazyLock::new(|| {
 
     // MoE: the gfx1151/gfx1201 modules of every codec (MQ4, MQ3-I4 W3, E8P-I4).
     for arch in [IsaArch::Gfx1151, IsaArch::Gfx1201] {
-        for codec in [WeightCodec::Mq4Sym, WeightCodec::Mq3I4, WeightCodec::E8pI4] {
+        for codec in [
+            WeightCodec::Mq4Sym,
+            WeightCodec::Mq3I4,
+            WeightCodec::E8pI4,
+            WeightCodec::Mq4SymPlanar,
+        ] {
             for spec in moe_gen::module_specs_codec(arch, codec) {
                 entries.push(moe_entry(spec));
             }
         }
     }
-    // MoE: the gfx11 NT1 module (gfx1100 MQ4 + E8P, gfx1151 E8P).
+    // MoE: the gfx11 NT1 module (gfx1100 MQ4 + W3 + E8P, gfx1151 E8P).
     for arch in gfx11_gen::ARCHES {
-        for codec in [Gfx11Codec::Mq4, Gfx11Codec::E8p] {
+        for codec in [Gfx11Codec::Mq4, Gfx11Codec::W3, Gfx11Codec::E8p] {
             for kind in Kind::ALL {
                 let spec = Gfx11Spec {
                     arch,
@@ -696,13 +969,16 @@ static GENERATORS: LazyLock<Vec<GenEntry>> = LazyLock::new(|| {
         }
     }
     // MoE: grouped-position down twins (`qwen4_moe_down_gp`) and the stream8 gate/up.
-    for nt in [4u8, 8u8] {
+    for (nt, codec) in [4u8, 8u8]
+        .into_iter()
+        .flat_map(|nt| [(nt, WeightCodec::Mq4Sym), (nt, WeightCodec::Mq4SymPlanar)])
+    {
         let spec = MoeSpec {
             arch: IsaArch::Gfx1201,
             kind: Kind::Down,
             nt,
             rr: 1,
-            codec: WeightCodec::Mq4Sym,
+            codec,
         };
         let emitted = moe_gen::emit_down_gp(spec)
             .unwrap_or_else(|e| panic!("qwen4_moe_sym::emit_down_gp nt{nt}: {e}"));
@@ -722,6 +998,32 @@ static GENERATORS: LazyLock<Vec<GenEntry>> = LazyLock::new(|| {
     let emitted = moe_gen::emit_gate_up_stream8(IsaArch::Gfx1151)
         .unwrap_or_else(|e| panic!("qwen4_moe_sym::emit_gate_up_stream8: {e}"));
     entries.push(emitted_entry(&emitted, stream8, "emit_gate_up_stream8"));
+    // IU4 GEMM: the fused A4 GDN input projection of the token (`_b1`) and slab (`_b1s`) bundles
+    // (`iu4_gemm::Spec::kernargs` states the 120 explicit bytes + K1's hidden block; the emitted
+    // assembly's metadata block states the static LDS, wave size and workgroup limit).
+    for act in [Iu4Layout::Token, Iu4Layout::Slab] {
+        let spec = Iu4Spec {
+            act,
+            ..Iu4Spec::control(Iu4Epi::QkvzaGdn)
+        };
+        let layout = spec.kernargs();
+        let emitted =
+            iu4_gen::emit(spec).unwrap_or_else(|e| panic!("iu4_gemm {}: {e}", spec.variant_name()));
+        let meta = parse_emitted_metadata(&emitted.s_text);
+        assert_eq!(meta.symbol, spec.symbol(), "{}", spec.variant_name());
+        entries.push(GenEntry {
+            arch: abi_arch(spec.arch),
+            symbol: spec.symbol(),
+            args: layout_args(&layout),
+            segment_bytes: layout.size,
+            threads: spec.tile.threads(),
+            dynamic_lds: Some(spec.lds_launch()),
+            group_segment_fixed: meta.group_segment_fixed,
+            wave: Some(meta.wave),
+            max_flat: Some(meta.max_flat),
+            origin: format!("iu4_gemm::Spec {}", spec.variant_name()),
+        });
+    }
     entries
 });
 
@@ -963,6 +1265,208 @@ fn broken_swapped_field_names() {
         .filter(|d| matches!(d, Drift::ArgName { .. }))
         .collect();
     assert_eq!(names.len(), 2, "{names:?}");
+}
+
+/// Gate of `hipcc_exports_match_compiled_metadata`: `Ok(toolchain id)` when a device compiler
+/// resolves, `Err(reason)` (the test then prints it and skips) when none does.
+fn hipcc_gate(toolchain: Option<String>) -> Result<String, String> {
+    toolchain.ok_or_else(|| {
+        "no hipcc resolves (KernelCompiler::local_toolchain_id() is None); the compiled-metadata \
+         leg needs a ROCm toolchain (CPU only, no GPU)"
+            .to_string()
+    })
+}
+
+#[test]
+fn hipcc_gate_skips_without_a_compiler() {
+    let reason = hipcc_gate(None).expect_err("no toolchain must skip");
+    assert!(reason.contains("no hipcc resolves"), "{reason}");
+    assert_eq!(
+        hipcc_gate(Some("AMD clang version 99".into())).as_deref(),
+        Ok("AMD clang version 99")
+    );
+}
+
+/// Every `HipccSource` export: its `source` is compiled with the runtime `KernelCompiler` for the
+/// export's arch (`compile_to_paths`: the JIT's own argv, module flags and per-source flags; no
+/// device), the object is lifted with `peacemaker_lift` and its AMDGPU metadata is compared with
+/// the contract through `check_export`. Each `(module, source, arch)` is compiled once. Skips
+/// (printing the reason) when no hipcc resolves.
+#[test]
+fn hipcc_exports_match_compiled_metadata() {
+    let toolchain = match hipcc_gate(rdna_compute::KernelCompiler::local_toolchain_id()) {
+        Ok(id) => id,
+        Err(reason) => {
+            eprintln!("SKIP hipcc_exports_match_compiled_metadata: {reason}");
+            return;
+        }
+    };
+
+    // (abi, export) pairs and the distinct compiles they need.
+    let mut pairs: Vec<(&'static KernelAbiV1, &'static ExportV1)> = Vec::new();
+    let mut jobs: BTreeSet<(&'static str, &'static str, &'static str)> = BTreeSet::new();
+    for abi in families::all() {
+        for export in abi.exports {
+            if let ObjectRefV1::HipccSource { module, source } = export.object {
+                pairs.push((abi, export));
+                jobs.insert((export.arch.name(), module, source));
+            }
+        }
+    }
+    assert!(!pairs.is_empty(), "no hipcc export was found");
+
+    // Keep the compiler's cache side effects out of $HOME (single-threaded setup: the only test
+    // of this file that touches a KernelCompiler).
+    let work = std::env::temp_dir().join(format!("kernel_abi_drift_hipcc_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(work.join("cache")).unwrap();
+    std::fs::create_dir_all(work.join("home")).unwrap();
+    std::env::set_var("HIPFIRE_KERNEL_CACHE", work.join("cache"));
+    std::env::set_var("HIPFIRE_HOME", work.join("home"));
+
+    let jobs: Vec<_> = jobs.into_iter().collect();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    type Compiled = (IrArch, Vec<(String, KernelMeta)>);
+    let results: std::sync::Mutex<BTreeMap<(&str, &str, &str), Result<Compiled, String>>> =
+        std::sync::Mutex::new(BTreeMap::new());
+    std::thread::scope(|scope| {
+        for _ in 0..8usize.min(jobs.len()) {
+            scope.spawn(|| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let Some(&(arch, module, source)) = jobs.get(i) else {
+                    break;
+                };
+                let built = (|| -> Result<Compiled, String> {
+                    let text = runtime_source(module, source)?;
+                    let dir = work.join(format!("{i}_{arch}_{module}"));
+                    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+                    let (src, obj) = (dir.join(format!("{module}.hip")), dir.join("o.hsaco"));
+                    let kc = rdna_compute::KernelCompiler::new(arch, String::new())
+                        .map_err(|e| e.to_string())?;
+                    kc.compile_to_paths(module, &text, &src, &obj)
+                        .map_err(|e| format!("hipcc failed: {e}"))?;
+                    let bytes = std::fs::read(&obj).map_err(|e| e.to_string())?;
+                    // Metadata only (envelope + AMDGPU note): the object is not decoded, so a
+                    // kernel using an instruction the lifter has no table for is still checked.
+                    let ir_arch = match arch {
+                        "gfx1100" => IrArch::Gfx1100,
+                        "gfx1151" => IrArch::Gfx1151,
+                        "gfx1201" => IrArch::Gfx1201,
+                        other => return Err(format!("{other}: no peacemaker arch")),
+                    };
+                    let (_, images) = IrSource::read(&bytes, ir_arch)
+                        .map_err(|e| format!("envelope read failed: {e}"))?;
+                    Ok((
+                        ir_arch,
+                        images
+                            .into_iter()
+                            .map(|k| (k.name, k.metadata.parsed))
+                            .collect(),
+                    ))
+                })();
+                results
+                    .lock()
+                    .unwrap()
+                    .insert((arch, module, source), built);
+            });
+        }
+    });
+    let results = results.into_inner().unwrap();
+
+    let mut failures = Vec::new();
+    let mut checked = 0usize;
+    for (abi, export) in pairs {
+        let ObjectRefV1::HipccSource { module, source } = export.object else {
+            unreachable!()
+        };
+        let key = (export.arch.name(), module, source);
+        let (ir_arch, kernels) = match &results[&key] {
+            Ok(p) => p,
+            Err(e) => {
+                failures.push(format!(
+                    "[{}] {} ({}, {module}, {source}): {e}",
+                    abi.id,
+                    export.symbol,
+                    export.arch.name()
+                ));
+                continue;
+            }
+        };
+        let object = ObjectMeta {
+            arch: *ir_arch,
+            kernels: kernels
+                .iter()
+                .map(|(n, m)| (n.strip_suffix(".kd").unwrap_or(n).to_string(), Some(m)))
+                .collect(),
+        };
+        let evidence = match program_evidence(export, &object, source, None) {
+            Ok(e) => e,
+            Err(e) => {
+                failures.push(format!("[{}] {e}", abi.id));
+                continue;
+            }
+        };
+        checked += 1;
+        let drifts = check_export(abi, export, &evidence);
+        if !drifts.is_empty() {
+            failures.push(drift_lines(abi, &drifts));
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&work);
+    eprintln!(
+        "hipcc_exports_match_compiled_metadata: {checked} exports checked against compiled metadata \
+         ({} distinct compiles, toolchain {toolchain})",
+        jobs.len()
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert!(checked > 0, "no hipcc export was checked");
+}
+
+/// The text the runtime hands hipcc for `module`: the `.hip` file, behind the `block_i8_128`
+/// prelude the MQ6 INT8 GEMM modules get in `rdna_compute::kernels` (`GEMM_MQ6G256V2_MMQ_I8_*`).
+fn runtime_source(module: &str, source: &str) -> Result<String, String> {
+    let read =
+        |p: &str| std::fs::read_to_string(repo_root().join(p)).map_err(|e| format!("{p}: {e}"));
+    let body = read(source)?;
+    Ok(match module {
+        "gemm_mq6g256v2_mmq_i8_gfx12" | "gemm_mq6g256v2_mmq_i8_gfx11" => format!(
+            "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n{}{body}",
+            read("kernels/src/block_i8_128_quant.hip")?
+        ),
+        "gemm_mq6g256v2_mmq_i8_gfx11_t256" => format!(
+            "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n#define I8_TILE 256\n{}{body}",
+            read("kernels/src/block_i8_128_quant.hip")?
+        ),
+        "gemv_mq6sym_i8_gfx1201" | "gemm_mq6sym_i8_gfx1201" => format!(
+            "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n{}{body}",
+            read("kernels/src/block_i8_128_quant.hip")?
+        ),
+        "ffn_grouped_activation_rotate_i8_gfx1201" => format!(
+            "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n\
+             #define HIPFIRE_FFN_GROUPED_ACTIVATION_NO_STANDALONE 1\n{}{}{}{}{body}",
+            read("kernels/src/block_i8_128_quant.hip")?,
+            read("kernels/src/block_i8_128_emit.hip")?,
+            read("kernels/src/mq_fwht256.h")?,
+            read("kernels/src/ffn_grouped_activation_pad.hip")?
+        ),
+        "topk8_rows_mq6g256v2" => format!(
+            "{}{}{body}",
+            read("kernels/src/topk8_select.hip")?,
+            read("kernels/src/qwen4_gemv_mq6g256v2.hip")?
+        ),
+        "moe_route_scatter_wide" => format!(
+            "{}{}{body}",
+            read("kernels/src/moe_router_softmax_top10_f32_fast.hip")?,
+            read("kernels/src/qwen4_moe_scatter_fused_k8.hip")?
+        ),
+        "qwen4_moe_ep_a8_rot_gfx12" => format!(
+            "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n{}{}{body}",
+            read("kernels/src/block_i8_128_quant.hip")?,
+            read("kernels/src/qwen4_moe_ep_a8.gfx12.hip")?
+        ),
+        _ => body,
+    })
 }
 
 /// Fixture c: a contract whose t128x256 export says 36864 B of dynamic LDS drifts from the

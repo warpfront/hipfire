@@ -68,6 +68,8 @@ mod pull_select;
 mod serve;
 mod setup;
 mod spill;
+#[cfg(all(test, unix))]
+mod test_exec;
 use crate::serve::complete::next_attempt_id;
 use crate::serve::http::request_id;
 use crate::serve::{detach_serve, parse_host_port, parse_pid_record, ServePidRecord};
@@ -220,7 +222,7 @@ enum ConfigAction {
 enum ConfigProfileAction {
     /// Merge a built-in or custom profile into the global sparse config.
     Set {
-        /// Built-in (`default`, `dev`, `hip`, `redline`) or custom profile name.
+        /// Built-in (`default`, `dev`, `hip`, `quality`, `redline`) or custom profile name.
         name: String,
     },
     /// Snapshot the current global sparse config as a new custom profile.
@@ -804,6 +806,13 @@ pub(crate) struct BenchArgs {
     /// Pair this with `--max-tokens` large enough for the span to close.
     #[arg(long = "reasoning-on")]
     reasoning_on: bool,
+    /// Hold EOS and stop sequences inactive until this many tokens were
+    /// generated (the daemon's vLLM-compatible `min_tokens`), so every measured
+    /// run decodes a fixed length even on a prompt the model would end early.
+    /// Clamped to each request's own `max_tokens`. Absent leaves the request
+    /// unchanged.
+    #[arg(long = "min-tokens")]
+    min_tokens: Option<usize>,
     /// Sweep closed-loop concurrency levels, e.g. `1,2,4,8`: at each level K,
     /// K client lanes drain the shape's N requests. Absent leaves bench on
     /// its single-stream path, unchanged.
@@ -1934,6 +1943,27 @@ fn pull_with_sidecar_pins(
     hotset_pins: &[ExpertHotsetPin],
     grandfather_pins: &[GrandfatheredMonolithic],
 ) -> Result<Option<PathBuf>> {
+    pull_with_all_pins(
+        paths,
+        args,
+        overlay_pins,
+        hotset_pins,
+        hipfire_registry::EP_EXPERT_HOTSET_PINS,
+        grandfather_pins,
+    )
+}
+
+/// [`pull_with_sidecar_pins`] with the EP2 expert-ranking pin table injectable too: on an
+/// already-installed base the pull fetches (SHA-verified) only the sidecars that are missing or
+/// stale and never downloads the base again.
+fn pull_with_all_pins(
+    paths: &Paths,
+    args: PullArgs,
+    overlay_pins: &[TrunkOverlayPin],
+    hotset_pins: &[ExpertHotsetPin],
+    ep_hotset_pins: &[ExpertHotsetPin],
+    grandfather_pins: &[GrandfatheredMonolithic],
+) -> Result<Option<PathBuf>> {
     // A retired tag is refused before any credential check or network work,
     // with or without --force: the registry no longer publishes it.
     if let Some(pin) = hipfire_registry::retired_model_named(&args.model, &retired_table()) {
@@ -2131,6 +2161,52 @@ fn pull_with_sidecar_pins(
             );
         }
     }
+    if let Some(hc8) =
+        hipfire_registry::hc8_sidecar_in(identity, hipfire_registry::HC8_SIDECAR_PINS)
+    {
+        if pull_select::hc8_sidecar_wanted(&ple::local_gpu_arches()) {
+            fetch_registry_sidecar(
+                &VerifiedCache::in_home(&paths.root),
+                "HC8 sidecar",
+                hc8.repo,
+                &hc8.sidecar,
+                &hipfire_config::memory::hc8_sidecar_path(&model_path),
+                args.force,
+            );
+        } else {
+            eprintln!(
+                "  Skipping HC8 sidecar (no gfx1201 GPU detected; the loader applies it only on exact gfx1201): {}",
+                hc8.sidecar.file
+            );
+        }
+    }
+    if choice.expert_hotset {
+        if let Some(units) = hipfire_registry::hot_units_sidecar_in(
+            identity,
+            hipfire_registry::HOT_UNITS_SIDECAR_PINS,
+        ) {
+            let destination = hipfire_config::memory::ep_hot_units_sidecar_path(&model_path);
+            let cache = VerifiedCache::in_home(&paths.root);
+            if units.published {
+                fetch_registry_sidecar(
+                    &cache,
+                    "EP hot-unit loan",
+                    units.repo,
+                    &units.sidecar,
+                    &destination,
+                    args.force,
+                );
+            } else {
+                report_unpublished_sidecar(
+                    &cache,
+                    "EP hot-unit loan",
+                    &units.sidecar,
+                    &destination,
+                    "the loan stays off",
+                );
+            }
+        }
+    }
     if choice.expert_hotset {
         if let Some(hotset) = hipfire_registry::expert_hotset_in(identity, hotset_pins) {
             fetch_registry_sidecar(
@@ -2141,6 +2217,32 @@ fn pull_with_sidecar_pins(
                 &hipfire_config::memory::expert_hotset_sidecar_path(&model_path),
                 args.force,
             );
+        }
+        if let Some(ep) = hipfire_registry::ep_expert_hotset_in(
+            identity,
+            ep_hotset_pins,
+            hipfire_config::memory::EP_EXPERT_HOTSET_DEFAULT_ON,
+        ) {
+            let destination = hipfire_config::memory::ep_expert_hotset_sidecar_path(&model_path);
+            let cache = VerifiedCache::in_home(&paths.root);
+            if ep.published {
+                fetch_registry_sidecar(
+                    &cache,
+                    "EP expert hot set",
+                    ep.repo,
+                    &ep.sidecar,
+                    &destination,
+                    args.force,
+                );
+            } else {
+                report_unpublished_sidecar(
+                    &cache,
+                    "EP expert hot set",
+                    &ep.sidecar,
+                    &destination,
+                    "placement falls back to whole-layer",
+                );
+            }
         }
     }
     for (name, sidecar) in &entry.heads {
@@ -2168,6 +2270,62 @@ fn pull_with_sidecar_pins(
         )?;
     }
     Ok(Some(model_path))
+}
+
+/// What sits at the path of a pinned sidecar that is not published yet.
+#[derive(Debug, PartialEq, Eq)]
+enum LocalUnpublished {
+    /// No file there.
+    Absent,
+    /// A file whose size and sha256 equal the pin.
+    Pinned,
+    /// A file that is not the pinned bytes (a local recalibration or a stale copy).
+    Different,
+}
+
+fn local_unpublished_state(
+    cache: &VerifiedCache,
+    sidecar: &Sidecar,
+    destination: &Path,
+) -> LocalUnpublished {
+    if !destination.is_file() {
+        return LocalUnpublished::Absent;
+    }
+    if existing_artifact_valid(
+        cache,
+        destination,
+        sidecar.sha256.as_deref(),
+        sidecar.size_bytes,
+    ) {
+        LocalUnpublished::Pinned
+    } else {
+        LocalUnpublished::Different
+    }
+}
+
+/// A pin that is not on Hugging Face yet is never requested and a local copy is never touched;
+/// report what the loader will see. `without` says what happens with no file.
+fn report_unpublished_sidecar(
+    cache: &VerifiedCache,
+    label: &str,
+    sidecar: &Sidecar,
+    destination: &Path,
+    without: &str,
+) {
+    match local_unpublished_state(cache, sidecar, destination) {
+        LocalUnpublished::Pinned => eprintln!(
+            "  {label} sidecar already present (matches the pin): {}",
+            sidecar.file
+        ),
+        LocalUnpublished::Different => eprintln!(
+            "  {label} sidecar present but not the pinned file (left untouched; the loader accepts it only if it binds this base): {}",
+            sidecar.file
+        ),
+        LocalUnpublished::Absent => eprintln!(
+            "  {label} sidecar not published yet; {without}: {}",
+            sidecar.file
+        ),
+    }
 }
 
 /// Fetch one optional sidecar to its local destination: an existing valid file is
@@ -2206,8 +2364,13 @@ fn fetch_registry_sidecar(
     }
 }
 
+/// Download URL of `file` for `entry`; the entry's own artifact may come from a
+/// versioned repo path (`hipfire_registry::ArtifactUpgradePin`), sidecars never.
 pub(crate) fn artifact_url(entry: &ModelEntry, file: &str) -> String {
-    artifact_url_in(&entry.repo, file)
+    artifact_url_in(
+        &entry.repo,
+        hipfire_registry::artifact_remote_file(entry, file),
+    )
 }
 
 fn artifact_url_in(repo: &str, file: &str) -> String {
@@ -2465,6 +2628,14 @@ fn rm_with_sidecar_pins(
                 targets.insert(hotset_path);
             }
         }
+        if let Some(ep) =
+            hipfire_registry::expert_hotset_in(entry, hipfire_registry::EP_EXPERT_HOTSET_PINS)
+        {
+            let ep_path = paths.models.join(&ep.sidecar.file);
+            if ep_path.is_file() {
+                targets.insert(ep_path);
+            }
+        }
         if let Some(sidecar) = entry.dflash.as_ref() {
             let sidecar_path = paths.models.join(&sidecar.file);
             if sidecar_path.is_file() {
@@ -2671,6 +2842,20 @@ fn rm_with_sidecar_pins(
     let hotset = hipfire_config::memory::expert_hotset_sidecar_path(&path);
     if hotset.is_file() {
         targets.insert(hotset);
+    }
+    let ep_hotset = hipfire_config::memory::ep_expert_hotset_sidecar_path(&path);
+    if ep_hotset.is_file() {
+        targets.insert(ep_hotset);
+    }
+    // The E4M3 HC sidecar (`<resolved file>.hc8`) rides with its base too.
+    let hc8 = hipfire_config::memory::hc8_sidecar_path(&path);
+    if hc8.is_file() {
+        targets.insert(hc8);
+    }
+    // The EP2 hot-unit loan sidecar (`<resolved file>.ep.hot-units`) too.
+    let hot_units = hipfire_config::memory::ep_hot_units_sidecar_path(&path);
+    if hot_units.is_file() {
+        targets.insert(hot_units);
     }
     if let Some((file, _)) = kept_mtp.as_ref() {
         // The stem sweep matched the shared head beside the trunk; keep it.
@@ -6749,13 +6934,11 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
     if args.exp && args.reasoning_on {
         bail!("--reasoning-on is not supported with --exp (its token budget is fixed at 128)");
     }
+    BENCH_MIN_TOKENS.store(
+        args.min_tokens.map_or(0, |tokens| tokens as u64),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     if let Some(spec) = args.concurrency.clone() {
-        if args.json {
-            bail!(
-                "--json is not supported with --concurrency; omit --json for the concurrency table, \
-                 or run without --concurrency for standard bench JSON (including kv_backend fields)"
-            );
-        }
         return bench_concurrency_command(paths, &args, &spec);
     }
     for (name, values) in [
@@ -6977,8 +7160,9 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
 /// when `--concurrency` is given; the single-stream path above is untouched.
 fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Result<()> {
     use crate::bench_concurrency::{
-        betterbench_workload, parse_concurrency, render_table, steady_workload, sweep_backend,
-        BackendSel, BenchShape, Driver, Point, WorkloadSel, STEADY_DEFAULT_MAX_TOKENS,
+        betterbench_workload, failed_overlap_cells, parse_concurrency, render_json, render_table,
+        steady_workload, sweep_backend, BackendSel, BenchShape, Driver, Point, WorkloadSel,
+        STEADY_DEFAULT_MAX_TOKENS,
     };
 
     let points = parse_concurrency(spec)?;
@@ -7136,7 +7320,23 @@ fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Res
         }
     }
 
-    println!("{}", render_table(&out, shape));
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&render_json(&out, shape))?
+        );
+    } else {
+        println!("{}", render_table(&out, shape));
+    }
+    // A K>1 cell whose every sample was serialized is not a concurrency
+    // result: the run fails.
+    let failed = failed_overlap_cells(&out);
+    if !failed.is_empty() {
+        bail!(
+            "overlap check failed (streams did not decode simultaneously, FAIL (serialized)): {}",
+            failed.join(", ")
+        );
+    }
     Ok(())
 }
 
@@ -7566,6 +7766,10 @@ fn open_bench_engine(
     apply_kv_axis_overrides(&mut params, args.kv_k.as_deref(), args.kv_v.as_deref())?;
     if let Some(selector) = args.speculation.as_deref() {
         apply_speculation_selector(&mut params, selector)?;
+        // Final effective selector wins, as on `run`: re-project the inherited
+        // `developer.dflash_draft` when `--spec` turned DFlash on over a
+        // config-off load.
+        project_dflash_draft(&mut params, developer_dflash_draft(&resolved));
     }
     // Registry sidecar for a final auto/on selector the config-time
     // load_params could not see (config-off + `bench --spec dflash`).
@@ -7638,6 +7842,16 @@ fn bench_generate_request(prompt: &str, max_tokens: u64) -> serde_json::Value {
     bench_generate_request_reasoning(prompt, max_tokens, false)
 }
 
+/// `--min-tokens` of the running bench (0 = unset), read by every bench generate request.
+static BENCH_MIN_TOKENS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The `min_tokens` a bench request carries: the flag clamped to the request's own
+/// `max_tokens` (the daemon rejects a larger value), none when unset or for a one-token
+/// request (the TTFT probe), where holding EOS inactive has no meaning.
+fn bench_min_tokens_field(flag: u64, max_tokens: u64) -> Option<u64> {
+    (flag > 0 && max_tokens > 1).then(|| flag.min(max_tokens))
+}
+
 fn bench_generate_request_reasoning(
     prompt: &str,
     max_tokens: u64,
@@ -7656,6 +7870,12 @@ fn bench_generate_request_reasoning(
         "max_tokens": max_tokens,
         "attempt_id": 1,
     });
+    if let Some(min_tokens) = bench_min_tokens_field(
+        BENCH_MIN_TOKENS.load(std::sync::atomic::Ordering::Relaxed),
+        max_tokens,
+    ) {
+        request["min_tokens"] = serde_json::json!(min_tokens);
+    }
     if !reasoning_on {
         request["max_think_tokens"] = serde_json::json!(1);
         request["assistant_prefix"] = serde_json::json!("closed_think");
@@ -8283,6 +8503,7 @@ fn profile_command(paths: &Paths, args: ProfileArgs) -> Result<()> {
             redline: false,
             speculation: None,
             reasoning_on: false,
+            min_tokens: None,
             concurrency: None,
             backend: "both".to_owned(),
             workload: "both".to_owned(),
@@ -11022,20 +11243,18 @@ mod tests {
     /// and return the argv it was launched with.
     #[cfg(unix)]
     fn recorded_quantizer_argv(label: &str, extra: &[&str]) -> Result<Vec<String>> {
-        use std::os::unix::fs::PermissionsExt;
         let paths = test_paths(label);
         let bin = paths.root.join("bin");
         fs::create_dir_all(&bin)?;
         let record = paths.root.join("argv.txt");
         let script = bin.join("hipfire-quantize");
-        fs::write(
+        crate::test_exec::write_executable(
             &script,
-            format!(
+            &format!(
                 "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = --output ]; then : > \"$2\"; fi\n  shift\ndone\n",
                 record.display()
             ),
-        )?;
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755))?;
+        );
         let input = paths.root.join("model");
         fs::create_dir_all(&input)?;
         let out = paths.root.join("out.hfq");
@@ -11047,30 +11266,11 @@ mod tests {
             out.display().to_string(),
         ];
         argv.extend(extra.iter().map(|s| s.to_string()));
-        // The script was just written: a sibling test's fork may still hold its
-        // write fd, so exec can fail ETXTBSY. Bounded retry like the fake-daemon
-        // spawns.
-        let mut attempt = 0u64;
-        loop {
-            let cli = Cli::try_parse_from(&argv)?;
-            let Some(Commands::Quantize(args)) = cli.command else {
-                panic!("expected quantize subcommand");
-            };
-            match quantize_command(&paths, args) {
-                Err(error)
-                    if attempt < 8
-                        && error
-                            .root_cause()
-                            .downcast_ref::<io::Error>()
-                            .and_then(io::Error::raw_os_error)
-                            == Some(libc::ETXTBSY) =>
-                {
-                    attempt += 1;
-                    thread::sleep(Duration::from_millis(5 * attempt));
-                }
-                other => break other?,
-            }
-        }
+        let cli = Cli::try_parse_from(&argv)?;
+        let Some(Commands::Quantize(args)) = cli.command else {
+            panic!("expected quantize subcommand");
+        };
+        quantize_command(&paths, args)?;
         let lines = fs::read_to_string(&record)?
             .lines()
             .map(str::to_owned)
@@ -13723,7 +13923,9 @@ effort = "high"
                 "qwen3.8:flash-next":{{"repo":"x","file":"qwen3.8-flash-next.mq4","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":16,{dflash}}},
                 "qwen3.8:27b-draft-mq4":{{"repo":"x","file":"qwen38-27b-draft.hfq","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":20,{dflash}}},
                 "qwen3.6:27b":{{"repo":"x","file":"qwen3.6-27b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x",{dflash}}},
-                "qwen3.5:9b":{{"repo":"x","file":"qwen3.5-9b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x",{dflash}}}
+                "qwen3.5:9b":{{"repo":"x","file":"qwen3.5-9b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x",{dflash}}},
+                "raon-1-mini-preview":{{"repo":"x","file":"raon-1-mini-preview.mq4-xts","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":19,"dflash":{{"file":"raon-1-mini-preview-dflash2.mq4"}}}},
+                "raon-1-mini-preview:draft":{{"repo":"x","file":"raon-1-mini-preview-dflash2.mq4","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":20}}
             }},
             "aliases":{{"qwen3.8":"qwen3.8:27b","qwen3.8:27b-mq4":"qwen3.8:27b"}}
         }}"#
@@ -13732,9 +13934,9 @@ effort = "high"
     }
 
     #[test]
-    pub(crate) fn resolved_for_model_defaults_dflash_auto_only_for_paired_qwen38_27b() {
+    pub(crate) fn resolved_for_model_defaults_dflash_auto_only_for_paired_qwen38_27b_and_raon() {
         // Registry layer lowers dflash=auto only for canonical qwen3.8:27b[-*]
-        // trunks that declare a dflash sidecar; BuiltIn off and MTP auto
+        // trunks and raon-1-mini-preview that declare a dflash sidecar; BuiltIn off and MTP auto
         // stay for everything else, including the no-registry path.
         let paths = test_paths("registry-dflash-default-scope");
         fs::create_dir_all(&paths.root).unwrap();
@@ -13748,6 +13950,8 @@ effort = "high"
             ("qwen3.8:27boops", "off"),
             ("qwen3.8:flash-next", "off"),
             ("qwen3.8:27b-draft-mq4", "off"),
+            ("raon-1-mini-preview", "auto"),
+            ("raon-1-mini-preview:draft", "off"),
             ("qwen3.6:27b", "off"),
             ("qwen3.5:9b", "off"),
         ] {
@@ -16624,7 +16828,10 @@ effort = "high"
 
     #[test]
     fn config_profile_helpers_merge_layer_and_are_global_only() {
-        assert_eq!(CONFIG_PROFILE_NAMES, &["default", "dev", "hip", "redline"]);
+        assert_eq!(
+            CONFIG_PROFILE_NAMES,
+            &["default", "dev", "hip", "quality", "redline"]
+        );
         let root = env::temp_dir().join(format!("hipfire-cli-profile-{}", std::process::id()));
         let config_paths = ConfigPaths::under(&root);
         let mut layer = ConfigLayer::default();
@@ -16799,12 +17006,10 @@ effort = "high"
     /// Scenario selection is driven by generate request prompt/model fixture tags.
     #[cfg(unix)]
     fn write_task11_fake_daemon(root: &Path) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         let daemon = root.join("task11-fake-daemon.py");
         // Python keeps correlated id/attempt_id, full reset ack, and commit handshake.
         let script = include_str!("serve/fake_daemon.py");
-        fs::write(&daemon, script).unwrap();
-        fs::set_permissions(&daemon, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_exec::write_executable(&daemon, script);
         daemon
     }
 
@@ -16854,33 +17059,9 @@ effort = "high"
             let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
             let process_config = hipfire_config::ProcessConfig::from_resolved(&resolved).unwrap();
 
-            // Bounded ETXTBSY retry like hipfire-client fake daemons.
-            const ETXTBSY: i32 = 26;
-            let mut engine = None;
-            let mut last = None;
-            for attempt in 0..8 {
-                match Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config, None) {
-                    Ok(e) => {
-                        engine = Some(e);
-                        break;
-                    }
-                    Err(hipfire_client::ClientError::Spawn { source, path })
-                        if source.raw_os_error() == Some(ETXTBSY) =>
-                    {
-                        last = Some(format!("spawn {path:?}: {source}"));
-                        thread::sleep(Duration::from_millis(
-                            5u64.saturating_mul(1 + attempt as u64),
-                        ));
-                    }
-                    Err(err) => panic!("Task11HttpHarness spawn non-retryable: {err}"),
-                }
-            }
-            let mut engine = engine.unwrap_or_else(|| {
-                panic!(
-                    "Task11HttpHarness exhausted ETXTBSY retries: {}",
-                    last.unwrap_or_default()
-                )
-            });
+            let mut engine =
+                Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config, None)
+                    .expect("Task11HttpHarness spawn");
             engine.ping().expect("fake daemon ping");
 
             let registry = hipfire_registry::bundled().unwrap();
@@ -16926,6 +17107,7 @@ effort = "high"
                     max_seq_override: None,
                     continuous_batch_size: 1,
                     vmm_batch: crate::serve::VmmBatchFlags::default(),
+                    batch_fallback: None,
                     multi_slot_enabled: false,
                     multi_slot_slots: 4,
                     multi_slot_ctx: 8192,
@@ -19660,6 +19842,7 @@ effort = "high"
             redline: false,
             speculation: None,
             reasoning_on: false,
+            min_tokens: None,
             concurrency: None,
             backend: "both".to_owned(),
             workload: "both".to_owned(),
@@ -19690,6 +19873,21 @@ effort = "high"
         })
         .unwrap();
         (ran, requests)
+    }
+
+    #[test]
+    fn bench_min_tokens_flag_parses_and_clamps_to_the_request_budget() {
+        assert_eq!(parse_bench_args(&[]).min_tokens, None);
+        assert_eq!(
+            parse_bench_args(&["--min-tokens", "256"]).min_tokens,
+            Some(256)
+        );
+        assert_eq!(bench_min_tokens_field(0, 256), None);
+        assert_eq!(bench_min_tokens_field(256, 256), Some(256));
+        assert_eq!(bench_min_tokens_field(512, 256), Some(256));
+        assert_eq!(bench_min_tokens_field(256, 1), None);
+        // Unset: the standard request carries no `min_tokens` key at all.
+        assert!(bench_generate_request("p", 128).get("min_tokens").is_none());
     }
 
     #[test]
@@ -21089,6 +21287,51 @@ effort = "high"
             Some(size)
         ));
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn local_unpublished_state_verifies_size_and_sha_against_the_pin() {
+        use sha2::{Digest, Sha256};
+        let paths = test_paths("hot-units-state");
+        fs::create_dir_all(&paths.models).unwrap();
+        let base = paths.models.join("base.mq4-xts-symtrunk");
+        let destination = hipfire_config::memory::ep_hot_units_sidecar_path(&base);
+        assert!(destination
+            .to_string_lossy()
+            .ends_with("base.mq4-xts-symtrunk.ep.hot-units"));
+        let content = br#"{"kind":"hipfire.qwen4.ep_hot_units"}"#;
+        let units = hipfire_registry::HotUnitsSidecar {
+            repo: "hipfire-models/qwen3.8-flash-next",
+            sidecar: Sidecar {
+                file: "base.mq4-xts-symtrunk.ep.hot-units".into(),
+                sha256: Some(format!("{:x}", Sha256::digest(content))),
+                size_bytes: Some(content.len() as u64),
+            },
+            ranking_sha256: hipfire_registry::HOT_UNITS_SIDECAR_PINS[0].ranking_sha256,
+            published: false,
+        };
+        let cache = VerifiedCache::disabled();
+        assert_eq!(
+            local_unpublished_state(&cache, &units.sidecar, &destination),
+            LocalUnpublished::Absent
+        );
+        fs::write(&destination, content).unwrap();
+        assert_eq!(
+            local_unpublished_state(&cache, &units.sidecar, &destination),
+            LocalUnpublished::Pinned
+        );
+        // Same size, other bytes: not the pinned calibration.
+        fs::write(&destination, br#"{"kind":"hipfire.qwen4.ep_hot_unitX"}"#).unwrap();
+        assert_eq!(
+            local_unpublished_state(&cache, &units.sidecar, &destination),
+            LocalUnpublished::Different
+        );
+        fs::write(&destination, b"{}").unwrap();
+        assert_eq!(
+            local_unpublished_state(&cache, &units.sidecar, &destination),
+            LocalUnpublished::Different
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
     }
 
     #[test]
@@ -24318,6 +24561,87 @@ effort = "high"
         fs::remove_dir_all(&paths.root).unwrap();
     }
 
+    const EP_HOTSET_BYTES: &[u8] = br#"{"kind":"hipfire.qwen4.expert_hotset","version":1,"ep":2}"#;
+    const EP_HOTSET_FILE: &str = "overlay-model.mq4.ep.expert-hotset";
+
+    fn ep_hotset_pins() -> Vec<ExpertHotsetPin> {
+        vec![ExpertHotsetPin {
+            base_sha256: ple_sha(OVERLAY_BASE).leak(),
+            base_size: OVERLAY_BASE.len() as u64,
+            repo: "test/repo",
+            file: EP_HOTSET_FILE,
+            sha256: ple_sha(EP_HOTSET_BYTES).leak(),
+            size_bytes: EP_HOTSET_BYTES.len() as u64,
+        }]
+    }
+
+    fn pull_ep_hotset_model(paths: &Paths) {
+        pull_with_all_pins(
+            paths,
+            PullArgs {
+                no_draft: true,
+                ..PullArgs::defaults("overlay-model")
+            },
+            &[],
+            &[],
+            &ep_hotset_pins(),
+            &grandfather_table(),
+        )
+        .unwrap();
+    }
+
+    /// `hipfire pull` on an already-installed model fetches a missing (or stale) EP2 expert-ranking
+    /// sidecar, SHA-verified, without downloading the base again: the second server holds the
+    /// sidecar ONLY, so a base request would 404 and fail the pull.
+    #[test]
+    fn pull_fetches_a_missing_ep_expert_hotset_on_an_installed_base_without_the_base() {
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _reg = EnvGuard::set("HIPFIRE_REGISTRY_URL", "https://example.com/test.json");
+        let paths = test_paths("ep-hotset-pull");
+        write_test_registry_cache(&paths, &overlay_registry_raw());
+        let ep_hotset = hipfire_config::memory::ep_expert_hotset_sidecar_path(
+            &paths.models.join("overlay-model.mq4"),
+        );
+        // Fresh install: base + sidecar.
+        let mut files = std::collections::HashMap::new();
+        files.insert("overlay-model.mq4".to_owned(), OVERLAY_BASE.to_vec());
+        files.insert(EP_HOTSET_FILE.to_owned(), EP_HOTSET_BYTES.to_vec());
+        let (base, handle) = exact_http_server(files);
+        let _hf = EnvGuard::set("HIPFIRE_HF_BASE", &base);
+        DOWNLOAD_INVOCATIONS.with(|count| count.set(0));
+        pull_ep_hotset_model(&paths);
+        handle.join().unwrap();
+        assert_eq!(fs::read(&ep_hotset).unwrap(), EP_HOTSET_BYTES);
+        DOWNLOAD_INVOCATIONS.with(|count| assert_eq!(count.get(), 2));
+
+        // Nothing missing: no request at all.
+        let (base, handle) = exact_http_server(std::collections::HashMap::new());
+        let _hf2 = EnvGuard::set("HIPFIRE_HF_BASE", &base);
+        pull_ep_hotset_model(&paths);
+        handle.join().unwrap();
+        DOWNLOAD_INVOCATIONS.with(|count| assert_eq!(count.get(), 2));
+
+        // The sidecar is removed: the pull fetches it back, and only it.
+        fs::remove_file(&ep_hotset).unwrap();
+        let mut files = std::collections::HashMap::new();
+        files.insert(EP_HOTSET_FILE.to_owned(), EP_HOTSET_BYTES.to_vec());
+        let (base, handle) = exact_http_server(files);
+        let _hf3 = EnvGuard::set("HIPFIRE_HF_BASE", &base);
+        pull_ep_hotset_model(&paths);
+        handle.join().unwrap();
+        DOWNLOAD_INVOCATIONS.with(|count| assert_eq!(count.get(), 3));
+        assert_eq!(fs::read(&ep_hotset).unwrap(), EP_HOTSET_BYTES);
+        assert_eq!(
+            ple_sha(&fs::read(&ep_hotset).unwrap()),
+            ep_hotset_pins()[0].sha256
+        );
+        assert_eq!(
+            fs::read(paths.models.join("overlay-model.mq4")).unwrap(),
+            OVERLAY_BASE
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
     #[test]
     fn pull_never_installs_an_expert_hotset_that_fails_verification() {
         let _env_lock = TEST_ENV_LOCK.lock().unwrap();
@@ -24406,6 +24730,32 @@ effort = "high"
         .unwrap();
         assert!(!paths.models.join("local.mq4").exists());
         assert!(!paths.models.join("local.mq4.expert-hotset").exists());
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn rm_removes_the_ep_expert_hotset_with_its_base() {
+        let paths = test_paths("ep-hotset-rm");
+        let registry = RegistryV1::parse(&overlay_registry_raw(), "ep hotset rm").unwrap();
+        fs::create_dir_all(&paths.models).unwrap();
+        let ep_file = "overlay-model.mq4.ep.expert-hotset";
+        for file in ["overlay-model.mq4", ep_file, "untouched.mq4"] {
+            fs::write(paths.models.join(file), b"x").unwrap();
+        }
+        rm_with_sidecar_pins(
+            &paths,
+            &registry,
+            &[],
+            &hotset_pins(),
+            RmArgs {
+                model: "overlay-model".into(),
+                yes: true,
+            },
+        )
+        .unwrap();
+        assert!(!paths.models.join("overlay-model.mq4").exists());
+        assert!(!paths.models.join(ep_file).exists());
+        assert!(paths.models.join("untouched.mq4").exists());
         fs::remove_dir_all(&paths.root).unwrap();
     }
 
@@ -24889,17 +25239,7 @@ effort = "high"
             let Some(Commands::Run(args)) = cli.command else {
                 panic!("expected run command");
             };
-            // The script was just written: bounded ETXTBSY retry like the
-            // other fake-daemon spawns.
-            for attempt in 0..8u64 {
-                match run_command(&paths, args.clone()) {
-                    Err(error) if format!("{error:#}").contains("os error 26") => {
-                        thread::sleep(Duration::from_millis(5 * (1 + attempt)));
-                    }
-                    other => return other,
-                }
-            }
-            bail!("fake daemon spawn kept failing with ETXTBSY")
+            run_command(&paths, args.clone())
         };
         let loads = || -> Vec<serde_json::Value> {
             let raw = fs::read_to_string(paths.root.join("requests.log")).unwrap_or_default();

@@ -10,9 +10,10 @@
 //! numeric candidate without that evidence is never promoted.
 
 use super::{
-    ktok, AttemptV1, ClaimPolicyV1, KldRunV1, KldTokenEvidenceV2, PromotionV1, Refusal,
+    ktok, rowclass, AttemptV1, ClaimPolicyV1, KldRunV1, KldTokenEvidenceV2, PromotionV1, Refusal,
     TuneEvidenceV1,
 };
+use serde_json::Value;
 
 pub const STAGES: [&str; 6] = [
     "m7",
@@ -369,27 +370,192 @@ pub fn kld_state_stage(ev: &TuneEvidenceV1, policy: &ClaimPolicyV1) -> Result<()
     Ok(())
 }
 
-fn run_stages_1_to_5(ev: &TuneEvidenceV1, policy: &ClaimPolicyV1) -> Result<(), Refusal> {
-    stage_m7(ev).map_err(|r| refuse(0, r))?;
-    stage_correctness(ev, policy).map_err(|r| refuse(1, r))?;
-    stage_abba(ev, policy).map_err(|r| refuse(2, r))?;
-    stage_noise(ev, policy).map_err(|r| refuse(3, r))?;
-    stage_confirm(ev, policy).map_err(|r| refuse(4, r))?;
-    Ok(())
+/// Stage name of the row-class gate ([`super::rowclass::gate`]). It is not in
+/// [`STAGES`]: it runs between `correctness` and `abba`, and only for records
+/// the gate [`applies`](super::rowclass::applies) to, which then also list it in
+/// the `passed` stages.
+pub const ROWCLASS_STAGE: &str = "rowclass";
+
+/// Stage name of the MoE route-evidence gate: MoE evidence whose every attempt
+/// ran only the `uniform` synthetic route is refused (`uniform-only route
+/// evidence`); `route=hist:` / `skew` evidence passes.
+pub const ROUTE_STAGE: &str = "route_evidence";
+
+/// `route=<kind>` of a shape text such as `a3b,T=8192,route=hist:f.json`: the
+/// kind before any `:` argument.
+fn route_in_shape_text(s: &str) -> Option<String> {
+    s.split(',')
+        .find_map(|kv| kv.trim().strip_prefix("route="))
+        .map(|v| v.split(':').next().unwrap_or(v).trim().to_owned())
 }
 
-/// Stages 1-5 all pass (KLD/state not considered).
+/// The route kind a pm_loop record states: top-level `route` (string, or an
+/// object's `kind`), else `shape.route`, else a `route=` key of a textual
+/// `shape`.
+fn record_route(rec: &Value) -> Option<String> {
+    let kind = |v: &Value| match v {
+        Value::String(s) => Some(s.split(':').next().unwrap_or(s).trim().to_owned()),
+        Value::Object(o) => o.get("kind").and_then(Value::as_str).map(str::to_owned),
+        _ => None,
+    };
+    if let Some(k) = rec.get("route").and_then(kind) {
+        return Some(k);
+    }
+    match rec.get("shape")? {
+        Value::String(s) => route_in_shape_text(s),
+        shape => shape.get("route").and_then(kind),
+    }
+}
+
+fn mentions_moe(v: Option<&Value>) -> bool {
+    v.and_then(Value::as_str)
+        .is_some_and(|s| s.to_ascii_lowercase().contains("moe"))
+}
+
+/// MoE evidence: a `moe` kernel/node name, or a `route` shape key anywhere.
+/// `Ok(true)` = the gate judged the evidence.
+fn stage_route(ev: &TuneEvidenceV1, recs: &[(String, Value)]) -> Result<bool, Refusal> {
+    let routes: Vec<(String, Option<String>)> = attempts(ev)
+        .map(|(n, _)| {
+            let rec = recs.iter().find(|(rn, _)| *rn == n).map(|(_, r)| r);
+            let route = rec
+                .and_then(record_route)
+                .or_else(|| route_in_shape_text(&ev.candidate.shape));
+            (n, route)
+        })
+        .collect();
+    let moe = ev.candidate.kernel.to_ascii_lowercase().contains("moe")
+        || recs
+            .iter()
+            .any(|(_, r)| mentions_moe(r.get("kernel")) || mentions_moe(r.get("node")))
+        || routes.iter().any(|(_, r)| r.is_some());
+    if !moe {
+        return Ok(false);
+    }
+    if routes.iter().all(|(_, r)| r.as_deref() == Some("uniform")) {
+        return Err(Refusal {
+            stage: ROUTE_STAGE.to_owned(),
+            reason: "uniform-only route evidence: every attempt ran route=uniform; \
+                     re-measure under route=hist:<route_hist.json> or route=skew"
+                .to_owned(),
+            passed: STAGES[..2].iter().map(|s| (*s).to_owned()).collect(),
+        });
+    }
+    Ok(true)
+}
+
+/// Parsed JSON of every attempt's `record_path` that can be read. An unreadable
+/// or non-JSON record is not a row-class record; its other stages still judge it.
+fn load_records(ev: &TuneEvidenceV1) -> Vec<(String, Value)> {
+    attempts(ev)
+        .filter_map(|(n, a)| {
+            let v = serde_json::from_slice(&std::fs::read(&a.record_path).ok()?).ok()?;
+            Some((n, v))
+        })
+        .collect()
+}
+
+/// Row-class gate over every governed record. `Ok(true)` = at least one record
+/// was judged.
+fn stage_rowclass(
+    recs: &[(String, Value)],
+    policy: &ClaimPolicyV1,
+    route_ran: bool,
+) -> Result<bool, Refusal> {
+    let mut ran = false;
+    for (n, r) in recs {
+        if !rowclass::applies(r, policy) {
+            continue;
+        }
+        ran = true;
+        rowclass::gate(r, policy).map_err(|e| Refusal {
+            stage: ROWCLASS_STAGE.to_owned(),
+            reason: format!("{n}: {e}"),
+            passed: passed_before(2, route_ran, false),
+        })?;
+    }
+    Ok(ran)
+}
+
+/// `passed` of a refusal at stage `idx` when the route / row-class gates did / did not run.
+fn passed_before(idx: usize, route_ran: bool, rowclass_ran: bool) -> Vec<String> {
+    let mut p: Vec<String> = STAGES[..idx].iter().map(|s| (*s).to_owned()).collect();
+    if idx >= 2 {
+        if route_ran {
+            p.insert(2, ROUTE_STAGE.to_owned());
+        }
+        if rowclass_ran {
+            p.insert(if route_ran { 3 } else { 2 }, ROWCLASS_STAGE.to_owned());
+        }
+    }
+    p
+}
+
+/// Stages 1-5; `Ok((route_ran, rowclass_ran))`.
+fn run_stages_1_to_5(
+    ev: &TuneEvidenceV1,
+    policy: &ClaimPolicyV1,
+    recs: &[(String, Value)],
+) -> Result<(bool, bool), Refusal> {
+    stage_m7(ev).map_err(|r| refuse(0, r))?;
+    stage_correctness(ev, policy).map_err(|r| refuse(1, r))?;
+    let route_ran = stage_route(ev, recs)?;
+    let ran = stage_rowclass(recs, policy, route_ran)?;
+    let late = |idx: usize, reason: String| Refusal {
+        passed: passed_before(idx, route_ran, ran),
+        ..refuse(idx, reason)
+    };
+    stage_abba(ev, policy).map_err(|r| late(2, r))?;
+    stage_noise(ev, policy).map_err(|r| late(3, r))?;
+    stage_confirm(ev, policy).map_err(|r| late(4, r))?;
+    Ok((route_ran, ran))
+}
+
+/// Stages 1-5 all pass (KLD/state not considered). Attempt records are read from
+/// their `record_path`s for the row-class gate; see [`is_winner_with_records`].
 pub fn is_winner(ev: &TuneEvidenceV1, policy: &ClaimPolicyV1) -> bool {
-    run_stages_1_to_5(ev, policy).is_ok()
+    is_winner_with_records(ev, policy, &load_records(ev))
+}
+
+/// [`is_winner`] with the attempts' parsed records (`(attempt name, record)`)
+/// supplied by the caller.
+pub fn is_winner_with_records(
+    ev: &TuneEvidenceV1,
+    policy: &ClaimPolicyV1,
+    recs: &[(String, Value)],
+) -> bool {
+    run_stages_1_to_5(ev, policy, recs).is_ok()
 }
 
 pub fn can_promote(ev: &TuneEvidenceV1, policy: &ClaimPolicyV1) -> Result<PromotionV1, Refusal> {
-    run_stages_1_to_5(ev, policy)?;
-    kld_state_stage(ev, policy).map_err(|r| refuse(5, r))?;
+    can_promote_with_records(ev, policy, &load_records(ev))
+}
+
+/// [`can_promote`] with the attempts' parsed records supplied by the caller. A
+/// `hip_loop --rowclasses` record is refused if any admitted row class is
+/// `Slower` (listing the classes), if its regime does not fit the LLC, or, for a
+/// `contract:` node whose contract admits several classes, if it has no sweep.
+pub fn can_promote_with_records(
+    ev: &TuneEvidenceV1,
+    policy: &ClaimPolicyV1,
+    recs: &[(String, Value)],
+) -> Result<PromotionV1, Refusal> {
+    let (route_ran, ran) = run_stages_1_to_5(ev, policy, recs)?;
+    kld_state_stage(ev, policy).map_err(|r| Refusal {
+        passed: passed_before(5, route_ran, ran),
+        ..refuse(5, r)
+    })?;
     let ratios: Vec<f64> = attempts(ev).filter_map(|(_, a)| a.block_ratio).collect();
     let g = (ratios.iter().map(|r| r.ln()).sum::<f64>() / ratios.len() as f64).exp();
+    let mut passed: Vec<String> = STAGES.iter().map(|s| (*s).to_owned()).collect();
+    if route_ran {
+        passed.insert(2, ROUTE_STAGE.to_owned());
+    }
+    if ran {
+        passed.insert(if route_ran { 3 } else { 2 }, ROWCLASS_STAGE.to_owned());
+    }
     Ok(PromotionV1 {
-        passed: STAGES.iter().map(|s| (*s).to_owned()).collect(),
+        passed,
         speedup: 1.0 / g,
     })
 }
@@ -847,5 +1013,208 @@ mod tests {
 
     fn s_ev(e: &TuneEvidenceV1) -> String {
         serde_json::to_string(e).unwrap()
+    }
+
+    fn rc_class(rows: u64, ratio: f64, pf: f64, ps: f64) -> Value {
+        serde_json::json!({
+            "rows": rows, "shape": "M=128,K=2560", "identical_to_baseline": true,
+            "timing": {"ratio_median": ratio, "p_faster": pf, "p_slower": ps, "rounds": []},
+            "admitted": {"baseline": true, "candidate": true},
+        })
+    }
+
+    fn rc_record(classes: Vec<Value>) -> Value {
+        serde_json::json!({
+            "node": "contract:generic_gemm.f32_tiled_rows.mpw16",
+            "vs": "contract:generic_gemm.f32_batched.wave_per_output",
+            "arch": "gfx1201", "regime": "hot", "bytes_per_call": 1.0e6, "rowclasses": classes,
+        })
+    }
+
+    #[test]
+    fn rowclass_veto_and_sweep_requirement_in_promotion() {
+        let p = ClaimPolicyV1::default();
+        let e = ev();
+        let recs = |r: Value| vec![("discovery".to_owned(), r)];
+        // Non-contract records keep today's behaviour: no records, no gate.
+        assert!(can_promote_with_records(&e, &p, &[]).is_ok());
+        let plain = serde_json::json!({"node": "mq6_res", "arch": "gfx1201"});
+        assert!(can_promote_with_records(&e, &p, &recs(plain)).is_ok());
+
+        // Faster everywhere admitted: promoted, and the stage is listed.
+        let good = rc_record(vec![
+            rc_class(1, 0.8, 1e-4, 1.0),
+            rc_class(512, 0.8, 1e-4, 1.0),
+        ]);
+        let g = can_promote_with_records(&e, &p, &recs(good.clone())).unwrap();
+        assert_eq!(g.passed[2], ROWCLASS_STAGE);
+        assert_eq!(g.passed.len(), 7);
+        assert!(is_winner_with_records(&e, &p, &recs(good)));
+
+        // Any admitted Slower class vetoes, naming the class.
+        let bad = rc_record(vec![
+            rc_class(1, 1.6, 1.0, 1e-4),
+            rc_class(512, 0.8, 1e-4, 1.0),
+        ]);
+        let r = can_promote_with_records(&e, &p, &recs(bad.clone())).unwrap_err();
+        assert_eq!(r.stage, ROWCLASS_STAGE);
+        assert_eq!(r.passed, STAGES[..2].to_vec());
+        assert!(
+            r.reason.contains("rows=1 ") && r.reason.contains("veto"),
+            "{}",
+            r.reason
+        );
+        assert!(!is_winner_with_records(&e, &p, &recs(bad)));
+
+        // Regime refusal flows through the gate.
+        let mut big = rc_record(vec![rc_class(512, 0.8, 1e-4, 1.0)]);
+        big["bytes_per_call"] = serde_json::json!(1u64 << 30);
+        let r = can_promote_with_records(&e, &p, &recs(big)).unwrap_err();
+        assert!(r.reason.contains("last-level cache"), "{}", r.reason);
+
+        // A single shape for a contract admitted at many classes needs a sweep.
+        let mut single = rc_record(vec![]);
+        single.as_object_mut().unwrap().remove("rowclasses");
+        let r = can_promote_with_records(&e, &p, &recs(single.clone())).unwrap_err();
+        assert_eq!(r.stage, ROWCLASS_STAGE);
+        assert!(r.reason.contains("no row-class sweep"), "{}", r.reason);
+        let off = ClaimPolicyV1 {
+            require_rowclasses: false,
+            ..p.clone()
+        };
+        assert!(can_promote_with_records(&e, &off, &recs(single)).is_ok());
+
+        // Later-stage refusals list the row-class stage once it ran.
+        let mut late = ev();
+        late.discovery.sign_p = Some(0.5);
+        let ok = rc_record(vec![rc_class(512, 0.8, 1e-4, 1.0)]);
+        let r = can_promote_with_records(&late, &p, &recs(ok)).unwrap_err();
+        assert_eq!(r.stage, "abba");
+        assert_eq!(r.passed, vec!["m7", "correctness", ROWCLASS_STAGE]);
+    }
+
+    #[test]
+    fn rowclass_records_are_read_from_record_path() {
+        let dir = std::env::temp_dir().join(format!("pmrc-promote-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rec.json");
+        let bad = rc_record(vec![
+            rc_class(1, 1.6, 1.0, 1e-4),
+            rc_class(512, 0.8, 1e-4, 1.0),
+        ]);
+        std::fs::write(&path, serde_json::to_vec(&bad).unwrap()).unwrap();
+        let mut e = ev();
+        e.discovery.record_path = path.to_str().unwrap().to_owned();
+        let p = ClaimPolicyV1::default();
+        assert_eq!(can_promote(&e, &p).unwrap_err().stage, ROWCLASS_STAGE);
+        assert!(!is_winner(&e, &p));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn moe_ev(shape: &str) -> TuneEvidenceV1 {
+        let mut e = ev();
+        e.candidate.kernel = "qwen4_moe_sym".into();
+        e.candidate.shape = shape.into();
+        e
+    }
+
+    fn moe_rec(route: Value) -> Value {
+        serde_json::json!({"kernel": "qwen4_moe_sym", "shape": {"E": 256, "route": route}})
+    }
+
+    #[test]
+    fn uniform_only_moe_evidence_is_refused() {
+        let p = ClaimPolicyV1::default();
+        // Textual shape on the candidate (no records readable).
+        let r = can_promote_with_records(&moe_ev("a3b,T=8192,route=uniform"), &p, &[]).unwrap_err();
+        assert_eq!(r.stage, ROUTE_STAGE);
+        assert!(
+            r.reason.contains("uniform-only route evidence"),
+            "{}",
+            r.reason
+        );
+        assert_eq!(r.passed, STAGES[..2].to_vec());
+        // Per-attempt records: shape.route string and an object `kind`.
+        let uni = |v: Value| {
+            vec![
+                ("discovery".to_owned(), moe_rec(v.clone())),
+                ("confirm[0]".to_owned(), moe_rec(v)),
+            ]
+        };
+        let e = moe_ev("a3b,T=8192");
+        for route in [
+            serde_json::json!("uniform"),
+            serde_json::json!({"kind": "uniform"}),
+        ] {
+            let r = can_promote_with_records(&e, &p, &uni(route)).unwrap_err();
+            assert_eq!(r.stage, ROUTE_STAGE);
+        }
+        // A `route` shape key makes the evidence MoE even if the kernel name is not.
+        let mut k = ev();
+        k.candidate.shape = "route=uniform".into();
+        assert_eq!(
+            can_promote_with_records(&k, &p, &[]).unwrap_err().stage,
+            ROUTE_STAGE
+        );
+        assert!(!is_winner_with_records(
+            &e,
+            &p,
+            &uni(serde_json::json!("uniform"))
+        ));
+    }
+
+    #[test]
+    fn hist_or_skew_moe_evidence_passes_the_route_gate() {
+        let p = ClaimPolicyV1::default();
+        for route in [
+            serde_json::json!("hist:/x/route_hist.json"),
+            serde_json::json!({"kind": "hist", "path": "/x/route_hist.json", "id": "ab", "layer": null}),
+            serde_json::json!("skew"),
+            serde_json::json!("skew5"),
+        ] {
+            let recs = vec![
+                ("discovery".to_owned(), moe_rec(route.clone())),
+                ("confirm[0]".to_owned(), moe_rec(route.clone())),
+            ];
+            let g = can_promote_with_records(&moe_ev("a3b"), &p, &recs).unwrap();
+            assert_eq!(g.passed[2], ROUTE_STAGE, "{route}");
+        }
+        assert!(can_promote_with_records(&moe_ev("a3b,T=8192,route=hist:f.json"), &p, &[]).is_ok());
+        // One non-uniform attempt is enough: not "every attempt uniform".
+        let mixed = vec![
+            (
+                "discovery".to_owned(),
+                moe_rec(serde_json::json!("uniform")),
+            ),
+            (
+                "confirm[0]".to_owned(),
+                moe_rec(serde_json::json!("hist:f.json")),
+            ),
+        ];
+        assert!(can_promote_with_records(&moe_ev("a3b"), &p, &mixed).is_ok());
+        // Non-MoE evidence is untouched, even with no route anywhere.
+        let g = can_promote_with_records(&ev(), &p, &[]).unwrap();
+        assert!(!g.passed.contains(&ROUTE_STAGE.to_owned()));
+    }
+
+    #[test]
+    fn route_gate_precedes_rowclass_and_later_stages_list_it() {
+        let p = ClaimPolicyV1::default();
+        let mut late = moe_ev("route=skew");
+        late.discovery.sign_p = Some(0.5);
+        let r = can_promote_with_records(&late, &p, &[]).unwrap_err();
+        assert_eq!(r.stage, "abba");
+        assert_eq!(r.passed, vec!["m7", "correctness", ROUTE_STAGE]);
+    }
+
+    #[test]
+    fn policy_defaults_for_rowclass_fields_load_from_old_json() {
+        let p: ClaimPolicyV1 = serde_json::from_str(
+            r#"{"sign_p_max":0.001,"min_effect":0.005,"confirm_processes":1,"aa_processes":3}"#,
+        )
+        .unwrap();
+        assert!(p.require_rowclasses && p.shares.is_empty());
+        let q: ClaimPolicyV1 = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+        assert_eq!(p, q);
     }
 }

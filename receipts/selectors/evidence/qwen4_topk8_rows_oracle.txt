@@ -1,0 +1,6 @@
+[devices] HIPFIRE_DEVICES -> index 1 gfx1201 0000:13:00.0 (ROCR_VISIBLE_DEVICES=GPU-e475645fe0200397 HIP_VISIBLE_DEVICES=0)
+[hip-bridge] GPU_PINNED_MIN_XFER_SIZE=100000: pageable weight copies staged out of reclaim
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.16)
+  pre-compiled kernels: /home/kaden/.hipfire_kernels/gfx1201
+PASS: 1154 cells (606 partial-only: a row with < 8 non-NaN logits), 678336 out bytes + 51822592 partial bytes compared, 0 mismatching cells; controls 18/18 detected (2 x-swap controls skipped: partial-only cell)
+rc=0

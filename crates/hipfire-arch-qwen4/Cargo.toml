@@ -24,9 +24,16 @@ rayon.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 railgun = { path = "../railgun", features = ["npu"] }
 
+# The D2 tail's slot/generation API (`railgun::sealed_table::generation`) is GPU-free and has no
+# platform code: off Linux the crate builds it without the HIP-interop `npu` feature.
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+railgun = { path = "../railgun" }
+
 [dev-dependencies]
 half.workspace = true
 memmap2.workspace = true
+# `mtp_head_reference_pin_hw` decodes the artifact head tensors the HIP head reads (qt44 / qt53 experts).
+hipfire-cpu = { path = "../hipfire-cpu" }
 saddle-quant = { path = "../saddle-quant" }
 # `greedy_mtp_identity_hw` loads through the product loader (`load_qwen4_rank`) so the
 # split-base PLE sidecar, trunk overlay and expert hot set are the serve load's own.
@@ -42,6 +49,10 @@ reference-parity = ["rdna-compute/lab", "hipfire-dispatch/test-utils"]
 # Tools-only S1 validation surface: the lab feature enables the S1
 lab = ["hipfire-dispatch/test-utils"]
 kernel-timing = ["lab", "rdna-compute/kernel-timing"]
+[[example]]
+name = "hc_pair_decode_oracle"
+required-features = ["lab"]
+
 [[example]]
 name = "qwen4_parity"
 required-features = ["reference-parity"]
@@ -74,6 +85,11 @@ required-features = ["lab", "reference-parity"]
 name = "qwen4_kld"
 required-features = ["lab"]
 
+# Served-route (EP) twin of `qwen4_kld eval --decode`: same references, estimator and decode route, loaded through the product loader.
+[[example]]
+name = "qwen4_ep_kld"
+required-features = ["lab"]
+
 [[example]]
 name = "qwen4_greedy_ids"
 required-features = ["lab"]
@@ -92,7 +108,23 @@ name = "qwen4_rows"
 required-features = ["lab"]
 
 [[example]]
+name = "qwen4_wide_grouped_moe_oracle"
+required-features = ["lab"]
+
+[[example]]
 name = "fn_lane_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "lane_q8_rows_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "lane_hc8_rows_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "ple_lanes_oracle"
 required-features = ["lab"]
 
 [[example]]
@@ -142,3 +174,24 @@ required-features = ["lab", "reference-parity"]
 [[test]]
 name = "slowlink_prefill_hw"
 required-features = ["lab", "reference-parity"]
+
+# Trunk-shard layer oracle: one real layer, unsharded vs the TP2 trunk shard on injected HC
+# streams (GPU for `run`; `plan`, `selftest` and `compare` are CPU-only).
+[[example]]
+name = "trunk_shard_layer_oracle"
+required-features = ["lab"]
+
+# EP unit-arena gather bench (mmap vs parallel O_DIRECT); developer-only.
+[[example]]
+name = "bench_ep_gather"
+required-features = ["lab"]
+
+# Lane WMMA screen: purpose-built WMMA HC mixer / shared-expert kernels (rdna_compute::lane_wmma{,_lab}) vs incumbents.
+[[example]]
+name = "hcwmma_screen"
+required-features = ["lab"]
+
+# HC8: 8-bit HC mixer weights (rdna_compute::hc8, PM module hc8_wmma_pm_gfx1201) vs BF16 incumbents.
+[[example]]
+name = "hc8_screen"
+required-features = ["lab"]

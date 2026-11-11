@@ -1,0 +1,439 @@
+{
+  "arch": "gfx1201",
+  "candidate": "contract:moe_grouped_qt44_a8_sym_gfx1201_xlds_nt4r1w8",
+  "classes": [
+    {
+      "admitted": false,
+      "p_faster": 1.0,
+      "p_slower": 0.000030517578125,
+      "ratio": 1.1601580671448075,
+      "rows": 96,
+      "shape": "M=2176,K=2560,n_experts=128,topk=6,route=hist:/home/kaden/qcal/release-0.4.3/pmrip/ev/s3/run1/raon.T4096.route_hist.json,vs=contract:moe_grouped_qt44_a8_sym_gfx1201_nt2r1,pool=1",
+      "verdict": "slower"
+    },
+    {
+      "admitted": false,
+      "p_faster": 0.003692626953125,
+      "p_slower": 0.99951171875,
+      "ratio": 0.9683184983041888,
+      "rows": 96,
+      "shape": "M=2560,K=1280,n_experts=128,topk=6,x_row_div=1,route=hist:/home/kaden/qcal/release-0.4.3/pmrip/ev/s3/run1/raon.T4096.route_hist.json,vs=contract:moe_grouped_qt44_a8_sym_gfx1201_nt2r1,pool=1",
+      "verdict": "tie"
+    },
+    {
+      "admitted": false,
+      "p_faster": 1.0,
+      "p_slower": 0.000030517578125,
+      "ratio": 1.0346501456170858,
+      "rows": 192,
+      "shape": "M=2176,K=2560,n_experts=128,topk=6,route=hist:/home/kaden/qcal/release-0.4.3/pmrip/ev/s3/run1/raon.T4096.route_hist.json,vs=contract:moe_grouped_qt44_a8_sym_gfx1201_nt2r1,pool=1",
+      "verdict": "slower"
+    },
+    {
+      "admitted": false,
+      "p_faster": 0.003692626953125,
+      "p_slower": 0.99951171875,
+      "ratio": 0.9940194053172516,
+      "rows": 192,
+      "shape": "M=2176,K=2560,n_experts=128,topk=6,route=hist:/home/kaden/qcal/release-0.4.3/pmrip/ev/s3/run1/raon.T4096.route_hist.json,vs=contract:moe_grouped_qt44_a8_sym_gfx1201_nt2r1,pool=1",
+      "verdict": "tie"
+    },
+    {
+      "admitted": false,
+      "p_faster": 1.0,
+      "p_slower": 0.000030517578125,
+      "ratio": 1.0350306907296754,
+      "rows": 192,
+      "shape": "M=2560,K=1280,n_experts=128,topk=6,x_row_div=1,route=hist:/home/kaden/qcal/release-0.4.3/pmrip/ev/s3/run1/raon.T4096.route_hist.json,vs=contract:moe_grouped_qt44_a8_sym_gfx1201_nt2r1,pool=1",
+      "verdict": "slower"
+    },
+    {
+      "admitted": false,
+      "p_faster": 1.0,
+      "p_slower": 0.000030517578125,
+      "ratio": 1.0342265718027637,
+      "rows": 192,
+      "shape": "M=2560,K=1280,n_experts=128,topk=6,x_row_div=1,route=hist:/home/kaden/qcal/release-0.4.3/pmrip/ev/s3/run1/raon.T4096.route_hist.json,vs=contract:moe_grouped_qt44_a8_sym_gfx1201_nt2r1,pool=1",
+      "verdict": "slower"
+    },
+    {
+      "admitted": false,
+      "p_faster": 1.0,
+      "p_slower": 0.000030517578125,
+      "ratio": 1.0276216573033277,
+      "rows": 288,
+      "shape": "M=2176,K=2560,n_experts=128,topk=6,route=hist:/home/kaden/qcal/release-0.4.3/pmrip/ev/s3/run1/raon.T4096.route_hist.json,vs=contract:moe_grouped_qt44_a8_sym_gfx1201_nt2r1,pool=1",
+      "verdict": "slower"
+    },
+    {
+      "admitted": false,
+      "p_faster": 1.0,
+      "p_slower": 0.000030517578125,
+      "ratio": 1.004785339626685,
+      "rows": 288,
+      "shape": "M=2560,K=1280,n_experts=128,topk=6,x_row_div=1,route=hist:/home/kaden/qcal/release-0.4.3/pmrip/ev/s3/run1/raon.T4096.route_hist.json,vs=contract:moe_grouped_qt44_a8_sym_gfx1201_nt2r1,pool=1",
+      "verdict": "tie"
+    },
+    {
+      "admitted": false,
+      "p_faster": 1.0,
+      "p_slower": 0.000030517578125,
+      "ratio": 1.032005017236025,
+      "rows": 384,
+      "shape": "M=2176,K=2560,n_experts=128,topk=6,route=hist:/home/kaden/qcal/release-0.4.3/pmrip/ev/s3/run1/raon.T4096.route_hist.json,vs=contract:moe_grouped_qt44_a8_sym_gfx1201_nt2r1,pool=1",
+      "verdict": "slower"
+    },
+    {
+      "admitted": false,
+      "p_faster": 1.0,
+      "p_slower": 0.000030517578125,
+      "ratio": 1.0328829858204511,
+      "rows": 384,
+      "shape": "M=2176,K=2560,n_experts=128,topk=6,route=hist:/home/kaden/qcal/release-0.4.3/pmrip/ev/s3/run1/raon.T4096.route_hist.json,vs=contract:moe_grouped_qt44_a8_sym_gfx1201_nt2r1,pool=1",
+      "verdict": "slower"
+    },
+    {
+      "admitted": false,
+      "p_faster": 0.9999694824218748,
+      "p_slower": 0.00048828125,
+      "ratio": 1.0061220844518022,
+      "rows": 384,
+      "shape": "M=2560,K=1280,n_experts=128,topk=6,x_row_div=1,route=hist:/home/kaden/qcal/release-0.4.3/pmrip/ev/s3/run1/raon.T4096.route_hist.json,vs=contract:moe_grouped_qt44_a8_sym_gfx1201_nt2r1,pool=1",
+      "verdict": "slower"
+    },
+    {
+      "admitted": false,
+      "p_faster": 1.0,
+      "p_slower": 0.000030517578125,
+      "ratio": 1.0388614665182194,
+      "rows": 384,
+      "shape": "M=2560,K=1280,n_experts=128,topk=6,x_row_div=1,route=hist:/home/kaden/qcal/release-0.4.3/pmrip/ev/s3/run1/raon.T4096.route_hist.json,vs=contract:moe_grouped_qt44_a8_sym_gfx1201_nt2r1,pool=1",
+      "verdict": "slower"
+    },
+    {
+      "admitted": false,
+      "p_faster": 1.0,
+      "p_slower": 0.000030517578125,
+      "ratio": 1.0790145160836222,
+      "rows": 480,
+      "shape": "M=2176,K=2560,n_experts=128,topk=6,route=hist:/home/kaden/qcal/release-0.4.3/pmrip/ev/s3/run1/raon.T4096.route_hist.json,vs=contract:moe_grouped_qt44_a8_sym_gfx1201_nt2r1,pool=1",
+      "verdict": "slower"
+    },
+    {
+      "admitted": false,
+      "p_faster": 1.0,
+      "p_slower": 0.000030517578125,
+      "ratio": 1.0141426008739238,
+      "rows": 480,
+      "shape": "M=2560,K=1280,n_experts=128,topk=6,x_row_div=1,route=hist:/home/kaden/qcal/release-0.4.3/pmrip/ev/s3/run1/raon.T4096.route_hist.json,vs=contract:moe_grouped_qt44_a8_sym_gfx1201_nt2r1,pool=1",
+      "verdict": "slower"
+    },
+    {
+      "admitted": false,
+      "p_faster": 1.0,
+      "p_slower": 0.000030517578125,
+      "ratio": 1.0360459350023277,
+      "rows": 576,
+      "shape": "M=2176,K=2560,n_experts=128,topk=6,route=hist:/home/kaden/qcal/release-0.4.3/pmrip/ev/s3/run1/raon.T4096.route_hist.json,vs=contract:moe_grouped_qt44_a8_sym_gfx1201_nt2r1,pool=1",
+      "verdict": "slower"
+    },
+    {
+      "admitted": false,
+      "p_faster": 1.0,
+      "p_slower": 0.000030517578125,
+      "ratio": 1.0293213434123325,
+      "rows": 576,
+      "shape": "M=2560,K=1280,n_experts=128,topk=6,x_row_div=1,route=hist:/home/kaden/qcal/release-0.4.3/pmrip/ev/s3/run1/raon.T4096.route_hist.json,vs=contract:moe_grouped_qt44_a8_sym_gfx1201_nt2r1,pool=1",
+      "verdict": "slower"
+    },
+    {
+      "admitted": false,
+      "p_faster": 1.0,
+      "p_slower": 0.000030517578125,
+      "ratio": 1.0167174977197946,
+      "rows": 672,
+      "shape": "M=2176,K=2560,n_experts=128,topk=6,route=hist:/home/kaden/qcal/release-0.4.3/pmrip/ev/s3/run1/raon.T4096.route_hist.json,vs=contract:moe_grouped_qt44_a8_sym_gfx1201_nt2r1,pool=1",
+      "verdict": "slower"
+    },
+    {
+      "admitted": false,
+      "p_faster": 1.0,
+      "p_slower": 0.000030517578125,
+      "ratio": 1.048243829245798,
+      "rows": 672,
+      "shape": "M=2560,K=1280,n_experts=128,topk=6,x_row_div=1,route=hist:/home/kaden/qcal/release-0.4.3/pmrip/ev/s3/run1/raon.T4096.route_hist.json,vs=contract:moe_grouped_qt44_a8_sym_gfx1201_nt2r1,pool=1",
+      "verdict": "slower"
+    },
+    {
+      "admitted": false,
+      "p_faster": 1.0,
+      "p_slower": 0.000030517578125,
+      "ratio": 1.015226945472788,
+      "rows": 768,
+      "shape": "M=2176,K=2560,n_experts=128,topk=6,route=hist:/home/kaden/qcal/release-0.4.3/pmrip/ev/s3/run1/raon.T4096.route_hist.json,vs=contract:moe_grouped_qt44_a8_sym_gfx1201_nt2r1,pool=1",
+      "verdict": "slower"
+    },
+    {
+      "admitted": false,
+      "p_faster": 1.0,
+      "p_slower": 0.000030517578125,
+      "ratio": 1.015638521404998,
+      "rows": 768,
+      "shape": "M=2176,K=2560,n_experts=128,topk=6,route=hist:/home/kaden/qcal/release-0.4.3/pmrip/ev/s3/run1/raon.T4096.route_hist.json,vs=contract:moe_grouped_qt44_a8_sym_gfx1201_nt2r1,pool=1",
+      "verdict": "slower"
+    },
+    {
+      "admitted": false,
+      "p_faster": 1.0,
+      "p_slower": 0.000030517578125,
+      "ratio": 1.0940665248450705,
+      "rows": 768,
+      "shape": "M=2560,K=1280,n_experts=128,topk=6,x_row_div=1,route=hist:/home/kaden/qcal/release-0.4.3/pmrip/ev/s3/run1/raon.T4096.route_hist.json,vs=contract:moe_grouped_qt44_a8_sym_gfx1201_nt2r1,pool=1",
+      "verdict": "slower"
+    },
+    {
+      "admitted": false,
+      "p_faster": 1.0,
+      "p_slower": 0.000030517578125,
+      "ratio": 1.055281502909826,
+      "rows": 768,
+      "shape": "M=2560,K=1280,n_experts=128,topk=6,x_row_div=1,route=hist:/home/kaden/qcal/release-0.4.3/pmrip/ev/s3/run1/raon.T4096.route_hist.json,vs=contract:moe_grouped_qt44_a8_sym_gfx1201_nt2r1,pool=1",
+      "verdict": "slower"
+    },
+    {
+      "admitted": false,
+      "p_faster": 0.8491210937499999,
+      "p_slower": 0.30361938476562494,
+      "ratio": 1.000361857291047,
+      "rows": 1152,
+      "shape": "M=2176,K=2560,n_experts=128,topk=6,route=hist:/home/kaden/qcal/release-0.4.3/pmrip/ev/s3/run1/raon.T4096.route_hist.json,vs=contract:moe_grouped_qt44_a8_sym_gfx1201_nt2r1,pool=1",
+      "verdict": "tie"
+    },
+    {
+      "admitted": false,
+      "p_faster": 1.0,
+      "p_slower": 0.000030517578125,
+      "ratio": 1.0198554339516204,
+      "rows": 1152,
+      "shape": "M=2560,K=1280,n_experts=128,topk=6,x_row_div=1,route=hist:/home/kaden/qcal/release-0.4.3/pmrip/ev/s3/run1/raon.T4096.route_hist.json,vs=contract:moe_grouped_qt44_a8_sym_gfx1201_nt2r1,pool=1",
+      "verdict": "slower"
+    },
+    {
+      "admitted": false,
+      "p_faster": 0.00048828125,
+      "p_slower": 0.9999694824218748,
+      "ratio": 0.9984294669019296,
+      "rows": 1536,
+      "shape": "M=2176,K=2560,n_experts=128,topk=6,route=hist:/home/kaden/qcal/release-0.4.3/pmrip/ev/s3/run1/raon.T4096.route_hist.json,vs=contract:moe_grouped_qt44_a8_sym_gfx1201_nt2r1,pool=1",
+      "verdict": "tie"
+    },
+    {
+      "admitted": false,
+      "p_faster": 1.0,
+      "p_slower": 0.000030517578125,
+      "ratio": 1.0046634630281288,
+      "rows": 1536,
+      "shape": "M=2560,K=1280,n_experts=128,topk=6,x_row_div=1,route=hist:/home/kaden/qcal/release-0.4.3/pmrip/ev/s3/run1/raon.T4096.route_hist.json,vs=contract:moe_grouped_qt44_a8_sym_gfx1201_nt2r1,pool=1",
+      "verdict": "tie"
+    },
+    {
+      "admitted": false,
+      "p_faster": 0.000030517578125,
+      "p_slower": 1.0,
+      "ratio": 0.9952467671266664,
+      "rows": 2112,
+      "shape": "M=2176,K=2560,n_experts=128,topk=6,route=hist:/home/kaden/qcal/release-0.4.3/pmrip/ev/s3/run1/raon.T4096.route_hist.json,vs=contract:moe_grouped_qt44_a8_sym_gfx1201_nt2r1,pool=1",
+      "verdict": "tie"
+    },
+    {
+      "admitted": false,
+      "p_faster": 0.00048828125,
+      "p_slower": 0.9999694824218748,
+      "ratio": 0.99409289662354,
+      "rows": 2112,
+      "shape": "M=2560,K=1280,n_experts=128,topk=6,x_row_div=1,route=hist:/home/kaden/qcal/release-0.4.3/pmrip/ev/s3/run1/raon.T4096.route_hist.json,vs=contract:moe_grouped_qt44_a8_sym_gfx1201_nt2r1,pool=1",
+      "verdict": "faster"
+    },
+    {
+      "admitted": true,
+      "p_faster": 0.000030517578125,
+      "p_slower": 1.0,
+      "ratio": 0.9939747613175466,
+      "rows": 2304,
+      "shape": "M=2176,K=2560,n_experts=128,topk=6,route=hist:/home/kaden/qcal/release-0.4.3/pmrip/ev/s3/run1/raon.T4096.route_hist.json,vs=contract:moe_grouped_qt44_a8_sym_gfx1201_nt2r1,pool=1",
+      "verdict": "faster"
+    },
+    {
+      "admitted": true,
+      "p_faster": 0.000030517578125,
+      "p_slower": 1.0,
+      "ratio": 0.9905139801258784,
+      "rows": 2304,
+      "shape": "M=2560,K=1280,n_experts=128,topk=6,x_row_div=1,route=hist:/home/kaden/qcal/release-0.4.3/pmrip/ev/s3/run1/raon.T4096.route_hist.json,vs=contract:moe_grouped_qt44_a8_sym_gfx1201_nt2r1,pool=1",
+      "verdict": "faster"
+    },
+    {
+      "admitted": true,
+      "p_faster": 0.000030517578125,
+      "p_slower": 1.0,
+      "ratio": 0.982204953563317,
+      "rows": 3456,
+      "shape": "M=2176,K=2560,n_experts=128,topk=6,route=hist:/home/kaden/qcal/release-0.4.3/pmrip/ev/s3/run1/raon.T4096.route_hist.json,vs=contract:moe_grouped_qt44_a8_sym_gfx1201_nt2r1,pool=1",
+      "verdict": "faster"
+    },
+    {
+      "admitted": true,
+      "p_faster": 0.000030517578125,
+      "p_slower": 1.0,
+      "ratio": 0.9778726520466194,
+      "rows": 3456,
+      "shape": "M=2560,K=1280,n_experts=128,topk=6,x_row_div=1,route=hist:/home/kaden/qcal/release-0.4.3/pmrip/ev/s3/run1/raon.T4096.route_hist.json,vs=contract:moe_grouped_qt44_a8_sym_gfx1201_nt2r1,pool=1",
+      "verdict": "faster"
+    },
+    {
+      "admitted": true,
+      "p_faster": 0.000030517578125,
+      "p_slower": 1.0,
+      "ratio": 0.9794499438583876,
+      "rows": 4992,
+      "shape": "M=2176,K=2560,n_experts=128,topk=6,route=hist:/home/kaden/qcal/release-0.4.3/pmrip/ev/s3/run1/raon.T4096.route_hist.json,vs=contract:moe_grouped_qt44_a8_sym_gfx1201_nt2r2,pool=1",
+      "verdict": "faster"
+    },
+    {
+      "admitted": true,
+      "p_faster": 0.000030517578125,
+      "p_slower": 1.0,
+      "ratio": 0.9824757836175714,
+      "rows": 4992,
+      "shape": "M=2560,K=1280,n_experts=128,topk=6,x_row_div=1,route=hist:/home/kaden/qcal/release-0.4.3/pmrip/ev/s3/run1/raon.T4096.route_hist.json,vs=contract:moe_grouped_qt44_a8_sym_gfx1201_nt2r2,pool=1",
+      "verdict": "faster"
+    },
+    {
+      "admitted": true,
+      "p_faster": 0.000030517578125,
+      "p_slower": 1.0,
+      "ratio": 0.9690244712366316,
+      "rows": 8064,
+      "shape": "M=2176,K=2560,n_experts=128,topk=6,route=hist:/home/kaden/qcal/release-0.4.3/pmrip/ev/s3/run1/raon.T4096.route_hist.json,vs=contract:moe_grouped_qt44_a8_sym_gfx1201_nt2r2,pool=1",
+      "verdict": "faster"
+    },
+    {
+      "admitted": true,
+      "p_faster": 0.000030517578125,
+      "p_slower": 1.0,
+      "ratio": 0.961290015339073,
+      "rows": 8064,
+      "shape": "M=2560,K=1280,n_experts=128,topk=6,x_row_div=1,route=hist:/home/kaden/qcal/release-0.4.3/pmrip/ev/s3/run1/raon.T4096.route_hist.json,vs=contract:moe_grouped_qt44_a8_sym_gfx1201_nt2r2,pool=1",
+      "verdict": "faster"
+    },
+    {
+      "admitted": true,
+      "p_faster": 0.000030517578125,
+      "p_slower": 1.0,
+      "ratio": 0.8804632487641778,
+      "rows": 14208,
+      "shape": "M=2176,K=2560,n_experts=128,topk=6,route=hist:/home/kaden/qcal/release-0.4.3/pmrip/ev/s3/run1/raon.T4096.route_hist.json,vs=contract:moe_grouped_qt44_a8_sym_gfx1201_nt2r2,pool=1",
+      "verdict": "faster"
+    },
+    {
+      "admitted": true,
+      "p_faster": 0.000030517578125,
+      "p_slower": 1.0,
+      "ratio": 0.8955846363012662,
+      "rows": 14208,
+      "shape": "M=2560,K=1280,n_experts=128,topk=6,x_row_div=1,route=hist:/home/kaden/qcal/release-0.4.3/pmrip/ev/s3/run1/raon.T4096.route_hist.json,vs=contract:moe_grouped_qt44_a8_sym_gfx1201_nt2r2,pool=1",
+      "verdict": "faster"
+    },
+    {
+      "admitted": true,
+      "p_faster": 0.000030517578125,
+      "p_slower": 1.0,
+      "ratio": 0.8253665877514894,
+      "rows": 26496,
+      "shape": "M=2176,K=2560,n_experts=128,topk=6,route=hist:/home/kaden/qcal/release-0.4.3/pmrip/ev/s3/run1/raon.T4096.route_hist.json,vs=contract:moe_grouped_qt44_a8_sym_gfx1201_nt2r2,pool=1",
+      "verdict": "faster"
+    },
+    {
+      "admitted": true,
+      "p_faster": 0.000030517578125,
+      "p_slower": 1.0,
+      "ratio": 0.8250563459758187,
+      "rows": 26496,
+      "shape": "M=2560,K=1280,n_experts=128,topk=6,x_row_div=1,route=hist:/home/kaden/qcal/release-0.4.3/pmrip/ev/s3/run1/raon.T4096.route_hist.json,vs=contract:moe_grouped_qt44_a8_sym_gfx1201_nt2r2,pool=1",
+      "verdict": "faster"
+    }
+  ],
+  "constant": "MOE_A8_XLDS_MIN_ROWS",
+  "covers": true,
+  "derived_max_rows": 26496,
+  "derived_min_rows": 2304,
+  "incumbent": "contract:generic_gemm.moe_grouped_qt44_a8_sym",
+  "judge_argv": [
+    "pm-census",
+    "tune",
+    "selector-receipt",
+    "--record",
+    "receipts/selectors/evidence/moe_a8_xlds/xlds-vs-inc-gu-A.json",
+    "--record",
+    "receipts/selectors/evidence/moe_a8_xlds/xlds-vs-inc-dn-A.json",
+    "--record",
+    "receipts/selectors/evidence/moe_a8_xlds/xlds-vs-inc-gu-F.json",
+    "--record",
+    "receipts/selectors/evidence/moe_a8_xlds/xlds-vs-inc-dn-F.json",
+    "--record",
+    "receipts/selectors/evidence/moe_a8_xlds/xlds-vs-inc-gu-B.json",
+    "--record",
+    "receipts/selectors/evidence/moe_a8_xlds/xlds-vs-inc-dn-B.json",
+    "--constant",
+    "MOE_A8_XLDS_MIN_ROWS",
+    "--path",
+    "crates/rdna-compute/src/moe_grouped_qt44_iu4.rs",
+    "--value",
+    "2304",
+    "--kind",
+    "min",
+    "--row-key",
+    "launch_rows",
+    "--out",
+    "receipts/selectors/moe_a8_xlds_min_rows.json"
+  ],
+  "kind": "min",
+  "min_effect": 0.005,
+  "path": "crates/rdna-compute/src/moe_grouped_qt44_iu4.rs",
+  "records": [
+    {
+      "path": "receipts/selectors/evidence/moe_a8_xlds/xlds-vs-inc-gu-A.json",
+      "sha256": "31e9a408e30ace3e18c0b736905d569bd87eb9a33236cb6d74a640325e5bf943"
+    },
+    {
+      "path": "receipts/selectors/evidence/moe_a8_xlds/xlds-vs-inc-dn-A.json",
+      "sha256": "eb30a92709a36f76351214755de9bbe4b869bd8238097f85c9855ba00ea12aa1"
+    },
+    {
+      "path": "receipts/selectors/evidence/moe_a8_xlds/xlds-vs-inc-gu-F.json",
+      "sha256": "4022ec164baa47f232bb059126740d5f51885d24dab06c8c457aaba7670d1285"
+    },
+    {
+      "path": "receipts/selectors/evidence/moe_a8_xlds/xlds-vs-inc-dn-F.json",
+      "sha256": "adfb8a3358dfbcf4768e05b99304590cfcdc087320670861cd40babdc25c557e"
+    },
+    {
+      "path": "receipts/selectors/evidence/moe_a8_xlds/xlds-vs-inc-gu-B.json",
+      "sha256": "17c058254c2e82b1ea97f34bffe34f00766cace2aaa91f09eb4db2e2b4050977"
+    },
+    {
+      "path": "receipts/selectors/evidence/moe_a8_xlds/xlds-vs-inc-dn-B.json",
+      "sha256": "da676fe2126b69266f7f0a47afa0e553f6748d49316c8ba0a895d266e5c14293"
+    }
+  ],
+  "row_key": "launch_rows",
+  "schema": "pm.selector_receipt.v1",
+  "shapes": [
+    "M=2176,K=2560,n_experts=128,topk=6,route=hist:/home/kaden/qcal/release-0.4.3/pmrip/ev/s3/run1/raon.T4096.route_hist.json,vs=contract:moe_grouped_qt44_a8_sym_gfx1201_nt2r1,pool=1",
+    "M=2560,K=1280,n_experts=128,topk=6,x_row_div=1,route=hist:/home/kaden/qcal/release-0.4.3/pmrip/ev/s3/run1/raon.T4096.route_hist.json,vs=contract:moe_grouped_qt44_a8_sym_gfx1201_nt2r1,pool=1",
+    "M=2176,K=2560,n_experts=128,topk=6,route=hist:/home/kaden/qcal/release-0.4.3/pmrip/ev/s3/run1/raon.T4096.route_hist.json,vs=contract:moe_grouped_qt44_a8_sym_gfx1201_nt2r2,pool=1",
+    "M=2560,K=1280,n_experts=128,topk=6,x_row_div=1,route=hist:/home/kaden/qcal/release-0.4.3/pmrip/ev/s3/run1/raon.T4096.route_hist.json,vs=contract:moe_grouped_qt44_a8_sym_gfx1201_nt2r2,pool=1"
+  ],
+  "sign_p_max": 0.001,
+  "value": 2304
+}

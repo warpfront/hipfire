@@ -86,6 +86,7 @@ fn kernel_dtype_for_quant_type(quant_type: u8) -> rdna_compute::DType {
         53 => DType::MQ4G128V2,
         55 => DType::FP8E4M3B128,
         56 => DType::FP8E4M3PT,
+        57 => DType::HC8E4M3Row,
         _ => DType::Raw,
     }
 }
@@ -129,6 +130,14 @@ pub struct BatchLoadRequest {
     /// Requested step row budget (`serve.max_batch_tokens`); the staged
     /// budget is `max(row_budget, continuous_batch_size)`.
     pub row_budget: usize,
+    /// Native-MTP lanes of draft depth `k` are staged (`serve.batch_spec`):
+    /// the EP lane reservation charges the spec lane store (target ring,
+    /// head state, wide hidden) instead of the AR store. `None`: AR lanes.
+    pub spec_k: Option<usize>,
+    /// With `spec_k`: the spec lanes are staged with the copy lane armed, so
+    /// the reservation charges the widened verify rows, rings and head-lag
+    /// storage (`stage_lanes_with_copy`).
+    pub spec_copy: bool,
 }
 
 impl BatchLoadRequest {
@@ -432,25 +441,106 @@ mod ep_lane_reservation_request_tests {
             vmm_batch: true,
             continuous_batch_size: 1,
             row_budget: 4096,
+            spec_k: None,
+            spec_copy: false,
         };
         assert_eq!(one.lanes(), None);
         let no_vmm = BatchLoadRequest {
             vmm_batch: false,
             continuous_batch_size: 8,
             row_budget: 4096,
+            spec_k: None,
+            spec_copy: false,
         };
         assert_eq!(no_vmm.lanes(), None);
         let zero = BatchLoadRequest {
             vmm_batch: true,
             continuous_batch_size: 0,
             row_budget: 0,
+            spec_k: None,
+            spec_copy: false,
         };
         assert_eq!(zero.lanes(), None);
         let on = BatchLoadRequest {
             vmm_batch: true,
             continuous_batch_size: 4,
             row_budget: 0,
+            spec_k: None,
+            spec_copy: false,
         };
         assert_eq!(on.lanes(), Some(4));
+    }
+}
+
+/// Which parallelism axis a refusal is about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TopologyAxis {
+    /// `topology.pp` (pipeline: layer bands across GPUs).
+    Pipeline,
+    /// `topology.ep` (expert-parallel degree).
+    Expert,
+    /// `--tp N` / daemon `params.tp` (tensor/expert parallelism).
+    Tp,
+}
+
+/// The one plain-language refusal for a model family that cannot be split
+/// across GPUs on `axis` at `degree`. `family` is the carrier name (kept as
+/// the stable prefix); `is_dir` selects the safetensors-directory wording
+/// for the pipeline axis (a directory cannot be banded; the other axes have a
+/// single wording). Every refusal site (admission, carrier backstops, bench,
+/// fit) builds its text here so the three axes read the same.
+pub fn topology_refusal(family: &str, axis: TopologyAxis, degree: usize, is_dir: bool) -> String {
+    match axis {
+        TopologyAxis::Pipeline if is_dir => format!(
+            "{family}: a safetensors model directory cannot be split across GPUs in pipeline \
+             mode (topology.pp = {degree}). Set topology.pp = 1 to load it on one GPU, or convert it \
+             to a packed .hfq file first"
+        ),
+        TopologyAxis::Pipeline => format!(
+            "{family}: this model family cannot be split across GPUs in pipeline mode \
+             (topology.pp = {degree}). Set topology.pp = 1 to load it on one GPU"
+        ),
+        TopologyAxis::Expert => format!(
+            "{family}: this model family cannot be split across GPUs in expert-parallel mode \
+             (topology.ep = {degree}). Set topology.ep = 1 to load it on one GPU"
+        ),
+        TopologyAxis::Tp => format!(
+            "{family}: this model family cannot be split across GPUs with --tp {degree} \
+             (tensor/expert parallelism). Set tp = 1 to load it on one GPU"
+        ),
+    }
+}
+
+#[cfg(test)]
+mod topology_refusal_tests {
+    use super::{topology_refusal, TopologyAxis};
+
+    #[test]
+    fn pipeline_text_is_the_historical_pp_sentence() {
+        assert_eq!(
+            topology_refusal("raon1_mini", TopologyAxis::Pipeline, 2, false),
+            "raon1_mini: this model family cannot be split across GPUs in pipeline mode \
+             (topology.pp = 2). Set topology.pp = 1 to load it on one GPU"
+        );
+        assert_eq!(
+            topology_refusal("llama", TopologyAxis::Pipeline, 3, true),
+            "llama: a safetensors model directory cannot be split across GPUs in pipeline \
+             mode (topology.pp = 3). Set topology.pp = 1 to load it on one GPU, or convert it \
+             to a packed .hfq file first"
+        );
+    }
+
+    #[test]
+    fn expert_and_tp_texts_name_the_family_degree_and_fix() {
+        assert_eq!(
+            topology_refusal("raon1_mini", TopologyAxis::Expert, 2, false),
+            "raon1_mini: this model family cannot be split across GPUs in expert-parallel mode \
+             (topology.ep = 2). Set topology.ep = 1 to load it on one GPU"
+        );
+        assert_eq!(
+            topology_refusal("raon1_mini", TopologyAxis::Tp, 4, true),
+            "raon1_mini: this model family cannot be split across GPUs with --tp 4 \
+             (tensor/expert parallelism). Set tp = 1 to load it on one GPU"
+        );
     }
 }

@@ -376,7 +376,7 @@ single-device or pipeline-parallel load (Flash-Next/Qwen4 included) unloads
 the prior model and requires clean VMM state before constructing the new
 one, so a failure after admission leaves no model loaded and the error says
 `no model loaded`. Only tp>1 expert-parallel loads stage the new model before
-retiring the prior one. Flash-Next with VMM QSA state (gfx1151/gfx1201 automatic) owns
+retiring the prior one. Flash-Next with VMM QSA state (gfx1151/gfx1201/gfx942 automatic) owns
 VMM arenas of its own: the target and MTP context arenas and the gathered
 attention workspace. All of them are released when the model unloads, so the
 next load's clean-VMM check starts from zero owners in either swap direction.
@@ -499,7 +499,8 @@ through to per-model / registry / daemon defaults when omitted):
 | `seed` | OpenAI-compatible sampling seed: non-negative integer (≤ u64::MAX). Same seed is reproducible only when prompt, sampling parameters, and execution shape match. Cold vs prefix-resumed and solo vs co-batched shapes may differ until `serve.batch_invariant` is implemented; `null`/omitted = fresh entropy. Negative/fractional/non-integer values are rejected. |
 | `presence_penalty`, `frequency_penalty` | Forwarded natively to the daemon (≥ 0); `presence_penalty` also inherits per-model / registry defaults |
 | `max_tokens` | Generation cap, shared by the `<think>` span and the answer (see the note under the example above) |
-| `stop` | A string or an array of up to 4 strings, each ≤ 64 characters; any other value is a 400. Matched on the answer only (never inside reasoning), across token boundaries; streaming holds back a possible partial match, the stop text and everything after it are not returned, and `finish_reason` is `stop` (or `tool_calls` when a call completed before the match). Honoured on the Qwen3.5-family routes (`qwen_ar`, `qwen_dflash`, which covers MTP) and Flash-Next (`qwen4_ar`, `qwen4_spec` = native MTP); every other route answers 400 instead of ignoring it |
+| `stop` | A string or an array of up to 4 strings, each ≤ 64 characters; any other value is a 400. Matched on the answer only (never inside reasoning), across token boundaries; streaming holds back a possible partial match, the stop text and everything after it are not returned, and `finish_reason` is `stop` (or `tool_calls` when a call completed before the match). Honoured on the Qwen3.5-family routes (`qwen_ar`, `qwen_dflash`, which covers MTP), Flash-Next (`qwen4_ar`, `qwen4_spec` = native MTP) and Raon-1-mini (`raon_ar`, `raon_spec` = DFlash2); every other route answers 400 instead of ignoring it |
+| `min_tokens` | vLLM-compatible minimum completion length: an integer `>= 0` (default `0`) that must not exceed `max_tokens` (400 otherwise; never clamped; when `max_tokens` is omitted the check is against the configured default). Until that many completion tokens have been emitted, the end-of-sequence token, the decoded end-of-turn markers (`<|im_end|>`, `<|endoftext|>`) and `stop` sequences are ignored: a sampled EOS is an ordinary token (counted toward `min_tokens` and `max_tokens`, fed back, its marker text never shown) and generation continues; `max_tokens` still caps, so `finish_reason` is `length` if the cap arrives first. Applies to every token, thinking included. Honoured on the same routes as `stop` (`qwen_ar`, `qwen_dflash`/MTP, `qwen4_ar`, `qwen4_spec`, `raon_ar`, `raon_spec`), where a speculative window that accepts an EOS inside it simply continues past it; every other route, image requests and experimental multi-slot answer 400 instead of ignoring it. Flash-Next fn-lanes (single card and EP, AR and native-MTP lanes) honour it per lane: the lane is admitted with no EOS rule, so a window runs through an EOS draft, and the lane driver ends the request at the first EOS or stop at or after `min_tokens` (the tokens after it in that window are dropped). On a serve that batches (`continuous_batch_size > 1`) every other route answers 400 `min_tokens is not supported on the <route> route (continuous-batch/VMM lanes/promotion)` instead of silently decoding on a serialized singleton: Qwen3.5 continuous-batch, VMM and EP-batch lanes, dense LFM, and pipeline-parallel Qwen4 lanes; a singleton-only serve (`continuous_batch_size = 1`) honours it on the routes above. A Flash-Next `min_tokens` request on an idle fn-lanes serve starts as a lane (a cohort of one) on every topology, so a request that arrives mid-generation joins it concurrently |
 | `tools` | Tool definitions (with structured `messages` when Jinja chat is on). Flash-Next accepts them with native MTP attached: greedy tool turns run on MTP and match AR byte for byte |
 | `response_format` | **Not enforced on the standard route.** Any value (`json_object`, `json_schema`, `text`, even an unknown type) is accepted unvalidated with HTTP 200 and is not forwarded to the daemon; the model output is unconstrained (a model asked for JSON may still wrap it in a code fence). Only `serve.multi_slot = true` enforces `json_schema` (pre-sampling grammar mask) and refuses `json_object` / unknown types with 400 |
 | `chat_template_kwargs.enable_thinking` | Mode axis. `false` forces a no-think turn (Qwen native empty closed think). Independent of effort and cap. |
@@ -785,7 +786,9 @@ emits an OpenAI-shaped SSE `data: {"error": {...}}` frame followed by
 `data: [DONE]`, so a streaming client always sees a terminal event instead of
 a silently truncated `200`. Non-streaming failures keep the typed
 status mapping (`400` request/config, `503` + `Retry-After` overload or
-transient, `500` internal).
+transient, `500` internal). A request the device ran out of memory for
+(`hipMalloc` / `hipMemCreate: out of memory` anywhere in its message) is an
+`overload` (`503`, retryable), never a `400`.
 
 Loads whose ack reports `cache_capable: true`, or whose route is continuous-batch
 capable, skip the per-request `reset` so multi-turn longest-common-prefix reuse
@@ -921,7 +924,13 @@ request run alone on the singleton route. **Default off, experimental.**
   row budget per step is `serve.max_batch_tokens`. The QSA context backend must
   be VMM and the lane store must fit the free device memory; otherwise the
   load logs `[daemon] qwen4 lanes refused: <reason> — fallback to sequential`
-  and serves the singleton route exactly as before. With
+  and serves the singleton route exactly as before. A single-card load that
+  asks for lanes reserves the lane store (every slot's state and its first
+  context pages) beside the singleton's census before it places the experts
+  (load log `qwen4 lane store: <N> MiB reserved beside the census ...`), so a
+  burst of lanes and the singleton's long-prompt prefill scratch and context
+  never compete for the same free memory; the price is that many MiB fewer
+  device-resident experts. With
   `continuous_batch_size >= 2` but `serve.vmm_batch` off the load logs
   `[daemon] qwen4 lanes need serve.vmm_batch — fallback to sequential` and
   advertises `continuous_batch_capable: false`.
@@ -949,6 +958,10 @@ request run alone on the singleton route. **Default off, experimental.**
   units from a measured model of the shared step (an AR row costs its
   proportional share of an all-AR step; a window adds its verify rows'
   marginal cost), so a lane whose drafts do not pay falls back to AR rows.
+  EP mesh lanes run without it by default and route their draft depth from
+  their own agreement (`HIPFIRE_QWEN4_EP_LANE_AR_FLOOR=1` restores it, see
+  [env-vars.md](env-vars.md)): it retired single lanes of a code C8 burst that
+  were emitting three tokens per step, leaving one stream to finish alone.
 - **Exact per lane:** every MTP lane window is byte-identical to the one
   singleton window it takes (a batched window at the lane's draft depth, or
   the singleton's AR step), on the lane's own states. Stateful stages (PLE
@@ -956,8 +969,16 @@ request run alone on the singleton route. **Default off, experimental.**
   stage runs once over all lanes' rows only where the G0 byte-identity oracle
   admitted it, otherwise per lane.
   On gfx1151 G0 admitted every row-local stage (embedding, HC read/write, the
-  GDN/QSA projections, the MoE, final HC read, head, argmax); other cards run
-  every stage per lane until their own G0 run.
+  GDN/QSA projections, the MoE, final HC read, head, argmax). On gfx942
+  (MI300X, the single-card stock-FP8 artifact, AR lanes: that artifact has no
+  MTP head) G0 passed the combined policy (every row-local stage plus the PLE
+  projection once over all rows, bound to the BF16 trunk and the resident FP8
+  expert class) but not every single-stage probe, so gfx942 shares all of
+  those stages or none; the GDN and QSA cores run one launch per lane there.
+  Measured on one MI300X (`hipfire bench --backend batch`, 16 prompts x 128
+  tokens, 4 fresh loads): C8 151 tok/s aggregate (TTFT 1.88 s, 208 tok/s
+  steady decode) against C1 60 tok/s, every stream's text identical to C1.
+  Other cards run every stage per lane until their own G0 run.
 - **Under `topology.pp` / `topology.ep` (2..=8 cards):** the same exact
   **AR** fn-lanes route is staged across the cards, with these differences from
   the single-card route above. The lane store is budgeted per device: every
@@ -996,8 +1017,16 @@ and the lane-store receipt:
 `fn_lanes_mapped_bytes`, `fn_lanes_stage_policy` (the per-stage sharing
 policy) and `fn_lanes_stage_evidence` (the G0 receipt id for the production
 policy). Each lane's `done` event carries the singleton's MTP counters
-(`mtp`, `mtp_windows`, `ar_windows`, `mtp_retired`) plus `mtp_drafts` and
-`mtp_accepted`. Under PP/EP the ack also reports `fn_lanes_topology`
+(`mtp`, `mtp_windows`, `ar_windows`, `mtp_retired`, `tau` = accepted drafts per
+verify window, `cycles`) plus `mtp_drafts` and `mtp_accepted` and the per-position
+arrays `mtp_depth_offered`, `mtp_depth_reached`, `mtp_depth_accepted` (index
+`d - 1` is draft depth `d`; `reached` counts windows that offered >= d drafts and
+accepted the first d-1, so `accepted[d] / reached[d]` is the per-position
+acceptance a_d over native windows). `GET /stats` sums them across requests as
+`draft_positions` (`depth`, `offered`, `reached`, `accepted`, `rate`) with
+`spec_cycles` and `spec_committed_tokens`; `/metrics` adds
+`hipfire_spec_draft_position_total{depth,kind}` and `hipfire_spec_cycles_total`
+once a lane window has run. Under PP/EP the ack also reports `fn_lanes_topology`
 (`"single"`, `"ep"` or `"pp"`) and `fn_lanes_device_receipts`, one entry per
 card (EP rank order; PP input band to output band); the scalar `fn_lanes_*`
 receipt is the root's (rank 0, or the output band), and

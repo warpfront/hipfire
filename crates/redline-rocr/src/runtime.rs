@@ -12,6 +12,7 @@ use hipfire_config::emu_budget;
 
 use super::abi;
 use super::packet::{AQL_PACKET_BYTES, KernelMetadata, LaunchGeometry, PacketImage};
+use super::pm4_gfx10_scratch::Gfx10ScratchTopology;
 
 /// Default bound for host-side queue-capacity and completion polling.
 ///
@@ -597,6 +598,28 @@ impl GpuDevice {
             (&mut count as *mut u32).cast(),
         )?;
         Ok(count)
+    }
+
+    /// Shader topology that sizes a GFX10/GFX11 scratch ring: CU count, shader
+    /// engines and the per-CU wave-slot capacity
+    /// (`HSA_AMD_AGENT_INFO_{COMPUTE_UNIT_COUNT,NUM_SHADER_ENGINES,MAX_WAVES_PER_CU}`;
+    /// the same inputs ROCr's `AqlQueue::FillComputeTmpRingSize*` uses).
+    pub fn scratch_topology(&self) -> Result<Gfx10ScratchTopology, RuntimeError> {
+        let query = |attribute: u32| -> Result<u32, RuntimeError> {
+            let mut value = 0_u32;
+            query_agent(
+                &self.runtime.symbols,
+                self.gpu_agent(),
+                attribute,
+                (&mut value as *mut u32).cast(),
+            )?;
+            Ok(value)
+        };
+        Ok(Gfx10ScratchTopology {
+            compute_units: query(abi::AMD_AGENT_INFO_COMPUTE_UNIT_COUNT)?,
+            shader_engines: query(abi::AMD_AGENT_INFO_NUM_SHADER_ENGINES)?,
+            max_waves_per_cu: query(abi::AMD_AGENT_INFO_MAX_WAVES_PER_CU)?,
+        })
     }
 
     /// CUs fully enabled for cooperative dispatch
@@ -2311,11 +2334,33 @@ impl KernargPool {
         self.allocate_bytes(length, 16, abi::AMD_MEMORY_POOL_EXECUTABLE_FLAG)
     }
 
+    /// Allocate a GPU scratch (private-segment) backing store for GFX10/GFX11
+    /// PM4 dispatches: `length` bytes at 4 KiB alignment, left uninitialized.
+    ///
+    /// Private-segment memory is write-before-read by definition, so unlike
+    /// every kernarg/command allocation it is not zeroed: at tens of MiB the
+    /// host store through the BAR would cost more than the buffer is worth.
+    /// Allocate it from a pool made by [`Self::discover_device_local`] so the
+    /// backing lives in device memory.
+    pub fn allocate_scratch_backing(&self, length: usize) -> Result<KernargBuffer, RuntimeError> {
+        self.allocate_bytes_init(length, 4096, abi::AMD_MEMORY_POOL_STANDARD_FLAG, false)
+    }
+
     fn allocate_bytes(
         &self,
         length: usize,
         required_alignment: usize,
         flags: u32,
+    ) -> Result<KernargBuffer, RuntimeError> {
+        self.allocate_bytes_init(length, required_alignment, flags, true)
+    }
+
+    fn allocate_bytes_init(
+        &self,
+        length: usize,
+        required_alignment: usize,
+        flags: u32,
+        zero: bool,
     ) -> Result<KernargBuffer, RuntimeError> {
         if !required_alignment.is_power_of_two() {
             return Err(RuntimeError::InvalidKernargAlignment(required_alignment));
@@ -2416,7 +2461,9 @@ impl KernargPool {
         // ReBAR systems (verified by the device_local_pool_host_memcpy_probe
         // test), so the same store path is valid.
         // SAFETY: pointer owns allocation_size writable host bytes.
-        unsafe { ptr::write_bytes(pointer.as_ptr(), 0, allocation_size) };
+        if zero {
+            unsafe { ptr::write_bytes(pointer.as_ptr(), 0, allocation_size) };
+        }
         Ok(KernargBuffer {
             pool: self.inner.clone(),
             device_local: self.inner.device_local,

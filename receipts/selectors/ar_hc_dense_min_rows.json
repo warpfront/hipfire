@@ -1,0 +1,241 @@
+{
+  "schema": "pm.selector_receipt.v1",
+  "arch": "gfx1201",
+  "candidate": "ar_hc_write_d8 (dense 8-byte wire)",
+  "incumbent": "ar_hc_write (16-byte tagged wire)",
+  "constant": "AR_HC_DENSE_MIN_ROWS",
+  "value": 16,
+  "kind": "min",
+  "row_key": "rows",
+  "covers": true,
+  "derived_min_rows": 16,
+  "note": "ratio = dense/tagged mean launch time (us, pipelined, 2 runs, E,C pair, 2 stream kinds). Wire is bandwidth-bound >=16 rows (fit a=13us b=0.366us/row, raw store ceiling ~40 GB/s), latency-bound below (dense adds ~1us re-arm). Byte identity: oracle-hybrid/oracle-dense pass; hostile-peer tear oracle pass. See arwire/RESULT.md.",
+  "classes": [
+    {
+      "rows": 1,
+      "stream": "bf16",
+      "ratio": 1.0197590361445783,
+      "verdict": "neutral",
+      "admitted": false
+    },
+    {
+      "rows": 2,
+      "stream": "bf16",
+      "ratio": 0.9614235938277751,
+      "verdict": "faster",
+      "admitted": false
+    },
+    {
+      "rows": 3,
+      "stream": "bf16",
+      "ratio": 1.0237174529517918,
+      "verdict": "neutral",
+      "admitted": false
+    },
+    {
+      "rows": 4,
+      "stream": "bf16",
+      "ratio": 0.9737654320987653,
+      "verdict": "neutral",
+      "admitted": false
+    },
+    {
+      "rows": 5,
+      "stream": "bf16",
+      "ratio": 0.9747357566383089,
+      "verdict": "neutral",
+      "admitted": false
+    },
+    {
+      "rows": 6,
+      "stream": "bf16",
+      "ratio": 0.9204601076847773,
+      "verdict": "faster",
+      "admitted": false
+    },
+    {
+      "rows": 7,
+      "stream": "bf16",
+      "ratio": 0.9321955003878976,
+      "verdict": "faster",
+      "admitted": false
+    },
+    {
+      "rows": 8,
+      "stream": "bf16",
+      "ratio": 1.2697274031563845,
+      "verdict": "slower",
+      "admitted": false
+    },
+    {
+      "rows": 16,
+      "stream": "bf16",
+      "ratio": 0.932111815832746,
+      "verdict": "faster",
+      "admitted": true
+    },
+    {
+      "rows": 32,
+      "stream": "bf16",
+      "ratio": 0.858491991538229,
+      "verdict": "faster",
+      "admitted": true
+    },
+    {
+      "rows": 64,
+      "stream": "bf16",
+      "ratio": 0.8900923861102261,
+      "verdict": "faster",
+      "admitted": true
+    },
+    {
+      "rows": 128,
+      "stream": "bf16",
+      "ratio": 0.7537963949039562,
+      "verdict": "faster",
+      "admitted": true
+    },
+    {
+      "rows": 192,
+      "stream": "bf16",
+      "ratio": 0.6652611705475142,
+      "verdict": "faster",
+      "admitted": true
+    },
+    {
+      "rows": 256,
+      "stream": "bf16",
+      "ratio": 0.6885782867430115,
+      "verdict": "faster",
+      "admitted": true
+    },
+    {
+      "rows": 1,
+      "stream": "f32",
+      "ratio": 1.0921683537559936,
+      "verdict": "slower",
+      "admitted": false
+    },
+    {
+      "rows": 2,
+      "stream": "f32",
+      "ratio": 1.093553459119497,
+      "verdict": "slower",
+      "admitted": false
+    },
+    {
+      "rows": 3,
+      "stream": "f32",
+      "ratio": 1.0963603037444358,
+      "verdict": "slower",
+      "admitted": false
+    },
+    {
+      "rows": 4,
+      "stream": "f32",
+      "ratio": 1.233820459290188,
+      "verdict": "slower",
+      "admitted": false
+    },
+    {
+      "rows": 5,
+      "stream": "f32",
+      "ratio": 1.1247077162899453,
+      "verdict": "slower",
+      "admitted": false
+    },
+    {
+      "rows": 6,
+      "stream": "f32",
+      "ratio": 1.0468169432747092,
+      "verdict": "slower",
+      "admitted": false
+    },
+    {
+      "rows": 7,
+      "stream": "f32",
+      "ratio": 1.1964197733617998,
+      "verdict": "slower",
+      "admitted": false
+    },
+    {
+      "rows": 8,
+      "stream": "f32",
+      "ratio": 0.9665071770334929,
+      "verdict": "faster",
+      "admitted": false
+    },
+    {
+      "rows": 16,
+      "stream": "f32",
+      "ratio": 1.0056806227645696,
+      "verdict": "neutral",
+      "admitted": true
+    },
+    {
+      "rows": 32,
+      "stream": "f32",
+      "ratio": 0.7322808006766282,
+      "verdict": "faster",
+      "admitted": true
+    },
+    {
+      "rows": 64,
+      "stream": "f32",
+      "ratio": 0.9325939382350128,
+      "verdict": "faster",
+      "admitted": true
+    },
+    {
+      "rows": 128,
+      "stream": "f32",
+      "ratio": 0.7332413597934133,
+      "verdict": "faster",
+      "admitted": true
+    },
+    {
+      "rows": 192,
+      "stream": "f32",
+      "ratio": 0.5198984640536936,
+      "verdict": "faster",
+      "admitted": true
+    },
+    {
+      "rows": 256,
+      "stream": "f32",
+      "ratio": 0.5217847498150919,
+      "verdict": "faster",
+      "admitted": true
+    }
+  ],
+  "records": [
+    {
+      "path": "receipts/selectors/evidence/ar_hc_dense/bench-tagged-r1.json",
+      "sha256": "e77de0ff5060eb88ed751f9641913012d1e1fe60c2ae975837ac65398e3616f6"
+    },
+    {
+      "path": "receipts/selectors/evidence/ar_hc_dense/bench-dense-r1.json",
+      "sha256": "4710dc745ee23d23af868d517ecf021932346462dca01ef8c027604c9d9039f5"
+    },
+    {
+      "path": "receipts/selectors/evidence/ar_hc_dense/bench-tagged-r2.json",
+      "sha256": "6e3992ad8f1b96d6e412aefc531073e373a8b5d294834dbe419d2d500ddb9e62"
+    },
+    {
+      "path": "receipts/selectors/evidence/ar_hc_dense/bench-dense-r2.json",
+      "sha256": "a18c502db50ef641bfc5cef24648a9edfe80ff521e52f86769ab60f17915e1d8"
+    },
+    {
+      "path": "receipts/selectors/evidence/ar_hc_dense/oracle-hybrid.json",
+      "sha256": "1c6b2ac3a35ea8160ff7db601cb778c374009cf6a13d0a3565db0ff63e7dc735"
+    },
+    {
+      "path": "receipts/selectors/evidence/ar_hc_dense/oracle-dense.json",
+      "sha256": "2f48d6e3d1bd274f4a7100d808ce049728054d5b5e0da559bd8f2f0a74da0083"
+    },
+    {
+      "path": "receipts/selectors/evidence/ar_hc_dense/tear-oracle.json",
+      "sha256": "24d950295339f13526f2b188a9a9ef0893ef1ed9bd111719b2c0e71f2425f2d0"
+    }
+  ]
+}

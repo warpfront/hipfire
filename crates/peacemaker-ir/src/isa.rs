@@ -68,7 +68,7 @@ impl OpRow {
 /// Whether a VMEM atomic returns its pre-op value: `glc` on gfx11, `th` bit 0
 /// (`TH_ATOMIC_RETURN`) on gfx12. Only rows with `@rtn`/`@nortn` tags consult it.
 pub fn atomic_returns(arch: Arch, cpol: &CachePolicy) -> bool {
-    if arch == Arch::Gfx1201 {
+    if arch.is_gfx12() {
         cpol.th & 1 != 0
     } else {
         cpol.glc
@@ -91,6 +91,7 @@ fn form(value: &str) -> Option<Form> {
         "smem" => Form::Smem,
         "vop1" => Form::Vop1,
         "vop1_dpp" => Form::Vop1Dpp,
+        "vop1_dpp8" => Form::Vop1Dpp8,
         "vop2" => Form::Vop2,
         "vop2_dpp" => Form::Vop2Dpp,
         "vopc" => Form::Vopc,
@@ -116,7 +117,7 @@ fn family(form: Form) -> Family {
         Form::Sopk => Family::Sopk,
         Form::Sopp => Family::Sopp,
         Form::Smem => Family::Smem,
-        Form::Vop1 | Form::Vop1Dpp => Family::Vop1,
+        Form::Vop1 | Form::Vop1Dpp | Form::Vop1Dpp8 => Family::Vop1,
         Form::Vop2 | Form::Vop2Dpp => Family::Vop2,
         Form::Vopc => Family::Vopc,
         Form::Vop3 => Family::Vop3,
@@ -266,7 +267,7 @@ pub fn table(arch: Arch) -> &'static [OpRow] {
     match arch {
         Arch::Gfx1100 => gfx1100(),
         Arch::Gfx1151 => gfx1151(),
-        Arch::Gfx1201 => gfx12(),
+        Arch::Gfx1200 | Arch::Gfx1201 => gfx12(),
         Arch::Gfx1010 | Arch::Gfx1030 => &[],
     }
 }

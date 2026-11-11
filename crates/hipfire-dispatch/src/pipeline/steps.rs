@@ -117,13 +117,17 @@ pub enum Step<'a> {
     LaneAttention(crate::pipeline::layer_ops::LaneAttentionOp<'a>),
     /// Launch-free clear of a preallocated scratch prefix.
     Clear(crate::pipeline::layer_ops::ClearOp<'a>),
+    /// Sequence-parallel all-gather of the rows of one scratch tensor across the EP ranks
+    /// (`HIPFIRE_QWEN4_EP_SEQ_PARALLEL`). A fusion barrier like `Clear`.
+    RowGather(crate::pipeline::layer_ops::RowGatherOp<'a>),
     /// Embedding-table lookup of device-resident token ids.
     Embed(crate::pipeline::layer_ops::EmbeddingOp<'a>),
     /// Grouped hyper-connection RMS norm.
     HyperNorm(crate::pipeline::layer_ops::HyperNormOp<'a>),
     /// One weight projection through the shared stateful-op contract.
     Project(crate::pipeline::layer_ops::ProjectOp<'a>),
-    /// Per-row broadcast add of one activation row.
+    /// Per-row broadcast add of one activation row per lane (one lane unless the op batches
+    /// the draft round's lanes).
     BroadcastAdd(crate::pipeline::layer_ops::BroadcastAddOp<'a>),
     /// Dense gated MLP (optional pre-norm, gate/up, activation, down, output
     /// epilogue) on its declared kernel ladder. Opaque to fusion: no HC
@@ -228,6 +232,7 @@ fn op_kind(step: &Step) -> Option<PipelineOp> {
         | Step::GatedShortConv(_)
         | Step::LaneAttention(_)
         | Step::Clear(_)
+        | Step::RowGather(_)
         | Step::Embed(_)
         | Step::HyperNorm(_)
         | Step::Project(_)
@@ -887,6 +892,7 @@ pub fn validate_steps<'a>(gpu: &Gpu, steps: &[Step<'a>]) -> Result<(), DispatchE
             Step::GatedShortConv(op) => op.validate_for_gpu(gpu)?,
             Step::LaneAttention(op) => op.validate_for_gpu(gpu)?,
             Step::Clear(op) => op.validate_for_gpu(gpu)?,
+            Step::RowGather(op) => op.validate_for_gpu(gpu)?,
             Step::Embed(op) => op.validate_for_gpu(gpu)?,
             Step::HyperNorm(op) => op.validate_for_gpu(gpu)?,
             Step::Project(op) => op.validate_for_gpu(gpu)?,
@@ -967,10 +973,11 @@ pub trait MoeStepHooks {
     /// At the top of the interpreter's loop, before `step` is dispatched by
     /// whatever route takes it (fused, CPU or plain): every earlier step has
     /// run, `step` has not. A step consumed inside an earlier step's fused
-    /// launch is never announced, except the members of a multi-lane GDN Core
-    /// group (fn-lanes): each is announced exactly once, in program order,
-    /// right before the group's launches (its members write only per-lane
-    /// scratch, so the state seen is the one sequential dispatch would show).
+    /// launch is never announced, except the members of a multi-lane GDN or
+    /// QSA Core group (fn-lanes): each is announced exactly once, in program
+    /// order, right before the group's launches (its members write only
+    /// per-lane scratch, so the state seen is the one sequential dispatch
+    /// would show).
     /// Default: nothing (no fusion changes).
     fn before_step(&mut self, _gpu: &mut Gpu, _step: &Step<'_>) -> Result<(), DispatchError> {
         Ok(())
@@ -1087,19 +1094,23 @@ fn execute_window<'a>(
     let row_fold_mixer_1201 =
         !cpu_exec::cpu_exec_enabled() && gpu.flags.qwen4_hc_row_fold_mixer_gfx1201_enabled();
     while i < end {
-        // fn-lanes: consecutive one-row GDN Core steps (one per AR lane) run
-        // as one multi-lane launch per kernel; otherwise one by one below. The
+        // fn-lanes: consecutive GDN Core steps (one per lane: one AR row, or a
+        // 2..=8-row verify window under its armed capture ring) run as
+        // multi-lane launches; otherwise one by one below. The
         // group's steps are announced here, once each in program order, after
         // every refusal check and before the grouped launch; a refused group
         // announced nothing and each step is announced by the plain path below.
-        if matches!(&steps[i], Step::GatedDeltaNet(op) if op.phase == MixerPhase::Core && op.rows == 1)
+        if matches!(&steps[i], Step::GatedDeltaNet(op)
+                if crate::pipeline::layer_ops::gdn_core_lane_groupable(gpu, op))
             && !cpu_exec::cpu_exec_enabled()
         {
             let ops: Vec<_> = steps[i..end]
                 .iter()
                 .take(rdna_compute::tensor_ops::GDN_CORE_LANES_MAX)
                 .map_while(|s| match s {
-                    Step::GatedDeltaNet(op) if op.phase == MixerPhase::Core && op.rows == 1 => {
+                    Step::GatedDeltaNet(op)
+                        if crate::pipeline::layer_ops::gdn_core_lane_groupable(gpu, op) =>
+                    {
                         Some(op)
                     }
                     _ => None,
@@ -1120,6 +1131,55 @@ fn execute_window<'a>(
             {
                 i += group;
                 continue;
+            }
+        }
+        // fn-lanes: consecutive QSA Core steps of one layer (one per AR lane,
+        // 1..=8 rows each) run as one multi-lane launch per kernel (prologue,
+        // pool, select, attention) under `HIPFIRE_QWEN4_QSA_LANES`; announced
+        // and refused exactly like the GDN group above.
+        if let Step::IndexedAttention(first) = &steps[i] {
+            if first.phase == MixerPhase::Core
+                && !cpu_exec::cpu_exec_enabled()
+                && gpu.flags.qwen4_qsa_lanes_enabled()
+            {
+                let ops: Vec<_> = steps[i..end]
+                    .iter()
+                    .take(rdna_compute::tensor_ops::QSA_CORE_LANES_MAX)
+                    .map_while(|s| match s {
+                        Step::IndexedAttention(op)
+                            if op.phase == MixerPhase::Core
+                                && op.q_norm.buf.as_ptr() == first.q_norm.buf.as_ptr() =>
+                        {
+                            Some(op)
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                let group = ops.len();
+                // The OutProj phase that follows the group (the fused lane attention
+                // may rotate its input, `HIPFIRE_QWEN4_QSA_LANES_FUSE`).
+                let out_proj = match steps[..end].get(i + group) {
+                    Some(Step::IndexedAttention(next)) if next.phase == MixerPhase::OutProj => {
+                        Some(next)
+                    }
+                    _ => None,
+                };
+                if group >= 2
+                    && crate::pipeline::layer_ops::execute_indexed_attention_core_lanes(
+                        gpu,
+                        &ops,
+                        out_proj,
+                        |gpu| {
+                            for step in &steps[i..i + group] {
+                                hooks.before_step(gpu, step)?;
+                            }
+                            Ok(())
+                        },
+                    )?
+                {
+                    i += group;
+                    continue;
+                }
             }
         }
         hooks.before_step(gpu, &steps[i])?;
@@ -1237,7 +1297,9 @@ fn execute_window<'a>(
             {
                 let write = match steps[..end].get(i + 2) {
                     Some(Step::HyperWrite(write))
-                        if (hc_level >= 3 || row_fold_moe_1201) && *pregated == Some(i + 2) =>
+                        if (hc_level >= 3 || row_fold_moe_1201)
+                            && *pregated == Some(i + 2)
+                            && write.ar.is_none() =>
                     {
                         Some(write)
                     }
@@ -1451,6 +1513,8 @@ fn paired_hyper_write<'s, 'a>(
             | Step::Clear(_)
             | Step::Moe(_)
             | Step::MoeStage(..) => {}
+            // A gather of rows other than the paired streams (`hc_mixed`) leaves the streams alone.
+            Step::RowGather(gather) if gather.tensor.buf.as_ptr() != streams => {}
             Step::HyperWrite(write) if write.input.buf.as_ptr() == streams => {
                 return Some((j, write));
             }
@@ -1979,6 +2043,7 @@ pub(crate) fn launch_op_rows(
         Step::GatedShortConv(op) => crate::pipeline::layer_ops::execute_gated_short_conv(gpu, op),
         Step::LaneAttention(op) => crate::pipeline::layer_ops::execute_lane_attention(gpu, op),
         Step::Clear(op) => crate::pipeline::layer_ops::execute_clear(gpu, op),
+        Step::RowGather(op) => crate::pipeline::layer_ops::execute_row_gather(gpu, op),
         Step::Embed(op) => crate::pipeline::layer_ops::execute_embedding(gpu, op),
         Step::HyperNorm(op) => crate::pipeline::layer_ops::execute_hyper_norm(gpu, op),
         Step::Project(op) => crate::pipeline::layer_ops::execute_project(gpu, op),

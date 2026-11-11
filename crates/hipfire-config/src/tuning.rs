@@ -585,38 +585,32 @@ mod prior_map {
 }
 
 /// Write the new `config.toml` and `tuning.toml` (spec §2.5 order): the state
-/// goes to a temp file, then `config.toml` is written, then the state is
-/// renamed into place. An empty state removes `tuning.toml`.
+/// goes to a staging file private to this call, then `config.toml` is written,
+/// then the state is renamed into place. An empty state removes `tuning.toml`.
 pub fn commit(paths: &ConfigPaths, layer: &ConfigLayer, state: &TuningState) -> Result<()> {
-    let tmp = paths
-        .tuning_toml
-        .with_extension(format!("tmp.{}", std::process::id()));
-    let write_err = |path: &Path, source| ConfigError::Write {
-        path: path.to_owned(),
-        source,
-    };
-    if !state.is_empty() {
+    let staged = if state.is_empty() {
+        None
+    } else {
         let rendered = state.to_toml_string()?;
-        if let Some(parent) = tmp.parent() {
-            std::fs::create_dir_all(parent).map_err(|source| write_err(parent, source))?;
-        }
-        std::fs::write(&tmp, rendered).map_err(|source| write_err(&tmp, source))?;
-    }
+        Some(crate::stage_file(&paths.tuning_toml, rendered.as_bytes())?)
+    };
     if let Err(error) = write_global_toml(paths, layer) {
-        let _ = std::fs::remove_file(&tmp);
+        if let Some(tmp) = &staged {
+            let _ = std::fs::remove_file(tmp);
+        }
         return Err(error);
     }
-    if state.is_empty() {
-        match std::fs::remove_file(&paths.tuning_toml) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(source) => return Err(write_err(&paths.tuning_toml, source)),
-        }
-    } else {
-        std::fs::rename(&tmp, &paths.tuning_toml)
-            .map_err(|source| write_err(&paths.tuning_toml, source))?;
+    match staged {
+        Some(tmp) => crate::publish_staged(&tmp, &paths.tuning_toml),
+        None => match std::fs::remove_file(&paths.tuning_toml) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(source) => Err(ConfigError::Write {
+                path: paths.tuning_toml.clone(),
+                source,
+            }),
+        },
     }
-    Ok(())
 }
 
 // ------------------------------------------------------------ apply / undo
@@ -1435,6 +1429,70 @@ mod tests {
         assert!(!paths.tuning_toml.exists());
         // Single level.
         assert!(undo(&undone.layer, &undone.state).is_none());
+        std::fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    /// `commit` stages the state file before it writes `config.toml`, so two
+    /// threads of one process committing at once must not share a staging
+    /// file: a shared one made the second rename fail (`No such file or
+    /// directory`) or published a mix of both states. Sixteen barrier-released
+    /// threads committing different states into one root must all succeed and
+    /// leave one whole `tuning.toml`, a parsable `config.toml` and no staging
+    /// file.
+    #[test]
+    fn concurrent_commits_all_succeed_and_leave_whole_files() {
+        const THREADS: u64 = 16;
+        const ROUNDS: usize = 50;
+        let paths = temp_paths("commit-concurrent");
+        let context = ctx("gfx1201", A8Prefill::NotLanded);
+        let global = layer(&[("generation.max_tokens", ConfigValue::Integer(1234))]);
+        let q = plan(Preset::QualityFirst, &context, &env_ok());
+        // Same layer, a different `now` per thread: distinct state payloads.
+        let outcomes: Vec<ApplyOutcome> = (0..THREADS)
+            .map(|thread| {
+                apply(
+                    &global,
+                    &TuningState::default(),
+                    &q,
+                    &q.default_ticked(),
+                    100 + thread,
+                )
+                .unwrap()
+            })
+            .collect();
+        let start = std::sync::Barrier::new(THREADS as usize);
+        std::thread::scope(|scope| {
+            for outcome in &outcomes {
+                let (paths, start) = (&paths, &start);
+                scope.spawn(move || {
+                    start.wait();
+                    for round in 0..ROUNDS {
+                        commit(paths, &outcome.layer, &outcome.state)
+                            .unwrap_or_else(|error| panic!("round {round}: {error}"));
+                    }
+                });
+            }
+        });
+        let state = TuningState::load(&paths).unwrap();
+        assert!(
+            outcomes.iter().any(|outcome| outcome.state == state),
+            "tuning.toml is not one committer's whole state"
+        );
+        let loaded = crate::load_global(&paths).unwrap().layer;
+        assert_eq!(
+            loaded.get("generation.max_tokens"),
+            Some(&ConfigValue::Integer(1234))
+        );
+        let mut names: Vec<String> = std::fs::read_dir(&paths.root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["config.toml", "tuning.toml"],
+            "a staging file was left behind"
+        );
         std::fs::remove_dir_all(&paths.root).unwrap();
     }
 

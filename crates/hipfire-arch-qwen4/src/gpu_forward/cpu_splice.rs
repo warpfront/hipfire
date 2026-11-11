@@ -394,17 +394,105 @@ fn host_range_table(
         .collect()
 }
 
+/// The CPU arm's ownership mask over one tier layer: `1` for a cold expert the
+/// GPU arm does not own, `0` otherwise. An empty `pcie` (no share) and an
+/// all-`false` one both give `1` for every cold expert, the mask before the
+/// share existed.
+pub(super) fn cpu_owned_mask(cold: &[bool], pcie: &[bool]) -> Vec<u8> {
+    cold.iter()
+        .enumerate()
+        .map(|(expert, &is_cold)| u8::from(is_cold && !pcie.get(expert).copied().unwrap_or(false)))
+        .collect()
+}
+
+/// Which cold experts of one tier layer the GPU arm reads over PCIe instead of
+/// the CPU arm computing them: a deterministic partition by routing mass.
+///
+/// `cold[e]` marks the host-mapped experts and `mass[e]` is every expert's
+/// routing count (the hot-set sidecar's `counts`); `ppm` is the fraction of the
+/// cold mass the GPU arm takes, in parts per million. Cold experts are
+/// visited in cold rank order (mass descending, expert id ascending), each
+/// weighted `mass + 1` (an expert the calibration never routed still counts, so
+/// the rule balances per-call counts rather than degenerating on zero mass).
+/// An expert goes to the GPU arm exactly when doing so leaves the running GPU
+/// mass nearer the running target `ppm * (mass visited so far)` than leaving
+/// it on the CPU arm, i.e. when `assigned + w / 2 < target` (strict). That
+/// error-diffusion rule spreads the GPU-owned experts evenly across the cold
+/// rank order (a `0.5` share alternates CPU, GPU, CPU, GPU, ...; no contiguous
+/// block of the hottest or the coldest), keeps the GPU-owned mass within half
+/// the heaviest expert of `ppm * (cold mass)`, and is exact integer arithmetic
+/// (`u128`), so the same inputs give the same partition on every host.
+/// `ppm == 0` owns nothing on the GPU arm (every cold expert stays CPU-owned:
+/// today's mask, byte for byte) and `ppm >= 1_000_000` owns every cold expert.
+/// A non-cold expert is never GPU-owned. `mass` shorter than `cold` is treated
+/// as zero-mass past its end.
+pub(super) fn pcie_partition(cold: &[bool], mass: &[u64], ppm: u32) -> Vec<bool> {
+    const ONE: u128 = hipfire_config::memory::D2_PCIE_SHARE_PPM_ONE as u128;
+    let ppm = u128::from(ppm).min(ONE);
+    let weight = |expert: usize| u128::from(mass.get(expert).copied().unwrap_or(0)) + 1;
+    let mut order: Vec<usize> = (0..cold.len()).filter(|&e| cold[e]).collect();
+    order.sort_by(|&a, &b| weight(b).cmp(&weight(a)).then(a.cmp(&b)));
+    let mut pcie = vec![false; cold.len()];
+    let (mut visited, mut assigned) = (0u128, 0u128);
+    for expert in order {
+        let w = weight(expert);
+        visited += w;
+        // assigned + w/2 < ppm * visited / ONE, scaled by 2 * ONE.
+        if 2 * assigned * ONE + w * ONE < 2 * ppm * visited {
+            pcie[expert] = true;
+            assigned += w;
+        }
+    }
+    pcie
+}
+
+/// The fraction (`0..=1`) of a layer's routing mass its cold experts carry.
+/// With no routing mass at all (`mass` empty or all zero) the cold fraction of
+/// the expert count.
+pub(super) fn cold_mass_fraction(cold: &[bool], mass: &[u64]) -> f64 {
+    let (mut cold_sum, mut all_sum) = (0u128, 0u128);
+    for (expert, &is_cold) in cold.iter().enumerate() {
+        let m = u128::from(mass.get(expert).copied().unwrap_or(0));
+        all_sum += m;
+        if is_cold {
+            cold_sum += m;
+        }
+    }
+    if all_sum == 0 {
+        let cold_count = cold.iter().filter(|&&c| c).count();
+        return if cold.is_empty() {
+            0.0
+        } else {
+            cold_count as f64 / cold.len() as f64
+        };
+    }
+    cold_sum as f64 / all_sum as f64
+}
+
 /// CPU views of one tier layer's COLD (host-mapped) experts.
 ///
 /// Addresses come from the lease's `host_cpu_range` (the pinned host owner's
 /// CPU address) plus each tier entry's owner-relative spans, never from the
 /// mapped device alias a device pointer table carries. The lease is retained
 /// here, so the owner outlives every returned slice.
+///
+/// Every cold expert keeps its CPU span (the parity lab's all-cold endpoint
+/// reads any of them); [`Self::placement`] names the subset the CPU arm owns,
+/// which is every cold expert unless [`Self::with_pcie_share`] gave a share of
+/// them to the GPU arm.
 pub(super) struct CpuTierOwners {
     /// Keeps the immutable CPU owner mapping alive.
     _lease: crate::expert_tier_owners::ExpertTierLease,
+    layer: usize,
     host_base: usize,
     ranges: Vec<Option<HostExpertRanges>>,
+    /// Cold experts the GPU arm reads over PCIe; empty when the CPU arm owns
+    /// every cold expert.
+    pcie: Vec<bool>,
+    /// The PCIe share this layer was partitioned with (parts per million).
+    share_ppm: u32,
+    /// How the layer's share was sized (`auto`'s predicted times).
+    share_plan: Option<crate::d2_default::LayerSharePlan>,
 }
 
 impl CpuTierOwners {
@@ -441,9 +529,45 @@ impl CpuTierOwners {
         let ranges = host_range_table(entries.into_iter(), gate_up_bytes, down_bytes, host_len)?;
         Ok(Self {
             _lease: lease.clone(),
+            layer,
             host_base,
             ranges,
+            pcie: Vec::new(),
+            share_ppm: 0,
+            share_plan: None,
         })
+    }
+
+    /// Give a share of this layer's cold experts to the GPU arm: the plan's
+    /// share for this layer ([`crate::d2_default::PcieShare::plan_layer`]: fixed,
+    /// or priced from the layer's own routing counts), partitioned by
+    /// [`pcie_partition`] over the lease's sidecar counts (uniform mass when
+    /// none are bound). A share of `0` leaves the owner exactly as
+    /// [`Self::new`] built it.
+    pub(super) fn with_pcie_share(mut self, share: crate::d2_default::PcieShare) -> Self {
+        let uniform;
+        let counts = match self._lease.hotset_layer_counts(self.layer) {
+            Some(counts) => counts,
+            None => {
+                uniform = vec![1u64; self.ranges.len()];
+                &uniform
+            }
+        };
+        let cold: Vec<bool> = self.ranges.iter().map(Option::is_some).collect();
+        let plan = share.plan_layer(&cold, counts, &|ppm| pcie_partition(&cold, counts, ppm));
+        self.share_plan = Some(plan);
+        if plan.ppm == 0 {
+            return self;
+        }
+        self.pcie = pcie_partition(&cold, counts, plan.ppm);
+        self.share_ppm = plan.ppm;
+        self
+    }
+
+    /// The share plan this layer was sized with, `None` before
+    /// [`Self::with_pcie_share`].
+    pub(super) fn share_plan(&self) -> Option<crate::d2_default::LayerSharePlan> {
+        self.share_plan
     }
 
     /// Borrowed CPU payload of one cold expert; `None` for a device-resident
@@ -488,13 +612,50 @@ impl CpuTierOwners {
         self.ranges.iter().flatten().count()
     }
 
-    /// The split's per-expert ownership mask: `1` for every host-mapped
-    /// (cold) expert, `0` for a device-resident one.
-    fn placement(&self) -> Vec<u8> {
+    /// The split's per-expert ownership mask: `1` for every host-mapped (cold)
+    /// expert the CPU arm computes, `0` for a device-resident one and for a
+    /// cold expert the GPU arm reads over PCIe ([`Self::with_pcie_share`]).
+    /// With no share this is every cold expert, as before the share existed.
+    pub(super) fn placement(&self) -> Vec<u8> {
+        let cold: Vec<bool> = self.ranges.iter().map(Option::is_some).collect();
+        cpu_owned_mask(&cold, &self.pcie)
+    }
+
+    /// `1` for every host-mapped (cold) expert of this layer, whichever arm serves it
+    /// (CPU-owned and PCIe-owned alike): the tier counters' host mask. Unlike
+    /// [`Self::placement`] it ignores the PCIe share.
+    pub(super) fn host_mask(&self) -> Vec<u8> {
+        cpu_owned_mask(
+            &self.ranges.iter().map(Option::is_some).collect::<Vec<_>>(),
+            &[],
+        )
+    }
+
+    /// `1` for each cold expert the GPU arm reads over PCIe; `None` when the
+    /// CPU arm owns every cold expert.
+    pub(super) fn pcie_owned(&self) -> Option<Vec<u8>> {
+        (!self.pcie.is_empty()).then(|| self.pcie.iter().map(|&p| u8::from(p)).collect())
+    }
+
+    /// The PCIe share this layer was partitioned with, parts per million.
+    pub(super) fn share_ppm(&self) -> u32 {
+        self.share_ppm
+    }
+
+    /// `(CPU-owned, PCIe-owned)` cold experts of this layer.
+    pub(super) fn owned_counts(&self) -> (usize, usize) {
+        let pcie = self.pcie.iter().filter(|&&p| p).count();
+        (self.cold_experts() - pcie, pcie)
+    }
+
+    /// Bytes of one host-mapped expert (gate/up + down; every cold expert has the
+    /// same extents), `None` when the layer has no cold expert.
+    fn cold_expert_bytes(&self) -> Option<usize> {
         self.ranges
             .iter()
-            .map(|range| u8::from(range.is_some()))
-            .collect()
+            .flatten()
+            .next()
+            .map(|(gate_up, down)| gate_up.len() + down.len())
     }
 }
 
@@ -563,12 +724,72 @@ impl HostSpanOwner {
         }
     }
 
+    /// Every expert that lives in host memory, whichever arm serves it (`1`), against the
+    /// device-resident ones (`0`). Equal to [`Self::placement`] while the CPU arm serves
+    /// every host-resident expert; the tier counters read this one so a CPU share of
+    /// the cold experts still counts the rest as PCIe-served.
+    pub(super) fn host_mask(&self) -> Vec<u8> {
+        match self {
+            Self::Tier(owners) => owners.host_mask(),
+            other => other.placement(),
+        }
+    }
+
+    /// Bytes of one host-resident expert when uniform across the layer (a codec-mixed
+    /// slab arena is not).
+    pub(super) fn cold_expert_bytes(&self) -> Option<usize> {
+        match self {
+            Self::Tier(owners) => owners.cold_expert_bytes(),
+            Self::WholeLayer(owners) => Some(owners.gate_up_stride + owners.down_stride),
+            Self::Slab(_) => None,
+        }
+    }
+
     /// Experts the CPU arm serves on this layer.
     pub(super) fn cold_experts(&self) -> usize {
         match self {
             Self::Tier(owners) => owners.cold_experts(),
             Self::WholeLayer(owners) => owners.experts,
             Self::Slab(owners) => owners.cold_experts(),
+        }
+    }
+
+    /// Apply the load's PCIe share to a hot-set tier owner (the only kind
+    /// that has device-resident experts to balance against); every other owner
+    /// kind is returned unchanged.
+    pub(super) fn with_pcie_share(self, share: crate::d2_default::PcieShare) -> Self {
+        match self {
+            Self::Tier(owners) => Self::Tier(owners.with_pcie_share(share)),
+            other => other,
+        }
+    }
+
+    /// Cold experts the GPU arm reads over PCIe (`1` per expert id); `None`
+    /// when the CPU arm owns every cold expert.
+    pub(super) fn pcie_owned(&self) -> Option<Vec<u8>> {
+        match self {
+            Self::Tier(owners) => owners.pcie_owned(),
+            Self::WholeLayer(_) | Self::Slab(_) => None,
+        }
+    }
+
+    /// `(CPU-owned, PCIe-owned)` cold experts and the layer's share in parts
+    /// per million. Un-tiered owner kinds are all CPU-owned.
+    pub(super) fn share_counts(&self) -> (usize, usize, u32) {
+        match self {
+            Self::Tier(owners) => {
+                let (cpu, pcie) = owners.owned_counts();
+                (cpu, pcie, owners.share_ppm())
+            }
+            other => (other.cold_experts(), 0, 0),
+        }
+    }
+
+    /// How a tier layer's share was sized; `None` for other owner kinds.
+    pub(super) fn share_plan(&self) -> Option<crate::d2_default::LayerSharePlan> {
+        match self {
+            Self::Tier(owners) => owners.share_plan(),
+            _ => None,
         }
     }
 }
@@ -806,11 +1027,17 @@ pub(super) fn layer_bitmap_hex(labels: &[usize]) -> String {
 /// artifact's, so there is no plan to freeze). Parts are joined with `+`.
 /// `tier` is the tier-split layers' digest and bound sidecar SHA; a tier layer
 /// set without it is not an identity and yields `unbound` digest zeros rather
-/// than silently collapsing into another mode.
+/// than silently collapsing into another mode. `pcie_share` is the
+/// [`pcie_share_digest`] of a load whose tier layers gave some cold experts to
+/// the GPU arm: it appends `/pcie-share-v1=<hex>` to the tier part (those
+/// experts run the GPU arithmetic instead of the CPU arm's, a different
+/// numerical domain per partition). `None` leaves the string exactly as it was
+/// before the share existed.
 pub(super) fn host_exec_identity(
     cpu_all: &[usize],
     splits: &[(SplitOwnerKind, &[usize])],
     tier: Option<(&[u8; 32], Option<&str>)>,
+    pcie_share: Option<&str>,
 ) -> String {
     let mut parts = Vec::new();
     if !cpu_all.is_empty() {
@@ -830,9 +1057,12 @@ pub(super) fn host_exec_identity(
                     let _ = write!(digest_hex, "{byte:02x}");
                 }
                 parts.push(format!(
-                    "cpu-tier-split-v1/{digest_hex}/{}/hotset-sha256={}",
+                    "cpu-tier-split-v1/{digest_hex}/{}/hotset-sha256={}{}",
                     layer_bitmap_hex(layers),
                     sidecar.unwrap_or("unbound"),
+                    pcie_share
+                        .map(|share| format!("/pcie-share-v1={share}"))
+                        .unwrap_or_default(),
                 ));
             }
             SplitOwnerKind::WholeLayer => {
@@ -844,6 +1074,33 @@ pub(super) fn host_exec_identity(
         }
     }
     parts.join("+")
+}
+
+/// The identity token of a PCIe-share partition: SHA-256 over every armed tier
+/// layer's `(label, GPU-owned cold-expert mask)` in layer order, 32 hex
+/// digits. `layers` holds only the layers that gave experts to the GPU arm; no
+/// such layer is `None`, which keeps the identity string exactly as it was
+/// without a share. The digest names the partition itself, not the knob that
+/// produced it, so a measured (`auto`) share never aliases another partition.
+pub(super) fn pcie_share_digest(layers: &[(usize, &[u8])]) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+    if layers.is_empty() {
+        return None;
+    }
+    let mut hash = Sha256::new();
+    hash.update(b"hipfire.d2.pcie_share.v1");
+    for &(label, mask) in layers {
+        hash.update((label as u64).to_le_bytes());
+        hash.update((mask.len() as u64).to_le_bytes());
+        hash.update(mask);
+    }
+    let digest = hash.finalize();
+    let mut hex = String::with_capacity(32);
+    for byte in &digest[..16] {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    Some(hex)
 }
 
 #[cfg(test)]
@@ -1199,9 +1456,11 @@ mod tests {
     fn split_arming_truth_table_any_arch() {
         // (arch, explicit hot-set path, armed)
         for (arch, explicit_path, armed) in [
-            // The default sibling sidecar builds a plan on gfx1201 only.
+            // The default sibling sidecar builds a plan on gfx1201 and (the gfx1100 tier
+            // package, default on) exact gfx1100; every other arch is byte-unchanged.
             ("gfx1201", false, true),
-            ("gfx1100", false, false),
+            ("gfx1100", false, true),
+            ("gfx1101", false, false),
             ("gfx1151", false, false),
             ("gfx1200", false, false),
             ("gfx942", false, false),
@@ -1222,7 +1481,7 @@ mod tests {
         // un-tiered host-mapped aggregate layer arms on every arch whatever
         // the hot-set rule says.
         assert_eq!(
-            split_on("gfx1100", false).refusal(),
+            split_on("gfx1151", false).refusal(),
             Some(SplitRefusal::NoSpanOwner)
         );
         for arch in ["gfx1100", "gfx1151", "gfx1201", "gfx942"] {
@@ -1425,15 +1684,19 @@ mod tests {
     #[test]
     fn host_exec_identity_is_empty_unless_cpu_arithmetic_armed() {
         use SplitOwnerKind::{Tier, WholeLayer};
-        assert_eq!(host_exec_identity(&[], &[], None), "");
+        assert_eq!(host_exec_identity(&[], &[], None, None), "");
         let all: Vec<usize> = (0..48).collect();
         assert_eq!(
-            host_exec_identity(&all, &[], None),
+            host_exec_identity(&all, &[], None, None),
             "cpu-all-v1/ffffffffffff"
         );
         let digest = [0xabu8; 32];
-        let split =
-            host_exec_identity(&[], &[(Tier, &all)], Some((&digest, Some(&"c".repeat(64)))));
+        let split = host_exec_identity(
+            &[],
+            &[(Tier, &all)],
+            Some((&digest, Some(&"c".repeat(64)))),
+            None,
+        );
         assert_eq!(
             split,
             format!(
@@ -1442,7 +1705,7 @@ mod tests {
                 "c".repeat(64)
             )
         );
-        let unbound = host_exec_identity(&[], &[(Tier, &all)], Some((&digest, None)));
+        let unbound = host_exec_identity(&[], &[(Tier, &all)], Some((&digest, None)), None);
         assert!(unbound.ends_with("/hotset-sha256=unbound"), "{unbound}");
         // Distinct modes, plans and armed layer sets never collide.
         let fewer: Vec<usize> = (0..47).collect();
@@ -1450,6 +1713,7 @@ mod tests {
             &[],
             &[(Tier, &fewer)],
             Some((&digest, Some(&"c".repeat(64)))),
+            None,
         );
         assert_ne!(split, other);
         let other_digest = [0xacu8; 32];
@@ -1458,21 +1722,24 @@ mod tests {
             host_exec_identity(
                 &[],
                 &[(Tier, &all)],
-                Some((&other_digest, Some(&"c".repeat(64))))
+                Some((&other_digest, Some(&"c".repeat(64)))),
+                None,
             )
         );
-        assert_ne!(split, host_exec_identity(&all, &[], None));
-        assert!(host_exec_identity(&all, &[(Tier, &all)], Some((&digest, None))).contains('+'));
+        assert_ne!(split, host_exec_identity(&all, &[], None, None));
+        assert!(
+            host_exec_identity(&all, &[(Tier, &all)], Some((&digest, None)), None).contains('+')
+        );
         // The un-tiered whole-layer split has its own identity: no tier digest
         // or sidecar (there is no plan to freeze: every host expert is cold),
         // never aliasing the tier or D1 strings.
-        let whole = host_exec_identity(&[], &[(WholeLayer, &all)], None);
+        let whole = host_exec_identity(&[], &[(WholeLayer, &all)], None, None);
         assert_eq!(whole, "cpu-whole-split-v1/ffffffffffff");
         assert_ne!(whole, split);
-        assert_ne!(whole, host_exec_identity(&all, &[], None));
+        assert_ne!(whole, host_exec_identity(&all, &[], None, None));
         assert_ne!(
             whole,
-            host_exec_identity(&[], &[(WholeLayer, &fewer)], None)
+            host_exec_identity(&[], &[(WholeLayer, &fewer)], None, None)
         );
         // Both split kinds on one load join in the fixed caller order.
         let tier_labels = [3usize];
@@ -1480,13 +1747,17 @@ mod tests {
             &[],
             &[(Tier, &tier_labels), (WholeLayer, &fewer)],
             Some((&digest, Some(&"c".repeat(64)))),
+            None,
         );
         assert!(both.starts_with("cpu-tier-split-v1/"), "{both}");
         assert!(both.contains("+cpu-whole-split-v1/"), "{both}");
         // The slab kind has its own frozen spelling, distinct from both.
-        let slab = host_exec_identity(&[], &[(SplitOwnerKind::Slab, &fewer)], None);
+        let slab = host_exec_identity(&[], &[(SplitOwnerKind::Slab, &fewer)], None, None);
         assert!(slab.starts_with("cpu-slab-split-v1/"), "{slab}");
-        assert_ne!(slab, host_exec_identity(&[], &[(WholeLayer, &fewer)], None));
+        assert_ne!(
+            slab,
+            host_exec_identity(&[], &[(WholeLayer, &fewer)], None, None)
+        );
         let all_kinds = host_exec_identity(
             &[],
             &[
@@ -1495,8 +1766,215 @@ mod tests {
                 (SplitOwnerKind::Slab, &fewer),
             ],
             Some((&digest, Some(&"c".repeat(64)))),
+            None,
         );
         assert!(all_kinds.ends_with(&format!("+{slab}")), "{all_kinds}");
+    }
+
+    /// A 512-expert layer: experts `0..hot` device-resident, the rest cold,
+    /// with a strictly decreasing routing count by expert id (so id order is
+    /// the cold rank order).
+    fn share_layer(hot: usize) -> (Vec<bool>, Vec<u64>) {
+        let cold = (0..EXPERTS).map(|e| e >= hot).collect();
+        let mass = (0..EXPERTS).map(|e| 100_000 - 150 * e as u64).collect();
+        (cold, mass)
+    }
+
+    fn mask_bytes(mask: &[bool]) -> Vec<u8> {
+        mask.iter().map(|&b| u8::from(b)).collect()
+    }
+
+    #[test]
+    fn share_identity_names_the_partition_and_is_unchanged_without_one() {
+        use SplitOwnerKind::Tier;
+        let all: Vec<usize> = (0..48).collect();
+        let digest = [0xabu8; 32];
+        let side = Some((&digest, Some(&"c".repeat(64)[..])));
+        let plain = host_exec_identity(&[], &[(Tier, &all)], side, None);
+        // No share: the string is byte-for-byte the pre-share identity.
+        assert!(!plain.contains("pcie-share"), "{plain}");
+        assert_eq!(pcie_share_digest(&[]), None);
+        let (cold, mass) = share_layer(100);
+        let half = mask_bytes(&pcie_partition(&cold, &mass, 500_000));
+        let third = mask_bytes(&pcie_partition(&cold, &mass, 333_333));
+        let token = |layers: &[(usize, &[u8])]| pcie_share_digest(layers).unwrap();
+        let (a, b) = (token(&[(3, &half)]), token(&[(3, &third)]));
+        assert_eq!(a.len(), 32);
+        assert_ne!(a, b, "different partitions never share a token");
+        assert_ne!(a, token(&[(4, &half)]), "the layer label is part of it");
+        assert_ne!(a, token(&[(3, &half), (4, &half)]));
+        assert_eq!(a, token(&[(3, &half)]), "deterministic");
+        let shared = host_exec_identity(&[], &[(Tier, &all)], side, Some(&a));
+        assert_eq!(shared, format!("{plain}/pcie-share-v1={a}"));
+        assert_ne!(
+            shared,
+            host_exec_identity(&[], &[(Tier, &all)], side, Some(&b))
+        );
+    }
+
+    #[test]
+    fn share_zero_keeps_exactly_todays_placement_vector() {
+        for hot in [0usize, 1, 100, 300, 511, 512] {
+            let (cold, mass) = share_layer(hot);
+            let none = pcie_partition(&cold, &mass, 0);
+            assert!(none.iter().all(|&owned| !owned), "hot={hot}");
+            // Today's mask is `1` for every cold expert; no GPU share is the
+            // empty list the owner starts with, and an all-false partition
+            // yields the same vector.
+            let today = mask_bytes(&cold);
+            assert_eq!(cpu_owned_mask(&cold, &[]), today, "hot={hot}");
+            assert_eq!(cpu_owned_mask(&cold, &none), today, "hot={hot}");
+        }
+    }
+
+    #[test]
+    fn share_one_gives_every_cold_expert_to_the_gpu_arm_and_the_cpu_arm_none() {
+        for hot in [0usize, 100, 511] {
+            let (cold, mass) = share_layer(hot);
+            let all = pcie_partition(&cold, &mass, hipfire_config::memory::D2_PCIE_SHARE_PPM_ONE);
+            assert_eq!(all, cold, "hot={hot}");
+            // Nothing left for the CPU arm: such a layer is not armed.
+            assert!(cpu_owned_mask(&cold, &all).iter().all(|&v| v == 0));
+            // A share above one is the same as one.
+            assert_eq!(pcie_partition(&cold, &mass, u32::MAX), all);
+        }
+        // No cold expert at all: nothing to own, at any share.
+        let (cold, mass) = share_layer(512);
+        assert!(pcie_partition(&cold, &mass, 500_000).iter().all(|&v| !v));
+    }
+
+    #[test]
+    fn share_partition_is_deterministic_and_never_touches_device_experts() {
+        let (cold, mass) = share_layer(180);
+        for ppm in [1u32, 50_000, 250_000, 500_000, 750_000, 999_999] {
+            let first = pcie_partition(&cold, &mass, ppm);
+            assert_eq!(first, pcie_partition(&cold, &mass, ppm), "ppm={ppm}");
+            for expert in 0..180 {
+                assert!(!first[expert], "ppm={ppm}: device expert {expert} owned");
+            }
+            // CPU-owned and GPU-owned cold experts partition the cold set.
+            let cpu = cpu_owned_mask(&cold, &first);
+            for expert in 0..EXPERTS {
+                let owners = u8::from(first[expert]) + cpu[expert];
+                assert_eq!(owners, u8::from(cold[expert]), "ppm={ppm} expert {expert}");
+            }
+        }
+        // Order of equal masses is the expert id, so ties are stable.
+        let flat = vec![7u64; EXPERTS];
+        let all_cold = vec![true; EXPERTS];
+        let first = pcie_partition(&all_cold, &flat, 400_000);
+        assert_eq!(first, pcie_partition(&all_cold, &flat, 400_000));
+    }
+
+    #[test]
+    fn share_partition_balances_mass_and_interleaves_the_rank_order() {
+        let (cold, mass) = share_layer(100);
+        let cold_mass: u128 = (100..EXPERTS).map(|e| u128::from(mass[e]) + 1).sum();
+        let heaviest = u128::from(mass[100]) + 1;
+        for ppm in [100_000u32, 250_000, 500_000, 800_000] {
+            let pcie = pcie_partition(&cold, &mass, ppm);
+            let owned: u128 = (0..EXPERTS)
+                .filter(|&e| pcie[e])
+                .map(|e| u128::from(mass[e]) + 1)
+                .sum();
+            let target = u128::from(ppm) * cold_mass / 1_000_000;
+            let error = owned.abs_diff(target);
+            assert!(
+                error <= heaviest,
+                "ppm={ppm}: owned {owned} vs target {target}"
+            );
+            // Spread, not blocked: the GPU-owned experts are found in every
+            // quarter of the cold rank order.
+            let quarter = (EXPERTS - 100) / 4;
+            for q in 0..4 {
+                let lo = 100 + q * quarter;
+                assert!(
+                    pcie[lo..lo + quarter].iter().any(|&p| p),
+                    "ppm={ppm}: quarter {q} has no GPU-owned expert"
+                );
+            }
+        }
+        // One half alternates CPU, GPU, CPU, GPU, ... over equal masses.
+        let flat = vec![0u64; 8];
+        let pcie = pcie_partition(&[true; 8], &flat, 500_000);
+        assert_eq!(
+            pcie,
+            [false, true, false, true, false, true, false, true],
+            "equal masses at one half alternate"
+        );
+    }
+
+    #[test]
+    fn share_partition_grows_monotonically_with_the_share() {
+        // Equal masses: the GPU-owned count is a rounding of `share * cold`,
+        // so it never shrinks as the share grows (with unequal masses the
+        // owned MASS tracks the target within the heaviest expert instead).
+        let (cold, _) = share_layer(100);
+        let mass = vec![5u64; EXPERTS];
+        let mut last = 0usize;
+        for ppm in (0..=1_000_000u32).step_by(50_000) {
+            let owned = pcie_partition(&cold, &mass, ppm)
+                .iter()
+                .filter(|&&p| p)
+                .count();
+            assert!(owned >= last, "ppm={ppm}: {owned} < {last}");
+            last = owned;
+        }
+        assert_eq!(last, EXPERTS - 100);
+    }
+
+    #[test]
+    fn tier_counters_count_pcie_owned_cold_experts_as_cold_not_hot() {
+        // The tier counters' host mask is every host-mapped expert whichever arm serves it;
+        // the executor's placement excludes the GPU-owned ones. Counting with the placement
+        // as the host mask would call PCIe-owned experts device-resident.
+        let (cold, mass) = share_layer(300);
+        let pcie = pcie_partition(&cold, &mass, 250_000);
+        let placement = cpu_owned_mask(&cold, &pcie);
+        let host = cpu_owned_mask(&cold, &[]);
+        assert_eq!(host, mask_bytes(&cold), "the host mask ignores the share");
+        let pcie_ids: Vec<i32> = (0..EXPERTS)
+            .filter(|&e| pcie[e])
+            .map(|e| e as i32)
+            .collect();
+        let cpu_ids: Vec<i32> = (0..EXPERTS)
+            .filter(|&e| cold[e] && !pcie[e])
+            .take(7)
+            .map(|e| e as i32)
+            .collect();
+        let hot_ids = [0i32, 5, 299];
+        assert!(pcie_ids.len() > 10);
+        let ids: Vec<i32> = pcie_ids
+            .iter()
+            .chain(&cpu_ids)
+            .chain(&hot_ids)
+            .copied()
+            .collect();
+        let mut seen = vec![0u64; EXPERTS.div_ceil(64)];
+        let right = hipfire_dispatch::cpu_split::tally_call(&ids, &placement, &host, &mut seen);
+        assert_eq!(
+            (right.hot, right.cold_cpu, right.cold_pcie),
+            (3, 7, pcie_ids.len() as u32)
+        );
+        // The old (placement-as-host) mask misfiles every PCIe-owned expert as hot.
+        let wrong =
+            hipfire_dispatch::cpu_split::tally_call(&ids, &placement, &placement, &mut seen);
+        assert_eq!(wrong.cold_pcie, 0);
+        assert_eq!(wrong.hot, 3 + pcie_ids.len() as u32);
+        // One PCIe-owned expert is one 2.6112 MB QT44+QT53 read.
+        assert_eq!(1_740_800u64 + 870_400, 2_611_200);
+    }
+
+    #[test]
+    fn cold_mass_fraction_is_the_mass_share_not_the_count_share() {
+        let cold = [true, false, true, false];
+        assert_eq!(cold_mass_fraction(&cold, &[1, 1, 1, 1]), 0.5);
+        assert_eq!(cold_mass_fraction(&cold, &[3, 0, 1, 0]), 1.0);
+        assert_eq!(cold_mass_fraction(&cold, &[1, 3, 0, 4]), 0.125);
+        // No routing mass: the count share.
+        assert_eq!(cold_mass_fraction(&cold, &[0, 0, 0, 0]), 0.5);
+        assert_eq!(cold_mass_fraction(&cold, &[]), 0.5);
+        assert_eq!(cold_mass_fraction(&[], &[]), 0.0);
     }
 
     /// The whole-layer owner resolves the same bytes D1's owners do, and

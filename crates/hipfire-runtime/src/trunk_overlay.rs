@@ -1,12 +1,17 @@
-//! Trunk overlay sidecar: pre-encoded QT44 tensors that replace a base
-//! model's MQ6 tensors at load.
+//! Trunk overlay sidecar: pre-encoded QT44 (or, for the Q8F16 measurement
+//! overlay, QT3) tensors that replace a base model's MQ6 tensors at load.
 //!
 //! The sidecar is an HFQM container (the model-file layout, written with
 //! [`write_hfqm_package_streaming`]) whose `arch_id` is the base's and whose
 //! tensors are QT44 matrices (`quant_type` 44, `group_size` 256, shape
-//! `[m, k]` of the base tensor it replaces, `data_size = m * (k / 256) * 136`),
-//! in base index order. Its metadata JSON is exactly one object key,
-//! [`TRUNK_OVERLAY_METADATA_KEY`], holding a [`TrunkOverlayManifest`].
+//! `[m, k]` of the base tensor it replaces, `data_size = m * (k / 256) * 136`)
+//! or, when the manifest entry says `"format": "qt3"`, Q8F16 matrices
+//! (`quant_type` 3, `group_size` 32, `data_size = m * (k / 32) * 34`: an f16
+//! scale and 32 int8 per block, the engine's `DType::Q8_0` rows), in base
+//! index order. Its metadata JSON is exactly one object key,
+//! [`TRUNK_OVERLAY_METADATA_KEY`], holding a [`TrunkOverlayManifest`]. An
+//! entry with no `format` key is QT44, so every sidecar written before the
+//! field existed binds and reads unchanged.
 //!
 //! # Binding
 //!
@@ -14,7 +19,7 @@
 //! length, sha256 of the base bytes `[0, data_offset)` (the PLE sidecar
 //! convention, [`HfqFile::index_sha256`]), manifest/index name agreement, and
 //! per-tensor agreement with the base (`quant_type`, `data_size`, shape) and
-//! with the QT44 size formula. The full-file `sha256` of the base is recorded
+//! with the size formula of the entry's format (QT44 or QT3). The full-file `sha256` of the base is recorded
 //! (verified by [`write_trunk_overlay`] at build time and by `hipfire pull` on
 //! download) and never recomputed at load. Payload sha256s are verified by
 //! [`BoundTrunkOverlay::read_verified`] when the payloads are read for upload.
@@ -26,8 +31,8 @@
 //! TrunkOverlayManifest / TrunkOverlayBase / TrunkOverlayTensor
 //! bind_trunk_overlay(base, path) -> Result<BoundTrunkOverlay, String>
 //! BoundTrunkOverlay::{path, manifest, marker, tensor_count, payload_bytes, read_verified}
-//! TrunkOverlayPayload { name, shape, bytes }
-//! write_trunk_overlay(base_path, payload_dir, suffixes, marker, output)
+//! TrunkOverlayPayload { name, shape, format, bytes }
+//! write_trunk_overlay(base_path, payload_dir, suffixes, marker, format, output)
 //!     -> Result<TrunkOverlayWriteReport, String>
 //! ```
 
@@ -51,6 +56,68 @@ pub const TRUNK_OVERLAY_VERSION: u32 = 1;
 const QT44_QUANT_TYPE: u8 = 44;
 /// QT44 group size (columns per group).
 const QT44_GROUP_SIZE: u32 = 256;
+/// Quant type byte of QT3 (Q8F16, `DType::Q8_0`) tensors.
+const QT3_QUANT_TYPE: u8 = 3;
+/// QT3 group size (columns per 34-byte block).
+const QT3_GROUP_SIZE: u32 = 32;
+/// Bytes of one QT3 block: an f16 scale and 32 int8 values.
+const QT3_BLOCK_BYTES: usize = 34;
+
+/// The payload format of one overlay tensor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrunkOverlayFormat {
+    /// MQ4G256V2: 136 bytes per 256 weights, `K % 256 == 0`.
+    #[default]
+    Qt44,
+    /// Q8F16 (`DType::Q8_0`): 34 bytes per 32 weights, `K % 32 == 0`.
+    Qt3,
+}
+
+impl TrunkOverlayFormat {
+    /// The HFQM `quant_type` byte the sidecar index carries.
+    pub const fn quant_type(self) -> u8 {
+        match self {
+            Self::Qt44 => QT44_QUANT_TYPE,
+            Self::Qt3 => QT3_QUANT_TYPE,
+        }
+    }
+
+    /// The HFQM `group_size` the sidecar index carries.
+    pub const fn group_size(self) -> u32 {
+        match self {
+            Self::Qt44 => QT44_GROUP_SIZE,
+            Self::Qt3 => QT3_GROUP_SIZE,
+        }
+    }
+
+    /// The name used in refusal messages.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Qt44 => "QT44",
+            Self::Qt3 => "QT3",
+        }
+    }
+
+    /// Exact payload bytes of an `[m, k]` matrix; `None` unless `k` is a
+    /// positive multiple of the group size, or on overflow.
+    pub fn payload_bytes(self, m: usize, k: usize) -> Option<usize> {
+        let group = self.group_size() as usize;
+        if k == 0 || k % group != 0 {
+            return None;
+        }
+        let groups = m.checked_mul(k / group)?;
+        match self {
+            Self::Qt44 => groups.checked_mul(rdna_compute::MQ4V2_GROUP_BYTES),
+            Self::Qt3 => groups.checked_mul(QT3_BLOCK_BYTES),
+        }
+    }
+
+    fn is_qt44(&self) -> bool {
+        *self == Self::Qt44
+    }
+}
+
 /// Streaming buffer for hashing the base file.
 const HASH_BUFFER_BYTES: usize = 8 << 20;
 
@@ -74,6 +141,9 @@ pub struct TrunkOverlayTensor {
     pub sha256: String,
     pub base_quant_type: u8,
     pub base_data_size: u64,
+    /// Payload format; absent (QT44) in every sidecar written before QT3.
+    #[serde(default, skip_serializing_if = "TrunkOverlayFormat::is_qt44")]
+    pub format: TrunkOverlayFormat,
 }
 
 /// The `hipfire_trunk_overlay` metadata object.
@@ -98,6 +168,7 @@ struct TrunkOverlayEnvelope {
 pub struct TrunkOverlayPayload {
     pub name: String,
     pub shape: [usize; 2],
+    pub format: TrunkOverlayFormat,
     pub bytes: Vec<u8>,
 }
 
@@ -120,14 +191,6 @@ impl std::fmt::Debug for BoundTrunkOverlay {
 
 fn is_hex64_lower(text: &str) -> bool {
     text.len() == 64 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-}
-
-fn qt44_payload_bytes(m: usize, k: usize) -> Option<usize> {
-    if k == 0 || k % QT44_GROUP_SIZE as usize != 0 {
-        return None;
-    }
-    m.checked_mul(k / QT44_GROUP_SIZE as usize)?
-        .checked_mul(rdna_compute::MQ4V2_GROUP_BYTES)
 }
 
 /// `[m, k]` of a rank-2 tensor.
@@ -226,22 +289,31 @@ pub fn bind_trunk_overlay(base: &HfqFile, path: &Path) -> Result<BoundTrunkOverl
                 info.shape.len()
             ));
         };
-        if info.quant_type != QT44_QUANT_TYPE || info.group_size != QT44_GROUP_SIZE {
+        let format = entry.format;
+        if info.quant_type != format.quant_type() || info.group_size != format.group_size() {
             return Err(format!(
-                "tensor {} is quant type {} group {}, not QT44 ({QT44_QUANT_TYPE}) group {QT44_GROUP_SIZE}",
-                info.name, info.quant_type, info.group_size
+                "tensor {} is quant type {} group {}, not {} ({}) group {}",
+                info.name,
+                info.quant_type,
+                info.group_size,
+                format.label(),
+                format.quant_type(),
+                format.group_size()
             ));
         }
-        let Some(expected) = qt44_payload_bytes(m, k) else {
+        let Some(expected) = format.payload_bytes(m, k) else {
             return Err(format!(
-                "tensor {} has K={k}, not a positive multiple of {QT44_GROUP_SIZE}",
-                info.name
+                "tensor {} has K={k}, not a positive multiple of {}",
+                info.name,
+                format.group_size()
             ));
         };
         if info.data_size != expected {
             return Err(format!(
-                "tensor {} is {} bytes, QT44 [{m}, {k}] is {expected}",
-                info.name, info.data_size
+                "tensor {} is {} bytes, {} [{m}, {k}] is {expected}",
+                info.name,
+                info.data_size,
+                format.label()
             ));
         }
         let Some(base_info) = base_by_name.get(entry.name.as_str()) else {
@@ -301,6 +373,22 @@ impl BoundTrunkOverlay {
             .sum()
     }
 
+    /// Resident device bytes the overlay adds on top of the base weights:
+    /// the payload bytes minus the base bytes of the tensors it replaces
+    /// (`base_data_size`). Positive for a Q8F16 (QT3) overlay (34 B per 32
+    /// weights replaces the six-bit trunk), negative for the QT44 zab overlay.
+    /// Placement budgets that run before the overlay applies do not see this;
+    /// a caller sizing free VRAM charges `max(0, net_extra_bytes())`.
+    pub fn net_extra_bytes(&self) -> i64 {
+        let replaced: u64 = self
+            .manifest
+            .tensors
+            .iter()
+            .map(|tensor| tensor.base_data_size)
+            .sum();
+        self.payload_bytes() as i64 - replaced as i64
+    }
+
     /// Read every payload with positional I/O and verify its sha256 against
     /// the manifest. All-or-nothing: the first mismatch names its tensor.
     pub fn read_verified(&self) -> Result<Vec<TrunkOverlayPayload>, String> {
@@ -327,6 +415,7 @@ impl BoundTrunkOverlay {
             payloads.push(TrunkOverlayPayload {
                 name: entry.name.clone(),
                 shape,
+                format: entry.format,
                 bytes,
             });
         }
@@ -379,7 +468,9 @@ fn sha256_file(path: &Path) -> Result<(String, u64), String> {
 ///
 /// Selects the base tensors whose names end with any of `suffixes` (base
 /// index order; none is an error). Each needs `payload_dir/<name>.bin` of
-/// exactly the QT44 size (the `HIPFIRE_QWEN4_REQUANT=...=qt44:<dir>` layout).
+/// exactly the `format` size (for QT44 the
+/// `HIPFIRE_QWEN4_REQUANT=...=qt44:<dir>` layout). All tensors of one sidecar
+/// share `format`.
 /// An existing `output` is refused; the file is written to
 /// `<output>.partial`, fsynced and renamed, then re-bound and re-read as a
 /// self-check (the output is deleted if that fails).
@@ -388,6 +479,7 @@ pub fn write_trunk_overlay(
     payload_dir: &Path,
     suffixes: &[String],
     marker: &str,
+    format: TrunkOverlayFormat,
     output: &Path,
 ) -> Result<TrunkOverlayWriteReport, String> {
     if suffixes.is_empty() {
@@ -423,20 +515,24 @@ pub fn write_trunk_overlay(
                 info.shape.len()
             ));
         };
-        let expected = qt44_payload_bytes(m as usize, k as usize).ok_or_else(|| {
-            format!(
-                "base tensor {} has K={k}, not a positive multiple of {QT44_GROUP_SIZE}",
-                info.name
-            )
-        })?;
+        let expected = format
+            .payload_bytes(m as usize, k as usize)
+            .ok_or_else(|| {
+                format!(
+                    "base tensor {} has K={k}, not a positive multiple of {}",
+                    info.name,
+                    format.group_size()
+                )
+            })?;
         let bin = payload_dir.join(format!("{}.bin", info.name));
         let metadata = std::fs::metadata(&bin)
             .map_err(|e| format!("payload for {}: {}: {e}", info.name, bin.display()))?;
         if metadata.len() != expected as u64 {
             return Err(format!(
-                "payload {} is {} bytes, QT44 [{m}, {k}] is {expected}",
+                "payload {} is {} bytes, {} [{m}, {k}] is {expected}",
                 bin.display(),
-                metadata.len()
+                metadata.len(),
+                format.label()
             ));
         }
         let (sha256, _) = sha256_file(&bin)?;
@@ -445,12 +541,13 @@ pub fn write_trunk_overlay(
             sha256,
             base_quant_type: info.quant_type,
             base_data_size: info.data_size as u64,
+            format,
         });
         entries.push(HfqStreamEntry {
             name: info.name.clone(),
-            quant_type: QT44_QUANT_TYPE,
+            quant_type: format.quant_type(),
             shape: info.shape.clone(),
-            group_size: QT44_GROUP_SIZE,
+            group_size: format.group_size(),
             data_len: expected as u64,
         });
         payload_total += expected as u64;
@@ -612,6 +709,7 @@ mod tests {
             &fx.payloads,
             &[SUFFIX.to_string()],
             "gfx1151-zab-v1",
+            TrunkOverlayFormat::Qt44,
             &out,
         )
         .unwrap();
@@ -655,12 +753,14 @@ mod tests {
                 sha256: hex_lower(&Sha256::digest(&fx.z0)),
                 base_quant_type: 15,
                 base_data_size: 4 * 192,
+                format: TrunkOverlayFormat::Qt44,
             },
             TrunkOverlayTensor {
                 name: tensors[1].name.clone(),
                 sha256: hex_lower(&Sha256::digest(&fx.z1)),
                 base_quant_type: 15,
                 base_data_size: 2 * 2 * 192,
+                format: TrunkOverlayFormat::Qt44,
             },
         ];
         Hand {
@@ -903,6 +1003,7 @@ mod tests {
             &fx.payloads,
             &[SUFFIX.to_string()],
             "gfx1151-zab-v1",
+            TrunkOverlayFormat::Qt44,
             &out,
         )
         .unwrap_err();
@@ -914,6 +1015,7 @@ mod tests {
             &fx.payloads,
             &[SUFFIX.to_string()],
             "gfx1151-zab-v1",
+            TrunkOverlayFormat::Qt44,
             &fx.dir.path().join("other.trunk-overlay"),
         )
         .unwrap_err();
@@ -937,6 +1039,7 @@ mod tests {
             &fx.payloads,
             &[SUFFIX.to_string()],
             "gfx1151-zab-v1",
+            TrunkOverlayFormat::Qt44,
             &fx.dir.path().join("a.trunk-overlay"),
         )
         .unwrap_err();
@@ -947,6 +1050,7 @@ mod tests {
             &fx.payloads,
             &[".nope".to_string()],
             "gfx1151-zab-v1",
+            TrunkOverlayFormat::Qt44,
             &fx.dir.path().join("b.trunk-overlay"),
         )
         .unwrap_err();
@@ -957,9 +1061,182 @@ mod tests {
             &fx.payloads,
             &[],
             "gfx1151-zab-v1",
+            TrunkOverlayFormat::Qt44,
             &fx.dir.path().join("c.trunk-overlay"),
         )
         .unwrap_err();
         assert!(err.contains("at least one"), "{err}");
+    }
+
+    fn qt3_bytes(seed: u8, m: usize, k: usize) -> Vec<u8> {
+        (0..m * (k / 32) * 34)
+            .map(|i| (i as u8).wrapping_mul(11).wrapping_add(seed))
+            .collect()
+    }
+
+    /// A valid hand-built sidecar whose two tensors are QT3 (Q8F16).
+    fn hand_qt3(fx: &Fixture) -> Hand {
+        let mut h = hand(fx);
+        let (z0, z1) = (qt3_bytes(3, 4, 256), qt3_bytes(5, 2, 512));
+        for (i, (data, shape)) in [(z0, vec![4u32, 256]), (z1, vec![2, 512])]
+            .into_iter()
+            .enumerate()
+        {
+            h.manifest.tensors[i].sha256 = hex_lower(&Sha256::digest(&data));
+            h.manifest.tensors[i].format = TrunkOverlayFormat::Qt3;
+            h.tensors[i].quant_type = 3;
+            h.tensors[i].group_size = 32;
+            h.tensors[i].shape = shape;
+            h.tensors[i].data = data;
+        }
+        h
+    }
+
+    #[test]
+    fn qt3_format_parse_and_size_formula() {
+        let q3 = TrunkOverlayFormat::Qt3;
+        assert_eq!(
+            (q3.quant_type(), q3.group_size(), q3.label()),
+            (3, 32, "QT3")
+        );
+        // 34 bytes per 32 weights; K only needs to be a multiple of 32.
+        assert_eq!(q3.payload_bytes(4, 256), Some(4 * 8 * 34));
+        assert_eq!(q3.payload_bytes(7, 2560), Some(7 * 80 * 34));
+        assert_eq!(q3.payload_bytes(3, 96), Some(3 * 3 * 34));
+        assert_eq!(q3.payload_bytes(3, 48), None);
+        assert_eq!(q3.payload_bytes(3, 0), None);
+        assert_eq!(q3.payload_bytes(usize::MAX, 64), None);
+        let q44 = TrunkOverlayFormat::Qt44;
+        assert_eq!(q44.payload_bytes(4, 256), Some(544));
+        assert_eq!(q44.payload_bytes(4, 96), None);
+        // JSON spelling and default.
+        assert_eq!(serde_json::to_string(&q3).unwrap(), "\"qt3\"");
+        let old: TrunkOverlayTensor = serde_json::from_str(
+            r#"{"name":"t","sha256":"","base_quant_type":15,"base_data_size":1}"#,
+        )
+        .unwrap();
+        assert_eq!(old.format, TrunkOverlayFormat::Qt44);
+        // A QT44 entry serializes with no `format` key (flag-off identity of
+        // every sidecar written before QT3); a QT3 entry carries it.
+        assert!(!serde_json::to_string(&old).unwrap().contains("format"));
+        let mut new = old.clone();
+        new.format = q3;
+        assert!(serde_json::to_string(&new)
+            .unwrap()
+            .contains("\"format\":\"qt3\""));
+    }
+
+    #[test]
+    fn qt3_hand_built_sidecar_binds_and_carries_the_format() {
+        let fx = fixture("{}");
+        let h = hand_qt3(&fx);
+        let path = write_hand(&fx, &h, "q8.trunk-overlay");
+        let bound = bind_trunk_overlay(&open(&fx.base), &path).unwrap();
+        assert_eq!(bound.payload_bytes(), 2 * 4 * 8 * 34);
+        let payloads = bound.read_verified().unwrap();
+        assert_eq!(payloads.len(), 2);
+        for payload in &payloads {
+            assert_eq!(payload.format, TrunkOverlayFormat::Qt3);
+        }
+        assert_eq!(payloads[0].shape, [4, 256]);
+        assert_eq!(payloads[0].bytes, qt3_bytes(3, 4, 256));
+        assert_eq!(payloads[1].bytes, qt3_bytes(5, 2, 512));
+        // The QT44 sidecar of the same base still reads as QT44.
+        let qt44 = write_hand(&fx, &hand(&fx), "q44.trunk-overlay");
+        let payloads = bind_trunk_overlay(&open(&fx.base), &qt44)
+            .unwrap()
+            .read_verified()
+            .unwrap();
+        assert!(payloads
+            .iter()
+            .all(|p| p.format == TrunkOverlayFormat::Qt44));
+    }
+
+    #[test]
+    fn qt3_writer_round_trip() {
+        let fx = fixture("{}");
+        let (z0, z1) = (qt3_bytes(3, 4, 256), qt3_bytes(5, 2, 512));
+        std::fs::write(fx.payloads.join("model.layers.0.in_proj_z.weight.bin"), &z0).unwrap();
+        std::fs::write(fx.payloads.join("model.layers.1.in_proj_z.weight.bin"), &z1).unwrap();
+        let out = fx.dir.path().join("q8.trunk-overlay");
+        let report = write_trunk_overlay(
+            &fx.base,
+            &fx.payloads,
+            &[SUFFIX.to_string()],
+            "gfx1151-zab-v1",
+            TrunkOverlayFormat::Qt3,
+            &out,
+        )
+        .unwrap();
+        assert_eq!(report.payload_bytes, (z0.len() + z1.len()) as u64);
+        let sidecar = open(&out);
+        for info in sidecar.tensors() {
+            assert_eq!((info.quant_type, info.group_size), (3, 32));
+        }
+        let bound = bind_trunk_overlay(&open(&fx.base), &out).unwrap();
+        let payloads = bound.read_verified().unwrap();
+        assert_eq!(payloads[0].bytes, z0);
+        assert_eq!(payloads[1].format, TrunkOverlayFormat::Qt3);
+        // The QT44-sized payloads are the wrong size for a QT3 build.
+        std::fs::write(
+            fx.payloads.join("model.layers.0.in_proj_z.weight.bin"),
+            &fx.z0,
+        )
+        .unwrap();
+        let err = write_trunk_overlay(
+            &fx.base,
+            &fx.payloads,
+            &[SUFFIX.to_string()],
+            "gfx1151-zab-v1",
+            TrunkOverlayFormat::Qt3,
+            &fx.dir.path().join("again.trunk-overlay"),
+        )
+        .unwrap_err();
+        assert!(err.contains("QT3 [4, 256] is 1088"), "{err}");
+    }
+
+    #[test]
+    fn qt3_refusals_name_the_tensor_and_format() {
+        let fx = fixture("{}");
+        // Wrong size for the QT3 formula (QT44 size under a qt3 entry).
+        let mut h = hand_qt3(&fx);
+        h.tensors[0].data = fx.z0.clone();
+        h.manifest.tensors[0].sha256 = hex_lower(&Sha256::digest(&h.tensors[0].data));
+        let err = refusal(&fx, &h);
+        assert!(
+            err.contains(
+                "tensor model.layers.0.in_proj_z.weight is 544 bytes, QT3 [4, 256] is 1088"
+            ),
+            "{err}"
+        );
+        // Index says qt44 while the manifest entry says qt3, and the reverse.
+        let mut h = hand_qt3(&fx);
+        h.tensors[0].quant_type = 44;
+        h.tensors[0].group_size = 256;
+        let err = refusal(&fx, &h);
+        assert!(
+            err.contains("is quant type 44 group 256, not QT3 (3) group 32"),
+            "{err}"
+        );
+        let mut h = hand(&fx);
+        h.tensors[0].quant_type = 3;
+        h.tensors[0].group_size = 32;
+        let err = refusal(&fx, &h);
+        assert!(
+            err.contains("is quant type 3 group 32, not QT44 (44) group 256"),
+            "{err}"
+        );
+        // A group size the format does not carry.
+        let mut h = hand_qt3(&fx);
+        h.tensors[1].group_size = 256;
+        assert!(refusal(&fx, &h).contains("not QT3 (3) group 32"));
+        // K not a multiple of 32 (shape differs from the base too, but the
+        // K check comes first).
+        let mut h = hand_qt3(&fx);
+        h.tensors[0].shape = vec![4, 48];
+        h.tensors[0].data = vec![0; 4 * 34];
+        h.manifest.tensors[0].sha256 = hex_lower(&Sha256::digest(&h.tensors[0].data));
+        let err = refusal(&fx, &h);
+        assert!(err.contains("K=48, not a positive multiple of 32"), "{err}");
     }
 }

@@ -12,4 +12,5 @@ pub mod liveness;
 pub(crate) mod predicates;
 pub mod resources;
 pub mod waits;
+pub mod wg_footprint;
 pub mod windows;

@@ -19,8 +19,8 @@
 //!
 //! - every rank/band charges the **target** side of every admitted lane
 //!   scoped to the layers it owns: the committed request state (live state,
-//!   snapshot mirror, committed QSA pages) and the target GDN capture ring
-//!   over its own GDN layers;
+//!   the snapshot mirror of an MTP lane only, committed QSA pages) and the
+//!   target GDN capture ring over its own GDN layers;
 //! - only a **head owner** (`owner_mask` bit; EP: every rank, PP: the output
 //!   band) charges the MTP head state, the pending/lag hidden, the wide
 //!   hidden capture, the draft candidate slots, the prompt-fill scratch and
@@ -34,7 +34,7 @@ use crate::config::Qwen4Config;
 use crate::gpu_forward_lanes::LANE_MAX_ROWS;
 use crate::kv_backend::Qwen4ContextCommit;
 use crate::mtp_gpu::{MtpAppendScratch, MtpGpuState};
-use crate::state::{scope_layer_counts, Qwen4State, Qwen4StateFormat};
+use crate::state::{scope_layer_counts, Qwen4State, Qwen4StateFormat, StateMirror};
 use crate::weights::Qwen4BandScope;
 use rdna_compute::Gpu;
 
@@ -44,6 +44,16 @@ pub const COPY_PROPOSAL_N_MAX: usize = 63;
 
 /// Ranks/bands one `owner_mask` can name.
 pub const MAX_OWNER_RANKS: usize = u64::BITS as usize;
+
+/// The snapshot mirror of every lane state of an AR store: none. An AR lane is
+/// only stepped and reset; it never takes a snapshot ticket (only a `Verify`
+/// window does, and that needs an MTP window) and arms no capture ring.
+pub(crate) const AR_LANE_MIRROR: StateMirror = StateMirror::Absent;
+
+/// The snapshot mirror of every lane state of an MTP store, on every band
+/// that owns target layers: a verify window snapshots the lane state and rolls
+/// it back.
+pub(crate) const SPEC_LANE_MIRROR: StateMirror = StateMirror::Snapshot;
 
 /// Immutable capacity of one lane store, fixed at load/admission.
 ///
@@ -78,6 +88,12 @@ pub struct LaneSpecBudget {
     /// Device bytes of sampled-verify scratch a head owner holds once (shared
     /// across lanes); `0` for greedy-only and the host-draw naive sampler.
     pub sampling_scratch: u64,
+    /// Decode rows per lane the step buffers hold (`verify_rows_per_lane`
+    /// unless [`Self::with_copy_steps`] narrows it).
+    step_rows_per_lane: usize,
+    /// Rows the widest copy step carries (`0`: no copy steps, the per-lane
+    /// rows alone size the step; see [`Self::with_copy_steps`]).
+    copy_step_rows: usize,
 }
 
 impl LaneSpecBudget {
@@ -137,6 +153,8 @@ impl LaneSpecBudget {
             context_commit,
             owner_mask,
             sampling_scratch: 0,
+            step_rows_per_lane: verify_rows_per_lane,
+            copy_step_rows: 0,
         })
     }
 
@@ -197,9 +215,27 @@ impl LaneSpecBudget {
         self
     }
 
-    /// Decode rows the step buffers hold: `lanes * verify_rows_per_lane`.
+    /// With the step buffers of a store that runs copy windows only in steps
+    /// of at most `copy_lanes` lanes (every other window is native, at most
+    /// `native_k + 1` rows): the buffers hold the larger of the native step
+    /// (`lanes * (native_k + 1)`) and the widest copy step (`min(copy_lanes,
+    /// lanes)` lanes of `verify_rows_per_lane` rows). A copy step must fit
+    /// whatever the lane count: at fewer lanes than the native rows cover
+    /// (`lanes * (native_k + 1) < copy_lanes * verify_rows_per_lane`) the
+    /// widest copy step sets the size, so a small store still takes its copy
+    /// windows. At the default eight lanes the native step is the larger
+    /// and the buffers are unchanged.
+    pub fn with_copy_steps(mut self, copy_lanes: usize) -> Self {
+        self.step_rows_per_lane = (self.native_k + 1).min(self.verify_rows_per_lane);
+        self.copy_step_rows = copy_lanes.min(self.lanes) * self.verify_rows_per_lane;
+        self
+    }
+
+    /// Decode rows the step buffers hold: `lanes * step_rows_per_lane`, and at
+    /// least the widest copy step ([`Self::with_copy_steps`]);
+    /// `lanes * verify_rows_per_lane` without it.
     pub fn step_rows(&self) -> usize {
-        self.lanes * self.verify_rows_per_lane
+        (self.lanes * self.step_rows_per_lane).max(self.copy_step_rows)
     }
 
     /// Whether rank/band `rank` owns the MTP head and the sampler.
@@ -211,8 +247,9 @@ impl LaneSpecBudget {
 /// One allocation family of a rank/band's lane store.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum CensusComponent {
-    /// Per lane: [`Qwen4State::device_bytes_scoped`] (live state, snapshot
-    /// mirror, committed QSA pages) over the band's own layers.
+    /// Per lane: [`Qwen4State::device_bytes_with_mirror`] (live state, the
+    /// snapshot mirror of an MTP lane only, committed QSA pages) over the
+    /// band's own layers.
     TargetState,
     /// Per lane: the target GDN capture ring over the band's GDN layers.
     CaptureRing,
@@ -220,7 +257,8 @@ pub enum CensusComponent {
     HeadState,
     /// Per lane, head owners: the pending target hidden row.
     PendingHidden,
-    /// Per lane, head owners: owed head-lag hidden rows and tokens.
+    /// Per lane, head owners: owed head-lag hidden rows (the owed tokens are
+    /// host values, not device bytes).
     HeadLag,
     /// Shared, LM-head bands: step logits (`(rows + lanes) * vocab` F32).
     StepLogits,
@@ -483,11 +521,13 @@ fn target_lines(
     context: &Qwen4ContextCommit,
     lanes: usize,
     capture_rows: usize,
+    mirror: StateMirror,
     lines: &mut Vec<CensusLine>,
 ) -> Result<(), String> {
-    let state = Qwen4State::device_bytes_scoped(config, inputs.format, context, inputs.scope)
-        .and_then(|bytes| u64::try_from(bytes).ok())
-        .ok_or_else(|| overflow("target state"))?;
+    let state =
+        Qwen4State::device_bytes_with_mirror(config, inputs.format, context, inputs.scope, mirror)
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| overflow("target state"))?;
     lines.push(CensusLine {
         component: CensusComponent::TargetState,
         copies: lanes,
@@ -514,8 +554,9 @@ fn check_rank(inputs: &CensusInputs<'_>) -> Result<(), String> {
 }
 
 /// The census of an AR lane store on one rank/band: `lanes` target states
-/// (no capture ring, no head) and, on an LM-head band, the step logits and
-/// top-1 of `lanes` decode rows plus `lanes` prompt-completing rows.
+/// ([`AR_LANE_MIRROR`]: no snapshot mirror; no capture ring, no head) and, on
+/// an LM-head band, the step logits and top-1 of `lanes` decode rows plus
+/// `lanes` prompt-completing rows.
 pub fn ar_lane_census(
     lanes: usize,
     context: &Qwen4ContextCommit,
@@ -524,7 +565,15 @@ pub fn ar_lane_census(
     check_rank(inputs)?;
     let config = inputs.config;
     let mut lines = Vec::new();
-    target_lines(config, inputs, context, lanes, 0, &mut lines)?;
+    target_lines(
+        config,
+        inputs,
+        context,
+        lanes,
+        0,
+        AR_LANE_MIRROR,
+        &mut lines,
+    )?;
     step_buffer_lines(config, inputs.scope, lanes, lanes, &mut lines)?;
     Ok(LaneCensus {
         rank: inputs.rank,
@@ -537,8 +586,9 @@ pub fn ar_lane_census(
 
 /// The census of a speculative lane store on one rank/band under `budget`.
 ///
-/// Every owning band charges its lanes' target state and capture ring; a
-/// head owner (which must hold the LM head) charges the head-side families
+/// Every owning band charges its lanes' target state (with the
+/// [`SPEC_LANE_MIRROR`] snapshot mirror) and capture ring; a head owner
+/// (which must hold the LM head) charges the head-side families
 /// and the wide hidden; a band that runs the LM head charges the step
 /// logits/top-1 over `step_rows() + lanes` rows. A head owner that does not
 /// run the LM head is refused, as is a rank outside the owner mask width.
@@ -564,6 +614,7 @@ pub fn lane_spec_census(
         &budget.context_commit,
         lanes,
         budget.capture_rows_per_lane,
+        SPEC_LANE_MIRROR,
         &mut lines,
     )?;
     if head_owner {
@@ -585,20 +636,16 @@ pub fn lane_spec_census(
             allocations: vec![wide_u64],
         });
         if budget.head_lag_rows > 0 {
-            let hidden = wide
-                .checked_mul(budget.head_lag_rows)
-                .ok_or_else(|| overflow("head-lag hidden"))?;
-            let tokens = budget
-                .head_lag_rows
-                .checked_mul(std::mem::size_of::<u32>())
-                .ok_or_else(|| overflow("head-lag tokens"))?;
+            // Owed hidden rows only: the lane's owed tokens are host values.
+            // The list is the allocator's own (`HeadLagStore::new`).
             lines.push(CensusLine {
                 component: CensusComponent::HeadLag,
                 copies: lanes,
-                allocations: vec![
-                    u64::try_from(hidden).map_err(|_| overflow("head-lag hidden"))?,
-                    u64::try_from(tokens).map_err(|_| overflow("head-lag tokens"))?,
-                ],
+                allocations: crate::mesh_rank_copy::lag_allocation_sizes(
+                    config,
+                    budget.head_lag_rows,
+                )
+                .ok_or_else(|| overflow("head-lag hidden"))?,
             });
         }
     }
@@ -649,6 +696,86 @@ pub fn lane_spec_census(
         output: inputs.scope.output,
         lines,
     })
+}
+
+/// The census of a mixed store from the MTP store's `census` over
+/// `lanes` lanes: only `spec_lanes` slots carry the per-lane MTP families
+/// (capture ring, head state, pending hidden, owed rows) and the
+/// snapshot-mirrored target state; the remaining `lanes - spec_lanes`
+/// AR-only slots hold one target state of `ar_state_bytes` (no mirror) and
+/// nothing else. Shared lines (step buffers, wide hidden, draft slots, append
+/// scratch) are the MTP store's, unchanged. `None` when `spec_lanes` exceeds
+/// `lanes` or the census was not built for `lanes` lanes.
+pub(crate) fn mixed_lane_census(
+    mut census: LaneCensus,
+    lanes: usize,
+    spec_lanes: usize,
+    ar_state_bytes: u64,
+) -> Option<LaneCensus> {
+    if spec_lanes > lanes {
+        return None;
+    }
+    let ar_lanes = lanes - spec_lanes;
+    let mut ar_state = None;
+    for line in &mut census.lines {
+        match line.component {
+            CensusComponent::TargetState => {
+                if line.copies != lanes {
+                    return None;
+                }
+                line.copies = spec_lanes;
+                ar_state = Some(CensusLine {
+                    component: CensusComponent::TargetState,
+                    copies: ar_lanes,
+                    allocations: vec![ar_state_bytes],
+                });
+            }
+            CensusComponent::CaptureRing
+            | CensusComponent::HeadState
+            | CensusComponent::PendingHidden
+            | CensusComponent::HeadLag => {
+                if line.copies != lanes {
+                    return None;
+                }
+                line.copies = spec_lanes;
+            }
+            _ => {}
+        }
+    }
+    census.lines.extend(ar_state);
+    Some(census)
+}
+
+/// The census of a copy store whose capture ring is wide only on its first
+/// `wide_lanes` MTP slots: `census` is the widened budget's, `narrow` the
+/// legacy (`k + 1`-row ring) budget's over the same lanes and band. Every
+/// `CaptureRing` line (its `copies` already reduced to the MTP slots) splits
+/// into `min(wide_lanes, copies)` wide copies and the rest at the narrow
+/// allocation, exactly as `Qwen4LaneStore::admit` sizes each slot. `None`
+/// when the narrow census has no ring line to price the narrow slots from.
+pub(crate) fn split_capture_ring(
+    mut census: LaneCensus,
+    narrow: &LaneCensus,
+    wide_lanes: usize,
+) -> Option<LaneCensus> {
+    let narrow_line = narrow
+        .lines
+        .iter()
+        .find(|l| l.component == CensusComponent::CaptureRing)?;
+    let mut extra = Vec::new();
+    for line in &mut census.lines {
+        if line.component != CensusComponent::CaptureRing || line.copies <= wide_lanes {
+            continue;
+        }
+        extra.push(CensusLine {
+            component: CensusComponent::CaptureRing,
+            copies: line.copies - wide_lanes,
+            allocations: narrow_line.allocations.clone(),
+        });
+        line.copies = wide_lanes;
+    }
+    census.lines.extend(extra);
+    Some(census)
 }
 
 #[cfg(test)]
@@ -827,7 +954,7 @@ mod tests {
                                     );
                                     expected += n * sum(&head_state) + n * wide;
                                     let lag = budget.head_lag_rows as u64;
-                                    expected += n * (lag * wide + lag * 4);
+                                    expected += n * lag * wide;
                                     expected += budget.step_rows() as u64 * wide;
                                     expected += n * Gpu::TOPK8_OUT_BYTES as u64;
                                     let append =
@@ -854,10 +981,160 @@ mod tests {
         }
     }
 
+    /// The in-place state a snapshot copies, from the config alone: per GDN
+    /// layer the recurrent state and conv history, per QSA layer the partial
+    /// K/V, the selection and the raw-index circular block, and on the input
+    /// band the PLE conv history and hyper feedback. Independent of
+    /// `Qwen4State`'s own accounting.
+    fn mirror_bytes(config: &Qwen4Config, format: Qwen4StateFormat, scope: &Qwen4BandScope) -> u64 {
+        let f32_bytes = 4usize;
+        let (gdn_layers, qsa_layers) = scope_layer_counts(config, scope);
+        let recurrent = format.gdn.state_bytes(
+            config.linear_num_value_heads,
+            config.linear_key_head_dim,
+            config.linear_value_head_dim,
+        );
+        let conv_channels = config.linear_num_key_heads * config.linear_key_head_dim * 2
+            + config.linear_num_value_heads * config.linear_value_head_dim;
+        let conv = conv_channels * (config.linear_conv_kernel_dim - 1) * f32_bytes;
+        let ratio = config.indexer_compress_ratio;
+        let raw_width = config.indexer_kv_heads * config.indexer_head_dim;
+        let full_width = config.num_key_value_heads * config.head_dim;
+        let qsa = ratio * raw_width * f32_bytes
+            + ratio * full_width * f32_bytes
+            + config.qsa_selected_capacity() * std::mem::size_of::<i32>()
+            + ratio * raw_width * format.layout().index_dtype().size();
+        let per_request = if scope.input {
+            (config.ple_conv_history_rows() * config.hidden_size * config.hc_count
+                + config.hc_count * config.hidden_size)
+                * f32_bytes
+        } else {
+            0
+        };
+        (gdn_layers * (recurrent + conv) + qsa_layers * qsa + per_request) as u64
+    }
+
+    /// An AR lane store charges every lane's live state alone: the census
+    /// target term drops by exactly the mirror bytes (computed from the
+    /// config's in-place parts), per lane and per band, for every state
+    /// format, context commit and ownership split; no other line moves; the
+    /// store's own byte query is the census; and the spec census keeps the
+    /// mirror on every band.
+    #[test]
+    fn ar_lane_census_drops_exactly_the_snapshot_mirror_bytes() {
+        use super::super::Qwen4LaneStore;
+        let config = compact_test_config();
+        assert_eq!(AR_LANE_MIRROR, StateMirror::Absent);
+        assert_eq!(SPEC_LANE_MIRROR, StateMirror::Snapshot);
+        assert_eq!(Qwen4LaneStore::state_mirror(None), AR_LANE_MIRROR);
+        let spec = crate::lane::LaneSpecConfig {
+            k: 3,
+            end_of_turn: None,
+            spec_lanes: None,
+        };
+        assert_eq!(Qwen4LaneStore::state_mirror(Some(spec)), SPEC_LANE_MIRROR);
+        // A mixed store's AR-only slots (past `spec_lanes`) are keyed per slot
+        // at `new_payload`, by whether the slot carries a spec payload.
+        assert_eq!(Qwen4LaneStore::state_mirror(None), AR_LANE_MIRROR);
+        let scopes = [
+            vec![Qwen4BandScope::single(&config)],
+            partition(&config, &[25, 23]),
+            partition(&config, &[16, 16, 16]),
+        ];
+        for gdn in FORMATS {
+            let format = format_of(gdn);
+            for context in contexts() {
+                for bands in &scopes {
+                    for (rank, scope) in bands.iter().enumerate() {
+                        let mirror = mirror_bytes(&config, format, scope);
+                        assert!(mirror > 0, "{gdn:?} rank={rank}");
+                        let snapshot_state =
+                            Qwen4State::device_bytes_scoped(&config, format, &context, scope)
+                                .unwrap() as u64;
+                        for lanes in [1usize, 2, 8] {
+                            let n = lanes as u64;
+                            let input = inputs(&config, gdn, scope, rank);
+                            let ar = ar_lane_census(lanes, &context, &input).unwrap();
+                            let target = ar.bytes_of(CensusComponent::TargetState).unwrap();
+                            assert_eq!(
+                                target,
+                                n * (snapshot_state - mirror),
+                                "{gdn:?} {context:?} lanes={lanes} rank={rank}"
+                            );
+                            assert_eq!(n * snapshot_state - target, n * mirror);
+                            // The step buffers are the only other lines (LM-head
+                            // band): rows = lanes decode + lanes prompt rows.
+                            let step = if scope.output {
+                                2 * n * (config.vocab_size as u64 * 4 + 4)
+                            } else {
+                                0
+                            };
+                            assert_eq!(ar.total(), Some(target + step));
+                            assert_eq!(sum(&ar.allocation_sizes()), target + step);
+                            assert_eq!(ar.bytes_of(CensusComponent::CaptureRing), Some(0));
+                            // One byte source: the store's own query is the census.
+                            assert_eq!(
+                                Qwen4LaneStore::device_bytes_scoped(
+                                    &config, format, &context, lanes, lanes, None, scope,
+                                ),
+                                ar.total()
+                            );
+                            // The spec census keeps the mirror on every band.
+                            let budget =
+                                LaneSpecBudget::legacy(lanes, 3, context, 1 << (bands.len() - 1))
+                                    .unwrap();
+                            let spec_census = lane_spec_census(&budget, &input).unwrap();
+                            assert_eq!(
+                                spec_census.bytes_of(CensusComponent::TargetState),
+                                Some(n * snapshot_state),
+                                "{gdn:?} {context:?} lanes={lanes} rank={rank}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The Flash-Next EP2 geometry (QSA fp8, GDN q8, 16384 context, the
+    /// whole model on a rank) at the 8-lane AR store: the mirror bytes the
+    /// store no longer charges, exactly, against the census of the state.
+    #[test]
+    fn ar_lane_store_flash_next_saving_is_the_mirror_of_eight_states() {
+        let config = compact_test_config();
+        let single = Qwen4BandScope::single(&config);
+        let context = Qwen4ContextCommit::new(Qwen4KvBackend::Vmm, 16384, 4096, 2 << 20);
+        for gdn in [
+            GdnStateFormat::F32,
+            GdnStateFormat::Q8,
+            GdnStateFormat::Q8Ef,
+        ] {
+            let format = format_of(gdn);
+            let input = inputs(&config, gdn, &single, 0);
+            let ar = ar_lane_census(8, &context, &input).unwrap();
+            let with_mirror =
+                8 * Qwen4State::device_bytes_scoped(&config, format, &context, &single).unwrap()
+                    as u64;
+            let target = ar.bytes_of(CensusComponent::TargetState).unwrap();
+            let saving = with_mirror - target;
+            assert_eq!(
+                saving,
+                8 * mirror_bytes(&config, format, &single),
+                "{gdn:?}"
+            );
+            eprintln!(
+                "{gdn:?}: per-lane mirror {} bytes, 8-lane saving {saving} bytes = {:.2} MiB",
+                saving / 8,
+                saving as f64 / (1u64 << 20) as f64
+            );
+        }
+    }
+
     /// The legacy store census is exactly what the formula
-    /// `Qwen4LaneStore::device_bytes_scoped` carried before the census:
-    /// the only change a caller can see is a non-output band's spec answer
-    /// (target-only bytes instead of `None`).
+    /// `Qwen4LaneStore::device_bytes_scoped` carried before the census, with
+    /// each lane state carrying the snapshot mirror only under `spec_k`:
+    /// the only changes a caller can see are a non-output band's spec answer
+    /// (target-only bytes instead of `None`) and an AR lane's mirror.
     #[test]
     fn legacy_store_bytes_match_the_prior_formula() {
         use super::super::Qwen4LaneStore;
@@ -872,9 +1149,11 @@ mod tests {
                 ] {
                     for lanes in [1usize, 2, 8] {
                         for spec_k in [None, Some(1usize), Some(3), Some(7)] {
-                            let mut per_lane =
-                                Qwen4State::device_bytes_scoped(&config, format, &context, &scope)
-                                    .unwrap();
+                            let mirror = spec_k.map_or(AR_LANE_MIRROR, |_| SPEC_LANE_MIRROR);
+                            let mut per_lane = Qwen4State::device_bytes_with_mirror(
+                                &config, format, &context, &scope, mirror,
+                            )
+                            .unwrap();
                             let rows_cap = match spec_k {
                                 Some(k) => lanes * (k + 1),
                                 None => lanes,
@@ -1164,21 +1443,304 @@ mod tests {
         assert_eq!(ok, vec![0, 1]);
     }
 
-    /// DESIGN §6's scale check, from the real allocation helper: about
-    /// 58.54 MiB per capture row per whole-model Q8 lane (36 GDN layers).
+    /// DESIGN §6's scale check, from the real allocation helper: per capture row
+    /// per whole-model Q8 lane (36 GDN layers) about 2.85 MiB of per-row inputs
+    /// plus `slots / (36 * rows)` Q8 state sets of 27.84 MiB, where `slots` is the
+    /// state's ring slots across its 36 layers: `2 * 35 + rows + 1` in the shared
+    /// pool (default), `36 * (rows + 1)` per-layer with
+    /// `HIPFIRE_QWEN4_LANE_RESERVE_TRIM=0`, `72 * rows` with the compact kill switch.
     #[test]
     fn capture_ring_scale_matches_the_design_check() {
+        use crate::state::{capture_ring_slots, current_capture_ring_total_slots};
         let config = compact_test_config();
         let gdn_layers = config.n_linear_layers();
         assert_eq!(gdn_layers, 36);
+        let set_mib = (gdn_layers * 811_008) as f64 / (1u64 << 20) as f64;
         for rows in [2usize, 4, 8] {
+            assert_eq!(capture_ring_slots(false, rows), Some(2 * rows));
+            let slots = current_capture_ring_total_slots(rows, gdn_layers).unwrap();
             let bytes =
                 Qwen4State::row_capture_bytes_scoped(&config, GdnStateFormat::Q8, rows, gdn_layers)
                     .unwrap();
             let per_row_mib = bytes as f64 / rows as f64 / (1u64 << 20) as f64;
+            let expected = 2.85 + slots as f64 / gdn_layers as f64 / rows as f64 * set_mib;
             assert!(
-                (58.4..58.7).contains(&per_row_mib),
-                "rows={rows}: {per_row_mib} MiB/row"
+                (per_row_mib - expected).abs() < 0.15,
+                "rows={rows} slots={slots}: {per_row_mib} MiB/row, expected {expected}"
+            );
+        }
+    }
+
+    /// `HIPFIRE_QWEN4_LANE_RESERVE_TRIM` at the shipped EP2 serve shape (K5 = the landed depth
+    /// cap, so a 6-row verify window / capture ring per lane; 8 lanes; a 48-row all-rows lane
+    /// step; symtrunk's 48 layers = 36 GDN + 12 QSA): the capture ring of a lane before (one
+    /// `rows + 1`-slot ring per GDN layer) and after (one shared pool), per format, and every
+    /// buffer of the trimmed layout still covers its maximum use.
+    #[test]
+    fn lane_reserve_trim_sizes_and_covers_the_depth_cap_five_c8_step() {
+        use crate::state::{capture_ring_slot, capture_view_start, CAPTURE_POOL_STRIDE};
+        let config = compact_test_config();
+        let (lanes, k) = (8usize, 5usize);
+        let rows = k + 1;
+        let gdn_layers = config.n_linear_layers();
+        assert_eq!((config.num_hidden_layers, gdn_layers), (48, 36));
+        let vh = config.linear_num_value_heads;
+        let qkv = 2 * config.linear_num_key_heads * config.linear_key_head_dim
+            + vh * config.linear_value_head_dim;
+        for gdn in FORMATS {
+            let layout = |compact: bool, trim: bool| {
+                Qwen4State::row_capture_allocation_sizes_layout(
+                    &config, gdn, rows, gdn_layers, compact, trim,
+                )
+                .unwrap()
+            };
+            let (before, after) = (layout(true, false), layout(true, true));
+            let slot = gdn.storage().state_bytes(vh, 128, 128) as u64;
+            let inputs = (rows * qkv * 4) as u64;
+            let recurrence = (rows * (qkv + 2 * vh) * 4) as u64;
+            let output = (rows * vh * 128 * 4) as u64;
+            let table = (gdn_layers * 16) as u64;
+            // Kill switch (`=0`): the previous per-layer layout, allocation for allocation.
+            assert_eq!(before.len(), 3 * gdn_layers + 2);
+            for layer in before[..3 * gdn_layers].chunks(3) {
+                assert_eq!(layer, [(rows as u64 + 1) * slot, inputs, recurrence]);
+            }
+            assert_eq!(before[3 * gdn_layers..], [output, table]);
+            // Default: one pool, then (inputs, recurrence) per layer.
+            let pool_slots = (CAPTURE_POOL_STRIDE * (gdn_layers - 1) + rows + 1) as u64;
+            assert_eq!(after.len(), 2 * gdn_layers + 3);
+            assert_eq!(after[0], pool_slots * slot);
+            for layer in after[1..1 + 2 * gdn_layers].chunks(2) {
+                assert_eq!(layer, [inputs, recurrence]);
+            }
+            assert_eq!(after[1 + 2 * gdn_layers..], [output, table]);
+            let (before_bytes, after_bytes) = (sum(&before), sum(&after));
+            // The trim removes exactly the slots no layer's window can touch.
+            assert_eq!(
+                before_bytes - after_bytes,
+                (gdn_layers as u64 * (rows as u64 + 1) - pool_slots) * slot
+            );
+            if gdn.storage() == GdnStateFormat::Q8 {
+                // 36 x (7 x 811008 + 245760 + 248064) + 147456 + 576 = 212.00 MiB per lane
+                // before; one 77-slot pool + the inputs = 76.65 MiB after: -135.35 MiB/lane.
+                assert_eq!(before_bytes, 222_299_712);
+                assert_eq!(after_bytes, 80_373_312);
+                assert_eq!(before_bytes - after_bytes, 175 * 811_008);
+            }
+            // Every view of every layer, for every block length a K5 window (2..=6 rows,
+            // rollback 1..=5 kept rows) and both halves, ends inside the pool.
+            let max_end = (0..gdn_layers)
+                .flat_map(|layer| {
+                    [0usize, rows].into_iter().flat_map(move |base| {
+                        (1..=rows).map(move |n| {
+                            CAPTURE_POOL_STRIDE * layer
+                                + capture_view_start(true, rows, base, n)
+                                + n
+                        })
+                    })
+                })
+                .max()
+                .unwrap() as u64;
+            assert!(after[0] >= max_end * slot, "pool covers every view");
+            assert_eq!(max_end, pool_slots, "and nothing more");
+            // The two write targets of a layer are the only slots touched; no two layers share
+            // one.
+            let mut touched = std::collections::HashSet::new();
+            for layer in 0..gdn_layers {
+                for logical in [0usize, rows] {
+                    let slot = CAPTURE_POOL_STRIDE * layer + capture_ring_slot(true, rows, logical);
+                    assert!(
+                        touched.insert(slot),
+                        "layer {layer} target {slot} is shared"
+                    );
+                }
+            }
+            assert_eq!(touched.len(), 2 * gdn_layers);
+            // The per-use buffers keep their per-window size (a 6-row verify's inputs, the
+            // recurrence, the rollback's discarded output).
+            assert_eq!(after[1], inputs);
+            assert_eq!(after[2], recurrence);
+        }
+        // The whole store at 8 lanes, K5, a 48-row step.
+        let ctx = Qwen4ContextCommit::new(Qwen4KvBackend::Vmm, 16384, 4096, 2 << 20);
+        let budget = LaneSpecBudget::new(lanes, k, 0, 0, ctx, 1).unwrap();
+        assert_eq!(
+            (budget.verify_rows_per_lane, budget.capture_rows_per_lane),
+            (rows, rows)
+        );
+        assert_eq!(budget.step_rows(), 48);
+        let gdn = GdnStateFormat::Q8;
+        let census = lane_spec_census(
+            &budget,
+            &inputs(&config, gdn, &Qwen4BandScope::single(&config), 0),
+        )
+        .unwrap();
+        let wide = (config.hc_count * config.hidden_size * 4) as u64;
+        // Step buffers cover 48 decode rows + 8 prompt-completing rows, unchanged by the trim.
+        assert_eq!(
+            census.bytes_of(CensusComponent::StepLogits),
+            Some((48 + 8) * config.vocab_size as u64 * 4)
+        );
+        assert_eq!(census.bytes_of(CensusComponent::StepTop1), Some(56 * 4));
+        assert_eq!(
+            census.bytes_of(CensusComponent::WideHidden),
+            Some(48 * wide)
+        );
+        assert!(census.bytes_of(CensusComponent::DraftTop1).unwrap() >= lanes as u64 * 8);
+        // The census ring line is the allocator's own inventory under the current flag state,
+        // so before/after totals differ by exactly `lanes` rings.
+        let ring_line = census
+            .lines
+            .iter()
+            .find(|l| l.component == CensusComponent::CaptureRing)
+            .unwrap();
+        let total_with = |trim: bool| {
+            let ring = sum(&Qwen4State::row_capture_allocation_sizes_layout(
+                &config, gdn, rows, gdn_layers, true, trim,
+            )
+            .unwrap());
+            census.total().unwrap() - ring_line.bytes().unwrap() + lanes as u64 * ring
+        };
+        assert_eq!(
+            total_with(false) - total_with(true),
+            lanes as u64 * 175 * 811_008
+        );
+        let expected = total_with(crate::state::lane_reserve_trim());
+        assert_eq!(census.total().unwrap(), expected);
+    }
+
+    /// Prints what one native-MTP lane adds to an EP2 rank over an AR-only lane at the shipped
+    /// shape (K5 -> 6-row ring, 8 lanes, QSA fp8 / GDN q8, 2 MiB VMM granules), before and after
+    /// `HIPFIRE_QWEN4_LANE_RESERVE_TRIM`:
+    /// `cargo test --release -p hipfire-arch-qwen4 --lib lane::census::tests::lane_mtp_itemisation_receipt -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "receipt generator: prints the per-lane itemisation, asserts the sum identity"]
+    fn lane_mtp_itemisation_receipt() {
+        use crate::state::StateMirror;
+        let config = compact_test_config();
+        let gdn = GdnStateFormat::Q8;
+        let format = format_of(gdn);
+        let scope = Qwen4BandScope::single(&config);
+        let (lanes, k) = (8usize, 5usize);
+        let rows = k + 1;
+        let gdn_layers = config.n_linear_layers();
+        let m = |bytes: u64| mib(bytes);
+        for (max_seq, chunk) in [(4096usize, 2048usize), (16384, 4096), (32768, 4096)] {
+            let ctx = Qwen4ContextCommit::new(Qwen4KvBackend::Vmm, max_seq, chunk, 2 << 20);
+            let ar = Qwen4State::device_bytes_with_mirror(
+                &config,
+                format,
+                &ctx,
+                &scope,
+                StateMirror::Absent,
+            )
+            .unwrap() as u64;
+            let snap = Qwen4State::device_bytes_with_mirror(
+                &config,
+                format,
+                &ctx,
+                &scope,
+                StateMirror::Snapshot,
+            )
+            .unwrap() as u64;
+            let head: Vec<u64> = MtpGpuState::allocation_sizes(&config, &ctx).unwrap();
+            let wide = (config.hc_count * config.hidden_size * 4) as u64;
+            let layout = |trim: bool| {
+                Qwen4State::row_capture_allocation_sizes_layout(
+                    &config, gdn, rows, gdn_layers, true, trim,
+                )
+                .unwrap()
+            };
+            let (before, after) = (layout(false), layout(true));
+            println!("## max_seq {max_seq} chunk {chunk} (K{k} -> {rows}-row ring), per MTP lane over an AR lane");
+            println!(
+                "AR lane target state                 {:>14} B {:>9} MiB (not MTP)",
+                ar,
+                m(ar)
+            );
+            println!(
+                "snapshot mirror of the target state  {:>14} B {:>9} MiB",
+                snap - ar,
+                m(snap - ar)
+            );
+            println!(
+                "MTP head state (QSA arenas+carries)  {:>14} B {:>9} MiB  {} allocations",
+                sum(&head),
+                m(sum(&head)),
+                head.len()
+            );
+            println!(
+                "pending hidden                       {:>14} B {:>9} MiB",
+                wide,
+                m(wide)
+            );
+            let slot = gdn
+                .storage()
+                .state_bytes(config.linear_num_value_heads, 128, 128) as u64;
+            for (name, ring) in [
+                ("capture ring BEFORE (kill switch)", &before),
+                ("capture ring AFTER  (default)    ", &after),
+            ] {
+                println!(
+                    "{name} {:>14} B {:>9} MiB  {} allocations",
+                    sum(ring),
+                    m(sum(ring)),
+                    ring.len()
+                );
+            }
+            println!(
+                "  state slot {slot} B x {} layers x {} slots (before) | pool {} slots (after)",
+                gdn_layers,
+                rows + 1,
+                2 * (gdn_layers - 1) + rows + 1
+            );
+            let before_lane = (snap - ar) + sum(&head) + wide + sum(&before);
+            let after_lane = (snap - ar) + sum(&head) + wide + sum(&after);
+            println!(
+                "PER-LANE MTP increment BEFORE {:>14} B {:>9} MiB",
+                before_lane,
+                m(before_lane)
+            );
+            println!(
+                "PER-LANE MTP increment AFTER  {:>14} B {:>9} MiB  (-{} MiB)",
+                after_lane,
+                m(after_lane),
+                m(before_lane - after_lane)
+            );
+            println!(
+                "8 lanes: BEFORE {} MiB, AFTER {} MiB; 5 extra lanes (3 -> 8) BEFORE {} MiB",
+                m(8 * before_lane),
+                m(8 * after_lane),
+                m(5 * before_lane)
+            );
+            let budget = LaneSpecBudget::new(lanes, k, 0, 0, ctx, 1).unwrap();
+            let census = lane_spec_census(&budget, &inputs(&config, gdn, &scope, 0)).unwrap();
+            for line in &census.lines {
+                println!(
+                    "    census {:<18} x{:<2} {:>14} B {:>10} MiB",
+                    line.component.name(),
+                    line.copies,
+                    line.bytes().unwrap(),
+                    mib(line.bytes().unwrap())
+                );
+            }
+            println!("    census TOTAL {} MiB", mib(census.total().unwrap()));
+            let mtp_lane = (snap - ar)
+                + sum(&head)
+                + wide
+                + sum(&Qwen4State::row_capture_allocation_sizes_scoped(
+                    &config, gdn, rows, gdn_layers,
+                )
+                .unwrap());
+            let shared: u64 = census
+                .lines
+                .iter()
+                .filter(|l| l.copies == 1)
+                .map(|l| l.bytes().unwrap())
+                .sum();
+            assert_eq!(
+                census.total().unwrap(),
+                lanes as u64 * (ar + mtp_lane) + shared
             );
         }
     }

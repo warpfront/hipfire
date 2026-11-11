@@ -143,6 +143,12 @@ pub trait Node {
         self.geometry_with(&mut Header::default())
             .expect("the production geometry covers the output")
     }
+    /// The CANDIDATE arm's own incumbent-style source/module/symbol when the node judges one shipped kernel
+    /// against another (`--vs`: `contract:` nodes), else `None` (the candidate is `--cand`/`--cand-object`/
+    /// the A/A twin of [`Node::incumbent`]). Its launch geometry is `geometry_with`'s.
+    fn candidate_incumbent(&self) -> Result<Option<Incumbent>> {
+        Ok(None)
+    }
     /// FLOPs and bytes of one dispatch (GPU-free).
     fn work(&self) -> Work;
     /// Extra node-specific record fields (merged into the top-level record).

@@ -78,6 +78,7 @@ pub mod native;
 pub mod ops;
 pub mod preprocess;
 pub mod run;
+pub mod search;
 pub mod srcfmt;
 pub mod validate;
 pub mod value;
@@ -433,7 +434,7 @@ pub fn symbol_of(e: &Emitted) -> Result<String, String> {
 }
 
 #[cfg(feature = "certify")]
-pub use certify::{certify, Certificate};
+pub use certify::{certify, objdump_spelling, Certificate};
 
 #[cfg(feature = "certify")]
 mod certify {
@@ -441,6 +442,65 @@ mod certify {
     use peacemaker_isa::toolchain::{build, Toolchain};
     use peacemaker_isa::{ledger_replay, pm_check};
     use std::path::Path;
+
+    /// `text` with the two spellings of an instruction operand that `llvm-objdump` never prints back
+    /// normalised, so the toolchain's parse-back (which compares the authored text with the disassembly
+    /// token for token) accepts a generator that spells them otherwise: a hex literal without leading zeros
+    /// (`0x07060302` is printed `0x7060302`) and no `offset:0`. Both denote the same encoding; only
+    /// instruction lines change (directives and labels start with `.` or end with `:`), and the object
+    /// assembled from either text is the same ELF (pinned per kernel by `tests/hc8_wmma_twin.rs`).
+    pub fn objdump_spelling(text: &str) -> String {
+        let mut out = String::with_capacity(text.len() + 1);
+        for line in text.lines() {
+            let t = line.trim_start();
+            if t.is_empty() || t.starts_with('.') || t.starts_with(';') || t.ends_with(':') {
+                out.push_str(line);
+            } else {
+                out.push_str(&instruction_spelling(line));
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    fn instruction_spelling(line: &str) -> String {
+        let c: Vec<char> = line.chars().collect();
+        let mut out = String::with_capacity(line.len());
+        let mut i = 0;
+        while i < c.len() {
+            if c[i] == '0'
+                && c.get(i + 1) == Some(&'x')
+                && (i == 0 || !c[i - 1].is_ascii_alphanumeric())
+            {
+                let mut j = i + 2;
+                while j < c.len() && c[j].is_ascii_hexdigit() {
+                    j += 1;
+                }
+                if j > i + 2 {
+                    let digits: String = c[i + 2..j].iter().collect();
+                    let trimmed = digits.trim_start_matches('0');
+                    out.push_str("0x");
+                    out.push_str(if trimmed.is_empty() { "0" } else { trimmed });
+                    i = j;
+                    continue;
+                }
+            }
+            out.push(c[i]);
+            i += 1;
+        }
+        // The disassembler omits a zero `offset:`.
+        let mut at = 0;
+        while let Some(p) = out[at..].find(" offset:0") {
+            let end = at + p + " offset:0".len();
+            if out[end..].chars().next().map_or(true, char::is_whitespace) {
+                out.replace_range(at + p..end, "");
+                at += p;
+            } else {
+                at = end;
+            }
+        }
+        out
+    }
 
     /// What certification proved about one symbol of a module.
     #[derive(Debug)]
@@ -469,7 +529,7 @@ mod certify {
         }
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         let s = dir.join(format!("{module_name}.s"));
-        std::fs::write(&s, text).map_err(|e| format!("{}: {e}", s.display()))?;
+        std::fs::write(&s, objdump_spelling(text)).map_err(|e| format!("{}: {e}", s.display()))?;
         let build = build(
             &Toolchain::default(),
             &s,

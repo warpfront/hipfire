@@ -1,0 +1,125 @@
+{
+  "schema": "pm.selector_receipt.v1",
+  "arch": "gfx1201",
+  "candidate": "ar_hc_write_s_* (branch-split tagged launch: one lane per (granule, branch))",
+  "incumbent": "ar_hc_write_* tagged, one lane per granule (HIPFIRE_EP_AR_FAST_APPLY=0, same binary)",
+  "constant": "AR_HC_SPLIT_MAX_ROWS",
+  "value": 12,
+  "kind": "max",
+  "row_key": "rows",
+  "covers": true,
+  "derived_max_rows": 12,
+  "note": "ratio = fast-apply/kill-switch mean pipelined launch time (us, spin-free bench, 2 runs x 2 ranks, A,C pair, j split1). 12 is the structural maximum (4 x rows x 640 items within 64 blocks x 512 lanes, one item per lane); every class 1..12 is faster. 16 rows run the dense wire (rounding change only, not split). Byte identity: ar_hc_write_oracle pass incl. the 2^32 rounding check (oracle.json) and the kill arm (oracle-kill.json).",
+  "classes": [
+    {
+      "rows": 1,
+      "stream": "bf16",
+      "ratio": 0.6802507836990596,
+      "verdict": "faster",
+      "admitted": true
+    },
+    {
+      "rows": 2,
+      "stream": "bf16",
+      "ratio": 0.47688060731538995,
+      "verdict": "faster",
+      "admitted": true
+    },
+    {
+      "rows": 4,
+      "stream": "bf16",
+      "ratio": 0.6247933884297521,
+      "verdict": "faster",
+      "admitted": true
+    },
+    {
+      "rows": 8,
+      "stream": "bf16",
+      "ratio": 0.5824003142801022,
+      "verdict": "faster",
+      "admitted": true
+    },
+    {
+      "rows": 12,
+      "stream": "bf16",
+      "ratio": 0.5401273885350318,
+      "verdict": "faster",
+      "admitted": true
+    },
+    {
+      "rows": 16,
+      "stream": "bf16",
+      "ratio": 0.8620173600718349,
+      "verdict": "faster",
+      "admitted": false
+    },
+    {
+      "rows": 1,
+      "stream": "f32",
+      "ratio": 0.4849445324881141,
+      "verdict": "faster",
+      "admitted": true
+    },
+    {
+      "rows": 2,
+      "stream": "f32",
+      "ratio": 0.5126849894291754,
+      "verdict": "faster",
+      "admitted": true
+    },
+    {
+      "rows": 4,
+      "stream": "f32",
+      "ratio": 0.5623020063357972,
+      "verdict": "faster",
+      "admitted": true
+    },
+    {
+      "rows": 8,
+      "stream": "f32",
+      "ratio": 0.4403973509933775,
+      "verdict": "faster",
+      "admitted": true
+    },
+    {
+      "rows": 12,
+      "stream": "f32",
+      "ratio": 0.4875227235167741,
+      "verdict": "faster",
+      "admitted": true
+    },
+    {
+      "rows": 16,
+      "stream": "f32",
+      "ratio": 0.8026574803149605,
+      "verdict": "faster",
+      "admitted": false
+    }
+  ],
+  "records": [
+    {
+      "path": "receipts/selectors/evidence/ar_hc_split/bench-kill-r1.json",
+      "sha256": "14f514bf771d2a1a65c8ac0f7c4683b347b0e74036d249205edf34c21edc06bb"
+    },
+    {
+      "path": "receipts/selectors/evidence/ar_hc_split/bench-kill-r2.json",
+      "sha256": "8161deadc56dddd48b7e5093640871f4dddde4374498fba1e32a767dc9d368b1"
+    },
+    {
+      "path": "receipts/selectors/evidence/ar_hc_split/bench-new-r1.json",
+      "sha256": "4119f5c858503a44c03a9c89bfb4f38bce558caf5a13ef52cdb56b01cb746486"
+    },
+    {
+      "path": "receipts/selectors/evidence/ar_hc_split/bench-new-r2.json",
+      "sha256": "138ce917d06fbf747ee3e8fc4739c03f8aaa54a03384d8bb75105cf8540e2dcc"
+    },
+    {
+      "path": "receipts/selectors/evidence/ar_hc_split/oracle-kill.json",
+      "sha256": "c01d12b41294ae5daaab11ef62740b689e58269d4ca43bfad0081501679caeaf"
+    },
+    {
+      "path": "receipts/selectors/evidence/ar_hc_split/oracle.json",
+      "sha256": "d06c51b219fd8a1dce4064c859e42f0547de75539e0c3c97f192775e5bd2b003"
+    }
+  ]
+}

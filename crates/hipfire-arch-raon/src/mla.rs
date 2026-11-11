@@ -23,7 +23,7 @@
 
 use hipfire_dispatch::pipeline::latent_attention::{
     execute_latent_attention, AbsorbOperands, AttentionRoute, ExpandedMirror, KvExpansion,
-    LatentAttentionOp, LatentCache, LatentGeometry, RowRange,
+    LatentAttentionOp, LatentCache, LatentGeometry, MlaRowsRoute, RowRange,
 };
 use hipfire_dispatch::types::DispatchError;
 use rdna_compute::latent_attention_absorb::latent_attention_absorb_packed_elems;
@@ -33,6 +33,7 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 use crate::config::RaonConfig;
 use crate::projection::{project, OutRound};
 use crate::weights::{RaonMixer, RaonWeights};
+use hipfire_dispatch::pipeline::PrefillActTier;
 
 /// Released geometry (config.json `q_lora_rank`, `kv_lora_rank`, `qk_*`, `v_head_dim`).
 pub const RAON_MLA_HEADS: usize = 40;
@@ -139,12 +140,18 @@ pub struct MlaPolicy {
     pub absorb: bool,
     /// `HIPFIRE_RAON_MIRROR_Q8` (default 1): allow the Q8 expanded K_nope/V mirror
     /// (INT8 codes with one F16 scale per (row, head, plane); about half the BF16
-    /// bytes per token, so twice the rows fit the mirror budget). Capacity-based:
-    /// `RaonState::fit_mirror_budget` keeps the BF16 mirror when its budget covers
-    /// the whole reserved context (it is 1-2% faster) and picks Q8 otherwise.
+    /// bytes per token, so twice the rows fit the mirror budget). Default rule
+    /// (`state::mirror_is_q8`): Q8, except that a speculative (DFlash2) slot keeps
+    /// BF16 while its budget covers the whole reserved context, because its verify
+    /// rows run the tiled kernel, faster on BF16. Q8 decodes faster at every context
+    /// (R9700: +4% at 4K, +11.5% at 16K/32K) and prefills 2-6% slower above 16K.
     /// Needs the tiled kernels (the reference route reads BF16 mirrors only), so
-    /// this is forced off when `tiled` is off. `0` always keeps the BF16 mirror.
+    /// this is forced off when `tiled` is off. `0` always keeps the BF16 mirror;
+    /// `force` always takes Q8, speculative slots included.
     pub mirror_q8: bool,
+    /// `HIPFIRE_RAON_MIRROR_Q8=force`: Q8 even for a speculative slot whose BF16
+    /// mirror would cover the reserved context. Implies [`Self::mirror_q8`].
+    pub mirror_q8_forced: bool,
 }
 
 /// Which attention operands serve a call.
@@ -173,14 +180,22 @@ impl MlaPolicy {
         tiled: true,
         absorb: true,
         mirror_q8: true,
+        mirror_q8_forced: false,
     };
 
     pub fn from_env() -> Result<Self, String> {
         let tiled = parse_flag("HIPFIRE_RAON_ATTN_TILED", Self::DEFAULT.tiled)?;
+        let forced = matches!(
+            hipfire_config::developer_var("HIPFIRE_RAON_MIRROR_Q8")
+                .map(|v| v.trim().to_ascii_lowercase()),
+            Ok(v) if v == "force"
+        );
+        let mirror_q8 = forced || parse_flag("HIPFIRE_RAON_MIRROR_Q8", Self::DEFAULT.mirror_q8)?;
         Ok(Self {
             tiled,
             absorb: parse_flag("HIPFIRE_RAON_MLA_ABSORB", Self::DEFAULT.absorb)?,
-            mirror_q8: parse_flag("HIPFIRE_RAON_MIRROR_Q8", Self::DEFAULT.mirror_q8)? && tiled,
+            mirror_q8: mirror_q8 && tiled,
+            mirror_q8_forced: forced && tiled,
         })
     }
 
@@ -203,6 +218,10 @@ impl MlaPolicy {
 pub struct RaonMlaWork {
     policy: MlaPolicy,
     split_ws: GpuTensor,
+    /// Widest call that runs the row-exact decode-split route
+    /// ([`crate::projection::rows_exact_max`] of the device); `split_ws`
+    /// holds one workspace plane per row of it.
+    rows_exact_max: usize,
     absorb: Option<AbsorbWork>,
 }
 
@@ -218,6 +237,33 @@ impl RaonMlaWork {
         Self::with_policy(gpu, cfg, rows, MlaPolicy::from_env()?)
     }
 
+    /// Device bytes the work holds for `rows` rows once [`Self::pack_absorbed`]
+    /// has run: split-KV workspace, absorbed-route scratch planes and the packed
+    /// expansion weights (one per MLA layer). Reads the route controls like
+    /// [`Self::new`].
+    pub fn required_bytes(cfg: &RaonConfig, rows: usize) -> Result<usize, String> {
+        let policy = MlaPolicy::from_env()?;
+        let v_width = if policy.absorb {
+            cfg.kv_lora.max(cfg.v_head)
+        } else {
+            cfg.v_head
+        };
+        let mut bytes =
+            (latent_attention_decode_workspace_elems(cfg.n_heads, v_width) * 4).max(256);
+        if policy.absorb {
+            bytes += (rows * cfg.n_heads * (cfg.kv_lora + cfg.qk_rope) * 4).max(256);
+            bytes += (rows * cfg.n_heads * cfg.kv_lora * 4).max(256);
+            let packed = latent_attention_absorb_packed_elems(
+                cfg.n_heads,
+                cfg.qk_nope,
+                cfg.v_head,
+                cfg.kv_lora,
+            );
+            bytes += cfg.mla_layers().len() * (packed * 2).max(256);
+        }
+        Ok(bytes)
+    }
+
     pub fn with_policy(
         gpu: &mut Gpu,
         cfg: &RaonConfig,
@@ -230,7 +276,11 @@ impl RaonMlaWork {
         } else {
             cfg.v_head
         };
-        let ws = latent_attention_decode_workspace_elems(cfg.n_heads, v_width);
+        // Row-exact verify blocks run up to `rows_exact_max` decode problems in
+        // one launch, one workspace plane each.
+        let rows_exact_max = crate::projection::rows_exact_max(&gpu.arch);
+        let planes = rows_exact_max.max(1);
+        let ws = latent_attention_decode_workspace_elems(cfg.n_heads, v_width) * planes;
         let split_ws = gpu.zeros(&[ws], DType::F32).map_err(hip)?;
         let absorb = if policy.absorb {
             let q = gpu
@@ -258,6 +308,7 @@ impl RaonMlaWork {
         Ok(Self {
             policy,
             split_ws,
+            rows_exact_max,
             absorb,
         })
     }
@@ -310,7 +361,16 @@ impl RaonMlaWork {
                 let RaonMixer::Mla(mw) = &w.layers[layer_idx].mixer else {
                     return Err(format!("layer {layer_idx} is not an MLA layer"));
                 };
-                project(gpu, &mw.kv_b_proj, &ident, &plane, latent, OutRound::Exact)?;
+                // The absorbed pack is built from an exact identity expansion: never tiered.
+                project(
+                    gpu,
+                    &mw.kv_b_proj,
+                    &ident,
+                    &plane,
+                    latent,
+                    OutRound::Exact,
+                    PrefillActTier::F16,
+                )?;
                 let packed = gpu.zeros(&[elems], DType::BF16).map_err(hip)?;
                 if let Err(e) = gpu.latent_attention_absorb_pack(
                     &plane,
@@ -343,28 +403,46 @@ impl RaonMlaWork {
         }
     }
 
-    /// Attention route operands for MLA layer ordinal `mi` under `route`.
+    /// Attention route operands for MLA layer ordinal `mi` under `route`, for
+    /// a call of `rows` rows. A row-exact verify block
+    /// ([`crate::projection::rows_exact`], `2..=rows_exact_max` rows) runs every
+    /// row as its own decode problem ([`MlaRowsRoute::DecodeExact`]).
     pub fn attention_route(
         &self,
         route: MlaRoute,
         mi: usize,
+        rows: usize,
     ) -> Result<AttentionRoute<'_>, String> {
         let policy = self.policy;
         let ws = Some(&self.split_ws);
+        let rows_route = (2..=self.rows_exact_max)
+            .contains(&rows)
+            .then_some(MlaRowsRoute::DecodeExact);
         match (route, policy.tiled) {
             (MlaRoute::Decompressed, false) => Ok(AttentionRoute::Reference),
-            (MlaRoute::Decompressed, true) => Ok(AttentionRoute::Tiled { workspace: ws }),
+            (MlaRoute::Decompressed, true) => Ok(match rows_route {
+                Some(rows_route) => AttentionRoute::TiledRows {
+                    workspace: ws,
+                    rows_route,
+                },
+                None => AttentionRoute::Tiled { workspace: ws },
+            }),
             (MlaRoute::Absorbed, _) => {
                 let ab = self.absorb.as_ref().filter(|a| mi < a.packed.len()).ok_or(
                     "raon mla: absorbed route selected but its packed weights are not built",
                 )?;
-                Ok(AttentionRoute::Absorbed {
-                    ops: AbsorbOperands {
-                        packed: &ab.packed[mi],
-                        q_abs: &ab.q_abs,
-                        z: &ab.z,
+                let ops = AbsorbOperands {
+                    packed: &ab.packed[mi],
+                    q_abs: &ab.q_abs,
+                    z: &ab.z,
+                };
+                Ok(match rows_route {
+                    Some(rows_route) => AttentionRoute::AbsorbedRows {
+                        ops,
+                        workspace: ws,
+                        rows_route,
                     },
-                    workspace: ws,
+                    None => AttentionRoute::Absorbed { ops, workspace: ws },
                 })
             }
         }

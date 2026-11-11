@@ -6,12 +6,26 @@
 //! contracts as `pub static` [`KernelAbiV1`] values, its storage formats and
 //! numeric contracts as `pub const`, and the list `ABIS`.
 
+pub mod generic_elem;
+pub mod generic_fused;
+pub mod generic_gemm;
+pub mod generic_mmq;
+pub mod generic_mq8;
+pub mod generic_rda;
+pub mod generic_seq;
 pub mod ggml_convert;
 pub mod ggml_mmvq;
 pub mod ggml_mmvq_fused;
+pub mod iu4_gdn;
 pub mod mq6_i8;
+pub mod mq6sym_i8;
+pub mod qwen4_lane_wmma;
+pub mod qwen4_lwmma_tile;
+pub mod qwen4_moe_glue_fold;
 pub mod qwen4_moe_sym;
+pub mod qwen4_topk8_rows;
 
+use crate::work::WorkSpecV1;
 use crate::{Arch, ExportV1, KernelAbiV1};
 
 /// Every contract this crate defines, in a stable order (the identity
@@ -19,11 +33,42 @@ use crate::{Arch, ExportV1, KernelAbiV1};
 pub fn all() -> impl Iterator<Item = &'static KernelAbiV1> {
     mq6_i8::ABIS
         .iter()
+        .chain(mq6sym_i8::ABIS.iter())
         .chain(qwen4_moe_sym::ABIS.iter())
+        .chain(qwen4_moe_glue_fold::ABIS.iter())
         .chain(ggml_mmvq::ABIS.iter())
         .chain(ggml_mmvq_fused::ABIS.iter())
         .chain(ggml_convert::ABIS.iter())
+        .chain(generic_gemm::ABIS.iter())
+        .chain(generic_seq::ABIS.iter())
+        .chain(generic_elem::ABIS.iter())
+        .chain(generic_mmq::ABIS.iter())
+        .chain(generic_mq8::ABIS.iter())
+        .chain(generic_rda::ABIS.iter())
+        .chain(generic_fused::ABIS.iter())
+        .chain(iu4_gdn::ABIS.iter())
+        .chain(qwen4_topk8_rows::ABIS.iter())
+        .chain(qwen4_lane_wmma::ABIS.iter())
+        .chain(qwen4_lwmma_tile::ABIS.iter())
         .copied()
+}
+
+/// Every work spec ([`WorkSpecV1`]), in a stable order. At most one per contract.
+pub fn work_specs() -> impl Iterator<Item = &'static WorkSpecV1> {
+    generic_gemm::WORK
+        .iter()
+        .chain(generic_seq::WORK.iter())
+        .chain(generic_elem::WORK.iter())
+        .chain(generic_mmq::WORK.iter())
+        .chain(generic_mq8::WORK.iter())
+        .chain(generic_rda::WORK.iter())
+        .chain(generic_fused::WORK.iter())
+        .copied()
+}
+
+/// The work spec attached to the contract `abi_id`, if any.
+pub fn work_for(abi_id: &str) -> Option<&'static WorkSpecV1> {
+    work_specs().find(|w| w.abi.id == abi_id)
 }
 
 /// The contract and export that own `symbol` on `arch` (export symbols are
@@ -51,7 +96,32 @@ mod tests {
             }
             assert!(ids.insert(abi.id), "duplicate contract id {}", abi.id);
         }
-        assert_eq!(ids.len(), 51);
+        assert_eq!(
+            ids.len(),
+            68 + super::generic_gemm::ABIS.len()
+                + super::generic_seq::ABIS.len()
+                + super::generic_elem::ABIS.len()
+                + super::generic_mmq::ABIS.len()
+                + super::generic_mq8::ABIS.len()
+                + super::generic_rda::ABIS.len()
+                + super::generic_fused::ABIS.len()
+        );
+    }
+
+    #[test]
+    fn every_work_spec_is_consistent_and_unique() {
+        let mut seen = std::collections::BTreeSet::new();
+        for w in super::work_specs() {
+            if let Err(e) = w.self_check() {
+                panic!("{e}");
+            }
+            assert!(
+                super::all().any(|a| std::ptr::eq(a, w.abi)),
+                "{}: work spec for an unregistered contract",
+                w.abi.id
+            );
+            assert!(seen.insert(w.abi.id), "two work specs for {}", w.abi.id);
+        }
     }
 
     #[test]

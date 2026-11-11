@@ -98,8 +98,8 @@ grouped quant (plain tensor, 256-element "group").
 | 50 | MQ2G256V2 | 72 | per-128 `fp16` `[s z]×2` | 2-bit packs | yes | `mq2g256v2_row_dot` | AVX2 + FMA + F16C |
 | 51 | MQ2G256LloydU | 72 | 4-entry `fp16` codebook | 2-bit indices | **no** (unrotated) | `mq2g256lloydu_row_dot` | AVX2 + FMA + F16C |
 | 53 | MQ4G128V2 | 68/128 | per-128 `fp16` `[s z]` | nibbles | yes (FWHT-128) | `mq4g128v2_row_dot` | AVX2 + FMA + F16C |
-| 131 | MQ3I4G128R256 (W3) | 48/128 + plane | **planar**: f16 scale plane after all code rows | 3-bit codes, `d·(2c−7)` | yes | `w3_row_dot` | AVX2 + FMA + F16C |
-| 132 | MQ3I4G128R128 (W3 down) | 48/128 + plane | as qt 131 | as qt 131 | yes (FWHT-128) | `w3_row_dot` | AVX2 + FMA + F16C |
+| 131 | MQ3I4G128R256 (W3) | 48/128 + plane | **planar**: f16 scale plane after all code rows | 3-bit codes, `d·(2c−7)` | yes | `w3_row_dot` (+ AVX-512 `w3_row_dot512`, decode-once multi-token; bit-identical) | AVX2 + FMA + F16C (AVX-512 tier: F + VBMI + BW + VL) |
+| 132 | MQ3I4G128R128 (W3 down) | 48/128 + plane | as qt 131 | as qt 131 | yes (FWHT-128) | `w3_row_dot` (+ AVX-512 `w3_row_dot512`, decode-once multi-token; bit-identical) | AVX2 + FMA + F16C (AVX-512 tier: F + VBMI + BW + VL) |
 | 135 | E8PI4G128R256 (E8P) | 32/128 + plane | **planar**: f16 scale plane after all code rows | E8P lattice words (8 weights per u16) | yes | `e8p_row_dot`; prepared `e8p_row_dot_cached`, `e8p_row_pair_dot_cached` | AVX2 + FMA + F16C |
 | 136 | E8PI4G128R128 (E8P down) | 32/128 + plane | as qt 135 | as qt 135 | yes (FWHT-128) | as qt 135 | AVX2 + FMA + F16C |
 

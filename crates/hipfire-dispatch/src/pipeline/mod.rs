@@ -26,23 +26,37 @@ pub use sealed_moe::{
     MoeRouterInput, MoeSharedContribution, PrefillRouteMode, ResourceAlias, SealedMoeCall,
 };
 pub(crate) mod moe_program;
+pub mod mq8_attn;
+pub mod q8_prefill;
 pub(crate) mod qt44_qt53_prefill;
 pub mod slab_moe_decode;
 pub mod slab_route;
 pub mod slowlink_prefill;
 pub mod sp_layer;
 pub use moe_program::{
-    execute_gated_ffn, execute_grouped_moe, CastPolicy, CombineOrder, FfnActivation, GatedFfnOp,
-    GroupedMoeGroupedScratch, GroupedMoeIndexedScratch, GroupedMoeOp, GroupedMoePolicy,
-    GroupedMoeProtocol, GroupedMoeRouted, GroupedMoeRouter, GroupedMoeScratch,
-    GroupedMoeScratchPlan, GroupedMoeShared, GroupedMoeSharedScratch, RouterKind,
-    SharedExpertPolicy,
+    execute_gated_ffn, execute_grouped_moe, grouped_moe_iu4_shape_admits, grouped_moe_site_tiers,
+    CastPolicy, CombineOrder, FfnActivation, GatedFfnOp, GroupedMoeGroupedScratch,
+    GroupedMoeIndexedScratch, GroupedMoeOp, GroupedMoePolicy, GroupedMoeProtocol, GroupedMoeRouted,
+    GroupedMoeRouter, GroupedMoeScratch, GroupedMoeScratchPlan, GroupedMoeShared,
+    GroupedMoeSharedScratch, GroupedMoeSiteTiers, RouterKind, SharedExpertPolicy,
+    SingleExpertTableCache, GROUPED_MOE_IU4_MIN_ROWS,
 };
 pub use moe_program::{MoeStage, SealedMoeOp};
+pub use mq8_attn::{
+    mq8_acts_current, mq8_gemv_fused, mq8_gemv_rows, mq8_prefill_gemm, mq8_quantize,
+};
+pub use q8_prefill::{
+    grouped_sym_tier_admits, prefill_quant_admitted, q8_0_f16_x_shareable, q8_0_prefill_gemm,
+    q8_0_prefill_gemm_f16x, q8_0_prefill_gemm_prepared, q8_0_prefill_prepare, q8_0_prefill_runs,
+    q8_0_weight_admits, PrefillActTier, PreparedA8, Q8PrefillRun, PREFILL_QUANT_MIN_ROWS,
+};
 pub(crate) mod draft_head;
+pub mod moe_capture;
 pub mod moe_dump;
 pub(crate) mod norm_fold;
-pub use draft_head::{DraftHead, DraftHeadLayout, DraftHeadPolicy, DraftHeadRequestState};
+pub use draft_head::{
+    DraftHead, DraftHeadLayout, DraftHeadPolicy, DraftHeadRequestState, DraftShard,
+};
 pub mod batched;
 #[cfg(feature = "deltanet")]
 pub mod batched_attention;
@@ -67,13 +81,14 @@ pub use layer_ops::{
     execute_gated_delta_net_uncovered, execute_grouped_depthwise, execute_grouped_depthwise_rows,
     execute_hyper_norm, execute_hyper_read, execute_hyper_write, execute_indexed_attention,
     execute_indexed_attention_arena, execute_indexed_attention_core_rows,
-    execute_indexed_attention_uncovered, execute_lm_head, execute_project, gdn_qkv_projection_bf16,
-    project_weight, project_weights, qsa_projection_hook_installed, reset_qsa_projection_slot,
-    set_qsa_projection_hook, validate_lm_head, BroadcastAddOp, ClearOp, CoreWindow, EmbeddingOp,
-    GatedDeltaNetOp, GatedShortConvOp, GdnRowCapture, GdnTrunkArenas, GroupedDepthwiseOp,
-    HyperNormOp, HyperReadOp, HyperWriteOp, IndexedAttentionMode, IndexedAttentionOp,
-    IndexedAttentionState, LaneAttentionOp, MixerPhase, ProjectLadder, ProjectOp,
-    QsaProjectionHook, QsaTrunkArenas,
+    execute_indexed_attention_uncovered, execute_lm_head, execute_project, execute_row_gather,
+    gdn_qkv_projection_bf16, grouped_depthwise_lanes_admitted, project_weight, project_weights,
+    qsa_projection_hook_installed, reset_qsa_projection_slot, set_qsa_projection_hook,
+    validate_lm_head, BroadcastAddOp, ClearOp, CoreWindow, EmbeddingOp, GatedDeltaNetOp,
+    GatedShortConvOp, GdnRowCapture, GdnTrunkArenas, GroupedDepthwiseOp, HyperNormOp, HyperReadOp,
+    HyperWriteAr, HyperWriteOp, IndexedAttentionMode, IndexedAttentionOp, IndexedAttentionState,
+    LaneAttentionOp, MixerPhase, ProjectLadder, ProjectOp, QsaProjectionHook, QsaSelectGather,
+    QsaSpSelect, QsaTrunkArenas, RowGather, RowGatherOp,
 };
 pub use step_graph::{
     op_kind_of, Alias, OpDecl, OpId, OpKind, ResourceClass, ResourceDecl, ResourceId, SplitRule,
@@ -637,6 +652,62 @@ mod qt53_fallback_tests {
                 ..
             })
         )
+    }
+
+    /// A trunk shard rank (`HIPFIRE_QWEN4_EP_TRUNK_SHARD`) seals the MoE with its K-slice of
+    /// the shared expert (384 / 256 of 640): the grouped route is still selected, for a
+    /// policy and call that agree on the width; the model's own 640 is unchanged; widths that
+    /// are not a 128-multiple within the model's, or a call that disagrees with its policy,
+    /// are refused.
+    #[cfg(feature = "deltanet")]
+    #[test]
+    fn trunk_shard_shared_slices_keep_the_grouped_route() {
+        let dtypes = fallback_dtypes();
+        let route = |policy_shared: usize, call_shared: usize| {
+            let mut policy = flash_next_policy(DType::BF16);
+            policy.geometry.shared_intermediate = policy_shared;
+            select_grouped_route_by(
+                &dtypes,
+                512,
+                10,
+                2560,
+                640,
+                call_shared,
+                2560,
+                2560,
+                640,
+                None,
+                false,
+                Some(policy),
+                &|_| true,
+            )
+        };
+        for shared in [640usize, 512, 384, 256, 128] {
+            assert_eq!(
+                route(shared, shared),
+                Some(MoeRouteCapability::Qt44Qt53Grouped),
+                "shared {shared}"
+            );
+        }
+        for shared in [0usize, 64, 320, 641, 768, 1280] {
+            assert_eq!(route(shared, shared), None, "shared {shared}");
+        }
+        assert_eq!(route(384, 640), None);
+        assert_eq!(route(640, 384), None);
+        // The slab route applies the same geometry rule (its codec admission is separate).
+        assert!(
+            crate::families::moe::fixed_route_geometry_up_to_shared_width(
+                flash_next_policy(DType::BF16).geometry
+            )
+        );
+        let mut other = flash_next_policy(DType::BF16).geometry;
+        other.shared_intermediate = 384;
+        assert!(crate::families::moe::fixed_route_geometry_up_to_shared_width(other));
+        other.routed_intermediate = 512;
+        assert!(!crate::families::moe::fixed_route_geometry_up_to_shared_width(other));
+        other.routed_intermediate = 640;
+        other.shared_intermediate = 0;
+        assert!(!crate::families::moe::fixed_route_geometry_up_to_shared_width(other));
     }
 
     #[test]
@@ -1361,7 +1432,7 @@ mod qwen4_route_tests {
         for landed in [false, true] {
             for (arch, admitted) in [
                 ("gfx1201", [true, true, true, false, false, false]),
-                ("gfx1100", [true, false, true, false, false, false]),
+                ("gfx1100", [true, true, true, false, false, false]),
                 ("gfx1151", [true, true, landed, false, false, false]),
                 ("gfx1200", [false; 6]),
                 ("gfx942", [false; 6]),
@@ -1413,7 +1484,7 @@ mod qwen4_route_tests {
                 assert_eq!(bucket(arch, pairs[4]), None);
             }
             assert_eq!(bucket("gfx1201", pairs[1]), Some(0));
-            assert_eq!(bucket("gfx1100", pairs[1]), None);
+            assert_eq!(bucket("gfx1100", pairs[1]), Some(0));
             // gfx1151: MQ4 = bucket 1, W3 = bucket 0, E8P = bucket 0 only once its receipts landed;
             // W2 has none.
             assert_eq!(bucket("gfx1151", pairs[0]), Some(1));
@@ -1430,7 +1501,8 @@ mod qwen4_route_tests {
 
     /// A mixed slab layer (per-expert pairs plus a codec table) is MQ4 plus
     /// exactly one admitted cold codec the policy declares: gfx1100 serves an
-    /// E8P layer (MQ4 first or cold first) and refuses W3, gfx1151 serves a W3 layer and, until
+    /// E8P layer (MQ4 first or cold first) and a decode-only W3 layer (K1, no K2), gfx1151 serves
+    /// a W3 layer and, until
     /// `SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED`, refuses E8P (afterwards it serves an E8P layer
     /// like gfx1100), and every arch refuses W3 + E8P in one
     /// layer, W2 anywhere, and a declaration that disagrees with the table.
@@ -1519,8 +1591,8 @@ mod qwen4_route_tests {
             assert_eq!(route("gfx1100", E8P, &[MQ4], Some(3)), deltanet);
             assert_eq!(route("gfx1201", MQ4, &[E8P], Some(3)), deltanet);
             assert_eq!(route("gfx1201", MQ4, &[W3], Some(1)), deltanet);
-            // W3 is not served on gfx1100.
-            assert!(!route("gfx1100", MQ4, &[W3], Some(1)));
+            // W3 is served on gfx1100 for decode (K1; no K2).
+            assert_eq!(route("gfx1100", MQ4, &[W3], Some(1)), deltanet);
             // W3 + E8P in one layer, W2 anywhere, a mismatched declaration.
             for arch in ["gfx1201", "gfx1100"] {
                 for cold in [None, Some(1), Some(3)] {
@@ -6855,6 +6927,117 @@ fn decode_mutation_fence_stage() -> Result<(), DispatchError> {
     Ok(())
 }
 
+/// The routed-combine arms a sealed grouped MoE call can reach (decode and prefill).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CombineArm {
+    /// The canonical top-10 slot-order combine over expanded F32 rows
+    /// (`moe_down_combine_top10_batched`): decode, path 1, the indexed-down re-entry and
+    /// the EP grouped-down unscatter. The only arm a fixed reduction partition can mask.
+    ExpandedTop10,
+    /// The k=8 expanded combine (`moe_down_combine_k8_batched`).
+    DecodeK8,
+    /// The BF16-row grouped combine (`moe_down_combine_grouped_top10_bf16in_owned`).
+    GroupedBf16InOwned,
+    /// The F32 grouped-row combine (`moe_down_combine_grouped_top10`).
+    GroupedF32,
+    /// The qt=55 FP8 grouped combine.
+    Fp8Grouped,
+    /// The row-folded tail: only the rank order is launched, the row kernel combines.
+    RankOrderOnly,
+    /// The combine rides the shared down launch (`moe_shared_down_combine`).
+    DeferredToSharedDown,
+}
+
+/// The kernel a routed combine launches for one call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CombineLeaf {
+    /// `moe_down_combine_top10_batched`: every live slot folds its expanded row.
+    Top10,
+    /// `moe_down_combine_top10_batched_partitioned`: a live slot whose expert
+    /// `e % ranks != rank` folds +0 in place (the call's fixed reduction partition).
+    Top10Partitioned { rank: usize, ranks: usize },
+}
+
+/// Select the combine leaf of `arm` under the call's fixed reduction partition
+/// (`MoeRowGather::reduction_partition` of this call's layer). A partition is honoured by the
+/// expanded top-10 arm only; every other arm folds foreign rows unmasked, so it is refused here,
+/// before any launch of the combine, never run silently. With no partition (`None`) every arm
+/// keeps its own kernel, and the returned [`CombineLeaf::Top10`] is the unmasked expanded leaf
+/// (the only one an expanded arm launches).
+pub(crate) fn combine_leaf(
+    arm: CombineArm,
+    partition: Option<(usize, usize)>,
+) -> Result<CombineLeaf, DispatchError> {
+    let Some((rank, ranks)) = partition else {
+        return Ok(CombineLeaf::Top10);
+    };
+    if ranks == 0 || rank >= ranks {
+        return Err(DispatchError::Hip(format!(
+            "sealed moe: reduction partition rank {rank} of {ranks} is invalid; refusing before launch"
+        )));
+    }
+    if arm != CombineArm::ExpandedTop10 {
+        return Err(DispatchError::Hip(format!(
+            "sealed moe: the {arm:?} combine cannot fold the call's fixed reduction partition \
+             (rank {rank} of {ranks}, e % ranks == rank); it would fold foreign experts \
+             unmasked; refusing before launch"
+        )));
+    }
+    Ok(CombineLeaf::Top10Partitioned { rank, ranks })
+}
+
+/// The decode call's fixed reduction partition `(rank, ranks)`: its row gather hook's
+/// `reduction_partition` of `layer_idx`, the layer index the decode row gather itself receives
+/// (the prefill protocol's counterpart reads `ep_layer_idx`). Per call and layer, never
+/// process-global; `None` without a hook.
+pub(crate) fn decode_reduction_partition(
+    p: &crate::families::moe::MoeParams<'_>,
+) -> Option<(usize, usize)> {
+    p.ep_row_gather
+        .and_then(|gather| gather.reduction_partition(p.layer_idx))
+}
+
+impl CombineLeaf {
+    /// Launch the leaf over `expanded` (`tokens * 10` rows of `hidden` F32) into `target`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch(
+        self,
+        gpu: &mut Gpu,
+        expanded: &GpuTensor,
+        topk_indices: &GpuTensor,
+        topk_weights: &GpuTensor,
+        target: &GpuTensor,
+        hidden: usize,
+        tokens: usize,
+        n_experts: usize,
+    ) -> Result<(), DispatchError> {
+        match self {
+            Self::Top10 => hip!(gpu.moe_down_combine_top10_batched(
+                expanded,
+                topk_indices,
+                topk_weights,
+                target,
+                hidden,
+                tokens,
+                n_experts,
+            )),
+            Self::Top10Partitioned { rank, ranks } => {
+                hip!(gpu.moe_down_combine_top10_batched_partitioned(
+                    expanded,
+                    topk_indices,
+                    topk_weights,
+                    target,
+                    hidden,
+                    tokens,
+                    n_experts,
+                    rank,
+                    ranks,
+                ))
+            }
+        }
+    }
+}
+
 fn decode_combine_stage(
     gpu: &mut Gpu,
     p: &crate::families::moe::MoeParams<'_>,
@@ -6864,10 +7047,21 @@ fn decode_combine_stage(
     reject_fp8_moe_unless_routed(&p.dtypes, route)?;
     check_qt53_decode_fallback(p, route)?;
     let grouped = route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped);
+    // The call's fixed reduction partition (the row gather's layer index is `layer_idx` on the
+    // decode protocol); decided before any launch of this combine.
+    let leaf = combine_leaf(
+        if grouped {
+            CombineArm::ExpandedTop10
+        } else {
+            CombineArm::DecodeK8
+        },
+        decode_reduction_partition(p),
+    )?;
     let dump = moe_dump::fold_begin(gpu, p.layer_idx as usize, p.hidden, p.x_residual, target)?;
     if grouped {
         let down_expanded = slice_moe_f32_view(p.down_expanded, 0, 10 * p.hidden);
-        hip!(gpu.moe_down_combine_top10_batched(
+        leaf.launch(
+            gpu,
             &down_expanded,
             p.topk_indices,
             p.topk_weights,
@@ -6875,7 +7069,7 @@ fn decode_combine_stage(
             p.hidden,
             1,
             p.n_exp,
-        ))?;
+        )?;
     } else {
         hip!(gpu.moe_down_combine_k8_batched(
             p.down_expanded,
@@ -7805,4 +7999,74 @@ fn prefill_mutation_fence_stage() -> Result<(), DispatchError> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod combine_leaf_tests {
+    use super::{combine_leaf, CombineArm, CombineLeaf};
+
+    const ARMS: [CombineArm; 7] = [
+        CombineArm::ExpandedTop10,
+        CombineArm::DecodeK8,
+        CombineArm::GroupedBf16InOwned,
+        CombineArm::GroupedF32,
+        CombineArm::Fp8Grouped,
+        CombineArm::RankOrderOnly,
+        CombineArm::DeferredToSharedDown,
+    ];
+
+    /// No partition (the static route, the MTP head, every non-EP call): the expanded top-10
+    /// arm keeps today's unmasked leaf and no arm is refused.
+    #[test]
+    fn no_partition_keeps_the_unmasked_leaf_for_every_arm() {
+        for arm in ARMS {
+            assert_eq!(
+                combine_leaf(arm, None).unwrap(),
+                CombineLeaf::Top10,
+                "{arm:?}"
+            );
+        }
+    }
+
+    /// A partition selects the partitioned leaf on the expanded top-10 arm only, for both ranks.
+    #[test]
+    fn a_partition_selects_the_partitioned_leaf_on_the_expanded_arm() {
+        for ranks in [2usize, 4, 8] {
+            for rank in 0..ranks {
+                assert_eq!(
+                    combine_leaf(CombineArm::ExpandedTop10, Some((rank, ranks))).unwrap(),
+                    CombineLeaf::Top10Partitioned { rank, ranks }
+                );
+            }
+        }
+    }
+
+    /// Every other combine reachable under a partition (the k8 combine, the grouped BF16-input /
+    /// F32 / FP8 grouped combines, the rank-order-only row fold and the combine deferred into
+    /// the shared down) fails BEFORE any launch with a message naming the arm: nothing folds
+    /// foreign experts unmasked.
+    #[test]
+    fn every_other_arm_refuses_a_partition_before_launch() {
+        for arm in ARMS {
+            if arm == CombineArm::ExpandedTop10 {
+                continue;
+            }
+            let error = combine_leaf(arm, Some((0, 2))).unwrap_err();
+            let text = format!("{error:?}");
+            assert!(
+                text.contains(&format!("{arm:?}")) && text.contains("before launch"),
+                "{arm:?}: {text}"
+            );
+        }
+    }
+
+    /// A malformed partition never reaches a launcher, on any arm.
+    #[test]
+    fn an_invalid_partition_is_refused() {
+        for arm in ARMS {
+            assert!(combine_leaf(arm, Some((0, 0))).is_err(), "{arm:?}");
+            assert!(combine_leaf(arm, Some((2, 2))).is_err(), "{arm:?}");
+            assert!(combine_leaf(arm, Some((5, 2))).is_err(), "{arm:?}");
+        }
+    }
 }

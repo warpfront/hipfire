@@ -13,6 +13,7 @@ a number store, and not a route selector.
 | Perf-variant allowlist discipline | [`perf-arch-discipline.md`](perf-arch-discipline.md) |
 | Redline timed-arm proof | [`docs/REDLINE.md`](../REDLINE.md) |
 | rocprof blindspot audit | [`rocprof-coverage.md`](rocprof-coverage.md) |
+| Lessons from served campaigns (decomposition, kill experiments, C>1 hygiene, gate gaps) | [`lessons-0.4.5.md`](lessons-0.4.5.md) |
 
 Truth labels for any number you produce: **measured** (named fixture +
 identity + date), **historical** (retained snapshot), or **planned**.
@@ -173,7 +174,10 @@ not a constant copied from another arch.
    bar above local noise) — that bar is campaign-local.
 
 A spread that is large relative to the claimed delta means more samples
-or a cleaner fixture — not a hand-waved “noise” win.
+or a cleaner fixture — not a hand-waved “noise” win. Served C>1 claims
+(nonces, reducer checks, host load, first-arm warm-up, at least 4
+interleaved fresh loads per arm, bootstrap CIs) follow
+[`lessons-0.4.5.md`](lessons-0.4.5.md) § 4.
 
 ## Profiling attribution
 

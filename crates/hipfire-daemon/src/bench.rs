@@ -133,9 +133,7 @@ pub(crate) fn handle_bench_prefill(
         m.seq_pos = 0;
         m.conversation_tokens.clear();
         let _ = hipfire_generate::common::reset_qwen35_recurrent(m, gpu);
-        if let Some(st) = m.state.as_mut() {
-            let _ = st.as_mut().reset_session_state(gpu);
-        }
+        let _ = m.reset_arch_session_state(gpu);
     } else if let Err(reason) = hipfire_generate::bench_topology::reset_mesh_for_bench(m, gpu) {
         emit_uncorrelated_error(
             stdout,
@@ -167,7 +165,7 @@ pub(crate) fn handle_bench_prefill(
             return;
         }
     }
-    if !bench_route.uses_carrier_hooks() {
+    if bench_route.is_mesh() {
         if let Err(reason) = hipfire_generate::bench_topology::quiesce_mesh(bench_route, m) {
             emit_uncorrelated_error(
                 stdout,
@@ -226,9 +224,7 @@ pub(crate) fn handle_bench_prefill(
         m.seq_pos = 0;
         m.conversation_tokens.clear();
         let _ = hipfire_generate::common::reset_qwen35_recurrent(m, gpu);
-        if let Some(st) = m.state.as_mut() {
-            let _ = st.as_mut().reset_session_state(gpu);
-        }
+        let _ = m.reset_arch_session_state(gpu);
     } else if let Err(reason) = hipfire_generate::bench_topology::reset_mesh_for_bench(m, gpu) {
         emit_uncorrelated_error(
             stdout,
@@ -589,7 +585,7 @@ pub(crate) fn handle_bench_decode(
         gpu.replay.begin_replay_observation_window();
     }
     let replay_before = gpu.replay.replay_observation();
-    if !bench_route.uses_carrier_hooks() {
+    if bench_route.is_mesh() {
         if let Err(reason) = hipfire_generate::bench_topology::quiesce_mesh(bench_route, m) {
             emit_uncorrelated_error(
                 stdout,

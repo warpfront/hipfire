@@ -50,6 +50,31 @@
 //!   other counter, and counts above the counter's capacity.
 //! * `release_store_sources` is a no-op on gfx942 (no `depctr_vm_vsrc`; a
 //!   store's VM_CNT slot is also its completion).
+//! * **Store sources are not counter-held when replaying gfx942** (`required_replay`,
+//!   used by `ledger_cfg` only; the Builder's `required` still locks them, which is
+//!   conservative, and its emission is unchanged). Basis:
+//!   - CDNA3 ISA §4.4 p.19-20 defines LGKM_CNT/VM_CNT by when the memory *effect*
+//!     completes (DS write: "data has been written to LDS/GWS"), and defines exactly one
+//!     counter for source-register lifetime, EXP_CNT: "when data has been read out of the
+//!     VGPR and sent to GWS, at which time it is safe to overwrite the contents of that
+//!     VGPR", incremented for GWS instructions only. No counter says a DS (non-GWS) or
+//!     VMEM store's data VGPRs are held until completion.
+//!   - Where the ISA bounds overwrite of store data it does so in wait states: VMEM
+//!     store/atomic of more than 64 bits, writer VGPRs 1 (any writer) / 2 (VALU) wait
+//!     states (§4.5 Table 11 p.20; `cdna::hazard` `StoreDataWrite`/`StoreDataValu`,
+//!     which the lifted certification runs). No row exists for narrower VMEM stores or
+//!     for DS stores.
+//!   - LLVM agrees (cross-check, not the basis): `GCNSubtarget::vmemWriteNeedsExpWaitcnt`
+//!     is `generation < SEA_ISLANDS`, so VMEM stores lock their VGPRs (`VMW_GPR_LOCK`,
+//!     an EXP_CNT event) only before gfx7; the DS source lock (`GDS_GPR_LOCK`) is
+//!     GDS-only (`AMDGPUHWEvents.cpp`).
+//!   A pending store therefore still occupies its counter slot, keeps ordering loads and
+//!   makes a barrier wait, but does not make a younger overwrite of its data/address
+//!   registers wait for the counter. The rows16 hipcc anchor relies on this: it overwrites
+//!   `ds_write2_b64` data VGPRs 19 instructions later with no `lgkmcnt` wait.
+//!   GDS/GWS operations are rejected by the lifted certification, so the EXP_CNT rule is
+//!   never needed. [UNVERIFIED: confirm on MI300X] the ISA gives no wait-state row for DS
+//!   store data; none is modelled.
 
 use crate::{
     arch::Arch,
@@ -58,7 +83,7 @@ use crate::{
 };
 use serde::Serialize;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
 pub enum Counter {
     Load,
     Store,
@@ -70,7 +95,7 @@ pub enum Counter {
     Exp,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MemoryFamily {
     Buffer,
     Global,
@@ -86,7 +111,7 @@ pub enum MemoryFamily {
 /// `global_*` loads and stores share VM_CNT's single in-order stream
 /// (`Gfx9Vmem`, CDNA3 ISA §4.4 p.19). Every other operation is ordered only
 /// within its family.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum OrderClass {
     Family(MemoryFamily),
     Gfx12VmemRead,
@@ -141,6 +166,18 @@ pub struct WaitProof {
     pub reason: Reason,
 }
 
+/// Per pending operation: counter, defs, source locks, in-order, family, order class, `maybe`
+/// (`Ledger::replay_state_key`).
+pub(crate) type StateKey = Vec<(
+    Counter,
+    Vec<RegRef>,
+    Vec<RegRef>,
+    bool,
+    MemoryFamily,
+    OrderClass,
+    bool,
+)>;
+
 /// `arch` is the architecture of the last recorded operation (it selects the
 /// counter capacities); it is `None` until something was recorded, and a
 /// ledger with nothing pending needs none.
@@ -168,6 +205,63 @@ impl Ledger {
     pub fn record(&mut self, arch: Arch, insn: &Instruction) {
         let Some(class) = insn.memory else { return };
         self.arch = Some(arch);
+        if let MemoryClass::VmemAtomic { returns } = class {
+            // gfx12: a returning atomic is a VMEM read access (LOADcnt), a returnless one a
+            // write access (STOREcnt); the builder emits atomics only on gfx12. Neither is
+            // assumed in order with the loads/stores around it (waits on it drain to zero),
+            // and its data/address sources stay locked until it retires.
+            let (counter, defs) = if returns {
+                (Counter::Load, insn.defs.clone())
+            } else {
+                (Counter::Store, vec![])
+            };
+            self.pending.push(Pending {
+                id: self.next_id,
+                counter,
+                defs,
+                src_locks: insn.uses.clone(),
+                in_order: false,
+                family: MemoryFamily::Global,
+                order: OrderClass::Family(MemoryFamily::Global),
+                maybe: false,
+                aliases: vec![],
+                lds_slots: vec![],
+            });
+            self.next_id += 1;
+            return;
+        }
+        if let MemoryClass::Flat { load } = class {
+            // one pending entry per counter it may count on; a load's destination is
+            // defined once both have retired (each entry carries it)
+            let vmem = match (arch.gfx12(), load) {
+                (true, true) => Counter::Load,
+                (true, false) => Counter::Store,
+                (false, true) => Counter::Vm,
+                (false, false) if arch == Arch::Gfx942 => Counter::Vm,
+                (false, false) => Counter::Vs,
+            };
+            let lds = if arch.gfx12() {
+                Counter::Ds
+            } else {
+                Counter::Lgkm
+            };
+            for counter in [vmem, lds] {
+                self.pending.push(Pending {
+                    id: self.next_id,
+                    counter,
+                    defs: if load { insn.defs.clone() } else { vec![] },
+                    src_locks: insn.uses.clone(),
+                    in_order: false,
+                    family: MemoryFamily::Global,
+                    order: OrderClass::Family(MemoryFamily::Global),
+                    maybe: false,
+                    aliases: vec![],
+                    lds_slots: vec![],
+                });
+                self.next_id += 1;
+            }
+            return;
+        }
         let gfx942 = arch == Arch::Gfx942;
         let mnemonic = insn.mnemonic();
         let (counter, in_order, load) = match (arch.gfx12(), class) {
@@ -185,12 +279,17 @@ impl Ledger {
             (false, MemoryClass::DsStore) => (Counter::Lgkm, true, false),
             (false, MemoryClass::SmemLoad) => (Counter::Lgkm, false, true),
             (_, MemoryClass::Export) => (Counter::Exp, false, false),
+            // recorded above
+            (_, MemoryClass::VmemAtomic { .. } | MemoryClass::Flat { .. }) => return,
         };
         let family = match class {
             MemoryClass::VmemLoad | MemoryClass::VmemStore if mnemonic.starts_with("buffer_") => {
                 MemoryFamily::Buffer
             }
-            MemoryClass::VmemLoad | MemoryClass::VmemStore => MemoryFamily::Global,
+            MemoryClass::VmemLoad
+            | MemoryClass::VmemStore
+            | MemoryClass::VmemAtomic { .. }
+            | MemoryClass::Flat { .. } => MemoryFamily::Global,
             MemoryClass::DsLoad | MemoryClass::DsStore => MemoryFamily::Ds,
             MemoryClass::SmemLoad => MemoryFamily::Smem,
             MemoryClass::Export => MemoryFamily::Export,
@@ -260,6 +359,24 @@ impl Ledger {
     }
 
     pub fn required(&self, insn: &Instruction) -> Vec<(Counter, u8, Reason)> {
+        self.required_with(insn, true)
+    }
+
+    /// `required` for replaying emitted code (`ledger_cfg`; the Builder never calls it, its
+    /// emission is unchanged). On gfx942 a store's sources are not held until its counter
+    /// slot retires: a younger write to a register a pending VMEM store, returnless VMEM
+    /// atomic or DS store reads needs no counter wait (no `Reason::War`). The operation
+    /// still occupies its counter slot, still orders in-flight loads, and still makes a
+    /// barrier wait (`pending_stores`); loads' results (RAW, WAW) are unaffected. Every
+    /// other architecture is `required` exactly. Basis, see the module docs: the CDNA3 ISA
+    /// defines the counters by when the memory *effect* completes (§4.4 p.19-20) and bounds
+    /// the consumption of store data by wait states (§4.5 Table 11 p.20, enforced by
+    /// `cdna::hazard`), not by a counter.
+    pub(crate) fn required_replay(&self, insn: &Instruction) -> Vec<(Counter, u8, Reason)> {
+        self.required_with(insn, self.arch != Some(Arch::Gfx942))
+    }
+
+    fn required_with(&self, insn: &Instruction, hold_sources: bool) -> Vec<(Counter, u8, Reason)> {
         let mut waits: Vec<(Counter, u8, Reason)> = Vec::new();
         for (index, pending) in self.pending.iter().enumerate() {
             let reason = pending
@@ -282,6 +399,9 @@ impl Ledger {
                         })
                 })
                 .or_else(|| {
+                    if !hold_sources {
+                        return None;
+                    }
                     pending.src_locks.iter().find_map(|lock| {
                         insn.defs
                             .iter()
@@ -498,6 +618,17 @@ impl Ledger {
             .retain(|p| !matches!(p.counter, Counter::Store | Counter::Vs));
     }
 
+    /// The vector registers the pending VMEM stores have not yet been shown to have read: only a full drain of the
+    /// store counter or `depctr_vm_vsrc(0)` frees them for a redefinition (a partial count is never trusted for
+    /// stores: their completion order is never inferred).
+    pub fn pending_store_sources(&self) -> Vec<RegRef> {
+        self.pending
+            .iter()
+            .filter(|p| matches!(p.counter, Counter::Store | Counter::Vs))
+            .flat_map(|p| p.src_locks.iter().copied())
+            .filter(|r| matches!(r.kind, crate::reg::Kind::V | crate::reg::Kind::A))
+            .collect()
+    }
     /// An LDS store not yet retired (DScnt on gfx12, LGKMcnt on gfx11 and
     /// gfx942): a barrier that publishes LDS must drain it first.
     pub fn pending_stores(&self) -> bool {
@@ -509,6 +640,10 @@ impl Ledger {
     }
     pub fn is_empty(&self) -> bool {
         self.pending.is_empty()
+    }
+    /// Some operation of counter `c` is pending.
+    pub fn has_pending(&self, c: Counter) -> bool {
+        self.pending.iter().any(|p| p.counter == c)
     }
     /// Id of the most recently recorded operation.
     pub fn last_id(&self) -> Option<u64> {
@@ -534,6 +669,154 @@ impl Ledger {
                 )
             })
             .collect()
+    }
+
+    /// The id-free state the replay (`required_replay`, `wait_replay`,
+    /// `clip_to_issue_bound`, the barrier's `shape` family check) depends on: per pending
+    /// operation its counter, registers, source locks, order class (`shape` has no order
+    /// class, which decides the count of an in-order wait) and `maybe` flag, in issue order.
+    /// Two ledgers with equal keys require and retire identically for every later
+    /// instruction, so a CFG walk (`ledger_cfg`) keys its seen states by it and loop
+    /// iterations that only advance ids do not grow.
+    ///
+    /// On gfx942 the **source locks are canonicalized away**: `required_replay` never reads
+    /// them there (`hold_sources` is false, no `Reason::War`) and nothing else the walk
+    /// calls observes them (`retire_count`, `wait`/`wait_replay`, `clip_to_issue_bound`,
+    /// `deepest_counter`, the barrier's family check use only the counter, order class,
+    /// `in_order`, `maybe`, family and defs; `release_store_sources` is a no-op; `join`,
+    /// `positional` and `pending_store*` are never called by the walk). A pending store keeps
+    /// its position, counter slot, order class and family in the key and drops only the
+    /// registers it read, so paths that differ only in which store (different data/address
+    /// registers) occupies a slot are one state. This is an exact observational
+    /// equivalence, not a join: no operation is added, dropped or made `maybe`, so every
+    /// wait and hazard outcome of every continuation is identical. Every other architecture
+    /// keeps its source locks in the key (`required_replay` there reports `Reason::War`).
+    pub(crate) fn replay_state_key(&self) -> StateKey {
+        let hold_sources = self.arch != Some(Arch::Gfx942);
+        self.pending
+            .iter()
+            .map(|p| {
+                (
+                    p.counter,
+                    p.defs.clone(),
+                    if hold_sources {
+                        p.src_locks.clone()
+                    } else {
+                        Vec::new()
+                    },
+                    p.in_order,
+                    p.family,
+                    p.order,
+                    p.maybe,
+                )
+            })
+            .collect()
+    }
+
+    /// The pre-canonicalization key (source locks kept on every architecture): the reference
+    /// the `ledger_cfg` tests compare `replay_state_key` against.
+    #[cfg(test)]
+    pub(crate) fn full_state_key(&self) -> StateKey {
+        self.pending
+            .iter()
+            .map(|p| {
+                (
+                    p.counter,
+                    p.defs.clone(),
+                    p.src_locks.clone(),
+                    p.in_order,
+                    p.family,
+                    p.order,
+                    p.maybe,
+                )
+            })
+            .collect()
+    }
+
+    /// The counter with the most pending operations and that count (`None` when
+    /// nothing is pending): a CFG walk bounds it instead of dropping operations,
+    /// since dropping the oldest would lose its register hazards.
+    pub(crate) fn deepest_counter(&self) -> Option<(Counter, usize)> {
+        let mut counts: Vec<(Counter, usize)> = Vec::new();
+        for p in &self.pending {
+            match counts.iter_mut().find(|(c, _)| *c == p.counter) {
+                Some(entry) => entry.1 += 1,
+                None => counts.push((p.counter, 1)),
+            }
+        }
+        counts.into_iter().max_by_key(|&(_, n)| n)
+    }
+
+    /// The order class `wait_replay` compares. On gfx11 VMcnt (`Counter::Vm`) holds only
+    /// loads (stores are on VScnt), and `buffer_*` and `global_*` loads return in issue
+    /// order through the one counter (RDNA3 ISA ch. 11; `peacemaker_ir` `passes/waits.rs`),
+    /// so the two families share a class. The builder's `retire_count` keeps its stricter
+    /// per-family classes (emission is unchanged); gfx942 stores share `Vm` under
+    /// `Gfx9Vmem` already.
+    fn replay_class(p: &Pending) -> OrderClass {
+        match (p.counter, p.order) {
+            (Counter::Vm, OrderClass::Family(MemoryFamily::Buffer | MemoryFamily::Global)) => {
+                OrderClass::Family(MemoryFamily::Buffer)
+            }
+            (_, order) => order,
+        }
+    }
+
+    /// `wait` for replaying emitted code: a wait of zero retires everything on the
+    /// counter, but a nonzero wait retires by position only when every pending
+    /// operation of the counter is in order, certain and of one order class (the
+    /// condition under which `required` computes a nonzero count). With mixed
+    /// classes (DS with SMEM on LGKMcnt, buffer with global on gfx11, out-of-order
+    /// SMEM) completion order is not known, so nothing retires.
+    pub(crate) fn wait_replay(&mut self, counter: Counter, count: u8) {
+        if count != 0 {
+            let ordered = {
+                let mut peers = self.pending.iter().filter(|p| p.counter == counter);
+                match peers.next() {
+                    None => true,
+                    Some(first) => {
+                        let class = Self::replay_class(first);
+                        first.in_order
+                            && !first.maybe
+                            && peers
+                                .all(|p| p.in_order && !p.maybe && Self::replay_class(p) == class)
+                    }
+                }
+            };
+            if !ordered {
+                return;
+            }
+        }
+        self.wait(counter, count)
+    }
+
+    /// Verifier-only (`ledger_cfg`; the Builder never calls it, its emission is unchanged):
+    /// retire what the architecture's issue bound retires. A counter field holds at most
+    /// `cap(counter)` outstanding operations (63 for LOADcnt/STOREcnt/DScnt and gfx11
+    /// VMcnt/VScnt/LGKMcnt, 31 for KMcnt, the `Caps` maxima on CDNA), and a wave stalls issue
+    /// at that maximum: when the next operation would exceed it, the oldest has retired. So a
+    /// counter with more than `cap` recorded operations keeps only its youngest `cap`, **but
+    /// only when its whole queue is ordered, known and of one class** (`wait_replay`'s
+    /// condition: every operation in order, none `maybe`, one order class). A mixed queue
+    /// (DS with SMEM, buffer with global on gfx11, atomics, out-of-order SMEM) retires in an
+    /// order the model does not know and is never clipped: its depth stays unbounded and
+    /// fails closed at the walk's `COUNTER_CAP`. A counter without a cap is never clipped.
+    pub(crate) fn clip_to_issue_bound(&mut self, cap: impl Fn(Counter) -> Option<u8>) {
+        let mut counters: Vec<Counter> = Vec::new();
+        for p in &self.pending {
+            if !counters.contains(&p.counter) {
+                counters.push(p.counter);
+            }
+        }
+        for counter in counters {
+            let Some(cap) = cap(counter).filter(|&c| c > 0) else {
+                continue;
+            };
+            let depth = self.pending.iter().filter(|p| p.counter == counter).count();
+            if depth > usize::from(cap) {
+                self.wait_replay(counter, cap);
+            }
+        }
     }
 
     pub fn wait_instruction(
@@ -777,6 +1060,39 @@ mod gfx942_tests {
     /// Loads and stores of buffer and global share VM_CNT in issue order
     /// (CDNA3 ISA §4.4 p.19): the wait is the number of younger VM_CNT
     /// operations of either kind, and no VS_CNT exists.
+    #[test]
+    fn a_flat_access_counts_on_the_vmem_counter_and_dscnt() {
+        let flat = Instruction::new(
+            "flat_load_b32 v3, v[1:2]",
+            vec![r(Kind::V, 3)],
+            vec![r(Kind::V, 1)],
+        )
+        .memory(MemoryClass::Flat { load: true });
+        let use_v3 = Instruction::new("v_mov_b32 v4, v3", vec![r(Kind::V, 4)], vec![r(Kind::V, 3)]);
+        let mut l = Ledger::default();
+        l.record(Arch::Gfx1201, &flat);
+        let mut need: Vec<(Counter, u8)> = l.required(&use_v3).iter().map(|w| (w.0, w.1)).collect();
+        need.sort_by_key(|w| format!("{w:?}"));
+        assert_eq!(need, vec![(Counter::Ds, 0), (Counter::Load, 0)]);
+        // a flat store keeps its sources until both counters retire it
+        let store = Instruction::new("flat_store_b32 v[1:2], v5", vec![], vec![r(Kind::V, 5)])
+            .memory(MemoryClass::Flat { load: false });
+        let def_v5 = Instruction::new("v_mov_b32 v5, 0", vec![r(Kind::V, 5)], vec![]);
+        let mut l = Ledger::default();
+        l.record(Arch::Gfx1201, &store);
+        let counters: std::collections::BTreeSet<String> = l
+            .required(&def_v5)
+            .iter()
+            .map(|w| format!("{:?}", w.0))
+            .collect();
+        assert!(
+            counters.contains("Store") && counters.contains("Ds"),
+            "{counters:?}"
+        );
+        l.drain();
+        assert!(l.is_empty());
+    }
+
     #[test]
     fn mixed_buffer_global_loads_and_stores_wait_by_position() {
         let window = [

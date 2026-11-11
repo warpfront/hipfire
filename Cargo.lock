@@ -1510,6 +1510,7 @@ dependencies = [
  "half",
  "hip-bridge",
  "hipfire-config",
+ "hipfire-cpu",
  "hipfire-dispatch",
  "hipfire-loader",
  "hipfire-runtime",
@@ -1535,6 +1536,8 @@ dependencies = [
  "hipfire-dispatch",
  "hipfire-runtime",
  "md5 0.8.1",
+ "railgun",
+ "railgun-corpus",
  "rdna-compute",
  "serde",
  "serde_json",
@@ -2726,6 +2729,7 @@ version = "0.4.5"
 dependencies = [
  "insta",
  "object",
+ "peacemaker-cdna",
  "peacemaker-ir",
  "proptest",
  "rmpv",
@@ -3053,6 +3057,7 @@ dependencies = [
 name = "railgun-cert"
 version = "0.4.5"
 dependencies = [
+ "object",
  "peacemaker-ir",
  "peacemaker-lift",
  "radiowave",
@@ -3297,6 +3302,7 @@ dependencies = [
  "peacemaker-rip",
  "radiowave",
  "railgun",
+ "railgun-cert",
  "railgun-corpus",
  "rayon",
  "redline-dispatch",

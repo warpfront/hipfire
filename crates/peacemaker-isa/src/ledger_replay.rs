@@ -258,7 +258,14 @@ fn replay(assembly: &str, arch: Arch, all: bool) -> Result<Vec<String>, String> 
             }
             continue;
         }
-        let kind = if name.starts_with("buffer_load") || name.starts_with("global_load") {
+        // gfx12 global atomics: with TH_ATOMIC_RETURN a LOADcnt read access defining its
+        // first operand; without, a STOREcnt write access. `global_wb` counts on STOREcnt.
+        let atomic = name.contains("_atomic_");
+        let kind = if atomic && operands.contains("TH_ATOMIC_RETURN") {
+            Some((Kind::Vmem, true))
+        } else if atomic || name == "global_wb" {
+            Some((Kind::Store, false))
+        } else if name.starts_with("buffer_load") || name.starts_with("global_load") {
             Some((Kind::Vmem, true))
         } else if name.starts_with("buffer_store") || name.starts_with("global_store") {
             Some((Kind::Store, false))

@@ -105,6 +105,7 @@ fn arg_facts() -> Vec<ArgFact> {
         role: ArgRole::Pointer {
             classes: classes.to_vec(),
             read_cache: ReadCache::VmemOnly,
+            atomic_ops: Vec::new(),
         },
     };
     let int = |offset| ArgFact {
@@ -184,6 +185,9 @@ pub(crate) fn writer_facts() -> Arc<NodeFacts> {
                     guard("grid_dim", 2, 0, "1"),
                 ],
                 indexed: vec![effect],
+                tables: Vec::new(),
+                arenas: Vec::new(),
+                task_protocol: None,
                 witnesses: vec!["indexed_bind".into()],
                 case_digest: "ef".repeat(32),
             }),

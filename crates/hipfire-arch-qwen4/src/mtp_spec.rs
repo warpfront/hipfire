@@ -522,7 +522,9 @@ pub struct Qwen4SpecScratch {
 }
 
 /// [`SpecTarget::spec_advance`] on one rank inside an EP fan-out (mesh
-/// detached, never aborting): the final row's argmax.
+/// detached, never aborting): the final row's argmax. This rank's prompt
+/// nesting spans the whole advance, so a borrowed EP reserve restores once, at
+/// its completion, on every rank (`spec_advance_from` nests inside).
 fn replica_spec_advance(
     bundle: &mut Qwen4Bundle,
     gpu: &mut Gpu,
@@ -530,10 +532,57 @@ fn replica_spec_advance(
     start_pos: usize,
     reset: bool,
 ) -> Result<u32, String> {
-    match bundle.spec_advance(gpu, tokens, start_pos, reset, &|| false, None)? {
-        SpecAdvance::Ready { last_argmax, .. } => Ok(last_argmax),
-        SpecAdvance::Aborted => Err("Qwen4 spec_advance aborted inside an EP fan-out".to_string()),
-    }
+    crate::ep::bracket_prompt(
+        (bundle, gpu),
+        |(bundle, _)| bundle.share_prompt_begin(),
+        |(bundle, gpu)| match bundle.spec_advance(gpu, tokens, start_pos, reset, &|| false, None)? {
+            SpecAdvance::Ready { last_argmax, .. } => Ok(last_argmax),
+            SpecAdvance::Aborted => {
+                Err("Qwen4 spec_advance aborted inside an EP fan-out".to_string())
+            }
+        },
+        |(bundle, gpu), ok| {
+            bundle
+                .share_prompt_end(gpu, ok)
+                .map_err(|error| error.to_string())
+        },
+    )
+}
+
+/// [`MtpDrafter::mtp_prefill`] on one rank inside an EP fan-out: the native-MTP
+/// fill is one whole-prompt entry on this rank, so the borrowed reserve is
+/// restored once, at its completion, after the last head continuation consumed
+/// the wide capture (`mtp_prefill_ops` nests inside).
+#[allow(clippy::too_many_arguments)]
+fn replica_mtp_prefill(
+    drafter: &mut Qwen4MtpDrafter,
+    bundle: &mut Qwen4Bundle,
+    gpu: &mut Gpu,
+    prompt_tokens: &[u32],
+    fill_tokens: &[u32],
+    start_pos: usize,
+    cache_hit: bool,
+) -> Result<PrefillOutcome, String> {
+    crate::ep::bracket_prompt(
+        (drafter, (bundle, gpu)),
+        |(_, (bundle, _))| bundle.share_prompt_begin_mtp_fill(),
+        |(drafter, (bundle, gpu))| {
+            drafter.mtp_prefill(
+                &mut **gpu,
+                &mut **bundle,
+                prompt_tokens,
+                fill_tokens,
+                start_pos,
+                cache_hit,
+                &|| false,
+            )
+        },
+        |(_, (bundle, gpu)), ok| {
+            bundle
+                .share_prompt_end(gpu, ok)
+                .map_err(|error| error.to_string())
+        },
+    )
 }
 
 impl SpecScratch for Qwen4SpecScratch {
@@ -1983,7 +2032,7 @@ const NGRAM_YIELD_RECOVERY: f32 = 0.95;
 /// Draft depths of the request-local n-gram acceptance table: one per verify
 /// row of the spec capacity below the seed, the longest proposal the pool
 /// can make (`qwen4_ngram_mod_config` caps `n_max` there).
-const NGRAM_DEPTHS: usize = QWEN4_SPEC_VERIFY_ROWS - 1;
+pub(crate) const NGRAM_DEPTHS: usize = QWEN4_SPEC_VERIFY_ROWS - 1;
 /// Fewest candidates of a takeover that may skip the head's row-0
 /// confirmation, once the copy source is established (see
 /// [`NGRAM_UNCONFIRMED_MIN_ACCEPT`]). Checked against teacher-forced replays
@@ -2059,7 +2108,10 @@ fn gdn_residual_trace_field(state: &crate::state::Qwen4State) -> String {
 /// their first windows and ran the whole response at AR speed (28–29 tok/s
 /// against 40–46 when drafting continued).  `HIPFIRE_MTP_FLOOR_MIN_WINDOWS=<n>`
 /// (n ≥ 1) overrides it; `3` restores retirement at the probe budget.
-/// Continuous-batching lanes keep retirement at the probe budget.
+/// Continuous-batching lanes keep retirement at the probe budget, except the
+/// gfx1201 lane profile (`mtp_lanes::LaneCostProfile::gfx1201`, kill switch
+/// `HIPFIRE_QWEN4_LANE_COST=0`), whose floor reads this threshold and the AR
+/// probe count below.
 const MTP_SINGLETON_FLOOR_MIN_WINDOWS: usize = 16;
 
 /// Ordinary AR tokens a singleton request's floor times, at the moment it
@@ -2075,7 +2127,7 @@ const MTP_SINGLETON_FLOOR_AR_PROBE_TOKENS: usize = 6;
 /// The singleton request's retirement threshold:
 /// `HIPFIRE_MTP_FLOOR_MIN_WINDOWS` when it parses as an integer ≥ 1, else
 /// [`MTP_SINGLETON_FLOOR_MIN_WINDOWS`].
-fn singleton_floor_min_windows() -> usize {
+pub(crate) fn singleton_floor_min_windows() -> usize {
     hipfire_config::developer_var("HIPFIRE_MTP_FLOOR_MIN_WINDOWS")
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
@@ -2104,7 +2156,7 @@ pub(crate) type Qwen4Floor =
 /// retirement (see [`Qwen4Floor::with_retire_evidence`]).
 /// `HIPFIRE_MTP_FLOOR_AR_PROBE=<n>` overrides it; `0` is the kill switch and
 /// restores the single-calibration-token floor.
-fn singleton_floor_ar_probe_tokens() -> usize {
+pub(crate) fn singleton_floor_ar_probe_tokens() -> usize {
     hipfire_config::developer_var("HIPFIRE_MTP_FLOOR_AR_PROBE")
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
@@ -3486,21 +3538,21 @@ fn window_key(window: Result<MtpWindow, String>) -> Result<(Vec<u32>, usize, usi
 /// `start - 1` (the head's position - 1), which owed token 0 pairs with
 /// (token `i` pairs with spec hidden row `i - 1`); the catch-up ends it on
 /// row `owed - 1`. Host only.
-#[derive(Debug, Default)]
-struct HeadLag {
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct HeadLag {
     /// The head position: where the first owed row goes.
-    start: usize,
+    pub(crate) start: usize,
     /// The owed tokens, at positions `start..start + tokens.len()`; token
     /// `i`'s own target hidden is spec hidden row `i` (the pair of token
     /// `i + 1`).
-    tokens: Vec<u32>,
+    pub(crate) tokens: Vec<u32>,
 }
 
 impl HeadLag {
     /// The spec hidden row the AR token at `position` captures into: the
     /// next row. Refused unless `position` continues the owed rows and a row
     /// below `capacity` is free.
-    fn next_row(&self, position: usize, capacity: usize) -> Result<usize, String> {
+    pub(crate) fn next_row(&self, position: usize, capacity: usize) -> Result<usize, String> {
         let row = self.tokens.len();
         if row != 0 && self.start + row != position {
             return Err(format!(
@@ -3518,7 +3570,7 @@ impl HeadLag {
     }
 
     /// Owe the token at `position`, whose hidden went to [`Self::next_row`].
-    fn push(&mut self, position: usize, token: u32) {
+    pub(crate) fn push(&mut self, position: usize, token: u32) {
         debug_assert!(self.tokens.is_empty() || self.start + self.tokens.len() == position);
         if self.tokens.is_empty() {
             self.start = position;
@@ -3526,7 +3578,7 @@ impl HeadLag {
         self.tokens.push(token);
     }
 
-    fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.tokens.clear();
     }
 }
@@ -4036,19 +4088,120 @@ struct FloorPending {
 /// of it (`rate` and `native_rate` stay 0 when the proposal was shorter than
 /// `n_min` or the budget and was never priced).
 #[derive(Clone, Copy, Debug)]
-struct NgramDecision {
+pub(crate) struct NgramDecision {
     /// The proposal's length.
-    available: usize,
+    pub(crate) available: usize,
     /// Candidates taken; 0 when the proposal was declined.
-    take: usize,
+    pub(crate) take: usize,
     /// The head's row-0 draft must confirm the first candidate.
-    confirm: bool,
+    pub(crate) confirm: bool,
     /// Best takeover rate (expected emitted tokens per AR step of cost).
-    rate: f32,
+    pub(crate) rate: f32,
     /// The native window's rate it was compared with.
-    native_rate: f32,
+    pub(crate) native_rate: f32,
     /// Depth-1 n-gram acceptance.
+    pub(crate) a1: f32,
+}
+
+/// Whether a copy take of `take` candidates still needs the head's own row-0
+/// draft to confirm its first candidate: only an established source
+/// (acceptance and evidence of the depth-1 shadow table, and the last shadow
+/// observation accepting its first candidate) skips it.
+pub(crate) fn copy_take_confirms(
+    take: usize,
     a1: f32,
+    a1_weight: f32,
+    last_first_accepted: bool,
+) -> bool {
+    !(take >= NGRAM_UNCONFIRMED_MIN_TAKE
+        && a1 >= NGRAM_UNCONFIRMED_MIN_ACCEPT
+        && a1_weight >= NGRAM_UNCONFIRMED_MIN_EVIDENCE
+        && last_first_accepted)
+}
+
+/// The inputs of the copy lane's take-length chooser, shared by the
+/// singleton drafter and the mesh lane root.
+pub(crate) struct CopyTakeInput<'a> {
+    /// The pool proposal's length.
+    pub(crate) available: usize,
+    /// Most candidates a take may carry (`min(take cap, caller budget,
+    /// table depths)`).
+    pub(crate) cap: usize,
+    pub(crate) n_min: usize,
+    /// The request's own per-depth copy acceptance (non-empty).
+    pub(crate) agreement: &'a [(f32, f32)],
+    /// The native floor retired the request.
+    pub(crate) retired: bool,
+    /// The last shadow observation accepted its first candidate.
+    pub(crate) last_first_accepted: bool,
+}
+
+/// The copy lane's take-length chooser: the `d` in `n_min..=min(proposal,
+/// cap)` maximizing the expected emitted tokens `1 + Σ_i Π_{j<=i} a_j` per
+/// unit `takeover_cost(d)` (shorter on ties), taken when that rate is at
+/// least the native window's (`native_rate`, evaluated only when a take is
+/// priced) or, on a retired request, AR's 1.0, and then only while the last
+/// shadow observation accepted its first candidate.
+pub(crate) fn copy_take_decision(
+    input: &CopyTakeInput<'_>,
+    native_rate: impl FnOnce() -> f32,
+    takeover_cost: impl Fn(usize) -> f32,
+) -> NgramDecision {
+    let (a1_sum, a1_weight) = input.agreement[0];
+    let a1 = a1_sum / a1_weight.max(f32::MIN_POSITIVE);
+    let mut decision = NgramDecision {
+        available: input.available,
+        take: 0,
+        confirm: true,
+        rate: 0.0,
+        native_rate: 0.0,
+        a1,
+    };
+    let hi = input.available.min(input.cap);
+    let lo = input.n_min.max(1);
+    if hi >= lo {
+        let native_rate = if input.retired { 1.0 } else { native_rate() };
+        let (mut prefix, mut expected) = (1.0f32, 1.0f32);
+        let mut best = (0usize, 0.0f32);
+        for d in 1..=hi {
+            let (accepted, weight) = input.agreement[d - 1];
+            prefix *= accepted / weight.max(f32::MIN_POSITIVE);
+            expected += prefix;
+            if d < lo {
+                continue;
+            }
+            let rate = expected / takeover_cost(d);
+            if best.0 == 0 || rate > best.1 {
+                best = (d, rate);
+            }
+        }
+        decision.rate = best.1;
+        decision.native_rate = native_rate;
+        // A retired request's alternative is one AR row, so a takeover
+        // rejected at its first candidate wastes the whole verify (a
+        // native window that agreed with the same wrong candidate would
+        // have failed with it): once retired, take only while the last
+        // shadow observation accepted its first candidate. A copy span
+        // that resumes re-arms after one AR token.
+        let retired_cold = input.retired && !input.last_first_accepted;
+        if best.1 >= native_rate && !retired_cold {
+            decision.take = best.0;
+            decision.confirm = copy_take_confirms(best.0, a1, a1_weight, input.last_first_accepted);
+        }
+    }
+    decision
+}
+
+/// `(matched, horizon)` of one shadow observation: the common prefix of the
+/// window's pool proposal and the tokens committed after it, censored at the
+/// committed length.
+pub(crate) fn copy_shadow_counts(proposal: &[u32], truth: &[u32]) -> (usize, usize) {
+    let matched = proposal
+        .iter()
+        .zip(truth)
+        .take_while(|(proposed, committed)| proposed == committed)
+        .count();
+    (matched, proposal.len().min(truth.len()))
 }
 
 // ---------------------------------------------------------------------------
@@ -5497,8 +5650,25 @@ impl Qwen4MtpDrafter {
             let bundle = Self::bundle(target)?;
             if bundle.mtp_append_rows_supported(ops.gpu()?) {
                 let rows = MTP_FILL_ROWS.min(prefill_rows);
-                let scratch = MtpAppendScratch::new(ops.gpu()?, &bundle.config, rows, prefill_rows)
-                    .map_err(|error| format!("Qwen4 MTP append scratch allocation: {error}"))?;
+                // `HIPFIRE_QWEN4_LANE_APPEND_SHARE`: with an MTP lane store staged, this scratch
+                // is a view of the store's own (same shape: `MTP_FILL_ROWS.min(chunk)` rows). The
+                // lane store and this drafter are never in use at the same time: both run on the
+                // one driver thread and the one stream of the bundle's single forward scratch,
+                // and no scratch tensor carries state between two passes (see
+                // `MtpAppendScratch::shared_view`). A longer prompt chunk than the lane
+                // store's id capacity takes the per-sub-chunk id upload
+                // (`prefill_uploads_chunk_ids`), which uploads the same bytes.
+                let shared = hipfire_config::qwen4_lane_append_share()
+                    .then(|| bundle.lane_append_scratch_view())
+                    .flatten()
+                    .filter(|view| view.rows() >= rows);
+                let scratch = match shared {
+                    Some(view) => view,
+                    None => MtpAppendScratch::new(ops.gpu()?, &bundle.config, rows, prefill_rows)
+                        .map_err(|error| {
+                        format!("Qwen4 MTP append scratch allocation: {error}")
+                    })?,
+                };
                 self.append_scratch = Some(scratch);
             }
         }
@@ -5925,13 +6095,7 @@ impl Qwen4MtpDrafter {
             return;
         }
         let truth = &emitted[start..];
-        let matched = self
-            .ngram_proposal
-            .iter()
-            .zip(truth)
-            .take_while(|(proposed, committed)| proposed == committed)
-            .count();
-        let horizon = self.ngram_proposal.len().min(truth.len());
+        let (matched, horizon) = copy_shadow_counts(&self.ngram_proposal, truth);
         observe_agreement_counts(
             &mut self.ngram_agreement,
             matched,
@@ -6892,76 +7056,48 @@ impl Qwen4MtpDrafter {
         // `k` already includes the remaining emit budget: a takeover commits
         // seed + candidates to both device owners before the host sees them.
         let cap = self.ngram_take_cap().min(k).min(self.ngram_agreement.len());
-        let (a1_sum, a1_weight) = self.ngram_agreement[0];
-        let a1 = a1_sum / a1_weight.max(f32::MIN_POSITIVE);
-        let mut decision = NgramDecision {
-            available,
-            take: 0,
-            confirm: true,
-            rate: 0.0,
-            native_rate: 0.0,
-            a1,
-        };
         #[cfg(feature = "reference-parity")]
         if let Some(d) = self.lab_ngram_width() {
             // Bypass the take-length chooser only. These are the exact
             // source's real tokens, never fabricated longer offers.
+            let (a1_sum, a1_weight) = self.ngram_agreement[0];
+            let a1 = a1_sum / a1_weight.max(f32::MIN_POSITIVE);
+            let mut decision = NgramDecision {
+                available,
+                take: 0,
+                confirm: true,
+                rate: 0.0,
+                native_rate: 0.0,
+                a1,
+            };
             if d > available || d > k {
                 self.ngram_decision = Some(decision);
                 return false;
             }
             decision.take = d;
-            decision.confirm = !(d >= NGRAM_UNCONFIRMED_MIN_TAKE
-                && a1 >= NGRAM_UNCONFIRMED_MIN_ACCEPT
-                && a1_weight >= NGRAM_UNCONFIRMED_MIN_EVIDENCE
-                && self.ngram_last_first_accepted);
+            decision.confirm = copy_take_confirms(d, a1, a1_weight, self.ngram_last_first_accepted);
             self.ngram_candidates.clear();
             self.ngram_candidates
                 .extend_from_slice(&self.ngram_proposal[..d]);
             self.ngram_decision = Some(decision);
             return d > 0;
         }
-        let hi = available.min(cap);
-        let lo = config.n_min.max(1);
-        if hi >= lo {
-            let native_rate = if self.floor.retired() {
-                1.0
-            } else {
-                self.native_rate(k.min(self.incumbent_max_k()))
-            };
-            let (mut prefix, mut expected) = (1.0f32, 1.0f32);
-            let mut best = (0usize, 0.0f32);
-            for d in 1..=hi {
-                let (accepted, weight) = self.ngram_agreement[d - 1];
-                prefix *= accepted / weight.max(f32::MIN_POSITIVE);
-                expected += prefix;
-                if d < lo {
-                    continue;
-                }
-                let rate = expected / self.takeover_cost(d);
-                if best.0 == 0 || rate > best.1 {
-                    best = (d, rate);
-                }
-            }
-            decision.rate = best.1;
-            decision.native_rate = native_rate;
-            // A retired request's alternative is one AR row, so a takeover
-            // rejected at its first candidate wastes the whole verify (a
-            // native window that agreed with the same wrong candidate would
-            // have failed with it): once retired, take only while the last
-            // shadow observation accepted its first candidate. A copy span
-            // that resumes re-arms after one AR token.
-            let retired_cold = self.floor.retired() && !self.ngram_last_first_accepted;
-            if best.1 >= native_rate && !retired_cold {
-                decision.take = best.0;
-                decision.confirm = !(best.0 >= NGRAM_UNCONFIRMED_MIN_TAKE
-                    && a1 >= NGRAM_UNCONFIRMED_MIN_ACCEPT
-                    && a1_weight >= NGRAM_UNCONFIRMED_MIN_EVIDENCE
-                    && self.ngram_last_first_accepted);
-                self.ngram_candidates.clear();
-                self.ngram_candidates
-                    .extend_from_slice(&self.ngram_proposal[..best.0]);
-            }
+        let decision = copy_take_decision(
+            &CopyTakeInput {
+                available,
+                cap,
+                n_min: config.n_min,
+                agreement: &self.ngram_agreement,
+                retired: self.floor.retired(),
+                last_first_accepted: self.ngram_last_first_accepted,
+            },
+            || self.native_rate(k.min(self.incumbent_max_k())),
+            |d| self.takeover_cost(d),
+        );
+        if decision.take > 0 {
+            self.ngram_candidates.clear();
+            self.ngram_candidates
+                .extend_from_slice(&self.ngram_proposal[..decision.take]);
         }
         self.ngram_decision = Some(decision);
         decision.take > 0
@@ -7547,6 +7683,24 @@ fn mark_phase(timers: &mut Option<&mut MtpPhaseTimers>, gpu: &Gpu, label: &'stat
     }
 }
 
+thread_local! {
+    /// `Some(None)`: armed by [`lane_fill_split_arm`] for one MTP lane prefill tile;
+    /// `Some(Some((trunk_ms, head_ms)))`: that tile's split, filled by [`mtp_prefill_chunk`].
+    static LANE_FILL_SPLIT: std::cell::Cell<Option<Option<(f64, f64)>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Arm the trunk/head split for the next [`mtp_prefill_chunk`] on this thread (the
+/// `HIPFIRE_CB_PHASES` per-tile line of `lane_exec::run_prefill_tiles`).
+pub(crate) fn lane_fill_split_arm() {
+    LANE_FILL_SPLIT.with(|split| split.set(Some(None)));
+}
+
+/// Disarm and return the split `(trunk_ms, head_ms)` the armed tile recorded, if any.
+pub(crate) fn lane_fill_split_take() -> Option<(f64, f64)> {
+    LANE_FILL_SPLIT.with(|split| split.replace(None)).flatten()
+}
+
 /// The body of `mtp_prefill`'s chunk loop for the chunk `chunk` at `pos`:
 /// the trunk tile with wide-hidden capture (`spec_prefill_rows` when
 /// `needs_pick`, else `spec_prefill_rows_silent`), then the head append of
@@ -7589,7 +7743,26 @@ pub(crate) fn mtp_prefill_chunk(
     } else {
         None
     };
+    // Lane-tile diagnostic (`lane_fill_split_arm`): the trunk forward and the head fill timed
+    // apart, each ending on a device wait. Unarmed (every singleton prefill, every serve step
+    // without `HIPFIRE_CB_PHASES`), this adds nothing.
+    let trunk_clock = LANE_FILL_SPLIT
+        .with(|split| split.get().is_some())
+        .then(std::time::Instant::now);
     let pick = bundle.ops_prefill_rows(ops, chunk, needs_pick)?;
+    let head_clock = match trunk_clock {
+        Some(clock) => {
+            ops.gpu()?
+                .hip
+                .device_synchronize()
+                .map_err(|error| error.to_string())?;
+            Some((
+                clock.elapsed().as_secs_f64() * 1e3,
+                std::time::Instant::now(),
+            ))
+        }
+        None => None,
+    };
     if let Some(shape) = &shape {
         // The target captured both banks together, but head append boundaries,
         // prompt-id uploads and pending rows remain those of the sequential run.
@@ -7640,11 +7813,19 @@ pub(crate) fn mtp_prefill_chunk(
     {
         return Ok(ControlFlow::Break(()));
     }
+    if let Some((trunk_ms, clock)) = head_clock {
+        ops.gpu()?
+            .hip
+            .device_synchronize()
+            .map_err(|error| error.to_string())?;
+        let head_ms = clock.elapsed().as_secs_f64() * 1e3;
+        LANE_FILL_SPLIT.with(|split| split.set(Some(Some((trunk_ms, head_ms)))));
+    }
     Ok(ControlFlow::Continue(pick))
 }
 
 #[allow(clippy::too_many_arguments)]
-fn mtp_append_prefill_chunk(
+pub(crate) fn mtp_append_prefill_chunk(
     bundle: &mut Qwen4Bundle,
     ops: &mut Qwen4Ops<'_>,
     chunk: &[u32],
@@ -7887,6 +8068,43 @@ pub(crate) struct NativeFinish<'a> {
     /// singleton drafter's windows, which a terminal stop may cut short. The
     /// caller records the tickets and releases them.
     pub retain: bool,
+    /// The head never advanced this window (a copy/forced window: `k > 0`
+    /// rows verified but no head Draft ran), so it is still at the window's
+    /// start and the seed's row is appended instead of truncated to. A native
+    /// window passes `false`.
+    pub head_at_start: bool,
+    /// The lane commit fill (`HIPFIRE_QWEN4_LANE_COMMIT_FILL`): when given,
+    /// two or more kept drafts are rebuilt by one batched decode-fill Append
+    /// (`Qwen4MtpGpu::append_rows`, `MtpFillContext::DecodeFill`, the
+    /// per-row reduction order) over `verify_hidden` rows `0..kept` instead of
+    /// one `mtp_append_token` per row. `None` keeps the per-row loop.
+    pub fill: Option<CommitFill<'a>>,
+}
+
+/// [`NativeFinish::fill`]: the Append scratch, and the row of block row 0 in
+/// the lane forward's device token-id upload (the kept drafts embed from those
+/// ids in place when the forward's mirror still holds them).
+pub(crate) struct CommitFill<'a> {
+    pub scratch: &'a mut MtpAppendScratch,
+    pub ids_row: usize,
+}
+
+/// A native window whose every fallible target/head operation succeeded and
+/// whose tickets validated, but whose tickets are still live (nothing is
+/// consumed). [`publish_native_window`] consumes them; a caller whose
+/// cross-owner agreement fails drops this and aborts, leaving the tickets
+/// for the outer rollback.
+pub(crate) struct PreparedNativeWindow {
+    /// The window's outcome, returned by publish.
+    pub window: MtpWindow,
+    /// The still-live pre-window target ticket.
+    pub target_snapshot: TargetTicket,
+    /// The still-live pre-window head ticket.
+    pub mtp_ticket: HeadTicket,
+    /// Retain (keep rollback-able) instead of consuming at publish.
+    pub retain: bool,
+    /// The position both target and head hold after the window.
+    pub committed_end: usize,
 }
 
 /// A batched window's tail, from the target's accepted length through the
@@ -7895,12 +8113,50 @@ pub(crate) struct NativeFinish<'a> {
 /// position checks, the pending hidden copy and the commit of both tickets.
 /// `mtp_step` and the lane executor both end their windows here; the caller
 /// clears its own scratch ticket and head ticket after `Ok`.
+/// Composition of [`prepare_native_window`] and [`publish_native_window`].
 pub(crate) fn finish_native_window(
     picks: &mut Qwen4Bundle,
     ops: &mut Qwen4Ops<'_>,
     f: NativeFinish<'_>,
-    mut timers: Option<&mut MtpPhaseTimers>,
+    timers: Option<&mut MtpPhaseTimers>,
 ) -> Result<MtpWindow, String> {
+    let prepared = prepare_native_window(picks, ops, f, timers)?;
+    publish_native_window(picks, ops, prepared)
+}
+
+/// Consume (or retain) the tickets of a [`PreparedNativeWindow`]. Infallible
+/// for a Local target (the tickets were validated by prepare and no GPU
+/// operation runs here). The Mesh variant (`pp_window_finalize`) can fail,
+/// hence the `Result`; the PP policy for that failure belongs to the PP path.
+pub(crate) fn publish_native_window(
+    picks: &mut Qwen4Bundle,
+    ops: &mut Qwen4Ops<'_>,
+    prepared: PreparedNativeWindow,
+) -> Result<MtpWindow, String> {
+    let PreparedNativeWindow {
+        window,
+        target_snapshot,
+        mtp_ticket,
+        retain,
+        committed_end,
+    } = prepared;
+    debug_assert_eq!(
+        picks.state.position, committed_end,
+        "publish_native_window: the target moved after prepare"
+    );
+    picks.ops_finish_window(ops, target_snapshot, mtp_ticket, retain)?;
+    Ok(window)
+}
+
+/// Every fallible operation of a window's tail (target rollback/replay, head
+/// restore and teacher-forced rebuild, position checks, pending hidden copy)
+/// plus a non-consuming ticket validation. On `Err` no ticket was consumed.
+pub(crate) fn prepare_native_window(
+    picks: &mut Qwen4Bundle,
+    ops: &mut Qwen4Ops<'_>,
+    f: NativeFinish<'_>,
+    mut timers: Option<&mut MtpPhaseTimers>,
+) -> Result<PreparedNativeWindow, String> {
     let NativeFinish {
         position,
         block,
@@ -7911,6 +8167,8 @@ pub(crate) fn finish_native_window(
         verify_hidden,
         ple_normed,
         retain,
+        head_at_start: head_already_at_start,
+        fill,
     } = f;
     let drafts = block
         .get(1..)
@@ -7924,7 +8182,7 @@ pub(crate) fn finish_native_window(
     // both owners if either side's GPU work fails.
     // Under a mesh a full target restore also restores the head to the
     // window's start (one aggregate restore): the head then replays below.
-    let mut head_at_start = false;
+    let mut head_at_start = head_already_at_start;
     if !full_accept && picks.ops_ring_eligible(target_snapshot, block.len()) {
         mark_phase(&mut timers, ops.gpu()?, "target_rollback");
         picks.ops_rollback_rows(
@@ -7974,18 +8232,41 @@ pub(crate) fn finish_native_window(
             picks.ops_head_truncate_retain(mtp_ticket, 1)?;
         }
     }
-    for row in 0..target_accept_len {
-        picks
-            .copy_hidden_row(ops.gpu()?, verify_hidden, row, pending_hidden)
-            .map_err(|error| error.to_string())?;
-        picks
-            .mtp_append_token(
-                ops.gpu()?,
-                block[row + 1],
-                Some(pending_hidden),
-                position + 1 + row,
-            )
-            .map_err(|error| error.to_string())?;
+    // Token `block[row + 1]` pairs with verify hidden row `row`: the batched
+    // fill reads those rows in place; the per-row loop stages each in
+    // `pending_hidden` first. Both leave `pending_hidden` to the copy below.
+    match fill.filter(|fill| target_accept_len >= 2 && target_accept_len <= fill.scratch.rows()) {
+        Some(fill) => {
+            let kept = &block[1..=target_accept_len];
+            let ids = picks.lane_uploaded_token_ids(fill.ids_row + 1, kept);
+            picks
+                .mtp_append_rows_hidden(
+                    ops.gpu()?,
+                    MtpFillContext::DecodeFill,
+                    fill.scratch,
+                    kept,
+                    verify_hidden,
+                    None,
+                    ids.as_ref(),
+                    position + 1,
+                )
+                .map_err(|error| error.to_string())?
+        }
+        None => {
+            for row in 0..target_accept_len {
+                picks
+                    .copy_hidden_row(ops.gpu()?, verify_hidden, row, pending_hidden)
+                    .map_err(|error| error.to_string())?;
+                picks
+                    .mtp_append_token(
+                        ops.gpu()?,
+                        block[row + 1],
+                        Some(pending_hidden),
+                        position + 1 + row,
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+        }
     }
     mark_phase(&mut timers, ops.gpu()?, "commit");
     let committed_end = position
@@ -8010,12 +8291,18 @@ pub(crate) fn finish_native_window(
         drafts_generated: drafts.len(),
     };
     // All fallible GPU operations are complete. Validate every owner's
-    // ticket (every band and the head, under a mesh) before invalidating
-    // any, then perform the no-copy commit boundary; a retaining window keeps
-    // the arena entries instead, so a terminal stop inside it can still roll
-    // every owner back.
-    picks.ops_finish_window(ops, target_snapshot, mtp_ticket, retain)?;
-    Ok(window)
+    // ticket (every band and the head, under a mesh) without consuming any;
+    // `publish_native_window` performs the no-copy commit boundary (a
+    // retaining window keeps the arena entries instead, so a terminal stop
+    // inside it can still roll every owner back).
+    picks.ops_window_valid(target_snapshot, mtp_ticket)?;
+    Ok(PreparedNativeWindow {
+        window,
+        target_snapshot,
+        mtp_ticket,
+        retain,
+        committed_end,
+    })
 }
 
 /// How a batched window's head reaches the committed position. Every route
@@ -8927,6 +9214,8 @@ impl Qwen4MtpDrafter {
                     verify_hidden: &verify_hidden,
                     ple_normed: ple_normed.as_ref(),
                     retain: true,
+                    head_at_start: false,
+                    fill: None,
                 },
                 Some(&mut timers),
             )?;
@@ -9062,12 +9351,22 @@ impl Qwen4MtpDrafter {
         cache_hit: bool,
         abort: &dyn Fn() -> bool,
     ) -> Result<PrefillOutcome, String> {
-        // The whole prompt is one decode-share prompt: the donor tail is
-        // restored once, after its last tile (`share_finish_prompt`). A mesh
-        // never takes decode-share.
+        // The whole prompt is one decode-share / EP-reserve prompt: the donor
+        // tail is restored once, after its last tile (`share_finish_prompt`).
+        // `!ops.is_mesh()` names the single-context route; it does not exclude
+        // per-rank EP execution (each EP rank runs this body on a `Single` context
+        // inside the fan-out). A PP mesh never takes decode-share or the EP
+        // reserve, and fails closed if one is somehow loaded.
         let single = !ops.is_mesh();
+        if !single && Self::bundle(target)?.ep_reserve_active() {
+            return Err(
+                "Qwen4 native-MTP prefill over a PP mesh cannot run on an EP \
+                        reserve-sharing load"
+                    .to_string(),
+            );
+        }
         if single {
-            Self::bundle(target)?.share_prompt_begin();
+            Self::bundle(target)?.share_prompt_begin_mtp_fill();
         }
         let result =
             self.mtp_prefill_tiles(ops, target, prompt_tokens, start_pos, cache_hit, abort);
@@ -9828,31 +10127,31 @@ impl MtpDrafter for Qwen4MtpDrafter {
                 target.reset_recurrent(gpu)?;
                 return Ok(PrefillOutcome::Aborted);
             }
-            let never = || false;
+            // Inside the fan-out every rank runs never-abort (`replica_mtp_prefill`).
             return Self::bundle(target)?.ep_drafter_fanout(
                 "mtp_prefill",
                 gpu,
                 self,
                 |drafter, bundle, gpu| {
-                    drafter.mtp_prefill(
-                        gpu,
+                    replica_mtp_prefill(
+                        drafter,
                         bundle,
+                        gpu,
                         prompt_tokens,
                         fill_tokens,
                         start_pos,
                         cache_hit,
-                        &never,
                     )
                 },
                 &|drafter, bundle, gpu| {
-                    drafter.mtp_prefill(
-                        gpu,
+                    replica_mtp_prefill(
+                        drafter,
                         bundle,
+                        gpu,
                         prompt_tokens,
                         fill_tokens,
                         start_pos,
                         cache_hit,
-                        &never,
                     )
                 },
             );
@@ -10567,6 +10866,24 @@ pub fn native_mtp_fill_scratch(gpu: &Gpu) -> bool {
     (gpu.arch_caps.is_gfx1151() || gpu.arch_caps.is_gfx1201()) && mtp_fill_scratch_wanted(gpu)
 }
 
+/// Set by the EP loader (`qwen4_set_lane_append_shared`) when the load reserves MTP lanes under
+/// `HIPFIRE_QWEN4_LANE_APPEND_SHARE`: the singleton drafter's Append scratch is then a view of
+/// the lane store's, so the native-MTP census charges it once (in the lane store).
+static LANE_APPEND_SHARED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Set or clear [`LANE_APPEND_SHARED`]; cleared by every Qwen4 load.
+pub fn qwen4_set_lane_append_shared(on: bool) {
+    LANE_APPEND_SHARED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// [`native_mtp_fill_scratch`] as the native-MTP census of a placement charges it: the
+/// singleton drafter's Append scratch only where it is its own allocation
+/// ([`LANE_APPEND_SHARED`] off).
+pub fn native_mtp_fill_scratch_charged(gpu: &Gpu) -> bool {
+    native_mtp_fill_scratch(gpu) && !LANE_APPEND_SHARED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Device bytes native MTP adds to a load whose QSA context storage is
 /// `context` (its admitted `max_seq` and committed part) with a
 /// `chunk_rows` prefill chunk, windows of up to `max_k` drafts (pass
@@ -10578,7 +10895,10 @@ pub fn native_mtp_fill_scratch(gpu: &Gpu) -> bool {
 /// is larger), the pending, row and retained-pending hidden carries, with `row_capture`
 /// (the GDN state format and ring rows, [`native_mtp_capture`]) the GDN
 /// capture ring in that format, and with `batched_fill`
-/// (where [`native_mtp_fill_scratch`]) the prompt-fill Append scratch.
+/// (where [`native_mtp_fill_scratch`]) the prompt-fill Append scratch. The head part and the
+/// request carries are sized under the head's GLOBAL geometry
+/// ([`crate::Qwen4Config::mtp_geometry`]: identity unless a TP trunk shard keeps the head);
+/// the GDN capture ring is the caller's `row_capture` (the trunk's, on its own config).
 pub fn native_mtp_device_bytes(
     config: &crate::Qwen4Config,
     context: &crate::Qwen4ContextCommit,
@@ -10588,8 +10908,37 @@ pub fn native_mtp_device_bytes(
     row_capture: Option<(crate::GdnStateFormat, usize)>,
     batched_fill: bool,
 ) -> Option<u64> {
-    let request = native_mtp_request_bytes(
+    native_mtp_device_bytes_ring(
         config,
+        config.mtp_geometry(),
+        context,
+        chunk_rows,
+        max_k,
+        head_dtype,
+        row_capture,
+        batched_fill,
+    )
+}
+
+/// [`native_mtp_device_bytes`] with the GDN capture ring sized under `ring_config` instead of
+/// the head's geometry: the EP reserve census passes the trunk shard's rank-local config
+/// (`HIPFIRE_EP_RESERVE_CENSUS`: 24 value heads, half of the global ring), since the rank
+/// allocates the ring on its own trunk's state.
+#[allow(clippy::too_many_arguments)]
+pub fn native_mtp_device_bytes_ring(
+    config: &crate::Qwen4Config,
+    ring_config: &crate::Qwen4Config,
+    context: &crate::Qwen4ContextCommit,
+    chunk_rows: usize,
+    max_k: usize,
+    head_dtype: rdna_compute::DType,
+    row_capture: Option<(crate::GdnStateFormat, usize)>,
+    batched_fill: bool,
+) -> Option<u64> {
+    let config = config.mtp_geometry();
+    let request = native_mtp_request_bytes_ring(
+        config,
+        ring_config,
         context.max_seq,
         chunk_rows,
         max_k,
@@ -10627,8 +10976,31 @@ pub fn native_mtp_request_bytes(
     row_capture: Option<(crate::GdnStateFormat, usize)>,
     batched_fill: bool,
 ) -> Option<u64> {
-    native_mtp_request_allocation_sizes(
+    native_mtp_request_bytes_ring(
         config,
+        config,
+        max_seq,
+        chunk_rows,
+        max_k,
+        row_capture,
+        batched_fill,
+    )
+}
+
+/// [`native_mtp_request_bytes`] with the GDN capture ring sized under `ring_config`
+/// ([`native_mtp_request_allocation_sizes_ring`]).
+pub fn native_mtp_request_bytes_ring(
+    config: &crate::Qwen4Config,
+    ring_config: &crate::Qwen4Config,
+    max_seq: usize,
+    chunk_rows: usize,
+    max_k: usize,
+    row_capture: Option<(crate::GdnStateFormat, usize)>,
+    batched_fill: bool,
+) -> Option<u64> {
+    native_mtp_request_allocation_sizes_ring(
+        config,
+        ring_config,
         max_seq,
         chunk_rows,
         max_k,
@@ -10654,6 +11026,30 @@ pub(crate) fn native_mtp_request_allocation_sizes(
     row_capture: Option<(crate::GdnStateFormat, usize)>,
     batched_fill: bool,
 ) -> Option<Vec<u64>> {
+    native_mtp_request_allocation_sizes_ring(
+        config,
+        config,
+        max_seq,
+        chunk_rows,
+        max_k,
+        row_capture,
+        batched_fill,
+    )
+}
+
+/// [`native_mtp_request_allocation_sizes`] with the GDN capture ring sized under `ring_config`
+/// (the trunk's own config) while the carries and the prompt-fill scratch stay under `config`.
+/// `ring_config` is `config` everywhere but an EP trunk-shard census, where the ring is the
+/// rank-local (half the value heads) one.
+pub(crate) fn native_mtp_request_allocation_sizes_ring(
+    config: &crate::Qwen4Config,
+    ring_config: &crate::Qwen4Config,
+    max_seq: usize,
+    chunk_rows: usize,
+    max_k: usize,
+    row_capture: Option<(crate::GdnStateFormat, usize)>,
+    batched_fill: bool,
+) -> Option<Vec<u64>> {
     let rows = native_mtp_window_rows(max_k);
     let hidden_row = config
         .hc_count
@@ -10673,10 +11069,10 @@ pub(crate) fn native_mtp_request_allocation_sizes(
     if let Some((gdn, ring_rows)) = row_capture {
         sizes.extend(
             crate::state::Qwen4State::row_capture_allocation_sizes_scoped(
-                config,
+                ring_config,
                 gdn,
                 ring_rows.max(rows),
-                config.n_linear_layers(),
+                ring_config.n_linear_layers(),
             )?,
         );
     }

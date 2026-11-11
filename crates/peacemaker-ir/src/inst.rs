@@ -23,7 +23,16 @@ pub enum Arch {
     Gfx1030,
     Gfx1100,
     Gfx1151,
+    /// RDNA4 `gfx1200`: the gfx1201 ISA (encodings, semantics, hazards, descriptors) under a
+    /// distinct ELF machine / bundle triple. ISA-family tests use [`Arch::is_gfx12`].
+    Gfx1200,
     Gfx1201,
+}
+impl Arch {
+    /// The gfx12 (RDNA4) instruction family: `gfx1200` and `gfx1201`.
+    pub const fn is_gfx12(self) -> bool {
+        matches!(self, Arch::Gfx1200 | Arch::Gfx1201)
+    }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Setting {
@@ -107,6 +116,7 @@ pub enum Form {
     Smem,
     Vop1,
     Vop1Dpp,
+    Vop1Dpp8,
     Vop2,
     Vop2Dpp,
     Vopc,
@@ -598,7 +608,7 @@ impl FpState {
     /// Target-dependent rules: RSRC1 bit 21 is `WG_RR_EN` on gfx12 and `DX10_CLAMP` on gfx11,
     /// so `wg_round_robin` is only meaningful on gfx12.
     pub fn validate_for(&self, arch: Arch) -> Result<(), String> {
-        if self.wg_round_robin && arch != Arch::Gfx1201 {
+        if self.wg_round_robin && !arch.is_gfx12() {
             return Err(format!(
                 "wg_round_robin (RSRC1 bit 21) is a gfx12 field; it is DX10_CLAMP on {arch:?}"
             ));
@@ -922,10 +932,13 @@ impl Program {
                     })?;
                 let matches_term = match &block.term {
                     Terminator::EndPgm => name == "s_endpgm",
-                    Terminator::Jump(_) => name == "s_branch",
+                    Terminator::Jump(_) => name == "s_branch" || name == "s_setpc_b64",
                     Terminator::Branch { .. } => name.starts_with("s_cbranch_"),
                     Terminator::FallThrough => {
-                        name != "s_endpgm" && name != "s_branch" && !name.starts_with("s_cbranch_")
+                        name != "s_endpgm"
+                            && name != "s_branch"
+                            && name != "s_setpc_b64"
+                            && !name.starts_with("s_cbranch_")
                     }
                     Terminator::Unreachable => true,
                 };

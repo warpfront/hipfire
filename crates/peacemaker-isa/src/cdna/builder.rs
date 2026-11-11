@@ -223,9 +223,9 @@ impl Builder {
 
     /// Any instruction except `s_waitcnt`, `s_barrier`, `s_endpgm` and
     /// branches; waits are inserted before it as the ledger requires.
-    /// Memory data/destinations must be plain SGPRs or VGPRs: the shared
-    /// ledger cannot track AGPRs or special-register files. Copy through
-    /// plain registers before using those files.
+    /// Memory data/destinations must be SGPRs, VGPRs or AGPRs. The shared
+    /// ledger tracks these as distinct register banks; special-register
+    /// memory operands remain unsupported.
     /// Of the FLAT-format segments, only GLOBAL is supported: FLAT needs
     /// dual VM/LGKM accounting, and the descriptor has no private segment
     /// for SCRATCH (CDNA3 ISA §10.3).
@@ -243,7 +243,7 @@ impl Builder {
             return Err("checked builder supports GLOBAL only: FLAT counts on VM+LGKM (CDNA3 ISA §10.3); SCRATCH requires a private segment".into());
         }
         if !plain_memory_data(&inst) {
-            return Err("checked memory data/destinations must use plain SGPR/VGPR registers, not AGPRs or special-register files".into());
+            return Err("checked memory data/destinations must use SGPR/VGPR/AGPR registers, not special-register files".into());
         }
         let footprint = inst.footprint();
         let memory = inst.memory();
@@ -567,6 +567,7 @@ fn ledger_reg(span: &RegSpan) -> Option<RegRef> {
     let kind = match span.file {
         RegFile::Sgpr => Kind::S,
         RegFile::Vgpr => Kind::V,
+        RegFile::Agpr => Kind::A,
         _ => return None,
     };
     Some(RegRef {
@@ -587,7 +588,9 @@ fn memory_class(memory: MemKind) -> MemoryClass {
 }
 
 fn plain_memory_data(inst: &Inst) -> bool {
-    let plain = |src: Option<Src>| src.is_none_or(|src| matches!(src, Src::Sgpr(_) | Src::Vgpr(_)));
+    let plain = |src: Option<Src>| {
+        src.is_none_or(|src| matches!(src, Src::Sgpr(_) | Src::Vgpr(_) | Src::Agpr(_)))
+    };
     match inst {
         Inst::Smem(i) => plain(i.sdata),
         Inst::Flat(i) => plain(i.vdst) && plain(i.data),

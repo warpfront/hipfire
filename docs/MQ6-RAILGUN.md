@@ -7,7 +7,7 @@ to the native MQ6 capture work in #941. It supplies an explicit reusable
 operator API; automatic model capture integration remains a separate step.
 
 `railgun::mq6::Mq6Facts::from_hit` requires the canonical bundle's actual
-schema-8 A1/G8 receipt from a verified `JitCorpus` lookup. The author derives
+schema-9 A1/G8 receipt from a verified `JitCorpus` lookup. The author derives
 memory effects from those facts through `kernel::author`, then the runtime
 executes the resulting `plan::Pm4Plan` with ROCr's existing PM4 transport.
 No name-based MQ6 `pointer_effects` entry is added to the Redline recorder.
