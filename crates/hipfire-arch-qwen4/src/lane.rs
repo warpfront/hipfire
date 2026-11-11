@@ -2366,7 +2366,7 @@ impl Qwen4LaneStore {
         // A head owner (the single scope, every EP rank, the PP output band)
         // holds the MTP head; any other band that owns target layers holds
         // only its lanes' verify rings (target-only ownership).
-        let proto = LaneProto::new(copy.map(|c| c.ngram))?;
+        let proto = LaneProto::new(copy.map(|c| c.ngram), &gpu.arch)?;
         if let Some(spec) = spec {
             let verify_rows = if bundle.has_cpu_deferred_experts() {
                 crate::program::QWEN4_CPU_SPLICE_MAX_ROWS
