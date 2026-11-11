@@ -1228,10 +1228,11 @@ pub fn free_checkpoints(
 /// direct fields m.dn_state/m.kv_cache — sourcing from the bundle (no hoist →
 /// no double-free). Mirrors the per-LA-device memset for pp>1. No-op off qwen35.
 ///
-/// Accumulates every `bind_thread` and HIP `memset` failure. Clears
-/// `s_matrices`, `s_scales`, `conv_states`, and `s_ef_residual` on both
-/// multi-GPU and single-GPU paths. Returns `Err` with the joined failures
-/// (still attempts every surface — does not short-circuit).
+/// Accumulates every `bind_thread` and HIP `memset` failure. Clears every
+/// state family (`s_matrices`, `s_scales`, `conv_states`, `s_ef_residual` and
+/// the persistent GDN carry) and the stream cursors on both multi-GPU and
+/// single-GPU paths. Returns `Err` with the joined failures (still attempts
+/// every surface — does not short-circuit).
 pub fn reset_qwen35_recurrent(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
@@ -1246,66 +1247,36 @@ pub fn reset_qwen35_recurrent(
             m.pp_dn_la_to_device.as_ref(),
         ) {
             let dn = &b.dn_state;
-            for (i, s) in dn.s_matrices.iter().enumerate() {
-                let g = &mut gpus.devices[la[i] as usize];
-                if let Err(e) = g.bind_thread() {
-                    push_reset_err(&mut first_err, "pp s_matrices bind_thread", e);
-                }
-                if let Err(e) = g.hip.memset(&s.buf, 0, s.buf.size()) {
-                    push_reset_err(&mut first_err, "pp s_matrices memset", e);
-                }
-            }
-            for (i, s) in dn.s_scales.iter().enumerate() {
-                let g = &mut gpus.devices[la[i] as usize];
-                if let Err(e) = g.bind_thread() {
-                    push_reset_err(&mut first_err, "pp s_scales bind_thread", e);
-                }
-                if let Err(e) = g.hip.memset(&s.buf, 0, s.buf.size()) {
-                    push_reset_err(&mut first_err, "pp s_scales memset", e);
-                }
-            }
-            for (i, s) in dn.conv_states.iter().enumerate() {
-                let g = &mut gpus.devices[la[i] as usize];
-                if let Err(e) = g.bind_thread() {
-                    push_reset_err(&mut first_err, "pp conv_states bind_thread", e);
-                }
-                if let Err(e) = g.hip.memset(&s.buf, 0, s.buf.size()) {
-                    push_reset_err(&mut first_err, "pp conv_states memset", e);
+            // Every family of `DeltaNetState::families`, each on its LA layer's
+            // device. Multi-GPU currently leaves s_ef_residual and the carry
+            // empty; those loops are no-ops then but keep single-GPU parity.
+            const FAMILY_NAMES: [&str; 8] = [
+                "s_matrices",
+                "s_scales",
+                "conv_states",
+                "s_ef_residual",
+                "carry tile_state",
+                "carry tile_conv",
+                "carry raw_qkv",
+                "carry raw_ab",
+            ];
+            for (name, fam) in FAMILY_NAMES.iter().zip(dn.families()) {
+                for (i, s) in fam.iter().enumerate() {
+                    let g = &mut gpus.devices[la[i] as usize];
+                    if let Err(e) = g.bind_thread() {
+                        push_reset_err(&mut first_err, &format!("pp {name} bind_thread"), e);
+                    }
+                    if let Err(e) = g.hip.memset(&s.buf, 0, s.buf.size()) {
+                        push_reset_err(&mut first_err, &format!("pp {name} memset"), e);
+                    }
                 }
             }
-            // multi-GPU currently leaves s_ef_residual empty; loop is a no-op then,
-            // but keeps single-GPU parity if EF is ever wired per-device.
-            for (i, s) in dn.s_ef_residual.iter().enumerate() {
-                let g = &mut gpus.devices[la[i] as usize];
-                if let Err(e) = g.bind_thread() {
-                    push_reset_err(&mut first_err, "pp s_ef_residual bind_thread", e);
-                }
-                if let Err(e) = g.hip.memset(&s.buf, 0, s.buf.size()) {
-                    push_reset_err(&mut first_err, "pp s_ef_residual memset", e);
-                }
-            }
+            b.dn_state.stream.reset_meta();
         }
-    } else if let Some(b) = m.qwen35() {
-        let dn = &b.dn_state;
-        for s in &dn.s_matrices {
-            if let Err(e) = gpu.hip.memset(&s.buf, 0, s.buf.size()) {
-                push_reset_err(&mut first_err, "s_matrices memset", e);
-            }
-        }
-        for s in &dn.s_scales {
-            if let Err(e) = gpu.hip.memset(&s.buf, 0, s.buf.size()) {
-                push_reset_err(&mut first_err, "s_scales memset", e);
-            }
-        }
-        for s in &dn.conv_states {
-            if let Err(e) = gpu.hip.memset(&s.buf, 0, s.buf.size()) {
-                push_reset_err(&mut first_err, "conv_states memset", e);
-            }
-        }
-        for s in &dn.s_ef_residual {
-            if let Err(e) = gpu.hip.memset(&s.buf, 0, s.buf.size()) {
-                push_reset_err(&mut first_err, "s_ef_residual memset", e);
-            }
+    } else if let Some(b) = m.qwen35_mut() {
+        // Owner reset: every family incl. the GDN carry, then the cursors.
+        if let Err(e) = b.dn_state.reset(gpu) {
+            push_reset_err(&mut first_err, "dn_state reset", e);
         }
     }
     if let Some(b) = m.qwen35_mut() {

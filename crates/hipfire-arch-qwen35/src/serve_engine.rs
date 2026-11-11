@@ -518,6 +518,11 @@ struct Rig {
     sessions: SessionTable,
     adm: AdmissionController,
     swap: SwapManager,
+    /// Host stream cursors (schema/recipe/phase/absolute position per LA layer)
+    /// of parked sessions. The swap store holds only tensor bytes; the cursors
+    /// must travel with them or a restored Open prefill would resume with the
+    /// wrong position. Keyed like `swap`; pruned when the session is gone.
+    parked_streams: std::collections::HashMap<u64, crate::qwen35::weights::GdnStreamImage>,
     stamp: SnapshotStamp,
     n_slots: usize,
     cap_tokens: usize,
@@ -636,13 +641,10 @@ fn cached_compile_schema(
     Ok(compiled)
 }
 
+/// Every device buffer a DeltaNet state owns (recurrence, scales, conv, EF and
+/// the persistent GDN carry), for byte accounting and ownership lists.
 fn dn_buffers(dn: &DeltaNetState) -> Vec<&GpuTensor> {
-    let mut v: Vec<&GpuTensor> = Vec::new();
-    v.extend(dn.s_matrices.iter());
-    v.extend(dn.s_scales.iter());
-    v.extend(dn.conv_states.iter());
-    v.extend(dn.s_ef_residual.iter());
-    v
+    dn.families().into_iter().flatten().collect()
 }
 
 /// Layer ordinal in an HFQ tensor name (`layers.<n>.…`, optionally behind a
@@ -1924,6 +1926,7 @@ impl Rig {
             sessions: SessionTable::default(),
             adm,
             swap,
+            parked_streams: std::collections::HashMap::new(),
             stamp,
             n_slots: cfg.n_slots,
             cap_tokens: cfg.cap_tokens,
@@ -7238,6 +7241,7 @@ fn evict(rig: &mut Rig, victim: SessionId, stats: &Arc<Mutex<EngineStats>>) -> b
     let Some(slot) = sess.slot else { return false };
     let tokens = sess.tokens.clone();
 
+    let stream_image = rig.model.dn_states[slot.0].stream.image();
     let dn_refs = dn_buffers(&rig.model.dn_states[slot.0]);
     let snap = capture_slot(
         &mut rig.gpu,
@@ -7254,6 +7258,10 @@ fn evict(rig: &mut Rig, victim: SessionId, stats: &Arc<Mutex<EngineStats>>) -> b
     let evicted = match snap {
         Ok(snap) => match rig.swap.park(victim.0, snap) {
             Ok(()) => {
+                rig.parked_streams.insert(victim.0, stream_image);
+                let sessions = &rig.sessions;
+                rig.parked_streams
+                    .retain(|key, _| sessions.get(SessionId(*key)).is_some());
                 rig.sessions
                     .mark_swapped(&mut rig.pool, &mut rig.adm, victim);
                 true
@@ -7301,6 +7309,7 @@ fn restore(rig: &mut Rig, id: SessionId, slot: SlotId, stats: &Arc<Mutex<EngineS
             ),
         );
         rig.swap.forget(id.0);
+        rig.parked_streams.remove(&id.0);
         rig.sessions.mark_cold(&mut rig.pool, &mut rig.adm, id);
         lock_stats(stats).note_swap(&rig.swap);
         return false;
@@ -7319,6 +7328,16 @@ fn restore(rig: &mut Rig, id: SessionId, slot: SlotId, stats: &Arc<Mutex<EngineS
                 rig.stamp,
             );
             drop(dn_refs);
+            // The cursors parked with the tensors; a missing or mismatching
+            // image fails closed to Cold below (never a guessed position).
+            let stream_applied: Result<(), String> = match rig.parked_streams.remove(&id.0) {
+                Some(image) if r.is_ok() => rig.model.dn_states[slot.0]
+                    .stream
+                    .apply_image(&image)
+                    .map_err(|e| e.to_string()),
+                Some(_) => Ok(()),
+                None => Err("no parked GDN stream cursors for session".to_string()),
+            };
             // MTP head KV is per-generation, not per-session. Reset it so
             // the restored session starts a fresh MTP prefill.
             if let Some(state) = rig.model.mtp_states[slot.0].as_mut() {
@@ -7329,6 +7348,7 @@ fn restore(rig: &mut Rig, id: SessionId, slot: SlotId, stats: &Arc<Mutex<EngineS
             if let Some(st) = rig.model.dflash_states[slot.0].take() {
                 st.free_gpu(&mut rig.gpu);
             }
+            let r = r.map_err(|e| e.to_string()).and_then(|()| stream_applied);
             match r {
                 Ok(()) => {
                     rig.sessions.mark_resident(id, slot, snap.seq_len);
@@ -7357,6 +7377,7 @@ fn restore(rig: &mut Rig, id: SessionId, slot: SlotId, stats: &Arc<Mutex<EngineS
                     id.0
                 ),
             );
+            rig.parked_streams.remove(&id.0);
             rig.sessions.mark_cold(&mut rig.pool, &mut rig.adm, id);
             lock_stats(stats).note_swap(&rig.swap);
             false

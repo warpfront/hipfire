@@ -1702,13 +1702,12 @@ fn ar_graph_binding(
     for t in kv_cache.k_gpu.iter().chain(&kv_cache.v_gpu) {
         mix(t.buf.as_ptr());
     }
-    for t in dn_state
-        .s_matrices
-        .iter()
-        .chain(&dn_state.s_scales)
-        .chain(&dn_state.conv_states)
-        .chain(&dn_state.s_ef_residual)
-    {
+    // Every owned family, GDN carry included: an exchange or reallocation of
+    // any of them changes the identity. Reset and same-pointer restore do not
+    // (the captured decode graph stays valid across them); the owner
+    // generation (`dn_state.stream.generation`) is for component-executor
+    // graph keys, not this decode graph.
+    for t in dn_state.families().into_iter().flatten() {
         mix(t.buf.as_ptr());
     }
     mix(s.pos_buf.as_ptr());

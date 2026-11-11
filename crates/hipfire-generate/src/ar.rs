@@ -4814,18 +4814,11 @@ pub fn generate(
                         (s.as_mut() as &mut dyn Any)
                             .downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
                     }) {
-                        let dn = &b.dn_state;
-                        for s in &dn.s_matrices {
-                            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-                        }
-                        for s in &dn.s_scales {
-                            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-                        }
-                        for s in &dn.conv_states {
-                            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-                        }
-                        for s in &dn.s_ef_residual {
-                            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                        // Complete state reset (recurrence, scales, conv, EF, GDN
+                        // carry and stream cursors): a cold restart must not let
+                        // carry from the discarded prefix survive.
+                        if let Err(e) = b.dn_state.reset(gpu) {
+                            eprintln!("[qwen-cache] cold DeltaNet reset failed: {e}");
                         }
                     }
                     if let Some(b) = m.state.as_mut().and_then(|s| {
@@ -5078,18 +5071,8 @@ pub fn generate(
             () => {{
                 debug_assert!(qwen_ar_forward_fail_action().reset_uncommitted_state);
                 debug_assert!(!qwen_ar_forward_fail_action().clear_adaptive_poison);
-                for s in &dn.s_matrices {
-                    let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-                }
-                for s in &dn.s_scales {
-                    let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-                }
-                for s in &dn.conv_states {
-                    let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-                }
-                for s in &dn.s_ef_residual {
-                    let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-                }
+                // Complete owner reset (every family, GDN carry, cursors).
+                let _ = dn.reset(gpu);
                 kv.compact_offset = 0;
                 if let Some(ad) = m.kv_adaptive.as_mut() {
                     if !ad.is_poisoned() {
@@ -5438,6 +5421,22 @@ pub fn generate(
                     return;
                 }
             }
+        }
+        // The single prefill→decode fence (never per chunk or checkpoint): the
+        // GDN stream transitions to Sealed at the actual prompt end before
+        // decode/verify may read its Q8/EF state.
+        if let Err(e) = dn.seal_streams(gpu, m.seq_pos) {
+            let _ = (kv, dn, weights, config, scratch);
+            let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
+            crate::common::emit_fail_closed_error(
+                stdout,
+                Some(id),
+                &format!("GDN stream seal failed after prefill: {e}"),
+                "internal",
+                false,
+                &ep,
+            );
+            return;
         }
         m.conversation_tokens.extend_from_slice(&new_tokens);
 

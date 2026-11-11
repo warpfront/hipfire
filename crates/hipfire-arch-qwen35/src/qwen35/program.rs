@@ -26,7 +26,7 @@ use hipfire_dispatch::pipeline::batched_attention::{
     AttentionLayerView, BatchedAttentionTap, FlashScratch, KvView,
 };
 use hipfire_dispatch::pipeline::batched_deltanet::{
-    DeltaNetLayerView, DeltaNetStateView, GdnTapeView,
+    DeltaNetLayerView, DeltaNetStateView, GdnCarryView, GdnStreamView, GdnTapeView,
 };
 use hipfire_dispatch::pipeline::batched_moe::{AttentionMoeLayerView, DeltaNetMoeLayerView};
 use hipfire_dispatch::pipeline::gated_mlp::{
@@ -522,13 +522,54 @@ pub(crate) fn flash_scratch(s: &Qwen35Scratch) -> FlashScratch<'_> {
 }
 
 pub(crate) fn deltanet_state_view(state: &DeltaNetState) -> DeltaNetStateView<'_> {
+    let stream = &state.stream;
     DeltaNetStateView {
         s_matrices: &state.s_matrices,
         s_scales: &state.s_scales,
         conv_states: &state.conv_states,
         s_ef_residual: &state.s_ef_residual,
         quant: state.quant,
+        stream: GdnStreamView {
+            recipe_id: stream.recipe_id,
+            generation: stream.generation,
+            lanes: stream.lanes,
+            meta: &stream.meta,
+            carry: stream.carry.as_ref().map(|c| GdnCarryView {
+                geometry: c.geometry,
+                tile_state: &c.tile_state,
+                tile_conv: &c.tile_conv,
+                raw_qkv: &c.raw_qkv,
+                raw_ab: &c.raw_ab,
+            }),
+        },
     }
+}
+
+/// The single genuine prefill→decode/verify fence (CHUNK-CANONICAL §3.5):
+/// transition every DeltaNet layer's stream to `Sealed` at the actual prompt
+/// end `position`, so decode/verify may read the Q8/EF state.
+///
+/// Call exactly once where an ordinary-prefill phase ends and decode/verify
+/// begins; never per outer chunk, checkpoint, snapshot, VRAM downgrade, lane
+/// swap, cancellation check or restore.
+///
+/// Streams already `Sealed` (owned by decode/verify, which does not maintain
+/// the cursors) are stamped at `position` with no pending rows.
+///
+/// **Open streams are refused before any mutation.** Finishing an Open phase
+/// (recomputing the incomplete tile's effective end from the retained
+/// tile-entry state and raw rows, quantizing once at `position`, retaining the
+/// current conv) is the S2 compute binding `Gpu::gdn_stream_seal(plan, &mut
+/// view)`, which is not present in this tree. Integration point: before the
+/// `seal_sealed_at` stamp below, call that binding once per Open layer over
+/// `deltanet_state_view(state)` (checking each Open cursor equals `position`),
+/// publishing the returned cursors only after every layer succeeded.
+pub(crate) fn seal_deltanet_streams(
+    _gpu: &mut Gpu,
+    state: &mut DeltaNetState,
+    position: usize,
+) -> HipResult<()> {
+    state.stream.seal_sealed_at(position as u64)
 }
 
 pub(crate) fn gdn_tape_view(tape: &GdnTape) -> GdnTapeView<'_> {
