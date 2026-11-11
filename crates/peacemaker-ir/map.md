@@ -14,6 +14,22 @@
 
 <!-- hand-written: what not to do here; traps a reader will hit. -->
 
+The complete RDNA XML catalogs are `isa/{gfx1100,gfx1151,gfx12}.xml.jsonl`.
+Regenerate with `scripts/pm-rdna-xml.py --xml-dir <AMD XML directory>
+--llvm-mc <ROCm llvm-mc>`. Each catalog begins with the source SHA-256,
+toolchain version, encoding bitmaps, and condition expressions. Subsequent rows
+retain every source instruction encoding, including duplicate XML entries:
+`variant` is the original instruction-local encoding ordinal. Operand input,
+output, implicit, size, and format information is retained; memory operands and
+branch/terminator flags are explicit.
+
+The catalogs extend the inventory, not the executable codec or numeric semantics.
+An oracle status other than `verified` is a disagreement or an unavailable
+candidate, never proof of LLVM non-support. In particular the XML's dangling
+SOP1 condition reference is preserved and diagnosed, not silently repaired.
+The `.tbl` census rows remain the executable codec's regression set, unchanged
+byte for byte. Do not infer complete lifting support from the catalog row count.
+
 ## Crate map
 
 <!-- crate-map:generated:begin -->

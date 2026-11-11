@@ -8,6 +8,10 @@
 - **Fixed: the GPU-free CI test shards run the ROCm CPU-oracle tests instead of skipping them.** Each shard installs the ROCm 10.1.0-3 compiler toolchain (the Containerfile's packages; no GPU or driver) and no longer sets `HIPFIRE_TEST_REQUIRE_ROCM=0`, so `p0_expand_live` (which never skips) and every ISA/PeaceMaker oracle test assemble, link and compile against the real tools. The Windows job remains the only no-ROCm host.
 - **Fixed: `hipfire-client`'s `mixed_build_daemon_is_refused_with_a_named_cause` no longer flakes under load (#1002).** The test relied on the `--version` probe's 2 s deadline, and a timed-out probe passes by design. The deadline is now a parameter (spawn still uses 2 s), and the test probes with one the exiting fixture cannot miss. Under test, the probe's fork now also holds the fixture-write gate, as the daemon spawn already did, so it cannot inherit another test's writable fixture FD (ETXTBSY).
 
+## Unreleased
+
+- PeaceMaker: add reproducible, XML-hash-pinned RDNA3/3.5/4 encoding metadata catalogs and a ROCm LLVM round-trip census. Preserve all existing ISA census rows and field exceptions; record source defects and oracle disagreements explicitly rather than treating them as verified codec coverage.
+
 ## v0.4.6 — 2026-11-11
 
 0.4.6 is the freeze baseline for the 0.5.0 consolidation (#666). Entries are grouped by area.
