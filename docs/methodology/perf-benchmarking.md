@@ -140,7 +140,7 @@ Route selection for “must I run X?” stays in
 
 | Source | Use for | Do not use for |
 |---|---|---|
-| Daemon `done` fields (`prefill_tok_s`, `decode_tok_s`, `ttft_ms`) | Production-path throughput | — |
+| Daemon `done` fields (`prefill_tok_s`, `decode_tok_s`, `ttft_ms`, and the measured `prefill_ms` / `decode_ms` they divide by; mirrored in the serve response's `timings`) | Production-path throughput; `decode_ms` is the decode span itself, not derived from the rounded rate | — |
 | `serve_harness.py` JSON | Native service-path ledger rows (when hashes present) | Unsigned exploratory if hashes missing |
 | In-process `bench_qwen35_mq4` | Kernel profile, rocprof attach, speed-gate floor, bisect lower bound | Citing as production MoE decode (misses daemon AR hipGraph) |
 | Probe-derived wall/gen tok/s | UX framing only | Kernel or format ranking |
