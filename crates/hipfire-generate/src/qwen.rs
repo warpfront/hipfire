@@ -4808,12 +4808,12 @@ pub fn generate_spec(
     // `SpecEmitRequest`; the arch's carrier turns it into the concrete
     // `Box<dyn SpecEmit>` (extracting its own grammar schema from `tools`).
     // VMM promotion needs a request whose spec emitter state an AR producer
-    // can reproduce: no tools/grammar, no stop strings, no `min_tokens`, no
-    // think budget.
+    // can reproduce: no tools/grammar, no stop strings, no `min_tokens`. A
+    // think budget moves as a replayed `ThinkCtl` while it has not acted.
     let promo_shape_ok = emit_req.tools.is_none()
         && emit_req.stop.is_empty()
-        && emit_req.min_tokens == 0
-        && emit_req.max_think == 0;
+        && emit_req.min_tokens == 0;
+    let promo_max_think = emit_req.max_think;
     let logprobs_top_k = emit_req.logprobs_top_k;
     // Logprob fields of emission token `index` (`tok`), from the target row
     // the speculator kept for it.
@@ -5227,7 +5227,23 @@ pub fn generate_spec(
             {
                 let attempt = hipfire_engine::terminal::active_attempt_id();
                 let rng_state = request_seed_for(&AttemptKey::new(id, attempt), permit.client_seed);
-                let promoted = crate::batch::replay_ar_producer(id, promo_started_in_think, tokenizer, &emitted)
+                // The lane enforces the AR loop's think budget from here; it
+                // takes over only while the spec emitter's budget (the same
+                // span count) has not acted, so the text so far matches.
+                let think = (permit.max_think_tokens == promo_max_think)
+                    .then(|| {
+                        crate::vmm_conv::ThinkCtl::replay(
+                            promo_max_think,
+                            promo_started_in_think,
+                            tokenizer,
+                            &emitted,
+                        )
+                    })
+                    .flatten();
+                let promoted = think
+                    .as_ref()
+                    .ok_or_else(|| "think budget already acted".to_string())
+                    .and_then(|_| crate::batch::replay_ar_producer(id, promo_started_in_think, tokenizer, &emitted))
                     .and_then(|(producer, bytes_fed)| {
                         let s = &permit.sampling;
                         let sampler = SamplerConfig {
@@ -5332,8 +5348,12 @@ pub fn generate_spec(
                         // was already moved out before the transfer.
                         let kind = if let Some(snap) = df_snap {
                             crate::batch::PromotedDecode::Dflash(snap)
-                        } else if permit.dflash_lane && spec.name() == "dflash" {
-                            eprintln!("[vmm-promote] id={id} DFlash lane state unavailable; continues as AR");
+                        } else if spec.name() == "dflash" {
+                            // Without a staged DFlash lane engine
+                            // (`serve.batch_spec = false`) the lane is AR by design.
+                            if permit.dflash_lane {
+                                eprintln!("[vmm-promote] id={id} DFlash lane state unavailable; continues as AR");
+                            }
                             crate::batch::PromotedDecode::Ar
                         } else {
                             match hipfire_arch_qwen35::forward_slots::vmm::spec::MtpLaneSnapshot::capture(
@@ -5366,7 +5386,10 @@ pub fn generate_spec(
                             ),
                             kind,
                             seed_emitted: true,
-                            conv: Default::default(),
+                            conv: crate::vmm_conv::PromotedConv {
+                                think,
+                                ..Default::default()
+                            },
                         });
                         drop(guard);
                         return None;

@@ -210,7 +210,9 @@ Config and env owners for bind, idle, queue, and body limits:
    `vmm_batch_max_seq_bound`). By default it runs the **exact** route
    (per request byte-identical to the singleton route; prefill uses the
    singleton's own chunking, so a long prompt prefills in singleton-sized
-   chunks), staged only where the executor admits it (gfx1201, uniform
+   chunks; those chunks run off the trunk on the singleton's scratch, so one
+   longer than `serve.max_batch_tokens` still runs, at least one per step),
+   staged only where the executor admits it (gfx1201, uniform
    MQ4G256V2 dense layers); the ack reports `continuous_batch_exact: true`.
    `serve.batch_nonexact` / `HIPFIRE_SERVE_BATCH_NONEXACT=1` selects the
    non-exact shared slots body instead (`continuous_batch_nonexact: true`).
@@ -239,9 +241,15 @@ Config and env owners for bind, idle, queue, and body limits:
    (`HIPFIRE_SERVE_BATCH_SPEC=0` disables it) lets lanes decode as
    cross-request MTP/DFlash speculative verify rows. A request that is alone at
    dispatch keeps the unchanged singleton
-   route (including native MTP/DFlash); requests arriving while a singleton
-   generation runs wait for it to finish, so their TTFT includes that
-   generation (known gap). The fixed-slot `serve.multi_slot` engine below is
+   route (including native MTP/DFlash). When a batched peer arrives, a
+   greedy singleton promotes into a lane at its next committed boundary (a
+   speculative singleton after a whole window): an MTP/DFlash lane with its
+   drafter state, or an AR lane when `serve.batch_spec = false`, continuing
+   byte for byte. A think budget (`max_think_tokens`,
+   `reasoning.max_total_tokens`) moves with it, replayed over the committed
+   tokens; a speculative singleton whose budget already acted (a forced
+   close or latch) stays on its route, as do requests with tools, stop
+   strings or `min_tokens`, whose peers then wait for it to finish. The fixed-slot `serve.multi_slot` engine below is
    the legacy route.
 
 With `serve.multi_slot = true`, up to `serve.multi_slot_slots` requests
