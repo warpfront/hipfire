@@ -1317,6 +1317,29 @@ pub fn reset_qwen35_recurrent(
     }
 }
 
+/// Cold start that keeps the assistant-turn cache: the attested rollback
+/// ([`production_fail_closed_rollback`], the one reset owner the daemon's
+/// `reset` command uses, which clears the cache) with the cache moved out and
+/// back. Entries are keyed by an assistant turn's content, not its position,
+/// and map it to the exact tokens the model emitted, so they stay valid across
+/// an ordinary cold start; dropping them would make the next turn's history
+/// render diverge from the KV it has just written and every following turn
+/// start cold. Used by the vision turn that cannot continue the resident
+/// conversation and by the decide session's cold start.
+pub fn cold_reset_keep_turn_cache(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+) -> RollbackEpilogue {
+    let turns = std::mem::replace(
+        &mut m.asst_turn_cache,
+        hipfire_loader::AsstTurnCache::new_from_env(),
+    );
+    let epilogue = production_fail_closed_rollback(m, gpu, None, None);
+    m.asst_turn_cache = turns;
+    m.vl_image_fingerprints.clear();
+    epilogue
+}
+
 /// Reset Qwen4's complete request owner (PLE epoch plus every recurrent/QSA/
 /// hyper-connection buffer).  Unlike the legacy Qwen3.5 helper this delegates
 /// to the bundle's fallible reset so PLE worker invalidation and GPU state
@@ -1645,6 +1668,9 @@ pub fn fail_closed_reset_target_and_spec(
         crate::vmm_conv::clear(&mut m.state, gpu);
         if let Some(b) = m.llama_mut() {
             b.kv.compact_offset = 0;
+        }
+        if let Some(b) = m.dots_ocr_mut() {
+            b.state.reset();
         }
         if let Some(b) = m.qwen2_mut() {
             b.state.reset();

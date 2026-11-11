@@ -292,3 +292,27 @@ fn zero_dimension_floors_to_factor() {
     assert!(h >= 32, "zero-dimension input should floor to factor");
     assert!(w >= 32, "zero-dimension input should floor to factor");
 }
+
+/// The visual-token run of an image the daemon may not encode is sized from the
+/// header alone, so it must equal what a full decode + resize produces.
+#[test]
+fn header_dims_match_the_full_preprocess_for_png_and_jpeg() {
+    use hipfire_arch_qwen35_vl::image::preprocessed_dims_from_bytes;
+    for (w, h) in [
+        (64u32, 64u32),
+        (300, 200),
+        (200, 300),
+        (1280, 736),
+        (40, 900),
+    ] {
+        for bytes in [
+            solid_png_bytes(10, 20, 30, w, h),
+            solid_jpeg_bytes(10, 20, 30, w, h),
+        ] {
+            let (_, full_h, full_w) = load_and_preprocess_from_bytes(&bytes, 16, 2).unwrap();
+            let dims = preprocessed_dims_from_bytes(&bytes, 16, 2).unwrap();
+            assert_eq!(dims, (full_h, full_w), "{w}x{h}");
+        }
+    }
+    assert!(preprocessed_dims_from_bytes(b"not an image", 16, 2).is_err());
+}

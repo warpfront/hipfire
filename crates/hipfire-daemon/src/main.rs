@@ -3373,6 +3373,40 @@ fn main() {
                 let system = msg.get("system").and_then(|v| v.as_str());
                 let image = msg.get("image").and_then(|v| v.as_str());
                 let image_base64 = msg.get("image_base64").and_then(|v| v.as_str());
+                // The conversation's images in order (the gateway's
+                // `images_base64`), one per image slot of `messages`.
+                let images_list: Vec<&str> = match msg.get("images_base64") {
+                    None | Some(serde_json::Value::Null) => Vec::new(),
+                    Some(serde_json::Value::Array(list)) => {
+                        match list.iter().map(|v| v.as_str()).collect::<Option<Vec<_>>>() {
+                            Some(list) => list,
+                            None => {
+                                hipfire_generate::dense::emit_active_attempt_error(
+                                    &mut stdout,
+                                    Some(id),
+                                    "invalid images_base64 field: every entry must be a base64 string",
+                                    "validation",
+                                    false,
+                                    false,
+                                );
+                                let _ = stdout.flush();
+                                continue;
+                            }
+                        }
+                    }
+                    Some(_) => {
+                        hipfire_generate::dense::emit_active_attempt_error(
+                            &mut stdout,
+                            Some(id),
+                            "invalid images_base64 field: expected an array of base64 strings",
+                            "validation",
+                            false,
+                            false,
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                };
 
                 // Structured-tools + structured-messages support (Phase 1 of
                 // Jinja-everywhere migration). When present, both fields are
@@ -3651,7 +3685,8 @@ fn main() {
                     _ => hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
                 };
 
-                let has_image = image_base64.is_some() || image.is_some();
+                let has_image =
+                    image_base64.is_some() || image.is_some() || !images_list.is_empty();
                 let vision_route = hipfire_loader::vision_route(m.arch_id);
                 // Covers qwen35-vl (arch 5/6 bundle), dots-ocr (arch 8) AND
                 // lfm2-vl (arch-11 bundle) in one declared-capability probe.
@@ -3693,138 +3728,71 @@ fn main() {
                 if has_image && !has_vl {
                     refuse_image_without_vision(&mut stdout, id, vision_gated_off.as_deref());
                 } else if has_image && has_vl {
-                    // DEFENSIVE: VL is single-image, single-turn only. The
-                    // CLI rejects images in non-last turns, but a raw
-                    // JSONL client could send a second image on turn 2+.
-                    // If seq_pos > 0 here, a previous conversation's KV
-                    // entries are live — running vision_forward and
-                    // splicing visual tokens into that context would
-                    // produce garbage. Force a reset so VL always starts
-                    // from a clean KV state.
-                    //
-                    // Must mirror the "reset" command handler (line ~2098).
-                    // VL runs on qwen35-vl (arch_id 5|6), dots-ocr (arch_id 8)
-                    // and lfm2-vl (arch_id 11); other arch states are None
-                    // here — but clear them anyway for defense-in-depth in
-                    // case a future arch adds VL support.
-                    if m.seq_pos > 0 {
+                    // The qwen35-VL route decides for itself whether this prompt
+                    // continues the resident conversation (it renders the whole
+                    // history, so an ongoing image conversation keeps its KV and
+                    // its images) and cold-starts through the shared vision reset
+                    // otherwise. dots-OCR and LFM2-VL render one self-contained
+                    // turn per request, so a live conversation is always dropped
+                    // first. Must mirror the "reset" command handler.
+                    if !matches!(
+                        vision_route,
+                        hipfire_loader::VisionRoute::QwenVl | hipfire_loader::VisionRoute::None
+                    ) && m.seq_pos > 0
+                    {
                         eprintln!("[daemon/vl] non-zero seq_pos ({}) at VL dispatch — resetting conversation", m.seq_pos);
-                        m.seq_pos = 0;
-                        m.conversation_tokens.clear();
-                        hipfire_generate::common::free_checkpoints(
-                            &mut m.prefill_checkpoints,
-                            &mut gpu,
-                        );
-                        hipfire_generate::common::free_checkpoints(
-                            &mut m.dflash_checkpoints,
-                            &mut gpu,
-                        );
-                        // The DFlash checkpoint ring now lives inside the
-                        // speculator (m.dflash_checkpoints is vestigial/empty),
-                        // so free THAT ring on conversation reset too — else its
-                        // GPU snapshots persist until the next prefill-miss.
-                        if let Some(s) = m.speculator.as_mut() {
-                            if let Err(e) = s.reset(&mut gpu) {
-                                hipfire_generate::dense::emit_active_attempt_error(
-                                    &mut stdout,
-                                    Some(id),
-                                    &format!("vision conversation reset failed: {e}"),
-                                    "gpu",
-                                    true,
-                                    false,
-                                );
-                                continue;
-                            }
-                        }
-                        // qwen35(-vl) recurrent state lives in the bundle
-                        // (qwen35 arch bundle, accessed via ArchModel). There is no
-                        // `LoadedModel.dn_state` — it was removed as vestigial
-                        // (always None); the live DeltaNet state is inside the
-                        // bundle. `m.kv_cache` is likewise vestigial on this path.
-                        if let Err(e) =
-                            hipfire_generate::common::reset_qwen35_recurrent(m, &mut gpu)
-                        {
+                        let reset =
+                            hipfire_generate::common::cold_reset_keep_turn_cache(m, &mut gpu);
+                        if !reset.rolled_back {
                             hipfire_generate::dense::emit_active_attempt_error(
                                 &mut stdout,
                                 Some(id),
-                                &format!("vision recurrent reset failed: {e}"),
+                                &format!(
+                                    "vision conversation reset failed: {}",
+                                    reset.context.unwrap_or_default()
+                                ),
                                 "gpu",
                                 true,
                                 false,
                             );
                             continue;
                         }
-                        if let Some(b) = m.llama_mut() {
-                            b.kv.compact_offset = 0;
-                        }
-                        if let Some(b) = m.dots_ocr_mut() {
-                            b.state.reset();
-                        }
-                        if let Some(b) = m.qwen2_mut() {
-                            b.state.reset();
-                        }
-                        if let Some(b) = m.deepseek4_mut() {
-                            b.state.reset();
-                        }
-                        // lfm2-vl (arch 11): KV + conv state live in the
-                        // lfm2moe bundle. generate_lfm2_vl cold-resets again
-                        // before its own prefill, so this arm is
-                        // defense-in-depth parity with the other VL arches —
-                        // without it a failed dispatch between guard and
-                        // generate body would leave stale state behind.
-                        if let Some(b) = m.lfm2moe_mut() {
-                            if let Err(e) = b.state.reset(&mut gpu) {
-                                hipfire_generate::dense::emit_active_attempt_error(
-                                    &mut stdout,
-                                    Some(id),
-                                    &format!("vision lfm2moe reset failed: {e:?}"),
-                                    "gpu",
-                                    true,
-                                    false,
-                                );
-                                continue;
-                            }
-                        }
-                        if let Some(ad) = m.kv_adaptive.as_mut() {
-                            if let Some(s) = m.state.as_mut() {
-                                if s.arch_key() == "qwen35" {
-                                    if let Some(kv) = s.kv_cache_mut() {
-                                        ad.reset_with_cache(&mut gpu, kv);
-                                    } else {
-                                        ad.reset();
-                                    }
-                                } else {
-                                    ad.reset();
-                                }
-                            } else {
-                                ad.reset();
-                            }
-                        }
                     }
-                    if image_base64.is_some() && image.is_some() {
+                    if !images_list.is_empty() && (image_base64.is_some() || image.is_some()) {
+                        eprintln!(
+                            "[daemon/vl] images_base64 provided with image/image_base64 — using images_base64"
+                        );
+                    } else if image_base64.is_some() && image.is_some() {
                         eprintln!(
                             "[daemon/vl] both image and image_base64 provided — using image_base64"
                         );
                     }
-                    let source = if let Some(b64) = image_base64 {
-                        if b64.len() > MAX_BASE64_ENCODED_LEN {
-                            write_typed_error(
-                                &mut stdout,
-                                id,
-                                &format!(
-                                    "image payload exceeds maximum encoded size ({} bytes)",
-                                    MAX_BASE64_ENCODED_LEN,
-                                ),
-                                "validation",
-                                false,
-                                false,
-                            );
-                            continue;
-                        }
-                        ImageSource::Base64(b64)
+                    let sources: Vec<ImageSource> = if !images_list.is_empty() {
+                        images_list
+                            .iter()
+                            .map(|b64| ImageSource::Base64(b64))
+                            .collect()
+                    } else if let Some(b64) = image_base64 {
+                        vec![ImageSource::Base64(b64)]
                     } else {
-                        ImageSource::Path(image.unwrap())
+                        vec![ImageSource::Path(image.unwrap())]
                     };
+                    if sources.iter().any(|source| {
+                        matches!(source, ImageSource::Base64(b64) if b64.len() > MAX_BASE64_ENCODED_LEN)
+                    }) {
+                        write_typed_error(
+                            &mut stdout,
+                            id,
+                            &format!(
+                                "image payload exceeds maximum encoded size ({} bytes)",
+                                MAX_BASE64_ENCODED_LEN,
+                            ),
+                            "validation",
+                            false,
+                            false,
+                        );
+                        continue;
+                    }
                     // Plan-mandated Phase-1 stopgap (docs/plans/completions_vision.md §2.1):
                     // VL dispatch defaults `max_think_tokens` to 256 when the
                     // client doesn't specify one. Caps runaway thinking
@@ -3850,7 +3818,10 @@ fn main() {
                         id,
                         prompt,
                         system_prompt: system,
-                        image_source: source,
+                        image_sources: sources,
+                        messages_history: messages_history.as_deref(),
+                        enable_thinking: enable_thinking_jinja,
+                        reasoning_effort: reasoning_effort_jinja.as_deref(),
                         temp,
                         top_p,
                         max_tokens,

@@ -1777,7 +1777,12 @@ pub(crate) fn project_request_contract(
     if multi_slot {
         validate_multi_slot_request_fields(body)?;
     }
-    let mut messages = normalize_openai_messages(body.get("messages"), include_reasoning);
+    // The singleton route renders an image at its message position (the
+    // daemon expands each slot); the experimental multi-slot route has no
+    // slot contract and keeps its text-only projection.
+    let mark_images = !multi_slot && !request_images_base64(body.get("messages"))?.is_empty();
+    let mut messages =
+        normalize_openai_messages_marked(body.get("messages"), include_reasoning, mark_images);
     let default_system = request_string(resolved, "prompt.system", None)?;
     inject_default_system_message(&mut messages, default_system.as_deref());
     let conversation_messages = multi_slot.then(|| messages.clone());
@@ -2271,7 +2276,7 @@ pub(crate) fn complete_request_attempt(
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| invalid_request!("model is required"))?
         .to_owned();
-    let image_base64 = request_image_base64(body.get("messages"))?;
+    let images_base64 = request_images_base64(body.get("messages"))?;
     // Acquire runtime, ensure model, and build the generate request while
     // holding the lock. Clone the engine handle before dropping the lock so
     // concurrent eligible requests can share the multiplexed transport.
@@ -2330,10 +2335,21 @@ pub(crate) fn complete_request_attempt(
         let tool_choice_policy = contract.tool_choice_policy;
         let forwarded_tools = contract.forwarded_tools;
         let response_format = contract.response_format;
+        // The prompt-only field (what a single-image model without a chat
+        // template frames) never carries the image slots `messages` does.
+        let prompt = last_user_prompt(&normalized_messages).unwrap_or_else(|| "Hello".into());
+        let prompt = if images_base64.is_empty() {
+            prompt
+        } else {
+            use hipfire_runtime::prompt_frame::IMAGE_SLOT;
+            prompt
+                .replace(&format!("{IMAGE_SLOT}\n"), "")
+                .replace(IMAGE_SLOT, "")
+        };
         let mut generate = serde_json::json!({
             "type": "generate",
             "id": identity.0.clone(),
-            "prompt": last_user_prompt(&normalized_messages).unwrap_or_else(|| "Hello".into()),
+            "prompt": prompt,
             "messages": normalized_messages,
             "max_tokens": max_tokens,
             "attempt_id": attempt_id,
@@ -2344,8 +2360,18 @@ pub(crate) fn complete_request_attempt(
         if contract.min_tokens > 0 {
             generate["min_tokens"] = contract.min_tokens.into();
         }
-        if let Some(image) = image_base64 {
-            generate["image_base64"] = serde_json::Value::String(image);
+        if runtime.multi_slot_enabled {
+            // The slot engine reads one `image_base64` and renders a
+            // single-turn VL prompt; more than one image cannot be honoured.
+            match images_base64.as_slice() {
+                [] => {}
+                [image] => generate["image_base64"] = serde_json::Value::String(image.clone()),
+                _ => bail_invalid!(
+                    "experimental multi-slot supports at most one image_url per request"
+                ),
+            }
+        } else if !images_base64.is_empty() {
+            generate["images_base64"] = serde_json::json!(images_base64);
         }
         for (key, config_key) in [
             ("temperature", "generation.temperature"),
@@ -3142,12 +3168,73 @@ pub(crate) fn openai_content_text(content: Option<&serde_json::Value>) -> String
     }
 }
 
-pub(crate) fn request_image_base64(messages: Option<&serde_json::Value>) -> Result<Option<String>> {
-    let Some(messages) = messages.and_then(serde_json::Value::as_array) else {
-        return Ok(None);
+/// The chat role a raw OpenAI message normalizes to; `None` for a role the
+/// projection drops. Shared by [`normalize_openai_messages_marked`] and
+/// [`request_images_base64`] so the images a request forwards are exactly the
+/// ones whose slots survive in the projected messages.
+fn normalized_role(message: &serde_json::Value) -> Option<&str> {
+    match message.get("role").and_then(serde_json::Value::as_str)? {
+        "developer" => Some("system"),
+        "toolResult" | "tool_result" => Some("tool"),
+        role @ ("system" | "user" | "assistant" | "tool") => Some(role),
+        _ => None,
+    }
+}
+
+/// [`openai_content_text`] with each `image_url` part kept as an in-order
+/// [`IMAGE_SLOT`](hipfire_runtime::prompt_frame::IMAGE_SLOT) marker, so the
+/// daemon renders the image at its message position instead of the projection
+/// silently flattening it away. An image directly followed by a text part is
+/// followed by a newline (the image-then-question framing the vision prompt has
+/// always used). Text is stripped of the marker character, which the wire
+/// reserves for images.
+fn openai_content_text_marked(content: Option<&serde_json::Value>) -> String {
+    use hipfire_runtime::prompt_frame::IMAGE_SLOT;
+    let part_type = |part: &serde_json::Value| {
+        part.get("type")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
     };
-    let mut image = None;
+    match content {
+        Some(serde_json::Value::String(text)) => text.replace(IMAGE_SLOT, ""),
+        Some(serde_json::Value::Array(parts)) => {
+            let mut out = String::new();
+            for (index, part) in parts.iter().enumerate() {
+                match part_type(part).as_deref() {
+                    Some("text") => {
+                        if let Some(text) = part.get("text").and_then(serde_json::Value::as_str) {
+                            out.push_str(&text.replace(IMAGE_SLOT, ""));
+                        }
+                    }
+                    Some("image_url") => {
+                        out.push(IMAGE_SLOT);
+                        if parts.get(index + 1).and_then(part_type).as_deref() == Some("text") {
+                            out.push('\n');
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            out
+        }
+        other => openai_content_text(other),
+    }
+}
+
+/// Every `image_url` payload of the request in message order (base64 of a PNG
+/// or JPEG data URI), across the whole conversation: clients resend an earlier
+/// image on every turn, and each one is part of the prompt at the position of
+/// its message. Only messages the projection keeps contribute, so the list
+/// lines up one-to-one with the slots in [`normalize_openai_messages_marked`].
+pub(crate) fn request_images_base64(messages: Option<&serde_json::Value>) -> Result<Vec<String>> {
+    let Some(messages) = messages.and_then(serde_json::Value::as_array) else {
+        return Ok(Vec::new());
+    };
+    let mut images = Vec::new();
     for message in messages {
+        if normalized_role(message).is_none() {
+            continue;
+        }
         let Some(parts) = message.get("content").and_then(serde_json::Value::as_array) else {
             continue;
         };
@@ -3176,12 +3263,10 @@ pub(crate) fn request_image_base64(messages: Option<&serde_json::Value>) -> Resu
             if payload.is_empty() {
                 bail_invalid!("image_url data URI has an empty base64 payload");
             }
-            if image.replace(payload.to_owned()).is_some() {
-                bail_invalid!("at most one image_url is supported per request");
-            }
+            images.push(payload.to_owned());
         }
     }
-    Ok(image)
+    Ok(images)
 }
 
 pub(crate) fn strip_inline_thinking(text: &str) -> String {
@@ -3259,19 +3344,31 @@ pub(crate) fn normalize_openai_messages(
     messages: Option<&serde_json::Value>,
     include_reasoning_content: bool,
 ) -> serde_json::Value {
+    normalize_openai_messages_marked(messages, include_reasoning_content, false)
+}
+
+/// [`normalize_openai_messages`], optionally keeping each `image_url` part as
+/// an in-order image slot in the message content (see
+/// [`openai_content_text_marked`]). Only a route that forwards the images to a
+/// vision-capable daemon may mark them; every other consumer gets the
+/// text-only projection it always had.
+pub(crate) fn normalize_openai_messages_marked(
+    messages: Option<&serde_json::Value>,
+    include_reasoning_content: bool,
+    mark_images: bool,
+) -> serde_json::Value {
     let Some(messages) = messages.and_then(serde_json::Value::as_array) else {
         return serde_json::json!([]);
     };
     let normalized = messages
         .iter()
         .filter_map(|message| {
-            let role = match message.get("role").and_then(serde_json::Value::as_str)? {
-                "developer" => "system",
-                "toolResult" | "tool_result" => "tool",
-                role @ ("system" | "user" | "assistant" | "tool") => role,
-                _ => return None,
+            let role = normalized_role(message)?;
+            let raw_content = if mark_images {
+                openai_content_text_marked(message.get("content"))
+            } else {
+                openai_content_text(message.get("content"))
             };
-            let raw_content = openai_content_text(message.get("content"));
             let mut entry = serde_json::json!({
                 "role": role,
                 "content": if role == "assistant" {
@@ -4069,7 +4166,7 @@ mod tests {
     }
 
     #[test]
-    fn openai_images_forward_one_base64_payload_and_reject_unsafe_shapes() {
+    fn openai_images_forward_every_base64_payload_in_message_order_and_reject_unsafe_shapes() {
         let messages = serde_json::json!([{
             "role": "user",
             "content": [
@@ -4078,17 +4175,111 @@ mod tests {
             ]
         }]);
         assert_eq!(
-            request_image_base64(Some(&messages)).unwrap().as_deref(),
-            Some("YWJj")
+            request_images_base64(Some(&messages)).unwrap(),
+            vec!["YWJj".to_owned()]
         );
         let remote = serde_json::json!([{
             "role": "user",
             "content": [{ "type": "image_url", "image_url": { "url": "https://example/image.png" } }]
         }]);
-        assert!(request_image_base64(Some(&remote))
+        assert!(request_images_base64(Some(&remote))
             .unwrap_err()
             .to_string()
             .contains("remote"));
+        // Clients resend an earlier image every turn: every image is kept, in
+        // message order, and a message the projection drops contributes none.
+        let image = |b64: &str| {
+            serde_json::json!({
+                "type": "image_url",
+                "image_url": { "url": format!("data:image/jpeg;base64,{b64}") }
+            })
+        };
+        let history = serde_json::json!([
+            { "role": "user", "content": [image("AAAA"), { "type": "text", "text": "first" }] },
+            { "role": "assistant", "content": "ok" },
+            { "role": "wizard", "content": [image("DROP")] },
+            { "role": "user", "content": [{ "type": "text", "text": "second" }, image("BBBB")] },
+        ]);
+        assert_eq!(
+            request_images_base64(Some(&history)).unwrap(),
+            vec!["AAAA".to_owned(), "BBBB".to_owned()]
+        );
+    }
+
+    #[test]
+    fn marked_messages_keep_each_image_at_its_message_position() {
+        use hipfire_runtime::prompt_frame::IMAGE_SLOT;
+        let image = |b64: &str| {
+            serde_json::json!({
+                "type": "image_url",
+                "image_url": { "url": format!("data:image/png;base64,{b64}") }
+            })
+        };
+        let body = serde_json::json!({ "messages": [
+            { "role": "user", "content": [
+                image("AAAA"),
+                { "type": "text", "text": format!("remember purple hippo{IMAGE_SLOT}") },
+            ] },
+            { "role": "assistant", "content": "Got it." },
+            { "role": "user", "content": [{ "type": "text", "text": "and now?" }, image("BBBB")] },
+            { "role": "user", "content": "what was the code word?" },
+        ] });
+        let marked = normalize_openai_messages_marked(body.get("messages"), false, true);
+        // Image first, then a text part: the image is followed by a newline.
+        // The reserved character a client typed is not a slot.
+        assert_eq!(
+            marked[0]["content"],
+            format!("{IMAGE_SLOT}\nremember purple hippo")
+        );
+        assert_eq!(marked[1]["content"], "Got it.");
+        assert_eq!(marked[2]["content"], format!("and now?{IMAGE_SLOT}"));
+        assert_eq!(marked[3]["content"], "what was the code word?");
+        let slots = |messages: &serde_json::Value| {
+            messages
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["content"].as_str().unwrap().matches(IMAGE_SLOT).count())
+                .sum::<usize>()
+        };
+        assert_eq!(slots(&marked), 2);
+        // The unmarked projection (every other consumer) never carries a slot.
+        let plain = normalize_openai_messages(body.get("messages"), false);
+        assert_eq!(slots(&plain), 1, "only the client's own typed character");
+        assert_eq!(plain[2]["content"], "and now?");
+    }
+
+    #[test]
+    fn contract_marks_images_only_for_the_singleton_route() {
+        use hipfire_runtime::prompt_frame::IMAGE_SLOT;
+        let resolved = contract_resolved_with_system("");
+        let body = serde_json::json!({
+            "max_tokens": 8,
+            "messages": [
+                { "role": "user", "content": [
+                    { "type": "text", "text": "look" },
+                    { "type": "image_url", "image_url": { "url": "data:image/png;base64,AAAA" } },
+                ] },
+                { "role": "assistant", "content": "seen" },
+                { "role": "user", "content": "and the colour?" },
+            ],
+        });
+        let single = project_request_contract(&body, &resolved, false, false).unwrap();
+        assert_eq!(
+            single.messages[0]["content"],
+            format!("look{IMAGE_SLOT}"),
+            "the history keeps the image slot"
+        );
+        assert_eq!(single.messages.as_array().unwrap().len(), 3);
+        let slot = project_request_contract(&body, &resolved, false, true).unwrap();
+        assert_eq!(slot.messages[0]["content"], "look");
+        // Text-only requests are untouched by the marking path.
+        let text_only = serde_json::json!({
+            "max_tokens": 8,
+            "messages": [{ "role": "user", "content": [{ "type": "text", "text": "a\u{fffc}b" }] }],
+        });
+        let projected = project_request_contract(&text_only, &resolved, false, false).unwrap();
+        assert_eq!(projected.messages[0]["content"], "a\u{fffc}b");
     }
 
     #[test]
@@ -8293,18 +8484,15 @@ mod tests {
             ),
             (
                 "remote image_url values are unsupported",
-                request_image_base64(Some(&serde_json::json!([
+                request_images_base64(Some(&serde_json::json!([
                     {"role": "user", "content": [image("https://x/y.png")]}
                 ])))
                 .map(drop),
             ),
             (
-                "at most one image_url",
-                request_image_base64(Some(&serde_json::json!([
-                    {"role": "user", "content": [
-                        image("data:image/png;base64,AA"),
-                        image("data:image/png;base64,AA")
-                    ]}
+                "only base64 PNG and JPEG image_url data URIs",
+                request_images_base64(Some(&serde_json::json!([
+                    {"role": "user", "content": [image("data:image/gif;base64,AA")]}
                 ])))
                 .map(drop),
             ),

@@ -330,7 +330,7 @@ pub fn is_batch_request_eligible(
     serve_continuous_batch: bool,
     pflash_active: bool,
 ) -> bool {
-    let has_image = msg.get("image").is_some() || msg.get("image_base64").is_some();
+    let has_image = hipfire_engine::prompt::wire_has_image(msg);
     let has_tools = msg
         .get("tools")
         .and_then(|v| v.as_array())
@@ -2909,7 +2909,7 @@ pub fn is_vmm_batch_request_eligible(
     if !staged || !serve_continuous_batch || continuous_batch_size <= 1 {
         return false;
     }
-    let has_image = msg.get("image").is_some() || msg.get("image_base64").is_some();
+    let has_image = hipfire_engine::prompt::wire_has_image(msg);
     let has_tools = msg
         .get("tools")
         .and_then(|v| v.as_array())
@@ -3069,7 +3069,7 @@ fn qwen4_lane_request_supported(
         Some(Value::Array(a)) => a.is_empty(),
         Some(_) => false,
     };
-    let images_ok = msg.get("image").is_none() && msg.get("image_base64").is_none();
+    let images_ok = !hipfire_engine::prompt::wire_has_image(msg);
     let logprobs_ok = matches!(msg.get("logprobs"), None | Some(Value::Bool(false)))
         && matches!(msg.get("top_logprobs"), None | Some(Value::Null))
         && sampling.repeat_penalty == 1.0
@@ -6926,7 +6926,7 @@ pub fn is_qwen_ep_batch_request_eligible(
     }
     // Staged `batch` above is the admission: staging already passed the full
     // `validate_ep_batch_compatibility` (embd/lm_head/all-global-experts).
-    let has_image = msg.get("image").is_some() || msg.get("image_base64").is_some();
+    let has_image = hipfire_engine::prompt::wire_has_image(msg);
     let has_tools = msg
         .get("tools")
         .and_then(|v| v.as_array())
@@ -8361,6 +8361,7 @@ mod tests {
             json!({"tools": null}),
             json!({"image": "x"}),
             json!({"image_base64": "x"}),
+            json!({"images_base64": ["x"]}),
             json!({"logprobs": true}),
             json!({"top_logprobs": 2}),
         ] {
