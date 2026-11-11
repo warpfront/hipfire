@@ -3421,6 +3421,7 @@ pub fn load_model_with_gemma4_drafter(
     // Validate draft_len early (refuse-don't-degrade, same rule as daemon).
     let _ = gemma4_eagle_spec_len(Some(gemma4_draft_len as u64))
         .map_err(|e| format!("gemma4 drafter: {e}"))?;
+    let vmm_runtime_refusal = gpu.vmm_runtime_refusal();
     let admission = crate::admission::admit_source_with_options(
         path,
         1, // this entry serves tp<=1
@@ -3445,7 +3446,7 @@ pub fn load_model_with_gemma4_drafter(
                 deepseek4_compute_placement,
                 hipfire_config::Deepseek4ComputePlacement::Single
             ),
-            vmm_runtime_available: gpu.vmm_recommended_granularity().is_ok(),
+            vmm_runtime_refusal: vmm_runtime_refusal.as_deref(),
             free_vram_bytes: gpu.device_mem_info().ok().map(|(free, _)| free),
         },
         crate::admission::SourceAdmissionOptions {
@@ -5003,7 +5004,8 @@ pub fn load_model_ep_with_kv_mode(
             kv_adaptive: None,
             cask: None,
             deepseek4_heterogeneous: false,
-            vmm_runtime_available,
+            vmm_runtime_refusal: (!vmm_runtime_available)
+                .then_some("the HIP runtime has no VMM allocation granularity on every rank"),
             free_vram_bytes: None, // EP has no single-card KV capacity envelope.
         },
     )?;

@@ -1245,7 +1245,7 @@ fn load_model(
             kv_adaptive: None,
             cask: Some(&cask),
             deepseek4_heterogeneous: false,
-            vmm_runtime_available: gpu.vmm_recommended_granularity().is_ok(),
+            vmm_runtime_refusal: gpu.vmm_runtime_refusal().as_deref(),
             free_vram_bytes: gpu.device_mem_info().ok().map(|(free, _)| free),
         },
         SourceAdmissionOptions {

@@ -1804,6 +1804,10 @@ pub struct Gpu {
     /// Arenas whose cleanup failed before they could enter the owner map.
     /// They have no tensor owner and are retried during explicit/Gpu teardown.
     orphan_vmm_arenas: Vec<VmmArena>,
+    /// Verdict of the one-time virtual-address reservation probe
+    /// ([`Self::vmm_runtime_refusal`]): `None` = the runtime reserved a range,
+    /// `Some(reason)` = it could not. Decided once per device owner.
+    vmm_runtime_probe: std::sync::OnceLock<Option<String>>,
     /// `hipHostMalloc(hipHostMallocMapped)` owners, keyed by the **device-visible**
     /// base address kernels are handed. The value is the *host* pointer that
     /// `hipHostFree` needs, which `hipHostGetDevicePointer` may alias differently
@@ -3245,6 +3249,7 @@ impl Gpu {
             vmm_generations: HashMap::new(),
             vmm_generation_counter: 0,
             orphan_vmm_arenas: Vec::new(),
+            vmm_runtime_probe: std::sync::OnceLock::new(),
             host_mapped: HashMap::new(),
             host_leases: HostLeaseTable::new(),
             device_wait: None,
@@ -7125,7 +7130,14 @@ impl Gpu {
         let byte_size = numel
             .checked_mul(dtype.size())
             .ok_or_else(|| HipError::new(0, "VMM tensor byte size overflowed"))?;
-        let mut arena = VmmArena::reserve(&self.hip, self.device_id, byte_size)?;
+        let mut arena =
+            VmmArena::reserve(&self.hip, self.device_id, byte_size).map_err(|mut err| {
+                err.message.push_str(
+                "; this runtime could not reserve the virtual address range a VMM tensor needs \
+                 (a KV cache can use --kv-backend legacy / memory.kv_backend = legacy instead)",
+            );
+                err
+            })?;
         if hipfire_config::developer_var("HIPFIRE_OFFLOAD_DEBUG").is_ok() {
             eprintln!(
                 "[offload-debug] device-vmm base=0x{:x} req={} reserved={} gran={}",
@@ -8687,6 +8699,31 @@ impl Gpu {
         let prop = HipMemAllocationProp::device_pinned(self.device_id);
         self.hip
             .mem_get_allocation_granularity(&prop, HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED)
+    }
+
+    /// Why this runtime cannot back a VMM KV cache, or `None` when it can.
+    ///
+    /// [`Self::vmm_recommended_granularity`] only queries a driver constant and
+    /// passes on stacks whose `hipMemAddressReserve` then returns
+    /// `hipErrorOutOfMemory` (#1058: gfx1100, in-tree amdgpu 6.8 under ROCm
+    /// 10.0), which made an automatically selected VMM backend fail the load
+    /// after every weight was uploaded. This runs the real reservation once
+    /// (see [`hip_bridge::probe_va_reservation`]); admission turns a refusal into
+    /// the legacy backend with the reason attached. The verdict is cached for the
+    /// life of this `Gpu`.
+    pub fn vmm_runtime_refusal(&self) -> Option<String> {
+        self.vmm_runtime_probe
+            .get_or_init(|| {
+                if let Err(err) = self.vmm_recommended_granularity() {
+                    return Some(format!("hipMemGetAllocationGranularity failed: {err}"));
+                }
+                hip_bridge::probe_va_reservation(&self.hip, self.device_id)
+                    .err()
+                    .map(|err| {
+                        format!("a probe reservation of virtual address space failed: {err}")
+                    })
+            })
+            .clone()
     }
 
     pub fn vmm_allocation_count(&self) -> usize {

@@ -172,7 +172,10 @@ pub struct KvBackendHints<'a> {
     pub kv_adaptive: Option<&'a str>,
     pub cask: Option<&'a hipfire_runtime::loader_api::CaskConfig>,
     pub deepseek4_heterogeneous: bool,
-    pub vmm_runtime_available: bool,
+    /// Why this device's runtime cannot back the VMM backend (granularity
+    /// query or virtual-address reservation failed, see
+    /// `Gpu::vmm_runtime_refusal`), or `None` when it can.
+    pub vmm_runtime_refusal: Option<&'a str>,
     /// Free device bytes before this load, queried from HIP at admission.
     pub free_vram_bytes: Option<usize>,
 }
@@ -187,7 +190,7 @@ impl KvBackendHints<'_> {
             kv_adaptive: None,
             cask: None,
             deepseek4_heterogeneous: false,
-            vmm_runtime_available: false,
+            vmm_runtime_refusal: Some("no device was probed"),
             free_vram_bytes: None,
         }
     }
@@ -3026,17 +3029,16 @@ pub fn admit_source_with_options(
     // its capability replaces the Qwen/KvCache predicates below; its
     // topology is Single by the refusals above.
     let unsupported = if arch_id == QWEN4_ARCH_ID {
-        hipfire_arch_qwen4::qwen4_vmm_refusal(gpu_arch, hints.vmm_runtime_available)
+        hipfire_arch_qwen4::qwen4_vmm_refusal(gpu_arch, hints.vmm_runtime_refusal.is_none())
     } else if heterogeneous_reason {
         Some(
             "this mixed-GPU DeepSeek setup keeps its compressor cache in a layout the VMM backend cannot manage"
                 .to_string(),
         )
-    } else if !hints.vmm_runtime_available {
-        Some(
-            "this GPU runtime does not provide the virtual-memory (VMM) support the backend needs"
-                .to_string(),
-        )
+    } else if let Some(refusal) = hints.vmm_runtime_refusal {
+        Some(format!(
+            "this GPU runtime does not provide the virtual-memory (VMM) support the backend needs ({refusal})"
+        ))
     } else if let Some(reason) = hipfire_config::devices::vmm_kv_platform_refusal() {
         Some(reason)
     } else if gpu_arch != "gfx1201"
@@ -3293,6 +3295,7 @@ pub fn admit_source_with_options(
                             | kv_mode::KvPair::Split(KvMode::Q8, kv_mode::VMode::Q8)
                     ),
                 kv_backend,
+                hints.vmm_runtime_refusal.is_some(),
             )?;
         }
         let k = pair.k();
@@ -5075,7 +5078,7 @@ mod tests {
                 kv_adaptive: None,
                 cask: None,
                 deepseek4_heterogeneous: false,
-                vmm_runtime_available: true,
+                vmm_runtime_refusal: None,
                 free_vram_bytes: None,
             };
             let admit = |request, arch| {
@@ -5096,6 +5099,80 @@ mod tests {
                 .map(|_| ())
                 .unwrap_err();
             assert!(error.contains("gfx940") && error.contains("legacy"));
+            cleanup(&trunk);
+        }
+        /// #1058: a runtime whose `hipMemAddressReserve` fails must resolve the
+        /// automatic backend to legacy at admission (before any weight is
+        /// uploaded), with the failure in the reason, instead of choosing VMM
+        /// and failing the load after the weights. An explicit `vmm` refuses
+        /// with the fix named; an explicit `legacy` is untouched.
+        #[test]
+        fn automatic_backend_falls_back_to_legacy_when_the_runtime_cannot_reserve_va() {
+            let trunk = write_hfq("kv-va-refusal", 5, false);
+            let path = trunk.to_str().unwrap();
+            let refusal = "a probe reservation of virtual address space failed: \
+                           HipError(2): hipMemAddressReserve: out of memory";
+            let hints = |vmm_runtime_refusal| KvBackendHints {
+                kv_mode: Some("q8"),
+                kv_k: None,
+                kv_v: None,
+                qwen_default_q8: true,
+                kv_adaptive: None,
+                cask: None,
+                deepseek4_heterogeneous: false,
+                vmm_runtime_refusal,
+                free_vram_bytes: None,
+            };
+            let admit = |request, arch, refusal| {
+                super::super::admit_source(
+                    path,
+                    1,
+                    1,
+                    request,
+                    None,
+                    arch,
+                    None,
+                    "auto",
+                    None,
+                    16384,
+                    hints(refusal),
+                )
+            };
+            for arch in ["gfx1100", "gfx1201"] {
+                let healthy = admit(KvBackendRequest::Automatic, arch, None).unwrap();
+                assert_eq!(healthy.kv_backend, KvBackend::Vmm, "{arch}");
+                let fallback = admit(KvBackendRequest::Automatic, arch, Some(refusal)).unwrap();
+                assert_eq!(fallback.kv_backend, KvBackend::Legacy, "{arch}");
+                let reason = fallback.kv_backend_reason.as_deref().unwrap();
+                assert!(reason.contains("hipMemAddressReserve"), "{arch}: {reason}");
+                let warning =
+                    legacy_warning(fallback.kv_backend, fallback.kv_backend_reason.as_deref())
+                        .unwrap();
+                assert!(
+                    warning.contains("hipMemAddressReserve"),
+                    "{arch}: {warning}"
+                );
+                let explicit_vmm = admit(
+                    KvBackendRequest::Explicit(KvBackend::Vmm),
+                    arch,
+                    Some(refusal),
+                )
+                .map(|_| ())
+                .unwrap_err();
+                assert!(
+                    explicit_vmm.contains("hipMemAddressReserve")
+                        && explicit_vmm.contains("--kv-backend legacy"),
+                    "{arch}: {explicit_vmm}"
+                );
+                let explicit_legacy = admit(
+                    KvBackendRequest::Explicit(KvBackend::Legacy),
+                    arch,
+                    Some(refusal),
+                )
+                .unwrap();
+                assert_eq!(explicit_legacy.kv_backend, KvBackend::Legacy, "{arch}");
+                assert!(explicit_legacy.kv_backend_reason.is_none(), "{arch}");
+            }
             cleanup(&trunk);
         }
         /// P2: the V axis admission sizes VMM KV with is the one the carrier
@@ -5165,7 +5242,7 @@ mod tests {
         fn gfx1151_fwht_k_override_refuses_instead_of_legacy_fallback() {
             let trunk = write_hfq("kv-axis-refusal", 5, false);
             let path = trunk.to_str().unwrap();
-            let admit = |request, arch, kv_mode, kv_k, vmm_runtime_available| {
+            let admit = |request, arch, kv_mode, kv_k, vmm_runtime_available: bool| {
                 super::super::admit_source(
                     path,
                     1,
@@ -5185,7 +5262,8 @@ mod tests {
                         kv_adaptive: None,
                         cask: None,
                         deepseek4_heterogeneous: false,
-                        vmm_runtime_available,
+                        vmm_runtime_refusal: (!vmm_runtime_available)
+                            .then_some("the test runtime has no VMM"),
                         free_vram_bytes: None,
                     },
                 )
@@ -5259,7 +5337,7 @@ mod tests {
                 kv_adaptive: None,
                 cask: None,
                 deepseek4_heterogeneous: false,
-                vmm_runtime_available: true,
+                vmm_runtime_refusal: None,
                 free_vram_bytes: Some(24 << 30),
             };
             let omitted = super::super::admit_source(
@@ -5337,7 +5415,7 @@ mod tests {
             std::fs::write(dir.join("model.safetensors"), shard).unwrap();
             let hints = KvBackendHints {
                 kv_mode: Some("q8"),
-                vmm_runtime_available: true,
+                vmm_runtime_refusal: None,
                 free_vram_bytes: Some(96 << 30),
                 ..KvBackendHints::without_device()
             };

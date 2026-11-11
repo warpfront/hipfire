@@ -847,8 +847,15 @@ the same source/mode/topology; registry cards set neither backend nor
 gfx1100/gfx1151 the certified Qwen3.5-family VMM KV pairs are Q8/Q8 and, on
 exact gfx1100 TP1 only, FWHT2/3/4 K with Q8 or Lloyd2/3/4 V. Existing
 pipeline-parallel VMM restrictions still apply. Unsupported combinations
-retain the existing legacy fallback,
-except on gfx1151 Qwen3.5-family loads (arch 5/6): a nonempty `kv_k` override
+retain the existing legacy fallback.
+Automatic selection also proves the runtime can reserve address space before
+any weight is uploaded: the daemon performs one real `hipMemAddressReserve`
+of a single allocation granule per device (retired, never mapped) and, if the
+call fails, resolves **legacy** with the driver's error in the logged reason
+(on gfx1100 the Q8 FA2 split-KV verifier, which admits VMM caches only, stays
+off instead of refusing the load). An explicit `--kv-backend vmm` is refused
+at admission with the same reason and names `--kv-backend legacy` as the fix.
+Exception: on gfx1151 Qwen3.5-family loads (arch 5/6): a nonempty `kv_k` override
 selecting FWHT2/3/4 (including typed aliases) with an unset/`auto`/`q8` mode
 is refused unless `--kv-backend legacy` is explicit. There is no certified
 gfx1151 VMM FWHT path, so this refusal also applies when VMM runtime or

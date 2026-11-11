@@ -1669,7 +1669,7 @@ impl AdmissionInputs<'_> {
             cask: Some(&self.cask),
             deepseek4_heterogeneous: self.options.non_single_compute,
             qwen_default_q8: qwen_default_q8_enabled(),
-            vmm_runtime_available: true,
+            vmm_runtime_refusal: None,
             free_vram_bytes: device.free.and_then(|n| usize::try_from(n).ok()),
         }
     }
