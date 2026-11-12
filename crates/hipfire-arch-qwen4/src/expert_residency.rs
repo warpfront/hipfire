@@ -654,13 +654,14 @@ pub struct StateCensus {
 ///
 /// - `qsa_context`: the trunk QSA context arenas as `context` commits them
 ///   (VMM: each arena's mapped pages rounded to the driver granularity).
-/// - `state`: the rest of `Qwen4State::device_bytes` (GDN recurrent and
-///   conv with the snapshot arena's mirror, the QSA fixed arenas, PLE conv,
-///   hyper feedback), the QSA context counted once in `qsa_context`. For a
-///   `Q8Ef` GDN format the state also carries the one live F16 residual
-///   plane per GDN layer (`Qwen4State::device_bytes` adds it once, 54 MiB over
-///   36 layers: not per ring row, snapshot mirror or session); this census
-///   adds nothing on top, so the plane is never charged twice.
+/// - `state`: the rest of `Qwen4State::device_bytes` (GDN recurrent, live EF
+///   residual and conv with the snapshot arena's mirror, the QSA fixed arenas,
+///   PLE conv, hyper feedback), the QSA context counted once in `qsa_context`.
+///   For a `Q8Ef` GDN format the state carries the one live F16 residual plane
+///   per GDN layer (54 MiB over 36 layers) and, on a snapshot-capable state, the
+///   mirror's copy of it (the residual is real state: another 54 MiB; not per
+///   ring row or session); this census adds nothing on top, so neither plane is
+///   charged twice.
 /// - `forward`: [`crate::gpu_forward::qwen4_forward_device_bytes`] at
 ///   `chunk_rows` in `mode`.
 pub fn state_census(
@@ -7142,10 +7143,12 @@ mod tests {
     }
 
     /// The census charges exactly when the runtime predicate can hold: every
-    /// capability family, the 511/512-row threshold, the gfx1201 opt-in and
-    /// the canonical routing scopes that lift sub-512-row forwards to
-    /// `route_rows >= 512`. The expectations are written independently of the
-    /// predicates under test.
+    /// capability family and the gfx1201 opt-in. Under canonical ordinary
+    /// prefill every prefill forward (any row count, one-row tails included)
+    /// routes at the canonical rows (>= 512), so the shadow-reading arms can run
+    /// at every chunk and only the capability gates the charge; the 511/512-row
+    /// threshold itself is checked on the pure charge. The expectations are
+    /// written independently of the predicates under test.
     #[test]
     fn shadow_census_agrees_with_the_runtime_route_predicate_across_capability_families() {
         use rdna_compute::arch_caps::ArchCaps;
@@ -7171,25 +7174,36 @@ mod tests {
                         )
                         .unwrap();
                         // Independent spec: WMMA-w32 parts, or gfx1201 with its
-                        // opt-in; rows reach 512 raw or through gfx1151's scope.
+                        // opt-in, can build the shadows.
                         let capable = matches!(arch, "gfx1100" | "gfx1101" | "gfx1151")
                             || (arch == "gfx1201" && optin);
-                        let scoped = arch == "gfx1151" && (pm_invariant || (append && chunk >= 48));
-                        let reaches = chunk >= 512 || scoped;
                         let label = format!(
                             "{arch} optin {optin} chunk {chunk} append {append} pm {pm_invariant}"
                         );
-                        assert_eq!(
-                            charge,
-                            if capable && reaches { bound } else { 0 },
-                            "{label}"
+                        // Every non-gfx942 arch takes the ordinary-prefill intent and gfx942
+                        // pins the same canonical routing through the invariant scope, so
+                        // `Gpu::route_rows` of any prefill forward is the canonical row count,
+                        // whatever the chunk or the append/invariant knobs.
+                        let runtime_rows =
+                            rdna_compute::prefill_invariant::QWEN4_PREFILL_CANON_ROWS;
+                        assert!(
+                            rdna_compute::prefill_invariant::PrefillRouteIntent::OrdinaryPrefill
+                                .canonical_routing()
                         );
+                        assert_eq!(route_rows, runtime_rows, "{label}");
+                        assert_eq!(charge, if capable { bound } else { 0 }, "{label}");
                         // The runtime predicate over the shadowed owners' K
                         // values agrees: it holds for some owner iff the census
                         // charges.
                         let runtime = [2560usize, 640, 10240].into_iter().any(|k| {
                             qwen4_f16_wmma_applies_for(
-                                &caps, optin, true, route_rows, k, true, true,
+                                &caps,
+                                optin,
+                                true,
+                                runtime_rows,
+                                k,
+                                true,
+                                true,
                             )
                         });
                         assert_eq!(runtime, charge > 0, "{label}");
@@ -7197,6 +7211,9 @@ mod tests {
                 }
             }
         }
+        // The threshold of the pure charge: a route below 512 rows reads no shadow.
+        assert_eq!(f16_shadow_charge(true, 511, &weights, 48), Ok(0));
+        assert_eq!(f16_shadow_charge(true, 512, &weights, 48), Ok(bound));
         // The guards the census inherits stay in the runtime predicate: a
         // non-BF16 weight, K not a multiple of 64, a recorder/capture and the
         // opt-out never apply.
@@ -10438,23 +10455,26 @@ mod tests {
     #[test]
     fn q8ef_live_residual_is_charged_once_by_the_state_census_and_flows_into_the_placement() {
         let config = crate::config::compact_test_config();
-        // One F16 residual plane per GDN layer, not mirrored, not per ring row.
+        // One F16 residual plane per GDN layer, not per ring row. The state owner charges it
+        // live and, on the snapshot-capable state, once more in the transaction mirror (the
+        // residual round-trips through snapshot/restore/rollback): two planes over plain Q8.
         let plane = 2
             * (config.linear_num_value_heads
                 * config.linear_key_head_dim
                 * config.linear_value_head_dim) as u64;
         let live = plane * config.n_linear_layers() as u64;
         assert_eq!(live, 54 << 20);
+        let residual = 2 * live;
         let weights = xtx_manifest();
         let (non_expert, layer) = resident_split(&weights, xtx_bytes).unwrap();
         let experts = routed_expert_bytes_ranks(&weights, xtx_bytes, 1).unwrap();
         for chunk in [512, 1536, 8192] {
             let q8 = gdn_reserve(chunk, crate::GdnStateFormat::Q8, false);
             let ef = gdn_reserve(chunk, crate::GdnStateFormat::Q8Ef, false);
-            assert_eq!(ef.census.state - q8.census.state, live, "chunk {chunk}");
+            assert_eq!(ef.census.state - q8.census.state, residual, "chunk {chunk}");
             assert_eq!(ef.census.qsa_context, q8.census.qsa_context);
             assert_eq!(ef.census.forward, q8.census.forward);
-            assert_eq!(ef.census_total - q8.census_total, live, "chunk {chunk}");
+            assert_eq!(ef.census_total - q8.census_total, residual, "chunk {chunk}");
             // The floor never sees the GDN format: a floor-led reserve is equal.
             let q8_floor = gdn_reserve(chunk, crate::GdnStateFormat::Q8, true);
             let ef_floor = gdn_reserve(chunk, crate::GdnStateFormat::Q8Ef, true);
@@ -10498,7 +10518,7 @@ mod tests {
             assert_eq!(total(&w8) - total(&wef), scratch, "chunk {chunk}");
         }
         // A free-VRAM window that fits exactly three resident layers beside the Q8
-        // census loses one under Q8Ef: the 54 MiB live plane is a real reserve.
+        // census loses one under Q8Ef: the 108 MiB residual (live plane + mirror) is a real reserve.
         let q8 = gdn_reserve(1536, crate::GdnStateFormat::Q8, false).bytes();
         let ef = gdn_reserve(1536, crate::GdnStateFormat::Q8Ef, false).bytes();
         let charges = PlacementCharges::new(layer, false).unwrap();

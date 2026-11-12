@@ -983,14 +983,20 @@ mod tests {
     }
 
     /// The in-place state a snapshot copies, from the config alone: per GDN
-    /// layer the recurrent state and conv history, per QSA layer the partial
-    /// K/V, the selection and the raw-index circular block, and on the input
-    /// band the PLE conv history and hyper feedback. Independent of
-    /// `Qwen4State`'s own accounting.
+    /// layer the recurrent state, the live EF residual (Q8Ef) and the conv
+    /// history, per QSA layer the partial K/V, the selection and the raw-index
+    /// circular block, and on the input band the PLE conv history and hyper
+    /// feedback. Independent of `Qwen4State`'s own accounting.
     fn mirror_bytes(config: &Qwen4Config, format: Qwen4StateFormat, scope: &Qwen4BandScope) -> u64 {
         let f32_bytes = 4usize;
         let (gdn_layers, qsa_layers) = scope_layer_counts(config, scope);
+        // The snapshot mirror copies the recurrent slot, the live EF residual plane (real state
+        // since the residual round-trips through snapshot/restore/rollback) and the conv.
         let recurrent = format.gdn.state_bytes(
+            config.linear_num_value_heads,
+            config.linear_key_head_dim,
+            config.linear_value_head_dim,
+        ) + format.gdn.residual_bytes(
             config.linear_num_value_heads,
             config.linear_key_head_dim,
             config.linear_value_head_dim,

@@ -18433,11 +18433,14 @@ mod qwen4_ep_reserve_loader_tests {
         )
     }
 
-    /// The member list is the shadow region's span order (what `install_shadows` checks),
-    /// empty when no family applies.
+    /// Canonical ordinary prefill reads the weight shadows at every row count, so
+    /// `shadow_flags` refuses on every arch and a decoupled EP reserve never hosts
+    /// them in its donor segments: the member list is empty for every family and
+    /// the plan stays the shadow-less one. The layout authority itself still lists
+    /// the members in its span order.
     #[test]
-    fn shadow_member_bytes_follow_the_region_spans_and_are_empty_when_none_applies() {
-        use hipfire_arch_qwen4::decode_share_shadows::{plan_shadow_region, shadow_flags};
+    fn shadow_member_bytes_are_empty_because_canonical_prefill_refuses_donor_hosting() {
+        use hipfire_arch_qwen4::decode_share_shadows::plan_shadow_region;
         let weights = vec![
             shadow_owner(
                 "model.language_model.hyper_connection_mixer.input_mix_weight_down.weight",
@@ -18447,28 +18450,24 @@ mod qwen4_ep_reserve_loader_tests {
             shadow_owner("model.language_model.layers.0.mlp.gate.weight", 512, 2560),
             shadow_owner("model.language_model.layers.1.mlp.gate.weight", 512, 2560),
         ];
-        let members =
-            qwen4_ep_shadow_member_bytes("gfx1201", true, false, 4096, &weights, 48).unwrap();
-        assert_eq!(
-            members,
-            vec![2 * 320 * 10240, 2 * 512 * 2560, 2 * 512 * 2560]
-        );
-        let (f16, shared_i8) = shadow_flags("gfx1201", true, false, 4096).unwrap();
-        let region = plan_shadow_region(&weights, 48, f16, shared_i8).unwrap();
-        assert_eq!(
-            members,
-            region.spans().iter().map(|span| span.2).collect::<Vec<_>>()
-        );
-        // Neither family applies: the plan stays the shadow-less one.
-        assert!(
-            qwen4_ep_shadow_member_bytes("gfx1201", false, false, 4096, &weights, 48)
-                .unwrap()
-                .is_empty()
-        );
+        for (f16_capable, shared_i8) in [(true, false), (true, true), (false, true), (false, false)]
+        {
+            assert!(
+                qwen4_ep_shadow_member_bytes("gfx1201", f16_capable, shared_i8, 4096, &weights, 48)
+                    .unwrap()
+                    .is_empty(),
+                "f16 {f16_capable} i8 {shared_i8}"
+            );
+        }
         assert!(
             qwen4_ep_shadow_member_bytes("gfx1201", true, true, 4096, &[], 48)
                 .unwrap()
                 .is_empty()
+        );
+        let region = plan_shadow_region(&weights, 48, true, false).unwrap();
+        assert_eq!(
+            region.spans().iter().map(|span| span.2).collect::<Vec<_>>(),
+            vec![2 * 320 * 10240, 2 * 512 * 2560, 2 * 512 * 2560]
         );
     }
 }

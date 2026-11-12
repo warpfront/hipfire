@@ -2926,7 +2926,7 @@ impl Qwen4State {
 
     /// Device bytes one snapshot-capable request state commits
     /// ([`StateMirror::Snapshot`]): every allocation
-    /// [`Self::new_with_backend`] makes (GDN recurrent, live-only EF and conv, the QSA
+    /// [`Self::new_with_backend`] makes (GDN recurrent, live EF residual and conv, the QSA
     /// fixed arenas and, as `context` commits them, the context arenas, PLE
     /// conv, hyper feedback) plus the snapshot arena's mirror of the state
     /// the forwards overwrite in place. The verify ring
@@ -6261,7 +6261,7 @@ mod tests {
 
     /// The per-allocation inventory sums to the closed-form byte query for
     /// every state format and legacy/VMM context commit (including the F16
-    /// and pooled BF16 arenas and the live-only EF residual), under both
+    /// and pooled BF16 arenas and the live EF residual and its mirror), under both
     /// snapshot-mirror choices; the unsuffixed queries are the
     /// snapshot-capable state.
     #[test]
@@ -6319,10 +6319,10 @@ mod tests {
 
     /// Compared with the owner's own tensor plan: under legacy storage the
     /// inventory is each planned tensor once plus exactly one snapshot-arena
-    /// mirror per in-place tensor (GDN recurrent/conv, QSA partial K/V,
+    /// mirror per in-place tensor (GDN recurrent/EF residual/conv, QSA partial K/V,
     /// selected indices, the raw-index circular block, PLE conv, hyper
-    /// feedback); the EF residual and the append-only/derived context arenas
-    /// have no mirror, and no alias is charged twice.
+    /// feedback); the append-only/derived context arenas have no mirror, and
+    /// no alias is charged twice.
     #[test]
     fn allocation_sizes_are_the_state_plan_plus_one_mirror_per_in_place_tensor() {
         let config = crate::config::compact_test_config();
@@ -6340,8 +6340,9 @@ mod tests {
                     expected.push(bytes);
                     live_only.push(bytes);
                     match spec.key.rsplit('.').next().unwrap() {
-                        "recurrent" | "conv" | "partial_keys" | "partial_values"
-                        | "selected_indices" | "ple_conv" | "hyper_feedback" => {
+                        // The Q8Ef residual is real state: the transaction mirror copies it.
+                        "recurrent" | "ef_residual" | "conv" | "partial_keys"
+                        | "partial_values" | "selected_indices" | "ple_conv" | "hyper_feedback" => {
                             expected.push(bytes)
                         }
                         "raw_index_keys" => expected.push(
@@ -7038,8 +7039,8 @@ mod tests {
 
     /// Bands charge their own layers' mirrors and nothing twice: the band
     /// mirror bytes sum to the whole-model mirror, only the input band holds
-    /// the PLE/feedback mirror, and the live EF residual is the same under
-    /// both choices.
+    /// the PLE/feedback mirror, and the live EF residual plane is mirrored
+    /// with the slot (the mirror is part of the sum).
     #[test]
     fn band_mirror_bytes_sum_to_the_single_mirror() {
         let config = crate::config::compact_test_config();
@@ -7084,12 +7085,13 @@ mod tests {
                 }
             }
         }
-        // The Q8Ef residual is live-only: 54 MiB over Q8 under either choice.
-        for mirror in [StateMirror::Snapshot, StateMirror::Absent] {
+        // The Q8Ef residual plane is 54 MiB over Q8 live; a snapshot-capable state also mirrors
+        // it (the residual is snapshotted/restored with the slot), so the same again.
+        for (mirror, copies) in [(StateMirror::Snapshot, 2), (StateMirror::Absent, 1)] {
             assert_eq!(
                 bytes(GdnStateFormat::Q8Ef, &single, mirror)
                     - bytes(GdnStateFormat::Q8, &single, mirror),
-                54 * 1024 * 1024,
+                copies * 54 * 1024 * 1024,
                 "{mirror:?}"
             );
         }
@@ -7961,8 +7963,8 @@ mod tests {
                 .storage()
                 .state_bytes(heads, GDN_HEAD_DIM, GDN_HEAD_DIM);
             let residual = format.gdn.residual_bytes(heads, GDN_HEAD_DIM, GDN_HEAD_DIM);
-            // Recurrent + conv, doubled by the snapshot mirror, plus the live-only residual.
-            let gdn_layer = 2 * (slot + conv) + residual;
+            // Recurrent + conv + residual, each doubled by the snapshot mirror.
+            let gdn_layer = 2 * (slot + conv + residual);
             for context in allocation_contexts() {
                 let whole = Qwen4State::device_bytes(&global, format, &context).expect("global");
                 for local in &locals {

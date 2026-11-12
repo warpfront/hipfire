@@ -4,14 +4,17 @@
 
 //! The weight-shadow region of a decode-share donor tail.
 //!
-//! On exact gfx1201 the BF16 -> F16 weight shadows
-//! (`Gpu::ensure_bf16_f16_shadow`) and the shared-expert INT8 shadows
-//! (`Gpu::qwen4_shared_i8_shadow`) are read only by prefill tiles of at least
-//! 512 rows, and on a decode-share load every such tile is a borrowed prompt
-//! tile. A load that keeps them in the donor tail charges neither the census
-//! `f16_shadows` nor the `shared_i8_shadows` term; the shadows are rebuilt in
-//! place at the first acquire of every borrow epoch and vanish with the next
-//! restore (the donors come back).
+//! The BF16 -> F16 weight shadows (`Gpu::ensure_bf16_f16_shadow`) and the
+//! shared-expert INT8 shadows (`Gpu::qwen4_shared_i8_shadow`) were read only by
+//! prefill tiles of at least 512 rows on exact gfx1201, and on a decode-share
+//! load every such tile is a borrowed prompt tile: a load could keep them in
+//! the donor tail, charging neither the census `f16_shadows` nor the
+//! `shared_i8_shadows` term, rebuilding them in place at the first acquire of
+//! every borrow epoch (they vanish with the next restore, when the donors come
+//! back). Under canonical ordinary prefill every call routes at the canonical
+//! rows whatever its row count, so the shadow-reading arms also run outside a
+//! borrow epoch and [`shadow_flags`] refuses every arch: the shadows are
+//! dedicated, censused VRAM.
 //!
 //! This module is the one pure authority on that region's layout: the
 //! loader sizes the class spans from [`ShadowRegionPlan::total_bytes`] and the
@@ -300,25 +303,29 @@ mod tests {
         assert_eq!(f16_only.f16, both.f16);
     }
 
-    /// The census predicates: capability and route rows >= 512 per family; the
-    /// tile-size gate the borrowed epoch relies on holds on gfx1201.
+    /// Canonical ordinary prefill routes EVERY prefill call (a one-row tail
+    /// included) at the canonical rows (>= 512), so the F16 WMMA / INT8 shared-expert arms
+    /// read their shadows at every row count, outside any borrow epoch: no
+    /// arch, capability or chunk size may keep the shadows in a donor tail.
+    /// (Before canonical routing a gfx1201 load borrowed them for tiles of at
+    /// least 512 rows only.)
     #[test]
-    fn shadow_flags_follow_the_census_predicates() {
-        assert_eq!(shadow_flags("gfx1201", true, true, 16384), Ok((true, true)));
-        assert_eq!(
-            shadow_flags("gfx1201", true, false, 16384),
-            Ok((true, false))
-        );
-        assert_eq!(
-            shadow_flags("gfx1201", false, true, 1024),
-            Ok((false, true))
-        );
-        assert_eq!(
-            shadow_flags("gfx1201", false, false, 16384),
-            Ok((false, false))
-        );
-        // A chunk below the route threshold never reads a shadow.
-        assert_eq!(shadow_flags("gfx1201", true, true, 511), Ok((false, false)));
+    fn shadow_flags_refuse_every_family_under_canonical_prefill_routing() {
+        let refusal =
+            Err("a sub-512-row call routes to the F16 WMMA arms (canonical routing rows)");
+        for arch in ["gfx1201", "gfx1100", "gfx1151", "gfx1200", "gfx942"] {
+            for (f16_capable, shared_i8) in
+                [(true, true), (true, false), (false, true), (false, false)]
+            {
+                for chunk in [1usize, 511, 512, 1024, 16384] {
+                    assert_eq!(
+                        shadow_flags(arch, f16_capable, shared_i8, chunk),
+                        refusal,
+                        "{arch} f16 {f16_capable} i8 {shared_i8} chunk {chunk}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

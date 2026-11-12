@@ -722,11 +722,15 @@ mod prefill_whole_tests {
 
     /// The existing `per-token` / split `prefill` scoring code of
     /// `eval_hipfire` is the code that produced every earlier kldseq. Each
-    /// snippet below is copied verbatim from the evaluator as it was before
-    /// `prefill-whole` existed (the split mode's padding default, its scratch
-    /// hook, its capture buffer, and its two forward calls), and must still
-    /// appear exactly once in the shipped evaluator: changing what the existing
-    /// modes run has to change this golden deliberately. The evaluator's
+    /// snippet below is copied verbatim from the evaluator (the split mode's
+    /// padding default, its scratch hook, its capture buffer, and its two
+    /// forward calls), and must still appear exactly once in the shipped
+    /// evaluator: changing what the existing modes run has to change this
+    /// golden deliberately. The split mode's scored-region call is the
+    /// ordinary prompt-fill hidden capture
+    /// (`forward_prefill_batch_capture_hidden`; it was a verify-capture
+    /// `forward_prefill_batch` before the canonical GDN prefill, whose stream
+    /// then stays Open across the prefix and scored calls). The evaluator's
     /// output itself needs the GPU forward, so this source golden is the CPU
     /// half of the identity argument.
     #[test]
@@ -766,8 +770,9 @@ mod prefill_whole_tests {
                     None,
                     None,
                 )
-                .expect("forward_prefill_batch prefix");
-                qwen35::forward_prefill_batch(
+                .expect("forward_prefill_batch prefix");"#,
+            // The scored region continues the prefix call as the ordinary prompt-fill capture.
+            r#"qwen35::forward_prefill_batch_capture_hidden(
                     &mut gpu,
                     &weights,
                     &config,
@@ -776,12 +781,9 @@ mod prefill_whole_tests {
                     &mut kv_cache,
                     &mut dn_state,
                     &scratch,
-                    None,
-                    Some(h_buf),
-                    None,
-                    None,
+                    h_buf,
                 )
-                .expect("forward_prefill_batch scored");"#,
+                .expect("forward_prefill_batch_capture_hidden scored");"#,
             // The split mode's position / reference-block / NLL mapping that
             // `legacy_scoring_tests::legacy_scoring_output_golden` executes.
             r#"let pos = scoring_start + j;
