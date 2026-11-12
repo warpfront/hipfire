@@ -158,6 +158,7 @@
     "kernels/src/qwen4_moe_iu4_sym.gfx1151.hip",
     "kernels/src/qwen4_moe_scatter_fused_k8.hip",
     "kernels/src/qwen4_moe_scatter_stable_top10.hip",
+    "kernels/src/qwen4_qsa_lanes_f32.gfx942.hip",
     "kernels/src/qwen4_slab_union_plan.hip",
     "kernels/src/slowlink_prefill.hip",
     "kernels/src/rope.hip",
@@ -248,6 +249,18 @@
         "qwen4_gdn_lanes_step_f32_gfx942"
       ],
       "reason": "gfx942 GDN lanes Route-A qualification twin: byte-identical full device ELF and exact HIP/HSA ABI. Land with its owner kernel and checked live launcher; no production dispatch or obligation-class change."
+    },
+    "kernels/qwen4_qsa_lanes_f32_gfx942_pm_gfx942.hxaco": {
+      "hip_source": "kernels/src/qwen4_qsa_lanes_f32.gfx942.hip",
+      "anchor": "kernels/qwen4_qsa_lanes_f32_gfx942_hipcc_gfx942.co",
+      "symbols": [
+        "qwen4_qsa_lanes_prologue_f32_gfx942",
+        "qwen4_qsa_lanes_pool_f32_gfx942",
+        "qwen4_qsa_lanes_scores_rows8_f32_gfx942",
+        "qwen4_qsa_lanes_select_from_scores_gfx942",
+        "qwen4_qsa_lanes_attention_f32_gfx942"
+      ],
+      "reason": "gfx942 QSA lanes F32 Route-A qualification twin: byte-identical full device ELF (seven entries) and exact HIP/HSA ABI with the hipcc anchor. Only the five F32/select entries are sealed and listed; the two FP8 entries qwen4_qsa_lanes_prologue_fp8_fnuz_gfx942 and qwen4_qsa_lanes_attention_fp8_fnuz_gfx942 stay OPEN and are never launched. Land with its owner kernel and checked live launcher; no unlaunched exemption, production dispatch or obligation-class change."
     }
   },
   "emitter_images": {
