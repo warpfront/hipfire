@@ -4382,8 +4382,13 @@ impl World {
                 if let Some(r) = recv {
                     arg = replace_self(&arg, r);
                 }
-                if contains_id(&arg, param) {
-                    return Err(format!("`{param}` is used inside the argument of a push"));
+                // The push is rewritten to write `out_name` (the caller's builder): neither the
+                // helper's own parameter name nor the caller's name may occur in the argument, so
+                // the rewrite cannot capture or be captured.
+                if contains_id(&arg, param) || contains_id(&arg, out_name) {
+                    return Err(format!(
+                        "`{param}`/`{out_name}` is used inside the argument of a push"
+                    ));
                 }
                 // A u64 word is a pointer only when that is provable from the expression alone:
                 // a local of the helper cannot be looked up at the call site.
@@ -4402,13 +4407,24 @@ impl World {
             }
             if t.is_id("for") {
                 let (pat, it, j) = for_parts(ts, i)?;
-                if contains_id(&pat, param) || contains_id(&it, param) {
-                    return Err(format!("`{param}` is used by a loop header"));
+                if contains_id(&pat, param)
+                    || contains_id(&it, param)
+                    || contains_id(&pat, out_name)
+                    || contains_id(&it, out_name)
+                {
+                    return Err(format!(
+                        "`{param}`/`{out_name}` is used by a loop header (the pushes are rewritten to the caller's builder `{out_name}`)"
+                    ));
                 }
                 let it = match recv {
                     Some(r) => replace_self(&it, r),
                     None => it,
                 };
+                if contains_id(&it, out_name) {
+                    return Err(format!(
+                        "the receiver of a method helper mentions the caller's builder `{out_name}` in a loop header"
+                    ));
+                }
                 let mut here = base.clone();
                 here.push(i);
                 let new_it = self.helper_iterable(&it, ctx, &here)?;
@@ -4909,6 +4925,54 @@ struct Unit;
         ] {
             expect_err(kinds(closure, CALL), what);
         }
+    }
+
+    #[test]
+    fn helper_names_cannot_capture_or_be_captured_by_the_callers_builder() {
+        // The caller's builder is `args`; the helper's own parameter is `p`. Pushes are rewritten
+        // from `p` to `args`, so a helper identifier `args` would change meaning.
+        let closure =
+            |stmts: &str| format!("    let push_ints = |p: &mut KernargBlob| {{\n{stmts}    }};\n");
+        let ok = closure("        p.push_i32(1);\n");
+        assert_eq!(
+            kinds(&ok, CALL).unwrap(),
+            seq(&[(PushKind::Ptr, 1), (PushKind::I32, 1)])
+        );
+        for (what, stmts) in [
+            (
+                "loop variable named like the caller's builder",
+                "        for args in [1, 2] {\n            p.push_i32(args);\n        }\n",
+            ),
+            (
+                "loop iterable mentions the caller's builder",
+                "        for v in [args.len(), 2] {\n            p.push_i32(1);\n        }\n",
+            ),
+            (
+                "push argument mentions the caller's builder",
+                "        p.push_i32(args.len() as i32);\n",
+            ),
+            (
+                "loop variable named like the helper parameter",
+                "        for p in [1, 2] {\n            p.push_i32(1);\n        }\n",
+            ),
+        ] {
+            expect_err(kinds(&closure(stmts), CALL), what);
+        }
+        // The same through a method helper whose parameter is `p` and whose loop variable is `args`.
+        let probe = "pub struct Plan { pub shape: Shape }\npub struct Shape { pub pair: Pair }\nfn probe(hip: &Hip, m: &Module, plan: &Plan) {\n    let f = hip.get_function(m, \"probe_sym\").unwrap();\n    let c = &plan.shape;\n    let mut args = KernargBlob::new();\n    args.push_ptr(p);\n    c.pair.push(&mut args);\n    hip.launch_kernel_blob(f, [1, 1, 1], [32, 1, 1], 0, None, &mut args).unwrap();\n}\n";
+        let pair = |header: &str| {
+            format!("pub struct Pair {{ pub t: i32 }}\nimpl Pair {{\n    pub fn push(&self, p: &mut KernargBlob) {{\n{header}            p.push_i32(self.t);\n        }}\n    }}\n}}\n")
+        };
+        let good = pair("        for _i in 0..2 {\n");
+        assert_eq!(
+            kinds_of(&[(PATH, probe), (OTHER, &good)]).unwrap(),
+            seq(&[(PushKind::Ptr, 1), (PushKind::I32, 2)])
+        );
+        let captured = pair("        for args in [1, 2] {\n");
+        expect_err(
+            kinds_of(&[(PATH, probe), (OTHER, &captured)]),
+            "method loop variable named like the caller's builder",
+        );
     }
 
     #[test]

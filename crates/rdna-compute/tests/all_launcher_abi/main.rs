@@ -4208,3 +4208,78 @@ fn actual_wide_selector_and_loader_feed_all_three_abi_checked_launches() {
         "classifications cannot stand in for a launch"
     );
 }
+
+#[test]
+fn actual_qsa_lanes_helpers_feed_all_five_checked_blob_sites() {
+    let root = root();
+    let paths = vec![
+        "crates/rdna-compute/src/cdna/gfx942_qsa_lanes.rs".to_string(),
+        "crates/rdna-compute/src/qsa_core_lanes_gfx942.rs".to_string(),
+        "crates/rdna-compute/src/rope.rs".to_string(),
+    ];
+    let world = World::load(&root, &paths).unwrap();
+    let source =
+        std::fs::read_to_string(root.join("kernels/src/qwen4_qsa_lanes_f32.gfx942.hip")).unwrap();
+    let declarations = hip::decls_of(&source).unwrap();
+    assert_eq!(declarations.len(), 7);
+    let mut symbols = Symbols::default();
+    for (name, decl) in &declarations {
+        symbols
+            .hip
+            .insert(name.clone(), vec![("actual QSA HIP".into(), decl.clone())]);
+    }
+    symbols
+        .changed_consts
+        .insert(("QWEN4_QSA_LANES_SRC".into(), paths[0].clone()));
+    let mut policy = no_policy();
+    let loader = format!("{}::g942_qsa_lanes_ensure", paths[0]);
+    policy.non_launching.insert(
+        loader.clone(),
+        load_inventory()["non_launching"][&loader]
+            .as_str()
+            .unwrap()
+            .into(),
+    );
+    let loader_fn = world
+        .file(&paths[0])
+        .unwrap()
+        .fns
+        .iter()
+        .find(|f| f.name == "g942_qsa_lanes_ensure")
+        .unwrap();
+    assert!(scan::find_sites(&loader_fn.body).unwrap().is_empty());
+    let analysis = analyze(&world, &symbols, &policy);
+    let (abi, coverage) = violations(&analysis, &policy);
+    assert!(
+        abi.is_empty() && coverage.is_empty(),
+        "{abi:?} {coverage:?}"
+    );
+    let report = analysis
+        .reports
+        .iter()
+        .find(|r| r.func == "qwen4_qsa_lanes_core")
+        .unwrap();
+    assert_eq!(report.sites.len(), 5);
+    for name in declarations.keys() {
+        assert!(analysis.covered.contains(name), "{name}");
+    }
+    // Loader classification and helper bodies cannot substitute for a live launch.
+    let missing = World::from_sources(
+        &root,
+        paths
+            .iter()
+            .map(|path| {
+                let source = std::fs::read_to_string(root.join(path)).unwrap();
+                (
+                    path.clone(),
+                    source.replace(".launch_blob_recorded(", ".not_a_launcher("),
+                )
+            })
+            .collect(),
+    )
+    .unwrap();
+    let missing = analyze(&missing, &symbols, &policy);
+    assert!(declarations
+        .keys()
+        .all(|name| !missing.covered.contains(name)));
+}
