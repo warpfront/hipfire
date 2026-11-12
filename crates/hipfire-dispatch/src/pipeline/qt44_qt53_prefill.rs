@@ -4146,6 +4146,28 @@ fn fp8_scatter(
         device.g942_fold_moe_enabled()
             && device.g942_fold_moe_scatter_admitted(plan.slots, p.n_exp, plan.grouped_rows)
     });
+    // G12 input: lane-wide (>= 8 rows) calls take the wide scatter, the fold's outputs bit for
+    // bit (executor-local route predicate on the slot count the call already carries).
+    let wide = gpu.try_gfx942().is_some_and(|device| {
+        device.g942_moe_wide_scatter_admitted(plan.slots, p.n_exp, plan.grouped_rows)
+    });
+    if wide {
+        return hip(gpu
+            .try_gfx942()
+            .ok_or_else(fp8_not_gfx942)?
+            .g942_moe_wide_group_scatter_desc(
+                p.topk_indices,
+                p.expert_token_counts,
+                p.expert_offsets,
+                p.sorted_slot_index,
+                p.expert_tile_ids,
+                p.inverse_perm,
+                p.gate_batch,
+                plan.slots,
+                p.n_exp,
+                plan.grouped_rows,
+            ));
+    }
     if fold {
         return hip(gpu
             .try_gfx942()
@@ -4328,6 +4350,30 @@ pub(crate) fn g942_fold_unscatter_act(
         f32_view(shared.up_out, 0, live),
         f32_view(shared.rotated, 0, live),
     );
+    // G12 input: lane-wide (>= 8 rows) calls unscatter over the flat slots through `inverse_perm`
+    // (the fold's outputs bit for bit; executor-local route predicate on the slot count).
+    let wide = gpu
+        .try_gfx942()
+        .is_some_and(|device| device.g942_moe_wide_glue_admitted(plan.slots));
+    if wide {
+        return hip(gpu
+            .try_gfx942()
+            .ok_or_else(fp8_not_gfx942)?
+            .g942_moe_wide_unscatter_act(
+                p.y_gate_up_grouped,
+                p.inverse_perm,
+                p.rot_batch,
+                p.mi,
+                plan.grouped_rows,
+                plan.slots,
+                &gate,
+                &up,
+                &rotated,
+                shared.scalar,
+                p.batch_size,
+                shared.intermediate,
+            ));
+    }
     hip(gpu
         .try_gfx942()
         .ok_or_else(fp8_not_gfx942)?
@@ -4382,6 +4428,29 @@ pub(crate) fn g942_fold_shared_down_combine(
         p.batch_size * p.down_m,
     );
     super::project_weight(gpu, down, shared.rotated, &out, p.batch_size, None)?;
+    // G12 input: lane-wide (>= 8 rows) calls take the batched-gather combine (the fold's output
+    // bit for bit; executor-local route predicate on the slot count).
+    let wide = gpu
+        .try_gfx942()
+        .is_some_and(|device| device.g942_moe_wide_glue_admitted(plan.slots));
+    if wide {
+        return hip(gpu
+            .try_gfx942()
+            .ok_or_else(fp8_not_gfx942)?
+            .g942_moe_wide_combine_shared_add(
+                p.y_down_grouped,
+                p.inverse_perm,
+                p.topk_indices,
+                p.topk_weights,
+                target,
+                &out,
+                shared.scalar,
+                p.down_m,
+                plan.grouped_rows,
+                plan.rows,
+                p.n_exp,
+            ));
+    }
     hip(gpu
         .try_gfx942()
         .ok_or_else(fp8_not_gfx942)?
