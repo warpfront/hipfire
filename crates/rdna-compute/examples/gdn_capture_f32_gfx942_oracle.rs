@@ -582,6 +582,27 @@ fn main() {
          steps {steps}",
         gpu.arch
     );
+    // The candidate routes: every launched entry is the hipcc source unless a twin image hook
+    // names a code object (`HIPFIRE_QWEN4_G942_GDN_VERIFY_IMAGE`: the capture / rollback /
+    // convolution + parameters / gated-norm entries of the verify chain;
+    // `HIPFIRE_QWEN4_G942_GDN_LANES_CAPTURE_IMAGE`: the batched capture lanes kernel). A set hook
+    // that does not load fails the first launch (non-zero exit); the route line and the final
+    // status say which objects the PASS covers. The pipe128 REFERENCE is the tensor_ops source
+    // route in every case.
+    let mut images: Vec<String> = Vec::new();
+    for hook in [
+        "HIPFIRE_QWEN4_G942_GDN_VERIFY_IMAGE",
+        "HIPFIRE_QWEN4_G942_GDN_LANES_CAPTURE_IMAGE",
+    ] {
+        match std::env::var(hook) {
+            Ok(path) if !path.is_empty() => {
+                let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                images.push(format!("{hook}={path} ({bytes} bytes)"));
+            }
+            _ => images.push(format!("{hook} unset (hipcc source)")),
+        }
+    }
+    println!("candidate route: {}", images.join("; "));
     let mut all = true;
     for &rows in &rows_list {
         all &= run_case(&mut gpu, rows, steps, controls, seed);
@@ -592,8 +613,9 @@ fn main() {
         }
     }
     println!(
-        "gdn_capture_f32_gfx942_oracle: {}",
-        if all { "PASS" } else { "FAIL" }
+        "gdn_capture_f32_gfx942_oracle: {} [route: {}]",
+        if all { "PASS" } else { "FAIL" },
+        images.join("; ")
     );
     std::process::exit(if all { 0 } else { 1 });
 }
