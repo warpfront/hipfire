@@ -50,7 +50,7 @@ const MANIFEST: &str =
     include_str!("../../../kernels/qwen4_qsa_lanes_f32_gfx942_pm_gfx942.twin.json");
 
 /// Per-symbol `(text_sha256, text_bytes, vgprs, sgprs, lds)` from the seal report.
-const SEAL: [(&str, u64, u64, u64, u64); 5] = [
+const SEAL: [(&str, u64, u32, u32, u32); 5] = [
     (
         "7b44dfdf7b432786b854eae364b0f7127a8e5cb5c299e7bacd41d7263e3bd0ed",
         11224,
