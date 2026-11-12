@@ -889,7 +889,7 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "gfx11-mqv2-prefill-projection-routes",
         predicates: &[IsRecording, CaptureMode],
-        condition: "gfx1100/gfx1151 MQ*V2 dispatchers: MMQ/IU4 at batch >= 64, BT/MW weight-reuse tiles (`mqv2_prefill_batch_tile`/`mqv2_mw_waves`, N >= 96), IU4 column-adjacent route and V2B/V2C tiles (gemm.rs:20266-20300, 20500-20540), try_gemm_*_mqv2_gfx11_reuse, MQ2V2 gfx11 routes",
+        condition: "gfx1100/gfx1151 MQ*V2 dispatchers: MMQ/IU4 at batch >= 64, BT/MW weight-reuse tiles (`mqv2_prefill_batch_tile`/`mqv2_mw_waves`, N >= 96), IU4 column-adjacent route and V2B/V2C tiles (gemm.rs:20266-20300, 20500-20540; the shared shape/flag eligibility `iu4_v2_eligible` ends in `!is_recording() && !capture_mode`), the ordinary-prefill zero-padded canonical tail of `gemm_mq4g256v2_mmq_prequant_iu4` (`canonical_tail` requires `!is_recording() && !capture_mode`, so a recorded/captured partial column tile keeps the incumbent partial-N route), try_gemm_*_mqv2_gfx11_reuse, MQ2V2 gfx11 routes",
         effect: KernelSelection,
         switches: "eager: MMQ/IU4/BT/MW/column kernels; recorded: base `*_mq4g256v2_wmma` or the row-major IU4 wrapper",
         kernels: &["gemm_*_mq*g256v2_*", "gemm_mq4g256v2_mmq*"],
@@ -1033,7 +1033,7 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "captured-batch-attention-physical-cap",
         predicates: &[CaptureMode],
-        condition: "`max_ctx_len = if capture_mode { kv_cache.physical_cap } else { logical_max_ctx }` (qwen35 prefill.rs forward_batch_chunk_impl; llama.rs forward_prefill_chunk), feeding the batched Q8 and fp8 attend crossover `max_ctx_len <= 4096` on gfx1200/gfx1201 (hipfire-dispatch families/attention.rs `AttnQ8_0KvBatchedMasked` / `AttnFp8E4m3KvBatchedMasked`) for every attend except DFlash chain-verify blocks (`DflashFusionCtx::ChainVerify`), which never take the crossover (`DispatchCtx::verify_tile_attend`; see captured-verify-attention-physical-cap); MTP verify keeps the crossover",
+        condition: "`max_ctx_len = if capture_mode { kv_cache.physical_cap } else { logical_max_ctx }` (qwen35 prefill.rs forward_batch_chunk_body; llama.rs forward_prefill_chunk), feeding the batched Q8 and fp8 attend crossover `max_ctx_len <= 4096` on gfx1200/gfx1201 (hipfire-dispatch families/attention.rs `AttnQ8_0KvBatchedMasked` / `AttnFp8E4m3KvBatchedMasked`) for every attend except DFlash chain-verify blocks (`DflashFusionCtx::ChainVerify`), which never take the crossover (`DispatchCtx::verify_tile_attend`; see captured-verify-attention-physical-cap); MTP verify keeps the crossover",
         effect: KernelSelection,
         switches: "captured: attention sized by physical_cap (attention_flash_{q8_0,fp8_e4m3}_tile_batched when physical_cap > 4096); recorded or eager: sized by the logical context (attention_{q8_0,fp8_e4m3}_kv_batched at ctx <= 4096) and a logical `max_ctx_len` kernarg",
         kernels: &["attention_q8_0_kv_batched*", "attention_fp8_e4m3_kv_batched*", "attention_flash_q8_0_tile_batched*", "attention_flash_fp8_e4m3_tile_batched*", "attention_flash_asym_reduce_batched*"],
@@ -1044,7 +1044,7 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "captured-verify-attention-physical-cap",
         predicates: &[CaptureMode],
-        condition: "the same `max_ctx_len = physical_cap` under capture (qwen35 prefill.rs forward_batch_chunk_impl) for DFlash chain-verify blocks (`DflashFusionCtx::ChainVerify`, `DispatchCtx::verify_tile_attend`), which on gfx1200/gfx1201 skip the LDS crossover in both batched attend arms and always run the tile + reduce (hipfire-dispatch families/attention.rs); MTP verify is not captured and keeps the crossover",
+        condition: "the same `max_ctx_len = physical_cap` under capture (qwen35 prefill.rs forward_batch_chunk_body) for DFlash chain-verify blocks (`DflashFusionCtx::ChainVerify`, `DispatchCtx::verify_tile_attend`), which on gfx1200/gfx1201 skip the LDS crossover in both batched attend arms and always run the tile + reduce (hipfire-dispatch families/attention.rs); MTP verify is not captured and keeps the crossover",
         effect: LaunchShape,
         switches: "captured: tile + reduce (gfx1201: the VerifyAttn twin try_attention_verify_gqa) with max_tiles = ceil(physical_cap / tile) and its split count; eager or recorded: the same kernels with max_tiles from the logical context",
         kernels: &["attention_flash_fp8_e4m3_tile_batched*", "attention_flash_q8_0_tile_batched*", "attention_flash_asym_reduce_batched*", "attention_verify_gqa*"],
@@ -1055,12 +1055,23 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "gdn-chunk-scan",
         predicates: &[IsRecording, CaptureMode],
-        condition: "gdn_chunk_scan admission in forward_batch_chunk_impl, two routes sharing the same recording clauses. Dense (`gdn_chunk_scan_common_admitted`): gfx12_gdn_chunk_scan && MQ4V2 dense && Q8 state && sequential, no tree/tape/hidden ring/fusion && !capture_mode && !is_recording() && gdn_chunk_scan_rows_admitted(n, commit_stride) (prefill.rs:17263-17351). Default-resolved MoE (`gdn_moe_chunk_scan_common_admitted`, GdnMoeChunkScanInputs; explicit HIPFIRE_GDN_MOE_CHUNK_SCAN wins, unset follows the prefill route capabilities): `capable` = gfx12_gdn_chunk_scan && gfx1201 && !fp8_verify_scope && !capture_mode && !is_recording(), plus supported head geometry, Q8 state, sequential, no tree/tape and the plain-forward clauses, then a per-layer projection-dtype gate (prefill.rs:16639-16670, 16800-16809; gdn_moe_chunk_scan_layer_admitted:13173)",
+        condition: "gdn_chunk_scan admission, resolved once per prefix in qwen35 prefill.rs `resolve_gdn_stream_plans` (called by `provision_gdn_stream`, never per chunk; the per-chunk `gdn_chunk_scan_common_admitted` of forward_batch_chunk_impl no longer exists), two routes sharing the same recording clauses. Dense (`gdn_dense_scan_static_admitted`): gfx12_gdn_chunk_scan && !fp8_verify_scope && gfx1100/gfx1151/gfx1201 && non-MoE Qwen3.5 GDN geometry (16 key / 48 value heads, head dim 128, conv kernel 4) && an MQ3 wide route or all-MQ4V2 dense layers with an admitted qkvza producer && complete Q8 state && !capture_mode && !is_recording(). Default-resolved MoE (`GdnMoeChunkScanInputs`; explicit HIPFIRE_GDN_MOE_CHUNK_SCAN wins, unset follows the prefill route capabilities): `capable` = gfx12_gdn_chunk_scan && gfx1201 && !fp8_verify_scope && !capture_mode && !is_recording(), plus supported head geometry and Q8 state, then a per-layer projection-dtype gate (`gdn_moe_chunk_scan_layer_admitted`). The result is each layer's `GdnLayerDesc::scan64_admitted`",
         effect: KernelSelection,
-        switches: "eager: chunked GatedDeltaNet scan (dense MQ4V2 layers, and DeltaNetMoe layers when the MoE route is admitted); recorded or captured: per-token GDN",
+        switches: "eager: scan64_admitted layers plan `GdnScanAlgorithm::Scan64` (F16 scan operand); recorded or captured: scan64_admitted is false and the plan is `GdnScanAlgorithm::Sequential` (F32 scan operand) (rdna-compute prefill_invariant.rs)",
         kernels: &[],
         verdict: NotEquivalent,
-        evidence: "different recurrence evaluation order; no byte-exact oracle. Reaches no default program: both routes need gdn_tape None (the DFlash verify carries a GDN tape), the MoE route also needs a plain forward (no DFlash fusion, hidden-ring capture, band, max_layer, routed_out or mask override), and prefill never records into a Redline tape or captures a graph on this path",
+        evidence: "different recurrence evaluation order; no byte-exact oracle. Reaches no default program: both routes are resolved for an ordinary-prefill state and recording or capture is never active on that path",
+        reaches: &[],
+    },
+    Decision {
+        id: "canonical-gdn-stream-eager-only",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "the canonical ordinary-prefill GDN stream and its plain-forward gate are eager-only: `ordinary_prefill_forward` (qwen35 prefill.rs; sequential, no tree/tape/fusion, band, max_layer, routed_out or mask override and !capture_mode && !is_recording() && !fp8_verify_scope && !iu4_verify_scope) feeds `with_gdn_forward` in forward_batch_chunk_impl and forward_prefill_chunk_pair_body; `gdn_dense_stream_route` and `gdn_wy_stream_route` (hipfire-dispatch pipeline/layer_ops.rs) each end in `&& !gpu.replay.is_recording() && !gpu.graphs.capture_mode` after the carry/stream, geometry and static-admission clauses; rdna-compute `fn_gdn_dense::applies_edge` ends in the same two clauses; `gdn_wy_stream_append` returns `wrong_shape()` when `replay.is_recording() || graphs.capture_mode`, as does `gdn_wy_stream_seal` for a not-yet-sealed stream; `Gpu::gdn_input_arith` (prefill_invariant.rs) computes `eager = !is_recording() && !capture_mode && k % 256 == 0` and reports the F16_WMMA arithmetic code instead of IU4/FP8/MMQ when not eager",
+        effect: KernelSelection,
+        switches: "eager: the canonical stream routes (dense Scan64 append, WY append/seal, edge executor) and ordinary-prefill-only recipes; recorded or captured: the route predicates are false and the call keeps the incumbent route (the layer_ops.rs doc: recorder/capture runs keep the incumbent route), the direct append/seal entry points return an error before any launch, and `gdn_input_arith` reports F16_WMMA",
+        kernels: &[],
+        verdict: NotEquivalent,
+        evidence: "different route (stream vs incumbent recurrence); no byte-exact oracle is cited. Reaches no default program: ordinary prefill is a plain sequential forward and the recorder/capture branches are the same clauses inventoried under gdn-chunk-scan",
         reaches: &[],
     },
     Decision {
@@ -1592,7 +1603,7 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "vl-batched-prefill-capture-refusal",
         predicates: &[IsRecording, CaptureMode],
-        condition: "Qwen3.5/3.8 batched image-token prefill (qwen35 vl_prefill.rs `vl_batched_prefill_admitted`, evaluated by generate_vl before any prefill work, and `ChunkRoute::refusal`, whose `capturing` input is `gpu.graphs.capture_mode || gpu.replay.is_recording()` in forward_batch_chunk_impl before any scratch, KV or recurrent write): a VL prompt refuses the batched route when HIP graph capture or Redline recording is active",
+        condition: "Qwen3.5/3.8 batched image-token prefill (qwen35 vl_prefill.rs `vl_batched_prefill_admitted`, evaluated by generate_vl before any prefill work, and `ChunkRoute::refusal`, whose `capturing` input is `gpu.graphs.capture_mode || gpu.replay.is_recording()` in forward_batch_chunk_body before any scratch, KV or recurrent write): a VL prompt refuses the batched route when HIP graph capture or Redline recording is active",
         effect: Refusal,
         switches: "outside capture and recording: the image prompt prefills in batched chunks (tower embeddings spliced over the image-pad rows, batched M-RoPE); under capture or recording: the batched route is refused up front and generate_vl falls back to the per-token VL prefill path (forward_scratch_embed_mrope)",
         kernels: &[],
@@ -2187,15 +2198,74 @@ pub const SITES: &[Site] = &[
     },
     Site {
         file: "hipfire-arch-qwen35/src/qwen35/prefill.rs",
-        function: "forward_batch_chunk_impl",
-        occurrences: 10,
+        function: "forward_batch_chunk_body",
+        occurrences: 6,
         decisions: &[
             "q8-multirow-verify-attention",
             "captured-batch-attention-physical-cap",
             "captured-verify-attention-physical-cap",
-            "gdn-chunk-scan",
             "vl-batched-prefill-capture-refusal",
         ],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/qwen35/prefill.rs",
+        function: "gdn_dense_scan_static_admitted",
+        occurrences: 2,
+        decisions: &["gdn-chunk-scan"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/qwen35/prefill.rs",
+        function: "resolve_gdn_stream_plans",
+        occurrences: 2,
+        decisions: &["gdn-chunk-scan"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/qwen35/prefill.rs",
+        function: "ordinary_prefill_forward",
+        occurrences: 2,
+        decisions: &["canonical-gdn-stream-eager-only"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/batched_attention.rs",
+        function: "batch_chunk_fa_attend_canonical_fp8q",
+        occurrences: 2,
+        decisions: &["kv-tier-capture-forces-flash"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/layer_ops.rs",
+        function: "gdn_dense_stream_route",
+        occurrences: 2,
+        decisions: &["canonical-gdn-stream-eager-only"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/layer_ops.rs",
+        function: "gdn_wy_stream_route",
+        occurrences: 2,
+        decisions: &["canonical-gdn-stream-eager-only"],
+    },
+    Site {
+        file: "rdna-compute/src/fn_gdn_dense.rs",
+        function: "applies_edge",
+        occurrences: 2,
+        decisions: &["canonical-gdn-stream-eager-only"],
+    },
+    Site {
+        file: "rdna-compute/src/gdn_wy_stream.rs",
+        function: "gdn_wy_stream_append",
+        occurrences: 2,
+        decisions: &["canonical-gdn-stream-eager-only"],
+    },
+    Site {
+        file: "rdna-compute/src/gdn_wy_stream.rs",
+        function: "gdn_wy_stream_seal",
+        occurrences: 2,
+        decisions: &["canonical-gdn-stream-eager-only"],
+    },
+    Site {
+        file: "rdna-compute/src/prefill_invariant.rs",
+        function: "gdn_input_arith",
+        occurrences: 2,
+        decisions: &["canonical-gdn-stream-eager-only"],
     },
     Site {
         file: "hipfire-arch-qwen35/src/qwen35/prefill.rs",
@@ -2205,7 +2275,7 @@ pub const SITES: &[Site] = &[
     },
     Site {
         file: "hipfire-arch-qwen35/src/qwen35/prefill.rs",
-        function: "forward_prefill_chunk_pair",
+        function: "forward_prefill_chunk_pair_body",
         occurrences: 2,
         decisions: &["q8-multirow-verify-attention"],
     },
@@ -3381,7 +3451,7 @@ pub const SITES: &[Site] = &[
     Site {
         file: "rdna-compute/src/gemm.rs",
         function: "gemm_mq4g256v2_mmq_prequant_iu4",
-        occurrences: 2,
+        occurrences: 4,
         decisions: &["gfx11-mqv2-prefill-projection-routes"],
     },
     Site {
@@ -3521,7 +3591,7 @@ pub const SITES: &[Site] = &[
     },
     Site {
         file: "rdna-compute/src/gemm.rs",
-        function: "iu4_v2_tile",
+        function: "iu4_v2_eligible",
         occurrences: 2,
         decisions: &["gfx11-mqv2-prefill-projection-routes"],
     },
