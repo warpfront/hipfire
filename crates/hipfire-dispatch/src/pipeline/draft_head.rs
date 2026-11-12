@@ -15,6 +15,7 @@ use crate::families::gemv::WeightRef;
 use crate::types::DispatchError;
 use hip_bridge::DeviceBuffer;
 use rdna_compute::gemv::{TOPK8_GROUPS, TOPK8_ROWS_MAX};
+use rdna_compute::tensor_ops::{copy_regions, CopyRegion};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use smallvec::SmallVec;
 use std::ffi::c_void;
@@ -705,6 +706,34 @@ impl DraftHead {
                                 at += take;
                             }
                         }
+                        continue;
+                    }
+                    if self.partial.is_none() && gpu.flags.qwen4_draft_glue_fold_enabled() {
+                        // `HIPFIRE_QWEN4_DRAFT_GLUE_FOLD`: no re-score, so a row's result is the
+                        // argmax index alone (word 0 of its slot). ONE `argmax_f32` launch over
+                        // the class's contiguous logits rows (a block per row, the one-row
+                        // launch's body and tie rule) lands the indices in the head's scratch;
+                        // ONE `copy_regions_u32` moves word `i` to word 0 of member `i`'s slot.
+                        // Every other word of a slot stays as the one-row launches leave it.
+                        let x = logits_rows.sub_offset(0, count * ranked);
+                        let indices = self.top1.sub_offset(0, count * std::mem::size_of::<i32>());
+                        execute_argmax(gpu, &x, &indices, count, ranked)?;
+                        let outs: SmallVec<[GpuTensor; 8]> = members
+                            .iter()
+                            .map(|&row| top1_out.sub_offset(row * slot, std::mem::size_of::<i32>()))
+                            .collect();
+                        let regions: SmallVec<[CopyRegion<'_>; 8]> = outs
+                            .iter()
+                            .enumerate()
+                            .map(|(i, out)| CopyRegion {
+                                dst: &out.buf,
+                                dst_offset: 0,
+                                src: &indices.buf,
+                                src_offset: i * std::mem::size_of::<i32>(),
+                                bytes: std::mem::size_of::<i32>(),
+                            })
+                            .collect();
+                        hip(copy_regions(gpu, &regions))?;
                         continue;
                     }
                     for (slot_in_batch, &row) in members.iter().enumerate() {

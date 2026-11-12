@@ -9,9 +9,9 @@
 //! projections, the HC reads and writes, the MoE with one EP row gather, the
 //! final HC read, the draft head) run once over `n` rows; the stateful core
 //! (the indexed attention over each lane's own head arena) runs once per lane
-//! on that lane's row, and on exact gfx1201 the attention's Q8_0 input and
-//! output projections run once over the `n` rows around those cores
-//! ([`projection_batch`]). Each lane keeps its own [`MtpGpuState`] and draft
+//! on that lane's row, and on exact gfx1201 (Q8_0) and exact gfx942 (BF16) the
+//! attention's input and output projections run once over the `n` rows around
+//! those cores ([`projection_batch`]). Each lane keeps its own [`MtpGpuState`] and draft
 //! request state; row `i` of every row stage is the one-token step of lane
 //! `i`, so the per-lane bytes equal `n` serial `forward_token_deferred`
 //! calls (proved per round by the lab oracle).
@@ -51,23 +51,32 @@ const MTP_DRAFT_PROJ_BATCH_ENV: &str = "HIPFIRE_QWEN4_MTP_DRAFT_PROJ_BATCH";
 /// Whether a batched round of `n` lanes splits the indexed attention into ONE
 /// input projection over the `n` rows, each lane's core (its own positions,
 /// K/V cache, pool and selection, one row) and ONE output projection over the
-/// `n` rows, instead of one whole op per lane. Exact gfx1201 with every QSA
-/// projection Q8_0 on the few-row route only: there the `n`-row launches are
-/// `gemv_q8_0_rows_exact` (each row bitwise the rows == 1 `gemv_q8_0` the
-/// whole op launches, weights read once per call); anything else keeps the
-/// whole ops.
+/// `n` rows, instead of one whole op per lane. Two routes qualify:
+/// - exact gfx1201 with every QSA projection Q8_0 on the few-row route: the `n`-row launches
+///   are `gemv_q8_0_rows_exact` (each row bitwise the rows == 1 `gemv_q8_0` the whole op
+///   launches, weights read once per call);
+/// - exact gfx942 with every QSA projection BF16 and `n <= 16`: the `n`-row launches are the
+///   MFMA `gemm_bf16_mfma_gfx942_rows16` (one fixed-order K walk per activation row, so each
+///   row is bitwise the rows == 1 launch the whole op makes;
+///   [`g942_bf16_few_rows_invariant`] is false only under `HIPFIRE_G942_TRUNK_GEMV=1`, whose
+///   one-row GEMV arm differs).
+///
+/// Anything else keeps the whole ops.
 fn projection_batch(gpu: &Gpu, qsa: &Qwen4QsaWeights<'_>, n: usize) -> bool {
     use rdna_compute::gemv::{q8_0_rows_exact_route, Q8RowsExactRoute};
-    n >= 2
-        && gpu.arch_caps.is_gfx1201()
-        && (2..=gpu.few_row_limit()).contains(&gpu.route_rows(n))
-        && [&qsa.indexer_qk, &qsa.q, &qsa.k, &qsa.v, &qsa.output]
-            .iter()
-            .all(|w| {
+    let weights = [&qsa.indexer_qk, &qsa.q, &qsa.k, &qsa.v, &qsa.output];
+    let route = if gpu.arch_caps.is_gfx1201() {
+        (2..=gpu.few_row_limit()).contains(&gpu.route_rows(n))
+            && weights.iter().all(|w| {
                 w.dtype == DType::Q8_0
                     && q8_0_rows_exact_route(&gpu.arch, w.k) != Q8RowsExactRoute::PerRowSingleton
             })
-        && hipfire_config::developer_bool(MTP_DRAFT_PROJ_BATCH_ENV, true)
+    } else {
+        g942_bf16_few_rows_invariant(gpu)
+            && n <= 16
+            && weights.iter().all(|w| w.dtype == DType::BF16)
+    };
+    n >= 2 && route && hipfire_config::developer_bool(MTP_DRAFT_PROJ_BATCH_ENV, true)
 }
 
 /// One drafting lane of a batched head round: the lane's own head arena and

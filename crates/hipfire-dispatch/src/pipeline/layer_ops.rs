@@ -1319,6 +1319,15 @@ fn g942_trunk_gemv() -> bool {
     *OPT_OUT
 }
 
+/// Whether a BF16-weight projection on this device is bitwise independent of its batch rows
+/// between one row and a few rows (up to 16): exact gfx942 on the MFMA trunk route
+/// ([`g942_trunk_mfma_route`]), i.e. unless `HIPFIRE_G942_TRUNK_GEMV=1` keeps the legacy GEMV
+/// arm at one row. Callers that run one op over `n` lanes' rows in place of `n` one-row ops
+/// (batched MTP head rounds) ask this before relying on that.
+pub fn g942_bf16_few_rows_invariant(gpu: &Gpu) -> bool {
+    gpu.arch_caps.is_gfx942() && !g942_trunk_gemv()
+}
+
 /// `HIPFIRE_G942_ROWS16_CHAIN` (read once, default on; `=0` kills): on gfx942,
 /// a BF16 projection of more than 16 rows takes ⌈rows/16⌉ chained few-row
 /// launches instead of the 32-row-tile entry while the shape's
