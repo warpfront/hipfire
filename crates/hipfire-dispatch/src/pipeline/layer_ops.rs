@@ -4606,14 +4606,16 @@ fn execute_gated_delta_net_hc_impl(
         // The dense C64 stream appends the rows at absolute tile/seam positions and publishes
         // exactly them (BF16 scan output in `recurrent_output`, gated below like the
         // incumbent dense route); the live slot is quantized only at an absolute 512 seam or
-        // the explicit seal.
+        // the explicit seal. A Sealed cursor is wherever the last prefill left it (decode
+        // does not advance it): the call's start restamps it, like the WY executor opening a
+        // Sealed stream at `start`; an Open cursor must already be at the start.
         #[cfg(feature = "deltanet")]
         if let (true, Some(view)) = (dense_stream, op.carry.as_ref()) {
             if let GdnEdgeView::Scan64 { consts, ws, plan } = view.edge {
                 let next = hip(rdna_compute::fn_gdn_dense::stream_append(
                     gpu,
                     plan,
-                    &view.carry.meta.get(),
+                    &view.carry.meta.get().begin_append_at(dims.position as u64),
                     dims.position as u64,
                     rows,
                     op.key_heads,

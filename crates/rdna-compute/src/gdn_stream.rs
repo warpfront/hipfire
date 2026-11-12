@@ -145,6 +145,25 @@ impl GdnStreamMeta {
             owner_generation,
         }
     }
+
+    /// This cursor at the start of an ordinary-prefill append at absolute `start_pos`.
+    /// Decode/verify own a `Sealed` live slot and do not maintain the cursor, so a
+    /// Sealed one is restamped at `start_pos` (a genuine decode/seal -> prefill boundary,
+    /// `phase_start = start_pos`). An `Open` cursor is returned unchanged: it must already
+    /// be at `start_pos`, which the append schedule checks.
+    pub fn begin_append_at(self, start_pos: u64) -> Self {
+        match self.phase {
+            GdnStreamPhase::Open => self,
+            GdnStreamPhase::Sealed => Self {
+                position: start_pos,
+                phase_start: start_pos,
+                frame_base: start_pos,
+                tile_base: start_pos,
+                pending_rows: 0,
+                ..self
+            },
+        }
+    }
 }
 
 /// Geometry of a per-layer persistent carry (§5): FP32 tile-entry state,
@@ -585,5 +604,26 @@ mod tests {
         m.pending_rows = 11;
         assert!(GdnAppendSchedule::new(&m, 10, 1, 64, 512).is_err());
         assert!(GdnAppendSchedule::new(&open_at(0), 0, 0, 64, 512).is_err());
+    }
+
+    #[test]
+    fn begin_append_restamps_a_sealed_cursor_left_behind_by_decode() {
+        // Turn 1 prefilled 42 rows and sealed; decode then advanced the live slot to 499
+        // without touching the cursor. The second turn starts at 499.
+        let first = GdnAppendSchedule::new(&open_at(0), 0, 42, 64, 512).unwrap().meta;
+        let sealed = GdnStreamMeta { phase: GdnStreamPhase::Sealed, ..first };
+        assert!(GdnAppendSchedule::new(&sealed, 499, 30, 64, 512).is_err());
+        let begun = sealed.begin_append_at(499);
+        assert_eq!(
+            (begun.position, begun.phase_start, begun.frame_base, begun.tile_base, begun.pending_rows),
+            (499, 499, 499, 499, 0)
+        );
+        assert_eq!((begun.recipe_id, begun.owner_generation), (sealed.recipe_id, sealed.owner_generation));
+        let s = GdnAppendSchedule::new(&begun, 499, 30, 64, 512).unwrap();
+        assert!(s.head && s.head_pending == 0 && s.head_new == 13 && s.head_complete);
+        // An Open cursor is never moved: a mismatched start stays refused.
+        let open = GdnAppendSchedule::new(&open_at(0), 0, 10, 64, 512).unwrap().meta;
+        assert_eq!(open.begin_append_at(499), open);
+        assert!(GdnAppendSchedule::new(&open.begin_append_at(499), 499, 1, 64, 512).is_err());
     }
 }

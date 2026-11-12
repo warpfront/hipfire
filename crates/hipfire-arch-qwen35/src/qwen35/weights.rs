@@ -3730,12 +3730,10 @@ impl GdnStreamOwner {
         let generation = self.generation;
         for m in &mut self.meta {
             if m.phase == GdnStreamPhase::Sealed {
-                m.position = start_pos;
-                m.phase_start = start_pos;
-                m.frame_base = start_pos;
-                m.tile_base = start_pos;
-                m.pending_rows = 0;
-                m.owner_generation = generation;
+                *m = GdnStreamMeta {
+                    owner_generation: generation,
+                    ..m.begin_append_at(start_pos)
+                };
             }
         }
         Ok(())

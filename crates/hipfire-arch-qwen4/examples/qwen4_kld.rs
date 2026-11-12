@@ -2267,7 +2267,12 @@ fn chunklogits(
 /// the snapshot, finish again (B): A == B byte for byte; (2) the session API: a turn-end token
 /// at `p - 1` makes `p` a session boundary captured MID-prefill (the stream is Open there); a
 /// second prompt sharing exactly that prefix restores the pooled snapshot (`session_plan` ==
-/// `p`) and continues: its final logits equal a cold prefill of the same prompt byte for byte.
+/// `p`) and continues: its final logits equal a cold prefill of the same prompt byte for byte;
+/// (3) multi-turn: prefill `ids[..p]` (sealed at the prompt end), decode `MULTI_TURN_DECODE`
+/// teacher-forced tokens, then prefill the rest as a second turn (the serve route,
+/// `prefill_final` reusing the live prefix) and again split into two calls at an off-grid
+/// row: both succeed and agree byte for byte (a Sealed cursor left behind by decode starts
+/// the second turn's stream at its real position).
 fn g2(
     model: &Path,
     prompts: &[PathBuf],
@@ -2338,6 +2343,51 @@ fn g2(
             let arena_ok = a == b;
             println!("G2 prompt={pi} cut={p} arena_snapshot_restore_identical={arena_ok} sha256={}", sha(&b));
 
+            // (3) second prefill after decode, whole vs split second turn.
+            let turn2 = p + MULTI_TURN_DECODE;
+            if turn2 + MULTI_TURN_SPLIT + 1 > n {
+                return Err(format!("cut {p} leaves no second turn ({} tokens)", n));
+            }
+            let multi = |m: &mut Model, split: bool| -> Result<Vec<f32>, String> {
+                m.bundle.reset(&mut m.gpu).map_err(|e| e.to_string())?;
+                m.bundle
+                    .prefill_final(&mut m.gpu, &base[..p], 0, &row)
+                    .map_err(|e| format!("g2 multi-turn first prefill: {e}"))?;
+                for &token in &base[p..turn2] {
+                    m.bundle
+                        .forward_token(&mut m.gpu, token, &row, None)
+                        .map_err(|e| format!("g2 multi-turn decode: {e}"))?;
+                }
+                if split {
+                    let mid = turn2 + MULTI_TURN_SPLIT;
+                    m.bundle
+                        .forward_chunk_final(&mut m.gpu, &base[turn2..mid], &row, None)
+                        .map_err(|e| format!("g2 multi-turn second prefill head: {e}"))?;
+                    m.bundle
+                        .forward_chunk_final(&mut m.gpu, &base[mid..n], &row, None)
+                        .map_err(|e| format!("g2 multi-turn second prefill tail: {e}"))?;
+                } else {
+                    m.bundle
+                        .prefill_final(&mut m.gpu, &base[..n], turn2, &row)
+                        .map_err(|e| format!("g2 multi-turn second prefill: {e}"))?;
+                }
+                m.gpu.download_f32(&row).map_err(|e| e.to_string())
+            };
+            let (whole, split) = match (multi(&mut m, false), multi(&mut m, true)) {
+                (Ok(w), Ok(s)) => (Some(w), Some(s)),
+                (w, s) => {
+                    for e in [w.err(), s.err()].into_iter().flatten() {
+                        println!("G2 prompt={pi} cut={p} multi_turn_error={e}");
+                    }
+                    (None, None)
+                }
+            };
+            let multi_ok = whole.is_some() && whole == split;
+            println!(
+                "G2 prompt={pi} cut={p} multi_turn_decode={MULTI_TURN_DECODE} multi_turn_ok={multi_ok} sha256={}",
+                whole.as_deref().map(sha).unwrap_or_default()
+            );
+
             // (2) session API: boundary at p captured mid-prefill, restored by a second prompt.
             let mut first = base.clone();
             first[p - 1] = turn_end;
@@ -2368,20 +2418,21 @@ fn g2(
                 sha(&cold),
                 sha(&restored)
             );
-            if !(arena_ok && session_ok) {
+            if !(arena_ok && session_ok && multi_ok) {
                 failures += 1;
             }
             cells.push(serde_json::json!({
                 "prompt": pi, "cut": p, "tokens": n,
                 "arena_snapshot_restore_identical": arena_ok,
                 "session_reused": reused, "session_restore_identical": cold == restored,
+                "multi_turn_identical": multi_ok,
             }));
             m.bundle.set_turn_snapshots(false);
             m.bundle.session_clear(&mut m.gpu);
         }
     }
     let receipt = serde_json::json!({
-        "schema": "hipfire.qwen4.g2.v1", "model": model.display().to_string(),
+        "schema": "hipfire.qwen4.g2.v2", "model": model.display().to_string(),
         "arch": m.gpu.arch.to_string(), "max_prompt": max_prompt, "failures": failures, "cells": cells,
     });
     std::fs::write(output.join("receipt.json"), serde_json::to_string_pretty(&receipt).map_err(|e| e.to_string())? + "\n")
@@ -2392,6 +2443,12 @@ fn g2(
     }
     Ok(())
 }
+
+/// Teacher-forced decode steps between the two turns of G2's multi-turn leg (odd: the
+/// second turn starts off the 64-row tile grid).
+const MULTI_TURN_DECODE: usize = 7;
+/// Rows of the second turn's first call in the split arm (off-grid).
+const MULTI_TURN_SPLIT: usize = 37;
 
 /// Little-endian f64 rows of a 1-D `.npy` as `write_kl_npy` writes them.
 fn read_kl_npy(path: &Path) -> Result<Vec<f64>, String> {

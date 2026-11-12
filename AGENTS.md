@@ -688,7 +688,10 @@ build commit `40c52c783a` (branch `canon-cand`), `eval_hipfire` md5
 `/home/kaden/qcal/release-0.5.0/reliability/chunkfix/runs-canon/G4/` (`base/`,
 `cand/`, `cand/paired-*.json`). The gfx942 rows are unchanged: the candidate
 `qwen4_kld` (commit `8842531d0e`, md5 `d7b5741db5590851c0362c22d0e75a0a`)
-reproduces both pinned sequences byte for byte.
+reproduces both pinned sequences byte for byte. The gfx1100 and gfx1151 rows
+round to the same KLD (means agree to about 9 digits: the canonical route gives
+both gfx11 archs the same arithmetic) but are distinct sequences from distinct
+devices; their `.kldseq` hashes differ.
 
 Previous (pre-canonical) RDNA pins, KLD / `.kldseq` SHA-256 in the row order of
 the table: gfx1201 A4 `0.069571 / 0.052119`
