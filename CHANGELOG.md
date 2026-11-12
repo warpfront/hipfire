@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Perf (exact gfx1100, dense Qwen3.8 B16 greedy selector): overlap the existing DeltaNet snapshot with CPU candidate scoring.** Retains beta's batched selector readback, penalties and device-wait error checks; no new HIP kernel or resident GPU buffers. `HIPFIRE_GFX1100_DFLASH_SNAPSHOT_OVERLAP=0` restores the previous timing; stale tables retain synchronous save and excluded capture/recording/PM4 routes remain unchanged. W7900 Dual Slot/HIP7.15 measurements on beta `f453d10da` plus this patch: top-K-to-target handoff1025.30->737.23us (-28.10%, snapshot kernel unchanged); five EOS-complete long-decode scenes,6 fresh loads per arm, median throughput changes0.00%..+0.56% with identical decoded outputs/workloads. Snake's load-bootstrap interval includes zero; Story largely retires to AR. Hard30 accuracy14/30 in both arms with30/30 decoded-output/workload pairs matching. These are versioned f453 results, not a new performance measurement of the conflict-resolution port.
+
 - PeaceMaker RDNA: pin a named SOP1 XML-condition override table to all three source hashes, with per-row LLVM register, inline and literal byte-round-trip evidence. Preserve the malformed source condition; exhaustively prove all 256 selectors for restricted operand domains instead of disabling valid register forms along with invalid inline/literal forms.
 - PeaceMaker RDNA: carry full instruction/encoding/condition/ordinal keys through IR construction and RDNA consumers, and add an XML-layout field codec backed by generated runtime rows. Preserve named graphics refusals and refuse unqualified XML variants in the numeric emulator.
 

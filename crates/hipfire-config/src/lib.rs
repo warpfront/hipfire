@@ -3066,6 +3066,15 @@ pub static FIELDS: &[ConfigField] = &[
         "Use the Q8 FA2 split-KV VerifyAttn route by default on exact gfx1100 inside the existing dense H24/KV4/HD256 long-context VMM-KV envelope (false or HIPFIRE_GFX1100_FA2_SPLIT_VERIFY=0 restores the established VerifyAttn/R4-R8/batched route). The independent parent kernel.verify_attn=false / HIPFIRE_VERIFY_ATTN=0 also opts out. Other architectures remain off."
     ),
     process_bool_field!(
+        "kernel.gfx1100_dflash_snapshot_overlap",
+        "gfx1100_dflash_snapshot_overlap",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_GFX1100_DFLASH_SNAPSHOT_OVERLAP",
+        "Overlap the existing DN bulk snapshot with CPU candidate scoring for the validated dense Qwen3.8 B16 greedy selector on exact gfx1100. No new resident buffers; stale bulk tables retain the synchronous save. False or HIPFIRE_GFX1100_DFLASH_SNAPSHOT_OVERLAP=0 restores original timing; admitted PM4, capture and other architectures retain the incumbent path."
+    ),
+    process_bool_field!(
         "kernel.gfx12_fa_prep_fused",
         "gfx12_fa_prep_fused",
         Kernel,

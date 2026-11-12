@@ -839,6 +839,9 @@ pub struct FeatureFlags {
     /// inside its existing VMM-KV admission envelope. This switch and the
     /// stable [`Self::verify_attn`] parent are independent opt-outs.
     pub gfx1100_fa2_split_verify: bool,
+    /// Guarded DN snapshot/CPU-scoring overlap, default on exact gfx1100.
+    /// `HIPFIRE_GFX1100_DFLASH_SNAPSHOT_OVERLAP=0` restores original timing.
+    pub gfx1100_dflash_snapshot_overlap: bool,
     /// `HIPFIRE_GFX1100_WMMA_VERIFY_ATTN` routes the exact-gfx1100 admitted
     /// multi-row Q8 verify attention (1..=8 rows, H24/KV4/HD256, plain Q8 K
     /// and V) to the WMMA split-K kernel (`attention_wmma_verify.rs`) ahead of
@@ -1688,6 +1691,8 @@ impl FeatureFlags {
             verify_attn: parse_bool("HIPFIRE_VERIFY_ATTN")
                 .unwrap_or(matches!(arch, "gfx1201" | "gfx1100" | "gfx1151")),
             gfx1100_fa2_split_verify: parse_bool("HIPFIRE_GFX1100_FA2_SPLIT_VERIFY")
+                .unwrap_or(arch == "gfx1100"),
+            gfx1100_dflash_snapshot_overlap: parse_bool("HIPFIRE_GFX1100_DFLASH_SNAPSHOT_OVERLAP")
                 .unwrap_or(arch == "gfx1100"),
             gfx1100_wmma_verify_attn: parse_bool("HIPFIRE_GFX1100_WMMA_VERIFY_ATTN")
                 .unwrap_or(arch == "gfx1100"),
@@ -2690,6 +2695,7 @@ impl FeatureFlags {
             attn_qresident_v2: false,
             verify_attn: false,
             gfx1100_fa2_split_verify: false,
+            gfx1100_dflash_snapshot_overlap: false,
             gfx1100_wmma_verify_attn: false,
             gfx12_fa_prep_fused: false,
             gfx12_fa_prep_fp8q: false,
@@ -2767,6 +2773,47 @@ impl FeatureFlags {
 mod tests {
     use super::*;
     use hipfire_config::{resolve, ConfigLayer, ConfigSource, NamedLayer, ProcessConfig};
+
+    #[test]
+    fn dflash_snapshot_overlap_process_config_keeps_arch_default_and_opt_out() {
+        let default = ProcessConfig::from_resolved(&resolve([]).unwrap()).unwrap();
+        for arch in ["gfx1100", "gfx1101", "gfx1151", "gfx1201", "gfx1100:xnack-"] {
+            assert_eq!(
+                FeatureFlags::from_process_config(arch, &default).gfx1100_dflash_snapshot_overlap,
+                arch == "gfx1100"
+            );
+            for enabled in [false, true] {
+                let mut cli = ConfigLayer::default();
+                cli.set_cli(
+                    "kernel.gfx1100_dflash_snapshot_overlap",
+                    if enabled { "1" } else { "0" },
+                )
+                .unwrap();
+                let resolved = resolve([NamedLayer {
+                    source: ConfigSource::OneShot {
+                        argument: "snapshot overlap".into(),
+                    },
+                    layer: cli,
+                }])
+                .unwrap();
+                let process = ProcessConfig::from_resolved(&resolved).unwrap();
+                let decoded: ProcessConfig =
+                    serde_json::from_str(&serde_json::to_string(&process).unwrap()).unwrap();
+                decoded.validate().unwrap();
+                assert_eq!(
+                    FeatureFlags::from_process_config(arch, &decoded)
+                        .gfx1100_dflash_snapshot_overlap,
+                    enabled
+                );
+                assert_eq!(
+                    decoded
+                        .legacy_value("HIPFIRE_GFX1100_DFLASH_SNAPSHOT_OVERLAP")
+                        .as_deref(),
+                    Some(if enabled { "1" } else { "0" })
+                );
+            }
+        }
+    }
 
     #[test]
     fn qsa_extent_check_parses_only_exact_developer_modes() {
