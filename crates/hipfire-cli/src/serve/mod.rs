@@ -4341,7 +4341,7 @@ mod tests {
                 reasoning_effort_native: true,
                 reasoning_efforts: vec!["low".into(), "high".into()],
                 reasoning_effort_probe_error: Some("render failed".into()),
-                kv_mode: Some("asym3".into()),
+                kv_mode: Some("fwht3".into()),
                 kv_backend: Some("paged".into()),
                 max_seq: Some(32768),
                 ..LoadedInfo::default()

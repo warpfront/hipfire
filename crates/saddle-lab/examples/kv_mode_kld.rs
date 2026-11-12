@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Nick Woolmer
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! kv_mode_kld — asym3-vs-q8 KV-mode quality gate (SP1 Task 9, spec §13).
+//! kv_mode_kld — fwht3-vs-q8 KV-mode quality gate (SP1 Task 9, spec §13).
 //!
 //! Loads a qwen35 model ONCE, then:
 //!   1. Free-generates greedily under `--baseline` KV mode (default q8) from
@@ -11,7 +11,7 @@
 //!      "model's own generated output" the method constraint requires — not
 //!      a canned reference completion.
 //!   2. Drops the KV cache, builds a fresh one under `--candidate` mode
-//!      (default asym3), and teacher-forces the SAME sequence T (same
+//!      (default fwht3), and teacher-forces the SAME sequence T (same
 //!      tokens, same positions), recording full-vocab logits at the same
 //!      steps.
 //!   3. Computes per-step KL(baseline || candidate) and KL(candidate ||
@@ -52,7 +52,7 @@ fn main() {
     let mut max_gen: usize = 150;
     let mut max_seq: usize = 4096;
     let mut baseline_mode = "q8".to_string();
-    let mut candidate_mode = "asym3".to_string();
+    let mut candidate_mode = "fwht3".to_string();
     let mut raw_prompt = false;
     let mut prompt_parts: Vec<String> = Vec::new();
     let mut i = 3;
@@ -143,28 +143,28 @@ fn main() {
                 config.head_dim,
                 kv_seq,
             ),
-            "asym4" | "turbo4" => KvCache::new_gpu_asym4(
+            "fwht4" => KvCache::new_gpu_fwht4(
                 gpu,
                 config.n_layers,
                 config.n_kv_heads,
                 config.head_dim,
                 kv_seq,
             ),
-            "asym3" | "turbo3" | "turbo" => KvCache::new_gpu_asym3(
+            "fwht3" => KvCache::new_gpu_fwht3_filtered(
                 gpu,
-                config.n_layers,
+                &vec![true; config.n_layers],
                 config.n_kv_heads,
                 config.head_dim,
                 kv_seq,
             ),
-            "asym2" | "turbo2" => KvCache::new_gpu_asym2(
+            "fwht2" => KvCache::new_gpu_fwht2_filtered(
                 gpu,
-                config.n_layers,
+                &vec![true; config.n_layers],
                 config.n_kv_heads,
                 config.head_dim,
                 kv_seq,
             ),
-            other => panic!("unknown kv mode: {other} (q8|asym4|asym3|asym2)"),
+            other => panic!("unknown kv mode: {other} (q8|fwht4|fwht3|fwht2)"),
         }
         .unwrap()
     }

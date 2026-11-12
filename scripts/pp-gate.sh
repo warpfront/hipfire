@@ -17,7 +17,7 @@
 # Three barriers (all skipped on <2 usable GPU):
 #
 #   1. pp_parity_chatml example — per-token forward_scratch{,_multi}
-#      bit-equivalence (50 decode tokens after ChatML prefill, asym3 KV).
+#      bit-equivalence (50 decode tokens after ChatML prefill, fwht3 KV).
 #      This is the floor: if forward_scratch_multi diverges from
 #      forward_scratch even with HIPFIRE_DETERMINISTIC=1, pp=2 is broken.
 #

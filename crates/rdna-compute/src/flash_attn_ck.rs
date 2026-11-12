@@ -779,49 +779,6 @@ impl crate::Gpu {
         Ok(true)
     }
 
-    /// Try the explicit Asym3-Givens-K/Q8-V D256 prefill cell. Unsupported
-    /// shapes and sidecar failures preserve the native attention fallback.
-    #[allow(clippy::too_many_arguments)]
-    pub fn try_flash_attn_ck_asym3_givens_prefill(
-        &mut self,
-        q: &crate::GpuTensor,
-        k_cache: &crate::GpuTensor,
-        v_cache: &crate::GpuTensor,
-        output: &crate::GpuTensor,
-        cos_theta: &crate::GpuTensor,
-        sin_theta: &crate::GpuTensor,
-        seqlen_q: usize,
-        seqlen_k: usize,
-        nhead_q: usize,
-        nhead_k: usize,
-        head_dim: usize,
-        contiguous_prefix: bool,
-        has_tree_bias: bool,
-        window: usize,
-        block_start: usize,
-        block_cols: usize,
-    ) -> hip_bridge::HipResult<bool> {
-        self.try_flash_attn_ck_transformed_prefill_impl(
-            FlashAttnCkKvFormat::Asym3Givens,
-            q,
-            k_cache,
-            v_cache,
-            output,
-            cos_theta,
-            sin_theta,
-            seqlen_q,
-            seqlen_k,
-            nhead_q,
-            nhead_k,
-            head_dim,
-            contiguous_prefix,
-            has_tree_bias,
-            window,
-            block_start,
-            block_cols,
-        )
-    }
-
     /// Try the explicit Asym3-FWHT-K/Q8-V D256 prefill cell.
     #[allow(clippy::too_many_arguments)]
     pub fn try_flash_attn_ck_asym3_fwht_prefill(
@@ -851,48 +808,6 @@ impl crate::Gpu {
             output,
             signs1,
             signs2,
-            seqlen_q,
-            seqlen_k,
-            nhead_q,
-            nhead_k,
-            head_dim,
-            contiguous_prefix,
-            has_tree_bias,
-            window,
-            block_start,
-            block_cols,
-        )
-    }
-
-    /// Try the explicit Asym4-Givens-K/Q8-V D256 prefill cell.
-    #[allow(clippy::too_many_arguments)]
-    pub fn try_flash_attn_ck_asym4_givens_prefill(
-        &mut self,
-        q: &crate::GpuTensor,
-        k_cache: &crate::GpuTensor,
-        v_cache: &crate::GpuTensor,
-        output: &crate::GpuTensor,
-        cos_theta: &crate::GpuTensor,
-        sin_theta: &crate::GpuTensor,
-        seqlen_q: usize,
-        seqlen_k: usize,
-        nhead_q: usize,
-        nhead_k: usize,
-        head_dim: usize,
-        contiguous_prefix: bool,
-        has_tree_bias: bool,
-        window: usize,
-        block_start: usize,
-        block_cols: usize,
-    ) -> hip_bridge::HipResult<bool> {
-        self.try_flash_attn_ck_transformed_prefill_impl(
-            FlashAttnCkKvFormat::Asym4Givens,
-            q,
-            k_cache,
-            v_cache,
-            output,
-            cos_theta,
-            sin_theta,
             seqlen_q,
             seqlen_k,
             nhead_q,

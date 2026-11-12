@@ -459,7 +459,7 @@ for model in "${!MODEL_CELLS[@]}"; do
     # TERM it kills only the daemon process group it spawned. Any overlapping
     # physical GPU UUID produces a FATAL contention message with the holder
     # PID, regardless of HOME; the driver records the daemon's stderr for it.
-    env HIPFIRE_KV_MODE=asym3 \
+    env HIPFIRE_KV_MODE=fwht3 \
         HIPFIRE_GRAPH=1 \
         python3 scripts/agentic_gate_driver.py \
             --exe "$EXE" --model "$model" --user-file "$USER_READ" \

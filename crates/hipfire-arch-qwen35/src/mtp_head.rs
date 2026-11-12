@@ -753,18 +753,13 @@ impl Qwen35MtpHeadScratch {
 /// - **Q8**: 8-bit per-block K and V, `attention_q8_0_kv` (non-flash).
 ///   Reference: -3% perf vs F32 at K=5 per [[mtp-session-state-2026-05-15-compaction]],
 ///   externally validated by Unsloth's 76.45% Q8 hit-rate claim.
-/// - **Asym3**: 3-bit Givens-rotated K + Q8 V, `attention_flash_asym3`.
-///   Prior session v2 attempt: -9% perf vs F32 (lower attention fidelity → lower τ).
-///   Reverted in favor of Q8. Re-running with the new ±1-3% methodology
-///   to confirm/refute that delta.
 /// - **Fwht4**: 4-bit signed-FWHT-rotated K + Q8 V, `attention_flash_fwht4`.
-///   Master's feat/fwht Phase 2 bench (3.5-27B prose, dflash): Fwht3 fixes
-///   asym3 collapse (τ 1.27→3.60) and Fwht2 EXCEEDS Q8 (τ 4.08 vs 3.91).
+///   Master's feat/fwht Phase 2 bench (3.5-27B prose, dflash): Fwht3 reaches
+///   τ 3.60 and Fwht2 EXCEEDS Q8 (τ 4.08 vs 3.91).
 ///   Wired here as the MTP-head's matching test.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum MtpKvMode {
     Q8,
-    Asym3,
     Fwht4,
 }
 
@@ -772,11 +767,9 @@ impl MtpKvMode {
     pub fn parse(s: &str) -> Result<Self, String> {
         match s {
             "q8" => Ok(Self::Q8),
-            "asym3" | "turbo3" => Ok(Self::Asym3),
             "fwht4" => Ok(Self::Fwht4),
-            other => Err(format!(
-                "unknown MTP kv-mode '{other}' (expected: q8, asym3, fwht4)"
-            )),
+            other => Err(hipfire_config::removed_kv_name_error(other)
+                .unwrap_or_else(|| format!("unknown MTP kv-mode '{other}' (expected: q8, fwht4)"))),
         }
     }
 }
@@ -812,13 +805,6 @@ impl Qwen35MtpHeadKvCache {
     ) -> HipResult<Self> {
         let inner = match kv_mode {
             MtpKvMode::Q8 => hipfire_runtime::llama::KvCache::new_gpu_q8(
-                gpu,
-                /* n_layers */ 1,
-                config.n_head_kv,
-                config.head_dim,
-                config.max_seq,
-            )?,
-            MtpKvMode::Asym3 => hipfire_runtime::llama::KvCache::new_gpu_asym3(
                 gpu,
                 /* n_layers */ 1,
                 config.n_head_kv,
@@ -2073,7 +2059,6 @@ mod packed_dtype_tests {
             DType::MQ6G256V2,
         ];
         assert!(mtp_prompt_fill_uses_batched(MtpKvMode::Q8, &mqv2));
-        assert!(!mtp_prompt_fill_uses_batched(MtpKvMode::Asym3, &mqv2));
         assert!(!mtp_prompt_fill_uses_batched(MtpKvMode::Fwht4, &mqv2));
         assert!(!mtp_prompt_fill_uses_batched(
             MtpKvMode::Q8,
@@ -3182,7 +3167,7 @@ fn weight_gemm_batched_supported(dtype: DType) -> bool {
 }
 
 /// Prompt-fill may use the chunked batched path only for Q8 MTP KV and
-/// projections [`weight_gemm_batched`] can represent. Asym3/Fwht4 and
+/// projections [`weight_gemm_batched`] can represent. Fwht4 and
 /// MQ6G256-v1 keep the tokenwise GEMV / KV-write path.
 pub(crate) fn mtp_prompt_fill_uses_batched(
     kv_mode: MtpKvMode,

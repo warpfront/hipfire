@@ -638,7 +638,6 @@ accepted sets differ by carrier). Concrete modes include:
 | `q8` | Q8_0 K and V |
 | `fp8` / `bf16` | Native K+V layout (`fp8`: Qwen single-GPU; `bf16`: Qwen quality-control arm, Maple default) |
 | `fwht2` / `fwht3` / `fwht4` | FWHT-rotated K tiers + Q8 V; optional headroom modes |
-| `asym2` / `asym3` / `asym4` | **Deprecated since 0.4.0, removal in 0.5.0**: legacy Givens-rotated Lloyd K + Q8 V (fwht3 supersedes Givens asym KV). On Qwen the bare names alias `fwhtN`; the Givens constructors need `legacy-asymN` |
 
 **Qwen-family `auto` / unset** (arch-aware, Qwen only): native **fp8/fp8** on
 exact `gfx1201` single GPU when the load is native-eligible (H24/Hkv4/D256

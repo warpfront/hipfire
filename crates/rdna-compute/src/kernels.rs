@@ -9215,44 +9215,6 @@ pub const TURBO_COMMON_H: &str = include_str!("../../../kernels/src/turbo_common
 /// Givens rotation common header: 2x2 block-diagonal rotation primitives.
 pub const GIVENS_COMMON_SRC: &str = include_str!("../../../kernels/src/givens_common.h");
 
-// ── asym4 / asym3 / asym2: K at rotated-quantized + V at Q8_0 (RotorQuant planar/Q8 style) ──
-//
-// K is rotated and stored 4-bit (asym4) or 2-bit (asym2) — same byte layout
-// as givens4 / givens2 K. V is stored at Q8_0 in NORMAL (un-rotated) space.
-// Attention reads K in rotated space, V in normal space; accumulation thus
-// ends in normal space — the plain Q8_0 flash reduce works as-is.
-pub const KV_CACHE_WRITE_ASYM_K_GIVENS4_SRC: &str =
-    include_str!("../../../kernels/src/kv_cache_write_asym_k_givens4.hip");
-pub const KV_CACHE_WRITE_ASYM_K_GIVENS3_SRC: &str =
-    include_str!("../../../kernels/src/kv_cache_write_asym_k_givens3.hip");
-pub const KV_CACHE_WRITE_ASYM3_Q8_PAIR_GFX1100_SRC: &str =
-    include_str!("../../../kernels/src/kv_cache_write_asym3_q8_pair.gfx1100.hip");
-pub const KV_CACHE_WRITE_ASYM_K_GIVENS2_SRC: &str =
-    include_str!("../../../kernels/src/kv_cache_write_asym_k_givens2.hip");
-pub const ATTENTION_FLASH_ASYM4_TILE_SRC: &str =
-    include_str!("../../../kernels/src/attention_flash_asym4_tile.hip");
-pub const ATTENTION_FLASH_ASYM3_TILE_SRC: &str =
-    include_str!("../../../kernels/src/attention_flash_asym3_tile.hip");
-pub const ATTENTION_FLASH_ASYM2_TILE_SRC: &str =
-    include_str!("../../../kernels/src/attention_flash_asym2_tile.hip");
-
-// asym batched prefill variants: K rotated + V Q8 in one launch for N positions.
-pub const KV_CACHE_WRITE_ASYM_K_GIVENS4_BATCHED_SRC: &str =
-    include_str!("../../../kernels/src/kv_cache_write_asym_k_givens4_batched.hip");
-pub const KV_CACHE_WRITE_ASYM_K_GIVENS3_BATCHED_SRC: &str =
-    include_str!("../../../kernels/src/kv_cache_write_asym_k_givens3_batched.hip");
-pub const KV_CACHE_WRITE_ASYM_K_GIVENS2_BATCHED_SRC: &str =
-    include_str!("../../../kernels/src/kv_cache_write_asym_k_givens2_batched.hip");
-pub const ATTENTION_FLASH_ASYM4_TILE_BATCHED_SRC: &str =
-    include_str!("../../../kernels/src/attention_flash_asym4_tile_batched.hip");
-pub const ATTENTION_FLASH_ASYM4_WMMA_TILE_BATCHED_SRC: &str =
-    include_str!("../../../kernels/src/attention_flash_asym4_wmma_tile_batched.hip");
-pub const ATTENTION_FLASH_ASYM4_WMMA_TILE_BATCHED_GFX12_SRC: &str =
-    include_str!("../../../kernels/src/attention_flash_asym4_wmma_tile_batched.gfx12.hip");
-pub const ATTENTION_FLASH_ASYM3_TILE_BATCHED_SRC: &str =
-    include_str!("../../../kernels/src/attention_flash_asym3_tile_batched.hip");
-pub const ATTENTION_FLASH_ASYM2_TILE_BATCHED_SRC: &str =
-    include_str!("../../../kernels/src/attention_flash_asym2_tile_batched.hip");
 pub const ATTENTION_FLASH_Q8_0_TILE_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_q8_0_tile_batched.hip");
 pub const ATTENTION_FLASH_BF16_TILE_BATCHED_SRC: &str =
@@ -11445,14 +11407,6 @@ pub const GEMM_HFQ4G128_MOE_DOWN_GROUPED_WMMA_SRC: &str =
 // ─── Gemma 4 hd512 attention + KV write kernels ─────────────────────────
 // (ROPE_PARTIAL_HALVED_SRC / LOGIT_SOFTCAP_SRC already defined above.)
 
-pub const ATTENTION_FLASH_ASYM3_TILE_HD512_SRC: &str =
-    include_str!("../../../kernels/src/attention_flash_asym3_tile_hd512.hip");
-pub const ATTENTION_FLASH_ASYM3_TILE_HD512_BATCHED_SRC: &str =
-    include_str!("../../../kernels/src/attention_flash_asym3_tile_hd512_batched.hip");
-pub const KV_CACHE_WRITE_ASYM_K_GIVENS3_HD512_SRC: &str =
-    include_str!("../../../kernels/src/kv_cache_write_asym_k_givens3_hd512.hip");
-pub const KV_CACHE_WRITE_ASYM_K_GIVENS3_HD512_BATCHED_SRC: &str =
-    include_str!("../../../kernels/src/kv_cache_write_asym_k_givens3_hd512_batched.hip");
 pub const KV_CACHE_WRITE_FWHT3_HD512_SRC: &str =
     include_str!("../../../kernels/src/kv_cache_write_fwht3_hd512.hip");
 pub const KV_CACHE_WRITE_FWHT3_HD512_BATCHED_SRC: &str =
@@ -11808,9 +11762,6 @@ mod dispatch_tests {
     fn gfx1100_q8_decode_fusions_are_translation_unit_isolated() {
         assert!(!KV_CACHE_WRITE_Q8_0_SRC.contains("kv_cache_write_q8_0_pair"));
         assert!(KV_CACHE_WRITE_Q8_0_PAIR_GFX1100_SRC.contains("kv_cache_write_q8_0_pair"));
-        assert!(!KV_CACHE_WRITE_ASYM_K_GIVENS3_SRC.contains("kv_cache_write_asym3_q8_pair_gfx1100"));
-        assert!(KV_CACHE_WRITE_ASYM3_Q8_PAIR_GFX1100_SRC
-            .contains("kv_cache_write_asym3_q8_pair_gfx1100"));
         assert!(!ATTENTION_FLASH_Q8_0_REDUCE_SRC
             .contains("attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100"));
         assert!(ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_GFX1100_SRC

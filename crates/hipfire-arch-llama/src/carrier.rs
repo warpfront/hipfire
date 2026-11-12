@@ -612,7 +612,7 @@ fn classify_hfq_route(hfq: &HfqFile) -> HfqLoadRoute {
 /// Resolve KV mode for llama-family loads.
 ///
 /// Qwen3 (arch_id=1) — both HFQ and Dir — uses the shared pair table with
-/// [`DIR_SAFETENSORS_POLICY`] (flat constructors only: Q8 + legacy Asym3/4).
+/// [`DIR_SAFETENSORS_POLICY`] (flat constructors only: Q8).
 /// Non-Qwen keeps the historical single-string [`resolve`] path: Dir stays on
 /// `DIR_SAFETENSORS_POLICY`, HFQ on `LLAMA_HFQ_POLICY`. Authored `--kv-k`/`--kv-v`
 /// on non-Qwen is refused here (admission also gates).
@@ -621,7 +621,7 @@ fn resolve_llama_family_kv_mode(
     ctx: &LoadCtx,
     dir_source: bool,
 ) -> Result<hipfire_runtime::kv_mode::KvMode, String> {
-    use hipfire_runtime::kv_mode::{self, KvMode, KvPair, VMode};
+    use hipfire_runtime::kv_mode::{self, KvPair, VMode};
     use hipfire_runtime::llama::ModelArch;
 
     let mode_raw = ctx
@@ -650,12 +650,6 @@ fn resolve_llama_family_kv_mode(
             return Err(format!(
                 "llama/qwen3: V={} unsupported on flat dir-safetensors constructor (need V=q8)",
                 kv_mode::qwen_v_display_name(v)
-            ));
-        }
-        if matches!(mode, KvMode::Asym3 | KvMode::Asym4) && config.head_dim != 256 {
-            return Err(format!(
-                "Qwen legacy-asym K requires head_dim=256 (got {}); use --kv-mode q8",
-                config.head_dim
             ));
         }
         eprintln!(

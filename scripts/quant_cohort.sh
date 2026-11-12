@@ -50,7 +50,7 @@
 #                          gfx906; full slice ≈ 9-11 h per variant.
 #                          Use for during-development iteration; omit for
 #                          "lock the result" cohorts.
-#   --kv-mode <mode>       q8 | asym2 | asym3 | asym4 (default: asym3)
+#   --kv-mode <mode>       q8 | fwht2 | fwht3 | fwht4 (default: fwht3)
 #   --scoring-mode <mode>  per-token | prefill (default: prefill, the
 #                          canonical hipfire scoring path per #113)
 #
@@ -92,7 +92,7 @@ shift 3
 # Optional flags.
 KLDREF=""
 MAX_CHUNKS=""
-KV_MODE="asym3"
+KV_MODE="fwht3"
 SCORING_MODE="prefill"
 while [ $# -gt 0 ]; do
     case "$1" in

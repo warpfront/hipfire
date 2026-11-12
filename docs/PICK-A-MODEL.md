@@ -70,10 +70,10 @@ separate surface: [IMAGEGEN.md](IMAGEGEN.md).
 ## Fixtures
 
 - **[A]** [Historical AR decode, 7900 XTX (gfx1100)](BENCHMARKS.md#historical-autoregressive-decode-no-spec--7900-xtx-gfx1100):
-  MQ4, then-default asym3 KV (deprecated since 0.4.0, removal in 0.5.0; on
-  Qwen `asym3` is now an alias of `fwht3`), median of 5 runs, no speculation.
+  MQ4, then-default asym3 KV (removed in 0.5.0; on Qwen `asym3` was an alias
+  of `fwht3`), median of 5 runs, no speculation.
 - **[B]** [Historical DFlash by genre, 7900 XTX](BENCHMARKS.md#historical-dflash-speculative-decode-by-genre--7900-xtx):
-  asym3 KV (same deprecation), `--no-chatml`, `max_tokens=120`, DFlash forced on, median of 5.
+  asym3 KV (same removal), `--no-chatml`, `max_tokens=120`, DFlash forced on, median of 5.
   Superseded methodology; the speedup depends on the prompt genre.
 - **[C]** [Historical other arches](BENCHMARKS.md#historical-other-arches-decode-toks):
   then-default configuration, decode tok/s.

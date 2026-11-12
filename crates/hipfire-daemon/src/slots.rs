@@ -2285,8 +2285,14 @@ pub fn validate_load_caps(msg: &serde_json::Value, gpu_arch: &str) -> Option<Str
         .and_then(|v| v.as_str())
         .filter(|v| !v.is_empty())
     {
-        let accepted_list = "q8|asym2|asym3|asym4|fwht2|fwht3|fwht4|bf16|f16, \
+        let accepted_list = "q8|fwht2|fwht3|fwht4|bf16|f16, \
                              fp8 on gfx1201 only; 'auto'/unset = q8";
+        if let Some(removed) = hipfire_runtime::kv_mode::removed_kv_name_error(raw) {
+            return Some(format!(
+                "experimental multi-slot refuses kv_mode='{raw}': {removed} \
+                 (accepted: {accepted_list})"
+            ));
+        }
         match hipfire_runtime::kv_mode::resolve_qwen35_slots(raw, gpu_arch) {
             // Arch gate (or any future hard error): refuse with the named
             // message verbatim — it already names the arch and the fix.
@@ -3810,14 +3816,18 @@ mod tests {
         // strings the policy rejects — garbage — and fp8 off gfx1201 are
         // refused here, loudly, before any GPU work. The gate is exact per
         // arch string, not per host card, so these run on any CI machine.
-        for kv in [
-            "asym3", "asym2", "asym4", "fwht2", "fwht3", "fwht4", "bf16", "f16", "auto",
-        ] {
+        for kv in ["fwht2", "fwht3", "fwht4", "bf16", "f16", "auto"] {
             assert_eq!(
                 validate_load_caps(&json!({"params": {"kv_mode": kv}}), "gfx1100"),
                 None,
                 "ladder tier {kv} must be accepted"
             );
+        }
+        // Names removed in 0.5.0 are refused naming the removal.
+        for kv in ["asym2", "asym3", "asym4", "legacy-asym3", "turbo", "turbo3"] {
+            let refused = validate_load_caps(&json!({"params": {"kv_mode": kv}}), "gfx1100")
+                .unwrap_or_else(|| panic!("{kv} must be refused"));
+            assert!(refused.contains("removed in 0.5.0"), "{kv}: {refused}");
         }
         // fp8: gfx1201 admits, every other arch refuses with a named error.
         assert_eq!(

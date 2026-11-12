@@ -3833,32 +3833,7 @@ fn forward_scratch_layers_multi(
                                 kv_cache.v_mode_bits(),
                             )?;
                         } else {
-                            gpu.kv_cache_write_asym4_fused(
-                                &kv_cache.k_gpu[layer_idx],
-                                &kv_cache.v_gpu[layer_idx],
-                                &s.fa_k,
-                                &s.fa_v,
-                                &s.pos_buf,
-                                ct,
-                                st,
-                                config.n_kv_heads,
-                                config.head_dim,
-                            )?;
-                            gpu.attention_flash_asym4(
-                                &s.fa_q,
-                                &kv_cache.k_gpu[layer_idx],
-                                &kv_cache.v_gpu[layer_idx],
-                                &s.fa_attn_out,
-                                &s.pos_buf,
-                                ct,
-                                st,
-                                pos + 1,
-                                config.n_heads,
-                                config.n_kv_heads,
-                                config.head_dim,
-                                kv_cache.physical_cap,
-                                &s.flash_partials,
-                            )?;
+                            unreachable!("Givens asym KV was removed in 0.5.0");
                         }
                     } else if kv_cache.quant_asym3 {
                         let ct = ct!();
@@ -3893,33 +3868,7 @@ fn forward_scratch_layers_multi(
                                 kv_cache.v_mode_bits(),
                             )?;
                         } else {
-                            gpu.kv_cache_write_asym3_fused(
-                                &kv_cache.k_gpu[layer_idx],
-                                &kv_cache.v_gpu[layer_idx],
-                                &s.fa_k,
-                                &s.fa_v,
-                                &s.pos_buf,
-                                ct,
-                                st,
-                                config.n_kv_heads,
-                                config.head_dim,
-                            )?;
-                            gpu.attention_flash_asym3(
-                                &s.fa_q,
-                                &kv_cache.k_gpu[layer_idx],
-                                &kv_cache.v_gpu[layer_idx],
-                                &s.fa_attn_out,
-                                &s.pos_buf,
-                                ct,
-                                st,
-                                pos + 1,
-                                config.n_heads,
-                                config.n_kv_heads,
-                                config.head_dim,
-                                kv_cache.physical_cap,
-                                &s.flash_partials,
-                                None,
-                            )?;
+                            unreachable!("Givens asym KV was removed in 0.5.0");
                         }
                     } else if kv_cache.quant_asym2 {
                         let ct = ct!();
@@ -3954,32 +3903,7 @@ fn forward_scratch_layers_multi(
                                 kv_cache.v_mode_bits(),
                             )?;
                         } else {
-                            gpu.kv_cache_write_asym2_fused(
-                                &kv_cache.k_gpu[layer_idx],
-                                &kv_cache.v_gpu[layer_idx],
-                                &s.fa_k,
-                                &s.fa_v,
-                                &s.pos_buf,
-                                ct,
-                                st,
-                                config.n_kv_heads,
-                                config.head_dim,
-                            )?;
-                            gpu.attention_flash_asym2(
-                                &s.fa_q,
-                                &kv_cache.k_gpu[layer_idx],
-                                &kv_cache.v_gpu[layer_idx],
-                                &s.fa_attn_out,
-                                &s.pos_buf,
-                                ct,
-                                st,
-                                pos + 1,
-                                config.n_heads,
-                                config.n_kv_heads,
-                                config.head_dim,
-                                kv_cache.physical_cap,
-                                &s.flash_partials,
-                            )?;
+                            unreachable!("Givens asym KV was removed in 0.5.0");
                         }
                     } else if kv_cache.quant_q8 {
                         gpu.kv_cache_write_q8_0(
@@ -4537,32 +4461,7 @@ fn forward_scratch_layers_multi(
                                 kv_cache.v_mode_bits(),
                             )?;
                         } else {
-                            gpu.kv_cache_write_asym4_fused(
-                                &kv_cache.k_gpu[layer_idx],
-                                &kv_cache.v_gpu[layer_idx],
-                                &s.fa_k,
-                                &s.fa_v,
-                                &s.pos_buf,
-                                ct,
-                                st,
-                                config.n_kv_heads,
-                                config.head_dim,
-                            )?;
-                            gpu.attention_flash_asym4(
-                                &s.fa_q,
-                                &kv_cache.k_gpu[layer_idx],
-                                &kv_cache.v_gpu[layer_idx],
-                                &s.fa_attn_out,
-                                &s.pos_buf,
-                                ct,
-                                st,
-                                pos + 1,
-                                config.n_heads,
-                                config.n_kv_heads,
-                                config.head_dim,
-                                kv_cache.physical_cap,
-                                &s.flash_partials,
-                            )?;
+                            unreachable!("Givens asym KV was removed in 0.5.0");
                         }
                     } else if kv_cache.quant_asym3 {
                         let ct = ct!();
@@ -4597,33 +4496,7 @@ fn forward_scratch_layers_multi(
                                 kv_cache.v_mode_bits(),
                             )?;
                         } else {
-                            gpu.kv_cache_write_asym3_fused(
-                                &kv_cache.k_gpu[layer_idx],
-                                &kv_cache.v_gpu[layer_idx],
-                                &s.fa_k,
-                                &s.fa_v,
-                                &s.pos_buf,
-                                ct,
-                                st,
-                                config.n_kv_heads,
-                                config.head_dim,
-                            )?;
-                            gpu.attention_flash_asym3(
-                                &s.fa_q,
-                                &kv_cache.k_gpu[layer_idx],
-                                &kv_cache.v_gpu[layer_idx],
-                                &s.fa_attn_out,
-                                &s.pos_buf,
-                                ct,
-                                st,
-                                pos + 1,
-                                config.n_heads,
-                                config.n_kv_heads,
-                                config.head_dim,
-                                kv_cache.physical_cap,
-                                &s.flash_partials,
-                                None,
-                            )?;
+                            unreachable!("Givens asym KV was removed in 0.5.0");
                         }
                     } else if kv_cache.quant_asym2 {
                         let ct = ct!();
@@ -4658,32 +4531,7 @@ fn forward_scratch_layers_multi(
                                 kv_cache.v_mode_bits(),
                             )?;
                         } else {
-                            gpu.kv_cache_write_asym2_fused(
-                                &kv_cache.k_gpu[layer_idx],
-                                &kv_cache.v_gpu[layer_idx],
-                                &s.fa_k,
-                                &s.fa_v,
-                                &s.pos_buf,
-                                ct,
-                                st,
-                                config.n_kv_heads,
-                                config.head_dim,
-                            )?;
-                            gpu.attention_flash_asym2(
-                                &s.fa_q,
-                                &kv_cache.k_gpu[layer_idx],
-                                &kv_cache.v_gpu[layer_idx],
-                                &s.fa_attn_out,
-                                &s.pos_buf,
-                                ct,
-                                st,
-                                pos + 1,
-                                config.n_heads,
-                                config.n_kv_heads,
-                                config.head_dim,
-                                kv_cache.physical_cap,
-                                &s.flash_partials,
-                            )?;
+                            unreachable!("Givens asym KV was removed in 0.5.0");
                         }
                     } else if kv_cache.quant_q8 {
                         gpu.kv_cache_write_q8_0(
@@ -4850,7 +4698,7 @@ pub fn forward_scratch_multi(
             0,
             "forward_scratch_multi: asym KV mode requires gpus.givens_*_per_dev \
              populated for every device. Construct KvCache via the *_multi ctor \
-             (e.g. KvCache::new_gpu_asym3_capped_multi) — single-GPU ctors leave \
+             (e.g. KvCache::new_gpu_fwht3_capped_multi) — single-GPU ctors leave \
              gpus.givens_*_per_dev empty.",
         ));
     }
@@ -4949,7 +4797,7 @@ pub fn forward_prefill_batch_multi(
             0,
             "forward_prefill_batch_multi: asym KV mode requires gpus.givens_*_per_dev \
              populated for every device. Construct KvCache via the *_multi ctor \
-             (e.g. KvCache::new_gpu_asym3_capped_multi) — single-GPU ctors leave \
+             (e.g. KvCache::new_gpu_fwht3_capped_multi) — single-GPU ctors leave \
              gpus.givens_*_per_dev empty.",
         ));
     }

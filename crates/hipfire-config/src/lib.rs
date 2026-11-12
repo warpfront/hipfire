@@ -498,6 +498,17 @@ impl ConfigField {
 
         if valid {
             Ok(())
+        } else if let Some(message) = matches!(self.key, "memory.kv_cache" | "memory.kv_k")
+            .then(|| match value {
+                ConfigValue::String(v) => removed_kv_name_error(v),
+                _ => None,
+            })
+            .flatten()
+        {
+            Err(ConfigError::InvalidValue {
+                key: self.key.to_owned(),
+                message,
+            })
         } else if matches!(self.rule, ValueRule::KvBackend)
             && matches!(value, ConfigValue::String(v) if v == "contiguous")
         {
@@ -595,24 +606,7 @@ fn expand_tilde(value: &str) -> PathBuf {
 
 // Qwen-only K/V axis overrides. Empty is the unset default (not an authored
 // format); consumers omit BuiltIn empty values from IPC.
-const KV_K_NAMES: &[&str] = &[
-    "",
-    "q8",
-    "fwht2",
-    "fwht3",
-    "fwht4",
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — Givens asym KV and the asymN/turboN aliases are superseded by fwht3
-    "asym2",
-    "asym3",
-    "asym4",
-    "turbo",
-    "turbo2",
-    "turbo3",
-    "turbo4",
-    "legacy-asym2",
-    "legacy-asym3",
-    "legacy-asym4",
-];
+const KV_K_NAMES: &[&str] = &["", "q8", "fwht2", "fwht3", "fwht4"];
 const KV_V_NAMES: &[&str] = &["", "q8", "lloyd2", "lloyd3", "lloyd4"];
 
 // The union of every KV-mode name any SITE accepts. This is the config
@@ -621,28 +615,36 @@ const KV_V_NAMES: &[&str] = &["", "q8", "lloyd2", "lloyd3", "lloyd4"];
 // which warn and fall back for anything they cannot allocate. `bf16` is
 // maple's default plus the Qwen quality-control arm; `fp8` is admitted at
 // the single-GPU Qwen sites under the carrier's exact gfx1201/geometry guards.
-// `legacy-asym3` is the Gemma4 lowered full-tier opt-out back to Givens asym3
-// (on Qwen it names the same legacy K as `--kv-k legacy-asym3`).
 const KV_MODES: &[&str] = &[
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — Givens asym KV and the asymN/turboN aliases are superseded by fwht3 (asymN / turbo*)
-    "auto",
-    "f32",
-    "f16",
-    "bf16",
-    "q8",
-    "asym4",
-    "asym3",
-    "asym2",
-    "fwht4",
-    "fwht3",
-    "fwht2",
-    "turbo",
-    "turbo4",
-    "turbo3",
-    "turbo2",
-    "fp8",
-    "legacy-asym3",
+    "auto", "f32", "f16", "bf16", "q8", "fwht4", "fwht3", "fwht2", "fp8",
 ];
+
+/// KV names removed in 0.5.0: the Givens `legacy-asymN` tiers and the
+/// `asymN` / `turbo*` aliases of `fwhtN`. Rejected by `memory.kv_cache` /
+/// `memory.kv_k` validation, the CLI/env parsers and the daemon load request.
+pub const REMOVED_KV_NAMES: &[&str] = &[
+    "asym2",
+    "asym3",
+    "asym4",
+    "legacy-asym2",
+    "legacy-asym3",
+    "legacy-asym4",
+    "turbo",
+    "turbo2",
+    "turbo3",
+    "turbo4",
+];
+
+/// The 0.5.0 removal message for an authored KV name, `None` for every other
+/// name (including unset / `auto`).
+pub fn removed_kv_name_error(raw: &str) -> Option<String> {
+    let name = raw.trim();
+    REMOVED_KV_NAMES.contains(&name).then(|| {
+        format!(
+            "KV name '{name}' was removed in 0.5.0 (Givens asym KV and the asymN/turboN aliases); use fwht2|fwht3|fwht4 or q8"
+        )
+    })
+}
 // GDN/DeltaNet recurrent-state storage names accepted by `memory.state_quant`.
 // A schema allow-list only: the Qwen3.5 (`parse_state_quant`) and Qwen4
 // (`resolve_state_format`) loaders each honor or refuse what they cannot serve
@@ -797,7 +799,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         false,
         Some("HIPFIRE_KV_MODE"),
-        "KV cache format; auto inherits the registry recommendation, then q8 — except single-GPU Qwen on exact gfx1201, where auto means native fp8 (stage-b FA2 arithmetic). DeepSeek V4 currently supports f32 and f16. asymN and turbo* are deprecated (removal in 0.5.0); use fwhtN or q8."
+        "KV cache format; auto inherits the registry recommendation, then q8 — except single-GPU Qwen on exact gfx1201, where auto means native fp8 (stage-b FA2 arithmetic). DeepSeek V4 currently supports f32 and f16."
     ),
     field!(
         "memory.kv_adaptive",
@@ -1208,7 +1210,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         false,
         None,
-        "Qwen-only K-axis override; empty leaves the mode-preset K unchanged. asymN, turboN and legacy-asymN are deprecated (removal in 0.5.0); use fwhtN or q8."
+        "Qwen-only K-axis override; empty leaves the mode-preset K unchanged. asymN, turbo* and legacy-asymN were removed in 0.5.0; use fwhtN or q8."
     ),
     field!(
         "memory.kv_v",
@@ -9242,6 +9244,41 @@ overrides = { decide = { calibration = { choice = 1.3, score = 2, noul = 0.7 } }
     }
 
     #[test]
+    fn removed_kv_names_fail_validation_cli_and_toml_load() {
+        let cache = field("memory.kv_cache").expect("memory.kv_cache schema field");
+        let k = field("memory.kv_k").expect("memory.kv_k schema field");
+        for name in REMOVED_KV_NAMES {
+            for f in [cache, k] {
+                let err = f.parse_cli(name).unwrap_err().to_string();
+                assert!(err.contains("removed in 0.5.0"), "{} {name}: {err}", f.key);
+                assert!(err.contains("fwht"), "{} {name}: {err}", f.key);
+            }
+            assert!(removed_kv_name_error(name).is_some(), "{name}");
+        }
+        assert!(removed_kv_name_error("fwht3").is_none());
+        assert!(removed_kv_name_error("auto").is_none());
+        // A config file that still authors a removed KV value fails the load.
+        for (key, body) in [
+            (
+                "kv_cache",
+                "schema_version = 1\n[memory]\nkv_cache = \"turbo3\"\n",
+            ),
+            (
+                "kv_k",
+                "schema_version = 1\n[memory]\nkv_k = \"legacy-asym3\"\n",
+            ),
+        ] {
+            let root = temp_root(&format!("removed-kv-{key}"));
+            fs::create_dir_all(&root).unwrap();
+            let paths = ConfigPaths::under(&root);
+            fs::write(&paths.config_toml, body).unwrap();
+            let err = load_global(&paths).unwrap_err().to_string();
+            assert!(err.contains("removed in 0.5.0"), "{key}: {err}");
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
     fn retired_keys_fail_the_load_naming_removal_and_replacement() {
         // kernel.mw16 shipped in 0.3.1/0.4.0 and was removed in 0.4.1. A file
         // that still sets it is a user-facing error, never a silent ignore.
@@ -9843,23 +9880,7 @@ overrides = { decide = { calibration = { choice = 1.3, score = 2, noul = 0.7 } }
         assert_eq!(k_resolved.source, ConfigSource::BuiltIn);
         assert_eq!(v_resolved.source, ConfigSource::BuiltIn);
 
-        for name in [
-            "",
-            "q8",
-            "fwht2",
-            "fwht3",
-            "fwht4",
-            "asym2",
-            "asym3",
-            "asym4",
-            "turbo",
-            "turbo2",
-            "turbo3",
-            "turbo4",
-            "legacy-asym2",
-            "legacy-asym3",
-            "legacy-asym4",
-        ] {
+        for name in ["", "q8", "fwht2", "fwht3", "fwht4"] {
             assert_eq!(
                 k.parse_cli(name).unwrap(),
                 ConfigValue::String(name.into()),
@@ -9878,11 +9899,11 @@ overrides = { decide = { calibration = { choice = 1.3, score = 2, noul = 0.7 } }
         assert!(k.parse_cli("auto").is_err());
 
         let mut layer = ConfigLayer::default();
-        layer.set_cli("memory.kv_k", "legacy-asym3").unwrap();
+        layer.set_cli("memory.kv_k", "fwht3").unwrap();
         layer.set_cli("memory.kv_v", "lloyd3").unwrap();
         assert_eq!(
             layer.get("memory.kv_k"),
-            Some(&ConfigValue::String("legacy-asym3".into()))
+            Some(&ConfigValue::String("fwht3".into()))
         );
         assert_eq!(
             layer.get("memory.kv_v"),

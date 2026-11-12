@@ -3,8 +3,8 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Stage 4 smoke: build the full multi-GPU state stack on a real model:
-//! `Qwen35ScratchSet` (per-device), `KvCache::new_gpu_asym3_capped_multi`
-//! (per-layer K/V on band-owning device + per-device givens replicas),
+//! `Qwen35ScratchSet` (per-device), `KvCache::new_gpu_fwht3_capped_multi`
+//! (per-layer K/V on band-owning device + per-device FWHT sign replicas),
 //! `DeltaNetState::new_with_quant_multi` (per-LA-layer state on owning
 //! device). Verifies each per-layer / per-device buffer's
 //! `pointer_get_attributes` matches the layer-band assignment, then runs
@@ -55,8 +55,8 @@ fn main() {
         assert_eq!(attr.device, dev_idx as i32);
     }
 
-    println!("\n── KvCache::new_gpu_asym3_capped_multi ───────────────────");
-    let kv = KvCache::new_gpu_asym3_capped_multi(
+    println!("\n── KvCache::new_gpu_fwht3_capped_multi ───────────────────");
+    let kv = KvCache::new_gpu_fwht3_capped_multi(
         &mut gpus,
         config.n_layers,
         config.n_kv_heads,
@@ -64,7 +64,7 @@ fn main() {
         4096,
         4096,
     )
-    .expect("KvCache asym3 multi");
+    .expect("KvCache fwht3 multi");
     assert_eq!(kv.k_gpu.len(), config.n_layers);
     let probe_layers = [0usize, config.n_layers / 2, config.n_layers - 1];
     for &i in &probe_layers {
@@ -170,9 +170,9 @@ fn main() {
     println!("    s_matrices[0].device={} OK", attr.device);
     dn2.free_gpu_multi(&mut gpus, &la_to_device2);
 
-    println!("  [2/3] KvCache::new_gpu_asym3_capped_multi — layer 0 on dev 0");
+    println!("  [2/3] KvCache::new_gpu_fwht3_capped_multi — layer 0 on dev 0");
     gpus.devices[1].bind_thread().expect("misbind dev 1");
-    let kv2 = KvCache::new_gpu_asym3_capped_multi(
+    let kv2 = KvCache::new_gpu_fwht3_capped_multi(
         &mut gpus,
         config.n_layers,
         config.n_kv_heads,
@@ -188,7 +188,7 @@ fn main() {
     assert_eq!(
         attr_k.device, 0,
         "REGRESSION: KvCache k_gpu[0] expected on dev 0 but landed on dev {} \
-         after pre-misbinding dev 1. Likely a removed bind in new_gpu_asym3_capped_multi.",
+         after pre-misbinding dev 1. Likely a removed bind in new_gpu_fwht3_capped_multi.",
         attr_k.device,
     );
     println!("    k_gpu[0].device={} OK", attr_k.device);

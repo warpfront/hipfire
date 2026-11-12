@@ -247,9 +247,9 @@ Flags may appear before or after the model. CLI help and the native typed schema
 | `--top-p <float>` | Nucleus sampling when set. Stored global default `0.8` is not auto-sent. |
 | `--repeat-penalty <float>` | Repeat penalty when set. Stored global default `1.05` is not auto-sent. |
 | `-n, --max-tokens <int>` | Generation cap (config default `4096`). |
-| `--kv-mode <m>` | Whole-cache KV preset for this load: `auto`, `q8`, `fp8`, `bf16`, `fwht4`/`3`/`2`; legacy spellings `asym4`/`3`/`2`, `turbo`… (see [KV load flags](#kv-load-flags-run--serve--bench)). |
+| `--kv-mode <m>` | Whole-cache KV preset for this load: `auto`, `q8`, `fp8`, `bf16`, `fwht4`/`3`/`2` (the `asymN`/`turboN` spellings were removed in 0.5.0; see [KV load flags](#kv-load-flags-run--serve--bench)). |
 | `--kv-backend <legacy\|vmm>` | KV allocation backend. Omitted = automatic (prefer VMM). `contiguous` is **rejected** (renamed to `legacy`). |
-| `--kv-k <name>` | Qwen-family K-axis override (`q8`, `fwhtN`; deprecated since 0.4.0, removal in 0.5.0: legacy `asymN`/`turboN` → `fwhtN`; legacy Givens `legacy-asymN`). |
+| `--kv-k <name>` | Qwen-family K-axis override (`q8`, `fwhtN`; `asymN`, `turboN` and `legacy-asymN` were removed in 0.5.0 and are rejected). |
 | `--kv-v <name>` | Qwen-family V-axis override (`q8`, `lloyd2`/`3`/`4`). |
 | `--head <name>` | Select a published `lm_head` variant from the registry's `heads` (e.g. `--head q4k`). The overlay shadows the model's own head at load time; omitted = the head baked into the model file. |
 | `--tp <N>` | Tensor/expert-parallel degree for this load, `1..=64` (same admission as `serve --tp` / `bench --tp`). Only values above 1 are forwarded and force a local daemon. |
@@ -318,8 +318,8 @@ Shared by `hipfire run`, `hipfire serve`, and `hipfire bench` (including `--matr
 | Flag | Values / default | Notes |
 |---|---|---|
 | `--kv-backend` | `legacy` \| `vmm`; **default automatic prefer VMM** | Accepts only those two spellings. Old `contiguous` is rejected with a migration error that names `legacy` (e.g. use `--kv-backend legacy` or `memory.kv_backend = "legacy"`). Selecting legacy (explicit or automatic fallback) prints one stderr warning containing the stable token `HIPFIRE_KV_BACKEND=legacy`. Explicit `vmm` on an unsupported combination fails closed before teardown. |
-| `--kv-mode` | `auto` (default when unset), `q8`, `fp8`, `bf16`, `fwht2`/`3`/`4`; legacy spellings `asym2`/`3`/`4`, `turbo`/`turbo2`/`3`/`4`; … | Whole-cache preset. Native `fp8`/`bf16` encode K and V together, without a separate V mode. `fwhtN` is an optional headroom mode, not a default. |
-| `--kv-k` / `--kv-v` | Qwen-only axis overrides; omitted when unset | Orthogonal to mode. On supported Qwen sites the legacy spellings `asymN` and `turboN` (bare `turbo` = `turbo3`) mean **`fwhtN`**; `legacy-asymN` selects the legacy Givens asym K. `asymN`, `turboN` and `legacy-asymN` are deprecated since 0.4.0 (removal in 0.5.0) and warn at load. V names: `q8`, `lloyd2`/`3`/`4`. Non-Qwen carriers refuse these axes before teardown. |
+| `--kv-mode` | `auto` (default when unset), `q8`, `fp8`, `bf16`, `fwht2`/`3`/`4`; … | Whole-cache preset. Native `fp8`/`bf16` encode K and V together, without a separate V mode. `fwhtN` is an optional headroom mode, not a default. |
+| `--kv-k` / `--kv-v` | Qwen-only axis overrides; omitted when unset | Orthogonal to mode. `asymN`, `turbo`/`turboN` and `legacy-asymN` were removed in 0.5.0 and are rejected with a message naming the removal (use `fwhtN` or `q8`). V names: `q8`, `lloyd2`/`3`/`4`. Non-Qwen carriers refuse these axes before teardown. |
 | `--max-seq` | int (512–1048576) when set; else automatic | On eligible growing Qwen VMM KV, default = **min(model trained context, measured card capacity)** after weights load; legacy and other owners retain their existing bounds. An explicit `--max-seq` replaces any configured `memory.max_seq` for that load (per process for `serve`). `bench` sizes its own load instead ([below](#bench-context-max_seq)). |
 
 **Qwen `auto` / unset mode:** native `fp8` (both K and V) on exact `gfx1201` single GPU when the load is native-eligible — H24/Hkv4/D256 dense or H16/Hkv2/D256 A3B attention, no PP/TP/EP/slots split, no `kv_adaptive`; `q8`/`q8` everywhere else, including gfx1100 and gfx1151. Native `bf16` stays H24 dense-only. Native modes report `kv_mode=fp8` or `bf16` in loaded/diag/bench JSON; no synthetic `V=q8` axis is reported. Non-Qwen family defaults are unchanged (e.g. Maple BF16, DeepSeek compressor F32, Gemma layered policy).

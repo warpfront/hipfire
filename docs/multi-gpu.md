@@ -2175,8 +2175,8 @@ fit or speed on other SKUs.
 PP KV policy for Qwen3.5 multi-GPU defaults through `QWEN35_PP_POLICY` (see
 `kv_mode.rs`) — do not assume single-GPU `auto` KV defaults apply unchanged:
 PP and dense TP / MoE EP have no native constructor, so `auto` is `q8/q8` on
-every arch there (gfx1201 included), and PP accepts only `q8`, `fwht2`,
-`fwht3` and legacy `legacy-asym3` K.
+every arch there (gfx1201 included), and PP accepts only `q8`, `fwht2`
+and `fwht3` K.
 
 ## Measured: Flash-Next EP on 2× R9700 (2026-10-13)
 

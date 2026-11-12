@@ -4765,7 +4765,7 @@ pub fn load_model_ep(path: &str, max_seq: usize, tp: usize) -> Result<LoadedMode
 /// map every sub-F16 request up to F16 — the nearest storage the model
 /// actually implements, and the one whose intent ("smaller than F32") the
 /// caller expressed. Redirecting rather than failing keeps `q8`, the historic
-/// DS4 default, and the `asym`/`fwht`/`turbo` families usable, and it is a
+/// DS4 default, and the `fwht` families usable, and it is a
 /// widening in precision terms: F16 carries more of the value than any of
 /// them would have.
 ///
@@ -4779,8 +4779,7 @@ fn resolve_deepseek4_compressor_cache_kv_mode(
     match raw.as_str() {
         "" | "auto" | "f32" => Ok(hipfire_config::Deepseek4CompressorCache::F32),
         "f16" => Ok(hipfire_config::Deepseek4CompressorCache::F16),
-        "q8" | "asym2" | "asym3" | "asym4" | "fwht2" | "fwht3" | "fwht4" | "turbo" | "turbo3"
-        | "turbo4" => {
+        "q8" | "fwht2" | "fwht3" | "fwht4" => {
             eprintln!(
                 "[deepseek4] kv_cache={raw} has no DeepSeek V4 implementation; \
                  using the F16 compressor cache instead (nearest supported storage \
@@ -4788,9 +4787,9 @@ fn resolve_deepseek4_compressor_cache_kv_mode(
             );
             Ok(hipfire_config::Deepseek4CompressorCache::F16)
         }
-        other => Err(format!(
-            "DeepSeek V4 kv_cache={other} is not recognised; use f32 (golden/default) or f16"
-        )),
+        other => Err(hipfire_config::removed_kv_name_error(other).unwrap_or_else(|| {
+            format!("DeepSeek V4 kv_cache={other} is not recognised; use f32 (golden/default) or f16")
+        })),
     }
 }
 
@@ -7264,9 +7263,7 @@ mod registry_tests {
         // its compressor cache as F32 or F16 only, and F16 is the nearest
         // implemented storage below F32 — a widening relative to what these
         // ask for. Only unrecognised strings still fail closed.
-        for mode in [
-            "q8", "asym2", "asym3", "asym4", "fwht2", "fwht3", "fwht4", "turbo", "turbo3", "turbo4",
-        ] {
+        for mode in ["q8", "fwht2", "fwht3", "fwht4"] {
             assert_eq!(
                 resolve_deepseek4_compressor_cache_kv_mode(Some(mode)).unwrap(),
                 F16,
@@ -7275,6 +7272,10 @@ mod registry_tests {
         }
         let error = resolve_deepseek4_compressor_cache_kv_mode(Some("nonsense")).unwrap_err();
         assert!(error.contains("not recognised"), "{error}");
+        for removed in ["asym3", "turbo", "legacy-asym3"] {
+            let error = resolve_deepseek4_compressor_cache_kv_mode(Some(removed)).unwrap_err();
+            assert!(error.contains("removed in 0.5.0"), "{removed}: {error}");
+        }
     }
 
     /// Every known arch_id must be claimed by AT MOST one carrier, for both

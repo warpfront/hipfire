@@ -1356,7 +1356,7 @@ Caveats that are part of the fixture, not trivia:
 | `HIPFIRE_PROMPT_TOKEN_HEAT` | Per-position BPE merge-rank dump | OFF |
 | `HIPFIRE_PROMPT_HEAT_JSON` | JSON output for heat dump | OFF |
 | `HIPFIRE_PROMPT_HEAT_LIMIT` | Max rows in heat dump | 64 |
-| `HIPFIRE_KV_MODE` | Override `kv_cache` config. `fwht3` is the optional compact mode; `asymN`/`turboN` on Qwen are aliases of `fwhtN`, and Givens asym is `legacy-asymN` only | `auto`: fp8 on gfx1201 (Qwen H24/Hkv4/D256, single GPU, no adaptive), q8 otherwise incl. gfx1100/gfx1151 (`kv_mode.rs:28-46,194-215`) |
+| `HIPFIRE_KV_MODE` | Override `kv_cache` config. `fwht3` is the optional compact mode; `asymN`, `turboN` and `legacy-asymN` were removed in 0.5.0 and are rejected | `auto`: fp8 on gfx1201 (Qwen H24/Hkv4/D256, single GPU, no adaptive), q8 otherwise incl. gfx1100/gfx1151 (`kv_mode.rs:28-46,194-215`) |
 | `HIPFIRE_ATTN_FLASH` | Override flash_mode config | (config) |
 | `HIPFIRE_OOM_GUARD` | Memory preflight OOM guard (`kv_slots::preflight_alloc`, SlotPool arena, bench-sweep headroom check). `auto`: on for unified-memory APUs (Strix Halo — overshoot is a global OOM), off for discrete GPUs, swap-decided for GPU-less processes | `auto` (`memory.oom_guard`) |
 |`HIPFIRE_DFLASH_DRAFT`|Force a specific draft path, overriding the registry sidecar. Empty string = explicit opt-out|(unset: registry sidecar when `dflash_mode` is `auto`/`on`)|

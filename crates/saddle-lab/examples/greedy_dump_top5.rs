@@ -122,30 +122,6 @@ fn main() {
             kv_seq,
         )
         .unwrap(),
-        "asym4" | "turbo4" => KvCache::new_gpu_asym4(
-            &mut gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_seq,
-        )
-        .unwrap(),
-        "asym3" | "turbo3" | "turbo" => KvCache::new_gpu_asym3(
-            &mut gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_seq,
-        )
-        .unwrap(),
-        "asym2" | "turbo2" => KvCache::new_gpu_asym2(
-            &mut gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_seq,
-        )
-        .unwrap(),
         "fwht4" => KvCache::new_gpu_fwht4(
             &mut gpu,
             config.n_layers,
@@ -176,9 +152,7 @@ fn main() {
             )
             .unwrap()
         }
-        other => panic!(
-            "unknown --kv-mode/HIPFIRE_KV_MODE: {other} (q8|asym4|asym3|asym2|fwht4|fwht3|fwht2)"
-        ),
+        other => panic!("unknown --kv-mode/HIPFIRE_KV_MODE: {other} (q8|fwht4|fwht3|fwht2)"),
     };
     let mut dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
     let scratch = Qwen35Scratch::new(&mut gpu, &config, 128).unwrap();

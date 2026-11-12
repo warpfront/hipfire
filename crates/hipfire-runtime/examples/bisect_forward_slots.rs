@@ -197,28 +197,16 @@ fn main() {
                 .expect("tier table upload");
             t
         };
-        let (cos, sin, s1, s2) = if let Some(len) = plan.givens_len {
-            let (c, si) = KvCache::gen_givens_angles(42, len);
+        let (s1, s2) = if let Some(len) = plan.fwht_len {
             (
-                Some(upload_f32(&mut gpu, &c)),
-                Some(upload_f32(&mut gpu, &si)),
-                None,
-                None,
-            )
-        } else if let Some(len) = plan.fwht_len {
-            (
-                None,
-                None,
                 Some(upload_f32(&mut gpu, &KvCache::gen_fwht_signs(42, len))),
                 Some(upload_f32(&mut gpu, &KvCache::gen_fwht_signs(1042, len))),
             )
         } else {
-            (None, None, None, None)
+            (None, None)
         };
         let kv_tier = SlotKvTier {
             mode,
-            givens_cos: cos,
-            givens_sin: sin,
             fwht_signs1: s1,
             fwht_signs2: s2,
         };

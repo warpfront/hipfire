@@ -2287,7 +2287,7 @@ pub struct TreeMaskRef<'a> {
 /// Eligibility (else falls back to per-token `forward_scratch` loop):
 ///   - all FA layer weights (wq/wk/wv/wo + w_gate/w_up/w_down) pass
 ///     `is_batchable_la`
-///   - KV cache is Q8_0 or asym{2,3,4}
+///   - KV cache is Q8_0
 ///
 /// Internally chunks at `pbs.max_batch` to bound VRAM regardless of prompt
 /// length. `pbs_in: Some` reuses caller-owned scratch; `None` allocates +
@@ -2332,8 +2332,7 @@ pub fn forward_prefill_batch_capture(
     let force_fallback = !crate::config::get().prefill_batched;
     const MIN_BATCH: usize = 4;
     let arch = gpu.arch.as_str();
-    let kv_ok =
-        kv_cache.quant_q8 || kv_cache.quant_asym2 || kv_cache.quant_asym3 || kv_cache.quant_asym4;
+    let kv_ok = kv_cache.quant_q8;
     let weights_ok = weights.layers.iter().all(|l| {
         is_batchable_la(l.wq.gpu_dtype, arch)
             && is_batchable_la(l.wk.gpu_dtype, arch)
@@ -2433,7 +2432,7 @@ pub fn forward_prefill_batch_capture(
 /// per-extract-layer residual rows for DFlash conditioning.
 ///
 /// Single chunk only: `n <= pbs.max_batch` (a tree never exceeds the speculation
-/// window). Requires Q8_0 KV (the canonical DFlash config): the asym/givens FA
+/// window). Requires Q8_0 KV (the canonical DFlash config): the rotated-K FA
 /// re-rotates K in-kernel by the WRITE slot, which conflicts with the decoupled
 /// depth-RoPE — so it is rejected here rather than silently skewed.
 #[allow(clippy::too_many_arguments)]
@@ -2468,10 +2467,9 @@ pub fn forward_prefill_batch_tree(
 
     let arch = gpu.arch.as_str();
     assert!(
-        kv_cache.quant_q8
-            && !(kv_cache.quant_asym2 || kv_cache.quant_asym3 || kv_cache.quant_asym4),
+        kv_cache.quant_q8,
         "forward_prefill_batch_tree requires Q8_0 KV (decoupled depth-RoPE is \
-         incompatible with the asym/givens in-kernel re-rotation)"
+         incompatible with the rotated-K in-kernel re-rotation)"
     );
     let weights_ok = weights.layers.iter().all(|l| {
         is_batchable_la(l.wq.gpu_dtype, arch)
@@ -2555,8 +2553,7 @@ pub fn forward_prefill_batch_chunk_captured(
     );
 
     let arch = gpu.arch.as_str();
-    let kv_ok =
-        kv_cache.quant_q8 || kv_cache.quant_asym2 || kv_cache.quant_asym3 || kv_cache.quant_asym4;
+    let kv_ok = kv_cache.quant_q8;
     let weights_ok = weights.layers.iter().all(|l| {
         is_batchable_la(l.wq.gpu_dtype, arch)
             && is_batchable_la(l.wk.gpu_dtype, arch)
@@ -2943,52 +2940,7 @@ fn forward_prefill_chunk(
         )?;
 
         // Batched KV write.
-        if kv_cache.quant_asym4 {
-            let ct = kv_cache.givens_cos.as_ref().unwrap();
-            let st = kv_cache.givens_sin.as_ref().unwrap();
-            gpu.kv_cache_write_asym4_batched(
-                &kv_cache.k_gpu[layer_idx],
-                &kv_cache.v_gpu[layer_idx],
-                &pbs.fa_k_batch,
-                &pbs.fa_v_batch,
-                &pbs.positions,
-                ct,
-                st,
-                config.n_kv_heads,
-                config.head_dim,
-                n,
-            )?;
-        } else if kv_cache.quant_asym3 {
-            let ct = kv_cache.givens_cos.as_ref().unwrap();
-            let st = kv_cache.givens_sin.as_ref().unwrap();
-            gpu.kv_cache_write_asym3_batched(
-                &kv_cache.k_gpu[layer_idx],
-                &kv_cache.v_gpu[layer_idx],
-                &pbs.fa_k_batch,
-                &pbs.fa_v_batch,
-                &pbs.positions,
-                ct,
-                st,
-                config.n_kv_heads,
-                config.head_dim,
-                n,
-            )?;
-        } else if kv_cache.quant_asym2 {
-            let ct = kv_cache.givens_cos.as_ref().unwrap();
-            let st = kv_cache.givens_sin.as_ref().unwrap();
-            gpu.kv_cache_write_asym2_batched(
-                &kv_cache.k_gpu[layer_idx],
-                &kv_cache.v_gpu[layer_idx],
-                &pbs.fa_k_batch,
-                &pbs.fa_v_batch,
-                &pbs.positions,
-                ct,
-                st,
-                config.n_kv_heads,
-                config.head_dim,
-                n,
-            )?;
-        } else if !q8_family_eligible {
+        if !q8_family_eligible {
             gpu.kv_cache_write_q8_0_batched(
                 &kv_cache.k_gpu[layer_idx],
                 &pbs.fa_k_batch,
@@ -3021,75 +2973,7 @@ fn forward_prefill_chunk(
             Some(tm) => (Some(tm.bias), tm.block_start, tm.block_cols),
             None => (None, 0usize, 0usize),
         };
-        if kv_cache.quant_asym4 {
-            let ct = kv_cache.givens_cos.as_ref().unwrap();
-            let st = kv_cache.givens_sin.as_ref().unwrap();
-            gpu.attention_flash_asym4_batched_masked(
-                &pbs.fa_q_batch,
-                &kv_cache.k_gpu[layer_idx],
-                &kv_cache.v_gpu[layer_idx],
-                &pbs.fa_attn_out_batch,
-                &pbs.positions,
-                ct,
-                st,
-                config.n_heads,
-                config.n_kv_heads,
-                config.head_dim,
-                kv_cache.physical_cap,
-                max_ctx_len,
-                n,
-                &pbs.flash_partials,
-                tree_bias,
-                tree_block_start,
-                tree_block_cols,
-            )?;
-        } else if kv_cache.quant_asym3 {
-            let ct = kv_cache.givens_cos.as_ref().unwrap();
-            let st = kv_cache.givens_sin.as_ref().unwrap();
-            gpu.attention_flash_asym3_batched_masked(
-                &pbs.fa_q_batch,
-                &kv_cache.k_gpu[layer_idx],
-                &kv_cache.v_gpu[layer_idx],
-                &pbs.fa_attn_out_batch,
-                &pbs.positions,
-                ct,
-                st,
-                config.n_heads,
-                config.n_kv_heads,
-                config.head_dim,
-                kv_cache.physical_cap,
-                max_ctx_len,
-                n,
-                &pbs.flash_partials,
-                tree_bias,
-                tree_block_start,
-                tree_block_cols,
-            )?;
-        } else if kv_cache.quant_asym2 {
-            assert!(
-                tree_mask.is_none(),
-                "tree-masked verify needs a masked attention kernel; asym2 KV \
-                 has only the unmasked batched flash kernel. Use q8/asym3/asym4 KV."
-            );
-            let ct = kv_cache.givens_cos.as_ref().unwrap();
-            let st = kv_cache.givens_sin.as_ref().unwrap();
-            gpu.attention_flash_asym2_batched(
-                &pbs.fa_q_batch,
-                &kv_cache.k_gpu[layer_idx],
-                &kv_cache.v_gpu[layer_idx],
-                &pbs.fa_attn_out_batch,
-                &pbs.positions,
-                ct,
-                st,
-                config.n_heads,
-                config.n_kv_heads,
-                config.head_dim,
-                kv_cache.physical_cap,
-                max_ctx_len,
-                n,
-                &pbs.flash_partials,
-            )?;
-        } else if q8_family_eligible {
+        if q8_family_eligible {
             debug_assert!(kv_cache.quant_q8);
             // Ordinary causal Q8 prefill now shares the same paired dispatch
             // used by Qwen3.5, enabling the existing gfx11/gfx1201 M16 kernel.
@@ -4582,7 +4466,7 @@ pub fn forward_scratch_layers(
         )?;
 
         if kv_cache.quant_asym4 || kv_cache.quant_asym3 || kv_cache.quant_asym2 {
-            // Asym/Givens KV: the manual ladder below has no asym kernels, so
+            // Rotated-K KV: the manual ladder below has no rotated-K kernels, so
             // route KV-write + flash-attend through the dispatch attention
             // family (the same path qwen35 uses). tier_inputs() classifies the
             // tier from the cache's quant flags; run_attention does both the
@@ -5180,7 +5064,7 @@ pub fn forward_scratch_compute_capture(
         )?;
 
         if kv_cache.quant_asym4 || kv_cache.quant_asym3 || kv_cache.quant_asym2 {
-            // Asym/Givens KV: the manual ladder below has no asym kernels, so
+            // Rotated-K KV: the manual ladder below has no rotated-K kernels, so
             // route KV-write + flash-attend through the dispatch attention
             // family (the same path qwen35 uses). tier_inputs() classifies the
             // tier from the cache's quant flags; run_attention does both the
@@ -5938,63 +5822,6 @@ pub trait KvCacheExt {
     ) -> HipResult<Self>
     where
         Self: Sized;
-    fn new_gpu_asym4_multi(
-        gpus: &mut Gpus,
-        n_layers: usize,
-        n_kv_heads: usize,
-        head_dim: usize,
-        max_seq_len: usize,
-    ) -> HipResult<Self>
-    where
-        Self: Sized;
-    fn new_gpu_asym4_capped_multi(
-        gpus: &mut Gpus,
-        n_layers: usize,
-        n_kv_heads: usize,
-        head_dim: usize,
-        max_seq_len: usize,
-        physical_cap: usize,
-    ) -> HipResult<Self>
-    where
-        Self: Sized;
-    fn new_gpu_asym3_multi(
-        gpus: &mut Gpus,
-        n_layers: usize,
-        n_kv_heads: usize,
-        head_dim: usize,
-        max_seq_len: usize,
-    ) -> HipResult<Self>
-    where
-        Self: Sized;
-    fn new_gpu_asym3_capped_multi(
-        gpus: &mut Gpus,
-        n_layers: usize,
-        n_kv_heads: usize,
-        head_dim: usize,
-        max_seq_len: usize,
-        physical_cap: usize,
-    ) -> HipResult<Self>
-    where
-        Self: Sized;
-    fn new_gpu_asym2_multi(
-        gpus: &mut Gpus,
-        n_layers: usize,
-        n_kv_heads: usize,
-        head_dim: usize,
-        max_seq_len: usize,
-    ) -> HipResult<Self>
-    where
-        Self: Sized;
-    fn new_gpu_asym2_capped_multi(
-        gpus: &mut Gpus,
-        n_layers: usize,
-        n_kv_heads: usize,
-        head_dim: usize,
-        max_seq_len: usize,
-        physical_cap: usize,
-    ) -> HipResult<Self>
-    where
-        Self: Sized;
     fn new_gpu_fwht4_multi(
         gpus: &mut Gpus,
         n_layers: usize,
@@ -6053,36 +5880,6 @@ pub trait KvCacheExt {
     where
         Self: Sized;
     fn new_gpu_q8_capped_multi_filtered(
-        gpus: &mut Gpus,
-        is_kv_layer: &[bool],
-        n_kv_heads: usize,
-        head_dim: usize,
-        max_seq_len: usize,
-        physical_cap: usize,
-    ) -> HipResult<Self>
-    where
-        Self: Sized;
-    fn new_gpu_asym4_capped_multi_filtered(
-        gpus: &mut Gpus,
-        is_kv_layer: &[bool],
-        n_kv_heads: usize,
-        head_dim: usize,
-        max_seq_len: usize,
-        physical_cap: usize,
-    ) -> HipResult<Self>
-    where
-        Self: Sized;
-    fn new_gpu_asym3_capped_multi_filtered(
-        gpus: &mut Gpus,
-        is_kv_layer: &[bool],
-        n_kv_heads: usize,
-        head_dim: usize,
-        max_seq_len: usize,
-        physical_cap: usize,
-    ) -> HipResult<Self>
-    where
-        Self: Sized;
-    fn new_gpu_asym2_capped_multi_filtered(
         gpus: &mut Gpus,
         is_kv_layer: &[bool],
         n_kv_heads: usize,
@@ -6216,7 +6013,6 @@ impl KvCacheExt for KvCache {
         let ms = dims.max_seq;
         match (mode, &dims.layers, dims.physical_cap) {
             (KvMode::Q8, Mask(m), Some(cap)) => Self::new_gpu_q8_capped_multi_filtered(gpus, m, nh, hd, ms, cap),
-            (KvMode::Asym3, Mask(m), Some(cap)) => Self::new_gpu_asym3_capped_multi_filtered(gpus, m, nh, hd, ms, cap),
             (KvMode::Fwht3, Mask(m), Some(cap)) => Self::new_gpu_fwht3_capped_multi_filtered(gpus, m, nh, hd, ms, cap),
             (KvMode::Fwht2, Mask(m), Some(cap)) => Self::new_gpu_fwht2_capped_multi_filtered(gpus, m, nh, hd, ms, cap),
             // Fp8 is single-GPU only: fail closed here, never fall through to
@@ -6580,210 +6376,6 @@ impl KvCacheExt for KvCache {
         })
     }
 
-    fn new_gpu_asym4_multi(
-        gpus: &mut Gpus,
-        n_layers: usize,
-        n_kv_heads: usize,
-        head_dim: usize,
-        max_seq_len: usize,
-    ) -> HipResult<Self> {
-        Self::new_gpu_asym4_capped_multi(
-            gpus,
-            n_layers,
-            n_kv_heads,
-            head_dim,
-            max_seq_len,
-            max_seq_len,
-        )
-    }
-
-    fn new_gpu_asym4_capped_multi(
-        gpus: &mut Gpus,
-        n_layers: usize,
-        n_kv_heads: usize,
-        head_dim: usize,
-        max_seq_len: usize,
-        physical_cap: usize,
-    ) -> HipResult<Self> {
-        assert!(
-            head_dim == 128 || head_dim == 256,
-            "asym4 requires head_dim=128 or 256"
-        );
-        assert!(head_dim % 32 == 0);
-        assert!(physical_cap > 0 && physical_cap <= max_seq_len);
-        let kv_dim = n_kv_heads * head_dim;
-        let k_bph = 4 + head_dim / 2;
-        let k_elems = (physical_cap * n_kv_heads * k_bph + 3) / 4;
-        let v_blocks_per_head = head_dim / 32;
-        let v_bpp = n_kv_heads * v_blocks_per_head * 34;
-        let v_elems = (physical_cap * v_bpp + 3) / 4;
-        let (k_gpu, v_gpu) = alloc_kv_per_layer_multi(gpus, n_layers, k_elems, v_elems)?;
-        replicate_givens_to_all_devices(gpus, head_dim / 2, 42)?;
-        Ok(Self {
-            k_gpu,
-            v_gpu,
-            k_scales: vec![],
-            v_scales: vec![],
-            kv_dim,
-            max_seq: max_seq_len,
-            physical_cap,
-            n_kv_heads,
-            head_dim,
-            quantized: true,
-            quant_q8: false,
-            quant_int8: false,
-            quant_hfq4: false,
-            quant_asym4: true,
-            quant_asym3: false,
-            quant_asym2: false,
-            quant_fwht: false,
-            quant_bf16: false,
-            quant_fp8: false,
-            boundary_layers: 0,
-            givens_cos: None,
-            givens_sin: None,
-            layer_is_boundary: vec![],
-            compact_offset: 0,
-            v_mode: VMode::Q8,
-        })
-    }
-
-    fn new_gpu_asym3_multi(
-        gpus: &mut Gpus,
-        n_layers: usize,
-        n_kv_heads: usize,
-        head_dim: usize,
-        max_seq_len: usize,
-    ) -> HipResult<Self> {
-        Self::new_gpu_asym3_capped_multi(
-            gpus,
-            n_layers,
-            n_kv_heads,
-            head_dim,
-            max_seq_len,
-            max_seq_len,
-        )
-    }
-
-    fn new_gpu_asym3_capped_multi(
-        gpus: &mut Gpus,
-        n_layers: usize,
-        n_kv_heads: usize,
-        head_dim: usize,
-        max_seq_len: usize,
-        physical_cap: usize,
-    ) -> HipResult<Self> {
-        assert!(
-            head_dim == 256,
-            "asym3 currently requires head_dim=256 (Qwen 3.5)"
-        );
-        assert!(head_dim % 32 == 0);
-        assert!(physical_cap > 0 && physical_cap <= max_seq_len);
-        let kv_dim = n_kv_heads * head_dim;
-        let k_bph = 4 + (head_dim * 3) / 8;
-        let k_elems = (physical_cap * n_kv_heads * k_bph + 3) / 4;
-        let v_blocks_per_head = head_dim / 32;
-        let v_bpp = n_kv_heads * v_blocks_per_head * 34;
-        let v_elems = (physical_cap * v_bpp + 3) / 4;
-        let (k_gpu, v_gpu) = alloc_kv_per_layer_multi(gpus, n_layers, k_elems, v_elems)?;
-        replicate_givens_to_all_devices(gpus, head_dim / 2, 42)?;
-        Ok(Self {
-            k_gpu,
-            v_gpu,
-            k_scales: vec![],
-            v_scales: vec![],
-            kv_dim,
-            max_seq: max_seq_len,
-            physical_cap,
-            n_kv_heads,
-            head_dim,
-            quantized: true,
-            quant_q8: false,
-            quant_int8: false,
-            quant_hfq4: false,
-            quant_asym4: false,
-            quant_asym3: true,
-            quant_asym2: false,
-            quant_fwht: false,
-            quant_bf16: false,
-            quant_fp8: false,
-            boundary_layers: 0,
-            givens_cos: None,
-            givens_sin: None,
-            layer_is_boundary: vec![],
-            compact_offset: 0,
-            v_mode: VMode::Q8,
-        })
-    }
-
-    fn new_gpu_asym2_multi(
-        gpus: &mut Gpus,
-        n_layers: usize,
-        n_kv_heads: usize,
-        head_dim: usize,
-        max_seq_len: usize,
-    ) -> HipResult<Self> {
-        Self::new_gpu_asym2_capped_multi(
-            gpus,
-            n_layers,
-            n_kv_heads,
-            head_dim,
-            max_seq_len,
-            max_seq_len,
-        )
-    }
-
-    fn new_gpu_asym2_capped_multi(
-        gpus: &mut Gpus,
-        n_layers: usize,
-        n_kv_heads: usize,
-        head_dim: usize,
-        max_seq_len: usize,
-        physical_cap: usize,
-    ) -> HipResult<Self> {
-        assert!(
-            head_dim == 128 || head_dim == 256,
-            "asym2 requires head_dim=128 or 256"
-        );
-        assert!(head_dim % 32 == 0);
-        assert!(physical_cap > 0 && physical_cap <= max_seq_len);
-        let kv_dim = n_kv_heads * head_dim;
-        let k_bph = 4 + head_dim / 4;
-        let k_elems = (physical_cap * n_kv_heads * k_bph + 3) / 4;
-        let v_blocks_per_head = head_dim / 32;
-        let v_bpp = n_kv_heads * v_blocks_per_head * 34;
-        let v_elems = (physical_cap * v_bpp + 3) / 4;
-        let (k_gpu, v_gpu) = alloc_kv_per_layer_multi(gpus, n_layers, k_elems, v_elems)?;
-        replicate_givens_to_all_devices(gpus, head_dim / 2, 42)?;
-        Ok(Self {
-            k_gpu,
-            v_gpu,
-            k_scales: vec![],
-            v_scales: vec![],
-            kv_dim,
-            max_seq: max_seq_len,
-            physical_cap,
-            n_kv_heads,
-            head_dim,
-            quantized: true,
-            quant_q8: false,
-            quant_int8: false,
-            quant_hfq4: false,
-            quant_asym4: false,
-            quant_asym3: false,
-            quant_asym2: true,
-            quant_fwht: false,
-            quant_bf16: false,
-            quant_fp8: false,
-            boundary_layers: 0,
-            givens_cos: None,
-            givens_sin: None,
-            layer_is_boundary: vec![],
-            compact_offset: 0,
-            v_mode: VMode::Q8,
-        })
-    }
-
     // ── fwht multi-GPU constructors ──────────────────────────────────
     // Mirror the asym{4,3,2}_multi shape. Per-device signs1/signs2
     // replicated via replicate_fwht_signs_to_all_devices. The KvCache
@@ -7044,159 +6636,6 @@ impl KvCacheExt for KvCache {
         })
     }
 
-    fn new_gpu_asym4_capped_multi_filtered(
-        gpus: &mut Gpus,
-        is_kv_layer: &[bool],
-        n_kv_heads: usize,
-        head_dim: usize,
-        max_seq_len: usize,
-        physical_cap: usize,
-    ) -> HipResult<Self> {
-        assert!(
-            head_dim == 128 || head_dim == 256,
-            "asym4 requires head_dim=128 or 256"
-        );
-        assert!(head_dim % 32 == 0);
-        assert!(physical_cap > 0 && physical_cap <= max_seq_len);
-        let kv_dim = n_kv_heads * head_dim;
-        let k_bph = 4 + head_dim / 2;
-        let k_elems = (physical_cap * n_kv_heads * k_bph + 3) / 4;
-        let v_bpp = n_kv_heads * (head_dim / 32) * 34;
-        let v_elems = (physical_cap * v_bpp + 3) / 4;
-        let (k_gpu, v_gpu) =
-            alloc_kv_per_layer_multi_filtered(gpus, is_kv_layer, k_elems, v_elems)?;
-        replicate_givens_to_all_devices(gpus, head_dim / 2, 42)?;
-        Ok(Self {
-            k_gpu,
-            v_gpu,
-            k_scales: vec![],
-            v_scales: vec![],
-            kv_dim,
-            max_seq: max_seq_len,
-            physical_cap,
-            n_kv_heads,
-            head_dim,
-            quantized: true,
-            quant_q8: false,
-            quant_int8: false,
-            quant_hfq4: false,
-            quant_asym4: true,
-            quant_asym3: false,
-            quant_asym2: false,
-            quant_fwht: false,
-            quant_bf16: false,
-            quant_fp8: false,
-            boundary_layers: 0,
-            givens_cos: None,
-            givens_sin: None,
-            layer_is_boundary: vec![],
-            compact_offset: 0,
-            v_mode: VMode::Q8,
-        })
-    }
-
-    fn new_gpu_asym3_capped_multi_filtered(
-        gpus: &mut Gpus,
-        is_kv_layer: &[bool],
-        n_kv_heads: usize,
-        head_dim: usize,
-        max_seq_len: usize,
-        physical_cap: usize,
-    ) -> HipResult<Self> {
-        assert!(
-            head_dim == 256,
-            "asym3 currently requires head_dim=256 (Qwen 3.5)"
-        );
-        assert!(head_dim % 32 == 0);
-        assert!(physical_cap > 0 && physical_cap <= max_seq_len);
-        let kv_dim = n_kv_heads * head_dim;
-        let k_bph = 4 + (head_dim * 3) / 8;
-        let k_elems = (physical_cap * n_kv_heads * k_bph + 3) / 4;
-        let v_bpp = n_kv_heads * (head_dim / 32) * 34;
-        let v_elems = (physical_cap * v_bpp + 3) / 4;
-        let (k_gpu, v_gpu) =
-            alloc_kv_per_layer_multi_filtered(gpus, is_kv_layer, k_elems, v_elems)?;
-        replicate_givens_to_all_devices(gpus, head_dim / 2, 42)?;
-        Ok(Self {
-            k_gpu,
-            v_gpu,
-            k_scales: vec![],
-            v_scales: vec![],
-            kv_dim,
-            max_seq: max_seq_len,
-            physical_cap,
-            n_kv_heads,
-            head_dim,
-            quantized: true,
-            quant_q8: false,
-            quant_int8: false,
-            quant_hfq4: false,
-            quant_asym4: false,
-            quant_asym3: true,
-            quant_asym2: false,
-            quant_fwht: false,
-            quant_bf16: false,
-            quant_fp8: false,
-            boundary_layers: 0,
-            givens_cos: None,
-            givens_sin: None,
-            layer_is_boundary: vec![],
-            compact_offset: 0,
-            v_mode: VMode::Q8,
-        })
-    }
-
-    fn new_gpu_asym2_capped_multi_filtered(
-        gpus: &mut Gpus,
-        is_kv_layer: &[bool],
-        n_kv_heads: usize,
-        head_dim: usize,
-        max_seq_len: usize,
-        physical_cap: usize,
-    ) -> HipResult<Self> {
-        assert!(
-            head_dim == 128 || head_dim == 256,
-            "asym2 requires head_dim=128 or 256"
-        );
-        assert!(head_dim % 32 == 0);
-        assert!(physical_cap > 0 && physical_cap <= max_seq_len);
-        let kv_dim = n_kv_heads * head_dim;
-        let k_bph = 4 + head_dim / 4;
-        let k_elems = (physical_cap * n_kv_heads * k_bph + 3) / 4;
-        let v_bpp = n_kv_heads * (head_dim / 32) * 34;
-        let v_elems = (physical_cap * v_bpp + 3) / 4;
-        let (k_gpu, v_gpu) =
-            alloc_kv_per_layer_multi_filtered(gpus, is_kv_layer, k_elems, v_elems)?;
-        replicate_givens_to_all_devices(gpus, head_dim / 2, 42)?;
-        Ok(Self {
-            k_gpu,
-            v_gpu,
-            k_scales: vec![],
-            v_scales: vec![],
-            kv_dim,
-            max_seq: max_seq_len,
-            physical_cap,
-            n_kv_heads,
-            head_dim,
-            quantized: true,
-            quant_q8: false,
-            quant_int8: false,
-            quant_hfq4: false,
-            quant_asym4: false,
-            quant_asym3: false,
-            quant_asym2: true,
-            quant_fwht: false,
-            quant_bf16: false,
-            quant_fp8: false,
-            boundary_layers: 0,
-            givens_cos: None,
-            givens_sin: None,
-            layer_is_boundary: vec![],
-            compact_offset: 0,
-            v_mode: VMode::Q8,
-        })
-    }
-
     fn new_gpu_fwht4_capped_multi_filtered(
         gpus: &mut Gpus,
         is_kv_layer: &[bool],
@@ -7426,41 +6865,8 @@ fn alloc_kv_with_scales_per_layer_multi(
     Ok((k_gpu, v_gpu, k_scales, v_scales))
 }
 
-/// Asym{2,3,4} KV-rotation tables replicated to every device. Replaces any
-/// previous contents of `gpus.givens_*_per_dev`. Stage 6 forward dispatch
-/// reads `gpus.givens_*_per_dev[layer_to_device[i]]` per layer.
-fn replicate_givens_to_all_devices(gpus: &mut Gpus, n_blocks: usize, seed: u32) -> HipResult<()> {
-    let (cos_vals, sin_vals) = KvCache::gen_givens_angles(seed, n_blocks);
-    let cb: Vec<u8> = cos_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
-    let sb: Vec<u8> = sin_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
-
-    let prev_cos = std::mem::take(&mut gpus.givens_cos_per_dev);
-    let prev_sin = std::mem::take(&mut gpus.givens_sin_per_dev);
-    for (i, t) in prev_cos.into_iter().enumerate() {
-        if i < gpus.devices.len() {
-            let _ = gpus.devices[i].free_tensor(t);
-        }
-    }
-    for (i, t) in prev_sin.into_iter().enumerate() {
-        if i < gpus.devices.len() {
-            let _ = gpus.devices[i].free_tensor(t);
-        }
-    }
-
-    for dev_idx in 0..gpus.devices.len() {
-        let g = &mut gpus.devices[dev_idx];
-        let ct = g.alloc_tensor(&[n_blocks], DType::F32)?;
-        let st = g.alloc_tensor(&[n_blocks], DType::F32)?;
-        g.hip.memcpy_htod(&ct.buf, &cb)?;
-        g.hip.memcpy_htod(&st.buf, &sb)?;
-        gpus.givens_cos_per_dev.push(ct);
-        gpus.givens_sin_per_dev.push(st);
-    }
-    Ok(())
-}
-
 /// Multi-device replication of signed-FWHT sign vectors. Mirrors
-/// `replicate_givens_to_all_devices` but uses gen_fwht_signs (seeds
+/// the per-device KV-rotation table replication, using gen_fwht_signs (seeds
 /// 42/1042, matching the single-GPU `new_gpu_fwht*_filtered` ctors and
 /// the MQ4 weight-FWHT convention). signs1/signs2 occupy the same
 /// per-device slots as cos/sin — dispatcher branches on `quant_fwht`
@@ -9184,13 +8590,13 @@ mod tests {
     /// hardcoded `quant_q4: false`; pin that `tier_inputs()` matches, and that
     /// `derive()` (which routes through classify) does not panic in debug.
     #[test]
-    fn tier_inputs_asym3_has_no_residual_q4_flag() {
+    fn tier_inputs_fwht3_has_no_residual_q4_flag() {
         let mut gpu = match Gpu::init() {
             Ok(g) => g,
             Err(_) => return,
         };
-        // asym3 requires head_dim == 256.
-        let kv = KvCache::new_gpu_asym3(&mut gpu, 1, 8, 256, 16).unwrap();
+        // fwht3 requires head_dim == 256.
+        let kv = KvCache::new_gpu_fwht3_filtered(&mut gpu, &[true], 8, 256, 16).unwrap();
 
         let got = KvTierInputs {
             pos: 100,

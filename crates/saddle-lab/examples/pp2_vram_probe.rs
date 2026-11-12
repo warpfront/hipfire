@@ -4,7 +4,7 @@
 
 //! Real-measurement VRAM probe for the multi-GPU PP=2 path. Loads the
 //! given model with `load_weights_multi`, builds `Qwen35ScratchSet` +
-//! `KvCache::new_gpu_asym3_capped_multi` + `DeltaNetState` (Q8), and
+//! `KvCache::new_gpu_q8_capped_multi` + `DeltaNetState` (Q8), and
 //! reports per-card VRAM deltas at each stage. Output is a markdown
 //! table row suitable for `docs/multi-gpu.md`.
 //!
@@ -96,8 +96,8 @@ fn main() {
     fmt_per_card("Δ scratch", &scratch_delta);
     after = after_scratch;
 
-    // Stage 3: KvCache asym3 capped
-    let kv = KvCache::new_gpu_asym3_capped_multi(
+    // Stage 3: KvCache q8 capped
+    let kv = KvCache::new_gpu_q8_capped_multi(
         &mut gpus,
         config.n_layers,
         config.n_kv_heads,
@@ -105,7 +105,7 @@ fn main() {
         max_seq,
         max_seq,
     )
-    .expect("kv asym3");
+    .expect("kv q8");
     let after_kv = used_gb(&gpus, &baseline_free);
     let kv_delta: Vec<f64> = after_kv
         .iter()
@@ -155,7 +155,7 @@ fn main() {
 
     println!("\n── markdown row ──────────────────────────────────────────");
     println!(
-        "| {} | {} | {} | {} | asym3 | {} | {:.1} GB | {} MB | {} MB | {:.1} GB | {:.1} GB | {} |",
+        "| {} | {} | {} | {} | q8 | {} | {:.1} GB | {} MB | {} MB | {:.1} GB | {:.1} GB | {} |",
         model_tag,
         quant_tag,
         config.n_layers,

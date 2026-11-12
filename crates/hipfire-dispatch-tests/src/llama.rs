@@ -52,36 +52,6 @@ fn llama_kv_tier_q8_uses_q8_kernels_no_givens() {
 }
 
 #[test]
-fn llama_kv_tier_asym4_uses_givens() {
-    use hipfire_dispatch::families::kv_tier::KvTierPlan;
-    use hipfire_dispatch::types::KernelKey;
-    let plan = KvTierPlan::derive(tier_inputs_base().with_asym4()).unwrap();
-    assert!(plan.uses_givens, "Asym4 must set uses_givens");
-    assert_eq!(plan.write_key, KernelKey::KvWriteAsym4);
-    assert_eq!(plan.attend_key, KernelKey::AttnFlashAsym4);
-}
-
-#[test]
-fn llama_kv_tier_asym3_uses_givens() {
-    use hipfire_dispatch::families::kv_tier::KvTierPlan;
-    use hipfire_dispatch::types::KernelKey;
-    let plan = KvTierPlan::derive(tier_inputs_base().with_asym3()).unwrap();
-    assert!(plan.uses_givens, "Asym3 must set uses_givens");
-    assert_eq!(plan.write_key, KernelKey::KvWriteAsym3);
-    assert_eq!(plan.attend_key, KernelKey::AttnFlashAsym3);
-}
-
-#[test]
-fn llama_kv_tier_asym2_uses_givens() {
-    use hipfire_dispatch::families::kv_tier::KvTierPlan;
-    use hipfire_dispatch::types::KernelKey;
-    let plan = KvTierPlan::derive(tier_inputs_base().with_asym2()).unwrap();
-    assert!(plan.uses_givens, "Asym2 must set uses_givens");
-    assert_eq!(plan.write_key, KernelKey::KvWriteAsym2);
-    assert_eq!(plan.attend_key, KernelKey::AttnFlashAsym2);
-}
-
-#[test]
 fn llama_kv_tier_hfq8_no_givens() {
     use hipfire_dispatch::families::kv_tier::KvTierPlan;
     use hipfire_dispatch::types::KernelKey;
@@ -138,8 +108,6 @@ fn llama_kv_tier_asym4_fwht_uses_givens() {
 trait KvTierInputsExt: Sized {
     fn with_q8(self) -> Self;
     fn with_asym4(self) -> Self;
-    fn with_asym3(self) -> Self;
-    fn with_asym2(self) -> Self;
     fn with_hfq8(self) -> Self;
     fn with_q4(self) -> Self;
     fn with_hfq4(self) -> Self;
@@ -152,14 +120,6 @@ impl KvTierInputsExt for hipfire_dispatch::families::kv_tier::KvTierInputs {
     }
     fn with_asym4(mut self) -> Self {
         self.quant_asym4 = true;
-        self
-    }
-    fn with_asym3(mut self) -> Self {
-        self.quant_asym3 = true;
-        self
-    }
-    fn with_asym2(mut self) -> Self {
-        self.quant_asym2 = true;
         self
     }
     fn with_hfq8(mut self) -> Self {

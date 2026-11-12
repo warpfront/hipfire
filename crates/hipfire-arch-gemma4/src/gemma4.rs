@@ -921,8 +921,6 @@ pub enum FullKvTier {
     Q8,
     /// FWHT-512 3-bit K + Q8_0 V (developer examples only).
     Fwht3,
-    /// Deprecated Givens asym3 (`kv_cache=legacy-asym3`).
-    LegacyAsym3,
 }
 
 /// Single-row routed-expert scratch of a MoE checkpoint; batched forwards
@@ -1081,9 +1079,9 @@ fn build_kv_slot_map(cfg: &Gemma4Config) -> Result<Vec<usize>, String> {
     Ok(slots)
 }
 
-/// Single-query asym3 hd512 flash partials: `n_heads * ceil(max_seq/128) *
-/// (2 + head_dim)` floats at the asym3 kernel's fixed 128-row tile.
-fn asym3_flash_partials_len(cfg: &Gemma4Config, max_seq: usize) -> usize {
+/// Single-query rotated-K hd512 flash partials: `n_heads * ceil(max_seq/128) *
+/// (2 + head_dim)` floats at the kernel's fixed 128-row tile.
+fn rotated_flash_partials_len(cfg: &Gemma4Config, max_seq: usize) -> usize {
     cfg.n_heads * max_seq.div_ceil(128) * (2 + cfg.full_head_dim)
 }
 
@@ -1159,7 +1157,6 @@ impl Gemma4State {
                 max_seq,
                 max_seq,
             ),
-            FullKvTier::LegacyAsym3 => KvCache::new_gpu_asym3_gemma4(g, n_full, heads, hd, max_seq),
         })?;
         let dim = cfg.dim;
         let max_q = cfg.max_q_dim();
@@ -1174,7 +1171,7 @@ impl Gemma4State {
             FLASH_PARTIALS_ROWS,
         );
         if tier != FullKvTier::Q8 {
-            partials = partials.max(asym3_flash_partials_len(cfg, max_seq));
+            partials = partials.max(rotated_flash_partials_len(cfg, max_seq));
         }
 
         let pos_buf = l.alloc("pos_buf", |g| g.zeros(&[1], DType::F32))?;

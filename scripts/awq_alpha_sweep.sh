@@ -33,7 +33,7 @@ QUANT_SLOT=/local/hipfire/qwen3.5-9b.mq4-awq-current
 
 # ── sweep params ──────────────────────────────────────────────────────
 MAX_CHUNKS=${MAX_CHUNKS:-50}
-KV_MODE=${KV_MODE:-asym3}
+KV_MODE=${KV_MODE:-fwht3}
 SCORING=${SCORING:-prefill}
 RESULTS_LABEL=${RESULTS_LABEL:-2026-05-14-awq-alpha-sweep-9b-gfx906}
 RESULTS_DIR=benchmarks/quality-baselines/results/$RESULTS_LABEL

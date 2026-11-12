@@ -49,14 +49,14 @@ for prefill in $PREFILLS; do
             log="$OUT_ROOT/raw/pp${prefill}_tg${GEN_TOKENS}_${mode}_run${run}.log"
             echo "[$mode] PP${prefill}/TG${GEN_TOKENS} run ${run}/${RUNS}"
             if [[ "$mode" == "ck" ]]; then
-                env HIP_VISIBLE_DEVICES="$GPU_ID" HIPFIRE_KV_MODE=asym3 \
+                env HIP_VISIBLE_DEVICES="$GPU_ID" HIPFIRE_KV_MODE=fwht3 \
                     HIPFIRE_FLASH_ATTN_CK_LIB="$SIDECAR" \
                     HIPFIRE_FLASH_ATTN_CK_WORKSPACE_BYTES="$WORKSPACE_BYTES" \
                     "$BENCH" "$MODEL" --prefill "$prefill" --prefill-runs 1 \
                     --warmup "$WARMUP_TOKENS" --gen "$GEN_TOKENS" 2>&1 | tee "$log"
             else
                 env -u HIPFIRE_FLASH_ATTN_CK_LIB -u HIPFIRE_FLASH_ATTN_CK_WORKSPACE_BYTES \
-                    -u HIPFIRE_FLASH_PREFILL HIP_VISIBLE_DEVICES="$GPU_ID" HIPFIRE_KV_MODE=asym3 \
+                    -u HIPFIRE_FLASH_PREFILL HIP_VISIBLE_DEVICES="$GPU_ID" HIPFIRE_KV_MODE=fwht3 \
                     "$BENCH" "$MODEL" --prefill "$prefill" --prefill-runs 1 \
                     --warmup "$WARMUP_TOKENS" --gen "$GEN_TOKENS" 2>&1 | tee "$log"
             fi

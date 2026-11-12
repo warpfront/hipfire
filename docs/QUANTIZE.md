@@ -213,8 +213,7 @@ Refused projection containers: Lloyd-V2 (qt52), E8/MFP4 and
 G128-rotated containers. fp32 DeltaNet state also refuses with a named
 error. AWQ sidecars are refused inside a mixed-dtype group (each scale
 needs its own rotated input). KV tiers: q8 (auto/unset default on every
-GPU), fwht{2,3,4} (`asymN`/`turboN` aliases; bare `turbo` = fwht3),
-legacy-asym{2,3,4}, native bf16/f16 (f16 is slots-only), and explicit fp8
+GPU), fwht{2,3,4}, native bf16/f16 (f16 is slots-only), and explicit fp8
 on exact gfx1201 only — `--kv-k`/`--kv-v` splits are not supported by slots.
 
 ### Vision-tower sidecar (`qwen3.8-27b-vision.hfq`)

@@ -21,7 +21,7 @@
 //! wall time that fusing into one kernel is worth the engineering.
 //!
 //! Usage:
-//!   profile_prefill_qwen35 <model.hfq> [--prefill N] [--warmup N] [--kv-mode asym3|q8|fp8]
+//!   profile_prefill_qwen35 <model.hfq> [--prefill N] [--warmup N] [--kv-mode q8|fp8]
 
 #[cfg(not(feature = "deltanet"))]
 fn main() {
@@ -40,14 +40,14 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: profile_prefill_qwen35 <model.hfq> [--prefill N] [--warmup N] [--kv-mode asym3|q8|fp8]");
+        eprintln!("Usage: profile_prefill_qwen35 <model.hfq> [--prefill N] [--warmup N] [--kv-mode q8|fp8]");
         std::process::exit(1);
     }
     let model_path = &args[1];
 
     let mut prefill_len: usize = 256;
     let mut warmup_iters: usize = 1;
-    let mut kv_mode: String = "asym3".into();
+    let mut kv_mode: String = "q8".into();
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
@@ -96,14 +96,6 @@ fn main() {
     // KV cache sized for prefill + a few extra tokens of headroom.
     let kv_seq = prefill_len + 32;
     let mut kv_cache = match kv_mode.as_str() {
-        "asym3" => KvCache::new_gpu_asym3(
-            &mut gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_seq,
-        )
-        .unwrap(),
         "q8" => KvCache::new_gpu_q8(
             &mut gpu,
             config.n_layers,
@@ -144,7 +136,7 @@ fn main() {
             .unwrap()
         }
         other => {
-            eprintln!("unknown --kv-mode {other}; use asym3, q8, or fp8");
+            eprintln!("unknown --kv-mode {other}; use q8 or fp8");
             std::process::exit(1);
         }
     };

@@ -16,7 +16,7 @@
 //!                --output <path-to-output.kldseq> \
 //!                [--variant <name>=auto-from-model-path] \
 //!                [--arch <name>=auto-from-gpu] \
-//!                [--kv-mode <mode>=asym3] \
+//!                [--kv-mode <mode>=q8] \
 //!                [--scoring-mode <per-token|prefill|prefill-whole|prefill-prompt>=prefill]
 //!                [--scored-max-batch <N>]
 //!
@@ -151,7 +151,7 @@ fn main() {
     let mut model: Option<PathBuf> = None;
     let mut ref_path: Option<PathBuf> = None;
     let mut output: Option<PathBuf> = None;
-    let mut kv_mode = "asym3".to_string();
+    let mut kv_mode = "q8".to_string();
     let mut kv_v = "q8".to_string();
     let mut scoring_mode = "prefill".to_string();
     let mut max_chunks: Option<usize> = None;
@@ -177,18 +177,11 @@ fn main() {
                 let v = argv[i + 1].clone();
                 if !matches!(
                     v.as_str(),
-                    "q8" | "fp8"
-                        | "bf16"
-                        | "asym2"
-                        | "asym3"
-                        | "asym4"
-                        | "fwht2"
-                        | "fwht3"
-                        | "fwht4"
-                        | "f32"
-                        | "f16"
+                    "q8" | "fp8" | "bf16" | "fwht2" | "fwht3" | "fwht4" | "f32" | "f16"
                 ) {
-                    eprintln!("--kv-mode must be one of: q8 fp8 bf16 asym2 asym3 asym4 fwht2 fwht3 fwht4 f32 f16 (got {v})");
+                    eprintln!(
+                        "--kv-mode must be one of: q8 fp8 bf16 fwht2 fwht3 fwht4 f32 f16 (got {v})"
+                    );
                     std::process::exit(1);
                 }
                 kv_mode = v;
@@ -241,7 +234,7 @@ fn main() {
                 i += 2;
             }
             "-h" | "--help" => {
-                eprintln!("Usage: eval_hipfire --model <path> --ref <path> --output <path> [--kv-mode asym3] [--kv-v q8] [--scoring-mode prefill|prefill-whole|prefill-prompt|per-token] [--max-chunks N] [--scored-max-batch N] [--tp N (qwen35 dense, prefill, q8/q8 KV)]\n{SCORING_MODE_HELP}");
+                eprintln!("Usage: eval_hipfire --model <path> --ref <path> --output <path> [--kv-mode q8] [--kv-v q8] [--scoring-mode prefill|prefill-whole|prefill-prompt|per-token] [--max-chunks N] [--scored-max-batch N] [--tp N (qwen35 dense, prefill, q8/q8 KV)]\n{SCORING_MODE_HELP}");
                 eprintln!("       [--per-token-output <path.ktok>]  (HFKTOK v1 per-token KLD f64s, any scoring mode; kldseq bytes unchanged)");
                 std::process::exit(0);
             }
@@ -293,7 +286,7 @@ fn main() {
     //
     // Note on HIPFIRE_GRAPH=0: byte-equality between graph=0 and graph=1
     // was verified on 2026-05-08 against this binary's forward path
-    // (dense Qwen3.5-9B mq4, prefill 64 tokens, kv_mode=asym3) — sha256
+    // (dense Qwen3.5-9B mq4, prefill 64 tokens, kv_mode=asym3 at the time; asym3 since removed) — sha256
     // matched, 0/248320 logits differed. The plan's force-OFF is therefore
     // a determinism *style* choice, not a correctness requirement: a
     // future contributor can safely flip this to opt-out (respect a
@@ -856,30 +849,6 @@ fn main() {
                 )
                 .unwrap()
             }
-            "asym4" => KvCache::new_gpu_asym4(
-                &mut gpu,
-                config.n_layers,
-                config.n_kv_heads,
-                config.head_dim,
-                kv_max,
-            )
-            .unwrap(),
-            "asym3" => KvCache::new_gpu_asym3(
-                &mut gpu,
-                config.n_layers,
-                config.n_kv_heads,
-                config.head_dim,
-                kv_max,
-            )
-            .unwrap(),
-            "asym2" => KvCache::new_gpu_asym2(
-                &mut gpu,
-                config.n_layers,
-                config.n_kv_heads,
-                config.head_dim,
-                kv_max,
-            )
-            .unwrap(),
             "fwht4" => KvCache::new_gpu_fwht4_filtered(
                 &mut gpu,
                 &is_kv_layer,
@@ -1246,30 +1215,6 @@ fn main() {
                 kv_max,
             )
             .unwrap(),
-            "asym4" => KvCache::new_gpu_asym4(
-                &mut gpu,
-                config.n_layers,
-                config.n_kv_heads,
-                config.head_dim,
-                kv_max,
-            )
-            .unwrap(),
-            "asym3" => KvCache::new_gpu_asym3(
-                &mut gpu,
-                config.n_layers,
-                config.n_kv_heads,
-                config.head_dim,
-                kv_max,
-            )
-            .unwrap(),
-            "asym2" => KvCache::new_gpu_asym2(
-                &mut gpu,
-                config.n_layers,
-                config.n_kv_heads,
-                config.head_dim,
-                kv_max,
-            )
-            .unwrap(),
             "f32" | "f16" => KvCache::new_gpu(
                 &mut gpu,
                 config.n_layers,
@@ -1279,7 +1224,7 @@ fn main() {
             )
             .unwrap(),
             other => {
-                eprintln!("llama: --kv-mode {other} not in q8/asym2/3/4/f32");
+                eprintln!("llama: --kv-mode {other} not in q8/f32");
                 std::process::exit(1);
             }
         };

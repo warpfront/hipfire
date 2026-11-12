@@ -40,7 +40,7 @@
 // The KV cache TIER is no longer fixed: the engine resolves a tier from the
 // same policy the sequential carrier uses (`QWEN35_HFQ_POLICY`), and the
 // KV-write + attend steps dispatch per tier (`SlotKvTier`, `kv_write_slots`,
-// `tier_attend_slots`) across the full static ladder — q8, asym{2,3,4},
+// `tier_attend_slots`) across the full static ladder — q8,
 // fwht{2,3,4} (bf16's descriptor-aware batched kernels are wired too; the
 // qwen35 policies simply never resolve to it). Slot addressing is a
 // KV-cache-tier property, not a weight-quant property, so the rest of the
@@ -160,7 +160,7 @@ fn pack_descs(descs: &[KvSlotDesc]) -> Vec<u8> {
 ///
 /// The multi-slot path originally shipped Q8_0-only (see this file's header
 /// comment); it is now tier-generic across the static ladder the qwen35
-/// carrier resolves — q8, asym{2,3,4}, fwht{2,3,4} — under BOTH the legacy
+/// carrier resolves — q8, fwht{2,3,4} — under BOTH the legacy
 /// slab pool and the paged pool, plus the flat native tiers bf16/f16 and
 /// the native fp8 tier (gfx1201-only; every other arch refuses at load).
 /// The tier touches exactly two steps of the FullAttention layer body: the
@@ -171,18 +171,13 @@ fn pack_descs(descs: &[KvSlotDesc]) -> Vec<u8> {
 /// DeltaNet, sampling — is tier-agnostic.
 ///
 /// The tables are model-global (shared by every slot and every layer):
-/// Givens angles for the asym tiers, ±1 FWHT sign vectors for the fwht
-/// tiers, none for q8/bf16/f16/fp8. They are built once by the rig with the
-/// same seeds as the sequential path's constructors
-/// (`gen_givens_angles(42, ·)`, `gen_fwht_signs(42|1042, ·)`), so the packed
+/// ±1 FWHT sign vectors for the fwht tiers, none for q8/bf16/f16/fp8. They
+/// are built once by the rig with the same seeds as the sequential path's
+/// constructors (`gen_fwht_signs(42|1042, ·)`), so the packed
 /// cache bytes a slot pool produces are bit-identical to the sequential
 /// engine's for the same tier.
 pub struct SlotKvTier {
     pub mode: KvMode,
-    /// Givens cos table (`[head_dim/2]` f32) — asym tiers only.
-    pub givens_cos: Option<GpuTensor>,
-    /// Givens sin table — asym tiers only.
-    pub givens_sin: Option<GpuTensor>,
     /// FWHT signs1 (`[128]` f32) — fwht tiers only.
     pub fwht_signs1: Option<GpuTensor>,
     /// FWHT signs2 — fwht tiers only.
@@ -194,8 +189,6 @@ impl SlotKvTier {
     pub fn q8() -> Self {
         Self {
             mode: KvMode::Q8,
-            givens_cos: None,
-            givens_sin: None,
             fwht_signs1: None,
             fwht_signs2: None,
         }
@@ -209,12 +202,6 @@ impl SlotKvTier {
 /// Drop the rig-owned tables when the engine tears down.
 impl SlotKvTier {
     pub fn free_gpu(self, gpu: &mut Gpu) {
-        if let Some(t) = self.givens_cos {
-            let _ = gpu.free_tensor(t);
-        }
-        if let Some(t) = self.givens_sin {
-            let _ = gpu.free_tensor(t);
-        }
         if let Some(t) = self.fwht_signs1 {
             let _ = gpu.free_tensor(t);
         }
@@ -2100,60 +2087,6 @@ fn kv_write_slots(
                 /*use_v_base=*/ false,
             )
         }
-        KvMode::Asym2 => gpu.kv_cache_write_asym2_batched_slots(
-            k_cache,
-            v_cache,
-            k_batch,
-            v_batch,
-            positions,
-            kv.givens_cos
-                .as_ref()
-                .expect("asym2 tier without givens cos"),
-            kv.givens_sin
-                .as_ref()
-                .expect("asym2 tier without givens sin"),
-            n_kv_heads,
-            head_dim,
-            n_rows,
-            Some(descs),
-            Some(row_slot),
-        ),
-        KvMode::Asym3 => gpu.kv_cache_write_asym3_batched_slots(
-            k_cache,
-            v_cache,
-            k_batch,
-            v_batch,
-            positions,
-            kv.givens_cos
-                .as_ref()
-                .expect("asym3 tier without givens cos"),
-            kv.givens_sin
-                .as_ref()
-                .expect("asym3 tier without givens sin"),
-            n_kv_heads,
-            head_dim,
-            n_rows,
-            Some(descs),
-            Some(row_slot),
-        ),
-        KvMode::Asym4 => gpu.kv_cache_write_asym4_batched_slots(
-            k_cache,
-            v_cache,
-            k_batch,
-            v_batch,
-            positions,
-            kv.givens_cos
-                .as_ref()
-                .expect("asym4 tier without givens cos"),
-            kv.givens_sin
-                .as_ref()
-                .expect("asym4 tier without givens sin"),
-            n_kv_heads,
-            head_dim,
-            n_rows,
-            Some(descs),
-            Some(row_slot),
-        ),
         KvMode::Fwht2 => gpu.kv_cache_write_fwht2_batched_slots(
             k_cache,
             v_cache,
@@ -2332,78 +2265,6 @@ fn tier_attend_slots(
     let d = Some(descs_dev);
     let r = Some(row_slot_dev);
     match kv.mode {
-        KvMode::Asym2 => gpu.attention_flash_asym2_batched_slots(
-            q,
-            k_cache,
-            v_cache,
-            out,
-            positions,
-            kv.givens_cos
-                .as_ref()
-                .expect("asym2 tier without givens cos"),
-            kv.givens_sin
-                .as_ref()
-                .expect("asym2 tier without givens sin"),
-            n_heads,
-            n_kv_heads,
-            head_dim,
-            physical_cap,
-            max_ctx_len,
-            batch_size,
-            flash_partials,
-            d,
-            r,
-        ),
-        KvMode::Asym3 => gpu.attention_flash_asym3_batched_masked_slots(
-            q,
-            k_cache,
-            v_cache,
-            out,
-            positions,
-            kv.givens_cos
-                .as_ref()
-                .expect("asym3 tier without givens cos"),
-            kv.givens_sin
-                .as_ref()
-                .expect("asym3 tier without givens sin"),
-            n_heads,
-            n_kv_heads,
-            head_dim,
-            physical_cap,
-            max_ctx_len,
-            batch_size,
-            flash_partials,
-            None,
-            0,
-            0,
-            d,
-            r,
-        ),
-        KvMode::Asym4 => gpu.attention_flash_asym4_batched_masked_slots(
-            q,
-            k_cache,
-            v_cache,
-            out,
-            positions,
-            kv.givens_cos
-                .as_ref()
-                .expect("asym4 tier without givens cos"),
-            kv.givens_sin
-                .as_ref()
-                .expect("asym4 tier without givens sin"),
-            n_heads,
-            n_kv_heads,
-            head_dim,
-            physical_cap,
-            max_ctx_len,
-            batch_size,
-            flash_partials,
-            None,
-            0,
-            0,
-            d,
-            r,
-        ),
         KvMode::Fwht2 => gpu.attention_flash_fwht2_batched_slots(
             q,
             k_cache,

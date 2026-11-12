@@ -110,7 +110,7 @@ pub fn legacy_warning(backend: KvBackend, reason: Option<&str>) -> Option<String
 /// FWHT K tiers paired with Q8/Lloyd V use the same static row layouts as their
 /// legacy-storage owners, but are admitted only on exact gfx1100 TP1: extending
 /// this predicate must not accidentally promote TP2 or gfx1151 without separate
-/// lifecycle proof. Deprecated Givens `legacy-asym*` remains fail-closed.
+/// lifecycle proof. Givens `legacy-asym*` was removed in 0.5.0.
 fn qwen35_gfx11_vmm_supported(
     gpu_arch: &str,
     arch_id: u32,
@@ -3287,50 +3287,18 @@ pub fn admit_source_with_options(
                 "Qwen native fp8/bf16 is single-GPU only; use --kv-mode q8 for TP/EP".into(),
             );
         }
-        if arch_id == 1 && matches!(k, KvMode::Asym3 | KvMode::Asym4) {
-            use hipfire_runtime::arch::Architecture;
-            let head_dim = match &source {
-                ModelSource::Hfq(h) => {
-                    <hipfire_arch_llama::Llama as Architecture>::config_from_hfq(h)
-                        .map_err(|e| format!("Qwen KV admission config: {e}"))?
-                        .head_dim
-                }
-                ModelSource::Dir(d) => {
-                    hipfire_runtime::hfq::config_from_safetensors_llama(d)
-                        .map_err(|e| format!("Qwen KV admission config: {e}"))?
-                        .head_dim
-                }
-            };
-            if head_dim != 256 {
-                return Err(format!(
-                    "Qwen legacy-asym K requires head_dim=256 (got {head_dim}); use --kv-mode q8"
-                ));
-            }
-        }
         if let Some(cfg) = qwen_cfg.as_ref() {
-            if matches!(
-                k,
-                KvMode::Fp8 | KvMode::Bf16 | KvMode::Asym2 | KvMode::Asym3 | KvMode::Asym4
-            ) {
-                if matches!(k, KvMode::Fp8 | KvMode::Bf16) {
-                    if let Some(why) = kv_mode::qwen35_native_refusal(
-                        k,
-                        gpu_arch,
-                        cfg.n_heads,
-                        cfg.n_kv_heads,
-                        cfg.head_dim,
-                        pp,
-                        adaptive,
-                    ) {
-                        return Err(why);
-                    }
-                }
-                if matches!(k, KvMode::Asym2 | KvMode::Asym3 | KvMode::Asym4) && cfg.head_dim != 256
-                {
-                    return Err(format!(
-                        "Qwen legacy-asym K requires head_dim=256 (got {}); use --kv-mode q8",
-                        cfg.head_dim
-                    ));
+            if matches!(k, KvMode::Fp8 | KvMode::Bf16) {
+                if let Some(why) = kv_mode::qwen35_native_refusal(
+                    k,
+                    gpu_arch,
+                    cfg.n_heads,
+                    cfg.n_kv_heads,
+                    cfg.head_dim,
+                    pp,
+                    adaptive,
+                ) {
+                    return Err(why);
                 }
             }
         }
@@ -3853,10 +3821,7 @@ mod tests {
 
     #[test]
     fn gfx1100_qwen35_vmm_admits_fwht_split_matrix_only_on_tp1() {
-        for mode in [
-            "fwht2", "fwht3", "fwht4", "asym2", "asym3", "asym4", "turbo", "turbo2", "turbo3",
-            "turbo4",
-        ] {
+        for mode in ["fwht2", "fwht3", "fwht4"] {
             assert!(qwen35_gfx11_vmm_supported(
                 "gfx1100", 5, 1, mode, None, None
             ));
@@ -3933,10 +3898,7 @@ mod tests {
     fn gfx1151_fwht_k_override_predicate_is_scoped() {
         let refuses = qwen35_gfx1151_fwht_k_override;
         for mode in ["", "auto", "q8", " q8 "] {
-            for k in [
-                "fwht2", "fwht3", "fwht4", "asym2", "asym3", "asym4", "turbo2", "turbo3", "turbo4",
-                "turbo", " fwht3 ",
-            ] {
+            for k in ["fwht2", "fwht3", "fwht4", " fwht3 "] {
                 for arch_id in [5, 6] {
                     assert!(refuses("gfx1151", arch_id, mode, Some(k)));
                     for arch in ["gfx1100", "gfx1201", "gfx1030"] {
@@ -3950,9 +3912,11 @@ mod tests {
                 Some(""),
                 Some(" "),
                 Some("q8"),
-                Some("legacy-asym2"),
+                // Names removed in 0.5.0 never parse as an FWHT override; the
+                // load request is rejected at name parsing instead.
+                Some("asym3"),
+                Some("turbo3"),
                 Some("legacy-asym3"),
-                Some("legacy-asym4"),
                 Some("fwht5"),
             ] {
                 for arch in ["gfx1100", "gfx1151", "gfx1201"] {
@@ -3960,7 +3924,7 @@ mod tests {
                 }
             }
         }
-        for mode in ["fwht2", "fwht3", "fwht4", "legacy-asym3", "fp8", "bf16"] {
+        for mode in ["fwht2", "fwht3", "fwht4", "fp8", "bf16"] {
             assert!(!refuses("gfx1151", 5, mode, Some("fwht3")));
         }
     }

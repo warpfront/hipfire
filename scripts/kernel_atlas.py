@@ -254,13 +254,6 @@ def normalize_flash_requested(env):
 def infer_attention_route(kv_mode, env):
     kv = str(kv_mode or (env or {}).get("HIPFIRE_KV_MODE", "")).strip().lower()
     flash_requested = normalize_flash_requested(env)
-    if kv in ("asym2", "asym3", "asym4"):
-        return {
-            "attention_impl": f"attention_flash_{kv}",
-            "flash_active": True,
-            "flash_requested": flash_requested,
-            "route_confidence": "static_kv_policy",
-        }
     if kv in ("fwht2", "fwht3", "fwht4"):
         return {
             "attention_impl": f"attention_flash_{kv}",
@@ -3430,7 +3423,7 @@ def build_parser():
     ar.add_argument("--gen", type=int, default=50)
     ar.add_argument("--warmup", type=int, default=5)
     ar.add_argument("--runs", type=int, default=1)
-    ar.add_argument("--kv-mode", default="asym3")
+    ar.add_argument("--kv-mode", default="fwht3")
     ar.add_argument("--dpm-warmup-secs", default="3")
     ar.add_argument("--graph", action="store_true")
     ar.add_argument("--profile-prefill", action="store_true", help="capture prefill per-kernel profile table")

@@ -309,13 +309,8 @@ pub fn fused_attention_epilogue(gpu: &Gpu, dims: &HybridDims, wo: &WeightRef<'_>
 /// partials the shared q8 gated reducer consumes unmodified (StageB S6). The
 /// scalar fp8 reader writes final output directly and has no fused path, so
 /// it must never set output_gate.
-fn attention_epilogue_route_supported(
-    is_gfx1201: bool,
-    q8_route: bool,
-    asym3_route: bool,
-    fp8_route: bool,
-) -> bool {
-    q8_route || fp8_route || (!is_gfx1201 && asym3_route)
+fn attention_epilogue_route_supported(q8_route: bool, fp8_route: bool) -> bool {
+    q8_route || fp8_route
 }
 
 /// Pure core of [`conv_scalar_prep`]: the arch, env `mode` and shape decision.
@@ -1084,9 +1079,7 @@ pub fn kv_attention(
     let plan = kv.tier_plan(gpu, row.position)?;
     let route = |write, attend| plan.write_key == write && plan.attend_key == attend;
     let fused_epilogue_route = attention_epilogue_route_supported(
-        gpu.arch_caps.is_gfx1201(),
         route(KernelKey::KvWriteQ8_0, KernelKey::AttnFlashQ8_0),
-        route(KernelKey::KvWriteAsym3, KernelKey::AttnFlashAsym3),
         route(KernelKey::KvWriteFp8E4m3, KernelKey::AttnFlashFp8E4m3),
     );
     let fused_epilogue = fused_attention_epilogue(gpu, dims, wo) && fused_epilogue_route;
@@ -1613,16 +1606,8 @@ mod tests {
 
     #[test]
     fn gfx1201_fa_epilogue_admits_q8_and_fp8_tile() {
-        assert!(attention_epilogue_route_supported(true, true, false, false));
-        assert!(attention_epilogue_route_supported(true, false, false, true));
-        assert!(!attention_epilogue_route_supported(
-            true, false, true, false
-        ));
-        assert!(attention_epilogue_route_supported(
-            false, false, true, false
-        ));
-        assert!(!attention_epilogue_route_supported(
-            true, false, false, false
-        ));
+        assert!(attention_epilogue_route_supported(true, false));
+        assert!(attention_epilogue_route_supported(false, true));
+        assert!(!attention_epilogue_route_supported(false, false));
     }
 }

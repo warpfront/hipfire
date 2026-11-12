@@ -106,16 +106,6 @@ fn qwen35_prefill_q4k_q6k_unsupported() {
 
 // ─── Qwen3.5 dispatch constants ───────────────────────────────
 
-#[test]
-fn qwen35_default_kv_mode_is_asym3() {
-    // The daemon defaults to asym3/turbo3 for KV cache.
-    // This is a policy decision in daemon.rs load_model.
-    // The KvCache::new_gpu_asym3_capped sets:
-    //   quantized=true, quant_asym3=true, quant_fwht=false (Givens rotation)
-    let caps = vec![false, false, false, false, true, false, false]; // matches asym3 pattern
-    assert_eq!(caps[4], true); // quant_asym3
-}
-
 // ─── Qwen3.5 MoE dispatch ─────────────────────────────────────
 
 #[test]

@@ -127,7 +127,7 @@ fn main() {
 
     let kv_seq = (prefill_len + warmup_len + gen_len + 16).max(512);
     // KV cache mode via resolved TOML policy:
-    //   q8 (default) | asym4 | asym3 | fwht3 | asym2
+    //   q8 (default) | fwht3
     let kv_mode = match hipfire_runtime::config::get().kv_mode.as_str() {
         "auto" => "q8".to_string(),
         mode => mode.to_string(),
@@ -135,22 +135,6 @@ fn main() {
     eprintln!("KV mode: {kv_mode}");
     let mut kv_cache = match kv_mode.as_str() {
         "q8" => KvCache::new_gpu_q8(
-            &mut gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_seq,
-        )
-        .unwrap(),
-        "asym4" | "turbo4" => KvCache::new_gpu_asym4(
-            &mut gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_seq,
-        )
-        .unwrap(),
-        "asym3" | "turbo3" | "turbo" => KvCache::new_gpu_asym3(
             &mut gpu,
             config.n_layers,
             config.n_kv_heads,
@@ -166,15 +150,7 @@ fn main() {
             kv_seq,
         )
         .unwrap(),
-        "asym2" | "turbo2" => KvCache::new_gpu_asym2(
-            &mut gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_seq,
-        )
-        .unwrap(),
-        other => panic!("unknown HIPFIRE_KV_MODE: {other}  (use q8|asym4|asym3|fwht3|asym2)"),
+        other => panic!("unknown HIPFIRE_KV_MODE: {other}  (use q8|fwht3)"),
     };
     let mut dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
     let scratch = Qwen35Scratch::new_with_kv_max(&mut gpu, &config, 128, kv_seq).unwrap();
@@ -237,33 +213,9 @@ fn main() {
                 kv_seq,
             )
             .unwrap(),
-            "asym4" | "turbo4" => KvCache::new_gpu_asym4(
-                &mut gpu,
-                config.n_layers,
-                config.n_kv_heads,
-                config.head_dim,
-                kv_seq,
-            )
-            .unwrap(),
-            "asym3" | "turbo3" | "turbo" => KvCache::new_gpu_asym3(
-                &mut gpu,
-                config.n_layers,
-                config.n_kv_heads,
-                config.head_dim,
-                kv_seq,
-            )
-            .unwrap(),
             "fwht3" => KvCache::new_gpu_fwht3_filtered(
                 &mut gpu,
                 &vec![true; config.n_layers],
-                config.n_kv_heads,
-                config.head_dim,
-                kv_seq,
-            )
-            .unwrap(),
-            "asym2" | "turbo2" => KvCache::new_gpu_asym2(
-                &mut gpu,
-                config.n_layers,
                 config.n_kv_heads,
                 config.head_dim,
                 kv_seq,
@@ -421,33 +373,9 @@ fn main() {
                         kv_seq,
                     )
                     .unwrap(),
-                    "asym4" | "turbo4" => KvCache::new_gpu_asym4(
-                        &mut gpu,
-                        config.n_layers,
-                        config.n_kv_heads,
-                        config.head_dim,
-                        kv_seq,
-                    )
-                    .unwrap(),
-                    "asym3" | "turbo3" | "turbo" => KvCache::new_gpu_asym3(
-                        &mut gpu,
-                        config.n_layers,
-                        config.n_kv_heads,
-                        config.head_dim,
-                        kv_seq,
-                    )
-                    .unwrap(),
                     "fwht3" => KvCache::new_gpu_fwht3_filtered(
                         &mut gpu,
                         &vec![true; config.n_layers],
-                        config.n_kv_heads,
-                        config.head_dim,
-                        kv_seq,
-                    )
-                    .unwrap(),
-                    "asym2" | "turbo2" => KvCache::new_gpu_asym2(
-                        &mut gpu,
-                        config.n_layers,
                         config.n_kv_heads,
                         config.head_dim,
                         kv_seq,

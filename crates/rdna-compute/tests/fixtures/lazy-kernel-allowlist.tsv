@@ -35,17 +35,6 @@ module	attention_dflash_wmma_m64_n32_f16kv_v6_f32	no-caller	No production caller
 module	attention_dflash_wmma_n128_f16kv_f32	non-core-family	Non-core family route: dots.ocr; rdna-compute/src/attention.rs:17776
 module	attention_dflash_wmma_n64_f16kv_f32	no-caller	No production caller; only definitions, tests/examples or an unreachable launcher branch remain; rdna-compute/src/attention.rs:17677
 module	attention_encoder_qtiled_f32	non-core-family	Non-core artifact/shape route: launcher ; sole caller (Qwen3.5 embedding encoder, not a core LLM artifact).; rdna-compute/src/attention.rs:3357
-module	attention_flash_asym2_tile	config-opt-in	Non-default configuration: attention.rs / memory.kv_cache; rdna-compute/src/attention.rs:15507
-module	attention_flash_asym2_tile_batched	config-opt-in	Non-default configuration: attention.rs / memory.kv_cache; rdna-compute/src/attention.rs:13479
-module	attention_flash_asym2_tile_batched_paged	config-opt-in	Non-default configuration: attention.rs / serve.multi_slot; rdna-compute/src/attention.rs:11406
-module	attention_flash_asym3_tile_hd512	non-core-family	Non-core family route: Gemma; hipfire-dispatch/src/families/attention.rs:629-631
-module	attention_flash_asym3_tile_hd512_batched	non-core-family	Non-core family route: Gemma, Qwen2/Llama; rdna-compute/src/attention.rs:14398
-module	attention_flash_asym3_tile_hd512_batched_paged	non-core-family	Non-core artifact/shape route: module attention_flash_asym3_tile_hd512_batched_paged compiled at (ensure_givens4_kv_slot_kernel); descr; rdna-compute/src/attention.rs:11406
-module	attention_flash_asym4_tile	config-opt-in	Non-default configuration: attention.rs / memory.kv_cache; rdna-compute/src/attention.rs:15169
-module	attention_flash_asym4_tile_batched	config-opt-in	Non-default configuration: attention.rs / memory.kv_cache; rdna-compute/src/attention.rs:13376
-module	attention_flash_asym4_tile_batched_paged	config-opt-in	Non-default configuration: attention.rs / serve.multi_slot; rdna-compute/src/attention.rs:11406
-module	attention_flash_asym4_wmma_tile_batched	config-opt-in	Non-default configuration: attention.rs / memory.kv_cache; rdna-compute/src/attention.rs:12775
-module	attention_flash_asym4_wmma_tile_batched_gfx12	config-opt-in	Non-default configuration: attention.rs / memory.kv_cache; rdna-compute/src/attention.rs:12775
 module	attention_flash_bf16_tile	config-opt-in	Non-default configuration: attention.rs / memory.kv_cache; rdna-compute/src/attention.rs:3475
 module	attention_flash_bf16_tile_batched	non-core-family	Non-core family route: Qwen2/Llama, MiniMax/Maple; rdna-compute/src/attention.rs:17017
 module	attention_flash_bf16_tile_batched_paged	no-caller	No production caller; only definitions, tests/examples or an unreachable launcher branch remain; rdna-compute/src/attention.rs:11406
@@ -1056,14 +1045,6 @@ module	kv_cache_write_asym_k_fwht3_batched_paged	config-opt-in	Non-default confi
 module	kv_cache_write_asym_k_fwht4	config-opt-in	Non-default configuration: attention.rs / memory.kv_cache; rdna-compute/src/attention.rs:11651
 module	kv_cache_write_asym_k_fwht4_batched	config-opt-in	Non-default configuration: attention.rs / memory.kv_cache; rdna-compute/src/attention.rs:13096
 module	kv_cache_write_asym_k_fwht4_batched_paged	config-opt-in	Non-default configuration: attention.rs / serve.multi_slot; rdna-compute/src/attention.rs:11406
-module	kv_cache_write_asym_k_givens2	config-opt-in	Non-default configuration: attention.rs / memory.kv_cache; rdna-compute/src/attention.rs:15026
-module	kv_cache_write_asym_k_givens2_batched	config-opt-in	Non-default configuration: attention.rs / memory.kv_cache; rdna-compute/src/attention.rs:13187
-module	kv_cache_write_asym_k_givens2_batched_paged	config-opt-in	Non-default configuration: attention.rs / serve.multi_slot; rdna-compute/src/attention.rs:11406
-module	kv_cache_write_asym_k_givens3_hd512	non-core-family	Non-core family route: Gemma; hipfire-dispatch/src/families/attention.rs:629-631
-module	kv_cache_write_asym_k_givens3_hd512_batched	non-core-family	Non-core family route: Gemma, Qwen2/Llama; rdna-compute/src/attention.rs:14084
-module	kv_cache_write_asym_k_givens4	config-opt-in	Non-default configuration: attention.rs / memory.kv_cache; rdna-compute/src/attention.rs:11587
-module	kv_cache_write_asym_k_givens4_batched	config-opt-in	Non-default configuration: attention.rs / memory.kv_cache; rdna-compute/src/attention.rs:13012
-module	kv_cache_write_asym_k_givens4_batched_paged	config-opt-in	Non-default configuration: attention.rs / serve.multi_slot; rdna-compute/src/attention.rs:11406
 module	kv_cache_write_bf16	config-opt-in	Non-default configuration: attention.rs / memory.kv_cache; rdna-compute/src/attention.rs:2883
 module	kv_cache_write_bf16_batched	config-opt-in	Non-default configuration: attention.rs / memory.kv_cache; rdna-compute/src/attention.rs:2942
 module	kv_cache_write_bf16_batched_paged	config-opt-in	Non-default configuration: attention.rs / serve.multi_slot; rdna-compute/src/attention.rs:2942

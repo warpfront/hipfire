@@ -64,9 +64,6 @@ pub enum FusedQkvVariant {
 pub enum TileImpl {
     #[default]
     None,
-    // WMMA-FA (quantized causal prefill — asym4+Q8-V only)
-    Asym4WmmaTile,
-    Asym4WmmaTileGfx12,
     // Vision/dflash F16-K/V rungs
     DflashV5,
     DflashV5Gfx12,
@@ -523,11 +520,8 @@ pub enum KernelKey {
     // `Gfx942Device::dequant_fp8b128_to_bf16`).
     DequantFp8B128ToBf16,
     // Attention
-    AttnFlashAsym4,
     AttnFlashAsym4Fwht,
-    AttnFlashAsym3,
     AttnFlashAsym3Fwht,
-    AttnFlashAsym2,
     AttnFlashAsym2Fwht,
     AttnFlashQ8_0,
     AttnFlashQ8_0Windowed, // Q8_0 flash with sliding-window mask (cohere2moe)
@@ -550,11 +544,8 @@ pub enum KernelKey {
     // F32 KV (decode only — no batched variant)
     AttnF32,
     // Attention — batched prefill / tree-verify (ship 3.2)
-    AttnFlashAsym4BatchedMasked,
     AttnFlashAsym4FwhtBatchedMasked,
-    AttnFlashAsym3BatchedMasked,
     AttnFlashAsym3FwhtBatchedMasked,
-    AttnFlashAsym2Batched,           // no _masked — 2-bit tree-verify gap
     AttnFlashAsym2FwhtBatched,       // no _masked — 2-bit tree-verify gap
     AttnQ8_0KvBatchedMasked,         // P-1 no-LDS-cap tiled kernel
     AttnQ8_0KvBatchedMaskedWindowed, // sliding-window batched Q8 (cohere2moe prefill)
@@ -578,11 +569,8 @@ pub enum KernelKey {
     AttnFullF16Causal, // F16 K/V, causal
     AttnFullF32Causal, // F32 K/V, causal
     // KV Cache Write
-    KvWriteAsym4,
     KvWriteAsym4Fwht,
-    KvWriteAsym3,
     KvWriteAsym3Fwht,
-    KvWriteAsym2,
     KvWriteAsym2Fwht,
     KvWriteQ8_0,
     KvWriteBf16,  // flat 2-byte BF16 KV write (maple)
@@ -592,11 +580,8 @@ pub enum KernelKey {
     KvWriteHfq8,  // HFQ8 flat-layout KV write (llama)
     KvWriteF32,
     // KV Cache Write — batched prefill (ship 3.2)
-    KvWriteAsym4Batched,
     KvWriteAsym4FwhtBatched,
-    KvWriteAsym3Batched,
     KvWriteAsym3FwhtBatched,
-    KvWriteAsym2Batched,
     KvWriteAsym2FwhtBatched,
     KvWriteQ8_0Batched,
     KvWriteBf16Batched,

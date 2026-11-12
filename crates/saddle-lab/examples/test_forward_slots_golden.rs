@@ -27,13 +27,12 @@
 // with the SAME mode-generic production constructor the carrier uses
 // (`KvCacheExt::from_mode_with_backend`), and the candidate arm builds its
 // `SlotKvTier` tables with the same seeds as the sequential constructors
-// (`gen_givens_angles(42,·)` / `gen_fwht_signs(42|1042,·)`), which is the
+// (`gen_fwht_signs(42|1042,·)`), which is the
 // bit-identical-packed-bytes contract `kv_write_slots` rests on. f16 is
 // skipped: it is a slots-only tier with no sequential qwen35 constructor
 // to reference against. fp8 is admitted only on exact gfx1201 and can be
 // requested explicitly through the slots policy; it is excluded from the
-// default sweep. bf16 is also an explicit, non-default mode. The `asymN`
-// names resolve to their post-0.4.0 `fwhtN` aliases.
+// default sweep. bf16 is also an explicit, non-default mode.
 //
 // NEGATIVE CONTROL. `run_negative_control` redirects one row's `row_slot`
 // entry in the CANDIDATE arm's `SlotBatch` — the harness-level analogue of
@@ -74,7 +73,7 @@
 //   cargo run --release -p saddle-lab --features deltanet,arch-qwen35 \
 //     --example test_forward_slots_golden -- <model.hf4> [kv-modes]
 //
-//   kv-modes  comma list from {q8,asym2,asym3,asym4,fwht2,fwht3,fwht4,
+//   kv-modes  comma list from {q8,fwht2,fwht3,fwht4,
 //             fp8,bf16,f16}; default: q8,fwht2,fwht3,fwht4.
 //             fp8 (exact gfx1201 only) and bf16 are explicit; f16 is skipped
 //             because there is no sequential reference constructor.
@@ -151,8 +150,6 @@ fn main() {
     /// slots-only tier BY DESIGN (saddle-core kv.rs: "F16 flat rows exist
     /// only on the slots engine") — no sequential qwen35 f16 cache
     /// constructor exists, so no golden reference can be built for it.
-    /// (The `asymN` names are still accepted: they alias to `fwhtN` since
-    /// 0.4.0 and exercise the alias table on their way through resolve.)
     fn resolve_mode_names(spec: &str) -> Vec<(String, KvMode)> {
         spec.split(',')
             .map(|s| s.trim())
@@ -288,28 +285,16 @@ fn main() {
                 .expect("tier table upload");
             t
         };
-        let (cos, sin, s1, s2) = if let Some(len) = fx.plan.givens_len {
-            let (c, si) = KvCache::gen_givens_angles(42, len);
+        let (s1, s2) = if let Some(len) = fx.plan.fwht_len {
             (
-                Some(upload_f32(gpu, &c)),
-                Some(upload_f32(gpu, &si)),
-                None,
-                None,
-            )
-        } else if let Some(len) = fx.plan.fwht_len {
-            (
-                None,
-                None,
                 Some(upload_f32(gpu, &KvCache::gen_fwht_signs(42, len))),
                 Some(upload_f32(gpu, &KvCache::gen_fwht_signs(1042, len))),
             )
         } else {
-            (None, None, None, None)
+            (None, None)
         };
         SlotKvTier {
             mode: fx.mode,
-            givens_cos: cos,
-            givens_sin: sin,
             fwht_signs1: s1,
             fwht_signs2: s2,
         }
@@ -747,7 +732,7 @@ fn main() {
     let model_path = args.next().unwrap_or_else(|| {
         eprintln!(
             "Usage: test_forward_slots_golden <model.hf4> [kv-modes]  (a DENSE \
-             Qwen3.5 checkpoint; kv-modes: comma list from q8,asym2,asym3,asym4,\
+             Qwen3.5 checkpoint; kv-modes: comma list from q8,\
              fwht2,fwht3,fwht4,fp8,bf16,f16 — default q8,fwht2,fwht3,fwht4; \
              fp8 requires exact gfx1201; f16 skipped: no sequential reference)"
         );

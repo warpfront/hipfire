@@ -396,7 +396,7 @@ def main() -> int:
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--prefill-batch", type=int, default=8)
     parser.add_argument(
-        "--kv-mode", choices=("q8", "asym4", "asym3", "asym2"), default="q8"
+        "--kv-mode", choices=("q8", "fwht4", "fwht3", "fwht2"), default="q8"
     )
     parser.add_argument("--flash-attn-ck-lib", type=Path)
     parser.add_argument("--flash-attn-ck-workspace-bytes", type=int, default=536870912)

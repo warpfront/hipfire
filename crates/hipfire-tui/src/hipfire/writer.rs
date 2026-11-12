@@ -35,9 +35,8 @@ pub struct FieldSpec {
 }
 
 /// KV cache modes in cycling order. Every entry is in the schema's own list
-/// (`memory.kv_cache`); the deprecated asymN/turboN aliases and the
-/// `legacy-*` Givens opt-outs are left out. A test pins this list to the schema
-/// minus those, so a mode the schema gains cannot silently go unselectable.
+/// (`memory.kv_cache`). A test pins this list to the schema, so a mode the
+/// schema gains cannot silently go unselectable.
 const KV_CACHE: &[&str] = &[
     "auto", "q8", "fwht4", "fwht3", "fwht2", "fp8", "bf16", "f16", "f32",
 ];
@@ -580,15 +579,7 @@ mod tests {
         let ValueRule::Enum(schema_list) = field("memory.kv_cache").unwrap().rule else {
             panic!("memory.kv_cache is not an enum rule");
         };
-        let live: std::collections::BTreeSet<&str> = schema_list
-            .iter()
-            .copied()
-            .filter(|mode| {
-                !(mode.starts_with("asym")
-                    || mode.starts_with("turbo")
-                    || mode.starts_with("legacy-"))
-            })
-            .collect();
+        let live: std::collections::BTreeSet<&str> = schema_list.iter().copied().collect();
         let offered: std::collections::BTreeSet<&str> = options.iter().copied().collect();
         assert_eq!(offered, live);
         for mode in ["fp8", "bf16", "f16", "f32"] {

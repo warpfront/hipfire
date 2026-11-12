@@ -476,8 +476,7 @@ pins compose to a release.
 
 ## Deprecated features
 
-Givens/asymmetric KV modes and the legacy DFlash knobs have been deprecated
-since 0.4.0. They are unsupported and will be removed in 0.5.0. See
+The Givens/asymmetric KV modes and the legacy DFlash knobs were removed in 0.5.0. See
 [configuration](docs/CONFIG.md) for supported settings and
 [validation](docs/VALIDATION.md) for the current gates.
 

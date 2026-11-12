@@ -129,9 +129,9 @@ SUPPORTED_POLICY_DOMAINS = {
 SUPPORTED_KV_MODES = {
     "fp16",
     "q8",
-    "asym2",
-    "asym3",
-    "asym4",
+    "fwht2",
+    "fwht3",
+    "fwht4",
     "turbo",
     "turbo2",
     "turbo3",
@@ -3054,8 +3054,8 @@ def build_policy_probe_plan(objectives, ingress):
         ]
     if "kv-policy" in objectives:
         plan["kv_policy"] = [
-            "treat asym3 as the current quality/perf baseline",
-            "profile q8, asym2, asym3, asym4, and turbo/rotor research modes separately",
+            "treat q8 as the current quality/perf baseline",
+            "profile q8, fwht2, fwht3, fwht4, and turbo/rotor research modes separately",
             "score AR and DFlash independently because eviction and speculative decode have different failure modes",
             "package persistent KV calibration data inside the HFQ model artifact before promotion",
         ]
@@ -3279,10 +3279,10 @@ def describe_kv_mode(mode):
             "persistent_artifact": False,
             "notes": ["byte-stable higher-precision KV reference path"],
         }
-    if mode in {"asym2", "asym3", "asym4"}:
+    if mode in {"fwht2", "fwht3", "fwht4"}:
         bits = mode[-1]
         return {
-            "family": "asym_rotated",
+            "family": "fwht_rotated",
             "status": "implemented",
             "persistent_artifact": False,
             "notes": [f"rotated K at {bits} bits with V stored as Q8_0"],
@@ -3312,15 +3312,15 @@ def build_kv_profile(
     profile_id=None,
     engine_root=None,
 ):
-    modes = modes or ["q8", "asym3", "turbo3", "rotor"]
+    modes = modes or ["q8", "fwht3", "turbo3", "rotor"]
     validate_values(modes, SUPPORTED_KV_MODES, "KV mode")
     hfq = summarize_hfq(model) if model and Path(model).is_file() else None
     mode_map = {
         mode: describe_kv_mode(mode)
         for mode in modes
     }
-    if "asym3" not in mode_map:
-        mode_map["asym3"] = describe_kv_mode("asym3")
+    if "fwht3" not in mode_map:
+        mode_map["fwht3"] = describe_kv_mode("fwht3")
     model_name = Path(model).name.replace(".", "-").replace("/", "-")
     return {
         "schema": KV_PROFILE_SCHEMA,
@@ -3336,7 +3336,7 @@ def build_kv_profile(
             "quant_type_counts": hfq["quant_type_counts"],
             "tensor_names_md5": hfq["tensor_names_md5"],
         } if hfq else None,
-        "baseline_mode": "asym3",
+        "baseline_mode": "fwht3",
         "modes": mode_map,
         "quality_gates": [
             "Collect AR KLD/PPL and long-context recall for each KV mode.",

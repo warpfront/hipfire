@@ -49,13 +49,6 @@ fn main() {
         .position(|a| a == "--max-tokens")
         .and_then(|i| args.get(i + 1).and_then(|v| v.parse().ok()))
         .unwrap_or(2048);
-    let kv_mode: &str = if args.iter().any(|a| a == "--givens4") {
-        "givens4"
-    } else if args.iter().any(|a| a == "--givens2") {
-        "givens2"
-    } else {
-        "q8"
-    };
     let image_path = args
         .iter()
         .position(|a| a == "--image")
@@ -69,7 +62,7 @@ fn main() {
             skip_next = false;
             continue;
         }
-        if a == "--no-think" || a == "--debug-compare" || a == "--givens4" || a == "--givens2" {
+        if a == "--no-think" || a == "--debug-compare" {
             continue;
         }
         if a == "--image" || a == "--max-tokens" {
@@ -228,33 +221,15 @@ fn main() {
     .expect("failed to load text weights");
 
     let kv_seq = 4096usize;
-    eprintln!("KV cache: {kv_mode}");
-    let mut kv_cache = match kv_mode {
-        "givens4" => llama::KvCache::new_gpu_asym3(
-            &mut gpu,
-            text_config.n_layers,
-            text_config.n_kv_heads,
-            text_config.head_dim,
-            kv_seq,
-        )
-        .unwrap(),
-        "givens2" => llama::KvCache::new_gpu_asym2(
-            &mut gpu,
-            text_config.n_layers,
-            text_config.n_kv_heads,
-            text_config.head_dim,
-            kv_seq,
-        )
-        .unwrap(),
-        _ => llama::KvCache::new_gpu_q8(
-            &mut gpu,
-            text_config.n_layers,
-            text_config.n_kv_heads,
-            text_config.head_dim,
-            kv_seq,
-        )
-        .unwrap(),
-    };
+    eprintln!("KV cache: q8");
+    let mut kv_cache = llama::KvCache::new_gpu_q8(
+        &mut gpu,
+        text_config.n_layers,
+        text_config.n_kv_heads,
+        text_config.head_dim,
+        kv_seq,
+    )
+    .unwrap();
     let mut dn_state = DeltaNetState::new(&mut gpu, &text_config).unwrap();
 
     if debug_cmp {

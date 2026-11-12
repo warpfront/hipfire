@@ -4,7 +4,7 @@
 
 //! Run inference on a .hfq (hipfire-quantized) model.
 //! Usage: cargo run --release --example infer_hfq <model.hfq> [flags] [prompt text...]
-//! Flags: --q8kv, --fp32kv, --givens4, --givens2, --hfq4kv, --temp T
+//! Flags: --q8kv, --fp32kv, --hfq4kv, --temp T
 
 use hipfire_arch_llama::Llama;
 use hipfire_runtime::arch::Architecture;
@@ -25,12 +25,12 @@ fn main() {
         libc::signal(libc::SIGINT, handle_sigint as libc::sighandler_t);
     }
     let args: Vec<String> = std::env::args().collect();
-    let model_path = args.get(1)
-        .unwrap_or_else(|| { eprintln!("Usage: infer_hfq <model.hfq> [--q8kv|--fp32kv|--givens4|--givens2|--hfq4kv] [--temp T] [prompt...]"); std::process::exit(1); });
+    let model_path = args.get(1).unwrap_or_else(|| {
+        eprintln!("Usage: infer_hfq <model.hfq> [--q8kv|--fp32kv|--hfq4kv] [--temp T] [prompt...]");
+        std::process::exit(1);
+    });
 
     // Parse flags
-    let use_givens4 = args.iter().any(|a| a == "--givens4");
-    let use_givens2 = args.iter().any(|a| a == "--givens2");
     let use_q8kv = args.iter().any(|a| a == "--q8kv");
     let use_fp32kv = args.iter().any(|a| a == "--fp32kv");
     let use_hfq4kv = args.iter().any(|a| a == "--hfq4kv");
@@ -42,15 +42,7 @@ fn main() {
     let top_p: f32 = if temp == 0.0 { 1.0 } else { 0.8 };
 
     let prompt_text = {
-        let skip_flags = [
-            "--q8kv",
-            "--fp32kv",
-            "--hfq4kv",
-            "--givens4",
-            "--givens2",
-            "--temp",
-            "--maxgen",
-        ];
+        let skip_flags = ["--q8kv", "--fp32kv", "--hfq4kv", "--temp", "--maxgen"];
         let mut skip_next = false;
         let parts: Vec<&str> = args[2..]
             .iter()
@@ -153,25 +145,7 @@ fn main() {
 
     // KV cache
     let kv_seq_len = config.max_seq_len.min(2048);
-    let mut kv_cache = if use_givens4 {
-        KvCache::new_gpu_asym3(
-            &mut gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_seq_len,
-        )
-        .unwrap()
-    } else if use_givens2 {
-        KvCache::new_gpu_asym2(
-            &mut gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_seq_len,
-        )
-        .unwrap()
-    } else if use_hfq4kv {
+    let mut kv_cache = if use_hfq4kv {
         KvCache::new_gpu_hfq4kv(
             &mut gpu,
             config.n_layers,
@@ -226,7 +200,7 @@ fn main() {
 
     // Prefill: WMMA-fused batched path via llama::forward_prefill_batch when
     // weights + KV qualify; per-token forward_scratch fallback otherwise. The
-    // batched path natively supports Q8 + asym{2,3,4}; HFQ4 KV stays sequential.
+    // batched path natively supports Q8; HFQ4 KV stays sequential.
     let t1 = Instant::now();
     let batched_ok = !use_hfq4kv;
     let mut next_token = if batched_ok {

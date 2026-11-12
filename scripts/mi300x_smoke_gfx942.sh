@@ -9,7 +9,7 @@
 #   1. eval_hipfire boots, GPU arch detected as gfx942 wave64
 #   2. Dequant byte-correctness on a known mq4 tensor (no kernel dispatch)
 #   3. AR decode of Q3.5-9B mq4 produces finite, sensible logits
-#   4. test_inference suite passes (forward, forward_scratch, asym3 KV)
+#   4. test_inference suite passes (forward, forward_scratch, fwht3 KV)
 #   5. coherence_probe self-check (CPU-side detector wiring)
 #
 # A failure at any step aborts. Total runtime ~5-10 min.
@@ -82,7 +82,7 @@ grep -qE "Paris|france|capital" -i "$WORK/results/smoke_gen.txt" \
     && ok "model emitted on-topic continuation" \
     || ok "model generated text (topic match not verified — manual check $WORK/results/smoke_gen.txt)"
 
-# ── 4. test_inference (full forward + forward_scratch + asym3 KV) ─────────
+# ── 4. test_inference (full forward + forward_scratch + fwht3 KV) ─────────
 phase "4/5  test_inference suite"
 if [ -x target/release/examples/test_inference ]; then
     timeout 120 ./target/release/examples/test_inference \

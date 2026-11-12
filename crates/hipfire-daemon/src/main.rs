@@ -1896,10 +1896,10 @@ fn main() {
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string());
-                // lifecycle: deprecated since 0.4.0, removal 0.5.0 — Givens asym KV and the asymN/turboN aliases are superseded by fwht3
-                // One warning line when the load names a deprecated KV format
-                // (kv_mode falls back to HIPFIRE_KV_MODE exactly as the carriers do).
-                if let Some(warning) = [
+                // KV names removed in 0.5.0 (Givens asymN / legacy-asymN and the
+                // asymN / turboN aliases) are rejected before any load work;
+                // kv_mode falls back to HIPFIRE_KV_MODE exactly as the carriers do.
+                if let Some(removed) = [
                     Some(
                         kv_mode_override
                             .as_deref()
@@ -1909,9 +1909,18 @@ fn main() {
                 ]
                 .into_iter()
                 .flatten()
-                .find_map(hipfire_runtime::kv_mode::deprecated_kv_name_warning)
+                .find_map(hipfire_runtime::kv_mode::removed_kv_name_error)
                 {
-                    eprintln!("[hipfire-daemon] {warning}");
+                    emit_uncorrelated_error(
+                        &mut stdout,
+                        None,
+                        &removed,
+                        "validation",
+                        false,
+                        false,
+                    );
+                    let _ = stdout.flush();
+                    continue;
                 }
 
                 // Per-load adaptive-KV selector (mirrors kv_mode). Overrides the

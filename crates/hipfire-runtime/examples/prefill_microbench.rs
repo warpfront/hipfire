@@ -30,7 +30,7 @@
 //! Usage:
 //!   prefill_microbench --model <path-to-hfq-model> \
 //!                      [--n-ctx <2048>] \
-//!                      [--kv-mode <asym3|q8|asym4|asym2>=asym3] \
+//!                      [--kv-mode <q8>=q8] \
 //!                      [--warmup-iters <1>] \
 //!                      [--measure-iters <3>]
 
@@ -57,7 +57,7 @@ fn main() {
     }
     let mut model: Option<PathBuf> = None;
     let mut n_ctx: usize = 2048;
-    let mut kv_mode = "asym3".to_string();
+    let mut kv_mode = "q8".to_string();
     let mut warmup_iters: usize = 1;
     let mut measure_iters: usize = 3;
     let mut prefill_only = false;
@@ -76,8 +76,8 @@ fn main() {
             }
             "--kv-mode" => {
                 let v = argv[i + 1].clone();
-                if !matches!(v.as_str(), "q8" | "asym2" | "asym3" | "asym4") {
-                    eprintln!("--kv-mode must be one of: q8 asym2 asym3 asym4 (got {v})");
+                if !matches!(v.as_str(), "q8") {
+                    eprintln!("--kv-mode must be one of: q8 (got {v})");
                     std::process::exit(1);
                 }
                 kv_mode = v;
@@ -96,7 +96,7 @@ fn main() {
                 i += 1;
             }
             "-h" | "--help" => {
-                eprintln!("Usage: prefill_microbench --model <path> [--n-ctx 2048] [--kv-mode asym3] [--warmup-iters 1] [--measure-iters 3]");
+                eprintln!("Usage: prefill_microbench --model <path> [--n-ctx 2048] [--kv-mode q8] [--warmup-iters 1] [--measure-iters 3]");
                 std::process::exit(0);
             }
             other => {
@@ -151,30 +151,6 @@ fn main() {
     let kv_max = args.n_ctx + 16;
     let mut kv_cache = match args.kv_mode.as_str() {
         "q8" => KvCache::new_gpu_q8(
-            &mut gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_max,
-        )
-        .unwrap(),
-        "asym4" => KvCache::new_gpu_asym4(
-            &mut gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_max,
-        )
-        .unwrap(),
-        "asym3" => KvCache::new_gpu_asym3(
-            &mut gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_max,
-        )
-        .unwrap(),
-        "asym2" => KvCache::new_gpu_asym2(
             &mut gpu,
             config.n_layers,
             config.n_kv_heads,

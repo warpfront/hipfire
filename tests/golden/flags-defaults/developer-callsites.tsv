@@ -405,7 +405,6 @@ developer_callsite	*	HIPFIRE_GEMMA4_LOGIT_TRACE_MAX_STEPS#developer_var=ok.and_t
 developer_callsite	*	HIPFIRE_GEMMA4_LOGIT_TRACE_TOPK#developer_var=ok.and_then.unwrap_or(16)
 developer_callsite	*	HIPFIRE_GEMMA4_NORM_PLUS_ONE#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_GEMMA4_PREFILL_BATCH#developer_var=ok.and_then
-developer_callsite	*	HIPFIRE_GFX1100_ASYM3_Q8_PAIR#developer_bool=true
 developer_callsite	*	HIPFIRE_GFX1100_DECODE_ATTN_GQA#developer_bool=true
 developer_callsite	*	HIPFIRE_GFX1100_DENSE_GATE_UP_DOT_REFORM#developer_bool=false
 developer_callsite	*	HIPFIRE_GFX1100_DENSE_GATE_UP_LANE0_HEADERS#developer_bool=false
@@ -987,5 +986,3 @@ developer_callsite	*	HIPFIRE_VL_SEQUENTIAL#developer_var=ok.is_some_and
 developer_callsite	*	HIPFIRE_VMM_PROMOTE_AT#developer_var=ok.and_then
 developer_callsite	*	HIPFIRE_WEIGHT_SLAB#developer_var=-
 developer_callsite	*	HIPFIRE_WIDENED_PBS_GROW_ONLY#developer_var=ok.as_deref.!=Some("0")
-developer_callsite	*	HIPFIRE_WMMA_FA#developer_bool=false
-developer_callsite	*	HIPFIRE_WMMA_FA_MIN_BATCH#developer_var=ok.and_then.unwrap_or(16)

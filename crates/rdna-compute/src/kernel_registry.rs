@@ -441,11 +441,6 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             kernels::FUSED_GATE_UP_HFQ4G256_STAGE_X32_GFX1100_SRC,
             ["fused_gate_up_hfq4g256_stage_x32_gfx1100"]
         );
-        add!(
-            "kv_cache_write_asym3_q8_pair_gfx1100",
-            assemble_asym(kernels::KV_CACHE_WRITE_ASYM3_Q8_PAIR_GFX1100_SRC),
-            ["kv_cache_write_asym3_q8_pair_gfx1100"]
-        );
         // Default-on int8 small-batch verify GEMV (`gemv_q8x.rs`): the
         // activation quantizer and every v4/v3 batch x residual variant, each
         // module with its `_multi` twin, so the pack carries them precompiled.
@@ -583,28 +578,8 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         );
     }
 
-    // KV paths: precompile's asym3/q8 assembly mirrors the runtime header
+    // KV paths: precompile's q8 assembly mirrors the runtime header
     // stripping; FP8 substitutions are only admitted for observed gfx1201.
-    add!(
-        "kv_cache_write_asym_k_givens3",
-        assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_GIVENS3_SRC),
-        ["kv_cache_write_asym_k_givens3"]
-    );
-    add!(
-        "kv_cache_write_asym_k_givens3_batched",
-        assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_GIVENS3_BATCHED_SRC),
-        ["kv_cache_write_asym_k_givens3_batched"]
-    );
-    add!(
-        "attention_flash_asym3_tile",
-        assemble_asym(kernels::ATTENTION_FLASH_ASYM3_TILE_SRC),
-        ["attention_flash_asym3_tile"]
-    );
-    add!(
-        "attention_flash_asym3_tile_batched",
-        assemble_asym(kernels::ATTENTION_FLASH_ASYM3_TILE_BATCHED_SRC),
-        ["attention_flash_asym3_tile_batched"]
-    );
     add!(
         "attention_flash_asym_reduce_batched",
         kernels::ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC,
@@ -684,7 +659,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         kernels::ATTENTION_FLASH_Q8_0_REDUCE_SKIP_SRC,
         ["attention_flash_q8_0_reduce_skip"]
     );
-    // Multi-slot (slot-descriptor) launches of the q8 and asym3 KV routes run
+    // Multi-slot (slot-descriptor) launches of the q8 KV route run
     // separately named `*_paged` modules (attention.rs `ensure_kv_slot_kernel`,
     // `ensure_givens4_kv_slot_kernel`, `attention_q8_0_flash_prefill_wmma_slots`).
     add!(
@@ -713,24 +688,6 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             "attention_flash_q8_0_tile_batched_paged"
         ),
         ["attention_flash_q8_0_tile_batched_paged"]
-    );
-    add!(
-        "kv_cache_write_asym_k_givens3_batched_paged",
-        kernels::kv_slot_givens4_paged_source(
-            kernels::KV_CACHE_WRITE_ASYM_K_GIVENS3_BATCHED_SRC,
-            "kv_cache_write_asym_k_givens3_batched",
-            "kv_cache_write_asym_k_givens3_batched_paged"
-        ),
-        ["kv_cache_write_asym_k_givens3_batched_paged"]
-    );
-    add!(
-        "attention_flash_asym3_tile_batched_paged",
-        kernels::kv_slot_givens4_paged_source(
-            kernels::ATTENTION_FLASH_ASYM3_TILE_BATCHED_SRC,
-            "attention_flash_asym3_tile_batched",
-            "attention_flash_asym3_tile_batched_paged"
-        ),
-        ["attention_flash_asym3_tile_batched_paged"]
     );
     if matches!(arch, "gfx1100" | "gfx1151") {
         // gfx11 admits the multi-slot WMMA prefill tile by default
@@ -11465,7 +11422,7 @@ mod tests {
             assert!(by_name.contains_key(module), "missing P0 module {module}");
             count += 1;
         }
-        assert_eq!(count, 92);
+        assert_eq!(count, 88);
         // Modules added since the P0 capture: the scalar-prefill runtime's BR/BC
         // specialization, the `HIPFIRE_G12_DEC_NORM` decode twins, the five
         // multi-slot `*_paged` modules of the q8/asym3 routes, the H2 decode /
@@ -11476,10 +11433,10 @@ mod tests {
         // gathers, the 27B AR route's plain q8 attention and slab sigmoid
         // producer, plus the opt-in twins, decode twins, QSA modules, slab
         // planner, pruned router, Q8 wide module, the fast narrow Q8 GEMV
-        // module and DFlash-draft overwrite twins and the one-token-per-wave HC read-up twin. Those 160 are the pre-S1 inventory; the S1 slow-link kernels
+        // module and DFlash-draft overwrite twins and the one-token-per-wave HC read-up twin. Those 158 are the pre-S1 inventory; the S1 slow-link kernels
         // add exactly the modules in `S1_ADDED_MODULES` (not P0 modules, not
         // in the provenance fixture), each its own isolated source.
-        const PRE_S1_ADDED_SINCE_P0: usize = 160;
+        const PRE_S1_ADDED_SINCE_P0: usize = 158;
         const S1_ADDED_MODULES: [&str; 1] = ["slowlink_prefill"];
         for module in S1_ADDED_MODULES {
             assert!(by_name.contains_key(module), "missing S1 module {module}");
@@ -14890,8 +14847,6 @@ extern "C" __global__ void NAMED(int* p) {}
                 ("q8_0", "q8_0"),
                 ("fp8", "q8"),
                 ("q8", "fp8"),
-                ("asym4", "asym4"),
-                ("asym3", "asym3"),
                 ("fwht4", "fwht4"),
                 ("fp16", "fp16"),
             ] {

@@ -666,15 +666,13 @@ pub(crate) fn tensor_layer_index(name: &str) -> Option<usize> {
 }
 
 /// Per-tier discriminant: K/V spans are stride-shaped, so a snapshot must
-/// never restore into a different KV tier. Preserve the historical tags.
+/// never restore into a different KV tier. Preserve the historical tags
+/// (21/31/41, the removed Givens asym tiers, stay retired).
 fn slot_snapshot_kv_tag(kv_mode: hipfire_runtime::kv_mode::KvMode) -> u32 {
     use hipfire_runtime::kv_mode::KvMode;
 
     match kv_mode {
         KvMode::Q8 => 1,
-        KvMode::Asym2 => 21,
-        KvMode::Asym3 => 31,
-        KvMode::Asym4 => 41,
         KvMode::Fwht2 => 22,
         KvMode::Fwht3 => 32,
         KvMode::Fwht4 => 42,
@@ -1518,30 +1516,15 @@ impl Rig {
                     .map_err(|e| format!("kv rotation table upload: {e}"))?;
                 Ok(t)
             };
-            let (cos, sin, s1, s2) = match kv_plan.givens_len {
-                Some(len) => {
-                    let (c, si) = KvCache::gen_givens_angles(42, len);
-                    (
-                        Some(upload_f32(gpu, &c)?),
-                        Some(upload_f32(gpu, &si)?),
-                        None,
-                        None,
-                    )
-                }
-                None => match kv_plan.fwht_len {
-                    Some(len) => (
-                        None,
-                        None,
-                        Some(upload_f32(gpu, &KvCache::gen_fwht_signs(42, len))?),
-                        Some(upload_f32(gpu, &KvCache::gen_fwht_signs(1042, len))?),
-                    ),
-                    None => (None, None, None, None),
-                },
+            let (s1, s2) = match kv_plan.fwht_len {
+                Some(len) => (
+                    Some(upload_f32(gpu, &KvCache::gen_fwht_signs(42, len))?),
+                    Some(upload_f32(gpu, &KvCache::gen_fwht_signs(1042, len))?),
+                ),
+                None => (None, None),
             };
             g.kv_tier = Some(crate::forward_slots::SlotKvTier {
                 mode: kv_mode,
-                givens_cos: cos,
-                givens_sin: sin,
                 fwht_signs1: s1,
                 fwht_signs2: s2,
             });
@@ -7395,9 +7378,6 @@ mod tests {
 
         let tags = [
             (KvMode::Q8, 1),
-            (KvMode::Asym2, 21),
-            (KvMode::Asym3, 31),
-            (KvMode::Asym4, 41),
             (KvMode::Fwht2, 22),
             (KvMode::Fwht3, 32),
             (KvMode::Fwht4, 42),

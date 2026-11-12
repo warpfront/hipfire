@@ -6,8 +6,8 @@
 // tiers — the kernels the multi-slot engine routes through when the slots
 // KV tier is not q8:
 //
-//   tile-batched attention:  attention_flash_{asym2,asym3,asym4,fwht2,fwht3,fwht4}_tile_batched
-//   batched K writers:       kv_cache_write_asym_k_{givens2,givens3,givens4,fwht2,fwht3,fwht4}_batched
+//   tile-batched attention:  attention_flash_{fwht2,fwht3,fwht4}_tile_batched
+//   batched K writers:       kv_cache_write_asym_k_{fwht2,fwht3,fwht4}_batched
 //   Q8 V writer:             kv_cache_write_q8_0_batched (use_v_base arm)
 //
 // Every check runs against the tier's own LEGACY (descriptor-free) entry
@@ -53,13 +53,13 @@ const POSITIONS: [i32; BATCH] = [31, 63, 127, 200];
 const TILE: usize = 128;
 const TOL: f32 = 1e-5;
 
-const TIERS: [&str; 6] = ["asym2", "asym3", "asym4", "fwht2", "fwht3", "fwht4"];
+const TIERS: [&str; 3] = ["fwht2", "fwht3", "fwht4"];
 
 fn k_bytes_per_head(tier: &str) -> usize {
     match tier {
-        "asym2" | "fwht2" => 4 + HEAD_DIM / 4,
-        "asym3" | "fwht3" => 4 + (HEAD_DIM * 3) / 8,
-        "asym4" | "fwht4" => 4 + HEAD_DIM / 2,
+        "fwht2" => 4 + HEAD_DIM / 4,
+        "fwht3" => 4 + (HEAD_DIM * 3) / 8,
+        "fwht4" => 4 + HEAD_DIM / 2,
         other => panic!("unknown tier {other}"),
     }
 }
@@ -185,8 +185,6 @@ fn slab_descs(gpu: &Gpu, k_bases: [u64; SLOTS], v_bases: [u64; SLOTS]) -> GpuTen
 }
 
 struct Tables {
-    cos: GpuTensor,
-    sin: GpuTensor,
     signs1: GpuTensor,
     signs2: GpuTensor,
 }
@@ -194,9 +192,7 @@ struct Tables {
 fn upload_tables(gpu: &mut Gpu, rng: &mut Rng) -> Tables {
     // Table CONTENT is arbitrary here — the same tables feed the candidate
     // and the reference, so parity does not depend on the canonical seeds
-    // (those live on KvCache: gen_givens_angles / gen_fwht_signs).
-    let cos = upload_f32(gpu, &rand_f32_vec(HEAD_DIM / 2, rng));
-    let sin = upload_f32(gpu, &rand_f32_vec(HEAD_DIM / 2, rng));
+    // (those live on KvCache: gen_fwht_signs).
     let signs1 = upload_f32(
         gpu,
         &(0..128)
@@ -221,12 +217,7 @@ fn upload_tables(gpu: &mut Gpu, rng: &mut Rng) -> Tables {
             })
             .collect::<Vec<_>>(),
     );
-    Tables {
-        cos,
-        sin,
-        signs1,
-        signs2,
-    }
+    Tables { signs1, signs2 }
 }
 
 fn positions_dev(gpu: &Gpu) -> GpuTensor {
@@ -279,66 +270,6 @@ fn attn_checks(gpu: &mut Gpu, tier: &str, t: &Tables, rng: &mut Rng) -> (f32, f3
     let out_ref = out_dev(gpu);
     let parity = {
         match tier {
-            "asym2" => gpu.attention_flash_asym2_batched_slots(
-                &q,
-                &k_clean,
-                &v_clean,
-                &out_slots,
-                &pos,
-                &t.cos,
-                &t.sin,
-                N_HEADS,
-                N_KV_HEADS,
-                HEAD_DIM,
-                SLAB_TOKENS,
-                MAX_CTX,
-                BATCH,
-                &partials,
-                Some(&descs_zero),
-                Some(&rs_alt),
-            ),
-            "asym3" => gpu.attention_flash_asym3_batched_masked_slots(
-                &q,
-                &k_clean,
-                &v_clean,
-                &out_slots,
-                &pos,
-                &t.cos,
-                &t.sin,
-                N_HEADS,
-                N_KV_HEADS,
-                HEAD_DIM,
-                SLAB_TOKENS,
-                MAX_CTX,
-                BATCH,
-                &partials,
-                None,
-                0,
-                0,
-                Some(&descs_zero),
-                Some(&rs_alt),
-            ),
-            "asym4" => gpu.attention_flash_asym4_batched_masked_slots(
-                &q,
-                &k_clean,
-                &v_clean,
-                &out_slots,
-                &pos,
-                &t.cos,
-                &t.sin,
-                N_HEADS,
-                N_KV_HEADS,
-                HEAD_DIM,
-                SLAB_TOKENS,
-                MAX_CTX,
-                BATCH,
-                &partials,
-                None,
-                0,
-                0,
-                Some(&descs_zero),
-                Some(&rs_alt),
-            ),
             "fwht2" => gpu.attention_flash_fwht2_batched_slots(
                 &q,
                 &k_clean,
@@ -404,60 +335,6 @@ fn attn_checks(gpu: &mut Gpu, tier: &str, t: &Tables, rng: &mut Rng) -> (f32, f3
         }
         .expect("slots attention launch");
         match tier {
-            "asym2" => gpu.attention_flash_asym2_batched(
-                &q,
-                &k_clean,
-                &v_clean,
-                &out_ref,
-                &pos,
-                &t.cos,
-                &t.sin,
-                N_HEADS,
-                N_KV_HEADS,
-                HEAD_DIM,
-                SLAB_TOKENS,
-                MAX_CTX,
-                BATCH,
-                &partials,
-            ),
-            "asym3" => gpu.attention_flash_asym3_batched_masked(
-                &q,
-                &k_clean,
-                &v_clean,
-                &out_ref,
-                &pos,
-                &t.cos,
-                &t.sin,
-                N_HEADS,
-                N_KV_HEADS,
-                HEAD_DIM,
-                SLAB_TOKENS,
-                MAX_CTX,
-                BATCH,
-                &partials,
-                None,
-                0,
-                0,
-            ),
-            "asym4" => gpu.attention_flash_asym4_batched_masked(
-                &q,
-                &k_clean,
-                &v_clean,
-                &out_ref,
-                &pos,
-                &t.cos,
-                &t.sin,
-                N_HEADS,
-                N_KV_HEADS,
-                HEAD_DIM,
-                SLAB_TOKENS,
-                MAX_CTX,
-                BATCH,
-                &partials,
-                None,
-                0,
-                0,
-            ),
             "fwht2" => gpu.attention_flash_fwht2_batched(
                 &q,
                 &k_clean,
@@ -538,66 +415,6 @@ fn attn_checks(gpu: &mut Gpu, tier: &str, t: &Tables, rng: &mut Rng) -> (f32, f3
     let out_ref2 = out_dev(gpu);
     let understudy = {
         match tier {
-            "asym2" => gpu.attention_flash_asym2_batched_slots(
-                &q,
-                &k_two_dev,
-                &v_two_dev,
-                &out_two,
-                &pos,
-                &t.cos,
-                &t.sin,
-                N_HEADS,
-                N_KV_HEADS,
-                HEAD_DIM,
-                SLAB_TOKENS,
-                MAX_CTX,
-                BATCH,
-                &partials,
-                Some(&descs_slab),
-                Some(&rs_one),
-            ),
-            "asym3" => gpu.attention_flash_asym3_batched_masked_slots(
-                &q,
-                &k_two_dev,
-                &v_two_dev,
-                &out_two,
-                &pos,
-                &t.cos,
-                &t.sin,
-                N_HEADS,
-                N_KV_HEADS,
-                HEAD_DIM,
-                SLAB_TOKENS,
-                MAX_CTX,
-                BATCH,
-                &partials,
-                None,
-                0,
-                0,
-                Some(&descs_slab),
-                Some(&rs_one),
-            ),
-            "asym4" => gpu.attention_flash_asym4_batched_masked_slots(
-                &q,
-                &k_two_dev,
-                &v_two_dev,
-                &out_two,
-                &pos,
-                &t.cos,
-                &t.sin,
-                N_HEADS,
-                N_KV_HEADS,
-                HEAD_DIM,
-                SLAB_TOKENS,
-                MAX_CTX,
-                BATCH,
-                &partials,
-                None,
-                0,
-                0,
-                Some(&descs_slab),
-                Some(&rs_one),
-            ),
             "fwht2" => gpu.attention_flash_fwht2_batched_slots(
                 &q,
                 &k_two_dev,
@@ -666,60 +483,6 @@ fn attn_checks(gpu: &mut Gpu, tier: &str, t: &Tables, rng: &mut Rng) -> (f32, f3
         let k_ref2 = upload_raw(gpu, &k_two[slab_k..]);
         let v_ref2 = upload_raw(gpu, &v_two[slab_v..]);
         match tier {
-            "asym2" => gpu.attention_flash_asym2_batched(
-                &q,
-                &k_ref2,
-                &v_ref2,
-                &out_ref2,
-                &pos,
-                &t.cos,
-                &t.sin,
-                N_HEADS,
-                N_KV_HEADS,
-                HEAD_DIM,
-                SLAB_TOKENS,
-                MAX_CTX,
-                BATCH,
-                &partials,
-            ),
-            "asym3" => gpu.attention_flash_asym3_batched_masked(
-                &q,
-                &k_ref2,
-                &v_ref2,
-                &out_ref2,
-                &pos,
-                &t.cos,
-                &t.sin,
-                N_HEADS,
-                N_KV_HEADS,
-                HEAD_DIM,
-                SLAB_TOKENS,
-                MAX_CTX,
-                BATCH,
-                &partials,
-                None,
-                0,
-                0,
-            ),
-            "asym4" => gpu.attention_flash_asym4_batched_masked(
-                &q,
-                &k_ref2,
-                &v_ref2,
-                &out_ref2,
-                &pos,
-                &t.cos,
-                &t.sin,
-                N_HEADS,
-                N_KV_HEADS,
-                HEAD_DIM,
-                SLAB_TOKENS,
-                MAX_CTX,
-                BATCH,
-                &partials,
-                None,
-                0,
-                0,
-            ),
             "fwht2" => gpu.attention_flash_fwht2_batched(
                 &q,
                 &k_ref2,
@@ -820,48 +583,6 @@ fn write_check(gpu: &mut Gpu, tier: &str, t: &Tables, rng: &mut Rng) -> (usize, 
 
     let descs = slab_descs(gpu, [0, slab_k as u64], [0, slab_v as u64]);
     match tier {
-        "asym2" => gpu.kv_cache_write_asym2_batched_slots(
-            &k_cand_dev,
-            &v_cand_dev,
-            &k_src,
-            &v_src,
-            &pos,
-            &t.cos,
-            &t.sin,
-            N_KV_HEADS,
-            HEAD_DIM,
-            BATCH,
-            Some(&descs),
-            Some(&rs_one),
-        ),
-        "asym3" => gpu.kv_cache_write_asym3_batched_slots(
-            &k_cand_dev,
-            &v_cand_dev,
-            &k_src,
-            &v_src,
-            &pos,
-            &t.cos,
-            &t.sin,
-            N_KV_HEADS,
-            HEAD_DIM,
-            BATCH,
-            Some(&descs),
-            Some(&rs_one),
-        ),
-        "asym4" => gpu.kv_cache_write_asym4_batched_slots(
-            &k_cand_dev,
-            &v_cand_dev,
-            &k_src,
-            &v_src,
-            &pos,
-            &t.cos,
-            &t.sin,
-            N_KV_HEADS,
-            HEAD_DIM,
-            BATCH,
-            Some(&descs),
-            Some(&rs_one),
-        ),
         "fwht2" => gpu.kv_cache_write_fwht2_batched_slots(
             &k_cand_dev,
             &v_cand_dev,
@@ -908,15 +629,6 @@ fn write_check(gpu: &mut Gpu, tier: &str, t: &Tables, rng: &mut Rng) -> (usize, 
     }
     .expect("candidate composite write");
     match tier {
-        "asym2" => gpu.kv_cache_write_asym2_batched(
-            &k_ref, &v_ref, &k_src, &v_src, &pos, &t.cos, &t.sin, N_KV_HEADS, HEAD_DIM, BATCH,
-        ),
-        "asym3" => gpu.kv_cache_write_asym3_batched(
-            &k_ref, &v_ref, &k_src, &v_src, &pos, &t.cos, &t.sin, N_KV_HEADS, HEAD_DIM, BATCH,
-        ),
-        "asym4" => gpu.kv_cache_write_asym4_batched(
-            &k_ref, &v_ref, &k_src, &v_src, &pos, &t.cos, &t.sin, N_KV_HEADS, HEAD_DIM, BATCH,
-        ),
         "fwht2" => gpu.kv_cache_write_fwht2_batched(
             &k_ref, &v_ref, &k_src, &v_src, &pos, &t.signs1, &t.signs2, N_KV_HEADS, HEAD_DIM,
             BATCH, 8,
@@ -1121,48 +833,6 @@ fn paged_write(
     descs: &GpuTensor,
 ) {
     match tier {
-        "asym2" => gpu.kv_cache_write_asym2_batched_slots(
-            k_dst,
-            v_dst,
-            k_src,
-            v_src,
-            pos,
-            &t.cos,
-            &t.sin,
-            N_KV_HEADS,
-            HEAD_DIM,
-            BATCH,
-            Some(descs),
-            Some(row_slot),
-        ),
-        "asym3" => gpu.kv_cache_write_asym3_batched_slots(
-            k_dst,
-            v_dst,
-            k_src,
-            v_src,
-            pos,
-            &t.cos,
-            &t.sin,
-            N_KV_HEADS,
-            HEAD_DIM,
-            BATCH,
-            Some(descs),
-            Some(row_slot),
-        ),
-        "asym4" => gpu.kv_cache_write_asym4_batched_slots(
-            k_dst,
-            v_dst,
-            k_src,
-            v_src,
-            pos,
-            &t.cos,
-            &t.sin,
-            N_KV_HEADS,
-            HEAD_DIM,
-            BATCH,
-            Some(descs),
-            Some(row_slot),
-        ),
         "fwht2" => gpu.kv_cache_write_fwht2_batched_slots(
             k_dst,
             v_dst,
@@ -1228,66 +898,6 @@ fn attend(
     row_slot: &GpuTensor,
 ) {
     match tier {
-        "asym2" => gpu.attention_flash_asym2_batched_slots(
-            q,
-            k,
-            v,
-            out,
-            pos,
-            &t.cos,
-            &t.sin,
-            N_HEADS,
-            N_KV_HEADS,
-            HEAD_DIM,
-            seq,
-            seq,
-            BATCH,
-            partials,
-            Some(descs),
-            Some(row_slot),
-        ),
-        "asym3" => gpu.attention_flash_asym3_batched_masked_slots(
-            q,
-            k,
-            v,
-            out,
-            pos,
-            &t.cos,
-            &t.sin,
-            N_HEADS,
-            N_KV_HEADS,
-            HEAD_DIM,
-            seq,
-            seq,
-            BATCH,
-            partials,
-            None,
-            0,
-            0,
-            Some(descs),
-            Some(row_slot),
-        ),
-        "asym4" => gpu.attention_flash_asym4_batched_masked_slots(
-            q,
-            k,
-            v,
-            out,
-            pos,
-            &t.cos,
-            &t.sin,
-            N_HEADS,
-            N_KV_HEADS,
-            HEAD_DIM,
-            seq,
-            seq,
-            BATCH,
-            partials,
-            None,
-            0,
-            0,
-            Some(descs),
-            Some(row_slot),
-        ),
         "fwht2" => gpu.attention_flash_fwht2_batched_slots(
             q,
             k,

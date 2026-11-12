@@ -844,29 +844,16 @@ pub fn reset_ddtree_meta_stats() {
 pub enum KvMode {
     /// INT8 co-located K and V (default).
     Q8,
-    /// Asym4: rotated 4-bit K + Q8 V (smaller than Q8, higher-fidelity than asym3).
-    Asym4,
-    /// Asym3: rotated 3-bit K + Q8 V. ~2.7× less KV BW than Q8, tightly-tuned
-    /// kernel for the hot FA attention path. Good choice for long-context verify.
-    Asym3,
-    /// Asym2: rotated 2-bit K + Q8 V. Smallest but most lossy.
-    Asym2,
-    /// Fwht4: signed-FWHT-rotated 4-bit K + Q8 V. Byte-identical storage to
-    /// Asym4 but with a Hadamard rotation (matches MQ4's weight-quant trick).
-    /// Centroid LUTs were always Lloyd-Max-fit for post-FWHT N(0, 1/128) per
-    /// turbo_common.h:13 — Fwht4 finally uses them on the distribution they
-    /// were calibrated for. Opt-in via `--kv-mode fwht4`.
+    /// Fwht4: signed-FWHT-rotated 4-bit K + Q8 V (Hadamard rotation, matches
+    /// MQ4's weight-quant trick). Centroid LUTs are Lloyd-Max-fit for
+    /// post-FWHT N(0, 1/128) per turbo_common.h:13. Opt-in via
+    /// `--kv-mode fwht4`.
     Fwht4,
-    /// Fwht3: signed-FWHT-256 rotated 3-bit K + Q8 V. Byte-identical storage to
-    /// Asym3 (the canonical default). Single-pass 256-element FWHT — the
-    /// natural fit for asym3's existing layout (8 dims/thread). Empirical
-    /// prose-τ win on 3.5-27b at the 4-bit tier suggests the 3-bit tier
-    /// should benefit even more from rotation. Opt-in via `--kv-mode fwht3`.
+    /// Fwht3: signed-FWHT-256 rotated 3-bit K + Q8 V. Single-pass 256-element
+    /// FWHT (8 dims/thread). Opt-in via `--kv-mode fwht3`.
     Fwht3,
-    /// Fwht2: signed-FWHT-128 rotated 2-bit K + Q8 V. Byte-identical storage
-    /// to Asym2. 2-pass-over-128 structure matches fwht4. Highest theoretical
-    /// leverage tier — Asym2 is doc'd "most lossy" and 2-bit centroid quant
-    /// suffers most from outliers. Opt-in via `--kv-mode fwht2`.
+    /// Fwht2: signed-FWHT-128 rotated 2-bit K + Q8 V. 2-pass-over-128
+    /// structure matches fwht4. Opt-in via `--kv-mode fwht2`.
     Fwht2,
     /// Native fp8 E4M3 KV (gfx1201 Qwen dense only). ModelSlot::load rejects
     /// this mode: single-slot speculative assembly goes through the carrier
@@ -1067,30 +1054,9 @@ impl ModelSlot {
 
         // Honor the caller's requested KV cache mode. Default is Q8 for
         // backwards-compat, but DFlash verify is KV-bandwidth sensitive at
-        // longer contexts — asym3/asym4 cut the verify attention cost.
+        // longer contexts — fwht3/fwht4 cut the verify attention cost.
         let kv_cache = match slot_config.kv_mode {
             KvMode::Q8 => KvCache::new_gpu_q8_filtered(
-                gpu,
-                &is_kv_layer,
-                config.n_kv_heads,
-                config.head_dim,
-                slot_config.max_seq,
-            )?,
-            KvMode::Asym4 => KvCache::new_gpu_asym4_filtered(
-                gpu,
-                &is_kv_layer,
-                config.n_kv_heads,
-                config.head_dim,
-                slot_config.max_seq,
-            )?,
-            KvMode::Asym3 => KvCache::new_gpu_asym3_filtered(
-                gpu,
-                &is_kv_layer,
-                config.n_kv_heads,
-                config.head_dim,
-                slot_config.max_seq,
-            )?,
-            KvMode::Asym2 => KvCache::new_gpu_asym2_filtered(
                 gpu,
                 &is_kv_layer,
                 config.n_kv_heads,

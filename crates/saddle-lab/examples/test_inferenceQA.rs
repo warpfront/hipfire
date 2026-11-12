@@ -44,7 +44,7 @@ const QWEN_GGUF_FALLBACK: &str = "/home/kaden/llama.cpp/models/Qwen3-0.6B-Q8_0.g
 #[cfg(feature = "deltanet")]
 const PREFILL_MEAN_LOGIT_TOL: f64 = 0.15;
 #[cfg(feature = "deltanet")]
-const PREFILL_ASYM2_MEAN_LOGIT_TOL: f64 = 0.25;
+const PREFILL_FWHT2_MEAN_LOGIT_TOL: f64 = 0.25;
 #[cfg(feature = "deltanet")]
 const PREFILL_SELECTED_LOGIT_TOL: f32 = 1.0;
 
@@ -75,14 +75,6 @@ const CASES: &[CaseDef] = &[
     CaseDef {
         name: "chatml_single_tokens",
         timeout: Duration::from_secs(10),
-    },
-    CaseDef {
-        name: "givens4_cache_allocates",
-        timeout: Duration::from_secs(20),
-    },
-    CaseDef {
-        name: "givens4_forward_no_hang",
-        timeout: Duration::from_secs(20),
     },
     CaseDef {
         name: "prefill_batch_matches_sequential",
@@ -289,8 +281,6 @@ fn run_case(case_name: &str, model_path: Option<&Path>) -> ExitCode {
             "sequence_no_hang" => sequence_no_hang(&mut ctx),
             "think_token_detectable" => think_token_detectable(&mut ctx),
             "chatml_single_tokens" => chatml_single_tokens(&mut ctx),
-            "givens4_cache_allocates" => givens4_cache_allocates(&mut ctx),
-            "givens4_forward_no_hang" => givens4_forward_no_hang(&mut ctx),
             "prefill_batch_matches_sequential" => prefill_batch_matches_sequential(&mut ctx),
             "decode_speed_sanity" => decode_speed_sanity(&mut ctx),
             "vram_leak_signal" => vram_leak_signal(&mut ctx),
@@ -438,8 +428,8 @@ fn prefill_mean_logit_tol(mode: &str) -> f64 {
     match mode {
         // The rotated 2-bit K cache is intentionally the lossiest KV mode.
         // Keep top-token and selected-logit checks strict, but allow a wider
-        // full-vocab mean drift than q8/asym3/asym4.
-        "asym2" | "turbo2" => PREFILL_ASYM2_MEAN_LOGIT_TOL,
+        // full-vocab mean drift than q8/fwht3/fwht4.
+        "fwht2" => PREFILL_FWHT2_MEAN_LOGIT_TOL,
         _ => PREFILL_MEAN_LOGIT_TOL,
     }
 }
@@ -477,23 +467,23 @@ fn kv_cache_for_mode(
             config.head_dim,
             seq_len,
         ),
-        "asym4" | "turbo4" => llama::KvCache::new_gpu_asym4(
+        "fwht4" => llama::KvCache::new_gpu_fwht4(
             gpu,
             config.n_layers,
             config.n_kv_heads,
             config.head_dim,
             seq_len,
         ),
-        "asym3" | "turbo3" | "turbo" => llama::KvCache::new_gpu_asym3(
+        "fwht3" => llama::KvCache::new_gpu_fwht3_filtered(
             gpu,
-            config.n_layers,
+            &vec![true; config.n_layers],
             config.n_kv_heads,
             config.head_dim,
             seq_len,
         ),
-        "asym2" | "turbo2" => llama::KvCache::new_gpu_asym2(
+        "fwht2" => llama::KvCache::new_gpu_fwht2_filtered(
             gpu,
-            config.n_layers,
+            &vec![true; config.n_layers],
             config.n_kv_heads,
             config.head_dim,
             seq_len,
@@ -693,74 +683,12 @@ fn chatml_single_tokens(ctx: &mut Context) -> CaseOutcome {
 }
 
 #[cfg(feature = "deltanet")]
-fn givens4_cache_allocates(ctx: &mut Context) -> CaseOutcome {
-    match llama::KvCache::new_gpu_asym3(
-        &mut ctx.gpu,
-        ctx.config.n_layers,
-        ctx.config.n_kv_heads,
-        ctx.config.head_dim,
-        128,
-    ) {
-        Ok(kv) => {
-            if kv.quant_asym3 && kv.givens_cos.is_some() && kv.givens_sin.is_some() {
-                CaseOutcome::Pass(format!(
-                    "allocated givens4 KV for {} layers",
-                    ctx.config.n_layers
-                ))
-            } else {
-                CaseOutcome::Fail("givens4 KV cache flags were inconsistent".to_string())
-            }
-        }
-        Err(err) => CaseOutcome::Fail(format!("failed to allocate givens4 KV cache: {err}")),
-    }
-}
-
-#[cfg(feature = "deltanet")]
-fn givens4_forward_no_hang(ctx: &mut Context) -> CaseOutcome {
-    match (|| -> Result<String, String> {
-        let mut kv = llama::KvCache::new_gpu_asym3(
-            &mut ctx.gpu,
-            ctx.config.n_layers,
-            ctx.config.n_kv_heads,
-            ctx.config.head_dim,
-            128,
-        )
-        .map_err(|e: hip_bridge::HipError| e.to_string())?;
-        let mut dn = DeltaNetState::new(&mut ctx.gpu, &ctx.config)
-            .map_err(|e: hip_bridge::HipError| e.to_string())?;
-        let tokens = ctx.tokenizer.encode("Hello world");
-        ensure(!tokens.is_empty(), "prompt encoded to zero tokens")?;
-        let t0 = Instant::now();
-        for (pos, &tok) in tokens.iter().enumerate() {
-            let _ = qwen35::forward(
-                &mut ctx.gpu,
-                &ctx.weights,
-                &ctx.config,
-                tok,
-                pos,
-                &mut kv,
-                &mut dn,
-            )
-            .map_err(|e: hip_bridge::HipError| e.to_string())?;
-        }
-        Ok(format!(
-            "{} tokens in {}ms",
-            tokens.len(),
-            t0.elapsed().as_millis()
-        ))
-    })() {
-        Ok(msg) => CaseOutcome::Pass(msg),
-        Err(err) => CaseOutcome::Fail(err),
-    }
-}
-
-#[cfg(feature = "deltanet")]
 fn prefill_batch_matches_sequential(ctx: &mut Context) -> CaseOutcome {
     match (|| -> Result<String, String> {
         let tokens = prompt_processing_tokens(ctx)?;
         let lengths = [2usize, 7, 17, 33];
         let kv_modes =
-            env::var("HIPFIRE_QA_KV_MODES").unwrap_or_else(|_| "q8,asym4,asym3,asym2".to_string());
+            env::var("HIPFIRE_QA_KV_MODES").unwrap_or_else(|_| "q8,fwht4,fwht3,fwht2".to_string());
         let kv_modes: Vec<&str> = kv_modes
             .split(',')
             .map(str::trim)

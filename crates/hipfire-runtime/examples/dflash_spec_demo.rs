@@ -477,7 +477,7 @@ fn main() {
     let mut ddtree_topk: usize = 8; // paper uses B-1 * budget_fanout; small k keeps tree shallow
                                     // --ddtree-batched: use spec_step_ddtree_batched (single tree-attention
                                     // forward) instead of the per-path DFS. Requires FA batched path (Q8 /
-                                    // asym3 / asym4 KV). Tree-exact on FA side, linear-replay on GDN.
+                                    // fwht KV). Tree-exact on FA side, linear-replay on GDN.
     let mut ddtree_batched: bool = false;
     // ChatML wrapping: <|im_start|>user\n{p}<|im_end|>\n<|im_start|>assistant\n —
     // matches how the daemon / infer_qwen35 call the instruction-tuned Qwen3.5.
@@ -1733,16 +1733,15 @@ fn main() {
     slot_cfg.max_seq = ctx_capacity + cfg_block_size_for_slot + 16;
     slot_cfg.kv_mode = match kv_mode_str.as_str() {
         "q8" => hipfire_arch_qwen35::speculative::KvMode::Q8,
-        "asym4" | "turbo4" => hipfire_arch_qwen35::speculative::KvMode::Asym4,
-        "asym3" | "turbo3" | "turbo" => hipfire_arch_qwen35::speculative::KvMode::Asym3,
-        "asym2" | "turbo2" => hipfire_arch_qwen35::speculative::KvMode::Asym2,
         "fwht4" => hipfire_arch_qwen35::speculative::KvMode::Fwht4,
         "fwht3" => hipfire_arch_qwen35::speculative::KvMode::Fwht3,
         "fwht2" => hipfire_arch_qwen35::speculative::KvMode::Fwht2,
         other => {
-            eprintln!(
-                "unknown --kv-mode: {other}. Valid: q8, asym4, asym3, asym2, fwht4, fwht3, fwht2"
-            );
+            if let Some(msg) = hipfire_config::removed_kv_name_error(other) {
+                eprintln!("{msg}");
+                std::process::exit(1);
+            }
+            eprintln!("unknown --kv-mode: {other}. Valid: q8, fwht4, fwht3, fwht2");
             std::process::exit(1);
         }
     };

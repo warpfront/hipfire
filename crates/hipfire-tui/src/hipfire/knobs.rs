@@ -136,11 +136,6 @@ pub const KNOBS: &[KnobInfo] = &[
             ("fwht4", "4-bit FWHT-rotated K + Q8 V. DFlash-safe."),
             ("fwht3", "3-bit FWHT-rotated, ~5.5x. Best compressed-yet-DFlash-safe."),
             ("fwht2", "2-bit FWHT. Smallest; for genuinely tight VRAM."),
-            // lifecycle: deprecated since 0.4.0, removal 0.5.0 — Givens asym KV and the asymN/turboN aliases are superseded by fwht3
-            ("asym4", "Deprecated (removal in 0.5.0): 4-bit Givens-era name; use fwht4."),
-            ("asym3", "Deprecated (removal in 0.5.0): 3-bit Givens-era name; use fwht3."),
-            ("asym2", "Deprecated (removal in 0.5.0): 2-bit Givens-era name; use fwht2."),
-            ("turbo / turbo2-4", "Deprecated (removal in 0.5.0) aliases; use fwhtN."),
         ],
     },
     KnobInfo {
@@ -179,7 +174,7 @@ pub const KNOBS: &[KnobInfo] = &[
         effect: "Empty leaves the format the KV cache precision row selects; a value forces just the K axis.",
         default: "",
         when: "Only for experiments on Qwen models; normally follow the KV cache precision row.",
-        note: Some("asymN and turboN names are deprecated (removal 0.5.0); use fwhtN or q8."),
+        note: None,
         options: &[],
     },
     KnobInfo {
@@ -313,14 +308,14 @@ pub const KNOBS: &[KnobInfo] = &[
         key: "flash_mode",
         title: "Flash attention mode",
         summary: "Controls the flash-attention path for the Q8 KV cache.",
-        effect: "auto picks per arch; always/never force it. Mostly a performance knob; the asym KV modes are flash-only.",
+        effect: "auto picks per arch; always/never force it. Mostly a performance knob; the FWHT KV modes are flash-only.",
         default: "auto",
         when: "Leave on auto unless debugging an attention path.",
         note: None,
         options: &[
             ("auto", "Engine decides per arch — flash on where it helps (already on by default on gfx11/gfx12)."),
             ("always", "Force flash attention on."),
-            ("never", "Disable flash attention (asym modes are flash-only)."),
+            ("never", "Disable flash attention (FWHT modes are flash-only)."),
         ],
     },
     KnobInfo {

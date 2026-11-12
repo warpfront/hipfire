@@ -2258,9 +2258,9 @@ pub fn vmm_kv_token_bytes(
             KvMode::Fp8 => head + 2,
             KvMode::Bf16 | KvMode::F16 => head.checked_mul(2)?,
             KvMode::Q8 => head / 32 * 34,
-            KvMode::Asym2 | KvMode::Fwht2 => head / 4 + 4,
-            KvMode::Asym3 | KvMode::Fwht3 => head * 3 / 8 + 4,
-            KvMode::Asym4 | KvMode::Fwht4 => head / 2 + 4,
+            KvMode::Fwht2 => head / 4 + 4,
+            KvMode::Fwht3 => head * 3 / 8 + 4,
+            KvMode::Fwht4 => head / 2 + 4,
         }
     };
     let v_head = match pair {
@@ -6751,7 +6751,7 @@ fn restore_inactive_residual_rows(
 //
 // Envelope (anything outside falls back to sequential 512 chunks): exact
 // gfx1151, eager, sequential single-request prefill, both chunks exactly
-// 512 rows, H24/KV4/D256, KV tier Q8 or fwht3-Asym3, no tree/tape/band/
+// 512 rows, H24/KV4/D256, KV tier Q8 or fwht3, no tree/tape/band/
 // max_layer, no hidden ring (its per-chunk staging commit is
 // chunk-sequential), DFlash fusion Off.
 // DeltaNet (dense LA + MoE-LA) sequential kernels stay 2x512 inside the
@@ -6870,7 +6870,7 @@ fn fa_pair_env_admitted(
             }
             gpu.arch_caps.has_wmma_w32() || gpu.arch_caps.has_wmma_w32_gfx12()
         }
-        hipfire_dispatch::families::kv_tier::KTier::Asym3 { fwht: true } => {
+        hipfire_dispatch::families::kv_tier::KTier::Fwht3 => {
             // fwht3-K FA2 arm: V must be Q8_0 and the givens tables present.
             tier_inputs.v_mode_bits == 8
                 && kv_cache.givens_cos.is_some()
@@ -11399,9 +11399,9 @@ mod tests {
         let mut flags = KvTierFlags::default();
         match pair.k() {
             KvMode::Q8 => flags.quant_q8 = true,
-            KvMode::Asym2 | KvMode::Fwht2 => flags.quant_asym2 = true,
-            KvMode::Asym3 | KvMode::Fwht3 => flags.quant_asym3 = true,
-            KvMode::Asym4 | KvMode::Fwht4 => flags.quant_asym4 = true,
+            KvMode::Fwht2 => flags.quant_asym2 = true,
+            KvMode::Fwht3 => flags.quant_asym3 = true,
+            KvMode::Fwht4 => flags.quant_asym4 = true,
             KvMode::Fp8 => flags.quant_fp8 = true,
             _ => {}
         }

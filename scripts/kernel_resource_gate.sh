@@ -61,12 +61,6 @@ assemble "$WORK/prefill.hip" '#define BR 8\n#define BC 32\n#define NTHREADS 256\
     attention_q8_0_flash_prefill.hip kv_slot_desc.h
 assemble "$WORK/q8_lds.hip"  '' attention_q8_0_kv_batched.hip        kv_slot_desc.h
 assemble "$WORK/q8_tile.hip" '' attention_flash_q8_0_tile_batched.hip kv_slot_desc.h
-assemble "$WORK/asym3.hip"   '' attention_flash_asym3_tile_batched.hip \
-    turbo_common.h givens_common.h kv_slot_desc.h
-# Sibling that SP1 did not port, but which now receives extra kernargs from the
-# shared launcher — included so an accidental edit to it is visible here.
-assemble "$WORK/asym2.hip"   '' attention_flash_asym2_tile_batched.hip \
-    turbo_common.h givens_common.h
 # DeltaNet: SP2 added a per-slot state stride here. Three quarters of both target
 # models' layers are DeltaNet, so a register regression in it is as costly as one
 # in attention -- and the gate did not cover it until SP2 Task 4 found the gap.
@@ -83,7 +77,7 @@ assemble "$WORK/wmma_gfx11.hip" "$WMMA_DEFS" attention_q8_0_flash_prefill_wmma.h
 assemble "$WORK/wmma_gfx12.hip" "$WMMA_DEFS" attention_q8_0_flash_prefill_wmma.gfx12.hip kv_slot_desc.h
 
 for arch in gfx1151 gfx1201; do
-  for k in prefill q8_lds q8_tile asym3 asym2 dn_q8; do
+  for k in prefill q8_lds q8_tile dn_q8; do
     line=$("$HIPCC" --genco "--offload-arch=$arch" -O3 \
              -Rpass-analysis=kernel-resource-usage \
              -o "$WORK/$k.$arch.o" "$WORK/$k.hip" 2>&1 \

@@ -1230,7 +1230,7 @@ class AstreaTests(unittest.TestCase):
             ],
         )
 
-    def test_kv_profile_records_asym_turbo_and_rotor_candidates(self):
+    def test_kv_profile_records_fwht_turbo_and_rotor_candidates(self):
         astrea = load_astrea()
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1239,15 +1239,15 @@ class AstreaTests(unittest.TestCase):
 
             profile = astrea.build_kv_profile(
                 model=str(model),
-                modes=["q8", "asym3", "turbo3", "rotor"],
+                modes=["q8", "fwht3", "turbo3", "rotor"],
                 model_family="qwen3.5-9b",
                 profile_id="kv-profile-smoke",
             )
 
         self.assertEqual(profile["schema"], "hipfire.astrea.kv_profile.v0")
         self.assertEqual(profile["profile_id"], "kv-profile-smoke")
-        self.assertEqual(profile["baseline_mode"], "asym3")
-        self.assertEqual(profile["modes"]["asym3"]["status"], "implemented")
+        self.assertEqual(profile["baseline_mode"], "fwht3")
+        self.assertEqual(profile["modes"]["fwht3"]["status"], "implemented")
         self.assertEqual(profile["modes"]["turbo3"]["status"], "research_candidate")
         self.assertEqual(profile["modes"]["rotor"]["family"], "rotor")
         self.assertIn("DFlash", " ".join(profile["quality_gates"]))
@@ -1339,7 +1339,7 @@ class AstreaTests(unittest.TestCase):
                     "--model",
                     str(model),
                     "--mode",
-                    "asym3",
+                    "fwht3",
                     "--mode",
                     "turbo3",
                     "--profile-id",

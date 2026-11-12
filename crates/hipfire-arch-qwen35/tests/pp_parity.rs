@@ -12,7 +12,7 @@
 //!
 //! Asserts: per-token `forward_scratch_multi` ≡ `forward_scratch` bit-
 //! exact across 50 decode tokens after a 15-token ChatML prefill on
-//! qwen3.5-0.8b.mq4 + asym3 KV. This is the floor — if this regresses,
+//! qwen3.5-0.8b.mq4 + Q8 KV. This is the floor — if this regresses,
 //! pp=2 is broken.
 //!
 //! Model location: `$HOME/.hipfire/models/qwen3.5-0.8b.mq4` (override
@@ -72,7 +72,7 @@ fn run_pp1(path: &str, prompt: &[u32]) -> Vec<u32> {
     let layout = qwen35::Layout::single(config.n_layers);
     let weights = qwen35::load_weights(&mut src, std::slice::from_mut(&mut gpu), &layout)
         .expect("load_weights");
-    let mut kv = KvCache::new_gpu_asym3_capped(
+    let mut kv = KvCache::new_gpu_q8_capped(
         &mut gpu,
         config.n_layers,
         config.n_kv_heads,
@@ -124,7 +124,7 @@ fn run_pp2(path: &str, prompt: &[u32]) -> Vec<u32> {
         .expect("load_weights_multi");
     let scratch_set =
         Qwen35ScratchSet::new_with_kv_max_multi(&mut gpus, &config, 64, 4096).expect("scratch_set");
-    let mut kv = KvCache::new_gpu_asym3_capped_multi(
+    let mut kv = KvCache::new_gpu_q8_capped_multi(
         &mut gpus,
         config.n_layers,
         config.n_kv_heads,

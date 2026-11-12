@@ -62,8 +62,7 @@ In the TUI Settings tab every non-deprecated key is editable inline: its editor
 kind (cycle an enum, toggle a boolean, type a number or text) is derived from
 the schema's value rule, so the TUI offers exactly what `hipfire config set`
 accepts. `memory.kv_cache` offers `auto`, `q8`, `fwht4`, `fwht3`, `fwht2`, `fp8`,
-`bf16`, `f16` and `f32` (the deprecated `asymN`/`turboN` aliases stay settable
-only from the CLI). `developer.qwen4_moe_sym_iu4` is written as a TOML boolean.
+`bf16`, `f16` and `f32`. `developer.qwen4_moe_sym_iu4` is written as a TOML boolean.
 The tab reads the same layers as `hipfire config explain` (built-in defaults,
 the model's registry card, `config.toml`, `models.toml`, the environment) and
 shows, per row, the value predicted for the active model on your GPU and the
@@ -522,8 +521,8 @@ model's contract still accepts the named-cap route):
 
 | Key | Default | Validated values |
 |---|---|---|
-| `kv_cache` | `"auto"` | `auto`, `q8`, `fp8`, `bf16`, `fwht4`, `fwht3`, `fwht2`, `f32`/`f16` (DeepSeek V4 only); legacy spellings `asym4`, `asym3`, `asym2`, `turbo`, `turbo4`, `turbo3`, `turbo2`, `legacy-asym3` (family-dependent; see below) |
-| `kv_k` | empty (unset) | Qwen-only: `q8`, `fwht2`–`fwht4`, `asym2`–`asym4`, `turbo`/`turbo2`–`turbo4`, `legacy-asym2`–`legacy-asym4` |
+| `kv_cache` | `"auto"` | `auto`, `q8`, `fp8`, `bf16`, `fwht4`, `fwht3`, `fwht2`, `f32`/`f16` (DeepSeek V4 only); the `asymN`/`turboN`/`legacy-asym3` spellings were removed in 0.5.0 and are rejected (family-dependent support; see below) |
+| `kv_k` | empty (unset) | Qwen-only: `q8`, `fwht2`–`fwht4` (`asymN`, `turbo`/`turboN` and `legacy-asymN` were removed in 0.5.0 and are rejected) |
 | `kv_v` | empty (unset) | Qwen-only: `q8`, `lloyd2`–`lloyd4` |
 | `kv_adaptive` | `"off"` | `off`, `conservative`, `balanced`, `aggressive`, or `advanced:k=<fwht4\|fwht3\|fwht2>,v=<lloyd4\|lloyd3\|lloyd2>` |
 | `kv_backend` | schema `"vmm"`; automatic when not authored | `legacy` \| `vmm` |
@@ -550,34 +549,25 @@ throughput; the capacity delta itself is not yet measured on this host.
 
 - `q8` → Q8 K
 - `fwht2` \| `fwht3` \| `fwht4` → signed FWHT K at that bit width
-- `asym2` \| `asym3` \| `asym4` and `turbo` \| `turbo2` \| `turbo3` \| `turbo4`
-  → **FWHT** K (`turbo` ≡ `fwht3`, `turboN`/`asymN` ≡ `fwhtN`). These are
-  legacy spellings kept as aliases; they do not build the old Givens-Asym
-  constructors. **Deprecated since 0.4.0, removal in 0.5.0**: spell `fwhtN`.
-- `legacy-asym2` \| `legacy-asym3` \| `legacy-asym4` → old Givens-Asym K
-  (**legacy**; explicit rollback spelling, `--kv-k` / `memory.kv_k` only —
-  `memory.kv_cache` does not accept it). **Deprecated since 0.4.0, removal in
-  0.5.0**: fwht3 supersedes Givens asym KV.
 
-Naming any deprecated KV value at load prints one line:
-`[hipfire-daemon] warning: KV name '<name>' is deprecated and will be removed in 0.5.0 (…; use fwhtN or q8)`.
+**Removed in 0.5.0:** `asym2` \| `asym3` \| `asym4`, `turbo` \| `turbo2` \|
+`turbo3` \| `turbo4` (aliases of `fwhtN` on Qwen) and `legacy-asym2` \|
+`legacy-asym3` \| `legacy-asym4` (Givens asym K). They are rejected by
+`memory.kv_cache` / `memory.kv_k` validation (config file, `config set`,
+`--kv-mode`, `--kv-k`), the `HIPFIRE_KV_MODE` environment variable and the
+daemon load request, with
+`KV name '<name>' was removed in 0.5.0 (…); use fwht2|fwht3|fwht4 or q8`.
 
 `fwht3` (and `fwht2`/`fwht4`) is an optional **headroom** mode on the
 Qwen3.5-family sites of every arch: it shrinks K to trade quality for
 context/VRAM. No default selects it (only the developer kill switch below).
 
-Qwen3 dense (flat constructor) accepts only `q8` K plus `legacy-asym3` /
-`legacy-asym4` at head_dim 256; bare `asymN`/`turboN`/`fwhtN` are refused.
-Outside Qwen, the llama-family **HFQ** loader keeps the pre-migration alias
-table: bare `asym3`/`asym4`/`turbo4` still build the legacy Givens
-constructors, while `asym2`/`turbo2`/`turbo`/`turbo3`/`fwhtN` are unsupported
-and fall back to `q8` with a warning. The llama **Dir** loader reads names
-through the Qwen table, so bare `asymN`/`turboN` mean FWHT there and fall back
-to `q8` with a warning. Those llama spellings are deprecated the same way.
+Qwen3 dense (flat constructor) accepts only `q8` K; `fwhtN` is refused. The
+llama-family **HFQ** and **Dir** loaders accept `q8`; any other name falls back
+to `q8` with a warning (removed names say so).
 
 **Qwen V names:** `q8`, `lloyd2`, `lloyd3`, `lloyd4`. Lloyd V **requires**
-FWHT K (including `asymN`/`turboN` aliases that resolve to FWHT). Lloyd V
-with `q8` or `legacy-asymN` K is rejected before teardown.
+FWHT K. Lloyd V with `q8` K is rejected before teardown.
 
 **Native pairs are indivisible.** An authored `--kv-mode fp8` or `bf16`
 (or the same via config) cannot be combined with any authored K or V axis
@@ -608,7 +598,6 @@ as `auto` (a registry `default_kv_mode = "q8"` is not lowered into config).
 auto; explicit `--kv-mode q8` still works). Gemma4 keeps its sliding tier
 Q8 on every variant; its full-attention tier follows `kv_cache`: `auto`/`q8`
 → Q8 on every arch (no Gemma4 attend site admits native FP8),
-`legacy-asym3` → the previous Givens Asym3 K + Q8 V,
 `fp8`/`bf16` → load error, anything else → Q8 with a warning. Only Q8/Q8
 loads take batched prefill and the session cache. llama HFQ,
 MiniMax and LFM2-MoE resolve `auto` to q8. DeepSeek4 keeps its F32
@@ -2239,7 +2228,6 @@ deprecated code. Env statuses live in [`env-vars.md`](env-vars.md#lifecycle-stat
 
 Deprecated since 0.4.0, removal in 0.5.0:
 
-- KV **values** `asym2|asym3|asym4`, `turbo|turbo2|turbo3|turbo4` (`kv_cache`, `kv_k`) and `legacy-asym2|3|4` (`kv_k`): Givens asym KV and its aliases; use `fwhtN` or `q8`.
 
 Removed keys. A key that shipped in a release and was later removed from the
 schema stays in `RETIRED_CONFIG_KEYS` (`crates/hipfire-config/src/lib.rs`). A

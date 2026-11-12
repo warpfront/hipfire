@@ -656,27 +656,12 @@ fn attention_keys_resolve_on_fleet_archs() {
             shape: None,
         },
         AttnKeyUse {
-            key: KernelKey::KvWriteAsym4,
-            archs: ALL,
-            shape: None,
-        },
-        AttnKeyUse {
             key: KernelKey::KvWriteAsym4Fwht,
             archs: ALL,
             shape: None,
         },
         AttnKeyUse {
-            key: KernelKey::KvWriteAsym3,
-            archs: ALL,
-            shape: None,
-        },
-        AttnKeyUse {
             key: KernelKey::KvWriteAsym3Fwht,
-            archs: ALL,
-            shape: None,
-        },
-        AttnKeyUse {
-            key: KernelKey::KvWriteAsym2,
             archs: ALL,
             shape: None,
         },
@@ -698,16 +683,6 @@ fn attention_keys_resolve_on_fleet_archs() {
         },
         // KV write — batched, Always-gated, BatchGt(1)
         AttnKeyUse {
-            key: KernelKey::KvWriteAsym4Batched,
-            archs: ALL,
-            shape: Some(ShapeInfo {
-                batch_size: 16,
-                head_dim: 128,
-                m: 0,
-                is_tree: false,
-            }),
-        },
-        AttnKeyUse {
             key: KernelKey::KvWriteAsym4FwhtBatched,
             archs: ALL,
             shape: Some(ShapeInfo {
@@ -718,27 +693,7 @@ fn attention_keys_resolve_on_fleet_archs() {
             }),
         },
         AttnKeyUse {
-            key: KernelKey::KvWriteAsym3Batched,
-            archs: ALL,
-            shape: Some(ShapeInfo {
-                batch_size: 16,
-                head_dim: 128,
-                m: 0,
-                is_tree: false,
-            }),
-        },
-        AttnKeyUse {
             key: KernelKey::KvWriteAsym3FwhtBatched,
-            archs: ALL,
-            shape: Some(ShapeInfo {
-                batch_size: 16,
-                head_dim: 128,
-                m: 0,
-                is_tree: false,
-            }),
-        },
-        AttnKeyUse {
-            key: KernelKey::KvWriteAsym2Batched,
             archs: ALL,
             shape: Some(ShapeInfo {
                 batch_size: 16,
@@ -784,27 +739,12 @@ fn attention_keys_resolve_on_fleet_archs() {
             shape: None,
         },
         AttnKeyUse {
-            key: KernelKey::AttnFlashAsym4,
-            archs: ALL,
-            shape: None,
-        },
-        AttnKeyUse {
             key: KernelKey::AttnFlashAsym4Fwht,
             archs: ALL,
             shape: None,
         },
         AttnKeyUse {
-            key: KernelKey::AttnFlashAsym3,
-            archs: ALL,
-            shape: None,
-        },
-        AttnKeyUse {
             key: KernelKey::AttnFlashAsym3Fwht,
-            archs: ALL,
-            shape: None,
-        },
-        AttnKeyUse {
-            key: KernelKey::AttnFlashAsym2,
             archs: ALL,
             shape: None,
         },
@@ -832,16 +772,6 @@ fn attention_keys_resolve_on_fleet_archs() {
         },
         // Attention — batched, Always-gated (scalar fallback), BatchGt(1)
         AttnKeyUse {
-            key: KernelKey::AttnFlashAsym4BatchedMasked,
-            archs: ALL,
-            shape: Some(ShapeInfo {
-                batch_size: 16,
-                head_dim: 128,
-                m: 0,
-                is_tree: false,
-            }),
-        },
-        AttnKeyUse {
             key: KernelKey::AttnFlashAsym4FwhtBatchedMasked,
             archs: ALL,
             shape: Some(ShapeInfo {
@@ -852,27 +782,7 @@ fn attention_keys_resolve_on_fleet_archs() {
             }),
         },
         AttnKeyUse {
-            key: KernelKey::AttnFlashAsym3BatchedMasked,
-            archs: ALL,
-            shape: Some(ShapeInfo {
-                batch_size: 16,
-                head_dim: 128,
-                m: 0,
-                is_tree: false,
-            }),
-        },
-        AttnKeyUse {
             key: KernelKey::AttnFlashAsym3FwhtBatchedMasked,
-            archs: ALL,
-            shape: Some(ShapeInfo {
-                batch_size: 16,
-                head_dim: 128,
-                m: 0,
-                is_tree: false,
-            }),
-        },
-        AttnKeyUse {
-            key: KernelKey::AttnFlashAsym2Batched,
             archs: ALL,
             shape: Some(ShapeInfo {
                 batch_size: 16,

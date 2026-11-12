@@ -884,7 +884,7 @@ impl MtpSpecState {
 
     /// Like [`Self::new_for_slot`] but allocates the MTP head's KV cache in
     /// the requested format. Used by `mtp_only_demo` to A/B kv-mode variants
-    /// (q8/asym3/fwht4) per the 2026-05-16 feat/fwht prose-τ findings.
+    /// (q8/fwht4) per the 2026-05-16 feat/fwht prose-τ findings.
     pub fn new_for_slot_with_kv_mode(
         gpu: &mut Gpu,
         target: &ModelSlot,
@@ -6159,7 +6159,7 @@ mod tests {
             MtpProposalGraphPolicy::Auto,
             true,
             false,
-            crate::mtp_head::MtpKvMode::Asym3,
+            crate::mtp_head::MtpKvMode::Fwht4,
         ));
         assert!(mtp_proposal_graph_eligible_for(
             MtpProposalGraphPolicy::On,

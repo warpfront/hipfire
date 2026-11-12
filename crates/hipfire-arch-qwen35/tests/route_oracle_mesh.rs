@@ -33,7 +33,7 @@
 //!   Measured: 2.1e-3 at pos 0 growing to 8.1e-1 over 27 positions,
 //!   bit-identical across fresh processes, tokens exact throughout. The
 //!   `pp_parity.rs` bit-exact floor does not transfer to fwht3+Q8 on 27B
-//!   (validated there on asym3+0.8B).
+//!   (validated there on q8+0.8B).
 //! * TP2-vs-single — BOUNDED (tokens `assert_eq`, max abs logit diff <= 1.0).
 //!   Dense TP shards heads/projections per rank and sums the row-parallel
 //!   partials through the deterministic rooted peer reduce
@@ -405,9 +405,8 @@ impl Single {
 
 fn log_kv(tag: &str, kv: &KvCache) {
     eprintln!(
-        "{tag}: kv tier=fwht3 fwht={} asym3={} kv_dim={} max_seq={} cap={} n_heads={} head_dim={} k_layers={} v_layers={} k0_bytes={} v0_bytes={}",
+        "{tag}: kv tier=fwht3 fwht={} kv_dim={} max_seq={} cap={} n_heads={} head_dim={} k_layers={} v_layers={} k0_bytes={} v0_bytes={}",
         kv.quant_fwht,
-        kv.quant_asym3,
         kv.kv_dim,
         kv.max_seq,
         kv.physical_cap,
@@ -494,7 +493,7 @@ fn qwen35_pp2_vs_single_oracle() {
         prompt.len()
     );
 
-    // Mesh route: mirror `pp_parity.rs::run_pp2`, tier lifted asym3 → fwht3.
+    // Mesh route: mirror `pp_parity.rs::run_pp2`, tier lifted q8 → fwht3.
     let mut hfq = HfqFile::open(Path::new(&path)).expect("open fixture (pp)");
     let config = qwen35::config_from_hfq(&hfq).expect("pp config");
     let mut gpus = match Gpus::init_uniform(2, config.n_layers) {

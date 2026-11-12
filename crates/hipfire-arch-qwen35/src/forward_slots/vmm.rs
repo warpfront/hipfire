@@ -1797,8 +1797,6 @@ fn run_pass(
     }
     let tier = SlotKvTier {
         mode: mode_of(format),
-        givens_cos: None,
-        givens_sin: None,
         fwht_signs1: None,
         fwht_signs2: None,
     };

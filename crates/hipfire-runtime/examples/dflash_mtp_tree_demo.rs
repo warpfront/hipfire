@@ -192,10 +192,11 @@ fn main() {
     slot_cfg.max_seq = ctx_capacity + max_tokens * (b + mtp_k) / b + n_verify + 16;
     slot_cfg.kv_mode = match kv_mode_str.as_str() {
         "q8" => speculative::KvMode::Q8,
-        "asym4" => speculative::KvMode::Asym4,
-        "asym3" => speculative::KvMode::Asym3,
-        "asym2" => speculative::KvMode::Asym2,
         other => {
+            if let Some(msg) = hipfire_config::removed_kv_name_error(other) {
+                eprintln!("{msg}");
+                std::process::exit(1);
+            }
             eprintln!("unknown --kv-mode: {other}");
             std::process::exit(1);
         }

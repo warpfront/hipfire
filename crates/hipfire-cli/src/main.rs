@@ -565,7 +565,7 @@ struct RunArgs {
     kv_mode: Option<String>,
     #[arg(long = "kv-k")]
     /// Qwen-only K-format override (e.g. `fwht3`, `q8`; `legacy-asymN`, `asymN`
-    /// and `turboN` are deprecated, removal in 0.5.0).
+    /// and `turboN` were removed in 0.5.0).
     kv_k: Option<String>,
     #[arg(long = "kv-v")]
     /// Qwen-only V-format override (`q8`, `lloyd2`, `lloyd3`, `lloyd4`).
@@ -783,7 +783,7 @@ pub(crate) struct BenchArgs {
     kv_mode: Option<String>,
     #[arg(long = "kv-k")]
     /// Qwen-only K-format override (e.g. `fwht3`, `q8`; `legacy-asymN`, `asymN`
-    /// and `turboN` are deprecated, removal in 0.5.0).
+    /// and `turboN` were removed in 0.5.0).
     kv_k: Option<String>,
     #[arg(long = "kv-v")]
     /// Qwen-only V-format override (`q8`, `lloyd2`, `lloyd3`, `lloyd4`).
@@ -10788,6 +10788,30 @@ fn registry_source(source: RegistrySource) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Givens asym KV names and the `asymN`/`turboN` aliases were removed in
+    /// 0.5.0: `--kv-k` rejects them naming the removal and the replacement,
+    /// while `fwhtN` / `q8` stay accepted.
+    #[test]
+    fn removed_kv_k_names_are_rejected_naming_the_removal() {
+        for name in hipfire_config::REMOVED_KV_NAMES {
+            let mut params = serde_json::json!({});
+            let err = apply_kv_axis_overrides(&mut params, Some(name), None)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("removed in 0.5.0"), "{name}: {err}");
+            assert!(err.contains("fwht"), "{name}: {err}");
+            assert!(
+                params.get("kv_k").is_none(),
+                "{name} must not reach the load params"
+            );
+        }
+        for name in ["q8", "fwht2", "fwht3", "fwht4"] {
+            let mut params = serde_json::json!({});
+            apply_kv_axis_overrides(&mut params, Some(name), None).unwrap();
+            assert_eq!(params["kv_k"], name);
+        }
+    }
 
     /// `--video` takes ONE clip per occurrence: its frames, comma separated,
     /// in display order. The comma is the only frame separator, so the

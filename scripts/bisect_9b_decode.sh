@@ -32,8 +32,8 @@ if [ $build_rc -ne 0 ] || [ ! -x target/release/examples/bench_qwen35_mq4 ]; the
     exit 125
 fi
 
-# Run the bench. asym3 KV matches speed-gate config.
-out=$(HIPFIRE_KV_MODE=asym3 HIPFIRE_GRAPH=1 \
+# Run the bench. fwht3 KV matches speed-gate config.
+out=$(HIPFIRE_KV_MODE=fwht3 HIPFIRE_GRAPH=1 \
     target/release/examples/bench_qwen35_mq4 "$MODEL" \
     --prefill 16 --warmup 3 --gen 30 2>&1)
 

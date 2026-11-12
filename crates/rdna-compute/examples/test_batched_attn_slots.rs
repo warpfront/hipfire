@@ -4,13 +4,13 @@
 //
 // Task 7 — the correctness gate for the whole multi-slot batched-attention
 // sub-project (SP1). Tasks 4-6 ported four `_slots` kernel entry points
-// (LDS decode, Q8 tile, asym3 tile, Q8 flash prefill) to a shared
+// (LDS decode, Q8 tile, Q8 flash prefill) to a shared
 // `KvSlotDesc` addressing scheme, verified ONLY against the legacy
 // null-descriptor path. This harness is the first thing to exercise the
 // multi-slot path itself.
 //
-// Three layers, each run for both KV modes (Q8_0 and asym3) wherever the
-// kernel family supports both:
+// Three layers, run for the Q8_0 KV mode wherever the
+// kernel family supports it:
 //   1. Golden equivalence  — per-slot legacy reference vs. one batched
 //      multi-slot launch, tolerance-based (tiling reorders accumulation).
 //   2. Cross-slot isolation — every OTHER slot's KV poisoned with NaN;
@@ -26,7 +26,6 @@
 //
 // Kernel families covered:
 //   - attention_flash_q8_0_batched_masked_slots   (Task 5, Q8 tile, no LDS cap)
-//   - attention_flash_asym3_batched_masked_slots  (Task 6, asym3 tile)
 //   - attention_q8_0_kv_batched_masked_slots      (Task 4, LDS decode/verify;
 //     context capped well under the ~16k LDS ceiling this kernel has always
 //     had, multi-slot or not)
@@ -57,7 +56,7 @@
 // poisons the TARGET slot itself and asserts its output DOES go
 // non-finite, proving the poison is live rather than assumed.
 
-use rdna_compute::kv_slots::{build_arena, build_asym3_k_arena, build_tiles, KvSlotDesc};
+use rdna_compute::kv_slots::{build_arena, build_tiles, KvSlotDesc};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 // ─────────────────────────── shared helpers ────────────────────────────
@@ -82,8 +81,8 @@ fn pack_descs(descs: &[KvSlotDesc]) -> Vec<u8> {
 /// build_arena is called once for K and once for V (different strides);
 /// each call independently numbers its own base offsets starting from 0.
 /// Merge the two so the final descriptor's legacy_k_base points into the K
-/// arena and legacy_v_base into the V arena — for asym3 the K and V
-/// per-position strides differ, so the slab offsets genuinely differ and
+/// arena and legacy_v_base into the V arena — the K and V
+/// per-position strides may differ, so the slab offsets genuinely differ and
 /// MUST NOT be collapsed into one field.
 fn merge_descs(k_descs: &[KvSlotDesc], v_descs: &[KvSlotDesc]) -> Vec<KvSlotDesc> {
     k_descs
@@ -97,25 +96,6 @@ fn merge_descs(k_descs: &[KvSlotDesc], v_descs: &[KvSlotDesc]) -> Vec<KvSlotDesc
             page_tokens: 0,
         })
         .collect()
-}
-
-/// Replicates hipfire_runtime::llama::KvCache::gen_givens_angles locally —
-/// rdna-compute (where this example lives) does not depend on
-/// hipfire-runtime, and the specific angle values don't matter for an
-/// addressing-correctness test: candidate and reference are always given
-/// the SAME cos/sin tensor, so any deterministic, non-degenerate angle set
-/// exercises the same question.
-fn gen_givens_angles(seed: u32, n_blocks: usize) -> (Vec<f32>, Vec<f32>) {
-    let mut state = seed;
-    let mut cos_vals = Vec::with_capacity(n_blocks);
-    let mut sin_vals = Vec::with_capacity(n_blocks);
-    for _ in 0..n_blocks {
-        state = state.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fff_ffff;
-        let angle = (state as f64 / 0x7fff_ffff as f64) * std::f64::consts::TAU;
-        cos_vals.push(angle.cos() as f32);
-        sin_vals.push(angle.sin() as f32);
-    }
-    (cos_vals, sin_vals)
 }
 
 /// Task 5 fixer's near-miss guard, generalized: a synthetic generator that
@@ -138,11 +118,10 @@ fn assert_close(label: &str, got: &[f32], want: &[f32]) {
     // NaN is false), so a candidate and reference that independently
     // compute the same garbage from the same bytes would both "pass" with
     // worst=0.000x. Caught empirically while building this harness: a raw
-    // pseudo-random byte generator produced a non-finite `cnorm` for
-    // asym3's K read, in BOTH the candidate and legacy-reference paths,
-    // and this loop alone reported a perfect match. Explicit finiteness
-    // check first, so a shared-NaN input is a hard failure, not a silent
-    // 0.000x.
+    // pseudo-random byte generator produced a non-finite norm header in
+    // BOTH the candidate and legacy-reference paths, and this loop alone
+    // reported a perfect match. Explicit finiteness check first, so a
+    // shared-NaN input is a hard failure, not a silent 0.000x.
     if let Some(i) = got.iter().position(|v| !v.is_finite()) {
         panic!(
             "{label}: candidate[{i}]={} is non-finite (want[{i}]={})",
@@ -217,17 +196,14 @@ fn maybe_corrupt(mut descs: Vec<KvSlotDesc>) -> Vec<KvSlotDesc> {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum KvMode {
     Q8,
-    Asym3,
 }
 
 impl KvMode {
     fn k_per_pos(self, n_kv_heads: usize, head_dim: usize) -> usize {
         match self {
             KvMode::Q8 => n_kv_heads * (head_dim / 32) * 34,
-            KvMode::Asym3 => n_kv_heads * (4 + (head_dim * 3) / 8),
         }
     }
-    // V is Q8_0 in BOTH modes (asym3 only rotates K).
     fn v_per_pos(self, n_kv_heads: usize, head_dim: usize) -> usize {
         n_kv_heads * (head_dim / 32) * 34
     }
@@ -386,7 +362,7 @@ fn shapes_lds() -> Vec<Shape> {
 }
 
 /// Shapes for the BR/BC-tiled Q8 flash-prefill kernel (Task 6), which is
-/// Q8-only (no asym3 prefill kernel exists). Includes the mid-batch ragged-
+/// Q8-only. Includes the mid-batch ragged-
 /// tile-at-slot-boundary case Task 6's report flagged as the one class of
 /// bug this kernel family, uniquely among the four, can have.
 fn shapes_prefill() -> Vec<(Shape, usize, usize)> {
@@ -463,7 +439,7 @@ fn shapes_prefill() -> Vec<(Shape, usize, usize)> {
 }
 
 // ───────────────────────── general tile-kernel path ─────────────────────
-// (attention_flash_q8_0_batched_masked_slots / attention_flash_asym3_batched_masked_slots)
+// (attention_flash_q8_0_batched_masked_slots)
 
 struct GeneralBatch {
     k_arena: GpuTensor,
@@ -507,16 +483,6 @@ fn build_k_arena_for_mode(
         KvMode::Q8 => build_arena(
             &shape.seq_lens,
             mode.k_per_pos(shape.n_kv_heads, shape.head_dim),
-            poison_except,
-        ),
-        // asym3's K `cnorm` is a 4-byte float read at a non-34-byte-aligned
-        // offset — see build_asym3_k_arena's doc comment for why the
-        // generic filler is unsafe here (empirically found while building
-        // this harness, not a hypothetical).
-        KvMode::Asym3 => build_asym3_k_arena(
-            &shape.seq_lens,
-            shape.n_kv_heads,
-            shape.head_dim,
             poison_except,
         ),
     }
@@ -620,8 +586,6 @@ fn run_general_candidate(
     mode: KvMode,
     batch: &GeneralBatch,
     force_subbatch: bool,
-    cos_theta: &GpuTensor,
-    sin_theta: &GpuTensor,
 ) -> Vec<f32> {
     let q_dim = shape.n_heads * shape.head_dim;
     if batch.batch_size == 0 {
@@ -667,30 +631,6 @@ fn run_general_candidate(
             )
             .expect("q8 tile candidate");
         }
-        KvMode::Asym3 => {
-            gpu.attention_flash_asym3_batched_masked_slots(
-                &batch.q,
-                &batch.k_arena,
-                &batch.v_arena,
-                &out,
-                &batch.positions,
-                cos_theta,
-                sin_theta,
-                shape.n_heads,
-                shape.n_kv_heads,
-                shape.head_dim,
-                batch.max_ctx_len,
-                batch.max_ctx_len,
-                batch.batch_size,
-                &partials,
-                None,
-                0,
-                0,
-                Some(&batch.descs_dev),
-                Some(&batch.row_slot),
-            )
-            .expect("asym3 tile candidate");
-        }
     }
     gpu.hip.device_synchronize().expect("sync");
     let result = gpu.download_f32(&out).expect("download");
@@ -704,8 +644,6 @@ fn run_general_reference(
     shape: &Shape,
     mode: KvMode,
     batch: &GeneralBatch,
-    cos_theta: &GpuTensor,
-    sin_theta: &GpuTensor,
 ) -> Vec<f32> {
     let q_dim = shape.n_heads * shape.head_dim;
     let k_per_pos = mode.k_per_pos(shape.n_kv_heads, shape.head_dim);
@@ -760,28 +698,6 @@ fn run_general_reference(
                 )
                 .expect("q8 legacy reference");
             }
-            KvMode::Asym3 => {
-                gpu.attention_flash_asym3_batched_masked(
-                    &q_slice,
-                    &k_view,
-                    &v_view,
-                    &out_ref,
-                    &pos_dev,
-                    cos_theta,
-                    sin_theta,
-                    shape.n_heads,
-                    shape.n_kv_heads,
-                    shape.head_dim,
-                    sl,
-                    sl,
-                    m,
-                    &partials_ref,
-                    None,
-                    0,
-                    0,
-                )
-                .expect("asym3 legacy reference");
-            }
         }
         gpu.hip.device_synchronize().expect("sync");
         let ref_out = gpu.download_f32(&out_ref).expect("download ref");
@@ -808,29 +724,14 @@ fn slot_output<'a>(flat: &'a [f32], shape: &Shape, target: usize, q_dim: usize) 
     &flat[row0 * q_dim..(row0 + m) * q_dim]
 }
 
-fn test_general_golden(
-    gpu: &mut Gpu,
-    shape: &Shape,
-    mode: KvMode,
-    cos_theta: &GpuTensor,
-    sin_theta: &GpuTensor,
-    force_subbatch: bool,
-) {
+fn test_general_golden(gpu: &mut Gpu, shape: &Shape, mode: KvMode, force_subbatch: bool) {
     let batch = build_general_batch(gpu, shape, mode, None);
     if batch.batch_size == 0 {
         batch.free(gpu);
         return;
     }
-    let reference = run_general_reference(gpu, shape, mode, &batch, cos_theta, sin_theta);
-    let candidate = run_general_candidate(
-        gpu,
-        shape,
-        mode,
-        &batch,
-        force_subbatch,
-        cos_theta,
-        sin_theta,
-    );
+    let reference = run_general_reference(gpu, shape, mode, &batch);
+    let candidate = run_general_candidate(gpu, shape, mode, &batch, force_subbatch);
     batch.free(gpu);
     assert_close(
         &format!(
@@ -844,29 +745,14 @@ fn test_general_golden(
     );
 }
 
-fn test_general_isolation(
-    gpu: &mut Gpu,
-    shape: &Shape,
-    mode: KvMode,
-    cos_theta: &GpuTensor,
-    sin_theta: &GpuTensor,
-    force_subbatch: bool,
-) {
+fn test_general_isolation(gpu: &mut Gpu, shape: &Shape, mode: KvMode, force_subbatch: bool) {
     let q_dim = shape.n_heads * shape.head_dim;
     let clean_batch = build_general_batch(gpu, shape, mode, None);
     if clean_batch.batch_size == 0 {
         clean_batch.free(gpu);
         return;
     }
-    let clean = run_general_candidate(
-        gpu,
-        shape,
-        mode,
-        &clean_batch,
-        force_subbatch,
-        cos_theta,
-        sin_theta,
-    );
+    let clean = run_general_candidate(gpu, shape, mode, &clean_batch, force_subbatch);
     // Free clean_batch's arenas/q/positions/row_slot now — every remaining
     // use in this function reads only the downloaded `clean: Vec<f32>`, not
     // the GPU tensors. Each loop iteration below builds and frees its own
@@ -878,15 +764,7 @@ fn test_general_isolation(
             continue;
         }
         let poisoned_batch = build_general_batch(gpu, shape, mode, Some(target));
-        let poisoned = run_general_candidate(
-            gpu,
-            shape,
-            mode,
-            &poisoned_batch,
-            force_subbatch,
-            cos_theta,
-            sin_theta,
-        );
+        let poisoned = run_general_candidate(gpu, shape, mode, &poisoned_batch, force_subbatch);
         poisoned_batch.free(gpu);
         let a = slot_output(&clean, shape, target, q_dim);
         let b = slot_output(&poisoned, shape, target, q_dim);
@@ -940,9 +818,9 @@ fn test_general_isolation(
 /// the TARGET slot itself (by naming a *different* slot as the
 /// `poison_except` survivor) and assert the target's own output DOES
 /// become non-finite. That is only true if the NaN bytes this harness
-/// writes (Q8_0's f16 scale field `0x7E00`, or asym3's `cnorm = NaN`) are
+/// writes (Q8_0's f16 scale field `0x7E00`) are
 /// actually reaching the device read the kernel performs for that slot.
-fn test_poison_is_live(gpu: &mut Gpu, mode: KvMode, cos_theta: &GpuTensor, sin_theta: &GpuTensor) {
+fn test_poison_is_live(gpu: &mut Gpu, mode: KvMode) {
     let shape = Shape {
         n_slots: 3,
         seq_lens: vec![2048, 2048, 2048],
@@ -959,7 +837,7 @@ fn test_poison_is_live(gpu: &mut Gpu, mode: KvMode, cos_theta: &GpuTensor, sin_t
                             // var happens to be set for an unrelated run — see build_general_batch_ex's
                             // doc comment.
     let batch = build_general_batch_ex(gpu, &shape, mode, Some(bystander), false);
-    let out = run_general_candidate(gpu, &shape, mode, &batch, false, cos_theta, sin_theta);
+    let out = run_general_candidate(gpu, &shape, mode, &batch, false);
     batch.free(gpu);
     let q_dim = shape.n_heads * shape.head_dim;
     let victim = slot_output(&out, &shape, target, q_dim);
@@ -1480,29 +1358,8 @@ fn main() {
         );
     }
 
-    // Step 4: assert the asym3 arm is really asym3 (not silently downgraded
-    // to q8 — see spec §4.4).
-    let hd = 256usize;
-    let nkv = 4usize; // 27B GQA config, arbitrary for this byte-budget check
-    let asym3_bytes_per_pos = KvMode::Asym3.k_per_pos(nkv, hd);
-    let q8_bytes_per_pos = KvMode::Q8.k_per_pos(nkv, hd);
-    assert!(
-        asym3_bytes_per_pos < q8_bytes_per_pos,
-        "asym3 arena is not smaller than Q8 — the asym3 path is not active"
-    );
-    println!("asym3 K bytes/pos={asym3_bytes_per_pos} < Q8 K bytes/pos={q8_bytes_per_pos}: OK (asym3 path confirmed active)\n");
-
-    let (cos_vals, sin_vals) = gen_givens_angles(42, hd / 2);
-    let cos_theta = gpu
-        .upload_f32(&cos_vals, &[cos_vals.len()])
-        .expect("cos upload");
-    let sin_theta = gpu
-        .upload_f32(&sin_vals, &[sin_vals.len()])
-        .expect("sin upload");
-
     println!("### Positive poison control (Fix 2, task-7 review) ###");
-    test_poison_is_live(&mut gpu, KvMode::Q8, &cos_theta, &sin_theta);
-    test_poison_is_live(&mut gpu, KvMode::Asym3, &cos_theta, &sin_theta);
+    test_poison_is_live(&mut gpu, KvMode::Q8);
     println!();
 
     let mut n_ok = 0usize;
@@ -1517,7 +1374,7 @@ fn main() {
         n_kv_heads: 2,
         head_dim: 256,
     };
-    println!("### General tile-kernel sweep (Task 5 Q8 tile + Task 6 asym3 tile) ###");
+    println!("### General tile-kernel sweep (Task 5 Q8 tile) ###");
     let general_shapes: Vec<Shape> = if smoke {
         vec![smoke_shape()]
     } else if negative_control_active() {
@@ -1526,30 +1383,16 @@ fn main() {
         shapes()
     };
     for shape in general_shapes {
-        for &mode in &[KvMode::Q8, KvMode::Asym3] {
+        for &mode in &[KvMode::Q8] {
             for &force_subbatch in &[false, true] {
                 println!(
                     "-- {} mode={mode:?} subbatch={force_subbatch}",
                     shape.label()
                 );
                 n_total += 2;
-                test_general_golden(
-                    &mut gpu,
-                    &shape,
-                    mode,
-                    &cos_theta,
-                    &sin_theta,
-                    force_subbatch,
-                );
+                test_general_golden(&mut gpu, &shape, mode, force_subbatch);
                 n_ok += 1;
-                test_general_isolation(
-                    &mut gpu,
-                    &shape,
-                    mode,
-                    &cos_theta,
-                    &sin_theta,
-                    force_subbatch,
-                );
+                test_general_isolation(&mut gpu, &shape, mode, force_subbatch);
                 n_ok += 1;
             }
         }
