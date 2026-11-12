@@ -1331,15 +1331,15 @@ fn g942_rows16_chain() -> bool {
     *ON
 }
 
-/// `HIPFIRE_G942_BF16_WIDE` (read once, default off until the Route-A twin
-/// lands; `=1` enables): on gfx942, a BF16 projection group of 17.. rows takes
-/// the wide entry (`Gpu::gemm_bf16_mfma_gfx942_wide`, one weight pass per 64
-/// rows) while `rdna_compute::cdna::gfx942::wide_max_rows` admits any of its
-/// members, ahead of the rows16 chain. Same bytes either way (row-invariant
-/// MFMA chain).
+/// `HIPFIRE_G942_BF16_WIDE` (read once, default on; `=0` kills): on gfx942, a BF16
+/// projection group of 17.. rows takes the wide entry (`Gpu::gemm_bf16_mfma_gfx942_wide`, one
+/// weight pass per 64 rows) while `rdna_compute::cdna::gfx942::wide_max_rows` admits any of its
+/// members, ahead of the rows16 chain. Same bytes either way (row-invariant MFMA chain; Tier C
+/// `qwen4_gemm_bf16_mfma_gfx942_wide`, rows 1..=64 / 65 / 257 / 1025 on every trunk shape; model
+/// prefill logits and states byte-equal with the switch on and off).
 fn g942_bf16_wide() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        hipfire_config::developer_bool("HIPFIRE_G942_BF16_WIDE", false)
+        hipfire_config::developer_bool("HIPFIRE_G942_BF16_WIDE", true)
     });
     *ON
 }
@@ -2228,12 +2228,12 @@ fn execute_hyper_read_inner(
         }
         // gfx942 C1 fold (`HIPFIRE_QWEN4_G942_FOLD_ELEM`): the few-row down GEMM with the
         // activation chain below as its epilogue, one launch for the six; bitwise their output.
-        // Past 16 rows only a lane step ([`Gpu::g942_lane_wide_rows`]) takes it, as a chain of
-        // 16-row slices of the same fused entry (bytewise the per-row singleton route, no
-        // five-launch activation chain); the ordinary prefill chunk keeps its own route.
+        // Past 16 rows (lane steps included) the wide / rows16 GEMM plus the unfused chain runs:
+        // measured at N = 32 on MI300X, 96 HC reads are 6.3 ms that way and 10.1 ms as two 16-row
+        // slices of the fused entry (20 workgroups per slice, launched serially).
         if g942_fold_elem()
             && gpu.arch_caps.is_gfx942()
-            && (op.rows <= 16 || gpu.g942_lane_wide_rows(op.rows))
+            && op.rows <= 16
             && op.input_mix_down.dtype == DType::BF16
             && normalized.dtype == DType::F32
             && low.dtype == DType::F32
@@ -2248,7 +2248,7 @@ fn execute_hyper_read_inner(
                 op.input_mix_down.k,
             );
             if let Some(mut device) = gpu.try_gfx942() {
-                g942_act_folded = hip(device.qwen4_hc_down_act_slices(
+                g942_act_folded = hip(device.qwen4_hc_down_act_rows16(
                     &op.input_mix_down.buf.buf,
                     &normalized,
                     &low,
