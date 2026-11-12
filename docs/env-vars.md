@@ -121,8 +121,7 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 | `HIPFIRE_SPECULATION` | `off`/`auto`/`ngram`/`dflash`/`mtp`/`dspark` | Canonical selector |
 | `HIPFIRE_DFLASH_DRAFT` | explicit draft path (overrides the registry sidecar); empty opts out | Legacy `developer.dflash_draft` read; still appears in legacy gate scripts. |
 | `HIPFIRE_VISION_SIDECAR` | explicit vision-tower sidecar path (overrides `params.vision`); empty opts out | Daemon load; validated at admission (arch 5\|6 + tower tensor), loaded by the Qwen35 carrier |
-| `HIPFIRE_DFLASH_WINDOW` | **unset → the draft artifact's declared `sliding_window`** (DFlash2 drafts: all layers sliding; DFlash drafts declaring n−1 sliding + last full: SWA on layers 0..n−2, last layer full). `<rows>` overrides (warns on mismatch); **`0` forces legacy contiguous** | Windowed draft context: draft VRAM pins at W and past-W requests degrade τ instead of falling back to AR. Legacy contiguous applies only when the draft declares no window, or `HIPFIRE_DFLASH_WINDOW=0`. **`=0` (explicit legacy contiguous) is deprecated since 0.4.0, removal in 0.5.0** and warns |
-| `HIPFIRE_DFLASH_CTX_CAP` | **8192**; `0` = uncapped | **Deprecated since 0.4.0, removal in 0.5.0** (legacy contiguous DFlash; setting it warns). **Legacy contiguous mode only** (no draft window, or `HIPFIRE_DFLASH_WINDOW=0`): caps draft-side context storage; over-cap requests fall back to AR. Ignored when the draft runs windowed |
+| `HIPFIRE_DFLASH_WINDOW` | **unset → the draft artifact's declared `sliding_window`** (DFlash2 drafts: all layers sliding; DFlash drafts declaring n−1 sliding + last full: SWA on layers 0..n−2, last layer full). `<rows>` overrides (warns on mismatch); `0` is refused (legacy contiguous DFlash removed in 0.5.0) | Windowed draft context: draft VRAM pins at W and past-W requests degrade τ instead of falling back to AR. The capped contiguous fallback (fixed 8192 rows; over-cap requests fall back to AR) applies only when the draft declares no window. |
 | `HIPFIRE_DFLASH_MODE` | RuntimeConfig default **`off`**; Qwen3.8-27B tiers with a registry-declared draft resolve `auto` through the registry layer; `off` beats it | Schema alias of `speculation.dflash` ([`CONFIG.md`](CONFIG.md#qwen38-27b-paired-dflash-default)). `on` requires a DFlash draft and refuses without one; it never aliases to native MTP. Use `--spec mtp` / `speculation.mtp=on` for native MTP. |
 | `HIPFIRE_DFLASH_NGRAM_BLOCK` | set/clear from config | |
 | `HIPFIRE_DFLASH_ADAPTIVE_B` | **kill switch**; `=0` forces the fixed full block, any other value or unset defers to the setting | Read through the `[developer]` namespace (lifecycle `developer`; it is **not** a schema alias — the schema key is `speculation.dflash_adaptive_b`, stable, default `false` = fixed block, listed in the [`CONFIG.md`](CONFIG.md#lifecycle-status) table with no env column). `=0` overrides an enabled `dflash_adaptive_b` load param/setting; it cannot turn adaptive on. Adaptive is also auto-suppressed on retained-PM4 verify loads (replay needs the fixed B=16 shape). |
@@ -1324,8 +1323,8 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_C2M_DUMP_PROMPT` | crates/hipfire-generate/src/dense.rs | developer |
 | `HIPFIRE_C2M_EMPTY_TURN_GUARD` | crates/hipfire-arch-cohere2moe/src/spec_emit.rs, crates/hipfire-generate/src/dense.rs | developer |
 | `HIPFIRE_C2M_NORMDUMP` | crates/hipfire-arch-cohere2moe/src/forward.rs | developer |
-| `HIPFIRE_CACHE_CKPT_INTERVAL` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-arch-qwen35/tests/mtp_cache_byte_identity.rs | developer |
-| `HIPFIRE_CACHE_CKPT_MAX` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-config/src/env_audit.rs | developer |
+| `HIPFIRE_CACHE_CKPT_INTERVAL` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-arch-qwen35/src/dflash_spec.rs | developer |
+| `HIPFIRE_CACHE_CKPT_MAX` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-arch-qwen35/src/dflash_spec.rs | developer |
 | `HIPFIRE_CACHE_CKPT_RESUME` | crates/hipfire-generate/src/ar.rs, crates/hipfire-loader/src/lib.rs | developer |
 | `HIPFIRE_CALIB_BF16` | crates/hipfire-arch-lfm2moe/src/lfm2moe.rs, crates/hipfire-arch-muse-glimmer/src/glimmer.rs | experimental |
 | `HIPFIRE_CALIB_F64_AUDIT` | crates/hipfire-runtime/src/calibration.rs | developer |
@@ -1351,7 +1350,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_CB_UPLOAD_COALESCE` | crates/hipfire-arch-qwen35/src/forward_slots/vmm.rs, crates/hipfire-arch-qwen35/src/qwen35/prefill_multi.rs | developer |
 | `HIPFIRE_CB_VERIFY_CHUNK128` | crates/hipfire-arch-qwen35/examples/cb_vmm_state_oracle.rs, crates/hipfire-arch-qwen35/src/dflash_cb.rs | developer |
 | `HIPFIRE_CB_VERIFY_FP8` | crates/hipfire-arch-qwen35/examples/pm_fp8_verify_kld.rs, crates/hipfire-arch-qwen35/examples/pm_fp8_verify_oracle.rs | developer |
-| `HIPFIRE_CB_VERIFY_IU4` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-arch-qwen35/src/qwen35/prefill_multi.rs | developer |
+| `HIPFIRE_CB_VERIFY_IU4` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-arch-qwen35/src/dflash_spec.rs | developer |
 | `HIPFIRE_CB_VERIFY_PM` | crates/hipfire-arch-qwen35/examples/cb_verify_gemm_oracle.rs, crates/hipfire-arch-qwen35/examples/cb_vmm_state_oracle.rs | developer |
 | `HIPFIRE_CERT_CACHE` | crates/peacemaker-isa/src/cert_cache.rs, crates/peacemaker-isa/src/pm_check.rs | developer |
 | `HIPFIRE_CHATML` | crates/saddle-lab/examples/probe_argmax_agreement.rs | harness |
@@ -1543,15 +1542,15 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_DFLASH_BLOCK` | crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_DFLASH_CHAT` | crates/hipfire-generate/src/ar.rs, crates/hipfire-generate/src/batch.rs | developer |
 | `HIPFIRE_DFLASH_CKPT_RESUME` | crates/hipfire-arch-qwen35/examples/cb_vmm_state_oracle.rs, crates/hipfire-arch-qwen35/src/dflash_spec.rs | developer |
-| `HIPFIRE_DFLASH_CTX_CAP` | crates/hipfire-arch-qwen35/examples/cb_vmm_state_oracle.rs, crates/hipfire-arch-qwen35/src/dflash_slot.rs | deprecated |
-| `HIPFIRE_DFLASH_CYCLE_TRACE` | crates/hipfire-arch-qwen35/src/dflash_spec.rs | developer |
+| `HIPFIRE_DFLASH_CTX_CAP` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-arch-qwen35/src/dflash_spec.rs | developer |
+| `HIPFIRE_DFLASH_CYCLE_TRACE` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-arch-qwen35/src/dflash_spec.rs | developer |
 | `HIPFIRE_DFLASH_DEVICE_ACCEPT` | crates/hipfire-arch-qwen35/src/speculative.rs, crates/hipfire-arch-qwen35/tests/sampled_dflash_device_accept_hw.rs | developer |
 | `HIPFIRE_DFLASH_DRAFT` | crates/hipfire-arch-muse-glimmer/src/drafter.rs, crates/hipfire-arch-qwen35/src/serve_engine.rs | developer |
 | `HIPFIRE_DFLASH_DRAFT_GRAPH` | crates/hipfire-arch-raon/examples/raon_dflash_oracle.rs, crates/hipfire-runtime/src/dflash.rs | developer |
 | `HIPFIRE_DFLASH_DRAFT_PENALTY` | crates/hipfire-arch-raon/examples/raon_dflash_oracle.rs, crates/hipfire-runtime/src/dflash2_spec.rs | developer |
 | `HIPFIRE_DFLASH_FAST_SAMPLE` | crates/hipfire-arch-qwen35/src/speculative.rs, crates/hipfire-config/src/lib.rs | experimental |
 | `HIPFIRE_DFLASH_FC_SKINNY` | crates/hipfire-arch-raon/examples/raon_dflash_oracle.rs, crates/hipfire-runtime/src/dflash.rs | developer |
-| `HIPFIRE_DFLASH_LEGACY_PREFILL` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-arch-qwen35/src/speculative.rs | developer |
+| `HIPFIRE_DFLASH_LEGACY_PREFILL` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-arch-qwen35/src/dflash_spec.rs | developer |
 | `HIPFIRE_DFLASH_LOGIT_DUMP` | crates/hipfire-arch-qwen35/src/speculative.rs | developer |
 | `HIPFIRE_DFLASH_LOOKUP` | crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_DFLASH_LOOP_BREAK` | crates/hipfire-runtime/examples/dflash_spec_demo.rs | harness |
@@ -1568,9 +1567,9 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_DFLASH_OFF` | scripts/serve-loop-gate.sh | harness |
 | `HIPFIRE_DFLASH_ONLINE_DUMP` | crates/hipfire-runtime/examples/dflash_online_replay.rs, crates/hipfire-runtime/src/dflash_online.rs | developer |
 | `HIPFIRE_DFLASH_ONLINE_HP` | crates/hipfire-runtime/src/dflash_online.rs, scripts/dflash_online_tune/online_ab.sh | developer |
-| `HIPFIRE_DFLASH_ONLINE_TUNE` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-runtime/examples/dflash_online_replay.rs | developer |
+| `HIPFIRE_DFLASH_ONLINE_TUNE` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-arch-qwen35/src/dflash_spec.rs | developer |
 | `HIPFIRE_DFLASH_ORDERED_DRAFT` | crates/hipfire-arch-qwen35/examples/cb_vmm_state_oracle.rs, crates/hipfire-arch-qwen35/examples/dflash_draft_graph_replay.rs | developer |
-| `HIPFIRE_DFLASH_PREFILL_DEVICE` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-arch-qwen35/tests/dflash_prefill_scatter.rs | developer |
+| `HIPFIRE_DFLASH_PREFILL_DEVICE` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-arch-qwen35/src/dflash_spec.rs | developer |
 | `HIPFIRE_DFLASH_PREFILL_SCATTER_FAST` | crates/hipfire-arch-qwen35/src/speculative.rs, crates/hipfire-arch-qwen35/tests/dflash_prefill_scatter.rs | developer |
 | `HIPFIRE_DFLASH_Q8_LMHEAD_WMMA` | crates/hipfire-arch-qwen35/examples/cb_vmm_state_oracle.rs, crates/hipfire-arch-qwen35/src/speculative.rs | experimental |
 | `HIPFIRE_DFLASH_RAILGUN_CORPUS` | crates/hipfire-arch-qwen35/src/dflash_railgun_builder.rs | developer |
@@ -1587,8 +1586,8 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_DFLASH_SPARSE_TARGET` | crates/hipfire-arch-qwen35/src/speculative.rs | developer |
 | `HIPFIRE_DFLASH_TEMP_SPEC` | crates/hipfire-generate/src/ar.rs, crates/hipfire-generate/src/batch.rs | developer |
 | `HIPFIRE_DFLASH_TREE` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/src/dflash_generic.rs | experimental |
-| `HIPFIRE_DFLASH_VERIFY_PM4` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-generate/src/redline.rs | developer |
-| `HIPFIRE_DFLASH_WINDOW` | crates/hipfire-arch-qwen35/examples/cb_vmm_state_oracle.rs, crates/hipfire-arch-qwen35/src/dflash_slot.rs | developer; `0` (legacy contiguous DFlash) deprecated, removal 0.5.0 |
+| `HIPFIRE_DFLASH_VERIFY_PM4` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-arch-qwen35/src/dflash_spec.rs | developer |
+| `HIPFIRE_DFLASH_WINDOW` | crates/hipfire-arch-qwen35/examples/cb_vmm_state_oracle.rs, crates/hipfire-arch-qwen35/src/dflash_spec.rs | developer |
 | `HIPFIRE_DFLASH_ZLAB_SAFETENSORS` | scripts/dflash_spec_debug.py | harness |
 | `HIPFIRE_DIR` | .agents/skills/hipfire-autoheal/triage.sh, scripts/ab-dispatch-validation.sh | harness |
 | `HIPFIRE_DIVERGENCE_PREFILL` | scripts/gfx906_logit_divergence.sh | harness |
@@ -1627,7 +1626,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_DS4_ROUTE_DUMP` | crates/hipfire-arch-deepseek4/src/forward.rs, crates/hipfire-arch-deepseek4/src/program.rs | developer |
 | `HIPFIRE_DSA_HW_TRIALS` | crates/hipfire-arch-qwen35/tests/sampled_dflash_device_accept_hw.rs | harness |
 | `HIPFIRE_DSA_HW_VOCAB` | crates/hipfire-arch-qwen35/tests/sampled_dflash_device_accept_hw.rs | harness |
-| `HIPFIRE_DSPARK_ADAPTIVE_BLOCK` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-runtime/src/dflash_adaptive_block.rs | developer |
+| `HIPFIRE_DSPARK_ADAPTIVE_BLOCK` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-arch-qwen35/src/dflash_spec.rs | developer |
 | `HIPFIRE_DSPARK_DEBUG` | crates/hipfire-runtime/src/dspark_core.rs | developer |
 | `HIPFIRE_DSPARK_FIXTURE` | crates/hipfire-arch-deepseek4/src/arch.rs | developer |
 | `HIPFIRE_DSPARK_HFQ4_WMMA` | crates/hipfire-runtime/src/dspark_core.rs | developer |
@@ -1678,13 +1677,13 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_EP_AR_WIRE_DENSE` | crates/hipfire-runtime/src/ar_hc_exchange.rs | developer |
 | `HIPFIRE_EP_BALANCED_OWNERS` | crates/hipfire-arch-qwen4/src/ep.rs, crates/hipfire-arch-qwen4/src/expert_ep_units.rs | developer |
 | `HIPFIRE_EP_CHUNK_AUTOFIT` | crates/hipfire-arch-qwen4/src/expert_ep_units.rs, crates/hipfire-arch-qwen4/src/expert_residency.rs | developer |
-| `HIPFIRE_EP_COMPACT_SCRATCH` | crates/hipfire-loader/src/carriers.rs, crates/hipfire-loader/src/carriers.rs | developer |
+| `HIPFIRE_EP_COMPACT_SCRATCH` | crates/hipfire-loader/src/carriers.rs | developer |
 | `HIPFIRE_EP_DECODE_TIMING` | crates/hipfire-arch-deepseek4/src/ep.rs, crates/hipfire-arch-minimax/src/forward.rs | developer |
 | `HIPFIRE_EP_DUMP_IDX` | crates/hipfire-arch-deepseek4/src/ep.rs | developer |
 | `HIPFIRE_EP_DUMP_POS` | crates/hipfire-arch-deepseek4/src/ep.rs | developer |
 | `HIPFIRE_EP_ELASTIC_LOG` | crates/hipfire-arch-qwen4/src/expert_unit_tail_rank.rs, crates/hipfire-config/src/lib.rs | developer |
 | `HIPFIRE_EP_ELASTIC_MIB` | crates/hipfire-arch-qwen4/src/ep.rs, crates/hipfire-arch-qwen4/src/lane/pages.rs | developer |
-| `HIPFIRE_EP_EMBED_HOST` | crates/hipfire-loader/src/carriers.rs, crates/hipfire-loader/src/carriers.rs | developer |
+| `HIPFIRE_EP_EMBED_HOST` | crates/hipfire-loader/src/carriers.rs | developer |
 | `HIPFIRE_EP_EXPERT_STAGE` | crates/hipfire-arch-qwen4/src/expert_ep_units.rs, crates/hipfire-arch-qwen4/src/gpu_forward.rs | developer |
 | `HIPFIRE_EP_FAIL_RANK` | crates/hipfire-loader/src/lib.rs | developer |
 | `HIPFIRE_EP_GATHER_DIRECT` | crates/hipfire-arch-qwen4/examples/bench_ep_gather.rs, crates/hipfire-config/src/lib.rs | developer |
@@ -1731,11 +1730,11 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_EP_TRUNK_BALANCED_OWNERS` | crates/hipfire-arch-qwen4/src/ep_mesh_lanes.rs, crates/hipfire-arch-qwen4/src/ep_mesh_lanes/tests.rs | developer |
 | `HIPFIRE_EP_TRUNK_SPLIT` | crates/hipfire-arch-qwen4/src/ep.rs, crates/hipfire-arch-qwen4/src/ep_trunk_split.rs | developer |
 | `HIPFIRE_EP_UNIT_BUDGET_DELTA_MIB` | crates/hipfire-arch-qwen4/src/expert_ep_units.rs, crates/hipfire-arch-qwen4/src/expert_unit_tail.rs | developer |
-| `HIPFIRE_EP_UNIT_DONORS` | crates/hipfire-loader/src/carriers.rs, crates/hipfire-loader/src/carriers.rs | developer |
-| `HIPFIRE_EP_UNIT_LANE_GROWTH` | crates/hipfire-loader/src/carriers.rs, crates/hipfire-loader/src/carriers.rs | developer |
+| `HIPFIRE_EP_UNIT_DONORS` | crates/hipfire-loader/src/carriers.rs | developer |
+| `HIPFIRE_EP_UNIT_LANE_GROWTH` | crates/hipfire-loader/src/carriers.rs | developer |
 | `HIPFIRE_EP_UNIT_PINNED_OWNERS` | crates/hipfire-arch-qwen4/src/expert_ep_units.rs, crates/hipfire-arch-qwen4/src/expert_unit_tail.rs | developer |
 | `HIPFIRE_EP_UNIT_RESERVE` | crates/hipfire-arch-qwen4/src/expert_ep_units.rs, crates/hipfire-config/src/lib.rs | developer |
-| `HIPFIRE_EP_UNIT_RESERVE_SHADOWS` | crates/hipfire-loader/src/carriers.rs, crates/hipfire-loader/src/carriers.rs | developer |
+| `HIPFIRE_EP_UNIT_RESERVE_SHADOWS` | crates/hipfire-loader/src/carriers.rs | developer |
 | `HIPFIRE_EP_UNIT_STAGE_BORROW` | crates/hipfire-arch-qwen4/src/expert_ep_units.rs, crates/hipfire-arch-qwen4/src/gpu_forward/slab_stage.rs | developer |
 | `HIPFIRE_EP_UNIT_TAIL` | crates/hipfire-arch-qwen4/src/ep.rs, crates/hipfire-arch-qwen4/src/expert_unit_tail.rs | developer |
 | `HIPFIRE_EP_UNIT_TAIL_FILL_OVERLAP` | crates/hipfire-arch-qwen4/src/expert_unit_tail.rs, crates/hipfire-arch-qwen4/src/expert_unit_tail_rank.rs | developer |
@@ -2096,7 +2095,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_GLIMMER_BATCHED_LM_HEAD` | crates/hipfire-arch-muse-glimmer/src/forward.rs | developer |
 | `HIPFIRE_GLIMMER_CACHE_TRACE` | crates/hipfire-generate/src/dense.rs, scripts/serve_harness.py | developer |
 | `HIPFIRE_GLIMMER_CTX_CAP` | crates/hipfire-arch-muse-glimmer/src/drafter.rs, crates/hipfire-generate/src/dense.rs | developer |
-| `HIPFIRE_GLIMMER_DEVICE_CAPTURE` | crates/hipfire-loader/src/carriers.rs, crates/hipfire-loader/src/carriers.rs | developer |
+| `HIPFIRE_GLIMMER_DEVICE_CAPTURE` | crates/hipfire-loader/src/carriers.rs, crates/hipfire-runtime/examples/dflash_spec_demo.rs | developer |
 | `HIPFIRE_GLIMMER_DEVICE_CAPTURE_AUDIT` | crates/hipfire-arch-muse-glimmer/src/glimmer.rs, crates/hipfire-generate/src/dense.rs | developer |
 | `HIPFIRE_GLIMMER_FUSED_SILU_ROTATE` | crates/hipfire-arch-muse-glimmer/src/forward.rs | developer |
 | `HIPFIRE_GLIMMER_GATE_UP_K6656` | crates/rdna-compute/src/kernels.rs | developer |
@@ -2208,7 +2207,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_KV_ADAPTIVE` | crates/hipfire-arch-qwen35/src/carrier.rs, crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_KV_BACKEND` | crates/hipfire-loader/src/admission.rs, scripts/guard_gfx1201_baseline.py | developer |
 | `HIPFIRE_KV_BF16` | crates/hipfire-dispatch/src/families/attention.rs, crates/hipfire-dispatch/src/families/kv_tier.rs | developer |
-| `HIPFIRE_KV_FP8_E4M3` | crates/hipfire-runtime/src/kv_mode.rs, crates/hipfire-runtime/src/kv_mode.rs | developer |
+| `HIPFIRE_KV_FP8_E4M3` | crates/hipfire-runtime/src/kv_mode.rs, crates/rdna-compute/src/attention.rs | developer |
 | `HIPFIRE_KV_MODE` | benchmarks/scripts/bench_pp_gfx906.sh, benchmarks/scripts/mq4v2_k5120_gfx1201_validate.sh | stable; `asymN`/`turbo*` values deprecated, removal 0.5.0 |
 | `HIPFIRE_KV_SLOT_PAGED` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_KV_V` | crates/hipfire-arch-qwen35/src/carrier.rs, crates/hipfire-loader/src/admission.rs | developer |
@@ -3170,7 +3169,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_SMOKE_PROMPT` | crates/hipfire-arch-qwen35/src/qwen35/forward.rs, crates/saddle-lab/examples/a3b_smoke_forward.rs | developer |
 | `HIPFIRE_SMOKE_STEPS` | crates/hipfire-arch-qwen35/src/qwen35/forward.rs, crates/saddle-lab/examples/a3b_smoke_forward.rs | developer |
 | `HIPFIRE_SPECULATION` | crates/hipfire-config/src/lib.rs, docs/investigations/evidence/ds4-mi300x-cdna-test-fail/raw/a1-m0/04-run-profile-direct.sh | stable |
-| `HIPFIRE_SPEC_LOOKUP_TAIL` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-config/src/lib.rs | developer |
+| `HIPFIRE_SPEC_LOOKUP_TAIL` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-arch-qwen35/src/dflash_spec.rs | developer |
 | `HIPFIRE_SPEC_PHASES` | crates/hipfire-arch-qwen35/examples/cb_vmm_state_oracle.rs, crates/hipfire-arch-qwen35/src/speculative.rs | developer |
 | `HIPFIRE_SPEC_RETIRE` | crates/hipfire-arch-raon/examples/raon_dflash_oracle.rs, crates/hipfire-generate/src/qwen.rs | developer |
 | `HIPFIRE_SPEC_WINDOW_ROLLBACK` | crates/hipfire-config/src/lib.rs | developer |

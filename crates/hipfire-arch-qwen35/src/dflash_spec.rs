@@ -315,32 +315,33 @@ fn alloc_dflash_owners(
 // ─── DFlash state load ────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
-/// Default ceiling for the DFlash draft's context-indexed structures
-/// (`target_hidden` [L × extract×hidden], the per-layer K/V caches, the
-/// hidden ring, `mq_x_rot`, and the host hidden log). Serve loads default
-/// `max_seq` to 32768+, which sized ALL of these to 32K rows — on a 27B
-/// target with a 5-layer-extract MQ4 draft that is ~11 GB of draft-side
-/// VRAM, vs ~1.4 GB at the ≤4K contexts DFlash benches actually run. The
-/// draft only affects acceptance rate (verify is target-gated), so a
+/// Ceiling for the DFlash draft's context-indexed structures when the draft
+/// declares no sliding window (`target_hidden` [L × extract×hidden], the
+/// per-layer K/V caches, the hidden ring, `mq_x_rot`, and the host hidden
+/// log). Serve loads default `max_seq` to 32768+, which sized ALL of these to
+/// 32K rows — on a 27B target with a 5-layer-extract MQ4 draft that is ~11 GB
+/// of draft-side VRAM, vs ~1.4 GB at the ≤4K contexts DFlash benches actually
+/// run. The draft only affects acceptance rate (verify is target-gated), so a
 /// request that outgrows the cap simply falls back to AR in the daemon —
-/// emitted tokens are never at risk. `HIPFIRE_DFLASH_CTX_CAP=0` opts out
-/// (legacy uncapped behaviour); any other value overrides the ceiling.
+/// emitted tokens are never at risk. The cap is fixed: the 0.4.x
+/// `HIPFIRE_DFLASH_CTX_CAP` override was removed in 0.5.0.
 pub const DEFAULT_DFLASH_CTX_CAP: usize = 8192;
 
-// lifecycle: deprecated since 0.4.0, removal 0.5.0 — legacy contiguous DFlash opt-in knobs; the draft-declared window supersedes them
-/// One warning line when an operator opts into legacy contiguous DFlash
-/// (`HIPFIRE_DFLASH_WINDOW=0`) or overrides its draft cap
-/// (`HIPFIRE_DFLASH_CTX_CAP`). Silent when neither knob is set.
-fn warn_deprecated_legacy_dflash_knobs() {
-    let window_zero = hipfire_config::developer_var("HIPFIRE_DFLASH_WINDOW")
+/// `HIPFIRE_DFLASH_WINDOW` as a window-row override: `Ok(Some(rows))` for a
+/// positive value, `Ok(None)` when unset or unparsable. `0` (the removed
+/// legacy contiguous mode) is refused so a stale environment fails loudly
+/// instead of silently running the windowed default.
+pub(crate) fn dflash_window_override() -> Result<Option<usize>, String> {
+    match hipfire_config::developer_var("HIPFIRE_DFLASH_WINDOW")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
-        == Some(0);
-    let ctx_cap = hipfire_config::developer_var("HIPFIRE_DFLASH_CTX_CAP").is_ok();
-    if window_zero || ctx_cap {
-        eprintln!(
-            "  warning: HIPFIRE_DFLASH_WINDOW=0 / HIPFIRE_DFLASH_CTX_CAP (legacy contiguous DFlash) are deprecated and will be removed in 0.5.0; use the draft-declared window"
-        );
+    {
+        Some(0) => Err(
+            "HIPFIRE_DFLASH_WINDOW=0 (legacy contiguous DFlash) was removed in 0.5.0; \
+             unset it to use the draft-declared window, or set it to a positive row count"
+                .to_string(),
+        ),
+        other => Ok(other),
     }
 }
 
@@ -402,14 +403,9 @@ pub fn load_dflash_state(
     // `DflashConfig::declared_window` / `all_layers_sliding`). That is the
     // only width correct by construction.
     //   HIPFIRE_DFLASH_WINDOW=<rows>  explicit override (warns on mismatch)
-    //   HIPFIRE_DFLASH_WINDOW=0       explicit Legacy (cap + AR fallback)
-    //   unset                         draft-declared window, else Legacy
-    warn_deprecated_legacy_dflash_knobs();
-    let window = match hipfire_config::developer_var("HIPFIRE_DFLASH_WINDOW")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-    {
-        Some(0) => None,
+    //   unset                         draft-declared window, else the capped
+    //                                 contiguous fallback (`DEFAULT_DFLASH_CTX_CAP`)
+    let window = match dflash_window_override()? {
         Some(w) => {
             if let Some(declared) = draft_config.declared_window {
                 if declared != w {
@@ -426,14 +422,7 @@ pub fn load_dflash_state(
     };
     let ctx_capacity = match window {
         Some(w) => w,
-        None => match hipfire_config::developer_var("HIPFIRE_DFLASH_CTX_CAP")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-        {
-            Some(0) => ctx_capacity, // explicit opt-out: legacy uncapped
-            Some(cap) => ctx_capacity.min(cap),
-            None => ctx_capacity.min(DEFAULT_DFLASH_CTX_CAP),
-        },
+        None => ctx_capacity.min(DEFAULT_DFLASH_CTX_CAP),
     };
     if let Some(w) = window {
         let from_meta = if draft_config.declared_window == Some(w) {
@@ -444,21 +433,20 @@ pub fn load_dflash_state(
         if draft_config.all_layers_sliding {
             eprintln!(
                 "  DFlash2 draft windowed: all {} layers sliding at W={w} \
-                 (no full-attention layer; draft VRAM pinned at W; \
-                 HIPFIRE_DFLASH_WINDOW=0 for Legacy){from_meta}",
+                 (no full-attention layer; draft VRAM pinned at W){from_meta}",
                 draft_config.n_layers
             );
         } else {
             eprintln!(
                 "  DFlash draft windowed: SWA W={w} rows on layers 0..n-2, full-attention \
-                 last layer over all {} rows (draft VRAM pinned at W; HIPFIRE_DFLASH_WINDOW=0 for Legacy){from_meta}",
+                 last layer over all {} rows (draft VRAM pinned at W){from_meta}",
                 requested_ctx
             );
         }
     } else if ctx_capacity < requested_ctx {
         eprintln!(
             "  DFlash draft ctx capped: {} -> {} rows (draft-side VRAM scales with this; \
-             HIPFIRE_DFLASH_CTX_CAP=0 for uncapped, or set a larger cap)",
+             the cap is fixed — use a draft that declares a sliding window)",
             requested_ctx, ctx_capacity
         );
     }
@@ -4100,13 +4088,8 @@ pub fn load_dflash_speculator_dense_tp2(
         ));
     }
     // Window posture mirrors `load_dflash_state` (declared window by default,
-    // explicit override or Legacy opt-out via HIPFIRE_DFLASH_WINDOW).
-    warn_deprecated_legacy_dflash_knobs();
-    let window = match hipfire_config::developer_var("HIPFIRE_DFLASH_WINDOW")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-    {
-        Some(0) => None,
+    // explicit override via HIPFIRE_DFLASH_WINDOW).
+    let window = match dflash_window_override()? {
         Some(w) => {
             if let Some(declared) = draft_config.declared_window {
                 if declared != w {
@@ -4123,14 +4106,7 @@ pub fn load_dflash_speculator_dense_tp2(
     let requested_ctx = ctx_capacity;
     let ctx_capacity = match window {
         Some(_) => requested_ctx,
-        None => match hipfire_config::developer_var("HIPFIRE_DFLASH_CTX_CAP")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-        {
-            Some(0) => ctx_capacity,
-            Some(cap) => ctx_capacity.min(cap),
-            None => ctx_capacity.min(DEFAULT_DFLASH_CTX_CAP),
-        },
+        None => ctx_capacity.min(DEFAULT_DFLASH_CTX_CAP),
     };
     let mut ranks: Vec<DenseTpDflashRankState> = Vec::with_capacity(2);
     // Free helper for the transactional unwind: every rank state fully built

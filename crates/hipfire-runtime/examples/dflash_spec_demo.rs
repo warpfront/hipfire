@@ -1802,13 +1802,17 @@ fn main() {
     // `use_sliding_window` and matching `layer_types`). Mirrors
     // `dflash_spec.rs::load_dflash_state`; keep serve and bench in sync.
     //   HIPFIRE_DFLASH_WINDOW=<rows>  explicit override (warns on mismatch)
-    //   HIPFIRE_DFLASH_WINDOW=0       explicit Legacy
     //   unset                         draft-declared window, else Legacy
     let dflash_window = match std::env::var("HIPFIRE_DFLASH_WINDOW")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
     {
-        Some(0) => None,
+        Some(0) => {
+            panic!(
+                "HIPFIRE_DFLASH_WINDOW=0 (legacy contiguous DFlash) was removed in 0.5.0; \
+                 unset it or set a positive row count"
+            );
+        }
         Some(w) => {
             if let Some(declared) = draft_cfg.declared_window {
                 if declared != w {

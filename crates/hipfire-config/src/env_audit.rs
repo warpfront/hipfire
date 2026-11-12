@@ -27,28 +27,6 @@ const REMOVED_IN: &str = "0.5.0";
 /// singular spelling of `HIPFIRE_DEVICES`).
 const STABLE_ENV: &[&str] = &["HIPFIRE_DEVICES", "HIPFIRE_DEVICE"];
 
-/// Deprecated variables that are not the `env_compat` of a deprecated schema
-/// key. `only_value` limits the deprecation to one value (`=0` is the legacy
-/// contiguous DFlash opt-in; other window values are supported).
-struct DeprecatedEnv {
-    name: &'static str,
-    only_value: Option<&'static str>,
-    replacement: &'static str,
-}
-
-const DEPRECATED_ENV: &[DeprecatedEnv] = &[
-    DeprecatedEnv {
-        name: "HIPFIRE_DFLASH_WINDOW",
-        only_value: Some("0"),
-        replacement: "unset it (the draft-declared window applies)",
-    },
-    DeprecatedEnv {
-        name: "HIPFIRE_DFLASH_CTX_CAP",
-        only_value: None,
-        replacement: "unset it (the draft-declared window applies)",
-    },
-];
-
 const NO_REPLACEMENT: &str = "no replacement (feature removed)";
 
 /// How one set variable relates to hipfire.
@@ -160,13 +138,8 @@ fn is_bootstrap(name: &str) -> bool {
     BOOTSTRAP_ENV.contains(&name) || STABLE_ENV.contains(&name)
 }
 
-fn deprecated(name: &str, value: &str) -> Option<EnvStatus> {
-    let replacement = if let Some(entry) = DEPRECATED_ENV.iter().find(|entry| entry.name == name) {
-        if entry.only_value.is_some_and(|only| only != value.trim()) {
-            return None;
-        }
-        entry.replacement
-    } else if inventory().get(name) == Some(&Some("deprecated")) {
+fn deprecated(name: &str) -> Option<EnvStatus> {
+    let replacement = if inventory().get(name) == Some(&Some("deprecated")) {
         NO_REPLACEMENT
     } else {
         return None;
@@ -228,8 +201,8 @@ fn suggest(name: &str) -> Option<String> {
 }
 
 /// Classify one variable.
-pub fn classify(name: &str, value: &str) -> EnvStatus {
-    if let Some(status) = deprecated(name, value) {
+pub fn classify(name: &str) -> EnvStatus {
+    if let Some(status) = deprecated(name) {
         return status;
     }
     if is_bootstrap(name) {
@@ -262,7 +235,7 @@ where
         .into_iter()
         .filter(|(name, _)| name.starts_with("HIPFIRE_"))
         .map(|(name, value)| {
-            let status = classify(&name, &value);
+            let status = classify(&name);
             let value = if is_secret_name(&name) {
                 "(set)".to_owned()
             } else {
@@ -337,24 +310,12 @@ mod tests {
 
     #[test]
     fn deprecated_names_name_since_removal_and_replacement() {
-        let status = one("HIPFIRE_DFLASH_CTX_CAP", "4096").status;
-        assert_eq!(
-            status.label(),
-            "DEPRECATED since 0.4.0, removed in 0.5.0: unset it (the draft-declared window applies)"
-        );
-        // Only `=0` is the deprecated window value.
-        assert_eq!(
-            one("HIPFIRE_DFLASH_WINDOW", "0")
-                .status
-                .kind_is_deprecated(),
-            true
-        );
-        assert_ne!(
-            one("HIPFIRE_DFLASH_WINDOW", "4096")
-                .status
-                .kind_is_deprecated(),
-            true
-        );
+        let name = inventory()
+            .iter()
+            .find(|(_, status)| **status == Some("deprecated"))
+            .map(|(name, _)| *name)
+            .expect("the inventory lists a deprecated name");
+        assert!(one(name, "1").status.kind_is_deprecated());
     }
 
     #[test]

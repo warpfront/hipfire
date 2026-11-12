@@ -12899,7 +12899,6 @@ effort = "high"
         let env_name = |suffix: &str| format!("HIPFIRE_{suffix}");
         let env = hipfire_config::env_audit::audit_env([
             (env_name("KVMODE"), "q8".to_owned()),
-            (env_name("DFLASH_CTX_CAP"), "1".to_owned()),
             (env_name("API_KEY"), "hunter2".to_owned()),
         ]);
         let mut out = Vec::new();
@@ -12917,10 +12916,6 @@ effort = "high"
         assert!(text.contains("\nenvironment\n"), "{text}");
         assert!(
             text.contains("UNKNOWN: not a hipfire variable (typo? did you mean HIPFIRE_KV_MODE)"),
-            "{text}"
-        );
-        assert!(
-            text.contains("DEPRECATED since 0.4.0, removed in 0.5.0: unset it"),
             "{text}"
         );
         assert!(
@@ -12942,7 +12937,7 @@ effort = "high"
             .unwrap();
         assert_eq!(kv["source"]["kind"], "default-arch");
         assert_eq!(kv["source"]["label"], "default · gfx1201");
-        assert_eq!(doc["env"].as_array().unwrap().len(), 3);
+        assert_eq!(doc["env"].as_array().unwrap().len(), 2);
         let _ = fs::remove_dir_all(&paths.root);
     }
 

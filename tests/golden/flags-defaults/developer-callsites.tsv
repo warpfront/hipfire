@@ -192,8 +192,6 @@ developer_callsite	*	HIPFIRE_DFLASH_ADAPTIVE_B#developer_var=ok.as_deref.!=Some(
 developer_callsite	*	HIPFIRE_DFLASH_CHAT#developer_var=ok.as_deref.==Some("0")
 developer_callsite	*	HIPFIRE_DFLASH_CKPT_RESUME#developer_bool=true
 developer_callsite	*	HIPFIRE_DFLASH_CKPT_RESUME#developer_var=ok.as_deref.!=Some("0")
-developer_callsite	*	HIPFIRE_DFLASH_CTX_CAP#developer_var=is_ok
-developer_callsite	*	HIPFIRE_DFLASH_CTX_CAP#developer_var=ok.and_then
 developer_callsite	*	HIPFIRE_DFLASH_CYCLE_TRACE#developer_var=ok.filter
 developer_callsite	*	HIPFIRE_DFLASH_DEVICE_ACCEPT#developer_var=map_or(true, |v| v.trim() != "0")
 developer_callsite	*	HIPFIRE_DFLASH_DRAFT#developer_var=ok

@@ -99,9 +99,8 @@ separate surface: [IMAGEGEN.md](IMAGEGEN.md).
 
 ## Not recommended
 
-The legacy contiguous-DFlash knobs
-(`HIPFIRE_DFLASH_WINDOW=0`, `HIPFIRE_DFLASH_CTX_CAP`) and the Givens `legacy-asymN`
-/ `asymN` / `turboN` KV names are deprecated; prefer a
+The legacy contiguous-DFlash knobs and the Givens `legacy-asymN` / `asymN` /
+`turboN` KV names were removed in 0.5.0; use a
 `kv_cache` of `auto`, `q8` or `fwhtN`. See
 [Measured on v0.4.4](#measured-on-v044) and the dated
 [perf checkpoints](perf-checkpoints/) for newer-family measurements.

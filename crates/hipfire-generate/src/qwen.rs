@@ -3585,7 +3585,7 @@ pub fn generate_dflash(
 
     // DFlash ctx-capacity downgrade. The draft's context-indexed structures
     // (target_hidden, per-layer K/V caches, hidden ring) are sized at load to
-    // min(max_seq, HIPFIRE_DFLASH_CTX_CAP|8192) to bound draft-side VRAM on
+    // min(max_seq, DEFAULT_DFLASH_CTX_CAP (8192)) to bound draft-side VRAM on
     // large-max_seq serve loads. A request that outgrows the cap cannot run
     // spec — but DFlash is verify-gated, so AR produces the same tokens, just
     // slower. Emit a correlated info event and hand the request back to the
@@ -3614,7 +3614,7 @@ pub fn generate_dflash(
             stdout,
             id,
             &format!(
-                "prompt={} + max_tokens={} exceeds {} draft ctx capacity {} — falling back to AR (identical output, slower; raise HIPFIRE_DFLASH_CTX_CAP to re-enable spec)",
+                "prompt={} + max_tokens={} exceeds {} draft ctx capacity {} — falling back to AR (identical output, slower)",
                 prompt_tokens.len(),
                 max_tokens,
                 if spec_name == "mtp" { "MTP" } else { "DFlash" },

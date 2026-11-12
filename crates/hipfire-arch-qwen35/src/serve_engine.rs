@@ -4172,7 +4172,7 @@ fn run_loop(
                         })
                     {
                         // Legacy DFlash owns context-indexed draft buffers capped by
-                        // HIPFIRE_DFLASH_CTX_CAP. Past the cap the documented policy
+                        // DEFAULT_DFLASH_CTX_CAP. Past the cap the documented policy
                         // is plain AR fallback, not an out-of-bounds scatter/assert.
                         work[s].spec = SpecKind::None;
                         if let Some(last) = work[s].remaining_prompt.last().copied() {

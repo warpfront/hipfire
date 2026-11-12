@@ -6192,7 +6192,7 @@ fn lone_row_control(
 /// refuse wide admission; the `HIPFIRE_PREFILL_CHUNK_ROWS` and
 /// `HIPFIRE_VERIFY_GRAPH` pins).
 fn receipt_env() -> serde_json::Map<String, Value> {
-    const KEYS: [&str; 20] = [
+    const KEYS: [&str; 19] = [
         "HIPFIRE_CB_VERIFY_CHUNK128",
         "HIPFIRE_CB_VERIFY_PM",
         "HIPFIRE_WMMA_BATCH_TILES",
@@ -6204,7 +6204,6 @@ fn receipt_env() -> serde_json::Map<String, Value> {
         "HIPFIRE_GRAPH",
         "HIPFIRE_CB_SEG_TWINS",
         "HIPFIRE_DFLASH_WINDOW",
-        "HIPFIRE_DFLASH_CTX_CAP",
         "HIPFIRE_DFLASH_ADAPTIVE_B",
         "HIPFIRE_DFLASH_CKPT_RESUME",
         "HIPFIRE_DFLASH_Q8_LMHEAD_WMMA",

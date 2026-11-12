@@ -52,18 +52,15 @@ DEPRECATED_GATES = {
 DEPRECATED_TUNING: set[str] = set()
 # Deprecated env knobs that are not schema aliases (developer namespace or
 # unread harness exports). Their unset default is the supported behaviour.
-DEPRECATED_ENV = {
-    "HIPFIRE_DFLASH_CTX_CAP": "legacy contiguous DFlash cap",
-}
+DEPRECATED_ENV: dict[str, str] = {}
 # Env vars that stay supported but have deprecated VALUES.
 ENV_VALUE_NOTES = {
-    "HIPFIRE_DFLASH_WINDOW": "`0` (legacy contiguous DFlash) deprecated, removal 0.5.0",
     "HIPFIRE_KV_MODE": "`asymN`/`turbo*` values deprecated, removal 0.5.0",
     "HIPFIRE_GFX1151_QKVZA_R4_STREAM": "`1` refused (fails closed to the default route): AMD clang 24 miscompiles the kernel (`.y` vector-lane bit-casts read lane 0)",
     "HIPFIRE_GFX1151_GATE_UP_HYBRID_BUFFER": "`1` refused (fails closed to the default route): AMD clang 24 miscompiles the kernel (`.y` vector-lane bit-casts read lane 0)",
 }
 # Developer-namespace spellings of deprecated env knobs (for TOML profiles).
-DEPRECATED_DEVELOPER_KEYS = {"dflash_ctx_cap"}
+DEPRECATED_DEVELOPER_KEYS: set[str] = set()
 # Deprecated code that the default path still reaches, by explicit decision:
 # it is the only way to select the route today, so it warns nowhere.
 DEFAULT_REACHED_ALLOWLIST = {
@@ -274,8 +271,6 @@ def check_defaults(fields: list[dict], kv_bad: set[str]) -> list[str]:
                     errors.append(f"(a) {where}: {full} = {v!r} is a deprecated KV name")
                 if path == "developer" and k in DEPRECATED_DEVELOPER_KEYS:
                     errors.append(f"(a) {where}: sets deprecated developer.{k}")
-                if path == "developer" and k == "dflash_window" and str(v) == "0":
-                    errors.append(f"(a) {where}: developer.dflash_window = 0 (legacy contiguous DFlash)")
                 scan(v, where, full)
         elif isinstance(obj, list):
             for v in obj:

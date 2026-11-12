@@ -23,13 +23,9 @@ architecture is admitted by this page or by that registry.
 
 - **DFlash is not deprecated.** It is a supported mechanism; its default and
   per-model resolution are in [`CONFIG.md`](CONFIG.md).
-- **Deprecated since 0.4.0, removal in 0.5.0:** only the legacy contiguous
-  DFlash opt-in knobs `HIPFIRE_DFLASH_WINDOW=0` and `HIPFIRE_DFLASH_CTX_CAP`.
-  Setting either warns at DFlash load; the draft-declared window supersedes
-  them. Do not recommend them. Source: the `lifecycle: deprecated since 0.4.0,
-  removal 0.5.0` marker on `warn_deprecated_legacy_dflash_knobs` in
-  `crates/hipfire-arch-qwen35/src/dflash_spec.rs`; status rows in
-  [`env-vars.md`](env-vars.md) and [`CONFIG.md`](CONFIG.md).
+- **Removed in 0.5.0:** the legacy contiguous DFlash opt-in knobs
+  `HIPFIRE_DFLASH_WINDOW=0` (now refused) and `HIPFIRE_DFLASH_CTX_CAP`
+  (ignored; the cap is fixed at 8192 rows). The draft-declared window applies.
 
 ## Vocabulary
 
@@ -104,9 +100,6 @@ a new arm.
   penalties, so a penalized request runs AR, and `min_p` is ignored (the daemon warns). Env
   opt-outs are documented (`HIPFIRE_DFLASH_TEMP_SPEC=0`, `HIPFIRE_DFLASH_CHAT=0`, etc.).
   Adaptive KV suppresses DFlash.
-- **Legacy contiguous knobs are deprecated since 0.4.0, removal 0.5.0:**
-  `HIPFIRE_DFLASH_WINDOW=0` and `HIPFIRE_DFLASH_CTX_CAP`. The default draft-declared window is the
-  supported path; see [Lifecycle](#lifecycle).
 - **llama 0/1:** `dflash_generic` requires arch_id=20 HFQ from `dflash_convert`.
   Chain is default; the tree arm is opt-in (`HIPFIRE_DFLASH_TREE=1`).
 - **qwen4 16 (DFlash2):** `Qwen4Carrier` builds the shared
@@ -242,11 +235,11 @@ Use [`VALIDATION.md`](VALIDATION.md) as the sole claim → route selector.
 
 ### Retired coherence gates (historical only)
 
-`scripts/coherence-gate-*.sh` (including the DFlash and per-arch batteries) are
-**retired as current acceptance evidence** and deprecated since 0.4.0, removal in 0.5.0
-(with `_coherence_runner.py`, `awq_coherence_check.sh`). They must not be
-required for merge, promotion, or benchmark claims. They may be used only for historical
-reproduction. See [`VALIDATION.md`](VALIDATION.md) § Retired gates (historical only).
+`scripts/coherence-gate-*.sh` (including the DFlash and per-arch batteries),
+`_coherence_runner.py` and `awq_coherence_check.sh` were **removed in 0.5.0**; they
+were never current acceptance evidence. Use `scripts/serve_harness.py`
+(battery/chain) for serve-level coherence. See
+[`VALIDATION.md`](VALIDATION.md) § Retired gates (historical only).
 
 Campaign-specific omissions of coherence gates (for example an LFM effort) are
 **not** a universal rule for every arch.
@@ -257,7 +250,7 @@ Campaign-specific omissions of coherence gates (for example an LFM effort) are
 |---|---|
 | “n-gram is wired ⇒ ship as default” | **Rejected** — opt-in; no admission row |
 | “native MTP / paired DFlash is on by default ⇒ admitted product route” | **Rejected** — config defaults and registry layers are not rows in `admissions.yml` |
-| “DFlash is deprecated” | **Rejected** — only the legacy contiguous knobs (`HIPFIRE_DFLASH_WINDOW=0`, `HIPFIRE_DFLASH_CTX_CAP`) are deprecated (0.4.0 → 0.5.0) |
+| “DFlash is deprecated” | **Rejected** — DFlash is supported; the legacy contiguous knobs (`HIPFIRE_DFLASH_WINDOW=0`, `HIPFIRE_DFLASH_CTX_CAP`) were removed in 0.5.0 |
 | “LFM SpecTarget ⇒ LFM Redline / batched prefill promoted” | **Rejected** — separate surfaces; see [`REDLINE.md`](REDLINE.md) §11.4 |
 | Coherence-gate green as current acceptance | **Rejected** |
 | Stitching Redline product bench + daemon harness into route proof | **Rejected** — [`REDLINE.md`](REDLINE.md) §5/§7 |
@@ -288,7 +281,6 @@ Not in-tree support. Useful when planning; does not admit a route.
 | build_speculator / n-gram gate | `crates/hipfire-loader/src/spec_build.rs` |
 | Carriers (per-arch load + DSpark/build_speculator) | `crates/hipfire-loader/src/carriers.rs` (llama 0/1 DSpark>DFlash>n-gram; deepseek4 DSpark>MTP; `Qwen4Carrier` native MTP and `admit_options`; `Gemma4Carrier` EAGLE; `MuseGlimmerCarrier` arch-23 draft; `MapleCarrier` no speculation) |
 | qwen35 DSpark / DFlash / MTP load | `crates/hipfire-loader/src/lib.rs` (`finish_qwen35_load`, `dspark_speculator`, `resolve_qwen35_mtp_head_sourced`; dense-TP MTP head resolution) |
-| qwen35 DFlash + deprecated contiguous knobs | `crates/hipfire-arch-qwen35/src/dflash_spec.rs` (`warn_deprecated_legacy_dflash_knobs`) |
 | qwen35 / qwen4 MTP speculators | `crates/hipfire-arch-qwen35/src/mtp_speculator.rs`; `crates/hipfire-arch-qwen4/src/mtp_spec.rs`; qwen4 policy `crates/hipfire-loader/src/admission.rs` (`qwen4_native_mtp`) |
 | Generation route selection | `crates/hipfire-generate/src/ar.rs` (`GenerationRoute`, `select_generation_route`, `deepseek4_spec_requested_from_policy`); `crates/hipfire-generate/src/qwen.rs` (`generate_dflash`, `generate_spec`) |
 | Daemon draft guard / MTP presence | `crates/hipfire-daemon/src/main.rs` (`dflash_mode == "off"` draft skip; `mtp_weights_present`) |

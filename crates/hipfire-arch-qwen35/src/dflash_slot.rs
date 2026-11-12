@@ -62,7 +62,7 @@ pub struct DflashShared {
     /// `None` for Legacy (capped) mode.
     pub window: Option<usize>,
     /// Row capacity of each slot's `target_hidden` ring / ctx K/V caches.
-    /// Legacy mode: `min(requested_ctx, HIPFIRE_DFLASH_CTX_CAP | 8192)`.
+    /// Legacy mode: `min(requested_ctx, DEFAULT_DFLASH_CTX_CAP)`.
     /// Windowed: `w`.
     pub ctx_capacity: usize,
     /// The engine's per-slot token capacity (`cap_tokens`) — the draft's
@@ -200,14 +200,11 @@ pub fn load_dflash_shared(
     }
 
     // Window resolution mirrors load_dflash_state: env override wins, else
-    // the draft-declared window, else Legacy. Split (non-all-sliding) drafts
-    // can't run windowed here — their seed backfill needs a host hidden
-    // shadow the slot path doesn't keep — so they fall back to Legacy.
-    let window = match hipfire_config::developer_var("HIPFIRE_DFLASH_WINDOW")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-    {
-        Some(0) => None,
+    // the draft-declared window, else the capped contiguous fallback. Split
+    // (non-all-sliding) drafts can't run windowed here — their seed backfill
+    // needs a host hidden shadow the slot path doesn't keep — so they fall
+    // back to the capped contiguous mode.
+    let window = match crate::dflash_spec::dflash_window_override()? {
         Some(w) => {
             if let Some(declared) = draft_config.declared_window {
                 if declared != w {
@@ -234,25 +231,18 @@ pub fn load_dflash_shared(
     };
     let ctx_capacity = match window {
         Some(w) => w,
-        None => match hipfire_config::developer_var("HIPFIRE_DFLASH_CTX_CAP")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-        {
-            Some(0) => requested_ctx,
-            Some(cap) => requested_ctx.min(cap),
-            None => requested_ctx.min(crate::dflash_spec::DEFAULT_DFLASH_CTX_CAP),
-        },
+        None => requested_ctx.min(crate::dflash_spec::DEFAULT_DFLASH_CTX_CAP),
     };
     if let Some(w) = window {
         eprintln!(
             "  DFlash2 draft windowed (slots): all {} layers sliding at W={w} \
-             (draft VRAM pinned at W; HIPFIRE_DFLASH_WINDOW=0 for Legacy)",
+             (draft VRAM pinned at W)",
             draft_config.n_layers
         );
     } else if ctx_capacity < requested_ctx {
         eprintln!(
             "  DFlash draft ctx capped: {requested_ctx} -> {ctx_capacity} rows \
-             (draft-side VRAM scales with this; HIPFIRE_DFLASH_CTX_CAP=0 for uncapped)"
+             (draft-side VRAM scales with this; the cap is fixed)"
         );
     }
 

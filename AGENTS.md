@@ -191,14 +191,15 @@ works, what to measure, what counts as pass/fail.
 - **Also deprecated since 0.4.0, removal in 0.5.0** (each entry point carries
   `// lifecycle: deprecated since 0.4.0, removal 0.5.0 — <reason>`; the
   status of every env var / config key is in `docs/env-vars.md` /
-  `docs/CONFIG.md`, enforced by `scripts/check-lifecycle.py`): Givens asym KV
-  (`legacy-asymN`) and the `asymN`/`turboN` KV aliases (use `fwhtN`);
-  legacy contiguous DFlash knobs (`HIPFIRE_DFLASH_WINDOW=0`,
-  `HIPFIRE_DFLASH_CTX_CAP`); the `scripts/coherence-gate-*.sh` batteries,
-  `_coherence_runner.py`, `awq_coherence_check.sh`;
-  GGUF **weight** input to the quantizer (lossy double quantization; use
-  llama.cpp for GGUF — `imatrix.gguf` stays); MQ4R / DS4 MQ2R route selection
-  by file extension (no runtime warning; 0.5.0 selects by HFQ metadata).
+  `docs/CONFIG.md`, enforced by `scripts/check-lifecycle.py`): MQ4R / DS4 MQ2R
+  route selection by file extension (no runtime warning; 0.5.0 selects by HFQ
+  metadata).
+- **Removed in 0.5.0:** Givens asym KV (`legacy-asymN`) and the
+  `asymN`/`turboN` KV aliases (use `fwhtN` or `q8`); the legacy contiguous
+  DFlash knobs (`HIPFIRE_DFLASH_WINDOW=0`, `HIPFIRE_DFLASH_CTX_CAP`); the
+  `scripts/coherence-gate-*.sh` batteries, `_coherence_runner.py` and
+  `awq_coherence_check.sh` (use `scripts/serve_harness.py`); GGUF **weight**
+  input to the quantizer (use llama.cpp for GGUF — `imatrix.gguf` stays).
 
 ---
 
@@ -1334,7 +1335,7 @@ Caveats that are part of the fixture, not trivia:
 | `τ=9.42` on first run, `τ=8.07` on next | Different prompt — see above | Same fix |
 | "DFlash 102 tok/s on prose vs 124 AR" | Draft-target argmax disagreement on prose tokens, τ collapses to ~1.2 | Expected with z-lab drafts; no retraining fix is planned — Path C (custom draft training, `feat/mtp-dflash-training`) was a failed month-1 experiment and is dead. Use AR or accept the genre-conditional behaviour. |
 | 3.6-A3B DFlash 68.6 tok/s vs AR 135 tok/s (50% loss) | 3.6 draft trained on 3.5 traces; target distribution mismatch on code. τ=1.22 on hard code. | Use AR mode for 3.6-A3B. Draft mismatch is expected and no 3.6 retrain is planned — Path C (`feat/mtp-dflash-training`) is dead/out-of-scope, not a forthcoming fix. 3.5-A3B DFlash works (τ=4.91). |
-| `hipMalloc out of memory` at hidden_rb | Legacy contiguous DFlash (draft declares no window or `HIPFIRE_DFLASH_WINDOW=0`) sizes the draft context structures to the context; long ctx + 27B can exhaust 24 GB | Use the default windowed draft (draft VRAM pinned at W); otherwise lower `HIPFIRE_DFLASH_CTX_CAP` or ctx. KV headroom: `fwht3` is the optional compact mode on every arch |
+| `hipMalloc out of memory` at hidden_rb | Contiguous DFlash (the draft declares no window) sizes the draft context structures to the context, capped at 8192 rows; long ctx + 27B can exhaust 24 GB | Use a draft that declares a sliding window (the default windowed draft pins draft VRAM at W); lower ctx. KV headroom: `fwht3` is the optional compact mode on every arch |
 | `tok/s` below expected on long-ctx | KV cache growth — prefill is fine but decode slows past ~2K | Test at small ctx first, then scale |
 | daemon doesn't pair a pulled draft | Renamed draft file, or pulled before the sidecar existed | Don't rename files after pull; re-run `hipfire pull <tag>` to fetch the registry-declared sidecar |
 | `[hipfire-daemon] dflash_mode=off — skipping draft load` | Default flipped to `off` in 35265c6 (post-2026-04-26). Pulling a draft does NOT auto-enable DFlash anymore. | `hipfire config set dflash_mode auto` (or `on`); or per-model `hipfire config qwen3.8:27b-mq4-xts set dflash_mode on` |
@@ -1359,8 +1360,7 @@ Caveats that are part of the fixture, not trivia:
 | `HIPFIRE_ATTN_FLASH` | Override flash_mode config | (config) |
 | `HIPFIRE_OOM_GUARD` | Memory preflight OOM guard (`kv_slots::preflight_alloc`, SlotPool arena, bench-sweep headroom check). `auto`: on for unified-memory APUs (Strix Halo — overshoot is a global OOM), off for discrete GPUs, swap-decided for GPU-less processes | `auto` (`memory.oom_guard`) |
 |`HIPFIRE_DFLASH_DRAFT`|Force a specific draft path, overriding the registry sidecar. Empty string = explicit opt-out|(unset: registry sidecar when `dflash_mode` is `auto`/`on`)|
-|`HIPFIRE_DFLASH_CTX_CAP`|**Legacy contiguous DFlash only** (draft declares no window or `HIPFIRE_DFLASH_WINDOW=0`). Max rows for draft context-indexed structures (target_hidden, draft K/V caches, hidden ring); over-cap requests fall back to AR (identical output, slower). `0` = uncapped. Ignored in windowed mode.|8192|
-|`HIPFIRE_DFLASH_WINDOW`|Windowed draft context: sliding attention over the last W rows (DFlash2: every layer; otherwise layers 0..n-2 plus a full-attention last layer). Draft VRAM pins at W regardless of `max_seq`; past-W requests degrade τ instead of falling back to AR. Unset = the draft's declared `sliding_window` (`dflash_spec.rs:170-200`); `<rows>` = override (warns on mismatch); `0` = legacy contiguous.|draft-declared window (legacy contiguous if none)|
+|`HIPFIRE_DFLASH_WINDOW`|Windowed draft context: sliding attention over the last W rows (DFlash2: every layer; otherwise layers 0..n-2 plus a full-attention last layer). Draft VRAM pins at W regardless of `max_seq`; past-W requests degrade τ instead of falling back to AR. Unset = the draft's declared `sliding_window` (`dflash_spec.rs:170-200`); `<rows>` = override (warns on mismatch); `0` is refused (legacy contiguous DFlash removed in 0.5.0).|draft-declared window (fixed 8192-row contiguous cap if none)|
 | `HIPFIRE_LM_HEAD_F16` | `auto`/`native` keeps qt=1 lm_head as F16; `f32`/`legacy` expands to F32 | auto/native |
 | `HIPFIRE_LOCAL` | Force local-spawn (skip serve HTTP) | OFF |
 | `HIPFIRE_HOST_TIMING` | Per-cycle host timing probe | OFF |
