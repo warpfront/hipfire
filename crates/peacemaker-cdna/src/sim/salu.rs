@@ -149,13 +149,15 @@ fn sop2(w: &mut Wave, op: Sop2Op, d: Src, s0: Src, s1: Src) -> SimResult<()> {
             w.write_s(d, r)?;
             w.scc = r != 0;
         }
-        AndB64 | OrB64 | XorB64 | Andn2B64 | Orn2B64 => {
+        // S_NOR_B64 p.101: complement the full 64-bit OR, SCC = result != 0.
+        AndB64 | OrB64 | XorB64 | Andn2B64 | Orn2B64 | NorB64 => {
             let (a, b) = (r64(w, s0)?, r64(w, s1)?);
             let r = match op {
                 AndB64 => a & b,
                 OrB64 => a | b,
                 XorB64 => a ^ b,
                 Andn2B64 => a & !b,
+                NorB64 => !(a | b),
                 _ => a | !b,
             };
             w.write_s64(d, r)?;

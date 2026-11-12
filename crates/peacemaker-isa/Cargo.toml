@@ -47,6 +47,11 @@ required-features = ["lab"]
 name = "cdna_mix_hw_oracle"
 required-features = ["lab"]
 
+# Narrow integer-SALU MI300X/interpreter bit oracle, including SCC and destination overlap.
+[[example]]
+name = "cdna_nor_hw_oracle"
+required-features = ["lab"]
+
 # GPU exactness harness of the exact libm lowerings against hipcc (fabric job; HIP runtime).
 [[example]]
 name = "libm_exact"
