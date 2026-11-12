@@ -166,7 +166,7 @@ fn disjoint(mut ranges: Vec<(usize, usize)>) -> bool {
 }
 
 fn extent(t: &GpuTensor) -> (usize, usize) {
-    (t.buf.as_ptr() as usize, t.buf.size())
+    (t.buf.as_ptr() as usize, t.byte_size())
 }
 
 /// Whether two views cover the same device bytes (a copy from one to the other is the identity).
