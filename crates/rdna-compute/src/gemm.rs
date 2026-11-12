@@ -435,6 +435,24 @@ fn gfx12_bt_tile(batch_size: usize) -> usize {
     unreachable!("batch sizes below 64 returned above")
 }
 
+impl Gpu {
+    /// Batch tile of the gfx12 MQ V2 WMMA projection family. Under the ordinary
+    /// prefill scope the arithmetic must not depend on the call's row count n:
+    /// the n < 64 base kernel (a different accumulation order) is replaced by the
+    /// masked bulk BT12 tile for every n >= 1, so a row's bytes are the same in
+    /// any chunking. Outside that scope (decode, verify, capture) the
+    /// historical n-keyed choice is unchanged.
+    #[inline]
+    fn ordinary_bt_tile(&self, batch_size: usize) -> usize {
+        let tile = gfx12_bt_tile(batch_size);
+        if tile == 1 && batch_size > 0 && *GATE_UP_BT && self.ordinary_prefill_active() {
+            12
+        } else {
+            tile
+        }
+    }
+}
+
 /// Waves per block of the gfx12 qt49 (MQ3G256V2) base WMMA kernels
 /// (`MQ3_KS` in the kernel sources): each wave owns every 4th K group and
 /// wave 0 reduces the partials through LDS. Must match the kernels.
@@ -11019,7 +11037,7 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         // Adaptive-B batch-tile (env HIPFIRE_GATE_UP_BT, shared with gate_up/residual).
-        let bt_b: usize = gfx12_bt_tile(batch_size);
+        let bt_b: usize = self.ordinary_bt_tile(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_qkvza_hfq4g256_wmma_gfx12_bt12",
@@ -12496,7 +12514,7 @@ impl Gpu {
                 alpha_m, k, batch_size,
             );
         }
-        let bt_b: usize = gfx12_bt_tile(batch_size);
+        let bt_b: usize = self.ordinary_bt_tile(batch_size);
         let (kname, ksrc, func_name): (&str, &str, &str) = match bt_b {
             12 => (
                 "gemm_qkvza_hfq4g256_wmma_gfx12_bt12",
@@ -14373,7 +14391,7 @@ impl Gpu {
         // accumulator chains hide the WMMA latency that caps the 1-acc kernel at ~19%
         // of peak. B = clamp(N/16, 1, 12), capped at 12 (B=16 spills VGPR). Byte-exact
         // vs the 1-acc kernel; +85% at N=192 on gfx1201.
-        let bt_b: usize = gfx12_bt_tile(batch_size);
+        let bt_b: usize = self.ordinary_bt_tile(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_gate_up_hfq4g256_wmma_gfx12_bt12",
@@ -14535,7 +14553,7 @@ impl Gpu {
             return result;
         }
         // Adaptive-B batch-tile (env HIPFIRE_GATE_UP_BT, shared with gate_up/qkvza).
-        let bt_b: usize = gfx12_bt_tile(batch_size);
+        let bt_b: usize = self.ordinary_bt_tile(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_hfq4g256_residual_wmma_gfx12_bt12",
@@ -37967,7 +37985,7 @@ impl Gpu {
                 a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
             );
         }
-        let bt_b: usize = gfx12_bt_tile(batch_size);
+        let bt_b: usize = self.ordinary_bt_tile(batch_size);
         let (kname, ksrc, func_name): (&str, &str, &str) = match bt_b {
             12 => (
                 "gemm_gate_up_hfq4g256_wmma_gfx12_bt12",
@@ -40596,7 +40614,7 @@ impl Gpu {
         if self.gfx12_verify_bt_active(batch_size, k) {
             return self.gemm_mq4g256v2_residual_wmma_gfx12_vt(a_raw, x, y, m, k, batch_size);
         }
-        let bt_b: usize = gfx12_bt_tile(batch_size);
+        let bt_b: usize = self.ordinary_bt_tile(batch_size);
         let (kname, ksrc, func_name): (&str, &str, &str) = match bt_b {
             12 => (
                 "gemm_hfq4g256_residual_wmma_gfx12_bt12",
@@ -44672,7 +44690,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let bt_b: usize = gfx12_bt_tile(batch_size);
+        let bt_b: usize = self.ordinary_bt_tile(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_qkvza_mq5g256v2_wmma_gfx12_bt12",
@@ -45145,7 +45163,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let bt_b: usize = gfx12_bt_tile(batch_size);
+        let bt_b: usize = self.ordinary_bt_tile(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_gate_up_mq5g256v2_wmma_gfx12_bt12",
@@ -45337,7 +45355,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let bt_b: usize = gfx12_bt_tile(batch_size);
+        let bt_b: usize = self.ordinary_bt_tile(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_mq5g256v2_residual_wmma_gfx12_bt12",
@@ -45835,7 +45853,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let bt_b: usize = gfx12_bt_tile(batch_size);
+        let bt_b: usize = self.ordinary_bt_tile(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_qkvza_mq6g256v2_wmma_gfx12_bt12",
@@ -46308,7 +46326,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let bt_b: usize = gfx12_bt_tile(batch_size);
+        let bt_b: usize = self.ordinary_bt_tile(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_gate_up_mq6g256v2_wmma_gfx12_bt12",
@@ -46509,7 +46527,7 @@ impl Gpu {
         let bt_b = if *GATE_UP_BT && batch_size >= 1024 && bt12_waves >= 256 {
             12
         } else {
-            gfx12_bt_tile(batch_size)
+            self.ordinary_bt_tile(batch_size)
         };
         self.gemm_mq6g256v2_residual_wmma_gfx12_bt(a_raw, x, y, m, k, batch_size, bt_b)
     }
@@ -47784,7 +47802,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let bt_b: usize = gfx12_bt_tile(batch_size);
+        let bt_b: usize = self.ordinary_bt_tile(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_qkvza_mq3g256v2_wmma_gfx12_bt12",
@@ -48242,7 +48260,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let bt_b: usize = gfx12_bt_tile(batch_size);
+        let bt_b: usize = self.ordinary_bt_tile(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_gate_up_mq3g256v2_wmma_gfx12_bt12",
@@ -48434,7 +48452,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let bt_b: usize = gfx12_bt_tile(batch_size);
+        let bt_b: usize = self.ordinary_bt_tile(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_mq3g256v2_residual_wmma_gfx12_bt12",
@@ -48932,7 +48950,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let bt_b: usize = gfx12_bt_tile(batch_size);
+        let bt_b: usize = self.ordinary_bt_tile(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_qkvza_mq2g256v2_wmma_gfx12_bt12",
@@ -49421,7 +49439,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let bt_b: usize = gfx12_bt_tile(batch_size);
+        let bt_b: usize = self.ordinary_bt_tile(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_gate_up_mq2g256v2_wmma_gfx12_bt12",
@@ -49621,7 +49639,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let bt_b: usize = gfx12_bt_tile(batch_size);
+        let bt_b: usize = self.ordinary_bt_tile(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_mq2g256v2_residual_wmma_gfx12_bt12",
@@ -50133,7 +50151,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let bt_b: usize = gfx12_bt_tile(batch_size);
+        let bt_b: usize = self.ordinary_bt_tile(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_qkvza_mq4cg256_wmma_gfx12_bt12",
@@ -50400,7 +50418,7 @@ impl Gpu {
             }
             return result;
         }
-        let bt_b: usize = gfx12_bt_tile(batch_size);
+        let bt_b: usize = self.ordinary_bt_tile(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_gate_up_mq4cg256_wmma_gfx12_bt12",
@@ -50621,7 +50639,7 @@ impl Gpu {
             }
             return result;
         }
-        let bt_b: usize = gfx12_bt_tile(batch_size);
+        let bt_b: usize = self.ordinary_bt_tile(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_mq4cg256_residual_wmma_gfx12_bt12",
