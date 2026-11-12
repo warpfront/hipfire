@@ -2034,6 +2034,9 @@ fn execute_hyper_read_inner(
     let mut activated = false;
     // gfx942 C1 fold: the down GEMM already applied the activation chain to `low`.
     let mut g942_act_folded = false;
+    // gfx942 wide verify (rows > 16, BF16 up weight): the BF16 copy of the activated `low`, which
+    // the up projection reads in place of its own F32 -> BF16 staging.
+    let mut g942_low_staged: Option<GpuTensor> = None;
     // The WMMA read takes `low` as packed BF16, staged in `up` (which that
     // route does not otherwise use).
     let low_bf16 = wmma_read.then(|| {
@@ -2286,30 +2289,62 @@ fn execute_hyper_read_inner(
             ))?;
         }
     } else if !g942_act_folded {
-        // The three source BF16 boundaries, each one launch over all rows of
-        // `low`: the round trip is elementwise, so this is bitwise the
-        // per-row launches it replaces. Its BF16 copy is staged in `up`,
-        // which the up projection below overwrites before anything reads it.
         let elements = op.rows * op.low_rank;
-        let mut staging = view(op.up, 0, elements);
-        staging.dtype = DType::BF16;
-        let roundtrip = Bf16Roundtrip {
-            input: &low,
-            scratch: &staging,
-            output: &low,
-            elements,
-        };
-        hip(bf16_roundtrip_f32(gpu, &roundtrip))?;
-        hip(scale_f32(
-            gpu,
-            &ScaleF32 {
-                values: &low,
-                scale: 1.0 / op.branches as f32,
-            },
-        ))?;
-        hip(bf16_roundtrip_f32(gpu, &roundtrip))?;
-        hip(gpu.silu_f32(&low, &low))?;
-        hip(bf16_roundtrip_f32(gpu, &roundtrip))?;
+        // G12 input: gfx942 wide verify. The chain below (three BF16 round trips around the
+        // scale and SiLU) is `hc_activation_fused_f32`'s expression on every element, one launch
+        // over all rows of `low`; with `bf16_out` it writes the BF16 bits the up projection's MFMA
+        // reads (the bytes `convert_f32_to_bf16` stages from the chain's F32 result), so the
+        // up projection skips its own staging launch as well. Six launches become one.
+        // The calibration tap needs the F32 `low` and a banded up weight reads F32.
+        let staged_bf16 = gpu.arch_caps.is_gfx942()
+            && gpu.active_capture.is_none()
+            && op.input_mix_up.dtype == DType::BF16
+            && g942_trunk_mfma_route(
+                true,
+                g942_trunk_gemv(),
+                op.rows,
+                DType::BF16,
+                DType::BF16,
+                DType::F32,
+            )
+            && !super::projection_split::is_split(gpu, &op.input_mix_up, op.rows);
+        if staged_bf16 {
+            let mut scratch = hip(gpu.qwen4_f16_x_scratch(elements))?;
+            scratch.dtype = DType::BF16;
+            hip(hc_activation_fused_f32(
+                gpu,
+                &HcActivationFused {
+                    values: &low,
+                    scale: 1.0 / op.branches as f32,
+                    bf16_out: Some(&scratch),
+                },
+            ))?;
+            g942_low_staged = Some(scratch);
+        } else {
+            // The three source BF16 boundaries, each one launch over all rows of
+            // `low`: the round trip is elementwise, so this is bitwise the
+            // per-row launches it replaces. Its BF16 copy is staged in `up`,
+            // which the up projection below overwrites before anything reads it.
+            let mut staging = view(op.up, 0, elements);
+            staging.dtype = DType::BF16;
+            let roundtrip = Bf16Roundtrip {
+                input: &low,
+                scratch: &staging,
+                output: &low,
+                elements,
+            };
+            hip(bf16_roundtrip_f32(gpu, &roundtrip))?;
+            hip(scale_f32(
+                gpu,
+                &ScaleF32 {
+                    values: &low,
+                    scale: 1.0 / op.branches as f32,
+                },
+            ))?;
+            hip(bf16_roundtrip_f32(gpu, &roundtrip))?;
+            hip(gpu.silu_f32(&low, &low))?;
+            hip(bf16_roundtrip_f32(gpu, &roundtrip))?;
+        }
     }
     if up_fused {
         // The F16 WMMA route's BF16 WMMA read (not bit-exact, see
@@ -2394,7 +2429,8 @@ fn execute_hyper_read_inner(
         return hip(hyper_read_up_fused(gpu, &read));
     }
     let held = std::mem::replace(&mut gpu.prefill_lwmma_dense_hold, true);
-    let projected = project_weight(gpu, &op.input_mix_up, &low, &up, op.rows, Some(op.rotation));
+    let up_input = g942_low_staged.as_ref().unwrap_or(&low);
+    let projected = project_weight(gpu, &op.input_mix_up, up_input, &up, op.rows, Some(op.rotation));
     gpu.prefill_lwmma_dense_hold = held;
     projected?;
     if let Some(rotated) = rotate_into.filter(|r| {

@@ -4014,6 +4014,11 @@ fn fp8_input_basis(gpu: &mut Gpu, p: &MoePrefillParams<'_>) -> Result<(), Dispat
 /// BF16 router through `project_weight` (gfx942 BF16 MFMA at every row count).
 fn fp8_router_projection(gpu: &mut Gpu, p: &MoePrefillParams<'_>) -> Result<(), DispatchError> {
     fp8_validate(gpu, p, p.m_total_max)?;
+    // G12 input: the shared gate/up stage (always the next stage, nothing writes `x_norm_batch`
+    // or reads the logits in between) projects the router in its group.
+    if fp8_router_with_shared(p) {
+        return Ok(());
+    }
     super::project_weight(
         gpu,
         &p.prelude.router,
@@ -4030,6 +4035,22 @@ fn fp8_shared_gate_up(gpu: &mut Gpu, p: &MoePrefillParams<'_>) -> Result<(), Dis
     fp8_validate(gpu, p, p.m_total_max)?;
     let shared = fp8_shared(p)?;
     let weights = &shared.weights;
+    if fp8_router_with_shared(p) {
+        // Router, selector, gate and up in one group: one BF16 staging of `x_norm_batch` and one
+        // four-member launch; each member's bytes are its own launch's.
+        return super::layer_ops::project_weights(
+            gpu,
+            p.x_norm_batch,
+            p.batch_size,
+            None,
+            &[
+                (&p.prelude.router, p.prelude.router_logits),
+                (&weights.selector, shared.scalar),
+                (&weights.gate, shared.gate_out),
+                (&weights.up, shared.up_out),
+            ],
+        );
+    }
     super::layer_ops::project_weights(
         gpu,
         p.x_norm_batch,
@@ -4041,6 +4062,20 @@ fn fp8_shared_gate_up(gpu: &mut Gpu, p: &MoePrefillParams<'_>) -> Result<(), Dis
             (&weights.up, shared.up_out),
         ],
     )
+}
+
+/// Whether the qt=55 FP8 router joins the shared selector/gate/up group (`fp8_shared_gate_up`):
+/// the router and the three shared weights are BF16 of one K, so the four projections of
+/// `x_norm_batch` run as one `project_weights` group instead of two, with one activation staging.
+fn fp8_router_with_shared(p: &MoePrefillParams<'_>) -> bool {
+    p.prelude.shared.as_ref().is_some_and(|shared| {
+        let w = &shared.weights;
+        router_shared_bf16_basis(&p.prelude.router, [&w.selector, &w.gate, &w.up])
+            && p.prelude.router_logits.dtype == DType::F32
+            && [shared.scalar, shared.gate_out, shared.up_out]
+                .iter()
+                .all(|t| t.dtype == DType::F32)
+    })
 }
 
 /// `fp8b128_moe_shared_activation` over the live rows: BF16 rounds of gate, up,
