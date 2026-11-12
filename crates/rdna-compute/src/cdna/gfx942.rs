@@ -3596,4 +3596,34 @@ mod tests {
         // The production module still defines the same entries (the non-gfx942 route).
         assert!(production.contains("gemv_bf16_xf32_k4_rows_tiled_r##R"));
     }
+
+    /// The frozen hipcc anchor of the HC-gates module: `hipcc --genco --offload-arch=gfx942 -O3
+    /// --no-offload-compress -fuse-cuid=none -mcode-object-version=6` (`core_hipcc_flags`) of the
+    /// pinned source, built twice on MI300X (ROCm 7.16, AMD clang 24.0.0git d6f6cb6918) with the
+    /// same bytes. Re-seal both hashes together when the source changes.
+    #[test]
+    fn g942_hc_gates_anchor_and_source_are_pinned() {
+        use sha2::{Digest, Sha256};
+        const SOURCE_SHA256: &str =
+            "4f94fe4e929fcbb22a8ec115220b4e21d154093403129f7aeea045d975416740";
+        const ANCHOR_SHA256: &str =
+            "00be6bc34e992331dd241f520e7659ebfd0ff28515895f83839bebe0aefe9287";
+        let hex = |bytes: &[u8]| -> String {
+            Sha256::digest(bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        };
+        assert_eq!(hex(super::QWEN4_G942_HC_GATES_SRC.as_bytes()), SOURCE_SHA256);
+        let anchor: &[u8] =
+            include_bytes!("../../../../kernels/qwen4_g942_hc_gates_hipcc_gfx942.co");
+        assert_eq!(hex(anchor), ANCHOR_SHA256);
+        // Every entry the module serves is exported by the anchor.
+        for name in super::QWEN4_G942_HC_GATES_TILED {
+            assert!(
+                anchor.windows(name.len()).any(|w| w == name.as_bytes()),
+                "{name} missing from the anchor"
+            );
+        }
+    }
 }

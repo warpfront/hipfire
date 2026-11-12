@@ -280,6 +280,18 @@ const CDNA_CERTIFIED: [(&str, &[&str]); 16] = [
         ],
     ),
     (
+        "qwen4_g942_hc_gates_hipcc_gfx942.co",
+        &[
+            "gemv_bf16_xf32_k4_rows_tiled_r2",
+            "gemv_bf16_xf32_k4_rows_tiled_r3",
+            "gemv_bf16_xf32_k4_rows_tiled_r4",
+            "gemv_bf16_xf32_k4_rows_tiled_r5",
+            "gemv_bf16_xf32_k4_rows_tiled_r6",
+            "gemv_bf16_xf32_k4_rows_tiled_r7",
+            "gemv_bf16_xf32_k4_rows_tiled_r8",
+        ],
+    ),
+    (
         "qwen4_gdn_lanes_step_f32_gfx942_hipcc_gfx942.co",
         &["qwen4_gdn_lanes_step_f32_gfx942"],
     ),
