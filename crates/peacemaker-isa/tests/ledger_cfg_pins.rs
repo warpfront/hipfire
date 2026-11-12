@@ -200,7 +200,23 @@ impl Report {
 /// Their absence fails the gate. Every other gfx942 image stays an explicit not-verified entry.
 /// Each entry is the committed file and the exact kernel symbols it must contain, and nothing
 /// else.
-const CDNA_CERTIFIED: [(&str, &[&str]); 20] = [
+const CDNA_CERTIFIED: [(&str, &[&str]); 22] = [
+    (
+        "qwen4_g942_gdn_lanes_verify_hipcc_gfx942.co",
+        &[
+            "qwen4_g942_gdn_lanes_conv_params_k4",
+            "qwen4_g942_gdn_lanes_step_f32",
+            "qwen4_g942_gdn_lanes_gate_batched",
+        ],
+    ),
+    (
+        "qwen4_g942_gdn_lanes_verify_pm_gfx942.hxaco",
+        &[
+            "qwen4_g942_gdn_lanes_conv_params_k4",
+            "qwen4_g942_gdn_lanes_step_f32",
+            "qwen4_g942_gdn_lanes_gate_batched",
+        ],
+    ),
     (
         "gemm_bf16_mfma_gfx942_rows16_hipcc_gfx942.co",
         &[
