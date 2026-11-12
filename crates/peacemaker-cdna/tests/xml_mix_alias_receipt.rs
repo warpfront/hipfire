@@ -43,15 +43,7 @@ const ROW: &str = "V_MAD_MIX_F32";
 /// word0 = 0xd380_0000 | opcode<<16 | vdst | neg_hi<<8 | op_sel<<11 |
 /// op_sel_hi[2]<<14 | clamp<<15; word1 = src0 | src1<<9 | src2<<18 |
 /// op_sel_hi[1:0]<<27 | neg_lo<<29.
-fn word(
-    opcode: u32,
-    codes: [u32; 3],
-    sel: u32,
-    hi: u32,
-    lo: u32,
-    nh: u32,
-    clamp: u32,
-) -> [u32; 2] {
+fn word(opcode: u32, codes: [u32; 3], sel: u32, hi: u32, lo: u32, nh: u32, clamp: u32) -> [u32; 2] {
     [
         0xd380_0000 | opcode << 16 | 1 | nh << 8 | sel << 11 | (hi >> 2) << 14 | clamp << 15,
         codes[0] | codes[1] << 9 | codes[2] << 18 | (hi & 3) << 27 | lo << 29,
@@ -136,7 +128,9 @@ fn the_row_stays_unverified_and_the_receipt_names_it() {
 #[test]
 fn receipt_cites_hardware_provenance_and_the_llvm_sweep() {
     let r = &V_MAD_MIX_F32_AS_FMA_MIX_F32;
-    assert!(r.evidence.contains("oracle_fma_mix_f32_full_selection_space"));
+    assert!(r
+        .evidence
+        .contains("oracle_fma_mix_f32_full_selection_space"));
     assert!(r.evidence.contains("7168"));
     assert!(!r.oracle_receipt.is_empty(), "hardware receipt path");
     assert_eq!(r.oracle_sha256.len(), 64, "hardware receipt sha256");
@@ -163,7 +157,10 @@ fn every_swept_word_is_promoted_verified_and_encodes_back() {
         let (x, n) = XmlInst::decode(Arch::Gfx942, w).unwrap_or_else(|e| panic!("{label}: {e}"));
         assert_eq!(n, 2, "{label}");
         assert!(x.verified() && x.verification().is_ok(), "{label}");
-        assert!(x.alias_receipt().is_some() && x.receipt().is_none(), "{label}");
+        assert!(
+            x.alias_receipt().is_some() && x.receipt().is_none(),
+            "{label}"
+        );
         assert!(!x.unsupported().contains("unverified"), "{label}");
         let mut out = Vec::new();
         x.encode(Arch::Gfx942, &mut out)
@@ -178,7 +175,11 @@ fn every_swept_word_is_promoted_verified_and_encodes_back() {
             "{label}: {inst:?}"
         );
         assert_eq!(inst.words(Arch::Gfx942).unwrap(), w, "{label}");
-        assert_eq!(inst.verification(Arch::Gfx942), RowStatus::Verified, "{label}");
+        assert_eq!(
+            inst.verification(Arch::Gfx942),
+            RowStatus::Verified,
+            "{label}"
+        );
     }
 }
 
