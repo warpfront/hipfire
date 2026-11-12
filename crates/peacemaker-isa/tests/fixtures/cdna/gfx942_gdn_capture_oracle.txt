@@ -1,0 +1,191 @@
+[hip-bridge] GPU_PINNED_MIN_XFER_SIZE=100000: pageable weight copies staged out of reclaim
+GPU dev 0: gfx942 (205.8 GB VRAM, HIP 7.16)
+[rocblas] loaded for gfx942
+device gfx942 | GDN shapes: key heads 16, value heads 48, 128x128, qkv width 10240 | steps 3
+candidate route: HIPFIRE_QWEN4_G942_GDN_VERIFY_IMAGE=/scratch/quant/fn-fp8/beat/WC8/twin/gdn/gdn-verify-reference-device.elf (45352 bytes); HIPFIRE_QWEN4_G942_GDN_LANES_CAPTURE_IMAGE=/scratch/quant/fn-fp8/beat/WC8/twin/gdn/gdn-capture-twin-device.elf (31304 bytes)
+  tensor_ops: hipcc compiled (gfx942, key a54af22a341a12b5)
+[rows=2] window 0 capture vs pipe128: final-state diff words 0 (first None), output diff words 0 (first None), live state changed words 0, state moved words 786432 => ok
+[rows=2] control: flipped captured bit: diff words 1 => ok
+[rows=2] control: stale reference: diff words 786432 => ok
+[rows=2] window 0 rollback keep 1 vs pipe128 prefix: diff words 0 (first None), other slots changed words 0 => ok
+[rows=2] window 0 rollback keep 2 vs pipe128 prefix: diff words 0 (first None), other slots changed words 0 => ok
+[rows=2] control: keep 2 vs keep-1 reference: diff words 786432 => ok
+[rows=2] window 0 full replay vs capture: diff words 0 => ok
+[rows=2] window 1 capture vs pipe128: final-state diff words 0 (first None), output diff words 0 (first None), live state changed words 0, state moved words 786432 => ok
+[rows=2] window 1 rollback keep 1 vs pipe128 prefix: diff words 0 (first None), other slots changed words 0 => ok
+[rows=2] window 1 rollback keep 2 vs pipe128 prefix: diff words 0 (first None), other slots changed words 0 => ok
+[rows=2] window 1 full replay vs capture: diff words 0 => ok
+[rows=2] window 2 capture vs pipe128: final-state diff words 0 (first None), output diff words 0 (first None), live state changed words 0, state moved words 786432 => ok
+[rows=2] window 2 rollback keep 1 vs pipe128 prefix: diff words 0 (first None), other slots changed words 0 => ok
+[rows=2] window 2 rollback keep 2 vs pipe128 prefix: diff words 0 (first None), other slots changed words 0 => ok
+[rows=2] window 2 full replay vs capture: diff words 0 => ok
+[rows=3] window 0 capture vs pipe128: final-state diff words 0 (first None), output diff words 0 (first None), live state changed words 0, state moved words 786432 => ok
+[rows=3] control: flipped captured bit: diff words 1 => ok
+[rows=3] control: stale reference: diff words 786432 => ok
+[rows=3] window 0 rollback keep 1 vs pipe128 prefix: diff words 0 (first None), other slots changed words 0 => ok
+[rows=3] window 0 rollback keep 2 vs pipe128 prefix: diff words 0 (first None), other slots changed words 0 => ok
+[rows=3] control: keep 2 vs keep-1 reference: diff words 786432 => ok
+[rows=3] window 0 rollback keep 3 vs pipe128 prefix: diff words 0 (first None), other slots changed words 0 => ok
+[rows=3] control: keep 3 vs keep-1 reference: diff words 786432 => ok
+[rows=3] window 0 full replay vs capture: diff words 0 => ok
+[rows=3] window 1 capture vs pipe128: final-state diff words 0 (first None), output diff words 0 (first None), live state changed words 0, state moved words 786432 => ok
+[rows=3] window 1 rollback keep 1 vs pipe128 prefix: diff words 0 (first None), other slots changed words 0 => ok
+[rows=3] window 1 rollback keep 2 vs pipe128 prefix: diff words 0 (first None), other slots changed words 0 => ok
+[rows=3] window 1 rollback keep 3 vs pipe128 prefix: diff words 0 (first None), other slots changed words 0 => ok
+[rows=3] window 1 full replay vs capture: diff words 0 => ok
+[rows=3] window 2 capture vs pipe128: final-state diff words 0 (first None), output diff words 0 (first None), live state changed words 0, state moved words 786432 => ok
+[rows=3] window 2 rollback keep 1 vs pipe128 prefix: diff words 0 (first None), other slots changed words 0 => ok
+[rows=3] window 2 rollback keep 2 vs pipe128 prefix: diff words 0 (first None), other slots changed words 0 => ok
+[rows=3] window 2 rollback keep 3 vs pipe128 prefix: diff words 0 (first None), other slots changed words 0 => ok
+[rows=3] window 2 full replay vs capture: diff words 0 => ok
+[rows=4] window 0 capture vs pipe128: final-state diff words 0 (first None), output diff words 0 (first None), live state changed words 0, state moved words 786432 => ok
+[rows=4] control: flipped captured bit: diff words 1 => ok
+[rows=4] control: stale reference: diff words 786432 => ok
+[rows=4] window 0 rollback keep 1 vs pipe128 prefix: diff words 0 (first None), other slots changed words 0 => ok
+[rows=4] window 0 rollback keep 2 vs pipe128 prefix: diff words 0 (first None), other slots changed words 0 => ok
+[rows=4] control: keep 2 vs keep-1 reference: diff words 786432 => ok
+[rows=4] window 0 rollback keep 3 vs pipe128 prefix: diff words 0 (first None), other slots changed words 0 => ok
+[rows=4] control: keep 3 vs keep-1 reference: diff words 786432 => ok
+[rows=4] window 0 rollback keep 4 vs pipe128 prefix: diff words 0 (first None), other slots changed words 0 => ok
+[rows=4] control: keep 4 vs keep-1 reference: diff words 786432 => ok
+[rows=4] window 0 full replay vs capture: diff words 0 => ok
+[rows=4] window 1 capture vs pipe128: final-state diff words 0 (first None), output diff words 0 (first None), live state changed words 0, state moved words 786432 => ok
+[rows=4] window 1 rollback keep 1 vs pipe128 prefix: diff words 0 (first None), other slots changed words 0 => ok
+[rows=4] window 1 rollback keep 2 vs pipe128 prefix: diff words 0 (first None), other slots changed words 0 => ok
+[rows=4] window 1 rollback keep 3 vs pipe128 prefix: diff words 0 (first None), other slots changed words 0 => ok
+[rows=4] window 1 rollback keep 4 vs pipe128 prefix: diff words 0 (first None), other slots changed words 0 => ok
+[rows=4] window 1 full replay vs capture: diff words 0 => ok
+[rows=4] window 2 capture vs pipe128: final-state diff words 0 (first None), output diff words 0 (first None), live state changed words 0, state moved words 786432 => ok
+[rows=4] window 2 rollback keep 1 vs pipe128 prefix: diff words 0 (first None), other slots changed words 0 => ok
+[rows=4] window 2 rollback keep 2 vs pipe128 prefix: diff words 0 (first None), other slots changed words 0 => ok
+[rows=4] window 2 rollback keep 3 vs pipe128 prefix: diff words 0 (first None), other slots changed words 0 => ok
+[rows=4] window 2 rollback keep 4 vs pipe128 prefix: diff words 0 (first None), other slots changed words 0 => ok
+[rows=4] window 2 full replay vs capture: diff words 0 => ok
+[rows=8] window 0 capture vs pipe128: final-state diff words 0 (first None), output diff words 0 (first None), live state changed words 0, state moved words 786432 => ok
+[rows=8] control: flipped captured bit: diff words 1 => ok
+[rows=8] control: stale reference: diff words 786432 => ok
+[rows=8] window 0 rollback keep 1 vs pipe128 prefix: diff words 0 (first None), other slots changed words 0 => ok
+[rows=8] window 0 rollback keep 2 vs pipe128 prefix: diff words 0 (first None), other slots changed words 0 => ok
+[rows=8] control: keep 2 vs keep-1 reference: diff words 786432 => ok
+[rows=8] window 0 rollback keep 3 vs pipe128 prefix: diff words 0 (first None), other slots changed words 0 => ok
+[rows=8] control: keep 3 vs keep-1 reference: diff words 786432 => ok
+[rows=8] window 0 rollback keep 4 vs pipe128 prefix: diff words 0 (first None), other slots changed words 0 => ok
+[rows=8] control: keep 4 vs keep-1 reference: diff words 786432 => ok
+[rows=8] window 0 rollback keep 5 vs pipe128 prefix: diff words 0 (first None), other slots changed words 0 => ok
+[rows=8] control: keep 5 vs keep-1 reference: diff words 786432 => ok
+[rows=8] window 0 rollback keep 6 vs pipe128 prefix: diff words 0 (first None), other slots changed words 0 => ok
+[rows=8] control: keep 6 vs keep-1 reference: diff words 786432 => ok
+[rows=8] window 0 rollback keep 7 vs pipe128 prefix: diff words 0 (first None), other slots changed words 0 => ok
+[rows=8] control: keep 7 vs keep-1 reference: diff words 786432 => ok
+[rows=8] window 0 rollback keep 8 vs pipe128 prefix: diff words 0 (first None), other slots changed words 0 => ok
+[rows=8] control: keep 8 vs keep-1 reference: diff words 786432 => ok
+[rows=8] window 0 full replay vs capture: diff words 0 => ok
+[rows=8] window 1 capture vs pipe128: final-state diff words 0 (first None), output diff words 0 (first None), live state changed words 0, state moved words 786432 => ok
+[rows=8] window 1 rollback keep 1 vs pipe128 prefix: diff words 0 (first None), other slots changed words 0 => ok
+[rows=8] window 1 rollback keep 2 vs pipe128 prefix: diff words 0 (first None), other slots changed words 0 => ok
+[rows=8] window 1 rollback keep 3 vs pipe128 prefix: diff words 0 (first None), other slots changed words 0 => ok
+[rows=8] window 1 rollback keep 4 vs pipe128 prefix: diff words 0 (first None), other slots changed words 0 => ok
+[rows=8] window 1 rollback keep 5 vs pipe128 prefix: diff words 0 (first None), other slots changed words 0 => ok
+[rows=8] window 1 rollback keep 6 vs pipe128 prefix: diff words 0 (first None), other slots changed words 0 => ok
+[rows=8] window 1 rollback keep 7 vs pipe128 prefix: diff words 0 (first None), other slots changed words 0 => ok
+[rows=8] window 1 rollback keep 8 vs pipe128 prefix: diff words 0 (first None), other slots changed words 0 => ok
+[rows=8] window 1 full replay vs capture: diff words 0 => ok
+[rows=8] window 2 capture vs pipe128: final-state diff words 0 (first None), output diff words 0 (first None), live state changed words 0, state moved words 786432 => ok
+[rows=8] window 2 rollback keep 1 vs pipe128 prefix: diff words 0 (first None), other slots changed words 0 => ok
+[rows=8] window 2 rollback keep 2 vs pipe128 prefix: diff words 0 (first None), other slots changed words 0 => ok
+[rows=8] window 2 rollback keep 3 vs pipe128 prefix: diff words 0 (first None), other slots changed words 0 => ok
+[rows=8] window 2 rollback keep 4 vs pipe128 prefix: diff words 0 (first None), other slots changed words 0 => ok
+[rows=8] window 2 rollback keep 5 vs pipe128 prefix: diff words 0 (first None), other slots changed words 0 => ok
+[rows=8] window 2 rollback keep 6 vs pipe128 prefix: diff words 0 (first None), other slots changed words 0 => ok
+[rows=8] window 2 rollback keep 7 vs pipe128 prefix: diff words 0 (first None), other slots changed words 0 => ok
+[rows=8] window 2 rollback keep 8 vs pipe128 prefix: diff words 0 (first None), other slots changed words 0 => ok
+[rows=8] window 2 full replay vs capture: diff words 0 => ok
+[capture lanes=1 rows=2] window 0 batched capture vs per-lane capture: ring diff words 0 (first None), output diff words 0, live state changed words 0, ring words written 786432 (want 786432) => ok
+[capture lanes=1 rows=2] control: flipped captured bit: diff words 1 => ok
+[capture lanes=1 rows=2] window 1 batched capture vs per-lane capture: ring diff words 0 (first None), output diff words 0, live state changed words 0, ring words written 786432 (want 786432) => ok
+[capture lanes=1 rows=2] window 2 batched capture vs per-lane capture: ring diff words 0 (first None), output diff words 0, live state changed words 0, ring words written 786432 (want 786432) => ok
+[capture lanes=2 rows=2] window 0 batched capture vs per-lane capture: ring diff words 0 (first None), output diff words 0, live state changed words 0, ring words written 1572864 (want 1572864) => ok
+[capture lanes=2 rows=2] control: flipped captured bit: diff words 1 => ok
+[capture lanes=2 rows=2] control: lanes' rings swapped: diff words 1572864 => ok
+[capture lanes=2 rows=2] control: last lane not launched: diff words 786432 => ok
+[capture lanes=2 rows=2] window 1 batched capture vs per-lane capture: ring diff words 0 (first None), output diff words 0, live state changed words 0, ring words written 1572864 (want 1572864) => ok
+[capture lanes=2 rows=2] window 2 batched capture vs per-lane capture: ring diff words 0 (first None), output diff words 0, live state changed words 0, ring words written 1572864 (want 1572864) => ok
+[capture lanes=8 rows=2] window 0 batched capture vs per-lane capture: ring diff words 0 (first None), output diff words 0, live state changed words 0, ring words written 6291456 (want 6291456) => ok
+[capture lanes=8 rows=2] control: flipped captured bit: diff words 1 => ok
+[capture lanes=8 rows=2] control: lanes' rings swapped: diff words 1572864 => ok
+[capture lanes=8 rows=2] control: last lane not launched: diff words 786432 => ok
+[capture lanes=8 rows=2] window 1 batched capture vs per-lane capture: ring diff words 0 (first None), output diff words 0, live state changed words 0, ring words written 6291456 (want 6291456) => ok
+[capture lanes=8 rows=2] window 2 batched capture vs per-lane capture: ring diff words 0 (first None), output diff words 0, live state changed words 0, ring words written 6291456 (want 6291456) => ok
+[capture lanes=33 rows=2] window 0 batched capture vs per-lane capture: ring diff words 0 (first None), output diff words 0, live state changed words 0, ring words written 25952256 (want 25952256) => ok
+[capture lanes=33 rows=2] control: flipped captured bit: diff words 1 => ok
+[capture lanes=33 rows=2] control: lanes' rings swapped: diff words 1572864 => ok
+[capture lanes=33 rows=2] control: last lane not launched: diff words 786432 => ok
+[capture lanes=33 rows=2] window 1 batched capture vs per-lane capture: ring diff words 0 (first None), output diff words 0, live state changed words 0, ring words written 25952256 (want 25952256) => ok
+[capture lanes=33 rows=2] window 2 batched capture vs per-lane capture: ring diff words 0 (first None), output diff words 0, live state changed words 0, ring words written 25952256 (want 25952256) => ok
+[capture lanes=1 rows=3] window 0 batched capture vs per-lane capture: ring diff words 0 (first None), output diff words 0, live state changed words 0, ring words written 786432 (want 786432) => ok
+[capture lanes=1 rows=3] control: flipped captured bit: diff words 1 => ok
+[capture lanes=1 rows=3] window 1 batched capture vs per-lane capture: ring diff words 0 (first None), output diff words 0, live state changed words 0, ring words written 786432 (want 786432) => ok
+[capture lanes=1 rows=3] window 2 batched capture vs per-lane capture: ring diff words 0 (first None), output diff words 0, live state changed words 0, ring words written 786432 (want 786432) => ok
+[capture lanes=2 rows=3] window 0 batched capture vs per-lane capture: ring diff words 0 (first None), output diff words 0, live state changed words 0, ring words written 1572864 (want 1572864) => ok
+[capture lanes=2 rows=3] control: flipped captured bit: diff words 1 => ok
+[capture lanes=2 rows=3] control: lanes' rings swapped: diff words 1572864 => ok
+[capture lanes=2 rows=3] control: last lane not launched: diff words 786432 => ok
+[capture lanes=2 rows=3] window 1 batched capture vs per-lane capture: ring diff words 0 (first None), output diff words 0, live state changed words 0, ring words written 1572864 (want 1572864) => ok
+[capture lanes=2 rows=3] window 2 batched capture vs per-lane capture: ring diff words 0 (first None), output diff words 0, live state changed words 0, ring words written 1572864 (want 1572864) => ok
+[capture lanes=8 rows=3] window 0 batched capture vs per-lane capture: ring diff words 0 (first None), output diff words 0, live state changed words 0, ring words written 6291456 (want 6291456) => ok
+[capture lanes=8 rows=3] control: flipped captured bit: diff words 1 => ok
+[capture lanes=8 rows=3] control: lanes' rings swapped: diff words 1572864 => ok
+[capture lanes=8 rows=3] control: last lane not launched: diff words 786432 => ok
+[capture lanes=8 rows=3] window 1 batched capture vs per-lane capture: ring diff words 0 (first None), output diff words 0, live state changed words 0, ring words written 6291456 (want 6291456) => ok
+[capture lanes=8 rows=3] window 2 batched capture vs per-lane capture: ring diff words 0 (first None), output diff words 0, live state changed words 0, ring words written 6291456 (want 6291456) => ok
+[capture lanes=33 rows=3] window 0 batched capture vs per-lane capture: ring diff words 0 (first None), output diff words 0, live state changed words 0, ring words written 25952256 (want 25952256) => ok
+[capture lanes=33 rows=3] control: flipped captured bit: diff words 1 => ok
+[capture lanes=33 rows=3] control: lanes' rings swapped: diff words 1572864 => ok
+[capture lanes=33 rows=3] control: last lane not launched: diff words 786432 => ok
+[capture lanes=33 rows=3] window 1 batched capture vs per-lane capture: ring diff words 0 (first None), output diff words 0, live state changed words 0, ring words written 25952256 (want 25952256) => ok
+[capture lanes=33 rows=3] window 2 batched capture vs per-lane capture: ring diff words 0 (first None), output diff words 0, live state changed words 0, ring words written 25952256 (want 25952256) => ok
+[capture lanes=1 rows=4] window 0 batched capture vs per-lane capture: ring diff words 0 (first None), output diff words 0, live state changed words 0, ring words written 786432 (want 786432) => ok
+[capture lanes=1 rows=4] control: flipped captured bit: diff words 1 => ok
+[capture lanes=1 rows=4] window 1 batched capture vs per-lane capture: ring diff words 0 (first None), output diff words 0, live state changed words 0, ring words written 786432 (want 786432) => ok
+[capture lanes=1 rows=4] window 2 batched capture vs per-lane capture: ring diff words 0 (first None), output diff words 0, live state changed words 0, ring words written 786432 (want 786432) => ok
+[capture lanes=2 rows=4] window 0 batched capture vs per-lane capture: ring diff words 0 (first None), output diff words 0, live state changed words 0, ring words written 1572864 (want 1572864) => ok
+[capture lanes=2 rows=4] control: flipped captured bit: diff words 1 => ok
+[capture lanes=2 rows=4] control: lanes' rings swapped: diff words 1572864 => ok
+[capture lanes=2 rows=4] control: last lane not launched: diff words 786432 => ok
+[capture lanes=2 rows=4] window 1 batched capture vs per-lane capture: ring diff words 0 (first None), output diff words 0, live state changed words 0, ring words written 1572864 (want 1572864) => ok
+[capture lanes=2 rows=4] window 2 batched capture vs per-lane capture: ring diff words 0 (first None), output diff words 0, live state changed words 0, ring words written 1572864 (want 1572864) => ok
+[capture lanes=8 rows=4] window 0 batched capture vs per-lane capture: ring diff words 0 (first None), output diff words 0, live state changed words 0, ring words written 6291456 (want 6291456) => ok
+[capture lanes=8 rows=4] control: flipped captured bit: diff words 1 => ok
+[capture lanes=8 rows=4] control: lanes' rings swapped: diff words 1572864 => ok
+[capture lanes=8 rows=4] control: last lane not launched: diff words 786432 => ok
+[capture lanes=8 rows=4] window 1 batched capture vs per-lane capture: ring diff words 0 (first None), output diff words 0, live state changed words 0, ring words written 6291456 (want 6291456) => ok
+[capture lanes=8 rows=4] window 2 batched capture vs per-lane capture: ring diff words 0 (first None), output diff words 0, live state changed words 0, ring words written 6291456 (want 6291456) => ok
+[capture lanes=33 rows=4] window 0 batched capture vs per-lane capture: ring diff words 0 (first None), output diff words 0, live state changed words 0, ring words written 25952256 (want 25952256) => ok
+[capture lanes=33 rows=4] control: flipped captured bit: diff words 1 => ok
+[capture lanes=33 rows=4] control: lanes' rings swapped: diff words 1572864 => ok
+[capture lanes=33 rows=4] control: last lane not launched: diff words 786432 => ok
+[capture lanes=33 rows=4] window 1 batched capture vs per-lane capture: ring diff words 0 (first None), output diff words 0, live state changed words 0, ring words written 25952256 (want 25952256) => ok
+[capture lanes=33 rows=4] window 2 batched capture vs per-lane capture: ring diff words 0 (first None), output diff words 0, live state changed words 0, ring words written 25952256 (want 25952256) => ok
+[capture lanes=1 rows=8] window 0 batched capture vs per-lane capture: ring diff words 0 (first None), output diff words 0, live state changed words 0, ring words written 786432 (want 786432) => ok
+[capture lanes=1 rows=8] control: flipped captured bit: diff words 1 => ok
+[capture lanes=1 rows=8] window 1 batched capture vs per-lane capture: ring diff words 0 (first None), output diff words 0, live state changed words 0, ring words written 786432 (want 786432) => ok
+[capture lanes=1 rows=8] window 2 batched capture vs per-lane capture: ring diff words 0 (first None), output diff words 0, live state changed words 0, ring words written 786432 (want 786432) => ok
+[capture lanes=2 rows=8] window 0 batched capture vs per-lane capture: ring diff words 0 (first None), output diff words 0, live state changed words 0, ring words written 1572864 (want 1572864) => ok
+[capture lanes=2 rows=8] control: flipped captured bit: diff words 1 => ok
+[capture lanes=2 rows=8] control: lanes' rings swapped: diff words 1572864 => ok
+[capture lanes=2 rows=8] control: last lane not launched: diff words 786432 => ok
+[capture lanes=2 rows=8] window 1 batched capture vs per-lane capture: ring diff words 0 (first None), output diff words 0, live state changed words 0, ring words written 1572864 (want 1572864) => ok
+[capture lanes=2 rows=8] window 2 batched capture vs per-lane capture: ring diff words 0 (first None), output diff words 0, live state changed words 0, ring words written 1572864 (want 1572864) => ok
+[capture lanes=8 rows=8] window 0 batched capture vs per-lane capture: ring diff words 0 (first None), output diff words 0, live state changed words 0, ring words written 6291456 (want 6291456) => ok
+[capture lanes=8 rows=8] control: flipped captured bit: diff words 1 => ok
+[capture lanes=8 rows=8] control: lanes' rings swapped: diff words 1572864 => ok
+[capture lanes=8 rows=8] control: last lane not launched: diff words 786432 => ok
+[capture lanes=8 rows=8] window 1 batched capture vs per-lane capture: ring diff words 0 (first None), output diff words 0, live state changed words 0, ring words written 6291456 (want 6291456) => ok
+[capture lanes=8 rows=8] window 2 batched capture vs per-lane capture: ring diff words 0 (first None), output diff words 0, live state changed words 0, ring words written 6291456 (want 6291456) => ok
+[capture lanes=33 rows=8] window 0 batched capture vs per-lane capture: ring diff words 0 (first None), output diff words 0, live state changed words 0, ring words written 25952256 (want 25952256) => ok
+[capture lanes=33 rows=8] control: flipped captured bit: diff words 1 => ok
+[capture lanes=33 rows=8] control: lanes' rings swapped: diff words 1572864 => ok
+[capture lanes=33 rows=8] control: last lane not launched: diff words 786432 => ok
+[capture lanes=33 rows=8] window 1 batched capture vs per-lane capture: ring diff words 0 (first None), output diff words 0, live state changed words 0, ring words written 25952256 (want 25952256) => ok
+[capture lanes=33 rows=8] window 2 batched capture vs per-lane capture: ring diff words 0 (first None), output diff words 0, live state changed words 0, ring words written 25952256 (want 25952256) => ok
+gdn_capture_f32_gfx942_oracle: PASS [route: HIPFIRE_QWEN4_G942_GDN_VERIFY_IMAGE=/scratch/quant/fn-fp8/beat/WC8/twin/gdn/gdn-verify-reference-device.elf (45352 bytes); HIPFIRE_QWEN4_G942_GDN_LANES_CAPTURE_IMAGE=/scratch/quant/fn-fp8/beat/WC8/twin/gdn/gdn-capture-twin-device.elf (31304 bytes)]

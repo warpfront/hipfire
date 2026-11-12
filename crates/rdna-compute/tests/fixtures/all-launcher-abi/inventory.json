@@ -153,6 +153,7 @@
     "kernels/src/qwen4_g942_glue_elem.hip",
     "kernels/src/qwen4_g942_glue_moe.hip",
     "kernels/src/qwen4_gdn_lanes_f32.gfx942.hip",
+    "kernels/src/qwen4_gdn_lanes_capture_f32.gfx942.hip",
     "kernels/src/qwen4_gemm_mq4g256v2_moe_grouped_wmma_k2.hip",
     "kernels/src/qwen4_gemv_mq4g256v2_moe_gate_up_k8_indexed_batched.hip",
     "kernels/src/qwen4_moe_iu4_sym.gfx1151.hip",
@@ -261,6 +262,14 @@
         "qwen4_qsa_lanes_attention_f32_gfx942"
       ],
       "reason": "gfx942 QSA lanes F32 Route-A qualification twin: byte-identical full device ELF (seven entries) and exact HIP/HSA ABI with the hipcc anchor. Only the five F32/select entries are sealed and listed; the two FP8 entries qwen4_qsa_lanes_prologue_fp8_fnuz_gfx942 and qwen4_qsa_lanes_attention_fp8_fnuz_gfx942 stay OPEN and are never launched. Land with its owner kernel and checked live launcher; no unlaunched exemption, production dispatch or obligation-class change."
+    },
+    "kernels/qwen4_gdn_lanes_step_capture_f32_gfx942_pm_gfx942.hxaco": {
+      "hip_source": "kernels/src/qwen4_gdn_lanes_capture_f32.gfx942.hip",
+      "anchor": "kernels/qwen4_gdn_lanes_step_capture_f32_gfx942_hipcc_gfx942.co",
+      "symbols": [
+        "qwen4_gdn_lanes_step_capture_f32_gfx942"
+      ],
+      "reason": "gfx942 GDN lanes capture-f32 single-entry Route-A qualification twin: byte-identical full device ELF to the hipcc anchor, exact HIP/HSA ABI, certified by the existing typed CDNA ledger. Standalone: it has no owner launcher in this tree, so the full owner ABI is checked when the owner stack lands. No production image or dispatch change; qualification evidence is the hash-bound hardware receipt only."
     }
   },
   "emitter_images": {
