@@ -2321,9 +2321,10 @@ impl FeatureFlags {
     }
 
     /// Lane-wide PLE projection (`HIPFIRE_QWEN4_LANE_PLE_PROJECT`, default on, `=0` kills it).
-    /// Exact gfx1201 only.
+    /// Exact gfx1201 (the row-exact BF16 GEMV) and exact gfx942 (the BF16 MFMA trunk route, whose
+    /// every output row is independent of the row count).
     pub fn qwen4_lane_ple_project_enabled(&self) -> bool {
-        self.qwen4_lane_ple_project && self.arch == "gfx1201"
+        self.qwen4_lane_ple_project && matches!(self.arch.as_str(), "gfx1201" | "gfx942")
     }
 
     /// E4M3 HC mixer sidecar (`HIPFIRE_QWEN4_HC8`, default on, `=0` kills it). Exact gfx1201
@@ -4444,6 +4445,18 @@ mod tests {
         }
         let t = FeatureFlags::for_test("gfx1201");
         assert!(!t.qwen4_mtp_fc_one_launch_enabled() && !t.qwen4_lane_ple_project_enabled());
+        // Exact gfx942 takes the lane-wide PLE projection (and only that one of the two) by
+        // default; `=0` kills it.
+        let on = FeatureFlags::from_lookup("gfx942", |_| Err(()));
+        assert!(on.qwen4_lane_ple_project_enabled() && !on.qwen4_mtp_fc_one_launch_enabled());
+        let off = FeatureFlags::from_lookup("gfx942", |n| {
+            if n == "HIPFIRE_QWEN4_LANE_PLE_PROJECT" {
+                Ok("0".into())
+            } else {
+                Err(())
+            }
+        });
+        assert!(!off.qwen4_lane_ple_project_enabled());
     }
 
     /// The HC8 sidecar route is default on (`=0` kills) and reaches exact gfx1201 only.
