@@ -9,9 +9,8 @@
 //! mutate the same sparse `~/.hipfire/config.toml` document.
 
 use hipfire_config::{
-    effective::Choice, field, is_deprecated_key, is_developer_key, is_typed_bool_developer_key,
-    load_global, parse_typed_bool, write_global_toml, ConfigLayer, ConfigPaths, ConfigValue,
-    ValueRule,
+    effective::Choice, field, is_developer_key, is_typed_bool_developer_key, load_global,
+    parse_typed_bool, write_global_toml, ConfigLayer, ConfigPaths, ConfigValue, ValueRule,
 };
 use serde_json::Value;
 use std::path::Path;
@@ -68,10 +67,8 @@ const FLASH_MODE: &[&str] = &["auto", "always", "never"];
 pub const SYM_IU4_KEY: &str = "developer.qwen4_moe_sym_iu4";
 
 /// Overrides of the schema-derived kind, only where the curated list has a
-/// better option order than the schema's own. Every other non-deprecated
-/// schema field gets its kind from its `ValueRule` ([`field_spec`]).
-/// `hipfire-config` is the sole validator; deprecated CASK/PFlash keys are
-/// deliberately absent (read-only in the TUI).
+/// better option order than the schema's own. Every other schema field gets its kind from its `ValueRule` ([`field_spec`]).
+/// `hipfire-config` is the sole validator.
 pub const EDITABLE_FIELDS: &[FieldSpec] = &[
     FieldSpec {
         key: "kv_cache",
@@ -146,7 +143,6 @@ fn spec_table() -> &'static [(&'static str, FieldSpec)] {
 fn build_spec_table() -> Vec<(&'static str, FieldSpec)> {
     let mut table: Vec<(&'static str, FieldSpec)> = hipfire_config::fields()
         .iter()
-        .filter(|schema| !is_deprecated_key(schema.key))
         .map(|schema| {
             let curated = EDITABLE_FIELDS
                 .iter()
@@ -171,8 +167,8 @@ fn build_spec_table() -> Vec<(&'static str, FieldSpec)> {
     table
 }
 
-/// The edit spec of `key` (canonical or legacy spelling); `None` for a
-/// deprecated key, an unknown key, and any `developer.*` key but the typed
+/// The edit spec of `key` (canonical or legacy spelling); `None` for an
+/// unknown key, and any `developer.*` key but the typed
 /// boolean one (see [`field_kind`]).
 pub fn field_spec(key: &str) -> Option<&'static FieldSpec> {
     let canonical = match field(key) {
@@ -524,21 +520,6 @@ mod tests {
         );
     }
 
-    /// Deprecated CASK/PFlash keys are not editable rows.
-    #[test]
-    fn deprecated_keys_have_no_field_spec() {
-        for spec in EDITABLE_FIELDS {
-            assert!(
-                !hipfire_config::is_deprecated_key(spec.key),
-                "{} is deprecated but editable",
-                spec.key
-            );
-        }
-        for key in ["cask"] {
-            assert!(field_spec(key).is_none(), "{key}");
-        }
-    }
-
     /// Numeric ranges come from the schema, not a local copy: the old table said
     /// 131072/524288 where the schema allows 393216/1048576.
     #[test]
@@ -626,10 +607,6 @@ mod tests {
     fn every_live_schema_field_has_a_kind_from_its_rule() {
         for schema in hipfire_config::fields() {
             let spec = field_spec(schema.key);
-            if is_deprecated_key(schema.key) {
-                assert!(spec.is_none(), "{} is deprecated", schema.key);
-                continue;
-            }
             let spec = spec.unwrap_or_else(|| panic!("{} has no spec", schema.key));
             assert!(
                 spec.key == schema.key || EDITABLE_FIELDS.iter().any(|s| s.key == spec.key),

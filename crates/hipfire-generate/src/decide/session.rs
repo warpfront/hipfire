@@ -10,9 +10,8 @@
 //! for the next chat turn. Spec: `docs/specs/2026-09-28-jev-decide-design.md` §12.
 
 use super::{
-    check_eviction_limit, check_uncompacted, decided_reply, execute_decide, gather_labels, hook,
-    ms, note_calibration, question_labels, rollback, DecideError, DecideOutcome, DecidePlan,
-    RenderedQuestions,
+    check_uncompacted, decided_reply, execute_decide, gather_labels, hook, ms, note_calibration,
+    question_labels, rollback, DecideError, DecideOutcome, DecidePlan, RenderedQuestions,
 };
 use hipfire_engine::decide as d;
 use hipfire_loader::decide::DecideSnapshot;
@@ -96,7 +95,6 @@ pub(crate) fn render_session_prompt(
 /// What bounds a session decide's longest render (see [`render_and_admit`]).
 struct SessionLimits {
     max_seq: usize,
-    eviction_budget: Option<usize>,
     physical_cap: usize,
 }
 
@@ -128,13 +126,10 @@ fn estimate_required_max_seq(probe_len: usize, r0_len: usize, text_lens: &[usize
 /// cost up to [`d::MAX_QUESTIONS`] whole-conversation renders under
 /// exclusive admission before its 422, so the order is:
 ///
-/// 1. the probe (conversation + a `.` user turn): over the eviction limit is
-///    a 422 before any question renders. A question turn is never shorter
-///    than the probe's `.` turn, so every R_i would fail too.
+/// 1. the probe (conversation + a `.` user turn).
 /// 2. R_0. If the probe alone is over `max_seq`: 422 with an estimated
 ///    `required_max_seq` ([`estimate_required_max_seq`]); no further render.
-/// 3. each R_i as it is rendered: the eviction limit and Jev's per-question
-///    / request limits on the suffixes past a provisional E (the end over
+/// 3. each R_i as it is rendered: Jev's per-question / request limits on the suffixes past a provisional E (the end over
 ///    the probe and R_0 only). More renders can only shorten the common
 ///    prefix, so the final E is <= the provisional one and every suffix only
 ///    grows: an early refusal is one the final check would make too.
@@ -149,7 +144,6 @@ fn render_and_admit(
 ) -> Result<SessionRenders, DecideError> {
     let turn_open = tok.special_token_id(TURN_OPEN);
     let probe = render(PROBE_USER_TEXT)?;
-    check_eviction_limit(probe.len(), limits.eviction_budget, limits.physical_cap)?;
     let mut label_ids = Vec::with_capacity(questions.len());
     let mut texts = Vec::with_capacity(questions.len());
     for q in questions {
@@ -161,7 +155,6 @@ fn render_and_admit(
     let mut provisional_end = 0;
     for (i, text) in texts.iter().enumerate() {
         let r = render(text)?;
-        check_eviction_limit(r.len(), limits.eviction_budget, limits.physical_cap)?;
         if i == 0 {
             if probe.len() + 1 > limits.max_seq {
                 let text_lens: Vec<usize> = texts.iter().map(|t| tok.encode(t).len()).collect();
@@ -188,7 +181,6 @@ fn render_and_admit(
     let lens: Vec<usize> = seqs.iter().map(Vec::len).collect();
     d::check_session_tokens(questions, conv_end, &lens).map_err(|e| DecideError::new(422, e))?;
     let longest = lens.iter().copied().max().unwrap_or(0);
-    check_eviction_limit(longest, limits.eviction_budget, limits.physical_cap)?;
     if longest + 1 > limits.max_seq {
         return Err(DecideError {
             status: 422,
@@ -261,7 +253,6 @@ pub(crate) fn plan_session(m: &mut LoadedModel, req: &Value) -> Result<SessionPl
     let tools = parsed.tools.as_deref();
     let limits = SessionLimits {
         max_seq: m.max_seq,
-        eviction_budget: m.eviction.as_ref().map(|e| e.budget()),
         physical_cap: m.physical_cap,
     };
     let SessionRenders {
@@ -271,11 +262,10 @@ pub(crate) fn plan_session(m: &mut LoadedModel, req: &Value) -> Result<SessionPl
     } = render_and_admit(tok, &parsed.questions, &limits, |text| {
         render_session_prompt(tok, template, cache, &parsed.messages, tools, text)
     })?;
-    // The chat path's prompt-cache eligibility (ar.rs:3025-3029): never under
-    // eviction or with the cache kill switch. A positional rewind also needs
-    // an uncompacted KV cache.
-    let reuse = m.eviction.is_none()
-        && !dev_flag_off("HIPFIRE_QWEN_PROMPT_CACHE")
+    // The chat path's prompt-cache eligibility (ar.rs:3025-3029): never with
+    // the cache kill switch. A positional rewind also needs an uncompacted KV
+    // cache.
+    let reuse = !dev_flag_off("HIPFIRE_QWEN_PROMPT_CACHE")
         && carrier.decide_kv_compact_offset(m) == Some(0);
     // With a speculator loaded the AR checkpoint ring is not the live one.
     let resume = crate::ar::ckpt_resume_enabled() && m.speculator.is_none();
@@ -402,7 +392,7 @@ fn run_session(
             *reset = true;
             cold_reset_keep_turn_cache(m, gpu)?;
             // As v1 after its rollback: attest the positional-rewind
-            // precondition (the rollback zeroes compact_offset, incl. CASK).
+            // precondition (the rollback zeroes compact_offset).
             check_uncompacted(carrier.decide_kv_compact_offset(m))?;
             0
         }
@@ -751,10 +741,9 @@ mod tests {
         (r, renders)
     }
 
-    fn no_eviction(max_seq: usize) -> SessionLimits {
+    fn limits_for(max_seq: usize) -> SessionLimits {
         SessionLimits {
             max_seq,
-            eviction_budget: None,
             physical_cap: max_seq,
         }
     }
@@ -762,7 +751,7 @@ mod tests {
     #[test]
     fn admits_and_matches_the_full_render() {
         let req = session_req(5, 10, None);
-        let (r, renders) = admit(&req, &no_eviction(1 << 20));
+        let (r, renders) = admit(&req, &limits_for(1 << 20));
         let r = r.unwrap();
         assert_eq!(renders, 6, "probe + one render per question");
         let t = tok();
@@ -783,12 +772,12 @@ mod tests {
     #[test]
     fn oversized_conversation_is_refused_before_rendering_the_questions() {
         let req = session_req(d::MAX_QUESTIONS, 3000, None);
-        let (r, renders) = admit(&req, &no_eviction(512));
+        let (r, renders) = admit(&req, &limits_for(512));
         let e = r.err().expect("over max_seq");
         assert_eq!(renders, 2, "probe and R_0 only");
         assert_eq!(e.status, 422);
         let required = e.required_max_seq.expect("required_max_seq");
-        let (retry, _) = admit(&req, &no_eviction(required));
+        let (retry, _) = admit(&req, &limits_for(required));
         let longest = retry
             .expect("the estimate admits the retry")
             .seqs
@@ -801,28 +790,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn probe_over_the_eviction_limit_renders_no_question() {
-        let req = session_req(d::MAX_QUESTIONS, 3000, None);
-        let limits = SessionLimits {
-            max_seq: 1 << 20,
-            eviction_budget: Some(1000),
-            physical_cap: 1 << 20,
-        };
-        let (r, renders) = admit(&req, &limits);
-        let e = r.err().expect("over the eviction limit");
-        assert_eq!(renders, 1, "probe only");
-        assert_eq!(e.status, 422);
-        assert_eq!(e.required_max_seq, None);
-        assert!(e.message.contains("KV eviction"), "{}", e.message);
-    }
-
     /// Jev's per-question limit fails on the offending question without
     /// rendering the rest, as v1 does.
     #[test]
     fn over_long_question_fails_where_it_is_rendered() {
         let req = session_req(d::MAX_QUESTIONS, 10, Some(3));
-        let (r, renders) = admit(&req, &no_eviction(1 << 20));
+        let (r, renders) = admit(&req, &limits_for(1 << 20));
         let e = r.err().expect("over the per-question limit");
         assert_eq!(renders, 5, "probe + q0..=q3");
         assert_eq!(e.status, 422);

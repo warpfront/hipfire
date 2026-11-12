@@ -170,7 +170,6 @@ pub struct KvBackendHints<'a> {
     pub kv_v: Option<&'a str>,
     pub qwen_default_q8: bool,
     pub kv_adaptive: Option<&'a str>,
-    pub cask: Option<&'a hipfire_runtime::loader_api::CaskConfig>,
     pub deepseek4_heterogeneous: bool,
     /// Why this device's runtime cannot back the VMM backend (granularity
     /// query or virtual-address reservation failed, see
@@ -188,7 +187,6 @@ impl KvBackendHints<'_> {
             kv_v: None,
             qwen_default_q8: true,
             kv_adaptive: None,
-            cask: None,
             deepseek4_heterogeneous: false,
             vmm_runtime_refusal: Some("no device was probed"),
             free_vram_bytes: None,
@@ -214,7 +212,6 @@ pub struct SourceAdmissionOptions {
     /// serializes its ordinary `off` schema default as a nonempty string.
     pub kv_adaptive: bool,
     pub eagle_drafter: bool,
-    pub cask: bool,
     pub state_quant: bool,
     pub non_single_compute: bool,
     pub expert_count_override: bool,
@@ -1326,10 +1323,8 @@ pub struct SourceAdmission {
     /// through `LoadCtx::batch_request`.
     pub batch_request: BatchLoadRequest,
 }
-/// The physical VMM reservation equals `max_seq` without eviction; with
-/// CASK eviction it is `min(max_seq, eviction_window)`. Only the former must
-/// grow to the full card-admitted bound. Explicit overrides may exceed either
-/// limit by operator request.
+/// The physical VMM reservation equals `max_seq`; it must grow to the full
+/// card-admitted bound. Explicit overrides may exceed it by operator request.
 #[derive(Debug, Clone)]
 pub struct SequenceResolution {
     pub max_seq: usize,
@@ -1939,7 +1934,6 @@ pub fn qwen35_card_projection(
         config.head_dim,
         1,
         adaptive,
-        hints.cask.is_some_and(|c| c.sidecar.is_some()),
     );
     let policy =
         kv_mode::qwen35_policy_for_native(&kv_mode::QWEN35_HFQ_POLICY, raw_mode, auto_native);
@@ -2433,7 +2427,6 @@ pub(crate) fn qwen4_pp_option_refusal(
         (crate::carriers::qwen4_ddtree_requested(spec), "DDTree"),
         (options.kv_adaptive, "adaptive KV"),
         (options.eagle_drafter, "an EAGLE drafter"),
-        (options.cask, "CASK"),
         (
             options.expert_count_override,
             "an experts-per-token override",
@@ -3074,8 +3067,6 @@ pub fn admit_source_with_options(
             "carrier {} has no VMM KV owner",
             carrier.unwrap().name()
         ))
-    } else if arch_id == 14 && hints.cask.is_some_and(|c| c.sidecar.is_some()) {
-        Some("Muse Glimmer does not support a CASK sidecar together with VMM KV".to_string())
     } else {
         None
     };
@@ -3088,15 +3079,6 @@ pub fn admit_source_with_options(
         | (KvBackendRequest::Automatic, None) => (KvBackend::Vmm, None),
         (KvBackendRequest::Automatic, Some(reason)) => (KvBackend::Legacy, Some(reason)),
     };
-    if kv_backend == KvBackend::Legacy
-        && matches!(arch_id, 5 | 6)
-        && hints
-            .cask
-            .is_some_and(|c| c.sidecar.is_some() && c.handoff_tokens > 0)
-        && hints.kv_adaptive.is_some_and(|s| !matches!(s, "" | "off"))
-    {
-        return Err("kv_adaptive -> CASK handoff needs the VMM KV backend, which is not available for this load; disable the CASK sidecar/handoff or use a GPU that supports VMM KV".into());
-    }
     if let Some(carrier) = carrier {
         crate::pp_degree_refusal(carrier.name(), &caps, pp)?;
         carrier.admit_topology(arch_id, is_dir, pp, kv_backend)?;
@@ -3244,7 +3226,6 @@ pub fn admit_source_with_options(
                 cfg.head_dim,
                 pp,
                 adaptive,
-                hints.cask.is_some_and(|c| c.sidecar.is_some()),
             )
         });
         let policy = kv_mode::qwen35_policy_for_native(policy, &mode, auto_native);
@@ -3340,7 +3321,6 @@ pub fn admit_source_with_options(
                         cfg.head_dim,
                         pp,
                         adaptive,
-                        hints.cask.is_some_and(|c| c.sidecar.is_some()),
                     ) {
                         return Err(why);
                     }
@@ -3353,13 +3333,6 @@ pub fn admit_source_with_options(
                     ));
                 }
             }
-        }
-        if !adaptive
-            && hints.cask.is_some_and(|c| c.sidecar.is_some())
-            && (matches!(k, KvMode::Fwht2 | KvMode::Fwht3 | KvMode::Fwht4)
-                || pair.v().is_some_and(|v| v != kv_mode::VMode::Q8))
-        {
-            return Err("static CASK requires q8 or legacy-asym K with q8 V; use --kv-k legacy-asym3 --kv-v q8 or disable CASK".into());
         }
     }
 
@@ -5064,7 +5037,6 @@ mod tests {
                 kv_v: None,
                 qwen_default_q8: true,
                 kv_adaptive: None,
-                cask: None,
                 deepseek4_heterogeneous: false,
                 vmm_runtime_refusal: None,
                 free_vram_bytes: None,
@@ -5106,7 +5078,6 @@ mod tests {
                 kv_v: None,
                 qwen_default_q8: true,
                 kv_adaptive: None,
-                cask: None,
                 deepseek4_heterogeneous: false,
                 vmm_runtime_refusal,
                 free_vram_bytes: None,
@@ -5248,7 +5219,6 @@ mod tests {
                         kv_v: None,
                         qwen_default_q8: true,
                         kv_adaptive: None,
-                        cask: None,
                         deepseek4_heterogeneous: false,
                         vmm_runtime_refusal: (!vmm_runtime_available)
                             .then_some("the test runtime has no VMM"),
@@ -5323,7 +5293,6 @@ mod tests {
                 kv_v: None,
                 qwen_default_q8: true,
                 kv_adaptive: None,
-                cask: None,
                 deepseek4_heterogeneous: false,
                 vmm_runtime_refusal: None,
                 free_vram_bytes: Some(24 << 30),
@@ -7129,7 +7098,6 @@ mod qwen4_pp_admission_tests {
             ),
             ("adaptive KV", None, options_with(|o| o.kv_adaptive = true)),
             ("EAGLE", None, options_with(|o| o.eagle_drafter = true)),
-            ("CASK", None, options_with(|o| o.cask = true)),
             (
                 "experts-per-token",
                 None,
@@ -7629,11 +7597,6 @@ mod qwen4_pp_admission_tests {
                         mtp: Some(true),
                         ..defaults
                     },
-                    ..Default::default()
-                },
-                SourceAdmissionOptions {
-                    spec: defaults,
-                    cask: true,
                     ..Default::default()
                 },
                 SourceAdmissionOptions {

@@ -215,7 +215,6 @@ fn store(m: &LoadedModel) -> Option<&Qwen35VmmStore> {
 /// singleton speculator, Jinja rendering, prompt cache on, plain KV.
 pub fn pool_enabled(m: &LoadedModel) -> bool {
     m.speculator.is_none()
-        && m.eviction.is_none()
         && m.kv_adaptive.is_none()
         && m.pp <= 1
         && m.ep.is_none()

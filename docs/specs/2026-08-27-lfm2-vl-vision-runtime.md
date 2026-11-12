@@ -78,7 +78,7 @@ carrier so that:
    tensors ⇒ vision stays `None`; generation path identical).
 
 Out of scope (fail-closed or follow-up): multi-image requests, DFlash/spec
-× VL, CASK eviction × VL (arch 11 has none), video, bf16 vision, VRAM-tiered
+× VL, video, bf16 vision, VRAM-tiered
 tower offload, per-SKU calibration docs.
 
 ## 1. Upstream contract (LiquidAI/LFM2.5-VL-3B, HF `transformers` lfm2_vl)

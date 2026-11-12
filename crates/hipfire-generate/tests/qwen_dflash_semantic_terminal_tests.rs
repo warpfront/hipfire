@@ -1678,7 +1678,7 @@ fn production_done_value_builder_matches_epilogue_shape() {
     assert_eq!(v["tokens"], 3);
 }
 
-// --- Task 4 production-seam invariants (pending-seed / cancel / evict /
+// --- Task 4 production-seam invariants (pending-seed / cancel /
 // capacity / jinja / wire / rollback attestation) ---
 
 #[test]
@@ -1769,7 +1769,6 @@ fn cancellation_classification_forced_gpu_advance() {
         hipfire_generate::qwen::ForcedGpuAdvanceKind::Cancelled
     );
     // Cancelled path must use aborted+done wire, never bake the forced token.
-    // ErrorOnly is reserved for eviction failures (XOR below).
     assert_ne!(
         hipfire_generate::qwen::SpecFailClosedWire::Cancelled,
         hipfire_generate::qwen::SpecFailClosedWire::ErrorOnly
@@ -1799,49 +1798,6 @@ fn cancellation_classification_forced_gpu_advance() {
 }
 
 #[test]
-fn eviction_error_terminal_exclusivity() {
-    // maybe_evict / on_evict Err → ErrorOnly: one fail-closed error, no done.
-    assert_eq!(
-        hipfire_generate::qwen::classify_evict_failure_wire(),
-        hipfire_generate::qwen::SpecFailClosedWire::ErrorOnly
-    );
-    let _guard = begin_terminal_test("ev1", 66);
-    set_active_attempt_id(66);
-    let mut sink = Vec::new();
-    let ep = attest_epilogue(true);
-    match hipfire_generate::qwen::classify_evict_failure_wire() {
-        hipfire_generate::qwen::SpecFailClosedWire::ErrorOnly => {
-            hipfire_generate::common::emit_fail_closed_error(
-                &mut sink,
-                Some("ev1"),
-                "on_evict: synthetic retain failure",
-                "validation",
-                false,
-                &ep,
-            );
-        }
-        hipfire_generate::qwen::SpecFailClosedWire::Cancelled => {
-            panic!("evict must not classify Cancelled")
-        }
-    }
-    let out = String::from_utf8(sink).unwrap();
-    let lines = parse_jsonl(&out);
-    assert_eq!(lines.len(), 1, "error XOR done: {lines:?}");
-    assert_eq!(lines[0]["type"], "error");
-    assert_eq!(lines[0]["class"], "validation");
-    assert_eq!(lines[0]["retryable"], false);
-    assert_eq!(lines[0]["rolled_back"], true);
-    assert_eq!(lines[0]["attempt_id"], 66);
-    assert_eq!(lines[0]["id"], "ev1");
-    assert!(!out.contains(r#""type":"done""#));
-    assert!(!out.contains(r#""type":"aborted""#));
-    assert!(!out.contains(r#""type":"tool_calls""#));
-    // Fail-closed early exit skips wrapper epilogue (same as step failure).
-    assert!(!qwen_dflash_epilogue_after_spec_run(false));
-    set_active_attempt_id(0);
-}
-
-#[test]
 fn strict_prefix_replay_capacity_rejection() {
     let prompt = vec![1u32, 2, 3];
     let plan = hipfire_generate::qwen::spec_prefix_realign_plan(&prompt, 9, &[10, 11, 12]);
@@ -1851,27 +1807,24 @@ fn strict_prefix_replay_capacity_rejection() {
     assert!(!plan.replay.contains(&12));
 
     // Fits both caps (position must be strictly < caps — pending seed slot).
-    assert!(hipfire_generate::qwen::spec_prefix_realign_admit(&plan, 64, 64, 0, false).is_ok());
+    assert!(hipfire_generate::qwen::spec_prefix_realign_admit(&plan, 64, 64).is_ok());
     // Boundary: position == cap leaves no legal write slot for pending seed.
     let err_eq =
-        hipfire_generate::qwen::spec_prefix_realign_admit(&plan, plan.position, 64, 0, false)
-            .unwrap_err();
+        hipfire_generate::qwen::spec_prefix_realign_admit(&plan, plan.position, 64).unwrap_err();
     assert!(
         err_eq.contains("physical_cap"),
         "expected position==physical_cap reject, got {err_eq}"
     );
 
     // Physical capacity rejection — fail closed before reset/prefill.
-    let err_phys =
-        hipfire_generate::qwen::spec_prefix_realign_admit(&plan, 5, 64, 0, false).unwrap_err();
+    let err_phys = hipfire_generate::qwen::spec_prefix_realign_admit(&plan, 5, 64).unwrap_err();
     assert!(
         err_phys.contains("physical_cap"),
         "expected physical_cap reject, got {err_phys}"
     );
 
     // Speculator ctx capacity rejection.
-    let err_ctx =
-        hipfire_generate::qwen::spec_prefix_realign_admit(&plan, 64, 4, 0, false).unwrap_err();
+    let err_ctx = hipfire_generate::qwen::spec_prefix_realign_admit(&plan, 64, 4).unwrap_err();
     assert!(
         err_ctx.contains("ctx_capacity"),
         "expected ctx_capacity reject, got {err_ctx}"
@@ -1883,19 +1836,10 @@ fn strict_prefix_replay_capacity_rejection() {
         position: 5,
         seed_token: 9,
     };
-    let err_inv =
-        hipfire_generate::qwen::spec_prefix_realign_admit(&broken, 100, 100, 0, false).unwrap_err();
+    let err_inv = hipfire_generate::qwen::spec_prefix_realign_admit(&broken, 100, 100).unwrap_err();
     assert!(
         err_inv.contains("invariant") || err_inv.contains("pending"),
         "expected invariant reject, got {err_inv}"
-    );
-
-    // Compacted/eviction path still fails closed on oversize full-history replay.
-    let err_ev =
-        hipfire_generate::qwen::spec_prefix_realign_admit(&plan, 5, 64, 3, true).unwrap_err();
-    assert!(
-        err_ev.contains("physical_cap") || err_ev.contains("compact"),
-        "expected compacted oversize reject, got {err_ev}"
     );
 
     // Capacity reject wires as exclusive error terminal (no done).
@@ -2083,7 +2027,7 @@ fn pending_seed_chain_trigger_clip_force_then_terminal_flush() {
     let plan = hipfire_generate::qwen::spec_prefix_realign_plan(&prompt, first, &raw);
     assert_eq!(plan.seed_token, 71);
     assert_ne!(plan.replay.last().copied(), Some(plan.seed_token));
-    assert!(hipfire_generate::qwen::spec_prefix_realign_admit(&plan, 1024, 1024, 0, false).is_ok());
+    assert!(hipfire_generate::qwen::spec_prefix_realign_admit(&plan, 1024, 1024).is_ok());
 }
 
 // ── Task 4 Important vetoes (production seam pins) ─────────────────────
@@ -2364,88 +2308,6 @@ fn rollback_attestation_omitted_reset_classes_and_ar_abort_xor() {
     assert!(msg.contains("device_synchronize failed"), "{msg}");
     assert!(!out.contains(r#""type":"done""#));
     assert!(!out.contains(r#""type":"aborted""#));
-    set_active_attempt_id(0);
-}
-
-/// Eviction-enabled missing optional kv_cache_mut is ErrorOnly (not panic):
-/// hipfire_generate::qwen::classify_evict_failure_wire → hipfire_generate::common::emit_fail_closed_error with the production
-/// post-prefill / per-cycle messages; no done/aborted/calls/cache.
-#[test]
-fn missing_optional_kv_cache_mut_is_error_only_not_panic() {
-    assert_eq!(
-        hipfire_generate::qwen::classify_evict_failure_wire(),
-        hipfire_generate::qwen::SpecFailClosedWire::ErrorOnly
-    );
-    assert_ne!(
-        hipfire_generate::qwen::SpecFailClosedWire::Cancelled,
-        hipfire_generate::qwen::SpecFailClosedWire::ErrorOnly,
-        "missing KV hook must never classify as Cancelled"
-    );
-
-    let _guard = begin_terminal_test("kv-pp", 301);
-    for (attempt, id, message) in [
-        (301u64, "kv-pp", "kv_cache_mut missing (post-prefill)"),
-        (302u64, "kv-pc", "kv_cache_mut missing (per-cycle)"),
-    ] {
-        _guard.activate(id, attempt);
-        let mut sink = Vec::new();
-        // Production seam: classify first, then fail-closed writer (same as
-        // hipfire_generate::qwen::generate_spec match slot.kv_cache_mut() { None => ... }).
-        let _ = hipfire_generate::qwen::classify_evict_failure_wire();
-        let ep = attest_epilogue(true);
-        match hipfire_generate::qwen::classify_evict_failure_wire() {
-            hipfire_generate::qwen::SpecFailClosedWire::ErrorOnly => {
-                hipfire_generate::common::emit_fail_closed_error(
-                    &mut sink,
-                    Some(id),
-                    message,
-                    "validation",
-                    false,
-                    &ep,
-                );
-            }
-            hipfire_generate::qwen::SpecFailClosedWire::Cancelled => {
-                panic!("kv_cache_mut missing must not classify Cancelled")
-            }
-        }
-        let out = String::from_utf8(sink).unwrap();
-        let lines = parse_jsonl(&out);
-        assert_eq!(lines.len(), 1, "error XOR done for {message}: {lines:?}");
-        assert_eq!(lines[0]["type"], "error");
-        assert_eq!(lines[0]["class"], "validation");
-        assert_eq!(lines[0]["retryable"], false);
-        assert_eq!(lines[0]["rolled_back"], true);
-        assert_eq!(lines[0]["attempt_id"], attempt);
-        assert_eq!(lines[0]["id"], id);
-        assert_eq!(lines[0]["message"], message);
-        assert!(!out.contains(r#""type":"done""#));
-        assert!(!out.contains(r#""type":"aborted""#));
-        assert!(!out.contains(r#""type":"tool_calls""#));
-        // hipfire_generate::qwen::generate_spec returns None → wrapper skips cache store / epilogue.
-        assert!(!qwen_dflash_epilogue_after_spec_run(false));
-    }
-
-    // Unattested rollback on the same missing-hook path: rolled_back=false
-    // + context appended; still error-only (no panic surface).
-    _guard.activate("kv-ua", 303);
-    let mut sink = Vec::new();
-    let ep = attest_epilogue_with_context("device_synchronize failed: test");
-    hipfire_generate::common::emit_fail_closed_error(
-        &mut sink,
-        Some("kv-ua"),
-        "kv_cache_mut missing (post-prefill)",
-        "validation",
-        false,
-        &ep,
-    );
-    let out = String::from_utf8(sink).unwrap();
-    let lines = parse_jsonl(&out);
-    assert_eq!(lines.len(), 1);
-    assert_eq!(lines[0]["rolled_back"], false);
-    let msg = lines[0]["message"].as_str().unwrap();
-    assert!(msg.contains("kv_cache_mut missing (post-prefill)"), "{msg}");
-    assert!(msg.contains("device_synchronize failed"), "{msg}");
-    assert!(!out.contains(r#""type":"done""#));
     set_active_attempt_id(0);
 }
 
@@ -3273,178 +3135,33 @@ fn held_tool_calls_with_semantic_stop_at_cap_is_tool_calls_not_length() {
 
 // ── Task 4 forced-continuation physical-cap admission ─────────────────
 
-/// Pure admission: no-eviction requires a free pending-seed write slot
+/// Pure admission: requires a free pending-seed write slot
 /// after the commit (`post_position < physical_cap`). Exact-cap rejects.
 #[test]
-fn forced_commit_no_evict_exact_cap_rejects_pending_seed_slot() {
+fn forced_commit_exact_cap_rejects_pending_seed_slot() {
     let physical_cap = 16usize;
     let position = 12usize;
     let commit_len = 4usize; // post_position == physical_cap
     assert_eq!(position.saturating_add(commit_len), physical_cap);
     assert!(
-        !hipfire_generate::qwen::spec_forced_commit_admits(
-            position,
-            commit_len,
-            physical_cap,
-            false
-        ),
-        "no-eviction exact-cap must reject: pending seed needs a legal slot"
+        !hipfire_generate::qwen::spec_forced_commit_admits(position, commit_len, physical_cap),
+        "exact-cap must reject: pending seed needs a legal slot"
     );
     // One slot under cap still fits (post == cap-1).
     assert!(hipfire_generate::qwen::spec_forced_commit_admits(
         position,
         commit_len.saturating_sub(1),
-        physical_cap,
-        false
+        physical_cap
     ));
     // Over-cap also rejects.
     assert!(!hipfire_generate::qwen::spec_forced_commit_admits(
         position,
         commit_len.saturating_add(1),
-        physical_cap,
-        false
+        physical_cap
     ));
 }
 
-/// Eviction path still refuses post_position > physical_cap before any GPU
-/// write. Exact-cap is the only boundary that eviction may open.
-#[test]
-fn forced_commit_eviction_over_cap_rejects_before_gpu() {
-    let physical_cap = 16usize;
-    let position = 12usize;
-    let over = 5usize; // post_position = 17 > cap
-    assert!(position.saturating_add(over) > physical_cap);
-    assert!(
-        !hipfire_generate::qwen::spec_forced_commit_admits(position, over, physical_cap, true),
-        "eviction must not admit over-cap commits"
-    );
-
-    // Deterministic pre-GPU gate: reject ⇒ no GPU commit, no staged render.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum Phase {
-        Staged,
-        GpuCommitted,
-        Rendered,
-        ErrorOnly,
-    }
-    let admitted =
-        hipfire_generate::qwen::spec_forced_commit_admits(position, over, physical_cap, true);
-    let mut phase = Phase::Staged;
-    let mut rendered = 0usize;
-    if !admitted {
-        // Production: rollback + ErrorOnly terminal; discard staged events.
-        phase = Phase::ErrorOnly;
-    } else {
-        phase = Phase::GpuCommitted;
-        phase = Phase::Rendered;
-        rendered = 1;
-    }
-    assert_eq!(phase, Phase::ErrorOnly);
-    assert_eq!(
-        rendered, 0,
-        "capacity reject must never render staged events"
-    );
-    assert_ne!(phase, Phase::GpuCommitted);
-    assert_ne!(phase, Phase::Rendered);
-    // Same wire class as maybe_evict / on_evict failures.
-    assert_eq!(
-        hipfire_generate::qwen::classify_evict_failure_wire(),
-        hipfire_generate::qwen::SpecFailClosedWire::ErrorOnly
-    );
-}
-
-/// Eviction exact-cap admits only because post-commit maybe_evict+on_evict
-/// is mandatory before host seed/raw/render and must leave a free seed slot.
-#[test]
-fn forced_commit_eviction_exact_cap_admits_with_mandatory_post_commit_evict() {
-    let physical_cap = 16usize;
-    let position = 12usize;
-    let commit_len = 4usize; // post_position == physical_cap
-    assert_eq!(position.saturating_add(commit_len), physical_cap);
-
-    assert!(
-        hipfire_generate::qwen::spec_forced_commit_admits(position, commit_len, physical_cap, true),
-        "eviction may admit exact-cap"
-    );
-    // Contrast: same numbers without eviction reject.
-    assert!(!hipfire_generate::qwen::spec_forced_commit_admits(
-        position,
-        commit_len,
-        physical_cap,
-        false
-    ));
-
-    // Ordering model for the admitted exact-cap path: GPU commit → mandatory
-    // post-commit eviction → require post_evict < physical_cap → only then
-    // host position/seed/raw/render. Skipping eviction must not reach render.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum Step {
-        Admit,
-        GpuCommit,
-        PostCommitEvict,
-        HostRender,
-        ErrorOnly,
-    }
-    let mut steps: Vec<Step> = Vec::new();
-    let admitted =
-        hipfire_generate::qwen::spec_forced_commit_admits(position, commit_len, physical_cap, true);
-    assert!(admitted);
-    steps.push(Step::Admit);
-    steps.push(Step::GpuCommit);
-
-    let eviction_enabled = true;
-    let mut post_position = position.saturating_add(commit_len);
-    let mut rendered = false;
-    if eviction_enabled {
-        // Mandatory: maybe_evict + on_evict before host updates.
-        steps.push(Step::PostCommitEvict);
-        // Synthetic successful compaction frees the pending-seed slot.
-        post_position = physical_cap.saturating_sub(1);
-        if post_position >= physical_cap {
-            steps.push(Step::ErrorOnly);
-        } else {
-            steps.push(Step::HostRender);
-            rendered = true;
-        }
-    } else {
-        steps.push(Step::HostRender);
-        rendered = true;
-    }
-    assert_eq!(
-        steps,
-        vec![
-            Step::Admit,
-            Step::GpuCommit,
-            Step::PostCommitEvict,
-            Step::HostRender
-        ]
-    );
-    assert!(rendered);
-    assert!(post_position < physical_cap);
-
-    // If post-evict still has no seed slot → ErrorOnly, no render.
-    let mut bad_steps: Vec<Step> = vec![Step::Admit, Step::GpuCommit, Step::PostCommitEvict];
-    let bad_post = physical_cap; // eviction failed to free a slot
-    let mut bad_rendered = false;
-    if bad_post >= physical_cap {
-        bad_steps.push(Step::ErrorOnly);
-    } else {
-        bad_steps.push(Step::HostRender);
-        bad_rendered = true;
-    }
-    assert_eq!(
-        bad_steps,
-        vec![
-            Step::Admit,
-            Step::GpuCommit,
-            Step::PostCommitEvict,
-            Step::ErrorOnly
-        ]
-    );
-    assert!(!bad_rendered);
-}
-
-/// Comfortably under the physical cap admits with or without eviction.
+/// Comfortably under the physical cap admits.
 #[test]
 fn forced_commit_under_threshold_fits() {
     let physical_cap = 64usize;
@@ -3454,27 +3171,13 @@ fn forced_commit_under_threshold_fits() {
     assert!(hipfire_generate::qwen::spec_forced_commit_admits(
         position,
         commit_len,
-        physical_cap,
-        false
-    ));
-    assert!(hipfire_generate::qwen::spec_forced_commit_admits(
-        position,
-        commit_len,
-        physical_cap,
-        true
+        physical_cap
     ));
     // Empty commit (seed-only replace) is always under threshold.
     assert!(hipfire_generate::qwen::spec_forced_commit_admits(
         position,
         0,
-        physical_cap,
-        false
-    ));
-    assert!(hipfire_generate::qwen::spec_forced_commit_admits(
-        position,
-        0,
-        physical_cap,
-        true
+        physical_cap
     ));
 }
 
@@ -3496,19 +3199,9 @@ fn forced_commit_admission_uses_tx_commit_len_not_forced_count() {
         !hipfire_generate::qwen::spec_forced_commit_admits(
             position,
             keep.commit.len(),
-            physical_cap,
-            false
+            physical_cap
         ),
-        "committable commit_len=3 at pos=8 must reject under no-evict"
-    );
-    assert!(
-        !hipfire_generate::qwen::spec_forced_commit_admits(
-            position,
-            keep.commit.len(),
-            physical_cap,
-            true
-        ),
-        "committable commit_len=3 at pos=8 is over-cap even with eviction"
+        "committable commit_len=3 at pos=8 must reject "
     );
 
     // Non-committable: commit = [10, 11] → len 2 (seed omitted); post = 10.
@@ -3521,39 +3214,22 @@ fn forced_commit_admission_uses_tx_commit_len_not_forced_count() {
         forced.len(),
         "must not admit against forced token count"
     );
-    // Using forced.len() would be wrong (post=11 over-cap); actual slice fits
-    // exact-cap under eviction and rejects under no-evict (needs seed slot).
+    // Using forced.len() would be wrong (post=11 over-cap); the actual slice
+    // lands on exact-cap, which still rejects (needs a seed slot).
     assert_eq!(position.saturating_add(omit.commit.len()), physical_cap);
     assert!(
         !hipfire_generate::qwen::spec_forced_commit_admits(
             position,
             omit.commit.len(),
-            physical_cap,
-            false
+            physical_cap
         ),
-        "no-evict exact-cap still needs a pending-seed slot"
+        "exact-cap still needs a pending-seed slot"
     );
-    assert!(
-        hipfire_generate::qwen::spec_forced_commit_admits(
-            position,
-            omit.commit.len(),
-            physical_cap,
-            true
-        ),
-        "eviction admits exact-cap on the actual (shorter) commit slice"
-    );
-    // Guard: if a caller mistakenly passed forced.len(), both modes reject.
+    // Guard: if a caller mistakenly passed forced.len(), it rejects.
     assert!(!hipfire_generate::qwen::spec_forced_commit_admits(
         position,
         forced.len(),
-        physical_cap,
-        true
-    ));
-    assert!(!hipfire_generate::qwen::spec_forced_commit_admits(
-        position,
-        forced.len(),
-        physical_cap,
-        false
+        physical_cap
     ));
 
     // Single forced + non-committable: empty commit — no GPU write.
@@ -3568,22 +3244,14 @@ fn forced_commit_admission_uses_tx_commit_len_not_forced_count() {
     assert!(hipfire_generate::qwen::spec_forced_commit_admits(
         position,
         one.commit.len(),
-        physical_cap,
-        false
+        physical_cap
     ));
-    // At physical_cap with zero-length commit: no-evict still needs a free
-    // pending-seed slot (post == cap rejects); eviction admits exact-cap.
+    // At physical_cap with zero-length commit: a free pending-seed slot is
+    // still needed (post == cap rejects).
     assert!(!hipfire_generate::qwen::spec_forced_commit_admits(
         physical_cap,
         one.commit.len(),
-        physical_cap,
-        false
-    ));
-    assert!(hipfire_generate::qwen::spec_forced_commit_admits(
-        physical_cap,
-        one.commit.len(),
-        physical_cap,
-        true
+        physical_cap
     ));
 }
 

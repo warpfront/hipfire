@@ -170,7 +170,6 @@ fn main() {
         config.head_dim,
         1,
         false,
-        false,
     ) {
         eprintln!("verify_route_logits: native fp8 KV refused: {reason}");
         std::process::exit(1);

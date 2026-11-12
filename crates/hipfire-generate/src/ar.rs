@@ -754,74 +754,13 @@ pub fn qwen_ar_forward_fail_message(phase: &str, err: impl std::fmt::Display) ->
     format!("{phase}: {err}")
 }
 
-/// One KV-eviction step at the write slot `*seq_pos` just advanced to; moves
-/// it to the compacted physical slot when the policy evicts. A failure is
-/// returned, never unwrapped: a transient HIP error mid-request fails the
-/// request closed ([`qwen_ar_eviction_fail_closed`]) instead of panicking
-/// the daemon. `evict` is the policy call (`Ok(None)` without a policy).
-pub fn qwen_ar_evict<E: std::fmt::Debug>(
-    seq_pos: &mut usize,
-    evict: impl FnOnce(usize) -> Result<Option<hipfire_runtime::triattn::EvictionResult>, E>,
-) -> Result<(), String> {
-    if crate::common::take_eviction_fault() {
-        return Err("injected fault: eviction".to_owned());
-    }
-    match evict(*seq_pos) {
-        Ok(Some(result)) => {
-            *seq_pos = result.new_physical;
-            Ok(())
-        }
-        Ok(None) => Ok(()),
-        Err(e) => Err(format!("{e:?}")),
-    }
-}
-
-/// Fail-closed terminal for a failed [`qwen_ar_evict`]: attested rollback
-/// and one correlated `gpu` error — no done, no cache store, no panic.
-pub fn qwen_ar_eviction_fail_closed(
-    m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
-    stdout: &mut impl std::io::Write,
-    id: &str,
-    phase: &str,
-    err: &str,
-) {
-    let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
-    crate::common::emit_fail_closed_error(
-        stdout,
-        Some(id),
-        &format!("KV eviction failed ({phase}): {err}"),
-        "gpu",
-        false,
-        &ep,
-    );
-}
-
-/// Bound an eviction-enabled Qwen prefill write while an adaptive cache still
-/// owns the layout.  Before the one-way handoff, the eviction window is not a
-/// capacity limit (its gate is closed); writes must instead stop at every
-/// adaptive transition boundary.  After handoff, the normal budget window
-/// again determines how much can be appended before compaction.
-pub fn qwen_ar_eviction_prefill_chunk_limit(
-    seq_pos: usize,
-    eviction_window: usize,
-    adaptive_staging: bool,
-) -> usize {
-    if adaptive_staging {
-        qwen35::PREFILL_MAX_BATCH
-    } else {
-        eviction_window.saturating_sub(seq_pos).max(1)
-    }
-}
-
 /// Whether a decode-phase cancel of the AR route may keep the live
 /// conversation (`production_cancel_epilogue`): the validated configuration is
-/// a resident single-GPU Qwen3.5-class bundle without KV eviction/compaction,
+/// a resident single-GPU Qwen3.5-class bundle without KV compaction,
 /// adaptive KV or a speculator (whose drafter state an AR turn does not
 /// advance).
 pub fn ar_cancel_keeps_committed_prefix(m: &LoadedModel) -> bool {
     m.pp <= 1
-        && m.eviction.is_none()
         && m.kv_adaptive.is_none()
         && m.speculator.is_none()
         && m.qwen35().is_some_and(|b| b.kv_cache.compact_offset == 0)
@@ -846,15 +785,13 @@ pub(crate) fn full_render_path(has_history: bool, has_template: bool, jinja_enab
 /// the prompt, so after a cold prefill it occupies the same positions and the
 /// reset would only destroy the cache.
 pub(crate) fn context_full_resets(
-    no_eviction: bool,
     full_render: bool,
     seq_pos: usize,
     prompt_est: usize,
     max_tokens: usize,
     max_seq: usize,
 ) -> bool {
-    no_eviction
-        && !full_render
+    !full_render
         && seq_pos
             .saturating_add(prompt_est)
             .saturating_add(max_tokens)
@@ -879,18 +816,11 @@ mod context_guard_tests {
     fn full_render_never_resets_for_context_full() {
         // 20K-token session, 12K generation ask on a 32K context: the old check
         // wiped the conversation on every tool-result request.
-        assert!(!context_full_resets(
-            true, true, 20_173, 800, 12_288, 32_768
-        ));
+        assert!(!context_full_resets(true, 20_173, 800, 12_288, 32_768));
         // The append path keeps its reset where it can create room.
-        assert!(context_full_resets(
-            true, false, 20_173, 800, 12_288, 32_768
-        ));
-        // Eviction never resets; a request that fits never resets.
-        assert!(!context_full_resets(
-            false, false, 20_173, 800, 12_288, 32_768
-        ));
-        assert!(!context_full_resets(true, false, 1_000, 800, 2_048, 32_768));
+        assert!(context_full_resets(false, 20_173, 800, 12_288, 32_768));
+        // A request that fits never resets.
+        assert!(!context_full_resets(false, 1_000, 800, 2_048, 32_768));
         assert!(full_render_path(true, true, true));
         assert!(!full_render_path(false, true, true));
         assert!(!full_render_path(true, true, false));
@@ -3235,7 +3165,7 @@ pub fn generate(
             unreachable!("gemma4 dispatches through generation_early_route before this match")
         }
         GenerationRoute::MapleAr => {
-            // Arch 15 has no eviction, but it DOES honour the
+            // Arch 15 DOES honour the
             // QwenJinja reasoning contract: `enable_thinking` (from
             // `thinking_enabled`), `assistant_prefix` (open/closed/plain) and
             // the explicit `max_think_tokens` cap are threaded into the
@@ -3317,7 +3247,7 @@ pub fn generate(
             // Arch 19 (Raon-1-mini). Single-GPU AR over the shared
             // `generate_ar_with_forward` body (QwenArSemanticProducer: think
             // router, XML tool router, stop matcher, gen_start/terminal
-            // lifecycle). No eviction/spec on this arch.
+            // lifecycle). No spec on this arch.
             let _ = (
                 budget_alert_at_tok,
                 budget_alert_text,
@@ -3792,11 +3722,8 @@ pub fn generate(
         }
     }
 
-    // Auto-reset on multi-turn rollover. When eviction is active (operator
-    // enabled cask_sidecar at load), the physical buffer is bounded by
-    // budget+beta+safety regardless of conversation length, so reset never
-    // needs to fire — eviction reclaims slots after each token. When eviction
-    // is OFF, physical grows unbounded up to max_seq; reset when we'd overrun.
+    // Auto-reset on multi-turn rollover: physical grows up to max_seq; reset
+    // when we'd overrun.
     // Borrow `tokenizer` per-use (never held across whole-`m` calls): the
     // context-full reset below reborrows `m` through the canonical reset.
     // Skip the full BPE encode when the prompt provably fits: every token
@@ -3814,8 +3741,7 @@ pub fn generate(
             .as_deref()
             != Some("0"),
     );
-    let prompt_est = if m.eviction.is_none()
-        && !full_render
+    let prompt_est = if !full_render
         && m.seq_pos
             .saturating_add(prompt.len())
             .saturating_add(20)
@@ -3837,14 +3763,7 @@ pub fn generate(
             m.seq_pos
         );
     }
-    if context_full_resets(
-        m.eviction.is_none(),
-        full_render,
-        m.seq_pos,
-        prompt_est,
-        max_tokens,
-        m.max_seq,
-    ) {
+    if context_full_resets(full_render, m.seq_pos, prompt_est, max_tokens, m.max_seq) {
         eprintln!(
             "[daemon] context full ({}/{}) — resetting conversation",
             m.seq_pos, m.max_seq
@@ -4078,8 +3997,6 @@ pub fn generate(
     // Mirrors V4F's prefix-cache (daemon.rs ~5390). Eligible when:
     //   - HIPFIRE_QWEN_PROMPT_CACHE != "0"  (default on)
     //   - messages_history is provided (full-conversation context)
-    //   - eviction not active (compact_offset > 0 invalidates the
-    //     "conversation_tokens mirrors KV" invariant the cache relies on)
     //   - prior conversation_tokens non-empty (first turn = nothing to LCP)
     //
     // On HIT we set `m.seq_pos = LCP` and override `new_tokens` to the
@@ -4121,7 +4038,6 @@ pub fn generate(
     let vmm_pool = jinja_active && tools.is_none() && crate::vmm_conv::pool_active(m);
     let cache_eligible = !cache_kill_switch
         && messages_history.is_some()
-        && m.eviction.is_none()
         && (!m.conversation_tokens.is_empty() || vmm_pool);
     if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
         .ok()
@@ -4129,11 +4045,10 @@ pub fn generate(
         == Some("1")
     {
         eprintln!(
-            "[qwen-cache eligible] eligible={} kill={} hist={} evict_none={} jinja={} conv_tok={}",
+            "[qwen-cache eligible] eligible={} kill={} hist={} jinja={} conv_tok={}",
             cache_eligible,
             cache_kill_switch,
             messages_history.is_some(),
-            m.eviction.is_none(),
             jinja_active,
             m.conversation_tokens.len(),
         );
@@ -4406,9 +4321,8 @@ pub fn generate(
             // `lcp`: restore the DeltaNet recurrent state captured there, rewind
             // seq_pos + the KV write head, and re-prefill only
             // [resume_pos..rendered.len()). KV for [0..resume_pos] is still
-            // resident (positional, never overwritten). Gated to the single-GPU,
-            // no-eviction case — eviction remaps physical KV slots, which would
-            // invalidate the resident prefix. `seq_pos < rendered.len()` on the
+            // resident (positional, never overwritten). Gated to the single-GPU
+            // case with a zero KV compact offset. `seq_pos < rendered.len()` on the
             // chosen checkpoint guarantees ≥1 token is re-prefilled.
             //
             // SAFETY INVARIANT: this restore-checkpoint-at-rpos + replay
@@ -4438,8 +4352,7 @@ pub fn generate(
             // from the forwarded stream no longer match, so the resume degrades
             // to a cold prefill.
             // Guarded by scripts/test-qwen35-abort-resume.sh.
-            let evict_safe = m.pp <= 1
-                && m.eviction.is_none()
+            let resume_safe = m.pp <= 1
                 && m.state.as_ref().map_or(true, |s| {
                     let am = s.as_ref();
                     if let Some(b) =
@@ -4460,7 +4373,7 @@ pub fn generate(
             // bundle). The gate used to read the always-None m.dn_state → resume
             // was silently disabled post-merge; gate on the bundle instead.
             let resume_idx = if ckpt_resume_enabled()
-                && evict_safe
+                && resume_safe
                 && m.state
                     .as_ref()
                     .map_or(false, |s| s.as_ref().arch_key() == "qwen35")
@@ -4520,7 +4433,7 @@ pub fn generate(
                 };
                 if ok {
                     m.seq_pos = rpos;
-                    // `evict_safe` guarantees compact_offset == 0, so setting
+                    // `resume_safe` guarantees compact_offset == 0, so setting
                     // seq_pos already points the KV write head at rpos — nothing
                     // to restore (checkpoints are only captured with offset 0).
                     m.conversation_tokens.truncate(rpos);
@@ -4602,7 +4515,7 @@ pub fn generate(
     // NOT blanket-reset here (that would discard a valid cache hit and force a
     // cold re-prefill every turn). Only cold-reset when the cache did NOT run
     // (item #37): first turn (empty conversation), kill switch
-    // (HIPFIRE_QWEN_PROMPT_CACHE=0), eviction active. On turn 2+ in those
+    // (HIPFIRE_QWEN_PROMPT_CACHE=0). On turn 2+ in those
     // cases, reset BEFORE the budget guard + prefill so the full render writes
     // from position 0 rather than appending to the prior turn's dirty
     // DeltaNet/KV/checkpoint state. Uses `crate::common::free_checkpoints` (NOT a bare
@@ -4660,39 +4573,14 @@ pub fn generate(
     // resolve to this binding; uses above resolved to the earlier one.
     let tokenizer = m.tokenizer.as_ref().unwrap();
 
-    // KV-budget guard. Without eviction the physical buffer is the hard cap;
-    // we must fit prefill + generation + trailer in one allocation. With
-    // eviction, physical is bounded by physical_cap regardless of total tokens
-    // — the chunked prefill below calls maybe_evict between chunks, and the
-    // decode loop evicts after every token. The only ceiling under eviction is
-    // the advertised context window (max_seq) — refuse requests that would
-    // overflow it in absolute position terms (current absolute + new).
+    // KV-budget guard. The physical buffer is the hard cap; we must fit
+    // prefill + generation + trailer in one allocation.
     let trailer = nl.len();
-    let absolute_pos = m.seq_pos.saturating_add(
-        m.state
-            .as_ref()
-            .and_then(|s| {
-                let am = s.as_ref();
-                if let Some(b) = (am as &dyn Any).downcast_ref::<hipfire_arch_llama::LlamaBundle>()
-                {
-                    Some(b.kv.compact_offset)
-                } else if let Some(b) =
-                    (am as &dyn Any).downcast_ref::<hipfire_arch_qwen35::Qwen35Bundle>()
-                {
-                    // qwen35 KV compact_offset lives in the bundle, not the
-                    // always-None m.kv_cache direct field.
-                    Some(b.kv_cache.compact_offset)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(0),
-    );
     // Full-render path: the generation budget is clamped to the room left in the
     // context (decode then ends with finish_reason "length" at the cap) instead of
     // wiping the session; only a render that itself does not fit (no room left)
     // reaches the refusal below.
-    let max_tokens = if full_render && m.eviction.is_none() {
+    let max_tokens = if full_render {
         clamp_generation_to_context(
             max_tokens,
             m.seq_pos + new_tokens.len() + trailer,
@@ -4701,47 +4589,21 @@ pub fn generate(
     } else {
         max_tokens
     };
-    let max_tokens = if m.eviction.is_none() {
-        crate::common::fit_max_tokens(
-            max_tokens,
-            m.seq_pos + new_tokens.len() + trailer,
-            m.physical_cap,
-        )
-    } else {
-        crate::common::fit_max_tokens(
-            max_tokens,
-            absolute_pos + new_tokens.len() + trailer,
-            m.max_seq,
-        )
-    };
-    if m.eviction.is_none() {
-        if m.seq_pos
-            .saturating_add(new_tokens.len())
-            .saturating_add(max_tokens)
-            .saturating_add(trailer)
-            > m.physical_cap
-        {
-            crate::dense::emit_active_attempt_error(
-                stdout,
-                Some(id),
-                &format!("request exceeds loaded KV budget: seq_pos={} + prefill={} + max_tokens={} + trailer={} > physical_cap={} — reload model with a larger max_seq", m.seq_pos, new_tokens.len(), max_tokens, trailer, m.physical_cap),
-                "context_length",
-                false,
-                false
-            );
-            let _ = stdout.flush();
-            return;
-        }
-    } else if absolute_pos
+    let max_tokens = crate::common::fit_max_tokens(
+        max_tokens,
+        m.seq_pos + new_tokens.len() + trailer,
+        m.physical_cap,
+    );
+    if m.seq_pos
         .saturating_add(new_tokens.len())
         .saturating_add(max_tokens)
         .saturating_add(trailer)
-        > m.max_seq
+        > m.physical_cap
     {
         crate::dense::emit_active_attempt_error(
             stdout,
             Some(id),
-            &format!("request exceeds advertised context window: absolute={} + prefill={} + max_tokens={} + trailer={} > max_seq={}", absolute_pos, new_tokens.len(), max_tokens, trailer, m.max_seq),
+            &format!("request exceeds loaded KV budget: seq_pos={} + prefill={} + max_tokens={} + trailer={} > physical_cap={} — reload model with a larger max_seq", m.seq_pos, new_tokens.len(), max_tokens, trailer, m.physical_cap),
             "context_length",
             false,
             false
@@ -4838,16 +4700,11 @@ pub fn generate(
         // mark earlier captures CPU-dispatch time, which under-reports
         // prefill by a large factor (prefill_tok_s ~5–10× too optimistic).
         //
-        // Under eviction: chunk prefill to the (budget+beta) eviction window
-        // and call `maybe_evict` between chunks so physical never exceeds
-        // physical_cap. Chunk size caps out at physical capacity available —
-        // when physical is at post-evict `budget`, a full `beta`-sized chunk
-        // can run before the next eviction fires.
         // Prefill loop with abort support. The CLI sends
         // `{type:"abort","id":"..."}` when the HTTP client closes the
         // connection (curl `-m` timeout, Pi/opencode response timer
         // fired, etc.); the stdin reader thread sets the abort flag
-        // and the chunk loop below picks it up. The no-eviction path
+        // and the chunk loop below picks it up. The prefill
         // is manually chunked at the ordinary prefill outer bound so abort
         // latency is bounded to one chunk (~5 s on gfx1151 at 50 tps).
         //
@@ -4867,250 +4724,142 @@ pub fn generate(
             pin: m.user_turn_ckpt,
         };
         let mut prefill_aborted = false;
-        if let Some(ref ev) = m.eviction {
-            let window = ev.budget() + ev.beta();
-            let mut remaining: &[u32] = &new_tokens;
-            while !remaining.is_empty() {
-                if check_abort(id) {
-                    prefill_aborted = true;
-                    break;
+        // Manually chunk the prefill so the abort check fires
+        // between batches. Outer chunks follow the admitted ordinary
+        // ceiling (the same decision the forward below enforces) with the
+        // serve tail rule (1025→1024+1); the inner forward re-admits per
+        // chunk, so a smaller memory admission only narrows chunks, never
+        // breaks them. At the 512 ceiling this is `min(remaining, 512),
+        // identical to the legacy split.
+        // Adaptive-KV keeps the hard `PREFILL_MAX_BATCH` (256) cap so the
+        // controller's margin and maybe_downshift boundaries stay exact.
+        let chunk_max = if m.kv_adaptive.is_some() {
+            qwen35::PREFILL_MAX_BATCH
+        } else {
+            let deduction =
+                qwen35::prefill::request_kv_growth_deduction(gpu, kv, m.seq_pos + new_tokens.len());
+            match qwen35::prefill::ordinary_prefill_chunk_limit_deducting(
+                gpu, weights, config, dn, kv, deduction,
+            ) {
+                Ok(limit) => limit,
+                Err(e) => {
+                    eprintln!("ar prefill: chunk-limit query failed ({e}); keeping legacy ceiling");
+                    qwen35::prefill_max_batch(gpu)
                 }
-                let adaptive_staging = m
-                    .kv_adaptive
-                    .as_ref()
-                    .is_some_and(|ad| !ad.handoff_complete());
-                let chunk_limit =
-                    qwen_ar_eviction_prefill_chunk_limit(m.seq_pos, window, adaptive_staging);
-                let chunk_len = remaining.len().min(chunk_limit);
-                let (chunk, rest) = remaining.split_at(chunk_len);
-                // Outer eviction-window / maybe_evict cadence is unchanged;
-                // only internal temporary PBS/chunks stay at the historical
-                // memory-safe ceiling (PREFILL_MAX_BATCH=256).
-                if let Err(e) = qwen35::forward_prefill_batch_ordinary_capped(
-                    gpu,
-                    weights,
-                    config,
-                    chunk,
-                    m.seq_pos,
-                    kv,
+            }
+        };
+        let mut start = 0usize;
+        while start < new_tokens.len() {
+            if check_abort(id) {
+                prefill_aborted = true;
+                break;
+            }
+            let remaining = new_tokens.len() - start;
+            let outer = qwen35::prefill::ordinary_serve_prefill_chunk_len(remaining, chunk_max)
+                .unwrap_or(remaining.min(chunk_max).max(1));
+            if ckpt_resume_enabled() {
+                speculative::take_turn_checkpoint_before_chunk(
+                    &mut m.prefill_checkpoints,
                     dn,
-                    scratch,
-                    qwen35::PREFILL_MAX_BATCH,
-                ) {
-                    // G4.7 fail-closed: attested rollback + correlated error
-                    // (no done, no cache store). Terminal identical except
-                    // `rolled_back` is now attested. Drops live bundle borrows
-                    // first (diverging block; intact on fallthrough).
-                    let _ = (kv, dn, weights, config, scratch);
-                    let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
-                    crate::common::emit_fail_closed_error(
-                        stdout,
-                        Some(id),
-                        &qwen_ar_forward_fail_message("forward_prefill_batch", e),
-                        "internal",
-                        false,
-                        &ep,
-                    );
-                    return;
-                }
-                m.seq_pos += chunk_len;
-                crate::common::emit_prefill_progress(
-                    stdout,
-                    id,
-                    Some(active_attempt_id()),
-                    new_tokens.len() - rest.len(),
-                    new_tokens.len(),
+                    kv,
+                    gpu,
+                    m.seq_pos,
+                    outer,
+                    ckpt_max(),
+                    &mut turn,
+                    // Committed conversation + the chunks forwarded so far.
+                    (&m.conversation_tokens, &new_tokens[..start]),
                 );
-                // The eviction gate remains closed until adaptive KV reaches
-                // its explicit handoff point and finishes every transcode.
-                // Drive that transition at the same bounded committed-prefix
-                // boundaries as the ordinary adaptive prefill path, before
-                // asking eviction to observe the gate.
-                if let Some(ad) = m.kv_adaptive.as_mut() {
-                    match ad.maybe_downshift(gpu, kv, m.seq_pos) {
-                        Ok(steps) => {
-                            for step in steps {
-                                eprintln!(
-                                    "[adaptive-kv] downshift @ pos {} (eviction prefill): {:?} (K={:?} V={:?})",
-                                    m.seq_pos, step, ad.cur_k, ad.cur_v
-                                );
-                            }
-                        }
-                        Err(e) => {
+                m.user_turn_ckpt = turn.pin;
+            }
+            let end = (start + outer).min(new_tokens.len());
+            let chunk = &new_tokens[start..end];
+            if let Err(e) = qwen35::forward_prefill_batch_ordinary(
+                gpu, weights, config, chunk, m.seq_pos, kv, dn, scratch,
+            ) {
+                // G4.7 fail-closed: attested rollback + correlated error
+                // (no done, no cache store). Terminal identical except
+                // `rolled_back` is now attested.
+                let _ = (kv, dn, weights, config, scratch);
+                let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
+                crate::common::emit_fail_closed_error(
+                    stdout,
+                    Some(id),
+                    &qwen_ar_forward_fail_message("forward_prefill_batch", e),
+                    "internal",
+                    false,
+                    &ep,
+                );
+                return;
+            }
+            m.seq_pos += chunk.len();
+            crate::common::emit_prefill_progress(
+                stdout,
+                id,
+                Some(active_attempt_id()),
+                end,
+                new_tokens.len(),
+            );
+            // Adaptive KV: downshift BETWEEN prefill chunks the moment the
+            // start-tier (q8/fwht4) buffer fills, so a long prompt can't
+            // overflow the floor-sized buffer before decode begins. The
+            // controller's margin (>= PREFILL_MAX_BATCH) guarantees the chunk
+            // that trips a threshold still wrote in-bounds; this call then
+            // re-quantizes [0, seq_pos) down a tier, freeing room for the next
+            // chunk. `m.kv_adaptive` is disjoint from the live kv/dn borrows.
+            if let Some(ad) = m.kv_adaptive.as_mut() {
+                match ad.maybe_downshift(gpu, kv, m.seq_pos) {
+                    Ok(steps) => {
+                        for step in steps {
                             eprintln!(
-                                "[adaptive-kv] maybe_downshift error @ pos {} (eviction prefill): {:?} — poisoning model",
-                                m.seq_pos, e
+                                "[adaptive-kv] downshift @ pos {} (prefill): {:?} (K={:?} V={:?})",
+                                m.seq_pos, step, ad.cur_k, ad.cur_v
                             );
-                            // G4.7 fail-closed: DN already advanced — full
-                            // attested rollback. Keeps `transient`/retryable;
-                            // only `rolled_back` is now attested.
-                            let _ = (kv, dn, weights, config, scratch);
-                            let ep =
-                                crate::common::production_fail_closed_rollback(m, gpu, None, None);
-                            crate::common::emit_fail_closed_error(
-                                stdout,
-                                Some(id),
-                                &format!(
-                                    "adaptive KV transition failed during eviction prefill: {e}"
-                                ),
-                                "transient",
-                                true,
-                                &ep,
-                            );
-                            return;
                         }
                     }
-                }
-                if let Err(err) = qwen_ar_evict(&mut m.seq_pos, |at| ev.maybe_evict(gpu, kv, at)) {
-                    qwen_ar_eviction_fail_closed(m, gpu, stdout, id, "prefill", &err);
-                    return;
-                }
-                remaining = rest;
-            }
-        } else {
-            // Manually chunk the no-eviction prefill so the abort check fires
-            // between batches. Outer chunks follow the admitted ordinary
-            // ceiling (the same decision the forward below enforces) with the
-            // serve tail rule (1025→1024+1); the inner forward re-admits per
-            // chunk, so a smaller memory admission only narrows chunks, never
-            // breaks them. At the 512 ceiling this is `min(remaining, 512),
-            // identical to the legacy split.
-            // Adaptive-KV keeps the hard `PREFILL_MAX_BATCH` (256) cap so the
-            // controller's margin and maybe_downshift boundaries stay exact.
-            let chunk_max = if m.kv_adaptive.is_some() {
-                qwen35::PREFILL_MAX_BATCH
-            } else {
-                let deduction = qwen35::prefill::request_kv_growth_deduction(
-                    gpu,
-                    kv,
-                    m.seq_pos + new_tokens.len(),
-                );
-                match qwen35::prefill::ordinary_prefill_chunk_limit_deducting(
-                    gpu, weights, config, dn, kv, deduction,
-                ) {
-                    Ok(limit) => limit,
                     Err(e) => {
                         eprintln!(
-                            "ar prefill: chunk-limit query failed ({e}); keeping legacy ceiling"
-                        );
-                        qwen35::prefill_max_batch(gpu)
-                    }
-                }
-            };
-            let mut start = 0usize;
-            while start < new_tokens.len() {
-                if check_abort(id) {
-                    prefill_aborted = true;
-                    break;
-                }
-                let remaining = new_tokens.len() - start;
-                let outer = qwen35::prefill::ordinary_serve_prefill_chunk_len(remaining, chunk_max)
-                    .unwrap_or(remaining.min(chunk_max).max(1));
-                if ckpt_resume_enabled() {
-                    speculative::take_turn_checkpoint_before_chunk(
-                        &mut m.prefill_checkpoints,
-                        dn,
-                        kv,
-                        gpu,
-                        m.seq_pos,
-                        outer,
-                        ckpt_max(),
-                        &mut turn,
-                        // Committed conversation + the chunks forwarded so far.
-                        (&m.conversation_tokens, &new_tokens[..start]),
-                    );
-                    m.user_turn_ckpt = turn.pin;
-                }
-                let end = (start + outer).min(new_tokens.len());
-                let chunk = &new_tokens[start..end];
-                if let Err(e) = qwen35::forward_prefill_batch_ordinary(
-                    gpu, weights, config, chunk, m.seq_pos, kv, dn, scratch,
-                ) {
-                    // G4.7 fail-closed: attested rollback + correlated error
-                    // (no done, no cache store). Terminal identical except
-                    // `rolled_back` is now attested.
-                    let _ = (kv, dn, weights, config, scratch);
-                    let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
-                    crate::common::emit_fail_closed_error(
-                        stdout,
-                        Some(id),
-                        &qwen_ar_forward_fail_message("forward_prefill_batch", e),
-                        "internal",
-                        false,
-                        &ep,
-                    );
-                    return;
-                }
-                m.seq_pos += chunk.len();
-                crate::common::emit_prefill_progress(
-                    stdout,
-                    id,
-                    Some(active_attempt_id()),
-                    end,
-                    new_tokens.len(),
-                );
-                // Adaptive KV: downshift BETWEEN prefill chunks the moment the
-                // start-tier (q8/fwht4) buffer fills, so a long prompt can't
-                // overflow the floor-sized buffer before decode begins. The
-                // controller's margin (>= PREFILL_MAX_BATCH) guarantees the chunk
-                // that trips a threshold still wrote in-bounds; this call then
-                // re-quantizes [0, seq_pos) down a tier, freeing room for the next
-                // chunk. `m.kv_adaptive` is disjoint from the live kv/dn borrows.
-                if let Some(ad) = m.kv_adaptive.as_mut() {
-                    match ad.maybe_downshift(gpu, kv, m.seq_pos) {
-                        Ok(steps) => {
-                            for step in steps {
-                                eprintln!(
-                                    "[adaptive-kv] downshift @ pos {} (prefill): {:?} (K={:?} V={:?})",
-                                    m.seq_pos, step, ad.cur_k, ad.cur_v
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!(
                                 "[adaptive-kv] maybe_downshift error @ pos {} (prefill): {:?} — poisoning model",
                                 m.seq_pos, e
                             );
-                            // G4.7 fail-closed: DN already advanced — full
-                            // attested rollback. Keeps `transient`/retryable;
-                            // only `rolled_back` is now attested.
-                            // maybe_downshift already poisons on partial failure; surface hard.
-                            let _ = (kv, dn, weights, config, scratch);
-                            let ep =
-                                crate::common::production_fail_closed_rollback(m, gpu, None, None);
-                            crate::common::emit_fail_closed_error(
-                                stdout,
-                                Some(id),
-                                &format!("adaptive KV transition failed during prefill: {e}"),
-                                "transient",
-                                true,
-                                &ep,
-                            );
-                            return;
-                        }
+                        // G4.7 fail-closed: DN already advanced — full
+                        // attested rollback. Keeps `transient`/retryable;
+                        // only `rolled_back` is now attested.
+                        // maybe_downshift already poisons on partial failure; surface hard.
+                        let _ = (kv, dn, weights, config, scratch);
+                        let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
+                        crate::common::emit_fail_closed_error(
+                            stdout,
+                            Some(id),
+                            &format!("adaptive KV transition failed during prefill: {e}"),
+                            "transient",
+                            true,
+                            &ep,
+                        );
+                        return;
                     }
                 }
-                // Snapshot the recurrent state every ckpt_interval() tokens so a
-                // later divergent render can resume here instead of cold. `dn`
-                // (&mut m.dn_state) and &mut m.prefill_checkpoints are disjoint
-                // fields, so this composes with the live kv/dn borrows.
-                if ckpt_resume_enabled() {
-                    // Stride snapshot that spares the pinned user-turn snapshot.
-                    speculative::take_turn_checkpoint(
-                        &mut m.prefill_checkpoints,
-                        dn,
-                        kv,
-                        gpu,
-                        m.seq_pos,
-                        ckpt_interval(),
-                        ckpt_max(),
-                        turn,
-                        // Committed conversation + the chunk forwarded so far.
-                        (&m.conversation_tokens, &new_tokens[..end]),
-                    );
-                }
-                start = end;
             }
+            // Snapshot the recurrent state every ckpt_interval() tokens so a
+            // later divergent render can resume here instead of cold. `dn`
+            // (&mut m.dn_state) and &mut m.prefill_checkpoints are disjoint
+            // fields, so this composes with the live kv/dn borrows.
+            if ckpt_resume_enabled() {
+                // Stride snapshot that spares the pinned user-turn snapshot.
+                speculative::take_turn_checkpoint(
+                    &mut m.prefill_checkpoints,
+                    dn,
+                    kv,
+                    gpu,
+                    m.seq_pos,
+                    ckpt_interval(),
+                    ckpt_max(),
+                    turn,
+                    // Committed conversation + the chunk forwarded so far.
+                    (&m.conversation_tokens, &new_tokens[..end]),
+                );
+            }
+            start = end;
         }
         if prefill_aborted {
             // Drop live bundle borrows (kv/dn) before production rollback, which
@@ -5467,7 +5216,7 @@ pub fn generate(
             // Promote at this committed boundary — `next_token` is the
             // pending seed, not yet fed — instead of making the peer wait
             // for this whole generation. Features the batch lane does not
-            // carry (grammar, budget alerts, logprobs, eviction/adaptive KV)
+            // carry (grammar, budget alerts, logprobs, adaptive KV)
             // keep the request here; think budgets/latches continue per lane
             // (`vmm_conv::ThinkCtl`) and stop strings in the moved producer.
             if let Some(permit) = crate::batch::promotion_permit().filter(|_| {
@@ -5475,7 +5224,6 @@ pub fn generate(
                     && !grammar_active
                     && budget_alert_at_tok == 0
                     && logprobs_top_k.is_none()
-                    && m.eviction.is_none()
                     && m.kv_adaptive.is_none()
             }) {
                 let boundary = crate::batch::SingletonBoundary {
@@ -5573,11 +5321,6 @@ pub fn generate(
             // trunk write never committed. Successful path still advances
             // conversation/stream state and emits with the same semantics as
             // before (generated++, push, committed, token text).
-            //
-            // Under eviction, m.seq_pos is the *physical* write slot; we
-            // advance and call maybe_evict immediately so the next write
-            // never overruns physical_cap. compact_offset bookkeeping on
-            // the cache itself keeps RoPE phase correct across evictions.
             if let Err(e) = qwen35::forward_scratch(
                 gpu, weights, config, next_token, m.seq_pos, kv, dn, scratch,
             ) {
@@ -5650,7 +5393,7 @@ pub fn generate(
             // Checkpoint during decode too, so a long generated turn (e.g. a
             // big code emission) can be resumed mid-region if the NEXT turn's
             // render diverges within it — without replaying the whole
-            // generation. No-op under eviction (compact_offset != 0).
+            // generation.
             if ckpt_resume_enabled() {
                 speculative::take_dn_checkpoint_pinned(
                     &mut m.prefill_checkpoints,
@@ -5662,18 +5405,9 @@ pub fn generate(
                     ckpt_max(),
                     m.user_turn_ckpt,
                     // `conversation_tokens` IS the forwarded stream here (each
-                    // token is committed as it is forwarded); under eviction
-                    // `seq_pos` is physical, the lengths differ and the
-                    // snapshot stays unattested.
+                    // token is committed as it is forwarded).
                     (&m.conversation_tokens, &[]),
                 );
-            }
-            if let Err(err) = qwen_ar_evict(&mut m.seq_pos, |at| match &m.eviction {
-                Some(ev) => ev.maybe_evict(gpu, kv, at),
-                None => Ok(None),
-            }) {
-                qwen_ar_eviction_fail_closed(m, gpu, stdout, id, "decode", &err);
-                return;
             }
             // Adaptive KV: downshift K/V precision as seq_pos crosses capacity
             // thresholds. `kv` (=m.kv_cache) and m.kv_adaptive are distinct
@@ -5843,7 +5577,6 @@ pub fn generate(
                         tokenizer.decode_token_bytes_into(t, &mut stream_bytes);
                         let new_bytes = &stream_bytes[fed..];
                         let elapsed_ms = t0.elapsed().as_millis() as u64;
-                        let mut evict_failure = None;
                         let classified = semantic.commit_and_classify(
                             stdout,
                             t,
@@ -5855,24 +5588,12 @@ pub fn generate(
                                     t,
                                     QwenArRawCommitDisposition::ClassifiedVisible,
                                 );
-                                if let Err(err) =
-                                    qwen_ar_evict(&mut m.seq_pos, |at| match &m.eviction {
-                                        Some(ev) => ev.maybe_evict(gpu, kv, at),
-                                        None => Ok(None),
-                                    })
-                                {
-                                    evict_failure = Some(err);
-                                }
                                 (pos, new_bytes)
                             },
                             |pos, out| {
                                 crate::common::emit_committed_event(out, id, t, pos, elapsed_ms);
                             },
                         );
-                        if let Some(err) = evict_failure {
-                            qwen_ar_eviction_fail_closed(m, gpu, stdout, id, "think close", &err);
-                            return;
-                        }
                         match classified {
                             Ok(true) => {
                                 generated += 1;
@@ -6003,10 +5724,7 @@ pub fn generate(
                 let nudge_len = nudge_tokens.len().min(budget_left);
                 // KV headroom check — don't run past physical_cap. If we don't
                 // have room for the clipped nudge, skip entirely rather than
-                // emit a partial nudge that poisons the trajectory. Under
-                // eviction the physical check is trivially satisfied (budget
-                // always holds post-evict), but we still respect the check for
-                // the non-eviction path.
+                // emit a partial nudge that poisons the trajectory.
                 let need_kv = m
                     .seq_pos
                     .saturating_add(nudge_len)
@@ -6016,7 +5734,7 @@ pub fn generate(
                             .saturating_sub(nudge_len),
                     )
                     .saturating_add(nl.len());
-                if nudge_len > 0 && (m.eviction.is_some() || need_kv <= m.physical_cap) {
+                if nudge_len > 0 && need_kv <= m.physical_cap {
                     for &tok in &nudge_tokens[..nudge_len] {
                         // KV before emit: budget-alert injection must not stream
                         // a token if trunk VMM/forward fails mid-nudge.
@@ -6046,7 +5764,6 @@ pub fn generate(
                         // so think markers never leak on the contract-v2 wire.
                         let new_bytes = &stream_bytes[fed..];
                         let elapsed_ms = t0.elapsed().as_millis() as u64;
-                        let mut evict_failure = None;
                         let classified = semantic.commit_and_classify(
                             stdout,
                             tok,
@@ -6058,24 +5775,12 @@ pub fn generate(
                                     tok,
                                     QwenArRawCommitDisposition::ClassifiedVisible,
                                 );
-                                if let Err(err) =
-                                    qwen_ar_evict(&mut m.seq_pos, |at| match &m.eviction {
-                                        Some(ev) => ev.maybe_evict(gpu, kv, at),
-                                        None => Ok(None),
-                                    })
-                                {
-                                    evict_failure = Some(err);
-                                }
                                 (pos, new_bytes)
                             },
                             |pos, out| {
                                 crate::common::emit_committed_event(out, id, tok, pos, elapsed_ms);
                             },
                         );
-                        if let Some(err) = evict_failure {
-                            qwen_ar_eviction_fail_closed(m, gpu, stdout, id, "budget alert", &err);
-                            return;
-                        }
                         match classified {
                             Ok(true) => {
                                 generated += 1;
@@ -6187,8 +5892,7 @@ pub fn generate(
             }
         }
         // m.seq_pos is already the "next physical write slot" — advanced
-        // per-token in the decode loop above, and evicted back down to
-        // `budget` whenever maybe_evict fired. No post-loop fix-up needed.
+        // per-token in the decode loop above. No post-loop fix-up needed.
 
         // ChatML requires \n after <|im_end|>. Run it through forward so KV cache
         // and DeltaNet state stay in sync with seq_pos. Trailer tokens use the same
@@ -6232,13 +5936,6 @@ pub fn generate(
                         |_pos, _out| {},
                     )
                     .expect("hidden commit never classifies");
-                if let Err(err) = qwen_ar_evict(&mut m.seq_pos, |at| match &m.eviction {
-                    Some(ev) => ev.maybe_evict(gpu, kv, at),
-                    None => Ok(None),
-                }) {
-                    qwen_ar_eviction_fail_closed(m, gpu, stdout, id, "trailer", &err);
-                    return;
-                }
             }
         }
 
@@ -6383,7 +6080,6 @@ pub fn generate(
         emit_active_route_done(stdout, id, &pending_done);
     } else {
         // LLaMA path -- multi-turn aware
-        let has_eviction = m.eviction.is_some();
         let b = m
             .state
             .as_mut()
@@ -6401,7 +6097,6 @@ pub fn generate(
             &gpu.arch,
             hipfire_runtime::config::get().prefill_batched,
             kv.quant_q8,
-            has_eviction,
             new_tokens.len(),
         );
         let (mut next_token, sampled_rng) = if batched_prefill {

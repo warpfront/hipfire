@@ -44,7 +44,7 @@ use hipfire_arch_qwen35::speculative::DeltaNetSnapshot;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::kv_backend::KvBackend;
 use hipfire_runtime::llama;
-use hipfire_runtime::loader_api::{CaskConfig, LoadCtx, ModelSource, SequenceHint, SpecLoadCfg};
+use hipfire_runtime::loader_api::{LoadCtx, ModelSource, SequenceHint, SpecLoadCfg};
 use hipfire_runtime::tokenizer::Tokenizer;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::fmt::Write as _;
@@ -201,7 +201,6 @@ fn run() -> R<()> {
         return Err(format!("gfx1201 required, got {}", gpu.arch).into());
     }
     let src = ModelSource::from_path(&model)?;
-    let cask = CaskConfig::default();
     let mut lc = LoadCtx {
         path: &model,
         max_seq: 4096,
@@ -224,7 +223,6 @@ fn run() -> R<()> {
         kv_backend: KvBackend::default(),
         kv_adaptive_override: None,
         state_quant_override: None,
-        cask: &cask,
         pp: 1,
         pp_layer_counts: None,
         admitted_mesh: None,

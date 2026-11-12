@@ -586,7 +586,6 @@ struct ArmResult {
 }
 
 fn load_loaded_model(args: &Args, gpu: &mut Gpu) -> R<hipfire_loader::LoadedModel> {
-    let cask = hipfire_runtime::loader_api::CaskConfig::default();
     let spec = hipfire_runtime::loader_api::SpecLoadCfg::default();
     hipfire_loader::load_model(
         &args.model_path(),
@@ -595,7 +594,6 @@ fn load_loaded_model(args: &Args, gpu: &mut Gpu) -> R<hipfire_loader::LoadedMode
         None,
         None,
         None,
-        &cask,
         1,
         spec,
         gpu,

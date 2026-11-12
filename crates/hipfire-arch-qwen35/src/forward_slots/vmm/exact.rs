@@ -1124,7 +1124,6 @@ pub(super) fn decode(
                     && program[i].kind == SuperOpKind::Attend
                     && stage_for == Some(0)
                     && hybrid::fused_attention_prep(gpu, &dims)
-                    && !hipfire_runtime::triattn::tap_enabled()
                     && epilogue_admitted
                     && rows.iter().all(|&(slot, _)| {
                         st.slots[slot]

@@ -15,7 +15,7 @@ use hipfire_config::{
     ConfigValue,
 };
 
-use super::{deprecated_status, not_editable_status, App, EditState, PendingEnum};
+use super::{not_editable_status, App, EditState, PendingEnum};
 use crate::hipfire::{
     dashboard::LoadedConfig,
     knobs::PROMPT_PROCESSING_ID,
@@ -580,11 +580,6 @@ impl App {
     }
 
     fn change_key_row(&mut self, row: &SettingsRow, key: &str, forward: bool) {
-        if row.deprecated {
-            self.discard_settings_preview();
-            self.last_reload = deprecated_status(key);
-            return;
-        }
         match writer::field_spec(key).map(|spec| spec.kind) {
             Some(FieldKind::Enum(_)) => {
                 // Cycle from the current PREVIEW when mid-preview on this row,
@@ -655,10 +650,6 @@ impl App {
             }
             RowId::Key(key) => key.clone(),
         };
-        if row.deprecated {
-            self.last_reload = deprecated_status(&key);
-            return;
-        }
         match writer::field_kind(&key) {
             Some(FieldKind::Int) | Some(FieldKind::Float) | Some(FieldKind::FreeStr { .. }) => {
                 let buffer = value_string(&row.resolved);
@@ -1349,46 +1340,6 @@ mod tests {
         press(&mut fixture.app, KeyCode::Delete);
         let edit = fixture.app.settings_edit.as_ref().unwrap();
         assert_eq!((edit.buffer.as_str(), edit.cursor), ("3268", 2));
-    }
-
-    #[test]
-    fn deprecated_rows_are_read_only_but_resettable() {
-        let mut fixture = FixtureBuilder::new("gfx1201").build();
-        let before = fixture.config_bytes();
-        for legacy in ["cask", "cask_budget"] {
-            let key = field(legacy).expect("deprecated key").key;
-            select_key(&mut fixture.app, key);
-            for code in [
-                KeyCode::Left,
-                KeyCode::Right,
-                KeyCode::Char(' '),
-                KeyCode::Enter,
-            ] {
-                fixture.app.last_reload.clear();
-                press(&mut fixture.app, code);
-                assert!(
-                    fixture.app.last_reload.contains("deprecated"),
-                    "{key} {code:?}: {}",
-                    fixture.app.last_reload
-                );
-                assert!(fixture.app.settings_pending.is_none());
-                assert!(fixture.app.settings_edit.is_none());
-            }
-        }
-        assert_eq!(fixture.config_bytes(), before);
-
-        // Read-only does not mean stuck: Del removes an existing value.
-        std::fs::write(
-            fixture.config_path(),
-            "schema_version = 1\n[memory.cask]\nenabled = true\n",
-        )
-        .unwrap();
-        fixture.app.rebuild_settings();
-        let key = field("cask").unwrap().key;
-        select_key(&mut fixture.app, key);
-        assert!(fixture.app.selected_row().unwrap().origin.marked());
-        press(&mut fixture.app, KeyCode::Delete);
-        assert_eq!(global(&fixture).get(key), None);
     }
 
     #[test]

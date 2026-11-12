@@ -907,7 +907,6 @@ fn run() -> R<()> {
     // Daemon parity: keep host-mapped expert memory out of reclaim before the first HIP call (KFD userptr eviction stalls, ROCm/rocm-systems#12528).
     hipfire_loader::prepare_host_memory_for(Path::new(&args.model));
     let mut gpu = Gpu::init().map_err(|x| format!("Gpu::init: {x:?}"))?;
-    let cask = hipfire_runtime::loader_api::CaskConfig::default();
     let mut spec_cfg = hipfire_runtime::loader_api::SpecLoadCfg::default();
     if args.mtp.is_some() {
         spec_cfg.mtp = Some(args.dflash.is_none());
@@ -923,7 +922,6 @@ fn run() -> R<()> {
         args.kv_mode.as_deref(),
         None,
         args.state_quant.as_deref(),
-        &cask,
         args.pp,
         spec_cfg,
         &mut gpu,

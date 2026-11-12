@@ -85,7 +85,7 @@ The `qwen3.6:35b-a3b*` entries and both `ornith-1.5:35b-a3b*` entries carry an `
 
 | Tag | File | Size GB | Min VRAM | Default KV | Notes |
 |---|---|---:|---:|---|---|
-| `qwen3.6:27b` | `qwen3.6-27b.mq4` | 15.0 | 16 | q8 | Registry also lists a `triattn` sidecar (deprecated CASK, removal in 0.5.0: `pull` fetches it, nothing attaches it by default); template not effort-native — `reasoning_effort` dropped+warned, never converted to a cap |
+| `qwen3.6:27b` | `qwen3.6-27b.mq4` | 15.0 | 16 | q8 | Template not effort-native — `reasoning_effort` dropped+warned, never converted to a cap |
 | `qwen3.6:27b-mq3` | `qwen3.6-27b.mq3` | 10.7 | 12 | | MQ3 alpha |
 
 ### Qwen 3.8 dense
@@ -713,7 +713,7 @@ With `HIPFIRE_GGUF_NATIVE=1`, `eval_hipfire`, `bench_qwen35_mq4` and `gguf_nativ
 ```text
 ~/.hipfire/models/
   <registry file names>
-  optional sibling drafts (DFlash / DSpark / MTP / vision sidecars); legacy .triattn*.bin sidecars (CASK, deprecated since 0.4.0, removal in 0.5.0)
+  optional sibling drafts (DFlash / DSpark / MTP / vision sidecars)
 ```
 
 Extension hints (loader recognizes several): `.mq4`, `.mq6`, `.mq4p`, `.mq4r`, `.mq2`, `.mq2lloyd`, `.mq2r`, `.mfp4`, `.hf4`, `.hf6`, `.hfq`, `.q8`, and related graded names as produced by quant tooling. Exact dtype routing is loader/kernel source, not this table. Selecting the MQ4R and DeepSeek V4 MQ2R routes by file extension is **deprecated since 0.4.0, removal in 0.5.0** (0.5.0 selects by HFQ metadata; no runtime warning).

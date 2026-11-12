@@ -527,15 +527,6 @@ tensor size, target format, calibration, and the thread cap, so no fixed numbers
 are given; run on a small model first to gauge cost, and lower the thread cap if
 the machine becomes memory-bandwidth constrained.
 
-## Deprecated: CASK sidecar (removal in 0.5.0)
-
-CASK / TriAttention eviction is deprecated and will be removed in 0.5.0; it is
-not a post-quantize step and not supported. Until then,
-`hipfire sidecar-gen <model> --corpus <file>` still writes
-`<model>.triattn.bin` (with a deprecation warning); nothing
-attaches it unless `cask_sidecar` or `cask_auto_attach=true` is set. See
-[CONFIG.md](CONFIG.md).
-
 ## Related
 
 - Formats, KV, QuantType IDs: [QUANTIZATION.md](QUANTIZATION.md)

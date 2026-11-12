@@ -1230,19 +1230,16 @@ class AstreaTests(unittest.TestCase):
             ],
         )
 
-    def test_kv_profile_records_asym_triattn_turbo_and_rotor_candidates(self):
+    def test_kv_profile_records_asym_turbo_and_rotor_candidates(self):
         astrea = load_astrea()
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             model = root / "synthetic.mq4.hfq"
-            triattn = root / "synthetic.mq4.hfq.triattn.bin"
             self.write_minimal_hfq(model)
-            triattn.write_bytes(b"TRIA" + b"\0" * 32)
 
             profile = astrea.build_kv_profile(
                 model=str(model),
-                modes=["q8", "asym3", "triattn", "turbo3", "rotor"],
-                triattn=str(triattn),
+                modes=["q8", "asym3", "turbo3", "rotor"],
                 model_family="qwen3.5-9b",
                 profile_id="kv-profile-smoke",
             )
@@ -1250,27 +1247,23 @@ class AstreaTests(unittest.TestCase):
         self.assertEqual(profile["schema"], "hipfire.astrea.kv_profile.v0")
         self.assertEqual(profile["profile_id"], "kv-profile-smoke")
         self.assertEqual(profile["baseline_mode"], "asym3")
-        self.assertTrue(profile["triattn"]["exists"])
         self.assertEqual(profile["modes"]["asym3"]["status"], "implemented")
         self.assertEqual(profile["modes"]["turbo3"]["status"], "research_candidate")
         self.assertEqual(profile["modes"]["rotor"]["family"], "rotor")
         self.assertIn("DFlash", " ".join(profile["quality_gates"]))
         self.assertIn("atlas", profile["next_step"].lower())
 
-    def test_bundle_plan_keeps_triattn_and_kv_policy_inside_model_package(self):
+    def test_bundle_plan_keeps_kv_policy_inside_model_package(self):
         astrea = load_astrea()
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             model = root / "synthetic.mq4.hfq"
-            triattn = root / "synthetic.mq4.hfq.triattn.bin"
             self.write_minimal_hfq(model)
-            triattn.write_bytes(b"TRIA" + b"\0" * 32)
 
             plan = astrea.build_bundle_plan(
                 model=str(model),
                 output=str(root / "synthetic.mq4.astrea.hfq"),
-                include=["weights", "kv-policy", "triattn"],
-                triattn=str(triattn),
+                include=["weights", "kv-policy"],
                 policy_id="combined-policy-smoke",
                 bundle_id="bundle-plan-smoke",
             )
@@ -1280,8 +1273,6 @@ class AstreaTests(unittest.TestCase):
         self.assertFalse(plan["external_sidecars_target"])
         self.assertEqual(plan["container"]["format"], "hfq-package-v0")
         self.assertIn("kv.policy", plan["sections"])
-        self.assertIn("triattn.centers", plan["sections"])
-        self.assertEqual(plan["sections"]["triattn.centers"]["source"]["path"], str(triattn))
         self.assertIn("loader", " ".join(plan["deferred_runtime_work"]))
 
     def test_cli_policy_emits_json(self):
@@ -1340,9 +1331,7 @@ class AstreaTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             model = root / "synthetic.mq4.hfq"
-            triattn = root / "synthetic.mq4.hfq.triattn.bin"
             self.write_minimal_hfq(model)
-            triattn.write_bytes(b"TRIA" + b"\0" * 32)
 
             code, stdout, stderr = astrea.main_for_test(
                 [
@@ -1353,8 +1342,6 @@ class AstreaTests(unittest.TestCase):
                     "asym3",
                     "--mode",
                     "turbo3",
-                    "--triattn",
-                    str(triattn),
                     "--profile-id",
                     "kv-cli-smoke",
                 ]
@@ -1373,10 +1360,6 @@ class AstreaTests(unittest.TestCase):
                     str(root / "out.hfq"),
                     "--include",
                     "kv-policy",
-                    "--include",
-                    "triattn",
-                    "--triattn",
-                    str(triattn),
                     "--bundle-id",
                     "bundle-cli-smoke",
                 ]
@@ -1384,7 +1367,7 @@ class AstreaTests(unittest.TestCase):
             self.assertEqual(code, 0, stderr)
             bundle = json.loads(stdout)
             self.assertEqual(bundle["schema"], "hipfire.astrea.bundle_plan.v0")
-            self.assertIn("triattn.centers", bundle["sections"])
+            self.assertIn("kv.policy", bundle["sections"])
 
     def test_metrics_ingests_kld_reduce_rows_and_computes_q8_floor_recovery(self):
         astrea = load_astrea()

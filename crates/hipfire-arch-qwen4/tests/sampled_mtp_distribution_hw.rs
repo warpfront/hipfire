@@ -1825,7 +1825,6 @@ impl PpLoaded {
             .ok_or_else(|| format!("{} is not valid UTF-8", model.display()))?;
         let mut gpu = Gpu::init().map_err(|e| e.to_string())?;
         let (state_request, _) = hw_identity::gdn_test_state_quant()?;
-        let cask = hipfire_runtime::loader_api::CaskConfig::default();
         let mut spec = hipfire_runtime::loader_api::SpecLoadCfg::default();
         // The native head is attached on every arm so placement and reserves
         // are identical across the arms of one comparison.
@@ -1837,7 +1836,6 @@ impl PpLoaded {
             None,
             None,
             Some(state_request),
-            &cask,
             PP_DEGREE,
             spec,
             &mut gpu,

@@ -22,9 +22,6 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen2Bundle, S
             "DFlash not supported on arch_id=7 (qwen2 bring-up). Reload without a draft.".into(),
         );
     }
-    if ctx.cask.sidecar.is_some() {
-        return Err("CASK eviction not supported on arch_id=7 (qwen2 bring-up). Reload without --cask-sidecar.".into());
-    }
     let (config, weights) = match src {
         ModelSource::Hfq(mut hfq) => {
             let config = <Qwen2 as Architecture>::config_from_hfq(&hfq)?;

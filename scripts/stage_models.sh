@@ -104,7 +104,6 @@ done
 log "────────────────────────────────────────────"
 if [ ${#FAILED[@]} -eq 0 ]; then
     log "all ${#MATRIX[@]} model/format pairs staged OK"
-    log "next: bash calibrate_multigpu.sh --models <comma-separated> --corpus <corpus.txt>"
 else
     log "FAILURES: ${FAILED[*]}"
     exit 1

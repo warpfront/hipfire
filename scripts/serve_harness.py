@@ -2513,7 +2513,7 @@ def spawn_serve(cfg, home, log):
                HIPFIRE_DAEMON_BIN=os.environ.get(
                    "HIPFIRE_DAEMON_BIN",
                    os.path.join(REPO, "target", "release", "daemon" + (".exe" if os.name == "nt" else ""))),
-               HIPFIRE_KV_MODE=cfg["kv"], HIPFIRE_CASK_OFF="1", HIPFIRE_MODEL=cfg["model"])
+               HIPFIRE_KV_MODE=cfg["kv"], HIPFIRE_MODEL=cfg["model"])
     # Sampled native MTP (`speculation.mtp_sampled`) is on by default; a parent
     # HIPFIRE_MTP_SAMPLED=0 passes through as the opt-out.
     if cfg["mtp"] == "on":

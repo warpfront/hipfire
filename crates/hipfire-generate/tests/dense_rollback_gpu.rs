@@ -36,7 +36,7 @@ use hipfire_generate::common::{
     arm_generation_fault_after_first_decode, arm_generation_fault_after_prefill,
     emit_fail_closed_error, fail_closed_device_sync, fail_closed_epilogue_after_sync,
 };
-use hipfire_runtime::loader_api::{CaskConfig, SpecLoadCfg};
+use hipfire_runtime::loader_api::SpecLoadCfg;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -133,7 +133,6 @@ fn dense_load(gpu: &mut rdna_compute::Gpu, path: &PathBuf) -> hipfire_loader::Lo
         None,
         None,
         None,
-        &CaskConfig::default(),
         1,
         dense_spec_off(),
         gpu,
@@ -567,7 +566,6 @@ fn glimmer_dflash_request_that_fits_max_seq_completes() {
         None,
         None,
         None,
-        &CaskConfig::default(),
         1,
         spec,
         &mut gpu,

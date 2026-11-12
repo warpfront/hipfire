@@ -27,7 +27,7 @@ use hipfire_arch_qwen35::{free_qwen35_bundle, load_qwen35_bundle, shared_weights
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::kv_backend::KvBackend;
 use hipfire_runtime::llama;
-use hipfire_runtime::loader_api::{CaskConfig, LoadCtx, ModelSource, SpecLoadCfg};
+use hipfire_runtime::loader_api::{LoadCtx, ModelSource, SpecLoadCfg};
 use hipfire_runtime::tokenizer::Tokenizer;
 use rdna_compute::{Gpu, GpuTensor};
 use serde_json::{json, Map, Value};
@@ -553,7 +553,6 @@ fn main() -> Result<()> {
 /// Production carrier load at an explicit (non-automatic) `max_seq`, PP=1,
 /// no MTP/drafter/vision. The weight route follows the environment.
 fn load_bundle(model: &str, max_seq: usize, gpu: &mut Gpu) -> Result<Qwen35Bundle> {
-    let cask = CaskConfig::default();
     let qwen_default_q8 = !matches!(
         hipfire_config::developer_var("HIPFIRE_QWEN_KV_DEFAULT_Q8")
             .ok()
@@ -577,7 +576,6 @@ fn load_bundle(model: &str, max_seq: usize, gpu: &mut Gpu) -> Result<Qwen35Bundl
         kv_backend: KvBackend::default(),
         kv_adaptive_override: None,
         state_quant_override: None,
-        cask: &cask,
         pp: 1,
         pp_layer_counts: None,
         admitted_mesh: None,

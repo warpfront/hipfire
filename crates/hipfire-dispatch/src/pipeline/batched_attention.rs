@@ -76,7 +76,7 @@ impl KvView<'_> {
     }
 }
 
-/// Pre-RoPE Q/K observer (TriAttention): `(gpu, layer, q, k, rows)` over the
+/// Pre-RoPE Q/K observer (diagnostic tap): `(gpu, layer, q, k, rows)` over the
 /// normed, un-rotated `[rows, heads, head_dim]` batches. Its presence keeps
 /// the unfused prep so Q/K exist in memory before RoPE.
 pub type BatchedAttentionTap<'a> =
@@ -1024,7 +1024,7 @@ pub fn batch_chunk_full_attn_prepare(
     // S6-fa-prep-q8-pair: exact gfx1100 fold of steps 3-5 (deinterleave +
     // Q/K rmsnorm + half-split RoPE, 4 launches) into one
     // qwen35_fa_prep_batched_gfx1100 launch. Bit-exact (same reduction tree,
-    // same RoPE expression/phase, explicit old-TU FMA formation); the triattn
+    // same RoPE expression/phase, explicit old-TU FMA formation); the diagnostic
     // tap needs pre-RoPE Q, legacy interleaved RoPE needs its own kernel, and
     // every other shape/arch/ctx keeps the old path. Admitted for DFlash
     // chain verify and, since gfx11-1, ordinary prefill (DflashFusionCtx::Off:
@@ -1141,7 +1141,7 @@ pub fn batch_chunk_full_attn_prepare(
         )?;
     } else {
         // Fused deinterleave + Q-rmsnorm — one launch instead of two, no Q
-        // global-memory round trip. K-norm, triattn tap, and RoPE below are
+        // global-memory round trip. K-norm, the diagnostic tap, and RoPE below are
         // unchanged.
         fa_prep_unfused_qk_norm(gpu, layer, config, pbs, n)?;
 
@@ -1606,7 +1606,7 @@ fn fa_pm_kv_keys(codec: FaPrefillKvCodec) -> (KernelKey, KernelKey) {
 /// PM + Q-prep flags (`fa_prefill_pm_flag` / `fa_prefill_pm_qprep_flag`: resolved per
 /// codec, so FP8 honors the FP8 opt-in and Q8 the Q8 qualification) and the raw gfx1201
 /// inventory with H16/KV2/D256 and a 64-wide rotary (`fa_prefill_pm_qprep_admitted`,
-/// which refuses capture and replay recording and the legacy interleaved RoPE), no triattn
+/// which refuses capture and replay recording and the legacy interleaved RoPE), no diagnostic
 /// tap (it needs the pre-RoPE F32 Q this route never materializes), and a KV tier plan that
 /// is exactly the codec-paired full-causal write + masked attend pair ([`fa_pm_kv_keys`])
 /// the PM direct attention serves (no window, no givens). The dense wrapper additionally

@@ -1088,11 +1088,6 @@ module	kv_cache_write_q4	non-core-family	Non-core family route: Qwen2/Llama; rdn
 module	kv_cache_write_q8	no-caller	No production caller; only definitions, tests/examples or an unreachable launcher branch remain; rdna-compute/src/attention.rs:16464
 module	kv_cache_write_q8_0_batched_vmm	config-opt-in	Non-default configuration: attention.rs / serve.vmm_batch; rdna-compute/src/attention.rs:4172
 module	kv_cache_write_q8_0_ring	non-core-family	Non-core family route: Muse Glimmer, Qwen2/Llama, LFM2; rdna-compute/src/attention.rs:2819
-module	kv_compact_gather	config-opt-in	Non-default configuration: attention.rs / memory.cask.sidecar; rdna-compute/src/attention.rs:16229
-module	kv_fold_asym2	config-opt-in	Non-default configuration: attention.rs / memory.cask.sidecar; rdna-compute/src/attention.rs:16424
-module	kv_fold_asym3	config-opt-in	Non-default configuration: attention.rs / memory.cask.sidecar; rdna-compute/src/attention.rs:16330
-module	kv_fold_asym4	config-opt-in	Non-default configuration: attention.rs / memory.cask.sidecar; rdna-compute/src/attention.rs:16375
-module	kv_fold_q8	config-opt-in	Non-default configuration: attention.rs / memory.cask.sidecar; rdna-compute/src/attention.rs:16283
 module	kv_transcode_k_fwht4_to_fwht2	config-opt-in	Non-default configuration: attention.rs / memory.kv_adaptive; rdna-compute/src/attention.rs:12378
 module	kv_transcode_k_fwht4_to_fwht3	config-opt-in	Non-default configuration: attention.rs / memory.kv_adaptive; rdna-compute/src/attention.rs:12421
 module	kv_transcode_v_lloyd_down	config-opt-in	Non-default configuration: attention.rs / memory.kv_adaptive; rdna-compute/src/attention.rs:12333
@@ -1194,12 +1189,6 @@ module	tp_graph_signal_store_gfx1201	non-core-family	Non-core family route: Deep
 module	tp_graph_signal_wait2_gfx1201	non-core-family	Non-core family route: DeepSeek4; rdna-compute/src/attention.rs:20690
 module	tp_graph_signal_wait3_gfx1201	non-core-family	Non-core family route: DeepSeek4; rdna-compute/src/attention.rs:20740
 module	transpose_f32	config-opt-in	Non-default configuration: vision.mode / vision.rs; qwen35_vl.rs:968
-module	triattn_accumulate	no-caller	No production caller; only definitions, tests/examples or an unreachable launcher branch remain; rdna-compute/src/attention.rs:965
-module	triattn_score_asym2	config-opt-in	Non-default configuration: attention.rs / memory.cask.sidecar; rdna-compute/src/attention.rs:16043
-module	triattn_score_asym3	config-opt-in	Non-default configuration: attention.rs / memory.cask.sidecar; rdna-compute/src/attention.rs:16170
-module	triattn_score_asym4	config-opt-in	Non-default configuration: attention.rs / memory.cask.sidecar; rdna-compute/src/attention.rs:16106
-module	triattn_score_fwht	config-opt-in	Non-default configuration: attention.rs / memory.cask.sidecar; rdna-compute/src/attention.rs:15978
-module	triattn_score_q8	config-opt-in	Non-default configuration: attention.rs / memory.cask.sidecar; rdna-compute/src/attention.rs:15917
 module	vae_attn	non-core-family	Non-core family route: Flux/VAE; hipfire-arch-diffusion/src/vae_gpu.rs:1404
 module	vae_conv1x1	non-core-family	Non-core family route: Flux/VAE; hipfire-arch-diffusion/src/vae_gpu.rs:1216
 module	vae_conv3x3	non-core-family	Non-core family route: Flux/VAE; hipfire-arch-diffusion/src/vae_gpu.rs:1049

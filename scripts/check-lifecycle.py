@@ -47,26 +47,14 @@ ENV_END = "<!-- env-inventory:end -->"
 # schema default each must keep. Every other deprecated field must be a tuning
 # knob in DEPRECATED_TUNING (read only once one of these gates is on).
 DEPRECATED_GATES = {
-    "memory.cask.sidecar": 'DefaultValue::String("")',
-    "memory.cask.enabled": "DefaultValue::Bool(false)",
-    "memory.cask.auto_attach": "DefaultValue::Bool(false)",
     "diagnostic.replay.gfx1151_cu_count": 'DefaultValue::String("all")',
 }
-DEPRECATED_TUNING = {
-    "memory.cask.budget",
-    "memory.cask.beta",
-    "memory.cask.handoff_tokens",
-    "memory.cask.core_fraction",
-    "memory.cask.fold",
-}
+DEPRECATED_TUNING: set[str] = set()
 # Deprecated env knobs that are not schema aliases (developer namespace or
 # unread harness exports). Their unset default is the supported behaviour.
 DEPRECATED_ENV = {
     "HIPFIRE_DFLASH_CTX_CAP": "legacy contiguous DFlash cap",
-    "HIPFIRE_CASK_OFF": "unread CASK harness export",
 }
-# Any variable named for a deprecated feature is deprecated with it.
-DEPRECATED_ENV_NAME = re.compile(r"CASK|TRIATT")
 # Env vars that stay supported but have deprecated VALUES.
 ENV_VALUE_NOTES = {
     "HIPFIRE_DFLASH_WINDOW": "`0` (legacy contiguous DFlash) deprecated, removal 0.5.0",
@@ -75,7 +63,7 @@ ENV_VALUE_NOTES = {
     "HIPFIRE_GFX1151_GATE_UP_HYBRID_BUFFER": "`1` refused (fails closed to the default route): AMD clang 24 miscompiles the kernel (`.y` vector-lane bit-casts read lane 0)",
 }
 # Developer-namespace spellings of deprecated env knobs (for TOML profiles).
-DEPRECATED_DEVELOPER_KEYS = {"dflash_ctx_cap", "cask_off"}
+DEPRECATED_DEVELOPER_KEYS = {"dflash_ctx_cap"}
 # Deprecated code that the default path still reaches, by explicit decision:
 # it is the only way to select the route today, so it warns nowhere.
 DEFAULT_REACHED_ALLOWLIST = {
@@ -391,7 +379,7 @@ def is_product(path: str) -> bool:
 
 def env_status(name: str, paths: list[str], alias: dict[str, dict], boot: set[str], dep: set[str]) -> str:
     field = alias.get(name)
-    if name in DEPRECATED_ENV or DEPRECATED_ENV_NAME.search(name) or (field and field["deprecated"]):
+    if name in DEPRECATED_ENV or (field and field["deprecated"]):
         status = "deprecated"
     elif paths and all(p in dep or any(p.startswith(d) for d in dep if d.endswith("/")) for p in paths):
         status = "deprecated"

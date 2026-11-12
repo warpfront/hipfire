@@ -253,7 +253,7 @@ pub fn spec_step_dflash_mtp(
         }
     }
 
-    // Positions (no eviction support — this is a v1 path, no FlashCASK).
+    // Positions.
     let effective_ctx_len = draft_scratch.thlog.abs_positions().len().min(position);
     let co = target.kv_cache.compact_offset as i32;
     let positions_q: Vec<i32> =

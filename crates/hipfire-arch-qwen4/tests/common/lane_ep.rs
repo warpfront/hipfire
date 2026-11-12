@@ -799,7 +799,6 @@ fn load_ep(
         .to_str()
         .ok_or_else(|| format!("{} is not valid UTF-8", model.display()))?;
     let (state_request, _) = hw_identity::gdn_test_state_quant()?;
-    let cask = hipfire_runtime::loader_api::CaskConfig::default();
     let spec = hipfire_runtime::loader_api::SpecLoadCfg {
         // The native head is attached only for the arms that decode with it.
         mtp: kind.mesh().then_some(true),
@@ -822,7 +821,6 @@ fn load_ep(
             kv_v: None,
             qwen_default_q8: qwen_default_q8_enabled(),
             kv_adaptive: None,
-            cask: Some(&cask),
             deepseek4_heterogeneous: false,
             vmm_runtime_refusal: gpu.vmm_runtime_refusal().as_deref(),
             free_vram_bytes: gpu.device_mem_info().ok().map(|(free, _)| free),
@@ -830,7 +828,6 @@ fn load_ep(
         SourceAdmissionOptions {
             spec,
             kv_adaptive: qwen4_kv_adaptive_requested(None),
-            cask: cask.sidecar.is_some(),
             ..Default::default()
         },
     )?;
@@ -858,7 +855,6 @@ fn load_ep(
         None,
         None,
         Some(state_request),
-        &cask,
         1,
         spec,
         gpu,

@@ -78,14 +78,6 @@ cache selection.
   direct-KMD compute, not wired into serving) — plus `hipfire-ds4-parent`
   (provisional).
 
-### CASK status
-
-CASK / TriAttention KV eviction (FlashCASK, `memory.cask.*`, `hipfire
-sidecar-gen`, `dflash_spec_demo --cask-*`) is deprecated since 0.4.0 and will
-be removed in 0.5.0. It still loads, but using it prints a deprecation
-warning and it is not supported; do not treat it as a production element,
-recommendation, acceptance route, or basis for a current performance claim.
-
 ## Building, testing & gates
 
 ```

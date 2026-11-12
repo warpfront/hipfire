@@ -1446,7 +1446,7 @@ pub fn execute_attention_moe_layer_batched(
 }
 
 /// F2 split of `execute_attention_moe_layer_batched`: QKV projection (all
-/// dtype arms) + deinterleave/Q-norm/K-norm + triattn tap + RoPE. Same
+/// dtype arms) + deinterleave/Q-norm/K-norm + diagnostic tap + RoPE. Same
 /// statements, same order, same launches as the inlined head. The F2 chunk
 /// pair calls this per half before its merged attend step.
 pub fn attention_moe_prep_batched(
@@ -1701,7 +1701,7 @@ pub fn attention_moe_prep_batched(
         return Ok(());
     }
     // Fused deinterleave + Q-rmsnorm — one launch instead of two, no Q
-    // global-memory round trip. K-norm, triattn tap, and RoPE below are
+    // global-memory round trip. K-norm, the diagnostic tap, and RoPE below are
     // unchanged.
     gpu.deinterleave_q_rmsnorm_f32_batched(
         pbs.fa_q_full_batch,
@@ -1727,7 +1727,7 @@ pub fn attention_moe_prep_batched(
     if fa_pm_qprep {
         // A3B F5 (admitted by the single-chunk wrapper only): K rmsnorm, K-only RoPE with
         // angle capture and the PM Q prep replace the deinterleave/Q-norm/K-norm/RoPE below;
-        // the triattn tap is excluded by admission.
+        // the diagnostic tap is excluded by admission.
         batch_chunk_fa_pm_qprep_prep(gpu, layer.q_norm, layer.k_norm, config, pbs, kv_cache, n)?;
         return Ok(());
     }

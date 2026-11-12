@@ -170,7 +170,7 @@ here as research artifacts and remain available behind feature flags.
 | First commit | `b7e55f47` |
 | Date         | 2026-04-13 |
 | Originator   | Kaden Schutt |
-| Canonical files | `kernels/src/attention_flash_asym3_tile.hip`, `kernels/src/kv_fold_asym3.hip`, `crates/hipfire-runtime/src/kv_cache.rs` (asym mode arms), `crates/hipfire-quantize/src/asym.rs` |
+| Canonical files | `kernels/src/attention_flash_asym3_tile.hip`, `crates/hipfire-runtime/src/kv_cache.rs` (asym mode arms), `crates/hipfire-quantize/src/asym.rs` |
 | Release tag  | `13d068ab` (2026-04-13) "chore(release): 0.1.5 \"redline\"" — first shipped release with asym3 KV |
 
 A KV cache quantization family that uses per-head, per-position

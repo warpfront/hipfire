@@ -78,10 +78,10 @@ python3 scripts/astrea.py policy --model MODEL --base-format FMT --promotion-for
   [--method METHOD] [--objective OBJ] [--domain weights|kv] [--model-family FAMILY]
 python3 scripts/astrea.py promote --policy POLICY.json --source-dir BF16_DIR --output CANDIDATE.hfq \
   [--max-tensors N] [--tensor-filter NAME]
-python3 scripts/astrea.py kv-profile --model MODEL [--mode MODE] [--triattn PATH] \
+python3 scripts/astrea.py kv-profile --model MODEL [--mode MODE] \
   [--model-family FAMILY] [--engine-root REPO]
 python3 scripts/astrea.py bundle-plan --model MODEL --output MODEL.hfq \
-  [--include weights|kv-policy|triattn|evidence] [--triattn PATH] [--policy-id ID]
+  [--include weights|kv-policy|evidence] [--policy-id ID]
 python3 scripts/astrea.py report ARTIFACT.json ...
 ```
 
@@ -123,7 +123,7 @@ script or `--help` rather than trusting a skill-local table.
    under investigation. Output is a policy/evidence shape for Atlas join, not
    proof that kernels/loader implement the mode.
 9. **`bundle-plan`** — future single-file package shape (weights, kv-policy,
-    triattn, evidence). Deferred loader/daemon work stays deferred until source
+    evidence). Deferred loader/daemon work stays deferred until source
     implements it.
 10. **Atlas perf** — if quality improves and the candidate touches runtime
     formats on AR and/or DFlash paths, collect phase-aware rows per

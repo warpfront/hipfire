@@ -18,9 +18,7 @@ use super::forward::moe_ffn_has_mq3_experts_uniform;
 use super::forward::moe_ffn_has_mq3_structural;
 use super::forward::moe_ffn_has_unsupported_mq3_experts_uniform;
 use super::forward::Qwen35Scratch;
-use super::program::{
-    batched_attention_tap, deltanet_state_view, flash_scratch, gdn_tape_view, hybrid_dims, kv_view,
-};
+use super::program::{deltanet_state_view, flash_scratch, gdn_tape_view, hybrid_dims, kv_view};
 use super::weights::DeltaNetCarry;
 use super::weights::DeltaNetState;
 use super::weights::DeltaNetStateGeometry;
@@ -7197,8 +7195,6 @@ fn forward_prefill_chunk_pair_body(
     let merge_fa = !multirow_c && !multirow_n;
     let dims = hybrid_dims(config);
     let flash = flash_scratch(s);
-    let tap_fn = batched_attention_tap(config);
-    let tap = tap_fn.get();
 
     let mut delta_layer_idx = 0usize;
     let mut kv_layer_idx = 0usize;
@@ -7289,7 +7285,7 @@ fn forward_prefill_chunk_pair_body(
                         false,
                         false,
                         false,
-                        tap,
+                        None,
                     )?;
                     batch_chunk_full_attn_input_projection(
                         gpu,
@@ -7322,7 +7318,7 @@ fn forward_prefill_chunk_pair_body(
                         false,
                         false,
                         false,
-                        tap,
+                        None,
                     )?;
                     stage.attend(
                         gpu,
@@ -7408,7 +7404,7 @@ fn forward_prefill_chunk_pair_body(
                         BatchEpilogue::Residual,
                         fusion,
                         None, // commit_stride: pair halves keep legacy cadence
-                        tap,
+                        None,
                     )?;
                     layer.ffn_rows(
                         gpu,
@@ -7444,7 +7440,7 @@ fn forward_prefill_chunk_pair_body(
                         BatchEpilogue::Residual,
                         fusion,
                         None, // commit_stride: pair halves keep legacy cadence
-                        tap,
+                        None,
                     )?;
                     layer.ffn_rows(
                         gpu,
@@ -7560,7 +7556,7 @@ fn forward_prefill_chunk_pair_body(
                             layer_idx,
                             false,
                             false, // the F2 pair never admits the FP8 Q prep
-                            tap,
+                            None,
                         )?;
                     }
                     stage.attend(
@@ -7634,7 +7630,7 @@ fn forward_prefill_chunk_pair_body(
                             None,
                             q8_wmma_arch,
                             layer_idx,
-                            tap,
+                            None,
                             |gpu: &mut Gpu| {
                                 prefill_moe_ffn_body_batched_with_route_layered(
                                     gpu,
@@ -8067,8 +8063,6 @@ fn forward_batch_chunk_body(
         });
     }
     let flash = flash_scratch(s);
-    let tap_fn = batched_attention_tap(config);
-    let tap = tap_fn.get();
 
     for layer_idx in layer_start..layer_end {
         // Developer capture (`HIPFIRE_MOE_ROUTE_DUMP` / `HIPFIRE_MOE_ACT_CAPTURE`): names this
@@ -8142,7 +8136,7 @@ fn forward_batch_chunk_body(
                     BatchEpilogue::Residual,
                     fusion,
                     commit_stride,
-                    tap,
+                    None,
                 )?;
                 layer.ffn_rows(
                     gpu,
@@ -8249,7 +8243,7 @@ fn forward_batch_chunk_body(
                     tree_verify,
                     q8_wmma_arch,
                     layer_idx,
-                    tap,
+                    None,
                     |gpu: &mut Gpu| {
                         prefill_moe_ffn_body_batched_with_route_layered(
                             gpu,
@@ -11424,7 +11418,6 @@ mod tests {
             config.n_kv_heads,
             config.head_dim,
             1,
-            false,
             false,
         );
         let policy =

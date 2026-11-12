@@ -133,9 +133,6 @@ pub(crate) enum Commands {
     KernelPack(KernelPackArgs),
     /// Quantize a Hugging Face or local model with the Rust quantizer.
     Quantize(QuantizeArgs),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
-    /// Deprecated (CASK; removal in 0.5.0): generate a TriAttention calibration sidecar.
-    SidecarGen(SidecarArgs),
     /// Generate text through a fresh native daemon process.
     Run(RunArgs),
     /// Generate an image (txt2img) through a fresh native daemon process.
@@ -944,25 +941,6 @@ struct QuantizeArgs {
     register: Option<String>,
 }
 
-#[derive(Args, Debug)]
-struct SidecarArgs {
-    model: String,
-    #[arg(long)]
-    corpus: Option<PathBuf>,
-    #[arg(long, default_value_t = 4000)]
-    max_tokens: usize,
-    #[arg(long, default_value_t = 256)]
-    chunk_len: usize,
-    #[arg(long, conflicts_with = "cpu_calib")]
-    gpu_calib: bool,
-    #[arg(long)]
-    cpu_calib: bool,
-    #[arg(short = 'o', long)]
-    output: Option<PathBuf>,
-    #[arg(long)]
-    skip_validation: bool,
-}
-
 #[derive(Args, Debug, Clone)]
 pub(crate) struct ServeArgs {
     /// Optional model, host, host:port, and/or port in legacy-compatible order.
@@ -1159,7 +1137,6 @@ fn run() -> Result<()> {
             KernelPackAction::Install(args) => kernel_pack::install_command(&paths, args),
         },
         Some(Commands::Quantize(args)) => quantize_command(&paths, args),
-        Some(Commands::SidecarGen(args)) => sidecar_command(&paths, args),
         Some(Commands::Run(args)) => run_command(&paths, args),
         Some(Commands::Img(args)) => img_command(&paths, args),
         Some(Commands::Embed(args)) => embed_command(&paths, args),
@@ -2614,17 +2591,11 @@ fn rm_with_sidecar_pins(
     let mut kept_mtp: Option<(String, String)> = None;
     if let Some((tag, entry)) = resolved {
         targets.extend(
-            [
-                &entry.triattn,
-                &entry.dspark,
-                &entry.t5,
-                &entry.clip,
-                &entry.vae,
-            ]
-            .into_iter()
-            .flatten()
-            .map(|sidecar| paths.models.join(&sidecar.file))
-            .filter(|path| path.is_file()),
+            [&entry.dspark, &entry.t5, &entry.clip, &entry.vae]
+                .into_iter()
+                .flatten()
+                .map(|sidecar| paths.models.join(&sidecar.file))
+                .filter(|path| path.is_file()),
         );
         if let Some(overlay) = hipfire_registry::trunk_overlay_in(entry, overlay_pins) {
             let overlay_path = paths.models.join(&overlay.sidecar.file);
@@ -2771,12 +2742,10 @@ fn rm_with_sidecar_pins(
                         };
                         candidate.is_file()
                             && name != file
-                            && ((name.starts_with(&format!("{stem}.triattn"))
-                                && name.ends_with(".bin"))
-                                || (name.starts_with(stem)
-                                    && (name.ends_with(".mtp")
-                                        || name.contains("-mtp.")
-                                        || name.contains("-dspark."))))
+                            && name.starts_with(stem)
+                            && (name.ends_with(".mtp")
+                                || name.contains("-mtp.")
+                                || name.contains("-dspark."))
                     }),
             );
         }
@@ -5149,21 +5118,8 @@ pub(crate) fn load_params(
         .map_err(|err| anyhow!("{err}"))?
         .as_str()
         .to_owned();
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
-    let mut cask_sidecar = config_string(resolved, "memory.cask.sidecar")?;
-    if cask_sidecar.is_empty() && config_bool(resolved, "memory.cask.auto_attach")? {
-        if let Some(sidecar) = entry.and_then(|entry| entry.triattn.as_ref()) {
-            let candidate = model_path
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .join(&sidecar.file);
-            if candidate.is_file() {
-                cask_sidecar = candidate.display().to_string();
-            }
-        }
-    }
     // Resolve --head <name> against the registry's `heads` map. The overlay
-    // lives beside the model file, exactly like the triattn sidecar. Refuse
+    // lives beside the model file. Refuse
     // rather than fall back: a silent fall-back would serve the base's head
     // and answer a different question than the operator asked.
     let head_file = match head_override.filter(|s| !s.is_empty()) {
@@ -5229,14 +5185,7 @@ pub(crate) fn load_params(
         "ngram_min_count": config_u64(resolved, "speculation.ngram_min_count")?,
         "ddtree_budget": config_u64(resolved, "speculation.ddtree_budget")?,
         "ddtree_topk": config_u64(resolved, "speculation.ddtree_topk")?,
-        "cask_sidecar": cask_sidecar,
         "head": head_file,
-        "cask": config_bool(resolved, "memory.cask.enabled")?,
-        "cask_budget": config_u64(resolved, "memory.cask.budget")?,
-        "cask_beta": config_u64(resolved, "memory.cask.beta")?,
-        "cask_handoff_tokens": config_u64(resolved, "memory.cask.handoff_tokens")?,
-        "cask_core_frac": config_f64(resolved, "memory.cask.core_fraction")?,
-        "cask_fold_m": config_u64(resolved, "memory.cask.fold")?,
         "speculation": config_string(resolved, "speculation.mode")?,
         "continuous_batch_size": config_u64(resolved, "serve.continuous_batch_size")?,
     });
@@ -9714,59 +9663,6 @@ fn quantize_command(paths: &Paths, mut args: QuantizeArgs) -> Result<()> {
     Ok(())
 }
 
-// lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
-fn sidecar_command(paths: &Paths, args: SidecarArgs) -> Result<()> {
-    eprintln!(
-        "warning: CASK is deprecated and will be removed in 0.5.0; not supported (sidecar-gen)"
-    );
-    if !(1..=1_000_000).contains(&args.max_tokens) {
-        bail!("--max-tokens must be between 1 and 1000000");
-    }
-    if !(1..=16_384).contains(&args.chunk_len) {
-        bail!("--chunk-len must be between 1 and 16384");
-    }
-    if let Some(corpus) = args.corpus.as_ref().filter(|path| !path.is_file()) {
-        bail!("corpus not found: {}", corpus.display());
-    }
-    let registry = load_registry(&paths.registry).registry;
-    let model = find_model_path(paths, &registry, &args.model)
-        .ok_or_else(|| model_not_found_error(paths, &registry, &args.model))?;
-    let output = args
-        .output
-        .unwrap_or_else(|| PathBuf::from(format!("{}.triattn.bin", model.display())));
-    let binary = find_workspace_example(paths, "triattn_validate").ok_or_else(|| anyhow!(
-        "triattn_validate is not installed; build `cargo build --release --features deltanet -p hipfire-runtime --example triattn_validate`"
-    ))?;
-    let mut command = Command::new(binary);
-    command
-        .arg(&model)
-        .arg("--sidecar")
-        .arg(&output)
-        .arg("--max-tokens")
-        .arg(args.max_tokens.to_string())
-        .arg("--chunk-len")
-        .arg(args.chunk_len.to_string());
-    if let Some(corpus) = args.corpus {
-        command.arg("--corpus").arg(corpus);
-    }
-    if args.cpu_calib {
-        command.arg("--cpu-calib");
-    }
-    if args.skip_validation {
-        command.arg("--val-prompt").arg("");
-    }
-    let _ = args.gpu_calib;
-    run_checked(&mut command, "triattn_validate")?;
-    if !output.is_file() {
-        bail!(
-            "sidecar generator reported success but {} was not created",
-            output.display()
-        );
-    }
-    println!("{}", output.display());
-    Ok(())
-}
-
 fn find_workspace_binary(paths: &Paths, name: &str) -> Option<PathBuf> {
     let exe = if cfg!(windows) {
         format!("{name}.exe")
@@ -9777,23 +9673,6 @@ fn find_workspace_binary(paths: &Paths, name: &str) -> Option<PathBuf> {
         paths.root.join("bin").join(&exe),
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/release")
-            .join(&exe),
-    ]
-    .into_iter()
-    .find(|path| path.is_file())
-    .or_else(|| find_on_path(&exe))
-}
-
-fn find_workspace_example(paths: &Paths, name: &str) -> Option<PathBuf> {
-    let exe = if cfg!(windows) {
-        format!("{name}.exe")
-    } else {
-        name.to_owned()
-    };
-    [
-        paths.root.join("bin").join(&exe),
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/release/examples")
             .join(&exe),
     ]
     .into_iter()
@@ -12010,67 +11889,6 @@ mod tests {
             find_daemon_in(&paths, None, &workspace, false),
             Some(bin.join("daemon"))
         );
-        fs::remove_dir_all(&paths.root).unwrap();
-    }
-
-    #[test]
-    fn cask_and_triattn_remain_opt_in_at_load() {
-        let paths = test_paths("experimental-defaults");
-        fs::create_dir_all(&paths.models).unwrap();
-        let registry = hipfire_registry::bundled().unwrap();
-        let entry = registry
-            .models
-            .values()
-            .find(|entry| entry.triattn.is_some())
-            .expect("bundled registry should retain a TriAttention sidecar");
-        let model_path = paths.models.join(&entry.file);
-        fs::write(&model_path, b"model").unwrap();
-        let triattn = entry.triattn.as_ref().unwrap();
-        let sidecar_path = paths.models.join(&triattn.file);
-        fs::write(&sidecar_path, b"sidecar").unwrap();
-
-        let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
-        let params = load_params(
-            &defaults,
-            Some(entry),
-            &model_path.parent().unwrap(),
-            &model_path,
-            64,
-            None,
-            None,
-            None,
-            false,
-            None,
-        )
-        .unwrap();
-        assert_eq!(params["cask"], false);
-        assert_eq!(params["cask_handoff_tokens"], 0);
-        assert_eq!(params["cask_sidecar"], "");
-
-        let mut explicit = ConfigLayer::default();
-        explicit.set_cli("memory.cask.auto_attach", "true").unwrap();
-        let enabled = resolve([NamedLayer {
-            source: ConfigSource::OneShot {
-                argument: "memory.cask.auto_attach=true".into(),
-            },
-            layer: explicit,
-        }])
-        .unwrap();
-        let params = load_params(
-            &enabled,
-            Some(entry),
-            &model_path.parent().unwrap(),
-            &model_path,
-            64,
-            None,
-            None,
-            None,
-            false,
-            None,
-        )
-        .unwrap();
-        assert_eq!(params["cask"], false);
-        assert_eq!(params["cask_sidecar"], sidecar_path.display().to_string());
         fs::remove_dir_all(&paths.root).unwrap();
     }
 
@@ -15792,7 +15610,6 @@ effort = "high"
         assert!(names.contains("version"));
         assert!(names.contains("update"));
         assert!(names.contains("quantize"));
-        assert!(names.contains("sidecar-gen"));
     }
 
     #[test]

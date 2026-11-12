@@ -229,16 +229,4 @@ log "       bash $REPO_DIR/scripts/stage_models.sh"
 log "  2. Fetch calibration corpus (if not done via --fetch-corpus):"
 log "       bash $REPO_DIR/scripts/fetch_calibration_corpus.sh \\"
 log "            /root/calibration_corpus.txt --recipe blended"
-if [ "$N_GPUS" -gt 1 ]; then
-log "  3. Parallel calibrate across all $N_GPUS GPUs:"
-log "       bash $REPO_DIR/scripts/calibrate_multigpu.sh \\"
-log "            --models \$(ls /root/models/*.mq[46] | tr '\\n' ',') \\"
-log "            --corpus /root/calibration_corpus.txt"
-else
-log "  3. Single-GPU calibration:"
-log "       $REPO_DIR/target/release/examples/triattn_validate \\"
-log "            /root/models/qwen3.5-9b.mq4 \\"
-log "            --corpus /root/calibration_corpus.txt --max-tokens 1000000 \\"
-log "            --sidecar /root/models/qwen3.5-9b.mq4.triattn.bin"
-fi
 log "────────────────────────────────────────────────────"

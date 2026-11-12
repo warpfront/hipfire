@@ -382,7 +382,7 @@ when the ranks are not one arch (a mixed gfx1100/gfx1201 set is refused:
 `requires the same architecture on every rank`), when fewer than `ep` devices
 are visible, or when a directed card pair is not peer-accessible. EP has no
 host-staged fallback for a missing peer pair; the load refuses. EP also refuses
-DFlash, DSpark, n-gram drafting, DDTree, adaptive KV, drafters, CASK,
+DFlash, DSpark, n-gram drafting, DDTree, adaptive KV, drafters,
 the retained Redline default and `HIPFIRE_MTP_SAMPLED_MODE=naive`. Exact AR
 lane batching (`serve.vmm_batch`) is **not** refused under EP; see
 [fn-lanes under PP and EP](#flash-next-fn-lanes-continuous-batching-under-pp-and-ep).
@@ -978,13 +978,12 @@ string or a blanket “always refuse at load.”
 | `tp > 1` and `pp > 1` | Error: mutually exclusive |
 | DFlash `draft` set and `HIPFIRE_PP_DFLASH` unset | Error: DFlash requires `pp=1` (daemon, any arch) |
 | DFlash `draft` set and `HIPFIRE_PP_DFLASH=1` | **Experimental exception, generic Qwen3.5 / 3.6 route only:** load may accept; cross-card speculative generate is **not** fully implemented (daemon message states cross-card spec-decode is not implemented). Not an admission. Flash-Next PP still refuses a draft: `does not support DFlash` |
-| CASK / TriAttention sidecar set | Error: requires `pp=1` (daemon); Flash-Next PP also names it: `does not support CASK` |
 | Non-PP carriers at `pp>1` | Carrier-specific error strings (not one universal quote). Examples at the audited ref: `qwen2: pipeline-parallel (pp>1) unsupported`; `llama:` / `dots_ocr:` / `deepseek4:` / `minimax:` / `lfm2moe:` `pipeline-parallel (pp>1) unsupported` on HFQ (and distinct `safetensors + pp>1 unsupported` on dirs); **`cohere2moe: pp>1 unsupported via registry`** (different wording). |
 | Qwen3.5 **safetensors directory** + `pp>1` | Error: `qwen35: safetensors + pp>1 unsupported` |
 | Qwen3.5 / 3.6 **VL HFQ** + `pp>1` | **Not a hard refuse.** `load_qwen35_pp` is the text HFQ loader only — vision weights are **not** loaded on that path, so VL artifacts **silently become text-only** under PP. Serve real VL at `pp=1`. |
 | `hipfire bench --matrix` on a multi-GPU load (PP, TP or EP) | **Not a refusal.** The synthetic `bench_prefill` / `bench_decode` rows run on every topology `serve` admits (the earlier `bench_prefill requires a single-GPU model (pp=1, non-EP)` refusal is gone) and the JSON reports the loaded `topology` as `{pp, tp, ep, cards}` from the daemon's own answers. Rows are synthetic token ids (no prompt, speculation or HTTP path); time a real prompt with `hipfire bench --prompt-file`. See [CLI.md](CLI.md#bench-matrix-topology) |
 | Raon-1-mini `pp>1` | HFQ only. A DFlash draft or speculation request is refused at admission (`raon1_mini: topology.pp = N does not run speculation ...`); the session cache is not attached; `tp > 1` and `topology.ep > 1` get the uniform sentences. Full list in [Raon-1-mini pipeline parallelism](#raon-1-mini-pipeline-parallelism) |
-| Flash-Next (Qwen4) `pp>1`, unsupported options | `qwen4: pipeline parallelism (topology.pp = N) does not support <subject>; drop the option or set topology.pp = 1`, subjects: DFlash, DSpark, n-gram drafting, DDTree, adaptive KV, an EAGLE drafter, CASK, an experts-per-token override, a non-Single compute placement, the MTP n-gram modifier. Full list: [refusals](#flash-next-pipeline-parallelism-host-staged) |
+| Flash-Next (Qwen4) `pp>1`, unsupported options | `qwen4: pipeline parallelism (topology.pp = N) does not support <subject>; drop the option or set topology.pp = 1`, subjects: DFlash, DSpark, n-gram drafting, DDTree, adaptive KV, an EAGLE drafter, an experts-per-token override, a non-Single compute placement, the MTP n-gram modifier. Full list: [refusals](#flash-next-pipeline-parallelism-host-staged) |
 | Flash-Next (Qwen4) `pp>1`, environment and config requests | Same sentence with subjects host-mapped routed experts (`HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS`), the expert hotset, expert staging, session snapshots, the session cache disk tier, the NPU trunk |
 | Flash-Next (Qwen4) `pp>1`, mesh, bands and budget | Refused before any allocation, naming `topology.pp`: pp outside `2..=8` or `tp`/`ep` ≠ 1, `HIPFIRE_EMULATE_GPUS`, too few visible devices, unknown PCI identity, an arch other than gfx1100/gfx1201, mixed arches, `HIPFIRE_MESH_TRANSPORT=peer`, a bad `HIPFIRE_PP_LAYERS`, a band that does not fit its card |
 | Flash-Next (Qwen4) `pp>1` + native MTP | Admitted only on explicit request (`--spec mtp`), for greedy requests and for sampled requests with the default Leviathan verify and neutral penalties; penalized requests, `HIPFIRE_MTP_SAMPLED=0` and `HIPFIRE_MTP_SAMPLED_MODE=naive` sampled requests run AR, MTP sessions are not distributed, DFlash/DSpark/n-gram/DDTree stay refused. fn-lanes under PP are AR lanes only: native-MTP lanes are not staged ([fn-lanes under PP and EP](#flash-next-fn-lanes-continuous-batching-under-pp-and-ep)) |
@@ -992,7 +991,7 @@ string or a blanket “always refuse at load.”
 EP-only: `tp>1` with a DFlash draft → refused; non-EP arch → `load_model_ep` error.
 Flash-Next `topology.ep > 1` has its own refusals (pp/tp ≠ 1, `ep` above 8, an
 arch other than gfx1100/gfx1201, mixed arches, too few devices, missing peer
-access, DFlash/DSpark/n-gram/DDTree/adaptive KV/drafters/CASK/Redline,
+access, DFlash/DSpark/n-gram/DDTree/adaptive KV/drafters/Redline,
 `HIPFIRE_MTP_SAMPLED_MODE=naive`): see
 [Flash-Next EP: enabling and status](#flash-next-ep-enabling-and-status).
 
@@ -1386,7 +1385,6 @@ within the environment rows, the first match wins.
 | DDTree | DDTree is requested |
 | adaptive KV | `kv_adaptive` is on |
 | an EAGLE drafter | a drafter model (`params.drafter`) is given |
-| CASK | a CASK / TriAttention sidecar is given |
 | an experts-per-token override | an experts-per-token override is given |
 | a non-Single compute placement | a compute placement other than `single` is given |
 | the MTP n-gram modifier (speculation.mtp_ngram = on; leave it auto or off) | native MTP is on and `speculation.mtp_ngram = on`; `auto` and `off` are accepted and build no n-gram pool |
@@ -2341,7 +2339,7 @@ Retired `scripts/coherence-gate-*.sh` batteries are **not** acceptance for PP
 
 **Status:** v1 feature-complete on `feat/multi-gpu-pp` branch — tracking
 issue [#58](https://github.com/warpfront/hipfire/issues/58). Stages
-0–9 of the v2 plan are merged; refusal contracts (DFlash / VL / CASK +
+0–9 of the v2 plan are merged; refusal contracts (DFlash / VL +
 pp>1) are wired and validated. This doc is the source of truth for
 memory budget, deployment recipes, throughput, and known limitations.
 
@@ -2465,8 +2463,7 @@ Direct daemon JSON (driving without the CLI):
 | arch_id ∈ {5, 6} (Qwen3.5 dense + MoE/A3B) | Accepted | Validated end-to-end |
 | arch_id = others (LLaMA / Qwen3) | Refused | Single-GPU only in v1 |
 | VL models (vision_config + vision tensors) | Refused | v1.1 |
-| DFlash draft (`draft` field set) | Refused | v1.1 — see `feedback_cask_mfold_dflash_broken.md` for the v1 ship-blocker |
-| CASK / TriAttention sidecar | Refused | Eviction context is single-device — v1.1 |
+| DFlash draft (`draft` field set) | Refused | v1.1 |
 
 ## Throughput baseline (gfx1100 × 2)
 
@@ -2489,7 +2486,6 @@ v1.1.
 
 Refused at load time:
 - `pp > 1` + DFlash speculative decode
-- `pp > 1` + CASK/TriAttention sidecar (eviction is single-device)
 - `pp > 1` + VL models (vision encoder is single-device)
 - `pp > 1` + arch_id ∉ {5, 6} (LLaMA / Qwen3 dense are pp=1 only)
 
@@ -2518,7 +2514,6 @@ The `pp-gate.sh` battery checks:
 1. Per-token `forward_scratch_multi` ≡ `forward_scratch` bit-exact (pp_parity_chatml)
 2. Daemon `pp=1` ≡ `pp=2` byte-identical with `HIPFIRE_DETERMINISTIC=1` (greedy ChatML)
 3. DFlash + pp=2 refusal at load
-4. CASK + pp=2 refusal at load
 
 A pre-commit hook calls `pp-gate.sh` automatically when staged files
 match the `multi_gpu|pp_|peer_access|pipeline|stages` hotspot regex.

@@ -132,8 +132,6 @@ SUPPORTED_KV_MODES = {
     "asym2",
     "asym3",
     "asym4",
-    "triattn",
-    "cask",
     "turbo",
     "turbo2",
     "turbo3",
@@ -146,7 +144,6 @@ SUPPORTED_KV_MODES = {
 SUPPORTED_BUNDLE_INCLUDES = {
     "weights",
     "kv-policy",
-    "triattn",
     "evidence",
 }
 
@@ -3058,7 +3055,7 @@ def build_policy_probe_plan(objectives, ingress):
     if "kv-policy" in objectives:
         plan["kv_policy"] = [
             "treat asym3 as the current quality/perf baseline",
-            "profile q8, asym2, asym3, asym4, TriAttention/CASK, and turbo/rotor research modes separately",
+            "profile q8, asym2, asym3, asym4, and turbo/rotor research modes separately",
             "score AR and DFlash independently because eviction and speculative decode have different failure modes",
             "package persistent KV calibration data inside the HFQ model artifact before promotion",
         ]
@@ -3264,18 +3261,7 @@ def build_policy(
     }
 
 
-def triattn_summary(path):
-    item = file_summary(path)
-    if item and item["is_file"]:
-        try:
-            with Path(path).open("rb") as f:
-                item["magic"] = f.read(4).decode("ascii", errors="replace")
-        except Exception as exc:
-            item["read_error"] = str(exc)
-    return item
-
-
-def describe_kv_mode(mode, *, triattn=None):
+def describe_kv_mode(mode):
     mode = mode.lower()
     if mode not in SUPPORTED_KV_MODES:
         raise ValueError(f"unsupported KV mode: {mode}")
@@ -3301,23 +3287,6 @@ def describe_kv_mode(mode, *, triattn=None):
             "persistent_artifact": False,
             "notes": [f"rotated K at {bits} bits with V stored as Q8_0"],
         }
-    if mode == "triattn":
-        exists = bool(triattn and triattn.get("exists"))
-        return {
-            "family": "triattention",
-            "status": "implemented" if exists else "needs_calibration_artifact",
-            "persistent_artifact": True,
-            "package_section": "triattn.centers",
-            "notes": ["drop-eviction policy; package centers inside the model artifact before promotion"],
-        }
-    if mode == "cask":
-        return {
-            "family": "triattention",
-            "status": "implemented_guarded",
-            "persistent_artifact": True,
-            "package_section": "triattn.centers",
-            "notes": ["m-folding policy has known DFlash and A3B hazards; require explicit gates"],
-        }
     if mode.startswith("turbo"):
         return {
             "family": "turboquant",
@@ -3339,21 +3308,19 @@ def build_kv_profile(
     *,
     model,
     modes=None,
-    triattn=None,
     model_family=None,
     profile_id=None,
     engine_root=None,
 ):
-    modes = modes or ["q8", "asym3", "triattn", "turbo3", "rotor"]
+    modes = modes or ["q8", "asym3", "turbo3", "rotor"]
     validate_values(modes, SUPPORTED_KV_MODES, "KV mode")
-    triattn_info = triattn_summary(triattn)
     hfq = summarize_hfq(model) if model and Path(model).is_file() else None
     mode_map = {
-        mode: describe_kv_mode(mode, triattn=triattn_info)
+        mode: describe_kv_mode(mode)
         for mode in modes
     }
     if "asym3" not in mode_map:
-        mode_map["asym3"] = describe_kv_mode("asym3", triattn=triattn_info)
+        mode_map["asym3"] = describe_kv_mode("asym3")
     model_name = Path(model).name.replace(".", "-").replace("/", "-")
     return {
         "schema": KV_PROFILE_SCHEMA,
@@ -3371,11 +3338,9 @@ def build_kv_profile(
         } if hfq else None,
         "baseline_mode": "asym3",
         "modes": mode_map,
-        "triattn": triattn_info,
         "quality_gates": [
             "Collect AR KLD/PPL and long-context recall for each KV mode.",
             "Collect DFlash KLD/PPL, tau, and decoded-output checks separately from AR.",
-            "Reject CASK m-folding on DFlash or A3B unless the dedicated coherence and recall gates pass.",
         ],
         "atlas_bridge": {
             "emit_rows": True,
@@ -3383,7 +3348,6 @@ def build_kv_profile(
         },
         "package_target": {
             "external_sidecars": False,
-            "triattn_section": "triattn.centers",
             "kv_policy_section": "kv.policy",
         },
         "next_step": "run Atlas AR/DFlash rows for implemented modes; keep turbo/rotor as research candidates until kernels exist",
@@ -3395,7 +3359,6 @@ def build_bundle_plan(
     model,
     output,
     include=None,
-    triattn=None,
     policy_id=None,
     bundle_id=None,
 ):
@@ -3420,13 +3383,6 @@ def build_bundle_plan(
             "policy_id": policy_id,
             "description": "selected KV mode, safety gates, profile provenance, and runtime constraints",
             "runtime_status": "deferred_until_loader_policy_dispatch_exists",
-        }
-    if "triattn" in include:
-        sections["triattn.centers"] = {
-            "required": False,
-            "source": triattn_summary(triattn),
-            "description": "TriAttention band centers embedded in the model package instead of stored as a loose sidecar",
-            "runtime_status": "deferred_until_loader_embedded_tria_read_exists",
         }
     if "evidence" in include:
         sections["evidence.summary"] = {
@@ -3453,7 +3409,6 @@ def build_bundle_plan(
         "deferred_runtime_work": [
             "loader must parse and validate the package section table",
             "runtime must reject transform or KV policy sections when required kernels are unavailable",
-            "CLI pull/run should prefer embedded triattn.centers over loose .triattn.bin files",
             "Atlas must record AR and DFlash perf rows before package promotion",
         ],
         "next_step": "treat this as a package contract artifact; do not write a packaged model until loader support exists",
@@ -3591,7 +3546,6 @@ def build_parser():
     kv_profile = sub.add_parser("kv-profile", help="Emit a KV cache policy/profile artifact.")
     kv_profile.add_argument("--model", required=True)
     kv_profile.add_argument("--mode", dest="modes", action="append", default=[])
-    kv_profile.add_argument("--triattn")
     kv_profile.add_argument("--model-family")
     kv_profile.add_argument("--engine-root")
     kv_profile.add_argument("--profile-id")
@@ -3602,7 +3556,6 @@ def build_parser():
     bundle_plan.add_argument("--model", required=True)
     bundle_plan.add_argument("--output", required=True)
     bundle_plan.add_argument("--include", dest="include", action="append", default=[])
-    bundle_plan.add_argument("--triattn")
     bundle_plan.add_argument("--policy-id")
     bundle_plan.add_argument("--bundle-id")
     bundle_plan.add_argument("--pretty", action="store_true")
@@ -3724,7 +3677,6 @@ def run(argv=None):
             build_kv_profile(
                 model=args.model,
                 modes=args.modes or None,
-                triattn=args.triattn,
                 model_family=args.model_family,
                 profile_id=args.profile_id,
                 engine_root=args.engine_root,
@@ -3738,7 +3690,6 @@ def run(argv=None):
                 model=args.model,
                 output=args.output,
                 include=args.include or None,
-                triattn=args.triattn,
                 policy_id=args.policy_id,
                 bundle_id=args.bundle_id,
             ),

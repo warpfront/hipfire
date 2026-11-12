@@ -44,9 +44,9 @@ use hipfire_engine::scheduler::*;
 use hipfire_engine::terminal::*;
 use hipfire_engine::turn_cache::*;
 use hipfire_loader::bench_topology::EpKind;
-use hipfire_loader::{AsstTurnCache, EpArch, EpState, Eviction, LoadedModel};
+use hipfire_loader::{AsstTurnCache, EpArch, EpState, LoadedModel};
 use hipfire_runtime::spec::{
-    ClientEvent, EmitOutcome, EvictRetain, FinishSummary, PrefillOutcome, SpecAdvance, SpecEmit,
+    ClientEvent, EmitOutcome, FinishSummary, PrefillOutcome, SpecAdvance, SpecEmit,
     SpecRequestConfig, SpecTarget, Speculator, StopReason,
 };
 
@@ -1833,7 +1833,7 @@ pub fn ep_serve_ds4(
 
     // O2b-2 capacity guard (ds4 EP): this path replays the full prompt from
     // position 0 every turn (no LCP reuse), so the absolute KV span is
-    // prompt_n + max_tokens. Without eviction the EP state KV was allocated
+    // prompt_n + max_tokens. The EP state KV was allocated
     // for `m.physical_cap` (== max_seq at load). Overrunning it drives
     // forward_ep past the KV buffer → corruption/panic (serve-wide crash).
     // Emit a clean error and return BEFORE prefill — mirror the qwen35 guard.
@@ -2781,7 +2781,6 @@ pub fn plan_prompt_cache(
     tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
     asst_turn_cache: &mut AsstTurnCache,
     conversation_tokens: &[u32],
-    eviction_is_none: bool,
     system_prompt: Option<&str>,
     prompt: &str,
     assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
@@ -2812,7 +2811,7 @@ pub fn plan_prompt_cache(
                 .and_then(|t| t.content.as_ref().map(|c| c.token_ids.clone()))
         },
     );
-    let cache_eligible = !cache_disabled && eviction_is_none && !conversation_tokens.is_empty();
+    let cache_eligible = !cache_disabled && !conversation_tokens.is_empty();
     plan_from_rendered(
         conversation_tokens,
         rendered,
@@ -3417,7 +3416,6 @@ pub fn generate_dflash(
             native_naive.unwrap_or(false),
             repeat_penalty != 1.0 || presence_penalty != 0.0 || frequency_penalty != 0.0,
             m.pp_gpus.is_some(),
-            m.eviction.is_some(),
             false,
         ) {
             emit_active_attempt_error(stdout, Some(id), &refusal, "validation", false, false);
@@ -3429,7 +3427,7 @@ pub fn generate_dflash(
     // The spec-step dispatch, ModelSlot assembly, checkpoint ring, and
     // SpecStats that this function used to drive inline now live behind the
     // arch-generic `Speculator` trait (the loader's `DflashSpeculator`) and the
-    // `Qwen35SlotGuard` RAII target borrow — see the prefill/step/on_evict/
+    // `Qwen35SlotGuard` RAII target borrow — see the prefill/step/
     // reset/rewind_to calls below.
 
     // Prompt build: same two-path branch as the AR-path generate() — when
@@ -3602,15 +3600,7 @@ pub fn generate_dflash(
     // An omitted client max_tokens fits the target context first (the same
     // budget the AR fallback would use), then the draft capacity decides
     // spec vs AR.
-    let max_tokens = crate::common::fit_max_tokens(
-        max_tokens,
-        prompt_tokens.len(),
-        if m.eviction.is_none() {
-            m.physical_cap
-        } else {
-            m.max_seq
-        },
-    );
+    let max_tokens = crate::common::fit_max_tokens(max_tokens, prompt_tokens.len(), m.physical_cap);
     // Shared margin with the `generate_spec` hard guard below: prompt +
     // budget + one draft block must fit, so any request the loop would refuse
     // falls back to AR here instead of erroring after `gen_start`.
@@ -3666,8 +3656,7 @@ pub fn generate_dflash(
                 == Some("0"),
     );
     // DFlash divergent-render resume (default ON; opt out with
-    // HIPFIRE_DFLASH_CKPT_RESUME=0). Requires no eviction (resume rewinds the
-    // resident KV prefix). When on, the recurrent state is checkpointed during
+    // HIPFIRE_DFLASH_CKPT_RESUME=0). When on, the recurrent state is checkpointed during
     // the prompt seed and a divergent render resumes from the latest checkpoint
     // ≤ lcp — byte-identical to a cold prefill of the same render (verified),
     // so worst case equals the legacy cold-reset path. Off ⇒ no checkpoints
@@ -3675,8 +3664,7 @@ pub fn generate_dflash(
     let dflash_resume_enabled = hipfire_config::developer_var("HIPFIRE_DFLASH_CKPT_RESUME")
         .ok()
         .as_deref()
-        != Some("0")
-        && m.eviction.is_none();
+        != Some("0");
     // Qwen4 history stage of the shared canonical render, after the cold-length
     // fit checks above (same order as the former cache-plan stage).
     let prompt_tokens: Vec<u32> = if is_qwen4 {
@@ -3712,10 +3700,8 @@ pub fn generate_dflash(
             attested_spec_checkpoint_positions(m.speculator.as_deref(), &m.conversation_tokens),
         )
     };
-    let cache_eligible = !cache_disabled
-        && messages_history.is_some()
-        && m.eviction.is_none()
-        && !conversation_tokens.is_empty();
+    let cache_eligible =
+        !cache_disabled && messages_history.is_some() && !conversation_tokens.is_empty();
     let cache_plan: Option<PromptCachePlan> = if is_qwen4 {
         None
     } else if try_jinja {
@@ -3785,7 +3771,6 @@ pub fn generate_dflash(
                 tok,
                 &mut m.asst_turn_cache,
                 conversation_tokens,
-                m.eviction.is_none(),
                 system_prompt,
                 prompt,
                 assistant_prefix,
@@ -4424,7 +4409,7 @@ pub fn generate_spec(
     // m.state on EVERY exit path (return, `?`, panic), which structurally
     // eliminates the eight hand-written reconstruction sites that were the
     // #462 cross-request state-bleed class. `m.speculator`, `m.state`,
-    // `m.seq_pos`, `m.conversation_tokens` and `m.eviction` are disjoint fields,
+    // `m.seq_pos` and `m.conversation_tokens` are disjoint fields,
     // so the guard, the speculator borrow, and the bookkeeping below coexist.
     // `block_size` is the speculator's EFFECTIVE proposal width: the DFlash
     // trailing-τ controller reseeds it to full at request start
@@ -4491,7 +4476,6 @@ pub fn generate_spec(
             native.is_some_and(|(naive, _)| naive),
             native.is_some_and(|(_, penalized)| penalized),
             m.pp_gpus.is_some(),
-            m.eviction.is_some(),
             resume_from.is_some(),
         ) {
             crate::ar::emit_active_route_error(
@@ -4603,30 +4587,13 @@ pub fn generate_spec(
     }
 
     let t0 = Instant::now();
-    // Capacity checks. With eviction enabled the advertised context window is
-    // effectively unbounded (eviction fires between spec cycles), but the
-    // *prompt* must still fit in one physical_cap span because the prompt seed
-    // writes it per-token without chunking. Error returns just `return` — the
-    // slot guard restores the bundle into m.state on the way out.
-    let eff_prompt_cap = if m.eviction.is_some() {
-        m.physical_cap
-    } else {
-        ctx_capacity
-    };
-    if prompt_tokens.len().saturating_add(block_size) > eff_prompt_cap {
+    // Capacity checks. Error returns just `return` — the slot guard restores
+    // the bundle into m.state on the way out.
+    if prompt_tokens.len().saturating_add(block_size) > ctx_capacity {
         crate::ar::emit_active_route_error(
             stdout,
             Some(id),
-            &format!(
-                "prompt+block_size exceeds {} {} (eviction {})",
-                if m.eviction.is_some() {
-                    "physical_cap"
-                } else {
-                    "ctx_capacity"
-                },
-                eff_prompt_cap,
-                if m.eviction.is_some() { "on" } else { "off" },
-            ),
+            &format!("prompt+block_size exceeds ctx_capacity {}", ctx_capacity,),
             "validation",
             false,
             false,
@@ -4635,11 +4602,9 @@ pub fn generate_spec(
         return None;
     }
     // Shared margin with the `generate_dflash` entry fallback above (same
-    // predicate): without eviction the entry already diverted these to AR,
-    // so this is belt-and-suspenders for direct `generate_spec` callers.
-    if m.eviction.is_none()
-        && !spec_ctx_request_fits(prompt_tokens.len(), max_tokens, block_size, ctx_capacity)
-    {
+    // predicate): the entry already diverted these to AR, so this is
+    // belt-and-suspenders for direct `generate_spec` callers.
+    if !spec_ctx_request_fits(prompt_tokens.len(), max_tokens, block_size, ctx_capacity) {
         crate::ar::emit_active_route_error(
             stdout,
             Some(id),
@@ -4900,114 +4865,6 @@ pub fn generate_spec(
     // (`finish_reason=length`) rather than a natural stop.
     let mut ctx_exhausted = false;
 
-    // Post-prefill compaction (FlashCASK pattern from dflash_spec_demo).
-    // If the prompt already filled past budget+beta, compact once before
-    // entering the spec loop so the first spec step writes at physical slot
-    // `budget`. compact_offset is maintained on slot.kv_cache; subsequent
-    // forwards inside the speculator read it for RoPE phase automatically. The
-    // drafter-local hidden cache is compacted to match via `on_evict`.
-    if let Some(ref ev) = m.eviction {
-        // Eviction is only ever configured for KvCache-backed arches
-        // (qwen35/llama); a `Qwen2State`-backed target never reaches here.
-        // Missing optional hook is an ordinary fail-closed error (no panic).
-        // Keep the kv borrow inside maybe_evict so rollback can reborrow `slot`.
-        let evict_outcome = match slot.kv_cache_mut() {
-            Some(kv) => ev.maybe_evict(gpu, kv, position),
-            None => {
-                let _ = classify_evict_failure_wire();
-                let ep = spec_rollback_live(
-                    &mut m.seq_pos,
-                    &mut m.conversation_tokens,
-                    &mut m.prefill_checkpoints,
-                    &mut m.dflash_checkpoints,
-                    &mut m.asst_turn_cache,
-                    gpu,
-                    pp.as_deref_mut(),
-                    slot,
-                    spec.as_mut(),
-                );
-                emit_fail_closed_error(
-                    stdout,
-                    Some(id),
-                    "kv_cache_mut missing (post-prefill)",
-                    "validation",
-                    false,
-                    &ep,
-                );
-                drop(guard);
-                return None;
-            }
-        };
-        match evict_outcome {
-            Ok(Some(res)) => {
-                let pre_phys = position;
-                let compact_offset = slot.kv_cache_mut().map(|kv| kv.compact_offset).unwrap_or(0);
-                eprintln!(
-                    "[dflash] post-prefill evict: {} -> {} (compact_offset={})",
-                    pre_phys, res.new_physical, compact_offset,
-                );
-                position = res.new_physical;
-                if !res.retain_mask.is_empty() {
-                    if let Err(e) = spec.on_evict(
-                        gpu,
-                        &EvictRetain {
-                            retain_mask: res.retain_mask,
-                            pre_phys,
-                        },
-                    ) {
-                        let _ = classify_evict_failure_wire();
-                        let ep = spec_rollback_live(
-                            &mut m.seq_pos,
-                            &mut m.conversation_tokens,
-                            &mut m.prefill_checkpoints,
-                            &mut m.dflash_checkpoints,
-                            &mut m.asst_turn_cache,
-                            gpu,
-                            pp.as_deref_mut(),
-                            slot,
-                            spec.as_mut(),
-                        );
-                        emit_fail_closed_error(
-                            stdout,
-                            Some(id),
-                            &format!("on_evict (post-prefill): {e}"),
-                            "validation",
-                            false,
-                            &ep,
-                        );
-                        drop(guard);
-                        return None;
-                    }
-                }
-            }
-            Ok(None) => {}
-            Err(e) => {
-                let _ = classify_evict_failure_wire();
-                let ep = spec_rollback_live(
-                    &mut m.seq_pos,
-                    &mut m.conversation_tokens,
-                    &mut m.prefill_checkpoints,
-                    &mut m.dflash_checkpoints,
-                    &mut m.asst_turn_cache,
-                    gpu,
-                    pp.as_deref_mut(),
-                    slot,
-                    spec.as_mut(),
-                );
-                emit_fail_closed_error(
-                    stdout,
-                    Some(id),
-                    &format!("maybe_evict (post-prefill): {e}"),
-                    "validation",
-                    false,
-                    &ep,
-                );
-                drop(guard);
-                return None;
-            }
-        }
-    }
-
     // Emit the first token immediately so TTFT is the prefill time. `begin`
     // pushes + filters it, seeds the grammar matcher, and reports whether the
     // first token is itself a terminator (→ skip the spec loop entirely, so
@@ -5073,7 +4930,6 @@ pub fn generate_spec(
                 &mut m.dflash_checkpoints,
                 &mut m.asst_turn_cache,
                 m.physical_cap,
-                m.eviction.as_ref(),
             ) {
                 SpecForcedApplyResult::Terminal => {
                     drop(guard);
@@ -5133,7 +4989,6 @@ pub fn generate_spec(
                 pp.as_deref_mut(),
                 slot,
                 spec.as_mut(),
-                m.eviction.is_some(),
                 &prompt_tokens,
                 &emitted,
                 position,
@@ -5151,12 +5006,7 @@ pub fn generate_spec(
         // speculative request must never undergo.
         // Pipeline parallelism never promotes: lanes and the VMM driver are
         // single-card owners.
-        if promo_shape_ok
-            && pp.is_none()
-            && pending_seed_committable
-            && semantic_stop.is_none()
-            && m.eviction.is_none()
-        {
+        if promo_shape_ok && pp.is_none() && pending_seed_committable && semantic_stop.is_none() {
             // Qwen4 (Flash-Next): the running singleton moves into an exact
             // lane — trunk/head/draft states and the drafter's pending hidden
             // — and the daemon drives it in `drive_qwen4_lane_batch`.
@@ -5702,14 +5552,7 @@ pub fn generate_spec(
         }
         if strict_prefix_action == SpecStrictPrefixAction::Realign {
             let plan = spec_prefix_realign_plan(&prompt_tokens, first_token, &raw_decode);
-            let compact_offset = slot.kv_cache_mut().map(|kv| kv.compact_offset).unwrap_or(0);
-            if let Err(msg) = spec_prefix_realign_admit(
-                &plan,
-                m.physical_cap,
-                ctx_capacity,
-                compact_offset,
-                m.eviction.is_some(),
-            ) {
+            if let Err(msg) = spec_prefix_realign_admit(&plan, m.physical_cap, ctx_capacity) {
                 let ep = spec_rollback_live(
                     &mut m.seq_pos,
                     &mut m.conversation_tokens,
@@ -5843,7 +5686,6 @@ pub fn generate_spec(
                 &mut m.dflash_checkpoints,
                 &mut m.asst_turn_cache,
                 m.physical_cap,
-                m.eviction.as_ref(),
             ) {
                 SpecForcedApplyResult::Terminal => {
                     drop(guard);
@@ -5861,104 +5703,6 @@ pub fn generate_spec(
                     }
                 }
                 SpecForcedApplyResult::Applied | SpecForcedApplyResult::Skipped => {}
-            }
-        }
-        // Per-cycle eviction (FlashCASK). Fires whenever current physical
-        // has grown to budget+β since the last compaction. No-op when
-        // physical < budget+β, so non-firing cycles pay only the check cost.
-        if let Some(ref ev) = m.eviction {
-            // Eviction ⇒ KvCache-backed target (qwen35/llama); never qwen2.
-            // Missing optional hook is an ordinary fail-closed error (no panic).
-            // Keep the kv borrow inside maybe_evict so rollback can reborrow `slot`.
-            let evict_outcome = match slot.kv_cache_mut() {
-                Some(kv) => ev.maybe_evict(gpu, kv, position),
-                None => {
-                    let _ = classify_evict_failure_wire();
-                    let ep = spec_rollback_live(
-                        &mut m.seq_pos,
-                        &mut m.conversation_tokens,
-                        &mut m.prefill_checkpoints,
-                        &mut m.dflash_checkpoints,
-                        &mut m.asst_turn_cache,
-                        gpu,
-                        pp.as_deref_mut(),
-                        slot,
-                        spec.as_mut(),
-                    );
-                    emit_fail_closed_error(
-                        stdout,
-                        Some(id),
-                        "kv_cache_mut missing (per-cycle)",
-                        "validation",
-                        false,
-                        &ep,
-                    );
-                    drop(guard);
-                    return None;
-                }
-            };
-            match evict_outcome {
-                Ok(Some(res)) => {
-                    let pre_phys = position;
-                    position = res.new_physical;
-                    if !res.retain_mask.is_empty() {
-                        if let Err(e) = spec.on_evict(
-                            gpu,
-                            &EvictRetain {
-                                retain_mask: res.retain_mask,
-                                pre_phys,
-                            },
-                        ) {
-                            let _ = classify_evict_failure_wire();
-                            let ep = spec_rollback_live(
-                                &mut m.seq_pos,
-                                &mut m.conversation_tokens,
-                                &mut m.prefill_checkpoints,
-                                &mut m.dflash_checkpoints,
-                                &mut m.asst_turn_cache,
-                                gpu,
-                                pp.as_deref_mut(),
-                                slot,
-                                spec.as_mut(),
-                            );
-                            emit_fail_closed_error(
-                                stdout,
-                                Some(id),
-                                &format!("on_evict (per-cycle): {e}"),
-                                "validation",
-                                false,
-                                &ep,
-                            );
-                            drop(guard);
-                            return None;
-                        }
-                    }
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    let _ = classify_evict_failure_wire();
-                    let ep = spec_rollback_live(
-                        &mut m.seq_pos,
-                        &mut m.conversation_tokens,
-                        &mut m.prefill_checkpoints,
-                        &mut m.dflash_checkpoints,
-                        &mut m.asst_turn_cache,
-                        gpu,
-                        pp.as_deref_mut(),
-                        slot,
-                        spec.as_mut(),
-                    );
-                    emit_fail_closed_error(
-                        stdout,
-                        Some(id),
-                        &format!("maybe_evict (per-cycle): {e}"),
-                        "validation",
-                        false,
-                        &ep,
-                    );
-                    drop(guard);
-                    return None;
-                }
             }
         }
         if hit_eos || think_cap_hit {
@@ -6001,7 +5745,6 @@ pub fn generate_spec(
                 pp.as_deref_mut(),
                 slot,
                 spec.as_mut(),
-                m.eviction.is_some(),
                 &prompt_tokens,
                 &emitted,
                 position,
@@ -6322,7 +6065,7 @@ fn pp_semantic_fail_closed(
 /// openers, max_think_tokens force-close, budget-alert nudge, ChatML \n
 /// trailer. Forward calls fan out to per-device tensors via
 /// `gpus.devices[dev]` and `scratch_set.per_device[dev]`; the final
-/// sample lives on `gpus.output_device`. DFlash, CASK, VL and
+/// sample lives on `gpus.output_device`. DFlash, VL and
 /// arch_id < 5 are refused upstream at load.
 
 #[allow(clippy::too_many_arguments)]
@@ -6368,14 +6111,7 @@ pub fn generate_multi(
             .as_deref()
             != Some("0"),
     );
-    if crate::ar::context_full_resets(
-        true,
-        full_render,
-        m.seq_pos,
-        prompt_est,
-        max_tokens,
-        m.max_seq,
-    ) {
+    if crate::ar::context_full_resets(full_render, m.seq_pos, prompt_est, max_tokens, m.max_seq) {
         eprintln!(
             "[daemon] context full ({}/{}) — resetting conversation",
             m.seq_pos, m.max_seq
@@ -8215,25 +7951,16 @@ pub fn spec_prefix_realign_plan(
     }
 }
 
-/// Prove a strict-prefix realign replay fits target physical + speculator caps
-/// and is compatible with current eviction/compact-offset state.
+/// Prove a strict-prefix realign replay fits target physical + speculator caps.
 ///
-/// Realign is reset + full-history prefill (`compact_offset` cleared). It must
-/// never overrun `physical_cap` / `ctx_capacity`, and must not silently rebuild
-/// a compacted/evicted cache from an oversize full-history replay. On `Err`,
-/// callers fail closed with one rollback+error terminal (no reset/prefill).
-///
-/// `compact_offset` / `eviction_enabled` are part of the admit contract: when
-/// either is live the physical buffer is a retained window, but realign still
-/// full-replays logical history after reset. Retain-mask partial repair is
-/// **not** used here (no source contract proves DeltaNet/drafter-hidden
-/// equivalence). Capacity fit is the only proof; oversized history fails closed.
+/// Realign is reset + full-history prefill. It must never overrun
+/// `physical_cap` / `ctx_capacity`. On `Err`, callers fail closed with one
+/// rollback+error terminal (no reset/prefill). Capacity fit is the only proof;
+/// oversized history fails closed.
 pub fn spec_prefix_realign_admit(
     plan: &SpecPrefixRealignPlan,
     physical_cap: usize,
     ctx_capacity: usize,
-    compact_offset: usize,
-    eviction_enabled: bool,
 ) -> Result<(), String> {
     // Processed-prefix / pending-seed split: replay holds only processed tokens;
     // `position` is the next write slot for the unprocessed pending seed.
@@ -8260,12 +7987,6 @@ pub fn spec_prefix_realign_admit(
             plan.position
         ));
     }
-    // Eviction/compact_offset: realign always reset+full-replays (offset cleared).
-    // Retain-mask partial repair is intentionally unused (no source contract for
-    // DeltaNet/drafter-hidden equivalence). Capacity fit above is the only admit
-    // proof — oversize full-history under compaction fails closed, never silent
-    // reconstruct. Params stay in the signature so callers cannot ignore the seam.
-    let _ = (compact_offset, eviction_enabled);
     Ok(())
 }
 
@@ -8307,7 +8028,7 @@ pub enum SpecForcedApplyResult {
 /// Shared by `generate_spec` immediately after `emit.begin(first_token)` and by
 /// the mid-window observe path after prefix realign. Same hard budget, commit
 /// ordering (trigger retained only when committable; last forced pending once),
-/// physical-cap admission, optional post-commit eviction, abort latch, rollback
+/// physical-cap admission, abort latch, rollback
 /// attestation, client observe/render, raw history, and pending-seed
 /// committability rules — begin/mid-window cannot drift.
 ///
@@ -8315,12 +8036,9 @@ pub enum SpecForcedApplyResult {
 /// 1. Stage `emit.observe` over the budget-clipped forced list and stop at the
 ///    first non-`None` stop — later forced tokens are never observed.
 /// 2. Build the exact pending+forced processed prefix; reject when the commit
-///    slice cannot fit `physical_cap` (no-eviction keeps a pending-seed slot;
-///    eviction may end at cap only with step 4).
+///    slice cannot fit `physical_cap` (keeps a pending-seed slot).
 /// 3. GPU-commit that exact prefix (`on_forced_advance` / `spec_advance`).
-/// 4. When eviction is active: `maybe_evict` + `on_evict` on the post-commit
-///    physical position before any host seed/raw/render/generated update.
-/// 5. Only after successful commit (+ eviction): set host position, push raw
+/// 4. Only after successful commit: set host position, push raw
 ///    history, render events, update `generated` / `pending_seed_committable`.
 ///
 /// `forced_all` is the raw `take_forced()` payload (may be empty). On
@@ -8356,7 +8074,6 @@ pub fn apply_spec_forced_pending_seed(
     dflash_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
     asst_turn_cache: &mut hipfire_loader::AsstTurnCache,
     physical_cap: usize,
-    eviction: Option<&Eviction>,
 ) -> SpecForcedApplyResult {
     if forced_all.is_empty() {
         return SpecForcedApplyResult::Skipped;
@@ -8394,7 +8111,7 @@ pub fn apply_spec_forced_pending_seed(
 
     // Physical-cap admission on the exact commit slice (actual tx.commit.len()).
     // Reject before any GPU write. Capacity failure is fail-closed ErrorOnly.
-    if !spec_forced_commit_admits(*position, tx.commit.len(), physical_cap, eviction.is_some()) {
+    if !spec_forced_commit_admits(*position, tx.commit.len(), physical_cap) {
         let ep = spec_rollback_live(
             seq_pos,
             conversation_tokens,
@@ -8410,11 +8127,10 @@ pub fn apply_spec_forced_pending_seed(
             stdout,
             Some(id),
             &format!(
-                "forced commit exceeds physical_cap: position={} commit_len={} physical_cap={} eviction={}",
+                "forced commit exceeds physical_cap: position={} commit_len={} physical_cap={}",
                 *position,
                 tx.commit.len(),
                 physical_cap,
-                eviction.is_some()
             ),
             "validation",
             false,
@@ -8524,124 +8240,7 @@ pub fn apply_spec_forced_pending_seed(
     }
     // GPU committed kept prefix (trigger only if committable + forced[..n-1]);
     // last kept forced is pending. position_delta tracks actual commit length.
-    // Post-commit eviction (when active) MUST complete before host seed/raw/render
-    // so client-visible state never observes over-cap physical occupancy.
-    let mut post_position = position.saturating_add(tx.position_delta);
-    if let Some(ev) = eviction {
-        let evict_outcome = match slot.kv_cache_mut() {
-            Some(kv) => ev.maybe_evict(gpu, kv, post_position),
-            None => {
-                let _ = classify_evict_failure_wire();
-                let ep = spec_rollback_live(
-                    seq_pos,
-                    conversation_tokens,
-                    prefill_checkpoints,
-                    dflash_checkpoints,
-                    asst_turn_cache,
-                    gpu,
-                    pp.as_deref_mut(),
-                    slot,
-                    spec,
-                );
-                emit_fail_closed_error(
-                    stdout,
-                    Some(id),
-                    "kv_cache_mut missing (forced)",
-                    "validation",
-                    false,
-                    &ep,
-                );
-                return SpecForcedApplyResult::Terminal;
-            }
-        };
-        match evict_outcome {
-            Ok(Some(res)) => {
-                let pre_phys = post_position;
-                if !res.retain_mask.is_empty() {
-                    if let Err(e) = spec.on_evict(
-                        gpu,
-                        &EvictRetain {
-                            retain_mask: res.retain_mask,
-                            pre_phys,
-                        },
-                    ) {
-                        let _ = classify_evict_failure_wire();
-                        let ep = spec_rollback_live(
-                            seq_pos,
-                            conversation_tokens,
-                            prefill_checkpoints,
-                            dflash_checkpoints,
-                            asst_turn_cache,
-                            gpu,
-                            pp.as_deref_mut(),
-                            slot,
-                            spec,
-                        );
-                        emit_fail_closed_error(
-                            stdout,
-                            Some(id),
-                            &format!("on_evict (forced): {e}"),
-                            "validation",
-                            false,
-                            &ep,
-                        );
-                        return SpecForcedApplyResult::Terminal;
-                    }
-                }
-                post_position = res.new_physical;
-            }
-            Ok(None) => {}
-            Err(e) => {
-                let _ = classify_evict_failure_wire();
-                let ep = spec_rollback_live(
-                    seq_pos,
-                    conversation_tokens,
-                    prefill_checkpoints,
-                    dflash_checkpoints,
-                    asst_turn_cache,
-                    gpu,
-                    pp.as_deref_mut(),
-                    slot,
-                    spec,
-                );
-                emit_fail_closed_error(
-                    stdout,
-                    Some(id),
-                    &format!("maybe_evict (forced): {e}"),
-                    "validation",
-                    false,
-                    &ep,
-                );
-                return SpecForcedApplyResult::Terminal;
-            }
-        }
-        // Pending seed requires a legal next write slot after eviction.
-        if post_position >= physical_cap {
-            let _ = classify_evict_failure_wire();
-            let ep = spec_rollback_live(
-                seq_pos,
-                conversation_tokens,
-                prefill_checkpoints,
-                dflash_checkpoints,
-                asst_turn_cache,
-                gpu,
-                pp.as_deref_mut(),
-                slot,
-                spec,
-            );
-            emit_fail_closed_error(
-                stdout,
-                Some(id),
-                &format!(
-                    "forced commit leaves no pending-seed slot: position={post_position} >= physical_cap={physical_cap}"
-                ),
-                "validation",
-                false,
-                &ep,
-            );
-            return SpecForcedApplyResult::Terminal;
-        }
-    }
+    let post_position = position.saturating_add(tx.position_delta);
 
     *position = post_position;
     *seed_token = tx.pending_seed;
@@ -8666,11 +8265,6 @@ pub fn apply_spec_forced_pending_seed(
         Some(reason) => SpecForcedApplyResult::Stopped(reason),
         None => SpecForcedApplyResult::Applied,
     }
-}
-
-/// Eviction / on_evict failure always uses the exclusive error terminal.
-pub fn classify_evict_failure_wire() -> SpecFailClosedWire {
-    SpecFailClosedWire::ErrorOnly
 }
 
 // --- iter appended ---
@@ -8816,24 +8410,10 @@ pub fn spec_failure_message(what: &str, err: &str) -> String {
 ///
 /// `commit_len` is the exact transaction commit length (`tx.commit.len()`), not
 /// the forced token count (non-committable seed may omit the trigger).
-/// - No eviction: admits iff `position + commit_len < physical_cap` so one legal
-///   write slot remains for the unprocessed pending seed.
-/// - Eviction enabled: admits iff `position + commit_len <= physical_cap`. Exact-cap
-///   is allowed only because the caller MUST run post-commit `maybe_evict` /
-///   `on_evict` before host seed/raw/render updates and still leave a legal
-///   pending-seed slot (`post_evict < physical_cap`).
-pub fn spec_forced_commit_admits(
-    position: usize,
-    commit_len: usize,
-    physical_cap: usize,
-    eviction_enabled: bool,
-) -> bool {
-    let post_position = position.saturating_add(commit_len);
-    if eviction_enabled {
-        post_position <= physical_cap
-    } else {
-        post_position < physical_cap
-    }
+/// Admits iff `position + commit_len < physical_cap` so one legal write slot
+/// remains for the unprocessed pending seed.
+pub fn spec_forced_commit_admits(position: usize, commit_len: usize, physical_cap: usize) -> bool {
+    position.saturating_add(commit_len) < physical_cap
 }
 
 /// Wire shape for fail-closed terminals on the Task 4 spec path.
@@ -10754,7 +10334,6 @@ pub(crate) fn render_qwen4_prompt_history(
             tokenizer,
             &mut m.asst_turn_cache,
             &[],
-            false,
             system_prompt,
             prompt,
             assistant_prefix,
@@ -11084,7 +10663,7 @@ pub(crate) fn qwen4_bundle_and_mesh(
 /// Why a Qwen4 speculative request cannot run on the pipeline-parallel mesh
 /// (`None` = it can). Only native MTP reaches the mesh (greedy, or sampled
 /// with the default Leviathan verify and neutral penalties), on the model's
-/// own `Gpus`, without eviction or a divergent-render resume; everything else
+/// own `Gpus`, without a divergent-render resume; everything else
 /// is refused before any state mutation. `naive_sampled`: the drafter runs
 /// `HIPFIRE_MTP_SAMPLED_MODE=naive` (process-wide sampler draws);
 /// `penalized`: the request carries a non-neutral repeat / presence /
@@ -11097,7 +10676,6 @@ fn qwen4_pp_spec_refusal(
     naive_sampled: bool,
     penalized: bool,
     has_gpus: bool,
-    evicting: bool,
     resumes: bool,
 ) -> Option<String> {
     if spec_name != "mtp" || !native_drafter {
@@ -11128,9 +10706,6 @@ fn qwen4_pp_spec_refusal(
     if !has_gpus {
         return Some("qwen4 topology.pp native MTP has no admitted Gpus owner".to_string());
     }
-    if evicting {
-        return Some("qwen4 topology.pp native MTP does not support KV eviction".to_string());
-    }
     if resumes {
         return Some(
             "qwen4 topology.pp native MTP does not support a checkpoint resume".to_string(),
@@ -11146,7 +10721,7 @@ mod qwen4_pp_spec_refusal_tests {
     #[test]
     fn greedy_native_mtp_with_gpus_is_admitted() {
         assert_eq!(
-            qwen4_pp_spec_refusal("mtp", true, 0.0, false, false, true, false, false),
+            qwen4_pp_spec_refusal("mtp", true, 0.0, false, false, true, false),
             None
         );
     }
@@ -11154,20 +10729,16 @@ mod qwen4_pp_spec_refusal_tests {
     #[test]
     fn other_speculators_and_foreign_drafters_are_refused() {
         for name in ["dflash", "dspark", "ngram", ""] {
-            assert!(
-                qwen4_pp_spec_refusal(name, true, 0.0, false, false, true, false, false).is_some()
-            );
+            assert!(qwen4_pp_spec_refusal(name, true, 0.0, false, false, true, false).is_some());
         }
-        assert!(
-            qwen4_pp_spec_refusal("mtp", false, 0.0, false, false, true, false, false).is_some()
-        );
+        assert!(qwen4_pp_spec_refusal("mtp", false, 0.0, false, false, true, false).is_some());
     }
 
     #[test]
     fn unpenalized_leviathan_sampled_requests_are_admitted() {
         for temp in [0.7, 1.0e-3, 1.0, 2.0] {
             assert_eq!(
-                qwen4_pp_spec_refusal("mtp", true, temp, false, false, true, false, false),
+                qwen4_pp_spec_refusal("mtp", true, temp, false, false, true, false),
                 None,
                 "temp {temp}"
             );
@@ -11177,33 +10748,25 @@ mod qwen4_pp_spec_refusal_tests {
     #[test]
     fn non_finite_naive_and_penalized_requests_are_refused() {
         for temp in [f32::NAN, f32::INFINITY] {
-            assert!(
-                qwen4_pp_spec_refusal("mtp", true, temp, false, false, true, false, false)
-                    .is_some()
-            );
+            assert!(qwen4_pp_spec_refusal("mtp", true, temp, false, false, true, false).is_some());
         }
         // Naive sampled mode (process-wide sampler draws) stays refused ...
-        assert!(qwen4_pp_spec_refusal("mtp", true, 0.7, true, false, true, false, false).is_some());
+        assert!(qwen4_pp_spec_refusal("mtp", true, 0.7, true, false, true, false).is_some());
         // ... but a greedy request never draws, whatever the mode.
         assert_eq!(
-            qwen4_pp_spec_refusal("mtp", true, 0.0, true, false, true, false, false),
+            qwen4_pp_spec_refusal("mtp", true, 0.0, true, false, true, false),
             None
         );
         // Penalties are refused greedy or sampled.
         for temp in [0.0, 0.7] {
-            assert!(
-                qwen4_pp_spec_refusal("mtp", true, temp, false, true, true, false, false).is_some()
-            );
+            assert!(qwen4_pp_spec_refusal("mtp", true, temp, false, true, true, false).is_some());
         }
     }
 
     #[test]
-    fn missing_gpus_eviction_and_resume_are_refused() {
-        assert!(
-            qwen4_pp_spec_refusal("mtp", true, 0.0, false, false, false, false, false).is_some()
-        );
-        assert!(qwen4_pp_spec_refusal("mtp", true, 0.0, false, false, true, true, false).is_some());
-        assert!(qwen4_pp_spec_refusal("mtp", true, 0.0, false, false, true, false, true).is_some());
+    fn missing_gpus_and_resume_are_refused() {
+        assert!(qwen4_pp_spec_refusal("mtp", true, 0.0, false, false, false, false).is_some());
+        assert!(qwen4_pp_spec_refusal("mtp", true, 0.0, false, false, true, true).is_some());
     }
 }
 
@@ -11337,7 +10900,7 @@ fn spec_rollback_live(
 /// is exactly `prompt_tokens` + the fed part of `emitted` (`position` tokens).
 /// [`production_cancel_epilogue_live`] keeps that prefix as the conversation
 /// when the cursors attest it; the validated configuration is a resident
-/// single-GPU Qwen3.5-class target (`ModelSlot`, no KV eviction/compaction) on
+/// single-GPU Qwen3.5-class target (`ModelSlot`, no KV compaction) on
 /// the MTP or DFlash speculator. A pipeline-parallel mesh, every other target
 /// and every unattestable cursor keep the full reset ([`spec_rollback_live`]).
 #[allow(clippy::too_many_arguments)]
@@ -11351,7 +10914,6 @@ fn spec_cancel_epilogue_live(
     pp: Option<&mut hipfire_runtime::multi_gpu::Gpus>,
     slot: &mut dyn SpecTarget,
     spec: &mut dyn Speculator,
-    eviction_active: bool,
     prompt_tokens: &[u32],
     emitted: &[u32],
     position: usize,
@@ -11370,8 +10932,7 @@ fn spec_cancel_epilogue_live(
             spec,
         );
     }
-    let eligible = !eviction_active
-        && matches!(spec.name(), "mtp" | "dflash")
+    let eligible = matches!(spec.name(), "mtp" | "dflash")
         && slot
             .as_any_mut()
             .downcast_mut::<speculative::ModelSlot>()
@@ -11397,12 +10958,11 @@ fn spec_cancel_epilogue_live(
 /// (the turn finished, the client left before `done`) may keep the conversation
 /// the turn already baked: the same validated configuration as
 /// [`spec_cancel_epilogue_live`] (resident single-GPU Qwen3.5-class bundle on
-/// the MTP or DFlash speculator, no KV eviction/compaction). Nothing was
+/// the MTP or DFlash speculator, no KV compaction). Nothing was
 /// reverted, so the host record and device cursor agree by construction;
 /// [`production_cancel_epilogue`] still checks that they do.
 fn spec_cancel_keeps_committed_prefix(m: &LoadedModel) -> bool {
     m.pp <= 1
-        && m.eviction.is_none()
         && m.kv_adaptive.is_none()
         && m.speculator
             .as_ref()

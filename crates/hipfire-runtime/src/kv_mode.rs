@@ -38,9 +38,9 @@ const QWEN35_NATIVE_BF16_SHAPES: &[(usize, usize, usize)] = &[(24, 4, 256)];
 const QWEN35_AUTO_FP8_SHAPES: &[(usize, usize, usize)] = &[(24, 4, 256), (16, 2, 256)];
 
 /// Route-level conditions shared by every native Qwen35 cache: exact gfx1201,
-/// single GPU, no adaptive tiering, no CASK eviction.
-fn qwen35_native_route(arch: &str, pp: usize, adaptive: bool, cask: bool) -> bool {
-    arch == "gfx1201" && pp == 1 && !adaptive && !cask
+/// single GPU, no adaptive tiering.
+fn qwen35_native_route(arch: &str, pp: usize, adaptive: bool) -> bool {
+    arch == "gfx1201" && pp == 1 && !adaptive
 }
 
 fn qwen35_native_shapes(mode: KvMode) -> &'static [(usize, usize, usize)] {
@@ -64,9 +64,8 @@ pub fn qwen35_native_supported(
     head_dim: usize,
     pp: usize,
     adaptive: bool,
-    cask: bool,
 ) -> bool {
-    qwen35_native_route(arch, pp, adaptive, cask)
+    qwen35_native_route(arch, pp, adaptive)
         && qwen35_native_shapes(mode).contains(&(n_heads, n_kv_heads, head_dim))
 }
 
@@ -79,9 +78,8 @@ pub fn qwen35_native_auto_eligible(
     head_dim: usize,
     pp: usize,
     adaptive: bool,
-    cask: bool,
 ) -> bool {
-    qwen35_native_route(arch, pp, adaptive, cask)
+    qwen35_native_route(arch, pp, adaptive)
         && QWEN35_AUTO_FP8_SHAPES.contains(&(n_heads, n_kv_heads, head_dim))
 }
 
@@ -97,11 +95,8 @@ pub fn qwen35_native_refusal(
     head_dim: usize,
     pp: usize,
     adaptive: bool,
-    cask: bool,
 ) -> Option<String> {
-    if qwen35_native_supported(
-        mode, arch, n_heads, n_kv_heads, head_dim, pp, adaptive, cask,
-    ) {
+    if qwen35_native_supported(mode, arch, n_heads, n_kv_heads, head_dim, pp, adaptive) {
         return None;
     }
     let shapes = qwen35_native_shapes(mode)
@@ -110,8 +105,8 @@ pub fn qwen35_native_refusal(
         .collect::<Vec<_>>()
         .join(" or ");
     Some(format!(
-        "native KV {} requires exact gfx1201 {shapes}, single GPU and no adaptive/CASK \
-         (got {arch}, H{n_heads}/Hkv{n_kv_heads}/D{head_dim}, pp={pp}, adaptive={adaptive}, cask={cask}); \
+        "native KV {} requires exact gfx1201 {shapes}, single GPU and no adaptive tiering \
+         (got {arch}, H{n_heads}/Hkv{n_kv_heads}/D{head_dim}, pp={pp}, adaptive={adaptive}); \
          use --kv-mode q8",
         qwen_k_display_name(mode),
     ))
@@ -848,13 +843,11 @@ mod tests {
     #[test]
     fn mismatched_qwen_geometry_auto_is_q8_but_explicit_native_is_preserved() {
         for base in [&QWEN35_HFQ_POLICY] {
-            let eligible = qwen35_native_auto_eligible("gfx1201", 24, 4, 256, 1, false, false);
-            let small = qwen35_native_auto_eligible("gfx1201", 8, 2, 256, 1, false, false);
+            let eligible = qwen35_native_auto_eligible("gfx1201", 24, 4, 256, 1, false);
+            let small = qwen35_native_auto_eligible("gfx1201", 8, 2, 256, 1, false);
             assert!(eligible);
             assert!(!small);
-            assert!(!qwen35_native_auto_eligible(
-                "gfx1201", 24, 4, 256, 1, false, true
-            ));
+            assert!(!qwen35_native_auto_eligible("gfx1201", 24, 4, 256, 1, true));
             let native = qwen35_policy_for_native(base, "auto", eligible);
             let portable = qwen35_policy_for_native(base, "auto", small);
             assert_eq!(
@@ -894,16 +887,15 @@ mod tests {
         shape: (usize, usize, usize),
         pp: usize,
         adaptive: bool,
-        cask: bool,
     ) -> Result<KvMode, String> {
         let (h, kv, d) = shape;
-        let auto = qwen35_native_auto_eligible(arch, h, kv, d, pp, adaptive, cask);
+        let auto = qwen35_native_auto_eligible(arch, h, kv, d, pp, adaptive);
         let policy = qwen35_policy_for_native(&QWEN35_HFQ_POLICY, raw, auto);
         let k = resolve_kv_pair(raw, None, None, &policy, arch, true)
             .map_err(|e| e.to_string())?
             .k();
         if matches!(k, Fp8 | Bf16) {
-            if let Some(why) = qwen35_native_refusal(k, arch, h, kv, d, pp, adaptive, cask) {
+            if let Some(why) = qwen35_native_refusal(k, arch, h, kv, d, pp, adaptive) {
                 return Err(why);
             }
         }
@@ -914,31 +906,23 @@ mod tests {
     fn native_support_vs_auto_qualification_truth_table() {
         const DENSE: (usize, usize, usize) = (24, 4, 256);
         const A3B: (usize, usize, usize) = (16, 2, 256);
-        let ok = |raw, arch, shape, pp, ad, cask| native_preflight(raw, arch, shape, pp, ad, cask);
+        let ok = |raw, arch, shape, pp, ad| native_preflight(raw, arch, shape, pp, ad);
 
         // Dense 27B: unchanged. auto/unset and explicit fp8/bf16 native; q8 override.
         for raw in ["", "auto", "fp8"] {
-            assert_eq!(
-                ok(raw, "gfx1201", DENSE, 1, false, false),
-                Ok(Fp8),
-                "dense {raw}"
-            );
+            assert_eq!(ok(raw, "gfx1201", DENSE, 1, false), Ok(Fp8), "dense {raw}");
         }
-        assert_eq!(ok("bf16", "gfx1201", DENSE, 1, false, false), Ok(Bf16));
-        assert_eq!(ok("q8", "gfx1201", DENSE, 1, false, false), Ok(Q8));
+        assert_eq!(ok("bf16", "gfx1201", DENSE, 1, false), Ok(Bf16));
+        assert_eq!(ok("q8", "gfx1201", DENSE, 1, false), Ok(Q8));
 
         // Exact A3B H16/Hkv2/D256: auto/unset and explicit fp8 are qualified;
         // q8 override honored, bf16 NOT widened.
         for raw in ["", "auto", "fp8"] {
-            assert_eq!(
-                ok(raw, "gfx1201", A3B, 1, false, false),
-                Ok(Fp8),
-                "a3b {raw}"
-            );
+            assert_eq!(ok(raw, "gfx1201", A3B, 1, false), Ok(Fp8), "a3b {raw}");
         }
-        assert_eq!(ok("q8", "gfx1201", A3B, 1, false, false), Ok(Q8));
-        assert!(ok("bf16", "gfx1201", A3B, 1, false, false).is_err());
-        assert!(ok("fp8", "gfx1201", (8, 2, 256), 1, false, false).is_err());
+        assert_eq!(ok("q8", "gfx1201", A3B, 1, false), Ok(Q8));
+        assert!(ok("bf16", "gfx1201", A3B, 1, false).is_err());
+        assert!(ok("fp8", "gfx1201", (8, 2, 256), 1, false).is_err());
 
         // Wrong shapes fail closed for explicit fp8/bf16; auto stays q8.
         for shape in [
@@ -952,42 +936,41 @@ mod tests {
         ] {
             for raw in ["fp8", "bf16"] {
                 assert!(
-                    ok(raw, "gfx1201", shape, 1, false, false).is_err(),
+                    ok(raw, "gfx1201", shape, 1, false).is_err(),
                     "{shape:?} {raw}"
                 );
             }
             for raw in ["", "auto"] {
                 assert_eq!(
-                    ok(raw, "gfx1201", shape, 1, false, false),
+                    ok(raw, "gfx1201", shape, 1, false),
                     Ok(Q8),
                     "{shape:?} {raw}"
                 );
             }
         }
 
-        // pp>1, adaptive, CASK and non-gfx1201 refuse explicit native on both
+        // pp>1, adaptive and non-gfx1201 refuse explicit native on both
         // supported shapes; auto stays q8; q8 override stays valid.
         for shape in [DENSE, A3B] {
-            for (arch, pp, ad, cask) in [
-                ("gfx1201", 2, false, false),
-                ("gfx1201", 1, true, false),
-                ("gfx1201", 1, false, true),
-                ("gfx1100", 1, false, false),
-                ("gfx1151", 1, false, false),
-                ("gfx1200", 1, false, false),
-                ("gfx942", 1, false, false),
+            for (arch, pp, ad) in [
+                ("gfx1201", 2, false),
+                ("gfx1201", 1, true),
+                ("gfx1100", 1, false),
+                ("gfx1151", 1, false),
+                ("gfx1200", 1, false),
+                ("gfx942", 1, false),
             ] {
                 for raw in ["fp8", "bf16"] {
                     assert!(
-                        ok(raw, arch, shape, pp, ad, cask).is_err(),
-                        "{shape:?} {arch} pp{pp} ad{ad} cask{cask} {raw}"
+                        ok(raw, arch, shape, pp, ad).is_err(),
+                        "{shape:?} {arch} pp{pp} ad{ad} {raw}"
                     );
                 }
                 for raw in ["", "auto", "q8"] {
                     assert_eq!(
-                        ok(raw, arch, shape, pp, ad, cask),
+                        ok(raw, arch, shape, pp, ad),
                         Ok(Q8),
-                        "{shape:?} {arch} pp{pp} ad{ad} cask{cask} {raw}"
+                        "{shape:?} {arch} pp{pp} ad{ad} {raw}"
                     );
                 }
             }
@@ -997,7 +980,7 @@ mod tests {
     #[test]
     fn native_predicates_per_mode_and_auto_is_subset_of_fp8_support() {
         let sup = |m, shape: (usize, usize, usize)| {
-            qwen35_native_supported(m, "gfx1201", shape.0, shape.1, shape.2, 1, false, false)
+            qwen35_native_supported(m, "gfx1201", shape.0, shape.1, shape.2, 1, false)
         };
         assert!(sup(Fp8, (24, 4, 256)) && sup(Fp8, (16, 2, 256)));
         assert!(sup(Bf16, (24, 4, 256)) && !sup(Bf16, (16, 2, 256)));
@@ -1005,28 +988,19 @@ mod tests {
             assert!(!sup(m, (24, 4, 256)) && !sup(m, (16, 2, 256)), "{m:?}");
         }
         // Auto qualification includes both exact supported FP8 geometries.
-        assert!(qwen35_native_auto_eligible(
-            "gfx1201", 24, 4, 256, 1, false, false
-        ));
-        assert!(qwen35_native_auto_eligible(
-            "gfx1201", 16, 2, 256, 1, false, false
-        ));
+        assert!(qwen35_native_auto_eligible("gfx1201", 24, 4, 256, 1, false));
+        assert!(qwen35_native_auto_eligible("gfx1201", 16, 2, 256, 1, false));
         for arch in ["gfx1201", "gfx1100"] {
             for (h, kv, d) in [(24, 4, 256), (16, 2, 256), (8, 2, 256)] {
-                for (pp, ad, cask) in [
-                    (1, false, false),
-                    (2, false, false),
-                    (1, true, false),
-                    (1, false, true),
-                ] {
-                    if qwen35_native_auto_eligible(arch, h, kv, d, pp, ad, cask) {
-                        assert!(qwen35_native_supported(Fp8, arch, h, kv, d, pp, ad, cask));
+                for (pp, ad) in [(1, false), (2, false), (1, true)] {
+                    if qwen35_native_auto_eligible(arch, h, kv, d, pp, ad) {
+                        assert!(qwen35_native_supported(Fp8, arch, h, kv, d, pp, ad));
                     }
                 }
             }
         }
-        assert!(qwen35_native_refusal(Fp8, "gfx1201", 16, 2, 256, 1, false, false).is_none());
-        assert!(qwen35_native_refusal(Fp8, "gfx1201", 16, 2, 256, 2, false, false).is_some());
+        assert!(qwen35_native_refusal(Fp8, "gfx1201", 16, 2, 256, 1, false).is_none());
+        assert!(qwen35_native_refusal(Fp8, "gfx1201", 16, 2, 256, 2, false).is_some());
     }
 
     #[test]

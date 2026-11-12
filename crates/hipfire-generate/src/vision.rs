@@ -247,7 +247,7 @@ impl<'a> GenerateVLParams<'a> {
     }
 }
 
-pub fn vl_no_eviction_kv_cap(physical_cap: usize, max_seq: usize, adaptive_engaged: bool) -> usize {
+pub fn vl_kv_cap(physical_cap: usize, max_seq: usize, adaptive_engaged: bool) -> usize {
     if adaptive_engaged {
         max_seq
     } else {
@@ -635,7 +635,7 @@ pub(crate) fn image_pad_runs(tokens: &[u32], image_pad_id: u32) -> Vec<(usize, u
 /// exact-match edge (nothing new to prefill) would re-apply the last token's
 /// non-commutative recurrent update, so it starts cold, as does a boundary
 /// that would cut through an image's pad run. Everything else — a diverging
-/// history, an edited message, eviction — is `0` (cold start).
+/// history, an edited message — is `0` (cold start).
 ///
 /// Every image's rows carry the same `<|image_pad|>` id, so equal tokens do not
 /// make equal images: the resident images' content fingerprints
@@ -1157,12 +1157,11 @@ pub fn generate_vl(
         .as_deref()
         != Some("0");
     // The text path's prompt-cache kill switch also gates continuing a vision
-    // conversation in place; eviction renumbers physical rows, so it never does.
+    // conversation in place.
     let turn_cache_enabled = hipfire_config::developer_var("HIPFIRE_QWEN_PROMPT_CACHE")
         .ok()
         .as_deref()
-        != Some("0")
-        && m.eviction.is_none();
+        != Some("0");
     let rendered = match m.tokenizer.as_ref() {
         None => Err("tokenizer not loaded".to_owned()),
         Some(tokenizer) => {
@@ -1371,76 +1370,48 @@ pub fn generate_vl(
     let dn = &mut b.dn_state;
     let vision_weights = b.vision_weights.as_ref().unwrap();
 
-    // KV-budget guard — tier-aware without eviction, absolute window with.
+    // KV-budget guard — tier-aware.
     // Adaptive admits against max_seq (floor-tier guarantee); non-adaptive keeps
     // physical_cap. Reserves trailer slots so natural im_end can write ChatML \n.
     // Checked on the real prefill length BEFORE the vision tower runs, the most
     // expensive part of a VL prefill.
     let trailer = nl.len();
-    let absolute_pos_vl = m.seq_pos.saturating_add(kv.compact_offset);
     let adaptive_engaged = m.kv_adaptive.is_some();
-    let no_evict_cap = vl_no_eviction_kv_cap(m.physical_cap, m.max_seq, adaptive_engaged);
-    let max_tokens = if m.eviction.is_none() {
-        crate::common::fit_max_tokens(
-            max_tokens,
-            m.seq_pos + prompt_tokens.len() + trailer,
-            no_evict_cap,
-        )
-    } else {
-        crate::common::fit_max_tokens(
-            max_tokens,
-            absolute_pos_vl + prompt_tokens.len() + trailer,
-            m.max_seq,
-        )
-    };
-    let over_budget = if m.eviction.is_none() {
-        m.seq_pos
-            .saturating_add(prompt_tokens.len())
-            .saturating_add(max_tokens)
-            .saturating_add(trailer)
-            > no_evict_cap
-    } else {
-        absolute_pos_vl
-            .saturating_add(prompt_tokens.len())
-            .saturating_add(max_tokens)
-            .saturating_add(trailer)
-            > m.max_seq
-    };
+    let kv_cap = vl_kv_cap(m.physical_cap, m.max_seq, adaptive_engaged);
+    let max_tokens = crate::common::fit_max_tokens(
+        max_tokens,
+        m.seq_pos + prompt_tokens.len() + trailer,
+        kv_cap,
+    );
+    let over_budget = m
+        .seq_pos
+        .saturating_add(prompt_tokens.len())
+        .saturating_add(max_tokens)
+        .saturating_add(trailer)
+        > kv_cap;
     if over_budget {
         write_error(stdout, id, &format!(
             "request exceeds loaded KV budget: seq_pos={} + prefill={} + max_tokens={} + trailer={} > cap={} — reload model with a larger max_seq",
             m.seq_pos, prompt_tokens.len(), max_tokens, trailer,
-            if m.eviction.is_none() { no_evict_cap } else { m.max_seq },
+            kv_cap,
         ));
         return;
     }
 
     // 3D mrope phases for this request, from the whole conversation, BEFORE any
     // GPU work so a validation bail is cheap.
-    //
-    // Disabled while eviction is armed: TriAttention renumbers physical slots
-    // mid-prefill (`m.seq_pos = new_phys`), and `MropeCtx::positions` is indexed
-    // by physical position. Rather than silently mis-indexing, that
-    // configuration keeps today's 1D behavior.
-    let mrope_ctx = if m.eviction.is_some() {
-        if !grids.is_empty() {
-            eprintln!("[daemon/vl] mrope disabled (eviction armed) — falling back to 1D positions");
-        }
-        None
-    } else {
-        match build_vl_mrope_ctx(
-            &prompt_full,
-            image_pad_id,
-            &grids,
-            vision_config.spatial_merge_size,
-            reuse,
-            config,
-        ) {
-            Ok(ctx) => Some(ctx),
-            Err(e) => {
-                write_error(stdout, id, &format!("vision rope phases: {e}"));
-                return;
-            }
+    let mrope_ctx = match build_vl_mrope_ctx(
+        &prompt_full,
+        image_pad_id,
+        &grids,
+        vision_config.spatial_merge_size,
+        reuse,
+        config,
+    ) {
+        Ok(ctx) => Some(ctx),
+        Err(e) => {
+            write_error(stdout, id, &format!("vision rope phases: {e}"));
+            return;
         }
     };
     let mrope = mrope_ctx.as_ref();
@@ -1543,15 +1514,13 @@ pub fn generate_vl(
     // Chosen BEFORE any prefill work. The batched route runs the prompt through
     // `forward_prefill_batch` chunks with the vision embeddings spliced over the
     // `<|image_pad|>` rows and the SAME absolute mrope phases the per-token arm
-    // uses (`qwen35::vl_prefill`); it needs a dense, batch-admissible model and
-    // no eviction. Anything else (and `HIPFIRE_VL_PREFILL=token`) keeps the
+    // uses (`qwen35::vl_prefill`); it needs a dense, batch-admissible model.
+    // Anything else (and `HIPFIRE_VL_PREFILL=token`) keeps the
     // per-token loop below. Decode is unchanged either way.
     let vl_token_forced = hipfire_config::developer_var("HIPFIRE_VL_PREFILL")
         .is_ok_and(|v| v.trim().eq_ignore_ascii_case("token"));
     let vl_batched_why: Result<(), String> = if vl_token_forced {
         Err("HIPFIRE_VL_PREFILL=token".to_string())
-    } else if m.eviction.is_some() {
-        Err("eviction armed".to_string())
     } else if m.ep.is_some() || m.pp > 1 {
         Err("multi-GPU topology".to_string())
     } else if prompt_tokens.len() < 2 {
@@ -1600,7 +1569,7 @@ pub fn generate_vl(
                 return;
             }
         };
-        // Outer chunking follows the ar.rs no-eviction branch: the admitted
+        // Outer chunking follows the ar.rs prefill branch: the admitted
         // ordinary ceiling, or the hard `PREFILL_MAX_BATCH` under adaptive KV
         // so the controller's downshift boundaries stay exact.
         let chunk_max = if m.kv_adaptive.is_some() {
@@ -1765,8 +1734,8 @@ pub fn generate_vl(
     }
 
     // Per-token prefill with vision token embedding for image_pad positions
-    // (`HIPFIRE_VL_PREFILL=token`, eviction, MoE / non-batch-admissible
-    // models). We advance m.seq_pos in-loop and call maybe_evict /
+    // (`HIPFIRE_VL_PREFILL=token`, MoE / non-batch-admissible
+    // models). We advance m.seq_pos in-loop and call
     // maybe_downshift after every committed write. Lazy VMM map/growth
     // failures and adaptive transition errors are request-scoped (no panic,
     // no later token emit). Empty when the batched route above already ran.
@@ -1841,33 +1810,6 @@ pub fn generate_vl(
             return;
         }
         m.seq_pos += 1;
-        if let Some(ref ev) = m.eviction {
-            match ev.maybe_evict(gpu, kv, m.seq_pos) {
-                Ok(Some(hipfire_runtime::triattn::EvictionResult {
-                    new_physical: new_phys,
-                    ..
-                })) => {
-                    m.seq_pos = new_phys;
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    vl_forward_fail(
-                        stdout,
-                        id,
-                        "maybe_evict (prefill)",
-                        e,
-                        gpu,
-                        dn,
-                        kv,
-                        &mut m.kv_adaptive,
-                        &mut m.seq_pos,
-                        &mut m.conversation_tokens,
-                        &mut m.prefill_checkpoints,
-                    );
-                    return;
-                }
-            }
-        }
         // Adaptive KV: downshift BETWEEN prefill tokens the moment the
         // start-tier buffer fills so a long multi-chunk visual+text prompt
         // cannot overflow current-stride capacity before decode begins.
@@ -2063,7 +2005,7 @@ pub fn generate_vl(
         }
         // Commit KV for this sampled token BEFORE any client-visible emit so a
         // lazy VMM map/growth failure cannot stream an uncommitted token.
-        // Order: forward → seq_pos++ → evict → downshift → then
+        // Order: forward → seq_pos++ → downshift → then
         // generated/conversation/committed/token text. On failure: cold-reset
         // + request error only (no failed token). Terminators break after a
         // successful commit (same as AR).
@@ -2086,33 +2028,6 @@ pub fn generate_vl(
             return;
         }
         m.seq_pos += 1;
-        if let Some(ref ev) = m.eviction {
-            match ev.maybe_evict(gpu, kv, m.seq_pos) {
-                Ok(Some(hipfire_runtime::triattn::EvictionResult {
-                    new_physical: new_phys,
-                    ..
-                })) => {
-                    m.seq_pos = new_phys;
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    vl_forward_fail(
-                        stdout,
-                        id,
-                        "maybe_evict (decode)",
-                        e,
-                        gpu,
-                        dn,
-                        kv,
-                        &mut m.kv_adaptive,
-                        &mut m.seq_pos,
-                        &mut m.conversation_tokens,
-                        &mut m.prefill_checkpoints,
-                    );
-                    return;
-                }
-            }
-        }
         if vl_adaptive_downshift_fail_closed(
             &mut m.kv_adaptive,
             &mut m.seq_pos,
@@ -2244,33 +2159,6 @@ pub fn generate_vl(
                             return;
                         }
                         m.seq_pos += 1;
-                        if let Some(ref ev) = m.eviction {
-                            match ev.maybe_evict(gpu, kv, m.seq_pos) {
-                                Ok(Some(hipfire_runtime::triattn::EvictionResult {
-                                    new_physical: new_phys,
-                                    ..
-                                })) => {
-                                    m.seq_pos = new_phys;
-                                }
-                                Ok(None) => {}
-                                Err(e) => {
-                                    vl_forward_fail(
-                                        stdout,
-                                        id,
-                                        "maybe_evict (vl-think-close)",
-                                        e,
-                                        gpu,
-                                        dn,
-                                        kv,
-                                        &mut m.kv_adaptive,
-                                        &mut m.seq_pos,
-                                        &mut m.conversation_tokens,
-                                        &mut m.prefill_checkpoints,
-                                    );
-                                    return;
-                                }
-                            }
-                        }
                         if vl_adaptive_downshift_fail_closed(
                             &mut m.kv_adaptive,
                             &mut m.seq_pos,
@@ -2389,33 +2277,6 @@ pub fn generate_vl(
                 return;
             }
             m.seq_pos += 1;
-            if let Some(ref ev) = m.eviction {
-                match ev.maybe_evict(gpu, kv, m.seq_pos) {
-                    Ok(Some(hipfire_runtime::triattn::EvictionResult {
-                        new_physical: new_phys,
-                        ..
-                    })) => {
-                        m.seq_pos = new_phys;
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        vl_forward_fail(
-                            stdout,
-                            id,
-                            "maybe_evict (vl-trailer)",
-                            e,
-                            gpu,
-                            dn,
-                            kv,
-                            &mut m.kv_adaptive,
-                            &mut m.seq_pos,
-                            &mut m.conversation_tokens,
-                            &mut m.prefill_checkpoints,
-                        );
-                        return;
-                    }
-                }
-            }
             if vl_adaptive_downshift_fail_closed(
                 &mut m.kv_adaptive,
                 &mut m.seq_pos,
@@ -4535,7 +4396,7 @@ mod vl_history_tests {
             vl_plan_reuse(prior, prompt, seq_pos, allowed, PAD, &one, &one)
         };
         assert_eq!(plan(&prior, &longer, 6, true), 6);
-        // Reuse disabled (eviction / kill switch), nothing resident, a cursor that
+        // Reuse disabled (kill switch), nothing resident, a cursor that
         // is not at the end of the resident tokens: cold.
         assert_eq!(plan(&prior, &longer, 6, false), 0);
         assert_eq!(plan(&[], &longer, 0, true), 0);

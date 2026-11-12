@@ -1493,12 +1493,7 @@ fn score_lanes(
 /// `load_model`'s admitted route with the per-load lane reservation and the MTP head armed, as
 /// `fn_mesh_lane_oracle --spec mtp --reserve-lanes 8` loads: the loader reserves `LANES` MTP
 /// lanes (depth `k`) in the EP expert placement. Planner capacity only; forward numerics unchanged.
-fn load_lanes_model(
-    args: &Args,
-    k: usize,
-    cask: &hipfire_runtime::loader_api::CaskConfig,
-    gpu: &mut Gpu,
-) -> R<hipfire_loader::LoadedModel> {
+fn load_lanes_model(args: &Args, k: usize, gpu: &mut Gpu) -> R<hipfire_loader::LoadedModel> {
     use hipfire_loader::admission::{
         admit_source_with_options, legacy_warning, qwen4_kv_adaptive_requested,
         qwen_default_q8_enabled, BatchLoadRequest, KvBackendHints, KvBackendRequest,
@@ -1525,7 +1520,6 @@ fn load_lanes_model(
             kv_v: None,
             qwen_default_q8: qwen_default_q8_enabled(),
             kv_adaptive: None,
-            cask: Some(cask),
             deepseek4_heterogeneous: false,
             vmm_runtime_refusal: gpu.vmm_runtime_refusal().as_deref(),
             free_vram_bytes: gpu.device_mem_info().ok().map(|(free, _)| free),
@@ -1533,7 +1527,6 @@ fn load_lanes_model(
         SourceAdmissionOptions {
             spec,
             kv_adaptive: qwen4_kv_adaptive_requested(None),
-            cask: cask.sidecar.is_some(),
             ..Default::default()
         },
     )?;
@@ -1559,7 +1552,6 @@ fn load_lanes_model(
         None,
         None,
         None,
-        cask,
         1,
         spec,
         gpu,
@@ -1589,7 +1581,6 @@ fn run(args: &Args) -> R<()> {
     // bounded wait trips (the EP2 route just stalls).
     hipfire_loader::prepare_host_memory_for(Path::new(&args.model));
     let mut gpu = Gpu::init().map_err(|x| format!("Gpu::init: {x:?}"))?;
-    let cask = hipfire_runtime::loader_api::CaskConfig::default();
     let mut model = match args.route {
         Route::Decode => hipfire_loader::load_model(
             &args.model,
@@ -1598,12 +1589,11 @@ fn run(args: &Args) -> R<()> {
             args.kv_mode.as_deref(),
             None,
             args.state_quant.as_deref(),
-            &cask,
             1,
             hipfire_runtime::loader_api::SpecLoadCfg::default(),
             &mut gpu,
         )?,
-        Route::Lanes { k } => load_lanes_model(args, k, &cask, &mut gpu)?,
+        Route::Lanes { k } => load_lanes_model(args, k, &mut gpu)?,
     };
     let bundle = model
         .qwen4_mut()

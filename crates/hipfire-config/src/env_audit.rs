@@ -15,7 +15,7 @@ use std::sync::LazyLock;
 
 use serde::Serialize;
 
-use crate::{developer_key_for_env, fields, is_deprecated_key, BOOTSTRAP_ENV};
+use crate::{developer_key_for_env, fields, BOOTSTRAP_ENV};
 
 const INVENTORY_DOC: &str = include_str!("../../../docs/env-vars.md");
 
@@ -166,9 +166,7 @@ fn deprecated(name: &str, value: &str) -> Option<EnvStatus> {
             return None;
         }
         entry.replacement
-    } else if schema_env_key(name).is_some_and(|field| is_deprecated_key(field.key))
-        || inventory().get(name) == Some(&Some("deprecated"))
-    {
+    } else if inventory().get(name) == Some(&Some("deprecated")) {
         NO_REPLACEMENT
     } else {
         return None;
@@ -307,7 +305,6 @@ mod tests {
         let names = inventory();
         assert!(names.len() > 1000, "parsed {} names", names.len());
         assert!(names.contains_key("HIPFIRE_KV_MODE"));
-        assert_eq!(names.get("HIPFIRE_CASK_SIDECAR"), Some(&Some("deprecated")));
     }
 
     #[test]
@@ -358,14 +355,6 @@ mod tests {
                 .kind_is_deprecated(),
             true
         );
-        // env_compat of a deprecated schema key.
-        let cask = fields()
-            .iter()
-            .find(|f| f.env_compat.is_some() && is_deprecated_key(f.key))
-            .expect("a deprecated key has an env alias");
-        assert!(one(cask.env_compat.unwrap(), "1")
-            .status
-            .kind_is_deprecated());
     }
 
     #[test]

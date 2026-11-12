@@ -1967,13 +1967,11 @@ pub fn llama_batched_prefill_eligible(
     gpu_arch: &str,
     prefill_batched_enabled: bool,
     quant_q8: bool,
-    has_eviction: bool,
     token_count: usize,
 ) -> bool {
     (gpu_arch.starts_with("gfx11") || gpu_arch == "gfx1201")
         && prefill_batched_enabled
         && quant_q8
-        && !has_eviction
         && token_count >= 4
 }
 

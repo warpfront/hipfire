@@ -51,7 +51,7 @@ use hipfire_arch_raon::forward::{
 };
 use hipfire_arch_raon::load_raon_bundle;
 use hipfire_runtime::kv_backend::KvBackend;
-use hipfire_runtime::loader_api::{CaskConfig, LoadCtx, ModelSource, SpecLoadCfg};
+use hipfire_runtime::loader_api::{LoadCtx, ModelSource, SpecLoadCfg};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use serde_json::{json, Map, Value};
 
@@ -124,7 +124,6 @@ pub fn load_bundle(
     path: &str,
     max_seq: usize,
 ) -> Result<RaonBundle, String> {
-    let cask = CaskConfig::default();
     let mut ctx = LoadCtx {
         path,
         max_seq,
@@ -142,7 +141,6 @@ pub fn load_bundle(
         kv_backend: KvBackend::default(),
         kv_adaptive_override: None,
         state_quant_override: None,
-        cask: &cask,
         pp: 1,
         pp_layer_counts: None,
         admitted_mesh: None,

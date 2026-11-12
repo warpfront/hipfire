@@ -43,12 +43,12 @@ use hipfire_generate::ar::{
     ckpt_interval, ckpt_max, ckpt_resume_enabled, deepseek4_spec_requested,
     deepseek4_spec_requested_from_policy, emit_qwen_ar_done, generate, llama_prefill_sample_seed,
     model_retry_reset_eligible, qwen_ar_cache_action, qwen_ar_done_value,
-    qwen_ar_drain_pending_into_router, qwen_ar_eviction_prefill_chunk_limit, qwen_ar_finish_route,
-    qwen_ar_forward_fail_action, qwen_ar_forward_fail_message, qwen_ar_observe_and_route,
-    qwen_ar_raw_commit_token, qwen_ar_route_filter_text, qwen_ar_route_think_events,
-    reset_core_arch_key, select_generation_route, truncate_checkpoints, write_error,
-    GenerationRoute, GenerationRouteInputs, QwenArForwardFailAction, QwenArRawCommitDisposition,
-    QwenArRouteFinish, QwenArSemanticProducer, QwenArTerminalCause,
+    qwen_ar_drain_pending_into_router, qwen_ar_finish_route, qwen_ar_forward_fail_action,
+    qwen_ar_forward_fail_message, qwen_ar_observe_and_route, qwen_ar_raw_commit_token,
+    qwen_ar_route_filter_text, qwen_ar_route_think_events, reset_core_arch_key,
+    select_generation_route, truncate_checkpoints, write_error, GenerationRoute,
+    GenerationRouteInputs, QwenArForwardFailAction, QwenArRawCommitDisposition, QwenArRouteFinish,
+    QwenArSemanticProducer, QwenArTerminalCause,
 };
 use hipfire_generate::batch::{
     attach_qwen_ep_batch_receipt_evidence, drive_lfm_continuous_batch,
@@ -103,17 +103,16 @@ use vision_ladder::{apply_vision_mode_gate, resolve_vision_ladder};
 pub(crate) static TERMINAL_TEST_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 use hipfire_generate::vision::{GenerateVLParams, ImageSource};
-use hipfire_loader::{AsstTurnCache, Eviction, LoadedModel};
+use hipfire_loader::{AsstTurnCache, LoadedModel};
 use hipfire_runtime::spec::{
-    ClientEvent, EmitOutcome, EvictRetain, FinishSummary, PrefillOutcome, SpecAdvance, SpecEmit,
-    SpecTarget, Speculator, StopReason,
+    ClientEvent, EmitOutcome, FinishSummary, PrefillOutcome, SpecAdvance, SpecEmit, SpecTarget,
+    Speculator, StopReason,
 };
 
 /// Formats the independent Qwen decode-batch path can actually execute.
 /// Must stay aligned with `lm_head_batched` + `prepare_decode_batch_inputs`
 /// in hipfire-arch-qwen35 — unsupported lm_head or F32 embedding must never
 /// advertise `continuous_batch_capable` or enter the batch route.
-pub type CaskConfig = hipfire_runtime::loader_api::CaskConfig;
 #[allow(dead_code)]
 fn emit_error_no_id(stdout: &mut impl std::io::Write, message: impl std::fmt::Display) {
     emit_uncorrelated_error(stdout, None, &message.to_string(), "internal", false, false);
@@ -534,7 +533,7 @@ const MAX_BASE64_ENCODED_LEN: usize = 40 * 1024 * 1024;
 /// hunt3 H-D: upper bound on a request-driven `max_seq` (1M). A defense-in-
 /// depth clamp only — it caps an unvalidated 10M `max_seq` that would otherwise
 /// drive a multi-GB KV allocation and OOM the daemon at load. It is NOT a
-/// VRAM-aware guard: a load that requests exactly this on a non-eviction config
+/// VRAM-aware guard: a load that requests exactly this
 /// can still OOM at allocation; that VRAM validation is out of scope here.
 const MAX_REQUESTED_SEQ: usize = 1024 * 1024;
 
@@ -2017,83 +2016,6 @@ fn main() {
                     dflash_block_auto,
                 };
 
-                // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
-                // 0.1.7: TriAttention / CASK eviction protocol fields. When
-                // `cask_sidecar` is set, `load_model` sizes the KV cache to a
-                // *physical_cap* (budget+beta+safety, clamped to max_seq) instead
-                // of the full max_seq, and wires an `Eviction` policy that the
-                // generate loop calls after every prefill-chunk / decode-forward.
-                // That decouples advertised context length from VRAM footprint —
-                // a 128K max_seq can run in ~1K-slot physical buffer when the
-                // operator opts in.
-                let cask_sidecar = msg
-                    .get("params")
-                    .and_then(|p| p.get("cask_sidecar"))
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_string());
-                let cask_enabled = msg
-                    .get("params")
-                    .and_then(|p| p.get("cask"))
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                let cask_budget = msg
-                    .get("params")
-                    .and_then(|p| p.get("cask_budget"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(512) as usize;
-                let cask_beta = msg
-                    .get("params")
-                    .and_then(|p| p.get("cask_beta"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(128) as usize;
-                let cask_handoff_tokens = msg
-                    .get("params")
-                    .and_then(|p| p.get("cask_handoff_tokens"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as usize;
-                let cask_core_frac = msg
-                    .get("params")
-                    .and_then(|p| p.get("cask_core_frac"))
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(0.5) as f32;
-                let cask_fold_m = msg
-                    .get("params")
-                    .and_then(|p| p.get("cask_fold_m"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(2) as usize;
-                // CASK/TriAttention eviction is deprecated (removal in 0.5.0):
-                // it still loads, but every opt-in gets exactly one warning line.
-                if cask_sidecar.is_some() || cask_enabled {
-                    eprintln!(
-                        "[hipfire-daemon] warning: CASK is deprecated and will be removed in 0.5.0; not supported (cask_sidecar/cask set at load)"
-                    );
-                }
-                // Known-broken combo guard: CASK m-folding + DFlash spec decode
-                // degenerates into single-token loops after the first eviction
-                // (the m-folded synthetic K/V rows are off the draft's trained
-                // hidden-state distribution). Until that's fixed at the library
-                // level, downgrade m-folding to plain TriAttention drop-eviction
-                // when a draft is attached. User's context window + eviction
-                // cadence still work; just the fold step is skipped.
-                let cask_m_folding_effective = if cask_enabled && draft_path.is_some() {
-                    eprintln!(
-                        "[hipfire-daemon] cask:true + draft: both set — downgrading to plain TriAttention drop-eviction (CASK m-fold + DFlash is a known-broken combo; see feedback_cask_mfold_dflash_broken.md)",
-                    );
-                    false
-                } else {
-                    cask_enabled
-                };
-                let cask = CaskConfig {
-                    sidecar: cask_sidecar,
-                    cask_m_folding: cask_m_folding_effective,
-                    handoff_tokens: cask_handoff_tokens,
-                    budget: cask_budget,
-                    beta: cask_beta,
-                    core_frac: cask_core_frac,
-                    fold_m: cask_fold_m,
-                };
-
                 // MMQ per-weight screening (#87): detect outlier rows that
                 // cause Q8_1 precision loss and fall back to WMMA for those
                 // weights. Disabled by default; enable with mmq_screen=true
@@ -2115,7 +2037,7 @@ fn main() {
 
                 // Pipeline-parallel degree (Stage 7 of #58). Default 1 =
                 // single-GPU (no behavior change). pp > 1 routes through
-                // Gpus + *_multi paths and refuses VL / DFlash / CASK at load
+                // Gpus + *_multi paths and refuses VL / DFlash at load
                 // time. v1 supports Qwen3.5 dense + MoE
                 // only — see load_model_pp for the arch_id check.
                 let pp = load_pp;
@@ -2159,11 +2081,6 @@ fn main() {
                         && developer_var("HIPFIRE_PP_DFLASH").ok().as_deref() != Some("1")
                     {
                         emit_uncorrelated_error(&mut stdout, None, "DFlash speculative decode requires pp=1 in v1 (set HIPFIRE_PP_DFLASH=1 to opt into the experimental pp>1 path; the load message will accept but generate will not run cross-card spec-decode). See issue #58 v1.1 roadmap.", "unsupported", false, false);
-                        let _ = stdout.flush();
-                        continue;
-                    }
-                    if cask.sidecar.is_some() {
-                        emit_uncorrelated_error(&mut stdout, None, "CASK / TriAttention eviction requires pp=1 in v1; see issue #58 v1.1 roadmap", "unsupported", false, false);
                         let _ = stdout.flush();
                         continue;
                     }
@@ -2227,7 +2144,6 @@ fn main() {
                         kv_adaptive_override.as_deref(),
                     ),
                     eagle_drafter: gemma4_drafter.is_some(),
-                    cask: cask.sidecar.is_some(),
                     state_quant: state_quant_override.is_some(),
                     non_single_compute: !matches!(
                         deepseek4_compute_placement,
@@ -2273,7 +2189,6 @@ fn main() {
                         kv_k: kv_k_override.as_deref(),
                         kv_v: kv_v_override.as_deref(),
                         kv_adaptive: kv_adaptive_override.as_deref(),
-                        cask: Some(&cask),
                         deepseek4_heterogeneous: !matches!(
                             deepseek4_compute_placement,
                             hipfire_config::Deepseek4ComputePlacement::Single
@@ -2407,7 +2322,6 @@ fn main() {
                         kv_k_override.as_deref(),
                         kv_adaptive_override.as_deref(),
                         state_quant_override.as_deref(),
-                        &cask,
                         pp,
                         spec_cfg,
                         &mut gpu,

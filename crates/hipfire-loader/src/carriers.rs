@@ -576,14 +576,8 @@ impl Carrier for Qwen2Carrier {
         // Opt-in model-free n-gram speculator (HIPFIRE_NGRAM_DRAFT=1). Qwen2
         // (arch_id=7, e.g. VibeThinker) impls `SpecTarget`, so it can be driven by
         // the arch-generic spec loop with no draft model. `None` ⇒ AR-only.
-        let speculator = crate::spec_build::build_speculator(
-            meta.arch_id,
-            None,
-            None,
-            true,
-            ctx.max_seq,
-            ctx.spec,
-        );
+        let speculator =
+            crate::spec_build::build_speculator(meta.arch_id, None, None, ctx.max_seq, ctx.spec);
         Ok(LoadedModel {
             state: Some(Box::new(bundle)),
             speculator,
@@ -752,7 +746,6 @@ impl Carrier for Qwen4Carrier {
                 "n-gram draft (speculation.ngram_draft)",
             ),
             (qwen4_ddtree_requested(spec), "DDTree"),
-            (options.cask, "CASK (memory.cask)"),
             (options.non_single_compute, "non-single compute placement"),
             (options.expert_count_override, "expert-count override"),
         ]
@@ -854,7 +847,6 @@ impl Carrier for Qwen4Carrier {
             spec: ctx.spec,
             kv_adaptive: crate::admission::qwen4_kv_adaptive_requested(ctx.kv_adaptive_override),
             eagle_drafter: ctx.gemma4_drafter_path.is_some(),
-            cask: ctx.cask.sidecar.is_some(),
             state_quant: ctx.state_quant_override.is_some(),
             non_single_compute: !matches!(
                 &ctx.deepseek4_compute_placement,
@@ -1171,7 +1163,6 @@ pub(crate) fn qwen4_ep_option_refusal(
         (qwen4_ddtree_requested(spec), "DDTree"),
         (options.kv_adaptive, "adaptive KV"),
         (options.eagle_drafter, "an EAGLE drafter"),
-        (options.cask, "CASK"),
         (
             options.expert_count_override,
             "an experts-per-token override",
@@ -11067,7 +11058,6 @@ fn load_qwen4_pp_model(src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedMode
         spec: ctx.spec,
         kv_adaptive: crate::admission::qwen4_kv_adaptive_requested(ctx.kv_adaptive_override),
         eagle_drafter: ctx.gemma4_drafter_path.is_some(),
-        cask: ctx.cask.sidecar.is_some(),
         state_quant: ctx.state_quant_override.is_some(),
         non_single_compute: !matches!(
             &ctx.deepseek4_compute_placement,
@@ -12182,7 +12172,6 @@ impl Carrier for LlamaCarrier {
                         meta.arch_id,
                         None,
                         None,
-                        true,
                         ctx.max_seq,
                         ctx.spec,
                     )
@@ -12196,7 +12185,6 @@ impl Carrier for LlamaCarrier {
                         meta.arch_id,
                         None,
                         None,
-                        true,
                         ctx.max_seq,
                         ctx.spec,
                     )
@@ -12204,14 +12192,7 @@ impl Carrier for LlamaCarrier {
             }
         } else {
             // No draft configured: opt-in model-free n-gram (HIPFIRE_NGRAM_DRAFT=1) or None.
-            crate::spec_build::build_speculator(
-                meta.arch_id,
-                None,
-                None,
-                true,
-                ctx.max_seq,
-                ctx.spec,
-            )
+            crate::spec_build::build_speculator(meta.arch_id, None, None, ctx.max_seq, ctx.spec)
         };
         Ok(LoadedModel {
             state: Some(Box::new(bundle)),
@@ -12351,14 +12332,8 @@ impl Carrier for DotsOcrCarrier {
         // output is densely self-repeating. The daemon's `generate_vl_dots_ocr`
         // routes to the spec decode loop when this is `Some` (vision prefill is
         // unchanged; only the decode phase becomes speculative).
-        let speculator = crate::spec_build::build_speculator(
-            meta.arch_id,
-            None,
-            None,
-            true,
-            ctx.max_seq,
-            ctx.spec,
-        );
+        let speculator =
+            crate::spec_build::build_speculator(meta.arch_id, None, None, ctx.max_seq, ctx.spec);
         Ok(LoadedModel {
             state: Some(Box::new(bundle)),
             speculator,
@@ -12763,14 +12738,8 @@ impl Carrier for MinimaxCarrier {
         dir_diag(&src);
         let meta = resolve_source_meta(&src, ctx.path)?;
         let bundle = hipfire_arch_minimax::load_minimax_bundle(src, ctx)?;
-        let speculator = crate::spec_build::build_speculator(
-            meta.arch_id,
-            None,
-            None,
-            true,
-            ctx.max_seq,
-            ctx.spec,
-        );
+        let speculator =
+            crate::spec_build::build_speculator(meta.arch_id, None, None, ctx.max_seq, ctx.spec);
         Ok(LoadedModel {
             state: Some(Box::new(bundle)),
             speculator,
@@ -12934,14 +12903,8 @@ impl Carrier for Lfm2MoeCarrier {
                 return Err(e);
             }
         };
-        let speculator = crate::spec_build::build_speculator(
-            meta.arch_id,
-            None,
-            None,
-            true,
-            ctx.max_seq,
-            ctx.spec,
-        );
+        let speculator =
+            crate::spec_build::build_speculator(meta.arch_id, None, None, ctx.max_seq, ctx.spec);
         Ok(LoadedModel {
             state: Some(Box::new(bundle)),
             speculator,
@@ -13444,14 +13407,8 @@ impl Carrier for Cohere2MoeCarrier {
         dir_diag(&src);
         let meta = resolve_source_meta(&src, ctx.path)?;
         let bundle = hipfire_arch_cohere2moe::load_cohere2moe_bundle(src, ctx)?;
-        let speculator = crate::spec_build::build_speculator(
-            meta.arch_id,
-            None,
-            None,
-            true,
-            ctx.max_seq,
-            ctx.spec,
-        );
+        let speculator =
+            crate::spec_build::build_speculator(meta.arch_id, None, None, ctx.max_seq, ctx.spec);
         Ok(LoadedModel {
             state: Some(Box::new(bundle)),
             speculator,
@@ -13546,14 +13503,8 @@ impl Carrier for MapleCarrier {
         dir_diag(&src);
         let meta = resolve_source_meta(&src, ctx.path)?;
         let bundle = hipfire_arch_maple::load_maple_bundle(src, ctx)?;
-        let speculator = crate::spec_build::build_speculator(
-            meta.arch_id,
-            None,
-            None,
-            true,
-            ctx.max_seq,
-            ctx.spec,
-        );
+        let speculator =
+            crate::spec_build::build_speculator(meta.arch_id, None, None, ctx.max_seq, ctx.spec);
         Ok(LoadedModel {
             state: Some(Box::new(bundle)),
             speculator,
@@ -13929,12 +13880,6 @@ impl Carrier for MuseGlimmerCarrier {
         Some(ok)
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
-        if ctx.kv_backend == KvBackend::Vmm && ctx.cask.sidecar.is_some() {
-            return Err(
-                "muse_glimmer: KV backend 'vmm' does not support CASK/TriAttention eviction; disable the sidecar or use 'legacy'"
-                    .into(),
-            );
-        }
         if ctx.pp > 1 {
             return Err(crate::pp_unsupported_message(
                 "muse_glimmer",
@@ -14127,7 +14072,6 @@ impl Carrier for MuseGlimmerCarrier {
                     meta.arch_id,
                     None,
                     None,
-                    true,
                     ctx.max_seq,
                     ctx.spec,
                 );
@@ -14696,14 +14640,6 @@ mod qwen4_admission_tests {
                 None,
                 SourceAdmissionOptions {
                     eagle_drafter: true,
-                    ..defaults
-                },
-            ),
-            (
-                "CASK",
-                None,
-                SourceAdmissionOptions {
-                    cask: true,
                     ..defaults
                 },
             ),

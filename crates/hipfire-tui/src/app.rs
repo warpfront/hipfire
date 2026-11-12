@@ -116,13 +116,6 @@ pub fn not_editable_status(key: &str) -> String {
     format!("{key} is not editable inline — edit with `hipfire config set {key}`")
 }
 
-/// Status line for a deprecated CASK/PFlash key: shown, never edited inline.
-pub fn deprecated_status(key: &str) -> String {
-    format!(
-        "{key} is deprecated (removal 0.5.0) and read-only here — edit with `hipfire config set {key}`"
-    )
-}
-
 /// A previewed-but-uncommitted enum value (5b). Cycling Left/Right/Space stages
 /// the next value here (dimmed in the UI) WITHOUT writing config.toml, so merely
 /// browsing the options can't mutate config. Enter commits it; Esc or navigating

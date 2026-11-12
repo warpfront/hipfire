@@ -291,10 +291,5 @@ impl SpecTarget for Lfm2MoeBundle {
         self.state.kv.physical_cap
     }
 
-    // kv_cache_mut: defaulted to `None`. Although LFM2 stores attention KV in the
-    // shared `llama::KvCache`, FlashCASK eviction is UNSOUND on this hybrid arch:
-    // evicting attention KV would desync the attention layers from the conv-state
-    // layers (whose recurrent history cannot be evicted in lockstep). arch_id=11
-    // therefore has no eviction; the daemon's eviction sites are
-    // `if let Some(ev)`-gated so this is never reached.
+    // kv_cache_mut: defaulted to `None`.
 }

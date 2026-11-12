@@ -8230,11 +8230,6 @@ pub const RMSNORM_RESIDUAL_ADD_SRC: &str =
 pub const FUSED_GEMMA4_QK_NORM_ROPE_SRC: &str =
     include_str!("../../../kernels/src/fused_gemma4_qk_norm_rope.hip");
 
-/// TriAttention sidecar calibration: GPU band-statistics accumulator.
-/// Replaces the CPU BandAccumulator loop (99% of sidecar cal wall time).
-pub const TRIATTN_ACCUMULATE_SRC: &str =
-    include_str!("../../../kernels/src/triattn_accumulate.hip");
-
 /// Element-wise add
 pub const ADD_SRC: &str = include_str!("../../../kernels/src/add.hip");
 
@@ -9439,39 +9434,6 @@ pub const ATTENTION_FLASH_FWHT2_TILE_SRC: &str =
 pub const ATTENTION_FLASH_FWHT2_TILE_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_fwht2_tile_batched.hip");
 
-/// TriAttention scoring on Q8 post-RoPE K cache (arXiv:2604.04921).
-pub const TRIATTN_SCORE_Q8_SRC: &str = include_str!("../../../kernels/src/triattn_score_q8.hip");
-
-/// TriAttention scoring on asym3 (Givens-rotated 3-bit) K cache.
-pub const TRIATTN_SCORE_ASYM3_SRC: &str =
-    include_str!("../../../kernels/src/triattn_score_asym3.hip");
-
-/// TriAttention scoring on asym4 (Givens-rotated 4-bit) K cache.
-pub const TRIATTN_SCORE_ASYM4_SRC: &str =
-    include_str!("../../../kernels/src/triattn_score_asym4.hip");
-
-/// TriAttention scoring on asym2 (Givens-rotated 2-bit) K cache.
-pub const TRIATTN_SCORE_ASYM2_SRC: &str =
-    include_str!("../../../kernels/src/triattn_score_asym2.hip");
-/// TriAttention scoring for adaptive signed-FWHT K caches.
-pub const TRIATTN_SCORE_FWHT_SRC: &str =
-    include_str!("../../../kernels/src/triattn_score_fwht.hip");
-
-/// Gather-based compaction for KV eviction: copy `budget` src rows to dst.
-pub const KV_COMPACT_GATHER_SRC: &str = include_str!("../../../kernels/src/kv_compact_gather.hip");
-
-/// CASK m-folding merge: weighted-average m Q8_0 rows into 1 per slot (arXiv:2604.10900).
-pub const KV_FOLD_Q8_SRC: &str = include_str!("../../../kernels/src/kv_fold_q8.hip");
-
-/// CASK m-folding merge for asym3 K (givens-rotated 3-bit).
-pub const KV_FOLD_ASYM3_SRC: &str = include_str!("../../../kernels/src/kv_fold_asym3.hip");
-
-/// CASK m-folding merge for asym4 K (givens-rotated 4-bit).
-pub const KV_FOLD_ASYM4_SRC: &str = include_str!("../../../kernels/src/kv_fold_asym4.hip");
-
-/// CASK m-folding merge for asym2 K (givens-rotated 2-bit).
-pub const KV_FOLD_ASYM2_SRC: &str = include_str!("../../../kernels/src/kv_fold_asym2.hip");
-
 /// Quantize KV vector to Q8 (int8 symmetric) and write to quantized KV cache.
 /// Per head: [4B f32 scale][head_dim × int8 values] = head_dim + 4 bytes.
 /// For head_dim=128: 132 bytes vs 512 bytes FP32 = 3.88x compression.
@@ -9591,7 +9553,7 @@ pub const QWEN35_FA_PREP_GFX1100_SRC: &str =
 /// compiler, this body fuses the second output as `fma(x1, cos, x0 * sin)` on
 /// both archs and differs from the unfused chain in the last bit, so decode
 /// diverged between the fused route and the unfused one (which still runs
-/// where the fusion gate is off: TriAttention tap, VL mrope, the opt-out).
+/// where the fusion gate is off: the diagnostic tap, VL mrope, the opt-out).
 fn qwen36_27b_fa_prep_body(entry: &str) -> String {
     let body =
         QWEN35_FA_PREP_GFX1100_SRC.replace("constexpr int NQ = 16;", "constexpr int NQ = 24;");

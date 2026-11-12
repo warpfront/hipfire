@@ -201,7 +201,6 @@ fn load_with_lane_reservation(
     model: &str,
     max_seq: usize,
     lanes: usize,
-    cask: &hipfire_runtime::loader_api::CaskConfig,
     spec: hipfire_runtime::loader_api::SpecLoadCfg,
     gpu: &mut Gpu,
 ) -> R<hipfire_loader::LoadedModel> {
@@ -226,7 +225,6 @@ fn load_with_lane_reservation(
             kv_v: None,
             qwen_default_q8: qwen_default_q8_enabled(),
             kv_adaptive: None,
-            cask: Some(cask),
             deepseek4_heterogeneous: false,
             vmm_runtime_refusal: gpu.vmm_runtime_refusal().as_deref(),
             free_vram_bytes: gpu.device_mem_info().ok().map(|(free, _)| free),
@@ -234,7 +232,6 @@ fn load_with_lane_reservation(
         SourceAdmissionOptions {
             spec,
             kv_adaptive: qwen4_kv_adaptive_requested(None),
-            cask: cask.sidecar.is_some(),
             ..Default::default()
         },
     )?;
@@ -259,7 +256,6 @@ fn load_with_lane_reservation(
         None,
         None,
         None,
-        cask,
         1,
         spec,
         gpu,
@@ -287,12 +283,10 @@ fn run(args: Args) -> R<i32> {
         args.model,
         if wide_flag { "ON" } else { "off" }
     );
-    let cask = hipfire_runtime::loader_api::CaskConfig::default();
     let mut model = load_with_lane_reservation(
         &args.model,
         args.max_seq,
         args.reserve_lanes,
-        &cask,
         Default::default(),
         &mut gpu,
     )?;

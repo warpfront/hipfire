@@ -19,9 +19,7 @@ use hipfire_engine::terminal::*;
 use hipfire_engine::turn_cache::*;
 use hipfire_loader::{AsstTurnCache, LoadedModel};
 use hipfire_runtime::prompt_frame::ThinkMode;
-use hipfire_runtime::spec::{
-    ClientEvent, EvictRetain, FinishSummary, SpecTarget, Speculator, StopReason,
-};
+use hipfire_runtime::spec::{ClientEvent, FinishSummary, SpecTarget, Speculator, StopReason};
 use std::any::Any;
 use std::io::Write;
 
@@ -271,7 +269,7 @@ pub enum CancelDisposition {
 /// The one decision a mid-decode cancel makes (host-side, no device work).
 ///
 /// `eligible` is the route/configuration gate the caller proves (single GPU,
-/// resident Qwen3.5-class target, no KV eviction/compaction, no adaptive KV,
+/// resident Qwen3.5-class target, no KV compaction, no adaptive KV,
 /// no stale drafter). `stream_len` is the length of the host record of the
 /// committed token stream (`None` = it could not be reconstructed) and `fed`
 /// the device cursor: how many tokens the target KV / DeltaNet state has
@@ -2018,7 +2016,6 @@ std::thread_local! {
         const { std::cell::Cell::new(false) };
     static GENERATION_FAULT_AFTER_FIRST_DECODE: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
-    static EVICTION_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 // Test-only fault points for the vision (Qwen35-VL / dots.ocr) generation
@@ -2088,29 +2085,14 @@ pub fn take_generation_fault_after_first_decode() -> bool {
     GENERATION_FAULT_AFTER_FIRST_DECODE.with(|c| c.replace(false))
 }
 
-/// Arm (or disarm) the Qwen AR KV-eviction fault: the next eviction step
-/// fails as a HIP error would.
-#[doc(hidden)]
-pub fn arm_eviction_fault(armed: bool) {
-    EVICTION_FAULT.with(|c| c.set(armed));
-}
-
-/// Take the armed KV-eviction fault, disarming it.
-#[doc(hidden)]
-pub fn take_eviction_fault() -> bool {
-    EVICTION_FAULT.with(|c| c.replace(false))
-}
-
 /// Arm the generation fault hooks from a daemon `generate` request carrying
-/// `test_fault_after_prefill` / `test_fault_after_first_decode` /
-/// `test_fault_eviction` booleans. Missing or non-boolean fields disarm.
+/// `test_fault_after_prefill` / `test_fault_after_first_decode` booleans. Missing or non-boolean fields disarm.
 /// Test-only wiring; the hooks are default-off and one-shot.
 #[doc(hidden)]
 pub fn arm_generation_faults_from_request(msg: &serde_json::Value) {
     let flag = |k: &str| msg.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
     arm_generation_fault_after_prefill(flag("test_fault_after_prefill"));
     arm_generation_fault_after_first_decode(flag("test_fault_after_first_decode"));
-    arm_eviction_fault(flag("test_fault_eviction"));
     #[cfg(feature = "serve-fault-inject")]
     hipfire_dispatch::pipeline::sealed_moe::arm_fault_after_expert_mutation(flag(
         "test_fault_after_expert_mutation",
@@ -2122,7 +2104,6 @@ pub fn arm_generation_faults_from_request(msg: &serde_json::Value) {
 pub fn disarm_generation_faults() {
     arm_generation_fault_after_prefill(false);
     arm_generation_fault_after_first_decode(false);
-    arm_eviction_fault(false);
     #[cfg(feature = "serve-fault-inject")]
     hipfire_dispatch::pipeline::sealed_moe::arm_fault_after_expert_mutation(false);
 }

@@ -781,7 +781,7 @@ fn main() {
                 // token/head). Admission is the shared mode-specific guard
                 // before allocation: neutral V (`--kv-v q8` spelling
                 // identifies fp8/fp8) plus qwen35_native_refusal for Fp8
-                // (exact gfx1201, single GPU, no adaptive/CASK; H24/KV4/D256
+                // (exact gfx1201, single GPU, no adaptive tiering; H24/KV4/D256
                 // dense or H16/KV2/D256 MoE); never falls through to a q8
                 // reader.
                 if args.kv_v != "q8" {
@@ -798,7 +798,6 @@ fn main() {
                     config.n_kv_heads,
                     config.head_dim,
                     1,
-                    false,
                     false,
                 ) {
                     eprintln!("eval_hipfire: --kv-mode fp8 refused: {reason}");
@@ -819,7 +818,7 @@ fn main() {
                 // no scales). Admission is the shared mode-specific guard
                 // before allocation: neutral V, dense only, plus
                 // qwen35_native_refusal for Bf16 (exact gfx1201, single GPU,
-                // no adaptive/CASK, dense H24/Hkv4/D256); never falls through
+                // no adaptive tiering, dense H24/Hkv4/D256); never falls through
                 // to a q8 reader. Expected to read ≈ the f32 reference.
                 if args.kv_v != "q8" {
                     eprintln!(
@@ -842,7 +841,6 @@ fn main() {
                     config.n_kv_heads,
                     config.head_dim,
                     1,
-                    false,
                     false,
                 ) {
                     eprintln!("eval_hipfire: --kv-mode bf16 refused: {reason}");

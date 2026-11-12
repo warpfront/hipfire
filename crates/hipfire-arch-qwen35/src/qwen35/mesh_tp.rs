@@ -1088,34 +1088,31 @@ impl<'a> Qwen35TpBindings<'a> {
                     )
                     .map_err(hip)
                 }
-                LayerWeights::FullAttn(l) => {
-                    let tap_fn = program::batched_attention_tap(&rank.config);
-                    batch_chunk_full_attn_attn(
-                        gpu,
-                        false,
-                        &l.mixer_view(),
-                        &dims,
-                        &rank.pbs.view(),
-                        &program::flash_scratch(s),
-                        &program::kv_view(&rank.kv),
-                        n,
-                        dim,
-                        start,
-                        start + n,
-                        &ctx,
-                        BatchSemantics::Sequential,
-                        None,
-                        q8,
-                        q8,
-                        index,
-                        layer,
-                        BatchEpilogue::Partial(&rank.partial),
-                        DflashFusionCtx::Off,
-                        None,
-                        tap_fn.get(),
-                    )
-                    .map_err(hip)
-                }
+                LayerWeights::FullAttn(l) => batch_chunk_full_attn_attn(
+                    gpu,
+                    false,
+                    &l.mixer_view(),
+                    &dims,
+                    &rank.pbs.view(),
+                    &program::flash_scratch(s),
+                    &program::kv_view(&rank.kv),
+                    n,
+                    dim,
+                    start,
+                    start + n,
+                    &ctx,
+                    BatchSemantics::Sequential,
+                    None,
+                    q8,
+                    q8,
+                    index,
+                    layer,
+                    BatchEpilogue::Partial(&rank.partial),
+                    DflashFusionCtx::Off,
+                    None,
+                    None,
+                )
+                .map_err(hip),
                 _ => Err("Qwen3.5 TP mixer on a MoE layer".into()),
             },
             (TpOp::Ffn { layer }, false) => {

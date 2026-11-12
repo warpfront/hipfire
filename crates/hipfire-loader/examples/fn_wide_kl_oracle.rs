@@ -1221,7 +1221,6 @@ fn load_model(
         admit_source_with_options, qwen4_kv_adaptive_requested, qwen_default_q8_enabled,
         BatchLoadRequest, KvBackendHints, KvBackendRequest, SourceAdmissionOptions,
     };
-    let cask = hipfire_runtime::loader_api::CaskConfig::default();
     let spec = hipfire_runtime::loader_api::SpecLoadCfg {
         mtp: Some(true),
         ..Default::default()
@@ -1243,7 +1242,6 @@ fn load_model(
             kv_v: None,
             qwen_default_q8: qwen_default_q8_enabled(),
             kv_adaptive: None,
-            cask: Some(&cask),
             deepseek4_heterogeneous: false,
             vmm_runtime_refusal: gpu.vmm_runtime_refusal().as_deref(),
             free_vram_bytes: gpu.device_mem_info().ok().map(|(free, _)| free),
@@ -1251,7 +1249,6 @@ fn load_model(
         SourceAdmissionOptions {
             spec,
             kv_adaptive: qwen4_kv_adaptive_requested(None),
-            cask: cask.sidecar.is_some(),
             ..Default::default()
         },
     )?;
@@ -1276,7 +1273,6 @@ fn load_model(
         None,
         None,
         None,
-        &cask,
         1,
         spec,
         gpu,

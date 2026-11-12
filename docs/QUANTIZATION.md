@@ -297,7 +297,7 @@ already attention-weighted. Split modes store **V as Q8** (or Lloyd V via
 | Mode | K | V | Notes |
 |---|---|---|---|
 | `q8` | Q8_0 (G32) | Q8_0 | `auto` default wherever native fp8 does not apply (gfx1100, gfx1151, …); DFlash-safe |
-| `fp8` | FP8 E4M3 | FP8 E4M3 | Qwen-only native pair; `auto` default on native-eligible exact gfx1201 single GPU (H24/Hkv4/D256 dense or H16/Hkv2/D256 A3B, D256, no adaptive/CASK/slots/TP/PP split). Native `bf16` stays H24 dense-only |
+| `fp8` | FP8 E4M3 | FP8 E4M3 | Qwen-only native pair; `auto` default on native-eligible exact gfx1201 single GPU (H24/Hkv4/D256 dense or H16/Hkv2/D256 A3B, D256, no adaptive/slots/TP/PP split). Native `bf16` stays H24 dense-only |
 | `fwht4` / `fwht3` / `fwht2` | FWHT-rotated K at 4/3/2-bit | Q8_0 | Optional headroom modes (Qwen3.5 family, any arch), not a default. Same byte layout family as legacy asym; FWHT basis matches MQ drafts |
 | `asym4` / `asym3` / `asym2`, `turbo` / `turbo2` / `turbo3` / `turbo4` | **Deprecated spellings** (since 0.4.0, removal in 0.5.0; spell `fwhtN` or `q8`) | Q8_0 | On Qwen they are aliases that resolve to the supported FWHT K path: `asymN`/`turboN` → `fwhtN`, `turbo` → `fwht3`. Only the llama HFQ loader still maps bare `asym3`/`asym4`/`turbo4` to the legacy Givens constructors (deprecated route, removal in 0.5.0) |
 | `legacy-asym4` / `legacy-asym3` / `legacy-asym2` | Givens + Lloyd-Max K | Q8_0 | **Deprecated since 0.4.0, removal in 0.5.0** (fwht3 supersedes Givens asym KV); Qwen `--kv-k` only |
@@ -311,7 +311,7 @@ then the load site's policy in `crates/hipfire-runtime/src/kv_mode.rs`):
    card's value is not `q8` (a `q8` card value is left to `auto`)
 4. Else `auto`, resolved by the architecture: Qwen native **fp8** on
    native-eligible exact gfx1201 single GPU (H24/Hkv4/D256 dense or
-   H16/Hkv2/D256 A3B; no adaptive/CASK/slots/TP/PP split), **q8** on
+   H16/Hkv2/D256 A3B; no adaptive/slots/TP/PP split), **q8** on
    every other Qwen load (gfx1100, gfx1151, …); other families keep
    their own default (Maple bf16, DeepSeek V4 f32, others q8)
 

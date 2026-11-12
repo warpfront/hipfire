@@ -139,25 +139,6 @@ Preconditions (409 otherwise):
   `decide_kv_compact_offset`). Positional rewind is only valid on an
   un-compacted cache.
 
-KV eviction (CASK / TriAttention, `m.eviction`) may be configured; `hipfire
-serve` loads every model with it when config has `cask` on. It is safe
-because eviction cannot run inside a decide: `Eviction::maybe_evict` is only
-called by the generate loops (`ar.rs`, `qwen.rs`, `vision.rs`), never by
-`qwen35::forward_prefill_batch` / `llama::forward_prefill_batch`, which are
-the only model calls the decide hooks make. What bounds a decide under
-eviction is the KV buffer: with `compact_offset == 0` the prefill writes KV
-slot = position, and the cache holds only `m.physical_cap` slots (by default
-`cask_budget + cask_beta + 256`, clamped to `max_seq`), with no bounds check
-in the prefill. So with eviction configured the longest question prompt + 1
-must be <= min(`Eviction::budget()`, `m.physical_cap`), else 422 naming the
-limit and without `required_max_seq` (a larger `max_seq` does not raise it).
-Under the current `CaskConfig` the load requires `max_seq >= budget + beta +
-4` and `physical_cap >= budget`, so `physical_cap` never binds and the limit
-is the budget; the `min` is defensive. Likewise the 409 compacted-cache check
-below is defensive: the pre-decide rollback resets `compact_offset`, so it
-cannot fire today. Decide prompts (hundreds to a few thousand tokens) are far
-below the usual budgets.
-
 A client disconnect does not interrupt a decide in v1. The loop is
 sub-second, and mid-loop abort would need the daemon's per-request terminal
 registry; serve simply discards the reply.
@@ -312,7 +293,6 @@ All three:
 | State + longest question > 32,000 tokens, or state + all questions > 64,000 tokens | 422 naming the limit, no `required_max_seq` |
 | Model architecture has no snapshot path (neither Qwen3.5 nor Llama family) | 400 `decide not supported for <arch>` |
 | No model loaded and `model` not a local model | 503 |
-| KV eviction configured and the longest prompt + 1 exceeds min(eviction budget, `physical_cap`) | 422 naming the limit, no `required_max_seq` |
 | KV cache compacted (`compact_offset != 0`) after the pre-decide reset | 409 |
 | Prompt exceeds the loaded `max_seq` | 422 + `required_max_seq`; serve reloads once up to `MAX_SEQ_CEILING`, above it returns the 422 as-is |
 | Fewer than K valid single-token codes | 422 |
@@ -427,19 +407,11 @@ in two modes.
 5. **Error replies.** Two requests are sent, and a normal decide must still
    succeed after each:
    - a state longer than the loaded `max_seq` returns 422 with an integer
-     `required_max_seq` greater than `max_seq` (with `--cask`: a state over
-     the eviction limit returns 422 naming the limit, without
-     `required_max_seq`);
+     `required_max_seq` greater than `max_seq`;
    - a malformed request returns 422;
    - a state over Jev's 32,000-token per-question limit, and four long
      questions over the 64,000-token request limit, each return 422 naming
      the limit, without `required_max_seq`.
-
-   `gates.py --cask` configures every daemon with the cask* params serve
-   sends (defaults from `~/.hipfire/config.json`), so all gates, including
-   1a exact-mode equality, run with eviction configured; it adds gate 0
-   (per daemon: the over-limit 422 is returned, proving eviction is on, and a
-   normal decide succeeds).
 
 ## 11. Evaluation
 
@@ -623,7 +595,6 @@ v1 does the state. That is O(questions × conversation) CPU.
    `asst_turn_cache`'s LRU order. It parses the request, checks the
    preconditions and limits, renders, computes E, and picks the start.
    Reuse is eligible only when all of these hold:
-   - no eviction;
    - `HIPFIRE_QWEN_PROMPT_CACHE` is not `0`;
    - `compact_offset == 0`;
    - `conversation_tokens` is non-empty and
@@ -688,7 +659,7 @@ rollbacks are:
 full-prefill path over each R_i: reset, one full prefill per question,
 reset. It is the S2 reference and ends reset, like v1.
 
-### 12.5 Preconditions, limits, eviction, thinking
+### 12.5 Preconditions, limits, thinking
 
 **Preconditions.** The v1 409s and 400s apply unchanged: pp/EP,
 `kv_adaptive`, multi-slot, active lanes, unsupported arch. Session mode also
@@ -708,29 +679,16 @@ path, and that is Jinja.
   conversation, and up to 128 questions run under exclusive admission, so a
   hostile oversized conversation must be refused before the questions
   render. The probe (§12.3) renders first:
-  - over the eviction limit (below): 422 before any question renders;
   - over `max_seq`: 422 after R_0 only. `required_max_seq` is estimated as
     R_0's length with question 0's text swapped for the longest question's
     (each text tokenized alone) plus 16 tokens of slack. It only sizes
     serve's reload; the retry re-checks exactly.
 
-  Then each R_i is checked as it is rendered: the eviction limit, and Jev's
+  Then each R_i is checked as it is rendered: Jev's
   limits on the suffixes past a provisional E computed from the probe and
   R_0. The final E can only be shorter, so every early refusal is one the
   final check would also make. The exact limits and `max_seq` are checked
   once every R_i is rendered.
-
-**CASK / eviction.** Session mode never reuses under eviction. The chat
-cache is off there (`ar.rs:3025-3029`) and every chat turn cold-starts
-(`ar.rs:3465`), so there is nothing to keep. The rule:
-
-- always start cold; the rollback zeroes `compact_offset`;
-- the decide never calls `maybe_evict`;
-- the limit is v1's: longest R_i + 1 ≤ min(budget, `physical_cap`), else
-  422 without `required_max_seq`.
-
-Without eviction there is no compaction. `compact_offset == 0` is also
-required for reuse, as a defensive check.
 
 **Multimodal content.** Session decide is text-only. Serve returns 422 for a
 `messages` content part that is not `text` (e.g. `image_url`), instead of
@@ -784,7 +742,6 @@ shaping are as in §6.
 | Session mode without a Jinja chat template | 400 |
 | A question suffix > 32,000 tokens, or all suffixes > 64,000 | 422 naming the limit, no `required_max_seq` |
 | Conversation + longest question > `max_seq` | 422 + `required_max_seq` |
-| Under eviction: conversation + longest question + 1 > min(budget, `physical_cap`) | 422, no `required_max_seq` |
 | GPU error mid-session | 500; the model is rolled back and the cache lost |
 
 ### 12.8 Gates
@@ -812,7 +769,7 @@ system prompt and `State:` block, so its tokens differ.
     - `conversation_prefill_tokens > 0`;
     - turn 2 `cached_tokens` == E, which is greater than the baseline's.
   - S1 is INCONCLUSIVE, not FAIL, when the baseline itself gets no cache
-    hit (Llama carrier, `--cask`). It must PASS on Qwen3.5.
+    hit (Llama carrier). It must PASS on Qwen3.5.
 - **Prefill-built vs decode-built state (human ruling).** S2 and S4 are
   split like gate 1:
   - **Prefill-built** conversations must be exact: Δ = 0 against the
@@ -862,16 +819,12 @@ system prompt and `State:` block, so its tokens differ.
   (the Llama carrier) it compares the answers only and is PASS or FAIL.
 - **S5 error replies.** Both, neither, an empty `messages` and a
   non-list `messages` each return 422. An over-long conversation (over
-  `max_seq`; with `--cask` over the eviction limit) with 128 questions
-  returns 422 (+ `required_max_seq` > `max_seq` without `--cask`) within 4×
+  `max_seq`) with 128 questions
+  returns 422 (+ `required_max_seq` > `max_seq`) within 4×
   the time of the same refusal with one question + 0.25 s, proving the
   fail-fast order (§12.5). After them, a session decide on the committed
   conversation must start `extend` with zero delta, proving the refusals
   left the cache untouched.
-- **`--cask`.** Every start is `cold`. S1 reports INCONCLUSIVE, and S2 and
-  S4 compare answers only. Every leg is prefill-built there, so every Δ must
-  be 0. S3 and S5 expect `cold`.
-
 **v1.1 is done when** S1–S5 pass on Qwen3.5-4B and the v1 gates still pass.
 On a Llama-carrier model S1 may be INCONCLUSIVE and the rest must pass (S3
 on `extend` + `cold`, S4 on answers only).
@@ -1005,7 +958,7 @@ request path is the consistent and cleaner one.
 - **Consistency.** Per-model settings that shape a request's *output*, such
   as `generation.temperature`, `top_p` and `prompt.system`, are resolved by
   serve per request and sent in the daemon message. Only settings that change
-  what the load *allocates* (`kv_cache`, `speculation`, CASK) travel as load
+  what the load *allocates* (`kv_cache`, `speculation`) travel as load
   params into `LoadedModel`. Calibration is an output setting.
 - **No reload.** A changed T applies to the next request. On `LoadedModel`
   it would need a reload of the weights.
@@ -1067,7 +1020,7 @@ logits or log-probabilities.
   serve configuration as the reported rows:
   - build: `eval/jev-decide-mq4-lloyd` at 237bb7bba, i.e. `feat/jev-decide`
     plus PR #768;
-  - config: KV q8, CASK on, budget 16384.
+  - config: KV q8.
 - **Row.** `{source, type, probs, gold}`: `probs` as served, in
   answer-key order, `gold` an index into them, ℓ = log p. There is no text,
   and no option keys, which would dominate the file size.

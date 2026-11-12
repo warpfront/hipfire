@@ -448,7 +448,7 @@ pub fn is_batch_request_eligible(
     if !batch_messages_are_single_user(msg) || has_tools || has_image || has_stop {
         return false;
     }
-    if has_spec || has_adaptive || m.eviction.is_some() {
+    if has_spec || has_adaptive {
         return false;
     }
     if m.pp != 1 || m.ep.is_some() {
@@ -2886,7 +2886,7 @@ fn vmm_retire_free(
 /// not run it per row: tools/tool turns (grammar-constrained CPU sampling
 /// and the tool-call parser), images (vision path), invalid stops (the
 /// singleton reports them), logprobs (the singleton sampler's envelopes),
-/// budget alerts (mid-stream text injection), adaptive KV/eviction
+/// budget alerts (mid-stream text injection), adaptive KV
 /// (per-request KV rewriting), and PP/EP outside the Qwen4 fn-lanes route. A loaded
 /// speculator does not exclude a greedy request — batched rows are AR, and a
 /// lonely request keeps its singleton spec route. Qwen4 fn-lanes also admit
@@ -2939,7 +2939,7 @@ pub fn is_vmm_batch_request_eligible(
     if m.qwen4().is_none() && request_sets_min_tokens(msg) {
         return false;
     }
-    if m.kv_adaptive.is_some() || m.eviction.is_some() {
+    if m.kv_adaptive.is_some() {
         return false;
     }
     if !lane_batch_topology_supported(qwen4_lanes_staged(m), m.pp, m.ep.is_some()) {
@@ -6952,7 +6952,7 @@ pub fn is_qwen_ep_batch_request_eligible(
     if !batch_messages_are_single_user(msg) {
         return false;
     }
-    if m.speculator.is_some() || m.kv_adaptive.is_some() || m.eviction.is_some() {
+    if m.speculator.is_some() || m.kv_adaptive.is_some() {
         return false;
     }
     if batch.is_none() {

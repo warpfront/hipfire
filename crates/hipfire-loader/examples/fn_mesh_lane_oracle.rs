@@ -3670,7 +3670,6 @@ fn run(args: Args) -> R<Verdict> {
 fn load_with_lane_reservation(
     args: &Args,
     lanes: usize,
-    cask: &hipfire_runtime::loader_api::CaskConfig,
     spec: hipfire_runtime::loader_api::SpecLoadCfg,
     gpu: &mut Gpu,
 ) -> R<hipfire_loader::LoadedModel> {
@@ -3696,7 +3695,6 @@ fn load_with_lane_reservation(
             kv_v: None,
             qwen_default_q8: qwen_default_q8_enabled(),
             kv_adaptive: None,
-            cask: Some(cask),
             deepseek4_heterogeneous: false,
             vmm_runtime_refusal: gpu.vmm_runtime_refusal().as_deref(),
             free_vram_bytes: gpu.device_mem_info().ok().map(|(free, _)| free),
@@ -3704,7 +3702,6 @@ fn load_with_lane_reservation(
         SourceAdmissionOptions {
             spec,
             kv_adaptive: qwen4_kv_adaptive_requested(None),
-            cask: cask.sidecar.is_some(),
             ..Default::default()
         },
     )?;
@@ -3734,7 +3731,6 @@ fn load_with_lane_reservation(
         None,
         None,
         None,
-        cask,
         args.pp,
         spec,
         gpu,
@@ -3752,7 +3748,6 @@ fn run_inner(args: &Args, report: &mut Value, ids_lines: &mut Vec<Value>) -> R<V
     // Daemon parity: keep host-mapped expert memory out of reclaim before the first HIP call (KFD userptr eviction stalls, ROCm/rocm-systems#12528).
     hipfire_loader::prepare_host_memory_for(Path::new(&args.model));
     let mut gpu = Gpu::init().map_err(|x| format!("Gpu::init: {x:?}"))?;
-    let cask = hipfire_runtime::loader_api::CaskConfig::default();
     // `--spec mtp` arms the native MTP head on every EP rank (under EP the
     // loader attaches it only on an explicit request); the AR oracle loads as before.
     let spec_cfg = hipfire_runtime::loader_api::SpecLoadCfg {
@@ -3767,12 +3762,11 @@ fn run_inner(args: &Args, report: &mut Value, ids_lines: &mut Vec<Value>) -> R<V
             None,
             None,
             None,
-            &cask,
             args.pp,
             spec_cfg,
             &mut gpu,
         )?,
-        Some(lanes) => load_with_lane_reservation(args, lanes, &cask, spec_cfg, &mut gpu)?,
+        Some(lanes) => load_with_lane_reservation(args, lanes, spec_cfg, &mut gpu)?,
     };
 
     let prompts = {

@@ -13,7 +13,7 @@ use hipfire_config::{
     developer_env_for_key,
     effective::{quality_choices, ArchCtx, Choice, Effective, Origin},
     evidence::{evidence_for, format_closer, format_slower, two_sig},
-    field, is_deprecated_key,
+    field,
 };
 
 use crate::hipfire::writer::FieldKind;
@@ -829,14 +829,11 @@ fn why_line(ctx: &ExplainCtx<'_>) -> String {
 pub fn schema_explainer(key: &str, ctx: &ExplainCtx<'_>) -> [String; 4] {
     let schema = field(key);
     let legacy = schema.and_then(|schema| knob_info(schema.legacy_key));
-    let mut text = match (legacy, schema) {
+    let text = match (legacy, schema) {
         (Some(info), _) => format!("{} {}", info.summary, info.effect),
         (None, Some(schema)) => schema.help.to_owned(),
         (None, None) => format!("{key} has no schema help."),
     };
-    if schema.is_some_and(|schema| is_deprecated_key(schema.key)) {
-        text = format!("Deprecated (removal 0.5.0), read-only here. {text}");
-    }
     let mut wrapped = wrap_cols(&text, EXPLAINER_COLS);
     let (first, second) = match wrapped.len() {
         0 => (String::new(), String::new()),
@@ -852,9 +849,6 @@ pub fn schema_explainer(key: &str, ctx: &ExplainCtx<'_>) -> [String; 4] {
         }
     };
     let controls = match crate::hipfire::writer::field_kind(key) {
-        _ if schema.is_some_and(|schema| is_deprecated_key(schema.key)) => {
-            "read-only; hipfire config set"
-        }
         Some(FieldKind::Enum(_)) => "←/→ preview, Enter saves",
         Some(FieldKind::Bool) => "←/→ toggles",
         Some(_) => "Enter edits",
@@ -1072,14 +1066,6 @@ mod tests {
         assert_eq!(spec.default, "auto");
         let values: Vec<&str> = spec.options.iter().map(|(v, _)| *v).collect();
         assert_eq!(values, hipfire_config::SPECULATION_MODES);
-    }
-
-    #[test]
-    fn deprecated_keys_have_no_curated_entry() {
-        // They fall back to the schema's own deprecation help text.
-        for key in ["cask"] {
-            assert!(knob_info(key).is_none(), "{key}");
-        }
     }
 
     #[test]

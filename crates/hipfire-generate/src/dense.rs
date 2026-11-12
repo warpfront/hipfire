@@ -38,8 +38,8 @@ use hipfire_runtime::emit_text::{
 };
 use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig};
 use hipfire_runtime::spec::{
-    accept_greedy_prefix, ClientEvent, EvictRetain, FinishSummary, SpecRequestConfig, SpecTarget,
-    Speculator, StopReason,
+    accept_greedy_prefix, ClientEvent, FinishSummary, SpecRequestConfig, SpecTarget, Speculator,
+    StopReason,
 };
 use hipfire_runtime::tokenizer::TokenTextStream;
 
@@ -7983,7 +7983,7 @@ pub fn generate_cohere2moe(
 /// Conversation state on the daemon side advances via
 /// `m.seq_pos` (mirrors the qwen35/llama bookkeeping) plus
 /// `state.next_pos` inside `Qwen2State`. On context overflow we hard
-/// reset (no CASK eviction on arch_id=7) — same fallback the
+/// reset — same fallback the
 /// llama path uses.
 pub fn generate_qwen2(
     m: &mut LoadedModel,
@@ -8282,8 +8282,7 @@ pub fn generate_qwen2(
 /// KV as context even though the OpenAI wire carries no such history. Verified
 /// on this branch before the fix — an independent second request answered
 /// "Zebedee." to "what was the word I asked you to remember?". A chat server
-/// cannot ship that. There is no CASK eviction for arch 15
-/// (`MapleBundle::kv_cache_mut` returns `None`), and the batched prefill makes
+/// cannot ship that. `MapleBundle::kv_cache_mut` returns `None`, and the batched prefill makes
 /// the full re-prefill affordable, so a cold reset is both the correct and the
 /// cheap option. `m.seq_pos` mirrors `MapleState::n_tokens` for daemon
 /// bookkeeping only; nothing reads it back as a resume point.

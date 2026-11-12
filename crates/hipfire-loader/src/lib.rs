@@ -42,17 +42,15 @@ use hipfire_arch_qwen35::Qwen35Bundle;
 use hipfire_arch_qwen35_vl::qwen35_vl;
 use hipfire_arch_raon as raon;
 use hipfire_runtime::arch_model::ArchModel;
-use hipfire_runtime::cask::CaskCtx;
 use hipfire_runtime::device_mesh::DimKind;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::kv_backend::KvBackend;
 use hipfire_runtime::kv_mode;
 use hipfire_runtime::llama;
 use hipfire_runtime::llama::{KvCacheExt, KvDims, KvLayers, KvTarget};
-use hipfire_runtime::loader_api::{CaskConfig, LoadCtx, ModelSource, SpecLoadCfg};
+use hipfire_runtime::loader_api::{LoadCtx, ModelSource, SpecLoadCfg};
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::spec::{SpecEmit, SpecEmitCtx, SpecTargetGuard, Speculator};
-use hipfire_runtime::triattn::{EvictionCtx, TriAttnCenters};
 use rdna_compute::Gpu;
 use std::any::Any;
 use std::path::Path;
@@ -710,47 +708,6 @@ const LFM2_TEMPLATE: &str =
 /// Built-in Gemma 4 IT chat template (arch_id=13).
 const GEMMA4_TEMPLATE: &str = include_str!("../../hipfire-runtime/templates/gemma-4-it.jinja");
 
-// ─── Eviction policy wrapper ──────────────────────────────────────────
-
-// lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
-/// Eviction policy wrapper — dispatches to plain TriAttention or CASK m-folding.
-pub enum Eviction {
-    Plain(EvictionCtx),
-    Cask(CaskCtx),
-}
-
-impl Eviction {
-    pub fn maybe_evict(
-        &self,
-        gpu: &mut rdna_compute::Gpu,
-        kv: &mut llama::KvCache,
-        physical: usize,
-    ) -> hip_bridge::HipResult<Option<hipfire_runtime::triattn::EvictionResult>> {
-        match self {
-            Eviction::Plain(c) => c.maybe_evict(gpu, kv, physical),
-            Eviction::Cask(c) => c.maybe_evict(gpu, kv, physical),
-        }
-    }
-    pub fn budget(&self) -> usize {
-        match self {
-            Eviction::Plain(c) => c.budget,
-            Eviction::Cask(c) => c.base.budget,
-        }
-    }
-    pub fn beta(&self) -> usize {
-        match self {
-            Eviction::Plain(c) => c.beta,
-            Eviction::Cask(c) => c.base.beta,
-        }
-    }
-    pub fn free_gpu(self, gpu: &mut rdna_compute::Gpu) {
-        match self {
-            Eviction::Plain(c) => c.free_gpu(gpu),
-            Eviction::Cask(c) => c.free_gpu(gpu),
-        }
-    }
-}
-
 // `DdtreeState`, `DflashState`, `load_dflash_state`, and the `DflashSpeculator`
 // impl now live in `hipfire_arch_qwen35::dflash_spec` — all qwen35 + runtime
 // types, so the loader only constructs and routes them, never owns the DFlash
@@ -1255,7 +1212,6 @@ pub struct LoadedModel {
     pub max_seq: usize,
     pub physical_cap: usize,
     pub sequence: Option<crate::admission::SequenceResolution>,
-    pub eviction: Option<Eviction>,
     pub kv_adaptive: Option<hipfire_runtime::kv_adaptive::KvAdaptive>,
     pub conversation_tokens: Vec<u32>,
     pub prefill_checkpoints: Vec<(usize, DeltaNetSnapshot)>,
@@ -1332,7 +1288,6 @@ impl LoadedModel {
             max_seq,
             physical_cap,
             sequence: None,
-            eviction: None,
             kv_adaptive: None,
             conversation_tokens: Vec::new(),
             asst_turn_cache: AsstTurnCache::new_from_env(),
@@ -2467,87 +2422,6 @@ fn rollback_unfinished_qwen35(
     }
 }
 
-/// CASK / plain eviction setup. Only hard-error stage in finish_qwen35_load
-/// before the bundle is published into LoadedModel.
-fn build_qwen35_eviction(
-    config: &hipfire_arch_qwen35::qwen35::Qwen35Config,
-    physical_cap: usize,
-    activation_gate: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    ctx: &mut LoadCtx,
-) -> Result<Option<Eviction>, String> {
-    use hipfire_arch_qwen35::qwen35::LayerType;
-    let Some(ref sidecar_path) = ctx.cask.sidecar else {
-        return Ok(None);
-    };
-    let centers = TriAttnCenters::load(Path::new(sidecar_path)).map_err(|e| {
-        use std::io::ErrorKind;
-        let p = Path::new(sidecar_path);
-        let why = match e.kind() {
-            ErrorKind::NotFound if p.symlink_metadata().is_ok() => {
-                format!("dangling symlink (target absent): {sidecar_path}")
-            }
-            ErrorKind::NotFound => format!("file not found: {sidecar_path}"),
-            ErrorKind::InvalidData => format!("bad format ({e}): {sidecar_path}"),
-            ErrorKind::UnexpectedEof => format!("truncated/corrupt sidecar: {sidecar_path}"),
-            _ => format!("read error ({e}): {sidecar_path}"),
-        };
-        format!(
-            "cask sidecar load failed — {why} (CASK is deprecated and will be removed in 0.5.0; not supported; regen: hipfire sidecar-gen, or clear memory.cask.sidecar)"
-        )
-    })?;
-    let fa_layer_ids: Vec<usize> = config
-        .layer_types
-        .iter()
-        .enumerate()
-        .filter_map(|(i, t)| {
-            if *t == LayerType::FullAttention {
-                Some(i)
-            } else {
-                None
-            }
-        })
-        .collect();
-    if fa_layer_ids.is_empty() {
-        eprintln!("  cask_sidecar set but model has no FullAttention layers — ignoring");
-        return Ok(None);
-    }
-    let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
-    let mut base = EvictionCtx::new(
-        ctx.gpu,
-        &centers,
-        fa_layer_ids,
-        ctx.cask.budget,
-        ctx.cask.beta,
-        config.n_heads,
-        config.n_kv_heads,
-        config.head_dim,
-        n_rot,
-        config.rope_theta,
-        physical_cap,
-    )
-    .map_err(|e| format!("build EvictionCtx: {e}"))?;
-    if let Some(gate) = activation_gate {
-        base.set_activation_gate(gate);
-    }
-    if ctx.cask.cask_m_folding {
-        eprintln!(
-            "  eviction: CASK α={:.2} m={} budget={} β={} physical_cap={}",
-            ctx.cask.core_frac, ctx.cask.fold_m, ctx.cask.budget, ctx.cask.beta, physical_cap
-        );
-        Ok(Some(Eviction::Cask(CaskCtx::new(
-            base,
-            ctx.cask.core_frac,
-            ctx.cask.fold_m,
-        ))))
-    } else {
-        eprintln!(
-            "  eviction: TriAttention (plain drop) budget={} β={} physical_cap={}",
-            ctx.cask.budget, ctx.cask.beta, physical_cap
-        );
-        Ok(Some(Eviction::Plain(base)))
-    }
-}
-
 /// Bundled `.mq4-mtp` trailer first, then the sidecar (`sidecar`, else the
 /// trunk's sibling `.mtp`). A head whose hidden size or vocab differs from the
 /// trunk is refused before upload. Returns the head, or the errors explaining
@@ -2642,8 +2516,8 @@ fn resolve_qwen35_mtp_head_sourced(
 }
 
 /// Build a `LoadedModel` from a carrier `Bundle`, shared fields, and
-/// eviction/DFlash state. This is the common body for qwen35 dispatch
-/// where eviction and DFlash need per-arch type info.
+/// DFlash state. This is the common body for qwen35 dispatch
+/// where DFlash needs per-arch type info.
 ///
 /// Hard errors before publish free the bundle and any preloaded VL weights.
 fn finish_qwen35_load(
@@ -2657,24 +2531,6 @@ fn finish_qwen35_load(
     vision_config: Option<qwen35_vl::VisionConfig>,
     vision_weights: Option<qwen35_vl::VisionWeights>,
 ) -> Result<LoadedModel, String> {
-    // ── Eviction (only hard-error stage before publish) ────────────
-    // Built before long-lived borrows so rollback can move `bundle`.
-    let activation_gate = bundle
-        .kv_adaptive
-        .as_ref()
-        .and_then(|adaptive| adaptive.eviction_gate());
-    let eviction = match build_qwen35_eviction(&bundle.config, physical_cap, activation_gate, ctx) {
-        Ok(e) => e,
-        Err(e) => {
-            return Err(rollback_unfinished_qwen35(
-                e,
-                bundle,
-                vision_weights,
-                ctx.gpu,
-            ));
-        }
-    };
-
     // Extract references for DFlash/spec setup (borrow, don't move)
     let config = &bundle.config;
     let dn_state = &bundle.dn_state;
@@ -2828,7 +2684,6 @@ fn finish_qwen35_load(
             ctx.gpu,
             ctx.spec.ddtree_budget,
             ctx.spec.ddtree_topk,
-            eviction.is_some(),
             &bundle.weights,
             // Exact plain Q8 KV (not asym/fwht variants). Matches design:
             // flags on the already-built cache — never re-resolve the string.
@@ -3006,7 +2861,6 @@ fn finish_qwen35_load(
     }
     if mtp_floor_declined
         && !adaptive_blocks_generic_spec
-        && eviction.is_none()
         && dflash.is_none()
         && dspark_speculator.is_none()
     {
@@ -3017,7 +2871,7 @@ fn finish_qwen35_load(
         );
     }
     // ── qwen35 MTP head (single resolver: bundled .mq4-mtp trailer then .mtp sidecar) ──
-    // Precedence: DSpark > DFlash > MTP > n-gram. Gate: only arch 5/6, no adaptive/eviction,
+    // Precedence: DSpark > DFlash > MTP > n-gram. Gate: only arch 5/6, no adaptive,
     // and a typed mtp the producer-capability gate admits (`on`; `auto` only with a
     // declared measured AR floor, which qwen35 lacks, so `auto` never loads a head).
     // Bundled first, then the sidecar the CLI resolved
@@ -3026,7 +2880,6 @@ fn finish_qwen35_load(
     // On missing/refused/failed: error when forced on (mtp=on), auto logs/falls back.
     let mtp: Option<(hipfire_arch_qwen35::mtp_head::Qwen35MtpHead, String)> =
         if adaptive_blocks_generic_spec
-            || eviction.is_some()
             || !matches!(arch_id, 5 | 6)
             || ctx.spec.mtp == Some(false)
             || mtp_spill_degrade
@@ -3149,13 +3002,12 @@ fn finish_qwen35_load(
     // Per-request owners the speculator/AR paths create lazily, charged to the
     // post-load fit below. `build_speculator` order: DSpark > DFlash > MTP >
     // n-gram; the MTP head is only attached when none of the earlier arms is
-    // and eviction is off (the same guard `build_speculator` re-asserts).
+    // (the same guard `build_speculator` re-asserts).
     let lazy_charges = {
         let spec_slot_free = !adaptive_blocks_generic_spec && dspark_speculator.is_none();
-        let mtp_attaches = spec_slot_free && dflash.is_none() && eviction.is_none();
-        let speculator_ring = spec_slot_free
-            && eviction.is_none()
-            && (dflash.is_some() || (mtp_attaches && mtp.is_some()));
+        let mtp_attaches = spec_slot_free && dflash.is_none();
+        let speculator_ring =
+            spec_slot_free && (dflash.is_some() || (mtp_attaches && mtp.is_some()));
         let mtp_sizing = if mtp_attaches && matches!(arch_id, 5 | 6) {
             mtp.as_ref()
                 .map(|head| (head, crate::spec_build::mtp_requested_k(&ctx.spec)))
@@ -3166,22 +3018,14 @@ fn finish_qwen35_load(
     };
     // Pick the arch-generic speculator: a loaded DFlash draft → DflashSpeculator,
     // else an MTP head → MtpSpeculator<Qwen35MtpDrafter>, else (opt-in) the
-    // model-free n-gram drafter. `eviction` is borrowed (not moved) here so it is
-    // still available for the struct literal below; `config`/`dn_state` are
+    // model-free n-gram drafter. `config`/`dn_state` are
     // borrowed only for the n-gram arm's scratch construction. `None` ⇒ AR-only.
     // DSpark wins over DFlash/MTP/n-gram when its sidecar loaded.
     let speculator = if adaptive_blocks_generic_spec {
         None
     } else {
         dspark_speculator.or_else(|| {
-            crate::spec_build::build_speculator(
-                arch_id,
-                dflash,
-                mtp,
-                eviction.is_none(),
-                physical_cap,
-                ctx.spec,
-            )
+            crate::spec_build::build_speculator(arch_id, dflash, mtp, physical_cap, ctx.spec)
         })
     };
     if let Some(name) = speculator.as_ref().map(|s| s.name()) {
@@ -3283,7 +3127,6 @@ fn finish_qwen35_load(
     let state: Option<Box<dyn hipfire_runtime::arch_model::ArchModel>> = Some(Box::new(bundle));
     let mut model = LoadedModel {
         state,
-        eviction,
         speculator,
         max_seq: ctx.max_seq,
         kv_adaptive,
@@ -3299,7 +3142,7 @@ fn finish_qwen35_load(
     };
     model.mtp_weights_present = mtp_present;
     if let Some(message) = fit_refusal {
-        // The speculator, eviction and bundle are all owned by `model` now:
+        // The speculator and bundle are all owned by `model` now:
         // the regular unload path frees every one of them.
         return Err(match unload_model(model, ctx.gpu) {
             Ok(()) => message,
@@ -3340,7 +3183,6 @@ pub fn load_model(
     kv_mode_override: Option<&str>,
     kv_adaptive_override: Option<&str>,
     state_quant_override: Option<&str>,
-    cask: &CaskConfig,
     pp: usize,
     spec: SpecLoadCfg,
     gpu: &mut rdna_compute::Gpu,
@@ -3355,7 +3197,6 @@ pub fn load_model(
         None,
         kv_adaptive_override,
         state_quant_override,
-        cask,
         pp,
         spec,
         gpu,
@@ -3378,7 +3219,6 @@ pub fn load_model_with_kv_backend(
     kv_backend_override: Option<&str>,
     kv_adaptive_override: Option<&str>,
     state_quant_override: Option<&str>,
-    cask: &CaskConfig,
     pp: usize,
     spec: SpecLoadCfg,
     gpu: &mut rdna_compute::Gpu,
@@ -3398,7 +3238,6 @@ pub fn load_model_with_kv_backend(
         kv_backend_override,
         kv_adaptive_override,
         state_quant_override,
-        cask,
         pp,
         spec,
         gpu,
@@ -3427,7 +3266,6 @@ pub fn load_model_with_gemma4_drafter(
     kv_backend_override: Option<&str>,
     kv_adaptive_override: Option<&str>,
     state_quant_override: Option<&str>,
-    cask: &CaskConfig,
     pp: usize,
     spec: SpecLoadCfg,
     gpu: &mut rdna_compute::Gpu,
@@ -3455,7 +3293,6 @@ pub fn load_model_with_gemma4_drafter(
             kv_v: kv_v_override,
             qwen_default_q8: crate::admission::qwen_default_q8_enabled(),
             kv_adaptive: kv_adaptive_override,
-            cask: Some(cask),
             deepseek4_heterogeneous: !matches!(
                 deepseek4_compute_placement,
                 hipfire_config::Deepseek4ComputePlacement::Single
@@ -3467,7 +3304,6 @@ pub fn load_model_with_gemma4_drafter(
             spec,
             kv_adaptive: crate::admission::qwen4_kv_adaptive_requested(kv_adaptive_override),
             eagle_drafter: gemma4_drafter_path.is_some(),
-            cask: cask.sidecar.is_some(),
             state_quant: state_quant_override.is_some(),
             non_single_compute: !matches!(
                 deepseek4_compute_placement,
@@ -3494,7 +3330,6 @@ pub fn load_model_with_gemma4_drafter(
         kv_k_override,
         kv_adaptive_override,
         state_quant_override,
-        cask,
         pp,
         spec,
         gpu,
@@ -3532,7 +3367,6 @@ struct RouteRequest<'a> {
     qwen_default_q8: bool,
     kv_adaptive_override: Option<&'a str>,
     state_quant_override: Option<&'a str>,
-    cask: &'a CaskConfig,
     spec: SpecLoadCfg,
     kv_backend: KvBackend,
 }
@@ -3590,9 +3424,6 @@ fn resolve_route_plan(
     if req.pp != 1 {
         return Err(format!("pp={}", req.pp));
     }
-    if req.cask.sidecar.is_some() {
-        return Err("CASK/TriAttention eviction sidecar".into());
-    }
     let adaptive = req
         .kv_adaptive_override
         .filter(|s| !s.is_empty())
@@ -3638,7 +3469,7 @@ fn resolve_route_plan(
     let config =
         <hipfire_arch_qwen35::Qwen35 as hipfire_runtime::arch::Architecture>::config_from_hfq(hfq)
             .map_err(|e| e.to_string())?;
-    // Same K/V resolution as the qwen35 HFQ carrier (adaptive/CASK refused above).
+    // Same K/V resolution as the qwen35 HFQ carrier (adaptive refused above).
     let mode_raw = req
         .kv_mode_override
         .filter(|s| !s.is_empty())
@@ -3650,7 +3481,6 @@ fn resolve_route_plan(
         config.n_kv_heads,
         config.head_dim,
         req.pp,
-        false,
         false,
     );
     let policy =
@@ -3822,8 +3652,8 @@ fn resolve_qwen4_route_plan(
     if ep > 1 {
         return Err(format!("expert parallelism (topology.ep = {ep})"));
     }
-    if req.draft_path.is_some() || req.cask.sidecar.is_some() {
-        return Err("a drafter or CASK sidecar".into());
+    if req.draft_path.is_some() {
+        return Err("a drafter".into());
     }
     if crate::admission::qwen4_kv_adaptive_requested(req.kv_adaptive_override) {
         return Err("adaptive KV".into());
@@ -4163,8 +3993,6 @@ fn finish_route_kernels(
         Some(spec) => {
             if model.kv_adaptive.is_some() {
                 Some("adaptive KV engaged")
-            } else if model.eviction.is_some() {
-                Some("eviction engaged")
             } else if model.speculator.is_some()
                 && !(spec == KernelSpecRoute::NativeMtp && model.mtp_weights_present)
             {
@@ -4237,7 +4065,6 @@ pub fn load_admitted_with_gemma4_drafter(
     kv_k_override: Option<&str>,
     kv_adaptive_override: Option<&str>,
     state_quant_override: Option<&str>,
-    cask: &CaskConfig,
     pp: usize,
     spec: SpecLoadCfg,
     gpu: &mut rdna_compute::Gpu,
@@ -4288,7 +4115,6 @@ pub fn load_admitted_with_gemma4_drafter(
             qwen_default_q8,
             kv_adaptive_override,
             state_quant_override,
-            cask,
             spec,
             kv_backend,
         },
@@ -4331,7 +4157,6 @@ pub fn load_admitted_with_gemma4_drafter(
         kv_backend,
         kv_adaptive_override,
         state_quant_override,
-        cask,
         pp,
         pp_layer_counts: pp_layer_counts.as_deref(),
         admitted_mesh: pp_bands.as_ref().map(|_| &mesh),
@@ -5015,7 +4840,6 @@ pub fn load_model_ep_with_kv_mode(
             kv_v: None,
             qwen_default_q8: crate::admission::qwen_default_q8_enabled(),
             kv_adaptive: None,
-            cask: None,
             deepseek4_heterogeneous: false,
             vmm_runtime_refusal: (!vmm_runtime_available)
                 .then_some("the HIP runtime has no VMM allocation granularity on every rank"),
@@ -6015,7 +5839,7 @@ fn load_model_tp_qwen35_dense(
         eprintln!("  dense TP: n-gram drafter refused (block verify is not wired on the mesh)");
     }
     let speculator =
-        crate::spec_build::build_speculator(arch_id, None, mtp_head, true, max_seq, mesh_spec);
+        crate::spec_build::build_speculator(arch_id, None, mtp_head, max_seq, mesh_spec);
 
     Ok(LoadedModel {
         speculator,
@@ -6414,8 +6238,7 @@ fn load_model_tp_qwen35_mesh(
         ngram_draft: Some(false),
         ..spec
     };
-    let speculator =
-        crate::spec_build::build_speculator(arch_id, None, None, true, max_seq, mesh_spec);
+    let speculator = crate::spec_build::build_speculator(arch_id, None, None, max_seq, mesh_spec);
 
     Ok(LoadedModel {
         speculator,
@@ -6487,9 +6310,6 @@ fn unload_qwen4_pp(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<()
     if let Some(spec) = m.speculator.take() {
         spec.free(gpu);
     }
-    if let Some(ev) = m.eviction.take() {
-        ev.free_gpu(gpu);
-    }
     for (_, snap) in std::mem::take(&mut m.prefill_checkpoints) {
         snap.free_gpu(gpu);
     }
@@ -6547,9 +6367,6 @@ fn mesh_owner_quarantine_report(error: &str) -> String {
 fn unload_mesh_owner(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
     if let Some(spec) = m.speculator.take() {
         spec.free(gpu);
-    }
-    if let Some(ev) = m.eviction.take() {
-        ev.free_gpu(gpu);
     }
     for (_, snap) in std::mem::take(&mut m.prefill_checkpoints) {
         snap.free_gpu(gpu);
@@ -6944,9 +6761,6 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
         // silent VRAM leak. The vestigial `m.dflash_checkpoints` (now always
         // empty) is still drained below for defense-in-depth.
         spec.free(gpu);
-    }
-    if let Some(ev) = m.eviction {
-        ev.free_gpu(gpu);
     }
     let mut first_err: Option<String> = None;
     let mut note = |r: Result<(), String>| {

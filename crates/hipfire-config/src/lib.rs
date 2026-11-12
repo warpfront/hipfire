@@ -1734,117 +1734,6 @@ pub static FIELDS: &[ConfigField] = &[
         Some("HIPFIRE_DFLASH_NGRAM_BLOCK"),
         "Verify-path n-gram defense."
     ),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
-    field!(
-        "memory.cask.sidecar",
-        "cask_sidecar",
-        Memory,
-        ModelLoad,
-        DefaultValue::String(""),
-        ValueRule::String,
-        true,
-        true,
-        Some("HIPFIRE_CASK_SIDECAR"),
-        "Deprecated CASK (removal in 0.5.0): TriAttention sidecar path; empty disables eviction."
-    ),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
-    field!(
-        "memory.cask.enabled",
-        "cask",
-        Memory,
-        ModelLoad,
-        DefaultValue::Bool(false),
-        ValueRule::Bool,
-        true,
-        true,
-        None,
-        "Deprecated CASK (removal in 0.5.0): enable core-aware m-folding."
-    ),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
-    field!(
-        "memory.cask.budget",
-        "cask_budget",
-        Memory,
-        ModelLoad,
-        DefaultValue::Integer(512),
-        ValueRule::Integer {
-            min: 64,
-            max: 65536
-        },
-        true,
-        true,
-        None,
-        "Deprecated CASK (removal in 0.5.0): active-token target after eviction."
-    ),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
-    field!(
-        "memory.cask.beta",
-        "cask_beta",
-        Memory,
-        ModelLoad,
-        DefaultValue::Integer(128),
-        ValueRule::Integer { min: 0, max: 65536 },
-        true,
-        true,
-        None,
-        "Deprecated CASK (removal in 0.5.0): eviction hysteresis."
-    ),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
-    field!(
-        "memory.cask.handoff_tokens",
-        "cask_handoff_tokens",
-        Memory,
-        ModelLoad,
-        DefaultValue::Integer(0),
-        ValueRule::Integer { min: 0, max: 1048576 },
-        true,
-        true,
-        None,
-        "Deprecated CASK (removal in 0.5.0): one-way kv_adaptive to plain TriAttention handoff position; zero disables it."
-    ),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
-    field!(
-        "memory.cask.core_fraction",
-        "cask_core_frac",
-        Memory,
-        ModelLoad,
-        DefaultValue::Float(0.5),
-        ValueRule::Float {
-            min: 0.0,
-            max: 1.0,
-            min_inclusive: true
-        },
-        true,
-        true,
-        None,
-        "Deprecated CASK (removal in 0.5.0): fraction of the budget retained as core."
-    ),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
-    field!(
-        "memory.cask.fold",
-        "cask_fold_m",
-        Memory,
-        ModelLoad,
-        DefaultValue::Integer(2),
-        ValueRule::Integer { min: 1, max: 16 },
-        true,
-        true,
-        None,
-        "Deprecated CASK (removal in 0.5.0): merge factor."
-    ),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
-    field!(
-        "memory.cask.auto_attach",
-        "cask_auto_attach",
-        Memory,
-        ModelLoad,
-        DefaultValue::Bool(false),
-        ValueRule::Bool,
-        true,
-        true,
-        None,
-        "Deprecated CASK (removal in 0.5.0): discover a matching TriAttention sidecar when explicitly enabled."
-    ),
     field!(
         "prompt.normalize",
         "prompt_normalize",
@@ -3966,19 +3855,6 @@ fn valid_developer_suffix(suffix: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
-/// Key prefixes (canonical names) of the CASK research feature,
-/// deprecated since 0.4.0 with removal in 0.5.0.
-const DEPRECATED_KEY_PREFIXES: &[&str] = &["memory.cask."];
-
-/// True when `key` (canonical or legacy flat name) belongs to a deprecated
-/// CASK family: `memory.cask.*`.
-pub fn is_deprecated_key(key: &str) -> bool {
-    let canonical = field(key).map_or(key, |schema| schema.key);
-    DEPRECATED_KEY_PREFIXES
-        .iter()
-        .any(|prefix| canonical.starts_with(prefix))
-}
-
 pub fn canonical_config_key(key: &str) -> Option<String> {
     field(key)
         .map(|schema| schema.key.to_owned())
@@ -4135,6 +4011,70 @@ pub static RETIRED_CONFIG_KEYS: &[RetiredConfigKey] = &[
         removed_in: "0.5.0",
         reason: "PFlash speculative-prefill compression was removed",
         replacement: "none; prefix caching (the existing prompt-prefix cache) replaces it",
+    },
+    RetiredConfigKey {
+        key: "memory.cask.sidecar",
+        legacy_key: "cask_sidecar",
+        shipped_in: "0.1.7",
+        removed_in: "0.5.0",
+        reason: "CASK / TriAttention KV eviction was removed",
+        replacement: "none; full KV (use a larger memory.max_seq or KV quantization)",
+    },
+    RetiredConfigKey {
+        key: "memory.cask.enabled",
+        legacy_key: "cask",
+        shipped_in: "0.1.7",
+        removed_in: "0.5.0",
+        reason: "CASK / TriAttention KV eviction was removed",
+        replacement: "none; full KV (use a larger memory.max_seq or KV quantization)",
+    },
+    RetiredConfigKey {
+        key: "memory.cask.budget",
+        legacy_key: "cask_budget",
+        shipped_in: "0.1.7",
+        removed_in: "0.5.0",
+        reason: "CASK / TriAttention KV eviction was removed",
+        replacement: "none; full KV (use a larger memory.max_seq or KV quantization)",
+    },
+    RetiredConfigKey {
+        key: "memory.cask.beta",
+        legacy_key: "cask_beta",
+        shipped_in: "0.1.7",
+        removed_in: "0.5.0",
+        reason: "CASK / TriAttention KV eviction was removed",
+        replacement: "none; full KV (use a larger memory.max_seq or KV quantization)",
+    },
+    RetiredConfigKey {
+        key: "memory.cask.handoff_tokens",
+        legacy_key: "cask_handoff_tokens",
+        shipped_in: "0.1.7",
+        removed_in: "0.5.0",
+        reason: "CASK / TriAttention KV eviction was removed",
+        replacement: "none; full KV (use a larger memory.max_seq or KV quantization)",
+    },
+    RetiredConfigKey {
+        key: "memory.cask.core_fraction",
+        legacy_key: "cask_core_frac",
+        shipped_in: "0.1.7",
+        removed_in: "0.5.0",
+        reason: "CASK / TriAttention KV eviction was removed",
+        replacement: "none; full KV (use a larger memory.max_seq or KV quantization)",
+    },
+    RetiredConfigKey {
+        key: "memory.cask.fold",
+        legacy_key: "cask_fold_m",
+        shipped_in: "0.1.7",
+        removed_in: "0.5.0",
+        reason: "CASK / TriAttention KV eviction was removed",
+        replacement: "none; full KV (use a larger memory.max_seq or KV quantization)",
+    },
+    RetiredConfigKey {
+        key: "memory.cask.auto_attach",
+        legacy_key: "cask_auto_attach",
+        shipped_in: "0.1.7",
+        removed_in: "0.5.0",
+        reason: "CASK / TriAttention KV eviction was removed",
+        replacement: "none; full KV (use a larger memory.max_seq or KV quantization)",
     },
 ];
 
@@ -6989,36 +6929,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn deprecated_key_covers_the_cask_family() {
-        for key in ["memory.cask.enabled", "cask", "cask_sidecar"] {
-            assert!(is_deprecated_key(key), "{key} must be deprecated");
-        }
-        for key in [
-            "kv_cache",
-            "speculation.mode",
-            "speculation",
-            "ple_format",
-            "memory.ple_format",
-            "max_seq",
-            "nonexistent.key",
-        ] {
-            assert!(!is_deprecated_key(key), "{key} must not be deprecated");
-        }
-        for field in fields() {
-            let family = ["memory.cask."]
-                .iter()
-                .any(|prefix| field.key.starts_with(prefix));
-            assert_eq!(is_deprecated_key(field.key), family, "{}", field.key);
-            assert_eq!(
-                is_deprecated_key(field.legacy_key),
-                family,
-                "{}",
-                field.legacy_key
-            );
-        }
-    }
-
     fn temp_root(name: &str) -> PathBuf {
         env::temp_dir().join(format!("hipfire-config-{name}-{}", std::process::id()))
     }
@@ -9071,22 +8981,6 @@ overrides = { decide = { calibration = { choice = 1.3, score = 2, noul = 0.7 } }
     }
 
     #[test]
-    fn experimental_memory_and_prefill_features_default_off() {
-        assert_eq!(
-            field("memory.cask.enabled").unwrap().default.to_value(),
-            ConfigValue::Bool(false)
-        );
-        assert_eq!(
-            field("memory.cask.auto_attach").unwrap().default.to_value(),
-            ConfigValue::Bool(false)
-        );
-        assert_eq!(
-            field("memory.cask.sidecar").unwrap().default.to_value(),
-            ConfigValue::String(String::new())
-        );
-    }
-
-    #[test]
     fn deepseek4_expert_fanout_is_optional_and_bounded() {
         let field = field("model.deepseek4_experts_per_token").unwrap();
         assert_eq!(field.default.to_value(), ConfigValue::Null);
@@ -9492,6 +9386,34 @@ overrides = { decide = { calibration = { choice = 1.3, score = 2, noul = 0.7 } }
                 "{name}: {err:?}"
             );
             for needle in ["removed in 0.5.0", "prefix caching"] {
+                assert!(err.to_string().contains(needle), "{name}: {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn removed_cask_keys_fail_the_load_naming_full_kv() {
+        for (name, body) in [
+            (
+                "canonical",
+                "schema_version = 1\n[memory.cask]\nenabled = true\n",
+            ),
+            ("legacy", "schema_version = 1\ncask_sidecar = \"a.bin\"\n"),
+            (
+                "auto_attach",
+                "schema_version = 1\n[memory.cask]\nauto_attach = true\n",
+            ),
+        ] {
+            let root = temp_root(&format!("retired-cask-{name}"));
+            fs::create_dir_all(&root).unwrap();
+            let paths = ConfigPaths::under(&root);
+            fs::write(&paths.config_toml, body).unwrap();
+            let err = load_global(&paths).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::RetiredKey { .. }),
+                "{name}: {err:?}"
+            );
+            for needle in ["removed in 0.5.0", "full KV"] {
                 assert!(err.to_string().contains(needle), "{name}: {err}");
             }
         }

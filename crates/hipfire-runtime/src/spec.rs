@@ -369,13 +369,10 @@ pub trait SpecTarget {
     ) {
     }
 
-    /// The target's KV cache, for the daemon's FlashCASK eviction — but ONLY for
-    /// arches that store KV in the shared [`crate::llama::KvCache`] (qwen35
-    /// `ModelSlot`, llama `LlamaBundle`). Arches with their own KV representation
-    /// (e.g. qwen2's `Qwen2State`) return `None` (the default): they don't support
-    /// eviction, and the daemon's eviction sites are `if let Some(ev)`-gated so
-    /// this is never reached for a non-evicting target. Keeping it `Option` is
-    /// what lets a `Qwen2State`-backed target implement `SpecTarget` at all
+    /// The target's KV cache, but ONLY for arches that store KV in the shared
+    /// [`crate::llama::KvCache`] (qwen35 `ModelSlot`, llama `LlamaBundle`).
+    /// Arches with their own KV representation (e.g. qwen2's `Qwen2State`)
+    /// return `None` (the default). Keeping it `Option` is what lets a `Qwen2State`-backed target implement `SpecTarget` at all
     /// (it has no `llama::KvCache` to hand back).
     fn kv_cache_mut(&mut self) -> Option<&mut crate::llama::KvCache> {
         None
@@ -817,17 +814,6 @@ impl PrefillOutcome {
     }
 }
 
-/// Eviction-retain descriptor for [`Speculator::on_evict`] — lets the drafter
-/// compact its cached target-hidden rows to match the target KV after a
-/// FlashCASK eviction the daemon already applied to the target.
-#[derive(Debug, Clone)]
-pub struct EvictRetain {
-    /// Per-physical-slot retain mask from the eviction policy.
-    pub retain_mask: Vec<u32>,
-    /// Physical fill before the eviction (rows to compact).
-    pub pre_phys: usize,
-}
-
 /// Live post-reset evidence for serve-fault-inject / parity snapshots.
 ///
 /// Produced only by Speculators that own DFlash-style scratch. Snapshot writers
@@ -920,13 +906,6 @@ pub trait Speculator {
         temp: f32,
         max_emit: usize,
     ) -> Result<SpecStep, String>;
-
-    /// Compact drafter-local cached state after a target KV eviction the daemon
-    /// already applied. Default no-op for drafters with no target-hidden cache.
-    fn on_evict(&mut self, gpu: &mut Gpu, retain: &EvictRetain) -> Result<(), String> {
-        let _ = (gpu, retain);
-        Ok(())
-    }
 
     /// Advance the target over a pending-seed GPU transaction (forced
     /// continuation or terminal flush) while keeping drafter-local per-position

@@ -123,39 +123,6 @@ pub fn classify(
 }
 
 impl KTier {
-    /// K bytes per position for the compaction gather kernels (cask/triattn).
-    /// Callers MUST gate with `is_compactable()` first.
-    pub fn k_bytes_per_pos(self, n_kv_heads: usize, head_dim: usize) -> usize {
-        match self {
-            KTier::Q8 => n_kv_heads * (head_dim / 32) * 34,
-            KTier::Asym4 { .. } => n_kv_heads * (4 + head_dim / 2),
-            KTier::Asym3 { .. } => n_kv_heads * (4 + (head_dim * 3) / 8),
-            KTier::Asym2 { .. } => n_kv_heads * (4 + head_dim / 4),
-            // Bf16 has a well-defined 2 bytes/element, but it is deliberately
-            // NOT compactable (see `is_compactable`), and this fn's contract
-            // is that callers gate on that first. Panicking keeps a
-            // compaction path that forgot the gate loud instead of silently
-            // compacting a layout no gather kernel can read.
-            KTier::F32
-            | KTier::Bf16
-            | KTier::Fp8
-            | KTier::Hfq4
-            | KTier::Q4
-            | KTier::Int8c
-            | KTier::Hfq8 => {
-                panic!("k_bytes_per_pos undefined for {self:?}")
-            }
-        }
-    }
-
-    /// Tiers the TriAttn/CASK compaction kernels support. Collapses `fwht`.
-    pub fn is_compactable(self) -> bool {
-        matches!(
-            self,
-            KTier::Q8 | KTier::Asym4 { .. } | KTier::Asym3 { .. } | KTier::Asym2 { .. }
-        )
-    }
-
     pub fn is_q8(self) -> bool {
         matches!(self, KTier::Q8)
     }
@@ -1006,16 +973,13 @@ mod tests {
             classify(false, false, false, false, false, false, false, false, false, false, false),
             KTier::F32
         );
-        // fp8 decodes to Fp8, is not q8/compactable, and has no
-        // defined compaction stride.
+        // fp8 decodes to Fp8 and is not q8.
         assert_eq!(
             classify(false, false, false, false, false, false, false, false, false, false, true),
             KTier::Fp8
         );
         assert!(!KTier::Fp8.is_q8());
-        assert!(!KTier::Fp8.is_compactable());
         assert!(!KTier::Bf16.is_q8());
-        assert!(!KTier::Bf16.is_compactable());
     }
 
     #[test]
@@ -1502,7 +1466,7 @@ mod tests {
 
     #[test]
     fn ktier_queries() {
-        assert!(KTier::Q8.is_compactable() && KTier::Q8.is_q8());
-        assert!(!KTier::F32.is_compactable());
+        assert!(KTier::Q8.is_q8());
+        assert!(!KTier::F32.is_q8());
     }
 }

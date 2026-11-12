@@ -152,7 +152,6 @@ impl Rig {
             &mut gpu,
             None,
             None,
-            false,
             &slot.weights,
             kv_q8,
             slot.kv_cache.uses_vmm_backend(),

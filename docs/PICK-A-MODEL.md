@@ -99,10 +99,9 @@ separate surface: [IMAGEGEN.md](IMAGEGEN.md).
 
 ## Not recommended
 
-CASK / TriAttention KV eviction is deprecated since 0.4.0 and scheduled for
-removal in 0.5.0; it is unsupported and no row here depends on it. The legacy contiguous-DFlash knobs
+The legacy contiguous-DFlash knobs
 (`HIPFIRE_DFLASH_WINDOW=0`, `HIPFIRE_DFLASH_CTX_CAP`) and the Givens `legacy-asymN`
-/ `asymN` / `turboN` KV names are deprecated on the same schedule; prefer a
+/ `asymN` / `turboN` KV names are deprecated; prefer a
 `kv_cache` of `auto`, `q8` or `fwhtN`. See
 [Measured on v0.4.4](#measured-on-v044) and the dated
 [perf checkpoints](perf-checkpoints/) for newer-family measurements.

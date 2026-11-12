@@ -270,7 +270,6 @@ pub fn build_speculator(
     arch_id: u32,
     dflash: Option<DflashState>,
     mtp: Option<Qwen35MtpHead>,
-    eviction_is_none: bool,
     ctx_capacity: usize,
     spec: hipfire_runtime::loader_api::SpecLoadCfg,
 ) -> Option<Box<dyn Speculator>> {
@@ -280,17 +279,14 @@ pub fn build_speculator(
         // the knob is on, mirroring the DSpark opt-out.
         return Some(build_dflash_speculator(
             df,
-            eviction_is_none,
             spec.dflash_adaptive_b.unwrap_or(false),
         ));
     }
     // qwen35 MTP head (arch 5/6). MTP wins over n-gram when present; the load
     // site is authoritative for whether a head was loaded (no `&mut Gpu` here
-    // to free it). Re-assert the eviction guard here (the MTP head KV is NOT
-    // FlashCASK-compacted, so building under eviction would desync head/trunk
-    // positions).
+    // to free it).
     if let Some(head) = mtp {
-        if eviction_is_none && matches!(arch_id, 5 | 6) {
+        if matches!(arch_id, 5 | 6) {
             let max_n = mtp_requested_k(&spec);
             eprintln!("  qwen35 MTP speculator enabled (compressed-serial, K={max_n})");
             hipfire_config::load_summary::note(
@@ -303,13 +299,13 @@ pub fn build_speculator(
                 ctx_capacity,
             ));
         }
-        // Declined (eviction/arch mismatch): the load site is authoritative and
+        // Declined (arch mismatch): the load site is authoritative and
         // must NOT load a head we'd decline (no `&mut Gpu` here to free it), so
         // this is unreachable in practice — drop it rather than leak silently.
-        eprintln!("  qwen35 MTP head present but arm declined (eviction/arch) — ignored");
+        eprintln!("  qwen35 MTP head present but arm declined (arch) — ignored");
         hipfire_config::load_summary::note(
             hipfire_config::load_summary::Facet::SpecOff,
-            "MTP head present but arm declined (eviction/arch)",
+            "MTP head present but arm declined (arch)",
         );
         let _ = head;
     }

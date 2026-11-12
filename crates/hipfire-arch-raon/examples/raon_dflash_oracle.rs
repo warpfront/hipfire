@@ -188,7 +188,7 @@ use hipfire_runtime::dflash2_spec::{
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::kv_backend::KvBackend;
 use hipfire_runtime::llama::sample_top_k_p_with_state;
-use hipfire_runtime::loader_api::{CaskConfig, LoadCtx, ModelSource, SpecLoadCfg};
+use hipfire_runtime::loader_api::{LoadCtx, ModelSource, SpecLoadCfg};
 use hipfire_runtime::prompt_frame::JinjaChatFrame;
 use hipfire_runtime::sampler::{apply_logit_policy_cpu, SamplerConfig};
 use hipfire_runtime::spec::{
@@ -472,7 +472,6 @@ fn load_bundle(
     max_seq: usize,
     draft: Option<&str>,
 ) -> Result<RaonBundle, String> {
-    let cask = CaskConfig::default();
     let mut ctx = LoadCtx {
         path,
         max_seq,
@@ -490,7 +489,6 @@ fn load_bundle(
         kv_backend: KvBackend::default(),
         kv_adaptive_override: None,
         state_quant_override: None,
-        cask: &cask,
         pp: 1,
         pp_layer_counts: None,
         admitted_mesh: None,

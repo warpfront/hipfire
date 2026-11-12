@@ -187,7 +187,7 @@ The mesh is owned by the rank-0 `Qwen4Bundle` (`attach_ep_mesh`,
 threads, each with its own `Gpu`. It is **not** `LoadedModel.ep`, so a Qwen4 EP
 model still takes the ordinary `Qwen4Ar` / `Qwen4Spec` generation route rather
 than `generate_ep`. EP refuses what the replicated program does not run
-(DFlash, DSpark, n-gram drafting, DDTree, adaptive KV, an EAGLE drafter, CASK,
+(DFlash, DSpark, n-gram drafting, DDTree, adaptive KV, an EAGLE drafter,
 an experts-per-token override, a non-Single compute placement; lane
 steps never run under EP), and native MTP attaches under EP only on an explicit
 `--spec mtp` (`qwen4_ep_option_refusal`, `qwen4_native_mtp`).
@@ -644,8 +644,7 @@ accepted sets differ by carrier). Concrete modes include:
 
 **Qwen-family `auto` / unset** (arch-aware, Qwen only): native **fp8/fp8** on
 exact `gfx1201` single GPU when the load is native-eligible (H24/Hkv4/D256
-dense or H16/Hkv2/D256 A3B, D256, no adaptive, no CASK
-(deprecated since 0.4.0, removal in 0.5.0), no slots/TP/PP split);
+dense or H16/Hkv2/D256 A3B, D256, no adaptive, no slots/TP/PP split);
 **q8/q8** everywhere else, gfx1100 and gfx1151 included. Native `bf16`
 stays H24 dense-only. Non-Qwen family defaults are unchanged (Maple BF16, DeepSeek
 compressor F32, Gemma layered policy, …). Full K/V axis overrides (`--kv-k` /

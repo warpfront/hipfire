@@ -192,8 +192,7 @@ row follows "all models" again, like `hipfire config <model> reset KEY`) and
 (the screen form of `hipfire config overrides`); the Models tab shows the
 count as `N own values`.
 
-This page is the normative **key/default/enum** table. CASK/TriAttention is
-deprecated (removal in 0.5.0); multi-GPU topology
+This page is the normative **key/default/enum** table. Multi-GPU topology
 lives in its linked owner rather than a duplicated matrix here.
 
 ---
@@ -356,7 +355,7 @@ Typed schema keys (process-scoped):
 | `fusions.npu_trunk_calibration` | `""` | path string | See the stable-controls table above. |
 | `kernel.npu_spillover` | `false` | bool; env `HIPFIRE_NPU_SPILLOVER` | Opt-in, gfx1151-only XDNA NPU spillover sidecar. Needs a pulled, verified `.xdna.zip` sidecar declared by the registry entry: with the flag on and no declared sidecar the load stays GPU-only (one log line); a declared sidecar that is missing or fails verification fails the load with a `hipfire pull` hint. Never active on other architectures. |
 
-With `topology.ep` > 1 the loader refuses DFlash (including a draft path), DSpark, n-gram drafting, DDTree, adaptive KV, an EAGLE drafter, CASK, an experts-per-token override and a non-`single` compute placement. Native MTP attaches only on an explicit request (`--spec mtp` / `speculation.mtp = "on"`; `auto` stays AR). Lane entry points, state snapshots and `HIPFIRE_MTP_SAMPLED_MODE=naive` are unsupported under Qwen4 EP.
+With `topology.ep` > 1 the loader refuses DFlash (including a draft path), DSpark, n-gram drafting, DDTree, adaptive KV, an EAGLE drafter, an experts-per-token override and a non-`single` compute placement. Native MTP attaches only on an explicit request (`--spec mtp` / `speculation.mtp = "on"`; `auto` stays AR). Lane entry points, state snapshots and `HIPFIRE_MTP_SAMPLED_MODE=naive` are unsupported under Qwen4 EP.
 
 The EP owner-routed prefill and the expert-staging levers have no typed schema key. They are `[developer]` keys (a legacy `HIPFIRE_FOO=value` maps to `developer.foo`), read from the process snapshot at load; restart the daemon after changing them. For the three `ep_*` levers only the exact value `0` turns the lever off.
 
@@ -589,19 +588,18 @@ both axes together may replace that pair when the constructor supports
 them; a single axis against native FP8 refuses and advises `--kv-mode q8`
 or both axes (never FP8-K/Q8-V).
 
-Unsupported K/V by topology, head dimension, or arch; static CASK with
-FWHT/Lloyd-V; and explicit native FP8/BF16 on unsupported arch/PP all fail
+Unsupported K/V by topology, head dimension, or arch; and explicit native FP8/BF16 on unsupported arch/PP all fail
 **before** destructive teardown with requested/effective values and
 supported alternatives. No silent fallback on unsupported Qwen sites.
 
 **Resolution of `auto` / unset (Qwen family):** native **fp8** (one K+V
 layout) on exact **gfx1201** single GPU (`pp = tp = 1`) when the load is
 native-eligible: attention geometry H24 / Hkv4 / D256 (dense 27B-class) or
-H16 / Hkv2 / D256 (A3B MoE-class), no `kv_adaptive`, no CASK sidecar, no
+H16 / Hkv2 / D256 (A3B MoE-class), no `kv_adaptive`, no
 slots, no TP/PP split. Native `bf16` stays H24 dense-only: `auto` never
 resolves an A3B load to `bf16`. Every other Qwen load resolves **q8/q8**:
 gfx1100, gfx1151 and every other arch; gfx1201 with a different geometry,
-with adaptive or CASK, on slots, or on PP / dense TP / MoE EP (those
+with adaptive, on slots, or on PP / dense TP / MoE EP (those
 policies have no native constructor); and Qwen3 dense (flat constructor).
 gfx1200 / gfx11 / gfx94x never inherit fp8. Registry Qwen cards leave mode
 as `auto` (a registry `default_kv_mode = "q8"` is not lowered into config).
@@ -948,7 +946,7 @@ capacity; the preflight weight projection never caps the effective context.
 Only full-attention layers carry KV (16 of 64 for Qwen3.8-27B), so card capacity
 divides that remaining memory by the selected K+V token stride. VMM reserves
 virtual space to `max_seq` and maps physical pages on demand; without eviction,
-`physical_cap == max_seq`, while deprecated CASK eviction can make `physical_cap < max_seq`.
+`physical_cap == max_seq`.
 The carrier's cap is provisional (it also charges the DFlash/MTP draft reserve):
 it sizes the VMM reservation and the draft structures before the drafts, DeltaNet
 state and scratch exist. So the automatic context is **re-measured after the
@@ -1013,9 +1011,7 @@ and never silently falls back (refusal may suggest `--kv-backend legacy`).
 
 Unsupported automatic cases (for example MoE EP/PP, non-Qwen carriers without a
 matching owner, uncertified device/OS, or missing HIP VMM symbols) keep
-legacy service with a logged reason. The deprecated adaptive→CASK handoff **requires**
-VMM: if VMM is unavailable that combination is refused rather than handed off as
-invalid legacy. Private speculative draft caches (DFlash/MTP) are owned
+legacy service with a logged reason. Private speculative draft caches (DFlash/MTP) are owned
 separately from the trunk KV backend and do not relabel it; their actual backend
 is logged on its own.
 
@@ -1150,32 +1146,6 @@ experimental weight-only route with `kernel.wo_mmq`. Screening only matters
 when MMQ is on. Daemon arch-gates the sweep (RDNA3/3.5 family in source
 comments). Legacy `HIPFIRE_MMQ` / `HIPFIRE_WO_MMQ` values remain one-shot
 compatibility overrides.
-
----
-
-## CASK / TriAttention eviction (deprecated, removal in 0.5.0)
-
-CASK / TriAttention KV eviction (including FlashCASK under DFlash) is
-deprecated since 0.4.0 and will be removed in 0.5.0. The keys below still
-load, but the path is **not supported**, not a recommended setting, and not an
-acceptance route. Every load that sets `cask_sidecar` or `cask=true` prints one
-warning line:
-`[hipfire-daemon] warning: CASK is deprecated and will be removed in 0.5.0; not supported`.
-All defaults leave it off, and a downloaded `.triattn*.bin` sidecar never
-attaches unless `cask_sidecar` or `cask_auto_attach=true` is set.
-
-| Key | Default | Range |
-|---|---|---|
-| `cask_sidecar` | `""` | path string; empty = disabled |
-| `cask` | `false` | bool (m-fold vs plain drop) |
-| `cask_budget` | `512` | int 64–65536 |
-| `cask_beta` | `128` | int 0–65536 |
-| `cask_handoff_tokens` | `0` | int 0–1048576 |
-| `cask_core_frac` | `0.5` | number 0.0–1.0 |
-| `cask_fold_m` | `2` | int 1–16 |
-| `cask_auto_attach` | `false` | bool |
-
-Sidecar generation (deprecated with CASK): `hipfire sidecar-gen` — [`CLI.md`](CLI.md).
 
 ---
 
@@ -2270,7 +2240,6 @@ deprecated code. Env statuses live in [`env-vars.md`](env-vars.md#lifecycle-stat
 
 Deprecated since 0.4.0, removal in 0.5.0:
 
-- `memory.cask.*` (CASK / TriAttention eviction).
 - KV **values** `asym2|asym3|asym4`, `turbo|turbo2|turbo3|turbo4` (`kv_cache`, `kv_k`) and `legacy-asym2|3|4` (`kv_k`): Givens asym KV and its aliases; use `fwhtN` or `q8`.
 
 Removed keys. A key that shipped in a release and was later removed from the
@@ -2302,10 +2271,18 @@ branch) or a misspelled key is unknown and fails the load with
 | `speculation.prefill.sparse_threshold` | `prefill_sparse_threshold` | 0.1.20 | 0.5.0 | none; prefix caching (the existing prompt-prefix cache) replaces it |
 | `speculation.prefill.drafter_kv` | `prefill_drafter_kv` | 0.1.20 | 0.5.0 | none; prefix caching (the existing prompt-prefix cache) replaces it |
 | `diagnostic.pflash.score_layer` | `pflash_score_layer` | 0.1.20 | 0.5.0 | none; prefix caching (the existing prompt-prefix cache) replaces it |
+| `memory.cask.sidecar` | `cask_sidecar` | 0.1.7 | 0.5.0 | none; full KV (use a larger `memory.max_seq` or KV quantization) |
+| `memory.cask.enabled` | `cask` | 0.1.7 | 0.5.0 | none; full KV (use a larger `memory.max_seq` or KV quantization) |
+| `memory.cask.budget` | `cask_budget` | 0.1.7 | 0.5.0 | none; full KV (use a larger `memory.max_seq` or KV quantization) |
+| `memory.cask.beta` | `cask_beta` | 0.1.7 | 0.5.0 | none; full KV (use a larger `memory.max_seq` or KV quantization) |
+| `memory.cask.handoff_tokens` | `cask_handoff_tokens` | 0.1.7 | 0.5.0 | none; full KV (use a larger `memory.max_seq` or KV quantization) |
+| `memory.cask.core_fraction` | `cask_core_frac` | 0.1.7 | 0.5.0 | none; full KV (use a larger `memory.max_seq` or KV quantization) |
+| `memory.cask.fold` | `cask_fold_m` | 0.1.7 | 0.5.0 | none; full KV (use a larger `memory.max_seq` or KV quantization) |
+| `memory.cask.auto_attach` | `cask_auto_attach` | 0.1.7 | 0.5.0 | none; full KV (use a larger `memory.max_seq` or KV quantization) |
 
 <!-- lifecycle-table:begin (generated by scripts/check-lifecycle.py --write) -->
 
-**Count:** 295 schema keys, plus the `developer.<name>` namespace.
+**Count:** 287 schema keys, plus the `developer.<name>` namespace.
 
 | Key | Legacy key | Env | Lifecycle |
 |---|---|---|---|
@@ -2494,14 +2471,6 @@ branch) or a misspelled key is unknown and fails the load with
 | `kernel.rope_interleaved_legacy` | `rope_interleaved_legacy` | `HIPFIRE_ROPE_INTERLEAVED_LEGACY` | experimental |
 | `kernel.verify_attn` | `verify_attn` | `HIPFIRE_VERIFY_ATTN` | stable |
 | `kernel.wo_mmq` | `wo_mmq` | `HIPFIRE_WO_MMQ` | experimental |
-| `memory.cask.auto_attach` | `cask_auto_attach` |  | deprecated |
-| `memory.cask.beta` | `cask_beta` |  | deprecated |
-| `memory.cask.budget` | `cask_budget` |  | deprecated |
-| `memory.cask.core_fraction` | `cask_core_frac` |  | deprecated |
-| `memory.cask.enabled` | `cask` |  | deprecated |
-| `memory.cask.fold` | `cask_fold_m` |  | deprecated |
-| `memory.cask.handoff_tokens` | `cask_handoff_tokens` |  | deprecated |
-| `memory.cask.sidecar` | `cask_sidecar` | `HIPFIRE_CASK_SIDECAR` | deprecated |
 | `memory.gpu_layer_budget` | `gpu_layer_budget` | `HIPFIRE_GPU_LAYER_BUDGET` | stable |
 | `memory.kv_adaptive` | `kv_adaptive` | `HIPFIRE_KV_ADAPTIVE` | stable |
 | `memory.kv_backend` | `kv_backend` |  | stable |

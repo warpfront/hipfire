@@ -73,7 +73,7 @@
 use hipfire_arch_qwen35::load_qwen35_bundle;
 use hipfire_arch_qwen35::qwen35::LayerWeights;
 use hipfire_runtime::kv_backend::KvBackend;
-use hipfire_runtime::loader_api::{CaskConfig, LoadCtx, ModelSource, SequenceHint, SpecLoadCfg};
+use hipfire_runtime::loader_api::{LoadCtx, ModelSource, SequenceHint, SpecLoadCfg};
 use rdna_compute::{
     fp8_verify_tile, DType, Fp8VerifyOp, Fp8VerifyTile, Fp8VerifyX, Gpu, GpuTensor,
 };
@@ -888,7 +888,6 @@ fn run() -> R<usize> {
     }
 
     let src = ModelSource::from_path(&args.model)?;
-    let cask = CaskConfig::default();
     let mut lc = LoadCtx {
         path: &args.model,
         max_seq: 4096,
@@ -911,7 +910,6 @@ fn run() -> R<usize> {
         kv_backend: KvBackend::default(),
         kv_adaptive_override: None,
         state_quant_override: None,
-        cask: &cask,
         pp: 1,
         pp_layer_counts: None,
         admitted_mesh: None,

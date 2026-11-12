@@ -762,9 +762,6 @@
       "min_vram_gb": 16,
       "default_kv_mode": "q8",
       "desc": "44 tok/s AR / 185 tok/s w/ draft on code",
-      "triattn": {
-        "file": "qwen3.6-27b.mq4.triattn.blended_v3.bin"
-      },
       "dflash": {
         "file": "qwen36-27b-dflash-mq4.hfq"
       }

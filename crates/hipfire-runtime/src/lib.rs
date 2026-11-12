@@ -9,7 +9,7 @@
 //! future `hipfire-arch-llama`, etc.) and depend on this crate for
 //! shared infrastructure: HFQ/GGUF file readers, the LLaMA-style
 //! scratch / KV / sampler primitives, tokenizer, prompt framing, eos
-//! filter, loop guard, eviction (TriAttn, CASK), spec-decode primitives
+//! filter, loop guard, spec-decode primitives
 //! (DFlash, DDTree), demand paging (cpu_router, weight_pager), and the
 //! [`arch::Architecture`] trait.
 
@@ -23,7 +23,6 @@ pub mod batch_sampler;
 pub mod bf16_loader;
 pub mod cache_plan;
 #[cfg(feature = "deltanet")]
-pub mod cask;
 pub mod chatml;
 pub mod checkpoint_pool;
 pub mod config;
@@ -125,7 +124,6 @@ pub mod spec_sampling;
 pub mod swap;
 pub mod tp_shard;
 #[cfg(feature = "deltanet")]
-pub mod triattn;
 pub mod trunk_overlay;
 pub mod verified_cache;
 /// Shared-weight host protocol v1 (`HIPFIRE_WEIGHT_HOST`): identities, typed

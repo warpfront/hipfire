@@ -534,7 +534,7 @@ pub fn dflash_slot_draft_step(
 
     // Positions: Q = [position .. position+B) (slot KV has no compaction —
     // compact_offset is always 0 on the slots path); K = committed abs
-    // positions (contiguous — no CASK eviction on slots) + the same block
+    // positions (contiguous) + the same block
     // slots.
     //
     // `effective_ctx_len` is capped at `scratch.max_ctx_len` (= the window

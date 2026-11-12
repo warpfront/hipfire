@@ -2233,7 +2233,7 @@ pub fn validate_load_caps(msg: &serde_json::Value, gpu_arch: &str) -> Option<Str
     }
     // The slot kernels own a fixed Q8 KV/state path plus the DFlash2
     // spec-decode sidecar (`params.draft` + `dflash_mode`). Other
-    // speculative/eviction sidecars stay refused rather than silently
+    // speculative sidecars stay refused rather than silently
     // ignored.
     let params = msg.get("params");
     if params
@@ -2249,14 +2249,6 @@ pub fn validate_load_caps(msg: &serde_json::Value, gpu_arch: &str) -> Option<Str
         == Some(true)
     {
         return Some("n-gram speculation not supported in experimental multi-slot".to_string());
-    }
-    if params.and_then(|p| p.get("cask")).and_then(|v| v.as_bool()) == Some(true)
-        || params
-            .and_then(|p| p.get("cask_sidecar"))
-            .and_then(|v| v.as_str())
-            .is_some_and(|v| !v.is_empty())
-    {
-        return Some("CASK not supported in experimental multi-slot".to_string());
     }
     if params
         .and_then(|p| p.get("kv_adaptive"))
@@ -3810,8 +3802,7 @@ mod tests {
             "kv_adaptive": "off",
             "dflash_mode": "off",
             "mtp_mode": "off",
-            "ngram_draft": false,
-            "cask": false
+            "ngram_draft": false
         }});
         assert_eq!(validate_load_caps(&supported, "gfx1100"), None);
         // The full static KV ladder plus the flat 2-byte native tiers is
@@ -3845,7 +3836,6 @@ mod tests {
             json!({"kv_mode": "garbage"}),
             json!({"kv_backend": "vmm"}),
             json!({"ngram_draft": true}),
-            json!({"cask": true}),
             json!({"drafter": "some-drafter"}),
         ] {
             assert!(

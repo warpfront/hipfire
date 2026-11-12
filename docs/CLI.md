@@ -20,7 +20,7 @@ Bare `hipfire` (no subcommand) is equivalent to `hipfire tui`: it launches the t
 | `hipfire ple derive [--format q4] [--rank PATH] <model>` / `hipfire ple split [--out PATH] [--keep-original] <model>` | Derive `<model>.ple-q4` from the Q8 rows, or split a monolithic model into a PLE-less base + `<base>.ple-q8`. `<model>` is a path or registry tag. |
 | `hipfire ple rebind --old-base PATH --new-base PATH --source PATH` | Copy an existing q4 PLE sidecar to `<new-base>.ple-q4` with a new base binding, only after proving both monolithic bases have identical embedded PLE descriptors and Q8 bytes. The source sidecar is never modified. |
 | `hipfire list [-r\|--remote] [-j\|--json]` | Local models; `-r` also lists pullable registry tags; user aliases from `quantize --register` appear separately. |
-| `hipfire rm <tag\|path> [-y\|--yes]` | Delete the weight file and sibling sidecars (`.triattn*.bin`, `*.mtp`, matching DSpark). A declared DFlash draft is **shared**: several tags can name the same `dflash.file` (e.g. `qwen3.8:27b` / `qwen3.8:27b-mq4-pro` / `qwen3.8:27b-mq4-xt` → one `qwen38-27b-dflash-mq4.hfq`). If any *other* registry entry that declares the same draft still has its own target file on disk, `rm` **keeps** the sidecar and prints one stderr line; otherwise the draft is removed with the target. The `vision` tower sidecar and the `mtp` head follow the same shared-keeper rule (every `qwen3.8:27b*` tier declares the one `qwen3.8-27b-vision.hfq`, and every trunk tier the one `qwen3.8-27b.mtp`). Confirms unless `-y`. |
+| `hipfire rm <tag\|path> [-y\|--yes]` | Delete the weight file and sibling sidecars (`*.mtp`, matching DSpark). A declared DFlash draft is **shared**: several tags can name the same `dflash.file` (e.g. `qwen3.8:27b` / `qwen3.8:27b-mq4-pro` / `qwen3.8:27b-mq4-xt` → one `qwen38-27b-dflash-mq4.hfq`). If any *other* registry entry that declares the same draft still has its own target file on disk, `rm` **keeps** the sidecar and prints one stderr line; otherwise the draft is removed with the target. The `vision` tower sidecar and the `mtp` head follow the same shared-keeper rule (every `qwen3.8:27b*` tier declares the one `qwen3.8-27b-vision.hfq`, and every trunk tier the one `qwen3.8-27b.mtp`). Confirms unless `-y`. |
 | `hipfire ps [-j\|--json]` | Running daemon / quantize / upload processes and whether the configured serve port is busy (process scan is Linux-oriented). |
 | `hipfire remove <tag\|path>` | Alias of `rm`. |
 | `hipfire registry status\|list\|update [-j\|--json]`, `hipfire registry show <tag> [-j]`, `hipfire registry verify [PATH] [-j]` | Inspect the registry migration surface. `status` prints the source in use (bundled, cache or network), schema version, revision, cache path and warnings; `list` prints the registered tags; `show` prints one canonical entry; `update` loads the registry and prints the same report as `status` (the cache is refetched only when older than 24 h); `verify` validates the bundled registry or an explicit v1 JSON file. |
@@ -322,7 +322,7 @@ Shared by `hipfire run`, `hipfire serve`, and `hipfire bench` (including `--matr
 | `--kv-k` / `--kv-v` | Qwen-only axis overrides; omitted when unset | Orthogonal to mode. On supported Qwen sites the legacy spellings `asymN` and `turboN` (bare `turbo` = `turbo3`) mean **`fwhtN`**; `legacy-asymN` selects the legacy Givens asym K. `asymN`, `turboN` and `legacy-asymN` are deprecated since 0.4.0 (removal in 0.5.0) and warn at load. V names: `q8`, `lloyd2`/`3`/`4`. Non-Qwen carriers refuse these axes before teardown. |
 | `--max-seq` | int (512–1048576) when set; else automatic | On eligible growing Qwen VMM KV, default = **min(model trained context, measured card capacity)** after weights load; legacy and other owners retain their existing bounds. An explicit `--max-seq` replaces any configured `memory.max_seq` for that load (per process for `serve`). `bench` sizes its own load instead ([below](#bench-context-max_seq)). |
 
-**Qwen `auto` / unset mode:** native `fp8` (both K and V) on exact `gfx1201` single GPU when the load is native-eligible — H24/Hkv4/D256 dense or H16/Hkv2/D256 A3B attention, no PP/TP/EP/slots split, no `kv_adaptive`, no CASK sidecar; `q8`/`q8` everywhere else, including gfx1100 and gfx1151. Native `bf16` stays H24 dense-only. Native modes report `kv_mode=fp8` or `bf16` in loaded/diag/bench JSON; no synthetic `V=q8` axis is reported. Non-Qwen family defaults are unchanged (e.g. Maple BF16, DeepSeek compressor F32, Gemma layered policy).
+**Qwen `auto` / unset mode:** native `fp8` (both K and V) on exact `gfx1201` single GPU when the load is native-eligible — H24/Hkv4/D256 dense or H16/Hkv2/D256 A3B attention, no PP/TP/EP/slots split, no `kv_adaptive`; `q8`/`q8` everywhere else, including gfx1100 and gfx1151. Native `bf16` stays H24 dense-only. Native modes report `kv_mode=fp8` or `bf16` in loaded/diag/bench JSON; no synthetic `V=q8` axis is reported. Non-Qwen family defaults are unchanged (e.g. Maple BF16, DeepSeek compressor F32, Gemma layered policy).
 
 **K/V precedence** (split modes only): CLI flag **>** per-model config **>** global config **>** registry / arch default. Mode seeds the pair; `--kv-k` overrides K and `--kv-v` overrides V. An authored `--kv-mode fp8`/`bf16` refuses every axis override, including `--kv-v q8`; an auto-selected native pair can be replaced only when both axes are supplied. Full refusal rules: [CONFIG.md](CONFIG.md#kv-cache).
 
@@ -466,7 +466,6 @@ Do not inventory every key here — [CONFIG.md](CONFIG.md) owns defaults and ran
 |---|---|
 | `hipfire quantize <hf-id\|dir\|file.gguf> [flags]` | CPU quantize via `hipfire-quantize`. GGUF weight input is deprecated since 0.4.0 (removal in 0.5.0): GGUF→mqN is lossy double quantization; quantize from the original safetensors checkpoint instead. GGUF input accepts only `hf4`, `hf6`, `mq4` and `mq6`. |
 | `hipfire-quantize --flux-pipe <pipe_dir> --output <base.hfq>` | Pack a FLUX.1 or FLUX.2 Klein diffusers pipe into per-component HFQ files (`<base>-transformer.hfq` plus `-t5.hfq`, `-clip.hfq`, `-vae.hfq` for FLUX.1, or `-qwen3.hfq`, `-vae.hfq` for Klein; arch ids 40–46). `--flux-component` packs one. The packs are the only form the daemon loads. |
-| `hipfire sidecar-gen <model> [flags]` | **Deprecated since 0.4.0 (CASK), removal in 0.5.0.** Build a `.triattn.bin` next to the model (does not pull); prints a deprecation warning. |
 | `hipfire calibrate-npu-trunk --from <measurements.json> --out <cal.json>` | Write a keyed NPU trunk calibration from offline measurement inputs. Every measured cost is mandatory; the record's `key.kernel.uname_release` must equal the current `uname -r`, otherwise the command fails. |
 
 ### `quantize` (summary)
@@ -482,17 +481,6 @@ Do not inventory every key here — [CONFIG.md](CONFIG.md) owns defaults and ran
 | `--upload <owner/repo>`, `--create-repo` | Optional HF publish through the `hf` CLI (`--create-repo` creates the model repo first). |
 
 Supported CLI formats include `mq4`, `mq6`, `q8`/`q8f16`, `hf4`/`hf6` and hfq aliases. Graded MoE recipes need the quantizer binary directly — [QUANTIZE.md](QUANTIZE.md).
-
-### `sidecar-gen` (summary; deprecated since 0.4.0, removal in 0.5.0)
-
-| Flag | Purpose |
-|---|---|
-| `--corpus PATH` | Calibration text (else builtin seeds). |
-| `--max-tokens N` | Default `4000`. |
-| `--chunk-len N` | Default `256`. |
-| `--gpu-calib` / `--cpu-calib` | Device (GPU is the usual default path). |
-| `-o PATH` | Output path (default `<model-path>.triattn.bin`). |
-| `--skip-validation` | Skip post-gen validation. |
 
 ## Benchmarks and diagnostics
 

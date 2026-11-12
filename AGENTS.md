@@ -199,11 +199,6 @@ works, what to measure, what counts as pass/fail.
   GGUF **weight** input to the quantizer (lossy double quantization; use
   llama.cpp for GGUF — `imatrix.gguf` stays); MQ4R / DS4 MQ2R route selection
   by file extension (no runtime warning; 0.5.0 selects by HFQ metadata).
-- **CASK is deprecated since 0.4.0 and will be removed in 0.5.0.**
-  CASK / TriAttention KV eviction (FlashCASK, `memory.cask.*`, `hipfire
-  sidecar-gen`) still loads, warns when used, and is not supported. Do not
-  treat it as a production element, recommendation, acceptance route, or basis
-  for a current performance claim, and do not build on it.
 
 ---
 
@@ -1360,7 +1355,7 @@ Caveats that are part of the fixture, not trivia:
 | `HIPFIRE_PROMPT_TOKEN_HEAT` | Per-position BPE merge-rank dump | OFF |
 | `HIPFIRE_PROMPT_HEAT_JSON` | JSON output for heat dump | OFF |
 | `HIPFIRE_PROMPT_HEAT_LIMIT` | Max rows in heat dump | 64 |
-| `HIPFIRE_KV_MODE` | Override `kv_cache` config. `fwht3` is the optional compact mode; `asymN`/`turboN` on Qwen are aliases of `fwhtN`, and Givens asym is `legacy-asymN` only | `auto`: fp8 on gfx1201 (Qwen H24/Hkv4/D256, single GPU, no adaptive/CASK), q8 otherwise incl. gfx1100/gfx1151 (`kv_mode.rs:28-46,194-215`) |
+| `HIPFIRE_KV_MODE` | Override `kv_cache` config. `fwht3` is the optional compact mode; `asymN`/`turboN` on Qwen are aliases of `fwhtN`, and Givens asym is `legacy-asymN` only | `auto`: fp8 on gfx1201 (Qwen H24/Hkv4/D256, single GPU, no adaptive), q8 otherwise incl. gfx1100/gfx1151 (`kv_mode.rs:28-46,194-215`) |
 | `HIPFIRE_ATTN_FLASH` | Override flash_mode config | (config) |
 | `HIPFIRE_OOM_GUARD` | Memory preflight OOM guard (`kv_slots::preflight_alloc`, SlotPool arena, bench-sweep headroom check). `auto`: on for unified-memory APUs (Strix Halo — overshoot is a global OOM), off for discrete GPUs, swap-decided for GPU-less processes | `auto` (`memory.oom_guard`) |
 |`HIPFIRE_DFLASH_DRAFT`|Force a specific draft path, overriding the registry sidecar. Empty string = explicit opt-out|(unset: registry sidecar when `dflash_mode` is `auto`/`on`)|
@@ -1384,13 +1379,6 @@ Caveats that are part of the fixture, not trivia:
 | `--ddtree-batched` | Use batched tree verify (research) |
 | `--ddtree-budget N` | Tree node budget |
 | `--ddtree-topk K` | Tree fan-out |
-
-**Deprecation note — CASK.** CASK / TriAttention KV eviction (`memory.cask.*`
-config keys, `hipfire sidecar-gen`, and the `dflash_spec_demo --cask-*`
-flags; FlashCASK) is deprecated since 0.4.0 and will be removed in 0.5.0.
-It prints a deprecation warning when used, forces legacy contiguous DFlash
-(windowed draft disabled), and is not a flag, fix or pitfall workaround to
-reach for.
 
 ---
 

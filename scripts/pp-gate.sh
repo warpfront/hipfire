@@ -28,9 +28,9 @@
 #      HIPFIRE_DETERMINISTIC=1 to opt out of the inherited ksplit
 #      atomicAdd reduction non-det.
 #
-#   3. Refusal sanity — DFlash + pp=2 and CASK + pp=2 must still
-#      produce clean error messages at load. These are v1 contract
-#      promises (see plan v2 stages 7 + 9).
+#   3. Refusal sanity — DFlash + pp=2 must still
+#      produce a clean error message at load. This is a v1 contract
+#      promise (see plan v2 stages 7 + 9).
 #
 # Environment knobs (precedence: PP_GATE_DEVICES > INCLUDE_IGPU > HETEROGENEOUS):
 #   PP_GATE_DEVICES=0,1                 # operator pin; bypasses all filters
@@ -624,12 +624,6 @@ DFLASH_REFUSAL=$( (printf '%s\n' \
     '{"type":"load","model":"'"$MODEL"'","params":{"max_seq":2048,"pp":2,"draft":"/nonexistent.hfq"}}'
 ) | "$EXE" 2>&1 | grep -c 'DFlash speculative decode requires pp=1' || true)
 if [ "$DFLASH_REFUSAL" -ge 1 ]; then echo "PASS"; else echo "FAIL"; fail=1; fi
-
-say "refusal: CASK + pp=2 must error at load"
-CASK_REFUSAL=$( (printf '%s\n' \
-    '{"type":"load","model":"'"$MODEL"'","params":{"max_seq":2048,"pp":2,"cask_sidecar":"/nonexistent.bin"}}'
-) | "$EXE" 2>&1 | grep -c 'CASK / TriAttention eviction requires pp=1' || true)
-if [ "$CASK_REFUSAL" -ge 1 ]; then echo "PASS"; else echo "FAIL"; fail=1; fi
 
 echo
 if [ "$fail" -ne 0 ]; then

@@ -604,9 +604,7 @@ another installed target still declares it (see [CLI.md](CLI.md)).
 ## Long context (optional)
 
 Long context needs no extra setup beyond `max_seq` and VRAM; for KV headroom
-pick a compact `kv_cache` mode (see [CONFIG.md](CONFIG.md)). CASK/TriAttention
-eviction is deprecated and will be removed in 0.5.0 — off by default, not
-supported, and not a recommended route to long context.
+pick a compact `kv_cache` mode (see [CONFIG.md](CONFIG.md)).
 
 **YaRN context extension (since 0.4.2, Qwen3.8-Flash-Next only).** The engine can
 apply YaRN RoPE scaling at load through `attention.yarn_factor` (env

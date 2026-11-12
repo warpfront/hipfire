@@ -535,7 +535,6 @@ developer_callsite	*	HIPFIRE_JINJA_CHAT#developer_var=ok.as_deref.!=Some("0")
 developer_callsite	*	HIPFIRE_JINJA_CHAT#developer_var=ok.as_deref.==Some("0")
 developer_callsite	*	HIPFIRE_JIT_JOBS#developer_var=ok
 developer_callsite	*	HIPFIRE_JIT_JOBS#developer_var=ok.as_deref
-developer_callsite	*	HIPFIRE_KV_PHYSICAL_CAP#developer_var=ok.and_then
 developer_callsite	*	HIPFIRE_KV_V#developer_var=ok
 developer_callsite	*	HIPFIRE_LAB_MTP_DRAFT_TRACE#developer_var=ok.filter
 developer_callsite	*	HIPFIRE_LAB_MTP_EXPERT_TRACE#developer_var=-

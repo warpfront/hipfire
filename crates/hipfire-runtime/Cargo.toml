@@ -296,10 +296,6 @@ name = "dflash_spec_demo"
 required-features = []
 
 [[example]]
-name = "triattn_validate"
-required-features = []
-
-[[example]]
 name = "pp_parity_chatml"
 required-features = ["deltanet"]
 
@@ -806,22 +802,6 @@ required-features = ["lab"]
 
 [[example]]
 name = "tp_allreduce_smoke"
-required-features = ["lab"]
-
-[[example]]
-name = "triattn_gpu_parity"
-required-features = ["lab"]
-
-[[example]]
-name = "triattn_gpu_parity_asym3"
-required-features = ["lab"]
-
-[[example]]
-name = "triattn_gpu_parity_fwht3"
-required-features = ["lab"]
-
-[[example]]
-name = "triattn_prune_demo"
 required-features = ["lab"]
 
 [[example]]

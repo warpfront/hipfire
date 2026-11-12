@@ -1274,8 +1274,6 @@ pub fn daemon_regular_with_admission(
     }
 }
 
-pub type CaskConfig = hipfire_runtime::loader_api::CaskConfig;
-
 /// Error from the real GPU batch driver. Host stub never errors.
 #[derive(Debug)]
 pub enum BatchDriveError {

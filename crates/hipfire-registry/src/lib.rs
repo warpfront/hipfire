@@ -933,8 +933,6 @@ pub struct ModelEntry {
     pub min_vram_gb: f64,
     pub desc: String,
     #[serde(default)]
-    pub triattn: Option<Sidecar>,
-    #[serde(default)]
     pub mtp: Option<Sidecar>,
     #[serde(default)]
     pub dspark: Option<Sidecar>,
@@ -1381,7 +1379,6 @@ impl RegistryV1 {
             }
             validate_digest(entry.sha256.as_deref(), tag).map_err(fail)?;
             for sidecar in [
-                &entry.triattn,
                 &entry.mtp,
                 &entry.dspark,
                 &entry.dflash,

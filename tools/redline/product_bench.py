@@ -742,7 +742,6 @@ class Daemon:
             HIPFIRE_REPLAY_BACKEND=configured_backend,
             HIPFIRE_REPLAY_TRANSPORT=transport,
             HIPFIRE_KV_MODE=kv_mode,
-            HIPFIRE_CASK_OFF="1",
             HIPFIRE_AR_GRAPH="1",
             HIPFIRE_GRAPH="1",
             HIPFIRE_DPM_WARMUP_SECS=str(dpm_warmup_secs),
@@ -1359,7 +1358,6 @@ def run_coherence_smoke(args, backend):
         HIPFIRE_REPLAY_BACKEND=configured_backend,
         HIPFIRE_REPLAY_TRANSPORT=args.transport,
         HIPFIRE_KV_MODE=args.kv_mode,
-        HIPFIRE_CASK_OFF="1",
         HIPFIRE_AR_GRAPH="1",
         HIPFIRE_GRAPH="1",
     )
@@ -1664,7 +1662,6 @@ def run_pm4_multiturn_session(args):
         HIPFIRE_REPLAY_BACKEND=configured_backend,
         HIPFIRE_REPLAY_TRANSPORT="pm4",
         HIPFIRE_KV_MODE=args.kv_mode,
-        HIPFIRE_CASK_OFF="1",
         HIPFIRE_AR_GRAPH="1",
         HIPFIRE_GRAPH="1",
     )

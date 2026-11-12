@@ -347,10 +347,10 @@ pub struct KvCache {
     pub v_mode: VMode,
     /// Per-layer flag: true = this layer uses Q8 (boundary layer)
     pub layer_is_boundary: Vec<bool>,
-    /// TriAttention compaction bookkeeping. After each eviction we leave the
-    /// retained keys in physical slots `0..budget` with their baked-in RoPE
-    /// phases intact, but the forward pass still counts absolute positions
-    /// for new writes. `compact_offset = absolute_seq_len - physical_seq_len`
+    /// Compaction offset bookkeeping (always 0: KV eviction was removed, the
+    /// plumbing stays so kernel arguments are unchanged). `compact_offset`
+    /// is the offset between the forward pass's absolute positions and
+    /// physical slots. `compact_offset = absolute_seq_len - physical_seq_len`
     /// — added to `pos` before RoPE so the new query/key get the correct
     /// absolute phase, and the cache write still lands at `pos` (physical).
     /// Zero when no compaction has happened.
@@ -4499,7 +4499,7 @@ impl KvCache {
     }
 
     /// Capped + filtered fwht3 — layer-filtered (skips non-KV layers) with an
-    /// explicit `physical_cap` for TriAttention/CASK eviction. Default path has
+    /// explicit `physical_cap`. Default path has
     /// `physical_cap == max_seq_len` (no eviction). Byte layout identical to
     /// `asym3_capped_filtered`; rotation primitive is signed-FWHT-256.
     pub fn new_gpu_fwht3_capped_filtered(
@@ -4620,9 +4620,8 @@ impl KvCache {
 
     /// Same as [`new_gpu_asym3`] but with an explicit physical capacity. When
     /// `physical_cap < max_seq_len`, the cache is sized for `physical_cap`
-    /// tokens along the time axis; the caller is responsible for triggering
-    /// TriAttention/CASK eviction before the physical position overruns
-    /// `physical_cap`. `max_seq_len` is retained for RoPE/mask purposes.
+    /// tokens along the time axis; the caller is responsible for keeping the
+    /// physical position below `physical_cap`. `max_seq_len` is retained for RoPE/mask purposes.
     pub fn new_gpu_asym3_capped(
         gpu: &mut Gpu,
         n_layers: usize,
@@ -4919,7 +4918,7 @@ impl KvCache {
     }
 
     /// Capped + filtered fwht2 — layer-filtered with explicit `physical_cap`
-    /// for TriAttention/CASK eviction. Byte layout identical to
+    /// with an explicit cap. Byte layout identical to
     /// `asym2_capped`; rotation primitive is signed-FWHT-128.
     pub fn new_gpu_fwht2_capped_filtered(
         gpu: &mut Gpu,

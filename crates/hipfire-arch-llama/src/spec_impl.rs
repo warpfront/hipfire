@@ -99,12 +99,10 @@ impl SpecTarget for LlamaBundle {
         // KV: one batched `forward_prefill_batch` call (same chunking as
         // AR's). Otherwise: per token through the AR decode forward, which appends
         // one position's `num_extract × dim` residual per call (extract order).
-        // The spec loop never evicts, so `has_eviction` is false.
         let batched = llama::llama_batched_prefill_eligible(
             &gpu.arch,
             hipfire_runtime::config::get().prefill_batched,
             self.kv.quant_q8,
-            false,
             tokens.len(),
         );
         let step = if batched { tokens.len() } else { 1 };
