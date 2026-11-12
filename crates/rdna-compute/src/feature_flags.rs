@@ -1104,6 +1104,19 @@ pub const MOE_GLUE_FOLD_ROUTER: u8 = 0b010;
 /// Sub-fold X8c: the down producer (`qwen4_moe_rotate128_i8`) runs in the gate/up epilogue.
 pub const MOE_GLUE_FOLD_ROTATE: u8 = 0b100;
 
+/// The `FeatureFlags` boolean grammar: `1`/`true`/`TRUE`/`on`/`ON` are `Some(true)`,
+/// `0`/`false`/`FALSE`/`off`/`OFF` are `Some(false)`, anything else (unset, empty, `2`,
+/// `yes`, `True`, garbage) is `None`. Pure form of the `parse_bool` closure in
+/// `FeatureFlags::from_lookup_on_host`, shared with the flags GC legacy-spelling harness.
+#[doc(hidden)]
+pub fn parse_legacy_flag_bool(raw: Option<&str>) -> Option<bool> {
+    match raw {
+        Some("1") | Some("true") | Some("TRUE") | Some("on") | Some("ON") => Some(true),
+        Some("0") | Some("false") | Some("FALSE") | Some("off") | Some("OFF") => Some(false),
+        _ => None,
+    }
+}
+
 /// Parse `HIPFIRE_QWEN4_MOE_GLUE_FOLD`: unset and `1` / `true` / `on` select all folds, `0` /
 /// `false` / `off` / empty and anything unrecognised select no fold, otherwise a list of the letters `a`
 /// ([`MOE_GLUE_FOLD_MASK`]), `b` ([`MOE_GLUE_FOLD_ROUTER`]) and `c` ([`MOE_GLUE_FOLD_ROTATE`])
@@ -1174,15 +1187,8 @@ impl FeatureFlags {
         windows: bool,
         value: impl Fn(&str) -> std::result::Result<String, ()>,
     ) -> Self {
-        let parse_bool = |name: &str| -> Option<bool> {
-            match value(name).ok().as_deref() {
-                Some("1") | Some("true") | Some("TRUE") | Some("on") | Some("ON") => Some(true),
-                Some("0") | Some("false") | Some("FALSE") | Some("off") | Some("OFF") => {
-                    Some(false)
-                }
-                _ => None,
-            }
-        };
+        let parse_bool =
+            |name: &str| -> Option<bool> { parse_legacy_flag_bool(value(name).ok().as_deref()) };
 
         let parse_usize =
             |name: &str| -> Option<usize> { value(name).ok().and_then(|s| s.parse().ok()) };

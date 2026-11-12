@@ -1,0 +1,38 @@
+# Flags migration gate GB: defaults golden. Do not edit by hand.
+# regenerate: scripts/flags-golden.sh --regen
+# sections: runtime_config (RuntimeConfig::from_process_config over the empty process config)
+# columns: section<TAB>arch<TAB>key=value (sorted)
+runtime_config	*	allow_mixed_arch=false
+runtime_config	*	attention_flash_mode="auto"
+runtime_config	*	chat_template_file=None
+runtime_config	*	devices=None
+runtime_config	*	dflash_fast_sample=true
+runtime_config	*	dflash_ngram_block=None
+runtime_config	*	draft_f16=true
+runtime_config	*	draft_gemm_dump=false
+runtime_config	*	draft_subphase=false
+runtime_config	*	emulate_gpus=None
+runtime_config	*	experimental_budget_alert=false
+runtime_config	*	flash_partials_batch=None
+runtime_config	*	kv_adaptive="off"
+runtime_config	*	kv_mode="auto"
+runtime_config	*	lm_head_f16="auto"
+runtime_config	*	max_total_think_tokens=0
+runtime_config	*	mtp_k=None
+runtime_config	*	mtp_mode="auto"
+runtime_config	*	ngram_draft=false
+runtime_config	*	ngram_k=12
+runtime_config	*	ngram_loop_threshold=0
+runtime_config	*	ngram_min_count=2
+runtime_config	*	ngram_window=256
+runtime_config	*	normalize_prompt=true
+runtime_config	*	npu_spillover=false
+runtime_config	*	prefill_batched=true
+runtime_config	*	prompt_cache_capacity=32
+runtime_config	*	prompt_cache_unbounded=false
+runtime_config	*	prompt_heat_json=false
+runtime_config	*	prompt_heat_limit=64
+runtime_config	*	prompt_token_heat=false
+runtime_config	*	tp_use_rccl=None
+runtime_config	*	uniform_vram_tolerance_gb=None
+runtime_config	*	yarn_factor=None

@@ -331,6 +331,9 @@ impl RuntimeConfig {
 }
 
 #[cfg(test)]
+mod legacy_spelling_golden;
+
+#[cfg(test)]
 mod tests {
     use super::{mq4r_redline_default, retained_redline_default as redline_with_ep, RuntimeConfig};
     use hipfire_config::{resolve, ConfigLayer, ConfigSource, NamedLayer, ProcessConfig};

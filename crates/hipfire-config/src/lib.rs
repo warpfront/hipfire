@@ -565,6 +565,14 @@ fn parse_bool(raw: &str) -> Option<bool> {
     }
 }
 
+/// The schema boolean grammar (`1/true/on/yes`, `0/false/off/no`, ASCII
+/// case-insensitive; anything else is `None`) for the flags GC legacy-spelling
+/// harness. Pure; same function as the private schema parse.
+#[doc(hidden)]
+pub fn legacy_spelling_schema_bool(raw: &str) -> Option<bool> {
+    parse_bool(raw)
+}
+
 fn valid_advanced_kv(value: &str) -> bool {
     let Some(rest) = value.strip_prefix("advanced:k=") else {
         return false;
@@ -4926,17 +4934,21 @@ pub fn developer_bool(name: &str, default: bool) -> bool {
 pub fn developer_typed_bool(name: &str) -> Option<bool> {
     typed_developer_bool_value(name, process_value(name).as_deref())
 }
-/// Pure body of [`developer_typed_bool`] for unit tests.
-fn typed_developer_bool_value(name: &str, raw: Option<&str>) -> Option<bool> {
+/// Pure body of [`developer_typed_bool`] for unit tests and the flags GC
+/// legacy-spelling harness.
+#[doc(hidden)]
+pub fn typed_developer_bool_value(name: &str, raw: Option<&str>) -> Option<bool> {
     let raw = raw?;
     match parse_typed_bool(raw) {
         Some(value) => Some(value),
         None => panic!("{name}={raw:?} is not a boolean: expected true, false, 1 or 0"),
     }
 }
-/// Pure truth table behind [`developer_bool`], split out so unit tests can
-/// pin the contract without touching the process-global snapshot.
-fn parse_developer_bool(raw: Option<&str>, default: bool) -> bool {
+/// Pure truth table behind [`developer_bool`], split out so unit tests and the
+/// flags GC legacy-spelling harness can pin the contract without touching the
+/// process-global snapshot.
+#[doc(hidden)]
+pub fn parse_developer_bool(raw: Option<&str>, default: bool) -> bool {
     match raw {
         Some("1") => true,
         Some("0") => false,
