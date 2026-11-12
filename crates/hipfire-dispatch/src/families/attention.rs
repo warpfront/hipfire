@@ -78,14 +78,11 @@ pub struct AttnParams<'a> {
 }
 
 impl<'a> AttnParams<'a> {
-    /// Returns the batched positions tensor, asserting `batch_size > 1`.
+    /// Returns the batched positions tensor. `batch_size > 1`, except for the
+    /// one-row call of an ordinary prefill, which takes the batched kernels.
     pub fn positions(&self) -> &'a GpuTensor {
-        debug_assert!(
-            self.batch_size > 1,
-            "positions() called with batch_size == 1"
-        );
         self.positions
-            .expect("positions required for batch_size > 1")
+            .expect("positions required for a batched attend")
     }
 
     /// `self` with a one-row batched call's position read from `positions`:
@@ -2599,7 +2596,13 @@ fn dispatch_attend(
                 // inside `gfx12_query16_default_eligible`'s measured envelope;
                 // outside that envelope dispatch falls back directly to the
                 // legacy LDS/tiled paths.
-                if flash_optin && io.tree_bias.is_none() && io.batch_size > 1 {
+                // An ordinary-prefill row count of one still takes the batched
+                // arithmetic (never the decode kernel): `execute_fa_attend_step`
+                // derives its plan at batched arity.
+                if flash_optin
+                    && io.tree_bias.is_none()
+                    && (io.batch_size > 1 || gpu.ordinary_prefill_active())
+                {
                     // WMMA is the default variant: it beats the legacy LDS
                     // kernel at EVERY context (1.21x @2048 .. 2.47x @12288) and
                     // is ~1.9x the scalar flash kernel, so it needs no MIN_CTX
@@ -2658,7 +2661,7 @@ fn dispatch_attend(
                         // twin of the single-slot WMMA kernel below for
                         // 1..=32 rows (f16 S tiles in the flash partials).
                         // Declines (Ok(false)) on every other arch/shape.
-                        if let Some(fp) = io.flash_partials {
+                        if let Some(fp) = io.flash_partials.filter(|_| !gpu.ordinary_prefill_active()) {
                             if hip!(gpu.try_attention_verify_wmma(
                                 io.q,
                                 io.k_cache,

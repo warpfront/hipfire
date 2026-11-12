@@ -2494,15 +2494,32 @@ pub fn execute_fa_attend_step(
         None => (0, 0),
     };
     let tree_bias = tree_verify.as_ref().map(|c| c.attn_bias);
-    let plan = KvTierPlan::derive(KvTierInputs {
-        pos: start_pos,
-        flash_mode: s.flash_mode as usize,
-        capture_mode: gpu.graphs.capture_mode,
-        batch_size: n,
-        is_tree,
-        ..kv_cache.tier_inputs()
-    })
-    .map_err(|e| HipError::new(0, &e.to_string()))?;
+    let derive_plan = |batch_size: usize| {
+        KvTierPlan::derive(KvTierInputs {
+            pos: start_pos,
+            flash_mode: s.flash_mode as usize,
+            capture_mode: gpu.graphs.capture_mode,
+            batch_size,
+            is_tree,
+            ..kv_cache.tier_inputs()
+        })
+        .map_err(|e| HipError::new(0, &e.to_string()))
+    };
+    let mut plan = derive_plan(n)?;
+    // A one-row call of an ordinary prefill is still a prefill row: the Q8 tier resolves its
+    // batched write and attend keys (not the decode kernels, whose arithmetic differs from the
+    // bulk route) and the launchers take the actual extent `n == 1`.
+    if n == 1
+        && !is_tree
+        && gpu.ordinary_prefill_active()
+        && plan.write_key == crate::types::KernelKey::KvWriteQ8_0
+        && matches!(
+            plan.attend_key,
+            crate::types::KernelKey::AttnQ8_0Kv | crate::types::KernelKey::AttnFlashQ8_0
+        )
+    {
+        plan = derive_plan(2)?;
+    }
     let io = AttnParams {
         q,
         k,

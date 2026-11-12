@@ -7995,27 +7995,31 @@ fn forward_batch_chunk_body(
     // gfx1100 envelope on VMM KV (`kernel.gfx1100_fa2_split_verify`, default
     // off; the parent `kernel.verify_attn` still opts out);
     // the launcher independently rejects every other captured shape.
-    let fa_attn_multirow = q8_multirow_attn_admitted(
-        gpu.arch_caps.arch(),
-        kv_cache.quant_q8,
-        config.head_dim,
-        n,
-        start_pos + n,
-        fa_pertoken_min_ctx(gpu.arch_caps.arch()),
-        tree_verify.is_some(),
-        batch_semantics.is_independent(),
-        gpu.graphs.capture_mode,
-        gpu.replay.is_recording(),
-        gfx1100_split_verify_admitted(
-            gpu,
-            config,
-            kv_cache.quant_q8 && matches!(kv_cache.v_mode, llama::VMode::Q8),
-            kv_cache.uses_vmm_backend(),
+    // Ordinary prefill never takes the verify-shaped multi-row attend (4..=32 rows over a long
+    // context): its row arithmetic is a function of the call's row count, and a prefill row must
+    // not depend on how the prompt was split into calls (CHUNK-CANONICAL-DESIGN §1.3).
+    let fa_attn_multirow = !gpu.ordinary_prefill_active()
+        && q8_multirow_attn_admitted(
+            gpu.arch_caps.arch(),
+            kv_cache.quant_q8,
+            config.head_dim,
             n,
             start_pos + n,
-            s.flash_partials.numel(),
-        ),
-    );
+            fa_pertoken_min_ctx(gpu.arch_caps.arch()),
+            tree_verify.is_some(),
+            batch_semantics.is_independent(),
+            gpu.graphs.capture_mode,
+            gpu.replay.is_recording(),
+            gfx1100_split_verify_admitted(
+                gpu,
+                config,
+                kv_cache.quant_q8 && matches!(kv_cache.v_mode, llama::VMode::Q8),
+                kv_cache.uses_vmm_backend(),
+                n,
+                start_pos + n,
+                s.flash_partials.numel(),
+            ),
+        );
     let logical_max_ctx = match batch_semantics {
         BatchSemantics::Sequential => start_pos + n,
         BatchSemantics::Independent { positions, .. } => {

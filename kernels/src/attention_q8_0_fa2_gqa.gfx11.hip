@@ -143,6 +143,36 @@ __device__ __forceinline__ int fa2_swiz(int c)
     return 2 * r;
 }
 
+// gfx11 WMMA rounds a sum differently for +0 and -0 zero products, so a masked key's V sign
+// (P == +0 there, 0 x negative V == -0) would leak into a row's output. On a not-full key
+// subtile a row with no masked key in it takes the plain single WMMA (bit-identical to the
+// full-subtile path); a row with masked keys takes V split by sign (V- first, then V+), so
+// every masked product is a uniform zero. Chosen per row by absolute position, so a row's
+// bytes do not depend on which other rows share its tile.
+__device__ __forceinline__ float8_t fa2_pv_mma(half16_t vf, half16_t prow, float8_t o,
+                                               bool full, bool rowfull)
+{
+    const float8_t one = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(vf, prow, o);
+    if (full)
+        return one;
+    union { unsigned short h[16]; half16_t v; } u, p, n;
+    u.v = vf;
+#pragma unroll
+    for (int e = 0; e < 16; ++e) {
+        const unsigned short b = u.h[e];
+        const bool s = (b >> 15) != 0;
+        p.h[e] = s ? (unsigned short)0 : b;
+        n.h[e] = s ? b : (unsigned short)0x8000u;
+    }
+    float8_t sp = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(n.v, prow, o);
+    sp = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(p.v, prow, sp);
+    float8_t r;
+#pragma unroll
+    for (int e = 0; e < 8; ++e)
+        r[e] = rowfull ? one[e] : sp[e];
+    return r;
+}
+
 #if FA2_FILL
 // ---- Warp-specialized fill (FA2_FILL) ----
 // Waves 0..5 compute, waves 6..7 own every K/V fill after tile 0. Per tile
@@ -500,7 +530,7 @@ __device__ __forceinline__ void fa2_fill_softmax_pv(
                 vf[2 * i + 2] = d1.h[0];
                 vf[2 * i + 3] = d1.h[1];
             }
-            Ofr[dc] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(vf, prow, Ofr[dc]);
+            Ofr[dc] = fa2_pv_mma(vf, prow, Ofr[dc], full, (kt_sub + 15) <= pos_ml);
             // Bound V-load hoisting to this chunk.
             asm volatile("" ::: "memory");
         }
@@ -1303,8 +1333,7 @@ __device__ __forceinline__ void fa2_gqa_body(
                             vf[2 * i + 2] = d1.h[0];
                             vf[2 * i + 3] = d1.h[1];
                         }
-                        Ofr[dc] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
-                            vf, prow, Ofr[dc]);
+                        Ofr[dc] = fa2_pv_mma(vf, prow, Ofr[dc], full, (kt_sub + 15) <= pos_ml);
                         // Bound V-load hoisting to this chunk.
                         asm volatile("" ::: "memory");
                     }
@@ -1459,8 +1488,7 @@ __device__ __forceinline__ void fa2_gqa_body(
                         vf[2 * i + 2] = d1.h[0];
                         vf[2 * i + 3] = d1.h[1];
                     }
-                    Ofr[dc] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
-                        vf, prow, Ofr[dc]);
+                    Ofr[dc] = fa2_pv_mma(vf, prow, Ofr[dc], full, (kt_sub + 15) <= pos_ml);
                     // Bound V-load hoisting to this chunk.
                     asm volatile("" ::: "memory");
                 }

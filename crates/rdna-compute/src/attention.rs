@@ -6430,15 +6430,20 @@ impl Gpu {
         // the single-slot launcher independently checks its arch/shape/size.
         // Q16 scratch growth invalidates retained graphs before allocation;
         // the same-stream preconvert and body both use owned kernarg blobs.
+        // Under the ordinary-prefill intent every call (any row count >= 1, any context >= 1)
+        // takes this FA2 body, so a row never changes kernel with the outer split
+        // (CHUNK-CANONICAL-DESIGN §1.3); the body masks its partial 16-row tile.
+        let ordinary = self.ordinary_prefill_active();
         if self.flags.gfx11_q8_fa2_wide
             && self.flags.gfx11_fa2_prefill
             && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
             && n_heads == 24
             && n_kv_heads == 4
             && head_dim == 256
-            && (64..=8192).contains(&batch_size)
-            && (batch_size <= 512 || batch_size % 512 == 0)
-            && self.fa2_gfx11_ctx_admitted(max_ctx_len)
+            && (if ordinary { 1..=8192 } else { 64..=8192 }).contains(&batch_size)
+            && (ordinary || batch_size <= 512 || batch_size % 512 == 0)
+            && (self.fa2_gfx11_ctx_admitted(max_ctx_len)
+                || (ordinary && (1..=self.fa2_gfx11_max_ctx()).contains(&max_ctx_len)))
         {
             return self.attention_q8_0_fa2_gqa_gfx11(
                 q,
