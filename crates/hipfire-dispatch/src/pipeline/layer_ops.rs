@@ -1319,6 +1319,15 @@ fn g942_trunk_gemv() -> bool {
     *OPT_OUT
 }
 
+/// Whether a BF16-weight projection on this device is bitwise independent of its batch rows
+/// between one row and a few rows (up to 16): exact gfx942 on the MFMA trunk route
+/// ([`g942_trunk_mfma_route`]), i.e. unless `HIPFIRE_G942_TRUNK_GEMV=1` keeps the legacy GEMV
+/// arm at one row. Callers that run one op over `n` lanes' rows in place of `n` one-row ops
+/// (batched MTP head rounds) ask this before relying on that.
+pub fn g942_bf16_few_rows_invariant(gpu: &Gpu) -> bool {
+    gpu.arch_caps.is_gfx942() && !g942_trunk_gemv()
+}
+
 /// `HIPFIRE_G942_ROWS16_CHAIN` (read once, default on; `=0` kills): on gfx942,
 /// a BF16 projection of more than 16 rows takes ⌈rows/16⌉ chained few-row
 /// launches instead of the 32-row-tile entry while the shape's
@@ -1957,6 +1966,25 @@ fn execute_hyper_read_hc8_decode(
     ))
 }
 
+/// G12 input: whether the gfx942 wide-verify HC read stages its down projection's BF16 activation
+/// from the norm launch itself (rows > 16, BF16 down weight on the MFMA route, no calibration tap
+/// and no banded weight: the tap needs the F32 rows and a banded weight reads F32).
+fn g942_hc_down_stages_bf16(gpu: &Gpu, op: &HyperReadOp<'_>) -> bool {
+    gpu.arch_caps.is_gfx942()
+        && op.rows > 16
+        && gpu.active_capture.is_none()
+        && op.input_mix_down.dtype == DType::BF16
+        && g942_trunk_mfma_route(
+            true,
+            g942_trunk_gemv(),
+            op.rows,
+            DType::BF16,
+            DType::BF16,
+            DType::F32,
+        )
+        && !super::projection_split::is_split(gpu, &op.input_mix_down, op.rows)
+}
+
 /// `normalized_ready`: a preceding fused launch already wrote this read's
 /// single-row `normalized` (see [`execute_hyper_write_then_read`]).
 fn execute_hyper_read_inner(
@@ -1967,6 +1995,32 @@ fn execute_hyper_read_inner(
     paired: Option<&HyperWriteOp<'_>>,
     gates_written: &mut bool,
     prenormed: bool,
+) -> Result<(), DispatchError> {
+    execute_hyper_read_core(
+        gpu,
+        op,
+        normalized_ready,
+        rotate_into,
+        paired,
+        gates_written,
+        prenormed,
+        None,
+    )
+}
+
+/// [`execute_hyper_read_inner`] with `staged_norm`: the BF16 bits of the read's `normalized` rows
+/// a preceding fused launch (`qwen4_g942_hyper_write_norm_bf16x`, only when
+/// [`g942_hc_down_stages_bf16`] held) already stored in the shared activation scratch.
+#[allow(clippy::too_many_arguments)]
+fn execute_hyper_read_core(
+    gpu: &mut Gpu,
+    op: &HyperReadOp<'_>,
+    normalized_ready: bool,
+    rotate_into: Option<&GpuTensor>,
+    paired: Option<&HyperWriteOp<'_>>,
+    gates_written: &mut bool,
+    prenormed: bool,
+    staged_norm: Option<GpuTensor>,
 ) -> Result<(), DispatchError> {
     // The HC8 sidecar (`DType::HC8E4M3Row`, exact gfx1201): decode / verify rows read the E4M3
     // weights through the PeaceMaker `hc8_gemm`; prefill-class rows get exact BF16 operands.
@@ -2033,6 +2087,9 @@ fn execute_hyper_read_inner(
     let mut activated = false;
     // gfx942 C1 fold: the down GEMM already applied the activation chain to `low`.
     let mut g942_act_folded = false;
+    // gfx942 wide verify (rows > 16, BF16 up weight): the BF16 copy of the activated `low`, which
+    // the up projection reads in place of its own F32 -> BF16 staging.
+    let mut g942_low_staged: Option<GpuTensor> = None;
     // The WMMA read takes `low` as packed BF16, staged in `up` (which that
     // route does not otherwise use).
     let low_bf16 = wmma_read.then(|| {
@@ -2222,8 +2279,25 @@ fn execute_hyper_read_inner(
         ))?;
         activated = true;
     } else {
+        // G12 input: gfx942 wide verify (rows > 16, BF16 down weight). The wide / rows16 down
+        // GEMM reads the activation as BF16, which `project_g942_mfma` stages from the F32
+        // `normalized` with one `convert_f32_to_bf16` launch; `qwen4_g942_hyper_norm_bf16x`
+        // stores those bytes (the values are already BF16-rounded) next to the F32 rows, so the
+        // staging launch drops out. The calibration tap needs the F32 rows and a banded down
+        // weight reads F32.
+        let mut g942_norm_staged: Option<GpuTensor> = staged_norm;
         if !normalized_ready {
-            hip(hyper_norm(gpu, &norm))?;
+            if g942_hc_down_stages_bf16(gpu, op) {
+                let mut scratch = hip(gpu.qwen4_f16_x_scratch(op.rows * wide))?;
+                scratch.dtype = DType::BF16;
+                match gpu.try_gfx942() {
+                    Some(mut device) => hip(device.hyper_norm_bf16x(&norm, &scratch))?,
+                    None => hip(hyper_norm(gpu, &norm))?,
+                }
+                g942_norm_staged = Some(scratch);
+            } else {
+                hip(hyper_norm(gpu, &norm))?;
+            }
         }
         // gfx942 C1 fold (`HIPFIRE_QWEN4_G942_FOLD_ELEM`): the few-row down GEMM with the
         // activation chain below as its epilogue, one launch for the six; bitwise their output.
@@ -2263,7 +2337,7 @@ fn execute_hyper_read_inner(
             let projected = project_weight(
                 gpu,
                 &op.input_mix_down,
-                &normalized,
+                g942_norm_staged.as_ref().unwrap_or(&normalized),
                 &low,
                 op.rows,
                 Some(op.rotation),
@@ -2285,30 +2359,62 @@ fn execute_hyper_read_inner(
             ))?;
         }
     } else if !g942_act_folded {
-        // The three source BF16 boundaries, each one launch over all rows of
-        // `low`: the round trip is elementwise, so this is bitwise the
-        // per-row launches it replaces. Its BF16 copy is staged in `up`,
-        // which the up projection below overwrites before anything reads it.
         let elements = op.rows * op.low_rank;
-        let mut staging = view(op.up, 0, elements);
-        staging.dtype = DType::BF16;
-        let roundtrip = Bf16Roundtrip {
-            input: &low,
-            scratch: &staging,
-            output: &low,
-            elements,
-        };
-        hip(bf16_roundtrip_f32(gpu, &roundtrip))?;
-        hip(scale_f32(
-            gpu,
-            &ScaleF32 {
-                values: &low,
-                scale: 1.0 / op.branches as f32,
-            },
-        ))?;
-        hip(bf16_roundtrip_f32(gpu, &roundtrip))?;
-        hip(gpu.silu_f32(&low, &low))?;
-        hip(bf16_roundtrip_f32(gpu, &roundtrip))?;
+        // G12 input: gfx942 wide verify. The chain below (three BF16 round trips around the
+        // scale and SiLU) is `hc_activation_fused_f32`'s expression on every element, one launch
+        // over all rows of `low`; with `bf16_out` it writes the BF16 bits the up projection's MFMA
+        // reads (the bytes `convert_f32_to_bf16` stages from the chain's F32 result), so the
+        // up projection skips its own staging launch as well. Six launches become one.
+        // The calibration tap needs the F32 `low` and a banded up weight reads F32.
+        let staged_bf16 = gpu.arch_caps.is_gfx942()
+            && gpu.active_capture.is_none()
+            && op.input_mix_up.dtype == DType::BF16
+            && g942_trunk_mfma_route(
+                true,
+                g942_trunk_gemv(),
+                op.rows,
+                DType::BF16,
+                DType::BF16,
+                DType::F32,
+            )
+            && !super::projection_split::is_split(gpu, &op.input_mix_up, op.rows);
+        if staged_bf16 {
+            let mut scratch = hip(gpu.qwen4_f16_x_scratch(elements))?;
+            scratch.dtype = DType::BF16;
+            hip(hc_activation_fused_f32(
+                gpu,
+                &HcActivationFused {
+                    values: &low,
+                    scale: 1.0 / op.branches as f32,
+                    bf16_out: Some(&scratch),
+                },
+            ))?;
+            g942_low_staged = Some(scratch);
+        } else {
+            // The three source BF16 boundaries, each one launch over all rows of
+            // `low`: the round trip is elementwise, so this is bitwise the
+            // per-row launches it replaces. Its BF16 copy is staged in `up`,
+            // which the up projection below overwrites before anything reads it.
+            let mut staging = view(op.up, 0, elements);
+            staging.dtype = DType::BF16;
+            let roundtrip = Bf16Roundtrip {
+                input: &low,
+                scratch: &staging,
+                output: &low,
+                elements,
+            };
+            hip(bf16_roundtrip_f32(gpu, &roundtrip))?;
+            hip(scale_f32(
+                gpu,
+                &ScaleF32 {
+                    values: &low,
+                    scale: 1.0 / op.branches as f32,
+                },
+            ))?;
+            hip(bf16_roundtrip_f32(gpu, &roundtrip))?;
+            hip(gpu.silu_f32(&low, &low))?;
+            hip(bf16_roundtrip_f32(gpu, &roundtrip))?;
+        }
     }
     if up_fused {
         // The F16 WMMA route's BF16 WMMA read (not bit-exact, see
@@ -2393,7 +2499,8 @@ fn execute_hyper_read_inner(
         return hip(hyper_read_up_fused(gpu, &read));
     }
     let held = std::mem::replace(&mut gpu.prefill_lwmma_dense_hold, true);
-    let projected = project_weight(gpu, &op.input_mix_up, &low, &up, op.rows, Some(op.rotation));
+    let up_input = g942_low_staged.as_ref().unwrap_or(&low);
+    let projected = project_weight(gpu, &op.input_mix_up, up_input, &up, op.rows, Some(op.rotation));
     gpu.prefill_lwmma_dense_hold = held;
     projected?;
     if let Some(rotated) = rotate_into.filter(|r| {
@@ -2796,7 +2903,15 @@ pub fn execute_hyper_write_then_read(
     if write.ar.is_some() {
         return Ok(None);
     }
-    let fusable = (1..=gpu.few_row_limit()).contains(&gpu.route_rows(write.rows))
+    // G12 input: an exact-gfx942 lane step's all-rows HC segment (9..=WIDE_VERIFY_MAX_ROWS rows)
+    // takes the same fused launch as the one-row singleton: `hyper_write_norm_f32` is one block
+    // per (branch, row) and bitwise the separate launches, and the unfused wide route's k4 gates
+    // are the quarters' arithmetic ([`g942_hc_quarters_gates`]), so each row is the singleton's.
+    // The read then rotates nothing ahead (`rotate_into` is dropped below).
+    let lane_wide = gpu.g942_lane_wide_rows(write.rows)
+        && write.rows <= rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS
+        && g942_hc_quarters_gates(gpu, write);
+    let fusable = ((1..=gpu.few_row_limit()).contains(&gpu.route_rows(write.rows)) || lane_wide)
         && read.rows == write.rows
         && !write.state_bf16
         && !read.state_bf16
@@ -2841,25 +2956,67 @@ pub fn execute_hyper_write_then_read(
     if quarters_in.is_none() {
         hyper_write_gates(gpu, write, &input, &write_normalized, &gates)?;
     }
-    hip(hyper_write_norm(
+    let fused_write = HyperWrite {
+        input: &input,
+        normalized: &write_normalized,
+        mixed: &mixed,
+        gates: &gates,
+        output: &output,
+        branches: write.branches,
+        hidden: write.hidden,
+        state_bf16: false,
+    };
+    // Lane-wide pairs: the launch also stores the read's `normalized` rows as the BF16 bits its
+    // down projection reads (`qwen4_g942_hyper_write_norm_bf16x`), as the read's own norm does.
+    let mut staged_norm = None;
+    let stage = lane_wide && g942_hc_down_stages_bf16(gpu, read);
+    if stage {
+        let mut scratch = hip(gpu.qwen4_f16_x_scratch(rows * wide))?;
+        scratch.dtype = DType::BF16;
+        match gpu.try_gfx942() {
+            Some(mut device) => hip(device.hyper_write_norm_bf16x(
+                &fused_write,
+                read.norm_weight,
+                &normalized,
+                &scratch,
+                quarters_in,
+                next_gates.as_ref(),
+                clear.as_ref(),
+            ))?,
+            None => hip(hyper_write_norm(
+                gpu,
+                &fused_write,
+                read.norm_weight,
+                &normalized,
+                quarters_in,
+                next_gates.as_ref(),
+                clear.as_ref(),
+            ))?,
+        }
+        staged_norm = Some(scratch);
+    } else {
+        hip(hyper_write_norm(
+            gpu,
+            &fused_write,
+            read.norm_weight,
+            &normalized,
+            quarters_in,
+            next_gates.as_ref(),
+            clear.as_ref(),
+        ))?;
+    }
+    // A lane-wide read rotates nothing ahead: the BF16 trunk weights read `mixed` as it is.
+    let rotate_into = rotate_into.filter(|_| !lane_wide);
+    execute_hyper_read_core(
         gpu,
-        &HyperWrite {
-            input: &input,
-            normalized: &write_normalized,
-            mixed: &mixed,
-            gates: &gates,
-            output: &output,
-            branches: write.branches,
-            hidden: write.hidden,
-            state_bf16: false,
-        },
-        read.norm_weight,
-        &normalized,
-        quarters_in,
-        next_gates.as_ref(),
-        clear.as_ref(),
-    ))?;
-    execute_hyper_read_inner(gpu, read, true, rotate_into, None, &mut false, false)?;
+        read,
+        true,
+        rotate_into,
+        None,
+        &mut false,
+        false,
+        staged_norm,
+    )?;
     Ok(Some(next_gates.is_some()))
 }
 

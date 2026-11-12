@@ -478,6 +478,199 @@ pub(crate) fn ensure_qsa_row_kernel(
     Ok(own)
 }
 
+const QWEN4_G942_CONV_FUSE_SRC: &str =
+    include_str!("../../../../kernels/src/qwen4_g942_conv_fuse.gfx942.hip");
+/// The exact-gfx942 convert-elimination module of the C8 lane-verify window (its own cache key and
+/// twin seat).
+pub const QWEN4_G942_CONV_FUSE_MODULE: &str = "qwen4_g942_conv_fuse";
+/// `hyper_norm_f32` with a second, BF16-bits output (`normalized_bf16`).
+pub const QWEN4_G942_HYPER_NORM_BF16X: &str = "qwen4_g942_hyper_norm_bf16x";
+/// `hyper_write_norm_f32` with a second, BF16-bits output of the read's `normalized` rows.
+pub const QWEN4_G942_HYPER_WRITE_NORM_BF16X: &str = "qwen4_g942_hyper_write_norm_bf16x";
+
+/// `HIPFIRE_QWEN4_G942_CONV_FUSE_IMAGE=/absolute/device.elf` (developer, read once): the explicitly
+/// supplied code object of [`QWEN4_G942_CONV_FUSE_MODULE`] (the Route-A twin proof: same module,
+/// same entry names, loaded through `ensure_embedded_kernel`). Unset: the hipcc source, unchanged.
+fn g942_conv_fuse_image() -> HipResult<Option<&'static std::sync::Arc<[u8]>>> {
+    static IMAGE: std::sync::LazyLock<Result<Option<std::sync::Arc<[u8]>>, String>> =
+        std::sync::LazyLock::new(|| {
+            match hipfire_config::developer_var("HIPFIRE_QWEN4_G942_CONV_FUSE_IMAGE") {
+                Ok(path) if !path.is_empty() => std::fs::read(&path)
+                    .map(|bytes| Some(std::sync::Arc::<[u8]>::from(bytes)))
+                    .map_err(|error| {
+                        format!("HIPFIRE_QWEN4_G942_CONV_FUSE_IMAGE {path}: {error}")
+                    }),
+                _ => Ok(None),
+            }
+        });
+    let loaded: &'static Result<Option<std::sync::Arc<[u8]>>, String> = &IMAGE;
+    match loaded {
+        Ok(image) => Ok(image.as_ref()),
+        Err(message) => Err(hip_bridge::HipError::new(0, message)),
+    }
+}
+
+/// Bind `func` of [`QWEN4_G942_CONV_FUSE_MODULE`]: the hipcc source (the anchor object), or the
+/// `HIPFIRE_QWEN4_G942_CONV_FUSE_IMAGE` code object.
+fn g942_conv_fuse_ensure(gpu: &mut Gpu, func: &str) -> HipResult<()> {
+    gpu.bind_thread()?;
+    match g942_conv_fuse_image()? {
+        Some(image) => gpu.ensure_embedded_kernel(QWEN4_G942_CONV_FUSE_MODULE, image.clone(), func),
+        None => gpu.ensure_kernel(QWEN4_G942_CONV_FUSE_MODULE, QWEN4_G942_CONV_FUSE_SRC, func),
+    }
+}
+
+impl Gfx942Device<'_> {
+    /// [`crate::tensor_ops::hyper_norm`] that also stores each normalized value as BF16 bits into
+    /// `normalized_bf16` (`[rows * branches * hidden]` BF16): the F32 `normalized` rows are
+    /// bitwise `hyper_norm_f32`'s, and the BF16 rows are the bytes `convert_f32_to_bf16` stages
+    /// from them (the values are BF16-rounded). Entry `qwen4_g942_hyper_norm_bf16x` of module
+    /// `qwen4_g942_conv_fuse`; grid `[branches, rows]`, block 256.
+    pub fn hyper_norm_bf16x(
+        &mut self,
+        p: &crate::tensor_ops::HyperNorm<'_>,
+        normalized_bf16: &GpuTensor,
+    ) -> HipResult<()> {
+        let refuse = |what: &str| Err(hip_bridge::HipError::new(0, &format!("hyper_norm_bf16x: {what}")));
+        if p.input.dtype != DType::F32
+            || p.normalized.dtype != DType::F32
+            || p.norm_weight.dtype != DType::BF16
+            || normalized_bf16.dtype != DType::BF16
+            || p.branches == 0
+            || p.hidden == 0
+        {
+            return refuse("dtype or geometry");
+        }
+        let Some(wide) = p.branches.checked_mul(p.hidden) else {
+            return refuse("extent overflow");
+        };
+        let elements = p.input.numel();
+        if elements == 0
+            || elements % wide != 0
+            || p.norm_weight.numel() != wide
+            || p.normalized.numel() != elements
+            || normalized_bf16.numel() < elements
+            || elements > i32::MAX as usize
+        {
+            return refuse("shape");
+        }
+        let rows = elements / wide;
+        g942_conv_fuse_ensure(self.gpu, QWEN4_G942_HYPER_NORM_BF16X)?;
+        let mut args = KernargBlob::new();
+        args.push_ptr(p.input.buf.as_ptr());
+        args.push_ptr(p.norm_weight.buf.as_ptr());
+        args.push_ptr(p.normalized.buf.as_ptr());
+        args.push_i32(p.branches as i32);
+        args.push_i32(p.hidden as i32);
+        args.push_i32(rows as i32);
+        args.push_ptr(normalized_bf16.buf.as_ptr());
+        args.push_i32(i32::from(p.state_bf16));
+        args.pad_to(16);
+        self.gpu.launch_blob_recorded(
+            QWEN4_G942_HYPER_NORM_BF16X,
+            [p.branches as u32, rows as u32, 1],
+            [256, 1, 1],
+            0,
+            args.as_mut_slice(),
+            crate::dispatch::ReplayLaunchBindings::NONE,
+        )
+    }
+}
+
+impl Gfx942Device<'_> {
+    /// [`crate::tensor_ops::hyper_write_norm`] that also stores the read's `normalized` rows as
+    /// BF16 bits into `normalized_bf16` (`[rows * 4 * 2560]` BF16): every other output is
+    /// bitwise `hyper_write_norm_f32`'s, and the BF16 rows are the bytes `convert_f32_to_bf16`
+    /// stages from `normalized` (the values are BF16-rounded). Entry
+    /// `qwen4_g942_hyper_write_norm_bf16x` of module `qwen4_g942_conv_fuse`, grid `[4, rows]`,
+    /// block 256; the same operand contract and refusals as `hyper_write_norm`.
+    pub fn hyper_write_norm_bf16x(
+        &mut self,
+        p: &crate::tensor_ops::HyperWrite<'_>,
+        norm_weight: &GpuTensor,
+        normalized: &GpuTensor,
+        normalized_bf16: &GpuTensor,
+        quarters_in: Option<&GpuTensor>,
+        next: Option<&crate::tensor_ops::HyperNextGates<'_>>,
+        clear: Option<&GpuTensor>,
+    ) -> HipResult<()> {
+        let refuse = |what: &str| {
+            Err(hip_bridge::HipError::new(
+                0,
+                &format!("hyper_write_norm_bf16x: {what}"),
+            ))
+        };
+        if [p.input, p.mixed, p.gates, p.output, normalized]
+            .iter()
+            .any(|t| t.dtype != DType::F32)
+        {
+            return refuse("F32 operand");
+        }
+        let Some(wide) = p.branches.checked_mul(p.hidden) else {
+            return refuse("extent overflow");
+        };
+        let rows = p.input.numel() / wide.max(1);
+        let quarters_ok = |q: &GpuTensor| q.dtype == DType::F32 && q.numel() == 16 * rows;
+        if p.state_bf16
+            || p.branches != 4
+            || p.hidden != 2560
+            || rows == 0
+            || rows > crate::prefill_invariant::WIDE_VERIFY_MAX_ROWS
+            || norm_weight.dtype != DType::BF16
+            || normalized_bf16.dtype != DType::BF16
+            || normalized_bf16.numel() < rows * wide
+            || p.input.numel() != rows * wide
+            || p.output.numel() != rows * wide
+            || normalized.numel() != rows * wide
+            || norm_weight.numel() != wide
+            || p.mixed.numel() != rows * p.hidden
+            || p.gates.numel() != rows * p.branches
+            || quarters_in.is_some_and(|q| !quarters_ok(q))
+            || clear.is_some_and(|c| c.dtype != DType::F32 || c.numel() > i32::MAX as usize)
+            || next.is_some_and(|n| {
+                !quarters_ok(n.quarters)
+                    || n.norm_weight.dtype != DType::BF16
+                    || n.norm_weight.numel() != wide
+                    || n.inject.dtype != DType::BF16
+                    || n.inject.numel() != 4 * wide
+            })
+        {
+            return refuse("shape");
+        }
+        g942_conv_fuse_ensure(self.gpu, QWEN4_G942_HYPER_WRITE_NORM_BF16X)?;
+        let null = std::ptr::null_mut();
+        let mut args = KernargBlob::new();
+        for ptr in [
+            p.input.buf.as_ptr(),
+            p.mixed.buf.as_ptr(),
+            p.gates.buf.as_ptr(),
+            quarters_in.map_or(null, |q| q.buf.as_ptr()),
+            p.output.buf.as_ptr(),
+            norm_weight.buf.as_ptr(),
+            normalized.buf.as_ptr(),
+            normalized_bf16.buf.as_ptr(),
+            next.map_or(null, |n| n.norm_weight.buf.as_ptr()),
+            next.map_or(null, |n| n.inject.buf.as_ptr()),
+            next.map_or(null, |n| n.quarters.buf.as_ptr()),
+            clear.map_or(null, |c| c.buf.as_ptr()),
+        ] {
+            args.push_ptr(ptr);
+        }
+        args.push_i32(clear.map_or(0, |c| c.numel() as i32));
+        args.push_i32(4);
+        args.push_i32(2560);
+        args.pad_to(16);
+        self.gpu.launch_blob_recorded(
+            QWEN4_G942_HYPER_WRITE_NORM_BF16X,
+            [4, rows as u32, 1],
+            [256, 1, 1],
+            0,
+            args.as_mut_slice(),
+            crate::dispatch::ReplayLaunchBindings::NONE,
+        )
+    }
+}
+
 /// A mutable GPU borrow proven to target exact gfx942.
 ///
 /// The constructor is intentionally available only through Gpu::try_gfx942.
@@ -2526,9 +2719,71 @@ fn wide_entry(members: &[usize]) -> (&'static str, usize, usize) {
         .unwrap_or(WIDE_ENTRIES[0])
 }
 
+const QWEN4_G942_ROWS16_GRID_SRC: &str =
+    include_str!("../../../../kernels/src/qwen4_g942_rows16_grid.gfx942.hip");
+/// The row-grid module of the exact-gfx942 verify route table (see [`row_grid_admitted`]).
+pub const QWEN4_G942_ROWS16_GRID_MODULE: &str = "qwen4_g942_rows16_grid";
+/// The module's two entries: BF16 X / F32 X of at most eight rows per slice, and the F32 X
+/// entry for nine to sixteen rows per slice.
+pub const QWEN4_G942_ROWS16_GRID_ENTRIES: [&str; 2] =
+    ["qwen4_g942_rows16_grid", "qwen4_g942_rows16_grid_x2"];
+
+/// Bind `func` of the row-grid module: the hipcc source, or, only when
+/// `HIPFIRE_QWEN4_G942_ROWS16_GRID_IMAGE=/absolute/device.elf` names one, that explicitly
+/// supplied code object (the Route-A twin proof: same module, same entry names, loaded through
+/// `ensure_embedded_kernel`). Unset: the source, unchanged.
+fn g942_rows16_grid_ensure(gpu: &mut Gpu, func: &str) -> HipResult<()> {
+    match hipfire_config::developer_var("HIPFIRE_QWEN4_G942_ROWS16_GRID_IMAGE") {
+        Ok(path) if !path.is_empty() => {
+            let bytes = std::fs::read(&path).map_err(|error| {
+                hip_bridge::HipError::new(
+                    0,
+                    &format!("HIPFIRE_QWEN4_G942_ROWS16_GRID_IMAGE {path}: {error}"),
+                )
+            })?;
+            gpu.ensure_embedded_kernel(
+                QWEN4_G942_ROWS16_GRID_MODULE,
+                std::sync::Arc::<[u8]>::from(bytes),
+                func,
+            )
+        }
+        _ => gpu.ensure_kernel(
+            QWEN4_G942_ROWS16_GRID_MODULE,
+            QWEN4_G942_ROWS16_GRID_SRC,
+            func,
+        ),
+    }
+}
+
+/// Row-grid row of the per-projection route table (17..=[`ROW_GRID_MAX_ROWS`] rows, BF16
+/// activation): a single narrow, long-K weight, at most [`ROW_GRID_MAX_TILES`] 16-row weight
+/// tiles with `K >= ROW_GRID_MIN_K` (the HC read's down projection, M = 320, K = 10240: 20 tiles).
+/// The wide entry launches those 20 workgroups each staging a 64-row activation tile (MI300X,
+/// 32 rows: 28.7 us; one rows16 chain slice per 16 rows: 39.9 us); one row-grid launch spreads the
+/// same weight over `20 * ceil(rows / 16)` workgroups of the rows16 body and takes 20.0 us at 16 /
+/// 32 / 64 rows (microbench, cold weights, every output word equal to the rows16 chain's; K2
+/// `fused_grid` 128 / 256 rows: 4.1 / 5.8 ms against 8.8 / 14.7 ms per 97-read sweep). Every
+/// other shape of the census keeps its measured-fastest wide entry (router and shared gate/up:
+/// within 8 % of the wide entry either way; the large-M groups: the row grid re-reads the weight
+/// per 16-row slice).
+const ROW_GRID_MAX_TILES: usize = 32;
+const ROW_GRID_MIN_K: usize = 8192;
+/// The most rows the measurements cover (K2, N = 256); past it the prefill routes are untouched.
+const ROW_GRID_MAX_ROWS: usize = 256;
+
+fn row_grid_admitted(members: &[usize], k: usize, batch: usize) -> bool {
+    batch > ROWS16_CHAIN_STEP
+        && batch <= ROW_GRID_MAX_ROWS
+        && k >= ROW_GRID_MIN_K
+        && members.len() == 1
+        && members[0].div_ceil(16) <= ROW_GRID_MAX_TILES
+}
+
 impl Gpu {
     /// [`Gpu::gemm_bf16_mfma_gfx942_rows16`] for any `batch`: up to 16 rows
-    /// it is that one launch; past 16 rows, with `wide` set and any
+    /// it is that one launch; past 16 rows a BF16 `x` of a single narrow, long-K weight
+    /// ([`row_grid_admitted`], with `wide` or `chain` set) takes the one-launch row grid
+    /// [`Gpu::gemm_bf16_mfma_gfx942_rows16_grid`]; otherwise, with `wide` set and any
     /// member's `batch <= `[`wide_max_rows`] (a small member rides in the launch
     /// of a large one at no cost), it is
     /// [`Gpu::gemm_bf16_mfma_gfx942_wide_slices`] (one weight pass per 64
@@ -2557,6 +2812,19 @@ impl Gpu {
         }
         if members.is_empty() || members.len() > MAX {
             return Ok(false);
+        }
+        // The row grid replaces the wide entry (and the chain) for the narrow long-K weight of
+        // [`row_grid_admitted`]; a declined launch falls through to them.
+        if (wide || chain) && x.dtype == DType::BF16 {
+            let mut ms = [0usize; MAX];
+            for (slot, &(_, _, m)) in ms.iter_mut().zip(members) {
+                *slot = m;
+            }
+            if row_grid_admitted(&ms[..members.len()], k, batch)
+                && self.gemm_bf16_mfma_gfx942_rows16_grid(x, members, k, batch)?
+            {
+                return Ok(true);
+            }
         }
         if wide
             && members
@@ -2587,6 +2855,112 @@ impl Gpu {
                 return Ok(false);
             }
         }
+        Ok(true)
+    }
+
+    /// The row-grid entry `qwen4_g942_rows16_grid{,_x2}` for any `batch >= 1`: up to four BF16
+    /// weights `[m_j, K]` that read the same `x` (F32 or BF16 `[batch, K]`) as ONE launch of grid
+    /// `[sum_j ceil(m_j / 16), ceil(batch / 16)]`, member j writing its `y_j` (F32 or BF16
+    /// `[batch, m_j]`). Same contract and the same bytes as [`Gpu::gemm_bf16_mfma_gfx942_rows16`]
+    /// per 16-row slice (the rows16 body runs unchanged per `blockIdx.y`); returns `Ok(false)`
+    /// without launching when the entry does not apply (no member or more than four, `K % 8 != 0`,
+    /// an operand not 16-byte aligned, a dtype outside F32 / BF16, or an output overlapping `x`).
+    pub fn gemm_bf16_mfma_gfx942_rows16_grid(
+        &mut self,
+        x: &GpuTensor,
+        members: &[(&hip_bridge::DeviceBuffer, &GpuTensor, usize)],
+        k: usize,
+        batch: usize,
+    ) -> HipResult<bool> {
+        const MAX: usize = crate::gemm::GEMM_BF16_MFMA_ROWS16_MAX_MEMBERS;
+        let (x_f32, x_size) = match x.dtype {
+            DType::F32 => (true, 4usize),
+            DType::BF16 => (false, 2usize),
+            _ => return Ok(false),
+        };
+        if members.is_empty()
+            || members.len() > MAX
+            || batch == 0
+            || k % 8 != 0
+            || (x.buf.as_ptr() as usize) % 16 != 0
+            || batch.div_ceil(16) > u16::MAX as usize
+        {
+            return Ok(false);
+        }
+        let x_start = x.buf.as_ptr() as usize;
+        let x_end = x_start + batch * k * x_size;
+        let mut a_ptr = [std::ptr::null_mut::<c_void>(); MAX];
+        let mut d_ptr = [std::ptr::null_mut::<c_void>(); MAX];
+        let mut m_i32 = [0i32; MAX];
+        let mut d_bf16_mask = 0i32;
+        let mut tiles = 0usize;
+        let mut bytes = batch * k * x_size;
+        for (j, &(a, y, m)) in members.iter().enumerate() {
+            // Every workgroup reads x for the whole launch: an output that overlaps it keeps the
+            // staged route (which reads a staged copy).
+            let y_start = y.buf.as_ptr() as usize;
+            if y_start < x_end && x_start < y_start + batch * m * y.dtype.size() {
+                return Ok(false);
+            }
+            let d_bf16 = match y.dtype {
+                DType::F32 => false,
+                DType::BF16 => true,
+                _ => return Ok(false),
+            };
+            if (a.as_ptr() as usize) % 16 != 0 {
+                return Ok(false);
+            }
+            self.gemm_bf16_mfma_gfx942_check(a, &x.buf, x_size, &y.buf, y.dtype.size(), m, k, batch)?;
+            a_ptr[j] = a.as_ptr();
+            d_ptr[j] = y.buf.as_ptr();
+            m_i32[j] = m as i32;
+            d_bf16_mask |= i32::from(d_bf16) << j;
+            tiles += m.div_ceil(16);
+            bytes += m * k * 2 + batch * m * y.dtype.size();
+        }
+        let kernel = QWEN4_G942_ROWS16_GRID_ENTRIES[usize::from(x_f32 && batch > 8)];
+        g942_rows16_grid_ensure(self, kernel)?;
+        let x_ptr = x.buf.as_ptr();
+        let (k_i32, batch_i32, x_f32_i32) = (k as i32, batch as i32, i32::from(x_f32));
+        let mut params: Vec<*mut c_void> = vec![&x_ptr as *const _ as *mut c_void];
+        params.extend(a_ptr.iter().map(|p| p as *const _ as *mut c_void));
+        params.extend(d_ptr.iter().map(|p| p as *const _ as *mut c_void));
+        params.extend(m_i32.iter().map(|v| v as *const _ as *mut c_void));
+        params.extend([
+            &k_i32 as *const _ as *mut c_void,
+            &batch_i32 as *const _ as *mut c_void,
+            &x_f32_i32 as *const _ as *mut c_void,
+            &d_bf16_mask as *const _ as *mut c_void,
+        ]);
+        // LDS for a full 16-row slice; a short last slice uses less.
+        let lds = (2 * (16 + batch.min(16)) * (256 + 4) * 2) as u32;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel, bytes);
+        let result = self.launch_maybe_blob(
+            kernel,
+            [tiles as u32, batch.div_ceil(16) as u32, 1],
+            [576, 1, 1],
+            lds,
+            &mut params,
+            || {
+                let mut blob = KernargBlob::new();
+                blob.push_ptr(x_ptr);
+                for p in a_ptr.iter().chain(d_ptr.iter()) {
+                    blob.push_ptr(*p);
+                }
+                for v in m_i32 {
+                    blob.push_i32(v);
+                }
+                blob.push_i32(k_i32);
+                blob.push_i32(batch_i32);
+                blob.push_i32(x_f32_i32);
+                blob.push_i32(d_bf16_mask);
+                blob
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result?;
         Ok(true)
     }
 
@@ -3882,5 +4256,220 @@ mod tests {
                 "{absent} entry in the QSA row anchor"
             );
         }
+    }
+
+    /// The convert-fuse module's blocks are `tensor_ops.hip`'s / `qwen4_gemv_bf16_xf32.hip`'s text
+    /// byte for byte once the `// G12` additions are removed (and the one renamed entry mapped
+    /// back), and nothing else in it is code but the entry wrappers.
+    #[test]
+    fn g942_conv_fuse_source_is_tensor_ops_verbatim() {
+        let sources = [
+            ("tensor_ops.hip", crate::tensor_ops::TENSOR_OPS_SRC, 3usize),
+            (
+                "qwen4_gemv_bf16_xf32.hip",
+                crate::kernels::QWEN4_GEMV_BF16_XF32_SRC,
+                2usize,
+            ),
+        ];
+        let mut g12_lines = 0;
+        let mut outside = super::QWEN4_G942_CONV_FUSE_SRC.to_string();
+        for (file, production, expected_blocks) in sources {
+            let begin = format!("// BEGIN verbatim {file}\n");
+            let end_marker = format!("// END verbatim {file}");
+            let mut blocks = 0;
+            while let Some(at) = outside.find(&begin) {
+                let body_start = at + begin.len();
+                let end = outside[body_start..]
+                    .find(&end_marker)
+                    .expect("END marker after every BEGIN marker");
+                let block = outside[body_start..body_start + end]
+                    .trim_end_matches('\n')
+                    .replace("qwen4_g942_hyper_write_norm_bf16x(", "hyper_write_norm_f32(");
+                let stripped: Vec<&str> = block
+                    .lines()
+                    .filter(|line| {
+                        let g12 = line.trim_end().ends_with("// G12");
+                        g12_lines += usize::from(g12);
+                        !g12
+                    })
+                    .collect();
+                let stripped = stripped.join("\n");
+                assert!(
+                    production.contains(&stripped),
+                    "verbatim block {blocks} of qwen4_g942_conv_fuse.gfx942.hip is no longer a \
+                     substring of {file}: mirror the production edit\nblock starts: {:?}",
+                    &stripped[..stripped.len().min(120)]
+                );
+                blocks += 1;
+                outside.replace_range(at..body_start + end + end_marker.len(), "");
+            }
+            assert_eq!(blocks, expected_blocks, "{file} blocks");
+        }
+        assert_eq!(
+            g12_lines, 6,
+            "the BF16 output parameter and two store lines of each of the two entries"
+        );
+        // Outside the markers: comments, includes and the one entry wrapper.
+        let code: Vec<&str> = outside
+            .lines()
+            .map(str::trim)
+            .filter(|t| !(t.is_empty() || t.starts_with("//") || t.starts_with("#include")))
+            .collect();
+        assert_eq!(
+            code,
+            [
+                "extern \"C\" __global__ void qwen4_g942_hyper_norm_bf16x(",
+                "const void* input,",
+                "const __hip_bfloat16* norm_weight,",
+                "float* normalized,",
+                "int branches,",
+                "int hidden,",
+                "int rows,",
+                "unsigned short* normalized_bf16,",
+                "int state_bf16) {",
+                "if (state_bf16)",
+                "hyper_norm_rows((const unsigned short*)input, norm_weight, normalized, branches, hidden,",
+                "rows, normalized_bf16, (_Float16*)nullptr);",
+                "else",
+                "hyper_norm_rows((const float*)input, norm_weight, normalized, branches, hidden, rows,",
+                "normalized_bf16, (_Float16*)nullptr);",
+                "}",
+            ],
+            "unmarked code in the convert-fuse module"
+        );
+    }
+
+    /// The frozen hipcc anchor of the convert-fuse module: `hipcc --genco --offload-arch=gfx942 -O3
+    /// --no-offload-compress -fuse-cuid=none -mcode-object-version=6` of the pinned source (ROCm
+    /// 7.16, AMD clang 24.0.0git d6f6cb6918). Re-seal both hashes together when the source changes.
+    #[test]
+    fn g942_conv_fuse_anchor_and_source_are_pinned() {
+        use sha2::{Digest, Sha256};
+        const SOURCE_SHA256: &str =
+            "f5b22c8d7f590a2e25511cc14d03f321a5072a13dbd617a6f68d1a17a275ca95";
+        const ANCHOR_SHA256: &str =
+            "acf9d67b83b041cbb291c6df8379cc5b0d1c6c208fa5b13c763f3979b84a7c3a";
+        let hex = |bytes: &[u8]| -> String {
+            Sha256::digest(bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        };
+        assert_eq!(hex(super::QWEN4_G942_CONV_FUSE_SRC.as_bytes()), SOURCE_SHA256);
+        let anchor: &[u8] =
+            include_bytes!("../../../../kernels/qwen4_g942_conv_fuse_hipcc_gfx942.co");
+        assert_eq!(hex(anchor), ANCHOR_SHA256);
+        for name in [
+            super::QWEN4_G942_HYPER_NORM_BF16X,
+            super::QWEN4_G942_HYPER_WRITE_NORM_BF16X,
+        ] {
+            assert!(
+                anchor.windows(name.len()).any(|w| w == name.as_bytes()),
+                "{name} missing from the anchor"
+            );
+        }
+    }
+
+    /// The row-grid module's two blocks are `gemm_bf16_mfma.gfx942.hip`'s text byte for byte (the
+    /// BF16 / MFMA typedefs, and the rows16 helpers plus `gemm_bf16_mfma_rows16_body`); the only
+    /// other code is the grid entry macro and its two instantiations.
+    #[test]
+    fn g942_rows16_grid_source_is_rows16_verbatim() {
+        const BEGIN: &str = "// BEGIN verbatim gemm_bf16_mfma.gfx942.hip\n";
+        const END: &str = "// END verbatim gemm_bf16_mfma.gfx942.hip";
+        let production = crate::kernels::GEMM_BF16_MFMA_GFX942_SRC;
+        let src = super::QWEN4_G942_ROWS16_GRID_SRC;
+        let mut blocks = 0;
+        let mut rest = src;
+        let mut outside = String::new();
+        while let Some(at) = rest.find(BEGIN) {
+            outside.push_str(&rest[..at]);
+            let body = &rest[at + BEGIN.len()..];
+            let end = body.find(END).expect("END marker after every BEGIN marker");
+            let block = body[..end].trim_end_matches('\n');
+            assert!(
+                production.contains(block),
+                "verbatim block {blocks} of qwen4_g942_rows16_grid.gfx942.hip is no longer a \
+                 substring of gemm_bf16_mfma.gfx942.hip: mirror the production edit\nblock \
+                 starts: {:?}",
+                &block[..block.len().min(120)]
+            );
+            blocks += 1;
+            rest = &body[end + END.len()..];
+        }
+        outside.push_str(rest);
+        assert_eq!(blocks, 2, "typedefs + mfma_bf16, rows16 helpers + body");
+        assert!(
+            production.contains("gemm_bf16_mfma_rows16_body<XI>(X, A0, A1, A2, A3, D0, D1, D2, D3,"),
+            "the production entries call the body the grid entries call"
+        );
+        // Outside the markers: comments, includes, the grid entry macro and its instantiations.
+        let code: Vec<&str> = outside
+            .lines()
+            .map(str::trim)
+            .filter(|t| !(t.is_empty() || t.starts_with("//") || t.starts_with("#include")))
+            .collect();
+        let instantiations: Vec<&str> = code
+            .iter()
+            .copied()
+            .filter(|t| t.starts_with("R16_GRID_ENTRY(") || t.starts_with("#undef R16_GRID_ENTRY"))
+            .collect();
+        assert_eq!(
+            instantiations,
+            [
+                "R16_GRID_ENTRY(qwen4_g942_rows16_grid, 1)",
+                "R16_GRID_ENTRY(qwen4_g942_rows16_grid_x2, 2)",
+                "#undef R16_GRID_ENTRY",
+            ]
+        );
+        // The grid slices X and every D by blockIdx.y and passes the slice's own batch.
+        assert!(src.contains("const int r0  = blockIdx.y * 16;"));
+        assert!(src.contains("M0, M1, M2, M3, K, sub, x_f32, d_bf16_mask);"));
+    }
+
+    /// The frozen hipcc anchor of the row-grid module: `hipcc --genco --offload-arch=gfx942 -O3
+    /// --no-offload-compress -fuse-cuid=none -mcode-object-version=6` of the pinned source (ROCm
+    /// 7.16, AMD clang 24.0.0git d6f6cb6918). Re-seal both hashes together when the source
+    /// changes.
+    #[test]
+    fn g942_rows16_grid_anchor_and_source_are_pinned() {
+        use sha2::{Digest, Sha256};
+        const SOURCE_SHA256: &str =
+            "a2de511e579acd71d91b543d35ae02f2644a76e22ab10f8bdbe11e22b2437b94";
+        const ANCHOR_SHA256: &str =
+            "75a775653ad9833cd6e93b9ba6ac25b6121ae91ee6c62d4d3fd0cd38fddc31b5";
+        let hex = |bytes: &[u8]| -> String {
+            Sha256::digest(bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        };
+        assert_eq!(hex(super::QWEN4_G942_ROWS16_GRID_SRC.as_bytes()), SOURCE_SHA256);
+        let anchor: &[u8] =
+            include_bytes!("../../../../kernels/qwen4_g942_rows16_grid_hipcc_gfx942.co");
+        assert_eq!(hex(anchor), ANCHOR_SHA256);
+        for name in super::QWEN4_G942_ROWS16_GRID_ENTRIES {
+            assert!(
+                anchor.windows(name.len()).any(|w| w == name.as_bytes()),
+                "{name} missing from the anchor"
+            );
+        }
+    }
+
+    /// The row-grid row of the route table admits exactly the narrow long-K single weight at
+    /// 17..=256 rows: the HC down projection (M = 320, K = 10240), not the router, the shared
+    /// group, the large-M groups, the HC up projection or any 16-row-or-fewer launch.
+    #[test]
+    fn g942_row_grid_route_row() {
+        for rows in [17, 32, 64, 128, 256] {
+            assert!(super::row_grid_admitted(&[320], 10240, rows), "hc_down {rows}");
+        }
+        assert!(!super::row_grid_admitted(&[320], 10240, 16));
+        assert!(!super::row_grid_admitted(&[320], 10240, 257));
+        assert!(!super::row_grid_admitted(&[512], 2560, 32), "router");
+        assert!(!super::row_grid_admitted(&[1, 640, 640], 2560, 32), "shared gate/up");
+        assert!(!super::row_grid_admitted(&[2560], 6144, 32), "out_proj");
+        assert!(!super::row_grid_admitted(&[10240], 320, 32), "hc_up");
+        assert!(!super::row_grid_admitted(&[10240, 6144, 48, 48], 2560, 32), "gdn in");
     }
 }

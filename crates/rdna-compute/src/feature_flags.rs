@@ -148,7 +148,7 @@ pub struct FeatureFlags {
     /// per-branch / per-lane `add_f32` broadcast adds run as one `broadcast_add_rows_f32`, the
     /// batched draft round's per-lane D2D staging copies, the head snapshot / restore copies and
     /// the draft ranking's per-row rotations run as one launch each (existing entries, bytes
-    /// identical). Default on for exact gfx1201, `0` is the kill switch.
+    /// identical). Default on for exact gfx1201 and exact gfx942, `0` is the kill switch.
     pub qwen4_draft_glue_fold: bool,
     /// MTP draft ranking row batch (`HIPFIRE_QWEN4_DRAFT_TOPK8_ROWS`): the MQ6G256V2 head's per-row
     /// top-8 partial + exact re-score pairs of one batched ranking class run as one pair per run
@@ -1329,7 +1329,8 @@ impl FeatureFlags {
                 .unwrap_or(is_gfx1201),
             qwen4_moe_combine_inline_order: parse_bool("HIPFIRE_QWEN4_MOE_COMBINE_INLINE_ORDER")
                 .unwrap_or(is_gfx1201),
-            qwen4_draft_glue_fold: parse_bool("HIPFIRE_QWEN4_DRAFT_GLUE_FOLD").unwrap_or(is_gfx1201),
+            qwen4_draft_glue_fold: parse_bool("HIPFIRE_QWEN4_DRAFT_GLUE_FOLD")
+                .unwrap_or(is_gfx1201 || arch == "gfx942"),
             qwen4_draft_topk8_rows: parse_bool("HIPFIRE_QWEN4_DRAFT_TOPK8_ROWS").unwrap_or(is_gfx1201),
             qwen4_lane_prepare_async: parse_bool("HIPFIRE_QWEN4_LANE_PREPARE_ASYNC")
                 .unwrap_or(is_gfx1201),
@@ -2058,10 +2059,10 @@ impl FeatureFlags {
         self.qwen4_moe_combine_inline_order && self.arch == "gfx1201"
     }
 
-    /// MTP draft-head launch-glue fold (`HIPFIRE_QWEN4_DRAFT_GLUE_FOLD`): exact gfx1201 only,
-    /// default on, `0` is the kill switch.
+    /// MTP draft-head launch-glue fold (`HIPFIRE_QWEN4_DRAFT_GLUE_FOLD`): exact gfx1201 and exact
+    /// gfx942, default on, `0` is the kill switch.
     pub fn qwen4_draft_glue_fold_enabled(&self) -> bool {
-        self.qwen4_draft_glue_fold && self.arch == "gfx1201"
+        self.qwen4_draft_glue_fold && matches!(self.arch.as_str(), "gfx1201" | "gfx942")
     }
 
     /// MTP draft ranking row batch (`HIPFIRE_QWEN4_DRAFT_TOPK8_ROWS`): exact gfx1201 only,
@@ -2321,9 +2322,10 @@ impl FeatureFlags {
     }
 
     /// Lane-wide PLE projection (`HIPFIRE_QWEN4_LANE_PLE_PROJECT`, default on, `=0` kills it).
-    /// Exact gfx1201 only.
+    /// Exact gfx1201 (the row-exact BF16 GEMV) and exact gfx942 (the BF16 MFMA trunk route, whose
+    /// every output row is independent of the row count).
     pub fn qwen4_lane_ple_project_enabled(&self) -> bool {
-        self.qwen4_lane_ple_project && self.arch == "gfx1201"
+        self.qwen4_lane_ple_project && matches!(self.arch.as_str(), "gfx1201" | "gfx942")
     }
 
     /// E4M3 HC mixer sidecar (`HIPFIRE_QWEN4_HC8`, default on, `=0` kills it). Exact gfx1201
@@ -3707,9 +3709,9 @@ mod tests {
         }
     }
 
-    /// The MTP draft glue fold is default on (`=0` kills) and reaches exact gfx1201 only.
+    /// The MTP draft glue fold is default on (`=0` kills) and reaches exact gfx1201 and exact gfx942.
     #[test]
-    fn qwen4_draft_glue_fold_is_default_on_exact_gfx1201() {
+    fn qwen4_draft_glue_fold_is_default_on_exact_gfx1201_and_gfx942() {
         let with = |value: &'static str| {
             move |key: &str| -> std::result::Result<String, ()> {
                 if key == "HIPFIRE_QWEN4_DRAFT_GLUE_FOLD" {
@@ -3720,7 +3722,7 @@ mod tests {
             }
         };
         for arch in ["gfx1100", "gfx1151", "gfx1200", "gfx1201", "gfx942"] {
-            let exact = arch == "gfx1201";
+            let exact = matches!(arch, "gfx1201" | "gfx942");
             let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
             assert_eq!(unset.qwen4_draft_glue_fold_enabled(), exact, "{arch}");
             let off = FeatureFlags::from_lookup(arch, with("0"));
@@ -4444,6 +4446,18 @@ mod tests {
         }
         let t = FeatureFlags::for_test("gfx1201");
         assert!(!t.qwen4_mtp_fc_one_launch_enabled() && !t.qwen4_lane_ple_project_enabled());
+        // Exact gfx942 takes the lane-wide PLE projection (and only that one of the two) by
+        // default; `=0` kills it.
+        let on = FeatureFlags::from_lookup("gfx942", |_| Err(()));
+        assert!(on.qwen4_lane_ple_project_enabled() && !on.qwen4_mtp_fc_one_launch_enabled());
+        let off = FeatureFlags::from_lookup("gfx942", |n| {
+            if n == "HIPFIRE_QWEN4_LANE_PLE_PROJECT" {
+                Ok("0".into())
+            } else {
+                Err(())
+            }
+        });
+        assert!(!off.qwen4_lane_ple_project_enabled());
     }
 
     /// The HC8 sidecar route is default on (`=0` kills) and reaches exact gfx1201 only.

@@ -30,7 +30,8 @@ use hipfire_dispatch::pipeline::gated_mlp::{
     Activation, GatedMlpOp, GatedMlpScratch, MlpLadder, MlpOutput, MlpStorage,
 };
 use hipfire_dispatch::pipeline::{
-    execute_validated_steps, validate_steps, BroadcastAddOp, ClearOp, DraftHead, DraftHeadLayout,
+    execute_validated_steps, g942_bf16_few_rows_invariant, validate_steps, BroadcastAddOp, ClearOp,
+    DraftHead, DraftHeadLayout,
     DraftHeadPolicy, DraftHeadRequestState, EmbeddingOp, HyperNormOp, HyperReadOp, HyperWriteOp,
     IndexedAttentionMode, IndexedAttentionOp, IndexedAttentionState, MixerPhase, ProjectLadder,
     ProjectOp, Step,

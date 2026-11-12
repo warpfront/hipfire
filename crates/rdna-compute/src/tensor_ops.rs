@@ -13,21 +13,6 @@ use hip_bridge::{HipError, HipResult, KernargBlob};
 use crate::prefill_invariant::{qwen4_gdn_prefill, Qwen4GdnPrefill};
 use crate::{DType, Gpu, GpuTensor};
 
-fn gdn_verify_entry(gpu: &Gpu, kernel: &'static str) -> &'static str {
-    if !gpu.arch_caps.is_gfx942() {
-        return kernel;
-    }
-    match kernel {
-        "gated_delta_step_halves_state128_persistent256_capture_f32" => {
-            "qwen4_g942_gdn_verify_capture_f32"
-        }
-        "gated_delta_rollback_layers_f32" => "qwen4_g942_gdn_verify_rollback_f32",
-        "gated_delta_conv_bf16_f32_batched_k4" => "qwen4_g942_gdn_verify_conv_params_k4",
-        "gated_delta_gate_bf16_f32_batched" => "qwen4_g942_gdn_verify_gate_batched",
-        _ => kernel,
-    }
-}
-
 #[path = "npu_trunk_consumers.rs"]
 pub(crate) mod npu_arena;
 pub use npu_arena::*;
@@ -1077,7 +1062,13 @@ pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) ->
         arch_gfx942: gpu.arch == "gfx942",
         pipe_enabled: *QWEN4_GDN_PIPE,
     });
-    let kernel = gdn_verify_entry(gpu, kernel);
+    let kernel = if gpu.arch_caps.is_gfx942()
+        && kernel == "gated_delta_step_halves_state128_persistent256_capture_f32"
+    {
+        "qwen4_g942_gdn_verify_capture_f32"
+    } else {
+        kernel
+    };
     crate::cdna::gfx942::ensure_gdn_verify_kernel(gpu, kernel)?;
     let frame = if format.has_frame_kernarg() {
         checked_u32(p.position + p.rows - 1, "GDN Q8 frame")?
@@ -1122,6 +1113,16 @@ pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) ->
 #[doc(hidden)]
 pub fn lab_ensure_tensor_ops_kernel(gpu: &mut Gpu, kernel: &str) -> HipResult<()> {
     gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)
+}
+
+/// Load the single-row QSA attention entry `kernel` (a `tensor_ops` name) the way the public
+/// launcher does and return the symbol to launch: on exact gfx942 the `qwen4_g942_qsa_row_*`
+/// entry of the gfx942 row module (hipcc source, or the `HIPFIRE_QWEN4_G942_QSA_ROW_IMAGE` code
+/// object), elsewhere `kernel` itself from `tensor_ops`. The module under test of
+/// `qwen4_g942_qsa_row_oracle`, which launches it directly through [`Gpu::launch_kernel_blob`].
+#[doc(hidden)]
+pub fn lab_ensure_qsa_row_entry(gpu: &mut Gpu, kernel: &'static str) -> HipResult<&'static str> {
+    crate::cdna::gfx942::ensure_qsa_row_kernel(gpu, kernel)
 }
 
 /// Single-launch rollback kernel of a state's STORAGE format. Q8Ef has no
@@ -1184,7 +1185,11 @@ pub fn gated_delta_rollback_layers(
             "GDN rollback: a Q8Ef state rolls back with its residual (gated_delta_rollback_layers_ef)",
         ));
     };
-    let kernel = gdn_verify_entry(gpu, kernel);
+    let kernel = if gpu.arch_caps.is_gfx942() && kernel == "gated_delta_rollback_layers_f32" {
+        "qwen4_g942_gdn_verify_rollback_f32"
+    } else {
+        kernel
+    };
     crate::cdna::gfx942::ensure_gdn_verify_kernel(gpu, kernel)?;
     let mut args = KernargBlob::new();
     args.push_ptr(p.table.buf.as_ptr());
@@ -4670,10 +4675,11 @@ fn gated_delta_conv_batched_impl(
     let row_grid = checked_u32(p.rows.div_ceil(16), "GDN batched convolution row grid")?;
     let kernel = if qk_norm.is_some() {
         "gated_delta_conv_qknorm_bf16_f32_batched_k4"
+    } else if gpu.arch_caps.is_gfx942() {
+        "qwen4_g942_gdn_verify_conv_params_k4"
     } else {
         "gated_delta_conv_bf16_f32_batched_k4"
     };
-    let kernel = gdn_verify_entry(gpu, kernel);
     crate::cdna::gfx942::ensure_gdn_verify_kernel(gpu, kernel)?;
     let mut args = KernargBlob::new();
     for tensor in [p.input, p.kernel, p.history, p.output, p.next_history] {
@@ -4689,20 +4695,16 @@ fn gated_delta_conv_batched_impl(
     // also store the unnormalized Q/K convolution (debug / capture).
     args.push_i32(i32::from(output_bf16) | qk_norm.map_or(0, |n| 2 * i32::from(n.keep_qk_conv)));
     args.push_i32(i32::from(input_bf16));
-    let (param_elements, param_heads) = match params {
-        Some(q) => {
-            for tensor in [q.a, q.b, q.a_log, q.dt_bias, q.gate, q.beta] {
-                args.push_ptr(tensor.buf.as_ptr());
-            }
-            (q.rows * q.heads, q.heads)
+    if let Some(q) = params {
+        for tensor in [q.a, q.b, q.a_log, q.dt_bias, q.gate, q.beta] {
+            args.push_ptr(tensor.buf.as_ptr());
         }
-        None => {
-            for _ in 0..6 {
-                args.push_ptr(std::ptr::null());
-            }
-            (0, 1)
+    } else {
+        for _ in 0..6 {
+            args.push_ptr(std::ptr::null());
         }
-    };
+    }
+    let (param_elements, param_heads) = params.map_or((0, 1), |q| (q.rows * q.heads, q.heads));
     args.push_i32(checked_i32(param_elements, "GDN batched parameter extent")?);
     args.push_i32(checked_i32(param_heads, "GDN batched parameter heads")?);
     if let Some(norm) = qk_norm {
@@ -4982,7 +4984,11 @@ pub fn gated_delta_gate_batched(gpu: &mut Gpu, p: &GatedDeltaGateBatched<'_>) ->
     let value_heads = checked_i32(p.value_heads, "GDN batched gate heads")?;
     let value_dim = checked_i32(p.value_dim, "GDN batched gate width")?;
     let value_heads_grid = checked_u32(elements / p.value_dim, "GDN batched gate grid")?;
-    let gate_kernel = gdn_verify_entry(gpu, "gated_delta_gate_bf16_f32_batched");
+    let gate_kernel = if gpu.arch_caps.is_gfx942() {
+        "qwen4_g942_gdn_verify_gate_batched"
+    } else {
+        "gated_delta_gate_bf16_f32_batched"
+    };
     crate::cdna::gfx942::ensure_gdn_verify_kernel(gpu, gate_kernel)?;
     let mut args = KernargBlob::new();
     for tensor in [p.recurrent_output, p.z, p.norm, p.output] {
