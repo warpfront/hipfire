@@ -123,6 +123,6 @@ are recorded in the follow-up amendment below once it finished; they do not alte
   almost none of this feature.
 - Prefill rate (GPU-side batched kernels; the seam cannot touch it).
 - Formats outside `CpuQuant` staying on PCIe by design (`Q8HFQ`, `MQ8G256`, the
-  HFP4/MFP4 family, PARO) — not present in these two fixtures.
+  HFP4/MFP4 family) — not present in these two fixtures.
 - The retained-replay (Redline) route under `offload_exec=cpu` (refused at load,
   per the base record §"Correctness gate").

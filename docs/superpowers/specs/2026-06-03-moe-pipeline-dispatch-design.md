@@ -85,7 +85,7 @@ qwen35 but means the "composable primitive" framing is aspirational.
 | `Softmax` | `gpu.softmax_f32` | — (shared math) |
 | `TopKRenorm{k=8 only}` | `moe_topk_renorm_k8` (GPU, hipGraph-capture-safe) | CPU download + `select_nth_unstable` + renorm |
 | `SharedExpertDown` (macro) | `gemv_hfq4g256_residual_sigmoid_scaled_gpu` (silu·mul·rotate + down + sigmoid + residual-add fused) | sigmoid + silu_mul + weight_gemv + scaled_add |
-| `IndexedGateUp` | `gemv_{hfq4g256,hfq6g256,paro_q4g128}_moe_gate_up_k8_indexed` (dtype-resolved) | per-expert loop |
+| `IndexedGateUp` | `gemv_{hfq4g256,hfq6g256}_moe_gate_up_k8_indexed` (dtype-resolved) | per-expert loop |
 | `SiluMulRotate` | `fused_silu_mul_{rotate_mq,givens_rotate}` (batched) | silu_mul + rotate (2 launches) |
 | `IndexedDownExpanded` | `gemv_*_moe_down_k8_indexed_batched_expanded` | per-expert loop |
 | `MoeCombine{k=8 only}` | `moe_down_combine_k8_batched` (atomic-free, deterministic) | — |
@@ -129,7 +129,7 @@ variant each op runs* before the executor iterates. The couplings, lifted
 verbatim from `moe_ffn_decode_impl` (qwen35.rs:4598-4671):
 
 - `gate_side_mq4` — all four gate-side weights MQ4G256 → `MoeGateSideProj` fused.
-- `routed_dtype_indexable_{mq4,mq6,paro}` — gate_up AND down dtypes must *agree*;
+- `routed_dtype_indexable_{mq4,mq6}` — gate_up AND down dtypes must *agree*;
   `IndexedGateUp` and `IndexedDownExpanded` cannot pick fused independently.
 - `use_gpu_topk = (k == 8) && routed_dtype_indexable` — **`TopKRenorm`'s GPU
   fused path is gated by the routed-expert dtype**, i.e. one op's variant depends
@@ -167,7 +167,7 @@ pub enum PipelineParams<'a> {
   grows to carry the scratch refs the MoE ops consume.
 - **dtype resolution moves per-op for the MoE arm.** `execute_pipeline`'s single
   `dtype` argument is GEMV-centric. MoE ops resolve dtype *per op* from the
-  weights in `MoeParams`, because gate-side (MQ4) and routed (MQ6/Paro) families
+  weights in `MoeParams`, because gate-side (MQ4) and routed (MQ6) families
   can differ within one layer. This is the one non-mechanical executor change.
   (Approved sanity-check (b).)
 
@@ -241,8 +241,8 @@ dispatch-adjacent absorption).
   k=8-hardcoded — finding #2), which is a separate, non-trivial later item.
 - No change to routing math.
 - **Not in Phase 1:** the batched-prefill path
-  (`forward_prefill_batch_with_pbs`) and the PARO prefill echo bug (#1) — kept
-  separate so byte-parity stays tractable. (#1 is a distinct Layer-3 item.)
+  (`forward_prefill_batch_with_pbs`) — kept
+  separate so byte-parity stays tractable.
 
 ## Open risks
 

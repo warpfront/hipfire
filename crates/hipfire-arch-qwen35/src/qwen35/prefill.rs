@@ -811,7 +811,7 @@ fn resident_moe_iu4_d53_pair(d: &hipfire_dispatch::families::moe::MoePrefillDtyp
 /// merge), or the d53 pair when the layer carries the verified loader IU4
 /// capability (`expert_iu4`), shared expert MQ4G256/MQ4G256V2 with a fused
 /// gate/up pair, router and shared scalar gate in the formats the dispatch
-/// admission accepts. Anything else (MQ6, E8, Lloyd/codebook, PARO, mixed
+/// admission accepts. Anything else (MQ6, E8, Lloyd/codebook, mixed
 /// tiers, d53 without the IU4 capability) keeps the incumbent chunk.
 fn resident_moe_producer_dtypes_supported(
     d: &hipfire_dispatch::families::moe::MoePrefillDtypes,
@@ -870,7 +870,7 @@ struct ResidentMoePlacement {
     /// carries a sealed contract (`adapt_expert_execution_plan` always attaches
     /// one), so its mere presence is NOT multi-device.
     multi_device_contract: bool,
-    /// AWQ/PARO sidecars, per-expert dtype tags or an EP global table: routes
+    /// AWQ sidecars, per-expert dtype tags or an EP global table: routes
     /// outside the validated grouped-producer set.
     sidecar_experts: bool,
 }
@@ -906,8 +906,7 @@ fn resident_moe_layer_placement(
         multi_device_contract: resident_moe_contract_multi_device(
             ffn.expert_table.execution_contract(),
         ),
-        sidecar_experts: ffn.paro_shared.is_some()
-            || ffn.expert_down_awq_ptrs.is_some()
+        sidecar_experts: ffn.expert_down_awq_ptrs.is_some()
             || ffn.expert_dtype_tags.is_some()
             || ffn.global_expert_dtypes.is_some(),
     }
@@ -4430,15 +4429,9 @@ pub(crate) fn is_batchable_la(dt: DType, arch: &str) -> bool {
         // (`run_plain_gemm_key` dequantises each weight); lockstep with the
         // `is_lowbit` / `qkv_all_ggml` widenings in hipfire-dispatch.
         | DType::GgmlQ4K | DType::GgmlQ5K | DType::GgmlQ6K | DType::GgmlQ8_0 | DType::GgmlIQ4XS
-        // Phase 1.5 (PARO): wqkv/wz/wo are ParoQ4G128, w_alpha/w_beta are F32
-        // on shisa-Qwen3.6-A3B-PARO. Dispatch in the DeltaNetMoe LA matcher
-        // routes these through gemm_hfq4g128 (with per-weight Givens
-        // rotation pre-pass) and gemm_f32_batched respectively. Eligibility
-        // is gated downstream by the env-keyed moe_ffn_batched_admissible
-        // (HIPFIRE_PARO_BATCHED=1) — admitting them here keeps non-PARO
-        // models unaffected because no production checkpoint sets
-        // wqkv.gpu_dtype = ParoQ4G128 outside the shisa-PARO codepath.
-        | DType::ParoQ4G128 | DType::F32
+        // F32 projections (unquantized w_alpha/w_beta) route through
+        // gemm_f32_batched in the DeltaNetMoe LA matcher.
+        | DType::F32
     );
     if always_ok {
         return true;
@@ -5283,7 +5276,6 @@ fn build_moe_prefill_params<'a>(
             ffn.experts[0].down.gpu_dtype
         },
         routed_has_mixed_experts: per_expert_gate_up.is_some() || per_expert_down.is_some(),
-        has_paro_shared: ffn.paro_shared.is_some(),
         per_expert_gate_up,
         per_expert_down,
     };
@@ -5298,25 +5290,6 @@ fn build_moe_prefill_params<'a>(
         }),
         per_expert_gate_up.is_some() || per_expert_down.is_some(),
     );
-
-    let paro_gate_up =
-        ffn.paro_shared
-            .as_ref()
-            .map(|paro| hipfire_dispatch::families::gemv::GivensRef {
-                pairs: &paro.gate_up_pairs,
-                theta: &paro.gate_up_theta,
-                scales: &paro.gate_up_channel_scales,
-                krot: paro.krot as usize,
-            });
-    let paro_down =
-        ffn.paro_shared
-            .as_ref()
-            .map(|paro| hipfire_dispatch::families::gemv::GivensRef {
-                pairs: &paro.down_pairs,
-                theta: &paro.down_theta,
-                scales: &paro.down_channel_scales,
-                krot: paro.krot as usize,
-            });
 
     let prelude = hipfire_dispatch::families::moe::MoePrefillPrelude {
         normalization: hipfire_dispatch::families::moe::MoeNormalization::RmsNorm {
@@ -5387,8 +5360,6 @@ fn build_moe_prefill_params<'a>(
         inverse_perm: pbs.moe_inverse_perm.as_ref().expect("moe scratch"),
         y_gate_up_grouped: pbs.moe_y_gate_up_grouped.as_ref().expect("moe scratch"),
         y_down_grouped: pbs.moe_y_down_grouped.as_ref().expect("moe scratch"),
-        paro_gate_up,
-        paro_down,
         down_awq_scale: None,
         routed_out,
         ep_row_gather: None,
@@ -8383,8 +8354,8 @@ mod tests {
     use hipfire_dispatch::families::gemm::residual_gemm_key_for;
     use hipfire_dispatch::families::moe::{
         gated_moe_prefill_admissible_for_dtypes as moe_ffn_batched_admissible_for_dtypes,
-        moe_prefill_topk_shape_supported, paro_batched_admit_enabled_from_env,
-        routed_codebook_grouped_supported, routed_uniform_mqv2_grouped_supported, MoePrefillDtypes,
+        moe_prefill_topk_shape_supported, routed_codebook_grouped_supported,
+        routed_uniform_mqv2_grouped_supported, MoePrefillDtypes,
     };
     use rdna_compute::DType;
 
@@ -8598,18 +8569,6 @@ mod tests {
     }
 
     #[test]
-    fn paro_batched_admit_defaults_off_and_allows_opt_in() {
-        // PARO batched prefill is default-OFF (the path has a coherence/echo bug;
-        // per-token fallback is correct) — opt in via HIPFIRE_PARO_BATCHED=1.
-        // `paro_batched_admit_enabled_from_env` is `value == Some("1")`, so only
-        // the exact string "1" enables it; everything else (incl. None) is off.
-        assert!(!paro_batched_admit_enabled_from_env(None));
-        assert!(paro_batched_admit_enabled_from_env(Some("1")));
-        assert!(!paro_batched_admit_enabled_from_env(Some("surprise")));
-        assert!(!paro_batched_admit_enabled_from_env(Some("0")));
-    }
-
-    #[test]
     fn prefill_max_batch_arch_defaults() {
         // Exact gfx1100 / gfx1201 alone get the measured defaults; every other
         // string keeps the conservative PREFILL_MAX_BATCH=256 ceiling.
@@ -8674,7 +8633,7 @@ mod tests {
     // ── Qwen3.5 dispatch: is_batchable_la ────────────────────────
 
     /// The Qwen3.5-specific copy admits more dtypes than the runtime copy
-    /// (ParoQ4G128, F32, Lloyd variants).
+    /// (F32, Lloyd variants).
 
     const BATCHABLE_ARCHS: &[&str] = &[
         "gfx900", "gfx906", "gfx908", "gfx940", "gfx941", "gfx942", "gfx1010", "gfx1011",
@@ -8715,10 +8674,6 @@ mod tests {
             assert!(
                 is_batchable_la(DType::Q8_0, arch),
                 "Q8_0 should batch on {arch}"
-            );
-            assert!(
-                is_batchable_la(DType::ParoQ4G128, arch),
-                "ParoQ4G128 should batch on {arch}"
             );
             assert!(
                 is_batchable_la(DType::F32, arch),
@@ -9192,7 +9147,7 @@ mod tests {
     fn moe_prefill_admits_mq4_as_known_good_control() {
         let dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
         assert!(moe_ffn_batched_admissible_for_dtypes(
-            &dtypes, false, false, false, false
+            &dtypes, false, false, false
         ));
     }
 
@@ -9209,12 +9164,12 @@ mod tests {
         dtypes.expert_down_uniform = false;
         dtypes.expert_down = DType::MQ3G256Lloyd; // representative cold-tier dtype
         assert!(moe_ffn_batched_admissible_for_dtypes(
-            &dtypes, true, false, false, false
+            &dtypes, true, false, false
         ));
         // The same mixed file WITHOUT the merged-kernel tag table is NOT admissible.
         dtypes.routed_mixed_merged = false;
         assert!(!moe_ffn_batched_admissible_for_dtypes(
-            &dtypes, true, false, false, false
+            &dtypes, true, false, false
         ));
     }
 
@@ -9231,7 +9186,6 @@ mod tests {
                 &dtypes,
                 true,
                 false,
-                false,
                 admit_codebook
             ));
 
@@ -9240,7 +9194,6 @@ mod tests {
             assert!(!moe_ffn_batched_admissible_for_dtypes(
                 &dtypes,
                 true,
-                false,
                 false,
                 admit_codebook
             ));
@@ -9255,7 +9208,6 @@ mod tests {
             assert!(!moe_ffn_batched_admissible_for_dtypes(
                 &dtypes,
                 true,
-                false,
                 false,
                 admit_codebook
             ));
@@ -9278,7 +9230,7 @@ mod tests {
                 dtypes.expert_gate_up = gl;
                 dtypes.expert_down = gl;
                 assert!(
-                    !moe_ffn_batched_admissible_for_dtypes(&dtypes, admit_mq6, true, true, true),
+                    !moe_ffn_batched_admissible_for_dtypes(&dtypes, admit_mq6, true, true),
                     "{gl:?} must not be batched-prefill admissible (admit_mq6={admit_mq6})"
                 );
             }
@@ -9294,7 +9246,6 @@ mod tests {
                 &dtypes,
                 true,
                 true,
-                true,
                 admit_codebook
             ));
             // Half-GL pairs must not sneak through the codebook arm either.
@@ -9305,7 +9256,6 @@ mod tests {
                 &dtypes,
                 true,
                 true,
-                true,
                 admit_codebook
             ));
             let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
@@ -9313,7 +9263,6 @@ mod tests {
             dtypes.expert_down = DType::MQ3G256GL;
             assert!(!moe_ffn_batched_admissible_for_dtypes(
                 &dtypes,
-                true,
                 true,
                 true,
                 admit_codebook
@@ -9331,10 +9280,10 @@ mod tests {
         dtypes.expert_gate_up = DType::MQ6G256;
         dtypes.expert_down = DType::MQ6G256;
         assert!(!moe_ffn_batched_admissible_for_dtypes(
-            &dtypes, false, false, false, false
+            &dtypes, false, false, false
         ));
         assert!(moe_ffn_batched_admissible_for_dtypes(
-            &dtypes, true, false, false, false
+            &dtypes, true, false, false
         ));
     }
 
@@ -9345,10 +9294,10 @@ mod tests {
     fn moe_prefill_admits_uniform_mq4v2_without_mq6_gate() {
         let dtypes = MoePrefillDtypes::uniform(DType::MQ4G256V2);
         assert!(moe_ffn_batched_admissible_for_dtypes(
-            &dtypes, false, false, false, false
+            &dtypes, false, false, false
         ));
         assert!(moe_ffn_batched_admissible_for_dtypes(
-            &dtypes, true, false, false, false
+            &dtypes, true, false, false
         ));
         assert!(routed_uniform_mqv2_grouped_supported(DType::MQ4G256V2));
         assert!(!routed_codebook_grouped_supported(DType::MQ4G256V2));
@@ -9367,10 +9316,10 @@ mod tests {
         dtypes.expert_gate_up = DType::MQ6G256V2;
         dtypes.expert_down = DType::MQ6G256V2;
         assert!(!moe_ffn_batched_admissible_for_dtypes(
-            &dtypes, false, false, false, false
+            &dtypes, false, false, false
         ));
         assert!(moe_ffn_batched_admissible_for_dtypes(
-            &dtypes, true, false, false, false
+            &dtypes, true, false, false
         ));
         assert!(routed_uniform_mqv2_grouped_supported(DType::MQ6G256V2));
         assert!(!routed_codebook_grouped_supported(DType::MQ6G256V2));
@@ -9386,10 +9335,10 @@ mod tests {
         dtypes.expert_gate_up = DType::MQ6G256V2;
         dtypes.expert_down = DType::MQ6G256V2;
         assert!(!moe_ffn_batched_admissible_for_dtypes(
-            &dtypes, false, false, false, false
+            &dtypes, false, false, false
         ));
         assert!(moe_ffn_batched_admissible_for_dtypes(
-            &dtypes, true, false, false, false
+            &dtypes, true, false, false
         ));
 
         // MQ6V2 shared, MQ4V2 routed.
@@ -9401,7 +9350,7 @@ mod tests {
         dtypes.expert_gate_up = DType::MQ4G256V2;
         dtypes.expert_down = DType::MQ4G256V2;
         assert!(moe_ffn_batched_admissible_for_dtypes(
-            &dtypes, true, false, false, false
+            &dtypes, true, false, false
         ));
     }
 
@@ -9415,7 +9364,7 @@ mod tests {
         dtypes.expert_down_uniform = false;
         dtypes.expert_down = DType::MQ3G256Lloyd;
         assert!(moe_ffn_batched_admissible_for_dtypes(
-            &dtypes, false, false, false, false
+            &dtypes, false, false, false
         ));
 
         let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
@@ -9427,10 +9376,10 @@ mod tests {
         dtypes.expert_gate_up_uniform = false;
         dtypes.expert_down_uniform = false;
         assert!(!moe_ffn_batched_admissible_for_dtypes(
-            &dtypes, false, false, false, false
+            &dtypes, false, false, false
         ));
         assert!(moe_ffn_batched_admissible_for_dtypes(
-            &dtypes, true, false, false, false
+            &dtypes, true, false, false
         ));
     }
 
@@ -9442,7 +9391,7 @@ mod tests {
             dtypes.expert_gate_up = v2;
             dtypes.expert_down = v2;
             assert!(
-                !moe_ffn_batched_admissible_for_dtypes(&dtypes, true, true, true, true),
+                !moe_ffn_batched_admissible_for_dtypes(&dtypes, true, true, true),
                 "{v2:?} must not be MoE batched-prefill admissible"
             );
             assert!(!routed_uniform_mqv2_grouped_supported(v2));
@@ -9503,13 +9452,13 @@ mod tests {
         let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
         dtypes.expert_gate_up_uniform = false;
         assert!(!moe_ffn_batched_admissible_for_dtypes(
-            &dtypes, true, false, false, false
+            &dtypes, true, false, false
         ));
 
         let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
         dtypes.expert_down_uniform = false;
         assert!(!moe_ffn_batched_admissible_for_dtypes(
-            &dtypes, true, false, false, false
+            &dtypes, true, false, false
         ));
     }
 
@@ -9518,7 +9467,7 @@ mod tests {
         let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
         dtypes.shared_expert_up = DType::MQ6G256;
         assert!(!moe_ffn_batched_admissible_for_dtypes(
-            &dtypes, true, false, false, false
+            &dtypes, true, false, false
         ));
     }
 
@@ -9537,11 +9486,11 @@ mod tests {
             dtypes.shared_expert_gate = gate;
             dtypes.shared_expert_up = up;
             assert!(
-                !moe_ffn_batched_admissible_for_dtypes(&dtypes, false, false, false, false),
+                !moe_ffn_batched_admissible_for_dtypes(&dtypes, false, false, false),
                 "uniform gate={gate:?} up={up:?} must reject without mq6 gate"
             );
             assert!(
-                !moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false, false, false),
+                !moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false, false),
                 "uniform gate={gate:?} up={up:?} must reject with mq6 gate"
             );
             // Graded merged arm (routed_mixed_merged = true).
@@ -9552,11 +9501,11 @@ mod tests {
             dtypes.shared_expert_gate = gate;
             dtypes.shared_expert_up = up;
             assert!(
-                !moe_ffn_batched_admissible_for_dtypes(&dtypes, false, false, false, false),
+                !moe_ffn_batched_admissible_for_dtypes(&dtypes, false, false, false),
                 "graded gate={gate:?} up={up:?} must reject"
             );
             assert!(
-                !moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false, false, false),
+                !moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false, false),
                 "graded gate={gate:?} up={up:?} must reject with mq6"
             );
             // Codebook arm (uniform codebook pair admitted via grouped GEMM).
@@ -9566,17 +9515,17 @@ mod tests {
             dtypes.shared_expert_gate = gate;
             dtypes.shared_expert_up = up;
             assert!(
-                !moe_ffn_batched_admissible_for_dtypes(&dtypes, false, false, false, true),
+                !moe_ffn_batched_admissible_for_dtypes(&dtypes, false, false, true),
                 "codebook gate={gate:?} up={up:?} must reject"
             );
         }
         // Exact V2 support preserved: uniform MQ4V2 gate/up admits.
         let dtypes = MoePrefillDtypes::uniform(DType::MQ4G256V2);
         assert!(moe_ffn_batched_admissible_for_dtypes(
-            &dtypes, false, false, false, false
+            &dtypes, false, false, false
         ));
         assert!(moe_ffn_batched_admissible_for_dtypes(
-            &dtypes, true, false, false, false
+            &dtypes, true, false, false
         ));
     }
 
@@ -9596,7 +9545,7 @@ mod tests {
             dtypes.expert_gate_up = gate;
             dtypes.expert_down = gate;
             assert!(
-                !moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false, false, false),
+                !moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false, false),
                 "mq6 uniform gate={gate:?} up={up:?} must reject"
             );
             // Graded merged arm with MQ6 cross-version shared expert.
@@ -9609,7 +9558,7 @@ mod tests {
             dtypes.expert_gate_up_uniform = false;
             dtypes.expert_down_uniform = false;
             assert!(
-                !moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false, false, false),
+                !moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false, false),
                 "mq6 graded gate={gate:?} up={up:?} must reject"
             );
         }
@@ -9622,20 +9571,7 @@ mod tests {
         dtypes.expert_gate_up = DType::MQ6G256V2;
         dtypes.expert_down = DType::MQ6G256V2;
         assert!(moe_ffn_batched_admissible_for_dtypes(
-            &dtypes, true, false, false, false
-        ));
-    }
-
-    #[test]
-    fn moe_prefill_admits_paro_when_enabled() {
-        let mut dtypes = MoePrefillDtypes::uniform(DType::ParoQ4G128);
-        dtypes.router = DType::F32;
-        dtypes.shared_expert_scalar_gate = DType::F32;
-        assert!(!moe_ffn_batched_admissible_for_dtypes(
-            &dtypes, true, false, false, false
-        ));
-        assert!(moe_ffn_batched_admissible_for_dtypes(
-            &dtypes, true, true, false, false
+            &dtypes, true, false, false
         ));
     }
 
@@ -9647,11 +9583,11 @@ mod tests {
         dtypes.expert_down = DType::MFP4G32E8;
         // Without the arch gate (non-gfx1151), E8 is rejected.
         assert!(!moe_ffn_batched_admissible_for_dtypes(
-            &dtypes, false, false, false, false
+            &dtypes, false, false, false
         ));
         // With the gfx1151 arch gate, the Q8-shared + E8-routed layer admits.
         assert!(moe_ffn_batched_admissible_for_dtypes(
-            &dtypes, false, false, true, false
+            &dtypes, false, true, false
         ));
     }
 
@@ -9665,15 +9601,15 @@ mod tests {
         dtypes.expert_gate_up = DType::MQ2G256Lloyd;
         dtypes.expert_down = DType::MQ3G256Lloyd;
         assert!(!moe_ffn_batched_admissible_for_dtypes(
-            &dtypes, true, false, false, false
+            &dtypes, true, false, false
         ));
         assert!(moe_ffn_batched_admissible_for_dtypes(
-            &dtypes, true, false, false, true
+            &dtypes, true, false, true
         ));
         // Also with the MQ6 admit off — the codebook arm does not depend on it
         // when the shared expert is plain MQ4.
         assert!(moe_ffn_batched_admissible_for_dtypes(
-            &dtypes, false, false, false, true
+            &dtypes, false, false, true
         ));
     }
 
@@ -9704,7 +9640,7 @@ mod tests {
             let mut dtypes = MoePrefillDtypes::uniform(MQ4G256);
             dtypes.expert_gate_up = gu;
             dtypes.expert_down = dn;
-            let got = moe_ffn_batched_admissible_for_dtypes(&dtypes, false, false, false, true);
+            let got = moe_ffn_batched_admissible_for_dtypes(&dtypes, false, false, true);
             assert_eq!(got, want, "gate_up={gu:?} down={dn:?}");
         }
     }
@@ -9721,7 +9657,7 @@ mod tests {
             dtypes.expert_gate_up_uniform = gu_uniform;
             dtypes.expert_down_uniform = dn_uniform;
             assert!(!moe_ffn_batched_admissible_for_dtypes(
-                &dtypes, true, false, false, true
+                &dtypes, true, false, true
             ));
         }
     }
@@ -9750,13 +9686,8 @@ mod tests {
                 let mut dtypes = MoePrefillDtypes::uniform(MQ4G256);
                 dtypes.expert_gate_up = gu;
                 dtypes.expert_down = dn;
-                let admitted = moe_ffn_batched_admissible_for_dtypes(
-                    &dtypes,
-                    true,
-                    false,
-                    false,
-                    admit_codebook,
-                );
+                let admitted =
+                    moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false, admit_codebook);
                 let refused = unsupported_mq3_experts_uniform_from_dtypes(
                     false,
                     [(gu, dn); 4],

@@ -187,7 +187,7 @@ optimised (1.77× decode, 4.1× prefill).
 - 34 B / 128 = 2.125 bpw ⇒ **5.20 GB** for the ternary part. Slightly smaller
   than B.
 - **But TQ2G128 has no MoE kernels.** Zero hits in `tables/moe_table.rs` and
-  `families/moe.rs`, and `MIXED_SUPPORTED_TIERS = [MQ4G256, MQ6G256, ParoQ4G128]`.
+  `families/moe.rs`, and `MIXED_SUPPORTED_TIERS = [MQ4G256, MQ6G256]`.
   #597's ternary kernels are dense-only. Arm A must add indexed gate_up, indexed
   down, k8-batched variants and a grouped GEMM — mechanical (templates exist for
   six other dtypes) but not small.

@@ -635,7 +635,6 @@ fn swiglu_down_residual(
     gpu.maybe_capture_activation(w_down.buf, hidden, 1, w_down.k);
     let wr = WeightRef {
         row_stride: 0,
-        rotation: None,
         awq_scale: None,
         ..*w_down
     };
@@ -741,7 +740,7 @@ fn swiglu_down_residual(
             // weighting must not depend on which decode path ran.
             gpu.maybe_capture_activation(w_down.buf, hidden, 1, w_down.k);
             gpu.maybe_capture_activation(w_down.buf, hidden, 1, w_down.k);
-            // Rotated formats (MQ8, G128, Givens, FP4, ...) keep their rotation
+            // Rotated formats (MQ8, G128, FP4, ...) keep their rotation
             // and AWQ sidecar so `run_auto` rotates the input first; it also
             // prepares that rotation's own sign tables and scratch.
             let w = if dtype_needs_rotation(dtype) { w_down } else { &wr };
@@ -772,7 +771,6 @@ mod tests {
             m,
             k,
             row_stride: k,
-            rotation: None,
             awq_scale: None,
             lloyd_lut_e4m3: None,
             lloyd_lut_f16: None,

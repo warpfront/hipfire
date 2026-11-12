@@ -30,7 +30,7 @@
 // WMMA fused kernels only on WMMA archs with the prefill WMMA switch on,
 // otherwise the reference's plain-GEMM fork (`plan_q8_fused_or_plain`).
 // DeltaNet state stays `StateQuant::Q8` regardless. Out of scope: Lloyd-V2,
-// PARO, E8/MFP4 and G128-rotated containers (named `HipError` refusals).
+// E8/MFP4 and G128-rotated containers (named `HipError` refusals).
 // This matches the ABI the multi-slot
 // infrastructure was actually built against — `SlotPool`'s per-slot
 // descriptor addressing (`KvSlotDesc`, with separate legacy K/V bases for
@@ -68,7 +68,7 @@
 // are admitted per SITE via `plan_proj_group` / `slots_check_residual_weight`:
 // any mix of `slots_proj_admissible` containers within a fused group falls
 // back to per-weight plain GEMMs (AWQ sidecars refuse mixed groups), and
-// PARO/Lloyd-V2/E8/G128-rotated containers stay out of scope — every refusal
+// Lloyd-V2/E8/G128-rotated containers stay out of scope — every refusal
 // returns a clear `HipError` rather than guessing at an untested path.
 // Legacy v1 MQ6G256 (qt=15) MoE attention rides the uniform-group path: AWQ
 // A3B checkpoints (`ornith-1.5:35b-a3b`, `qwen3.6-35b-a3b.mq4-awq-mi300x`)

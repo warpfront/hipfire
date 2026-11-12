@@ -758,12 +758,12 @@ amdhsa.target:   amdgcn-amd-amdhsa--gfx1100
         row = {
             "arch": "gfx1100",
             "hostname": "k9lin",
-            "workload": "qwen3.5-0.8b-paro4-native",
-            "quant": "paro4",
+            "workload": "qwen3.5-0.8b-mq4-native",
+            "quant": "mq4",
             "phase": "decode_ar",
             "shape_bucket": "decode_ar_pp32_gen16",
             "metrics": {"gen_tok_s": 72.5},
-            "command": ["bench_qwen35_mq4", "/models/paro4.hfq"],
+            "command": ["bench_qwen35_mq4", "/models/mq4.hfq"],
             "variant": {"env": {"HIPFIRE_PROFILE_DECODE": "1", "HIPFIRE_GRAPH": "0"}},
             "artifacts": {
                 "profile_kernels": kernel_atlas.annotate_profile_kernels(
@@ -1061,8 +1061,8 @@ amdhsa.target:   amdgcn-amd-amdhsa--gfx1100
         row = {
             "arch": "gfx1100",
             "hostname": "k9lin",
-            "workload": "qwen3.5-0.8b-paro4-native",
-            "quant": "paro4",
+            "workload": "qwen3.5-0.8b-mq4-native",
+            "quant": "mq4",
             "phase": "decode_ar",
             "shape_bucket": "decode_ar_pp32_gen16",
             "command": ["python3", "-c", code],
@@ -1358,8 +1358,8 @@ amdhsa.target:   amdgcn-amd-amdhsa--gfx1100
             row = {
                 "arch": "gfx1100",
                 "hostname": "k9lin",
-                "workload": "qwen3.5-0.8b-paro4-native",
-                "quant": "paro4",
+                "workload": "qwen3.5-0.8b-mq4-native",
+                "quant": "mq4",
                 "phase": "decode_ar",
                 "shape_bucket": "decode_ar_pp32_gen16",
                 "metrics": {"gen_tok_s": 72.5},
@@ -1374,7 +1374,7 @@ amdhsa.target:   amdgcn-amd-amdhsa--gfx1100
             isa = {
                 "objects": [
                     {
-                        "kernels": [{"name": "gemv_paro4g128"}],
+                        "kernels": [{"name": "gemv_hfq4g256"}],
                         "instruction_summary": {"instruction_count": 10, "category_counts": {"valu": 10}},
                     }
                 ]

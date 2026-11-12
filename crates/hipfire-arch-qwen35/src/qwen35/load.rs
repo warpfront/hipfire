@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Qwen3.5 weight loading: HFQ / ParoQuant sources, AWQ repack, packed-MQ4
+//! Qwen3.5 weight loading: HFQ sources, AWQ repack, packed-MQ4
 //! experts, `load_weights`, and the EP sharded loader.
 
 use super::config::f16_lm_head_mode_from_config;
@@ -20,7 +20,6 @@ use super::weights::FullAttnLayerWeights;
 use super::weights::LayerWeights;
 use super::weights::MoeExpertSourceRecord;
 use super::weights::MoeFfnWeights;
-use super::weights::MoeParoSidecars;
 use super::weights::MoeProjectionSource;
 use super::weights::PackedExpertOwners;
 use super::weights::Qt53Fact;
@@ -43,20 +42,16 @@ use hipfire_runtime::hfq_parallel::read_hfq_jobs_ordered;
 use hipfire_runtime::hfq_parallel::HfqReadJob;
 use hipfire_runtime::llama::f16_to_f32;
 use hipfire_runtime::llama::EmbeddingFormat;
-use hipfire_runtime::llama::ParoRotation;
 use hipfire_runtime::llama::WeightTensor;
 use hipfire_runtime::model_load::load_weights as rt_load_weights;
 use hipfire_runtime::model_load::load_weights_with_fault as rt_load_weights_with_fault;
 use hipfire_runtime::model_load::LoadedWeights;
 pub use hipfire_runtime::model_load::StagedLoadFault;
 use hipfire_runtime::model_load::WeightSource;
-use hipfire_runtime::model_source::ModelSource;
 use hipfire_runtime::offload::expert_memory_target;
 use hipfire_runtime::offload::memory_target;
 use hipfire_runtime::offload::LayerBytes;
 use hipfire_runtime::offload::LayerResidency;
-use hipfire_runtime::paro::paro_load_norm;
-use hipfire_runtime::paro::paro_text_prefix;
 use hipfire_runtime::tp_shard::ExpertAssign;
 use hipfire_runtime::tp_shard::ShardConfig;
 use hipfire_runtime::weight_backend::dequant_norm;
@@ -64,10 +59,8 @@ use hipfire_runtime::weight_backend::dequant_weight_raw;
 use hipfire_runtime::weight_backend::load_awq_scale_for;
 use hipfire_runtime::weight_backend::load_embedding;
 use hipfire_runtime::weight_backend::resolve_lm_head;
-use hipfire_runtime::weight_backend::reupload_f16_as_f32;
 use hipfire_runtime::weight_backend::HfqBackend;
 use hipfire_runtime::weight_backend::MemoryTarget;
-use hipfire_runtime::weight_backend::ParoBackend;
 use hipfire_runtime::weight_manifest::WeightResidency;
 use rdna_compute::DType;
 use rdna_compute::Gpu;
@@ -260,7 +253,6 @@ fn load_weight_tensor_raw_with(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -281,7 +273,6 @@ fn load_weight_tensor_raw_with(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -296,7 +287,6 @@ fn load_weight_tensor_raw_with(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -311,7 +301,6 @@ fn load_weight_tensor_raw_with(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -326,7 +315,6 @@ fn load_weight_tensor_raw_with(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -342,7 +330,6 @@ fn load_weight_tensor_raw_with(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -358,7 +345,6 @@ fn load_weight_tensor_raw_with(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -374,7 +360,6 @@ fn load_weight_tensor_raw_with(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -390,7 +375,6 @@ fn load_weight_tensor_raw_with(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -406,7 +390,6 @@ fn load_weight_tensor_raw_with(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -422,7 +405,6 @@ fn load_weight_tensor_raw_with(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -438,7 +420,6 @@ fn load_weight_tensor_raw_with(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -455,7 +436,6 @@ fn load_weight_tensor_raw_with(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -474,7 +454,6 @@ fn load_weight_tensor_raw_with(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -497,7 +476,6 @@ fn load_weight_tensor_raw_with(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -518,7 +496,6 @@ fn load_weight_tensor_raw_with(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -538,7 +515,6 @@ fn load_weight_tensor_raw_with(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -559,7 +535,6 @@ fn load_weight_tensor_raw_with(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -580,7 +555,6 @@ fn load_weight_tensor_raw_with(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -601,7 +575,6 @@ fn load_weight_tensor_raw_with(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -622,7 +595,6 @@ fn load_weight_tensor_raw_with(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -656,7 +628,6 @@ fn load_weight_tensor_raw_with(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -678,7 +649,6 @@ fn load_weight_tensor_raw_with(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -702,7 +672,6 @@ fn load_weight_tensor_raw_with(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -744,7 +713,6 @@ fn load_weight_tensor_raw_with(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -781,7 +749,6 @@ fn load_weight_tensor_raw_with(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -816,7 +783,6 @@ fn load_weight_tensor_raw_with(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -851,7 +817,6 @@ fn load_weight_tensor_raw_with(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -886,7 +851,6 @@ fn load_weight_tensor_raw_with(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -917,7 +881,6 @@ fn load_weight_tensor_raw_with(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -939,7 +902,6 @@ fn load_weight_tensor_raw_with(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -954,7 +916,6 @@ fn load_weight_tensor_raw_with(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -969,7 +930,6 @@ fn load_weight_tensor_raw_with(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -984,7 +944,6 @@ fn load_weight_tensor_raw_with(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -1008,7 +967,6 @@ fn load_weight_tensor_raw_with(
                     m,
                     k,
                     row_stride: 0,
-                    paro: None,
                     awq_scale: None,
                     lloyd_lut_e4m3: None,
                     lloyd_lut_f16: None,
@@ -1028,7 +986,6 @@ fn load_weight_tensor_raw_with(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -1046,7 +1003,6 @@ fn load_weight_tensor_raw_with(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -1066,7 +1022,6 @@ fn load_weight_tensor_raw_with(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -1368,352 +1323,6 @@ fn load_weight_tensor_keep(
             .or_else(|| load_awq_scale_for(hfq, gpu, name, k));
     }
     Ok(wt)
-}
-
-// ─── ParoQuant AWQ → HFQ4G128 repack ────────────────────────────────────────
-
-/// Repack AWQ-format INT4 weights into HFQ4G128 inline layout.
-///
-/// AWQ layout (3 separate tensors):
-///   qweight: I32 [in_dim, out_dim/8] — 8 nibbles per I32
-///   qzeros:  I32 [in_dim/group_size, out_dim/8] — 8 zero-point nibbles per I32
-///   scales:  F16 [in_dim/group_size, out_dim] — per-group scales
-///
-/// HFQ4G128 layout (per output row, one contiguous buffer):
-///   For each group of 128 input elements:
-///     [f32 scale (4B)][f32 zero (4B)][64B packed nibbles] = 72 bytes
-///
-/// Returns: Vec<u8> in HFQ4G128 format, ready for gpu.upload_raw.
-///
-/// SYNC: must match `repack_awq_to_hfq4g128` in
-/// `crates/hipfire-runtime/src/hfq.rs`. Duplicated to avoid a cross-crate
-/// dependency cycle (hipfire-arch-qwen35 -> hipfire-runtime); keep the two
-/// bodies byte-identical when editing.
-fn repack_awq_to_hfq4g128(
-    qweight: &[u8],    // I32 raw bytes
-    qzeros: &[u8],     // I32 raw bytes
-    scales: &[u8],     // F16 raw bytes
-    out_dim: usize,    // M (output features)
-    in_dim: usize,     // K (input features)
-    group_size: usize, // 128
-) -> Vec<u8> {
-    let groups_per_row = in_dim / group_size;
-    let bytes_per_row = groups_per_row * 72;
-    let mut out = vec![0u8; out_dim * bytes_per_row];
-
-    // Parse qweight as &[u32] (LE)
-    debug_assert_eq!(
-        qweight.as_ptr() as usize % 4,
-        0,
-        "AWQ qweight not 4-byte aligned"
-    );
-    let qw: &[u32] =
-        unsafe { std::slice::from_raw_parts(qweight.as_ptr() as *const u32, qweight.len() / 4) };
-    // qweight shape: [in_dim, out_dim/8] → row-major
-    let qw_cols = out_dim / 8;
-
-    // Parse qzeros as &[u32]
-    debug_assert_eq!(
-        qzeros.as_ptr() as usize % 4,
-        0,
-        "AWQ qzeros not 4-byte aligned"
-    );
-    let qz: &[u32] =
-        unsafe { std::slice::from_raw_parts(qzeros.as_ptr() as *const u32, qzeros.len() / 4) };
-    // qzeros shape: [in_dim/group_size, out_dim/8]
-    let qz_cols = out_dim / 8;
-
-    // Parse scales as &[u16] (F16)
-    debug_assert_eq!(
-        scales.as_ptr() as usize % 2,
-        0,
-        "AWQ scales not 2-byte aligned"
-    );
-    let sc: &[u16] =
-        unsafe { std::slice::from_raw_parts(scales.as_ptr() as *const u16, scales.len() / 2) };
-    // scales shape: [in_dim/group_size, out_dim]
-
-    // AWQ nibble reorder: ParoQuant packs with _AWQ_REORDER=(0,2,4,6,1,3,5,7).
-    // To extract element m, use the inverse permutation:
-    const AWQ_DEQUANT: [usize; 8] = [0, 4, 1, 5, 2, 6, 3, 7];
-
-    for m in 0..out_dim {
-        for g in 0..groups_per_row {
-            let row_off = m * bytes_per_row + g * 72;
-
-            let scale_f16 = sc[g * out_dim + m];
-            let scale_f32 = f16_to_f32(scale_f16);
-
-            let zero_i32 = qz[g * qz_cols + m / 8];
-            let zero_nibble = ((zero_i32 >> (AWQ_DEQUANT[m % 8] * 4)) & 0xF) as f32;
-            let zero_f32 = -scale_f32 * zero_nibble;
-
-            out[row_off..row_off + 4].copy_from_slice(&scale_f32.to_le_bytes());
-            out[row_off + 4..row_off + 8].copy_from_slice(&zero_f32.to_le_bytes());
-
-            let nibble_shift = AWQ_DEQUANT[m % 8] * 4;
-            let qw_col = m / 8;
-            for i in 0..64 {
-                let in_idx0 = g * group_size + i * 2;
-                let in_idx1 = in_idx0 + 1;
-
-                let nib0 = ((qw[in_idx0 * qw_cols + qw_col] >> nibble_shift) & 0xF) as u8;
-                let nib1 = ((qw[in_idx1 * qw_cols + qw_col] >> nibble_shift) & 0xF) as u8;
-
-                // HFQ4G128: lo nibble = even element, hi nibble = odd element
-                out[row_off + 8 + i] = nib0 | (nib1 << 4);
-            }
-        }
-    }
-
-    out
-}
-
-/// Load a ParoQuant-quantized weight from a SafetensorsSource.
-/// Repacks AWQ INT4 → HFQ4G128 and uploads rotation metadata.
-pub(crate) fn load_paroquant_weight(
-    source: &dyn ModelSource,
-    gpu: &Gpu,
-    tensor_prefix: &str, // e.g. "model.language_model.layers.0.mlp.gate_proj"
-    out_dim: usize,      // M
-    in_dim: usize,       // K
-    group_size: u32,
-    krot: u8,
-) -> HipResult<WeightTensor> {
-    let qw_name = format!("{tensor_prefix}.qweight");
-    let qz_name = format!("{tensor_prefix}.qzeros");
-    let sc_name = format!("{tensor_prefix}.scales");
-    let pairs_name = format!("{tensor_prefix}.pairs");
-    let theta_name = format!("{tensor_prefix}.theta");
-    let cs_name = format!("{tensor_prefix}.channel_scales");
-
-    let (_, qw_data) = source
-        .tensor_data(&qw_name)
-        .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {qw_name}")))?;
-    let (_, qz_data) = source
-        .tensor_data(&qz_name)
-        .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {qz_name}")))?;
-    let (_, sc_data) = source
-        .tensor_data(&sc_name)
-        .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {sc_name}")))?;
-
-    // Repack AWQ → HFQ4G128
-    let hfq_data = repack_awq_to_hfq4g128(
-        qw_data,
-        qz_data,
-        sc_data,
-        out_dim,
-        in_dim,
-        group_size as usize,
-    );
-    let buf = gpu.upload_raw(&hfq_data, &[hfq_data.len()])?;
-
-    // Load rotation metadata
-    let (_, pairs_data) = source
-        .tensor_data(&pairs_name)
-        .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {pairs_name}")))?;
-    let (_, theta_data) = source
-        .tensor_data(&theta_name)
-        .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {theta_name}")))?;
-    let (_, cs_data) = source
-        .tensor_data(&cs_name)
-        .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {cs_name}")))?;
-
-    let pairs = gpu.upload_raw(pairs_data, &[pairs_data.len()])?;
-    let theta = gpu.upload_raw(theta_data, &[theta_data.len()])?;
-    let channel_scales = gpu.upload_raw(cs_data, &[cs_data.len()])?;
-
-    Ok(WeightTensor {
-        buf,
-        gpu_dtype: DType::ParoQ4G128,
-        m: out_dim,
-        k: in_dim,
-        row_stride: 0,
-        paro: Some(ParoRotation {
-            pairs,
-            theta,
-            channel_scales,
-            krot: krot as u32,
-            group_size,
-            is_alias: false,
-        }),
-        awq_scale: None,
-        lloyd_lut_e4m3: None,
-        lloyd_lut_f16: None,
-        lloyd_lut_c16: None,
-    })
-}
-
-/// Load an FP16 weight and encode it into MQ4G128 byte layout at load time.
-/// Used by `paro_load_wt` for LinearAttention `in_proj_a` / `in_proj_b` weights
-/// (alpha/beta) when the PARO checkpoint doesn't include them in the calibrated
-/// set AND the per-arch/env gating chose the MQ4G128 path.
-///
-/// At decode time, the weight routes through `gemv_mq4g128_prerotated` which
-/// applies FWHT-128 to the activation (via `rotate_x_mq_128_for`) before the
-/// inner GEMV. Encoder applies FWHT-128 to weight with the same sign tables,
-/// so the two FWHTs orthogonally cancel.
-
-/// Load an FP16 weight tensor from safetensors (for excluded/unquantized layers).
-fn load_fp16_weight_from_source(
-    source: &dyn ModelSource,
-    gpu: &Gpu,
-    name: &str,
-    m: usize,
-    k: usize,
-) -> HipResult<WeightTensor> {
-    let (_, data) = source
-        .tensor_data(name)
-        .ok_or_else(|| HipError::new(0, &format!("PARO tensor not found: {name}")))?;
-    let f32_data: Vec<f32> = data
-        .chunks_exact(2)
-        .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-        .collect();
-    let bytes: &[u8] =
-        unsafe { std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4) };
-    let buf = gpu.upload_raw(bytes, &[m, k])?;
-    Ok(WeightTensor {
-        buf,
-        gpu_dtype: DType::F32,
-        m,
-        k,
-        row_stride: 0,
-        paro: None,
-        awq_scale: None,
-        lloyd_lut_e4m3: None,
-        lloyd_lut_f16: None,
-        lloyd_lut_c16: None,
-    })
-}
-
-// ─── ParoQuant MoE expert loading (Option A — per-expert qweight, shared sidecars) ──
-
-/// Repack a single per-expert AWQ projection (gate, up, or down) into HFQ4G128
-/// byte rows. Returns the row-major byte buffer (size `out_dim * groups_per_row * 72`).
-///
-/// Caller is responsible for uploading the buffer to GPU (or concatenating with
-/// another projection's rows before upload — gate||up fusion path).
-fn paro_repack_moe_projection(
-    source: &dyn ModelSource,
-    full_prefix: &str, // e.g. "model.language_model.layers.0.mlp.experts.5.gate_proj"
-    out_dim: usize,
-    in_dim: usize,
-    group_size: usize,
-) -> HipResult<Vec<u8>> {
-    let qw_name = format!("{full_prefix}.qweight");
-    let qz_name = format!("{full_prefix}.qzeros");
-    let sc_name = format!("{full_prefix}.scales");
-    let (_, qw_data) = source
-        .tensor_data(&qw_name)
-        .ok_or_else(|| HipError::new(0, &format!("ParoQuant MoE tensor not found: {qw_name}")))?;
-    let (_, qz_data) = source
-        .tensor_data(&qz_name)
-        .ok_or_else(|| HipError::new(0, &format!("ParoQuant MoE tensor not found: {qz_name}")))?;
-    let (_, sc_data) = source
-        .tensor_data(&sc_name)
-        .ok_or_else(|| HipError::new(0, &format!("ParoQuant MoE tensor not found: {sc_name}")))?;
-    Ok(repack_awq_to_hfq4g128(
-        qw_data, qz_data, sc_data, out_dim, in_dim, group_size,
-    ))
-}
-
-/// Upload the per-layer shared PARO rotation sidecars (one tuple for gate||up,
-/// one for down). All 256 experts will reference these via non-owning
-/// `ParoRotation` aliases.
-///
-/// Shisa-ai's PARO checkpoint stores these at:
-///   `model.language_model.layers.{L}.mlp.experts.{gate_up,down}_weight_{pairs,theta,channel_scales}`
-fn paro_load_moe_shared_sidecars(
-    source: &dyn ModelSource,
-    gpu: &Gpu,
-    p: &str, // e.g. "layers.0"
-) -> HipResult<MoeParoSidecars> {
-    let mp = paro_text_prefix(source)?;
-    let base = format!("{mp}.{p}.mlp.experts");
-    let load = |name: &str| -> HipResult<GpuTensor> {
-        let full = format!("{base}.{name}");
-        let (_, data) = source.tensor_data(&full).ok_or_else(|| {
-            HipError::new(
-                0,
-                &format!("ParoQuant MoE shared sidecar not found: {full}"),
-            )
-        })?;
-        gpu.upload_raw(data, &[data.len()])
-    };
-    let qc = source
-        .quant_config()
-        .ok_or_else(|| HipError::new(0, "ParoQuant: quant_config required"))?;
-    let gate_up_sidecar_names = Vec::from([
-        format!("{base}.gate_up_weight_pairs"),
-        format!("{base}.gate_up_weight_theta"),
-        format!("{base}.gate_up_weight_channel_scales"),
-    ])
-    .into_boxed_slice();
-    let down_sidecar_names = Vec::from([
-        format!("{base}.down_weight_pairs"),
-        format!("{base}.down_weight_theta"),
-        format!("{base}.down_weight_channel_scales"),
-    ])
-    .into_boxed_slice();
-    Ok(MoeParoSidecars {
-        gate_up_pairs: load("gate_up_weight_pairs")?,
-        gate_up_theta: load("gate_up_weight_theta")?,
-        gate_up_channel_scales: load("gate_up_channel_scales")?,
-        down_pairs: load("down_weight_pairs")?,
-        down_theta: load("down_weight_theta")?,
-        down_channel_scales: load("down_channel_scales")?,
-        krot: qc.krot as u32,
-        group_size: qc.group_size,
-        gate_up_sidecar_names,
-        down_sidecar_names,
-        source_fingerprint: super::weights::model_source_fingerprint(source),
-    })
-}
-
-/// Build a non-owning `ParoRotation` whose tensor fields alias `src`'s
-/// underlying GPU memory. The returned rotation must NOT outlive `src`;
-/// callers store the owning `MoeParoSidecars` in `MoeFfnWeights.paro_shared`
-/// to guarantee that.
-fn alias_paro_rotation(
-    pairs_src: &GpuTensor,
-    theta_src: &GpuTensor,
-    cs_src: &GpuTensor,
-    krot: u32,
-    group_size: u32,
-) -> ParoRotation {
-    let alias = |t: &GpuTensor| -> GpuTensor {
-        GpuTensor {
-            buf: unsafe { t.buf.alias() },
-            shape: t.shape.clone(),
-            dtype: t.dtype,
-        }
-    };
-    ParoRotation {
-        pairs: alias(pairs_src),
-        theta: alias(theta_src),
-        channel_scales: alias(cs_src),
-        krot,
-        group_size,
-        is_alias: true,
-    }
-}
-
-/// Load the full ParoQuant MoE FFN block for one layer:
-///   - dense FP16 router (`mlp.gate.weight [n_exp, hidden]`)
-///   - dense FP16 shared-expert scalar gate (`mlp.shared_expert_gate.weight [1, hidden]`)
-///   - shared expert (three per-projection PARO tensors: gate, up, down)
-///   - 256 routed experts, each with a fused gate||up HFQ4G128 buffer + a down
-///     HFQ4G128 buffer, all referencing layer-shared PARO sidecars
-fn paro_load_moe_ffn(
-    source: &dyn ModelSource,
-    gpu: &mut Gpu,
-    p: &str,
-    config: &Qwen35Config,
-    layer_idx: u16,
-) -> HipResult<MoeFfnWeights> {
-    // Keep one production Paro adapter.  This legacy private entry point is
-    // retained only for source compatibility with old local callers.
-    crate::paro_moe::paro_load_moe_ffn(source, gpu, p, config, layer_idx)
 }
 
 // ─── Standard HFQ loading ───────────────────────────────────────────────────
@@ -2810,7 +2419,7 @@ pub fn report_cpu_exec_coverage(
                 // Resolve through the *loader's own* map, not the passthrough table:
                 // `hfq_weight_dtype` is RAW_CODECS, which omits the `arch-loaded`
                 // formats (qt 31 per `docs/quant-formats/qt-register.txt`, the MFP4
-                // family, PARO), and a tensor skipped here would be reported as
+                // family), and a tensor skipped here would be reported as
                 // covered while nothing decodes it. F16/F32/BF16 do resolve, and are
                 // covered because the loader host-decodes them to f32 at load time.
                 let Ok(dtype) = dtype_from_quant_type(t.quant_type) else {
@@ -3298,141 +2907,6 @@ impl WeightSource for HfqSource<'_> {
     }
 }
 
-// ── ParoSource ────────────────────────────────────────────────────────────
-
-pub struct ParoSource<'a> {
-    source: &'a dyn ModelSource,
-    mp: &'static str,
-    c: &'a Qwen35Config,
-}
-impl<'a> ParoSource<'a> {
-    pub fn new(source: &'a dyn ModelSource, c: &'a Qwen35Config) -> HipResult<Self> {
-        let qc = source
-            .quant_config()
-            .ok_or_else(|| HipError::new(0, "ParoQuant model must have quantization_config"))?;
-        // qwen3.5 Paro decode/prefill bind only the G128 kernels; the shared
-        // loader would hand a G64 checkpoint ParoQ4G64 weights they never admit.
-        if qc.group_size != 128 {
-            return Err(HipError::new(
-                0,
-                &format!(
-                    "qwen3.5 ParoQuant supports group_size 128 only, got {}",
-                    qc.group_size
-                ),
-            ));
-        }
-        let mp = paro_text_prefix(source)?;
-        Ok(Self { source, mp, c })
-    }
-    fn read_f16_as_f32(&self, name: &str) -> HipResult<Vec<f32>> {
-        let (_, data) = self
-            .source
-            .tensor_data(name)
-            .ok_or_else(|| HipError::new(0, &format!("PARO tensor not found: {name}")))?;
-        Ok(hipfire_runtime::weight_backend::f16_bytes_to_f32(&data))
-    }
-}
-impl WeightSource for ParoSource<'_> {
-    type Layer = LayerWeights;
-
-    fn n_layers(&self) -> usize {
-        self.c.n_layers
-    }
-
-    fn prepare(&mut self, n_devices: usize) -> HipResult<()> {
-        if n_devices > 1 {
-            return Err(HipError::new(
-                0,
-                "ParoQuant multi-GPU loading is not supported (HFQ-only)",
-            ));
-        }
-        Ok(())
-    }
-
-    fn read_embed(&mut self, gpu: &mut Gpu) -> HipResult<(GpuTensor, EmbeddingFormat)> {
-        eprintln!("  loading token_embd (ParoQuant)...");
-        let f32_embd = self.read_f16_as_f32(&format!("{}.embed_tokens.weight", self.mp))?;
-        let token_embd = gpu.upload_f32(&f32_embd, &[self.c.vocab_size, self.c.dim])?;
-        Ok((token_embd, EmbeddingFormat::F32))
-    }
-
-    fn read_final_norm(&mut self, gpu: &mut Gpu) -> HipResult<GpuTensor> {
-        eprintln!("  loading output_norm...");
-        paro_load_norm(
-            self.source,
-            gpu,
-            "norm.weight",
-            &[self.c.dim],
-            QWEN35_NORM_BIAS,
-        )
-    }
-
-    fn read_output(
-        &mut self,
-        gpu: &mut Gpu,
-        embd: &GpuTensor,
-        embd_fmt: EmbeddingFormat,
-        can_alias: bool,
-    ) -> HipResult<(WeightTensor, bool)> {
-        let mp = self.mp;
-        let c = self.c;
-        let source = self.source;
-        let has_separate = source.tensor_data("lm_head.weight").is_some();
-        resolve_lm_head(
-            gpu,
-            has_separate,
-            can_alias,
-            embd,
-            embd_fmt,
-            c.vocab_size,
-            c.dim,
-            |gpu| {
-                let (_, f16) = source
-                    .tensor_data("lm_head.weight")
-                    .ok_or_else(|| HipError::new(0, "PARO tensor not found: lm_head.weight"))?;
-                reupload_f16_as_f32(gpu, &f16, c.vocab_size, c.dim)
-            },
-            |gpu| {
-                let embd_name = format!("{mp}.embed_tokens.weight");
-                let (_, f16) = source.tensor_data(&embd_name).ok_or_else(|| {
-                    HipError::new(0, &format!("PARO tensor not found: {embd_name}"))
-                })?;
-                reupload_f16_as_f32(gpu, &f16, c.vocab_size, c.dim)
-            },
-        )
-    }
-
-    fn read_layer(
-        &mut self,
-        gpu: &mut Gpu,
-        layer_idx: usize,
-        _residency: LayerResidency,
-    ) -> HipResult<LayerWeights> {
-        // ParoQuant loads through `ParoBackend`, which has no host-upload path:
-        // it never honours a spill, and the loader refuses a configured spill on
-        // this source before it reaches here.
-        let c = self.c;
-        eprintln!(
-            "  loading layer {layer_idx}/{} ({:?}, ParoQuant)...",
-            c.n_layers, c.layer_types[layer_idx]
-        );
-        let mut b = qwen35_paro_backend(self.source, gpu, self.mp, layer_idx);
-        let moe = |bk: &mut ParoBackend, cfg: &Qwen35Config, li: usize| {
-            crate::paro_moe::paro_load_moe_ffn(
-                bk.source,
-                bk.gpu,
-                &format!("layers.{li}"),
-                cfg,
-                li as u16,
-            )
-        };
-        crate::layer_driver::load_layer(&mut b, c, layer_idx, moe)
-    }
-    fn free_layer(&mut self, gpu: &mut Gpu, layer: Self::Layer) {
-        layer.free_gpu(gpu);
-    }
-}
-
 /// Construct an `HfqBackend` with qwen35's defaults baked in: `QWEN35_NORM_BIAS`,
 /// the qwen35 tensor-name resolver, and the standard pread+awq weight reader.
 fn qwen35_hfq_backend<'a>(
@@ -3452,23 +2926,6 @@ fn qwen35_hfq_backend<'a>(
         // `MemoryTarget` handed to `read_proj` and the host uploader for
         // `norm`/`raw_f32`/`bias`; `Resident` is the zero-diff default.
         residency,
-    }
-}
-
-/// Construct a `ParoBackend` with qwen35's `norm_bias` baked in. `mp` is the
-/// text-tower prefix from `paro_text_prefix`.
-fn qwen35_paro_backend<'a>(
-    source: &'a dyn ModelSource,
-    gpu: &'a mut Gpu,
-    mp: &'static str,
-    layer: usize,
-) -> ParoBackend<'a> {
-    ParoBackend {
-        source,
-        gpu,
-        mp,
-        layer,
-        norm_bias: QWEN35_NORM_BIAS,
     }
 }
 
@@ -5524,7 +4981,6 @@ fn try_load_packed_experts(
             m: 2 * mi,
             k: dim,
             row_stride: 0,
-            paro: None,
             awq_scale: None,
             lloyd_lut_e4m3: None,
             lloyd_lut_f16: None,
@@ -5537,7 +4993,6 @@ fn try_load_packed_experts(
             m: dim,
             k: mi,
             row_stride: 0,
-            paro: None,
             awq_scale: None,
             lloyd_lut_e4m3: None,
             lloyd_lut_f16: None,
@@ -5818,7 +5273,6 @@ fn try_load_graded_host_experts(
                 m: 2 * mi,
                 k: dim,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -5830,7 +5284,6 @@ fn try_load_graded_host_experts(
                 m: dim,
                 k: mi,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -5902,7 +5355,6 @@ pub(crate) struct PendingMoeFfn {
     pub(crate) cpu_deferred_experts: bool,
     pub(crate) expert_down_awq_ptrs: Option<GpuTensor>,
     pub(crate) expert_dtype_tags: Option<GpuTensor>,
-    pub(crate) paro_shared: Option<MoeParoSidecars>,
     pub(crate) ep_dummy_buffers: Vec<GpuTensor>,
     pub(crate) ep_dummy_views: Vec<ExpertWeights>,
     pub(crate) layer_idx: u16,
@@ -5923,7 +5375,6 @@ impl PendingMoeFfn {
             cpu_deferred_experts: false,
             expert_down_awq_ptrs: None,
             expert_dtype_tags: None,
-            paro_shared: None,
             ep_dummy_buffers: Vec::new(),
             ep_dummy_views: Vec::new(),
             layer_idx,
@@ -5981,19 +5432,11 @@ impl PendingMoeFfn {
             weight.free_all(gpu);
         }
 
-        if let Some(sidecars) = self.paro_shared.take() {
-            let _ = gpu.free_tensor(sidecars.gate_up_pairs);
-            let _ = gpu.free_tensor(sidecars.gate_up_theta);
-            let _ = gpu.free_tensor(sidecars.gate_up_channel_scales);
-            let _ = gpu.free_tensor(sidecars.down_pairs);
-            let _ = gpu.free_tensor(sidecars.down_theta);
-            let _ = gpu.free_tensor(sidecars.down_channel_scales);
-        }
         for tensor in self.ep_dummy_buffers.drain(..) {
             let _ = gpu.free_tensor(tensor);
         }
         // Dummy views borrow `ep_dummy_buffers` (already freed above); their
-        // metadata is empty by construction (no paro, no AWQ), so dropping
+        // metadata is empty by construction (no AWQ), so dropping
         // the handles reclaims nothing and frees nothing.
         self.ep_dummy_views.clear();
         err
@@ -6035,7 +5478,6 @@ impl PendingMoeFfn {
             cpu_deferred_experts,
             expert_down_awq_ptrs,
             expert_dtype_tags,
-            paro_shared,
             ep_dummy_buffers,
             ep_dummy_views,
             layer_idx,
@@ -6065,7 +5507,6 @@ impl PendingMoeFfn {
             expert_dtype_tags,
             layer_idx,
             expert_shape: None,
-            paro_shared,
             global_expert_dtypes: None,
             ep_dummy_buffers,
             ep_dummy_experts: Vec::new(),
@@ -6148,7 +5589,6 @@ impl PendingMoeFfn {
             cpu_deferred_experts,
             expert_down_awq_ptrs,
             expert_dtype_tags,
-            paro_shared,
             ep_dummy_buffers,
             ep_dummy_views,
             layer_idx,
@@ -6182,7 +5622,6 @@ impl PendingMoeFfn {
             expert_dtype_tags,
             layer_idx,
             expert_shape: None,
-            paro_shared,
             global_expert_dtypes: Some(global_pairs.into_boxed_slice()),
             ep_dummy_buffers,
             ep_dummy_experts: ep_dummy_views,
@@ -6767,7 +6206,6 @@ pub(crate) struct ExpertIu4LayerFacts {
     pub(crate) has_dtype_tags: bool,
     pub(crate) has_awq: bool,
     pub(crate) cpu_deferred: bool,
-    pub(crate) paro: bool,
 }
 
 /// `Some(dtype)` when the iterator is non-empty and every item is equal.
@@ -6813,7 +6251,6 @@ fn expert_iu4_layer_facts(
                 .iter()
                 .any(|e| e.gate_up.awq_scale.is_some() || e.down.awq_scale.is_some()),
         cpu_deferred: ffn.cpu_deferred_experts,
-        paro: ffn.paro_shared.is_some(),
     }
 }
 
@@ -6821,7 +6258,7 @@ fn expert_iu4_layer_facts(
 /// first reason it cannot carry the capability. Fully loaded (resident or
 /// host-mapped), uniform qt44 (MQ4G256V2) gate_up + qt53 (MQ4G128V2) down only;
 /// the spec's own geometry requirements are those of `ExpertIu4Spec::validate`.
-/// Paged/EP/CPU-deferred/tagged/AWQ/Paro layers stay refused.
+/// Paged/EP/CPU-deferred/tagged/AWQ layers stay refused.
 pub(crate) fn expert_iu4_layer_spec(
     facts: &ExpertIu4LayerFacts,
 ) -> Result<hipfire_dispatch::families::moe_expert_iu4::ExpertIu4Spec, &'static str> {
@@ -6843,9 +6280,6 @@ pub(crate) fn expert_iu4_layer_spec(
     }
     if facts.cpu_deferred {
         return Err("routed FFN is deferred to the CPU expert splice");
-    }
-    if facts.paro {
-        return Err("routed experts carry ParoQuant sidecars");
     }
     let (Ok(experts), Ok(top_k), Ok(hidden), Ok(intermediate)) = (
         u32::try_from(facts.experts),
@@ -8392,7 +7826,6 @@ mod sealed_ep_tests {
                     m: 64,
                     k: 32,
                     row_stride: 0,
-                    paro: None,
                     awq_scale: None,
                     lloyd_lut_e4m3: None,
                     lloyd_lut_f16: None,
@@ -8404,7 +7837,6 @@ mod sealed_ep_tests {
                     m: 32,
                     k: 16,
                     row_stride: 0,
-                    paro: None,
                     awq_scale: None,
                     lloyd_lut_e4m3: None,
                     lloyd_lut_f16: None,
@@ -9417,7 +8849,6 @@ mod packed_host_expert_tests {
                         m: weight.m,
                         k: weight.k,
                         row_stride: weight.row_stride,
-                        rotation: None,
                         awq_scale: weight.awq_scale.as_ref(),
                         lloyd_lut_e4m3: weight.lloyd_lut_e4m3,
                         lloyd_lut_f16: weight.lloyd_lut_f16,
@@ -9701,7 +9132,6 @@ mod expert_iu4_load_tests {
             has_dtype_tags: false,
             has_awq: false,
             cpu_deferred: false,
-            paro: false,
         }
     }
 
@@ -9737,7 +9167,7 @@ mod expert_iu4_load_tests {
 
     #[test]
     fn layer_spec_refusal_table() {
-        let cases: [(&str, fn(&mut ExpertIu4LayerFacts)); 13] = [
+        let cases: [(&str, fn(&mut ExpertIu4LayerFacts)); 12] = [
             ("not fully resident", |f| f.resident_experts = 0),
             ("not fully resident", |f| f.resident_experts = 255),
             ("not fully resident", |f| f.experts = 0),
@@ -9752,7 +9182,6 @@ mod expert_iu4_load_tests {
             ("dtype tags", |f| f.has_dtype_tags = true),
             ("AWQ", |f| f.has_awq = true),
             ("CPU expert splice", |f| f.cpu_deferred = true),
-            ("ParoQuant", |f| f.paro = true),
             // Spec geometry requirement surfaces its reason.
             ("top_k", |f| f.top_k = 10),
             ("multiple of 128", |f| f.intermediate = 576),

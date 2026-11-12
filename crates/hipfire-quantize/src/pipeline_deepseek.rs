@@ -214,8 +214,12 @@ pub(crate) fn build_deepseek4_dspark_e8soa_sidecar(
             }
             tensors.push(HfqTensor {
                 name: name.clone(),
-                quant_type: QuantType::from_u8(qt)
-                    .ok_or_else(|| format!("{name}: unknown source qt={qt}"))?,
+                quant_type: QuantType::from_u8(qt).ok_or_else(|| {
+                    match hipfire_runtime::hfq::removed_quant_type_error(u32::from(qt)) {
+                        Some(msg) => format!("{name}: {msg}"),
+                        None => format!("{name}: unknown source qt={qt}"),
+                    }
+                })?,
                 shape,
                 group_size: gs,
                 data: bytes,

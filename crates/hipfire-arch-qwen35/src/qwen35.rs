@@ -47,7 +47,7 @@ pub use forward::{
 pub use load::{
     host_mapped_expert_accounting, load_weights, load_weights_dense_tp_rank, load_weights_ep_rank,
     load_weights_ep_rank_with_fault, load_weights_with_fault, preflight_weights_dense_tp, EpFault,
-    EpLoadStage, HfqSource, Layout, ParoSource, StagedLoadFault,
+    EpLoadStage, HfqSource, Layout, StagedLoadFault,
 };
 pub use prefill::{
     forward_prefill_batch, forward_prefill_batch_capped, forward_prefill_batch_capture_hidden,
@@ -62,7 +62,7 @@ pub(crate) use prefill::{moe_prefill_dtypes, prefill_moe_ffn_body_batched};
 pub use weights::{
     mixed_expert_tag, DeltaNetLayerWeights, DeltaNetMoeLayerWeights, DeltaNetState, ExpertWeights,
     FullAttnLayerWeights, FullAttnMoeLayerWeights, GpuTensorDescriptor, LayerWeights,
-    MoeFfnWeights, MoeParoSidecars, ParoDescriptor, Qwen35EpConfigFingerprint, Qwen35EpShardInfo,
-    Qwen35HfqSourceIdentity, Qwen35LayerSeal, Qwen35LocalExpertDescriptor, Qwen35MoeFfnSeal,
-    Qwen35RankSeal, Qwen35Weights, SharedExpertWeights, StateQuant, WeightTensorDescriptor,
+    MoeFfnWeights, Qwen35EpConfigFingerprint, Qwen35EpShardInfo, Qwen35HfqSourceIdentity,
+    Qwen35LayerSeal, Qwen35LocalExpertDescriptor, Qwen35MoeFfnSeal, Qwen35RankSeal, Qwen35Weights,
+    SharedExpertWeights, StateQuant, WeightTensorDescriptor,
 };

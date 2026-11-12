@@ -63,32 +63,20 @@ pub const GEMV_HFQ4G128_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4
 
 /// HFQ4-G128 batched GEMV with fused per-token sigmoid-scaled residual.
 /// HFQ4-G256 sister: `GEMV_HFQ4G256_RESIDUAL_SCALED_SRC`. Used by the
-/// PARO shared-expert down dispatch (Phase 2 — moe_ffn_batched_admissible
-/// under HIPFIRE_PARO_BATCHED=1).
+/// shared-expert down dispatch.
 pub const GEMV_HFQ4G128_RESIDUAL_SIGMOID_SCALED_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g128_residual_sigmoid_scaled.hip");
 
-/// PARO4-G128: ParoQuant-compatible rotated activation + W4 GEMV.
-/// Block: [f32 scale][f32 zero][64B nibbles] = 72 bytes per 128 weights,
-/// followed by shared pair-rotation metadata and channel scales.
-pub const GEMV_PARO4G128_SRC: &str = include_str!("../../../kernels/src/gemv_paro4g128.hip");
-
 /// HFQ4-G128 batched GEMM: same tiled approach as G256 but 72 bytes/group, 4 weights/thread.
 pub const GEMM_HFQ4G128_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g128.hip");
-
-/// HFQ4-G64 GEMV / batched GEMM (ParoQ4G64): 40 bytes per 64 weights,
-/// [f32 scale][f32 zero][32B nibbles].
-pub const GEMV_HFQ4G64_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g64.hip");
-pub const GEMM_HFQ4G64_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g64.hip");
 
 /// HFQ4-G128 i8 WMMA MMQ (non-grouped) for gfx1151. Mirror of the routed
 /// grouped k8 kernel minus expert scatter — same i8 WMMA pattern, same
 /// 16×16 tile, same 8-WMMA-per-group K-pipeline. Activation must be
 /// pre-quantized to block_q8_1_mmq via `quantize_q8_1_mmq_ds4` (handled
 /// transparently by the dispatcher). Closes the perf gap left when only
-/// the routed-expert path got the MMQ port — see the
-/// `paroquant-real-bottleneck-gemm-hfq4g128` rocprof finding (66% of
-/// pp256 prefill time was the non-grouped baseline).
+/// the routed-expert path got the MMQ port (the non-grouped baseline was
+/// the dominant share of pp256 prefill time).
 pub const GEMM_HFQ4G128_MMQ_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g128_mmq.gfx1151.hip");
 
@@ -3601,23 +3589,6 @@ pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_WG2_SRC: &str = concat!(
 pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_ROWTILE_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up_indexed_rowtile.hip");
 
-/// HFQ4G128 (ParoQuant) variant of the indexed MoE gate_up GEMV. Same
-/// device-side expert-pointer table + topk_indices contract as the
-/// HFQ4G256 sibling; closes the residual hipGraph-capture gap for
-/// ParoQuant routed experts (Qwen3.6-A3B-PARO etc.) left open by
-/// PR #317.
-pub const GEMV_PARO_Q4G128_MOE_GATE_UP_INDEXED_SRC: &str =
-    include_str!("../../../kernels/src/gemv_paro_q4g128_moe_gate_up_indexed.hip");
-
-/// N-batched indexed MoE gate_up GEMV for HFQ4G128 (ParoQuant routed
-/// experts). Sister of `GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_SRC` with
-/// 72 B/group stride. Used by Path 1 fallback in
-/// `prefill_moe_ffn_body_batched` when ParoQ4G128 expert weights are admitted
-/// (HIPFIRE_PARO_BATCHED=1) on non-WMMA archs (CDNA/gfx10). gfx11/gfx12 takes
-/// Path 2's grouped-WMMA kernel instead (Phase 4).
-pub const GEMV_PARO_Q4G128_MOE_GATE_UP_K8_INDEXED_BATCHED_SRC: &str =
-    include_str!("../../../kernels/src/gemv_paro_q4g128_moe_gate_up_k8_indexed_batched.hip");
-
 /// CDNA3 (MI300X / gfx94x) wave64-native counterpart to the indexed
 /// gate_up GEMV. Block=[64,1,1] with 2 rows per block (one per warp) —
 /// halves the grid count vs the wave32 variant, which otherwise wastes
@@ -3942,66 +3913,6 @@ pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_LAST_COMBINE_SRC: &str = concat!(
 /// opt-in via `HIPFIRE_MOE_DOWN_FUSED=1`.
 pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_FUSED_ACC_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_fused_acc.hip");
-
-/// HFQ4G128 (ParoQuant) variant of the atomic-free batched indexed MoE
-/// down. Same expanded-output contract as the HFQ4G256 sibling; pairs
-/// with `MOE_DOWN_COMBINE_K8_BATCHED_SRC` for the K_TOP fold. Closes the
-/// hipGraph-capture gap for ParoQuant routed experts.
-pub const GEMV_PARO_Q4G128_MOE_DOWN_K8_INDEXED_BATCHED_SRC: &str =
-    include_str!("../../../kernels/src/gemv_paro_q4g128_moe_down_k8_indexed_batched.hip");
-
-/// SGLang-style grouped-WMMA-GEMM for HFQ4G128 (ParoQuant) routed-expert
-/// gate_up + down dispatch on RDNA3/4. Port of
-/// `GEMM_HFQ4G256_MOE_GROUPED_WMMA_K2_SRC` with 72 B/group stride and 128
-/// elements per group. Same scatter-pipeline contract (expert_tile_ids +
-/// sorted_slot_index) and same WMMA 16×16×16 F16 layout. Caller pre-
-/// rotates X by the layer's shared Givens sidecar (gate_up or down) and
-/// the kernel reads HFQ4G128 nibbles; F32→F16 X conversion is handled by
-/// the Rust dispatch wrapper via `ensure_fp16_x`.
-pub const GEMM_PARO_Q4G128_MOE_GROUPED_WMMA_K2_SRC: &str =
-    include_str!("../../../kernels/src/gemm_paro_q4g128_moe_grouped_wmma_k2.hip");
-
-/// i8 WMMA MMQ MoE grouped GEMM for HFQ4G128 (ParoQuant) on gfx1151
-/// (Strix Halo iGPU). Port of GEMM_HFQ4G256_MOE_GROUPED_MMQ_GFX1151_SRC
-/// with the 72 B/group HFQ4G128 stride. Targets the same +2× FP16 WMMA
-/// throughput lift on routed-expert grouped GEMM. Compute-bound regime
-/// per Phase 4 rocprof attribution (gemm_paro_q4g128_moe_grouped_wmma_k2
-/// = 68.5% of GPU time, 25.8 GiB/s effective — far from the ~256 GB/s BW
-/// roof, so compute-throughput doubling has full upside).
-pub const GEMM_PARO_Q4G128_MOE_GROUPED_MMQ_GFX1151_SRC: &str =
-    include_str!("../../../kernels/src/gemm_paro_q4g128_moe_grouped_mmq.gfx1151.hip");
-
-/// k8 (deepest pipeline) sibling of GEMM_PARO_Q4G128_MOE_GROUPED_MMQ_GFX1151_SRC.
-/// Processes all 4 Q8_1 sub-blocks of the (single) mmq block per HFQ4G128 group
-/// in one inner iteration — 8 WMMAs into 4 independent int32 accumulators
-/// before the per-sub-block scale FMA resolves. Same kernarg + grid as k2.
-/// Opt-IN via HIPFIRE_MOE_PARO_I8_K8=1 (default OFF pending bench validation).
-pub const GEMM_PARO_Q4G128_MOE_GROUPED_MMQ_K8_GFX1151_SRC: &str =
-    include_str!("../../../kernels/src/gemm_paro_q4g128_moe_grouped_mmq_k8.gfx1151.hip");
-
-/// Fused silu(gate)*up + per-channel scale + krot rounds of Givens
-/// rotation. Replaces the silu_mul_f32 + givens_rotate two-launch
-/// composition the ParoQuant MoE decode path used for the gate→down
-/// hop. Structural mirror of MQ4's `fused_silu_mul_rotate_mq` — fuses
-/// the gate→down activations to eliminate inter-launch state and
-/// match the single-kernel reduction pattern that holds up under
-/// hipGraph capture.
-pub const FUSED_SILU_MUL_GIVENS_ROTATE_SRC: &str =
-    include_str!("../../../kernels/src/fused_silu_mul_givens_rotate.hip");
-
-/// Out-of-place variant of `givens_rotate_f32`. Reads `x_in`, writes
-/// rotated activations to `x_out`. Used by `rotate_x_paro_for` to
-/// eliminate the preceding `copy_d2d` (one fewer graph node + one
-/// fewer inter-node dependency for the hipGraph dependency analyzer).
-pub const GIVENS_ROTATE_TO_SRC: &str = include_str!("../../../kernels/src/givens_rotate_to.hip");
-
-/// `givens_rotate_to_f32` over 64-channel rotation blocks (ParoQ4G64).
-pub const GIVENS_ROTATE_TO_G64_SRC: &str = concat!(
-    "#define GROUP_SIZE 64\n",
-    "#define HALF_GROUP 32\n",
-    "#define GIVENS_ROTATE_TO_KERNEL givens_rotate_to_g64_f32\n",
-    include_str!("../../../kernels/src/givens_rotate_to.hip")
-);
 
 /// Index-aware MoE gate_up GEMV for HFQ6G256-layout routed experts. Used
 /// by mixed-kmap MoE models where some layers are promoted from MQ4 → MQ6
@@ -11803,9 +11714,6 @@ pub const GEMM_BF16_SMALL_ROWS_SRC: &str =
 pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_EXPANDED_K4_SRC: &str =
     include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_down_expanded_k4.hip");
 
-/// ParoQuant Givens rotation: apply learned pairwise rotations + channel scaling
-/// to activations in-place. Called before each ParoQ4G128 GEMV.
-pub const GIVENS_ROTATE_SRC: &str = include_str!("../../../kernels/src/givens_rotate.hip");
 /// Calibration activation reductions (`calib_sumsq_reduce_f32` = per-column Σx²
 /// for imatrix/diag; `calib_hessian_outer_f32` = Σxxᵀ K×K for GPTQ Hessian).
 /// Accumulate-in-place over the calibration corpus. Tier-1 native collector.

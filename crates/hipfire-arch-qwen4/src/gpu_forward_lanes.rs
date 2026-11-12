@@ -1338,9 +1338,9 @@ fn lm_head_row_slice(
             full.m
         )));
     }
-    if full.rotation.is_some() || full.awq_scale.is_some() {
+    if full.awq_scale.is_some() {
         return Err(invalid(
-            "vocabulary shard: the LM head carries a rotation / scale sidecar",
+            "vocabulary shard: the LM head carries a scale sidecar",
         ));
     }
     let row_bytes = full.row_stride;

@@ -110,7 +110,6 @@ fn run(rows: usize) {
         m: VOCAB,
         k: K,
         row_stride: K / GROUP_ELEMS * GROUP_BYTES,
-        rotation: None,
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,

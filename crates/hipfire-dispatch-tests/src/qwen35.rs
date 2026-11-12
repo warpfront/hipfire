@@ -143,7 +143,6 @@ fn mq4_dtypes() -> MoeDtypes<'static> {
         routed_gate_up: DType::MQ4G256,
         routed_down: DType::MQ4G256,
         routed_has_mixed_experts: false,
-        has_paro_shared: false,
         per_expert_gate_up: None,
         per_expert_down: None,
     }
@@ -170,7 +169,7 @@ fn moe_resolve_k_ne_8_falls_back_to_cpu() {
 
 #[test]
 fn moe_resolve_non_indexable_routed_falls_back() {
-    // Routed gate_up is Q8 (not MQ4/MQ6/Paro) → not indexable.
+    // Routed gate_up is Q8 (not MQ4/MQ6) → not indexable.
     let d = MoeDtypes {
         routed_gate_up: DType::Q8_0,
         routed_down: DType::Q8_0,
@@ -196,32 +195,6 @@ fn moe_resolve_mq6_indexable() {
     assert!(res.use_gpu_topk);
     assert!(res.routed_indexable_mq6);
     assert!(res.routed_indexable());
-}
-
-#[test]
-fn moe_resolve_paro_indexable() {
-    let d = MoeDtypes {
-        routed_gate_up: DType::ParoQ4G128,
-        routed_down: DType::ParoQ4G128,
-        has_paro_shared: true,
-        ..mq4_dtypes()
-    };
-    let res = MoeResolution::resolve(&d, 8);
-    assert!(res.use_gpu_topk);
-    assert!(res.routed_indexable_paro);
-    assert!(res.routed_indexable());
-}
-
-#[test]
-fn moe_resolve_paro_without_sidecar_falls_back() {
-    let d = MoeDtypes {
-        routed_gate_up: DType::ParoQ4G128,
-        routed_down: DType::ParoQ4G128,
-        has_paro_shared: false,
-        ..mq4_dtypes()
-    };
-    let res = MoeResolution::resolve(&d, 8);
-    assert!(!res.use_gpu_topk, "Paro without sidecar must fall back");
 }
 
 #[test]

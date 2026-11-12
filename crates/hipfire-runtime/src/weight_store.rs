@@ -1171,7 +1171,6 @@ pub(crate) fn source_dtype(dtype: &str) -> Result<DType, String> {
         "MFP4G32E8G128" => DType::MFP4G32E8G128,
         "MFP3G32E8" => DType::MFP3G32E8,
         "MFP2G32E8" => DType::MFP2G32E8,
-        "PAROQ4G128" => DType::ParoQ4G128,
         "FP8E4M3B128" => DType::FP8E4M3B128,
         "FP8E4M3PT" => DType::FP8E4M3PT,
         "RAW" => DType::Raw,
@@ -1249,8 +1248,6 @@ fn quant_block_bytes(dtype: DType) -> usize {
         DType::BQ1G128 => 18,
         DType::F32 => 4,
         DType::F16 | DType::BF16 => 2,
-        DType::ParoQ4G128 => 72,
-        DType::ParoQ4G64 => 40,
         DType::Raw => 1,
         // Keep this arm in sync if a new storage dtype is added. `size()` is
         // a conservative byte alignment for formats without a block codec.
@@ -1336,8 +1333,8 @@ fn expected_payload_bytes(shape: &[usize], dtype: DType) -> Result<Option<usize>
         .try_fold(1usize, |product, &dim| product.checked_mul(dim))
         .ok_or_else(|| format!("{dtype:?} payload row count overflows usize"))?;
     let row_bytes = match dtype {
-        // `DType::row_bytes` has no HFQ4G128 arm; ParoQ4G128 is its layout.
-        DType::HFQ4G128 => DType::ParoQ4G128.row_bytes(k),
+        // `DType::row_bytes` has no HFQ4G128 arm: 72 bytes per 128-wide group.
+        DType::HFQ4G128 => k.div_ceil(128).checked_mul(72),
         DType::HFQ2G128 | DType::HFQ3G128 | DType::Q4F16G64 | DType::Q4K | DType::Q8_0 => {
             (k / k_alignment).checked_mul(quant_block_bytes(dtype))
         }

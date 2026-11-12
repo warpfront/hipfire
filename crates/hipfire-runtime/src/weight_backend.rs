@@ -3,7 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Arch-agnostic weight loading: dequant primitives, HF tensor-name resolution,
-//! and a `WeightBackend` trait abstracting HFQ vs ParoQuant on-disk formats.
+//! and a `WeightBackend` trait abstracting the HFQ on-disk format.
 //! Per-arch crates build their `load_layer` schema on top of this; the only
 //! arch-varying knobs are the RMSNorm `+bias` and the name-candidate resolver.
 
@@ -76,15 +76,6 @@ pub fn hfq_proj_name(layer: usize, rel: &str) -> String {
 /// HFQ norm / raw-f32 name: `layers.{layer}.{rel}` (rel already carries `.weight`
 /// where the on-disk tensor has it, e.g. `input_layernorm.weight`).
 pub fn hfq_plain_name(layer: usize, rel: &str) -> String {
-    format!("layers.{layer}.{rel}")
-}
-/// PaRo projection base (augmentor appends `.qweight`/`.weight`): `{mp}.layers.{layer}.{rel}`.
-pub fn paro_proj_name(mp: &str, layer: usize, rel: &str) -> String {
-    format!("{mp}.layers.{layer}.{rel}")
-}
-/// PaRo norm/raw-f32 name for `paro_load_norm`/`paro_load_f32`, which prepend `mp`
-/// THEMSELVES — so this is prefix-LESS: `layers.{layer}.{rel}`.
-pub fn paro_plain_name(layer: usize, rel: &str) -> String {
     format!("layers.{layer}.{rel}")
 }
 
@@ -200,7 +191,7 @@ pub fn load_awq_scale_for(hfq: &HfqFile, gpu: &Gpu, name: &str, k: usize) -> Opt
 }
 
 /// Decode a little-endian f16 byte buffer to `f32`. Pure (GPU-free). The shared
-/// core of every tied-lm_head reupload across HFQ + ParoQuant arches.
+/// core of every tied-lm_head reupload.
 pub fn f16_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
     bytes
         .chunks_exact(2)
@@ -209,7 +200,7 @@ pub fn f16_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
 }
 
 /// Reupload an f16 weight buffer as a device F32 `WeightTensor [m, k]`. The
-/// canonical tied-lm_head / ParoQuant-output reupload — replaces three hand-rolled
+/// canonical tied-lm_head reupload — replaces three hand-rolled
 /// `unsafe { from_raw_parts }` copies.
 pub fn reupload_f16_as_f32(
     gpu: &mut Gpu,
@@ -227,7 +218,6 @@ pub fn reupload_f16_as_f32(
         m,
         k,
         row_stride: 0,
-        paro: None,
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
@@ -253,7 +243,6 @@ pub fn tied_lm_head_alias(
         m,
         k,
         row_stride: 0,
-        paro: None,
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
@@ -329,7 +318,6 @@ pub fn requantize_weight_q8_0_to_hfq4g256(
         m,
         k,
         row_stride: 0,
-        paro: None,
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
@@ -410,7 +398,6 @@ pub fn requantize_weight_q8_0_to_hfq3g256(
         m,
         k,
         row_stride: 0,
-        paro: None,
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
@@ -485,7 +472,6 @@ pub fn requantize_weight_q8_0_to_hfq2g256(
         m,
         k,
         row_stride: 0,
-        paro: None,
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
@@ -969,7 +955,6 @@ pub(crate) fn decode_raw_codec(
         m,
         k,
         row_stride: codec.dtype.row_stride(k),
-        paro: None,
         awq_scale: None,
         // Lloyd LUTs are attached by the caller (hfq / arch loader) from the
         // lloyd_levels sidecar — same pattern as AWQ sidecars, never here.
@@ -1094,7 +1079,6 @@ pub fn dequant_weight_raw(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -1110,7 +1094,6 @@ pub fn dequant_weight_raw(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
                 lloyd_lut_c16: None,
@@ -1130,7 +1113,6 @@ pub fn dequant_weight_raw(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -1504,9 +1486,6 @@ pub const HOST_DECODE_REFUSAL: &str =
      in device memory would defeat the offload; use a model quantized in a supported format, \
      or unset memory.gpu_layer_budget / memory.moe_expert_budget";
 
-use crate::augmentor::{try_augmentors, DEFAULT_AUGMENTORS};
-use crate::model_source::ModelSource;
-use crate::paro::{load_fp16_weight_from_source, paro_load_f32, paro_load_norm};
 pub use crate::weight_manifest::WeightResidency;
 
 /// Pluggable weight-loading backend. `rel` is a layer-relative path: for `proj`
@@ -1628,54 +1607,6 @@ pub fn read_first(
     None
 }
 
-/// PaRo backend (augmentor chain + paro primitives) — fully arch-agnostic.
-/// `mp` is the text-tower prefix from `paro_text_prefix`.
-pub struct ParoBackend<'a> {
-    pub source: &'a dyn ModelSource,
-    pub gpu: &'a mut Gpu,
-    pub mp: &'static str,
-    pub layer: usize,
-    /// `1.0` (qwen3.5/gemma) or `0.0` (qwen2/llama).
-    pub norm_bias: f32,
-}
-
-impl<'a> WeightBackend for ParoBackend<'a> {
-    fn set_layer(&mut self, layer: usize) {
-        self.layer = layer;
-    }
-
-    fn proj(&mut self, rel: &str, m: usize, k: usize) -> HipResult<WeightTensor> {
-        let base = paro_proj_name(self.mp, self.layer, rel);
-        match try_augmentors(self.source, &base, m, k, self.gpu, DEFAULT_AUGMENTORS)? {
-            Some(t) => Ok(t),
-            None => {
-                load_fp16_weight_from_source(self.source, self.gpu, &format!("{base}.weight"), m, k)
-            }
-        }
-    }
-    fn norm(&mut self, rel: &str, shape: &[usize]) -> HipResult<GpuTensor> {
-        paro_load_norm(
-            self.source,
-            self.gpu,
-            &paro_plain_name(self.layer, rel),
-            shape,
-            self.norm_bias,
-        )
-    }
-    fn raw_f32(&mut self, rel: &str, n: usize) -> HipResult<GpuTensor> {
-        paro_load_f32(self.source, self.gpu, &paro_plain_name(self.layer, rel), n)
-    }
-    fn free_tensor(&mut self, tensor: GpuTensor) {
-        let _ = self.gpu.free_tensor(tensor);
-    }
-    fn bias(&mut self, _rel: &str, _n: usize) -> HipResult<GpuTensor> {
-        Err(hip_bridge::HipError::new(
-            0,
-            "ParoBackend: attention biases unsupported",
-        ))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1779,14 +1710,6 @@ mod tests {
         assert_eq!(
             hfq_plain_name(3, "input_layernorm.weight"),
             "layers.3.input_layernorm.weight"
-        );
-        assert_eq!(
-            paro_proj_name("model.language_model", 0, "linear_attn.in_proj_qkv"),
-            "model.language_model.layers.0.linear_attn.in_proj_qkv"
-        );
-        assert_eq!(
-            paro_plain_name(0, "input_layernorm.weight"),
-            "layers.0.input_layernorm.weight"
         );
     }
 
@@ -1935,7 +1858,6 @@ mod tests {
         assert_eq!(wt.m, 100);
         assert_eq!(wt.k, 64);
         assert_eq!(wt.row_stride, 0);
-        assert!(wt.paro.is_none());
         assert!(wt.awq_scale.is_none());
     }
 

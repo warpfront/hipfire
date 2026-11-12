@@ -189,7 +189,6 @@ impl<'a> LayerRefs<'a> {
                 routed_down: down.gpu_dtype,
                 // One packed format per projection per layer.
                 routed_has_mixed_experts: false,
-                has_paro_shared: false,
                 per_expert_gate_up: None,
                 per_expert_down: None,
             },
@@ -233,8 +232,6 @@ impl<'a> LayerRefs<'a> {
             routed_down_m: down.m,
             routed_down_k: down.k,
             routed_experts: routed,
-            routed_gate_up_paro: None,
-            routed_down_paro: None,
             router_logits: &state.router_logits,
             x_rot_local: &state.ffn_x_rot,
             // Host-routed fallback scratch: the biased router always routes on

@@ -33,7 +33,6 @@
 use crate::cohere2moe::{Cohere2MoeState, Cohere2MoeWeights, Ffn};
 use crate::config::{AttnKind, Cohere2MoeConfig};
 use hipfire_dispatch::context::DispatchCtx;
-use hipfire_dispatch::families::gemv::GivensRef;
 use hipfire_dispatch::families::moe::{
     MoeDtypes, MoeEpMode, MoeNormalization, MoeParams, MoePrefillParams, MoePrefillPrelude,
     MoeQ8RouterPolicy, MoeRecipe, MOE_GROUPED_BLOCK_M,
@@ -294,18 +293,6 @@ fn decode_step_body(
                     .first()
                     .copied()
                     .ok_or_else(|| format!("cohere2moe L{l}: no down expert dtype"))?;
-                let params_gate_paro = m.experts[0].gate_up.paro.as_ref().map(|paro| GivensRef {
-                    pairs: &paro.pairs,
-                    theta: &paro.theta,
-                    scales: &paro.channel_scales,
-                    krot: paro.krot as usize,
-                });
-                let params_down_paro = m.experts[0].down.paro.as_ref().map(|paro| GivensRef {
-                    pairs: &paro.pairs,
-                    theta: &paro.theta,
-                    scales: &paro.channel_scales,
-                    krot: paro.krot as usize,
-                });
                 let params = MoeParams {
                     dtypes: MoeDtypes {
                         router: m.router.gpu_dtype,
@@ -316,7 +303,6 @@ fn decode_step_body(
                         routed_gate_up,
                         routed_down,
                         routed_has_mixed_experts: gate_up_mixed || down_mixed,
-                        has_paro_shared: m.paro_shared.is_some(),
                         per_expert_gate_up: gate_up_mixed.then_some(gate_up_dtypes),
                         per_expert_down: down_mixed.then_some(down_dtypes),
                     },
@@ -351,8 +337,6 @@ fn decode_step_body(
                     routed_down_m: m.experts[0].down.m,
                     routed_down_k: m.experts[0].down.k,
                     routed_experts: m,
-                    routed_gate_up_paro: params_gate_paro,
-                    routed_down_paro: params_down_paro,
                     router_logits: &state.router_logits,
                     x_rot_local: &state.ffn_x_rot,
                     gate_up_buf: &state.expert_gate_up,
@@ -748,18 +732,6 @@ pub fn forward_batch(
                     .first()
                     .copied()
                     .ok_or_else(|| format!("cohere2moe L{l}: no down expert dtype"))?;
-                let params_gate_paro = m.experts[0].gate_up.paro.as_ref().map(|paro| GivensRef {
-                    pairs: &paro.pairs,
-                    theta: &paro.theta,
-                    scales: &paro.channel_scales,
-                    krot: paro.krot as usize,
-                });
-                let params_down_paro = m.experts[0].down.paro.as_ref().map(|paro| GivensRef {
-                    pairs: &paro.pairs,
-                    theta: &paro.theta,
-                    scales: &paro.channel_scales,
-                    krot: paro.krot as usize,
-                });
                 let params = MoePrefillParams {
                     dtypes: MoeDtypes {
                         router: m.router.gpu_dtype,
@@ -770,7 +742,6 @@ pub fn forward_batch(
                         routed_gate_up,
                         routed_down,
                         routed_has_mixed_experts: gate_up_mixed || down_mixed,
-                        has_paro_shared: m.paro_shared.is_some(),
                         per_expert_gate_up: gate_up_mixed.then_some(gate_up_dtypes),
                         per_expert_down: down_mixed.then_some(down_dtypes),
                     },
@@ -823,8 +794,6 @@ pub fn forward_batch(
                     inverse_perm: &inverse_perm,
                     y_gate_up_grouped: &y_gate_up_grouped,
                     y_down_grouped: &y_down_grouped,
-                    paro_gate_up: params_gate_paro,
-                    paro_down: params_down_paro,
                     down_awq_scale: None,
                     routed_out: None,
                     ep_row_gather: None,

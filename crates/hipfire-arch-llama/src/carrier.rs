@@ -396,7 +396,6 @@ fn resident_weight(
         m,
         k,
         row_stride: dtype.row_stride(k),
-        paro: None,
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
@@ -592,9 +591,7 @@ fn assemble_llama_weights(
 /// The HFQ plain-LLaMA Single path is the production manifest pilot: planning
 /// and source admission happen first, fulfillment uploads transactionally, and
 /// typed handles are moved into `LlamaWeights` before the committed remainder
-/// is published beneath this bundle's owner. The directory path remains on its
-/// existing ParoQuant loader until that source has an equivalent representation
-/// resolver.
+/// is published beneath this bundle's owner. Directory sources are refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HfqLoadRoute {
     /// Plain, non-AWQ files admitted to the manifest/typed-assembly pilot.
@@ -788,45 +785,12 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<LlamaBundle, S
                 weight_origin,
             )
         }
-        ModelSource::Dir(source) => {
-            let config = hipfire_runtime::hfq::config_from_safetensors_llama(&source)
-                .map_err(|e| format!("failed to parse LLaMA/Qwen3 config from config.json: {e}"))?;
-            // Pair/string resolution is pure CPU; fail before any GPU upload.
-            let mode = resolve_llama_family_kv_mode(&config, ctx, true)?;
-            let (mesh, manifest_plan) =
-                plan_single(&config, source.tensor_info("lm_head.weight").is_some())?;
-            let weight_origin = WeightOrigin::for_single(&mesh, ctx.gpu);
-            let weights =
-                hipfire_runtime::hfq::load_weights_paroquant_llama(&source, &config, ctx.gpu)
-                    .map_err(|e| format!("load_weights_paroquant_llama: {e:?}"))?;
-            hipfire_runtime::maybe_screen_mmq(&weights, ctx.gpu);
-            let dims = llama_kv_dims(&config, ctx.max_seq, Some(ctx.max_seq));
-            let kv =
-                match <KvCache as KvCacheExt>::from_mode(mode, KvTarget::Single(ctx.gpu), &dims) {
-                    Ok(kv) => kv,
-                    Err(error) => {
-                        weights.free_gpu(ctx.gpu);
-                        return Err(format!("KvCache: {error}"));
-                    }
-                };
-            let scratch = match ForwardScratch::new_with_max_seq(ctx.gpu, &config, ctx.max_seq) {
-                Ok(scratch) => scratch,
-                Err(error) => {
-                    let _ = kv.free_gpu(ctx.gpu);
-                    weights.free_gpu(ctx.gpu);
-                    return Err(format!("ForwardScratch::new_with_max_seq: {error:?}"));
-                }
-            };
-            (
-                config,
-                weights,
-                kv,
-                scratch,
-                manifest_plan,
-                None,
-                mesh,
-                weight_origin,
-            )
+        ModelSource::Dir(_) => {
+            return Err(
+                "llama: safetensors-directory loading is unsupported — convert first with \
+                 `hipfire-quantize` to an HFQ file"
+                    .into(),
+            );
         }
     };
 

@@ -607,7 +607,6 @@ fn moe_params_for_decode<'a>(
                 .unwrap_or(DType::F32)
         },
         routed_has_mixed_experts: per_expert_gate_up.is_some() || per_expert_down.is_some(),
-        has_paro_shared: ffn.paro_shared.is_some(),
         per_expert_gate_up,
         per_expert_down,
     };
@@ -672,28 +671,6 @@ fn moe_params_for_decode<'a>(
         routed_down_m: ffn.experts.first().map_or(0, |e| e.down.m),
         routed_down_k: ffn.experts.first().map_or(0, |e| e.down.k),
         routed_experts: ffn,
-        routed_gate_up_paro: ffn.experts.first().and_then(|e| {
-            e.gate_up
-                .paro
-                .as_ref()
-                .map(|p| hipfire_dispatch::families::gemv::GivensRef {
-                    pairs: &p.pairs,
-                    theta: &p.theta,
-                    scales: &p.channel_scales,
-                    krot: p.krot as usize,
-                })
-        }),
-        routed_down_paro: ffn.experts.first().and_then(|e| {
-            e.down
-                .paro
-                .as_ref()
-                .map(|p| hipfire_dispatch::families::gemv::GivensRef {
-                    pairs: &p.pairs,
-                    theta: &p.theta,
-                    scales: &p.channel_scales,
-                    krot: p.krot as usize,
-                })
-        }),
         router_logits: s.router_logits,
         x_rot_local: s.x_rot_local,
         gate_up_buf: s.gate_up_buf,
@@ -1418,7 +1395,7 @@ impl Qwen35Scratch {
             // uses attention_q8_0_kv while a captured-and-replayed forward
             // uses attention_flash_q8_0 — same math, different fp32
             // reduction order, observed as ~0.44 logit delta direct-vs-graph
-            // on shisa-Qwen3.6-A3B-PARO (see
+            // on a Qwen3.6-A3B MoE checkpoint (see
             // .scratch/hipgraph-moe-drift-audit.md Part A). Aligning the
             // default flips both paths to `attention_flash_q8_0` and makes
             // direct vs graph byte-identical at the cost of moving small-
@@ -3085,12 +3062,6 @@ impl PreparedMoeShard {
             return Err(HipError::new(
                 0,
                 "qwen35: post-load EP shard refuses AWQ pointer tables",
-            ));
-        }
-        if ffn.paro_shared.is_some() {
-            return Err(HipError::new(
-                0,
-                "qwen35: post-load EP shard refuses ParoQuant rotation sidecars",
             ));
         }
         // The only sanctioned Single -> EP transition: rebuild planner input

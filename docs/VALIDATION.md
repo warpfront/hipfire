@@ -202,7 +202,7 @@ Manual load/serve evidence for those changes (in addition to the
    harness `--out` / bench `--json` fields and stderr markers agree).
 2. **Default axes.** On exact **gfx1201**, unpinned eligible Qwen must
    keep native **fp8/fp8** (`KV cache: Fp8 vmm (` or equivalent admission
-   marker). On a **non-gfx1201** arch, unpinned Qwen HFQ/PaRo must
+   marker). On a **non-gfx1201** arch, unpinned Qwen HFQ must
    default **q8/q8** (not the former FWHT3/Q8).
 3. **Card-B baseline guard.** Run
    [`scripts/guard_gfx1201_baseline.py`](../scripts/guard_gfx1201_baseline.py)

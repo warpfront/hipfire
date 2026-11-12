@@ -103,13 +103,6 @@ const FLEET: &[OpUse] = &[
         dtype: Q8_0,
         archs: WAVE32,
     },
-    // ── Paro o_proj (no fused residual kernel → uses the same fallback) ──
-    OpUse {
-        model: "qwen3.5-*.paro4g128",
-        role: Role::Residual,
-        dtype: ParoQ4G128,
-        archs: WAVE32,
-    },
     // ── dense MQ4/MQ3/Lloyd: o_proj has a fused residual kernel — anchors (stay green) ──
     // MQ4/MQ6 work on ALL archs (generic GEMV fallback for gfx906/RDNA1 + arch-tuned
     // variants for RDNA2/3/4). Previously WAVE32-only (excluded gfx906) because
@@ -301,7 +294,7 @@ fn has_dispatch_plan(role: Role, dtype: DType) -> bool {
 
 /// LAYER 1 — dispatch-plan coverage (catches the missing-arm panic class). Every
 /// (role, dtype) a shipped model uses MUST have a dispatch plan. Before the
-/// Q8/Paro fix this FAILED on the q8f16/A3B/Paro `Residual` rows (the panic);
+/// Q8 fix this FAILED on the q8f16/A3B `Residual` rows (the panic);
 /// after the fix those resolve via the plain-GEMV fallback.
 #[test]
 fn fleet_ops_have_a_dispatch_plan() {
@@ -351,7 +344,7 @@ fn fleet_dtypes_resolve_on_every_target_arch() {
 
 /// LAYER 1b — o_proj/down dtype sweep (defense in depth). Reports which residual
 /// dtypes still lack a FUSED kernel (use the slower fallback — informational), and
-/// HARD-asserts the confirmed-shipped o_proj dtypes (Q8_0, ParoQ4G128) have a
+/// HARD-asserts the confirmed-shipped o_proj dtype (Q8_0) has a
 /// dispatch plan so the panic can't be reintroduced.
 #[test]
 fn confirmed_oproj_dtypes_have_a_plan() {
@@ -365,7 +358,6 @@ fn confirmed_oproj_dtypes_have_a_plan() {
         HFQ6G256,
         MQ3G256Lloyd,
         MQ4G256Lloyd,
-        ParoQ4G128,
         MFP4G32,
         Q4K,
     ];
@@ -379,7 +371,7 @@ fn confirmed_oproj_dtypes_have_a_plan() {
             no_fused
         );
     }
-    for d in [Q8_0, ParoQ4G128] {
+    for d in [Q8_0] {
         assert!(
             has_dispatch_plan(Role::Residual, d),
             "Role::Residual / {:?} has no dispatch plan — the o_proj panic would return",
@@ -391,7 +383,7 @@ fn confirmed_oproj_dtypes_have_a_plan() {
 /// LAYER 1d — MoE CPU-top-K fallback coverage (catches the #393 regression).
 /// `run_moe_decode`'s GPU-top-K fast path only serves `k == 8` MoE layers whose
 /// routed experts are indexable — today `{MQ4G256, MQ4G256V2, MQ6G256,
-/// MQ6G256V2, ParoQ4G128, …}`. Every OTHER MoE layer (`k != 8`, or a routed
+/// MQ6G256V2, …}`. Every OTHER MoE layer (`k != 8`, or a routed
 /// dtype like Q8_0) MUST take the generic CPU-top-K per-expert fallback —
 /// #393 deleted that fallback so those layers hit
 /// `UnsupportedVariant{cpu-topk-fallback}` and HARD-PANIC on decode.
@@ -466,7 +458,6 @@ fn non_k8_and_q8_routed_moe_has_a_dispatch_plan() {
             routed_gate_up: u.routed_gate_up,
             routed_down: u.routed_down,
             routed_has_mixed_experts: false,
-            has_paro_shared: false,
             per_expert_gate_up: None,
             per_expert_down: None,
         };
@@ -528,7 +519,6 @@ fn moe_decode_pre_guard_admits_fallback_and_rejects_invalid() {
         routed_gate_up: MQ4G256,
         routed_down: MQ4G256,
         routed_has_mixed_experts: false,
-        has_paro_shared: false,
         per_expert_gate_up: None,
         per_expert_down: None,
     };
@@ -582,49 +572,12 @@ fn moe_decode_pre_guard_admits_fallback_and_rejects_invalid() {
     );
 }
 
-/// #651: ParoQ4G64 (40-byte groups, 64-channel Givens blocks) and ParoQ4G128
-/// (72-byte groups, 128-channel blocks) must never share a GEMV route, in
-/// either direction, while keeping the same Givens-then-plain-GEMV contract.
-#[test]
-fn paro_g64_and_g128_never_share_a_route() {
-    use crate::families::gemv::GemvFamily;
-    let fam = GemvFamily::new();
-    let ctx = DispatchCtx::for_test("gfx1151");
-    for (dtype, key, group, row) in [
-        (ParoQ4G64, KernelKey::GemvParoQ4G64, 64, 40),
-        (ParoQ4G128, KernelKey::GemvParoQ4G128, 128, 72),
-    ] {
-        assert_eq!(
-            KernelKey::for_gemv(dtype, GemvVariant::Plain, false).unwrap(),
-            key
-        );
-        // Prerotated (decode QKV/FFN) and Plain must land on the same kernel.
-        assert_eq!(KernelKey::for_gemv_prerotated(dtype).unwrap(), key);
-        assert_eq!(
-            fam.resolve(dtype, GemvVariant::Plain, false, &ctx, None)
-                .unwrap()
-                .key,
-            key
-        );
-        assert_eq!(dtype_rotation_plan(dtype), RotationPlan::Givens);
-        assert_eq!(dtype_post_rotation_variant(dtype), GemvVariant::Plain);
-        assert_eq!(dtype.paro_group_size(), Some(group));
-        assert_eq!(dtype.row_bytes(group), Some(row));
-    }
-    assert_ne!(KernelKey::GemvParoQ4G64, KernelKey::GemvParoQ4G128);
-    // No fused residual twin: both take the plain GEMV + add fallback.
-    assert!(KernelKey::for_gemv_residual(ParoQ4G64).is_err());
-    assert!(has_dispatch_plan(Role::Residual, ParoQ4G64));
-    // Only the G128 dtype is admitted into the G128-only MoE tier list.
-    assert!(!crate::families::moe::MIXED_SUPPORTED_TIERS.contains(&ParoQ4G64));
-}
-
-/// LAYER 1c — Q8/Paro were gapped in MULTIPLE GEMV variants: o_proj used Residual,
+/// LAYER 1c — Q8 was gapped in MULTIPLE GEMV variants: o_proj used Residual,
 /// then the FFN/qkv used Prerotated (the second panic domino). Lock every variant
-/// these dtypes are actually dispatched through.
+/// this dtype is actually dispatched through.
 #[test]
-fn q8_and_paro_dispatchable_in_all_used_variants() {
-    for d in [Q8_0, ParoQ4G128] {
+fn q8_dispatchable_in_all_used_variants() {
+    for d in [Q8_0] {
         assert!(
             KernelKey::for_gemv(d, GemvVariant::Plain, false).is_ok(),
             "{:?}: plain GEMV missing (lm_head / direct GEMV panics)",
@@ -1130,20 +1083,6 @@ fn fused_qkv_keys_resolve_on_fleet_archs() {
             key: KernelKey::FusedQkvzaHfq3G256,
             archs: ALL,
         },
-        // ── HasDp4a (gfx906 v_dot4_i32_i8) kernels ──
-        // Paro fused: Always-gated (generic wave32 kernels, no ISA intrinsics)
-        FusedKeyUse {
-            key: KernelKey::FusedQkvzaParo4G128T,
-            archs: ALL,
-        },
-        FusedKeyUse {
-            key: KernelKey::FusedQkvParo4G128T,
-            archs: ALL,
-        },
-        FusedKeyUse {
-            key: KernelKey::FusedGateUpParo4G128T,
-            archs: ALL,
-        },
         // ── Exact verify fused (MQ4G256V2, singleton F16-WMMA chain): explicit
         //    key only, IsGfx1201-gated; fail-closed elsewhere is pinned by
         //    mq4v2_verify_exact_keys_resolve_on_gfx1201_only. ──
@@ -1485,7 +1424,6 @@ fn moe_dtypes_uniform(gate_up: DType, down: DType) -> MoeDtypes<'static> {
         routed_gate_up: gate_up,
         routed_down: down,
         routed_has_mixed_experts: false,
-        has_paro_shared: false,
         per_expert_gate_up: None,
         per_expert_down: None,
     }
@@ -1845,7 +1783,7 @@ fn mqv2_mixed_routes_have_exact_tags_and_admission() {
     }
 
     // MIXED_SUPPORTED_TIERS must list exactly the dtypes mixed kernels consume.
-    for dt in [MQ4G256, MQ6G256, ParoQ4G128, MQ4G256V2, MQ6G256V2] {
+    for dt in [MQ4G256, MQ6G256, MQ4G256V2, MQ6G256V2] {
         if !MIXED_SUPPORTED_TIERS.contains(&dt) {
             failures.push(format!(
                 "  MIXED_SUPPORTED_TIERS missing {:?} (mixed branches consume it)",
@@ -1853,9 +1791,9 @@ fn mqv2_mixed_routes_have_exact_tags_and_admission() {
             ));
         }
     }
-    if MIXED_SUPPORTED_TIERS.len() != 5 {
+    if MIXED_SUPPORTED_TIERS.len() != 4 {
         failures.push(format!(
-            "  MIXED_SUPPORTED_TIERS len={} want 5 (no MQ2/3/5V2 widen)",
+            "  MIXED_SUPPORTED_TIERS len={} want 4 (no MQ2/3/5V2 widen)",
             MIXED_SUPPORTED_TIERS.len()
         ));
     }

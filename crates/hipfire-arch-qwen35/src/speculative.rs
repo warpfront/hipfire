@@ -99,7 +99,6 @@ fn run_spec_gemm_key(
         m,
         k,
         row_stride: k,
-        rotation: None,
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,

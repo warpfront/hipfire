@@ -129,7 +129,6 @@ pub fn qwen35_policy_for_native(
     if !auto_native_eligible && matches!(mode_raw.trim(), "" | "auto") {
         selected.accepted = match policy.site {
             "qwen35-hfq" => &[Q8, Asym2, Asym3, Asym4, Fwht2, Fwht3, Fwht4],
-            "qwen35-paro" => &[Q8, Asym2, Asym4, Fwht2, Fwht3, Fwht4],
             _ => policy.accepted,
         };
     }
@@ -295,13 +294,8 @@ fn is_fwht_k(k: KvMode) -> bool {
 /// Qwen `""`|`auto` pair before axis overrides.
 ///
 /// Shipped default is Q8/Q8 except eligible exact gfx1201, which uses native
-/// FP8. The kill switch restores historical HFQ/PaRo FWHT3/Q8 selection.
-fn qwen_auto_default_pair(
-    mode_raw: &str,
-    policy: &KvModePolicy,
-    arch: &str,
-    qwen_default_q8: bool,
-) -> KvPair {
+/// FP8. The kill switch restores historical HFQ FWHT3/Q8 selection.
+fn qwen_auto_default_pair(policy: &KvModePolicy, arch: &str, qwen_default_q8: bool) -> KvPair {
     if arch == "gfx1201" && policy.accepted.contains(&Fp8) {
         return KvPair::Native(Fp8);
     }
@@ -310,7 +304,6 @@ fn qwen_auto_default_pair(
     }
     match policy.site {
         "qwen35-hfq" => KvPair::Split(Fwht3, VMode::Q8),
-        "qwen35-paro" if !mode_raw.trim().is_empty() => KvPair::Split(Fwht3, VMode::Q8),
         _ => KvPair::Split(Q8, VMode::Q8),
     }
 }
@@ -355,7 +348,7 @@ pub fn resolve_kv_pair(
     let k_axis = authored_axis(k_raw);
     let v_axis = authored_axis(v_raw);
     let initial = if is_auto {
-        qwen_auto_default_pair(mode_trim, policy, arch, qwen_default_q8)
+        qwen_auto_default_pair(policy, arch, qwen_default_q8)
     } else {
         match mode_trim {
             "fp8" => KvPair::Native(Fp8),
@@ -431,16 +424,7 @@ pub const QWEN35_HFQ_POLICY: KvModePolicy = KvModePolicy {
     default: Q8,
 };
 
-/// Site 2 — qwen35 PaRo loader. `Asym3` absent from `accepted` (no bare
-/// legacy-asym3 constructor arm). `asym3`/`turbo3` parse to `Fwht3` (accepted).
-pub const QWEN35_PARO_POLICY: KvModePolicy = KvModePolicy {
-    site: "qwen35-paro",
-    normalize_alias: normalize_qwen,
-    accepted: &[Q8, Asym2, Asym4, Fwht2, Fwht3, Fwht4, Fp8, Bf16],
-    default: Q8,
-};
-
-/// Site 3 — Dir/safetensors llama/qwen3 PaRo (flat). FWHT has no Flat
+/// Site 3 — llama/qwen3 flat constructors. FWHT has no Flat
 /// constructor: only Q8 + legacy Asym3/Asym4. Shared name table still applies
 /// (`legacy-asymN` → AsymN; bare `asymN`/`turboN` → FwhtN → rejected by pair path).
 pub const DIR_SAFETENSORS_POLICY: KvModePolicy = KvModePolicy {
@@ -771,7 +755,6 @@ mod tests {
     fn qwen_auto_q8_default_off_gfx1201_fp8_on_eligible() {
         for p in [
             &QWEN35_HFQ_POLICY,
-            &QWEN35_PARO_POLICY,
             &QWEN35_PP_POLICY,
             &DIR_SAFETENSORS_POLICY,
         ] {
@@ -790,7 +773,7 @@ mod tests {
             }
         }
         // Eligible exact gfx1201 + Fp8 in accepted → native FP8
-        for p in [&QWEN35_HFQ_POLICY, &QWEN35_PARO_POLICY] {
+        for p in [&QWEN35_HFQ_POLICY] {
             for raw in ["", "auto"] {
                 let (k, v) = pair(raw, None, None, p, "gfx1201", true).unwrap();
                 assert_eq!((k, v), (Fp8, None), "site={} raw={raw}", p.site);
@@ -864,7 +847,7 @@ mod tests {
 
     #[test]
     fn mismatched_qwen_geometry_auto_is_q8_but_explicit_native_is_preserved() {
-        for base in [&QWEN35_HFQ_POLICY, &QWEN35_PARO_POLICY] {
+        for base in [&QWEN35_HFQ_POLICY] {
             let eligible = qwen35_native_auto_eligible("gfx1201", 24, 4, 256, 1, false, false);
             let small = qwen35_native_auto_eligible("gfx1201", 8, 2, 256, 1, false, false);
             assert!(eligible);
@@ -1047,17 +1030,12 @@ mod tests {
     }
 
     #[test]
-    fn kill_switch_restores_hfq_paro_historical_auto() {
+    fn kill_switch_restores_hfq_historical_auto() {
         // HFQ: both "" and auto → Fwht3 off gfx1201 when kill switch off
         for raw in ["", "auto"] {
             let (k, v) = pair(raw, None, None, &QWEN35_HFQ_POLICY, "gfx1100", false).unwrap();
             assert_eq!((k, v), (Fwht3, Some(VMode::Q8)), "hfq raw={raw}");
         }
-        // PaRo: raw unset Q8; auto FWHT3
-        let (k, v) = pair("", None, None, &QWEN35_PARO_POLICY, "gfx1100", false).unwrap();
-        assert_eq!((k, v), (Q8, Some(VMode::Q8)));
-        let (k, v) = pair("auto", None, None, &QWEN35_PARO_POLICY, "gfx1100", false).unwrap();
-        assert_eq!((k, v), (Fwht3, Some(VMode::Q8)));
         // PP/Dir stay Q8 under kill switch
         for p in [&QWEN35_PP_POLICY, &DIR_SAFETENSORS_POLICY] {
             let (k, v) = pair("auto", None, None, p, "gfx1100", false).unwrap();
@@ -1088,7 +1066,6 @@ mod tests {
         ];
         for p in [
             &QWEN35_HFQ_POLICY,
-            &QWEN35_PARO_POLICY,
             &QWEN35_PP_POLICY,
             &DIR_SAFETENSORS_POLICY,
         ] {
@@ -1106,16 +1083,7 @@ mod tests {
     }
 
     #[test]
-    fn paro_rejects_legacy_asym3_hfq_accepts() {
-        assert!(pair(
-            "legacy-asym3",
-            None,
-            None,
-            &QWEN35_PARO_POLICY,
-            "gfx1100",
-            true
-        )
-        .is_err());
+    fn hfq_accepts_legacy_asym3() {
         let (k, _) = pair(
             "legacy-asym3",
             None,
@@ -1126,9 +1094,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(k, Asym3);
-        // bare asym3 is Fwht3 — accepted on PaRo
-        let (k, _) = pair("asym3", None, None, &QWEN35_PARO_POLICY, "gfx1100", true).unwrap();
-        assert_eq!(k, Fwht3);
     }
 
     #[test]
@@ -1294,8 +1259,6 @@ mod tests {
         // explicit native alone ok when accepted
         let (k, v) = pair("fp8", None, None, &QWEN35_HFQ_POLICY, "gfx1100", true).unwrap();
         assert_eq!((k, v), (Fp8, None));
-        let (k, v) = pair("bf16", None, None, &QWEN35_PARO_POLICY, "gfx1100", true).unwrap();
-        assert_eq!((k, v), (Bf16, None));
         // explicit native on PP (no Fp8/Bf16 accepted) → error
         assert!(pair("fp8", None, None, &QWEN35_PP_POLICY, "gfx1201", true).is_err());
         assert!(pair("bf16", None, None, &DIR_SAFETENSORS_POLICY, "gfx1100", true).is_err());
@@ -1489,7 +1452,6 @@ mod tests {
         // multi-GPU sites) instead of failing the load.
         for p in [
             &QWEN35_HFQ_POLICY,
-            &QWEN35_PARO_POLICY,
             &QWEN35_PP_POLICY,
             &QWEN35_TP_POLICY,
             &DIR_SAFETENSORS_POLICY,
@@ -1697,10 +1659,5 @@ mod tests {
         assert_eq!(resolve("auto", p).mode, Q8);
         assert_eq!(resolve("", p).mode, Q8);
         assert!(resolve("", p).warning.is_none());
-        // PaRo: legacy-asym3 unaccepted → default q8 + warn
-        let r = resolve("legacy-asym3", &QWEN35_PARO_POLICY);
-        assert_eq!(r.mode, Q8);
-        assert!(r.warning.is_some());
-        assert_eq!(resolve("asym3", &QWEN35_PARO_POLICY).mode, Fwht3);
     }
 }

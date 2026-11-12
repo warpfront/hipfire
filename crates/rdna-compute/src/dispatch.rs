@@ -944,16 +944,8 @@ pub enum DType {
     TQ2G128,  // ternary Bonsai-27B: 34 bytes per 128 elements (flat 2-bit ternary, group 128)
     // Phase 4: ternary kernels wire GPU decode/dispatch; this Task 7 slice is
     // CPU-foundation only (variant + byte-size + RawCodec load mapping).
-    BQ1G128,    // binary Bonsai-27B: 18 bytes per 128 elements (flat 1-bit sign, group 128)
-    HFQ6G256,   // 200 bytes per 256 elements (6-bit, f32 scale+zero)
-    ParoQ4G128, // ParoQuant: AWQ-packed INT4 G128 repacked to HFQ4G128 layout at load.
-    // Weights are standard HFQ4G128 (72 bytes/group); the ParoQuant distinction
-    // is that weight_gemv applies Givens rotation to activations before GEMV.
-    // Rotation metadata (pairs, theta, channel_scales) lives on WeightTensor::paro.
-    ParoQ4G64, // ParoQuant group_size=64 twin of ParoQ4G128: HFQ4-G64 layout, 40 bytes per
-    // 64 elements (f32 scale + f32 zero + 32 B nibbles), Givens rotation in 64-channel
-    // blocks. A distinct dtype so a G64 tensor can never reach a G128 kernel (or the
-    // reverse); `paro_group_size` is the one place either width is read from.
+    BQ1G128,  // binary Bonsai-27B: 18 bytes per 128 elements (flat 1-bit sign, group 128)
+    HFQ6G256, // 200 bytes per 256 elements (6-bit, f32 scale+zero)
     /// OCP FP8 E4M3 (e4m3fn) with 128x128 block scales (qt=55 `FP8E4M3B128`).
     /// Tensor logical shape `[E, R, K]` (E=1 allowed). Payload is E consecutive
     /// expert blocks of stride [`crate::fp8_e4m3::b128_block_stride`]: `codes u8[R*K]`
@@ -1079,8 +1071,6 @@ impl DType {
             | DType::MFP3G32E8
             | DType::MFP2G32E8
             | DType::MFP4G32E8G128
-            | DType::ParoQ4G128
-            | DType::ParoQ4G64
             | DType::Raw
             | DType::MQ3I4G128R256
             | DType::MQ3I4G128R128
@@ -1126,9 +1116,6 @@ impl DType {
             DType::MQ2G256 | DType::MQ2G256Lloyd | DType::MQ2G256V2 => grouped(256, 72),
             DType::MQ3G256Lloyd => grouped(256, 112),
             DType::MQ4G256Lloyd => grouped(256, 160),
-            // HFQ4-G128 layout, see the variant.
-            DType::ParoQ4G128 => grouped(128, 72),
-            DType::ParoQ4G64 => grouped(64, 40),
             // E8 formats: a 16-byte row header, then per-32 blocks.
             DType::MFP4G32E8 => blocks.checked_mul(17)?.checked_add(16),
             DType::MFP3G32E8 => blocks.checked_mul(13)?.checked_add(16),
@@ -1155,17 +1142,6 @@ impl DType {
             | DType::E8PI4G128R128
             | DType::MQ4G256V2P
             | DType::MQ4G128V2P => None,
-            _ => None,
-        }
-    }
-
-    /// Paro group width: the HFQ4 group of the repacked weight and the Givens
-    /// block of its activation rotation (the two are the same in ParoQuant).
-    /// `None` for every non-Paro dtype.
-    pub fn paro_group_size(self) -> Option<usize> {
-        match self {
-            DType::ParoQ4G128 => Some(128),
-            DType::ParoQ4G64 => Some(64),
             _ => None,
         }
     }
@@ -3298,8 +3274,6 @@ impl Gpu {
                 ggml: Default::default(),
                 q8x_act: None,
                 mq6_fp8_x_rot: None,
-                paro_x_scratch: None,
-                paro_fused_scratch: None,
                 fp16_x_scratch: None,
                 fp16_x_scratch_bytes: 0,
                 lane_wmma_scratch: None,
@@ -10711,31 +10685,6 @@ impl Gpu {
     /// HFQ4-G128 GEMV: flat 4-bit with 128-weight groups.
     /// K must be multiple of 128.
 
-    /// ParoQuant Givens rotation: apply learned pairwise rotations + channel
-    /// scaling to activation vector x in-place. Called before GEMV on
-    /// ParoQ4G128 weights.
-    ///
-    /// x: [seq_len, hidden_dim] F16 (modified in place)
-    /// pairs: [krot, hidden_dim] I16
-    /// theta: [krot, hidden_dim/2] F16
-    /// channel_scales: [hidden_dim] F16
-
-    /// Out-of-place Givens rotation. Reads `x_in`, writes rotated
-    /// activations to `x_out`. Replaces the
-    /// `copy_d2d + givens_rotate` pair used by `rotate_x_paro_for` —
-    /// one graph node + one inter-node dependency removed.
-    #[allow(clippy::too_many_arguments)]
-
-    /// Fused silu(gate)*up + per-channel scale + krot rounds of Givens
-    /// rotation. Single-launch replacement for the
-    /// `silu_mul_f32 + givens_rotate` pair used by the ParoQuant routed
-    /// gate→down hop. Same shared-memory + grid contract as
-    /// `givens_rotate`, plus two additional input pointers (gate, up)
-    /// and a separate output pointer.
-    #[allow(clippy::too_many_arguments)]
-
-    /// Ensure the ParoQuant activation scratch buffer is allocated (F32, sized for dim).
-
     /// Device-to-device copy.
     ///
     /// Routes through `memcpy_dtod_auto` so it picks `memcpy_dtod_async` on
@@ -10761,73 +10710,6 @@ impl Gpu {
         );
         self.memcpy_dtod_auto(&dst.buf, &src.buf, n_bytes)
     }
-
-    /// PARO4-G128 GEMV: ParoQuant pair-rotated activation + W4 weights.
-    /// K must be multiple of 128 and M must be a multiple of the AWQ pack size
-    /// (8). Each block computes one packed output column (8 output rows).
-
-    /// Residual PARO4-G128 GEMV: y += A(x) where x is pair-rotated per
-    /// ParoQuant metadata. One block computes one AWQ packed output column.
-
-    /// PARO4-G128 fused SwiGLU down projection: y += W * (silu(gate) * up).
-    /// Saves the standalone `silu_mul_f32` launch and ffn_hidden global write/read.
-
-    /// PARO4-G128T direct GEMV for tiny-M projections. This keeps the Paro
-    /// rotation inside the GEMV block instead of materializing x_rot globally.
-
-    /// Residual PARO4-G128T direct GEMV for tiny-M projections.
-
-    /// PARO4-G128 activation pre-rotation. This materializes the ParoQuant
-    /// channel-scale + pair-rotation transform once per projection so the
-    /// packed GEMV does not repeat it for every 8-output pack.
-
-    /// PARO4-G128 fused SwiGLU activation + Paro pre-rotation. This is the
-    /// useful fused shape for down projection: `x_rot = rotate(silu(gate)*up)`.
-
-    /// PARO4-G128T activation pre-rotation. Same math as PARO4-G128, but
-    /// theta is stored as precomputed f16 sin/cos pairs in the payload.
-
-    /// PARO4-G128T fused SwiGLU activation + Paro pre-rotation.
-
-    /// PARO4-G128 GEMV over an already materialized Paro-rotated activation.
-
-    /// Residual PARO4-G128 GEMV over an already materialized Paro-rotated
-    /// activation.
-
-    /// PARO4-G128T GEMV over an already materialized Paro-rotated activation.
-    /// The payload stores qweight as [M/8, K], making the inner-loop reads
-    /// contiguous for the GEMV access pattern.
-
-    /// Residual PARO4-G128T GEMV over an already materialized Paro-rotated
-    /// activation.
-
-    /// PARO4-G128T prerotated GEMV with four output lanes per block. This
-    /// duplicates qweight reads relative to the 8-lane pack but lowers
-    /// accumulator/register pressure for empirical Atlas testing.
-
-    /// Residual PARO4-G128T pack4 prerotated GEMV.
-
-    /// PARO4-G128T prerotated GEMV with two output lanes per block. This is
-    /// an Atlas probe for whether lower accumulator pressure beats duplicate
-    /// qweight traffic on the residual/down hot path.
-
-    /// Residual PARO4-G128T pack2 prerotated GEMV.
-
-    /// PARO4-G128T prerotated GEMV with one output lane per block.
-
-    /// Residual PARO4-G128T pack1 prerotated GEMV.
-
-    /// PARO4-G128 rotate-once wrapper used for env-gated runtime probes.
-
-    /// PARO4-G128 rotate-once residual wrapper used for env-gated runtime probes.
-
-    /// PARO4-G128 fused SwiGLU rotate-once down projection.
-
-    /// PARO4-G128T rotate-once wrapper for engine-tiled qweight payloads.
-
-    /// PARO4-G128T rotate-once residual wrapper for engine-tiled qweight payloads.
-
-    /// PARO4-G128T fused SwiGLU rotate-once down projection.
 
     // ═══════════════════════════════════════════════════════════════════════════
     // Registry precompilation (profiling)
@@ -11654,10 +11536,6 @@ mod tests {
         assert_eq!(DType::MQ4G128V2.row_bytes(640), Some(5 * 68));
         assert_eq!(DType::MQ4G128V2.row_bytes(129), Some(2 * 68));
         assert_eq!(DType::MQ6G256V2.row_bytes(2560), Some(10 * 200));
-        assert_eq!(DType::ParoQ4G128.row_bytes(128), Some(72));
-        // SmolLM2-360M: K=960 is 15 G64 groups; it is not a whole number of G128 groups.
-        assert_eq!(DType::ParoQ4G64.row_bytes(960), Some(15 * 40));
-        assert_eq!(DType::ParoQ4G64.row_bytes(64), Some(40));
         assert_eq!(DType::MFP4G32E8SOA.row_bytes(2560), Some(16 + 80 + 80 * 16));
         assert_eq!(DType::MFP4G32E8.row_bytes(4096), Some(2192));
         assert_eq!(DType::MFP4G32E8SOA.row_bytes(4096), Some(2192));

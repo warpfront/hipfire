@@ -137,7 +137,7 @@ fn a3b_lane_proj_enabled() -> bool {
 /// `[n][k]`): per row the singleton's `fused_qkvza_mq4g256v2` /
 /// `fused_qkv_mq4g256v2` bytes (`Gpu::gemv_mq4g256v2_lane_proj`). `false`
 /// (nothing launched) when the group is not admitted: switch off, a weight that
-/// is not plain MQ4G256V2 (AWQ, ParoQuant, other codecs), K != 2048, or a
+/// is not plain MQ4G256V2 (AWQ, other codecs), K != 2048, or a
 /// non-gfx1201 device; the caller then runs the `pm_xbatch` loop.
 fn lane_proj_group(
     gpu: &mut Gpu,
@@ -151,7 +151,7 @@ fn lane_proj_group(
     }
     let plain = ws
         .iter()
-        .all(|(w, _)| w.gpu_dtype == DType::MQ4G256V2 && w.paro.is_none() && w.awq_scale.is_none());
+        .all(|(w, _)| w.gpu_dtype == DType::MQ4G256V2 && w.awq_scale.is_none());
     let rows: Vec<usize> = ws.iter().map(|(w, _)| w.m).collect();
     if !plain
         || !ws.iter().all(|(w, _)| w.k == ws[0].0.k)
@@ -181,7 +181,7 @@ fn lane_proj_group(
 
 /// The certified A3B `.mq4rs` MoE layer: exact gfx1201, hidden 2048, 256
 /// experts top-8 with 512-wide routed and shared experts, MQ4G256V2
-/// attention/router/selector/shared projections (no AWQ, no Paro, no host
+/// attention/router/selector/shared projections (no AWQ, no host
 /// placement), routed gate_up MQ4G256V2 and down MQ4G128V2 resident (not
 /// paged / mixed-dtype / EP / CPU-deferred).
 fn a3b_moe_layer_admitted(
@@ -191,10 +191,7 @@ fn a3b_moe_layer_admitted(
     attn: &[&WeightTensor],
 ) -> bool {
     let v2 = |w: &WeightTensor| {
-        w.gpu_dtype == DType::MQ4G256V2
-            && w.awq_scale.is_none()
-            && w.paro.is_none()
-            && !gpu.host_located(&w.buf)
+        w.gpu_dtype == DType::MQ4G256V2 && w.awq_scale.is_none() && !gpu.host_located(&w.buf)
     };
     a3b_vmm_batch_enabled()
         && gpu.arch_caps.is_gfx1201()
@@ -219,7 +216,6 @@ fn a3b_moe_layer_admitted(
         && ffn.experts.len() == 256
         && ffn.expert_dtype_tags.is_none()
         && ffn.expert_down_awq_ptrs.is_none()
-        && ffn.paro_shared.is_none()
         && !ffn.cpu_deferred_experts
         && ffn.experts.iter().all(|e| {
             e.gate_up.gpu_dtype == DType::MQ4G256V2
@@ -675,7 +671,7 @@ fn a3b_lane_wo_enabled() -> bool {
 
 /// Batched residual projection `x_batch[r] += W · staged[r]` for every
 /// decode row: per column the singleton's `gemv_mq4g256v2_residual`. The A3B
-/// MoE layers' `wo` (MQ4G256V2, no AWQ / Paro) runs the lane-batched kernel
+/// MoE layers' `wo` (MQ4G256V2, no AWQ) runs the lane-batched kernel
 /// where its shape admission holds; every other residual (the dense models'
 /// `wo` / `w_down`) stays on the PM x-batch launch.
 fn batched_residual(
@@ -694,7 +690,6 @@ fn batched_residual(
         )
         && w.gpu_dtype == DType::MQ4G256V2
         && w.awq_scale.is_none()
-        && w.paro.is_none()
         && a3b_lane_wo_enabled();
     for (b0, nb) in xbatch_chunks(n) {
         let x = stage.sub_offset(b0 * w.k, nb * w.k);
@@ -1430,7 +1425,6 @@ pub(super) fn decode(
         && n >= 2
         && out.gpu_dtype == DType::MQ4G256V2
         && out.awq_scale.is_none()
-        && out.paro.is_none()
         && out.m == vocab
         && out.k == dim
         && gpu.head_lanes_admitted(vocab, dim, PM_XBATCH_MAX.min(n))

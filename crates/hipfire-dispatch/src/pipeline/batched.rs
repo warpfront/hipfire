@@ -119,7 +119,7 @@ pub struct BatchScratch<'a> {
     /// Small-arena scratch: the packed MQ4 routes need full-size planes.
     pub lean: bool,
     pub x_batch: &'a GpuTensor,
-    /// Un-rotated RMSNorm rows: the PARO Givens projections rotate from it.
+    /// Un-rotated RMSNorm rows.
     pub x_norm_batch: &'a GpuTensor,
     pub x_rot_batch: &'a GpuTensor,
     pub x_rot_f16_batch: &'a GpuTensor,
@@ -1509,7 +1509,6 @@ pub fn run_plain_gemm_key(
         m,
         k,
         row_stride: k,
-        rotation: None,
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
@@ -1560,7 +1559,6 @@ pub fn run_residual_gemm_key(
         m,
         k,
         row_stride: k,
-        rotation: None,
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
@@ -1669,7 +1667,6 @@ pub fn run_fused_gate_up_key(
         outputs: &[y_gate, y_up],
         m: &[gate_m, up_m],
         k,
-        rot_scratch: &[],
         batch_size: Some(n),
     };
     FUSED_QKV.run(&ctx, gpu, &params).map_err(hip_err)
@@ -1716,7 +1713,6 @@ pub fn run_fused_qkv_key(
         outputs: &[y_q, y_k, y_v],
         m: &[q_m, k_m, v_m],
         k,
-        rot_scratch: &[],
         batch_size: Some(n),
     };
     FUSED_QKV.run(&ctx, gpu, &params).map_err(hip_err)
@@ -1761,7 +1757,6 @@ pub fn run_fused_qkvza_key(
         outputs: &[y_qkv, y_z, y_beta, y_alpha],
         m: &[qkv_m, z_m, beta_m, alpha_m],
         k,
-        rot_scratch: &[],
         batch_size: Some(n),
     };
     FUSED_QKV.run(&ctx, gpu, &params).map_err(hip_err)

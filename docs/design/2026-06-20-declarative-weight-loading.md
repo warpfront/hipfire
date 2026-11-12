@@ -48,7 +48,7 @@ formats and across the ~8 arch crates.
 1. The **layer schema** is code, not data (names × shapes × slots).
 2. ~10% of loading is genuine **compute** that pure data can't express:
    dequant, FWHT rotation (MQ formats), transpose, fuse-QKV (3→1 buffer),
-   split-QKV (1→3), tied-lm_head aliasing, ParoQuant sidecar application.
+   split-QKV (1→3), tied-lm_head aliasing.
    These are the reason a naive "just a TOML manifest" approach stalls.
 3. There is **no GPU-free validation** — a mis-mapped tensor (wrong slot,
    wrong shape, missing→zero-defaulted) produces a *coherent-but-wrong*
@@ -83,7 +83,7 @@ Three layers, each independently shippable:
                                    ▼
   ┌─────────────────────────────────────────────────────────────┐
   │ Layer B: THUNK REGISTRY     HashMap<TransformId, dyn Thunk>  │
-  │   Dequant·Fwht·Transpose·FuseQKV·SplitQKV·AliasOf·Paro       │
+  │   Dequant·Fwht·Transpose·FuseQKV·SplitQKV·AliasOf            │
   │   → RoleMap (HashMap<RoleKey, WeightTensor>)                 │
   └───────────────────────────────┬─────────────────────────────┘
                                    │ impl From<RoleMap> for Qwen2Weights
@@ -159,7 +159,6 @@ pub enum TransformId {
     FuseQkv,                     // 3 inputs → 1 buffer
     SplitQkv { slot: u8 },       // 1 input → this slot of 3
     AliasOf(Role),               // view of an already-built buffer (tied lm_head)
-    ApplyParoSidecar,            // wraps load_paroquant_weight_from_source
 }
 
 /// One declarative tensor line-item.
@@ -195,7 +194,6 @@ pub struct Schema {
 | MoE 256 experts | `{e}` expansion of `ExpertGate/Up/Down` line-items |
 | Hybrid DeltaNet+attn | `layer_fragments(i, cfg)` returns different fragments |
 | Tied lm_head | `Output` line-item with `transform: AliasOf(TokenEmbd)` |
-| ParoQuant sidecar | `transform: ApplyParoSidecar` + sidecar siblings as inputs |
 | Vision tower | a `VisionFragment` appended to the model/layer schema |
 | Mixed precision per layer | `Dequant` reads `quant_type` from the file header |
 
@@ -233,7 +231,6 @@ Most thunk bodies are **lifted verbatim** from code that exists inline today:
 |---|---|---|
 | `Dequant` | `weight_backend::dequant_weight_raw` (`weight_backend.rs:441`) | ✅ real |
 | `RmsBake { bias }` | `weight_backend::dequant_norm` (`weight_backend.rs:988`) | ✅ real — see ⚠️1 |
-| `ApplyParoSidecar` | `hfq::load_paroquant_weight_from_source` (`hfq.rs:1006`) | ⚠️ 6-in/4-out, not 1-in — see ⚠️2 |
 | `Identity` | `gpu.upload_raw` / `upload_f32` | ✅ real |
 | `AliasOf` | the tied-lm_head re-alias branch in `qwen2::load_lm_head` | ⚠️ tri-state, not 2 — see ⚠️3 |
 | ~~`Fwht`~~ | ~~`fused_rmsnorm_rotate_for_mq`~~ | ❌ **WRONG — no load-time referent** |
@@ -252,9 +249,6 @@ Most thunk bodies are **lifted verbatim** from code that exists inline today:
 > - ⚠️1 the `(1+weight)` RMSNorm bake is a **mandatory per-arch transform on
 >   every norm slot** (`norm_bias` threaded into `dequant_norm`), resolving
 >   Open Question §9.1: yes, a dedicated `RmsBake` thunk.
-> - ⚠️2 ParoQuant reads **6 sibling tensors** and emits a `WeightTensor` plus
->   **3 sidecar GPU buffers**; the coverage validator must claim all 6 or
->   they read as "unclaimed."
 > - ⚠️3 lm_head resolution is **tri-state** (load `lm_head.weight` / alias
 >   embed / re-upload tied), gated on conditional presence + an embd-dtype
 >   alias-compatibility check — not the 2-state `AliasOf`.
@@ -420,11 +414,11 @@ uploads vs the pre-change path on a real checkpoint.
 - **Verify:** `cargo test` golden + refusal tests; coherence-gate.
 
 ### Step 4 — generalize thunks for the hard cases
-- Add `Fwht`, `Transpose`, `FuseQkv`, `SplitQkv`, `ApplyParoSidecar` (lifted
+- Add `Fwht`, `Transpose`, `FuseQkv`, `SplitQkv` (lifted
   verbatim from qwen35/llama inline code). Build the DAG + toposort +
   fixpoint sizing pass for `LikeSibling`.
 - Port `llama` (dense, no bias, optional fused QKV) as the second arch.
-- **Verify:** byte-diff + coherence-gate on a llama and a ParoQuant model.
+- **Verify:** byte-diff + coherence-gate on a llama model.
 
 ### Step 5 — port the remaining arches one at a time
 - Order by difficulty: `llama` → `minimax` → `lfm2moe` → `qwen35` (hybrid +

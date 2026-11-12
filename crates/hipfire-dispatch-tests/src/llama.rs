@@ -255,11 +255,7 @@ fn llama_fallback_to_llama_path_for_unknown_arch_ids() {
 fn llama_runtime_copy_admits_fewer_dtypes_than_qwen35_copy() {
     use hipfire_runtime::llama::is_batchable_la as runtime_is_batchable;
 
-    // The runtime copy does NOT admit ParoQ4G128, F32, or Lloyd variants.
-    assert!(
-        !runtime_is_batchable(DType::ParoQ4G128, "gfx1100"),
-        "runtime copy should NOT admit ParoQ4G128"
-    );
+    // The runtime copy does NOT admit F32 or Lloyd variants.
     assert!(
         !runtime_is_batchable(DType::F32, "gfx1100"),
         "runtime copy should NOT admit F32"

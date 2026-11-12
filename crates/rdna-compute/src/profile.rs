@@ -456,11 +456,6 @@ pub fn gemv_hfq4g128_bytes(m: usize, k: usize) -> usize {
     hfq4g128_weight_bytes(m, k) + k * 4 + m * 4
 }
 
-/// Bytes for a single-row HFQ4-G64 GEMV: weight + input vector + output vector.
-pub fn gemv_hfq4g64_bytes(m: usize, k: usize) -> usize {
-    hfq4_weight_bytes(m, k, 64) + k * 4 + m * 4
-}
-
 /// HFQ3-G256 weight footprint: 104 B per 256-element group (4 B scale +
 /// 4 B zero + 96 B packed 3-bit weights).
 pub fn hfq3g256_weight_bytes(m: usize, k: usize) -> usize {
@@ -471,24 +466,6 @@ pub fn hfq3g256_weight_bytes(m: usize, k: usize) -> usize {
 /// Bytes for a single-row HFQ3-G256 GEMV: weight + input vector + output vector.
 pub fn gemv_hfq3g256_bytes(m: usize, k: usize) -> usize {
     hfq3g256_weight_bytes(m, k) + k * 4 + m * 4
-}
-
-/// PARO4-G128T activation rotation with precomputed f32 sin/cos pairs.
-pub fn paro4g128t_rotate_bytes(_m: usize, k: usize) -> usize {
-    let pairs = 8 * k * 2;
-    let sincos = 8 * (k / 2) * 2 * 4;
-    let channel_scales = k * 2;
-    k * 4 + pairs + sincos + channel_scales + k * 4
-}
-
-/// PARO4-G128 GEMV after activation rotation has been materialized.
-pub fn gemv_paro4g128_prerotated_bytes(m: usize, k: usize) -> usize {
-    let groups = k / 128;
-    let m_pack = m / 8;
-    let qweight = k * m_pack * 4;
-    let qzeros = groups * m_pack * 4;
-    let scales = groups * m * 2;
-    qweight + qzeros + scales + k * 4 + m * 4
 }
 
 /// MQ3-Lloyd GEMV bytes: weight (112 B / group) + x + y.

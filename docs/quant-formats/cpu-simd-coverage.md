@@ -147,7 +147,7 @@ any runner.
   an int8-quantized activation, not a plain FWHT of f32), qt 21/24/32/33/35/36/37
   (HFP4/MFP4 family: per-row 16 B header + per-32 block scales — qt 34 `MFP4G32E8`
   is covered above), qt 28/29
-  (PARO4G128(-T), a Givens rotation on the *activation*), qt 38/39
+  (reserved; formerly PARO4G128/PARO4G128T, removed in 0.5.0), qt 38/39
   (`MQ{2,3}G256GL`, MoE-indexed only), qt 22 (`TidI32`, a routing table, not a
   weight), qt 42 (`MFP4G32E8G128`, qt 34 row layout with 128-wide rotation
   groups), qt 52 (`MQ4G256V2L`, codes index an external per-tensor

@@ -19,7 +19,6 @@ describes the math and wire contracts.
 | **HFQ** | none | INT asymmetric | G256 (G128 variants exist) | Dense Llama / Mistral / Gemma / plain Qwen |
 | **MQ (MagnumQuant)** | offline FWHT-256 | INT asymmetric (or Lloyd codebook) | G256 | Qwen 3.5+ hybrid path; FWHT baked into weights |
 | **HFP / MFP** | optional offline FWHT | OCP E2M1 FP4 | G32 rows | RDNA-oriented FP4; MFP = HFP + FWHT |
-| **PARO** | pairwise Givens | AWQ W4 | G128 or G64 (`ParoQ4G128` / `ParoQ4G64`, from `group_size`) | Imported ParoQuant/AWQ probe path |
 | **Q8F16** | none | INT8 + f16 scale | G32 | Embeddings, routers, precision-sensitive 2D |
 
 Production defaults for day-to-day use:
@@ -192,7 +191,7 @@ codebook, so their per-weight cost depends on K.
 | `MFP4G32` | 24 | 17 per 32 | 4.25 + 128 / K | **shipped / ref-pinned** drop-in MQ4-class FP4+FWHT |
 | `MFP4G32Lloyd` / `MFP4G32P` / `MFP4G32E8` / SoA / `MFP3G32E8` / `MFP2G32E8` | 32–37 | 17 / 17 / 17 / 17 / 13 / 9 per 32 | 4.25 / 4.25 / 4.25 / ≈4.25 / 3.25 / 2.25 (each + row overhead) | **shipped / ref-pinned** encoders + selective kernels; experimental opt-in qualifier; MoE cold-tier recipes — not CLI defaults. The SoA layout (qt 35) pads its scale block to 16 B per row |
 | `MFP4G32E8G128` | 42 | 17 per 32 | 4.25 + 128 / K | arch-loaded (Qwen4 expert load path): wire layout byte-identical to qt 34, but the encoder rotates in 128-wide segments (sign seeds 43 / 1043) because a 256-wide segment cannot tile K = 640; the rotation width is not in the bytes |
-| `PARO4G128` / `PARO4G128T` | 28 / 29 | Paro buffers | varies | **shipped / ref-pinned** load/probe path for ParoQuant imports |
+| reserved (formerly `PARO4G128` / `PARO4G128T`) | 28 / 29 | — | — | **reserved** — removed in 0.5.0; files carrying these ids are refused |
 | `MQ2G256V2` | 50 | 72 | 2.25 | **wire/runtime supported; product quality-rejected** — see V2 family section |
 
 **Historical quality note (not a live admission):** uniform MQ3/MQ2 local
@@ -213,10 +212,7 @@ lockstep (`crates/hipfire-runtime/src/llama.rs`,
 `crates/hipfire-arch-qwen35/src/qwen35.rs`).
 
 **Always batch-eligible (both owners):** `MQ4G256`, `HFQ4G256`, `MQ6G256`,
-`HFQ6G256`, `Q8_0`. (qwen35 also treats `ParoQ4G128` / `F32` as always-ok for
-the PARO probe path; llama admits `ParoQ4G64`, whose prefill rotates each
-projection's rows and runs `gemm_hfq4g64`, while llama `ParoQ4G128` stays
-per-token.)
+`HFQ6G256`, `Q8_0`. (qwen35 also treats `F32` as always-ok.)
 
 | DType | `llama::is_batchable_la` | `qwen35::is_batchable_la` |
 |---|---|---|
@@ -389,8 +385,8 @@ Source of truth: [`quant-formats/qt-register.txt`](quant-formats/qt-register.txt
 | 23 | *(reserved)* | Former HFP4G64 ablation slot — still reserved, not built |
 | 24 | MFP4G32 | HFP4 + offline FWHT — **shipped / ref-pinned** |
 | 25–27 | *(reserved)* | Former MX/NV/HFP8 interop slots — still reserved, not built |
-| 28 | PARO4G128 | ParoQuant native — **shipped / ref-pinned** load path |
-| 29 | PARO4G128T | Engine-tiled Paro — **reassigned** from former `MFP4G32R` online-R reservation |
+| 28 | reserved (formerly PARO4G128, removed in 0.5.0; files carrying this id are refused) | **reserved** |
+| 29 | reserved (formerly PARO4G128T, removed in 0.5.0; files carrying this id are refused) | **reserved** |
 | 30 | MQ4G256Lloyd | Research MQ Lloyd — **reassigned** (was 21 pre-renumber off HFP4) |
 | 31 | MQ5G256 | 5-bit MQ v1 — **shipped / ref-pinned** encoder |
 | 32–37 | MFP4Lloyd / MFP4P / E8 / SoA / MFP3E8 / MFP2E8 | **shipped / ref-pinned** encoders + selective kernels; experimental opt-in |
@@ -418,8 +414,8 @@ Source of truth: [`quant-formats/qt-register.txt`](quant-formats/qt-register.txt
 
 **Never-reuse reserved wire IDs:** 23 and 25–27 (deliberately unassigned). qt 54 is
 held in the register with disposition `reserved` for the Qwen4 I64 metadata
-record described above; it is not an encoded weight type. IDs **22, 29, and 30
-were reassigned** (TidI32, PARO4G128T, MQ4G256Lloyd). qt 42 and 53 are now live
+record described above; it is not an encoded weight type. IDs **22 and 30
+were reassigned** (TidI32, MQ4G256Lloyd); 28 and 29 are reserved (formerly PARO4G128/PARO4G128T, removed in 0.5.0; files carrying these ids are refused). qt 42 and 53 are now live
 rows (above); qt **43 and 46** have no register row (43 is burned by the retired
 SEL codebook, 46 is the design-only hierarchical `mq4_k`). Do not invent slots —
 edit `qt-register.txt` to claim a number.
@@ -551,30 +547,6 @@ E8P cells (K2, K1, stage) hold only while `SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDE
 per-arch artifact receipts flags gate the load only. W2 and gfx1100 W3 have no kernel. Stage
 defaults (gfx1201 always on and 2048 rows; narrow-link policy elsewhere; the gfx1100 8192-row
 narrow-link chunk) are `stage_policy` metadata read together with the measured link predicate.
-
-### PARO4G128 probe payload
-
-`quant_type=28` is **not** row-major HFQ4/MQ4. Each tensor stores ParoQuant
-buffers in order:
-
-```
-qweight        int32 [K, M/8]
-qzeros         int32 [K/128, M/8]
-scales         f16   [K/128, M]
-pairs          int16 [8, K]
-theta          f16   [8, K/2]
-channel_scales f16   [K]
-```
-
-Runtime contract:
-
-```
-x_rot = rotate(x, pairs, theta, channel_scales)
-y     = awq_w4_gemv(x_rot, qweight, qzeros, scales)
-```
-
-Verify imports with `python3 scripts/astrea.py paro-oracle --source PARO_SAFE_DIR
---hfq MODEL.hfq --module MODULE --pretty` before quality or perf claims.
 
 ## Why a custom format
 

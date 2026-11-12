@@ -62,8 +62,8 @@
 21  HFP4G32       passthrough
 22  TidI32        non-weight   index tensor (tid2eid), never a quantized weight
 24  MFP4G32       passthrough
-28  PARO4G128     arch-loaded  PARO family loads via hipfire-runtime/src/paro.rs, not the passthrough table
-29  PARO4G128T    arch-loaded  PARO family loads via hipfire-runtime/src/paro.rs, not the passthrough table
+28  reserved       reserved     formerly PARO4G128; removed in 0.5.0; files carrying this id are refused
+29  reserved       reserved     formerly PARO4G128T; removed in 0.5.0; files carrying this id are refused
 30  MQ4G256Lloyd  passthrough
 31  MQ5G256       arch-loaded  qwen35 load.rs owns the MQ5 upload path
 32  MFP4G32Lloyd  arch-loaded  qwen35 load.rs owns the MFP4-Lloyd upload path

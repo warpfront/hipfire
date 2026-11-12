@@ -104,7 +104,6 @@ Exactly one canonical owner (or explicit `BLOCKED`) per concern.
 | Published benchmark tables | [`docs/BENCHMARKS.md`](BENCHMARKS.md) | historical | Unmanifested / incomplete evidence identity on tables → historical only; not live floors or admissions. |
 | Dated perf campaign checkpoints | [`docs/perf-checkpoints/`](perf-checkpoints/) | measured | Immutable bodies; amend only via new dated files. |
 | Dependency adoption log | [`docs/dependency-adoption-log.md`](dependency-adoption-log.md) | historical | |
-| Upstream merge journal | [`docs/upstream-merge-journal.md`](upstream-merge-journal.md) | historical | |
 | DeepSeek4 PR body archive | [`docs/deepseek4-pr-body.md`](deepseek4-pr-body.md) | historical | |
 | Multi-GPU bring-up lessons | [`docs/multi-gpu-bringup-lessons.md`](multi-gpu-bringup-lessons.md) | historical | |
 | HFP4 format note | [`docs/quant-formats/hfp4.md`](quant-formats/hfp4.md) | shipped / ref-pinned | Current HFP4/MFP4 owners are shipped / ref-pinned; some reserved aliases remain planned. Broader quant authority stays `QUANTIZATION.md`. |
@@ -164,7 +163,6 @@ Every current top-level page, exactly once.
 | [`load-refusal-wording.md`](load-refusal-wording.md) | shipped / ref-pinned | Model-load refusal wording inventory. |
 | [`spec-decode-durability-2026-06-23.md`](spec-decode-durability-2026-06-23.md) | historical | Dated 2026-06-23 durability fixture/tables report. |
 | [`dependency-adoption-log.md`](dependency-adoption-log.md) | historical | Dependency log. |
-| [`upstream-merge-journal.md`](upstream-merge-journal.md) | historical | Merge journal. |
 | [`deepseek4-pr-body.md`](deepseek4-pr-body.md) | historical | PR body archive. |
 | [`multi-gpu-bringup-lessons.md`](multi-gpu-bringup-lessons.md) | historical | Bring-up narrative. |
 | [`GLOSSARY.md`](GLOSSARY.md) | shipped / ref-pinned | Named subsystems. |

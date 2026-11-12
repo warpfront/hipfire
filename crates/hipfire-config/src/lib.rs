@@ -2792,22 +2792,6 @@ pub static FIELDS: &[ConfigField] = &[
         "Override grouped MoE i8 dispatch."
     ),
     process_auto_bool_field!(
-        "kernel.moe_paro_i8",
-        "moe_paro_i8",
-        Kernel,
-        true,
-        "HIPFIRE_MOE_PARO_I8",
-        "Override architecture-selected Paro grouped-GEMM i8 dispatch."
-    ),
-    process_auto_bool_field!(
-        "kernel.moe_paro_i8_k8",
-        "moe_paro_i8_k8",
-        Kernel,
-        true,
-        "HIPFIRE_MOE_PARO_I8_K8",
-        "Override architecture-selected Paro grouped-GEMM i8 K8 dispatch."
-    ),
-    process_auto_bool_field!(
         "kernel.rdna3_hfq4_qkvza_k2048",
         "rdna3_hfq4_qkvza_k2048",
         Kernel,
@@ -4212,14 +4196,32 @@ pub struct RetiredConfigKey {
     pub replacement: &'static str,
 }
 
-pub static RETIRED_CONFIG_KEYS: &[RetiredConfigKey] = &[RetiredConfigKey {
-    key: "kernel.mw16",
-    legacy_key: "mw16",
-    shipped_in: "0.3.1",
-    removed_in: "0.4.1",
-    reason: "the MW16 GEMM experiment was removed",
-    replacement: "none; the default GEMM path applies",
-}];
+pub static RETIRED_CONFIG_KEYS: &[RetiredConfigKey] = &[
+    RetiredConfigKey {
+        key: "kernel.mw16",
+        legacy_key: "mw16",
+        shipped_in: "0.3.1",
+        removed_in: "0.4.1",
+        reason: "the MW16 GEMM experiment was removed",
+        replacement: "none; the default GEMM path applies",
+    },
+    RetiredConfigKey {
+        key: "kernel.moe_paro_i8",
+        legacy_key: "moe_paro_i8",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "ParoQuant was removed",
+        replacement: "none; ParoQuant models are no longer supported, use an MQ4 or HFQ4 model",
+    },
+    RetiredConfigKey {
+        key: "kernel.moe_paro_i8_k8",
+        legacy_key: "moe_paro_i8_k8",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "ParoQuant was removed",
+        replacement: "none; ParoQuant models are no longer supported, use an MQ4 or HFQ4 model",
+    },
+];
 
 pub fn retired_config_key(key: &str) -> Option<&'static RetiredConfigKey> {
     RETIRED_CONFIG_KEYS
@@ -9499,6 +9501,39 @@ overrides = { decide = { calibration = { choice = 1.3, score = 2, noul = 0.7 } }
             assert!(matches!(
                 ConfigLayer::default().set_cli("kernel.mw17", "true"),
                 Err(ConfigError::UnknownKey(_))
+            ));
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn removed_paro_keys_fail_the_load_naming_removal_and_replacement() {
+        for key in ["moe_paro_i8", "moe_paro_i8_k8"] {
+            let root = temp_root(&format!("retired-paro-{key}"));
+            fs::create_dir_all(&root).unwrap();
+            let paths = ConfigPaths::under(&root);
+            fs::write(
+                &paths.config_toml,
+                format!("schema_version = 1\n[kernel]\n{key} = true\n"),
+            )
+            .unwrap();
+            let err = load_global(&paths).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ConfigError::RetiredKey {
+                        removed_in: "0.5.0",
+                        ..
+                    }
+                ),
+                "{key}: {err:?}"
+            );
+            for needle in [key, "removed in 0.5.0", "ParoQuant", "replacement:"] {
+                assert!(err.to_string().contains(needle), "{key}: {err}");
+            }
+            assert!(matches!(
+                ConfigLayer::default().set_cli(&format!("kernel.{key}"), "true"),
+                Err(ConfigError::RetiredKey { .. })
             ));
             let _ = fs::remove_dir_all(root);
         }

@@ -26,10 +26,10 @@ Ship 4.2: qwen35 grouped-GEMM MoE prefill → `MoeFamily::run_prefill` (Step 8)
 |---|---|---|
 | Prefill byte-parity (hidden-state diff) | **PASS (dense)** | 27B dense model (`qwen3.6-27b.mq4`): pre-4.2 vs post-4.2 `.batched` hidden states are byte-identical (md5 `e647a43...`). MoE batched prefill: NOT exercised (A3B falls to per-token path). |
 | `probe_commits.sh` prefill tok/s ±1-3% | **PARTIAL** | gfx1151 only (no gfx1100/gfx1201). A3B prefill=256: 57.0 tok/s Path 2 (default), prefill=32: 60.5 tok/s Path 1 (force). JIT-included first runs; post-JIT numbers pending second-run methodology. |
-| `coherence-gate.sh --full` (A3B cells) | **PARTIAL** | Short gate passed. Full gate needs `qwen3.5-35b-a3b.mq4` (not present) and `qwen3.6-35b-a3b-paro.hfq` (not converted). A3B v3.6 tested manually: loads, clean decode. |
+| `coherence-gate.sh --full` (A3B cells) | **PARTIAL** | Short gate passed. Full gate needs `qwen3.5-35b-a3b.mq4` (not present). A3B v3.6 tested manually: loads, clean decode. |
 | Path-1 force-smoke | **PASS** | `HIPFIRE_MOE_GROUPED_GEMM=0` on gfx1151: clean, no panics. |
 | A3B MoE DFlash pinned fixture | SKIP | Draft `qwen36-35b-a3b-dflash-mq4.hfq` not present. Target at `/local/hipfire/qwen3.6-35b-a3b.mq4` (22.9 GB). |
-| Paro/MQ6 A3B fixtures | **PARTIAL** | PARO safetensors at `/local/models/z-lab/Qwen3.6-35B-A3B-PARO/` (20 GB, not converted). MQ6: root cause found — `qwen3.6-35b-a3b.mq4` has MQ6 FFN weights; gfx12-only grouped kernel blocks batched prefill on gfx1151. |
+| MQ6 A3B fixtures | **PARTIAL** | MQ6: root cause found — `qwen3.6-35b-a3b.mq4` has MQ6 FFN weights; gfx12-only grouped kernel blocks batched prefill on gfx1151. |
 
 ## Investigation: A3B batched prefill gap (2026-06-06)
 

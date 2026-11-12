@@ -22,7 +22,7 @@ use crate::families::attention::{AttentionFamily, AttnParams};
 use crate::families::gemv::WeightRef;
 use crate::families::kv_tier::{KvTierInputs, KvTierPlan};
 use crate::pipeline::steps::{execute_steps, GemvInput, Step};
-use crate::types::{dtype_rotation_plan, DispatchError, KernelKey, RotationPlan};
+use crate::types::{dtype_rotation_plan, DispatchError, KernelKey};
 use hip_bridge::DeviceBuffer;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::sync::LazyLock;
@@ -408,8 +408,7 @@ pub fn conv_qknorm(gpu: &Gpu, dims: &HybridDims, q8_state: bool) -> bool {
 /// RMS norm (plus the input basis the first weight needs) followed by one
 /// projection per `(weight, output)` pair sharing that normalized input. The
 /// fusion table rewrites the projections into fused qkv/qkvza/gate-up kernels.
-/// Givens (ParoQuant) weights take a plain norm and rotate per GEMV; every
-/// other format rotates once in the norm and the GEMVs read it prerotated.
+/// Every format rotates once in the norm and the GEMVs read it prerotated.
 #[allow(clippy::too_many_arguments)]
 pub fn normed_projection<const N: usize>(
     gpu: &mut Gpu,
@@ -446,7 +445,6 @@ pub fn normed_projection<const N: usize>(
             } else {
                 let plain_w = WeightRef {
                     row_stride: 0,
-                    rotation: None,
                     awq_scale: None,
                     ..*w
                 };
@@ -464,19 +462,13 @@ pub fn normed_projection<const N: usize>(
         return Ok(());
     }
     let rotation = dtype_rotation_plan(first.dtype);
-    let givens = rotation == RotationPlan::Givens;
     // The AWQ scale is consumed by the norm, never by the GEMV.
     let weights = projections.map(|(w, _)| WeightRef {
         row_stride: 0,
-        rotation: if givens { w.rotation } else { None },
         awq_scale: None,
         ..w
     });
-    let input = if givens {
-        GemvInput::Raw(normed)
-    } else {
-        GemvInput::Prerotated(normed)
-    };
+    let input = GemvInput::Prerotated(normed);
     let gemv = |i: usize| {
         let i = i.min(N - 1);
         Step::Gemv {
@@ -495,7 +487,7 @@ pub fn normed_projection<const N: usize>(
             awq_scale: first.awq_scale,
             k: first.k,
             eps,
-            rotation: if givens { RotationPlan::None } else { rotation },
+            rotation,
             rows: 1,
         },
         gemv(0),

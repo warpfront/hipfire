@@ -26,7 +26,7 @@
 //   - 32 threads × 4 elements per thread per group = 128 ✓
 //
 // Used by prefill_moe_ffn_body_batched's shared-expert down projection on
-// PARO checkpoints (DType::ParoQ4G128). The HFQ4-G256 sister kernel is
+// HFQ4G128 checkpoints (DType::HFQ4G128). The HFQ4-G256 sister kernel is
 // gemv_hfq4g256_residual_sigmoid_scaled_gpu_batched (kernels/src/
 // gemv_hfq4g256_residual_scaled.hip). Same epilogue, different group stride.
 __launch_bounds__(32, 20)

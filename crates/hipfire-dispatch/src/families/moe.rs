@@ -40,7 +40,7 @@ use rdna_compute::DType;
 use rdna_compute::{Gpu, GpuTensor};
 
 use crate::context::DispatchCtx;
-use crate::families::gemv::{GivensRef, WeightRef};
+use crate::families::gemv::WeightRef;
 use crate::pipeline::sealed_moe::PrefillRouteMode;
 use crate::tables::KernelRegistry;
 use crate::traits::KernelFamily;
@@ -920,13 +920,12 @@ fn softmax_shared_gate_mq4v2_layouts(layouts: [(DType, usize, usize, bool); 4]) 
 /// cannot be served by the mixed path and is rejected up front with a clear
 /// error rather than failing deep in the per-bucket dispatch.
 ///
-/// Includes V1 affine MQ4/MQ6, Paro, and the dual-half V2 layouts (qt44/qt47)
+/// Includes V1 affine MQ4/MQ6 and the dual-half V2 layouts (qt44/qt47)
 /// consumed by mixed kernel branch tags 7..18. V1/V2 must stay distinct —
 /// collapsing either pair silently corrupts scale/zero decode.
-pub const MIXED_SUPPORTED_TIERS: [DType; 5] = [
+pub const MIXED_SUPPORTED_TIERS: [DType; 4] = [
     DType::MQ4G256,
     DType::MQ6G256,
-    DType::ParoQ4G128,
     DType::MQ4G256V2,
     DType::MQ6G256V2,
 ];
@@ -941,7 +940,7 @@ pub const MIXED_SUPPORTED_TIERS: [DType; 5] = [
 pub struct MoeDtypes<'a> {
     pub router: DType,
     /// Optional shared-expert projection dtypes. `None` is a first-class
-    /// no-shared recipe, independent of `has_paro_shared`.
+    /// no-shared recipe.
     pub shared: Option<MoeSharedDtypes>,
     pub experts_all_gate_up_mq4: bool,
     pub routed_gate_up: DType, // ffn.experts[0].gate_up
@@ -951,7 +950,6 @@ pub struct MoeDtypes<'a> {
     /// or MQ3L or E8-family cold), so `routed_gate_up` / `routed_down`
     /// (= experts[0]) are NOT representative.
     pub routed_has_mixed_experts: bool,
-    pub has_paro_shared: bool, // ffn.paro_shared.is_some()
     /// Per-expert gate_up tiers for intra-layer mixed-tier dispatch.
     pub per_expert_gate_up: Option<&'a [DType]>,
     /// Per-expert down tiers (parallel to `per_expert_gate_up`).
@@ -992,7 +990,7 @@ impl MoeDtypes<'_> {
 
     /// The one narrow qwen35 qt53 routed-down typed fallback shape: uniform
     /// routed gate/up `MQ4G256V2` (qt44) + uniform routed down `MQ4G128V2`
-    /// (qt53), no mixed tiers or per-expert tag shape, no Paro, and qt53 (or
+    /// (qt53), no mixed tiers or per-expert tag shape, and qt53 (or
     /// any planar MQ-I4 / qt=55) nowhere else (router, shared selector,
     /// shared gate/up/down). Pure dtype shape only; tags and AWQ sidecars are
     /// not part of this snapshot and are refused by the pipeline stages.
@@ -1006,7 +1004,6 @@ impl MoeDtypes<'_> {
         self.routed_gate_up == DType::MQ4G256V2
             && self.routed_down == DType::MQ4G128V2
             && !self.routed_has_mixed_experts
-            && !self.has_paro_shared
             && uniform(self.per_expert_gate_up, DType::MQ4G256V2)
             && uniform(self.per_expert_down, DType::MQ4G128V2)
             && !qt53_or_mq_i4(self.router)
@@ -1061,7 +1058,6 @@ pub struct MoeResolution {
     /// (optionally AWQ) is weight-agnostic. Decode-only (prefill Path-0 on
     /// gfx9* has no MQ6 down arm; eval scores per-token = decode).
     pub routed_indexable_mixed_gu4_dn6: bool,
-    pub routed_indexable_paro: bool,
     /// Uniform all-MQ2-Lloyd routed experts (gate_up == down == MQ2G256Lloyd).
     /// Reuses the ds4/minimax indexed Lloyd MoE GEMVs on the decode GPU-top-K
     /// path: gate_up uses the MQ2-Lloyd indexed GEMV, down uses the MQ2-Lloyd
@@ -1147,7 +1143,6 @@ impl MoeResolution {
         // families consume the same FwhtG256 activation.
         let shared = d.shared;
         // A no-shared recipe cannot enter any shared/gate-quartet fusion.
-        // `has_paro_shared` remains independent metadata for routed Paro.
         let gate_fusable = shared.is_some_and(|shared| {
             d.router == MQ4G256
                 && shared.selector == MQ4G256
@@ -1176,7 +1171,6 @@ impl MoeResolution {
         let routed_gate_up_mq6 = d.routed_gate_up == MQ6G256;
         // qt47. FWHT-G256 dual-half header like qt44 — kernels read rotated x.
         let routed_gate_up_mq6v2 = d.routed_gate_up == MQ6G256V2;
-        let routed_gate_up_paro = d.routed_gate_up == ParoQ4G128 && d.has_paro_shared;
         let routed_gate_up_mq2lloyd = d.routed_gate_up == MQ2G256Lloyd;
         let routed_gate_up_mq3lloyd = d.routed_gate_up == MQ3G256Lloyd;
         // UNROTATED Lloyd sibling (qt=51). Same kernels, same byte layout —
@@ -1221,8 +1215,6 @@ impl MoeResolution {
         const CODEBOOK_INDEXABLE: [DType; 4] = [MQ2G256Lloyd, MQ3G256Lloyd, MQ2G256GL, MQ3G256GL];
         let routed_indexable_mixed_lloyd = CODEBOOK_INDEXABLE.contains(&d.routed_gate_up)
             && CODEBOOK_INDEXABLE.contains(&d.routed_down);
-        let routed_indexable_paro =
-            (d.routed_down == ParoQ4G128 && d.has_paro_shared) && routed_gate_up_paro;
         // Per-expert mixed: the model already verified the experts carry
         // different down dtypes and built the tag table (single source of
         // truth). gate_up stays uniform MQ4, so it pairs with the MQ4 indexed
@@ -1251,7 +1243,6 @@ impl MoeResolution {
             || routed_indexable_mq2lloyd_u
             || routed_indexable_mq3lloyd
             || routed_indexable_mixed_lloyd
-            || routed_indexable_paro
             || routed_indexable_e8
             || routed_indexable_qt53_f32;
 
@@ -1272,7 +1263,6 @@ impl MoeResolution {
             // `x_rot`, so the local rotation MUST be produced. Missing this is a
             // silent garbage-output failure (unrotated x into a rotated weight).
             || routed_gate_up_gl
-            || routed_gate_up_paro
             || routed_indexable_e8;
         // NOTE: `routed_gate_up_mq2lloyd_u` is DELIBERATELY ABSENT from the
         // chain above. MQ2G256LloydU is the unrotated sibling: its weights are
@@ -1311,7 +1301,6 @@ impl MoeResolution {
             routed_indexable_mq3lloyd,
             routed_indexable_mixed_lloyd,
             routed_indexable_mixed_per_expert,
-            routed_indexable_paro,
             use_gpu_topk,
             needs_x_rot_local,
             mixed,
@@ -1348,7 +1337,6 @@ impl MoeResolution {
             routed_indexable_mq3lloyd: false,
             routed_indexable_mixed_lloyd: false,
             routed_indexable_mixed_per_expert: false,
-            routed_indexable_paro: false,
             use_gpu_topk: false,
             needs_x_rot_local: false,
             mixed: false,
@@ -1389,7 +1377,6 @@ impl MoeResolution {
             || self.routed_indexable_mq2lloyd
             || self.routed_indexable_mq3lloyd
             || self.routed_indexable_mixed_lloyd
-            || self.routed_indexable_paro
             || self.routed_indexable_qt53_f32
     }
 }
@@ -1836,9 +1823,6 @@ pub struct MoeParams<'a> {
     /// CPU-top-K fallback (`!use_gpu_topk`). Empty under paged residency, where
     /// the indexed GPU-top-K path is the only supported mode.
     pub routed_experts: &'a dyn RoutedExpertWeights,
-    // paro sidecars
-    pub routed_gate_up_paro: Option<GivensRef<'a>>,
-    pub routed_down_paro: Option<GivensRef<'a>>,
     // scratch buffers
     pub router_logits: &'a GpuTensor,
     pub x_rot_local: &'a GpuTensor,
@@ -2056,7 +2040,7 @@ pub struct MoeStageTables<'a> {
 /// Parameters for the qwen35 batched/prefill MoE routed-expert block.
 ///
 /// Distinct from [`MoeBiasAwarePrefillParams`] — qwen35 uses softmax top-k
-/// routing (k=8) with MQ4/MQ6/Paro routed experts, a fused gate-side, and a
+/// routing (k=8) with MQ4/MQ6 routed experts, a fused gate-side, and a
 /// shared expert that seeds `x_batch` before this arm runs.
 ///
 /// The model owns RMSNorm, the router GEMV + softmax top-k (producing
@@ -2140,9 +2124,6 @@ pub struct MoePrefillParams<'a> {
     pub inverse_perm: &'a GpuTensor,
     pub y_gate_up_grouped: &'a GpuTensor,
     pub y_down_grouped: &'a GpuTensor,
-    // paro sidecars (per-layer shared Givens rotation tables)
-    pub paro_gate_up: Option<GivensRef<'a>>,
-    pub paro_down: Option<GivensRef<'a>>,
     /// AWQ scale for the routed down weight (experts[0].down.awq_scale).
     /// Used by the AWQ-aware silu+rotate step. `None` when the routed
     /// experts are non-AWQ (the common case for A3B).
@@ -2222,11 +2203,6 @@ impl MoePrefillDtypes {
 }
 
 #[inline]
-pub fn paro_batched_admit_enabled_from_env(value: Option<&str>) -> bool {
-    value == Some("1")
-}
-
-#[inline]
 pub fn moe_prefill_topk_shape_supported(k_top: usize, num_experts: usize) -> bool {
     moe_softmax_k8_router_top_k_supported(k_top) && num_experts <= FFN_ROUTER_MAX_EXPERTS
 }
@@ -2299,7 +2275,6 @@ pub fn mq6_batched_admit_enabled_from_env(value: Option<&str>, arch: &str) -> bo
 pub fn gated_moe_prefill_admissible_for_dtypes(
     dtypes: &MoePrefillDtypes,
     admit_mq6: bool,
-    admit_paro: bool,
     admit_e8: bool,
     admit_codebook: bool,
 ) -> bool {
@@ -2378,16 +2353,6 @@ pub fn gated_moe_prefill_admissible_for_dtypes(
         }
     }
 
-    if admit_paro
-        && dtypes.shared_expert_gate == DType::ParoQ4G128
-        && dtypes.shared_expert_up == DType::ParoQ4G128
-        && dtypes.shared_expert_down == DType::ParoQ4G128
-        && dtypes.expert_gate_up == DType::ParoQ4G128
-        && dtypes.expert_down == DType::ParoQ4G128
-    {
-        return true;
-    }
-
     // qwen35 qt53 routed-down typed fallback: uniform qt44 gate/up + uniform qt53
     // down. The shared expert stays an MQ4/MQ6 (G256) dense projection pair.
     if dtypes.expert_gate_up == DType::MQ4G256V2 && dtypes.expert_down == DType::MQ4G128V2 {
@@ -2448,13 +2413,8 @@ pub fn gated_moe_prefill_admissible(
         .ok()
         .as_deref()
         == Some("1");
-    let admit_paro = paro_batched_admit_enabled_from_env(
-        hipfire_config::developer_var("HIPFIRE_PARO_BATCHED")
-            .ok()
-            .as_deref(),
-    );
     let admit_codebook = codebook_batched_admit_enabled(arch);
-    gated_moe_prefill_admissible_for_dtypes(dtypes, admit_mq6, admit_paro, admit_e8, admit_codebook)
+    gated_moe_prefill_admissible_for_dtypes(dtypes, admit_mq6, admit_e8, admit_codebook)
 }
 
 /// Upper extent (rows) of the shared narrow-window width: the MTP verify
@@ -2777,7 +2737,7 @@ impl<'a> MoePrefillParams<'a> {
 /// Resolved dispatch plan for the qwen35 batched MoE prefill routed block.
 ///
 /// Distinct from [`MoeResolution`] (decode) — prefill adds the Path 0/1/2
-/// grouped-vs-scalar down selection and the Paro i8/k8 levers.
+/// grouped-vs-scalar down selection.
 /// Pure function of [`MoeDtypes`] + arch + [`FeatureFlags`].
 
 pub struct MoePrefillResolution {
@@ -2787,12 +2747,6 @@ pub struct MoePrefillResolution {
     /// Down uses atomic-accumulate GEMV (Path 0) instead of atomic-free
     /// expanded+combine (Path 1). gfx9* wave64 archs (gfx906/gfx908/gfx94x).
     pub down_path0: bool,
-    /// gfx1151 Paro i8 MMQ grouped GEMM (Path 2 only).
-    pub use_paro_i8: bool,
-    /// gfx1151 Paro i8 MMQ k8 grouped GEMM (Path 2 only).
-    pub use_paro_i8_k8: bool,
-    /// Routed experts use ParoQ4G128 (determines SwiGLU+rotate kernel selection).
-    pub paro_mode: bool,
     /// gfx1151's HFQ4 grouped-i8 path is correct for pure MQ4, but corrupts
     /// MQ6-promoted A3B MTP prefill when the same MoE layer mixes MQ4 and MQ6
     /// projections. Default mixed layers back to FP16 WMMA; explicit
@@ -2848,15 +2802,11 @@ impl MoePrefillResolution {
             return Self {
                 use_path2: false,
                 down_path0: false,
-                use_paro_i8: false,
-                use_paro_i8_k8: false,
-                paro_mode: false,
                 force_mq4_grouped_fp16: false,
                 fp8_b128_refused: true,
                 qt53_refused: false,
             };
         }
-        let paro_mode = d.routed_gate_up == DType::ParoQ4G128 && d.has_paro_shared;
         // Resident routed experts never take the narrow-verify route: only a
         // host-mapped verify window moves to Path 1.
         let narrow_verify =
@@ -2933,16 +2883,11 @@ impl MoePrefillResolution {
         // atomics make the atomic GEMV pattern competitive vs expanded scratch.
         let down_path0 = arch.is_gcn5() || arch.is_cdna1() || arch.is_cdna3();
         let is_gfx1151 = arch.is_gfx1151();
-        let use_paro_i8 = paro_mode && use_path2 && is_gfx1151 && flags.moe_paro_i8.unwrap_or(true);
-        let use_paro_i8_k8 = use_paro_i8 && flags.moe_paro_i8_k8.unwrap_or(true);
         let force_mq4_grouped_fp16 =
             use_path2 && is_gfx1151 && d.has_mq6_projection() && flags.moe_grouped_i8.is_none();
         Self {
             use_path2,
             down_path0,
-            use_paro_i8,
-            use_paro_i8_k8,
-            paro_mode,
             force_mq4_grouped_fp16,
             fp8_b128_refused: false,
             qt53_refused: d.qt53_routed_down_fallback() && down_path0 && !use_path2,
@@ -2956,9 +2901,6 @@ impl MoePrefillResolution {
         Self {
             use_path2: false,
             down_path0: false,
-            use_paro_i8: false,
-            use_paro_i8_k8: false,
-            paro_mode: false,
             force_mq4_grouped_fp16: false,
             fp8_b128_refused: false,
             qt53_refused: false,
@@ -3072,7 +3014,6 @@ mod tests {
             routed_gate_up: DType::MQ4G256,
             routed_down: DType::MQ4G256,
             routed_has_mixed_experts: false,
-            has_paro_shared: false,
             per_expert_gate_up: None,
             per_expert_down: None,
         }
@@ -3254,10 +3195,9 @@ mod tests {
         // them alongside the preserved V1 tiers. Exact membership — no MQ2/3/5V2.
         assert!(MIXED_SUPPORTED_TIERS.contains(&DType::MQ4G256));
         assert!(MIXED_SUPPORTED_TIERS.contains(&DType::MQ6G256));
-        assert!(MIXED_SUPPORTED_TIERS.contains(&DType::ParoQ4G128));
         assert!(MIXED_SUPPORTED_TIERS.contains(&DType::MQ4G256V2));
         assert!(MIXED_SUPPORTED_TIERS.contains(&DType::MQ6G256V2));
-        assert_eq!(MIXED_SUPPORTED_TIERS.len(), 5);
+        assert_eq!(MIXED_SUPPORTED_TIERS.len(), 4);
         assert!(!MIXED_SUPPORTED_TIERS.contains(&DType::MQ5G256V2));
         assert!(!MIXED_SUPPORTED_TIERS.contains(&DType::MQ2G256V2));
         assert!(!MIXED_SUPPORTED_TIERS.contains(&DType::MQ3G256V2));
@@ -3279,7 +3219,6 @@ mod tests {
         d.routed_gate_up = dtype;
         d.routed_down = dtype;
         d.experts_all_gate_up_mq4 = dtype == DType::MQ4G256;
-        d.has_paro_shared = dtype == DType::ParoQ4G128;
         let shared_dtype = match dtype {
             DType::MFP4G32E8 | DType::MFP3G32E8 | DType::MFP2G32E8 => DType::Q8_0,
             _ => dtype,
@@ -3293,15 +3232,12 @@ mod tests {
         d
     }
 
-    fn prefill_resolution_fields(r: &MoePrefillResolution) -> [bool; 8] {
+    fn prefill_resolution_fields(r: &MoePrefillResolution) -> [bool; 5] {
         // Exhaustive destructuring makes a new resolution field require an
         // explicit comparison here, without changing the production API.
         let MoePrefillResolution {
             use_path2,
             down_path0,
-            use_paro_i8,
-            use_paro_i8_k8,
-            paro_mode,
             force_mq4_grouped_fp16,
             fp8_b128_refused,
             qt53_refused,
@@ -3309,9 +3245,6 @@ mod tests {
         [
             *use_path2,
             *down_path0,
-            *use_paro_i8,
-            *use_paro_i8_k8,
-            *paro_mode,
             *force_mq4_grouped_fp16,
             *fp8_b128_refused,
             *qt53_refused,
@@ -3322,15 +3255,11 @@ mod tests {
         for arch_name in [
             "gfx1201", "gfx1200", "gfx1151", "gfx1100", "gfx1030", "gfx942",
         ] {
-            for flag_case in 0..4 {
+            for flag_case in 0..3 {
                 let mut flags = rdna_compute::feature_flags::FeatureFlags::for_test(arch_name);
                 match flag_case {
                     1 => flags.moe_grouped_gemm = false,
                     2 => flags.moe_grouped_i8 = Some(true),
-                    3 => {
-                        flags.moe_paro_i8 = Some(false);
-                        flags.moe_paro_i8_k8 = Some(false);
-                    }
                     _ => {}
                 }
                 let flags = std::sync::Arc::new(flags);
@@ -3366,7 +3295,6 @@ mod tests {
             DType::MFP4G32E8,
             DType::MFP3G32E8,
             DType::MFP2G32E8,
-            DType::ParoQ4G128,
         ] {
             assert_resident_verify_matches_legacy(&uniform_prefill_dtypes(dtype));
         }
@@ -3442,7 +3370,6 @@ mod tests {
                 DType::MFP4G32E8,
                 DType::MFP3G32E8,
                 DType::MFP2G32E8,
-                DType::ParoQ4G128,
             ] {
                 let d = uniform_prefill_dtypes(dtype);
                 let legacy = MoePrefillResolution::resolve(&d, &ctx.arch, &ctx.flags);
@@ -3459,13 +3386,7 @@ mod tests {
                     assert_eq!(
                         prefill_resolution_fields(&host),
                         [
-                            false,
-                            false,
-                            false,
-                            false,
-                            dtype == DType::ParoQ4G128,
-                            false,
-                            false,
+                            false, false, false, false,
                             false // qt53_refused: none of these dtypes is qt53
                         ],
                         "{arch_name}, {dtype:?}, batch={batch}",
@@ -3802,8 +3723,8 @@ mod tests {
                     );
                     assert_eq!(
                         prefill_resolution_fields(&r),
-                        // qwen35 qt53 routed-down typed fallback: eighth field is qt53_refused.
-                        [false, false, false, false, false, false, true, false],
+                        // qwen35 qt53 routed-down typed fallback: last field is qt53_refused.
+                        [false, false, false, true, false],
                         "{arch_name} batch={batch}",
                     );
                     assert!(fp8_b128_refusal(r.check_generic_route(None).unwrap_err()));
@@ -3967,10 +3888,6 @@ mod tests {
                 ..base
             },
             MoeDtypes {
-                has_paro_shared: true,
-                ..base
-            },
-            MoeDtypes {
                 router: DType::MQ4G128V2,
                 ..base
             },
@@ -4112,7 +4029,7 @@ mod tests {
             ..MoePrefillDtypes::uniform(DType::MQ4G256V2)
         };
         let admits = |d: &MoePrefillDtypes, mq6: bool| {
-            gated_moe_prefill_admissible_for_dtypes(d, mq6, false, false, false)
+            gated_moe_prefill_admissible_for_dtypes(d, mq6, false, false)
         };
         assert!(admits(&base, false) && admits(&base, true));
         assert!(!admits(

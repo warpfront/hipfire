@@ -131,18 +131,6 @@ fn herr(e: impl std::fmt::Display) -> hip_bridge::HipError {
     hip_bridge::HipError::new(0, &e.to_string())
 }
 
-/// Norm-step rotation and projection input for a group of projections that
-/// share one normed activation. A Givens (Paro) weight carries its own rotation
-/// sidecar, so no single rotated activation serves the group: the norm stays
-/// plain and every GEMV rotates its raw input (`GemvInput::Raw`).
-fn shared_input(rot: RotationPlan, x_rot: &GpuTensor) -> (RotationPlan, GemvInput<'_>) {
-    if rot == RotationPlan::Givens {
-        (RotationPlan::None, GemvInput::Raw(x_rot))
-    } else {
-        (rot, GemvInput::Prerotated(x_rot))
-    }
-}
-
 /// Shared dense-transformer decode forward for one token. Runs the per-layer op
 /// sequence; the caller does embedding (before) and final norm + lm_head +
 /// sampling (after), since those buffers/dtypes differ per arch.
@@ -152,8 +140,8 @@ pub fn dense_forward<A: DenseArch>(gpu: &mut Gpu, ctx: &DispatchCtx, arch: &A) -
 
     for l in 0..arch.n_layers() {
         let layer = arch.layer(l);
-        let (qkv_rot, qkv_in) = shared_input(layer.qkv_rot, s.x_rot);
-        let (ffn_rot, ffn_in) = shared_input(layer.ffn_rot, s.x_rot);
+        let (qkv_rot, qkv_in) = (layer.qkv_rot, GemvInput::Prerotated(s.x_rot));
+        let (ffn_rot, ffn_in) = (layer.ffn_rot, GemvInput::Prerotated(s.x_rot));
 
         // The attention block as one contiguous step list: QKV (fuses to
         // FusedQkv*), bias, qk-norm, RoPE — then, on the `Some` path, the

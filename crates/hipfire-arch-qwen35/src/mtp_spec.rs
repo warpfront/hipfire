@@ -1630,7 +1630,6 @@ fn mtp_verify_graph_eligible(
                     .map(|e| e.down.gpu_dtype)
                     .unwrap_or(DType::F32),
                 routed_has_mixed_experts: per_expert_gate_up.is_some() || per_expert_down.is_some(),
-                has_paro_shared: ffn.paro_shared.is_some(),
                 per_expert_gate_up,
                 per_expert_down,
             };
@@ -1680,7 +1679,7 @@ struct MtpVerifyGraphKey {
     /// Those pools are grow-never-shrink, so a moved (or newly zeroed) slot identifies
     /// growth or free — no contents hashed and no converted activation values cached
     /// here. Unused cells stay `0`.
-    scratch: [usize; 32],
+    scratch: [usize; 27],
 }
 
 /// Capture-identity key for the narrow MTP verify graph.
@@ -1724,7 +1723,7 @@ fn mtp_verify_graph_key(
             .s_matrices
             .first()
             .map_or(0, |t| t.buf.as_ptr() as usize),
-        scratch: [0usize; 32],
+        scratch: [0usize; 27],
     };
 
     // Global conversion/attention scratch pools (grow-never-shrink) in ScratchState
@@ -1736,35 +1735,27 @@ fn mtp_verify_graph_key(
     key.scratch[3] = tensor_ptr(&gpu.scratch.mq_signs2_128);
     key.scratch[4] = tensor_ptr(&gpu.scratch.mq_x_rot);
     key.scratch[5] = tensor_ptr(&gpu.scratch.gemv_residual_tmp);
-    key.scratch[6] = tensor_ptr(&gpu.scratch.paro_x_scratch);
-    key.scratch[7] = buffer_ptr(&gpu.scratch.gdn_pair_counters);
-    key.scratch[8] = tensor_ptr(&gpu.scratch.argmax_host);
-    key.scratch[9] = buffer_ptr(&gpu.scratch.mq_x_rot_fp8);
-    key.scratch[10] = buffer_ptr(&gpu.scratch.mq_x_q8);
-    key.scratch[11] = buffer_ptr(&gpu.scratch.mq_x_scales);
-    key.scratch[12] = buffer_ptr(&gpu.scratch.mq_rmsnorm_wavegrid_scratch);
-    key.scratch[13] = buffer_ptr(&gpu.scratch.fp16_x_scratch);
-    key.scratch[14] = buffer_ptr(&gpu.scratch.qsa_select_scores);
-    key.scratch[15] = buffer_ptr(&gpu.scratch.gdn_state_f32);
-    key.scratch[16] = buffer_ptr(&gpu.scratch.fp8_x_scratch);
-    key.scratch[17] = buffer_ptr(&gpu.scratch.q8_1_mmq_x_scratch);
-    key.scratch[18] = buffer_ptr(&gpu.scratch.int4_mmq_x_scratch);
-    key.scratch[19] = buffer_ptr(&gpu.scratch.int8_mmq_x_scratch);
-    key.scratch[20] = buffer_ptr(&gpu.scratch.mq4v2_fp8_x_scratch);
-    key.scratch[21] = buffer_ptr(&gpu.scratch.mq4v2_fp8_half_sums_scratch);
-    key.scratch[22] = buffer_ptr(&gpu.scratch.mq4v2_fp8_row_scales_scratch);
-    key.scratch[23] = buffer_ptr(&gpu.scratch.fp8_f2_weights);
-    key.scratch[24] = buffer_ptr(&gpu.scratch.ksplit_det_partials);
-    key.scratch[25] = buffer_ptr(&gpu.scratch.sample_partials);
-    key.scratch[26] = buffer_ptr(&gpu.scratch.fa2_q16_scratch);
-    key.scratch[27] = buffer_ptr(&gpu.scratch.fa2_fp8_q_scratch);
-
-    // paro_fused_scratch is an optional Vec of 4 tensor buffers (indices 0..3).
-    if let Some(bufs) = &gpu.scratch.paro_fused_scratch {
-        for (i, t) in bufs.iter().take(4).enumerate() {
-            key.scratch[28 + i] = t.buf.as_ptr() as usize;
-        }
-    }
+    key.scratch[6] = buffer_ptr(&gpu.scratch.gdn_pair_counters);
+    key.scratch[7] = tensor_ptr(&gpu.scratch.argmax_host);
+    key.scratch[8] = buffer_ptr(&gpu.scratch.mq_x_rot_fp8);
+    key.scratch[9] = buffer_ptr(&gpu.scratch.mq_x_q8);
+    key.scratch[10] = buffer_ptr(&gpu.scratch.mq_x_scales);
+    key.scratch[11] = buffer_ptr(&gpu.scratch.mq_rmsnorm_wavegrid_scratch);
+    key.scratch[12] = buffer_ptr(&gpu.scratch.fp16_x_scratch);
+    key.scratch[13] = buffer_ptr(&gpu.scratch.qsa_select_scores);
+    key.scratch[14] = buffer_ptr(&gpu.scratch.gdn_state_f32);
+    key.scratch[15] = buffer_ptr(&gpu.scratch.fp8_x_scratch);
+    key.scratch[16] = buffer_ptr(&gpu.scratch.q8_1_mmq_x_scratch);
+    key.scratch[17] = buffer_ptr(&gpu.scratch.int4_mmq_x_scratch);
+    key.scratch[18] = buffer_ptr(&gpu.scratch.int8_mmq_x_scratch);
+    key.scratch[19] = buffer_ptr(&gpu.scratch.mq4v2_fp8_x_scratch);
+    key.scratch[20] = buffer_ptr(&gpu.scratch.mq4v2_fp8_half_sums_scratch);
+    key.scratch[21] = buffer_ptr(&gpu.scratch.mq4v2_fp8_row_scales_scratch);
+    key.scratch[22] = buffer_ptr(&gpu.scratch.fp8_f2_weights);
+    key.scratch[23] = buffer_ptr(&gpu.scratch.ksplit_det_partials);
+    key.scratch[24] = buffer_ptr(&gpu.scratch.sample_partials);
+    key.scratch[25] = buffer_ptr(&gpu.scratch.fa2_q16_scratch);
+    key.scratch[26] = buffer_ptr(&gpu.scratch.fa2_fp8_q_scratch);
 
     key
 }

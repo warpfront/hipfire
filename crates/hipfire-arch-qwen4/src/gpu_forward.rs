@@ -1318,7 +1318,6 @@ pub(crate) fn dense_ref<'a>(
         m,
         k,
         row_stride: row_stride(tensor.dtype, k),
-        rotation: None,
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
@@ -7684,7 +7683,6 @@ pub(crate) fn seal_moe_decode<'a>(
             .map(|expert| expert.down.dtype.shipped_layout())
             .ok_or_else(|| invalid("MoE expert table is empty"))?,
         routed_has_mixed_experts: false,
-        has_paro_shared: false,
         per_expert_gate_up: None,
         per_expert_down: None,
     };
@@ -7746,8 +7744,6 @@ pub(crate) fn seal_moe_decode<'a>(
         routed_down_m: config.hidden_size,
         routed_down_k: config.moe_intermediate_size,
         routed_experts: runtime,
-        routed_gate_up_paro: None,
-        routed_down_paro: None,
         router_logits: scratch.router_logits,
         x_rot_local: scratch.x_rot_local,
         gate_up_buf: scratch.gate_up_buf,

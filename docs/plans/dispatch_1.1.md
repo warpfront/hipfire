@@ -134,7 +134,7 @@ the pipeline interpreter.
 5. Add GPU-free (arch × dtype) coverage golden in
    `hipfire-dispatch-tests` asserting the resolved `KernelKey` for QKVZA
    across (gfx1100, gfx1201) × (MQ4G256Lloyd, MQ3G256Lloyd, HFQ4G256,
-   MQ4G256, HFQ6G256, MQ6G256, ParoQ4G128, Q8_0). The QKVZA table
+   MQ4G256, HFQ6G256, MQ6G256, Q8_0). The QKVZA table
    entries gate on `HasWmmaW32` which already ORs gfx12
    (`tables/mod.rs:81`), so both arches should resolve correctly.
 
@@ -153,11 +153,6 @@ the pipeline interpreter.
    Builds `[RmsnormAutomatic, Gemv{wqkv}, Gemv{wz}, Gemv{w_beta}, Gemv{w_alpha}]`
    and calls `execute_steps`. All dtypes go through the same step slice:
    - MQ4/MQ3/MQ6/HFQ4/HFQ6: `FUSED_TABLE` matches QKVZA4 → fused kernel
-   - ParoQ4G128: no fused entry, interpreter falls through to per-op
-     `launch_op` → `GemvFamily::run_auto` (handles internal Givens
-     rotation). This is semantically identical to the current
-     `fused_qkvza_dispatch` Paro branch which calls `weight_gemv`
-     four times — same GPU launches, no regression.
    - Q8_0 / others: per-op fallback, same as unfused path
 
    **Rotation-tag contract** (must replicate identically from
@@ -180,7 +175,7 @@ the pipeline interpreter.
    - DeltaNetMoe site (L12754–12759)
 
 8. Delete `rmsnorm_rotate_dispatch` and `fused_qkvza_dispatch` functions
-   **in their entirety**. The ParoQ4G128 fallback inside
+   **in their entirety**. The per-dtype fallback inside
    `fused_qkvza_dispatch` (four bare `weight_gemv` calls) is subsumed
    by the interpreter's per-op fallback — no retention needed.
 
@@ -265,7 +260,6 @@ caller changes needed.
 |---|---|
 | `forward_prefill_chunk` batched GEMM migration | Ship 5 (GemmFamily) |
 | `forward_scratch_layers_multi` multi-GPU migration | Ship 5 |
-| ParoQ4G128 fused QKVZA entries | Ship 1.2 |
 | Q4K fused QKV entries | Ship 1.2 |
 | Q8_0 fused gate+up gap | Ship 1.2 |
 | `w_down` `Step::GemvSwigluResidual` variant | `dispatch_todo.md` (D-1) |

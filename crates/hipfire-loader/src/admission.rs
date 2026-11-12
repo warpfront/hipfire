@@ -2795,6 +2795,14 @@ pub fn admit_source_with_options(
         ..hints
     };
     let is_dir = source.is_dir();
+    // A Qwen3.5/3.6 (arch 5|6) safetensors directory has no loader left: its
+    // only one was the removed ParoQuant path. Refuse before any admission work.
+    if is_dir && matches!(arch_id, 5 | 6) {
+        return Err(format!(
+            "{path}: {}",
+            hipfire_runtime::hfq::REMOVED_SAFETENSORS_DIR_MSG
+        ));
+    }
 
     // Refuse before backend selection or sequence budgeting, even without VMM
     // runtime/platform support; only an explicit legacy request opts out.
@@ -3119,12 +3127,7 @@ pub fn admit_source_with_options(
     } else {
         false
     };
-    // A safetensors directory (ParoQuant) has no HFQ manifest to project from,
-    // and its carrier allocates KV at the admitted `max_seq` without a
-    // post-weight remeasure, so it keeps a fixed context (HIPF-34).
-    let dir_fixed_context = is_dir && matches!(arch_id, 5 | 6) && kv_backend == KvBackend::Vmm;
     let sequence = if matches!(arch_id, 5 | 6)
-        && !is_dir
         && topology == EffectiveTopology::Single
         && kv_backend == KvBackend::Vmm
         && !pinned_moe
@@ -3158,13 +3161,10 @@ pub fn admit_source_with_options(
         },
         |resolved| resolved.max_seq,
     );
-    let sequence_reason = match (max_seq, pinned_moe, dir_fixed_context) {
-        (0, true, _) => {
+    let sequence_reason = match (max_seq, pinned_moe) {
+        (0, true) => {
             Some("max_seq auto-capacity unsupported for MoE on a discrete GPU; using prior default")
         }
-        (0, _, true) => Some(
-            "max_seq auto-capacity unsupported for safetensors directory sources; using default",
-        ),
         _ => None,
     };
     let mut has_vision = probe_vision(&source, arch_id)?;
@@ -3219,8 +3219,6 @@ pub fn admit_source_with_options(
             &kv_mode::QWEN35_TP_POLICY
         } else if pp > 1 {
             &kv_mode::QWEN35_PP_POLICY
-        } else if is_dir {
-            &kv_mode::QWEN35_PARO_POLICY
         } else {
             &kv_mode::QWEN35_HFQ_POLICY
         };
@@ -3229,12 +3227,12 @@ pub fn admit_source_with_options(
             .unwrap_or(hipfire_runtime::config::get().kv_mode.as_str())
             .to_ascii_lowercase();
         let qwen_cfg = if matches!(arch_id, 5 | 6) {
+            let ModelSource::Hfq(h) = &source else {
+                return Err(hipfire_runtime::hfq::REMOVED_SAFETENSORS_DIR_MSG.to_string());
+            };
             Some(
-                match &source {
-                    ModelSource::Hfq(h) => hipfire_arch_qwen35::qwen35::config_from_hfq(h),
-                    ModelSource::Dir(d) => hipfire_arch_qwen35::qwen35::config_from_safetensors(d),
-                }
-                .map_err(|e| format!("Qwen KV admission config: {e}"))?,
+                hipfire_arch_qwen35::qwen35::config_from_hfq(h)
+                    .map_err(|e| format!("Qwen KV admission config: {e}"))?,
             )
         } else {
             None
@@ -5394,13 +5392,13 @@ mod tests {
             assert!(uma.sequence_reason.is_none());
             cleanup(&path);
         }
-        /// HIPF-34: a safetensors directory (ParoQuant) has no HFQ manifest to
-        /// project from and its carrier never remeasures post-weight VRAM, so
-        /// it keeps a fixed context under VMM KV instead of being refused.
+        /// A Qwen3.5/3.6 safetensors directory (arch 5|6) is refused at admission:
+        /// its only loader was the removed ParoQuant one, so no fixed-context
+        /// fallback exists any more.
         #[test]
-        fn safetensors_dir_skips_automatic_vmm_sizing() {
-            let dir =
-                std::env::temp_dir().join(format!("hipfire-paro-dir-admit-{}", std::process::id()));
+        fn qwen35_safetensors_dir_is_refused_as_removed() {
+            let dir = std::env::temp_dir()
+                .join(format!("hipfire-qwen35-dir-admit-{}", std::process::id()));
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(
                 dir.join("config.json"),
@@ -5434,15 +5432,15 @@ mod tests {
                     hints,
                 )
             };
-            let explicit = admit(4096).expect("Dir MoE with explicit max_seq must load");
-            assert_eq!(explicit.kv_backend, KvBackend::Vmm);
-            assert_eq!(explicit.max_seq, 4096);
-            assert!(explicit.sequence.is_none());
-            assert!(explicit.sequence_reason.is_none());
-            let omitted = admit(0).expect("Dir MoE without max_seq must load");
-            assert_eq!(omitted.max_seq, 4096);
-            assert!(omitted.sequence.is_none());
-            assert!(omitted.sequence_reason.is_some());
+            for max_seq in [4096, 0] {
+                let err = admit(max_seq)
+                    .err()
+                    .expect("a Qwen MoE safetensors dir must be refused");
+                assert!(
+                    err.contains("ParoQuant safetensors directories were removed in 0.5.0"),
+                    "{err}"
+                );
+            }
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
