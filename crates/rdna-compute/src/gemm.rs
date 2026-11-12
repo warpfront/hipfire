@@ -22933,6 +22933,14 @@ impl Gpu {
     /// all-zero: zero activations project to zero rows), run through the same consumer a complete
     /// tile takes, and only the live rows are copied back. `add` preloads the live rows of `y`
     /// into the private output first (ADD semantics); padded rows never reach `y`.
+    ///
+    /// All data movement is host-asynchronous on the active stream: one `memset_d32_async` zeroes
+    /// the private sidecar, one pitched copy (`[K/128]` rows of `r` records, source pitch `n`
+    /// records, destination pitch 128 records) fills the live records, `add` does one preload
+    /// copy, and one copy-back returns the live rows. The private output is NOT zeroed: padded
+    /// output rows `r..128` are never copied back, and each output column (token) of the GEMM
+    /// depends only on its own activation records and its own `y` element (SET writes, ADD reads
+    /// only its own element), so uninitialised padded rows cannot reach any live byte.
     #[allow(clippy::too_many_arguments)]
     fn gfx11_iu4_canonical_tail(
         &mut self,
@@ -22954,24 +22962,30 @@ impl Gpu {
         let tail_x = self.alloc_tensor(&[tail_x_elems], DType::F32)?;
         let tail_y = self.alloc_tensor(&[TILE * m], DType::F32)?;
         let result = (|| -> HipResult<()> {
-            self.hip.memset(&tail_x.buf, 0, tail_x.byte_size())?;
-            self.hip.memset(&tail_y.buf, 0, tail_y.byte_size())?;
-            for b in 0..kb {
-                // SAFETY: the sidecar scratch holds `kb * n` records of `RECORD` bytes
-                // (`int4_mmq_x_needed`); the view covers records `[b * n + n_full, b * n + n)`.
-                let src = unsafe {
-                    hip_bridge::DeviceBuffer::from_raw(
-                        (x_i4_ptr as *mut u8).add((b * n + n_full) * RECORD) as *mut c_void,
-                        r * RECORD,
-                    )
-                };
-                let dst = tail_x.buf.byte_view(b * TILE * RECORD, r * RECORD);
-                self.hip.memcpy_dtod(&dst, &src, r * RECORD)?;
-            }
+            let stream = self.active_stream.as_ref();
+            self.hip
+                .memset_d32_async(&tail_x.buf, 0, tail_x.byte_size() / 4, stream)?;
+            // SAFETY: the sidecar scratch holds `kb * n` records of `RECORD` bytes
+            // (`int4_mmq_x_needed`); the non-owning view covers all of it.
+            let src = unsafe { hip_bridge::DeviceBuffer::from_raw(x_i4_ptr, kb * n * RECORD) };
+            self.memcpy_dtod_2d_at_ordered_async(
+                &tail_x.buf,
+                0,
+                TILE * RECORD,
+                &src,
+                n_full * RECORD,
+                n * RECORD,
+                r * RECORD,
+                kb,
+            )?;
             if add {
-                let live = y.buf.byte_view(n_full * m * 4, r * m * 4);
-                let dst = tail_y.buf.byte_view(0, r * m * 4);
-                self.hip.memcpy_dtod(&dst, &live, r * m * 4)?;
+                self.memcpy_dtod_at_ordered_async(
+                    &tail_y.buf,
+                    0,
+                    &y.buf,
+                    n_full * m * 4,
+                    r * m * 4,
+                )?;
             }
             // A complete 128-column tile: the same consumer (and symmetric fold) a whole tile of
             // the bulk call runs.
@@ -22985,9 +22999,13 @@ impl Gpu {
                 add,
                 None,
             )?;
-            let live = tail_y.buf.byte_view(0, r * m * 4);
-            let dst = y.buf.byte_view(n_full * m * 4, r * m * 4);
-            self.hip.memcpy_dtod(&dst, &live, r * m * 4)
+            self.memcpy_dtod_at_ordered_async(
+                &y.buf,
+                n_full * m * 4,
+                &tail_y.buf,
+                0,
+                r * m * 4,
+            )
         })();
         self.free_tensor(tail_x)?;
         self.free_tensor(tail_y)?;
