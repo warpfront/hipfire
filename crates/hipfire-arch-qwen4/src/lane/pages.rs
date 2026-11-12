@@ -610,7 +610,7 @@ pub(crate) struct ElasticRank {
     pub log: bool,
     /// Reclaims on this rank that freed a bank (the idle step count restarts when it moves).
     pub reclaims: std::sync::atomic::AtomicU64,
-    /// Root only: step boundaries since the last >= 512-row prefill or reclaim
+    /// Root only: step boundaries since the last long prefill or reclaim
     /// ([`Qwen4Bundle::elastic_idle_boundary`]). It lives here, not in the serve loop: the batch
     /// loop returns whenever no lane is active and nothing is queued, so a loop-local count
     /// restarts with every request and a workload of short replies never reached
@@ -621,6 +621,9 @@ pub(crate) struct ElasticRank {
     /// Root only: the idle-step count of the last tick that probed the ranks, so an unchanged
     /// "nothing to do" answer is asked again only after another [`ELASTIC_IDLE_STEPS`] steps.
     pub probed_at: Option<usize>,
+    /// The long-prefill note of the lane step being provisioned (a serial tile routing at >= 512
+    /// rows as the forward runs it); every rank notes it, the root's step boundary consumes it.
+    pub step_long_prefill: bool,
 }
 
 /// The store-level facts the byte arithmetic reads (all host values).
@@ -1172,6 +1175,7 @@ impl Qwen4Bundle {
             idle_steps: 0,
             idle_reclaims: 0,
             probed_at: None,
+            step_long_prefill: false,
         });
         Ok(())
     }
@@ -1182,14 +1186,18 @@ impl Qwen4Bundle {
         self.elastic.as_ref().is_some_and(|elastic| elastic.cap > 0)
     }
 
-    /// One step boundary of the serve loop: the count of boundaries since the last prefill tile of
-    /// >= 512 route rows (`long_prefill`) or elastic reclaim, which restarts it. The count spans
-    /// the loop's busy periods (a request's end does not restart it). 0 without the reserve.
-    pub fn elastic_idle_boundary(&mut self, long_prefill: bool) -> usize {
+    /// One step boundary of the serve loop: the count of boundaries since the last long prefill
+    /// or elastic reclaim, which restarts it. The long prefill is the note the step's provisioning
+    /// left ([`Self::elastic_note_step_prefill`]: a serial tile routing at >= 512 rows as the
+    /// forward runs it), consumed here, so a later boundary without a provisioned step (a mesh
+    /// decode step, an idle iteration) counts on. The count spans the loop's busy periods (a
+    /// request's end does not restart it). 0 without the reserve.
+    pub fn elastic_idle_boundary(&mut self) -> usize {
         let Some(elastic) = self.elastic.as_mut() else {
             return 0;
         };
         let reclaims = elastic.reclaims.load(std::sync::atomic::Ordering::Relaxed);
+        let long_prefill = std::mem::take(&mut elastic.step_long_prefill);
         elastic.idle_steps = elastic_idle_next(
             elastic.idle_steps,
             elastic.idle_reclaims,
@@ -1266,12 +1274,38 @@ impl Qwen4Bundle {
         }
     }
 
-    /// Backstop before a forward of `rows` rows on this rank: a prefill whose GEMM route rows reach
-    /// the F16 shadow floor ([`long_prefill_route_rows`] over `Gpu::route_rows`, so a wave under
-    /// the EP route cap never qualifies) reclaims the bank first.
-    pub(crate) fn elastic_prefill_backstop(&self, gpu: &mut Gpu, rows: usize) {
-        if self.elastic_active() && long_prefill_route_rows(gpu.route_rows(rows)) {
+    /// Backstop before a forward tile on this rank whose GEMM routing rows (`route_rows`, as the
+    /// tile runs them: `Qwen4GpuForward::tile_route_rows`, so the ordinary-prefill intent's
+    /// canonical chunk counts whatever the extent and a wave under the EP route cap never
+    /// qualifies) reach the F16 shadow floor: it builds the long-prefill caches, so it reclaims
+    /// the bank first.
+    pub(crate) fn elastic_prefill_backstop(&self, gpu: &mut Gpu, route_rows: usize) {
+        if self.elastic_active() && long_prefill_route_rows(route_rows) {
             self.elastic_reclaim_logged(gpu, "prefill");
+        }
+    }
+
+    /// The routing rows a SERIAL prefill tile of `rows` rows runs at on this bundle's forward
+    /// (prefill scope, no wave: `Qwen4GpuForward::tile_route_rows`); `rows` without a forward.
+    /// Host flags only, every scope restored. The elastic accounting reads this, never the bare
+    /// `Gpu::route_rows` outside the tile's scopes (which misses the ordinary-prefill intent).
+    pub(crate) fn serial_prefill_tile_route_rows(&mut self, gpu: &mut Gpu, rows: usize) -> usize {
+        let Some(forward) = self.execution.as_mut() else {
+            return rows;
+        };
+        let prefill = std::mem::replace(&mut forward.prefill_scope, true);
+        let wave = forward.wave_route.take();
+        let route_rows = forward.tile_route_rows(gpu, rows);
+        forward.prefill_scope = prefill;
+        forward.wave_route = wave;
+        route_rows
+    }
+
+    /// Note whether the lane step being provisioned holds a long prefill; the step's boundary
+    /// consumes it ([`Self::elastic_idle_boundary`]). A no-op without the reserve.
+    pub(crate) fn elastic_note_step_prefill(&mut self, long_prefill: bool) {
+        if let Some(elastic) = self.elastic.as_mut() {
+            elastic.step_long_prefill = long_prefill;
         }
     }
 

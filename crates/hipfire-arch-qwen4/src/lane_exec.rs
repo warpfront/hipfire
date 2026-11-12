@@ -818,7 +818,7 @@ impl Qwen4LaneExecutor<'_> {
     }
 
     fn provision_step_local(&mut self, gpu: &mut Gpu, plan: &BatchStepPlan) -> Result<(), String> {
-        let (ends, reclaim) = {
+        let (ends, maps_past_charge, prefill) = {
             let bundle: &Qwen4Bundle = &*self.bundle;
             let store = bundle
                 .lanes
@@ -834,14 +834,29 @@ impl Qwen4LaneExecutor<'_> {
                 |epoch| store.lane(epoch).map(view_of),
                 |host| bundle.lane_prefill_tile_len(&host.prompt, host.prefilled),
             )?;
-            let reclaim = bundle.elastic_active()
-                && elastic_step_needs_reclaim(bundle, gpu, store, plan, &ends);
-            (ends, reclaim)
+            let elastic = bundle.elastic_active();
+            let maps_past_charge =
+                elastic && elastic_step_maps_past_charge(bundle, gpu, store, plan, &ends);
+            // (tile rows, MTP lane) of the step's prefill tiles, plan order.
+            let prefill: Vec<(usize, bool)> = plan
+                .requests
+                .iter()
+                .filter(|r| elastic && r.kind == RequestStepKind::Prefill)
+                .map(|r| {
+                    let mtp = store.lane(&r.epoch).is_some_and(|lane| lane.spec.is_some());
+                    (r.rows.len, mtp)
+                })
+                .collect();
+            (ends, maps_past_charge, prefill)
         };
-        // The elastic reserve's rank-local backstop: a step that builds the long-prefill caches or
-        // maps lane pages past the charge needs the bank's memory back first. Ranks run the same
-        // plan, so they reclaim in lockstep; a failure is logged and the bank stays in place.
-        if reclaim {
+        // The elastic reserve's rank-local backstop: a step whose serial prefill tile builds the
+        // long-prefill caches, or that maps lane pages past the charge, needs the bank's memory
+        // back first (the lend is sized into the revocable cold reserve, so this rule is what
+        // keeps a lend from starving a prefill). Ranks run the same plan and the same parts, so
+        // they reclaim in lockstep; a failure is logged and the bank stays in place.
+        let long_prefill = elastic_step_long_prefill(self.bundle, gpu, &prefill);
+        self.bundle.elastic_note_step_prefill(long_prefill);
+        if maps_past_charge || long_prefill {
             self.bundle.elastic_reclaim_logged(gpu, "prefill");
         }
         let mut store = self
@@ -1051,11 +1066,9 @@ pub(crate) fn pick_at(host: &[u8], row: usize) -> u32 {
     u32::from_ne_bytes([b[0], b[1], b[2], b[3]])
 }
 
-/// Whether the step takes memory the elastic bank holds: a prefill tile whose GEMM route rows
-/// reach the F16 shadow floor (it builds the long-prefill caches; `Gpu::route_rows` honours the EP
-/// wave cap, so a sub-512-row lane wave never qualifies), or a lane mapping new context pages past
-/// the load-time charge. Plain host reads.
-fn elastic_step_needs_reclaim(
+/// Whether a lane maps new context pages past the load-time charge this step (the mapping takes
+/// memory the elastic bank holds). Plain host reads.
+fn elastic_step_maps_past_charge(
     bundle: &Qwen4Bundle,
     gpu: &Gpu,
     store: &Qwen4LaneStore,
@@ -1064,12 +1077,49 @@ fn elastic_step_needs_reclaim(
 ) -> bool {
     let charge = bundle.lane_charge_rows(gpu);
     plan.requests.iter().zip(ends).any(|(r, &end)| {
-        (r.kind == RequestStepKind::Prefill
-            && crate::lane::pages::long_prefill_route_rows(gpu.route_rows(r.rows.len)))
-            || (end > charge
-                && store
-                    .lane(&r.epoch)
-                    .is_some_and(|lane| end > lane.state.mapped_context_tokens()))
+        end > charge
+            && store
+                .lane(&r.epoch)
+                .is_some_and(|lane| end > lane.state.mapped_context_tokens())
+    })
+}
+
+/// Whether the step holds a long prefill for the elastic reserve (`prefill`: `(rows, MTP lane)`
+/// of its prefill tiles in plan order): a SERIAL tile of the parts [`run_prefill_tiles`] then
+/// runs ([`step_prefill_parts`]) whose routing rows AS THE FORWARD RUNS IT
+/// (`Qwen4Bundle::serial_prefill_tile_route_rows`) reach the F16 shadow floor
+/// ([`serial_tiles_long`]). Under the ordinary-prefill intent that is every serial tile whatever
+/// its extent: a 59-row lane tile routes at the canonical chunk, builds the long-prefill caches
+/// and allocates its canonical scratch. Empty `prefill` (the reserve off, or no prefill tile):
+/// `false` without a probe.
+fn elastic_step_long_prefill(
+    bundle: &mut Qwen4Bundle,
+    gpu: &mut Gpu,
+    prefill: &[(usize, bool)],
+) -> bool {
+    if prefill.is_empty() {
+        return false;
+    }
+    let tile_rows: Vec<usize> = prefill.iter().map(|&(rows, _)| rows).collect();
+    let mtp: Vec<bool> = prefill.iter().map(|&(_, mtp)| mtp).collect();
+    let (parts, _) = step_prefill_parts(bundle, gpu, &tile_rows, &mtp);
+    serial_tiles_long(&parts, |i| {
+        bundle.serial_prefill_tile_route_rows(gpu, tile_rows[i])
+    })
+}
+
+/// Whether a serial part of `parts` routes at the F16 shadow floor or above
+/// (`serial_route_rows(i)`: the routing rows the i-th prefill tile runs at as a serial tile).
+/// A wave never qualifies: it routes under its row cap and builds no long-prefill cache.
+pub(crate) fn serial_tiles_long(
+    parts: &[PrefillPart],
+    mut serial_route_rows: impl FnMut(usize) -> usize,
+) -> bool {
+    parts.iter().any(|part| match part {
+        PrefillPart::Serial(i) => {
+            crate::lane::pages::long_prefill_route_rows(serial_route_rows(*i))
+        }
+        PrefillPart::Wave(_) => false,
     })
 }
 
@@ -1294,6 +1344,52 @@ fn forward_with_proto(
     Ok(picks)
 }
 
+/// The parts (serial tiles and waves) [`run_prefill_tiles`] runs a step's prefill tiles as
+/// (`tile_rows[i]` rows; `mtp[i]`: the i-th prefill lane carries MTP state), and the last wave
+/// refusal: [`plan_prefill_parts`] under the wave knob (on an EP forward only; off it every tile
+/// is its own part in plan order, the serial schedule), each lane's eligibility (an MTP lane
+/// joins a wave only when the bundle's resident spec hidden buffer can take the wave's
+/// wide-hidden capture its head fill reads), the wave row cap (that buffer caps a wave holding
+/// an MTP lane) and the forward's own wave admission ([`Qwen4Bundle::ep_wave_admission`]). Host
+/// only, so `provision_step` sees exactly the parts the forward then runs.
+pub(crate) fn step_prefill_parts(
+    bundle: &mut Qwen4Bundle,
+    gpu: &mut Gpu,
+    tile_rows: &[usize],
+    mtp: &[bool],
+) -> (Vec<PrefillPart>, Option<String>) {
+    let ep_forward = bundle
+        .execution
+        .as_ref()
+        .is_some_and(|forward| forward.ep.is_some());
+    let wave_on = ep_lane_prefill_wave_enabled() && ep_forward;
+    let wide_width = bundle.config.hc_count * bundle.config.hidden_size;
+    let wide_rows = bundle
+        .spec_hidden
+        .as_ref()
+        .map_or(0, |hidden| hidden.numel() / wide_width.max(1));
+    let eligible: Vec<bool> = mtp.iter().map(|&mtp| !mtp || wide_rows > 0).collect();
+    let wave_cap = if mtp.iter().any(|&mtp| mtp) {
+        EP_WAVE_MAX_ROWS.min(wide_rows)
+    } else {
+        EP_WAVE_MAX_ROWS
+    };
+    let refused = std::cell::Cell::new(None::<String>);
+    let admit_cell = std::cell::RefCell::new((bundle, gpu));
+    let host_admits = |rows: &[usize]| match {
+        let (bundle, gpu) = &mut *admit_cell.borrow_mut();
+        bundle.ep_wave_admission(gpu, rows)
+    } {
+        Ok(()) => true,
+        Err(reason) => {
+            refused.set(Some(reason));
+            false
+        }
+    };
+    let parts = plan_prefill_parts(wave_on, tile_rows, &eligible, wave_cap, &host_admits);
+    (parts, refused.take())
+}
+
 /// Each prefill tile of the plan through the singleton chunk program on the
 /// lane's own state (an MTP lane's tile also fills its head), or, under
 /// `HIPFIRE_EP_LANE_PREFILL_WAVE_EXACT=1` on an EP forward, the step's 65..=511-row
@@ -1364,52 +1460,18 @@ fn run_prefill_tiles(
     } else {
         bundle.share_prompt_begin();
     }
-    // The step's parts: with the wave knob off (or off the EP forward) every tile is its own
-    // part in plan order, exactly the serial schedule.
-    let ep_forward = bundle
-        .execution
-        .as_ref()
-        .is_some_and(|forward| forward.ep.is_some());
-    let wave_on = ep_lane_prefill_wave_enabled() && ep_forward;
+    // The step's parts, the ones provisioning reclaimed the elastic bank for.
     let tile_rows: Vec<usize> = tiles.iter().map(|r| r.rows.len).collect();
-    // MTP lanes join a wave when the bundle's resident spec hidden buffer can take the wave's
-    // wide-hidden capture (the head fill reads it); a wave holding one is capped by that buffer.
-    let wide_width = bundle.config.hc_count * bundle.config.hidden_size;
-    let wide_rows = bundle
-        .spec_hidden
-        .as_ref()
-        .map_or(0, |hidden| hidden.numel() / wide_width.max(1));
-    let eligible: Vec<bool> = lanes
-        .iter()
-        .map(|lane| lane.spec.is_none() || wide_rows > 0)
-        .collect();
-    let wave_cap = if lanes.iter().any(|lane| lane.spec.is_some()) {
-        EP_WAVE_MAX_ROWS.min(wide_rows)
-    } else {
-        EP_WAVE_MAX_ROWS
-    };
-    let refused = std::cell::Cell::new(None::<String>);
-    let parts = {
-        let admit_cell = std::cell::RefCell::new((&mut *bundle, &mut *gpu));
-        let host_admits = |rows: &[usize]| match {
-            let (bundle_mut, gpu_mut) = &mut *admit_cell.borrow_mut();
-            bundle_mut.ep_wave_admission(gpu_mut, rows)
-        } {
-            Ok(()) => true,
-            Err(reason) => {
-                refused.set(Some(reason));
-                false
-            }
-        };
-        plan_prefill_parts(wave_on, &tile_rows, &eligible, wave_cap, &host_admits)
-    };
-    if let Some(reason) = refused.take() {
+    let mtp: Vec<bool> = lanes.iter().map(|lane| lane.spec.is_some()).collect();
+    let (parts, refused) = step_prefill_parts(bundle, gpu, &tile_rows, &mtp);
+    if let Some(reason) = refused {
         // Once per process: the refusal is a configuration fact, not a per-step event.
         static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
             eprintln!("  qwen4 EP lane prefill wave: serial tiles for refused waves ({reason})");
         }
     }
+    let wide_width = bundle.config.hc_count * bundle.config.hidden_size;
     let tiles_ran: Result<(), String> = (|| {
         for part in parts {
             let i = match part {
@@ -2782,13 +2844,102 @@ mod wave_tests {
         assert!(wave_arm.contains("wants_pick(&lanes[ordinal].host, r)"));
         assert!(wave_arm.contains("final_tiles.push((ordinal, r.rows.end() - 1))"));
         assert!(body.contains("WaveHead::Final"));
+        // The parts come from `step_prefill_parts`, the function provisioning reads too.
+        assert!(body.contains("step_prefill_parts(bundle, gpu, &tile_rows, &mtp)"));
+        let parts_fn = fn_src(src, "pub(crate) fn step_prefill_parts(");
         // The host's admission gates every candidate wave; the knob and the EP forward gate the
         // whole plan.
-        assert!(body.contains("ep_wave_admission(gpu_mut, rows)"));
-        assert!(body.contains("ep_lane_prefill_wave_enabled() && ep_forward"));
+        assert!(parts_fn.contains("bundle.ep_wave_admission(gpu, rows)"));
+        assert!(parts_fn.contains("ep_lane_prefill_wave_enabled() && ep_forward"));
         // A wave carrying an MTP lane captures the wave's wide hidden into the resident spec
         // hidden buffer and caps its rows by that buffer.
-        assert!(body.contains("EP_WAVE_MAX_ROWS.min(wide_rows)"));
+        assert!(parts_fn.contains("EP_WAVE_MAX_ROWS.min(wide_rows)"));
         assert!(body.contains("hidden.sub_offset(0, total_rows * wide_width)"));
+    }
+
+    /// `src` from `head` through the end of that item (`\n}\n`).
+    fn fn_src<'a>(src: &'a str, head: &str) -> &'a str {
+        let rest = &src[src.find(head).expect(head)..];
+        &rest[..rest.find("\n}\n").expect("item end")]
+    }
+
+    /// j9704 (FN EP2 serve, 8 lanes): a 59-row C1 lane tile runs under the ordinary-prefill
+    /// intent, routes at the canonical chunk and rebuilds the long-prefill caches (946 MiB) plus
+    /// its 8192-row scratch, but the reclaim rule read `Gpu::route_rows(59)` outside the tile's
+    /// scopes, so the bank lent into the cold reserve stayed lent and the tile's `hipMalloc` ran
+    /// out of memory (rank pool poisoned). A serial tile counts by the routing rows it RUNS at;
+    /// a wave lane (under the wave's row cap) never does.
+    #[test]
+    fn a_serial_tile_routing_at_the_canonical_chunk_is_a_long_prefill_whatever_its_rows() {
+        let canonical = rdna_compute::prefill_invariant::QWEN4_PREFILL_CANON_ROWS;
+        let serial = [PrefillPart::Serial(0)];
+        // The C1 tile: 59 rows, routed at the canonical chunk by the ordinary-prefill intent.
+        assert!(serial_tiles_long(&serial, |_| canonical));
+        // The same tile on the product routes (no intent, e.g. gfx942) stays short.
+        assert!(!serial_tiles_long(&serial, |_| 59));
+        // A wave never asks: its lanes route under the wave cap.
+        let wave = [PrefillPart::Wave(0..8)];
+        assert!(!serial_tiles_long(&wave, |_| panic!(
+            "a wave lane was priced as a tile"
+        )));
+        // A refused wave's lanes run serially and each one counts.
+        let refused: Vec<PrefillPart> = (0..8).map(PrefillPart::Serial).collect();
+        let mut asked = Vec::new();
+        assert!(serial_tiles_long(&refused, |i| {
+            asked.push(i);
+            if i == 3 {
+                canonical
+            } else {
+                149
+            }
+        }));
+        assert_eq!(asked, vec![0, 1, 2, 3], "stops at the first long tile");
+    }
+
+    /// The reclaim-before-provision rule, pinned on the source (a device is needed to run it):
+    /// provisioning prices the very parts the forward runs (`step_prefill_parts`), each serial
+    /// tile at the routing rows its scopes give it (`serial_prefill_tile_route_rows` probing
+    /// `tile_route_rows`), and reclaims before any lane maps or forwards; the forward's own
+    /// backstop reads the scoped rows too. No elastic predicate reads the bare
+    /// `Gpu::route_rows` of a tile outside its scopes.
+    #[test]
+    fn the_elastic_reclaim_prices_each_tile_at_the_rows_it_routes() {
+        let src = include_str!("lane_exec.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("tests")];
+        let provision = fn_src(prod, "    fn provision_step_local(");
+        let parts = provision
+            .find("elastic_step_long_prefill(self.bundle, gpu, &prefill)")
+            .expect("long prefill priced");
+        let reclaim = provision
+            .find("elastic_reclaim_logged(gpu, \"prefill\")")
+            .expect("reclaim");
+        let mapped = provision.find("provision_inner(").expect("provision_inner");
+        assert!(parts < reclaim && reclaim < mapped);
+        assert!(provision.contains("if maps_past_charge || long_prefill {"));
+        assert!(provision.contains("elastic_note_step_prefill(long_prefill)"));
+        let long = fn_src(prod, "fn elastic_step_long_prefill(");
+        assert!(long.contains("step_prefill_parts(bundle, gpu, &tile_rows, &mtp)"));
+        assert!(long.contains("bundle.serial_prefill_tile_route_rows(gpu, tile_rows[i])"));
+        let pages = include_str!("lane/pages.rs");
+        let probe = fn_src(pages, "    pub(crate) fn serial_prefill_tile_route_rows(");
+        assert!(probe.contains("std::mem::replace(&mut forward.prefill_scope, true)"));
+        assert!(probe.contains("forward.wave_route.take()"));
+        assert!(probe.contains("forward.tile_route_rows(gpu, rows)"));
+        // The step's note restarts the idle count once: its boundary consumes it, so the mesh
+        // decode steps after a long tile (they provision nothing) count on to the next tick.
+        let boundary = fn_src(pages, "    pub fn elastic_idle_boundary(");
+        assert!(boundary.contains("std::mem::take(&mut elastic.step_long_prefill)"));
+        let forward = include_str!("gpu_forward.rs");
+        let route = fn_src(forward, "    pub(crate) fn tile_route_rows(");
+        let enter = route.find("self.enter_tile_scopes(gpu, rows)").unwrap();
+        let rows = route.find("gpu.route_rows(rows)").unwrap();
+        let leave = route.find("Self::leave_tile_scopes(gpu, saved)").unwrap();
+        assert!(enter < rows && rows < leave);
+        assert!(forward.contains(
+            "let route_rows = self.tile_route_rows(gpu, tokens.len());\n            bundle.elastic_prefill_backstop(gpu, route_rows);"
+        ));
+        for text in [prod, pages] {
+            assert!(!text.contains("long_prefill_route_rows(gpu.route_rows("));
+        }
     }
 }

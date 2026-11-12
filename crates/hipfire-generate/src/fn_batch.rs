@@ -1070,21 +1070,20 @@ fn page_budget_gate(
     }
 }
 
-/// Step-boundary housekeeping of the elastic reserve; a no-op without it. `step` is
-/// `Some(long_prefill)` after a step (`long_prefill`: it held a tile of >= 512 route rows) and
-/// `None` on an idle iteration (the loop's 2 ms idle sleep with lanes active but nothing planned),
+/// Step-boundary housekeeping of the elastic reserve; a no-op without it. Runs after every step
+/// and on every idle iteration (the loop's 2 ms idle sleep with lanes active but nothing planned),
 /// which counts like a step. The idle count lives in the bundle (`Qwen4Bundle::elastic_idle_boundary`)
 /// because this loop returns when no lane is active and nothing is queued: it spans busy periods
-/// and restarts after a long prefill or any reclaim (a gate, backstop or borrow reclaim all move
-/// the bundle's reclaim count); the tick runs only while no request is queued and no lane
-/// prefills. Never fails the loop: a failed tick is logged by the bundle and the next one asks
-/// again.
+/// and restarts after a long prefill (a serial tile whose routing rows reach 512 as the forward
+/// runs it, noted by the step's provisioning and consumed here) or any reclaim (a gate, backstop
+/// or borrow reclaim all move the bundle's reclaim count); the tick runs only while no request is
+/// queued and no lane prefills. Never fails the loop: a failed tick is logged by the bundle and
+/// the next one asks again.
 fn elastic_boundary(
     sched: &ContinuousBatchScheduler,
     m: &mut LoadedModel,
     gpu: &mut Gpu,
     controls: &[Option<LaneCtl>],
-    step: Option<bool>,
 ) {
     match Owner::of(m, gpu) {
         Ok(owner) if owner.elastic_active() => {}
@@ -1107,7 +1106,7 @@ fn elastic_boundary(
     let Ok(mut owner) = Owner::of(m, gpu) else {
         return;
     };
-    let idle_steps = owner.bundle.elastic_idle_boundary(step == Some(true));
+    let idle_steps = owner.bundle.elastic_idle_boundary();
     if prefilling || !sched.inbox.is_empty() {
         return;
     }
@@ -2308,7 +2307,7 @@ pub fn drive_qwen4_lane_batch(
                 }
             };
             if plan.requests.is_empty() && mesh_requests.is_empty() {
-                elastic_boundary(sched, m, gpu, &controls, None);
+                elastic_boundary(sched, m, gpu, &controls);
                 std::thread::sleep(Duration::from_millis(2));
                 continue;
             }
@@ -2465,11 +2464,7 @@ pub fn drive_qwen4_lane_batch(
                 );
             }
             // The elastic reserve's step boundary (idle count, cache give-back, re-lend).
-            let long_prefill = plan
-                .requests
-                .iter()
-                .any(|r| r.kind == RequestStepKind::Prefill && long_prefill_route_rows(r.rows.len));
-            elastic_boundary(sched, m, gpu, &controls, Some(long_prefill));
+            elastic_boundary(sched, m, gpu, &controls);
         }
     })();
     mix.report();
@@ -2730,7 +2725,7 @@ mod tests {
             .find("executor.commit_step(&plan, out)")
             .expect("commit");
         let tick = body
-            .find("elastic_boundary(sched, m, gpu, &controls, Some(long_prefill))")
+            .find("elastic_boundary(sched, m, gpu, &controls);\n        }\n    })();")
             .expect("tick");
         assert!(commit < tick, "the elastic tick follows the step's commit");
     }

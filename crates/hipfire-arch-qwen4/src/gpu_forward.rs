@@ -16297,6 +16297,18 @@ impl Qwen4GpuForward {
         }
     }
 
+    /// The routing rows ([`Gpu::route_rows`]) of a tile of `rows` rows of this forward under the
+    /// scopes [`Self::enter_tile_scopes`] enters for it: the ordinary-prefill intent (and the
+    /// invariant profile / append scopes) route every extent at the canonical chunk; a wave keeps
+    /// its row cap. Host flags only, every scope restored. The elastic reserve's prefill
+    /// accounting reads this, never the bare `Gpu::route_rows` outside the tile's scopes.
+    pub(crate) fn tile_route_rows(&self, gpu: &mut Gpu, rows: usize) -> usize {
+        let (saved, _) = self.enter_tile_scopes(gpu, rows);
+        let route_rows = gpu.route_rows(rows);
+        Self::leave_tile_scopes(gpu, saved);
+        route_rows
+    }
+
     /// Bank and runtime selection, the only place decode-share state changes.
     /// Every tile of every route that reaches [`Self::forward_chunk_scoped`]
     /// passes here.
@@ -16335,9 +16347,14 @@ impl Qwen4GpuForward {
             gather.decode_step_end(gpu);
         }
         // The elastic reserve's backstop for every singleton / promoted / non-lane prefill tile:
-        // a forward whose GEMM route rows reach the F16 shadow floor reclaims the bank before it
-        // builds the long-prefill caches (a no-op without the reserve or while nothing is lent).
-        bundle.elastic_prefill_backstop(gpu, tokens.len());
+        // a forward whose GEMM routing rows, as its tile runs them (`tile_route_rows`: the
+        // ordinary-prefill intent routes every extent at the canonical chunk), reach the F16
+        // shadow floor reclaims the bank before it builds the long-prefill caches (a no-op
+        // without the reserve or while nothing is lent).
+        if bundle.elastic_active() {
+            let route_rows = self.tile_route_rows(gpu, tokens.len());
+            bundle.elastic_prefill_backstop(gpu, route_rows);
+        }
         if self.ep_reserve.is_some() {
             return self.ep_reserve_forward_chunk(
                 bundle,
