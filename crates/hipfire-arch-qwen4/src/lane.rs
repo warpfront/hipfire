@@ -2366,7 +2366,12 @@ impl Qwen4LaneStore {
         // A head owner (the single scope, every EP rank, the PP output band)
         // holds the MTP head; any other band that owns target layers holds
         // only its lanes' verify rings (target-only ownership).
-        let proto = LaneProto::new(copy.map(|c| c.ngram))?;
+        let mut proto = LaneProto::new(copy.map(|c| c.ngram))?;
+        // Exact gfx942 binds its lane cost profile (static drafting depth) before the first
+        // lane is admitted; every other arch keeps the pooled legacy floor of this store.
+        if gpu.arch_caps.is_gfx942() {
+            proto.bind_cost_arch(&gpu.arch);
+        }
         if let Some(spec) = spec {
             let verify_rows = if bundle.has_cpu_deferred_experts() {
                 crate::program::QWEN4_CPU_SPLICE_MAX_ROWS
@@ -2387,6 +2392,22 @@ impl Qwen4LaneStore {
                 return Err(
                     "lane store: MTP lanes need the GDN row capture this GPU lacks".to_string(),
                 );
+            }
+            // gfx942 captures the F32 recurrent state only and runs the single-card
+            // topology (the capture recurrence and its rollback are the gfx942-pinned
+            // F32 persistent body; PP/EP rings were never proven there).
+            if gpu.arch_caps.is_gfx942() {
+                if bundle.state_format().gdn != crate::GdnStateFormat::F32 {
+                    return Err(format!(
+                        "lane store: gfx942 MTP lanes capture the F32 GDN state only, not {}",
+                        bundle.state_format().gdn.name()
+                    ));
+                }
+                if lane_topology(bundle) != LaneTopology::Single {
+                    return Err(
+                        "lane store: gfx942 MTP lanes run the single-card topology only".to_string(),
+                    );
+                }
             }
         }
         // The copy lane widens the store's verify rows and the first
