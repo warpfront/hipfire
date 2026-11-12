@@ -106,7 +106,7 @@ fn device_elf(bundle_bytes: &[u8]) -> &[u8] {
 fn manifest_records_pinned_source_and_artifact_hashes() {
     let m = manifest();
     assert_eq!(s(&m, &["arch"]), ARCH);
-    assert_eq!(s(&m, &["module"]), "%s_pm_gfx942");
+    assert_eq!(s(&m, &["module"]), "qwen4_g942_hc_gates_pm_gfx942");
     let symbols: Vec<&str> = m["symbols"]
         .as_array()
         .expect("symbols")
