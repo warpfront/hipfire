@@ -205,26 +205,6 @@ fn quantized_dtype(quant_type: u8) -> Option<DType> {
     })
 }
 
-/// HFQ4-G128 rows each start a fresh 72-byte group; a trailing partial group
-/// is padded. Files quantized before the 2-D packer (`b4846285e`) packed
-/// groups across rows whenever `K % 128 != 0` (Gemma 4 expert `down_proj`,
-/// K = 704), which every per-row kernel reads as garbage. Refuse them.
-fn check_hfq4g128_rows(name: &str, m: usize, k: usize, bytes: usize) -> Result<(), String> {
-    let rows = m * k.div_ceil(128) * 72;
-    if bytes == rows {
-        return Ok(());
-    }
-    let reason = if bytes == (m * k).div_ceil(128) * 72 {
-        "packs HFQ4-G128 groups across rows (quantized before hipfire-quantize \
-         b4846285e); requantize the model"
-    } else {
-        "has an unexpected byte size"
-    };
-    Err(format!(
-        "{name} [{m} x {k}] {reason} ({bytes} bytes, expected {rows})"
-    ))
-}
-
 /// AWQ per-channel scale sidecar (`<weight>.awq_scale.weight`, F16 `[k]`).
 /// Absent or malformed sidecars are skipped; a present, well-formed one whose
 /// upload fails fails the load instead of silently computing `(W·s)·x`.
@@ -303,9 +283,8 @@ fn load_wt(
         qt => {
             let dtype = quantized_dtype(qt)
                 .ok_or_else(|| format!("gemma4: unsupported quant_type {qt} for {name}"))?;
-            if dtype == DType::HFQ4G128 {
-                check_hfq4g128_rows(name, m, k, data.len())?;
-            }
+            hipfire_runtime::weight_backend::validate_row_extent(dtype, data.len(), m, k, name)
+                .map_err(|e| format!("gemma4: {e:?}"))?;
             (
                 l.alloc(name, |g| upload_pooled_bytes(g, data, &[data.len()]))?,
                 dtype,
@@ -480,15 +459,20 @@ fn load_expert_pool(
             first_info.quant_type
         )
     })?;
-    if dtype == DType::HFQ4G128 {
-        let [m, k] = first_info.shape[..] else {
-            return Err(format!(
-                "{first_name}: expected a 2-D shape, got {:?}",
-                first_info.shape
-            ));
-        };
-        check_hfq4g128_rows(&first_name, m as usize, k as usize, bytes_per_expert)?;
-    }
+    let [m, k] = first_info.shape[..] else {
+        return Err(format!(
+            "{first_name}: expected a 2-D shape, got {:?}",
+            first_info.shape
+        ));
+    };
+    hipfire_runtime::weight_backend::validate_row_extent(
+        dtype,
+        bytes_per_expert,
+        m as usize,
+        k as usize,
+        &first_name,
+    )
+    .map_err(|e| format!("gemma4: {e:?}"))?;
     let mut concat = Vec::with_capacity(bytes_per_expert * n_experts);
     concat.extend_from_slice(first_data);
     for x in 1..n_experts {

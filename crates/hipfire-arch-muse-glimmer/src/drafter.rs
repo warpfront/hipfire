@@ -356,6 +356,14 @@ fn load_wt(
         .ok_or_else(|| format!("glimmer drafter: tensor '{name}' not found"))?;
     let mut wt = match info.quant_type {
         3 => {
+            hipfire_runtime::weight_backend::validate_row_extent(
+                DType::Q8_0,
+                data.len(),
+                m,
+                k,
+                name,
+            )
+            .map_err(|e| format!("glimmer drafter: {e:?}"))?;
             let buf = gpu
                 .upload_raw(data, &[data.len()])
                 .map_err(|e| format!("glimmer drafter: upload Q8 '{name}': {e:?}"))?;
