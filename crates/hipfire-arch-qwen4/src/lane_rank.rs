@@ -179,7 +179,9 @@ impl LaneProto {
     }
 
     /// Bind the lane cost profile of `arch` at the root, before the first lane is admitted
-    /// ([`crate::mesh_lane_protocol::MeshRoot::bind_cost_arch`]).
+    /// ([`crate::mesh_lane_protocol::MeshRoot::bind_cost_arch`], unchanged).
+    // G12 input: executor-local pass-through to the existing root surface; the scheduler's own
+    // interfaces are untouched.
     pub(crate) fn bind_cost_arch(&mut self, arch: &str) {
         self.root.bind_cost_arch(arch);
     }
