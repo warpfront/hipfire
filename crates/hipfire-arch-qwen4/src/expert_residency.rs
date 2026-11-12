@@ -8894,7 +8894,8 @@ mod tests {
     /// agreed 36 resident layers against the planned capacity (32624 MiB, device total) while
     /// the rank refused them against its instantaneous free (32550 MiB) with "keeps only 35".
     /// The numbers are that load's receipt (trunk 3302 MiB, 637.5 MiB per layer, reserve
-    /// 6300 MiB); base 56e88adbfa's reserve of 6281 MiB (same trunk) kept 36 on either basis.
+    /// 6300 MiB at max_seq 21000); base 56e88adbfa at the same config reserved 6090 MiB (census
+    /// `state` 33 MiB instead of the canonical carry's 243) and kept 36 on either basis.
     #[test]
     fn ep_rank_check_holds_the_agreed_split_to_the_planners_basis() {
         const MIB: u64 = 1 << 20;
@@ -8913,9 +8914,9 @@ mod tests {
                 free_layers: 35
             })
         );
-        // Base terms kept 36 on either basis (17 MiB of slack on the instantaneous free).
+        // Base terms kept 36 on either basis (208 MiB of slack on the instantaneous free).
         assert_eq!(
-            ep_agreed_split_fit(&config, 36, planned, free_now, trunk, layer, 6_281 * MIB),
+            ep_agreed_split_fit(&config, 36, planned, free_now, trunk, layer, 6_090 * MIB),
             Ok(EpAgreedSplitFit {
                 planned_layers: 36,
                 free_layers: 36
@@ -8924,7 +8925,7 @@ mod tests {
         // Whatever the planner agrees on any capacity, the rank keeps on the same capacity,
         // even when the instantaneous free sits a driver baseline lower.
         for planned_mib in (20_000..=40_000u64).step_by(37) {
-            for reserve_mib in [1_088u64, 6_281, 6_300, 7_000] {
+            for reserve_mib in [1_088u64, 6_090, 6_300, 7_000] {
                 let planned = planned_mib * MIB;
                 let reserve = reserve_mib * MIB;
                 let agreed = ep_vram_layers(&config, &[planned, planned], trunk, layer, reserve);
