@@ -27,6 +27,16 @@ pub use qsa_lanes::{
 };
 pub(crate) use qsa_lanes::{Qwen4QsaLaneDesc, Qwen4QsaLanesShape, QsaLanesTableCache};
 
+// The GDN Core of a whole lane group (verify windows and AR lanes, ragged rows) in three
+// launches: a child module so it reaches the private `Gfx942Device` borrow and the table cache.
+#[path = "gfx942_gdn_lanes_verify.rs"]
+mod gdn_lanes_verify;
+pub use gdn_lanes_verify::{
+    Qwen4GdnLanesVerifyLane, Qwen4GdnLanesVerifyShape, QWEN4_G942_GDN_LANES_CONV_PARAMS,
+    QWEN4_G942_GDN_LANES_GATE, QWEN4_G942_GDN_LANES_STEP, QWEN4_G942_GDN_LANES_VERIFY_MAX,
+    QWEN4_G942_GDN_LANES_VERIFY_MODULE, QWEN4_G942_GDN_LANES_VERIFY_ROWS,
+};
+
 const GROUPED_OLORA_E8_SRC: &str =
     include_str!("../../../../kernels/src/gemv_mfp4g32_e8_soa_grouped.gfx942.hip");
 const GROUPED_OLORA_E8_KERNEL: &str = "gemv_mfp4g32_e8_soa_grouped_gfx942";
@@ -205,6 +215,12 @@ pub(crate) struct GdnLanesTableCache {
     /// the same way over the six-pointer descriptors.
     capture_tables:
         std::collections::HashMap<GdnLanesCaptureTableKey, (hip_bridge::DeviceBuffer, Vec<u8>)>,
+    /// The GDN Core lanes' tables ([`Gfx942Device::qwen4_gdn_lanes_verify`], one seventeen-pointer
+    /// descriptor per lane).
+    verify_tables: std::collections::HashMap<
+        gdn_lanes_verify::GdnLanesVerifyTableKey,
+        (hip_bridge::DeviceBuffer, Vec<u8>),
+    >,
 }
 
 /// One lane of a [`Gfx942Device::qwen4_gdn_lanes_step_f32`] launch: the tensors the

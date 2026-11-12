@@ -32,7 +32,8 @@ use super::layer_ops::{
 };
 use crate::types::DispatchError;
 use rdna_compute::cdna::gfx942::{
-    Qwen4GdnLanesCaptureF32Lane, Qwen4GdnLanesF32Lane, Qwen4GdnLanesF32Shape,
+    qwen4_gdn_lanes_verify_admitted, Qwen4GdnLanesF32Lane, Qwen4GdnLanesF32Shape,
+    Qwen4GdnLanesVerifyLane, Qwen4GdnLanesVerifyShape, QWEN4_G942_GDN_LANES_VERIFY_MAX,
     QWEN4_GDN_LANES_F32_MAX,
 };
 use rdna_compute::gdn_stream::GdnStreamPhase;
@@ -322,6 +323,82 @@ where
     if !sets.into_iter().all(disjoint) {
         return Ok(Gfx942GdnLanes::Declined(before_launch));
     }
+    // Verify lanes: the whole group (the one-row AR lanes beside them included) runs the
+    // Core chain as three launches per chunk of lanes (convolution + gate parameters + the
+    // capture-input copy, the recurrence, the gated norm), every lane on its own rows. A group
+    // the launch refuses is handed back untouched and runs per lane.
+    if !capture_lanes.is_empty() {
+        let history_rows = first.conv_kernel.saturating_sub(1);
+        let mut lanes: Vec<Qwen4GdnLanesVerifyLane<'_>> = Vec::with_capacity(ops.len());
+        for (op, v) in &ar_lanes {
+            lanes.push(Qwen4GdnLanesVerifyLane {
+                projection: &v.projection,
+                inputs: None,
+                kernel: op.conv,
+                history: op.conv_state,
+                conv_output: &v.conv_output,
+                a: &v.a,
+                b: &v.b,
+                a_log: op.a_log,
+                dt_bias: op.dt_bias,
+                gate: &v.gate,
+                beta: &v.beta,
+                state: op.recurrent,
+                ring: None,
+                recurrent_output: &v.recurrent_output,
+                z: &v.z,
+                norm: op.norm,
+                gdn_output: &v.gdn_output,
+                rows: 1,
+                start_cursor: op.start_position % history_rows,
+            });
+        }
+        for (op, capture, v) in &capture_lanes {
+            lanes.push(Qwen4GdnLanesVerifyLane {
+                projection: &v.projection,
+                // Already the capture's retained input (a direct in-projection): no copy.
+                inputs: (!is_same_extent(&v.projection, &v.inputs)).then_some(&v.inputs),
+                kernel: op.conv,
+                history: op.conv_state,
+                conv_output: &v.conv_output,
+                a: &v.a,
+                b: &v.b,
+                a_log: op.a_log,
+                dt_bias: op.dt_bias,
+                gate: &v.gate,
+                beta: &v.beta,
+                state: op.recurrent,
+                ring: Some(&capture.states),
+                recurrent_output: &v.recurrent_output,
+                z: &v.z,
+                norm: op.norm,
+                gdn_output: &v.gdn_output,
+                rows: op.rows,
+                start_cursor: op.start_position % history_rows,
+            });
+        }
+        let shape = Qwen4GdnLanesVerifyShape {
+            key_heads: first.key_heads,
+            value_heads: first.value_heads,
+            key_dim: first.key_dim,
+            value_dim: first.value_dim,
+            conv_kernel: first.conv_kernel,
+        };
+        if !lanes
+            .chunks(QWEN4_G942_GDN_LANES_VERIFY_MAX)
+            .all(|chunk| qwen4_gdn_lanes_verify_admitted(chunk, shape).is_ok())
+        {
+            return Ok(Gfx942GdnLanes::Declined(before_launch));
+        }
+        before_launch(gpu)?;
+        let mut device = gpu.try_gfx942().ok_or_else(|| {
+            DispatchError::Hip("gfx942 GDN lanes: the context is not exact gfx942".into())
+        })?;
+        for chunk in lanes.chunks(QWEN4_G942_GDN_LANES_VERIFY_MAX) {
+            hip(device.qwen4_gdn_lanes_verify(chunk, shape))?;
+        }
+        return Ok(Gfx942GdnLanes::Done);
+    }
     before_launch(gpu)?;
 
     let value_heads = first.value_heads;
@@ -388,92 +465,6 @@ where
                     norm: op.norm,
                     output: &v.gdn_output,
                     rows: 1,
-                    value_heads,
-                    value_dim: op.value_dim,
-                },
-            ))?;
-        }
-    }
-
-    // The verify lanes, one batched capture recurrence per row count.
-    let mut row_counts: Vec<usize> = Vec::new();
-    for (op, ..) in &capture_lanes {
-        if !row_counts.contains(&op.rows) {
-            row_counts.push(op.rows);
-        }
-    }
-    for rows in row_counts {
-        let class: Vec<&(&GatedDeltaNetOp<'_>, &GdnRowCapture<'_>, CaptureViews)> = capture_lanes
-            .iter()
-            .filter(|(op, ..)| op.rows == rows)
-            .collect();
-        // The qkv rows into the capture, then convolution + gate parameters into the retained
-        // recurrence input.
-        for (op, _, v) in class.iter().map(|lane| (lane.0, lane.1, &lane.2)) {
-            if !is_same_extent(&v.projection, &v.inputs) {
-                hip(gpu.copy_d2d(&v.projection, &v.inputs, v.inputs.byte_size()))?;
-            }
-            let conv = GatedDeltaConvBatched {
-                input: &v.inputs,
-                kernel: op.conv,
-                history: op.conv_state,
-                output: &v.conv_output,
-                next_history: op.conv_state,
-                rows,
-                channels: qkv,
-                history_rows,
-                kernel_size: op.conv_kernel,
-                start_cursor: op.start_position % history_rows,
-            };
-            let params = GatedDeltaParamsBatched {
-                a: &v.a,
-                b: &v.b,
-                a_log: op.a_log,
-                dt_bias: op.dt_bias,
-                gate: &v.gate,
-                beta: &v.beta,
-                rows,
-                heads: value_heads,
-            };
-            hip(gated_delta_conv_params_batched(gpu, &conv, &params))?;
-        }
-        let lanes: Vec<Qwen4GdnLanesCaptureF32Lane<'_>> = class
-            .iter()
-            .map(|lane| {
-                let (op, capture, v) = (lane.0, lane.1, &lane.2);
-                Qwen4GdnLanesCaptureF32Lane {
-                    projection: &v.conv_output,
-                    gate: &v.gate,
-                    beta: &v.beta,
-                    state: op.recurrent,
-                    ring: &capture.states,
-                    output: &v.recurrent_output,
-                }
-            })
-            .collect();
-        let mut device = gpu.try_gfx942().ok_or_else(|| {
-            DispatchError::Hip("gfx942 GDN lanes: the context is not exact gfx942".into())
-        })?;
-        hip(device.qwen4_gdn_lanes_step_capture_f32(
-            &lanes,
-            Qwen4GdnLanesF32Shape {
-                rows,
-                key_heads: first.key_heads,
-                value_heads,
-                key_dim: first.key_dim,
-                value_dim: first.value_dim,
-            },
-        ))?;
-        for lane in &class {
-            let (op, v) = (lane.0, &lane.2);
-            hip(gated_delta_gate_batched(
-                gpu,
-                &GatedDeltaGateBatched {
-                    recurrent_output: &v.recurrent_output,
-                    z: &v.z,
-                    norm: op.norm,
-                    output: &v.gdn_output,
-                    rows,
                     value_heads,
                     value_dim: op.value_dim,
                 },

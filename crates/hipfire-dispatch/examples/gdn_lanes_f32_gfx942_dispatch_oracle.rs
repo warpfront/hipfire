@@ -212,6 +212,7 @@ fn core_op<'a>(s: &'a Shared, l: &'a LaneBufs, position: usize) -> GatedDeltaNet
         zba_fold: None,
         trunk_a4: 0,
         phase: MixerPhase::Core,
+        carry: None,
     }
 }
 
