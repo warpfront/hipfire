@@ -198,8 +198,8 @@ pub static V_MAD_MIX_F32_AS_FMA_MIX_F32: AliasReceipt = AliasReceipt {
     encoding: "ENC_VOP3P",
     llvm_mnemonic: "v_fma_mix_f32",
     model: typed_fma_mix_f32,
-    oracle_receipt: "",
-    oracle_sha256: "",
+    oracle_receipt: "crates/peacemaker-isa/tests/fixtures/cdna/gfx942_fma_mix_f32_receipt.json",
+    oracle_sha256: "a010d0af7bab8664a51b2b01b1609a9abbd50fdd5c1e2641474fe65dcd58f3ee",
     evidence: "tests/enc_vop3p.rs oracle_fma_mix_f32_full_selection_space: every \
 OP_SEL x OP_SEL_HI x NEG_LO x CLAMP combination (1024) over seven source shapes \
 (all VGPR, one SGPR per position, one inline constant per position; 7168 words), \
