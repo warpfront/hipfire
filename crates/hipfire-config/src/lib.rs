@@ -49,13 +49,14 @@ pub enum ConfigError {
     #[error("unknown configuration key '{0}'")]
     UnknownKey(String),
     #[error(
-        "configuration key '{key}' was removed in {removed_in} ({reason}); it has no effect — \
-         delete it from config.toml if it is still set"
+        "configuration key '{key}' was removed in {removed_in} ({reason}); replacement: \
+         {replacement} — delete it from config.toml"
     )]
     RetiredKey {
         key: &'static str,
         removed_in: &'static str,
         reason: &'static str,
+        replacement: &'static str,
     },
     #[error("invalid value for {key}: {message}")]
     InvalidValue { key: String, message: String },
@@ -4198,17 +4199,17 @@ pub fn canonical_config_key(key: &str) -> Option<String> {
 }
 
 /// A config key that shipped in a release and was later removed from the
-/// schema. Through its deprecation window (until `ignored_until`) a config
-/// file that still sets it loads with a warning and the value is ignored;
-/// keys that never shipped stay unknown and fail the load.
+/// schema. Setting it (config file, `config set`) fails with
+/// [`ConfigError::RetiredKey`], which names the removal and its replacement;
+/// keys that never shipped stay unknown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RetiredConfigKey {
     pub key: &'static str,
     pub legacy_key: &'static str,
     pub shipped_in: &'static str,
     pub removed_in: &'static str,
-    pub ignored_until: &'static str,
     pub reason: &'static str,
+    pub replacement: &'static str,
 }
 
 pub static RETIRED_CONFIG_KEYS: &[RetiredConfigKey] = &[RetiredConfigKey {
@@ -4216,8 +4217,8 @@ pub static RETIRED_CONFIG_KEYS: &[RetiredConfigKey] = &[RetiredConfigKey {
     legacy_key: "mw16",
     shipped_in: "0.3.1",
     removed_in: "0.4.1",
-    ignored_until: "0.5.0",
     reason: "the MW16 GEMM experiment was removed",
+    replacement: "none; the default GEMM path applies",
 }];
 
 pub fn retired_config_key(key: &str) -> Option<&'static RetiredConfigKey> {
@@ -4234,22 +4235,9 @@ pub fn unknown_key(key: &str) -> ConfigError {
             key: retired.key,
             removed_in: retired.removed_in,
             reason: retired.reason,
+            replacement: retired.replacement,
         },
         None => ConfigError::UnknownKey(key.to_owned()),
-    }
-}
-
-impl RetiredConfigKey {
-    fn warning(&self, path: &Path) -> String {
-        format!(
-            "ignored {} in {}: removed in {} ({}); the setting has no effect and is \
-             accepted with this warning until {} — delete it from the file",
-            self.key,
-            path.display(),
-            self.removed_in,
-            self.reason,
-            self.ignored_until
-        )
     }
 }
 
@@ -5728,12 +5716,11 @@ impl ConfigPaths {
 
 pub fn load_global(paths: &ConfigPaths) -> Result<LoadedConfig> {
     if paths.config_toml.exists() {
-        let (layer, warnings) = load_toml_layer_with_warnings(&paths.config_toml)?;
         return Ok(LoadedConfig {
-            layer,
+            layer: load_toml_layer(&paths.config_toml)?,
             path: paths.config_toml.clone(),
             format: ConfigFormat::Toml,
-            warnings,
+            warnings: Vec::new(),
         });
     }
     if paths.config_json.exists() {
@@ -6387,15 +6374,9 @@ pub fn load_env_layer() -> Result<ConfigLayer> {
     Ok(layer)
 }
 
-/// Load a TOML config layer. Retired keys ([`RETIRED_CONFIG_KEYS`]) are
-/// dropped; use [`load_toml_layer_with_warnings`] to report them.
+/// Load a TOML config layer. A retired key ([`RETIRED_CONFIG_KEYS`]) or any
+/// other unknown key fails the load.
 pub fn load_toml_layer(path: &Path) -> Result<ConfigLayer> {
-    load_toml_layer_with_warnings(path).map(|(layer, _)| layer)
-}
-
-/// Load a TOML config layer, ignoring retired keys with one warning each.
-/// Every other unknown key still fails the load.
-pub fn load_toml_layer_with_warnings(path: &Path) -> Result<(ConfigLayer, Vec<String>)> {
     let raw = read_string(path)?;
     let table = toml::from_str::<toml::Table>(&raw).map_err(|source| ConfigError::Parse {
         path: path.to_owned(),
@@ -6412,17 +6393,10 @@ pub fn load_toml_layer_with_warnings(path: &Path) -> Result<(ConfigLayer, Vec<St
     let mut flat = BTreeMap::new();
     flatten_toml("", &table, &mut flat, path)?;
     let mut layer = ConfigLayer::default();
-    let mut warnings = Vec::new();
     for (key, value) in flat {
-        if field(&key).is_none() {
-            if let Some(retired) = retired_config_key(&key) {
-                warnings.push(retired.warning(path));
-                continue;
-            }
-        }
         layer.set(&key, value)?;
     }
-    Ok((layer, warnings))
+    Ok(layer)
 }
 
 fn flatten_toml(
@@ -9475,9 +9449,9 @@ overrides = { decide = { calibration = { choice = 1.3, score = 2, noul = 0.7 } }
     }
 
     #[test]
-    fn retired_keys_warn_and_are_ignored() {
+    fn retired_keys_fail_the_load_naming_removal_and_replacement() {
         // kernel.mw16 shipped in 0.3.1/0.4.0 and was removed in 0.4.1. A file
-        // written by those releases must still load through the window.
+        // that still sets it is a user-facing error, never a silent ignore.
         for (name, body) in [
             (
                 "canonical",
@@ -9492,29 +9466,21 @@ overrides = { decide = { calibration = { choice = 1.3, score = 2, noul = 0.7 } }
             fs::create_dir_all(&root).unwrap();
             let paths = ConfigPaths::under(&root);
             fs::write(&paths.config_toml, body).unwrap();
-            let loaded = load_global(&paths).unwrap();
-            assert_eq!(loaded.format, ConfigFormat::Toml);
-            assert_eq!(
-                loaded.layer.get("memory.max_seq"),
-                Some(&ConfigValue::Integer(8192))
+            let err = load_global(&paths).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ConfigError::RetiredKey {
+                        key: "kernel.mw16",
+                        ..
+                    }
+                ),
+                "{name}: {err:?}"
             );
-            assert_eq!(
-                loaded.layer.values.len(),
-                1,
-                "{name}: retired key must be dropped"
-            );
-            assert_eq!(loaded.warnings.len(), 1, "{name}: {:?}", loaded.warnings);
-            let warning = &loaded.warnings[0];
-            for needle in ["kernel.mw16", "removed in 0.4.1", "until 0.5.0"] {
-                assert!(warning.contains(needle), "{name}: {warning}");
+            for needle in ["kernel.mw16", "removed in 0.4.1", "replacement:"] {
+                assert!(err.to_string().contains(needle), "{name}: {err}");
             }
-            assert!(resolve([NamedLayer {
-                source: ConfigSource::GlobalUser { path: loaded.path },
-                layer: loaded.layer,
-            }])
-            .is_ok());
-            // Setting a retired key is still refused: it has no effect. The
-            // error names the removal instead of calling the key unknown.
+            // `config set` of a retired key names the removal too.
             let err = ConfigLayer::default()
                 .set_cli("kernel.mw16", "true")
                 .unwrap_err();
@@ -9576,7 +9542,7 @@ overrides = { decide = { calibration = { choice = 1.3, score = 2, noul = 0.7 } }
                 "{} is live",
                 retired.legacy_key
             );
-            assert!(!retired.ignored_until.is_empty() && !retired.shipped_in.is_empty());
+            assert!(!retired.replacement.is_empty() && !retired.shipped_in.is_empty());
         }
     }
 
