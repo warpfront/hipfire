@@ -2397,8 +2397,8 @@ pub fn generate_vl(
             crate::ar::emit_active_route_done_value(stdout, &pending_done)
         }
         ClientTerminalDecision::Abort => {
-            // Abort after the turn committed: roll back like the in-loop
-            // polls (and text AR), or the cancelled turn stays in context.
+            // Abort at the commit wait (turn decoded, never committed): roll
+            // back like the in-loop polls (and text AR), or it stays in context.
             vl_cancel_after_rollback(
                 stdout,
                 id,

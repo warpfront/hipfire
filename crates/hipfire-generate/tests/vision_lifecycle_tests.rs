@@ -320,12 +320,13 @@ fn vl_lifecycle_matrix() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (mut child, mut reader, mut stdin) = spawn_child("vl");
-    // Drive abort injection: prefill cancels fire on READY, decode cancels
-    // on the first streamed token.
+    // Drive abort injection: prefill cancels fire on gen_start, decode cancels
+    // on the first streamed text (token or reasoning: VL thinks by default),
+    // commit-wait cancels on commit_ready.
     let mut line = String::new();
     let mut transcript = Transcript::default();
-    let mut t6_tokens = 0;
     let mut aborted_t6 = false;
+    let mut aborted_t6c = false;
     loop {
         line.clear();
         match reader.read_line(&mut line) {
@@ -342,13 +343,15 @@ fn vl_lifecycle_matrix() {
                     writeln!(stdin, "ABORT g48-vl-t2 2").expect("abort t2");
                     stdin.flush().expect("flush abort");
                 }
-                if e.id == "g48-vl-t6" && e.typ == "token" {
-                    t6_tokens += 1;
-                    if t6_tokens == 1 && !aborted_t6 {
-                        aborted_t6 = true;
-                        writeln!(stdin, "ABORT g48-vl-t6 6").expect("abort t6");
-                        stdin.flush().expect("flush abort");
-                    }
+                if e.id == "g48-vl-t6" && e.text.is_some() && !aborted_t6 {
+                    aborted_t6 = true;
+                    writeln!(stdin, "ABORT g48-vl-t6 6").expect("abort t6");
+                    stdin.flush().expect("flush abort");
+                }
+                if e.id == "g48-vl-t6c" && e.typ == "commit_ready" && !aborted_t6c {
+                    aborted_t6c = true;
+                    writeln!(stdin, "ABORT g48-vl-t6c 10").expect("abort t6c");
+                    stdin.flush().expect("flush abort");
                 }
                 transcript.events.push(e);
             }
@@ -369,6 +372,7 @@ fn vl_lifecycle_matrix() {
         "reload-ok",
         "g48-vl-t5",
         "g48-vl-t6",
+        "g48-vl-t6c",
         "g48-vl-t7",
         "g48-vl-t8",
         "g48-vl-t9",
@@ -415,8 +419,9 @@ fn vl_lifecycle_matrix() {
     assert!(!fresh.is_empty(), "fresh-load turn streamed no text");
     // Reuse after cancel + injected prefill fault.
     assert_eq!(token_text(&transcript, "g48-vl-t4"), fresh);
-    // Cancel during decode, then reuse.
+    // Cancel during decode, then cancel at the commit wait, then reuse.
     assert_outcome(&transcript, "g48-vl-t6", TerminalOutcome::Cancel);
+    assert_outcome(&transcript, "g48-vl-t6c", TerminalOutcome::Cancel);
     assert_eq!(token_text(&transcript, "g48-vl-t7"), fresh);
     // Injected decode fault, then reuse.
     assert_outcome(&transcript, "g48-vl-t8", TerminalOutcome::Error);
@@ -798,9 +803,11 @@ fn child_vl_matrix() {
     );
     emit_marker("SECTION reload-ok");
     vl_turn(&mut m, &mut gpu, "g48-vl-t5", 5, &image, prompt, 8, true);
-    // T6 cancel-during-decode (parent aborts on first token; wider budget
-    // so decode is still in flight); T7 reuse.
+    // T6 cancel-during-decode (parent aborts on the first streamed text; wider
+    // budget so decode is still in flight); T6c client abort at the commit
+    // wait (parent aborts on commit_ready); T7 reuse.
     vl_turn(&mut m, &mut gpu, "g48-vl-t6", 6, &image, prompt, 32, false);
+    vl_turn(&mut m, &mut gpu, "g48-vl-t6c", 10, &image, prompt, 8, false);
     vl_turn(&mut m, &mut gpu, "g48-vl-t7", 7, &image, prompt, 8, true);
     // T8 injected decode fault; T9 reuse.
     hipfire_generate::common::arm_vision_fault(Some("decode"));
