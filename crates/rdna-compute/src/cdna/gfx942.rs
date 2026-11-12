@@ -479,6 +479,199 @@ pub(crate) fn ensure_qsa_row_kernel(
     Ok(own)
 }
 
+const QWEN4_G942_CONV_FUSE_SRC: &str =
+    include_str!("../../../../kernels/src/qwen4_g942_conv_fuse.gfx942.hip");
+/// The exact-gfx942 convert-elimination module of the C8 lane-verify window (its own cache key and
+/// twin seat).
+pub const QWEN4_G942_CONV_FUSE_MODULE: &str = "qwen4_g942_conv_fuse";
+/// `hyper_norm_f32` with a second, BF16-bits output (`normalized_bf16`).
+pub const QWEN4_G942_HYPER_NORM_BF16X: &str = "qwen4_g942_hyper_norm_bf16x";
+/// `hyper_write_norm_f32` with a second, BF16-bits output of the read's `normalized` rows.
+pub const QWEN4_G942_HYPER_WRITE_NORM_BF16X: &str = "qwen4_g942_hyper_write_norm_bf16x";
+
+/// `HIPFIRE_QWEN4_G942_CONV_FUSE_IMAGE=/absolute/device.elf` (developer, read once): the explicitly
+/// supplied code object of [`QWEN4_G942_CONV_FUSE_MODULE`] (the Route-A twin proof: same module,
+/// same entry names, loaded through `ensure_embedded_kernel`). Unset: the hipcc source, unchanged.
+fn g942_conv_fuse_image() -> HipResult<Option<&'static std::sync::Arc<[u8]>>> {
+    static IMAGE: std::sync::LazyLock<Result<Option<std::sync::Arc<[u8]>>, String>> =
+        std::sync::LazyLock::new(|| {
+            match hipfire_config::developer_var("HIPFIRE_QWEN4_G942_CONV_FUSE_IMAGE") {
+                Ok(path) if !path.is_empty() => std::fs::read(&path)
+                    .map(|bytes| Some(std::sync::Arc::<[u8]>::from(bytes)))
+                    .map_err(|error| {
+                        format!("HIPFIRE_QWEN4_G942_CONV_FUSE_IMAGE {path}: {error}")
+                    }),
+                _ => Ok(None),
+            }
+        });
+    let loaded: &'static Result<Option<std::sync::Arc<[u8]>>, String> = &IMAGE;
+    match loaded {
+        Ok(image) => Ok(image.as_ref()),
+        Err(message) => Err(hip_bridge::HipError::new(0, message)),
+    }
+}
+
+/// Bind `func` of [`QWEN4_G942_CONV_FUSE_MODULE`]: the hipcc source (the anchor object), or the
+/// `HIPFIRE_QWEN4_G942_CONV_FUSE_IMAGE` code object.
+fn g942_conv_fuse_ensure(gpu: &mut Gpu, func: &str) -> HipResult<()> {
+    gpu.bind_thread()?;
+    match g942_conv_fuse_image()? {
+        Some(image) => gpu.ensure_embedded_kernel(QWEN4_G942_CONV_FUSE_MODULE, image.clone(), func),
+        None => gpu.ensure_kernel(QWEN4_G942_CONV_FUSE_MODULE, QWEN4_G942_CONV_FUSE_SRC, func),
+    }
+}
+
+impl Gfx942Device<'_> {
+    /// [`crate::tensor_ops::hyper_norm`] that also stores each normalized value as BF16 bits into
+    /// `normalized_bf16` (`[rows * branches * hidden]` BF16): the F32 `normalized` rows are
+    /// bitwise `hyper_norm_f32`'s, and the BF16 rows are the bytes `convert_f32_to_bf16` stages
+    /// from them (the values are BF16-rounded). Entry `qwen4_g942_hyper_norm_bf16x` of module
+    /// `qwen4_g942_conv_fuse`; grid `[branches, rows]`, block 256.
+    pub fn hyper_norm_bf16x(
+        &mut self,
+        p: &crate::tensor_ops::HyperNorm<'_>,
+        normalized_bf16: &GpuTensor,
+    ) -> HipResult<()> {
+        let refuse = |what: &str| Err(hip_bridge::HipError::new(0, &format!("hyper_norm_bf16x: {what}")));
+        if p.input.dtype != DType::F32
+            || p.normalized.dtype != DType::F32
+            || p.norm_weight.dtype != DType::BF16
+            || normalized_bf16.dtype != DType::BF16
+            || p.branches == 0
+            || p.hidden == 0
+        {
+            return refuse("dtype or geometry");
+        }
+        let Some(wide) = p.branches.checked_mul(p.hidden) else {
+            return refuse("extent overflow");
+        };
+        let elements = p.input.numel();
+        if elements == 0
+            || elements % wide != 0
+            || p.norm_weight.numel() != wide
+            || p.normalized.numel() != elements
+            || normalized_bf16.numel() < elements
+            || elements > i32::MAX as usize
+        {
+            return refuse("shape");
+        }
+        let rows = elements / wide;
+        g942_conv_fuse_ensure(self.gpu, QWEN4_G942_HYPER_NORM_BF16X)?;
+        let mut args = KernargBlob::new();
+        args.push_ptr(p.input.buf.as_ptr());
+        args.push_ptr(p.norm_weight.buf.as_ptr());
+        args.push_ptr(p.normalized.buf.as_ptr());
+        args.push_i32(p.branches as i32);
+        args.push_i32(p.hidden as i32);
+        args.push_i32(rows as i32);
+        args.push_ptr(normalized_bf16.buf.as_ptr());
+        args.push_i32(i32::from(p.state_bf16));
+        args.pad_to(16);
+        self.gpu.launch_blob_recorded(
+            QWEN4_G942_HYPER_NORM_BF16X,
+            [p.branches as u32, rows as u32, 1],
+            [256, 1, 1],
+            0,
+            args.as_mut_slice(),
+            crate::dispatch::ReplayLaunchBindings::NONE,
+        )
+    }
+}
+
+impl Gfx942Device<'_> {
+    /// [`crate::tensor_ops::hyper_write_norm`] that also stores the read's `normalized` rows as
+    /// BF16 bits into `normalized_bf16` (`[rows * 4 * 2560]` BF16): every other output is
+    /// bitwise `hyper_write_norm_f32`'s, and the BF16 rows are the bytes `convert_f32_to_bf16`
+    /// stages from `normalized` (the values are BF16-rounded). Entry
+    /// `qwen4_g942_hyper_write_norm_bf16x` of module `qwen4_g942_conv_fuse`, grid `[4, rows]`,
+    /// block 256; the same operand contract and refusals as `hyper_write_norm`.
+    pub fn hyper_write_norm_bf16x(
+        &mut self,
+        p: &crate::tensor_ops::HyperWrite<'_>,
+        norm_weight: &GpuTensor,
+        normalized: &GpuTensor,
+        normalized_bf16: &GpuTensor,
+        quarters_in: Option<&GpuTensor>,
+        next: Option<&crate::tensor_ops::HyperNextGates<'_>>,
+        clear: Option<&GpuTensor>,
+    ) -> HipResult<()> {
+        let refuse = |what: &str| {
+            Err(hip_bridge::HipError::new(
+                0,
+                &format!("hyper_write_norm_bf16x: {what}"),
+            ))
+        };
+        if [p.input, p.mixed, p.gates, p.output, normalized]
+            .iter()
+            .any(|t| t.dtype != DType::F32)
+        {
+            return refuse("F32 operand");
+        }
+        let Some(wide) = p.branches.checked_mul(p.hidden) else {
+            return refuse("extent overflow");
+        };
+        let rows = p.input.numel() / wide.max(1);
+        let quarters_ok = |q: &GpuTensor| q.dtype == DType::F32 && q.numel() == 16 * rows;
+        if p.state_bf16
+            || p.branches != 4
+            || p.hidden != 2560
+            || rows == 0
+            || rows > crate::prefill_invariant::WIDE_VERIFY_MAX_ROWS
+            || norm_weight.dtype != DType::BF16
+            || normalized_bf16.dtype != DType::BF16
+            || normalized_bf16.numel() < rows * wide
+            || p.input.numel() != rows * wide
+            || p.output.numel() != rows * wide
+            || normalized.numel() != rows * wide
+            || norm_weight.numel() != wide
+            || p.mixed.numel() != rows * p.hidden
+            || p.gates.numel() != rows * p.branches
+            || quarters_in.is_some_and(|q| !quarters_ok(q))
+            || clear.is_some_and(|c| c.dtype != DType::F32 || c.numel() > i32::MAX as usize)
+            || next.is_some_and(|n| {
+                !quarters_ok(n.quarters)
+                    || n.norm_weight.dtype != DType::BF16
+                    || n.norm_weight.numel() != wide
+                    || n.inject.dtype != DType::BF16
+                    || n.inject.numel() != 4 * wide
+            })
+        {
+            return refuse("shape");
+        }
+        g942_conv_fuse_ensure(self.gpu, QWEN4_G942_HYPER_WRITE_NORM_BF16X)?;
+        let null = std::ptr::null_mut();
+        let mut args = KernargBlob::new();
+        for ptr in [
+            p.input.buf.as_ptr(),
+            p.mixed.buf.as_ptr(),
+            p.gates.buf.as_ptr(),
+            quarters_in.map_or(null, |q| q.buf.as_ptr()),
+            p.output.buf.as_ptr(),
+            norm_weight.buf.as_ptr(),
+            normalized.buf.as_ptr(),
+            normalized_bf16.buf.as_ptr(),
+            next.map_or(null, |n| n.norm_weight.buf.as_ptr()),
+            next.map_or(null, |n| n.inject.buf.as_ptr()),
+            next.map_or(null, |n| n.quarters.buf.as_ptr()),
+            clear.map_or(null, |c| c.buf.as_ptr()),
+        ] {
+            args.push_ptr(ptr);
+        }
+        args.push_i32(clear.map_or(0, |c| c.numel() as i32));
+        args.push_i32(4);
+        args.push_i32(2560);
+        args.pad_to(16);
+        self.gpu.launch_blob_recorded(
+            QWEN4_G942_HYPER_WRITE_NORM_BF16X,
+            [4, rows as u32, 1],
+            [256, 1, 1],
+            0,
+            args.as_mut_slice(),
+            crate::dispatch::ReplayLaunchBindings::NONE,
+        )
+    }
+}
+
 /// A mutable GPU borrow proven to target exact gfx942.
 ///
 /// The constructor is intentionally available only through Gpu::try_gfx942.
@@ -3881,6 +4074,118 @@ mod tests {
             assert!(
                 !anchor.windows(absent.len()).any(|w| w == absent.as_bytes()),
                 "{absent} entry in the QSA row anchor"
+            );
+        }
+    }
+
+    /// The convert-fuse module's blocks are `tensor_ops.hip`'s / `qwen4_gemv_bf16_xf32.hip`'s text
+    /// byte for byte once the `// G12` additions are removed (and the one renamed entry mapped
+    /// back), and nothing else in it is code but the entry wrappers.
+    #[test]
+    fn g942_conv_fuse_source_is_tensor_ops_verbatim() {
+        let sources = [
+            ("tensor_ops.hip", crate::tensor_ops::TENSOR_OPS_SRC, 3usize),
+            (
+                "qwen4_gemv_bf16_xf32.hip",
+                crate::kernels::QWEN4_GEMV_BF16_XF32_SRC,
+                2usize,
+            ),
+        ];
+        let mut g12_lines = 0;
+        let mut outside = super::QWEN4_G942_CONV_FUSE_SRC.to_string();
+        for (file, production, expected_blocks) in sources {
+            let begin = format!("// BEGIN verbatim {file}\n");
+            let end_marker = format!("// END verbatim {file}");
+            let mut blocks = 0;
+            while let Some(at) = outside.find(&begin) {
+                let body_start = at + begin.len();
+                let end = outside[body_start..]
+                    .find(&end_marker)
+                    .expect("END marker after every BEGIN marker");
+                let block = outside[body_start..body_start + end]
+                    .trim_end_matches('\n')
+                    .replace("qwen4_g942_hyper_write_norm_bf16x(", "hyper_write_norm_f32(");
+                let stripped: Vec<&str> = block
+                    .lines()
+                    .filter(|line| {
+                        let g12 = line.trim_end().ends_with("// G12");
+                        g12_lines += usize::from(g12);
+                        !g12
+                    })
+                    .collect();
+                let stripped = stripped.join("\n");
+                assert!(
+                    production.contains(&stripped),
+                    "verbatim block {blocks} of qwen4_g942_conv_fuse.gfx942.hip is no longer a \
+                     substring of {file}: mirror the production edit\nblock starts: {:?}",
+                    &stripped[..stripped.len().min(120)]
+                );
+                blocks += 1;
+                outside.replace_range(at..body_start + end + end_marker.len(), "");
+            }
+            assert_eq!(blocks, expected_blocks, "{file} blocks");
+        }
+        assert_eq!(
+            g12_lines, 6,
+            "the BF16 output parameter and two store lines of each of the two entries"
+        );
+        // Outside the markers: comments, includes and the one entry wrapper.
+        let code: Vec<&str> = outside
+            .lines()
+            .map(str::trim)
+            .filter(|t| !(t.is_empty() || t.starts_with("//") || t.starts_with("#include")))
+            .collect();
+        assert_eq!(
+            code,
+            [
+                "extern \"C\" __global__ void qwen4_g942_hyper_norm_bf16x(",
+                "const void* input,",
+                "const __hip_bfloat16* norm_weight,",
+                "float* normalized,",
+                "int branches,",
+                "int hidden,",
+                "int rows,",
+                "unsigned short* normalized_bf16,",
+                "int state_bf16) {",
+                "if (state_bf16)",
+                "hyper_norm_rows((const unsigned short*)input, norm_weight, normalized, branches, hidden,",
+                "rows, normalized_bf16, (_Float16*)nullptr);",
+                "else",
+                "hyper_norm_rows((const float*)input, norm_weight, normalized, branches, hidden, rows,",
+                "normalized_bf16, (_Float16*)nullptr);",
+                "}",
+            ],
+            "unmarked code in the convert-fuse module"
+        );
+    }
+
+    /// The frozen hipcc anchor of the convert-fuse module: `hipcc --genco --offload-arch=gfx942 -O3
+    /// --no-offload-compress -fuse-cuid=none -mcode-object-version=6` of the pinned source (ROCm
+    /// 7.16, AMD clang 24.0.0git d6f6cb6918). Re-seal both hashes together when the source changes.
+    #[test]
+    fn g942_conv_fuse_anchor_and_source_are_pinned() {
+        use sha2::{Digest, Sha256};
+        const SOURCE_SHA256: &str =
+            "f5b22c8d7f590a2e25511cc14d03f321a5072a13dbd617a6f68d1a17a275ca95";
+        const ANCHOR_SHA256: &str =
+            "acf9d67b83b041cbb291c6df8379cc5b0d1c6c208fa5b13c763f3979b84a7c3a";
+        let hex = |bytes: &[u8]| -> String {
+            Sha256::digest(bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        };
+        assert_eq!(hex(super::QWEN4_G942_CONV_FUSE_SRC.as_bytes()), SOURCE_SHA256);
+        let anchor: &[u8] =
+            include_bytes!("../../../../kernels/qwen4_g942_conv_fuse_hipcc_gfx942.co");
+        assert_eq!(hex(anchor), ANCHOR_SHA256);
+        for name in [
+            super::QWEN4_G942_HYPER_NORM_BF16X,
+            super::QWEN4_G942_HYPER_WRITE_NORM_BF16X,
+        ] {
+            assert!(
+                anchor.windows(name.len()).any(|w| w == name.as_bytes()),
+                "{name} missing from the anchor"
             );
         }
     }
