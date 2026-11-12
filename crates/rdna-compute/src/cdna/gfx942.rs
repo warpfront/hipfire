@@ -406,6 +406,39 @@ impl Gfx942Device<'_> {
         }
         result.map(|()| true)
     }
+
+    /// [`Self::qwen4_hc_down_act_rows16`] for any `batch`: up to 16 rows that one launch, past 16
+    /// one launch per 16-row slice of `x` and of `out` (last slice partial). Each output row is
+    /// the single-row fused entry's bytes (the entry's per-element chain does not depend on the
+    /// batch), so a slice chain is bytewise the per-row singleton route and the unfused
+    /// `gemm_bf16_mfma_gfx942_*` + five-launch activation chain over the same rows, with no
+    /// extra launches for the activation. Returns `Ok(false)` when any slice declines (the
+    /// caller's unfused route then rewrites every row of `out`; a declined later slice leaves
+    /// the earlier slices' rows written, which that route overwrites).
+    pub fn qwen4_hc_down_act_slices(
+        &mut self,
+        a: &DeviceBuffer,
+        x: &GpuTensor,
+        out: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch: usize,
+        scale: f32,
+    ) -> HipResult<bool> {
+        const SLICE: usize = 16;
+        if batch <= SLICE {
+            return self.qwen4_hc_down_act_rows16(a, x, out, m, k, batch, scale);
+        }
+        for row in (0..batch).step_by(SLICE) {
+            let rows = (batch - row).min(SLICE);
+            let xs = x.sub_offset(row * k, rows * k);
+            let ys = out.sub_offset(row * m, rows * m);
+            if !self.qwen4_hc_down_act_rows16(a, &xs, &ys, m, k, rows, scale)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
 }
 
 impl Gfx942Device<'_> {
