@@ -800,7 +800,7 @@ pub fn is_batch_eligible(
     if req.has_image || req.has_tools || req.has_stop {
         return false;
     }
-    if req.has_speculator || req.has_adaptive || req.has_pflash {
+    if req.has_speculator || req.has_adaptive {
         return false;
     }
     if req.has_messages_history {

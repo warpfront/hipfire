@@ -2004,201 +2004,6 @@ pub static FIELDS: &[ConfigField] = &[
         "HIPFIRE_PROMPT_CACHE_UNBOUNDED",
         "Remove the assistant-turn cache capacity bound."
     ),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
-    field!(
-        "speculation.prefill.mode",
-        "prefill_compression",
-        Speculation,
-        ModelLoad,
-        DefaultValue::String("off"),
-        ValueRule::Enum(&["off", "auto", "always"]),
-        true,
-        true,
-        None,
-        "Deprecated PFlash (removal in 0.5.0): speculative-prefill policy."
-    ),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
-    field!(
-        "speculation.prefill.threshold",
-        "prefill_threshold",
-        Speculation,
-        ModelLoad,
-        DefaultValue::Integer(32768),
-        ValueRule::Integer {
-            min: 0,
-            max: 1048576
-        },
-        true,
-        true,
-        None,
-        "Deprecated PFlash (removal in 0.5.0): auto-mode token threshold."
-    ),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
-    field!(
-        "speculation.prefill.keep_ratio",
-        "prefill_keep_ratio",
-        Speculation,
-        ModelLoad,
-        DefaultValue::Float(0.05),
-        ValueRule::Float {
-            min: 0.0,
-            max: 1.0,
-            min_inclusive: false
-        },
-        true,
-        true,
-        None,
-        "Deprecated PFlash (removal in 0.5.0): retained-token ratio."
-    ),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
-    field!(
-        "speculation.prefill.alpha",
-        "prefill_alpha",
-        Speculation,
-        ModelLoad,
-        DefaultValue::Float(0.85),
-        ValueRule::Float {
-            min: 0.0,
-            max: 1.0,
-            min_inclusive: true
-        },
-        true,
-        true,
-        None,
-        "Deprecated PFlash (removal in 0.5.0): block-selection strictness."
-    ),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
-    field!(
-        "speculation.prefill.min_keep",
-        "prefill_min_keep",
-        Speculation,
-        ModelLoad,
-        DefaultValue::Integer(2048),
-        ValueRule::Integer {
-            min: 0,
-            max: 1048576
-        },
-        true,
-        true,
-        None,
-        "Deprecated PFlash (removal in 0.5.0): retained-token floor."
-    ),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
-    field!(
-        "speculation.prefill.sink",
-        "prefill_sink",
-        Speculation,
-        ModelLoad,
-        DefaultValue::Integer(256),
-        ValueRule::Integer { min: 0, max: 65536 },
-        true,
-        true,
-        None,
-        "Deprecated PFlash (removal in 0.5.0): always-retained prompt prefix."
-    ),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
-    field!(
-        "speculation.prefill.recent",
-        "prefill_recent",
-        Speculation,
-        ModelLoad,
-        DefaultValue::Integer(1024),
-        ValueRule::Integer { min: 0, max: 65536 },
-        true,
-        true,
-        None,
-        "Deprecated PFlash (removal in 0.5.0): always-retained prompt tail."
-    ),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
-    field!(
-        "speculation.prefill.block",
-        "prefill_block",
-        Speculation,
-        ModelLoad,
-        DefaultValue::Integer(128),
-        ValueRule::Integer { min: 1, max: 4096 },
-        true,
-        true,
-        None,
-        "Deprecated PFlash (removal in 0.5.0): scoring block size."
-    ),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
-    field!(
-        "speculation.prefill.drafter",
-        "prefill_drafter",
-        Speculation,
-        ModelLoad,
-        DefaultValue::String(""),
-        ValueRule::String,
-        true,
-        true,
-        None,
-        "Deprecated PFlash (removal in 0.5.0): drafter path."
-    ),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
-    field!(
-        "speculation.prefill.drafter_device",
-        "prefill_drafter_device",
-        Speculation,
-        ModelLoad,
-        DefaultValue::Integer(-1),
-        ValueRule::Integer { min: -1, max: 15 },
-        true,
-        true,
-        None,
-        "Deprecated PFlash (removal in 0.5.0): drafter device; -1 uses the target device."
-    ),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
-    field!(
-        "speculation.prefill.profile",
-        "prefill_profile",
-        Speculation,
-        Diagnostic,
-        DefaultValue::Bool(false),
-        ValueRule::Bool,
-        false,
-        true,
-        None,
-        "Deprecated PFlash (removal in 0.5.0): emit PFlash stage timings."
-    ),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
-    field!(
-        "speculation.prefill.sparse_threshold",
-        "prefill_sparse_threshold",
-        Speculation,
-        ModelLoad,
-        DefaultValue::Integer(32768),
-        ValueRule::Integer {
-            min: 0,
-            max: 1048576
-        },
-        true,
-        true,
-        None,
-        "Deprecated PFlash (removal in 0.5.0): sparse-attention threshold."
-    ),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
-    field!(
-        "speculation.prefill.drafter_kv",
-        "prefill_drafter_kv",
-        Speculation,
-        ModelLoad,
-        DefaultValue::String("q8"),
-        ValueRule::Enum(&["q8", "fwht4", "fwht3", "fwht2"]),
-        true,
-        true,
-        Some("HIPFIRE_PFLASH_DRAFTER_KV"),
-        "Deprecated PFlash (removal in 0.5.0): KV quantization used by the PFlash drafter scorer."
-    ),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
-    diagnostic_field!(
-        "diagnostic.pflash.score_layer",
-        "pflash_score_layer",
-        DefaultValue::Null,
-        ValueRule::NullableInteger { min: 0, max: 65535 },
-        "HIPFIRE_PFLASH_SCORE_LAYER",
-        "Deprecated PFlash (removal in 0.5.0): override the PFlash scoring layer; null uses model policy."
-    ),
     field!(
         "speculation.mtp",
         "mtp_mode",
@@ -4161,14 +3966,12 @@ fn valid_developer_suffix(suffix: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
-/// Key prefixes (canonical names) of the CASK and PFlash research features,
+/// Key prefixes (canonical names) of the CASK research feature,
 /// deprecated since 0.4.0 with removal in 0.5.0.
-const DEPRECATED_KEY_PREFIXES: &[&str] =
-    &["memory.cask.", "speculation.prefill.", "diagnostic.pflash."];
+const DEPRECATED_KEY_PREFIXES: &[&str] = &["memory.cask."];
 
 /// True when `key` (canonical or legacy flat name) belongs to a deprecated
-/// CASK/PFlash family: `memory.cask.*`, `speculation.prefill.*` or
-/// `diagnostic.pflash.*`.
+/// CASK family: `memory.cask.*`.
 pub fn is_deprecated_key(key: &str) -> bool {
     let canonical = field(key).map_or(key, |schema| schema.key);
     DEPRECATED_KEY_PREFIXES
@@ -4220,6 +4023,118 @@ pub static RETIRED_CONFIG_KEYS: &[RetiredConfigKey] = &[
         removed_in: "0.5.0",
         reason: "ParoQuant was removed",
         replacement: "none; ParoQuant models are no longer supported, use an MQ4 or HFQ4 model",
+    },
+    RetiredConfigKey {
+        key: "speculation.prefill.mode",
+        legacy_key: "prefill_compression",
+        shipped_in: "0.1.20",
+        removed_in: "0.5.0",
+        reason: "PFlash speculative-prefill compression was removed",
+        replacement: "none; prefix caching (the existing prompt-prefix cache) replaces it",
+    },
+    RetiredConfigKey {
+        key: "speculation.prefill.threshold",
+        legacy_key: "prefill_threshold",
+        shipped_in: "0.1.20",
+        removed_in: "0.5.0",
+        reason: "PFlash speculative-prefill compression was removed",
+        replacement: "none; prefix caching (the existing prompt-prefix cache) replaces it",
+    },
+    RetiredConfigKey {
+        key: "speculation.prefill.keep_ratio",
+        legacy_key: "prefill_keep_ratio",
+        shipped_in: "0.1.20",
+        removed_in: "0.5.0",
+        reason: "PFlash speculative-prefill compression was removed",
+        replacement: "none; prefix caching (the existing prompt-prefix cache) replaces it",
+    },
+    RetiredConfigKey {
+        key: "speculation.prefill.alpha",
+        legacy_key: "prefill_alpha",
+        shipped_in: "0.1.20",
+        removed_in: "0.5.0",
+        reason: "PFlash speculative-prefill compression was removed",
+        replacement: "none; prefix caching (the existing prompt-prefix cache) replaces it",
+    },
+    RetiredConfigKey {
+        key: "speculation.prefill.min_keep",
+        legacy_key: "prefill_min_keep",
+        shipped_in: "0.1.20",
+        removed_in: "0.5.0",
+        reason: "PFlash speculative-prefill compression was removed",
+        replacement: "none; prefix caching (the existing prompt-prefix cache) replaces it",
+    },
+    RetiredConfigKey {
+        key: "speculation.prefill.sink",
+        legacy_key: "prefill_sink",
+        shipped_in: "0.1.20",
+        removed_in: "0.5.0",
+        reason: "PFlash speculative-prefill compression was removed",
+        replacement: "none; prefix caching (the existing prompt-prefix cache) replaces it",
+    },
+    RetiredConfigKey {
+        key: "speculation.prefill.recent",
+        legacy_key: "prefill_recent",
+        shipped_in: "0.1.20",
+        removed_in: "0.5.0",
+        reason: "PFlash speculative-prefill compression was removed",
+        replacement: "none; prefix caching (the existing prompt-prefix cache) replaces it",
+    },
+    RetiredConfigKey {
+        key: "speculation.prefill.block",
+        legacy_key: "prefill_block",
+        shipped_in: "0.1.20",
+        removed_in: "0.5.0",
+        reason: "PFlash speculative-prefill compression was removed",
+        replacement: "none; prefix caching (the existing prompt-prefix cache) replaces it",
+    },
+    RetiredConfigKey {
+        key: "speculation.prefill.drafter",
+        legacy_key: "prefill_drafter",
+        shipped_in: "0.1.20",
+        removed_in: "0.5.0",
+        reason: "PFlash speculative-prefill compression was removed",
+        replacement: "none; prefix caching (the existing prompt-prefix cache) replaces it",
+    },
+    RetiredConfigKey {
+        key: "speculation.prefill.drafter_device",
+        legacy_key: "prefill_drafter_device",
+        shipped_in: "0.1.20",
+        removed_in: "0.5.0",
+        reason: "PFlash speculative-prefill compression was removed",
+        replacement: "none; prefix caching (the existing prompt-prefix cache) replaces it",
+    },
+    RetiredConfigKey {
+        key: "speculation.prefill.profile",
+        legacy_key: "prefill_profile",
+        shipped_in: "0.1.20",
+        removed_in: "0.5.0",
+        reason: "PFlash speculative-prefill compression was removed",
+        replacement: "none; prefix caching (the existing prompt-prefix cache) replaces it",
+    },
+    RetiredConfigKey {
+        key: "speculation.prefill.sparse_threshold",
+        legacy_key: "prefill_sparse_threshold",
+        shipped_in: "0.1.20",
+        removed_in: "0.5.0",
+        reason: "PFlash speculative-prefill compression was removed",
+        replacement: "none; prefix caching (the existing prompt-prefix cache) replaces it",
+    },
+    RetiredConfigKey {
+        key: "speculation.prefill.drafter_kv",
+        legacy_key: "prefill_drafter_kv",
+        shipped_in: "0.1.20",
+        removed_in: "0.5.0",
+        reason: "PFlash speculative-prefill compression was removed",
+        replacement: "none; prefix caching (the existing prompt-prefix cache) replaces it",
+    },
+    RetiredConfigKey {
+        key: "diagnostic.pflash.score_layer",
+        legacy_key: "pflash_score_layer",
+        shipped_in: "0.1.20",
+        removed_in: "0.5.0",
+        reason: "PFlash speculative-prefill compression was removed",
+        replacement: "none; prefix caching (the existing prompt-prefix cache) replaces it",
     },
 ];
 
@@ -7075,18 +6990,8 @@ mod tests {
     }
 
     #[test]
-    fn deprecated_key_covers_cask_and_pflash_families() {
-        for key in [
-            "memory.cask.enabled",
-            "cask",
-            "cask_sidecar",
-            "speculation.prefill.mode",
-            "prefill_compression",
-            "prefill_drafter",
-            "prefill_threshold",
-            "diagnostic.pflash.score_layer",
-            "pflash_score_layer",
-        ] {
+    fn deprecated_key_covers_the_cask_family() {
+        for key in ["memory.cask.enabled", "cask", "cask_sidecar"] {
             assert!(is_deprecated_key(key), "{key} must be deprecated");
         }
         for key in [
@@ -7101,7 +7006,7 @@ mod tests {
             assert!(!is_deprecated_key(key), "{key} must not be deprecated");
         }
         for field in fields() {
-            let family = ["memory.cask.", "speculation.prefill.", "diagnostic.pflash."]
+            let family = ["memory.cask."]
                 .iter()
                 .any(|prefix| field.key.starts_with(prefix));
             assert_eq!(is_deprecated_key(field.key), family, "{}", field.key);
@@ -9179,13 +9084,6 @@ overrides = { decide = { calibration = { choice = 1.3, score = 2, noul = 0.7 } }
             field("memory.cask.sidecar").unwrap().default.to_value(),
             ConfigValue::String(String::new())
         );
-        assert_eq!(
-            field("speculation.prefill.mode")
-                .unwrap()
-                .default
-                .to_value(),
-            ConfigValue::String("off".into())
-        );
     }
 
     #[test]
@@ -9566,6 +9464,37 @@ overrides = { decide = { calibration = { choice = 1.3, score = 2, noul = 0.7 } }
         let loaded = load_global(&paths).unwrap();
         assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn removed_pflash_keys_fail_the_load_naming_prefix_caching() {
+        for (name, body) in [
+            (
+                "canonical",
+                "schema_version = 1\n[speculation.prefill]\nmode = \"auto\"\n",
+            ),
+            (
+                "legacy",
+                "schema_version = 1\nprefill_compression = \"auto\"\n",
+            ),
+            (
+                "diagnostic",
+                "schema_version = 1\n[diagnostic.pflash]\nscore_layer = 3\n",
+            ),
+        ] {
+            let root = temp_root(&format!("retired-pflash-{name}"));
+            fs::create_dir_all(&root).unwrap();
+            let paths = ConfigPaths::under(&root);
+            fs::write(&paths.config_toml, body).unwrap();
+            let err = load_global(&paths).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::RetiredKey { .. }),
+                "{name}: {err:?}"
+            );
+            for needle in ["removed in 0.5.0", "prefix caching"] {
+                assert!(err.to_string().contains(needle), "{name}: {err}");
+            }
+        }
     }
 
     #[test]

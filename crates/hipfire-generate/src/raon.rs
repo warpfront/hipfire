@@ -606,8 +606,6 @@ pub fn generate_raon_spec(
         // The Jinja render owns the generation suffix once it succeeds, and
         // `spec_prompt_matches_ar` proved that it does.
         AssistantPrefix::Plain,
-        None,
-        None,
         tools.filter(|t| !t.is_empty()),
         messages_history.filter(|h| !h.is_empty()),
         stop,

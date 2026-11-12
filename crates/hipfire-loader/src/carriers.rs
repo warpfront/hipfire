@@ -755,10 +755,6 @@ impl Carrier for Qwen4Carrier {
             (options.cask, "CASK (memory.cask)"),
             (options.non_single_compute, "non-single compute placement"),
             (options.expert_count_override, "expert-count override"),
-            (
-                options.pflash,
-                "PFlash (prefill_compression; set it to off)",
-            ),
         ]
         .into_iter()
         .filter_map(|(set, name)| set.then_some(name))
@@ -865,7 +861,6 @@ impl Carrier for Qwen4Carrier {
                 hipfire_config::Deepseek4ComputePlacement::Single
             ),
             expert_count_override: ctx.deepseek4_experts_per_token.is_some(),
-            pflash: false,
         };
         qwen4_ep_option_refusal(ep, ctx.draft_path, &options)?;
         self.admit_options(ctx.draft_path, options)?;
@@ -1177,7 +1172,6 @@ pub(crate) fn qwen4_ep_option_refusal(
         (options.kv_adaptive, "adaptive KV"),
         (options.eagle_drafter, "an EAGLE drafter"),
         (options.cask, "CASK"),
-        (options.pflash, "PFlash"),
         (
             options.expert_count_override,
             "an experts-per-token override",
@@ -11080,7 +11074,6 @@ fn load_qwen4_pp_model(src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedMode
             hipfire_config::Deepseek4ComputePlacement::Single
         ),
         expert_count_override: ctx.deepseek4_experts_per_token.is_some(),
-        pflash: false,
     };
     crate::admission::qwen4_pp_option_refusal(pp, ctx.draft_path, &options)?;
     Qwen4Carrier.admit_options(ctx.draft_path, options)?;
@@ -14590,13 +14583,6 @@ mod qwen4_admission_tests {
                 },
             ),
             (
-                "PFlash",
-                SourceAdmissionOptions {
-                    pflash: true,
-                    ..defaults
-                },
-            ),
-            (
                 "expert-count override",
                 SourceAdmissionOptions {
                     expert_count_override: true,
@@ -14669,34 +14655,6 @@ mod qwen4_admission_tests {
     }
 
     #[test]
-    fn pflash_alone_refusal_names_only_pflash() {
-        let options = SourceAdmissionOptions {
-            spec: resolved_ar_spec(),
-            pflash: true,
-            ..Default::default()
-        };
-        let error = Qwen4Carrier.admit_options(None, options).unwrap_err();
-        assert_eq!(
-            error,
-            "qwen4: unsupported option(s): PFlash (prefill_compression; set it to off); turn them off to load Flash-Next"
-        );
-        for other in [
-            "draft model",
-            "EAGLE",
-            "adaptive KV",
-            "DFlash",
-            "DSpark",
-            "n-gram",
-            "DDTree",
-            "CASK",
-            "non-single",
-            "expert-count",
-        ] {
-            assert!(!error.contains(other), "{other}: {error}");
-        }
-    }
-
-    #[test]
     fn expert_parallel_refuses_speculation_and_single_device_options_naming_ep() {
         use super::qwen4_ep_option_refusal;
         let defaults = SourceAdmissionOptions {
@@ -14709,7 +14667,7 @@ mod qwen4_admission_tests {
             1,
             Some("draft.hfq"),
             &SourceAdmissionOptions {
-                pflash: true,
+                eagle_drafter: true,
                 ..defaults
             }
         )
@@ -14746,14 +14704,6 @@ mod qwen4_admission_tests {
                 None,
                 SourceAdmissionOptions {
                     cask: true,
-                    ..defaults
-                },
-            ),
-            (
-                "PFlash",
-                None,
-                SourceAdmissionOptions {
-                    pflash: true,
                     ..defaults
                 },
             ),

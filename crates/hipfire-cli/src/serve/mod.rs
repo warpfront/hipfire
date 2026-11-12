@@ -1246,7 +1246,6 @@ pub(crate) fn is_batch_eligible_request(
         "dflash_mode",
         "mtp_mode",
         "ngram_draft",
-        "prefill_sparse_threshold",
         "kv_adaptive",
         "prefix",
     ] {

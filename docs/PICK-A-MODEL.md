@@ -99,9 +99,8 @@ separate surface: [IMAGEGEN.md](IMAGEGEN.md).
 
 ## Not recommended
 
-PFlash prefill compression and CASK / TriAttention KV eviction are deprecated
-since 0.4.0 and scheduled for removal in 0.5.0; they are unsupported and no
-row here depends on them. The legacy contiguous-DFlash knobs
+CASK / TriAttention KV eviction is deprecated since 0.4.0 and scheduled for
+removal in 0.5.0; it is unsupported and no row here depends on it. The legacy contiguous-DFlash knobs
 (`HIPFIRE_DFLASH_WINDOW=0`, `HIPFIRE_DFLASH_CTX_CAP`) and the Givens `legacy-asymN`
 / `asymN` / `turboN` KV names are deprecated on the same schedule; prefer a
 `kv_cache` of `auto`, `q8` or `fwhtN`. See

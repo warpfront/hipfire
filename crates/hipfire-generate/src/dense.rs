@@ -7973,7 +7973,7 @@ pub fn generate_cohere2moe(
 /// Phase-1 bring-up scope: encode prompt → prefill → greedy decode loop
 /// → stream `{"type":"token",...}` events → `{"type":"done",...}`.
 ///
-/// Deliberately bypasses qwen35/llama machinery — no PFlash, no DFlash,
+/// Deliberately bypasses qwen35/llama machinery — no DFlash,
 /// no eviction, no ChatML scaffolding, no tool-use, no `<think>` /
 /// `max_think_tokens`, no repeat penalty, no top-p sampling. These
 /// land as the surrounding daemon features mature for the Qwen2 path.

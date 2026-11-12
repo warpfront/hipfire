@@ -188,12 +188,6 @@ works, what to measure, what counts as pass/fail.
   `serve.vmm_batch` serve with ≥ 4 lanes, IU4 verify gates unchanged).
   DFlash greedy may differ from AR near argmax ties; judge it against the
   MTP arm and the C1 == C8 state oracle, not byte-equality with AR.
-- **PFlash is deprecated since 0.4.0 and will be removed in 0.5.0.**
-  It lives in `crates/hipfire-pflash` outside `crates/hipfire-arch-*`, still
-  loads, warns when used (`prefill_compression` != `off`), and is not
-  supported; prefix caching supersedes it for supported serving workloads.
-  Agents must not treat PFlash as a production element, recommendation,
-  acceptance route, or basis for a current performance claim.
 - **Also deprecated since 0.4.0, removal in 0.5.0** (each entry point carries
   `// lifecycle: deprecated since 0.4.0, removal 0.5.0 — <reason>`; the
   status of every env var / config key is in `docs/env-vars.md` /
@@ -201,7 +195,7 @@ works, what to measure, what counts as pass/fail.
   (`legacy-asymN`) and the `asymN`/`turboN` KV aliases (use `fwhtN`);
   legacy contiguous DFlash knobs (`HIPFIRE_DFLASH_WINDOW=0`,
   `HIPFIRE_DFLASH_CTX_CAP`); the `scripts/coherence-gate-*.sh` batteries,
-  `_coherence_runner.py`, `awq_coherence_check.sh`, `pflash-gate.sh`;
+  `_coherence_runner.py`, `awq_coherence_check.sh`;
   GGUF **weight** input to the quantizer (lossy double quantization; use
   llama.cpp for GGUF — `imatrix.gguf` stays); MQ4R / DS4 MQ2R route selection
   by file extension (no runtime warning; 0.5.0 selects by HFQ metadata).

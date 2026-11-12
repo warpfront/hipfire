@@ -49,7 +49,7 @@ pub enum KTier {
     },
     /// Native E4M3FN K/V, one f16 scale per (token, KV head) inline in the
     /// token row. gfx1201-only, Qwen dense single-GPU only. Never q8, never
-    /// compactable, never a PFlash drafter tier.
+    /// compactable.
     Fp8,
 }
 
@@ -153,17 +153,6 @@ impl KTier {
         matches!(
             self,
             KTier::Q8 | KTier::Asym4 { .. } | KTier::Asym3 { .. } | KTier::Asym2 { .. }
-        )
-    }
-
-    /// Drafter-scoring storage must be Q8 or FWHT-asym (Givens-asym banned).
-    pub fn storage_ok_for_pflash(self) -> bool {
-        matches!(
-            self,
-            KTier::Q8
-                | KTier::Asym4 { fwht: true }
-                | KTier::Asym3 { fwht: true }
-                | KTier::Asym2 { fwht: true }
         )
     }
 
@@ -1017,7 +1006,7 @@ mod tests {
             classify(false, false, false, false, false, false, false, false, false, false, false),
             KTier::F32
         );
-        // fp8 decodes to Fp8, is not q8/compactable/pflash, and has no
+        // fp8 decodes to Fp8, is not q8/compactable, and has no
         // defined compaction stride.
         assert_eq!(
             classify(false, false, false, false, false, false, false, false, false, false, true),
@@ -1025,10 +1014,8 @@ mod tests {
         );
         assert!(!KTier::Fp8.is_q8());
         assert!(!KTier::Fp8.is_compactable());
-        assert!(!KTier::Fp8.storage_ok_for_pflash());
         assert!(!KTier::Bf16.is_q8());
         assert!(!KTier::Bf16.is_compactable());
-        assert!(!KTier::Bf16.storage_ok_for_pflash());
     }
 
     #[test]
@@ -1515,11 +1502,7 @@ mod tests {
 
     #[test]
     fn ktier_queries() {
-        assert!(
-            KTier::Q8.is_compactable() && KTier::Q8.is_q8() && KTier::Q8.storage_ok_for_pflash()
-        );
-        assert!(KTier::Asym3 { fwht: true }.storage_ok_for_pflash());
-        assert!(!KTier::Asym3 { fwht: false }.storage_ok_for_pflash());
+        assert!(KTier::Q8.is_compactable() && KTier::Q8.is_q8());
         assert!(!KTier::F32.is_compactable());
     }
 }

@@ -476,7 +476,7 @@ pins compose to a release.
 
 ## Deprecated features
 
-PFlash prefill compression, CASK / TriAttention KV eviction,
+CASK / TriAttention KV eviction,
 Givens/asymmetric KV modes and the legacy DFlash knobs have been deprecated
 since 0.4.0. They are unsupported and will be removed in 0.5.0. See
 [configuration](docs/CONFIG.md) for supported settings and

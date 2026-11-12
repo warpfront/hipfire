@@ -458,9 +458,8 @@ pub fn qwen_ar_done_value(
     decode_tok_s: f64,
     ttft_ms: f64,
     cached_tokens: usize,
-    pflash_fragment_json: &str,
 ) -> serde_json::Value {
-    let mut envelope = serde_json::json!({
+    let envelope = serde_json::json!({
         "type": "done",
         "id": id,
         "tokens": generated,
@@ -474,18 +473,6 @@ pub fn qwen_ar_done_value(
         "finish_reason": finish_reason,
         "attempt_id": active_attempt_id(),
     });
-    // Optional pflash object already serialized as `, "pflash":{...}` fragment
-    // by production; parse and merge when non-empty so the writer stays serde.
-    if !pflash_fragment_json.is_empty() {
-        let padded = format!("{{{}}}", pflash_fragment_json.trim_start_matches(','));
-        if let Ok(serde_json::Value::Object(map)) =
-            serde_json::from_str::<serde_json::Value>(&padded)
-        {
-            for (k, v) in map {
-                envelope[k] = v;
-            }
-        }
-    }
     envelope
 }
 
@@ -2642,7 +2629,6 @@ pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
         decode_tok_s,
         prefill_ms,
         cached_tokens,
-        "",
     );
     stage_terminal_tool_calls(
         &mut pending_done,
@@ -2695,7 +2681,6 @@ pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
 pub fn generate(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
-    drafter_gpu: Option<&mut rdna_compute::Gpu>,
     stdout: &mut std::io::Stdout,
     id: &str,
     prompt: &str,
@@ -2720,8 +2705,6 @@ pub fn generate(
     budget_alert_text: &str,
     max_think_tokens: usize,
     assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
-    pflash_state: Option<&mut hipfire_pflash::pflash::PflashState>,
-    pflash_cfg: Option<&hipfire_pflash::pflash::PflashConfig>,
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
     think_mode: ThinkMode,
@@ -2919,8 +2902,6 @@ pub fn generate(
                 budget_alert_at_tok,
                 budget_alert_text,
                 assistant_prefix,
-                pflash_state,
-                pflash_cfg,
                 think_mode,
                 user_explicit_sampling,
                 cactus_delta,
@@ -2958,8 +2939,6 @@ pub fn generate(
                 budget_alert_at_tok,
                 budget_alert_text,
                 assistant_prefix,
-                pflash_state,
-                pflash_cfg,
                 user_explicit_sampling,
                 cactus_delta,
             );
@@ -3010,11 +2989,6 @@ pub fn generate(
         }
     }
 
-    // Compress runs on the PFlash drafter handle when one is set (hetero
-    // sibling device), else on the target gpu. The handle is consumed at
-    // the seq_pos==0 compress site; decode always uses `gpu`.
-    let mut drafter_gpu = drafter_gpu;
-
     // Dispatch is structurally authoritative on `selected_route`. Spec-capacity
     // miss fallthrough (crate::qwen::generate_dflash → false) stays inside the Spec arm and
     // continues to that arch's AR producer — never an independent re-predicate.
@@ -3030,8 +3004,6 @@ pub fn generate(
                 max_tokens,
                 max_think_tokens,
                 assistant_prefix,
-                None, // native Qwen4 MTP owns no PFlash drafter
-                None, // pflash_alpha
                 tools,
                 messages_history,
                 stop,
@@ -3192,8 +3164,6 @@ pub fn generate(
                 max_tokens,
                 max_think_tokens,
                 assistant_prefix,
-                None, // pflash_bypass_reason — no pflash on the n-gram path
-                None, // pflash_alpha
                 tools,
                 messages_history,
                 stop,
@@ -3219,8 +3189,6 @@ pub fn generate(
                 budget_alert_text,
                 max_think_tokens,
                 assistant_prefix,
-                pflash_state,
-                pflash_cfg,
                 tools,
                 messages_history,
             );
@@ -3245,8 +3213,6 @@ pub fn generate(
                 budget_alert_text,
                 max_think_tokens,
                 assistant_prefix,
-                pflash_state,
-                pflash_cfg,
                 tools,
                 messages_history,
             );
@@ -3269,18 +3235,13 @@ pub fn generate(
             unreachable!("gemma4 dispatches through generation_early_route before this match")
         }
         GenerationRoute::MapleAr => {
-            // Arch 15 has no pflash/no eviction, but it DOES honour the
+            // Arch 15 has no eviction, but it DOES honour the
             // QwenJinja reasoning contract: `enable_thinking` (from
             // `thinking_enabled`), `assistant_prefix` (open/closed/plain) and
             // the explicit `max_think_tokens` cap are threaded into the
             // generate path so a user's `reasoning_effort:"none"` or cap is
             // not silently ignored.
-            let _ = (
-                budget_alert_at_tok,
-                budget_alert_text,
-                pflash_state,
-                pflash_cfg,
-            );
+            let _ = (budget_alert_at_tok, budget_alert_text);
             crate::dense::generate_maple(
                 m,
                 gpu,
@@ -3307,8 +3268,6 @@ pub fn generate(
                 budget_alert_text,
                 max_think_tokens,
                 assistant_prefix,
-                pflash_state,
-                pflash_cfg,
             );
             let _ = (repeat_penalty, repeat_window);
             crate::dense::generate_deepseek4_spec(
@@ -3336,8 +3295,6 @@ pub fn generate(
                 budget_alert_text,
                 max_think_tokens,
                 assistant_prefix,
-                pflash_state,
-                pflash_cfg,
             );
             let _ = (repeat_penalty, repeat_window);
             crate::dense::generate_deepseek4(
@@ -3360,13 +3317,11 @@ pub fn generate(
             // Arch 19 (Raon-1-mini). Single-GPU AR over the shared
             // `generate_ar_with_forward` body (QwenArSemanticProducer: think
             // router, XML tool router, stop matcher, gen_start/terminal
-            // lifecycle). No pflash/eviction/spec on this arch.
+            // lifecycle). No eviction/spec on this arch.
             let _ = (
                 budget_alert_at_tok,
                 budget_alert_text,
                 assistant_prefix,
-                pflash_state,
-                pflash_cfg,
                 think_mode,
                 cactus_delta,
                 logprobs_top_k,
@@ -3411,8 +3366,6 @@ pub fn generate(
                 budget_alert_at_tok,
                 budget_alert_text,
                 assistant_prefix,
-                pflash_state,
-                pflash_cfg,
                 think_mode,
                 logprobs_top_k,
                 reasoning_effort,
@@ -3458,8 +3411,6 @@ pub fn generate(
                 max_tokens,
                 max_think_tokens,
                 assistant_prefix,
-                None,
-                None,
                 tools,
                 messages_history,
                 stop,
@@ -3483,8 +3434,6 @@ pub fn generate(
                 budget_alert_at_tok,
                 budget_alert_text,
                 assistant_prefix,
-                pflash_state,
-                pflash_cfg,
                 think_mode,
             );
             let _ = (repeat_penalty, repeat_window);
@@ -3509,8 +3458,6 @@ pub fn generate(
                 budget_alert_at_tok,
                 budget_alert_text,
                 assistant_prefix,
-                pflash_state,
-                pflash_cfg,
                 think_mode,
             );
             let _ = (repeat_penalty, repeat_window);
@@ -3541,8 +3488,6 @@ pub fn generate(
                 max_tokens,
                 max_think_tokens,
                 assistant_prefix,
-                None,
-                None,
                 tools,
                 messages_history,
                 stop,
@@ -3566,8 +3511,6 @@ pub fn generate(
                 budget_alert_at_tok,
                 budget_alert_text,
                 assistant_prefix,
-                pflash_state,
-                pflash_cfg,
                 think_mode,
             );
             let _ = (repeat_penalty, repeat_window);
@@ -3592,8 +3535,6 @@ pub fn generate(
                 budget_alert_at_tok,
                 budget_alert_text,
                 assistant_prefix,
-                pflash_state,
-                pflash_cfg,
                 think_mode,
             );
             let _ = (repeat_penalty, repeat_window);
@@ -3624,8 +3565,6 @@ pub fn generate(
                 max_tokens,
                 max_think_tokens,
                 assistant_prefix,
-                None,
-                None,
                 tools,
                 messages_history,
                 stop,
@@ -3649,8 +3588,6 @@ pub fn generate(
                 budget_alert_at_tok,
                 budget_alert_text,
                 assistant_prefix,
-                pflash_state,
-                pflash_cfg,
                 think_mode,
             );
             let _ = (repeat_penalty, repeat_window);
@@ -3675,8 +3612,6 @@ pub fn generate(
                 budget_alert_at_tok,
                 budget_alert_text,
                 assistant_prefix,
-                pflash_state,
-                pflash_cfg,
                 think_mode,
             );
             let _ = (repeat_penalty, repeat_window);
@@ -3702,8 +3637,6 @@ pub fn generate(
                 budget_alert_text,
                 max_think_tokens,
                 assistant_prefix,
-                pflash_state,
-                pflash_cfg,
                 tools,
                 messages_history,
             );
@@ -3726,8 +3659,6 @@ pub fn generate(
             crate::qwen::generate_mesh_carrier(
                 m,
                 gpu,
-                pflash_state,
-                pflash_cfg,
                 stdout,
                 id,
                 prompt,
@@ -3771,19 +3702,6 @@ pub fn generate(
                     let _ = stdout.flush();
                 }
             }
-            let mut dflash_bypass_reason: Option<&'static str> = None;
-            let dflash_alpha = pflash_cfg.as_ref().map(|c| c.alpha);
-            if let Some(cfg) = pflash_cfg.as_ref() {
-                if cfg.mode != hipfire_pflash::pflash::PflashMode::Off {
-                    let _ = writeln!(
-                        stdout,
-                        r#"{{"type":"pflash_bypass","id":"{}","reason":"dflash_decode_active (pflash compression on the DFlash path is a follow-up; set dflash_mode=off to compress with AR decode)"}}"#,
-                        id,
-                    );
-                    let _ = stdout.flush();
-                    dflash_bypass_reason = Some("dflash_decode_active");
-                }
-            }
             if crate::qwen::generate_dflash(
                 m,
                 gpu,
@@ -3794,8 +3712,6 @@ pub fn generate(
                 max_tokens,
                 max_think_tokens,
                 assistant_prefix,
-                dflash_bypass_reason,
-                dflash_alpha,
                 tools,
                 messages_history,
                 stop,
@@ -3813,7 +3729,7 @@ pub fn generate(
                 reasoning_effort,
                 enable_thinking,
             ) {
-                let _ = (budget_alert_at_tok, budget_alert_text, pflash_state);
+                let _ = (budget_alert_at_tok, budget_alert_text);
                 return;
             }
             // ctx-capacity miss → fall through to default AR body below.
@@ -3999,188 +3915,7 @@ pub fn generate(
     // ChatML scaffolding tokens are now built inside hipfire_runtime::prompt_frame.
     let im_end = tokenizer.encode("<|im_end|>");
     let nl = tokenizer.encode("\n");
-    let raw_q_tokens = tokenizer.encode(prompt);
-
-    // ── PFlash compression (Phase 4.1 #93) ──────────────────────────────
-    //
-    // Only on first turn (seq_pos == 0). Multi-turn compression of newly-
-    // added user content has knock-on effects on prior KV state that we
-    // haven't validated yet, so subsequent turns always bypass.
-    //
-    // Compression operates on the user's actual content tokens
-    // (`raw_q_tokens`); chat-template scaffolding (im_start / role / nl /
-    // im_end) wraps the result AFTER and is never compressed away.
-    // Empty must_keep_spans is correct: there are no chat boundaries
-    // INSIDE q_tokens (they live in the scaffolding the daemon adds).
-    //
-    // Bypass / compressed status is reported as a `pflash_compressed` or
-    // `pflash_bypass` event so operators can see what the request actually
-    // ran through.
-    //
-    // Tool-call detection: the prompt may contain a `<tool_call>` token
-    // that the parser uses for structure. Compressing those tokens away
-    // would corrupt the response shape, so we surface a ToolCall request
-    // kind to the gate and let `decide_bypass` reject the request loudly.
-    //
-    // Two scan locations:
-    //   1. raw_q_tokens (the user message itself).
-    //   2. system_prompt -- the OpenAI serve path puts tool definitions
-    //      and the `<tool_call>` format example in the system prompt
-    //      when `body.tools` is present (cli/index.ts buildSystem). A
-    //      first-turn user message with tools therefore needs a system-
-    //      prompt scan or it would slip through as Text and get its
-    //      schema text mangled by compression.
-    //
-    // Detection is best-effort -- the special-token id is missing on
-    // older vocabs, in which case the gate just routes through Text.
-    let request_kind = match tokenizer.special_token_id("<tool_call>") {
-        Some(tid) => {
-            let in_user = raw_q_tokens.iter().any(|&t| t == tid);
-            let in_system = system_prompt
-                .map(|s| tokenizer.encode(s).iter().any(|&t| t == tid))
-                .unwrap_or(false);
-            if in_user || in_system {
-                hipfire_pflash::pflash::RequestKind::ToolCall
-            } else {
-                hipfire_pflash::pflash::RequestKind::Text
-            }
-        }
-        None => hipfire_pflash::pflash::RequestKind::Text,
-    };
-
-    // Stashed CompressedPrompt summary (when compression actually fired);
-    // appended to the `done` event later so a streaming client gets one
-    // consolidated line. None means no compression happened on this request.
-    let mut pflash_summary: Option<hipfire_pflash::pflash::CompressedPrompt> = None;
-    // Bypass reason when compression was attempted but skipped (mode != Off
-    // and a drafter was loaded). PRD §3.1 requires "bypass reason if
-    // skipped" in the done object.
-    let mut pflash_bypass_reason: Option<String> = None;
-    // Effective alpha for this request (from cfg if pflash_state is loaded).
-    // PRD §3.1 lists alpha as a required done-object field.
-    let pflash_alpha: Option<f32> = pflash_cfg.map(|c| c.alpha);
-    // Helper: render the JSON field fragment for `done` per PRD §3.1.
-    // Three states:
-    //   - compressed: full metadata + alpha
-    //   - bypass (non-Off, drafter loaded): alpha + bypass_reason
-    //   - nothing: empty string so backwards-compatible clients see the
-    //     original done shape
-    pub fn pflash_done_fragment(
-        s: &Option<hipfire_pflash::pflash::CompressedPrompt>,
-        bypass_reason: &Option<String>,
-        alpha: Option<f32>,
-    ) -> String {
-        match (s, bypass_reason) {
-            (Some(cp), _) => format!(
-                r#","pflash":{{"source_tokens":{},"kept_tokens":{},"keep_ratio":{:.6},"alpha":{:.6},"score_ms":{},"total_ms":{},"source_md5":"{}","compressed_md5":"{}"}}"#,
-                cp.source_tokens,
-                cp.kept_tokens,
-                cp.kept_tokens as f32 / cp.source_tokens.max(1) as f32,
-                alpha.unwrap_or(0.0),
-                cp.timings.score_ms,
-                cp.timings.total_ms,
-                cp.source_md5,
-                cp.compressed_md5,
-            ),
-            (None, Some(reason)) => format!(
-                r#","pflash":{{"bypass_reason":"{}","alpha":{:.6}}}"#,
-                reason.replace('"', "'"),
-                alpha.unwrap_or(0.0),
-            ),
-            (None, None) => String::new(),
-        }
-    }
-    if hipfire_config::developer_var("HIPFIRE_PFLASH_DEBUG").is_ok() {
-        eprintln!(
-            "[pflash] gen: state={} cfg-present seq_pos={} q={} drafter_gpu={}",
-            pflash_state.is_some(),
-            m.seq_pos,
-            raw_q_tokens.len(),
-            drafter_gpu.is_some()
-        );
-    }
-    let q_tokens = if let (Some(state), Some(cfg)) = (pflash_state, pflash_cfg) {
-        if m.seq_pos == 0 {
-            let compress_gpu: &mut rdna_compute::Gpu = drafter_gpu.as_deref_mut().unwrap_or(gpu);
-            // Sibling-device drafter: bind its device before compress, then
-            // restore the target binding for decode. No-op when shared.
-            compress_gpu.bind_thread_or_warn();
-            let decision = hipfire_pflash::pflash::maybe_compress_prompt(
-                compress_gpu,
-                state,
-                cfg,
-                &raw_q_tokens,
-                request_kind,
-                &[],
-            );
-            gpu.bind_thread_or_warn();
-            match decision {
-                Ok(hipfire_pflash::pflash::PflashDecision::Compressed(cp)) => {
-                    eprintln!(
-                        "[pflash] COMPRESSED {} -> {} tok dev1 ({}ms)",
-                        cp.source_tokens, cp.kept_tokens, cp.timings.total_ms
-                    );
-                    let _ = writeln!(
-                        stdout,
-                        r#"{{"type":"pflash_compressed","id":"{}","source_tokens":{},"kept_tokens":{},"keep_ratio":{:.6},"source_md5":"{}","compressed_md5":"{}","score_ms":{},"select_ms":{},"gather_ms":{},"total_ms":{}}}"#,
-                        id,
-                        cp.source_tokens,
-                        cp.kept_tokens,
-                        cp.kept_tokens as f32 / cp.source_tokens.max(1) as f32,
-                        cp.source_md5,
-                        cp.compressed_md5,
-                        cp.timings.score_ms,
-                        cp.timings.select_ms,
-                        cp.timings.gather_ms,
-                        cp.timings.total_ms,
-                    );
-                    let _ = stdout.flush();
-                    let token_ids = cp.token_ids.clone();
-                    pflash_summary = Some(cp);
-                    token_ids
-                }
-                Ok(hipfire_pflash::pflash::PflashDecision::Bypass { reason }) => {
-                    eprintln!(
-                        "[pflash] BYPASS reason={} q={}",
-                        reason.as_str(),
-                        raw_q_tokens.len()
-                    );
-                    // Only emit bypass events for non-trivial reasons.
-                    // ModeOff is the silent default; nothing to report.
-                    if !matches!(reason, hipfire_pflash::pflash::BypassReason::ModeOff) {
-                        let r = reason.as_str();
-                        let _ = writeln!(
-                            stdout,
-                            r#"{{"type":"pflash_bypass","id":"{}","reason":"{}"}}"#,
-                            id,
-                            r.replace('"', "'"),
-                        );
-                        let _ = stdout.flush();
-                        // Stash for the `done` object too so a single-line
-                        // log scrape sees both the bypass reason and the
-                        // request's prefill timings.
-                        pflash_bypass_reason = Some(r);
-                    }
-                    raw_q_tokens
-                }
-                Err(e) => {
-                    eprintln!("[pflash] ERROR compress: {e}");
-                    let _ = writeln!(
-                        stdout,
-                        r#"{{"type":"pflash_error","id":"{}","reason":"{}"}}"#,
-                        id,
-                        e.to_string().replace('"', "'"),
-                    );
-                    let _ = stdout.flush();
-                    raw_q_tokens
-                }
-            }
-        } else {
-            raw_q_tokens
-        }
-    } else {
-        raw_q_tokens
-    };
+    let q_tokens = tokenizer.encode(prompt);
 
     // ChatML framing — two paths:
     //
@@ -4190,9 +3925,7 @@ pub fn generate(
     //      sequence the model was actually trained on (fixes the "hand-roll
     //      drifted from upstream template" class — XML tool calls on
     //      Qwen3.5/3.6 instead of JSON, `<|im_start|>user` for tool
-    //      responses instead of `<|im_start|>tool`, etc.). PFlash
-    //      compression is bypassed under Jinja for now (q_tokens not
-    //      reusable when the template renders to a String).
+    //      responses instead of `<|im_start|>tool`, etc.).
     //
     //   2) Default: hand-rolled `prompt_frame::ChatFrame::Plain`
     //      scaffold, byte-identical to today's behavior.
@@ -4347,8 +4080,6 @@ pub fn generate(
     //   - messages_history is provided (full-conversation context)
     //   - eviction not active (compact_offset > 0 invalidates the
     //     "conversation_tokens mirrors KV" invariant the cache relies on)
-    //   - PFlash compression not enabled this session (compression
-    //     changes the KV's token IDs relative to msg.content from history)
     //   - prior conversation_tokens non-empty (first turn = nothing to LCP)
     //
     // On HIT we set `m.seq_pos = LCP` and override `new_tokens` to the
@@ -4362,9 +4093,6 @@ pub fn generate(
         .ok()
         .as_deref()
         == Some("0");
-    let pflash_active = pflash_cfg
-        .map(|c| !matches!(c.mode, hipfire_pflash::pflash::PflashMode::Off))
-        .unwrap_or(false);
     // Jinja-on disqualification: when `HIPFIRE_JINJA_CHAT=1` the first
     // turn renders through the upstream HF chat template (which the
     // model was actually trained on — emits default system prompts,
@@ -4394,7 +4122,6 @@ pub fn generate(
     let cache_eligible = !cache_kill_switch
         && messages_history.is_some()
         && m.eviction.is_none()
-        && !pflash_active
         && (!m.conversation_tokens.is_empty() || vmm_pool);
     if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
         .ok()
@@ -4402,9 +4129,13 @@ pub fn generate(
         == Some("1")
     {
         eprintln!(
-            "[qwen-cache eligible] eligible={} kill={} hist={} evict_none={} !pflash={} jinja={} conv_tok={}",
-            cache_eligible, cache_kill_switch, messages_history.is_some(),
-            m.eviction.is_none(), !pflash_active, jinja_active, m.conversation_tokens.len(),
+            "[qwen-cache eligible] eligible={} kill={} hist={} evict_none={} jinja={} conv_tok={}",
+            cache_eligible,
+            cache_kill_switch,
+            messages_history.is_some(),
+            m.eviction.is_none(),
+            jinja_active,
+            m.conversation_tokens.len(),
         );
     }
     let mut cached_tokens_count: usize = 0;
@@ -4871,7 +4602,7 @@ pub fn generate(
     // NOT blanket-reset here (that would discard a valid cache hit and force a
     // cold re-prefill every turn). Only cold-reset when the cache did NOT run
     // (item #37): first turn (empty conversation), kill switch
-    // (HIPFIRE_QWEN_PROMPT_CACHE=0), eviction/PFlash active. On turn 2+ in those
+    // (HIPFIRE_QWEN_PROMPT_CACHE=0), eviction active. On turn 2+ in those
     // cases, reset BEFORE the budget guard + prefill so the full render writes
     // from position 0 rather than appending to the prior turn's dirty
     // DeltaNet/KV/checkpoint state. Uses `crate::common::free_checkpoints` (NOT a bare
@@ -6552,8 +6283,6 @@ pub fn generate(
         } else {
             0.0
         };
-        let pflash_frag =
-            pflash_done_fragment(&pflash_summary, &pflash_bypass_reason, pflash_alpha);
         let mut pending_done = qwen_ar_done_value(
             id,
             finish.finish_reason,
@@ -6565,7 +6294,6 @@ pub fn generate(
             decode_tok_s,
             prefill_s * 1000.0,
             cached_tokens_count,
-            &pflash_frag,
         );
         // Stage canonical calls in commit_ready/done for tool-safe terminals.
         // No post-commit tool_calls event — engine drain sees only final done.
@@ -6963,8 +6691,6 @@ pub fn generate(
         } else {
             0.0
         };
-        let pflash_frag =
-            pflash_done_fragment(&pflash_summary, &pflash_bypass_reason, pflash_alpha);
         let mut pending_done = serde_json::json!({
             "type": "done",
             "id": id,
@@ -6979,16 +6705,6 @@ pub fn generate(
             "finish_reason": if hit_stop { "stop" } else { "length" },
             "attempt_id": active_attempt_id(),
         });
-        if !pflash_frag.is_empty() {
-            let padded = format!("{{{}}}", pflash_frag.trim_start_matches(','));
-            if let Ok(serde_json::Value::Object(map)) =
-                serde_json::from_str::<serde_json::Value>(&padded)
-            {
-                for (k, v) in map {
-                    pending_done[k] = v;
-                }
-            }
-        }
         match await_client_terminal_commit(stdout, id, &pending_done) {
             ClientTerminalDecision::Commit => {
                 // Same store decision as the legacy spec route.
@@ -7083,7 +6799,6 @@ pub fn emit_qwen_ar_done(
     decode_tok_s: f64,
     ttft_ms: f64,
     cached_tokens: usize,
-    pflash_fragment_json: &str,
 ) {
     let envelope = qwen_ar_done_value(
         id,
@@ -7096,7 +6811,6 @@ pub fn emit_qwen_ar_done(
         decode_tok_s,
         ttft_ms,
         cached_tokens,
-        pflash_fragment_json,
     );
     emit_active_route_done(stdout, id, &envelope);
 }

@@ -1483,7 +1483,7 @@ fn serde_done_v2_hostile_id_roundtrip() {
     set_active_attempt_id(5);
     let mut sink = Vec::new();
     emit_qwen_dflash_done_terminal(
-        &mut sink, id, 2, 1.0, 1, 1.0, 1.0, 1.0, 1.0, 1.0, 1, 0, "stop", None,
+        &mut sink, id, 2, 1.0, 1, 1.0, 1.0, 1.0, 1.0, 1.0, 1, 0, "stop",
     );
     let out = String::from_utf8(sink).unwrap();
     let lines = parse_jsonl(&out);

@@ -515,7 +515,6 @@ Workspace crates with a path dependency on this crate:
 - `hipfire-engine`
 - `hipfire-generate`
 - `hipfire-loader`
-- `hipfire-pflash`
 - `hipfire-runtime`
 - `hsa-bridge`
 - `npu-tools`

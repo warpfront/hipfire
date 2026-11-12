@@ -51,8 +51,6 @@ DEPRECATED_GATES = {
     "memory.cask.enabled": "DefaultValue::Bool(false)",
     "memory.cask.auto_attach": "DefaultValue::Bool(false)",
     "diagnostic.replay.gfx1151_cu_count": 'DefaultValue::String("all")',
-    "speculation.prefill.mode": 'DefaultValue::String("off")',
-    "speculation.prefill.drafter": 'DefaultValue::String("")',
 }
 DEPRECATED_TUNING = {
     "memory.cask.budget",
@@ -60,18 +58,6 @@ DEPRECATED_TUNING = {
     "memory.cask.handoff_tokens",
     "memory.cask.core_fraction",
     "memory.cask.fold",
-    "speculation.prefill.threshold",
-    "speculation.prefill.keep_ratio",
-    "speculation.prefill.alpha",
-    "speculation.prefill.min_keep",
-    "speculation.prefill.sink",
-    "speculation.prefill.recent",
-    "speculation.prefill.block",
-    "speculation.prefill.drafter_device",
-    "speculation.prefill.profile",
-    "speculation.prefill.sparse_threshold",
-    "speculation.prefill.drafter_kv",
-    "diagnostic.pflash.score_layer",
 }
 # Deprecated env knobs that are not schema aliases (developer namespace or
 # unread harness exports). Their unset default is the supported behaviour.
@@ -80,7 +66,7 @@ DEPRECATED_ENV = {
     "HIPFIRE_CASK_OFF": "unread CASK harness export",
 }
 # Any variable named for a deprecated feature is deprecated with it.
-DEPRECATED_ENV_NAME = re.compile(r"PFLASH|CASK|TRIATT")
+DEPRECATED_ENV_NAME = re.compile(r"CASK|TRIATT")
 # Env vars that stay supported but have deprecated VALUES.
 ENV_VALUE_NOTES = {
     "HIPFIRE_DFLASH_WINDOW": "`0` (legacy contiguous DFlash) deprecated, removal 0.5.0",

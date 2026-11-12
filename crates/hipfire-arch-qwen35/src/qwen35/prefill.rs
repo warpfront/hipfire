@@ -3389,7 +3389,7 @@ fn forward_prefill_batch_intent(
         tree_verify,
         pbs_for_call,
         None, // mask_override: MTP probe is the only consumer; default callers don't override
-        None, // max_layer: pflash uses this; non-pflash default is full stack
+        None, // max_layer: default is the full stack
         true, // preserve legacy post-condition: scratch.logits is last-token logits
         None,
         wrapper.max_batch_override,

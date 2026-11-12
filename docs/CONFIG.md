@@ -193,8 +193,7 @@ row follows "all models" again, like `hipfire config <model> reset KEY`) and
 count as `N own values`.
 
 This page is the normative **key/default/enum** table. CASK/TriAttention is
-deprecated (removal in 0.5.0) and PFlash is retained legacy research (see their
-sections); multi-GPU topology
+deprecated (removal in 0.5.0); multi-GPU topology
 lives in its linked owner rather than a duplicated matrix here.
 
 ---
@@ -357,7 +356,7 @@ Typed schema keys (process-scoped):
 | `fusions.npu_trunk_calibration` | `""` | path string | See the stable-controls table above. |
 | `kernel.npu_spillover` | `false` | bool; env `HIPFIRE_NPU_SPILLOVER` | Opt-in, gfx1151-only XDNA NPU spillover sidecar. Needs a pulled, verified `.xdna.zip` sidecar declared by the registry entry: with the flag on and no declared sidecar the load stays GPU-only (one log line); a declared sidecar that is missing or fails verification fails the load with a `hipfire pull` hint. Never active on other architectures. |
 
-With `topology.ep` > 1 the loader refuses DFlash (including a draft path), DSpark, n-gram drafting, DDTree, adaptive KV, an EAGLE drafter, CASK, PFlash, an experts-per-token override and a non-`single` compute placement. Native MTP attaches only on an explicit request (`--spec mtp` / `speculation.mtp = "on"`; `auto` stays AR). Lane entry points, state snapshots and `HIPFIRE_MTP_SAMPLED_MODE=naive` are unsupported under Qwen4 EP.
+With `topology.ep` > 1 the loader refuses DFlash (including a draft path), DSpark, n-gram drafting, DDTree, adaptive KV, an EAGLE drafter, CASK, an experts-per-token override and a non-`single` compute placement. Native MTP attaches only on an explicit request (`--spec mtp` / `speculation.mtp = "on"`; `auto` stays AR). Lane entry points, state snapshots and `HIPFIRE_MTP_SAMPLED_MODE=naive` are unsupported under Qwen4 EP.
 
 The EP owner-routed prefill and the expert-staging levers have no typed schema key. They are `[developer]` keys (a legacy `HIPFIRE_FOO=value` maps to `developer.foo`), read from the process snapshot at load; restart the daemon after changing them. For the three `ep_*` levers only the exact value `0` turns the lever off.
 
@@ -1188,37 +1187,6 @@ Sidecar generation (deprecated with CASK): `hipfire sidecar-gen` — [`CLI.md`](
 
 Collapse `\n{3,}` → `\n\n` at engine entry. Legacy alias:
 `HIPFIRE_NORMALIZE_PROMPT` (`0`/`false`/`off`/`no` disable).
-
----
-
-## PFlash speculative prefill (deprecated, removal in 0.5.0)
-
-| Key | Default | Range / values |
-|---|---|---|
-| `prefill_compression` | `"off"` | `off` \| `auto` \| `always` |
-| `prefill_threshold` | `32768` | int 0–1048576 |
-| `prefill_keep_ratio` | `0.05` | (0, 1] |
-| `prefill_alpha` | `0.85` | [0, 1] |
-| `prefill_min_keep` | `2048` | int 0–1048576 |
-| `prefill_sink` | `256` | int 0–65536 |
-| `prefill_recent` | `1024` | int 0–65536 |
-| `prefill_block` | `128` | int 1–4096 |
-| `prefill_drafter` | `""` | path |
-| `prefill_drafter_device` | `-1` | int −1–15 (`-1` = same device as target) |
-| `prefill_profile` | `false` | bool |
-| `prefill_sparse_threshold` | `32768` | int 0–1048576 |
-| `prefill_drafter_kv` | `"q8"` | `q8` \| `fwht4` \| `fwht3` \| `fwht2` (`speculation.prefill.drafter_kv`, env `HIPFIRE_PFLASH_DRAFTER_KV`) |
-| `diagnostic.pflash.score_layer` | `null` | `null` or int 0–65535 (env `HIPFIRE_PFLASH_SCORE_LAYER`) |
-
-**Status:** deprecated since 0.4.0, removal in 0.5.0; not supported. Prefix
-caching supersedes it. Setting `prefill_compression` to anything but `off`
-prints one line at load:
-`[hipfire-daemon] warning: PFlash is deprecated and will be removed in 0.5.0; not supported, prefix caching supersedes it (prefill_compression=<mode> set at load)`.
-
-Off by default. Typed fields cover product PFlash policy; remaining experiments
-live under `[developer]` and retain matching `HIPFIRE_PREFILL_*` one-shot
-aliases. Detailed bypass reasons and serve wiring: [`SERVE.md`](SERVE.md) /
-runtime PFlash module — not restated here.
 
 ---
 
@@ -2303,7 +2271,6 @@ deprecated code. Env statuses live in [`env-vars.md`](env-vars.md#lifecycle-stat
 Deprecated since 0.4.0, removal in 0.5.0:
 
 - `memory.cask.*` (CASK / TriAttention eviction).
-- `speculation.prefill.*` and `diagnostic.pflash.score_layer` (PFlash; prefix caching supersedes it).
 - KV **values** `asym2|asym3|asym4`, `turbo|turbo2|turbo3|turbo4` (`kv_cache`, `kv_k`) and `legacy-asym2|3|4` (`kv_k`): Givens asym KV and its aliases; use `fwhtN` or `q8`.
 
 Removed keys. A key that shipped in a release and was later removed from the
@@ -2321,10 +2288,24 @@ branch) or a misspelled key is unknown and fails the load with
 | `kernel.mw16` | `mw16` | 0.3.1 | 0.4.1 | none; the default GEMM path applies |
 | `kernel.moe_paro_i8` | `moe_paro_i8` | 0.3.1 | 0.5.0 | none; ParoQuant models are no longer supported, use an MQ4 or HFQ4 model |
 | `kernel.moe_paro_i8_k8` | `moe_paro_i8_k8` | 0.3.1 | 0.5.0 | none; ParoQuant models are no longer supported, use an MQ4 or HFQ4 model |
+| `speculation.prefill.mode` | `prefill_compression` | 0.1.20 | 0.5.0 | none; prefix caching (the existing prompt-prefix cache) replaces it |
+| `speculation.prefill.threshold` | `prefill_threshold` | 0.1.20 | 0.5.0 | none; prefix caching (the existing prompt-prefix cache) replaces it |
+| `speculation.prefill.keep_ratio` | `prefill_keep_ratio` | 0.1.20 | 0.5.0 | none; prefix caching (the existing prompt-prefix cache) replaces it |
+| `speculation.prefill.alpha` | `prefill_alpha` | 0.1.20 | 0.5.0 | none; prefix caching (the existing prompt-prefix cache) replaces it |
+| `speculation.prefill.min_keep` | `prefill_min_keep` | 0.1.20 | 0.5.0 | none; prefix caching (the existing prompt-prefix cache) replaces it |
+| `speculation.prefill.sink` | `prefill_sink` | 0.1.20 | 0.5.0 | none; prefix caching (the existing prompt-prefix cache) replaces it |
+| `speculation.prefill.recent` | `prefill_recent` | 0.1.20 | 0.5.0 | none; prefix caching (the existing prompt-prefix cache) replaces it |
+| `speculation.prefill.block` | `prefill_block` | 0.1.20 | 0.5.0 | none; prefix caching (the existing prompt-prefix cache) replaces it |
+| `speculation.prefill.drafter` | `prefill_drafter` | 0.1.20 | 0.5.0 | none; prefix caching (the existing prompt-prefix cache) replaces it |
+| `speculation.prefill.drafter_device` | `prefill_drafter_device` | 0.1.20 | 0.5.0 | none; prefix caching (the existing prompt-prefix cache) replaces it |
+| `speculation.prefill.profile` | `prefill_profile` | 0.1.20 | 0.5.0 | none; prefix caching (the existing prompt-prefix cache) replaces it |
+| `speculation.prefill.sparse_threshold` | `prefill_sparse_threshold` | 0.1.20 | 0.5.0 | none; prefix caching (the existing prompt-prefix cache) replaces it |
+| `speculation.prefill.drafter_kv` | `prefill_drafter_kv` | 0.1.20 | 0.5.0 | none; prefix caching (the existing prompt-prefix cache) replaces it |
+| `diagnostic.pflash.score_layer` | `pflash_score_layer` | 0.1.20 | 0.5.0 | none; prefix caching (the existing prompt-prefix cache) replaces it |
 
 <!-- lifecycle-table:begin (generated by scripts/check-lifecycle.py --write) -->
 
-**Count:** 309 schema keys, plus the `developer.<name>` namespace.
+**Count:** 295 schema keys, plus the `developer.<name>` namespace.
 
 | Key | Legacy key | Env | Lifecycle |
 |---|---|---|---|
@@ -2358,7 +2339,6 @@ branch) or a misspelled key is unknown and fails the load with
 | `diagnostic.kernel.rocblas_min_batch` | `rocblas_min_batch` | `HIPFIRE_ROCBLAS_MIN_BATCH` | experimental |
 | `diagnostic.kernel.wo_wmma_variant` | `wo_wmma_variant` | `HIPFIRE_WO_WMMA_VARIANT` | experimental |
 | `diagnostic.mmq_quantize_only` | `mmq_diag_quantize_only` | `HIPFIRE_MMQ_DIAG_QUANTIZE_ONLY` | experimental |
-| `diagnostic.pflash.score_layer` | `pflash_score_layer` | `HIPFIRE_PFLASH_SCORE_LAYER` | deprecated |
 | `diagnostic.prompt_heat_json` | `prompt_heat_json` | `HIPFIRE_PROMPT_HEAT_JSON` | experimental |
 | `diagnostic.prompt_heat_limit` | `prompt_heat_limit` | `HIPFIRE_PROMPT_HEAT_LIMIT` | experimental |
 | `diagnostic.prompt_token_heat` | `prompt_token_heat` | `HIPFIRE_PROMPT_TOKEN_HEAT` | experimental |
@@ -2621,19 +2601,6 @@ branch) or a misspelled key is unknown and fails the load with
 | `speculation.ngram` | `ngram_mode` | `HIPFIRE_NGRAM_DRAFT` | stable |
 | `speculation.ngram_k` | `ngram_k` | `HIPFIRE_NGRAM_DRAFT_K` | stable |
 | `speculation.ngram_min_count` | `ngram_min_count` | `HIPFIRE_NGRAM_MIN_COUNT` | stable |
-| `speculation.prefill.alpha` | `prefill_alpha` |  | deprecated |
-| `speculation.prefill.block` | `prefill_block` |  | deprecated |
-| `speculation.prefill.drafter` | `prefill_drafter` |  | deprecated |
-| `speculation.prefill.drafter_device` | `prefill_drafter_device` |  | deprecated |
-| `speculation.prefill.drafter_kv` | `prefill_drafter_kv` | `HIPFIRE_PFLASH_DRAFTER_KV` | deprecated |
-| `speculation.prefill.keep_ratio` | `prefill_keep_ratio` |  | deprecated |
-| `speculation.prefill.min_keep` | `prefill_min_keep` |  | deprecated |
-| `speculation.prefill.mode` | `prefill_compression` |  | deprecated |
-| `speculation.prefill.profile` | `prefill_profile` |  | deprecated |
-| `speculation.prefill.recent` | `prefill_recent` |  | deprecated |
-| `speculation.prefill.sink` | `prefill_sink` |  | deprecated |
-| `speculation.prefill.sparse_threshold` | `prefill_sparse_threshold` |  | deprecated |
-| `speculation.prefill.threshold` | `prefill_threshold` |  | deprecated |
 | `topology.ep` | `ep` | `HIPFIRE_TOPOLOGY_EP` | experimental |
 | `topology.pp` | `pp` | `HIPFIRE_TOPOLOGY_PP` | experimental |
 | `vision.mode` | `vision_mode` | `HIPFIRE_VISION_MODE` | stable |

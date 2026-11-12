@@ -1355,12 +1355,7 @@ mod tests {
     fn deprecated_rows_are_read_only_but_resettable() {
         let mut fixture = FixtureBuilder::new("gfx1201").build();
         let before = fixture.config_bytes();
-        for legacy in [
-            "cask",
-            "prefill_compression",
-            "prefill_threshold",
-            "cask_budget",
-        ] {
+        for legacy in ["cask", "cask_budget"] {
             let key = field(legacy).expect("deprecated key").key;
             select_key(&mut fixture.app, key);
             for code in [

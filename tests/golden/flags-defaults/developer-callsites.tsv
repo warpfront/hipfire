@@ -662,7 +662,6 @@ developer_callsite	*	HIPFIRE_OFFLOAD_DEBUG#developer_var=is_ok
 developer_callsite	*	HIPFIRE_PACK_JOBS#developer_var=ok
 developer_callsite	*	HIPFIRE_PAGE_EVICTION#developer_var=ok.map.unwrap_or_else
 developer_callsite	*	HIPFIRE_PARENT_ROUTE_SCALE#developer_var=-
-developer_callsite	*	HIPFIRE_PFLASH_DEBUG#developer_var=is_ok
 developer_callsite	*	HIPFIRE_PLE_HOT_DEBUG#developer_var=is_ok_and
 developer_callsite	*	HIPFIRE_PLE_HOT_PACK_FILE#developer_var=ok.filter
 developer_callsite	*	HIPFIRE_PLE_HOT_RANK_FILE#developer_var=ok.filter
@@ -676,8 +675,6 @@ developer_callsite	*	HIPFIRE_PP_LANE_EDGE_HOST_WAIT#developer_var=ok.as_deref
 developer_callsite	*	HIPFIRE_PP_LANE_GROUPS#developer_var=ok.as_deref
 developer_callsite	*	HIPFIRE_PP_LANE_OVERLAP#developer_var=ok
 developer_callsite	*	HIPFIRE_PP_LAYERS#developer_var=ok.filter
-developer_callsite	*	HIPFIRE_PP_PFLASH#developer_var=ok.as_deref.!=Some("1")
-developer_callsite	*	HIPFIRE_PP_PFLASH#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_PREFILL_CHUNK_ROWS#developer_var=is_ok
 developer_callsite	*	HIPFIRE_PREFILL_CHUNK_ROWS#developer_var=ok
 developer_callsite	*	HIPFIRE_PREFILL_CHUNK_ROWS#developer_var=ok.and_then.filter

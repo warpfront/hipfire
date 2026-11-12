@@ -76,15 +76,7 @@ cache selection.
 - Support crates: hipfire-atlas (perf corpus), hipfire-reap (MoE
   expert pruning), hipfire-tui (chat/settings TUI), redline (experimental
   direct-KMD compute, not wired into serving) — plus `hipfire-ds4-parent`
-  (provisional) and `hipfire-pflash` (deprecated, removal in 0.5.0, see below).
-
-### PFlash status
-
-PFlash is deprecated since 0.4.0 and will be removed in 0.5.0. Prefix caching
-supersedes it for supported serving workloads. It still loads, but enabling it
-prints a deprecation warning and it is not supported; do not treat PFlash as a
-production element, recommendation, acceptance route, or basis for a current
-performance claim.
+  (provisional).
 
 ### CASK status
 

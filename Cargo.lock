@@ -1639,7 +1639,6 @@ dependencies = [
  "hipfire-engine",
  "hipfire-generate",
  "hipfire-loader",
- "hipfire-pflash",
  "hipfire-runtime",
  "libc",
  "parking_lot",
@@ -1736,7 +1735,6 @@ dependencies = [
  "hipfire-dispatch",
  "hipfire-engine",
  "hipfire-loader",
- "hipfire-pflash",
  "hipfire-runtime",
  "rdna-compute",
  "saddle-core",
@@ -1785,18 +1783,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
-]
-
-[[package]]
-name = "hipfire-pflash"
-version = "0.4.6"
-dependencies = [
- "hip-bridge",
- "hipfire-arch-qwen35",
- "hipfire-config",
- "hipfire-dispatch",
- "hipfire-runtime",
- "rdna-compute",
 ]
 
 [[package]]
@@ -1874,7 +1860,6 @@ dependencies = [
  "hipfire-dispatch",
  "hipfire-engine",
  "hipfire-loader",
- "hipfire-pflash",
  "hipfire-quantize",
  "hipfire-registry",
  "image",

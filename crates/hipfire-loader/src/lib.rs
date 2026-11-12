@@ -3474,7 +3474,6 @@ pub fn load_model_with_gemma4_drafter(
                 hipfire_config::Deepseek4ComputePlacement::Single
             ),
             expert_count_override: deepseek4_experts_per_token.is_some(),
-            pflash: false,
         },
     )?;
     let warning = crate::admission::legacy_warning(

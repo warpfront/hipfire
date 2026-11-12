@@ -4093,7 +4093,7 @@ pub struct DenseTpDflashSpeculator {
 
 /// Transactionally build both draft replicas. Every rank binds its own device
 /// and runs the single-rank load logic under a `DenseTp2EagerGreedy` posture:
-/// fixed B=16, DFlash2 all-sliding selector draft, no DDTree/PFlash/CASK/
+/// fixed B=16, DFlash2 all-sliding selector draft, no DDTree/CASK/
 /// adaptive-KV state, PM4/graph never armed. A later rank's failure frees all
 /// earlier ranks' draft + partial state; borrowed target state is untouched.
 /// Returns the mesh owner; target rank configs must already exist.

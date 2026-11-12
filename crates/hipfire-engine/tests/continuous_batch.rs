@@ -128,7 +128,6 @@ fn elig(
     has_stop: bool,
     has_speculator: bool,
     has_adaptive: bool,
-    has_pflash: bool,
     has_messages_history: bool,
     think_mode_is_nonthink: bool,
     serve_continuous_batch: bool,
@@ -143,7 +142,6 @@ fn elig(
         has_stop,
         has_speculator,
         has_adaptive,
-        has_pflash,
         has_messages_history,
         think_mode_is_nonthink,
         serve_continuous_batch,
@@ -155,46 +153,43 @@ fn elig(
 fn batch_eligible_only_qwen_text_single_gpu() {
     let _l = begin();
     assert!(elig(
-        5, 1, false, false, false, false, false, false, false, false, true, true, 4
+        5, 1, false, false, false, false, false, false, false, true, true, 4
     ));
     assert!(elig(
-        6, 1, false, false, false, false, false, false, false, false, true, true, 2
+        6, 1, false, false, false, false, false, false, false, true, true, 2
     ));
     assert!(!elig(
-        5, 1, false, false, false, false, false, false, false, false, true, false, 4
+        5, 1, false, false, false, false, false, false, false, true, false, 4
     ));
     assert!(!elig(
-        5, 1, false, false, false, false, false, false, false, false, true, true, 1
+        5, 1, false, false, false, false, false, false, false, true, true, 1
     ));
     assert!(!elig(
-        9, 1, false, false, false, false, false, false, false, false, true, true, 4
+        9, 1, false, false, false, false, false, false, false, true, true, 4
     ));
     assert!(!elig(
-        5, 2, false, false, false, false, false, false, false, false, true, true, 4
+        5, 2, false, false, false, false, false, false, false, true, true, 4
     ));
     assert!(!elig(
-        5, 1, true, false, false, false, false, false, false, false, true, true, 4
+        5, 1, true, false, false, false, false, false, false, true, true, 4
     ));
     assert!(!elig(
-        5, 1, false, true, false, false, false, false, false, false, true, true, 4
+        5, 1, false, true, false, false, false, false, false, true, true, 4
     ));
     assert!(!elig(
-        5, 1, false, false, true, false, false, false, false, false, true, true, 4
+        5, 1, false, false, true, false, false, false, false, true, true, 4
     ));
     assert!(!elig(
-        5, 1, false, false, false, true, false, false, false, false, true, true, 4
+        5, 1, false, false, false, true, false, false, false, true, true, 4
     ));
     assert!(!elig(
-        5, 1, false, false, false, false, true, false, false, false, true, true, 4
+        5, 1, false, false, false, false, true, false, false, true, true, 4
     ));
     assert!(!elig(
-        5, 1, false, false, false, false, false, true, false, false, true, true, 4
+        5, 1, false, false, false, false, false, true, false, true, true, 4
     ));
     assert!(!elig(
-        5, 1, false, false, false, false, false, false, true, false, true, true, 4
-    ));
-    assert!(!elig(
-        5, 1, false, false, false, false, false, false, false, true, true, true, 4
+        5, 1, false, false, false, false, false, false, true, true, true, 4
     ));
 }
 
@@ -204,40 +199,40 @@ fn batch_eligible_refuses_lfm11_and_preserves_qwen() {
     // LFM (arch 11) has no servable batch path: the capability is false, so
     // even a fully clean request is refused and no batch state is allocated.
     assert!(!elig(
-        11, 1, false, false, false, false, false, false, false, false, true, true, 4
+        11, 1, false, false, false, false, false, false, false, true, true, 4
     ));
     assert!(!elig(
-        11, 1, false, false, false, false, false, false, false, false, true, true, 2
+        11, 1, false, false, false, false, false, false, false, true, true, 2
     ));
-    // Same pure exclusions as Qwen: B=1, pp!=1, ep, images, tools, stops, spec, adaptive, pflash, history, think.
+    // Same pure exclusions as Qwen: B=1, pp!=1, ep, images, tools, stops, spec, adaptive, history, think.
     assert!(!elig(
-        11, 1, false, false, false, false, false, false, false, false, true, false, 4
-    ));
-    assert!(!elig(
-        11, 1, false, false, false, false, false, false, false, false, true, true, 1
+        11, 1, false, false, false, false, false, false, false, true, false, 4
     ));
     assert!(!elig(
-        11, 2, false, false, false, false, false, false, false, false, true, true, 4
+        11, 1, false, false, false, false, false, false, false, true, true, 1
     ));
     assert!(!elig(
-        11, 1, true, false, false, false, false, false, false, false, true, true, 4
+        11, 2, false, false, false, false, false, false, false, true, true, 4
     ));
     assert!(!elig(
-        11, 1, false, true, false, false, false, false, false, false, true, true, 4
+        11, 1, true, false, false, false, false, false, false, true, true, 4
+    ));
+    assert!(!elig(
+        11, 1, false, true, false, false, false, false, false, true, true, 4
     ));
     // Archs beside 5/6 stay ineligible (11 included, via the caps refusal above).
     assert!(!elig(
-        12, 1, false, false, false, false, false, false, false, false, true, true, 4
+        12, 1, false, false, false, false, false, false, false, true, true, 4
     ));
     assert!(!elig(
-        9, 1, false, false, false, false, false, false, false, false, true, true, 4
+        9, 1, false, false, false, false, false, false, false, true, true, 4
     ));
     // Qwen still eligible (preserve existing behavior).
     assert!(elig(
-        5, 1, false, false, false, false, false, false, false, false, true, true, 4
+        5, 1, false, false, false, false, false, false, false, true, true, 4
     ));
     assert!(elig(
-        6, 1, false, false, false, false, false, false, false, false, true, true, 4
+        6, 1, false, false, false, false, false, false, false, true, true, 4
     ));
 }
 

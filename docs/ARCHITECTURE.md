@@ -55,7 +55,6 @@ crates/
 ├── hipfire-arch-diffusion/   # FLUX.1 / FLUX.2 image-generation components (ids 40/45)
 ├── hipfire-arch-toy/         # template only (0xFF); never dispatched
 ├── hipfire-ds4-parent/       # DeepSeek V4 parent-checkpoint calibration oracle
-├── hipfire-pflash/           # PFlash prefill compression — deprecated since 0.4.0, removal in 0.5.0
 ├── hipfire-loader/           # Carrier registry, load_model, LoadedModel, batch staging
 ├── hipfire-engine/           # arch-free serve engine: scheduler, terminal, emit, prompt
 ├── hipfire-generate/         # generation bodies: ar, qwen, dense, vision, batch, img, redline fixtures
@@ -100,7 +99,6 @@ operator runtime.
 | Retained replay | `redline-dispatch`, `redline-rocr`, `rdna-compute::replay` | Product-integrated Redline **transport**: record, retain, replay PM4/AQL (see below) |
 | Typed authoring and validation | `peacemaker-ir`, `peacemaker-lift`, `peacemaker-cdna`, `peacemaker-author`, `peacemaker-isa`, `peacemaker-rip`, `railgun`, `railgun-cert`, `railgun-corpus`, `railgun-jitcorpus` | Machine-code types, lifter, checked builder, certified facts and dispatch-program model. `peacemaker-cdna` (CDNA3/gfx942 instruction model and CPU emulator) is reached only through `peacemaker-isa`'s opt-in `cdna` arm. It is a transitive compile-time dependency of `rdna-compute` (which depends on `peacemaker-isa`), but no runtime dispatch, callsite selection or default behavior uses it. Authoring and validation, **not** the retained transport (see railgun below) |
 | Direct-KMD research | `redline`, `saddle-lab` | Not the serving transport |
-| Deprecated | `hipfire-pflash` | PFlash prefill compression: deprecated since 0.4.0, removal in 0.5.0 |
 | NPU (XDNA2/AIE2P) | `peacemaker-npu`, `railgun` feature `npu`, `hipfire-arch-qwen4` `npu_trunk`, `npu-tools`, `hipfire-xdna` | `hipfire-arch-qwen4` links `peacemaker-npu` and `railgun`'s `npu` feature on Linux; the Flash-Next trunk route defaults to `auto` and arms only on gfx1151 with an openable NPU and matching calibration (see [Qwen4 NPU trunk](#qwen4-npu-trunk-xdna2)). `npu-tools` and `hipfire-xdna` are diagnostic/experimental ([`npu/README.md`](npu/README.md)) |
 
 The dependency edge runs one way and is checked by `cargo tree`:
@@ -190,7 +188,7 @@ threads, each with its own `Gpu`. It is **not** `LoadedModel.ep`, so a Qwen4 EP
 model still takes the ordinary `Qwen4Ar` / `Qwen4Spec` generation route rather
 than `generate_ep`. EP refuses what the replicated program does not run
 (DFlash, DSpark, n-gram drafting, DDTree, adaptive KV, an EAGLE drafter, CASK,
-PFlash, an experts-per-token override, a non-Single compute placement; lane
+an experts-per-token override, a non-Single compute placement; lane
 steps never run under EP), and native MTP attaches under EP only on an explicit
 `--spec mtp` (`qwen4_ep_option_refusal`, `qwen4_native_mtp`).
 

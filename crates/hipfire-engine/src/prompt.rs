@@ -80,7 +80,7 @@ pub fn wire_has_image(msg: &serde_json::Value) -> bool {
 
 /// Stateless prompt rendering for a batch lane, reusing the production
 /// `ChatFrame`/`JinjaChatFrame` path. Called with `seq_pos=0`, no tools/
-/// messages/PFlash, retains `started_in_think` for barrier gating.
+/// messages, retains `started_in_think` for barrier gating.
 /// Plain fallback on Jinja render failure is preserved only when no explicit
 /// `reasoning_effort` was supplied; explicit effort render errors are
 /// surfaced as `Err` (request validation) instead of hidden by Plain.

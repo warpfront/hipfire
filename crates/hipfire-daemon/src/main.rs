@@ -1150,25 +1150,10 @@ fn main() {
     // Monotonic cold-reset epoch; bumped only after successful synchronized reset.
     // Echoed on reset acks so Engine::reset can reject non-increasing epochs.
     let mut state_epoch: u64 = 0;
-    // PFlash speculative-prefill state. None unless the load message
-    // includes a `prefill_drafter` path AND `prefill_compression` != "off".
-    // Lives alongside `model` so unload_model + this state are paired
-    // teardowns.
-    let mut pflash_state: Option<hipfire_pflash::pflash::PflashState> = None;
     // Set when the most recent load had a tower sidecar available but
     // `vision_mode=off` skipped it, so an image request can name the knob
     // instead of claiming the model has no vision encoder at all.
     let mut vision_gated_off: Option<String> = None;
-    // The PflashConfig captured at load time. Per-request `prefill_*`
-    // params override individual fields; the rest fall back to these
-    // load-time defaults. Cleared alongside `pflash_state`.
-    let mut pflash_cfg: Option<hipfire_pflash::pflash::PflashConfig> = None;
-    // Hetero PFlash: when prefill_drafter_device differs from the target,
-    // the drafter weights/KV/scratch live on a sibling device. The compress
-    // output is a host-side Vec<u32>, so no peer-copy is needed — generate
-    // routes maybe_compress_prompt to this handle, decode stays on target.
-    // None means the drafter shares the target gpu (single-card, unchanged).
-    let mut pflash_drafter_gpu: Option<rdna_compute::Gpu> = None;
     // Continuous-batch host scheduler + GPU batch state (if available).
     // Initialized on successful load when `continuous_batch_size` > 1 and
     // the loaded route staged lane state (including Qwen4 single/EP/PP fn-lanes).
@@ -1511,17 +1496,7 @@ fn main() {
                     // Fixed Q8 slot arena has no VMM owner — always legacy.
                     // Emit once here; prior model/slot is about to be torn down.
                     let slot_kv_diag = ResidentKvDiag::for_slot(slot_kv_explicit);
-                    // Tear down PFlash / ordinary model (eager; experimental requires pp=tp=1 so no EP deferral).
-                    if let Some(mut pf) = pflash_state.take() {
-                        if let Some(mut dg) = pflash_drafter_gpu.take() {
-                            dg.bind_thread_or_warn();
-                            pf.unload_drafter(&mut dg);
-                            gpu.bind_thread_or_warn();
-                        } else {
-                            pf.unload_drafter(&mut gpu);
-                        }
-                    }
-                    pflash_cfg = None;
+                    // Tear down the ordinary model (eager; experimental requires pp=tp=1 so no EP deferral).
                     if let Some(m) = model.take() {
                         if let Err(err) = hipfire_loader::unload_model(m, &mut gpu) {
                             emit_uncorrelated_error(
@@ -2138,106 +2113,10 @@ fn main() {
                     gpu.mmq_screen.threshold = v as f32;
                 }
 
-                // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
-                // ── PFlash load-time params (Phase 4.0 #93) ──────────────
-                //
-                // Parse compression knobs per PRD §5.3.2. None of these
-                // affect the target load itself; they only configure the
-                // optional drafter that PFlash uses for prompt scoring.
-                // Drafter loading happens AFTER target load succeeds so
-                // we can use the target's tokenizer for the compat check.
-                let pflash_mode_str = msg
-                    .get("params")
-                    .and_then(|p| p.get("prefill_compression"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("off")
-                    .to_string();
-                let pflash_threshold = msg
-                    .get("params")
-                    .and_then(|p| p.get("prefill_threshold"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(32768) as usize;
-                let pflash_keep_ratio = msg
-                    .get("params")
-                    .and_then(|p| p.get("prefill_keep_ratio"))
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(0.05) as f32;
-                let pflash_alpha = msg
-                    .get("params")
-                    .and_then(|p| p.get("prefill_alpha"))
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(0.85) as f32;
-                let pflash_min_keep = msg
-                    .get("params")
-                    .and_then(|p| p.get("prefill_min_keep"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(2048) as usize;
-                let pflash_sink = msg
-                    .get("params")
-                    .and_then(|p| p.get("prefill_sink"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(256) as usize;
-                let pflash_recent = msg
-                    .get("params")
-                    .and_then(|p| p.get("prefill_recent"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(1024) as usize;
-                let pflash_block = msg
-                    .get("params")
-                    .and_then(|p| p.get("prefill_block"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(128) as usize;
-                let pflash_drafter = msg
-                    .get("params")
-                    .and_then(|p| p.get("prefill_drafter"))
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_string());
-                // -1 = drafter shares the target gpu (default). >=0 routes
-                // the drafter to that HIP device for hetero compress.
-                let pflash_drafter_device: i32 = msg
-                    .get("params")
-                    .and_then(|p| p.get("prefill_drafter_device"))
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(-1) as i32;
-                let pflash_profile = msg
-                    .get("params")
-                    .and_then(|p| p.get("prefill_profile"))
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                let pflash_sparse_threshold = msg
-                    .get("params")
-                    .and_then(|p| p.get("prefill_sparse_threshold"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(32768) as usize;
-
-                // Validate load-time PFlash params before they reach
-                // PflashConfig + load_drafter. Same range rules the
-                // per-request override path uses; without these, a
-                // bad load-time value would silently be accepted and
-                // panic the daemon at the first generate request.
-                let pflash_load_err: Option<String> =
-                    if !(pflash_keep_ratio > 0.0 && pflash_keep_ratio <= 1.0) {
-                        Some(format!(
-                            "prefill_keep_ratio={pflash_keep_ratio} not in (0, 1]"
-                        ))
-                    } else if pflash_block == 0 {
-                        Some("prefill_block must be > 0".to_string())
-                    } else {
-                        None
-                    };
-                // PFlash is deprecated (removal in 0.5.0): it still loads, but
-                // every opt-in (prefill_compression != off) gets one warning line.
-                if pflash_mode_str != "off" {
-                    eprintln!(
-                        "[hipfire-daemon] warning: PFlash is deprecated and will be removed in 0.5.0; not supported, prefix caching supersedes it (prefill_compression={pflash_mode_str} set at load)"
-                    );
-                }
-
                 // Pipeline-parallel degree (Stage 7 of #58). Default 1 =
                 // single-GPU (no behavior change). pp > 1 routes through
-                // Gpus + *_multi paths and refuses VL / DFlash / CASK /
-                // PFlash at load time. v1 supports Qwen3.5 dense + MoE
+                // Gpus + *_multi paths and refuses VL / DFlash / CASK at load
+                // time. v1 supports Qwen3.5 dense + MoE
                 // only — see load_model_pp for the arch_id check.
                 let pp = load_pp;
                 // Expert-parallel degree (EP, task #26). tp>1 shards routed
@@ -2279,19 +2158,12 @@ fn main() {
                     if draft_path.is_some()
                         && developer_var("HIPFIRE_PP_DFLASH").ok().as_deref() != Some("1")
                     {
-                        emit_uncorrelated_error(&mut stdout, None, "DFlash speculative decode requires pp=1 in v1 (set HIPFIRE_PP_DFLASH=1 to opt into the experimental pp>1 PRD path; note PR2-4 of docs/plans/hetero-pflash-dflash.prd are not yet implemented — the load message will accept but generate will not run cross-card spec-decode). See issue #58 v1.1 roadmap.", "unsupported", false, false);
+                        emit_uncorrelated_error(&mut stdout, None, "DFlash speculative decode requires pp=1 in v1 (set HIPFIRE_PP_DFLASH=1 to opt into the experimental pp>1 path; the load message will accept but generate will not run cross-card spec-decode). See issue #58 v1.1 roadmap.", "unsupported", false, false);
                         let _ = stdout.flush();
                         continue;
                     }
                     if cask.sidecar.is_some() {
                         emit_uncorrelated_error(&mut stdout, None, "CASK / TriAttention eviction requires pp=1 in v1; see issue #58 v1.1 roadmap", "unsupported", false, false);
-                        let _ = stdout.flush();
-                        continue;
-                    }
-                    if (pflash_drafter.is_some() || pflash_mode_str != "off")
-                        && developer_var("HIPFIRE_PP_PFLASH").ok().as_deref() != Some("1")
-                    {
-                        emit_uncorrelated_error(&mut stdout, None, "PFlash prefill compression requires pp=1 in v1 (set HIPFIRE_PP_PFLASH=1 to opt into the experimental pp>1 PoC); see issue #58 v1.1 roadmap", "unsupported", false, false);
                         let _ = stdout.flush();
                         continue;
                     }
@@ -2362,7 +2234,6 @@ fn main() {
                         hipfire_config::Deepseek4ComputePlacement::Single
                     ),
                     expert_count_override: deepseek4_experts_per_token.is_some(),
-                    pflash: pflash_drafter.is_some() || pflash_mode_str != "off",
                 };
                 let backend_request =
                     match hipfire_loader::admission::KvBackendRequest::from_override(
@@ -2467,36 +2338,12 @@ fn main() {
                     admission.kv_backend_reason.as_deref(),
                 );
 
-                // Unload previous if any. PFlash drafter goes first so
-                // its tensors join the pool before unload_model drains
-                // it -- otherwise free_tensor would queue them into the
-                // pool just-emptied by drain_pool with no follow-up
-                // drain, leaving drafter VRAM resident across the next
-                // load (the explicit "unload" handler has the same
-                // ordering for the same reason).
-                //
-                // FIX (transactional pflash teardown): pflash_state is part of
-                // the PRIOR model (it holds that model's PFlash drafter). For
-                // the deferred tp>1 EP path it must NOT be torn down here —
-                // otherwise a partial EP load failure (whose FIX #1 deferral
-                // keeps `model` alive) would leave the surviving prior model
-                // stripped of its drafter. Defer it to the success branch
-                // alongside the deferred model unload. For load_tp <= 1 the
-                // prior model is unloaded eagerly, so tear pflash down here in
-                // the original order. (EP archs are ds4/minimax and refuse
-                // PFlash drafters, so on a SUCCESSFUL tp>1 load this just frees
-                // the outgoing model's drafter at the deferred site.)
+                // Unload previous if any. For the deferred tp>1 EP path the
+                // prior model must NOT be torn down here: a partial EP load
+                // failure keeps `model` alive, so retirement is deferred to the
+                // success branch below. For load_tp <= 1 the prior model is
+                // unloaded eagerly.
                 if !defer_prior_unload {
-                    if let Some(mut pf) = pflash_state.take() {
-                        if let Some(mut dg) = pflash_drafter_gpu.take() {
-                            dg.bind_thread_or_warn();
-                            pf.unload_drafter(&mut dg); // sibling-device drafter: free on its own handle, then drop
-                            gpu.bind_thread_or_warn();
-                        } else {
-                            pf.unload_drafter(&mut gpu);
-                        }
-                    }
-                    pflash_cfg = None;
                     if let Some(m) = model.take() {
                         if let Err(err) = hipfire_loader::unload_model(m, &mut gpu) {
                             emit_uncorrelated_error(
@@ -2594,8 +2441,7 @@ fn main() {
                             eprintln!("{reason}");
                         }
                         // Deferred EP retirement lives AFTER continuous-batch
-                        // staging below: the prior resident in `model` (and
-                        // its PFlash drafter) must survive every fallible
+                        // staging below: the prior resident in `model` must survive every fallible
                         // stage of the new model so a staging failure rolls
                         // back only `m` and keeps the prior usable.
                         let arch = hipfire_loader::arch_label(m.arch_id);
@@ -2768,9 +2614,7 @@ fn main() {
                         // the new model is fully staged — NOW retire the
                         // prior model before publishing. Single-GPU/pp models
                         // are unloaded eagerly above; this branch handles
-                        // deferred tp>1 EP loads. Prior PFlash drafter is
-                        // part of that prior model, so tear it down first in
-                        // the same drafter-before-unload order used elsewhere.
+                        // deferred tp>1 EP loads.
                         //
                         // Transactional: if prior unload fails, do NOT install
                         // or emit `loaded` for the new model. Explicitly unload
@@ -2778,16 +2622,6 @@ fn main() {
                         // and emit a hard error covering prior failure and any
                         // rollback failure.
                         if defer_prior_unload {
-                            if let Some(mut pf) = pflash_state.take() {
-                                if let Some(mut dg) = pflash_drafter_gpu.take() {
-                                    dg.bind_thread_or_warn();
-                                    pf.unload_drafter(&mut dg); // sibling-device drafter: free on its own handle, then drop
-                                    gpu.bind_thread_or_warn();
-                                } else {
-                                    pf.unload_drafter(&mut gpu);
-                                }
-                            }
-                            pflash_cfg = None;
                             let prior_unload = if let Some(old) = model.take() {
                                 hipfire_loader::unload_model(old, &mut gpu)
                             } else {
@@ -2803,7 +2637,7 @@ fn main() {
                                     Ok(()) => None,
                                     Err(e) => Some(e),
                                 };
-                                // model stays None; pflash already cleared above.
+                                // model stays None.
                                 resident_kv = None;
                                 let msg = ep_deferred_handoff_error_message(
                                     &prior_err,
@@ -2975,133 +2809,6 @@ fn main() {
                             );
                             emit_load_phases();
                             let _ = writeln!(stdout, "{ack}");
-                        }
-                        // ── PFlash drafter load (Phase 4.0) ──────────────
-                        //
-                        // Only attempt when mode != off AND a drafter path
-                        // was provided. Failures here are NON-FATAL: log
-                        // the reason and continue with PFlash disabled so
-                        // the operator gets a clear "model is up, but
-                        // compression isn't" signal rather than losing
-                        // the entire session.
-                        //
-                        // EP guard (load_tp > 1): the EP path serves through
-                        // `hipfire_generate::qwen::generate_ep`, which bypasses PFlash entirely (no
-                        // EP server reads PFlash drafters).
-                        // Loading a drafter here would just pin GPU memory it
-                        // never reads until unload, so skip the load outright.
-                        // Warn once if the operator actually supplied a drafter
-                        // so the silent no-op is visible.
-                        if load_tp > 1 {
-                            if pflash_drafter.is_some() && pflash_mode_str != "off" {
-                                eprintln!(
-                                    "[pflash] WARN: ignoring PFlash drafter on EP (tp={}) model \
-                                     — hipfire_generate::qwen::generate_ep bypasses PFlash; drafter would only waste GPU memory",
-                                    load_tp
-                                );
-                            }
-                        } else if let Some(ref pf_drafter_path) = pflash_drafter {
-                            if pflash_mode_str != "off" {
-                                if let Some(ref reason) = pflash_load_err {
-                                    let _ = writeln!(
-                                        stdout,
-                                        r#"{{"type":"pflash_load_failed","reason":"invalid load param: {}"}}"#,
-                                        reason.replace('"', "'")
-                                    );
-                                    let _ = stdout.flush();
-                                    model = Some(m);
-                                    batch_poisoned = None;
-                                    continue;
-                                }
-                                let pf_cfg = hipfire_pflash::pflash::PflashConfig {
-                                    mode: hipfire_pflash::pflash::PflashMode::parse(
-                                        &pflash_mode_str,
-                                    )
-                                    .unwrap_or(hipfire_pflash::pflash::PflashMode::Off),
-                                    threshold_tokens: pflash_threshold,
-                                    keep_ratio: pflash_keep_ratio,
-                                    alpha: pflash_alpha,
-                                    min_keep_tokens: pflash_min_keep,
-                                    sink_tokens: pflash_sink,
-                                    recent_tokens: pflash_recent,
-                                    block_size: pflash_block,
-                                    profile: pflash_profile,
-                                    drafter_path: Some(pf_drafter_path.clone()),
-                                    sparse_threshold: pflash_sparse_threshold,
-                                };
-                                let mut pf_state =
-                                    hipfire_pflash::pflash::PflashState::new(&pf_cfg);
-                                // Pull the target tokenizer out of the loaded model
-                                // for the compat check. Both Qwen3.5 and plain
-                                // Qwen3 paths expose `tokenizer` on LoadedModel.
-                                let tgt_tok_ref = m.tokenizer.as_ref();
-                                if let Some(tok) = tgt_tok_ref {
-                                    let pf_max_kv = max_seq.max(2048);
-                                    // Hetero: when prefill_drafter_device >= 0 and isn't
-                                    // device 0 (target), allocate a sibling Gpu handle so
-                                    // drafter weights/KV/scratch live on the secondary
-                                    // card. Compress output is host-side, so decode stays
-                                    // on target. -1 / 0 => share target gpu (unchanged).
-                                    let mut sibling: Option<rdna_compute::Gpu> = None;
-                                    if pflash_drafter_device > 0 {
-                                        match rdna_compute::Gpu::init_with_device(
-                                            pflash_drafter_device,
-                                        ) {
-                                            Ok(g) => sibling = Some(g),
-                                            Err(e) => {
-                                                let _ = writeln!(
-                                                    stdout,
-                                                    r#"{{"type":"pflash_load_failed","reason":"drafter device {} init: {}"}}"#,
-                                                    pflash_drafter_device,
-                                                    e.to_string().replace('"', "'")
-                                                );
-                                            }
-                                        }
-                                    }
-                                    let dg: &mut rdna_compute::Gpu =
-                                        sibling.as_mut().unwrap_or(&mut gpu);
-                                    dg.bind_thread_or_warn();
-                                    match hipfire_pflash::pflash::load_drafter(
-                                        &mut pf_state,
-                                        dg,
-                                        std::path::Path::new(pf_drafter_path),
-                                        tok,
-                                        pf_max_kv,
-                                    ) {
-                                        Ok(()) => {
-                                            eprintln!("[pflash] LOADED drafter={} dev={} mode={} compat={} keep={} thr={}",
-                                                pf_drafter_path, pflash_drafter_device, pflash_mode_str,
-                                                pf_state.tokenizer_compat, pflash_keep_ratio, pflash_threshold);
-                                            let _ = writeln!(
-                                                stdout,
-                                                r#"{{"type":"pflash","mode":"{}","drafter":"{}","drafter_device":{},"tokenizer_compat":{},"keep_ratio":{},"threshold":{}}}"#,
-                                                pflash_mode_str,
-                                                pf_drafter_path,
-                                                pflash_drafter_device,
-                                                pf_state.tokenizer_compat,
-                                                pflash_keep_ratio,
-                                                pflash_threshold
-                                            );
-                                            pflash_state = Some(pf_state);
-                                            pflash_cfg = Some(pf_cfg);
-                                            pflash_drafter_gpu = sibling; // persist sibling across requests (None if shared)
-                                        }
-                                        Err(e) => {
-                                            eprintln!("[pflash] LOAD FAILED: {}", e);
-                                            let _ = writeln!(
-                                                stdout,
-                                                r#"{{"type":"pflash_load_failed","reason":"{}"}}"#,
-                                                e.to_string().replace('"', "'")
-                                            );
-                                        }
-                                    }
-                                } else {
-                                    let _ = writeln!(
-                                        stdout,
-                                        r#"{{"type":"pflash_load_failed","reason":"target tokenizer unavailable"}}"#
-                                    );
-                                }
-                            }
                         }
 
                         model = Some(m);
@@ -3853,104 +3560,12 @@ fn main() {
                         }
                     }
                 } else {
-                    // Per-request PflashConfig: clone the load-time cfg
-                    // and apply any per-request overrides from `params`.
-                    // None when no drafter was configured at load --
-                    // generate() then takes the identity path.
-                    //
-                    // Out-of-range overrides (keep_ratio outside (0, 1],
-                    // block_size == 0) would otherwise reach asserts inside
-                    // select_spans / scoring and panic the entire daemon.
-                    // Reject the request with an explicit error event so
-                    // the client gets a clean signal and the daemon stays up.
-                    let mut pf_override_err: Option<String> = None;
-                    let pf_cfg_owned = pflash_cfg.as_ref().map(|base| {
-                        let mut c = base.clone();
-                        if let Some(s) = msg
-                            .get("params")
-                            .and_then(|p| p.get("prefill_compression"))
-                            .and_then(|v| v.as_str())
-                        {
-                            if let Some(m) = hipfire_pflash::pflash::PflashMode::parse(s) {
-                                c.mode = m;
-                            }
-                        }
-                        if let Some(v) = msg
-                            .get("params")
-                            .and_then(|p| p.get("prefill_threshold"))
-                            .and_then(|v| v.as_u64())
-                        {
-                            c.threshold_tokens = v as usize;
-                        }
-                        if let Some(v) = msg
-                            .get("params")
-                            .and_then(|p| p.get("prefill_keep_ratio"))
-                            .and_then(|v| v.as_f64())
-                        {
-                            let r = v as f32;
-                            if !(r > 0.0 && r <= 1.0) {
-                                pf_override_err =
-                                    Some(format!("prefill_keep_ratio={r} not in (0, 1]"));
-                            } else {
-                                c.keep_ratio = r;
-                            }
-                        }
-                        if let Some(v) = msg
-                            .get("params")
-                            .and_then(|p| p.get("prefill_min_keep"))
-                            .and_then(|v| v.as_u64())
-                        {
-                            c.min_keep_tokens = v as usize;
-                        }
-                        if let Some(v) = msg
-                            .get("params")
-                            .and_then(|p| p.get("prefill_sink"))
-                            .and_then(|v| v.as_u64())
-                        {
-                            c.sink_tokens = v as usize;
-                        }
-                        if let Some(v) = msg
-                            .get("params")
-                            .and_then(|p| p.get("prefill_recent"))
-                            .and_then(|v| v.as_u64())
-                        {
-                            c.recent_tokens = v as usize;
-                        }
-                        if let Some(v) = msg
-                            .get("params")
-                            .and_then(|p| p.get("prefill_block"))
-                            .and_then(|v| v.as_u64())
-                        {
-                            let b = v as usize;
-                            if b == 0 {
-                                pf_override_err = Some("prefill_block must be > 0".to_string());
-                            } else {
-                                c.block_size = b;
-                            }
-                        }
-                        c
-                    });
-                    if let Some(reason) = pf_override_err {
-                        hipfire_generate::dense::emit_active_attempt_error(
-                            &mut stdout,
-                            Some(id),
-                            &format!("invalid pflash override: {}", reason.replace('"', "'"),),
-                            "validation",
-                            false,
-                            false,
-                        );
-                        let _ = stdout.flush();
-                        continue;
-                    }
                     // ── Continuous batch admission (tightened to actual route) ──
                     // EP Qwen35 expert-parallel continuous batch is TP=4, 4×gfx1201;
                     // sequential EP (tp=2|4) serves every request that is not
                     // batch-eligible. Check EP eligibility first so the batch
                     // route wins when staged and requested.
                     let serve_continuous_batch = parse_serve_continuous_batch(&msg);
-                    let pflash_active = pf_cfg_owned.as_ref().is_some_and(|c| {
-                        !matches!(c.mode, hipfire_pflash::pflash::PflashMode::Off)
-                    });
                     // `min_tokens` is honoured by the singleton routes and the
                     // Flash-Next fn-lanes only. On any other batching serve it is
                     // refused (400), never rerouted to a serialized singleton.
@@ -3984,7 +3599,6 @@ fn main() {
                                 m,
                                 continuous_batch_size,
                                 serve_continuous_batch,
-                                pflash_active,
                             )
                         } else {
                             false
@@ -4135,7 +3749,6 @@ fn main() {
                             m,
                             continuous_batch_size,
                             serve_continuous_batch,
-                            pflash_active,
                             &mut inbox,
                         )
                     } else {
@@ -4431,7 +4044,6 @@ fn main() {
                         m,
                         continuous_batch_size,
                         serve_continuous_batch,
-                        pflash_active,
                         max_tokens,
                         max_think_tokens,
                         client_seed,
@@ -4440,7 +4052,6 @@ fn main() {
                     generate(
                         m,
                         &mut gpu,
-                        pflash_drafter_gpu.as_mut(),
                         &mut stdout,
                         id,
                         prompt,
@@ -4460,8 +4071,6 @@ fn main() {
                         &budget_alert_text,
                         max_think_tokens,
                         assistant_prefix,
-                        pflash_state.as_mut(),
-                        pf_cfg_owned.as_ref(),
                         tools_json.as_deref(),
                         messages_history.as_deref(),
                         think_mode,
@@ -4752,25 +4361,7 @@ fn main() {
                     let _ = stdout.flush();
                     continue;
                 }
-                // PFlash drafter goes FIRST: its weights/scratch/KV
-                // tensors are released via Gpu::free_tensor, which only
-                // queues into the GPU pool. The actual hipFree happens
-                // inside unload_model -> drain_pool. Calling
-                // unload_drafter AFTER unload_model would leave the
-                // drafter buffers cached in the just-emptied pool with
-                // no drain to follow, so the VRAM stays resident until
-                // the next load message arrives. Order matters here.
                 vision_gated_off = None;
-                if let Some(mut pf) = pflash_state.take() {
-                    if let Some(mut dg) = pflash_drafter_gpu.take() {
-                        dg.bind_thread_or_warn();
-                        pf.unload_drafter(&mut dg);
-                        gpu.bind_thread_or_warn();
-                    } else {
-                        pf.unload_drafter(&mut gpu);
-                    }
-                }
-                pflash_cfg = None;
                 let unload_result = if let Some(m) = model.take() {
                     hipfire_loader::unload_model(m, &mut gpu)
                 } else {

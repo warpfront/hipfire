@@ -1575,7 +1575,6 @@ fn finish_lane(
         batch_finite_rate(generated, decode),
         ctl.prefill_ms,
         0,
-        "",
     );
     stage_terminal_tool_calls(&mut done, finish.finish_reason, &finish.wire_tool_calls);
     attach_continuous_batch_route_evidence(

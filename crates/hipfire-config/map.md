@@ -757,7 +757,6 @@ Workspace crates with a path dependency on this crate:
 - `hipfire-engine`
 - `hipfire-generate`
 - `hipfire-loader`
-- `hipfire-pflash`
 - `hipfire-quantize`
 - `hipfire-reap`
 - `hipfire-registry`

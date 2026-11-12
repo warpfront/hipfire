@@ -1122,10 +1122,6 @@ module	mq8_rotate_quantize_x	codec-outside-core-rungs	MQ8G256 route absent from 
 module	mq_rotate_x_i8_gfx11	developer-opt-in	gfx1151 opt-in only, measured slower: HIPFIRE_MQ6_I8=1 (one-pass rotate + A8 producer of the exact-INT8 MQ6 prefill); rdna-compute/src/gemv.rs:6666
 module	pack_f32_to_fp8_gfx12	codec-outside-core-rungs	HFP4G32/MQ4 route absent from admitted core artifact rungs; rdna-compute/src/dispatch.rs:4358
 module	pack_fp8_verify_rows_gfx1201	developer-opt-in	Non-default developer override: HIPFIRE_CB_VERIFY_FP8; rdna-compute/src/gemm_fp8_verify.rs:400-440
-module	pflash_score_fwht2_kv	config-opt-in	Non-default configuration: attention.rs / speculation.prefill.mode; rdna-compute/src/attention.rs:18932
-module	pflash_score_fwht3_kv	config-opt-in	Non-default configuration: attention.rs / speculation.prefill.mode; rdna-compute/src/attention.rs:18864
-module	pflash_score_fwht4_kv	config-opt-in	Non-default configuration: attention.rs / speculation.prefill.mode; rdna-compute/src/attention.rs:18897
-module	pflash_score_q8_kv	config-opt-in	Non-default configuration: attention.rs / speculation.prefill.mode; rdna-compute/src/attention.rs:18798
 module	qk_rmsnorm_rope_flux	non-core-family	Non-core family route: Flux/VAE; hipfire-arch-diffusion/src/flux_gpu.rs:2010
 module	qkv_split_interleaved	non-core-family	Non-core family route: dots.ocr; hipfire-arch-dots-ocr/src/dots_ocr.rs:1559
 module	quick_gelu_f32	non-core-family	Non-core family route: Flux/VAE; rdna-compute/src/text_encoder.rs:179
@@ -1237,7 +1233,6 @@ dynamic	crates/rdna-compute/src/attention.rs::ensure_vmm_rows_module	dynamic-laz
 dynamic	crates/rdna-compute/src/attention.rs::ensure_vmm_rows_module_from	dynamic-lazy	Forwards a caller module; static callers are checked separately. Non-core, config and codec variants retain explicit module exceptions; rdna-compute/src/attention.rs:5074
 dynamic	crates/rdna-compute/src/attention.rs::launch_asym_flash_batched	dynamic-lazy	Forwards a caller module; static callers are checked separately. Non-core, config and codec variants retain explicit module exceptions; rdna-compute/src/attention.rs:12775
 dynamic	crates/rdna-compute/src/attention.rs::launch_asym_k_batched	dynamic-lazy	Forwards a caller module; static callers are checked separately. Non-core, config and codec variants retain explicit module exceptions; rdna-compute/src/attention.rs:12515
-dynamic	crates/rdna-compute/src/attention.rs::pflash_score_fwht_kv_impl	dynamic-lazy	Forwards a caller module; static callers are checked separately. Non-core, config and codec variants retain explicit module exceptions; rdna-compute/src/attention.rs:18974
 dynamic	crates/rdna-compute/src/attention.rs::qresident_launch	dynamic-lazy	Forwards a caller module; static callers are checked separately. Non-core, config and codec variants retain explicit module exceptions; rdna-compute/src/attention.rs:7150
 dynamic	crates/rdna-compute/src/dispatch.rs::begin_route_kernel_load_predicted	dynamic-enumerated	Registry-fed KernelEntry/PlannedKernel modules are enumerated by kernel_registry::entries; no synthesized module keys; dispatch.rs:3943-3952
 dynamic	crates/rdna-compute/src/dispatch.rs::dequantize_lowbit_to_f16	dynamic-lazy	Forwards a caller module; static callers are checked separately. Non-core, config and codec variants retain explicit module exceptions; rdna-compute/src/dispatch.rs:2447

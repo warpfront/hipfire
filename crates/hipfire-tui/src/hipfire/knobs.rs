@@ -1077,12 +1077,7 @@ mod tests {
     #[test]
     fn deprecated_keys_have_no_curated_entry() {
         // They fall back to the schema's own deprecation help text.
-        for key in [
-            "cask",
-            "prefill_compression",
-            "prefill_drafter",
-            "prefill_threshold",
-        ] {
+        for key in ["cask"] {
             assert!(knob_info(key).is_none(), "{key}");
         }
     }

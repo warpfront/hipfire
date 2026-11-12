@@ -2213,9 +2213,8 @@ pub fn emit_qwen_dflash_done_terminal(
     cycles: usize,
     cached_tokens: usize,
     finish_reason: &str,
-    pflash: Option<(&str, f32)>,
 ) {
-    let mut done_env = crate::qwen::qwen_dflash_done_value(
+    let done_env = crate::qwen::qwen_dflash_done_value(
         id,
         generated,
         tok_s,
@@ -2230,12 +2229,6 @@ pub fn emit_qwen_dflash_done_terminal(
         finish_reason,
         active_attempt_id(),
     );
-    if let Some((reason, alpha)) = pflash {
-        done_env["pflash"] = serde_json::json!({
-            "bypass_reason": reason,
-            "alpha": alpha,
-        });
-    }
     let _ = writeln!(stdout, "{}", done_env);
     let _ = stdout.flush();
 }

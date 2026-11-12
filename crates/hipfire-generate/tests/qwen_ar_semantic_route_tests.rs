@@ -125,19 +125,8 @@ fn drive_ar_semantic_path_with_stop(
                 fin.store_cache,
             );
             if effects.emit_done {
-                let mut pending = qwen_ar_done_value(
-                    "t1",
-                    fin.finish_reason,
-                    0,
-                    0.0,
-                    0,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0,
-                    "",
-                );
+                let mut pending =
+                    qwen_ar_done_value("t1", fin.finish_reason, 0, 0.0, 0, 0.0, 0.0, 0.0, 0.0, 0);
                 stage_terminal_tool_calls(&mut pending, fin.finish_reason, &fin.wire_tool_calls);
                 emit_staged_terminal_done(&mut sink, &pending);
             }
@@ -1245,9 +1234,7 @@ fn real_writers_hostile_request_ids() {
             rendered_body: None,
         }],
     );
-    emit_qwen_ar_done(
-        &mut sink, hostile, "stop", 1, 1.0, 0, 0.0, 0.0, 1.0, 0.0, 0, "",
-    );
+    emit_qwen_ar_done(&mut sink, hostile, "stop", 1, 1.0, 0, 0.0, 0.0, 1.0, 0.0, 0);
     let events = parse_jsonl(&String::from_utf8(sink).unwrap());
     assert_eq!(events.len(), 4);
     for e in &events {
@@ -1706,7 +1693,6 @@ fn finish_defers_tool_calls_until_commit_effects() {
         1.0,
         0.0,
         0,
-        "",
     );
     stage_terminal_tool_calls(&mut pending, fin.finish_reason, &fin.wire_tool_calls);
     emit_staged_terminal_done(&mut sink, &pending);

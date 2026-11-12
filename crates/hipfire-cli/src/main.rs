@@ -5237,18 +5237,6 @@ pub(crate) fn load_params(
         "cask_handoff_tokens": config_u64(resolved, "memory.cask.handoff_tokens")?,
         "cask_core_frac": config_f64(resolved, "memory.cask.core_fraction")?,
         "cask_fold_m": config_u64(resolved, "memory.cask.fold")?,
-        // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
-        "prefill_compression": config_string(resolved, "speculation.prefill.mode")?,
-        "prefill_threshold": config_u64(resolved, "speculation.prefill.threshold")?,
-        "prefill_keep_ratio": config_f64(resolved, "speculation.prefill.keep_ratio")?,
-        "prefill_alpha": config_f64(resolved, "speculation.prefill.alpha")?,
-        "prefill_min_keep": config_u64(resolved, "speculation.prefill.min_keep")?,
-        "prefill_sink": config_u64(resolved, "speculation.prefill.sink")?,
-        "prefill_recent": config_u64(resolved, "speculation.prefill.recent")?,
-        "prefill_block": config_u64(resolved, "speculation.prefill.block")?,
-        "prefill_drafter": config_string(resolved, "speculation.prefill.drafter")?,
-        "prefill_drafter_device": config_i64(resolved, "speculation.prefill.drafter_device")?,
-        "prefill_sparse_threshold": config_u64(resolved, "speculation.prefill.sparse_threshold")?,
         "speculation": config_string(resolved, "speculation.mode")?,
         "continuous_batch_size": config_u64(resolved, "serve.continuous_batch_size")?,
     });
@@ -12026,7 +12014,7 @@ mod tests {
     }
 
     #[test]
-    fn cask_triattn_and_pflash_remain_opt_in_at_load() {
+    fn cask_and_triattn_remain_opt_in_at_load() {
         let paths = test_paths("experimental-defaults");
         fs::create_dir_all(&paths.models).unwrap();
         let registry = hipfire_registry::bundled().unwrap();
@@ -12058,7 +12046,6 @@ mod tests {
         assert_eq!(params["cask"], false);
         assert_eq!(params["cask_handoff_tokens"], 0);
         assert_eq!(params["cask_sidecar"], "");
-        assert_eq!(params["prefill_compression"], "off");
 
         let mut explicit = ConfigLayer::default();
         explicit.set_cli("memory.cask.auto_attach", "true").unwrap();
@@ -12084,7 +12071,6 @@ mod tests {
         .unwrap();
         assert_eq!(params["cask"], false);
         assert_eq!(params["cask_sidecar"], sidecar_path.display().to_string());
-        assert_eq!(params["prefill_compression"], "off");
         fs::remove_dir_all(&paths.root).unwrap();
     }
 

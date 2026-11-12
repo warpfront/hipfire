@@ -2243,15 +2243,6 @@ pub fn validate_load_caps(msg: &serde_json::Value, gpu_arch: &str) -> Option<Str
     {
         return Some("spec/drafter not supported in experimental multi-slot".to_string());
     }
-    for (key, label) in [("prefill_compression", "PFlash")] {
-        if params
-            .and_then(|p| p.get(key))
-            .and_then(|v| v.as_str())
-            .is_some_and(|v| !v.is_empty() && v != "off")
-        {
-            return Some(format!("{label} not supported in experimental multi-slot"));
-        }
-    }
     if params
         .and_then(|p| p.get("ngram_draft"))
         .and_then(|v| v.as_bool())
@@ -3593,8 +3584,6 @@ mod tests {
         assert!(validate_load_caps(&m3, "gfx1100").is_some());
         let m4 = json!({"params": {"drafter": "some.hfq"}});
         assert!(validate_load_caps(&m4, "gfx1100").is_some());
-        let m5 = json!({"params": {"prefill_compression": "on"}});
-        assert!(validate_load_caps(&m5, "gfx1100").is_some());
     }
 
     #[test]
@@ -3821,7 +3810,6 @@ mod tests {
             "kv_adaptive": "off",
             "dflash_mode": "off",
             "mtp_mode": "off",
-            "prefill_compression": "off",
             "ngram_draft": false,
             "cask": false
         }});
@@ -3859,7 +3847,6 @@ mod tests {
             json!({"ngram_draft": true}),
             json!({"cask": true}),
             json!({"drafter": "some-drafter"}),
-            json!({"prefill_compression": "on"}),
         ] {
             assert!(
                 validate_load_caps(&json!({"params": params}), "gfx1201").is_some(),

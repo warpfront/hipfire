@@ -453,7 +453,7 @@ mod tests {
 
         // A free string keeps the empty string as a value.
         assert_eq!(
-            write_value(&path, "prefill_drafter", "").unwrap(),
+            write_value(&path, "session_cache_dir", "").unwrap(),
             Value::String(String::new())
         );
         // And a genuinely bad value is still rejected.
@@ -534,12 +534,7 @@ mod tests {
                 spec.key
             );
         }
-        for key in [
-            "cask",
-            "prefill_compression",
-            "prefill_drafter",
-            "prefill_threshold",
-        ] {
+        for key in ["cask"] {
             assert!(field_spec(key).is_none(), "{key}");
         }
     }

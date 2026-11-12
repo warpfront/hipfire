@@ -5,12 +5,11 @@
 
 ## Purpose
 
-Qwen3.5 dense + MoE (A3B/A10B/A17B) hybrid: DeltaNet + full attention, MTP/DSpark hooks. Owns `qwen35/` model forward (config/weights/state/tiled attention), `speculative.rs` qwen35-specific spec glue (deeply coupled to `qwen35::*` symbols; `pflash.rs` branch evacuated to `hipfire-pflash` per B3), arch-specific kernels, and the `Architecture` impl used by `Qwen35Carrier`/`Qwen35VL` text path. The `//!` docs in [`src/lib.rs`](src/lib.rs) note the future move of `speculative.rs` back to runtime once it becomes arch-generic.
+Qwen3.5 dense + MoE (A3B/A10B/A17B) hybrid: DeltaNet + full attention, MTP/DSpark hooks. Owns `qwen35/` model forward (config/weights/state/tiled attention), `speculative.rs` qwen35-specific spec glue (deeply coupled to `qwen35::*` symbols), arch-specific kernels, and the `Architecture` impl used by `Qwen35Carrier`/`Qwen35VL` text path. The `//!` docs in [`src/lib.rs`](src/lib.rs) note the future move of `speculative.rs` back to runtime once it becomes arch-generic.
 
 ## Gotchas
 
 - `speculative.rs` is still qwen35-coupled — do not move it to `hipfire-runtime` without de-tangling the `qwen35::*` deps.
-- PFlash text path now lives in `hipfire-pflash` — this crate must not reintroduce a `pflash.rs` sibling.
 - Compact root-routed EP decode, `prefill_lane`, `forward_tick`, and `forward_prefill_batch_ep` use runtime's checked collective schedule. The pure prefill parameter builder is shared with all-rank preflight; do not reintroduce local zero/transfer/reduce/add sequencing.
 - Native MTP is explicit-only here: `MTP_MEASURED_AR_FLOOR` (`src/lib.rs`) is `false`, so `speculation.mtp = auto` keeps plain AR and loads no head (`hipfire_config::mtp_mode_admits`); only `--spec mtp` / `speculation.mtp = on` arms it. Do not rearm `auto` from head presence.
 - Resident Qwen35 MoE ordinary prefill admits the 8192-row `RESIDENT_MOE_CHUNK_ROWS` rung only when actual resident placement, supported producer dtypes, full-width IU4 scratch reservation and coverage, and `resident_moe_rung_fits` all pass. The fit charges projected full PBS/grouped scratch, the checked `rows*(2*v_dim+256)*4` DeltaNet addition, projection and full-row Q16 deficits, mapped KV capacity and 1 GiB headroom against actual free VRAM; refusal keeps `prefill_max_batch_for_model`. Explicit `HIPFIRE_PREFILL_MAX_BATCH` or `prefill.chunk_rows` below the rung keep the incumbent. Production and installed-facts tests share `plan_ordinary_prefill`; the default is planned as a virtual explicit-8192 PBS owner. Credit applies only to a genuinely reusable widened cache or the kept same-target wrapper owner; smaller, mismatched and lean owners are replaced and the full rung is charged. The allocation-free `DeltaNetStateGeometry` exposes every S/EF owner's extent. The wrapper checks actual-row and 512-row-seam eligibility before mapping/querying/allocating; small/config-off/capture refusals retain their prior resource plan. Generic `commit_stride=512` is not proof of any particular MoE/GDN kernel route; actual launch evidence is separate.
@@ -1211,7 +1210,6 @@ Workspace crates with a path dependency on this crate:
 - `hipfire-daemon`
 - `hipfire-generate`
 - `hipfire-loader`
-- `hipfire-pflash`
 - `hipfire-runtime`
 - `saddle-lab`
 

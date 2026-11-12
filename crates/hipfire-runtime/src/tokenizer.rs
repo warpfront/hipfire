@@ -2064,7 +2064,7 @@ impl Tokenizer {
 
     /// Read-only view of the full vocabulary by token id. Index `i` is the
     /// canonical byte string for token id `i`. Used for cross-tokenizer
-    /// equivalence checks (PFlash drafter / target compatibility gate).
+    /// equivalence checks.
     pub fn vocab(&self) -> &[String] {
         &self.vocab
     }

@@ -328,7 +328,6 @@ pub fn is_batch_request_eligible(
     m: &LoadedModel,
     continuous_batch_size: usize,
     serve_continuous_batch: bool,
-    pflash_active: bool,
 ) -> bool {
     let has_image = hipfire_engine::prompt::wire_has_image(msg);
     let has_tools = msg
@@ -449,7 +448,7 @@ pub fn is_batch_request_eligible(
     if !batch_messages_are_single_user(msg) || has_tools || has_image || has_stop {
         return false;
     }
-    if has_spec || has_adaptive || m.eviction.is_some() || pflash_active {
+    if has_spec || has_adaptive || m.eviction.is_some() {
         return false;
     }
     if m.pp != 1 || m.ep.is_some() {
@@ -479,8 +478,7 @@ pub fn is_batch_request_eligible(
 
 /// Batch eligibility predicate shape shared by the Qwen continuous-batch
 /// drivers (fixed-lane and VMM).
-pub(crate) type QwenBatchEligibility =
-    fn(&serde_json::Value, &LoadedModel, usize, bool, bool) -> bool;
+pub(crate) type QwenBatchEligibility = fn(&serde_json::Value, &LoadedModel, usize, bool) -> bool;
 
 /// Drain already-delivered daemon messages into a Qwen batch scheduler at a
 /// step boundary: admit eligible generates (render once, enqueue, announce),
@@ -590,7 +588,6 @@ pub(crate) fn drain_qwen_batch_inbox(
                         model,
                         batch_size,
                         parse_serve_continuous_batch(&json),
-                        false,
                     ) {
                         barrier = Some(daemon_regular_with_admission(json, carried_admission));
                         break;
@@ -1389,7 +1386,6 @@ pub fn drive_qwen_continuous_batch(
                     metrics.decode_tok_s,
                     metrics.ttft_ms,
                     0,
-                    "",
                 );
                 pending_done["latency_ms"] =
                     serde_json::json!((metrics.latency_ms * 10.0).round() / 10.0);
@@ -2890,7 +2886,7 @@ fn vmm_retire_free(
 /// not run it per row: tools/tool turns (grammar-constrained CPU sampling
 /// and the tool-call parser), images (vision path), invalid stops (the
 /// singleton reports them), logprobs (the singleton sampler's envelopes),
-/// budget alerts (mid-stream text injection), adaptive KV/eviction/PFlash
+/// budget alerts (mid-stream text injection), adaptive KV/eviction
 /// (per-request KV rewriting), and PP/EP outside the Qwen4 fn-lanes route. A loaded
 /// speculator does not exclude a greedy request — batched rows are AR, and a
 /// lonely request keeps its singleton spec route. Qwen4 fn-lanes also admit
@@ -2902,7 +2898,6 @@ pub fn is_vmm_batch_request_eligible(
     m: &LoadedModel,
     continuous_batch_size: usize,
     serve_continuous_batch: bool,
-    pflash_active: bool,
 ) -> bool {
     let staged = qwen4_lanes_staged(m)
         || m.state.as_ref().is_some_and(|s| {
@@ -2944,7 +2939,7 @@ pub fn is_vmm_batch_request_eligible(
     if m.qwen4().is_none() && request_sets_min_tokens(msg) {
         return false;
     }
-    if m.kv_adaptive.is_some() || m.eviction.is_some() || pflash_active {
+    if m.kv_adaptive.is_some() || m.eviction.is_some() {
         return false;
     }
     if !lane_batch_topology_supported(qwen4_lanes_staged(m), m.pp, m.ep.is_some()) {
@@ -3326,25 +3321,13 @@ pub fn batch_request_eligible_for_route(
     m: &LoadedModel,
     continuous_batch_size: usize,
     serve_continuous_batch: bool,
-    pflash_active: bool,
     inbox: &mut DaemonInbox,
 ) -> bool {
     if vmm_route {
-        is_vmm_batch_request_eligible(
-            msg,
-            m,
-            continuous_batch_size,
-            serve_continuous_batch,
-            pflash_active,
-        ) && (qwen4_lone_request_takes_lane_for(msg, m) || inbox.has_pending_batch_generate())
+        is_vmm_batch_request_eligible(msg, m, continuous_batch_size, serve_continuous_batch)
+            && (qwen4_lone_request_takes_lane_for(msg, m) || inbox.has_pending_batch_generate())
     } else {
-        is_batch_request_eligible(
-            msg,
-            m,
-            continuous_batch_size,
-            serve_continuous_batch,
-            pflash_active,
-        )
+        is_batch_request_eligible(msg, m, continuous_batch_size, serve_continuous_batch)
     }
 }
 
@@ -3387,7 +3370,6 @@ pub fn arm_promotion(
     m: &LoadedModel,
     continuous_batch_size: usize,
     serve_continuous_batch: bool,
-    pflash_active: bool,
     max_tokens: usize,
     max_think_tokens: usize,
     client_seed: Option<u64>,
@@ -3408,13 +3390,7 @@ pub fn arm_promotion(
         && m.qwen4().is_none_or(|b| {
             b.lanes().is_some() && qwen4_lane_promotion_supported(b.lane_topology())
         })
-        && is_vmm_batch_request_eligible(
-            msg,
-            m,
-            continuous_batch_size,
-            serve_continuous_batch,
-            pflash_active,
-        )
+        && is_vmm_batch_request_eligible(msg, m, continuous_batch_size, serve_continuous_batch)
         && (sampling.temp <= 0.0
             || (m.qwen4().is_none()
                 && vmm_sampled_lane(msg, m, &sampling) == Some(VmmLaneDecode::Ar))))
@@ -4702,7 +4678,6 @@ pub fn drive_qwen_vmm_continuous_batch(
                 metrics.decode_tok_s,
                 metrics.ttft_ms,
                 c.cached,
-                "",
             );
             pending_done["latency_ms"] =
                 serde_json::json!((metrics.latency_ms * 10.0).round() / 10.0);
@@ -5836,7 +5811,6 @@ pub fn drive_lfm_continuous_batch(
                             model,
                             batch_size,
                             parse_serve_continuous_batch(&json),
-                            false,
                         ) {
                             barrier = Some(daemon_regular_with_admission(json, carried_admission));
                             break;
@@ -6935,7 +6909,6 @@ pub fn is_qwen_ep_batch_request_eligible(
     m: &LoadedModel,
     continuous_batch_size: usize,
     serve_continuous_batch: bool,
-    pflash_active: bool,
 ) -> bool {
     let caps = hipfire_loader::carrier_for(m.arch_id)
         .map(|c| c.caps())
@@ -6979,7 +6952,7 @@ pub fn is_qwen_ep_batch_request_eligible(
     if !batch_messages_are_single_user(msg) {
         return false;
     }
-    if m.speculator.is_some() || m.kv_adaptive.is_some() || m.eviction.is_some() || pflash_active {
+    if m.speculator.is_some() || m.kv_adaptive.is_some() || m.eviction.is_some() {
         return false;
     }
     if batch.is_none() {
@@ -7396,7 +7369,6 @@ pub fn drive_qwen35_ep_continuous_batch(
                             model,
                             batch_size,
                             parse_serve_continuous_batch(&json),
-                            false,
                         ) {
                             barrier = Some(daemon_regular_with_admission(json, Some(admission)));
                             break;
@@ -7897,7 +7869,6 @@ pub fn drive_qwen35_ep_continuous_batch(
                     metrics.decode_tok_s,
                     metrics.ttft_ms,
                     0,
-                    "",
                 );
                 pending_done["latency_ms"] =
                     serde_json::json!((metrics.latency_ms * 10.0).round() / 10.0);

@@ -269,7 +269,6 @@ fn run_generate_with(
         hipfire_generate::ar::generate(
             m,
             gpu,
-            None,
             &mut stdout,
             id,
             prompt,
@@ -289,8 +288,6 @@ fn run_generate_with(
             "",
             1,
             hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
-            None,
-            None,
             None,
             None,
             hipfire_runtime::prompt_frame::ThinkMode::NonThink,

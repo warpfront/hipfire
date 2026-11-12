@@ -4,7 +4,7 @@
 
 //! ChatML prompt framing — single source of truth for assembling
 //! the token sequence that gets fed to the model. Replaces the three
-//! near-copies that lived in daemon.rs (AR, PFlash, DFlash paths).
+//! near-copies that lived in daemon.rs (AR and DFlash paths).
 //!
 //! The canonical layout for a single turn is:
 //!
@@ -207,8 +207,8 @@ impl<'a> ChatFrame<'a> {
 
     /// Build the prompt token sequence for a single-turn request,
     /// substituting `user_tokens` for the encoding of `self.user`.
-    /// Used by the daemon's AR/PFlash path where the user content has
-    /// already been tokenized (and possibly compressed) upstream. The
+    /// Used by the daemon's AR path where the user content has
+    /// already been tokenized upstream. The
     /// `self.user` field is ignored by this method when not in `raw`
     /// mode.
     ///
@@ -2443,7 +2443,7 @@ mod tests {
     fn build_with_user_tokens_matches_build_when_tokens_match_string() {
         // The pre-tokenized variant must produce byte-identical output
         // to `build()` when the supplied tokens equal `tokenizer.encode(self.user)`.
-        // This is the daemon AR-path no-PFlash case.
+        // This is the daemon AR-path case.
         let t = make_tokenizer();
         let user_text = "hello";
         let frame = ChatFrame {

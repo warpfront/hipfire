@@ -950,12 +950,6 @@ fn model_params(
             .as_deref()
             == Some("1")
     );
-    params["_pp_pflash"] = json!(
-        hipfire_config::developer_var("HIPFIRE_PP_PFLASH")
-            .ok()
-            .as_deref()
-            == Some("1")
-    );
     // daemon/main.rs:1270-1289 resolves the process topology before parsing
     // admission inputs. Keep environmental resolution outside the pure mapper.
     let mut message = json!({"params": params});
@@ -1851,8 +1845,6 @@ fn admission_inputs(params: &Value) -> AdmissionInputs<'_> {
         state_quant: str_param(params, "state_quant").is_some(),
         non_single_compute: !matches!(placement, hipfire_config::Deepseek4ComputePlacement::Single),
         expert_count_override: usize_param(params, "deepseek4_experts_per_token").is_some(),
-        pflash: str_param(params, "prefill_drafter").is_some()
-            || params["prefill_compression"].as_str().unwrap_or("off") != "off",
     };
     // :2115-2197: source-independent pre-admission feature refusals. They must
     // not become a successful fit merely because a non-Qwen4 carrier is used.
@@ -1868,8 +1860,6 @@ fn admission_inputs(params: &Value) -> AdmissionInputs<'_> {
         Some(
             "CASK / TriAttention eviction requires pp=1; reload without CASK or set topology.pp=1.",
         )
-    } else if pp > 1 && options.pflash && params["_pp_pflash"].as_bool() != Some(true) {
-        Some("PFlash prefill compression requires pp=1; turn off prefill compression or set topology.pp=1.")
     } else if tp > 1 && options.expert_count_override {
         Some("DeepSeek V4 experts-per-token override requires tp=1; reload without the experts-per-token override.")
     } else {
@@ -2149,7 +2139,7 @@ mod tests {
             "vision_mode": "off", "cask": true, "cask_sidecar": "eviction.hfq",
             "cask_budget": 768, "cask_beta": 256, "cask_handoff_tokens": 128,
             "cask_core_frac": 0.25, "cask_fold_m": 3, "state_quant": "off",
-            "prefill_drafter": "prefill.hfq", "drafter": "eagle.hfq",
+            "drafter": "eagle.hfq",
             "deepseek4_experts_per_token": 4});
         let a = admission_inputs(&params);
         assert!(a.error.is_none());
@@ -2165,7 +2155,7 @@ mod tests {
             (768, 256, 128, 3)
         );
         assert_eq!(a.cask.core_frac, 0.25);
-        assert!(a.options.cask && a.options.state_quant && a.options.pflash);
+        assert!(a.options.cask && a.options.state_quant);
         assert!(a.options.eagle_drafter && a.options.expert_count_override);
         let params = json!({"draft": "draft.hfq", "dflash_mode": "auto",
             "vision": "vision.hfq", "vision_mode": "auto", "cask": true});

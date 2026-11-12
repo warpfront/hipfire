@@ -218,7 +218,6 @@ pub struct SourceAdmissionOptions {
     pub state_quant: bool,
     pub non_single_compute: bool,
     pub expert_count_override: bool,
-    pub pflash: bool,
 }
 
 /// Return whether a per-load adaptive-KV value requests the active controller.
@@ -2435,7 +2434,6 @@ pub(crate) fn qwen4_pp_option_refusal(
         (options.kv_adaptive, "adaptive KV"),
         (options.eagle_drafter, "an EAGLE drafter"),
         (options.cask, "CASK"),
-        (options.pflash, "PFlash"),
         (
             options.expert_count_override,
             "an experts-per-token override",
@@ -4573,14 +4571,6 @@ mod tests {
                 "active adaptive KV must be refused at source admission: {err}"
             );
             for (option, options) in [
-                (
-                    "PFlash",
-                    SourceAdmissionOptions {
-                        spec: defaults,
-                        pflash: true,
-                        ..Default::default()
-                    },
-                ),
                 (
                     "EAGLE",
                     SourceAdmissionOptions {
@@ -7140,7 +7130,6 @@ mod qwen4_pp_admission_tests {
             ("adaptive KV", None, options_with(|o| o.kv_adaptive = true)),
             ("EAGLE", None, options_with(|o| o.eagle_drafter = true)),
             ("CASK", None, options_with(|o| o.cask = true)),
-            ("PFlash", None, options_with(|o| o.pflash = true)),
             (
                 "experts-per-token",
                 None,
@@ -7645,11 +7634,6 @@ mod qwen4_pp_admission_tests {
                 SourceAdmissionOptions {
                     spec: defaults,
                     cask: true,
-                    ..Default::default()
-                },
-                SourceAdmissionOptions {
-                    spec: defaults,
-                    pflash: true,
                     ..Default::default()
                 },
                 SourceAdmissionOptions {

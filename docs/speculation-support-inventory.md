@@ -31,9 +31,8 @@ architecture is admitted by this page or by that registry.
   `crates/hipfire-arch-qwen35/src/dflash_spec.rs`; status rows in
   [`env-vars.md`](env-vars.md) and [`CONFIG.md`](CONFIG.md).
 - **Deprecated since 0.4.0, removal in 0.5.0, adjacent to this page:** CASK /
-  TriAttention KV eviction and PFlash prefill compression. They still load and
-  warn, are unsupported, and are not a basis for any speculation claim. Qwen4
-  admission refuses them outright.
+  TriAttention KV eviction. It still loads and warns, is unsupported, and is
+  not a basis for any speculation claim. Qwen4 admission refuses it outright.
 
 ## Vocabulary
 
@@ -248,7 +247,7 @@ Use [`VALIDATION.md`](VALIDATION.md) as the sole claim → route selector.
 
 `scripts/coherence-gate-*.sh` (including the DFlash and per-arch batteries) are
 **retired as current acceptance evidence** and deprecated since 0.4.0, removal in 0.5.0
-(with `_coherence_runner.py`, `awq_coherence_check.sh`, `pflash-gate.sh`). They must not be
+(with `_coherence_runner.py`, `awq_coherence_check.sh`). They must not be
 required for merge, promotion, or benchmark claims. They may be used only for historical
 reproduction. See [`VALIDATION.md`](VALIDATION.md) § Retired gates (historical only).
 

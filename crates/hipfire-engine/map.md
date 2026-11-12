@@ -9,7 +9,7 @@ Architecture-neutral daemon machinery extracted from `crates/hipfire-daemon/src/
 
 ## Gotchas
 
-- Must remain arch-free: depending on any `hipfire-arch-*` or `hipfire-pflash` recreates the cycle the extraction was created to break (`cargo tree` checks this).
+- Must remain arch-free: depending on any `hipfire-arch-*` recreates the cycle the extraction was created to break (`cargo tree` checks this).
 - Weight manifests and device placement are out of scope (PR #527) — they stay in the loader.
 
 ## Crate map

@@ -26,9 +26,8 @@
 //! pair, with full state reset between rows. Each row's stderr output
 //! is bracketed by `@@@ ROW <i>: <label> @@@` / `@@@ ROW <i> END @@@`
 //! markers so downstream parsers can split a multi-row stream.
-//! `--prompts-file` rejects `--cask-sidecar` and `--pflash` (those
-//! paths have single-prompt state that would otherwise leak across
-//! rows). Single `--prompt` mode emits no row separators — output
+//! `--prompts-file` rejects `--cask-sidecar` (that path has
+//! single-prompt state that would otherwise leak across rows). Single `--prompt` mode emits no row separators — output
 //! stays byte-identical to the legacy path.
 //!
 //! `--cask-sidecar` / `--cask` / `--cask-budget` / `--cask-beta` /
@@ -50,8 +49,7 @@
 //! to assemble the JSON-lines manifest at runtime from committed
 //! `.txt` fixtures via `jq -nR --arg p "$(cat path/to/prompt.txt)"
 //! '{label:"...",prompt:$p,max:N}'` (or commit the JSONL fixture
-//! directly, see `benchmarks/prompts/longcode_pflash.jsonl` for an
-//! example of the latter shape). Smoke / correctness tests that
+//! directly). Smoke / correctness tests that
 //! don't compare numbers across sessions can inline prompts safely.
 
 #[cfg(not(feature = "deltanet"))]
@@ -446,11 +444,6 @@ fn main() {
     let mut prompts_file: Option<String> = None;
     let mut prompt_file: Option<String> = None;
     let mut tp: usize = 1;
-    let mut pflash_path: Option<String> = None;
-    let mut pflash_keep_ratio: f32 = 0.30;
-    let mut pflash_block_size: usize = 64;
-    let mut pflash_sink_tokens: usize = 16;
-    let mut pflash_recent_tokens: usize = 32;
     let mut max_tokens: usize = 64;
     let mut ctx_capacity: usize = 512;
     let mut ctx_slice: Option<usize> = None;
@@ -572,28 +565,6 @@ fn main() {
             }
             "--prompt-file" => {
                 prompt_file = Some(args[i + 1].clone());
-                i += 2;
-            }
-            // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
-            "--pflash" => {
-                eprintln!("warning: PFlash is deprecated and will be removed in 0.5.0; not supported (--pflash)");
-                pflash_path = Some(args[i + 1].clone());
-                i += 2;
-            }
-            "--keep-ratio" => {
-                pflash_keep_ratio = args[i + 1].parse().expect("--keep-ratio f32");
-                i += 2;
-            }
-            "--pflash-block-size" => {
-                pflash_block_size = args[i + 1].parse().expect("--pflash-block-size usize");
-                i += 2;
-            }
-            "--sink-tokens" => {
-                pflash_sink_tokens = args[i + 1].parse().expect("--sink-tokens usize");
-                i += 2;
-            }
-            "--recent-tokens" => {
-                pflash_recent_tokens = args[i + 1].parse().expect("--recent-tokens usize");
                 i += 2;
             }
             "--max" => {
@@ -812,10 +783,6 @@ fn main() {
         eprintln!("--prompts-file + --cask-sidecar is not supported (eviction state would leak across rows)");
         std::process::exit(1);
     }
-    if prompts_file.is_some() && pflash_path.is_some() {
-        eprintln!("--prompts-file + --pflash is not supported yet (PFlash drafter state is single-prompt only)");
-        std::process::exit(1);
-    }
     // Each row is (label, raw_prompt, row_max_tokens). row_max_tokens
     // defaults to the global --max if the manifest line omits it.
     let prompts: Vec<(String, String, usize)> = if let Some(pf) = prompts_file.as_ref() {
@@ -919,10 +886,6 @@ fn main() {
         }
         if ddtree_enabled || ddtree_batched {
             eprintln!("--ddtree is not supported for Glimmer");
-            std::process::exit(1);
-        }
-        if pflash_path.is_some() {
-            eprintln!("--pflash is not supported for Glimmer");
             std::process::exit(1);
         }
         if cask_sidecar.is_some() || use_cask {
@@ -1753,10 +1716,6 @@ fn main() {
             eprintln!("--tp 2 rejects --ddtree*");
             std::process::exit(1);
         }
-        if pflash_path.is_some() {
-            eprintln!("--tp 2 rejects --pflash");
-            std::process::exit(1);
-        }
         if cask_sidecar.is_some() || use_cask {
             eprintln!("--tp 2 rejects --cask*");
             std::process::exit(1);
@@ -2021,7 +1980,7 @@ fn main() {
     );
 
     let tokenizer: Tokenizer = target.load_tokenizer().expect("target tokenizer");
-    // Per-row tokenize, ChatML wrap, and optional PFlash compression are
+    // Per-row tokenize, and ChatML wrap are
     // done inside the loop below.
 
     // ── Hidden ring buffer + snapshot + target_hidden_host ────────────
@@ -2254,104 +2213,6 @@ fn main() {
                 format!("[{} tokens]", prompt_tokens.len())
             }
         );
-
-        // ── Optional PFlash compression ───────────────────────────────
-        // Single-prompt only for now. --prompts-file + --pflash is rejected
-        // during arg validation so the drafter state cannot leak across rows.
-        let mut pflash_compress_ms: u128 = 0;
-        let mut pflash_kept_tokens: usize = prompt_tokens.len();
-        let pflash_source_tokens = prompt_tokens.len();
-        if let Some(pflash_drafter_path) = pflash_path.as_ref() {
-            use hipfire_pflash::pflash::{
-                self, BypassReason, PflashConfig, PflashDecision, PflashMode, PflashState,
-                RequestKind,
-            };
-            let cfg = PflashConfig {
-                mode: PflashMode::Always,
-                keep_ratio: pflash_keep_ratio,
-                block_size: pflash_block_size,
-                sink_tokens: pflash_sink_tokens,
-                recent_tokens: pflash_recent_tokens,
-                min_keep_tokens: 0,
-                drafter_path: Some(pflash_drafter_path.clone()),
-                ..Default::default()
-            };
-            let mut state = PflashState::new(&cfg);
-            let drafter_max_kv = prompt_tokens.len() + 64;
-            let t_load = Instant::now();
-            pflash::load_drafter(
-                &mut state,
-                &mut gpu,
-                Path::new(pflash_drafter_path),
-                &tokenizer,
-                drafter_max_kv,
-            )
-            .expect("pflash: load drafter");
-            eprintln!(
-                "pflash drafter loaded: {:.2}s | tokenizer_compat={}",
-                t_load.elapsed().as_secs_f64(),
-                state.tokenizer_compat
-            );
-            if !state.tokenizer_compat {
-                eprintln!("FAIL: pflash drafter tokenizer incompatible with target");
-                state.unload_drafter(&mut gpu);
-                std::process::exit(2);
-            }
-
-            let t_compress = Instant::now();
-            let decision = pflash::maybe_compress_prompt(
-                &mut gpu,
-                &mut state,
-                &cfg,
-                &prompt_tokens,
-                RequestKind::Text,
-                &[],
-            )
-            .expect("pflash: maybe_compress_prompt");
-            pflash_compress_ms = t_compress.elapsed().as_millis();
-
-            prompt_tokens = match decision {
-                PflashDecision::Compressed(cp) => {
-                    eprintln!(
-                        "pflash compress: {} ms (score={}ms select={}ms gather={}ms)",
-                        pflash_compress_ms,
-                        cp.timings.score_ms,
-                        cp.timings.select_ms,
-                        cp.timings.gather_ms
-                    );
-                    eprintln!(
-                        "pflash kept:    {} -> {} tokens (ratio {:.3})",
-                        cp.source_tokens,
-                        cp.kept_tokens,
-                        cp.kept_tokens as f32 / cp.source_tokens.max(1) as f32
-                    );
-                    eprintln!("pflash spans:   {} ranges", cp.kept_spans.len());
-                    pflash_kept_tokens = cp.kept_tokens;
-                    cp.token_ids
-                }
-                PflashDecision::Bypass {
-                    reason:
-                        BypassReason::BelowThreshold {
-                            source_tokens: st,
-                            threshold,
-                        },
-                } => {
-                    eprintln!(
-                        "pflash bypass (BelowThreshold {st} < {threshold}); running full prefill"
-                    );
-                    prompt_tokens
-                }
-                PflashDecision::Bypass { reason } => {
-                    eprintln!("FAIL: unexpected pflash bypass: {reason:?}");
-                    state.unload_drafter(&mut gpu);
-                    std::process::exit(2);
-                }
-            };
-            // Free PFlash drafter VRAM before DFlash machinery starts touching
-            // the target / DFlash-head scratches. The DFlash drafter remains loaded.
-            state.unload_drafter(&mut gpu);
-            vram_report(&gpu.hip, "after pflash unload");
-        }
 
         // Shadow `max_tokens` (CLI default) with this row's value so the
         // existing decode-loop body keeps working unchanged.
@@ -3345,17 +3206,6 @@ fn main() {
         let vram_total_mb = (vram_total_bytes as f64 / (1024.0 * 1024.0)) as u64;
         eprintln!("=== BENCH METRICS ===");
         eprintln!("prompt_tokens: {}", prompt_tokens.len());
-        if pflash_path.is_some() {
-            eprintln!("pflash_source_tokens: {pflash_source_tokens}");
-            eprintln!("pflash_kept_tokens: {pflash_kept_tokens}");
-            eprintln!("pflash_compress_ms: {pflash_compress_ms}");
-            if pflash_source_tokens > 0 {
-                eprintln!(
-                    "pflash_ratio: {:.3}",
-                    pflash_kept_tokens as f32 / pflash_source_tokens as f32
-                );
-            }
-        }
         eprintln!("prefill_secs: {:.4}", prefill_secs);
         eprintln!("prefill_tok_s: {:.2}", prefill_tok_s);
         eprintln!("ttft_ms: {:.2}", ttft_ms.unwrap_or(0.0));
