@@ -83,7 +83,7 @@ Equation: `x = residual + post_norm(down(act(gate(n)) * up(n)))`, `n = pre_norm(
   super-op `ForwardBindings`. The super-op calls the stages separately: `PROJ_GATE_UP` → `project`,
   and the residual opcode → `down`.
 - **Decode gate/up:** `normed_projection`, i.e. `RmsnormAutomatic` with the first weight's rotation
-  plan (FWHT, AWQ, Givens) plus two `Step::Gemv`. The fusion table rewrites them.
+  plan (FWHT, AWQ) plus two `Step::Gemv`. The fusion table rewrites them.
 - **Decode down:** `swiglu_down_residual`. Arms:
   - MQ formats: `fused_silu_mul_rotate_mq{_awq}` + GEMV `WithSwiGLUResidual` (`x += W·h`);
   - HFQ formats: `silu_mul_f32` + GEMV `WithResidual`;

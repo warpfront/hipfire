@@ -486,30 +486,12 @@ fn load_tensor_f32(gguf: &GgufFile, info: &TensorInfo) -> Vec<f32> {
 }
 
 /// A weight matrix on GPU — may be quantized or F32.
-/// ParoQuant Givens rotation metadata for a single linear layer.
-/// Stored alongside the weight buffer; applied to activations before GEMV.
-pub struct ParoRotation {
-    pub pairs: GpuTensor, // I16 [krot, in_dim] — pair indices per rotation layer
-    pub theta: GpuTensor, // F16 [krot, in_dim/2] — learned angles
-    pub channel_scales: GpuTensor, // F16 [in_dim] — per-channel scaling factor alpha
-    pub krot: u32,        // number of rotation layers (typically 8)
-    pub group_size: u32,  // quantization group size (typically 128)
-    /// True if `pairs`/`theta`/`channel_scales` are non-owning aliases into
-    /// shared per-layer sidecars (e.g. MoE routed experts that share one
-    /// rotation tuple across all experts in a layer). Owning ParoRotations
-    /// set this to false; `WeightTensor::free_all` skips tensor frees when
-    /// is_alias is true so the shared sidecars aren't double-freed.
-    pub is_alias: bool,
-}
-
 pub struct WeightTensor {
     pub buf: GpuTensor,
     pub gpu_dtype: DType,  // dispatch type for kernel selection
     pub m: usize,          // output dim (rows)
     pub k: usize,          // input dim (cols)
     pub row_stride: usize, // padded row bytes (Q8HFQ, gfx1151 DFlash draft F16; 0 for others)
-    /// ParoQuant Givens rotation metadata. None for all non-ParoQuant formats.
-    pub paro: Option<ParoRotation>,
     /// Phase A Stage A — AWQ per-channel scale vector, length K, dtype F16.
     ///
     /// Populated by the loader when the .hfq carries a sibling sidecar tensor
@@ -539,18 +521,8 @@ pub struct WeightTensor {
 }
 
 impl WeightTensor {
-    /// Free the weight buffer and any associated metadata (ParoQuant rotation,
-    /// AWQ sidecar) from GPU.
+    /// Free the weight buffer and its AWQ sidecar from GPU.
     pub fn free_all(self, gpu: &mut Gpu) {
-        if let Some(paro) = self.paro {
-            // Aliased rotations point into shared per-layer sidecars; the owner
-            // (e.g. MoeFfnWeights.paro_shared) frees them. Skip here.
-            if !paro.is_alias {
-                let _ = gpu.free_tensor(paro.pairs);
-                let _ = gpu.free_tensor(paro.theta);
-                let _ = gpu.free_tensor(paro.channel_scales);
-            }
-        }
         if let Some(awq) = self.awq_scale {
             let _ = gpu.free_tensor(awq);
         }
@@ -564,13 +536,6 @@ impl WeightTensor {
     /// metadata still belongs to the output descriptor, but freeing the buffer
     /// here would double-release the embedding allocation.
     pub fn free_metadata_only(self, gpu: &mut Gpu) {
-        if let Some(paro) = self.paro {
-            if !paro.is_alias {
-                let _ = gpu.free_tensor(paro.pairs);
-                let _ = gpu.free_tensor(paro.theta);
-                let _ = gpu.free_tensor(paro.channel_scales);
-            }
-        }
         if let Some(awq) = self.awq_scale {
             let _ = gpu.free_tensor(awq);
         }
@@ -578,22 +543,16 @@ impl WeightTensor {
 }
 
 impl WeightTensor {
-    /// Logic-free adapter to the dispatch-layer WeightRef. Wires Givens +
-    /// AWQ + row_stride so GemvFamily sees everything a weight needs.
+    /// Logic-free adapter to the dispatch-layer WeightRef. Wires AWQ +
+    /// row_stride so GemvFamily sees everything a weight needs.
     pub fn dispatch_ref(&self) -> hipfire_dispatch::families::gemv::WeightRef<'_> {
-        use hipfire_dispatch::families::gemv::{GivensRef, WeightRef};
+        use hipfire_dispatch::families::gemv::WeightRef;
         WeightRef {
             buf: &self.buf,
             dtype: self.gpu_dtype,
             m: self.m,
             k: self.k,
             row_stride: self.row_stride,
-            rotation: self.paro.as_ref().map(|p| GivensRef {
-                pairs: &p.pairs,
-                theta: &p.theta,
-                scales: &p.channel_scales,
-                krot: p.krot as usize,
-            }),
             awq_scale: self.awq_scale.as_ref(),
             lloyd_lut_e4m3: self.lloyd_lut_e4m3,
             lloyd_lut_f16: self.lloyd_lut_f16,
@@ -748,15 +707,15 @@ impl LayerWeights {
 
 impl LlamaWeights {
     /// Return all GPU buffers to the pool (drained on unload). Consumes self.
-    /// Each weight goes through `WeightTensor::free_all` so the PARO rotation
-    /// and AWQ scale sidecars are released with their buffers.
+    /// Each weight goes through `WeightTensor::free_all` so the AWQ scale
+    /// sidecars are released with their buffers.
     pub fn free_gpu(self, gpu: &mut Gpu) {
         let _ = gpu.free_tensor(self.token_embd);
         let _ = gpu.free_tensor(self.output_norm);
         if !self.lm_head_aliases_embd {
-            // free_all (not .buf) so the AWQ / PARO sidecars are released too.
+            // free_all (not .buf) so the AWQ sidecar is released too.
             // The tied-lm_head alias carries no sidecars by construction
-            // (`tied_lm_head_alias` sets paro/awq_scale to None), so skipping
+            // (`tied_lm_head_alias` sets awq_scale to None), so skipping
             // the whole output weight when aliased still frees exactly once.
             self.output.free_all(gpu);
         }
@@ -809,7 +768,6 @@ pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor
         m: w.m,
         k: w.k,
         row_stride: 0,
-        rotation: None,
         awq_scale: None,
         lloyd_lut_e4m3: w.lloyd_lut_e4m3,
         lloyd_lut_f16: w.lloyd_lut_f16,
@@ -861,11 +819,6 @@ pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor
                         eps: 1e-6,
                         batch_size: 1,
                         variant: hipfire_dispatch::types::RotationVariant::PlainG128,
-                        givens_pairs: None,
-                        givens_theta: None,
-                        givens_scales: None,
-                        givens_krot: None,
-                        givens_group_size: None,
                     },
                 )
                 .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
@@ -883,64 +836,6 @@ pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor
                     x: &xr,
                     y,
                     variant: GemvVariant::Prerotated,
-                    residual: None,
-                    gate: None,
-                    up: None,
-                },
-            )
-            .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
-        }
-        // ParoQ4G128 / ParoQ4G64: Givens rotation (model-layer ParoRotation
-        // metadata, block width from the dtype) + the dtype's HFQ4 GEMV. Uses
-        // RotationFamily::run(Givens) which calls givens_rotate_to (copy_d2d +
-        // rotate in one kernel).
-        DType::ParoQ4G128 | DType::ParoQ4G64 => {
-            use hipfire_dispatch::families::rotation::{RotationFamily, RotationParams};
-            use std::sync::OnceLock;
-            static ROTATION: OnceLock<RotationFamily> = OnceLock::new();
-            let rotation = ROTATION.get_or_init(|| RotationFamily::new());
-            let paro = w
-                .paro
-                .as_ref()
-                .expect("Paro weight missing ParoRotation metadata");
-            gpu.ensure_paro_scratch(w.k)?;
-            let xr = GpuTensor {
-                buf: unsafe { gpu.scratch.paro_x_scratch.as_ref().unwrap().buf.alias() },
-                shape: vec![w.k],
-                dtype: DType::F32,
-            };
-            rotation
-                .run(
-                    &ctx,
-                    gpu,
-                    RotationParams {
-                        x,
-                        x_up: None,
-                        w_norm: None,
-                        x_plain: &xr,
-                        x_rot: &xr,
-                        awq_scale: None,
-                        k: w.k,
-                        eps: 1e-6,
-                        batch_size: 1,
-                        variant: hipfire_dispatch::types::RotationVariant::Givens,
-                        givens_pairs: Some(&paro.pairs),
-                        givens_theta: Some(&paro.theta),
-                        givens_scales: Some(&paro.channel_scales),
-                        givens_krot: Some(paro.krot as usize),
-                        givens_group_size: w.gpu_dtype.paro_group_size(),
-                    },
-                )
-                .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
-            // After Givens rotation xr is ready; use Plain (the dtype's HFQ4 kernel), not Prerotated.
-            gemv.run(
-                &ctx,
-                gpu,
-                &GemvParams {
-                    w: &wr,
-                    x: &xr,
-                    y,
-                    variant: GemvVariant::Plain,
                     residual: None,
                     gate: None,
                     up: None,
@@ -1177,69 +1072,6 @@ pub fn rotate_x_mq_128_for(
     gpu.rotate_x_mq_128(x, x_rot, k)
 }
 
-/// ParoQuant single-token rotation: read x, write Givens-rotated
-/// activation to x_rot via a single out-of-place kernel. Earlier
-/// versions did `copy_d2d(x → x_rot)` then `givens_rotate(x_rot)`;
-/// fusing into one launch eliminates an inter-node dependency that
-/// the hipGraph dependency analyzer can fail to enforce (observed
-/// numerical delta direct-vs-graph on gfx1151 / HIP 7.13).
-pub fn rotate_x_paro_for(
-    gpu: &mut Gpu,
-    paro: &ParoRotation,
-    x: &GpuTensor,
-    x_rot: &GpuTensor,
-    k: usize,
-) -> HipResult<()> {
-    gpu.givens_rotate_to(
-        x,
-        x_rot,
-        &paro.pairs,
-        &paro.theta,
-        &paro.channel_scales,
-        1,
-        k,
-        paro.krot as usize,
-        paro.group_size as usize,
-    )
-}
-
-/// Batched ParoQ4G64 projection (prefill): Givens-rotate the `n` rows of `x`
-/// through the weight's own sidecar (64-channel blocks) into `x_rot`, then the
-/// HFQ4-G64 GEMM into `y` (overwrite). `x_rot` must hold `n * w.k` floats.
-fn paro_g64_gemm(
-    gpu: &mut Gpu,
-    w: &WeightTensor,
-    x: &GpuTensor,
-    x_rot: &GpuTensor,
-    y: &GpuTensor,
-    n: usize,
-) -> HipResult<()> {
-    if w.gpu_dtype != DType::ParoQ4G64 {
-        return Err(hip_bridge::HipError::new(
-            0,
-            &format!(
-                "ParoQ4G64 prefill projection got a {:?} weight",
-                w.gpu_dtype
-            ),
-        ));
-    }
-    let paro = w.paro.as_ref().ok_or_else(|| {
-        hip_bridge::HipError::new(0, "ParoQ4G64 weight missing ParoRotation metadata")
-    })?;
-    gpu.givens_rotate_to(
-        x,
-        x_rot,
-        &paro.pairs,
-        &paro.theta,
-        &paro.channel_scales,
-        n,
-        w.k,
-        paro.krot as usize,
-        64,
-    )?;
-    gpu.gemm_hfq4g64(&w.buf, x_rot, y, w.m, w.k, n)
-}
-
 /// Phase A Stage A — F2: batched AWQ-aware variant of `rotate_x_mq`.
 /// Grid.y is the batch dim. See `rotate_x_mq_for` for routing logic.
 pub fn rotate_x_mq_batched_for(
@@ -1393,7 +1225,6 @@ pub fn weight_gemv_rows_exact(
             m: w.m,
             k: w.k,
             row_stride: 0,
-            rotation: None,
             awq_scale: None,
             lloyd_lut_e4m3: w.lloyd_lut_e4m3,
             lloyd_lut_f16: w.lloyd_lut_f16,
@@ -1445,7 +1276,6 @@ pub fn weight_gemv_prerotated(
             m: w.m,
             k: w.k,
             row_stride: 0,
-            rotation: None,
             awq_scale: None,
             lloyd_lut_e4m3: w.lloyd_lut_e4m3,
             lloyd_lut_f16: w.lloyd_lut_f16,
@@ -1458,7 +1288,7 @@ pub fn weight_gemv_prerotated(
 
     if dtype_needs_rotation(w.gpu_dtype) {
         if let Some(xr) = x_rot {
-            // `xr` is ALREADY FWHT/Givens-rotated by the caller (the whole
+            // `xr` is ALREADY FWHT-rotated by the caller (the whole
             // point of `weight_gemv_prerotated`: rotate once, reuse across the
             // Q/K/V or gate/up projections that share this input). It MUST go
             // straight into the `gemv_*_prerotated` kernel — i.e. through
@@ -1487,7 +1317,6 @@ pub fn weight_gemv_prerotated(
                 m: w.m,
                 k: w.k,
                 row_stride: 0,
-                rotation: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: w.lloyd_lut_e4m3,
                 lloyd_lut_f16: w.lloyd_lut_f16,
@@ -1518,7 +1347,6 @@ pub fn weight_gemv_prerotated(
         m: w.m,
         k: w.k,
         row_stride: 0,
-        rotation: None,
         awq_scale: None,
         lloyd_lut_e4m3: w.lloyd_lut_e4m3,
         lloyd_lut_f16: w.lloyd_lut_f16,
@@ -1559,7 +1387,6 @@ pub fn weight_gemv_residual(
         m: w.m,
         k: w.k,
         row_stride: 0,
-        rotation: None,
         awq_scale: None,
         lloyd_lut_e4m3: w.lloyd_lut_e4m3,
         lloyd_lut_f16: w.lloyd_lut_f16,
@@ -1668,7 +1495,6 @@ pub fn weight_gemv_swiglu_residual(
         m: w_down.m,
         k: w_down.k,
         row_stride: 0,
-        rotation: None,
         awq_scale: None,
         lloyd_lut_e4m3: w_down.lloyd_lut_e4m3,
         lloyd_lut_f16: w_down.lloyd_lut_f16,
@@ -2220,9 +2046,6 @@ pub fn is_batchable_la(dt: DType, arch: &str) -> bool {
             | DType::GgmlQ6K
             | DType::GgmlQ8_0
             | DType::GgmlIQ4XS
-            // ParoQ4G64: per-projection batched Givens + portable HFQ4-G64
-            // GEMM (`paro_g64_gemm`). ParoQ4G128 stays per-token here.
-            | DType::ParoQ4G64
     );
     if always_ok {
         return true;
@@ -2289,9 +2112,7 @@ pub struct PrefillBatchScratch {
     pub fa_k_batch: GpuTensor,        // [N × n_kv_heads × head_dim]
     pub fa_v_batch: GpuTensor,        // [N × n_kv_heads × head_dim]
     pub fa_attn_out_batch: GpuTensor, // [N × n_heads × head_dim]
-    // FWHT-rotated fa_attn_out for feeding MQ4 wo; ParoQ4G64 also uses it as
-    // the per-projection Givens temp for the dim-wide QKV / gate-up inputs,
-    // hence [N × max(q_dim, dim)].
+    // FWHT-rotated fa_attn_out for feeding MQ4 wo, [N × max(q_dim, dim)].
     pub fa_attn_out_rot_batch: GpuTensor,
 
     // FFN intermediates [N × hidden_dim].
@@ -2942,18 +2763,7 @@ fn forward_prefill_chunk(
         let qkv_is_hfq4g128 = matches!(layer.wq.gpu_dtype, DType::HFQ4G128);
 
         // 3-way fused QKV projection.
-        if layer.wq.gpu_dtype == DType::ParoQ4G64 {
-            // Every projection carries its own Givens sidecar, so each rotates
-            // the shared normed rows into the temp before its G64 GEMM.
-            let x_rot = pbs.fa_attn_out_rot_batch.sub_offset(0, n * dim);
-            for (w, out) in [
-                (&layer.wq, &pbs.fa_q_batch),
-                (&layer.wk, &pbs.fa_k_batch),
-                (&layer.wv, &pbs.fa_v_batch),
-            ] {
-                paro_g64_gemm(gpu, w, &pbs.x_rot_batch, &x_rot, out, n)?;
-            }
-        } else if qkv_is_hfq4g128 {
+        if qkv_is_hfq4g128 {
             debug_assert!(
                 matches!(layer.wk.gpu_dtype, DType::HFQ4G128)
                     && matches!(layer.wv.gpu_dtype, DType::HFQ4G128),
@@ -3399,14 +3209,7 @@ fn forward_prefill_chunk(
         } else {
             &pbs.fa_attn_out_batch
         };
-        if layer.wo.gpu_dtype == DType::ParoQ4G64 {
-            // Same overwrite-then-add as HFQ4G128 below, after the wo rotation.
-            let x_rot = pbs.fa_attn_out_rot_batch.sub_offset(0, n * layer.wo.k);
-            let projected = pbs.x_rot_batch.sub_offset(0, n * layer.wo.m);
-            paro_g64_gemm(gpu, &layer.wo, wo_input, &x_rot, &projected, n)?;
-            let x_n = pbs.x_batch.sub_offset(0, n * layer.wo.m);
-            gpu.add_inplace_f32(&x_n, &projected)?;
-        } else if wo_is_hfq4g128 {
+        if wo_is_hfq4g128 {
             // The generic G128 GEMM has overwrite semantics. Reuse x_rot_batch
             // as a dead-after-QKV temporary, then add into the residual stream.
             let projected = pbs.x_rot_batch.sub_offset(0, n * layer.wo.m);
@@ -3503,18 +3306,7 @@ fn forward_prefill_chunk(
                 config.norm_eps,
             )?;
         }
-        if layer.w_gate.gpu_dtype == DType::ParoQ4G64 {
-            let x_rot = pbs.fa_attn_out_rot_batch.sub_offset(0, n * dim);
-            paro_g64_gemm(
-                gpu,
-                &layer.w_gate,
-                &pbs.x_rot_batch,
-                &x_rot,
-                &pbs.gate_ffn_batch,
-                n,
-            )?;
-            paro_g64_gemm(gpu, &layer.w_up, &pbs.x_rot_batch, &x_rot, &pbs.up_batch, n)?;
-        } else if ffn_is_hfq4g128 {
+        if ffn_is_hfq4g128 {
             debug_assert!(
                 matches!(layer.w_up.gpu_dtype, DType::HFQ4G128),
                 "llama HFQ4G128 gate/up batch requires one uniform wire layout",
@@ -3640,22 +3432,7 @@ fn forward_prefill_chunk(
         } else {
             gpu.silu_mul_f32(&pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch)?;
         }
-        if layer.w_down.gpu_dtype == DType::ParoQ4G64 {
-            // up_batch is dead after silu_mul (rotation temp); gate_ffn_batch
-            // takes the projection, as in the HFQ4G128 arm below.
-            let x_rot = pbs.up_batch.sub_offset(0, n * layer.w_down.k);
-            let projected = pbs.gate_ffn_batch.sub_offset(0, n * layer.w_down.m);
-            paro_g64_gemm(
-                gpu,
-                &layer.w_down,
-                &pbs.ffn_hidden_batch,
-                &x_rot,
-                &projected,
-                n,
-            )?;
-            let x_n = pbs.x_batch.sub_offset(0, n * layer.w_down.m);
-            gpu.add_inplace_f32(&x_n, &projected)?;
-        } else if w_down_is_hfq4g128 {
+        if w_down_is_hfq4g128 {
             // gate_ffn_batch is dead after silu_mul and is larger than the
             // dim-wide down projection output, so it is a safe residual temp.
             let projected = pbs.gate_ffn_batch.sub_offset(0, n * layer.w_down.m);
@@ -3826,7 +3603,6 @@ pub fn load_weights(
                     m,
                     k,
                     row_stride: 0,
-                    paro: None,
                     awq_scale: None,
                     lloyd_lut_e4m3: None,
                     lloyd_lut_f16: None,
@@ -3841,7 +3617,6 @@ pub fn load_weights(
                     m,
                     k,
                     row_stride: 0,
-                    paro: None,
                     awq_scale: None,
                     lloyd_lut_e4m3: None,
                     lloyd_lut_f16: None,
@@ -3856,7 +3631,6 @@ pub fn load_weights(
                     m,
                     k,
                     row_stride: 0,
-                    paro: None,
                     awq_scale: None,
                     lloyd_lut_e4m3: None,
                     lloyd_lut_f16: None,
@@ -3871,7 +3645,6 @@ pub fn load_weights(
                     m,
                     k,
                     row_stride: 0,
-                    paro: None,
                     awq_scale: None,
                     lloyd_lut_e4m3: None,
                     lloyd_lut_f16: None,
@@ -3891,7 +3664,6 @@ pub fn load_weights(
                     m,
                     k,
                     row_stride: 0,
-                    paro: None,
                     awq_scale: None,
                     lloyd_lut_e4m3: None,
                     lloyd_lut_f16: None,
@@ -3936,7 +3708,6 @@ pub fn load_weights(
             m: config.vocab_size,
             k: config.dim,
             row_stride: 0,
-            paro: None,
             awq_scale: None,
             lloyd_lut_e4m3: None,
             lloyd_lut_f16: None,
@@ -9225,16 +8996,6 @@ mod tests {
         ] {
             assert!(is_batchable_la(DType::Q8_0, arch));
         }
-    }
-
-    // ── ParoQuant dispatch helpers ──────────────────────────────
-
-    #[test]
-    fn paro_small_direct_returns_none_when_unset() {
-        // With env var unset, should return None
-        // (can't clear env in test, but this verifies the conversion logic)
-        // The function returns None when env var is not set (via try_opt)
-        // We test the parsing behavior with a lock
     }
 
     // ── KvCache format dispatch ─────────────────────────────────

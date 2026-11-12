@@ -5429,7 +5429,6 @@ mod tests {
                         m: expert.gate_up.m,
                         k: expert.gate_up.k,
                         row_stride: expert.gate_up.row_stride,
-                        rotation: None,
                         awq_scale: None,
                         lloyd_lut_e4m3: None,
                         lloyd_lut_f16: None,
@@ -5441,7 +5440,6 @@ mod tests {
                         m: expert.down.m,
                         k: expert.down.k,
                         row_stride: expert.down.row_stride,
-                        rotation: None,
                         awq_scale: None,
                         lloyd_lut_e4m3: None,
                         lloyd_lut_f16: None,
@@ -6309,43 +6307,6 @@ mod tests {
     }
 
     #[test]
-    fn paro_separate_gate_up_uses_each_half_of_fused_rows() {
-        let gate = resource("paro_gate", DType::ParoQ4G128, &[4, 4]);
-        let up = resource("paro_up", DType::ParoQ4G128, &[4, 4]);
-        let down = resource("paro_down", DType::ParoQ4G128, &[4, 4]);
-        let table = ExpertTable::new(vec![ExpertMetadata::new(
-            0,
-            0,
-            0,
-            ExpertResources::separate(gate, up, down).unwrap(),
-        )
-        .unwrap()])
-        .unwrap();
-        let mut cache = table.prepare_binding(0, 1, 0).unwrap();
-        let fixture = live_fixture(&table, 0x20_0000);
-        bind_fixture(&table, &mut cache, &fixture);
-        let bound = BoundMoeExperts::from_cache(&table, &cache).unwrap();
-
-        validate_expert_shape_and_dtype(
-            &bound,
-            1,
-            8,
-            4,
-            4,
-            4,
-            DType::ParoQ4G128,
-            DType::ParoQ4G128,
-            false,
-            None,
-            None,
-        )
-        .unwrap();
-        let resources = bound.expert(0).unwrap().resources();
-        assert_eq!(resources.gate().unwrap().source_name(), "paro_gate");
-        assert_eq!(resources.up().unwrap().source_name(), "paro_up");
-    }
-
-    #[test]
     fn grouped_prefill_capacity_accepts_just_fit_and_rejects_one_row_small() {
         let total_slots = 17;
         let n_experts = 2;
@@ -6426,7 +6387,6 @@ mod tests {
             m,
             k,
             row_stride: 0,
-            rotation: None,
             awq_scale: None,
             lloyd_lut_e4m3: None,
             lloyd_lut_f16: None,
@@ -6991,7 +6951,6 @@ mod tests {
             m: 1,
             k: 1,
             row_stride: 0,
-            rotation: None,
             awq_scale: None,
             lloyd_lut_e4m3: None,
             lloyd_lut_f16: None,
@@ -7010,7 +6969,6 @@ mod tests {
             m,
             k,
             row_stride: k,
-            rotation: None,
             awq_scale: None,
             lloyd_lut_e4m3: None,
             lloyd_lut_f16: None,
@@ -7045,7 +7003,6 @@ mod tests {
                 routed_gate_up: DType::MQ4G256,
                 routed_down: DType::MQ4G256,
                 routed_has_mixed_experts: false,
-                has_paro_shared: false,
                 per_expert_gate_up: None,
                 per_expert_down: None,
             },
@@ -7094,8 +7051,6 @@ mod tests {
             routed_down_m: 4,
             routed_down_k: 4,
             routed_experts: routed,
-            routed_gate_up_paro: None,
-            routed_down_paro: None,
             router_logits: dummy,
             x_rot_local: dummy,
             gate_up_buf: dummy,
@@ -7304,7 +7259,6 @@ mod tests {
                 routed_gate_up: DType::MQ4G256,
                 routed_down: DType::MQ4G256,
                 routed_has_mixed_experts: false,
-                has_paro_shared: false,
                 per_expert_gate_up: None,
                 per_expert_down: None,
             },
@@ -7353,8 +7307,6 @@ mod tests {
             routed_down_m: 4,
             routed_down_k: 4,
             routed_experts: routed,
-            routed_gate_up_paro: None,
-            routed_down_paro: None,
             router_logits: &s.router_logits,
             x_rot_local: &s.x_rot_local,
             gate_up_buf: &s.gate_up_buf,
@@ -7973,7 +7925,6 @@ mod tests {
                 routed_gate_up: DType::MQ4G256,
                 routed_down: DType::MQ4G256,
                 routed_has_mixed_experts: false,
-                has_paro_shared: false,
                 per_expert_gate_up: None,
                 per_expert_down: None,
             },
@@ -8042,8 +7993,6 @@ mod tests {
             inverse_perm: &s.inverse_perm,
             y_gate_up_grouped: &s.y_gate_up_grouped,
             y_down_grouped: &s.y_down_grouped,
-            paro_gate_up: None,
-            paro_down: None,
             down_awq_scale: None,
             routed_out: partial,
             ep_row_gather: None,
@@ -9336,72 +9285,6 @@ mod tests {
                 "rows={rows}"
             );
         }
-    }
-
-    /// HIPF-137: a Paro shared gate/up rotates into `x_rot_batch`, so the routed
-    /// Paro input basis must be lowered after the shared stages, not before
-    /// them (otherwise the routed GEMMs read the shared up's rotation).
-    #[test]
-    fn paro_prefill_lowers_the_routed_input_basis_after_the_shared_stages() {
-        let table = table(4, DType::MQ4G256);
-        let mut cache = table.prepare_binding(0, 1, 0).unwrap();
-        let fixture = live_fixture(&table, 0xE8_1000);
-        bind_fixture(&table, &mut cache, &fixture);
-        let experts = BoundMoeExperts::from_cache(&table, &cache).unwrap();
-        let ctx = DispatchCtx::for_test("gfx1151");
-        let scratch = prefill_scratch(0xE9_1000);
-        let params = MoePrefillParams {
-            batch_size: 21,
-            recipe: MoeRecipe::SoftmaxGatedShared {
-                bf16_round_trip: false,
-                shared_after_combine: false,
-            },
-            ..ep_prefill_params(
-                &scratch,
-                &fixture.routed,
-                &fixture.gate_up_ptrs,
-                &fixture.down_ptrs,
-                None,
-            )
-        };
-        let resolution = crate::families::moe::MoePrefillResolution {
-            use_path2: true,
-            paro_mode: true,
-            ..crate::families::moe::MoePrefillResolution::sealed_fp8()
-        };
-        let selection = MoeKernelSelection::Prefill(MoePrefillSelection {
-            resolution,
-            path2_m_total: params.m_total_max,
-            force_mq4_grouped_fp16: false,
-            coalesced_verify: false,
-            route: None,
-            cpu_deferred_experts: false,
-            cpu_split: false,
-            cpwait: false,
-        });
-        let call = lowering_call(&ctx, experts, selection, SealedParams::Prefill(params));
-        let stages = moe_program::lowered_stages(&call).unwrap();
-        let at = |stage: MoeStage| stages.iter().position(|s| *s == stage).unwrap();
-        assert_eq!(
-            stages
-                .iter()
-                .filter(|s| **s == MoeStage::InputBasis)
-                .count(),
-            1,
-            "{stages:?}"
-        );
-        assert!(
-            at(MoeStage::SharedGateUp) < at(MoeStage::InputBasis),
-            "{stages:?}"
-        );
-        assert!(
-            at(MoeStage::SharedDown) < at(MoeStage::InputBasis),
-            "{stages:?}"
-        );
-        assert!(
-            at(MoeStage::InputBasis) < at(MoeStage::Scatter),
-            "{stages:?}"
-        );
     }
 
     /// `with` is `without` plus exactly one `RowGather`, right after the

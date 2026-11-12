@@ -901,7 +901,6 @@ fn shared_int8(gpu: &Gpu, p: &MoePrefillParams<'_>, use_path2: bool) -> bool {
                 && w.down.dtype == DType::BF16
                 && w.down.k == shared.intermediate
                 && w.down.m == p.down_m
-                && w.down.rotation.is_none()
                 && w.down.awq_scale.is_none()
                 && gpu.qwen4_shared_i8_applies(&shared_i8_weights(shared), p.batch_size)
         })
@@ -1495,7 +1494,6 @@ fn hc_shared_down_admits(gpu: &Gpu, p: &MoePrefillParams<'_>, hc: &HcSharedDown)
     !super::layer_ops::wide_exact_rows(gpu, p.batch_size)
         && gpu.flags.qwen4_hc_fuse_level() >= 3
         && down.dtype == DType::BF16
-        && down.rotation.is_none()
         && down.awq_scale.is_none()
         && p.recipe.bf16_round_trip()
         && p.recipe.shared_after_combine()
@@ -1570,7 +1568,6 @@ fn row_fold_gfx1201_applies(
         && !gpu.qwen4_shared_down_epi_enabled()
         && p.shared_down_out.is_none()
         && down.dtype == DType::BF16
-        && down.rotation.is_none()
         && down.awq_scale.is_none()
         && p.recipe.bf16_round_trip()
         && p.recipe.shared_after_combine()
@@ -1695,7 +1692,6 @@ pub(crate) fn epilogue_fuse_applies(gpu: &Gpu, p: &MoePrefillParams<'_>, use_pat
         && (rows == 1 || (rows <= gpu.few_row_limit() && gpu.arch_caps.has_gfx11_plus_simt()));
     few_row_gemv
         && down.dtype == DType::BF16
-        && down.rotation.is_none()
         && down.awq_scale.is_none()
         && p.recipe.bf16_round_trip()
         && p.recipe.shared_after_combine()
@@ -3728,8 +3724,8 @@ fn fp8_need_f32(tensor: &GpuTensor, name: &str, need: usize) -> Result<(), Dispa
     fp8_need_bytes(tensor, name, need)
 }
 
-/// A BF16 router/shared weight of exactly `[m, k]`, with no rotation or AWQ
-/// sidecar (its `project_weight` reads the natural activation).
+/// A BF16 router/shared weight of exactly `[m, k]`, with no AWQ sidecar (its
+/// `project_weight` reads the natural activation).
 fn fp8_bf16_weight(w: &WeightRef<'_>, name: &str, m: usize, k: usize) -> Result<(), DispatchError> {
     if w.dtype != DType::BF16 || w.m != m || w.k != k {
         return Err(fp8_refuse(format!(
@@ -3737,10 +3733,8 @@ fn fp8_bf16_weight(w: &WeightRef<'_>, name: &str, m: usize, k: usize) -> Result<
             w.dtype, w.m, w.k
         )));
     }
-    if w.rotation.is_some() || w.awq_scale.is_some() {
-        return Err(fp8_refuse(format!(
-            "{name} carries a rotation or AWQ sidecar"
-        )));
+    if w.awq_scale.is_some() {
+        return Err(fp8_refuse(format!("{name} carries an AWQ sidecar")));
     }
     let need = scratch_mul(scratch_mul(m, k)?, BF16_BYTES)?;
     if w.buf.buf.size() < need {
@@ -3771,9 +3765,9 @@ fn fp8_expert_base(
                 w.dtype, w.m, w.k
             )));
         }
-        if w.rotation.is_some() || w.awq_scale.is_some() {
+        if w.awq_scale.is_some() {
             return Err(fp8_refuse(format!(
-                "{what} {label} expert carries a rotation or AWQ sidecar"
+                "{what} {label} expert carries an AWQ sidecar"
             )));
         }
         if w.buf.buf.is_host_mapped() {
@@ -3827,8 +3821,6 @@ fn fp8_validate(
         ("ep_tile_exchange", p.ep_tile_exchange.is_some()),
         ("expert_dtype_tags", p.expert_dtype_tags.is_some()),
         ("expert_down_awq_ptrs", p.expert_down_awq_ptrs.is_some()),
-        ("paro_gate_up", p.paro_gate_up.is_some()),
-        ("paro_down", p.paro_down.is_some()),
         ("down_awq_scale", p.down_awq_scale.is_some()),
     ] {
         if present {
@@ -4838,7 +4830,6 @@ mod scratch_tests {
             m,
             k,
             row_stride: 0,
-            rotation: None,
             awq_scale: None,
             lloyd_lut_e4m3: None,
             lloyd_lut_f16: None,
@@ -5487,7 +5478,6 @@ mod hc_ar_tests {
             m,
             k,
             row_stride: k,
-            rotation: None,
             awq_scale: None,
             lloyd_lut_e4m3: None,
             lloyd_lut_f16: None,

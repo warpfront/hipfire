@@ -601,12 +601,8 @@ pub(crate) struct MoeProjectionSource {
 
 #[derive(Clone)]
 pub(crate) struct MoeExpertSourceRecord {
-    /// Fused HFQ gate||up source, when the carrier stores one projection.
-    pub(crate) gate_up: Option<MoeProjectionSource>,
-    /// Separate Paro gate/up source records, when the carrier stores them
-    /// independently even though the runtime uploads a fused gate||up view.
-    pub(crate) gate: Option<MoeProjectionSource>,
-    pub(crate) up: Option<MoeProjectionSource>,
+    /// Fused gate||up source: one projection carries both halves.
+    pub(crate) gate_up: MoeProjectionSource,
     pub(crate) down: MoeProjectionSource,
 }
 
@@ -783,88 +779,39 @@ pub(crate) fn build_expert_binding(
         add_source(sidecar)?;
     }
     for record in records.iter() {
-        if let Some(gate_up) = &record.gate_up {
-            add_source(gate_up)?;
-        } else {
-            add_source(record.gate.as_ref().ok_or_else(|| {
-                HipError::new(0, "expert source set has no gate or fused gate/up source")
-            })?)?;
-            add_source(record.up.as_ref().ok_or_else(|| {
-                HipError::new(0, "expert source set has no up or fused gate/up source")
-            })?)?;
-        }
+        add_source(&record.gate_up)?;
         add_source(&record.down)?;
     }
-    let first = records
-        .first()
-        .ok_or_else(|| HipError::new(0, "cannot bind an empty expert source set"))?;
-    let first_gate = first
-        .gate_up
-        .as_ref()
-        .or(first.gate.as_ref())
-        .ok_or_else(|| HipError::new(0, "expert source set has no gate source"))?;
-    let first_up = first
-        .gate_up
-        .as_ref()
-        .or(first.up.as_ref())
-        .ok_or_else(|| HipError::new(0, "expert source set has no up source"))?;
-    let fused = first.gate_up.is_some();
+    let first_gate = &records[0].gate_up;
     let mut gate_names = Vec::with_capacity(n_experts);
     let mut down_names = Vec::with_capacity(n_experts);
     let mut sidecar_names = std::collections::BTreeSet::new();
     let mut resources = Vec::with_capacity(n_experts);
-    let mut up_names = Vec::with_capacity(n_experts);
     for record in records.iter() {
-        let (gate, up) = match (&record.gate_up, &record.gate, &record.up) {
-            (Some(gate_up), None, None) => (gate_up, gate_up),
-            (None, Some(gate), Some(up)) => (gate, up),
-            _ => {
-                return Err(HipError::new(
-                    0,
-                    "expert source must be fused or separate gate/up",
-                ))
-            }
-        };
-        if gate.shape != up.shape {
-            return Err(HipError::new(
-                0,
-                &format!("expert gate/up shapes differ for '{}'", gate.name),
-            ));
-        }
-        let gate_bytes = source_bytes(gate, fused)?;
-        let up_bytes = source_bytes(up, fused)?;
+        let gate = &record.gate_up;
+        let gate_bytes = source_bytes(gate, true)?;
         let alignment = gate.alignment;
-        if alignment == 0
-            || !alignment.is_power_of_two()
-            || up.alignment != alignment
-            || record.down.alignment != alignment
-        {
+        if alignment == 0 || !alignment.is_power_of_two() || record.down.alignment != alignment {
             return Err(HipError::new(
                 0,
                 "expert projection alignments are inconsistent",
             ));
         }
         let down_bytes = source_bytes(&record.down, false)?;
-        if gate_bytes % alignment != 0 || up_bytes % alignment != 0 || down_bytes % alignment != 0 {
+        if gate_bytes % alignment != 0 || down_bytes % alignment != 0 {
             return Err(HipError::new(
                 0,
                 "expert projection bytes violate alignment",
             ));
         }
         gate_names.push(gate.name.clone());
-        up_names.push(up.name.clone());
         down_names.push(record.down.name.clone());
-        for sidecar in gate
-            .sidecars
-            .iter()
-            .chain(up.sidecars.iter())
-            .chain(record.down.sidecars.iter())
-        {
+        for sidecar in gate.sidecars.iter().chain(record.down.sidecars.iter()) {
             sidecar_names.insert(sidecar.clone());
         }
         resources.push(ExpertProjectionResources {
             gate_bytes,
-            up_bytes,
+            up_bytes: gate_bytes,
             down_bytes,
             alignment,
         });
@@ -874,20 +821,6 @@ pub(crate) fn build_expert_binding(
         .get(1)
         .copied()
         .ok_or_else(|| HipError::new(0, "expert gate source has no columns"))?;
-    let intermediate = if fused {
-        first_gate
-            .shape
-            .first()
-            .copied()
-            .ok_or_else(|| HipError::new(0, "expert gate source has no rows"))?
-            / 2
-    } else {
-        first_gate
-            .shape
-            .first()
-            .copied()
-            .ok_or_else(|| HipError::new(0, "expert gate source has no rows"))?
-    };
     let manifest_dtype = first_gate.dtype;
     // Expert projections replicate on Single and shard on EP; the router and
     // every sidecar replicate on both targets.
@@ -914,17 +847,6 @@ pub(crate) fn build_expert_binding(
             manifest_dtype,
             expert_policy.clone(),
         ));
-    }
-    if !fused {
-        for name in &up_names {
-            manifest.push(WeightEntry::layer(
-                name.clone(),
-                layer_idx,
-                vec![n_experts, first_up.shape[0], hidden],
-                manifest_dtype,
-                expert_policy.clone(),
-            ));
-        }
     }
     let down_shape = records[0].down.shape.clone();
     manifest.extend(down_names.iter().map(|name| {
@@ -966,19 +888,10 @@ pub(crate) fn build_expert_binding(
         n_experts,
         parallelism: parallelism,
         assignment: spec_assignment,
-        source_layout: if fused {
-            ExpertSourceLayout::PerExpertFused {
-                gate_up: gate_names,
-                down: down_names,
-                sidecars: sidecar_names.iter().cloned().collect(),
-            }
-        } else {
-            ExpertSourceLayout::PerExpertSeparate {
-                gate: gate_names,
-                up: up_names,
-                down: down_names,
-                sidecars: sidecar_names.iter().cloned().collect(),
-            }
+        source_layout: ExpertSourceLayout::PerExpertFused {
+            gate_up: gate_names,
+            down: down_names,
+            sidecars: sidecar_names.iter().cloned().collect(),
         },
         resources: ExpertResourceRequirements::new(resources),
         router: router.name,
@@ -1052,12 +965,7 @@ pub(crate) fn test_expert_binding() -> HipResult<(
     let gate_up = source("test.expert.gate_up", vec![2, 1], 8);
     let down = source("test.expert.down", vec![1, 1], 4);
     build_expert_binding(
-        Box::new([MoeExpertSourceRecord {
-            gate_up: Some(gate_up),
-            gate: None,
-            up: None,
-            down,
-        }]),
+        Box::new([MoeExpertSourceRecord { gate_up, down }]),
         router,
         Vec::new(),
         0,
@@ -1089,13 +997,7 @@ mod sealed_ep_owner_tests {
     fn test_records(n_experts: usize) -> Box<[MoeExpertSourceRecord]> {
         (0..n_experts)
             .map(|expert| MoeExpertSourceRecord {
-                gate_up: Some(test_source(
-                    &format!("test.expert.{expert}.gate_up"),
-                    vec![2, 1],
-                    8,
-                )),
-                gate: None,
-                up: None,
+                gate_up: test_source(&format!("test.expert.{expert}.gate_up"), vec![2, 1], 8),
                 down: test_source(&format!("test.expert.{expert}.down"), vec![1, 1], 4),
             })
             .collect()
@@ -1328,12 +1230,7 @@ pub(crate) fn global_dtype_pairs_from_records(
     records
         .iter()
         .map(|record| {
-            let gate_dtype = record
-                .gate_up
-                .as_ref()
-                .or(record.gate.as_ref())
-                .map(|source| source.dtype)
-                .unwrap_or(DType::F32);
+            let gate_dtype = record.gate_up.dtype;
             (gate_dtype, record.down.dtype)
         })
         .collect()
@@ -1420,7 +1317,6 @@ pub(crate) fn alloc_ep_dummies(
             m: spec.gate_m,
             k: spec.gate_k,
             row_stride: spec.gate_stride,
-            paro: None,
             awq_scale: None,
             lloyd_lut_e4m3: None,
             lloyd_lut_f16: None,
@@ -1432,7 +1328,6 @@ pub(crate) fn alloc_ep_dummies(
             m: spec.down_m,
             k: spec.down_k,
             row_stride: spec.down_stride,
-            paro: None,
             awq_scale: None,
             lloyd_lut_e4m3: None,
             lloyd_lut_f16: None,
@@ -1555,7 +1450,7 @@ pub struct MoeFfnWeights {
     /// patches per-token via `patch_expert_ptr_table`).
     pub experts: Vec<ExpertWeights>, // num_experts (= 256 for A3B); empty in paged mode
     /// Two allocation owners for the uniform MQ4 packed path. `None` preserves
-    /// the literal per-expert ownership used by mixed quant, Paro, paged, and
+    /// the literal per-expert ownership used by mixed quant, paged, and
     /// EP-streaming routes.
     pub(crate) packed_expert_owners: Option<PackedExpertOwners>,
     pub shared_expert: SharedExpertWeights,
@@ -1605,17 +1500,6 @@ pub struct MoeFfnWeights {
     /// Qwen3.5-MoE-A3B has uniform per-expert shape so one descriptor per
     /// layer suffices for v0.1.
     pub expert_shape: Option<hipfire_runtime::weight_pager::ExpertShape>,
-
-    /// ParoQuant only: shared per-layer rotation sidecars for the routed
-    /// experts. shisa-ai's PARO checkpoint quantizes all 256 experts with
-    /// one rotation tuple per projection-group (gate||up vs down), so we
-    /// upload the sidecars ONCE per layer and broadcast a non-owning
-    /// `ParoRotation` (built via `DeviceBuffer::from_raw`) into every
-    /// `ExpertWeights.gate_up.paro` / `ExpertWeights.down.paro`. The
-    /// owning storage lives here so the aliases stay valid for the
-    /// lifetime of the layer. `None` for HFQ MoE (per-tensor PARO sidecars
-    /// or no PARO at all).
-    pub paro_shared: Option<MoeParoSidecars>,
 
     /// EP global (gate_up_dtype, down_dtype) table — CPU-side immutable
     /// snapshot of the *full-model* expert dtypes (`len == num_experts`).
@@ -1702,31 +1586,6 @@ impl MoeFfnWeights {
     }
 }
 
-/// Owning storage for the per-layer shared ParoQuant rotation sidecars.
-/// One tuple per projection-group:
-///   - `gate_up_*`: applied to the post-RMSNorm hidden activation (K = hidden_dim).
-///     Shared by all 256 experts' gate AND up projections, and by the fused
-///     gate_up `WeightTensor`'s `paro` alias.
-///   - `down_*`: applied to the post-SiLU intermediate activation (K = mi).
-///     Shared by all 256 experts' down projection.
-pub struct MoeParoSidecars {
-    pub gate_up_pairs: GpuTensor,
-    pub gate_up_theta: GpuTensor,
-    pub gate_up_channel_scales: GpuTensor,
-    pub down_pairs: GpuTensor,
-    pub down_theta: GpuTensor,
-    pub down_channel_scales: GpuTensor,
-    pub krot: u32,
-    pub group_size: u32,
-    /// Exact source names for the two projection-specific sidecar tuples.
-    /// Gate/up and down are deliberately not collapsed: the loaded expert
-    /// tensors carry distinct rotation identities and must bind to the
-    /// matching tuple only.
-    pub(crate) gate_up_sidecar_names: Box<[String]>,
-    pub(crate) down_sidecar_names: Box<[String]>,
-    pub(crate) source_fingerprint: String,
-}
-
 pub struct DeltaNetMoeLayerWeights {
     pub attn_norm: GpuTensor,
     pub wqkv: WeightTensor,
@@ -1769,7 +1628,7 @@ impl LayerWeights {
     ///
     /// This is the single layer-level teardown used by both normal unload and
     /// whole-model load rollback. In particular, it preserves the packed,
-    /// paged, EP, and Paro ownership branches in `free_moe_ffn`.
+    /// paged and EP ownership branches in `free_moe_ffn`.
     pub fn free_gpu(self, gpu: &mut Gpu) {
         match self {
             LayerWeights::DeltaNet(l) => {
@@ -1947,42 +1806,6 @@ pub(crate) fn hfq_source_fingerprint(hfq: &HfqFile) -> String {
     format!("hfq:{:016x}", hasher.finish())
 }
 
-/// Derive the same kind of artifact-bound fingerprint for a generic
-/// [`ModelSource`] (including the safetensors-backed Paro loader).  Tensor
-/// names, shape, dtype, encoded byte ranges, and quantization metadata are
-/// included so a projection cannot be rebound to a different source merely
-/// because its logical dimensions happen to match.
-pub(crate) fn model_source_fingerprint(
-    source: &dyn hipfire_runtime::model_source::ModelSource,
-) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut names = source.tensor_names();
-    names.sort_unstable();
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    source.path().hash(&mut hasher);
-    source.metadata_json().hash(&mut hasher);
-    source.arch_id().hash(&mut hasher);
-    if let Some(qc) = source.quant_config() {
-        qc.method.hash(&mut hasher);
-        qc.bits.hash(&mut hasher);
-        qc.group_size.hash(&mut hasher);
-        qc.krot.hash(&mut hasher);
-        qc.dynamic_excludes.hash(&mut hasher);
-    }
-    for name in names {
-        name.hash(&mut hasher);
-        if let Some(info) = source.tensor_info(name) {
-            info.name.hash(&mut hasher);
-            info.dtype.hash(&mut hasher);
-            info.shape.hash(&mut hasher);
-            info.quant_type.hash(&mut hasher);
-            info.data_offset.hash(&mut hasher);
-            info.data_size.hash(&mut hasher);
-        }
-    }
-    format!("source:{:016x}", hasher.finish())
-}
-
 /// Frozen config fingerprint for EP seal. Contains every Qwen35Config primitive.
 /// Equality is exact (f32 via to_bits). EP admission still rejects paged/REAP but
 #[derive(Debug, Clone, PartialEq)]
@@ -2072,17 +1895,6 @@ impl GpuTensorDescriptor {
     }
 }
 
-/// Paro sidecar descriptor excluding pointers.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParoDescriptor {
-    pub krot: u32,
-    pub group_size: u32,
-    pub is_alias: bool,
-    pub pairs: GpuTensorDescriptor,
-    pub theta: GpuTensorDescriptor,
-    pub channel_scales: GpuTensorDescriptor,
-}
-
 /// Weight tensor descriptor excluding device pointer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WeightTensorDescriptor {
@@ -2092,7 +1904,6 @@ pub struct WeightTensorDescriptor {
     pub row_stride: usize,
     pub buf: GpuTensorDescriptor,
     pub awq_scale: Option<GpuTensorDescriptor>,
-    pub paro: Option<ParoDescriptor>,
     /// MQ4G256V2-Lloyd centered codebook LUTs (host values). All three are
     /// `Some` for a Lloyd tensor and are part of the seal: a missing LUT must
     /// never silently decode on the uniform grid.
@@ -2110,14 +1921,6 @@ impl WeightTensorDescriptor {
             row_stride: w.row_stride,
             buf: GpuTensorDescriptor::from_tensor(&w.buf),
             awq_scale: w.awq_scale.as_ref().map(GpuTensorDescriptor::from_tensor),
-            paro: w.paro.as_ref().map(|p| ParoDescriptor {
-                krot: p.krot,
-                group_size: p.group_size,
-                is_alias: p.is_alias,
-                pairs: GpuTensorDescriptor::from_tensor(&p.pairs),
-                theta: GpuTensorDescriptor::from_tensor(&p.theta),
-                channel_scales: GpuTensorDescriptor::from_tensor(&p.channel_scales),
-            }),
             lloyd_lut_e4m3: w.lloyd_lut_e4m3,
             lloyd_lut_f16: w.lloyd_lut_f16,
             lloyd_lut_c16: w.lloyd_lut_c16,
@@ -2653,12 +2456,11 @@ impl Qwen35Weights {
 //   `layers.{i:04}.<field>`.
 // A plain tensor field (norms, `a_log`, `dt_bias`, `conv_weight`,
 // `norm_weight`) is its own role. A `WeightTensor` field `<w>` contributes
-// `<w>.buf`, then `<w>.awq_scale` (if present), then `<w>.paro.pairs`,
-// `<w>.paro.theta`, `<w>.paro.channel_scales` (if present). Lloyd LUTs are
-// host values and are carried by the seal descriptor, not by a tensor role.
+// `<w>.buf`, then `<w>.awq_scale` (if present). Lloyd LUTs are host values
+// and are carried by the seal descriptor, not by a tensor role.
 // A tied lm_head keeps its `output.buf` role: it is a non-owning view of
-// `token_embd` (`buf.is_borrowed()`), while `output.awq_scale` / `output.paro.*`
-// remain independent owners.
+// `token_embd` (`buf.is_borrowed()`), while `output.awq_scale` remains an
+// independent owner.
 
 fn dense_unsupported(what: &str) -> HipError {
     HipError::new(0, &format!("qwen35 dense shared weights: {what}"))
@@ -2672,14 +2474,6 @@ fn visit_weight(prefix: &str, w: &WeightTensor, f: DenseVisit<'_>) -> HipResult<
     if let Some(awq) = &w.awq_scale {
         f(&format!("{prefix}.awq_scale"), awq)?;
     }
-    if let Some(paro) = &w.paro {
-        f(&format!("{prefix}.paro.pairs"), &paro.pairs)?;
-        f(&format!("{prefix}.paro.theta"), &paro.theta)?;
-        f(
-            &format!("{prefix}.paro.channel_scales"),
-            &paro.channel_scales,
-        )?;
-    }
     Ok(())
 }
 
@@ -2687,14 +2481,6 @@ fn visit_weight_mut(prefix: &str, w: &mut WeightTensor, f: DenseVisitMut<'_>) ->
     f(&format!("{prefix}.buf"), &mut w.buf)?;
     if let Some(awq) = &mut w.awq_scale {
         f(&format!("{prefix}.awq_scale"), awq)?;
-    }
-    if let Some(paro) = &mut w.paro {
-        f(&format!("{prefix}.paro.pairs"), &mut paro.pairs)?;
-        f(&format!("{prefix}.paro.theta"), &mut paro.theta)?;
-        f(
-            &format!("{prefix}.paro.channel_scales"),
-            &mut paro.channel_scales,
-        )?;
     }
     Ok(())
 }
@@ -2795,17 +2581,6 @@ fn placeholder_weight(d: &WeightTensorDescriptor) -> WeightTensor {
         m: d.m,
         k: d.k,
         row_stride: d.row_stride,
-        paro: d
-            .paro
-            .as_ref()
-            .map(|p| hipfire_runtime::llama::ParoRotation {
-                pairs: placeholder_tensor(&p.pairs),
-                theta: placeholder_tensor(&p.theta),
-                channel_scales: placeholder_tensor(&p.channel_scales),
-                krot: p.krot,
-                group_size: p.group_size,
-                is_alias: p.is_alias,
-            }),
         awq_scale: d.awq_scale.as_ref().map(placeholder_tensor),
         lloyd_lut_e4m3: d.lloyd_lut_e4m3,
         lloyd_lut_f16: d.lloyd_lut_f16,
@@ -2827,17 +2602,12 @@ fn validate_dense_weight_descriptor(role: &str, d: &WeightTensorDescriptor) -> H
             "{role}: MQ4G256V2Lloyd weight is missing its codebook LUTs"
         )));
     }
-    if d.paro.as_ref().is_some_and(|p| p.is_alias) {
-        return Err(dense_unsupported(&format!(
-            "{role}: aliased Paro sidecars are not dense-owned"
-        )));
-    }
     Ok(())
 }
 
 impl Qwen35RankSeal {
     /// Dense-only seal check: rejects MoE layers, expert metadata, pager and
-    /// MQ6-MoE flags, partial/missing Lloyd LUTs and aliased Paro sidecars,
+    /// MQ6-MoE flags, partial/missing Lloyd LUTs,
     /// and requires a tied `output.buf` descriptor to equal `token_embd`'s.
     pub fn validate_dense(&self) -> HipResult<()> {
         if self.has_pager {
@@ -2990,7 +2760,7 @@ impl Qwen35Weights {
     }
 
     /// Full dense validation: structure (no MoE/pager/EP/MQ6), seal-level
-    /// descriptor rules (complete Lloyd LUTs, no aliased Paro), and ownership
+    /// descriptor rules (complete Lloyd LUTs), and ownership
     /// (every role is a unique non-borrowed, non-host-mapped owner; a tied
     /// `output.buf` is a borrowed view of `token_embd`).
     pub fn validate_dense(&self) -> HipResult<()> {
@@ -3231,13 +3001,6 @@ pub(crate) fn free_weight_with<F>(weight: WeightTensor, free: &mut F)
 where
     F: FnMut(GpuTensor),
 {
-    if let Some(paro) = weight.paro {
-        if !paro.is_alias {
-            free(paro.pairs);
-            free(paro.theta);
-            free(paro.channel_scales);
-        }
-    }
     if let Some(awq) = weight.awq_scale {
         free(awq);
     }
@@ -3251,13 +3014,6 @@ pub(crate) fn free_weight_metadata_with<F>(weight: WeightTensor, free: &mut F)
 where
     F: FnMut(GpuTensor),
 {
-    if let Some(paro) = weight.paro {
-        if !paro.is_alias {
-            free(paro.pairs);
-            free(paro.theta);
-            free(paro.channel_scales);
-        }
-    }
     if let Some(awq) = weight.awq_scale {
         free(awq);
     }
@@ -3266,8 +3022,8 @@ where
 /// Free a staged MoE owner through a caller-supplied GPU-tensor cleanup seam.
 ///
 /// The ownership branches here are authoritative for all current routed-expert
-/// layouts: ordinary per-expert weights, packed uniform-MQ4 owners, ParoQuant
-/// shared sidecars, EP dummy buffers, and paged-mode's empty expert vector.
+/// layouts: ordinary per-expert weights, packed uniform-MQ4 owners,
+/// EP dummy buffers, and paged-mode's empty expert vector.
 /// Each callback invocation consumes one actual owning buffer exactly once.
 pub(crate) fn free_moe_ffn_with(ffn: MoeFfnWeights, free: &mut impl FnMut(GpuTensor)) {
     free_weight_with(ffn.router, free);
@@ -3316,16 +3072,6 @@ pub(crate) fn free_moe_ffn_with(ffn: MoeFfnWeights, free: &mut impl FnMut(GpuTen
     for e in ffn.ep_dummy_experts {
         free_weight_metadata_with(e.gate_up, free);
         free_weight_metadata_with(e.down, free);
-    }
-    // ParoQuant MoE: free the owning shared sidecars (per-expert `paro` fields
-    // alias these and must NOT be freed separately — they're non-owning views).
-    if let Some(s) = ffn.paro_shared {
-        free(s.gate_up_pairs);
-        free(s.gate_up_theta);
-        free(s.gate_up_channel_scales);
-        free(s.down_pairs);
-        free(s.down_theta);
-        free(s.down_channel_scales);
     }
     for d in ffn.ep_dummy_buffers {
         free(d);
@@ -3844,7 +3590,6 @@ mod tests {
             m: 1,
             k: 1,
             row_stride: 0,
-            paro: None,
             awq_scale: None,
             lloyd_lut_e4m3: None,
             lloyd_lut_f16: None,
@@ -3894,7 +3639,6 @@ mod tests {
             expert_dtype_tags: None,
             layer_idx: 0,
             expert_shape: None,
-            paro_shared: None,
             global_expert_dtypes: None,
             ep_dummy_buffers: Vec::new(),
             ep_dummy_experts: Vec::new(),
@@ -4155,7 +3899,6 @@ mod tests {
             (MQ4G256Lloyd, MQ4G256Lloyd),
             (Q8_0, Q8_0),
             (F16, F16),
-            (ParoQ4G128, ParoQ4G128),
             (MQ2G256Lloyd, MQ4G256),
             (MQ3G256Lloyd, MQ4G256V2),
             (MFP4G32E8, MQ4G256),
@@ -4194,7 +3937,6 @@ mod tests {
 #[cfg(test)]
 mod dense_shared_tests {
     use super::*;
-    use hipfire_runtime::llama::ParoRotation;
     use std::collections::HashMap;
 
     /// CPU-only fixture allocator: distinct fake VMM-owner pointers, never
@@ -4221,7 +3963,6 @@ mod dense_shared_tests {
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -4250,15 +3991,8 @@ mod dense_shared_tests {
         };
         output.awq_scale = Some(a.tensor(&[8], DType::F16, 16));
         let output_norm = a.tensor(&[8], DType::F32, 32);
-        let mut wz = a.weight(DType::ParoQ4G128, 4, 8);
-        wz.paro = Some(ParoRotation {
-            pairs: a.tensor(&[2, 8], DType::Raw, 32),
-            theta: a.tensor(&[2, 4], DType::F16, 16),
-            channel_scales: a.tensor(&[8], DType::F16, 16),
-            krot: 2,
-            group_size: 128,
-            is_alias: false,
-        });
+        let mut wz = a.weight(DType::MQ4G256, 4, 8);
+        wz.awq_scale = Some(a.tensor(&[8], DType::F16, 16));
         let delta = DeltaNetLayerWeights {
             attn_norm: a.tensor(&[8], DType::F32, 32),
             wqkv: a.lloyd(12, 8),
@@ -4336,7 +4070,7 @@ mod dense_shared_tests {
             assert_eq!(ref_roles[0], "token_embd");
             assert!(ref_roles.iter().any(|r| r == "output.buf"));
             assert!(ref_roles.iter().any(|r| r == "output.awq_scale"));
-            assert!(ref_roles.iter().any(|r| r == "layers.0000.wz.paro.theta"));
+            assert!(ref_roles.iter().any(|r| r == "layers.0000.wz.awq_scale"));
             assert!(ref_roles.iter().any(|r| r == "layers.0001.wq.awq_scale"));
             let mut mut_roles = Vec::new();
             weights

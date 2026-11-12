@@ -1158,7 +1158,7 @@ fn validate_expert_sources(spec: &ExpertGroupSpec, manifest: &[WeightEntry]) -> 
             }
             let entry = manifest_entry(spec, manifest, &format!("{label}[{index}]"), name)?;
             source_shape_matches(spec, label, per_expert, entry)?;
-            // Sidecars (e.g. PARO pairs/theta/scales) are distinct group-shared
+            // Sidecars (e.g. per-group scale tables) are distinct group-shared
             // tensors, not one slice per expert, so their shapes may differ.
             if per_expert && label != "sidecar" {
                 if let Some(previous) = &shape {
@@ -1960,7 +1960,7 @@ mod tests {
             ));
         }
         let spec = ExpertGroupSpec {
-            group: "paro".into(),
+            group: "sidecar_group".into(),
             layer: Some(0),
             n_experts: 2,
             parallelism: ExpertParallelism::Single,
@@ -1981,7 +1981,7 @@ mod tests {
                 2
             ]),
             router: "router".into(),
-            execution: "test.paro".into(),
+            execution: "test.sidecar_group".into(),
         };
         validate_expert_group_specs(&[spec], &manifest).unwrap();
     }

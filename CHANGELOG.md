@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Removed (breaking): the Givens-rotation INT4 safetensors import format and all of its kernels, loaders, dispatch paths, config keys and env flags (HIPF-382).** Its HFQ quant ids 28/29 stay reserved and unassigned. A checkpoint in that format now fails at load with a named refusal (`unsupported quantization_config.quant_method ...` for LLaMA/Qwen3 directories; Qwen3.5 and Cohere2-MoE safetensors directories are refused outright) instead of loading. Raw FP16/BF16 LLaMA/Qwen3 safetensors directories still load. Quantize to an HFQ build instead.
 - PeaceMaker RDNA: pin a named SOP1 XML-condition override table to all three source hashes, with per-row LLVM register, inline and literal byte-round-trip evidence. Preserve the malformed source condition; exhaustively prove all 256 selectors for restricted operand domains instead of disabling valid register forms along with invalid inline/literal forms.
 - PeaceMaker RDNA: carry full instruction/encoding/condition/ordinal keys through IR construction and RDNA consumers, and add an XML-layout field codec backed by generated runtime rows. Preserve named graphics refusals and refuse unqualified XML variants in the numeric emulator.
 

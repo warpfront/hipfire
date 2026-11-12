@@ -4,7 +4,6 @@
 > **Live follow-ups promoted to issues:**
 > - [#649](https://github.com/warpfront/hipfire/issues/649) — Redline retained-replay levers still open
 > - [#650](https://github.com/warpfront/hipfire/issues/650) — FWHT residual QJL transform
-> - [#651](https://github.com/warpfront/hipfire/issues/651) — PARO group_size=64 (G64) support
 >
 > Body distinction: sections already labeled complete/closed are **negative or finished
 > results** kept for provenance. Open bullets that were still actionable are the work
@@ -70,18 +69,3 @@ explicit shared-LDS GQA reuse.
 *(Promoted → issue #650.)*
 
 - Implement a Johnson-Lindenstrauss / QJL transformation on the residual in the FWHT path. The current FWHT path applies a signed-FWHT rotation to Q/K for attention and leaves the residual stream without a separate QJL transform.
-
-## PARO group_size=64 support (SmolLM2-360M)
-
-*(Open remaining work promoted → issue #651. ✅ items are complete results.)*
-
-The SmolLM2-360M PARO model uses group_size=64 (hidden_size=960 not divisible by 128).
-Need to generalize the hardcoded group_size=128 assumptions:
-
-1. ✅ **Repacker** (`paro.rs` + `hfq.rs`): parameterized — `bytes_per_group = 8 + gs/2`, loop `gs/2`
-   - Verified: SmolLM2 PARO loads all 32 layers through `load_weights_paroquant_llama` → `ParoBackend` → `load_layer`
-2. ❌ **DType**: add `ParoQ4G64` variant (or rename `ParoQ4G128` → `ParoQ4` + runtime group_size)
-3. ❌ **GEMM guard** (`gemm.rs:129`): relax `k % 128 == 0` → `k % gs == 0`
-4. ❌ **GPU kernels** (6 `.hip` files): new kernels with GROUP_SIZE=64 byte layout (40 bytes/group)
-   - Existing G128 kernels will silently produce wrong results for K not divisible by 128
-5. ❌ **Profile** (`profile.rs`): parameterize hardcoded 128/72 constants

@@ -3,8 +3,8 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! The single qwen35 per-layer weight schema, generic over a runtime
-//! `WeightBackend`. `load_weights` (HFQ), `load_weights_paroquant` (PaRo), and
-//! `load_layer_into` (multi-GPU HFQ) all funnel through `load_layer`.
+//! `WeightBackend`. `load_weights` (HFQ) and `load_layer_into` (multi-GPU HFQ)
+//! both funnel through `load_layer`.
 
 use crate::qwen35::weights::{free_moe_ffn_with, free_weight_with};
 use crate::qwen35::{
@@ -87,7 +87,7 @@ impl PendingLayer {
 }
 
 /// Load one layer's weights. `load_moe` builds the MoE FFN block for MoE layers
-/// (format-specific: HFQ `load_moe_ffn` vs PaRo `paro_load_moe_ffn`), supplied by
+/// (format-specific: HFQ `load_moe_ffn`), supplied by
 /// the caller so MoE layout stays arch-owned.
 pub(crate) fn load_layer<B: WeightBackend>(
     b: &mut B,
@@ -382,7 +382,6 @@ mod tests {
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -410,7 +409,6 @@ mod tests {
                     m: 1,
                     k: 1,
                     row_stride: 0,
-                    paro: None,
                     awq_scale: None,
                     lloyd_lut_e4m3: None,
                     lloyd_lut_f16: None,
@@ -437,7 +435,6 @@ mod tests {
                 expert_dtype_tags: None,
                 layer_idx: 0,
                 expert_shape: None,
-                paro_shared: None,
                 global_expert_dtypes: None,
                 ep_dummy_buffers: Vec::new(),
                 ep_dummy_experts: Vec::new(),

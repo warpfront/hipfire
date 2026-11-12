@@ -1488,8 +1488,7 @@ fn main() {
     let q8_bytes_per_pos = KvMode::Q8.k_per_pos(nkv, hd);
     assert!(
         asym3_bytes_per_pos < q8_bytes_per_pos,
-        "asym3 arena is not smaller than Q8 — the asym3 path is not active \
-         (see spec §4.4: QWEN35_PARO_POLICY silently downgrades asym3 to q8)"
+        "asym3 arena is not smaller than Q8 — the asym3 path is not active"
     );
     println!("asym3 K bytes/pos={asym3_bytes_per_pos} < Q8 K bytes/pos={q8_bytes_per_pos}: OK (asym3 path confirmed active)\n");
 

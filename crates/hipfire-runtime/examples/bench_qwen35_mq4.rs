@@ -77,84 +77,48 @@ fn main() {
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
     eprintln!("GPU: {}", gpu.arch);
 
-    // Auto-route safetensors directories (ParoQuant / AWQ / HF native) —
-    // mirrors daemon.rs:1500-1504 and eval_hipfire's load path. HFQ files
-    // take the canonical HFQ path below.
+    // GGUF files take the native path; HFQ files take the canonical HFQ path.
     let t_load = Instant::now();
-    let (config, weights, model_bytes) = if model_path_buf.extension().is_some_and(|e| e == "gguf")
-    {
-        // GGUF-native (`HIPFIRE_GGUF_NATIVE=1`): ggml block bytes served as-is.
-        let m = hipfire_loader::gguf_native::GgufNativeModel::open(model_path_buf).unwrap_or_else(
-            |e| {
-                eprintln!("{e}");
-                std::process::exit(1)
-            },
-        );
-        let config = m.hparams.config.clone();
-        eprintln!(
-            "Config: dim={} layers={} heads={} kv_heads={} vocab={}",
-            config.dim, config.n_layers, config.n_heads, config.n_kv_heads, config.vocab_size
-        );
-        let bytes = std::fs::metadata(model_path).map(|m| m.len()).unwrap_or(0);
-        eprintln!(
-            "Model size: {:.3} GiB ({} bytes, GGUF)",
-            bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-            bytes
-        );
-        let weights = m.load_qwen35_weights(&mut gpu).expect("load GGUF weights");
-        (config, weights, bytes)
-    } else if model_path_buf.is_dir() {
-        use hipfire_runtime::safetensors_source::SafetensorsSource;
-        let source = SafetensorsSource::open(model_path_buf).expect("safetensors open");
-        let config = qwen35::config_from_safetensors(&source).expect("config_from_safetensors");
-        eprintln!(
-            "Config: dim={} layers={} heads={} kv_heads={} vocab={}",
-            config.dim, config.n_layers, config.n_heads, config.n_kv_heads, config.vocab_size
-        );
-        let bytes = std::fs::read_dir(model_path_buf)
-            .ok()
-            .map(|rd| {
-                rd.filter_map(|e| e.ok())
-                    .filter(|e| e.path().extension().is_some_and(|x| x == "safetensors"))
-                    .filter_map(|e| std::fs::metadata(e.path()).ok())
-                    .map(|m| m.len())
-                    .sum::<u64>()
-            })
-            .unwrap_or(0);
-        eprintln!(
-            "Model size: {:.3} GiB ({} bytes, safetensors)",
-            bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-            bytes
-        );
-        eprintln!("  loading via safetensors (ParoQuant path)");
-        let mut paro_source = qwen35::ParoSource::new(&source, &config).expect("ParoSource::new");
-        let paro_layout = qwen35::Layout::single(config.n_layers);
-        let weights = qwen35::load_weights(
-            &mut paro_source,
-            std::slice::from_mut(&mut gpu),
-            &paro_layout,
-        )
-        .expect("load_weights");
-        (config, weights, bytes)
-    } else {
-        let mut hfq = HfqFile::open(model_path_buf).expect("open model");
-        let config = qwen35::config_from_hfq(&hfq).expect("read config");
-        eprintln!(
-            "Config: dim={} layers={} heads={} kv_heads={} vocab={}",
-            config.dim, config.n_layers, config.n_heads, config.n_kv_heads, config.vocab_size
-        );
-        let bytes = std::fs::metadata(model_path).map(|m| m.len()).unwrap_or(0);
-        eprintln!(
-            "Model size: {:.3} GiB ({} bytes)",
-            bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-            bytes
-        );
-        let mut src = qwen35::HfqSource::new(&mut hfq, &config);
-        let layout = qwen35::Layout::single(config.n_layers);
-        let weights = qwen35::load_weights(&mut src, std::slice::from_mut(&mut gpu), &layout)
-            .expect("load weights");
-        (config, weights, bytes)
-    };
+    let (config, weights, model_bytes) =
+        if model_path_buf.extension().is_some_and(|e| e == "gguf") {
+            // GGUF-native (`HIPFIRE_GGUF_NATIVE=1`): ggml block bytes served as-is.
+            let m = hipfire_loader::gguf_native::GgufNativeModel::open(model_path_buf)
+                .unwrap_or_else(|e| {
+                    eprintln!("{e}");
+                    std::process::exit(1)
+                });
+            let config = m.hparams.config.clone();
+            eprintln!(
+                "Config: dim={} layers={} heads={} kv_heads={} vocab={}",
+                config.dim, config.n_layers, config.n_heads, config.n_kv_heads, config.vocab_size
+            );
+            let bytes = std::fs::metadata(model_path).map(|m| m.len()).unwrap_or(0);
+            eprintln!(
+                "Model size: {:.3} GiB ({} bytes, GGUF)",
+                bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                bytes
+            );
+            let weights = m.load_qwen35_weights(&mut gpu).expect("load GGUF weights");
+            (config, weights, bytes)
+        } else {
+            let mut hfq = HfqFile::open(model_path_buf).expect("open model");
+            let config = qwen35::config_from_hfq(&hfq).expect("read config");
+            eprintln!(
+                "Config: dim={} layers={} heads={} kv_heads={} vocab={}",
+                config.dim, config.n_layers, config.n_heads, config.n_kv_heads, config.vocab_size
+            );
+            let bytes = std::fs::metadata(model_path).map(|m| m.len()).unwrap_or(0);
+            eprintln!(
+                "Model size: {:.3} GiB ({} bytes)",
+                bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                bytes
+            );
+            let mut src = qwen35::HfqSource::new(&mut hfq, &config);
+            let layout = qwen35::Layout::single(config.n_layers);
+            let weights = qwen35::load_weights(&mut src, std::slice::from_mut(&mut gpu), &layout)
+                .expect("load weights");
+            (config, weights, bytes)
+        };
     eprintln!("Weights loaded in {:.2}s", t_load.elapsed().as_secs_f64());
 
     let kv_seq = (prefill_len + warmup_len + gen_len + 16).max(512);

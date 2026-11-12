@@ -281,7 +281,7 @@ fn main() {
             std::process::exit(1);
         }
         if args.model.is_dir() {
-            eprintln!("--tp is not supported for safetensors/paro model directories");
+            eprintln!("--tp is not supported for safetensors model directories");
             std::process::exit(1);
         }
     }
@@ -723,27 +723,11 @@ fn main() {
         // respects calib_force_bf16 for teachers.
         use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
 
-        // Auto-route safetensors directories (ParoQuant / AWQ / HF native) — mirrors
-        // daemon.rs:1500-1504. HFQ files take the canonical HFQ path below.
+        // GGUF files take the native path; HFQ files take the canonical HFQ path.
         let (config, weights) = if let Some(m) = &gguf_model {
             eprintln!("  loading via GGUF-native source arch_id={arch_id}");
             let weights = m.load_qwen35_weights(&mut gpu).expect("load GGUF weights");
             (m.hparams.config.clone(), weights)
-        } else if args.model.is_dir() {
-            use hipfire_runtime::safetensors_source::SafetensorsSource;
-            let source = SafetensorsSource::open(&args.model).expect("safetensors open");
-            let config = qwen35::config_from_safetensors(&source).expect("config_from_safetensors");
-            eprintln!("  loading via safetensors (ParoQuant path) arch_id={arch_id}");
-            let mut paro_source =
-                qwen35::ParoSource::new(&source, &config).expect("ParoSource::new");
-            let paro_layout = qwen35::Layout::single(config.n_layers);
-            let weights = qwen35::load_weights(
-                &mut paro_source,
-                std::slice::from_mut(&mut gpu),
-                &paro_layout,
-            )
-            .expect("load_weights");
-            (config, weights)
         } else {
             let mut hfq = HfqFile::open(&args.model).expect("open model");
             let config = qwen35::config_from_hfq(&hfq).expect("read config");

@@ -1,6 +1,6 @@
 //! Arch-generic whole-model weight orchestration (Tier-2). Sequences
 //! embed → final-norm → output → per-device layer loop over a `WeightSource`,
-//! whose impls own the format-specific reads (HFQ vs ParoQuant) and bake their
+//! whose impls own the format-specific reads (HFQ, GGUF) and bake their
 //! own config. Per-arch crates wrap the returned `LoadedWeights<L>` into their
 //! own weights struct. Complements `weight_backend::WeightBackend` (Tier-3,
 //! per-tensor dequant), which `WeightSource::read_layer` calls internally.
@@ -151,7 +151,7 @@ pub struct LoadedWeights<L> {
     pub lm_head_aliases_embd: bool,
 }
 
-/// Whole-model weight source — the one place HFQ vs PaRo differs. Config is held
+/// Whole-model weight source — the one place container formats differ. Config is held
 /// by the impl (not passed per-call) so the orchestrator stays config-agnostic.
 /// `read_layer` reuses Tier-3 `load_layer<B: WeightBackend>` internally.
 pub trait WeightSource {
@@ -167,7 +167,7 @@ pub trait WeightSource {
     fn mq3v2_symmetric(&self) -> bool {
         false
     }
-    /// Pre-load hook. HFQ drops the mmap when n==1; PaRo rejects n>1; llama no-op.
+    /// Pre-load hook. HFQ drops the mmap when n==1; llama no-op.
     fn prepare(&mut self, n_devices: usize) -> HipResult<()>;
     fn read_embed(&mut self, gpu: &mut Gpu) -> HipResult<(GpuTensor, EmbeddingFormat)>;
     fn read_final_norm(&mut self, gpu: &mut Gpu) -> HipResult<GpuTensor>;
@@ -197,7 +197,7 @@ pub trait WeightSource {
     /// Release one successfully loaded layer during whole-model rollback.
     ///
     /// Layer ownership is architecture-specific (Qwen3.5 carries MoE
-    /// pointer tables and shared Paro sidecars), so the source supplies the
+    /// pointer tables), so the source supplies the
     /// exact teardown instead of relying on a generic `Drop`.
     fn free_layer(&mut self, gpu: &mut Gpu, layer: Self::Layer);
 }

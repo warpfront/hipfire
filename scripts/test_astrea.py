@@ -1180,7 +1180,25 @@ class AstreaTests(unittest.TestCase):
         self.assertTrue(any("expert" in item for item in policy["probe_plan"]["moe"]))
         self.assertEqual(policy["model_family"], "qwen3.6-a3b")
 
-    def test_policy_wires_paro_and_kv_domains_without_runtime_mutation(self):
+    def test_unknown_quant_type_and_method_are_refused(self):
+        astrea = load_astrea()
+        with self.assertRaisesRegex(ValueError, "unsupported quant type"):
+            astrea.build_policy(
+                model="synthetic.mq4.hfq",
+                base_format="bogus4",
+                promotion_format="q8",
+                max_extra_bytes=0,
+            )
+        with self.assertRaisesRegex(ValueError, "unsupported quantization method"):
+            astrea.build_policy(
+                model="synthetic.mq4.hfq",
+                base_format="q8",
+                promotion_format="q8",
+                max_extra_bytes=0,
+                methods=["bogus-method"],
+            )
+
+    def test_policy_wires_kv_domains_without_runtime_mutation(self):
         astrea = load_astrea()
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1213,15 +1231,13 @@ class AstreaTests(unittest.TestCase):
                 promotion_format="q8",
                 sensitivity_json=str(sensitivity),
                 max_extra_bytes=272,
-                methods=["paroquant", "awq"],
+                methods=["awq"],
                 domains=["weights", "kv"],
                 objectives=["dynamic-tensor-policy", "kv-policy"],
                 policy_id="combined-policy-smoke",
             )
 
         self.assertEqual(policy["domains"], ["weights", "kv"])
-        self.assertIn("paroquant", policy["methods"])
-        self.assertIn("paroquant", policy["weight_transform_plan"])
         self.assertIn("kv_policy", policy["probe_plan"])
         self.assertEqual(policy["runtime_mutation_status"], "deferred_to_loader_and_kernel_work")
         self.assertEqual(
@@ -1271,7 +1287,7 @@ class AstreaTests(unittest.TestCase):
             plan = astrea.build_bundle_plan(
                 model=str(model),
                 output=str(root / "synthetic.mq4.astrea.hfq"),
-                include=["weights", "paro", "kv-policy", "triattn"],
+                include=["weights", "kv-policy", "triattn"],
                 triattn=str(triattn),
                 policy_id="combined-policy-smoke",
                 bundle_id="bundle-plan-smoke",
@@ -1281,7 +1297,6 @@ class AstreaTests(unittest.TestCase):
         self.assertEqual(plan["bundle_id"], "bundle-plan-smoke")
         self.assertFalse(plan["external_sidecars_target"])
         self.assertEqual(plan["container"]["format"], "hfq-package-v0")
-        self.assertIn("transform.paro", plan["sections"])
         self.assertIn("kv.policy", plan["sections"])
         self.assertIn("triattn.centers", plan["sections"])
         self.assertEqual(plan["sections"]["triattn.centers"]["source"]["path"], str(triattn))
@@ -1374,8 +1389,6 @@ class AstreaTests(unittest.TestCase):
                     str(model),
                     "--output",
                     str(root / "out.hfq"),
-                    "--include",
-                    "paro",
                     "--include",
                     "kv-policy",
                     "--include",

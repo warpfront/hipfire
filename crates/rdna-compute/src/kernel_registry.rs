@@ -4940,15 +4940,6 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         kernels::FUSED_QKVZA_Q8_0_SRC,
         ["fused_qkvza_q8_0"]
     );
-    // ParoQ4G64 scalar projections and its group-sized out-of-place rotation;
-    // these launchers have no architecture gate.
-    add!("gemm_hfq4g64", kernels::GEMM_HFQ4G64_SRC, ["gemm_hfq4g64"]);
-    add!("gemv_hfq4g64", kernels::GEMV_HFQ4G64_SRC, ["gemv_hfq4g64"]);
-    add!(
-        "givens_rotate_to_g64_f32",
-        kernels::GIVENS_ROTATE_TO_G64_SRC,
-        ["givens_rotate_to_g64_f32"]
-    );
     // DFlash2's HC-state mean capture uses the same scalar source on all arches.
     add!(
         "hc_mean_capture",
@@ -11570,17 +11561,12 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
-        // Later ParoQ4G64 and DFlash2 launchers add their own modules, not P0 rows.
-        const G64_AND_HC_CAPTURE_ADDED_MODULES: [&str; 4] = [
-            "gemm_hfq4g64",
-            "gemv_hfq4g64",
-            "givens_rotate_to_g64_f32",
-            "hc_mean_capture",
-        ];
-        for module in G64_AND_HC_CAPTURE_ADDED_MODULES {
+        // Later DFlash2 launchers add their own modules, not P0 rows.
+        const HC_CAPTURE_ADDED_MODULES: [&str; 1] = ["hc_mean_capture"];
+        for module in HC_CAPTURE_ADDED_MODULES {
             assert!(
                 by_name.contains_key(module),
-                "missing G64/HC capture module {module}"
+                "missing HC capture module {module}"
             );
             assert!(
                 !expected
@@ -12176,7 +12162,7 @@ mod tests {
                 + MQ6_I8_ADDED_MODULES.len()
                 + HC_DOWN_FUSED_ADDED_MODULES.len()
                 + SHARED_I8_ADDED_MODULES.len()
-                + G64_AND_HC_CAPTURE_ADDED_MODULES.len()
+                + HC_CAPTURE_ADDED_MODULES.len()
                 + HC_ROW_FOLD_ADDED_MODULES.len()
                 + MOE_FRONT_ADDED_MODULES.len()
                 + MQ4RS_DECODE_ADDED_MODULES.len()

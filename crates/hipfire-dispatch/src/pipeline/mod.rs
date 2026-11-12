@@ -190,7 +190,7 @@ fn reject_mq4g128v2_moe(dtypes: &crate::families::moe::MoeDtypes<'_>) -> Result<
     // qwen35 qt53 routed-down typed fallback: the one narrow exception to this
     // generic refusal (uniform qt44 gate/up + uniform qt53 routed down, qt53
     // nowhere else). Reached only for MoE without a route policy: with one, a
-    // missing route is refused before this guard runs. Tags / AWQ / Paro /
+    // missing route is refused before this guard runs. Tags / AWQ /
     // CPU-deferred operands the snapshot cannot see are refused by
     // [`qt53_fallback_operand_refusal`] in every stage that launches.
     if dtypes.qt53_routed_down_fallback() {
@@ -248,15 +248,12 @@ pub enum RoutedDownRotation {
     Fwht128,
     /// Natural basis, no rotation (`MQ2G256LloydU`).
     Natural,
-    /// Givens (PARO sidecar) rotation, not an FWHT (`ParoQ4G128`).
-    Givens,
 }
 
 /// The [`RoutedDownRotation`] of a routed expert down dtype.
 pub fn routed_down_rotation(dtype: DType) -> RoutedDownRotation {
     match dtype {
         DType::MQ4G128V2 => RoutedDownRotation::Fwht128,
-        DType::ParoQ4G128 => RoutedDownRotation::Givens,
         dtype if gate_down_skips_rotation(dtype) => RoutedDownRotation::Natural,
         _ => RoutedDownRotation::Fwht256,
     }
@@ -269,7 +266,7 @@ pub fn routed_down_rotation(dtype: DType) -> RoutedDownRotation {
 /// * qt53 outside the exact fallback dtype shape (defence behind the generic
 ///   guard) is refused;
 /// * per-expert dtype tags (no tag exists for the qt44/qt53 pair), per-expert
-///   AWQ scales and Paro sidecars are refused;
+///   AWQ scales are refused;
 /// * CPU-deferred routed experts are refused (the CPU splice has no qt53 F32
 ///   FWHT128 recipe for the non-route F32 path).
 ///
@@ -280,7 +277,6 @@ pub(crate) fn qt53_fallback_operand_refusal(
     route: Option<MoeRouteCapability>,
     has_dtype_tags: bool,
     has_expert_awq: bool,
-    has_paro_sidecar: bool,
     cpu_deferred_experts: bool,
 ) -> Result<(), DispatchError> {
     use crate::families::moe::qt53_fallback_unsupported as unsupported;
@@ -295,9 +291,6 @@ pub(crate) fn qt53_fallback_operand_refusal(
     }
     if has_expert_awq {
         return Err(unsupported("qt53-fallback-awq-unsupported"));
-    }
-    if has_paro_sidecar {
-        return Err(unsupported("qt53-fallback-paro-unsupported"));
     }
     if cpu_deferred_experts {
         return Err(unsupported("qt53-fallback-cpu-deferred-unsupported"));
@@ -323,7 +316,6 @@ fn check_qt53_decode_fallback(
         route,
         p.expert_dtype_tags.is_some(),
         expert_awq,
-        p.routed_gate_up_paro.is_some() || p.routed_down_paro.is_some(),
         p.cpu_deferred_experts,
     )
 }
@@ -338,7 +330,6 @@ fn check_qt53_prefill_fallback(
         None,
         p.expert_dtype_tags.is_some(),
         p.expert_down_awq_ptrs.is_some() || p.down_awq_scale.is_some(),
-        p.paro_gate_up.is_some() || p.paro_down.is_some(),
         p.cpu_deferred_experts,
     )
 }
@@ -420,7 +411,6 @@ fn select_grouped_route_by(
                 )
                 && shared_intermediate == policy.geometry.shared_intermediate
                 && !dtypes.routed_has_mixed_experts
-                && !dtypes.has_paro_shared
                 && !has_sidecars
                 && dtype_tags.is_none()
                 && formats.router == DType::BF16
@@ -466,7 +456,6 @@ fn select_grouped_route_by(
                     dtype_tags.is_some(),
                 )
                 && shared_intermediate == policy.geometry.shared_intermediate
-                && !dtypes.has_paro_shared
                 && !has_sidecars
                 && formats.router == DType::BF16
                 && formats.shared_selector == DType::BF16
@@ -548,7 +537,6 @@ pub(crate) fn select_fp8_grouped_route(
         )
         && shared_intermediate == policy.geometry.shared_intermediate
         && !dtypes.routed_has_mixed_experts
-        && !dtypes.has_paro_shared
         && !has_sidecars
         && dtype_tags.is_none()
         && [
@@ -601,7 +589,6 @@ mod qt53_fallback_tests {
             routed_gate_up: DType::MQ4G256V2,
             routed_down: DType::MQ4G128V2,
             routed_has_mixed_experts: false,
-            has_paro_shared: false,
             per_expert_gate_up: None,
             per_expert_down: None,
         }
@@ -723,7 +710,6 @@ mod qt53_fallback_tests {
             (DType::MQ2G256Lloyd, Fwht256),
             (DType::MFP4G32E8, Fwht256),
             (DType::MQ2G256LloydU, Natural),
-            (DType::ParoQ4G128, Givens),
         ] {
             assert_eq!(routed_down_rotation(dtype), want, "{dtype:?}");
         }
@@ -823,17 +809,13 @@ mod qt53_fallback_tests {
                 routed_gate_up: DType::MQ4G256,
                 ..base
             },
-            // mixed / tagged tiers, Paro.
+            // mixed / tagged tiers.
             MoeDtypes {
                 routed_has_mixed_experts: true,
                 ..base
             },
             MoeDtypes {
                 per_expert_down: Some(&MIXED_DOWN),
-                ..base
-            },
-            MoeDtypes {
-                has_paro_shared: true,
                 ..base
             },
         ];
@@ -845,23 +827,21 @@ mod qt53_fallback_tests {
         }
     }
 
-    /// Operands the dtype snapshot cannot see: tags, AWQ, Paro, CPU-deferred.
+    /// Operands the dtype snapshot cannot see: tags, AWQ, CPU-deferred.
     #[test]
     fn qt53_operand_guard_table() {
         let dtypes = fallback_dtypes();
-        let guard = |tags, awq, paro, deferred| {
-            qt53_fallback_operand_refusal(&dtypes, None, tags, awq, paro, deferred)
-        };
-        assert!(guard(false, false, false, false).is_ok());
-        for (tags, awq, paro, deferred) in [
-            (true, false, false, false),
-            (false, true, false, false),
-            (false, false, true, false),
-            (false, false, false, true),
+        let guard =
+            |tags, awq, deferred| qt53_fallback_operand_refusal(&dtypes, None, tags, awq, deferred);
+        assert!(guard(false, false, false).is_ok());
+        for (tags, awq, deferred) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
         ] {
             assert!(
-                is_qt53_refusal(guard(tags, awq, paro, deferred)),
-                "{tags} {awq} {paro} {deferred}"
+                is_qt53_refusal(guard(tags, awq, deferred)),
+                "{tags} {awq} {deferred}"
             );
         }
         // qt53 outside the fallback shape is refused even without sidecars.
@@ -870,16 +850,16 @@ mod qt53_fallback_tests {
             ..dtypes
         };
         assert!(is_qt53_refusal(qt53_fallback_operand_refusal(
-            &crossed, None, false, false, false, false
+            &crossed, None, false, false, false
         )));
         // A specialized route (Flash-Next) and every other down dtype are never consulted.
         let route = Some(MoeRouteCapability::Qt44Qt53Grouped);
-        assert!(qt53_fallback_operand_refusal(&dtypes, route, true, true, true, true).is_ok());
+        assert!(qt53_fallback_operand_refusal(&dtypes, route, true, true, true).is_ok());
         let other = MoeDtypes {
             routed_down: DType::MQ4G256V2,
             ..dtypes
         };
-        assert!(qt53_fallback_operand_refusal(&other, None, true, true, true, true).is_ok());
+        assert!(qt53_fallback_operand_refusal(&other, None, true, true, true).is_ok());
     }
 
     /// Flash-Next (`route_policy = Some(Qt44Qt53Grouped*)`) selection and its
@@ -989,27 +969,14 @@ mod qt53_fallback_tests {
             assert_eq!(variant(res.check_generic_route(None)), want, "{arch}");
         }
         // operands.
-        for (tags, awq, paro, deferred, want) in [
-            (
-                true,
-                false,
-                false,
-                false,
-                "qt53-fallback-dtype-tags-unsupported",
-            ),
-            (false, true, false, false, "qt53-fallback-awq-unsupported"),
-            (false, false, true, false, "qt53-fallback-paro-unsupported"),
-            (
-                false,
-                false,
-                false,
-                true,
-                "qt53-fallback-cpu-deferred-unsupported",
-            ),
+        for (tags, awq, deferred, want) in [
+            (true, false, false, "qt53-fallback-dtype-tags-unsupported"),
+            (false, true, false, "qt53-fallback-awq-unsupported"),
+            (false, false, true, "qt53-fallback-cpu-deferred-unsupported"),
         ] {
             assert_eq!(
                 variant(qt53_fallback_operand_refusal(
-                    &dtypes, None, tags, awq, paro, deferred
+                    &dtypes, None, tags, awq, deferred
                 )),
                 want
             );
@@ -1066,7 +1033,6 @@ mod qwen4_route_tests {
             routed_gate_up: DType::MQ4G256V2,
             routed_down: DType::MQ4G128V2,
             routed_has_mixed_experts: false,
-            has_paro_shared: false,
             per_expert_gate_up: None,
             per_expert_down: None,
         }
@@ -1661,7 +1627,6 @@ mod fp8_route_tests {
             routed_gate_up: DType::FP8E4M3B128,
             routed_down: DType::FP8E4M3B128,
             routed_has_mixed_experts: false,
-            has_paro_shared: false,
             per_expert_gate_up: None,
             per_expert_down: None,
         }
@@ -1965,11 +1930,6 @@ pub fn execute_pipeline(
                         eps: 1e-6,
                         batch_size: 1,
                         variant: RotationVariant::Plain,
-                        givens_pairs: None,
-                        givens_theta: None,
-                        givens_scales: None,
-                        givens_krot: None,
-                        givens_group_size: None,
                     },
                 )
                 .map_err(|e| DispatchError::Hip(e.to_string()))?;
@@ -1983,7 +1943,6 @@ pub fn execute_pipeline(
                     m: params.m,
                     k: params.k,
                     row_stride: params.k,
-                    rotation: None,
                     awq_scale: None,
                     lloyd_lut_e4m3: None,
                     lloyd_lut_f16: None,
@@ -2355,7 +2314,6 @@ pub(crate) fn decode_expanded_down_kind(down: DType) -> Option<&'static str> {
         DType::MQ6G256 => Some("hfq6"),
         DType::MQ6G256V2 => Some("mq6v2"),
         DType::MFP4G32E8 => Some("mfp4e8"),
-        DType::ParoQ4G128 => Some("paro"),
         DType::MQ2G256Lloyd | DType::MQ2G256LloydU => Some("mq2lloyd_atomic"),
         DType::MQ3G256Lloyd => Some("mq3lloyd_atomic"),
         DType::MQ2G256GL => Some("mq2gl_atomic"),
@@ -2373,7 +2331,6 @@ pub(crate) fn prefill_path1_gate_up_kind(gate_up: DType) -> Option<&'static str>
         DType::MQ6G256 => Some("hfq6"),
         DType::MQ6G256V2 => Some("mq6v2"),
         DType::MFP4G32E8 => Some("mfp4e8"),
-        DType::ParoQ4G128 => Some("paro"),
         _ => None,
     }
 }
@@ -2388,7 +2345,6 @@ pub(crate) fn prefill_path1_down_kind(down: DType) -> Option<&'static str> {
         DType::MQ6G256 => Some("hfq6"),
         DType::MQ6G256V2 => Some("mq6v2"),
         DType::MFP4G32E8 => Some("mfp4e8"),
-        DType::ParoQ4G128 => Some("paro"),
         _ => None,
     }
 }
@@ -2401,7 +2357,6 @@ pub(crate) fn grouped_gemm_kind(dtype: DType) -> Option<&'static str> {
         DType::MQ6G256 => Some("hfq6"),
         DType::MQ6G256V2 => Some("mq6v2"),
         DType::MFP4G32E8 => Some("mfp4e8"),
-        DType::ParoQ4G128 => Some("paro"),
         DType::MQ2G256Lloyd | DType::MQ2G256LloydU => Some("mq2lloyd"),
         DType::MQ3G256Lloyd => Some("mq3lloyd"),
         _ => None,
@@ -2667,7 +2622,6 @@ fn dtype_name(d: DType) -> &'static str {
         DType::MQ4G256V2 => "MQ4G256V2",
         DType::MQ6G256 => "MQ6G256",
         DType::MQ6G256V2 => "MQ6G256V2",
-        DType::ParoQ4G128 => "ParoQ4G128",
         DType::Q8_0 => "Q8_0",
         DType::MQ3G256 => "MQ3G256",
         DType::MQ2G256 => "MQ2G256",
@@ -3481,8 +3435,6 @@ fn dispatch_grouped_gemm(
     m_total: usize,
     rows: usize,
     force_mq4_fp16: bool,
-    paro_i8: bool,
-    paro_i8_k8: bool,
     coalesced: bool,
 ) -> Result<(), DispatchError> {
     dispatch_grouped_gemm_role(
@@ -3502,8 +3454,6 @@ fn dispatch_grouped_gemm(
         m_total,
         rows,
         force_mq4_fp16,
-        paro_i8,
-        paro_i8_k8,
         coalesced,
     )
 }
@@ -3528,8 +3478,6 @@ fn dispatch_grouped_gemm_role(
     m_total: usize,
     rows: usize,
     force_mq4_fp16: bool,
-    paro_i8: bool,
-    paro_i8_k8: bool,
     coalesced: bool,
 ) -> Result<(), DispatchError> {
     reject_fp8_b128(dtype)?;
@@ -3657,48 +3605,6 @@ fn dispatch_grouped_gemm_role(
             m_total,
             rows,
         )),
-        DType::ParoQ4G128 => {
-            if paro_i8_k8 {
-                hip!(gpu.gemm_paro_q4g128_moe_grouped_mmq_k8_gfx1151(
-                    ptrs,
-                    tile_ids,
-                    sorted_slot_index,
-                    x,
-                    y,
-                    m,
-                    k,
-                    x_row_div,
-                    m_total,
-                    rows,
-                ))
-            } else if paro_i8 {
-                hip!(gpu.gemm_paro_q4g128_moe_grouped_mmq_gfx1151(
-                    ptrs,
-                    tile_ids,
-                    sorted_slot_index,
-                    x,
-                    y,
-                    m,
-                    k,
-                    x_row_div,
-                    m_total,
-                    rows,
-                ))
-            } else {
-                hip!(gpu.gemm_paro_q4g128_moe_grouped_wmma_k2(
-                    ptrs,
-                    tile_ids,
-                    sorted_slot_index,
-                    x,
-                    y,
-                    m,
-                    k,
-                    x_row_div,
-                    m_total,
-                    rows,
-                ))
-            }
-        }
         // Uniform-per-projection codebook routed experts (the antirez asymmetric
         // recipe: gate_up = MQ2-Lloyd 72 B/group, down = MQ3-Lloyd 112 B/group).
         // Both entries are arch-selecting (gfx11 `_k2` / gfx12 `_gfx12`) — do NOT
@@ -4166,7 +4072,7 @@ fn prefill_shared_gemm_key(dtype: DType) -> Option<KernelKey> {
         DType::MQ4G256V2 => KernelKey::GemmMq4G256V2,
         DType::MQ6G256 => return None,
         DType::MQ6G256V2 => KernelKey::GemmMq6G256V2,
-        DType::HFQ4G128 | DType::ParoQ4G128 => KernelKey::GemmHfq4G128,
+        DType::HFQ4G128 => KernelKey::GemmHfq4G128,
         _ => return None,
     })
 }
@@ -4340,65 +4246,7 @@ pub(super) fn prefill_shared_gate_up_stage(
                     outputs: &outputs,
                     m: &m,
                     k: gate.k,
-                    rot_scratch: &[],
                     batch_size: Some(n),
-                },
-            )
-        }
-        DType::ParoQ4G128 => {
-            let gate_rot = gate.rotation.as_ref().ok_or_else(|| {
-                DispatchError::Hip("shared Paro gate has no rotation metadata".into())
-            })?;
-            let up_rot = up.rotation.as_ref().ok_or_else(|| {
-                DispatchError::Hip("shared Paro up has no rotation metadata".into())
-            })?;
-            gpu.givens_rotate_to(
-                p.x_norm_batch,
-                p.x_rot_batch,
-                gate_rot.pairs,
-                gate_rot.theta,
-                gate_rot.scales,
-                n,
-                gate.k,
-                gate_rot.krot,
-                128,
-            )
-            .map_err(|e| DispatchError::Hip(e.to_string()))?;
-            let gate_key = prefill_shared_gemm_key(gate.dtype)
-                .ok_or_else(|| DispatchError::Hip("shared Paro gate has no GEMM key".into()))?;
-            gemm.run_key(
-                gate_key,
-                ctx,
-                gpu,
-                &GemmParams {
-                    w: gate,
-                    x: p.x_rot_batch,
-                    y: shared.gate_out,
-                    batch_size: n,
-                },
-            )?;
-            gpu.givens_rotate_to(
-                p.x_norm_batch,
-                p.x_rot_batch,
-                up_rot.pairs,
-                up_rot.theta,
-                up_rot.scales,
-                n,
-                up.k,
-                up_rot.krot,
-                128,
-            )
-            .map_err(|e| DispatchError::Hip(e.to_string()))?;
-            gemm.run_key(
-                prefill_shared_gemm_key(up.dtype)
-                    .ok_or_else(|| DispatchError::Hip("shared Paro up has no GEMM key".into()))?,
-                ctx,
-                gpu,
-                &GemmParams {
-                    w: up,
-                    x: p.x_rot_batch,
-                    y: shared.up_out,
-                    batch_size: n,
                 },
             )
         }
@@ -4437,7 +4285,6 @@ pub(super) fn prefill_shared_gate_up_stage(
                 m: gate.m,
                 k: gate.k,
                 row_stride: gate.k,
-                rotation: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -4449,7 +4296,6 @@ pub(super) fn prefill_shared_gate_up_stage(
                 m: up.m,
                 k: up.k,
                 row_stride: up.k,
-                rotation: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -4753,7 +4599,6 @@ mod shared_down_producer_fused_tests {
             DType::MQ4G256,
             DType::MQ6G256,
             DType::MQ6G256V2,
-            DType::ParoQ4G128,
             DType::Q8_0,
             DType::F32,
             DType::BF16,
@@ -4813,7 +4658,6 @@ mod shared_down_sigmoid_epi_tests {
             DType::MQ6G256,
             DType::Q8_0,
             DType::F32,
-            DType::ParoQ4G128,
             DType::MFP4G32E8,
         ] {
             assert!(!admitted(true, true, dtype, 2048, 2048, false), "{dtype:?}");
@@ -4859,23 +4703,7 @@ fn prefill_shared_activation_stage(
             .map_err(|e| DispatchError::Hip(e.to_string()))?;
         return Ok(Some(token));
     }
-    let launched: Result<(), DispatchError> = if down.dtype == DType::ParoQ4G128 {
-        let rot = down.rotation.as_ref().ok_or_else(|| {
-            DispatchError::Hip("shared Paro down has no rotation metadata".into())
-        })?;
-        gpu.fused_silu_mul_givens_rotate_f32(
-            shared.gate_out,
-            shared.up_out,
-            shared.rotated,
-            rot.pairs,
-            rot.theta,
-            rot.scales,
-            p.batch_size,
-            shared.intermediate,
-            rot.krot,
-        )
-        .map_err(|e| DispatchError::Hip(e.to_string()))
-    } else if matches!(down.dtype, DType::Q8_0 | DType::F32) {
+    let launched: Result<(), DispatchError> = if matches!(down.dtype, DType::Q8_0 | DType::F32) {
         gpu.silu_mul_f32(shared.gate_out, shared.up_out, shared.rotated)
             .map_err(|e| DispatchError::Hip(e.to_string()))
     } else if let Some(awq) = down.awq_scale {
@@ -4941,17 +4769,6 @@ fn prefill_shared_down_stage(
             .map_err(|e| DispatchError::Hip(e.to_string())),
         DType::MQ6G256 => gpu
             .gemv_hfq6g256_residual_sigmoid_scaled_gpu_batched(
-                &down.buf,
-                shared.rotated,
-                p.x_batch,
-                shared.scalar,
-                down.m,
-                down.k,
-                p.batch_size,
-            )
-            .map_err(|e| DispatchError::Hip(e.to_string())),
-        DType::ParoQ4G128 => gpu
-            .gemv_hfq4g128_residual_sigmoid_scaled_gpu_batched(
                 &down.buf,
                 shared.rotated,
                 p.x_batch,
@@ -5049,7 +4866,6 @@ fn prefill_shared_down_stage(
                 m: down.m,
                 k: down.k,
                 row_stride: down.k,
-                rotation: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -5957,17 +5773,6 @@ fn decode_gate_up_stage(
             2 * p.mi,
             gate_up_k,
         ))?;
-    } else if res.routed_indexable_paro {
-        hip!(gpu.gemv_paro_q4g128_moe_gate_up_k8_indexed(
-            p.expert_gate_up_ptrs,
-            p.topk_indices,
-            xr,
-            p.gate_batch,
-            p.up_batch,
-            2 * p.mi,
-            gate_up_k,
-            p.k,
-        ))?;
     } else if matches!(
         p.dtypes.routed_gate_up,
         DType::MQ2G256Lloyd | DType::MQ2G256LloydU
@@ -6135,7 +5940,6 @@ fn qt44_shared_activation_in_routed(
 fn decode_activation_stage(
     gpu: &mut Gpu,
     p: &crate::families::moe::MoeParams<'_>,
-    res: crate::families::moe::MoeResolution,
     route: Option<MoeRouteCapability>,
     shared_views: Option<(&GpuTensor, &GpuTensor)>,
 ) -> Result<(), DispatchError> {
@@ -6197,22 +6001,6 @@ fn decode_activation_stage(
         let rot_live = slice_moe_f32_view(p.rot_batch, 0, live);
         hip!(gpu.silu_mul_f32(&gate_live, &up_live, &rot_live))?;
         hip!(gpu.rotate_x_mq_128_v2(&rot_live, &rot_live, p.mi, p.k))?;
-    } else if res.routed_indexable_paro {
-        let paro_down = p
-            .routed_down_paro
-            .as_ref()
-            .expect("routed_indexable_paro implies down paro sidecar");
-        hip!(gpu.fused_silu_mul_givens_rotate_f32(
-            p.gate_batch,
-            p.up_batch,
-            p.rot_batch,
-            &paro_down.pairs,
-            &paro_down.theta,
-            &paro_down.scales,
-            p.k,
-            p.mi,
-            paro_down.krot,
-        ))?;
     } else if let Some(awq_ptrs) = p.expert_down_awq_ptrs {
         // Route A MoE-AWQ: per-routed-expert down.awq_scale selected by
         // topk_indices[krank]. Divides silu(g)*u by the expert's scale before
@@ -6274,7 +6062,6 @@ fn decode_activation_stage(
 fn decode_down_stage(
     gpu: &mut Gpu,
     p: &crate::families::moe::MoeParams<'_>,
-    res: crate::families::moe::MoeResolution,
     target: &GpuTensor,
     ninepath_d4: bool,
     ninepath_mq3l: bool,
@@ -6438,17 +6225,6 @@ fn decode_down_stage(
         hip!(gpu.gemv_mixed_moe_down_k8_indexed_batched_expanded(
             p.expert_down_ptrs,
             tags,
-            p.topk_indices,
-            p.rot_batch,
-            p.down_expanded,
-            down_m,
-            down_k,
-            p.k,
-            1,
-        ))?;
-    } else if res.routed_indexable_paro {
-        hip!(gpu.gemv_paro_q4g128_moe_down_k8_indexed_batched(
-            p.expert_down_ptrs,
             p.topk_indices,
             p.rot_batch,
             p.down_expanded,
@@ -6655,27 +6431,9 @@ fn decode_input_basis_stage(
     if !res.needs_x_rot_local {
         return Ok(());
     }
-    if !res.routed_indexable_paro {
-        hip!(gpu.ensure_mq_signs())?;
-    }
+    hip!(gpu.ensure_mq_signs())?;
     if !p.x_rot_prerotated {
-        if res.routed_indexable_paro {
-            let paro = p
-                .routed_gate_up_paro
-                .as_ref()
-                .expect("routed_indexable_paro implies gate_up paro sidecar");
-            hip!(gpu.givens_rotate_to(
-                p.x_norm,
-                p.x_rot_local,
-                &paro.pairs,
-                &paro.theta,
-                &paro.scales,
-                1,
-                p.hidden,
-                paro.krot,
-                128,
-            ))?;
-        } else if res.gate_side_mq4 {
+        if res.gate_side_mq4 {
             if let Some(awq) = p.router.awq_scale {
                 hip!(gpu.rotate_x_mq_awq(p.x_norm, awq, p.x_rot_local, p.hidden))?;
             } else {
@@ -7148,28 +6906,6 @@ fn prefill_scatter_stage(
     Ok(())
 }
 
-fn prefill_input_basis_stage(
-    gpu: &mut Gpu,
-    p: &crate::families::moe::MoePrefillParams<'_>,
-) -> Result<(), DispatchError> {
-    let paro = p
-        .paro_gate_up
-        .as_ref()
-        .expect("paro_mode implies paro_gate_up sidecar");
-    hip!(gpu.givens_rotate_to(
-        p.x_norm_batch,
-        p.x_rot_batch,
-        paro.pairs,
-        paro.theta,
-        paro.scales,
-        p.batch_size,
-        p.gate_up_k,
-        paro.krot,
-        128,
-    ))?;
-    Ok(())
-}
-
 fn prefill_gate_up_stage(
     gpu: &mut Gpu,
     p: &crate::families::moe::MoePrefillParams<'_>,
@@ -7213,8 +6949,6 @@ fn prefill_gate_up_stage(
             path2_m_total,
             n,
             force_mq4_grouped_fp16,
-            res.use_paro_i8,
-            res.use_paro_i8_k8,
             coalesced_verify
                 && crate::families::moe::routed_host_mapped_projections(p.routed_experts).0,
         )?;
@@ -7226,19 +6960,7 @@ fn prefill_gate_up_stage(
         // mixed only when gate_up exact dtype varies (V1/V2 graded); uniform
         // gate shortcut requires exact DType equality. Down always uses mixed
         // when tags exist (handled in the down block below).
-        if res.paro_mode {
-            hip!(gpu.gemv_paro_q4g128_moe_gate_up_k8_indexed_batched(
-                p.expert_gate_up_ptrs,
-                p.topk_indices,
-                p.x_rot_batch,
-                p.gate_batch,
-                p.up_batch,
-                2 * mi,
-                gate_up_k,
-                k_top,
-                n,
-            ))?;
-        } else if let Some(tags) = p.expert_dtype_tags {
+        if let Some(tags) = p.expert_dtype_tags {
             let gate_up_varies = gate_up_varies(p.dtypes.per_expert_gate_up.as_deref());
             if decode_gate_uses_mixed(true, gate_up_varies) {
                 // Gate varies → mixed gate kernel before representative arms.
@@ -7440,7 +7162,6 @@ fn prefill_gate_up_unscatter_stage(
 fn prefill_activation_stage(
     gpu: &mut Gpu,
     p: &crate::families::moe::MoePrefillParams<'_>,
-    res: &crate::families::moe::MoePrefillResolution,
     total_slots: usize,
 ) -> Result<(), DispatchError> {
     reject_fp8_moe(&p.dtypes)?;
@@ -7459,22 +7180,6 @@ fn prefill_activation_stage(
         let rot_live = slice_moe_f32_view(p.rot_batch, 0, live);
         hip!(gpu.silu_mul_f32(&gate_live, &up_live, &rot_live))?;
         hip!(gpu.rotate_x_mq_128_v2(&rot_live, &rot_live, mi, total_slots))?;
-    } else if res.paro_mode {
-        let paro = p
-            .paro_down
-            .as_ref()
-            .expect("paro_mode implies paro_down sidecar");
-        hip!(gpu.fused_silu_mul_givens_rotate_f32(
-            p.gate_batch,
-            p.up_batch,
-            p.rot_batch,
-            paro.pairs,
-            paro.theta,
-            paro.scales,
-            total_slots,
-            mi,
-            paro.krot,
-        ))?;
     } else if p.expert_dtype_tags.is_some() {
         // Graded/mixed routed experts: the silu+rotate is weight-agnostic (the
         // per-expert down dtype only affects the down GEMM that READS rot_batch;
@@ -7606,15 +7311,13 @@ fn prefill_down_stage(
             path2_m_total,
             total_slots,
             force_mq4_grouped_fp16,
-            res.use_paro_i8,
-            res.use_paro_i8_k8,
             coalesced_verify
                 && crate::families::moe::routed_host_mapped_projections(p.routed_experts).1,
         )?;
         // Publication is deferred to the explicit combine stage.
     } else if res.down_path0 {
         // Path 0: gfx9* wave64 — residual-scaled atomic GEMV (MQ4 only;
-        // MQ6/Paro never reach here — their admit predicates require WMMA).
+        // MQ6 never reaches here — its admit predicates require WMMA).
         let down_result = match p.dtypes.routed_down {
             DType::MQ4G256 => hip!(
                 gpu.gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_batched(
@@ -7730,16 +7433,6 @@ fn prefill_down_stage(
                     n,
                 )),
                 DType::MFP4G32E8 => hip!(gpu.gemv_mfp4g32_e8_moe_down_k8_indexed_batched_expanded(
-                    p.expert_down_ptrs,
-                    p.topk_indices,
-                    p.rot_batch,
-                    p.down_expanded,
-                    down_m,
-                    down_k,
-                    k_top,
-                    n,
-                )),
-                DType::ParoQ4G128 => hip!(gpu.gemv_paro_q4g128_moe_down_k8_indexed_batched(
                     p.expert_down_ptrs,
                     p.topk_indices,
                     p.rot_batch,

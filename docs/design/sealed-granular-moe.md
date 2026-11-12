@@ -12,7 +12,7 @@ Non-goals: new model or topology admission, mixed TP×EP enablement, new kernels
 
 - All immutable source, shape, alias, local-slot, physical-device, scratch-capacity, and route checks remain enforced.
 - A complete program is validated before its first side effect. A bad later rank or operation must not leave an earlier rank mutated.
-- Preserve launch order and specialized fused kernels, including shared-expert treatment, CPU routing, mixed formats, Paro, expanded versus residual-fused down, and deferred combine where already supported.
+- Preserve launch order and specialized fused kernels, including shared-expert treatment, CPU routing, mixed formats, expanded versus residual-fused down, and deferred combine where already supported.
 - Preserve root-authoritative route bytes, destination-owned transport events, reverse source-reuse dependencies, and reduction leases. Qwen compact EP must fold routed contributions in global top-k slot order, matching the single-device combine; rank-partial routes for other families retain their existing fixed-rank fold.
 - Shared contributions enter the correct residual or partial exactly once. No duplicate reduction or combine.
 - No new per-token allocation for immutable plan construction. Do not cache borrowed mutable resource identity across reuse or reload.

@@ -10,10 +10,10 @@
 //! scan output plane). Moved verbatim from the Qwen3.5 prefill path. They stay
 //! separate from the dense executors in [`super::batched_deltanet`] and
 //! [`super::batched_attention`]: the output projection always accumulates into
-//! the residual, the PARO Givens arms rotate the un-rotated `x_norm_batch`, and
-//! the conv / QK-norm launches are the MoE sequence, so merging them would
-//! change numerics. The architecture binds the layer's MoE FFN (the sealed
-//! program with its CPU expert splice) as the `moe_ffn` callback.
+//! the residual, and the conv / QK-norm launches are the MoE sequence, so
+//! merging them would change numerics. The architecture binds the layer's
+//! MoE FFN (the sealed program with its CPU expert splice) as the
+//! `moe_ffn` callback.
 
 #![allow(clippy::too_many_arguments)]
 
@@ -477,14 +477,6 @@ pub fn execute_deltanet_moe_layer_batched(
             layer.wo.dtype,
         ],
     )?;
-    // Phase 1.5: PARO mode for DeltaNetMoe — wqkv/wz are
-    // ParoQ4G128 (each with its own Givens rotation tables);
-    // w_alpha/w_beta are F32 (no rotation, no quantization).
-    // Dispatch is unfused: rotate+gemm_hfq4g128 for wqkv and wz,
-    // direct gemm_f32_batched for w_alpha and w_beta. Same shape
-    // outputs as the Q8/MQ4 paths (dn_qkv_batch, dn_z_batch,
-    // dn_alpha_batch, dn_beta_batch).
-    let is_paro = matches!(layer.wqkv.dtype, DType::ParoQ4G128);
     let q8_wmma_arch = q8_prefill_wmma_enabled(gpu);
 
     // JIT/load failure and extent errors must precede the projection and the
@@ -554,19 +546,6 @@ pub fn execute_deltanet_moe_layer_batched(
                 n,
             )?;
         }
-    } else if is_paro {
-        // PARO: need un-rotated x_norm available for per-weight
-        // Givens rotation. Write rmsnorm into x_norm_batch (the
-        // dedicated normalized buffer); x_rot_batch becomes the
-        // per-weight rotation scratch (overwritten per GEMM).
-        gpu.rmsnorm_batched(
-            pbs.x_batch,
-            layer.attn_norm,
-            pbs.x_norm_batch,
-            n,
-            dim,
-            config.norm_eps,
-        )?;
     } else {
         gpu.rmsnorm_batched(
             pbs.x_batch,
@@ -605,88 +584,6 @@ pub fn execute_deltanet_moe_layer_batched(
         FUSED_QKV
             .run_iu4_prepared(&ctx, gpu, &params)
             .map_err(hip_err)?;
-    } else if is_paro {
-        // PARO 4-way unfused dispatch. wqkv and wz are
-        // ParoQ4G128 with their own Givens rotation tables;
-        // w_alpha and w_beta are F32 with no rotation.
-        let paro_wqkv = layer.wqkv.rotation.as_ref().unwrap_or_else(|| {
-            panic!(
-                "ParoQ4G128 wqkv missing paro metadata at LA layer {layer_idx} \
-                             — load_paroquant_weight() loader regression?"
-            )
-        });
-        let paro_wz = layer.wz.rotation.as_ref().unwrap_or_else(|| {
-            panic!("ParoQ4G128 wz missing paro metadata at LA layer {layer_idx}")
-        });
-        // wqkv: rotate x_norm → x_rot, then HFQ4G128 GEMM.
-        gpu.givens_rotate_to(
-            pbs.x_norm_batch,
-            pbs.x_rot_batch,
-            &paro_wqkv.pairs,
-            &paro_wqkv.theta,
-            &paro_wqkv.scales,
-            n,
-            dim,
-            paro_wqkv.krot,
-            128,
-        )?;
-        run_plain_gemm_key(
-            gpu,
-            crate::types::KernelKey::GemmHfq4G128,
-            layer.wqkv.buf,
-            layer.wqkv.dtype,
-            pbs.x_rot_batch,
-            pbs.dn_qkv_batch,
-            layer.wqkv.m,
-            layer.wqkv.k,
-            n,
-        )?;
-        // wz: re-rotate x_norm → x_rot (overwrite), then GEMM.
-        gpu.givens_rotate_to(
-            pbs.x_norm_batch,
-            pbs.x_rot_batch,
-            &paro_wz.pairs,
-            &paro_wz.theta,
-            &paro_wz.scales,
-            n,
-            dim,
-            paro_wz.krot,
-            128,
-        )?;
-        run_plain_gemm_key(
-            gpu,
-            crate::types::KernelKey::GemmHfq4G128,
-            layer.wz.buf,
-            layer.wz.dtype,
-            pbs.x_rot_batch,
-            pbs.dn_z_batch,
-            layer.wz.m,
-            layer.wz.k,
-            n,
-        )?;
-        // w_alpha / w_beta: F32, no rotation, direct batched GEMM.
-        run_plain_gemm_key(
-            gpu,
-            crate::types::KernelKey::GemmF32Batched,
-            layer.w_alpha.buf,
-            layer.w_alpha.dtype,
-            pbs.x_norm_batch,
-            pbs.dn_alpha_batch,
-            layer.w_alpha.m,
-            layer.w_alpha.k,
-            n,
-        )?;
-        run_plain_gemm_key(
-            gpu,
-            crate::types::KernelKey::GemmF32Batched,
-            layer.w_beta.buf,
-            layer.w_beta.dtype,
-            pbs.x_norm_batch,
-            pbs.dn_beta_batch,
-            layer.w_beta.m,
-            layer.w_beta.k,
-            n,
-        )?;
     } else if is_6bit {
         run_fused_qkvza_key(
             gpu,
@@ -1337,7 +1234,6 @@ fn deltanet_moe_output_batched(
     // stride and produce fluent-but-wrong tokens.
     let dn_wo_is_lowbit = matches!(layer.wo.dtype, DType::TQ2G128 | DType::BQ1G128);
     let dn_wo_is_6bit = matches!(layer.wo.dtype, DType::MQ6G256 | DType::HFQ6G256);
-    let dn_wo_is_paro = matches!(layer.wo.dtype, DType::ParoQ4G128);
     // T-B: fused rotate+quantize (always-Residual here — no epilogue param).
     // Skipped when the slices-4 GDN producer already emitted both outputs.
     let mut iu4_wo_prep: Option<rdna_compute::Int4MmqPrepared> = None;
@@ -1354,25 +1250,6 @@ fn deltanet_moe_output_batched(
         pbs.dn_normed_rot_batch
     } else if dn_wo_is_q8 {
         pbs.dn_normed_batch
-    } else if dn_wo_is_paro {
-        // PARO wo: rotate dn_normed by wo's own Givens tables
-        // into dn_normed_rot_batch. Same scratch layout as MQ4
-        // (since dn_normed_rot_batch is unused on the Q8 path).
-        let paro_wo = layer.wo.rotation.as_ref().unwrap_or_else(|| {
-            panic!("ParoQ4G128 wo missing paro metadata at LA layer {layer_idx}")
-        });
-        gpu.givens_rotate_to(
-            pbs.dn_normed_batch,
-            pbs.dn_normed_rot_batch,
-            &paro_wo.pairs,
-            &paro_wo.theta,
-            &paro_wo.scales,
-            n,
-            layer.wo.k,
-            paro_wo.krot,
-            128,
-        )?;
-        pbs.dn_normed_rot_batch
     } else {
         // F2: AWQ-aware rotate for linear_attn wo (out_proj) input.
         rotate_x_mq_batched_for(
@@ -1418,25 +1295,6 @@ fn deltanet_moe_output_batched(
         run_plain_gemm_key(
             gpu,
             plain_gemm_key_for(layer.wo.dtype),
-            layer.wo.buf,
-            layer.wo.dtype,
-            dn_wo_input,
-            &scratch,
-            layer.wo.m,
-            layer.wo.k,
-            n,
-        )?;
-        let x_n = pbs.x_batch.sub_offset(0, n * layer.wo.m);
-        gpu.add_inplace_f32(&x_n, &scratch)?;
-    } else if dn_wo_is_paro {
-        // PARO wo residual: HFQ4G128 batched GEMM into scratch,
-        // then add into x_batch. Reuse x_norm_batch (free at
-        // this point — used earlier for the QKVZA stage; not
-        // needed for the rest of this layer) as the scratch.
-        let scratch = pbs.x_norm_batch.sub_offset(0, n * layer.wo.m);
-        run_plain_gemm_key(
-            gpu,
-            crate::types::KernelKey::GemmHfq4G128,
             layer.wo.buf,
             layer.wo.dtype,
             dn_wo_input,
@@ -1688,12 +1546,6 @@ pub fn attention_moe_prep_batched(
             layer.wo.dtype,
         ],
     )?;
-    // Phase 1.6 (PARO FullAttnMoe): wq/wk/wv are ParoQ4G128
-    // (each with its own Givens rotation tables). The fused-QKV
-    // kernels can't handle this — they assume one shared
-    // rotation. Unfused 3-way dispatch (rotate + gemm_hfq4g128
-    // per projection) matches the LA QKVZA Phase 1.5 pattern.
-    let qkv_is_paro = matches!(layer.wq.dtype, DType::ParoQ4G128);
     // Fused QKV requires uniform dtype — see issue #249 for
     // the dense FA variant. Gate the same way here.
     let q8_wmma_arch = q8_prefill_wmma_enabled(gpu);
@@ -1728,17 +1580,6 @@ pub fn attention_moe_prep_batched(
                 n,
             )?;
         }
-    } else if qkv_is_paro {
-        // PARO: rmsnorm into x_norm_batch (un-rotated). x_rot_batch
-        // is reused as the per-weight rotation scratch.
-        gpu.rmsnorm_batched(
-            pbs.x_batch,
-            layer.attn_norm,
-            pbs.x_norm_batch,
-            n,
-            dim,
-            config.norm_eps,
-        )?;
     } else {
         gpu.rmsnorm_batched(
             pbs.x_batch,
@@ -1767,88 +1608,6 @@ pub fn attention_moe_prep_batched(
         FUSED_QKV
             .run_iu4_prepared(&ctx, gpu, &params)
             .map_err(hip_err)?;
-    } else if qkv_is_paro {
-        // PARO 3-way unfused dispatch (wq, wk, wv each with own
-        // Givens rotation). Same shape outputs as the fused
-        // paths: fa_q_full_batch, fa_k_batch, fa_v_batch.
-        let paro_wq = layer.wq.rotation.as_ref().unwrap_or_else(|| {
-            panic!("ParoQ4G128 wq missing paro metadata at FA layer {layer_idx}")
-        });
-        let paro_wk = layer.wk.rotation.as_ref().unwrap_or_else(|| {
-            panic!("ParoQ4G128 wk missing paro metadata at FA layer {layer_idx}")
-        });
-        let paro_wv = layer.wv.rotation.as_ref().unwrap_or_else(|| {
-            panic!("ParoQ4G128 wv missing paro metadata at FA layer {layer_idx}")
-        });
-        // wq
-        gpu.givens_rotate_to(
-            pbs.x_norm_batch,
-            pbs.x_rot_batch,
-            &paro_wq.pairs,
-            &paro_wq.theta,
-            &paro_wq.scales,
-            n,
-            dim,
-            paro_wq.krot,
-            128,
-        )?;
-        run_plain_gemm_key(
-            gpu,
-            crate::types::KernelKey::GemmHfq4G128,
-            layer.wq.buf,
-            layer.wq.dtype,
-            pbs.x_rot_batch,
-            pbs.fa_q_full_batch,
-            layer.wq.m,
-            layer.wq.k,
-            n,
-        )?;
-        // wk
-        gpu.givens_rotate_to(
-            pbs.x_norm_batch,
-            pbs.x_rot_batch,
-            &paro_wk.pairs,
-            &paro_wk.theta,
-            &paro_wk.scales,
-            n,
-            dim,
-            paro_wk.krot,
-            128,
-        )?;
-        run_plain_gemm_key(
-            gpu,
-            crate::types::KernelKey::GemmHfq4G128,
-            layer.wk.buf,
-            layer.wk.dtype,
-            pbs.x_rot_batch,
-            pbs.fa_k_batch,
-            layer.wk.m,
-            layer.wk.k,
-            n,
-        )?;
-        // wv
-        gpu.givens_rotate_to(
-            pbs.x_norm_batch,
-            pbs.x_rot_batch,
-            &paro_wv.pairs,
-            &paro_wv.theta,
-            &paro_wv.scales,
-            n,
-            dim,
-            paro_wv.krot,
-            128,
-        )?;
-        run_plain_gemm_key(
-            gpu,
-            crate::types::KernelKey::GemmHfq4G128,
-            layer.wv.buf,
-            layer.wv.dtype,
-            pbs.x_rot_batch,
-            pbs.fa_v_batch,
-            layer.wv.m,
-            layer.wv.k,
-            n,
-        )?;
     } else if qkv_is_6bit && qkv_same_dtype {
         run_fused_qkv_key(
             gpu,
@@ -2110,11 +1869,6 @@ pub fn attention_moe_finish_batched(
     // stride and produce fluent-but-wrong tokens.
     let fa_wo_is_lowbit = matches!(layer.wo.dtype, DType::TQ2G128 | DType::BQ1G128);
     let fa_wo_is_6bit = matches!(layer.wo.dtype, DType::MQ6G256 | DType::HFQ6G256);
-    // Phase 1.6 (PARO FullAttnMoe wo): own Givens rotation table,
-    // 72 B/group HFQ4G128 layout. Rotate fa_attn_out_batch by wo's
-    // paro into fa_attn_out_rot_batch, then HFQ4G128 GEMM into a
-    // scratch, then add into x_batch.
-    let fa_wo_is_paro = matches!(layer.wo.dtype, DType::ParoQ4G128);
     // T-B: fused rotate+quantize (always-Residual here — no epilogue param).
     let mut iu4_wo_prep = match folded_wo_prep {
         Some(prep) => Some(prep),
@@ -2140,22 +1894,6 @@ pub fn attention_moe_finish_batched(
         pbs.fa_attn_out_rot_batch
     } else if fa_wo_is_q8 {
         pbs.fa_attn_out_batch
-    } else if fa_wo_is_paro {
-        let paro_wo = layer.wo.rotation.as_ref().unwrap_or_else(|| {
-            panic!("ParoQ4G128 wo missing paro metadata at FA layer {layer_idx}")
-        });
-        gpu.givens_rotate_to(
-            pbs.fa_attn_out_batch,
-            pbs.fa_attn_out_rot_batch,
-            &paro_wo.pairs,
-            &paro_wo.theta,
-            &paro_wo.scales,
-            n,
-            layer.wo.k,
-            paro_wo.krot,
-            128,
-        )?;
-        pbs.fa_attn_out_rot_batch
     } else {
         // F2: AWQ-aware rotate for FullAttention wo (o_proj) input.
         rotate_x_mq_batched_for(
@@ -2201,25 +1939,6 @@ pub fn attention_moe_finish_batched(
         run_plain_gemm_key(
             gpu,
             plain_gemm_key_for(layer.wo.dtype),
-            layer.wo.buf,
-            layer.wo.dtype,
-            fa_wo_input,
-            &scratch,
-            layer.wo.m,
-            layer.wo.k,
-            n,
-        )?;
-        let x_n = pbs.x_batch.sub_offset(0, n * layer.wo.m);
-        gpu.add_inplace_f32(&x_n, &scratch)?;
-    } else if fa_wo_is_paro {
-        // PARO wo residual: HFQ4G128 batched GEMM into scratch,
-        // then add into x_batch. Reuse x_norm_batch (free since
-        // QKVZA is done — the MoE FFN body below rewrites it
-        // as its first action) as the gemm output scratch.
-        let scratch = pbs.x_norm_batch.sub_offset(0, n * layer.wo.m);
-        run_plain_gemm_key(
-            gpu,
-            crate::types::KernelKey::GemmHfq4G128,
             layer.wo.buf,
             layer.wo.dtype,
             fa_wo_input,
@@ -2276,12 +1995,7 @@ mod tests {
                 );
             }
         }
-        for ok in [
-            DType::MQ4G256,
-            DType::MQ3G256V2,
-            DType::Q8_0,
-            DType::ParoQ4G128,
-        ] {
+        for ok in [DType::MQ4G256, DType::MQ3G256V2, DType::Q8_0] {
             assert!(refuse_mq3_projections("t", &[ok; 5]).is_ok(), "{ok:?}");
         }
     }

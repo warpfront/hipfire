@@ -100,7 +100,7 @@ The `FusedGateUpQ8_0` (from `6ded4332`) and `FusedQkvQ4K`/`FusedGateUpQ4K`
 2. **guards:** `guard_gate_up_q8_0`, `guard_qkv_q4k`, `guard_gate_up_q4k` —
    `force_unfused` early-return → `window_gemv_dtype == {Q8_0|Q4K}` →
    `gemv_steps_uniform` (Prerotated; these are non-rotated, so plain rmsnorm output
-   feeds the kernel — **no Raw-guard**, that was Paro-only).
+   feeds the kernel).
 3. **launch_fused:** extend the existing `QKV3` and `GATE_UP2` arms' key match-lists to
    include the three keys (single-`x` extraction, no scratch — same shape as HFQ4).
 4. Producer for all: `RmsnormAutomatic(rotation=None)` (lowers to plain rmsnorm;
@@ -214,7 +214,7 @@ differ); `probe_commits.sh master HEAD` ±1–3%; `coherence-gate.sh`.
    elementwise add should be byte-identical — confirm under the master byte-parity
    check, don't assume.
 6. **llama MQ-branch rotation parity** (A3-full): fused MQ vs per-op may differ in FP
-   order (cf. 1.2 Paro) — use fused-vs-master as the byte oracle, coherence/cosine for
+   order — use fused-vs-master as the byte oracle, coherence/cosine for
    force-unfused.
 
 ---

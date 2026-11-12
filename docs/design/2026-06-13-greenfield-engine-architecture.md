@@ -1,7 +1,7 @@
 # Greenfield engine architecture — the daemon↔model↔decode layer
 
 **Date:** 2026-06-13 (revised after a 3-reviewer adversarial pass)
-**Branch:** `feature/paro-transparent-loading`
+**Branch:** `feature/transparent-loading`
 **Status:** Concept design (no code). Companion to `2026-06-13-archspec-and-dyn-boundary.md`.
 **Scope:** How hipfire's model-loading / dispatch / decode layer *should* be structured if rebuilt
 from scratch — split into a load-bearing **core** (ship) and three **deferred bets** (separate docs).

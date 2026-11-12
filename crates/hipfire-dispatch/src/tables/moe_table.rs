@@ -16,9 +16,8 @@ use crate::types::*;
 /// **dtype/env internally**, not through `KernelRegistry::resolve()`. The
 /// grouped keys below carry `shape_gate: BatchGt(1)` as **documentation**
 /// (the prefill executor never calls `resolve()`). Per-dtype grouped-GEMM
-/// coverage — MQ4 → HFQ4-layout WMMA, MQ6 → HFQ6-layout WMMA, ParoQ4G128 →
-/// HFQ4G128 WMMA (with gfx1151 i8/k8 MMQ levers) — is exercised by the
-/// `MoePrefillResolution` GPU-free tests in `tests.rs`.
+/// coverage — MQ4 → HFQ4-layout WMMA, MQ6 → HFQ6-layout WMMA — is exercised by
+/// the `MoePrefillResolution` GPU-free tests in `tests.rs`.
 pub fn populate(registry: &mut KernelRegistry) {
     registry.register(KernelVariant {
         key: KernelKey::MoeIndexedGateUpLloyd,

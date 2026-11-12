@@ -1,6 +1,6 @@
 //! SafetensorsSource: load HuggingFace safetensors models directly.
 //!
-//! Supports ParoQuant, AWQ, and unquantized safetensors models.
+//! Supports AWQ and unquantized safetensors models.
 //! Reads config.json for architecture detection and quantization config.
 //! Opens shard headers without mapping payloads; the incumbent borrowed-byte
 //! API maps a shard lazily only when explicitly requested.
@@ -770,7 +770,6 @@ fn parse_quant_config(config: &serde_json::Value) -> Option<QuantConfig> {
     let method = qc.get("quant_method")?.as_str()?.to_string();
     let bits = qc.get("bits").and_then(|v| v.as_u64()).unwrap_or(4) as u8;
     let group_size = qc.get("group_size").and_then(|v| v.as_u64()).unwrap_or(128) as u32;
-    let krot = qc.get("krot").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
 
     let dynamic_excludes = qc
         .get("dynamic")
@@ -787,7 +786,6 @@ fn parse_quant_config(config: &serde_json::Value) -> Option<QuantConfig> {
         method,
         bits,
         group_size,
-        krot,
         dynamic_excludes,
     })
 }

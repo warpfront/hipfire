@@ -418,7 +418,6 @@ pub(super) fn fused_projection(
             outputs,
             m: &m,
             k: weights[0].k,
-            rot_scratch: &[],
             batch_size: (rows > 1).then_some(rows),
         },
     )
@@ -1985,11 +1984,6 @@ fn activate<'a>(
                     eps: 0.0,
                     batch_size: if op.stream.batched() { rows } else { 1 },
                     variant: RotationVariant::WithSwiGLU,
-                    givens_pairs: None,
-                    givens_theta: None,
-                    givens_scales: None,
-                    givens_krot: None,
-                    givens_group_size: None,
                 },
             )
             .map_err(hip_dbg)?,
@@ -2068,7 +2062,6 @@ fn project_group(
                     outputs: &[q.1, k.1, v.1, g.1],
                     m: &ws.map(|w| w.m),
                     k: q.0.k,
-                    rot_scratch: &[],
                     batch_size: Some(rows),
                 },
             );
@@ -2378,8 +2371,6 @@ fn routed_rows_grouped(
         m_total,
         rows,
         false,
-        false,
-        false,
         // Gemma 4 experts are device-resident: no host-mapped coalesced read.
         false,
     )?;
@@ -2666,7 +2657,6 @@ mod tests {
             m,
             k,
             row_stride: k,
-            rotation: None,
             awq_scale: None,
             lloyd_lut_e4m3: None,
             lloyd_lut_f16: None,
@@ -2895,7 +2885,6 @@ mod validation_tests {
             m: DIM,
             k: DIM,
             row_stride: 0,
-            rotation: None,
             awq_scale: None,
             lloyd_lut_e4m3: None,
             lloyd_lut_f16: None,

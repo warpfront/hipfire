@@ -18,13 +18,6 @@ pub struct RotationParams<'a> {
     pub eps: f32,
     pub batch_size: usize,
     pub variant: RotationVariant,
-    // Givens rotation metadata (ParoQuant)
-    pub givens_pairs: Option<&'a GpuTensor>,
-    pub givens_theta: Option<&'a GpuTensor>,
-    pub givens_scales: Option<&'a GpuTensor>,
-    pub givens_krot: Option<usize>,
-    /// Givens block width = `DType::paro_group_size` of the consuming weight.
-    pub givens_group_size: Option<usize>,
 }
 
 /// Rotation kernel family — selects and runs FWHT rotation kernels.
@@ -56,35 +49,6 @@ impl RotationFamily {
         let batched = params.batch_size > 1;
 
         match params.variant {
-            RotationVariant::Givens => {
-                let pairs = params
-                    .givens_pairs
-                    .ok_or_else(|| HipError::new(0, "givens_pairs required for Givens rotation"))?;
-                let theta = params
-                    .givens_theta
-                    .ok_or_else(|| HipError::new(0, "givens_theta required for Givens rotation"))?;
-                let scales = params.givens_scales.ok_or_else(|| {
-                    HipError::new(0, "givens_scales required for Givens rotation")
-                })?;
-                let krot = params
-                    .givens_krot
-                    .ok_or_else(|| HipError::new(0, "givens_krot required for Givens rotation"))?;
-                let group = params.givens_group_size.ok_or_else(|| {
-                    HipError::new(0, "givens_group_size required for Givens rotation")
-                })?;
-                // givens_rotate_to does copy_d2d + rotate in one kernel
-                gpu.givens_rotate_to(
-                    params.x,
-                    params.x_rot,
-                    pairs,
-                    theta,
-                    scales,
-                    1, /* seq_len */
-                    params.k,
-                    krot,
-                    group,
-                )
-            }
             RotationVariant::PlainG128 => {
                 self.registry
                     .resolve(KernelKey::RotateMqG128, ctx, None)

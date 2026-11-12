@@ -44,7 +44,7 @@ MFP4G32Lloyd — per-tensor 16-entry Lloyd codebook   experimental (qt 32)
 HFP4G16   — was qt 22 reservation; **ID 22 reassigned to TidI32** (DeepSeek tables)
 HFP4G64   — **reserved** qt 23 (ablation; not built as product)
 HFP4G32MX / HFP4G16NV / HFP8* — former 25–27 reservations; still **reserved**, unbuilt
-MFP4G32R (online-R) — former qt 29; **reassigned to PARO4G128T** — online-R has no live reserved ID
+MFP4G32R (online-R) — former qt 29; **retired; unassigned, do not reuse** — online-R has no live reserved ID
 ```
 
 ## Element format (OCP E2M1)
@@ -173,8 +173,8 @@ signs1/signs2) unchanged.
 | 23 | HFP4G64 | **reserved** ablation (not product) |
 | 24 | `MFP4G32` | **shipped / ref-pinned** |
 | 25–27 | MX/NV/HFP8 reservations | **reserved** / unbuilt (**planned** product intent only) |
-| 28 | PARO4G128 (unrelated family) | **shipped / ref-pinned** load path — listed so IDs are not squatted |
-| 29 | PARO4G128T (unrelated) | **reassigned** from former `MFP4G32R` online-R slot |
+| 28 | *(retired)* | **retired; unassigned, do not reuse** (listed so IDs are not squatted) |
+| 29 | *(retired)* | **retired; unassigned, do not reuse** (formerly the `MFP4G32R` online-R slot) |
 | 30 | MQ4G256Lloyd (unrelated) | **shipped / ref-pinned** research MQ opt-in — renumbered off 21 |
 | 32 | `MFP4G32Lloyd` | **shipped / ref-pinned** impl; experimental opt-in |
 | 33 | `MFP4G32P` | **shipped / ref-pinned** impl; experimental opt-in |

@@ -1,7 +1,7 @@
 # ArchSpec + the daemon↔model step contract
 
 **Date:** 2026-06-13 (N1 revised same day, post-adversarial-review + ADHD)
-**Branch:** `feature/paro-transparent-loading`
+**Branch:** `feature/transparent-loading`
 **Status:** §2 (the unified step contract) is **SUPERSEDED** — kept as a documented dead-end per
 Rule 3. §3–§5 (the `ArchSpec` authoring surface) remain **live as BET 2** of the greenfield design.
 **Scope:** How to minimize the effort of adding a new model architecture to hipfire.
@@ -40,7 +40,7 @@ The branch landed two stacked abstractions that were supposed to make adding an
 architecture cheap:
 
 - **`WeightBackend`** (`crates/hipfire-runtime/src/weight_backend.rs`) — hides the quant
-  matrix (`HfqBackend`/`ParoBackend`, `proj`/`norm`/`raw_f32`) from per-arch callers.
+  matrix (`HfqBackend`, `proj`/`norm`/`raw_f32`) from per-arch callers.
 - **Carrier registry** (`crates/hipfire-loader/src/carriers.rs` + `lib.rs`) — a
   machine-checked, fail-loud dispatch table that replaced the old `match arch_id` ladder.
 
@@ -295,7 +295,6 @@ hipfire is ~70% of the way to a data-driven arch model and doesn't advertise it:
 | `WeightBackend` | `weight_backend.rs` | quant matrix (~25 formats) in one arch-agnostic place |
 | `load_layer<B>` | qwen35 `layer_driver.rs` | per-layer weight **table** — `b.proj("self_attn.q_proj", …)` struct literals |
 | `Step` op-list | `hipfire-dispatch/.../steps.rs` | the forward pass is **already** an interpreted op-list (`Step::{Gemv, RmsnormAutomatic, Attend}`) with a fusion engine |
-| `WeightAugmentor` | `augmentor.rs` | transparent ParoQuant plugin keyed on `QuantConfig` |
 | `Architecture` | `arch.rs` | bring-up contract (`config_from_hfq`/`load_weights`/`new_state` + override structs) |
 
 ### What is needlessly code

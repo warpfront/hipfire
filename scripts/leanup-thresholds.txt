@@ -127,7 +127,7 @@ arch_key_dispatch           <= 14
 #
 # The first draft of this gate WAS three counts, including `qt_unregistered <= 10`.
 # That ceiling could not distinguish a deliberate non-passthrough format (qt 22 is
-# an index tensor; 28/29 load via paro.rs; 31-37 via arch loaders) from a genuine
+# an index tensor; 28/29 retired, never reused; 31-37 via arch loaders) from a genuine
 # omission like cf061b7ed, where qt=40's encoder, GEMV and is_mq arms all landed
 # and the model would not load. Nor could any count see substitution -- delete one
 # justified entry, add an unjustified one, cardinality unchanged, gate green. That

@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Migrate qwen2 and llama single-tensor weight loading onto the existing `WeightBackend` trait, keeping each arch's own layer-walk, and collapse llama's two loaders into one shared walk.
+**Goal:** Migrate qwen2 and llama single-tensor weight loading onto the existing `WeightBackend` trait, keeping each arch's own layer-walk, and route llama's HFQ loader through one shared walk.
 
-**Architecture:** Add one method (`bias()`) to `WeightBackend`. qwen2's `load_layer` and a new `llama::load_layer<B>` build an `HfqBackend`/`ParoBackend` and call `b.proj/norm/raw_f32/bias`. Name resolution reuses the already-built `flat_name_candidates` (prefix-less `hfq_proj_name`/`hfq_plain_name` + `model.` prepend) and `norm_bias = 0.0`. Each arch passes its OWN existing reader as `read_proj` so the dequant path stays byte-identical; only name resolution moves to the candidates fn.
+**Architecture:** Add one method (`bias()`) to `WeightBackend`. qwen2's `load_layer` and a new `llama::load_layer<B>` build an `HfqBackend` and call `b.proj/norm/raw_f32/bias`. Name resolution reuses the already-built `flat_name_candidates` (prefix-less `hfq_proj_name`/`hfq_plain_name` + `model.` prepend) and `norm_bias = 0.0`. Each arch passes its OWN existing reader as `read_proj` so the dequant path stays byte-identical; only name resolution moves to the candidates fn.
 
-**Tech Stack:** Rust; `rdna-compute` (`Gpu`/`GpuTensor`) → `hipfire-runtime` (`WeightBackend`/`HfqBackend`/`ParoBackend`, `dequant_*`) → `hipfire-arch-qwen2` / `hipfire-runtime::hfq` (llama).
+**Tech Stack:** Rust; `rdna-compute` (`Gpu`/`GpuTensor`) → `hipfire-runtime` (`WeightBackend`/`HfqBackend`/`SafetensorsBackend`, `dequant_*`) → `hipfire-arch-qwen2` / `hipfire-runtime::hfq` (llama).
 
 **Design doc:** `docs/plans/2026-06-11-cross-arch-weightbackend-adoption-design.md`.
 
@@ -22,7 +22,7 @@
 
 ## Task 0: Prerequisite — green build + source models + baseline capture
 
-**This task is verification setup, not code. It MUST complete before Tasks 3/5/6 can be gated.**
+**This task is verification setup, not code. It MUST complete before Tasks 3/5 can be gated.**
 
 - [ ] **Step 1: Confirm the tree compiles (gap #1)**
 
@@ -31,12 +31,12 @@ Expected: no `error[...]`. If the `shallow_clone` E0599 at `qwen35.rs:1387` is s
 
 - [ ] **Step 2: Source three models into `~/.hipfire/models/`**
 
-Need: one HFQ qwen2 (`arch_id 7`), one HFQ llama / Qwen3-dense (`arch_id < 5`), one PARO/safetensors llama directory. Record absolute paths and `md5` of each in a scratch note (`/home/bjoern/hipfire-cross-arch-baselines/paths.txt` — not `/tmp`).
+Need: one HFQ qwen2 (`arch_id 7`), one HFQ llama / Qwen3-dense (`arch_id < 5`), one safetensors llama directory. Record absolute paths and `md5` of each in a scratch note (`/home/bjoern/hipfire-cross-arch-baselines/paths.txt` — not `/tmp`).
 
 - [ ] **Step 3: Capture pre-refactor baselines**
 
 Build the dump tool once: `cargo build --release --example greedy_dump -p hipfire-runtime`
-For EACH model, with a fixed prompt and `--temperature 0.0`, capture the first 32 greedy token ids to a file under `/home/bjoern/hipfire-cross-arch-baselines/` (e.g. `qwen2-before.txt`, `llama-hfq-before.txt`, `llama-paro-before.txt`). Use the GPU lock per CLAUDE.md (`source scripts/gpu-lock.sh && gpu_acquire "cross-arch" ... gpu_release`).
+For EACH model, with a fixed prompt and `--temperature 0.0`, capture the first 32 greedy token ids to a file under `/home/bjoern/hipfire-cross-arch-baselines/` (e.g. `qwen2-before.txt`, `llama-hfq-before.txt`, `llama-safetensors-before.txt`). Use the GPU lock per CLAUDE.md (`source scripts/gpu-lock.sh && gpu_acquire "cross-arch" ... gpu_release`).
 Expected: 32 token ids per model. These are the byte-identical reference.
 
 ---
@@ -79,13 +79,13 @@ In the `impl<'a> WeightBackend for HfqBackend<'a>` block (after `raw_f32`, ~`wei
 
 This reproduces qwen2's `load_bias_f32` (resolve → `dequant_f32` → length assert), with candidate-based name resolution.
 
-- [ ] **Step 3: Implement `ParoBackend::bias`**
+- [ ] **Step 3: Implement `SafetensorsBackend::bias`**
 
-In the `impl<'a> WeightBackend for ParoBackend<'a>` block (after `raw_f32`, ~`weight_backend.rs:1046`):
+In the `impl<'a> WeightBackend for SafetensorsBackend<'a>` block (after `raw_f32`, ~`weight_backend.rs:1046`):
 
 ```rust
     fn bias(&mut self, _rel: &str, _n: usize) -> HipResult<GpuTensor> {
-        Err(hip_bridge::HipError::new(0, "ParoBackend: attention biases unsupported"))
+        Err(hip_bridge::HipError::new(0, "biases unsupported"))
     }
 ```
 
@@ -94,13 +94,13 @@ If `hip_bridge::HipError` is not already imported at the top of the file, add `u
 - [ ] **Step 4: Build**
 
 Run: `cargo check -p hipfire-runtime`
-Expected: compiles. (qwen35's `load_layer` does not implement `bias` because it uses `HfqBackend`/`ParoBackend` from this crate — the impls above satisfy the trait for all callers.)
+Expected: compiles. (qwen35's `load_layer` does not implement `bias` because it uses `HfqBackend`/`SafetensorsBackend` from this crate — the impls above satisfy the trait for all callers.)
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add crates/hipfire-runtime/src/weight_backend.rs
-git commit -m "feat(weight_backend): add bias() to WeightBackend (HfqBackend impl, ParoBackend errors)
+git commit -m "feat(weight_backend): add bias() to WeightBackend (HfqBackend impl, SafetensorsBackend errors)
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 ```
@@ -365,93 +365,30 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 
 ---
 
-## Task 6: llama PARO — route safetensors path through `load_layer`
+## Task 6: Final sweep + close the gap
 
 **Files:**
-- Modify: `crates/hipfire-runtime/src/hfq.rs`
+- Modify: `crates/hipfire-arch-qwen35/src/qwen35.rs` (remove the `@todo(unified-loading)` marker if its condition is now met)
 
-> Implementation choice (within the approved design): `load_weights_paroquant_llama` KEEPS its `pub fn` signature (so `LlamaCarrier`'s Dir arm at `carriers.rs:255` is untouched). The DUPLICATION the design targets — its separate per-layer walk — is eliminated by funnelling through the shared `load_layer`. This is strictly less risky than deleting the fn + rewiring the carrier.
-
-- [ ] **Step 1: Replace the PARO per-layer loop body**
-
-In `load_weights_paroquant_llama` (`hfq.rs:1117`), keep the embed / `output_norm` / `lm_head` PARO loading (uses `paro_load_llama_norm_raw`, `load_fp16_weight_tensor_from_source`) and the final assembly. Replace its `for i in 0..config.n_layers { … }` per-layer body (`hfq.rs:~1149`) with:
-
-```rust
-    let q_out_dim = config.n_heads * config.head_dim; // KEEP existing expr
-    let kv_dim = config.n_kv_heads * config.head_dim; // KEEP existing expr
-    let mut layers = Vec::with_capacity(config.n_layers);
-    {
-        let mut b = crate::weight_backend::ParoBackend {
-            source, gpu,
-            mp: "model",          // KEEP whatever model-prefix the current code passes to paro_proj_name
-            layer: 0,
-            norm_bias: 0.0,
-        };
-        for i in 0..config.n_layers {
-            layers.push(load_layer(&mut b, config, q_out_dim, kv_dim, i)?);
-        }
-    }
-```
-
-NOTE on `mp`: `ParoBackend::proj` builds `paro_proj_name(self.mp, layer, rel)` = `{mp}.layers.{layer}.{rel}` then the augmentor appends `.qweight`/`.weight`. Confirm `mp` reproduces the prefix the current `load_weights_paroquant_llama` uses (the design notes llama is flat `model.layers.…`, so `mp = "model"`). Verify against the current `format!`/`paro_load_*` names in this fn before building.
-
-`ParoBackend::norm` uses `paro_load_norm(…, norm_bias=0.0)` — confirm this matches the current `paro_load_llama_norm_raw` for llama's norm dtype (both should be raw F16/F32 → upload; the gate proves it). `q_norm`/`k_norm` are loaded conditionally inside `load_layer` (Task 4) via `b.norm`, matching the current `if config.has_qk_norm` blocks.
-
-- [ ] **Step 2: Delete now-orphaned PARO per-layer helpers**
-
-If `paro_load_llama_norm_raw` (and any per-layer-only PARO weight helper) is now referenced ONLY by the embed/output code (not the deleted loop), keep it. Run `rg 'paro_load_llama_norm_raw' crates/hipfire-runtime` — delete it only if it has zero remaining callers. Do the same for any per-layer PARO weight loader the old loop used.
-
-- [ ] **Step 3: Build**
-
-Run: `cargo check -p hipfire-runtime -p hipfire-loader`
-Expected: compiles; no new `dead_code` (or remove whatever the old loop solely used).
-
-- [ ] **Step 4: Byte-identical gate (llama PARO)**
-
-Re-run `greedy_dump` on the PARO/safetensors llama dir (same prompt, temp 0.0) → `llama-paro-after.txt`.
-Run: `diff …/llama-paro-before.txt …/llama-paro-after.txt`
-Expected: **no diff**. Then `./scripts/coherence-gate.sh` (PARO llama) green — fluent, no attractor.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add crates/hipfire-runtime/src/hfq.rs
-git commit -m "refactor(llama): paroquant loader funnels through shared load_layer (ParoBackend)
-
-Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
-```
-
----
-
-## Task 7: Final sweep + close the gap
-
-**Files:**
-- Modify: `crates/hipfire-arch-qwen35/src/qwen35.rs`, `crates/hipfire-runtime/src/hfq.rs` (remove the two `@todo(unified-loading)` markers if their conditions are now met)
-
-- [ ] **Step 1: Remove the llama `@todo(unified-loading)` marker**
-
-`hfq.rs:1110` carries `// @todo(unified-loading): llama PARO still has its own loader; … Migrate llama onto the same generic walk`. llama now runs through `load_layer`; delete this comment block.
-
-- [ ] **Step 2: Full workspace build + warning scan**
+- [ ] **Step 1: Full workspace build + warning scan**
 
 Run: `cargo check --workspace 2>&1 | rg '^warning|^error' | rg -i 'qwen2|llama|weight_backend|hfq' || echo CLEAN`
 Expected: no new errors; no `dead_code` for anything this plan touched.
 
-- [ ] **Step 3: Final coherence gate (all three)**
+- [ ] **Step 2: Final coherence gate (qwen2 + llama)**
 
 Run: `./scripts/coherence-gate.sh`
-Expected: green across qwen2 + llama HFQ + PARO llama (plus the existing qwen35 models). Eyeball each report per CLAUDE.md.
+Expected: green across qwen2 + llama HFQ (plus the existing qwen35 models). Eyeball each report per CLAUDE.md.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 3: Commit**
 
 ```bash
-git add -A
-git commit -m "docs(loading): close llama @todo(unified-loading) — llama on shared load_layer
+git commit --allow-empty -m "test(loading): coherence green for qwen2 + llama HFQ on shared load_layer
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 ```
 
-- [ ] **Step 5: Update the review memory**
+- [ ] **Step 4: Update the review memory**
 
 Mark gap #2 done in `unified-loading-review-todos.md` (memory), with the commit range. The qwen2 `@todo`-free state and the deleted llama duplication are the evidence.
 
@@ -459,13 +396,13 @@ Mark gap #2 done in `unified-loading-review-todos.md` (memory), with the commit 
 
 ## Self-review (done at plan-write time)
 
-- **Spec coverage:** §1 trait change → Task 1. §2 qwen2 → Tasks 2-3. §3 llama collapse → Tasks 4-6. §4 verification → Task 0 + the per-arch gates in Tasks 3/5/6. §6 risks: Risk-1 (norm) resolved by inspection + gated; Risk-2 (name prefix) handled by `flat_name_candidates` + gated; Risk-3 (`bias` on ParoBackend) compile-isolated (only qwen2 calls `bias`, qwen2 has no ParoBackend).
-- **Placeholder scan:** the two `// KEEP existing expr` notes on `q_out_dim`/`kv_dim` are deliberate instructions to copy existing exact code (not invent), because re-deriving the dim formula risks a silent mismatch — the implementer lifts the present let-bindings verbatim. The `mp` prefix in Task 6 is flagged for confirmation against current PARO names. These are verification instructions, not unfilled blanks.
-- **Type consistency:** `load_layer<B>` signature `(b, config, q_out_dim, kv_dim, i)` is identical in Tasks 4/5/6. `read_proj` fn-ptr signature matches the widened readers in Tasks 2 (qwen2) and 4 (llama). `bias(rel, n)` matches between trait (Task 1) and call sites (Task 2).
+- **Spec coverage:** §1 trait change → Task 1. §2 qwen2 → Tasks 2-3. §3 llama collapse → Tasks 4-5. §4 verification → Task 0 + the per-arch gates in Tasks 3/5. §6 risks: Risk-1 (norm) resolved by inspection + gated; Risk-2 (name prefix) handled by `flat_name_candidates` + gated; Risk-3 (`bias` on `SafetensorsBackend`) compile-isolated (only qwen2 calls `bias`, qwen2 has no `SafetensorsBackend`).
+- **Placeholder scan:** the two `// KEEP whatever expr exists today` notes on `q_out_dim`/`kv_dim` (Task 5) are deliberate instructions to copy existing exact code (not invent), because re-deriving the dim formula risks a silent mismatch — the implementer lifts the present let-bindings verbatim. These are verification instructions, not unfilled blanks.
+- **Type consistency:** `load_layer<B>` signature `(b, config, q_out_dim, kv_dim, i)` is identical in Tasks 4/5. `read_proj` fn-ptr signature matches the widened readers in Tasks 2 (qwen2) and 4 (llama). `bias(rel, n)` matches between trait (Task 1) and call sites (Task 2).
 
 ## Deferred (unchanged by this plan)
 
 - Generic arch-agnostic `load_layer` (rejected — reverted once as 611e10ce/f2a5895b).
-- qwen2 safetensors/PARO + multi-GPU (no path exists).
+- qwen2 safetensors + multi-GPU (no path exists).
 - Embedding/output assembly unification (stays arch-local per the qwen35 precedent).
 - The multi-GPU `@todo(unified-loading)` at `qwen35.rs:1566` stays (out of scope).

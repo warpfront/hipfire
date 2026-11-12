@@ -17,11 +17,11 @@ still branches on source** inside `carriers.rs`. Concretely, the Dir arm of each
 core carrier is inlined in the loader:
 
 - `LlamaCarrier` (`carriers.rs:430-477`) inlines the entire Dir bundle:
-  `config_from_safetensors_llama` + `load_weights_paroquant_llama` + KV policy
+  `config_from_safetensors_llama` + KV policy
   (`DIR_SAFETENSORS_POLICY`) + `ForwardScratch`.
 - `Qwen35Carrier` (`carriers.rs:319-394`) inlines the Dir bundle:
-  `config_from_safetensors` + `ParoSource` + `load_weights` + KV policy
-  (`QWEN35_PARO_POLICY`) + `DeltaNetState::new` + `Qwen35Scratch::new`.
+  `config_from_safetensors` + `load_weights` + the qwen35 Dir KV policy +
+  `DeltaNetState::new` + `Qwen35Scratch::new`.
 - `MinimaxCarrier` (`carriers.rs:562-582`) inlines both arms' `(config, weights)`
   match (it has no `load_bundle` at all — the whole carrier is in the loader).
 
@@ -66,8 +66,8 @@ Success criteria:
   `carriers.rs` for every carrier in scope and moves into the arch crate.
 - Dir-specific loader imports disappear from `carriers.rs`:
   `hipfire_arch_minimax::{config_from_safetensors, load_weights_from_safetensors}`,
-  `hipfire_runtime::hfq::{config_from_safetensors_llama, load_weights_paroquant_llama}`,
-  and the qwen35 `ParoSource`/`config_from_safetensors`/policy wiring.
+  `hipfire_runtime::hfq::config_from_safetensors_llama`,
+  and the qwen35 `config_from_safetensors`/policy wiring.
 - Adding GGUF becomes a **single-crate** change: one new arm inside the arch's
   `load_bundle` (plus the source-only arm in `resolve_source_meta`). No
   carrier edit.
@@ -91,7 +91,7 @@ arch crate; layers 1, 3, 4 are structurally pinned to the loader.
 
 The Tier-2 `WeightSource` trait (`model_load.rs:57`) is what makes layer 2
 foldable cleanly: the **only** irreducible Hfq-vs-Dir difference at the tensor
-level is *which `WeightSource` impl is constructed* (`HfqSource` vs `ParoSource`
+level is *which `WeightSource` impl is constructed* (`HfqSource` vs the Dir source
 for qwen35), driving one shared `load_weights` orchestrator. The config fn and
 KV policy site also branch, but those are small and already live in the arch
 crate's namespace.
@@ -127,8 +127,8 @@ it is not a bundle-build concern.
 
 `LlamaBundle` lives in the arch crate and `load_bundle` already returns it. The
 Dir arm currently inlined in `carriers.rs:430-477` moves verbatim into a `Dir`
-arm of `load_bundle`. The Dir-side deps (`config_from_safetensors_llama`,
-`load_weights_paroquant_llama` — both in `hipfire-runtime::hfq`) are already
+arm of `load_bundle`. The Dir-side dep `config_from_safetensors_llama`
+(in `hipfire-runtime::hfq`) is already
 reachable from the arch crate (it depends on `hipfire-runtime`). No
 `LoadedModel`-level data, no VL, no finish. **Both arms return the same
 `LlamaBundle` and the carrier's shared tail is untouched.** This is the model
@@ -154,7 +154,7 @@ Three structural facts block a naive uniform fold:
    skeleton (no eviction/dflash/vl).** This asymmetry is load-bearing behavior.
 
 What *can* fold: the Dir-pp1 **bundle build** (`config_from_safetensors` +
-`ParoSource` + `load_weights` + `QWEN35_PARO_POLICY` KV + `DeltaNetState::new` +
+`load_weights` + qwen35 Dir KV policy + `DeltaNetState::new` +
 `Qwen35Scratch::new`) moves into a `Dir` arm of `load_bundle`. After that,
 `load_bundle(src, ctx)` returns a `Qwen35Bundle` for both Hfq-pp1 and Dir-pp1.
 But the carrier must **still branch after the bundle** to preserve fact 3:
@@ -204,7 +204,7 @@ Everything in B1 **plus** fold qwen35's Dir-pp1 bundle build into `load_bundle`,
 keeping VL/finish/pp in the loader and HFQ-conditional via the post-bundle
 `was_hfq` branch shown above.
 
-- **Pro:** The `(config, weights)`/`ParoSource`/`config_from_safetensors` block
+- **Pro:** The `(config, weights)`/`config_from_safetensors` block
   leaves `carriers.rs` for *every* carrier; qwen35's Dir recipe moves to its
   arch crate. Most complete realization of "carrier is source-agnostic."
 - **Con:** qwen35's carrier keeps a *different* source branch (`was_hfq` for
@@ -213,7 +213,7 @@ keeping VL/finish/pp in the loader and HFQ-conditional via the post-bundle
 - **Con / risk:** The Dir-skips-`finish` asymmetry must be preserved exactly. The
   refactor's correctness hinges on the `was_hfq` capture and on Dir continuing to
   *not* attempt eviction/dflash. A subtle slip (e.g. routing Dir through
-  `finish`) silently changes behavior for ParoQuant + `--cask-sidecar`/`--draft`
+  `finish`) silently changes behavior for Dir + `--cask-sidecar`/`--draft`
   users. Higher review burden for a thinner payoff.
 - **Stronger only if** combined with B3 (below) to also kill the internal
   branch — otherwise the qwen35 fold mostly relocates code.
@@ -243,7 +243,7 @@ shared weights/scratch tail driven by the boxed source.
   config fn and KV policy still branch (they're not part of `WeightSource`), so
   it does **not** fully unify the path — it trades two small matches for one box.
 - **Con:** llama's Dir path doesn't even use `WeightSource` (it calls
-  `load_weights_paroquant_llama` directly), so B3 only helps qwen35; llama would
+  its loader directly), so B3 only helps qwen35; llama would
   need a `WeightSource` retrofit first. Scope creep.
 - **Verdict:** YAGNI now. Revisit only if a 3rd+ source kind (GGUF *and* another)
   lands, making the factory pay for itself. Tracked as a future note, not this
@@ -270,7 +270,7 @@ This staging keeps every commit independently gated and preserves the project's
 1. **Llama Dir fold.** Move `carriers.rs:430-477` (config/weights/KV/scratch)
    into a `Dir` arm of `hipfire_arch_llama::load_bundle`. Carrier becomes
    `let bundle = load_llama_bundle(src, ctx)?;` + shared tail. Remove now-unused
-   `config_from_safetensors_llama`/`load_weights_paroquant_llama` imports from
+   `config_from_safetensors_llama` imports from
    `carriers.rs`. `cargo build -p hipfire-loader` + clippy.
 2. **Minimax `load_bundle` (option M-a).** Create
    `hipfire_arch_minimax::load_bundle` returning
@@ -291,7 +291,7 @@ This staging keeps every commit independently gated and preserves the project's
 
 - **KV policy unification** — untouched (same as Approach A). Every policy site
   (`LLAMA_HFQ_POLICY`, `DIR_SAFETENSORS_POLICY`, `QWEN35_HFQ_POLICY`,
-  `QWEN35_PARO_POLICY`, `QWEN35_PP_POLICY`) moves *with* its arm, byte-identical.
+  qwen35 Dir KV policy, `QWEN35_PP_POLICY`) moves *with* its arm, byte-identical.
 - **qwen35 pp>1** (`load_qwen35_pp`) — stays a loader helper (returns
   `LoadedModel`-level pp data). Not a bundle.
 - **VL detection** — stays in the loader (arch-qwen35 has no vl dep).
@@ -310,6 +310,6 @@ This staging keeps every commit independently gated and preserves the project's
 - Minimax HFQ smoke (Dir smoke if a safetensors MiniMax dir is available).
 - `scripts/probe_commits.sh` perf A/B: Δ≈0% (load-time structure refactor).
 - Registry disjointness tests (`registry_tests`) unaffected (dispatch untouched).
-- **Cannot validate locally (gfx1100 dev workstation):** llama (arch <5) and Dir/ParoQuant paths —
+- **Cannot validate locally (gfx1100 dev workstation):** llama (arch <5) and Dir paths —
   same gaps Approach A flags; not regressed. Covered by code review of the
   verbatim moves + gates where a model is reachable.

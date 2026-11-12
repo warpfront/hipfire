@@ -5,7 +5,7 @@
 > **⚠️ RECONCILED 2026-06-11.** The original from-scratch version of this plan was
 > written against a STALE snapshot (a detached HEAD in the *master* worktree where
 > none of the unification existed). On the actual feature branch
-> (`feature/paro-transparent-loading`, tip `b187e792`) the `WeightBackend`
+> (`feature/transparent-loading`, tip `b187e792`) the `WeightBackend`
 > unification is **already implemented — and went further than the plan**. This
 > document is rewritten to reflect reality: most of the original 10 tasks are DONE;
 > what remains is small dedup + verification. The companion design doc
@@ -18,7 +18,7 @@
 the already-shipped `WeightBackend` + `layer_driver` + carrier-registry work.
 
 **Tech Stack:** Rust; `rdna-compute` (`Gpu`/`GpuTensor`) → `hipfire-runtime`
-(`WeightBackend`/`HfqBackend`/`ParoBackend`/`HfqFile`/`ModelSource`) → `hipfire-loader`
+(`WeightBackend`/`HfqBackend`/`HfqFile`/`ModelSource`) → `hipfire-loader`
 (`Carrier` registry) → `hipfire-arch-qwen35` (`load_layer`, `load_moe_ffn`).
 
 ---
@@ -29,13 +29,10 @@ Verified against the feature worktree on 2026-06-11:
 
 | Plan item | Reality on `b187e792` |
 |---|---|
-| `WeightBackend` trait + `HfqBackend`/`ParoBackend` | **Done** — `crates/hipfire-runtime/src/weight_backend.rs:968+`. Stateful (`set_layer`), relative-name `proj`/`norm`/`raw_f32`, a `candidates` name-resolver fn-ptr, `norm_bias` (1.0 qwen3.5/gemma · 0.0 qwen2/llama), and a Paro **augmentor chain** (`try_augmentors`/`DEFAULT_AUGMENTORS`). More general than the design — covers qwen2/llama too. |
+| `WeightBackend` trait + `HfqBackend`/safetensors backend | **Done** — `crates/hipfire-runtime/src/weight_backend.rs:968+`. Stateful (`set_layer`), relative-name `proj`/`norm`/`raw_f32`, a `candidates` name-resolver fn-ptr, `norm_bias` (1.0 qwen3.5/gemma · 0.0 qwen2/llama), and an **augmentor chain** (`try_augmentors`/`DEFAULT_AUGMENTORS`). More general than the design — covers qwen2/llama too. |
 | Single generic layer-walk | **Done** — `crates/hipfire-arch-qwen35/src/layer_driver.rs::load_layer<B: WeightBackend>`. All three loaders funnel through it with a `load_moe` closure for the MoE fork. |
-| `paro_load_moe_ffn`/`load_moe_ffn` duplication | **Done** — `paro_load_moe_ffn` moved to `crates/hipfire-arch-qwen35/src/paro_moe.rs`; HFQ `load_moe_ffn` stays in `qwen35.rs:1734`. The MoE fork is the caller-supplied `load_moe` closure (intended residual). |
 | Embed/output, `+1.0` bake, page-drop (`drop_mmap`/`drop_pages_range`) | **Done** — `load_embedding` + `norm_bias` + per-layer `layer_data_range`/`drop_pages_range` in `load_weights` (`qwen35.rs:1340`, `:1440-1456`). |
 | Daemon/safetensors routing, multi-GPU, VL, llama | **Done & beyond** — `hipfire-loader` `Carrier` registry: `enum ModelSource{Hfq,Dir}` + `from_path` (`loader_api.rs`), `Qwen35Carrier`/`LlamaCarrier` (`carriers.rs`). pp>1 folded into `Qwen35Carrier` (commit `48c3acc6`); side-doors removed. |
-
-The original premise of this whole effort — *"`paro_load_moe_ffn` still referenced, check dead code/loose ends"* — was a stale-tree artifact. On this branch that function isn't even in `qwen35.rs` anymore.
 
 ---
 
@@ -118,9 +115,9 @@ Per CLAUDE.md, any loader/forward change must pass it. The pre-commit hook runs 
 when loader files are staged; run it explicitly too:
 
 Run: `./scripts/coherence-gate.sh`
-Expected: PASS for both an HFQ model and the A3B PARO model — fluent, on-topic, no
-verbatim loop. If the daemon path changed, also confirm the safetensors/PARO route
-(`Qwen35Carrier` → `load_weights_paroquant`) still loads and generates coherently.
+Expected: PASS for both an HFQ model and the A3B model — fluent, on-topic, no
+verbatim loop. If the daemon path changed, also confirm the safetensors route
+(`Qwen35Carrier` → the safetensors loader) still loads and generates coherently.
 
 - [ ] **Step 2: Record + commit the report**
 
@@ -130,57 +127,44 @@ git add -A && git commit -m "test(qwen35): coherence gate green after load_weigh
 
 ### Task 3: Mark the genuinely-deferred paths
 
-Two paths remain intentionally un-unified; mark them so future sessions don't
-re-investigate them as "loose ends."
+One path remains intentionally un-unified; mark it so future sessions don't
+re-investigate it as a "loose end."
 
 **Files:**
 - Modify: `crates/hipfire-arch-qwen35/src/qwen35.rs`
-- Modify: `crates/hipfire-runtime/src/hfq.rs`
 
 - [ ] **Step 1: `@todo` on multi-GPU = HFQ-only**
 
 Above `load_weights_multi` (`qwen35.rs:1582`):
 
 ```rust
-// @todo(unified-loading): multi-GPU is HFQ-only — no ParoBackend/safetensors
+// @todo(unified-loading): multi-GPU is HFQ-only — no safetensors
 // multi-GPU path (drop_pages_range has no ModelSource equivalent, band-routing
 // is HFQ-mmap-specific). See 2026-06-11-carrier-registry-unified-design.md.
 ```
 
-- [ ] **Step 2: `@todo` on the separate llama PARO loader**
-
-Above `load_weights_paroquant_llama` (`hfq.rs`, ~line 1050):
-
-```rust
-// @todo(unified-loading): llama PARO still has its own loader; qwen35 already
-// runs through layer_driver::load_layer + WeightBackend. Migrate llama onto the
-// same generic walk (the trait is arch-agnostic via norm_bias + candidates).
-```
-
-- [ ] **Step 3: Build + commit**
+- [ ] **Step 2: Build + commit**
 
 Run: `cargo build`
 Expected: compiles (comment-only changes).
 
 ```bash
 git add -A
-git commit -m "docs(loading): @todo markers for deferred multi-GPU-Paro + llama PARO unification"
+git commit -m "docs(loading): @todo marker for deferred multi-GPU safetensors unification"
 ```
 
 ---
 
 ## Deferred items reminder (plan-level — final item)
 
-After Task 3, `grep -rn "@todo(unified-loading)"` should list exactly the two
-deferred paths below. Confirm both are present before declaring done:
+After Task 3, `grep -rn "@todo(unified-loading)"` should list exactly the
+deferred path below. Confirm it is present before declaring done:
 
-1. **Multi-GPU for safetensors/Paro** — `load_weights_multi` is HFQ-only; a
-   `ModelSource` page-drop/band-routing story is needed before Paro multi-GPU.
-2. **Llama-family PARO** — `hfq.rs:load_weights_paroquant_llama` still bypasses
-   `layer_driver::load_layer`; migrate it onto the shared `WeightBackend` walk.
+1. **Multi-GPU for safetensors** — `load_weights_multi` is HFQ-only; a
+   `ModelSource` page-drop/band-routing story is needed before safetensors multi-GPU.
 
 Optional / not scheduled (low value, note only): the three `load_weights*` entry
-points still exist separately (single-HFQ, single-Paro, multi-HFQ). They legitimately
+points still exist separately (single-HFQ, single-safetensors, multi-HFQ). They legitimately
 differ in backend construction + embed/output handling and already share
 `load_layer`; collapsing them into one `load_weights_generic<B>(embed_fn, output_fn,
 moe_fn)` is possible but buys little — defer unless a 4th entry point appears.

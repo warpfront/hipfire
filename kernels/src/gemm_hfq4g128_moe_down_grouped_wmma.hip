@@ -6,9 +6,8 @@
 // contract as `gemv_hfq4g128_moe_down_grouped`: 16-slot tiles sorted by
 // expert (`moe_scatter_fused_k8` layout), `y[grouped_row, :] =
 // per_expert_scale[e] * W_e · act[sorted_slots[grouped_row]]`, padding rows
-// unwritten. Adapted from `gemm_paro_q4g128_moe_grouped_wmma_k2` for rows
-// whose K is not a multiple of 128: a row holds ceil(K/128) 72-byte groups
-// and the last group's tail beyond K is skipped (K % 16 == 0). Weights are
+// unwritten. Rows whose K is not a multiple of 128: a row holds ceil(K/128) 72-byte
+// groups and the last group's tail beyond K is skipped (K % 16 == 0). Weights are
 // dequantized in f32 and rounded once to f16; X is F16.
 //
 // Grid: [ceil(M/16), m_total/16]. Block: [32].

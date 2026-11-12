@@ -188,9 +188,6 @@ pub enum KernelKey {
     GemvMq4G256Lloyd,
     GemvMfp4G32,
     GemvHfp4G32,
-    GemvParo4G128,
-    GemvParo4G128T,
-    GemvParoQ4G128,
     GemvQ4F16G64,
     GemvQ4F16G32,
     // Prerotated
@@ -212,8 +209,6 @@ pub enum KernelKey {
     GemvMq6G256Residual,
     GemvMq3G256LloydResidual,
     GemvMq4G256LloydResidual,
-    GemvParo4G128Residual,
-    GemvParo4G128TResidual,
     // SwiGLU + Residual
     GemvHfq4G256SwiGLUResidual,
     GemvHfq3G256SwiGLUResidual,
@@ -223,8 +218,6 @@ pub enum KernelKey {
     GemvMq6G256SwiGLUResidual,
     GemvMq3G256LloydSwiGLUResidual,
     GemvMq4G256LloydSwiGLUResidual,
-    GemvParo4G128SwiGLUResidual,
-    GemvParo4G128TSwiGLUResidual,
     // GEMM
     GemmHfq4G256,
     GemmHfq4G128,
@@ -239,20 +232,17 @@ pub enum KernelKey {
     FusedQkvMq3G256Lloyd,
     FusedQkvMq4G256Lloyd,
     FusedQkvHfq6G256,
-    FusedQkvParo4G128T,
     FusedQkvQ4K,
     // Fused QKVZA (LA4)
     FusedQkvzaHfq4G256,
     FusedQkvzaMq3G256Lloyd,
     FusedQkvzaMq4G256Lloyd,
     FusedQkvzaHfq6G256,
-    FusedQkvzaParo4G128T,
     // Fused Gate+Up
     FusedGateUpHfq4G256,
     FusedGateUpMq3G256Lloyd,
     FusedGateUpMq4G256Lloyd,
     FusedGateUpHfq6G256,
-    FusedGateUpParo4G128T,
     FusedGateUpQ4K,
     // Rotation
     RotateMq,
@@ -497,7 +487,6 @@ Assisted-by: OpenCode:deepseek/deepseek-v4-flash
 
 Extract the following kernel dispatch logic from `llama.rs` (lines 869-960, 971-1000, 1013-1101) and `qwen35.rs` (rotation prelude calls):
 - `fused_rmsnorm_rotate_for_mq`
-- `fused_rmsnorm_rotate_for_paro`
 - `rotate_x_for_mq`
 - `rotate_x_mq_for`
 - `fused_silu_mul_rotate_mq_for`

@@ -1063,12 +1063,6 @@ QUANT_PROFILES = {
         "unpack_tax": "low",
         "fit_question": "is cache/KV bandwidth or launch overhead dominant?",
     },
-    "paro4": {
-        "label": "PARO4",
-        "bytes_saved": "medium",
-        "unpack_tax": "high",
-        "fit_question": "is pair-rotation repeated across output packs instead of amortized?",
-    },
 }
 
 
@@ -1278,17 +1272,8 @@ def fit_interpretation(row, manifest_summary, arch_info, quant_info):
     vmem_frac = observed["vmem"] / total
     valu_frac = observed["valu"] / total
     phase = row.get("phase", "")
-    hot = row.get("artifacts", {}).get("profile_kernels", []) or []
-    paro_gemv_pct = sum(
-        profile_pct(item)
-        for item in hot
-        if "gemv_paro4g128" in ((item.get("name") if isinstance(item, dict) else str(item)) or "")
-    )
 
-    if paro_gemv_pct >= 35.0 and phase in ("decode_ar", "decode_dflash"):
-        likely = "Paro rotated-GEMV dominates"
-        left = "amortize pair rotation / prerotate once per projection / improve packed-output tiling"
-    elif arch_info["native_matrix"] and matrix == 0 and phase in ("decode_ar", "decode_dflash"):
+    if arch_info["native_matrix"] and matrix == 0 and phase in ("decode_ar", "decode_dflash"):
         likely = "memory/launch, not matrix throughput"
         left = "fusion / launch reduction / lower bytes moved"
     elif arch_info["native_matrix"] and matrix == 0 and phase == "prefill":
@@ -1765,46 +1750,6 @@ def build_suggestion_queue(
     seen = set()
 
     unmatched = joined.get("unmatched_profile_names", []) or []
-    paro_gemv_pct = sum(
-        profile_pct(item)
-        for item in hot[:hot_limit]
-        if "gemv_paro4g128" in ((item.get("name") if isinstance(item, dict) else str(item)) or "")
-    )
-    if paro_gemv_pct >= 35.0:
-        paro_files = []
-        for item in hot[:hot_limit]:
-            name = item.get("name") if isinstance(item, dict) else str(item)
-            if "gemv_paro4g128" not in name:
-                continue
-            entry = dispatch_by_name.get(name, {})
-            src = source_path_for_entry(entry)
-            if src:
-                paro_files.append(src)
-            paro_files.extend(dispatch_paths_for_entry(entry, limit=1))
-        add_suggestion(
-            suggestions,
-            seen,
-            suggestion_record(
-                title="Split Paro activation rotation from packed GEMV",
-                lever_type="format_kernel",
-                score=96 + min(8, paro_gemv_pct / 16.0),
-                risk="medium/high",
-                expected_impact="high",
-                allowed_files=paro_files or ["kernels/src/gemv_paro4g128.hip", "crates/rdna-compute/src/dispatch.rs"],
-                rationale=[
-                    f"Paro GEMV kernels account for {paro_gemv_pct:.1f}% of the captured profile.",
-                    "The current native kernel rotates each G128 activation group inside every packed-output block.",
-                    "A prerotate-once plus packed-GEMV path can amortize pairs/theta/channel-scale work across all output rows.",
-                ],
-                candidate_steps=[
-                    "Add a Paro G128 activation-rotation kernel that writes an x_rot scratch once per projection.",
-                    "Add a prerotated packed W4 GEMV/residual kernel that consumes x_rot without pair rotation.",
-                    "Gate the route, then compare against a clean Atlas baseline before making it default.",
-                ],
-                eval_contract=eval_contract,
-                correctness_commands=correctness_commands,
-            ),
-        )
     if unmatched:
         add_suggestion(
             suggestions,
@@ -1833,7 +1778,6 @@ def build_suggestion_queue(
         arch_info.get("native_matrix")
         and phase in ("decode_ar", "decode_dflash")
         and observed["matrix/wmma"] == 0
-        and paro_gemv_pct < 35.0
     ):
         low_byte_sources = []
         for item in hot[:hot_limit]:

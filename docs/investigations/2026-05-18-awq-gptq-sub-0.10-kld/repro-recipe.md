@@ -19,10 +19,10 @@ ls /home/kaden/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots/c202236
 ls /home/kaden/.hipfire/imatrix/unsloth/Qwen3.5-9B-GGUF/imatrix_unsloth.gguf_file
 
 # Precomputed Hessian (c64 chunks at ctx=256)
-ls ~/hipfire/.worktrees/paroquant/.codeinsight+research/astrea/mq4-gptq-9b-poc/20260515T-start/hessian-linear-c64-ctx256/stats-merged.npz
+ls ~/hipfire/.worktrees/<worktree>/.codeinsight+research/astrea/mq4-gptq-9b-poc/20260515T-start/hessian-linear-c64-ctx256/stats-merged.npz
 
 # GPTQ mask (67 linear tensors)
-ls ~/hipfire/.worktrees/paroquant/.codeinsight+research/astrea/mq4-gptq-9b-poc/20260515T-start/mask.json
+ls ~/hipfire/.worktrees/<worktree>/.codeinsight+research/astrea/mq4-gptq-9b-poc/20260515T-start/mask.json
 
 # BF16 reference dump for KLD eval
 ls ~/hipfire/.worktrees/HIPa/benchmarks/quality-baselines/refs/qwen3.5-9b-bf16.kldref.bin
@@ -75,8 +75,8 @@ print(open(p,'rb').read(min(50_000_000,sz)).count(b'.awq_scale.weight'))
 $PYTHON scripts/mq4_masked_calib.py quantize \
   --base /home/kaden/.hipfire/models/qwen3.5-9b.mq4-awq-pr266-repro \
   --source-dir /home/kaden/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a \
-  --mask ~/hipfire/.worktrees/paroquant/.codeinsight+research/astrea/mq4-gptq-9b-poc/20260515T-start/mask.json \
-  --stats-npz ~/hipfire/.worktrees/paroquant/.codeinsight+research/astrea/mq4-gptq-9b-poc/20260515T-start/hessian-linear-c64-ctx256/stats-merged.npz \
+  --mask ~/hipfire/.worktrees/<worktree>/.codeinsight+research/astrea/mq4-gptq-9b-poc/20260515T-start/mask.json \
+  --stats-npz ~/hipfire/.worktrees/<worktree>/.codeinsight+research/astrea/mq4-gptq-9b-poc/20260515T-start/hessian-linear-c64-ctx256/stats-merged.npz \
   --output /home/kaden/.hipfire/models/qwen3.5-9b.mq4-awq-pr266-gptq-v3 \
   --out /tmp/candidate-awq-gptq-v3.json \
   --method gptq --gptq-damp 0.01 --gptq-refit-iters 2 \
@@ -137,7 +137,7 @@ Expected:
 $PYTHON scripts/mq4_masked_calib.py iterate \
   --hf-model /home/kaden/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a \
   --calib-text benchmarks/calib/calib-1m.txt \
-  --imatrix-mask ~/hipfire/.worktrees/paroquant/.codeinsight+research/astrea/mq4-gptq-9b-poc/20260515T-start/mask.json \
+  --imatrix-mask ~/hipfire/.worktrees/<worktree>/.codeinsight+research/astrea/mq4-gptq-9b-poc/20260515T-start/mask.json \
   --base-output-dir .codeinsight+research/iterative-awq-gptq-9b/run-001 \
   --awq-alpha 0.5 --damping 0.5 --epsilon 0.01 --max-rounds 4 \
   --bench-each-round \

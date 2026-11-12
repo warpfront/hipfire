@@ -12,7 +12,7 @@ use rdna_compute::Gpu;
 use std::path::{Path, PathBuf};
 
 /// A model on disk, before we know its arch. Carries either a parsed
-/// HFQ header or a directory (safetensors/ParoQuant — probed later).
+/// HFQ header or a safetensors directory (probed later).
 pub enum ModelSource {
     Hfq(HfqFile),
     Dir(SafetensorsSource),

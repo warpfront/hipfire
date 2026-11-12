@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Smoke test for formats that must work before dispatch-unification ships.
-# Covers: DS4 MQ2Lloyd, Qwen3.6 MQ4, MQ6 (9B proxy), PARO (35B A3B).
+# Covers: DS4 MQ2Lloyd, Qwen3.6 MQ4, MQ6 (9B proxy).
 # Usage: ./scripts/smoke-dispatch.sh
 # Exit code: 0 = all pass, 1 = one or more hard errors
 
@@ -92,9 +92,6 @@ run_case "Qwen3.6-27B MQ4" "$MODELS/qwen3.6-27b.mq4"
 
 # 3. MQ6 — use 9B as format proxy (no qwen3.6-27b-mq6 in registry)
 run_case "Qwen3.5-9B MQ6" "$MODELS/qwen3.5-9b.mq6"
-
-# 4. PARO (Qwen3.6-35B-A3B shisa packed)
-run_case "PARO Qwen3.6-35B-A3B" "$MODELS/shisa-Qwen3.6-35B-A3B-PARO-packed"
 
 echo
 echo "=== Results: ${pass} pass  ${fail} fail  ${skip} skip ==="

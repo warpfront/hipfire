@@ -92,7 +92,7 @@
 //!
 //! ## T = 1 (AR decode family, `select_decode` `moe_program.rs:3048-3105`)
 //!
-//! Grouped route requires `SoftmaxGatedShared`, `batch_size == 1`, no EP / Paro / deferred combine
+//! Grouped route requires `SoftmaxGatedShared`, `batch_size == 1`, no EP / deferred combine
 //! and `select_grouped_route` (`mod.rs:322-423`: capability admitted, geometry, formats, no
 //! tags / sidecars); decode params `program.rs:1107-1128` (`batch_size: 1`, `x_rot_prerotated:
 //! false`, `normalization: Provided`). Same four Gpu launchers on every arch, residency-blind:
@@ -1650,7 +1650,7 @@ impl ChainBase {
         } else {
             v.extend([
                 p(
-                    "select_decode: SoftmaxGatedShared && batch_size==1 && ep None && no Paro && !defer_routed_combine -> select_grouped_route",
+                    "select_decode: SoftmaxGatedShared && batch_size==1 && ep None && !defer_routed_combine -> select_grouped_route",
                     json!(true),
                     "crates/hipfire-dispatch/src/pipeline/moe_program.rs:3048-3105; mod.rs:322-423; program.rs:1107-1128",
                 ),

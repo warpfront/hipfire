@@ -35,29 +35,22 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen2Bundle, S
             let config = crate::qwen2::config_from_source(&source).ok_or_else(|| {
                 "qwen2: failed to parse Qwen2Config from safetensors config.json".to_string()
             })?;
-            // The Dir path loads the F16 `.weight` tensors; the ParoQuant 4-bit
-            // qweight decode is NOT implemented for qwen2 dirs. Fail cleanly if
-            // the F16 weights are absent (a paro-only / qweight-only dir) rather
-            // than panicking deep in the tensor loader, and warn when we ignore
-            // a present paro quant_config (loading F16 ≈ 2x the VRAM of 4-bit).
+            // Only plain F16 `.weight` dirs load here. A quantized dir is refused rather
+            // than loaded as F16 (~2x the VRAM).
+            if source.quant_config().is_some() {
+                return Err(
+                    "qwen2: quantized safetensors dir unsupported; use the HFQ (arch_id=7) build"
+                        .into(),
+                );
+            }
+            // Fail cleanly, not with a panic in the tensor loader, when the F16 weights are absent.
             let has_f16_weights = source
                 .tensor_info("model.layers.0.self_attn.q_proj.weight")
                 .is_some();
-            let is_paro = source.quant_config().is_some();
             if !has_f16_weights {
-                return Err(format!(
-                    "qwen2: safetensors dir has no F16 `.weight` tensors{} — 4-bit \
-                     qwen2 dir loading is not implemented; use the HFQ (arch_id=7) build",
-                    if is_paro {
-                        " (ParoQuant qweight-only)"
-                    } else {
-                        ""
-                    }
-                ));
-            }
-            if is_paro {
-                eprintln!(
-                    "  qwen2: loading F16 `.weight` (ParoQuant 4-bit qweight ignored — ~2x VRAM)"
+                return Err(
+                    "qwen2: safetensors dir has no F16 `.weight` tensors; use the HFQ (arch_id=7) build"
+                        .into(),
                 );
             }
             let weights = crate::qwen2::load_weights_from_source(&source, &config, ctx.gpu)

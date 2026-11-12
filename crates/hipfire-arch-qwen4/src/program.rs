@@ -1143,7 +1143,6 @@ fn build_moe_decode<'a>(
         routed_gate_up: first_gate_up.dtype.shipped_layout(),
         routed_down: first_down.dtype.shipped_layout(),
         routed_has_mixed_experts: moe.expert_codec_tags.is_some(),
-        has_paro_shared: false,
         per_expert_gate_up: moe.expert_gate_up_dtypes,
         per_expert_down: moe.expert_down_dtypes,
     };
@@ -1197,8 +1196,6 @@ fn build_moe_decode<'a>(
         routed_down_m: dims.hidden,
         routed_down_k: moe_dims.intermediate,
         routed_experts: moe.routed_experts,
-        routed_gate_up_paro: None,
-        routed_down_paro: None,
         router_logits: scratch.moe_router_logits,
         x_rot_local: scratch.moe_x_rot,
         gate_up_buf: scratch.moe_gate_up,
@@ -1258,7 +1255,6 @@ fn build_moe_prefill<'a>(
         routed_gate_up: first_gate_up.dtype.shipped_layout(),
         routed_down: first_down.dtype.shipped_layout(),
         routed_has_mixed_experts: moe.expert_codec_tags.is_some(),
-        has_paro_shared: false,
         per_expert_gate_up: moe.expert_gate_up_dtypes,
         per_expert_down: moe.expert_down_dtypes,
     };
@@ -1312,8 +1308,6 @@ fn build_moe_prefill<'a>(
         inverse_perm: scratch.moe_inverse_perm,
         y_gate_up_grouped: scratch.moe_y_gate_up_grouped,
         y_down_grouped: scratch.moe_y_down_grouped,
-        paro_gate_up: None,
-        paro_down: None,
         down_awq_scale: None,
         routed_out: None,
         ep_row_gather: moe.row_gather,

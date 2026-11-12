@@ -40,8 +40,7 @@ This file remains a **higher-level policy boundary sketch** only.
 Intended Astrea scope when implemented and owned:
 
 - Weight calibration: AWQ, imatrix-scale, GPTQ probes, k-map/promotion, MSE,
-  percentile, minmax, FWHT/QuaRot-style transform lanes, and ParoQuant-style
-  transform planning.
+  percentile, minmax, FWHT/QuaRot-style transform lanes.
 - Dynamic tensor policy: rank tensors by quality sensitivity per added byte and
   emit mixed-format recipes under a size budget.
 - MoE ingress: separate router, expert, and shared dense tensors before
@@ -64,7 +63,7 @@ measurement — not admissions.
 Runtime/package work stays deferred until policy artifacts identify a candidate
 worth carrying:
 
-- HFQ package header and section table for `transform.paro`, `kv.policy`,
+- HFQ package header and section table for `kv.policy`,
   `triattn.centers`, and evidence metadata.
 - Loader-side validation and rejection of unsupported sections.
 - Daemon and CLI preference for embedded TriAttention/CASK data over external
@@ -98,12 +97,6 @@ Do not run this as a required current product workflow:
    model artifact once loader support exists.
 5. Use Astrea eval/metrics for KLD, PPL, MSE, and recovered above-floor KLD.
 6. Use Atlas to validate AR and DFlash perf before any promotion claim.
-
-ParoQuant should be treated as a high-priority **transform experiment lane**,
-not a reason to invent runtime contracts. The first implementation target is
-evidence: show whether Paro-style transforms improve MQ/HFQ/HFP/MFP quality
-enough to justify new producer-consumer runtime contracts — still subject to
-VALIDATION and fail-closed [`admissions.yml`](../admissions.yml) (schema v2; no inferred rows).
 
 ## Related
 

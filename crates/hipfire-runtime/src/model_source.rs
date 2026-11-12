@@ -3,7 +3,7 @@
 //!
 //! The Architecture trait's `load_weights` and `config_from_source` consume
 //! `&dyn ModelSource` so the same loading code works for hipfire's native HFQ
-//! format and HuggingFace safetensors (ParoQuant, AWQ, etc.).
+//! format and HuggingFace safetensors (AWQ, GPTQ, raw FP, etc.).
 
 use std::fmt;
 use std::fs::File;
@@ -583,10 +583,9 @@ pub(crate) fn verify_path_identity(expected: &SourceFileIdentity) -> Result<(), 
 /// Quantization config parsed from HFQ metadata or HF config.json.
 #[derive(Debug, Clone, Default)]
 pub struct QuantConfig {
-    pub method: String,  // "paroquant", "awq", "gptq", "" (HFQ native)
+    pub method: String,  // "awq", "gptq", "" (HFQ native)
     pub bits: u8,        // 4
     pub group_size: u32, // 128
-    pub krot: u8,        // 8 for ParoQuant, 0 otherwise
     /// Regex patterns for layers excluded from quantization (kept FP16).
     pub dynamic_excludes: Vec<String>,
 }

@@ -1,9 +1,8 @@
-# hipEngine perf comparison — what hipfire is missing on Qwen3.6-35B-A3B-PARO / gfx1151
+# hipEngine perf comparison — what hipfire is missing on Qwen3.6-35B-A3B / gfx1151
 
 Read-only audit, 2026-05-20. Cross-references:
 
 - hipEngine survey: `/tmp/hipengine-survey/`
-- hipfire branch: `paroquant-a3b` worktree
 
 ## Baseline (this branch, `bench_qwen35_mq4`, prefill 256 / gen 100 / kv-mode q8 / gfx1151)
 
@@ -13,8 +12,8 @@ Read-only audit, 2026-05-20. Cross-references:
 | Decode  | 30.8 tok/s      |
 | Load    | 26.3 s          |
 
-hipEngine does NOT publish a directly comparable gfx1151 row for Qwen3.5-35B-A3B-PARO MoE: the
-retained gfx1151 row in `docs/ROOFLINE-gfx1151.md:325-327` is the 0.8B PARO model (prefill
+hipEngine does NOT publish a directly comparable gfx1151 row for Qwen3.5-35B-A3B MoE: the
+retained gfx1151 row in `docs/ROOFLINE-gfx1151.md:325-327` is the 0.8B model (prefill
 2451 tok/s, decode 145 tok/s). hipEngine's W7900/gfx1100 35B-A3B row is from
 `benchmarks/results/2026-05-16-hipengine-qwen35-comparison-tables-diagnostic.json` and the
 audit in `docs/OPTIMIZE.md:256-273` (~115 tok/s decode, ~877 dispatches/token). Direct gfx1151
@@ -27,7 +26,7 @@ methodology gaps are visible regardless.
 
 From `docs/ROOFLINE-gfx1151.md:182-217`: gfx1151 has 256 GB/s LPDDR5X theoretical, ~221 GB/s
 measured read, 59.4 TFLOP/s FP16/BF16/INT8 WMMA. Active-weight bandwidth ceiling for
-A3B-PARO (3B active params × 0.5 byte/W4 ≈ 1.5 GB/token) is **~147 tok/s** at the 221 GB/s
+A3B (3B active params × 0.5 byte/W4 ≈ 1.5 GB/token) is **~147 tok/s** at the 221 GB/s
 practical ceiling (`ROOFLINE-gfx1151.md:248-251`). KV reads + attention add ~10-20% at 256
 prefill context, so the headroom for **decode is roughly 110-130 tok/s** before bandwidth
 saturation. We are at 30.8 tok/s → **~25% of bandwidth roof**. The gap is dominated by
@@ -40,13 +39,13 @@ with room for 3-10× before hitting the FP16/BF16 WMMA roof.
 
 ---
 
-## Top-5 lever differences (ranked by suspected wall-clock impact)
+## Top-4 lever differences (ranked by suspected wall-clock impact)
 
 ### 1. Decode hipGraph capture is OFF for MoE in hipfire — DISABLED due to drift
 
 - **Description**: hipEngine captures the full decode step into a hipGraph and replays it
   with the device-side token auto-advancing
-  (`hipengine/runtime/qwen35_paro_runner.py:1469-1559`, `capture_decode_graph`). On gfx1151
+  (`capture_decode_graph`). On gfx1151
   the M.4 audit (OPTIMIZE.md:256-273) shows 877 dispatches/token; without graph replay each
   dispatch pays ~10-20 µs HIP launch overhead → 9-17 ms/token of pure launch cost.
 
@@ -65,9 +64,7 @@ with room for 3-10× before hitting the FP16/BF16 WMMA roof.
 - **Effort**: **L**. The drift bug needs root-causing first — `qwen35.rs:3787` suspects
   atomic/wavefront ordering inside `gated_delta_net_q8` reductions. Fixing it is a
   correctness investigation, then enabling is one-line.
-- **Citations (hipEngine)**: `runtime/qwen35_paro_runner.py:1469-1559`,
-  `runtime/qwen35_paro_runner.py:3282-3343` (Qwen35ParoDecodeGraph),
-  `docs/OPTIMIZE.md:255-273` (877 dispatches/token measurement).
+- **Citations (hipEngine)**: `docs/OPTIMIZE.md:255-273` (877 dispatches/token measurement).
 - **Citations (hipfire)**: `crates/hipfire-arch-qwen35/src/qwen35.rs:3765-3825`,
   `crates/hipfire-runtime/examples/bench_qwen35_mq4.rs:128-156` (DPM warmup + prefill warmup).
 - **Portability**: portable to all RDNA arches; CDNA already has HIP graph support.
@@ -100,39 +97,9 @@ with room for 3-10× before hitting the FP16/BF16 WMMA roof.
   is still sequential per token").
 - **Portability**: chunkwise GDN is architecture-agnostic and would work on all RDNA/CDNA.
 
-### 3. Multi-rotation fusion: `paro_rotate2_kernel` and `paro_rotate3_kernel`
+### 3. AWQ pack8 dot-product GEMV layout for non-expert decode (Marlin-K vec8)
 
-- **Description**: hipEngine has kernels that take **one input x** and emit it rotated under
-  **N different rotation tables** in a single launch, using grid.z to select which rotation:
-  `kernels/hip_gfx1100/rotary/paro_rotate.hip:163-219` (rotate2 — two outputs, two pairs/theta
-  tables) and `:222-330` (rotate3 — three outputs). The shared input x is read **once** and
-  the LDS rotation buffer is reused per grid.z plane.
-
-  Hipfire has fused-rmsnorm-rotate and fused-silu-rotate, but each rotation is a separate
-  launch when multiple downstream consumers need different rotated bases. From
-  `qwen35.rs:5325-5350` and `crates/rdna-compute/src/kernels.rs:335-353`, hipfire's path is:
-  one `fused_silu_mul_rotate_mq_batched_for` per consumer.
-
-- **Suspected impact**: **+3-7% decode** on MoE because the routed-experts down-projection and
-  shared-expert down-projection use different rotation tables but read the **same SwiGLU
-  intermediate** — that's exactly what `silu_mul_pair_rotate_out_kernel`
-  (`kernels/hip_gfx1100/fused/paro_silu.hip:144-197`) optimizes. Audit decode rotation cost:
-  M.4 (OPTIMIZE.md:262) measures rotation at 9.4-9.6% of decode kernel time at 160 calls/token.
-- **Prefill impact**: **+1-3%** — prefill rotation is 6.7-7.7% per OPTIMIZE.md:182, batched.
-- **Effort**: **M**. New HIP kernel + dispatch wiring; needs AWQ-aware variant. Hipfire's
-  rotation is FWHT-based, not Givens; the algorithmic structure is different, so this is a
-  port-and-adapt, not a copy.
-- **Citations (hipEngine)**: `kernels/hip_gfx1100/rotary/paro_rotate.hip:163-219`,
-  `kernels/hip_gfx1100/rotary/paro_rotate.hip:222-330`,
-  `kernels/hip_gfx1100/fused/paro_silu.hip:87-197`.
-- **Citations (hipfire)**: `crates/hipfire-arch-qwen35/src/qwen35.rs:2860, 2896, 2929, 2959,
-  5052, 5175`, `kernels/src/fused_silu_mul_mq_rotate.hip`.
-- **Portability**: portable.
-
-### 4. AWQ pack8 dot-product GEMV layout for non-expert decode (Marlin-K vec8)
-
-- **Description**: hipEngine's `gemv_awq_dual_pack8_kernel`
-  (`kernels/hip_gfx1100/quant/paro_awq_gemv.hip:612-700`) is the W4 decode workhorse: 128
+- **Description**: hipEngine's `gemv_awq_dual_pack8_kernel` is the W4 decode workhorse: 128
   threads, `__launch_bounds__(128, 4)`, 8-way packed AWQ dequant, dual-projection fusion
   (q+k or k+v same-input). hipEngine measured **+5.6% decode** at 512/128 and 4K/128 from
   porting the Marlin-K vec8 layout + qweight-neutral repack (`docs/OPTIMIZE.md:295`
@@ -146,19 +113,17 @@ with room for 3-10× before hitting the FP16/BF16 WMMA roof.
 
 - **Suspected impact**: **+5-8% decode**. Direct port of the AWQ pack8 layout for non-expert
   linears (lm_head, attention projections) — these are the W8A16-equivalent ~16% of decode
-  kernel time per M.4 (OPTIMIZE.md:257). Hipfire's lm_head is already W8A16
-  (`qwen35.rs:NANOVLLM_PARO_LM_HEAD_W8A16=1` analog in ROOFLINE-gfx1151.md:495).
+  kernel time per M.4 (OPTIMIZE.md:257). Hipfire's lm_head is already W8A16.
 - **Prefill impact**: neutral.
 - **Effort**: **M-L**. Requires repacking weights at load time (hipfire's MQ4 format would
   need an alternate pack8 storage), and a new dual-projection GEMV kernel.
-- **Citations (hipEngine)**: `kernels/hip_gfx1100/quant/paro_awq_gemv.hip:497-700` (single +
-  dual pack8 GEMV), `docs/OPTIMIZE.md:285-295` (D2.1 Marlin-K port, accepted +5.6%).
+- **Citations (hipEngine)**: `docs/OPTIMIZE.md:285-295` (D2.1 Marlin-K port, accepted +5.6%).
 - **Citations (hipfire)**: `crates/hipfire-arch-qwen35/src/qwen35.rs:2791` (fused_qkvza),
   `crates/rdna-compute/src/dispatch.rs:62, 573-603` (pack8 GEMV surface).
 - **Portability**: layout decision is RDNA-wide; gfx1100/gfx1151/gfx12 all have wave32 + dot
   variants suitable.
 
-### 5. AOTriton long-context attention and shape-bucketed graph dispatch
+### 4. AOTriton long-context attention and shape-bucketed graph dispatch
 
 - **Description**: hipEngine ships AOTriton V3 BF16 head-dim-256 forward images and uses them
   for full-attention prefill above 512 tokens
@@ -170,8 +135,7 @@ with room for 3-10× before hitting the FP16/BF16 WMMA roof.
 
   Also: hipEngine uses **shape-bucketed graph buckets** for c=1 decode at 512/4K/32K/128K
   contexts (decode graph captures different `num_splits` and split_K configurations per
-  bucket — see `runtime/qwen35_paro_runner.py:1500` `num_splits = max(1, (position +
-  replay_span + decode_chunk_size - 1) // decode_chunk_size`).
+  bucket).
 
 - **Suspected impact**: **+0% to +200% prefill at long context**, ~0% at the current bench
   shape (prefill=256 < 512 threshold so AOTriton wouldn't fire). At the bench's prefill=256
@@ -241,7 +205,7 @@ kernel-trace pass. Rank by total kernel time; expect to find:
 - If GDN kernels dominate (>20%) → win #2 (chunkwise GDN) is the lever.
 - If launch gaps dominate (sum of kernel time << wall time) → win #1 (graph) is the lever.
 - If `gemv_hfq4g256_*` and `gemv_hfq4g256_moe_*` dominate → memory bandwidth is the wall;
-  port AWQ pack8 dual layout (lever #4).
+  port AWQ pack8 dual layout (lever #3).
 
 **Expected**: not a perf win itself, but **redirects the next day's work** with hipEngine-grade
 evidence rather than guessing.
@@ -284,13 +248,7 @@ From `docs/LESSONS-LEARNED.md` and `docs/BENCHMARK.md`:
 
 ## Files of interest (hipEngine snapshot)
 
-- `/tmp/hipengine-survey/hipengine/runtime/qwen35_paro.py` — 6570-line orchestrator
-- `/tmp/hipengine-survey/hipengine/runtime/qwen35_paro_runner.py` — generator + graph capture
-- `/tmp/hipengine-survey/hipengine/kernels/hip_gfx1100/wmma/paro_awq_wmma.hip` — compact WMMA MoE prefill
 - `/tmp/hipengine-survey/hipengine/kernels/hip_gfx1100/linear_attn/gdn.hip` — recurrent GDN kernels
-- `/tmp/hipengine-survey/hipengine/kernels/hip_gfx1100/quant/paro_awq_gemv.hip` — W4 pack8 GEMV
-- `/tmp/hipengine-survey/hipengine/kernels/hip_gfx1100/rotary/paro_rotate.hip` — rotate1/2/3 multi-fused
-- `/tmp/hipengine-survey/hipengine/kernels/hip_gfx1100/fused/paro_silu.hip` — silu+rotate fusion
 - `/tmp/hipengine-survey/hipengine/kernels/hip_gfx1151/__init__.py` — gfx1151 reuses gfx1100 sources verbatim
 - `/tmp/hipengine-survey/docs/ROOFLINE-gfx1151.md:182-292` — bandwidth/compute roof model
 - `/tmp/hipengine-survey/docs/OPTIMIZE.md:245-285` — MoE decode Amdahl table (D1.x rejected
@@ -300,9 +258,9 @@ From `docs/LESSONS-LEARNED.md` and `docs/BENCHMARK.md`:
 
 ## Files of interest (hipfire, this branch)
 
-- `/home/bjoern/hipfire/.worktrees/paroquant-a3b/crates/hipfire-arch-qwen35/src/qwen35.rs:3765-3825` — MoE graph disable
-- `/home/bjoern/hipfire/.worktrees/paroquant-a3b/crates/hipfire-arch-qwen35/src/qwen35.rs:2685-2974` — MoE decode hot path
-- `/home/bjoern/hipfire/.worktrees/paroquant-a3b/crates/hipfire-arch-qwen35/src/qwen35.rs:4426-5243` — MoE prefill (Path 2 grouped-WMMA)
-- `/home/bjoern/hipfire/.worktrees/paroquant-a3b/kernels/src/gated_delta_net_q8.hip:56-86` — GDN serial-per-token loop
-- `/home/bjoern/hipfire/.worktrees/paroquant-a3b/kernels/src/gemm_hfq4g256_moe_grouped_wmma_k2.hip:43-100` — grouped-MoE WMMA
-- `/home/bjoern/hipfire/.worktrees/paroquant-a3b/crates/hipfire-runtime/examples/bench_qwen35_mq4.rs:1-200` — bench config
+- `crates/hipfire-arch-qwen35/src/qwen35.rs:3765-3825` — MoE graph disable
+- `crates/hipfire-arch-qwen35/src/qwen35.rs:2685-2974` — MoE decode hot path
+- `crates/hipfire-arch-qwen35/src/qwen35.rs:4426-5243` — MoE prefill (Path 2 grouped-WMMA)
+- `kernels/src/gated_delta_net_q8.hip:56-86` — GDN serial-per-token loop
+- `kernels/src/gemm_hfq4g256_moe_grouped_wmma_k2.hip:43-100` — grouped-MoE WMMA
+- `crates/hipfire-runtime/examples/bench_qwen35_mq4.rs:1-200` — bench config

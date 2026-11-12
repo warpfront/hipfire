@@ -339,7 +339,7 @@ Load is **source × carrier**, not a two-file hard split.
 | Source | Type | Arch id origin |
 |---|---|---|
 | HFQ / MQ* artifact | `ModelSource::Hfq(HfqFile)` | Header `HfqFile::arch_id` |
-| Safetensors / Paro directory | `ModelSource::Dir(SafetensorsSource)` | `derive_arch_id` from `config.json` (`architectures` / `model_type`) |
+| Safetensors directory | `ModelSource::Dir(SafetensorsSource)` | `derive_arch_id` from `config.json` (`architectures` / `model_type`) |
 
 Defined in `crates/hipfire-runtime/src/loader_api.rs` and
 `safetensors_source.rs`. Unrecognized dir `model_type` yields sentinel

@@ -99,11 +99,6 @@ Plus on the Rust side:
    is already a small fraction of decode time so this is a marginal win at
    best.
 
-5. **Inherits zero of paroquant's trig pain.** Paroquant cost ~512
-   transcendentals per group per gemv (8 rotation passes × 64 pairs). FWHT
-   has zero transcendentals by construction. The "trig hurt us" objection
-   to paroquant doesn't apply.
-
 ## Storage math (hd=256, identical to asym)
 
 | Mode  | K bytes/head | V bytes/head | Total K+V | bpv (K) | bpv (K+V) |

@@ -25,8 +25,8 @@ formats and the build stayed green.
 in the tree but not the table, STALE for a table row with no crate. This applies
 the same bidirectional check to the qt space, and folds the exemption problem in
 with it: `qt_unregistered <= 10` was uninterpretable because ten variants were a
-mix of deliberate non-passthrough (22 is an index tensor, 28/29 load via
-paro.rs, 31-37 via arch loaders) and genuine omissions like `cf061b7ed`, where
+mix of deliberate non-passthrough (22 is an index tensor; 28/29 retired;
+unassigned, do not reuse; 31-37 via arch loaders) and genuine omissions like `cf061b7ed`, where
 qt=40's encoder, GEMV and is_mq arms all landed and the model simply would not
 load. Declaring a disposition per row makes those two cases distinguishable.
 
@@ -57,10 +57,11 @@ QUANT_TYPE_SOURCES = (
 NEEDS_CODEC_ROW = {"passthrough": True, "host-decode": False,
                    "arch-loaded": False, "non-weight": False, "reserved": False}
 
-# `reserved` claims a number for work that has not landed yet, so it is the one
-# disposition exempt from the STALE check. Without it the register can only
-# mirror the enum, and a register that can only describe the present cannot stop
-# two branches claiming the same number -- which is the case it exists for.
+# `reserved` holds a number that has no variant: claimed for work that has not
+# landed yet, or retired and never reused. It is the one disposition exempt from
+# the STALE check. Without it the register can only mirror the enum, and a register
+# that can only describe the present cannot stop two branches claiming the same
+# number -- which is the case it exists for.
 RESERVED = "reserved"
 
 

@@ -48,8 +48,6 @@ GGUF_SUMMARY_SCHEMA = "hipfire.astrea.gguf_summary.v0"
 HFQ_SUMMARY_SCHEMA = "hipfire.astrea.hfq_summary.v0"
 IMATRIX_HFQ_JOIN_SCHEMA = "hipfire.astrea.imatrix_hfq_join.v0"
 SAFETENSORS_SUMMARY_SCHEMA = "hipfire.astrea.safetensors_summary.v0"
-PARO_PROBE_SCHEMA = "hipfire.astrea.paro_probe.v0"
-PARO_IMPORT_SCHEMA = "hipfire.astrea.paro_import.v0"
 
 SUPPORTED_FORMATS = {
     "mq3",
@@ -59,7 +57,6 @@ SUPPORTED_FORMATS = {
     "hfq6",
     "hfp4",
     "mfp4",
-    "paro4",
     "q8",
     "f16",
 }
@@ -77,7 +74,6 @@ SUPPORTED_METHODS = {
     "kmap",
     "fwht",
     "quarot",
-    "paroquant",
     "roundtrip-eval",
     "gptq-probe",
     "awq-probe",
@@ -112,7 +108,6 @@ DEFAULT_METHOD_STAGE = {
     "imatrix-kmap": "promotion",
     "fwht": "transform",
     "quarot": "transform",
-    "paroquant": "transform",
     "roundtrip-eval": "eval",
     "moe-probe": "probe",
     "model-ingress": "ingress",
@@ -150,7 +145,6 @@ SUPPORTED_KV_MODES = {
 
 SUPPORTED_BUNDLE_INCLUDES = {
     "weights",
-    "paro",
     "kv-policy",
     "triattn",
     "evidence",
@@ -210,8 +204,8 @@ HFQ_QUANT_TYPE_NAMES = {
     21: "HFP4G32",
     22: "TidI32",
     24: "MFP4G32",
-    28: "PARO4G128",
-    29: "PARO4G128T",
+    # 28  retired  reserved  retired; unassigned, do not reuse
+    # 29  retired  reserved  retired; unassigned, do not reuse
     30: "MQ4G256_LLOYD",
     31: "MQ5G256",
     32: "MFP4G32_LLOYD",
@@ -1860,7 +1854,9 @@ def write_policy_promotion_candidate(
     for record in layout["records"]:
         if record["name"] not in selected_names:
             continue
-        tensor_format = HFQ_QUANT_TYPE_FORMATS.get(record["quant_type_name"], "unknown")
+        tensor_format = HFQ_QUANT_TYPE_FORMATS.get(record["quant_type_name"])
+        if tensor_format is None:
+            raise ValueError(f"unsupported quant type: {record['quant_type_name']}")
         if tensor_format != policy.get("base_format"):
             raise ValueError(
                 f"selected tensor {record['name']} is {tensor_format}, expected {policy.get('base_format')}"
@@ -2512,6 +2508,8 @@ def build_recipe(methods, recipe_stages=None):
 
 
 def inspect_model(model, *, imatrix=None, quant_format=None):
+    if quant_format:
+        validate_values([quant_format], SUPPORTED_FORMATS, "quant type")
     result = {
         "schema": INSPECT_SCHEMA,
         "captured_at_utc": utc_now(),
@@ -2558,8 +2556,8 @@ def build_plan(
         raise ValueError("at least one --format is required")
     if not methods:
         raise ValueError("at least one --method is required")
-    validate_values(formats, SUPPORTED_FORMATS, "format")
-    validate_values(methods, SUPPORTED_METHODS, "method")
+    validate_values(formats, SUPPORTED_FORMATS, "quant type")
+    validate_values(methods, SUPPORTED_METHODS, "quantization method")
     recipe = build_recipe(methods, recipe_stages=recipe_stages)
 
     model_name = Path(model).name.replace(".", "-").replace("/", "-")
@@ -3073,18 +3071,10 @@ def build_policy_probe_plan(objectives, ingress):
 
 def build_weight_transform_plan(methods):
     plan = {}
-    if "paroquant" in methods:
-        plan["paroquant"] = {
-            "status": "planned",
-            "transform": "channel-wise scaling plus independent pairwise Givens rotations",
-            "first_probe": "optimize a single layer or small model in PyTorch, then compare KLD/PPL before any runtime mutation",
-            "runtime_requirement": "fused inverse transform plus quant matvec kernel must pass Atlas AR/DFlash perf gates",
-            "package_section": "transform.paro",
-        }
     if "quarot" in methods:
         plan["quarot"] = {
             "status": "candidate",
-            "transform": "orthogonal rotation baseline for comparison against ParoQuant",
+            "transform": "orthogonal rotation baseline",
             "package_section": "transform.quarot",
         }
     return plan
@@ -3104,9 +3094,9 @@ def build_policy(
     model_family=None,
     policy_id=None,
 ):
-    validate_values([base_format, promotion_format], SUPPORTED_FORMATS, "format")
+    validate_values([base_format, promotion_format], SUPPORTED_FORMATS, "quant type")
     methods = methods or []
-    validate_values(methods, SUPPORTED_METHODS, "method")
+    validate_values(methods, SUPPORTED_METHODS, "quantization method")
     objectives = objectives or ["dynamic-tensor-policy"]
     validate_values(objectives, SUPPORTED_POLICY_OBJECTIVES, "policy objective")
     domains = domains or ["weights"]
@@ -3428,13 +3418,6 @@ def build_bundle_plan(
             "source": file_summary(model),
             "description": "existing HFQ tensor index and contiguous tensor payloads",
         }
-    if "paro" in include:
-        sections["transform.paro"] = {
-            "required": False,
-            "policy_id": policy_id,
-            "description": "ParoQuant channel scales and independent pairwise rotation parameters",
-            "runtime_status": "deferred_until_loader_and_fused_kernel_exist",
-        }
     if "kv-policy" in include:
         sections["kv.policy"] = {
             "required": False,
@@ -3508,63 +3491,6 @@ def build_report(paths):
         "metric_verdicts": [item.get("verdict") for item in metric_items],
         "recommendation": recommendation,
     }
-
-
-def load_paroquant_import_module():
-    import importlib.util
-
-    script_path = Path(__file__).with_name("paroquant_import.py")
-    spec = importlib.util.spec_from_file_location("hipfire_paroquant_import", script_path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"could not load {script_path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def load_paroquant_oracle_module():
-    import importlib.util
-
-    script_path = Path(__file__).with_name("paroquant_oracle.py")
-    spec = importlib.util.spec_from_file_location("hipfire_paroquant_oracle", script_path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"could not load {script_path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def paro_probe_model(model, *, local_only=False, max_modules=None):
-    module = load_paroquant_import_module()
-    return module.probe_model(model, local_only=local_only, max_modules=max_modules)
-
-
-def paro_import_model(model, output, *, local_only=False, max_modules=None, layout="native", copy_floats="f16"):
-    module = load_paroquant_import_module()
-    return module.import_model(
-        model,
-        output,
-        local_only=local_only,
-        max_modules=max_modules,
-        layout=layout,
-        copy_floats=copy_floats,
-    )
-
-
-def paro_oracle_model(source, hfq, *, module_name=None, local_only=False, samples=2, seed=1234, input_scale=0.125, atol=0.0):
-    module = load_paroquant_oracle_module()
-    args = argparse.Namespace(
-        source=source,
-        hfq=hfq,
-        module=module_name,
-        local_only=local_only,
-        samples=samples,
-        seed=seed,
-        input_scale=input_scale,
-        atol=atol,
-        pretty=False,
-    )
-    return module.run_oracle(args)
 
 
 def build_parser():
@@ -3685,35 +3611,6 @@ def build_parser():
     bundle_plan.add_argument("--bundle-id")
     bundle_plan.add_argument("--pretty", action="store_true")
     bundle_plan.add_argument("--out", help="Write JSON to this path instead of stdout.")
-
-    paro_probe = sub.add_parser("paro-probe", help="Inspect a ParoQuant checkpoint and runtime contract.")
-    paro_probe.add_argument("--model", required=True)
-    paro_probe.add_argument("--local-only", action="store_true")
-    paro_probe.add_argument("--max-modules", type=int)
-    paro_probe.add_argument("--pretty", action="store_true")
-    paro_probe.add_argument("--out", help="Write JSON to this path instead of stdout.")
-
-    paro_import = sub.add_parser("paro-import", help="Write a runtime-loadable PARO4G128 HFQ model.")
-    paro_import.add_argument("--model", required=True)
-    paro_import.add_argument("--output", required=True)
-    paro_import.add_argument("--local-only", action="store_true")
-    paro_import.add_argument("--max-modules", type=int)
-    paro_import.add_argument("--layout", choices=("native", "engine"), default="native")
-    paro_import.add_argument("--copy-floats", choices=("f16", "q8"), default="f16")
-    paro_import.add_argument("--pretty", action="store_true")
-    paro_import.add_argument("--out", help="Write JSON to this path instead of stdout.")
-
-    paro_oracle = sub.add_parser("paro-oracle", help="Compare PARO4G128 HFQ bytes against a PyTorch Paro decode oracle.")
-    paro_oracle.add_argument("--source", required=True, help="ParoQuant safetensors directory or HuggingFace repo id.")
-    paro_oracle.add_argument("--hfq", required=True, help="HFQ file produced by astrea paro-import.")
-    paro_oracle.add_argument("--module", dest="module_name", help="Paro module base name; defaults to the first complete module.")
-    paro_oracle.add_argument("--local-only", action="store_true")
-    paro_oracle.add_argument("--samples", type=int, default=2)
-    paro_oracle.add_argument("--seed", type=int, default=1234)
-    paro_oracle.add_argument("--input-scale", type=float, default=0.125)
-    paro_oracle.add_argument("--atol", type=float, default=0.0)
-    paro_oracle.add_argument("--pretty", action="store_true")
-    paro_oracle.add_argument("--out", help="Write JSON to this path instead of stdout.")
 
     report = sub.add_parser("report", help="Summarize Astrea JSON artifacts.")
     report.add_argument("artifacts", nargs="+")
@@ -3848,44 +3745,6 @@ def run(argv=None):
                 triattn=args.triattn,
                 policy_id=args.policy_id,
                 bundle_id=args.bundle_id,
-            ),
-            pretty=args.pretty,
-            out=args.out,
-        )
-    elif args.command == "paro-probe":
-        write_json(
-            paro_probe_model(
-                args.model,
-                local_only=args.local_only,
-                max_modules=args.max_modules,
-            ),
-            pretty=args.pretty,
-            out=args.out,
-        )
-    elif args.command == "paro-import":
-        write_json(
-            paro_import_model(
-                args.model,
-                args.output,
-                local_only=args.local_only,
-                max_modules=args.max_modules,
-                layout=args.layout,
-                copy_floats=args.copy_floats,
-            ),
-            pretty=args.pretty,
-            out=args.out,
-        )
-    elif args.command == "paro-oracle":
-        write_json(
-            paro_oracle_model(
-                args.source,
-                args.hfq,
-                module_name=args.module_name,
-                local_only=args.local_only,
-                samples=args.samples,
-                seed=args.seed,
-                input_scale=args.input_scale,
-                atol=args.atol,
             ),
             pretty=args.pretty,
             out=args.out,

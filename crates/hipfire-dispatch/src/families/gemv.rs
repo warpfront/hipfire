@@ -29,15 +29,6 @@ fn reject_mq4g128v2() -> Result<(), DispatchError> {
 
 // ── Lightweight weight descriptor ──────────────────────
 
-/// Givens rotation metadata for ParoQuant weights (mirrors ParoRotation
-#[derive(Clone, Copy)]
-pub struct GivensRef<'a> {
-    pub pairs: &'a GpuTensor,
-    pub theta: &'a GpuTensor,
-    pub scales: &'a GpuTensor,
-    pub krot: usize,
-}
-
 #[derive(Clone, Copy)]
 pub struct WeightRef<'a> {
     pub buf: &'a GpuTensor,
@@ -45,7 +36,6 @@ pub struct WeightRef<'a> {
     pub m: usize,
     pub k: usize,
     pub row_stride: usize,
-    pub rotation: Option<GivensRef<'a>>,
     pub awq_scale: Option<&'a GpuTensor>,
     /// MQ4G256V2-Lloyd (qt=52) centered codebook LUTs, copied from
     /// `WeightTensor` by `dispatch_ref`. `Some` iff the tensor was correctly
@@ -164,7 +154,6 @@ pub fn select_rotation_variant(
 ) -> RotationVariant {
     match plan {
         RotationPlan::FwhtG128 => RotationVariant::PlainG128,
-        RotationPlan::Givens => RotationVariant::Givens,
         RotationPlan::Mq8Internal => {
             if has_norm {
                 RotationVariant::WithRmsnorm
@@ -241,8 +230,7 @@ impl GemvFamily {
 
     /// Run a GEMV with automatic variant selection.
     ///
-    /// Uses `dtype_post_rotation_variant` so ParoQ4G128 resolves to Plain
-    /// (rotate-then-HFQ4G128) and MQ-family to Prerotated.
+    /// Uses `dtype_post_rotation_variant` so MQ-family resolves to Prerotated.
     pub fn run_auto(
         &self,
         ctx: &DispatchCtx,
@@ -481,7 +469,6 @@ impl GemvFamily {
             inputs.swiglu_up.is_some(),
         );
         let (x_rot, awq, batched) = prepare_rotation_scratch(gpu, w, inputs)?;
-        let g = w.rotation.as_ref();
         self.rotation
             .run(
                 ctx,
@@ -497,12 +484,6 @@ impl GemvFamily {
                     eps: inputs.eps,
                     batch_size: inputs.batch_size,
                     variant,
-                    givens_pairs: g.map(|g| g.pairs),
-                    givens_theta: g.map(|g| g.theta),
-                    givens_scales: g.map(|g| g.scales),
-                    givens_krot: g.map(|g| g.krot),
-                    // The rotation block is the weight dtype's group, never sidecar metadata.
-                    givens_group_size: w.dtype.paro_group_size(),
                 },
             )
             .map_err(|e| DispatchError::Hip(e.to_string()))?;
@@ -549,19 +530,6 @@ fn prepare_rotation_scratch(
                 .map_err(|e| DispatchError::Hip(e.to_string()))?;
             Ok((mq(gpu)?, awq, batched))
         }
-        RotationPlan::Givens => {
-            gpu.ensure_paro_scratch(w.k)
-                .map_err(|e| DispatchError::Hip(e.to_string()))?;
-            Ok((
-                GpuTensor {
-                    buf: unsafe { gpu.scratch.paro_x_scratch.as_ref().unwrap().buf.alias() },
-                    shape: vec![w.k],
-                    dtype: DType::F32,
-                },
-                awq,
-                batched,
-            ))
-        }
         RotationPlan::None => Err(DispatchError::UnsupportedVariant {
             family: "gemv",
             variant: "rotate-none",
@@ -596,8 +564,7 @@ fn launch(gpu: &mut Gpu, key: KernelKey, p: &GemvParams) -> Result<(), DispatchE
         K::GemvQ4K => hip!(gpu.gemv_q4k(w.buf, x, y, m, k)),
         K::GemvQ6K => hip!(gpu.gemv_q6k(w.buf, x, y, m, k)),
         K::GemvHfq4G256 => hip!(gpu.gemv_hfq4g256(w.buf, x, y, m, k)),
-        K::GemvHfq4G128 | K::GemvParoQ4G128 => hip!(gpu.gemv_hfq4g128(w.buf, x, y, m, k)),
-        K::GemvParoQ4G64 => hip!(gpu.gemv_hfq4g64(w.buf, x, y, m, k)),
+        K::GemvHfq4G128 => hip!(gpu.gemv_hfq4g128(w.buf, x, y, m, k)),
         K::GemvHfq3G256 => hip!(gpu.gemv_hfq3g256(w.buf, x, y, m, k)),
         K::GemvHfq3G128 => hip!(gpu.gemv_hfq3g128(w.buf, x, y, m, k)),
         K::GemvHfq2G256 => hip!(gpu.gemv_hfq2g256(w.buf, x, y, m, k)),
@@ -741,7 +708,7 @@ fn dispatch_swiglu_residual(gpu: &mut Gpu, params: &GemvParams) -> Result<(), Di
     // The caller pre-computes silu(gate)*up into `gate` (MQ-family: also
     // pre-rotated via fused_silu_mul_rotate_mq); the GEMV is then the plain
     // residual kernel over that input. True fused SwiGLU+Residual kernels
-    // (PARO) are not yet wired here.
+    // are not yet wired here.
     let x_in = params.gate.ok_or_else(|| DispatchError::MissingImpl {
         key: KernelKey::GemvF32,
     })?;
@@ -818,8 +785,6 @@ mod residual_coverage_tests {
             TQ2G128,
             BQ1G128,
             HFQ6G256,
-            ParoQ4G128,
-            ParoQ4G64,
             FP8E4M3B128,
             FP8E4M3PT,
             HC8E4M3Row,

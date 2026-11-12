@@ -47,7 +47,6 @@ impl RoutedExpertWeights for RoutedViews {
             m,
             k,
             row_stride,
-            rotation: None,
             awq_scale: None,
             lloyd_lut_e4m3: None,
             lloyd_lut_f16: None,

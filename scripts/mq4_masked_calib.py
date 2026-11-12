@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Masked flat-MQ4 calibration for Qwen3.5 experiments.
 
-This is a PoC for the "Paro/QAT-style quality at flat MQ4 runtime cost" lane.
+This is a PoC for the "QAT-style quality at flat MQ4 runtime cost" lane.
 It keeps the output HFQ structurally identical to the base MQ4 file and only
 re-packs selected MQ4 tensors. The main calibration signal is the diagonal of
 the *rotated* activation covariance, which matches MQ4's FWHT-at-runtime dot

@@ -578,12 +578,6 @@ pub struct FeatureFlags {
     // ── MoE prefill (Ship 4.2) ────────────────────────────────────
     /// Grouped-GEMM MoE prefill gate (HIPFIRE_MOE_GROUPED_GEMM). Default ON.
     pub moe_grouped_gemm: bool,
-    /// gfx1151 i8 MMQ opt-in for Paro grouped GEMM (HIPFIRE_MOE_PARO_I8).
-    /// None = arch-default (gfx1151 → true, else false).
-    pub moe_paro_i8: Option<bool>,
-    /// gfx1151 i8 MMQ k8 opt-in for Paro grouped GEMM (HIPFIRE_MOE_PARO_I8_K8).
-    /// None = arch-default (gfx1151 → true, else false).
-    pub moe_paro_i8_k8: Option<bool>,
 
     // ── Graph / capture / deterministic ─────────────────────────────
     pub graph_forward: Option<bool>,
@@ -1553,8 +1547,6 @@ impl FeatureFlags {
                 Some("0") | Some("off") => false,
                 _ => true,
             },
-            moe_paro_i8: parse_bool("HIPFIRE_MOE_PARO_I8"),
-            moe_paro_i8_k8: parse_bool("HIPFIRE_MOE_PARO_I8_K8"),
 
             // Graph / capture / deterministic
             graph_forward: parse_bool("HIPFIRE_GRAPH"),
@@ -2643,8 +2635,6 @@ impl FeatureFlags {
             moe_hfq6_i8: false,
             moe_hfq6_v2: false,
             moe_grouped_gemm: true,
-            moe_paro_i8: None,
-            moe_paro_i8_k8: None,
             graph_forward: None,
             graph_ar: true,
             graph_moe: true,

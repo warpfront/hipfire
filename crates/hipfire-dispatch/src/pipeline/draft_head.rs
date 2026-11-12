@@ -781,7 +781,6 @@ impl DraftHead {
                         .dtype
                         .row_bytes(self.hidden)
                         .unwrap_or(self.hidden * ranking_head.dtype.size()),
-                    rotation: None,
                     awq_scale: None,
                     lloyd_lut_e4m3: None,
                     lloyd_lut_f16: None,
@@ -851,7 +850,6 @@ impl DraftHead {
                         .dtype
                         .row_bytes(self.hidden)
                         .unwrap_or(self.hidden * half.dtype.size()),
-                    rotation: None,
                     awq_scale: None,
                     lloyd_lut_e4m3: None,
                     lloyd_lut_f16: None,

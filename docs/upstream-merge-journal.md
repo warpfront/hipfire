@@ -15,15 +15,15 @@
 > Current-tree evidence for action item #1 (checked against the beta
 > source): the `GemvResidual` else-branch in
 > `crates/hipfire-dispatch/src/pipeline/steps.rs` calls
-> `gemv.run_auto(...)` (with a comment that `Plain` would skip the Givens
-> rotation for `ParoQ4G128`), and `families/gemv.rs` no longer carries the
-> `ParoQ4G128` arm in `dispatch_residual`. The guardrail test
+> `gemv.run_auto(...)` (with a comment that `Plain` would skip the rotation
+> for the rotation-INT4 dtype), and `families/gemv.rs` no longer carries the
+> rotation-INT4 arm in `dispatch_residual`. The guardrail test
 > `crates/hipfire-dispatch/src/coverage_tests.rs` is in tree.
 
 **Date:** 2026-06-05  
 **Upstream remote:** https://github.com/warpfront/hipfire.git  
 **Upstream/master HEAD:** `02634f4c` (same as our local master — fully in sync)  
-**Our branch HEAD:** `715f966c` refactor(dispatch): route ParoQ4G128 through per-op gemv path (Phase 2c)  
+**Our branch HEAD:** `715f966c` refactor(dispatch): route rotation-INT4 through per-op gemv path (Phase 2c)  
 **Commits behind upstream/master:** 0  
 **Commits ahead of upstream/master:** 79  
 
@@ -41,7 +41,7 @@ Our branch has **1 commit** not in upstream/integration:
 
 | SHA | Message |
 |-----|---------|
-| `715f966c` | refactor(dispatch): route ParoQ4G128 through per-op gemv path (Phase 2c) |
+| `715f966c` | refactor(dispatch): route rotation-INT4 through per-op gemv path (Phase 2c) |
 
 ---
 
@@ -54,7 +54,7 @@ Our branch has **1 commit** not in upstream/integration:
 | `b79d9fc6` | fix(runtime): weight_gemv_prerotated double-rotates pre-rotated xr (#393) |
 | `3c8a7f4d` | fix(dispatch): restore MoE CPU-top-K generic fallback dropped by #393 |
 | `a4e226dd` | fix(gemm,llama): admit gfx12/RDNA4 in 3 WMMA arch gates (dead-gate sweep) |
-| `5a9083a3` | fix(dispatch): wire Q8_0 + ParoQ4G128 through residual & prerotated GEMV |
+| `5a9083a3` | fix(dispatch): wire Q8_0 + rotation-INT4 through residual & prerotated GEMV |
 | `6d2500a2` | test(dispatch): (op×dtype×arch) coverage guardrail — catches missing-arm panics at CI |
 
 Also available: `upstream/docs/dispatch-phase0-decisions` (`5b8432cb` docs(dispatch): #397 Phase 0 contract decision spike) — informational doc only, no code.
@@ -77,12 +77,12 @@ All other files are additive (new file or non-overlapping edits).
 |------|---------------|-------|
 | `crates/hipfire-dispatch/src/coverage_tests.rs` | UPSTREAM-APPLIES-CLEAN | New file — GPU-free guardrail test suite. Purely additive. |
 | `crates/hipfire-dispatch/src/lib.rs` | UPSTREAM-APPLIES-CLEAN | Adds `mod coverage_tests`. No overlap with our changes. |
-| `crates/hipfire-dispatch/src/pipeline/steps.rs` | NEEDS-ADAPTATION | Upstream GemvResidual fallback calls `gemv.run(Plain)` which skips Givens rotation for ParoQ4G128. See action item #1. |
-| `crates/hipfire-dispatch/src/types.rs` | MERGE-TRIVIAL | Auto-merged. Upstream adds Q8_0 + ParoQ4G128 to `for_gemv_prerotated` and rotation-free dtype fallback. Our commit deleted 3 Fused Paro KernelKey variants. Regions are disjoint. |
+| `crates/hipfire-dispatch/src/pipeline/steps.rs` | NEEDS-ADAPTATION | Upstream GemvResidual fallback calls `gemv.run(Plain)` which skips rotation for rotation-INT4. See action item #1. |
+| `crates/hipfire-dispatch/src/types.rs` | MERGE-TRIVIAL | Auto-merged. Upstream adds Q8_0 + rotation-INT4 to `for_gemv_prerotated` and rotation-free dtype fallback. Our commit deleted 3 fused rotation-INT4 KernelKey variants. Regions are disjoint. |
 | `crates/hipfire-dispatch/src/families/moe.rs` | UPSTREAM-APPLIES-CLEAN | Upstream adds `routed_experts`+`gate_up_buf` to `MoeParams` struct. Our branch didn't change this struct. |
 | `crates/hipfire-dispatch/src/pipeline/mod.rs` | UPSTREAM-APPLIES-CLEAN | Upstream adds `run_moe_decode_cpu_fallback`. No overlap with our additions to this file. |
-| `crates/hipfire-dispatch/src/families/gemv.rs` | NEEDS-ADAPTATION | Our `dispatch_residual` for ParoQ4G128 (gemv+add_inplace) becomes dead code once steps.rs uses the upstream `else` branch. See action item #1. |
-| `crates/hipfire-arch-qwen35/src/qwen35.rs` | MERGE-TRIVIAL | Auto-merged. Upstream adds: MQ8 INT8 early-return in `rmsnorm_rotate_dispatch`, MoE CPU fallback calller + `routed_experts`/`gate_up_buf` population. Our commit: QKV Givens path branching. Regions disjoint. Verify post-merge (see action item #2). |
+| `crates/hipfire-dispatch/src/families/gemv.rs` | NEEDS-ADAPTATION | Our `dispatch_residual` for rotation-INT4 (gemv+add_inplace) becomes dead code once steps.rs uses the upstream `else` branch. See action item #1. |
+| `crates/hipfire-arch-qwen35/src/qwen35.rs` | MERGE-TRIVIAL | Auto-merged. Upstream adds: MQ8 INT8 early-return in `rmsnorm_rotate_dispatch`, MoE CPU fallback calller + `routed_experts`/`gate_up_buf` population. Our commit: QKV rotation-INT4 path branching. Regions disjoint. Verify post-merge (see action item #2). |
 | `crates/hipfire-runtime/src/llama.rs` | UPSTREAM-APPLIES-CLEAN | Upstream fixes double-rotation (`gemv.run_auto` → `gemv.run(Prerotated)` in `weight_gemv_prerotated`) + gfx12 Q8 prefill gate (`has_wmma_w32()` → `has_wmma()`). Our branch also modified llama.rs (earlier); regions are disjoint, auto-merge correct. |
 | `crates/rdna-compute/src/gemm.rs` | UPSTREAM-APPLIES-CLEAN | Upstream widens 2 WMMA gates for HFQ4G256 and HFQ6G256 batched lmhead on gfx12. Our branch didn't touch these sites. |
 
@@ -90,7 +90,7 @@ All other files are additive (new file or non-overlapping edits).
 
 ## Required adaptations (action items)
 
-### Action item #1 — `steps.rs` GemvResidual + ParoQ4G128 Givens rotation (BLOCKING)
+### Action item #1 — `steps.rs` GemvResidual + rotation-INT4 dtype (BLOCKING)
 
 **File:** `crates/hipfire-dispatch/src/pipeline/steps.rs`
 
@@ -98,27 +98,27 @@ All other files are additive (new file or non-overlapping edits).
 ```rust
 gemv.run(ctx, gpu, &GemvParams { w, x, y: &tmp, variant: GemvVariant::Plain, ... })
 ```
-`GemvFamily::run(..., Plain)` calls `launch()` directly — it does NOT apply the Givens rotation. For ParoQ4G128, `gemv_hfq4g128` receives un-rotated `fa_attn_out` → wrong output.
+`GemvFamily::run(..., Plain)` calls `launch()` directly — it does NOT apply the rotation. For rotation-INT4, `gemv_hfq4g128` receives un-rotated `fa_attn_out` → wrong output.
 
-The upstream comment ("plain GEMV applies the dtype's own rotation") is only true for Q8_0 (no rotation). It is WRONG for ParoQ4G128.
+The upstream comment ("plain GEMV applies the dtype's own rotation") is only true for Q8_0 (no rotation). It is WRONG for rotation-INT4.
 
 **Fix:** Replace `gemv.run(...)` in the else branch with `gemv.run_auto()`:
 
 ```rust
-// Before (upstream else branch — wrong for ParoQ4G128):
+// Before (upstream else branch — wrong for rotation-INT4):
 gemv.run(ctx, gpu, &GemvParams {
     w, x, y: &tmp, variant: GemvVariant::Plain,
     residual: None, gate: None, up: None,
 })?;
 
-// After — run_auto applies Givens rotation internally via run_input(RotInput::Raw):
+// After — run_auto applies the rotation internally via run_input(RotInput::Raw):
 gemv.run_auto(ctx, gpu, w, x, &tmp)?;
 ```
 
-**Consequence:** The `ParoQ4G128` arm in `dispatch_residual` (`crates/hipfire-dispatch/src/families/gemv.rs:439-449`) becomes unreachable dead code. Remove it:
+**Consequence:** The rotation-INT4 arm in `dispatch_residual` (`crates/hipfire-dispatch/src/families/gemv.rs:439-449`) becomes unreachable dead code. Remove it:
 ```rust
 // DELETE this arm from dispatch_residual():
-ParoQ4G128 => {
+<rotation-INT4 arm> => {
     let tmp = gpu.alloc_tensor(&[m], DType::F32)...
     ...
 }
@@ -128,7 +128,7 @@ ParoQ4G128 => {
 ```bash
 cargo test -p hipfire-dispatch coverage_tests
 ```
-Then test PARO o_proj decode coherence with an A3B model.
+Then test rotation-INT4 o_proj decode coherence with an A3B model.
 
 ---
 
@@ -171,7 +171,7 @@ These branches were fetched but not analyzed in detail — worth checking before
 ```bash
 # Apply in commit order (oldest first):
 git cherry-pick 6d2500a2  # test: coverage guardrail
-git cherry-pick 5a9083a3  # fix: Q8_0 + Paro residual/prerotated  ← THEN APPLY ACTION ITEM #1
+git cherry-pick 5a9083a3  # fix: Q8_0 + rotation-INT4 residual/prerotated  ← THEN APPLY ACTION ITEM #1
 git cherry-pick a4e226dd  # fix: gfx12 WMMA gates
 git cherry-pick 3c8a7f4d  # fix: MoE CPU fallback  ← THEN VERIFY ACTION ITEM #2
 git cherry-pick b79d9fc6  # fix: double-rotation in weight_gemv_prerotated

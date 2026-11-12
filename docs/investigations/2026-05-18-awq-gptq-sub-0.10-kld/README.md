@@ -32,7 +32,7 @@ v3 is **−61% KLD vs flat-mq4 at +0 bytes on disk**. Beats prior best `cand151-
 - **Engine binary state**: `awq-kmap-bench` worktree at origin/master HEAD post-PR-#273 (`a99b4643` or later) plus iterative pipeline overlay
 - **Imatrix**: unsloth-published Qwen3.5-9B imatrix at `~/.hipfire/imatrix/unsloth/Qwen3.5-9B-GGUF/imatrix_unsloth.gguf_file`
 - **Calibration corpus**: `benchmarks/calib/calib-1m.txt`
-- **Calibration Hessian** (reused across all GPTQ experiments): `~/hipfire/.worktrees/paroquant/.codeinsight+research/astrea/mq4-gptq-9b-poc/20260515T-start/hessian-linear-c64-ctx256/stats-merged.npz` (814 MB, c64 chunks at ctx=256)
+- **Calibration Hessian** (reused across all GPTQ experiments): `~/hipfire/.worktrees/<worktree>/.codeinsight+research/astrea/mq4-gptq-9b-poc/20260515T-start/hessian-linear-c64-ctx256/stats-merged.npz` (814 MB, c64 chunks at ctx=256)
 
 ## Reproducibility commitments
 

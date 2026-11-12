@@ -2783,22 +2783,6 @@ pub static FIELDS: &[ConfigField] = &[
         "Override grouped MoE i8 dispatch."
     ),
     process_auto_bool_field!(
-        "kernel.moe_paro_i8",
-        "moe_paro_i8",
-        Kernel,
-        true,
-        "HIPFIRE_MOE_PARO_I8",
-        "Override architecture-selected Paro grouped-GEMM i8 dispatch."
-    ),
-    process_auto_bool_field!(
-        "kernel.moe_paro_i8_k8",
-        "moe_paro_i8_k8",
-        Kernel,
-        true,
-        "HIPFIRE_MOE_PARO_I8_K8",
-        "Override architecture-selected Paro grouped-GEMM i8 K8 dispatch."
-    ),
-    process_auto_bool_field!(
         "kernel.rdna3_hfq4_qkvza_k2048",
         "rdna3_hfq4_qkvza_k2048",
         Kernel,

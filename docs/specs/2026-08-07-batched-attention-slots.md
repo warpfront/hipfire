@@ -136,7 +136,7 @@ widening SP1 now.
 
 ### 4.4 Trap to remember
 
-`QWEN35_PARO_POLICY` deliberately omits `Asym3` from its `accepted` set, so
+The retired rotation-INT4 loader policy deliberately omits `Asym3` from its `accepted` set, so
 `HIPFIRE_KV_MODE=asym3` **silently yields q8** on that loader path
 (`kv_mode.rs:84`). That is easy to misread as a broken kernel or a no-op
 optimisation. Any asym3 measurement must first confirm the resolved mode from
@@ -472,7 +472,7 @@ target.
 - **Split-K changes accumulation order**, so golden tests are tolerance-based;
   a regression that shifts numerics slightly could hide inside tolerance. The
   isolation test is the sharper instrument and should gate merges.
-- **asym3 could silently resolve to q8** on the PaRo loader path (§4.4), making
+- **asym3 could silently resolve to q8** on the retired rotation-INT4 loader path (§4.4), making
   a completely unimplemented asym3 arm pass every test and show no speedup. Every
   asym3 result must carry the resolved-mode log line as evidence.
 - **asym3 is not the shipped default for these models**, so widening scope to it

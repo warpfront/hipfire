@@ -128,7 +128,7 @@ impl GpuTensor {
   `output.buf = token_embd.shallow_clone()`. No re-read of `embed_tokens.weight`,
   no second upload — **saves `vocab × dim × dtype_bytes` of VRAM**. The
   `WeightTensor` carries the embedding's dtype (via `embedding_format_dtype`),
-  `m = vocab`, `k = dim`, `paro: None`, `awq_scale: None`. Set the weights
+  `m = vocab`, `k = dim`, `awq_scale: None`. Set the weights
   struct's `lm_head_aliases_embd = true`.
 
 - **Multi-GPU / cross-device (qwen35 `output_device != 0`):** a cross-GPU alias
@@ -152,7 +152,7 @@ pub fn embedding_format_dtype(fmt: EmbeddingFormat) -> DType;
   when `tied_lm_head` is true; frees it otherwise.
 - **qwen35**: add `lm_head_aliases_embd: bool` to `Qwen35Weights`.
   - `free_gpu` (`:684`): skip `self.output.free_all(gpu)` when
-    `lm_head_aliases_embd` (the alias has no owned buf, and `paro`/`awq_scale`
+    `lm_head_aliases_embd` (the alias has no owned buf, and `awq_scale`
     are `None` on a tied lm_head, so skipping `free_all` entirely is safe).
   - `free_gpu_multi` (`:761`): always `false` — the multi path never aliases, so
     `self.output.free_all(...)` runs unchanged.

@@ -1,7 +1,7 @@
 # Cross-arch `WeightBackend` adoption (qwen2 + llama) — Design
 
 **Date:** 2026-06-11
-**Branch:** `feature/paro-transparent-loading`
+**Branch:** `feature/transparent-loading`
 **Status:** design (approved)
 **Context:** Gap #2 from the unified-loading review
 (`unified-loading-review-todos` memory). qwen35 already runs all three of its
@@ -54,7 +54,7 @@ fn bias(&mut self, rel: &str, n: usize) -> HipResult<GpuTensor>;
 
 - `HfqBackend::bias` wraps today's qwen2 `load_bias_f32` logic (resolve via
   `self.candidates`, dequant/upload as f32, length `n`).
-- `ParoBackend::bias` returns `Err("ParoBackend: biases unsupported")` — no PARO
+- The safetensors backend's `bias` returns `Err("biases unsupported")` — no safetensors-format
   arch carries attention biases. Honest dead surface (accepted trade-off).
 
 qwen35 and llama walks never call `bias()`.
@@ -88,7 +88,7 @@ qwen35 and llama walks never call `bias()`.
   `self_attn.q_proj.bias`).
 - Delete qwen2's local `load_weight_tensor`, `load_norm_weight_raw`,
   `load_bias_f32` once unused (the `TODO(transformer-extraction)` helpers).
-- No Dir/PARO path is added (none exists; `Qwen2Carrier` is HFQ-only).
+- No Dir/safetensors path is added (none exists; `Qwen2Carrier` is HFQ-only).
 
 qwen2 has **no** `q_norm`/`k_norm` and **no** MoE — its walk stays a flat dense
 walk, not routed through qwen35's `load_layer` (different struct).
@@ -108,10 +108,10 @@ walk, not routed through qwen35's `load_layer` (different struct).
   `HfqBackend { norm_bias: 0.0, candidates: flat_name_candidates, .. }`, funnel
   each layer through `load_layer`. **Keep** its qwen2-bias rejection guard
   (`hfq.rs:~769`) and its embed / tied-lm_head handling (arch-local).
-- `load_weights_paroquant_llama` (`hfq.rs:1117`): **deleted**. `LlamaCarrier`'s
-  Dir arm (`carriers.rs:239`) instead builds `ParoBackend` and funnels through
-  the same `load_layer`; PARO transparency comes from the existing
-  `ParoAugmentor`. The Dir arm keeps its own embed/output + tokenizer/template
+- The llama safetensors loader (`hfq.rs:1117`): **deleted**. `LlamaCarrier`'s
+  Dir arm (`carriers.rs:239`) instead builds the safetensors backend and funnels through
+  the same `load_layer`. The Dir arm
+  keeps its own embed/output + tokenizer/template
   resolution (already there).
 - Delete llama's local `load_weight_tensor` / `load_norm_weight_raw` /
   `load_f16_tensor` (norm path) once unused — **but only after §Risk-1 proves
@@ -122,16 +122,16 @@ walk, not routed through qwen35's `load_layer` (different struct).
 Prerequisite — source models into `~/.hipfire/models/`:
 - one HFQ qwen2 (arch_id 7),
 - one HFQ llama / Qwen3-dense (arch_id < 5),
-- one PARO/safetensors llama directory.
+- one safetensors llama directory.
 
 Procedure (mirrors the qwen35 migration's net):
 1. **Pre-refactor capture:** first-token logits (or a hash of all loaded
    `WeightTensor`/`GpuTensor` device buffers) for each of the three models.
 2. **Post-refactor assert:** identical capture from the unified path.
-3. `./scripts/coherence-gate.sh` green for qwen2 + llama (HFQ) and the PARO
+3. `./scripts/coherence-gate.sh` green for qwen2 + llama (HFQ) and the safetensors
    llama — fluent, on-topic, no verbatim loop.
 4. `cargo build` clean; deleted fns gone; no new `dead_code` warnings;
-   `load_weights_paroquant_llama` removed and `LlamaCarrier` Dir arm green.
+   the llama safetensors loader removed and `LlamaCarrier` Dir arm green.
 
 **Blocked on #1:** the byte-identical capture and coherence gate require a
 compiling tree. Gap #1 (`qwen35.rs:1387 shallow_clone` E0599) must be confirmed
@@ -151,12 +151,12 @@ green before this verification can run.
    builder is written — the residual check is only that `read_proj` is wired to
    a candidates-aware reader (else the `candidates` fn is ignored). Caught by the
    byte-identical gate regardless.
-3. **`bias()` on `ParoBackend`.** Returns `Err`; ensure no walk except qwen2's
+3. **`bias()` on the safetensors backend.** Returns `Err`; ensure no walk except qwen2's
    (HFQ-only) ever calls it. Compile-checked by construction (only qwen2 calls
-   `bias`, and qwen2 has no `ParoBackend`).
+   `bias`, and qwen2 has no safetensors backend).
 
 ## Out of scope / follow-ups
 
 - Generic arch-agnostic `load_layer` (rejected).
-- qwen2 safetensors/PARO + multi-GPU (no path exists).
+- qwen2 safetensors + multi-GPU (no path exists).
 - Embedding/output unification across arches (stays arch-local).

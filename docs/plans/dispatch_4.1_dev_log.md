@@ -31,15 +31,13 @@
 | `MoeParams { dtypes: moe_dtypes, batch_size: 1, ... }` | `qwen35.rs:4616-4617` |
 | Builds one `DispatchCtx::new(gpu)` → `moe_family().run(&ctx, gpu, &moe_params)` | `qwen35.rs:4663-4665` |
 
-### W0 tests (GPU-free, 8 new)
+### W0 tests (GPU-free)
 
 `MoeResolution::resolve` unit cells in `crates/hipfire-dispatch-tests/src/qwen35.rs`:
 - k=8 MQ4 indexable → `use_gpu_topk` ✅
 - k≠8 (1,2,4,6,7,9,16) → CPU fallback ✅
 - Non-indexable routed (Q8) → fallback even with k=8 ✅
 - MQ6 indexable ✅
-- Paro indexable (with sidecar) ✅
-- Paro without sidecar → fallback ✅
 - `needs_x_rot_local` when gate-side MQ4 ✅
 - All-F32 → no rotation ✅
 

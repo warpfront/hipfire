@@ -10,7 +10,7 @@
 
 **Spec:** `docs/superpowers/specs/2026-06-11-carrier-registry-unified-design.md` (read it; this plan implements its §1–4 + migration order).
 
-**Worktree:** `<repo>/.worktrees/feature-paro-transparent-loading` (branch `feature/paro-transparent-loading`).
+**Worktree:** `<repo>/.worktrees/feature-transparent-loading` (branch `feature/transparent-loading`).
 
 ---
 
@@ -412,7 +412,7 @@ Expected: warnings-only.
 
 ```bash
 ./target/release/examples/daemon &  # or via coherence harness
-# load ~/.hipfire/models/shisa-Qwen3.6-35B-A3B-PARO-packed, generate a short completion
+# load a model dir under ~/.hipfire/models/, generate a short completion
 ```
 Expected: loads as qwen35 (MoE/A3B), fluent output. If it loads as llama or errors with an arch mismatch, the namespace bridge (probe Dir 5|6) is wrong — fix before continuing. Capture the daemon log line showing the arch.
 

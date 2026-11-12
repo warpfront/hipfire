@@ -5,7 +5,7 @@ below is the *design-time* plan; read the as-shipped note first before implement
 **Author:** (agent)
 **Created:** 2026-09-23
 **Companion:** `docs/VALIDATION.md`, `CLAUDE.md` § Runtime validation, AGENTS.md §6 pitfalls
-**Related plans:** `docs/plans/dispatch_1.2_gpu_verify.md`, `docs/plans/multi-gpu-pp.md`,
+**Related plans:** `docs/plans/multi-gpu-pp.md`,
 `docs/plans/2026-07-28-pr549-vmm-all-kv-adaptive-design.md`
 
 > **As-shipped note (2026-09-26).** §5 Option A (staging arena + drop graph capture) and the
@@ -378,8 +378,7 @@ PCIe link (27.1 GB/s measured, §7) instead of device DRAM: this is llama.cpp's
   qt 14 `MQ8G256` (`RotationPlan::Mq8Internal`: int8-quantized activations),
   qt 21/24/32/33/35/36/37 HFP4/MFP4(+Lloyd/P) (per-row 16 B header + per-32 block
   scales/codewords, and an arch-owned upload path — qt 34 `MFP4G32E8` is covered
-  above), qt 28/29 PARO (Givens
-  rotation on the activation), qt 0/4 GGUF-side formats, and qt 38/39 GL +
+  above), qt 28/29 retired; unassigned, do not reuse, qt 0/4 GGUF-side formats, and qt 38/39 GL +
   qt 22 `TidI32` (MoE-indexed only, no dense GEMV kernel exists / not a weight).
   Each stays on the GPU over PCIe and is *named* by the load-time line
   `cpu exec: {covered}/{spilled} spilled layers fully covered; uncovered quants: …`.

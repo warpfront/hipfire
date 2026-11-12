@@ -243,7 +243,7 @@ Embedding lookup admits only the loaded formats `Q8_0`, `F32`, `HFQ4G256`
 and `HFQ4G128`. Supported host-decoded embeddings arrive as `F32`: F16,
 BF16, TQ2G128, BQ1G128 and MQ*G256V2 (quant types 44/45/47–50); other
 embedding formats still refuse with a named error.
-Refused projection containers: Lloyd-V2 (qt52), PARO, E8/MFP4 and
+Refused projection containers: Lloyd-V2 (qt52), E8/MFP4 and
 G128-rotated containers. fp32 DeltaNet state also refuses with a named
 error. AWQ sidecars are refused inside a mixed-dtype group (each scale
 needs its own rotated input). KV tiers: q8 (auto/unset default on every

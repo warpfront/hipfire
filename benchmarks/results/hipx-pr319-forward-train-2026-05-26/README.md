@@ -34,7 +34,6 @@ Detected GPUs:
 | MQ3-Lloyd WMMA parity | gfx1151 | PASS: all shapes, max abs `5.829e-5` | `raw/hipx-pr319-gfx1151_mq3_lloyd_wmma-20260526-214102.log` |
 | HFQ3 MMQ sweep | gfx1030 | PASS: sweep completed | `raw/hipx-pr319-gfx1030_hfq3_mmq_sweep-20260526-214104.log` |
 | FWHT-128 GPU vs CPU | gfx1151 | PASS: max abs `0e0` | `raw/hipx-pr319-gfx1151_fwht128-20260526-214331.log` |
-| Paro4G128 GEMV variants | gfx1151 | PASS: all variants | `raw/hipx-pr319-gfx1151_paro4g128-20260526-214335.log` |
 | Causal WMMA attention parity | gfx1151 | PASS: max abs `1.439e-4` | `raw/hipx-pr319-gfx1151_causal_wmma_parity-20260526-214336.log` |
 | Decode attention microbench | gfx1151 | PASS: kernels launch and compare | `raw/hipx-pr319-gfx1151_decode_attention_short-20260526-214339.log` |
 | MTP head smoke, 9B | gfx1151 | PASS: finite logits, KV readback signal | `raw/hipx-pr319-gfx1151_mtp_head_smoke_9b-20260526-214341.log` |
@@ -52,7 +51,7 @@ environment gap (`bun not found`).
 
 | PR / commit | Main surface | Coverage in this artifact set |
 |---|---|---|
-| PR319 | Paro4G128, FWHT-128, arch caps, quant/runtime dispatch | FWHT-128, Paro4G128, DFlash coherence/perf |
+| PR319 | FWHT-128, arch caps, quant/runtime dispatch | FWHT-128, DFlash coherence/perf |
 | `441924f6` | HFQ3 MMQ y-variant dispatch fix-forward | gfx1030 HFQ3 MMQ sweep |
 | PR337 | FeatureFlags / ArchCaps refactor, env/config routing | `cargo check`, arch cap tests, cross-arch DFlash smokes |
 | PR338 | MTP head/spec paths, DFlash/MTP demos, docs/scripts | MTP head smoke and MTP-only q8 decode |

@@ -46,7 +46,6 @@ fn dtypes_all_mq4() -> MoeDtypes {
         experts_all_gate_up_mq4: true,
         routed_gate_up: DType::MQ4G256,
         routed_down: DType::MQ4G256,
-        has_paro_shared: false,
     }
 }
 
@@ -94,18 +93,6 @@ fn moe_res_mq6_routed_indexable() {
     assert!(r.use_gpu_topk);
 }
 
-#[test]
-fn moe_res_paro_needs_sidecar() {
-    let mut d = dtypes_all_mq4();
-    d.routed_gate_up = DType::ParoQ4G128;
-    d.routed_down = DType::ParoQ4G128;
-    d.has_paro_shared = false;
-    assert!(!MoeResolution::resolve(&d, 8).routed_indexable_paro);
-    d.has_paro_shared = true;
-    let r = MoeResolution::resolve(&d, 8);
-    assert!(r.routed_indexable_paro);
-    assert!(r.use_gpu_topk);
-}
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -135,7 +122,6 @@ pub struct MoeDtypes {
     pub experts_all_gate_up_mq4: bool,
     pub routed_gate_up: DType,       // ffn.experts[0].gate_up
     pub routed_down: DType,          // ffn.experts[0].down
-    pub has_paro_shared: bool,       // ffn.paro_shared.is_some()
 }
 
 /// Resolved fused-vs-fallback eligibility for one MoE decode layer. This IS the
@@ -146,7 +132,6 @@ pub struct MoeResolution {
     pub gate_side_mq4: bool,
     pub routed_indexable_mq4: bool,
     pub routed_indexable_mq6: bool,
-    pub routed_indexable_paro: bool,
     pub use_gpu_topk: bool,
     pub needs_x_rot_local: bool,
 }
@@ -162,34 +147,29 @@ impl MoeResolution {
 
         let routed_gate_up_mq4 = d.routed_gate_up == MQ4G256;
         let routed_gate_up_mq6 = d.routed_gate_up == MQ6G256;
-        let routed_gate_up_paro = d.routed_gate_up == ParoQ4G128 && d.has_paro_shared;
 
         let routed_indexable_mq4 = (d.routed_down == MQ4G256) && routed_gate_up_mq4;
         let routed_indexable_mq6 = (d.routed_down == MQ6G256) && routed_gate_up_mq6;
-        let routed_indexable_paro =
-            (d.routed_down == ParoQ4G128 && d.has_paro_shared) && routed_gate_up_paro;
 
         let routed_dtype_indexable =
-            routed_indexable_mq4 || routed_indexable_mq6 || routed_indexable_paro;
+            routed_indexable_mq4 || routed_indexable_mq6;
 
         let use_gpu_topk = k == 8 && routed_dtype_indexable;
         let needs_x_rot_local = gate_side_mq4
             || routed_gate_up_mq4
-            || routed_gate_up_mq6
-            || routed_gate_up_paro;
+            || routed_gate_up_mq6;
 
         Self {
             gate_side_mq4,
             routed_indexable_mq4,
             routed_indexable_mq6,
-            routed_indexable_paro,
             use_gpu_topk,
             needs_x_rot_local,
         }
     }
 
     pub fn routed_indexable(&self) -> bool {
-        self.routed_indexable_mq4 || self.routed_indexable_mq6 || self.routed_indexable_paro
+        self.routed_indexable_mq4 || self.routed_indexable_mq6
     }
 }
 ```
@@ -239,27 +219,24 @@ No op changes — only replace the inline boolean computation (qwen35.rs:4598-46
             .first()
             .map(|e| e.down.gpu_dtype)
             .unwrap_or(DType::F32),
-        has_paro_shared: ffn.paro_shared.is_some(),
     };
     let moe_res = hipfire_dispatch::families::moe::MoeResolution::resolve(&moe_dtypes, k);
 ```
 
-- [ ] **Step 2: Replace the inline boolean block** — delete the original computations of `gate_side_mq4`, `routed_mq4`, `routed_gate_up_mq4`, `routed_mq6`, `routed_gate_up_mq6`, `routed_paro`, `routed_gate_up_paro`, `routed_dtype_indexable_mq4`, `routed_dtype_indexable_mq6`, `routed_dtype_indexable_paro`, `routed_dtype_indexable`, `use_gpu_topk`, `needs_x_rot_local` (qwen35.rs:4598-4673) and replace with the bindings below. Keep `routed_mq4`/`routed_gate_up_paro` etc. as locals so the rest of the body (which references them by name, e.g. 4675, 4868, 5031) compiles unchanged:
+- [ ] **Step 2: Replace the inline boolean block** — delete the original computations of `gate_side_mq4`, `routed_mq4`, `routed_gate_up_mq4`, `routed_mq6`, `routed_gate_up_mq6`, `routed_dtype_indexable_mq4`, `routed_dtype_indexable_mq6`, `routed_dtype_indexable`, `use_gpu_topk`, `needs_x_rot_local` (qwen35.rs:4598-4673) and replace with the bindings below. Keep `routed_mq4` etc. as locals so the rest of the body (which references them by name, e.g. 4675, 4868, 5031) compiles unchanged:
 
 ```rust
     let gate_side_mq4 = moe_res.gate_side_mq4;
     let routed_gate_up_mq4 = ffn.experts.first().map(|e| e.gate_up.gpu_dtype == DType::MQ4G256).unwrap_or(false);
     let routed_mq4 = ffn.experts.first().map(|e| e.down.gpu_dtype == DType::MQ4G256).unwrap_or(false);
     let routed_gate_up_mq6 = ffn.experts.first().map(|e| e.gate_up.gpu_dtype == DType::MQ6G256).unwrap_or(false);
-    let routed_gate_up_paro = ffn.experts.first().map(|e| e.gate_up.gpu_dtype == DType::ParoQ4G128).unwrap_or(false) && ffn.paro_shared.is_some();
     let routed_dtype_indexable_mq4 = moe_res.routed_indexable_mq4;
     let routed_dtype_indexable_mq6 = moe_res.routed_indexable_mq6;
-    let routed_dtype_indexable_paro = moe_res.routed_indexable_paro;
     let use_gpu_topk = moe_res.use_gpu_topk;
     let needs_x_rot_local = moe_res.needs_x_rot_local;
 ```
 
-(Note: `routed_mq6`, `routed_paro`, `routed_dtype_indexable` were only used to *derive* the above; if the post-4673 body references any of them directly, keep a local `let` for it too. Verify with `cargo build` in Step 3.)
+(Note: `routed_mq6`, `routed_dtype_indexable` were only used to *derive* the above; if the post-4673 body references either of them directly, keep a local `let` for it too. Verify with `cargo build` in Step 3.)
 
 - [ ] **Step 3: Build** to verify no dangling references
 
@@ -385,7 +362,7 @@ fn moe_decode_oplist_prefix_matches_gate_side() {
 Run: `cargo test -p hipfire-dispatch moe_decode_oplist 2>&1 | tail -10`
 Expected: FAIL to compile — `PipelineOp::MoeGateSideProj` etc. not found.
 
-- [ ] **Step 3a: Add the op variants** — in `crates/hipfire-dispatch/src/types.rs`, extend the `PipelineOp` enum (after `GivensRotate,` at line 16):
+- [ ] **Step 3a: Add the op variants** — in `crates/hipfire-dispatch/src/types.rs`, extend the `PipelineOp` enum (after the rotate variants, around line 16):
 
 ```rust
     // MoE decode ops (Phase 1). TopKRenorm / MoeCombine fused impls are
@@ -405,7 +382,7 @@ Expected: FAIL to compile — `PipelineOp::MoeGateSideProj` etc. not found.
 
 ```rust
 /// Everything the MoE decode executor arm reads, marshaled by the model from
-/// its weight/config/scratch structs. Generic (GpuTensor + scalars + GivensRef)
+/// its weight/config/scratch structs. Generic (GpuTensor + scalars)
 /// so the dispatch crate needs no arch dependency.
 pub struct MoeParams<'a> {
     pub res: super::moe::MoeResolution,
@@ -432,9 +409,6 @@ pub struct MoeParams<'a> {
     pub routed_gate_up_k: usize,
     pub routed_down_m: usize,
     pub routed_down_k: usize,
-    // paro sidecars for routed experts (None unless routed_indexable_paro)
-    pub routed_gate_up_paro: Option<GivensRef<'a>>,
-    pub routed_down_paro: Option<GivensRef<'a>>,
     // scratch (mirrors MoeScratchRef)
     pub router_logits: &'a GpuTensor,
     pub scalar_buf: &'a GpuTensor,
@@ -451,7 +425,7 @@ pub struct MoeParams<'a> {
     pub down_expanded: &'a GpuTensor,
 }
 ```
-Add `use crate::families::gemv::{GivensRef, WeightRef};` to the imports if not present. Delete the old `variant`/`weights`/`x`/`y` fields and the now-stale `MoeVariant` resolve usage in `MoeFamily::resolve` only if it stops compiling — otherwise leave `MoeFamily` untouched this task.
+Add `use crate::families::gemv::WeightRef;` to the imports if not present. Delete the old `variant`/`weights`/`x`/`y` fields and the now-stale `MoeVariant` resolve usage in `MoeFamily::resolve` only if it stops compiling — otherwise leave `MoeFamily` untouched this task.
 
 - [ ] **Step 3c: Extend the enum** — in `crates/hipfire-dispatch/src/pipeline/mod.rs`, add the `Moe` arm to `PipelineParams`:
 
@@ -520,10 +494,8 @@ Port the body **block-by-block** from qwen35.rs:4674-5142, substituting:
   `ffn.expert_gate_up_ptrs` → `p.expert_gate_up_ptrs`, scratch `s.foo` → `p.foo`.
 - `config.dim` → `p.hidden`, `mi`/`smi`/`k`/`n_exp` → `p.mi`/`p.smi`/`p.k`/`p.n_exp`,
   `config.norm_topk_prob` → `p.norm_topk_prob`, `x_rot_prerotated` → `p.x_rot_prerotated`.
-- The paro branches read `ffn.experts[0].gate_up.paro` → `p.routed_gate_up_paro`
-  (`Option<GivensRef>`), `...down.paro` → `p.routed_down_paro`.
 - Helper fns called inside (`weight_gemv`, `rotate_x_mq_for`, `fused_silu_mul_rotate_mq_for`,
-  `fused_silu_mul_rotate_mq_batched_for`, `slice_f32_view`, `rotate_x_paro_for`) live in
+  `fused_silu_mul_rotate_mq_batched_for`, `slice_f32_view`) live in
   `hipfire-runtime::llama` / qwen35; they take `gpu` + `WeightRef`-equivalent buffers.
   Where a helper needs a qwen35 `Linear`, replace with the underlying `gpu.*` call it wraps
   (read the helper body; e.g. `weight_gemv` dispatches on dtype to a `gpu.gemv_*`). Keep the
@@ -558,8 +530,6 @@ Port the body **block-by-block** from qwen35.rs:4674-5142, substituting:
         routed_gate_up_k: ffn.experts[0].gate_up.k,
         routed_down_m: ffn.experts[0].down.m,
         routed_down_k: ffn.experts[0].down.k,
-        routed_gate_up_paro: ffn.experts[0].gate_up.paro.as_ref().map(givens_ref),
-        routed_down_paro: ffn.experts[0].down.paro.as_ref().map(givens_ref),
         router_logits: s.router_logits, scalar_buf: s.scalar_buf,
         x_rot_local: s.x_rot_local, gate_buf: s.gate_buf, up_buf: s.up_buf,
         ffn_hidden: s.ffn_hidden, ffn_out: s.ffn_out,
@@ -573,7 +543,7 @@ Port the body **block-by-block** from qwen35.rs:4674-5142, substituting:
 ```
 Phase 1 calls `run_moe_decode` **directly** — the MoE arm needs no `DispatchCtx`/registry/op-list because `MoeResolution` already did all gating (there is no arch-predicate or fused-search left to run). The `execute_pipeline` Moe arm (Step 2) exists only as the generic-entry forwarder for future callers; the qwen35 hot path skips it to avoid threading an unused ctx/registry down into `moe_ffn_decode_impl`.
 
-Add two small local helpers in qwen35 mapping a `Linear` → dispatch `WeightRef` and a paro sidecar → `GivensRef` (mirror the existing `WeightRef` construction already used by this crate's `GemvFamily::run_auto` call sites — grep `WeightRef {` in qwen35 for the exact field mapping; for `GivensRef` map `paro.pairs`/`paro.theta`/`paro.channel_scales`/`paro.krot as usize` → `pairs`/`theta`/`scales`/`krot`).
+Add a small local helper in qwen35 mapping a `Linear` → dispatch `WeightRef` (mirror the existing `WeightRef` construction already used by this crate's `GemvFamily::run_auto` call sites — grep `WeightRef {` in qwen35 for the exact field mapping).
 
 - [ ] **Step 4: Build, then byte-parity gate**
 
@@ -583,7 +553,7 @@ Then the gate (GPU + A3B model):
 md5sum benchmarks/prompts/lru_cache_pep8_strict.txt
 ./scripts/coherence-gate.sh 2>&1 | tail -5
 ```
-Expected: no hard errors AND the A3B-MQ4 / MQ6 / Paro transcripts are **byte-identical** to a `HEAD~1` run on the same prompt md5 (greedy, temp 0.0). Compare all three routed dtypes — they exercise the mq4 / mq6 / paro branches of the relocated body. Any divergence → a relocation substitution is wrong; bisect by reverting `run_moe_decode` block-by-block.
+Expected: no hard errors AND the A3B-MQ4 / MQ6 transcripts are **byte-identical** to a `HEAD~1` run on the same prompt md5 (greedy, temp 0.0). Compare both routed dtypes — they exercise the mq4 / mq6 branches of the relocated body. Any divergence → a relocation substitution is wrong; bisect by reverting `run_moe_decode` block-by-block.
 
 - [ ] **Step 5: Commit**
 
@@ -601,8 +571,8 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 
 ## Notes on verification honesty
 
-Tasks 1, 3, 4 are true TDD (pure logic, GPU-free unit tests). Tasks 2 and 5 are GPU integration refactors whose correctness criterion is **byte-identical output** vs the prior commit (the spec's stated success criterion and the CLAUDE.md coherence rule) — there is no meaningful "failing unit test first" for a faithful relocation, so the byte-parity A/B + coherence gate IS the test. Run each on a **fresh process** with a **byte-identical prompt** (record md5) per the CLAUDE.md bench rule. Exercise all three routed dtypes (MQ4, MQ6, ParoQ4G128) since they take different branches.
+Tasks 1, 3, 4 are true TDD (pure logic, GPU-free unit tests). Tasks 2 and 5 are GPU integration refactors whose correctness criterion is **byte-identical output** vs the prior commit (the spec's stated success criterion and the CLAUDE.md coherence rule) — there is no meaningful "failing unit test first" for a faithful relocation, so the byte-parity A/B + coherence gate IS the test. Run each on a **fresh process** with a **byte-identical prompt** (record md5) per the CLAUDE.md bench rule. Exercise both routed dtypes (MQ4, MQ6) since they take different branches.
 
 ## Known risk to watch (Task 5)
 
-The relocation assumes every `gpu.*` call in qwen35.rs:4674-5142 reduces to a `Gpu` method + generic-buffer args. The qwen35 helper fns (`weight_gemv`, `rotate_x_mq_for`, `fused_silu_mul_rotate_mq*_for`, `rotate_x_paro_for`, `slice_f32_view`) are the friction points — some may read a qwen35 `Linear`'s AWQ sidecar or dtype to pick a kernel. If reducing one to generic args is not mechanical, **do not guess**: either thread its missing input into `MoeParams` or move the helper into the dispatch crate, and re-confirm byte-parity. This is the single most likely place Phase 1 stalls.
+The relocation assumes every `gpu.*` call in qwen35.rs:4674-5142 reduces to a `Gpu` method + generic-buffer args. The qwen35 helper fns (`weight_gemv`, `rotate_x_mq_for`, `fused_silu_mul_rotate_mq*_for`, `slice_f32_view`) are the friction points — some may read a qwen35 `Linear`'s AWQ sidecar or dtype to pick a kernel. If reducing one to generic args is not mechanical, **do not guess**: either thread its missing input into `MoeParams` or move the helper into the dispatch crate, and re-confirm byte-parity. This is the single most likely place Phase 1 stalls.

@@ -563,7 +563,6 @@ fn hfq_weight(
                     m,
                     k,
                     row_stride: if ld == k { 0 } else { ld * 2 },
-                    paro: None,
                     awq_scale: None,
                     lloyd_lut_e4m3: None,
                     lloyd_lut_f16: None,
@@ -582,7 +581,6 @@ fn hfq_weight(
                     m,
                     k,
                     row_stride: 0,
-                    paro: None,
                     awq_scale: None,
                     lloyd_lut_e4m3: None,
                     lloyd_lut_f16: None,
@@ -603,7 +601,6 @@ fn hfq_weight(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -620,7 +617,6 @@ fn hfq_weight(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -637,7 +633,6 @@ fn hfq_weight(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -655,7 +650,6 @@ fn hfq_weight(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -684,7 +678,6 @@ fn hfq_weight(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -711,7 +704,6 @@ fn hfq_weight(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -738,7 +730,6 @@ fn hfq_weight(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -765,7 +756,6 @@ fn hfq_weight(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -792,7 +782,6 @@ fn hfq_weight(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -855,7 +844,7 @@ fn attach_awq_scale_with_copy(
 
 impl DflashLayerWeights {
     /// Consume one layer's weights, releasing every GPU tensor including the
-    /// AWQ/paro sidecars (`free_all`, not `.buf` — an AWQ-trunk drafter
+    /// AWQ sidecars (`free_all`, not `.buf` — an AWQ-trunk drafter
     /// carries one scale tensor per weight per layer). Shared by the
     /// success-path `DflashWeights::free_gpu` and the `load` error path so a
     /// failed load frees completed layers without duplicating this list.
@@ -1346,7 +1335,7 @@ impl DflashWeights {
         })
     }
     pub fn free_gpu(self, gpu: &mut Gpu) {
-        // free_all (not .buf) so the awq_scale / paro sidecars are released too —
+        // free_all (not .buf) so the awq_scale sidecars are released too —
         // on an AWQ-trunk drafter every weight carries an awq_scale GpuTensor, so
         // .buf-only freeing leaks one tensor per weight per layer on each unload.
         self.fc.free_all(gpu);
@@ -5421,7 +5410,6 @@ mod construction_tests {
                 m: 2,
                 k: 8,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,

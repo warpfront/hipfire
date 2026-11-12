@@ -30,7 +30,7 @@
 //! [n_ctx/2 .. n_ctx-1). Both models use true FP32 KV (the f32 oracle regime).
 //!
 //! Usage:
-//!   eval_hipfire_fullvocab --oracle <f32-oracle.hfq> --candidate <quant.hfq|dir> \
+//!   eval_hipfire_fullvocab --oracle <f32-oracle.hfq> --candidate <quant.hfq> \
 //!       --ref <hfkldr.bin> [--max-chunks N]
 
 #[cfg(not(feature = "deltanet"))]
@@ -137,24 +137,12 @@ fn main() {
         .expect("load oracle");
     eprintln!("loaded oracle ({} layers)", weights_o.layers.len());
 
-    let (cfg_c, weights_c) = if candidate.is_dir() {
-        use hipfire_runtime::safetensors_source::SafetensorsSource;
-        let source = SafetensorsSource::open(&candidate).expect("safetensors open");
-        let cfg_c = qwen35::config_from_safetensors(&source).expect("cand config");
-        let mut paro_c = qwen35::ParoSource::new(&source, &cfg_c).expect("ParoSource::new");
-        let layout_c = qwen35::Layout::single(cfg_c.n_layers);
-        let w = qwen35::load_weights(&mut paro_c, std::slice::from_mut(&mut gpu), &layout_c)
-            .expect("load_weights");
-        (cfg_c, w)
-    } else {
-        let mut hfq_c = HfqFile::open(&candidate).expect("open candidate");
-        let cfg_c = qwen35::config_from_hfq(&hfq_c).expect("cand config");
-        let mut src_c = qwen35::HfqSource::new(&mut hfq_c, &cfg_c);
-        let layout_c = qwen35::Layout::single(cfg_c.n_layers);
-        let w = qwen35::load_weights(&mut src_c, std::slice::from_mut(&mut gpu), &layout_c)
-            .expect("load cand");
-        (cfg_c, w)
-    };
+    let mut hfq_c = HfqFile::open(&candidate).expect("open candidate");
+    let cfg_c = qwen35::config_from_hfq(&hfq_c).expect("cand config");
+    let mut src_c = qwen35::HfqSource::new(&mut hfq_c, &cfg_c);
+    let layout_c = qwen35::Layout::single(cfg_c.n_layers);
+    let weights_c = qwen35::load_weights(&mut src_c, std::slice::from_mut(&mut gpu), &layout_c)
+        .expect("load cand");
     assert_eq!(
         cfg_c.vocab_size, config.vocab_size,
         "candidate vocab mismatch"

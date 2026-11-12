@@ -264,7 +264,7 @@ if (requant_per_token == 0) {
     // single requant pass after the loop — master's structure, EF-aware
     requant_tile(/* last-token state, use_ef, frame + (n_tokens-1) */);
 }
-// requant_per_token == 1 keeps the in-loop per-token requant (PARO path)
+// requant_per_token == 1 keeps the in-loop per-token requant
 ```
 
 **Option A2 (fallback): `#if`-guard the EF temporaries behind the uniform.**

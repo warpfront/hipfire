@@ -187,7 +187,7 @@ fallback (`run_moe_decode_cpu_fallback`) was re-plumbed (ctx threaded through
 per-expert loop) but has no on-GPU fixture to validate it.
 
 **Action:** Procure or build a k≠8 MoE model (e.g. k=4 or k=16 variant), or a
-non-MQ4/MQ6/Paro routed-expert model, and run through coherence-gate.sh.
+non-MQ4/MQ6 routed-expert model, and run through coherence-gate.sh.
 **Doc:** Document the residual until a fixture is available.
 **Assignee: Kaden** (model procurement); Kevin can validate once fixture exists.
 

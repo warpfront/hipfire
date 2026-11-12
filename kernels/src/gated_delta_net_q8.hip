@@ -36,8 +36,8 @@ __global__ void gated_delta_net_q8(
     ,
     // Requant cadence gate (host-supplied). 0 = single-end: requant S→Q8 ONCE at
     // the last token (MQ4-fast path; intermediate tokens keep FP32 state in LDS).
-    // 1 = per-token: Q8 roundtrip after every token (PARO drift-echo correctness,
-    // ~1.8× slower in batched). MQ4/HFQ4 weights pass 0; PARO passes 1. For
+    // 1 = per-token: Q8 roundtrip after every token (drift-echo correctness,
+    // ~1.8× slower in batched). MQ4/HFQ4 weights pass 0. For
     // n_tokens==1 (AR decode / DFlash draft) both modes are identical.
     int requant_per_token,
     // Q/K head ratio (n_heads / qk_heads): Q/K token stride is
@@ -119,13 +119,13 @@ __global__ void gated_delta_net_q8(
         }
 
         // Q8 requant. Cadence gated by `requant_per_token`:
-        //   per_token=1 (PARO): requant S→Q8 after EVERY token and dequant back into
+        //   per_token=1: requant S→Q8 after EVERY token and dequant back into
         //     LDS so the next token reads the Q8-roundtripped state (matches decode
-        //     cadence; prevents recurrent-state drift → PARO prompt echo).
+        //     cadence; prevents recurrent-state drift → prompt echo).
         //   per_token=0 (MQ4-fast, DEFAULT): requant ONCE at the last token;
         //     intermediate tokens keep FP32 state in LDS. ~1.8× faster in batched
         //     (no n_tokens× requant, VGPR pressure lower). MQ4 stays coherent with
-        //     this (the drift echo is PARO-specific; prototype cceb07c0 = 254 tok/s
+        //     this (prototype cceb07c0 = 254 tok/s
         //     coherent). For n_tokens==1 both modes are identical.
         // Stochastic rounding: floor(x + uniform) has E[result] = x (unbiased).
         const bool per_token = (requant_per_token != 0);

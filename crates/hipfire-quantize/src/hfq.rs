@@ -48,8 +48,6 @@ impl QuantType {
             21 => Some(Self::HFP4G32),
             24 => Some(Self::MFP4G32),
             22 => Some(Self::TidI32),
-            28 => Some(Self::PARO4G128),
-            29 => Some(Self::PARO4G128T),
             30 => Some(Self::MQ4G256Lloyd),
             31 => Some(Self::MQ5G256),
             32 => Some(Self::MFP4G32Lloyd),
@@ -128,8 +126,6 @@ pub(crate) enum QuantType {
     // HFP4G32MX   = 25, // v2  — strict OCP MXFP4 interop alias (no row scale, UE8M0 only)
     // HFP4G16NV   = 26, // v2  — strict NVFP4 interop alias (E4M3 scale + FP32 tensor)
     // HFP8E4M3G32 = 27, // v2  — HFP8 E4M3 family
-    PARO4G128 = 28,  // ParoQuant native AWQ W4 + pairwise activation rotation metadata
-    PARO4G128T = 29, // ParoQuant engine-tiled qweight [M/8, K] for coalesced GEMV reads
     // MFP4G32R    = 29, // v3  — HFP4G32 + online block-diag-128 rotation (AMD recipe)
     MQ4G256Lloyd = 30, // MagnumQuant 4-bit + per-block Lloyd-Max 16-entry fp16 codebook (160 B/group)
     // Renumbered from 21 → 30 in mq4-lloyd merge to avoid HFP4G32=21 collision.

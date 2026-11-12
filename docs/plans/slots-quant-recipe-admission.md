@@ -46,7 +46,7 @@ MQ4G256V2, MQ4CG256, MQ6G256, HFQ6G256, MQ6G256V2, MQ5G256V2, MQ3G256,
 MQ3G256V2, MQ3G256Lloyd, MQ2G256V2 (arch-sensitive half via `is_batchable_la`).
 lm_head: `lm_head_slots_admissible` (14-dtype allow-list, dtype-generic
 GEMV; xbatch fast path stays MQ4G256-only). Still refused with named
-errors: Lloyd-V2 (qt52), PARO, E8/MFP4, G128-rotated, F32/F16/Q4K/TQ2/BQ1
+errors: Lloyd-V2 (qt52), E8/MFP4, G128-rotated, F32/F16/Q4K/TQ2/BQ1
 projections, non-Q8 embed, fp32 DeltaNet state.
 
 ## 3 · Kernel inventory (no new kernels needed for A/B)

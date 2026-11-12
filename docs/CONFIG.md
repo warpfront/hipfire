@@ -218,7 +218,7 @@ to `auto` and do not materialize an environment value until explicitly set:
 |---|---|
 | RDNA4 MQ4V2 gate/up decode | `kernel.gfx12_mq4v2_gateup_k5120` (exact gfx1201, K=5120, 17408 rows per output; default off) |
 | GEMV / quant | `kernel.gemv_dp4a`, `kernel.gemv_prefetch`, `kernel.gfx942_lds_gemv`, `kernel.hfq3_dp4a`, `kernel.hfq3_mmq`, `kernel.hfq4_mmq_rdna2`, `kernel.gcn5_wave64_hybrid`, `kernel.mmq`, `kernel.gfx942_gemv_v2` |
-| MoE | `kernel.moe_grouped_i8`, `kernel.moe_paro_i8`, `kernel.moe_paro_i8_k8` |
+| MoE | `kernel.moe_grouped_i8` |
 | Certified arch routes | `kernel.rdna3_hfq4_qkvza_k2048`, `kernel.rdna3_hfq4_residual_stage_x32`, `kernel.rdna3_hfq4_sigmoid_buffer`, `kernel.rdna3_rmsnorm_vecsum`, `kernel.gfx942_rmsnorm_split` |
 
 Stable/default-on and safety controls:
@@ -808,8 +808,8 @@ lower the context or fall back to Q8.
 
 **Kill switch:** `HIPFIRE_QWEN_KV_DEFAULT_Q8=0` (developer variable) restores
 the prior *implicit Qwen* per-site default wherever `auto` does not pick
-native fp8: HFQ `auto`/unset → FWHT3 K + Q8 V, PaRo `auto` → FWHT3/Q8,
-PaRo unset → Q8/Q8, other sites Q8/Q8. Default is ON (Q8/Q8). It must not
+native fp8: HFQ `auto`/unset → FWHT3 K + Q8 V,
+other sites Q8/Q8. Default is ON (Q8/Q8). It must not
 override any authored CLI/config mode or K/V, must not touch the eligible
 gfx1201 fp8 path, and must not affect non-Qwen families.
 
@@ -2482,8 +2482,6 @@ misspelled key is unknown and fails the load with
 | `kernel.moe_grouped_m2` | `moe_grouped_m2` | `HIPFIRE_MOE_GROUPED_M2` | experimental |
 | `kernel.moe_hfq6_i8` | `moe_hfq6_i8` | `HIPFIRE_MOE_HFQ6_I8` | experimental |
 | `kernel.moe_hfq6_v2` | `moe_hfq6_v2` | `HIPFIRE_MOE_HFQ6_V2` | experimental |
-| `kernel.moe_paro_i8` | `moe_paro_i8` | `HIPFIRE_MOE_PARO_I8` | experimental |
-| `kernel.moe_paro_i8_k8` | `moe_paro_i8_k8` | `HIPFIRE_MOE_PARO_I8_K8` | experimental |
 | `kernel.mq4v2_gateup_k5120` | `mq4v2_gateup_k5120` | `HIPFIRE_MQ4V2_GATEUP_K5120` | stable |
 | `kernel.npu_spillover` | `npu_spillover` | `HIPFIRE_NPU_SPILLOVER` | experimental |
 | `kernel.pm_decode` | `pm_decode` | `HIPFIRE_PM_DECODE` | experimental |

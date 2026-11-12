@@ -277,7 +277,7 @@ impl Qwen2Weights {
     /// Release every GPU buffer back to the pool. Consumes self.
     /// Mirrors `LlamaWeights::free_gpu` and `Qwen35Weights::free_gpu`
     /// — the daemon calls this on unload to actually return VRAM. Linear
-    /// weights go through `WeightTensor::free_all` so any PARO / AWQ sidecar
+    /// weights go through `WeightTensor::free_all` so any AWQ sidecar
     /// (none are allocated for Qwen2 today, but the forward already reads
     /// `awq_scale`) is released with the buffer instead of leaking per reload.
     pub fn free_gpu(self, gpu: &mut Gpu) {
@@ -625,9 +625,9 @@ fn load_weight_tensor_from_source(
     m: usize,
     k: usize,
 ) -> HipResult<WeightTensor> {
-    // Clean error (not panic) on a missing tensor — e.g. a ParoQuant qwen2 dir
-    // that ships only `.qweight` (no F16 `.weight`). The caller turns this into
-    // a load failure instead of aborting the daemon.
+    // Clean error (not panic) on a missing tensor, e.g. a quantized dir that ships
+    // only `.qweight` (no F16 `.weight`). The caller turns this into a load failure
+    // instead of aborting the daemon.
     let (info, data) = source
         .tensor_data(name)
         .ok_or_else(|| hip_bridge::HipError::new(0, &format!("qwen2: tensor not found: {name}")))?;
@@ -640,7 +640,6 @@ fn load_weight_tensor_from_source(
         m,
         k,
         row_stride: 0,
-        paro: None,
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
@@ -690,7 +689,6 @@ fn load_lm_head_from_source(
             m: cfg.vocab_size,
             k: cfg.hidden_size,
             row_stride: 0,
-            paro: None,
             awq_scale: None,
             lloyd_lut_e4m3: None,
             lloyd_lut_f16: None,
