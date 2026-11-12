@@ -23,7 +23,8 @@
 //! projected rows and its own position; the output scratch is sentinel-filled first; after
 //! each step every lane tensor of both arms is compared as bytes (a sentinel left behind
 //! fails). The launch count of each arm is checked (`hip_bridge::memory_effects`: reference 5N,
-//! candidate 5) so a silent per-lane fallback cannot pass, and negative controls MUST be
+//! candidate 5 for F32; E4M3-FNUZ K/V is declined by the admission, so its candidate is 5N too)
+//! so a silent per-lane fallback cannot pass for F32, and negative controls MUST be
 //! detected: the candidate with two lanes' state tensors swapped and a candidate lane at the
 //! wrong position.
 //!
@@ -483,11 +484,14 @@ fn run_case(
             let cand_launches = memory_effects::snapshot().since(m1).launches;
             drop(list);
             Arc::make_mut(&mut gpu.flags).qwen4_qsa_lanes = false;
-            let launches_good = ref_launches == 5 * n as u64 && cand_launches == 5;
+            // F32 takes the lanes route (5 launches); E4M3-FNUZ K/V is declined by the
+            // admission and runs per lane, like the reference.
+            let want_cand = if fmt == Fmt::F32 { 5 } else { 5 * n as u64 };
+            let launches_good = ref_launches == 5 * n as u64 && cand_launches == want_cand;
             if control == Control::None {
                 launch_ok &= launches_good;
                 detail.push(format!(
-                    "step {step}: launches reference {ref_launches} (want {}) candidate {cand_launches} (want 5)",
+                    "step {step}: launches reference {ref_launches} (want {}) candidate {cand_launches} (want {want_cand})",
                     5 * n
                 ));
             }
