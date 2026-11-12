@@ -20969,6 +20969,13 @@ impl Gpu {
     /// launch for the `rows % 8` remainder; each row bitwise the single-row
     /// kernel's. Requires `k % 32 == 0`. Prompt fill: the weight is read once
     /// per eight rows instead of once per row.
+    ///
+    /// Exact gfx942 tiles two rows (`_r2`, grid `[m, rows / 2]`, one single-row launch for an odd
+    /// last row): the four-row HC gate matrix has only `4 * rows / 8` workgroups at eight rows,
+    /// each walking eight activation rows per weight pass; two-row tiles run four times the
+    /// workgroups on a quarter of the per-thread loads (G12 input: executor-local route-table
+    /// row; MI300X, N = 8 / 16 / 32 / 64: 6.5 / 5.6 / 5.6 / 5.7 us vs 9.2 / 9.3 / 9.3 / 9.3 us per
+    /// write, every output word equal to the eight-row tiling's).
     #[allow(clippy::too_many_arguments)]
     pub fn gemv_bf16_xf32_k4_rows_tiled(
         &mut self,
@@ -20989,8 +20996,9 @@ impl Gpu {
             "gemv_bf16_xf32_k4_rows_tiled_r7",
             "gemv_bf16_xf32_k4_rows_tiled_r8",
         ];
-        let tiles = rows / 8;
-        let tail = rows % 8;
+        let tile = if self.arch_caps.is_gfx942() { 2 } else { 8 };
+        let tiles = rows / tile;
+        let tail = rows % tile;
         if rows == 0 || !k.is_multiple_of(32) || tiles > 65_535 {
             return Err(hip_bridge::HipError::new(
                 1,
@@ -21002,7 +21010,7 @@ impl Gpu {
         let x_base = x.buf.as_ptr();
         let y_base = y.buf.as_ptr();
         if tiles > 0 {
-            let func = TILED[6];
+            let func = TILED[tile - 2];
             self.ensure_k4_rows_tiled_entry(func, true)?;
             self.launch_gemv_k4_raw(
                 func,
@@ -21016,7 +21024,7 @@ impl Gpu {
             )?;
         }
         if tail > 0 {
-            let done = tiles * 8;
+            let done = tiles * tile;
             // F32 activations and outputs: skip the rows the tiles covered.
             let x_ptr = unsafe { (x_base as *mut u8).add(done * k * 4) as *mut c_void };
             let y_ptr = unsafe { (y_base as *mut u8).add(done * m * 4) as *mut c_void };

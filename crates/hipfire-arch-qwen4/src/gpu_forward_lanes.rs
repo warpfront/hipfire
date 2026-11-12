@@ -3097,14 +3097,16 @@ fn forward_lanes_scoped(
     // lane's tail reads it through its own views. Taken for 2+ lanes of a decode step whose `n`
     // rows run ONE row-exact BF16 launch (`Gpu::bf16_rows_exact_one_launch`) under a policy that
     // shares the stage; the weights' dtype and the 1-row-lane PLE batch are checked where the
-    // weights are known (`ple_project`).
+    // weights are known (`ple_project`). G12 input: exact gfx942 runs the pair on the BF16 MFMA
+    // trunk route (`ProjectLadder::TrunkRowExact` falls through to `project_weight`, one chain per
+    // output element whatever the row count), so every row count of the step is one launch there.
     let ple_seg: Option<usize> = (band_scope.input
         && !prefill
         && lanes.len() >= 2
         && policy.share(StageName::PleProject) == StageShare::OnceAllRows
         && gpu.flags.qwen4_lane_ple_project_enabled()
         && (2..=rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS).contains(&n)
-        && gpu.bf16_rows_exact_one_launch(n))
+        && (gpu.arch_caps.is_gfx942() || gpu.bf16_rows_exact_one_launch(n)))
     .then(|| {
         all_segs.push(Segment {
             begin: 0,
