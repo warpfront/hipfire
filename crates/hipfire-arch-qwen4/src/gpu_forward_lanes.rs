@@ -113,6 +113,7 @@ use crate::gpu_forward::ep_wave::{
     ep_wave_partial_mask, ep_wave_policy_for, ep_wave_refusal, ep_wave_route, ep_wave_scope_rows,
     ep_wave_tile_exchange, EpWaveRoute,
 };
+use crate::gpu_forward::g942_lanes;
 use crate::gpu_forward::{
     bind_ep_lane_gather, ep_lane, ep_lane_buffer, ep_lane_check_invocations, ep_lane_moe_rows,
     lane_layer_moe,
@@ -1674,6 +1675,8 @@ pub struct LaneAllRowsRule {
     pub trunk_ar_write: bool,
     /// MoE calls per step the gather buffer parity is checked on (the band's layers).
     pub band_moe_calls: usize,
+    /// Single-device gfx942: the MoE all-rows segment needs no EP gather ([`g942_lanes::moe_refusal`]).
+    pub g942_single: bool,
     /// The stage shares (HC read / write, MoE) the rule reads.
     pub policy: LaneStagePolicy,
 }
@@ -1712,6 +1715,7 @@ impl LaneAllRowsRule {
             gather_cap: None,
             trunk_ar_write: false,
             band_moe_calls: 0,
+            g942_single: false,
             policy: LaneStagePolicy::production(),
         }
     }
@@ -1745,6 +1749,7 @@ impl LaneAllRowsRule {
             trunk_ar_write: crate::trunk_route::attn_writer().is_some()
                 || crate::trunk_route::ffn_writer().is_some(),
             band_moe_calls,
+            g942_single: g942_lanes::single_device_rule(gpu, gather_cap),
             policy: *policy,
         }
     }
@@ -1802,7 +1807,14 @@ impl LaneAllRowsRule {
             (n >= self.bf16_min_rows) == (1 >= self.bf16_min_rows),
         );
         let exact_scope = (self.exact_flag || any_exact_lane) && all_stages;
-        let moe_refusal = if self.moe_flag {
+        let moe_refusal = if self.moe_flag && self.g942_single {
+            g942_lanes::moe_refusal(
+                all_stages,
+                self.policy.share(StageName::Moe) == StageShare::OnceAllRows,
+                n,
+                any_wide_lane,
+            )
+        } else if self.moe_flag {
             all_rows_moe_refusal(
                 all_stages,
                 self.policy.share(StageName::Moe) == StageShare::OnceAllRows,
@@ -2487,6 +2499,13 @@ fn forward_wave_with(
         .execution
         .take()
         .ok_or_else(|| invalid("Qwen4 forward resources are not attached"))?;
+    // gfx942 single device (P2): the lane tile's canonical prefill routing and F16 clamp.
+    let g942 = crate::lane_exec::g942_wave::wave_applies(gpu, bundle);
+    if g942 {
+        lanes
+            .iter_mut()
+            .for_each(|lane| lane.state.clamp_f16_valid());
+    }
     let mut rows: Vec<LaneRows<'_>> = lanes
         .iter_mut()
         .map(|lane| LaneRows {
@@ -2499,8 +2518,9 @@ fn forward_wave_with(
         })
         .collect();
     let scope = std::mem::replace(&mut gpu.qwen4_scope, true);
-    let invariant =
-        rdna_compute::prefill_invariant::prefill_pm_invariant_enabled() && gpu.arch == "gfx1151";
+    let invariant = (rdna_compute::prefill_invariant::prefill_pm_invariant_enabled()
+        && gpu.arch == "gfx1151")
+        || g942;
     let invariant = std::mem::replace(&mut gpu.prefill_invariant_scope, invariant);
     let result = if forward.ep.is_some() {
         forward_wave_ep(gpu, &mut forward, bundle, &mut rows, out)
@@ -7695,6 +7715,7 @@ mod tests {
             gather_cap: Some(48),
             trunk_ar_write: false,
             band_moe_calls: 48,
+            g942_single: false,
             policy: LaneStagePolicy::production(),
         }
     }

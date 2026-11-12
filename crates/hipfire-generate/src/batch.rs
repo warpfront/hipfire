@@ -3325,10 +3325,31 @@ pub fn batch_request_eligible_for_route(
 ) -> bool {
     if vmm_route {
         is_vmm_batch_request_eligible(msg, m, continuous_batch_size, serve_continuous_batch)
-            && (qwen4_lone_request_takes_lane_for(msg, m) || inbox.has_pending_batch_generate())
+            && (qwen4_lone_request_takes_lane_for(msg, m)
+                || inbox.has_pending_batch_generate()
+                || g942_burst_peer(m, inbox))
     } else {
         is_batch_request_eligible(msg, m, continuous_batch_size, serve_continuous_batch)
     }
+}
+
+/// gfx942 single-device fn-lanes (P2): an eligible request that finds no peer queued waits up to
+/// `g942_wave::BURST_GAP` (4 ms; G12's single admission-coalescing rule replaces it) for one, so
+/// a burst enters the lane driver together (one prefill wave) instead of its first request
+/// starting as an AR singleton.
+fn g942_burst_peer(m: &LoadedModel, inbox: &mut DaemonInbox) -> bool {
+    use hipfire_arch_qwen4::lane_exec::g942_wave;
+    let gap = m.qwen4().is_some_and(g942_wave::serve_armed).then_some(g942_wave::BURST_GAP);
+    let start = Instant::now();
+    while gap.is_some_and(|gap| start.elapsed() < gap) {
+        if inbox.has_pending_batch_generate() {
+            let ms = start.elapsed().as_secs_f64() * 1e3;
+            eprintln!("[g942-wave] burst: peer queued {ms:.2} ms after the first arrival");
+            return true;
+        }
+        std::thread::sleep(Duration::from_micros(200));
+    }
+    false
 }
 
 /// Daemon: drive the staged batch scheduler — the Qwen4 lane driver on a

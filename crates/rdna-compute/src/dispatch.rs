@@ -1852,8 +1852,16 @@ pub struct Gpu {
     pub(crate) kernel_timing_replay_baseline: crate::replay::ReplayObservation,
     /// Scratch buffers for FWHT rotation, FP16/FP8 activation conversion, etc.
     pub scratch: crate::scratch::ScratchState,
+    /// Device lane tables of the gfx942 batched GDN decode core
+    /// ([`crate::cdna::gfx942::Gfx942Device::qwen4_gdn_lanes_step_f32`]), keyed by
+    /// their content: built once per layer and lane set, never rewritten.
+    pub(crate) gdn_lanes_f32_tables: crate::cdna::gfx942::GdnLanesTableCache,
     /// Model-scoped Redline warmup recorder and fail-closed backend gate.
     pub replay: crate::replay::ReplayController,
+    /// Device lane tables of the gfx942 batched QSA decode core
+    /// ([`crate::cdna::gfx942::Gfx942Device::qwen4_qsa_lanes_core`]), keyed by their content:
+    /// built once per layer and lane set, never rewritten.
+    pub(crate) qsa_lanes_gfx942_tables: crate::cdna::gfx942::QsaLanesTableCache,
     /// Artifact-level MQ4V2 grid contract. Set by the model loader from HFQ
     /// metadata; false for legacy/asymmetric artifacts.
     pub mq4v2_symmetric: bool,
@@ -3255,6 +3263,7 @@ impl Gpu {
             kernel_timing_pool: None,
             #[cfg(feature = "kernel-timing")]
             kernel_timing_replay_baseline: crate::replay::ReplayObservation::default(),
+            gdn_lanes_f32_tables: Default::default(),
             scratch: crate::scratch::ScratchState {
                 mq_signs1: None,
                 mq_signs2: None,
@@ -3347,6 +3356,7 @@ impl Gpu {
                 pm_decode,
             },
             replay: crate::replay::ReplayController::from_config(),
+            qsa_lanes_gfx942_tables: Default::default(),
             mq4v2_symmetric: false,
             fp8_verify_scope: false,
             iu4_verify_scope: false,

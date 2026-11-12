@@ -480,6 +480,16 @@ impl ArchCaps {
     pub fn has_qwen4_parallel_qsa_gdn(&self) -> bool {
         self.has_gfx11_plus_simt || self.is_gfx942
     }
+    /// Qwen4 native-MTP GDN verify-row capture (the `row_states` capture
+    /// recurrence `gated_delta_step_*_persistent256_capture_*` and the
+    /// recurrence-only rollback `gated_delta_rollback_layers_*`): every
+    /// `has_gfx11_plus_simt` arch plus exact gfx942. gfx942 runs the F32
+    /// state only (its persistent body is pinned to the sequential kernel's
+    /// arithmetic; the caller admits the stock-FP8 profile, whose numerical
+    /// contract pins the F32 recurrent state). gfx940/gfx941 are not admitted.
+    pub fn has_qwen4_gdn_row_capture(&self) -> bool {
+        self.has_gfx11_plus_simt || self.is_gfx942
+    }
     pub fn has_dot2_f32_f16(&self) -> bool {
         self.has_dot2_f32_f16
     }
@@ -871,6 +881,19 @@ mod tests {
                 caps.has_gfx11_plus_simt() && caps.has_qwen4_parallel_qsa_gdn(),
                 "{arch}"
             );
+        }
+    }
+
+    #[test]
+    fn qwen4_gdn_row_capture_is_gfx11_plus_and_exact_gfx942() {
+        for arch in &[
+            "gfx1100", "gfx1101", "gfx1102", "gfx1103", "gfx1150", "gfx1151", "gfx1152", "gfx1200",
+            "gfx1201", "gfx942",
+        ] {
+            assert!(make_caps(arch).has_qwen4_gdn_row_capture(), "{arch}");
+        }
+        for arch in &["gfx1010", "gfx1030", "gfx906", "gfx908", "gfx940", "gfx941", ""] {
+            assert!(!make_caps(arch).has_qwen4_gdn_row_capture(), "{arch:?}");
         }
     }
 

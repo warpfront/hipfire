@@ -87,8 +87,8 @@ pub(crate) mod groups;
 pub mod pages;
 use groups::GroupPlanner;
 
-/// Most lanes one store holds.
-pub(crate) const MAX_LANES: usize = 64;
+/// Most lanes one store holds (gfx942 stock-FP8 serves 64: 259 MiB/lane [MEAS], ~16.6 GB).
+pub const MAX_LANES: usize = 64;
 
 /// Topology of THIS rank's bundle. Expert parallelism is read from the
 /// rank's own weights (peers hold no root `bundle.ep`); a band that is not the
@@ -2366,7 +2366,14 @@ impl Qwen4LaneStore {
         // A head owner (the single scope, every EP rank, the PP output band)
         // holds the MTP head; any other band that owns target layers holds
         // only its lanes' verify rings (target-only ownership).
-        let proto = LaneProto::new(copy.map(|c| c.ngram))?;
+        let mut proto = LaneProto::new(copy.map(|c| c.ngram))?;
+        // G12 input: executor-local adapter, no scheduler interface changes. Exact gfx942 binds
+        // its lane cost profile (static drafting depth, `LaneCostProfile::gfx942`) through the
+        // existing `MeshRoot::bind_cost_arch` before the first lane is admitted; every other
+        // arch keeps the pooled legacy floor of this store.
+        if gpu.arch_caps.is_gfx942() {
+            proto.bind_cost_arch(&gpu.arch);
+        }
         if let Some(spec) = spec {
             let verify_rows = if bundle.has_cpu_deferred_experts() {
                 crate::program::QWEN4_CPU_SPLICE_MAX_ROWS
@@ -2387,6 +2394,22 @@ impl Qwen4LaneStore {
                 return Err(
                     "lane store: MTP lanes need the GDN row capture this GPU lacks".to_string(),
                 );
+            }
+            // gfx942 captures the F32 recurrent state only and runs the single-card
+            // topology (the capture recurrence and its rollback are the gfx942-pinned
+            // F32 persistent body; PP/EP rings were never proven there).
+            if gpu.arch_caps.is_gfx942() {
+                if bundle.state_format().gdn != crate::GdnStateFormat::F32 {
+                    return Err(format!(
+                        "lane store: gfx942 MTP lanes capture the F32 GDN state only, not {}",
+                        bundle.state_format().gdn.name()
+                    ));
+                }
+                if lane_topology(bundle) != LaneTopology::Single {
+                    return Err(
+                        "lane store: gfx942 MTP lanes run the single-card topology only".to_string(),
+                    );
+                }
             }
         }
         // The copy lane widens the store's verify rows and the first

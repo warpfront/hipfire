@@ -159,7 +159,7 @@ environment variable.
 | `--spec <mode>` (alias `--speculation`) | Speculation mode for every load: `off`, `auto`, `ngram`, `dflash`, `mtp`, `dspark`; `off` disables MTP/DFlash |
 | `--idle-timeout <s>` | Idle model-unload timeout, 0..86400 s (`0` = never); overrides `serve.idle_timeout_seconds` |
 | `--tp N` | Tensor/expert-parallel degree (1..64) |
-| `--continuous-batch-size N` | Number of eligible concurrent batched lanes, 1..256 (`1` keeps sequential behavior), subject to memory admission; same range as the `serve.continuous_batch_size` config key. The runtime batch width is dynamic, and the 128/63 chunk sizes are not lane limits |
+| `--continuous-batch-size N` | Number of eligible concurrent batched lanes, 1..256 (`1` keeps sequential behavior), subject to memory admission; same range as the `serve.continuous_batch_size` config key. The runtime batch width is dynamic, and the 128/63 chunk sizes are not lane limits Flash-Next (qwen4 fn-lanes) stores hold at most 64 lanes: `--continuous-batch-size 65..256` is accepted by the schema but the load logs `[daemon] qwen4 lanes refused: lanes=N outside the lane store capacity 1..=64 — fallback to sequential`. On gfx942 the stock-FP8 artifact serves 32 and 64 lanes (lane store ~259 MiB per lane at `max_seq` 16384, ~16.6 GB at 64 [MEAS, 2,069 MiB for 8]); the load line reads `qwen4 fn-lanes staged: topology=single lanes=64 row_budget=...`; a store larger than free device memory is refused with `lane store needs <N> MiB, <M> MiB free`. |
 | `--vision <path>` | Vision-tower sidecar wired into every model load; overrides the registry `vision` slot and `HIPFIRE_VISION_SIDECAR`. Honored by foreground serve only: `-d` does not forward it to the child |
 | `--ui` | Serve the embedded chat UI (see below) |
 | `--open` | Open the chat UI in the default browser once serving; implies `--ui` |
@@ -975,6 +975,9 @@ request run alone on the singleton route. **Default off, experimental.**
   projection once over all rows, bound to the BF16 trunk and the resident FP8
   expert class) but not every single-stage probe, so gfx942 shares all of
   those stages or none; the GDN and QSA cores run one launch per lane there.
+  Steps of 9..=64 rows (more than 8 lanes) run those shared stages, and the
+  routed MoE, once over all rows (always on for gfx942 by arch, no env switch; G0 identical to the singletons at 16 / 32 / 64
+  lanes, see [env-vars.md](env-vars.md)).
   Measured on one MI300X (`hipfire bench --backend batch`, 16 prompts x 128
   tokens, 4 fresh loads): C8 151 tok/s aggregate (TTFT 1.88 s, 208 tok/s
   steady decode) against C1 60 tok/s, every stream's text identical to C1.

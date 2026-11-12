@@ -28,9 +28,33 @@
 //! compared with the singleton reference (first differing byte reported).
 //!
 //! `--g0`: per-stage probe (each non-stateful stage alone at once-over-all-rows,
-//! k=2 and k=8, `min(steps, 16)` steps) and the combined policy at every k.
+//! at `--g0-probe-ks` (default 2,8), `min(steps, 16)` steps) and the combined
+//! policy at every k.
 //! `--controls`: negative controls that MUST be detected (lane swap, wrong
-//! position). `--bench N`: lane step vs singleton step wall time.
+//! position), run at every `--control-ks` (default 2; a wide k such as 16 or 64
+//! puts the swaps and the wrong position on the all-rows segment of a >8-row
+//! step). `--bench N`: lane step vs singleton step wall time.
+//!
+//! gfx942 all-rows L1 (PLAN-beat-sglang §3.L): with
+//! `HIPFIRE_QWEN4_LANE_{HC_ALLROWS,ALLROWS,ALLROWS_MOE}=1` and
+//! `HIPFIRE_QWEN4_LANE_STEP_TRACE=1`, `--ks 16,32,64 --contexts 64,512,2048
+//! --steps 64 --g0 --controls --control-ks 16,64` compares every lane step of
+//! a >8-row step (logits, ids, state checkpoints) with the singletons; the
+//! trace lines in the log show `hc_allrows=true stages_allrows=true moe=allrows`.
+//!
+//! `--wave-prefill` (AR lanes; the exact gfx942 single-device lane prefill wave, P2): every step
+//! plans the prefill tile of EVERY unfinished lane (a burst), so the executor forwards them as
+//! joint waves (`lane_exec::g942_wave`) next to the decoding lanes' AR rows; each lane's prefill
+//! logits row, first token and prefill state checkpoint are compared with the singleton
+//! reference, then every AR step as above. A run in which no wave ran FAILS (a silent serial
+//! fallback is not evidence); per-run JSON carries `waves` / `wave_lanes` / `wave_rows` and
+//! `prefill_items_differing`. `--controls` adds `wave_perturb_prompt` (lane 1's prompt carries
+//! one wrong token; its prefill comparison must fail). Use mixed `--contexts` (57,512,2048) so
+//! waves hold lanes of different lengths.
+//! `--decode-rows N` (with `--wave-prefill`): plan the AR rows of at most `N` lanes per step (a
+//! serve store's `row_budget = N`: 8 on the served C8 shape), so a 32 / 64-lane burst's prefill
+//! wave is compared with serve-shaped decode steps; without it every decoding lane runs in one
+//! step (a many-row decode step is its own lane-oracle subject, not the prefill wave's).
 //!
 //! `--spec mtp [--k 3] [--routes cycle]`: MTP lanes (fn-batch S5). Requires
 //! `HIPFIRE_MTP_INCREMENTAL=0` so the singleton reference window
@@ -169,6 +193,14 @@ struct Args {
     promote: Option<usize>,
     /// Staged lane capacity override; `None` stages exactly the lanes the run drives.
     lane_capacity: Option<usize>,
+    /// `--wave-prefill` (AR lanes, gfx942 single device): every step plans the prefill tile of
+    /// EVERY unfinished lane (a burst), so the executor takes its joint prefill wave; the
+    /// run must have run at least one wave (`g942_wave::wave_counters`), else it fails.
+    wave_prefill: bool,
+    /// `--decode-rows N`: plan the AR rows of at most `N` lanes per step (the lanes with the
+    /// fewest AR steps first), as a serve store with `row_budget = N` does; 0 = every decoding
+    /// lane in one step. Lets a 32 / 64-lane prefill wave run with serve-shaped decode steps.
+    decode_rows: usize,
     /// `--copy` (with `--spec mtp`): the store arms the copy lane; windows,
     /// forced rows and retired-lane head lag run through the shared rank
     /// helper. The run must take at least one copy window.
@@ -179,6 +211,11 @@ struct Args {
     /// `--lag-rows N`: owed head rows a retired lane holds before the root
     /// flushes them (`LaneCopyConfig.head_lag_rows`).
     lag_rows: usize,
+    /// `--control-ks`: lane counts the negative controls run at (default 2: the plan-level swaps
+    /// and the wrong position need only two lanes; a wide k puts them on the all-rows segment).
+    control_ks: Vec<usize>,
+    /// `--g0-probe-ks`: lane counts of the `--g0` per-stage probes (default 2 and 8).
+    probe_ks: Vec<usize>,
 }
 
 fn parse_list(s: &str, what: &str) -> R<Vec<usize>> {
@@ -200,8 +237,9 @@ fn parse_args() -> R<Args> {
 fn parse_args_from(raw: &[String]) -> R<Args> {
     let usage = "usage: fn_lane_oracle MODEL.mq4 TEXT.txt OUT_DIR [--ks 1,2,4,8] [--contexts 512,2048,8192] \
                  [--steps 64] [--max-seq 16384] [--policy production|per-lane|<spec>] [--g0] [--controls] [--bench N] \
+                 [--control-ks 2] [--g0-probe-ks 2,8] \
                  [--spec ar|mtp] [--k K] [--routes floor|cycle|batched] [--promote P] [--lane-capacity N] \
-                 [--copy [--repeat P] [--lag-rows N]]";
+                 [--copy [--repeat P] [--lag-rows N]] [--wave-prefill] [--decode-rows N]";
     let mut pos = Vec::new();
     let mut a = Args {
         model: PathBuf::new(),
@@ -220,9 +258,13 @@ fn parse_args_from(raw: &[String]) -> R<Args> {
         routes: RoutesArg::Cycle,
         promote: None,
         lane_capacity: None,
+        wave_prefill: false,
+        decode_rows: 0,
         copy: false,
         repeat: None,
         lag_rows: 8,
+        control_ks: vec![2],
+        probe_ks: vec![2, 8],
     };
     let mut i = 0;
     let value = |i: &mut usize, flag: &str| -> R<String> {
@@ -254,6 +296,16 @@ fn parse_args_from(raw: &[String]) -> R<Args> {
             }
             "--g0" => a.g0 = true,
             "--controls" => a.controls = true,
+            "--control-ks" => {
+                a.control_ks = parse_list(&value(&mut i, "--control-ks")?, "--control-ks")?
+            }
+            "--g0-probe-ks" => {
+                a.probe_ks = parse_list(&value(&mut i, "--g0-probe-ks")?, "--g0-probe-ks")?
+            }
+            "--wave-prefill" => a.wave_prefill = true,
+            "--decode-rows" => {
+                a.decode_rows = value(&mut i, "--decode-rows")?.parse().map_err(e)?
+            }
             "--copy" => a.copy = true,
             "--repeat" => a.repeat = Some(value(&mut i, "--repeat")?.parse().map_err(e)?),
             "--lag-rows" => a.lag_rows = value(&mut i, "--lag-rows")?.parse().map_err(e)?,
@@ -271,6 +323,12 @@ fn parse_args_from(raw: &[String]) -> R<Args> {
     if a.ks.is_empty() || a.ks.contains(&0) {
         return Err("--ks must be non-empty and positive".into());
     }
+    if a.probe_ks.is_empty() || a.probe_ks.contains(&0) {
+        return Err("--g0-probe-ks must be non-empty and positive".into());
+    }
+    if a.control_ks.is_empty() || a.control_ks.contains(&0) {
+        return Err("--control-ks must be non-empty and positive".into());
+    }
     if a.contexts.is_empty() || a.contexts.contains(&0) {
         return Err("--contexts must be non-empty and positive".into());
     }
@@ -285,6 +343,9 @@ fn parse_args_from(raw: &[String]) -> R<Args> {
     }
     if a.spec_mtp && a.g0 {
         return Err("--g0 probes the AR lane stages; use it with --spec ar".into());
+    }
+    if a.wave_prefill && (a.spec_mtp || a.promote.is_some() || a.copy) {
+        return Err("--wave-prefill drives AR lanes: it does not combine with --spec mtp, --promote or --copy".into());
     }
     if let Some(p) = a.promote {
         if a.spec_mtp && p == 0 {
@@ -327,10 +388,10 @@ const LANE_STORE_MAX_LANES: usize = 64;
 fn required_lanes(args: &Args) -> usize {
     let mut max_k = *args.ks.iter().max().unwrap();
     if args.g0 {
-        max_k = max_k.max(8);
+        max_k = max_k.max(*args.probe_ks.iter().max().unwrap());
     }
     if args.controls {
-        max_k = max_k.max(2);
+        max_k = max_k.max(*args.control_ks.iter().max().unwrap());
     }
     max_k
 }
@@ -899,6 +960,9 @@ enum Control {
     SwapRows,
     /// One lane runs an extra AR row before a step (position ahead).
     WrongPosition,
+    /// `--wave-prefill`: lane 1's prompt carries one wrong token (the plan and the lane agree,
+    /// the reference does not): its prefill logits and state must differ from the reference.
+    WavePerturb,
 }
 
 impl Control {
@@ -909,6 +973,7 @@ impl Control {
             Control::SwapRowSlot => "lane_swap_row_slot",
             Control::SwapRows => "lane_swap_rows",
             Control::WrongPosition => "wrong_position",
+            Control::WavePerturb => "wave_perturb_prompt",
         }
     }
 }
@@ -931,6 +996,13 @@ struct Run {
     diff: Diff,
     /// Mismatches attributable to the prefill (logits row 0, first id, prefill state).
     pre_bad: usize,
+    /// `--wave-prefill`: plan every unfinished lane's prefill tile in one step.
+    wave_prefill: bool,
+    /// `--decode-rows`: most AR rows per step (0 = all).
+    decode_rows: usize,
+    /// `(request, prompt)` the lane of `request` is admitted and planned with instead of the
+    /// reference prompt (the wave perturbation control).
+    prompt_override: Option<(usize, Vec<u32>)>,
     pre_checked: usize,
     lane_steps: usize,
     ckpts: usize,
@@ -1123,8 +1195,15 @@ fn drive(
             break;
         }
         let all_prefilled = run.lanes.iter().all(|l| l.prefilled == l.prompt_len);
-        let pre = run.lanes.iter().position(|l| l.prefilled < l.prompt_len);
-        let ar: Vec<usize> = run
+        let pre: Vec<usize> = run
+            .lanes
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.prefilled < l.prompt_len)
+            .map(|(i, _)| i)
+            .take(if run.wave_prefill { usize::MAX } else { 1 })
+            .collect();
+        let mut ar: Vec<usize> = run
             .lanes
             .iter()
             .enumerate()
@@ -1135,11 +1214,16 @@ fn drive(
             })
             .map(|(i, _)| i)
             .collect();
-        if pre.is_none() && ar.is_empty() {
+        if run.decode_rows > 0 && ar.len() > run.decode_rows {
+            ar.sort_by_key(|&i| (run.lanes[i].ar_steps, i));
+            ar.truncate(run.decode_rows);
+            ar.sort_unstable();
+        }
+        if pre.is_empty() && ar.is_empty() {
             break;
         }
         let mut specs = Vec::new();
-        if let Some(i) = pre {
+        for &i in &pre {
             let l = &run.lanes[i];
             let len = w
                 .bundle
@@ -1152,10 +1236,14 @@ fn drive(
                     l.req, l.prefilled, l.prompt_len
                 ));
             }
+            let prompt = match &run.prompt_override {
+                Some((req, p)) if *req == l.req => p,
+                _ => &refs[l.req].prompt,
+            };
             specs.push(RowSpec {
                 slot: l.slot,
                 epoch: l.epoch,
-                tokens: refs[l.req].prompt[l.prefilled..l.prefilled + len].to_vec(),
+                tokens: prompt[l.prefilled..l.prefilled + len].to_vec(),
                 start: l.prefilled,
                 kind: RequestStepKind::Prefill,
             });
@@ -1396,6 +1484,9 @@ struct App {
     /// `--copy`: the store arms the copy lane and the reference phase checks the copy lane's
     /// identity instead of replaying the windows on the singleton.
     copy: bool,
+    /// `--wave-prefill`: every step plans the prefill tile of every unfinished lane.
+    wave_prefill: bool,
+    decode_rows: usize,
 }
 
 impl App {
@@ -1427,6 +1518,7 @@ impl App {
         promote: Option<ArPromote>,
     ) -> RunReport {
         let started = Instant::now();
+        let waves0 = hipfire_arch_qwen4::lane_exec::g942_wave::wave_counters();
         let mut run = Run {
             lanes: Vec::new(),
             diff: Diff::default(),
@@ -1440,6 +1532,9 @@ impl App {
             refused: None,
             control_note: None,
             release_errors: Vec::new(),
+            wave_prefill: self.wave_prefill,
+            decode_rows: self.decode_rows,
+            prompt_override: None,
         };
         let res = (|| -> R<()> {
             self.w
@@ -1469,7 +1564,16 @@ impl App {
                     request_tag: self.tag,
                     owner_generation: 1,
                 };
-                let prompt = self.refs[req].prompt.clone();
+                let mut prompt = self.refs[req].prompt.clone();
+                if control == Control::WavePerturb && req == 1 {
+                    let at = prompt.len() / 2;
+                    prompt[at] = (prompt[at] + 1) % self.w.vocab as u32;
+                    run.prompt_override = Some((req, prompt.clone()));
+                    run.fired = true;
+                    run.control_note = Some(format!(
+                        "request 1's prompt token {at} changed by one (reference prompt unchanged)"
+                    ));
+                }
                 let prompt_len = prompt.len();
                 let slot = self
                     .w
@@ -1505,6 +1609,18 @@ impl App {
                     .push(format!("release request {}: {x}", l.req));
             }
         }
+        let waves1 = hipfire_arch_qwen4::lane_exec::g942_wave::wave_counters();
+        let waves = (
+            waves1.0 - waves0.0,
+            waves1.1 - waves0.1,
+            waves1.2 - waves0.2,
+        );
+        if self.wave_prefill && waves.0 == 0 && run.error.is_none() {
+            run.diff.note(
+                "--wave-prefill: no prefill wave ran (the serial lane tiles took every step)"
+                    .to_string(),
+            );
+        }
         let clean = run.diff.bad == 0 && run.error.is_none() && run.release_errors.is_empty();
         let first = run
             .error
@@ -1534,6 +1650,12 @@ impl App {
             "control_note": run.control_note,
             "release_errors": run.release_errors,
             "prefill_pass": prefill_pass,
+            "prefill_lanes_checked": run.pre_checked,
+            "prefill_items_differing": run.pre_bad,
+            "wave_prefill": self.wave_prefill,
+            "waves": waves.0,
+            "wave_lanes": waves.1,
+            "wave_rows": waves.2,
             "wall_s": started.elapsed().as_secs_f64(),
         });
         RunReport {
@@ -3056,6 +3178,8 @@ fn spec_main(
         lanes_dir: args.out.join("lanes"),
         ar_ids: Vec::new(),
         copy: args.copy,
+        wave_prefill: false,
+        decode_rows: 0,
     };
     let short_steps = args.steps.min(16);
     let mut all_pass = true;
@@ -3127,7 +3251,15 @@ fn spec_main(
             false,
         );
         app.log.say(r.line.clone());
-        let exercised = r.stats.rejected > 0;
+        // The skipped rollback keeps every verified row of a REJECTED window, so the rank's own
+        // head-schedule check ("the rank appended ... head rows, the decision schedules ...")
+        // catches it at the first such window, before that window is recorded: an executor error
+        // of exactly that kind is the control being exercised and detected.
+        let schedule_caught = r.run.error.as_deref().is_some_and(|m| {
+            m.contains("head rows, the decision schedules")
+                || m.contains("head rows, the decision's schedule is")
+        });
+        let exercised = r.stats.rejected > 0 || schedule_caught;
         let diverged = r.run.diff.bad > 0 || r.run.error.is_some();
         let (detected, how) = if !exercised {
             (
@@ -3320,6 +3452,27 @@ fn load(
     attach_mtp: bool,
 ) -> R<(HfqModelSource, World, Tokenizer)> {
     let mut hfq = HfqFile::open(path).map_err(e)?;
+    // A stock-FP8 artifact has no MTP head of its own: with MTP requested its `<model>.mtp`
+    // sidecar is bound and merged at admission (the standalone recipe of
+    // `tests/common/stock_mtp_load.rs`).
+    let stock_mtp = if attach_mtp {
+        let sidecar = hipfire_arch_qwen4::stock_mtp_sidecar::qwen4_stock_mtp_sidecar_path(path);
+        if sidecar.is_file() {
+            let bound = hipfire_arch_qwen4::stock_mtp_sidecar::bind_stock_mtp_sidecar(&hfq, &sidecar)
+                .map_err(|reason| {
+                    hipfire_arch_qwen4::stock_mtp_sidecar::stock_mtp_refusal_line(&sidecar, &reason)
+                })?;
+            eprintln!(
+                "{}",
+                hipfire_arch_qwen4::stock_mtp_sidecar::stock_mtp_attached_line(&bound)
+            );
+            Some(bound)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json).map_err(e)?;
     // Daemon parity: keep host-mapped expert memory out of reclaim before the first HIP call (KFD userptr eviction stalls, ROCm/rocm-systems#12528).
     hipfire_loader::prepare_host_memory_for(path);
@@ -3337,7 +3490,16 @@ fn load(
     )?;
     // Admission is GPU-arch aware: an expert-slab artifact admits only on a
     // supported arch. Initialising the GPU allocates no model memory.
-    let receipt = admit_hfqm_artifact_on(&hfq, Some(&gpu.arch)).map_err(e)?;
+    let receipt = match stock_mtp.as_ref() {
+        Some(bound) => hipfire_arch_qwen4::artifact::admit_hfqm_artifact_with(
+            &hfq,
+            Some(&gpu.arch),
+            false,
+            Some(bound),
+        ),
+        None => admit_hfqm_artifact_on(&hfq, Some(&gpu.arch)),
+    }
+    .map_err(e)?;
     match &choice {
         Some(choice) => {
             eprintln!(
@@ -3377,6 +3539,13 @@ fn load(
     let mesh = DeviceMesh::single().map_err(e)?;
     let expected = WeightOrigin::for_single(&mesh, &gpu);
     let source = HfqModelSource::from_hfq(hfq);
+    // The sidecar is served Borrowed from its own mapping (never a range: a second backing file
+    // would fail the direct reader's identity check).
+    let mtp_side = stock_mtp.map(|bound| {
+        let mut side = HfqModelSource::from_hfq(bound.hfq);
+        side.set_prefer_ranges(false);
+        side
+    });
     // `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS=N` keeps trunk layers 0..N resident
     // and host-maps the rest (a slab artifact larger than one card).
     let weights = {
@@ -3408,6 +3577,13 @@ fn load(
         &mut gpu,
         expected,
         |entry| {
+            // The stock-FP8 head sidecar: `mtp.*` is its own mapping's, everything else the base's.
+            if let Some(side) = mtp_side.as_ref().filter(|_| entry.name.starts_with("mtp.")) {
+                let (info, bytes) = side
+                    .tensor_data(&entry.name)
+                    .ok_or_else(|| format!("missing sidecar tensor '{}'", entry.name))?;
+                return Ok(SourcePayload::Borrowed { info, bytes });
+            }
             if let Some(payload) = hipfire_arch_qwen4::expert_arena::recipe_arena_payload(
                 &source,
                 &receipt.manifest.identity.recipe,
@@ -3458,6 +3634,10 @@ fn load(
         .map_err(e)?;
     if attach_mtp {
         bundle.attach_mtp(&mut gpu, max_seq).map_err(e)?;
+        if mtp_side.is_some() {
+            // The loader settles the int8 routed-down verdict right after its head-attach step.
+            bundle.settle_moe_down_a8_head(&mut gpu, true).map_err(e)?;
+        }
     }
     bundle
         .stage_lanes_with_copy(&mut gpu, lane_capacity, lane_capacity, spec, copy)
@@ -3681,6 +3861,8 @@ fn real_main() -> R<bool> {
         lanes_dir: args.out.join("lanes"),
         ar_ids: Vec::new(),
         copy: false,
+        wave_prefill: args.wave_prefill,
+        decode_rows: args.decode_rows,
     };
     let full = RunOpts { prefill_ckpt: true };
     let mut all_pass = true;
@@ -3743,7 +3925,7 @@ fn real_main() -> R<bool> {
             let mut identical = true;
             let mut first: Option<String> = None;
             let mut per_k = Vec::new();
-            for k in [2usize, 8] {
+            for &k in &args.probe_ks {
                 let label = format!("g0:{}=once", stage.key());
                 let r = app.run_lanes(k, short_steps, policy, &label, Control::None, &probe);
                 if !r.pass {
@@ -3805,56 +3987,77 @@ fn real_main() -> R<bool> {
             return Err("--controls needs --steps >= 4".into());
         }
         let probe = RunOpts { prefill_ckpt: true };
-        for control in [
-            Control::SwapTokens,
-            Control::SwapRowSlot,
-            Control::SwapRows,
-            Control::WrongPosition,
-        ] {
-            let r = app.run_lanes(2, short_steps, primary, &args.policy, control, &probe);
-            let refused = r.run.refused.clone();
-            let diverged = r.run.diff.bad > 0 || r.run.error.is_some();
-            let (detected, how) = if !r.run.fired {
-                (
-                    false,
-                    "control was not exercised (no eligible step)".to_string(),
-                )
-            } else if let Some(m) = &refused {
-                (true, format!("refused at provision: {m}"))
-            } else if diverged {
-                (
-                    true,
-                    format!("comparison failed: {}", r.first.clone().unwrap_or_default()),
-                )
-            } else {
-                (false, "comparison still passed".to_string())
-            };
-            // A refused plan must leave every lane byte-exact for the rest of the run.
-            let clean_after_refusal = refused.is_none() || r.pass;
-            let ok = detected && clean_after_refusal;
-            all_pass &= ok;
-            let mut line = format!(
-                "control {}: {}",
-                control.name(),
-                if detected { "detected" } else { "MISSED" }
-            );
-            line += &format!(" ({how})");
-            if !clean_after_refusal {
-                line += &format!(
-                    "; FAIL: the refusal left lane state modified: {}",
-                    r.first.clone().unwrap_or_default()
-                );
+        for &control_k in &args.control_ks {
+            let mut controls = vec![
+                Control::SwapTokens,
+                Control::SwapRowSlot,
+                Control::SwapRows,
+                Control::WrongPosition,
+            ];
+            if args.wave_prefill {
+                controls.push(Control::WavePerturb);
             }
-            app.log.say(line);
-            controls_json.push(json!({
-                "control": control.name(),
-                "detected": detected,
-                "how": how,
-                "refused_at_provision": refused,
-                "clean_after_refusal": clean_after_refusal,
-                "note": r.run.control_note,
-                "run": r.json,
-            }));
+            for control in controls {
+                let r = app.run_lanes(
+                    control_k,
+                    short_steps,
+                    primary,
+                    &args.policy,
+                    control,
+                    &probe,
+                );
+                let refused = r.run.refused.clone();
+                let diverged = r.run.diff.bad > 0 || r.run.error.is_some();
+                // The wave perturbation is detected by the PREFILL comparison failing (a run that
+                // failed only because no wave ran does not count).
+                let diverged = if control == Control::WavePerturb {
+                    r.run.pre_bad > 0
+                } else {
+                    diverged
+                };
+                let (detected, how) = if !r.run.fired {
+                    (
+                        false,
+                        "control was not exercised (no eligible step)".to_string(),
+                    )
+                } else if let Some(m) = &refused {
+                    (true, format!("refused at provision: {m}"))
+                } else if diverged {
+                    (
+                        true,
+                        format!("comparison failed: {}", r.first.clone().unwrap_or_default()),
+                    )
+                } else {
+                    (false, "comparison still passed".to_string())
+                };
+                // A refused plan must leave every lane byte-exact for the rest of the run.
+                let clean_after_refusal = refused.is_none() || r.pass;
+                let ok = detected && clean_after_refusal;
+                all_pass &= ok;
+                let mut line = format!(
+                    "control {} k={control_k}: {}",
+                    control.name(),
+                    if detected { "detected" } else { "MISSED" }
+                );
+                line += &format!(" ({how})");
+                if !clean_after_refusal {
+                    line += &format!(
+                        "; FAIL: the refusal left lane state modified: {}",
+                        r.first.clone().unwrap_or_default()
+                    );
+                }
+                app.log.say(line);
+                controls_json.push(json!({
+                    "control": control.name(),
+                    "k": control_k,
+                    "detected": detected,
+                    "how": how,
+                    "refused_at_provision": refused,
+                    "clean_after_refusal": clean_after_refusal,
+                    "note": r.run.control_note,
+                    "run": r.json,
+                }));
+            }
         }
         app.log.say(
             "control lane_swap (device level): no test-visible path exchanges two lanes' Qwen4State; \
@@ -3956,7 +4159,7 @@ fn real_main() -> R<bool> {
             "ks": args.ks, "contexts": args.contexts, "steps": args.steps, "max_seq": args.max_seq,
             "lane_capacity": lane_capacity,
             "policy": args.policy, "policy_described": primary.describe(), "g0": args.g0,
-            "controls": args.controls, "bench": args.bench, "spec": "ar",
+            "controls": args.controls, "bench": args.bench, "spec": "ar", "wave_prefill": args.wave_prefill, "decode_rows": args.decode_rows,
             "promote": args.promote, "k": args.promote.map(|_| args.k),
         },
         "policy_evidence": app.w.bundle.lanes().map_or("", |store| store.evidence()),
@@ -4187,5 +4390,36 @@ mod lane_capacity_tests {
         assert_eq!(a.ks, vec![1]);
         let k4 = parse(&["--ks", "4", "--lane-capacity", "8"]).unwrap();
         assert_eq!((k4.ks.clone(), required_lanes(&k4)), (vec![4], 4));
+    }
+
+    #[test]
+    fn wide_control_and_probe_ks_set_the_reference_count() {
+        let wide = parse(&[
+            "--ks",
+            "16,32,64",
+            "--g0",
+            "--g0-probe-ks",
+            "2,8",
+            "--controls",
+            "--control-ks",
+            "16,64",
+        ])
+        .unwrap();
+        assert_eq!(
+            (wide.probe_ks.clone(), wide.control_ks.clone()),
+            (vec![2, 8], vec![16, 64])
+        );
+        assert_eq!(required_lanes(&wide), 64);
+        // A control k above the main ks still needs its own references.
+        let ctl = parse(&["--ks", "2", "--controls", "--control-ks", "32"]).unwrap();
+        assert_eq!(required_lanes(&ctl), 32);
+        // Defaults keep the historical 2-lane controls and 2 / 8 probes.
+        let default = parse(&["--ks", "2", "--g0", "--controls"]).unwrap();
+        assert_eq!(
+            (default.control_ks, default.probe_ks),
+            (vec![2], vec![2, 8])
+        );
+        assert!(parse(&["--control-ks", "0"]).is_err());
+        assert!(parse(&["--g0-probe-ks", ""]).is_err());
     }
 }

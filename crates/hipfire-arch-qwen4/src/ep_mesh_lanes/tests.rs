@@ -648,6 +648,7 @@ fn mesh_lane_ep_multi_group_all_rows_step_plans_one_exchange_per_layer() {
         gather_cap: Some(48),
         trunk_ar_write: trunk,
         band_moe_calls: 48,
+        g942_single: false,
         policy: crate::gpu_forward_lanes::LaneStagePolicy::production(),
     };
     for trunk in [false, true] {

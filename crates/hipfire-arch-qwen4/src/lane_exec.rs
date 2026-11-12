@@ -139,6 +139,10 @@ pub(crate) static LANE_TILE_PHASES: std::sync::LazyLock<bool> = std::sync::LazyL
     hipfire_config::developer_var("HIPFIRE_CB_PHASES").is_ok_and(|v| v.trim() == "1")
 });
 
+/// gfx942 single-device lane prefill wave: policy, scope and serve-admission knobs (P2).
+#[path = "gpu_forward/g942_wave.rs"]
+pub mod g942_wave;
+
 /// The knob of the EXACT joint prefill wave of a step's sub-512-row lane prefill tiles (EP lane
 /// forwards only; see [`plan_prefill_parts`]). Default ON; `0` is the kill switch: every tile is
 /// its own serial singleton chunk forward, byte-identical to the wave's output anyway.
@@ -1473,6 +1477,13 @@ fn run_prefill_tiles(
         }
     }
     let wide_width = bundle.config.hc_count * bundle.config.hidden_size;
+    // gfx942 single device (P2): every run of two or more non-MTP tiles is one joint wave.
+    let parts = if g942_wave::wave_applies(gpu, bundle) {
+        let plain: Vec<bool> = lanes.iter().map(|lane| lane.spec.is_none()).collect();
+        g942_wave::plan_parts(&tile_rows, &plain, g942_wave::wave_cap(bundle))
+    } else {
+        parts
+    };
     let tiles_ran: Result<(), String> = (|| {
         for part in parts {
             let i = match part {
@@ -1523,6 +1534,9 @@ fn run_prefill_tiles(
                             ),
                         };
                         waved.map_err(|e| e.to_string())?;
+                    }
+                    if g942_wave::wave_applies(gpu, bundle) {
+                        g942_wave::note_wave(gpu.device_id, count, total_rows);
                     }
                     // Each MTP lane's head fill, in plan order, from its own rows of the capture
                     // (the same head append, pairing and pending hidden as its serial tile).

@@ -35,6 +35,12 @@ pub use qsa_core_lanes::{
 };
 pub(crate) use qsa_core_lanes::{QSA_LANES_FUSE_SRC, QSA_LANES_SRC};
 
+// The same core on exact gfx942 (F32 / E4M3-FNUZ K/V, F32 index keys): admission only, the
+// kernels and launcher live in `cdna/gfx942_qsa_lanes.rs`.
+#[path = "qsa_core_lanes_gfx942.rs"]
+mod qsa_core_lanes_gfx942;
+pub use qsa_core_lanes_gfx942::{qsa_core_lanes_gfx942, qsa_core_lanes_gfx942_min};
+
 pub(crate) const TENSOR_OPS_SRC: &str = concat!(
     include_str!("../../../kernels/src/mq_fwht256.h"),
     include_str!("../../../kernels/src/rope_yarn.h"),
@@ -1056,7 +1062,7 @@ pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) ->
         arch_gfx942: gpu.arch == "gfx942",
         pipe_enabled: *QWEN4_GDN_PIPE,
     });
-    gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
+    let kernel = crate::cdna::gfx942::ensure_gdn_verify_kernel(gpu, kernel)?;
     let frame = if format.has_frame_kernarg() {
         checked_u32(p.position + p.rows - 1, "GDN Q8 frame")?
     } else {
@@ -1091,6 +1097,15 @@ pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) ->
         args.as_mut_slice(),
         crate::dispatch::ReplayLaunchBindings::NONE,
     )
+}
+
+/// Load `kernel` from the `tensor_ops` module itself and return it, whatever the arch routes
+/// the public launchers to: the byte-compare REFERENCE of the exact-gfx942 verify-module oracle
+/// cases (`gdn_capture_f32_gfx942_oracle`), which launch the `tensor_ops` convolution and
+/// gated-norm kernels directly through [`Gpu::launch_kernel_blob`].
+#[doc(hidden)]
+pub fn lab_ensure_tensor_ops_kernel(gpu: &mut Gpu, kernel: &str) -> HipResult<()> {
+    gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)
 }
 
 /// Single-launch rollback kernel of a state's STORAGE format. Q8Ef has no
@@ -1153,7 +1168,7 @@ pub fn gated_delta_rollback_layers(
             "GDN rollback: a Q8Ef state rolls back with its residual (gated_delta_rollback_layers_ef)",
         ));
     };
-    gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
+    let kernel = crate::cdna::gfx942::ensure_gdn_verify_kernel(gpu, kernel)?;
     let mut args = KernargBlob::new();
     args.push_ptr(p.table.buf.as_ptr());
     args.push_ptr(p.discard.buf.as_ptr());
@@ -4641,7 +4656,7 @@ fn gated_delta_conv_batched_impl(
     } else {
         "gated_delta_conv_bf16_f32_batched_k4"
     };
-    gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
+    let kernel = crate::cdna::gfx942::ensure_gdn_verify_kernel(gpu, kernel)?;
     let mut args = KernargBlob::new();
     for tensor in [p.input, p.kernel, p.history, p.output, p.next_history] {
         args.push_ptr(tensor.buf.as_ptr());
@@ -4949,11 +4964,8 @@ pub fn gated_delta_gate_batched(gpu: &mut Gpu, p: &GatedDeltaGateBatched<'_>) ->
     let value_heads = checked_i32(p.value_heads, "GDN batched gate heads")?;
     let value_dim = checked_i32(p.value_dim, "GDN batched gate width")?;
     let value_heads_grid = checked_u32(elements / p.value_dim, "GDN batched gate grid")?;
-    gpu.ensure_kernel_public(
-        "tensor_ops",
-        TENSOR_OPS_SRC,
-        "gated_delta_gate_bf16_f32_batched",
-    )?;
+    let gate_kernel =
+        crate::cdna::gfx942::ensure_gdn_verify_kernel(gpu, "gated_delta_gate_bf16_f32_batched")?;
     let mut args = KernargBlob::new();
     for tensor in [p.recurrent_output, p.z, p.norm, p.output] {
         args.push_ptr(tensor.buf.as_ptr());
@@ -4963,7 +4975,7 @@ pub fn gated_delta_gate_batched(gpu: &mut Gpu, p: &GatedDeltaGateBatched<'_>) ->
     args.push_i32(value_dim);
     args.pad_to(16);
     gpu.launch_blob_recorded(
-        "gated_delta_gate_bf16_f32_batched",
+        gate_kernel,
         [value_heads_grid, 1, 1],
         [32, 1, 1],
         0,

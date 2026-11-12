@@ -6133,6 +6133,7 @@ mod tests {
             gather_cap,
             trunk_ar_write,
             band_moe_calls: 48,
+            g942_single: false,
             policy: crate::gpu_forward_lanes::LaneStagePolicy::production(),
         }
     }

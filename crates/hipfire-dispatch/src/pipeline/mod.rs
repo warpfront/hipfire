@@ -65,12 +65,14 @@ pub mod batched_deltanet;
 #[cfg(feature = "deltanet")]
 pub mod batched_moe;
 pub mod gated_mlp;
+pub(crate) mod gdn;
 #[cfg(feature = "deltanet")]
 pub mod hybrid;
 pub mod latent_attention;
 pub(crate) mod layer_ops;
 pub mod mla;
 pub mod projection_split;
+pub(crate) mod qsa;
 pub mod sandwich;
 pub mod step_graph;
 pub(crate) mod steps;
