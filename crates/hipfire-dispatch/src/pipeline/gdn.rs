@@ -288,7 +288,7 @@ where
     // The phases reorder lane chains against each other: lanes must share no written buffer
     // (the conv ring, the recurrence inputs and outputs, the gated output and the state / its
     // capture ring), or a lane's chain would see another's writes.
-    let sets: [Vec<(usize, usize)>; 10] = [
+    let sets: [Vec<(usize, usize)>; 11] = [
         ar_lanes
             .iter()
             .map(|(op, _)| extent(op.conv_state))
@@ -315,10 +315,11 @@ where
             .iter()
             .map(|(_, c, _)| extent(c.recurrence))
             .collect(),
-        capture_lanes
-            .iter()
-            .flat_map(|(op, c, _)| [extent(&c.states), extent(op.recurrent)])
-            .collect(),
+        capture_lanes.iter().map(|(_, c, _)| extent(&c.states)).collect(),
+        // The live states are pairwise disjoint. A lane's own live slot may sit inside its
+        // capture view (the ring halves alternate per window); the launch checks that the
+        // slot it WRITES (`rows - 1`) never overlaps a state it reads.
+        capture_lanes.iter().map(|(op, ..)| extent(op.recurrent)).collect(),
     ];
     if !sets.into_iter().all(disjoint) {
         return { eprintln!("[DBGDECL] site 5 ops={}", ops.len()); Ok(Gfx942GdnLanes::Declined(before_launch)) };
