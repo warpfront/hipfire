@@ -13,7 +13,7 @@
 //! DOT OPSEL, and packed32 inline sources (whose two-item materialization is
 //! not specified here) return Unsupported. MFMA ignores EXEC and round MODE
 //! (CDNA3 ISA §7.1.2 Table 28 p.42); no inactive-lane reduction is invented.
-use super::{unsupported, Config, Flow, SimError, SimResult, Ty, Wave};
+use super::{unsupported, Config, Flow, Mode, SimError, SimResult, Ty, Wave};
 use crate::arch::Arch;
 use crate::enc::vop3p::{Mai, MaiOp, MfmaShape, MfmaType, Vop3p, Vop3pOp};
 use crate::float::{self, F8};
@@ -831,6 +831,9 @@ fn exec_packed(w: &mut Wave, i: &Vop3p) -> SimResult<()> {
                 let lo = (src[0] >> (32 * (i.op_sel & 1))) as u32;
                 let hi = (src[1] >> (32 * ((i.op_sel >> 1) & 1))) as u32;
                 w.write_v64(i.dst, lane, u64::from(lo) | (u64::from(hi) << 32))?;
+            } else if i.op == FmaMixF32 && w.arch == Arch::Gfx942 {
+                let value = fma_mix_f32_gfx942(i, src, &w.mode);
+                w.write_v(i.dst, lane, value)?;
             } else if mix {
                 let mut f = [0f32; 3];
                 for index in 0..3 {
@@ -1047,6 +1050,113 @@ fn clamp_float(value: f32, clamp: bool, dx10_clamp: bool) -> f32 {
     } else {
         value.max(0.0).min(1.0)
     }
+}
+
+/// One `v_fma_mix_f32` source, gfx942: an f32 word (input denormals flushed when `denorm32` bit 0 is clear) or one
+/// f16 half widened to f32 (input denormals flushed when `denorm16_64` bit 0 is clear). A half NaN keeps its sign and
+/// payload shifted into the f32 mantissa and is NOT quieted (`0x7c01` -> `0x7f802000`): the quiet bit is only set by
+/// the result stage under MODE.IEEE. [MI300X receipt cdna_mix_hw_oracle/1 r1, 32 MODE settings x 1024 variants.]
+fn mix_f32_source(word: u64, f16: bool, half: u64, mode: &Mode) -> u32 {
+    if !f16 {
+        let bits = word as u32;
+        return if mode.denorm32 & 1 == 0 && bits & 0x7f80_0000 == 0 {
+            bits & 0x8000_0000
+        } else {
+            bits
+        };
+    }
+    let mut h = (word >> (16 * half)) as u16;
+    if mode.denorm16_64 & 1 == 0 && h & 0x7c00 == 0 {
+        h &= 0x8000;
+    }
+    if h & 0x7c00 == 0x7c00 && h & 0x03ff != 0 {
+        u32::from(h & 0x8000) << 16 | 0x7f80_0000 | u32::from(h & 0x03ff) << 13
+    } else {
+        float::f16_to_f32(h).to_bits()
+    }
+}
+
+/// True when the exact value `a*b+c` (signed by `negative`) rounds, as if the exponent range were unbounded
+/// (24-bit significand, RNE), to a magnitude below 2^-126, given that the fixed-grid RNE result is exactly
+/// +-2^-126. The unbounded rounding grid just below 2^-126 is 2^-150, so that holds iff the exact magnitude is
+/// strictly below `2^-126 - 2^-151` (the tie rounds to even, i.e. up to 2^-126). `a*b` is exact in f64 and
+/// `two_sum` makes `(s, err)` the exact sum, so the comparison is exact.
+fn fma_tiny_after_rounding(a: f32, b: f32, c: f32, negative: bool) -> bool {
+    let p = f64::from(a) * f64::from(b);
+    let c = f64::from(c);
+    let s = p + c;
+    let bb = s - p;
+    let err = (p - (s - bb)) + (c - bb);
+    let (s, err) = if negative { (-s, -err) } else { (s, err) };
+    let threshold = f64::from(f32::MIN_POSITIVE) - f64::from_bits(872u64 << 52);
+    s < threshold || (s == threshold && err < 0.0)
+}
+
+/// `v_fma_mix_f32` on gfx942 (all sources read as B32 words; inline-constant / SGPR materialization of a half
+/// selection is NOT measured). Rules, each reproduced exactly by the MI300X receipt cdna_mix_hw_oracle/1 r1
+/// (all 32 MODE settings; NaN-result histograms, sNaN counts and finite-flush counts equal):
+///
+/// * NaN result: after source selection and NEG_LO (which flips a NaN's sign too), (1) `0 * inf` (both non-NaN)
+///   gives the default NaN `0xffc00000` even when a source is NaN; (2) else the first NaN source in order
+///   src0, src1, src2 is returned with its sign and payload, quiet bit set iff MODE.IEEE (an sNaN passes
+///   unquieted with IEEE=0); (3) else `inf - inf` gives `0xffc00000`. With CLAMP a NaN result is `+0.0` when
+///   MODE.DX10_CLAMP is set and otherwise passes unchanged.
+/// * Finite results: single-rounded fused multiply-add. With `denorm32` bit 1 clear (output flush) a result is
+///   flushed to a zero of the result's sign when it is tiny AFTER rounding with an unbounded exponent range, i.e. a
+///   fixed-grid result of exactly 2^-126 that came from an exact value below `2^-126 - 2^-151` is flushed too
+///   (not the fixed-grid subnormal check alone).
+///
+/// [UNVERIFIED: confirm on MI300X] the exact tie `|a*b+c| == 2^-126 - 2^-151` (no such row in r1; modelled as
+/// round-to-even, i.e. not flushed); sign of a clamped -0.0 is the host's `f32::max` (r1 shows no mismatch).
+fn fma_mix_f32_gfx942(i: &Vop3p, src: [u64; 3], mode: &Mode) -> u32 {
+    let mut x = [0u32; 3];
+    for (k, bits) in x.iter_mut().enumerate() {
+        *bits = mix_f32_source(
+            src[k],
+            i.op_sel_hi >> k & 1 != 0,
+            u64::from(i.op_sel >> k & 1),
+            mode,
+        );
+        if i.neg_hi >> k & 1 != 0 {
+            *bits &= 0x7fff_ffff;
+        }
+        if i.neg_lo >> k & 1 != 0 {
+            *bits ^= 0x8000_0000;
+        }
+    }
+    let nan = |b: u32| b & 0x7fff_ffff > 0x7f80_0000;
+    let inf = |b: u32| b & 0x7fff_ffff == 0x7f80_0000;
+    let zero = |b: u32| b & 0x7fff_ffff == 0;
+    let default_nan = 0xffc0_0000u32;
+    let product_finite_operands = !nan(x[0]) && !nan(x[1]);
+    let invalid_product =
+        product_finite_operands && (zero(x[0]) && inf(x[1]) || inf(x[0]) && zero(x[1]));
+    let nan_result = if invalid_product {
+        Some(default_nan)
+    } else if let Some(&first) = x.iter().find(|&&b| nan(b)) {
+        Some(if mode.ieee {
+            first | 0x0040_0000
+        } else {
+            first
+        })
+    } else if (inf(x[0]) || inf(x[1])) && inf(x[2]) && (x[0] ^ x[1]) >> 31 != x[2] >> 31 {
+        Some(default_nan)
+    } else {
+        None
+    };
+    if let Some(bits) = nan_result {
+        return if i.clamp && mode.dx10_clamp { 0 } else { bits };
+    }
+    let [f0, f1, f2] = x.map(f32::from_bits);
+    let value = clamp_float(f0.mul_add(f1, f2), i.clamp, mode.dx10_clamp);
+    if mode.denorm32 & 2 == 0
+        && (value.is_subnormal()
+            || value.abs() == f32::MIN_POSITIVE
+                && fma_tiny_after_rounding(f0, f1, f2, value.is_sign_negative()))
+    {
+        return value.to_bits() & 0x8000_0000;
+    }
+    value.to_bits()
 }
 fn integer_half(op: Vop3pOp, a: u16, b: u16, clamp: bool) -> u16 {
     use Vop3pOp::*;

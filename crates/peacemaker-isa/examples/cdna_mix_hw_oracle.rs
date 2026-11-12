@@ -5,9 +5,10 @@
 //! MI300X (gfx942) hardware oracle of the PeaceMaker CDNA interpreter for the promoted `v_fma_mix_f32`.
 //!
 //! Scope: `FmaMixF32` only, `NEG_HI = 0` (no `|abs|` source modifier), `NEG_LO` (all 8 masks), `CLAMP`, and every
-//! source selection (`OP_SEL` 0..7 x `OP_SEL_HI` 0..7 = 64 combinations): 64 hipcc kernels x 16 `asm volatile`
-//! instructions = 1024 variants. `v_fma_mix_f32` is the only op; `v_fma_mixlo/hi_f16`, `v_mad_mix*`, `|abs|`
-//! and gfx950 are NOT covered and nothing here promotes them.
+//! source selection (`OP_SEL` 0..7 x `OP_SEL_HI` 0..7 = 64 combinations), across VGPRs, an SGPR
+//! in each position, inline 1.0 in each position, and inline -1 in each position: 10240 variants.
+//! `v_fma_mix_f32` (XML alias `V_MAD_MIX_F32`) is the only op; mixed half-result instructions,
+//! `|abs|` and gfx950 are NOT covered and nothing here promotes them.
 //!
 //! Every variant runs on the card (generated HIP source, real `hipcc` code object, `hipModuleLoadData`) and in the
 //! interpreter (`peacemaker_cdna::sim::exec_one` on a `Wave`, one `Inst::Vop3p` per 64 lanes) over the same
@@ -35,7 +36,7 @@
 //! ```text
 //! cdna_mix_hw_oracle --hip-work DIR --receipt FILE.json [--patterns N] [--dry-run]
 //! ```
-//! * `--patterns N`: rows per variant, multiple of 256, >= 13568 (default 16384).
+//! * `--patterns N`: rows per variant, multiple of 256, >= 16640 (default 16640).
 //! * `--dry-run`: NO hardware, NO hipcc, NO HIP call. Only the generated source/inputs and the interpreter run; the
 //!   controls compare mutated interpreters with the baseline interpreter. The receipt says
 //!   `"hardware_evidence": false` and `"verdict": "DRY_RUN_NO_HARDWARE_CLAIM"`; it proves nothing about the card.
@@ -47,7 +48,7 @@ use hip_bridge::{DeviceBuffer, Function, HipRuntime, Module};
 use peacemaker_cdna::enc::vop3p::{Vop3p, Vop3pOp};
 use peacemaker_cdna::float::{f16_to_f32, f32_to_f16_rne};
 use peacemaker_cdna::inst::Inst;
-use peacemaker_cdna::operand::Src;
+use peacemaker_cdna::operand::{InlineFloat, Src};
 use peacemaker_cdna::sim::{exec_one, Config, Memory, Mode, Wave};
 use peacemaker_cdna::Arch;
 use serde_json::{json, Map, Value};
@@ -58,23 +59,61 @@ use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-const USAGE: &str = "usage: cdna_mix_hw_oracle --hip-work DIR --receipt FILE [--patterns N] [--dry-run]\n\
+const USAGE: &str =
+    "usage: cdna_mix_hw_oracle --hip-work DIR --receipt FILE [--patterns N] [--dry-run]\n\
   --hip-work DIR  directory for the generated .hip source and the hipcc code object\n\
   --receipt FILE  receipt JSON (rewritten after every mode)\n\
-  --patterns N    rows per variant (multiple of 256, >= 13568; default 16384)\n\
+  --patterns N    rows per variant (multiple of 256, >= 16640; default 16640)\n\
   --dry-run       NO hardware claim: interpreter + controls only, no hipcc, no HIP call";
 
 const EXPECTED_ARCH: &str = "gfx942";
-/// 8 op_sel x 8 op_sel_hi kernels; kernel k = op_sel * 8 + op_sel_hi.
-const NK: usize = 64;
+/// All VGPR, then one SGPR / inline float / inline integer in each source position.
+const NSHAPES: usize = 10;
+const NK: usize = NSHAPES * 64;
 /// Variants per kernel: v = neg_lo * 2 + clamp.
 const NV: usize = 16;
+
+fn kernel_fields(k: usize) -> (usize, u8, u8) {
+    (k / 64, (k % 64 / 8) as u8, (k % 8) as u8)
+}
+
+fn kernel_sources(k: usize) -> [Src; 3] {
+    let shape = k / 64;
+    let mut src = [Src::Vgpr(1), Src::Vgpr(2), Src::Vgpr(3)];
+    match shape {
+        0 => {}
+        1..=3 => src[shape - 1] = Src::Sgpr(8),
+        4..=6 => src[shape - 4] = Src::Float(InlineFloat::One),
+        7..=9 => src[shape - 7] = Src::Int(-1),
+        _ => unreachable!("operand shape"),
+    }
+    src
+}
+
+fn asm_operands(k: usize) -> ([String; 3], String) {
+    let mut bindings = Vec::new();
+    let src = kernel_sources(k);
+    let operands = std::array::from_fn(|i| match src[i] {
+        Src::Vgpr(_) | Src::Sgpr(_) => {
+            let ix = bindings.len() + 1;
+            let (constraint, variable) = if matches!(src[i], Src::Sgpr(_)) {
+                ("s", "scalar")
+            } else {
+                ("v", ["a", "b", "c"][i])
+            };
+            bindings.push(format!("\"{constraint}\"({variable})"));
+            format!("%{ix}")
+        }
+        operand => operand.fmt(1),
+    });
+    (operands, bindings.join(", "))
+}
 const BLOCK: usize = 256;
 const GUARD: usize = 256;
 const POISONS: [u8; 2] = [0xa5, 0x5a];
 const SIM_POISON: u32 = 0xdead_beef;
 const SEED: u64 = 0x6d69_785f_6f72_6163; // "mix_orac"
-const MIN_PATTERNS: usize = 12288 + 1024 + 256;
+const MIN_PATTERNS: usize = 16640;
 const MAX_SAMPLES_PER_CLASS: usize = 4;
 const MAX_FIRST: usize = 8;
 const HIST_CAP: usize = 32;
@@ -153,13 +192,15 @@ fn parse_args() -> Result<Option<Opts>, String> {
     let mut hip_work = None;
     let mut receipt = None;
     let mut dry_run = false;
-    let mut patterns = 16384usize;
+    let mut patterns = MIN_PATTERNS;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
             "-h" | "--help" => return Ok(None),
             "--dry-run" => dry_run = true,
-            "--hip-work" => hip_work = Some(PathBuf::from(it.next().ok_or("--hip-work needs DIR")?)),
+            "--hip-work" => {
+                hip_work = Some(PathBuf::from(it.next().ok_or("--hip-work needs DIR")?))
+            }
             "--receipt" => receipt = Some(PathBuf::from(it.next().ok_or("--receipt needs FILE")?)),
             "--patterns" => {
                 patterns = it
@@ -188,13 +229,37 @@ fn parse_args() -> Result<Option<Opts>, String> {
 // Deterministic adversarial inputs
 
 const F32S: [u32; 32] = [
-    0x0000_0000, 0x8000_0000, 0x0000_0001, 0x8000_0001, 0x007f_ffff, 0x807f_ffff, 0x0040_0000,
+    0x0000_0000,
+    0x8000_0000,
+    0x0000_0001,
+    0x8000_0001,
+    0x007f_ffff,
+    0x807f_ffff,
+    0x0040_0000,
     0x0080_0000, // zeros, denormals, min normal
-    0x3f80_0000, 0xbf80_0000, 0x4000_0000, 0x3f00_0000, 0x4040_0000, 0x3f80_0001, 0x3f7f_ffff,
+    0x3f80_0000,
+    0xbf80_0000,
+    0x4000_0000,
+    0x3f00_0000,
+    0x4040_0000,
+    0x3f80_0001,
+    0x3f7f_ffff,
     0xbf80_0002, // +-1, 2, .5, 3, 1+-ulp
-    0x7f7f_ffff, 0xff7f_ffff, 0x7f80_0000, 0xff80_0000, 0x7fc0_0000, 0xffc0_0000, 0x7f80_0001,
+    0x7f7f_ffff,
+    0xff7f_ffff,
+    0x7f80_0000,
+    0xff80_0000,
+    0x7fc0_0000,
+    0xffc0_0000,
+    0x7f80_0001,
     0xffa5_a5a5, // f32 max, inf, qNaN, sNaN (payload)
-    0x7fff_ffff, 0x477f_e000, 0x477f_f000, 0x4b80_0000, 0x7f00_0000, 0x3380_0000, 0x3880_0000,
+    0x7fff_ffff,
+    0x477f_e000,
+    0x477f_f000,
+    0x4b80_0000,
+    0x7f00_0000,
+    0x3380_0000,
+    0x3880_0000,
     0x00bf_ffff, // NaN all ones, 65504, 65520, 2^24, 2^127, 2^-24, 2^-14, near-denormal
 ];
 const HALVES: [u16; 12] = [
@@ -283,7 +348,11 @@ fn random_operand(r: &mut Rng, w: &[u32; 64]) -> u32 {
 fn gen_inputs(n: usize) -> Inputs {
     let w = special_words();
     let mut r = Rng(SEED);
-    let (mut a, mut b, mut c) = (Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n));
+    let (mut a, mut b, mut c) = (
+        Vec::with_capacity(n),
+        Vec::with_capacity(n),
+        Vec::with_capacity(n),
+    );
     let mut blocks = Vec::new();
     let push = |a: &mut Vec<u32>, b: &mut Vec<u32>, c: &mut Vec<u32>, x: u32, y: u32, z: u32| {
         a.push(x);
@@ -293,19 +362,40 @@ fn gen_inputs(n: usize) -> Inputs {
     blocks.push(("ab_exhaustive_c_strided", a.len(), 4096));
     for i in 0..64 {
         for j in 0..64 {
-            push(&mut a, &mut b, &mut c, w[i], w[j], w[(i * 5 + j * 11 + 1) % 64]);
+            push(
+                &mut a,
+                &mut b,
+                &mut c,
+                w[i],
+                w[j],
+                w[(i * 5 + j * 11 + 1) % 64],
+            );
         }
     }
     blocks.push(("bc_exhaustive_a_strided", a.len(), 4096));
     for j in 0..64 {
         for k in 0..64 {
-            push(&mut a, &mut b, &mut c, w[(j * 3 + k * 7 + 2) % 64], w[j], w[k]);
+            push(
+                &mut a,
+                &mut b,
+                &mut c,
+                w[(j * 3 + k * 7 + 2) % 64],
+                w[j],
+                w[k],
+            );
         }
     }
     blocks.push(("ac_exhaustive_b_strided", a.len(), 4096));
     for i in 0..64 {
         for k in 0..64 {
-            push(&mut a, &mut b, &mut c, w[i], w[(i * 9 + k * 5 + 3) % 64], w[k]);
+            push(
+                &mut a,
+                &mut b,
+                &mut c,
+                w[i],
+                w[(i * 9 + k * 5 + 3) % 64],
+                w[k],
+            );
         }
     }
     // Fused discriminators: 3 hand-made f32 rows (fused = +-2^-46 / 2^-48, unfused = 0), then 1021 rows over the
@@ -315,9 +405,30 @@ fn gen_inputs(n: usize) -> Inputs {
     blocks.push(("fma_discriminators", d0, 1024));
     let mut f32_disc_rows = Vec::new();
     let (mut disc, mut exact, mut unresolved) = (3usize, 0usize, 0usize);
-    push(&mut a, &mut b, &mut c, 0x3f80_0001, 0x3f80_0001, 0xbf80_0002);
-    push(&mut a, &mut b, &mut c, 0xbf80_0001, 0x3f80_0001, 0x3f80_0002);
-    push(&mut a, &mut b, &mut c, 0x3f7f_ffff, 0x3f7f_ffff, 0xbf7f_fffe);
+    push(
+        &mut a,
+        &mut b,
+        &mut c,
+        0x3f80_0001,
+        0x3f80_0001,
+        0xbf80_0002,
+    );
+    push(
+        &mut a,
+        &mut b,
+        &mut c,
+        0xbf80_0001,
+        0x3f80_0001,
+        0x3f80_0002,
+    );
+    push(
+        &mut a,
+        &mut b,
+        &mut c,
+        0x3f7f_ffff,
+        0x3f7f_ffff,
+        0xbf7f_fffe,
+    );
     f32_disc_rows.extend([0, 1, 2]);
     for i in 3..1024usize {
         let q = (i - 3) % 27;
@@ -370,11 +481,29 @@ fn gen_inputs(n: usize) -> Inputs {
         }
         push(&mut a, &mut b, &mut c, last.0, last.1, last.2);
     }
-    blocks.push(("random_edge", a.len(), n - a.len()));
-    while a.len() < n {
+    // Preserve the complete original 16384-row r1 corpus, then append boundary
+    // probes; a failure is never removed by changing an existing input.
+    blocks.push(("random_edge", a.len(), n - 256 - a.len()));
+    while a.len() < n - 256 {
         let x = random_operand(&mut r, &w);
         let y = random_operand(&mut r, &w);
         let z = random_operand(&mut r, &w);
+        push(&mut a, &mut b, &mut c, x, y, z);
+    }
+    blocks.push(("output_flush_ties_and_signed_zero", a.len(), 256));
+    for i in 0..256 {
+        // 31 * 2^-63 times 1082401 * 2^-88 is exactly
+        // (2^25 - 1) * 2^-151 = 2^-126 - 2^-151, the unbounded-RNE tie.
+        let (x, y, z) = match i % 8 {
+            0 => (0x2278_0000, 0x1d84_2108, 0),
+            1 => (0x2278_0000, 0x1d84_2107, 0),
+            2 => (0x2278_0000, 0x1d84_2109, 0),
+            3 => (0xa278_0000, 0x1d84_2108, 0),
+            4 => (0xa278_0000, 0x1d84_2107, 0),
+            5 => (0xa278_0000, 0x1d84_2109, 0),
+            6 => (0x8000_0000, 0x3f80_0000, 0x8000_0000),
+            _ => (0, 0xbf80_0000, 0x8000_0000),
+        };
         push(&mut a, &mut b, &mut c, x, y, z);
     }
     Inputs {
@@ -404,15 +533,20 @@ impl Inputs {
 // Variants and generated HIP source
 
 fn asm_line(dst: &str, s: [&str; 3], op_sel: u8, op_sel_hi: u8, neg_lo: u8, clamp: bool) -> String {
-    let n = |i: u8| if neg_lo >> i & 1 != 0 { "-" } else { "" };
+    let operand = |i: usize| {
+        if neg_lo >> i & 1 == 0 {
+            s[i].to_string()
+        } else if matches!(s[i], "1.0" | "-1") {
+            format!("neg({})", s[i])
+        } else {
+            format!("-{}", s[i])
+        }
+    };
     format!(
-        "v_fma_mix_f32 {dst}, {}{}, {}{}, {}{} op_sel:[{},{},{}] op_sel_hi:[{},{},{}]{}",
-        n(0),
-        s[0],
-        n(1),
-        s[1],
-        n(2),
-        s[2],
+        "v_fma_mix_f32 {dst}, {}, {}, {} op_sel:[{},{},{}] op_sel_hi:[{},{},{}]{}",
+        operand(0),
+        operand(1),
+        operand(2),
         op_sel & 1,
         op_sel >> 1 & 1,
         op_sel >> 2 & 1,
@@ -473,18 +607,31 @@ extern "C" __global__ void mix_mode_probe(unsigned* out) {
 fn gen_source() -> String {
     let mut s = String::from(SRC_HEADER);
     for k in 0..NK {
-        let (os, oh) = ((k / 8) as u8, (k % 8) as u8);
+        let (shape, os, oh) = kernel_fields(k);
+        let (operands, bindings) = asm_operands(k);
+        let operands = [
+            operands[0].as_str(),
+            operands[1].as_str(),
+            operands[2].as_str(),
+        ];
         let _ = write!(
             s,
-            "\n// op_sel={os} op_sel_hi={oh} sources=({})\nextern \"C\" __global__ void __launch_bounds__({BLOCK}) mix_s{os}_h{oh}(\n    const unsigned* __restrict__ in0, const unsigned* __restrict__ in1, const unsigned* __restrict__ in2,\n    unsigned* __restrict__ out, unsigned* __restrict__ mrb, unsigned npat, unsigned mode_lo, unsigned mode_hi) {{\n  const unsigned gid = blockIdx.x * {BLOCK}u + threadIdx.x;\n  mix_set_mode(mode_lo, mode_hi);\n  const unsigned pre = mix_get_mode();\n  const unsigned a = in0[gid], b = in1[gid], c = in2[gid];\n  unsigned r;\n",
+            "\n// shape={shape} op_sel={os} op_sel_hi={oh} sources=({})\nextern \"C\" __global__ void __launch_bounds__({BLOCK}) mix_o{shape}_s{os}_h{oh}(\n    const unsigned* __restrict__ in0, const unsigned* __restrict__ in1, const unsigned* __restrict__ in2,\n    unsigned* __restrict__ out, unsigned* __restrict__ mrb, unsigned npat, unsigned mode_lo, unsigned mode_hi) {{\n  const unsigned gid = blockIdx.x * {BLOCK}u + threadIdx.x;\n  mix_set_mode(mode_lo, mode_hi);\n  const unsigned pre = mix_get_mode();\n  const unsigned a = in0[gid], b = in1[gid], c = in2[gid];\n  unsigned r;\n",
             sel_signature(os, oh)
         );
+        if (1..=3).contains(&shape) {
+            let variable = ["a", "b", "c"][shape - 1];
+            let _ = writeln!(
+                s,
+                "  const unsigned scalar = __builtin_amdgcn_readfirstlane({variable});"
+            );
+        }
         for v in 0..NV {
             let (nl, cl) = ((v >> 1) as u8, v & 1 == 1);
             let _ = write!(
                 s,
-                "  asm volatile(\"{}\" : \"=v\"(r) : \"v\"(a), \"v\"(b), \"v\"(c));\n  out[{v}u * npat + gid] = r;\n",
-                asm_line("%0", ["%1", "%2", "%3"], os, oh, nl, cl)
+                "  asm volatile(\"{}\" : \"=v\"(r) : {bindings});\n  out[{v}u * npat + gid] = r;\n",
+                asm_line("%0", operands, os, oh, nl, cl)
             );
         }
         s.push_str("  const unsigned post = mix_get_mode();\n  if ((threadIdx.x & 63u) == 0u) { mrb[2u * (gid >> 6)] = pre; mrb[2u * (gid >> 6) + 1u] = post; }\n}\n");
@@ -543,7 +690,13 @@ struct Mutation {
     flip_denorm: bool,
 }
 
-fn sim_kernel(w: &mut Wave, k: usize, mode: Mode, mu: Mutation, inp: &Inputs) -> Result<Vec<u32>, String> {
+fn sim_kernel(
+    w: &mut Wave,
+    k: usize,
+    mode: Mode,
+    mu: Mutation,
+    inp: &Inputs,
+) -> Result<Vec<u32>, String> {
     let mut mode = mode;
     if mu.flip_denorm {
         mode.denorm32 ^= 3;
@@ -553,13 +706,14 @@ fn sim_kernel(w: &mut Wave, k: usize, mode: Mode, mu: Mutation, inp: &Inputs) ->
     let cfg = Config::default();
     let n = inp.n;
     let mut out = vec![0u32; NV * n];
+    let (shape, os, oh) = kernel_fields(k);
     for v in 0..NV {
         let inst = Inst::Vop3p(Vop3p {
             op: Vop3pOp::FmaMixF32,
             dst: Src::Vgpr(4),
-            src: [Some(Src::Vgpr(1)), Some(Src::Vgpr(2)), Some(Src::Vgpr(3))],
-            op_sel: (k / 8) as u8 ^ mu.xor_op_sel,
-            op_sel_hi: (k % 8) as u8 ^ mu.xor_op_sel_hi,
+            src: kernel_sources(k).map(Some),
+            op_sel: os ^ mu.xor_op_sel,
+            op_sel_hi: oh ^ mu.xor_op_sel_hi,
             neg_lo: (v >> 1) as u8 ^ mu.xor_neg_lo,
             neg_hi: mu.neg_hi,
             clamp: (v & 1 == 1) ^ mu.flip_clamp,
@@ -569,6 +723,9 @@ fn sim_kernel(w: &mut Wave, k: usize, mode: Mode, mu: Mutation, inp: &Inputs) ->
             w.v[1].copy_from_slice(&inp.a[r.clone()]);
             w.v[2].copy_from_slice(&inp.b[r.clone()]);
             w.v[3].copy_from_slice(&inp.c[r.clone()]);
+            if (1..=3).contains(&shape) {
+                w.s[8] = [&inp.a, &inp.b, &inp.c][shape - 1][r.start];
+            }
             w.v[4] = [SIM_POISON; 64];
             exec_one(w, &inst, &mut [], &mut Memory::default(), &cfg)
                 .map_err(|e| format!("interpreter kernel {k} variant {v} chunk {chunk}: {e:?}"))?;
@@ -606,7 +763,9 @@ fn sim_all(mode: Mode, mu: Mutation, inp: &Inputs) -> Result<Vec<Vec<u32>>, Stri
                     }
                 }
                 Ok(Err(e)) => err = Some(err.unwrap_or(e)),
-                Err(p) => err = Some(err.unwrap_or(format!("interpreter thread panic: {}", panic_msg(p)))),
+                Err(p) => {
+                    err = Some(err.unwrap_or(format!("interpreter thread panic: {}", panic_msg(p))))
+                }
             }
         }
         match err {
@@ -637,7 +796,11 @@ fn classify(hw: u32, sim: u32) -> &'static str {
     if hm == sm {
         return "sign_only_nonzero";
     }
-    if is_denorm(hw) || is_denorm(sim) || (hm == 0 && sm < 0x0080_0000) || (sm == 0 && hm < 0x0080_0000) {
+    if is_denorm(hw)
+        || is_denorm(sim)
+        || (hm == 0 && sm < 0x0080_0000)
+        || (sm == 0 && hm < 0x0080_0000)
+    {
         return "denormal_or_zero_vs_denormal";
     }
     if hw >> 31 == sim >> 31 && hw.abs_diff(sim) == 1 {
@@ -695,11 +858,14 @@ fn sample(
     cls: &'static str,
     bits: u32,
 ) -> Value {
-    let (os, oh, nl, cl) = ((k / 8) as u8, (k % 8) as u8, (v >> 1) as u8, v & 1 == 1);
+    let (shape, os, oh) = kernel_fields(k);
+    let (nl, cl) = ((v >> 1) as u8, v & 1 == 1);
+    let src = kernel_sources(k).map(|s| s.fmt(1));
     json!({
         "kernel": k, "variant": v, "op_sel": os, "op_sel_hi": oh, "neg_lo": nl, "clamp": cl,
-        "source_class": sel_signature(os, oh),
-        "asm": asm_line("v0", ["v1", "v2", "v3"], os, oh, nl, cl),
+        "source_class": sel_signature(os, oh), "operand_shape": shape, "operands": src,
+        "asm": asm_line("v0", [src[0].as_str(), src[1].as_str(), src[2].as_str()], os, oh, nl, cl),
+        "sgpr_wave_first_lane_row": row & !63,
         "row": row, "block": inp.block_of(row), "mode": h32(bits),
         "in0": h32(inp.a[row]), "in1": h32(inp.b[row]), "in2": h32(inp.c[row]),
         "ref": h32(hw), "sim": h32(sim), "class": cls,
@@ -726,7 +892,7 @@ fn compare(refv: &[Vec<u32>], sim: &[Vec<u32>], inp: &Inputs, bits: u32) -> Cmp 
         samples_by_class: BTreeMap::new(),
         samples_by_source_class: BTreeMap::new(),
     };
-    let mut seen_src = [false; 54];
+    let mut seen_src = [false; NSHAPES * 54];
     for k in 0..NK {
         let (rk, sk) = (&refv[k], &sim[k]);
         c.rows += rk.len() as u64;
@@ -756,7 +922,9 @@ fn compare(refv: &[Vec<u32>], sim: &[Vec<u32>], inp: &Inputs, bits: u32) -> Cmp 
             let want_first = c.first.len() < MAX_FIRST;
             let by_class = c.samples_by_class.entry(cls).or_default();
             let want_class = by_class.len() < MAX_SAMPLES_PER_CLASS;
-            let src_id = source_class_id((k / 8) as u8, (k % 8) as u8) * 2 + usize::from(is_nan(h) || is_nan(s));
+            let (shape, os, oh) = kernel_fields(k);
+            let src_id =
+                shape * 54 + source_class_id(os, oh) * 2 + usize::from(is_nan(h) || is_nan(s));
             let want_src = !seen_src[src_id];
             if want_first || want_class || want_src {
                 let j = sample(inp, k, v, row, h, s, cls, bits);
@@ -764,12 +932,23 @@ fn compare(refv: &[Vec<u32>], sim: &[Vec<u32>], inp: &Inputs, bits: u32) -> Cmp 
                     c.first.push(j.clone());
                 }
                 if want_class {
-                    c.samples_by_class.get_mut(cls).expect("entry").push(j.clone());
+                    c.samples_by_class
+                        .get_mut(cls)
+                        .expect("entry")
+                        .push(j.clone());
                 }
                 if want_src {
                     seen_src[src_id] = true;
                     c.samples_by_source_class.insert(
-                        format!("{}|{}", sel_signature((k / 8) as u8, (k % 8) as u8), if is_nan(h) || is_nan(s) { "nan" } else { "non_nan" }),
+                        format!(
+                            "{shape}|{}|{}",
+                            sel_signature(os, oh),
+                            if is_nan(h) || is_nan(s) {
+                                "nan"
+                            } else {
+                                "non_nan"
+                            }
+                        ),
                         j,
                     );
                 }
@@ -858,7 +1037,8 @@ impl Card {
             .map_err(|e| format!("hipModuleLoadData: {e}"))?;
         let mut kernels = Vec::new();
         for k in 0..NK {
-            let name = format!("mix_s{}_h{}", k / 8, k % 8);
+            let (shape, os, oh) = kernel_fields(k);
+            let name = format!("mix_o{shape}_s{os}_h{oh}");
             kernels.push(
                 rt.module_get_function(&module, &name)
                     .map_err(|e| format!("hipModuleGetFunction({name}): {e}"))?,
@@ -868,7 +1048,9 @@ impl Card {
             .module_get_function(&module, "mix_mode_probe")
             .map_err(|e| format!("hipModuleGetFunction(mix_mode_probe): {e}"))?;
         let up = |w: &[u32]| -> Result<DeviceBuffer, String> {
-            let d = rt.malloc(w.len() * 4).map_err(|e| format!("hipMalloc(in): {e}"))?;
+            let d = rt
+                .malloc(w.len() * 4)
+                .map_err(|e| format!("hipMalloc(in): {e}"))?;
             rt.memcpy_htod(&d, &words_bytes(w))
                 .map_err(|e| format!("upload in: {e}"))?;
             Ok(d)
@@ -880,7 +1062,9 @@ impl Card {
         let d_mrb = rt
             .malloc(2 * (inp.n / 64) * 4)
             .map_err(|e| format!("hipMalloc(mrb): {e}"))?;
-        let d_probe = rt.malloc(16).map_err(|e| format!("hipMalloc(probe): {e}"))?;
+        let d_probe = rt
+            .malloc(16)
+            .map_err(|e| format!("hipMalloc(probe): {e}"))?;
         Ok(Card {
             rt,
             _module: module,
@@ -911,14 +1095,21 @@ impl Card {
 
     fn mode_probe(&self) -> Result<[u32; 3], String> {
         let rt = &self.rt;
-        rt.memset(&self.d_probe, 0xa5, 16).map_err(|e| format!("memset(probe): {e}"))?;
-        let mut blob = hip_blob(&(self.d_probe.as_ptr() as usize as u64).to_le_bytes(), 1, 64);
+        rt.memset(&self.d_probe, 0xa5, 16)
+            .map_err(|e| format!("memset(probe): {e}"))?;
+        let mut blob = hip_blob(
+            &(self.d_probe.as_ptr() as usize as u64).to_le_bytes(),
+            1,
+            64,
+        );
         // SAFETY: the blob is the kernel's explicit kernarg image (one pointer to a live 16-byte allocation).
         unsafe { rt.launch_kernel_blob(&self.probe, [1, 1, 1], [64, 1, 1], 0, None, &mut blob) }
             .map_err(|e| format!("launch(mode_probe): {e}"))?;
-        rt.device_synchronize().map_err(|e| format!("synchronize(mode_probe): {e}"))?;
+        rt.device_synchronize()
+            .map_err(|e| format!("synchronize(mode_probe): {e}"))?;
         let mut b = vec![0u8; 16];
-        rt.memcpy_dtoh(&mut b, &self.d_probe).map_err(|e| format!("readback(mode_probe): {e}"))?;
+        rt.memcpy_dtoh(&mut b, &self.d_probe)
+            .map_err(|e| format!("readback(mode_probe): {e}"))?;
         let w = bytes_words(&b);
         Ok([w[0], w[1], w[2]])
     }
@@ -927,11 +1118,19 @@ impl Card {
         let rt = &self.rt;
         let total = 2 * GUARD + NV * self.n * 4;
         let mrb_bytes = 2 * (self.n / 64) * 4;
-        rt.memset(&self.d_out, i32::from(poison), total).map_err(|e| format!("memset(out): {e}"))?;
-        rt.memset(&self.d_mrb, i32::from(poison), mrb_bytes).map_err(|e| format!("memset(mrb): {e}"))?;
+        rt.memset(&self.d_out, i32::from(poison), total)
+            .map_err(|e| format!("memset(out): {e}"))?;
+        rt.memset(&self.d_mrb, i32::from(poison), mrb_bytes)
+            .map_err(|e| format!("memset(mrb): {e}"))?;
         let p = |d: &DeviceBuffer| d.as_ptr() as usize as u64;
         let mut e = Vec::new();
-        for x in [p(&self.d_in[0]), p(&self.d_in[1]), p(&self.d_in[2]), p(&self.d_out) + GUARD as u64, p(&self.d_mrb)] {
+        for x in [
+            p(&self.d_in[0]),
+            p(&self.d_in[1]),
+            p(&self.d_in[2]),
+            p(&self.d_out) + GUARD as u64,
+            p(&self.d_mrb),
+        ] {
             e.extend(x.to_le_bytes());
         }
         e.extend((self.n as u32).to_le_bytes());
@@ -941,14 +1140,27 @@ impl Card {
         let mut blob = hip_blob(&e, grid, BLOCK as u32);
         // SAFETY: the blob is the kernel's explicit kernarg image (5 pointers to live allocations sized for the
         // launch, then three u32), followed by the zeroed hidden arguments.
-        unsafe { rt.launch_kernel_blob(&self.kernels[k], [grid, 1, 1], [BLOCK as u32, 1, 1], 0, None, &mut blob) }
-            .map_err(|e| format!("launch(kernel {k}): {e}"))?;
-        rt.device_synchronize().map_err(|e| format!("synchronize(kernel {k}): {e}"))?;
+        unsafe {
+            rt.launch_kernel_blob(
+                &self.kernels[k],
+                [grid, 1, 1],
+                [BLOCK as u32, 1, 1],
+                0,
+                None,
+                &mut blob,
+            )
+        }
+        .map_err(|e| format!("launch(kernel {k}): {e}"))?;
+        rt.device_synchronize()
+            .map_err(|e| format!("synchronize(kernel {k}): {e}"))?;
         let mut ob = vec![0u8; total];
-        rt.memcpy_dtoh(&mut ob, &self.d_out).map_err(|e| format!("readback(out, kernel {k}): {e}"))?;
+        rt.memcpy_dtoh(&mut ob, &self.d_out)
+            .map_err(|e| format!("readback(out, kernel {k}): {e}"))?;
         let mut mb = vec![0u8; mrb_bytes];
-        rt.memcpy_dtoh(&mut mb, &self.d_mrb).map_err(|e| format!("readback(mrb, kernel {k}): {e}"))?;
-        let guards_ok = ob[..GUARD].iter().all(|&x| x == poison) && ob[total - GUARD..].iter().all(|&x| x == poison);
+        rt.memcpy_dtoh(&mut mb, &self.d_mrb)
+            .map_err(|e| format!("readback(mrb, kernel {k}): {e}"))?;
+        let guards_ok = ob[..GUARD].iter().all(|&x| x == poison)
+            && ob[total - GUARD..].iter().all(|&x| x == poison);
         Ok(Launched {
             payload: bytes_words(&ob[GUARD..total - GUARD]),
             guards_ok,
@@ -963,7 +1175,12 @@ impl Card {
         for k in 0..NK {
             let r0 = self.launch(k, bits, POISONS[0])?;
             let r1 = self.launch(k, bits, POISONS[1])?;
-            poison_dep += r0.payload.iter().zip(&r1.payload).filter(|(a, b)| a != b).count() as u64;
+            poison_dep += r0
+                .payload
+                .iter()
+                .zip(&r1.payload)
+                .filter(|(a, b)| a != b)
+                .count() as u64;
             guard_bad += u64::from(!r0.guards_ok) + u64::from(!r1.guards_ok);
             for rb in [&r0.mrb, &r1.mrb] {
                 for &x in rb.iter() {
@@ -978,7 +1195,10 @@ impl Card {
         }
         let mut errors = Vec::new();
         if guard_bad > 0 {
-            errors.push(format!("mode {}: {guard_bad} output guard canaries corrupted", h32(bits)));
+            errors.push(format!(
+                "mode {}: {guard_bad} output guard canaries corrupted",
+                h32(bits)
+            ));
         }
         if poison_dep > 0 {
             errors.push(format!("mode {}: {poison_dep} output words depend on the poison pattern (unwritten/nondeterministic)", h32(bits)));
@@ -1025,26 +1245,41 @@ impl Receipt {
     fn ok(&self) -> bool {
         self.errors.is_empty() && self.failures.is_empty()
     }
-    fn flush(&self, complete: bool, dry: bool) {
+    fn flush(&mut self, complete: bool, dry: bool) {
         let mut m = self.top.clone();
         m.insert("modes".into(), Value::Array(self.modes.clone()));
         m.insert("controls".into(), Value::Array(self.controls.clone()));
         m.insert("errors".into(), json!(self.errors));
         m.insert("failures".into(), json!(self.failures));
-        let total: u64 = self.modes.iter().filter_map(|x| x["compare"]["rows_compared"].as_u64()).sum();
-        let mism: u64 = self.modes.iter().filter_map(|x| x["compare"]["mismatches"].as_u64()).sum();
+        let total: u64 = self
+            .modes
+            .iter()
+            .filter_map(|x| x["compare"]["rows_compared"].as_u64())
+            .sum();
+        let mism: u64 = self
+            .modes
+            .iter()
+            .filter_map(|x| x["compare"]["mismatches"].as_u64())
+            .sum();
         m.insert("summary".into(), json!({
             "modes_run": self.modes.len(), "rows_compared": total, "strict_mismatches": mism,
             "controls": self.controls.len(),
             "controls_detected": self.controls.iter().filter(|c| c["detected"] == json!(true)).count(),
         }));
-        m.insert("wall_seconds".into(), json!(self.t0.elapsed().as_secs_f64()));
+        m.insert(
+            "wall_seconds".into(),
+            json!(self.t0.elapsed().as_secs_f64()),
+        );
         m.insert("complete".into(), json!(complete));
         let ok = complete && self.ok();
         m.insert("exit_ok".into(), json!(ok));
         m.insert("exit_status".into(), json!(if ok { 0 } else { 1 }));
         let verdict = if dry {
-            if ok { "DRY_RUN_NO_HARDWARE_CLAIM" } else { "DRY_RUN_FAILED_NO_HARDWARE_CLAIM" }
+            if ok {
+                "DRY_RUN_NO_HARDWARE_CLAIM"
+            } else {
+                "DRY_RUN_FAILED_NO_HARDWARE_CLAIM"
+            }
         } else if !complete {
             "INCOMPLETE"
         } else if ok {
@@ -1053,14 +1288,20 @@ impl Receipt {
             "FAIL"
         };
         m.insert("verdict".into(), json!(verdict));
-        m.insert("finished_unix".into(), json!(SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).ok()));
+        m.insert(
+            "finished_unix".into(),
+            json!(SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .ok()),
+        );
         match serde_json::to_vec_pretty(&Value::Object(m)) {
             Ok(b) => {
                 if let Err(e) = std::fs::write(&self.path, b) {
-                    eprintln!("cannot write receipt {}: {e}", self.path.display());
+                    self.error(format!("cannot write receipt {}: {e}", self.path.display()));
                 }
             }
-            Err(e) => eprintln!("cannot serialise receipt: {e}"),
+            Err(e) => self.error(format!("cannot serialise receipt: {e}")),
         }
     }
 }
@@ -1071,26 +1312,31 @@ fn tool_version(path: &str) -> Value {
             "command": format!("{path} --version"), "ok": o.status.success(), "exit_code": o.status.code(),
             "stdout": String::from_utf8_lossy(&o.stdout), "stderr": String::from_utf8_lossy(&o.stderr),
         }),
-        Err(e) => json!({ "command": format!("{path} --version"), "ok": false, "error": e.to_string() }),
+        Err(e) => {
+            json!({ "command": format!("{path} --version"), "ok": false, "error": e.to_string() })
+        }
     }
 }
 
 fn clip(b: &[u8]) -> String {
     let s = String::from_utf8_lossy(b);
     if s.len() > 8192 {
-        format!("{}...[truncated, {} bytes]", s.chars().take(8192).collect::<String>(), s.len())
+        format!(
+            "{}...[truncated, {} bytes]",
+            s.chars().take(8192).collect::<String>(),
+            s.len()
+        )
     } else {
         s.into_owned()
     }
 }
 
 const CONCERNS: &[&str] = &[
-    "[CONCERN] interpreter NaN bits come from host f32::mul_add / f32::from_bits arithmetic (platform-defined payload/sign); the comparator is strict, so any hardware NaN-bit difference is reported as a mismatch (class both_nan) and decided only from hardware evidence",
-    "[CONCERN] interpreter clamp_float uses f32::max(0.0).min(1.0): the sign of a clamped -0.0 result is host-defined; watch zero_vs_zero_sign samples",
-    "[CONCERN] OP_SEL=1 with OP_SEL_HI=0 is modelled as f32 (same as OP_SEL=0); the oracle spans all 64 selections so hardware decides",
-    "[CONCERN] the interpreter ignores MODE.IEEE and MODE.FP16_OVFL for v_fma_mix_f32 (f32 result); both are swept on hardware",
-    "[CONCERN] f16 sNaN sources are quieted by float::f16_to_f32 (QNAN32 | payload<<13) in the interpreter; hardware behaviour is measured via the sNaN-half words",
-    "[SCOPE] NEG_HI/abs, v_fma_mixlo/hi_f16, v_mad_mix*, gfx950 are not covered and not promoted",
+    "[MODEL] gfx942 mixed FMA explicitly models NaN sign/payload/IEEE quieting and invalid-operation precedence; all comparisons remain strict raw bits",
+    "[CHECK] signed-zero clamp, the exact unbounded-rounding underflow tie and adjacent finite values are included, not inferred from host floating-point conventions",
+    "[CHECK] OP_SEL=1 with OP_SEL_HI=0 is modelled as f32; every selection is measured for VGPR, SGPR and inline source classes",
+    "[CHECK] MODE.IEEE and MODE.FP16_OVFL are both swept, including half sNaNs and infinities",
+    "[SCOPE] NEG_HI/abs, mixed half-result instructions, literal sources and gfx950 are not covered and not promoted",
     "[SCOPE] hw asm text is assembled by the ROCm assembler from the generated source; the receipt binds the source and code object hashes but the harness does not disassemble the code object to re-derive the encoded fields",
 ];
 
@@ -1105,24 +1351,79 @@ fn run_controls(
     hw: bool,
     rec: &mut Receipt,
 ) -> Result<(), String> {
-    let refname = if hw { "hardware" } else { "baseline interpreter (dry-run: no hardware)" };
+    let refname = if hw {
+        "hardware"
+    } else {
+        "baseline interpreter (dry-run: no hardware)"
+    };
     let mode = sim_mode(bits);
     // (name, category, mutation)
     let muts: [(&str, &str, Mutation); 7] = [
-        ("interp_op_sel_xor_src0", "source_selection", Mutation { xor_op_sel: 1, ..Default::default() }),
-        ("interp_op_sel_hi_xor_src0", "source_selection", Mutation { xor_op_sel_hi: 1, ..Default::default() }),
-        ("interp_op_sel_xor_src1_src2", "source_selection", Mutation { xor_op_sel: 6, ..Default::default() }),
-        ("interp_neg_lo_xor_src0", "negation", Mutation { xor_neg_lo: 1, ..Default::default() }),
-        ("interp_clamp_flipped", "clamp", Mutation { flip_clamp: true, ..Default::default() }),
-        ("interp_denorm_mode_flipped", "denormal_mode", Mutation { flip_denorm: true, ..Default::default() }),
-        ("interp_neg_hi_abs_src0", "abs_modifier_never_used_by_hw_kernels", Mutation { neg_hi: 1, ..Default::default() }),
+        (
+            "interp_op_sel_xor_src0",
+            "source_selection",
+            Mutation {
+                xor_op_sel: 1,
+                ..Default::default()
+            },
+        ),
+        (
+            "interp_op_sel_hi_xor_src0",
+            "source_selection",
+            Mutation {
+                xor_op_sel_hi: 1,
+                ..Default::default()
+            },
+        ),
+        (
+            "interp_op_sel_xor_src1_src2",
+            "source_selection",
+            Mutation {
+                xor_op_sel: 6,
+                ..Default::default()
+            },
+        ),
+        (
+            "interp_neg_lo_xor_src0",
+            "negation",
+            Mutation {
+                xor_neg_lo: 1,
+                ..Default::default()
+            },
+        ),
+        (
+            "interp_clamp_flipped",
+            "clamp",
+            Mutation {
+                flip_clamp: true,
+                ..Default::default()
+            },
+        ),
+        (
+            "interp_denorm_mode_flipped",
+            "denormal_mode",
+            Mutation {
+                flip_denorm: true,
+                ..Default::default()
+            },
+        ),
+        (
+            "interp_neg_hi_abs_src0",
+            "abs_modifier_never_used_by_hw_kernels",
+            Mutation {
+                neg_hi: 1,
+                ..Default::default()
+            },
+        ),
     ];
     for (name, cat, mu) in muts {
         let s = sim_all(mode, mu, inp)?;
         let c = compare(refv, &s, inp, bits);
         let detected = c.mismatches > 0;
         if !detected {
-            rec.failure(format!("negative control {name} NOT detected (0 mismatches vs {refname})"));
+            rec.failure(format!(
+                "negative control {name} NOT detected (0 mismatches vs {refname})"
+            ));
         }
         rec.controls.push(json!({
             "control": name, "category": cat, "reference": refname, "mode": h32(bits),
@@ -1137,7 +1438,10 @@ fn run_controls(
     let c = compare(&cor, base_sim, inp, bits);
     let detected = c.mismatches == 1;
     if !detected {
-        rec.failure(format!("negative control ref_word_flip_bit0: expected exactly 1 mismatch, got {}", c.mismatches));
+        rec.failure(format!(
+            "negative control ref_word_flip_bit0: expected exactly 1 mismatch, got {}",
+            c.mismatches
+        ));
     }
     rec.controls.push(json!({
         "control": "ref_word_flip_bit0", "category": "corruption", "reference": refname, "mode": h32(bits),
@@ -1150,11 +1454,21 @@ fn run_controls(
 /// Diagnostic only: on the f32/f32/f32 discriminator rows of the plain variant (op_sel 0, op_sel_hi 0, no neg, no
 /// clamp) does the hardware equal the fused interpreter or the unfused host model round32(round32(a*b)+c)?
 fn fused_discrimination(hw0: &[u32], sim0: &[u32], inp: &Inputs) -> Value {
-    let d0 = inp.blocks.iter().find(|b| b.0 == "fma_discriminators").map(|b| b.1).unwrap_or(0);
-    let (mut rows, mut discr, mut hw_eq_sim, mut hw_eq_unf, mut sim_eq_unf, mut hw_eq_unf_on_discr) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+    let d0 = inp
+        .blocks
+        .iter()
+        .find(|b| b.0 == "fma_discriminators")
+        .map(|b| b.1)
+        .unwrap_or(0);
+    let (mut rows, mut discr, mut hw_eq_sim, mut hw_eq_unf, mut sim_eq_unf, mut hw_eq_unf_on_discr) =
+        (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
     for &r in &inp.f32_disc_rows {
         let row = d0 + r;
-        let (a, b, c) = (f32::from_bits(inp.a[row]), f32::from_bits(inp.b[row]), f32::from_bits(inp.c[row]));
+        let (a, b, c) = (
+            f32::from_bits(inp.a[row]),
+            f32::from_bits(inp.b[row]),
+            f32::from_bits(inp.c[row]),
+        );
         let unf = (a * b + c).to_bits();
         let (h, s) = (hw0[row], sim0[row]);
         rows += 1;
@@ -1180,9 +1494,14 @@ fn fused_discrimination(hw0: &[u32], sim0: &[u32], inp: &Inputs) -> Value {
 
 fn run(o: &Opts, rec: &mut Receipt) {
     let argv: Vec<String> = std::env::args().collect();
-    rec.top.insert("schema".into(), json!("cdna_mix_hw_oracle/1"));
-    rec.top.insert("mode".into(), json!(if o.dry_run { "dry-run" } else { "hardware" }));
-    rec.top.insert("hardware_evidence".into(), json!(!o.dry_run));
+    rec.top
+        .insert("schema".into(), json!("cdna_mix_hw_oracle/1"));
+    rec.top.insert(
+        "mode".into(),
+        json!(if o.dry_run { "dry-run" } else { "hardware" }),
+    );
+    rec.top
+        .insert("hardware_evidence".into(), json!(!o.dry_run));
     if o.dry_run {
         rec.top.insert("dry_run_notice".into(), json!("DRY RUN: no HIP call, no hipcc, no hardware. This receipt makes NO claim about the MI300X; the controls compare mutated interpreters with the baseline interpreter."));
         println!("DRY RUN: no hardware, no hipcc; no hardware claim");
@@ -1191,7 +1510,13 @@ fn run(o: &Opts, rec: &mut Receipt) {
     rec.top.insert("scope".into(), json!({
         "op": "v_fma_mix_f32 (Vop3pOp::FmaMixF32)", "neg_hi": 0, "neg_lo_masks": 8, "clamp": [false, true],
         "op_sel": "0..7", "op_sel_hi": "0..7", "kernels": NK, "variants_per_kernel": NV, "variants_total": NK * NV,
-        "not_covered": ["v_fma_mixlo_f16", "v_fma_mixhi_f16", "v_mad_mix*", "|abs| / NEG_HI", "gfx950"],
+        "operand_shapes": NSHAPES,
+        "operand_shape_order": ["all_vgpr", "sgpr_src0", "sgpr_src1", "sgpr_src2",
+            "inline_1.0_src0", "inline_1.0_src1", "inline_1.0_src2",
+            "inline_minus1_src0", "inline_minus1_src1", "inline_minus1_src2"],
+        "sgpr_inputs": "Each wave broadcasts that input array's first-lane word using readfirstlane; the interpreter uses the identical word.",
+        "xml_alias": "V_MAD_MIX_F32",
+        "not_covered": ["v_fma_mixlo_f16", "v_fma_mixhi_f16", "|abs| / NEG_HI", "gfx950"],
         "round_mode": "RNE only (FP_ROUND = 0)",
     }));
     rec.top.insert("concerns".into(), json!(CONCERNS));
@@ -1202,6 +1527,10 @@ fn run(o: &Opts, rec: &mut Receipt) {
     }));
 
     // Source and inputs.
+    rec.top.insert("implementation".into(), json!({
+        "oracle_source_sha256": sha(include_bytes!("cdna_mix_hw_oracle.rs")),
+        "interpreter_mfma_source_sha256": sha(include_bytes!("../../peacemaker-cdna/src/sim/mfma.rs")),
+    }));
     let src = gen_source();
     let inp = gen_inputs(o.patterns);
     let modes = mode_list();
@@ -1215,7 +1544,11 @@ fn run(o: &Opts, rec: &mut Receipt) {
         rec.error(format!("write {}: {e}", src_path.display()));
         return;
     }
-    let (ab, bb, cb) = (words_bytes(&inp.a), words_bytes(&inp.b), words_bytes(&inp.c));
+    let (ab, bb, cb) = (
+        words_bytes(&inp.a),
+        words_bytes(&inp.b),
+        words_bytes(&inp.c),
+    );
     let mut all = ab.clone();
     all.extend(&bb);
     all.extend(&cb);
@@ -1224,6 +1557,12 @@ fn run(o: &Opts, rec: &mut Receipt) {
         "patterns": inp.n, "variants_total": NK * NV, "rows_per_mode": NK * NV * inp.n,
         "modes": modes.len(), "rows_total": modes.len() * NK * NV * inp.n,
         "in0_sha256": sha(&ab), "in1_sha256": sha(&bb), "in2_sha256": sha(&cb), "in0_in1_in2_sha256": sha(&all),
+        "preserved_r1_prefix": {
+            "patterns": 16384,
+            "in0_sha256": sha(&ab[..16384 * 4]),
+            "in1_sha256": sha(&bb[..16384 * 4]),
+            "in2_sha256": sha(&cb[..16384 * 4]),
+        },
         "blocks": inp.blocks.iter().map(|b| json!({ "name": b.0, "start": b.1, "rows": b.2 })).collect::<Vec<_>>(),
         "fma_discriminator_rows_discriminating": inp.disc_rows_discriminating,
         "fma_discriminator_rows_exact_product_f16_x_f16": inp.disc_rows_exact_product,
@@ -1234,16 +1573,23 @@ fn run(o: &Opts, rec: &mut Receipt) {
         "path": src_path.display().to_string(), "bytes": src.len(), "sha256": sha(src.as_bytes()),
         "example_asm": asm_line("v0", ["v1", "v2", "v3"], 5, 3, 5, true),
     }));
-    rec.top.insert("mode_list".into(), json!(modes.iter().map(|&b| mode_json(b)).collect::<Vec<_>>()));
+    rec.top.insert(
+        "mode_list".into(),
+        json!(modes.iter().map(|&b| mode_json(b)).collect::<Vec<_>>()),
+    );
     if inp.disc_rows_unresolved > 0 {
-        rec.error(format!("{} fused-discriminator rows could not be made discriminating", inp.disc_rows_unresolved));
+        rec.error(format!(
+            "{} fused-discriminator rows could not be made discriminating",
+            inp.disc_rows_unresolved
+        ));
     }
 
     // Hardware setup.
     let mut card: Option<Card> = None;
     if !o.dry_run {
         let hipcc = std::env::var("HIPCC").unwrap_or_else(|_| "hipcc".into());
-        rec.top.insert("tools".into(), json!({ "hipcc": tool_version(&hipcc) }));
+        rec.top
+            .insert("tools".into(), json!({ "hipcc": tool_version(&hipcc) }));
         let rt = match HipRuntime::load() {
             Ok(r) => r,
             Err(e) => {
@@ -1290,11 +1636,18 @@ fn run(o: &Opts, rec: &mut Receipt) {
         rec.top.insert("device".into(), Value::Object(dev));
         println!("device 0 arch {arch}");
         if arch != EXPECTED_ARCH {
-            rec.error(format!("device 0 reports `{arch}`, this oracle runs only on {EXPECTED_ARCH}: refusing"));
+            rec.error(format!(
+                "device 0 reports `{arch}`, this oracle runs only on {EXPECTED_ARCH}: refusing"
+            ));
             return;
         }
         let args = [
-            "--genco", "--offload-arch=gfx942", "-O3", "--no-offload-compress", "-fuse-cuid=none", "-o",
+            "--genco",
+            "--offload-arch=gfx942",
+            "-O3",
+            "--no-offload-compress",
+            "-fuse-cuid=none",
+            "-o",
             hsaco_path.to_str().unwrap_or("cdna_mix_hw_oracle.hsaco"),
             src_path.to_str().unwrap_or("cdna_mix_hw_oracle.hip"),
         ];
@@ -1305,13 +1658,19 @@ fn run(o: &Opts, rec: &mut Receipt) {
                 "command": format!("{hipcc} {}", args.join(" ")), "exit_code": r.status.code(), "success": r.status.success(),
                 "stdout": clip(&r.stdout), "stderr": clip(&r.stderr), "seconds": t.elapsed().as_secs_f64(),
             }),
-            Err(e) => json!({ "command": format!("{hipcc} {}", args.join(" ")), "error": e.to_string() }),
+            Err(e) => {
+                json!({ "command": format!("{hipcc} {}", args.join(" ")), "error": e.to_string() })
+            }
         };
         rec.top.insert("compile".into(), compile);
         match out {
             Ok(r) if r.status.success() => {}
             Ok(r) => {
-                rec.error(format!("hipcc failed (exit {:?}): {}", r.status.code(), clip(&r.stderr)));
+                rec.error(format!(
+                    "hipcc failed (exit {:?}): {}",
+                    r.status.code(),
+                    clip(&r.stderr)
+                ));
                 return;
             }
             Err(e) => {
@@ -1349,7 +1708,10 @@ fn run(o: &Opts, rec: &mut Receipt) {
             }
         }
     } else {
-        rec.top.insert("device".into(), json!({ "device_arch": null, "note": "dry-run: no device" }));
+        rec.top.insert(
+            "device".into(),
+            json!({ "device_arch": null, "note": "dry-run: no device" }),
+        );
     }
     rec.flush(false, o.dry_run);
 
@@ -1361,7 +1723,8 @@ fn run(o: &Opts, rec: &mut Receipt) {
                 Ok(h) => Some(h),
                 Err(e) => {
                     rec.error(format!("mode {}: {e}", h32(bits)));
-                    rec.modes.push(json!({ "mode": mode_json(bits), "error": e }));
+                    rec.modes
+                        .push(json!({ "mode": mode_json(bits), "error": e }));
                     rec.flush(false, o.dry_run);
                     continue;
                 }
@@ -1372,7 +1735,8 @@ fn run(o: &Opts, rec: &mut Receipt) {
             Ok(s) => s,
             Err(e) => {
                 rec.error(format!("mode {}: {e}", h32(bits)));
-                rec.modes.push(json!({ "mode": mode_json(bits), "error": e }));
+                rec.modes
+                    .push(json!({ "mode": mode_json(bits), "error": e }));
                 rec.flush(false, o.dry_run);
                 continue;
             }
@@ -1397,11 +1761,19 @@ fn run(o: &Opts, rec: &mut Receipt) {
         if let (Some(h), true) = (&hw, usable) {
             let c = compare(&h.out, &sim, &inp, bits);
             if c.mismatches > 0 {
-                rec.failure(format!("mode {}: {} strict raw-bit mismatches of {} rows", h32(bits), c.mismatches, c.rows));
+                rec.failure(format!(
+                    "mode {}: {} strict raw-bit mismatches of {} rows",
+                    h32(bits),
+                    c.mismatches,
+                    c.rows
+                ));
             }
             m.insert("compare".into(), c.json());
             if mi == 0 {
-                rec.top.insert("fused_discrimination".into(), fused_discrimination(&h.out[0], &sim[0], &inp));
+                rec.top.insert(
+                    "fused_discrimination".into(),
+                    fused_discrimination(&h.out[0], &sim[0], &inp),
+                );
                 if let Err(e) = run_controls(&h.out, &sim, bits, &inp, true, rec) {
                     rec.error(format!("controls: {e}"));
                 }
@@ -1412,10 +1784,19 @@ fn run(o: &Opts, rec: &mut Receipt) {
                 Ok(s2) => {
                     let c = compare(&s2, &sim, &inp, bits);
                     if c.mismatches > 0 {
-                        rec.failure(format!("mode {}: interpreter is not deterministic ({} rows)", h32(bits), c.mismatches));
+                        rec.failure(format!(
+                            "mode {}: interpreter is not deterministic ({} rows)",
+                            h32(bits),
+                            c.mismatches
+                        ));
                     }
                     m.insert("compare".into(), c.json());
-                    m.insert("compare_kind".into(), json!("interpreter run vs second interpreter run (determinism); NOT hardware"));
+                    m.insert(
+                        "compare_kind".into(),
+                        json!(
+                            "interpreter run vs second interpreter run (determinism); NOT hardware"
+                        ),
+                    );
                     if mi == 0 {
                         if let Err(e) = run_controls(&s2, &sim, bits, &inp, false, rec) {
                             rec.error(format!("controls: {e}"));
@@ -1431,7 +1812,9 @@ fn run(o: &Opts, rec: &mut Receipt) {
             h32(bits),
             mi + 1,
             modes.len(),
-            m.get("compare").map(|c| c["mismatches"].to_string()).unwrap_or_else(|| "n/a".into()),
+            m.get("compare")
+                .map(|c| c["mismatches"].to_string())
+                .unwrap_or_else(|| "n/a".into()),
             t.elapsed().as_secs_f64()
         );
         rec.modes.push(Value::Object(m));
@@ -1479,7 +1862,11 @@ fn main() -> ExitCode {
         rec.failures.len(),
         rec.t0.elapsed().as_secs_f64(),
         if ok { "OK" } else { "FAILED" },
-        if opts.dry_run { " (DRY RUN: no hardware claim)" } else { "" }
+        if opts.dry_run {
+            " (DRY RUN: no hardware claim)"
+        } else {
+            ""
+        }
     );
     if ok {
         ExitCode::SUCCESS
