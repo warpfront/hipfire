@@ -3251,7 +3251,15 @@ fn spec_main(
             false,
         );
         app.log.say(r.line.clone());
-        let exercised = r.stats.rejected > 0;
+        // The skipped rollback keeps every verified row of a REJECTED window, so the rank's own
+        // head-schedule check ("the rank appended ... head rows, the decision schedules ...")
+        // catches it at the first such window, before that window is recorded: an executor error
+        // of exactly that kind is the control being exercised and detected.
+        let schedule_caught = r.run.error.as_deref().is_some_and(|m| {
+            m.contains("head rows, the decision schedules")
+                || m.contains("head rows, the decision's schedule is")
+        });
+        let exercised = r.stats.rejected > 0 || schedule_caught;
         let diverged = r.run.diff.bad > 0 || r.run.error.is_some();
         let (detected, how) = if !exercised {
             (
