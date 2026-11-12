@@ -55,6 +55,13 @@
 //! serve store's `row_budget = N`: 8 on the served C8 shape), so a 32 / 64-lane burst's prefill
 //! wave is compared with serve-shaped decode steps; without it every decoding lane runs in one
 //! step (a many-row decode step is its own lane-oracle subject, not the prefill wave's).
+//! `--wave-prefill --spec mtp`: the same burst with MTP lanes. Every unfinished lane's prefill
+//! tile is planned in one step, so the MTP lanes' trunk rows run as one joint wave whose wide
+//! hidden capture feeds each lane's head fill (`fill_head_after_wave`); the lane's trunk, head,
+//! pending hidden and draft state after prefill, window 1 and the last window are compared with
+//! the singleton `mtp_prefill` + `mtp_step` replay as in every MTP run. A run of two or more
+//! lanes in which no wave ran FAILS. `--controls` adds `wave_perturb_prompt` (lane 1's prompt
+//! carries one wrong token; the replay comparison must fail).
 //!
 //! `--spec mtp [--k 3] [--routes cycle]`: MTP lanes (fn-batch S5). Requires
 //! `HIPFIRE_MTP_INCREMENTAL=0` so the singleton reference window
@@ -344,8 +351,11 @@ fn parse_args_from(raw: &[String]) -> R<Args> {
     if a.spec_mtp && a.g0 {
         return Err("--g0 probes the AR lane stages; use it with --spec ar".into());
     }
-    if a.wave_prefill && (a.spec_mtp || a.promote.is_some() || a.copy) {
-        return Err("--wave-prefill drives AR lanes: it does not combine with --spec mtp, --promote or --copy".into());
+    if a.wave_prefill && (a.promote.is_some() || a.copy) {
+        return Err("--wave-prefill drives AR lanes or MTP lanes (--spec mtp): it does not combine with --promote or --copy".into());
+    }
+    if a.wave_prefill && a.spec_mtp && a.decode_rows > 0 {
+        return Err("--decode-rows plans AR rows: it does not combine with --wave-prefill --spec mtp".into());
     }
     if let Some(p) = a.promote {
         if a.spec_mtp && p == 0 {
@@ -1910,6 +1920,11 @@ impl SpecLane {
 }
 
 struct SpecRun {
+    /// `--wave-prefill`: every step plans the prefill tile of every unfinished lane.
+    wave_prefill: bool,
+    /// The wave perturbation control: request and the prompt its plan and lane carry in place
+    /// of the reference prompt.
+    prompt_override: Option<(usize, Vec<u32>)>,
     lanes: Vec<SpecLane>,
     diff: Diff,
     error: Option<String>,
@@ -2366,8 +2381,15 @@ fn drive_spec(
             break;
         }
         let all_prefilled = run.lanes.iter().all(|l| l.prefilled == l.prompt_len);
-        let pre = run.lanes.iter().position(|l| l.prefilled < l.prompt_len);
-        if pre.is_none() {
+        let pre: Vec<usize> = run
+            .lanes
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.prefilled < l.prompt_len)
+            .map(|(i, _)| i)
+            .take(if run.wave_prefill { usize::MAX } else { 1 })
+            .collect();
+        if pre.is_empty() {
             if let Some(i) = run.lanes.iter().position(|l| l.pending_promotion()) {
                 let prompt = prompts[run.lanes[i].req].clone();
                 promote_lane(w, run, i, prompt, dir)?;
@@ -2385,11 +2407,11 @@ fn drive_spec(
             })
             .map(|(i, _)| i)
             .collect();
-        if pre.is_none() && dec.is_empty() {
+        if pre.is_empty() && dec.is_empty() {
             break;
         }
         let mut specs = Vec::new();
-        if let Some(i) = pre {
+        for &i in &pre {
             let l = &run.lanes[i];
             let len = w
                 .bundle
@@ -2402,10 +2424,14 @@ fn drive_spec(
                     l.req, l.prefilled, l.prompt_len
                 ));
             }
+            let prompt = match &run.prompt_override {
+                Some((req, p)) if *req == l.req => p,
+                _ => &prompts[l.req],
+            };
             specs.push(RowSpec {
                 slot: l.slot,
                 epoch: l.epoch,
-                tokens: prompts[l.req][l.prefilled..l.prefilled + len].to_vec(),
+                tokens: prompt[l.prefilled..l.prefilled + len].to_vec(),
                 start: l.prefilled,
                 kind: RequestStepKind::Prefill,
             });
@@ -2488,6 +2514,8 @@ struct SpecReport {
     first: Option<String>,
     json: Value,
     stats: SpecStats,
+    /// Prefill waves this run ran.
+    waves: u64,
     run: SpecRun,
     line: String,
 }
@@ -2742,9 +2770,13 @@ impl App {
         skip_rollback: bool,
         promote: Option<usize>,
         zero_pending: bool,
+        wave_perturb: bool,
     ) -> SpecReport {
         let started = Instant::now();
+        let waves0 = hipfire_arch_qwen4::lane_exec::g942_wave::wave_counters();
         let mut run = SpecRun {
+            wave_prefill: self.wave_prefill,
+            prompt_override: None,
             lanes: Vec::new(),
             diff: Diff::default(),
             error: None,
@@ -2800,7 +2832,12 @@ impl App {
                     request_tag: self.tag,
                     owner_generation: 1,
                 };
-                let prompt = self.prompts[req].clone();
+                let mut prompt = self.prompts[req].clone();
+                if wave_perturb && req == 1 {
+                    let at = prompt.len() / 2;
+                    prompt[at] = (prompt[at] + 1) % self.w.vocab as u32;
+                    run.prompt_override = Some((req, prompt.clone()));
+                }
                 let prompt_len = prompt.len();
                 let slot = self
                     .w
@@ -2834,6 +2871,19 @@ impl App {
         }
         if let Some(d) = run.drafter.take() {
             Box::new(d).mtp_free(&mut self.w.gpu);
+        }
+        let waves1 = hipfire_arch_qwen4::lane_exec::g942_wave::wave_counters();
+        let waves = (
+            waves1.0 - waves0.0,
+            waves1.1 - waves0.1,
+            waves1.2 - waves0.2,
+        );
+        // A burst of two or more lanes must have run a wave (a single lane has no peer to join).
+        if self.wave_prefill && lanes >= 2 && waves.0 == 0 && run.error.is_none() {
+            run.diff.note(
+                "--wave-prefill: no prefill wave ran (the serial lane tiles took every step)"
+                    .to_string(),
+            );
         }
         for l in &run.lanes {
             if let Err(m) = write_windows(&self.lanes_dir, l) {
@@ -2964,6 +3014,11 @@ impl App {
             "spec": "mtp",
             "spec_k": k,
             "promote": promote,
+            "wave_prefill": self.wave_prefill,
+            "wave_perturb": wave_perturb,
+            "waves": waves.0,
+            "wave_lanes": waves.1,
+            "wave_rows": waves.2,
             "promotion_position": run.lanes.first().and_then(|l| l.promote.as_ref()).filter(|p| p.done).map(|p| p.position),
             "routes": routes.name(),
             "policy": label,
@@ -3000,10 +3055,15 @@ impl App {
             None => String::new(),
         };
         let mut line = format!(
-            "run lanes={lanes} spec=mtp k={k} routes={} policy={label}{promo}{}: {} (windows {} [batched {}, ar_synced {}, \
+            "run lanes={lanes} spec=mtp k={k} routes={} policy={label}{promo}{}{}: {} (windows {} [batched {}, ar_synced {}, \
              ar_retired {}], rejected {}, drafts {} accepted {}, tau {:?}, state checkpoints {})",
             routes.name(),
             if skip_rollback { " control=skip_rollback" } else { "" },
+            if self.wave_prefill {
+                format!(" wave_prefill waves={} wave_lanes={} wave_rows={}{}", waves.0, waves.1, waves.2, if wave_perturb { " control=wave_perturb_prompt" } else { "" })
+            } else {
+                String::new()
+            },
             if clean { "PASS" } else { "FAIL" },
             stats.windows,
             stats.batched,
@@ -3026,6 +3086,7 @@ impl App {
             first,
             json,
             stats,
+            waves: waves.0,
             run,
             line,
         }
@@ -3178,7 +3239,7 @@ fn spec_main(
         lanes_dir: args.out.join("lanes"),
         ar_ids: Vec::new(),
         copy: args.copy,
-        wave_prefill: false,
+        wave_prefill: args.wave_prefill,
         decode_rows: 0,
     };
     let short_steps = args.steps.min(16);
@@ -3196,6 +3257,7 @@ fn spec_main(
             args.routes,
             false,
             args.promote,
+            false,
             false,
         );
         app.log.say(r.line.clone());
@@ -3219,6 +3281,7 @@ fn spec_main(
             RoutesArg::Cycle,
             false,
             None,
+            false,
             false,
         );
         app.log.say(r.line.clone());
@@ -3248,6 +3311,7 @@ fn spec_main(
             RoutesArg::Cycle,
             true,
             None,
+            false,
             false,
         );
         app.log.say(r.line.clone());
@@ -3286,6 +3350,49 @@ fn spec_main(
             "rejected_windows": r.stats.rejected,
             "run": r.json,
         }));
+        if args.wave_prefill {
+            // Negative: lane 1's prompt carries one wrong token in the burst's wave; the
+            // comparison with the singleton replay of the reference prompt must fail.
+            let r = app.run_spec_lanes(
+                2,
+                short_steps,
+                k,
+                primary,
+                &args.policy,
+                args.routes,
+                false,
+                None,
+                false,
+                true,
+            );
+            app.log.say(r.line.clone());
+            let diverged = r.run.diff.bad > 0 || r.run.error.is_some();
+            let (detected, how) = if r.waves == 0 {
+                (
+                    false,
+                    "control was not exercised (no prefill wave ran)".to_string(),
+                )
+            } else if diverged {
+                (
+                    true,
+                    format!("comparison failed: {}", r.first.clone().unwrap_or_default()),
+                )
+            } else {
+                (false, "comparison still passed".to_string())
+            };
+            all_pass &= detected;
+            app.log.say(format!(
+                "control wave_perturb_prompt: {} ({how})",
+                if detected { "detected" } else { "MISSED" }
+            ));
+            controls_json.push(json!({
+                "control": "wave_perturb_prompt",
+                "detected": detected,
+                "how": how,
+                "waves": r.waves,
+                "run": r.json,
+            }));
+        }
         if let Some(p) = args.promote {
             // Negative: the promoted lane's pending hidden is zeroed right after the promotion; the comparison must fail.
             let p = p.min(short_steps - 1);
@@ -3299,6 +3406,7 @@ fn spec_main(
                 false,
                 Some(p),
                 true,
+                false,
             );
             app.log.say(r.line.clone());
             let promoted = r
@@ -3388,7 +3496,7 @@ fn spec_main(
             "policy": args.policy, "policy_described": primary.describe(), "g0": false,
             "controls": args.controls, "bench": args.bench,
             "spec": "mtp", "k": args.k, "routes": args.routes.name(), "promote": args.promote,
-            "copy": args.copy, "repeat": args.repeat, "lag_rows": args.lag_rows,
+            "copy": args.copy, "repeat": args.repeat, "lag_rows": args.lag_rows, "wave_prefill": args.wave_prefill,
         },
         "policy_evidence": app.w.bundle.lanes().map_or("", |store| store.evidence()),
         "loaded_policy_evidence": loaded_evidence,

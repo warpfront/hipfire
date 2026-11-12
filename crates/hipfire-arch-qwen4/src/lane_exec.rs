@@ -1368,11 +1368,7 @@ pub(crate) fn step_prefill_parts(
         .as_ref()
         .is_some_and(|forward| forward.ep.is_some());
     let wave_on = ep_lane_prefill_wave_enabled() && ep_forward;
-    let wide_width = bundle.config.hc_count * bundle.config.hidden_size;
-    let wide_rows = bundle
-        .spec_hidden
-        .as_ref()
-        .map_or(0, |hidden| hidden.numel() / wide_width.max(1));
+    let wide_rows = bundle.spec_hidden_rows();
     let eligible: Vec<bool> = mtp.iter().map(|&mtp| !mtp || wide_rows > 0).collect();
     let wave_cap = if mtp.iter().any(|&mtp| mtp) {
         EP_WAVE_MAX_ROWS.min(wide_rows)
@@ -1477,10 +1473,15 @@ fn run_prefill_tiles(
         }
     }
     let wide_width = bundle.config.hc_count * bundle.config.hidden_size;
-    // gfx942 single device (P2): every run of two or more non-MTP tiles is one joint wave.
+    // gfx942 single device (P2): every run of two or more tiles is one joint wave, an MTP lane's
+    // included (its head fill follows the wave from its own rows of the wide-hidden capture): an
+    // MTP lane joins only when the spec hidden buffer exists, and a wave holding one is capped
+    // by that buffer's rows.
     let parts = if g942_wave::wave_applies(gpu, bundle) {
-        let plain: Vec<bool> = lanes.iter().map(|lane| lane.spec.is_none()).collect();
-        g942_wave::plan_parts(&tile_rows, &plain, g942_wave::wave_cap(bundle))
+        let any_mtp = mtp.iter().any(|&mtp| mtp);
+        let can_capture = bundle.spec_hidden_rows() > 0;
+        let eligible: Vec<bool> = mtp.iter().map(|&mtp| !mtp || can_capture).collect();
+        g942_wave::plan_parts(&tile_rows, &eligible, g942_wave::wave_cap(bundle, any_mtp))
     } else {
         parts
     };
