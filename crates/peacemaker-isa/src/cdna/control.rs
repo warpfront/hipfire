@@ -8,8 +8,9 @@
 //! the entire result; CMP_EQ/LG_U32 writes its comparison result. These are
 //! the only precise transfers here. Every other definition is forgotten via
 //! the full typed footprint, including conditional writes and VALU SGPR defs.
-//! Special registers remain unknown even after writes. No facts cross a CFG
-//! block boundary and no fact belongs to a pending-memory/replay state.
+//! Special registers remain unknown even after writes. Facts never leave the callers'
+//! scope (one block, or one predecessor block plus the block it enters over one edge, see
+//! `lifted::entry_proofs`) and no fact belongs to a pending-memory/replay state.
 
 use crate::ledger_control::{EdgeChoice, Facts, Truth, Word};
 use peacemaker_cdna::enc::sop::{Sop1Op, Sop2Op, SopcOp, SoppOp};

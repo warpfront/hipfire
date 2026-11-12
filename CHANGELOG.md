@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- PeaceMaker gfx942: seal all four unchanged GLOBAL-only GDN verify entries after proving the conv join's incoming scalar-constant edge. Pin the immutable replacement source/anchor and exact-image MI300X oracle receipt (280 checks, including conv and gate); original FLAT rollback fixture remains negative-only. No wait allowance, cap increase, instruction rewrite or production dispatch change.
+
 ### 0.5.0 removals
 
 - **Removed config keys fail the load.** A `config.toml` or custom profile that still sets a key listed in `hipfire_config::RETIRED_CONFIG_KEYS` (including `kernel.mw16`, whose 0.4.x warn-and-ignore window ended) now fails with `configuration key '<key>' was removed in <version> (<reason>); replacement: <replacement>` instead of loading with a warning. See [`docs/CONFIG.md`](docs/CONFIG.md#lifecycle-status).
@@ -36,6 +38,9 @@
 - PeaceMaker gfx942: add the single-entry GDN lanes capture-f32 twin (`qwen4_gdn_lanes_step_capture_f32_gfx942`) next to its hipcc anchor, registered as fully certified CDNA in the CPU ledger and in the all-launcher ABI inventory. Default production is unchanged: nothing embeds or dispatches the twin. Qualification evidence comes only from the hash-bound hardware receipt, not from this entry.
 
 - PeaceMaker gfx942: add the seven-entry HC-gates BF16 GEMV twin (`gemv_bf16_xf32_k4_rows_tiled_r2`..`r8`) next to its hipcc anchor, registered as fully certified CDNA in the CPU ledger and in the all-launcher ABI inventory. Default production is unchanged: nothing embeds or dispatches the twin. Qualification evidence comes only from the hash-bound hardware receipt, not from this entry.
+
+- PeaceMaker gfx942: pin the frozen four-entry GDN verification module as negative-only evidence. Rollback FLAT segment semantics and convolution VMEM WAW at body PC674 remain OPEN; individually provable capture/gate entries do not establish a four-entry certificate. No deployable twin or new verifier allowance is added.
+- PeaceMaker gfx942: strict typed certification now carries one predecessor block's scalar facts across exactly one CFG edge (`EntryProof`): a labelled block ending in an undecided `s_cbranch_scc0/scc1` takes its proven direction for executions that crossed an edge whose predecessor leaves a constant in an SGPR (hipcc's boolean-phi join, `s_mov_b64 s[14:15], 0; s_branch J` into `J: s_and_b64 s[14:15], s[14:15], exec; s_cselect_b32; s_cmp_lg_u32; s_cbranch_scc1`). The label dedup key records the applied direction so arrivals over other edges are never merged or hidden; every memory, wait, cap and key rule is unchanged, dispatcher mode takes no proofs, and no allowance, suppression or limit is added. It removes the infeasible `s_branch L648` edge behind the GDN convolution VMEM WAW at body pc 674; the original GDN anchor stays pinned (rollback FLAT refusal unchanged) and the owner's replacement anchor `98b7f417…` (`1b0d830afa`) is pinned with an all-four-entries acceptance test.
 
 ### Fixes: GDN prefill independent of outer chunking (Qwen3.5 dense and MoE)
 

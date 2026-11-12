@@ -32,10 +32,18 @@
 //! and after every branch or `s_endpgm`; nothing flows between blocks, so a choice holds for
 //! every state entering its block (the P1b `s_mov_b64 s[0:1],0; s_and_b64 s[0:1],s[0:1],exec;
 //! s_cselect_b32 s0,1,0; s_cmp_lg_u32 s0,1; s_cbranch_scc1` gate always takes its branch).
-//! `certify_stream` hands that exact table to `ledger_cfg::verify_with_branch_proofs`, which
-//! prunes only the impossible edge; the layout, target, fall-off and hazard validation still
-//! run over the full unchanged typed stream first, and inserted labels map to `Both`. No
-//! public API accepts caller-supplied proofs.
+//! A second, edge-conditioned table (`entry_proofs`) covers the join that block-local facts
+//! cannot: a labelled block ending in an undecided `s_cbranch_scc0/scc1` gets, per CFG edge
+//! into it, the direction its branch must take for executions that crossed that edge, from
+//! the facts of the predecessor's own block (run from unknown, so no meet or fixed point) and
+//! the block's instructions (hipcc's boolean phi: the predecessor's `s_mov_b64 s[14:15], 0;
+//! s_branch J` makes `J: s_and_b64 s[14:15],s[14:15],exec; s_cselect_b32; s_cmp_lg_u32;
+//! s_cbranch_scc1` take its branch, while the fall-through predecessor's `-1` proves nothing).
+//! `certify_stream` hands both tables to `ledger_cfg::verify_with_branch_proofs`, which
+//! prunes only the impossible edge, and only for walks that arrived over the proven edge; the
+//! layout, target, fall-off and hazard validation still run over the full unchanged typed
+//! stream first, and inserted labels map to `Both`. No public API accepts caller-supplied
+//! proofs.
 //!
 //! Fail-closed, never skipped: an instruction the ledger cannot model is an error, not a
 //! pass. That covers `s_setpc_b64`, `s_trap`, `s_sendmsg`, a branch off an instruction
@@ -54,7 +62,7 @@ use super::{control, hazard};
 use crate::arch::Arch;
 use crate::insn::{Instruction, MemoryClass, Program};
 use crate::ledger_cfg;
-use crate::ledger_control::{EdgeChoice, Facts};
+use crate::ledger_control::{EdgeChoice, EntryProof, Facts};
 use crate::reg::{Kind, RegRef};
 use peacemaker_cdna::enc::flat::FlatSeg;
 use peacemaker_cdna::enc::sop::{waitcnt_fields, Sop1Op, SoppOp};
@@ -117,8 +125,8 @@ pub fn certify_stream(name: &str, instructions: &[Typed]) -> Result<Value, Strin
         ));
     }
 
-    let (program, counts, choices) = ledger_program(name, &insts, &cfg)?;
-    let stats = ledger_cfg::verify_with_branch_proofs(&program, &[], &choices)
+    let (program, counts, choices, entries) = ledger_program(name, &insts, &cfg)?;
+    let stats = ledger_cfg::verify_with_branch_proofs(&program, &[], &choices, &entries)
         .map_err(|e| format!("{name}: wait ledger replay: {e}"))?;
 
     let mut nops = 0u64;
@@ -296,26 +304,42 @@ struct Counts {
     smem: u64,
 }
 
-/// The ledger [`Program`] of the typed stream, its counts, and the static branch proofs
-/// (`choices[pc]`, one per ledger instruction, labels included).
+/// Whether execution can continue at the next instruction: everything but `s_branch` and
+/// `s_endpgm`.
+fn falls_through(inst: &Inst) -> bool {
+    !matches!(inst, Inst::Sopp(p) if p.op == SoppOp::Branch || p.op == SoppOp::Endpgm)
+}
+
+/// Whether `inst` (whose encoded branch target is `branch`) ends its basic block: any branch
+/// or `s_endpgm`.
+fn ends_block(inst: &Inst, branch: Option<usize>) -> bool {
+    branch.is_some() || matches!(inst, Inst::Sopp(p) if p.op == SoppOp::Endpgm)
+}
+
+/// The ledger [`Program`] of the typed stream, its counts, and the static branch proofs: the
+/// block-local `choices[pc]` (one per ledger instruction, labels included) and the
+/// edge-conditioned [`EntryProof`]s.
 ///
 /// Each instruction's full typed [`Footprint`] is computed once and reused for both the
 /// ledger defs/uses (`convert`, which then drops the special registers) and the scalar
 /// control analysis (`control::transfer`, whose invalidation must see SCC/EXEC/VCC and every
-/// SGPR a scalar or vector instruction may write). The scalar `Facts` are block-local: they
-/// are reset at instruction 0, at every branch target (original CFG, reachable or not) and
-/// after every branch or `s_endpgm`, so nothing is carried between blocks, along any edge or
-/// around any loop. A conditional branch's choice is read from the facts of its own block
-/// before its transfer; inserted labels and every other instruction are `Both`.
+/// SGPR a scalar or vector instruction may write). The scalar `Facts` of `choices` are
+/// block-local: they are reset at instruction 0, at every branch target (original CFG,
+/// reachable or not) and after every branch or `s_endpgm`, so nothing is carried between
+/// blocks, along any edge or around any loop. A conditional branch's choice is read from the
+/// facts of its own block before its transfer; inserted labels and every other instruction
+/// are `Both`. [`entry_proofs`] then refines the blocks whose own facts prove nothing.
 fn ledger_program(
     name: &str,
     insts: &[Inst],
     cfg: &Cfg,
-) -> Result<(Program, Counts, Vec<EdgeChoice>), String> {
+) -> Result<(Program, Counts, Vec<EdgeChoice>, Vec<EntryProof>), String> {
     let mut counts = Counts::default();
     let capacity = insts.len() + cfg.targets.len();
     let mut out = Vec::with_capacity(capacity);
     let mut choices = Vec::with_capacity(capacity);
+    // Ledger pc of each typed instruction (a label, if any, sits at `pc_of[i] - 1`).
+    let mut pc_of = Vec::with_capacity(insts.len());
     // One allocation for the stream; the register count is the architecture's (s0..s101).
     let mut facts = Facts::new(usize::from(CDNA.caps().sgprs));
     let mut block_start = true;
@@ -338,13 +362,15 @@ fn ledger_program(
             EdgeChoice::Both
         };
         control::transfer(inst, &footprint, &mut facts);
+        pc_of.push(out.len());
         out.push(
             convert(inst, &footprint, branch, &mut counts)
                 .map_err(|e| format!("{name}: instruction {i} `{inst}`: {e}"))?,
         );
         choices.push(choice);
-        block_start = branch.is_some() || matches!(inst, Inst::Sopp(p) if p.op == SoppOp::Endpgm);
+        block_start = ends_block(inst, branch);
     }
+    let entries = entry_proofs(insts, cfg, &pc_of, &choices, &mut facts);
     Ok((
         Program {
             arch: Arch::Gfx942,
@@ -352,7 +378,98 @@ fn ledger_program(
         },
         counts,
         choices,
+        entries,
     ))
+}
+
+/// Edge-conditioned branch proofs.
+///
+/// For every labelled block whose terminal instruction is a conditional `s_cbranch_scc0/scc1`
+/// that the block's own facts leave open (`Both`), and for every CFG edge into the block (the
+/// taken edge of each branch or `s_branch` naming it, and the fall-through from the previous
+/// instruction unless that one is `s_branch`/`s_endpgm`): run the scalar transfer over the
+/// *predecessor's* basic block from unknown facts, which yields facts valid for every
+/// execution that reaches the end of that block, then over the labelled block up to its branch,
+/// and read the branch's choice. The facts hold for every execution that crossed this edge
+/// (the predecessor block starts from all-unknown, so nothing about its own entry is
+/// assumed; no meet or fixed point is involved), so a proven direction is mandatory for
+/// exactly those executions. Other edges into the same label, and the block-local `choices`,
+/// are untouched: the verifier applies an [`EntryProof`] only to a walk that arrived over its
+/// edge and keys the label state on it.
+///
+/// hipcc lowers a boolean join this way: each predecessor materializes the constant (`s_mov_b64
+/// s[14:15], 0` before an `s_branch` to the join, `-1` on the fall-through side) and the join
+/// ANDs it with EXEC and branches on the result; only the zero side is decided
+/// (`0 & EXEC = 0`).
+fn entry_proofs(
+    insts: &[Inst],
+    cfg: &Cfg,
+    pc_of: &[usize],
+    choices: &[EdgeChoice],
+    facts: &mut Facts,
+) -> Vec<EntryProof> {
+    let n = insts.len();
+    // Taken edges by target: the branches (conditional or not) naming each instruction.
+    let mut taken_from: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (from, to) in cfg.branch.iter().enumerate() {
+        if let Some(to) = to {
+            taken_from.entry(*to).or_default().push(from);
+        }
+    }
+    let mut entries = Vec::new();
+    for &label in &cfg.targets {
+        // The terminal branch of the block that starts at this target: the first branch or
+        // `s_endpgm` before the next leader.
+        let Some(branch) = (label..n)
+            .take_while(|&i| i == label || !cfg.targets.contains(&i))
+            .find(|&i| ends_block(&insts[i], cfg.branch[i]))
+        else {
+            continue;
+        };
+        let scc_branch = |i: usize| {
+            cfg.branch[i].is_some()
+                && matches!(&insts[i], Inst::Sopp(p)
+                    if p.op == SoppOp::CbranchScc0 || p.op == SoppOp::CbranchScc1)
+        };
+        if !scc_branch(branch) || choices[pc_of[branch]] != EdgeChoice::Both {
+            continue;
+        }
+        let mut edges: Vec<(usize, bool)> = taken_from
+            .get(&label)
+            .map(|froms| froms.iter().map(|&from| (from, true)).collect())
+            .unwrap_or_default();
+        if label > 0 && falls_through(&insts[label - 1]) {
+            edges.push((label - 1, false));
+        }
+        for (from, taken) in edges {
+            // The predecessor's basic block, from its own leader up to the edge's source.
+            let mut leader = from;
+            while leader > 0
+                && !cfg.targets.contains(&leader)
+                && !ends_block(&insts[leader - 1], cfg.branch[leader - 1])
+            {
+                leader -= 1;
+            }
+            facts.reset_block();
+            for inst in &insts[leader..=from] {
+                control::transfer(inst, &inst.footprint(), facts);
+            }
+            for inst in &insts[label..branch] {
+                control::transfer(inst, &inst.footprint(), facts);
+            }
+            let choice = control::branch_choice(&insts[branch], facts);
+            if choice != EdgeChoice::Both {
+                entries.push(EntryProof {
+                    from: pc_of[from],
+                    taken,
+                    label: pc_of[label] - 1,
+                    branch: pc_of[branch],
+                    choice,
+                });
+            }
+        }
+    }
+    entries
 }
 
 fn convert(
@@ -508,6 +625,7 @@ fn tracked(spans: &[RegSpan]) -> Vec<RegRef> {
 mod tests {
     use super::*;
     use crate::cdna::ops;
+    use peacemaker_cdna::enc::flat::FlatOp;
     use peacemaker_cdna::enc::sop::{Sop2Op, SopcOp};
     use peacemaker_cdna::enc::vop::Vop1Op;
     use peacemaker_cdna::Src;
@@ -517,6 +635,9 @@ mod tests {
 
     /// The final P1b anchor (bytes identical to the pinned owner bundle).
     const P1B: &[u8] = include_bytes!("../../tests/fixtures/cdna/gfx942_p1b_wide.co");
+    /// The owner's replacement GDN verification anchor (`1b0d830afa`, rollback through the
+    /// global address space; the original `gfx942_gdn_verify_open.co` stays a negative pin).
+    const GDN: &[u8] = include_bytes!("../../tests/fixtures/cdna/gfx942_gdn_verify_global.co");
 
     fn typed(insts: &[Inst]) -> Vec<Typed> {
         let mut at = 0;
@@ -534,15 +655,22 @@ mod tests {
     }
 
     /// The same front half as `certify_stream` (layout, CFG), then the ledger conversion.
-    fn analyze(insts: &[Inst]) -> Result<(Program, Counts, Vec<EdgeChoice>), String> {
+    fn analyze(
+        insts: &[Inst],
+    ) -> Result<(Program, Counts, Vec<EdgeChoice>, Vec<EntryProof>), String> {
         let layout = layout("t", &typed(insts))?;
         let cfg = cfg("t", insts, &layout)?;
         ledger_program("t", insts, &cfg)
     }
     fn convert_ok(insts: &[Inst]) -> (Program, Vec<EdgeChoice>) {
-        let (program, _, choices) = analyze(insts).expect("converts");
-        assert_eq!(choices.len(), program.instructions.len());
+        let (program, choices, _) = convert_entries(insts);
         (program, choices)
+    }
+    /// [`convert_ok`] with the edge-conditioned proofs as well.
+    fn convert_entries(insts: &[Inst]) -> (Program, Vec<EdgeChoice>, Vec<EntryProof>) {
+        let (program, _, choices, entries) = analyze(insts).expect("converts");
+        assert_eq!(choices.len(), program.instructions.len());
+        (program, choices, entries)
     }
 
     /// A branch at instruction `from` to instruction `to`; every instruction in these streams
@@ -591,7 +719,7 @@ mod tests {
             [Both, Both, Both, Both, Taken, Both, Both, Both],
             "labels and non-conditionals are Both"
         );
-        ledger_cfg::verify_with_branch_proofs(&program, &[], &choices).unwrap();
+        ledger_cfg::verify_with_branch_proofs(&program, &[], &choices, &[]).unwrap();
 
         // The opposite polarity falls through.
         let mut insts = certificate();
@@ -660,6 +788,21 @@ mod tests {
         assert_eq!(choices[4], Both, "inserted labels map to Both");
         assert_eq!(choices[6], Both, "{choices:?}");
         assert!(choices.iter().all(|c| *c == Both));
+        // The block-local table stays Both, but the fall-through edge into `L4` comes from the
+        // zeroed pair and does prove the branch for executions that crossed it. The early
+        // branch into the middle of the sequence (pc 0 -> L4) carries no proof and keeps both
+        // edges.
+        let (_, _, entries) = convert_entries(&insts);
+        assert_eq!(
+            entries,
+            [EntryProof {
+                from: 3,
+                taken: false,
+                label: 4,
+                branch: 6,
+                choice: Taken
+            }]
+        );
     }
 
     #[test]
@@ -688,7 +831,7 @@ mod tests {
         assert_eq!(program.instructions[0].text, "L0:");
         assert_eq!(program.instructions[5].text, "s_cbranch_scc1 L0");
         assert_eq!(choices, [Both, Both, Both, Both, Both, Taken, Both]);
-        let stats = ledger_cfg::verify_with_branch_proofs(&program, &[], &choices).unwrap();
+        let stats = ledger_cfg::verify_with_branch_proofs(&program, &[], &choices, &[]).unwrap();
         assert_eq!(stats.label_states, 1, "{stats:?}");
     }
 
@@ -756,7 +899,7 @@ mod tests {
             hazard::check(CDNA, &insts).is_empty(),
             "hazard pass is unchanged"
         );
-        let (program, _, choices) = ledger_program("wide64", &insts, &cfg).unwrap();
+        let (program, _, choices, entries) = ledger_program("wide64", &insts, &cfg).unwrap();
         assert_eq!(choices.len(), program.instructions.len());
 
         let text = |pc: usize| program.instructions[pc].text.as_str();
@@ -788,15 +931,278 @@ mod tests {
         }
         let both = vec![Both; program.instructions.len()];
         assert_eq!(
-            ledger_cfg::verify_with_branch_proofs(&program, &[], &both),
+            ledger_cfg::verify_with_branch_proofs(&program, &[], &both, &[]),
             Err(reference.clone())
         );
 
         // Refined: either certifies, or reports a finding that is not the infeasible edge
         // into pc 975 (a distinct later error is fine; nothing is hidden).
-        if let Err(refined) = ledger_cfg::verify_with_branch_proofs(&program, &[], &choices) {
+        let refined = ledger_cfg::verify_with_branch_proofs(&program, &[], &choices, &entries);
+        if let Err(refined) = refined {
             let impossible = format!("pc 893 `{}` not taken", text(893));
             assert!(!refined.contains(&impossible), "{refined}");
+        }
+    }
+
+    /// Patch the placeholder at `from` into the branch `op` to instruction `to`. Offsets are
+    /// real dword distances: the global loads of these streams are two dwords.
+    fn link(insts: &mut [Inst], from: usize, op: SoppOp, to: usize) {
+        let dword = |i: usize| -> i64 {
+            insts[..i]
+                .iter()
+                .map(|x| x.words(CDNA).expect("encodes").len() as i64)
+                .sum()
+        };
+        let offset = dword(to) - dword(from) - 1;
+        insts[from] = ops::sp(op, offset as i16 as u16);
+    }
+    /// `global_load_dword v1, v[2:3]`
+    fn reload() -> Inst {
+        ops::global_load(FlatOp::LoadDword, v(1), v(2), None, 0)
+    }
+    /// `s_mov_b64 s[14:15], value`
+    fn pair14(value: Src) -> Inst {
+        ops::s1(Sop1Op::MovB64, s(14), value)
+    }
+    /// hipcc's boolean-phi join with the constant of each side materialized in its own
+    /// predecessor: `0: s_cbranch_scc1 B`; `jump_side`; `s_branch J`; `B:` `fall_side`; `J:`
+    /// `s_and_b64 s[14:15], s[14:15], exec; s_cselect_b32 s14, 1, 0; s_cmp_lg_u32 s14, 1`; the
+    /// `gate` branch over a reload of `v1`; the reload; `E: s_endpgm`. `fall_side` is not empty.
+    fn phi_join(jump_side: &[Inst], fall_side: &[Inst], gate: SoppOp) -> Vec<Inst> {
+        let mut insts = vec![nop()];
+        insts.extend_from_slice(jump_side);
+        let jump = insts.len();
+        insts.push(nop());
+        let fall = insts.len();
+        insts.extend_from_slice(fall_side);
+        let join = insts.len();
+        insts.extend([
+            ops::s2(Sop2Op::AndB64, s(14), s(14), Src::ExecLo),
+            ops::s2(Sop2Op::CselectB32, s(14), Int(1), Int(0)),
+            ops::sc(SopcOp::CmpLgU32, s(14), Int(1)),
+        ]);
+        let gated = insts.len();
+        insts.extend([nop(), reload(), end()]);
+        let exit = insts.len() - 1;
+        link(&mut insts, 0, SoppOp::CbranchScc1, fall);
+        link(&mut insts, jump, SoppOp::Branch, join);
+        link(&mut insts, gated, gate, exit);
+        insts
+    }
+
+    #[test]
+    fn a_predecessors_zero_constant_proves_the_join_branch_over_that_edge_only() {
+        // 0 br B, 1 load v1, 2 mov s[14:15],0, 3 s_branch J, 4 B: mov s[14:15],-1,
+        // 5 J: and, 6 select, 7 compare, 8 gate, 9 reload, 10 E: end.
+        let insts = phi_join(
+            &[reload(), pair14(Int(0))],
+            &[pair14(Int(-1))],
+            SoppOp::CbranchScc1,
+        );
+        let (program, choices, entries) = convert_entries(&insts);
+        // Ledger pcs: 4 `L4:`, 6 `L5:` (the join), 10 the gate, 11 the reload, 12 `L10:`.
+        assert_eq!(program.instructions[6].text, "L5:");
+        assert_eq!(program.instructions[10].text, "s_cbranch_scc1 L10");
+        assert!(
+            choices.iter().all(|c| *c == Both),
+            "block-local facts decide nothing here"
+        );
+        assert_eq!(
+            entries,
+            [EntryProof {
+                from: 3,
+                taken: true,
+                label: 6,
+                branch: 10,
+                choice: Taken
+            }],
+            "only the `s_branch` edge carries 0; the fall-through's -1 & EXEC is unknown"
+        );
+        // The block-local verifier (the previous release) refuses: the pending load of v1
+        // reaches the reload over the impossible not-taken edge.
+        let e = ledger_cfg::verify_with_branch_proofs(&program, &[], &choices, &[]).unwrap_err();
+        assert!(e.contains("pc 11") && e.contains("Waw"), "{e}");
+        ledger_cfg::verify_with_branch_proofs(&program, &[], &choices, &entries).unwrap();
+        // And the typed certification carries the proof end to end.
+        let evidence = certify_stream("k", &typed(&insts)).expect("certifies");
+        assert_eq!(evidence["checked"], true);
+    }
+
+    #[test]
+    fn edge_proofs_hold_back_for_unknown_constants_clobbers_and_other_edges() {
+        let refuses = |insts: &[Inst], reload_pc: usize, proofs: usize| {
+            let (program, choices, entries) = convert_entries(insts);
+            assert_eq!(entries.len(), proofs, "{entries:?}");
+            let e = ledger_cfg::verify_with_branch_proofs(&program, &[], &choices, &entries)
+                .unwrap_err();
+            assert!(
+                e.contains(&format!("pc {reload_pc} ")) && e.contains("Waw"),
+                "{e}"
+            );
+        };
+        let gate = SoppOp::CbranchScc1;
+        // The constant is not proven: EXEC itself, or -1 (-1 & EXEC is EXEC).
+        refuses(
+            &phi_join(&[reload(), pair14(Src::ExecLo)], &[pair14(Int(-1))], gate),
+            11,
+            0,
+        );
+        refuses(
+            &phi_join(&[reload(), pair14(Int(-1))], &[pair14(Int(-1))], gate),
+            11,
+            0,
+        );
+        // A vector instruction writes s14 after the zero: the fact is gone, not the stale 0.
+        let clobbered = [
+            reload(),
+            pair14(Int(0)),
+            ops::v1(Vop1Op::ReadfirstlaneB32, s(14), v(3)),
+        ];
+        refuses(&phi_join(&clobbered, &[pair14(Int(-1))], gate), 12, 0);
+        // A scalar write of an unknown value to the high half (s15) of the zeroed pair: s14
+        // stays 0 but the pair is no longer all zero, so `0 & EXEC` is not known to be 0 and
+        // no proof is taken from a partially overwritten pair.
+        let partial = [
+            reload(),
+            pair14(Int(0)),
+            ops::s1(Sop1Op::MovB32, s(15), Src::ExecHi),
+        ];
+        refuses(&phi_join(&partial, &[pair14(Int(-1))], gate), 12, 0);
+        // The fall-through predecessor also carries a pending load of v1 into the same join
+        // and proves nothing: the proof of the `s_branch` edge must not hide it.
+        let both_sides = phi_join(
+            &[reload(), pair14(Int(0))],
+            &[reload(), pair14(Int(-1))],
+            gate,
+        );
+        refuses(&both_sides, 12, 1);
+        let (program, choices, entries) = convert_entries(&both_sides);
+        let e =
+            ledger_cfg::verify_with_branch_proofs(&program, &[], &choices, &entries).unwrap_err();
+        assert!(e.contains("pc 0 `s_cbranch_scc1 L4` taken"), "{e}");
+    }
+
+    #[test]
+    fn edge_proofs_respect_the_branch_polarity() {
+        // scc0 over a zero mask is never taken: the proven edge is the fall-through, into the
+        // reload, so the pending load is now the real hazard.
+        let insts = phi_join(
+            &[reload(), pair14(Int(0))],
+            &[pair14(Int(-1))],
+            SoppOp::CbranchScc0,
+        );
+        let (program, choices, entries) = convert_entries(&insts);
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].choice, Fallthrough);
+        let e =
+            ledger_cfg::verify_with_branch_proofs(&program, &[], &choices, &entries).unwrap_err();
+        assert!(e.contains("pc 11") && e.contains("Waw"), "{e}");
+        // Without the pending load the same proven fall-through is harmless.
+        let insts = phi_join(&[pair14(Int(0))], &[pair14(Int(-1))], SoppOp::CbranchScc0);
+        let (program, choices, entries) = convert_entries(&insts);
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        ledger_cfg::verify_with_branch_proofs(&program, &[], &choices, &entries).unwrap();
+    }
+
+    #[test]
+    fn a_zero_constant_across_a_loop_back_edge_is_not_carried_between_iterations() {
+        // 0 H: mov s[14:15],-1  1 and  2 select  3 compare  4 scc1 -> 6  5 mov s[14:15],0 +
+        // jump back to H... The back edge leaves 0 in s[14:15] but H starts with its own
+        // `mov -1`, so nothing about the previous iteration can reach the AND: no proof.
+        let mut insts = vec![
+            pair14(Int(-1)),
+            ops::s2(Sop2Op::AndB64, s(14), s(14), Src::ExecLo),
+            ops::s2(Sop2Op::CselectB32, s(14), Int(1), Int(0)),
+            ops::sc(SopcOp::CmpLgU32, s(14), Int(1)),
+            nop(),
+            pair14(Int(0)),
+            nop(),
+            end(),
+        ];
+        link(&mut insts, 4, SoppOp::CbranchScc1, 7);
+        link(&mut insts, 6, SoppOp::Branch, 0);
+        let (_, choices, entries) = convert_entries(&insts);
+        assert!(choices.iter().all(|c| *c == Both), "{choices:?}");
+        assert!(entries.is_empty(), "{entries:?}");
+        // Whereas a back edge that does re-enter the AND with the zero proves its branch.
+        let mut insts = vec![
+            nop(),
+            ops::s2(Sop2Op::AndB64, s(14), s(14), Src::ExecLo),
+            ops::s2(Sop2Op::CselectB32, s(14), Int(1), Int(0)),
+            ops::sc(SopcOp::CmpLgU32, s(14), Int(1)),
+            nop(),
+            pair14(Int(0)),
+            nop(),
+            end(),
+        ];
+        link(&mut insts, 0, SoppOp::Branch, 1);
+        link(&mut insts, 4, SoppOp::CbranchScc1, 7);
+        link(&mut insts, 6, SoppOp::Branch, 1);
+        let (_, choices, entries) = convert_entries(&insts);
+        assert!(choices.iter().all(|c| *c == Both), "{choices:?}");
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert!(
+            entries[0].taken && entries[0].choice == Taken,
+            "{entries:?}"
+        );
+    }
+
+    /// The owner's replacement GDN verification anchor: the convolution kernel's pc 674
+    /// `global_load_dword v1` after `L648` is reached with a pending `global_load_ushort v1`
+    /// only over the `s_branch L648` at pc 665, whose join (pc 668..=672) ANDs the `0` that
+    /// edge's predecessor stored in `s[14:15]` with EXEC and so always takes `s_cbranch_scc1`
+    /// at pc 672 over the load. The previous verifier (block-local choices only) refuses with
+    /// the pinned message; the edge proof removes exactly that edge.
+    #[test]
+    fn gdn_conv_params_pc674_is_not_reachable_over_the_s_branch_into_l648() {
+        let (bundle, payloads) = peacemaker_ir::envelope::Bundle::read(GDN).expect("bundle");
+        let entry = bundle
+            .entries
+            .iter()
+            .position(|e| e.triple == "hipv4-amdgcn-amd-amdhsa--gfx942")
+            .expect("one gfx942 entry");
+        let lifted = peacemaker_lift::cdna::lift_object(payloads[entry]).expect("typed image");
+        let kernel = lifted
+            .kernels
+            .iter()
+            .find(|k| k.image.name == "qwen4_g942_gdn_verify_conv_params_k4")
+            .expect("conv symbol");
+        let insts: Vec<Inst> = kernel.instructions.iter().map(|t| t.inst.clone()).collect();
+        let layout = layout("conv", &kernel.instructions).unwrap();
+        let cfg = cfg("conv", &insts, &layout).unwrap();
+        let (program, _, choices, entries) = ledger_program("conv", &insts, &cfg).unwrap();
+        let text = |pc: usize| program.instructions[pc].text.as_str();
+        assert_eq!(text(665), "s_branch L648");
+        assert_eq!(text(668), "L648:");
+        assert!(text(672).starts_with("s_cbranch_scc1 "), "{}", text(672));
+        assert_eq!(text(674), "global_load_dword v1, v[6:7], off");
+        assert_eq!(choices[672], Both, "the join's own facts decide nothing");
+        let proof = EntryProof {
+            from: 665,
+            taken: true,
+            label: 668,
+            branch: 672,
+            choice: Taken,
+        };
+        assert!(entries.contains(&proof), "{entries:?}");
+
+        // Reference: block-local proofs only, as before the edge table existed.
+        let before =
+            ledger_cfg::verify_with_branch_proofs(&program, &[], &choices, &[]).unwrap_err();
+        assert!(
+            before.starts_with(
+                "pc 674 `global_load_dword v1, v[6:7], off` (after label `L648`): needs Vm wait 0 \
+                 (Waw { reg: \"v1\" }) but a path reaches it without one:"
+            ),
+            "{before}"
+        );
+        // Refined: either certifies, or reports something that is not that infeasible edge.
+        let after = ledger_cfg::verify_with_branch_proofs(&program, &[], &choices, &entries);
+        if let Err(after) = after {
+            assert!(
+                !after.contains("pc 674 `global_load_dword v1, v[6:7], off`"),
+                "{after}"
+            );
         }
     }
 

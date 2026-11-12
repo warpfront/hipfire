@@ -19,13 +19,13 @@ use crate::{DType, Gpu, GpuTensor};
 // reaches the private `Gfx942Device` borrow.
 #[path = "gfx942_qsa_lanes.rs"]
 mod qsa_lanes;
+pub(crate) use qsa_lanes::{QsaLanesTableCache, Qwen4QsaLaneDesc, Qwen4QsaLanesShape};
 pub use qsa_lanes::{
     Qwen4QsaLanesPlan, QWEN4_QSA_LANES_ATTENTION_F32, QWEN4_QSA_LANES_ATTENTION_FP8_FNUZ,
-    QWEN4_QSA_LANES_MAX, QWEN4_QSA_LANES_MODULE, QWEN4_QSA_LANES_POOL, QWEN4_QSA_LANES_PROLOGUE_F32,
-    QWEN4_QSA_LANES_PROLOGUE_FP8_FNUZ, QWEN4_QSA_LANES_SCORES, QWEN4_QSA_LANES_SELECT,
-    QWEN4_QSA_LANE_ROWS,
+    QWEN4_QSA_LANES_MAX, QWEN4_QSA_LANES_MODULE, QWEN4_QSA_LANES_POOL,
+    QWEN4_QSA_LANES_PROLOGUE_F32, QWEN4_QSA_LANES_PROLOGUE_FP8_FNUZ, QWEN4_QSA_LANES_SCORES,
+    QWEN4_QSA_LANES_SELECT, QWEN4_QSA_LANE_ROWS,
 };
-pub(crate) use qsa_lanes::{Qwen4QsaLaneDesc, Qwen4QsaLanesShape, QsaLanesTableCache};
 
 const GROUPED_OLORA_E8_SRC: &str =
     include_str!("../../../../kernels/src/gemv_mfp4g32_e8_soa_grouped.gfx942.hip");
@@ -359,7 +359,10 @@ fn g942_gdn_verify_image() -> HipResult<Option<&'static std::sync::Arc<[u8]>>> {
 /// (hipcc source, or the `HIPFIRE_QWEN4_G942_GDN_VERIFY_IMAGE` code object) and the module's own
 /// symbol is returned; every other arch, and every other entry, loads from `tensor_ops` as
 /// before and returns `kernel`.
-pub(crate) fn ensure_gdn_verify_kernel(gpu: &mut Gpu, kernel: &'static str) -> HipResult<&'static str> {
+pub(crate) fn ensure_gdn_verify_kernel(
+    gpu: &mut Gpu,
+    kernel: &'static str,
+) -> HipResult<&'static str> {
     let entry = gpu
         .arch_caps
         .is_gfx942()
@@ -375,7 +378,9 @@ pub(crate) fn ensure_gdn_verify_kernel(gpu: &mut Gpu, kernel: &'static str) -> H
     };
     gpu.bind_thread()?;
     match g942_gdn_verify_image()? {
-        Some(image) => gpu.ensure_embedded_kernel(QWEN4_G942_GDN_VERIFY_MODULE, image.clone(), own)?,
+        Some(image) => {
+            gpu.ensure_embedded_kernel(QWEN4_G942_GDN_VERIFY_MODULE, image.clone(), own)?
+        }
         None => gpu.ensure_kernel(QWEN4_G942_GDN_VERIFY_MODULE, QWEN4_G942_GDN_VERIFY_SRC, own)?,
     }
     Ok(own)
@@ -2015,9 +2020,9 @@ impl Gfx942Device<'_> {
             &vdv as *const _ as *mut c_void,
             &scale as *const _ as *mut c_void,
         ];
-        let bytes = lanes.len().saturating_mul(
-            2 * state_elems * 4 + (proj_elems + out_elems + 2 * gate_elems) * 4,
-        );
+        let bytes = lanes
+            .len()
+            .saturating_mul(2 * state_elems * 4 + (proj_elems + out_elems + 2 * gate_elems) * 4);
         let timer = crate::profile::begin_timer(
             &self.gpu.hip,
             "deltanet",
@@ -2153,7 +2158,12 @@ impl Gfx942Device<'_> {
             });
         }
         let key: GdnLanesCaptureTableKey = ([rows, key_heads, value_heads], descs);
-        if !self.gpu.gdn_lanes_f32_tables.capture_tables.contains_key(&key) {
+        if !self
+            .gpu
+            .gdn_lanes_f32_tables
+            .capture_tables
+            .contains_key(&key)
+        {
             // Validated once per distinct lane set: the table is a pure function of the key.
             let descs = &key.1;
             let mut writes: Vec<(u64, u64)> = Vec::with_capacity(2 * descs.len());
@@ -2198,9 +2208,16 @@ impl Gfx942Device<'_> {
                 .1
                 .iter()
                 .flat_map(|d| {
-                    [d.projection, d.gate, d.beta, d.state, d.final_state, d.output]
-                        .into_iter()
-                        .flat_map(u64::to_le_bytes)
+                    [
+                        d.projection,
+                        d.gate,
+                        d.beta,
+                        d.state,
+                        d.final_state,
+                        d.output,
+                    ]
+                    .into_iter()
+                    .flat_map(u64::to_le_bytes)
                 })
                 .collect();
             let buf = self.gpu.hip.malloc(bytes.len().next_multiple_of(256))?;
@@ -2215,7 +2232,9 @@ impl Gfx942Device<'_> {
                 .capture_tables
                 .insert(key.clone(), (buf, bytes));
         }
-        let table = self.gpu.gdn_lanes_f32_tables.capture_tables[&key].0.as_ptr();
+        let table = self.gpu.gdn_lanes_f32_tables.capture_tables[&key]
+            .0
+            .as_ptr();
         self.gpu.bind_thread()?;
         g942_gdn_lanes_capture_ensure(&mut *self.gpu)?;
         let (rv, qv, khv, vhv, kdv, vdv) = (
@@ -3354,12 +3373,18 @@ mod tests {
             blocks += 1;
             rest = &body[end + END.len()..];
         }
-        assert_eq!(blocks, 4, "bf16 helpers, Q8 helpers, barrier, pipe128 helpers + body");
+        assert_eq!(
+            blocks, 4,
+            "bf16 helpers, Q8 helpers, barrier, pipe128 helpers + body"
+        );
         // The one-row production kernel is the body this wrapper batches.
         assert!(production.contains(
             "gated_delta_step_pipe128_body<false>(projection, gate, beta, state, output, rows,"
         ));
-        assert_eq!(src.matches("gated_delta_step_pipe128_body<false>(").count(), 1);
+        assert_eq!(
+            src.matches("gated_delta_step_pipe128_body<false>(").count(),
+            1
+        );
         assert!(src.contains(&format!("void {}(", super::QWEN4_GDN_LANES_F32_KERNEL)));
         assert_eq!(src.matches("__launch_bounds__(128)").count(), 1);
     }
@@ -3407,7 +3432,10 @@ mod tests {
             blocks += 1;
             rest = &body[end + END.len()..];
         }
-        assert_eq!(blocks, 4, "bf16 helpers, Q8 helpers, barrier, pipe128 helpers");
+        assert_eq!(
+            blocks, 4,
+            "bf16 helpers, Q8 helpers, barrier, pipe128 helpers"
+        );
         // The derived body: the production pipe128 body with the two edits applied.
         let derived_at = src.find(BEGIN_BODY).expect("derived body marker") + BEGIN_BODY.len();
         let derived = &src[derived_at..derived_at + src[derived_at..].find(END_BODY).unwrap()];
@@ -3435,7 +3463,10 @@ mod tests {
             expected.trim_end_matches('\n'),
             "the capture lanes body drifted from tensor_ops.hip's pipe128 body"
         );
-        assert_eq!(src.matches("gated_delta_step_pipe128_body<false>(").count(), 1);
+        assert_eq!(
+            src.matches("gated_delta_step_pipe128_body<false>(").count(),
+            1
+        );
         assert!(src.contains(&format!(
             "void {}(",
             super::QWEN4_GDN_LANES_CAPTURE_F32_KERNEL
@@ -3454,10 +3485,17 @@ mod tests {
         let body = &src[at..src[at..].find("};").unwrap() + at];
         assert_eq!(body.matches("QWEN4_GDN_GLOBAL*").count(), 6);
         assert_eq!(body.matches(';').count(), 6);
-        let order: Vec<usize> = ["projection", "gate", "beta", "state", "final_state", "output"]
-            .iter()
-            .map(|field| body.find(&format!("* {field};")).expect(field))
-            .collect();
+        let order: Vec<usize> = [
+            "projection",
+            "gate",
+            "beta",
+            "state",
+            "final_state",
+            "output",
+        ]
+        .iter()
+        .map(|field| body.find(&format!("* {field};")).expect(field))
+        .collect();
         assert!(order.windows(2).all(|w| w[0] < w[1]), "field order");
     }
 
@@ -3510,12 +3548,14 @@ mod tests {
         );
         // The rollback wrapper is the production wrapper with exactly one edit: the layer table
         // and the pointers loaded from it go through address space 1 (global).
-        const BEGIN_WRAP: &str = "// BEGIN derived tensor_ops.hip rollback wrapper (global lane table)\n";
+        const BEGIN_WRAP: &str =
+            "// BEGIN derived tensor_ops.hip rollback wrapper (global lane table)\n";
         const END_WRAP: &str = "// END derived tensor_ops.hip rollback wrapper (global lane table)";
         let at = src.find(BEGIN_WRAP).expect("derived wrapper marker") + BEGIN_WRAP.len();
         let derived = &src[at..at + src[at..].find(END_WRAP).unwrap()];
         let derived = &derived[derived.find("#define QWEN4_G942_GDN_GLOBAL").unwrap()..];
-        let head = "__launch_bounds__(256)\nextern \"C\" __global__ void gated_delta_rollback_layers_f32(";
+        let head =
+            "__launch_bounds__(256)\nextern \"C\" __global__ void gated_delta_rollback_layers_f32(";
         let from = production.find(head).expect("production rollback wrapper");
         let wrapper = &production[from..];
         let wrapper = &wrapper[..wrapper.find("\n}\n").unwrap() + 2];
@@ -3562,7 +3602,10 @@ mod tests {
             blocks += 1;
             rest = &body[end + END.len()..];
         }
-        assert_eq!(blocks, 4, "bf16 macros, row_multi, k4 rows body, tiled entry macro");
+        assert_eq!(
+            blocks, 4,
+            "bf16 macros, row_multi, k4 rows body, tiled entry macro"
+        );
         // Nothing outside the markers but the preamble (comments, includes).
         let stripped: String = {
             let mut out = String::new();
@@ -3585,7 +3628,10 @@ mod tests {
         }
         // Exactly the seven tiled instantiations, none else.
         for r in 2..=8 {
-            assert!(src.contains(&format!("GEMV_BF16_XF32_K4_ROWS_TILED({r})\n")), "R={r}");
+            assert!(
+                src.contains(&format!("GEMV_BF16_XF32_K4_ROWS_TILED({r})\n")),
+                "R={r}"
+            );
         }
         assert_eq!(src.matches("\nGEMV_BF16_XF32_K4_ROWS_TILED(").count(), 7);
         assert_eq!(src.matches("extern \"C\" __global__").count(), 1);
@@ -3614,7 +3660,10 @@ mod tests {
                 .map(|b| format!("{b:02x}"))
                 .collect()
         };
-        assert_eq!(hex(super::QWEN4_G942_HC_GATES_SRC.as_bytes()), SOURCE_SHA256);
+        assert_eq!(
+            hex(super::QWEN4_G942_HC_GATES_SRC.as_bytes()),
+            SOURCE_SHA256
+        );
         let anchor: &[u8] =
             include_bytes!("../../../../kernels/qwen4_g942_hc_gates_hipcc_gfx942.co");
         assert_eq!(hex(anchor), ANCHOR_SHA256);
