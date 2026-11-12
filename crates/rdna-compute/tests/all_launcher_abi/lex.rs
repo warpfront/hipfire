@@ -351,6 +351,9 @@ pub struct FileItems {
     pub uses: Vec<Vec<String>>,
     /// Every `struct Name`: its attributes (`derive(..)` among them).
     pub structs: Vec<(String, Vec<String>)>,
+    /// Every `struct Name { .. }` with named fields: the field names and their type tokens
+    /// (attributes and visibility removed). Tuple/unit structs have no entry.
+    pub struct_fields: Vec<(String, Vec<(String, Vec<Tt>)>)>,
 }
 
 pub fn walk_items(ts: &[Tt]) -> FileItems {
@@ -359,6 +362,7 @@ pub fn walk_items(ts: &[Tt]) -> FileItems {
         consts: Vec::new(),
         uses: Vec::new(),
         structs: Vec::new(),
+        struct_fields: Vec::new(),
     };
     go(ts, &[], None, &mut out);
     out
@@ -386,6 +390,9 @@ fn go(ts: &[Tt], attrs_inh: &[String], owner: Option<&str>, out: &mut FileItems)
                 let mut all = attrs_inh.to_vec();
                 all.extend(attrs.iter().cloned());
                 out.structs.push((name.to_string(), all));
+                if let Some(fields) = struct_named_fields(&ts[i + 2..]) {
+                    out.struct_fields.push((name.to_string(), fields));
+                }
             }
         }
         if t.is_id("use") {
@@ -492,6 +499,70 @@ fn go(ts: &[Tt], attrs_inh: &[String], owner: Option<&str>, out: &mut FileItems)
         }
         i += 1;
     }
+}
+
+/// Field names and type tokens of `struct Name<..> [where ..] { fields }` (`after` = the tokens
+/// after the name). `None` for tuple and unit structs. A field whose declaration is not
+/// `[#[attr]] [pub[(..)]] name: Type` is left out, so a missing field never gets a wrong type.
+fn struct_named_fields(after: &[Tt]) -> Option<Vec<(String, Vec<Tt>)>> {
+    let mut depth = 0i32;
+    let mut where_seen = false;
+    let mut body: Option<&[Tt]> = None;
+    for (k, t) in after.iter().enumerate() {
+        if t.is_p('<') {
+            depth += 1;
+        } else if t.is_p('>') && !(k > 0 && after[k - 1].is_p('-')) {
+            depth -= 1;
+        } else if depth == 0 && t.is_id("where") {
+            where_seen = true;
+        } else if depth == 0 && t.is_p(';') {
+            return None;
+        } else if depth == 0 && t.is_g('(') && !where_seen {
+            return None;
+        } else if depth == 0 && t.is_g('{') {
+            body = t.group();
+            break;
+        }
+    }
+    let body = body?;
+    // Split at top-level commas (a `<..>` generic list may contain commas).
+    let mut parts: Vec<Vec<Tt>> = vec![Vec::new()];
+    let mut angle = 0i32;
+    for (k, t) in body.iter().enumerate() {
+        if t.is_p('<') {
+            angle += 1;
+        } else if t.is_p('>') && !(k > 0 && body[k - 1].is_p('-')) {
+            angle -= 1;
+        }
+        if t.is_p(',') && angle == 0 {
+            parts.push(Vec::new());
+        } else {
+            parts.last_mut().unwrap().push(t.clone());
+        }
+    }
+    let mut fields = Vec::new();
+    for part in parts {
+        let mut k = 0usize;
+        while part.get(k).map_or(false, |t| t.is_p('#'))
+            && part.get(k + 1).map_or(false, |t| t.is_g('['))
+        {
+            k += 2;
+        }
+        if part.get(k).map_or(false, |t| t.is_id("pub")) {
+            k += 1;
+            if part.get(k).map_or(false, |t| t.is_g('(')) {
+                k += 1;
+            }
+        }
+        let (Some(name), Some(colon)) = (part.get(k).and_then(|t| t.id()), part.get(k + 1)) else {
+            continue;
+        };
+        if !colon.is_p(':') || part.len() <= k + 2 {
+            continue;
+        }
+        fields.push((name.to_string(), part[k + 2..].to_vec()));
+    }
+    Some(fields)
 }
 
 /// The implemented type of `impl<..> [Trait for] Type<..>` (header tokens after `impl`):

@@ -24,6 +24,8 @@ pub struct SrcFile {
     pub uses: Vec<Vec<String>>,
     /// Each `struct Name` with its attributes.
     pub structs: Vec<(String, Vec<String>)>,
+    /// Each named-field `struct Name { .. }`: field names and their type tokens.
+    pub struct_fields: Vec<(String, Vec<(String, Vec<Tt>)>)>,
 }
 
 pub struct World {
@@ -90,6 +92,7 @@ impl World {
                 id_counts,
                 uses: items.uses,
                 structs: items.structs,
+                struct_fields: items.struct_fields,
             });
         }
         let mut fn_index: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
@@ -1725,8 +1728,9 @@ pub fn binding_init(b: &Binding) -> Vec<Tt> {
     }
 }
 
-/// Component `k` of a tuple expression, following `if`/`else` branches to their tails.
-/// `None` when the expression is not a tuple or a chain of them.
+/// Component `k` of a tuple expression, following `if`/`else` branches and `match` arms to
+/// their tails; branches that provably `return` produce no value and are skipped. `None`
+/// when the expression is not a tuple or a chain of them, or any branch is neither.
 fn project_let(init: &[Tt], k: usize) -> Option<Vec<Tt>> {
     let mut t: Vec<Tt> = init.to_vec();
     while t.first().map_or(false, |x| x.is_p('&')) {
@@ -1751,6 +1755,9 @@ fn project_let(init: &[Tt], k: usize) -> Option<Vec<Tt>> {
         .ok()?;
         let mut out: Vec<Tt> = Vec::new();
         for b in bodies {
+            if block_diverges(&b) {
+                continue;
+            }
             let tail = crate::layout::split_stmts(&b).1;
             let comp = project_let(&tail, k)?;
             if !out.is_empty() {
@@ -1758,9 +1765,81 @@ fn project_let(init: &[Tt], k: usize) -> Option<Vec<Tt>> {
             }
             out.extend(comp);
         }
-        return Some(out);
+        return (!out.is_empty()).then_some(out);
+    }
+    if t.first().map_or(false, |x| x.is_id("match")) && t.last().map_or(false, |x| x.is_g('{')) {
+        return project_match(t.last()?.group()?, k);
     }
     None
+}
+
+/// A block whose last statement (or trailing expression) is a `return`, so control never
+/// leaves it normally. Anything less obvious is NOT divergence: the caller then projects
+/// the block like any other arm and gives up (whole-initialiser fallback) when it cannot.
+fn block_diverges(block: &[Tt]) -> bool {
+    let (stmts, tail) = crate::layout::split_stmts(block);
+    let last = if tail.is_empty() {
+        stmts.last()
+    } else {
+        Some(&tail)
+    };
+    last.and_then(|s| s.first())
+        .map_or(false, |f| f.is_id("return"))
+}
+
+/// An arm value that provably never produces a value: `return ..` or a block ending in one.
+fn arm_diverges(value: &[Tt]) -> bool {
+    match value.first() {
+        Some(f) if f.is_id("return") => true,
+        Some(f) if f.is_g('{') && value.len() == 1 => block_diverges(f.group().unwrap()),
+        _ => false,
+    }
+}
+
+/// Component `k` of every value-producing arm of a `match` body (`PAT => VALUE, ..`),
+/// joined with `,`. Arms that provably diverge (`return`) contribute nothing; any arm that
+/// is malformed, ambiguous, or neither diverges nor projects makes the whole match
+/// unprojectable (`None`).
+fn project_match(body: &[Tt], k: usize) -> Option<Vec<Tt>> {
+    let n = body.len();
+    let mut out: Vec<Tt> = Vec::new();
+    let mut i = 0;
+    while i < n {
+        let arrow =
+            (i..n.saturating_sub(1)).find(|&j| body[j].is_p('=') && body[j + 1].is_p('>'))?;
+        if arrow == i {
+            return None;
+        }
+        let v = arrow + 2;
+        if v >= n {
+            return None;
+        }
+        let (value, next) = if body[v].is_g('{') {
+            // A block arm may omit its comma; any other punctuation after it continues the
+            // expression (`{..}.f()`), which is not an arm boundary we can trust.
+            match body.get(v + 1) {
+                None => (&body[v..v + 1], n),
+                Some(x) if x.is_p(',') => (&body[v..v + 1], v + 2),
+                Some(Tt::P(..)) => return None,
+                Some(_) => (&body[v..v + 1], v + 1),
+            }
+        } else {
+            let end = (v..n).find(|&j| body[j].is_p(',')).unwrap_or(n);
+            (&body[v..end], end + 1)
+        };
+        if value.is_empty() {
+            return None;
+        }
+        if !arm_diverges(value) {
+            let comp = project_let(value, k)?;
+            if !out.is_empty() {
+                out.push(Tt::P(',', 0));
+            }
+            out.extend(comp);
+        }
+        i = next;
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 /// Leaves of a `for` pattern with their positions: `(i, (l, blob))` gives

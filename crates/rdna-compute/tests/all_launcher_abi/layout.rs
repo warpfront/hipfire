@@ -48,7 +48,7 @@ pub struct Variant {
     pub only_for: Option<Vec<String>>,
 }
 
-fn push_kind(m: &str) -> Option<PushKind> {
+pub(crate) fn push_kind(m: &str) -> Option<PushKind> {
     match m {
         "push_ptr" => Some(PushKind::Ptr),
         "push_u32" => Some(PushKind::U32),

@@ -153,7 +153,7 @@
               "vmem_store": 130
             },
             "steps": 16120,
-            "verifier": "peacemaker_isa::ledger_cfg::verify",
+            "verifier": "peacemaker_isa::ledger_cfg::verify_with_branch_proofs",
             "waitcnt": 211,
             "waitcnt_lgkmcnt_partial": 164,
             "waitcnt_vmcnt_partial": 23
