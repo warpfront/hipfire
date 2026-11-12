@@ -21929,11 +21929,7 @@ impl Gpu {
         let y_base = y.buf.as_ptr();
         if tiles > 0 {
             let func = TILED[6];
-            self.ensure_kernel(
-                "qwen4_gemv_bf16_xf32",
-                kernels::QWEN4_GEMV_BF16_XF32_SRC,
-                func,
-            )?;
+            self.ensure_k4_rows_tiled_entry(func, true)?;
             self.launch_gemv_k4_raw(
                 func,
                 tiles as u32,
@@ -21955,14 +21951,26 @@ impl Gpu {
             } else {
                 TILED[tail - 2]
             };
-            self.ensure_kernel(
-                "qwen4_gemv_bf16_xf32",
-                kernels::QWEN4_GEMV_BF16_XF32_SRC,
-                func,
-            )?;
+            self.ensure_k4_rows_tiled_entry(func, tail > 1)?;
             self.launch_gemv_k4_raw(func, 1, w_ptr, x_ptr, y_ptr, m, k, hc_act_scale)?;
         }
         Ok(())
+    }
+
+    /// Load `func` for [`Gpu::gemv_bf16_xf32_k4_rows_tiled`]. On exact gfx942 the seven
+    /// `gemv_bf16_xf32_k4_rows_tiled_r2..r8` entries (`tiled`) come from the subset module
+    /// `qwen4_g942_hc_gates` (verbatim blocks of `qwen4_gemv_bf16_xf32.hip`, its own anchor and
+    /// `HIPFIRE_QWEN4_G942_HC_GATES_IMAGE` hook); the one-row `gemv_bf16_xf32_k4` and every other
+    /// arch keep the shared `qwen4_gemv_bf16_xf32` module.
+    fn ensure_k4_rows_tiled_entry(&mut self, func: &str, tiled: bool) -> HipResult<()> {
+        if tiled && self.arch_caps.is_gfx942() {
+            return crate::cdna::gfx942::g942_hc_gates_ensure(self, func);
+        }
+        self.ensure_kernel(
+            "qwen4_gemv_bf16_xf32",
+            kernels::QWEN4_GEMV_BF16_XF32_SRC,
+            func,
+        )
     }
 
     /// One launch of a `gemv_bf16_xf32_k4*` kernel (block 128, grid

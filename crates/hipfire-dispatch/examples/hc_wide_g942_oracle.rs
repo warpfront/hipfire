@@ -29,11 +29,15 @@
 //! ```text
 //! cargo run --release -p hipfire-dispatch --features test-utils --example hc_wide_g942_oracle -- \
 //!   [--out DIR] [--model PATH] [--layers 0,1,..] [--rows 9,16,17,32,33,64 | --sweep] \
-//!   [--seeds N] [--bench] [--bench-only] [--iters N] [--bench-rows N]
+//!   [--seeds N] [--bench] [--bench-only] [--iters N] [--bench-rows N] [--image DEVICE_ELF]
 //! ```
 //!
+//! `--image PATH` runs the batched k4 gate entries (`gemv_bf16_xf32_k4_rows_tiled_r2..r8`) from that
+//! explicitly supplied device ELF (the Route-A twin; it sets `HIPFIRE_QWEN4_G942_HC_GATES_IMAGE`
+//! before the GPU is initialised); a missing or unloadable image fails the run (exit 2).
+//!
 //! Exit nonzero on a non-gfx942 device, a launch error, any mismatch, census failure or an
-//! undetected control.
+//! undetected control (1 = comparison failed, 2 = setup / launch / image error).
 
 use std::collections::BTreeMap;
 use std::fmt::Debug;
@@ -1132,6 +1136,7 @@ struct Cli {
     bench_only: bool,
     iters: usize,
     bench_rows: usize,
+    image: Option<String>,
 }
 
 fn parse_cli() -> R<Cli> {
@@ -1145,6 +1150,7 @@ fn parse_cli() -> R<Cli> {
         bench_only: false,
         iters: 15,
         bench_rows: 32,
+        image: None,
     };
     let mut args = std::env::args().skip(1);
     let value = |args: &mut dyn Iterator<Item = String>, flag: &str| {
@@ -1168,6 +1174,7 @@ fn parse_cli() -> R<Cli> {
             "--bench" => cli.bench = true,
             "--bench-only" => cli.bench_only = true,
             "--iters" => cli.iters = number(value(&mut args, "--iters")?, "--iters")?,
+            "--image" => cli.image = Some(value(&mut args, "--image")?),
             "--bench-rows" => cli.bench_rows = number(value(&mut args, "--bench-rows")?, "--bench-rows")?,
             other => return Err(format!("unknown argument {other}")),
         }
@@ -1180,6 +1187,14 @@ fn parse_cli() -> R<Cli> {
 
 fn run() -> R<bool> {
     let cli = parse_cli()?;
+    if let Some(image) = &cli.image {
+        if !std::path::Path::new(image).is_absolute() || !std::path::Path::new(image).is_file() {
+            return Err(format!("--image {image}: needs the absolute path of an existing file"));
+        }
+        // Read by the library when the first gate entry loads (process snapshot at first use).
+        std::env::set_var("HIPFIRE_QWEN4_G942_HC_GATES_IMAGE", image);
+        println!("hc_wide_g942_oracle: gate entries from image {image}");
+    }
     let mut gpu = Gpu::init().map_err(err("Gpu::init"))?;
     println!("hc_wide_g942_oracle: arch={} model={:?}", gpu.arch, cli.model);
     if !gpu.arch_caps.is_gfx942() {

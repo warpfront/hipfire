@@ -284,6 +284,46 @@ fn g942_fold_elem_ensure(gpu: &mut Gpu, func: &str) -> HipResult<()> {
     }
 }
 
+const QWEN4_G942_HC_GATES_SRC: &str =
+    include_str!("../../../../kernels/src/qwen4_g942_hc_gates.gfx942.hip");
+const QWEN4_G942_HC_GATES_MODULE: &str = "qwen4_g942_hc_gates";
+/// The seven `gemv_bf16_xf32_k4_rows_tiled_r<R>` entries of the module, R = 2..=8.
+pub(crate) const QWEN4_G942_HC_GATES_TILED: [&str; 7] = [
+    "gemv_bf16_xf32_k4_rows_tiled_r2",
+    "gemv_bf16_xf32_k4_rows_tiled_r3",
+    "gemv_bf16_xf32_k4_rows_tiled_r4",
+    "gemv_bf16_xf32_k4_rows_tiled_r5",
+    "gemv_bf16_xf32_k4_rows_tiled_r6",
+    "gemv_bf16_xf32_k4_rows_tiled_r7",
+    "gemv_bf16_xf32_k4_rows_tiled_r8",
+];
+
+/// Bind `func` (one of [`QWEN4_G942_HC_GATES_TILED`]) of the gfx942 HC-gates module: the hipcc
+/// source of this subset module (the anchor object, `kernels/qwen4_g942_hc_gates_hipcc_gfx942.co`),
+/// or, only when `HIPFIRE_QWEN4_G942_HC_GATES_IMAGE=/absolute/device.elf` names one, that
+/// explicitly supplied code object (the Route-A twin proof: same module, same entry names,
+/// loaded through `ensure_embedded_kernel`). Unset: the source, unchanged. Only this module is
+/// affected: the one-row `gemv_bf16_xf32_k4` and every other `qwen4_gemv_bf16_xf32` entry keep
+/// their own module and cache entry.
+pub(crate) fn g942_hc_gates_ensure(gpu: &mut Gpu, func: &str) -> HipResult<()> {
+    match hipfire_config::developer_var("HIPFIRE_QWEN4_G942_HC_GATES_IMAGE") {
+        Ok(path) if !path.is_empty() => {
+            let bytes = std::fs::read(&path).map_err(|error| {
+                hip_bridge::HipError::new(
+                    0,
+                    &format!("HIPFIRE_QWEN4_G942_HC_GATES_IMAGE {path}: {error}"),
+                )
+            })?;
+            gpu.ensure_embedded_kernel(
+                QWEN4_G942_HC_GATES_MODULE,
+                std::sync::Arc::<[u8]>::from(bytes),
+                func,
+            )
+        }
+        _ => gpu.ensure_kernel(QWEN4_G942_HC_GATES_MODULE, QWEN4_G942_HC_GATES_SRC, func),
+    }
+}
+
 impl Gfx942Device<'_> {
     /// The HC read's down projection and its activation as ONE launch (C1 fold,
     /// kill switch `HIPFIRE_QWEN4_G942_FOLD_ELEM`):
@@ -2968,5 +3008,65 @@ mod tests {
         for field in ["projection", "gate", "beta", "state", "output"] {
             assert!(body.contains(&format!("* {field};")), "field {field}");
         }
+    }
+
+    /// The HC-gates module's blocks are `qwen4_gemv_bf16_xf32.hip`'s, byte for byte: every block
+    /// between the `BEGIN` / `END verbatim qwen4_gemv_bf16_xf32.hip` markers must occur in the
+    /// production source, and the module carries exactly the seven tiled entries.
+    #[test]
+    fn g942_hc_gates_source_is_qwen4_gemv_bf16_xf32_verbatim() {
+        const BEGIN: &str = "// BEGIN verbatim qwen4_gemv_bf16_xf32.hip\n";
+        const END: &str = "// END verbatim qwen4_gemv_bf16_xf32.hip";
+        let src = super::QWEN4_G942_HC_GATES_SRC;
+        let production = crate::kernels::QWEN4_GEMV_BF16_XF32_SRC;
+        let mut blocks = 0;
+        let mut rest = src;
+        while let Some(at) = rest.find(BEGIN) {
+            let body = &rest[at + BEGIN.len()..];
+            let end = body.find(END).expect("END marker after every BEGIN marker");
+            let block = body[..end].trim_end_matches('\n');
+            assert!(
+                production.contains(block),
+                "verbatim block {blocks} of qwen4_g942_hc_gates.gfx942.hip is no longer a \
+                 substring of qwen4_gemv_bf16_xf32.hip: mirror the production edit into the \
+                 HC-gates module\nblock starts: {:?}",
+                &block[..block.len().min(120)]
+            );
+            blocks += 1;
+            rest = &body[end + END.len()..];
+        }
+        assert_eq!(blocks, 4, "bf16 macros, row_multi, k4 rows body, tiled entry macro");
+        // Nothing outside the markers but the preamble (comments, includes).
+        let stripped: String = {
+            let mut out = String::new();
+            let mut rest = src;
+            while let Some(at) = rest.find(BEGIN) {
+                out.push_str(&rest[..at]);
+                let body = &rest[at + BEGIN.len()..];
+                let end = body.find(END).unwrap();
+                rest = &body[end + END.len()..];
+            }
+            out.push_str(rest);
+            out
+        };
+        for line in stripped.lines() {
+            let t = line.trim();
+            assert!(
+                t.is_empty() || t.starts_with("//") || t.starts_with("#include"),
+                "unmarked code in the HC-gates module: {t:?}"
+            );
+        }
+        // Exactly the seven tiled instantiations, none else.
+        for r in 2..=8 {
+            assert!(src.contains(&format!("GEMV_BF16_XF32_K4_ROWS_TILED({r})\n")), "R={r}");
+        }
+        assert_eq!(src.matches("\nGEMV_BF16_XF32_K4_ROWS_TILED(").count(), 7);
+        assert_eq!(src.matches("extern \"C\" __global__").count(), 1);
+        assert_eq!(super::QWEN4_G942_HC_GATES_TILED.len(), 7);
+        for (i, name) in super::QWEN4_G942_HC_GATES_TILED.iter().enumerate() {
+            assert_eq!(*name, format!("gemv_bf16_xf32_k4_rows_tiled_r{}", i + 2));
+        }
+        // The production module still defines the same entries (the non-gfx942 route).
+        assert!(production.contains("gemv_bf16_xf32_k4_rows_tiled_r##R"));
     }
 }
