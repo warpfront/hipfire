@@ -46,6 +46,9 @@ pub mod dflash2_spec;
 pub mod dflash_adaptive_block;
 pub mod dflash_generic;
 pub mod dflash_online;
+/// DSpine drafter sidecar metadata (arch 24) — contract double-check for the
+/// `dspine_convert` output before any bridge tensor reaches the GPU.
+pub mod dspine;
 pub mod dspark_block_controller;
 pub mod dspark_core;
 /// CPU arithmetic oracles for the E8P-on-IU4 route (decode, SWAR unpack, `2C+s` fold, epoch, writer guard).

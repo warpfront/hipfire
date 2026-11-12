@@ -171,6 +171,10 @@ pub fn f16_to_f32(bits: u16) -> f32 {
     half::f16::from_bits(bits).to_f32()
 }
 
+pub fn bf16_to_f32(bits: u16) -> f32 {
+    half::bf16::from_bits(bits).to_f32()
+}
+
 pub fn f32_to_f16(val: f32) -> u16 {
     let bits = val.to_bits();
     let sign = (bits >> 31) & 1;

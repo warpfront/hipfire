@@ -12365,6 +12365,57 @@ impl Carrier for LlamaCarrier {
                     );
                     Some(spec)
                 }
+                Ok(draft_hfq) if draft_hfq.arch_id == 24 => {
+                    // DSpine sidecar: the converter already enforced the
+                    // fail-closed contract; the loader re-checks it and then
+                    // validates the target pairing (the draft borrows the
+                    // target's embedding and lm_head, so hidden/vocab/layers
+                    // must match exactly).
+                    let dspine = hipfire_runtime::dspine::DspineConfig::from_hfq(&draft_hfq)
+                        .map_err(|e| format!("DSpine draft '{dp}': {e}"))?
+                        .ok_or_else(|| {
+                            format!(
+                                "draft '{dp}' claims arch_id=24 but carries no `dspine` metadata \
+                                 block; re-convert with dspine_convert"
+                            )
+                        })?;
+                    if bundle.config.dim != dspine.trunk.hidden {
+                        return Err(format!(
+                            "DSpine draft '{dp}' has hidden size {} but the target model's is {}; \
+                             a draft must be made for this exact target model",
+                            dspine.trunk.hidden, bundle.config.dim
+                        ));
+                    }
+                    if bundle.config.vocab_size != dspine.trunk.vocab_size {
+                        return Err(format!(
+                            "DSpine draft '{dp}' vocab {} != target vocab {}; the draft borrows \
+                             the target embedding and lm_head, vocab sizes must match",
+                            dspine.trunk.vocab_size, bundle.config.vocab_size
+                        ));
+                    }
+                    let max_layer = dspine
+                        .trunk
+                        .target_layer_ids
+                        .iter()
+                        .copied()
+                        .max()
+                        .unwrap_or(0);
+                    if max_layer >= bundle.config.n_layers {
+                        return Err(format!(
+                            "DSpine draft '{dp}' reads target layer {max_layer} but the trunk \
+                             has only {} layers",
+                            bundle.config.n_layers
+                        ));
+                    }
+                    drop(draft_hfq);
+                    // The bridge HIP kernels and speculator build are the
+                    // next slice of this PR; until they land, refuse at the
+                    // same pointing surface instead of half-serving.
+                    return Err(format!(
+                        "DSpine sidecar '{dp}' passed target pairing, but the bridge-kernel \
+                         wiring is not merged yet; nothing can serve this draft yet"
+                    ));
+                }
                 // Not a DFlash draft or unreadable — log why and fall through to n-gram.
                 Err(e) => {
                     eprintln!(

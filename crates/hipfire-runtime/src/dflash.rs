@@ -499,6 +499,9 @@ fn upload_f32_weight_with_copy(
 /// Supported quant_types:
 ///   1  (F16)      → lifted to F32 on GPU (legacy path).
 ///   2  (F32)      → uploaded as F32.
+///   16 (BF16)     → lifted to F32 on GPU (dspine default tier; bf16→f32 is
+///                   exact, and the bit-exact arm prefers the 2× VRAM of an
+///                   F32 upload over any lossy f16 round trip).
 ///   13 (MQ4-G256) → uploaded raw, kernel dispatch will FWHT-rotate x at use.
 ///   15 (MQ6-G256) → uploaded raw, kernel dispatch will FWHT-rotate x at use.
 ///   17 (MQ3-G256) → uploaded raw, kernel dispatch will FWHT-rotate x at use.
@@ -596,6 +599,31 @@ fn hfq_weight(
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
             assert_eq!(f32_data.len(), m * k, "dflash {name} F32 size mismatch");
+            let buf = upload_f32_weight(gpu, &f32_data, &[m * k])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::F32,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
+            })
+        }
+        16 => {
+            // BF16 (dspine default tier): dequant to F32 and take the F32
+            // path. bf16→f32 is exact, so the bit-exact arm pays 2× VRAM
+            // rather than round-tripping through f16; a native-bf16 WMMA
+            // arm is a later optimization. NaN payloads canonicalize
+            // through the half crate, which is irrelevant for weights.
+            let f32_data: Vec<f32> = data
+                .chunks_exact(2)
+                .map(|c| crate::llama::bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .collect();
+            assert_eq!(f32_data.len(), m * k, "dflash {name} BF16 size mismatch");
             let buf = upload_f32_weight(gpu, &f32_data, &[m * k])?;
             Ok(WeightTensor {
                 buf,

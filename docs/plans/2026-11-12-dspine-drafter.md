@@ -51,8 +51,12 @@ Non-goals for this PR: no `admissions.yml` row (routing-capable, product-refused
   the real `tencent/Qwen3.8-27B-DSpine-b16` checkpoint both ways (bf16 tier
   3.86 GiB raw-copy, mq4 tier 1.41 GiB, 2.026B params, 71→67 tensors with the
   four version scalars moved into `dspine.versions` metadata)
-- [ ] arch-24 sidecar carrier + drafter load path
-- [ ] bridge kernels (Tier C)
+- [x] arch-24 load surface: qt-16 BF16 arm in the dflash weight loader, the
+  `dspine` metadata double-check (`hipfire-runtime/src/dspine.rs`), and the
+  Qwen35Carrier arch-24 branch with target-pairing refusals (hidden/vocab/
+  target-layer). The branch refuses at the same pointing surface until the
+  bridge kernels land, so nothing half-serves
+- [ ] bridge HIP kernels + speculator build (consumes the load surface above)
 - [ ] serial refinement (Tier C)
 - [ ] parity + KLD oracle (Tier P)
 - [ ] gfx1100 end-to-end: acceptance length vs DFlash2/MTP arms (Tier S/U)
