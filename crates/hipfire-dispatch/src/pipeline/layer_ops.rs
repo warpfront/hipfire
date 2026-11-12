@@ -2228,8 +2228,12 @@ fn execute_hyper_read_inner(
         }
         // gfx942 C1 fold (`HIPFIRE_QWEN4_G942_FOLD_ELEM`): the few-row down GEMM with the
         // activation chain below as its epilogue, one launch for the six; bitwise their output.
+        // Past 16 rows only a lane step ([`Gpu::g942_lane_wide_rows`]) takes it, as a chain of
+        // 16-row slices of the same fused entry (bytewise the per-row singleton route, no
+        // five-launch activation chain); the ordinary prefill chunk keeps its own route.
         if g942_fold_elem()
             && gpu.arch_caps.is_gfx942()
+            && (op.rows <= 16 || gpu.g942_lane_wide_rows(op.rows))
             && op.input_mix_down.dtype == DType::BF16
             && normalized.dtype == DType::F32
             && low.dtype == DType::F32
@@ -2244,7 +2248,7 @@ fn execute_hyper_read_inner(
                 op.input_mix_down.k,
             );
             if let Some(mut device) = gpu.try_gfx942() {
-                g942_act_folded = hip(device.qwen4_hc_down_act_rows16(
+                g942_act_folded = hip(device.qwen4_hc_down_act_slices(
                     &op.input_mix_down.buf.buf,
                     &normalized,
                     &low,
@@ -2894,6 +2898,37 @@ fn g942_hc_quarters_gates_enabled() -> bool {
     *ON
 }
 
+/// Which row window an exact-gfx942 hyper write's gate projection runs in; the one typed input
+/// of [`g942_hc_quarters_gates_route`] besides the geometry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum G942HcGateRows {
+    /// `1..=few_row_limit` route rows: decode, few-row verify, and every <= 8-row lane group.
+    FewRow,
+    /// More rows than the few-row window inside an exact-gfx942 lane step
+    /// ([`Gpu::g942_lane_wide_rows`]): the all-rows HC segment. Every row must be bitwise the row
+    /// the one-row singleton (and each <= 8-row group) computes, so it takes the quarters
+    /// arithmetic too.
+    LaneWide,
+    /// Everything else: the ordinary prefill chunk, the invariant profile and the P2 prefill
+    /// wave. Its pinned route is the BF16 MFMA GEMV and must not change.
+    Chunk,
+}
+
+/// Classify a write of `rows` rows. `route_rows` is [`Gpu::route_rows`] of them.
+fn g942_hc_gate_rows(
+    route_rows: usize,
+    few_row_limit: usize,
+    lane_wide: bool,
+) -> G942HcGateRows {
+    if (1..=few_row_limit).contains(&route_rows) {
+        G942HcGateRows::FewRow
+    } else if lane_wide {
+        G942HcGateRows::LaneWide
+    } else {
+        G942HcGateRows::Chunk
+    }
+}
+
 /// Whether the unfused hyper write's gates take the quarters-equivalent route on gfx942.
 ///
 /// [`execute_hyper_write_then_read`] fuses the NEXT write's gate quarters into `hyper_write_norm`
@@ -2905,8 +2940,8 @@ fn g942_hc_quarters_gates_enabled() -> bool {
 /// geometries the unfused route therefore runs `hyper_norm` and the four-wave k4 gate GEMV
 /// (`gemv_bf16_xf32_k4*`: per branch `gemv_bf16_xf32_row` over K = 2560, folded
 /// `(q0 + q1) + (q2 + q3)`), which is the `hyper_write_norm` quarter code's arithmetic on the same
-/// normalized values. Any other geometry keeps the MFMA route. Pure: `route_rows` is
-/// [`Gpu::route_rows`] of the write's rows.
+/// normalized values. A lane step's all-rows HC segment ([`G942HcGateRows::LaneWide`]) takes it
+/// at any width; the chunk keeps the MFMA route. Any other geometry keeps the MFMA route.
 #[allow(clippy::too_many_arguments)]
 fn g942_hc_quarters_gates_route(
     caps: &rdna_compute::arch_caps::ArchCaps,
@@ -2917,8 +2952,7 @@ fn g942_hc_quarters_gates_route(
     hidden: usize,
     state_bf16: bool,
     gates_f32: bool,
-    route_rows: usize,
-    few_row_limit: usize,
+    rows: G942HcGateRows,
 ) -> bool {
     let (dtype, m, k, has_awq_scale) = inject;
     caps.is_gfx942()
@@ -2929,7 +2963,7 @@ fn g942_hc_quarters_gates_route(
         && hidden == 2560
         && hc_quarters_inject_ok(dtype, m, k, has_awq_scale, 4 * 2560)
         && gates_f32
-        && (1..=few_row_limit).contains(&route_rows)
+        && rows != G942HcGateRows::Chunk
 }
 
 fn g942_hc_quarters_gates(gpu: &Gpu, op: &HyperWriteOp<'_>) -> bool {
@@ -2947,8 +2981,11 @@ fn g942_hc_quarters_gates(gpu: &Gpu, op: &HyperWriteOp<'_>) -> bool {
         op.hidden,
         op.state_bf16,
         op.gates.dtype == DType::F32,
-        gpu.route_rows(op.rows),
-        gpu.few_row_limit(),
+        g942_hc_gate_rows(
+            gpu.route_rows(op.rows),
+            gpu.few_row_limit(),
+            gpu.g942_lane_wide_rows(op.rows),
+        ),
     )
 }
 
@@ -3021,6 +3058,10 @@ fn hyper_write_gates(
     // K across four waves, and a verify row is bitwise the decode row it
     // replaces (greedy MTP == AR depends on it).
     let k4 = hyper_write_gates_k4(gpu, op) || g942_hc_quarters_gates(gpu, op);
+    // Every row of an exact-gfx942 lane step's all-rows segment: the batched tiled k4 launch
+    // (eight-row tiles plus the remainder, each row bitwise the one-row kernel's), whatever
+    // the width. Named here, not left to `gemv_bf16_xf32_k4_rows`' width-keyed pick.
+    let lane_wide_k4 = k4 && gpu.g942_lane_wide_rows(op.rows);
     // Multi-row: one launch normalizes each row into LDS and projects the
     // BF16 gate from there; `normalized` (read by nothing below) is not
     // written.  Bitwise identical to hyper_norm + project_weight.
@@ -3057,7 +3098,17 @@ fn hyper_write_gates(
                 state_bf16: op.state_bf16,
             },
         ))?;
-        if k4 {
+        if lane_wide_k4 {
+            hip(gpu.gemv_bf16_xf32_k4_rows_tiled(
+                op.block_inject.buf,
+                normalized,
+                gates,
+                op.block_inject.m,
+                op.block_inject.k,
+                None,
+                op.rows,
+            ))?;
+        } else if k4 {
             // Four gate rows of K = branches * hidden; four waves per row
             // instead of one.
             hip(gpu.gemv_bf16_xf32_k4_rows(
@@ -7627,7 +7678,15 @@ mod tests {
                      gates_f32: bool,
                      rows: usize| {
             g942_hc_quarters_gates_route(
-                caps, enabled, has_ar, inject, branches, hidden, state_bf16, gates_f32, rows, 8,
+                caps,
+                enabled,
+                has_ar,
+                inject,
+                branches,
+                hidden,
+                state_bf16,
+                gates_f32,
+                g942_hc_gate_rows(rows, 8, false),
             )
         };
         let gfx942 = DispatchCtx::for_test("gfx942");
@@ -7640,13 +7699,44 @@ mod tests {
             // the quarters' own inject predicate agrees with the route's
             assert!(hc_quarters_inject_ok(bf16.0, bf16.1, bf16.2, bf16.3, wide));
         }
-        // Past the few-row limit (verify beyond 8 rows, prefill's invariant scope): MFMA route.
-        for rows in [9, 16, 64, 8192] {
+        // Past the few-row limit outside a lane step (verify beyond 8 rows, prefill's invariant
+        // scope, the ordinary prefill chunk): the pinned MFMA route, unchanged.
+        for rows in [9, 16, 17, 32, 33, 64, 8192] {
             assert!(
                 !route(c, true, false, bf16, 4, 2560, false, true, rows),
                 "{rows}"
             );
         }
+        // ... but a row of a lane step's all-rows HC segment takes the quarters at every width,
+        // under the same geometry / kill-switch refusals.
+        for rows in [9usize, 16, 17, 32, 33, 64, 128, 256] {
+            assert_eq!(g942_hc_gate_rows(rows, 8, true), G942HcGateRows::LaneWide);
+            assert_eq!(g942_hc_gate_rows(rows, 8, false), G942HcGateRows::Chunk);
+            let lane = g942_hc_gate_rows(rows, 8, true);
+            let wide_route = |enabled: bool, branches: usize, ar: bool, awq: bool| {
+                g942_hc_quarters_gates_route(
+                    c,
+                    enabled,
+                    ar,
+                    (DType::BF16, 4, wide, awq),
+                    branches,
+                    2560,
+                    false,
+                    true,
+                    lane,
+                )
+            };
+            assert!(wide_route(true, 4, false, false), "{rows}");
+            assert!(!wide_route(false, 4, false, false), "{rows} kill switch");
+            assert!(!wide_route(true, 8, false, false), "{rows} branches");
+            assert!(!wide_route(true, 4, true, false), "{rows} all-reduce write");
+            assert!(!wide_route(true, 4, false, true), "{rows} awq");
+        }
+        // The few-row window wins over the lane flag, and a lane step never makes <= 8 rows chunk.
+        for rows in 1..=8usize {
+            assert_eq!(g942_hc_gate_rows(rows, 8, true), G942HcGateRows::FewRow);
+        }
+        assert_eq!(g942_hc_gate_rows(0, 8, false), G942HcGateRows::Chunk);
         assert!(!route(c, true, false, bf16, 4, 2560, false, true, 0));
         // Kill switch, all-reduce write, BF16 state, geometry, dtype and AWQ refusals.
         assert!(!route(c, false, false, bf16, 4, 2560, false, true, 1));
