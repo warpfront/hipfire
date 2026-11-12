@@ -140,13 +140,13 @@
           }
         ],
         "compared_to_incumbent": true,
-        "incumbent_sha256": "db4e8a09f8c434a0d7dc697935bcdcb6016119d6f0589c3f0fdd30e514749337",
+        "incumbent_sha256": "210b3ec92bb5b4bd10b05a491288d3e442b07f48d587208b0d9c9d977e74469d",
         "incumbent_symbol": "gated_delta_chunk_gate_q8_wmma_arena",
         "kernarg_segment_size": 112
       },
       "arch": "gfx1151",
-      "elf_bytes": 36504,
-      "elf_sha256": "e568e16e5d1546ed80af8f54d2b356e017f6cd7de0abaddf46adee7e182a480c",
+      "elf_bytes": 38680,
+      "elf_sha256": "7dc170eaa4da4ef436852a5e8b1e33635965421dbdbc099b254cd49bd71b52b6",
       "hazards": {
         "advisory": 192,
         "blocking": 0,
@@ -154,16 +154,16 @@
         "findings": 192,
         "pm_ir_obligations": 0
       },
-      "hxaco_bytes": 40600,
-      "hxaco_sha256": "99567ed88287eb592bc121b28c31dc9198ce55a6f4ed9a50d7a9b3d51aa5a6bd",
+      "hxaco_bytes": 42776,
+      "hxaco_sha256": "1601e9b2a27fcbbc9a24c808544eb5529b949458d574dc1e243301a2c6fc6a1a",
       "kernel": "gated_delta_chunk_gate_q8_wmma_arena_pm_gfx1151",
       "lds": 31168,
       "lift_identity": "emit::checked ok; emitted bytes == input ELF",
       "rsrc2": 132,
       "scratch": 0,
       "sgprs": 89,
-      "text_bytes": 31460,
-      "text_sha256": "d5224e204671e653d8a908c4a2da32a41d50b66cb86507ed4d4fdc897aae7d3a",
+      "text_bytes": 33604,
+      "text_sha256": "7f8b581cac16b11c41d62e70f433c0658d891b7c492b9c6fbc2ce60b44521b2f",
       "user_sgprs": 2,
       "vgprs": 240,
       "wavefront_size": 32
@@ -173,8 +173,8 @@
     {
       "symbol": "gated_delta_chunk_gate_q8_wmma_arena_pm_gfx1151",
       "judged_candidate": "incumbent-hipcc",
-      "judged_code_sha256": "d5224e204671e653d8a908c4a2da32a41d50b66cb86507ed4d4fdc897aae7d3a",
-      "twin_text_sha256": "d5224e204671e653d8a908c4a2da32a41d50b66cb86507ed4d4fdc897aae7d3a",
+      "judged_code_sha256": "7f8b581cac16b11c41d62e70f433c0658d891b7c492b9c6fbc2ce60b44521b2f",
+      "twin_text_sha256": "7f8b581cac16b11c41d62e70f433c0658d891b7c492b9c6fbc2ce60b44521b2f",
       "equal": true
     }
   ]

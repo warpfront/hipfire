@@ -3863,6 +3863,7 @@ mod tests {
             gdn: crate::GdnStateFormat::Q8,
             qsa_f16_arena: false,
             qsa_pooled_bf16: false,
+            gdn_stream: crate::GdnStreamKind::None,
         }
     }
 
@@ -4931,6 +4932,7 @@ mod tests {
             gdn: crate::GdnStateFormat::Q8,
             qsa_f16_arena: false,
             qsa_pooled_bf16: false,
+            gdn_stream: crate::GdnStreamKind::None,
         };
         let (max_seq, tile) = (16_640usize, purpose_tile_rows(AdmissionPurpose::Product));
 

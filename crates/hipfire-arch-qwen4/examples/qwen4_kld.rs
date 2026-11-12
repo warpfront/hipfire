@@ -29,6 +29,11 @@
 //!                    [--sequence-range START:END]
 //!   qwen4_kld speed --model MODEL.hfq --prompt-file PROMPT.txt --output OUT.json \
 //!                    [--product-prompt] [--decode-tokens 128] [--speed-warmup 8] [--reps 2]
+//!   qwen4_kld chunklogits --model MODEL.hfq --prompts A.txt,B.txt[,..] --max-prompt N \
+//!                    --schedules single,c512,h25,t25,.. --output DIR   (G3 chunk invariance)
+//!   qwen4_kld g2 --model MODEL.hfq --prompts A.txt,.. --max-prompt N \
+//!                    --schedules 25,63,65,513,521 --output DIR   (G2 snapshot/session roundtrip at
+//!                    an Open GDN stream: restore and continue byte-exact vs uninterrupted)
 //!   qwen4_kld pair --base BASE.npy --cand CAND.npy --corpus CORPUS.json --output OUT.json
 //! `pair` (S1 slow-link gate, CPU-only) reads two full-gate `s11ref --decode`
 //! outputs (each with its OUT.npy.json receipt) over the same reference and
@@ -223,7 +228,7 @@ impl HotsetPin {
         if self.sidecar.is_some() && self.budget_mib.is_none() {
             return Err("--hotset requires a nonzero --hot-budget-mib".into());
         }
-        if self.budget_mib.is_some() && !matches!(mode, "ref" | "eval" | "s11ref" | "speed") {
+        if self.budget_mib.is_some() && !matches!(mode, "ref" | "eval" | "s11ref" | "speed" | "chunklogits" | "g2") {
             return Err("--hot-budget-mib and --hotset require ref, eval, s11ref or speed".into());
         }
         if self.untiered.is_some() {
@@ -2125,6 +2130,269 @@ fn speed(
     Ok(())
 }
 
+/// One outer-call schedule of `chunklogits`: `single` (one forward), `c<K>` (consecutive
+/// forwards of K rows), `h<K>` (a K-row forward, then the rest), `t<K>` (everything but the
+/// last K rows, then those K).
+fn chunk_schedule(name: &str, n: usize) -> Result<Vec<usize>, String> {
+    let k = |t: &str| -> Result<usize, String> {
+        let k: usize = t.parse().map_err(|_| format!("schedule {name}: bad rows"))?;
+        if k == 0 || k >= n {
+            return Err(format!("schedule {name}: rows {k} out of 1..{n}"));
+        }
+        Ok(k)
+    };
+    Ok(match name {
+        "single" => vec![n],
+        _ if name.starts_with('c') => {
+            let k = k(&name[1..])?;
+            let mut v = vec![k; n / k];
+            if n % k != 0 {
+                v.push(n % k);
+            }
+            v
+        }
+        _ if name.starts_with('h') => {
+            let k = k(&name[1..])?;
+            vec![k, n - k]
+        }
+        _ if name.starts_with('t') => {
+            let k = k(&name[1..])?;
+            vec![n - k, k]
+        }
+        _ => return Err(format!("unknown schedule {name}")),
+    })
+}
+
+/// KL(p || q) of two logit rows over the full vocabulary in f64.
+fn full_vocab_kl(p: &[f32], q: &[f32]) -> f64 {
+    fn log_softmax(x: &[f32]) -> Vec<f64> {
+        let max = x.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b)) as f64;
+        let lse = x.iter().map(|&v| (v as f64 - max).exp()).sum::<f64>().ln() + max;
+        x.iter().map(|&v| v as f64 - lse).collect()
+    }
+    let (lp, lq) = (log_softmax(p), log_softmax(q));
+    lp.iter().zip(&lq).map(|(a, b)| a.exp() * (a - b)).sum()
+}
+
+/// G3: the final-row logits of each prompt under every outer-call schedule against the
+/// single-call reference (KL over the full vocabulary, max |difference|, byte identity).
+/// Each prefill is `forward_chunk_final` calls from a freshly reset state (the ordinary
+/// prefill route). The reference is run twice to prove it repeats.
+fn chunklogits(
+    model: &Path,
+    prompts: &[PathBuf],
+    max_prompt: usize,
+    schedules: &[String],
+    output: &Path,
+    pin: &HotsetPin,
+) -> Result<(), String> {
+    let hfq = HfqFile::open(model).map_err(|e| e.to_string())?;
+    let tok =
+        Tokenizer::from_hfq_metadata(&hfq.metadata_json).map_err(|e| format!("tokenizer: {e}"))?;
+    let mut sets = Vec::new();
+    for path in prompts {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("read {}: {e}", path.display()))?;
+        let mut ids = tok.encode(&text);
+        if ids.len() < max_prompt {
+            return Err(format!("{}: {} tokens < --max-prompt {max_prompt}", path.display(), ids.len()));
+        }
+        ids.truncate(max_prompt);
+        sets.push(ids);
+    }
+    drop(tok);
+    drop(hfq);
+    std::fs::create_dir_all(output).map_err(|e| e.to_string())?;
+    // The admitted prefill chunk follows `n_ctx`: round it up to a whole number of 256-row V2B
+    // tiles so a ragged (padded) projection of the longest call has its dedicated extent.
+    let mut m = Model::load(model, (max_prompt + 8).next_multiple_of(256), 1, None, pin)?;
+    let row = m.logits.sub_offset(0, m.vocab);
+    let mut cells = Vec::new();
+    let mut worst_kl = 0f64;
+    for (pi, ids) in sets.iter().enumerate() {
+        let mut run = |m: &mut Model, name: &str| -> Result<Vec<f32>, String> {
+            let parts = chunk_schedule(name, ids.len())?;
+            m.bundle.reset(&mut m.gpu).map_err(|e| e.to_string())?;
+            let mut at = 0;
+            for part in parts {
+                m.bundle
+                    .forward_chunk_final(&mut m.gpu, &ids[at..at + part], &row, None)
+                    .map_err(|e| format!("{name}: {e}"))?;
+                at += part;
+            }
+            let v = m.gpu.download_f32(&row).map_err(|e| e.to_string())?;
+            if v.iter().any(|x| !x.is_finite()) {
+                return Err(format!("{name}: non-finite logits"));
+            }
+            Ok(v)
+        };
+        let reference = run(&mut m, "single")?;
+        let repeat = run(&mut m, "single")?;
+        let repeat2 = run(&mut m, "single")?;
+        println!("CHUNKLOGITS prompt={pi} single_repeat2_identical_to_repeat1={}", repeat2 == repeat);
+        let bytes = |v: &[f32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let ref_bytes = bytes(&reference);
+        std::fs::write(output.join(format!("p{pi}-single.f32")), &ref_bytes).map_err(|e| e.to_string())?;
+        let sha = |b: &[u8]| format!("{:x}", Sha256::digest(b));
+        println!("CHUNKLOGITS prompt={pi} tokens={} schedule=single repeat_identical={} sha256={}", ids.len(), repeat == reference, sha(&ref_bytes));
+        cells.push(serde_json::json!({"prompt": pi, "schedule": "single-repeat", "identical": repeat == reference}));
+        for name in schedules.iter().filter(|s| s.as_str() != "single") {
+            let got = run(&mut m, name)?;
+            let kl = full_vocab_kl(&reference, &got);
+            let maxabs = reference.iter().zip(&got).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            let identical = got == reference;
+            worst_kl = worst_kl.max(kl);
+            let argmax = |v: &[f32]| v.iter().enumerate().fold((0, f32::MIN), |a, (i, &x)| if x > a.1 { (i, x) } else { a }).0;
+            println!("CHUNKLOGITS prompt={pi} tokens={} schedule={name} kl={kl:.3e} maxabs={maxabs:.3e} identical={identical} argmax_equal={} sha256={}", ids.len(), argmax(&got) == argmax(&reference), sha(&bytes(&got)));
+            cells.push(serde_json::json!({"prompt": pi, "tokens": ids.len(), "schedule": name, "kl": kl, "maxabs": maxabs, "identical": identical}));
+        }
+    }
+    let binary = std::env::current_exe().map_err(|e| e.to_string())?;
+    let receipt = serde_json::json!({
+        "schema": "hipfire.qwen4.chunklogits.v1",
+        "model": model.display().to_string(),
+        "binary_sha256": artifact_id(&binary)?.sha256,
+        "arch": m.gpu.arch.to_string(),
+        "prompts": prompts.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+        "max_prompt": max_prompt, "worst_kl": worst_kl, "cells": cells,
+    });
+    std::fs::write(output.join("receipt.json"), serde_json::to_string_pretty(&receipt).map_err(|e| e.to_string())? + "\n")
+        .map_err(|e| e.to_string())?;
+    println!("CHUNKLOGITS worst_kl={worst_kl:.3e}");
+    Ok(())
+}
+
+/// G2: restore-and-continue at an Open GDN stream. For each prompt and cut position `p`:
+/// (1) the state-arena snapshot API: prefill `ids[..p]`, snapshot, finish the prompt (A), restore
+/// the snapshot, finish again (B): A == B byte for byte; (2) the session API: a turn-end token
+/// at `p - 1` makes `p` a session boundary captured MID-prefill (the stream is Open there); a
+/// second prompt sharing exactly that prefix restores the pooled snapshot (`session_plan` ==
+/// `p`) and continues: its final logits equal a cold prefill of the same prompt byte for byte.
+fn g2(
+    model: &Path,
+    prompts: &[PathBuf],
+    max_prompt: usize,
+    cuts: &[String],
+    output: &Path,
+    pin: &HotsetPin,
+) -> Result<(), String> {
+    use hipfire_runtime::arch_model::ArchModel;
+    use hipfire_runtime::session_cache::{SessionCache, SessionRoute};
+    let hfq = HfqFile::open(model).map_err(|e| e.to_string())?;
+    let tok =
+        Tokenizer::from_hfq_metadata(&hfq.metadata_json).map_err(|e| format!("tokenizer: {e}"))?;
+    let mut sets = Vec::new();
+    for path in prompts {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("read {}: {e}", path.display()))?;
+        let mut ids = tok.encode(&text);
+        if ids.len() < max_prompt {
+            return Err(format!("{}: {} tokens < --max-prompt {max_prompt}", path.display(), ids.len()));
+        }
+        ids.truncate(max_prompt);
+        sets.push(ids);
+    }
+    let cuts: Vec<usize> = cuts
+        .iter()
+        .map(|c| c.parse().map_err(|_| format!("bad cut {c}")))
+        .collect::<Result<_, _>>()?;
+    std::fs::create_dir_all(output).map_err(|e| e.to_string())?;
+    let mut m = Model::load(model, (max_prompt + 8).next_multiple_of(256), 1, None, pin)?;
+    let domain = hipfire_runtime::serve_contract::CacheDomain::for_model(
+        &hfq,
+        &tok,
+        None,
+        "qwen4",
+        m.gpu.device_id,
+    );
+    drop(hfq);
+    let row = m.logits.sub_offset(0, m.vocab);
+    let sha = |v: &[f32]| format!("{:x}", Sha256::digest(v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>()));
+    let mut cells = Vec::new();
+    let mut failures = 0usize;
+    for (pi, base) in sets.iter().enumerate() {
+        // A turn-end token absent from the prompt: it marks the session boundary only.
+        let turn_end = (1..u32::MAX)
+            .find(|t| !base.contains(t))
+            .ok_or("no free token id")?;
+        for &p in &cuts {
+            if p == 0 || p + 2 > base.len() {
+                return Err(format!("cut {p} outside the prompt ({} tokens)", base.len()));
+            }
+            // (1) snapshot / restore through the state arena at an Open stream.
+            let n = base.len();
+            m.bundle.reset(&mut m.gpu).map_err(|e| e.to_string())?;
+            m.bundle
+                .forward_chunk_final(&mut m.gpu, &base[..p], &row, None)
+                .map_err(|e| format!("g2 prefix: {e}"))?;
+            let snapshot = m.bundle.snapshot(&mut m.gpu).map_err(|e| format!("g2 snapshot: {e}"))?;
+            m.bundle
+                .forward_chunk_final(&mut m.gpu, &base[p..n], &row, None)
+                .map_err(|e| format!("g2 continue: {e}"))?;
+            let a = m.gpu.download_f32(&row).map_err(|e| e.to_string())?;
+            m.bundle.restore(&mut m.gpu, snapshot).map_err(|e| format!("g2 restore: {e}"))?;
+            m.bundle
+                .forward_chunk_final(&mut m.gpu, &base[p..n], &row, None)
+                .map_err(|e| format!("g2 continue after restore: {e}"))?;
+            let b = m.gpu.download_f32(&row).map_err(|e| e.to_string())?;
+            let arena_ok = a == b;
+            println!("G2 prompt={pi} cut={p} arena_snapshot_restore_identical={arena_ok} sha256={}", sha(&b));
+
+            // (2) session API: boundary at p captured mid-prefill, restored by a second prompt.
+            let mut first = base.clone();
+            first[p - 1] = turn_end;
+            let mut second: Vec<u32> = first[..p].to_vec();
+            second.extend(base[p..].iter().rev());
+            m.bundle.set_turn_snapshots(true);
+            m.bundle.set_turn_end_token(Some(turn_end));
+            m.bundle.attach_session_cache(SessionCache::new(domain.clone(), u64::MAX >> 1));
+            let run = |m: &mut Model, prompt: &[u32], reused: usize| -> Result<Vec<f32>, String> {
+                m.bundle
+                    .prefill_final(&mut m.gpu, prompt, reused, &row)
+                    .map_err(|e| format!("g2 prefill_final: {e}"))?;
+                m.gpu.download_f32(&row).map_err(|e| e.to_string())
+            };
+            // Cold reference of `second` (also fills the pool with the boundary at p).
+            m.bundle.reset(&mut m.gpu).map_err(|e| e.to_string())?;
+            let cold = run(&mut m, &second, 0)?;
+            // Publish the turn-boundary snapshots captured during the cold prefill.
+            m.bundle.session_commit();
+            // Drop the live state, keep the pool: the next prefill restores the snapshot.
+            m.bundle.reset(&mut m.gpu).map_err(|e| e.to_string())?;
+            let reused = m.bundle.session_plan(&second, SessionRoute::Ar);
+            let restored = run(&mut m, &second, reused)?;
+            let session_ok = cold == restored && reused == p;
+            println!(
+                "G2 prompt={pi} cut={p} session_reused={reused} session_restore_identical={} cold_sha256={} restored_sha256={}",
+                cold == restored,
+                sha(&cold),
+                sha(&restored)
+            );
+            if !(arena_ok && session_ok) {
+                failures += 1;
+            }
+            cells.push(serde_json::json!({
+                "prompt": pi, "cut": p, "tokens": n,
+                "arena_snapshot_restore_identical": arena_ok,
+                "session_reused": reused, "session_restore_identical": cold == restored,
+            }));
+            m.bundle.set_turn_snapshots(false);
+            m.bundle.session_clear(&mut m.gpu);
+        }
+    }
+    let receipt = serde_json::json!({
+        "schema": "hipfire.qwen4.g2.v1", "model": model.display().to_string(),
+        "arch": m.gpu.arch.to_string(), "max_prompt": max_prompt, "failures": failures, "cells": cells,
+    });
+    std::fs::write(output.join("receipt.json"), serde_json::to_string_pretty(&receipt).map_err(|e| e.to_string())? + "\n")
+        .map_err(|e| e.to_string())?;
+    println!("G2 failures={failures}");
+    if failures > 0 {
+        return Err(format!("G2: {failures} cells failed"));
+    }
+    Ok(())
+}
+
 /// Little-endian f64 rows of a 1-D `.npy` as `write_kl_npy` writes them.
 fn read_kl_npy(path: &Path) -> Result<Vec<f64>, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
@@ -2288,6 +2556,7 @@ fn run_args(mut args: impl Iterator<Item = String>) -> Result<(), String> {
     let (mut decode_tokens, mut speed_warmup, mut reps, mut max_prompt) =
         (128usize, 8usize, 2usize, None::<usize>);
     let (mut tail_split, mut score_tail) = (None, None);
+    let (mut prompts, mut schedules): (Vec<PathBuf>, Vec<String>) = (Vec::new(), Vec::new());
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value"));
         let number = |v: String| v.parse::<usize>().map_err(|e| format!("{flag}: {e}"));
@@ -2325,6 +2594,8 @@ fn run_args(mut args: impl Iterator<Item = String>) -> Result<(), String> {
             "--speed-warmup" => speed_warmup = number(value()?)?,
             "--reps" => reps = number(value()?)?,
             "--max-prompt" => max_prompt = Some(number(value()?)?),
+            "--prompts" => prompts = value()?.split(',').map(PathBuf::from).collect(),
+            "--schedules" => schedules = value()?.split(',').map(str::to_owned).collect(),
             "--tail-split" => match number(value()?)? {
                 0 => return Err("--tail-split: rows must be positive".into()),
                 rows => tail_split = Some(rows),
@@ -2411,6 +2682,20 @@ fn run_args(mut args: impl Iterator<Item = String>) -> Result<(), String> {
                 product_prompt,
                 &pin,
             )
+        }
+        ("chunklogits", Some(model), None, None, Some(output)) => {
+            let max_prompt = max_prompt.ok_or("chunklogits requires --max-prompt")?;
+            if prompts.is_empty() || schedules.is_empty() {
+                return Err("chunklogits requires --prompts and --schedules".into());
+            }
+            chunklogits(&model, &prompts, max_prompt, &schedules, &output, &pin)
+        }
+        ("g2", Some(model), None, None, Some(output)) => {
+            let max_prompt = max_prompt.ok_or("g2 requires --max-prompt")?;
+            if prompts.is_empty() || schedules.is_empty() {
+                return Err("g2 requires --prompts and --schedules (the cut positions)".into());
+            }
+            g2(&model, &prompts, max_prompt, &schedules, &output, &pin)
         }
         ("pair", None, None, None, Some(output)) => {
             // CPU-only: the paired candidate-minus-beta verdict over two

@@ -141,7 +141,10 @@ fn every_module_verifies_with_the_incumbent_kernarg_layout_and_text() {
             + 3 * 16 * 4
             + 16 * 136 * 2;
         assert_eq!(s.lds, lds, "{}: static LDS", m.name);
-        assert_eq!(s.vgprs, 240, "{}: vgprs", m.name);
+        // gfx1151 is pinned to six waves per SIMD (<= 240 VGPRs); gfx1100 is not pinned, and its
+        // F32 triangular products (see the kernel header) allocate 248.
+        let vgprs = if m.arch == Arch::Gfx1100 { 248 } else { 240 };
+        assert_eq!(s.vgprs, vgprs, "{}: vgprs", m.name);
 
         // The seal's judged code is the incumbent hipcc kernel's own `.text`.
         let rec: serde_json::Value = serde_json::from_str(m.twin_json).expect("twin.json");

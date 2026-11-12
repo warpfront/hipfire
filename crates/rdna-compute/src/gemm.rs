@@ -22188,7 +22188,21 @@ impl Gpu {
     ///   of 4-12 and 24 CTAs (e.g. M1024 at N512) lost and keep X5.
     ///   `HIPFIRE_IU4_V2B=0` falls back to X5.
     fn iu4_v2_tile(&self, m: usize, k: usize, n: usize) -> Option<Iu4V2Tile> {
-        let eligible = m > 0
+        match self.arch.as_str() {
+            "gfx1151"
+                if self.iu4_v2b_shape(m, k, n)
+                    && (m / 256) * (n / 256) >= self.cu_count_or_default() =>
+            {
+                Some(Iu4V2Tile::V2b)
+            }
+            "gfx1100" if self.iu4_v2_eligible(m, k, n) && *DISPATCH_IU4_V2C => Some(Iu4V2Tile::V2c),
+            _ => None,
+        }
+    }
+
+    /// The shape/flag part of the X5 eligibility every v2 tile shares.
+    fn iu4_v2_eligible(&self, m: usize, k: usize, n: usize) -> bool {
+        m > 0
             && k > 0
             && n > 0
             && k % 256 == 0
@@ -22198,22 +22212,20 @@ impl Gpu {
             && self.flags.gfx11_iu4_symfold
             && *DISPATCH_IU4_SYMFOLD
             && !self.replay.is_recording()
-            && !self.graphs.capture_mode;
-        if !eligible {
-            return None;
-        }
-        match self.arch.as_str() {
-            "gfx1100" if *DISPATCH_IU4_V2C => Some(Iu4V2Tile::V2c),
-            "gfx1151"
-                if m % 256 == 0
-                    && n % 256 == 0
-                    && (m / 256) * (n / 256) >= self.cu_count_or_default()
-                    && *DISPATCH_IU4_V2B =>
-            {
-                Some(Iu4V2Tile::V2b)
-            }
-            _ => None,
-        }
+            && !self.graphs.capture_mode
+    }
+
+    /// Whether the gfx1151 V2B tile can run an (m, k, n) IU4 SET at all: the X5 eligibility,
+    /// M%256 == N%256 == 0 and the kill switch, with no grid-size (CTA count) condition. The
+    /// CTA count is a throughput heuristic of [`Self::iu4_v2_tile`]; the ordinary prefill
+    /// recipe must not let it pick the arithmetic (the Z|beta|alpha scatter fold and the
+    /// separate M-tail SETs round differently), so its Z|beta|alpha fold asks this instead.
+    fn iu4_v2b_shape(&self, m: usize, k: usize, n: usize) -> bool {
+        self.arch.as_str() == "gfx1151"
+            && self.iu4_v2_eligible(m, k, n)
+            && m % 256 == 0
+            && n % 256 == 0
+            && *DISPATCH_IU4_V2B
     }
 
     /// iu4-direct MMQ consumer for the MQ4V2 family (W4A4 prefill): reads the
@@ -31801,7 +31813,13 @@ impl Gpu {
         let mut x_view: Option<GpuTensor> = x16.map(GpuTensor::shallow_clone);
         for projections in groups {
             for &(weight, y, m) in projections.iter().filter(|&&(_, _, m)| short(m)) {
-                self.gemm_bf16_xf32_multirow(weight, x, y, m, k, batch_size)?;
+                if batch_size == 1 {
+                    // A one-row ordinary-prefill call: the multirow kernel needs two rows; its
+                    // row arithmetic is the singleton GEMV's (the lane groups above rely on it).
+                    self.gemv_bf16_xf32(weight, x, y, m, k)?;
+                } else {
+                    self.gemm_bf16_xf32_multirow(weight, x, y, m, k, batch_size)?;
+                }
             }
             if projections.iter().all(|&(_, _, m)| short(m)) {
                 continue;
@@ -53399,14 +53417,14 @@ pub fn qwen4_trunk_iu4_ragged_rows(rows: usize) -> Option<usize> {
 }
 
 /// Dense trunk IU4 admission of `rows` under `intent`: product/invariant need the 512-row
-/// prefill floor; the ordinary prefill intent admits any positive whole-128-row extent.
+/// prefill floor; the ordinary prefill intent admits any positive whole-256-row extent (the V2B tile).
 pub(crate) fn qwen4_trunk_iu4_dense_rows_for(
     intent: crate::prefill_invariant::PrefillRouteIntent,
     rows: usize,
 ) -> bool {
     match intent {
         crate::prefill_invariant::PrefillRouteIntent::OrdinaryPrefill => {
-            rows > 0 && rows % 128 == 0
+            rows > 0 && rows % 256 == 0
         }
         _ => qwen4_trunk_iu4_dense_rows(rows),
     }
@@ -53418,7 +53436,7 @@ pub(crate) fn qwen4_trunk_iu4_ragged_rows_for(
 ) -> Option<usize> {
     match intent {
         crate::prefill_invariant::PrefillRouteIntent::OrdinaryPrefill => {
-            (rows > 0 && rows % 128 != 0).then(|| rows.next_multiple_of(256))
+            (rows > 0 && rows % 256 != 0).then(|| rows.next_multiple_of(256))
         }
         _ => qwen4_trunk_iu4_ragged_rows(rows),
     }
@@ -53451,7 +53469,7 @@ mod qwen4_trunk_ragged_tests {
 mod qwen4_trunk_ordinary_prefill_tests {
     use crate::prefill_invariant::PrefillRouteIntent as I;
 
-    /// Ordinary prefill: every positive extent is exactly one of dense (whole 128-row tiles) or
+    /// Ordinary prefill: every positive extent is exactly one of dense (whole 256-row tiles) or
     /// ragged (padded to whole 256-row tiles), never both, never neither; product / invariant
     /// keep the 512-row floor. The padded count always covers the live rows and is a whole V2B tile.
     #[test]
@@ -53460,7 +53478,7 @@ mod qwen4_trunk_ordinary_prefill_tests {
             let dense = super::qwen4_trunk_iu4_dense_rows_for(I::OrdinaryPrefill, rows);
             let ragged = super::qwen4_trunk_iu4_ragged_rows_for(I::OrdinaryPrefill, rows);
             assert_ne!(dense, ragged.is_some(), "rows {rows}: exactly one of dense/ragged");
-            assert_eq!(dense, rows % 128 == 0, "rows {rows}");
+            assert_eq!(dense, rows % 256 == 0, "rows {rows}");
             if let Some(pad) = ragged {
                 assert!(pad >= rows && pad % 256 == 0 && pad - rows < 256, "rows {rows} pad {pad}");
             }
@@ -53502,7 +53520,7 @@ impl Gpu {
     }
 
     /// Whether a `rows`-row trunk projection takes the dense IU4 route: verified
-    /// trunk, whole 128-row tiles, eager (no replay recording or graph capture), and
+    /// trunk, whole 128-row tiles (256 under the ordinary prefill intent), eager (no replay recording or graph capture), and
     /// either a product prefill of at least [`QWEN4_F16_WMMA_MIN_TOKENS`] rows or the
     /// ordinary prefill intent at ANY positive extent. A partial N tile would reach the
     /// IU4 tail entry, whose fold differs from the symmetric one (measured: tail outputs
@@ -53526,7 +53544,7 @@ impl Gpu {
 
     /// Ragged (padded to whole 256-row V2B tiles) trunk IU4 rows, never decode, invariant
     /// profile or capture. Product prefill: `rows >= 512` (Z|beta|alpha only); ordinary
-    /// prefill: any positive `rows` not a multiple of 128, for every IU4 trunk
+    /// prefill: any positive `rows` not a multiple of 256, for every IU4 trunk
     /// projection ([`Self::qwen4_trunk_set_ragged`], [`Self::qwen4_trunk_zba_ragged`]).
     pub fn qwen4_trunk_iu4_ragged(&self, rows: usize) -> Option<usize> {
         let intent = self.prefill_route_intent();
@@ -53664,7 +53682,11 @@ impl Gpu {
         let folded_m = z_m + 256;
         if z_m % 256 != 0
             || a_fold.byte_size() != folded_m * row_bytes
-            || self.iu4_v2_tile(folded_m, k, n) != Some(Iu4V2Tile::V2b)
+            || !(if self.ordinary_prefill_active() {
+                self.iu4_v2b_shape(folded_m, k, n)
+            } else {
+                self.iu4_v2_tile(folded_m, k, n) == Some(Iu4V2Tile::V2b)
+            })
             || y_z.byte_size() < n * z_m * 4
             || y_beta.byte_size() < n * 48 * 4
             || y_alpha.byte_size() < n * 48 * 4

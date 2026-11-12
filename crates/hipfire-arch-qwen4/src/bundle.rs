@@ -287,9 +287,10 @@ pub fn session_snapshot_bytes(
     p: usize,
 ) -> Option<u64> {
     let part = |bytes: usize| bytes.checked_next_multiple_of(256);
-    // A Q8Ef snapshot carries the plain Q8 payload only: the live F16
-    // residual plane is never snapshotted (it is zeroed on every restore), so
-    // the size is the `storage()` format's, equal to Q8's.
+    // A Q8Ef snapshot carries the plain Q8 slot and, with it, the real live F16
+    // residual plane (restored verbatim; it is no longer zeroed on restore).
+    // A carrying stream (`format.gdn_stream`: C16 WY on gfx11, dense C64 on gfx1201) adds its
+    // carry tensors to every snapshot (the Open phase's authoritative state).
     let gdn_storage = format.gdn.storage();
     let gdn_recurrent = gdn_storage.state_units(
         config.linear_num_value_heads,
@@ -303,11 +304,32 @@ pub fn session_snapshot_bytes(
                 .linear_num_value_heads
                 .checked_mul(config.linear_value_head_dim)?,
         )?;
-    let gdn = part(gdn_recurrent.checked_mul(gdn_storage.dtype().size())?)?.checked_add(part(
-        conv_channels
-            .checked_mul(config.linear_conv_kernel_dim.saturating_sub(1))?
-            .checked_mul(4)?,
-    )?)?;
+    let residual = if format.gdn.has_residual() {
+        format
+            .gdn
+            .residual_units(
+                config.linear_num_value_heads,
+                config.linear_key_head_dim,
+                config.linear_value_head_dim,
+            )
+            .checked_mul(2)?
+    } else {
+        0
+    };
+    let mut carry = 0usize;
+    if format.gdn_stream != crate::GdnStreamKind::None {
+        for &(_, elements, dtype) in &crate::state::gdn_carry::carry_layer_specs(config, format.gdn_stream) {
+            carry = carry.checked_add(part(elements.checked_mul(dtype.size())?)?)?;
+        }
+    }
+    let gdn = part(gdn_recurrent.checked_mul(gdn_storage.dtype().size())?)?
+        .checked_add(part(carry)?)?
+        .checked_add(part(residual)?)?
+        .checked_add(part(
+            conv_channels
+                .checked_mul(config.linear_conv_kernel_dim.saturating_sub(1))?
+                .checked_mul(4)?,
+        )?)?;
     let compress = config.indexer_compress_ratio;
     let raw_width = config
         .indexer_kv_heads
@@ -387,11 +409,12 @@ impl PpSessionPolicy {
 
 /// The session-cache scope of one bundle. Single (`band == None`) is exactly the
 /// historical string for the F32 and Q8 GDN formats; Q8Ef appends the distinct
-/// `/q8_ef-reset` spelling after the format (its snapshots carry Q8 payload
-/// only and restore zeroes the live residual, so they never alias a plain Q8
-/// or F32 scope). A PP band appends its band identity (index/count, layers,
-/// complete placement, devices, mesh and load epoch) and the shared schedule
-/// policy, so no two bands, placements, devices, meshes or loads alias.
+/// `/q8_ef-v2` spelling after the format (its snapshots carry the plain Q8
+/// payload plus the real residual, so they never alias a plain Q8 or F32 scope
+/// nor an older residual-less Q8Ef snapshot). A PP band appends its band
+/// identity (index/count, layers, complete placement, devices, mesh and load
+/// epoch) and the shared schedule policy, so no two bands, placements, devices,
+/// meshes or loads alias.
 pub(crate) fn session_scope(
     route: SessionRoute,
     chunk: usize,
@@ -404,7 +427,7 @@ pub(crate) fn session_scope(
     let turns = if turns { "/turns" } else { "" };
     let gdn_abi = match format.gdn {
         crate::GdnStateFormat::F32 | crate::GdnStateFormat::Q8 => "",
-        crate::GdnStateFormat::Q8Ef => "/q8_ef-reset",
+        crate::GdnStateFormat::Q8Ef => "/q8_ef-v2",
     };
     let mut scope = format!("qwen4/{route:?}/chunk{chunk}/{format:?}{gdn_abi}{turns}");
     if let Some((band, policy)) = band {
@@ -434,6 +457,16 @@ impl SessionState for Qwen4Bundle {
                 .as_ref()
                 .map(|band| (band, self.pp_session_policy())),
         );
+        // A WY-stream state's payload carries each layer's stream cursor and
+        // carry tensors under the plan's recipe: another recipe or schema is
+        // another domain.
+        if let Some(plan) = self.state.gdn_stream_plan() {
+            scope.push_str(&format!(
+                "/gdnstream-wy16-s{}-{:016x}",
+                rdna_compute::gdn_stream::GDN_STREAM_SCHEMA_VERSION,
+                plan.recipe_id
+            ));
+        }
         // A slow-link load mixes in `tile_rows` tiles but checkpoints on its
         // own cadence (`checkpoint_stride_rows`): the pair is a distinct
         // numeric/cache identity, never aliasing an explicit chunk-1536
@@ -5081,7 +5114,24 @@ impl Qwen4Bundle {
         self.share_prompt_begin();
         let result = self.prefill_final_tiles(gpu, prompt, reused, logits);
         let finish = self.share_prompt_end(gpu, result.is_ok());
-        result.and(finish)
+        // The terminal fence of the ordinary-prefill phase: the real prompt end, once (never a
+        // tile, session boundary or checkpoint), before decode/verify reads the live slot.
+        let sealed = if result.is_ok() {
+            let weights = &self.weights;
+            self.state
+                .seal_gdn_streams(gpu, &|abs| {
+                    let gdn = weights.layer(abs)?.gdn.as_ref()?;
+                    Some(crate::state::gdn_carry::GdnSealWeights {
+                        conv: weights.resident(&gdn.conv).ok()?,
+                        a_log: weights.resident(&gdn.a_log).ok()?,
+                        dt_bias: weights.resident(&gdn.dt_bias).ok()?,
+                    })
+                })
+                .map_err(BundleError::State)
+        } else {
+            Ok(())
+        };
+        result.and(finish).and(sealed)
     }
 
     /// The chunk loop of [`Self::prefill_final_from`].

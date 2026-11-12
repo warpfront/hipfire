@@ -112,32 +112,32 @@
           }
         ],
         "compared_to_incumbent": true,
-        "incumbent_sha256": "b8cb1d766f1d50b0f02e72f36bf6d04f2e4c0a33fe804d38da467fb49e5d590f",
+        "incumbent_sha256": "574630bc877c8034545ec9cdc764a932356ebf4454f529faec53ab64b3722d5e",
         "incumbent_symbol": "gated_delta_chunk_gate_wmma",
         "kernarg_segment_size": 96
       },
       "arch": "gfx1100",
-      "elf_bytes": 28168,
-      "elf_sha256": "f65cf161a2939fd167600dadc59091d31d87260d7a87836ceb5ca5bfdc7fface",
+      "elf_bytes": 30088,
+      "elf_sha256": "32dbd01c973256214fd11baab0e678d0f889e59e2d30b22f4bf3d1165b1d2286",
       "hazards": {
-        "advisory": 189,
+        "advisory": 188,
         "blocking": 0,
         "checked": true,
-        "findings": 189,
+        "findings": 188,
         "pm_ir_obligations": 0
       },
-      "hxaco_bytes": 32264,
-      "hxaco_sha256": "64ff6dbbb25d4afdd8aa7bdc79fecf95bed17f95e9814cbb656912ea9cf6b789",
+      "hxaco_bytes": 34184,
+      "hxaco_sha256": "cd1b626f7a2841a10f2a5e4ed0caf9371a3234208bbe73ac20bd2786720fddd2",
       "kernel": "gated_delta_chunk_gate_wmma_pm_gfx1100",
       "lds": 31168,
       "lift_identity": "emit::checked ok; emitted bytes == input ELF",
       "rsrc2": 158,
       "scratch": 0,
       "sgprs": 78,
-      "text_bytes": 23336,
-      "text_sha256": "872669cb93f5d0c1fba823306103a2e1298c912b52aa77613e01b0d02bf13f55",
+      "text_bytes": 25316,
+      "text_sha256": "6af703c3f0a520766280b551abc505676a370ce67049e927e785d0a6698b3156",
       "user_sgprs": 15,
-      "vgprs": 240,
+      "vgprs": 248,
       "wavefront_size": 32
     }
   ],
@@ -145,8 +145,8 @@
     {
       "symbol": "gated_delta_chunk_gate_wmma_pm_gfx1100",
       "judged_candidate": "incumbent-hipcc",
-      "judged_code_sha256": "872669cb93f5d0c1fba823306103a2e1298c912b52aa77613e01b0d02bf13f55",
-      "twin_text_sha256": "872669cb93f5d0c1fba823306103a2e1298c912b52aa77613e01b0d02bf13f55",
+      "judged_code_sha256": "6af703c3f0a520766280b551abc505676a370ce67049e927e785d0a6698b3156",
+      "twin_text_sha256": "6af703c3f0a520766280b551abc505676a370ce67049e927e785d0a6698b3156",
       "equal": true
     }
   ]

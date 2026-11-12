@@ -3973,6 +3973,10 @@ fn forward_lanes_scoped(
                                 zba_fold: fwd.trunk_zba.get(layer).and_then(Option::as_ref),
                                 trunk_a4: fwd.trunk_a4.get(layer).copied().unwrap_or(0),
                                 phase,
+                                // A consumer view: an open stream (a promoted
+                                // request prefilled by the WY scan) is sealed
+                                // before the lane reads its live slot.
+                                carry: state.gdn_carry_view(slot, false),
                             }));
                         }
                         LaneOp::Qsa { layer, slot, phase } => {

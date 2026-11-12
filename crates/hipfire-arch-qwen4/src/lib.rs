@@ -166,7 +166,9 @@ pub use ple::{
     PLE_PADDED_ROWS, PLE_PADDING_MULTIPLE, PLE_ROW_WIDTH, PLE_VALID_ROWS,
 };
 pub use rdna_compute::tensor_ops::{GdnStateFormat, QsaKvFormat};
-pub use state::{resolve_gdn_format, resolve_qsa_format, resolve_state_format, Qwen4StateFormat};
+pub use state::{
+    resolve_gdn_format, resolve_qsa_format, resolve_state_format, GdnStreamKind, Qwen4StateFormat,
+};
 pub use trunk_overlay::{
     resolve_trunk_overlay, trunk_overlay_extra_bytes, Qwen4TrunkOverlay, TrunkOverlayPolicy,
 };

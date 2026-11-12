@@ -1447,6 +1447,7 @@ mod tests {
             gdn: GdnStateFormat::F32,
             qsa_f16_arena: false,
             qsa_pooled_bf16: false,
+            gdn_stream: crate::GdnStreamKind::None,
         }
     }
 

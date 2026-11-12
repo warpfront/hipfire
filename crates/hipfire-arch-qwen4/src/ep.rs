@@ -4455,6 +4455,7 @@ mod tests {
             gdn: crate::GdnStateFormat::Q8,
             qsa_f16_arena: false,
             qsa_pooled_bf16: false,
+            gdn_stream: crate::GdnStreamKind::None,
         };
         let bytes = |rows: usize| {
             ep_lane_store_device_bytes(
@@ -4559,6 +4560,7 @@ mod tests {
             gdn: crate::GdnStateFormat::Q8,
             qsa_f16_arena: false,
             qsa_pooled_bf16: false,
+            gdn_stream: crate::GdnStreamKind::None,
         };
         // The production census inputs (`device_bytes`): the prompt-fill append
         // scratch is charged when the store allocates it.
@@ -4652,6 +4654,7 @@ mod tests {
             gdn: crate::GdnStateFormat::Q8,
             qsa_f16_arena: false,
             qsa_pooled_bf16: false,
+            gdn_stream: crate::GdnStreamKind::None,
         };
         let copy = |wide_lanes: usize| crate::lane::LaneCopyConfig {
             ngram: hipfire_runtime::ngram_mod::NgramModConfig {
@@ -4791,6 +4794,7 @@ mod tests {
                 gdn,
                 qsa_f16_arena: false,
                 qsa_pooled_bf16: false,
+                gdn_stream: crate::GdnStreamKind::None,
             };
             let with = Qwen4State::device_bytes_with_mirror(
                 &config,
