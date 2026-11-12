@@ -52,6 +52,7 @@ op_table!(Sop2Op {
     Andn2B64,
     Orn2B32,
     Orn2B64,
+    NorB64,
     LshlB32,
     LshlB64,
     LshrB32,
@@ -184,7 +185,7 @@ impl Sop2Op {
     pub fn widths(self) -> (u8, u8, u8) {
         use Sop2Op::*;
         match self {
-            CselectB64 | AndB64 | OrB64 | XorB64 | Andn2B64 | Orn2B64 => (2, 2, 2),
+            CselectB64 | AndB64 | OrB64 | XorB64 | Andn2B64 | Orn2B64 | NorB64 => (2, 2, 2),
             LshlB64 | LshrB64 | AshrI64 => (2, 2, 1),
             _ => (1, 1, 1),
         }
@@ -1021,6 +1022,7 @@ impl Sop2Op {
                 Self::Andn2B64 => 19,
                 Self::Orn2B32 => 20,
                 Self::Orn2B64 => 21,
+                Self::NorB64 => 25,
                 Self::LshlB32 => 28,
                 Self::LshlB64 => 29,
                 Self::LshrB32 => 30,
@@ -1070,6 +1072,7 @@ impl Sop2Op {
             Self::Andn2B64 => "s_andn2_b64",
             Self::Orn2B32 => "s_orn2_b32",
             Self::Orn2B64 => "s_orn2_b64",
+            Self::NorB64 => "s_nor_b64",
             Self::LshlB32 => "s_lshl_b32",
             Self::LshlB64 => "s_lshl_b64",
             Self::LshrB32 => "s_lshr_b32",
