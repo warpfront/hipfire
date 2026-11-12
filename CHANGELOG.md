@@ -81,9 +81,9 @@
 
 - Launcher ABI audit: preserve source-proven aggregate scalar fields (array extents remain symbolic) and compare actual blob writes against their exact byte offsets/types, rather than equating one push with one C argument. Trace bounded blob-writing helpers through their real bodies; loader-only classification never replaces the required live launch checks.
 
-- PeaceMaker gfx942: preserve the original QSA lanes anchor as a negative-only seven-entry regression. Pin FLAT-segment, missing F16 comparison model, and unverified mixed-FMA encoding refusals; no deployable twin, new ledger allowance, or hardware qualification is claimed.
+- PeaceMaker gfx942: preserve the original QSA lanes anchor as a negative-only seven-entry regression. Pin FLAT-segment and missing F16 comparison model refusals; after mixed-FMA qualification the original FP8 attention advances to its actual FLAT load at instruction 240. No deployable twin, new ledger allowance, or hardware qualification of that original image is claimed.
 
-- PeaceMaker gfx942: add a full device-ELF-identical Route-A twin of the five F32/select QSA lane entries from frozen owner c06ab5d626, with immutable source/anchor recipe, strict per-entry hazard and CFG wait proofs, ABI pins, and exact-image qualification. The two FP8 entries remain explicitly unsupported and negatively pinned; no new obligation class or verifier allowance is introduced.
+- PeaceMaker gfx942: add a full device-ELF-identical Route-A twin of the five F32/select QSA lane entries from frozen owner c06ab5d626, with immutable source/anchor recipe, strict per-entry hazard and CFG wait proofs, ABI pins, and exact-image qualification. The FP8 prologue remains negatively pinned; mixed-FMA qualification now strictly certifies the FP8 attention, checked positively without expanding the frozen five-entry seal or its hardware claim. No new obligation class or verifier allowance is introduced.
 
 ### Fixes: exact-gfx942 lane steps wider than eight rows (wide C8 verify)
 
