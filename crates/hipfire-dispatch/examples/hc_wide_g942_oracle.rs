@@ -1002,6 +1002,27 @@ fn bench_hc(env: &mut Env, set: &WeightSet, n: usize, scope: Scope, iters: usize
     })
 }
 
+/// Wall of 96 calls of one stage kind (a forward's reads, or its writes) at `n` rows.
+fn bench_stage(env: &mut Env, set: &WeightSet, n: usize, scope: Scope, iters: usize, write: bool) -> R<f64> {
+    let init = make_init(n, 0);
+    env.bufs.reset(&env.gpu, &init)?;
+    time_ms(env, iters, |env| {
+        let Env { gpu, ctx, bufs, .. } = env;
+        let v = bufs.views(0, BRANCHES);
+        for i in 0..96 {
+            let layer = (i / 2) % set.layers.len();
+            let mlp = i % 2 == 1;
+            let stage = if write {
+                Stage::Write { layer, mlp }
+            } else {
+                Stage::Read { layer, mlp }
+            };
+            exec_stage(gpu, ctx, set, stage, &v, &bufs.rotation, n, scope)?;
+        }
+        Ok(())
+    })
+}
+
 /// The trunk's dense projection census (shapes and per-forward counts of
 /// `mi300x/beat/P/tilechain.cpp`, grouped as the dispatch groups them) at `n` rows through the
 /// real `project_weights` route, each shape cycling enough weight instances to exceed the 256 MiB
@@ -1223,6 +1244,11 @@ fn run() -> R<bool> {
         let hc_lane = bench_hc(&mut env, set, n, Scope::Lane(n), cli.iters)?;
         let hc_chunk = bench_hc(&mut env, set, n, Scope::Off, cli.iters)?;
         let dense = bench_dense(&mut env, n, cli.iters)?;
+        for (name, scope) in [("lane", Scope::Lane(n)), ("chunk", Scope::Off)] {
+            let reads = bench_stage(&mut env, set, n, scope, cli.iters, false)?;
+            let writes = bench_stage(&mut env, set, n, scope, cli.iters, true)?;
+            println!("BENCH-STAGE n={n} route={name} reads96_ms={reads:.3} writes96_ms={writes:.3}");
+        }
         println!(
             "BENCH n={n} iters={} weights={} hc_lane_scope_ms={hc_lane:.3} hc_chunk_route_ms={hc_chunk:.3} \
              dense_census_ms={dense:.3} (dense route per HIPFIRE_G942_BF16_WIDE / chain flags of this process)",
