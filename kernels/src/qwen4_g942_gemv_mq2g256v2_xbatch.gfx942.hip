@@ -31,6 +31,7 @@
 #include <hip/hip_fp16.h>
 
 #define MQ2X_ROWS_PER_SLOT 16
+#define MQ2X_ROWS_PER_ITER 2
 #define MQ2X_MAX_CHAIN_GROUPS 3
 
 // Tail-group sum: every product rounded, left-associated adds (no fma contraction).
@@ -68,8 +69,11 @@ static __device__ __forceinline__ void mq2_xbatch_body(
 ) {
     constexpr int G = QUADS * 4 + TAIL;
     constexpr int CG = (G + 3) / 4;  // groups of the longest chain
+    constexpr int RPI = MQ2X_ROWS_PER_ITER;
     static_assert(CG <= MQ2X_MAX_CHAIN_GROUPS, "K too wide for the register-resident x");
-    __shared__ float part[2][2][4][NB][32];  // [parity][slot][chain][row b][lane]
+    static_assert(MQ2X_ROWS_PER_SLOT % RPI == 0, "rows per slot must be a multiple of RPI");
+    // [parity][slot][row of the iteration][chain][row b][lane]
+    __shared__ float part[2][2][RPI][4][NB][32];
 
     const int tid = (int)threadIdx.x;
     const int slot = tid >> 7;
@@ -102,77 +106,86 @@ static __device__ __forceinline__ void mq2_xbatch_body(
     const int slot_row0 = ((int)blockIdx.x * 2 + slot) * MQ2X_ROWS_PER_SLOT;
     const int hdr_off = (p < 16) ? 0 : 4;
 
-    // Weight words of one row of this thread: header word and 16 code bits per group.
-    unsigned int hs[CG];
-    unsigned int pk[CG];
+    // Weight words of RPI rows of this thread: header word and 16 code bits per group.
+    unsigned int pre_hs[RPI][CG];
+    unsigned int pre_pk[RPI][CG];
+    auto load_rows = [&](int row0) {
 #pragma unroll
-    for (int i = 0; i < CG; ++i) { hs[i] = 0u; pk[i] = 0u; }
-    auto load_row = [&](int row) {
-        if (row < M) {
-            const char* rp = A + (long long)row * row_bytes;
+        for (int r = 0; r < RPI; ++r) {
+            const int row = row0 + r;
 #pragma unroll
             for (int i = 0; i < CG; ++i) {
                 const int g = c + 4 * i;
-                if (g < G) {
-                    hs[i] = *reinterpret_cast<const unsigned int*>(rp + g * 72 + hdr_off);
-                    pk[i] = *reinterpret_cast<const unsigned short*>(rp + g * 72 + 8 + p * 2);
-                } else {
-                    hs[i] = 0u;
-                    pk[i] = 0u;
+                pre_hs[r][i] = 0u;
+                pre_pk[r][i] = 0u;
+                if (row < M && g < G) {
+                    const char* rp = A + (long long)row * row_bytes + g * 72;
+                    pre_hs[r][i] = *reinterpret_cast<const unsigned int*>(rp + hdr_off);
+                    pre_pk[r][i] = *reinterpret_cast<const unsigned short*>(rp + 8 + p * 2);
                 }
             }
         }
     };
-    load_row(slot_row0);
+    load_rows(slot_row0);
 
-    for (int it = 0; it < MQ2X_ROWS_PER_SLOT; ++it) {
-        const int row = slot_row0 + it;
-        unsigned int cur_hs[CG];
-        unsigned int cur_pk[CG];
+    for (int it = 0; it < MQ2X_ROWS_PER_SLOT / RPI; ++it) {
+        const int row0 = slot_row0 + it * RPI;
+        unsigned int cur_hs[RPI][CG];
+        unsigned int cur_pk[RPI][CG];
 #pragma unroll
-        for (int i = 0; i < CG; ++i) { cur_hs[i] = hs[i]; cur_pk[i] = pk[i]; }
-        if (it + 1 < MQ2X_ROWS_PER_SLOT) load_row(row + 1);
+        for (int r = 0; r < RPI; ++r)
+#pragma unroll
+            for (int i = 0; i < CG; ++i) { cur_hs[r][i] = pre_hs[r][i]; cur_pk[r][i] = pre_pk[r][i]; }
+        if (it + 1 < MQ2X_ROWS_PER_SLOT / RPI) load_rows(row0 + RPI);
 
-        float acc[NB];
+        float (*pp)[RPI][4][NB][32] = part[it & 1];
 #pragma unroll
-        for (int b = 0; b < NB; ++b) acc[b] = 0.0f;
+        for (int r = 0; r < RPI; ++r) {
+            float acc[NB];
 #pragma unroll
-        for (int i = 0; i < CG; ++i) {
-            const int g = c + 4 * i;
-            if (g < G) {
-                const float sc = __half2float(__ushort_as_half((unsigned short)(cur_hs[i] & 0xFFFFu)));
-                const float zp = __half2float(__ushort_as_half((unsigned short)(cur_hs[i] >> 16)));
-                float t[8];
+            for (int b = 0; b < NB; ++b) acc[b] = 0.0f;
 #pragma unroll
-                for (int j = 0; j < 8; ++j)
-                    t[j] = __fmaf_rn(sc, (float)((cur_pk[i] >> (2 * j)) & 0x3u), zp);
-                const bool tail_group = (i >= QUADS);
+            for (int i = 0; i < CG; ++i) {
+                const int g = c + 4 * i;
+                if (g < G) {
+                    const float sc =
+                        __half2float(__ushort_as_half((unsigned short)(cur_hs[r][i] & 0xFFFFu)));
+                    const float zp =
+                        __half2float(__ushort_as_half((unsigned short)(cur_hs[r][i] >> 16)));
+                    float t[8];
 #pragma unroll
-                for (int b = 0; b < NB; ++b) {
-                    if (b < B) {
-                        const float s = tail_group ? mq2x_tail_sum(t, xr[i][b])
-                                                   : mq2x_main_sum(t, xr[i][b]);
-                        acc[b] = acc[b] + s;
+                    for (int j = 0; j < 8; ++j)
+                        t[j] = __fmaf_rn(sc, (float)((cur_pk[r][i] >> (2 * j)) & 0x3u), zp);
+                    const bool tail_group = (i >= QUADS);
+#pragma unroll
+                    for (int b = 0; b < NB; ++b) {
+                        if (b < B) {
+                            const float s = tail_group ? mq2x_tail_sum(t, xr[i][b])
+                                                       : mq2x_main_sum(t, xr[i][b]);
+                            acc[b] = acc[b] + s;
+                        }
                     }
                 }
             }
-        }
-
-        // Exchange the four chains and finish the row: (acc0 + acc1) + (acc2 + acc3), then the
-        // lane tree.
-        float (*pp)[4][NB][32] = part[it & 1];
 #pragma unroll
-        for (int b = 0; b < NB; ++b) pp[slot][c][b][p] = acc[b];
+            for (int b = 0; b < NB; ++b) pp[slot][r][c][b][p] = acc[b];
+        }
+        // Exchange the four chains and finish the rows: (acc0 + acc1) + (acc2 + acc3), then the
+        // lane tree.
         __syncthreads();
 #pragma unroll
-        for (int k = 0; k < NB / 4; ++k) {
-            const int b = (cl >> 5) + 4 * k;   // this half-wave reduces row b
-            float v = (pp[slot][0][b][p] + pp[slot][1][b][p]) +
-                      (pp[slot][2][b][p] + pp[slot][3][b][p]);
+        for (int r = 0; r < RPI; ++r) {
 #pragma unroll
-            for (int offset = 16; offset > 0; offset >>= 1)
-                v += __shfl_down(v, offset, 32);
-            if (p == 0 && row < M && b < B) y[(long long)b * M + row] = v;
+            for (int k = 0; k < NB / 4; ++k) {
+                const int b = (cl >> 5) + 4 * k;   // this half-wave reduces row b
+                float v = (pp[slot][r][0][b][p] + pp[slot][r][1][b][p]) +
+                          (pp[slot][r][2][b][p] + pp[slot][r][3][b][p]);
+#pragma unroll
+                for (int offset = 16; offset > 0; offset >>= 1)
+                    v += __shfl_down(v, offset, 32);
+                const int row = row0 + r;
+                if (p == 0 && row < M && b < B) y[(long long)b * M + row] = v;
+            }
         }
     }
 }
