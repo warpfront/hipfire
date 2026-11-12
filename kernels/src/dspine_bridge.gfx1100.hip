@@ -198,3 +198,99 @@ __global__ void dspine_finish_gfx1100(
     }
     x[idx] += rms[row] * delta[idx];
 }
+
+// ── serial refinement: fused score + greedy chain ────────────────────────
+// Grid: [n/T blocks, 1, 1]. Block: [256] (16 candidates × 16 sub-lanes).
+// Rows within a block are walked serially (each row sender = previous
+// row argmax). base/cand are the per-row head-logits top-K [n, K];
+// tsv_gate/tsv_val/tg are the load-time sender tables [V, R] f32;
+// query [n, R] f32 is the last-write stash query segment.
+// draft_ids [n] u32: the selected token id per row.
+extern "C" __launch_bounds__(256, 2)
+__global__ void dspine_serial_chain_gfx1100(
+    const float* __restrict__ base,
+    const unsigned int* __restrict__ cand,
+    const float* __restrict__ rms,
+    const float* __restrict__ query,
+    const float* __restrict__ tsv_gate,
+    const float* __restrict__ tsv_val,
+    const float* __restrict__ tg,
+    const float* __restrict__ gate_bias,
+    unsigned int anchor_sid,
+    unsigned int* __restrict__ draft_ids,
+    int K,
+    int R,
+    int T
+) {
+    const int block_idx = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int lane = tid / 16;      // candidate lane 0..15 (K <= 16)
+    const int sub = tid % 16;       // sub-lane within the candidate
+
+    __shared__ float s_sender[512];
+    __shared__ float s_part[16][16];
+    __shared__ float s_score[16];
+    __shared__ unsigned int s_sid;
+
+    if (tid == 0) {
+        s_sid = anchor_sid;
+    }
+    __syncthreads();
+
+    const int cand_sub_elems = R / 16;
+    for (int r = 0; r < T; ++r) {
+        const int row = block_idx * T + r;
+        // 1. sender contribution for this row: sigmoid(query + TSV_gate[sid]
+        //    + bias) * TSV_val[sid], R-wide (256 threads × 2 elements).
+        const unsigned int sid = s_sid;
+        if (tid < 256) {
+            #pragma unroll
+            for (int half = 0; half < 2; ++half) {
+                const int j = tid + half * 256;
+                if (j < R) {
+                    const long long s_off = (long long)sid * R;
+                    const float gate = 1.0f /
+                        (1.0f + expf(-(query[(long long)row * R + j]
+                                       + tsv_gate[s_off + j]
+                                       + gate_bias[j])));
+                    s_sender[j] = gate * tsv_val[s_off + j];
+                }
+            }
+        }
+        __syncthreads();
+        // 2. candidate score: sender · TG[cand] over R (16 sub-lanes each).
+        const unsigned int cid = cand[(long long)row * K + lane];
+        const long long tg_off = (long long)cid * R;
+        float part = 0.0f;
+        for (int j = sub * cand_sub_elems; j < (sub + 1) * cand_sub_elems; ++j) {
+            part += s_sender[j] * tg[tg_off + j];
+        }
+        s_part[lane][sub] = part;
+        __syncthreads();
+        // 3. reduce each candidate lane to a score (one thread per lane).
+        if (sub == 0 && lane < K) {
+            float s = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                s += s_part[lane][i];
+            }
+            s_score[lane] = base[(long long)row * K + lane] + rms[row] * s;
+        }
+        __syncthreads();
+        // 4. argmax over K candidates; advance the chain.
+        if (tid == 0) {
+            int best = 0;
+            float best_s = s_score[0];
+            for (int c = 1; c < K; ++c) {
+                if (s_score[c] > best_s) {
+                    best_s = s_score[c];
+                    best = c;
+                }
+            }
+            const unsigned int picked = cand[(long long)row * K + best];
+            s_sid = picked;
+            draft_ids[row] = picked;
+        }
+        __syncthreads();
+    }
+}

@@ -384,7 +384,76 @@ impl crate::dflash::DraftLayerBridge for DspineBridge {
 /// assertions (`test_kernels` oracles) and these unit tests. All accumulation
 /// is F32 exactly as the kernels will do it; BF16 rounding is applied by the
 /// caller where the kernel stores BF16.
-pub mod cpu_oracle {    /// Kernel 1 (`dspine_prepare_read`) stats half: RMS denominator of each
+pub mod cpu_oracle {
+    /// Serial refinement (): per block of  rows, walk
+    /// from the anchor sender id; each row scores its K candidates as
+    ///  (F32 accumulate over R), picks the argmax, and advances
+    ///  to the winning candidate token id. / are the
+    /// head-logits top-K of that row ([n, K] each); the three tables are
+    /// flat [V, R] f32 views of the load-time sender tables. Returns the
+    /// selected token id per row.
+    pub fn serial_chain(
+        base: &[f32],
+        cand: &[u32],
+        rms: &[f32],
+        query: &[f32],
+        tsv_gate: &[f32],
+        tsv_val: &[f32],
+        tg: &[f32],
+        gate_b: &[f32],
+        anchor_sid: u32,
+        n: usize,
+        k: usize,
+        r: usize,
+        t: usize,
+        v: usize,
+    ) -> Vec<u32> {
+        assert_eq!(base.len(), n * k);
+        assert_eq!(cand.len(), n * k);
+        assert_eq!(rms.len(), n);
+        assert_eq!(query.len(), n * r);
+        assert_eq!(gate_b.len(), r);
+        let mut sid = anchor_sid as usize;
+        let mut out = Vec::with_capacity(n);
+        for row in 0..n {
+            if row % t == 0 {
+                // Each draft block restarts its chain at the anchor: the
+                // block-first row sender is the anchor token (upstream
+                // semantic, mirrored by the kernel which initializes s_sid
+                // once per block workgroup).
+                sid = anchor_sid as usize;
+            }
+            assert!(sid < v, "sender id {sid} out of vocab");
+            let q = &query[row * r..(row + 1) * r];
+            let s_gate = &tsv_gate[sid * r..(sid + 1) * r];
+            let s_val = &tsv_val[sid * r..(sid + 1) * r];
+            let mut sender = vec![0.0f32; r];
+            for j in 0..r {
+                let gate = 1.0 / (1.0 + (-(q[j] + s_gate[j] + gate_b[j])).exp());
+                sender[j] = gate * s_val[j];
+            }
+            let mut best_c = 0usize;
+            let mut best_score = f32::NEG_INFINITY;
+            for c in 0..k {
+                let cand_id = cand[row * k + c] as usize;
+                assert!(cand_id < v);
+                let tg_row = &tg[cand_id * r..(cand_id + 1) * r];
+                let mut s = 0.0f32;
+                for j in 0..r {
+                    s += sender[j] * tg_row[j];
+                }
+                let score = base[row * k + c] + rms[row] * s;
+                if score > best_score {
+                    best_score = score;
+                    best_c = c;
+                }
+            }
+            sid = cand[row * k + best_c] as usize;
+            out.push(sid as u32);
+        }
+        out
+    }
+    /// Kernel 1 (`dspine_prepare_read`) stats half: RMS denominator of each
     /// row, F32 accumulate — the kernel stores this value so the finish stage
     /// can scale `delta` with it. `y = x / rms` defines `rms = sqrt(mean(x²)+eps)`.
     pub fn rms_rows(x: &[f32], h: usize, eps: f32) -> Vec<f32> {

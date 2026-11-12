@@ -241,4 +241,93 @@ impl Gpu {
             },
         )
     }
+
+    /// Fused serial-refinement chain (): one
+    /// workgroup per T-row block; rows walked serially from ,
+    /// each row scoring its K head-logit candidates against the sender
+    /// tables and advancing the chain to the argmax. / [n, K]
+    /// f32/u32;  [n, R] f32; the three tables [V, R] f32;
+    ///  [n] u32 out.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dspine_serial_chain(
+        &mut self,
+        base: &GpuTensor,
+        cand: &GpuTensor,
+        rms: &GpuTensor,
+        query: &GpuTensor,
+        tsv_gate: &GpuTensor,
+        tsv_val: &GpuTensor,
+        tg: &GpuTensor,
+        gate_bias: &GpuTensor,
+        anchor_sid: u32,
+        draft_ids: &GpuTensor,
+        n: usize,
+        k: usize,
+        r: usize,
+        t: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !self.arch_caps.is_gfx1100() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "dspine bridge kernels are gfx1100-only in v1",
+            ));
+        }
+        const SYM: &str = "dspine_serial_chain_gfx1100";
+        self.ensure_kernel(SYM, DSPINE_SRC, SYM)?;
+
+        let mut base_ptr = base.buf.as_ptr();
+        let mut cand_ptr = cand.buf.as_ptr();
+        let mut rms_ptr = rms.buf.as_ptr();
+        let mut q_ptr = query.buf.as_ptr();
+        let mut sgate_ptr = tsv_gate.buf.as_ptr();
+        let mut sval_ptr = tsv_val.buf.as_ptr();
+        let mut tg_ptr = tg.buf.as_ptr();
+        let mut gb_ptr = gate_bias.buf.as_ptr();
+        let mut anchor = anchor_sid;
+        let mut out_ptr = draft_ids.buf.as_ptr();
+        let mut k_val = k as i32;
+        let mut r_val = r as i32;
+        let mut t_val = t as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut base_ptr as *mut _ as *mut c_void,
+            &mut cand_ptr as *mut _ as *mut c_void,
+            &mut rms_ptr as *mut _ as *mut c_void,
+            &mut q_ptr as *mut _ as *mut c_void,
+            &mut sgate_ptr as *mut _ as *mut c_void,
+            &mut sval_ptr as *mut _ as *mut c_void,
+            &mut tg_ptr as *mut _ as *mut c_void,
+            &mut gb_ptr as *mut _ as *mut c_void,
+            &mut anchor as *mut _ as *mut c_void,
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut r_val as *mut _ as *mut c_void,
+            &mut t_val as *mut _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            SYM,
+            [(n / t) as u32, 1, 1],
+            [256, 1, 1],
+            512 * 4 + 16 * 16 * 4 + 16 * 4,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(base_ptr);
+                b.push_ptr(cand_ptr);
+                b.push_ptr(rms_ptr);
+                b.push_ptr(q_ptr);
+                b.push_ptr(sgate_ptr);
+                b.push_ptr(sval_ptr);
+                b.push_ptr(tg_ptr);
+                b.push_ptr(gb_ptr);
+                b.push_u32(anchor);
+                b.push_ptr(out_ptr);
+                b.push_i32(k_val);
+                b.push_i32(r_val);
+                b.push_i32(t_val);
+                b
+            },
+        )
+    }
 }
