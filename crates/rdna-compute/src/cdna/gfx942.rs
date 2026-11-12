@@ -483,6 +483,8 @@ const QWEN4_G942_CONV_FUSE_SRC: &str =
 pub const QWEN4_G942_CONV_FUSE_MODULE: &str = "qwen4_g942_conv_fuse";
 /// `hyper_norm_f32` with a second, BF16-bits output (`normalized_bf16`).
 pub const QWEN4_G942_HYPER_NORM_BF16X: &str = "qwen4_g942_hyper_norm_bf16x";
+/// `hyper_write_norm_f32` with a second, BF16-bits output of the read's `normalized` rows.
+pub const QWEN4_G942_HYPER_WRITE_NORM_BF16X: &str = "qwen4_g942_hyper_write_norm_bf16x";
 
 /// `HIPFIRE_QWEN4_G942_CONV_FUSE_IMAGE=/absolute/device.elf` (developer, read once): the explicitly
 /// supplied code object of [`QWEN4_G942_CONV_FUSE_MODULE`] (the Route-A twin proof: same module,
@@ -565,6 +567,100 @@ impl Gfx942Device<'_> {
         self.gpu.launch_blob_recorded(
             QWEN4_G942_HYPER_NORM_BF16X,
             [p.branches as u32, rows as u32, 1],
+            [256, 1, 1],
+            0,
+            args.as_mut_slice(),
+            crate::dispatch::ReplayLaunchBindings::NONE,
+        )
+    }
+}
+
+impl Gfx942Device<'_> {
+    /// [`crate::tensor_ops::hyper_write_norm`] that also stores the read's `normalized` rows as
+    /// BF16 bits into `normalized_bf16` (`[rows * 4 * 2560]` BF16): every other output is
+    /// bitwise `hyper_write_norm_f32`'s, and the BF16 rows are the bytes `convert_f32_to_bf16`
+    /// stages from `normalized` (the values are BF16-rounded). Entry
+    /// `qwen4_g942_hyper_write_norm_bf16x` of module `qwen4_g942_conv_fuse`, grid `[4, rows]`,
+    /// block 256; the same operand contract and refusals as `hyper_write_norm`.
+    pub fn hyper_write_norm_bf16x(
+        &mut self,
+        p: &crate::tensor_ops::HyperWrite<'_>,
+        norm_weight: &GpuTensor,
+        normalized: &GpuTensor,
+        normalized_bf16: &GpuTensor,
+        quarters_in: Option<&GpuTensor>,
+        next: Option<&crate::tensor_ops::HyperNextGates<'_>>,
+        clear: Option<&GpuTensor>,
+    ) -> HipResult<()> {
+        let refuse = |what: &str| {
+            Err(hip_bridge::HipError::new(
+                0,
+                &format!("hyper_write_norm_bf16x: {what}"),
+            ))
+        };
+        if [p.input, p.mixed, p.gates, p.output, normalized]
+            .iter()
+            .any(|t| t.dtype != DType::F32)
+        {
+            return refuse("F32 operand");
+        }
+        let Some(wide) = p.branches.checked_mul(p.hidden) else {
+            return refuse("extent overflow");
+        };
+        let rows = p.input.numel() / wide.max(1);
+        let quarters_ok = |q: &GpuTensor| q.dtype == DType::F32 && q.numel() == 16 * rows;
+        if p.state_bf16
+            || p.branches != 4
+            || p.hidden != 2560
+            || rows == 0
+            || rows > crate::prefill_invariant::WIDE_VERIFY_MAX_ROWS
+            || norm_weight.dtype != DType::BF16
+            || normalized_bf16.dtype != DType::BF16
+            || normalized_bf16.numel() < rows * wide
+            || p.input.numel() != rows * wide
+            || p.output.numel() != rows * wide
+            || normalized.numel() != rows * wide
+            || norm_weight.numel() != wide
+            || p.mixed.numel() != rows * p.hidden
+            || p.gates.numel() != rows * p.branches
+            || quarters_in.is_some_and(|q| !quarters_ok(q))
+            || clear.is_some_and(|c| c.dtype != DType::F32 || c.numel() > i32::MAX as usize)
+            || next.is_some_and(|n| {
+                !quarters_ok(n.quarters)
+                    || n.norm_weight.dtype != DType::BF16
+                    || n.norm_weight.numel() != wide
+                    || n.inject.dtype != DType::BF16
+                    || n.inject.numel() != 4 * wide
+            })
+        {
+            return refuse("shape");
+        }
+        g942_conv_fuse_ensure(self.gpu, QWEN4_G942_HYPER_WRITE_NORM_BF16X)?;
+        let null = std::ptr::null_mut();
+        let mut args = KernargBlob::new();
+        for ptr in [
+            p.input.buf.as_ptr(),
+            p.mixed.buf.as_ptr(),
+            p.gates.buf.as_ptr(),
+            quarters_in.map_or(null, |q| q.buf.as_ptr()),
+            p.output.buf.as_ptr(),
+            norm_weight.buf.as_ptr(),
+            normalized.buf.as_ptr(),
+            normalized_bf16.buf.as_ptr(),
+            next.map_or(null, |n| n.norm_weight.buf.as_ptr()),
+            next.map_or(null, |n| n.inject.buf.as_ptr()),
+            next.map_or(null, |n| n.quarters.buf.as_ptr()),
+            clear.map_or(null, |c| c.buf.as_ptr()),
+        ] {
+            args.push_ptr(ptr);
+        }
+        args.push_i32(clear.map_or(0, |c| c.numel() as i32));
+        args.push_i32(4);
+        args.push_i32(2560);
+        args.pad_to(16);
+        self.gpu.launch_blob_recorded(
+            QWEN4_G942_HYPER_WRITE_NORM_BF16X,
+            [4, rows as u32, 1],
             [256, 1, 1],
             0,
             args.as_mut_slice(),
@@ -3929,44 +4025,57 @@ mod tests {
         }
     }
 
-    /// The convert-fuse module's tensor_ops blocks are `tensor_ops.hip`'s text byte for byte once
-    /// the `// G12` additions are removed, and nothing else in it is code but the entry wrappers.
+    /// The convert-fuse module's blocks are `tensor_ops.hip`'s / `qwen4_gemv_bf16_xf32.hip`'s text
+    /// byte for byte once the `// G12` additions are removed (and the one renamed entry mapped
+    /// back), and nothing else in it is code but the entry wrappers.
     #[test]
     fn g942_conv_fuse_source_is_tensor_ops_verbatim() {
-        const BEGIN: &str = "// BEGIN verbatim tensor_ops.hip\n";
-        const END: &str = "// END verbatim tensor_ops.hip";
-        let production = crate::tensor_ops::TENSOR_OPS_SRC;
-        let src = super::QWEN4_G942_CONV_FUSE_SRC;
-        let mut blocks = 0;
+        let sources = [
+            ("tensor_ops.hip", crate::tensor_ops::TENSOR_OPS_SRC, 3usize),
+            (
+                "qwen4_gemv_bf16_xf32.hip",
+                crate::kernels::QWEN4_GEMV_BF16_XF32_SRC,
+                2usize,
+            ),
+        ];
         let mut g12_lines = 0;
-        let mut rest = src;
-        let mut outside = String::new();
-        while let Some(at) = rest.find(BEGIN) {
-            outside.push_str(&rest[..at]);
-            let body = &rest[at + BEGIN.len()..];
-            let end = body.find(END).expect("END marker after every BEGIN marker");
-            let block = body[..end].trim_end_matches('\n');
-            let stripped: Vec<&str> = block
-                .lines()
-                .filter(|line| {
-                    let g12 = line.trim_end().ends_with("// G12");
-                    g12_lines += usize::from(g12);
-                    !g12
-                })
-                .collect();
-            let stripped = stripped.join("\n");
-            assert!(
-                production.contains(&stripped),
-                "verbatim block {blocks} of qwen4_g942_conv_fuse.gfx942.hip is no longer a \
-                 substring of tensor_ops.hip: mirror the production edit\nblock starts: {:?}",
-                &stripped[..stripped.len().min(120)]
-            );
-            blocks += 1;
-            rest = &body[end + END.len()..];
+        let mut outside = super::QWEN4_G942_CONV_FUSE_SRC.to_string();
+        for (file, production, expected_blocks) in sources {
+            let begin = format!("// BEGIN verbatim {file}\n");
+            let end_marker = format!("// END verbatim {file}");
+            let mut blocks = 0;
+            while let Some(at) = outside.find(&begin) {
+                let body_start = at + begin.len();
+                let end = outside[body_start..]
+                    .find(&end_marker)
+                    .expect("END marker after every BEGIN marker");
+                let block = outside[body_start..body_start + end]
+                    .trim_end_matches('\n')
+                    .replace("qwen4_g942_hyper_write_norm_bf16x(", "hyper_write_norm_f32(");
+                let stripped: Vec<&str> = block
+                    .lines()
+                    .filter(|line| {
+                        let g12 = line.trim_end().ends_with("// G12");
+                        g12_lines += usize::from(g12);
+                        !g12
+                    })
+                    .collect();
+                let stripped = stripped.join("\n");
+                assert!(
+                    production.contains(&stripped),
+                    "verbatim block {blocks} of qwen4_g942_conv_fuse.gfx942.hip is no longer a \
+                     substring of {file}: mirror the production edit\nblock starts: {:?}",
+                    &stripped[..stripped.len().min(120)]
+                );
+                blocks += 1;
+                outside.replace_range(at..body_start + end + end_marker.len(), "");
+            }
+            assert_eq!(blocks, expected_blocks, "{file} blocks");
         }
-        outside.push_str(rest);
-        assert_eq!(blocks, 3, "bf16 helpers, HC stream helpers, hyper_norm_rows");
-        assert_eq!(g12_lines, 3, "the BF16 output parameter and its two store lines");
+        assert_eq!(
+            g12_lines, 6,
+            "the BF16 output parameter and two store lines of each of the two entries"
+        );
         // Outside the markers: comments, includes and the one entry wrapper.
         let code: Vec<&str> = outside
             .lines()
@@ -4004,9 +4113,9 @@ mod tests {
     fn g942_conv_fuse_anchor_and_source_are_pinned() {
         use sha2::{Digest, Sha256};
         const SOURCE_SHA256: &str =
-            "5a2349c57483ca4bb619ffa37512dc5ddd97697d077b90a0826773322cff9b61";
+            "f5b22c8d7f590a2e25511cc14d03f321a5072a13dbd617a6f68d1a17a275ca95";
         const ANCHOR_SHA256: &str =
-            "70dfa39676c2a3db8131b308293ce015a5dfa979c0173f8a4d25b1ac65410ba9";
+            "acf9d67b83b041cbb291c6df8379cc5b0d1c6c208fa5b13c763f3979b84a7c3a";
         let hex = |bytes: &[u8]| -> String {
             Sha256::digest(bytes)
                 .iter()
@@ -4017,12 +4126,14 @@ mod tests {
         let anchor: &[u8] =
             include_bytes!("../../../../kernels/qwen4_g942_conv_fuse_hipcc_gfx942.co");
         assert_eq!(hex(anchor), ANCHOR_SHA256);
-        assert!(
-            anchor
-                .windows(super::QWEN4_G942_HYPER_NORM_BF16X.len())
-                .any(|w| w == super::QWEN4_G942_HYPER_NORM_BF16X.as_bytes()),
-            "{} missing from the anchor",
-            super::QWEN4_G942_HYPER_NORM_BF16X
-        );
+        for name in [
+            super::QWEN4_G942_HYPER_NORM_BF16X,
+            super::QWEN4_G942_HYPER_WRITE_NORM_BF16X,
+        ] {
+            assert!(
+                anchor.windows(name.len()).any(|w| w == name.as_bytes()),
+                "{name} missing from the anchor"
+            );
+        }
     }
 }

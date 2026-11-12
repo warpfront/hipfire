@@ -1958,6 +1958,25 @@ fn execute_hyper_read_hc8_decode(
     ))
 }
 
+/// G12 input: whether the gfx942 wide-verify HC read stages its down projection's BF16 activation
+/// from the norm launch itself (rows > 16, BF16 down weight on the MFMA route, no calibration tap
+/// and no banded weight: the tap needs the F32 rows and a banded weight reads F32).
+fn g942_hc_down_stages_bf16(gpu: &Gpu, op: &HyperReadOp<'_>) -> bool {
+    gpu.arch_caps.is_gfx942()
+        && op.rows > 16
+        && gpu.active_capture.is_none()
+        && op.input_mix_down.dtype == DType::BF16
+        && g942_trunk_mfma_route(
+            true,
+            g942_trunk_gemv(),
+            op.rows,
+            DType::BF16,
+            DType::BF16,
+            DType::F32,
+        )
+        && !super::projection_split::is_split(gpu, &op.input_mix_down, op.rows)
+}
+
 /// `normalized_ready`: a preceding fused launch already wrote this read's
 /// single-row `normalized` (see [`execute_hyper_write_then_read`]).
 fn execute_hyper_read_inner(
@@ -1968,6 +1987,32 @@ fn execute_hyper_read_inner(
     paired: Option<&HyperWriteOp<'_>>,
     gates_written: &mut bool,
     prenormed: bool,
+) -> Result<(), DispatchError> {
+    execute_hyper_read_core(
+        gpu,
+        op,
+        normalized_ready,
+        rotate_into,
+        paired,
+        gates_written,
+        prenormed,
+        None,
+    )
+}
+
+/// [`execute_hyper_read_inner`] with `staged_norm`: the BF16 bits of the read's `normalized` rows
+/// a preceding fused launch (`qwen4_g942_hyper_write_norm_bf16x`, only when
+/// [`g942_hc_down_stages_bf16`] held) already stored in the shared activation scratch.
+#[allow(clippy::too_many_arguments)]
+fn execute_hyper_read_core(
+    gpu: &mut Gpu,
+    op: &HyperReadOp<'_>,
+    normalized_ready: bool,
+    rotate_into: Option<&GpuTensor>,
+    paired: Option<&HyperWriteOp<'_>>,
+    gates_written: &mut bool,
+    prenormed: bool,
+    staged_norm: Option<GpuTensor>,
 ) -> Result<(), DispatchError> {
     // The HC8 sidecar (`DType::HC8E4M3Row`, exact gfx1201): decode / verify rows read the E4M3
     // weights through the PeaceMaker `hc8_gemm`; prefill-class rows get exact BF16 operands.
@@ -2232,22 +2277,9 @@ fn execute_hyper_read_inner(
         // stores those bytes (the values are already BF16-rounded) next to the F32 rows, so the
         // staging launch drops out. The calibration tap needs the F32 rows and a banded down
         // weight reads F32.
-        let mut g942_norm_staged: Option<GpuTensor> = None;
+        let mut g942_norm_staged: Option<GpuTensor> = staged_norm;
         if !normalized_ready {
-            let staged_bf16 = gpu.arch_caps.is_gfx942()
-                && op.rows > 16
-                && gpu.active_capture.is_none()
-                && op.input_mix_down.dtype == DType::BF16
-                && g942_trunk_mfma_route(
-                    true,
-                    g942_trunk_gemv(),
-                    op.rows,
-                    DType::BF16,
-                    DType::BF16,
-                    DType::F32,
-                )
-                && !super::projection_split::is_split(gpu, &op.input_mix_down, op.rows);
-            if staged_bf16 {
+            if g942_hc_down_stages_bf16(gpu, op) {
                 let mut scratch = hip(gpu.qwen4_f16_x_scratch(op.rows * wide))?;
                 scratch.dtype = DType::BF16;
                 match gpu.try_gfx942() {
@@ -2916,26 +2948,67 @@ pub fn execute_hyper_write_then_read(
     if quarters_in.is_none() {
         hyper_write_gates(gpu, write, &input, &write_normalized, &gates)?;
     }
-    hip(hyper_write_norm(
-        gpu,
-        &HyperWrite {
-            input: &input,
-            normalized: &write_normalized,
-            mixed: &mixed,
-            gates: &gates,
-            output: &output,
-            branches: write.branches,
-            hidden: write.hidden,
-            state_bf16: false,
-        },
-        read.norm_weight,
-        &normalized,
-        quarters_in,
-        next_gates.as_ref(),
-        clear.as_ref(),
-    ))?;
+    let fused_write = HyperWrite {
+        input: &input,
+        normalized: &write_normalized,
+        mixed: &mixed,
+        gates: &gates,
+        output: &output,
+        branches: write.branches,
+        hidden: write.hidden,
+        state_bf16: false,
+    };
+    // Lane-wide pairs: the launch also stores the read's `normalized` rows as the BF16 bits its
+    // down projection reads (`qwen4_g942_hyper_write_norm_bf16x`), as the read's own norm does.
+    let mut staged_norm = None;
+    let stage = lane_wide && g942_hc_down_stages_bf16(gpu, read);
+    if stage {
+        let mut scratch = hip(gpu.qwen4_f16_x_scratch(rows * wide))?;
+        scratch.dtype = DType::BF16;
+        match gpu.try_gfx942() {
+            Some(mut device) => hip(device.hyper_write_norm_bf16x(
+                &fused_write,
+                read.norm_weight,
+                &normalized,
+                &scratch,
+                quarters_in,
+                next_gates.as_ref(),
+                clear.as_ref(),
+            ))?,
+            None => hip(hyper_write_norm(
+                gpu,
+                &fused_write,
+                read.norm_weight,
+                &normalized,
+                quarters_in,
+                next_gates.as_ref(),
+                clear.as_ref(),
+            ))?,
+        }
+        staged_norm = Some(scratch);
+    } else {
+        hip(hyper_write_norm(
+            gpu,
+            &fused_write,
+            read.norm_weight,
+            &normalized,
+            quarters_in,
+            next_gates.as_ref(),
+            clear.as_ref(),
+        ))?;
+    }
+    // A lane-wide read rotates nothing ahead: the BF16 trunk weights read `mixed` as it is.
     let rotate_into = rotate_into.filter(|_| !lane_wide);
-    execute_hyper_read_inner(gpu, read, true, rotate_into, None, &mut false, false)?;
+    execute_hyper_read_core(
+        gpu,
+        read,
+        true,
+        rotate_into,
+        None,
+        &mut false,
+        false,
+        staged_norm,
+    )?;
     Ok(Some(next_gates.is_some()))
 }
 
