@@ -1157,6 +1157,17 @@ pub const DECISIONS: &[Decision] = &[
         reaches: &[],
     },
     Decision {
+        id: "dflash-gfx1100-snapshot-overlap",
+        predicates: &[IsRecording, G0Observing, CaptureMode],
+        condition: "spec_step_dflash_with_railgun: exact gfx1100 dense B16 H5120/V248320, selector R256/K16 and MQ4V2 target head, full context, no admitted PM4, phase profiling, recording/G0/capture or FP8/IU4 scope",
+        effect: LaunchMechanism,
+        switches: "eager: enqueue the existing bulk DN save after the incumbent stream-ordered readback, overlap CPU scoring and drain before lookup/verify; otherwise retain the incumbent synchronous save",
+        kernels: &[],
+        verdict: Invariant,
+        evidence: "host-only scheduling of the same bulk copy, with the same arguments and unchanged live target state before verify; no new kernel or arithmetic. Stale/disabled tables keep the synchronous save. Failed enqueue/scoring paths drain before returning; no error-path trace equivalence is asserted. Exact gfx1100 is unreachable from the gfx1201 DFlash default",
+        reaches: &[],
+    },
+    Decision {
         id: "ds4-gfx942-compressor-sentinel-gate",
         predicates: &[CaptureMode],
         condition: "DS4 compressor host gate: gfx942 && !capture_mode && (pos + 1) % ratio != 0 skips the compressor (forward.rs compressor_op)",
@@ -2793,6 +2804,12 @@ pub const SITES: &[Site] = &[
         function: "gemm_dispatch_shared",
         occurrences: 2,
         decisions: &["dflash-gfx1100-shared-rotation"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/speculative.rs",
+        function: "spec_step_dflash_with_railgun",
+        occurrences: 3,
+        decisions: &["dflash-gfx1100-snapshot-overlap"],
     },
     Site {
         file: "hipfire-runtime/src/dflash/lanes.rs",

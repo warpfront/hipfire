@@ -119,6 +119,7 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 
 | Variable | Default / sense | Notes |
 |---|---|---|
+| `HIPFIRE_GFX1100_DFLASH_SNAPSHOT_OVERLAP` | **on** for exact gfx1100; `0` opts out | `kernel.gfx1100_dflash_snapshot_overlap`. Validated dense Qwen3.8 B16 greedy selector only (H5120/V248320, R256/K16, MQ4V2 target head, full context). Queue the existing bulk DeltaNet save after beta's unchanged stream-ordered selector readback, overlap CPU scoring, then drain before lookup/verify or error return. Stale/disabled bulk tables retain synchronous save. Recording/G0/capture, admitted PM4, phase diagnostics and FP8/IU4 verify scopes retain the incumbent; other architectures are not admitted. No new GPU buffers and no readback-policy change. |
 | `HIPFIRE_SPECULATION` | `off`/`auto`/`ngram`/`dflash`/`mtp`/`dspark` | Canonical selector |
 | `HIPFIRE_DFLASH_DRAFT` | explicit draft path (overrides the registry sidecar); empty opts out | Legacy `developer.dflash_draft` read; still appears in legacy gate scripts. |
 | `HIPFIRE_VISION_SIDECAR` | explicit vision-tower sidecar path (overrides `params.vision`); empty opts out | Daemon load; validated at admission (arch 5\|6 + tower tensor), loaded by the Qwen35 carrier |
@@ -1232,7 +1233,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 2093
+**Count:** 2094
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -1963,6 +1964,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_GFX1100_DENSE_GATE_UP_QUAD_PREFETCH` | crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_GFX1100_DENSE_GATE_UP_SETPRIO` | crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_GFX1100_DENSE_GATE_UP_STAGE_X32` | crates/rdna-compute/src/gemm.rs | developer |
+| `HIPFIRE_GFX1100_DFLASH_SNAPSHOT_OVERLAP` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | stable |
 | `HIPFIRE_GFX1100_DRAFT_VOCAB` | crates/hipfire-arch-qwen35/src/draft_vocab.rs, crates/hipfire-loader/src/lib.rs | developer |
 | `HIPFIRE_GFX1100_FA2_R3` | crates/rdna-compute/src/attention.rs | developer |
 | `HIPFIRE_GFX1100_FA2_SPLIT_VERIFY` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | stable |

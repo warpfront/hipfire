@@ -1903,6 +1903,16 @@ impl DeltaNetSnapshot {
         Ok(())
     }
 
+    /// Queue only the validated bulk save; false retains the synchronous fallback.
+    /// The caller must drain the active stream even when the launch returns an error.
+    fn enqueue_bulk_save(&mut self, state: &DeltaNetState, gpu: &mut Gpu) -> HipResult<bool> {
+        let Some((table, n)) = self.bulk_table(state, gpu, true) else {
+            return Ok(false);
+        };
+        gpu.dflash_state_bulk_copy_gfx1100(table.as_ptr() as *const _, n)?;
+        Ok(true)
+    }
+
     /// Async copy live state → backup on `stream`.
     ///
     /// Caller owns cross-stream ordering. MTP trunk-spine uses this as an
@@ -7933,6 +7943,25 @@ pub(crate) fn draft_lmhead_batched(
     Ok(())
 }
 
+fn dflash_snapshot_overlap_shape(
+    arch: &str,
+    experts: usize,
+    b: usize,
+    h: usize,
+    vocab: usize,
+) -> bool {
+    arch == "gfx1100" && experts == 0 && b == 16 && h == 5120 && vocab == 248320
+}
+
+/// (drain submitted work, skip the later synchronous save).
+fn dflash_snapshot_enqueue_state(overlap: bool, result: Result<bool, ()>) -> (bool, bool) {
+    match (overlap, result) {
+        (true, Ok(true)) => (true, true),
+        (true, Err(())) => (true, false),
+        _ => (false, false),
+    }
+}
+
 /// Greedy rank-local draft production: the forward prefix above plus the
 /// temp==0 LM-head leaves (batched GEMM + selector-device / GPU argmax, or
 /// the non-batched selector-host / per-row argmax fallbacks). Returns
@@ -7956,6 +7985,43 @@ pub fn draft_dflash_block_rank(
     draft_ffn_graph: bool,
     seed_token: u32,
     vocab: usize,
+) -> HipResult<Vec<u32>> {
+    draft_dflash_block_rank_ready(
+        gpu,
+        target_weights,
+        draft_weights,
+        draft_cfg,
+        draft_scratch,
+        verify_scratch,
+        target_hidden_host,
+        block,
+        position,
+        compact_offset,
+        ctx_slice,
+        draft_ffn_graph,
+        seed_token,
+        vocab,
+        &mut |_| Ok(()),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draft_dflash_block_rank_ready(
+    gpu: &mut Gpu,
+    target_weights: &Qwen35Weights,
+    draft_weights: &DflashWeights,
+    draft_cfg: &DflashConfig,
+    draft_scratch: &mut DflashScratch,
+    verify_scratch: &VerifyScratch,
+    target_hidden_host: &[f32],
+    block: &[u32],
+    position: usize,
+    compact_offset: i32,
+    ctx_slice: Option<usize>,
+    draft_ffn_graph: bool,
+    seed_token: u32,
+    vocab: usize,
+    ready: &mut impl FnMut(&mut Gpu) -> HipResult<()>,
 ) -> HipResult<Vec<u32>> {
     let b = block.len();
     let h = draft_cfg.hidden;
@@ -8010,7 +8076,7 @@ pub fn draft_dflash_block_rank(
             h,
         )?;
         if selector_mode {
-            let proposal = dflash::propose_candidates_device(
+            let proposal = dflash::propose_candidates_device_penalized_with_ready(
                 gpu,
                 draft_weights,
                 draft_scratch,
@@ -8020,6 +8086,8 @@ pub fn draft_dflash_block_rank(
                 seed_token,
                 0.0,
                 None,
+                None,
+                ready,
             )?;
             apply_dflash2_selector_proposal(
                 &proposal,
@@ -9172,6 +9240,7 @@ pub fn spec_step_dflash_with_railgun(
     // Selector / PLD q rows in the sparse FAST_SAMPLE representation; `None`
     // keeps the dense `draft_softmaxes` rows.
     let mut q_receipt: Option<DflashSampledDraft> = None;
+    let mut snapshot_ready = false;
     let use_temp_sampling = temp > 0.0;
     let rp_active = repeat_penalty > 1.0 && !use_temp_sampling;
     // HIPFIRE_DFLASH_NGRAM_BLOCK=1: apply llama::apply_ngram_block to every
@@ -9421,7 +9490,23 @@ pub fn spec_step_dflash_with_railgun(
     } else if !use_temp_sampling && !host_path_active {
         // Greedy fast path shared verbatim with the dense-TP mesh ranks
         // (byte-identical draft production through draft_dflash_block_rank).
-        drafted = draft_dflash_block_rank(
+        let overlap = gpu.flags.gfx1100_dflash_snapshot_overlap
+            && gpu.arch_caps.is_gfx1100()
+            && dflash_snapshot_overlap_shape(&gpu.arch, target.config.num_experts, b, h, vocab)
+            && selector_mode
+            && draft_weights.selector_rank.unwrap_or(256) == 256
+            && draft_weights.selector_top_k.unwrap_or(16) == 16
+            && target.weights.output.gpu_dtype == DType::MQ4G256V2
+            && ctx_slice.is_none()
+            && verify_pm4.as_deref().is_none_or(|route| !route.admitted())
+            && !phase_on
+            && !gpu.replay.is_recording()
+            && !gpu.replay.is_g0_observing()
+            && !gpu.graphs.capture_mode
+            && !gpu.fp8_verify_scope
+            && !gpu.iu4_verify_scope;
+        let mut drain_snapshot = false;
+        let result = draft_dflash_block_rank_ready(
             gpu,
             &target.weights,
             draft_weights,
@@ -9436,7 +9521,29 @@ pub fn spec_step_dflash_with_railgun(
             draft_ffn_graph,
             seed_token,
             vocab,
-        )?;
+            &mut |gpu| {
+                if overlap {
+                    let result = target_snap.enqueue_bulk_save(&target.dn_state, gpu);
+                    (drain_snapshot, snapshot_ready) = dflash_snapshot_enqueue_state(
+                        overlap,
+                        result.as_ref().map(|queued| *queued).map_err(|_| ()),
+                    );
+                    result?;
+                }
+                Ok(())
+            },
+        );
+        if drain_snapshot {
+            DeltaNetSnapshot::bulk_sync(gpu)?;
+            gpu.take_device_wait_error()?;
+        }
+        drafted = result?;
+        if snapshot_ready {
+            static ACTIVE: std::sync::Once = std::sync::Once::new();
+            ACTIVE.call_once(|| {
+                eprintln!("DFlash: gfx1100 snapshot/scoring overlap active (B16 bulk save)")
+            });
+        }
     } else {
         // Sampled / host-shaped (RP, n-gram-block, logit-dump) path: shared
         // forward prefix, per-row head selection below.
@@ -9944,7 +10051,7 @@ pub fn spec_step_dflash_with_railgun(
     // per-LA-layer (q, k, v, α, β) innovation tape so the rollback can
     // replay just the GDN recurrence for `accept+1` steps without
     // re-running the target.
-    if railgun_verify.is_none() {
+    if railgun_verify.is_none() && !snapshot_ready {
         target_snap.save_from(&target.dn_state, gpu)?;
     }
     // Mutable variable to allow both verify capture + rollback replay usage.
@@ -14492,6 +14599,95 @@ mod sparse_target_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dflash_snapshot_overlap_admits_only_measured_shape() {
+        assert!(dflash_snapshot_overlap_shape(
+            "gfx1100", 0, 16, 5120, 248320
+        ));
+        for arch in ["gfx1101", "gfx1151", "gfx1201", "gfx1100:xnack-"] {
+            assert!(!dflash_snapshot_overlap_shape(arch, 0, 16, 5120, 248320));
+        }
+        for (experts, b, h, vocab) in [
+            (128, 16, 5120, 248320),
+            (0, 8, 5120, 248320),
+            (0, 16, 4096, 248320),
+            (0, 16, 5120, 151936),
+        ] {
+            assert!(!dflash_snapshot_overlap_shape(
+                "gfx1100", experts, b, h, vocab
+            ));
+        }
+    }
+
+    #[test]
+    fn dflash_snapshot_overlap_enqueue_decision_covers_fallback_and_errors() {
+        for result in [Ok(false), Ok(true), Err(())] {
+            assert_eq!(dflash_snapshot_enqueue_state(false, result), (false, false));
+        }
+        assert_eq!(
+            dflash_snapshot_enqueue_state(true, Ok(false)),
+            (false, false)
+        );
+        assert_eq!(dflash_snapshot_enqueue_state(true, Ok(true)), (true, true));
+        assert_eq!(dflash_snapshot_enqueue_state(true, Err(())), (true, false));
+    }
+
+    #[test]
+    #[ignore = "requires an idle gfx1100/gfx1151/gfx1201 GPU; bulk snapshot byte oracle"]
+    fn dflash_snapshot_overlap_bulk_copy_is_exact() {
+        let mut gpu = Gpu::init().unwrap();
+        gpu.active_stream = Some(gpu.hip.stream_create().unwrap());
+        std::sync::Arc::make_mut(&mut gpu.flags).dn_snapshot_bulk_off = false;
+        assert!(DeltaNetSnapshot::bulk_arch(&gpu));
+        let mut state = tiny_dn_with_ef(&mut gpu);
+        for (family, tensor) in state
+            .s_matrices
+            .iter()
+            .chain(&state.s_scales)
+            .chain(&state.conv_states)
+            .chain(&state.s_ef_residual)
+            .enumerate()
+        {
+            let bytes: Vec<_> = (0..tensor.buf.size())
+                .map(|i| ((i * 13 + family * 71) % 251) as u8)
+                .collect();
+            gpu.hip.memcpy_htod(&tensor.buf, &bytes).unwrap();
+        }
+        let mut reference = DeltaNetSnapshot::new_for(&mut gpu, &state).unwrap();
+        let mut candidate = DeltaNetSnapshot::new_for(&mut gpu, &state).unwrap();
+        reference.save_from(&state, &mut gpu).unwrap();
+        assert!(candidate.enqueue_bulk_save(&state, &mut gpu).unwrap());
+        DeltaNetSnapshot::bulk_sync(&gpu).unwrap();
+        fn read(gpu: &Gpu, snapshot: &DeltaNetSnapshot) -> Vec<Vec<u8>> {
+            snapshot
+                .s_matrix_bufs
+                .iter()
+                .chain(&snapshot.s_scale_bufs)
+                .chain(&snapshot.conv_state_bufs)
+                .chain(&snapshot.s_ef_residual_bufs)
+                .map(|buffer| {
+                    let mut bytes = vec![0; buffer.size()];
+                    gpu.hip.memcpy_dtoh(&mut bytes, buffer).unwrap();
+                    bytes
+                })
+                .collect()
+        }
+        let expected = read(&gpu, &reference);
+        assert_eq!(read(&gpu, &candidate), expected);
+        let mut other = tiny_dn_with_ef(&mut gpu);
+        assert!(!candidate.enqueue_bulk_save(&other, &mut gpu).unwrap());
+        assert_eq!(read(&gpu, &candidate), expected);
+        candidate.save_from(&other, &mut gpu).unwrap();
+        reference.save_from(&other, &mut gpu).unwrap();
+        assert_eq!(read(&gpu, &candidate), read(&gpu, &reference));
+        std::sync::Arc::make_mut(&mut gpu.flags).dn_snapshot_bulk_off = true;
+        assert!(!candidate.enqueue_bulk_save(&state, &mut gpu).unwrap());
+        reference.free_gpu(&mut gpu);
+        candidate.free_gpu(&mut gpu);
+        state.free_gpu(&mut gpu);
+        other.free_gpu(&mut gpu);
+    }
 
     #[test]
     fn two_slot_alternating_keys_hit_after_two_misses() {

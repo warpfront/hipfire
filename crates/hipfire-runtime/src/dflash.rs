@@ -5938,6 +5938,37 @@ pub fn propose_candidates_device_penalized(
     uniforms: Option<&[f32]>,
     penalty: Option<&mut SelectorPenalty<'_>>,
 ) -> HipResult<DflashCandidateProposal> {
+    propose_candidates_device_penalized_with_ready(
+        gpu,
+        weights,
+        scratch,
+        hidden,
+        logits,
+        rows,
+        anchor,
+        temperature,
+        uniforms,
+        penalty,
+        &mut |_| Ok(()),
+    )
+}
+
+/// The existing penalized selector with a post-readback, pre-scoring hook.
+/// A caller enqueueing work here owns completion, including on scoring errors.
+#[allow(clippy::too_many_arguments)]
+pub fn propose_candidates_device_penalized_with_ready(
+    gpu: &mut Gpu,
+    weights: &DflashWeights,
+    scratch: &DflashScratch,
+    hidden: &GpuTensor,
+    logits: &GpuTensor,
+    rows: usize,
+    anchor: u32,
+    temperature: f32,
+    uniforms: Option<&[f32]>,
+    penalty: Option<&mut SelectorPenalty<'_>>,
+    ready: &mut impl FnMut(&mut Gpu) -> HipResult<()>,
+) -> HipResult<DflashCandidateProposal> {
     if rows == 0 {
         return Err(hip_bridge::HipError::new(0, "rows must be >0"));
     }
@@ -5987,6 +6018,7 @@ pub fn propose_candidates_device_penalized(
         (&ids_slice.buf, &mut ids_bytes[..]),
         (&vals_slice.buf, &mut vals_bytes[..]),
     ])?;
+    ready(gpu)?;
     let (top_ids, top_vals) = decode_top(&ids_bytes, &vals_bytes);
     propose_candidates_from_rows_penalized(
         weights,
