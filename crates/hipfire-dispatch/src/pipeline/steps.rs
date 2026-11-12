@@ -1100,7 +1100,7 @@ fn execute_window<'a>(
         // group's steps are announced here, once each in program order, after
         // every refusal check and before the grouped launch; a refused group
         // announced nothing and each step is announced by the plain path below.
-        // Exact gfx942 (`HIPFIRE_QWEN4_GDN_LANES`, default off) also groups one-row F32
+        // Exact gfx942 also groups one-row F32
         // Core steps, up to `QWEN4_GDN_LANES_F32_MAX` of them (`pipeline/gdn.rs`).
         let core_lane = |gpu: &Gpu, op: &crate::pipeline::layer_ops::GatedDeltaNetOp<'_>| {
             crate::pipeline::layer_ops::gdn_core_lane_groupable(gpu, op)
@@ -1136,7 +1136,7 @@ fn execute_window<'a>(
         }
         // fn-lanes: consecutive QSA Core steps of one layer (one per AR lane,
         // 1..=8 rows each) run as one multi-lane launch per kernel (prologue,
-        // pool, select, attention) under `HIPFIRE_QWEN4_QSA_LANES`; announced
+        // pool, select, attention) where the arch admits them; announced
         // and refused exactly like the GDN group above.
         if let Step::IndexedAttention(first) = &steps[i] {
             if first.phase == MixerPhase::Core

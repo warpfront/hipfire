@@ -20,8 +20,9 @@
 //! one ascending-K walk of its own activation row, `gemm_bf16_mfma_gfx942_rows16[_chain]`), and
 //! the FP8 grouped expert route runs the same kernels at every row count.
 //!
-//! The kill switch [`WAVE_ENV`] `=0` restores today's behaviour exactly: every lane tile is its
-//! own serial singleton chunk (no wave, no burst wait).
+//! The wave is not switchable: it is the exact gfx942 single-device route (resolved by the
+//! arch capability and the lane store's receipt), and a lone first arrival of a burst waits
+//! [`BURST_GAP`] for a peer.
 
 use crate::bundle::Qwen4Bundle;
 use crate::lane_exec::PrefillPart;
@@ -29,67 +30,27 @@ use rdna_compute::Gpu;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-/// `HIPFIRE_G942_LANE_PREFILL_WAVE` (developer, read once; default on, exact `0` is the kill
-/// switch): exact gfx942 single-device lane prefill tiles of a step run as joint waves, and a
-/// lone first arrival of a burst waits [`BURST_GAP_ENV`] for a peer instead of starting as an
-/// AR singleton.
-pub const WAVE_ENV: &str = "HIPFIRE_G942_LANE_PREFILL_WAVE";
-
-/// `HIPFIRE_G942_BURST_GAP_MS` (developer; default [`DEFAULT_BURST_GAP_MS`], `0` no wait): how
-/// long, at most, a batch-eligible request that finds the daemon idle waits for a second
+/// How long, at most, a batch-eligible request that finds the daemon idle waits for a second
 /// batched request before it takes the AR singleton route (the burst's first request would
 /// otherwise prefill alone and be promoted afterwards). The wait ends the moment a peer is
-/// queued.
-pub const BURST_GAP_ENV: &str = "HIPFIRE_G942_BURST_GAP_MS";
-
-/// Default of [`BURST_GAP_ENV`].
-pub const DEFAULT_BURST_GAP_MS: u64 = 4;
+/// queued. A fixed constant: G12's single admission-coalescing rule replaces it.
+pub const BURST_GAP: Duration = Duration::from_millis(4);
 
 /// The oracle run that evidences the wave (`fn_lane_oracle --wave-prefill`, k = 8 / 32 / 64,
 /// contexts 57 / 512 / 2048): cited by the wave's log line.
 pub const WAVE_RECEIPT: &str =
     "g0 mi300x/beat/P/p2 2026-11-10 gfx942 stock-fp8 single, lane prefill wave vs singleton";
 
-/// [`WAVE_ENV`] parsed: on unless exactly `0`.
-fn wave_from(value: Option<&str>) -> bool {
-    value.is_none_or(|v| v.trim() != "0")
-}
-
-/// [`BURST_GAP_ENV`] parsed: unset or unparsable is the default, `0` is no wait.
-fn burst_gap_from(value: Option<&str>) -> Option<Duration> {
-    let ms = value
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(DEFAULT_BURST_GAP_MS);
-    (ms > 0).then(|| Duration::from_millis(ms))
-}
-
-/// The wave switch, read once per process.
-pub fn wave_enabled() -> bool {
-    static WAVE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        wave_from(hipfire_config::developer_var(WAVE_ENV).ok().as_deref())
-    });
-    *WAVE
-}
-
-/// The burst wait of a lone arrival (`None`: no wait), read once per process.
-pub fn burst_gap() -> Option<Duration> {
-    static GAP: std::sync::LazyLock<Option<Duration>> = std::sync::LazyLock::new(|| {
-        burst_gap_from(hipfire_config::developer_var(BURST_GAP_ENV).ok().as_deref())
-    });
-    *GAP
-}
-
-/// The lane prefill wave applies to this forward: the switch is on, the device is exactly
-/// `gfx942` and the bundle is the single-device root (no PP mesh, no EP).
+/// The lane prefill wave applies to this forward: the device is exactly `gfx942` and the bundle
+/// is the single-device root (no PP mesh, no EP).
 pub(crate) fn wave_applies(gpu: &Gpu, bundle: &Qwen4Bundle) -> bool {
-    wave_enabled() && gpu.arch == "gfx942" && bundle.lane_topology() == "single"
+    gpu.arch_caps.is_gfx942() && bundle.lane_topology() == "single"
 }
 
 /// Serve admission (no device at hand): the staged store is the gfx942 single-device stock-FP8
-/// lane store (its stage policy resolved under that proof) and the switch is on.
+/// lane store (its stage policy resolved under that proof).
 pub fn serve_armed(bundle: &Qwen4Bundle) -> bool {
-    wave_enabled()
-        && bundle.lane_topology() == "single"
+    bundle.lane_topology() == "single"
         && bundle.lanes().is_some_and(|store| {
             store
                 .evidence()
@@ -156,8 +117,8 @@ pub(crate) fn note_wave(device: i32, lanes: usize, rows: usize) {
     WAVE_ROWS.fetch_add(rows as u64, Ordering::Relaxed);
     if nth == 1 {
         eprintln!(
-            "[g942-wave] lane prefill waves on ({WAVE_ENV}=0 kills; burst wait {} ms): proofs {WAVE_RECEIPT}",
-            burst_gap().map_or(0, |gap| gap.as_millis())
+            "[g942-wave] lane prefill waves on (burst wait {} ms): proofs {WAVE_RECEIPT}",
+            BURST_GAP.as_millis()
         );
     }
     eprintln!("[g942-wave] dev={device} wave={nth} lanes={lanes} rows={rows}");
@@ -169,30 +130,6 @@ mod tests {
 
     fn serial(range: std::ops::Range<usize>) -> Vec<PrefillPart> {
         range.map(PrefillPart::Serial).collect()
-    }
-
-    #[test]
-    fn the_switch_is_on_unless_exactly_zero() {
-        assert!(wave_from(None));
-        assert!(wave_from(Some("1")));
-        assert!(wave_from(Some("")));
-        assert!(wave_from(Some("off")));
-        assert!(!wave_from(Some("0")));
-        assert!(!wave_from(Some(" 0 ")));
-    }
-
-    #[test]
-    fn the_burst_gap_defaults_and_zero_kills_it() {
-        assert_eq!(
-            burst_gap_from(None),
-            Some(Duration::from_millis(DEFAULT_BURST_GAP_MS))
-        );
-        assert_eq!(
-            burst_gap_from(Some("x")),
-            Some(Duration::from_millis(DEFAULT_BURST_GAP_MS))
-        );
-        assert_eq!(burst_gap_from(Some("7")), Some(Duration::from_millis(7)));
-        assert_eq!(burst_gap_from(Some("0")), None);
     }
 
     #[test]

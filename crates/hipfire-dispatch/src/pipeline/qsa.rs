@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Björn Bösel
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Exact-gfx942 batched QSA decode Core for lane steps (`HIPFIRE_QWEN4_QSA_LANES`).
+//! Exact-gfx942 batched QSA decode Core for lane steps.
 //!
 //! On gfx942 a lane's QSA Core is five launches per layer (decode prologue, incremental
 //! pool, row-8 scores, select-from-scores with the persistent mirror, per-head attention;

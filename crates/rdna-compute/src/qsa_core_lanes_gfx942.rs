@@ -2,7 +2,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Admission of the batched QSA decode core on exact gfx942
-//! (`HIPFIRE_QWEN4_QSA_LANES`, kernels `qwen4_qsa_lanes_*_gfx942`, launcher
+//! (kernels `qwen4_qsa_lanes_*_gfx942`, launcher
 //! [`crate::cdna::gfx942::Gfx942Device::qwen4_qsa_lanes_core`]).
 //!
 //! A child module of `tensor_ops` like `qsa_core_lanes` (the gfx1201 twin), so the admission
@@ -43,7 +43,7 @@ const SCORE_SCRATCH_MAX_BYTES: usize = 512 << 20;
 /// single lane.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct QsaLanesGfx942Facts {
-    /// `HIPFIRE_QWEN4_QSA_LANES` on an exact gfx942.
+    /// The device is an exact gfx942.
     pub enabled: bool,
     pub recording: bool,
     pub capture: bool,
@@ -67,7 +67,7 @@ pub(crate) fn qsa_lanes_gfx942_gpu_refusal(
     } else if lanes > QWEN4_QSA_LANES_MAX {
         Some("more lanes than the lane kernels hold")
     } else if !f.enabled {
-        Some("HIPFIRE_QWEN4_QSA_LANES is off or the arch is not exact gfx942")
+        Some("the arch is not exact gfx942")
     } else if f.recording {
         Some("a replay tape is recording")
     } else if f.capture {
@@ -84,8 +84,7 @@ pub(crate) fn qsa_lanes_gfx942_gpu_refusal(
 /// Admission of the per-lane QSA Core launches of 2..=[`QWEN4_QSA_LANES_MAX`] lanes as five
 /// launches (see [`Qwen4QsaLanesPlan`] and `Gfx942Device::qwen4_qsa_lanes_core`).
 ///
-/// Refuses (`Ok(None)`: nothing launched, run the lanes one by one) unless the flag is on
-/// (`HIPFIRE_QWEN4_QSA_LANES`, exact gfx942, default off), no replay tape is recording and no
+/// Refuses (`Ok(None)`: nothing launched, run the lanes one by one) unless the arch is exact gfx942, no replay tape is recording and no
 /// hipGraph capture is open, and every lane is an F32 or FNUZ-fp8 Full decode / verify
 /// window of 1..=8 rows that completes at least one pooled block and whose per-lane launches
 /// would be: the one-launch prologue, the incremental pool, the live rows-8 score /
@@ -109,7 +108,7 @@ pub fn qsa_core_lanes_gfx942_min(
     min_lanes: usize,
 ) -> HipResult<Option<Qwen4QsaLanesPlan>> {
     let facts = QsaLanesGfx942Facts {
-        enabled: gpu.flags.qwen4_qsa_lanes_enabled() && gpu.arch_caps.is_gfx942(),
+        enabled: gpu.arch_caps.is_gfx942(),
         recording: gpu.replay.is_recording(),
         capture: gpu.graphs.capture_mode,
         extent_check: gpu.flags.qwen4_qsa_extent_check,

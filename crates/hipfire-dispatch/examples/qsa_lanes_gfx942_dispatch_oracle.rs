@@ -3,7 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Dispatch oracle of the gfx942 batched QSA lanes Core (`pipeline/qsa.rs`,
-//! `HIPFIRE_QWEN4_QSA_LANES=1` on exact gfx942) against the per-lane Core it replaces.
+//! exact gfx942, on by arch) against the per-lane Core it replaces.
 //!
 //! Both arms are driven through the real dispatch entry points `validate_steps` /
 //! `execute_validated_steps` with `DispatchCtx::new(&gpu)`:
