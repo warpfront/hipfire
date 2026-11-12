@@ -24,6 +24,8 @@ pub struct SrcFile {
     pub uses: Vec<Vec<String>>,
     /// Each `struct Name` with its attributes.
     pub structs: Vec<(String, Vec<String>)>,
+    /// Each named-field `struct Name { .. }`: field names and their type tokens.
+    pub struct_fields: Vec<(String, Vec<(String, Vec<Tt>)>)>,
 }
 
 pub struct World {
@@ -90,6 +92,7 @@ impl World {
                 id_counts,
                 uses: items.uses,
                 structs: items.structs,
+                struct_fields: items.struct_fields,
             });
         }
         let mut fn_index: HashMap<String, Vec<(usize, usize)>> = HashMap::new();

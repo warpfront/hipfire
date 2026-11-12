@@ -8,6 +8,16 @@
 
 use std::collections::BTreeMap;
 
+/// One scalar member, or a fixed-size array of scalar members, of a source-proven struct.
+/// Array elements have stride `size`; offsets become absolute when the argument is placed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Field {
+    pub offset: u32,
+    pub size: u32,
+    pub kind: char,
+    pub count: u32,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Arg {
     pub offset: u32,
@@ -15,6 +25,8 @@ pub struct Arg {
     /// `p` pointer, `i` integer, `f` floating point, `v` by-value of unknown class.
     pub kind: char,
     pub text: String,
+    /// Source-proven scalar fields. Empty for scalar/pointer and opaque metadata arguments.
+    pub fields: Vec<Field>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -35,6 +47,7 @@ impl Decl {
                 size: *size,
                 kind: *kind,
                 text: String::new(),
+                fields: Vec::new(),
             });
             off += size;
         }
@@ -640,7 +653,7 @@ pub fn preprocess(text: &str, predef: &BTreeMap<String, String>) -> Result<Strin
 
 /// Natural C layout of a named, plain struct. Only scalar fields and fixed-size scalar
 /// arrays are accepted; unsupported declarations never acquire a guessed layout.
-fn struct_layout(active: &str, ty: &str) -> Result<(u32, u32), String> {
+fn struct_layout(active: &str, ty: &str) -> Result<(u32, u32, Vec<Field>), String> {
     let name = ty.strip_prefix("struct ").unwrap_or(ty);
     if name.is_empty() || !name.chars().all(is_ident_char) {
         return Err(format!("unsupported aggregate type {ty:?}"));
@@ -722,6 +735,7 @@ fn struct_layout(active: &str, ty: &str) -> Result<(u32, u32), String> {
     let mut alignment = 1u32;
     let mut count = 0usize;
     let mut names = std::collections::BTreeSet::new();
+    let mut layout = Vec::new();
     for field in fields.split(';').filter(|s| !s.trim().is_empty()) {
         let (declaration, extent) = if let Some((head, rest)) = field.split_once('[') {
             let number = rest
@@ -755,7 +769,7 @@ fn struct_layout(active: &str, ty: &str) -> Result<(u32, u32), String> {
         {
             return Err(format!("struct {name}: unsupported field {field:?}"));
         }
-        let (size, _) = type_table(ty.trim())
+        let (size, kind) = type_table(ty.trim())
             .ok_or_else(|| format!("struct {name}: unsupported field type {ty:?}"))?;
         alignment = alignment.max(size);
         offset = offset
@@ -763,6 +777,12 @@ fn struct_layout(active: &str, ty: &str) -> Result<(u32, u32), String> {
             .ok_or("aggregate alignment overflow")?
             / size
             * size;
+        layout.push(Field {
+            offset,
+            size,
+            kind,
+            count: extent,
+        });
         offset = offset
             .checked_add(
                 size.checked_mul(extent)
@@ -779,7 +799,7 @@ fn struct_layout(active: &str, ty: &str) -> Result<(u32, u32), String> {
         .ok_or("aggregate tail alignment overflow")?
         / alignment
         * alignment;
-    Ok((size, alignment))
+    Ok((size, alignment, layout))
 }
 
 fn type_table(ty: &str) -> Option<(u32, char)> {
@@ -822,6 +842,7 @@ fn parse_arg(a: &str, active: &str) -> Result<(Arg, u32), String> {
                 size: 8,
                 kind: 'p',
                 text: a.trim().to_string(),
+                fields: Vec::new(),
             },
             8,
         ));
@@ -833,12 +854,12 @@ fn parse_arg(a: &str, active: &str) -> Result<(Arg, u32), String> {
         let (head, name) = words.split_at(words.len() - 1);
         (head.join(" "), name[0].to_string())
     };
-    let (size, kind, alignment) = match type_table(&ty) {
-        Some((size, kind)) => (size, kind, size),
+    let (size, kind, alignment, fields) = match type_table(&ty) {
+        Some((size, kind)) => (size, kind, size, Vec::new()),
         None => {
-            let (size, alignment) = struct_layout(active, &ty)
+            let (size, alignment, fields) = struct_layout(active, &ty)
                 .map_err(|e| format!("unknown kernel argument type {ty:?} in {a:?}: {e}"))?;
-            (size, 'v', alignment)
+            (size, 'v', alignment, fields)
         }
     };
     Ok((
@@ -847,6 +868,7 @@ fn parse_arg(a: &str, active: &str) -> Result<(Arg, u32), String> {
             size,
             kind,
             text: a.trim().to_string(),
+            fields,
         },
         alignment,
     ))
@@ -946,6 +968,12 @@ pub fn parse_globals(active: &str) -> Result<Vec<(String, Decl)>, String> {
                     / *alignment
                     * *alignment;
                 a.offset = off;
+                for field in &mut a.fields {
+                    field.offset = field
+                        .offset
+                        .checked_add(off)
+                        .ok_or("aggregate field offset overflow")?;
+                }
                 off = off
                     .checked_add(a.size)
                     .ok_or("kernel argument size overflow")?;
@@ -986,7 +1014,14 @@ pub fn decls_of(text: &str) -> Result<BTreeMap<String, Decl>, String> {
         let active = preprocess(text, &predef).map_err(|e| format!("{arch}: {e}"))?;
         for (name, decl) in parse_globals(&active).map_err(|e| format!("{arch}: {e}"))? {
             match out.get(&name) {
-                Some(prev) if !same_layout(prev, &decl) => {
+                Some(prev)
+                    if !same_layout(prev, &decl)
+                        || prev
+                            .args
+                            .iter()
+                            .zip(&decl.args)
+                            .any(|(a, b)| a.fields != b.fields) =>
+                {
                     return Err(format!(
                         "{name}: argument layout depends on the target ({arch})"
                     ))
@@ -1032,6 +1067,27 @@ mod aggregate_tests {
             ]
         );
         assert_eq!(declarations["k"].end, 1072);
+        assert_eq!(
+            args[1]
+                .fields
+                .iter()
+                .map(|f| (f.offset, f.size, f.kind, f.count))
+                .collect::<Vec<_>>(),
+            vec![
+                (4, 4, 'f', 1),
+                (8, 4, 'f', 1),
+                (12, 4, 'f', 1),
+                (16, 4, 'f', 1)
+            ]
+        );
+        assert_eq!(
+            args[2]
+                .fields
+                .iter()
+                .map(|f| (f.offset, f.size, f.kind, f.count))
+                .collect::<Vec<_>>(),
+            vec![(20, 4, 'i', 128), (532, 4, 'i', 128)]
+        );
     }
 
     #[test]
@@ -1084,5 +1140,18 @@ mod aggregate_tests {
         let macros = "#define N 128\nstruct T { int first[N]; int second[N]; };
             __global__ void k(struct T value) {}";
         assert_eq!(decls_of(macros).unwrap()["k"].args[0].size, 1024);
+        let same_size_drift = "struct T {
+            #if defined(__gfx942__)
+            int first; float second;
+            #else
+            float first; int second;
+            #endif
+            };
+            __global__ void k(T value) {}";
+        assert!(decls_of(same_size_drift).is_err());
+        let huge = "struct T { char bytes[4294967295]; }; __global__ void k(T value) {}";
+        let declaration = decls_of(huge).expect("symbolic array does not allocate per element");
+        assert_eq!(declaration["k"].args[0].fields.len(), 1);
+        assert_eq!(declaration["k"].args[0].fields[0].count, u32::MAX);
     }
 }

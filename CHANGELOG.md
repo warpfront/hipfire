@@ -12,6 +12,8 @@
 
 - Launcher ABI audit: derive natural size and alignment independently for plain by-value HIP structs with scalar fields and literal fixed-size scalar arrays. This covers QSA RopeYarn and lane-int tables without hardcoded type names; packed, attributed, nested, ambiguous, malformed and overflowing layouts fail closed.
 
+- Launcher ABI audit: preserve source-proven aggregate scalar fields (array extents remain symbolic) and compare actual blob writes against their exact byte offsets/types, rather than equating one push with one C argument. Trace bounded blob-writing helpers through their real bodies; loader-only classification never replaces the required live launch checks.
+
 - PeaceMaker gfx942: preserve the original QSA lanes anchor as a negative-only seven-entry regression. Pin FLAT-segment, missing F16 comparison model, and unverified mixed-FMA encoding refusals; no deployable twin, new ledger allowance, or hardware qualification is claimed.
 
 - PeaceMaker gfx942: add a full device-ELF-identical Route-A twin of the five F32/select QSA lane entries from frozen owner c06ab5d626, with immutable source/anchor recipe, strict per-entry hazard and CFG wait proofs, ABI pins, and exact-image qualification. The two FP8 entries remain explicitly unsupported and negatively pinned; no new obligation class or verifier allowance is introduced.

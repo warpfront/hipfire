@@ -8,9 +8,11 @@
 //!   block initialisers and calls of same-file (or workspace-unique) functions,
 //!   binding the callee's formals to the call's actual arguments so `Option`/`bool`
 //!   parameters select the real branch.
-//! * A `KernargBlob` builder may only be touched by push methods; a hand-written
-//!   `[0u8; N]` array only by indexed `copy_from_slice` writes (so its untouched
-//!   bytes are proven zero). Any other use fails closed.
+//! * A `KernargBlob` builder may only be touched by push methods, or handed (`&mut b`) to a
+//!   closure bound in the function / a `&self` method of the receiver's declared type whose body
+//!   is only pushes and finite loops (`inline_blob_helpers`: those pushes replace the call, in
+//!   order); a hand-written `[0u8; N]` array only by indexed `copy_from_slice` writes (so its
+//!   untouched bytes are proven zero). Any other use fails closed.
 //! * Parameters are followed to every call of the function in the same file, struct
 //!   fields to every initialiser/assignment of the field, collections to their
 //!   literal elements, `push` calls and `map(..).collect()` closures, tuple loop
@@ -1382,6 +1384,15 @@ impl World {
                 None => sc.body.to_vec(),
             };
             let after = scope_after(&lim_body, &bloc);
+            // Closure / `&self`-method helpers that append to the blob are replaced by the pushes
+            // they provably make (see `inline_blob_helpers`); everything else still has to be a
+            // plain push method below.
+            let after = {
+                let off = scope_after_offset(&lim_body, &bloc);
+                let mut base: Loc = bloc[..bloc.len().saturating_sub(1)].to_vec();
+                self.inline_blob_helpers(&after, off, &mut base, x, sc, &idx)
+                    .map_err(FlowErr::Fail)?
+            };
             check_builder_uses(&after, x, true).map_err(FlowErr::Fail)?;
             let ctx = Ctx {
                 file,
@@ -3961,4 +3972,1036 @@ fn sizes_array(body: &[Tt], name: &str) -> bool {
         }
     }
     false
+}
+
+// ---- blob helpers: closures and `&self` methods that append to a `&mut KernargBlob` -----------
+//
+// `push_ints(&mut args);` (a closure bound in the function) and `c.yarn.push(&mut args);` (a
+// method of the receiver's type) hand the builder to code that appends to it. Such a call is
+// replaced, before the ordinary push collector runs, by the pushes the helper makes, in order:
+//
+// * the callee is the closure visible AT the call (shadowing, reassignment and non-closure
+//   bindings are judged there), or the one `&self` method of the receiver's type, found from the
+//   struct field declarations (`c = &plan.shape` -> `Shape` -> field `yarn: Yarn` -> `Yarn::push`);
+// * the helper takes exactly the blob (`&mut KernargBlob`) and its body is only blob push
+//   statements and `for` loops over literal element lists or constant ranges (evaluated where the
+//   helper is defined). Any other statement, any other use of the blob, a conditional, `?`,
+//   `return`, `break`, `continue` or a pointer-class `push_u64` whose class cannot be read is
+//   refused, so the pushes seen here are exactly the writes the helper makes.
+
+/// Is `ty` exactly `&mut [path::]KernargBlob` (no lifetime, no generics)?
+fn is_blob_ref_type(ty: &[Tt]) -> bool {
+    ty.len() >= 3
+        && ty[0].is_p('&')
+        && ty[1].is_id("mut")
+        && ty[2..].iter().all(|t| t.id().is_some() || t.is_p(':'))
+        && ty.last().map_or(false, |t| t.is_id("KernargBlob"))
+}
+
+/// The last path segment of a plain named type (`&'a mut a::Foo` -> `Foo`); `None` for generics,
+/// arrays, tuples, `Self` and anything else that does not name one struct.
+fn type_head(ty: &[Tt]) -> Option<String> {
+    let mut k = 0usize;
+    while let Some(t) = ty.get(k) {
+        let lifetime = matches!(t, Tt::N(s, _) if s.starts_with('\''));
+        if t.is_p('&') || t.is_id("mut") || t.is_id("dyn") || lifetime {
+            k += 1;
+        } else {
+            break;
+        }
+    }
+    let mut last: Option<&str> = None;
+    let mut expect_id = true;
+    while let Some(t) = ty.get(k) {
+        if expect_id {
+            last = Some(t.id()?);
+            expect_id = false;
+            k += 1;
+        } else if t.is_p(':') && ty.get(k + 1).map_or(false, |x| x.is_p(':')) {
+            expect_id = true;
+            k += 2;
+        } else {
+            return None;
+        }
+    }
+    if expect_id {
+        return None;
+    }
+    last.filter(|s| *s != "Self").map(str::to_string)
+}
+
+/// The type of parameter `id` of `f`, from its signature.
+fn param_type(f: &FnRec, id: &str) -> Option<String> {
+    let g = f
+        .sig
+        .iter()
+        .find_map(|t| if t.is_g('(') { t.group() } else { None })?;
+    for part in split_top(g, ',') {
+        let Some(k) = part.iter().position(|x| x.is_p(':')) else {
+            continue;
+        };
+        let names: Vec<&str> = part[..k]
+            .iter()
+            .filter_map(|x| x.id())
+            .filter(|n| *n != "mut" && *n != "ref")
+            .collect();
+        if names == [id] {
+            return type_head(&part[k + 1..]);
+        }
+    }
+    None
+}
+
+/// `( & mut x )`: the one argument shape a blob helper call may have.
+fn is_blob_arg(t: Option<&Tt>, x: &str) -> bool {
+    let Some(g) = t.filter(|t| t.is_g('(')).and_then(|t| t.group()) else {
+        return false;
+    };
+    let g = if g.last().map_or(false, |t| t.is_p(',')) {
+        &g[..g.len() - 1]
+    } else {
+        g
+    };
+    g.len() == 3 && g[0].is_p('&') && g[1].is_id("mut") && g[2].is_id(x)
+}
+
+/// A keyword or `?` that can leave a helper before its last push (or repeat pushes).
+fn flow_escape(ts: &[Tt]) -> Option<String> {
+    for t in ts {
+        match t {
+            Tt::Id(s, _)
+                if matches!(
+                    s.as_str(),
+                    "return" | "break" | "continue" | "async" | "await" | "yield"
+                ) =>
+            {
+                return Some(s.clone())
+            }
+            Tt::P('?', _) => return Some("?".to_string()),
+            Tt::G(_, c, _) => {
+                if let Some(e) = flow_escape(c) {
+                    return Some(e);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// `ts` with every `self` (not a field/path segment) replaced by the receiver's tokens.
+fn replace_self(ts: &[Tt], recv: &[Tt]) -> Vec<Tt> {
+    let mut out = Vec::with_capacity(ts.len());
+    for (k, t) in ts.iter().enumerate() {
+        match t {
+            Tt::Id(s, _)
+                if s == "self" && !(k > 0 && (ts[k - 1].is_p('.') || ts[k - 1].is_p(':'))) =>
+            {
+                out.extend(recv.iter().cloned())
+            }
+            Tt::G(d, c, l) => out.push(Tt::G(*d, replace_self(c, recv), *l)),
+            other => out.push(other.clone()),
+        }
+    }
+    out
+}
+
+/// Index in `ts` of the first token `scope_after` returns for the binding at `loc`.
+fn scope_after_offset(ts: &[Tt], loc: &[usize]) -> usize {
+    let Some((last, parent)) = loc.split_last() else {
+        return 0;
+    };
+    let Some(g) = tokens_at(ts, parent) else {
+        return 0;
+    };
+    let mut k = *last + 1;
+    while k < g.len() && !g[k].is_p(';') {
+        k += 1;
+    }
+    k + 1
+}
+
+impl World {
+    /// Replace every helper call `NAME(&mut x)` / `RECV.m(&mut x)` inside `ts` by a block of the
+    /// pushes the helper makes. `base` is the location of the group `ts` belongs to and `off` the
+    /// index of `ts[0]` inside that group (both in `sc.body` coordinates). Calls that are not a
+    /// helper are left untouched, so the builder-use check rejects them as before.
+    fn inline_blob_helpers(
+        &self,
+        ts: &[Tt],
+        off: usize,
+        base: &mut Loc,
+        x: &str,
+        sc: &Sc,
+        idx: &BindIndex,
+    ) -> Result<Vec<Tt>, String> {
+        let n = ts.len();
+        let mut out: Vec<Tt> = Vec::with_capacity(n);
+        let mut i = 0usize;
+        while i < n {
+            let t = &ts[i];
+            if let Tt::Id(name, _) = t {
+                let path_tail = i > 0 && (ts[i - 1].is_p('.') || ts[i - 1].is_p(':'));
+                if !path_tail && name != x && is_blob_arg(ts.get(i + 1), x) {
+                    // `name(&mut x)`: a closure bound in this function.
+                    let mut here = base.clone();
+                    here.push(off + i);
+                    if let Some(block) = self.closure_helper(name, &here, x, sc, idx)? {
+                        out.push(block);
+                        i += 2;
+                        continue;
+                    }
+                } else if i >= 2
+                    && ts[i - 1].is_p('.')
+                    && ts[i - 2].id().map_or(false, |r| r != x)
+                    && is_blob_arg(ts.get(i + 1), x)
+                {
+                    // `a.b.m(&mut x)`: a method of the receiver `a.b` (a plain field path).
+                    let mut start = i - 2;
+                    while start >= 2 && ts[start - 1].is_p('.') && ts[start - 2].id().is_some() {
+                        start -= 2;
+                    }
+                    let chained = start > 0 && (ts[start - 1].is_p('.') || ts[start - 1].is_p(':'));
+                    if !chained {
+                        let recv = &ts[start..i - 1];
+                        let mut here = base.clone();
+                        here.push(off + start);
+                        let block = self.method_helper(recv, name, x, sc, &here)?;
+                        // The receiver path and its dot were copied one token each.
+                        out.truncate(out.len() - (i - start));
+                        out.push(block);
+                        i += 2;
+                        continue;
+                    }
+                }
+            }
+            if let Tt::G(d, c, l) = t {
+                base.push(off + i);
+                let inner = self.inline_blob_helpers(c, 0, base, x, sc, idx)?;
+                base.pop();
+                out.push(Tt::G(*d, inner, *l));
+            } else {
+                out.push(t.clone());
+            }
+            i += 1;
+        }
+        Ok(out)
+    }
+
+    /// The pushes of the closure `name` bound in this function and visible at `here`, as a block
+    /// writing to `x`. `Ok(None)` when `name` is not a closure binding.
+    fn closure_helper(
+        &self,
+        name: &str,
+        here: &[usize],
+        x: &str,
+        sc: &Sc,
+        idx: &BindIndex,
+    ) -> Result<Option<Tt>, String> {
+        let Some(b) = idx.visible(name, here) else {
+            return Ok(None);
+        };
+        if b.for_pos.is_some() || b.let_pos.is_some() {
+            return Ok(None);
+        }
+        let mut init: &[Tt] = &b.init;
+        if init.first().map_or(false, |t| t.is_id("move")) {
+            init = &init[1..];
+        }
+        if !init.first().map_or(false, |t| t.is_p('|')) {
+            return Ok(None);
+        }
+        if idx.assigns.contains_key(name) {
+            return Err(format!(
+                "blob helper closure `{name}` is reassigned, so the call does not name one body"
+            ));
+        }
+        let close = init[1..]
+            .iter()
+            .position(|t| t.is_p('|'))
+            .map(|p| p + 1)
+            .ok_or_else(|| {
+                format!("blob helper closure `{name}` has a malformed parameter list")
+            })?;
+        let parts = split_top(&init[1..close], ',');
+        let shape = format!(
+            "blob helper closure `{name}` must take exactly one parameter, `p: &mut KernargBlob`, and have a block body"
+        );
+        let [part] = parts.as_slice() else {
+            return Err(shape);
+        };
+        let rest = &init[close + 1..];
+        let (Some(pname), true) = (
+            part.first().and_then(|t| t.id()),
+            part.get(1).map_or(false, |t| t.is_p(':')) && is_blob_ref_type(&part[2..]),
+        ) else {
+            return Err(shape);
+        };
+        if pname == "mut" || !(rest.len() == 1 && rest[0].is_g('{')) {
+            return Err(shape);
+        }
+        let body_loc = closure_body_loc(sc.body, b)
+            .ok_or_else(|| format!("blob helper closure `{name}`: body location not found"))?;
+        let body = rest[0].group().unwrap();
+        if let Some(e) = flow_escape(body) {
+            return Err(format!(
+                "blob helper closure `{name}` contains `{e}`, which can end or repeat its pushes"
+            ));
+        }
+        let ctx = Ctx {
+            file: &self.files[sc.fi].path,
+            body: sc.body,
+            params: fn_params(sc.func),
+            idx,
+        };
+        let mut base = body_loc;
+        let stmts = self
+            .helper_stmts(body, pname, x, None, &ctx, &mut base)
+            .map_err(|e| format!("blob helper closure `{name}`: {e}"))?;
+        Ok(Some(Tt::G('{', stmts, rest[0].line())))
+    }
+
+    /// The pushes of the `&self` method `m` of the type of receiver path `recv`, as a block
+    /// writing to `x` (its `self` is `recv`).
+    fn method_helper(
+        &self,
+        recv: &[Tt],
+        m: &str,
+        x: &str,
+        sc: &Sc,
+        here: &[usize],
+    ) -> Result<Tt, String> {
+        let shown = format!("{}.{m}(&mut {x})", text(recv));
+        let ty = self.path_type(recv, sc, here).ok_or_else(|| {
+            format!("receiver type of `{shown}` cannot be read from the struct field declarations")
+        })?;
+        let defined = self
+            .files
+            .iter()
+            .map(|f| f.structs.iter().filter(|(s, _)| *s == ty).count())
+            .sum::<usize>();
+        if defined != 1 {
+            return Err(format!(
+                "type `{ty}` of `{shown}` has {defined} struct definitions, one is required"
+            ));
+        }
+        let defs: Vec<(usize, usize)> = self
+            .fn_index
+            .get(m)
+            .map(|l| {
+                l.iter()
+                    .copied()
+                    .filter(|(fi, fk)| {
+                        self.files[*fi].fns[*fk].owner.as_deref() == Some(ty.as_str())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let [(cfi, cfk)] = defs.as_slice() else {
+            return Err(format!(
+                "`{ty}::{m}` (the callee of `{shown}`) has {} definitions, one is required",
+                defs.len()
+            ));
+        };
+        let cf = &self.files[*cfi].fns[*cfk];
+        let shape = format!("`{ty}::{m}` must take `&self` and exactly one `&mut KernargBlob`");
+        let g = cf
+            .sig
+            .iter()
+            .find_map(|t| if t.is_g('(') { t.group() } else { None })
+            .ok_or_else(|| shape.clone())?;
+        let parts = split_top(g, ',');
+        let [recv_part, blob_part] = parts.as_slice() else {
+            return Err(shape);
+        };
+        if !(recv_part.len() == 2 && recv_part[0].is_p('&') && recv_part[1].is_id("self")) {
+            return Err(shape);
+        }
+        let (Some(pname), true) = (
+            blob_part.first().and_then(|t| t.id()),
+            blob_part.get(1).map_or(false, |t| t.is_p(':')) && is_blob_ref_type(&blob_part[2..]),
+        ) else {
+            return Err(shape);
+        };
+        if pname == "mut" {
+            return Err(shape);
+        }
+        if let Some(e) = flow_escape(&cf.body) {
+            return Err(format!(
+                "`{ty}::{m}` contains `{e}`, which can end or repeat its pushes"
+            ));
+        }
+        let fsc = self.fn_sc(*cfi, *cfk);
+        let fidx = self.bind_index(&fsc);
+        let ctx = Ctx {
+            file: &self.files[*cfi].path,
+            body: &cf.body,
+            params: fn_params(cf),
+            idx: &fidx,
+        };
+        let mut base: Loc = Vec::new();
+        let stmts = self
+            .helper_stmts(&cf.body, pname, x, Some(recv), &ctx, &mut base)
+            .map_err(|e| format!("`{ty}::{m}`: {e}"))?;
+        Ok(Tt::G('{', stmts, 0))
+    }
+
+    /// A helper body: blob pushes and `for` loops only. Pushes are rewritten to write `out_name`
+    /// (and `self` to the receiver); a loop iterable is kept when it is a literal element list and
+    /// replaced by `lo..hi` literals when it is a constant range (evaluated through `ctx`, i.e.
+    /// where the helper is defined). `base` is the location of `ts` inside `ctx.body`.
+    fn helper_stmts(
+        &self,
+        ts: &[Tt],
+        param: &str,
+        out_name: &str,
+        recv: Option<&[Tt]>,
+        ctx: &Ctx,
+        base: &mut Loc,
+    ) -> Result<Vec<Tt>, String> {
+        let n = ts.len();
+        let mut out: Vec<Tt> = Vec::with_capacity(n);
+        let mut i = 0usize;
+        while i < n {
+            let t = &ts[i];
+            if t.is_p(';') {
+                out.push(t.clone());
+                i += 1;
+                continue;
+            }
+            if t.is_id(param) && i + 3 < n && ts[i + 1].is_p('.') && ts[i + 3].is_g('(') {
+                let m = ts[i + 2]
+                    .id()
+                    .ok_or_else(|| format!("`{param}.` is not followed by a method"))?;
+                let Some(kind) = push_kind(m) else {
+                    return Err(format!(
+                        "`{param}.{m}(..)`: only the push methods are followed inside a helper (a `{m}` can move later pushes)"
+                    ));
+                };
+                let mut arg = ts[i + 3].group().unwrap().to_vec();
+                if let Some(r) = recv {
+                    arg = replace_self(&arg, r);
+                }
+                if contains_id(&arg, param) {
+                    return Err(format!("`{param}` is used inside the argument of a push"));
+                }
+                // A u64 word is a pointer only when that is provable from the expression alone:
+                // a local of the helper cannot be looked up at the call site.
+                if kind == PushKind::U64 && !is_ptr_flow(&arg) {
+                    return Err(format!(
+                        "`push_u64({})` in a helper: the class of the word cannot be read at the call site",
+                        text(&arg)
+                    ));
+                }
+                out.push(Tt::Id(out_name.to_string(), t.line()));
+                out.push(ts[i + 1].clone());
+                out.push(ts[i + 2].clone());
+                out.push(Tt::G('(', arg, ts[i + 3].line()));
+                i += 4;
+                continue;
+            }
+            if t.is_id("for") {
+                let (pat, it, j) = for_parts(ts, i)?;
+                if contains_id(&pat, param) || contains_id(&it, param) {
+                    return Err(format!("`{param}` is used by a loop header"));
+                }
+                let it = match recv {
+                    Some(r) => replace_self(&it, r),
+                    None => it,
+                };
+                let mut here = base.clone();
+                here.push(i);
+                let new_it = self.helper_iterable(&it, ctx, &here)?;
+                out.push(t.clone());
+                out.extend(pat);
+                out.push(Tt::Id("in".to_string(), t.line()));
+                out.extend(new_it);
+                base.push(j);
+                let inner =
+                    self.helper_stmts(ts[j].group().unwrap(), param, out_name, recv, ctx, base)?;
+                base.pop();
+                out.push(Tt::G('{', inner, ts[j].line()));
+                i = j + 1;
+                continue;
+            }
+            return Err(format!(
+                "statement `{}` is neither a blob push nor a `for` loop over a finite iterable",
+                text(&ts[i..(i + 6).min(n)])
+            ));
+        }
+        Ok(out)
+    }
+
+    /// The iterable of a helper loop in a form the push collector counts exactly.
+    fn helper_iterable(&self, it: &[Tt], ctx: &Ctx, here: &[usize]) -> Result<Vec<Tt>, String> {
+        let mut s = 0usize;
+        while it.get(s).map_or(false, |t| t.is_p('&')) {
+            s += 1;
+        }
+        let core = &it[s..];
+        if core.len() == 1 && core[0].is_g('[') {
+            if core[0].group().unwrap().iter().any(|t| t.is_p(';')) {
+                return Err("a `[x; N]` loop iterable is not a literal element list".into());
+            }
+            return Ok(core.to_vec());
+        }
+        let k = (0..core.len().saturating_sub(1))
+            .find(|&k| core[k].is_p('.') && core[k + 1].is_p('.'))
+            .ok_or_else(|| {
+                format!(
+                    "loop iterable `{}` is neither a literal array nor a constant range",
+                    text(it)
+                )
+            })?;
+        let (lo, hi) = (&core[..k], &core[k + 2..]);
+        if lo.is_empty() || hi.is_empty() || hi[0].is_p('=') {
+            return Err(format!("loop range `{}` is not `lo..hi`", text(it)));
+        }
+        let bound = |e: &[Tt]| {
+            self.repeat_len_at(e, ctx, here).ok_or_else(|| {
+                format!(
+                    "loop bound `{}` is not a constant the helper can prove",
+                    text(e)
+                )
+            })
+        };
+        let (lo, hi) = (bound(lo)?, bound(hi)?);
+        let line = core[0].line();
+        Ok(vec![
+            Tt::N(lo.to_string(), line),
+            Tt::P('.', line),
+            Tt::P('.', line),
+            Tt::N(hi.to_string(), line),
+        ])
+    }
+
+    /// The struct type of a field path `a.b.c`: the root's declared or initialised type, then
+    /// each field's declared type.
+    fn path_type(&self, recv: &[Tt], sc: &Sc, loc: &[usize]) -> Option<String> {
+        if recv.len() % 2 == 0 {
+            return None;
+        }
+        let mut segs: Vec<&str> = Vec::new();
+        for (k, t) in recv.iter().enumerate() {
+            if k % 2 == 0 {
+                segs.push(t.id()?);
+            } else if !t.is_p('.') {
+                return None;
+            }
+        }
+        let mut ty = self.local_type(segs[0], sc, Some(loc), 0)?;
+        for f in &segs[1..] {
+            ty = self.struct_field_type(&ty, f)?;
+        }
+        Some(ty)
+    }
+
+    /// The struct type named by local or parameter `id` as seen at `loc`.
+    fn local_type(&self, id: &str, sc: &Sc, loc: Option<&[usize]>, depth: u32) -> Option<String> {
+        if depth > 4 {
+            return None;
+        }
+        if id == "self" {
+            return sc.func.owner.clone();
+        }
+        let idx = self.bind_index(sc);
+        if let Some(l) = loc {
+            // A parameter of an enclosing closure shadows everything else of that name.
+            if closure_param_origin(sc.body, &idx, id, l).is_some() {
+                return None;
+            }
+        }
+        match loc.and_then(|l| idx.visible(id, l)) {
+            Some(b) => {
+                if b.for_pos.is_some() || b.let_pos.is_some() {
+                    return None;
+                }
+                if !b.ty.is_empty() {
+                    return type_head(&b.ty);
+                }
+                self.init_type(&b.init, sc, &b.loc, depth + 1)
+            }
+            None => param_type(sc.func, id),
+        }
+    }
+
+    /// The struct type an initialiser expression evaluates to: a field path of typed locals, or
+    /// whatever `recv_type` reads off a literal / constructor call.
+    fn init_type(&self, ex: &[Tt], sc: &Sc, loc: &[usize], depth: u32) -> Option<String> {
+        let t = peel_val(ex);
+        let path = !t.is_empty()
+            && t.len() % 2 == 1
+            && t.iter().enumerate().all(|(k, x)| {
+                if k % 2 == 0 {
+                    x.id().is_some()
+                } else {
+                    x.is_p('.')
+                }
+            });
+        if path {
+            let mut ty = self.local_type(t[0].id()?, sc, Some(loc), depth)?;
+            for k in (2..t.len()).step_by(2) {
+                ty = self.struct_field_type(&ty, t[k].id()?)?;
+            }
+            return Some(ty);
+        }
+        self.recv_type(&t, sc, Some(loc), 0)
+    }
+
+    /// The declared type of field `field` of the one struct named `owner`.
+    fn struct_field_type(&self, owner: &str, field: &str) -> Option<String> {
+        let total: usize = self
+            .files
+            .iter()
+            .map(|f| f.structs.iter().filter(|(n, _)| n == owner).count())
+            .sum();
+        if total != 1 {
+            return None;
+        }
+        let mut found: Option<&Vec<Tt>> = None;
+        for f in &self.files {
+            for (name, fields) in &f.struct_fields {
+                if name == owner {
+                    found = fields.iter().find(|(n, _)| n == field).map(|(_, t)| t);
+                }
+            }
+        }
+        type_head(found?)
+    }
+}
+
+#[cfg(test)]
+mod blob_helper_tests {
+    use super::*;
+    use crate::hip::Decl;
+    use std::path::Path;
+
+    const PATH: &str = "crates/x/examples/qsa_helper_probe.rs";
+    const OTHER: &str = "crates/x/examples/qsa_helper_other.rs";
+
+    const TYPES: &str = r#"const LANES_MAX: usize = 3;
+pub struct Yarn { pub a: f32, pub b: f32 }
+impl Yarn {
+    pub fn push(&self, args: &mut hip_bridge::KernargBlob) {
+        for v in [self.a, self.b] {
+            args.push_f32(v);
+        }
+    }
+}
+pub struct Tag { pub t: i32 }
+impl Tag {
+    pub fn push(&self, args: &mut KernargBlob) {
+        args.push_i32(self.t);
+    }
+}
+pub struct Mutr { pub z: i32 }
+impl Mutr {
+    pub fn push(&mut self, args: &mut KernargBlob) {
+        args.push_i32(self.z);
+    }
+}
+pub struct Cond { pub z: i32 }
+impl Cond {
+    pub fn push(&self, args: &mut KernargBlob) {
+        if self.z > 0 {
+            args.push_i32(self.z);
+        }
+    }
+}
+pub struct Shape {
+    pub yarn: Yarn,
+    pub tag: Tag,
+    pub mutr: Mutr,
+    pub cond: Cond,
+    pub vecs: Vec<Tag>,
+    pub n: usize,
+}
+pub struct Plan { pub shape: Shape, pub positions: Vec<i32>, pub rows: Vec<i32> }
+"#;
+
+    const INTS: &str = "    let push_ints = |args: &mut KernargBlob| {\n        for lanes in [&plan.positions, &plan.rows] {\n            for slot in 0..LANES_MAX {\n                args.push_i32(lanes.get(slot).copied().unwrap_or(0));\n            }\n        }\n    };\n";
+    const YARN: &str = "    c.yarn.push(&mut args);\n";
+    const CALL: &str = "    push_ints(&mut args);\n";
+
+    fn probe_src(types: &str, closure: &str, calls: &str) -> String {
+        format!(
+            "{types}fn probe(hip: &Hip, m: &Module, plan: &Plan, n: usize) {{\n    let f = hip.get_function(m, \"probe_sym\").unwrap();\n    let c = &plan.shape;\n{closure}    let mut args = KernargBlob::with_capacity(64);\n    args.push_ptr(p);\n{calls}    hip.launch_kernel_blob(f, [1, 1, 1], [32, 1, 1], 0, None, args.as_mut_slice()).unwrap();\n}}\n"
+        )
+    }
+
+    fn kinds_of(files: &[(&str, &str)]) -> Result<Vec<PushKind>, String> {
+        let world = World::from_sources(
+            Path::new("."),
+            files
+                .iter()
+                .map(|(p, s)| (p.to_string(), s.to_string()))
+                .collect(),
+        )
+        .expect("lexes");
+        let fi = world.file_index[PATH];
+        let file = &world.files[fi];
+        let fk = file
+            .fns
+            .iter()
+            .position(|f| f.name == "probe")
+            .expect("probe");
+        let sites = find_sites(&file.fns[fk].body).expect("sites");
+        assert_eq!(sites.len(), 1, "one launch site");
+        let vs = world.probe_variants(fi, fk, &sites[0], &BTreeSet::new())?;
+        assert_eq!(vs.len(), 1, "one layout variant");
+        Ok(vs[0].pushes.iter().map(|p| p.kind).collect())
+    }
+
+    fn kinds(closure: &str, calls: &str) -> Result<Vec<PushKind>, String> {
+        kinds_of(&[(PATH, &probe_src(TYPES, closure, calls))])
+    }
+
+    fn expect_err(r: Result<Vec<PushKind>, String>, what: &str) -> String {
+        match r {
+            Ok(k) => panic!("{what}: must be refused, got {k:?}"),
+            Err(e) => e,
+        }
+    }
+
+    fn seq(parts: &[(PushKind, usize)]) -> Vec<PushKind> {
+        parts
+            .iter()
+            .flat_map(|(k, n)| std::iter::repeat(*k).take(*n))
+            .collect()
+    }
+
+    fn baseline() -> Vec<PushKind> {
+        seq(&[(PushKind::Ptr, 1), (PushKind::F32, 2), (PushKind::I32, 6)])
+    }
+
+    #[test]
+    fn struct_fields_are_read_with_their_declared_types() {
+        let world = World::from_sources(
+            Path::new("."),
+            vec![(
+                PATH.to_string(),
+                r#"pub struct G<T> where T: Copy {
+    #[allow(dead_code)]
+    pub(crate) a: Vec<(T, u8)>,
+    pub b: std::collections::HashMap<u8, u8>,
+    c: &'static Foo,
+    pub d: a::b::Bar,
+}
+struct Tup(f32);
+struct Unit;
+"#
+                .to_string(),
+            )],
+        )
+        .unwrap();
+        let f = &world.files[0];
+        assert_eq!(
+            f.struct_fields.len(),
+            1,
+            "tuple and unit structs have no fields"
+        );
+        let (name, fields) = &f.struct_fields[0];
+        assert_eq!(name, "G");
+        let names: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["a", "b", "c", "d"]);
+        let heads: Vec<Option<String>> = fields.iter().map(|(_, t)| type_head(t)).collect();
+        assert_eq!(
+            heads,
+            [None, None, Some("Foo".to_string()), Some("Bar".to_string())]
+        );
+    }
+
+    #[test]
+    fn actual_qsa_helper_shape_expands_in_order_with_exact_counts() {
+        // yarn (2 x f32) then the two lane tables (2 x LANES_MAX i32), after the pointer.
+        assert_eq!(kinds(INTS, &format!("{YARN}{CALL}")).unwrap(), baseline());
+        // The order of the helper calls is the order of the bytes.
+        let reordered = kinds(INTS, &format!("{CALL}{YARN}")).unwrap();
+        assert_eq!(
+            reordered,
+            seq(&[(PushKind::Ptr, 1), (PushKind::I32, 6), (PushKind::F32, 2)])
+        );
+        assert_ne!(reordered, baseline());
+        // A helper called twice writes twice.
+        let twice = kinds(INTS, &format!("{YARN}{CALL}{CALL}")).unwrap();
+        assert_eq!(twice.len(), 1 + 2 + 12);
+        // Pushes of the caller around the helper calls keep their place.
+        let mixed = kinds(
+            INTS,
+            "    args.push_u32(1);\n    c.yarn.push(&mut args);\n    args.push_i32(2);\n    push_ints(&mut args);\n    args.push_f32(3.0);\n",
+        )
+        .unwrap();
+        let mut want = vec![PushKind::Ptr, PushKind::U32, PushKind::F32, PushKind::F32];
+        want.push(PushKind::I32);
+        want.extend(std::iter::repeat(PushKind::I32).take(6));
+        want.push(PushKind::F32);
+        assert_eq!(mixed, want);
+    }
+
+    #[test]
+    fn helper_loop_bounds_follow_the_constant_not_a_hardcoded_extent() {
+        let wide = TYPES.replace("LANES_MAX: usize = 3", "LANES_MAX: usize = 5");
+        let src = probe_src(&wide, INTS, &format!("{YARN}{CALL}"));
+        let k = kinds_of(&[(PATH, &src)]).unwrap();
+        assert_eq!(
+            k,
+            seq(&[(PushKind::Ptr, 1), (PushKind::F32, 2), (PushKind::I32, 10)])
+        );
+        // A bound that is not a constant is refused.
+        let runtime = INTS.replace("0..LANES_MAX", "0..n");
+        expect_err(kinds(&runtime, CALL), "runtime loop bound");
+        // A const declared in the function shadows the global one: the bound is the one in
+        // scope where the closure is defined.
+        let local = format!("    const LANES_MAX: usize = 2;\n{INTS}");
+        assert_eq!(
+            kinds(&local, CALL).unwrap(),
+            seq(&[(PushKind::Ptr, 1), (PushKind::I32, 4)])
+        );
+        // Inclusive ranges and `[x; N]` iterables are not followed.
+        expect_err(
+            kinds(&INTS.replace("0..LANES_MAX", "0..=LANES_MAX"), CALL),
+            "inclusive",
+        );
+        expect_err(
+            kinds(
+                &INTS.replace("[&plan.positions, &plan.rows]", "[&plan.rows; 2]"),
+                CALL,
+            ),
+            "repeat",
+        );
+    }
+
+    #[test]
+    fn method_helper_constants_come_from_the_file_that_defines_it() {
+        let probe = "const N: usize = 5;\npub struct Plan { pub shape: Shape }\npub struct Shape { pub gap: Gap }\nfn probe(hip: &Hip, m: &Module, plan: &Plan) {\n    let f = hip.get_function(m, \"probe_sym\").unwrap();\n    let c = &plan.shape;\n    let mut args = KernargBlob::new();\n    args.push_ptr(p);\n    c.gap.push(&mut args);\n    hip.launch_kernel_blob(f, [1, 1, 1], [32, 1, 1], 0, None, &mut args).unwrap();\n}\n";
+        let other = "const N: usize = 2;\npub struct Gap { pub t: i32 }\nimpl Gap {\n    pub fn push(&self, args: &mut KernargBlob) {\n        for _i in 0..N {\n            args.push_i32(self.t);\n        }\n    }\n}\n";
+        let k = kinds_of(&[(PATH, probe), (OTHER, other)]).unwrap();
+        assert_eq!(k, seq(&[(PushKind::Ptr, 1), (PushKind::I32, 2)]));
+    }
+
+    #[test]
+    fn missing_extra_and_wrong_kind_writes_change_the_layout() {
+        // Only one table written.
+        let one = INTS.replace("[&plan.positions, &plan.rows]", "[&plan.positions]");
+        assert_eq!(
+            kinds(&one, &format!("{YARN}{CALL}")).unwrap(),
+            seq(&[(PushKind::Ptr, 1), (PushKind::F32, 2), (PushKind::I32, 3)])
+        );
+        // The helper is never called.
+        assert_eq!(
+            kinds(INTS, YARN).unwrap(),
+            seq(&[(PushKind::Ptr, 1), (PushKind::F32, 2)])
+        );
+        // A different push method is a different kind.
+        let f32s = INTS.replace("push_i32", "push_f32");
+        assert_eq!(
+            kinds(&f32s, CALL).unwrap(),
+            seq(&[(PushKind::Ptr, 1), (PushKind::F32, 6)])
+        );
+    }
+
+    #[test]
+    fn closure_calls_are_judged_at_the_call_by_the_visible_binding() {
+        let second =
+            "    let push_ints = |args: &mut KernargBlob| {\n        args.push_i32(0);\n    };\n";
+        // The later binding is the one the call runs.
+        assert_eq!(
+            kinds(&format!("{INTS}{second}"), CALL).unwrap(),
+            seq(&[(PushKind::Ptr, 1), (PushKind::I32, 1)])
+        );
+        // A binding in a block that has ended is not visible.
+        let inner = format!("    {{\n{second}        let _unused = 0;\n    }}\n");
+        assert_eq!(
+            kinds(&format!("{INTS}{inner}"), CALL).unwrap(),
+            seq(&[(PushKind::Ptr, 1), (PushKind::I32, 6)])
+        );
+        // A later non-closure binding of the name is not a helper: refused.
+        let e = expect_err(
+            kinds(&format!("{INTS}    let push_ints = 5;\n"), CALL),
+            "non-closure shadow",
+        );
+        assert!(e.contains("used other than through its methods"), "{e}");
+        // A closure that is reassigned has no single body.
+        let e = expect_err(
+            kinds(
+                &format!(
+                    "{}    push_ints = |args: &mut KernargBlob| {{ args.push_i32(0); }};\n",
+                    INTS.replace("let push_ints", "let mut push_ints")
+                ),
+                CALL,
+            ),
+            "reassigned closure",
+        );
+        assert!(e.contains("reassigned"), "{e}");
+    }
+
+    #[test]
+    fn arbitrary_mutable_aliases_and_unknown_callees_stay_refused() {
+        let used = "used other than through its methods";
+        // An alias of the builder handed to the helper.
+        let e = expect_err(
+            kinds(INTS, "    let alias = &mut args;\n    push_ints(alias);\n"),
+            "alias",
+        );
+        assert!(e.contains(used), "{e}");
+        // A helper that is not bound in the function (a free fn, unknown name).
+        let e = expect_err(kinds("", "    push_all(&mut args);\n"), "unknown callee");
+        assert!(e.contains(used), "{e}");
+        let free = format!("fn push_all(args: &mut KernargBlob) {{ args.push_i32(0); }}\n{TYPES}");
+        let e = expect_err(
+            kinds_of(&[(PATH, &probe_src(&free, "", "    push_all(&mut args);\n"))]),
+            "free fn",
+        );
+        assert!(e.contains(used), "{e}");
+        // Passed on to a function that is not a closure helper, inside a nested group.
+        let e = expect_err(
+            kinds(INTS, "    if n > 0 {\n        sink(&mut args);\n    }\n"),
+            "sink",
+        );
+        assert!(e.contains(used), "{e}");
+        // The closure also called by a receiver the type reader cannot follow.
+        let e = expect_err(
+            kinds(INTS, "    make().push(&mut args);\n"),
+            "call receiver",
+        );
+        assert!(e.contains(used), "{e}");
+    }
+
+    #[test]
+    fn helper_bodies_may_only_push_and_loop() {
+        let body = |stmts: &str| {
+            format!("    let push_ints = |args: &mut KernargBlob| {{\n{stmts}    }};\n")
+        };
+        let ok = body("        args.push_i32(1);\n");
+        assert_eq!(
+            kinds(&ok, CALL).unwrap(),
+            seq(&[(PushKind::Ptr, 1), (PushKind::I32, 1)])
+        );
+        for (what, stmts) in [
+            ("pad_to moves later pushes", "        args.pad_to(8);\n        args.push_i32(1);\n"),
+            ("conditional push", "        if n > 1 {\n            args.push_i32(1);\n        }\n"),
+            ("early return", "        args.push_i32(1);\n        return;\n"),
+            ("question mark", "        args.push_i32(i32::try_from(n)?);\n"),
+            ("break in a loop", "        for _i in 0..2 {\n            args.push_i32(1);\n            break;\n        }\n"),
+            ("blob read in an argument", "        args.push_i32(args.len() as i32);\n"),
+            ("let statement", "        let k = 1;\n        args.push_i32(k);\n"),
+            ("while loop", "        while n > 0 {\n            args.push_i32(1);\n        }\n"),
+            ("loop variable shadows the blob", "        for args in [1, 2] {\n            args.push_i32(1);\n        }\n"),
+            ("unknown method", "        args.clear();\n"),
+            ("other call", "        helper();\n        args.push_i32(1);\n"),
+            ("pointer class of a local", "        args.push_u64(wp);\n"),
+        ] {
+            expect_err(kinds(&body(stmts), CALL), what);
+        }
+        // A pointer-valued u64 is accepted only when the expression itself proves it.
+        let ptr = body("        args.push_u64(t.buf.as_ptr() as u64);\n");
+        assert_eq!(
+            kinds(&ptr, CALL).unwrap(),
+            seq(&[(PushKind::Ptr, 1), (PushKind::U64, 1)])
+        );
+        // The closure itself: exactly one `&mut KernargBlob` parameter and a block body.
+        for (what, closure) in [
+            ("two parameters", "    let push_ints = |args: &mut KernargBlob, k: i32| {\n        args.push_i32(k);\n    };\n"),
+            ("wrong type", "    let push_ints = |args: &mut Vec<u8>| {\n        args.push(1);\n    };\n"),
+            ("untyped", "    let push_ints = |args| {\n        args.push_i32(1);\n    };\n"),
+            ("expression body", "    let push_ints = |args: &mut KernargBlob| args.push_i32(1);\n"),
+            ("shared reference", "    let push_ints = |args: &KernargBlob| {\n        args.push_i32(1);\n    };\n"),
+        ] {
+            expect_err(kinds(closure, CALL), what);
+        }
+    }
+
+    #[test]
+    fn field_typed_receivers_resolve_to_the_impl_of_their_declared_type() {
+        // Same method name, different impls: the field's declared type decides.
+        assert_eq!(
+            kinds("", "    c.tag.push(&mut args);\n").unwrap(),
+            seq(&[(PushKind::Ptr, 1), (PushKind::I32, 1)])
+        );
+        assert_eq!(
+            kinds("", "    c.yarn.push(&mut args);\n").unwrap(),
+            seq(&[(PushKind::Ptr, 1), (PushKind::F32, 2)])
+        );
+        // A receiver reached through a typed local and a typed parameter.
+        assert_eq!(
+            kinds("", "    let t = &c.tag;\n    t.push(&mut args);\n").unwrap(),
+            seq(&[(PushKind::Ptr, 1), (PushKind::I32, 1)])
+        );
+        assert_eq!(
+            kinds("", "    plan.shape.yarn.push(&mut args);\n").unwrap(),
+            seq(&[(PushKind::Ptr, 1), (PushKind::F32, 2)])
+        );
+        // Unknown or unusable field types refuse by name instead of guessing.
+        for (what, call) in [
+            ("undeclared field", "    c.nope.push(&mut args);\n"),
+            ("primitive field type", "    c.n.push(&mut args);\n"),
+            ("generic field type", "    c.vecs.push(&mut args);\n"),
+            ("method takes &mut self", "    c.mutr.push(&mut args);\n"),
+            ("conditional method body", "    c.cond.push(&mut args);\n"),
+            ("untyped receiver", "    unknown.tag.push(&mut args);\n"),
+        ] {
+            expect_err(kinds("", call), what);
+        }
+        // Two definitions of the receiver's type: ambiguous.
+        let dup = format!("{TYPES}pub struct Tag {{ pub t: i32 }}\n");
+        expect_err(
+            kinds_of(&[(PATH, &probe_src(&dup, "", "    c.tag.push(&mut args);\n"))]),
+            "duplicate struct",
+        );
+        // Two `push` methods of the receiver's own type: ambiguous.
+        let twice = format!("{TYPES}impl Tag {{\n    pub fn push(&self, args: &mut KernargBlob) {{\n        args.push_u32(0);\n    }}\n}}\n");
+        expect_err(
+            kinds_of(&[(PATH, &probe_src(&twice, "", "    c.tag.push(&mut args);\n"))]),
+            "duplicate method",
+        );
+        // A same-named struct in another file makes the type ambiguous even if the field is not.
+        let e = expect_err(
+            kinds_of(&[
+                (PATH, &probe_src(TYPES, "", "    c.tag.push(&mut args);\n")),
+                (OTHER, "pub struct Tag { pub other: u8 }\n"),
+            ]),
+            "same type name elsewhere",
+        );
+        assert!(e.contains("struct definitions"), "{e}");
+    }
+
+    fn qsa_decl(ints: usize) -> Decl {
+        let mut a = vec![(8u32, 'p'), (4, 'f'), (4, 'f')];
+        a.extend(vec![(4u32, 'i'); ints]);
+        Decl::from_scalars(&a)
+    }
+
+    #[test]
+    fn helper_blobs_are_compared_against_the_declared_kernel_abi() {
+        let run = |src: &str, d: Decl| {
+            crate::run_synth_at(PATH, src, &[("probe_sym", d)], &crate::no_policy())
+        };
+        let good = probe_src(TYPES, INTS, &format!("{YARN}{CALL}"));
+        let (abi, cov) = run(&good, qsa_decl(6));
+        assert!(abi.is_empty() && cov.is_empty(), "{abi:?} {cov:?}");
+        // The kernel declares one more word than the helpers write.
+        let (abi, cov) = run(&good, qsa_decl(7));
+        assert!(
+            !abi.is_empty() || !cov.is_empty(),
+            "a missing write must be reported"
+        );
+        // A helper that writes fewer words than declared.
+        let one = probe_src(
+            TYPES,
+            &INTS.replace("[&plan.positions, &plan.rows]", "[&plan.rows]"),
+            &format!("{YARN}{CALL}"),
+        );
+        let (abi, cov) = run(&one, qsa_decl(6));
+        assert!(
+            !abi.is_empty() || !cov.is_empty(),
+            "a short helper must be reported"
+        );
+        // Helper order: ints before the yarn floats is another layout.
+        let swapped = probe_src(TYPES, INTS, &format!("{CALL}{YARN}"));
+        let (abi, cov) = run(&swapped, qsa_decl(6));
+        assert!(
+            !abi.is_empty() || !cov.is_empty(),
+            "reordered writes must be reported"
+        );
+    }
 }
