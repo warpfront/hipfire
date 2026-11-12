@@ -408,6 +408,74 @@ pub(crate) fn ensure_gdn_verify_kernel(gpu: &mut Gpu, kernel: &'static str) -> H
     Ok(own)
 }
 
+const QWEN4_G942_QSA_ROW_SRC: &str =
+    include_str!("../../../../kernels/src/qwen4_g942_qsa_row_attention.gfx942.hip");
+/// The exact-gfx942 single-row parallel QSA attention module (its own cache key and twin seat).
+pub const QWEN4_G942_QSA_ROW_MODULE: &str = "qwen4_g942_qsa_row_attention";
+/// `(tensor_ops entry, gfx942 row module entry)`: the two parallel single-row QSA attention
+/// entries exact gfx942 can select (K/V formats F32 and E4M3 FNUZ; `fp8` is gfx12-only and `q8`
+/// gfx11/gfx12-only). The serial entries stay in `tensor_ops`. The names differ (the per-context
+/// function table is keyed by entry name); the device body is `tensor_ops.hip`'s, byte for byte.
+pub const QWEN4_G942_QSA_ROW_ENTRIES: [(&str, &str); 2] = [
+    (
+        "indexed_attention_attention_f32",
+        "qwen4_g942_qsa_row_f32",
+    ),
+    (
+        "indexed_attention_attention_fp8_fnuz",
+        "qwen4_g942_qsa_row_fp8_fnuz",
+    ),
+];
+
+/// `HIPFIRE_QWEN4_G942_QSA_ROW_IMAGE=/absolute/device.elf` (developer, read once): the explicitly
+/// supplied code object of [`QWEN4_G942_QSA_ROW_MODULE`] (the Route-A twin proof). Unset: the
+/// hipcc source, unchanged.
+fn g942_qsa_row_image() -> HipResult<Option<&'static std::sync::Arc<[u8]>>> {
+    static IMAGE: std::sync::LazyLock<Result<Option<std::sync::Arc<[u8]>>, String>> =
+        std::sync::LazyLock::new(|| {
+            match hipfire_config::developer_var("HIPFIRE_QWEN4_G942_QSA_ROW_IMAGE") {
+                Ok(path) if !path.is_empty() => std::fs::read(&path)
+                    .map(|bytes| Some(std::sync::Arc::<[u8]>::from(bytes)))
+                    .map_err(|error| {
+                        format!("HIPFIRE_QWEN4_G942_QSA_ROW_IMAGE {path}: {error}")
+                    }),
+                _ => Ok(None),
+            }
+        });
+    let loaded: &'static Result<Option<std::sync::Arc<[u8]>>, String> = &IMAGE;
+    match loaded {
+        Ok(image) => Ok(image.as_ref()),
+        Err(message) => Err(hip_bridge::HipError::new(0, message)),
+    }
+}
+
+/// Load the single-row QSA attention entry `kernel` and return the symbol to launch. On exact
+/// gfx942 the two [`QWEN4_G942_QSA_ROW_ENTRIES`] resolve to the gfx942-only module (hipcc source,
+/// or the `HIPFIRE_QWEN4_G942_QSA_ROW_IMAGE` code object) and the module's own symbol is
+/// returned; every other arch, and every other entry (the serial row kernels), loads from
+/// `tensor_ops` as before and returns `kernel`.
+pub(crate) fn ensure_qsa_row_kernel(gpu: &mut Gpu, kernel: &'static str) -> HipResult<&'static str> {
+    let entry = gpu
+        .arch_caps
+        .is_gfx942()
+        .then(|| {
+            QWEN4_G942_QSA_ROW_ENTRIES
+                .iter()
+                .find(|(tensor_ops, _)| *tensor_ops == kernel)
+        })
+        .flatten();
+    let Some(&(_, own)) = entry else {
+        gpu.ensure_kernel_public("tensor_ops", crate::tensor_ops::TENSOR_OPS_SRC, kernel)?;
+        return Ok(kernel);
+    };
+    gpu.bind_thread()?;
+    match g942_qsa_row_image()? {
+        Some(image) => gpu.ensure_embedded_kernel(QWEN4_G942_QSA_ROW_MODULE, image.clone(), own)?,
+        None => gpu.ensure_kernel(QWEN4_G942_QSA_ROW_MODULE, QWEN4_G942_QSA_ROW_SRC, own)?,
+    }
+    Ok(own)
+}
+
 /// A mutable GPU borrow proven to target exact gfx942.
 ///
 /// The constructor is intentionally available only through Gpu::try_gfx942.
@@ -3650,6 +3718,116 @@ mod tests {
             assert!(
                 anchor.windows(name.len()).any(|w| w == name.as_bytes()),
                 "{name} missing from the anchor"
+            );
+        }
+    }
+
+    /// The single-row QSA attention module is `tensor_ops.hip`'s body byte for byte: with the two
+    /// entry names mapped back, every `BEGIN` / `END verbatim` block occurs in the production
+    /// source (format helpers + key dots, the gfx942 rounding pins + `qsa_attention_row_parallel`,
+    /// the `qsa_attention_single` wrapper, the `QSA_ATTENTION_SINGLE` entry macro), and nothing
+    /// else but the two instantiations is code.
+    #[test]
+    fn g942_qsa_row_source_is_tensor_ops_verbatim() {
+        const BEGIN: &str = "// BEGIN verbatim tensor_ops.hip\n";
+        const END: &str = "// END verbatim tensor_ops.hip";
+        let production = crate::tensor_ops::TENSOR_OPS_SRC;
+        let mut src = super::QWEN4_G942_QSA_ROW_SRC.to_string();
+        for (old, new) in super::QWEN4_G942_QSA_ROW_ENTRIES {
+            assert!(
+                src.contains(&format!("QSA_ATTENTION_SINGLE({new},")),
+                "entry {new} is instantiated by the module"
+            );
+            assert!(
+                production.contains("QSA_ATTENTION_SINGLE(indexed_attention_attention_##TAG, qsa_attention_single,"),
+                "entry {old} is the tensor_ops single-row instantiation"
+            );
+            src = src.replace(new, old);
+        }
+        assert_eq!(src.matches("QSA_ATTENTION_SINGLE(indexed_attention_attention_").count(), 2);
+        let mut blocks = 0;
+        let mut rest = src.as_str();
+        let mut outside = String::new();
+        while let Some(at) = rest.find(BEGIN) {
+            outside.push_str(&rest[..at]);
+            let body = &rest[at + BEGIN.len()..];
+            let end = body.find(END).expect("END marker after every BEGIN marker");
+            let block = body[..end].trim_end_matches('\n');
+            assert!(
+                production.contains(block),
+                "verbatim block {blocks} of qwen4_g942_qsa_row_attention.gfx942.hip is no longer \
+                 a substring of tensor_ops.hip: mirror the production edit\nblock starts: {:?}",
+                &block[..block.len().min(120)]
+            );
+            blocks += 1;
+            rest = &body[end + END.len()..];
+        }
+        outside.push_str(rest);
+        assert_eq!(
+            blocks, 4,
+            "format helpers + key dots, rounding pins + row body, single wrapper, entry macro"
+        );
+        // The production source instantiates both entries under the arch guards the module
+        // relies on: F32 unguarded, FNUZ gfx942-only (the only formats gfx942 compiles).
+        assert!(production.contains("QSA_ATTENTION_KERNELS(f32, QSA_KV_F32, float)"));
+        assert!(production
+            .contains("#if defined(__gfx942__)\nQSA_ATTENTION_KERNELS(fp8_fnuz, QSA_KV_FP8_FNUZ, unsigned char)"));
+        // Outside the markers: comments, includes, the bf16 alias and the two instantiations.
+        let code: Vec<&str> = outside
+            .lines()
+            .map(str::trim)
+            .filter(|t| {
+                !(t.is_empty()
+                    || t.starts_with("//")
+                    || t.starts_with("#include")
+                    || t.starts_with("using __hip_bfloat16"))
+            })
+            .collect();
+        assert_eq!(
+            code,
+            [
+                "QSA_ATTENTION_SINGLE(indexed_attention_attention_f32, qsa_attention_single, __launch_bounds__(256),",
+                "QSA_KV_F32, float)",
+                "QSA_ATTENTION_SINGLE(indexed_attention_attention_fp8_fnuz, qsa_attention_single, __launch_bounds__(256),",
+                "QSA_KV_FP8_FNUZ, unsigned char)",
+            ],
+            "unmarked code in the QSA row module"
+        );
+    }
+
+    /// The frozen hipcc anchor of the QSA row module: `hipcc --genco --offload-arch=gfx942 -O3
+    /// --no-offload-compress -fuse-cuid=none -mcode-object-version=6` (`core_hipcc_flags`) of the
+    /// pinned source (ROCm 7.16, AMD clang 24.0.0git d6f6cb6918). Re-seal both hashes together
+    /// when the source changes.
+    #[test]
+    fn g942_qsa_row_anchor_and_source_are_pinned() {
+        use sha2::{Digest, Sha256};
+        const SOURCE_SHA256: &str =
+            "e95e554a7f939feaa2d9a80393edb9a4d1df0596149afb3b4cc54e9599a06b6e";
+        const ANCHOR_SHA256: &str =
+            "bbc9fbcfe6a2cd5ebc830fc82ffc9a6a360d7efe3c15c5824d93eda5513e4d9c";
+        let hex = |bytes: &[u8]| -> String {
+            Sha256::digest(bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        };
+        assert_eq!(hex(super::QWEN4_G942_QSA_ROW_SRC.as_bytes()), SOURCE_SHA256);
+        let anchor: &[u8] =
+            include_bytes!("../../../../kernels/qwen4_g942_qsa_row_attention_hipcc_gfx942.co");
+        assert_eq!(hex(anchor), ANCHOR_SHA256);
+        // Exactly the entries gfx942 can select are exported by the anchor, and no serial or
+        // batched sibling is.
+        for (_, name) in super::QWEN4_G942_QSA_ROW_ENTRIES {
+            assert!(
+                anchor.windows(name.len()).any(|w| w == name.as_bytes()),
+                "{name} missing from the anchor"
+            );
+        }
+        for absent in ["_serial", "_batched", "_hg4", "_hg12"] {
+            assert!(
+                !anchor.windows(absent.len()).any(|w| w == absent.as_bytes()),
+                "{absent} entry in the QSA row anchor"
             );
         }
     }

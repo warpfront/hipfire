@@ -10077,7 +10077,7 @@ pub fn indexed_attention_attention(
             }
             _ => (serial, 0),
         };
-    gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel_name)?;
+    let kernel_name = crate::cdna::gfx942::ensure_qsa_row_kernel(gpu, kernel_name)?;
     let mut args = KernargBlob::new();
     for tensor in [
         p.q_with_gate,
