@@ -598,6 +598,9 @@ pub fn parse_tool_calls_body(body: &str) -> Result<Vec<ToolCall>, String> {
     let mut out = Vec::new();
     let mut cursor = 0;
     while let Some((open_rel, open_len, close_marker)) = next_open(&body[cursor..]) {
+        // Only whitespace may sit between invokes: anything else is a
+        // misspelled open whose call would be dropped silently.
+        stray_text(&body[cursor..cursor + open_rel])?;
         let abs = cursor + open_rel + open_len;
         let close_attr = body[abs..]
             .find("\">")
@@ -627,6 +630,7 @@ pub fn parse_tool_calls_body(body: &str) -> Result<Vec<ToolCall>, String> {
         });
         cursor = invoke_close + used_close_len;
     }
+    stray_text(&body[cursor..])?;
     if out.is_empty() {
         return Err("DSML tool_calls block without a parseable invoke".to_string());
     }
@@ -640,6 +644,7 @@ fn parse_parameters(body: &str) -> Result<Value, String> {
     let mut map = serde_json::Map::new();
     let mut cursor = 0;
     while let Some(param_start) = body[cursor..].find(PARAMETER_OPEN_PREFIX) {
+        stray_text(&body[cursor..cursor + param_start])?;
         let abs = cursor + param_start + PARAMETER_OPEN_PREFIX.len();
         let bad = || format!("malformed DSML parameter at {:?}", &body[abs..]);
         // name="..." [string="true|false"]>
@@ -675,7 +680,18 @@ fn parse_parameters(body: &str) -> Result<Value, String> {
         map.insert(name.to_string(), value);
         cursor = content_end + PARAMETER_CLOSE.len();
     }
+    stray_text(&body[cursor..])?;
     Ok(Value::Object(map))
+}
+
+/// Text between DSML tags must be whitespace (the grammar emits only `\n`);
+/// anything else is a misspelled tag whose call or parameter would be lost.
+fn stray_text(s: &str) -> Result<(), String> {
+    if s.trim().is_empty() {
+        Ok(())
+    } else {
+        Err(format!("stray text between DSML tags: {s:?}"))
+    }
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -1142,6 +1158,49 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].arguments, json!({"city": "Paris"}));
         assert_eq!(calls[1].arguments, json!({"tz": "CET"}));
+    }
+
+    #[test]
+    fn misspelled_open_or_attr_is_malformed_not_dropped() {
+        // Misspelled invoke open, after and before a good invoke: the
+        // misspelled call was dropped silently.
+        assert_malformed(&format!(
+            "<｜DSML｜invoke name=\"get_weather\">\n{WEATHER}</｜DSML｜invoke>\n\
+             <｜DSML｜invinoke name=\"get_time\">\n{TIME}</｜DSML｜invoke>\n"
+        ));
+        assert_malformed(&format!(
+            "<｜DSML｜invinoke name=\"get_time\">\n{TIME}</｜DSML｜invoke>\n\
+             <｜DSML｜invoke name=\"get_weather\">\n{WEATHER}</｜DSML｜invoke>\n"
+        ));
+        // Misspelled parameter open before a good one.
+        assert_malformed(&format!(
+            "<｜DSML｜invoke name=\"get_weather\">\n\
+             <｜DSML｜paramter name=\"tz\" string=\"true\">CET</｜DSML｜parameter>\n\
+             {WEATHER}</｜DSML｜invoke>\n"
+        ));
+        // Misspelled parameter open, alone ({} args) and after a good one.
+        assert_malformed(
+            "<｜DSML｜invoke name=\"get_weather\">\n\
+             <｜DSML｜paramter name=\"city\" string=\"true\">Paris</｜DSML｜parameter>\n\
+             </｜DSML｜invoke>\n",
+        );
+        assert_malformed(&format!(
+            "<｜DSML｜invoke name=\"get_weather\">\n{WEATHER}\
+             <｜DSML｜paramter name=\"tz\" string=\"true\">CET</｜DSML｜parameter>\n\
+             </｜DSML｜invoke>\n"
+        ));
+        // Misspelled string attr; empty parameter name; empty block.
+        assert_malformed(
+            "<｜DSML｜invoke name=\"get_weather\">\n\
+             <｜DSML｜parameter name=\"city\" strng=\"true\">Paris</｜DSML｜parameter>\n\
+             </｜DSML｜invoke>\n",
+        );
+        assert_malformed(
+            "<｜DSML｜invoke name=\"get_weather\">\n\
+             <｜DSML｜parameter name=\"\" string=\"true\">Paris</｜DSML｜parameter>\n\
+             </｜DSML｜invoke>\n",
+        );
+        assert_malformed("");
     }
 
     #[test]
