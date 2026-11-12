@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Launcher ABI audit: expand bounded identifier/decimal token pastes in kernel-defining macros using raw paste arguments, so the unchanged HC-gates macro source and all seven real launch ABIs are checked without source exclusions. Stringification, variadics and unsupported paste operands still fail closed.
+
 - PeaceMaker gfx942: seal all four unchanged GLOBAL-only GDN verify entries after proving the conv join's incoming scalar-constant edge. Pin the immutable replacement source/anchor and exact-image MI300X oracle receipt (280 checks, including conv and gate); original FLAT rollback fixture remains negative-only. No wait allowance, cap increase, instruction rewrite or production dispatch change.
 
 ### 0.5.0 removals

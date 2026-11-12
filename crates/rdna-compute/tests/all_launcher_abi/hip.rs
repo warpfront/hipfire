@@ -189,8 +189,8 @@ fn parse_func_macro(after_name: &str) -> Result<Def, String> {
 /// Expands one invocation of a kernel-defining function-like macro starting at the
 /// identifier that ends at `c[after_name]`: returns the expansion and the index after
 /// the invocation's closing parenthesis. Fail closed on everything this reader does
-/// not model: variadics, `#`/`##`, string/char literals or unclosed (multi-line)
-/// invocation arguments, and an argument-count mismatch.
+/// not model: variadics, stringification, non-identifier/non-decimal token pastes,
+/// string/char invocation arguments, unclosed arguments, and argument-count mismatches.
 fn expand_kernel_macro(
     name: &str,
     params: &[String],
@@ -200,9 +200,9 @@ fn expand_kernel_macro(
     defs: &BTreeMap<String, Def>,
     depth: u32,
 ) -> Result<(String, usize), String> {
-    if params.iter().any(|p| p.contains("...")) || body.contains('#') {
+    if params.iter().any(|p| p.contains("...")) {
         return Err(format!(
-            "kernel-defining macro {name} uses variadics, `#` or `##`, which this reader does not expand"
+            "kernel-defining macro {name} uses variadics, which this reader does not expand"
         ));
     }
     let mut k = after_name;
@@ -265,6 +265,11 @@ fn expand_kernel_macro(
         actual.insert(p.as_str(), expand_obj(a.trim(), defs, depth + 1)?);
     }
     let b: Vec<char> = body.chars().collect();
+    let raw: BTreeMap<&str, &str> = params
+        .iter()
+        .zip(&args)
+        .map(|(p, a)| (p.as_str(), a.trim()))
+        .collect();
     let mut sub = String::with_capacity(body.len());
     let mut i = 0usize;
     while i < b.len() {
@@ -274,9 +279,18 @@ fn expand_kernel_macro(
                 j += 1;
             }
             let w: String = b[i..j].iter().collect();
-            match actual.get(w.as_str()) {
-                Some(a) => sub.push_str(a),
-                None => sub.push_str(&w),
+            let next = b[j..]
+                .iter()
+                .position(|c| !c.is_whitespace())
+                .map(|k| j + k);
+            let pasted = next.is_some_and(|k| b[k] == '#' && b.get(k + 1) == Some(&'#'));
+            if pasted {
+                sub.push_str(raw.get(w.as_str()).copied().unwrap_or(&w));
+            } else {
+                match actual.get(w.as_str()) {
+                    Some(a) => sub.push_str(a),
+                    None => sub.push_str(&w),
+                }
             }
             i = j;
         } else if b[i].is_ascii_digit() {
@@ -286,6 +300,63 @@ fn expand_kernel_macro(
             }
             sub.extend(b[i..j].iter());
             i = j;
+        } else if b[i] == '#' {
+            if b.get(i + 1) != Some(&'#') {
+                return Err(format!(
+                    "kernel-defining macro {name}: stringification is unsupported"
+                ));
+            }
+            while sub.ends_with(char::is_whitespace) {
+                sub.pop();
+            }
+            let left = sub
+                .char_indices()
+                .rev()
+                .take_while(|(_, c)| is_ident_char(*c))
+                .last()
+                .map(|(k, _)| k)
+                .ok_or_else(|| format!("kernel-defining macro {name}: missing paste operand"))?;
+            // The raw operand must be exactly one supported preprocessing token.
+            if left > 0
+                && sub[..left]
+                    .chars()
+                    .last()
+                    .is_some_and(|c| !c.is_whitespace() && c != '(' && c != ',' && c != '*')
+            {
+                return Err(format!(
+                    "kernel-defining macro {name}: ambiguous paste operand"
+                ));
+            }
+            let mut start = i + 2;
+            while b.get(start).is_some_and(|c| c.is_whitespace()) {
+                start += 1;
+            }
+            let mut end = start;
+            while b.get(end).is_some_and(|c| is_ident_char(*c)) {
+                end += 1;
+            }
+            let word: String = b[start..end].iter().collect();
+            let right = raw.get(word.as_str()).copied().unwrap_or(&word);
+            let token = |s: &str| {
+                !s.is_empty()
+                    && s.chars().all(is_ident_char)
+                    && (s.starts_with(|c: char| c == '_' || c.is_ascii_alphabetic())
+                        || s.chars().all(|c| c.is_ascii_digit()))
+            };
+            if !token(&sub[left..]) || !token(right) {
+                return Err(format!(
+                    "kernel-defining macro {name}: unsupported paste operand"
+                ));
+            }
+            let joined = format!("{}{right}", &sub[left..]);
+            if !token(&joined) {
+                return Err(format!(
+                    "kernel-defining macro {name}: unsupported pasted token"
+                ));
+            }
+            sub.truncate(left);
+            sub.push_str(&joined);
+            i = end;
         } else {
             sub.push(b[i]);
             i += 1;

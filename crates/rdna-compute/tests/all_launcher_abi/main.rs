@@ -3953,6 +3953,56 @@ fn hip_expands_kernel_defining_function_macros_and_fails_closed() {
     assert!(hip::decls_of(plain).expect("parse").contains_key("k"));
 }
 
+#[test]
+fn hip_kernel_macro_token_pastes_use_raw_arguments_and_fail_closed() {
+    let src = "#define R 8\n#define ENTRY(R) extern \"C\" __global__ void kernel_r##R(float* p, int n) {}\nENTRY(2)\nENTRY(R)\n";
+    let declarations = hip::decls_of(src).unwrap();
+    assert_eq!(declarations.len(), 2);
+    assert!(declarations.contains_key("kernel_r2"));
+    assert!(
+        declarations.contains_key("kernel_rR"),
+        "paste operands are not macro-expanded first"
+    );
+    assert!(!declarations.contains_key("kernel_r8"));
+    let spaced = src.replace("kernel_r##R", "kernel_ ## r ## R");
+    assert!(hip::decls_of(&spaced).unwrap().contains_key("kernel_r2"));
+    for bad in [
+        src.replace("kernel_r##R", "kernel_r##"),
+        src.replace("kernel_r##R", "##R"),
+        src.replace("kernel_r##R", "kernel_r#R"),
+        src.replace("ENTRY(2)", "ENTRY(2 + 1)"),
+        src.replace("ENTRY(2)", "ENTRY()"),
+        src.replace("ENTRY(2)", "ENTRY(2.0)"),
+        src.replace("ENTRY(2)", "ENTRY(\"2\")"),
+    ] {
+        assert!(hip::decls_of(&bad).is_err(), "{bad}");
+    }
+    let source =
+        std::fs::read_to_string(root().join("kernels/src/qwen4_g942_hc_gates.gfx942.hip")).unwrap();
+    let actual = hip::decls_of(&source).unwrap();
+    assert_eq!(actual.len(), 7);
+    for rows in 2..=8 {
+        let declaration = &actual[&format!("gemv_bf16_xf32_k4_rows_tiled_r{rows}")];
+        assert_eq!(declaration.end, 40);
+        assert_eq!(
+            declaration
+                .args
+                .iter()
+                .map(|a| (a.offset, a.size, a.kind))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, 8, 'p'),
+                (8, 8, 'p'),
+                (16, 8, 'p'),
+                (24, 4, 'i'),
+                (28, 4, 'i'),
+                (32, 4, 'f'),
+                (36, 4, 'i')
+            ]
+        );
+    }
+}
+
 // ---- `[x; N]` repeat arrays and `.iter().chain(..)` loops ----------------------------
 
 fn repeat_array_source() -> String {
