@@ -913,15 +913,12 @@ fn oracle(env: &mut Env, sets: &[WeightSet], rows: &[usize], seeds: u64, rep: &m
                             }
                         }
                         Kind::Read | Kind::Final => {
-                            // Both arms: the fused rows16 down + activation up to 16 rows,
-                            // the (wide / rows16) GEMM and the unfused chain past it.
-                            let fold = n <= 16;
+                            // Both arms: the fused rows16 down + activation up to 16 rows; past it
+                            // the (wide / rows16) GEMM and the one `hc_activation_fused_f32` launch.
                             for (arm, symbols) in [("lane", &lane.symbols), ("chunk", &chunk.symbols)] {
                                 let fused = count(symbols, "hc_act");
                                 let chain = count(symbols, "roundtrip");
-                                if (fold && (fused != 1 || chain != 0))
-                                    || (!fold && (fused != 0 || chain == 0))
-                                {
+                                if fused != 1 || chain != 0 {
                                     rep.census_failures.push(format!(
                                         "{label}: {arm} read route: {}",
                                         census_line(symbols)
