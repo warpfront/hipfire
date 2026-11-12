@@ -56,8 +56,12 @@ Non-goals for this PR: no `admissions.yml` row (routing-capable, product-refused
   Qwen35Carrier arch-24 branch with target-pairing refusals (hidden/vocab/
   target-layer). The branch refuses at the same pointing surface until the
   bridge kernels land, so nothing half-serves
-- [ ] bridge HIP kernels + speculator build (consumes the load surface above;
-  contracts pinned in [2026-11-12-dspine-kernels.md](2026-11-12-dspine-kernels.md))
+- [~] bridge HIP kernels + speculator build (contracts pinned in
+  [2026-11-12-dspine-kernels.md](2026-11-12-dspine-kernels.md)): four HIP
+  symbols + gfx1100 launchers + `DspineBridge` runner (load, scratch, and the
+  seven-step per-layer chain) + the `DraftLayerBridge` trunk hook are in;
+  Tier C parity on gfx1100 and the speculator wiring (carrier build flip,
+  embedding tap, anchor feed) remain
 - [ ] serial refinement (Tier C)
 - [ ] parity + KLD oracle (Tier P)
 - [ ] gfx1100 end-to-end: acceptance length vs DFlash2/MTP arms (Tier S/U)

@@ -22,6 +22,8 @@ pub mod dflash_sampled_accept;
 pub mod dflash_selector;
 pub mod dflash_state_copy;
 mod dispatch;
+/// DSpine arch-24 code-bridge launchers (gfx1100-only, include_str! pattern).
+pub mod dspine_bridge;
 pub mod draft_lane_conv;
 pub mod draft_lane_rows;
 pub mod e8p_moe_decode;

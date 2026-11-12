@@ -3691,6 +3691,62 @@ pub fn draft_seed_backfill(
 ///     If `None`, the caller must have already filled `scratch.target_hidden`
 ///     with `ctx_len × feature_width` F32 rows.
 #[allow(clippy::too_many_arguments)]
+/// Per-layer bridge hook for composite drafters over the shared DFlash trunk
+/// (arch-24 DSpine: the code-bridge write runs after every draft layer).
+///
+/// Called after draft layer `li` finished its post stage, on the eager path
+/// only — the bridge launchers are not graph-capturable in v1, so callers
+/// with a bridge refuse graph capture/replay up front. The implementer adds
+/// its delta into `scratch.x` (the block's `b` rows); the next layer's
+/// existing pre-stage attention norm then applies to the bridged rows, which
+/// is the same math as upstream fusing the next-input RMSNorm into the
+/// write.
+pub trait DraftLayerBridge {
+    fn after_layer(
+        &mut self,
+        gpu: &mut Gpu,
+        scratch: &mut DflashScratch,
+        li: usize,
+        b: usize,
+        ctx_len: usize,
+    ) -> HipResult<()>;
+}
+
+/// [`draft_forward`] with a per-layer bridge hook (arch-24 DSpine). Everything
+/// else matches [`draft_forward_opts`] with `graph_ffn = false`.
+#[allow(clippy::too_many_arguments)]
+pub fn draft_forward_bridge(
+    gpu: &mut Gpu,
+    weights: &DflashWeights,
+    cfg: &DflashConfig,
+    noise_embedding: Option<&[f32]>,
+    target_hidden: Option<&[f32]>,
+    positions_q: &[i32],
+    positions_k: &[i32],
+    block_size: usize,
+    ctx_len: usize,
+    scratch: &mut DflashScratch,
+    bridge: &mut dyn DraftLayerBridge,
+) -> HipResult<()> {
+    draft_forward_based_impl(
+        gpu,
+        weights,
+        cfg,
+        noise_embedding,
+        target_hidden,
+        0,
+        positions_q,
+        positions_k,
+        block_size,
+        ctx_len,
+        scratch,
+        false,
+        None,
+        false,
+        Some(bridge),
+    )
+}
+
 pub fn draft_forward(
     gpu: &mut Gpu,
     weights: &DflashWeights,
@@ -3781,6 +3837,7 @@ pub fn draft_forward_based(
         graph_ffn,
         None,
         true,
+        None,
     )
 }
 
@@ -3827,6 +3884,7 @@ pub fn draft_forward_planned(
         false,
         Some(staged),
         false,
+        None,
     )
 }
 
@@ -3846,6 +3904,7 @@ fn draft_forward_based_impl(
     graph_ffn: bool,
     staged: Option<&DraftStagedInputs<'_>>,
     publish: bool,
+    bridge: Option<&mut dyn DraftLayerBridge>,
 ) -> HipResult<()> {
     // The graph state is taken out of the scratch for the call so the segment
     // closures can borrow the scratch while the state records into itself.
@@ -3865,6 +3924,7 @@ fn draft_forward_based_impl(
         graph_ffn,
         staged,
         publish,
+        bridge,
         &mut graphs,
     );
     scratch.draft_graph = graphs;
@@ -3887,6 +3947,7 @@ fn draft_forward_based_inner(
     graph_ffn: bool,
     staged: Option<&DraftStagedInputs<'_>>,
     publish: bool,
+    mut bridge: Option<&mut dyn DraftLayerBridge>,
     graphs: &mut DraftGraphState,
 ) -> HipResult<()> {
     let base = target_hidden_base;
@@ -4208,6 +4269,12 @@ fn draft_forward_based_inner(
         ordered,
         dbg || staged.is_some(),
     )?;
+    if bridge.is_some() && (graph_ffn || graph_seg) {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "draft layer bridge is eager-only in v1; graph capture/replay cannot host it",
+        ));
+    }
     if graph_seg {
         // Segment 0: layer 0's fixed head. Segment `i + 1`: layer `i`'s fixed tail + layer
         // `i + 1`'s fixed head (the last one ends with the final norm). The variable
@@ -4518,6 +4585,13 @@ fn draft_forward_based_inner(
             draft_layer_post(
                 gpu, layer, scratch, cfg, li, b, h, eps, ordered, graph_ffn, dbg, false,
             )?;
+        }
+        // Arch-24 bridge write (DSpine): runs on the eager path only (the
+        // graph route was refused above when a bridge is present). It adds
+        // its delta into scratch.x; the next layer's pre-stage norm applies
+        // to the bridged rows, so the trunk loop needs nothing else.
+        if let Some(bridge) = bridge.as_deref_mut() {
+            bridge.after_layer(gpu, scratch, li, b, l)?;
         }
         // 2026-04-21: tried target's fused gemm_gate_up_hfq4g256 here (shared
         // FP16-X convert + interleaved gate/up GEMMs). Byte-exact A/B neutral
