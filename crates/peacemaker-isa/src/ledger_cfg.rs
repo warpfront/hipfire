@@ -715,7 +715,15 @@ fn region_exit_is_drained(
 }
 
 fn walk(program: &Program, foreign: &[Range<usize>], mode: Mode) -> Result<Stats, String> {
-    walk_with(program, foreign, mode, Ledger::replay_state_key, None, &[], true)
+    walk_with(
+        program,
+        foreign,
+        mode,
+        Ledger::replay_state_key,
+        None,
+        &[],
+        true,
+    )
 }
 
 /// Why `choices` and `entries` cannot be the proof tables of `program`: `choices` must have
@@ -1071,9 +1079,13 @@ fn walk_with(
                 let entry = edge.and_then(|e| entry_proofs.get(&e));
                 let states = seen.entry(pc).or_default();
                 let mut key = state_key(&ledger);
-                if vm_observers.get(end).and_then(Option::as_ref).is_some_and(|observed| {
-                    ledger.vmem_loads_unobserved(|reg| observed.observes(reg))
-                }) {
+                if vm_observers
+                    .get(end)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|observed| {
+                        ledger.vmem_loads_unobserved(|reg| observed.observes(reg))
+                    })
+                {
                     key.retain(|entry| entry.0 != Counter::Vm);
                 }
                 if !states.insert((key, entry.map(|e| e.choice))) {
@@ -1888,7 +1900,15 @@ mod tests {
     }
     /// The baseline walk: label dedup on the un-canonicalized key (`Ledger::full_state_key`).
     fn walk_full(p: &Program) -> Result<Stats, String> {
-        walk_with(p, &[], Mode::Strict, Ledger::full_state_key, None, &[], false)
+        walk_with(
+            p,
+            &[],
+            Mode::Strict,
+            Ledger::full_state_key,
+            None,
+            &[],
+            false,
+        )
     }
 
     /// gfx942 `replay_state_key` drops only the registers a pending store read, which the gfx942
@@ -2233,7 +2253,10 @@ mod tests {
         assert_eq!(new.label_states, 10, "{new:?}");
         // The scalar-control adapter uses the same abstraction with identical proof maps.
         let choices = vec![EdgeChoice::Both; p.instructions.len()];
-        assert_eq!(verify_with_branch_proofs(&p, &[], &choices, &[]).unwrap(), new);
+        assert_eq!(
+            verify_with_branch_proofs(&p, &[], &choices, &[]).unwrap(),
+            new
+        );
     }
 
     #[test]
@@ -2387,7 +2410,15 @@ mod tests {
 
     /// The baseline-keyed walk under the same proof map as `verify_with_branch_proofs`.
     fn walk_full_proved(p: &Program, choices: &[EdgeChoice]) -> Result<Stats, String> {
-        walk_with(p, &[], Mode::Strict, Ledger::full_state_key, Some(choices), &[], false)
+        walk_with(
+            p,
+            &[],
+            Mode::Strict,
+            Ledger::full_state_key,
+            Some(choices),
+            &[],
+            false,
+        )
     }
 
     #[test]
