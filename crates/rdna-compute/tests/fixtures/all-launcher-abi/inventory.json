@@ -427,6 +427,7 @@
   },
   "non_launching": {
     "crates/rdna-compute/src/cdna/gfx942.rs::g942_gdn_lanes_ensure": "GDN lanes module loader (ensure_kernel or ensure_embedded_kernel) only; never launches. The owner qwen4_gdn_lanes_step_f32 method contains the required independently checked live blob site.",
+    "crates/rdna-compute/src/cdna/gfx942.rs::g942_gdn_lanes_capture_ensure": "GDN capture lanes module loader (ensure_kernel or ensure_embedded_kernel) only; never launches. The owner qwen4_gdn_lanes_step_capture_f32 method retains its independently checked live blob site; no symbol is exempted from live launch coverage.",
     "crates/rdna-compute/src/cdna/gfx942_qsa_lanes.rs::g942_qsa_lanes_ensure": "QSA lanes module loader (ensure_kernel or ensure_embedded_kernel) only; never launches. All five required blob launch sites remain checked in qwen4_qsa_lanes_core; no symbol is exempted from live launch coverage.",
     "crates/rdna-compute/src/cdna/gfx942.rs::g942_wide_ensure": "wide module loader: ensure_kernel or ensure_embedded_kernel only, never launches; gemm_bf16_mfma_gfx942_wide calls it and its actual params/blob site checks all three returned entry names",
     "crates/rdna-compute/src/cdna/gfx942.rs::wide_entry": "pure WIDE_ENTRIES selector returning the symbol, tile rows and chunk size; never launches or loads; gemm_bf16_mfma_gfx942_wide consumes the returned symbol at its checked live launch site",
