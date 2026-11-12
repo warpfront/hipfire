@@ -1111,7 +1111,10 @@ fn main() {
                         None,
                     )
                     .expect("forward_prefill_batch prefix");
-                    qwen35::forward_prefill_batch(
+                    // The scored region is an ordinary prefill continuation that captures
+                    // its rows' hidden states (the prompt-fill capture), so the canonical
+                    // GDN stream stays Open across the prefix and scored calls.
+                    qwen35::forward_prefill_batch_capture_hidden(
                         &mut gpu,
                         &weights,
                         &config,
@@ -1120,12 +1123,9 @@ fn main() {
                         &mut kv_cache,
                         &mut dn_state,
                         &scratch,
-                        None,
-                        Some(h_buf),
-                        None,
-                        None,
+                        h_buf,
                     )
-                    .expect("forward_prefill_batch scored");
+                    .expect("forward_prefill_batch_capture_hidden scored");
                     h_buf
                 };
 
