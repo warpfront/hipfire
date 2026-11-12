@@ -160,7 +160,9 @@ fn kv_bytes(rng: &mut Rng, fmt: Fmt, geo: Geo, cap: usize, scale: f32) -> Vec<u8
 
 fn inputs(rng: &mut Rng, fmt: Fmt, geo: Geo, cap: usize, wide: bool) -> Inputs {
     let scale = if wide { 3.0 } else { 1.0 };
-    let q = (0..geo.nh * geo.hd * 2).map(|_| rng.f32() * 2.0 * scale).collect();
+    let q = (0..geo.nh * geo.hd * 2)
+        .map(|_| rng.f32() * 2.0 * scale)
+        .collect();
     Inputs {
         q,
         k: kv_bytes(rng, fmt, geo, cap, scale),
@@ -224,7 +226,9 @@ fn upload_sel(gpu: &Gpu, sel: &[i32]) -> Res<GpuTensor> {
 /// A fresh output tensor with 0x7f guards; the body view is `[nh * hd]` F32.
 fn out_buffer(gpu: &mut Gpu, geo: Geo) -> Res<(GpuTensor, GpuTensor)> {
     let n = geo.nh * geo.hd;
-    let full = gpu.alloc_tensor(&[n + 2 * GUARD], DType::F32).map_err(err)?;
+    let full = gpu
+        .alloc_tensor(&[n + 2 * GUARD], DType::F32)
+        .map_err(err)?;
     gpu.hip
         .memset(&full.buf, 0x7f, full.byte_size())
         .map_err(err)?;
@@ -305,7 +309,9 @@ fn run_case(
     let reference = fmt.reference();
     let module = lab_ensure_qsa_row_entry(gpu, reference).map_err(err)?;
     if module == reference {
-        return Err(format!("{reference} was not routed to the gfx942 row module"));
+        return Err(format!(
+            "{reference} was not routed to the gfx942 row module"
+        ));
     }
     ensure_reference(gpu, reference)?;
     let mk = |symbol| Launch {
@@ -371,12 +377,43 @@ fn ensure_reference(gpu: &mut Gpu, kernel: &str) -> Res<()> {
 }
 
 const SEL_LENS: [usize; 26] = [
-    1, 2, 3, 7, 23, 24, 25, 47, 48, 49, 50, 63, 64, 65, 127, 128, 255, 256, 257, 511, 512, 1000,
-    2051, 4096, 8187, LDS_MAX_SELECTED,
+    1,
+    2,
+    3,
+    7,
+    23,
+    24,
+    25,
+    47,
+    48,
+    49,
+    50,
+    63,
+    64,
+    65,
+    127,
+    128,
+    255,
+    256,
+    257,
+    511,
+    512,
+    1000,
+    2051,
+    4096,
+    8187,
+    LDS_MAX_SELECTED,
 ];
 const SEL_LENS_SHORT: [usize; 8] = [1, 23, 24, 25, 48, 257, 1000, 2051];
 
-fn sweep(gpu: &mut Gpu, rng: &mut Rng, tally: &mut Tally, fmt: Fmt, geo: Geo, quick: bool) -> Res<()> {
+fn sweep(
+    gpu: &mut Gpu,
+    rng: &mut Rng,
+    tally: &mut Tally,
+    fmt: Fmt,
+    geo: Geo,
+    quick: bool,
+) -> Res<()> {
     let main = geo.nh == 24 && geo.nkv == 2 && geo.hd == 256;
     let lens: Vec<usize> = if quick {
         vec![1, 24, 257, 2051]
@@ -387,7 +424,11 @@ fn sweep(gpu: &mut Gpu, rng: &mut Rng, tally: &mut Tally, fmt: Fmt, geo: Geo, qu
     };
     let modes: &[Sel] = &[Sel::Valid, Sel::Mixed, Sel::AllInvalid];
     // Fixed capacities: one K/V upload serves every selection length.
-    let fixed: &[usize] = if main && !quick { &[4096, 16384] } else { &[4096] };
+    let fixed: &[usize] = if main && !quick {
+        &[4096, 16384]
+    } else {
+        &[4096]
+    };
     for &cap in fixed {
         let host = inputs(rng, fmt, geo, cap, cap == 4096 && geo.hd != 98);
         let dev = upload_dev(gpu, fmt, &host)?;
@@ -424,12 +465,18 @@ fn detect(tally: &mut Tally, name: &str, differing: usize) {
         tally.missed += 1;
         eprintln!("CONTROL MISSED {name}: no differing byte");
     }
-    tally.rows.push(json!({"control": name, "differing_bytes": differing, "detected": differing > 0}));
+    tally
+        .rows
+        .push(json!({"control": name, "differing_bytes": differing, "detected": differing > 0}));
 }
 
 /// The planted controls of one format on a small clean case (8 valid rows, capacity 64).
 fn controls(gpu: &mut Gpu, rng: &mut Rng, tally: &mut Tally, fmt: Fmt) -> Res<()> {
-    let geo = Geo { nh: 24, nkv: 2, hd: 256 };
+    let geo = Geo {
+        nh: 24,
+        nkv: 2,
+        hd: 256,
+    };
     let (cap, len) = (64usize, 8usize);
     let host = inputs(rng, fmt, geo, cap, false);
     let sel: Vec<i32> = (0..len as i32).map(|i| i * 5 + 1).collect();
@@ -442,7 +489,15 @@ fn controls(gpu: &mut Gpu, rng: &mut Rng, tally: &mut Tally, fmt: Fmt) -> Res<()
         let (full, body) = out_buffer(gpu, geo)?;
         launch_direct(
             gpu,
-            &Launch { symbol, dev, sel: &sel_dev, geo, sel_len: len, cap, swap_kv: swap },
+            &Launch {
+                symbol,
+                dev,
+                sel: &sel_dev,
+                geo,
+                sel_len: len,
+                cap,
+                swap_kv: swap,
+            },
             &body,
         )?;
         Ok(read_out(gpu, &full, geo)?.0)
@@ -451,14 +506,25 @@ fn controls(gpu: &mut Gpu, rng: &mut Rng, tally: &mut Tally, fmt: Fmt) -> Res<()
     // Sanity: the clean module equals the reference (also a counted case above).
     let m = run(gpu, module, &clean, len, false)?;
     if diff(&m, &r) != 0 {
-        return Err(format!("{}: clean control case: module differs from reference", fmt.name()));
+        return Err(format!(
+            "{}: clean control case: module differs from reference",
+            fmt.name()
+        ));
     }
     let row = fmt.row_bytes(geo.nkv, geo.hd);
     // One flipped byte: V of the first selected token (kv head 0, channel 0), K of it, Q of head 0.
     let first = sel[0] as usize;
     let flip = |bytes: &mut Vec<u8>, at: usize| bytes[at] ^= 0x40;
-    for (name, which) in [("flip_v_byte", 'v'), ("flip_k_byte", 'k'), ("flip_q_byte", 'q')] {
-        let mut h = Inputs { q: host.q.clone(), k: host.k.clone(), v: host.v.clone() };
+    for (name, which) in [
+        ("flip_v_byte", 'v'),
+        ("flip_k_byte", 'k'),
+        ("flip_q_byte", 'q'),
+    ] {
+        let mut h = Inputs {
+            q: host.q.clone(),
+            k: host.k.clone(),
+            v: host.v.clone(),
+        };
         match (which, fmt) {
             ('v', Fmt::F32) => flip(&mut h.v, first * row + 3),
             ('k', Fmt::F32) => flip(&mut h.k, first * row + 3),
@@ -470,8 +536,16 @@ fn controls(gpu: &mut Gpu, rng: &mut Rng, tally: &mut Tally, fmt: Fmt) -> Res<()
         let got = run(gpu, module, &dev, len, false)?;
         detect(tally, &format!("{} {name}", fmt.name()), diff(&got, &r));
     }
-    detect(tally, &format!("{} swap_kv_binding", fmt.name()), diff(&run(gpu, module, &clean, len, true)?, &r));
-    detect(tally, &format!("{} selected_len_minus_1", fmt.name()), diff(&run(gpu, module, &clean, len - 1, false)?, &r));
+    detect(
+        tally,
+        &format!("{} swap_kv_binding", fmt.name()),
+        diff(&run(gpu, module, &clean, len, true)?, &r),
+    );
+    detect(
+        tally,
+        &format!("{} selected_len_minus_1", fmt.name()),
+        diff(&run(gpu, module, &clean, len - 1, false)?, &r),
+    );
     // The other format's module entry on the same buffers. F32 buffers hold more bytes than the
     // FNUZ rows read; FNUZ buffers are zero-padded to the F32 row size first.
     let wrong_symbol = lab_ensure_qsa_row_entry(gpu, fmt.other().reference()).map_err(err)?;
@@ -491,7 +565,11 @@ fn controls(gpu: &mut Gpu, rng: &mut Rng, tally: &mut Tally, fmt: Fmt) -> Res<()
         }
     };
     let got = run(gpu, wrong_symbol, &wrong_dev, len, false)?;
-    detect(tally, &format!("{} wrong_entry({wrong_symbol})", fmt.name()), diff(&got, &r));
+    detect(
+        tally,
+        &format!("{} wrong_entry({wrong_symbol})", fmt.name()),
+        diff(&got, &r),
+    );
     Ok(())
 }
 
@@ -512,30 +590,71 @@ fn main() {
         eprintln!("skip: needs an exact gfx942 device");
         std::process::exit(0);
     }
-    let image = std::env::var("HIPFIRE_QWEN4_G942_QSA_ROW_IMAGE").ok().filter(|p| !p.is_empty());
+    let image = std::env::var("HIPFIRE_QWEN4_G942_QSA_ROW_IMAGE")
+        .ok()
+        .filter(|p| !p.is_empty());
     println!(
         "module arm: {}",
-        image
-            .as_deref()
-            .map_or("hipcc source (module qwen4_g942_qsa_row_attention)".to_owned(), |p| {
-                format!("code object {p}")
-            })
+        image.as_deref().map_or(
+            "hipcc source (module qwen4_g942_qsa_row_attention)".to_owned(),
+            |p| { format!("code object {p}") }
+        )
     );
     let mut rng = Rng(seed);
     let mut tally = Tally::default();
     let geoms_f32 = [
-        Geo { nh: 24, nkv: 2, hd: 256 },
-        Geo { nh: 24, nkv: 2, hd: 128 },
-        Geo { nh: 8, nkv: 1, hd: 256 },
-        Geo { nh: 6, nkv: 3, hd: 98 },
-        Geo { nh: 16, nkv: 4, hd: 64 },
-        Geo { nh: 4, nkv: 2, hd: 384 },
+        Geo {
+            nh: 24,
+            nkv: 2,
+            hd: 256,
+        },
+        Geo {
+            nh: 24,
+            nkv: 2,
+            hd: 128,
+        },
+        Geo {
+            nh: 8,
+            nkv: 1,
+            hd: 256,
+        },
+        Geo {
+            nh: 6,
+            nkv: 3,
+            hd: 98,
+        },
+        Geo {
+            nh: 16,
+            nkv: 4,
+            hd: 64,
+        },
+        Geo {
+            nh: 4,
+            nkv: 2,
+            hd: 384,
+        },
     ];
     let geoms_fnuz = [
-        Geo { nh: 24, nkv: 2, hd: 256 },
-        Geo { nh: 8, nkv: 2, hd: 256 },
-        Geo { nh: 12, nkv: 4, hd: 256 },
-        Geo { nh: 16, nkv: 2, hd: 256 },
+        Geo {
+            nh: 24,
+            nkv: 2,
+            hd: 256,
+        },
+        Geo {
+            nh: 8,
+            nkv: 2,
+            hd: 256,
+        },
+        Geo {
+            nh: 12,
+            nkv: 4,
+            hd: 256,
+        },
+        Geo {
+            nh: 16,
+            nkv: 2,
+            hd: 256,
+        },
     ];
     for (fmt, geoms) in [(Fmt::F32, &geoms_f32[..]), (Fmt::Fnuz, &geoms_fnuz[..])] {
         for &geo in geoms {
@@ -546,7 +665,12 @@ fn main() {
                 eprintln!("{} {geo:?}: {e}", fmt.name());
                 std::process::exit(1);
             }
-            println!("{} {geo:?}: cumulative PASS {} FAIL {}", fmt.name(), tally.pass, tally.fail);
+            println!(
+                "{} {geo:?}: cumulative PASS {} FAIL {}",
+                fmt.name(),
+                tally.pass,
+                tally.fail
+            );
         }
     }
     for fmt in [Fmt::F32, Fmt::Fnuz] {

@@ -2500,7 +2500,14 @@ fn execute_hyper_read_core(
     }
     let held = std::mem::replace(&mut gpu.prefill_lwmma_dense_hold, true);
     let up_input = g942_low_staged.as_ref().unwrap_or(&low);
-    let projected = project_weight(gpu, &op.input_mix_up, up_input, &up, op.rows, Some(op.rotation));
+    let projected = project_weight(
+        gpu,
+        &op.input_mix_up,
+        up_input,
+        &up,
+        op.rows,
+        Some(op.rotation),
+    );
     gpu.prefill_lwmma_dense_hold = held;
     projected?;
     if let Some(rotated) = rotate_into.filter(|r| {

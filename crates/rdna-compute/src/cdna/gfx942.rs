@@ -206,9 +206,7 @@ fn g942_moe_wide_image() -> HipResult<Option<&'static std::sync::Arc<[u8]>>> {
             match hipfire_config::developer_var("HIPFIRE_QWEN4_G942_MOE_WIDE_IMAGE") {
                 Ok(path) if !path.is_empty() => std::fs::read(&path)
                     .map(|bytes| Some(std::sync::Arc::<[u8]>::from(bytes)))
-                    .map_err(|error| {
-                        format!("HIPFIRE_QWEN4_G942_MOE_WIDE_IMAGE {path}: {error}")
-                    }),
+                    .map_err(|error| format!("HIPFIRE_QWEN4_G942_MOE_WIDE_IMAGE {path}: {error}")),
                 _ => Ok(None),
             }
         });
@@ -224,9 +222,7 @@ fn g942_moe_wide_image() -> HipResult<Option<&'static std::sync::Arc<[u8]>>> {
 /// names, loaded through `ensure_embedded_kernel`).
 fn g942_moe_wide_ensure(gpu: &mut Gpu, func: &str) -> HipResult<()> {
     match g942_moe_wide_image()? {
-        Some(image) => {
-            gpu.ensure_embedded_kernel(QWEN4_G942_MOE_WIDE_MODULE, image.clone(), func)
-        }
+        Some(image) => gpu.ensure_embedded_kernel(QWEN4_G942_MOE_WIDE_MODULE, image.clone(), func),
         None => gpu.ensure_kernel(QWEN4_G942_MOE_WIDE_MODULE, QWEN4_G942_MOE_WIDE_SRC, func),
     }
 }
@@ -261,9 +257,7 @@ fn g942_moe_gemm_image() -> HipResult<Option<&'static std::sync::Arc<[u8]>>> {
             match hipfire_config::developer_var("HIPFIRE_QWEN4_G942_MOE_GEMM_IMAGE") {
                 Ok(path) if !path.is_empty() => std::fs::read(&path)
                     .map(|bytes| Some(std::sync::Arc::<[u8]>::from(bytes)))
-                    .map_err(|error| {
-                        format!("HIPFIRE_QWEN4_G942_MOE_GEMM_IMAGE {path}: {error}")
-                    }),
+                    .map_err(|error| format!("HIPFIRE_QWEN4_G942_MOE_GEMM_IMAGE {path}: {error}")),
                 _ => Ok(None),
             }
         });
@@ -614,9 +608,7 @@ fn g942_conv_fuse_image() -> HipResult<Option<&'static std::sync::Arc<[u8]>>> {
             match hipfire_config::developer_var("HIPFIRE_QWEN4_G942_CONV_FUSE_IMAGE") {
                 Ok(path) if !path.is_empty() => std::fs::read(&path)
                     .map(|bytes| Some(std::sync::Arc::<[u8]>::from(bytes)))
-                    .map_err(|error| {
-                        format!("HIPFIRE_QWEN4_G942_CONV_FUSE_IMAGE {path}: {error}")
-                    }),
+                    .map_err(|error| format!("HIPFIRE_QWEN4_G942_CONV_FUSE_IMAGE {path}: {error}")),
                 _ => Ok(None),
             }
         });
@@ -648,7 +640,12 @@ impl Gfx942Device<'_> {
         p: &crate::tensor_ops::HyperNorm<'_>,
         normalized_bf16: &GpuTensor,
     ) -> HipResult<()> {
-        let refuse = |what: &str| Err(hip_bridge::HipError::new(0, &format!("hyper_norm_bf16x: {what}")));
+        let refuse = |what: &str| {
+            Err(hip_bridge::HipError::new(
+                0,
+                &format!("hyper_norm_bf16x: {what}"),
+            ))
+        };
         if p.input.dtype != DType::F32
             || p.normalized.dtype != DType::F32
             || p.norm_weight.dtype != DType::BF16
@@ -3036,7 +3033,16 @@ impl Gpu {
             if (a.as_ptr() as usize) % 16 != 0 {
                 return Ok(false);
             }
-            self.gemm_bf16_mfma_gfx942_check(a, &x.buf, x_size, &y.buf, y.dtype.size(), m, k, batch)?;
+            self.gemm_bf16_mfma_gfx942_check(
+                a,
+                &x.buf,
+                x_size,
+                &y.buf,
+                y.dtype.size(),
+                m,
+                k,
+                batch,
+            )?;
             a_ptr[j] = a.as_ptr();
             d_ptr[j] = y.buf.as_ptr();
             m_i32[j] = m as i32;
@@ -3820,9 +3826,17 @@ impl Gfx942Device<'_> {
                 ),
             ));
         }
-        crate::moe::require_span(logits, &[tokens, 512, 4], "qwen4_g942_moe_wide_router logits")?;
+        crate::moe::require_span(
+            logits,
+            &[tokens, 512, 4],
+            "qwen4_g942_moe_wide_router logits",
+        )?;
         crate::moe::require_span(topk_idx, &[tokens, 10, 4], "qwen4_g942_moe_wide_router ids")?;
-        crate::moe::require_span(topk_w, &[tokens, 10, 4], "qwen4_g942_moe_wide_router weights")?;
+        crate::moe::require_span(
+            topk_w,
+            &[tokens, 10, 4],
+            "qwen4_g942_moe_wide_router weights",
+        )?;
         self.gpu.bind_thread()?;
         g942_moe_wide_ensure(&mut *self.gpu, QWEN4_G942_MOE_WIDE_ROUTER)?;
         static NOTE: std::sync::Once = std::sync::Once::new();
@@ -3914,15 +3928,31 @@ impl Gfx942Device<'_> {
             ));
         }
         let n_tiles = grouped_rows / 16;
-        crate::moe::require_span(topk, &[total_slots, 4], "qwen4_g942_moe_wide_group_scatter_desc topk")?;
-        crate::moe::require_span(counts, &[experts, 4], "qwen4_g942_moe_wide_group_scatter_desc counts")?;
+        crate::moe::require_span(
+            topk,
+            &[total_slots, 4],
+            "qwen4_g942_moe_wide_group_scatter_desc topk",
+        )?;
+        crate::moe::require_span(
+            counts,
+            &[experts, 4],
+            "qwen4_g942_moe_wide_group_scatter_desc counts",
+        )?;
         crate::moe::require_span(
             offsets,
             &[experts + 1, 4],
             "qwen4_g942_moe_wide_group_scatter_desc offsets",
         )?;
-        crate::moe::require_span(sorted, &[grouped_rows, 4], "qwen4_g942_moe_wide_group_scatter_desc sorted")?;
-        crate::moe::require_span(tiles, &[n_tiles, 4], "qwen4_g942_moe_wide_group_scatter_desc tiles")?;
+        crate::moe::require_span(
+            sorted,
+            &[grouped_rows, 4],
+            "qwen4_g942_moe_wide_group_scatter_desc sorted",
+        )?;
+        crate::moe::require_span(
+            tiles,
+            &[n_tiles, 4],
+            "qwen4_g942_moe_wide_group_scatter_desc tiles",
+        )?;
         crate::moe::require_span(
             inverse,
             &[total_slots, 4],
@@ -3936,7 +3966,10 @@ impl Gfx942Device<'_> {
         self.gpu.bind_thread()?;
         g942_moe_wide_ensure(&mut *self.gpu, QWEN4_G942_MOE_WIDE_SCATTER_DESC)?;
         static NOTE: std::sync::Once = std::sync::Once::new();
-        g942_fold_note(&NOTE, "wide scatter (mask + popcount grouping + tile descriptors)");
+        g942_fold_note(
+            &NOTE,
+            "wide scatter (mask + popcount grouping + tile descriptors)",
+        );
         let tp = topk.buf.as_ptr();
         let cp = counts.buf.as_ptr();
         let op = offsets.buf.as_ptr();
@@ -4057,8 +4090,16 @@ impl Gfx942Device<'_> {
                 inverse.dtype
             ));
         }
-        crate::moe::require_span(gate_up, &[n_sorted, 2, mi, 4], "qwen4_g942_moe_wide_unscatter_act gate_up")?;
-        crate::moe::require_span(inverse, &[slots, 4], "qwen4_g942_moe_wide_unscatter_act inverse")?;
+        crate::moe::require_span(
+            gate_up,
+            &[n_sorted, 2, mi, 4],
+            "qwen4_g942_moe_wide_unscatter_act gate_up",
+        )?;
+        crate::moe::require_span(
+            inverse,
+            &[slots, 4],
+            "qwen4_g942_moe_wide_unscatter_act inverse",
+        )?;
         crate::moe::require_span(
             activation,
             &[slots, mi, 4],
@@ -4079,7 +4120,11 @@ impl Gfx942Device<'_> {
             &[rows, shared_mi, 4],
             "qwen4_g942_moe_wide_unscatter_act shared activation",
         )?;
-        crate::moe::require_span(selector, &[rows, 4], "qwen4_g942_moe_wide_unscatter_act selector")?;
+        crate::moe::require_span(
+            selector,
+            &[rows, 4],
+            "qwen4_g942_moe_wide_unscatter_act selector",
+        )?;
         let (yp, ip, ap) = (
             gate_up.buf.as_ptr(),
             inverse.buf.as_ptr(),
@@ -4105,7 +4150,10 @@ impl Gfx942Device<'_> {
         self.gpu.bind_thread()?;
         g942_moe_wide_ensure(&mut *self.gpu, QWEN4_G942_MOE_WIDE_UNSCATTER_ACT)?;
         static NOTE: std::sync::Once = std::sync::Once::new();
-        g942_fold_note(&NOTE, "wide unscatter (slot-major unscatter-silu + shared activation)");
+        g942_fold_note(
+            &NOTE,
+            "wide unscatter (slot-major unscatter-silu + shared activation)",
+        );
         let (miv, nv, sv) = (mi as i32, n_sorted as i32, slots as i32);
         let (rv, smv, abv) = (rows as i32, shared_mi as i32, act_blocks as i32);
         let mut params: Vec<*mut c_void> = vec![
@@ -4235,7 +4283,11 @@ impl Gfx942Device<'_> {
             &[tokens, hidden, 4],
             "qwen4_g942_moe_wide_combine_shared_add shared rows",
         )?;
-        crate::moe::require_span(selector, &[tokens, 4], "qwen4_g942_moe_wide_combine_shared_add selector")?;
+        crate::moe::require_span(
+            selector,
+            &[tokens, 4],
+            "qwen4_g942_moe_wide_combine_shared_add selector",
+        )?;
         let (gp, ip, tp, wp, rp, hp, sp) = (
             grouped_down.buf.as_ptr(),
             inverse_perm.buf.as_ptr(),
@@ -4378,7 +4430,10 @@ mod tests {
             define(super::QWEN4_G942_MOE_GEMM_SRC, "MG_D"),
         );
         assert_eq!(super::G942_MOE_GEMM_ROWS_PER_WG, 64 * nsub);
-        assert_eq!(super::G942_MOE_GEMM_ROWS_PER_WG, super::FP8B128_MOE_ROWS_PER_WG);
+        assert_eq!(
+            super::G942_MOE_GEMM_ROWS_PER_WG,
+            super::FP8B128_MOE_ROWS_PER_WG
+        );
         assert_eq!(nsub, define(super::FP8B128_MOE_GROUPED_SRC, "FP8MOE_NSUB"));
         assert_eq!(d, define(super::FP8B128_MOE_GROUPED_SRC, "FP8MOE_D"));
         for entry in super::QWEN4_G942_MOE_GEMM_ENTRIES {
@@ -5027,7 +5082,10 @@ mod tests {
                     .expect("END marker after every BEGIN marker");
                 let block = outside[body_start..body_start + end]
                     .trim_end_matches('\n')
-                    .replace("qwen4_g942_hyper_write_norm_bf16x(", "hyper_write_norm_f32(");
+                    .replace(
+                        "qwen4_g942_hyper_write_norm_bf16x(",
+                        "hyper_write_norm_f32(",
+                    );
                 let stripped: Vec<&str> = block
                     .lines()
                     .filter(|line| {
@@ -5098,7 +5156,10 @@ mod tests {
                 .map(|b| format!("{b:02x}"))
                 .collect()
         };
-        assert_eq!(hex(super::QWEN4_G942_CONV_FUSE_SRC.as_bytes()), SOURCE_SHA256);
+        assert_eq!(
+            hex(super::QWEN4_G942_CONV_FUSE_SRC.as_bytes()),
+            SOURCE_SHA256
+        );
         let anchor: &[u8] =
             include_bytes!("../../../../kernels/qwen4_g942_conv_fuse_hipcc_gfx942.co");
         assert_eq!(hex(anchor), ANCHOR_SHA256);
@@ -5143,7 +5204,8 @@ mod tests {
         outside.push_str(rest);
         assert_eq!(blocks, 2, "typedefs + mfma_bf16, rows16 helpers + body");
         assert!(
-            production.contains("gemm_bf16_mfma_rows16_body<XI>(X, A0, A1, A2, A3, D0, D1, D2, D3,"),
+            production
+                .contains("gemm_bf16_mfma_rows16_body<XI>(X, A0, A1, A2, A3, D0, D1, D2, D3,"),
             "the production entries call the body the grid entries call"
         );
         // Outside the markers: comments, includes, the grid entry macro and its instantiations.
@@ -5187,7 +5249,10 @@ mod tests {
                 .map(|b| format!("{b:02x}"))
                 .collect()
         };
-        assert_eq!(hex(super::QWEN4_G942_ROWS16_GRID_SRC.as_bytes()), SOURCE_SHA256);
+        assert_eq!(
+            hex(super::QWEN4_G942_ROWS16_GRID_SRC.as_bytes()),
+            SOURCE_SHA256
+        );
         let anchor: &[u8] =
             include_bytes!("../../../../kernels/qwen4_g942_rows16_grid_hipcc_gfx942.co");
         assert_eq!(hex(anchor), ANCHOR_SHA256);
@@ -5205,14 +5270,23 @@ mod tests {
     #[test]
     fn g942_row_grid_route_row() {
         for rows in [17, 32, 64, 128, 256] {
-            assert!(super::row_grid_admitted(&[320], 10240, rows), "hc_down {rows}");
+            assert!(
+                super::row_grid_admitted(&[320], 10240, rows),
+                "hc_down {rows}"
+            );
         }
         assert!(!super::row_grid_admitted(&[320], 10240, 16));
         assert!(!super::row_grid_admitted(&[320], 10240, 257));
         assert!(!super::row_grid_admitted(&[512], 2560, 32), "router");
-        assert!(!super::row_grid_admitted(&[1, 640, 640], 2560, 32), "shared gate/up");
+        assert!(
+            !super::row_grid_admitted(&[1, 640, 640], 2560, 32),
+            "shared gate/up"
+        );
         assert!(!super::row_grid_admitted(&[2560], 6144, 32), "out_proj");
         assert!(!super::row_grid_admitted(&[10240], 320, 32), "hc_up");
-        assert!(!super::row_grid_admitted(&[10240, 6144, 48, 48], 2560, 32), "gdn in");
+        assert!(
+            !super::row_grid_admitted(&[10240, 6144, 48, 48], 2560, 32),
+            "gdn in"
+        );
     }
 }

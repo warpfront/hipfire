@@ -31,10 +31,9 @@ use hipfire_dispatch::pipeline::gated_mlp::{
 };
 use hipfire_dispatch::pipeline::{
     execute_validated_steps, g942_bf16_few_rows_invariant, validate_steps, BroadcastAddOp, ClearOp,
-    DraftHead, DraftHeadLayout,
-    DraftHeadPolicy, DraftHeadRequestState, EmbeddingOp, HyperNormOp, HyperReadOp, HyperWriteOp,
-    IndexedAttentionMode, IndexedAttentionOp, IndexedAttentionState, MixerPhase, ProjectLadder,
-    ProjectOp, Step,
+    DraftHead, DraftHeadLayout, DraftHeadPolicy, DraftHeadRequestState, EmbeddingOp, HyperNormOp,
+    HyperReadOp, HyperWriteOp, IndexedAttentionMode, IndexedAttentionOp, IndexedAttentionState,
+    MixerPhase, ProjectLadder, ProjectOp, Step,
 };
 use hipfire_dispatch::types::DispatchError;
 use hipfire_runtime::kv_backend::{
