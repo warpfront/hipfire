@@ -645,6 +645,9 @@ impl Qwen4GpuForward {
     ) -> EpWaveFacts {
         let total: usize = lane_rows.iter().sum();
         let prior_prefill = std::mem::replace(&mut self.prefill_scope, true);
+        // A wave's lanes are lane prefill tiles: probe them under the lane intent, whose
+        // sub-512-row MoE chain is the A8 one unless `serve.batch_exact` is on.
+        let prior_lane = std::mem::replace(&mut self.lane_scope, true);
         // (tile route, any scope entered, A8 chain, symmetric chain) of `rows` rows under the
         // routing scopes a prefill tile of those rows enters.
         let probe = |this: &Self, gpu: &mut Gpu, rows: usize| -> (bool, bool, bool, bool) {
@@ -670,6 +673,7 @@ impl Qwen4GpuForward {
             scoped_route |= scoped;
         }
         self.prefill_scope = prior_prefill;
+        self.lane_scope = prior_lane;
         let reserve = self.ep_reserve.as_ref();
         let resident_limit = reserve.map(|reserve| reserve.banks.resident_call_limit());
         EpWaveFacts {

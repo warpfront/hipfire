@@ -484,10 +484,18 @@ pub(crate) fn ordinary_prefill_applies(prefill_scope: bool, arch: &str) -> bool 
 /// Whether a forward of `rows` actual rows runs the EP symmetric-MoE A8 chain
 /// (`Gpu::qwen4_ep_a8_scope`): an EP forward below the owner-routed floor
 /// ([`rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS`]) outside the ordinary-prefill intent
-/// (lanes, verify, decode). Under the intent every actual extent takes the canonical chunk's
-/// A4 chain, so the recipe never follows the outer call size.
-pub(crate) fn ep_a8_scope_applies(ep: bool, ordinary: bool, rows: usize) -> bool {
-    ep && !ordinary && rows < rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS
+/// (verify, decode), or a distribution-equivalent serve lane tile / wave (`lane_distribution`:
+/// lane intent with `serve.batch_exact` off). Ordinary prefill (single request, session resume,
+/// C1 non-lane) and exact lanes take the canonical chunk's A4 chain at every actual extent, so
+/// their recipe never follows the outer call size. Lane prefill is distribution-equivalent by
+/// design, not chunk-invariant: only the A8 chain is proven per-slot independent in a wave.
+pub(crate) fn ep_a8_scope_applies(
+    ep: bool,
+    ordinary: bool,
+    lane_distribution: bool,
+    rows: usize,
+) -> bool {
+    ep && (!ordinary || lane_distribution) && rows < rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS
 }
 
 /// gfx942 pins canonical prefill routing; gfx1151 retains its opt-in profile.
@@ -16192,7 +16200,13 @@ impl Qwen4GpuForward {
         // an ordinary prefill computes its rows exactly as the full chunk would.
         let ep_a8 = std::mem::replace(
             &mut gpu.qwen4_ep_a8_scope,
-            ep_a8_scope_applies(self.ep.is_some(), ordinary_scope, rows),
+            ep_a8_scope_applies(
+                self.ep.is_some(),
+                ordinary_scope,
+                self.lane_scope
+                    && hipfire_config::qwen4_lane_row_exact() == hipfire_config::LaneRowExact::Off,
+                rows,
+            ),
         );
         // The owner-routed symmetric IU4 tile route's row floor (`HIPFIRE_EP_PREFILL_TILE_MIN_ROWS`):
         // lowered only for a PREFILL forward (`prefill_scope`: never decode, verify or the MTP head)
@@ -20144,13 +20158,23 @@ mod tests {
         for rows in [
             1, 9, 25, 218, 511, 512, 730, 1024, 1754, 2048, 3793, 4096, 8192,
         ] {
-            assert!(!a8(true, true, rows), "ordinary EP rows {rows}");
-            assert!(!a8(false, true, rows), "ordinary single-card rows {rows}");
-            assert!(!a8(false, false, rows), "single-card rows {rows}");
+            assert!(!a8(true, true, false, rows), "ordinary EP rows {rows}");
+            assert!(
+                !a8(false, true, false, rows),
+                "ordinary single-card rows {rows}"
+            );
+            assert!(!a8(false, false, false, rows), "single-card rows {rows}");
+            assert!(!a8(false, true, true, rows), "single-card lane rows {rows}");
             assert_eq!(
-                a8(true, false, rows),
+                a8(true, false, false, rows),
                 rows < floor,
                 "non-ordinary EP rows {rows}"
+            );
+            // Distribution-equivalent lane tiles / waves keep the base sub-512 A8 chain.
+            assert_eq!(
+                a8(true, true, true, rows),
+                rows < floor,
+                "lane EP rows {rows}"
             );
         }
     }
