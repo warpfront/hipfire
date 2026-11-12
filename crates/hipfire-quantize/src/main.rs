@@ -26,7 +26,6 @@ mod model_filter;
 mod pipeline;
 mod pipeline_deepseek;
 mod pipeline_flux;
-mod pipeline_gguf;
 mod pipeline_maple;
 mod ple_hot_pack;
 mod ple_hot_rank;

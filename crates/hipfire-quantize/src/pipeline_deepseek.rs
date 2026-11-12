@@ -5,8 +5,8 @@
 
 use std::path::Path;
 
+use crate::dequant::dequantize_hfq_q8f16;
 use crate::hfq::*;
-use crate::pipeline_gguf::dequantize_hfq_q8f16;
 use crate::quant_e8::*;
 use crate::quant_fwht::*;
 

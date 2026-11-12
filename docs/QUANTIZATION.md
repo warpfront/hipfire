@@ -29,7 +29,7 @@ Production defaults for day-to-day use:
 | `mq4v1` / `mq4g256` / `magnum` | `MQ4G256` (qt 13) | 4 | 4.25 | 136 (8 hdr f32 scale+min + 128 data) | Legacy Magnum v1 only — not the `mq4` alias |
 | `mq6` / `.mq6` | `MQ6G256` (qt 15) | 6 | 6.25 | 200 | Qwen 3.5+ higher quality (v1 body) |
 | `mq6v2` … `mq2v2` | V2 family qt 47/48/49/50 | 6…2 | 6.25 / 5.25 / 3.25 / 2.25 | 200/168/104/72 | Dense Magnum V2 ladder bodies — see below |
-| `hf4` / `.hf4` | `HFQ4G256` (qt 6) | 4 | 4.25 | 136 | Dense GGUF default (**GGUF weight input deprecated since 0.4.0, removal in 0.5.0**); Llama-style dense |
+| `hf4` / `.hf4` | `HFQ4G256` (qt 6) | 4 | 4.25 | 136 | Dense Llama-style models |
 | `hf6` / `.hf6` | `HFQ6G256` (qt 8) | 6 | 6.25 | 200 | Dense, higher quality |
 | `mq3` / `.mq3` | `MQ3G256` (qt 17) | 3 | 3.25 | 104 (8 hdr + 96 data) | Sub-4-bit bandwidth; quality-sensitive |
 | `q8` | `Q8F16` (qt 3) | 8 | 8.5 | **34 B / 32 el** (2 B f16 scale + 32×i8; 272 B / 256 el) | Reference / debug / protected tensors |
@@ -168,8 +168,8 @@ the current-quality-methodology note for shipped XTS trunks.
 
 | Type | qt | Bytes/group | Stored bpw | Notes |
 |---|---:|---|---:|---|
-| `TQ2G128` | 40 | 34 per 128 | 2.125 | PrismML Bonsai ternary — passthrough; `[fp16 d][32 B 2-bit codes]` |
-| `BQ1G128` | 41 | 18 per 128 | 1.125 | PrismML Bonsai 1-bit — passthrough; `[fp16 d][16 B sign bits]`; won qt=41 adjudication 2026-08-18 |
+| `TQ2G128` | 40 | 34 per 128 | 2.125 | PrismML Bonsai ternary; `[fp16 d][32 B 2-bit codes]`. Read-only: `hipfire-quantize` stopped producing it when GGUF weight input was removed in 0.5.0 |
+| `BQ1G128` | 41 | 18 per 128 | 1.125 | PrismML Bonsai 1-bit; `[fp16 d][16 B sign bits]`; won qt=41 adjudication 2026-08-18. Read-only: `hipfire-quantize` stopped producing it when GGUF weight input was removed in 0.5.0 |
 
 ### Sub-4-bit and research formats (v1 / Lloyd / FP4)
 
@@ -256,9 +256,7 @@ On Llama-style dense models the math still cancels, but the rotation adds
 `rotate_x_mq` cost on the activation side. Recipe guidance: **MQ for Qwen
 3.5+; HFQ for other dense families** — treat this as a starting point, not a
 guarantee: whether MQ helps or HFQ suffices is model-specific and needs
-validation per model. CLI defaults follow the guidance (`safetensors` → `mq4`;
-GGUF → `hf4`, GGUF weight input is **deprecated since 0.4.0, removal in
-0.5.0**; see [QUANTIZE.md](QUANTIZE.md)).
+validation per model. The CLI default is `mq4` (see [QUANTIZE.md](QUANTIZE.md)); GGUF weight input was removed in 0.5.0.
 
 ## Header layout (HFQ/MQ G256 affine blocks)
 
@@ -392,8 +390,8 @@ Source of truth: [`quant-formats/qt-register.txt`](quant-formats/qt-register.txt
 | 32–37 | MFP4Lloyd / MFP4P / E8 / SoA / MFP3E8 / MFP2E8 | **shipped / ref-pinned** encoders + selective kernels; experimental opt-in |
 | 38 | MQ2G256GL | Magnum GL 2-bit — passthrough |
 | 39 | MQ3G256GL | Magnum GL 3-bit — passthrough |
-| 40 | TQ2G128 | Bonsai ternary — passthrough |
-| 41 | BQ1G128 | Bonsai 1-bit — passthrough |
+| 40 | TQ2G128 | Bonsai ternary — passthrough (no longer produced by `hipfire-quantize`) |
+| 41 | BQ1G128 | Bonsai 1-bit — passthrough (no longer produced by `hipfire-quantize`) |
 | 42 | MFP4G32E8G128 | mfp4-E8 with a 128-wide FWHT rotation group — arch-loaded (Qwen4 expert load path); wire layout byte-identical to qt 34 (16 B header + (K/32) × 17 B), 4.25 bpw + 128 / K; split from qt 34 because its 256-wide segments cannot tile K = 640 |
 | 44 | MQ4G256V2 | **Default `mq4` body** — dual-fp16 per-128 header, 136 B (4.25 bpw) |
 | 45 | MQ4CG256 | MQ4 v1.5 pad — 136 B |

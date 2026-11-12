@@ -7,7 +7,6 @@ use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use crate::pipeline_gguf::GgufFormat;
 use crate::reap_overlay;
 
 // ─── HFQ File Format ────────────────────────────────────────────────────────
@@ -284,13 +283,6 @@ pub(crate) enum QuantLevel {
     Q8,
     /// Promote to 6-bit variant of the base format (edge layers, MoE expert FFN).
     Promote6,
-    /// Override the default for a specific tensor class (today: lm_head)
-    /// to a CLI-specified format. Currently unused on this branch (no emission
-    /// site); kept so origin/master's lm_head-format override match arms
-    /// compile after the merge. Re-wire to `--lm-head-format` when the
-    /// configurable-kmap-pair refactor lands here.
-    #[allow(dead_code)]
-    Override(GgufFormat),
     /// Use the base format as-is.
     Base,
 }

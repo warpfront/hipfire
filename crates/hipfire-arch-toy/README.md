@@ -93,8 +93,6 @@ skip one and the workspace stops building (exhaustive `match` on
     (`is_<name> = arch_id == <N>`) when your tensors need special quant
     routing (MoE experts, tied-embed guards). Dense plain-vanilla arches
     may need nothing.
-    (`pipeline_gguf.rs` needs no edit — it calls the same
-    `lookup_model_type`.)
 
 ### Tier E — optional capability surfaces
 

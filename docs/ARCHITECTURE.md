@@ -345,9 +345,7 @@ Defined in `crates/hipfire-runtime/src/loader_api.rs` and
 to Qwen3.5.
 
 Tensor names follow family-dependent HuggingFace conventions (e.g. dense LLaMA
-`model.layers.{i}.…`; Qwen3.5 nested `model.language_model.layers.…`). GGUF
-inputs map only **recognized** llama.cpp names via `gguf_to_safetensors_name`
-at quantize time; unknown GGUF names are retained unchanged.
+`model.layers.{i}.…`; Qwen3.5 nested `model.language_model.layers.…`).
 
 ### Carriers
 

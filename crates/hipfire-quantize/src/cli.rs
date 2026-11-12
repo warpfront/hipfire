@@ -19,7 +19,7 @@ pub(crate) enum MoeExpertDown {
 #[command(
     name = "hipfire-quantize",
     version,
-    about = "Quantize Hugging Face safetensors (or deprecated GGUF weights) into Hipfire HFQ",
+    about = "Quantize Hugging Face safetensors into Hipfire HFQ",
     after_help = "SUBCOMMANDS:\n  ple-hot-rank  Rank Qwen4 PLE rows over a corpus and write the <model>.plehot \
                   hot-row sidecar (run `hipfire-quantize ple-hot-rank --help`)\n  \
                   ple-hot-pack  Cut the <model>.plehotrows hot-row pack from a model and its \
@@ -31,7 +31,7 @@ pub(crate) enum MoeExpertDown {
 )]
 pub(crate) struct QuantizeArgs {
     /// Hugging Face model directory or model ID. A GGUF weight file is
-    /// deprecated (removal in 0.5.0): GGUF→mqN is lossy double quantization; use llama.cpp for GGUF. For
+    /// refused (GGUF weight input was removed in 0.5.0; use llama.cpp for GGUF). For
     /// `--qwen4-flash-next`, use a local directory/file or the immutable
     /// remote form `hf://OWNER/REPO@40_HEX_REVISION`; floating refs such as
     /// `main`, tags, and short revisions are rejected. Not used by
@@ -41,7 +41,6 @@ pub(crate) struct QuantizeArgs {
         value_name = "PATH_OR_MODEL_ID",
         required_unless_present = "flux_pipe"
     )]
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — GGUF→mqN is lossy double quantization; use llama.cpp for GGUF (GGUF weight input only; imatrix.gguf stays)
     pub input: Option<String>,
 
     /// Produce the native Qwen4/Qwen3.8-Flash-Next streaming artifact.  This
@@ -455,8 +454,6 @@ pub(crate) enum Route {
     RaonSharedFfn,
     /// `--format maple|ds4-dense-e8soa-overlay|ds4-dspark-e8soa|qwen3-dspark-q8`.
     EarlySpecial,
-    /// Deprecated GGUF weight input.
-    Gguf,
     /// Raon-1-mini (`model_type: raon1_mini`) symmetric qt44 control artifact.
     Raon,
     /// `--reap-overlay` selective re-quant.
@@ -475,7 +472,6 @@ const EVERY: &[Route] = &[
     Qwen4StockMtpSidecar,
     FinalCodes,
     EarlySpecial,
-    Gguf,
     Raon,
     RaonSharedFfn,
     ReapOverlay,
@@ -490,7 +486,6 @@ const EVERY: &[Route] = &[
     Qwen4DevTiny,
     FinalCodes,
     EarlySpecial,
-    Gguf,
     Raon,
     RaonSharedFfn,
     ReapOverlay,
@@ -509,7 +504,6 @@ pub(crate) const FLAG_ROUTES: &[(&str, &[Route])] = &[
             Qwen4StockMtpSidecar,
             FinalCodes,
             EarlySpecial,
-            Gguf,
             Raon,
             RaonSharedFfn,
             ReapOverlay,
@@ -526,7 +520,6 @@ pub(crate) const FLAG_ROUTES: &[(&str, &[Route])] = &[
             Qwen4DevTiny,
             FinalCodes,
             EarlySpecial,
-            Gguf,
             Raon,
             RaonSharedFfn,
             ReapOverlay,
@@ -542,11 +535,11 @@ pub(crate) const FLAG_ROUTES: &[(&str, &[Route])] = &[
     ("base_sha256", &[Qwen4StockMtpSidecar]),
     #[cfg(feature = "qwen4-dev-profiles")]
     ("qwen4_dev_tiny", &[Qwen4DevTiny]),
-    ("format", &[EarlySpecial, Gguf, Raon, Main]),
+    ("format", &[EarlySpecial, Raon, Main]),
     ("head_quant", &[EarlySpecial]),
     ("head_only", &[EarlySpecial]),
-    ("arch_id", &[Gguf, ReapOverlay, Main]),
-    ("force_arch_id", &[Gguf, ReapOverlay, Main]),
+    ("arch_id", &[ReapOverlay, Main]),
+    ("force_arch_id", &[ReapOverlay, Main]),
     ("flux_pipe", &[Flux]),
     ("flux_component", &[Flux]),
     ("source_url", &[ReapOverlay, Main]),
@@ -567,8 +560,8 @@ pub(crate) const FLAG_ROUTES: &[(&str, &[Route])] = &[
     ("q8_router", &[Main]),
     ("no_q8_conv1d", &[Main]),
     ("no_q8_router", &[Main]),
-    ("no_kmap", &[Gguf, Main]),
-    ("uniform", &[Gguf, Main]),
+    ("no_kmap", &[Main]),
+    ("uniform", &[Main]),
     ("awq", &[Main]),
     ("awq_fix_la_head_order", &[Main]),
     ("awq_a4_aware", &[Main]),
@@ -585,18 +578,18 @@ pub(crate) const FLAG_ROUTES: &[(&str, &[Route])] = &[
     ("raon_source", &[RaonSharedFfn]),
     ("raon_shared_ffn_verify", &[RaonSharedFfn]),
     ("raon_shared_ffn_scope", &[RaonSharedFfn]),
-    ("kmap_dense", &[Gguf, Main]),
-    ("kmap_mode", &[Gguf, Main]),
-    ("allow_mq2", &[Gguf, Main]),
-    ("allow_mq2_lloyd", &[Gguf, Main]),
-    ("allow_mq3_lloyd", &[Gguf, Main]),
-    ("allow_mq4_lloyd", &[Gguf, Main]),
+    ("kmap_dense", &[Main]),
+    ("kmap_mode", &[Main]),
+    ("allow_mq2", &[Main]),
+    ("allow_mq2_lloyd", &[Main]),
+    ("allow_mq3_lloyd", &[Main]),
+    ("allow_mq4_lloyd", &[Main]),
     ("include_vision", &[Main]),
     ("vision_quant", &[Main]),
     ("include_prefix", &[Main]),
     ("vision_only", &[Main]),
-    ("tier", &[Gguf, Raon, Main]),
-    ("fixed_tier", &[Gguf, Main]),
+    ("tier", &[Raon, Main]),
+    ("fixed_tier", &[Main]),
 ];
 
 fn route_label(route: Route) -> &'static str {
@@ -609,7 +602,6 @@ fn route_label(route: Route) -> &'static str {
         Qwen4DevTiny => "--qwen4-dev-tiny",
         FinalCodes => "--mq*v2-final-codes",
         EarlySpecial => "this --format",
-        Gguf => "GGUF weight input",
         Raon => "the Raon-1-mini converter",
         RaonSharedFfn => "--raon-shared-ffn / --raon-shared-ffn-verify",
         ReapOverlay => "--reap-overlay",
@@ -714,11 +706,6 @@ mod route_tests {
                     "--mq4v2-symmetric",
                 ],
                 "--mq4v2-symmetric",
-            ),
-            (
-                Gguf,
-                &["--input", "m.gguf", "--output", "o", "--imatrix", "x"],
-                "--imatrix",
             ),
             (
                 RaonSharedFfn,
@@ -855,7 +842,7 @@ mod route_tests {
             );
         }
         // No other route reads --recipe.
-        for route in [Qwen4, Main, Gguf, EarlySpecial] {
+        for route in [Qwen4, Main, EarlySpecial] {
             let err = reject_unreachable(&matches(&base), route).unwrap_err();
             assert!(
                 err.starts_with("--recipe has no effect"),

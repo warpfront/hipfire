@@ -692,15 +692,9 @@ See [`QUANTIZE.md`](QUANTIZE.md) and [`QUANTIZATION.md`](QUANTIZATION.md).
 
 Requires `config.json` + `.safetensors`. Architectures the **engine** loads are those with arch crates / loaders above; the quantizer may accept more shapes than inference can run.
 
-### GGUF (deprecated, removal in 0.5.0)
+### GGUF
 
-GGUF weight input is deprecated since 0.4.0: GGUF→mqN is lossy double quantization; use llama.cpp for GGUF.
-
-```bash
-hipfire quantize ./model.Q4_K_M.gguf --install --register my:tag
-```
-
-Dequant path support is format-specific (common Q4_0 / Q8_0 / Q4_K / Q6_K / F16 / BF16 / F32). Unsupported GGUF quants fail closed in the quantizer.
+GGUF **weight** input to the quantizer was removed in 0.5.0: GGUF→mqN is lossy double quantization; quantize from the original safetensors, or use llama.cpp for GGUF. `hipfire quantize` refuses a `.gguf` input with an error naming the removal.
 
 #### GGUF-native serving (developer tools, gfx1201, default off)
 

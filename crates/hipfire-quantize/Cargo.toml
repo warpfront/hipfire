@@ -41,10 +41,6 @@ tempfile = "3"
 # integration test lives in-module in reap_overlay.rs (it needs crate-internal
 # write_hfq / quantize_* access that a tests/ target can't reach).
 hipfire-runtime = { path = "../hipfire-runtime" }
-# Test-only: parse `config_json_from_gguf` output through the REAL gemma4
-# loader parser (Gemma4Config::from_metadata_json) — the config-emission /
-# loader-admission boundary is where the GGUF gemma4 gap sat.
-hipfire-arch-gemma4 = { path = "../hipfire-arch-gemma4" }
 # ---------------------------------------------------------------------------
 # Archived research probes.
 #

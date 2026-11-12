@@ -901,8 +901,8 @@ struct ProfileArgs {
 
 #[derive(Args, Debug)]
 struct QuantizeArgs {
-    /// Hugging Face model ID or local safetensors directory (a GGUF file is
-    /// deprecated, removal in 0.5.0: GGUF→mqN is lossy double quantization; use llama.cpp for GGUF).
+    /// Hugging Face model ID or local safetensors directory (a GGUF weight file
+    /// is refused: GGUF weight input was removed in 0.5.0; use llama.cpp for GGUF).
     input: String,
     #[arg(long = "format")]
     /// Repeatable output format: mq4, mq6, q8, q8f16, hf4, or hf6.
@@ -9487,16 +9487,20 @@ fn quantize_command(paths: &Paths, mut args: QuantizeArgs) -> Result<()> {
         args.formats.extend(["mq4".into(), "mq6".into()]);
     }
     let input_path = PathBuf::from(&args.input);
-    let is_gguf = input_path.is_file()
+    if input_path.is_file()
         && input_path
             .extension()
             .and_then(|value| value.to_str())
-            .is_some_and(|value| value.eq_ignore_ascii_case("gguf"));
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — GGUF→mqN is lossy double quantization; use llama.cpp for GGUF
-    // (the one-line warning is printed by hipfire-quantize itself)
+            .is_some_and(|value| value.eq_ignore_ascii_case("gguf"))
+    {
+        bail!(
+            "GGUF weight input was removed in 0.5.0 (GGUF→mqN is lossy double quantization); \
+             quantize from the original safetensors checkpoint, or use llama.cpp for GGUF. \
+             `--imatrix <file.gguf>` is still supported"
+        );
+    }
     if args.formats.is_empty() {
-        args.formats
-            .push(if is_gguf { "hf4".into() } else { "mq4".into() });
+        args.formats.push("mq4".into());
     }
     for format in &mut args.formats {
         *format = match format.as_str() {
@@ -9514,9 +9518,6 @@ fn quantize_command(paths: &Paths, mut args: QuantizeArgs) -> Result<()> {
                 "unsupported format {format}; supported: {}",
                 valid.join(", ")
             );
-        }
-        if is_gguf && !matches!(format.as_str(), "hf4" | "hf6" | "mq4" | "mq6") {
-            bail!("GGUF input supports hf4, hf6, mq4, or mq6");
         }
     }
     if (args.mq4v2_symmetric || args.tier.is_some()) && args.formats.iter().any(|f| f != "mq4") {
@@ -9540,7 +9541,6 @@ fn quantize_command(paths: &Paths, mut args: QuantizeArgs) -> Result<()> {
             .file_name()
             .and_then(|value| value.to_str())
             .unwrap_or(&args.input)
-            .trim_end_matches(".gguf")
             .to_owned()
     });
     let output_dir = args.output_dir.unwrap_or(env::current_dir()?);

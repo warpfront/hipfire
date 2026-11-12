@@ -154,7 +154,7 @@ pub(crate) fn maple_tensor_policy(name: &str) -> MapleTensorPolicy {
 /// so `<Wrot, xrot> == <W, x>` holds ONLY when both sides used the same signs.
 /// A mismatch is not an error and not a crash: it is a plausible-looking
 /// logit vector that is entirely wrong. Every other call site in the tree
-/// (`pipeline.rs`, `pipeline_gguf.rs`, `pipeline_deepseek.rs`,
+/// (`pipeline.rs`, `pipeline_deepseek.rs`,
 /// `reap_overlay.rs`) uses these same two seeds for G256.
 ///
 /// `K` must be a multiple of 256 for MQ4 and of 32 for Q8. Maple's head is

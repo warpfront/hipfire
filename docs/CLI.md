@@ -464,7 +464,7 @@ Do not inventory every key here — [CONFIG.md](CONFIG.md) owns defaults and ran
 
 | Command | Purpose |
 |---|---|
-| `hipfire quantize <hf-id\|dir\|file.gguf> [flags]` | CPU quantize via `hipfire-quantize`. GGUF weight input is deprecated since 0.4.0 (removal in 0.5.0): GGUF→mqN is lossy double quantization; quantize from the original safetensors checkpoint instead. GGUF input accepts only `hf4`, `hf6`, `mq4` and `mq6`. |
+| `hipfire quantize <hf-id\|dir> [flags]` | CPU quantize via `hipfire-quantize`. A GGUF weight file is refused (GGUF weight input was removed in 0.5.0: GGUF→mqN is lossy double quantization); quantize from the original safetensors checkpoint, or use llama.cpp for GGUF. `--imatrix <file.gguf>` is still supported. |
 | `hipfire-quantize --flux-pipe <pipe_dir> --output <base.hfq>` | Pack a FLUX.1 or FLUX.2 Klein diffusers pipe into per-component HFQ files (`<base>-transformer.hfq` plus `-t5.hfq`, `-clip.hfq`, `-vae.hfq` for FLUX.1, or `-qwen3.hfq`, `-vae.hfq` for Klein; arch ids 40–46). `--flux-component` packs one. The packs are the only form the daemon loads. |
 | `hipfire calibrate-npu-trunk --from <measurements.json> --out <cal.json>` | Write a keyed NPU trunk calibration from offline measurement inputs. Every measured cost is mandatory; the record's `key.kernel.uname_release` must equal the current `uname -r`, otherwise the command fails. |
 
@@ -472,10 +472,10 @@ Do not inventory every key here — [CONFIG.md](CONFIG.md) owns defaults and ran
 
 | Flag | Purpose |
 |---|---|
-| `--format <fmt>` | Repeatable: `mq4`, `mq6`, `q8`, `q8f16`, `hf4`, `hf6` (`hfq4`/`hfq4g256` map to `hf4`, `hfq6`/`hfq6g256` to `hf6`). With no `--format` and no `--both` the default is **`mq4`** for safetensors input and **`hf4`** for a `.gguf` file. |
+| `--format <fmt>` | Repeatable: `mq4`, `mq6`, `q8`, `q8f16`, `hf4`, `hf6` (`hfq4`/`hfq4g256` map to `hf4`, `hfq6`/`hfq6g256` to `hf6`). With no `--format` and no `--both` the default is **`mq4`**. |
 | `--both` | Add `mq4` and `mq6` to the requested formats (suppresses the default format). |
 | `-o` / `--output` | Exact output path; valid with exactly one format. |
-| `--output-dir`, `--stem` | Output directory (default: working directory) and filename stem (default: the input's file/directory name, `.gguf` removed); files are `<stem>.<format>`. |
+| `--output-dir`, `--stem` | Output directory (default: working directory) and filename stem (default: the input's file/directory name); files are `<stem>.<format>`. |
 | `--install` | Copy into `~/.hipfire/models/`. |
 | `--register <tag>` | Local alias in `~/.hipfire/models.toml`, pointing at the `mq4` artifact when produced, else the first one. |
 | `--upload <owner/repo>`, `--create-repo` | Optional HF publish through the `hf` CLI (`--create-repo` creates the model repo first). |

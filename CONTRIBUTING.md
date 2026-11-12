@@ -270,8 +270,8 @@ and see `crates/hipfire-arch-qwen35/src/arch.rs` for a production
 implementation), plus a carrier registered in `hipfire-loader` and an id
 in [docs/architecture-ids.md](docs/architecture-ids.md).
 
-Quantize from the original safetensors; GGUF weight input is deprecated
-and will be removed in 0.5.0 (see [docs/QUANTIZE.md](docs/QUANTIZE.md)).
+Quantize from the original safetensors; GGUF weight input to the quantizer
+was removed in 0.5.0 (see [docs/QUANTIZE.md](docs/QUANTIZE.md)).
 
 ### Branch naming
 
