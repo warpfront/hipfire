@@ -10059,7 +10059,7 @@ pub fn indexed_attention_attention(
     let (kernel_name, shared_mem) =
         match p.selected_len.checked_mul(QSA_ATTENTION_LDS_BYTES_PER_ROW) {
             Some(bytes)
-                if gpu.arch_caps.has_gfx11_plus_simt()
+                if gpu.arch_caps.has_qwen4_parallel_qsa_gdn()
                     // The kernel adds 32 bytes of static LDS (per-wave maxes).
                     && bytes + 32 <= QSA_ATTENTION_DYNAMIC_LDS_LIMIT_BYTES
                     && bytes <= u32::MAX as usize =>
