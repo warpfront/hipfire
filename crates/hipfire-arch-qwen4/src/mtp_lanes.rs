@@ -2524,7 +2524,9 @@ mod tests {
 
     #[test]
     fn profiles_follow_the_arch_and_gfx1151_stays_legacy() {
-        for arch in ["gfx1151", "gfx1100", "gfx1200", "", "gfx1201x", "gfx940", "gfx9420"] {
+        for arch in [
+            "gfx1151", "gfx1100", "gfx1200", "", "gfx1201x", "gfx940", "gfx9420",
+        ] {
             assert_eq!(
                 LaneCostProfile::for_arch_with(arch, true),
                 LaneCostProfile::LEGACY,

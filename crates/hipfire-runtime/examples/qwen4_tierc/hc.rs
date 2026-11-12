@@ -1348,52 +1348,50 @@ fn case_lane_wide_write(gpu: &mut Gpu) -> Result<String, String> {
     for &rows in &LANE_WIDE_ROWS {
         let x = rng.vec(rows * HC_WIDE, -2.0, 2.0);
         let mix = rng.vec(rows * HIDDEN, -1.0, 1.0);
-        let run = |gpu: &mut Gpu,
-                   single: bool,
-                   lane: bool|
-         -> Result<(Vec<f32>, Vec<f32>), String> {
-            let st = up_f32(gpu, &x)?;
-            let nt = sentinel_f32(gpu, rows * HC_WIDE)?;
-            let mt = up_f32(gpu, &mix)?;
-            let gt = sentinel_f32(gpu, rows * HC_STREAMS)?;
-            let rot = zeros_f32(gpu, rows * HC_WIDE)?;
-            let call = |gpu: &mut Gpu, r0: usize, n: usize| -> Result<(), String> {
-                let (sv, nv, mv, gv) = (
-                    st.sub_offset(r0 * HC_WIDE, n * HC_WIDE),
-                    nt.sub_offset(r0 * HC_WIDE, n * HC_WIDE),
-                    mt.sub_offset(r0 * HIDDEN, n * HIDDEN),
-                    gt.sub_offset(r0 * HC_STREAMS, n * HC_STREAMS),
-                );
-                let op = HyperWriteOp {
-                    ar: None,
-                    state_bf16: false,
-                    input: &sv,
-                    norm_weight: &wnt,
-                    block_inject: wref(&injt, HC_STREAMS, HC_WIDE),
-                    normalized: &nv,
-                    mixed: &mv,
-                    gates: &gv,
-                    output: &sv,
-                    rows: n,
-                    branches: HC_STREAMS,
-                    hidden: HIDDEN,
-                    rotation: &rot,
+        let run =
+            |gpu: &mut Gpu, single: bool, lane: bool| -> Result<(Vec<f32>, Vec<f32>), String> {
+                let st = up_f32(gpu, &x)?;
+                let nt = sentinel_f32(gpu, rows * HC_WIDE)?;
+                let mt = up_f32(gpu, &mix)?;
+                let gt = sentinel_f32(gpu, rows * HC_STREAMS)?;
+                let rot = zeros_f32(gpu, rows * HC_WIDE)?;
+                let call = |gpu: &mut Gpu, r0: usize, n: usize| -> Result<(), String> {
+                    let (sv, nv, mv, gv) = (
+                        st.sub_offset(r0 * HC_WIDE, n * HC_WIDE),
+                        nt.sub_offset(r0 * HC_WIDE, n * HC_WIDE),
+                        mt.sub_offset(r0 * HIDDEN, n * HIDDEN),
+                        gt.sub_offset(r0 * HC_STREAMS, n * HC_STREAMS),
+                    );
+                    let op = HyperWriteOp {
+                        ar: None,
+                        state_bf16: false,
+                        input: &sv,
+                        norm_weight: &wnt,
+                        block_inject: wref(&injt, HC_STREAMS, HC_WIDE),
+                        normalized: &nv,
+                        mixed: &mv,
+                        gates: &gv,
+                        output: &sv,
+                        rows: n,
+                        branches: HC_STREAMS,
+                        hidden: HIDDEN,
+                        rotation: &rot,
+                    };
+                    execute_hyper_write(gpu, &op).map_err(de)
                 };
-                execute_hyper_write(gpu, &op).map_err(de)
-            };
-            if single {
-                for r in 0..rows {
-                    call(gpu, r, 1)?;
+                if single {
+                    for r in 0..rows {
+                        call(gpu, r, 1)?;
+                    }
+                } else if lane {
+                    with_lane_scope(gpu, rows, |gpu| call(gpu, 0, rows))?;
+                } else {
+                    call(gpu, 0, rows)?;
                 }
-            } else if lane {
-                with_lane_scope(gpu, rows, |gpu| call(gpu, 0, rows))?;
-            } else {
-                call(gpu, 0, rows)?;
-            }
-            let got = (down_f32(gpu, &gt)?, down_f32(gpu, &st)?);
-            free_all(gpu, vec![st, nt, mt, gt, rot])?;
-            Ok(got)
-        };
+                let got = (down_f32(gpu, &gt)?, down_f32(gpu, &st)?);
+                free_all(gpu, vec![st, nt, mt, gt, rot])?;
+                Ok(got)
+            };
         let (g_single, s_single) = run(gpu, true, false)?;
         let (g_lane, s_lane) = run(gpu, false, true)?;
         let (g_chunk, _) = run(gpu, false, false)?;

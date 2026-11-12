@@ -10068,7 +10068,7 @@ pub fn indexed_attention_attention(
     let (kernel_name, shared_mem) =
         match p.selected_len.checked_mul(QSA_ATTENTION_LDS_BYTES_PER_ROW) {
             Some(bytes)
-                if gpu.arch_caps.has_gfx11_plus_simt()
+                if gpu.arch_caps.has_qwen4_parallel_qsa_gdn()
                     // The kernel adds 32 bytes of static LDS (per-wave maxes).
                     && bytes + 32 <= QSA_ATTENTION_DYNAMIC_LDS_LIMIT_BYTES
                     && bytes <= u32::MAX as usize =>
@@ -10077,7 +10077,7 @@ pub fn indexed_attention_attention(
             }
             _ => (serial, 0),
         };
-    gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel_name)?;
+    let kernel_name = crate::cdna::gfx942::ensure_qsa_row_kernel(gpu, kernel_name)?;
     let mut args = KernargBlob::new();
     for tensor in [
         p.q_with_gate,

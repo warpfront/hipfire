@@ -218,9 +218,15 @@ fn run_case(
     let proj_n = rows * QKV;
     let gate_n = rows * NV;
     let out_n = rows * VALUE;
-    let proj_pool = gpu.upload_f32(&vec![0.0; pool * proj_n], &[pool * proj_n]).unwrap();
-    let gate_pool = gpu.upload_f32(&vec![0.0; pool * gate_n], &[pool * gate_n]).unwrap();
-    let beta_pool = gpu.upload_f32(&vec![0.0; pool * gate_n], &[pool * gate_n]).unwrap();
+    let proj_pool = gpu
+        .upload_f32(&vec![0.0; pool * proj_n], &[pool * proj_n])
+        .unwrap();
+    let gate_pool = gpu
+        .upload_f32(&vec![0.0; pool * gate_n], &[pool * gate_n])
+        .unwrap();
+    let beta_pool = gpu
+        .upload_f32(&vec![0.0; pool * gate_n], &[pool * gate_n])
+        .unwrap();
     let mut arms: Vec<Arm> = Vec::new();
     let init: Vec<Vec<f32>> = (0..lanes)
         .map(|_| rand_vec(&mut rng, STATE, -0.5, 0.5))
@@ -262,7 +268,11 @@ fn run_case(
         start_diff += word_diff(&init[l], &dtoh(gpu, &refr.states[l])).0;
         start_diff += word_diff(&init[l], &dtoh(gpu, &cand.states[l])).0;
     }
-    report("identical start states", start_diff == 0, format!("diff words {start_diff}"));
+    report(
+        "identical start states",
+        start_diff == 0,
+        format!("diff words {start_diff}"),
+    );
 
     for step in 0..steps {
         let p = rand_vec(&mut rng, pool * proj_n, -1.0, 1.0);
@@ -278,7 +288,14 @@ fn run_case(
         for l in 0..lanes {
             gated_delta_step_batched(
                 gpu,
-                &step_args(&proj[l], &gate[l], &beta[l], &refr.states[l], &out_ref[l], rows),
+                &step_args(
+                    &proj[l],
+                    &gate[l],
+                    &beta[l],
+                    &refr.states[l],
+                    &out_ref[l],
+                    rows,
+                ),
             )
             .expect("per-lane launch");
         }
@@ -322,8 +339,12 @@ fn run_case(
         }
         let spare_ok = spare_slots.iter().all(|&s| {
             let lo = s * out_n;
-            out_r[lo..lo + out_n].iter().all(|w| w.to_bits() == SENTINEL)
-                && out_c[lo..lo + out_n].iter().all(|w| w.to_bits() == SENTINEL)
+            out_r[lo..lo + out_n]
+                .iter()
+                .all(|w| w.to_bits() == SENTINEL)
+                && out_c[lo..lo + out_n]
+                    .iter()
+                    .all(|w| w.to_bits() == SENTINEL)
         });
         let good = state_diff == 0
             && out_diff == 0
@@ -359,9 +380,10 @@ fn run_case(
             );
             // Controls 2 and 3 run the candidate again from the step's start states.
             if lanes >= 2 {
-                for (name, swap, drop_last) in
-                    [("two lanes' states swapped", true, false), ("last lane dropped", false, true)]
-                {
+                for (name, swap, drop_last) in [
+                    ("two lanes' states swapped", true, false),
+                    ("last lane dropped", false, true),
+                ] {
                     for l in 0..lanes {
                         htod(gpu, &cand.states[l], &before[l]);
                     }
@@ -391,7 +413,8 @@ fn run_case(
                     gpu.hip.device_synchronize().unwrap();
                     let mut bad = 0usize;
                     for l in 0..lanes {
-                        bad += word_diff(&dtoh(gpu, &refr.states[l]), &dtoh(gpu, &cand.states[l])).0;
+                        bad +=
+                            word_diff(&dtoh(gpu, &refr.states[l]), &dtoh(gpu, &cand.states[l])).0;
                     }
                     bad += word_diff(&out_r, &dtoh(gpu, &cand.out_pool)).0;
                     report(
@@ -407,7 +430,13 @@ fn run_case(
     for t in refr.states.into_iter().chain(cand.states) {
         gpu.free_tensor(t).ok();
     }
-    for t in [proj_pool, gate_pool, beta_pool, refr.out_pool, cand.out_pool] {
+    for t in [
+        proj_pool,
+        gate_pool,
+        beta_pool,
+        refr.out_pool,
+        cand.out_pool,
+    ] {
         gpu.free_tensor(t).ok();
     }
     ok
@@ -444,9 +473,14 @@ fn time_case(gpu: &mut Gpu, lanes: usize, reps: usize, warm: usize, seed: u64) {
             beta: gpu
                 .upload_f32(&rand_vec(&mut rng, lanes * NV, 0.02, 0.98), &[lanes * NV])
                 .unwrap(),
-            out: gpu.upload_f32(&vec![0.0; lanes * VALUE], &[lanes * VALUE]).unwrap(),
+            out: gpu
+                .upload_f32(&vec![0.0; lanes * VALUE], &[lanes * VALUE])
+                .unwrap(),
             states: (0..lanes)
-                .map(|_| gpu.upload_f32(&rand_vec(&mut rng, STATE, -0.5, 0.5), &[STATE]).unwrap())
+                .map(|_| {
+                    gpu.upload_f32(&rand_vec(&mut rng, STATE, -0.5, 0.5), &[STATE])
+                        .unwrap()
+                })
                 .collect(),
         })
         .collect();

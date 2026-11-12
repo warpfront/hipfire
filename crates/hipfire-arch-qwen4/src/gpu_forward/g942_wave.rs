@@ -7,10 +7,12 @@
 //! On one MI300X (exact `gfx942`, `topology = single`, stock-FP8 Flash-Next) a serve step's
 //! lane prefill tiles used to run one singleton chunk forward each, one lane after another:
 //! every tile re-read the layer weights. With the wave, every run of two or more consecutive
-//! non-MTP tiles of a step is ONE [`Qwen4Bundle::prefill_wave`] forward: the row-local stages
+//! tiles of a step, native-MTP lanes' included, is ONE [`Qwen4Bundle::prefill_wave`] forward: the row-local stages
 //! of the lane policy (embed, PLE rows, HC read / write, the GDN and QSA projections, the FP8
 //! grouped MoE, the final hyper) run once over all the wave's rows, and the stateful cores
-//! (GDN, QSA, PLE conv) per lane on the lane's own rows and state.
+//! (GDN, QSA, PLE conv) per lane on the lane's own rows and state. An MTP lane's wave rows are
+//! captured into the resident spec hidden buffer (`prefill_wave_wide`) and its head fill then
+//! runs from its own rows of that capture (`fill_head_after_wave`), the serial tile's head append.
 //!
 //! Why each lane's bytes equal its serial tile (checked by the lane oracle, not assumed):
 //! the singleton chunk forward on gfx942 pins `Gpu::prefill_invariant_scope`
@@ -58,23 +60,35 @@ pub fn serve_armed(bundle: &Qwen4Bundle) -> bool {
         })
 }
 
-/// Most rows one wave carries: the forward scratch's chunk rows (the prefill chunk bound).
-pub(crate) fn wave_cap(bundle: &Qwen4Bundle) -> usize {
-    bundle.spec_chunk_rows().unwrap_or(0)
+/// Most rows one wave carries: the forward scratch's chunk rows (the prefill chunk bound). A
+/// wave holding an MTP lane (`has_mtp`) is also capped by the rows of the resident spec hidden
+/// buffer, the wide-hidden capture its head fills read.
+pub(crate) fn wave_cap(bundle: &Qwen4Bundle, has_mtp: bool) -> usize {
+    let chunk = bundle.spec_chunk_rows().unwrap_or(0);
+    if has_mtp {
+        chunk.min(bundle.spec_hidden_rows())
+    } else {
+        chunk
+    }
 }
 
 /// Partition a step's prefill tiles (`tile_rows[i]` rows of the i-th Prefill request, plan
-/// order; `plain[i]`: the lane is not an MTP lane) into serial tiles and joint waves: runs of
-/// consecutive plain tiles pack greedily into waves of at most `max_rows` rows; a single-tile
-/// run, a tile wider than `max_rows` and every MTP lane's tile stay serial. Parts come back in
-/// plan order and cover every ordinal exactly once.
-pub(crate) fn plan_parts(tile_rows: &[usize], plain: &[bool], max_rows: usize) -> Vec<PrefillPart> {
-    debug_assert_eq!(tile_rows.len(), plain.len());
+/// order; `eligible[i]`: the lane may be forwarded by a wave, an MTP lane only with a spec hidden
+/// buffer to capture into) into serial tiles and joint waves: runs of consecutive eligible tiles
+/// pack greedily into waves of at most `max_rows` rows; a single-tile run, a tile wider than
+/// `max_rows` and every ineligible lane's tile stay serial. Parts come back in plan order and
+/// cover every ordinal exactly once.
+pub(crate) fn plan_parts(
+    tile_rows: &[usize],
+    eligible: &[bool],
+    max_rows: usize,
+) -> Vec<PrefillPart> {
+    debug_assert_eq!(tile_rows.len(), eligible.len());
     let n = tile_rows.len();
     let mut parts = Vec::with_capacity(n);
     let mut i = 0;
     while i < n {
-        let joins = |k: usize| plain[k] && tile_rows[k] > 0 && tile_rows[k] <= max_rows;
+        let joins = |k: usize| eligible[k] && tile_rows[k] > 0 && tile_rows[k] <= max_rows;
         if !joins(i) {
             parts.push(PrefillPart::Serial(i));
             i += 1;
@@ -148,6 +162,16 @@ mod tests {
     }
 
     #[test]
+    fn a_burst_of_eight_mtp_prompts_is_one_wave() {
+        // Eight ~150-row prompts (an MTP burst) are 1200 rows: one wave under the chunk cap.
+        let rows = [150, 148, 152, 149, 151, 147, 153, 150];
+        assert_eq!(
+            plan_parts(&rows, &[true; 8], 1536),
+            vec![PrefillPart::Wave(0..8)]
+        );
+    }
+
+    #[test]
     fn waves_pack_to_the_row_cap_and_cover_every_ordinal_once() {
         // 26 x 57 = 1482 rows fit a 1536-row wave, the 27th starts the next.
         let rows = vec![57usize; 64];
@@ -163,7 +187,7 @@ mod tests {
     }
 
     #[test]
-    fn a_tile_wider_than_the_cap_and_an_mtp_lane_stay_serial() {
+    fn a_tile_wider_than_the_cap_and_an_ineligible_lane_stay_serial() {
         let parts = plan_parts(
             &[57, 2000, 512, 512, 57],
             &[true, true, true, true, false],

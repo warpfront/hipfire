@@ -19,23 +19,33 @@ use crate::{DType, Gpu, GpuTensor};
 // reaches the private `Gfx942Device` borrow.
 #[path = "gfx942_qsa_lanes.rs"]
 mod qsa_lanes;
+pub(crate) use qsa_lanes::{QsaLanesTableCache, Qwen4QsaLaneDesc, Qwen4QsaLanesShape};
 pub use qsa_lanes::{
     Qwen4QsaLanesPlan, QWEN4_QSA_LANES_ATTENTION_F32, QWEN4_QSA_LANES_ATTENTION_FP8_FNUZ,
-    QWEN4_QSA_LANES_MAX, QWEN4_QSA_LANES_MODULE, QWEN4_QSA_LANES_POOL, QWEN4_QSA_LANES_PROLOGUE_F32,
-    QWEN4_QSA_LANES_PROLOGUE_FP8_FNUZ, QWEN4_QSA_LANES_SCORES, QWEN4_QSA_LANES_SELECT,
-    QWEN4_QSA_LANE_ROWS,
+    QWEN4_QSA_LANES_MAX, QWEN4_QSA_LANES_MODULE, QWEN4_QSA_LANES_POOL,
+    QWEN4_QSA_LANES_PROLOGUE_F32, QWEN4_QSA_LANES_PROLOGUE_FP8_FNUZ, QWEN4_QSA_LANES_SCORES,
+    QWEN4_QSA_LANES_SELECT, QWEN4_QSA_LANE_ROWS,
 };
-pub(crate) use qsa_lanes::{Qwen4QsaLaneDesc, Qwen4QsaLanesShape, QsaLanesTableCache};
 
 // The GDN Core of a whole lane group (verify windows and AR lanes, ragged rows) in three
 // launches: a child module so it reaches the private `Gfx942Device` borrow and the table cache.
 #[path = "gfx942_gdn_lanes_verify.rs"]
 mod gdn_lanes_verify;
 pub use gdn_lanes_verify::{
-    qwen4_gdn_lanes_verify_admitted,
-    Qwen4GdnLanesVerifyLane, Qwen4GdnLanesVerifyShape, QWEN4_G942_GDN_LANES_CONV_PARAMS,
-    QWEN4_G942_GDN_LANES_GATE, QWEN4_G942_GDN_LANES_STEP, QWEN4_G942_GDN_LANES_VERIFY_MAX,
-    QWEN4_G942_GDN_LANES_VERIFY_MODULE, QWEN4_G942_GDN_LANES_VERIFY_ROWS,
+    qwen4_gdn_lanes_verify_admitted, Qwen4GdnLanesVerifyLane, Qwen4GdnLanesVerifyShape,
+    QWEN4_G942_GDN_LANES_CONV_PARAMS, QWEN4_G942_GDN_LANES_GATE, QWEN4_G942_GDN_LANES_STEP,
+    QWEN4_G942_GDN_LANES_VERIFY_MAX, QWEN4_G942_GDN_LANES_VERIFY_MODULE,
+    QWEN4_G942_GDN_LANES_VERIFY_ROWS,
+};
+
+// x-batched MQ2G256V2 GEMV of the MTP draft head's ranking (one weight pass for up to eight
+// rows, bit-equal to the one-row GEMV): a child module so it reaches the private
+// `Gfx942Device` borrow.
+#[path = "gfx942_mq2_xbatch.rs"]
+mod mq2_xbatch;
+pub use mq2_xbatch::{
+    qwen4_g942_mq2_xbatch_covers, qwen4_g942_mq2_xbatch_entry, QWEN4_G942_MQ2_XBATCH_MAX_ROWS,
+    QWEN4_G942_MQ2_XBATCH_MODULE,
 };
 const GROUPED_OLORA_E8_SRC: &str =
     include_str!("../../../../kernels/src/gemv_mfp4g32_e8_soa_grouped.gfx942.hip");
@@ -375,7 +385,10 @@ fn g942_gdn_verify_image() -> HipResult<Option<&'static std::sync::Arc<[u8]>>> {
 /// (hipcc source, or the `HIPFIRE_QWEN4_G942_GDN_VERIFY_IMAGE` code object) and the module's own
 /// symbol is returned; every other arch, and every other entry, loads from `tensor_ops` as
 /// before and returns `kernel`.
-pub(crate) fn ensure_gdn_verify_kernel(gpu: &mut Gpu, kernel: &'static str) -> HipResult<&'static str> {
+pub(crate) fn ensure_gdn_verify_kernel(
+    gpu: &mut Gpu,
+    kernel: &'static str,
+) -> HipResult<&'static str> {
     if !gpu.arch_caps.is_gfx942() {
         gpu.ensure_kernel_public("tensor_ops", crate::tensor_ops::TENSOR_OPS_SRC, kernel)?;
         return Ok(kernel);
@@ -394,8 +407,76 @@ pub(crate) fn ensure_gdn_verify_kernel(gpu: &mut Gpu, kernel: &'static str) -> H
     };
     gpu.bind_thread()?;
     match g942_gdn_verify_image()? {
-        Some(image) => gpu.ensure_embedded_kernel(QWEN4_G942_GDN_VERIFY_MODULE, image.clone(), own)?,
+        Some(image) => {
+            gpu.ensure_embedded_kernel(QWEN4_G942_GDN_VERIFY_MODULE, image.clone(), own)?
+        }
         None => gpu.ensure_kernel(QWEN4_G942_GDN_VERIFY_MODULE, QWEN4_G942_GDN_VERIFY_SRC, own)?,
+    }
+    Ok(own)
+}
+
+const QWEN4_G942_QSA_ROW_SRC: &str =
+    include_str!("../../../../kernels/src/qwen4_g942_qsa_row_attention.gfx942.hip");
+/// The exact-gfx942 single-row parallel QSA attention module (its own cache key and twin seat).
+pub const QWEN4_G942_QSA_ROW_MODULE: &str = "qwen4_g942_qsa_row_attention";
+/// `(tensor_ops entry, gfx942 row module entry)`: the two parallel single-row QSA attention
+/// entries exact gfx942 can select (K/V formats F32 and E4M3 FNUZ; `fp8` is gfx12-only and `q8`
+/// gfx11/gfx12-only). The serial entries stay in `tensor_ops`. The names differ (the per-context
+/// function table is keyed by entry name); the device body is `tensor_ops.hip`'s, byte for byte.
+pub const QWEN4_G942_QSA_ROW_ENTRIES: [(&str, &str); 2] = [
+    ("indexed_attention_attention_f32", "qwen4_g942_qsa_row_f32"),
+    (
+        "indexed_attention_attention_fp8_fnuz",
+        "qwen4_g942_qsa_row_fp8_fnuz",
+    ),
+];
+
+/// `HIPFIRE_QWEN4_G942_QSA_ROW_IMAGE=/absolute/device.elf` (developer, read once): the explicitly
+/// supplied code object of [`QWEN4_G942_QSA_ROW_MODULE`] (the Route-A twin proof). Unset: the
+/// hipcc source, unchanged.
+fn g942_qsa_row_image() -> HipResult<Option<&'static std::sync::Arc<[u8]>>> {
+    static IMAGE: std::sync::LazyLock<Result<Option<std::sync::Arc<[u8]>>, String>> =
+        std::sync::LazyLock::new(|| {
+            match hipfire_config::developer_var("HIPFIRE_QWEN4_G942_QSA_ROW_IMAGE") {
+                Ok(path) if !path.is_empty() => std::fs::read(&path)
+                    .map(|bytes| Some(std::sync::Arc::<[u8]>::from(bytes)))
+                    .map_err(|error| format!("HIPFIRE_QWEN4_G942_QSA_ROW_IMAGE {path}: {error}")),
+                _ => Ok(None),
+            }
+        });
+    let loaded: &'static Result<Option<std::sync::Arc<[u8]>>, String> = &IMAGE;
+    match loaded {
+        Ok(image) => Ok(image.as_ref()),
+        Err(message) => Err(hip_bridge::HipError::new(0, message)),
+    }
+}
+
+/// Load the single-row QSA attention entry `kernel` and return the symbol to launch. On exact
+/// gfx942 the two [`QWEN4_G942_QSA_ROW_ENTRIES`] resolve to the gfx942-only module (hipcc source,
+/// or the `HIPFIRE_QWEN4_G942_QSA_ROW_IMAGE` code object) and the module's own symbol is
+/// returned; every other arch, and every other entry (the serial row kernels), loads from
+/// `tensor_ops` as before and returns `kernel`.
+pub(crate) fn ensure_qsa_row_kernel(
+    gpu: &mut Gpu,
+    kernel: &'static str,
+) -> HipResult<&'static str> {
+    let entry = gpu
+        .arch_caps
+        .is_gfx942()
+        .then(|| {
+            QWEN4_G942_QSA_ROW_ENTRIES
+                .iter()
+                .find(|(tensor_ops, _)| *tensor_ops == kernel)
+        })
+        .flatten();
+    let Some(&(_, own)) = entry else {
+        gpu.ensure_kernel_public("tensor_ops", crate::tensor_ops::TENSOR_OPS_SRC, kernel)?;
+        return Ok(kernel);
+    };
+    gpu.bind_thread()?;
+    match g942_qsa_row_image()? {
+        Some(image) => gpu.ensure_embedded_kernel(QWEN4_G942_QSA_ROW_MODULE, image.clone(), own)?,
+        None => gpu.ensure_kernel(QWEN4_G942_QSA_ROW_MODULE, QWEN4_G942_QSA_ROW_SRC, own)?,
     }
     Ok(own)
 }
@@ -2034,9 +2115,9 @@ impl Gfx942Device<'_> {
             &vdv as *const _ as *mut c_void,
             &scale as *const _ as *mut c_void,
         ];
-        let bytes = lanes.len().saturating_mul(
-            2 * state_elems * 4 + (proj_elems + out_elems + 2 * gate_elems) * 4,
-        );
+        let bytes = lanes
+            .len()
+            .saturating_mul(2 * state_elems * 4 + (proj_elems + out_elems + 2 * gate_elems) * 4);
         let timer = crate::profile::begin_timer(
             &self.gpu.hip,
             "deltanet",
@@ -2172,7 +2253,12 @@ impl Gfx942Device<'_> {
             });
         }
         let key: GdnLanesCaptureTableKey = ([rows, key_heads, value_heads], descs);
-        if !self.gpu.gdn_lanes_f32_tables.capture_tables.contains_key(&key) {
+        if !self
+            .gpu
+            .gdn_lanes_f32_tables
+            .capture_tables
+            .contains_key(&key)
+        {
             // Validated once per distinct lane set: the table is a pure function of the key.
             let descs = &key.1;
             let mut writes: Vec<(u64, u64)> = Vec::with_capacity(2 * descs.len());
@@ -2217,9 +2303,16 @@ impl Gfx942Device<'_> {
                 .1
                 .iter()
                 .flat_map(|d| {
-                    [d.projection, d.gate, d.beta, d.state, d.final_state, d.output]
-                        .into_iter()
-                        .flat_map(u64::to_le_bytes)
+                    [
+                        d.projection,
+                        d.gate,
+                        d.beta,
+                        d.state,
+                        d.final_state,
+                        d.output,
+                    ]
+                    .into_iter()
+                    .flat_map(u64::to_le_bytes)
                 })
                 .collect();
             let buf = self.gpu.hip.malloc(bytes.len().next_multiple_of(256))?;
@@ -2234,7 +2327,9 @@ impl Gfx942Device<'_> {
                 .capture_tables
                 .insert(key.clone(), (buf, bytes));
         }
-        let table = self.gpu.gdn_lanes_f32_tables.capture_tables[&key].0.as_ptr();
+        let table = self.gpu.gdn_lanes_f32_tables.capture_tables[&key]
+            .0
+            .as_ptr();
         self.gpu.bind_thread()?;
         g942_gdn_lanes_capture_ensure(&mut *self.gpu)?;
         let (rv, qv, khv, vhv, kdv, vdv) = (
@@ -3373,12 +3468,18 @@ mod tests {
             blocks += 1;
             rest = &body[end + END.len()..];
         }
-        assert_eq!(blocks, 4, "bf16 helpers, Q8 helpers, barrier, pipe128 helpers + body");
+        assert_eq!(
+            blocks, 4,
+            "bf16 helpers, Q8 helpers, barrier, pipe128 helpers + body"
+        );
         // The one-row production kernel is the body this wrapper batches.
         assert!(production.contains(
             "gated_delta_step_pipe128_body<false>(projection, gate, beta, state, output, rows,"
         ));
-        assert_eq!(src.matches("gated_delta_step_pipe128_body<false>(").count(), 1);
+        assert_eq!(
+            src.matches("gated_delta_step_pipe128_body<false>(").count(),
+            1
+        );
         assert!(src.contains(&format!("void {}(", super::QWEN4_GDN_LANES_F32_KERNEL)));
         assert_eq!(src.matches("__launch_bounds__(128)").count(), 1);
     }
@@ -3426,7 +3527,10 @@ mod tests {
             blocks += 1;
             rest = &body[end + END.len()..];
         }
-        assert_eq!(blocks, 4, "bf16 helpers, Q8 helpers, barrier, pipe128 helpers");
+        assert_eq!(
+            blocks, 4,
+            "bf16 helpers, Q8 helpers, barrier, pipe128 helpers"
+        );
         // The derived body: the production pipe128 body with the two edits applied.
         let derived_at = src.find(BEGIN_BODY).expect("derived body marker") + BEGIN_BODY.len();
         let derived = &src[derived_at..derived_at + src[derived_at..].find(END_BODY).unwrap()];
@@ -3454,7 +3558,10 @@ mod tests {
             expected.trim_end_matches('\n'),
             "the capture lanes body drifted from tensor_ops.hip's pipe128 body"
         );
-        assert_eq!(src.matches("gated_delta_step_pipe128_body<false>(").count(), 1);
+        assert_eq!(
+            src.matches("gated_delta_step_pipe128_body<false>(").count(),
+            1
+        );
         assert!(src.contains(&format!(
             "void {}(",
             super::QWEN4_GDN_LANES_CAPTURE_F32_KERNEL
@@ -3473,10 +3580,17 @@ mod tests {
         let body = &src[at..src[at..].find("};").unwrap() + at];
         assert_eq!(body.matches("QWEN4_GDN_GLOBAL*").count(), 6);
         assert_eq!(body.matches(';').count(), 6);
-        let order: Vec<usize> = ["projection", "gate", "beta", "state", "final_state", "output"]
-            .iter()
-            .map(|field| body.find(&format!("* {field};")).expect(field))
-            .collect();
+        let order: Vec<usize> = [
+            "projection",
+            "gate",
+            "beta",
+            "state",
+            "final_state",
+            "output",
+        ]
+        .iter()
+        .map(|field| body.find(&format!("* {field};")).expect(field))
+        .collect();
         assert!(order.windows(2).all(|w| w[0] < w[1]), "field order");
     }
 
@@ -3529,12 +3643,14 @@ mod tests {
         );
         // The rollback wrapper is the production wrapper with exactly one edit: the layer table
         // and the pointers loaded from it go through address space 1 (global).
-        const BEGIN_WRAP: &str = "// BEGIN derived tensor_ops.hip rollback wrapper (global lane table)\n";
+        const BEGIN_WRAP: &str =
+            "// BEGIN derived tensor_ops.hip rollback wrapper (global lane table)\n";
         const END_WRAP: &str = "// END derived tensor_ops.hip rollback wrapper (global lane table)";
         let at = src.find(BEGIN_WRAP).expect("derived wrapper marker") + BEGIN_WRAP.len();
         let derived = &src[at..at + src[at..].find(END_WRAP).unwrap()];
         let derived = &derived[derived.find("#define QWEN4_G942_GDN_GLOBAL").unwrap()..];
-        let head = "__launch_bounds__(256)\nextern \"C\" __global__ void gated_delta_rollback_layers_f32(";
+        let head =
+            "__launch_bounds__(256)\nextern \"C\" __global__ void gated_delta_rollback_layers_f32(";
         let from = production.find(head).expect("production rollback wrapper");
         let wrapper = &production[from..];
         let wrapper = &wrapper[..wrapper.find("\n}\n").unwrap() + 2];
@@ -3581,7 +3697,10 @@ mod tests {
             blocks += 1;
             rest = &body[end + END.len()..];
         }
-        assert_eq!(blocks, 4, "bf16 macros, row_multi, k4 rows body, tiled entry macro");
+        assert_eq!(
+            blocks, 4,
+            "bf16 macros, row_multi, k4 rows body, tiled entry macro"
+        );
         // Nothing outside the markers but the preamble (comments, includes).
         let stripped: String = {
             let mut out = String::new();
@@ -3604,7 +3723,10 @@ mod tests {
         }
         // Exactly the seven tiled instantiations, none else.
         for r in 2..=8 {
-            assert!(src.contains(&format!("GEMV_BF16_XF32_K4_ROWS_TILED({r})\n")), "R={r}");
+            assert!(
+                src.contains(&format!("GEMV_BF16_XF32_K4_ROWS_TILED({r})\n")),
+                "R={r}"
+            );
         }
         assert_eq!(src.matches("\nGEMV_BF16_XF32_K4_ROWS_TILED(").count(), 7);
         assert_eq!(src.matches("extern \"C\" __global__").count(), 1);
@@ -3633,7 +3755,10 @@ mod tests {
                 .map(|b| format!("{b:02x}"))
                 .collect()
         };
-        assert_eq!(hex(super::QWEN4_G942_HC_GATES_SRC.as_bytes()), SOURCE_SHA256);
+        assert_eq!(
+            hex(super::QWEN4_G942_HC_GATES_SRC.as_bytes()),
+            SOURCE_SHA256
+        );
         let anchor: &[u8] =
             include_bytes!("../../../../kernels/qwen4_g942_hc_gates_hipcc_gfx942.co");
         assert_eq!(hex(anchor), ANCHOR_SHA256);
@@ -3642,6 +3767,122 @@ mod tests {
             assert!(
                 anchor.windows(name.len()).any(|w| w == name.as_bytes()),
                 "{name} missing from the anchor"
+            );
+        }
+    }
+
+    /// The single-row QSA attention module is `tensor_ops.hip`'s body byte for byte: with the two
+    /// entry names mapped back, every `BEGIN` / `END verbatim` block occurs in the production
+    /// source (format helpers + key dots, the gfx942 rounding pins + `qsa_attention_row_parallel`,
+    /// the `qsa_attention_single` wrapper, the `QSA_ATTENTION_SINGLE` entry macro), and nothing
+    /// else but the two instantiations is code.
+    #[test]
+    fn g942_qsa_row_source_is_tensor_ops_verbatim() {
+        const BEGIN: &str = "// BEGIN verbatim tensor_ops.hip\n";
+        const END: &str = "// END verbatim tensor_ops.hip";
+        let production = crate::tensor_ops::TENSOR_OPS_SRC;
+        let mut src = super::QWEN4_G942_QSA_ROW_SRC.to_string();
+        for (old, new) in super::QWEN4_G942_QSA_ROW_ENTRIES {
+            assert!(
+                src.contains(&format!("QSA_ATTENTION_SINGLE({new},")),
+                "entry {new} is instantiated by the module"
+            );
+            assert!(
+                production.contains(
+                    "QSA_ATTENTION_SINGLE(indexed_attention_attention_##TAG, qsa_attention_single,"
+                ),
+                "entry {old} is the tensor_ops single-row instantiation"
+            );
+            src = src.replace(new, old);
+        }
+        assert_eq!(
+            src.matches("QSA_ATTENTION_SINGLE(indexed_attention_attention_")
+                .count(),
+            2
+        );
+        let mut blocks = 0;
+        let mut rest = src.as_str();
+        let mut outside = String::new();
+        while let Some(at) = rest.find(BEGIN) {
+            outside.push_str(&rest[..at]);
+            let body = &rest[at + BEGIN.len()..];
+            let end = body.find(END).expect("END marker after every BEGIN marker");
+            let block = body[..end].trim_end_matches('\n');
+            assert!(
+                production.contains(block),
+                "verbatim block {blocks} of qwen4_g942_qsa_row_attention.gfx942.hip is no longer \
+                 a substring of tensor_ops.hip: mirror the production edit\nblock starts: {:?}",
+                &block[..block.len().min(120)]
+            );
+            blocks += 1;
+            rest = &body[end + END.len()..];
+        }
+        outside.push_str(rest);
+        assert_eq!(
+            blocks, 4,
+            "format helpers + key dots, rounding pins + row body, single wrapper, entry macro"
+        );
+        // The production source instantiates both entries under the arch guards the module
+        // relies on: F32 unguarded, FNUZ gfx942-only (the only formats gfx942 compiles).
+        assert!(production.contains("QSA_ATTENTION_KERNELS(f32, QSA_KV_F32, float)"));
+        assert!(production
+            .contains("#if defined(__gfx942__)\nQSA_ATTENTION_KERNELS(fp8_fnuz, QSA_KV_FP8_FNUZ, unsigned char)"));
+        // Outside the markers: comments, includes, the bf16 alias and the two instantiations.
+        let code: Vec<&str> = outside
+            .lines()
+            .map(str::trim)
+            .filter(|t| {
+                !(t.is_empty()
+                    || t.starts_with("//")
+                    || t.starts_with("#include")
+                    || t.starts_with("using __hip_bfloat16"))
+            })
+            .collect();
+        assert_eq!(
+            code,
+            [
+                "QSA_ATTENTION_SINGLE(indexed_attention_attention_f32, qsa_attention_single, __launch_bounds__(256),",
+                "QSA_KV_F32, float)",
+                "QSA_ATTENTION_SINGLE(indexed_attention_attention_fp8_fnuz, qsa_attention_single, __launch_bounds__(256),",
+                "QSA_KV_FP8_FNUZ, unsigned char)",
+            ],
+            "unmarked code in the QSA row module"
+        );
+    }
+
+    /// The frozen hipcc anchor of the QSA row module: `hipcc --genco --offload-arch=gfx942 -O3
+    /// --no-offload-compress -fuse-cuid=none -mcode-object-version=6` (`core_hipcc_flags`) of the
+    /// pinned source (ROCm 7.16, AMD clang 24.0.0git d6f6cb6918). Re-seal both hashes together
+    /// when the source changes.
+    #[test]
+    fn g942_qsa_row_anchor_and_source_are_pinned() {
+        use sha2::{Digest, Sha256};
+        const SOURCE_SHA256: &str =
+            "e95e554a7f939feaa2d9a80393edb9a4d1df0596149afb3b4cc54e9599a06b6e";
+        const ANCHOR_SHA256: &str =
+            "bbc9fbcfe6a2cd5ebc830fc82ffc9a6a360d7efe3c15c5824d93eda5513e4d9c";
+        let hex = |bytes: &[u8]| -> String {
+            Sha256::digest(bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        };
+        assert_eq!(hex(super::QWEN4_G942_QSA_ROW_SRC.as_bytes()), SOURCE_SHA256);
+        let anchor: &[u8] =
+            include_bytes!("../../../../kernels/qwen4_g942_qsa_row_attention_hipcc_gfx942.co");
+        assert_eq!(hex(anchor), ANCHOR_SHA256);
+        // Exactly the entries gfx942 can select are exported by the anchor, and no serial or
+        // batched sibling is.
+        for (_, name) in super::QWEN4_G942_QSA_ROW_ENTRIES {
+            assert!(
+                anchor.windows(name.len()).any(|w| w == name.as_bytes()),
+                "{name} missing from the anchor"
+            );
+        }
+        for absent in ["_serial", "_batched", "_hg4", "_hg12"] {
+            assert!(
+                !anchor.windows(absent.len()).any(|w| w == absent.as_bytes()),
+                "{absent} entry in the QSA row anchor"
             );
         }
     }

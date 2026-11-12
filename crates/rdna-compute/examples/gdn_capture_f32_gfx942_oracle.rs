@@ -232,7 +232,11 @@ fn run_case(gpu: &mut Gpu, rows: usize, steps: usize, controls: bool, seed: u64)
             let mut bad = c_final.to_vec();
             bad[STATE - 1] = f32::from_bits(bad[STATE - 1].to_bits() ^ 1);
             let (d, _) = word_diff(&r_state, &bad);
-            report("control: flipped captured bit", d == 1, format!("diff words {d}"));
+            report(
+                "control: flipped captured bit",
+                d == 1,
+                format!("diff words {d}"),
+            );
             // The capture compared against the wrong (stale) reference state.
             let d = word_diff(&ref_before, c_final).0;
             report("control: stale reference", d > 0, format!("diff words {d}"));
@@ -253,11 +257,8 @@ fn run_case(gpu: &mut Gpu, rows: usize, steps: usize, controls: bool, seed: u64)
             // The kept rows' gate / beta are the first `keep` rows of the rows-wide blocks.
             let kg = recurrence.sub_offset(rows * QKV, keep * NV);
             let kb = recurrence.sub_offset(rows * QKV + rows * NV, keep * NV);
-            gated_delta_step_batched(
-                gpu,
-                &step(&kp, &kg, &kb, &k_state, &k_out, None, keep),
-            )
-            .expect("pipe128 prefix launch");
+            gated_delta_step_batched(gpu, &step(&kp, &kg, &kb, &k_state, &k_out, None, keep))
+                .expect("pipe128 prefix launch");
             gpu.hip.device_synchronize().expect("sync");
             let want = dtoh(gpu, &k_state);
             let got = &after_ring[keep * STATE..(keep + 1) * STATE];
@@ -286,11 +287,8 @@ fn run_case(gpu: &mut Gpu, rows: usize, steps: usize, controls: bool, seed: u64)
                 let sg = recurrence.sub_offset(rows * QKV, sk * NV);
                 let sb = recurrence.sub_offset(rows * QKV + rows * NV, sk * NV);
                 let s_out = gpu.zeros(&[sk * VALUE], DType::F32).unwrap();
-                gated_delta_step_batched(
-                    gpu,
-                    &step(&sp, &sg, &sb, &short, &s_out, None, sk),
-                )
-                .expect("short prefix launch");
+                gated_delta_step_batched(gpu, &step(&sp, &sg, &sb, &short, &s_out, None, sk))
+                    .expect("short prefix launch");
                 gpu.hip.device_synchronize().expect("sync");
                 let d = word_diff(&dtoh(gpu, &short), got).0;
                 report(
@@ -362,15 +360,23 @@ fn run_lanes_case(
     let init: Vec<Vec<f32>> = (0..lanes)
         .map(|_| rand_vec(&mut rng, STATE, -0.5, 0.5))
         .collect();
-    let rec: Vec<GpuTensor> = (0..lanes).map(|_| gpu.zeros(&[rec_n], DType::F32).unwrap()).collect();
-    let live_ref: Vec<GpuTensor> =
-        init.iter().map(|s| gpu.upload_f32(s, &[STATE]).unwrap()).collect();
-    let live_cand: Vec<GpuTensor> =
-        init.iter().map(|s| gpu.upload_f32(s, &[STATE]).unwrap()).collect();
-    let ring_ref: Vec<GpuTensor> =
-        (0..lanes).map(|_| gpu.upload_f32(&sentinel, &[ring_n]).unwrap()).collect();
-    let ring_cand: Vec<GpuTensor> =
-        (0..lanes).map(|_| gpu.upload_f32(&sentinel, &[ring_n]).unwrap()).collect();
+    let rec: Vec<GpuTensor> = (0..lanes)
+        .map(|_| gpu.zeros(&[rec_n], DType::F32).unwrap())
+        .collect();
+    let live_ref: Vec<GpuTensor> = init
+        .iter()
+        .map(|s| gpu.upload_f32(s, &[STATE]).unwrap())
+        .collect();
+    let live_cand: Vec<GpuTensor> = init
+        .iter()
+        .map(|s| gpu.upload_f32(s, &[STATE]).unwrap())
+        .collect();
+    let ring_ref: Vec<GpuTensor> = (0..lanes)
+        .map(|_| gpu.upload_f32(&sentinel, &[ring_n]).unwrap())
+        .collect();
+    let ring_cand: Vec<GpuTensor> = (0..lanes)
+        .map(|_| gpu.upload_f32(&sentinel, &[ring_n]).unwrap())
+        .collect();
     let out_ref: Vec<GpuTensor> = (0..lanes)
         .map(|_| gpu.upload_f32(&sentinel_out, &[rows * VALUE]).unwrap())
         .collect();
@@ -378,8 +384,10 @@ fn run_lanes_case(
         .map(|_| gpu.upload_f32(&sentinel_out, &[rows * VALUE]).unwrap())
         .collect();
     let proj: Vec<GpuTensor> = rec.iter().map(|r| r.sub_offset(0, rows * QKV)).collect();
-    let gate: Vec<GpuTensor> =
-        rec.iter().map(|r| r.sub_offset(rows * QKV, rows * NV)).collect();
+    let gate: Vec<GpuTensor> = rec
+        .iter()
+        .map(|r| r.sub_offset(rows * QKV, rows * NV))
+        .collect();
     let beta: Vec<GpuTensor> = rec
         .iter()
         .map(|r| r.sub_offset(rows * QKV + rows * NV, rows * NV))
@@ -407,7 +415,15 @@ fn run_lanes_case(
         for l in 0..lanes {
             gated_delta_step_batched(
                 gpu,
-                &step(&proj[l], &gate[l], &beta[l], &live_ref[l], &out_ref[l], Some(&ring_ref[l]), rows),
+                &step(
+                    &proj[l],
+                    &gate[l],
+                    &beta[l],
+                    &live_ref[l],
+                    &out_ref[l],
+                    Some(&ring_ref[l]),
+                    rows,
+                ),
             )
             .expect("per-lane capture launch");
         }
@@ -458,7 +474,11 @@ fn run_lanes_case(
             let at = ring_n - 1;
             bad[at] = f32::from_bits(bad[at].to_bits() ^ 1);
             let d = word_diff(&dtoh(gpu, &ring_ref[lanes - 1]), &bad).0;
-            report("control: flipped captured bit", d == 1, format!("diff words {d}"));
+            report(
+                "control: flipped captured bit",
+                d == 1,
+                format!("diff words {d}"),
+            );
             if lanes >= 2 {
                 // The candidate launched over the lanes in swapped ring order: the rings
                 // must differ from the reference (the comparison sees lane identity).
@@ -484,7 +504,11 @@ fn run_lanes_case(
                 gpu.hip.device_synchronize().expect("sync");
                 let d = word_diff(&dtoh(gpu, &ring_ref[0]), &dtoh(gpu, &ring_cand[0])).0
                     + word_diff(&dtoh(gpu, &ring_ref[1]), &dtoh(gpu, &ring_cand[1])).0;
-                report("control: lanes' rings swapped", d > 0, format!("diff words {d}"));
+                report(
+                    "control: lanes' rings swapped",
+                    d > 0,
+                    format!("diff words {d}"),
+                );
                 // The candidate launched without its last lane leaves that ring unwritten.
                 htod_f32(gpu, &ring_cand[lanes - 1], &sentinel);
                 let short: Vec<Qwen4GdnLanesCaptureF32Lane<'_>> = (0..lanes - 1)
@@ -507,7 +531,11 @@ fn run_lanes_case(
                     &dtoh(gpu, &ring_cand[lanes - 1]),
                 )
                 .0;
-                report("control: last lane not launched", d > 0, format!("diff words {d}"));
+                report(
+                    "control: last lane not launched",
+                    d > 0,
+                    format!("diff words {d}"),
+                );
             }
         }
         // Carry: both chains' next window starts from this window's final state.
@@ -612,11 +640,20 @@ fn run_conv_case(gpu: &mut Gpu, rows: usize, cursor: usize, controls: bool, seed
             let next = if alias {
                 None
             } else {
-                Some(gpu.upload_f32(&vec![sentinel; 3 * channels], &[3 * channels]).unwrap())
+                Some(
+                    gpu.upload_f32(&vec![sentinel; 3 * channels], &[3 * channels])
+                        .unwrap(),
+                )
             };
-            let out = gpu.upload_f32(&vec![sentinel; rows * channels], &[rows * channels]).unwrap();
-            let gate = gpu.upload_f32(&vec![sentinel; rows * heads], &[rows * heads]).unwrap();
-            let beta = gpu.upload_f32(&vec![sentinel; rows * heads], &[rows * heads]).unwrap();
+            let out = gpu
+                .upload_f32(&vec![sentinel; rows * channels], &[rows * channels])
+                .unwrap();
+            let gate = gpu
+                .upload_f32(&vec![sentinel; rows * heads], &[rows * heads])
+                .unwrap();
+            let beta = gpu
+                .upload_f32(&vec![sentinel; rows * heads], &[rows * heads])
+                .unwrap();
             (hist, next, out, gate, beta)
         };
         let (r_hist, r_next, r_out, r_gate, r_beta) = mk(gpu);
@@ -636,8 +673,14 @@ fn run_conv_case(gpu: &mut Gpu, rows: usize, cursor: usize, controls: bool, seed
         args.push_i32((rows * heads) as i32);
         args.push_i32(heads as i32);
         args.pad_to(16);
-        gpu.launch_kernel_blob(KERNEL, [grid as u32, 1, 1], [256, 1, 1], 0, args.as_mut_slice())
-            .expect("reference launch");
+        gpu.launch_kernel_blob(
+            KERNEL,
+            [grid as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            args.as_mut_slice(),
+        )
+        .expect("reference launch");
         // Candidate: the public launcher (verify module on gfx942).
         let c_next_t = c_next.as_ref().unwrap_or(&c_hist);
         let run_cand = |gpu: &mut Gpu, start_cursor: usize| {
@@ -670,7 +713,8 @@ fn run_conv_case(gpu: &mut Gpu, rows: usize, cursor: usize, controls: bool, seed
         };
         run_cand(gpu, cursor);
         gpu.hip.device_synchronize().expect("sync");
-        let diff = |gpu: &Gpu, r: &GpuTensor, c: &GpuTensor| word_diff(&dtoh(gpu, r), &dtoh(gpu, c));
+        let diff =
+            |gpu: &Gpu, r: &GpuTensor, c: &GpuTensor| word_diff(&dtoh(gpu, r), &dtoh(gpu, c));
         let (d_out, f_out) = diff(gpu, &r_out, &c_out);
         let (d_next, f_next) = diff(gpu, r_next_t, c_next_t);
         let (d_gate, _) = diff(gpu, &r_gate, &c_gate);
@@ -680,7 +724,10 @@ fn run_conv_case(gpu: &mut Gpu, rows: usize, cursor: usize, controls: bool, seed
             .filter(|w| w.to_bits() != 0xFFFF_FFFF)
             .count();
         report(
-            &format!("{} history vs tensor_ops kernel", if alias { "aliased" } else { "separate" }),
+            &format!(
+                "{} history vs tensor_ops kernel",
+                if alias { "aliased" } else { "separate" }
+            ),
             d_out == 0 && d_next == 0 && d_gate == 0 && d_beta == 0 && written == rows * channels,
             format!(
                 "output diff words {d_out} (first {f_out:?}), next-history diff words {d_next} \
@@ -693,7 +740,11 @@ fn run_conv_case(gpu: &mut Gpu, rows: usize, cursor: usize, controls: bool, seed
             let mut bad = dtoh(gpu, &c_out);
             bad[rows * channels - 1] = f32::from_bits(bad[rows * channels - 1].to_bits() ^ 1);
             let d = word_diff(&dtoh(gpu, &r_out), &bad).0;
-            report("control: flipped output bit", d == 1, format!("diff words {d}"));
+            report(
+                "control: flipped output bit",
+                d == 1,
+                format!("diff words {d}"),
+            );
             // The candidate at the next ring cursor: its history reads / tail ring differ.
             let (w_hist, w_next, w_out, w_gate, w_beta) = mk(gpu);
             let w_next_t = w_next.as_ref().unwrap_or(&w_hist);
@@ -724,9 +775,16 @@ fn run_conv_case(gpu: &mut Gpu, rows: usize, cursor: usize, controls: bool, seed
             )
             .expect("wrong-cursor launch");
             gpu.hip.device_synchronize().expect("sync");
-            let d = word_diff(&dtoh(gpu, &r_next_t.sub_offset(0, 3 * channels)), &dtoh(gpu, w_next_t)).0
-                + word_diff(&dtoh(gpu, &r_out), &dtoh(gpu, &w_out)).0;
-            report("control: candidate at the wrong ring cursor", d > 0, format!("diff words {d}"));
+            let d = word_diff(
+                &dtoh(gpu, &r_next_t.sub_offset(0, 3 * channels)),
+                &dtoh(gpu, w_next_t),
+            )
+            .0 + word_diff(&dtoh(gpu, &r_out), &dtoh(gpu, &w_out)).0;
+            report(
+                "control: candidate at the wrong ring cursor",
+                d > 0,
+                format!("diff words {d}"),
+            );
             for t in [w_hist, w_out, w_gate, w_beta].into_iter().chain(w_next) {
                 gpu.free_tensor(t).ok();
             }
@@ -790,8 +848,14 @@ fn run_gate_case(gpu: &mut Gpu, rows: usize, controls: bool, seed: u64) -> bool 
         args.push_i32(v);
     }
     args.pad_to(16);
-    gpu.launch_kernel_blob(KERNEL, [(rows * NV) as u32, 1, 1], [32, 1, 1], 0, args.as_mut_slice())
-        .expect("reference launch");
+    gpu.launch_kernel_blob(
+        KERNEL,
+        [(rows * NV) as u32, 1, 1],
+        [32, 1, 1],
+        0,
+        args.as_mut_slice(),
+    )
+    .expect("reference launch");
     gated_delta_gate_batched(
         gpu,
         &GatedDeltaGateBatched {
@@ -809,7 +873,10 @@ fn run_gate_case(gpu: &mut Gpu, rows: usize, controls: bool, seed: u64) -> bool 
     let (d_out, f_out) = word_diff(&dtoh(gpu, &r_out), &dtoh(gpu, &c_out));
     let (d_rec, f_rec) = word_diff(&dtoh(gpu, &r_rec), &dtoh(gpu, &c_rec));
     let moved = word_diff(&recurrent, &dtoh(gpu, &r_rec)).0;
-    let written = dtoh(gpu, &r_out).iter().filter(|w| w.to_bits() != 0xFFFF_FFFF).count();
+    let written = dtoh(gpu, &r_out)
+        .iter()
+        .filter(|w| w.to_bits() != 0xFFFF_FFFF)
+        .count();
     report(
         "gated norm vs tensor_ops kernel",
         d_out == 0 && d_rec == 0 && written == n && moved > 0,
@@ -822,9 +889,15 @@ fn run_gate_case(gpu: &mut Gpu, rows: usize, controls: bool, seed: u64) -> bool 
         let mut bad = dtoh(gpu, &c_out);
         bad[n - 1] = f32::from_bits(bad[n - 1].to_bits() ^ 1);
         let d = word_diff(&dtoh(gpu, &r_out), &bad).0;
-        report("control: flipped output bit", d == 1, format!("diff words {d}"));
+        report(
+            "control: flipped output bit",
+            d == 1,
+            format!("diff words {d}"),
+        );
         // The candidate with a different z row: its output must differ from the reference.
-        let t_z2 = gpu.upload_f32(&rand_vec(&mut rng, n, -3.0, 3.0), &[n]).unwrap();
+        let t_z2 = gpu
+            .upload_f32(&rand_vec(&mut rng, n, -3.0, 3.0), &[n])
+            .unwrap();
         let w_rec = gpu.upload_f32(&recurrent, &[n]).unwrap();
         let w_out = gpu.upload_f32(&sentinel, &[n]).unwrap();
         gated_delta_gate_batched(
@@ -842,7 +915,11 @@ fn run_gate_case(gpu: &mut Gpu, rows: usize, controls: bool, seed: u64) -> bool 
         .expect("wrong-z launch");
         gpu.hip.device_synchronize().expect("sync");
         let d = word_diff(&dtoh(gpu, &r_out), &dtoh(gpu, &w_out)).0;
-        report("control: candidate on another z", d > 0, format!("diff words {d}"));
+        report(
+            "control: candidate on another z",
+            d > 0,
+            format!("diff words {d}"),
+        );
         for t in [t_z2, w_rec, w_out] {
             gpu.free_tensor(t).ok();
         }

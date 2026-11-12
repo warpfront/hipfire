@@ -58,9 +58,7 @@ pub(crate) enum Gfx942GdnLanes<F> {
 /// recording (the device lane table is not a declared kernel input) and no graph
 /// capture (a lane set's table is staged on first use, which a capture cannot do).
 pub(crate) fn lanes_f32_gfx942_admitted(gpu: &Gpu) -> bool {
-    gpu.arch_caps.is_gfx942()
-        && !gpu.replay.is_recording()
-        && !gpu.graphs.capture_mode
+    gpu.arch_caps.is_gfx942() && !gpu.replay.is_recording() && !gpu.graphs.capture_mode
 }
 
 /// Most consecutive GDN Core steps the lane-step grouper collects into one group: the
@@ -294,32 +292,51 @@ where
             .map(|(op, _)| extent(op.conv_state))
             .chain(capture_lanes.iter().map(|(op, ..)| extent(op.conv_state)))
             .collect(),
-        ar_lanes.iter().map(|(_, v)| extent(&v.conv_output)).collect(),
+        ar_lanes
+            .iter()
+            .map(|(_, v)| extent(&v.conv_output))
+            .collect(),
         ar_lanes.iter().map(|(_, v)| extent(&v.gate)).collect(),
         ar_lanes.iter().map(|(_, v)| extent(&v.beta)).collect(),
         ar_lanes
             .iter()
             .map(|(_, v)| extent(&v.recurrent_output))
-            .chain(capture_lanes.iter().map(|(.., v)| extent(&v.recurrent_output)))
+            .chain(
+                capture_lanes
+                    .iter()
+                    .map(|(.., v)| extent(&v.recurrent_output)),
+            )
             .collect(),
         ar_lanes
             .iter()
             .map(|(_, v)| extent(&v.gdn_output))
             .chain(capture_lanes.iter().map(|(.., v)| extent(&v.gdn_output)))
             .collect(),
-        ar_lanes.iter().map(|(op, _)| extent(op.recurrent)).collect(),
+        ar_lanes
+            .iter()
+            .map(|(op, _)| extent(op.recurrent))
+            .collect(),
         // The capture's retained qkv rows, its recurrence input (convolution output, gate,
         // beta) and the ring (with every capture lane's read-only state beside it).
-        capture_lanes.iter().map(|(_, c, _)| extent(c.inputs)).collect(),
+        capture_lanes
+            .iter()
+            .map(|(_, c, _)| extent(c.inputs))
+            .collect(),
         capture_lanes
             .iter()
             .map(|(_, c, _)| extent(c.recurrence))
             .collect(),
-        capture_lanes.iter().map(|(_, c, _)| extent(&c.states)).collect(),
+        capture_lanes
+            .iter()
+            .map(|(_, c, _)| extent(&c.states))
+            .collect(),
         // The live states are pairwise disjoint. A lane's own live slot may sit inside its
         // capture view (the ring halves alternate per window); the launch checks that the
         // slot it WRITES (`rows - 1`) never overlaps a state it reads.
-        capture_lanes.iter().map(|(op, ..)| extent(op.recurrent)).collect(),
+        capture_lanes
+            .iter()
+            .map(|(op, ..)| extent(op.recurrent))
+            .collect(),
     ];
     if !sets.into_iter().all(disjoint) {
         return Ok(Gfx942GdnLanes::Declined(before_launch));

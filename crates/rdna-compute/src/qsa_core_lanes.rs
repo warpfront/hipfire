@@ -963,7 +963,10 @@ mod tests {
         for arch in ["gfx1100", "gfx1151"] {
             let mut flags = crate::feature_flags::FeatureFlags::for_test(arch);
             flags.qwen4_qsa_lanes = true;
-            assert!(!flags.qwen4_qsa_lanes_enabled(), "{arch}: gfx1201 and gfx942 only");
+            assert!(
+                !flags.qwen4_qsa_lanes_enabled(),
+                "{arch}: gfx1201 and gfx942 only"
+            );
         }
     }
 

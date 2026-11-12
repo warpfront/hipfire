@@ -25,11 +25,17 @@ use crate::program::Qwen4LayerScratch;
 /// Whether batched head rounds are on: `HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS=1`
 /// asks for them on any load, `=0` kills them, and unset they are on exactly
 /// where the lane route exists: an expert-parallel Qwen4 load
-/// (`topology.ep` >= 2, [`hipfire_config::topology::qwen4_ep`]).
-pub(crate) fn draft_rounds_enabled() -> bool {
+/// (`topology.ep` >= 2, [`hipfire_config::topology::qwen4_ep`]) and the
+/// stock-FP8 load, which admission accepts on exact gfx942 only
+/// (`Qwen4Admission`: `Fp8ExpertsUnsupported` everywhere else), where the
+/// head's per-lane draft chains (about 45 launches each, one lm-head weight
+/// pass per lane) are the draft's cost. `config` is the trunk config (the
+/// profile lives on it, not on the MTP geometry).
+pub(crate) fn draft_rounds_enabled(config: &Qwen4Config) -> bool {
     hipfire_config::developer_bool(
         MTP_DRAFT_ROUNDS_ENV,
-        hipfire_config::topology::qwen4_ep().is_ok_and(|ep| ep >= 2),
+        hipfire_config::topology::qwen4_ep().is_ok_and(|ep| ep >= 2)
+            || config.profile.is_stock_fp8(),
     )
 }
 
@@ -254,7 +260,7 @@ impl MtpRowsScratch {
     /// Device bytes [`Self::new`] allocates: zero unless
     /// [`draft_rounds_enabled`] and the head is MoE.
     pub(crate) fn device_bytes(config: &Qwen4Config) -> Option<usize> {
-        if !draft_rounds_enabled() {
+        if !draft_rounds_enabled(config) {
             return Some(0);
         }
         Some(
@@ -266,7 +272,7 @@ impl MtpRowsScratch {
 
     /// [`Self::device_bytes`] per allocation, in field order.
     pub(crate) fn allocation_sizes(config: &Qwen4Config) -> Option<Vec<u64>> {
-        if !draft_rounds_enabled() {
+        if !draft_rounds_enabled(config) {
             return Some(Vec::new());
         }
         Self::shapes(config)
@@ -281,7 +287,7 @@ impl MtpRowsScratch {
 
     /// The rows scratch when batched rounds are requested and the head is MoE.
     pub(crate) fn new(gpu: &mut Gpu, config: &Qwen4Config) -> Result<Option<Self>, MtpGpuError> {
-        if !draft_rounds_enabled() {
+        if !draft_rounds_enabled(config) {
             return Ok(None);
         }
         let Some(shapes) = Self::shapes(config)? else {
@@ -550,13 +556,13 @@ impl Qwen4MtpGpu {
         top1_out: &GpuTensor,
         ep: Option<MtpEpGather<'_>>,
     ) -> Result<(), MtpGpuError> {
-        let config = config.mtp_geometry();
-        let n = lanes.len();
-        if !draft_rounds_enabled() {
+        if !draft_rounds_enabled(config) {
             return Err(invalid(format!(
                 "batched MTP head rounds need {MTP_DRAFT_ROUNDS_ENV}=1"
             )));
         }
+        let config = config.mtp_geometry();
+        let n = lanes.len();
         let min_rows = if self.s4_round.is_some() { 1 } else { 2 };
         if !(min_rows..=MTP_DRAFT_LANES_MAX).contains(&n) {
             return Err(invalid(format!(
