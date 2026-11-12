@@ -18,7 +18,11 @@
 //!   sources (the absent source2 bit is 1; every other absent-source bit is 0);
 //!   `v_fma_mix*` defaults to 0 (bit set = f16 source).
 //! - Every `Dot*` op: `op_sel = 0`, `op_sel_hi = 7`, `neg_lo`/`neg_hi` free; clamp is free.
-//! - `v_fma_mix*`: `neg_lo` is the per-source `-src` negate, `neg_hi` must be 0.
+//! - `v_fma_mix*`: `neg_lo` is the per-source `-src` negate, `neg_hi` (llvm's
+//!   `|src|`) must be 0: the codec refuses it. `v_fma_mix_f32` alone is swept
+//!   exhaustively against llvm-mc (`oracle_fma_mix_f32_full_selection_space`);
+//!   that sweep backs the `V_MAD_MIX_F32` alias receipt of
+//!   `tests/xml_mix_alias_receipt.rs`.
 //! - Multi-dword register tuples (VGPR, AGPR, SGPR) start on an even register.
 //! - `MaiOp::MfmaF64_16x16x4F64`: `blgp` carries the `neg:[..]` bits.
 use peacemaker_cdna::enc::vop3p::{Mai, MaiOp, MfmaType, Vop3p, Vop3pOp};
@@ -26,7 +30,8 @@ use peacemaker_cdna::inst::{
     classify, decode_all, encode_all, Footprint, Format, RegFile, RegSpan,
 };
 use peacemaker_cdna::operand::{InlineFloat, Src};
-use peacemaker_cdna::{oracle, Arch, Inst};
+use peacemaker_cdna::xml::{self, Isa};
+use peacemaker_cdna::{oracle, Arch, Inst, XmlInst};
 
 const ARCH: Arch = Arch::Gfx942;
 
@@ -513,6 +518,55 @@ fn vop3p_corpus() -> Vec<Vop3p> {
     all
 }
 
+/// The seven `v_fma_mix_f32` source shapes of the selection sweep: all VGPR,
+/// an SGPR in each source position, an inline constant in each source position.
+fn fma_mix_shapes() -> [[Src; 3]; 7] {
+    [
+        [v(2), v(3), v(4)],
+        [s(2), v(3), v(4)],
+        [v(2), s(101), v(4)],
+        [v(2), v(3), s(7)],
+        [Src::Int(0), v(3), v(4)],
+        [v(2), Src::Float(InlineFloat::One), v(4)],
+        [v(2), v(3), Src::Int(64)],
+    ]
+}
+
+/// Operand codes of [`fma_mix_shapes`], written out independently of `Src::code`.
+const FMA_MIX_SHAPE_CODES: [[u32; 3]; 7] = [
+    [258, 259, 260],
+    [2, 259, 260],
+    [258, 101, 260],
+    [258, 259, 7],
+    [128, 259, 260],
+    [258, 242, 260],
+    [258, 259, 192],
+];
+
+/// Words per shape of [`fma_mix_f32_selection_space`]: 8 `op_sel` x 8
+/// `op_sel_hi` x 8 `neg_lo` x 2 `clamp`.
+const FMA_MIX_SELECTIONS: usize = 8 * 8 * 8 * 2;
+
+/// `v_fma_mix_f32` over its whole encoding selection space (`neg_hi` = 0, which
+/// the codec refuses otherwise): shape-major, then `op_sel`, `op_sel_hi`,
+/// `neg_lo`, `clamp` (clamp fastest).
+fn fma_mix_f32_selection_space() -> Vec<Vop3p> {
+    let mut out = Vec::with_capacity(7 * FMA_MIX_SELECTIONS);
+    for srcs in fma_mix_shapes() {
+        let base = pk(Vop3pOp::FmaMixF32, v(1), &srcs);
+        for sel in 0..8 {
+            for hi in 0..8 {
+                for lo in 0..8 {
+                    for clamp in [false, true] {
+                        out.push(modded(base.clone(), sel, hi, lo, 0, clamp));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 // ----------------------------------------------------------------------------
 // MAI corpus
 // ----------------------------------------------------------------------------
@@ -728,16 +782,13 @@ fn move_corpus() -> Vec<Mai> {
 // Oracle round trips
 // ----------------------------------------------------------------------------
 
-#[test]
-fn oracle_vop3p_round_trip() {
-    if oracle::disabled() {
-        eprintln!("enc_vop3p: ROCm oracle disabled");
-        return;
-    }
-    let cases = vop3p_corpus();
-    assert!(cases.len() > 6_000, "{}", cases.len());
+/// Assemble every case with llvm-mc and check, per case: our bytes == llvm's,
+/// `Display` == llvm's text, `decode(bytes)` == the case, and llvm's
+/// disassembly of the bytes == its text. Returns llvm's bytes per case.
+fn check_vop3p_round_trip(cases: &[Vop3p]) -> Vec<Vec<u8>> {
     let lines: Vec<String> = cases.iter().map(asm_p).collect();
     let assembled = oracle::mc_encode(ARCH, &lines).unwrap();
+    assert_eq!(assembled.len(), cases.len());
     let mut byte_vecs = Vec::with_capacity(cases.len());
     for ((x, line), (mc_text, mc_bytes)) in cases.iter().zip(&lines).zip(&assembled) {
         let ours = vwords(x);
@@ -758,8 +809,98 @@ fn oracle_vop3p_round_trip() {
         byte_vecs.push(mc_bytes.clone());
     }
     let disassembled = oracle::mc_disassemble(ARCH, &byte_vecs).unwrap();
+    assert_eq!(disassembled.len(), cases.len());
     for ((line, (mc_text, _)), dis) in lines.iter().zip(&assembled).zip(&disassembled) {
         assert_eq!(dis, mc_text, "llvm disassembly: {line}")
+    }
+    byte_vecs
+}
+
+#[test]
+fn oracle_vop3p_round_trip() {
+    if oracle::disabled() {
+        eprintln!("enc_vop3p: ROCm oracle disabled");
+        return;
+    }
+    let cases = vop3p_corpus();
+    assert!(cases.len() > 6_000, "{}", cases.len());
+    check_vop3p_round_trip(&cases);
+}
+
+/// Every `op_sel` x `op_sel_hi` x `neg_lo` x `clamp` of `v_fma_mix_f32` over
+/// the seven source shapes (7168 words, all distinct): llvm-mc's bytes, text
+/// and disassembly agree with the codec. The `V_MAD_MIX_F32` alias receipt
+/// (`src/xml_inst.rs`) cites this test.
+#[test]
+fn oracle_fma_mix_f32_full_selection_space() {
+    if oracle::disabled() {
+        eprintln!("enc_vop3p: ROCm oracle disabled");
+        return;
+    }
+    let cases = fma_mix_f32_selection_space();
+    assert_eq!(cases.len(), 7 * FMA_MIX_SELECTIONS);
+    let llvm = check_vop3p_round_trip(&cases);
+    let distinct: std::collections::HashSet<&Vec<u8>> = llvm.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        cases.len(),
+        "llvm bytes are pairwise distinct"
+    );
+}
+
+/// llvm-mc spells `NEG_HI` for `v_fma_mix_f32` as `|src|`: it assembles every
+/// abs x neg x op_sel_hi combination into the NEG_HI bits, and neither the
+/// typed decode nor the XML promotion accepts any of them.
+#[test]
+fn oracle_fma_mix_f32_abs_spelling_is_neg_hi_and_refused() {
+    if oracle::disabled() {
+        eprintln!("enc_vop3p: ROCm oracle disabled");
+        return;
+    }
+    let regs = ["v2", "v3", "v4"];
+    let mut lines = Vec::new();
+    let mut want = Vec::new();
+    for abs in 1..8u32 {
+        for neg in 0..8u32 {
+            for hi in 0..8u8 {
+                let srcs: Vec<String> = (0..3)
+                    .map(|i| match (abs >> i & 1, neg >> i & 1) {
+                        (0, 0) => regs[i].to_string(),
+                        (0, _) => format!("-{}", regs[i]),
+                        (_, 0) => format!("|{}|", regs[i]),
+                        (_, _) => format!("-|{}|", regs[i]),
+                    })
+                    .collect();
+                lines.push(format!(
+                    "v_fma_mix_f32 v1, {}, {}, {} op_sel_hi:{}",
+                    srcs[0],
+                    srcs[1],
+                    srcs[2],
+                    bit_array(hi, 3)
+                ));
+                want.push((abs, neg, hi));
+            }
+        }
+    }
+    let assembled = oracle::mc_encode(ARCH, &lines).unwrap();
+    assert_eq!(assembled.len(), lines.len());
+    for ((line, (abs, neg, hi)), (_, bytes)) in lines.iter().zip(&want).zip(&assembled) {
+        assert_eq!(bytes.len(), 8, "{line}");
+        let w: Vec<u32> = bytes
+            .chunks(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(w[0] >> 8 & 7, *abs, "NEG_HI bits: {line}");
+        assert_eq!(w[1] >> 29, *neg, "NEG bits: {line}");
+        assert_eq!(w[1] >> 27 & 3, u32::from(hi & 3), "op_sel_hi[1:0]: {line}");
+        assert_eq!(w[0] >> 14 & 1, u32::from(hi >> 2), "op_sel_hi[2]: {line}");
+        let e = Vop3p::decode(ARCH, &w).unwrap_err();
+        assert!(e.contains("NEG_HI"), "{line}: {e}");
+        let (d, _) = xml::decode(Isa::Cdna3, &w).unwrap_or_else(|e| panic!("{line}: {e}"));
+        assert!(
+            XmlInst::verification_of(&d).is_err(),
+            "abs spelling promoted: {line}"
+        );
     }
 }
 
@@ -2818,6 +2959,157 @@ fn dot_neg_masks_encode_for_every_dot_op() {
                 assert_eq!((w[0] >> 8) & 7, u32::from(hi), "{op:?}");
                 assert_eq!(Vop3p::decode(ARCH, &w).unwrap().0, x, "{op:?}");
             }
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// v_fma_mix_f32 selection space: CPU-only layout, distinctness and refusals
+// ----------------------------------------------------------------------------
+
+#[test]
+fn fma_mix_f32_selection_space_layout_and_distinctness() {
+    let cases = fma_mix_f32_selection_space();
+    assert_eq!(cases.len(), 7 * FMA_MIX_SELECTIONS);
+    let mut seen = std::collections::HashSet::new();
+    for (i, x) in cases.iter().enumerate() {
+        // The enumeration order is the documented one, so every field value
+        // of every shape occurs exactly once.
+        let (shape, j) = (i / FMA_MIX_SELECTIONS, i % FMA_MIX_SELECTIONS);
+        assert_eq!(
+            (x.op_sel, x.op_sel_hi, x.neg_lo, x.clamp, x.neg_hi),
+            (
+                (j >> 7 & 7) as u8,
+                (j >> 4 & 7) as u8,
+                (j >> 1 & 7) as u8,
+                j & 1 == 1,
+                0
+            ),
+            "{x}"
+        );
+        assert_eq!(x.src, fma_mix_shapes()[shape].map(Some), "{x}");
+        assert_eq!((x.op, x.dst), (Vop3pOp::FmaMixF32, v(1)));
+        // word0 = 0xd3a00000 | vdst | op_sel<<11 | op_sel_hi[2]<<14 | clamp<<15
+        // word1 = src0 | src1<<9 | src2<<18 | op_sel_hi[1:0]<<27 | neg_lo<<29
+        let codes = FMA_MIX_SHAPE_CODES[shape];
+        let (sel, hi, lo, clamp) = (
+            u32::from(x.op_sel),
+            u32::from(x.op_sel_hi),
+            u32::from(x.neg_lo),
+            u32::from(x.clamp),
+        );
+        let want = [
+            0xd3a0_0001 | sel << 11 | (hi >> 2) << 14 | clamp << 15,
+            codes[0] | codes[1] << 9 | codes[2] << 18 | (hi & 3) << 27 | lo << 29,
+        ];
+        let words = vwords(x);
+        assert_eq!(words, want, "{x}");
+        assert!(seen.insert(want), "duplicate encoding: {x}");
+        let (decoded, len) = Vop3p::decode(ARCH, &words).unwrap_or_else(|e| panic!("{x}: {e}"));
+        assert_eq!((len, &decoded), (2, x), "{x}");
+        assert_eq!(classify(words[0]), Some(Format::Vop3p), "{x}");
+    }
+    assert_eq!(seen.len(), cases.len());
+}
+
+#[test]
+fn fma_mix_f32_refuses_everything_outside_the_swept_space() {
+    let op = Vop3pOp::FmaMixF32;
+    let base = pk(op, v(1), &[v(2), v(3), v(4)]);
+    let good = vwords(&base);
+    let enc = |x: &Vop3p| x.encode(ARCH, &mut Vec::new());
+
+    // NEG_HI (llvm's `|src|`): refused on encode and on decode.
+    for nh in 1..8u8 {
+        let e = enc(&Vop3p {
+            neg_hi: nh,
+            ..base.clone()
+        })
+        .unwrap_err();
+        assert!(e.contains("NEG_HI"), "neg_hi {nh}: {e}");
+        let mut w = good.clone();
+        w[0] |= u32::from(nh) << 8;
+        let e = Vop3p::decode(ARCH, &w).unwrap_err();
+        assert!(e.contains("NEG_HI"), "neg_hi {nh}: {e}");
+    }
+
+    // Modifier values that do not fit three bits.
+    for field in 0..4 {
+        let mut x = base.clone();
+        match field {
+            0 => x.op_sel = 8,
+            1 => x.op_sel_hi = 8,
+            2 => x.neg_lo = 8,
+            _ => x.neg_hi = 8,
+        }
+        let e = enc(&x).unwrap_err();
+        assert!(e.contains("three bits"), "field {field}: {e}");
+    }
+
+    // Source count: all three sources are required.
+    for i in 0..3 {
+        let mut x = base.clone();
+        x.src[i] = None;
+        let e = enc(&x).unwrap_err();
+        assert!(e.contains("source count"), "src{i}: {e}");
+    }
+
+    // AGPR and literal sources, in every position.
+    for i in 0..3 {
+        let mut x = base.clone();
+        x.src[i] = Some(a(2));
+        let e = enc(&x).unwrap_err();
+        assert!(e.contains("AGPR"), "src{i}: {e}");
+        x.src[i] = Some(Src::Lit(0x3e80_0000));
+        let e = enc(&x).unwrap_err();
+        assert!(e.contains("illegal source"), "src{i} literal: {e}");
+    }
+
+    // The constant bus: one scalar register (any number of times) plus inline
+    // constants is legal; two different scalar registers are not.
+    for srcs in [
+        [s(2), s(2), s(2)],
+        [s(2), Src::Int(5), s(2)],
+        [Src::Float(InlineFloat::Half), s(2), Src::Int(-3)],
+    ] {
+        enc(&pk(op, v(1), &srcs)).unwrap_or_else(|e| panic!("{srcs:?}: {e}"));
+    }
+    for srcs in [
+        [s(2), s(3), v(4)],
+        [s(2), v(3), s(3)],
+        [v(2), s(3), s(4)],
+        [s(2), Src::VccLo, v(4)],
+    ] {
+        let e = enc(&pk(op, v(1), &srcs)).unwrap_err();
+        assert!(e.contains("constant bus"), "{srcs:?}: {e}");
+    }
+
+    // The destination is a VGPR.
+    for dst in [s(1), a(1)] {
+        let mut x = base.clone();
+        x.dst = dst;
+        let e = enc(&x).unwrap_err();
+        assert!(e.contains("destination"), "{dst:?}: {e}");
+    }
+
+    // gfx950 is decode-only for the typed model.
+    assert!(base.encode(Arch::Gfx950, &mut Vec::new()).is_err());
+    assert!(Vop3p::decode(Arch::Gfx950, &good).is_err());
+
+    // Decode: truncated words, a literal operand code, every reserved operand
+    // code, in every source position.
+    assert!(Vop3p::decode(ARCH, &good[..1]).is_err());
+    for i in 0..3 {
+        for code in 0..512u16 {
+            if code != 255 && Src::from_code(code, None).is_ok() {
+                continue;
+            }
+            let mut w = good.clone();
+            w[1] = (w[1] & !(0x1ff << (9 * i))) | u32::from(code) << (9 * i);
+            assert!(
+                Vop3p::decode(ARCH, &w).is_err(),
+                "src{i} operand code {code} decoded"
+            );
         }
     }
 }

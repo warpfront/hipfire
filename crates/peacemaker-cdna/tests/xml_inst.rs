@@ -9,7 +9,7 @@
 use peacemaker_cdna::inst::{MemKind, RegFile, RegSpan, RowStatus};
 use peacemaker_cdna::sim::{self, Config, Memory, SimError, Wave};
 use peacemaker_cdna::xml::{self, Decoded, Isa};
-use peacemaker_cdna::{Arch, Inst};
+use peacemaker_cdna::{Arch, Inst, XmlInst};
 
 /// The words of the (default-condition) form `name`, fields not given zero.
 fn build(isa: Isa, name: &str, set: &[(&str, u64)]) -> Vec<u32> {
@@ -199,6 +199,11 @@ fn unverified_rows_decode_but_never_encode() {
             continue;
         }
         let d = Decoded::new(Isa::Cdna3, form);
+        // The one alias-receipt row (V_MAD_MIX_F32): its canonical instances
+        // are promoted per instance, see tests/xml_mix_alias_receipt.rs.
+        if XmlInst::alias_receipt_of(&d).is_some() {
+            continue;
+        }
         let Ok((words, n)) = d.assemble() else {
             continue;
         };

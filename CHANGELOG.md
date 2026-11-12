@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- PeaceMaker gfx942: qualify the `V_MAD_MIX_F32` / `v_fma_mix_f32` alias with a 7,168-case LLVM codec sweep and a hash-bound MI300X/interpreter receipt (7,088,373,760 strict raw-bit comparisons across 32 modes, eight detected controls). Model IEEE NaN payload/quieting and invalid-operation precedence, unbounded-rounding output flush, deterministic zero clamp, and half-precision float-inline materialization. Promotion remains instance-bounded; gfx950, mixed half-result operations and unsupported modifiers stay unverified.
+- PeaceMaker gfx942: seal the frozen three-entry GDN Core verify-lanes image byte-identically, with strict ledger replay and a hash-bound MI300X oracle (seven cases, three carried windows, 23 detected negative controls). No anchor, instruction or production route changes.
+- Launcher ABI audit: expand bounded identifier/decimal token pastes in kernel-defining macros using raw paste arguments, so the unchanged HC-gates macro source and all seven real launch ABIs are checked without source exclusions. Stringification, variadics and unsupported paste operands still fail closed.
+
+- PeaceMaker gfx942: seal all four unchanged GLOBAL-only GDN verify entries after proving the conv join's incoming scalar-constant edge. Pin the immutable replacement source/anchor and exact-image MI300X oracle receipt (280 checks, including conv and gate); original FLAT rollback fixture remains negative-only. No wait allowance, cap increase, instruction rewrite or production dispatch change.
+
 ### 0.5.0 removals
 
 - **Removed config keys fail the load.** A `config.toml` or custom profile that still sets a key listed in `hipfire_config::RETIRED_CONFIG_KEYS` (including `kernel.mw16`, whose 0.4.x warn-and-ignore window ended) now fails with `configuration key '<key>' was removed in <version> (<reason>); replacement: <replacement>` instead of loading with a warning. See [`docs/CONFIG.md`](docs/CONFIG.md#lifecycle-status).
