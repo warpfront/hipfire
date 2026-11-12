@@ -622,14 +622,14 @@ mod tests {
                 18 => Some("embeddinggemma2"),
                 40 => Some("flux"),
                 45 => Some("flux2"),
-                // Drafter sidecars (22, 23) are intentionally not retry
+                // Drafter sidecars (22, 23, 24) are intentionally not retry
                 // candidates and have no inventory row.
-                22 | 23 => None,
+                22 | 23 | 24 => None,
                 _ => None,
             }
         }
 
-        let drafters: BTreeSet<u32> = [22, 23].into_iter().collect();
+        let drafters: BTreeSet<u32> = [22, 23, 24].into_iter().collect();
         let mut expected_keys = BTreeSet::new();
         let mut id_to_key = BTreeMap::new();
         for (_, id) in MODEL_TYPE_TO_ARCH_ID

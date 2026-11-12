@@ -47,7 +47,10 @@ Non-goals for this PR: no `admissions.yml` row (routing-capable, product-refused
 
 - [x] Design + validation plan (this doc)
 - [x] Semantics map (docs/plans/2026-11-12-dspine-semantics-map.md)
-- [ ] `dspine_convert` (mq4 + bf16)
+- [x] `dspine_convert` (mq4 + bf16) — converter + 17 unit tests; smoke-converted
+  the real `tencent/Qwen3.8-27B-DSpine-b16` checkpoint both ways (bf16 tier
+  3.86 GiB raw-copy, mq4 tier 1.41 GiB, 2.026B params, 71→67 tensors with the
+  four version scalars moved into `dspine.versions` metadata)
 - [ ] arch-24 sidecar carrier + drafter load path
 - [ ] bridge kernels (Tier C)
 - [ ] serial refinement (Tier C)

@@ -110,6 +110,12 @@ pub const MODEL_TYPE_TO_ARCH_ID: &[(&str, u32)] = &[
     ("gemma4_unified_assistant", 22),
     // arch 23 — muse_glimmer DFlash drafter
     ("muse_glimmer_assistant", 23),
+    // arch 24 — qwen3.5 DSpine drafter (code-bridge sidecar over the DFlash
+    // trunk). The shipped checkpoint carries `model_type: qwen3` and
+    // `architectures: [DFlashDraftModel]`, so neither string discriminates it:
+    // dspine_convert stamps 24 directly off the bridge config section, and
+    // this key is a lookup alias for packers/probing.
+    ("dspine_draft", 24),
     // arch 40 — flux MMDiT diffusion trunk (image-gen component block 40–47;
     // high by design so the sequential primary range 17–19 stays free for
     // future text arches; never a chat-serve trunk — see
