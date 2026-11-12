@@ -230,6 +230,59 @@ fn g942_moe_wide_ensure(gpu: &mut Gpu, func: &str) -> HipResult<()> {
         None => gpu.ensure_kernel(QWEN4_G942_MOE_WIDE_MODULE, QWEN4_G942_MOE_WIDE_SRC, func),
     }
 }
+
+/// The exact-gfx942 wide-lane FP8 grouped MoE GEMM: `gemm_fp8b128_moe_grouped_bf16mfma`'s
+/// kernel with the strip transpose through a wave-private LDS slot instead of `ds_bpermute`
+/// (byte-identical outputs; `kernels/src/qwen4_g942_moe_gemm.gfx942.hip`; its own cache key and
+/// twin seat).
+const QWEN4_G942_MOE_GEMM_SRC: &str =
+    include_str!("../../../../kernels/src/qwen4_g942_moe_gemm.gfx942.hip");
+pub const QWEN4_G942_MOE_GEMM_MODULE: &str = "qwen4_g942_moe_gemm";
+const QWEN4_G942_MOE_GEMM_F32_KERNEL: &str = "qwen4_g942_moe_gemm_f32";
+const QWEN4_G942_MOE_GEMM_XBF16_KERNEL: &str = "qwen4_g942_moe_gemm_xbf16";
+/// The two entries of [`QWEN4_G942_MOE_GEMM_MODULE`] (F32-X and BF16-X).
+pub const QWEN4_G942_MOE_GEMM_ENTRIES: [&str; 2] = [
+    QWEN4_G942_MOE_GEMM_F32_KERNEL,
+    QWEN4_G942_MOE_GEMM_XBF16_KERNEL,
+];
+/// Output rows per workgroup of the wide GEMM: `64 * MG_NSUB` (pinned against the source by a
+/// unit test below).
+const G942_MOE_GEMM_ROWS_PER_WG: usize = 64;
+/// Fewest 16-row tiles that take the wide GEMM: 80 tiles = the 80 routed slots (eight top-10
+/// rows) at which the wide glue starts ([`G942_MOE_WIDE_MIN_SLOTS`]).
+const G942_MOE_GEMM_MIN_TILES: usize = 80;
+
+/// `HIPFIRE_QWEN4_G942_MOE_GEMM_IMAGE=/absolute/device.elf` (developer, read once): the
+/// explicitly supplied code object of [`QWEN4_G942_MOE_GEMM_MODULE`] (the Route-A twin proof).
+/// Unset: the hipcc source, unchanged.
+fn g942_moe_gemm_image() -> HipResult<Option<&'static std::sync::Arc<[u8]>>> {
+    static IMAGE: std::sync::LazyLock<Result<Option<std::sync::Arc<[u8]>>, String>> =
+        std::sync::LazyLock::new(|| {
+            match hipfire_config::developer_var("HIPFIRE_QWEN4_G942_MOE_GEMM_IMAGE") {
+                Ok(path) if !path.is_empty() => std::fs::read(&path)
+                    .map(|bytes| Some(std::sync::Arc::<[u8]>::from(bytes)))
+                    .map_err(|error| {
+                        format!("HIPFIRE_QWEN4_G942_MOE_GEMM_IMAGE {path}: {error}")
+                    }),
+                _ => Ok(None),
+            }
+        });
+    let loaded: &'static Result<Option<std::sync::Arc<[u8]>>, String> = &IMAGE;
+    match loaded {
+        Ok(image) => Ok(image.as_ref()),
+        Err(message) => Err(hip_bridge::HipError::new(0, message)),
+    }
+}
+
+/// Bind `func` of the wide GEMM module: the hipcc source (the anchor object) or, only when
+/// `HIPFIRE_QWEN4_G942_MOE_GEMM_IMAGE` names one, that code object (same module, same entry
+/// names, loaded through `ensure_embedded_kernel`).
+fn g942_moe_gemm_ensure(gpu: &mut Gpu, func: &str) -> HipResult<()> {
+    match g942_moe_gemm_image()? {
+        Some(image) => gpu.ensure_embedded_kernel(QWEN4_G942_MOE_GEMM_MODULE, image.clone(), func),
+        None => gpu.ensure_kernel(QWEN4_G942_MOE_GEMM_MODULE, QWEN4_G942_MOE_GEMM_SRC, func),
+    }
+}
 const QWEN4_GDN_LANES_F32_SRC: &str =
     include_str!("../../../../kernels/src/qwen4_gdn_lanes_f32.gfx942.hip");
 const QWEN4_GDN_LANES_F32_KERNEL: &str = "qwen4_gdn_lanes_step_f32_gfx942";
@@ -1497,12 +1550,18 @@ impl Gfx942Device<'_> {
                 "expert_stride {expert_stride} must be a multiple of 16 and >= {min_stride}"
             ));
         }
-        let (func, x_elem) = match (x.dtype, reference) {
-            (DType::F32, false) => (FP8B128_MOE_GROUPED_KERNEL, 4),
-            (DType::BF16, false) => (FP8B128_MOE_GROUPED_XBF16_KERNEL, 2),
-            (DType::F32, true) => (FP8B128_MOE_GROUPED_REFERENCE_KERNEL, 4),
-            (DType::BF16, true) => (FP8B128_MOE_GROUPED_REFERENCE_XBF16_KERNEL, 2),
-            (other, _) => return refuse(format!("x must be F32 or BF16, got {other:?}")),
+        // G12 input: lane-wide (>= 80 slots, i.e. >= 80 tiles) launches take the LDS-transpose
+        // build of the same kernel (byte-identical outputs; executor-local route predicate on the
+        // tile count the caller already passes).
+        let wide = !reference && n_tiles >= G942_MOE_GEMM_MIN_TILES;
+        let (func, x_elem) = match (x.dtype, reference, wide) {
+            (DType::F32, false, false) => (FP8B128_MOE_GROUPED_KERNEL, 4),
+            (DType::BF16, false, false) => (FP8B128_MOE_GROUPED_XBF16_KERNEL, 2),
+            (DType::F32, false, true) => (QWEN4_G942_MOE_GEMM_F32_KERNEL, 4),
+            (DType::BF16, false, true) => (QWEN4_G942_MOE_GEMM_XBF16_KERNEL, 2),
+            (DType::F32, true, _) => (FP8B128_MOE_GROUPED_REFERENCE_KERNEL, 4),
+            (DType::BF16, true, _) => (FP8B128_MOE_GROUPED_REFERENCE_XBF16_KERNEL, 2),
+            (other, _, _) => return refuse(format!("x must be F32 or BF16, got {other:?}")),
         };
         crate::moe::require_span(
             w,
@@ -1536,6 +1595,9 @@ impl Gfx942Device<'_> {
                 func,
             )?;
             FP8B128_MOE_REFERENCE_ROWS_PER_WG
+        } else if wide {
+            g942_moe_gemm_ensure(&mut *self.gpu, func)?;
+            G942_MOE_GEMM_ROWS_PER_WG
         } else {
             self.gpu
                 .ensure_kernel(FP8B128_MOE_GROUPED_MODULE, FP8B128_MOE_GROUPED_SRC, func)?;
@@ -3908,6 +3970,38 @@ mod tests {
         // The wide scatter's capacity is a whole number of 32-slot mask words per expert.
         assert_eq!(super::G942_MOE_WIDE_MAX_SLOTS % 32, 0);
         assert!(super::G942_MOE_WIDE_MIN_SLOTS <= super::G942_MOE_WIDE_MAX_SLOTS);
+    }
+
+    /// The wide GEMM's launcher constants are the kernel source's own, and its geometry is the
+    /// production kernel's (the two entries differ only in the strip transpose).
+    #[test]
+    fn g942_moe_gemm_launcher_matches_kernel_source() {
+        let define = |src: &str, name: &str| -> usize {
+            src.lines()
+                .find_map(|l| l.trim().strip_prefix(&format!("#define {name} ")))
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or_else(|| panic!("{name} define in the kernel source"))
+        };
+        let (nsub, d) = (
+            define(super::QWEN4_G942_MOE_GEMM_SRC, "MG_NSUB"),
+            define(super::QWEN4_G942_MOE_GEMM_SRC, "MG_D"),
+        );
+        assert_eq!(super::G942_MOE_GEMM_ROWS_PER_WG, 64 * nsub);
+        assert_eq!(super::G942_MOE_GEMM_ROWS_PER_WG, super::FP8B128_MOE_ROWS_PER_WG);
+        assert_eq!(nsub, define(super::FP8B128_MOE_GROUPED_SRC, "FP8MOE_NSUB"));
+        assert_eq!(d, define(super::FP8B128_MOE_GROUPED_SRC, "FP8MOE_D"));
+        for entry in super::QWEN4_G942_MOE_GEMM_ENTRIES {
+            assert!(
+                super::QWEN4_G942_MOE_GEMM_SRC.contains(&format!("void {entry}(")),
+                "{entry} is not an entry of the wide GEMM source"
+            );
+        }
+        // 80 slots -> 80 tiles (n_tiles = (slots + min(slots, 512) * 15 + 15) / 16).
+        let slots = super::G942_MOE_WIDE_MIN_SLOTS;
+        assert_eq!(
+            (slots + slots.min(512) * 15 + 15) / 16,
+            super::G942_MOE_GEMM_MIN_TILES
+        );
     }
 
     /// The retained P1 oracle is an immutable standalone source: any byte change
