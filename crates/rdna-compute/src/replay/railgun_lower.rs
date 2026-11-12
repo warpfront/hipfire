@@ -29,12 +29,12 @@ use redline_dispatch::aql::{load_symbols, Executable, GpuSelector, PciBusId, Run
 
 use super::railgun_shadow::Transport;
 use super::{
-    gfx10_dispatch_initiator_policy, gfx1151_cu_count_knob_refusal, gfx1151_dispatch_interleave,
-    gfx1151_entry_acquire_policy, gfx1151_resource_limits_policy, retained_kernarg_pool,
-    Gfx10DispatchInitiatorPolicy, Gfx10Pm4CommandBuffer, Gfx11ComputeResourceLimitsPolicy,
-    Gfx11EntryAcquirePolicy, Gfx12DispatchPacing, GpuDevice, KernargBuffer, KernargPool, Kernel,
-    LaunchGeometry, LegacyDependencyMode, Pm4Architecture, Pm4Commands, Pm4RegisterPolicy,
-    ReplayQuiescence, SingleQueuePm4Ib,
+    gfx10_dispatch_initiator_policy, gfx1151_dispatch_interleave, gfx1151_entry_acquire_policy,
+    gfx1151_resource_limits_policy, retained_kernarg_pool, Gfx10DispatchInitiatorPolicy,
+    Gfx10Pm4CommandBuffer, Gfx11ComputeResourceLimitsPolicy, Gfx11EntryAcquirePolicy,
+    Gfx12DispatchPacing, GpuDevice, KernargBuffer, KernargPool, Kernel, LaunchGeometry,
+    LegacyDependencyMode, Pm4Architecture, Pm4Commands, Pm4RegisterPolicy, ReplayQuiescence,
+    SingleQueuePm4Ib,
 };
 use crate::code_object::{CodeObjectId, RecordedArtifact};
 
@@ -543,7 +543,6 @@ impl LoweringContext {
         if let Some(reason) = device_refusal(architecture, device.name(), select) {
             return Err(reason);
         }
-        gfx1151_cu_count_knob_refusal()?;
         let (dispatch_initiator_policy, dispatch_interleave, resource_limits_policy, entry_policy) =
             if architecture == Pm4Architecture::Gfx11 {
                 (

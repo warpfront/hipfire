@@ -3661,15 +3661,6 @@ pub static FIELDS: &[ConfigField] = &[
         "HIPFIRE_GFX1151_PM4_RESOURCE_LIMITS",
         "gfx1151 compute-resource-limits packet policy."
     ),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CU masking on RDNA hung the R9700 MES (2026-10-14); refused
-    diagnostic_field!(
-        "diagnostic.replay.gfx1151_cu_count",
-        "gfx1151_redline_cu_count",
-        DefaultValue::String("all"),
-        ValueRule::String,
-        "HIPFIRE_GFX1151_REDLINE_CU_COUNT",
-        "Refused: any value other than all fails PM4 replay preparation (CU masks on RDNA hung the R9700 MES on 2026-10-14). Default all."
-    ),
     diagnostic_field!(
         "diagnostic.replay.gfx1151_entry_acquire",
         "gfx1151_pm4_entry_acquire",
@@ -4075,6 +4066,14 @@ pub static RETIRED_CONFIG_KEYS: &[RetiredConfigKey] = &[
         removed_in: "0.5.0",
         reason: "CASK / TriAttention KV eviction was removed",
         replacement: "none; full KV (use a larger memory.max_seq or KV quantization)",
+    },
+    RetiredConfigKey {
+        key: "diagnostic.replay.gfx1151_cu_count",
+        legacy_key: "gfx1151_redline_cu_count",
+        shipped_in: "0.4.0",
+        removed_in: "0.5.0",
+        reason: "CU masking on RDNA hung the R9700 MES (2026-10-14) and was refused; the knob (HIPFIRE_GFX1151_REDLINE_CU_COUNT) was removed",
+        replacement: "none; the full CU set is always used",
     },
 ];
 
@@ -9327,6 +9326,41 @@ overrides = { decide = { calibration = { choice = 1.3, score = 2, noul = 0.7 } }
                 ConfigLayer::default().set_cli(&format!("kernel.{key}"), "true"),
                 Err(ConfigError::RetiredKey { .. })
             ));
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn retired_gfx1151_cu_count_fails_the_load() {
+        for (name, body) in [
+            (
+                "canonical",
+                "schema_version = 1\n[diagnostic.replay]\ngfx1151_cu_count = \"all\"\n",
+            ),
+            (
+                "legacy",
+                "schema_version = 1\ngfx1151_redline_cu_count = \"all\"\n",
+            ),
+        ] {
+            let root = temp_root(&format!("retired-cu-count-{name}"));
+            fs::create_dir_all(&root).unwrap();
+            let paths = ConfigPaths::under(&root);
+            fs::write(&paths.config_toml, body).unwrap();
+            let err = load_global(&paths).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ConfigError::RetiredKey {
+                        key: "diagnostic.replay.gfx1151_cu_count",
+                        ..
+                    }
+                ),
+                "{name}: {err:?}"
+            );
+            assert!(
+                err.to_string().contains("removed in 0.5.0"),
+                "{name}: {err}"
+            );
             let _ = fs::remove_dir_all(root);
         }
     }

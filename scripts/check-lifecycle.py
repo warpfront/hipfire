@@ -46,9 +46,7 @@ ENV_END = "<!-- env-inventory:end -->"
 # Deprecated config fields that switch a deprecated feature on, with the inert
 # schema default each must keep. Every other deprecated field must be a tuning
 # knob in DEPRECATED_TUNING (read only once one of these gates is on).
-DEPRECATED_GATES = {
-    "diagnostic.replay.gfx1151_cu_count": 'DefaultValue::String("all")',
-}
+DEPRECATED_GATES: dict[str, str] = {}
 DEPRECATED_TUNING: set[str] = set()
 # Deprecated env knobs that are not schema aliases (developer namespace or
 # unread harness exports). Their unset default is the supported behaviour.

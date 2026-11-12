@@ -3722,28 +3722,6 @@ fn gfx1151_resource_limits_policy_from_value(
     }
 }
 
-/// `HIPFIRE_GFX1151_REDLINE_CU_COUNT` can no longer produce a CU mask: any value
-/// other than `all`/`inherit`/`40`/empty is refused (CU masks on RDNA hung the
-/// R9700 MES on 2026-10-14).
-fn gfx1151_cu_count_knob_refusal() -> Result<(), String> {
-    let value = hipfire_config::process_value("HIPFIRE_GFX1151_REDLINE_CU_COUNT")
-        .unwrap_or_else(|| "all".to_owned());
-    gfx1151_cu_count_refusal(&value)
-}
-
-fn gfx1151_cu_count_refusal(value: &str) -> Result<(), String> {
-    if matches!(
-        value.to_ascii_lowercase().as_str(),
-        "" | "all" | "inherit" | "40"
-    ) {
-        return Ok(());
-    }
-    Err(format!(
-        "HIPFIRE_GFX1151_REDLINE_CU_COUNT={value:?} requests a CU mask and is refused: {}",
-        hipfire_config::devices::RDNA_CU_MASK_BAN
-    ))
-}
-
 fn gfx1151_entry_acquire_policy(
     architecture: Pm4Architecture,
     device_name: &str,
@@ -6528,7 +6506,6 @@ impl ReplayController {
         let dispatch_interleave = gfx1151_dispatch_interleave(pm4_architecture, device.name());
         let resource_limits_policy =
             gfx1151_resource_limits_policy(pm4_architecture, device.name());
-        gfx1151_cu_count_knob_refusal()?;
         let entry_acquire_policy = gfx1151_entry_acquire_policy(pm4_architecture, device.name());
         let pool = KernargPool::discover(&device).map_err(|error| error.to_string())?;
         let kernarg_pool = retained_kernarg_pool(&device, &pool, entry_acquire_policy);
@@ -11144,23 +11121,6 @@ mod tests {
         assert!(check_prepared_grid("gfx1201", "k.kd", [7, 65_537, 1]).is_err());
         assert!(check_prepared_grid("gfx1201", "k.kd", [7, 1, 65_537]).is_err());
         assert!(check_prepared_grid("gfx1100", "k.kd", [7, 65_537, 65_537]).is_ok());
-    }
-
-    #[test]
-    fn gfx1151_cu_count_knob_is_refused() {
-        for value in ["all", "", "inherit", "40", "ALL", "Inherit"] {
-            assert_eq!(gfx1151_cu_count_refusal(value), Ok(()), "{value:?}");
-        }
-        for value in ["32", "36", "35", "42"] {
-            let message =
-                gfx1151_cu_count_refusal(value).expect_err(&format!("{value:?} must be refused"));
-            assert!(
-                message.contains("HIPFIRE_GFX1151_REDLINE_CU_COUNT"),
-                "{message}"
-            );
-            assert!(message.contains("2026-10-14"), "{message}");
-            assert!(message.contains(value), "{message}");
-        }
     }
 
     #[test]
