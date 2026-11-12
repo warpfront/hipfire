@@ -31795,7 +31795,13 @@ impl Gpu {
         let mut x_view: Option<GpuTensor> = x16.map(GpuTensor::shallow_clone);
         for projections in groups {
             for &(weight, y, m) in projections.iter().filter(|&&(_, _, m)| short(m)) {
-                self.gemm_bf16_xf32_multirow(weight, x, y, m, k, batch_size)?;
+                if batch_size == 1 {
+                    // A one-row ordinary-prefill call: the multirow kernel needs two rows; its
+                    // row arithmetic is the singleton GEMV's (the lane groups above rely on it).
+                    self.gemv_bf16_xf32(weight, x, y, m, k)?;
+                } else {
+                    self.gemm_bf16_xf32_multirow(weight, x, y, m, k, batch_size)?;
+                }
             }
             if projections.iter().all(|&(_, _, m)| short(m)) {
                 continue;
