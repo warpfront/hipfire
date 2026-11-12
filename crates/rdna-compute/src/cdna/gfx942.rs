@@ -26,7 +26,6 @@ pub use qsa_lanes::{
     QWEN4_QSA_LANE_ROWS,
 };
 pub(crate) use qsa_lanes::{Qwen4QsaLaneDesc, Qwen4QsaLanesShape, QsaLanesTableCache};
-
 const GROUPED_OLORA_E8_SRC: &str =
     include_str!("../../../../kernels/src/gemv_mfp4g32_e8_soa_grouped.gfx942.hip");
 const GROUPED_OLORA_E8_KERNEL: &str = "gemv_mfp4g32_e8_soa_grouped_gfx942";
