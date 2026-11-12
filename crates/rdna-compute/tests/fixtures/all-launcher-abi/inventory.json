@@ -271,6 +271,20 @@
         "qwen4_gdn_lanes_step_capture_f32_gfx942"
       ],
       "reason": "gfx942 GDN lanes capture-f32 single-entry Route-A qualification twin: byte-identical full device ELF to the hipcc anchor, exact HIP/HSA ABI, certified by the existing typed CDNA ledger. Standalone: it has no owner launcher in this tree, so the full owner ABI is checked when the owner stack lands. No production image or dispatch change; qualification evidence is the hash-bound hardware receipt only."
+    },
+    "kernels/qwen4_g942_hc_gates_pm_gfx942.hxaco": {
+      "hip_source": "kernels/src/qwen4_g942_hc_gates.gfx942.hip",
+      "anchor": "kernels/qwen4_g942_hc_gates_hipcc_gfx942.co",
+      "symbols": [
+        "gemv_bf16_xf32_k4_rows_tiled_r2",
+        "gemv_bf16_xf32_k4_rows_tiled_r3",
+        "gemv_bf16_xf32_k4_rows_tiled_r4",
+        "gemv_bf16_xf32_k4_rows_tiled_r5",
+        "gemv_bf16_xf32_k4_rows_tiled_r6",
+        "gemv_bf16_xf32_k4_rows_tiled_r7",
+        "gemv_bf16_xf32_k4_rows_tiled_r8"
+      ],
+      "reason": "gfx942 HC-gates BF16 GEMV (k4 rows-tiled r2..r8) Route-A qualification twin: byte-identical full device ELF to the hipcc anchor, exact HIP/HSA ABI, certified by the existing typed CDNA ledger. Standalone: the source is the verbatim hc-gates kernel set with no new owner launcher here. No production image or dispatch change; qualification evidence is the hash-bound hardware receipt only."
     }
   },
   "emitter_images": {
