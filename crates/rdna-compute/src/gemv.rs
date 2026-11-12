@@ -27357,10 +27357,22 @@ mod g942_lane_wide_rows_tests {
         let rule = g942_lane_wide_rows_rule;
         for rows in [9usize, 16, 17, 32, 33, 64, 128, 256] {
             assert!(rule(true, true, Product, false, rows), "rows {rows}");
-            assert!(!rule(false, true, Product, false, rows), "other arch {rows}");
-            assert!(!rule(true, false, Product, false, rows), "no lane scope {rows}");
-            assert!(!rule(true, true, OrdinaryPrefill, false, rows), "ordinary prefill {rows}");
-            assert!(!rule(true, true, InvariantProfile, true, rows), "invariant {rows}");
+            assert!(
+                !rule(false, true, Product, false, rows),
+                "other arch {rows}"
+            );
+            assert!(
+                !rule(true, false, Product, false, rows),
+                "no lane scope {rows}"
+            );
+            assert!(
+                !rule(true, true, OrdinaryPrefill, false, rows),
+                "ordinary prefill {rows}"
+            );
+            assert!(
+                !rule(true, true, InvariantProfile, true, rows),
+                "invariant {rows}"
+            );
             assert!(!rule(true, true, Product, true, rows), "wave {rows}");
         }
         for rows in 0..=FEW_ROW_ROUTE_ROWS {

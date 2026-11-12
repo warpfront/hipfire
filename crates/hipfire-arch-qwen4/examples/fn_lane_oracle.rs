@@ -355,7 +355,10 @@ fn parse_args_from(raw: &[String]) -> R<Args> {
         return Err("--wave-prefill drives AR lanes or MTP lanes (--spec mtp): it does not combine with --promote or --copy".into());
     }
     if a.wave_prefill && a.spec_mtp && a.decode_rows > 0 {
-        return Err("--decode-rows plans AR rows: it does not combine with --wave-prefill --spec mtp".into());
+        return Err(
+            "--decode-rows plans AR rows: it does not combine with --wave-prefill --spec mtp"
+                .into(),
+        );
     }
     if let Some(p) = a.promote {
         if a.spec_mtp && p == 0 {
@@ -3566,10 +3569,13 @@ fn load(
     let stock_mtp = if attach_mtp {
         let sidecar = hipfire_arch_qwen4::stock_mtp_sidecar::qwen4_stock_mtp_sidecar_path(path);
         if sidecar.is_file() {
-            let bound = hipfire_arch_qwen4::stock_mtp_sidecar::bind_stock_mtp_sidecar(&hfq, &sidecar)
-                .map_err(|reason| {
-                    hipfire_arch_qwen4::stock_mtp_sidecar::stock_mtp_refusal_line(&sidecar, &reason)
-                })?;
+            let bound =
+                hipfire_arch_qwen4::stock_mtp_sidecar::bind_stock_mtp_sidecar(&hfq, &sidecar)
+                    .map_err(|reason| {
+                        hipfire_arch_qwen4::stock_mtp_sidecar::stock_mtp_refusal_line(
+                            &sidecar, &reason,
+                        )
+                    })?;
             eprintln!(
                 "{}",
                 hipfire_arch_qwen4::stock_mtp_sidecar::stock_mtp_attached_line(&bound)

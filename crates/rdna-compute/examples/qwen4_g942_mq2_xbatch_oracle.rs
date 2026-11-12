@@ -63,7 +63,8 @@ fn weights(rng: &mut Rng, m: usize, k: usize, wide: bool) -> Vec<u8> {
             let (scale, zero) = if wide {
                 let pick = |rng: &mut Rng| loop {
                     // Any finite half with a magnitude below 2^8: subnormals included.
-                    let bits = (rng.next() >> 40) as u16 & 0x5bff | ((rng.next() >> 50) as u16 & 0x8000);
+                    let bits =
+                        (rng.next() >> 40) as u16 & 0x5bff | ((rng.next() >> 50) as u16 & 0x8000);
                     let h = half::f16::from_bits(bits);
                     if h.is_finite() {
                         break h.to_f32();
@@ -281,7 +282,11 @@ fn main() {
         .count();
     let hipcc_info: u64 = cases
         .iter()
-        .map(|c| c["hipcc_xbatch_vs_singleton_bad_bytes_info"].as_u64().unwrap_or(0))
+        .map(|c| {
+            c["hipcc_xbatch_vs_singleton_bad_bytes_info"]
+                .as_u64()
+                .unwrap_or(0)
+        })
         .sum();
     let bench_rows = if do_bench {
         match bench(&mut gpu, &mut rng) {
@@ -304,7 +309,8 @@ fn main() {
         "detail": cases,
     });
     if let Some(path) = out {
-        std::fs::write(&path, serde_json::to_string_pretty(&report).unwrap()).expect("write report");
+        std::fs::write(&path, serde_json::to_string_pretty(&report).unwrap())
+            .expect("write report");
     }
     println!(
         "qwen4_g942_mq2_xbatch_oracle: {} cases, {} failing; hipcc xbatch vs singleton (info) {} bytes{}",

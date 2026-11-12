@@ -197,9 +197,7 @@ struct Init {
 
 fn make_init(n: usize, seed: u64) -> Init {
     let mut rng = Rng::new(0xC0FF_EE42 ^ (seed << 20) ^ n as u64);
-    let mut words: Vec<Vec<u32>> = (0..NBUF)
-        .map(|b| vec![SENTINEL; CAP * WIDTH[b]])
-        .collect();
+    let mut words: Vec<Vec<u32>> = (0..NBUF).map(|b| vec![SENTINEL; CAP * WIDTH[b]]).collect();
     for r in 0..n {
         for (b, width) in [(STREAMS, WIDE), (WMIX, HIDDEN), (WMIX2, HIDDEN)] {
             let row = gen_row(&mut rng, width);
@@ -246,7 +244,6 @@ fn wref(buf: &GpuTensor, m: usize, k: usize) -> WeightRef<'_> {
         m,
         k,
         row_stride: 2 * k,
-        rotation: None,
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
@@ -534,10 +531,18 @@ enum Kind {
 
 #[derive(Clone, Copy)]
 enum Stage {
-    Read { layer: usize, mlp: bool },
-    Write { layer: usize, mlp: bool },
+    Read {
+        layer: usize,
+        mlp: bool,
+    },
+    Write {
+        layer: usize,
+        mlp: bool,
+    },
     /// `W(attn first) R(attn first) W(mlp first) R(mlp first)` over layer `first`.
-    Chain { first: usize },
+    Chain {
+        first: usize,
+    },
     Final,
 }
 
@@ -560,12 +565,9 @@ impl Stage {
     /// The buffers whose live rows are compared, and the words per live row of each.
     fn compared(self) -> Vec<(usize, usize)> {
         match self.kind() {
-            Kind::Read | Kind::Final => vec![
-                (NORMALIZED, WIDE),
-                (LOW, RANK),
-                (UP, WIDE),
-                (MIXED, HIDDEN),
-            ],
+            Kind::Read | Kind::Final => {
+                vec![(NORMALIZED, WIDE), (LOW, RANK), (UP, WIDE), (MIXED, HIDDEN)]
+            }
             Kind::Write => vec![(NORMALIZED, WIDE), (GATES, BRANCHES), (STREAMS, WIDE)],
             Kind::Chain => vec![(STREAMS, WIDE), (MIXED, HIDDEN), (MIXED2, HIDDEN)],
         }
@@ -596,7 +598,13 @@ fn stages(set: &WeightSet) -> Vec<Stage> {
     out
 }
 
-fn read_op<'a>(r: &'a ReadW, v: &'a [GpuTensor], rotation: &'a GpuTensor, rows: usize, mixed: usize) -> HyperReadOp<'a> {
+fn read_op<'a>(
+    r: &'a ReadW,
+    v: &'a [GpuTensor],
+    rotation: &'a GpuTensor,
+    rows: usize,
+    mixed: usize,
+) -> HyperReadOp<'a> {
     HyperReadOp {
         state_bf16: false,
         input: &v[STREAMS],
@@ -651,7 +659,10 @@ struct Log {
 
 impl Log {
     fn start(&self) {
-        self.symbols.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.symbols
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         self.on.store(true, Ordering::Relaxed);
     }
     fn stop(&self) -> Vec<String> {
@@ -713,7 +724,14 @@ fn exec_stage(
                 let steps = vec![
                     Step::HyperWrite(write_op(conn(first, false), v, rotation, rows, GATES, WMIX)),
                     Step::HyperRead(read_op(&conn(first, false).read, v, rotation, rows, MIXED)),
-                    Step::HyperWrite(write_op(conn(first, true), v, rotation, rows, GATES2, WMIX2)),
+                    Step::HyperWrite(write_op(
+                        conn(first, true),
+                        v,
+                        rotation,
+                        rows,
+                        GATES2,
+                        WMIX2,
+                    )),
                     Step::HyperRead(read_op(&conn(first, true).read, v, rotation, rows, MIXED2)),
                 ];
                 validate_steps(gpu, &steps).map_err(dbg_err)?;
@@ -747,8 +765,20 @@ struct Outcome {
     symbols: Vec<String>,
 }
 
-fn run_arm(env: &mut Env, set: &WeightSet, stage: Stage, arm: Arm, n: usize, init: &Init) -> R<Outcome> {
-    let Env { gpu, ctx, bufs, log } = env;
+fn run_arm(
+    env: &mut Env,
+    set: &WeightSet,
+    stage: Stage,
+    arm: Arm,
+    n: usize,
+    init: &Init,
+) -> R<Outcome> {
+    let Env {
+        gpu,
+        ctx,
+        bufs,
+        log,
+    } = env;
     bufs.reset(gpu, init)?;
     log.start();
     let result = (|| -> R<()> {
@@ -809,11 +839,12 @@ fn tail_clean(stage: Stage, n: usize, out: &Outcome, init: &Init) -> Option<Stri
     for (buf, width) in stage.compared() {
         // The gate buffer's tail in the packed stages starts at the live end.
         let from = n * width;
-        let to = CAP * if buf == GATES || buf == GATES2 {
-            WIDTH[buf]
-        } else {
-            width
-        };
+        let to = CAP
+            * if buf == GATES || buf == GATES2 {
+                WIDTH[buf]
+            } else {
+                width
+            };
         for i in from..to.min(out.snap[buf].len()) {
             if out.snap[buf][i] != init.words[buf][i] {
                 return Some(format!("{} word {i} past row {n} was written", NAMES[buf]));
@@ -859,7 +890,13 @@ impl Report {
     }
 }
 
-fn oracle(env: &mut Env, sets: &[WeightSet], rows: &[usize], seeds: u64, rep: &mut Report) -> R<()> {
+fn oracle(
+    env: &mut Env,
+    sets: &[WeightSet],
+    rows: &[usize],
+    seeds: u64,
+    rep: &mut Report,
+) -> R<()> {
     for set in sets {
         for stage in stages(set) {
             for &n in rows {
@@ -916,7 +953,9 @@ fn oracle(env: &mut Env, sets: &[WeightSet], rows: &[usize], seeds: u64, rep: &m
                             // Both arms: the fused rows16 down + activation up to 16 rows,
                             // the (wide / rows16) GEMM and the unfused chain past it.
                             let fold = n <= 16;
-                            for (arm, symbols) in [("lane", &lane.symbols), ("chunk", &chunk.symbols)] {
+                            for (arm, symbols) in
+                                [("lane", &lane.symbols), ("chunk", &chunk.symbols)]
+                            {
                                 let fused = count(symbols, "hc_act");
                                 let chain = count(symbols, "roundtrip");
                                 if (fold && (fused != 1 || chain != 0))
@@ -996,14 +1035,30 @@ fn bench_hc(env: &mut Env, set: &WeightSet, n: usize, scope: Scope, iters: usize
         let v = bufs.views(0, GATES_PER_ROW);
         for layer in 0..48 {
             let first = layer % set.layers.len();
-            exec_stage(gpu, ctx, set, Stage::Chain { first }, &v, &bufs.rotation, n, scope)?;
+            exec_stage(
+                gpu,
+                ctx,
+                set,
+                Stage::Chain { first },
+                &v,
+                &bufs.rotation,
+                n,
+                scope,
+            )?;
         }
         exec_stage(gpu, ctx, set, Stage::Final, &v, &bufs.rotation, n, scope)
     })
 }
 
 /// Wall of 96 calls of one stage kind (a forward's reads, or its writes) at `n` rows.
-fn bench_stage(env: &mut Env, set: &WeightSet, n: usize, scope: Scope, iters: usize, write: bool) -> R<f64> {
+fn bench_stage(
+    env: &mut Env,
+    set: &WeightSet,
+    n: usize,
+    scope: Scope,
+    iters: usize,
+    write: bool,
+) -> R<f64> {
     let init = make_init(n, 0);
     env.bufs.reset(&env.gpu, &init)?;
     time_ms(env, iters, |env| {
@@ -1036,22 +1091,102 @@ fn bench_dense(env: &mut Env, n: usize, iters: usize) -> R<f64> {
     }
     // (group, m, k, calls per forward); members of a group read one input, so one call.
     let shapes = [
-        Shape { group: "gdn", m: 10240, k: 2560, count: 36 },
-        Shape { group: "gdn", m: 6144, k: 2560, count: 36 },
-        Shape { group: "gdn", m: 48, k: 2560, count: 36 },
-        Shape { group: "gdn", m: 48, k: 2560, count: 36 },
-        Shape { group: "out", m: 2560, k: 6144, count: 48 },
-        Shape { group: "qsa", m: 12288, k: 2560, count: 12 },
-        Shape { group: "qsa", m: 512, k: 2560, count: 12 },
-        Shape { group: "qsa", m: 512, k: 2560, count: 12 },
-        Shape { group: "qsa", m: 640, k: 2560, count: 12 },
-        Shape { group: "sh", m: 640, k: 2560, count: 48 },
-        Shape { group: "sh", m: 640, k: 2560, count: 48 },
-        Shape { group: "shd", m: 2560, k: 640, count: 48 },
-        Shape { group: "router", m: 512, k: 2560, count: 48 },
-        Shape { group: "egate", m: 1, k: 2560, count: 48 },
-        Shape { group: "ple", m: 10240, k: 2560, count: 1 },
-        Shape { group: "ple2", m: 2560, k: 2560, count: 1 },
+        Shape {
+            group: "gdn",
+            m: 10240,
+            k: 2560,
+            count: 36,
+        },
+        Shape {
+            group: "gdn",
+            m: 6144,
+            k: 2560,
+            count: 36,
+        },
+        Shape {
+            group: "gdn",
+            m: 48,
+            k: 2560,
+            count: 36,
+        },
+        Shape {
+            group: "gdn",
+            m: 48,
+            k: 2560,
+            count: 36,
+        },
+        Shape {
+            group: "out",
+            m: 2560,
+            k: 6144,
+            count: 48,
+        },
+        Shape {
+            group: "qsa",
+            m: 12288,
+            k: 2560,
+            count: 12,
+        },
+        Shape {
+            group: "qsa",
+            m: 512,
+            k: 2560,
+            count: 12,
+        },
+        Shape {
+            group: "qsa",
+            m: 512,
+            k: 2560,
+            count: 12,
+        },
+        Shape {
+            group: "qsa",
+            m: 640,
+            k: 2560,
+            count: 12,
+        },
+        Shape {
+            group: "sh",
+            m: 640,
+            k: 2560,
+            count: 48,
+        },
+        Shape {
+            group: "sh",
+            m: 640,
+            k: 2560,
+            count: 48,
+        },
+        Shape {
+            group: "shd",
+            m: 2560,
+            k: 640,
+            count: 48,
+        },
+        Shape {
+            group: "router",
+            m: 512,
+            k: 2560,
+            count: 48,
+        },
+        Shape {
+            group: "egate",
+            m: 1,
+            k: 2560,
+            count: 48,
+        },
+        Shape {
+            group: "ple",
+            m: 10240,
+            k: 2560,
+            count: 1,
+        },
+        Shape {
+            group: "ple2",
+            m: 2560,
+            k: 2560,
+            count: 1,
+        },
     ];
     let mut rng = Rng::new(0xD3_5E);
     // Instances per shape.
@@ -1161,7 +1296,9 @@ fn parse_cli() -> R<Cli> {
             .map_err(|_| format!("{flag}: not a number: {text}"))
     };
     let list = |text: String, flag: &str| -> R<Vec<usize>> {
-        text.split(',').map(|s| number(s.to_string(), flag)).collect()
+        text.split(',')
+            .map(|s| number(s.to_string(), flag))
+            .collect()
     };
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -1175,7 +1312,9 @@ fn parse_cli() -> R<Cli> {
             "--bench-only" => cli.bench_only = true,
             "--iters" => cli.iters = number(value(&mut args, "--iters")?, "--iters")?,
             "--image" => cli.image = Some(value(&mut args, "--image")?),
-            "--bench-rows" => cli.bench_rows = number(value(&mut args, "--bench-rows")?, "--bench-rows")?,
+            "--bench-rows" => {
+                cli.bench_rows = number(value(&mut args, "--bench-rows")?, "--bench-rows")?
+            }
             other => return Err(format!("unknown argument {other}")),
         }
     }
@@ -1189,28 +1328,35 @@ fn run() -> R<bool> {
     let cli = parse_cli()?;
     if let Some(image) = &cli.image {
         if !std::path::Path::new(image).is_absolute() || !std::path::Path::new(image).is_file() {
-            return Err(format!("--image {image}: needs the absolute path of an existing file"));
+            return Err(format!(
+                "--image {image}: needs the absolute path of an existing file"
+            ));
         }
         // Read by the library when the first gate entry loads (process snapshot at first use).
         std::env::set_var("HIPFIRE_QWEN4_G942_HC_GATES_IMAGE", image);
         println!("hc_wide_g942_oracle: gate entries from image {image}");
     }
     let mut gpu = Gpu::init().map_err(err("Gpu::init"))?;
-    println!("hc_wide_g942_oracle: arch={} model={:?}", gpu.arch, cli.model);
+    println!(
+        "hc_wide_g942_oracle: arch={} model={:?}",
+        gpu.arch, cli.model
+    );
     if !gpu.arch_caps.is_gfx942() {
         return Err(format!("needs exact gfx942, got {}", gpu.arch));
     }
     let log = Arc::new(Log::default());
     let sink = log.clone();
-    let observer = Arc::new(move |_gpu: &Gpu, w: &LabLaunchWitness<'_>| -> HipResult<()> {
-        if sink.on.load(Ordering::Relaxed) {
-            sink.symbols
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push(w.symbol.to_string());
-        }
-        Ok(())
-    });
+    let observer = Arc::new(
+        move |_gpu: &Gpu, w: &LabLaunchWitness<'_>| -> HipResult<()> {
+            if sink.on.load(Ordering::Relaxed) {
+                sink.symbols
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(w.symbol.to_string());
+            }
+            Ok(())
+        },
+    );
     gpu.set_lab_launch_observer(Some(observer));
 
     let mut sets = vec![synthetic_weights(&mut gpu)?];
@@ -1219,7 +1365,12 @@ fn run() -> R<bool> {
     }
     let bufs = Bufs::new(&mut gpu)?;
     let ctx = DispatchCtx::new(&gpu);
-    let mut env = Env { gpu, ctx, bufs, log };
+    let mut env = Env {
+        gpu,
+        ctx,
+        bufs,
+        log,
+    };
 
     let mut rep = Report::default();
     if !cli.bench_only {
@@ -1247,7 +1398,14 @@ fn run() -> R<bool> {
             cli.rows,
             cli.seeds
         );
-        println!("{} {line}", if rep.passed() { "ORACLE PASS" } else { "ORACLE FAIL" });
+        println!(
+            "{} {line}",
+            if rep.passed() {
+                "ORACLE PASS"
+            } else {
+                "ORACLE FAIL"
+            }
+        );
     }
     if (cli.bench || cli.bench_only) && (cli.bench_only || rep.passed()) {
         let n = cli.bench_rows;
@@ -1258,7 +1416,9 @@ fn run() -> R<bool> {
         for (name, scope) in [("lane", Scope::Lane(n)), ("chunk", Scope::Off)] {
             let reads = bench_stage(&mut env, set, n, scope, cli.iters, false)?;
             let writes = bench_stage(&mut env, set, n, scope, cli.iters, true)?;
-            println!("BENCH-STAGE n={n} route={name} reads96_ms={reads:.3} writes96_ms={writes:.3}");
+            println!(
+                "BENCH-STAGE n={n} route={name} reads96_ms={reads:.3} writes96_ms={writes:.3}"
+            );
         }
         println!(
             "BENCH n={n} iters={} weights={} hc_lane_scope_ms={hc_lane:.3} hc_chunk_route_ms={hc_chunk:.3} \

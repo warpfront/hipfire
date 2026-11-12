@@ -38,6 +38,21 @@ peacemaker-lift = { path = "../peacemaker-lift" }
 peacemaker-rip = { path = "../peacemaker-rip" }
 railgun-cert = { path = "../railgun-cert" }
 [[example]]
+name = "gdn_capture_f32_gfx942_oracle"
+required-features = ["lab"]
+[[example]]
+name = "gdn_lanes_f32_gfx942_oracle"
+required-features = ["lab"]
+[[example]]
+name = "gdn_lanes_verify_f32_gfx942_oracle"
+required-features = ["lab"]
+[[example]]
+name = "qsa_lanes_gfx942_oracle"
+required-features = ["lab"]
+[[example]]
+name = "qwen4_g942_mq2_xbatch_oracle"
+required-features = ["lab"]
+[[example]]
 name = "bench_stream_mix_chain_gfx1201"
 required-features = ["lab"]
 [[example]]

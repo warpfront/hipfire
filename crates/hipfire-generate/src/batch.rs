@@ -3339,7 +3339,10 @@ pub fn batch_request_eligible_for_route(
 /// starting as an AR singleton.
 fn g942_burst_peer(m: &LoadedModel, inbox: &mut DaemonInbox) -> bool {
     use hipfire_arch_qwen4::lane_exec::g942_wave;
-    let gap = m.qwen4().is_some_and(g942_wave::serve_armed).then_some(g942_wave::BURST_GAP);
+    let gap = m
+        .qwen4()
+        .is_some_and(g942_wave::serve_armed)
+        .then_some(g942_wave::BURST_GAP);
     let start = Instant::now();
     while gap.is_some_and(|gap| start.elapsed() < gap) {
         if inbox.has_pending_batch_generate() {

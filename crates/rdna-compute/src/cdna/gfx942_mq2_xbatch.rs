@@ -53,7 +53,8 @@ pub fn qwen4_g942_mq2_xbatch_covers(m: usize, k: usize) -> bool {
             .checked_mul(72)
             .and_then(|row| row.checked_mul(m))
             .is_some_and(|bytes| bytes <= i32::MAX as usize)
-        && m.checked_mul(8).is_some_and(|bytes| bytes <= i32::MAX as usize)
+        && m.checked_mul(8)
+            .is_some_and(|bytes| bytes <= i32::MAX as usize)
 }
 
 /// Bind `kernel` of the module: the hipcc source (the anchor object), or, only when
@@ -75,7 +76,11 @@ fn g942_mq2_xbatch_ensure(gpu: &mut Gpu, kernel: &str) -> HipResult<()> {
                 kernel,
             )
         }
-        _ => gpu.ensure_kernel(QWEN4_G942_MQ2_XBATCH_MODULE, QWEN4_G942_MQ2_XBATCH_SRC, kernel),
+        _ => gpu.ensure_kernel(
+            QWEN4_G942_MQ2_XBATCH_MODULE,
+            QWEN4_G942_MQ2_XBATCH_SRC,
+            kernel,
+        ),
     }
 }
 

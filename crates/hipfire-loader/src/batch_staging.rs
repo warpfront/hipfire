@@ -568,9 +568,8 @@ pub fn d2_single_card_lane_refusal(
 /// device-byte accounting so the load logs the real cause and stays sequential.
 pub fn qwen4_lane_capacity_refusal(requested: usize) -> Option<String> {
     let max = hipfire_arch_qwen4::lane::MAX_LANES;
-    (requested == 0 || requested > max).then(|| {
-        format!("lanes={requested} outside the lane store capacity 1..={max}")
-    })
+    (requested == 0 || requested > max)
+        .then(|| format!("lanes={requested} outside the lane store capacity 1..={max}"))
 }
 
 /// Kill switch of EP native-MTP lanes: exact `0` keeps the AR lane store (as
@@ -1164,8 +1163,9 @@ fn stage_qwen_vmm_dflash(m: &mut LoadedModel, gpu: &mut Gpu, row_budget: usize) 
 #[cfg(test)]
 mod tests {
     use super::{
-        d2_single_card_lane_refusal, qwen4_lane_capacity_refusal, ep_spec_lane_reservation, ep_spec_lane_reservation_with,
-        ep_spec_off_reason, stochastic_q8_state_without_ef, StateQuant,
+        d2_single_card_lane_refusal, ep_spec_lane_reservation, ep_spec_lane_reservation_with,
+        ep_spec_off_reason, qwen4_lane_capacity_refusal, stochastic_q8_state_without_ef,
+        StateQuant,
     };
     use hipfire_runtime::loader_api::SpecLoadCfg;
 
@@ -1178,7 +1178,10 @@ mod tests {
         }
         for bad in [0usize, 65, 128, 256] {
             let why = qwen4_lane_capacity_refusal(bad).expect("refused");
-            assert!(why.contains(&format!("lanes={bad}")) && why.contains("1..=64"), "{why}");
+            assert!(
+                why.contains(&format!("lanes={bad}")) && why.contains("1..=64"),
+                "{why}"
+            );
         }
     }
 

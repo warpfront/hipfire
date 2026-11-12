@@ -2407,7 +2407,8 @@ impl Qwen4LaneStore {
                 }
                 if lane_topology(bundle) != LaneTopology::Single {
                     return Err(
-                        "lane store: gfx942 MTP lanes run the single-card topology only".to_string(),
+                        "lane store: gfx942 MTP lanes run the single-card topology only"
+                            .to_string(),
                     );
                 }
             }

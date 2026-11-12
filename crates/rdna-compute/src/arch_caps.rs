@@ -892,7 +892,9 @@ mod tests {
         ] {
             assert!(make_caps(arch).has_qwen4_gdn_row_capture(), "{arch}");
         }
-        for arch in &["gfx1010", "gfx1030", "gfx906", "gfx908", "gfx940", "gfx941", ""] {
+        for arch in &[
+            "gfx1010", "gfx1030", "gfx906", "gfx908", "gfx940", "gfx941", "",
+        ] {
             assert!(!make_caps(arch).has_qwen4_gdn_row_capture(), "{arch:?}");
         }
     }

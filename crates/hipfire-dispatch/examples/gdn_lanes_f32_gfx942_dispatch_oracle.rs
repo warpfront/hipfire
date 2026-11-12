@@ -96,7 +96,10 @@ fn dtoh(gpu: &Gpu, t: &GpuTensor) -> Vec<f32> {
 }
 
 fn words_diff(a: &[f32], b: &[f32]) -> usize {
-    a.iter().zip(b).filter(|(x, y)| x.to_bits() != y.to_bits()).count()
+    a.iter()
+        .zip(b)
+        .filter(|(x, y)| x.to_bits() != y.to_bits())
+        .count()
 }
 
 /// One lane's tensors in one arm.
@@ -164,7 +167,6 @@ fn weight<'a>(w: &'a GpuTensor, m: usize, k: usize) -> WeightRef<'a> {
         m,
         k,
         row_stride: k,
-        rotation: None,
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
@@ -228,14 +230,30 @@ enum Control {
     WrongPosition,
 }
 
-fn run_case(gpu: &mut Gpu, ctx: &DispatchCtx, sh: &Shared, n: usize, steps: usize, seed: u64) -> bool {
+fn run_case(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    sh: &Shared,
+    n: usize,
+    steps: usize,
+    seed: u64,
+) -> bool {
     let mut rng = Rng(seed ^ ((n as u64) << 32));
     let init: Vec<(Vec<f32>, Vec<f32>)> = (0..n)
-        .map(|_| (rv(&mut rng, STATE, -0.5, 0.5), rv(&mut rng, 3 * QKV, -1.5, 1.5)))
+        .map(|_| {
+            (
+                rv(&mut rng, STATE, -0.5, 0.5),
+                rv(&mut rng, 3 * QKV, -1.5, 1.5),
+            )
+        })
         .collect();
     let mut positions: Vec<usize> = (0..n).map(|i| (rng.next() % 1000) as usize + i).collect();
     let mut ok = true;
-    for control in [Control::None, Control::SwappedStates, Control::WrongPosition] {
+    for control in [
+        Control::None,
+        Control::SwappedStates,
+        Control::WrongPosition,
+    ] {
         if control != Control::None && n < 2 {
             continue;
         }
@@ -302,8 +320,7 @@ fn run_case(gpu: &mut Gpu, ctx: &DispatchCtx, sh: &Shared, n: usize, steps: usiz
             let cand_launches = memory_effects::snapshot().since(m1).launches;
             order.clear();
             Arc::make_mut(&mut gpu.flags).qwen4_gdn_lanes = false;
-            let launches_good =
-                ref_launches == 3 * n as u64 && cand_launches == 2 * n as u64 + 1;
+            let launches_good = ref_launches == 3 * n as u64 && cand_launches == 2 * n as u64 + 1;
             if control == Control::None {
                 launch_ok &= launches_good;
                 detail.push(format!(
@@ -320,8 +337,19 @@ fn run_case(gpu: &mut Gpu, ctx: &DispatchCtx, sh: &Shared, n: usize, steps: usiz
                         detail.push(format!("  lane {l} {name}: {d} differing words"));
                     }
                     total_diff += d;
-                    if matches!(name, "projection2 (conv out)" | "gate" | "beta" | "recurrent output" | "gated output") {
-                        sentinel_left += rv_.iter().chain(&cv_).filter(|x| x.to_bits() == SENT).count();
+                    if matches!(
+                        name,
+                        "projection2 (conv out)"
+                            | "gate"
+                            | "beta"
+                            | "recurrent output"
+                            | "gated output"
+                    ) {
+                        sentinel_left += rv_
+                            .iter()
+                            .chain(&cv_)
+                            .filter(|x| x.to_bits() == SENT)
+                            .count();
                     }
                 }
             }
@@ -377,7 +405,10 @@ fn main() {
     }
     let mut gpu = Gpu::init().expect("Gpu::init");
     if gpu.try_gfx942().is_none() {
-        eprintln!("gdn_lanes_f32_gfx942_dispatch_oracle: needs exact gfx942, this is {}", gpu.arch);
+        eprintln!(
+            "gdn_lanes_f32_gfx942_dispatch_oracle: needs exact gfx942, this is {}",
+            gpu.arch
+        );
         std::process::exit(2);
     }
     let ctx = DispatchCtx::new(&gpu);

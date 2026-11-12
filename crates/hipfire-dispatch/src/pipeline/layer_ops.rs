@@ -1338,9 +1338,8 @@ fn g942_rows16_chain() -> bool {
 /// `qwen4_gemm_bf16_mfma_gfx942_wide`, rows 1..=64 / 65 / 257 / 1025 on every trunk shape; model
 /// prefill logits and states byte-equal with the switch on and off).
 fn g942_bf16_wide() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        hipfire_config::developer_bool("HIPFIRE_G942_BF16_WIDE", true)
-    });
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_G942_BF16_WIDE", true));
     *ON
 }
 
@@ -2915,11 +2914,7 @@ enum G942HcGateRows {
 }
 
 /// Classify a write of `rows` rows. `route_rows` is [`Gpu::route_rows`] of them.
-fn g942_hc_gate_rows(
-    route_rows: usize,
-    few_row_limit: usize,
-    lane_wide: bool,
-) -> G942HcGateRows {
+fn g942_hc_gate_rows(route_rows: usize, few_row_limit: usize, lane_wide: bool) -> G942HcGateRows {
     if (1..=few_row_limit).contains(&route_rows) {
         G942HcGateRows::FewRow
     } else if lane_wide {
@@ -4092,11 +4087,10 @@ pub fn execute_gated_delta_net_core_lanes(
     // Exact gfx942: the one-row F32 lanes'
     // recurrence as one launch over every lane (`pipeline/gdn.rs`); a group it declines
     // falls through to the gfx11+ multi-lane kernels below, which refuse it too.
-    let before_launch =
-        match super::gdn::execute_core_lanes_f32_gfx942(gpu, ops, before_launch)? {
-            super::gdn::Gfx942GdnLanes::Done => return Ok(true),
-            super::gdn::Gfx942GdnLanes::Declined(before_launch) => before_launch,
-        };
+    let before_launch = match super::gdn::execute_core_lanes_f32_gfx942(gpu, ops, before_launch)? {
+        super::gdn::Gfx942GdnLanes::Done => return Ok(true),
+        super::gdn::Gfx942GdnLanes::Declined(before_launch) => before_launch,
+    };
     let Some(first) = ops.first() else {
         return Ok(false);
     };
