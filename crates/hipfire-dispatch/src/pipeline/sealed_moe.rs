@@ -2622,17 +2622,42 @@ pub(super) fn produce_prefill_route<'a>(
                         }
                     }
                 } else {
-                    gpu.moe_router_softmax_top10_f32(
-                        scores,
-                        topk_indices,
-                        params.topk_weights,
-                        params.batch_size,
-                        normalize,
-                        params.recipe.bf16_round_trip(),
-                        router_layer,
-                        row_base,
-                    )
-                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                    // G12 input: exact gfx942 takes the wave-per-token router for the BF16
+                    // recipe at lane-wide row counts (bitwise the incumbent's ids/weights).
+                    let wide_router = params.recipe.bf16_round_trip()
+                        && gpu.try_gfx942().is_some_and(|device| {
+                            device.g942_moe_wide_router_admitted(
+                                params.batch_size,
+                                params.n_exp,
+                                params.k_top,
+                            )
+                        });
+                    if wide_router {
+                        gpu.try_gfx942()
+                            .ok_or_else(|| invalid("the wide router needs exact gfx942"))?
+                            .g942_moe_wide_router(
+                                scores,
+                                topk_indices,
+                                params.topk_weights,
+                                params.batch_size,
+                                normalize,
+                                router_layer,
+                                row_base,
+                            )
+                            .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                    } else {
+                        gpu.moe_router_softmax_top10_f32(
+                            scores,
+                            topk_indices,
+                            params.topk_weights,
+                            params.batch_size,
+                            normalize,
+                            params.recipe.bf16_round_trip(),
+                            router_layer,
+                            row_base,
+                        )
+                        .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                    }
                 }
             } else {
                 let result = if params.k_top == 10 {
