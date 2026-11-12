@@ -1006,7 +1006,7 @@ impl RankLane<'_> {
                 // serial and batched head steps on scratch twins of their states
                 // (no effect on the lanes; armed by env only, `lab` builds only).
                 #[cfg(feature = "lab")]
-                if crate::lab_draft_rounds::probe_enabled()
+                if crate::lab_draft_rounds::probe_enabled(bundle)
                     && s4.is_none()
                     && round.ops.len() >= 2
                     && !round.ops.iter().try_fold(false, |any, op| {

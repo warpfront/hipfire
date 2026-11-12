@@ -104,7 +104,7 @@ impl S4Round {
 pub(crate) const MTP_DRAFT_ROUNDS_ENV: &str = "HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS";
 
 mod rows;
-pub(crate) use rows::{draft_rounds_enabled, DraftRow, MtpRowsScratch};
+pub(crate) use rows::{DraftRow, MtpRowsScratch};
 mod fp8_moe;
 #[cfg(feature = "lab")]
 pub use fp8_moe::LabHeadRouting;

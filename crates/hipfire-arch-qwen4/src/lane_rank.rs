@@ -602,7 +602,7 @@ impl LaneMeshExecutor for LocalLaneRank<'_> {
         // Lab oracle of the batched head round: serial vs batched on scratch
         // twins of this round's lanes, before the round's own work.
         #[cfg(feature = "lab")]
-        if crate::lab_draft_rounds::probe_enabled() && round.ops.len() >= 2 {
+        if crate::lab_draft_rounds::probe_enabled(bundle) && round.ops.len() >= 2 {
             let inputs: Vec<(u32, usize)> =
                 round.ops.iter().map(|op| (op.input, op.position)).collect();
             crate::lab_draft_rounds::probe_round(bundle, gpu, &mut lanes, &inputs, 0, round.round)

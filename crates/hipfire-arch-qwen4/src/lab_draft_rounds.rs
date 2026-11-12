@@ -32,9 +32,10 @@ use std::sync::{Arc, Mutex};
 /// Directory the per-rank probe files are written to.
 pub(crate) const PROBE_DIR_ENV: &str = "HIPFIRE_LAB_MTP_ROUNDS_PROBE_DIR";
 
-/// Whether the probe is armed: its directory is set and the batched rounds are on.
-pub(crate) fn probe_enabled() -> bool {
-    crate::mtp_gpu::draft_rounds_enabled()
+/// Whether the probe is armed: its directory is set and the bundle's batched rounds are on
+/// (the rows scratch is allocated).
+pub(crate) fn probe_enabled(bundle: &crate::bundle::Qwen4Bundle) -> bool {
+    bundle.mtp_rows_ready()
         && hipfire_config::developer_var(PROBE_DIR_ENV).is_ok_and(|dir| !dir.is_empty())
 }
 

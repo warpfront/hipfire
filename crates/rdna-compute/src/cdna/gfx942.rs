@@ -27,6 +27,16 @@ pub use qsa_lanes::{
 };
 pub(crate) use qsa_lanes::{Qwen4QsaLaneDesc, Qwen4QsaLanesShape, QsaLanesTableCache};
 
+// x-batched MQ2G256V2 GEMV of the MTP draft head's ranking (one weight pass for up to eight
+// rows, bit-equal to the one-row GEMV): a child module so it reaches the private
+// `Gfx942Device` borrow.
+#[path = "gfx942_mq2_xbatch.rs"]
+mod mq2_xbatch;
+pub use mq2_xbatch::{
+    qwen4_g942_mq2_xbatch_covers, qwen4_g942_mq2_xbatch_entry, QWEN4_G942_MQ2_XBATCH_MAX_ROWS,
+    QWEN4_G942_MQ2_XBATCH_MODULE,
+};
+
 const GROUPED_OLORA_E8_SRC: &str =
     include_str!("../../../../kernels/src/gemv_mfp4g32_e8_soa_grouped.gfx942.hip");
 const GROUPED_OLORA_E8_KERNEL: &str = "gemv_mfp4g32_e8_soa_grouped_gfx942";
