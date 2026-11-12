@@ -379,6 +379,10 @@ pub(crate) fn ep_mesh_lane_floor_enabled() -> bool {
 
 const LANE_MAX_DRAFTS: usize = crate::gpu_forward_lanes::LANE_MAX_ROWS - 1;
 
+/// The gfx942 lane profile's static drafting depth ([`LaneCostProfile::gfx942`]):
+/// the C8 program's K = 3 window (4 verify rows per lane).
+const GFX942_LANE_STATIC_DEPTH: usize = 3;
+
 /// `HIPFIRE_QWEN4_LANE_COST` (developer; `0` opts out): the measured lane
 /// cost profile of an arch ([`LaneCostProfile::for_arch`]). Off, every arch
 /// runs the gfx1151-prior, store-pooled, probe-budget-retire lane floor
@@ -441,6 +445,9 @@ pub(crate) struct LaneCostProfile {
     /// Most verify rows one step may carry before its rows spill into a second
     /// once-over-all-rows group (0: the step's rows are not capped).
     step_rows: usize,
+    /// A static drafting depth every window of a lane takes (0: the floor and
+    /// the cost tables choose it). No floor, calibration or retirement runs.
+    static_depth: usize,
 }
 
 impl LaneCostProfile {
@@ -452,6 +459,7 @@ impl LaneCostProfile {
         retire_after: FLOOR_PROBE_WINDOWS,
         probe_tokens: 0,
         step_rows: 0,
+        static_depth: 0,
     };
 
     /// The gfx1201 (EP2 R9700) profile under the singleton's retire rules.
@@ -467,6 +475,26 @@ impl LaneCostProfile {
             } else {
                 0
             },
+            static_depth: 0,
+        }
+    }
+
+    /// The exact-gfx942 (MI300X) profile: a **static drafting depth of
+    /// [`GFX942_LANE_STATIC_DEPTH`] at every lane window**, no floor, no
+    /// calibration, no retirement. This is the C8 wide-verify program's
+    /// measured-cost row **placeholder**: it is replaced by the measured lane
+    /// cycle cost (the per-depth window price of the C8 lane step) once that
+    /// is published. The remaining fields are the legacy ones; they are inert
+    /// with the floor off.
+    pub(crate) fn gfx942() -> Self {
+        Self {
+            name: "gfx942",
+            prior_us: COST_PRIOR_US,
+            per_request: false,
+            retire_after: FLOOR_PROBE_WINDOWS,
+            probe_tokens: 0,
+            step_rows: 0,
+            static_depth: GFX942_LANE_STATIC_DEPTH,
         }
     }
 
@@ -485,6 +513,7 @@ impl LaneCostProfile {
     fn for_arch_with(arch: &str, enabled: bool) -> Self {
         match arch {
             "gfx1201" if enabled => Self::gfx1201(),
+            "gfx942" if enabled => Self::gfx942(),
             _ => Self::LEGACY,
         }
     }
@@ -566,6 +595,8 @@ impl LaneSpecPolicy {
     ) -> Self {
         let mut floor = profile.floor();
         floor.set_capacity(max_k);
+        // A static-depth profile runs no floor at all: nothing observes, prices or retires.
+        let floor_enabled = floor_enabled && profile.static_depth == 0;
         let floor = floor_with_call_log(floor, "lane", floor_enabled);
         Self {
             agreement,
@@ -699,6 +730,11 @@ impl LaneSpecPolicy {
             0 => LaneRoute::ArSynced,
             k_max => LaneRoute::Batched { k_max },
         };
+        // A static-depth profile (gfx942): every window drafts its depth, the
+        // floor and the tables never consulted.
+        if self.profile.static_depth > 0 {
+            return batched(self.profile.static_depth);
+        }
         if !self.floor_enabled {
             let static_depth = self.floor.provisional_depth(&self.agreement, k);
             let depth = match depth_costs {
@@ -2488,7 +2524,7 @@ mod tests {
 
     #[test]
     fn profiles_follow_the_arch_and_gfx1151_stays_legacy() {
-        for arch in ["gfx1151", "gfx1100", "gfx1200", "gfx942", "", "gfx1201x"] {
+        for arch in ["gfx1151", "gfx1100", "gfx1200", "", "gfx1201x", "gfx940", "gfx9420"] {
             assert_eq!(
                 LaneCostProfile::for_arch_with(arch, true),
                 LaneCostProfile::LEGACY,
@@ -2510,6 +2546,39 @@ mod tests {
         let own = lane.cost.as_ref().expect("per-request fit");
         assert_eq!(fit_array(own), COST_PRIOR_GFX1201_US);
         assert_eq!(own.observed(), 0);
+    }
+
+    #[test]
+    fn gfx942_lanes_draft_a_static_depth_three_with_no_floor() {
+        let p = LaneCostProfile::for_arch_with("gfx942", true);
+        assert_eq!(p.name(), "gfx942");
+        assert_eq!(p.static_depth, 3);
+        // The kill switch (HIPFIRE_QWEN4_LANE_COST=0) is the legacy floor.
+        assert_eq!(
+            LaneCostProfile::for_arch_with("gfx942", false),
+            LaneCostProfile::LEGACY
+        );
+        // Even with the floor requested, no floor runs and every window drafts 3.
+        let mut policy = LaneSpecPolicy::with_profile(7, true, &p);
+        assert!(!policy.floor_enabled && !policy.retired());
+        for _ in 0..40 {
+            assert_eq!(
+                policy.route(7, LabRoutes::Floor, None),
+                LaneRoute::Batched { k_max: 3 }
+            );
+        }
+        // The window budget still caps it; a zero budget is an AR window.
+        assert_eq!(
+            policy.route(2, LabRoutes::Floor, None),
+            LaneRoute::Batched { k_max: 2 }
+        );
+        assert_eq!(policy.route(0, LabRoutes::Floor, None), LaneRoute::ArSynced);
+        // A lane capped at two drafts (k = 2) never exceeds its own capacity.
+        let mut small = LaneSpecPolicy::with_profile(2, true, &p);
+        assert_eq!(
+            small.route(7, LabRoutes::Floor, None),
+            LaneRoute::Batched { k_max: 2 }
+        );
     }
 
     #[test]

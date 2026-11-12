@@ -178,6 +178,12 @@ impl LaneProto {
         })
     }
 
+    /// Bind the lane cost profile of `arch` at the root, before the first lane is admitted
+    /// ([`crate::mesh_lane_protocol::MeshRoot::bind_cost_arch`]).
+    pub(crate) fn bind_cost_arch(&mut self, arch: &str) {
+        self.root.bind_cost_arch(arch);
+    }
+
     /// A lane's first decode step: the root learns the request (the seed is
     /// the prompt-completing pick, or the promoted singleton's pending seed).
     pub(crate) fn admit_decoding(&mut self, a: DecodeAdmission<'_>) -> Result<(), String> {
