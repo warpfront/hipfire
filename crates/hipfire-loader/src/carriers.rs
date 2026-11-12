@@ -11486,6 +11486,8 @@ impl Carrier for Qwen35Carrier {
         synthetic: &[u32],
     ) -> Option<Option<String>> {
         let b = m.qwen35_mut().unwrap();
+        // The ordinary prefill leaves the canonical GDN stream Open; decode (the timed
+        // loop that follows) reads the sealed planes, so seal once at the prompt end.
         Some(
             hipfire_arch_qwen35::qwen35::forward_prefill_batch(
                 gpu,
@@ -11501,6 +11503,7 @@ impl Carrier for Qwen35Carrier {
                 None,
                 None,
             )
+            .and_then(|()| b.dn_state.seal_streams(gpu, synthetic.len()))
             .err()
             .map(|e| format!("{e:?}")),
         )
