@@ -35,7 +35,7 @@ use rdna_compute::Gpu;
 /// combined production policy, the all-rows HC / stage / MoE segments engaged (step trace
 /// `hc_allrows=true stages_allrows=true moe=allrows`). It proves the combined policy only, like
 /// [`GFX942_STOCK_FP8_RECEIPT`](crate::gpu_forward_lanes::GFX942_STOCK_FP8_RECEIPT), and binds
-/// [`QWEN4_G942_LANE_ALLROWS_DEFAULT`](rdna_compute::feature_flags::QWEN4_G942_LANE_ALLROWS_DEFAULT).
+/// the exact-gfx942 all-rows flags, which are always on there.
 pub const GFX942_STOCK_FP8_ALLROWS_RECEIPT: &str = "g0 mi300x/beat/L/l1-out/g0-final+ctl-final 2026-11-10 gfx942 stock-fp8 single, all-rows k=16/32/64 ctx 64/512/2048 steps 64, combined policy only, fn_lane_oracle sha256 3699aa99dddfc788 rc=0, with C0 2028a9d12e";
 
 /// Widest all-rows step the receipt covers: the wide-verify row bound the HC all-rows arms admit
@@ -97,13 +97,10 @@ mod tests {
         assert!(moe_refusal(true, true, 16, true).is_some());
     }
 
-    /// The gfx942 all-rows flags default on only with a receipt that cites the oracle run.
+    /// The gfx942 all-rows flags are on by arch only with a receipt that cites the oracle run.
     #[test]
-    fn gfx942_all_rows_default_on_needs_the_receipt() {
-        assert_eq!(
-            rdna_compute::feature_flags::QWEN4_G942_LANE_ALLROWS_DEFAULT,
-            !GFX942_STOCK_FP8_ALLROWS_RECEIPT.is_empty()
-        );
+    fn gfx942_all_rows_on_needs_the_receipt() {
+        assert!(!GFX942_STOCK_FP8_ALLROWS_RECEIPT.is_empty());
         assert!(G942_ALLROWS_MAX_ROWS >= 64);
     }
 }

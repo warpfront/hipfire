@@ -976,9 +976,7 @@ request run alone on the singleton route. **Default off, experimental.**
   expert class) but not every single-stage probe, so gfx942 shares all of
   those stages or none; the GDN and QSA cores run one launch per lane there.
   Steps of 9..=64 rows (more than 8 lanes) run those shared stages, and the
-  routed MoE, once over all rows (`HIPFIRE_QWEN4_LANE_HC_ALLROWS`,
-  `HIPFIRE_QWEN4_LANE_ALLROWS`, `HIPFIRE_QWEN4_LANE_ALLROWS_MOE`, default on
-  for gfx942, `=0` kills; G0 identical to the singletons at 16 / 32 / 64
+  routed MoE, once over all rows (always on for gfx942 by arch, no env switch; G0 identical to the singletons at 16 / 32 / 64
   lanes, see [env-vars.md](env-vars.md)).
   Measured on one MI300X (`hipfire bench --backend batch`, 16 prompts x 128
   tokens, 4 fresh loads): C8 151 tok/s aggregate (TTFT 1.88 s, 208 tok/s

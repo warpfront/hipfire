@@ -4038,7 +4038,7 @@ pub fn execute_gated_delta_net_core_lanes(
     ops: &[&GatedDeltaNetOp<'_>],
     before_launch: impl FnOnce(&mut Gpu) -> Result<(), DispatchError>,
 ) -> Result<bool, DispatchError> {
-    // Exact gfx942 (`HIPFIRE_QWEN4_GDN_LANES`, default off): the one-row F32 lanes'
+    // Exact gfx942: the one-row F32 lanes'
     // recurrence as one launch over every lane (`pipeline/gdn.rs`); a group it declines
     // falls through to the gfx11+ multi-lane kernels below, which refuse it too.
     let before_launch =
@@ -5716,7 +5716,7 @@ pub fn execute_indexed_attention_core_lanes(
             }
         })
         .collect();
-    // Exact gfx942 (`HIPFIRE_QWEN4_QSA_LANES`, default off): five launches over every lane
+    // Exact gfx942: five launches over every lane
     // (`pipeline/qsa.rs`); the gfx1201 kernels below are not admitted there.
     if gpu.arch_caps.is_gfx942() {
         return super::qsa::execute_core_lanes_gfx942(gpu, &lanes, before_launch);

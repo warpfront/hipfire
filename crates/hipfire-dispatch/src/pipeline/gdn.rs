@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Björn Bösel
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Exact-gfx942 batched GDN decode Core for lane steps (`HIPFIRE_QWEN4_GDN_LANES`).
+//! Exact-gfx942 batched GDN decode Core for lane steps.
 //!
 //! On gfx942 a one-row lane's GDN Core is the persistent-batch branch of
 //! [`super::layer_ops::execute_gated_delta_net`]: convolution + gate parameters
@@ -42,12 +42,11 @@ pub(crate) enum Gfx942GdnLanes<F> {
 }
 
 /// Whether this context runs the gfx942 batched GDN lanes core at all: exact
-/// gfx942, `HIPFIRE_QWEN4_GDN_LANES` on (default off there), no replay tape
+/// gfx942 (always on there, resolved by arch), no replay tape
 /// recording (the device lane table is not a declared kernel input) and no graph
 /// capture (a lane set's table is staged on first use, which a capture cannot do).
 pub(crate) fn lanes_f32_gfx942_admitted(gpu: &Gpu) -> bool {
     gpu.arch_caps.is_gfx942()
-        && gpu.flags.qwen4_gdn_lanes_enabled()
         && !gpu.replay.is_recording()
         && !gpu.graphs.capture_mode
 }

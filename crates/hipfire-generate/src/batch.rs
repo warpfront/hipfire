@@ -3351,11 +3351,12 @@ pub fn batch_request_eligible_for_route(
 }
 
 /// gfx942 single-device fn-lanes (P2): an eligible request that finds no peer queued waits up to
-/// `HIPFIRE_G942_BURST_GAP_MS` for one, so a burst enters the lane driver together (one prefill
-/// wave) instead of its first request starting as an AR singleton (`..._LANE_PREFILL_WAVE=0` kills).
+/// `g942_wave::BURST_GAP` (4 ms; G12's single admission-coalescing rule replaces it) for one, so
+/// a burst enters the lane driver together (one prefill wave) instead of its first request
+/// starting as an AR singleton.
 fn g942_burst_peer(m: &LoadedModel, inbox: &mut DaemonInbox) -> bool {
     use hipfire_arch_qwen4::lane_exec::g942_wave;
-    let gap = g942_wave::burst_gap().filter(|_| m.qwen4().is_some_and(g942_wave::serve_armed));
+    let gap = m.qwen4().is_some_and(g942_wave::serve_armed).then_some(g942_wave::BURST_GAP);
     let start = Instant::now();
     while gap.is_some_and(|gap| start.elapsed() < gap) {
         if inbox.has_pending_batch_generate() {

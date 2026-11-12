@@ -41,8 +41,8 @@
 //! a layer) against the batched launches (5 a layer, admission included), median and min..max
 //! over `--reps` timed passes after `--warm` warm-up passes, 1 GiB cache scrub between reps.
 //!
-//! `HIPFIRE_QWEN4_QSA_LANES` need not be set: the oracle turns the flag on in its own `Gpu`.
-//! Exit 0 and `qsa_lanes_gfx942_oracle: PASS` only if every case and every control passes.
+//! The QSA lanes route is on by arch on gfx942; the oracle sets the flag in its own `Gpu` regardless.
+
 //!
 //! `cargo run --release -p rdna-compute --example qsa_lanes_gfx942_oracle --
 //!    [--formats f32,fnuz] [--lanes 1,8,64] [--ctxs 64,2048,16384] [--steps 2] [--seed U64]
