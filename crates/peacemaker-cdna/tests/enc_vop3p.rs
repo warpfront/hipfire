@@ -841,7 +841,11 @@ fn oracle_fma_mix_f32_full_selection_space() {
     assert_eq!(cases.len(), 7 * FMA_MIX_SELECTIONS);
     let llvm = check_vop3p_round_trip(&cases);
     let distinct: std::collections::HashSet<&Vec<u8>> = llvm.iter().collect();
-    assert_eq!(distinct.len(), cases.len(), "llvm bytes are pairwise distinct");
+    assert_eq!(
+        distinct.len(),
+        cases.len(),
+        "llvm bytes are pairwise distinct"
+    );
 }
 
 /// llvm-mc spells `NEG_HI` for `v_fma_mix_f32` as `|src|`: it assembles every
