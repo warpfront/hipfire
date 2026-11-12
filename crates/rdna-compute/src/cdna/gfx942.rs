@@ -3464,9 +3464,34 @@ mod tests {
             rest = &body[end + END.len()..];
         }
         assert_eq!(
-            blocks, 9,
-            "bf16 helpers, Q8 helpers, barrier, Q8 peak, persistent body, capture + rollback \
-             wrappers, convolution + parameters, gated norm"
+            blocks, 8,
+            "bf16 helpers, Q8 helpers, barrier, Q8 peak, persistent body, capture wrapper, \
+             convolution + parameters, gated norm"
+        );
+        // The rollback wrapper is the production wrapper with exactly one edit: the layer table
+        // and the pointers loaded from it go through address space 1 (global).
+        const BEGIN_WRAP: &str = "// BEGIN derived tensor_ops.hip rollback wrapper (global lane table)\n";
+        const END_WRAP: &str = "// END derived tensor_ops.hip rollback wrapper (global lane table)";
+        let at = src.find(BEGIN_WRAP).expect("derived wrapper marker") + BEGIN_WRAP.len();
+        let derived = &src[at..at + src[at..].find(END_WRAP).unwrap()];
+        let derived = &derived[derived.find("#define QWEN4_G942_GDN_GLOBAL").unwrap()..];
+        let head = "__launch_bounds__(256)\nextern \"C\" __global__ void gated_delta_rollback_layers_f32(";
+        let from = production.find(head).expect("production rollback wrapper");
+        let wrapper = &production[from..];
+        let wrapper = &wrapper[..wrapper.find("\n}\n").unwrap() + 2];
+        let loads = "    const float* recurrence = reinterpret_cast<const float*>(table[2 * blockIdx.y]);\n    float* ring = reinterpret_cast<float*>(table[2 * blockIdx.y + 1]);\n";
+        assert_eq!(wrapper.matches(loads).count(), 1);
+        let expected = format!(
+            "#define QWEN4_G942_GDN_GLOBAL __attribute__((address_space(1)))\n{}",
+            wrapper.replace(
+                loads,
+                "    const unsigned long long QWEN4_G942_GDN_GLOBAL* table_g =\n        (const unsigned long long QWEN4_G942_GDN_GLOBAL*)table;\n    const float* recurrence =\n        (const float*)(const float QWEN4_G942_GDN_GLOBAL*)table_g[2 * blockIdx.y];\n    float* ring = (float*)(float QWEN4_G942_GDN_GLOBAL*)table_g[2 * blockIdx.y + 1];\n"
+            )
+        );
+        assert_eq!(
+            derived.trim_end_matches('\n'),
+            expected.trim_end_matches('\n'),
+            "the rollback wrapper drifted from tensor_ops.hip's"
         );
         // gfx942 never defines the gfx12-only staged parameter pass.
         assert!(!src.contains("#define GDN_PERSISTENT_STAGED"));

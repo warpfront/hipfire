@@ -597,20 +597,27 @@ extern "C" __global__ void qwen4_g942_gdn_verify_capture_f32(
 }
 // END verbatim tensor_ops.hip
 
-// BEGIN verbatim tensor_ops.hip
+// BEGIN derived tensor_ops.hip rollback wrapper (global lane table)
+// The layer table's pointers are loaded through address space 1 (global), so the table loads and
+// every access of the body through them compile to global_* (a generic pointer loaded from memory
+// would make them flat_*); the body is untouched.
+#define QWEN4_G942_GDN_GLOBAL __attribute__((address_space(1)))
 __launch_bounds__(256)
 extern "C" __global__ void qwen4_g942_gdn_verify_rollback_f32(
     const unsigned long long* table, float* discard, int rows, int keep, int from, int to,
     int qkv_width, int key_heads, int value_heads, float query_scale) {
-    const float* recurrence = reinterpret_cast<const float*>(table[2 * blockIdx.y]);
-    float* ring = reinterpret_cast<float*>(table[2 * blockIdx.y + 1]);
+    const unsigned long long QWEN4_G942_GDN_GLOBAL* table_g =
+        (const unsigned long long QWEN4_G942_GDN_GLOBAL*)table;
+    const float* recurrence =
+        (const float*)(const float QWEN4_G942_GDN_GLOBAL*)table_g[2 * blockIdx.y];
+    float* ring = (float*)(float QWEN4_G942_GDN_GLOBAL*)table_g[2 * blockIdx.y + 1];
     const size_t state = (size_t)value_heads * 128 * 128;
     const size_t gate = (size_t)rows * qkv_width;
     gated_delta_step_persistent256_body<true>(recurrence, recurrence + gate,
         recurrence + gate + (size_t)rows * value_heads, ring + from * state, discard,
         ring + to * state, keep, qkv_width, key_heads, value_heads, 128, 128, query_scale);
 }
-// END verbatim tensor_ops.hip
+// END derived tensor_ops.hip rollback wrapper (global lane table)
 
 // BEGIN verbatim tensor_ops.hip
 static __device__ __forceinline__ void gated_delta_params_flat(
