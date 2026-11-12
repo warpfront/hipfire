@@ -112,6 +112,12 @@ required-features = ["lab"]
 name = "qwen4_mtp_g942_cost"
 required-features = ["lab"]
 
+# gfx942 single-row QSA attention module: exact-image byte oracle (module vs tensor_ops entries
+# vs the public launcher; HIPFIRE_QWEN4_G942_QSA_ROW_IMAGE honored).
+[[example]]
+name = "qwen4_g942_qsa_row_oracle"
+required-features = ["lab"]
+
 # G3 head-logit oracle: stock-FP8 `<model>.mtp` sidecar head logits at N positions + the exact head inputs
 # (`beat/M/g3`). `reference-parity` supplies `wide_verify_oracle::dev_head_chain` (a head step on an explicit
 # backbone hidden); `lab` supplies `Qwen4MtpDrafter::lab_pending_hidden_bytes`.

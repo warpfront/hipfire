@@ -1115,6 +1115,16 @@ pub fn lab_ensure_tensor_ops_kernel(gpu: &mut Gpu, kernel: &str) -> HipResult<()
     gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)
 }
 
+/// Load the single-row QSA attention entry `kernel` (a `tensor_ops` name) the way the public
+/// launcher does and return the symbol to launch: on exact gfx942 the `qwen4_g942_qsa_row_*`
+/// entry of the gfx942 row module (hipcc source, or the `HIPFIRE_QWEN4_G942_QSA_ROW_IMAGE` code
+/// object), elsewhere `kernel` itself from `tensor_ops`. The module under test of
+/// `qwen4_g942_qsa_row_oracle`, which launches it directly through [`Gpu::launch_kernel_blob`].
+#[doc(hidden)]
+pub fn lab_ensure_qsa_row_entry(gpu: &mut Gpu, kernel: &'static str) -> HipResult<&'static str> {
+    crate::cdna::gfx942::ensure_qsa_row_kernel(gpu, kernel)
+}
+
 /// Single-launch rollback kernel of a state's STORAGE format. Q8Ef has no
 /// single-launch kernel: its rollback must carry the residual and runs
 /// [`gated_delta_rollback_layers_ef`] instead.
