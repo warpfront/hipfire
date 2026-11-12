@@ -5,10 +5,10 @@
 //! The EXACT expert-parallel prefill wave: one joint forward of several lanes' prompt tiles on an
 //! EP rank whose rows are per-slot independent (BEAT-PAITON S1): a lane's bytes do not depend on
 //! the other lanes of the wave. The wave runs the sub-512 product routes outside the
-//! ordinary-prefill intent (`ordinary_prefill_applies`), while a lane's serial prefill tile runs
-//! the canonical recipe under it, so a wave lane is distribution-equivalent, not byte-identical,
-//! to its serial tile (lane prefill is distribution-equivalent by design); `serve.batch_exact`
-//! lanes never wave.
+//! ordinary-prefill intent (`ordinary_prefill_applies`), as a distribution-equivalent lane's
+//! serial prefill tile does (lane prefill is distribution-equivalent by design, not
+//! chunk-invariant); `serve.batch_exact` lanes take the canonical recipe under the intent and
+//! never wave.
 //!
 //! A sub-512-row lane tile runs the EP FULL-TABLE MoE: every rank computes every expert of the
 //! layer (peer tables over P2P, host-mapped arenas), no gather, no tile exchange, so its cost is
@@ -1375,7 +1375,7 @@ mod tests {
         assert!(mark < run.find("self.enter_tile_scopes(gpu, scope_rows)").unwrap());
         let forward = include_str!("../gpu_forward.rs");
         assert!(forward.contains(
-            "ordinary_prefill_applies(self.prefill_scope, self.wave_route.is_some(), &gpu.arch)"
+            "ordinary_prefill_applies(\n            self.prefill_scope,\n            self.wave_route.is_some(),\n            lane_distribution,"
         ));
     }
 

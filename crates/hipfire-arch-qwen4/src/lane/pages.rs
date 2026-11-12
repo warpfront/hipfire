@@ -1285,18 +1285,22 @@ impl Qwen4Bundle {
         }
     }
 
-    /// The routing rows a SERIAL prefill tile of `rows` rows runs at on this bundle's forward
-    /// (prefill scope, no wave: `Qwen4GpuForward::tile_route_rows`); `rows` without a forward.
-    /// Host flags only, every scope restored. The elastic accounting reads this, never the bare
-    /// `Gpu::route_rows` outside the tile's scopes (which misses the ordinary-prefill intent).
-    pub(crate) fn serial_prefill_tile_route_rows(&mut self, gpu: &mut Gpu, rows: usize) -> usize {
+    /// The routing rows a SERIAL lane prefill tile of `rows` rows runs at on this bundle's forward
+    /// (prefill and lane scope, no wave: `Qwen4GpuForward::tile_route_rows`); `rows` without a
+    /// forward. A distribution-equivalent lane tile routes at its own rows; a `serve.batch_exact`
+    /// lane tile runs under the ordinary-prefill intent and routes at the canonical chunk. Host
+    /// flags only, every scope restored. The elastic accounting reads this, never the bare
+    /// `Gpu::route_rows` outside the tile's scopes (which misses the intent).
+    pub(crate) fn lane_prefill_tile_route_rows(&mut self, gpu: &mut Gpu, rows: usize) -> usize {
         let Some(forward) = self.execution.as_mut() else {
             return rows;
         };
         let prefill = std::mem::replace(&mut forward.prefill_scope, true);
+        let lane = std::mem::replace(&mut forward.lane_scope, true);
         let wave = forward.wave_route.take();
         let route_rows = forward.tile_route_rows(gpu, rows);
         forward.prefill_scope = prefill;
+        forward.lane_scope = lane;
         forward.wave_route = wave;
         route_rows
     }

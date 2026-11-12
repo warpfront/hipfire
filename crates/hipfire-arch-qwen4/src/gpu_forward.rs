@@ -476,15 +476,24 @@ fn native_trunk_prefill_scope(
 
 /// Whether an ordinary prefill forward runs under the canonical-recipe intent
 /// ([`Gpu::ordinary_prefill_enter`]): every prefill forward, one-row tails included, except a
-/// lane prefill WAVE (`wave`: [`ep_wave::EpWaveRoute`] set by `ep_wave_run` and by its admission
-/// probe `ep_wave_facts`) and gfx942, whose pinned canonical-routing scope and AR route stay as
-/// they are. A wave concatenates several lanes' rows into its joint stages, which reproduce each
-/// lane's rows only on the sub-512 product routes under the wave's routing-row cap
-/// (`QWEN4_EXACT_WAVE_ROUTE_ROWS_CAP`); the intent would route every call at the canonical chunk
-/// past that cap. Lane prefill is distribution-equivalent by design (see
-/// [`ep_a8_scope_applies`]), so the wave keeps the product routes.
-pub(crate) fn ordinary_prefill_applies(prefill_scope: bool, wave: bool, arch: &str) -> bool {
-    prefill_scope && !wave && arch != "gfx942"
+/// distribution-equivalent serve lane forward and gfx942, whose pinned canonical-routing scope
+/// and AR route stay as they are. A lane forward is a prefill WAVE (`wave`:
+/// [`ep_wave::EpWaveRoute`] set by `ep_wave_run` and by its admission probe `ep_wave_facts`) or
+/// a serial lane prefill tile while `serve.batch_exact` is off (`lane_distribution`, the same
+/// fact [`ep_a8_scope_applies`] reads). A wave concatenates several lanes' rows into its joint
+/// stages, which reproduce each lane's rows only on the sub-512 product routes under the wave's
+/// routing-row cap (`QWEN4_EXACT_WAVE_ROUTE_ROWS_CAP`); the intent would route every call at the
+/// canonical chunk past that cap. Lane prefill is distribution-equivalent by design, so a lane
+/// tile keeps the product routes too (as before the canonical recipe: no 8192-row routing, no
+/// long-prefill weight shadows for a short tile); only `serve.batch_exact` lanes take the
+/// canonical recipe, byte-identical to the same prompt alone.
+pub(crate) fn ordinary_prefill_applies(
+    prefill_scope: bool,
+    wave: bool,
+    lane_distribution: bool,
+    arch: &str,
+) -> bool {
+    prefill_scope && !wave && !lane_distribution && arch != "gfx942"
 }
 
 /// Whether a forward of `rows` actual rows runs the EP symmetric-MoE A8 chain
@@ -15880,7 +15889,7 @@ impl Qwen4GpuForward {
             )));
         }
         let ordinary_scope =
-            ordinary_prefill_applies(route == MeshRoute::Prefill, false, &gpu.arch);
+            ordinary_prefill_applies(route == MeshRoute::Prefill, false, false, &gpu.arch);
         let ordinary = ordinary_scope.then(|| gpu.ordinary_prefill_enter());
         let (pm_invariant, append) = if ordinary_scope {
             (false, false)
@@ -16170,9 +16179,16 @@ impl Qwen4GpuForward {
         // Ordinary prefill takes the typed intent instead of the invariant profile / agent-turn
         // append scopes: the canonical recipe for every row, never the append route's
         // symmetric-MoE suppression or the invariant profile's trunk IU4 exclusion. A lane
-        // prefill wave (`wave_route` set) keeps the product routes under its routing-row cap.
-        let ordinary_scope =
-            ordinary_prefill_applies(self.prefill_scope, self.wave_route.is_some(), &gpu.arch);
+        // prefill wave (`wave_route` set) keeps the product routes under its routing-row cap, and
+        // a distribution-equivalent lane tile (`serve.batch_exact` off) the product routes.
+        let lane_distribution = self.lane_scope
+            && hipfire_config::qwen4_lane_row_exact() == hipfire_config::LaneRowExact::Off;
+        let ordinary_scope = ordinary_prefill_applies(
+            self.prefill_scope,
+            self.wave_route.is_some(),
+            lane_distribution,
+            &gpu.arch,
+        );
         let ordinary = ordinary_scope.then(|| gpu.ordinary_prefill_enter());
         let (pm_invariant, append) = if ordinary_scope {
             (false, false)
@@ -16209,13 +16225,7 @@ impl Qwen4GpuForward {
         // an ordinary prefill computes its rows exactly as the full chunk would.
         let ep_a8 = std::mem::replace(
             &mut gpu.qwen4_ep_a8_scope,
-            ep_a8_scope_applies(
-                self.ep.is_some(),
-                ordinary_scope,
-                self.lane_scope
-                    && hipfire_config::qwen4_lane_row_exact() == hipfire_config::LaneRowExact::Off,
-                rows,
-            ),
+            ep_a8_scope_applies(self.ep.is_some(), ordinary_scope, lane_distribution, rows),
         );
         // The owner-routed symmetric IU4 tile route's row floor (`HIPFIRE_EP_PREFILL_TILE_MIN_ROWS`):
         // lowered only for a PREFILL forward (`prefill_scope`: never decode, verify or the MTP head)
@@ -20205,22 +20215,35 @@ mod tests {
         }
     }
 
-    /// A lane prefill wave never runs under the ordinary-prefill intent: its joint stages
-    /// concatenate several lanes' rows, and under the intent the canonical routing rows (8192)
-    /// select the packed BF16 HC streams the lanes' own PLE conv / final HC read addressed at the
-    /// F32 row pitch (19/32 corrupted code C8 streams on `abdff7e047`). Every other prefill
-    /// forward keeps the intent (gfx942 never takes it).
+    /// A serve lane prefill forward never runs under the ordinary-prefill intent unless it is
+    /// under `serve.batch_exact`. A wave's joint stages concatenate several lanes' rows, and under
+    /// the intent the canonical routing rows (8192) select the packed BF16 HC streams the lanes'
+    /// own PLE conv / final HC read addressed at the F32 row pitch (19/32 corrupted code C8 streams
+    /// on `abdff7e047`). A distribution-equivalent serial lane tile keeps the product routes too
+    /// (decision (a)): under the intent a 59-row tile routed at 8192 rows, rebuilt the 946 MiB
+    /// long-prefill weight shadows and ran ~27 ms slower than base (j9715). Every other prefill
+    /// forward (single request, session resume, `serve.batch_exact` lanes) keeps the intent;
+    /// gfx942 never takes it.
     #[test]
-    fn a_lane_wave_never_takes_the_ordinary_prefill_intent() {
+    fn a_distribution_equivalent_lane_never_takes_the_ordinary_prefill_intent() {
         use super::ordinary_prefill_applies as ordinary;
         for arch in ["gfx1201", "gfx1151", "gfx1100", "gfx942"] {
-            assert!(!ordinary(true, true, arch), "{arch} wave");
-            assert!(!ordinary(false, true, arch), "{arch} non-prefill wave flag");
-            assert!(!ordinary(false, false, arch), "{arch} decode / verify");
+            for lane in [false, true] {
+                assert!(!ordinary(true, true, lane, arch), "{arch} wave");
+                assert!(
+                    !ordinary(false, true, lane, arch),
+                    "{arch} non-prefill wave"
+                );
+                assert!(
+                    !ordinary(false, false, lane, arch),
+                    "{arch} decode / verify"
+                );
+            }
+            assert!(!ordinary(true, false, true, arch), "{arch} lane tile");
             assert_eq!(
-                ordinary(true, false, arch),
+                ordinary(true, false, false, arch),
                 arch != "gfx942",
-                "{arch} prefill"
+                "{arch} prefill or batch_exact lane tile"
             );
         }
     }

@@ -1087,10 +1087,11 @@ fn elastic_step_maps_past_charge(
 /// Whether the step holds a long prefill for the elastic reserve (`prefill`: `(rows, MTP lane)`
 /// of its prefill tiles in plan order): a SERIAL tile of the parts [`run_prefill_tiles`] then
 /// runs ([`step_prefill_parts`]) whose routing rows AS THE FORWARD RUNS IT
-/// (`Qwen4Bundle::serial_prefill_tile_route_rows`) reach the F16 shadow floor
-/// ([`serial_tiles_long`]). Under the ordinary-prefill intent that is every serial tile whatever
-/// its extent: a 59-row lane tile routes at the canonical chunk, builds the long-prefill caches
-/// and allocates its canonical scratch. Empty `prefill` (the reserve off, or no prefill tile):
+/// (`Qwen4Bundle::lane_prefill_tile_route_rows`) reach the F16 shadow floor
+/// ([`serial_tiles_long`]). A `serve.batch_exact` lane tile runs under the ordinary-prefill
+/// intent, so whatever its extent it routes at the canonical chunk, builds the long-prefill
+/// caches and allocates its canonical scratch; a distribution-equivalent lane tile routes at its
+/// own rows (long only from 512). Empty `prefill` (the reserve off, or no prefill tile):
 /// `false` without a probe.
 fn elastic_step_long_prefill(
     bundle: &mut Qwen4Bundle,
@@ -1104,7 +1105,7 @@ fn elastic_step_long_prefill(
     let mtp: Vec<bool> = prefill.iter().map(|&(_, mtp)| mtp).collect();
     let (parts, _) = step_prefill_parts(bundle, gpu, &tile_rows, &mtp);
     serial_tiles_long(&parts, |i| {
-        bundle.serial_prefill_tile_route_rows(gpu, tile_rows[i])
+        bundle.lane_prefill_tile_route_rows(gpu, tile_rows[i])
     })
 }
 
@@ -2863,19 +2864,20 @@ mod wave_tests {
         &rest[..rest.find("\n}\n").expect("item end")]
     }
 
-    /// j9704 (FN EP2 serve, 8 lanes): a 59-row C1 lane tile runs under the ordinary-prefill
-    /// intent, routes at the canonical chunk and rebuilds the long-prefill caches (946 MiB) plus
-    /// its 8192-row scratch, but the reclaim rule read `Gpu::route_rows(59)` outside the tile's
-    /// scopes, so the bank lent into the cold reserve stayed lent and the tile's `hipMalloc` ran
-    /// out of memory (rank pool poisoned). A serial tile counts by the routing rows it RUNS at;
-    /// a wave lane (under the wave's row cap) never does.
+    /// j9704 (FN EP2 serve, 8 lanes): a 59-row C1 lane tile ran under the ordinary-prefill
+    /// intent (as a `serve.batch_exact` lane tile still does), routed at the canonical chunk and
+    /// rebuilt the long-prefill caches (946 MiB) plus its 8192-row scratch, but the reclaim rule
+    /// read `Gpu::route_rows(59)` outside the tile's scopes, so the bank lent into the cold
+    /// reserve stayed lent and the tile's `hipMalloc` ran out of memory (rank pool poisoned). A
+    /// serial tile counts by the routing rows it RUNS at; a wave lane (under the wave's row cap)
+    /// never does.
     #[test]
     fn a_serial_tile_routing_at_the_canonical_chunk_is_a_long_prefill_whatever_its_rows() {
         let canonical = rdna_compute::prefill_invariant::QWEN4_PREFILL_CANON_ROWS;
         let serial = [PrefillPart::Serial(0)];
-        // The C1 tile: 59 rows, routed at the canonical chunk by the ordinary-prefill intent.
+        // A 59-row tile under the intent (a `serve.batch_exact` lane): the canonical chunk.
         assert!(serial_tiles_long(&serial, |_| canonical));
-        // The same tile on the product routes (no intent, e.g. gfx942) stays short.
+        // A distribution-equivalent lane tile on the product routes stays short.
         assert!(!serial_tiles_long(&serial, |_| 59));
         // A wave never asks: its lanes route under the wave cap.
         let wave = [PrefillPart::Wave(0..8)];
@@ -2898,7 +2900,7 @@ mod wave_tests {
 
     /// The reclaim-before-provision rule, pinned on the source (a device is needed to run it):
     /// provisioning prices the very parts the forward runs (`step_prefill_parts`), each serial
-    /// tile at the routing rows its scopes give it (`serial_prefill_tile_route_rows` probing
+    /// tile at the routing rows its scopes give it (`lane_prefill_tile_route_rows` probing
     /// `tile_route_rows`), and reclaims before any lane maps or forwards; the forward's own
     /// backstop reads the scoped rows too. No elastic predicate reads the bare
     /// `Gpu::route_rows` of a tile outside its scopes.
@@ -2919,10 +2921,11 @@ mod wave_tests {
         assert!(provision.contains("elastic_note_step_prefill(long_prefill)"));
         let long = fn_src(prod, "fn elastic_step_long_prefill(");
         assert!(long.contains("step_prefill_parts(bundle, gpu, &tile_rows, &mtp)"));
-        assert!(long.contains("bundle.serial_prefill_tile_route_rows(gpu, tile_rows[i])"));
+        assert!(long.contains("bundle.lane_prefill_tile_route_rows(gpu, tile_rows[i])"));
         let pages = include_str!("lane/pages.rs");
-        let probe = fn_src(pages, "    pub(crate) fn serial_prefill_tile_route_rows(");
+        let probe = fn_src(pages, "    pub(crate) fn lane_prefill_tile_route_rows(");
         assert!(probe.contains("std::mem::replace(&mut forward.prefill_scope, true)"));
+        assert!(probe.contains("std::mem::replace(&mut forward.lane_scope, true)"));
         assert!(probe.contains("forward.wave_route.take()"));
         assert!(probe.contains("forward.tile_route_rows(gpu, rows)"));
         // The step's note restarts the idle count once: its boundary consumes it, so the mesh
