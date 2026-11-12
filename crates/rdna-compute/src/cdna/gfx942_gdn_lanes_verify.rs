@@ -613,3 +613,55 @@ impl Gfx942Device<'_> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The helper blocks of the lanes module are `tensor_ops.hip`'s byte for byte, its pipe128
+    /// body is the capture lanes kernel's (itself pinned against `tensor_ops.hip`), and the
+    /// module defines exactly the three entries.
+    #[test]
+    fn gdn_lanes_verify_source_blocks_are_tensor_ops_and_the_capture_lanes_body() {
+        const BEGIN: &str = "// BEGIN verbatim tensor_ops.hip\n";
+        const END: &str = "// END verbatim tensor_ops.hip";
+        const BEGIN_BODY: &str = "// BEGIN derived tensor_ops.hip pipe128 body (final_out)\n";
+        const END_BODY: &str = "// END derived tensor_ops.hip pipe128 body (final_out)";
+        let src = QWEN4_G942_GDN_LANES_VERIFY_SRC;
+        let production = crate::tensor_ops::TENSOR_OPS_SRC;
+        let mut blocks = 0;
+        let mut rest = src;
+        while let Some(at) = rest.find(BEGIN) {
+            let body = &rest[at + BEGIN.len()..];
+            let end = body.find(END).expect("END marker after every BEGIN marker");
+            let block = body[..end].trim_end_matches('\n');
+            assert!(
+                production.contains(block),
+                "verbatim block {blocks} of qwen4_g942_gdn_lanes_verify.gfx942.hip is no longer \
+                 a substring of tensor_ops.hip\nblock starts: {:?}",
+                &block[..block.len().min(120)]
+            );
+            blocks += 1;
+            rest = &body[end + END.len()..];
+        }
+        assert_eq!(
+            blocks, 6,
+            "bf16 helpers, Q8 helpers, barrier, pipe128 helpers, gate parameters, gated norm"
+        );
+        let capture = super::super::QWEN4_GDN_LANES_CAPTURE_F32_SRC;
+        let derived = |s: &str| {
+            let at = s.find(BEGIN_BODY).expect("derived body marker") + BEGIN_BODY.len();
+            s[at..at + s[at..].find(END_BODY).unwrap()].to_string()
+        };
+        assert_eq!(derived(src), derived(capture), "pipe128 body drifted");
+        assert_eq!(src.matches("extern \"C\" __global__").count(), 3);
+        for entry in [
+            QWEN4_G942_GDN_LANES_CONV_PARAMS,
+            QWEN4_G942_GDN_LANES_STEP,
+            QWEN4_G942_GDN_LANES_GATE,
+        ] {
+            assert!(src.contains(&format!("void {entry}(")), "{entry}");
+        }
+        assert_eq!(src.matches("QWEN4_GDN_GLOBAL*").count(), 17);
+    }
+}
