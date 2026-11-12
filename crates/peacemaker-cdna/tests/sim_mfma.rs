@@ -3595,6 +3595,112 @@ fn fma_mix_f32_gfx942_output_flush_is_tiny_after_unbounded_rounding() {
     );
 }
 
+#[test]
+fn fma_mix_f32_gfx942_inline_float_uses_selected_precision_rom() {
+    // MI300X r2: half inline 1.0 is 0x00003c00. Low selection is 1;
+    // high selection is zero, not the high half of f32 0x3f800000.
+    for pos in 0..3 {
+        for high in [false, true] {
+            for negate in [false, true] {
+                let mut w = new_wave();
+                for (reg, value) in [2.0f32, 3.0, 4.0].into_iter().enumerate() {
+                    w.v[reg + 1] = [value.to_bits(); 64];
+                }
+                let mut src = [Src::Vgpr(1), Src::Vgpr(2), Src::Vgpr(3)];
+                src[pos] = Src::Float(InlineFloat::One);
+                vexec(
+                    &mut w,
+                    vop3p(
+                        Vop3pOp::FmaMixF32,
+                        Src::Vgpr(4),
+                        &src,
+                        if high { 1 << pos } else { 0 },
+                        1 << pos,
+                        if negate { 1 << pos } else { 0 },
+                        0,
+                        false,
+                    ),
+                )
+                .unwrap();
+                let expected: [f32; 3] = if high {
+                    [4.0, 4.0, 6.0]
+                } else if negate {
+                    [1.0, 2.0, 5.0]
+                } else {
+                    [7.0, 6.0, 7.0]
+                };
+                assert_eq!(
+                    w.v[4],
+                    [expected[pos].to_bits(); 64],
+                    "pos={pos}, high={high}, negate={negate}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn fma_mix_f32_gfx942_integer_inline_stays_sign_extended() {
+    // MI300X r2: unlike float constants, integer -1 remains a B32 word;
+    // either selected half is 0xffff, including the high half.
+    for pos in 0..3 {
+        for high in [false, true] {
+            let mut w = new_wave();
+            for (reg, value) in [2.0f32, 3.0, 4.0].into_iter().enumerate() {
+                w.v[reg + 1] = [value.to_bits(); 64];
+            }
+            let mut src = [Src::Vgpr(1), Src::Vgpr(2), Src::Vgpr(3)];
+            src[pos] = Src::Int(-1);
+            vexec(
+                &mut w,
+                vop3p(
+                    Vop3pOp::FmaMixF32,
+                    Src::Vgpr(4),
+                    &src,
+                    if high { 1 << pos } else { 0 },
+                    1 << pos,
+                    0,
+                    0,
+                    false,
+                ),
+            )
+            .unwrap();
+            assert_eq!(w.v[4], [0xffff_e000; 64]);
+        }
+    }
+}
+
+#[test]
+fn fma_mix_f32_gfx942_exact_underflow_ties_and_clamped_negative_zero() {
+    let mode = Mode {
+        denorm32: 0,
+        ..Mode::default()
+    };
+    // The middle product is exactly 2^-126 - 2^-151. MI300X r2
+    // preserves that RNE tie; the adjacent products bracket it.
+    for (b, expected) in [
+        (0x1d84_2107, 0),
+        (0x1d84_2108, 0x0080_0000),
+        (0x1d84_2109, 0x0080_0001),
+    ] {
+        assert_eq!(
+            mix_f32_hw(mode, [0x2278_0000, b, 0], 0, 0, 0, false),
+            expected
+        );
+        assert_eq!(
+            mix_f32_hw(mode, [0xa278_0000, b, 0], 0, 0, 0, false),
+            expected | 0x8000_0000
+        );
+    }
+    for src in [
+        [0x8000_0000, 0x3f80_0000, 0x8000_0000],
+        [0, 0xbf80_0000, 0x8000_0000],
+    ] {
+        assert_eq!(mix_f32_hw(mode, src, 0, 0, 0, false), 0x8000_0000);
+        assert_eq!(mix_f32_hw(mode, src, 0, 0, 0, true), 0);
+    }
+}
+
 // ---- packed F32
 
 fn pk32_case(

@@ -815,6 +815,22 @@ fn exec_packed(w: &mut Wave, i: &Vop3p) -> SimResult<()> {
     if i.src[..needed].iter().any(Option::is_none) || i.src[needed..].iter().any(Option::is_some) {
         return unsupported(format!("{} missing or excess source", i.op.name()));
     }
+    // Mixed-FMA float inline constants use the selected source precision's
+    // constant ROM: half 1.0 materializes as 0x00003c00, not 0x3f800000.
+    // OP_SEL still chooses its half, so its high half is zero. Integer
+    // inline constants remain sign-extended B32 words (MI300X oracle r2).
+    let source_types: [Ty; 3] = std::array::from_fn(|index| {
+        if fp16
+            || i.op == FmaMixF32
+                && w.arch == Arch::Gfx942
+                && i.op_sel_hi >> index & 1 != 0
+                && matches!(i.src[index], Some(Src::Float(_)))
+        {
+            Ty::F16
+        } else {
+            Ty::B32
+        }
+    });
     for lane in 0..64 {
         if w.lane_active(lane) {
             let mut src = [0u64; 3];
@@ -823,7 +839,7 @@ fn exec_packed(w: &mut Wave, i: &Vop3p) -> SimResult<()> {
                     src[index] = if wide {
                         w.read_v64(*operand, lane, Ty::B64)?
                     } else {
-                        u64::from(w.read_v(*operand, lane, if fp16 { Ty::F16 } else { Ty::B32 })?)
+                        u64::from(w.read_v(*operand, lane, source_types[index])?)
                     };
                 }
             }
@@ -1092,9 +1108,10 @@ fn fma_tiny_after_rounding(a: f32, b: f32, c: f32, negative: bool) -> bool {
     s < threshold || (s == threshold && err < 0.0)
 }
 
-/// `v_fma_mix_f32` on gfx942 (all sources read as B32 words; inline-constant / SGPR materialization of a half
-/// selection is NOT measured). Rules, each reproduced exactly by the MI300X receipt cdna_mix_hw_oracle/1 r1
-/// (all 32 MODE settings; NaN-result histograms, sNaN counts and finite-flush counts equal):
+/// `v_fma_mix_f32` on gfx942. Register and integer-inline sources are B32;
+/// half-selected float inline constants are materialized as F16 before the
+/// half selection. MI300X oracle r2 verifies VGPR/SGPR semantics, exact
+/// underflow ties and signed-zero clamp across all 32 MODE settings.
 ///
 /// * NaN result: after source selection and NEG_LO (which flips a NaN's sign too), (1) `0 * inf` (both non-NaN)
 ///   gives the default NaN `0xffc00000` even when a source is NaN; (2) else the first NaN source in order
@@ -1106,8 +1123,8 @@ fn fma_tiny_after_rounding(a: f32, b: f32, c: f32, negative: bool) -> bool {
 ///   fixed-grid result of exactly 2^-126 that came from an exact value below `2^-126 - 2^-151` is flushed too
 ///   (not the fixed-grid subnormal check alone).
 ///
-/// [UNVERIFIED: confirm on MI300X] the exact tie `|a*b+c| == 2^-126 - 2^-151` (no such row in r1; modelled as
-/// round-to-even, i.e. not flushed); sign of a clamped -0.0 is the host's `f32::max` (r1 shows no mismatch).
+/// The exact tie `|a*b+c| == 2^-126 - 2^-151` rounds to even (not flushed).
+/// Clamp produces positive zero explicitly, without host min/max tie rules.
 fn fma_mix_f32_gfx942(i: &Vop3p, src: [u64; 3], mode: &Mode) -> u32 {
     let mut x = [0u32; 3];
     for (k, bits) in x.iter_mut().enumerate() {
@@ -1148,7 +1165,19 @@ fn fma_mix_f32_gfx942(i: &Vop3p, src: [u64; 3], mode: &Mode) -> u32 {
         return if i.clamp && mode.dx10_clamp { 0 } else { bits };
     }
     let [f0, f1, f2] = x.map(f32::from_bits);
-    let value = clamp_float(f0.mul_add(f1, f2), i.clamp, mode.dx10_clamp);
+    let value = f0.mul_add(f1, f2);
+    let value = if i.clamp {
+        // NaNs have already been handled above, including DX10_CLAMP.
+        if value <= 0.0 {
+            0.0
+        } else if value >= 1.0 {
+            1.0
+        } else {
+            value
+        }
+    } else {
+        value
+    };
     if mode.denorm32 & 2 == 0
         && (value.is_subnormal()
             || value.abs() == f32::MIN_POSITIVE

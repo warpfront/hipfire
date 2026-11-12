@@ -6,7 +6,7 @@
 //!
 //! Scope: `FmaMixF32` only, `NEG_HI = 0` (no `|abs|` source modifier), `NEG_LO` (all 8 masks), `CLAMP`, and every
 //! source selection (`OP_SEL` 0..7 x `OP_SEL_HI` 0..7 = 64 combinations), across VGPRs, an SGPR
-//! in each position, inline 1.0 in each position, and inline -1 in each position: 10240 variants.
+//! in each position, and inline 1.0, -1 and 64 in each position: 13312 variants.
 //! `v_fma_mix_f32` (XML alias `V_MAD_MIX_F32`) is the only op; mixed half-result instructions,
 //! `|abs|` and gfx950 are NOT covered and nothing here promotes them.
 //!
@@ -68,7 +68,7 @@ const USAGE: &str =
 
 const EXPECTED_ARCH: &str = "gfx942";
 /// All VGPR, then one SGPR / inline float / inline integer in each source position.
-const NSHAPES: usize = 10;
+const NSHAPES: usize = 13;
 const NK: usize = NSHAPES * 64;
 /// Variants per kernel: v = neg_lo * 2 + clamp.
 const NV: usize = 16;
@@ -85,6 +85,7 @@ fn kernel_sources(k: usize) -> [Src; 3] {
         1..=3 => src[shape - 1] = Src::Sgpr(8),
         4..=6 => src[shape - 4] = Src::Float(InlineFloat::One),
         7..=9 => src[shape - 7] = Src::Int(-1),
+        10..=12 => src[shape - 10] = Src::Int(64),
         _ => unreachable!("operand shape"),
     }
     src
@@ -536,7 +537,7 @@ fn asm_line(dst: &str, s: [&str; 3], op_sel: u8, op_sel_hi: u8, neg_lo: u8, clam
     let operand = |i: usize| {
         if neg_lo >> i & 1 == 0 {
             s[i].to_string()
-        } else if matches!(s[i], "1.0" | "-1") {
+        } else if matches!(s[i], "1.0" | "-1" | "64") {
             format!("neg({})", s[i])
         } else {
             format!("-{}", s[i])
@@ -1513,7 +1514,8 @@ fn run(o: &Opts, rec: &mut Receipt) {
         "operand_shapes": NSHAPES,
         "operand_shape_order": ["all_vgpr", "sgpr_src0", "sgpr_src1", "sgpr_src2",
             "inline_1.0_src0", "inline_1.0_src1", "inline_1.0_src2",
-            "inline_minus1_src0", "inline_minus1_src1", "inline_minus1_src2"],
+            "inline_minus1_src0", "inline_minus1_src1", "inline_minus1_src2",
+            "inline_64_src0", "inline_64_src1", "inline_64_src2"],
         "sgpr_inputs": "Each wave broadcasts that input array's first-lane word using readfirstlane; the interpreter uses the identical word.",
         "xml_alias": "V_MAD_MIX_F32",
         "not_covered": ["v_fma_mixlo_f16", "v_fma_mixhi_f16", "|abs| / NEG_HI", "gfx950"],
