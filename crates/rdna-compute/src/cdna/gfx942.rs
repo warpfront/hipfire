@@ -32,6 +32,7 @@ pub(crate) use qsa_lanes::{Qwen4QsaLaneDesc, Qwen4QsaLanesShape, QsaLanesTableCa
 #[path = "gfx942_gdn_lanes_verify.rs"]
 mod gdn_lanes_verify;
 pub use gdn_lanes_verify::{
+    qwen4_gdn_lanes_verify_admitted,
     Qwen4GdnLanesVerifyLane, Qwen4GdnLanesVerifyShape, QWEN4_G942_GDN_LANES_CONV_PARAMS,
     QWEN4_G942_GDN_LANES_GATE, QWEN4_G942_GDN_LANES_STEP, QWEN4_G942_GDN_LANES_VERIFY_MAX,
     QWEN4_G942_GDN_LANES_VERIFY_MODULE, QWEN4_G942_GDN_LANES_VERIFY_ROWS,

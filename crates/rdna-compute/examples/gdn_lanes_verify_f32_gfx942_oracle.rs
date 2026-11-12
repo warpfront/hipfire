@@ -141,7 +141,7 @@ impl LaneBufs {
         };
         let projection = gpu.zeros(&[rows * QKV], DType::F32).unwrap();
         let inputs = if direct && captured {
-            projection.clone()
+            projection.sub_offset(0, rows * QKV)
         } else {
             sentinel_rows(gpu, rows * QKV)
         };
