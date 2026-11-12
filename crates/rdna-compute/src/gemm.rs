@@ -42806,6 +42806,25 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if self.arch_caps.is_gfx942() && crate::cdna::gfx942::qwen4_g942_mq2_xbatch_covers(m, k) {
+            if self.fp8_verify_scope {
+                return Err(crate::gemm_fp8_verify::fp8_verify_scope_error(
+                    "gemv_mq2g256v2_xbatch",
+                ));
+            }
+            // Exact gfx942: the register-resident-x kernel, one weight pass per chunk of
+            // eight rows, every row the bytes of the one-row GEMV.
+            let chunk = crate::cdna::gfx942::QWEN4_G942_MQ2_XBATCH_MAX_ROWS;
+            for start in (0..batch_size).step_by(chunk) {
+                let rows = chunk.min(batch_size - start);
+                let x_rows = x.sub_offset(start * k, rows * k);
+                let y_rows = y.sub_offset(start * m, rows * m);
+                self.try_gfx942()
+                    .expect("gfx942 arch caps imply a gfx942 device")
+                    .mq2g256v2_xbatch_head(a_raw, &x_rows, &y_rows, m, k, rows)?;
+            }
+            return Ok(());
+        }
         let pm = self.mq2_xbatch_pm_active(m, k);
         self.gemv_mq2g256v2_xbatch_with(a_raw, x, y, m, k, batch_size, pm)
     }
