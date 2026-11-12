@@ -8,8 +8,8 @@
 //! A gfx942 lane step of more than eight rows runs its HC reads / writes once over every row
 //! (the all-rows segment, `LaneAllRowsRule`). Every row of that segment must be bitwise the row
 //! the one-row AR singleton computes: the write's gates take the four-quarter `(q0 + q1) +
-//! (q2 + q3)` arithmetic (not the ordinary chunk's BF16 MFMA GEMV) and the read's down
-//! projection + activation is the fused rows16 entry in 16-row slices. This example drives the real
+//! (q2 + q3)` arithmetic (not the ordinary chunk's BF16 MFMA GEMV); the read's row-invariant MFMA
+//! projections already are. This example drives the real
 //! dispatch entry points (`execute_hyper_read`, `execute_hyper_write`, `execute_final_hyper`, and
 //! the `execute_steps` write -> read chain) on three arms and compares every live buffer word for
 //! word:
@@ -909,24 +909,20 @@ fn oracle(env: &mut Env, sets: &[WeightSet], rows: &[usize], seeds: u64, rep: &m
                             }
                         }
                         Kind::Read | Kind::Final => {
-                            let l = &lane.symbols;
-                            let slices = n.div_ceil(16);
-                            if count(l, "hc_act") != slices || count(l, "roundtrip") != 0 {
-                                rep.census_failures.push(format!(
-                                    "{label}: lane read wants {slices} fused hc_act slices and no \
-                                     unfused activation chain: {}",
-                                    census_line(l)
-                                ));
-                            }
-                            let c = &chunk.symbols;
-                            let want_fold = n <= 16;
-                            if (count(c, "hc_act") != 0) == !want_fold
-                                || (!want_fold && count(c, "roundtrip") == 0)
-                            {
-                                rep.census_failures.push(format!(
-                                    "{label}: chunk read route changed: {}",
-                                    census_line(c)
-                                ));
+                            // Both arms: the fused rows16 down + activation up to 16 rows,
+                            // the (wide / rows16) GEMM and the unfused chain past it.
+                            let fold = n <= 16;
+                            for (arm, symbols) in [("lane", &lane.symbols), ("chunk", &chunk.symbols)] {
+                                let fused = count(symbols, "hc_act");
+                                let chain = count(symbols, "roundtrip");
+                                if (fold && (fused != 1 || chain != 0))
+                                    || (!fold && (fused != 0 || chain == 0))
+                                {
+                                    rep.census_failures.push(format!(
+                                        "{label}: {arm} read route: {}",
+                                        census_line(symbols)
+                                    ));
+                                }
                             }
                         }
                         Kind::Chain => {}

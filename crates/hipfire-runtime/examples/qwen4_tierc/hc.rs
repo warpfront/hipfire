@@ -145,11 +145,6 @@ pub const CASES: &[Q4Case] = &[
         run: case_lane_wide_read,
     },
     Q4Case {
-        name: "qwen4_g942_hc_down_act_slices_bytes",
-        timeout_s: 300,
-        run: case_hc_down_act_slices,
-    },
-    Q4Case {
         name: "qwen4_hc_step_program_write_read_pairs",
         timeout_s: 240,
         run: case_step_program,
@@ -1431,8 +1426,7 @@ fn case_lane_wide_write(gpu: &mut Gpu) -> Result<String, String> {
     all(out)
 }
 
-/// A lane step's all-rows `execute_hyper_read` / `execute_final_hyper` (norm, fused rows16 down +
-/// activation in 16-row slices, up, mix) is bitwise the one-row singleton call of every row.
+/// A lane step's all-rows `execute_hyper_read` / `execute_final_hyper` (norm, down + activation, up, mix) is bitwise the one-row singleton call of every row.
 fn case_lane_wide_read(gpu: &mut Gpu) -> Result<String, String> {
     let mut rng = Rng::new(0x4843_C201);
     let wn = rng.vec_bf16_exact(HC_WIDE, -0.5, 0.5);
@@ -1514,58 +1508,5 @@ fn case_lane_wide_read(gpu: &mut Gpu) -> Result<String, String> {
         }
     }
     free_all(gpu, vec![wnt, downt, upt])?;
-    all(out)
-}
-
-/// `Gfx942Device::qwen4_hc_down_act_slices` (16-row slices of the fused rows16 entry) over 17..=64
-/// rows is bitwise the single-row fused entry of every row, for F32 and BF16 X.
-fn case_hc_down_act_slices(gpu: &mut Gpu) -> Result<String, String> {
-    let mut rng = Rng::new(0x4843_C301);
-    let scale = 1.0 / HC_STREAMS as f32;
-    let down = rng.vec_bf16_exact(HC_LOW * HC_WIDE, -0.5, 0.5);
-    let downt = up_bf16(gpu, &down)?;
-    let mut out = Vec::new();
-    for &rows in &[17usize, 31, 32, 33, 48, 64] {
-        for x_bf16 in [false, true] {
-            let x = rng.vec(rows * HC_WIDE, -4.0, 4.0);
-            let xt = if x_bf16 {
-                up_bf16(gpu, &x)?
-            } else {
-                up_f32(gpu, &x)?
-            };
-            let want_t = sentinel_f32(gpu, rows * HC_LOW)?;
-            for r in 0..rows {
-                let xs = xt.sub_offset(r * HC_WIDE, HC_WIDE);
-                let ys = want_t.sub_offset(r * HC_LOW, HC_LOW);
-                let folded = gpu
-                    .try_gfx942()
-                    .ok_or_else(|| "not gfx942".to_string())?
-                    .qwen4_hc_down_act_rows16(&downt.buf, &xs, &ys, HC_LOW, HC_WIDE, 1, scale)
-                    .map_err(e)?;
-                if !folded {
-                    return Err(format!("one-row fused entry declined rows={rows} r={r}"));
-                }
-            }
-            let got_t = sentinel_f32(gpu, rows * HC_LOW)?;
-            let folded = gpu
-                .try_gfx942()
-                .ok_or_else(|| "not gfx942".to_string())?
-                .qwen4_hc_down_act_slices(&downt.buf, &xt, &got_t, HC_LOW, HC_WIDE, rows, scale)
-                .map_err(e)?;
-            if !folded {
-                return Err(format!("slice chain declined rows={rows}"));
-            }
-            out.push(exact_f32(
-                &format!(
-                    "hc_down_act slices rows={rows} x={} == single-row fused",
-                    if x_bf16 { "bf16" } else { "f32" }
-                ),
-                &down_f32(gpu, &got_t)?,
-                &down_f32(gpu, &want_t)?,
-            ));
-            free_all(gpu, vec![xt, want_t, got_t])?;
-        }
-    }
-    free_all(gpu, vec![downt])?;
     all(out)
 }
