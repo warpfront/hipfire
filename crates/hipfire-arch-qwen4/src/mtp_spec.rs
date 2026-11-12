@@ -11019,9 +11019,12 @@ pub(crate) fn mtp_prefill_chunk_needs_pick(
     !skip_intermediate || end == prompt_len
 }
 /// Whether this GPU's GDN route captures verify rows: row capture rides the
-/// few-row persistent GDN recurrence.
+/// few-row persistent GDN recurrence. gfx942 captures the F32 state only, so
+/// there the stock-FP8 profile (which pins it, [`crate::state::resolve_gdn_format`])
+/// is required.
 pub fn native_mtp_row_capture(gpu: &Gpu, config: &crate::Qwen4Config) -> bool {
-    gpu.arch_caps.has_gfx11_plus_simt()
+    gpu.arch_caps.has_qwen4_gdn_row_capture()
+        && (!gpu.arch_caps.is_gfx942() || config.profile.is_stock_fp8())
         && config.linear_key_head_dim == 128
         && config.linear_value_head_dim == 128
         && config.linear_conv_kernel_dim == 4

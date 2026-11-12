@@ -156,6 +156,10 @@ pub const QWEN4_GDN_LANES_F32_MAX: usize = 256;
 /// lane set: 36 layers x about a hundred distinct lane sets).
 const GDN_LANES_TABLE_CACHE_MAX: usize = 4096;
 
+const QWEN4_GDN_LANES_CAPTURE_F32_SRC: &str =
+    include_str!("../../../../kernels/src/qwen4_gdn_lanes_capture_f32.gfx942.hip");
+const QWEN4_GDN_LANES_CAPTURE_F32_KERNEL: &str = "qwen4_gdn_lanes_step_capture_f32_gfx942";
+
 /// One lane of the device lane table: the five pointers of one lane's recurrence
 /// (`struct Qwen4GdnLaneDesc` in `kernels/src/qwen4_gdn_lanes_f32.gfx942.hip`).
 #[repr(C)]
@@ -169,6 +173,24 @@ struct Qwen4GdnLaneDesc {
 }
 const _: () = assert!(std::mem::size_of::<Qwen4GdnLaneDesc>() == 40);
 
+/// One lane of the capture lanes' device table: the six pointers of one lane's captured
+/// recurrence (`struct Qwen4GdnLaneCaptureDesc` in
+/// `kernels/src/qwen4_gdn_lanes_capture_f32.gfx942.hip`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct Qwen4GdnLaneCaptureDesc {
+    projection: u64,
+    gate: u64,
+    beta: u64,
+    state: u64,
+    final_state: u64,
+    output: u64,
+}
+const _: () = assert!(std::mem::size_of::<Qwen4GdnLaneCaptureDesc>() == 48);
+
+/// [`GdnLanesTableKey`] of the capture lanes.
+type GdnLanesCaptureTableKey = ([usize; 3], Vec<Qwen4GdnLaneCaptureDesc>);
+
 /// `[rows, key_heads, value_heads]` and the lane descriptors a cached table was built from.
 type GdnLanesTableKey = ([usize; 3], Vec<Qwen4GdnLaneDesc>);
 
@@ -179,6 +201,10 @@ type GdnLanesTableKey = ([usize; 3], Vec<Qwen4GdnLaneDesc>);
 #[derive(Default)]
 pub(crate) struct GdnLanesTableCache {
     tables: std::collections::HashMap<GdnLanesTableKey, (hip_bridge::DeviceBuffer, Vec<u8>)>,
+    /// The capture lanes' tables ([`Gfx942Device::qwen4_gdn_lanes_step_capture_f32`]), keyed
+    /// the same way over the six-pointer descriptors.
+    capture_tables:
+        std::collections::HashMap<GdnLanesCaptureTableKey, (hip_bridge::DeviceBuffer, Vec<u8>)>,
 }
 
 /// One lane of a [`Gfx942Device::qwen4_gdn_lanes_step_f32`] launch: the tensors the
@@ -206,6 +232,25 @@ pub struct Qwen4GdnLanesF32Shape {
     pub value_dim: usize,
 }
 
+/// One lane of a [`Gfx942Device::qwen4_gdn_lanes_step_capture_f32`] launch: the tensors the
+/// per-lane capture launch of that lane (`gated_delta_step_batched` with `row_states`) names.
+pub struct Qwen4GdnLanesCaptureF32Lane<'a> {
+    /// F32 `[rows, qkv_width]` convolution output (q | k | v per row).
+    pub projection: &'a GpuTensor,
+    /// F32 `[rows, value_heads]` decay gate.
+    pub gate: &'a GpuTensor,
+    /// F32 `[rows, value_heads]` beta.
+    pub beta: &'a GpuTensor,
+    /// F32 `[value_heads, 128, 128]` recurrent state: read only (the pre-window state a
+    /// rollback replays from).
+    pub state: &'a GpuTensor,
+    /// The lane's capture ring (`GdnRowCapture::states`): F32 slots of `[value_heads, 128, 128]`,
+    /// at least `rows` of them; the state after the last row lands in slot `rows - 1`.
+    pub ring: &'a GpuTensor,
+    /// F32 `[rows, value_heads * 128]` recurrent output.
+    pub output: &'a GpuTensor,
+}
+
 /// Bind the lanes kernel: the hipcc source (the anchor object), or, only when
 /// `HIPFIRE_QWEN4_G942_GDN_LANES_IMAGE=/absolute/device.elf` names one, that explicitly supplied
 /// code object (the Route-A twin proof: same module, same entry name, loaded through
@@ -231,6 +276,109 @@ fn g942_gdn_lanes_ensure(gpu: &mut Gpu) -> HipResult<()> {
             QWEN4_GDN_LANES_F32_KERNEL,
         ),
     }
+}
+
+/// Bind the capture lanes kernel (`qwen4_gdn_lanes_step_capture_f32_gfx942`, its own module):
+/// the hipcc source (the anchor object), or, only when
+/// `HIPFIRE_QWEN4_G942_GDN_LANES_CAPTURE_IMAGE=/absolute/device.elf` names one, that explicitly
+/// supplied code object (the Route-A twin proof: same module, same entry name, loaded through
+/// `ensure_embedded_kernel`). Unset: the source, unchanged.
+fn g942_gdn_lanes_capture_ensure(gpu: &mut Gpu) -> HipResult<()> {
+    match hipfire_config::developer_var("HIPFIRE_QWEN4_G942_GDN_LANES_CAPTURE_IMAGE") {
+        Ok(path) if !path.is_empty() => {
+            let bytes = std::fs::read(&path).map_err(|error| {
+                hip_bridge::HipError::new(
+                    0,
+                    &format!("HIPFIRE_QWEN4_G942_GDN_LANES_CAPTURE_IMAGE {path}: {error}"),
+                )
+            })?;
+            gpu.ensure_embedded_kernel(
+                QWEN4_GDN_LANES_CAPTURE_F32_KERNEL,
+                std::sync::Arc::<[u8]>::from(bytes),
+                QWEN4_GDN_LANES_CAPTURE_F32_KERNEL,
+            )
+        }
+        _ => gpu.ensure_kernel(
+            QWEN4_GDN_LANES_CAPTURE_F32_KERNEL,
+            QWEN4_GDN_LANES_CAPTURE_F32_SRC,
+            QWEN4_GDN_LANES_CAPTURE_F32_KERNEL,
+        ),
+    }
+}
+
+const QWEN4_G942_GDN_VERIFY_SRC: &str =
+    include_str!("../../../../kernels/src/qwen4_g942_gdn_verify.gfx942.hip");
+/// The exact-gfx942 GDN verify-window module (its own cache key and twin seat).
+pub const QWEN4_G942_GDN_VERIFY_MODULE: &str = "qwen4_g942_gdn_verify";
+/// `(tensor_ops entry, gfx942 verify module entry)`: the four entries whose gfx942 launches live in
+/// [`QWEN4_G942_GDN_VERIFY_MODULE`]. The names differ (the per-context function table is keyed by
+/// entry name, so the module cannot reuse the tensor_ops symbols); every body is a verbatim copy.
+pub const QWEN4_G942_GDN_VERIFY_ENTRIES: [(&str, &str); 4] = [
+    (
+        "gated_delta_step_halves_state128_persistent256_capture_f32",
+        "qwen4_g942_gdn_verify_capture_f32",
+    ),
+    (
+        "gated_delta_rollback_layers_f32",
+        "qwen4_g942_gdn_verify_rollback_f32",
+    ),
+    (
+        "gated_delta_conv_bf16_f32_batched_k4",
+        "qwen4_g942_gdn_verify_conv_params_k4",
+    ),
+    (
+        "gated_delta_gate_bf16_f32_batched",
+        "qwen4_g942_gdn_verify_gate_batched",
+    ),
+];
+
+/// `HIPFIRE_QWEN4_G942_GDN_VERIFY_IMAGE=/absolute/device.elf` (developer, read once): the
+/// explicitly supplied code object of [`QWEN4_G942_GDN_VERIFY_MODULE`] (the Route-A twin proof).
+/// Unset: the hipcc source, unchanged.
+fn g942_gdn_verify_image() -> HipResult<Option<&'static std::sync::Arc<[u8]>>> {
+    static IMAGE: std::sync::LazyLock<Result<Option<std::sync::Arc<[u8]>>, String>> =
+        std::sync::LazyLock::new(|| {
+            match hipfire_config::developer_var("HIPFIRE_QWEN4_G942_GDN_VERIFY_IMAGE") {
+                Ok(path) if !path.is_empty() => std::fs::read(&path)
+                    .map(|bytes| Some(std::sync::Arc::<[u8]>::from(bytes)))
+                    .map_err(|error| {
+                        format!("HIPFIRE_QWEN4_G942_GDN_VERIFY_IMAGE {path}: {error}")
+                    }),
+                _ => Ok(None),
+            }
+        });
+    let loaded: &'static Result<Option<std::sync::Arc<[u8]>>, String> = &IMAGE;
+    match loaded {
+        Ok(image) => Ok(image.as_ref()),
+        Err(message) => Err(hip_bridge::HipError::new(0, message)),
+    }
+}
+
+/// Load the entry `kernel` of the tensor_ops GDN verify launches and return the symbol to launch.
+/// On exact gfx942 the four [`QWEN4_G942_GDN_VERIFY_ENTRIES`] resolve to the gfx942-only module
+/// (hipcc source, or the `HIPFIRE_QWEN4_G942_GDN_VERIFY_IMAGE` code object) and the module's own
+/// symbol is returned; every other arch, and every other entry, loads from `tensor_ops` as
+/// before and returns `kernel`.
+pub(crate) fn ensure_gdn_verify_kernel(gpu: &mut Gpu, kernel: &'static str) -> HipResult<&'static str> {
+    let entry = gpu
+        .arch_caps
+        .is_gfx942()
+        .then(|| {
+            QWEN4_G942_GDN_VERIFY_ENTRIES
+                .iter()
+                .find(|(tensor_ops, _)| *tensor_ops == kernel)
+        })
+        .flatten();
+    let Some(&(_, own)) = entry else {
+        gpu.ensure_kernel_public("tensor_ops", crate::tensor_ops::TENSOR_OPS_SRC, kernel)?;
+        return Ok(kernel);
+    };
+    gpu.bind_thread()?;
+    match g942_gdn_verify_image()? {
+        Some(image) => gpu.ensure_embedded_kernel(QWEN4_G942_GDN_VERIFY_MODULE, image.clone(), own)?,
+        None => gpu.ensure_kernel(QWEN4_G942_GDN_VERIFY_MODULE, QWEN4_G942_GDN_VERIFY_SRC, own)?,
+    }
+    Ok(own)
 }
 
 /// A mutable GPU borrow proven to target exact gfx942.
@@ -1860,6 +2008,228 @@ impl Gfx942Device<'_> {
         }
         result
     }
+
+    /// The captured F32 GDN verify-window recurrence (`rows` rows per lane, uniform) of up to
+    /// [`QWEN4_GDN_LANES_F32_MAX`] lanes in ONE launch
+    /// (`qwen4_gdn_lanes_step_capture_f32_gfx942`, grid `[value_heads, lanes]`, block 128).
+    ///
+    /// Lane `i` runs `gated_delta_step_pipe128_f32`'s body (the AR singleton's F32 recurrence)
+    /// over its `rows` rows from its `state`, which is NOT written: the state after the last
+    /// row is stored to slot `rows - 1` of its `ring`, the layout the per-lane capture launch
+    /// (`gated_delta_step_batched` with `row_states`) leaves, so the lane's rollback
+    /// (`gated_delta_rollback_layers`) and commit read it unchanged. The lane pointers ride in a
+    /// device lane table built once per distinct lane set and layer and reused until the set
+    /// changes (content-keyed, as [`Self::qwen4_gdn_lanes_step_f32`]).
+    ///
+    /// Refused (`Err`, nothing launched) unless every tensor is F32 with exactly the extent the
+    /// per-lane launch validates, the shape is the exact 128 x 128 GDN one, no lane's written
+    /// range (final-state slot, output) overlaps another lane's written range or any lane's
+    /// read range (projection, gate, beta, state), and, during hipGraph capture, the table is
+    /// already cached.
+    pub fn qwen4_gdn_lanes_step_capture_f32(
+        &mut self,
+        lanes: &[Qwen4GdnLanesCaptureF32Lane<'_>],
+        shape: Qwen4GdnLanesF32Shape,
+    ) -> HipResult<()> {
+        const WHAT: &str = "qwen4_gdn_lanes_step_capture_f32";
+        let refuse = |msg: String| Err(hip_bridge::HipError::new(0, &msg));
+        let Qwen4GdnLanesF32Shape {
+            rows,
+            key_heads,
+            value_heads,
+            key_dim,
+            value_dim,
+        } = shape;
+        if lanes.is_empty() || lanes.len() > QWEN4_GDN_LANES_F32_MAX {
+            return refuse(format!(
+                "{WHAT}: {} lanes (1..={QWEN4_GDN_LANES_F32_MAX})",
+                lanes.len()
+            ));
+        }
+        if rows == 0
+            || key_heads == 0
+            || value_heads == 0
+            || value_heads % key_heads != 0
+            || key_dim != 128
+            || value_dim != 128
+        {
+            return refuse(format!(
+                "{WHAT}: needs the exact 128x128 GDN shape (rows={rows} key_heads={key_heads} \
+                 value_heads={value_heads} key_dim={key_dim} value_dim={value_dim})"
+            ));
+        }
+        let qk = key_heads * 128;
+        let value = value_heads * 128;
+        let qkv = 2 * qk + value;
+        let (Some(proj_elems), Some(gate_elems), Some(out_elems), Some(ring_elems)) = (
+            rows.checked_mul(qkv),
+            rows.checked_mul(value_heads),
+            rows.checked_mul(value),
+            rows.checked_mul(value * 128),
+        ) else {
+            return refuse(format!("{WHAT}: lane extent overflows"));
+        };
+        let state_elems = value * 128;
+        // The kernel indexes rows with 32-bit ints.
+        if proj_elems.max(out_elems) > i32::MAX as usize {
+            return refuse(format!(
+                "{WHAT}: rows={rows} exceeds the kernel's 32-bit row index"
+            ));
+        }
+        let mut descs = Vec::with_capacity(lanes.len());
+        for (i, lane) in lanes.iter().enumerate() {
+            // The ring only has to HOLD `rows` slots (a compact capture view may be larger).
+            for (name, tensor, elems, exact) in [
+                ("projection", lane.projection, proj_elems, true),
+                ("gate", lane.gate, gate_elems, true),
+                ("beta", lane.beta, gate_elems, true),
+                ("state", lane.state, state_elems, true),
+                ("ring", lane.ring, ring_elems, false),
+                ("output", lane.output, out_elems, true),
+            ] {
+                let extent_ok = if exact {
+                    tensor.numel() == elems
+                } else {
+                    tensor.numel() >= elems
+                };
+                if tensor.dtype != DType::F32 || !extent_ok || tensor.buf.size() < elems * 4 {
+                    return refuse(format!(
+                        "{WHAT}: lane {i} {name} must be F32 with {}{elems} elements (got {:?}, \
+                         {} elements, {} bytes)",
+                        if exact { "" } else { "at least " },
+                        tensor.dtype,
+                        tensor.numel(),
+                        tensor.buf.size()
+                    ));
+                }
+            }
+            descs.push(Qwen4GdnLaneCaptureDesc {
+                projection: lane.projection.buf.as_ptr() as u64,
+                gate: lane.gate.buf.as_ptr() as u64,
+                beta: lane.beta.buf.as_ptr() as u64,
+                state: lane.state.buf.as_ptr() as u64,
+                final_state: lane.ring.buf.as_ptr() as u64 + ((rows - 1) * state_elems * 4) as u64,
+                output: lane.output.buf.as_ptr() as u64,
+            });
+        }
+        let key: GdnLanesCaptureTableKey = ([rows, key_heads, value_heads], descs);
+        if !self.gpu.gdn_lanes_f32_tables.capture_tables.contains_key(&key) {
+            // Validated once per distinct lane set: the table is a pure function of the key.
+            let descs = &key.1;
+            let mut writes: Vec<(u64, u64)> = Vec::with_capacity(2 * descs.len());
+            for d in descs {
+                writes.push((d.final_state, d.final_state + (state_elems * 4) as u64));
+                writes.push((d.output, d.output + (out_elems * 4) as u64));
+            }
+            writes.sort_unstable();
+            if writes.windows(2).any(|w| w[0].1 > w[1].0) {
+                return refuse(format!(
+                    "{WHAT}: two lanes write overlapping final-state or output ranges"
+                ));
+            }
+            let hits_write = |start: u64, bytes: usize| {
+                let end = start + bytes as u64;
+                // The last write starting before `end` is the only one that can reach back over
+                // `start` (the writes are disjoint and sorted).
+                let at = writes.partition_point(|w| w.0 < end);
+                at > 0 && writes[at - 1].1 > start
+            };
+            for d in descs {
+                if hits_write(d.projection, proj_elems * 4)
+                    || hits_write(d.gate, gate_elems * 4)
+                    || hits_write(d.beta, gate_elems * 4)
+                    || hits_write(d.state, state_elems * 4)
+                {
+                    return refuse(format!(
+                        "{WHAT}: a lane reads a range another lane (or itself) writes"
+                    ));
+                }
+            }
+            if self.gpu.graphs.capture_mode {
+                return refuse(format!("{WHAT}: lane table staging during graph capture"));
+            }
+            self.gpu.bind_thread()?;
+            if self.gpu.gdn_lanes_f32_tables.capture_tables.len() >= GDN_LANES_TABLE_CACHE_MAX {
+                // Queued launches may still read a table: drain before freeing any.
+                self.gpu.hip.device_synchronize()?;
+                self.gpu.gdn_lanes_f32_tables.capture_tables.clear();
+            }
+            let bytes: Vec<u8> = key
+                .1
+                .iter()
+                .flat_map(|d| {
+                    [d.projection, d.gate, d.beta, d.state, d.final_state, d.output]
+                        .into_iter()
+                        .flat_map(u64::to_le_bytes)
+                })
+                .collect();
+            let buf = self.gpu.hip.malloc(bytes.len().next_multiple_of(256))?;
+            // Stream-ordered before this launch; `bytes` lives in the cache entry, so the
+            // (possibly staged) copy never reads a dropped source and nothing synchronizes.
+            match self.gpu.active_stream.as_ref() {
+                Some(stream) => self.gpu.hip.memcpy_htod_async(&buf, &bytes, stream)?,
+                None => self.gpu.hip.memcpy_htod(&buf, &bytes)?,
+            }
+            self.gpu
+                .gdn_lanes_f32_tables
+                .capture_tables
+                .insert(key.clone(), (buf, bytes));
+        }
+        let table = self.gpu.gdn_lanes_f32_tables.capture_tables[&key].0.as_ptr();
+        self.gpu.bind_thread()?;
+        g942_gdn_lanes_capture_ensure(&mut *self.gpu)?;
+        let (rv, qv, khv, vhv, kdv, vdv) = (
+            rows as i32,
+            qkv as i32,
+            key_heads as i32,
+            value_heads as i32,
+            key_dim as i32,
+            value_dim as i32,
+        );
+        let scale = (key_dim as f32).sqrt().recip();
+        let mut params: Vec<*mut c_void> = vec![
+            &table as *const _ as *mut c_void,
+            &rv as *const _ as *mut c_void,
+            &qv as *const _ as *mut c_void,
+            &khv as *const _ as *mut c_void,
+            &vhv as *const _ as *mut c_void,
+            &kdv as *const _ as *mut c_void,
+            &vdv as *const _ as *mut c_void,
+            &scale as *const _ as *mut c_void,
+        ];
+        let bytes = lanes
+            .len()
+            .saturating_mul(2 * state_elems * 4 + (proj_elems + out_elems + 2 * gate_elems) * 4);
+        let timer = crate::profile::begin_timer(
+            &self.gpu.hip,
+            "deltanet",
+            QWEN4_GDN_LANES_CAPTURE_F32_KERNEL,
+            bytes,
+        );
+        let result = self.gpu.launch_maybe_blob(
+            QWEN4_GDN_LANES_CAPTURE_F32_KERNEL,
+            [value_heads as u32, lanes.len() as u32, 1],
+            [128, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = KernargBlob::new();
+                blob.push_ptr(table);
+                blob.push_i32(rv);
+                blob.push_i32(qv);
+                blob.push_i32(khv);
+                blob.push_i32(vhv);
+                blob.push_i32(kdv);
+                blob.push_i32(vdv);
+                blob.push_f32(scale);
+                blob
+            },
+        );
+        if let Some(timer) = timer {
+            timer.finish(&self.gpu.hip);
+        }
+        result
+    }
 }
 
 /// Most batch rows one `gemm_bf16_mfma_gfx942_rows16` launch takes; a chain
@@ -2968,5 +3338,137 @@ mod tests {
         for field in ["projection", "gate", "beta", "state", "output"] {
             assert!(body.contains(&format!("* {field};")), "field {field}");
         }
+    }
+
+    /// The capture lanes kernel's helpers are `tensor_ops.hip`'s, byte for byte (the same
+    /// `BEGIN` / `END verbatim` blocks as the uncaptured lanes kernel, the pipe128 body split
+    /// out), and its body is the production pipe128 body with exactly the two documented edits
+    /// (the `final_out` parameter and the final-state store).
+    #[test]
+    fn gdn_lanes_capture_f32_gfx942_source_is_tensor_ops_with_the_final_store_edit() {
+        const BEGIN: &str = "// BEGIN verbatim tensor_ops.hip\n";
+        const END: &str = "// END verbatim tensor_ops.hip";
+        const BEGIN_BODY: &str = "// BEGIN derived tensor_ops.hip pipe128 body (final_out)\n";
+        const END_BODY: &str = "// END derived tensor_ops.hip pipe128 body (final_out)";
+        let src = super::QWEN4_GDN_LANES_CAPTURE_F32_SRC;
+        let production = crate::tensor_ops::TENSOR_OPS_SRC;
+        let mut blocks = 0;
+        let mut rest = src;
+        while let Some(at) = rest.find(BEGIN) {
+            let body = &rest[at + BEGIN.len()..];
+            let end = body.find(END).expect("END marker after every BEGIN marker");
+            let block = body[..end].trim_end_matches('\n');
+            assert!(
+                production.contains(block),
+                "verbatim block {blocks} of qwen4_gdn_lanes_capture_f32.gfx942.hip is no longer a \
+                 substring of tensor_ops.hip: mirror the production edit\nblock starts: {:?}",
+                &block[..block.len().min(120)]
+            );
+            blocks += 1;
+            rest = &body[end + END.len()..];
+        }
+        assert_eq!(blocks, 4, "bf16 helpers, Q8 helpers, barrier, pipe128 helpers");
+        // The derived body: the production pipe128 body with the two edits applied.
+        let derived_at = src.find(BEGIN_BODY).expect("derived body marker") + BEGIN_BODY.len();
+        let derived = &src[derived_at..derived_at + src[derived_at..].find(END_BODY).unwrap()];
+        let derived = derived.trim_end_matches('\n');
+        let head = "template <bool kQ8, bool kEf = false>\n__device__ __forceinline__ void gated_delta_step_pipe128_body(";
+        let from = production.find(head).expect("production pipe128 body");
+        let production_body = &production[from..];
+        let to = production_body
+            .find("\n}\n")
+            .expect("end of the production pipe128 body")
+            + 2;
+        let production_body = &production_body[..to];
+        let signature = "    unsigned short* ef = nullptr) {";
+        let store = "    float* const final_state = reinterpret_cast<float*>(state);";
+        assert_eq!(production_body.matches(signature).count(), 1);
+        assert_eq!(production_body.matches(store).count(), 1);
+        let expected = production_body
+            .replace(
+                signature,
+                "    unsigned short* ef = nullptr,\n    float* final_out = nullptr) {",
+            )
+            .replace(store, "    float* const final_state = final_out;");
+        assert_eq!(
+            derived,
+            expected.trim_end_matches('\n'),
+            "the capture lanes body drifted from tensor_ops.hip's pipe128 body"
+        );
+        assert_eq!(src.matches("gated_delta_step_pipe128_body<false>(").count(), 1);
+        assert!(src.contains(&format!(
+            "void {}(",
+            super::QWEN4_GDN_LANES_CAPTURE_F32_KERNEL
+        )));
+        assert_eq!(src.matches("__launch_bounds__(128)").count(), 1);
+    }
+
+    /// The capture lane table entry is six 8-byte pointers on both sides of the launch.
+    #[test]
+    fn gdn_lanes_capture_f32_gfx942_lane_desc_matches_kernel_struct() {
+        assert_eq!(std::mem::size_of::<super::Qwen4GdnLaneCaptureDesc>(), 48);
+        let src = super::QWEN4_GDN_LANES_CAPTURE_F32_SRC;
+        let at = src
+            .find("struct Qwen4GdnLaneCaptureDesc {")
+            .expect("kernel lane descriptor");
+        let body = &src[at..src[at..].find("};").unwrap() + at];
+        assert_eq!(body.matches("QWEN4_GDN_GLOBAL*").count(), 6);
+        assert_eq!(body.matches(';').count(), 6);
+        let order: Vec<usize> = ["projection", "gate", "beta", "state", "final_state", "output"]
+            .iter()
+            .map(|field| body.find(&format!("* {field};")).expect(field))
+            .collect();
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "field order");
+    }
+
+    /// The gfx942 GDN verify module is `tensor_ops.hip`'s bodies byte for byte: with the four
+    /// entry names mapped back, every `BEGIN` / `END verbatim` block occurs in the production
+    /// source (the bf16 / Q8 helpers, the barrier, the Q8 peak exchange, the persistent body,
+    /// the capture and rollback wrappers, the convolution + parameters kernel, the gated norm).
+    #[test]
+    fn g942_gdn_verify_source_is_tensor_ops_verbatim() {
+        const BEGIN: &str = "// BEGIN verbatim tensor_ops.hip\n";
+        const END: &str = "// END verbatim tensor_ops.hip";
+        let production = crate::tensor_ops::TENSOR_OPS_SRC;
+        let mut src = super::QWEN4_G942_GDN_VERIFY_SRC.to_string();
+        for (old, new) in super::QWEN4_G942_GDN_VERIFY_ENTRIES {
+            assert!(
+                src.contains(&format!("void {new}(")),
+                "entry {new} is defined by the module"
+            );
+            assert!(
+                production.contains(&format!("void {old}(")),
+                "entry {old} is a tensor_ops kernel"
+            );
+            src = src.replace(new, old);
+        }
+        // Mapped back, the module names no tensor_ops entry it does not carry: every
+        // `extern "C" __global__` of the module is one of the four.
+        assert_eq!(
+            src.matches("extern \"C\" __global__").count(),
+            super::QWEN4_G942_GDN_VERIFY_ENTRIES.len()
+        );
+        let mut blocks = 0;
+        let mut rest = src.as_str();
+        while let Some(at) = rest.find(BEGIN) {
+            let body = &rest[at + BEGIN.len()..];
+            let end = body.find(END).expect("END marker after every BEGIN marker");
+            let block = body[..end].trim_end_matches('\n');
+            assert!(
+                production.contains(block),
+                "verbatim block {blocks} of qwen4_g942_gdn_verify.gfx942.hip is no longer a \
+                 substring of tensor_ops.hip: mirror the production edit\nblock starts: {:?}",
+                &block[..block.len().min(120)]
+            );
+            blocks += 1;
+            rest = &body[end + END.len()..];
+        }
+        assert_eq!(
+            blocks, 9,
+            "bf16 helpers, Q8 helpers, barrier, Q8 peak, persistent body, capture + rollback \
+             wrappers, convolution + parameters, gated norm"
+        );
+        // gfx942 never defines the gfx12-only staged parameter pass.
+        assert!(!src.contains("#define GDN_PERSISTENT_STAGED"));
     }
 }
