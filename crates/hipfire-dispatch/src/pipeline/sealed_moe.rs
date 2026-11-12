@@ -6307,6 +6307,43 @@ mod tests {
     }
 
     #[test]
+    fn separate_gate_up_binds_each_projection_by_name() {
+        let gate = resource("sep_gate", DType::MQ4G256, &[4, 4]);
+        let up = resource("sep_up", DType::MQ4G256, &[4, 4]);
+        let down = resource("sep_down", DType::MQ4G256, &[4, 4]);
+        let table = ExpertTable::new(vec![ExpertMetadata::new(
+            0,
+            0,
+            0,
+            ExpertResources::separate(gate, up, down).unwrap(),
+        )
+        .unwrap()])
+        .unwrap();
+        let mut cache = table.prepare_binding(0, 1, 0).unwrap();
+        let fixture = live_fixture(&table, 0x20_0000);
+        bind_fixture(&table, &mut cache, &fixture);
+        let bound = BoundMoeExperts::from_cache(&table, &cache).unwrap();
+
+        validate_expert_shape_and_dtype(
+            &bound,
+            1,
+            8,
+            4,
+            4,
+            4,
+            DType::MQ4G256,
+            DType::MQ4G256,
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        let resources = bound.expert(0).unwrap().resources();
+        assert_eq!(resources.gate().unwrap().source_name(), "sep_gate");
+        assert_eq!(resources.up().unwrap().source_name(), "sep_up");
+    }
+
+    #[test]
     fn grouped_prefill_capacity_accepts_just_fit_and_rejects_one_row_small() {
         let total_slots = 17;
         let n_experts = 2;

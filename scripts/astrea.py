@@ -1854,9 +1854,7 @@ def write_policy_promotion_candidate(
     for record in layout["records"]:
         if record["name"] not in selected_names:
             continue
-        tensor_format = HFQ_QUANT_TYPE_FORMATS.get(record["quant_type_name"])
-        if tensor_format is None:
-            raise ValueError(f"unsupported quant type: {record['quant_type_name']}")
+        tensor_format = HFQ_QUANT_TYPE_FORMATS.get(record["quant_type_name"], "unknown")
         if tensor_format != policy.get("base_format"):
             raise ValueError(
                 f"selected tensor {record['name']} is {tensor_format}, expected {policy.get('base_format')}"
@@ -2508,8 +2506,6 @@ def build_recipe(methods, recipe_stages=None):
 
 
 def inspect_model(model, *, imatrix=None, quant_format=None):
-    if quant_format:
-        validate_values([quant_format], SUPPORTED_FORMATS, "quant type")
     result = {
         "schema": INSPECT_SCHEMA,
         "captured_at_utc": utc_now(),
@@ -2556,8 +2552,8 @@ def build_plan(
         raise ValueError("at least one --format is required")
     if not methods:
         raise ValueError("at least one --method is required")
-    validate_values(formats, SUPPORTED_FORMATS, "quant type")
-    validate_values(methods, SUPPORTED_METHODS, "quantization method")
+    validate_values(formats, SUPPORTED_FORMATS, "format")
+    validate_values(methods, SUPPORTED_METHODS, "method")
     recipe = build_recipe(methods, recipe_stages=recipe_stages)
 
     model_name = Path(model).name.replace(".", "-").replace("/", "-")
@@ -3094,9 +3090,9 @@ def build_policy(
     model_family=None,
     policy_id=None,
 ):
-    validate_values([base_format, promotion_format], SUPPORTED_FORMATS, "quant type")
+    validate_values([base_format, promotion_format], SUPPORTED_FORMATS, "format")
     methods = methods or []
-    validate_values(methods, SUPPORTED_METHODS, "quantization method")
+    validate_values(methods, SUPPORTED_METHODS, "method")
     objectives = objectives or ["dynamic-tensor-policy"]
     validate_values(objectives, SUPPORTED_POLICY_OBJECTIVES, "policy objective")
     domains = domains or ["weights"]

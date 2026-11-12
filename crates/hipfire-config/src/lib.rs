@@ -4187,14 +4187,32 @@ pub struct RetiredConfigKey {
     pub reason: &'static str,
 }
 
-pub static RETIRED_CONFIG_KEYS: &[RetiredConfigKey] = &[RetiredConfigKey {
-    key: "kernel.mw16",
-    legacy_key: "mw16",
-    shipped_in: "0.3.1",
-    removed_in: "0.4.1",
-    ignored_until: "0.5.0",
-    reason: "the MW16 GEMM experiment was removed",
-}];
+pub static RETIRED_CONFIG_KEYS: &[RetiredConfigKey] = &[
+    RetiredConfigKey {
+        key: "kernel.mw16",
+        legacy_key: "mw16",
+        shipped_in: "0.3.1",
+        removed_in: "0.4.1",
+        ignored_until: "0.5.0",
+        reason: "the MW16 GEMM experiment was removed",
+    },
+    RetiredConfigKey {
+        key: "kernel.moe_paro_i8",
+        legacy_key: "moe_paro_i8",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        ignored_until: "0.6.0",
+        reason: "the Givens-rotation INT4 import format was removed",
+    },
+    RetiredConfigKey {
+        key: "kernel.moe_paro_i8_k8",
+        legacy_key: "moe_paro_i8_k8",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        ignored_until: "0.6.0",
+        reason: "the Givens-rotation INT4 import format was removed",
+    },
+];
 
 pub fn retired_config_key(key: &str) -> Option<&'static RetiredConfigKey> {
     RETIRED_CONFIG_KEYS

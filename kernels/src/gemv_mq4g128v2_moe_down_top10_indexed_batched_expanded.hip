@@ -10,7 +10,7 @@
 // deterministic and prevents a second weighting in the grouped path.
 //
 // Wire rows use exactly 68*ceil(K/128) bytes.  This is deliberately not the
-// legacy 72-byte HFQ4G128 row stride.
+// legacy 72-byte HFQ4G128/Paro row stride.
 // The exact K640 module uses this same arithmetic with a constant trip
 // count. The generic entry remains the independent dynamic-K launch oracle.
 #ifndef QT53_DOWN_ENTRY

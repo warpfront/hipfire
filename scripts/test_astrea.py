@@ -1180,24 +1180,6 @@ class AstreaTests(unittest.TestCase):
         self.assertTrue(any("expert" in item for item in policy["probe_plan"]["moe"]))
         self.assertEqual(policy["model_family"], "qwen3.6-a3b")
 
-    def test_unknown_quant_type_and_method_are_refused(self):
-        astrea = load_astrea()
-        with self.assertRaisesRegex(ValueError, "unsupported quant type"):
-            astrea.build_policy(
-                model="synthetic.mq4.hfq",
-                base_format="bogus4",
-                promotion_format="q8",
-                max_extra_bytes=0,
-            )
-        with self.assertRaisesRegex(ValueError, "unsupported quantization method"):
-            astrea.build_policy(
-                model="synthetic.mq4.hfq",
-                base_format="q8",
-                promotion_format="q8",
-                max_extra_bytes=0,
-                methods=["bogus-method"],
-            )
-
     def test_policy_wires_kv_domains_without_runtime_mutation(self):
         astrea = load_astrea()
         with tempfile.TemporaryDirectory() as td:

@@ -3219,6 +3219,24 @@ fn load_f32_weight_from_source(
     })
 }
 
+/// Refuse a safetensors directory that declares any `quantization_config`:
+/// only raw FP directories load directly; quantized ones need an HFQ build.
+fn refuse_quantized_safetensors_dir(
+    source: &dyn crate::model_source::ModelSource,
+) -> HipResult<()> {
+    match source.quant_config() {
+        Some(qc) => Err(HipError::new(
+            0,
+            &format!(
+                "unsupported quantization_config.quant_method '{}' in a safetensors directory; \
+                 quantize the model to an HFQ build",
+                qc.method
+            ),
+        )),
+        None => Ok(()),
+    }
+}
+
 /// Load LLaMA/Qwen3 weights from a raw FP (F16/BF16/F32) safetensors model.
 /// Quantized checkpoints (any `quantization_config`) are refused: they need
 /// an HFQ build.
@@ -3230,16 +3248,7 @@ pub fn load_weights_safetensors_llama(
     config: &LlamaConfig,
     gpu: &mut Gpu,
 ) -> HipResult<LlamaWeights> {
-    if let Some(qc) = source.quant_config() {
-        return Err(HipError::new(
-            0,
-            &format!(
-                "unsupported quantization_config.quant_method '{}' in a safetensors directory; \
-                 quantize the model to an HFQ build",
-                qc.method
-            ),
-        ));
-    }
+    refuse_quantized_safetensors_dir(source)?;
     eprintln!("  loading token_embd (LLaMA/Qwen3 safetensors)...");
     let embd_name = "model.embed_tokens.weight";
     let (embd_info, embd_data) = source
@@ -3491,6 +3500,45 @@ pub struct HfqPackageEntry {
 #[cfg(test)]
 mod llama_config_tests {
     use super::*;
+
+    /// A safetensors directory with a `quantization_config` is refused before
+    /// any upload; the same directory without it is admitted as raw FP.
+    #[test]
+    fn safetensors_dir_refuses_any_quantization_config() {
+        use crate::safetensors_source::SafetensorsSource;
+        let header =
+            br#"{"model.embed_tokens.weight":{"dtype":"F16","shape":[2,2],"data_offsets":[0,8]}}"#;
+        let mut shard = (header.len() as u64).to_le_bytes().to_vec();
+        shard.extend_from_slice(header);
+        shard.extend_from_slice(&[0u8; 8]);
+        let open = |tag: &str, config: serde_json::Value| {
+            let dir = std::env::temp_dir().join(format!(
+                "hipfire-st-quant-refuse-{tag}-{}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+            std::fs::write(dir.join("model.safetensors"), &shard).unwrap();
+            (SafetensorsSource::open(&dir).unwrap(), dir)
+        };
+        let (quant, qdir) = open(
+            "q",
+            serde_json::json!({
+                "model_type": "llama",
+                "quantization_config": {"quant_method": "removed-method", "bits": 4, "group_size": 128}
+            }),
+        );
+        let err = refuse_quantized_safetensors_dir(&quant).unwrap_err();
+        assert!(
+            format!("{err:?}")
+                .contains("unsupported quantization_config.quant_method 'removed-method'"),
+            "{err:?}"
+        );
+        let (raw, rdir) = open("raw", serde_json::json!({"model_type": "llama"}));
+        assert!(refuse_quantized_safetensors_dir(&raw).is_ok());
+        let _ = std::fs::remove_dir_all(qdir);
+        let _ = std::fs::remove_dir_all(rdir);
+    }
 
     fn config_value(model_type: &str) -> serde_json::Value {
         serde_json::json!({

@@ -234,12 +234,21 @@ fn run_rejects_tag_plan_mismatch() {
         awq: false,
         batched: false,
     };
+    let g128 = RotationTag {
+        plan: RotationPlan::FwhtG128,
+        awq: false,
+        batched: false,
+    };
     let awq = RotationTag {
         plan: RotationPlan::FwhtG256,
         awq: true,
         batched: false,
     };
     assert!(check_rotation_tag(want, want).is_ok());
+    assert!(
+        check_rotation_tag(want, g128).is_err(),
+        "plan mismatch must reject"
+    );
     assert!(
         check_rotation_tag(want, awq).is_err(),
         "awq mismatch must reject"
