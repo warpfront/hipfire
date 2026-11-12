@@ -727,6 +727,15 @@ fn vl_turn(
     let mut out = std::io::stdout();
     hipfire_generate::vision::generate_vl(m, gpu, &mut out, &params);
     std::io::stdout().flush().expect("flush turn");
+    // Uncommitted turns end in cancel or error: whenever the abort lands
+    // (prefill, decode, or the commit wait), nothing of the turn may stay resident.
+    if !commit {
+        assert_eq!(m.seq_pos, 0, "{id}: uncommitted turn left seq_pos");
+        assert!(
+            m.conversation_tokens.is_empty(),
+            "{id}: uncommitted turn left tokens"
+        );
+    }
     clear_terminal_control();
     emit_marker(&format!("SECTION {id}"));
 }

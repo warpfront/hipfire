@@ -2523,7 +2523,23 @@ pub fn generate_vl(
             crate::ar::emit_active_route_done_value(stdout, &pending_done)
         }
         ClientTerminalDecision::Abort => {
-            crate::ar::emit_active_route_cancel(stdout, id, generated);
+            // Abort after the turn committed: roll back like the in-loop
+            // polls (and text AR), or the cancelled turn stays in context.
+            vl_cancel_after_rollback(
+                stdout,
+                id,
+                generated,
+                gpu,
+                dn,
+                kv,
+                &mut m.kv_adaptive,
+                &mut m.seq_pos,
+                &mut m.conversation_tokens,
+                &mut m.prefill_checkpoints,
+                &mut m.dflash_checkpoints,
+                &mut m.asst_turn_cache,
+                &mut m.speculator,
+            );
         }
     }
 }
