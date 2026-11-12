@@ -18,6 +18,7 @@
 //! [`Gfx942Device::qwen4_qsa_lanes_core`] launches.
 
 use std::collections::HashMap;
+use std::ffi::c_void;
 
 use hip_bridge::{DeviceBuffer, HipError, HipResult, KernargBlob};
 
@@ -140,11 +141,11 @@ pub(crate) struct Qwen4QsaLanesShape {
     /// The pooling capacity every lane declares (`shape_blocks`): the score row stride.
     pub(crate) pooled_capacity: usize,
     pub(crate) query_row_stride: usize,
-    pub(crate) index_q_norm: u64,
-    pub(crate) q_norm: u64,
-    pub(crate) k_norm: u64,
+    pub(crate) index_q_norm: *const c_void,
+    pub(crate) q_norm: *const c_void,
+    pub(crate) k_norm: *const c_void,
     /// The pool's norm (every lane shares it).
-    pub(crate) pool_norm: u64,
+    pub(crate) pool_norm: *const c_void,
     pub(crate) yarn: RopeYarn,
     /// The pool's RoPE (the same `RopeYarn` the lanes' prologue uses, as the interpreter builds it).
     pub(crate) pool_yarn: RopeYarn,
@@ -301,7 +302,7 @@ impl Gfx942Device<'_> {
         let mut args = KernargBlob::with_capacity(1280);
         args.push_ptr(table);
         for norm in [c.index_q_norm, c.q_norm, c.k_norm] {
-            args.push_u64(norm);
+            args.push_ptr(norm);
         }
         for v in [
             c.index_heads,
@@ -334,7 +335,7 @@ impl Gfx942Device<'_> {
         // exits at its first check).
         let mut args = KernargBlob::with_capacity(1280);
         args.push_ptr(table);
-        args.push_u64(c.pool_norm);
+        args.push_ptr(c.pool_norm);
         args.push_i32(int(c.compress, "compress")?);
         args.push_i32(int(c.index_kv_width, "index width")?);
         c.pool_yarn.push(&mut args);

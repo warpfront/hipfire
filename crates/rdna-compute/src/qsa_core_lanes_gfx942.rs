@@ -34,6 +34,7 @@ use crate::cdna::gfx942::{
 };
 use crate::{DType, Gpu};
 use hip_bridge::HipResult;
+use std::ffi::c_void;
 
 /// Most bytes of F32 score scratch (every lane's score rows at the pooled-capacity stride) a
 /// plan may ask the shared F16-X scratch for; a larger set runs per lane.
@@ -143,7 +144,7 @@ fn admit(gpu: &Gpu, lanes: &[QsaCoreLane<'_>]) -> HipResult<Option<Qwen4QsaLanes
     let mut descs: Vec<Qwen4QsaLaneDesc> = Vec::with_capacity(lanes.len());
     let (mut positions, mut rows_all) = (Vec::new(), Vec::new());
     let mut shape: Option<Qwen4QsaLanesShape> = None;
-    let mut pool_cfg: Option<(u64, crate::rope::RopeYarn)> = None;
+    let mut pool_cfg: Option<(*const c_void, crate::rope::RopeYarn)> = None;
     let (mut max_rows, mut pool_grid, mut max_blocks, mut attention_lds, mut pooled_capacity) =
         (0usize, 0usize, 0usize, 0usize, 0usize);
     // Per scratch / state family: the lane's [start, end) byte range.
@@ -326,10 +327,10 @@ fn admit(gpu: &Gpu, lanes: &[QsaCoreLane<'_>]) -> HipResult<Option<Qwen4QsaLanes
             full_capacity: a.full_capacity,
             pooled_capacity: 0,
             query_row_stride: s.query_row_stride,
-            index_q_norm: ptr(p.index_q_norm),
-            q_norm: ptr(p.q_norm),
-            k_norm: ptr(p.k_norm),
-            pool_norm: 0,
+            index_q_norm: p.index_q_norm.buf.as_ptr() as *const c_void,
+            q_norm: p.q_norm.buf.as_ptr() as *const c_void,
+            k_norm: p.k_norm.buf.as_ptr() as *const c_void,
+            pool_norm: std::ptr::null(),
             yarn: p.yarn,
             pool_yarn: p.yarn,
             max_rows: 0,
@@ -345,7 +346,11 @@ fn admit(gpu: &Gpu, lanes: &[QsaCoreLane<'_>]) -> HipResult<Option<Qwen4QsaLanes
         let Some(pool) = &lane.pool else {
             return Ok(None);
         };
-        let cfg = (pool.norm.map_or(0, ptr), pool.yarn);
+        let cfg = (
+            pool.norm
+                .map_or(std::ptr::null(), |norm| norm.buf.as_ptr() as *const c_void),
+            pool.yarn,
+        );
         match pool_cfg {
             None => pool_cfg = Some(cfg),
             Some(c) if c == cfg => {}
