@@ -10,6 +10,8 @@
   - Removed config keys (now fail the load, see `RETIRED_CONFIG_KEYS`): `kernel.moe_paro_i8`, `kernel.moe_paro_i8_k8`. Replacement: none (the grouped MoE i8 route is `kernel.moe_grouped_i8`).
   - Removed env vars (no longer read; no replacement, ParoQuant models are unsupported): `HIPFIRE_MOE_PARO_I8`, `HIPFIRE_MOE_PARO_I8_K8`, `HIPFIRE_PARO_BATCHED`, `HIPFIRE_PARO_DEBUG`, `HIPFIRE_PARO_FA3_FUSED`, `HIPFIRE_PARO_FUSED_PACK2`, `HIPFIRE_PARO_FUSE_RMSNORM`, `HIPFIRE_PARO_GATE_UP_FUSED`, `HIPFIRE_PARO_LA4_FUSED`, `HIPFIRE_PARO_PACK1`, `HIPFIRE_PARO_PREROTATE`, `HIPFIRE_PARO_ROTATE_DECIMATE`, `HIPFIRE_PARO_SHARED_PAIRS`, `HIPFIRE_PARO_SKIP_ROTATE`, `HIPFIRE_PARO_SMALL_DIRECT`, `HIPFIRE_PARO_SWIGLU_FUSED`.
 
+- Launcher ABI audit: derive natural size and alignment independently for plain by-value HIP structs with scalar fields and literal fixed-size scalar arrays. This covers QSA RopeYarn and lane-int tables without hardcoded type names; packed, attributed, nested, ambiguous, malformed and overflowing layouts fail closed.
+
 - PeaceMaker gfx942: preserve the original QSA lanes anchor as a negative-only seven-entry regression. Pin FLAT-segment, missing F16 comparison model, and unverified mixed-FMA encoding refusals; no deployable twin, new ledger allowance, or hardware qualification is claimed.
 
 - PeaceMaker gfx942: add a full device-ELF-identical Route-A twin of the five F32/select QSA lane entries from frozen owner c06ab5d626, with immutable source/anchor recipe, strict per-entry hazard and CFG wait proofs, ABI pins, and exact-image qualification. The two FP8 entries remain explicitly unsupported and negatively pinned; no new obligation class or verifier allowance is introduced.

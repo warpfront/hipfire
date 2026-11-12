@@ -618,6 +618,9 @@ pub fn preprocess(text: &str, predef: &BTreeMap<String, String>) -> Result<Strin
                 "undef" => {
                     defs.remove(&directive_ident(rest));
                 }
+                "pragma" if active && rest.trim_start().starts_with("pack") => {
+                    return Err("unsupported #pragma pack changes aggregate alignment".into());
+                }
                 "include" | "pragma" | "error" | "warning" | "line" => {}
                 other => return Err(format!("unsupported directive #{other}")),
             }
@@ -635,6 +638,150 @@ pub fn preprocess(text: &str, predef: &BTreeMap<String, String>) -> Result<Strin
     Ok(out)
 }
 
+/// Natural C layout of a named, plain struct. Only scalar fields and fixed-size scalar
+/// arrays are accepted; unsupported declarations never acquire a guessed layout.
+fn struct_layout(active: &str, ty: &str) -> Result<(u32, u32), String> {
+    let name = ty.strip_prefix("struct ").unwrap_or(ty);
+    if name.is_empty() || !name.chars().all(is_ident_char) {
+        return Err(format!("unsupported aggregate type {ty:?}"));
+    }
+    let c: Vec<char> = active.chars().collect();
+    let mut definitions = Vec::new();
+    let mut i = 0;
+    let mut depth = 0u32;
+    while i < c.len() {
+        if c[i] == '"' || c[i] == '\'' {
+            let quote = c[i];
+            i += 1;
+            while i < c.len() && c[i] != quote {
+                if c[i] == '\\' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            if i == c.len() {
+                return Err("unterminated literal while reading aggregate".into());
+            }
+            i += 1;
+            continue;
+        }
+        if starts_with_word(&c, i, "struct") && (i == 0 || !is_ident_char(c[i - 1])) {
+            let start = skip_ws(&c, i + 6);
+            let mut end = start;
+            while end < c.len() && is_ident_char(c[end]) {
+                end += 1;
+            }
+            if c[start..end].iter().collect::<String>() == name {
+                let body = skip_ws(&c, end);
+                if body < c.len() && c[body] == '{' {
+                    let previous = c[..i].iter().rev().find(|ch| !ch.is_whitespace());
+                    if depth != 0 || previous.is_some_and(|ch| !matches!(ch, ';' | '{' | '}')) {
+                        return Err(format!(
+                            "struct {name}: unsupported scope or declaration prefix"
+                        ));
+                    }
+                    let close = c[body + 1..]
+                        .iter()
+                        .position(|&ch| ch == '}')
+                        .map(|n| body + 1 + n)
+                        .ok_or_else(|| format!("unterminated struct {name}"))?;
+                    if c[body + 1..close].contains(&'{')
+                        || c.get(skip_ws(&c, close + 1)) != Some(&';')
+                    {
+                        return Err(format!("unsupported struct definition {name}"));
+                    }
+                    definitions.push(c[body + 1..close].iter().collect::<String>());
+                } else if body < c.len() && c[body] != ';' {
+                    // Attributes, inheritance and other definition modifiers are not plain C.
+                    // Ordinary references (`struct T *p`) do not define a type.
+                    let next = c[body..].iter().position(|&ch| ch == ';').map(|n| body + n);
+                    if next.is_some_and(|end| c[body..end].contains(&'{')) {
+                        return Err(format!("unsupported struct definition {name}"));
+                    }
+                }
+            }
+        }
+        match c[i] {
+            '{' => depth = depth.checked_add(1).ok_or("aggregate scope overflow")?,
+            '}' => depth = depth.checked_sub(1).ok_or("unbalanced aggregate scope")?,
+            _ => {}
+        }
+        i += 1;
+    }
+    if definitions.len() != 1 {
+        return Err(format!(
+            "aggregate {name}: expected one plain struct definition, got {}",
+            definitions.len()
+        ));
+    }
+    let fields = &definitions[0];
+    if !fields.trim_end().ends_with(';') {
+        return Err(format!("struct {name}: missing field terminator"));
+    }
+    let mut offset = 0u32;
+    let mut alignment = 1u32;
+    let mut count = 0usize;
+    let mut names = std::collections::BTreeSet::new();
+    for field in fields.split(';').filter(|s| !s.trim().is_empty()) {
+        let (declaration, extent) = if let Some((head, rest)) = field.split_once('[') {
+            let number = rest
+                .strip_suffix(']')
+                .ok_or("unsupported aggregate array")?
+                .trim();
+            if number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(format!("struct {name}: nonliteral array bound {number:?}"));
+            }
+            let extent = number
+                .parse::<u32>()
+                .map_err(|_| "aggregate array bound overflow")?;
+            if extent == 0 {
+                return Err(format!("struct {name}: zero array bound"));
+            }
+            (head.trim(), extent)
+        } else {
+            (field.trim(), 1)
+        };
+        let (ty, field_name) = declaration
+            .rsplit_once(char::is_whitespace)
+            .ok_or_else(|| format!("struct {name}: unsupported field {field:?}"))?;
+        if field_name.is_empty()
+            || !field_name.chars().all(is_ident_char)
+            || !field_name
+                .chars()
+                .next()
+                .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
+            || type_table(field_name).is_some()
+            || !names.insert(field_name)
+        {
+            return Err(format!("struct {name}: unsupported field {field:?}"));
+        }
+        let (size, _) = type_table(ty.trim())
+            .ok_or_else(|| format!("struct {name}: unsupported field type {ty:?}"))?;
+        alignment = alignment.max(size);
+        offset = offset
+            .checked_add(size - 1)
+            .ok_or("aggregate alignment overflow")?
+            / size
+            * size;
+        offset = offset
+            .checked_add(
+                size.checked_mul(extent)
+                    .ok_or("aggregate array size overflow")?,
+            )
+            .ok_or("aggregate size overflow")?;
+        count += 1;
+    }
+    if count == 0 {
+        return Err(format!("struct {name}: empty aggregate"));
+    }
+    let size = offset
+        .checked_add(alignment - 1)
+        .ok_or("aggregate tail alignment overflow")?
+        / alignment
+        * alignment;
+    Ok((size, alignment))
+}
+
 fn type_table(ty: &str) -> Option<(u32, char)> {
     Some(match ty {
         "int" | "int32_t" | "unsigned" | "unsigned int" | "uint32_t" => (4, 'i'),
@@ -649,7 +796,7 @@ fn type_table(ty: &str) -> Option<(u32, char)> {
     })
 }
 
-fn parse_arg(a: &str) -> Result<Arg, String> {
+fn parse_arg(a: &str, active: &str) -> Result<(Arg, u32), String> {
     // Only plain `type [qualifiers] [*] name [array]` declarators are understood:
     // anything else (function pointers, parenthesised names, defaults, references)
     // could change the real parameter size, so it fails closed.
@@ -669,12 +816,15 @@ fn parse_arg(a: &str) -> Result<Arg, String> {
     let joined = words.join(" ");
     // Pointers, and arrays (which adjust to pointers as parameters), are 8 bytes.
     if joined.contains('*') || joined.contains('[') {
-        return Ok(Arg {
-            offset: 0,
-            size: 8,
-            kind: 'p',
-            text: a.trim().to_string(),
-        });
+        return Ok((
+            Arg {
+                offset: 0,
+                size: 8,
+                kind: 'p',
+                text: a.trim().to_string(),
+            },
+            8,
+        ));
     }
     // Last word is the parameter name unless the whole text is a bare type.
     let (ty, _) = if type_table(&joined).is_some() {
@@ -683,14 +833,23 @@ fn parse_arg(a: &str) -> Result<Arg, String> {
         let (head, name) = words.split_at(words.len() - 1);
         (head.join(" "), name[0].to_string())
     };
-    let (size, kind) =
-        type_table(&ty).ok_or_else(|| format!("unknown kernel argument type {ty:?} in {a:?}"))?;
-    Ok(Arg {
-        offset: 0,
-        size,
-        kind,
-        text: a.trim().to_string(),
-    })
+    let (size, kind, alignment) = match type_table(&ty) {
+        Some((size, kind)) => (size, kind, size),
+        None => {
+            let (size, alignment) = struct_layout(active, &ty)
+                .map_err(|e| format!("unknown kernel argument type {ty:?} in {a:?}: {e}"))?;
+            (size, 'v', alignment)
+        }
+    };
+    Ok((
+        Arg {
+            offset: 0,
+            size,
+            kind,
+            text: a.trim().to_string(),
+        },
+        alignment,
+    ))
 }
 
 fn skip_balanced(c: &[char], mut i: usize) -> Result<usize, String> {
@@ -777,15 +936,27 @@ pub fn parse_globals(active: &str) -> Result<Vec<(String, Decl)>, String> {
                 if p.trim().is_empty() {
                     continue;
                 }
-                args.push(parse_arg(p)?);
+                args.push(parse_arg(p, active)?);
             }
             let mut off = 0u32;
-            for a in args.iter_mut() {
-                off = (off + a.size - 1) / a.size * a.size;
+            for (a, alignment) in args.iter_mut() {
+                off = off
+                    .checked_add(*alignment - 1)
+                    .ok_or("kernel argument alignment overflow")?
+                    / *alignment
+                    * *alignment;
                 a.offset = off;
-                off += a.size;
+                off = off
+                    .checked_add(a.size)
+                    .ok_or("kernel argument size overflow")?;
             }
-            out.push((name, Decl { args, end: off }));
+            out.push((
+                name,
+                Decl {
+                    args: args.into_iter().map(|(a, _)| a).collect(),
+                    end: off,
+                },
+            ));
             i = end;
         } else {
             i += 1;
@@ -834,4 +1005,84 @@ pub fn decls_of(text: &str) -> Result<BTreeMap<String, Decl>, String> {
 /// same bytes as a HIP `int`/`float`. A pointer never matches a scalar.
 fn kinds_compatible(a: char, b: char) -> bool {
     a == b || (a == 'v' && b != 'p') || (b == 'v' && a != 'p')
+}
+
+#[cfg(test)]
+mod aggregate_tests {
+    use super::*;
+
+    #[test]
+    fn plain_struct_size_and_alignment_are_independent() {
+        let source = "struct Yarn { float scale; float low; float high; float magnitude; };
+            struct Lanes { int positions[128]; int rows[128]; };
+            struct Padded { char first; double second; char last; };
+            __global__ void k(char prefix, Yarn yarn, Lanes lanes, int suffix, Padded padded) {}";
+        let declarations = decls_of(source).expect("plain aggregates");
+        let args = &declarations["k"].args;
+        assert_eq!(
+            args.iter()
+                .map(|a| (a.offset, a.size, a.kind))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, 1, 'i'),
+                (4, 16, 'v'),
+                (20, 1024, 'v'),
+                (1044, 4, 'i'),
+                (1048, 24, 'v')
+            ]
+        );
+        assert_eq!(declarations["k"].end, 1072);
+    }
+
+    #[test]
+    fn unsupported_aggregate_declarations_refuse_instead_of_guessing() {
+        for definition in [
+            "struct T {};",
+            "struct T { float a; float a; };",
+            "struct T { float *p; };",
+            "struct T { float a[0]; };",
+            "struct T { float a[]; };",
+            "struct T { float a[1 + 1]; };",
+            "struct T { float a[2][2]; };",
+            "struct T { float a[4294967295]; };",
+            "struct T { float a:1; };",
+            "struct T { float a = 1; };",
+            "struct T { static float a; };",
+            "struct T { float a, b; };",
+            "struct T { float a };",
+            "struct T { struct Nested { float a; } b; };",
+            "struct T { float a; }; struct T { float b; };",
+            "struct __attribute__((packed)) T { float a; };",
+            "__attribute__((packed)) struct T { float a; };",
+            "struct T { float a; } __attribute__((packed));",
+            "struct alignas(16) T { float a; };",
+            "struct T : Base { float a; };",
+            "union T { float a; int b; };",
+            "void helper() { struct T { float a; }; }",
+            "namespace hidden { struct T { float a; }; }",
+            "#pragma pack(push, 1)\nstruct T { float a; };",
+        ] {
+            let source = format!("{definition}\n__global__ void k(T value) {{}}");
+            assert!(decls_of(&source).is_err(), "accepted {definition}");
+        }
+    }
+
+    #[test]
+    fn aggregate_architecture_drift_and_parameter_overflow_refuse() {
+        let source = "struct T {
+            #if defined(__gfx942__)
+            double value;
+            #else
+            float value;
+            #endif
+            };
+            __global__ void k(T value) {}";
+        assert!(decls_of(source).is_err());
+        let overflow = "struct T { char bytes[4294967295]; };
+            __global__ void k(T value, int next) {}";
+        assert!(decls_of(overflow).is_err());
+        let macros = "#define N 128\nstruct T { int first[N]; int second[N]; };
+            __global__ void k(struct T value) {}";
+        assert_eq!(decls_of(macros).unwrap()["k"].args[0].size, 1024);
+    }
 }
