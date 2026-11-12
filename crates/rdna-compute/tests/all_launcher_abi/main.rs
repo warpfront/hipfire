@@ -1071,6 +1071,111 @@ fn tuple_match_kernel_selectors_check_every_arm_and_fail_closed() {
 }
 
 #[test]
+fn tuple_let_match_projects_each_name_and_skips_only_diverging_arms() {
+    // `let (first, second) = match ..` : `first` stands for the first component of every
+    // value arm and `second` for the second. The two components have DIFFERENT ABIs, so any
+    // overapproximation (a name checked against the other component's kernels) fails.
+    let source = |arms: &str| {
+        format!(
+            "fn launch(gpu: &Gpu, sym: &str, args: &mut KernargBlob) {{
+                gpu.launch_kernel_blob(sym, g, bl, 0, args.as_mut_slice()).unwrap();
+            }}
+            fn run(gpu: &Gpu, fmt: Fmt, wide: bool) -> Result<(), HipError> {{
+                {SMALL_LETS}
+                let (first, second) = match fmt {{ {arms} }};
+                let mut b = KernargBlob::new();
+                b.push_ptr(wp); b.push_i32(nv); b.push_f32(sc); b.push_u64(big);
+                let mut c = KernargBlob::new();
+                c.push_ptr(wp); c.push_i32(nv); c.push_f32(sc); c.push_u64(big); c.push_i32(nv);
+                launch(gpu, first, &mut b);
+                launch(gpu, second, &mut c);
+                Ok(())
+            }}"
+        )
+    };
+    let first_decl = small_decl;
+    let second_decl = || Decl::from_scalars(&[(8, 'p'), (4, 'i'), (4, 'f'), (8, 'i'), (4, 'i')]);
+    let symbols = |names: &[&'static str]| -> Vec<(&'static str, Decl)> {
+        names
+            .iter()
+            .map(|n| {
+                (
+                    *n,
+                    if n.starts_with("p_") {
+                        first_decl()
+                    } else {
+                        second_decl()
+                    },
+                )
+            })
+            .collect()
+    };
+    let ab = ["p_a", "s_a", "p_b", "s_b"];
+    let abc = ["p_a", "s_a", "p_b", "s_b", "p_c", "s_c"];
+    let positive: [(&str, &[&'static str]); 3] = [
+        // A block `return` arm (the QSA lane selector shape).
+        (
+            r#"Fmt::A => ("p_a", "s_a"), Fmt::B => ("p_b", "s_b"),
+               other => { return refuse(other, "no_such_kernel") }"#,
+            &ab,
+        ),
+        // A comma-less block arm, then a block arm that ends in `return ..;`.
+        (
+            r#"Fmt::A => { ("p_a", "s_a") }
+               Fmt::B => ("p_b", "s_b"),
+               other => { log(other); return Err("no_such_kernel".into()); }"#,
+            &ab,
+        ),
+        // A bare `return` arm, plus a nested `if` arm that itself yields tuples.
+        (
+            r#"Fmt::C => return Err("no_such_kernel"),
+               Fmt::A => ("p_a", "s_a"),
+               Fmt::B => if wide { ("p_b", "s_b") } else { ("p_c", "s_c") },"#,
+            &abc,
+        ),
+    ];
+    for (arms, names) in positive {
+        let src = source(arms);
+        let (abi, cov) = run_synth_at(PROBE_PATH, &src, &symbols(names), &no_policy());
+        assert!(abi.is_empty() && cov.is_empty(), "{arms}: {abi:?} {cov:?}");
+        // Every candidate name of each component is still checked against its own ABI.
+        for (index, name) in names.iter().enumerate() {
+            let mut bad = symbols(names);
+            bad[index].1 = if name.starts_with("p_") {
+                second_decl()
+            } else {
+                first_decl()
+            };
+            let (abi, cov) = run_synth_at(PROBE_PATH, &src, &bad, &no_policy());
+            assert!(
+                abi.iter().chain(&cov).any(|p| p.contains(name)),
+                "{name} escaped checking in {arms}: {abi:?} {cov:?}"
+            );
+        }
+    }
+    // Conservative fallback: an arm that neither projects nor provably diverges makes the
+    // whole initialiser the origin again, so the cross-component mismatch (or the
+    // unresolved name) is reported instead of being silently dropped.
+    let fallback = [
+        // A non-diverging block ending in an opaque expression.
+        r#"Fmt::A => ("p_a", "s_a"), Fmt::B => ("p_b", "s_b"),
+           other => { log(other); fallback_pair }"#,
+        // A call that merely looks like a refusal does not diverge.
+        r#"Fmt::A => ("p_a", "s_a"), Fmt::B => ("p_b", "s_b"),
+           other => { refuse(other) }"#,
+        // An arm without the component: tuple of the wrong arity.
+        r#"Fmt::A => ("p_a", "s_a"), Fmt::B => ("p_b", "s_b"), other => ("p_b",),"#,
+    ];
+    for arms in fallback {
+        let (abi, cov) = run_synth_at(PROBE_PATH, &source(arms), &symbols(&ab), &no_policy());
+        assert!(
+            !abi.is_empty() || !cov.is_empty(),
+            "an unprojectable arm must fall back to the whole initialiser: {arms}"
+        );
+    }
+}
+
+#[test]
 fn negative_blob_layout_and_alignment_mistakes_are_rejected() {
     let good = "            b.push_ptr(wp);\n            b.push_i32(nv);\n            b.push_f32(sc);\n            b.push_u64(big);\n";
     let (abi, cov) = run_synth(
