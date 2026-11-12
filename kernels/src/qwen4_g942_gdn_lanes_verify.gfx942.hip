@@ -797,3 +797,4 @@ extern "C" __global__ __launch_bounds__(32) void qwen4_g942_gdn_lanes_gate_batch
                              (const __hip_bfloat16*)lane.norm, (float*)lane.gdn_output,
                              flat_head * 128, (int)threadIdx.x, rounded);
 }
+#endif
