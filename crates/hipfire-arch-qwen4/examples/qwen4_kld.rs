@@ -2355,6 +2355,8 @@ fn g2(
             // Cold reference of `second` (also fills the pool with the boundary at p).
             m.bundle.reset(&mut m.gpu).map_err(|e| e.to_string())?;
             let cold = run(&mut m, &second, 0)?;
+            // Publish the turn-boundary snapshots captured during the cold prefill.
+            m.bundle.session_commit();
             // Drop the live state, keep the pool: the next prefill restores the snapshot.
             m.bundle.reset(&mut m.gpu).map_err(|e| e.to_string())?;
             let reused = m.bundle.session_plan(&second, SessionRoute::Ar);
