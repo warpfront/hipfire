@@ -37,6 +37,29 @@ pub const QWEN4_QSA_LANES_SELECT: &str = "qwen4_qsa_lanes_select_from_scores_gfx
 pub const QWEN4_QSA_LANES_ATTENTION_F32: &str = "qwen4_qsa_lanes_attention_f32_gfx942";
 pub const QWEN4_QSA_LANES_ATTENTION_FP8_FNUZ: &str = "qwen4_qsa_lanes_attention_fp8_fnuz_gfx942";
 
+/// Bind `kernel` of the QSA lanes module: the hipcc source (the anchor object), or, only when
+/// `HIPFIRE_QWEN4_G942_QSA_LANES_IMAGE=/absolute/device.elf` names one, that explicitly supplied
+/// code object (the Route-A twin proof: same module, same entry names, loaded through
+/// `ensure_embedded_kernel`). Unset: the source, unchanged.
+fn g942_qsa_lanes_ensure(gpu: &mut crate::Gpu, kernel: &str) -> HipResult<()> {
+    match hipfire_config::developer_var("HIPFIRE_QWEN4_G942_QSA_LANES_IMAGE") {
+        Ok(path) if !path.is_empty() => {
+            let bytes = std::fs::read(&path).map_err(|error| {
+                HipError::new(
+                    0,
+                    &format!("HIPFIRE_QWEN4_G942_QSA_LANES_IMAGE {path}: {error}"),
+                )
+            })?;
+            gpu.ensure_embedded_kernel(
+                QWEN4_QSA_LANES_MODULE,
+                std::sync::Arc::<[u8]>::from(bytes),
+                kernel,
+            )
+        }
+        _ => gpu.ensure_kernel(QWEN4_QSA_LANES_MODULE, QWEN4_QSA_LANES_SRC, kernel),
+    }
+}
+
 /// Most lanes one launch covers (`QWEN4_QSA_LANES_MAX` in the kernel file: the by-value
 /// per-step table is 8 bytes a lane inside the 4 KiB kernarg limit).
 pub const QWEN4_QSA_LANES_MAX: usize = 128;
@@ -263,8 +286,7 @@ impl Gfx942Device<'_> {
             QWEN4_QSA_LANES_SELECT,
             attention,
         ] {
-            self.gpu
-                .ensure_kernel(QWEN4_QSA_LANES_MODULE, QWEN4_QSA_LANES_SRC, kernel)?;
+            g942_qsa_lanes_ensure(self.gpu, kernel)?;
         }
         // By-value per-step table (`struct Qwen4QsaLaneInts`): positions, then rows.
         let push_ints = |args: &mut KernargBlob| {

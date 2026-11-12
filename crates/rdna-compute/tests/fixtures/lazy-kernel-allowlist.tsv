@@ -1137,7 +1137,7 @@ module	qwen4_gdn_lanes_step_f32_gfx942	non-target-arch	Only non-target gfx942 re
 module	qwen4_moe_down_a8_gfx1201	developer-opt-in	Non-default developer override: HIPFIRE_QWEN4_MOE_DOWN_A8; rdna-compute/src/qwen4_moe_down_a8.rs:343
 module	qwen4_moe_ep_a8_gfx12	developer-opt-in	Developer overrides HIPFIRE_QWEN4_MOE_EP_A8 (EP prefill) and HIPFIRE_QWEN4_MOE_GU_A8 (default-on kill switch, EP2 9..=64-row verify), like qwen4_moe_down_a8_gfx1201; rdna-compute/src/qwen4_moe_ep_a8.rs:525
 module	qwen4_moe_rotate128_i8_gfx12	developer-opt-in	Developer overrides HIPFIRE_QWEN4_MOE_EP_A8 (EP prefill) and HIPFIRE_QWEN4_MOE_GU_A8 (default-on kill switch, EP2 9..=64-row verify); rdna-compute/src/qwen4_moe_ep_a8.rs:358
-module	qwen4_qsa_lanes_f32_gfx942	non-target-arch	Only non-target gfx942 reaches this path (exact gfx942 batched QSA lanes core, resolved by arch); rdna-compute/src/cdna/gfx942_qsa_lanes.rs:267
+module	qwen4_qsa_lanes_f32_gfx942	non-target-arch	Only non-target gfx942 reaches this path (exact gfx942 batched QSA lanes core, resolved by arch); rdna-compute/src/cdna/gfx942_qsa_lanes.rs:289
 module	rmsnorm_f32_at_slot_buf	non-core-family	Non-core family route: DeepSeek4; hipfire-arch-deepseek4/src/forward.rs:2362
 module	rmsnorm_f32_staged_buf	non-core-family	Non-core family route: DeepSeek4; rdna-compute/src/attention.rs:19388
 module	rmsnorm_f32_warp_reduce	no-caller	Dead branch: warp_reduce=false; no production caller; rdna-compute/src/norm.rs:188-191

@@ -952,6 +952,34 @@ struct Qwen4QsaLaneInts {
     int rows[QWEN4_QSA_LANES_MAX];
 };
 
+// Every pointer a lane kernel dereferences (the lane table's pointers, the shared norms and the
+// score scratch) is device global memory. The table's pointers are loaded from memory, so the
+// compiler cannot prove an address space for them and would emit FLAT loads and stores; the cast
+// through `address_space(1)` and back states the fact, address-space inference then makes every
+// access through them a GLOBAL instruction. Same address, same value: no arithmetic changes.
+template <typename T>
+static __device__ __forceinline__ T* qsa_lanes_global(T* p) {
+    return (T*)(__attribute__((address_space(1))) T*)(unsigned long)p;
+}
+
+// Lane `l`'s descriptor, every pointer in global memory.
+static __device__ __forceinline__ Qwen4QsaLaneDesc qwen4_qsa_lanes_desc(
+    const Qwen4QsaLaneDesc* table, int l) {
+    Qwen4QsaLaneDesc d = table[l];
+    d.full_keys = qsa_lanes_global(d.full_keys);
+    d.full_values = qsa_lanes_global(d.full_values);
+    d.raw_idx = qsa_lanes_global(d.raw_idx);
+    d.pooled = qsa_lanes_global(d.pooled);
+    d.sel_persist = qsa_lanes_global(d.sel_persist);
+    d.index_row = qsa_lanes_global(d.index_row);
+    d.qgate = qsa_lanes_global(d.qgate);
+    d.keys = qsa_lanes_global(d.keys);
+    d.values = qsa_lanes_global(d.values);
+    d.selected = qsa_lanes_global(d.selected);
+    d.output = qsa_lanes_global(d.output);
+    return d;
+}
+
 // prologue: grid [index_heads + heads + kv_heads + 1, max_rows, lanes], block 256.
 template <int F>
 static __device__ __forceinline__ void qwen4_qsa_lanes_prologue(
@@ -969,7 +997,7 @@ static __device__ __forceinline__ void qwen4_qsa_lanes_prologue(
     Qwen4QsaLaneInts ints) {
     const int l = (int)blockIdx.z;
     if ((int)blockIdx.y >= ints.rows[l]) return;
-    const Qwen4QsaLaneDesc d = table[l];
+    const Qwen4QsaLaneDesc d = qwen4_qsa_lanes_desc(table, l);
     qsa_decode_prologue<F, float>(
         d.index_row, d.qgate, d.keys, d.values, d.full_keys, d.full_values, d.raw_idx,
         index_q_norm, q_norm, k_norm, index_heads, index_dim, index_kv_width, heads, kv_heads,
@@ -1001,7 +1029,7 @@ extern "C" __global__ void qwen4_qsa_lanes_pool_f32_gfx942(
     RopeYarn yarn,
     Qwen4QsaLaneInts ints) {
     const int l = (int)blockIdx.z;
-    const Qwen4QsaLaneDesc d = table[l];
+    const Qwen4QsaLaneDesc d = qwen4_qsa_lanes_desc(table, l);
     qsa_pool_rope<float>(d.raw_idx, d.pooled, norm, (ints.pos[l] + ints.rows[l]) / compress,
                          compress, index_dim, ints.pos[l] / compress, yarn);
 }
@@ -1024,7 +1052,7 @@ extern "C" __global__ __launch_bounds__(256) void qwen4_qsa_lanes_scores_rows8_f
     const int block_count = (pos + rows) / compress;
     // A whole workgroup past the lane's blocks: the per-lane grid does not have it.
     if ((int)blockIdx.x * 256 >= block_count) return;
-    const Qwen4QsaLaneDesc d = table[l];
+    const Qwen4QsaLaneDesc d = qwen4_qsa_lanes_desc(table, l);
     indexed_attention_select_scores_rows<8>(d.index_row, d.pooled,
                                             scores + (size_t)l * (size_t)lane_stride, rows,
                                             query_row_stride, block_count, index_dim, compress,
@@ -1045,7 +1073,7 @@ extern "C" __global__ __launch_bounds__(256) void qwen4_qsa_lanes_select_from_sc
     const int pos = ints.pos[l];
     const int rows = ints.rows[l];
     if ((int)blockIdx.x >= rows) return;
-    const Qwen4QsaLaneDesc d = table[l];
+    const Qwen4QsaLaneDesc d = qwen4_qsa_lanes_desc(table, l);
     qsa_lanes_select_from_scores_body(scores + (size_t)l * (size_t)lane_stride, score_stride,
                                       d.selected, rows, (pos + rows) / compress, budget_blocks,
                                       compress, pos, capacity, d.sel_persist);
@@ -1070,7 +1098,7 @@ static __device__ __forceinline__ void qwen4_qsa_lanes_attention(
     const int l = (int)blockIdx.z / max_rows;
     const int row = (int)blockIdx.z - l * max_rows;
     if (row >= ints.rows[l]) return;
-    const Qwen4QsaLaneDesc d = table[l];
+    const Qwen4QsaLaneDesc d = qwen4_qsa_lanes_desc(table, l);
     int visible = ints.pos[l] + row + 1;
     int block_count = visible / compress;
     int chosen = budget_blocks < block_count ? budget_blocks : block_count;

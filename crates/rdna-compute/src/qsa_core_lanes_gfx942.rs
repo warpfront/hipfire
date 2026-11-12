@@ -85,7 +85,7 @@ pub(crate) fn qsa_lanes_gfx942_gpu_refusal(
 /// launches (see [`Qwen4QsaLanesPlan`] and `Gfx942Device::qwen4_qsa_lanes_core`).
 ///
 /// Refuses (`Ok(None)`: nothing launched, run the lanes one by one) unless the arch is exact gfx942, no replay tape is recording and no
-/// hipGraph capture is open, and every lane is an F32 or FNUZ-fp8 Full decode / verify
+/// hipGraph capture is open, and every lane is an F32-state Full decode / verify
 /// window of 1..=8 rows that completes at least one pooled block and whose per-lane launches
 /// would be: the one-launch prologue, the incremental pool, the live rows-8 score /
 /// select-from-scores pair with the persistent mirror, and the one-row per-head parallel
@@ -95,7 +95,22 @@ pub fn qsa_core_lanes_gfx942(
     gpu: &Gpu,
     lanes: &[QsaCoreLane<'_>],
 ) -> HipResult<Option<Qwen4QsaLanesPlan>> {
+    // E4M3-FNUZ K/V takes the per-lane route: its kernels convert through opcodes the PeaceMaker
+    // CDNA twin sealer does not model. (`qsa_core_lanes_gfx942_min`, the byte oracle's entry,
+    // still admits them.)
+    if lanes
+        .iter()
+        .any(|lane| !qsa_lanes_gfx942_format_admitted(lane.prologue.format))
+    {
+        return Ok(None);
+    }
     qsa_core_lanes_gfx942_min(gpu, lanes, 2)
+}
+
+/// Whether the interpreter's lane route (`qsa_core_lanes_gfx942`) takes lanes with K/V state
+/// `format`: F32 only. E4M3-FNUZ lanes run the per-lane launches.
+pub(crate) fn qsa_lanes_gfx942_format_admitted(format: QsaKvFormat) -> bool {
+    format == QsaKvFormat::F32
 }
 
 /// [`qsa_core_lanes_gfx942`] admitting `min_lanes..=`[`QWEN4_QSA_LANES_MAX`] lanes. The
@@ -444,6 +459,12 @@ mod tests {
             extent_check: false,
             select_exact: false,
         }
+    }
+
+    #[test]
+    fn interpreter_route_declines_fnuz_kv() {
+        assert!(qsa_lanes_gfx942_format_admitted(QsaKvFormat::F32));
+        assert!(!qsa_lanes_gfx942_format_admitted(QsaKvFormat::Fp8Fnuz));
     }
 
     #[test]
