@@ -12,8 +12,6 @@
       a deprecated key or value;
     - CI entry points (`scripts/no-gpu-ci.sh`, `.github/workflows/*`,
       `.githooks/*`) never invoke a deprecated script;
-    - deprecated code that IS reached by default (only the extension-based
-      MQ4R / DS4 MQ2R route selection) is listed in DEFAULT_REACHED_ALLOWLIST.
 (b) Every env var and config key carries a lifecycle status:
     - `docs/CONFIG.md` lifecycle table == schema keys + derived status;
     - `docs/env-vars.md` generated inventory == `HIPFIRE_*` token scan + status.
@@ -55,15 +53,6 @@ ENV_VALUE_NOTES = {
 }
 # Developer-namespace spellings of deprecated env knobs (for TOML profiles).
 DEPRECATED_DEVELOPER_KEYS: set[str] = set()
-# Deprecated code that the default path still reaches, by explicit decision:
-# it is the only way to select the route today, so it warns nowhere.
-DEFAULT_REACHED_ALLOWLIST = {
-    ("crates/hipfire-runtime/src/config.rs", "MQ4R route selection by file extension"),
-    ("crates/hipfire-runtime/src/config.rs", "DS4 MQ2R selection by file extension"),
-    ("crates/hipfire-runtime/src/config.rs", "A3B symmetric-MQ4R (`.mq4rs`) route selection by file extension"),
-    ("crates/hipfire-cli/src/serve/mod.rs", "MQ4R route selection by file extension"),
-    ("crates/hipfire-arch-deepseek4/src/deepseek4.rs", "DS4 MQ2R selection by file extension"),
-}
 CI_ENTRY_GLOBS = ["scripts/no-gpu-ci.sh", ".github/workflows/*", ".githooks/*"]
 STATUSES = ("stable", "experimental", "developer", "harness", "deprecated")
 
@@ -270,13 +259,6 @@ def check_defaults(fields: list[dict]) -> list[str]:
         for script in deprecated_scripts:
             if re.search(rf"(?<![\w-]){re.escape(script)}\b", text):
                 errors.append(f"(a) CI entry {entry} invokes deprecated {script}")
-
-    # Markers that say the default path reaches them must be allowlisted.
-    for path in git_files("crates/*.rs", "crates/**/*.rs"):
-        for line in (ROOT / path).read_text(encoding="utf-8", errors="ignore").splitlines():
-            if MARK in line and "no runtime warning" in line:
-                if not any(path == p and r in line for p, r in DEFAULT_REACHED_ALLOWLIST):
-                    errors.append(f"(a) {path}: default-reached deprecated marker not allowlisted: {line.strip()}")
     return errors
 
 
@@ -438,8 +420,7 @@ def main() -> int:
     dep_env = sum(1 for s in env_statuses.values() if s.startswith("deprecated"))
     print(
         f"check-lifecycle: {len(fields)} config keys ({deprecated} deprecated, gates inert), "
-        f"{len(env_statuses)} env vars ({dep_env} deprecated) carry a lifecycle status; "
-        f"{len(DEFAULT_REACHED_ALLOWLIST)} allowlisted default-reached deprecated route(s)"
+        f"{len(env_statuses)} env vars ({dep_env} deprecated) carry a lifecycle status"
     )
     return 0
 

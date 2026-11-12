@@ -585,8 +585,9 @@ recorder-aware launch site
 **Runtime routing/default ≠ admission or certification.** Example runtime
 automatic default (source capability/default fact only, `REDLINE.md`; not an
 admission or certification record): `mq4r_redline_default` — exact GPU arch
-`gfx1100`/`gfx1151`/`gfx1201` + PP=1 + TP=1 + case-insensitive `.mq4r`
-extension configures model default replay backend (model-family agnostic; no
+`gfx1100`/`gfx1151`/`gfx1201` + PP=1 + TP=1 + the MQ4R SKU (HFQ
+metadata or registry card, never the file extension) configures model default
+replay backend (model-family agnostic; no
 `arch_id` gate); `gfx1200` and all other arches remain opt-in. Built-in `hip`
 config profile, explicit `HIPFIRE_REPLAY_BACKEND`, or manual capture disables
 the automatic default / opts into broader capability.

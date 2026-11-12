@@ -10,7 +10,7 @@
 //! and a kernarg ABI to `redline-dispatch` before installing a prepared plan.
 //! Replay remains default-off except for the runtime automatic default
 //! `mq4r_redline_default` (exact `gfx1100`/`gfx1151`/`gfx1201`, single-GPU,
-//! case-insensitive `.mq4r`; `gfx1200`/others opt-in)
+//! the MQ4R route SKU (HFQ metadata or registry card); `gfx1200`/others opt-in)
 //! selected by the daemon after model load. Runtime default ≠ Redline
 //! certification/registry admission; built-in `hip` profile or explicit backend
 //! selection disables the automatic default.

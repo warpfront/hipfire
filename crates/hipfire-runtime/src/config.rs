@@ -8,30 +8,29 @@
 //! `RuntimeConfig::get()` accessor. Runtime hot paths access config
 //! fields instead of hitting `std::env::var` on every call.
 
+use crate::route_sku::RouteSku;
 use std::sync::OnceLock;
 
-// lifecycle: deprecated since 0.4.0, removal 0.5.0 — MQ4R route selection by file extension; 0.5.0 selects by HFQ metadata (no runtime warning: only way to reach the route today)
-/// Automatic Redline runtime default for single-GPU MQ4R models.
-pub fn mq4r_redline_default(gpu_arch: &str, model_path: &str, pp: usize, tp: usize) -> bool {
+/// Automatic Redline runtime default for single-GPU MQ4R models. The SKU is
+/// the file's identity ([`RouteSku::Mq4r`], see [`crate::route_sku`]); the
+/// file name is never read.
+pub fn mq4r_redline_default(gpu_arch: &str, route: Option<RouteSku>, pp: usize, tp: usize) -> bool {
     matches!(gpu_arch, "gfx1100" | "gfx1151" | "gfx1201")
         && pp == 1
         && tp == 1
-        && std::path::Path::new(model_path)
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("mq4r"))
+        && route == Some(RouteSku::Mq4r)
 }
 
 /// Automatic retained-Redline admission for a loaded model.
 ///
-/// MQ4R keeps its existing cross-model policy with three carve-outs. Muse
+/// MQ4R ([`RouteSku::Mq4r`]) keeps its existing cross-model policy with three carve-outs. Muse
 /// Glimmer (arch 14) IS an MQ4R Redline SKU, but it is not lowered to
 /// Redline PM4 yet, so automatic admission is withheld until that lowering
-/// lands — the extension-only policy would otherwise route Glimmer onto a
+/// lands — the SKU-only policy would otherwise route Glimmer onto a
 /// dispatch path that cannot yet execute it. Delete this carve-out together
 /// with the lowering. Gemma 4 (arch 13, every variant) is never admitted
 /// automatically: its retained tape is not validated (the E4B PM4 shadow is
-/// not exact), so a Gemma 4 `.mq4r` stays on the HIP graph unless Redline is
+/// not exact), so a Gemma 4 MQ4R file stays on the HIP graph unless Redline is
 /// selected explicitly. DeepSeek4 MQ2R is narrower still: only the certified
 /// gfx1151 single-GPU AR route is admitted, and an installed drafter keeps the
 /// model on its speculative execution path. Qwen3.5 dense (arch 5) on exact
@@ -40,7 +39,7 @@ pub fn mq4r_redline_default(gpu_arch: &str, model_path: &str, pp: usize, tp: usi
 /// AR graph. Qwen4 (Flash-Next) on exact gfx1201 is admitted the same way:
 /// single GPU, no drafter (a native MTP head is a drafter, so only an
 /// MTP-off load replays), byte-identical greedy text to the HIP graph.
-/// The symmetric-expert A3B file (`qwen3_5_moe`, `.mq4rs`) on exact gfx1201 is
+/// The symmetric-expert A3B SKU (`qwen3_5_moe`, [`RouteSku::Mq4rs`]) on exact gfx1201 is
 /// admitted the same way (single GPU, no drafter, PM4 transport), with greedy
 /// ids identical to the HIP route. The Qwen3.5 dense `.mq3-xt` file on exact
 /// gfx1100 is admitted for single-GPU plain-AR decode (no drafter): its
@@ -56,13 +55,14 @@ pub fn mq4r_redline_default(gpu_arch: &str, model_path: &str, pp: usize, tp: usi
 /// which a single-device retained tape cannot record, so it is never admitted.
 ///
 /// Qwen4 (Flash-Next) on gfx1100/gfx1151 is never admitted automatically,
-/// `.mq4r` included (HIPF-254): recording closes the eager-only QSA split-KV
+/// the MQ4R SKU included (HIPF-254): recording closes the eager-only QSA split-KV
 /// decode attention, so the replay differs from the HIP route and measured
 /// slower on gfx1151.
 pub fn retained_redline_default(
     gpu_arch: &str,
     model_arch: &str,
     model_path: &str,
+    route: Option<RouteSku>,
     pp: usize,
     tp: usize,
     ep: usize,
@@ -84,8 +84,8 @@ pub fn retained_redline_default(
     if is_qwen35_family(model_arch) && cpu_offload_configured() {
         return false;
     }
-    // gfx1100 `.mq3-xt` (Qwen3.5 dense, plain AR): selected by file extension, like the
-    // `.mq4r` rule; its receipts are the 27B served identity + tok/s in CHANGELOG.md.
+    // gfx1100 `.mq3-xt` (Qwen3.5 dense, plain AR): selected by file extension;
+    // its receipts are the 27B served identity + tok/s in CHANGELOG.md.
     if gpu_arch == "gfx1100"
         && model_arch.eq_ignore_ascii_case("qwen3_5")
         && pp == 1
@@ -98,7 +98,7 @@ pub fn retained_redline_default(
     {
         return true;
     }
-    if mq4r_redline_default(gpu_arch, model_path, pp, tp) {
+    if mq4r_redline_default(gpu_arch, route, pp, tp) {
         return true;
     }
     if gpu_arch.eq_ignore_ascii_case("gfx1201")
@@ -109,29 +109,21 @@ pub fn retained_redline_default(
     {
         return true;
     }
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — A3B symmetric-MQ4R (`.mq4rs`) route selection by file extension; 0.5.0 selects by HFQ metadata (symmetric IU4 headers verified at load) (no runtime warning: only way to reach the route today)
     if gpu_arch.eq_ignore_ascii_case("gfx1201")
         && model_arch.eq_ignore_ascii_case("qwen3_5_moe")
         && pp == 1
         && tp == 1
         && !has_drafter
-        && std::path::Path::new(model_path)
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("mq4rs"))
+        && route == Some(RouteSku::Mq4rs)
     {
         return true;
     }
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — DS4 MQ2R selection by file extension; 0.5.0 selects by HFQ metadata (no runtime warning: only way to reach the route today)
     gpu_arch.eq_ignore_ascii_case("gfx1151")
         && model_arch.eq_ignore_ascii_case("deepseek4")
         && pp == 1
         && tp == 1
         && !has_drafter
-        && std::path::Path::new(model_path)
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("mq2r"))
+        && route == Some(RouteSku::Mq2r)
 }
 
 fn is_qwen35_family(model_arch: &str) -> bool {
@@ -335,8 +327,52 @@ mod legacy_spelling_golden;
 
 #[cfg(test)]
 mod tests {
-    use super::{mq4r_redline_default, retained_redline_default as redline_with_ep, RuntimeConfig};
+    use super::{
+        mq4r_redline_default as mq4r_with_route, retained_redline_default as redline_with_route,
+        RuntimeConfig,
+    };
+    use crate::route_sku::RouteSku;
     use hipfire_config::{resolve, ConfigLayer, ConfigSource, NamedLayer, ProcessConfig};
+
+    /// The SKU a fixture name stands for. Production resolves the SKU from the
+    /// HFQ metadata or the registry card and never reads a name; these tests
+    /// spell the already-resolved SKU through the fixture file name so each
+    /// case stays one line.
+    fn fixture_route(model_path: &str) -> Option<RouteSku> {
+        let lower = model_path.to_ascii_lowercase();
+        [
+            (".mq4rs", RouteSku::Mq4rs),
+            (".mq4r", RouteSku::Mq4r),
+            (".mq2r", RouteSku::Mq2r),
+        ]
+        .into_iter()
+        .find_map(|(suffix, sku)| lower.ends_with(suffix).then_some(sku))
+    }
+
+    fn mq4r_redline_default(gpu_arch: &str, model_path: &str, pp: usize, tp: usize) -> bool {
+        mq4r_with_route(gpu_arch, fixture_route(model_path), pp, tp)
+    }
+
+    fn redline_with_ep(
+        gpu_arch: &str,
+        model_arch: &str,
+        model_path: &str,
+        pp: usize,
+        tp: usize,
+        ep: usize,
+        has_drafter: bool,
+    ) -> bool {
+        redline_with_route(
+            gpu_arch,
+            model_arch,
+            model_path,
+            fixture_route(model_path),
+            pp,
+            tp,
+            ep,
+            has_drafter,
+        )
+    }
 
     /// The pre-EP call shape: every case below is a single-rank (`ep == 1`) load.
     fn retained_redline_default(
@@ -348,6 +384,68 @@ mod tests {
         has_drafter: bool,
     ) -> bool {
         redline_with_ep(gpu_arch, model_arch, model_path, pp, tp, 1, has_drafter)
+    }
+
+    #[test]
+    fn route_comes_from_the_sku_never_from_the_file_name() {
+        // A path named like every removed extension but with no resolved SKU
+        // gets no automatic route; a SKU on an unrelated name does.
+        for name in ["/m/x.mq4r", "/m/x.mq4rs", "/m/x.mq2r", "/m/X.MQ4R"] {
+            for (arch, model_arch) in [
+                ("gfx1100", "qwen3_6_moe"),
+                ("gfx1151", "deepseek4"),
+                ("gfx1201", "qwen3_5_moe"),
+            ] {
+                assert!(
+                    !redline_with_route(arch, model_arch, name, None, 1, 1, 1, false),
+                    "{name} with no resolved SKU on {arch}"
+                );
+            }
+            assert!(!mq4r_with_route("gfx1201", None, 1, 1), "{name}");
+        }
+        assert!(redline_with_route(
+            "gfx1100",
+            "qwen3_6_moe",
+            "/m/blob",
+            Some(RouteSku::Mq4r),
+            1,
+            1,
+            1,
+            false
+        ));
+        assert!(redline_with_route(
+            "gfx1201",
+            "qwen3_5_moe",
+            "/m/blob",
+            Some(RouteSku::Mq4rs),
+            1,
+            1,
+            1,
+            false
+        ));
+        assert!(redline_with_route(
+            "gfx1151",
+            "deepseek4",
+            "/m/blob",
+            Some(RouteSku::Mq2r),
+            1,
+            1,
+            1,
+            false
+        ));
+        // A SKU only opens its own predicate.
+        assert!(!mq4r_with_route("gfx1201", Some(RouteSku::Mq4rs), 1, 1));
+        assert!(!mq4r_with_route("gfx1201", Some(RouteSku::Mq2r), 1, 1));
+        assert!(!redline_with_route(
+            "gfx1100",
+            "qwen3_5_moe",
+            "/m/blob",
+            Some(RouteSku::Mq4rs),
+            1,
+            1,
+            1,
+            false
+        ));
     }
 
     #[test]

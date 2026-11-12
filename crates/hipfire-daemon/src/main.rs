@@ -1872,6 +1872,53 @@ fn main() {
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string());
+                // Redline route SKU (MQ4R / MQ4RS / DS4 MQ2R): the file's HFQ
+                // metadata, else the registry card `quant` the CLI forwards as
+                // `route_sku`, else (DeepSeek V4) the tensor structure. The
+                // file name is never read. A file that declares a SKU it does
+                // not satisfy is refused here, before any prior model unloads.
+                let route_sku_hint = msg
+                    .get("params")
+                    .and_then(|p| p.get("route_sku"))
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string());
+                let route = match hipfire_runtime::route_sku::resolve_path(
+                    std::path::Path::new(path),
+                    route_sku_hint.as_deref(),
+                ) {
+                    Ok(route) => route,
+                    Err(err) => {
+                        emit_uncorrelated_error(
+                            &mut stdout,
+                            None,
+                            &format!("route identity: {err}"),
+                            "validation",
+                            false,
+                            false,
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                };
+                let route_sku = route.map(|route| route.sku);
+                if let Some(route) = route {
+                    eprintln!(
+                        "[redline] route sku: {} (from {})",
+                        route.sku.as_str(),
+                        route.source.as_str()
+                    );
+                } else if let Some(ext) = std::path::Path::new(path)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .filter(|e| matches!(*e, "mq4r" | "mq4rs" | "mq2r"))
+                {
+                    // 0.5.0: the extension no longer selects the route. Say so
+                    // once per load so the route change is never silent.
+                    eprintln!(
+                        "[redline] {path}: .{ext} file has no hipfire_route_sku metadata and no registry card; automatic Redline default is off since 0.5.0. Opt in with replay.backend = \"redline\" or re-quantize with hipfire-quantize to stamp the route."
+                    );
+                }
                 let kv_mode_override = msg
                     .get("params")
                     .and_then(|p| p.get("kv_mode"))
@@ -2373,6 +2420,7 @@ fn main() {
                             &gpu.arch,
                             arch,
                             path,
+                            route_sku,
                             pp,
                             tp, hipfire_loader::admission::effective_ep(m.arch_id),
                             drafter.is_some(),
@@ -2396,7 +2444,7 @@ fn main() {
                             && gpu.arch == "gfx1201"
                             && arch == "qwen3_5"
                             && !hipfire_runtime::config::mq4r_redline_default(
-                                &gpu.arch, path, pp, tp,
+                                &gpu.arch, route_sku, pp, tp,
                             );
                         gpu.replay
                             .set_pm4_gfx12_dispatch_pacing(if gfx1201_dense_pacing {

@@ -122,6 +122,27 @@ struct MainQuantState<'a> {
     spill: &'a mut Option<TensorSpill>,
 }
 
+/// The `hipfire_route_sku` the writer stamps (`hipfire_runtime::route_sku`):
+/// `mq4r` for an MoE-class model whose fixed tier follows an MQ4 `--format`
+/// (`--no-q8-router`), `mq4rs` when that MQ4V2 build is symmetric and carries
+/// the MQ4G128V2-symmetric routed-expert down_proj; none otherwise.
+fn route_sku_for_recipe(
+    is_moe_like: bool,
+    no_q8_router: bool,
+    mq4_format: bool,
+    mq4v2_symmetric: bool,
+    down_mq4g128v2_symmetric: bool,
+) -> Option<&'static str> {
+    if !(is_moe_like && no_q8_router && mq4_format) {
+        return None;
+    }
+    Some(if mq4v2_symmetric && down_mq4g128v2_symmetric {
+        "mq4rs"
+    } else {
+        "mq4r"
+    })
+}
+
 static MQ4V2_SYMMETRIC: OnceLock<bool> = OnceLock::new();
 static MQ3V2_SYMMETRIC: OnceLock<bool> = OnceLock::new();
 static MQ2V2_SYMMETRIC: OnceLock<bool> = OnceLock::new();
@@ -4544,6 +4565,22 @@ pub(crate) fn run() {
                 );
             }
             obj.insert("hipfire_base_format".to_string(), format.to_string().into());
+            // Explicit route identity: the runtime selects the MQ4R / MQ4RS
+            // retained-Redline SKU from this key (0.5.0 removed the file
+            // extension). The claim is the recipe `--no-q8-router` documents:
+            // an MoE-class model whose fixed tier follows an MQ4 `--format`
+            // instead of Q8F16 (MQ4RS adds symmetric MQ4V2 plus the
+            // MQ4G128V2-symmetric routed-expert down_proj).
+            if let Some(sku) = route_sku_for_recipe(
+                is_moe_like,
+                no_q8_router_flag,
+                use_mq4g256 || use_mq4v2,
+                use_mq4v2 && args.mq4v2_symmetric,
+                args.moe_expert_down == Some(MoeExpertDown::Mq4g128v2Symmetric),
+            ) {
+                obj.insert("hipfire_route_sku".to_string(), sku.into());
+                eprintln!("  Route SKU: {sku} (hipfire_route_sku)");
+            }
             metadata_json = serde_json::to_string(&meta_val).unwrap_or(metadata_json);
         }
     }
@@ -9844,5 +9881,35 @@ mod hfq4g128_pipeline_roundtrip_tests {
         const M: usize = 4;
         const K: usize = 704;
         assert_eq!(packed.len(), M * K.div_ceil(128) * 72);
+    }
+}
+
+#[cfg(test)]
+mod route_sku_stamp_tests {
+    use super::route_sku_for_recipe;
+
+    #[test]
+    fn stamps_mq4r_and_mq4rs_only_for_the_moe_no_q8_router_mq4_recipe() {
+        // (is_moe_like, no_q8_router, mq4_format, mq4v2_symmetric, down_sym)
+        assert_eq!(
+            route_sku_for_recipe(true, true, true, false, false),
+            Some("mq4r")
+        );
+        assert_eq!(
+            route_sku_for_recipe(true, true, true, true, false),
+            Some("mq4r")
+        );
+        assert_eq!(
+            route_sku_for_recipe(true, true, true, false, true),
+            Some("mq4r")
+        );
+        assert_eq!(
+            route_sku_for_recipe(true, true, true, true, true),
+            Some("mq4rs")
+        );
+        // Dense models, the Q8 fixed tier, and non-MQ4 formats are never stamped.
+        assert_eq!(route_sku_for_recipe(false, true, true, true, true), None);
+        assert_eq!(route_sku_for_recipe(true, false, true, true, true), None);
+        assert_eq!(route_sku_for_recipe(true, true, false, true, true), None);
     }
 }

@@ -36,10 +36,10 @@
 //!
 //! Route admission. The gate is required only where the product itself takes
 //! the retained Redline route by default: after the load, the loaded model's
-//! facts (GPU arch, `qwen4`, file extension, single-GPU mesh, no drafter
+//! facts (GPU arch, `qwen4`, route SKU identity, single-GPU mesh, no drafter
 //! installed, expert parallelism, platform refusal) are passed to
 //! `hipfire_runtime::config::retained_redline_default`, the daemon's own
-//! admission (`.mq4r` on gfx1100/gfx1151/gfx1201, or Qwen4 on exact gfx1201
+//! admission (the MQ4R SKU on gfx1100/gfx1151/gfx1201, or Qwen4 on exact gfx1201
 //! with no drafter). Where the product does not take that route the gate
 //! does not force it: it frees the bundle, runs no capture, positive or
 //! negative phase, and writes a successful structured SKIP report
@@ -272,10 +272,15 @@ impl RouteFacts {
     /// The daemon's decision: `retained_redline_default` and no platform
     /// refusal. The same function the product calls, not a copy of it.
     fn default_route(&self) -> bool {
+        let route =
+            hipfire_runtime::route_sku::resolve_path(std::path::Path::new(&self.model_path), None)
+                .unwrap_or_else(|error| panic!("route identity: {error}"))
+                .map(|route| route.sku);
         hipfire_runtime::config::retained_redline_default(
             &self.gpu_arch,
             &self.model_arch,
             &self.model_path,
+            route,
             self.pp,
             self.tp,
             self.ep,

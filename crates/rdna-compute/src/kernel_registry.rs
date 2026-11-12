@@ -6440,8 +6440,8 @@ static QSA_LANES_FUSE_SYMBOLS: std::sync::LazyLock<Vec<&'static str>> =
     });
 
 /// JIT modules that the admitted default Redline programs load
-/// (`hipfire-runtime` `retained_redline_default`: MQ4R on gfx1100/gfx1151/
-/// gfx1201, Qwen3.5 dense on gfx1201, DeepSeek4 MQ2R on gfx1151) and that the
+/// (`hipfire-runtime` `retained_redline_default`: the MQ4R SKU on gfx1100/gfx1151/
+/// gfx1201, Qwen3.5 dense on gfx1201, the DeepSeek4 MQ2R SKU on gfx1151) and that the
 /// installer inventory [`entries`] does not carry. Module names are the ones
 /// the programs' captures record; each source is the expression the cited
 /// launcher passes to `ensure_kernel` on the default route. railgun's JIT

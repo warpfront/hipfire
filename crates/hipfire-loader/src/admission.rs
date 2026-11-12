@@ -227,7 +227,8 @@ pub fn qwen4_kv_adaptive_requested(value: Option<&str>) -> bool {
 /// Whether a Qwen4 load attaches its native MTP head. The executable HFQM
 /// manifest always carries the validated head, and Qwen4 declares a measured
 /// AR floor ([`hipfire_arch_qwen4::MTP_MEASURED_AR_FLOOR`]), so `auto`
-/// (`None`) attaches it and `Some(false)` keeps AR. The retained Redline default (a `.mq4r` name)
+/// (`None`) attaches it and `Some(false)` keeps AR. The retained Redline
+/// default (the MQ4R SKU identity, never a file name)
 /// owns the load instead: its tape is the single-row AR forward, which no MTP
 /// window runs, so `auto` stays AR there and an explicit `Some(true)` refuses.
 /// Under expert parallelism (`ep` > 1) and pipeline parallelism (`pp` > 1) the
@@ -258,8 +259,24 @@ pub(crate) fn qwen4_native_mtp(
         }
         return Ok(on);
     }
+    let route = hipfire_runtime::route_sku::resolve_path(std::path::Path::new(path), None)?
+        .map(|route| route.sku);
+    qwen4_native_mtp_routed(spec, gpu_arch, path, route, pp, tp, ep)
+}
+
+/// [`qwen4_native_mtp`] with the file's route SKU already resolved.
+pub(crate) fn qwen4_native_mtp_routed(
+    spec: SpecLoadCfg,
+    gpu_arch: &str,
+    path: &str,
+    route: Option<hipfire_runtime::route_sku::RouteSku>,
+    pp: usize,
+    tp: usize,
+    ep: usize,
+) -> Result<bool, String> {
+    use hipfire_config::load_summary::{note, Facet};
     let retained = hipfire_runtime::config::retained_redline_default(
-        gpu_arch, "qwen4", path, pp, tp, ep, true,
+        gpu_arch, "qwen4", path, route, pp, tp, ep, true,
     );
     let floor = hipfire_arch_qwen4::MTP_MEASURED_AR_FLOOR;
     let verdict = qwen4_native_mtp_for_floor(spec.mtp, retained, floor);
@@ -4013,22 +4030,23 @@ mod tests {
             qwen4_native_mtp(with(Some(true)), "gfx1151", hfq, 1, 1, 1),
             Ok(true)
         );
-        // A `.mq4r` load on a retained-default GPU is the retained AR route.
-        assert_eq!(
-            qwen4_native_mtp(with(None), "gfx1201", mq4r, 1, 1, 1),
-            Ok(false)
-        );
-        assert!(qwen4_native_mtp(with(Some(true)), "gfx1201", mq4r, 1, 1, 1).is_err());
+        // An MQ4R-SKU load on a retained-default GPU is the retained AR route.
+        let sku = Some(hipfire_runtime::route_sku::RouteSku::Mq4r);
+        let routed = |mtp, gpu_arch: &str, route| {
+            qwen4_native_mtp_routed(with(mtp), gpu_arch, hfq, route, 1, 1, 1)
+        };
+        assert_eq!(routed(None, "gfx1201", sku), Ok(false));
+        assert!(routed(Some(true), "gfx1201", sku).is_err());
         // gfx1100/gfx1151 never retain Qwen4 (HIPF-254): the head stays on.
         for gpu_arch in ["gfx1100", "gfx1151"] {
-            assert_eq!(
-                qwen4_native_mtp(with(None), gpu_arch, mq4r, 1, 1, 1),
-                Ok(true)
-            );
+            assert_eq!(routed(None, gpu_arch, sku), Ok(true));
         }
-        // Off the retained-default GPUs the name does not claim the load.
+        // Off the retained-default GPUs the SKU does not claim the load.
+        assert_eq!(routed(None, "gfx1030", sku), Ok(true));
+        // The file name never claims it: a `.mq4r` name with no SKU is not the
+        // retained AR route, so MTP stays default-on even on gfx1201.
         assert_eq!(
-            qwen4_native_mtp(with(None), "gfx1030", mq4r, 1, 1, 1),
+            qwen4_native_mtp(with(None), "gfx1201", mq4r, 1, 1, 1),
             Ok(true)
         );
         // Expert parallelism attaches the head only on an explicit `on`:

@@ -603,7 +603,12 @@ pub(super) fn preload_spec_mtp_k(max_k_given: bool, max_k: usize) -> Option<usiz
 /// load (`pp = tp = ep = 1`), via the same public
 /// `retained_redline_default` authority the loader's admission uses.
 pub(super) fn preload_retained_default(gpu_arch: &str, model_path: &str) -> bool {
-    hipfire_runtime::config::retained_redline_default(gpu_arch, "qwen4", model_path, 1, 1, 1, true)
+    let route = hipfire_runtime::route_sku::resolve_path(std::path::Path::new(model_path), None)
+        .unwrap_or_else(|error| panic!("route identity: {error}"))
+        .map(|route| route.sku);
+    hipfire_runtime::config::retained_redline_default(
+        gpu_arch, "qwen4", model_path, route, 1, 1, 1, true,
+    )
 }
 
 /// The ordinary floor policy for a single-device Qwen4 planning load: the

@@ -1,6 +1,6 @@
 # AGENTS.md — project notice + testing playbook
 
-Redline = retained PM4/AQL capture-and-replay of an eager decode step. It is the default only where `retained_redline_default` (`crates/hipfire-runtime/src/config.rs`) admits it, always single-device (EP=PP=TP=1): `.mq4r` files on gfx1100/gfx1151/gfx1201, and, without a drafter, gfx1201 Qwen3.5 dense and Qwen4 (Flash-Next with MTP off), gfx1100 Qwen3.5 dense `.mq3-xt`, the gfx1201 A3B `.mq4rs` and the gfx1151 DeepSeek V4 `.mq2r`; Gemma 4, Muse Glimmer and Qwen3.5-family CPU-executed offload are excluded.
+Redline = retained PM4/AQL capture-and-replay of an eager decode step. It is the default only where `retained_redline_default` (`crates/hipfire-runtime/src/config.rs`) admits it, always single-device (EP=PP=TP=1): the MQ4R SKU on gfx1100/gfx1151/gfx1201, and, without a drafter, gfx1201 Qwen3.5 dense and Qwen4 (Flash-Next with MTP off), gfx1100 Qwen3.5 dense `.mq3-xt`, the gfx1201 A3B MQ4RS SKU and the gfx1151 DeepSeek V4 MQ2R SKU; Gemma 4, Muse Glimmer and Qwen3.5-family CPU-executed offload are excluded. Since 0.5.0 the MQ4R/MQ4RS/MQ2R SKU is the file's identity (`crates/hipfire-runtime/src/route_sku.rs`: the HFQ metadata key `hipfire_route_sku`, else the registry card `quant`, else for DeepSeek V4 the MQ2R tensor structure), never its file extension; an unregistered, unstamped `.mq4r` file gets no automatic Redline.
 railgun = certified typed dispatch programs (railgun, railgun-cert, railgun-corpus, railgun-jitcorpus), including railgun::npu (the Strix Halo NPU trunk runtime), D8 and G7. Do not conflate them.
 
 **Engineering lessons (authoritative):** [`docs/methodology/lessons-0.4.5.md`](docs/methodology/lessons-0.4.5.md)
@@ -188,18 +188,16 @@ works, what to measure, what counts as pass/fail.
   `serve.vmm_batch` serve with ≥ 4 lanes, IU4 verify gates unchanged).
   DFlash greedy may differ from AR near argmax ties; judge it against the
   MTP arm and the C1 == C8 state oracle, not byte-equality with AR.
-- **Also deprecated since 0.4.0, removal in 0.5.0** (each entry point carries
-  `// lifecycle: deprecated since 0.4.0, removal 0.5.0 — <reason>`; the
-  status of every env var / config key is in `docs/env-vars.md` /
-  `docs/CONFIG.md`, enforced by `scripts/check-lifecycle.py`): MQ4R / DS4 MQ2R
-  route selection by file extension (no runtime warning; 0.5.0 selects by HFQ
-  metadata).
-- **Removed in 0.5.0:** Givens asym KV (`legacy-asymN`) and the
+- **Removed in 0.5.0** (status of every env var / config key is in
+  `docs/env-vars.md` / `docs/CONFIG.md`, enforced by
+  `scripts/check-lifecycle.py`): Givens asym KV (`legacy-asymN`) and the
   `asymN`/`turboN` KV aliases (use `fwhtN` or `q8`); the legacy contiguous
   DFlash knobs (`HIPFIRE_DFLASH_WINDOW=0`, `HIPFIRE_DFLASH_CTX_CAP`); the
   `scripts/coherence-gate-*.sh` batteries, `_coherence_runner.py` and
   `awq_coherence_check.sh` (use `scripts/serve_harness.py`); GGUF **weight**
-  input to the quantizer (use llama.cpp for GGUF — `imatrix.gguf` stays).
+  input to the quantizer (use llama.cpp for GGUF — `imatrix.gguf` stays);
+  MQ4R / MQ4RS / DS4 MQ2R route selection by file extension (the route is now
+  selected by HFQ metadata, falling back to registry identity).
 
 ---
 

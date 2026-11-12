@@ -5186,6 +5186,14 @@ pub(crate) fn load_params(
         "ddtree_budget": config_u64(resolved, "speculation.ddtree_budget")?,
         "ddtree_topk": config_u64(resolved, "speculation.ddtree_topk")?,
         "head": head_file,
+        // Redline route SKU of the registry artifact (`mq4r` | `mq4rs` | `mq2r`,
+        // the card's `quant`): the daemon's fallback when the file's HFQ
+        // metadata names no SKU. Empty for every other quant and for files with
+        // no registry card; the file name is never consulted.
+        "route_sku": hipfire_runtime::route_sku::registry_route(
+            entry.and_then(|entry| entry.quant.as_deref()),
+        )
+        .map_or("", |sku| sku.as_str()),
         "speculation": config_string(resolved, "speculation.mode")?,
         "continuous_batch_size": config_u64(resolved, "serve.continuous_batch_size")?,
     });
@@ -13293,6 +13301,60 @@ effort = "high"
         )
         .unwrap();
         assert_eq!(params["deepseek4_experts_per_token"], 4);
+    }
+
+    #[test]
+    pub(crate) fn load_params_forwards_the_registry_route_sku_never_the_file_name() {
+        let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let load = |path: &str, quant: Option<&str>| {
+            let model_path = PathBuf::from(path);
+            let entry = ModelEntry {
+                repo: "test/repo".into(),
+                file: "x".into(),
+                size_gb: 1.0,
+                min_vram_gb: 1.0,
+                desc: "route sku test".into(),
+                quant: quant.map(str::to_owned),
+                ..Default::default()
+            };
+            load_params(
+                &defaults,
+                Some(&entry),
+                model_path.parent().unwrap(),
+                &model_path,
+                64,
+                Some("q8"),
+                None,
+                None,
+                false,
+                None,
+            )
+            .unwrap()["route_sku"]
+                .clone()
+        };
+        for sku in ["mq4r", "mq4rs", "mq2r"] {
+            assert_eq!(load("/models/blob", Some(sku)), sku);
+        }
+        // Other quants and name-only `.mq4r` / `.mq4rs` / `.mq2r` files name no SKU.
+        assert_eq!(load("/models/a.mq4r", Some("mq4")), "");
+        assert_eq!(load("/models/a.mq4r", None), "");
+        assert_eq!(load("/models/a.mq2r", Some("mq2lloyd")), "");
+        // A file with no registry card at all.
+        let model_path = PathBuf::from("/models/a.mq4rs");
+        let params = load_params(
+            &defaults,
+            None,
+            model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(params["route_sku"], "");
     }
 
     #[test]

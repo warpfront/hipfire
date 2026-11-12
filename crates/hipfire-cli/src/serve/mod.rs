@@ -2308,9 +2308,11 @@ pub(crate) fn format_bind(host: &str, port: u16) -> String {
     }
 }
 
-// lifecycle: deprecated since 0.4.0, removal 0.5.0 — MQ4R route selection by file extension; 0.5.0 selects by HFQ metadata (no runtime warning: only way to reach the route today)
+/// The Qwen MQ4R decode pre-warm applies to the MQ4R SKU (HFQ metadata or the
+/// registry card's `quant`, `hipfire_runtime::route_sku`), never to a file name.
 pub(crate) fn should_prewarm_qwen_mq4r_decode(
     path: &Path,
+    registry_quant: Option<&str>,
     loaded: &serde_json::Value,
     tp: Option<u64>,
 ) -> bool {
@@ -2318,10 +2320,12 @@ pub(crate) fn should_prewarm_qwen_mq4r_decode(
         .get("arch")
         .and_then(serde_json::Value::as_str)
         .is_some_and(|arch| arch.starts_with("qwen3_5"));
-    let mq4r = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("mq4r"));
+    // The daemon resolved (and, on a bad declaration, refused) the same
+    // identity before it acknowledged the load.
+    let mq4r = hipfire_runtime::route_sku::resolve_path(path, registry_quant)
+        .ok()
+        .flatten()
+        .is_some_and(|route| route.sku == hipfire_runtime::route_sku::RouteSku::Mq4r);
     qwen && mq4r && tp.unwrap_or(1) == 1
 }
 
@@ -2505,6 +2509,10 @@ impl ServeRuntime {
             // the new one, so after a failed load nothing is resident. At
             // tp>1 it defers that unload until the new model is built, and a
             // failure leaves the old model in place.
+            let route_sku_hint = params
+                .get("route_sku")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
             let loaded = match self.engine.load(&path, params) {
                 Ok(loaded) => loaded,
                 Err(error) => {
@@ -2514,7 +2522,13 @@ impl ServeRuntime {
                     return Err(error.into());
                 }
             };
-            if !self.multi_slot_enabled && should_prewarm_qwen_mq4r_decode(&path, &loaded, self.tp)
+            if !self.multi_slot_enabled
+                && should_prewarm_qwen_mq4r_decode(
+                    &path,
+                    route_sku_hint.as_deref(),
+                    &loaded,
+                    self.tp,
+                )
             {
                 // The new model is resident but not recorded yet; clear the
                 // old record so the next request reloads.
@@ -4237,28 +4251,47 @@ mod tests {
         let qwen = serde_json::json!({ "arch": "qwen3_5_moe" });
         let qwen_dense = serde_json::json!({ "arch": "qwen3_5" });
         let deepseek = serde_json::json!({ "arch": "deepseek4" });
+        // The SKU is the registry card's `quant` (the file does not exist,
+        // so there is no HFQ metadata to read); the path's name is irrelevant.
+        let path = Path::new("qwen-card-resolved");
         assert!(should_prewarm_qwen_mq4r_decode(
-            Path::new("qwen3.6-35b-a3b.mq4r"),
+            path,
+            Some("mq4r"),
             &qwen,
-            None,
+            None
         ));
         assert!(should_prewarm_qwen_mq4r_decode(
-            Path::new("QWEN3.6-9B.MQ4R"),
+            path,
+            Some("mq4r"),
             &qwen_dense,
             Some(1),
         ));
-        assert!(!should_prewarm_qwen_mq4r_decode(
-            Path::new("qwen3.6-35b-a3b.mq4"),
-            &qwen,
-            None,
-        ));
+        // No identity: a removed-extension name alone selects nothing.
+        for name in ["qwen3.6-35b-a3b.mq4r", "QWEN3.6-9B.MQ4R"] {
+            assert!(!should_prewarm_qwen_mq4r_decode(
+                Path::new(name),
+                None,
+                &qwen,
+                None
+            ));
+        }
+        for quant in ["mq4", "mq4rs", "mq2r", "mq4-xts"] {
+            assert!(!should_prewarm_qwen_mq4r_decode(
+                path,
+                Some(quant),
+                &qwen,
+                None
+            ));
+        }
         assert!(!should_prewarm_qwen_mq4r_decode(
             Path::new("deepseek-v4-flash.mq4r"),
+            Some("mq4r"),
             &deepseek,
             None,
         ));
         assert!(!should_prewarm_qwen_mq4r_decode(
-            Path::new("qwen3.6-35b-a3b.mq4r"),
+            path,
+            Some("mq4r"),
             &qwen,
             Some(2),
         ));
