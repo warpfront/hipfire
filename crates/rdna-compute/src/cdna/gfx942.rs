@@ -381,11 +381,10 @@ fn g942_gdn_verify_image() -> HipResult<Option<&'static std::sync::Arc<[u8]>>> {
     }
 }
 
-/// Load the entry `kernel` of the tensor_ops GDN verify launches and return the symbol to launch.
-/// On exact gfx942 the four [`QWEN4_G942_GDN_VERIFY_ENTRIES`] resolve to the gfx942-only module
-/// (hipcc source, or the `HIPFIRE_QWEN4_G942_GDN_VERIFY_IMAGE` code object) and the module's own
-/// symbol is returned; every other arch, and every other entry, loads from `tensor_ops` as
-/// before and returns `kernel`.
+/// Load an already selected GDN verify entry and return it unchanged. The tensor_ops
+/// launchers select the four gfx942 symbols locally before calling this loader.
+/// On exact gfx942 those symbols use the dedicated module (or the explicit image);
+/// every other entry and architecture loads from tensor_ops.
 pub(crate) fn ensure_gdn_verify_kernel(
     gpu: &mut Gpu,
     kernel: &'static str,
@@ -395,12 +394,10 @@ pub(crate) fn ensure_gdn_verify_kernel(
         return Ok(kernel);
     }
     let own = match kernel {
-        "gated_delta_step_halves_state128_persistent256_capture_f32" => {
-            "qwen4_g942_gdn_verify_capture_f32"
-        }
-        "gated_delta_rollback_layers_f32" => "qwen4_g942_gdn_verify_rollback_f32",
-        "gated_delta_conv_bf16_f32_batched_k4" => "qwen4_g942_gdn_verify_conv_params_k4",
-        "gated_delta_gate_bf16_f32_batched" => "qwen4_g942_gdn_verify_gate_batched",
+        "qwen4_g942_gdn_verify_capture_f32"
+        | "qwen4_g942_gdn_verify_rollback_f32"
+        | "qwen4_g942_gdn_verify_conv_params_k4"
+        | "qwen4_g942_gdn_verify_gate_batched" => kernel,
         _ => {
             gpu.ensure_kernel_public("tensor_ops", crate::tensor_ops::TENSOR_OPS_SRC, kernel)?;
             return Ok(kernel);

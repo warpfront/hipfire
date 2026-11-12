@@ -13,6 +13,21 @@ use hip_bridge::{HipError, HipResult, KernargBlob};
 use crate::prefill_invariant::{qwen4_gdn_prefill, Qwen4GdnPrefill};
 use crate::{DType, Gpu, GpuTensor};
 
+fn gdn_verify_entry(gpu: &Gpu, kernel: &'static str) -> &'static str {
+    if !gpu.arch_caps.is_gfx942() {
+        return kernel;
+    }
+    match kernel {
+        "gated_delta_step_halves_state128_persistent256_capture_f32" => {
+            "qwen4_g942_gdn_verify_capture_f32"
+        }
+        "gated_delta_rollback_layers_f32" => "qwen4_g942_gdn_verify_rollback_f32",
+        "gated_delta_conv_bf16_f32_batched_k4" => "qwen4_g942_gdn_verify_conv_params_k4",
+        "gated_delta_gate_bf16_f32_batched" => "qwen4_g942_gdn_verify_gate_batched",
+        _ => kernel,
+    }
+}
+
 #[path = "npu_trunk_consumers.rs"]
 pub(crate) mod npu_arena;
 pub use npu_arena::*;
@@ -1062,7 +1077,8 @@ pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) ->
         arch_gfx942: gpu.arch == "gfx942",
         pipe_enabled: *QWEN4_GDN_PIPE,
     });
-    let kernel = crate::cdna::gfx942::ensure_gdn_verify_kernel(gpu, kernel)?;
+    let kernel = gdn_verify_entry(gpu, kernel);
+    crate::cdna::gfx942::ensure_gdn_verify_kernel(gpu, kernel)?;
     let frame = if format.has_frame_kernarg() {
         checked_u32(p.position + p.rows - 1, "GDN Q8 frame")?
     } else {
@@ -1168,7 +1184,8 @@ pub fn gated_delta_rollback_layers(
             "GDN rollback: a Q8Ef state rolls back with its residual (gated_delta_rollback_layers_ef)",
         ));
     };
-    let kernel = crate::cdna::gfx942::ensure_gdn_verify_kernel(gpu, kernel)?;
+    let kernel = gdn_verify_entry(gpu, kernel);
+    crate::cdna::gfx942::ensure_gdn_verify_kernel(gpu, kernel)?;
     let mut args = KernargBlob::new();
     args.push_ptr(p.table.buf.as_ptr());
     args.push_ptr(p.discard.buf.as_ptr());
@@ -4656,7 +4673,8 @@ fn gated_delta_conv_batched_impl(
     } else {
         "gated_delta_conv_bf16_f32_batched_k4"
     };
-    let kernel = crate::cdna::gfx942::ensure_gdn_verify_kernel(gpu, kernel)?;
+    let kernel = gdn_verify_entry(gpu, kernel);
+    crate::cdna::gfx942::ensure_gdn_verify_kernel(gpu, kernel)?;
     let mut args = KernargBlob::new();
     for tensor in [p.input, p.kernel, p.history, p.output, p.next_history] {
         args.push_ptr(tensor.buf.as_ptr());
@@ -4964,8 +4982,8 @@ pub fn gated_delta_gate_batched(gpu: &mut Gpu, p: &GatedDeltaGateBatched<'_>) ->
     let value_heads = checked_i32(p.value_heads, "GDN batched gate heads")?;
     let value_dim = checked_i32(p.value_dim, "GDN batched gate width")?;
     let value_heads_grid = checked_u32(elements / p.value_dim, "GDN batched gate grid")?;
-    let gate_kernel =
-        crate::cdna::gfx942::ensure_gdn_verify_kernel(gpu, "gated_delta_gate_bf16_f32_batched")?;
+    let gate_kernel = gdn_verify_entry(gpu, "gated_delta_gate_bf16_f32_batched");
+    crate::cdna::gfx942::ensure_gdn_verify_kernel(gpu, gate_kernel)?;
     let mut args = KernargBlob::new();
     for tensor in [p.recurrent_output, p.z, p.norm, p.output] {
         args.push_ptr(tensor.buf.as_ptr());
