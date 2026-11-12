@@ -620,7 +620,10 @@ mod tests {
         }
         for n in SP_SUB512_MIN_ROWS..=16384 {
             let [a, b] = sp_even_split(n);
-            assert!(a.1 > WIDE_VERIFY_MAX_ROWS && b.1 > WIDE_VERIFY_MAX_ROWS, "{n}");
+            assert!(
+                a.1 > WIDE_VERIFY_MAX_ROWS && b.1 > WIDE_VERIFY_MAX_ROWS,
+                "{n}"
+            );
             assert!(SpRows::of(0, n).own.1 > WIDE_VERIFY_MAX_ROWS, "{n}");
             assert!(SpRows::of(1, n).own.1 > WIDE_VERIFY_MAX_ROWS, "{n}");
         }

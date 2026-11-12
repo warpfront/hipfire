@@ -22999,13 +22999,7 @@ impl Gpu {
                 add,
                 None,
             )?;
-            self.memcpy_dtod_at_ordered_async(
-                &y.buf,
-                n_full * m * 4,
-                &tail_y.buf,
-                0,
-                r * m * 4,
-            )
+            self.memcpy_dtod_at_ordered_async(&y.buf, n_full * m * 4, &tail_y.buf, 0, r * m * 4)
         })();
         self.free_tensor(tail_x)?;
         self.free_tensor(tail_y)?;
