@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- PeaceMaker gfx942: seal all four unchanged GLOBAL-only GDN verify entries after proving the conv join's incoming scalar-constant edge. Pin the immutable replacement source/anchor and exact-image MI300X oracle receipt (280 checks, including conv and gate); original FLAT rollback fixture remains negative-only. No wait allowance, cap increase, instruction rewrite or production dispatch change.
+
 ### 0.5.0 removals
 
 - **Removed config keys fail the load.** A `config.toml` or custom profile that still sets a key listed in `hipfire_config::RETIRED_CONFIG_KEYS` (including `kernel.mw16`, whose 0.4.x warn-and-ignore window ended) now fails with `configuration key '<key>' was removed in <version> (<reason>); replacement: <replacement>` instead of loading with a warning. See [`docs/CONFIG.md`](docs/CONFIG.md#lifecycle-status).

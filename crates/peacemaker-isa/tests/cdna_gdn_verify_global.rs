@@ -123,3 +123,75 @@ fn replacement_anchor_certifies_all_four_entries() {
         assert_eq!(b.report["hazards"]["hazard"]["rewritten_instructions"], 0);
     }
 }
+
+#[test]
+fn committed_twin_reproduces_and_binds_the_exact_hardware_receipt() {
+    let hxaco = include_bytes!("../../../kernels/qwen4_g942_gdn_verify_pm_gfx942.hxaco");
+    let manifest: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../kernels/qwen4_g942_gdn_verify_pm_gfx942.twin.json"
+    ))
+    .unwrap();
+    let sha_file = include_str!("../../../kernels/qwen4_g942_gdn_verify_pm_gfx942.hxaco.sha256");
+    let log = include_str!("fixtures/cdna/gfx942_gdn_verify_oracle.txt");
+    let sealed = seal_many(ANCHOR, Arch::Gfx942, &specs()).unwrap();
+    assert_eq!(sealed[0].hxaco.as_slice(), hxaco.as_slice());
+    assert_eq!(sha_file.split_whitespace().next().unwrap(), sha(hxaco));
+    assert_eq!(manifest["anchor"]["sha256"], BUNDLE_SHA256);
+    assert_eq!(manifest["source"]["sha256"], SOURCE_SHA256);
+    assert_eq!(manifest["hxaco"]["sha256"], sha(hxaco));
+    assert_eq!(
+        manifest["seal"]["reports"].as_array().unwrap().len(),
+        SYMBOLS.len()
+    );
+    for (report, symbol) in manifest["seal"]["reports"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(SYMBOLS)
+    {
+        assert_eq!(report["kernel"], symbol);
+        assert_eq!(report["elf_sha256"], DEVICE_ELF_SHA256);
+        assert_eq!(report["hazards"]["checked"], true);
+        for field in ["findings", "blocking", "bypasses"] {
+            assert_eq!(report["hazards"][field], 0);
+        }
+    }
+    let receipt = &manifest["gpu_oracle"];
+    assert_eq!(receipt["status"], "PASS");
+    assert_eq!(receipt["target"], "gfx942");
+    assert_eq!(receipt["input_hxaco_sha256"], sha(hxaco));
+    assert_eq!(receipt["hipcc_image_sha256"], BUNDLE_SHA256);
+    assert_eq!(receipt["pm_device_elf_sha256"], DEVICE_ELF_SHA256);
+    assert_eq!(receipt["hipcc_device_elf_sha256"], DEVICE_ELF_SHA256);
+    assert_eq!(receipt["raw_log_sha256"], sha(log.as_bytes()));
+    assert_eq!(
+        receipt["oracle_binary_sha256"],
+        "2ecc14cfb1dd105cdac8e6b77b298b764c7d14e5472862f7c3316b2330c4f24c"
+    );
+    assert_eq!(receipt["case_count"], 280);
+    assert_eq!(
+        log.lines().filter(|line| line.contains("=> ok")).count(),
+        280
+    );
+    assert_eq!(
+        log.lines()
+            .filter(|line| line.starts_with("[conv_params"))
+            .count(),
+        84
+    );
+    assert_eq!(
+        log.lines()
+            .filter(|line| line.starts_with("[gate_batched"))
+            .count(),
+        12
+    );
+    assert!(log.contains("gdn_capture_f32_gfx942_oracle: PASS"));
+    assert!(log.contains(
+        "GDN_VERIFY_IMAGE=/scratch/quant/fn-fp8/beat/WC8/twin/gdn/gdn-verify-twin-device.elf"
+    ));
+    assert!(log.contains("GDN_LANES_CAPTURE_IMAGE=/scratch/quant/fn-fp8/beat/WC8/twin/gdn/gdn-capture-twin-device.elf"));
+    assert_eq!(receipt["failed_cases"], 0);
+    assert_eq!(receipt["exit_code"], 0);
+    assert_eq!(receipt["ledger"]["row"], 248);
+    assert_eq!(receipt["ledger"]["exit"], 0);
+}
