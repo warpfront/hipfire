@@ -25,7 +25,13 @@
 //!     capture's source state overwritten.
 //!
 //! `cargo run --release -p rdna-compute --example gdn_capture_f32_gfx942_oracle --
-//!    [--rows 2,3,4,8] [--steps 3] [--seed U64] [--skip-controls]`
+//!    [--rows 2,3,4,8] [--lanes 1,2,8,33] [--steps 3] [--seed U64] [--skip-controls]`
+//!
+//! The batched capture recurrence of many lanes (`Gfx942Device::qwen4_gdn_lanes_step_capture_f32`,
+//! kernel `qwen4_gdn_lanes_step_capture_f32_gfx942`) is compared word for word with the per-lane
+//! capture launches it replaces, for every `--lanes` x `--rows` case: each lane's whole ring (only
+//! slot `rows - 1` written), output rows and untouched live state, over carried windows, with
+//! the lane-swap and unlaunched-lane controls.
 //!
 //! Prints one line per case and a final `gdn_capture_f32_gfx942_oracle: PASS|FAIL`.
 //! Exit 0 = PASS, 1 = a mismatch / undetected control, 2 = not exact gfx942 (or
@@ -322,8 +328,213 @@ fn run_case(gpu: &mut Gpu, rows: usize, steps: usize, controls: bool, seed: u64)
     ok
 }
 
+const SENTINEL: u32 = 0xFFFF_FFFF;
+
+/// The batched capture recurrence of `lanes` lanes (`qwen4_gdn_lanes_step_capture_f32_gfx942`)
+/// against the per-lane capture launches it replaces (`gated_delta_step_batched` with
+/// `row_states`, the persistent256 capture kernel the per-lane verify chain launches): every
+/// lane's whole ring (the final slot written, every other slot still sentinel), its output rows
+/// and its untouched live state, word for word, over `steps` carried windows.
+fn run_lanes_case(
+    gpu: &mut Gpu,
+    lanes: usize,
+    rows: usize,
+    steps: usize,
+    controls: bool,
+    seed: u64,
+) -> bool {
+    use rdna_compute::cdna::gfx942::{Qwen4GdnLanesCaptureF32Lane, Qwen4GdnLanesF32Shape};
+    let mut rng = Rng(seed ^ ((lanes as u64) << 20) ^ ((rows as u64) << 48) ^ 0x5A5A);
+    let mut ok = true;
+    let mut report = |what: &str, good: bool, detail: String| {
+        if !good {
+            ok = false;
+        }
+        println!(
+            "[capture lanes={lanes} rows={rows}] {what}: {detail} => {}",
+            if good { "ok" } else { "MISMATCH" }
+        );
+    };
+    let rec_n = rows * (QKV + 2 * NV);
+    let ring_n = rows * STATE;
+    let sentinel = vec![f32::from_bits(SENTINEL); ring_n];
+    let sentinel_out = vec![f32::from_bits(SENTINEL); rows * VALUE];
+    let init: Vec<Vec<f32>> = (0..lanes)
+        .map(|_| rand_vec(&mut rng, STATE, -0.5, 0.5))
+        .collect();
+    let rec: Vec<GpuTensor> = (0..lanes).map(|_| gpu.zeros(&[rec_n], DType::F32).unwrap()).collect();
+    let live_ref: Vec<GpuTensor> =
+        init.iter().map(|s| gpu.upload_f32(s, &[STATE]).unwrap()).collect();
+    let live_cand: Vec<GpuTensor> =
+        init.iter().map(|s| gpu.upload_f32(s, &[STATE]).unwrap()).collect();
+    let ring_ref: Vec<GpuTensor> =
+        (0..lanes).map(|_| gpu.upload_f32(&sentinel, &[ring_n]).unwrap()).collect();
+    let ring_cand: Vec<GpuTensor> =
+        (0..lanes).map(|_| gpu.upload_f32(&sentinel, &[ring_n]).unwrap()).collect();
+    let out_ref: Vec<GpuTensor> = (0..lanes)
+        .map(|_| gpu.upload_f32(&sentinel_out, &[rows * VALUE]).unwrap())
+        .collect();
+    let out_cand: Vec<GpuTensor> = (0..lanes)
+        .map(|_| gpu.upload_f32(&sentinel_out, &[rows * VALUE]).unwrap())
+        .collect();
+    let proj: Vec<GpuTensor> = rec.iter().map(|r| r.sub_offset(0, rows * QKV)).collect();
+    let gate: Vec<GpuTensor> =
+        rec.iter().map(|r| r.sub_offset(rows * QKV, rows * NV)).collect();
+    let beta: Vec<GpuTensor> = rec
+        .iter()
+        .map(|r| r.sub_offset(rows * QKV + rows * NV, rows * NV))
+        .collect();
+    let shape = Qwen4GdnLanesF32Shape {
+        rows,
+        key_heads: NK,
+        value_heads: NV,
+        key_dim: HD,
+        value_dim: HD,
+    };
+    for window in 0..steps {
+        for l in 0..lanes {
+            let mut all = rand_vec(&mut rng, rows * QKV, -1.0, 1.0);
+            all.extend(rand_vec(&mut rng, rows * NV, -3.0, -0.01));
+            all.extend(rand_vec(&mut rng, rows * NV, 0.02, 0.98));
+            htod_f32(gpu, &rec[l], &all);
+            htod_f32(gpu, &ring_ref[l], &sentinel);
+            htod_f32(gpu, &ring_cand[l], &sentinel);
+            htod_f32(gpu, &out_ref[l], &sentinel_out);
+            htod_f32(gpu, &out_cand[l], &sentinel_out);
+        }
+        let pre: Vec<Vec<f32>> = (0..lanes).map(|l| dtoh(gpu, &live_ref[l])).collect();
+        // Reference: one production capture launch per lane.
+        for l in 0..lanes {
+            gated_delta_step_batched(
+                gpu,
+                &step(&proj[l], &gate[l], &beta[l], &live_ref[l], &out_ref[l], Some(&ring_ref[l]), rows),
+            )
+            .expect("per-lane capture launch");
+        }
+        // Candidate: one launch.
+        let lane_args: Vec<Qwen4GdnLanesCaptureF32Lane<'_>> = (0..lanes)
+            .map(|l| Qwen4GdnLanesCaptureF32Lane {
+                projection: &proj[l],
+                gate: &gate[l],
+                beta: &beta[l],
+                state: &live_cand[l],
+                ring: &ring_cand[l],
+                output: &out_cand[l],
+            })
+            .collect();
+        gpu.try_gfx942()
+            .expect("exact gfx942")
+            .qwen4_gdn_lanes_step_capture_f32(&lane_args, shape)
+            .expect("capture lanes launch");
+        gpu.hip.device_synchronize().expect("sync");
+        let (mut ring_diff, mut out_diff, mut live_diff, mut written, mut first_bad) =
+            (0usize, 0usize, 0usize, 0usize, None);
+        for l in 0..lanes {
+            let r = dtoh(gpu, &ring_ref[l]);
+            let c = dtoh(gpu, &ring_cand[l]);
+            let (d, f) = word_diff(&r, &c);
+            if d > 0 && first_bad.is_none() {
+                first_bad = Some((l, f.unwrap()));
+            }
+            ring_diff += d;
+            // Only slot `rows - 1` was written: every other word is still the sentinel.
+            written += r.iter().filter(|w| w.to_bits() != SENTINEL).count();
+            out_diff += word_diff(&dtoh(gpu, &out_ref[l]), &dtoh(gpu, &out_cand[l])).0;
+            live_diff += word_diff(&pre[l], &dtoh(gpu, &live_cand[l])).0
+                + word_diff(&pre[l], &dtoh(gpu, &live_ref[l])).0;
+        }
+        report(
+            &format!("window {window} batched capture vs per-lane capture"),
+            ring_diff == 0 && out_diff == 0 && live_diff == 0 && written == lanes * STATE,
+            format!(
+                "ring diff words {ring_diff} (first {first_bad:?}), output diff words {out_diff}, \
+                 live state changed words {live_diff}, ring words written {written} (want {})",
+                lanes * STATE
+            ),
+        );
+        if controls && window == 0 {
+            // A flipped bit in one lane's captured final state: exactly one differing word.
+            let mut bad = dtoh(gpu, &ring_cand[lanes - 1]);
+            let at = ring_n - 1;
+            bad[at] = f32::from_bits(bad[at].to_bits() ^ 1);
+            let d = word_diff(&dtoh(gpu, &ring_ref[lanes - 1]), &bad).0;
+            report("control: flipped captured bit", d == 1, format!("diff words {d}"));
+            if lanes >= 2 {
+                // The candidate launched over the lanes in swapped ring order: the rings
+                // must differ from the reference (the comparison sees lane identity).
+                htod_f32(gpu, &ring_cand[0], &sentinel);
+                htod_f32(gpu, &ring_cand[1], &sentinel);
+                let mut swapped: Vec<Qwen4GdnLanesCaptureF32Lane<'_>> = (0..lanes)
+                    .map(|l| Qwen4GdnLanesCaptureF32Lane {
+                        projection: &proj[l],
+                        gate: &gate[l],
+                        beta: &beta[l],
+                        state: &live_cand[l],
+                        ring: &ring_cand[l],
+                        output: &out_cand[l],
+                    })
+                    .collect();
+                let (r0, r1) = (swapped[0].ring, swapped[1].ring);
+                swapped[0].ring = r1;
+                swapped[1].ring = r0;
+                gpu.try_gfx942()
+                    .expect("exact gfx942")
+                    .qwen4_gdn_lanes_step_capture_f32(&swapped, shape)
+                    .expect("swapped launch");
+                gpu.hip.device_synchronize().expect("sync");
+                let d = word_diff(&dtoh(gpu, &ring_ref[0]), &dtoh(gpu, &ring_cand[0])).0
+                    + word_diff(&dtoh(gpu, &ring_ref[1]), &dtoh(gpu, &ring_cand[1])).0;
+                report("control: lanes' rings swapped", d > 0, format!("diff words {d}"));
+                // The candidate launched without its last lane leaves that ring unwritten.
+                htod_f32(gpu, &ring_cand[lanes - 1], &sentinel);
+                let short: Vec<Qwen4GdnLanesCaptureF32Lane<'_>> = (0..lanes - 1)
+                    .map(|l| Qwen4GdnLanesCaptureF32Lane {
+                        projection: &proj[l],
+                        gate: &gate[l],
+                        beta: &beta[l],
+                        state: &live_cand[l],
+                        ring: &ring_cand[l],
+                        output: &out_cand[l],
+                    })
+                    .collect();
+                gpu.try_gfx942()
+                    .expect("exact gfx942")
+                    .qwen4_gdn_lanes_step_capture_f32(&short, shape)
+                    .expect("short launch");
+                gpu.hip.device_synchronize().expect("sync");
+                let d = word_diff(
+                    &dtoh(gpu, &ring_ref[lanes - 1]),
+                    &dtoh(gpu, &ring_cand[lanes - 1]),
+                )
+                .0;
+                report("control: last lane not launched", d > 0, format!("diff words {d}"));
+            }
+        }
+        // Carry: both chains' next window starts from this window's final state.
+        for l in 0..lanes {
+            let r = dtoh(gpu, &ring_ref[l]);
+            let final_state = &r[(rows - 1) * STATE..rows * STATE];
+            htod_f32(gpu, &live_ref[l], final_state);
+            htod_f32(gpu, &live_cand[l], final_state);
+        }
+    }
+    for t in rec
+        .into_iter()
+        .chain(live_ref)
+        .chain(live_cand)
+        .chain(ring_ref)
+        .chain(ring_cand)
+        .chain(out_ref)
+        .chain(out_cand)
+    {
+        gpu.free_tensor(t).ok();
+    }
+    ok
+}
+
 fn main() {
     let mut rows_list = vec![2usize, 3, 4, 8];
+    let mut lanes_list = vec![1usize, 2, 8, 33];
     let mut steps = 3usize;
     let mut seed = 0x6D69_3330_3078_6370u64;
     let mut controls = true;
@@ -331,6 +542,13 @@ fn main() {
     while let Some(a) = args.next() {
         let mut value = || args.next().unwrap_or_else(|| panic!("{a} needs a value"));
         match a.as_str() {
+            "--lanes" => {
+                lanes_list = value()
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.parse().expect("integer list"))
+                    .collect()
+            }
             "--rows" => {
                 rows_list = value()
                     .split(',')
@@ -367,6 +585,11 @@ fn main() {
     let mut all = true;
     for &rows in &rows_list {
         all &= run_case(&mut gpu, rows, steps, controls, seed);
+    }
+    for &rows in &rows_list {
+        for &lanes in &lanes_list {
+            all &= run_lanes_case(&mut gpu, lanes, rows, steps, controls, seed);
+        }
     }
     println!(
         "gdn_capture_f32_gfx942_oracle: {}",
