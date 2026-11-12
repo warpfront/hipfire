@@ -245,6 +245,7 @@ fn load_weight_tensor_raw_with(
     target: MemoryTarget,
 ) -> HipResult<WeightTensor> {
     let row_packed = match quant_type {
+        3 => Some(DType::Q8_0),
         6 => Some(DType::HFQ4G256),
         7 => Some(DType::HFQ4G128),
         8 => Some(DType::HFQ6G256),

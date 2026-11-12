@@ -1660,6 +1660,13 @@ fn weight_tensor_from_raw(
         3 => {
             // Q8_F16 (group_size=32, 34 bytes/group) — same byte layout as
             // GGML Q8_0; existing gemv_q8_0 dispatch works directly.
+            hipfire_runtime::weight_backend::validate_row_extent(
+                DType::Q8_0,
+                data.len(),
+                m,
+                k,
+                name,
+            )?;
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
