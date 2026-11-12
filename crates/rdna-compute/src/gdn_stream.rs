@@ -357,6 +357,21 @@ pub struct GdnStreamConsts<'a> {
     pub n_value_heads: usize,
 }
 
+/// What the projection stored in [`GdnStreamRaw::qkv`] (and, for the gates, in
+/// alpha/beta).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GdnStreamInput {
+    /// Full raw rows; the executor preps every row it runs.
+    Raw,
+    /// The fused A4 `qkvzagdn` projection already ran the q/k/v part of
+    /// `gdn_chunk_prep` for these rows into the scratch planes and left only the
+    /// raw rows `gdn_chunk_prep_fixup` reads (tile edges, last three tokens) in
+    /// `qkv`. Valid ONLY for an append with no head replay and no incomplete
+    /// final tile (start and end on absolute tile boundaries):
+    /// `Gpu::gdn_stream_append` fails closed otherwise.
+    FusedPrepped,
+}
+
 /// Canonical projected inputs of the rows being appended: post-projection,
 /// pre-convolution QKV (`[rows][qkv_width]` f32) and raw alpha/beta
 /// (`[rows][n_value_heads]` f32). The prep rewrites `alpha`/`beta` in place for
@@ -367,6 +382,7 @@ pub struct GdnStreamRaw<'a> {
     pub qkv: &'a GpuTensor,
     pub alpha: &'a GpuTensor,
     pub beta: &'a GpuTensor,
+    pub input: GdnStreamInput,
 }
 
 /// Caller-owned prepared-plane scratch for the rows past the head tile: q/k

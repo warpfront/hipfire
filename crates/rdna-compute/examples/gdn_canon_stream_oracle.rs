@@ -459,6 +459,7 @@ fn stream_run(
             qkv: &x,
             alpha: &a,
             beta: &b,
+            input: rdna_compute::gdn_stream::GdnStreamInput::Raw,
         };
         let scratch = GdnStreamScratch {
             q: &q,
@@ -1194,6 +1195,7 @@ impl GraphRig<'_> {
             qkv: &b.x,
             alpha: &b.a,
             beta: &b.b,
+            input: rdna_compute::gdn_stream::GdnStreamInput::Raw,
         };
         let scratch = GdnStreamScratch {
             q: &b.q,

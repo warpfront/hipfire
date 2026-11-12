@@ -971,7 +971,12 @@ pub fn stream_append(
             n_key_heads: key_heads,
             n_value_heads: value_heads,
         },
-        &GdnStreamRaw { qkv, alpha, beta },
+        &GdnStreamRaw {
+            qkv,
+            alpha,
+            beta,
+            input: crate::gdn_stream::GdnStreamInput::Raw,
+        },
         &GdnStreamScratch {
             q: &q,
             k: &k,

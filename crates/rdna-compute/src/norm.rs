@@ -145,7 +145,7 @@ pub enum GdnScanOut {
 use crate::gdn_stream::{
     next_boundary, GdnAppendSchedule, GdnCarryGeometry, GdnCarryView, GdnLiveState, GdnPrefillPlan,
     GdnQ8Planes, GdnScanAlgorithm, GdnScanEntry, GdnScanExit, GdnSeqInputs, GdnStateQuant,
-    GdnStreamConsts, GdnStreamMeta, GdnStreamPhase, GdnStreamRaw, GdnStreamScratch,
+    GdnStreamConsts, GdnStreamInput, GdnStreamMeta, GdnStreamPhase, GdnStreamRaw, GdnStreamScratch,
     GdnStreamWorkspace, GdnTensorFormat, GDN_STREAM_SCHEMA_VERSION, GS_ENTRY_F32, GS_ENTRY_Q8,
     GS_ENTRY_Q8EF, GS_EXIT_EF, GS_EXIT_F32, GS_EXIT_NONE, GS_EXIT_SEAL, GS_EXIT_SEAM,
 };
@@ -6295,25 +6295,48 @@ impl Gpu {
         n_key_heads: usize,
         n_value_heads: usize,
     ) -> HipResult<()> {
+        self.gdn_chunk_prep_fixup_launch(
+            [
+                input,
+                conv_weight,
+                conv_state,
+                g,
+                beta,
+                dt_bias,
+                a_log,
+                q,
+                k,
+                v,
+            ]
+            .map(|t| t.buf.as_ptr()),
+            n_tokens,
+            q_scale,
+            eps,
+            n_key_heads,
+            n_value_heads,
+        )
+    }
+
+    /// [`Self::gdn_chunk_prep_fixup`] over device addresses in the argument order
+    /// `[input, conv_weight, conv_state, g, beta, dt_bias, a_log, q, k, v]` (row
+    /// views of larger planes: the stream executor completes the fused QKVZA's
+    /// whole-tile run in place). Mirrors [`Self::gdn_chunk_prep_launch`].
+    #[cfg(feature = "deltanet")]
+    fn gdn_chunk_prep_fixup_launch(
+        &mut self,
+        ptrs: [*mut c_void; 10],
+        n_tokens: usize,
+        q_scale: f32,
+        eps: f32,
+        n_key_heads: usize,
+        n_value_heads: usize,
+    ) -> HipResult<()> {
         const MODULE: &str = "gdn_chunk_prep_fixup";
         Self::gdn_chunk_check_heads(n_key_heads, n_value_heads)?;
         self.gdn_chunk_prep_fixup_prepare()?;
         let grid_x = n_tokens.div_ceil(64).max(n_tokens.div_ceil(128)) as u32;
         let grid_y = (1 + (2 * n_key_heads + n_value_heads).div_ceil(8)) as u32;
         let (hk, hv) = (n_key_heads as u32, n_value_heads as u32);
-        let ptrs = [
-            input,
-            conv_weight,
-            conv_state,
-            g,
-            beta,
-            dt_bias,
-            a_log,
-            q,
-            k,
-            v,
-        ]
-        .map(|t| t.buf.as_ptr());
         let nt = n_tokens as i32;
         let mut params: Vec<*mut c_void> =
             ptrs.iter().map(|p| p as *const _ as *mut c_void).collect();
@@ -7077,6 +7100,44 @@ impl Gpu {
         )
     }
 
+    /// [`Self::gdn_stream_prep`] for rows whose q/k/v the fused QKVZA already
+    /// wrote: the completion pass (tile heads, C64 gates, conv ring).
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    fn gdn_stream_prep_fixup(
+        &mut self,
+        c: &GdnStreamCtx<'_>,
+        x: *mut c_void,
+        conv: *mut c_void,
+        g: *mut c_void,
+        b: *mut c_void,
+        q: *mut c_void,
+        k: *mut c_void,
+        v: *mut c_void,
+        t: usize,
+    ) -> HipResult<()> {
+        let cs = &c.consts;
+        self.gdn_chunk_prep_fixup_launch(
+            [
+                x,
+                cs.conv_weight.buf.as_ptr(),
+                conv,
+                g,
+                b,
+                cs.dt_bias.buf.as_ptr(),
+                cs.a_log.buf.as_ptr(),
+                q,
+                k,
+                v,
+            ],
+            t,
+            cs.q_scale,
+            cs.eps,
+            c.hk,
+            c.hv,
+        )
+    }
+
     #[cfg(feature = "deltanet")]
     fn gdn_stream_kkt(&mut self, c: &GdnStreamCtx<'_>, p: &GdnScanPtrs, t: usize) -> HipResult<()> {
         if c.kkt_batched {
@@ -7183,6 +7244,19 @@ impl Gpu {
     /// sigmoid), as in the whole-call route. Returns the candidate metadata; the
     /// caller commits it only after every layer succeeded (device state is not
     /// rolled back here: use the owner's transaction ticket).
+    ///
+    /// `raw.input == FusedPrepped` (gfx1201 A4 fused `qkvzagdn` projection): the
+    /// whole-tile run's plain `gdn_chunk_prep` is replaced by
+    /// `gdn_chunk_prep_fixup` over the same pointers and row count. Admitted
+    /// only when the schedule has no head replay and no incomplete final tile
+    /// (fails closed before any mutation otherwise), because the fused GEMM
+    /// stores just the raw rows the fixup reads, never the full rows a head
+    /// replay or the carried raw prefix would need. Byte-exactness: the fused
+    /// epilogue and the fixup run the plain prep's per-element expressions
+    /// (`gdn_arith::IU4_G12`: one arithmetic with the separate SETs), the C64
+    /// gate chunks and 128-row producer tiles start at the call's first row,
+    /// which is an absolute tile boundary, and the persistent ring is updated by
+    /// the fixup from the last three raw rows exactly as the plain prep does.
     #[cfg(feature = "deltanet")]
     #[allow(clippy::too_many_arguments)]
     pub fn gdn_stream_append(
@@ -7206,6 +7280,17 @@ impl Gpu {
         let sched = GdnAppendSchedule::new(meta, start_pos, rows, 64, 512).map_err(fail)?;
         let (rc, rt) = (sched.bulk_complete, sched.bulk_tail);
         let r = rc + rt;
+        let fused = raw.input == GdnStreamInput::FusedPrepped;
+        if fused {
+            if sched.head || rt != 0 {
+                return Err(fail(format!(
+                    "fused-prepped input needs a tile-aligned append (head {}, tail rows {rt})",
+                    sched.head
+                )));
+            }
+            // JIT/load failure must precede every mutation.
+            self.gdn_chunk_prep_fixup_prepare()?;
+        }
         let need = |what: &str, have: usize, want: usize| -> HipResult<()> {
             if have < want {
                 Err(fail(format!("{what}: {have} bytes, needs {want}")))
@@ -7315,7 +7400,14 @@ impl Gpu {
                 self.gdn_stream_cp(carry.pending_beta, 0, raw.beta, (kh + rc) * arow, rt * arow)?;
             }
             if rc > 0 {
-                self.gdn_stream_prep(&c, xb, live_conv, alb, beb, qs, ks, vs, rc)?;
+                if fused {
+                    // The fused projection already wrote q/k/v for every row but
+                    // the 3-row tile heads; the completion pass finishes those,
+                    // the C64 gates and the ring (no head, no tail: see above).
+                    self.gdn_stream_prep_fixup(&c, xb, live_conv, alb, beb, qs, ks, vs, rc)?;
+                } else {
+                    self.gdn_stream_prep(&c, xb, live_conv, alb, beb, qs, ks, vs, rc)?;
+                }
             }
             if rt > 0 {
                 // The ring after the whole tiles is the incomplete tile's entry.

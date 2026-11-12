@@ -808,6 +808,7 @@ pub fn execute_deltanet_moe_layer_batched(
             1.0 / (hd as f32).sqrt(),
             config.linear_key_heads,
             n_v_heads,
+            rdna_compute::gdn_stream::GdnStreamInput::Raw,
         )?;
         return deltanet_moe_output_batched(
             gpu,
