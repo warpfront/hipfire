@@ -326,6 +326,41 @@ impl DspineBridge {
         })
     }
 
+    /// Explicit GPU release (mirrors `DflashWeights::free_gpu`: tensor drops
+    /// do not return pool pages on their own).
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let DspineBridge {
+            codebook,
+            read_w,
+            early_w,
+            write_w,
+            packed_w,
+            gate_bias,
+            s_normed,
+            s_projected,
+            s_codes,
+            s_packed,
+            s_message,
+            s_delta,
+            s_rms,
+            s_anchor,
+            ..
+        } = self;
+        let _ = gpu.free_tensor(codebook);
+        let _ = gpu.free_tensor(read_w);
+        for t in early_w {
+            let _ = gpu.free_tensor(t);
+        }
+        for t in write_w {
+            let _ = gpu.free_tensor(t);
+        }
+        let _ = gpu.free_tensor(packed_w);
+        let _ = gpu.free_tensor(gate_bias);
+        for t in [s_normed, s_projected, s_codes, s_packed, s_message, s_delta, s_rms, s_anchor] {
+            let _ = gpu.free_tensor(t);
+        }
+    }
+
     /// Feed the block's first real token id (the code anchor) before each
     /// bridged forward. The speculator driver owns the token.
     pub fn set_anchor(&mut self, gpu: &mut Gpu, anchor: u32) -> Result<(), String> {

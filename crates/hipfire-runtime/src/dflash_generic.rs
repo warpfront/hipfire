@@ -55,7 +55,8 @@ use crate::ddtree::{
     build_ddtree_tree_bounded, linearize_tree_with_parents, naive_sample_chain,
     sample_verified_tree, sample_verified_tree_swor, swor_draft_candidates, topk_from_logits,
 };
-use crate::dflash::{draft_forward, DflashConfig, DflashScratch, DflashWeights};
+use crate::dspine::{DspineBridge, DspineConfig};
+use crate::dflash::{draft_forward, draft_forward_bridge, DflashConfig, DflashScratch, DflashWeights};
 use crate::hfq::HfqFile;
 use crate::llama;
 use crate::spec::{
@@ -144,6 +145,10 @@ pub struct GenericDflashSpeculator {
     /// Xorshift64* RNG state for the temp>0 chain naive sampler. Bit-compatible
     /// with the qwen35 spec sampler's seed so the chain draws are deterministic.
     rng_state: u64,
+    /// Arch-24 DSpine code-bridge runner. `Some` when the draft HFQ carries a
+    /// `dspine` metadata block: the trunk loop then splices the bridge write
+    /// after every layer via `draft_forward_bridge` (eager only).
+    bridge: Option<DspineBridge>,
     /// Per-request temperature from [`Speculator::set_sampling`]. Used only for
     /// the post-prefill first-token draw (`step` receives `temp` as an argument).
     /// Default 0 → historical greedy argmax.
@@ -556,7 +561,11 @@ fn clamp_accept_to_budget(
 
 impl Speculator for GenericDflashSpeculator {
     fn name(&self) -> &'static str {
-        "dflash"
+        if self.bridge.is_some() {
+            "dspine"
+        } else {
+            "dflash"
+        }
     }
 
     fn prefill(
@@ -719,19 +728,41 @@ impl Speculator for GenericDflashSpeculator {
             ne,
             h
         );
-        draft_forward(
-            gpu,
-            &self.weights,
-            &self.config,
-            Some(&noise_embedding),
-            Some(&self.target_hidden_host[..ctx_elems]),
-            &positions_q,
-            &positions_k,
-            b,
-            position,
-            &mut self.scratch,
-        )
-        .map_err(|e| format!("draft_forward: {e}"))?;
+        if let Some(bridge) = self.bridge.as_mut() {
+            // Arch-24: anchor = the block's first real token id (the seed); the
+            // bridge write runs after every trunk layer, eager-only.
+            bridge
+                .set_anchor(gpu, block[0])
+                .map_err(|e| format!("dspine anchor: {e}"))?;
+            draft_forward_bridge(
+                gpu,
+                &self.weights,
+                &self.config,
+                Some(&noise_embedding),
+                Some(&self.target_hidden_host[..ctx_elems]),
+                &positions_q,
+                &positions_k,
+                b,
+                position,
+                &mut self.scratch,
+                bridge,
+            )
+            .map_err(|e| format!("draft_forward_bridge: {e}"))?;
+        } else {
+            draft_forward(
+                gpu,
+                &self.weights,
+                &self.config,
+                Some(&noise_embedding),
+                Some(&self.target_hidden_host[..ctx_elems]),
+                &positions_q,
+                &positions_k,
+                b,
+                position,
+                &mut self.scratch,
+            )
+            .map_err(|e| format!("draft_forward: {e}"))?;
+        }
 
         // ── 3b. Draft → tokens: apply the TARGET lm_head to draft hidden rows ─
         // The draft's final-hidden rows live in draft_scratch.x; row 0 is the seed
@@ -1056,12 +1087,16 @@ impl Speculator for GenericDflashSpeculator {
             weights,
             scratch,
             verify_scratch,
+            bridge,
             ..
         } = *self;
         weights.free_gpu(gpu);
         scratch.free_gpu(gpu);
         if let Some(vs) = verify_scratch {
             vs.free(gpu);
+        }
+        if let Some(mut b) = bridge {
+            b.free_gpu(gpu);
         }
     }
 }
@@ -1114,6 +1149,24 @@ pub fn build_generic_dflash_speculator(
             return Err(e);
         }
     };
+    // Arch-24 DSpine sidecar: when the HFQ carries a `dspine` metadata block,
+    // load the code-bridge runner (transactional like the weights/scratch).
+    let bridge = match DspineConfig::from_hfq(&draft_hfq) {
+        Ok(Some(dspine_cfg)) => match DspineBridge::new(gpu, &draft_hfq, dspine_cfg) {
+            Ok(b) => Some(b),
+            Err(e) => {
+                weights.free_gpu(gpu);
+                scratch.free_gpu(gpu);
+                return Err(e);
+            }
+        },
+        Ok(None) => None,
+        Err(e) => {
+            weights.free_gpu(gpu);
+            scratch.free_gpu(gpu);
+            return Err(format!("dspine contract re-check failed: {e}"));
+        }
+    };
     let _ = draft_hfq;
 
     // Tell the target which residual-hidden layers to capture (the drafter's
@@ -1137,6 +1190,7 @@ pub fn build_generic_dflash_speculator(
         block_size,
         ctx_capacity,
         tree: TreeMode::from_flags(&gpu.flags),
+        bridge,
         // Fixed deterministic seed (matches the qwen35 dflash_spec default).
         rng_state: 0x13579BDF,
         // Greedy until a request calls `set_sampling`. Truncation defaults

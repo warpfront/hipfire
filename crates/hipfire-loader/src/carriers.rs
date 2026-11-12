@@ -12408,13 +12408,22 @@ impl Carrier for LlamaCarrier {
                         ));
                     }
                     drop(draft_hfq);
-                    // The bridge HIP kernels and speculator build are the
-                    // next slice of this PR; until they land, refuse at the
-                    // same pointing surface instead of half-serving.
-                    return Err(format!(
-                        "DSpine sidecar '{dp}' passed target pairing, but the bridge-kernel \
-                         wiring is not merged yet; nothing can serve this draft yet"
-                    ));
+                    // Build through the generic speculator: the builder
+                    // auto-detects the `dspine` metadata block and loads the
+                    // code-bridge runner (the trunk then runs with the
+                    // bridge write spliced after every layer).
+                    let spec = hipfire_runtime::dflash_generic::build_generic_dflash_speculator(
+                        ctx.gpu,
+                        dp,
+                        &mut bundle,
+                        ctx.max_seq,
+                    )
+                    .map_err(|e| format!("DSpine speculator build failed: {e}"))?;
+                    eprintln!(
+                        "  DSpine speculator loaded for arch {} target: {}",
+                        meta.arch_id, dp
+                    );
+                    Some(spec)
                 }
                 // Not a DFlash draft or unreadable — log why and fall through to n-gram.
                 Err(e) => {
