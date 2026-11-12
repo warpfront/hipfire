@@ -675,19 +675,37 @@ use different R9700 cards. gfx1100/gfx1151 run serialized under a shared timing
 lock. **gfx1151 pins require a warm kernel cache**: populate it once, then
 reuse it for two scored runs with fresh HOME directories. Cold-JIT Halo runs
 can differ in chunk 0 only; warm-cache WT2/code24 repeats agree byte for byte.
-The gfx1201 KLD values remain unchanged at six decimals; their ROCm 10.1 sequence hashes
-are the expected re-pins, including the repaired native-FP8 producer route.
+The RDNA rows below are re-pinned for the canonical GDN prefill (chunk- and
+VRAM-independent numerics; CHANGELOG `## Unreleased`): the prefill GDN recipe
+and the scored-region route moved the sequences, paired against the previous
+pins on the same model, references, toolchain and cards (per-chunk paired-t 95%
+CI contains zero on every cell; the only bootstrap CI that excludes zero is the
+gfx1201 native-FP8 WT2 one, on the better side; absolute KLD below 0.08
+everywhere). Evaluator
+build commit `40c52c783a` (branch `canon-cand`), `eval_hipfire` md5
+`8b9ac50188aa0052211ea562d90d6b9f` (gfx1201 build) and
+`546b5f3a183b891b5a60fb5fccb36305` (gfx1100/gfx1151 build). Receipts:
+`/home/kaden/qcal/release-0.5.0/reliability/chunkfix/runs-canon/G4/` (`base/`,
+`cand/`, `cand/paired-*.json`). The gfx942 rows are unchanged: the candidate
+`qwen4_kld` (commit `8842531d0e`, md5 `d7b5741db5590851c0362c22d0e75a0a`)
+reproduces both pinned sequences byte for byte.
+
+Previous (pre-canonical) RDNA pins, KLD / `.kldseq` SHA-256 in the row order of
+the table: gfx1201 A4 `0.069571 / 0.052119`
+(`ff88c499…`, `9b061631…`), native fp8 `0.041859 / 0.029867` (`a4f68b12…`,
+`8373bc27…`), gfx1100 `0.069312 / 0.052757` (`3169b093…`, `27d837f3…`),
+gfx1151 warm `0.070054 / 0.050338` (`2355f76c…`, `9caca85b…`).
 
 | Arch | Route, KV flags | Corpus | KLD | `.kldseq` SHA-256 |
 |---|---|---|---:|---|
-| gfx1201 | A4 (default), `--kv-mode fp8 --kv-v q8` | WT2 | 0.069571 | `ff88c49910be618a98a917afc40d4b01ceeb7c6299c62f1c553444c11b402841` |
-| gfx1201 | A4 (default), `--kv-mode fp8 --kv-v q8` | code24 | 0.052119 | `9b0616316f50e9a654690d06d594d57466430d0a4a67041ec4ff0128d830910e` |
-| gfx1201 | native fp8 (`HIPFIRE_IU4_PREFILL=0`), `--kv-mode fp8 --kv-v q8` | WT2 | 0.041859 | `a4f68b12cf777a99dfc8ac1f398f41ec96614da118e9071e02951ca80dc5b113` |
-| gfx1201 | native fp8 (`HIPFIRE_IU4_PREFILL=0`), `--kv-mode fp8 --kv-v q8` | code24 | 0.029867 | `8373bc27da1fa88245b18bdb2ae90caebd275c06d1ecaf0dce1b9dc4855ca38e` |
-| gfx1100 | A4 (default), `--kv-mode q8 --kv-v q8` | WT2 | 0.069312 | `3169b09310d7598852a6eaa1f32f41aa54b531737c4d4ddd29b8dc90f546e7b2` |
-| gfx1100 | A4 (default), `--kv-mode q8 --kv-v q8` | code24 | 0.052757 | `27d837f388f3294d645b825d1cff7d1b06d219595f4459e9efc3fc4af2f93311` |
-| gfx1151 | A4 (default), `--kv-mode q8 --kv-v q8`, warm kernel cache | WT2 | 0.070054 | `2355f76cfd730cae26cdad027b3de00aeb14b0af8bb666eef934680bd14ca225` |
-| gfx1151 | A4 (default), `--kv-mode q8 --kv-v q8`, warm kernel cache | code24 | 0.050338 | `9caca85b4bf9c4049c921d85afc372ffcbb4698642313d5ce605eb1b2bb8feb0` |
+| gfx1201 | A4 (default), `--kv-mode fp8 --kv-v q8` | WT2 | 0.070184 | `b12344933a335f5e4228f0feef076c227e281b1ff41d87bcdb31571256b8ff6b` |
+| gfx1201 | A4 (default), `--kv-mode fp8 --kv-v q8` | code24 | 0.054421 | `c4515cbe74f89cf2fef3c1f0d26e3de0c39af8918b9f90cbbdad13cca25f11a3` |
+| gfx1201 | native fp8 (`HIPFIRE_IU4_PREFILL=0`), `--kv-mode fp8 --kv-v q8` | WT2 | 0.041267 | `6b5b901694794a04096dd060ce10f4f0787ce00117440a63d1bd5b932ea7ba39` |
+| gfx1201 | native fp8 (`HIPFIRE_IU4_PREFILL=0`), `--kv-mode fp8 --kv-v q8` | code24 | 0.029258 | `a74aff5367db0b983c7d3c8352ac24f46e8eb7e5b76dd02c648a29e57c331129` |
+| gfx1100 | A4 (default), `--kv-mode q8 --kv-v q8` | WT2 | 0.069955 | `bb80365b8a1ad14d8c8199f6726dfc27897b340f369ddaae46ccea99694c992d` |
+| gfx1100 | A4 (default), `--kv-mode q8 --kv-v q8` | code24 | 0.054395 | `2eeae80fc7e7d94bc5c4be1d0c7008e32050e4c098f03702b0feef1bcd73dc50` |
+| gfx1151 | A4 (default), `--kv-mode q8 --kv-v q8`, warm kernel cache | WT2 | 0.069955 | `6aa50d12c7256cb4de88feddafbfd7226ca2817d98154b57b3979ee65909cc68` |
+| gfx1151 | A4 (default), `--kv-mode q8 --kv-v q8`, warm kernel cache | code24 | 0.054395 | `d1e0004402e688109ef2c91cb06b0a26007700661a0fc288d960971e79e31131` |
 | gfx942 | Flash-Next stock FP8 AR (default route, `qwen4_kld eval --decode`), BF16 teacher | WT2 | 0.018734 | `d4b4d4adaa338cf4d738394b8fcaa2c481b2895d56753a4b35710c5d32d3be68` |
 | gfx942 | Flash-Next stock FP8 AR (default route, `qwen4_kld eval --decode`), BF16 teacher | code24 | 0.023527 | `5255454e0c638d46443ceabd1b316a5daf28ecf387a8293def6c6da46019327f` |
 
