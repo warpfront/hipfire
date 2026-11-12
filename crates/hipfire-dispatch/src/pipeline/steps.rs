@@ -1118,7 +1118,6 @@ fn execute_window<'a>(
                 })
                 .collect();
             let group = ops.len();
-            if group < 2 { eprintln!("[DBGDECL] group {} small", group); }
             if group >= 2
                 && crate::pipeline::layer_ops::execute_gated_delta_net_core_lanes(
                     gpu,

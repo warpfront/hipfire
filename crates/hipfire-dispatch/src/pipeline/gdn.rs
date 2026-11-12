@@ -217,10 +217,10 @@ where
     F: FnOnce(&mut Gpu) -> Result<(), DispatchError>,
 {
     let Some(first) = ops.first() else {
-        return { eprintln!("[DBGDECL] site 1 ops={}", ops.len()); Ok(Gfx942GdnLanes::Declined(before_launch)) };
+        return Ok(Gfx942GdnLanes::Declined(before_launch));
     };
     if ops.len() < 2 || ops.len() > QWEN4_GDN_LANES_F32_MAX || !lanes_f32_gfx942_admitted(gpu) {
-        return { eprintln!("[DBGDECL] site 2 ops={}", ops.len()); Ok(Gfx942GdnLanes::Declined(before_launch)) };
+        return Ok(Gfx942GdnLanes::Declined(before_launch));
     }
     let shape: LaneShape = (
         first.key_heads,
@@ -255,7 +255,7 @@ where
                     position: op.start_position,
                 };
                 if lane_declined(gpu, op, shape, &dims) {
-                    return { eprintln!("[DBGDECL] site 3 ops={}", ops.len()); Ok(Gfx942GdnLanes::Declined(before_launch)) };
+                    return Ok(Gfx942GdnLanes::Declined(before_launch));
                 }
                 ar_lanes.push((op, views));
             }
@@ -279,7 +279,7 @@ where
                     position: op.start_position,
                 };
                 if lane_declined(gpu, op, shape, &dims) {
-                    return { eprintln!("[DBGDECL] site 4 ops={}", ops.len()); Ok(Gfx942GdnLanes::Declined(before_launch)) };
+                    return Ok(Gfx942GdnLanes::Declined(before_launch));
                 }
                 capture_lanes.push((op, capture, views));
             }
@@ -322,7 +322,7 @@ where
         capture_lanes.iter().map(|(op, ..)| extent(op.recurrent)).collect(),
     ];
     if !sets.into_iter().all(disjoint) {
-        return { eprintln!("[DBGDECL] site 5 ops={}", ops.len()); Ok(Gfx942GdnLanes::Declined(before_launch)) };
+        return Ok(Gfx942GdnLanes::Declined(before_launch));
     }
     // Verify lanes: the whole group (the one-row AR lanes beside them included) runs the
     // Core chain as three launches per chunk of lanes (convolution + gate parameters + the
@@ -385,12 +385,11 @@ where
             value_dim: first.value_dim,
             conv_kernel: first.conv_kernel,
         };
-        if let Some(e) = lanes
+        if !lanes
             .chunks(QWEN4_G942_GDN_LANES_VERIFY_MAX)
-            .find_map(|chunk| qwen4_gdn_lanes_verify_admitted(chunk, shape).err())
+            .all(|chunk| qwen4_gdn_lanes_verify_admitted(chunk, shape).is_ok())
         {
-            eprintln!("[DBGDECL] admission {e:?}");
-            return { eprintln!("[DBGDECL] site 6 ops={}", ops.len()); Ok(Gfx942GdnLanes::Declined(before_launch)) };
+            return Ok(Gfx942GdnLanes::Declined(before_launch));
         }
         before_launch(gpu)?;
         let mut device = gpu.try_gfx942().ok_or_else(|| {
