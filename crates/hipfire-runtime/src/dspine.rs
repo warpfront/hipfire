@@ -363,15 +363,17 @@ impl crate::dflash::DraftLayerBridge for DspineBridge {
         } else {
             &self.read_w
         };
-        gpu.gemm_f32_batched(&self.s_normed, w, &self.s_projected, b, h, c)?;
+        // gemm computes y = b_arg·a_arg^T ([n,m] row-major): pass the weight
+        // first so y lands as projected [b, C] row-major.
+        gpu.gemm_f32_batched(w, &self.s_normed, &self.s_projected, c, h, b)?;
         // 3. normalize_codes (kernel 2): anchor identity / L2 to sqrt(C).
         gpu.dspine_normalize_codes(&self.s_projected, &self.codebook, &self.s_anchor, &self.s_codes, b, c, t)?;
         // 4. packed GEMM: codes [b,C] × packed_w[3R,C]^T → packed [b,3R].
-        gpu.gemm_f32_batched(&self.s_codes, &self.packed_w, &self.s_packed, b, c, 3 * r)?;
+        gpu.gemm_f32_batched(&self.packed_w, &self.s_codes, &self.s_packed, 3 * r, c, b)?;
         // 5. feature_message (kernel 3): gate · predecessor value.
         gpu.dspine_feature_message(&self.s_packed, &self.gate_bias, &self.s_message, b, r, t)?;
         // 6. delta GEMM: message [b,R] × W_i[H,R]^T → delta [b,H].
-        gpu.gemm_f32_batched(&self.s_message, &self.write_w[li], &self.s_delta, b, r, h)?;
+        gpu.gemm_f32_batched(&self.write_w[li], &self.s_message, &self.s_delta, h, r, b)?;
         // 7. finish (kernel 4): x += rms * delta on non-first rows, in place.
         gpu.dspine_finish(&scratch.x, &self.s_rms, &self.s_delta, b, h, t)?;
         Ok(())

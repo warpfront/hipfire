@@ -32,7 +32,17 @@
 // matrices are tiny ([16,5120]@[5120,1024] and friends).
 
 #include <hip/hip_runtime.h>
-#include <hip/hip_bfloat16.h>
+
+
+// bf16 storage is plain u16 bit patterns: every ROCm release names the
+// bf16 type differently (7.x hip_bfloat16 vs 10.x __hip_bfloat16) and the
+// system header ordering differs per host, so the kernels take u16 and
+// convert through the bit layout — no bf16 type anywhere.
+__device__ static inline float dspine_bf16_to_f32_bits(unsigned short bits) {
+    union { unsigned int u; float f; } cvt;
+    cvt.u = ((unsigned int)bits) << 16;
+    return cvt.f;
+}
 
 // ── prepare_read: rms stats + normalized rows ────────────────────────────
 // Grid: [m, 1, 1]. Block: [256]. x: [m, H] f32 (trunk block rows);
@@ -83,7 +93,7 @@ __global__ void dspine_prepare_read_gfx1100(
 extern "C" __launch_bounds__(256, 4)
 __global__ void dspine_normalize_codes_gfx1100(
     const float* __restrict__ projected,
-    const __hip_bfloat16* __restrict__ codebook,
+    const unsigned short* __restrict__ codebook,
     const unsigned int* __restrict__ anchor_ids,
     float* __restrict__ codes,
     int C,
@@ -98,9 +108,9 @@ __global__ void dspine_normalize_codes_gfx1100(
     if (block_row == 0) {
         // Identity path: codebook[anchor_id] * sqrt(C).
         const unsigned int anchor = anchor_ids[row / T];
-        const __hip_bfloat16* code = codebook + (long long)anchor * C;
+        const unsigned short* code = codebook + (long long)anchor * C;
         for (int i = tid; i < C; i += 256) {
-            out_row[i] = __bfloat162float(code[i]) * scale;
+            out_row[i] = dspine_bf16_to_f32_bits(code[i]) * scale;
         }
         return;
     }
