@@ -387,18 +387,21 @@ fn g942_gdn_verify_image() -> HipResult<Option<&'static std::sync::Arc<[u8]>>> {
 /// symbol is returned; every other arch, and every other entry, loads from `tensor_ops` as
 /// before and returns `kernel`.
 pub(crate) fn ensure_gdn_verify_kernel(gpu: &mut Gpu, kernel: &'static str) -> HipResult<&'static str> {
-    let entry = gpu
-        .arch_caps
-        .is_gfx942()
-        .then(|| {
-            QWEN4_G942_GDN_VERIFY_ENTRIES
-                .iter()
-                .find(|(tensor_ops, _)| *tensor_ops == kernel)
-        })
-        .flatten();
-    let Some(&(_, own)) = entry else {
+    if !gpu.arch_caps.is_gfx942() {
         gpu.ensure_kernel_public("tensor_ops", crate::tensor_ops::TENSOR_OPS_SRC, kernel)?;
         return Ok(kernel);
+    }
+    let own = match kernel {
+        "gated_delta_step_halves_state128_persistent256_capture_f32" => {
+            "qwen4_g942_gdn_verify_capture_f32"
+        }
+        "gated_delta_rollback_layers_f32" => "qwen4_g942_gdn_verify_rollback_f32",
+        "gated_delta_conv_bf16_f32_batched_k4" => "qwen4_g942_gdn_verify_conv_params_k4",
+        "gated_delta_gate_bf16_f32_batched" => "qwen4_g942_gdn_verify_gate_batched",
+        _ => {
+            gpu.ensure_kernel_public("tensor_ops", crate::tensor_ops::TENSOR_OPS_SRC, kernel)?;
+            return Ok(kernel);
+        }
     };
     gpu.bind_thread()?;
     match g942_gdn_verify_image()? {
