@@ -3457,8 +3457,20 @@ impl HipRuntime {
 
     // ── Modules & Kernels ───────────────────────────────────────
 
+    /// gfx1033-1036 (proven on gfx1036, HIPF-371): loading a code object drops an
+    /// in-flight null-stream hipMemset, so its target keeps the old bytes. Drain
+    /// the device first; this runs once per module load.
+    fn drain_before_code_object_load(&self) -> HipResult<()> {
+        let arch = self.current_device().and_then(|d| self.get_arch(d));
+        if arch.is_ok_and(|a| matches!(a.as_str(), "gfx1033" | "gfx1034" | "gfx1035" | "gfx1036")) {
+            self.device_synchronize()?;
+        }
+        Ok(())
+    }
+
     pub fn module_load(&self, path: &str) -> HipResult<Module> {
         self.plan_deny("hipModuleLoad")?;
+        self.drain_before_code_object_load()?;
         let c_path =
             CString::new(path).map_err(|_| HipError::new(1, "invalid path for module_load"))?;
         let mut module: HipModule = ptr::null_mut();
@@ -3475,6 +3487,7 @@ impl HipRuntime {
 
     pub fn module_load_data(&self, image: &[u8]) -> HipResult<Module> {
         self.plan_deny("hipModuleLoadData")?;
+        self.drain_before_code_object_load()?;
         let mut module: HipModule = ptr::null_mut();
         let code =
             // SAFETY: module/function handles are live HIP objects from earlier loads;

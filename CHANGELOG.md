@@ -148,6 +148,7 @@
 
 - PeaceMaker RDNA: pin a named SOP1 XML-condition override table to all three source hashes, with per-row LLVM register, inline and literal byte-round-trip evidence. Preserve the malformed source condition; exhaustively prove all 256 selectors for restricted operand domains instead of disabling valid register forms along with invalid inline/literal forms.
 - PeaceMaker RDNA: carry full instruction/encoding/condition/ordinal keys through IR construction and RDNA consumers, and add an XML-layout field codec backed by generated runtime rows. Preserve named graphics refusals and refuse unqualified XML variants in the numeric emulator.
+- HIP runtime: drain the device before every `hipModuleLoad`/`hipModuleLoadData` on gfx1033-1036. On gfx1036 a code-object load drops an in-flight null-stream `hipMemset`, so a buffer memset just before a kernel's first use kept stale bytes (HIPF-371).
 
 ### Performance and loading: canonical GDN prefill
 
