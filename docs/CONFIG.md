@@ -2219,15 +2219,10 @@ The developer overrides `HIPFIRE_QWEN4_EXPERT_STAGE`, `HIPFIRE_PREFILL_CHUNK_ROW
 
 Every schema key carries one lifecycle status. The table is generated from
 `crates/hipfire-config/src/lib.rs` by `scripts/check-lifecycle.py --write`, and
-`scripts/no-gpu-ci.sh` fails when it drifts. The status is `deprecated` when the
-field carries `// lifecycle: deprecated since 0.4.0, removal 0.5.0 — <reason>`,
-otherwise `experimental` or `stable` from the schema's `experimental` flag.
-Deprecated keys still load in 0.4.0 and warn once when they switch a deprecated
-feature on; their defaults are inert, so default configs never reach
-deprecated code. Env statuses live in [`env-vars.md`](env-vars.md#lifecycle-status).
-
-Deprecated since 0.4.0, removal in 0.5.0:
-
+`scripts/no-gpu-ci.sh` fails when it drifts. The status is `experimental` or
+`stable` from the schema's `experimental` flag. Every key and env var deprecated
+since 0.4.0 was removed in 0.5.0, so no key carries the `deprecated` status in
+this release. Env statuses live in [`env-vars.md`](env-vars.md#lifecycle-status).
 
 Removed keys. A key that shipped in a release and was later removed from the
 schema stays in `RETIRED_CONFIG_KEYS` (`crates/hipfire-config/src/lib.rs`). A

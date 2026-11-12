@@ -474,7 +474,7 @@ The image is `ghcr.io/warpfront/hipfire:latest` (`docker pull
 ghcr.io/warpfront/hipfire:0.4.6`); `HIPFIRE_IMAGE=ghcr.io/warpfront/hipfire:0.4.6`
 pins compose to a release.
 
-## Deprecated features
+## Removed features
 
 The Givens/asymmetric KV modes and the legacy DFlash knobs were removed in 0.5.0. See
 [configuration](docs/CONFIG.md) for supported settings and

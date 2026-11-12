@@ -37,7 +37,7 @@ it has no [`admissions.yml`](admissions.yml) row and is not a product floor.
    admission claim **additionally** requires an explicit row in
    [`admissions.yml`](admissions.yml) (schema v2; exactly one earned record — fail closed otherwise).
 2. Many older rows used the then-default `asym3` KV mode (Givens asymmetric KV),
-   which is **deprecated since 0.4.0, removal in 0.5.0** — historical
+   which was **removed in 0.5.0** — historical
    reproduction only. Current
    clean configs resolve `kv_cache=auto` through the model registry and
    otherwise to the architecture default (Qwen native `fp8` on eligible exact
