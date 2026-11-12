@@ -475,10 +475,16 @@ fn native_trunk_prefill_scope(
 }
 
 /// Whether an ordinary prefill forward runs under the canonical-recipe intent
-/// ([`Gpu::ordinary_prefill_enter`]): every prefill forward, one-row tails included, except on
-/// gfx942, whose pinned canonical-routing scope and AR route stay as they are.
-pub(crate) fn ordinary_prefill_applies(prefill_scope: bool, arch: &str) -> bool {
-    prefill_scope && arch != "gfx942"
+/// ([`Gpu::ordinary_prefill_enter`]): every prefill forward, one-row tails included, except a
+/// lane prefill WAVE (`wave`: [`ep_wave::EpWaveRoute`] set by `ep_wave_run` and by its admission
+/// probe `ep_wave_facts`) and gfx942, whose pinned canonical-routing scope and AR route stay as
+/// they are. A wave concatenates several lanes' rows into its joint stages, which reproduce each
+/// lane's rows only on the sub-512 product routes under the wave's routing-row cap
+/// (`QWEN4_EXACT_WAVE_ROUTE_ROWS_CAP`); the intent would route every call at the canonical chunk
+/// past that cap. Lane prefill is distribution-equivalent by design (see
+/// [`ep_a8_scope_applies`]), so the wave keeps the product routes.
+pub(crate) fn ordinary_prefill_applies(prefill_scope: bool, wave: bool, arch: &str) -> bool {
+    prefill_scope && !wave && arch != "gfx942"
 }
 
 /// Whether a forward of `rows` actual rows runs the EP symmetric-MoE A8 chain
@@ -15873,7 +15879,8 @@ impl Qwen4GpuForward {
                 self.scratch.max_chunk
             )));
         }
-        let ordinary_scope = ordinary_prefill_applies(route == MeshRoute::Prefill, &gpu.arch);
+        let ordinary_scope =
+            ordinary_prefill_applies(route == MeshRoute::Prefill, false, &gpu.arch);
         let ordinary = ordinary_scope.then(|| gpu.ordinary_prefill_enter());
         let (pm_invariant, append) = if ordinary_scope {
             (false, false)
@@ -16162,8 +16169,10 @@ impl Qwen4GpuForward {
         let scope = std::mem::replace(&mut gpu.qwen4_scope, true);
         // Ordinary prefill takes the typed intent instead of the invariant profile / agent-turn
         // append scopes: the canonical recipe for every row, never the append route's
-        // symmetric-MoE suppression or the invariant profile's trunk IU4 exclusion.
-        let ordinary_scope = ordinary_prefill_applies(self.prefill_scope, &gpu.arch);
+        // symmetric-MoE suppression or the invariant profile's trunk IU4 exclusion. A lane
+        // prefill wave (`wave_route` set) keeps the product routes under its routing-row cap.
+        let ordinary_scope =
+            ordinary_prefill_applies(self.prefill_scope, self.wave_route.is_some(), &gpu.arch);
         let ordinary = ordinary_scope.then(|| gpu.ordinary_prefill_enter());
         let (pm_invariant, append) = if ordinary_scope {
             (false, false)
@@ -20175,6 +20184,26 @@ mod tests {
                 a8(true, true, true, rows),
                 rows < floor,
                 "lane EP rows {rows}"
+            );
+        }
+    }
+
+    /// A lane prefill wave never runs under the ordinary-prefill intent: its joint stages
+    /// concatenate several lanes' rows, and under the intent the canonical routing rows (8192)
+    /// select the packed BF16 HC streams the lanes' own PLE conv / final HC read addressed at the
+    /// F32 row pitch (19/32 corrupted code C8 streams on `abdff7e047`). Every other prefill
+    /// forward keeps the intent (gfx942 never takes it).
+    #[test]
+    fn a_lane_wave_never_takes_the_ordinary_prefill_intent() {
+        use super::ordinary_prefill_applies as ordinary;
+        for arch in ["gfx1201", "gfx1151", "gfx1100", "gfx942"] {
+            assert!(!ordinary(true, true, arch), "{arch} wave");
+            assert!(!ordinary(false, true, arch), "{arch} non-prefill wave flag");
+            assert!(!ordinary(false, false, arch), "{arch} decode / verify");
+            assert_eq!(
+                ordinary(true, false, arch),
+                arch != "gfx942",
+                "{arch} prefill"
             );
         }
     }

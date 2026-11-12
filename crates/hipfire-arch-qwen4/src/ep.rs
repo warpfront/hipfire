@@ -3296,7 +3296,25 @@ fn stage_rank_lanes(
         .device_mem_info()
         .map(|(free, _)| free as u64)
         .map_err(|error| format!("rank {rank}: device memory query failed: {error}"))?;
-    ep_lane_fit(rank, need, free, reserve)?;
+    ep_lane_fit(rank, need, free, reserve).map_err(|error| {
+        // Only `serve.batch_exact` lanes carry the canonical GDN stream (`Qwen4StateFormat::lane`):
+        // name it, it is what such a store adds per lane.
+        let carry = crate::state::Qwen4State::gdn_stream_device_bytes(
+            &bundle.config,
+            bundle.state_format().lane().gdn_stream,
+            &crate::weights::Qwen4BandScope::single(&bundle.config),
+            crate::state::StateMirror::Snapshot,
+        )
+        .unwrap_or(0);
+        if carry == 0 {
+            error
+        } else {
+            format!(
+                "{error}; serve.batch_exact lanes keep the canonical GDN stream carry ({} MiB per MTP lane): lower serve.continuous_batch_size or turn serve.batch_exact off",
+                carry >> 20
+            )
+        }
+    })?;
     bundle
         .stage_lanes_with_copy(gpu, max_lanes, row_budget, spec, copy)
         .map_err(|error| format!("rank {rank}: {}", bundle_text(error)))

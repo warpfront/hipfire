@@ -1546,7 +1546,7 @@ pub fn f16_shadow_route_rows_with(
     pm_invariant_enabled: bool,
 ) -> usize {
     // Ordinary prefill runs under the typed intent (canonical routing for every row count).
-    if crate::gpu_forward::ordinary_prefill_applies(true, arch) {
+    if crate::gpu_forward::ordinary_prefill_applies(true, false, arch) {
         return chunk_rows.max(rdna_compute::prefill_invariant::QWEN4_PREFILL_CANON_ROWS);
     }
     // The batch-invariant flag does not depend on the row count, and the append

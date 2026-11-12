@@ -3,10 +3,12 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! The EXACT expert-parallel prefill wave: one joint forward of several lanes' prompt tiles on an
-//! EP rank, byte-identical per lane to the serial lane tiles it replaces for lanes of 65+ rows
-//! (BEAT-PAITON S1). A small lane (9..=64 rows) is only distribution-equivalent to its serial
-//! tile by default and skips the wave under `serve.batch_exact`
-//! ([`QWEN4_EP_WAVE_SMALL_LANES_ENV`]).
+//! EP rank whose rows are per-slot independent (BEAT-PAITON S1): a lane's bytes do not depend on
+//! the other lanes of the wave. The wave runs the sub-512 product routes outside the
+//! ordinary-prefill intent (`ordinary_prefill_applies`), while a lane's serial prefill tile runs
+//! the canonical recipe under it, so a wave lane is distribution-equivalent, not byte-identical,
+//! to its serial tile (lane prefill is distribution-equivalent by design); `serve.batch_exact`
+//! lanes never wave.
 //!
 //! A sub-512-row lane tile runs the EP FULL-TABLE MoE: every rank computes every expert of the
 //! layer (peer tables over P2P, host-mapped arenas), no gather, no tile exchange, so its cost is
@@ -25,9 +27,10 @@
 //! its whole forward under `Gpu::qwen4_route_rows_cap = 511`: lanes are below 512 rows so every
 //! per-lane op is untouched, and the wide MoE call sees `511` routing rows, i.e. it picks the
 //! sub-512 kernels (BF16 multirow router and shared expert, `o4_r8_x4` gate/up, `O8R16` down,
-//! F32 grouped chain) a lane's own singleton picks, while its launches carry the real rows. Those
-//! kernels compute each (slot, output row) with a fixed accumulation order independent of the
-//! other slots of its tile, of the padding and of the launch's grouped row count.
+//! F32 grouped chain) a sub-512-row lane picks outside the ordinary-prefill intent, while its
+//! launches carry the real rows. Those kernels compute each (slot, output row) with a fixed
+//! accumulation order independent of the other slots of its tile, of the padding and of the
+//! launch's grouped row count.
 //!
 //! # Admission
 //!
@@ -307,8 +310,12 @@ pub(crate) struct EpWaveFacts {
     /// Per lane: the lane's own rows take the owner-routed tile route (see [`ep_wave_route`]).
     pub lane_tile: Vec<bool>,
     /// Per lane: the A8 chain is the lane's active owner-routed chain (`Gpu::qwen4_moe_ep_a8_requested`
-    /// under the lane's own tile scopes).
+    /// under the wave's scopes for the lane's rows).
     pub lane_a8: Vec<bool>,
+    /// `serve.batch_exact` is on: every lane keeps its canonical serial tile (ordinary-prefill
+    /// intent, byte-identical to the same prompt prefilled alone). A wave runs the product routes
+    /// outside that intent, so it is only distribution-equivalent to those tiles and never runs.
+    pub batch_exact: bool,
     /// The EP full tables are built (`attach_ep` ran).
     pub moe_full_ready: bool,
     /// Trunk-shard partial FFN route active: every chunk of 9+ rows binds the rank's compact
@@ -361,6 +368,12 @@ pub(crate) fn ep_wave_refusal(facts: &EpWaveFacts) -> Option<String> {
     let refuse = |why: String| Some(format!("ep wave refused: {why}"));
     if facts.lane_rows.len() < 2 {
         return refuse("a wave needs at least two lanes".to_string());
+    }
+    if facts.batch_exact {
+        return refuse(
+            "serve.batch_exact lanes keep their canonical serial tile (a wave is distribution-equivalent, not byte-identical, to it)"
+                .to_string(),
+        );
     }
     for (lane, &rows) in facts.lane_rows.iter().enumerate() {
         if !(facts.min_lane_rows..=EXACT_WAVE_MAX_LANE_ROWS).contains(&rows) {
@@ -645,11 +658,13 @@ impl Qwen4GpuForward {
     ) -> EpWaveFacts {
         let total: usize = lane_rows.iter().sum();
         let prior_prefill = std::mem::replace(&mut self.prefill_scope, true);
-        // A wave's lanes are lane prefill tiles: probe them under the lane intent, whose
-        // sub-512-row MoE chain is the A8 one unless `serve.batch_exact` is on.
         let prior_lane = std::mem::replace(&mut self.lane_scope, true);
+        // A wave's lanes are probed under the wave's own scope (`wave_route` set: no
+        // ordinary-prefill intent, see `ordinary_prefill_applies`), the scopes `ep_wave_run`
+        // executes them under. The route is what these facts decide; any value marks the wave.
+        let prior_route = self.wave_route.replace(EpWaveRoute::FullTable);
         // (tile route, any scope entered, A8 chain, symmetric chain) of `rows` rows under the
-        // routing scopes a prefill tile of those rows enters.
+        // routing scopes a wave lane of those rows runs under.
         let probe = |this: &Self, gpu: &mut Gpu, rows: usize| -> (bool, bool, bool, bool) {
             let (pm_invariant, append) = Self::route_scopes(this.prefill_scope, gpu, rows);
             let (saved, _) = this.enter_tile_scopes(gpu, rows);
@@ -674,12 +689,15 @@ impl Qwen4GpuForward {
         }
         self.prefill_scope = prior_prefill;
         self.lane_scope = prior_lane;
+        self.wave_route = prior_route;
         let reserve = self.ep_reserve.as_ref();
         let resident_limit = reserve.map(|reserve| reserve.banks.resident_call_limit());
         EpWaveFacts {
             lane_rows: lane_rows.to_vec(),
             lane_tile,
             lane_a8,
+            batch_exact: hipfire_config::qwen4_lane_row_exact()
+                != hipfire_config::LaneRowExact::Off,
             moe_full_ready: self
                 .ep
                 .as_ref()
@@ -843,6 +861,7 @@ mod tests {
             lane_rows: lane_rows.to_vec(),
             lane_tile: vec![false; lane_rows.len()],
             lane_a8: vec![true; lane_rows.len()],
+            batch_exact: false,
             moe_full_ready: true,
             ffn_partial: false,
             decode_share: false,
@@ -880,6 +899,19 @@ mod tests {
         let mut over = facts(&[511, 511, 511, 300, 216]);
         over.capacity_rows = 8192;
         assert!(refused(&over).contains("wave cap"), "{}", refused(&over));
+    }
+
+    /// `serve.batch_exact` lanes stay canonical (their serial tile runs under the ordinary-prefill
+    /// intent): no wave reproduces them, whatever its lanes and route.
+    #[test]
+    fn batch_exact_lanes_never_wave() {
+        for lanes in [&[149usize; 8][..], &[65, 65], &[511, 300]] {
+            let mut exact = facts(lanes);
+            exact.batch_exact = true;
+            assert!(refused(&exact).contains("serve.batch_exact"), "{lanes:?}");
+            exact.lane_tile = vec![true; lanes.len()];
+            assert!(refused(&exact).contains("serve.batch_exact"), "{lanes:?}");
+        }
     }
 
     #[test]
@@ -1323,6 +1355,30 @@ mod tests {
         assert!(lanes.contains("fwd.ep_wave_run(gpu, total, scope_rows, &lane_rows, route,"));
     }
 
+    /// The wave and its admission probe run outside the ordinary-prefill intent: both mark the
+    /// wave (`wave_route`) before they enter the tile scopes, and `enter_tile_scopes` keys the
+    /// intent on that mark (`ordinary_prefill_applies`). Under the intent the joint stages ran at
+    /// the canonical routing rows past the wave's 511-row cap and corrupted lanes (`abdff7e047`).
+    #[test]
+    fn the_wave_and_its_probe_enter_the_scopes_marked_as_a_wave() {
+        let src = include_str!("ep_wave.rs");
+        let body = &src[..src.find("#[cfg(test)]").unwrap()];
+        let facts = &body[body.find("pub(crate) fn ep_wave_facts(").unwrap()..];
+        let facts = &facts[..facts.find("pub(crate) fn ep_wave_run(").unwrap()];
+        let mark = facts
+            .find("self.wave_route.replace(")
+            .expect("the probe marks the wave");
+        assert!(mark < facts.find("this.enter_tile_scopes(gpu, rows)").unwrap());
+        assert!(facts.contains("self.wave_route = prior_route;"));
+        let run = &body[body.find("pub(crate) fn ep_wave_run(").unwrap()..];
+        let mark = run.find("self.wave_route.replace(route)").unwrap();
+        assert!(mark < run.find("self.enter_tile_scopes(gpu, scope_rows)").unwrap());
+        let forward = include_str!("../gpu_forward.rs");
+        assert!(forward.contains(
+            "ordinary_prefill_applies(self.prefill_scope, self.wave_route.is_some(), &gpu.arch)"
+        ));
+    }
+
     #[test]
     fn scratch_capacity_follows_the_mode_and_the_reserve_bank() {
         use Qwen4ForwardScratchMode::{FnSymGfx1201, Full};
@@ -1482,6 +1538,7 @@ mod tests {
         // Both routes run under the routing-row cap, set and restored once.
         assert_eq!(body.matches("gpu.qwen4_route_rows_cap").count(), 2);
         assert_eq!(body.matches("self.wave_route.replace(route)").count(), 1);
-        assert_eq!(body.matches("self.wave_route = prior_route").count(), 1);
+        // Restored by the wave and by its admission probe (which marks the wave scope).
+        assert_eq!(body.matches("self.wave_route = prior_route").count(), 2);
     }
 }

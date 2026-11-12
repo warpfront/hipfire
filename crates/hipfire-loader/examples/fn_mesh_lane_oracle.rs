@@ -98,6 +98,17 @@
 //! the same prompts) beside `burst_vs_singleton_sum`. stderr carries one `[oracle-burst]` line
 //! per run (read by `d1/scripts/wave-table.py`).
 //!
+//! Twin lanes: lanes of one run whose prompts have identical token ids (repeat the same
+//! `--prompt-file`; equal files count too) are twins. A joint prefill wave is per-slot
+//! independent (each lane's rows depend only on its own tokens, never on its neighbours or
+//! its position in the wave), so twins must produce byte-identical ids and logits rows (the
+//! prompt-completing row 0 and every AR row) whatever the singleton reference does. With
+//! `--logits` every run reports a `twins` object (`groups`, `groups_equal`/`groups_total`,
+//! first differing lane/row per group) in report.json and `twins_equal=a/b` on the
+//! `[oracle-burst]` line; a twin mismatch fails the run (exit 1) independently of the
+//! singleton comparison. `--burst` still refuses one prompt INDEX twice; twins are distinct
+//! indices naming the same file.
+//!
 //! Speculative-lane schema (CLI contract; execution is an explicit boundary):
 //! ```text
 //!     [--spec ar|mtp] [--k K] [--routes floor|cycle|batched]
@@ -1169,6 +1180,13 @@ fn compared_json(prompt: usize, prompt_len: usize, lane: usize, c: &Comparison) 
 fn burst_extras(set: &RunSet, run: &KRun, prompts: &[&[u32]], references: &[Reference]) -> Value {
     let lens: Vec<usize> = set.members.iter().map(|&i| prompts[i].len()).collect();
     let single_ms: f64 = set.members.iter().map(|&i| references[i].prefill_ms).sum();
+    // Twin check only when the run hashed logits rows (`--logits`).
+    let twins = if run.logits_sha.iter().any(|rows| !rows.is_empty()) {
+        let lane_prompts: Vec<&[u32]> = set.members.iter().map(|&i| prompts[i]).collect();
+        twins_json(&twin_groups(&lane_prompts, &run.ids, &run.logits_sha))
+    } else {
+        Value::Null
+    };
     json!({
         "set": set.label(),
         "burst": set.burst,
@@ -1178,6 +1196,101 @@ fn burst_extras(set: &RunSet, run: &KRun, prompts: &[&[u32]], references: &[Refe
         "singleton_prefill_ms_sum": single_ms,
         "burst_vs_singleton_sum": (run.prefill.wall > 0.0 && single_ms > 0.0)
             .then(|| single_ms / (run.prefill.wall * 1e3)),
+        "twins": twins,
+    })
+}
+
+/// First (lane, row) where a twin differs from the first lane of its group.
+#[derive(Debug, PartialEq, Eq)]
+struct TwinDiff {
+    lane: usize,
+    vs_lane: usize,
+    row: usize,
+    via: &'static str,
+}
+
+/// Lanes of one run fed identical prompt ids ("twins"); `first_diff` is `None` when every
+/// twin's ids and per-row logits shas equal the group's first lane's.
+#[derive(Debug, PartialEq, Eq)]
+struct TwinGroup {
+    lanes: Vec<usize>,
+    first_diff: Option<TwinDiff>,
+}
+
+/// Group a run's lanes by prompt token ids (`prompt_ids[lane]`); every group of 2+ lanes is
+/// compared: ids and every logits row sha (index 0 = prompt-completing row, then each AR row)
+/// must equal the group's first lane's, whatever the singleton reference does. Groups are in
+/// the order of their first lane.
+fn twin_groups(
+    prompt_ids: &[&[u32]],
+    ids: &[Vec<u32>],
+    logits_sha: &[Vec<String>],
+) -> Vec<TwinGroup> {
+    let mut by_ids: std::collections::BTreeMap<&[u32], Vec<usize>> = Default::default();
+    for (lane, prompt) in prompt_ids.iter().enumerate() {
+        by_ids.entry(*prompt).or_default().push(lane);
+    }
+    let rows = |lane: usize| logits_sha.get(lane).map_or(&[][..], Vec::as_slice);
+    let mut groups: Vec<TwinGroup> = by_ids
+        .into_values()
+        .filter(|lanes| lanes.len() >= 2)
+        .map(|lanes| {
+            let head = lanes[0];
+            let first_diff = lanes[1..].iter().find_map(|&lane| {
+                let by_ids = first_mismatch(&ids[head], &ids[lane]);
+                let by_logits = first_mismatch(rows(head), rows(lane));
+                let (row, via) = match (by_ids, by_logits) {
+                    (None, None) => return None,
+                    (Some(a), None) => (a, "ids"),
+                    (None, Some(b)) => (b, "logits"),
+                    (Some(a), Some(b)) if a == b => (a, "ids+logits"),
+                    (Some(a), Some(b)) if a < b => (a, "ids"),
+                    (Some(_), Some(b)) => (b, "logits"),
+                };
+                Some(TwinDiff {
+                    lane,
+                    vs_lane: head,
+                    row,
+                    via,
+                })
+            });
+            TwinGroup { lanes, first_diff }
+        })
+        .collect();
+    groups.sort_by_key(|g| g.lanes[0]);
+    groups
+}
+
+/// The `twins` object of a run in report.json.
+fn twins_json(groups: &[TwinGroup]) -> Value {
+    let equal = groups.iter().filter(|g| g.first_diff.is_none()).count();
+    json!({
+        "groups_total": groups.len(),
+        "groups_equal": equal,
+        "all_equal": equal == groups.len(),
+        "groups": groups.iter().map(|g| json!({
+            "lanes": g.lanes,
+            "equal": g.first_diff.is_none(),
+            "first_diff": g.first_diff.as_ref().map(|d| json!({
+                "lane": d.lane, "vs_lane": d.vs_lane, "row": d.row, "via": d.via,
+            })),
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// A one-line description of the first twin mismatch of a run's `twins` object; `None` when
+/// every group is equal or the run had no twin verdict (`null`).
+fn twin_failure(twins: &Value) -> Option<String> {
+    twins["groups"].as_array()?.iter().find_map(|g| {
+        let d = g.get("first_diff").filter(|d| !d.is_null())?;
+        Some(format!(
+            "twin lanes {}: lane {} row {} ({}) differs from lane {}",
+            g["lanes"],
+            d["lane"],
+            d["row"],
+            d["via"].as_str().unwrap_or("?"),
+            d["vs_lane"],
+        ))
     })
 }
 
@@ -1206,8 +1319,18 @@ fn burst_line(spec: &str, set: &RunSet, run: &KRun, compared: &[Value], extras: 
             ))
         })
         .collect();
+    let twins = &extras["twins"];
+    let twins_equal = if twins.is_null() {
+        "n/a".to_string()
+    } else {
+        format!(
+            "{}/{}",
+            twins["groups_equal"].as_u64().unwrap_or(0),
+            twins["groups_total"].as_u64().unwrap_or(0)
+        )
+    };
     format!(
-        "[oracle-burst] policy={spec} set={} lens={lens:?} prompts_equal={}/{} passes={} rows={} burst_prefill_ms={:.1} admit_ms={:.1} ms_per_row={:.3} singleton_sum_ms={:.1} first_divergence(prompt,row,pos)={divergences:?}",
+        "[oracle-burst] policy={spec} set={} lens={lens:?} prompts_equal={}/{} passes={} rows={} burst_prefill_ms={:.1} admit_ms={:.1} ms_per_row={:.3} singleton_sum_ms={:.1} first_divergence(prompt,row,pos)={divergences:?} twins_equal={twins_equal}{}",
         set.label(),
         compared.iter().filter(|c| c["equal"] == json!(true)).count(),
         compared.len(),
@@ -1221,6 +1344,7 @@ fn burst_line(spec: &str, set: &RunSet, run: &KRun, compared: &[Value], extras: 
             f64::NAN
         },
         extras["singleton_prefill_ms_sum"].as_f64().unwrap_or(f64::NAN),
+        twin_failure(twins).map_or(String::new(), |why| format!(" twin_mismatch=\"{why}\"")),
     )
 }
 
@@ -2301,6 +2425,12 @@ fn run_policy(
                 );
                 let equal = compared.iter().all(|c| c["equal"] == json!(true));
                 let extras = burst_extras(&set, &run, prompts, references);
+                if let Some(why) = twin_failure(&extras["twins"]) {
+                    if status == PolicyStatus::Pass {
+                        status = PolicyStatus::Fail;
+                    }
+                    failures.push(format!("{label} {why}"));
+                }
                 eprintln!("{}", burst_line(spec, &set, &run, &compared, &extras));
                 per_k.push(json!({
                     "k": run.k,
@@ -4953,6 +5083,112 @@ mod tests {
     }
 
     #[test]
+    fn twin_lanes_equal_pass_one_differing_row_fails_and_names_lane_and_row() {
+        let a = [5u32, 6, 7];
+        let b = [9u32, 9];
+        let c = [5u32, 6, 8];
+        // Lanes: 0 = a, 1 = b (singleton), 2 = a, 3 = c (singleton), 4 = a.
+        let prompts: Vec<&[u32]> = vec![&a, &b, &a, &c, &a];
+        let row = |tag: &str| -> Vec<String> { (0..4).map(|r| format!("{tag}{r}")).collect() };
+        let ids = |first: u32| -> Vec<u32> { vec![first, 2, 3] };
+        // Singletons carry rows that differ from the twins' (never compared).
+        let run_ids = vec![ids(1), ids(7), ids(1), ids(8), ids(1)];
+        let mut shas = vec![row("t"), row("s"), row("t"), row("u"), row("t")];
+
+        let groups = twin_groups(&prompts, &run_ids, &shas);
+        assert_eq!(
+            groups,
+            [TwinGroup {
+                lanes: vec![0, 2, 4],
+                first_diff: None
+            }]
+        );
+        let j = twins_json(&groups);
+        assert_eq!(
+            (
+                j["groups_total"].clone(),
+                j["groups_equal"].clone(),
+                j["all_equal"].clone()
+            ),
+            (json!(1), json!(1), json!(true))
+        );
+        assert_eq!(twin_failure(&j), None);
+
+        // One AR row sha of lane 4 differs: row 2, lane 4 vs lane 0.
+        shas[4][2] = "bad".into();
+        let groups = twin_groups(&prompts, &run_ids, &shas);
+        assert_eq!(
+            groups[0].first_diff,
+            Some(TwinDiff {
+                lane: 4,
+                vs_lane: 0,
+                row: 2,
+                via: "logits"
+            })
+        );
+        let j = twins_json(&groups);
+        assert_eq!(j["all_equal"], json!(false));
+        assert_eq!(j["groups_equal"], json!(0));
+        assert_eq!(j["groups"][0]["first_diff"]["row"], json!(2));
+        assert_eq!(j["groups"][0]["first_diff"]["lane"], json!(4));
+        assert_eq!(
+            twin_failure(&j).as_deref(),
+            Some("twin lanes [0,2,4]: lane 4 row 2 (logits) differs from lane 0")
+        );
+
+        // The prompt-completing row (index 0) and a differing id are caught too; the earliest
+        // differing lane in group order is the one named.
+        shas[2][0] = "bad0".into();
+        let mut diff_ids = run_ids.clone();
+        diff_ids[4][1] = 99;
+        let groups = twin_groups(&prompts, &diff_ids, &shas);
+        assert_eq!(
+            groups[0].first_diff,
+            Some(TwinDiff {
+                lane: 2,
+                vs_lane: 0,
+                row: 0,
+                via: "logits"
+            })
+        );
+        let same_rows = vec![row("t"); 5];
+        let only_ids = twin_groups(&prompts, &diff_ids, &same_rows);
+        assert_eq!(
+            only_ids[0].first_diff,
+            Some(TwinDiff {
+                lane: 4,
+                vs_lane: 0,
+                row: 1,
+                via: "ids"
+            })
+        );
+    }
+
+    #[test]
+    fn twin_groups_ignore_singletons_and_group_by_prompt_ids_not_index() {
+        let a = [1u32, 2];
+        let b = [3u32];
+        let a2 = a; // a distinct prompt index with equal ids is a twin
+        let prompts: Vec<&[u32]> = vec![&b, &a, &a2];
+        let ids = vec![vec![0u32]; 3];
+        let shas = vec![vec!["x".to_string()]; 3];
+        let groups = twin_groups(&prompts, &ids, &shas);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].lanes, [1, 2]);
+        // Singletons only: no groups, vacuously equal, nothing to fail.
+        let none = twin_groups(&prompts[..2], &ids[..2], &shas[..2]);
+        assert!(none.is_empty());
+        let j = twins_json(&none);
+        assert_eq!(
+            (j["groups_total"].clone(), j["all_equal"].clone()),
+            (json!(0), json!(true))
+        );
+        assert_eq!(twin_failure(&j), None);
+        // A run without logits rows has no twin verdict.
+        assert_eq!(twin_failure(&Value::Null), None);
+    }
+
+    #[test]
     fn a_diverging_burst_lane_reports_its_row_position_and_labels() {
         let args = sweep_args("--policies per-lane:moe=once --burst 3,1", "1");
         let mut backend = FakeLanes::new(4, 3);
@@ -5010,9 +5246,11 @@ mod tests {
         );
         assert!(line.contains("singleton_sum_ms=11.0"), "{line}");
         assert!(
-            line.ends_with("first_divergence(prompt,row,pos)=[]"),
+            line.contains("first_divergence(prompt,row,pos)=[]"),
             "{line}"
         );
+        // No `--logits` rows in this run: no twin verdict.
+        assert!(line.ends_with(" twins_equal=n/a"), "{line}");
     }
 
     fn sweep(backend: &mut dyn LaneBackend, args: &Args) -> (Vec<PolicyOutcome>, Vec<Value>) {

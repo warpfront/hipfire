@@ -904,7 +904,7 @@ impl Qwen4LaneStore {
         let Some((k, copy)) = spec else {
             return Qwen4State::device_bytes_with_mirror(
                 config,
-                format,
+                format.lane(),
                 context,
                 &scope,
                 Self::state_mirror(None),

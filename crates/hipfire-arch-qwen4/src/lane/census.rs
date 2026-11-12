@@ -524,10 +524,12 @@ fn target_lines(
     mirror: StateMirror,
     lines: &mut Vec<CensusLine>,
 ) -> Result<(), String> {
-    let state =
-        Qwen4State::device_bytes_with_mirror(config, inputs.format, context, inputs.scope, mirror)
-            .and_then(|bytes| u64::try_from(bytes).ok())
-            .ok_or_else(|| overflow("target state"))?;
+    // A lane's trunk state is allocated in the lane format (no stream carry unless
+    // `serve.batch_exact`): `Qwen4Bundle::new_lane_state`.
+    let format = inputs.format.lane();
+    let state = Qwen4State::device_bytes_with_mirror(config, format, context, inputs.scope, mirror)
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or_else(|| overflow("target state"))?;
     lines.push(CensusLine {
         component: CensusComponent::TargetState,
         copies: lanes,

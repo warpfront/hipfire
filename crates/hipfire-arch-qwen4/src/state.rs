@@ -1044,6 +1044,30 @@ impl Qwen4StateFormat {
             pooled_bf16: self.qsa_pooled_bf16,
         }
     }
+
+    /// The format of a serve lane's trunk state ([`Self::lane_with`] under this process's
+    /// `serve.batch_exact`).
+    pub fn lane(self) -> Self {
+        self.lane_with(hipfire_config::qwen4_lane_row_exact() != hipfire_config::LaneRowExact::Off)
+    }
+
+    /// The format of a serve lane's trunk state: this (resident) format without the canonical
+    /// GDN stream carry, unless `batch_exact` (`serve.batch_exact`) keeps the lanes canonical.
+    /// Lane prefill is distribution-equivalent by design (the A8 lane chain, the product-route
+    /// wave), so a lane never needs the chunk-invariant stream; a carry per lane (tile entry,
+    /// pending rows, their snapshot mirror and the Scan64 workspace: 419.7 MiB per Flash-Next
+    /// lane on gfx1201, 3.28 GiB per EP2 rank at 8 lanes) would only take expert VRAM. The
+    /// resident state keeps the carry: ordinary prefill stays chunk-invariant.
+    pub fn lane_with(self, batch_exact: bool) -> Self {
+        if batch_exact {
+            self
+        } else {
+            Self {
+                gdn_stream: GdnStreamKind::None,
+                ..self
+            }
+        }
+    }
 }
 
 /// Both state formats: `kv_request` is `memory.kv_cache`, `state_request`
@@ -3475,18 +3499,38 @@ impl Qwen4State {
 
     /// Exchange the requests two states hold: a promotion moves the resident
     /// request into its lane and takes the lane's fresh state back. The
-    /// states swap whole, except that a snapshot mirror belongs to the slot
-    /// it was provisioned for, not to the request: when exactly one side has
-    /// none, the arenas are swapped back and rebound, so the resident state
-    /// keeps the mirror it snapshots prompt and verify windows with, and an
-    /// AR lane stays within the bytes its census charged (none for the
-    /// mirror). Two snapshot-capable states swap whole, as before.
+    /// states swap whole, except for what belongs to the slot, not to the
+    /// request. A snapshot mirror belongs to the slot it was provisioned for:
+    /// when exactly one side has none, the arenas are swapped back and
+    /// rebound, so the resident state keeps the mirror it snapshots prompt and
+    /// verify windows with, and an AR lane stays within the bytes its census
+    /// charged (none for the mirror). The GDN stream carry belongs to the slot
+    /// too: when exactly one side carries one (the resident does, a lane does
+    /// not: [`Qwen4StateFormat::lane`]), the per-layer carries, the edge
+    /// staging, the recipe and the arenas' carry mirrors go back to their
+    /// slots, so ordinary prefill on the resident state keeps its
+    /// chunk-invariant stream. The request moves with its stream sealed
+    /// (`Qwen4Bundle::commit_promotion` seals it first), so no open tile
+    /// travels with it. Two equal states swap whole, as before.
     pub(crate) fn swap_requests(&mut self, other: &mut Self) {
         std::mem::swap(self, other);
-        if self.snapshot_arena.mirror != other.snapshot_arena.mirror {
+        let arenas_back = self.snapshot_arena.mirror != other.snapshot_arena.mirror;
+        if arenas_back {
             std::mem::swap(&mut self.snapshot_arena, &mut other.snapshot_arena);
             self.snapshot_arena.rebind(self.model_id);
             other.snapshot_arena.rebind(other.model_id);
+        }
+        if self.gdn_stream.is_some() != other.gdn_stream.is_some() {
+            for (mine, theirs) in self.gdn.iter_mut().zip(other.gdn.iter_mut()) {
+                std::mem::swap(&mut mine.carry, &mut theirs.carry);
+            }
+            std::mem::swap(&mut self.gdn_edge, &mut other.gdn_edge);
+            std::mem::swap(&mut self.gdn_stream, &mut other.gdn_stream);
+            if !arenas_back {
+                let (mine, theirs) = (&mut self.snapshot_arena, &mut other.snapshot_arena);
+                std::mem::swap(&mut mine.carry, &mut theirs.carry);
+                std::mem::swap(&mut mine.carry_meta, &mut theirs.carry_meta);
+            }
         }
     }
 
@@ -7273,6 +7317,158 @@ mod tests {
             c.snapshot_arena.mirror == StateMirror::Absent
                 && d.snapshot_arena.mirror == StateMirror::Absent
         );
+    }
+
+    /// A lane's trunk state drops the canonical GDN stream carry (lane prefill is
+    /// distribution-equivalent); `serve.batch_exact` lanes stay canonical and keep it. Nothing
+    /// else of the format changes, and the resident format is never touched.
+    #[test]
+    fn a_lane_carries_the_stream_only_under_batch_exact() {
+        for kind in [
+            GdnStreamKind::None,
+            GdnStreamKind::Wy16,
+            GdnStreamKind::Scan64,
+        ] {
+            let resident = Qwen4StateFormat {
+                qsa: QsaKvFormat::F32,
+                gdn: GdnStateFormat::Q8,
+                qsa_f16_arena: true,
+                qsa_pooled_bf16: true,
+                gdn_stream: kind,
+            };
+            assert_eq!(
+                resident.lane_with(false),
+                Qwen4StateFormat {
+                    gdn_stream: GdnStreamKind::None,
+                    ..resident
+                }
+            );
+            assert_eq!(resident.lane_with(true), resident);
+        }
+    }
+
+    /// A tensor over fake device memory: only pointers are compared, nothing is dereferenced
+    /// or freed.
+    fn fake_tensor(address: usize) -> GpuTensor {
+        GpuTensor {
+            // SAFETY: a `Borrowed` buffer over an address no test dereferences.
+            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(address as *mut std::ffi::c_void, 4) },
+            shape: vec![1],
+            dtype: DType::F32,
+        }
+    }
+
+    /// `host_only_state` with two GDN layers whose tensors sit at `base + ...`, carrying a WY
+    /// stream (with its snapshot mirror) when `carry`.
+    fn gdn_state(
+        mirror: StateMirror,
+        model_id: u64,
+        position: usize,
+        base: usize,
+        carry: bool,
+    ) -> Qwen4State {
+        let mut state = host_only_state(mirror, model_id, position);
+        let plan = gdn_carry::gdn_stream_plan(GdnStreamKind::Wy16, GdnStateFormat::Q8);
+        for layer in 0..2 {
+            let at = |part: usize| fake_tensor(base + 0x1000 * (8 * layer + part));
+            state.gdn.push(GdnGpuState {
+                recurrent: at(0),
+                ef_residual: None,
+                conv: at(1),
+                carry: carry.then(|| GdnCarry {
+                    plan,
+                    tile_entry: at(2),
+                    pending_conv: at(3),
+                    pending_params: at(4),
+                    meta: Cell::new(gdn_carry::sealed_cursor(&plan, position as u64, 0)),
+                }),
+            });
+            state
+                .snapshot_arena
+                .carry
+                .push(if carry && mirror == StateMirror::Snapshot {
+                    vec![at(5), at(6), at(7)]
+                } else {
+                    Vec::new()
+                });
+            let meta = state.gdn[layer].carry.as_ref().map(GdnCarry::meta);
+            state.snapshot_arena.carry_meta.push(meta);
+        }
+        if carry {
+            state.gdn_stream = Some(plan);
+            state.gdn_edge = Some(GdnEdge::Wy {
+                z: fake_tensor(base + 0x2_0000),
+                out: fake_tensor(base + 0x2_1000),
+                norm: fake_tensor(base + 0x2_2000),
+            });
+        }
+        state
+    }
+
+    fn ptr(tensor: &GpuTensor) -> usize {
+        tensor.buf.as_ptr() as usize
+    }
+
+    /// The slot of `state` by its stream carry (and the carry's snapshot mirrors): `Some(base)`
+    /// of the `gdn_state` that allocated it, `None` without one.
+    fn carry_slot(state: &Qwen4State) -> Option<usize> {
+        let carry = state.gdn[0].carry.as_ref()?;
+        let base = ptr(&carry.tile_entry) - 0x2000;
+        assert_eq!(
+            ptr(&state.gdn[1].carry.as_ref()?.pending_params),
+            base + 0xc000
+        );
+        match state.gdn_edge.as_ref()? {
+            GdnEdge::Wy { z, .. } => assert_eq!(ptr(z), base + 0x2_0000),
+            GdnEdge::Scan64 { .. } => panic!("a WY test carry"),
+        }
+        assert!(state.gdn_stream.is_some());
+        if state.snapshot_arena.mirror == StateMirror::Snapshot {
+            assert_eq!(ptr(&state.snapshot_arena.carry[1][0]), base + 0xd000);
+        }
+        Some(base)
+    }
+
+    /// A promotion between a carrying resident state and a carry-less lane
+    /// (`Qwen4StateFormat::lane`): the request (recurrent / conv slots, position) changes
+    /// slot, the stream carry, its edge staging, recipe and snapshot mirrors stay with the
+    /// slot that allocated them, so ordinary prefill on the resident keeps its chunk-invariant
+    /// stream. Both an MTP lane (snapshot mirror) and an AR lane (none), from either side; two
+    /// carrying states swap whole.
+    #[test]
+    fn swap_requests_keeps_each_slots_stream_carry() {
+        let (r, l) = (0x10_0000usize, 0x20_0000usize);
+        for lane_mirror in [StateMirror::Snapshot, StateMirror::Absent] {
+            let mut resident = gdn_state(StateMirror::Snapshot, 1, 7, r, true);
+            let mut lane = gdn_state(lane_mirror, 2, 0, l, false);
+            resident.swap_requests(&mut lane);
+            assert_eq!((resident.position, lane.position), (0, 7));
+            assert_eq!(
+                (ptr(&resident.gdn[0].recurrent), ptr(&lane.gdn[0].recurrent)),
+                (l, r)
+            );
+            assert_eq!(carry_slot(&resident), Some(r), "{lane_mirror:?}");
+            assert_eq!(carry_slot(&lane), None, "{lane_mirror:?}");
+            assert!(lane.snapshot_arena.carry.iter().all(Vec::is_empty));
+            assert!(resident
+                .snapshot_arena
+                .carry_meta
+                .iter()
+                .all(Option::is_some));
+            assert!(lane.snapshot_arena.carry_meta.iter().all(Option::is_none));
+            // The same swap from the lane's side.
+            let mut lane = gdn_state(lane_mirror, 3, 9, l, false);
+            let mut resident = gdn_state(StateMirror::Snapshot, 4, 0, r, true);
+            lane.swap_requests(&mut resident);
+            assert_eq!((lane.position, resident.position), (0, 9));
+            assert_eq!(carry_slot(&resident), Some(r), "{lane_mirror:?}");
+            assert_eq!(carry_slot(&lane), None, "{lane_mirror:?}");
+        }
+        // `serve.batch_exact` MTP lanes carry too: the states swap whole, carries included.
+        let mut a = gdn_state(StateMirror::Snapshot, 5, 3, r, true);
+        let mut b = gdn_state(StateMirror::Snapshot, 6, 0, l, true);
+        a.swap_requests(&mut b);
+        assert_eq!((carry_slot(&a), carry_slot(&b)), (Some(l), Some(r)));
     }
 
     /// A real mirrorless state (needs a device; skipped without one):

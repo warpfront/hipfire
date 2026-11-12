@@ -2700,7 +2700,7 @@ impl Qwen4LaneStore {
             spec_lanes,
             Qwen4State::device_bytes_with_mirror(
                 config,
-                format,
+                format.lane(),
                 context,
                 &scope,
                 Self::state_mirror(None),

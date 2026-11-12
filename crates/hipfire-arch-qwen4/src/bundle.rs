@@ -5119,21 +5119,27 @@ impl Qwen4Bundle {
         // The terminal fence of the ordinary-prefill phase: the real prompt end, once (never a
         // tile, session boundary or checkpoint), before decode/verify reads the live slot.
         let sealed = if result.is_ok() {
-            let weights = &self.weights;
-            self.state
-                .seal_gdn_streams(gpu, &|abs| {
-                    let gdn = weights.layer(abs)?.gdn.as_ref()?;
-                    Some(crate::state::gdn_carry::GdnSealWeights {
-                        conv: weights.resident(&gdn.conv).ok()?,
-                        a_log: weights.resident(&gdn.a_log).ok()?,
-                        dt_bias: weights.resident(&gdn.dt_bias).ok()?,
-                    })
-                })
-                .map_err(BundleError::State)
+            self.seal_gdn_streams(gpu)
         } else {
             Ok(())
         };
         result.and(finish).and(sealed)
+    }
+
+    /// Seal every open GDN stream of the resident state ([`Qwen4State::seal_gdn_streams`] with
+    /// this bundle's resident GDN weights). A no-op on a sealed or carry-less state.
+    fn seal_gdn_streams(&mut self, gpu: &mut Gpu) -> Result<(), BundleError> {
+        let weights = &self.weights;
+        self.state
+            .seal_gdn_streams(gpu, &|abs| {
+                let gdn = weights.layer(abs)?.gdn.as_ref()?;
+                Some(crate::state::gdn_carry::GdnSealWeights {
+                    conv: weights.resident(&gdn.conv).ok()?,
+                    a_log: weights.resident(&gdn.a_log).ok()?,
+                    dt_bias: weights.resident(&gdn.dt_bias).ok()?,
+                })
+            })
+            .map_err(BundleError::State)
     }
 
     /// The chunk loop of [`Self::prefill_final_from`].
@@ -5746,6 +5752,11 @@ impl Qwen4Bundle {
                     ));
                 }
             }
+            // The request moves sealed: its stream carry stays with the resident slot when the
+            // lane carries none ([`Qwen4State::swap_requests`]).
+            bundle
+                .seal_gdn_streams(gpu)
+                .map_err(|error| error.to_string())?;
             bundle.state.clamp_f16_valid();
             lane.state.clamp_f16_valid();
             bundle.state.swap_requests(&mut lane.state);
@@ -5778,7 +5789,7 @@ impl Qwen4Bundle {
             gpu,
             &self.config,
             self.state.max_seq_len,
-            self.state_format,
+            self.state_format.lane(),
             self.state.qsa_backend(),
             self.weights.band_scope(),
             mirror,

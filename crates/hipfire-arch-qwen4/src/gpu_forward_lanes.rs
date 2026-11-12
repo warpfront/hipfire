@@ -3226,9 +3226,11 @@ fn forward_lanes_scoped(
                 ar_out,
                 *seg,
                 ple_head_count * ple_row_width,
-                // PP edges require packed BF16 rows; preserve the original
-                // single-scope scratch addressing without changing its ops.
-                bf16_state && !(band_scope.input && band_scope.output),
+                // BF16 streams are packed rows whatever the band: every stream op (a joint HC
+                // write over the wave's rows, a lane's own PLE conv and final HC read, the wide
+                // hidden capture) addresses row `i` at `2 * i * wide` bytes, so a lane view starts
+                // at its packed row (`bf16_stream_rows`), never at the F32 pitch.
+                bf16_state,
                 // Every segment of the step addresses the one field its
                 // total row count selects.
                 scratch.ple_normed_field(n),
@@ -3573,7 +3575,7 @@ fn forward_lanes_scoped(
                         first_lane: lane_segs[*first].first_lane,
                     },
                     ple_head_count * ple_row_width,
-                    bf16_state && !(band_scope.input && band_scope.output),
+                    bf16_state,
                     scratch.ple_normed_field(n),
                 )
             })
