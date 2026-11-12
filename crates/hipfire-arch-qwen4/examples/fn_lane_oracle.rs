@@ -3444,6 +3444,27 @@ fn load(
     attach_mtp: bool,
 ) -> R<(HfqModelSource, World, Tokenizer)> {
     let mut hfq = HfqFile::open(path).map_err(e)?;
+    // A stock-FP8 artifact has no MTP head of its own: with MTP requested its `<model>.mtp`
+    // sidecar is bound and merged at admission (the standalone recipe of
+    // `tests/common/stock_mtp_load.rs`).
+    let stock_mtp = if attach_mtp {
+        let sidecar = hipfire_arch_qwen4::stock_mtp_sidecar::qwen4_stock_mtp_sidecar_path(path);
+        if sidecar.is_file() {
+            let bound = hipfire_arch_qwen4::stock_mtp_sidecar::bind_stock_mtp_sidecar(&hfq, &sidecar)
+                .map_err(|reason| {
+                    hipfire_arch_qwen4::stock_mtp_sidecar::stock_mtp_refusal_line(&sidecar, &reason)
+                })?;
+            eprintln!(
+                "{}",
+                hipfire_arch_qwen4::stock_mtp_sidecar::stock_mtp_attached_line(&bound)
+            );
+            Some(bound)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json).map_err(e)?;
     // Daemon parity: keep host-mapped expert memory out of reclaim before the first HIP call (KFD userptr eviction stalls, ROCm/rocm-systems#12528).
     hipfire_loader::prepare_host_memory_for(path);
@@ -3461,7 +3482,16 @@ fn load(
     )?;
     // Admission is GPU-arch aware: an expert-slab artifact admits only on a
     // supported arch. Initialising the GPU allocates no model memory.
-    let receipt = admit_hfqm_artifact_on(&hfq, Some(&gpu.arch)).map_err(e)?;
+    let receipt = match stock_mtp.as_ref() {
+        Some(bound) => hipfire_arch_qwen4::artifact::admit_hfqm_artifact_with(
+            &hfq,
+            Some(&gpu.arch),
+            false,
+            Some(bound),
+        ),
+        None => admit_hfqm_artifact_on(&hfq, Some(&gpu.arch)),
+    }
+    .map_err(e)?;
     match &choice {
         Some(choice) => {
             eprintln!(
@@ -3501,6 +3531,13 @@ fn load(
     let mesh = DeviceMesh::single().map_err(e)?;
     let expected = WeightOrigin::for_single(&mesh, &gpu);
     let source = HfqModelSource::from_hfq(hfq);
+    // The sidecar is served Borrowed from its own mapping (never a range: a second backing file
+    // would fail the direct reader's identity check).
+    let mtp_side = stock_mtp.map(|bound| {
+        let mut side = HfqModelSource::from_hfq(bound.hfq);
+        side.set_prefer_ranges(false);
+        side
+    });
     // `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS=N` keeps trunk layers 0..N resident
     // and host-maps the rest (a slab artifact larger than one card).
     let weights = {
@@ -3532,6 +3569,13 @@ fn load(
         &mut gpu,
         expected,
         |entry| {
+            // The stock-FP8 head sidecar: `mtp.*` is its own mapping's, everything else the base's.
+            if let Some(side) = mtp_side.as_ref().filter(|_| entry.name.starts_with("mtp.")) {
+                let (info, bytes) = side
+                    .tensor_data(&entry.name)
+                    .ok_or_else(|| format!("missing sidecar tensor '{}'", entry.name))?;
+                return Ok(SourcePayload::Borrowed { info, bytes });
+            }
             if let Some(payload) = hipfire_arch_qwen4::expert_arena::recipe_arena_payload(
                 &source,
                 &receipt.manifest.identity.recipe,
@@ -3582,6 +3626,10 @@ fn load(
         .map_err(e)?;
     if attach_mtp {
         bundle.attach_mtp(&mut gpu, max_seq).map_err(e)?;
+        if mtp_side.is_some() {
+            // The loader settles the int8 routed-down verdict right after its head-attach step.
+            bundle.settle_moe_down_a8_head(&mut gpu, true).map_err(e)?;
+        }
     }
     bundle
         .stage_lanes_with_copy(&mut gpu, lane_capacity, lane_capacity, spec, copy)
