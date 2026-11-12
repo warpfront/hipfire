@@ -278,13 +278,107 @@ fn g942_gdn_lanes_ensure(gpu: &mut Gpu) -> HipResult<()> {
     }
 }
 
-/// Bind the capture lanes kernel (`qwen4_gdn_lanes_step_capture_f32_gfx942`, its own module).
+/// Bind the capture lanes kernel (`qwen4_gdn_lanes_step_capture_f32_gfx942`, its own module):
+/// the hipcc source (the anchor object), or, only when
+/// `HIPFIRE_QWEN4_G942_GDN_LANES_CAPTURE_IMAGE=/absolute/device.elf` names one, that explicitly
+/// supplied code object (the Route-A twin proof: same module, same entry name, loaded through
+/// `ensure_embedded_kernel`). Unset: the source, unchanged.
 fn g942_gdn_lanes_capture_ensure(gpu: &mut Gpu) -> HipResult<()> {
-    gpu.ensure_kernel(
-        QWEN4_GDN_LANES_CAPTURE_F32_KERNEL,
-        QWEN4_GDN_LANES_CAPTURE_F32_SRC,
-        QWEN4_GDN_LANES_CAPTURE_F32_KERNEL,
-    )
+    match hipfire_config::developer_var("HIPFIRE_QWEN4_G942_GDN_LANES_CAPTURE_IMAGE") {
+        Ok(path) if !path.is_empty() => {
+            let bytes = std::fs::read(&path).map_err(|error| {
+                hip_bridge::HipError::new(
+                    0,
+                    &format!("HIPFIRE_QWEN4_G942_GDN_LANES_CAPTURE_IMAGE {path}: {error}"),
+                )
+            })?;
+            gpu.ensure_embedded_kernel(
+                QWEN4_GDN_LANES_CAPTURE_F32_KERNEL,
+                std::sync::Arc::<[u8]>::from(bytes),
+                QWEN4_GDN_LANES_CAPTURE_F32_KERNEL,
+            )
+        }
+        _ => gpu.ensure_kernel(
+            QWEN4_GDN_LANES_CAPTURE_F32_KERNEL,
+            QWEN4_GDN_LANES_CAPTURE_F32_SRC,
+            QWEN4_GDN_LANES_CAPTURE_F32_KERNEL,
+        ),
+    }
+}
+
+const QWEN4_G942_GDN_VERIFY_SRC: &str =
+    include_str!("../../../../kernels/src/qwen4_g942_gdn_verify.gfx942.hip");
+/// The exact-gfx942 GDN verify-window module (its own cache key and twin seat).
+pub const QWEN4_G942_GDN_VERIFY_MODULE: &str = "qwen4_g942_gdn_verify";
+/// `(tensor_ops entry, gfx942 verify module entry)`: the four entries whose gfx942 launches live in
+/// [`QWEN4_G942_GDN_VERIFY_MODULE`]. The names differ (the per-context function table is keyed by
+/// entry name, so the module cannot reuse the tensor_ops symbols); every body is a verbatim copy.
+pub const QWEN4_G942_GDN_VERIFY_ENTRIES: [(&str, &str); 4] = [
+    (
+        "gated_delta_step_halves_state128_persistent256_capture_f32",
+        "qwen4_g942_gdn_verify_capture_f32",
+    ),
+    (
+        "gated_delta_rollback_layers_f32",
+        "qwen4_g942_gdn_verify_rollback_f32",
+    ),
+    (
+        "gated_delta_conv_bf16_f32_batched_k4",
+        "qwen4_g942_gdn_verify_conv_params_k4",
+    ),
+    (
+        "gated_delta_gate_bf16_f32_batched",
+        "qwen4_g942_gdn_verify_gate_batched",
+    ),
+];
+
+/// `HIPFIRE_QWEN4_G942_GDN_VERIFY_IMAGE=/absolute/device.elf` (developer, read once): the
+/// explicitly supplied code object of [`QWEN4_G942_GDN_VERIFY_MODULE`] (the Route-A twin proof).
+/// Unset: the hipcc source, unchanged.
+fn g942_gdn_verify_image() -> HipResult<Option<&'static std::sync::Arc<[u8]>>> {
+    static IMAGE: std::sync::LazyLock<Result<Option<std::sync::Arc<[u8]>>, String>> =
+        std::sync::LazyLock::new(|| {
+            match hipfire_config::developer_var("HIPFIRE_QWEN4_G942_GDN_VERIFY_IMAGE") {
+                Ok(path) if !path.is_empty() => std::fs::read(&path)
+                    .map(|bytes| Some(std::sync::Arc::<[u8]>::from(bytes)))
+                    .map_err(|error| {
+                        format!("HIPFIRE_QWEN4_G942_GDN_VERIFY_IMAGE {path}: {error}")
+                    }),
+                _ => Ok(None),
+            }
+        });
+    let loaded: &'static Result<Option<std::sync::Arc<[u8]>>, String> = &IMAGE;
+    match loaded {
+        Ok(image) => Ok(image.as_ref()),
+        Err(message) => Err(hip_bridge::HipError::new(0, message)),
+    }
+}
+
+/// Load the entry `kernel` of the tensor_ops GDN verify launches and return the symbol to launch.
+/// On exact gfx942 the four [`QWEN4_G942_GDN_VERIFY_ENTRIES`] resolve to the gfx942-only module
+/// (hipcc source, or the `HIPFIRE_QWEN4_G942_GDN_VERIFY_IMAGE` code object) and the module's own
+/// symbol is returned; every other arch, and every other entry, loads from `tensor_ops` as
+/// before and returns `kernel`.
+pub(crate) fn ensure_gdn_verify_kernel(gpu: &mut Gpu, kernel: &'static str) -> HipResult<&'static str> {
+    let entry = gpu
+        .arch_caps
+        .is_gfx942()
+        .then(|| {
+            QWEN4_G942_GDN_VERIFY_ENTRIES
+                .iter()
+                .find(|(tensor_ops, _)| *tensor_ops == kernel)
+        })
+        .flatten();
+    let Some(&(_, own)) = entry else {
+        gpu.ensure_kernel_public("tensor_ops", crate::tensor_ops::TENSOR_OPS_SRC, kernel)?;
+        return Ok(kernel);
+    };
+    gpu.bind_thread()?;
+    match g942_gdn_verify_image()? {
+        Some(image) => gpu.ensure_embedded_kernel(QWEN4_G942_GDN_VERIFY_MODULE, image.clone(), own)?,
+        None => gpu.ensure_kernel(QWEN4_G942_GDN_VERIFY_MODULE, QWEN4_G942_GDN_VERIFY_SRC, own)?,
+    }
+    Ok(own)
 }
 
 /// A mutable GPU borrow proven to target exact gfx942.
@@ -3325,5 +3419,56 @@ mod tests {
             .map(|field| body.find(&format!("* {field};")).expect(field))
             .collect();
         assert!(order.windows(2).all(|w| w[0] < w[1]), "field order");
+    }
+
+    /// The gfx942 GDN verify module is `tensor_ops.hip`'s bodies byte for byte: with the four
+    /// entry names mapped back, every `BEGIN` / `END verbatim` block occurs in the production
+    /// source (the bf16 / Q8 helpers, the barrier, the Q8 peak exchange, the persistent body,
+    /// the capture and rollback wrappers, the convolution + parameters kernel, the gated norm).
+    #[test]
+    fn g942_gdn_verify_source_is_tensor_ops_verbatim() {
+        const BEGIN: &str = "// BEGIN verbatim tensor_ops.hip\n";
+        const END: &str = "// END verbatim tensor_ops.hip";
+        let production = crate::tensor_ops::TENSOR_OPS_SRC;
+        let mut src = super::QWEN4_G942_GDN_VERIFY_SRC.to_string();
+        for (old, new) in super::QWEN4_G942_GDN_VERIFY_ENTRIES {
+            assert!(
+                src.contains(&format!("void {new}(")),
+                "entry {new} is defined by the module"
+            );
+            assert!(
+                production.contains(&format!("void {old}(")),
+                "entry {old} is a tensor_ops kernel"
+            );
+            src = src.replace(new, old);
+        }
+        // Mapped back, the module names no tensor_ops entry it does not carry: every
+        // `extern "C" __global__` of the module is one of the four.
+        assert_eq!(
+            src.matches("extern \"C\" __global__").count(),
+            super::QWEN4_G942_GDN_VERIFY_ENTRIES.len()
+        );
+        let mut blocks = 0;
+        let mut rest = src.as_str();
+        while let Some(at) = rest.find(BEGIN) {
+            let body = &rest[at + BEGIN.len()..];
+            let end = body.find(END).expect("END marker after every BEGIN marker");
+            let block = body[..end].trim_end_matches('\n');
+            assert!(
+                production.contains(block),
+                "verbatim block {blocks} of qwen4_g942_gdn_verify.gfx942.hip is no longer a \
+                 substring of tensor_ops.hip: mirror the production edit\nblock starts: {:?}",
+                &block[..block.len().min(120)]
+            );
+            blocks += 1;
+            rest = &body[end + END.len()..];
+        }
+        assert_eq!(
+            blocks, 9,
+            "bf16 helpers, Q8 helpers, barrier, Q8 peak, persistent body, capture + rollback \
+             wrappers, convolution + parameters, gated norm"
+        );
+        // gfx942 never defines the gfx12-only staged parameter pass.
+        assert!(!src.contains("#define GDN_PERSISTENT_STAGED"));
     }
 }

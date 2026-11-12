@@ -1131,8 +1131,10 @@ module	qkv_split_interleaved	non-core-family	Non-core family route: dots.ocr; hi
 module	quick_gelu_f32	non-core-family	Non-core family route: Flux/VAE; rdna-compute/src/text_encoder.rs:179
 module	qwen35_fa_prep_kvwrite_gfx1100	developer-opt-in	Non-default developer override: HIPFIRE_FA_KVWRITE_FOLD; hipfire-arch-qwen35/src/qwen35/forward.rs:6709-6711
 module	qwen36_27b_fa_prep_gfx1201_rows	config-opt-in	Non-default configuration: serve.vmm_batch; hipfire-config/src/lib.rs:1370-1377
+module	qwen4_g942_gdn_verify	non-target-arch	Only non-target gfx942 reaches this path (exact gfx942 GDN verify-window entries of native MTP: persistent capture recurrence, rollback, convolution + gate parameters, gated norm; resolved by arch); rdna-compute/src/cdna/gfx942.rs:379
 module	qwen4_g942_glue_elem	non-target-arch	Only non-target gfx942 reaches this path (exact gfx942 C1 elementwise fold, HIPFIRE_QWEN4_G942_FOLD_ELEM, default on); rdna-compute/src/cdna/gfx942.rs:182
 module	qwen4_g942_glue_moe	non-target-arch	Only non-target gfx942 reaches this path (exact gfx942 C1 MoE glue fold, HIPFIRE_QWEN4_G942_FOLD_MOE, default on); rdna-compute/src/cdna/gfx942.rs:131
+module	qwen4_gdn_lanes_step_capture_f32_gfx942	non-target-arch	Only non-target gfx942 reaches this path (exact gfx942 batched captured F32 GDN verify-lane recurrence of native MTP lanes, resolved by arch); rdna-compute/src/cdna/gfx942.rs:301
 module	qwen4_gdn_lanes_step_f32_gfx942	non-target-arch	Only non-target gfx942 reaches this path (exact gfx942 batched F32 GDN lanes core, resolved by arch); rdna-compute/src/cdna/gfx942.rs:1572
 module	qwen4_moe_down_a8_gfx1201	developer-opt-in	Non-default developer override: HIPFIRE_QWEN4_MOE_DOWN_A8; rdna-compute/src/qwen4_moe_down_a8.rs:343
 module	qwen4_moe_ep_a8_gfx12	developer-opt-in	Developer overrides HIPFIRE_QWEN4_MOE_EP_A8 (EP prefill) and HIPFIRE_QWEN4_MOE_GU_A8 (default-on kill switch, EP2 9..=64-row verify), like qwen4_moe_down_a8_gfx1201; rdna-compute/src/qwen4_moe_ep_a8.rs:525
