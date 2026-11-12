@@ -2,8 +2,17 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Negative-only pin of the frozen four-entry GDN verification module.
-//! No deployable twin or ledger allowance is established for this OPEN family.
+//! Negative pin of the frozen four-entry GDN verification module: its rollback entry (FLAT
+//! segment) stays refused, so it is not a four-entry certificate and no deployable twin or ledger
+//! allowance is established for it.
+//!
+//! History (do not lose it): the convolution entry was also refused here, with
+//! `wait ledger replay: pc 674 global_load_dword v1, v[6:7], off (after label L648): needs Vm
+//! wait 0 (Waw { reg: "v1" })`. That witness crossed `s_branch L648` (pc 665) after a pending
+//! `global_load_ushort v1`; the predecessor of that edge stores 0 in `s[14:15]`, so the join's
+//! `s_and_b64 s[14:15], s[14:15], exec; s_cselect_b32; s_cmp_lg_u32; s_cbranch_scc1` always
+//! takes its branch over the load. The edge-conditioned scalar proof (`cdna::lifted`
+//! `entry_proofs`) removes exactly that edge; the fixture bytes are unchanged.
 use peacemaker_isa::arch::Arch;
 use peacemaker_isa::hip_twin::{seal_many, KernelSpec};
 use sha2::{Digest, Sha256};
@@ -49,14 +58,27 @@ fn rollback_flat_segment_stays_open() {
 }
 
 #[test]
-fn convolution_vmem_waw_stays_open_at_its_body_pc() {
-    let error = refusal(SYMBOLS[2]);
-    assert!(error.starts_with("CDNA certification of `qwen4_g942_gdn_verify_conv_params_k4`: qwen4_g942_gdn_verify_conv_params_k4: wait ledger replay: pc 674 `global_load_dword v1, v[6:7], off` (after label `L648`): needs Vm wait 0 (Waw { reg: \"v1\" }) but a path reaches it without one:"), "{error}");
+fn convolution_vmem_waw_at_pc674_is_discharged_by_the_join_edge_proof() {
+    let sealed = seal_many(
+        ANCHOR,
+        Arch::Gfx942,
+        &[KernelSpec {
+            symbol: SYMBOLS[2],
+            abi_ref: None,
+        }],
+    )
+    .unwrap_or_else(|error| panic!("{}: {error}", SYMBOLS[2]));
+    assert_eq!(sealed.len(), 1);
+    let report = &sealed[0].report;
+    assert_eq!(report["hazards"]["checked"], true);
+    for field in ["findings", "blocking", "bypasses"] {
+        assert_eq!(report["hazards"][field], 0, "{field}");
+    }
 }
 
 #[test]
-fn capture_and_gate_are_individually_provable_but_not_a_four_entry_certificate() {
-    for symbol in [SYMBOLS[0], SYMBOLS[3]] {
+fn capture_conv_and_gate_are_individually_provable_but_not_a_four_entry_certificate() {
+    for symbol in [SYMBOLS[0], SYMBOLS[2], SYMBOLS[3]] {
         let sealed = seal_many(
             ANCHOR,
             Arch::Gfx942,

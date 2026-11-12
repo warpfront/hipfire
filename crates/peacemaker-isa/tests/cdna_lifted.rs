@@ -652,19 +652,24 @@ fn a_branch_into_the_middle_of_the_proof_sequence_resets_the_facts() {
 }
 
 #[test]
-fn facts_do_not_cross_the_instruction_after_a_conditional_branch() {
-    // s0 = 0 in the previous block; a new block starts after any branch, so the compare
-    // below knows nothing even though only one predecessor exists.
+fn facts_cross_exactly_one_edge_into_the_block_after_a_conditional_branch() {
+    // s0 = 0 in the predecessor block; `s_cbranch_execz 0` makes the next instruction a branch
+    // target with two in-edges, both leaving that block with s0 = 0. Over either edge the
+    // compare decides its `scc0` (previously the block-local table kept both edges and this
+    // refused): the hazardous fall-through does not exist.
     let hazard = [load(1), wait(0, 15)];
-    let p = [
-        &[load(1), mov32(0, Src::Int(0))][..],
-        &[ops::sp(SoppOp::CbranchExecz, 0)],
-        &[cmp_lg(s(0), Src::Int(0)), br(SoppOp::CbranchScc0, &hazard)],
-        &hazard,
-        &[end()],
-    ]
-    .concat();
-    fails(&p, "Vm wait");
+    let through = |hops: usize| {
+        let mut p = vec![load(1), mov32(0, Src::Int(0))];
+        p.extend((0..hops).map(|_| ops::sp(SoppOp::CbranchExecz, 0)));
+        p.extend([cmp_lg(s(0), Src::Int(0)), br(SoppOp::CbranchScc0, &hazard)]);
+        p.extend(hazard.iter().cloned());
+        p.push(end());
+        p
+    };
+    ok(&through(1));
+    // One more block between the constant and the compare: a predecessor's facts are carried
+    // across one edge only, so the second hop knows nothing and keeps both edges.
+    fails(&through(2), "Vm wait");
 }
 
 #[test]

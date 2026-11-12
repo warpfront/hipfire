@@ -1,10 +1,12 @@
 //! Block-local scalar abstract domain for static CFG edge proofs.
 //!
 //! Architecture-neutral: one [`Word`] per SGPR dword plus the SCC bit. Facts
-//! describe *every* concrete state entering the current basic block, so they are
-//! reset at each block boundary and only become more precise through an
-//! implemented transfer. No opcode parsing, memory state or replay state lives
-//! here; typed adapters decide which instructions they model and call
+//! describe *every* concrete state in the context they were derived for, so they start
+//! all-unknown at each block boundary and only become more precise through an
+//! implemented transfer; the typed adapter either keeps them inside one block
+//! ([`EdgeChoice`]) or carries one predecessor block's exit facts across exactly one edge
+//! into the next block ([`EntryProof`]), never further. No opcode parsing, memory state or
+//! replay state lives here; typed adapters decide which instructions they model and call
 //! [`Facts::kill_defs`] for everything else.
 
 use std::ops::Range;
@@ -25,11 +27,32 @@ pub(crate) enum Truth {
 }
 
 /// Statically proven feasible directions of a conditional branch.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum EdgeChoice {
     Both,
     Taken,
     Fallthrough,
+}
+
+/// A branch direction proven only for executions that enter a labelled basic block over one
+/// specific CFG edge (all indices are ledger [`Program`](crate::insn::Program) pcs, labels
+/// included).
+///
+/// The block is the straight-line run that starts at the label `label` and ends at the
+/// conditional `s_cbranch_scc0/scc1` at `branch`. The edge is the transfer `from` ->
+/// `label`: the taken edge of the branch (or `s_branch`) at `from` when `taken`, otherwise
+/// the fall-through from `from` to `from + 1 == label`. `choice` (never `Both`) is the
+/// direction `branch` must take on every execution that crossed that edge, derived from
+/// the scalar facts the predecessor block establishes on the edge. It is consulted only by
+/// the walk that arrived over exactly that edge; every other arrival at the label keeps
+/// the block-local choice.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct EntryProof {
+    pub(crate) from: usize,
+    pub(crate) taken: bool,
+    pub(crate) label: usize,
+    pub(crate) branch: usize,
+    pub(crate) choice: EdgeChoice,
 }
 
 impl Word {
