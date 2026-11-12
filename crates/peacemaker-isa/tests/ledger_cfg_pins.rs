@@ -323,6 +323,7 @@ const CDNA_CERTIFIED: [(&str, &[&str]); 22] = [
             "qwen4_qsa_lanes_scores_rows8_f32_gfx942",
             "qwen4_qsa_lanes_select_from_scores_gfx942",
             "qwen4_qsa_lanes_attention_f32_gfx942",
+            "qwen4_qsa_lanes_attention_fp8_fnuz_gfx942",
         ],
     ),
     (
@@ -333,6 +334,7 @@ const CDNA_CERTIFIED: [(&str, &[&str]); 22] = [
             "qwen4_qsa_lanes_scores_rows8_f32_gfx942",
             "qwen4_qsa_lanes_select_from_scores_gfx942",
             "qwen4_qsa_lanes_attention_f32_gfx942",
+            "qwen4_qsa_lanes_attention_fp8_fnuz_gfx942",
         ],
     ),
     (
@@ -375,16 +377,13 @@ const CDNA_CERTIFIED: [(&str, &[&str]); 22] = [
     ),
 ];
 
-/// The exact current `certify` refusals of the two FP8 entries of the QSA lanes ELF. They are
-/// never launched and stay OPEN; a refusal that changes, or a success, fails the gate.
-const QSA_OPEN_FP8: [(&str, &str); 2] = [
+/// The FP8 prologue's exact remaining refusal. Mixed-FMA now discharges the
+/// attention encoding obligation, so both images positively certify it above;
+/// this is a typed proof, not an expansion of the frozen five-entry seal.
+const QSA_OPEN_FP8: [(&str, &str); 1] = [
     (
         "qwen4_qsa_lanes_prologue_fp8_fnuz_gfx942",
         "qwen4_qsa_lanes_prologue_fp8_fnuz_gfx942: dword 1209: generated instruction v_cmp_eq_f16 (ENC_VOP3 opcode 34, gfx942) has no hand-written model",
-    ),
-    (
-        "qwen4_qsa_lanes_attention_fp8_fnuz_gfx942",
-        "v_fma_mix_f32 v4, v10, 1.0, v10 op_sel_hi:[1,1,1]: unverified encoding: unverified(xml-only: XML mnemonic V_MAD_MIX_F32 decoded as v_fma_mix_f32 v0, v0, v0, v0 op_sel_hi:[1,1,1])",
     ),
 ];
 

@@ -5,10 +5,11 @@
 //! CPU-only checks of the committed gfx942 QSA lanes Route-A twin.
 //! Every input is a committed file (`include_bytes!`); nothing is compiled or shelled out.
 //!
-//! The module holds seven entries; exactly FIVE f32 entries are sealed and certified. The two
-//! FP8 (`*_fp8_fnuz_gfx942`) entries stay OPEN: they ship in the same ELF but are never
-//! launched, are not in the sealed symbol set, and sealing them against the current anchor
-//! must keep being refused (strict negative seals below). Nothing here claims seven.
+//! The module holds seven entries; exactly FIVE f32 entries are in the committed seal.
+//! Neither FP8 entry is in that sealed symbol set or enabled by this artifact-only unit.
+//! Mixed-FMA qualification now lets the FP8 attention entry certify; its successful
+//! strict proof is checked separately, without changing the five-entry artifact or receipt.
+//! The FP8 prologue still refuses its unmodelled f16 compare. Nothing here claims seven.
 
 use peacemaker_ir::envelope::Bundle;
 use peacemaker_isa::arch::Arch;
@@ -25,17 +26,15 @@ const SYMBOLS: [&str; 5] = [
     "qwen4_qsa_lanes_select_from_scores_gfx942",
     "qwen4_qsa_lanes_attention_f32_gfx942",
 ];
-/// Present in the full ELF, NOT sealed, NOT launched: stay OPEN. `(symbol, exact refusal)`.
-const OPEN_FP8: [(&str, &str); 2] = [
+/// Present in the full ELF, not sealed or enabled here, and still refused.
+const OPEN_FP8: [(&str, &str); 1] = [
     (
         "qwen4_qsa_lanes_prologue_fp8_fnuz_gfx942",
         "CDNA certification of `qwen4_qsa_lanes_prologue_fp8_fnuz_gfx942`: qwen4_qsa_lanes_prologue_fp8_fnuz_gfx942: dword 1209: generated instruction v_cmp_eq_f16 (ENC_VOP3 opcode 34, gfx942) has no hand-written model",
     ),
-    (
-        "qwen4_qsa_lanes_attention_fp8_fnuz_gfx942",
-        "CDNA certification of `qwen4_qsa_lanes_attention_fp8_fnuz_gfx942`: v_fma_mix_f32 v4, v10, 1.0, v10 op_sel_hi:[1,1,1]: unverified encoding: unverified(xml-only: XML mnemonic V_MAD_MIX_F32 decoded as v_fma_mix_f32 v0, v0, v0, v0 op_sel_hi:[1,1,1])",
-    ),
 ];
+/// Now certifiable after mixed-FMA qualification, but outside the frozen five-entry seal.
+const UNSEALED_ATTENTION: &str = "qwen4_qsa_lanes_attention_fp8_fnuz_gfx942";
 const SOURCE_SHA256: &str = "552ea9cb5af4f1bcb6efd2fabef98b9b99b51f10d3522c57beea5d845287550f";
 const ANCHOR_SHA256: &str = "7d2fdcae51bc1f235692d3d171f80025607257ad79d2107428e019fa9a816f1f";
 const HXACO_SHA256: &str = "a7f134b50b0360ca395f4e689c5cc081111b7163dde77ef9892ca23c3fee4578";
@@ -183,6 +182,7 @@ fn manifest_records_source_and_artifact_hashes() {
     for (open, _) in OPEN_FP8 {
         assert!(!symbols.contains(&open), "{open} must not be certified");
     }
+    assert!(!symbols.contains(&UNSEALED_ATTENTION));
     assert_eq!(
         s(&m, &["source", "path"]),
         "kernels/src/qwen4_qsa_lanes_f32.gfx942.hip"
@@ -338,6 +338,7 @@ fn typed_lift_certifies_the_five_sealed_kernels_and_has_no_global_atomics() {
             .iter()
             .copied()
             .chain(OPEN_FP8.iter().map(|(s, _)| *s))
+            .chain(std::iter::once(UNSEALED_ATTENTION))
             .map(|s| s.to_string())
             .collect();
         want.sort();
@@ -365,10 +366,10 @@ fn typed_lift_certifies_the_five_sealed_kernels_and_has_no_global_atomics() {
     }
 }
 
-/// The FP8 entries are never certified: sealing each against the current anchor is refused
-/// with the exact observed error; the twin must not verify seven symbols.
+/// The FP8 prologue still refuses with its exact observed error. A seven-entry
+/// seal must fail rather than silently omit it.
 #[test]
-fn fp8_entries_stay_open_and_refuse_sealing() {
+fn fp8_prologue_stays_open_and_refuses_sealing() {
     for (symbol, expected) in OPEN_FP8 {
         let error = match seal_many(
             ANCHOR,
@@ -392,10 +393,39 @@ fn fp8_entries_stay_open_and_refuse_sealing() {
     assert!(seal_many(ANCHOR, arch(), &mixed).is_err());
     let mut all: Vec<&str> = SYMBOLS.to_vec();
     all.extend(OPEN_FP8.iter().map(|(s, _)| *s));
+    all.push(UNSEALED_ATTENTION);
     assert!(
         verify_hxaco_many(HXACO, arch(), &all).is_err(),
         "twin must not certify seven symbols"
     );
+}
+
+/// Discharge the obsolete mixed-FMA negative pin positively, without broadening
+/// the committed seal's symbol list or its five-entry hardware claim.
+#[test]
+fn mixed_fma_attention_now_seals_without_expanding_the_frozen_artifact() {
+    let sealed = seal_many(
+        ANCHOR,
+        arch(),
+        &[KernelSpec {
+            symbol: UNSEALED_ATTENTION,
+            abi_ref: None,
+        }],
+    )
+    .expect("mixed-FMA attention must now strictly seal");
+    assert_eq!(sealed.len(), 1);
+    let reports = verify_hxaco_many(&sealed[0].hxaco, arch(), &[UNSEALED_ATTENTION]).unwrap();
+    assert_eq!(reports.len(), 1);
+    let report = &reports[0].report;
+    assert_eq!(report["elf_sha256"], ELF_SHA256);
+    assert_eq!(report["hazards"]["checked"], true);
+    for field in ["findings", "blocking", "bypasses"] {
+        assert_eq!(report["hazards"][field], 0);
+    }
+    for field in ["inserted_nops", "rewritten_instructions", "violations"] {
+        assert_eq!(report["hazards"]["hazard"][field], 0);
+    }
+    assert!(!SYMBOLS.contains(&UNSEALED_ATTENTION));
 }
 
 /// Hardware byte-oracle receipt bound to both exact input images and the shared device ELF.

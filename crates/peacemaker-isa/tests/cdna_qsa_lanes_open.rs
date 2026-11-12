@@ -17,7 +17,7 @@ const CASES: &[(&str, &str)] = &[
     ("qwen4_qsa_lanes_scores_rows8_f32_gfx942", "CDNA certification of `qwen4_qsa_lanes_scores_rows8_f32_gfx942`: qwen4_qsa_lanes_scores_rows8_f32_gfx942: instruction 100 `flat_load_dword v11, v[6:7]`: Flat segment access: FLAT counts on VM_CNT and LGKM_CNT and may address LDS, SCRATCH needs a private segment; only GLOBAL is modelled"),
     ("qwen4_qsa_lanes_select_from_scores_gfx942", "CDNA certification of `qwen4_qsa_lanes_select_from_scores_gfx942`: qwen4_qsa_lanes_select_from_scores_gfx942: instruction 72 `flat_store_dword v[6:7], v1`: Flat segment access: FLAT counts on VM_CNT and LGKM_CNT and may address LDS, SCRATCH needs a private segment; only GLOBAL is modelled"),
     ("qwen4_qsa_lanes_attention_f32_gfx942", "CDNA certification of `qwen4_qsa_lanes_attention_f32_gfx942`: qwen4_qsa_lanes_attention_f32_gfx942: instruction 223 `flat_load_dword v6, v[6:7]`: Flat segment access: FLAT counts on VM_CNT and LGKM_CNT and may address LDS, SCRATCH needs a private segment; only GLOBAL is modelled"),
-    ("qwen4_qsa_lanes_attention_fp8_fnuz_gfx942", "CDNA certification of `qwen4_qsa_lanes_attention_fp8_fnuz_gfx942`: v_fma_mix_f32 v18, v27, 1.0, v27 op_sel_hi:[1,1,1]: unverified encoding: unverified(xml-only: XML mnemonic V_MAD_MIX_F32 decoded as v_fma_mix_f32 v0, v0, v0, v0 op_sel_hi:[1,1,1])"),
+    ("qwen4_qsa_lanes_attention_fp8_fnuz_gfx942", "CDNA certification of `qwen4_qsa_lanes_attention_fp8_fnuz_gfx942`: qwen4_qsa_lanes_attention_fp8_fnuz_gfx942: instruction 240 `flat_load_dword v18, v[18:19]`: Flat segment access: FLAT counts on VM_CNT and LGKM_CNT and may address LDS, SCRATCH needs a private segment; only GLOBAL is modelled"),
 ];
 
 #[test]
