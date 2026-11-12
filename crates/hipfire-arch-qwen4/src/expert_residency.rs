@@ -5652,6 +5652,7 @@ mod tests {
             gdn: crate::GdnStateFormat::Q8,
             qsa_f16_arena: false,
             qsa_pooled_bf16: false,
+            gdn_stream: crate::GdnStreamKind::None,
         }
     }
 
@@ -6845,6 +6846,7 @@ mod tests {
             gdn: crate::GdnStateFormat::Q8,
             qsa_f16_arena: false,
             qsa_pooled_bf16: true,
+            gdn_stream: crate::GdnStreamKind::None,
         };
         let (max_seq, chunk, granularity) = (16384usize, 8192usize, 2usize << 20);
         // Unified memory: the historical formula charges the first chunk's
@@ -7272,6 +7274,7 @@ mod tests {
             gdn: crate::GdnStateFormat::Q8,
             qsa_f16_arena: false,
             qsa_pooled_bf16: false,
+            gdn_stream: crate::GdnStreamKind::None,
         };
         let weights = j1778_bf16_manifest();
         let max_seq = 16_640usize;
@@ -9662,6 +9665,7 @@ mod tests {
             gdn,
             qsa_f16_arena: false,
             qsa_pooled_bf16: false,
+            gdn_stream: crate::GdnStreamKind::None,
         }
     }
 
@@ -10730,6 +10734,7 @@ mod tests {
             gdn: GdnStateFormat::Q8,
             qsa_f16_arena: false,
             qsa_pooled_bf16: true,
+            gdn_stream: crate::GdnStreamKind::None,
         };
         let scope = Qwen4BandScope::single(&config);
         let lane_context =
@@ -10780,6 +10785,7 @@ mod tests {
             gdn: GdnStateFormat::Q8,
             qsa_f16_arena: false,
             qsa_pooled_bf16: true,
+            gdn_stream: crate::GdnStreamKind::None,
         };
         let (max_seq, chunk, granularity) = (16384usize, 4096usize, 2usize << 20);
         let mode = Qwen4ForwardScratchMode::FnSymGfx1201;
@@ -11001,6 +11007,7 @@ mod tests {
             gdn: GdnStateFormat::Q8,
             qsa_f16_arena: false,
             qsa_pooled_bf16: true,
+            gdn_stream: crate::GdnStreamKind::None,
         };
         let (max_seq, chunk, granularity) = (16384usize, 4096usize, 2usize << 20);
         let mode = Qwen4ForwardScratchMode::FnSymGfx1201;

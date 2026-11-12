@@ -281,6 +281,31 @@ pub struct GdnStreamWorkspace {
     pub conv: GpuTensor,
 }
 
+/// Device bytes of each plane of one [`GdnStreamWorkspace`], in allocation order (x, alpha,
+/// beta, q, k, v, A, out, conv ring; `out_elem` bytes per scan output element: 4 for F32, 2
+/// for BF16). `Gpu::gdn_stream_workspace_alloc` allocates exactly these.
+pub const fn stream_workspace_plane_bytes(hk: usize, hv: usize, out_elem: usize) -> [usize; 9] {
+    let xdim = (2 * hk + hv) * 128;
+    [
+        64 * xdim * 4,
+        64 * hv * 4,
+        64 * hv * 4,
+        64 * hk * 128 * 2,
+        64 * hk * 128 * 2,
+        64 * hv * 128 * 2,
+        64 * hv * 64 * 2,
+        64 * hv * 128 * out_elem,
+        xdim * 3 * 4,
+    ]
+}
+
+/// Device bytes of one [`GdnStreamWorkspace`]: the sum of its planes. Pure, for admission
+/// census.
+pub const fn stream_workspace_bytes(hk: usize, hv: usize, out_elem: usize) -> usize {
+    let p = stream_workspace_plane_bytes(hk, hv, out_elem);
+    p[0] + p[1] + p[2] + p[3] + p[4] + p[5] + p[6] + p[7] + p[8]
+}
+
 /// Model constants of one GDN layer's prep (never carried).
 #[derive(Clone, Copy)]
 pub struct GdnStreamConsts<'a> {
@@ -469,6 +494,16 @@ impl GdnAppendSchedule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_bytes_match_the_planes() {
+        // FN 16/48, BF16 output: x 2.5 MiB, alpha+beta 24 KiB, q+k 512 KiB, v 768 KiB,
+        // A 384 KiB, out 768 KiB, conv ring 120 KiB.
+        assert_eq!(
+            stream_workspace_bytes(16, 48, 2),
+            2_621_440 + 24_576 + 524_288 + 786_432 + 393_216 + 786_432 + 122_880
+        );
+    }
 
     #[test]
     fn carry_bytes_match_design_table() {

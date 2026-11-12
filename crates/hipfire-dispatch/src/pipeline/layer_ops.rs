@@ -3194,23 +3194,123 @@ pub struct GatedDeltaNetOp<'a> {
 #[derive(Clone, Copy)]
 pub struct GdnCarryView<'a> {
     pub carry: GdnWyCarry<'a>,
-    pub edge: GdnWyEdge<'a>,
-    /// BF16 `[128]` gated-norm stand-in for the seal's discarded rows.
-    pub norm: &'a GpuTensor,
+    pub edge: GdnEdgeView<'a>,
     pub stream: bool,
+}
+
+/// The shared per-state staging of the layer's stream, by scan algorithm.
+#[derive(Clone, Copy)]
+pub enum GdnEdgeView<'a> {
+    /// gfx11 C16 WY stream: replay staging and the gated-norm stand-in for the seal's
+    /// discarded rows (BF16 `[128]`).
+    Wy { edge: GdnWyEdge<'a>, norm: &'a GpuTensor },
+    /// gfx1201 dense C64 stream: the F32 widened-constants staging and the edge workspace.
+    /// `carry.tile_entry` is the F32 tile-entry state, `carry.pending_conv` the F32
+    /// `[live ring | tile ring | pending qkv]` plane and `carry.pending_params` the pending
+    /// raw alpha/beta rows ([`rdna_compute::fn_gdn_dense::DenseStreamCarry`]).
+    Scan64 {
+        consts: &'a GpuTensor,
+        ws: &'a rdna_compute::gdn_stream::GdnStreamWorkspace,
+        plan: &'a rdna_compute::gdn_stream::GdnPrefillPlan,
+    },
 }
 
 /// Whether `op` appends to its WY stream: ordinary-prefill intent with a
 /// carry, no row capture, and the static WY admission of the device (never
 /// the call's row count). Recorder/capture runs keep the incumbent route.
 fn gdn_wy_stream_route(gpu: &Gpu, op: &GatedDeltaNetOp<'_>) -> bool {
-    op.carry.as_ref().is_some_and(|view| view.stream)
+    op.carry
+        .as_ref()
+        .is_some_and(|view| view.stream && matches!(view.edge, GdnEdgeView::Wy { .. }))
         && op.row_capture.is_none()
         && op.conv_kernel == 4
         && gpu.arch_caps.has_qwen4_parallel_qsa_gdn()
         && wy_stream_admitted(gpu, op.key_heads, op.value_heads, op.key_dim, op.value_dim)
         && !gpu.replay.is_recording()
         && !gpu.graphs.capture_mode
+}
+
+/// Whether `op` appends to its dense C64 (Scan64) stream: ordinary-prefill intent with a
+/// Scan64 carry, no row capture, eager, and the dense scan's static admission (never the
+/// call's row count: a 1-row call appends too). The input projection is F32.
+#[cfg(feature = "deltanet")]
+fn gdn_dense_stream_route(gpu: &Gpu, op: &GatedDeltaNetOp<'_>) -> bool {
+    op.carry
+        .as_ref()
+        .is_some_and(|view| view.stream && matches!(view.edge, GdnEdgeView::Scan64 { .. }))
+        && op.row_capture.is_none()
+        && op.conv_kernel == 4
+        && rdna_compute::fn_gdn_dense::stream_admitted(
+            gpu,
+            op.format,
+            op.key_heads,
+            op.value_heads,
+            op.key_dim,
+            op.value_dim,
+        )
+        && !gpu.replay.is_recording()
+        && !gpu.graphs.capture_mode
+}
+
+#[cfg(not(feature = "deltanet"))]
+fn gdn_dense_stream_route(_: &Gpu, _: &GatedDeltaNetOp<'_>) -> bool {
+    false
+}
+
+/// Seal `op`'s open stream (finish the incomplete tile, quantize once at the absolute end)
+/// before a consumer of the live slot runs: the WY or the Scan64 executor by the layer's edge.
+fn seal_open_stream(
+    gpu: &mut Gpu,
+    op: &GatedDeltaNetOp<'_>,
+    view: &GdnCarryView<'_>,
+) -> Result<(), DispatchError> {
+    match view.edge {
+        GdnEdgeView::Wy { edge, norm } => hip(gdn_wy_stream_seal(
+            gpu,
+            &GdnWySeal {
+                state: op.recurrent,
+                format: op.format,
+                residual: op.residual,
+                carry: view.carry,
+                edge: &edge,
+                key_heads: op.key_heads,
+                value_heads: op.value_heads,
+                norm,
+            },
+        )
+        .map(drop)),
+        #[cfg(feature = "deltanet")]
+        GdnEdgeView::Scan64 { consts, ws, plan } => {
+            let sealed = hip(rdna_compute::fn_gdn_dense::stream_seal(
+                gpu,
+                plan,
+                &view.carry.meta.get(),
+                op.key_heads,
+                op.value_heads,
+                op.recurrent,
+                op.residual,
+                op.conv_state,
+                &rdna_compute::fn_gdn_dense::DenseStreamCarry {
+                    tile_entry: view.carry.tile_entry,
+                    conv: view.carry.pending_conv,
+                    params: view.carry.pending_params,
+                },
+                &rdna_compute::fn_gdn_dense::DenseStreamModel {
+                    conv_weight: op.conv,
+                    a_log: op.a_log,
+                    dt_bias: op.dt_bias,
+                    consts,
+                },
+                ws,
+            ))?;
+            view.carry.meta.set(sealed);
+            Ok(())
+        }
+        #[cfg(not(feature = "deltanet"))]
+        GdnEdgeView::Scan64 { .. } => Err(DispatchError::Hip(
+            "Scan64 stream needs the deltanet feature".into(),
+        )),
+    }
 }
 
 /// Where a few-row GDN forward leaves what a later rollback to any accepted
@@ -3497,6 +3597,8 @@ fn gdn_dense_qkv_bf16(
         && gdn_persistent_batch(gpu, op, op.rows)
         && !gated_delta_chunk_route(gpu, step)
         && rdna_compute::fn_gdn_dense::applies(gpu, step)
+        // The canonical stream's prep reads the F32 projection.
+        && !gdn_dense_stream_route(gpu, op)
         && mq6_i8_route(gpu, &op.qkv, op.rows)
 }
 
@@ -4196,26 +4298,15 @@ fn execute_gated_delta_net_hc_impl(
         op.phase
     };
     let arenas = core_arena(phase, arenas);
-    // Ordinary prefill appends to the layer's WY stream at absolute tile and
-    // seam positions; any other consumer of the live slot first seals an open
-    // stream (finishes the incomplete tile, quantizes once at the absolute end).
+    // Ordinary prefill appends to the layer's stream (C16 WY on gfx11, dense C64 on gfx1201)
+    // at absolute tile and seam positions; any other consumer of the live slot first seals an
+    // open stream (finishes the incomplete tile, quantizes once at the absolute end).
     let wy_stream = gdn_wy_stream_route(gpu, op) && arenas.is_none();
-    if !wy_stream && matches!(phase, MixerPhase::Whole | MixerPhase::Core) {
+    let dense_stream = gdn_dense_stream_route(gpu, op) && arenas.is_none();
+    if !wy_stream && !dense_stream && matches!(phase, MixerPhase::Whole | MixerPhase::Core) {
         if let Some(view) = op.carry.as_ref() {
             if view.carry.meta.get().phase == GdnStreamPhase::Open {
-                hip(gdn_wy_stream_seal(
-                    gpu,
-                    &GdnWySeal {
-                        state: op.recurrent,
-                        format: op.format,
-                        residual: op.residual,
-                        carry: view.carry,
-                        edge: &view.edge,
-                        key_heads: op.key_heads,
-                        value_heads: op.value_heads,
-                        norm: view.norm,
-                    },
-                ))?;
+                seal_open_stream(gpu, op, view)?;
             }
         }
     }
@@ -4246,7 +4337,7 @@ fn execute_gated_delta_net_hc_impl(
     let mut beta = view(op.beta, 0, rows * op.value_heads);
     let z = view(op.z_output, lo * value, rows * value);
     let history_rows = op.conv_kernel.saturating_sub(1);
-    let persistent_batch = gdn_persistent_batch(gpu, op, rows) || wy_stream;
+    let persistent_batch = gdn_persistent_batch(gpu, op, rows) || wy_stream || dense_stream;
     if arenas.is_some() && (!persistent_batch || op.row_capture.is_some()) {
         return Err(DispatchError::Hip(
             "GDN trunk arena needs batched k4 without row capture".into(),
@@ -4445,11 +4536,14 @@ fn execute_gated_delta_net_hc_impl(
         // gfx1201 FN dense route: its producer replaces the convolution, the
         // gate-parameter pass and the step (the gate below finishes it).
         #[cfg(feature = "deltanet")]
-        let dense = arenas.is_none() && !chunked && rdna_compute::fn_gdn_dense::applies(gpu, &step);
+        let dense = dense_stream
+            || (arenas.is_none() && !chunked && rdna_compute::fn_gdn_dense::applies(gpu, &step));
         #[cfg(not(feature = "deltanet"))]
         let dense = false;
         // Convolution and gate parameters in one launch.
-        if dense {
+        if dense_stream {
+            // The stream's prep owns the convolution, gate parameters, Q/K norm and packing.
+        } else if dense {
             #[cfg(feature = "deltanet")]
             hip(rdna_compute::fn_gdn_dense::run(
                 gpu,
@@ -4509,9 +4603,56 @@ fn execute_gated_delta_net_hc_impl(
             value_heads: op.value_heads,
             value_dim: op.value_dim,
         };
+        // The dense C64 stream appends the rows at absolute tile/seam positions and publishes
+        // exactly them (BF16 scan output in `recurrent_output`, gated below like the
+        // incumbent dense route); the live slot is quantized only at an absolute 512 seam or
+        // the explicit seal.
+        #[cfg(feature = "deltanet")]
+        if let (true, Some(view)) = (dense_stream, op.carry.as_ref()) {
+            if let GdnEdgeView::Scan64 { consts, ws, plan } = view.edge {
+                let next = hip(rdna_compute::fn_gdn_dense::stream_append(
+                    gpu,
+                    plan,
+                    &view.carry.meta.get(),
+                    dims.position as u64,
+                    rows,
+                    op.key_heads,
+                    op.value_heads,
+                    op.recurrent,
+                    op.residual,
+                    op.conv_state,
+                    &rdna_compute::fn_gdn_dense::DenseStreamCarry {
+                        tile_entry: view.carry.tile_entry,
+                        conv: view.carry.pending_conv,
+                        params: view.carry.pending_params,
+                    },
+                    &rdna_compute::fn_gdn_dense::DenseStreamModel {
+                        conv_weight: op.conv,
+                        a_log: op.a_log,
+                        dt_bias: op.dt_bias,
+                        consts,
+                    },
+                    ws,
+                    &projection,
+                    &a,
+                    &b,
+                    &conv_output,
+                    &recurrent_output,
+                ))?;
+                view.carry.meta.set(next);
+            }
+        }
         // The F16 prefill route fuses the gate into the chunked WMMA
         // recurrence (KLD-gated); otherwise the exact kernels run.
-        if let (true, Some(view)) = (wy_stream, op.carry.as_ref()) {
+        if let (
+            true,
+            Some(GdnCarryView {
+                carry,
+                edge: GdnEdgeView::Wy { edge, .. },
+                ..
+            }),
+        ) = (wy_stream, op.carry.as_ref())
+        {
             // The stream appends the rows at absolute tile/seam positions and
             // publishes exactly them; the live slot is quantized only at an
             // absolute 512 seam (or the explicit seal).
@@ -4520,8 +4661,8 @@ fn execute_gated_delta_net_hc_impl(
                 &GdnWyAppend {
                     step: &step,
                     gate: &gated,
-                    carry: view.carry,
-                    edge: &view.edge,
+                    carry: *carry,
+                    edge,
                 },
             ))?;
         } else if chunked {

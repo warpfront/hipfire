@@ -1494,6 +1494,7 @@ mod tests {
             qsa: QsaKvFormat::Fp8,
             qsa_f16_arena: false,
             qsa_pooled_bf16: false,
+            gdn_stream: crate::GdnStreamKind::None,
         };
         let inputs = CensusInputs {
             config: &config,

@@ -6796,22 +6796,11 @@ impl Gpu {
     ) -> HipResult<GdnStreamWorkspace> {
         Self::gdn_chunk_check_heads(n_key_heads, n_value_heads)?;
         let (hk, hv) = (n_key_heads, n_value_heads);
-        let xdim = (2 * hk + hv) * 128;
         let out_elem = match out_fmt {
             GdnScanOut::F32 => 4,
             GdnScanOut::Bf16 => 2,
         };
-        let sizes = [
-            64 * xdim * 4,
-            64 * hv * 4,
-            64 * hv * 4,
-            64 * hk * 128 * 2,
-            64 * hk * 128 * 2,
-            64 * hv * 128 * 2,
-            64 * hv * 64 * 2,
-            64 * hv * 128 * out_elem,
-            xdim * 3 * 4,
-        ];
+        let sizes = crate::gdn_stream::stream_workspace_plane_bytes(hk, hv, out_elem);
         let mut made: Vec<GpuTensor> = Vec::with_capacity(sizes.len());
         for bytes in sizes {
             match self.zeros(&[bytes], DType::Raw) {

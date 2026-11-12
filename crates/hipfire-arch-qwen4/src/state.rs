@@ -26,7 +26,7 @@ use crate::config::{LayerType, Qwen4Config};
 use crate::kv_backend::{Qwen4ContextCommit, Qwen4KvBackend};
 use crate::ple::PleHistory;
 use crate::weights::Qwen4BandScope;
-use hipfire_dispatch::pipeline::{GdnCarryView, GdnRowCapture};
+use hipfire_dispatch::pipeline::{GdnCarryView, GdnEdgeView, GdnRowCapture};
 use hipfire_runtime::kv_backend::{
     KvChunkPlan, KvChunkPlanError, DEFAULT_KV_CHUNK_TOKENS, DEFAULT_VMM_PHYSICAL_CHUNK_BYTES,
 };
@@ -52,7 +52,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 #[path = "gdn_carry.rs"]
 pub mod gdn_carry;
-pub use gdn_carry::{GdnCarry, GdnEdge};
+pub use gdn_carry::{GdnCarry, GdnEdge, GdnStreamKind};
 
 /// GDN key and value head width of the few-row capture route.
 const GDN_HEAD_DIM: usize = 128;
@@ -1018,6 +1018,11 @@ pub struct Qwen4StateFormat {
     /// (`HIPFIRE_QWEN4_QSA_POOLED_BF16`, gfx1151 F32 index_dim 128;
     /// [`resolve_state_format`]).
     pub qsa_pooled_bf16: bool,
+    /// The canonical GDN scan stream whose carry a snapshot-capable state allocates
+    /// ([`gdn_carry::resolve_gdn_stream_kind`]: static device facts, resolved once by
+    /// [`resolve_state_format`]); `None` when the persistent/sequential recurrence serves
+    /// ordinary prefill. Part of the format so byte accounting needs no device handle.
+    pub gdn_stream: GdnStreamKind,
 }
 
 impl Qwen4StateFormat {
@@ -1027,6 +1032,7 @@ impl Qwen4StateFormat {
         gdn: GdnStateFormat::F32,
         qsa_f16_arena: false,
         qsa_pooled_bf16: false,
+        gdn_stream: GdnStreamKind::None,
     };
 
     /// The QSA layers' context storage: what admission accounts and the state
@@ -1059,14 +1065,16 @@ pub fn resolve_state_format(
     config: &Qwen4Config,
 ) -> Result<Qwen4StateFormat, String> {
     let qsa = resolve_qsa_format(kv_request, gpu, config)?;
+    let gdn = resolve_gdn_format_for_arch(
+        state_request,
+        config,
+        &gpu.arch,
+        gpu.flags.qwen4_gdn_q8_inline,
+    )?;
     Ok(Qwen4StateFormat {
         qsa,
-        gdn: resolve_gdn_format_for_arch(
-            state_request,
-            config,
-            &gpu.arch,
-            gpu.flags.qwen4_gdn_q8_inline,
-        )?,
+        gdn,
+        gdn_stream: gdn_carry::resolve_gdn_stream_kind(gpu, config, gdn),
         qsa_f16_arena: rdna_compute::tensor_ops::qsa_f16_arena_enabled(gpu, qsa, config.head_dim),
         qsa_pooled_bf16: qsa_pooled_bf16_mirror_enabled(
             gpu,
@@ -2743,12 +2751,15 @@ impl Qwen4State {
         let hyper_feedback = map.owns_input().then(|| next_tensor());
         let model_id = next_qwen4_model_id();
         let ple_history = PleHistory::new(config.eos_token_id);
-        // The stream recipe is resolved from static facts once; a state that
-        // is only stepped (no mirror: an AR lane) never prefills and carries
+        // The stream recipe follows the format's resolved kind (static device facts, once);
+        // a state that is only stepped (no mirror: an AR lane) never prefills and carries
         // nothing.
-        let stream_plan = (mirror == StateMirror::Snapshot && map.gdn_count() != 0)
-            .then(|| gdn_carry::resolve_gdn_stream(gpu, config, format.gdn))
-            .flatten();
+        let stream_kind = if mirror == StateMirror::Snapshot && map.gdn_count() != 0 {
+            format.gdn_stream
+        } else {
+            GdnStreamKind::None
+        };
+        let stream_plan = gdn_carry::resolve_gdn_stream(stream_kind, format.gdn);
         let mut edge: Option<GdnEdge> = None;
         let snapshot_arena = match (|| {
             for layer in &gdn {
@@ -2757,9 +2768,10 @@ impl Qwen4State {
                 }
             }
             if let Some(plan) = &stream_plan {
-                let layer_specs = gdn_carry::carry_layer_specs(config);
-                let edge_specs = gdn_carry::edge_specs(config);
+                let layer_specs = gdn_carry::carry_layer_specs(config, stream_kind);
+                let edge_specs = gdn_carry::edge_specs(config, stream_kind);
                 let mut staged: Vec<GpuTensor> = Vec::new();
+                let mut workspace = None;
                 let allocated = (|| -> Result<(), StateError> {
                     for _ in &gdn {
                         for &(_, elements, dtype) in &layer_specs {
@@ -2768,6 +2780,16 @@ impl Qwen4State {
                     }
                     for &(_, elements, dtype) in &edge_specs {
                         staged.push(gpu.zeros(&[elements], dtype).map_err(StateError::Hip)?);
+                    }
+                    if stream_kind == GdnStreamKind::Scan64 {
+                        workspace = Some(
+                            gpu.gdn_stream_workspace_alloc(
+                                config.linear_num_key_heads,
+                                config.linear_num_value_heads,
+                                rdna_compute::norm::GdnScanOut::Bf16,
+                            )
+                            .map_err(StateError::Hip)?,
+                        );
                     }
                     Ok(())
                 })();
@@ -2788,10 +2810,13 @@ impl Qwen4State {
                         meta: Cell::new(gdn_carry::sealed_cursor(plan, 0, 0)),
                     });
                 }
-                edge = Some(GdnEdge {
-                    z: take(),
-                    out: take(),
-                    norm: take(),
+                edge = Some(match workspace {
+                    Some(ws) => GdnEdge::Scan64 { consts: take(), ws },
+                    None => GdnEdge::Wy {
+                        z: take(),
+                        out: take(),
+                        norm: take(),
+                    },
                 });
             }
             match mirror {
@@ -2812,9 +2837,7 @@ impl Qwen4State {
             Err(error) => {
                 // Reverse of allocation: edge staging, feedback, PLE, then layers last to first.
                 if let Some(edge) = edge.take() {
-                    for tensor in [edge.norm, edge.out, edge.z] {
-                        let _ = gpu.free_tensor(tensor);
-                    }
+                    edge.free(gpu);
                 }
                 if let Some(hyper_feedback) = hyper_feedback {
                     let _ = gpu.free_tensor(hyper_feedback);
@@ -3019,7 +3042,8 @@ impl Qwen4State {
         gdn_layer
             .checked_mul(gdn_layers)?
             .checked_add(qsa_layer.checked_mul(qsa_layers)?)?
-            .checked_add(per_request)
+            .checked_add(per_request)?
+            .checked_add(Self::gdn_stream_device_bytes(config, format.gdn_stream, scope, mirror)?)
     }
 
     /// Device bytes the whole-model QSA context arenas of one state commit under
@@ -3094,6 +3118,14 @@ impl Qwen4State {
                 }
             }
         }
+        let (gdn_layers, _) = scope_layer_counts(config, &Qwen4BandScope::single(config));
+        if gdn_layers != 0 {
+            for bytes in
+                Self::gdn_stream_allocation_sizes(config, format.gdn_stream, gdn_layers, mirror)?
+            {
+                push(usize::try_from(bytes).ok()?)?;
+            }
+        }
         Some(sizes)
     }
 
@@ -3127,11 +3159,17 @@ impl Qwen4State {
                 meta: &carry.meta,
                 recipe_id: carry.plan.recipe_id,
             },
-            edge: GdnWyEdge {
-                z: &edge.z,
-                out: &edge.out,
+            edge: match edge {
+                GdnEdge::Wy { z, out, norm } => GdnEdgeView::Wy {
+                    edge: GdnWyEdge { z, out },
+                    norm,
+                },
+                GdnEdge::Scan64 { consts, ws } => GdnEdgeView::Scan64 {
+                    consts,
+                    ws,
+                    plan: &carry.plan,
+                },
             },
-            norm: &edge.norm,
             stream,
         })
     }
@@ -3150,52 +3188,85 @@ impl Qwen4State {
     /// lane exchange. The dispatch layer also seals lazily before any
     /// non-stream consumer reaches a layer, so a missed owner call is never a
     /// stale read.
-    pub fn seal_gdn_streams(&mut self, gpu: &mut Gpu) -> Result<(), StateError> {
+    pub fn seal_gdn_streams<'w>(
+        &mut self,
+        gpu: &mut Gpu,
+        weights: &dyn Fn(usize) -> Option<gdn_carry::GdnSealWeights<'w>>,
+    ) -> Result<(), StateError> {
         let Some(edge) = &self.gdn_edge else {
             return Ok(());
         };
-        let wy_edge = GdnWyEdge {
-            z: &edge.z,
-            out: &edge.out,
-        };
-        for layer in &self.gdn {
+        for (slot, layer) in self.gdn.iter().enumerate() {
             let Some(carry) = &layer.carry else { continue };
             if !carry.is_open() {
                 continue;
             }
-            gdn_wy_stream_seal(
-                gpu,
-                &GdnWySeal {
-                    state: &layer.recurrent,
-                    format: self.gdn_format,
-                    residual: layer.ef_residual.as_ref(),
-                    carry: GdnWyCarry {
-                        tile_entry: &carry.tile_entry,
-                        pending_conv: &carry.pending_conv,
-                        pending_params: &carry.pending_params,
-                        meta: &carry.meta,
-                        recipe_id: carry.plan.recipe_id,
+            let wy_carry = GdnWyCarry {
+                tile_entry: &carry.tile_entry,
+                pending_conv: &carry.pending_conv,
+                pending_params: &carry.pending_params,
+                meta: &carry.meta,
+                recipe_id: carry.plan.recipe_id,
+            };
+            match edge {
+                GdnEdge::Wy { z, out, norm } => gdn_wy_stream_seal(
+                    gpu,
+                    &GdnWySeal {
+                        state: &layer.recurrent,
+                        format: self.gdn_format,
+                        residual: layer.ef_residual.as_ref(),
+                        carry: wy_carry,
+                        edge: &GdnWyEdge { z, out },
+                        key_heads: self.gdn_key_heads,
+                        value_heads: self.gdn_value_heads,
+                        norm,
                     },
-                    edge: &wy_edge,
-                    key_heads: self.gdn_key_heads,
-                    value_heads: self.gdn_value_heads,
-                    norm: &edge.norm,
-                },
-            )
+                )
+                .map(drop),
+                GdnEdge::Scan64 { consts, ws } => {
+                    let layer_weights = self
+                        .map
+                        .gdn_layer(slot)
+                        .and_then(weights)
+                        .ok_or(StateError::SnapshotShape)?;
+                    rdna_compute::fn_gdn_dense::stream_seal(
+                        gpu,
+                        &carry.plan,
+                        &carry.meta.get(),
+                        self.gdn_key_heads,
+                        self.gdn_value_heads,
+                        &layer.recurrent,
+                        layer.ef_residual.as_ref(),
+                        &layer.conv,
+                        &rdna_compute::fn_gdn_dense::DenseStreamCarry {
+                            tile_entry: &carry.tile_entry,
+                            conv: &carry.pending_conv,
+                            params: &carry.pending_params,
+                        },
+                        &rdna_compute::fn_gdn_dense::DenseStreamModel {
+                            conv_weight: layer_weights.conv,
+                            a_log: layer_weights.a_log,
+                            dt_bias: layer_weights.dt_bias,
+                            consts,
+                        },
+                        ws,
+                    )
+                    .map(|sealed| carry.meta.set(sealed))
+                }
+            }
             .map_err(StateError::Hip)?;
         }
         Ok(())
     }
 
-    /// Device bytes of the stream carry a state with `mirror` allocates for
-    /// the band `scope` owns: per GDN layer the tile-entry state, pending conv
-    /// rows and pending gate/beta rows (plus their snapshot mirror), and the
-    /// shared edge staging once. Added to [`Self::device_bytes_with_mirror`]
-    /// exactly when [`gdn_carry::resolve_gdn_stream`] resolves a plan for the
-    /// device (the byte accounting is device-free; the arch decision is the
-    /// caller's).
+    /// Device bytes of the stream carry a state of `kind` with `mirror` allocates for the band
+    /// `scope` owns: per GDN layer the tile-entry state and pending rows (plus their snapshot
+    /// mirror), and the shared edge staging once. Zero unless the state mirrors (a stepped-only
+    /// AR lane carries nothing) and `kind` carries. Added to [`Self::device_bytes_with_mirror`]
+    /// from the format's resolved [`GdnStreamKind`].
     pub(crate) fn gdn_stream_device_bytes(
         config: &Qwen4Config,
+        kind: GdnStreamKind,
         scope: &Qwen4BandScope,
         mirror: StateMirror,
     ) -> Option<usize> {
@@ -3203,32 +3274,38 @@ impl Qwen4State {
         if gdn_layers == 0 {
             return Some(0);
         }
-        let sizes = Self::gdn_stream_allocation_sizes(config, gdn_layers, mirror)?;
+        let sizes = Self::gdn_stream_allocation_sizes(config, kind, gdn_layers, mirror)?;
         sizes
             .iter()
             .try_fold(0usize, |total, &bytes| total.checked_add(usize::try_from(bytes).ok()?))
     }
 
     /// One entry per stream-carry allocation (live per layer, mirror per
-    /// layer, then the edge staging), zero-byte entries omitted.
+    /// layer, then the edge staging), zero-byte entries omitted; empty without a carrying
+    /// kind or without a mirror.
     pub(crate) fn gdn_stream_allocation_sizes(
         config: &Qwen4Config,
+        kind: GdnStreamKind,
         gdn_layers: usize,
         mirror: StateMirror,
     ) -> Option<Vec<u64>> {
-        let layer_bytes = gdn_carry::carry_layer_specs(config)
+        if kind == GdnStreamKind::None || mirror != StateMirror::Snapshot {
+            return Some(Vec::new());
+        }
+        let layer_bytes = gdn_carry::carry_layer_specs(config, kind)
             .iter()
             .map(|&(_, elements, dtype)| elements.checked_mul(dtype.size()))
             .collect::<Option<Vec<_>>>()?;
         let mut sizes = Vec::new();
         for _ in 0..gdn_layers {
             sizes.extend(layer_bytes.iter().copied());
-            if mirror == StateMirror::Snapshot {
-                sizes.extend(layer_bytes.iter().copied());
-            }
+            sizes.extend(layer_bytes.iter().copied());
         }
-        for &(_, elements, dtype) in &gdn_carry::edge_specs(config) {
+        for &(_, elements, dtype) in &gdn_carry::edge_specs(config, kind) {
             sizes.push(elements.checked_mul(dtype.size())?);
+        }
+        if kind == GdnStreamKind::Scan64 {
+            sizes.extend(gdn_carry::scan64_workspace_plane_bytes(config));
         }
         sizes
             .into_iter()
@@ -3843,19 +3920,44 @@ impl Qwen4State {
                         // The F32 tile entry and exactly the valid pending
                         // rows; spare capacity is uninitialized and excluded.
                         let rows = meta.pending_rows as usize;
-                        let row_bytes = carry.pending_conv.byte_size() / WY_TILE_ROWS;
-                        let param_bytes = carry.pending_params.byte_size() / (2 * WY_TILE_ROWS);
-                        format!(
-                            "tile={} conv={} gate={} beta={} rows={rows}",
-                            device(&carry.tile_entry)?,
-                            hash_prefix(&carry.pending_conv, rows * row_bytes)?,
-                            hash_range(&carry.pending_params, 0, rows * param_bytes)?,
-                            hash_range(
-                                &carry.pending_params,
-                                WY_TILE_ROWS * param_bytes,
-                                rows * param_bytes
-                            )?,
-                        )
+                        match carry.plan.algorithm {
+                            rdna_compute::gdn_stream::GdnScanAlgorithm::Scan64 => {
+                                // `conv` = [live ring | tile-entry ring | 64 pending qkv
+                                // rows] and `params` = [64 alpha | 64 beta rows], all F32.
+                                let channels = carry.pending_conv.byte_size() / (70 * 4);
+                                let heads = carry.pending_params.byte_size() / (128 * 4);
+                                let ring = 3 * channels * 4;
+                                format!(
+                                    "tile={} live_ring={} tile_ring={} qkv={} alpha={} beta={} rows={rows}",
+                                    device(&carry.tile_entry)?,
+                                    hash_range(&carry.pending_conv, 0, ring)?,
+                                    hash_range(&carry.pending_conv, ring, ring)?,
+                                    hash_range(&carry.pending_conv, 2 * ring, rows * channels * 4)?,
+                                    hash_range(&carry.pending_params, 0, rows * heads * 4)?,
+                                    hash_range(
+                                        &carry.pending_params,
+                                        64 * heads * 4,
+                                        rows * heads * 4
+                                    )?,
+                                )
+                            }
+                            _ => {
+                                let row_bytes = carry.pending_conv.byte_size() / WY_TILE_ROWS;
+                                let param_bytes =
+                                    carry.pending_params.byte_size() / (2 * WY_TILE_ROWS);
+                                format!(
+                                    "tile={} conv={} gate={} beta={} rows={rows}",
+                                    device(&carry.tile_entry)?,
+                                    hash_prefix(&carry.pending_conv, rows * row_bytes)?,
+                                    hash_range(&carry.pending_params, 0, rows * param_bytes)?,
+                                    hash_range(
+                                        &carry.pending_params,
+                                        WY_TILE_ROWS * param_bytes,
+                                        rows * param_bytes
+                                    )?,
+                                )
+                            }
+                        }
                     }
                 }
                 DigestRow::Qsa(slot, field) => {
@@ -4431,10 +4533,22 @@ impl Qwen4State {
         if let Some(hyper_feedback) = self.hyper_feedback {
             free(hyper_feedback);
         }
-        if let Some(edge) = self.gdn_edge {
-            free(edge.z);
-            free(edge.out);
-            free(edge.norm);
+        match self.gdn_edge {
+            Some(GdnEdge::Wy { z, out, norm }) => {
+                free(z);
+                free(out);
+                free(norm);
+            }
+            Some(GdnEdge::Scan64 { consts, ws }) => {
+                free(consts);
+                let rdna_compute::gdn_stream::GdnStreamWorkspace {
+                    x, alpha, beta, q, k, v, a, out, conv, ..
+                } = ws;
+                for tensor in [x, alpha, beta, q, k, v, a, out, conv] {
+                    free(tensor);
+                }
+            }
+            None => {}
         }
         // With a shared pool the per-layer rings are views of it.
         let pooled = self.row_capture_pool.is_some();
@@ -5761,7 +5875,7 @@ mod tests {
             ));
         }
         // A carrying state's payload is its own ABI under the plan's recipe.
-        let plan = gdn_carry::gdn_stream_plan(GdnStateFormat::Q8Ef);
+        let plan = gdn_carry::gdn_stream_plan(GdnStreamKind::Wy16, GdnStateFormat::Q8Ef);
         let carry_tag = gdn_session_tag(map.session_tag(), GdnStateFormat::Q8Ef, Some(&plan));
         assert_ne!(carry_tag, ef_tag);
         assert!(matches!(
@@ -6010,6 +6124,7 @@ mod tests {
         let config = crate::config::compact_test_config();
         let mirror = Qwen4StateFormat {
             qsa_pooled_bf16: true,
+            gdn_stream: crate::GdnStreamKind::None,
             ..Qwen4StateFormat::F32
         };
         let layout = mirror.layout();
@@ -6088,6 +6203,7 @@ mod tests {
                 "pooled_bf16",
                 Qwen4StateFormat {
                     qsa_pooled_bf16: true,
+                    gdn_stream: crate::GdnStreamKind::None,
                     ..base
                 },
             ),
@@ -6097,6 +6213,7 @@ mod tests {
                     gdn: GdnStateFormat::Q8Ef,
                     qsa_f16_arena: true,
                     qsa_pooled_bf16: true,
+                    gdn_stream: crate::GdnStreamKind::None,
                     ..base
                 },
             ),
@@ -6912,6 +7029,7 @@ mod tests {
             gdn,
             qsa_f16_arena: false,
             qsa_pooled_bf16: false,
+            gdn_stream: crate::GdnStreamKind::None,
         };
         let bytes = |gdn, scope: &Qwen4BandScope, mirror| {
             Qwen4State::device_bytes_with_mirror(&config, format(gdn), &context, scope, mirror)

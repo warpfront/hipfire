@@ -686,6 +686,361 @@ pub fn gate_i8(gpu: &mut Gpu, p: &GatedDeltaGateBatched<'_>) -> HipResult<*mut c
     gpu.int8_mmq_prepared_ptr(&prepared, k, p.rows)
 }
 
+
+// ---------------------------------------------------------------------------
+// Canonical Scan64 stream route (CHUNK-CANONICAL-DESIGN §3.3). The dense C64 scan
+// of an ordinary prefill appends to the layer's stream at ABSOLUTE tile and seam
+// positions whatever the call's row count (`Gpu::gdn_stream_append`: head tile,
+// whole tiles, replayed incomplete tile), so no row's bytes depend on how the prompt
+// was split into calls. The stream's prep (`gdn_chunk_prep`: F32 conv, F16 packing,
+// tile-local gate cumsum) is the canonical recipe applied uniformly to every row;
+// the model's BF16 conv / gate constants are widened to F32 exactly per call and the
+// Qwen4 convolution ring (`[3][channels]`, slot = absolute position mod 3) is
+// converted to and from the stream's newest-first layout at the phase boundaries.
+// ---------------------------------------------------------------------------
+
+/// The per-layer persistent carry buffers of a Scan64 stream, owned by the request
+/// state: the F32 tile-entry recurrent state and `conv`, laid out as three
+/// `channels * 3` F32 rings followed by the pending raw QKV rows
+/// (`[live stream ring | tile-entry ring | 64 x channels pending qkv]`), and the
+/// pending raw alpha / beta rows (`[2][64][value_heads]` F32).
+#[cfg(feature = "deltanet")]
+#[derive(Clone, Copy)]
+pub struct DenseStreamCarry<'a> {
+    pub tile_entry: &'a GpuTensor,
+    pub conv: &'a GpuTensor,
+    pub params: &'a GpuTensor,
+}
+
+/// The model constants of one layer's prep (BF16 as stored) and the per-state F32
+/// staging they are widened into (`channels * 4 + 2 * value_heads` F32).
+#[cfg(feature = "deltanet")]
+#[derive(Clone, Copy)]
+pub struct DenseStreamModel<'a> {
+    pub conv_weight: &'a GpuTensor,
+    pub a_log: &'a GpuTensor,
+    pub dt_bias: &'a GpuTensor,
+    pub consts: &'a GpuTensor,
+}
+
+/// F32 elements of the per-state constants staging of a geometry.
+#[cfg(feature = "deltanet")]
+pub const fn stream_consts_elems(key_heads: usize, value_heads: usize) -> usize {
+    (2 * key_heads + value_heads) * 128 * 4 + 2 * value_heads
+}
+
+/// F32 elements of one layer's `carry.conv` plane (three rings of `channels * 3` plus the
+/// 64 pending raw QKV rows) and `carry.params` plane of a geometry.
+#[cfg(feature = "deltanet")]
+pub const fn stream_carry_elems(key_heads: usize, value_heads: usize) -> (usize, usize) {
+    let channels = (2 * key_heads + value_heads) * 128;
+    ((6 + 64) * channels, 2 * 64 * value_heads)
+}
+
+#[cfg(feature = "deltanet")]
+struct DenseStreamViews {
+    live_ring: GpuTensor,
+    tile_ring: GpuTensor,
+    pending_qkv: GpuTensor,
+    alpha: GpuTensor,
+    beta: GpuTensor,
+    conv_w: GpuTensor,
+    a_log: GpuTensor,
+    dt_bias: GpuTensor,
+}
+
+#[cfg(feature = "deltanet")]
+fn stream_views(
+    geometry: Geometry,
+    carry: &DenseStreamCarry<'_>,
+    model: &DenseStreamModel<'_>,
+) -> HipResult<DenseStreamViews> {
+    let (channels, hv) = (geometry.channels(), geometry.value_heads);
+    let (conv_elems, params_elems) = stream_carry_elems(geometry.key_heads, geometry.value_heads);
+    let consts_elems = stream_consts_elems(geometry.key_heads, geometry.value_heads);
+    let bad = |what: &str, have: usize, want: usize| {
+        hip_bridge::HipError::new(
+            0,
+            &format!("fn_gdn_dense stream: {what} is {have} bytes, needs {want}"),
+        )
+    };
+    for (what, t, want) in [
+        ("tile entry", carry.tile_entry, geometry.value_heads * 128 * 128 * 4),
+        ("carry conv", carry.conv, conv_elems * 4),
+        ("carry params", carry.params, params_elems * 4),
+        ("constants staging", model.consts, consts_elems * 4),
+    ] {
+        if t.byte_size() < want {
+            return Err(bad(what, t.byte_size(), want));
+        }
+    }
+    let f32s = |t: &GpuTensor, off: usize, len: usize| {
+        let mut v = raw(t, off * 4, len * 4);
+        v.dtype = DType::F32;
+        v
+    };
+    Ok(DenseStreamViews {
+        live_ring: f32s(carry.conv, 0, 3 * channels),
+        tile_ring: f32s(carry.conv, 3 * channels, 3 * channels),
+        pending_qkv: f32s(carry.conv, 6 * channels, 64 * channels),
+        alpha: f32s(carry.params, 0, 64 * hv),
+        beta: f32s(carry.params, 64 * hv, 64 * hv),
+        conv_w: f32s(model.consts, 0, channels * 4),
+        a_log: f32s(model.consts, channels * 4, hv),
+        dt_bias: f32s(model.consts, channels * 4 + hv, hv),
+    })
+}
+
+#[cfg(feature = "deltanet")]
+fn stream_widen_consts(
+    gpu: &mut Gpu,
+    geometry: Geometry,
+    model: &DenseStreamModel<'_>,
+) -> HipResult<()> {
+    let (channels, hv) = (geometry.channels(), geometry.value_heads);
+    let mut args = KernargBlob::new();
+    for t in [model.conv_weight, model.a_log, model.dt_bias, model.consts] {
+        args.push_ptr(t.buf.as_ptr());
+    }
+    args.push_i32(channels as i32);
+    args.push_i32(hv as i32);
+    let total = channels * 4 + 2 * hv;
+    launch(
+        gpu,
+        "fn_gdn_dense_stream_consts",
+        [total.div_ceil(256) as u32, 1, 1],
+        256,
+        &mut args,
+    )
+}
+
+/// Convert between the live Qwen4 ring `ring` and the stream ring `stream` at absolute
+/// `position` (`to_stream`: ring -> stream; else stream -> ring, BF16-rounded).
+#[cfg(feature = "deltanet")]
+fn stream_ring_convert(
+    gpu: &mut Gpu,
+    ring: &GpuTensor,
+    stream: &GpuTensor,
+    channels: usize,
+    position: u64,
+    to_stream: bool,
+) -> HipResult<()> {
+    let mut args = KernargBlob::new();
+    if to_stream {
+        args.push_ptr(ring.buf.as_ptr());
+        args.push_ptr(stream.buf.as_ptr());
+    } else {
+        args.push_ptr(stream.buf.as_ptr());
+        args.push_ptr(ring.buf.as_ptr());
+    }
+    args.push_i32(channels as i32);
+    args.push_i32((position % 3) as i32);
+    launch(
+        gpu,
+        if to_stream { "fn_gdn_dense_ring_to_stream" } else { "fn_gdn_dense_ring_from_stream" },
+        [channels.div_ceil(256) as u32, 1, 1],
+        256,
+        &mut args,
+    )
+}
+
+/// The Q8 planes of a dense-slot state tensor (codes then row scales) with its residual.
+#[cfg(feature = "deltanet")]
+fn stream_planes(
+    geometry: Geometry,
+    state: &GpuTensor,
+    residual: Option<&GpuTensor>,
+) -> (GpuTensor, GpuTensor) {
+    let codes = raw(state, 0, geometry.state_codes());
+    let scales = raw(state, geometry.state_codes(), geometry.state_scales());
+    let _ = residual;
+    (codes, scales)
+}
+
+/// The A-block scratch of a `rows`-row stream call (the shared per-device scratch of
+/// [`run`], grown on demand; the same census charge).
+#[cfg(feature = "deltanet")]
+fn take_a_scratch(gpu: &mut Gpu, n64: usize) -> HipResult<Scratch> {
+    let mut slot = SCRATCH.with(|s| {
+        let mut slots = s.borrow_mut();
+        let index = slots.iter().position(|(device, _)| *device == gpu.device_id)?;
+        Some(slots.swap_remove(index).1)
+    });
+    if slot.as_ref().is_some_and(|s| s.rows < n64) {
+        let s = slot.take().unwrap();
+        gpu.free_tensor(s.a)?;
+        if let Some(ef) = s.ef {
+            gpu.free_tensor(ef)?;
+        }
+        if let Some(planes) = s.planes {
+            gpu.free_tensor(planes)?;
+        }
+    }
+    Ok(match slot {
+        Some(s) => s,
+        None => Scratch {
+            rows: n64,
+            a: gpu.zeros(
+                &[n64.checked_mul(A_ROW_BYTES).ok_or_else(|| {
+                    hip_bridge::HipError::new(0, "fn_gdn_dense stream: A scratch extent overflow")
+                })?],
+                DType::Raw,
+            )?,
+            ef: None,
+            planes: None,
+        },
+    })
+}
+
+/// Append `rows` rows of the dense scan to the layer's Scan64 stream at absolute `start_pos`.
+/// `qkv` is the F32 `[rows][channels]` pre-convolution projection, `alpha` / `beta` the raw F32
+/// `[rows][value_heads]` rows (rewritten in place by the prep), `scratch` the dead F32 plane the
+/// prepared F16 Q/K/V planes are staged in (>= `rows * channels * 2` bytes) and `output` the
+/// BF16 scan output `[rows][value_heads * 128]` the gate reads. Returns the candidate cursor;
+/// the caller commits it only after every layer of the forward succeeded.
+#[cfg(feature = "deltanet")]
+#[allow(clippy::too_many_arguments)]
+pub fn stream_append(
+    gpu: &mut Gpu,
+    plan: &crate::gdn_stream::GdnPrefillPlan,
+    meta: &crate::gdn_stream::GdnStreamMeta,
+    start_pos: u64,
+    rows: usize,
+    key_heads: usize,
+    value_heads: usize,
+    state: &GpuTensor,
+    residual: Option<&GpuTensor>,
+    conv_ring: &GpuTensor,
+    carry: &DenseStreamCarry<'_>,
+    model: &DenseStreamModel<'_>,
+    ws: &crate::gdn_stream::GdnStreamWorkspace,
+    qkv: &GpuTensor,
+    alpha: &GpuTensor,
+    beta: &GpuTensor,
+    scratch: &GpuTensor,
+    output: &GpuTensor,
+) -> HipResult<crate::gdn_stream::GdnStreamMeta> {
+    use crate::gdn_stream::{
+        GdnCarryView, GdnLiveState, GdnQ8Planes, GdnStreamConsts, GdnStreamPhase, GdnStreamRaw,
+        GdnStreamScratch,
+    };
+    let geometry = Geometry::of(key_heads, value_heads).ok_or_else(|| {
+        hip_bridge::HipError::new(0, "fn_gdn_dense stream: head geometry not admitted")
+    })?;
+    let v = stream_views(geometry, carry, model)?;
+    let channels = geometry.channels();
+    if scratch.byte_size() < rows * channels * 2 {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "fn_gdn_dense stream: prepared-plane scratch smaller than rows * channels * 2",
+        ));
+    }
+    if meta.phase == GdnStreamPhase::Sealed {
+        // The first append of a phase: the stream's authoritative ring is the live one.
+        stream_ring_convert(gpu, conv_ring, &v.live_ring, channels, start_pos, true)?;
+    }
+    stream_widen_consts(gpu, geometry, model)?;
+    let (codes, scales) = stream_planes(geometry, state, residual);
+    let n64 = rows.div_ceil(64) * 64;
+    let s = take_a_scratch(gpu, n64)?;
+    let (qk_bytes, v_bytes) = (rows * geometry.qk() * 2, rows * geometry.value_width() * 2);
+    let q = raw(scratch, 0, qk_bytes);
+    let k = raw(scratch, qk_bytes, qk_bytes);
+    let vv = raw(scratch, 2 * qk_bytes, v_bytes);
+    let out = raw(output, 0, rows * geometry.value_width() * 2);
+    let result = gpu.gdn_stream_append(
+        plan,
+        meta,
+        start_pos,
+        rows,
+        &GdnStreamConsts {
+            conv_weight: &v.conv_w,
+            dt_bias: &v.dt_bias,
+            a_log: &v.a_log,
+            q_scale: (128f32).sqrt().recip(),
+            eps: 1.0e-6,
+            n_key_heads: key_heads,
+            n_value_heads: value_heads,
+        },
+        &GdnStreamRaw { qkv, alpha, beta },
+        &GdnStreamScratch { q: &q, k: &k, v: &vv, a: &s.a },
+        &out,
+        &GdnLiveState {
+            planes: GdnQ8Planes { codes: &codes, scales: &scales, ef: residual },
+            conv: &v.live_ring,
+        },
+        &GdnCarryView {
+            tile_entry_f32: carry.tile_entry,
+            tile_entry_conv: &v.tile_ring,
+            pending_qkv: &v.pending_qkv,
+            pending_alpha: &v.alpha,
+            pending_beta: &v.beta,
+        },
+        ws,
+    );
+    SCRATCH.with(|c| c.borrow_mut().push((gpu.device_id, s)));
+    result
+}
+
+/// Seal an Open Scan64 stream once at the actual prompt end (finish the incomplete tile,
+/// quantize once) and hand the live Qwen4 convolution ring back at `meta.position`. A
+/// Sealed cursor is returned as is.
+#[cfg(feature = "deltanet")]
+#[allow(clippy::too_many_arguments)]
+pub fn stream_seal(
+    gpu: &mut Gpu,
+    plan: &crate::gdn_stream::GdnPrefillPlan,
+    meta: &crate::gdn_stream::GdnStreamMeta,
+    key_heads: usize,
+    value_heads: usize,
+    state: &GpuTensor,
+    residual: Option<&GpuTensor>,
+    conv_ring: &GpuTensor,
+    carry: &DenseStreamCarry<'_>,
+    model: &DenseStreamModel<'_>,
+    ws: &crate::gdn_stream::GdnStreamWorkspace,
+) -> HipResult<crate::gdn_stream::GdnStreamMeta> {
+    use crate::gdn_stream::{
+        GdnCarryView, GdnLiveState, GdnQ8Planes, GdnStreamConsts, GdnStreamPhase,
+    };
+    if meta.phase == GdnStreamPhase::Sealed {
+        return Ok(*meta);
+    }
+    let geometry = Geometry::of(key_heads, value_heads).ok_or_else(|| {
+        hip_bridge::HipError::new(0, "fn_gdn_dense stream: head geometry not admitted")
+    })?;
+    let v = stream_views(geometry, carry, model)?;
+    stream_widen_consts(gpu, geometry, model)?;
+    let (codes, scales) = stream_planes(geometry, state, residual);
+    let sealed = gpu.gdn_stream_seal(
+        plan,
+        meta,
+        &GdnStreamConsts {
+            conv_weight: &v.conv_w,
+            dt_bias: &v.dt_bias,
+            a_log: &v.a_log,
+            q_scale: (128f32).sqrt().recip(),
+            eps: 1.0e-6,
+            n_key_heads: key_heads,
+            n_value_heads: value_heads,
+        },
+        &GdnLiveState {
+            planes: GdnQ8Planes { codes: &codes, scales: &scales, ef: residual },
+            conv: &v.live_ring,
+        },
+        &GdnCarryView {
+            tile_entry_f32: carry.tile_entry,
+            tile_entry_conv: &v.tile_ring,
+            pending_qkv: &v.pending_qkv,
+            pending_alpha: &v.alpha,
+            pending_beta: &v.beta,
+        },
+        ws,
+    )?;
+    stream_ring_convert(gpu, conv_ring, &v.live_ring, geometry.channels(), meta.position, false)?;
+    Ok(sealed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

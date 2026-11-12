@@ -48,6 +48,7 @@ fn format_of(qsa: QsaKvFormat, gdn: GdnStateFormat) -> Qwen4StateFormat {
         gdn,
         qsa_f16_arena: false,
         qsa_pooled_bf16: false,
+        gdn_stream: crate::GdnStreamKind::None,
     }
 }
 

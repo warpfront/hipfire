@@ -289,9 +289,8 @@ pub fn session_snapshot_bytes(
     let part = |bytes: usize| bytes.checked_next_multiple_of(256);
     // A Q8Ef snapshot carries the plain Q8 slot and, with it, the real live F16
     // residual plane (restored verbatim; it is no longer zeroed on restore).
-    // The stream carry of a WY-capable device adds
-    // `Qwen4State::gdn_stream_allocation_sizes` parts per GDN layer, which the
-    // caller owning the arch decision charges.
+    // A carrying stream (`format.gdn_stream`: C16 WY on gfx11, dense C64 on gfx1201) adds its
+    // carry tensors to every snapshot (the Open phase's authoritative state).
     let gdn_storage = format.gdn.storage();
     let gdn_recurrent = gdn_storage.state_units(
         config.linear_num_value_heads,
@@ -317,7 +316,14 @@ pub fn session_snapshot_bytes(
     } else {
         0
     };
+    let mut carry = 0usize;
+    if format.gdn_stream != crate::GdnStreamKind::None {
+        for &(_, elements, dtype) in &crate::state::gdn_carry::carry_layer_specs(config, format.gdn_stream) {
+            carry = carry.checked_add(part(elements.checked_mul(dtype.size())?)?)?;
+        }
+    }
     let gdn = part(gdn_recurrent.checked_mul(gdn_storage.dtype().size())?)?
+        .checked_add(part(carry)?)?
         .checked_add(part(residual)?)?
         .checked_add(part(
             conv_channels
@@ -5111,7 +5117,17 @@ impl Qwen4Bundle {
         // The terminal fence of the ordinary-prefill phase: the real prompt end, once (never a
         // tile, session boundary or checkpoint), before decode/verify reads the live slot.
         let sealed = if result.is_ok() {
-            self.state.seal_gdn_streams(gpu).map_err(BundleError::State)
+            let weights = &self.weights;
+            self.state
+                .seal_gdn_streams(gpu, &|abs| {
+                    let gdn = weights.layer(abs)?.gdn.as_ref()?;
+                    Some(crate::state::gdn_carry::GdnSealWeights {
+                        conv: weights.resident(&gdn.conv).ok()?,
+                        a_log: weights.resident(&gdn.a_log).ok()?,
+                        dt_bias: weights.resident(&gdn.dt_bias).ok()?,
+                    })
+                })
+                .map_err(BundleError::State)
         } else {
             Ok(())
         };

@@ -22,11 +22,12 @@
 
 use super::*;
 use rdna_compute::gdn_stream::{
-    GdnPrefillPlan, GdnProjectionRecipe, GdnScanAlgorithm, GdnStateQuant, GdnStreamMeta,
-    GdnStreamPhase, GdnTensorFormat, GDN_COMMIT_ROWS, GDN_STREAM_SCHEMA_VERSION,
+    GdnAppendSchedule, GdnPrefillPlan, GdnProjectionRecipe, GdnScanAlgorithm, GdnStateQuant,
+    GdnStreamMeta, GdnStreamPhase, GdnStreamWorkspace, GdnTensorFormat, GDN_COMMIT_ROWS,
+    GDN_STREAM_SCHEMA_VERSION,
 };
 use rdna_compute::tensor_ops::gdn_wy_stream::{
-    wy_advance_meta, wy_carry_bytes, wy_stream_admitted, WY_TILE_ROWS,
+    wy_advance_meta, wy_stream_admitted, WY_TILE_ROWS,
 };
 
 /// Session metadata words one carrying GDN layer adds
@@ -64,26 +65,81 @@ impl GdnCarry {
     }
 }
 
-/// Shared per-state staging for the output/Z rows of a replayed tile
-/// (sequential layers reuse one); charged once per state, never copied by a
-/// snapshot.
-pub struct GdnEdge {
-    pub z: GpuTensor,
-    pub out: GpuTensor,
-    /// BF16 `[128]` gated-norm weight stand-in: the seal's replayed rows are
-    /// discarded, so only a valid address is read.
-    pub norm: GpuTensor,
+/// Which canonical scan stream serves a state's ordinary prefill (resolved once from static
+/// facts: architecture, flags, geometry, configured state quantization; never a row count).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GdnStreamKind {
+    /// The persistent / sequential recurrence (no carry: the FP32 accumulator continues).
+    None,
+    /// gfx11 C16 WY chunk scan.
+    Wy16,
+    /// gfx1201 dense C64 chunk scan (`fn_gdn_dense`).
+    Scan64,
 }
 
-/// The numerical recipe of a Qwen4 WY stream over `format`: algorithm, tile,
-/// seam, operand/output storage and state quantization. The projection
-/// recipe is the producer policy's (not resolved by the state): its fields
-/// stay zero until a producer plan fills them, and are part of the identity.
-pub(crate) fn gdn_stream_plan(format: GdnStateFormat) -> GdnPrefillPlan {
+/// The model weights the Scan64 seal replays an incomplete tile with (BF16 as stored).
+#[derive(Clone, Copy)]
+pub struct GdnSealWeights<'a> {
+    pub conv: &'a GpuTensor,
+    pub a_log: &'a GpuTensor,
+    pub dt_bias: &'a GpuTensor,
+}
+
+impl GdnEdge {
+    /// Release the staging (best effort, like every teardown path).
+    pub(crate) fn free(self, gpu: &mut Gpu) {
+        match self {
+            Self::Wy { z, out, norm } => {
+                for tensor in [norm, out, z] {
+                    let _ = gpu.free_tensor(tensor);
+                }
+            }
+            Self::Scan64 { consts, ws } => {
+                let _ = gpu.gdn_stream_workspace_free(ws);
+                let _ = gpu.free_tensor(consts);
+            }
+        }
+    }
+}
+
+impl GdnStreamKind {
+    pub const fn algorithm(self) -> Option<GdnScanAlgorithm> {
+        match self {
+            Self::None => None,
+            Self::Wy16 => Some(GdnScanAlgorithm::Wy16),
+            Self::Scan64 => Some(GdnScanAlgorithm::Scan64),
+        }
+    }
+}
+
+/// Shared per-state staging of a carrying state (charged once per state, never copied by a
+/// snapshot): the WY replay's output/Z rows, or the Scan64 executor's edge workspace and the
+/// widened model constants staging.
+pub enum GdnEdge {
+    Wy {
+        z: GpuTensor,
+        out: GpuTensor,
+        /// BF16 `[128]` gated-norm weight stand-in: the seal's replayed rows are
+        /// discarded, so only a valid address is read.
+        norm: GpuTensor,
+    },
+    Scan64 {
+        /// F32 widened conv weight / a_log / dt_bias of the layer being run.
+        consts: GpuTensor,
+        ws: GdnStreamWorkspace,
+    },
+}
+
+/// The numerical recipe of a Qwen4 stream of `kind` over `format`: algorithm, tile, seam,
+/// operand/output storage and state quantization. The projection recipe is the producer
+/// policy's (not resolved by the state): its fields stay zero until a producer plan fills
+/// them, and are part of the identity.
+pub(crate) fn gdn_stream_plan(kind: GdnStreamKind, format: GdnStateFormat) -> GdnPrefillPlan {
+    let algorithm = kind.algorithm().expect("a carrying stream kind");
     let mut plan = GdnPrefillPlan {
         recipe_id: 0,
-        algorithm: GdnScanAlgorithm::Wy16,
-        micro_rows: WY_TILE_ROWS,
+        algorithm,
+        micro_rows: algorithm.micro_rows(),
         commit_rows: match format {
             GdnStateFormat::F32 => 0,
             GdnStateFormat::Q8 | GdnStateFormat::Q8Ef => GDN_COMMIT_ROWS,
@@ -95,7 +151,10 @@ pub(crate) fn gdn_stream_plan(format: GdnStateFormat) -> GdnPrefillPlan {
             beta: 0,
             out: 0,
         },
-        scan_operand_format: GdnTensorFormat::Bf16,
+        scan_operand_format: match kind {
+            GdnStreamKind::Scan64 => GdnTensorFormat::F32,
+            _ => GdnTensorFormat::Bf16,
+        },
         scan_output_format: GdnTensorFormat::Bf16,
         state_quant: match format {
             GdnStateFormat::F32 => GdnStateQuant::F32,
@@ -108,70 +167,99 @@ pub(crate) fn gdn_stream_plan(format: GdnStateFormat) -> GdnPrefillPlan {
     plan
 }
 
-/// Resolve the stream plan from static facts only (architecture, flags,
-/// geometry, configured state quantization): `Some` exactly when the C16 WY
-/// scan serves ordinary prefill on this device. Never reads a row count or free
-/// memory. The dense C64 route (gfx1201, `fn_gdn_dense`) and the sequential
-/// persistent recurrence carry nothing here: C64 carry arrives with the C64
-/// edge executor (CHUNK-CANONICAL-DESIGN §3.3), the sequential route
-/// continues its own F32 accumulator.
-pub(crate) fn resolve_gdn_stream(
+/// Resolve the stream kind from static facts only (architecture, flags, geometry,
+/// configured state quantization). Never reads a row count or free memory.
+pub(crate) fn resolve_gdn_stream_kind(
     gpu: &Gpu,
     config: &Qwen4Config,
     format: GdnStateFormat,
-) -> Option<GdnPrefillPlan> {
-    wy_stream_admitted(
-        gpu,
-        config.linear_num_key_heads,
-        config.linear_num_value_heads,
-        config.linear_key_head_dim,
-        config.linear_value_head_dim,
-    )
-    .then(|| gdn_stream_plan(format))
+) -> GdnStreamKind {
+    let (hk, hv) = (config.linear_num_key_heads, config.linear_num_value_heads);
+    let (kd, vd) = (config.linear_key_head_dim, config.linear_value_head_dim);
+    if wy_stream_admitted(gpu, hk, hv, kd, vd) {
+        GdnStreamKind::Wy16
+    } else if rdna_compute::fn_gdn_dense::stream_admitted(gpu, format, hk, hv, kd, vd) {
+        GdnStreamKind::Scan64
+    } else {
+        GdnStreamKind::None
+    }
 }
 
-/// Per-layer carry bytes `(tile_entry, pending_conv, pending_params)` and the
-/// shared edge staging `(z, out)` bytes of `config`'s GDN geometry.
-pub(crate) fn carry_bytes(config: &Qwen4Config) -> (usize, usize, usize, usize) {
-    wy_carry_bytes(
-        config.linear_num_key_heads,
-        config.linear_num_value_heads,
-        config.linear_key_head_dim,
-        config.linear_value_head_dim,
-    )
+/// The stream recipe `kind` resolves for `format`, `None` without a carrying kind.
+pub(crate) fn resolve_gdn_stream(kind: GdnStreamKind, format: GdnStateFormat) -> Option<GdnPrefillPlan> {
+    kind.algorithm().map(|_| gdn_stream_plan(kind, format))
 }
 
 /// Allocation specs of one carrying GDN layer, in allocation order:
 /// `(name, elements, dtype)`.
-pub(crate) fn carry_layer_specs(config: &Qwen4Config) -> [(&'static str, usize, DType); 3] {
-    let qkv = 2 * config.linear_num_key_heads * config.linear_key_head_dim
-        + config.linear_num_value_heads * config.linear_value_head_dim;
-    [
-        (
-            "carry.tile_entry",
-            config.linear_num_value_heads
-                * config.linear_key_head_dim
-                * config.linear_value_head_dim,
-            DType::F32,
-        ),
-        ("carry.pending_conv", WY_TILE_ROWS * qkv, DType::BF16),
-        (
-            "carry.pending_params",
-            2 * WY_TILE_ROWS * config.linear_num_value_heads,
-            DType::F32,
-        ),
-    ]
+pub(crate) fn carry_layer_specs(
+    config: &Qwen4Config,
+    kind: GdnStreamKind,
+) -> [(&'static str, usize, DType); 3] {
+    let state = config.linear_num_value_heads
+        * config.linear_key_head_dim
+        * config.linear_value_head_dim;
+    match kind {
+        GdnStreamKind::Scan64 => {
+            let (conv, params) = rdna_compute::fn_gdn_dense::stream_carry_elems(
+                config.linear_num_key_heads,
+                config.linear_num_value_heads,
+            );
+            [
+                ("carry.tile_entry", state, DType::F32),
+                ("carry.conv", conv, DType::F32),
+                ("carry.params", params, DType::F32),
+            ]
+        }
+        _ => {
+            let qkv = 2 * config.linear_num_key_heads * config.linear_key_head_dim
+                + config.linear_num_value_heads * config.linear_value_head_dim;
+            [
+                ("carry.tile_entry", state, DType::F32),
+                ("carry.pending_conv", WY_TILE_ROWS * qkv, DType::BF16),
+                (
+                    "carry.pending_params",
+                    2 * WY_TILE_ROWS * config.linear_num_value_heads,
+                    DType::F32,
+                ),
+            ]
+        }
+    }
 }
 
-/// Allocation specs of the shared edge staging: `(name, elements, dtype)`.
-pub(crate) fn edge_specs(config: &Qwen4Config) -> [(&'static str, usize, DType); 3] {
-    let stage =
-        WY_TILE_ROWS * config.linear_num_value_heads * config.linear_value_head_dim;
-    [
-        ("gdn_edge.z", stage, DType::F32),
-        ("gdn_edge.out", stage, DType::F32),
-        ("gdn_edge.norm", config.linear_value_head_dim, DType::BF16),
-    ]
+/// Allocation specs of the shared edge staging of `kind` (the Scan64 workspace is allocated
+/// by [`Gpu::gdn_stream_workspace_alloc`], its bytes counted by [`scan64_workspace_bytes`]):
+/// `(name, elements, dtype)`.
+pub(crate) fn edge_specs(config: &Qwen4Config, kind: GdnStreamKind) -> Vec<(&'static str, usize, DType)> {
+    match kind {
+        GdnStreamKind::Scan64 => vec![(
+            "gdn_edge.consts",
+            rdna_compute::fn_gdn_dense::stream_consts_elems(
+                config.linear_num_key_heads,
+                config.linear_num_value_heads,
+            ),
+            DType::F32,
+        )],
+        _ => {
+            let stage =
+                WY_TILE_ROWS * config.linear_num_value_heads * config.linear_value_head_dim;
+            vec![
+                ("gdn_edge.z", stage, DType::F32),
+                ("gdn_edge.out", stage, DType::F32),
+                ("gdn_edge.norm", config.linear_value_head_dim, DType::BF16),
+            ]
+        }
+    }
+}
+
+/// Device bytes of each plane of the Scan64 executor's edge workspace of `config`'s geometry
+/// (BF16 scan output), in [`Gpu::gdn_stream_workspace_alloc`]'s allocation order.
+pub(crate) fn scan64_workspace_plane_bytes(config: &Qwen4Config) -> [usize; 9] {
+    rdna_compute::gdn_stream::stream_workspace_plane_bytes(
+        config.linear_num_key_heads,
+        config.linear_num_value_heads,
+        2,
+    )
 }
 
 /// A freshly reset / never-opened cursor.
@@ -265,11 +353,35 @@ pub(crate) fn meta_after(
             GdnStreamPhase::Sealed => sealed_cursor(plan, position, entry.owner_generation),
         };
     }
-    wy_advance_meta(
-        entry,
-        plan.recipe_id,
-        entry_position,
-        position - entry_position,
-        plan.state_quant != GdnStateQuant::F32,
-    )
+    match plan.algorithm {
+        GdnScanAlgorithm::Scan64 => {
+            // The Scan64 executor's schedule is the shared pure arithmetic over the cursor;
+            // a Sealed entry opens at `entry_position`.
+            let from = match entry.phase {
+                GdnStreamPhase::Open => entry,
+                GdnStreamPhase::Sealed => GdnStreamMeta {
+                    recipe_id: plan.recipe_id,
+                    ..GdnStreamMeta::sealed_at(entry_position, entry.owner_generation)
+                },
+            };
+            GdnAppendSchedule::new(
+                &from,
+                entry_position,
+                (position - entry_position) as usize,
+                plan.micro_rows,
+                plan.commit_rows.max(1),
+            )
+            .map_or(from, |schedule| GdnStreamMeta {
+                recipe_id: plan.recipe_id,
+                ..schedule.meta
+            })
+        }
+        _ => wy_advance_meta(
+            entry,
+            plan.recipe_id,
+            entry_position,
+            position - entry_position,
+            plan.state_quant != GdnStateQuant::F32,
+        ),
+    }
 }
