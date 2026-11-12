@@ -417,6 +417,8 @@
     "crates/rdna-compute/src/gemma4_ext.rs::gemv_q8_0_moe_down_residual_scaled_k8_indexed": "`#[cfg(any())]` duplicate of the live gemma4 launcher in gemm.rs; never compiled"
   },
   "non_launching": {
+    "crates/rdna-compute/src/cdna/gfx942.rs::g942_gdn_lanes_ensure": "GDN lanes module loader (ensure_kernel or ensure_embedded_kernel) only; never launches. The owner qwen4_gdn_lanes_step_f32 method contains the required independently checked live blob site.",
+    "crates/rdna-compute/src/cdna/gfx942_qsa_lanes.rs::g942_qsa_lanes_ensure": "QSA lanes module loader (ensure_kernel or ensure_embedded_kernel) only; never launches. All five required blob launch sites remain checked in qwen4_qsa_lanes_core; no symbol is exempted from live launch coverage.",
     "crates/rdna-compute/src/cdna/gfx942.rs::g942_wide_ensure": "wide module loader: ensure_kernel or ensure_embedded_kernel only, never launches; gemm_bf16_mfma_gfx942_wide calls it and its actual params/blob site checks all three returned entry names",
     "crates/rdna-compute/src/cdna/gfx942.rs::wide_entry": "pure WIDE_ENTRIES selector returning the symbol, tile rows and chunk size; never launches or loads; gemm_bf16_mfma_gfx942_wide consumes the returned symbol at its checked live launch site",
     "crates/rdna-compute/src/cdna/gfx942.rs::fp8b128_moe_grouped_build_identity": "records the JIT build identity (source/object hashes) of the FP8 MoE module; compiles, never launches",
