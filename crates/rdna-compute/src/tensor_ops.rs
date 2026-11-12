@@ -1099,6 +1099,15 @@ pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) ->
     )
 }
 
+/// Load `kernel` from the `tensor_ops` module itself and return it, whatever the arch routes
+/// the public launchers to: the byte-compare REFERENCE of the exact-gfx942 verify-module oracle
+/// cases (`gdn_capture_f32_gfx942_oracle`), which launch the `tensor_ops` convolution and
+/// gated-norm kernels directly through [`Gpu::launch_kernel_blob`].
+#[doc(hidden)]
+pub fn lab_ensure_tensor_ops_kernel(gpu: &mut Gpu, kernel: &str) -> HipResult<()> {
+    gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)
+}
+
 /// Single-launch rollback kernel of a state's STORAGE format. Q8Ef has no
 /// single-launch kernel: its rollback must carry the residual and runs
 /// [`gated_delta_rollback_layers_ef`] instead.

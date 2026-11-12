@@ -532,6 +532,327 @@ fn run_lanes_case(
     ok
 }
 
+/// Which arm the verify-module entries run on: the `HIPFIRE_QWEN4_G942_GDN_VERIFY_IMAGE` code
+/// object when the hook is set, else the hipcc source of module `qwen4_g942_gdn_verify`.
+fn verify_arm() -> String {
+    match std::env::var("HIPFIRE_QWEN4_G942_GDN_VERIFY_IMAGE") {
+        Ok(path) if !path.is_empty() => format!("image {path}"),
+        _ => "source (hipcc, module qwen4_g942_gdn_verify)".to_string(),
+    }
+}
+
+fn bf16_bits(x: f32) -> u16 {
+    let u = x.to_bits();
+    ((u.wrapping_add(0x7fff + ((u >> 16) & 1))) >> 16) as u16
+}
+
+fn rand_bf16(rng: &mut Rng, n: usize, lo: f32, hi: f32) -> Vec<u16> {
+    (0..n).map(|_| bf16_bits(rng.range(lo, hi))).collect()
+}
+
+fn htod_u16(gpu: &Gpu, tensor: &GpuTensor, data: &[u16]) {
+    let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2) };
+    gpu.bind_thread().expect("bind");
+    gpu.hip.memcpy_htod(&tensor.buf, bytes).expect("htod");
+}
+
+/// The verify module's convolution + gate-parameter kernel (`qwen4_g942_gdn_verify_conv_params_k4`,
+/// through `gated_delta_conv_params_batched`, on the arm [`verify_arm`] names) against the
+/// `tensor_ops` JIT kernel it copies (`gated_delta_conv_bf16_f32_batched_k4`, launched directly):
+/// the convolution output rows, the next history ring, and the gate / beta parameter rows, word
+/// for word, once with separate history / next-history buffers and once with them aliased (the
+/// production call). Controls: a flipped output bit and the candidate at the next ring cursor.
+fn run_conv_case(gpu: &mut Gpu, rows: usize, cursor: usize, controls: bool, seed: u64) -> bool {
+    use hip_bridge::KernargBlob;
+    use rdna_compute::tensor_ops::{
+        gated_delta_conv_params_batched, lab_ensure_tensor_ops_kernel, GatedDeltaConvBatched,
+        GatedDeltaParamsBatched,
+    };
+    const KERNEL: &str = "gated_delta_conv_bf16_f32_batched_k4";
+    let arm = verify_arm();
+    let mut rng = Rng(seed ^ ((rows as u64) << 36) ^ ((cursor as u64) << 52) ^ 0xC0DE);
+    let mut ok = true;
+    let mut report = |what: &str, good: bool, detail: String| {
+        if !good {
+            ok = false;
+        }
+        println!(
+            "[conv_params_k4 rows={rows} cursor={cursor}] [arm: {arm}] {what}: {detail} => {}",
+            if good { "ok" } else { "MISMATCH" }
+        );
+    };
+    let channels = QKV;
+    let heads = NV;
+    let input = rand_vec(&mut rng, rows * channels, -2.0, 2.0);
+    let weight = rand_bf16(&mut rng, channels * 4, -1.0, 1.0);
+    let history = rand_vec(&mut rng, 3 * channels, -2.0, 2.0);
+    let a = rand_vec(&mut rng, rows * heads, -3.0, 3.0);
+    let b = rand_vec(&mut rng, rows * heads, -3.0, 3.0);
+    let a_log = rand_bf16(&mut rng, heads, -1.0, 1.0);
+    let dt_bias = rand_bf16(&mut rng, heads, -1.0, 1.0);
+    let sentinel = f32::from_bits(0xFFFF_FFFF);
+    let t_input = gpu.upload_f32(&input, &[rows * channels]).unwrap();
+    let t_weight = gpu.zeros(&[channels * 4], DType::BF16).unwrap();
+    htod_u16(gpu, &t_weight, &weight);
+    let t_a = gpu.upload_f32(&a, &[rows * heads]).unwrap();
+    let t_b = gpu.upload_f32(&b, &[rows * heads]).unwrap();
+    let t_a_log = gpu.zeros(&[heads], DType::BF16).unwrap();
+    htod_u16(gpu, &t_a_log, &a_log);
+    let t_dt = gpu.zeros(&[heads], DType::BF16).unwrap();
+    htod_u16(gpu, &t_dt, &dt_bias);
+    lab_ensure_tensor_ops_kernel(gpu, KERNEL).expect("tensor_ops kernel");
+    let conv_blocks = channels.div_ceil(256);
+    let grid = conv_blocks * rows.div_ceil(16) + (rows * heads).div_ceil(256);
+    // One arm pair per history layout: (ref, cand) with `alias` = history IS next_history.
+    let mut candidate_out: Option<Vec<f32>> = None;
+    let mut reference_out: Option<Vec<f32>> = None;
+    for alias in [false, true] {
+        let mk = |gpu: &mut Gpu| {
+            let hist = gpu.upload_f32(&history, &[3 * channels]).unwrap();
+            let next = if alias {
+                None
+            } else {
+                Some(gpu.upload_f32(&vec![sentinel; 3 * channels], &[3 * channels]).unwrap())
+            };
+            let out = gpu.upload_f32(&vec![sentinel; rows * channels], &[rows * channels]).unwrap();
+            let gate = gpu.upload_f32(&vec![sentinel; rows * heads], &[rows * heads]).unwrap();
+            let beta = gpu.upload_f32(&vec![sentinel; rows * heads], &[rows * heads]).unwrap();
+            (hist, next, out, gate, beta)
+        };
+        let (r_hist, r_next, r_out, r_gate, r_beta) = mk(gpu);
+        let (c_hist, c_next, c_out, c_gate, c_beta) = mk(gpu);
+        // Reference: the tensor_ops kernel, launched directly.
+        let r_next_t = r_next.as_ref().unwrap_or(&r_hist);
+        let mut args = KernargBlob::new();
+        for t in [&t_input, &t_weight, &r_hist, &r_out, r_next_t] {
+            args.push_ptr(t.buf.as_ptr());
+        }
+        for v in [rows as i32, channels as i32, 3, 4, cursor as i32, 0, 0] {
+            args.push_i32(v);
+        }
+        for t in [&t_a, &t_b, &t_a_log, &t_dt, &r_gate, &r_beta] {
+            args.push_ptr(t.buf.as_ptr());
+        }
+        args.push_i32((rows * heads) as i32);
+        args.push_i32(heads as i32);
+        args.pad_to(16);
+        gpu.launch_kernel_blob(KERNEL, [grid as u32, 1, 1], [256, 1, 1], 0, args.as_mut_slice())
+            .expect("reference launch");
+        // Candidate: the public launcher (verify module on gfx942).
+        let c_next_t = c_next.as_ref().unwrap_or(&c_hist);
+        let run_cand = |gpu: &mut Gpu, start_cursor: usize| {
+            gated_delta_conv_params_batched(
+                gpu,
+                &GatedDeltaConvBatched {
+                    input: &t_input,
+                    kernel: &t_weight,
+                    history: &c_hist,
+                    output: &c_out,
+                    next_history: c_next_t,
+                    rows,
+                    channels,
+                    history_rows: 3,
+                    kernel_size: 4,
+                    start_cursor,
+                },
+                &GatedDeltaParamsBatched {
+                    a: &t_a,
+                    b: &t_b,
+                    a_log: &t_a_log,
+                    dt_bias: &t_dt,
+                    gate: &c_gate,
+                    beta: &c_beta,
+                    rows,
+                    heads,
+                },
+            )
+            .expect("candidate launch");
+        };
+        run_cand(gpu, cursor);
+        gpu.hip.device_synchronize().expect("sync");
+        let diff = |gpu: &Gpu, r: &GpuTensor, c: &GpuTensor| word_diff(&dtoh(gpu, r), &dtoh(gpu, c));
+        let (d_out, f_out) = diff(gpu, &r_out, &c_out);
+        let (d_next, f_next) = diff(gpu, r_next_t, c_next_t);
+        let (d_gate, _) = diff(gpu, &r_gate, &c_gate);
+        let (d_beta, _) = diff(gpu, &r_beta, &c_beta);
+        let written = dtoh(gpu, &r_out)
+            .iter()
+            .filter(|w| w.to_bits() != 0xFFFF_FFFF)
+            .count();
+        report(
+            &format!("{} history vs tensor_ops kernel", if alias { "aliased" } else { "separate" }),
+            d_out == 0 && d_next == 0 && d_gate == 0 && d_beta == 0 && written == rows * channels,
+            format!(
+                "output diff words {d_out} (first {f_out:?}), next-history diff words {d_next} \
+                 (first {f_next:?}), gate diff {d_gate}, beta diff {d_beta}, output words written \
+                 {written}/{}",
+                rows * channels
+            ),
+        );
+        if controls && !alias {
+            let mut bad = dtoh(gpu, &c_out);
+            bad[rows * channels - 1] = f32::from_bits(bad[rows * channels - 1].to_bits() ^ 1);
+            let d = word_diff(&dtoh(gpu, &r_out), &bad).0;
+            report("control: flipped output bit", d == 1, format!("diff words {d}"));
+            // The candidate at the next ring cursor: its history reads / tail ring differ.
+            let (w_hist, w_next, w_out, w_gate, w_beta) = mk(gpu);
+            let w_next_t = w_next.as_ref().unwrap_or(&w_hist);
+            gated_delta_conv_params_batched(
+                gpu,
+                &GatedDeltaConvBatched {
+                    input: &t_input,
+                    kernel: &t_weight,
+                    history: &w_hist,
+                    output: &w_out,
+                    next_history: w_next_t,
+                    rows,
+                    channels,
+                    history_rows: 3,
+                    kernel_size: 4,
+                    start_cursor: (cursor + 1) % 3,
+                },
+                &GatedDeltaParamsBatched {
+                    a: &t_a,
+                    b: &t_b,
+                    a_log: &t_a_log,
+                    dt_bias: &t_dt,
+                    gate: &w_gate,
+                    beta: &w_beta,
+                    rows,
+                    heads,
+                },
+            )
+            .expect("wrong-cursor launch");
+            gpu.hip.device_synchronize().expect("sync");
+            let d = word_diff(&dtoh(gpu, &r_next_t.sub_offset(0, 3 * channels)), &dtoh(gpu, w_next_t)).0
+                + word_diff(&dtoh(gpu, &r_out), &dtoh(gpu, &w_out)).0;
+            report("control: candidate at the wrong ring cursor", d > 0, format!("diff words {d}"));
+            for t in [w_hist, w_out, w_gate, w_beta].into_iter().chain(w_next) {
+                gpu.free_tensor(t).ok();
+            }
+        }
+        candidate_out.get_or_insert_with(|| dtoh(gpu, &c_out));
+        reference_out.get_or_insert_with(|| dtoh(gpu, &r_out));
+        for t in [r_hist, r_out, r_gate, r_beta, c_hist, c_out, c_gate, c_beta]
+            .into_iter()
+            .chain(r_next)
+            .chain(c_next)
+        {
+            gpu.free_tensor(t).ok();
+        }
+    }
+    for t in [t_input, t_weight, t_a, t_b, t_a_log, t_dt] {
+        gpu.free_tensor(t).ok();
+    }
+    ok
+}
+
+/// The verify module's gated norm (`qwen4_g942_gdn_verify_gate_batched`, through
+/// `gated_delta_gate_batched`, on the arm [`verify_arm`] names) against the `tensor_ops` JIT kernel
+/// it copies (`gated_delta_gate_bf16_f32_batched`, launched directly): the gated output and the
+/// in-place BF16-rounded recurrent rows, word for word; controls as the convolution cases.
+fn run_gate_case(gpu: &mut Gpu, rows: usize, controls: bool, seed: u64) -> bool {
+    use hip_bridge::KernargBlob;
+    use rdna_compute::tensor_ops::{
+        gated_delta_gate_batched, lab_ensure_tensor_ops_kernel, GatedDeltaGateBatched,
+    };
+    const KERNEL: &str = "gated_delta_gate_bf16_f32_batched";
+    let arm = verify_arm();
+    let mut rng = Rng(seed ^ ((rows as u64) << 36) ^ 0x6A7E);
+    let mut ok = true;
+    let mut report = |what: &str, good: bool, detail: String| {
+        if !good {
+            ok = false;
+        }
+        println!(
+            "[gate_batched rows={rows}] [arm: {arm}] {what}: {detail} => {}",
+            if good { "ok" } else { "MISMATCH" }
+        );
+    };
+    let n = rows * VALUE;
+    let recurrent = rand_vec(&mut rng, n, -3.0, 3.0);
+    let z = rand_vec(&mut rng, n, -3.0, 3.0);
+    let norm = rand_bf16(&mut rng, 128, 0.2, 2.0);
+    let sentinel = vec![f32::from_bits(0xFFFF_FFFF); n];
+    let t_z = gpu.upload_f32(&z, &[n]).unwrap();
+    let t_norm = gpu.zeros(&[128], DType::BF16).unwrap();
+    htod_u16(gpu, &t_norm, &norm);
+    let r_rec = gpu.upload_f32(&recurrent, &[n]).unwrap();
+    let c_rec = gpu.upload_f32(&recurrent, &[n]).unwrap();
+    let r_out = gpu.upload_f32(&sentinel, &[n]).unwrap();
+    let c_out = gpu.upload_f32(&sentinel, &[n]).unwrap();
+    lab_ensure_tensor_ops_kernel(gpu, KERNEL).expect("tensor_ops kernel");
+    let mut args = KernargBlob::new();
+    for t in [&r_rec, &t_z, &t_norm, &r_out] {
+        args.push_ptr(t.buf.as_ptr());
+    }
+    for v in [rows as i32, NV as i32, 128] {
+        args.push_i32(v);
+    }
+    args.pad_to(16);
+    gpu.launch_kernel_blob(KERNEL, [(rows * NV) as u32, 1, 1], [32, 1, 1], 0, args.as_mut_slice())
+        .expect("reference launch");
+    gated_delta_gate_batched(
+        gpu,
+        &GatedDeltaGateBatched {
+            recurrent_output: &c_rec,
+            z: &t_z,
+            norm: &t_norm,
+            output: &c_out,
+            rows,
+            value_heads: NV,
+            value_dim: 128,
+        },
+    )
+    .expect("candidate launch");
+    gpu.hip.device_synchronize().expect("sync");
+    let (d_out, f_out) = word_diff(&dtoh(gpu, &r_out), &dtoh(gpu, &c_out));
+    let (d_rec, f_rec) = word_diff(&dtoh(gpu, &r_rec), &dtoh(gpu, &c_rec));
+    let moved = word_diff(&recurrent, &dtoh(gpu, &r_rec)).0;
+    let written = dtoh(gpu, &r_out).iter().filter(|w| w.to_bits() != 0xFFFF_FFFF).count();
+    report(
+        "gated norm vs tensor_ops kernel",
+        d_out == 0 && d_rec == 0 && written == n && moved > 0,
+        format!(
+            "output diff words {d_out} (first {f_out:?}), recurrent diff words {d_rec} (first \
+             {f_rec:?}), output words written {written}/{n}, recurrent rows rounded {moved}"
+        ),
+    );
+    if controls {
+        let mut bad = dtoh(gpu, &c_out);
+        bad[n - 1] = f32::from_bits(bad[n - 1].to_bits() ^ 1);
+        let d = word_diff(&dtoh(gpu, &r_out), &bad).0;
+        report("control: flipped output bit", d == 1, format!("diff words {d}"));
+        // The candidate with a different z row: its output must differ from the reference.
+        let t_z2 = gpu.upload_f32(&rand_vec(&mut rng, n, -3.0, 3.0), &[n]).unwrap();
+        let w_rec = gpu.upload_f32(&recurrent, &[n]).unwrap();
+        let w_out = gpu.upload_f32(&sentinel, &[n]).unwrap();
+        gated_delta_gate_batched(
+            gpu,
+            &GatedDeltaGateBatched {
+                recurrent_output: &w_rec,
+                z: &t_z2,
+                norm: &t_norm,
+                output: &w_out,
+                rows,
+                value_heads: NV,
+                value_dim: 128,
+            },
+        )
+        .expect("wrong-z launch");
+        gpu.hip.device_synchronize().expect("sync");
+        let d = word_diff(&dtoh(gpu, &r_out), &dtoh(gpu, &w_out)).0;
+        report("control: candidate on another z", d > 0, format!("diff words {d}"));
+        for t in [t_z2, w_rec, w_out] {
+            gpu.free_tensor(t).ok();
+        }
+    }
+    for t in [t_z, t_norm, r_rec, c_rec, r_out, c_out] {
+        gpu.free_tensor(t).ok();
+    }
+    ok
+}
+
 fn main() {
     let mut rows_list = vec![2usize, 3, 4, 8];
     let mut lanes_list = vec![1usize, 2, 8, 33];
@@ -603,6 +924,8 @@ fn main() {
         }
     }
     println!("candidate route: {}", images.join("; "));
+    let conv_rows = [1usize, 2, 3, 4, 8, 16, 17];
+    let gate_rows = [1usize, 2, 4, 8];
     let mut all = true;
     for &rows in &rows_list {
         all &= run_case(&mut gpu, rows, steps, controls, seed);
@@ -611,6 +934,14 @@ fn main() {
         for &lanes in &lanes_list {
             all &= run_lanes_case(&mut gpu, lanes, rows, steps, controls, seed);
         }
+    }
+    for &rows in &conv_rows {
+        for cursor in 0..3 {
+            all &= run_conv_case(&mut gpu, rows, cursor, controls, seed);
+        }
+    }
+    for &rows in &gate_rows {
+        all &= run_gate_case(&mut gpu, rows, controls, seed);
     }
     println!(
         "gdn_capture_f32_gfx942_oracle: {} [route: {}]",
