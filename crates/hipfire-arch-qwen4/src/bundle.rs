@@ -2369,6 +2369,15 @@ impl Qwen4Bundle {
             .or_else(|| self.pp_band.as_ref().map(|band| band.chunk()))
     }
 
+    /// Rows the resident spec hidden buffer holds (the wide-hidden capture of a prompt chunk or
+    /// a prefill wave that holds an MTP lane); 0 before the buffer exists.
+    pub(crate) fn spec_hidden_rows(&self) -> usize {
+        let width = self.config.hc_count * self.config.hidden_size;
+        self.spec_hidden
+            .as_ref()
+            .map_or(0, |hidden| hidden.numel() / width.max(1))
+    }
+
     /// A whole-prompt entry begins (see [`Qwen4GpuForward::share_prompt_begin`]):
     /// drivers that issue several forward calls for one prompt bracket their
     /// loop so decode-share finishes the prompt once, after its last tile.
