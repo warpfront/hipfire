@@ -16836,10 +16836,13 @@ impl Qwen4GpuForward {
             }
         }
         // Partial mask (`HIPFIRE_QWEN4_EP_TRUNK_SHARD_PMASK`): the shard's wide chunk on a
-        // layer the owner-routed route admits masks the non-owned tiles, no exchange.
+        // layer the owner-routed route admits masks the non-owned tiles, no exchange. Admitted
+        // at the call's real extent or under the ordinary-prefill intent
+        // (`ep_reserve_forward::ep_partial_mask_active`): the intent's canonical route rows
+        // make every chunk, a 25-row tail included, take the grouped arm the 8192-row chunk takes.
         let partial_mask_route = tile_route.filter(|_| {
             trunk_partial_mask_on(trunk_chunk_partial, trunk_shard_pmask_env_on())
-                && ep_reserve_forward::ep_tile_active(ep, gpu, &config, n, route_n)
+                && ep_reserve_forward::ep_partial_mask_active(ep, gpu, &config, n, route_n)
         });
         let partial_mask_exchange: Option<PartialMaskExchange<'_>> = partial_mask_route
             .and_then(|route| route.hook.as_deref())
@@ -16874,15 +16877,21 @@ impl Qwen4GpuForward {
         // (`trunk_route::sp_rows_in_band`): at least `SP_MIN_ROWS`, or the sub-512 band
         // (`HIPFIRE_QWEN4_EP_SP_SUB512`, default on, `0` kills) of `SP_SUB512_MIN_ROWS`..=511 rows
         // when the HC read of the whole chunk and of both halves is the row-count-invariant
-        // prefill lane WMMA entry.
+        // prefill lane WMMA entry. Under the ordinary-prefill intent (`gpu.ordinary_prefill_active()`:
+        // every row-keyed route is canonical for any launch extent, `route_n` is the canonical
+        // chunk) the band is every chunk of `SP_SUB512_MIN_ROWS`.. rows (same sub-512 switch), with
+        // no lane WMMA check and no `route_n == n` requirement
+        // (`trunk_route::routes_at_real_extent`).
+        let ordinary_intent = gpu.ordinary_prefill_active();
         let sp_rows = crate::trunk_route::sp_rows(n).filter(|_| {
             ep.is_some()
                 && trunk_chunk_partial
                 && self.prefill_scope
-                && crate::trunk_route::sp_chunk_rows_in_band(n)
+                && crate::trunk_route::sp_chunk_rows_in_band(n, ordinary_intent)
                 && (n >= crate::trunk_route::SP_MIN_ROWS
+                    || ordinary_intent
                     || (gpu.prefill_lwmma_hc_applies(n / 2) && gpu.prefill_lwmma_hc_applies(n)))
-                && route_n == n
+                && crate::trunk_route::routes_at_real_extent(n, route_n, ordinary_intent)
         });
         let sp_views: Option<SpViews> = match (sp_rows, crate::trunk_route::sp_route()) {
             (Some(rows), Some(route)) => {
@@ -16915,8 +16924,9 @@ impl Qwen4GpuForward {
                             std::sync::atomic::AtomicBool::new(false);
                         if !NOTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                             eprintln!(
-                                "  qwen4 EP sequence-parallel prefill (HIPFIRE_QWEN4_EP_SEQ_PARALLEL, =0 restores the all-reduce route): chunks of >= {} rows, and of {}..=511 rows on the prefill lane WMMA HC read (HIPFIRE_QWEN4_EP_SP_SUB512, =0 keeps those on the all-reduce route), split their rows across the two ranks (reduce-scatter HC write, row all-gather)",
+                                "  qwen4 EP sequence-parallel prefill (HIPFIRE_QWEN4_EP_SEQ_PARALLEL, =0 restores the all-reduce route): chunks of >= {} rows, and of {}..=511 rows on the prefill lane WMMA HC read ({}.. rows under the ordinary-prefill intent) (HIPFIRE_QWEN4_EP_SP_SUB512, =0 keeps those on the all-reduce route), split their rows across the two ranks (reduce-scatter HC write, row all-gather)",
                                 crate::trunk_route::SP_MIN_ROWS,
+                                crate::trunk_route::SP_SUB512_MIN_ROWS,
                                 crate::trunk_route::SP_SUB512_MIN_ROWS
                             );
                         }

@@ -278,8 +278,47 @@ pub(super) fn exchange_max_tiles(capacity: &EpExchangeCapacity, hidden: usize) -
 /// Whether a call of `n` rows on `ep` takes the owner-routed tile exchange:
 /// `forward_chunk_scoped` and the reserve bank switch share this one predicate
 /// so the bank is chosen from the same decision the forward then executes.
-/// `route_n` is the routing row count under the call's routing scopes.
+/// `route_n` is the routing row count under the call's routing scopes. The exchange runs only
+/// at the call's real extent (`route_n == n`), as it always has: a scope that substitutes the
+/// count, the ordinary prefill intent included, keeps the call on the full-table route. The
+/// trunk shard's mask-only route has its own extent rule ([`ep_partial_mask_active`]).
 pub(super) fn ep_tile_active(
+    ep: Option<&Qwen4ForwardEp>,
+    gpu: &Gpu,
+    config: &Qwen4Config,
+    n: usize,
+    route_n: usize,
+) -> bool {
+    route_n == n && ep_tile_route_admits(ep, gpu, config, n, route_n)
+}
+
+/// Whether a trunk-shard partial chunk of `n` rows (`route_n` routing rows) masks the non-owned
+/// experts' tiles out of its grouped launches (the partial tile mask, mask-only: no exchange):
+/// the owner-routed route's own admission ([`ep_tile_route_admits`]: hook installed, not a
+/// few-row window, the symmetric IU4 / F16 WMMA grouped arm at `route_n`) at the call's real
+/// extent OR under the ordinary-prefill intent ([`crate::trunk_route::routes_at_real_extent`]).
+/// A masked tile reads as the exact +0 rows the zero-dummy table wrote, so the mask is byte-exact
+/// against the unmasked partial route. Decided from `n`, `route_n`, the intent and load-time
+/// facts only, so both ranks agree. `forward_chunk_scoped` is the only executor; the reserve bank
+/// choice needs no copy of it: the partial chunk takes the borrowed bank's tile-exchange route
+/// masked or not ([`ep_wide_bank_route`]). Callers evaluate it under the call's tile scopes
+/// ([`Qwen4GpuForward::enter_tile_scopes`]), where `gpu.ordinary_prefill_active()` is the intent
+/// the forward runs in.
+pub(super) fn ep_partial_mask_active(
+    ep: Option<&Qwen4ForwardEp>,
+    gpu: &Gpu,
+    config: &Qwen4Config,
+    n: usize,
+    route_n: usize,
+) -> bool {
+    crate::trunk_route::routes_at_real_extent(n, route_n, gpu.ordinary_prefill_active())
+        && ep_tile_route_admits(ep, gpu, config, n, route_n)
+}
+
+/// The owner-routed tile route's admission without the extent rule: an installed tile route with
+/// its hook, a routing row count above one that is not a few-row window, and the symmetric IU4
+/// (gfx1201) or F16 WMMA grouped (gfx1100) arm at `route_n`.
+fn ep_tile_route_admits(
     ep: Option<&Qwen4ForwardEp>,
     gpu: &Gpu,
     config: &Qwen4Config,
@@ -295,16 +334,15 @@ pub(super) fn ep_tile_active(
     else {
         return false;
     };
-    route_n == n
-        && if route.wmma {
-            gpu.qwen4_moe_f16_wmma_grouped_applies(
-                route_n,
-                config.moe_intermediate_size,
-                config.hidden_size,
-            )
-        } else {
-            gpu.qwen4_moe_sym_iu4_applies(route_n)
-        }
+    if route.wmma {
+        gpu.qwen4_moe_f16_wmma_grouped_applies(
+            route_n,
+            config.moe_intermediate_size,
+            config.hidden_size,
+        )
+    } else {
+        gpu.qwen4_moe_sym_iu4_applies(route_n)
+    }
 }
 
 /// Whether a call of `n` rows (`route_n` routing rows) on an EP forward takes the trunk-shard
@@ -1620,7 +1658,10 @@ impl Qwen4GpuForward {
             reserve.banks.resident_call_limit()
         };
         let route = if n > resident_rows {
-            // The same decision `forward_chunk_scoped` takes, under the same scopes.
+            // The same decision `forward_chunk_scoped` takes, under the same scopes (the
+            // ordinary-prefill intent included: `enter_tile_scopes` opens it exactly as the
+            // forward's own entry does). A partial chunk borrows the TileExchange bank whether
+            // or not it masks (`ep_partial_mask_active`), so the mask needs no copy here.
             let (scopes, _) = self.enter_tile_scopes(gpu, n);
             let route_n = gpu.route_rows(n);
             let tile = ep_tile_active(self.ep.as_ref(), gpu, &bundle.config, n, route_n);
@@ -2844,6 +2885,13 @@ mod tests {
         // a wide launch whose routing rows are a few-row count is not a verify window (its
         // routing rows differ from its launch rows): it takes the chunk route
         assert!(ep_trunk_partial_chunk(true, 4096, 8, true));
+        // Under the ordinary-prefill intent every chunk routes at the canonical 8192 rows: a
+        // 4096-row, a 25-row and a 1-row chunk are all partial chunks (the 1-row tail is not a
+        // decode forward under the intent), and no few-row window exists.
+        assert!(ep_trunk_partial_chunk(true, 4096, 8192, true));
+        assert!(ep_trunk_partial_chunk(true, 25, 8192, true));
+        assert!(ep_trunk_partial_chunk(true, 8, 8192, true));
+        assert!(ep_trunk_partial_chunk(true, 1, 8192, true));
     }
 
     #[test]

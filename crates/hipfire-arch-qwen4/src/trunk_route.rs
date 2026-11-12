@@ -24,8 +24,10 @@ use std::sync::{Arc, Mutex};
 /// `false` is the kill switch (the all-reduce route); any other value is off (fail safe).
 pub(crate) const SP_ENV: &str = "HIPFIRE_QWEN4_EP_SEQ_PARALLEL";
 
-/// Smallest chunk (rows) of the wide sequence-parallel band (any HC route; the sub-512 band is
-/// [`SP_SUB512_MIN_ROWS`]..=511 on the prefill lane WMMA HC read): both halves (`n / 2` rows, floored) must
+/// Smallest chunk (rows) of the wide sequence-parallel band outside the ordinary-prefill intent
+/// (any HC route; the sub-512 band is [`SP_SUB512_MIN_ROWS`]..=511 on the prefill lane WMMA HC
+/// read; under the ordinary-prefill intent every chunk of [`SP_SUB512_MIN_ROWS`] rows and up, see
+/// [`sp_rows_in_band`]): both halves (`n / 2` rows, floored) must
 /// sit on the same side of every HC read / write kernel-route threshold as the whole chunk
 /// (`wide_exact_rows` / the few-row limit up to `WIDE_VERIFY_MAX_ROWS`, the F16 WMMA and BF16
 /// stream floor `QWEN4_F16_WMMA_MIN_TOKENS`, the HC up `_v2` floor, the HC down fused floors), so
@@ -51,6 +53,9 @@ pub(crate) fn sp_requested() -> bool {
 /// sequence-parallel, provided its HC read is the pinned-split-K prefill lane WMMA entry for the
 /// whole chunk AND for both halves (`Gpu::prefill_lwmma_hc_applies`, checked by the forward):
 /// that entry is row-count invariant, so a row's bytes do not depend on which half carries it.
+/// Under the ordinary-prefill intent (every Qwen4 prefill forward but gfx942's) the switch also
+/// admits every chunk of [`SP_SUB512_MIN_ROWS`] rows and up, with no lane WMMA check: the intent
+/// makes every row-keyed route canonical for any launch extent.
 pub(crate) const SP_SUB512_ENV: &str = "HIPFIRE_QWEN4_EP_SP_SUB512";
 
 /// Fewest rows of a sub-512 sequence-parallel chunk: both halves (the smaller is `n / 2`) above
@@ -63,18 +68,35 @@ static SP_SUB512_ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     sp_switch(hipfire_config::developer_var(SP_SUB512_ENV).ok().as_deref())
 });
 
+/// Whether a forward routes at its real row extent: the routing row count equals the launch
+/// rows (`route_n == n`, no scope substituted the count), OR the ordinary-prefill intent is open
+/// (`ordinary`: `Gpu::ordinary_prefill_active`). Under that intent `Gpu::route_rows` returns the
+/// canonical chunk for EVERY extent and every row-keyed route is the canonical one for any launch
+/// extent (a 1-row, a 25-row and a 4096-row launch pick the same kernels), so own-row halves and
+/// masked tiles pick exactly the kernels the whole-chunk launch picks. Only a scope that
+/// substitutes the count while per-extent routes still exist (the invariant profile, the append
+/// route, a route-rows cap) leaves `route_n != n` without the intent: those keep the all-rows
+/// routes. Pure. The one predicate of the sequence-parallel admission and of the partial tile
+/// mask (`ep_partial_mask_active`).
+pub(crate) fn routes_at_real_extent(n: usize, route_n: usize, ordinary: bool) -> bool {
+    route_n == n || ordinary
+}
+
 /// Whether an `n`-row chunk is inside a sequence-parallel row band: at least [`SP_MIN_ROWS`], or
-/// (`sub512`, [`SP_SUB512_ENV`]) [`SP_SUB512_MIN_ROWS`]..=511 rows. The forward adds the HC route
-/// check of the sub-512 band.
-pub(crate) fn sp_rows_in_band(n: usize, sub512: bool) -> bool {
+/// (`sub512`, [`SP_SUB512_ENV`]) [`SP_SUB512_MIN_ROWS`]..=511 rows, or, under the ordinary-prefill
+/// intent (`ordinary`), [`SP_SUB512_MIN_ROWS`] rows and up (the 512..3071 gap only keeps the
+/// halves on one side of row-count thresholds, which the intent removes). The forward adds the HC
+/// route check of the sub-512 band outside the intent.
+pub(crate) fn sp_rows_in_band(n: usize, sub512: bool, ordinary: bool) -> bool {
     n >= SP_MIN_ROWS
         || (sub512
-            && (SP_SUB512_MIN_ROWS..rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS).contains(&n))
+            && n >= SP_SUB512_MIN_ROWS
+            && (ordinary || n < rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS))
 }
 
 /// [`sp_rows_in_band`] with this process's [`SP_SUB512_ENV`].
-pub(crate) fn sp_chunk_rows_in_band(n: usize) -> bool {
-    sp_rows_in_band(n, *SP_SUB512_ON)
+pub(crate) fn sp_chunk_rows_in_band(n: usize, ordinary: bool) -> bool {
+    sp_rows_in_band(n, *SP_SUB512_ON, ordinary)
 }
 
 /// Switch of sequence-parallel HC for EP prefill WAVES (`forward_lanes_scoped`) of at least
@@ -533,7 +555,8 @@ mod tests {
         assert_eq!(rdna_compute::hc8::MAX_ROWS, WIDE_VERIFY_MAX_ROWS);
         assert!(rdna_compute::gemv::LANE_WMMA_MIN_ROWS <= WIDE_VERIFY_MAX_ROWS);
         for n in SP_SUB512_MIN_ROWS..QWEN4_F16_WMMA_MIN_TOKENS {
-            assert!(sp_rows_in_band(n, true), "{n}");
+            assert!(sp_rows_in_band(n, true, false), "{n}");
+            assert!(sp_rows_in_band(n, true, true), "{n} ordinary");
             let [a, b] = sp_even_split(n);
             for half in [a.1, b.1] {
                 assert!(half > WIDE_VERIFY_MAX_ROWS, "{n}: {half}");
@@ -548,7 +571,8 @@ mod tests {
         }
         let below = SP_SUB512_MIN_ROWS - 1;
         assert!(sp_even_split(below)[1].1 <= WIDE_VERIFY_MAX_ROWS);
-        assert!(!sp_rows_in_band(below, true));
+        assert!(!sp_rows_in_band(below, true, false));
+        assert!(!sp_rows_in_band(below, true, true));
     }
 
     #[test]
@@ -565,10 +589,62 @@ mod tests {
             (SP_MIN_ROWS, true, true),
             (16384, true, true),
         ] {
-            assert_eq!(sp_rows_in_band(n, true), on, "{n} on");
-            assert_eq!(sp_rows_in_band(n, false), off, "{n} off");
+            assert_eq!(sp_rows_in_band(n, true, false), on, "{n} on");
+            assert_eq!(sp_rows_in_band(n, false, false), off, "{n} off");
         }
         assert_ne!(SP_SUB512_ENV, SP_ENV);
+    }
+
+    /// Under the ordinary-prefill intent the band is every chunk of `SP_SUB512_MIN_ROWS` rows and
+    /// up (the 512..3071 gap included) on the sub-512 switch; the kill switch still keeps the
+    /// chunks below `SP_MIN_ROWS` on the all-reduce route; both halves stay above the few-row
+    /// window for every admitted chunk.
+    #[test]
+    fn sp_band_under_the_ordinary_intent_is_every_chunk_from_130_rows() {
+        use rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS;
+        for (n, on, off) in [
+            (64, false, false),
+            (129, false, false),
+            (130, true, false),
+            (149, true, false),
+            (511, true, false),
+            (512, true, false),
+            (1192, true, false),
+            (3071, true, false),
+            (SP_MIN_ROWS, true, true),
+            (4096, true, true),
+            (16384, true, true),
+        ] {
+            assert_eq!(sp_rows_in_band(n, true, true), on, "{n} on");
+            assert_eq!(sp_rows_in_band(n, false, true), off, "{n} off");
+        }
+        for n in SP_SUB512_MIN_ROWS..=16384 {
+            let [a, b] = sp_even_split(n);
+            assert!(a.1 > WIDE_VERIFY_MAX_ROWS && b.1 > WIDE_VERIFY_MAX_ROWS, "{n}");
+            assert!(SpRows::of(0, n).own.1 > WIDE_VERIFY_MAX_ROWS, "{n}");
+            assert!(SpRows::of(1, n).own.1 > WIDE_VERIFY_MAX_ROWS, "{n}");
+        }
+    }
+
+    /// A forward routes at its real extent when no scope substituted the row count, or under the
+    /// ordinary-prefill intent (whose `route_n` is the canonical chunk for every `n`).
+    #[test]
+    fn routes_at_real_extent_is_the_row_count_or_the_ordinary_intent() {
+        const CANON: usize = rdna_compute::prefill_invariant::QWEN4_PREFILL_CANON_ROWS;
+        // No substituted count: always at the real extent.
+        for n in [1usize, 25, 130, 4096, 8192] {
+            assert!(routes_at_real_extent(n, n, false), "{n}");
+            assert!(routes_at_real_extent(n, n, true), "{n} ordinary");
+        }
+        // A substituted count (invariant profile, append route, cap) keeps the all-rows routes.
+        for n in [1usize, 25, 130, 4096] {
+            assert!(!routes_at_real_extent(n, CANON, false), "{n} substituted");
+            assert!(!routes_at_real_extent(n, 511, false), "{n} capped");
+        }
+        // The ordinary intent: canonical route rows for every extent.
+        for n in [1usize, 25, 129, 130, 512, 3071, 4096] {
+            assert!(routes_at_real_extent(n, CANON, true), "{n} ordinary");
+        }
     }
 
     #[test]
