@@ -314,10 +314,10 @@ fn gfx942_checked_evidence_is_recorded_and_reproduced() {
 }
 
 /// Typed lift of anchor and twin: the module holds seven kernels; the five sealed ones
-/// certify and re-emit exactly and carry no atomics. The FP8 entries are only required to be
-/// present in the ELF; they are not certified here.
+/// certify and re-emit exactly and carry no global atomics. The select kernel uses integer
+/// LDS atomicAdd for its radix histogram, as pinned by source and exact text identity.
 #[test]
-fn typed_lift_certifies_the_five_sealed_kernels_and_has_no_atomics() {
+fn typed_lift_certifies_the_five_sealed_kernels_and_has_no_global_atomics() {
     for (label, bytes) in [("anchor", ANCHOR), ("twin", HXACO)] {
         let elf = device_elf(bytes);
         let lifted = peacemaker_lift::cdna::lift_object(elf)
@@ -358,23 +358,8 @@ fn typed_lift_certifies_the_five_sealed_kernels_and_has_no_atomics() {
                 .collect();
             assert!(!text.is_empty(), "{label}: {name}: no instructions");
             assert!(
-                !text.iter().any(|l| l.contains("atomic")
-                    || [
-                        "ds_add",
-                        "ds_sub",
-                        "ds_inc",
-                        "ds_dec",
-                        "ds_min",
-                        "ds_max",
-                        "ds_and",
-                        "ds_or",
-                        "ds_xor",
-                        "ds_cmpst",
-                        "ds_wrxchg",
-                    ]
-                    .iter()
-                    .any(|p| l.starts_with(p))),
-                "{label}: {name} contains an atomic"
+                !text.iter().any(|l| l.contains("atomic")),
+                "{label}: {name} contains a global atomic"
             );
         }
     }
@@ -432,6 +417,17 @@ fn gpu_oracle_receipt_is_bound_to_these_images() {
     assert_eq!(receipt["certified_f32_case_count"], 23);
     assert_eq!(receipt["steps"], 2);
     assert_eq!(receipt["controls_passed"], 58);
+    let dispatch = &receipt["dispatch"];
+    assert_eq!(dispatch["status"], "PASS");
+    assert_eq!(dispatch["case_count"], 8);
+    assert_eq!(dispatch["certified_f32_case_count"], 4);
+    assert_eq!(dispatch["steps"], 3);
+    assert_eq!(dispatch["lanes"], serde_json::json!([2, 8, 33, 64]));
+    assert_eq!(dispatch["controls_passed"], 16);
+    assert_eq!(dispatch["state_diff_bytes"], 0);
+    assert_eq!(dispatch["sentinel_words_left"], 0);
+    assert_eq!(dispatch["exit_code"], 0);
+    assert!(dispatch["ledger"]["row"].as_u64().expect("dispatch ledger") > 0);
     let stdout = include_str!("fixtures/cdna/gfx942_qsa_lanes_oracle.txt");
     assert_eq!(receipt["stdout_sha256"], hex(stdout.as_bytes()));
     assert!(stdout.contains("qsa_lanes_gfx942_oracle: PASS"));

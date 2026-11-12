@@ -23,6 +23,28 @@
     "case_count": 46,
     "certified_f32_case_count": 23,
     "controls_passed": 58,
+    "dispatch": {
+      "status": "PASS",
+      "case_count": 8,
+      "certified_f32_case_count": 4,
+      "steps": 3,
+      "lanes": [2, 8, 33, 64],
+      "controls_passed": 16,
+      "state_diff_bytes": 0,
+      "sentinel_words_left": 0,
+      "exit_code": 0,
+      "oracle_binary_sha256": "16115f1bacd47306912bff674485ae6f7bace2ef206227f4407653c5314305ec",
+      "ledger": {
+        "row": 201,
+        "owner": "TwinWide942",
+        "class": "oracle",
+        "start": "2026-11-12T18:37:08+00:00",
+        "end": "2026-11-12T18:37:34+00:00",
+        "exit": 0,
+        "run_s": 26,
+        "wait_s": 189
+      }
+    },
     "exit_code": 0,
     "failed_cases": 0,
     "hipcc_device_elf_sha256": "142d236f6b1f03146d052f7576723d1b5eb11f7237a4385bbe65e1bc3bb7015e",
