@@ -481,6 +481,15 @@ pub(crate) fn ordinary_prefill_applies(prefill_scope: bool, arch: &str) -> bool 
     prefill_scope && arch != "gfx942"
 }
 
+/// Whether a forward of `rows` actual rows runs the EP symmetric-MoE A8 chain
+/// (`Gpu::qwen4_ep_a8_scope`): an EP forward below the owner-routed floor
+/// ([`rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS`]) outside the ordinary-prefill intent
+/// (lanes, verify, decode). Under the intent every actual extent takes the canonical chunk's
+/// A4 chain, so the recipe never follows the outer call size.
+pub(crate) fn ep_a8_scope_applies(ep: bool, ordinary: bool, rows: usize) -> bool {
+    ep && !ordinary && rows < rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS
+}
+
 /// gfx942 pins canonical prefill routing; gfx1151 retains its opt-in profile.
 fn trunk_prefill_invariant_scope(prefill: bool, arch: &str, rdna_opt_in: bool) -> bool {
     prefill && (arch == "gfx942" || (arch == "gfx1151" && rdna_opt_in))
@@ -16177,10 +16186,13 @@ impl Qwen4GpuForward {
         // The A8 chain is the default only for an EP forward BELOW the owner-routed floor (the
         // sub-512-row lane/singleton prompts that take the lowered-floor tile route): card gates
         // measured it +4.4% pp4096 prefill time with no measurable quality gain on >= 512-row
-        // prompts (j7430, j7431), so every >= 512-row forward keeps the A4 chain.
+        // prompts (j7430, j7431), so every >= 512-row forward keeps the A4 chain. Never under the
+        // ordinary-prefill intent: its recipe is the canonical chunk's (the A4 chain) at every
+        // actual extent, so a short call (a sub-512 tail, the session cache's lineage split) of
+        // an ordinary prefill computes its rows exactly as the full chunk would.
         let ep_a8 = std::mem::replace(
             &mut gpu.qwen4_ep_a8_scope,
-            self.ep.is_some() && rows < rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS,
+            ep_a8_scope_applies(self.ep.is_some(), ordinary_scope, rows),
         );
         // The owner-routed symmetric IU4 tile route's row floor (`HIPFIRE_EP_PREFILL_TILE_MIN_ROWS`):
         // lowered only for a PREFILL forward (`prefill_scope`: never decode, verify or the MTP head)
@@ -20119,6 +20131,28 @@ mod tests {
             chunk("gfx1100", None, 1024, || Discrete { gbps: 7.1 }),
             1024
         );
+    }
+
+    /// EP2 chunk invariance: under the ordinary-prefill intent the A8 chain never follows the
+    /// actual extent (the 4096-row schedule's 9-row session-cache lineage call and the 512/1024
+    /// schedules' ragged tails all take the canonical A4 chain); outside it the sub-512 EP
+    /// default is unchanged.
+    #[test]
+    fn ep_a8_scope_is_extent_free_under_the_ordinary_intent() {
+        use super::ep_a8_scope_applies as a8;
+        let floor = rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS;
+        for rows in [
+            1, 9, 25, 218, 511, 512, 730, 1024, 1754, 2048, 3793, 4096, 8192,
+        ] {
+            assert!(!a8(true, true, rows), "ordinary EP rows {rows}");
+            assert!(!a8(false, true, rows), "ordinary single-card rows {rows}");
+            assert!(!a8(false, false, rows), "single-card rows {rows}");
+            assert_eq!(
+                a8(true, false, rows),
+                rows < floor,
+                "non-ordinary EP rows {rows}"
+            );
+        }
     }
 
     #[test]
