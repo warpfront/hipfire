@@ -3,7 +3,9 @@
 use crate::dispatch::{DType, Gpu, GpuTensor, FP8_GEMV_MIN_M};
 use crate::kernels;
 use crate::lane_wmma::{LaneWmmaMultiPart, LaneWmmaWeight};
-use crate::prefill_invariant::{few_row_groups, FEW_ROW_ROUTE_ROWS, WIDE_VERIFY_MAX_ROWS};
+use crate::prefill_invariant::{
+    few_row_groups, PrefillRouteIntent, FEW_ROW_ROUTE_ROWS, WIDE_VERIFY_MAX_ROWS,
+};
 use hip_bridge::HipResult;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22024,6 +22026,30 @@ impl Gpu {
             && self.few_row_limit() >= rows
     }
 
+    /// Whether a `rows`-row stateless HC / dense stage of the CURRENT forward is a row of an
+    /// exact-gfx942 lane step wider than the few-row window ([`FEW_ROW_ROUTE_ROWS`]): the one
+    /// scope in which every row of a wide call must reproduce the pinned singleton
+    /// arithmetic row by row, not the ordinary prefill chunk's.
+    ///
+    /// True exactly when the arch is exact gfx942, the forward is a lane step
+    /// ([`Gpu::lane_rows_scope`], set by `forward_lanes` and the speculative verify forward
+    /// only), the numerical intent is [`PrefillRouteIntent::Product`] (so never an ordinary
+    /// prefill, never the prefill-invariant profile, never the P2 prefill wave, which runs under
+    /// `prefill_invariant_scope`) and `rows` exceeds the few-row window. The lane forward owns
+    /// the upper bound (`G942_ALLROWS_MAX_ROWS`); this rule does not cap it, so raising that
+    /// bound cannot silently route a wider step's gates onto the chunk's BF16 MFMA. Pure
+    /// host state; never keyed on replay recording or graph capture (the arithmetic must
+    /// not depend on how a step is launched).
+    pub fn g942_lane_wide_rows(&self, rows: usize) -> bool {
+        g942_lane_wide_rows_rule(
+            self.arch_caps.is_gfx942(),
+            self.lane_rows_scope,
+            self.prefill_route_intent(),
+            self.prefill_invariant_scope,
+            rows,
+        )
+    }
+
     /// [`Gpu::gemv_bf16_xf32_k4_rows`] of `rows` (9..=[`WIDE_VERIFY_MAX_ROWS`]) activation rows
     /// (x row stride K, y row stride M) in ONE `gemv_bf16_xf32_k4_rows_lane_t8` launch, grid
     /// `[m, ceil(rows / 8)]`: full tiles of eight rows and the partial last tile run the
@@ -28218,5 +28244,45 @@ mod lane_wmma_row_bounds_tests {
         assert!(LANE_WMMA_MIN_ROWS > FEW_ROW_ROUTE_ROWS);
         assert!(LANE_WMMA_MIN_ROWS <= WIDE_VERIFY_MAX_ROWS);
         assert_eq!(WIDE_VERIFY_MAX_ROWS, 64);
+    }
+}
+
+/// [`Gpu::g942_lane_wide_rows`] over explicit scope facts.
+pub(crate) fn g942_lane_wide_rows_rule(
+    gfx942: bool,
+    lane_rows_scope: bool,
+    intent: PrefillRouteIntent,
+    prefill_invariant_scope: bool,
+    rows: usize,
+) -> bool {
+    gfx942
+        && lane_rows_scope
+        && intent == PrefillRouteIntent::Product
+        && !prefill_invariant_scope
+        && rows > FEW_ROW_ROUTE_ROWS
+}
+
+#[cfg(test)]
+mod g942_lane_wide_rows_tests {
+    use super::*;
+
+    /// Only an exact-gfx942 lane step (Product intent, not the invariant profile) wider than
+    /// eight rows is lane-wide; the ordinary prefill chunk, the invariant profile / P2 wave,
+    /// a non-lane forward, every other arch and the few-row window are not.
+    #[test]
+    fn only_a_gfx942_lane_step_wider_than_the_few_row_window_is_lane_wide() {
+        use PrefillRouteIntent::*;
+        let rule = g942_lane_wide_rows_rule;
+        for rows in [9usize, 16, 17, 32, 33, 64, 128, 256] {
+            assert!(rule(true, true, Product, false, rows), "rows {rows}");
+            assert!(!rule(false, true, Product, false, rows), "other arch {rows}");
+            assert!(!rule(true, false, Product, false, rows), "no lane scope {rows}");
+            assert!(!rule(true, true, OrdinaryPrefill, false, rows), "ordinary prefill {rows}");
+            assert!(!rule(true, true, InvariantProfile, true, rows), "invariant {rows}");
+            assert!(!rule(true, true, Product, true, rows), "wave {rows}");
+        }
+        for rows in 0..=FEW_ROW_ROUTE_ROWS {
+            assert!(!rule(true, true, Product, false, rows), "few-row {rows}");
+        }
     }
 }
