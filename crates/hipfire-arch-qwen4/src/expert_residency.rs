@@ -3883,6 +3883,70 @@ pub fn ep_vram_layers(
         .unwrap_or(0)
 }
 
+/// One rank's check of the agreed expert-parallel split ([`ep_vram_layers`]): what the
+/// rank's own device keeps resident, on the planner's basis and on the instantaneous free.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EpAgreedSplitFit {
+    /// Resident layers this rank keeps on the planner's basis (`planned`).
+    pub planned_layers: usize,
+    /// Resident layers this rank keeps on the instantaneous free figure.
+    pub free_layers: usize,
+}
+
+/// Check the agreed split `agreed` against one rank's device, refusing before any allocation
+/// when it does not fit.
+///
+/// `planned` is the capacity the split was agreed on: the planner budgets every rank against
+/// its device total less this process's own live allocations
+/// (`rdna_compute::PlannedCapacity::before_reserve`), because the reserve census carries the
+/// HIP runtime's device residency itself, the device's idle driver baseline included (the
+/// gfx1201 EP2 runtime term). `free_now` is the instantaneous free figure, which already lacks
+/// that baseline (tens of MiB on an idle R9700). Judging the agreed split against `free_now`
+/// charges the baseline twice, so a split the planner agreed with less than the baseline of
+/// slack is refused by the very rank it was agreed for. The rank therefore holds the split to
+/// the planner's basis: it refuses only when `planned` itself keeps fewer layers (the device or
+/// this process's allocations changed since the plan); `free_layers` is reported for the log.
+pub fn ep_agreed_split_fit(
+    config: &Qwen4Config,
+    agreed: usize,
+    planned: u64,
+    free_now: u64,
+    non_expert_bytes: u64,
+    layer_expert_bytes_per_rank: u64,
+    reserve_bytes: u64,
+) -> Result<EpAgreedSplitFit, String> {
+    const MIB: u64 = 1 << 20;
+    let moe_layers = moe_layer_count(config);
+    let rank_layers = |free| {
+        ep_rank_layers(
+            config,
+            free,
+            non_expert_bytes,
+            layer_expert_bytes_per_rank,
+            reserve_bytes,
+        )
+    };
+    let fit = EpAgreedSplitFit {
+        planned_layers: rank_layers(planned),
+        free_layers: rank_layers(free_now),
+    };
+    if fit.planned_layers < agreed.min(moe_layers) {
+        return Err(format!(
+            "the agreed expert VRAM split of {agreed} of {moe_layers} MoE layers does not fit this device: \
+             {} MiB planned capacity (device total less this process's own allocations, the basis the split was agreed on; \
+             {} MiB instantaneous free) keeps only {} (trunk {} MiB, {} MiB per expert layer, {} MiB reserve). \
+             Free GPU memory or lower the number of expert layers kept on the GPU",
+            planned / MIB,
+            free_now / MIB,
+            fit.planned_layers,
+            non_expert_bytes / MIB,
+            layer_expert_bytes_per_rank / MIB,
+            reserve_bytes / MIB
+        ));
+    }
+    Ok(fit)
+}
+
 /// The expert-parallel split with each rank's AR lane store reserved
 /// ([`ep_vram_layers_with_lanes`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -8824,6 +8888,76 @@ mod tests {
             "{}",
             lines[1]
         );
+    }
+
+    /// Regression (EP2 `prefill.chunk_rows=8192` on gfx1201, Flash-Next mq4-xts): the planner
+    /// agreed 36 resident layers against the planned capacity (32624 MiB, device total) while
+    /// the rank refused them against its instantaneous free (32550 MiB) with "keeps only 35".
+    /// The numbers are that load's receipt (trunk 3302 MiB, 637.5 MiB per layer, reserve
+    /// 6300 MiB); base 56e88adbfa's reserve of 6281 MiB (same trunk) kept 36 on either basis.
+    #[test]
+    fn ep_rank_check_holds_the_agreed_split_to_the_planners_basis() {
+        const MIB: u64 = 1 << 20;
+        let config = crate::config::compact_test_config();
+        let layer = 637 * MIB + MIB / 2;
+        let (planned, free_now) = (32_624 * MIB, 32_550 * MIB);
+        let (trunk, reserve) = (3_302 * MIB, 6_300 * MIB);
+        // The planner (every rank budgeted against the planned capacity).
+        let agreed = ep_vram_layers(&config, &[planned, planned], trunk, layer, reserve);
+        assert_eq!(agreed, 36);
+        // The rank keeps it: 36 on the planned basis, 35 on the instantaneous free (reported).
+        assert_eq!(
+            ep_agreed_split_fit(&config, agreed, planned, free_now, trunk, layer, reserve),
+            Ok(EpAgreedSplitFit {
+                planned_layers: 36,
+                free_layers: 35
+            })
+        );
+        // Base terms kept 36 on either basis (17 MiB of slack on the instantaneous free).
+        assert_eq!(
+            ep_agreed_split_fit(&config, 36, planned, free_now, trunk, layer, 6_281 * MIB),
+            Ok(EpAgreedSplitFit {
+                planned_layers: 36,
+                free_layers: 36
+            })
+        );
+        // Whatever the planner agrees on any capacity, the rank keeps on the same capacity,
+        // even when the instantaneous free sits a driver baseline lower.
+        for planned_mib in (20_000..=40_000u64).step_by(37) {
+            for reserve_mib in [1_088u64, 6_281, 6_300, 7_000] {
+                let planned = planned_mib * MIB;
+                let reserve = reserve_mib * MIB;
+                let agreed = ep_vram_layers(&config, &[planned, planned], trunk, layer, reserve);
+                let fit = ep_agreed_split_fit(
+                    &config,
+                    agreed,
+                    planned,
+                    planned - 74 * MIB,
+                    trunk,
+                    layer,
+                    reserve,
+                )
+                .unwrap_or_else(|error| panic!("{planned_mib} MiB / {reserve_mib} MiB: {error}"));
+                assert_eq!(fit.planned_layers, agreed);
+                assert!(fit.free_layers <= agreed);
+            }
+        }
+        // A rank whose planned capacity really shrank since the plan (another allocation of
+        // this process) refuses, naming both bases.
+        let error = ep_agreed_split_fit(
+            &config,
+            36,
+            planned - 100 * MIB,
+            free_now - 100 * MIB,
+            trunk,
+            layer,
+            reserve,
+        )
+        .unwrap_err();
+        assert!(error.contains("split of 36 of 49"), "{error}");
+        assert!(error.contains("32524 MiB planned capacity"), "{error}");
+        assert!(error.contains("32450 MiB instantaneous free"), "{error}");
+        assert!(error.contains("keeps only 35"), "{error}");
     }
 
     #[test]

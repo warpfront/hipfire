@@ -8248,13 +8248,13 @@ fn load_qwen4_rank_unscoped(
     }
     // The agreed split must fit this rank: refuse before allocating.
     if let Some(layers) = expert_vram_layers {
-        let (free, non_expert, layer_experts, reserve, ..) = auto_inputs()?;
+        let (free, non_expert, layer_experts, census, ..) = auto_inputs()?;
         // Expert-parallel loads have no slab stage; the safety margin is
         // charged like `auto`'s.
         let charges = placement_charges(layer_experts, false)?;
         settled_placement_charges = Some(charges);
         let reserve = charges
-            .reserve(reserve.bytes())
+            .reserve(census.bytes())
             .map_err(|error| format!("qwen4: {error}"))?;
         if let Some(plan) = &ep_reserve {
             qwen4_ep_reserve_rank_terms(plan, layers, reserve)?;
@@ -8292,8 +8292,8 @@ fn load_qwen4_rank_unscoped(
             // The plan was budgeted against the planned capacity (total minus this process's own
             // allocations; the census carries the runtime reserve), not the instantaneous free
             // this check reads, which sits tens of MiB lower (driver context). A plan that fits
-            // its own planned budget is admitted with a note; whole-layer splits absorb the same
-            // gap in their floor.
+            // its own planned budget is admitted with a note; whole-layer splits are held to the
+            // same basis below.
             let planned = units
                 .rank_budget(rank)
                 .map(|planned| planned.saturating_add(stage.bytes));
@@ -8315,16 +8315,39 @@ fn load_qwen4_rank_unscoped(
                 ));
             }
         } else {
-            let own = residency::ep_rank_layers(&config, free, non_expert, layer_experts, reserve);
-            if own < layers.min(moe_layers) {
-                return Err(format!(
-                    "qwen4: the agreed expert VRAM split of {layers} of {moe_layers} MoE layers does not fit this device: \
-                     {} MiB free keeps only {own} (trunk {} MiB, {} MiB per expert layer, {} MiB reserve). Free GPU memory or lower the number of expert layers kept on the GPU",
+            // Whole-layer split: held to the planner's basis (`qwen4_ep_free_vram`: the device
+            // total less this process's own allocations), whose reserve census carries the
+            // runtime residency the instantaneous free figure already lacks.
+            let planned = ctx
+                .gpu
+                .planned_capacity()
+                .map_err(|error| format!("qwen4: planned capacity query: {error}"))?
+                .before_reserve() as u64;
+            let fit = residency::ep_agreed_split_fit(
+                &config,
+                layers,
+                planned,
+                free,
+                non_expert,
+                layer_experts,
+                reserve,
+            )
+            .map_err(|error| format!("qwen4: {error}; reserve {}", census.describe()))?;
+            let rank = ep.map_or(0, |placement| placement.rank);
+            eprintln!(
+                "  qwen4 EP rank {rank} reserve: trunk {} MiB, reserve {} MiB = {}",
+                non_expert / MIB,
+                reserve / MIB,
+                census.describe()
+            );
+            if fit.free_layers < layers.min(moe_layers) {
+                eprintln!(
+                    "qwen4 EP rank {rank}: agreed split {layers} kept on the planned capacity it was agreed on ({} MiB keeps {}); the instantaneous free {} MiB keeps {} because it already lacks the device residency the reserve census charges",
+                    planned / MIB,
+                    fit.planned_layers,
                     free / MIB,
-                    non_expert / MIB,
-                    layer_experts / MIB,
-                    reserve / MIB
-                ));
+                    fit.free_layers
+                );
             }
         }
     }
