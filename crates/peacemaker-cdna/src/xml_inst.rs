@@ -33,9 +33,13 @@
 //! could not confirm is *unverified* ([`XmlInst::verification`]): it decodes
 //! but [`XmlInst::encode`] refuses it. A [`FieldReceipt`] promotes only the
 //! instances inside one hardware-proven field combination of such a row
-//! ([`XmlInst::verification_of`]); the row itself stays unverified. gfx950 is
-//! decode-only.
+//! ([`XmlInst::verification_of`]); the row itself stays unverified. An
+//! [`AliasReceipt`] does the same for a row whose XML mnemonic `llvm-mc` does
+//! not assemble (`V_MAD_MIX_F32` is `v_fma_mix_f32` on gfx942): only the
+//! canonical instances of the hand-written typed model that an exhaustive
+//! `llvm-mc` sweep confirmed. gfx950 is decode-only.
 use crate::arch::Arch;
+use crate::enc::vop3p::{Vop3p, Vop3pOp};
 use crate::inst::{Footprint, Format, MemKind, RegFile};
 use crate::operand::Src;
 use crate::xml::{self, Decoded, Form, Isa, Operand, OperandKind as K, Verification};
@@ -109,6 +113,99 @@ impl FieldReceipt {
 
 /// Every hardware receipt that promotes an instance of an unverified row.
 pub static FIELD_RECEIPTS: &[&FieldReceipt] = &[&V_CVT_PK_F32_FP8_SDWA_WORD1];
+
+/// An LLVM-alias receipt: the XML row names the instruction differently from
+/// `llvm-mc` (so the row-level cross-check records `xml-only`), but the row's
+/// opcode is the one `llvm-mc` assembles under another mnemonic, and the
+/// hand-written typed model (`model`) round-trips every instance it accepts
+/// against `llvm-mc` over that instruction's whole encoding selection space.
+/// An instance is covered only when it is in that model's canonical set: the
+/// words must decode through `model`, which refuses every other field value
+/// (reserved, unmodelled or illegal), so nothing outside the swept space is
+/// promoted. The row itself stays unverified, and no other row is affected.
+/// This receipt confirms the *encoding* only; numeric behaviour is the
+/// emulator's and the hardware oracle's.
+#[derive(Debug)]
+pub struct AliasReceipt {
+    pub isa: Isa,
+    /// XML `InstructionName` of the row.
+    pub name: &'static str,
+    /// XML encoding name of the row.
+    pub encoding: &'static str,
+    /// The `llvm-mc` mnemonic of the same opcode.
+    pub llvm_mnemonic: &'static str,
+    /// The typed model's mnemonic for `words`: `Some` only when the words
+    /// decode through it (canonical, legal and modelled).
+    pub model: fn(&[u32]) -> Option<&'static str>,
+    /// The MI300X hardware semantics oracle receipt
+    /// (`peacemaker-isa` `cdna_mix_hw_oracle`) and its sha256, as for
+    /// [`FieldReceipt`]. The separate LLVM sweep confirms encoding across
+    /// source classes; the hardware receipt proves numeric semantics.
+    pub oracle_receipt: &'static str,
+    pub oracle_sha256: &'static str,
+    /// The test that sweeps the model against `llvm-mc`, and the LLVM probe.
+    pub evidence: &'static str,
+}
+
+impl AliasReceipt {
+    /// Whether `d` is a canonical instance of the receipt's typed model.
+    pub fn covers(&self, d: &Decoded) -> bool {
+        if d.form.isa != self.isa || d.form.name != self.name || d.form.encoding != self.encoding {
+            return false;
+        }
+        let Ok((words, n)) = d.assemble() else {
+            return false;
+        };
+        (self.model)(&words[..n]) == Some(self.llvm_mnemonic)
+    }
+}
+
+/// Every LLVM-alias receipt that promotes an instance of an unverified row.
+pub static ALIAS_RECEIPTS: &[&AliasReceipt] = &[&V_MAD_MIX_F32_AS_FMA_MIX_F32];
+
+/// The typed model of `v_fma_mix_f32` restricted to the source classes the
+/// `llvm-mc` sweep covers: VGPR, one SGPR, inline constant (the codec already
+/// refuses `NEG_HI`, literal, AGPR and a second scalar register).
+fn typed_fma_mix_f32(words: &[u32]) -> Option<&'static str> {
+    match Vop3p::decode(Arch::Gfx942, words) {
+        Ok((x, 2))
+            if words.len() == 2
+                && x.op == Vop3pOp::FmaMixF32
+                && x.src.iter().all(|s| {
+                    matches!(
+                        s,
+                        Some(Src::Vgpr(_) | Src::Sgpr(_) | Src::Int(_) | Src::Float(_))
+                    )
+                }) =>
+        {
+            Some(x.op.name())
+        }
+        _ => None,
+    }
+}
+
+/// gfx942 `V_MAD_MIX_F32` (`ENC_VOP3P` opcode 32). `llvm-mc -mcpu=gfx942`
+/// rejects `v_mad_mix_f32` ("instruction not supported on this GPU") and
+/// assembles/disassembles opcode 32 as `v_fma_mix_f32`
+/// (`0xd3a00000` | `OP_SEL`<<11 | `OP_SEL_HI[2]`<<14 | `CLAMP`<<15, word 1
+/// `OP_SEL_HI[1:0]`<<27 | `NEG`<<29). The typed `Vop3pOp::FmaMixF32` model
+/// covers `NEG_HI` = 0 only (the `|src|` spelling is refused), VGPR / SGPR
+/// (s0..s101, at most one) / inline-constant sources, and the operand
+/// legality of the typed codec.
+pub static V_MAD_MIX_F32_AS_FMA_MIX_F32: AliasReceipt = AliasReceipt {
+    isa: Isa::Cdna3,
+    name: "V_MAD_MIX_F32",
+    encoding: "ENC_VOP3P",
+    llvm_mnemonic: "v_fma_mix_f32",
+    model: typed_fma_mix_f32,
+    oracle_receipt: "",
+    oracle_sha256: "",
+    evidence: "tests/enc_vop3p.rs oracle_fma_mix_f32_full_selection_space: every \
+OP_SEL x OP_SEL_HI x NEG_LO x CLAMP combination (1024) over seven source shapes \
+(all VGPR, one SGPR per position, one inline constant per position; 7168 words), \
+bytes, text, decode and disassembly against llvm-mc -mcpu=gfx942; \
+tools/cdna3-llvm.json row 1677 mnemonic_probe",
+};
 
 /// `v_cvt_pk_f32_fp8_sdwa vdst[2], vsrc0 src0_sel:WORD_1` (dst_sel DWORD,
 /// dst_unused PAD, no clamp/omod/sext/neg/abs, src1 fields zero), the 32 SDWA
@@ -251,15 +348,19 @@ impl XmlInst {
     /// the LLVM cross-check confirmed is `Ok` for every instance. An
     /// unverified row is `Ok` only for an instance whose every field outside
     /// a [`FieldReceipt`]'s free (register-number) fields equals the
-    /// combination that receipt proved on hardware; every other instance
-    /// keeps the row's refusal.
+    /// combination that receipt proved on hardware, or a canonical instance
+    /// of an [`AliasReceipt`]'s typed model; every other instance keeps the
+    /// row's refusal.
     pub fn verification_of(d: &Decoded) -> std::result::Result<(), &'static str> {
         match d.form.verification {
             Verification::Verified => Ok(()),
-            Verification::Unverified(why) => match Self::receipt_of(d) {
-                Some(_) => Ok(()),
-                None => Err(why),
-            },
+            Verification::Unverified(why) => {
+                if Self::receipt_of(d).is_some() || Self::alias_receipt_of(d).is_some() {
+                    Ok(())
+                } else {
+                    Err(why)
+                }
+            }
         }
     }
     /// The hardware receipt that promotes this instruction, if one does.
@@ -273,6 +374,19 @@ impl XmlInst {
             return None;
         }
         FIELD_RECEIPTS.iter().copied().find(|r| r.covers(d))
+    }
+    /// The LLVM-alias receipt that promotes this instruction, if one does.
+    pub fn alias_receipt(&self) -> Option<&'static AliasReceipt> {
+        Self::alias_receipt_of(&self.decoded)
+    }
+    /// [`XmlInst::alias_receipt`] for a decoded value: `Some` only when `d`'s
+    /// row is unverified and `d` is a canonical instance of the receipt's
+    /// hand-written model.
+    pub fn alias_receipt_of(d: &Decoded) -> Option<&'static AliasReceipt> {
+        if d.form.verification.is_verified() {
+            return None;
+        }
+        ALIAS_RECEIPTS.iter().copied().find(|r| r.covers(d))
     }
     /// Registers read and written, explicit and implicit, from the XML row.
     pub fn footprint(&self) -> Footprint {

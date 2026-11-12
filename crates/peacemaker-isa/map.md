@@ -13,6 +13,8 @@
 ## Gotchas
 
 <!-- hand-written: what not to do here; traps a reader will hit. -->
+- `examples/cdna_mix_hw_oracle.rs` compares actual gfx942 `v_fma_mix_f32` instructions against `peacemaker_cdna::sim::exec_one`, including raw NaN/sign bits and explicit MODE readback. Run it through the MI300X ledger wrapper; `--dry-run` is interpreter determinism evidence only, never a hardware receipt.
+
 
 - Wave-private LDS: `lds::Lds::add_wave_private` declares a `stride x waves` window (`LdsSlot::wave_private`, recorded in `BuilderProof::lds_slots`; `lds::private_windows` / `PrivateWindow` read it back). Its slot steps (`private_store/load/publish/retire`) are reachable only through the typed core's `Backend` (`author.rs`), refuse barrier transitions and shared store/load, and publish with no instruction. `pm_check::lds_wave_private` proves from the object that every lane of every wave stays in its own slice; the Builder's assembly carries one `; pm.wave_private symbol= base= stride= waves=` marker line per wave-private slot (`emit::kernel_assembly`, before `.protected`; `lds::private_marker` writes it, `lds::private_markers` reads it per symbol, so no author can omit it), and `toolchain::certify` derives the windows from those markers: whenever any exist it runs `lds_wave_private` with them (refusing a non-M7 symbol), and a contract's `IsaShapeContract::wave_private_windows` must be empty or equal to the derived set as a set, else it refuses. Kernels without wave-private slots emit byte-identical assembly.
 

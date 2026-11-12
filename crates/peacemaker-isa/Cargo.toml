@@ -41,6 +41,12 @@ required-features = ["toolchain"]
 name = "cdna_card_tierc"
 required-features = ["lab"]
 
+# MI300X (gfx942) hardware oracle of the interpreter's v_fma_mix_f32 (hipcc kernels, strict raw-bit compare,
+# hash-bound receipt; fabric job, HIP runtime + hipcc). `--dry-run` makes no hardware claim.
+[[example]]
+name = "cdna_mix_hw_oracle"
+required-features = ["lab"]
+
 # GPU exactness harness of the exact libm lowerings against hipcc (fabric job; HIP runtime).
 [[example]]
 name = "libm_exact"

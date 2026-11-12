@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- PeaceMaker gfx942: add a strict mixed-FMA hardware/interpreter oracle over all source selectors, negation masks, clamp and representative floating-point modes, paired with an exhaustive LLVM codec sweep. XML alias promotion remains instance-bounded; gfx950, mixed half-result operations and unsupported source modifiers are not promoted.
 - PeaceMaker gfx942: seal the frozen three-entry GDN Core verify-lanes image byte-identically, with strict ledger replay and a hash-bound MI300X oracle (seven cases, three carried windows, 23 detected negative controls). No anchor, instruction or production route changes.
 - Launcher ABI audit: expand bounded identifier/decimal token pastes in kernel-defining macros using raw paste arguments, so the unchanged HC-gates macro source and all seven real launch ABIs are checked without source exclusions. Stringification, variadics and unsupported paste operands still fail closed.
 
