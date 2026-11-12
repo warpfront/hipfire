@@ -2226,8 +2226,38 @@ fn execute_hyper_read_inner(
         ))?;
         activated = true;
     } else {
+        // G12 input: gfx942 wide verify (rows > 16, BF16 down weight). The wide / rows16 down
+        // GEMM reads the activation as BF16, which `project_g942_mfma` stages from the F32
+        // `normalized` with one `convert_f32_to_bf16` launch; `qwen4_g942_hyper_norm_bf16x`
+        // stores those bytes (the values are already BF16-rounded) next to the F32 rows, so the
+        // staging launch drops out. The calibration tap needs the F32 rows and a banded down
+        // weight reads F32.
+        let mut g942_norm_staged: Option<GpuTensor> = None;
         if !normalized_ready {
-            hip(hyper_norm(gpu, &norm))?;
+            let staged_bf16 = gpu.arch_caps.is_gfx942()
+                && op.rows > 16
+                && gpu.active_capture.is_none()
+                && op.input_mix_down.dtype == DType::BF16
+                && g942_trunk_mfma_route(
+                    true,
+                    g942_trunk_gemv(),
+                    op.rows,
+                    DType::BF16,
+                    DType::BF16,
+                    DType::F32,
+                )
+                && !super::projection_split::is_split(gpu, &op.input_mix_down, op.rows);
+            if staged_bf16 {
+                let mut scratch = hip(gpu.qwen4_f16_x_scratch(op.rows * wide))?;
+                scratch.dtype = DType::BF16;
+                match gpu.try_gfx942() {
+                    Some(mut device) => hip(device.hyper_norm_bf16x(&norm, &scratch))?,
+                    None => hip(hyper_norm(gpu, &norm))?,
+                }
+                g942_norm_staged = Some(scratch);
+            } else {
+                hip(hyper_norm(gpu, &norm))?;
+            }
         }
         // gfx942 C1 fold (`HIPFIRE_QWEN4_G942_FOLD_ELEM`): the few-row down GEMM with the
         // activation chain below as its epilogue, one launch for the six; bitwise their output.
@@ -2267,7 +2297,7 @@ fn execute_hyper_read_inner(
             let projected = project_weight(
                 gpu,
                 &op.input_mix_down,
-                &normalized,
+                g942_norm_staged.as_ref().unwrap_or(&normalized),
                 &low,
                 op.rows,
                 Some(op.rotation),
