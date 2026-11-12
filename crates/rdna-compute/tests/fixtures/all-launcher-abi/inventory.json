@@ -152,6 +152,7 @@
     "kernels/src/pm_cdna/fp8_moe_gate_up.gfx942.hip",
     "kernels/src/qwen4_g942_glue_elem.hip",
     "kernels/src/qwen4_g942_glue_moe.hip",
+    "kernels/src/qwen4_g942_hc_gates.gfx942.hip",
     "kernels/src/qwen4_gemm_mq4g256v2_moe_grouped_wmma_k2.hip",
     "kernels/src/qwen4_gemv_mq4g256v2_moe_gate_up_k8_indexed_batched.hip",
     "kernels/src/qwen4_moe_iu4_sym.gfx1151.hip",
@@ -239,6 +240,20 @@
         "qwen4_g942_moe_combine_shared_add"
       ],
       "reason": "gfx942 C MoE glue Route-A qualification twin: byte-identical full device ELF and exact HIP/HSA ABI. Land with its owner kernel and checked live launcher; no production dispatch or obligation-class change."
+    },
+    "kernels/qwen4_g942_hc_gates_pm_gfx942.hxaco": {
+      "hip_source": "kernels/src/qwen4_g942_hc_gates.gfx942.hip",
+      "anchor": "kernels/qwen4_g942_hc_gates_hipcc_gfx942.co",
+      "symbols": [
+        "gemv_bf16_xf32_k4_rows_tiled_r2",
+        "gemv_bf16_xf32_k4_rows_tiled_r3",
+        "gemv_bf16_xf32_k4_rows_tiled_r4",
+        "gemv_bf16_xf32_k4_rows_tiled_r5",
+        "gemv_bf16_xf32_k4_rows_tiled_r6",
+        "gemv_bf16_xf32_k4_rows_tiled_r7",
+        "gemv_bf16_xf32_k4_rows_tiled_r8"
+      ],
+      "reason": "gfx942 HC-gates BF16 GEMV (k4 rows-tiled r2..r8) Route-A qualification twin: byte-identical full device ELF to the hipcc anchor, exact HIP/HSA ABI, certified by the existing typed CDNA ledger. Standalone: the source is the verbatim hc-gates kernel set with no new owner launcher here. No production image or dispatch change; qualification evidence is the hash-bound hardware receipt only."
     }
   },
   "emitter_images": {
