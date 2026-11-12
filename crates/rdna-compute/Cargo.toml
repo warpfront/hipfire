@@ -1404,3 +1404,30 @@ required-features = ["lab", "deltanet"]
 [[example]]
 name = "gdn_canon_wy_prefix_kill"
 required-features = ["lab", "deltanet"]
+
+# Canonical GDN prefill oracles / probes (reliability/CHUNK-CANONICAL-DESIGN.md G1/G3):
+# build with `--features lab,deltanet` (gdn_*) or `--features lab` (attn_call_shape_oracle_gfx11,
+# wmma_zero_sign_probe).
+[[example]]
+name = "gdn_canon_stream_oracle"
+required-features = ["lab", "deltanet"]
+
+[[example]]
+name = "gdn_canon_bulk_digest"
+required-features = ["lab", "deltanet"]
+
+[[example]]
+name = "gdn_canonical_producer_oracle"
+required-features = ["lab", "deltanet"]
+
+[[example]]
+name = "gdn_wy_stream_oracle"
+required-features = ["lab", "deltanet"]
+
+[[example]]
+name = "attn_call_shape_oracle_gfx11"
+required-features = ["lab"]
+
+[[example]]
+name = "wmma_zero_sign_probe"
+required-features = ["lab"]

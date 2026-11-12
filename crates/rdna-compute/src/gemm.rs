@@ -11565,8 +11565,9 @@ impl Gpu {
         // already-guarded uniform route above (exact gfx1201, eager, K%256)
         // plus N>=256; the family flag stays a prerequisite and smaller
         // batches keep s2bt8/BT. Params/blob layout below is the frozen v2 ABI.
-        let v2 =
-            self.flags.gfx12_mq4v2_fp8_v2 && self.flags.gfx12_mq4v2_fp8_qkvza && self.fp8_v2_rows_admit(batch_size);
+        let v2 = self.flags.gfx12_mq4v2_fp8_v2
+            && self.flags.gfx12_mq4v2_fp8_qkvza
+            && self.fp8_v2_rows_admit(batch_size);
         // Balanced-aspect launch: block/LDS/grid follow the selected geometry
         // (bv = BM/16 keeps batch_tiles = ceil(N/BM)).
         let (vbm, vbn, vbk, vwaves) = Self::fp8_v2_geom(&self.arch);
@@ -11807,8 +11808,9 @@ impl Gpu {
         // already-guarded uniform route above (exact gfx1201, eager, K%256)
         // plus N>=256; the family flag stays a prerequisite and smaller
         // batches keep s2bt8/BT. Params/blob layout below is the frozen v2 ABI.
-        let v2 =
-            self.flags.gfx12_mq4v2_fp8_v2 && self.flags.gfx12_mq4v2_fp8_qkvza && self.fp8_v2_rows_admit(batch_size);
+        let v2 = self.flags.gfx12_mq4v2_fp8_v2
+            && self.flags.gfx12_mq4v2_fp8_qkvza
+            && self.fp8_v2_rows_admit(batch_size);
         // Balanced-aspect launch: block/LDS/grid follow the selected geometry
         // (bv = BM/16 keeps batch_tiles = ceil(N/BM)).
         let (vbm, vbn, vbk, vwaves) = Self::fp8_v2_geom(&self.arch);
@@ -12027,8 +12029,9 @@ impl Gpu {
         // already-guarded uniform route above (exact gfx1201, eager, K%256)
         // plus N>=256; the family flag stays a prerequisite and smaller
         // batches keep s2bt8/BT. Params/blob layout below is the frozen v2 ABI.
-        let v2 =
-            self.flags.gfx12_mq4v2_fp8_v2 && self.flags.gfx12_mq4v2_fp8_qkv && self.fp8_v2_rows_admit(batch_size);
+        let v2 = self.flags.gfx12_mq4v2_fp8_v2
+            && self.flags.gfx12_mq4v2_fp8_qkv
+            && self.fp8_v2_rows_admit(batch_size);
         // Balanced-aspect launch: block/LDS/grid follow the selected geometry
         // (bv = BM/16 keeps batch_tiles = ceil(N/BM)).
         let (vbm, vbn, vbk, vwaves) = Self::fp8_v2_geom(&self.arch);
@@ -12258,8 +12261,9 @@ impl Gpu {
         // already-guarded uniform route above (exact gfx1201, eager, K%256)
         // plus N>=256; the family flag stays a prerequisite and smaller
         // batches keep s2bt8/BT. Params/blob layout below is the frozen v2 ABI.
-        let v2 =
-            self.flags.gfx12_mq4v2_fp8_v2 && self.flags.gfx12_mq4v2_fp8_qkv && self.fp8_v2_rows_admit(batch_size);
+        let v2 = self.flags.gfx12_mq4v2_fp8_v2
+            && self.flags.gfx12_mq4v2_fp8_qkv
+            && self.fp8_v2_rows_admit(batch_size);
         // Balanced-aspect launch: block/LDS/grid follow the selected geometry
         // (bv = BM/16 keeps batch_tiles = ceil(N/BM)).
         let (vbm, vbn, vbk, vwaves) = Self::fp8_v2_geom(&self.arch);
@@ -36801,8 +36805,16 @@ impl Gpu {
         }
         self.bind_thread()?;
         let res = self.reserve_int4_mmq(k, rows)?;
-        let prep =
-            self.fused_rmsnorm_rotate_mq_i4_gfx12_batched(x, norm_weight, awq, None, res, k, eps, rows)?;
+        let prep = self.fused_rmsnorm_rotate_mq_i4_gfx12_batched(
+            x,
+            norm_weight,
+            awq,
+            None,
+            res,
+            k,
+            eps,
+            rows,
+        )?;
         let xq = self.int4_mmq_prepared_ptr(&prep, k, rows)?;
         self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_qkv, xq, y_qkv, dims[0], k, rows)?;
         self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_beta, xq, y_beta, dims[1], k, rows)?;
@@ -38163,8 +38175,9 @@ impl Gpu {
         // already-guarded uniform route above (exact gfx1201, eager, K%256)
         // plus N>=256; the family flag stays a prerequisite and smaller
         // batches keep s2bt8/BT. Params/blob layout below is the frozen v2 ABI.
-        let v2 =
-            self.flags.gfx12_mq4v2_fp8_v2 && self.flags.gfx12_mq4v2_fp8_gateup && self.fp8_v2_rows_admit(batch_size);
+        let v2 = self.flags.gfx12_mq4v2_fp8_v2
+            && self.flags.gfx12_mq4v2_fp8_gateup
+            && self.fp8_v2_rows_admit(batch_size);
         // Balanced-aspect launch: block/LDS/grid follow the selected geometry
         // (bv = BM/16 keeps batch_tiles = ceil(N/BM)).
         let (vbm, vbn, vbk, vwaves) = Self::fp8_v2_geom(&self.arch);
@@ -40381,8 +40394,9 @@ impl Gpu {
         // K%256) plus N>=256; the family flag stays a prerequisite and
         // smaller batches keep s2bt8/BT. Params/blob layout below is the
         // frozen v2 ABI.
-        let v2 =
-            self.flags.gfx12_mq4v2_fp8_v2 && self.flags.gfx12_mq4v2_fp8_resid && self.fp8_v2_rows_admit(batch_size);
+        let v2 = self.flags.gfx12_mq4v2_fp8_v2
+            && self.flags.gfx12_mq4v2_fp8_resid
+            && self.fp8_v2_rows_admit(batch_size);
         // Balanced-aspect launch: block/LDS/grid follow the selected geometry
         // (bv = BM/16 keeps batch_tiles = ceil(N/BM)).
         let (vbm, vbn, vbk, vwaves) = Self::fp8_v2_geom(&self.arch);
@@ -53477,10 +53491,17 @@ mod qwen4_trunk_ordinary_prefill_tests {
         for rows in (1usize..=1300).chain([4097, 8151, 8191, 8192, 8193]) {
             let dense = super::qwen4_trunk_iu4_dense_rows_for(I::OrdinaryPrefill, rows);
             let ragged = super::qwen4_trunk_iu4_ragged_rows_for(I::OrdinaryPrefill, rows);
-            assert_ne!(dense, ragged.is_some(), "rows {rows}: exactly one of dense/ragged");
+            assert_ne!(
+                dense,
+                ragged.is_some(),
+                "rows {rows}: exactly one of dense/ragged"
+            );
             assert_eq!(dense, rows % 256 == 0, "rows {rows}");
             if let Some(pad) = ragged {
-                assert!(pad >= rows && pad % 256 == 0 && pad - rows < 256, "rows {rows} pad {pad}");
+                assert!(
+                    pad >= rows && pad % 256 == 0 && pad - rows < 256,
+                    "rows {rows} pad {pad}"
+                );
             }
             for product in [I::Product, I::InvariantProfile] {
                 assert_eq!(
@@ -53493,8 +53514,14 @@ mod qwen4_trunk_ordinary_prefill_tests {
                 );
             }
         }
-        assert!(!super::qwen4_trunk_iu4_dense_rows_for(I::OrdinaryPrefill, 0));
-        assert_eq!(super::qwen4_trunk_iu4_ragged_rows_for(I::OrdinaryPrefill, 0), None);
+        assert!(!super::qwen4_trunk_iu4_dense_rows_for(
+            I::OrdinaryPrefill,
+            0
+        ));
+        assert_eq!(
+            super::qwen4_trunk_iu4_ragged_rows_for(I::OrdinaryPrefill, 0),
+            None
+        );
     }
 }
 
@@ -53742,7 +53769,8 @@ impl Gpu {
         // The ordinary prefill intent never takes the append route's F16 MoE suppression: its
         // symmetric IU4 arm is part of the canonical recipe at every row count.
         let append_f16 = self.qwen4_append_f16_moe_scope
-            && self.prefill_route_intent() != crate::prefill_invariant::PrefillRouteIntent::OrdinaryPrefill;
+            && self.prefill_route_intent()
+                != crate::prefill_invariant::PrefillRouteIntent::OrdinaryPrefill;
         sym_iu4_rows_admit_from(
             self.route_rows(rows),
             append_f16,

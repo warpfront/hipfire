@@ -26,8 +26,8 @@ use crate::pipeline::batched_deltanet::*;
 use crate::pipeline::dump_hidden_localize;
 use crate::pipeline::hybrid::HybridDims;
 use hip_bridge::{HipError, HipResult};
-use rdna_compute::norm::GdnScanOut;
 use rdna_compute::gdn_stream::GdnScanAlgorithm;
+use rdna_compute::norm::GdnScanOut;
 use rdna_compute::prefill_route_capabilities::{self, PrefillRoute};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -366,7 +366,6 @@ fn gdn_moe_route(
         GdnMoeRoute::Legacy
     }
 }
-
 
 /// Batched gated DeltaNet mixer of a MoE layer, then the layer's MoE FFN
 /// (`moe_ffn`, which reads and accumulates into `pbs.x_batch`).
@@ -776,17 +775,21 @@ pub fn execute_deltanet_moe_layer_batched(
     );
     // The fused preamble already materializes value-head Q/K. It wins over
     // QK_INDEXED, which otherwise consumes the normalized raw key-head planes.
-    let qk_indexed_ratio = if stream_call.is_some() { None } else { gdn_qk_indexed_ratio(
-        gdn_qk_indexed_on(&gpu.arch),
-        pre_fused_ratio.is_some(),
-        dn_state.quant,
-        tree_parents.is_some(),
-        batch_semantics.is_independent(),
-        config.linear_key_heads,
-        n_v_heads,
-        hd,
-        config.linear_value_dim,
-    ) };
+    let qk_indexed_ratio = if stream_call.is_some() {
+        None
+    } else {
+        gdn_qk_indexed_ratio(
+            gdn_qk_indexed_on(&gpu.arch),
+            pre_fused_ratio.is_some(),
+            dn_state.quant,
+            tree_parents.is_some(),
+            batch_semantics.is_independent(),
+            config.linear_key_heads,
+            n_v_heads,
+            hd,
+            config.linear_value_dim,
+        )
+    };
     let chunk_scan = stream_algo == Some(GdnScanAlgorithm::Scan64);
     let moe_route = gdn_moe_route(chunk_scan, pre_fused_ratio, qk_indexed_ratio);
     if let (GdnMoeRoute::ChunkScan, Some(call)) = (moe_route, stream_call.as_ref()) {
@@ -1125,7 +1128,15 @@ pub fn execute_deltanet_moe_layer_batched(
                     .as_ref()
                     .filter(|_| stream_algo == Some(GdnScanAlgorithm::Sequential))
                 {
-                    gdn_stream_sequential_layer(gpu, call, pbs, dn_state, delta_layer_idx, n, n_v_heads)?
+                    gdn_stream_sequential_layer(
+                        gpu,
+                        call,
+                        pbs,
+                        dn_state,
+                        delta_layer_idx,
+                        n,
+                        n_v_heads,
+                    )?
                 } else if let Some(ratio) = qk_indexed_ratio {
                     // Raw (un-repeated) Q/K: the kernel maps value head h to
                     // key head h / ratio. `qk_indexed_ratio` is Some only for

@@ -589,7 +589,9 @@ impl Gpu {
         }
         let rows = GDN_COMMIT_ROWS;
         let k = desc.dim;
-        let field = |p: GdnProjDesc, small_m_tail: bool| self.gdn_input_arith(desc, p, k, rows, small_m_tail);
+        let field = |p: GdnProjDesc, small_m_tail: bool| {
+            self.gdn_input_arith(desc, p, k, rows, small_m_tail)
+        };
         let projection_recipe = GdnProjectionRecipe {
             qkv: field(desc.qkv, false),
             z: field(desc.z, false),
@@ -618,7 +620,11 @@ impl Gpu {
         } else {
             GdnTensorFormat::F32
         };
-        let commit_rows = if desc.state == GdnStateQuant::F32 { 0 } else { GDN_COMMIT_ROWS };
+        let commit_rows = if desc.state == GdnStateQuant::F32 {
+            0
+        } else {
+            GDN_COMMIT_ROWS
+        };
         // Minimum physical producer tile: gfx1201 A4/FP8/A8 consumers mask partial tiles
         // natively (1 row); gfx11 symmetric IU4 symfold arithmetic needs a complete 128-row tile.
         let producer_tile_rows = if self.arch.starts_with("gfx11")
@@ -732,7 +738,10 @@ impl Gpu {
             return (gdn_arith::A8, false);
         }
         if self.flags.iu4_prefill_enabled() && k % 256 == 0 {
-            return (gdn_arith::IU4_G12 + 0x80 * (self.arch != "gfx1201") as u32, false);
+            return (
+                gdn_arith::IU4_G12 + 0x80 * (self.arch != "gfx1201") as u32,
+                false,
+            );
         }
         (gdn_arith::F16_WMMA, false)
     }

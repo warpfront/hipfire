@@ -66,9 +66,23 @@ struct Geo {
 
 const GEOS: [Geo; 2] = [
     // Ornith / A3B family LA geometry.
-    Geo { name: "ornith", k: 2048, qkv: 8192, z: 4096, beta: 32, alpha: 32 },
+    Geo {
+        name: "ornith",
+        k: 2048,
+        qkv: 8192,
+        z: 4096,
+        beta: 32,
+        alpha: 32,
+    },
     // Qwen3.6/3.8 27B dense LA geometry (the fused qkvzagdn dims).
-    Geo { name: "q27b", k: 5120, qkv: 10240, z: 6144, beta: 48, alpha: 48 },
+    Geo {
+        name: "q27b",
+        k: 5120,
+        qkv: 10240,
+        z: 6144,
+        beta: 48,
+        alpha: 48,
+    },
 ];
 
 struct Rng(u64);
@@ -170,7 +184,16 @@ fn upload(gpu: &mut Gpu, geo: Geo, seed: u64) -> Res {
         gpu.alloc_tensor(&[REF_ROWS, geo.z + 128], DType::F32)
             .expect("y_z_fold")
     });
-    Res { geo, w, z_fold, norm, x, x_rot, ys, y_z_fold }
+    Res {
+        geo,
+        w,
+        z_fold,
+        norm,
+        x,
+        x_rot,
+        ys,
+        y_z_fold,
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -222,9 +245,20 @@ fn run(gpu: &mut Gpu, r: &Res, arm: Arm, off: usize, n: usize) -> R {
         Arm::Prep => {
             let res = gpu.reserve_int4_mmq(g.k, n)?;
             let prep = if gpu.arch == "gfx1201" {
-                gpu.fused_rmsnorm_rotate_mq_i4_gfx12_batched(&x, &r.norm, None, None, res, g.k, EPS, n)?
+                gpu.fused_rmsnorm_rotate_mq_i4_gfx12_batched(
+                    &x, &r.norm, None, None, res, g.k, EPS, n,
+                )?
             } else {
-                gpu.fused_rmsnorm_rotate_mq_i4_batched(&x, &r.norm, None, Some(&xr), res, g.k, EPS, n)?
+                gpu.fused_rmsnorm_rotate_mq_i4_batched(
+                    &x,
+                    &r.norm,
+                    None,
+                    Some(&xr),
+                    res,
+                    g.k,
+                    EPS,
+                    n,
+                )?
             };
             gpu.gemm_qkvza_mq4g256v2_wmma_iu4_prepared(
                 &r.w[0], &r.w[1], &r.w[2], &r.w[3], &xr, &prep, &y[0], &y[1], &y[2], &y[3], g.qkv,
@@ -235,11 +269,12 @@ fn run(gpu: &mut Gpu, r: &Res, arm: Arm, off: usize, n: usize) -> R {
             let fold = r.z_fold.as_ref().expect("zba arm needs the 27B fold");
             let yf = r.y_z_fold.as_ref().unwrap().sub_offset(0, n * (g.z + 128));
             let res = gpu.reserve_int4_mmq(g.k, n)?;
-            let prep =
-                gpu.fused_rmsnorm_rotate_mq_i4_gfx12_batched(&x, &r.norm, None, None, res, g.k, EPS, n)?;
+            let prep = gpu.fused_rmsnorm_rotate_mq_i4_gfx12_batched(
+                &x, &r.norm, None, None, res, g.k, EPS, n,
+            )?;
             gpu.gemm_qkvza_mq4g256v2_wmma_iu4_prepared_zba(
-                &r.w[0], fold, &r.w[2], &r.w[3], &xr, &prep, &y[0], &yf, &y[1], &y[2], &y[3], g.qkv,
-                g.z, g.beta, g.alpha, g.k, n,
+                &r.w[0], fold, &r.w[2], &r.w[3], &xr, &prep, &y[0], &yf, &y[1], &y[2], &y[3],
+                g.qkv, g.z, g.beta, g.alpha, g.k, n,
             )
         }
     }
@@ -275,14 +310,21 @@ fn offsets_for(n: usize) -> Vec<usize> {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let scope_on = !args.windows(2).any(|w| w[0] == "--scope" && w[1] == "off");
-    let geos: Vec<Geo> = match args.windows(2).find(|w| w[0] == "--geo").map(|w| w[1].as_str()) {
+    let geos: Vec<Geo> = match args
+        .windows(2)
+        .find(|w| w[0] == "--geo")
+        .map(|w| w[1].as_str())
+    {
         Some(name) => GEOS.iter().copied().filter(|g| g.name == name).collect(),
         None => GEOS.to_vec(),
     };
     let quick = args.iter().any(|a| a == "--quick");
     let mut gpu = Gpu::init().expect("gpu init");
     if gpu.arch != "gfx1201" && !gpu.arch.starts_with("gfx11") {
-        eprintln!("gdn_canonical_producer_oracle: unsupported arch {}", gpu.arch);
+        eprintln!(
+            "gdn_canonical_producer_oracle: unsupported arch {}",
+            gpu.arch
+        );
         std::process::exit(2);
     }
     gpu.mq4v2_symmetric = true;
@@ -326,7 +368,11 @@ fn main() {
                     gpu.fp8_stream_active(n, k),
                     gpu.mq4g256v2_shared_iu4_supported(k, n),
                 );
-                assert_eq!(got, bulk, "{} predicates at n={n} differ from the bulk admission", geo.name);
+                assert_eq!(
+                    got, bulk,
+                    "{} predicates at n={n} differ from the bulk admission",
+                    geo.name
+                );
             }
             gpu.ordinary_prefill_exit(prev);
         }
@@ -339,7 +385,10 @@ fn main() {
         #[cfg(feature = "deltanet")]
         {
             use rdna_compute::prefill_invariant::{GdnLayerDesc, GdnProjDesc};
-            let d = |m| GdnProjDesc { dtype: DType::MQ4G256V2, m };
+            let d = |m| GdnProjDesc {
+                dtype: DType::MQ4G256V2,
+                m,
+            };
             let desc = GdnLayerDesc {
                 dim: k,
                 key_heads: 16,
@@ -357,9 +406,12 @@ fn main() {
                 scan64_admitted: true,
             };
             let plan = gpu.resolve_gdn_prefill_plan(&desc).expect("plan");
-            println!("{}", json!({"plan": geo.name, "recipe_id": format!("{:#x}", plan.recipe_id),
+            println!(
+                "{}",
+                json!({"plan": geo.name, "recipe_id": format!("{:#x}", plan.recipe_id),
                 "algorithm": format!("{:?}", plan.algorithm), "proj": format!("{:?}", plan.projection_recipe),
-                "scan_out": format!("{:?}", plan.scan_output_format), "tile": plan.producer_tile_rows}));
+                "scan_out": format!("{:?}", plan.scan_output_format), "tile": plan.producer_tile_rows})
+            );
         }
         let arms: Vec<Arm> = {
             let mut a = vec![Arm::Unprep];
@@ -385,12 +437,18 @@ fn main() {
                     continue;
                 }
                 for off in offsets_for(n) {
-                    let prev = if scope_on { Some(gpu.ordinary_prefill_enter()) } else { None };
+                    let prev = if scope_on {
+                        Some(gpu.ordinary_prefill_enter())
+                    } else {
+                        None
+                    };
                     let res = run(&mut gpu, &r, arm, off, n);
                     if let Some(p) = prev {
                         gpu.ordinary_prefill_exit(p);
                     }
-                    res.unwrap_or_else(|e| panic!("{} {} n={n} off={off}: {e:?}", geo.name, arm.name()));
+                    res.unwrap_or_else(|e| {
+                        panic!("{} {} n={n} off={off}: {e:?}", geo.name, arm.name())
+                    });
                     gpu.hip.device_synchronize().unwrap();
                     let got = download(&gpu, &r, n);
                     let mut ok = true;
@@ -415,7 +473,9 @@ fn main() {
             // reference rows' QKV/beta/alpha bytes as an independent `rows`-row call.
             if arm == Arm::Prep && scope_on && gpu.iu4_producer_quant_fused_active(512, geo.k) {
                 let (mut raw_calls, mut raw_bad) = (0usize, 0usize);
-                for &rows in &[1usize, 2, 3, 15, 16, 17, 25, 31, 32, 33, 63, 64, 65, 100, 127, 128, 129] {
+                for &rows in &[
+                    1usize, 2, 3, 15, 16, 17, 25, 31, 32, 33, 63, 64, 65, 100, 127, 128, 129,
+                ] {
                     for &off in &[0usize, 5, 64, 1000, 8191 - rows] {
                         let x = r.x.sub_offset(off * geo.k, rows * geo.k);
                         let y: Vec<GpuTensor> = [geo.qkv, geo.beta, geo.alpha]
@@ -429,15 +489,29 @@ fn main() {
                         let prev = gpu.ordinary_prefill_enter();
                         let did = gpu
                             .gdn_raw_rows_g12_iu4(
-                                &x, &r.norm, None, EPS, &r.w[0], &r.w[2], &r.w[3], &y[0], &y[1], &y[2],
-                                [geo.qkv, geo.beta, geo.alpha], geo.k, rows,
+                                &x,
+                                &r.norm,
+                                None,
+                                EPS,
+                                &r.w[0],
+                                &r.w[2],
+                                &r.w[3],
+                                &y[0],
+                                &y[1],
+                                &y[2],
+                                [geo.qkv, geo.beta, geo.alpha],
+                                geo.k,
+                                rows,
                             )
                             .unwrap();
                         gpu.ordinary_prefill_exit(prev);
                         assert!(did, "raw-rows materializer declined at rows={rows}");
                         gpu.hip.device_synchronize().unwrap();
                         let mut ok = true;
-                        for (t, (f, m)) in y.iter().zip([(0usize, geo.qkv), (2, geo.beta), (3, geo.alpha)]) {
+                        for (t, (f, m)) in
+                            y.iter()
+                                .zip([(0usize, geo.qkv), (2, geo.beta), (3, geo.alpha)])
+                        {
                             let got = gpu.download_raw_bytes(t).unwrap();
                             ok &= got == refo[f][off * m * 4..(off + rows) * m * 4];
                         }
@@ -499,7 +573,11 @@ fn main() {
         // rows the fused kernel stores must equal the SET's rows (that is what makes the SET
         // output the exact raw carry of an incomplete tile).
         #[cfg(feature = "deltanet")]
-        if geo.name == "q27b" && gpu.arch == "gfx1201" && r.z_fold.is_some() && gpu.flags.iu4_prefill_enabled() {
+        if geo.name == "q27b"
+            && gpu.arch == "gfx1201"
+            && r.z_fold.is_some()
+            && gpu.flags.iu4_prefill_enabled()
+        {
             let nl: Vec<usize> = N_LIST
                 .iter()
                 .copied()
@@ -582,7 +660,11 @@ fn run_site(
 ) -> R {
     let (_, k, ms) = site_shape(s);
     let xv = x.sub_offset(off * k, n * k);
-    let y: Vec<GpuTensor> = ms.iter().zip(ys).map(|(m, t)| t.sub_offset(0, n * m)).collect();
+    let y: Vec<GpuTensor> = ms
+        .iter()
+        .zip(ys)
+        .map(|(m, t)| t.sub_offset(0, n * m))
+        .collect();
     match s {
         Site::ResidualAdd => {
             let r0 = y0.sub_offset(off * ms[0], n * ms[0]);
@@ -605,13 +687,15 @@ fn run_site(
         (Site::GateUp, false) => gpu.gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2(
             &w[0], &w[1], &xv, &y[0], &y[1], ms[0], ms[1], k, n,
         ),
-        (Site::GateUp, true) => gpu.gemm_gate_up_mq4g256v2_wmma(
-            &w[0], &w[1], &xv, &y[0], &y[1], ms[0], ms[1], k, n,
-        ),
+        (Site::GateUp, true) => {
+            gpu.gemm_gate_up_mq4g256v2_wmma(&w[0], &w[1], &xv, &y[0], &y[1], ms[0], ms[1], k, n)
+        }
         (Site::ResidualAdd, false) => {
             gpu.gemm_hfq4g256_residual_wmma_gfx12_mq4v2(&w[0], &xv, &y[0], ms[0], k, n)
         }
-        (Site::ResidualAdd, true) => gpu.gemm_mq4g256v2_residual_wmma(&w[0], &xv, &y[0], ms[0], k, n),
+        (Site::ResidualAdd, true) => {
+            gpu.gemm_mq4g256v2_residual_wmma(&w[0], &xv, &y[0], ms[0], k, n)
+        }
         (Site::SharedDown, _) => gpu.gemm_mq4g256v2(&w[0], &xv, &y[0], ms[0], k, n),
     }
 }
@@ -619,7 +703,12 @@ fn run_site(
 fn other_sites(gpu: &mut Gpu, scope_on: bool, quick: bool) -> (usize, usize, Option<Value>) {
     let (mut total, mut bad) = (0usize, 0usize);
     let mut first: Option<Value> = None;
-    for s in [Site::FaQkv, Site::GateUp, Site::ResidualAdd, Site::SharedDown] {
+    for s in [
+        Site::FaQkv,
+        Site::GateUp,
+        Site::ResidualAdd,
+        Site::SharedDown,
+    ] {
         let (name, k, ms) = site_shape(s);
         let w: Vec<GpuTensor> = ms
             .iter()
@@ -700,7 +789,11 @@ fn other_sites(gpu: &mut Gpu, scope_on: bool, quick: bool) -> (usize, usize, Opt
 /// fused launcher declined (not admitted). `Ok(Some(None))`: identical; `Ok(Some(Some(what)))`:
 /// the first differing buffer.
 #[cfg(feature = "deltanet")]
-fn fused_vs_plain(gpu: &mut Gpu, r: &Res, n: usize) -> rdna_compute::HipResult<Option<Option<String>>> {
+fn fused_vs_plain(
+    gpu: &mut Gpu,
+    r: &Res,
+    n: usize,
+) -> rdna_compute::HipResult<Option<Option<String>>> {
     use rdna_compute::F2GdnTargets;
     let g = r.geo;
     let (hk, hv, hd) = (16usize, 48usize, 128usize);
@@ -733,7 +826,8 @@ fn fused_vs_plain(gpu: &mut Gpu, r: &Res, n: usize) -> rdna_compute::HipResult<O
             gpu.hip.memset(&t.buf, SENTINEL, t.byte_size())?;
         }
         let res = gpu.reserve_int4_mmq(g.k, n)?;
-        let prep = gpu.fused_rmsnorm_rotate_mq_i4_gfx12_batched(&x, &r.norm, None, None, res, g.k, EPS, n)?;
+        let prep = gpu
+            .fused_rmsnorm_rotate_mq_i4_gfx12_batched(&x, &r.norm, None, None, res, g.k, EPS, n)?;
         gpu.gemm_qkvza_mq4g256v2_wmma_iu4_prepared(
             &r.w[0], &r.w[1], &r.w[2], &r.w[3], &xr, &prep, &p[0], &p[1], &p[2], &p[3], g.qkv, g.z,
             g.beta, g.alpha, g.k, n,
@@ -749,7 +843,8 @@ fn fused_vs_plain(gpu: &mut Gpu, r: &Res, n: usize) -> rdna_compute::HipResult<O
             gpu.hip.memset(&t.buf, SENTINEL, t.byte_size())?;
         }
         let res = gpu.reserve_int4_mmq(g.k, n)?;
-        let prep = gpu.fused_rmsnorm_rotate_mq_i4_gfx12_batched(&x, &r.norm, None, None, res, g.k, EPS, n)?;
+        let prep = gpu
+            .fused_rmsnorm_rotate_mq_i4_gfx12_batched(&x, &r.norm, None, None, res, g.k, EPS, n)?;
         let targets = F2GdnTargets {
             conv_weight: &conv_w,
             conv_state: &f[7],
@@ -760,7 +855,16 @@ fn fused_vs_plain(gpu: &mut Gpu, r: &Res, n: usize) -> rdna_compute::HipResult<O
             eps: 1.0e-6,
         };
         let admitted = gpu.gemm_qkvza_mq4g256v2_iu4_gdn_prepared(
-            &r.w[0], fold, &prep, &f[0], &f[1], &f[2], &f[3], [g.qkv, g.z, g.beta, g.alpha], g.k, n,
+            &r.w[0],
+            fold,
+            &prep,
+            &f[0],
+            &f[1],
+            &f[2],
+            &f[3],
+            [g.qkv, g.z, g.beta, g.alpha],
+            g.k,
+            n,
             &targets,
         )?;
         if !admitted {
@@ -781,7 +885,11 @@ fn fused_vs_plain(gpu: &mut Gpu, r: &Res, n: usize) -> rdna_compute::HipResult<O
             let a = gpu.download_raw_bytes(&p[i])?;
             let b = gpu.download_raw_bytes(&f[i])?;
             if a != b && verdict.is_none() {
-                verdict = Some(format!("{} differs at byte {:?}", names[i], first_diff(&a, &b)));
+                verdict = Some(format!(
+                    "{} differs at byte {:?}",
+                    names[i],
+                    first_diff(&a, &b)
+                ));
             }
         }
         // Raw rows the fused kernel stored must be the SET rows: compare only rows it wrote
@@ -791,7 +899,9 @@ fn fused_vs_plain(gpu: &mut Gpu, r: &Res, n: usize) -> rdna_compute::HipResult<O
             let fr = &raw_fused[t * row..(t + 1) * row];
             let pr = &raw_plain[t * row..(t + 1) * row];
             if fr.iter().any(|b| *b != SENTINEL as u8) && fr != pr && verdict.is_none() {
-                verdict = Some(format!("raw qkv row {t} stored by the fused kernel differs from the SET"));
+                verdict = Some(format!(
+                    "raw qkv row {t} stored by the fused kernel differs from the SET"
+                ));
             }
         }
         for t in p.into_iter().chain(f) {

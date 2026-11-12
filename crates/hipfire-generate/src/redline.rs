@@ -243,8 +243,7 @@ pub fn redline_qwen_snapshot(
         redline_append_mapped(gpu, &mut kv, tensor)?;
     }
     let mut recurrent = Vec::new();
-    for tensor in bundle.dn_state.families().into_iter().flatten()
-    {
+    for tensor in bundle.dn_state.families().into_iter().flatten() {
         redline_append_buffer(gpu, &mut recurrent, &tensor.buf)?;
     }
     Ok(RedlineQwenSnapshot {
@@ -5530,12 +5529,7 @@ fn redline_trace_hash(bytes: &[u8]) -> u64 {
 }
 
 fn redline_trace_dn_planes(bundle: &Qwen35Bundle) -> Vec<&rdna_compute::GpuTensor> {
-    bundle
-        .dn_state
-        .families()
-        .into_iter()
-        .flatten()
-        .collect()
+    bundle.dn_state.families().into_iter().flatten().collect()
 }
 
 fn redline_trace_kv_planes(bundle: &Qwen35Bundle) -> Vec<&rdna_compute::GpuTensor> {

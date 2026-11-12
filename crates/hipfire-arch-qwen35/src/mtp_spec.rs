@@ -3991,7 +3991,9 @@ where
             off = end;
         }
         // The prompt spine ends ordinary prefill: one seal before decode/verify.
-        target.dn_state.seal_streams(gpu, start_pos + prompt_tokens.len())?;
+        target
+            .dn_state
+            .seal_streams(gpu, start_pos + prompt_tokens.len())?;
 
         let last = prompt_tokens.len() - 1;
         gpu.hip

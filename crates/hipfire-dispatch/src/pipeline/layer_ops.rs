@@ -19,8 +19,8 @@ use crate::families::gemm::{GemmFamily, GemmParams};
 use crate::families::gemv::WeightRef;
 use crate::types::DispatchError;
 use crate::types::KernelKey;
-use rdna_compute::qsa_sp_select::QsaSpBlocks;
 use rdna_compute::gdn_stream::GdnStreamPhase;
+use rdna_compute::qsa_sp_select::QsaSpBlocks;
 use rdna_compute::tensor_ops::gdn_wy_stream::{
     gdn_wy_stream_append, gdn_wy_stream_seal, wy_stream_admitted, GdnWyAppend, GdnWyCarry,
     GdnWyEdge, GdnWySeal,
@@ -978,11 +978,8 @@ fn project_trunk_masked_inner(
             // be padded (output capacity) is an error, never a silent fall to another recipe.
             if gpu.ordinary_prefill_active() && !gpu.qwen4_trunk_iu4_applies(rows) {
                 if let Some(n_pad) = gpu.qwen4_trunk_iu4_ragged(rows) {
-                    let rest: SmallVec<[usize; 4]> = mq4
-                        .iter()
-                        .copied()
-                        .filter(|&j| a4[j] && !done[j])
-                        .collect();
+                    let rest: SmallVec<[usize; 4]> =
+                        mq4.iter().copied().filter(|&j| a4[j] && !done[j]).collect();
                     if !rest.is_empty() {
                         // The Z|beta|alpha members project into the fold's full-capacity padded
                         // planes (their row views hold only `rows`); the rest into their own.
@@ -3203,7 +3200,10 @@ pub struct GdnCarryView<'a> {
 pub enum GdnEdgeView<'a> {
     /// gfx11 C16 WY stream: replay staging and the gated-norm stand-in for the seal's
     /// discarded rows (BF16 `[128]`).
-    Wy { edge: GdnWyEdge<'a>, norm: &'a GpuTensor },
+    Wy {
+        edge: GdnWyEdge<'a>,
+        norm: &'a GpuTensor,
+    },
     /// gfx1201 dense C64 stream: the F32 widened-constants staging and the edge workspace.
     /// `carry.tile_entry` is the F32 tile-entry state, `carry.pending_conv` the F32
     /// `[live ring | tile ring | pending qkv]` plane and `carry.pending_params` the pending
@@ -3981,8 +3981,7 @@ pub fn execute_gated_delta_net_uncovered(
 /// under `HIPFIRE_QWEN4_GDN_LANES_ROWS` ([`rdna_compute::feature_flags::FeatureFlags::qwen4_gdn_lanes_rows_enabled`]).
 pub fn gdn_core_lane_groupable(gpu: &Gpu, op: &GatedDeltaNetOp<'_>) -> bool {
     // An op whose stream is open must run the per-op route, which seals it.
-    !op
-        .carry
+    !op.carry
         .as_ref()
         .is_some_and(|view| view.carry.meta.get().phase == GdnStreamPhase::Open)
         && op.phase == MixerPhase::Core

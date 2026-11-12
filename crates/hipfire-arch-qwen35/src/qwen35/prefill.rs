@@ -21,10 +21,10 @@ use super::forward::Qwen35Scratch;
 use super::program::{
     batched_attention_tap, deltanet_state_view, flash_scratch, gdn_tape_view, hybrid_dims, kv_view,
 };
-use super::weights::DeltaNetState;
 use super::weights::DeltaNetCarry;
-use super::weights::GdnStreamBinding;
+use super::weights::DeltaNetState;
 use super::weights::DeltaNetStateGeometry;
+use super::weights::GdnStreamBinding;
 use super::weights::LayerWeights;
 use super::weights::MoeFfnWeights;
 use super::weights::Qwen35Weights;
@@ -71,12 +71,14 @@ use hipfire_dispatch::pipeline::gated_mlp::MlpOutput;
 use hipfire_dispatch::pipeline::GemvInput;
 use hipfire_dispatch::pipeline::Step;
 use hipfire_runtime::llama;
+use rdna_compute::gdn_stream::{
+    GdnPrefillPlan, GdnScanAlgorithm, GdnStateQuant, GdnStreamMeta, GdnTensorFormat,
+};
 use rdna_compute::norm::GdnScanOut;
-use rdna_compute::gdn_stream::{GdnPrefillPlan, GdnScanAlgorithm, GdnStateQuant, GdnStreamMeta, GdnTensorFormat};
 use rdna_compute::prefill_invariant::{GdnLayerDesc, GdnProjDesc};
-use std::cell::{Cell, RefCell};
 use rdna_compute::prefill_route_capabilities;
 use rdna_compute::prefill_route_capabilities::PrefillRoute;
+use std::cell::{Cell, RefCell};
 
 /// Multi-request batched prefill chunk (cross-request speculative verify).
 #[path = "prefill_multi.rs"]
@@ -6309,7 +6311,12 @@ pub(crate) fn resolve_gdn_stream_plans(
         let ef_slot = plans.len() < dn_state.s_ef_residual.len();
         let desc = match lw {
             LayerWeights::DeltaNet(l) => {
-                let dtypes = [l.wqkv.gpu_dtype, l.wz.gpu_dtype, l.w_beta.gpu_dtype, l.w_alpha.gpu_dtype];
+                let dtypes = [
+                    l.wqkv.gpu_dtype,
+                    l.wz.gpu_dtype,
+                    l.w_beta.gpu_dtype,
+                    l.w_alpha.gpu_dtype,
+                ];
                 let z_folded = dtypes == [DType::MQ4G256V2; 4]
                     && l.wz.buf.byte_size()
                         == gpu.mq4v2_fold_betaalpha_padded_m(l.wz.m)
@@ -6333,7 +6340,12 @@ pub(crate) fn resolve_gdn_stream_plans(
                 }
             }
             LayerWeights::DeltaNetMoe(l) => {
-                let dtypes = [l.wqkv.gpu_dtype, l.wz.gpu_dtype, l.w_beta.gpu_dtype, l.w_alpha.gpu_dtype];
+                let dtypes = [
+                    l.wqkv.gpu_dtype,
+                    l.wz.gpu_dtype,
+                    l.w_beta.gpu_dtype,
+                    l.w_alpha.gpu_dtype,
+                ];
                 GdnLayerDesc {
                     dim: config.dim,
                     key_heads: config.linear_num_key_heads,
@@ -6412,9 +6424,9 @@ pub fn provision_gdn_stream(
             return Err(HipError::new(
                 0,
                 &format!(
-                    "GDN stream: the state's carry {:?} cannot serve plans needing microtile {micro}",
-                    c.geometry
-                ),
+                "GDN stream: the state's carry {:?} cannot serve plans needing microtile {micro}",
+                c.geometry
+            ),
             ))
         }
         None => dn_state.stream.attach_carry(gpu, geometry)?,
@@ -6444,7 +6456,10 @@ pub fn provision_gdn_stream(
         });
     }
     let mut formats: Vec<GdnScanOut> = Vec::new();
-    for p in plans.iter().filter(|p| p.algorithm == GdnScanAlgorithm::Scan64) {
+    for p in plans
+        .iter()
+        .filter(|p| p.algorithm == GdnScanAlgorithm::Scan64)
+    {
         let f = match p.scan_output_format {
             GdnTensorFormat::Bf16 => GdnScanOut::Bf16,
             _ => GdnScanOut::F32,
@@ -6528,7 +6543,9 @@ fn with_gdn_forward<T>(
     }
     match (session, result) {
         (Some(s), Ok(v)) => {
-            dn_state.stream.commit_candidates(&s.candidates.into_inner())?;
+            dn_state
+                .stream
+                .commit_candidates(&s.candidates.into_inner())?;
             Ok(v)
         }
         (Some(s), Err(e)) => {
@@ -6976,28 +6993,34 @@ fn forward_prefill_chunk_pair(
         false,
         mask_override.is_some(),
     );
-    with_gdn_forward(gpu, dn_state, plain, start_pos + chunk_start_c, |gpu, dn_state, route| {
-        forward_prefill_chunk_pair_body(
-            gpu,
-            weights,
-            config,
-            tokens_c,
-            tokens_n,
-            start_pos,
-            chunk_start_c,
-            kv_cache,
-            dn_state,
-            s,
-            pbs_c,
-            pbs_n,
-            stage,
-            per_token_hidden_out,
-            mask_override,
-            needs_last_token_logits,
-            fusion,
-            route,
-        )
-    })
+    with_gdn_forward(
+        gpu,
+        dn_state,
+        plain,
+        start_pos + chunk_start_c,
+        |gpu, dn_state, route| {
+            forward_prefill_chunk_pair_body(
+                gpu,
+                weights,
+                config,
+                tokens_c,
+                tokens_n,
+                start_pos,
+                chunk_start_c,
+                kv_cache,
+                dn_state,
+                s,
+                pbs_c,
+                pbs_n,
+                stage,
+                per_token_hidden_out,
+                mask_override,
+                needs_last_token_logits,
+                fusion,
+                route,
+            )
+        },
+    )
 }
 
 #[allow(clippy::too_many_arguments)]

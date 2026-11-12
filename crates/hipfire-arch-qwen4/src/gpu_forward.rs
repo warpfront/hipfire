@@ -10117,9 +10117,7 @@ impl<'a> LayerPhaseEnv<'a> {
                     // included) appends to the layer's WY stream at absolute tile
                     // and seam positions; decode and verify are consumers of
                     // the live slot and seal an open stream first.
-                    carry: bundle
-                        .state
-                        .gdn_carry_view(gdn_slot, self.prefill_scope),
+                    carry: bundle.state.gdn_carry_view(gdn_slot, self.prefill_scope),
                 }));
             }
             LayerType::FullAttention => {

@@ -26,9 +26,7 @@ use rdna_compute::gdn_stream::{
     GdnStreamMeta, GdnStreamPhase, GdnStreamWorkspace, GdnTensorFormat, GDN_COMMIT_ROWS,
     GDN_STREAM_SCHEMA_VERSION,
 };
-use rdna_compute::tensor_ops::gdn_wy_stream::{
-    wy_advance_meta, wy_stream_admitted, WY_TILE_ROWS,
-};
+use rdna_compute::tensor_ops::gdn_wy_stream::{wy_advance_meta, wy_stream_admitted, WY_TILE_ROWS};
 
 /// Session metadata words one carrying GDN layer adds
 /// (`[schema|phase, recipe, position, phase_start, frame_base, tile_base,
@@ -186,7 +184,10 @@ pub(crate) fn resolve_gdn_stream_kind(
 }
 
 /// The stream recipe `kind` resolves for `format`, `None` without a carrying kind.
-pub(crate) fn resolve_gdn_stream(kind: GdnStreamKind, format: GdnStateFormat) -> Option<GdnPrefillPlan> {
+pub(crate) fn resolve_gdn_stream(
+    kind: GdnStreamKind,
+    format: GdnStateFormat,
+) -> Option<GdnPrefillPlan> {
     kind.algorithm().map(|_| gdn_stream_plan(kind, format))
 }
 
@@ -196,9 +197,8 @@ pub(crate) fn carry_layer_specs(
     config: &Qwen4Config,
     kind: GdnStreamKind,
 ) -> [(&'static str, usize, DType); 3] {
-    let state = config.linear_num_value_heads
-        * config.linear_key_head_dim
-        * config.linear_value_head_dim;
+    let state =
+        config.linear_num_value_heads * config.linear_key_head_dim * config.linear_value_head_dim;
     match kind {
         GdnStreamKind::Scan64 => {
             let (conv, params) = rdna_compute::fn_gdn_dense::stream_carry_elems(
@@ -230,7 +230,10 @@ pub(crate) fn carry_layer_specs(
 /// Allocation specs of the shared edge staging of `kind` (the Scan64 workspace is allocated
 /// by [`Gpu::gdn_stream_workspace_alloc`], its bytes counted by [`scan64_workspace_bytes`]):
 /// `(name, elements, dtype)`.
-pub(crate) fn edge_specs(config: &Qwen4Config, kind: GdnStreamKind) -> Vec<(&'static str, usize, DType)> {
+pub(crate) fn edge_specs(
+    config: &Qwen4Config,
+    kind: GdnStreamKind,
+) -> Vec<(&'static str, usize, DType)> {
     match kind {
         GdnStreamKind::Scan64 => vec![(
             "gdn_edge.consts",
@@ -241,8 +244,7 @@ pub(crate) fn edge_specs(config: &Qwen4Config, kind: GdnStreamKind) -> Vec<(&'st
             DType::F32,
         )],
         _ => {
-            let stage =
-                WY_TILE_ROWS * config.linear_num_value_heads * config.linear_value_head_dim;
+            let stage = WY_TILE_ROWS * config.linear_num_value_heads * config.linear_value_head_dim;
             vec![
                 ("gdn_edge.z", stage, DType::F32),
                 ("gdn_edge.out", stage, DType::F32),
@@ -263,7 +265,11 @@ pub(crate) fn scan64_workspace_plane_bytes(config: &Qwen4Config) -> [usize; 9] {
 }
 
 /// A freshly reset / never-opened cursor.
-pub(crate) fn sealed_cursor(plan: &GdnPrefillPlan, position: u64, generation: u64) -> GdnStreamMeta {
+pub(crate) fn sealed_cursor(
+    plan: &GdnPrefillPlan,
+    position: u64,
+    generation: u64,
+) -> GdnStreamMeta {
     GdnStreamMeta {
         recipe_id: plan.recipe_id,
         ..GdnStreamMeta::sealed_at(position, generation)
@@ -271,8 +277,7 @@ pub(crate) fn sealed_cursor(plan: &GdnPrefillPlan, position: u64, generation: u6
 }
 
 fn pack_phase(meta: &GdnStreamMeta) -> u64 {
-    u64::from(meta.schema_version)
-        | (u64::from(meta.phase == GdnStreamPhase::Open) << 32)
+    u64::from(meta.schema_version) | (u64::from(meta.phase == GdnStreamPhase::Open) << 32)
 }
 
 /// Session words of one layer's cursor.

@@ -318,7 +318,9 @@ pub fn session_snapshot_bytes(
     };
     let mut carry = 0usize;
     if format.gdn_stream != crate::GdnStreamKind::None {
-        for &(_, elements, dtype) in &crate::state::gdn_carry::carry_layer_specs(config, format.gdn_stream) {
+        for &(_, elements, dtype) in
+            &crate::state::gdn_carry::carry_layer_specs(config, format.gdn_stream)
+        {
             carry = carry.checked_add(part(elements.checked_mul(dtype.size())?)?)?;
         }
     }

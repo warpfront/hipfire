@@ -36,9 +36,9 @@
 //! Exit status 0 only if every comparison is byte identical and non-vacuous.
 
 use rdna_compute::gdn_stream::{
-    GdnCarryView, GdnLiveState, GdnPrefillPlan, GdnProjectionRecipe, GdnQ8Planes,
-    GdnScanAlgorithm, GdnScanEntry, GdnScanExit, GdnSeqInputs, GdnStateQuant, GdnStreamConsts,
-    GdnStreamMeta, GdnStreamPhase, GdnStreamRaw, GdnStreamScratch, GdnTensorFormat,
+    GdnCarryView, GdnLiveState, GdnPrefillPlan, GdnProjectionRecipe, GdnQ8Planes, GdnScanAlgorithm,
+    GdnScanEntry, GdnScanExit, GdnSeqInputs, GdnStateQuant, GdnStreamConsts, GdnStreamMeta,
+    GdnStreamPhase, GdnStreamRaw, GdnStreamScratch, GdnTensorFormat,
 };
 use rdna_compute::norm::GdnScanOut;
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -176,7 +176,13 @@ impl Cfg {
             algorithm: GdnScanAlgorithm::Scan64,
             micro_rows: 64,
             commit_rows: 512,
-            projection_recipe: GdnProjectionRecipe { qkv: 0, z: 0, alpha: 0, beta: 0, out: 0 },
+            projection_recipe: GdnProjectionRecipe {
+                qkv: 0,
+                z: 0,
+                alpha: 0,
+                beta: 0,
+                out: 0,
+            },
             scan_operand_format: GdnTensorFormat::F16,
             scan_output_format: match self.fmt {
                 GdnScanOut::F32 => GdnTensorFormat::F32,
@@ -229,7 +235,10 @@ impl Fixture {
             dt_bias,
             a_log,
             conv0: f32_bytes(&lcg(9, 3 * xdim, -0.5, 0.5)),
-            q80: lcg(10, hv * HD * HD, -64.0, 64.0).iter().map(|x| *x as i8 as u8).collect(),
+            q80: lcg(10, hv * HD * HD, -64.0, 64.0)
+                .iter()
+                .map(|x| *x as i8 as u8)
+                .collect(),
             scales0: f32_bytes(&lcg(11, hv * HD, 0.005, 0.02)),
             ef0: lcg(12, hv * HD * HD, -0.004, 0.004)
                 .iter()
@@ -305,10 +314,17 @@ impl Live {
         })
     }
     fn view(&self) -> GdnLiveState<'_> {
-        GdnLiveState { planes: self.planes(), conv: &self.conv }
+        GdnLiveState {
+            planes: self.planes(),
+            conv: &self.conv,
+        }
     }
     fn planes(&self) -> GdnQ8Planes<'_> {
-        GdnQ8Planes { codes: &self.codes, scales: &self.scales, ef: self.ef.as_ref() }
+        GdnQ8Planes {
+            codes: &self.codes,
+            scales: &self.scales,
+            ef: self.ef.as_ref(),
+        }
     }
     fn snap(&self, gpu: &Gpu) -> Result<StateBytes> {
         Ok(StateBytes {
@@ -439,8 +455,17 @@ fn stream_run(
             fill(gpu, t, 0xff)?;
         }
         let o = raw(gpu, n * orow)?;
-        let raw_in = GdnStreamRaw { qkv: &x, alpha: &a, beta: &b };
-        let scratch = GdnStreamScratch { q: &q, k: &k, v: &v, a: &aa };
+        let raw_in = GdnStreamRaw {
+            qkv: &x,
+            alpha: &a,
+            beta: &b,
+        };
+        let scratch = GdnStreamScratch {
+            q: &q,
+            k: &k,
+            v: &v,
+            a: &aa,
+        };
         let pos = s + done as u64;
         meta = gpu.gdn_stream_append(
             &plan,
@@ -479,7 +504,11 @@ fn stream_run(
                 // which feed the recurrence state; or the first four state
                 // rows): a single mantissa bit can round away in F16, and the Q ring only
                 // touches the replayed (unpublished) rows' own outputs.
-                let (first, span) = if what == 1 { (HK * HD * 3, (2 * HD + HD) * 3) } else { (0, 512) };
+                let (first, span) = if what == 1 {
+                    (HK * HD * 3, (2 * HD + HD) * 3)
+                } else {
+                    (0, 512)
+                };
                 for w in first..first + span {
                     d[w * 4 + 3] ^= 0x80;
                 }
@@ -499,7 +528,12 @@ fn stream_run(
     live.free(gpu)?;
     carry.free(gpu)?;
     gpu.gdn_stream_workspace_free(ws)?;
-    Ok(StreamRun { out, boundaries, sealed, final_meta })
+    Ok(StreamRun {
+        out,
+        boundaries,
+        sealed,
+        final_meta,
+    })
 }
 
 /// Independent absolute-tile reference (module docs). Returns outputs, the FP32 plane after every
@@ -519,8 +553,15 @@ fn tile_ref(gpu: &mut Gpu, fx: &Fixture, cfg: &Cfg, s: u64, n: usize) -> Result<
     let dummy = raw(gpu, 64)?;
     fn entry_live(l: &Live) -> GdnScanEntry<'_> {
         match &l.ef {
-            Some(ef) => GdnScanEntry::Q8Ef { codes: &l.codes, scales: &l.scales, ef },
-            None => GdnScanEntry::Q8 { codes: &l.codes, scales: &l.scales },
+            Some(ef) => GdnScanEntry::Q8Ef {
+                codes: &l.codes,
+                scales: &l.scales,
+                ef,
+            },
+            None => GdnScanEntry::Q8 {
+                codes: &l.codes,
+                scales: &l.scales,
+            },
         }
     }
     // Open: Q8(+EF) -> FP32 once.
@@ -561,14 +602,39 @@ fn tile_ref(gpu: &mut Gpu, fx: &Fixture, cfg: &Cfg, s: u64, n: usize) -> Result<
         let v = raw(gpu, 64 * hv * HD * 2)?;
         let aa = raw(gpu, 64 * hv * 64 * 2)?;
         let o = raw(gpu, 64 * orow)?;
-        gpu.gdn_chunk_prep(&x, &fx.conv_w, &ring, &a, &b, &fx.dt_bias, &fx.a_log, &q, &k, &v, rows, q_scale(), EPS, HK, hv)?;
+        gpu.gdn_chunk_prep(
+            &x,
+            &fx.conv_w,
+            &ring,
+            &a,
+            &b,
+            &fx.dt_bias,
+            &fx.a_log,
+            &q,
+            &k,
+            &v,
+            rows,
+            q_scale(),
+            EPS,
+            HK,
+            hv,
+        )?;
         let last = t_end == end_pos;
         let seam = t_end % 512 == 0;
         let (planes_ef, planes_c, planes_s) = (live.ef.as_ref(), &live.codes, &live.scales);
         let exit = if last && !complete {
-            GdnScanExit::Seal { codes: planes_c, scales: planes_s, ef: planes_ef }
+            GdnScanExit::Seal {
+                codes: planes_c,
+                scales: planes_s,
+                ef: planes_ef,
+            }
         } else if seam {
-            GdnScanExit::Seam { codes: planes_c, scales: planes_s, ef: planes_ef, next: &h }
+            GdnScanExit::Seam {
+                codes: planes_c,
+                scales: planes_s,
+                ef: planes_ef,
+                next: &h,
+            }
         } else {
             GdnScanExit::F32 { state: &h }
         };
@@ -611,7 +677,11 @@ fn tile_ref(gpu: &mut Gpu, fx: &Fixture, cfg: &Cfg, s: u64, n: usize) -> Result<
             &dummy,
             &dummy,
             &GdnScanEntry::F32 { state: &h },
-            &GdnScanExit::Seal { codes: &live.codes, scales: &live.scales, ef: live.ef.as_ref() },
+            &GdnScanExit::Seal {
+                codes: &live.codes,
+                scales: &live.scales,
+                ef: live.ef.as_ref(),
+            },
             &dummy,
             cfg.fmt,
             0,
@@ -627,7 +697,12 @@ fn tile_ref(gpu: &mut Gpu, fx: &Fixture, cfg: &Cfg, s: u64, n: usize) -> Result<
     gpu.free_tensor(h)?;
     gpu.free_tensor(dummy)?;
     live.free(gpu)?;
-    Ok(TileRef { out, f32_at, planes_at, end })
+    Ok(TileRef {
+        out,
+        f32_at,
+        planes_at,
+        end,
+    })
 }
 
 /// The incumbent whole-call route (`gdn_chunk_scan_layer`: prep, batched KKT when more than one
@@ -653,12 +728,42 @@ fn legacy_run(gpu: &mut Gpu, fx: &Fixture, cfg: &Cfg, n: usize) -> Result<(Vec<u
     let seg = 512usize;
     gpu.gdn_chunk_prepare(cfg.fmt)?;
     let kkt_batched = gpu.gdn_kkt_batched_enabled() && n > seg;
-    gpu.gdn_chunk_prep(&x, &fx.conv_w, &live.conv, &a, &b, &fx.dt_bias, &fx.a_log, &q, &k, &v, n, q_scale(), EPS, HK, hv)?;
+    gpu.gdn_chunk_prep(
+        &x,
+        &fx.conv_w,
+        &live.conv,
+        &a,
+        &b,
+        &fx.dt_bias,
+        &fx.a_log,
+        &q,
+        &k,
+        &v,
+        n,
+        q_scale(),
+        EPS,
+        HK,
+        hv,
+    )?;
     if kkt_batched {
         gpu.gdn_chunk_kkt_solve_batched(&k, &a, &b, &aa, n, HK, hv)?;
     }
     if kkt_batched && gpu.gdn_scan_mseg_enabled(cfg.fmt, seg) {
-        gpu.gdn_chunk_scan_layer_mseg(&q, &k, &v, &aa, &a, &b, &live.codes, &live.scales, ef, &o, n, HK, hv)?;
+        gpu.gdn_chunk_scan_layer_mseg(
+            &q,
+            &k,
+            &v,
+            &aa,
+            &a,
+            &b,
+            &live.codes,
+            &live.scales,
+            ef,
+            &o,
+            n,
+            HK,
+            hv,
+        )?;
     } else {
         for row0 in (0..n).step_by(seg) {
             let rows = (n - row0).min(seg);
@@ -667,7 +772,24 @@ fn legacy_run(gpu: &mut Gpu, fx: &Fixture, cfg: &Cfg, n: usize) -> Result<(Vec<u
             } else {
                 aa.shallow_clone()
             };
-            gpu.gdn_chunk_scan_segment(&q, &k, &v, &a_seg, &a, &b, &live.codes, &live.scales, ef, &o, cfg.fmt, row0, rows, !kkt_batched, HK, hv)?;
+            gpu.gdn_chunk_scan_segment(
+                &q,
+                &k,
+                &v,
+                &a_seg,
+                &a,
+                &b,
+                &live.codes,
+                &live.scales,
+                ef,
+                &o,
+                cfg.fmt,
+                row0,
+                rows,
+                !kkt_batched,
+                HK,
+                hv,
+            )?;
         }
     }
     let out = download(gpu, &o)?;
@@ -759,8 +881,16 @@ fn check_boundaries(
         let pend = (p - tb) as usize;
         r.check(&c, "meta.position", b.meta.position == p);
         r.check(&c, "meta.tile_base", b.meta.tile_base == tb);
-        r.check(&c, "meta.pending_rows", b.meta.pending_rows as usize == pend);
-        r.check(&c, "meta.frame_base", b.meta.frame_base == s.max(p / 512 * 512));
+        r.check(
+            &c,
+            "meta.pending_rows",
+            b.meta.pending_rows as usize == pend,
+        );
+        r.check(
+            &c,
+            "meta.frame_base",
+            b.meta.frame_base == s.max(p / 512 * 512),
+        );
         r.check(&c, "meta.phase_open", b.meta.phase == GdnStreamPhase::Open);
         match tref.f32_at.get(&tb) {
             Some(h) => r.cmp(&c, "tile_entry_f32", &b.tile_f32, h),
@@ -786,7 +916,11 @@ fn check_boundaries(
         }
     }
     let _ = xr;
-    r.check(ctx, "sealed_meta", run.final_meta.phase == GdnStreamPhase::Sealed && run.final_meta.pending_rows == 0);
+    r.check(
+        ctx,
+        "sealed_meta",
+        run.final_meta.phase == GdnStreamPhase::Sealed && run.final_meta.pending_rows == 0,
+    );
     cmp_state(r, &format!("{ctx}/sealed"), &run.sealed, &tref.end);
 }
 
@@ -839,7 +973,13 @@ fn seq_plan(quant: Quant) -> GdnPrefillPlan {
         algorithm: GdnScanAlgorithm::Sequential,
         micro_rows: 1,
         commit_rows: 512,
-        projection_recipe: GdnProjectionRecipe { qkv: 0, z: 0, alpha: 0, beta: 0, out: 0 },
+        projection_recipe: GdnProjectionRecipe {
+            qkv: 0,
+            z: 0,
+            alpha: 0,
+            beta: 0,
+            out: 0,
+        },
         scan_operand_format: GdnTensorFormat::F32,
         scan_output_format: GdnTensorFormat::F32,
         state_quant: match quant {
@@ -881,8 +1021,25 @@ fn seq_run(
         let g = upload(gpu, &f32_bytes(&sf.gate[done * hv..(done + n) * hv]))?;
         let b = upload(gpu, &f32_bytes(&sf.beta[done * hv..(done + n) * hv]))?;
         let o = raw(gpu, n * w * 4)?;
-        let inp = GdnSeqInputs { q: &q, k: &k, v: &v, gate: &g, beta: &b, qk_head_ratio: 1 };
-        meta = gpu.gdn_stream_append_sequential(&plan, &meta, s + done as u64, n, &inp, &o, &live.planes(), &carry, hv)?;
+        let inp = GdnSeqInputs {
+            q: &q,
+            k: &k,
+            v: &v,
+            gate: &g,
+            beta: &b,
+            qk_head_ratio: 1,
+        };
+        meta = gpu.gdn_stream_append_sequential(
+            &plan,
+            &meta,
+            s + done as u64,
+            n,
+            &inp,
+            &o,
+            &live.planes(),
+            &carry,
+            hv,
+        )?;
         out.extend_from_slice(&download(gpu, &o)?[..n * w * 4]);
         done += n;
         if corrupt == Some(i) {
@@ -907,7 +1064,13 @@ fn seq_run(
 
 /// Incumbent sequential route for Q8Ef: `gated_delta_net_q8` (fast kernel) per absolute 512-row
 /// segment.
-fn seq_legacy(gpu: &mut Gpu, fx: &Fixture, sf: &SeqFx, s: u64, n: usize) -> Result<(Vec<u8>, StateBytes)> {
+fn seq_legacy(
+    gpu: &mut Gpu,
+    fx: &Fixture,
+    sf: &SeqFx,
+    s: u64,
+    n: usize,
+) -> Result<(Vec<u8>, StateBytes)> {
     let hv = sf.hv;
     let live = Live::new(gpu, fx, Quant::Q8Ef)?;
     let w = hv * HD;
@@ -922,7 +1085,20 @@ fn seq_legacy(gpu: &mut Gpu, fx: &Fixture, sf: &SeqFx, s: u64, n: usize) -> Resu
         let g = upload(gpu, &f32_bytes(&sf.gate[off * hv..(off + len) * hv]))?;
         let b = upload(gpu, &f32_bytes(&sf.beta[off * hv..(off + len) * hv]))?;
         let o = raw(gpu, len * w * 4)?;
-        gpu.gated_delta_net_q8(&q, &k, &v, &g, &b, &live.codes, &live.scales, &o, len, hv, HD, live.ef.as_ref())?;
+        gpu.gated_delta_net_q8(
+            &q,
+            &k,
+            &v,
+            &g,
+            &b,
+            &live.codes,
+            &live.scales,
+            &o,
+            len,
+            hv,
+            HD,
+            live.ef.as_ref(),
+        )?;
         out.extend_from_slice(&download(gpu, &o)?[..len * w * 4]);
         for t in [q, k, v, g, b, o] {
             gpu.free_tensor(t)?;
@@ -989,7 +1165,9 @@ impl Bufs {
         Ok(())
     }
     fn free(self, gpu: &mut Gpu) -> Result<()> {
-        for t in [self.x, self.a, self.b, self.q, self.k, self.v, self.aa, self.o] {
+        for t in [
+            self.x, self.a, self.b, self.q, self.k, self.v, self.aa, self.o,
+        ] {
             gpu.free_tensor(t)?;
         }
         Ok(())
@@ -1005,9 +1183,24 @@ struct GraphRig<'a> {
 }
 
 impl GraphRig<'_> {
-    fn append(&self, gpu: &mut Gpu, meta: &GdnStreamMeta, pos: u64, b: &Bufs) -> Result<GdnStreamMeta> {
-        let raw_in = GdnStreamRaw { qkv: &b.x, alpha: &b.a, beta: &b.b };
-        let scratch = GdnStreamScratch { q: &b.q, k: &b.k, v: &b.v, a: &b.aa };
+    fn append(
+        &self,
+        gpu: &mut Gpu,
+        meta: &GdnStreamMeta,
+        pos: u64,
+        b: &Bufs,
+    ) -> Result<GdnStreamMeta> {
+        let raw_in = GdnStreamRaw {
+            qkv: &b.x,
+            alpha: &b.a,
+            beta: &b.b,
+        };
+        let scratch = GdnStreamScratch {
+            q: &b.q,
+            k: &b.k,
+            v: &b.v,
+            a: &b.aa,
+        };
         Ok(gpu.gdn_stream_append(
             &self.plan,
             meta,
@@ -1027,11 +1220,20 @@ impl GraphRig<'_> {
         if let Some(e) = &self.live.ef {
             v.push(e);
         }
-        v.extend([&self.carry.f32, &self.carry.conv, &self.carry.qkv, &self.carry.alpha, &self.carry.beta]);
+        v.extend([
+            &self.carry.f32,
+            &self.carry.conv,
+            &self.carry.qkv,
+            &self.carry.alpha,
+            &self.carry.beta,
+        ]);
         v
     }
     fn snap(&self, gpu: &Gpu) -> Result<Vec<Vec<u8>>> {
-        self.tensors().into_iter().map(|t| download(gpu, t)).collect()
+        self.tensors()
+            .into_iter()
+            .map(|t| download(gpu, t))
+            .collect()
     }
     fn restore(&self, gpu: &Gpu, snap: &[Vec<u8>]) -> Result<()> {
         for (t, d) in self.tensors().into_iter().zip(snap) {
@@ -1051,23 +1253,31 @@ fn shifted(meta: &GdnStreamMeta, by: u64) -> GdnStreamMeta {
     }
 }
 
-fn graph_main(gpu: &mut Gpu, hv: usize, fmts: &[GdnScanOut], json_path: Option<String>) -> Result<()> {
+fn graph_main(
+    gpu: &mut Gpu,
+    hv: usize,
+    fmts: &[GdnScanOut],
+    json_path: Option<String>,
+) -> Result<()> {
     let stream = gpu.hip.stream_create()?;
     gpu.active_stream = Some(stream);
     let fx = Fixture::new(gpu, hv, 1300)?;
-    let mut rep = Report { comparisons: 0, bad: Vec::new() };
+    let mut rep = Report {
+        comparisons: 0,
+        bad: Vec::new(),
+    };
     let mut cells = Vec::new();
     // (start, rows appended before, rows of the captured append)
     let cases: [(u64, &[usize], usize); 9] = [
-        (25, &[10], 300),      // pending head completes, whole tiles, incomplete tail
-        (0, &[], 1100),        // aligned multi-frame (mseg on gfx1201 bf16)
-        (64, &[63], 1),        // singleton finishing a tile... then pending
-        (500, &[], 40),        // clipped head crossing a seam
-        (25, &[1], 1),         // singleton inside a tile
-        (511, &[], 2),         // seam straddle
-        (300, &[100], 700),    // off-grid with pending, two seams
-        (0, &[], 64),          // exactly one tile, aligned
-        (130, &[], 37),        // clipped head, partial
+        (25, &[10], 300),   // pending head completes, whole tiles, incomplete tail
+        (0, &[], 1100),     // aligned multi-frame (mseg on gfx1201 bf16)
+        (64, &[63], 1),     // singleton finishing a tile... then pending
+        (500, &[], 40),     // clipped head crossing a seam
+        (25, &[1], 1),      // singleton inside a tile
+        (511, &[], 2),      // seam straddle
+        (300, &[100], 700), // off-grid with pending, two seams
+        (0, &[], 64),       // exactly one tile, aligned
+        (130, &[], 37),     // clipped head, partial
     ];
     for &fmt in fmts {
         for quant in [Quant::Q8Ef, Quant::Q8] {
@@ -1093,18 +1303,34 @@ fn graph_main(gpu: &mut Gpu, hv: usize, fmts: &[GdnScanOut], json_path: Option<S
     }
     println!(
         "{}",
-        serde_json::to_string(&json!({"oracle": "gdn_canon_stream_oracle --graph", "arch": gpu.arch, "hv": hv, "comparisons": rep.comparisons, "all_pass": receipt["all_pass"], "failures": receipt["failures"].as_array().map(|a| a.len())}))?
+        serde_json::to_string(
+            &json!({"oracle": "gdn_canon_stream_oracle --graph", "arch": gpu.arch, "hv": hv, "comparisons": rep.comparisons, "all_pass": receipt["all_pass"], "failures": receipt["failures"].as_array().map(|a| a.len())})
+        )?
     );
     if !rep.bad.is_empty() {
         for b in rep.bad.iter().take(30) {
             eprintln!("FAIL {b}");
         }
-        return Err(format!("{} failing comparison(s) of {}", rep.bad.len(), rep.comparisons).into());
+        return Err(format!(
+            "{} failing comparison(s) of {}",
+            rep.bad.len(),
+            rep.comparisons
+        )
+        .into());
     }
     Ok(())
 }
 
-fn graph_case(gpu: &mut Gpu, fx: &Fixture, cfg: &Cfg, s: u64, pre: &[usize], n: usize, ctx: &str, rep: &mut Report) -> Result<()> {
+fn graph_case(
+    gpu: &mut Gpu,
+    fx: &Fixture,
+    cfg: &Cfg,
+    s: u64,
+    pre: &[usize],
+    n: usize,
+    ctx: &str,
+    rep: &mut Report,
+) -> Result<()> {
     let hv = fx.hv;
     let rig = GraphRig {
         fx,
@@ -1141,7 +1367,8 @@ fn graph_case(gpu: &mut Gpu, fx: &Fixture, cfg: &Cfg, s: u64, pre: &[usize], n: 
     gpu.graphs.drop_captured_graph(&gpu.hip, gpu.device_id);
     {
         let st = gpu.active_stream.as_ref().ok_or("no active stream")?;
-        gpu.graphs.begin_graph_capture(&gpu.hip, gpu.device_id, st)?;
+        gpu.graphs
+            .begin_graph_capture(&gpu.hip, gpu.device_id, st)?;
     }
     let captured = rig.append(gpu, &meta, pos, &bufs);
     {
@@ -1153,7 +1380,11 @@ fn graph_case(gpu: &mut Gpu, fx: &Fixture, cfg: &Cfg, s: u64, pre: &[usize], n: 
         }
     }
     let meta_c = captured?;
-    rep.check(ctx, "capture_recorded_kernels", !gpu.graphs.ar_forward_blobs.is_empty() && gpu.graphs.graph_exec.is_some());
+    rep.check(
+        ctx,
+        "capture_recorded_kernels",
+        !gpu.graphs.ar_forward_blobs.is_empty() && gpu.graphs.graph_exec.is_some(),
+    );
     rep.check(ctx, "capture_returns_same_candidate_meta", meta_c == meta_e);
     gpu.hip.device_synchronize()?;
     rep.check(ctx, "capture_executed_nothing", rig.snap(gpu)? == snap0);
@@ -1168,12 +1399,21 @@ fn graph_case(gpu: &mut Gpu, fx: &Fixture, cfg: &Cfg, s: u64, pre: &[usize], n: 
     }
     gpu.hip.device_synchronize()?;
     let out_r = download(gpu, &bufs.o)?;
-    rep.cmp(ctx, "replay_out_vs_eager", &out_r[..n * orow], &out_e[..n * orow]);
+    rep.cmp(
+        ctx,
+        "replay_out_vs_eager",
+        &out_r[..n * orow],
+        &out_e[..n * orow],
+    );
     let st_r = rig.snap(gpu)?;
     for (i, (a, b)) in st_r.iter().zip(&st_e).enumerate() {
         rep.cmp(ctx, &format!("replay_state{i}_vs_eager"), a, b);
     }
-    rep.check(ctx, "nonvacuous_out", out_e[..n * orow].iter().any(|b| *b != 0));
+    rep.check(
+        ctx,
+        "nonvacuous_out",
+        out_e[..n * orow].iter().any(|b| *b != 0),
+    );
 
     // 4. a second replay from the same state is identical (no state baked into the graph)
     rig.restore(gpu, &snap0)?;
@@ -1184,24 +1424,46 @@ fn graph_case(gpu: &mut Gpu, fx: &Fixture, cfg: &Cfg, s: u64, pre: &[usize], n: 
         gpu.graphs.graph_launch(&gpu.hip, gpu.device_id, st)?;
     }
     gpu.hip.device_synchronize()?;
-    rep.cmp(ctx, "second_replay_out", &download(gpu, &bufs.o)?[..n * orow], &out_e[..n * orow]);
+    rep.cmp(
+        ctx,
+        "second_replay_out",
+        &download(gpu, &bufs.o)?[..n * orow],
+        &out_e[..n * orow],
+    );
 
     // 5. a different absolute cursor of the same class: eager there == the graph captured at `pos`
     let by = 2048u64;
     rig.restore(gpu, &snap0)?;
     bufs.reset(gpu, fx)?;
-    let meta_shift = if pre.is_empty() { GdnStreamMeta::sealed_at(pos + by, 1) } else { shifted(&meta, by) };
+    let meta_shift = if pre.is_empty() {
+        GdnStreamMeta::sealed_at(pos + by, 1)
+    } else {
+        shifted(&meta, by)
+    };
     let meta_e2 = rig.append(gpu, &meta_shift, pos + by, &bufs)?;
     gpu.hip.device_synchronize()?;
-    rep.cmp(ctx, "eager_at_shifted_cursor_out", &download(gpu, &bufs.o)?[..n * orow], &out_e[..n * orow]);
+    rep.cmp(
+        ctx,
+        "eager_at_shifted_cursor_out",
+        &download(gpu, &bufs.o)?[..n * orow],
+        &out_e[..n * orow],
+    );
     for (i, (a, b)) in rig.snap(gpu)?.iter().zip(&st_e).enumerate() {
         rep.cmp(ctx, &format!("eager_at_shifted_cursor_state{i}"), a, b);
     }
-    rep.check(ctx, "shifted_meta_is_shifted_class", meta_e2.pending_rows == meta_e.pending_rows && meta_e2.tile_base == meta_e.tile_base + by && meta_e2.frame_base == meta_e.frame_base + by);
+    rep.check(
+        ctx,
+        "shifted_meta_is_shifted_class",
+        meta_e2.pending_rows == meta_e.pending_rows
+            && meta_e2.tile_base == meta_e.tile_base + by
+            && meta_e2.frame_base == meta_e.frame_base + by,
+    );
 
     gpu.graphs.drop_captured_graph(&gpu.hip, gpu.device_id);
     bufs.free(gpu)?;
-    let GraphRig { live, carry, ws, .. } = rig;
+    let GraphRig {
+        live, carry, ws, ..
+    } = rig;
     live.free(gpu)?;
     carry.free(gpu)?;
     gpu.gdn_stream_workspace_free(ws)?;
@@ -1249,7 +1511,10 @@ fn run() -> Result<()> {
     let total_rows = 1100usize;
     let fx = Fixture::new(&mut gpu, hv, total_rows)?;
     let mut rng = Rng(SEED);
-    let mut rep = Report { comparisons: 0, bad: Vec::new() };
+    let mut rep = Report {
+        comparisons: 0,
+        bad: Vec::new(),
+    };
     let mut cells = Vec::new();
 
     for &fmt in &fmts {
@@ -1261,7 +1526,10 @@ fn run() -> Result<()> {
             let legacy_ns: Vec<usize> = if quick {
                 vec![1, 25, 63, 64, 65, 512, 575]
             } else {
-                vec![1, 2, 3, 17, 25, 31, 32, 33, 62, 63, 64, 65, 100, 127, 128, 129, 300, 511, 512, 513, 575, 1024, 1100]
+                vec![
+                    1, 2, 3, 17, 25, 31, 32, 33, 62, 63, 64, 65, 100, 127, 128, 129, 300, 511, 512,
+                    513, 575, 1024, 1100,
+                ]
             };
             for &n in &legacy_ns {
                 let ctx = format!("{cname}/legacy-n{n}");
@@ -1286,7 +1554,8 @@ fn run() -> Result<()> {
                 rep.check(&ctx0, "state_moved", tref.end.codes != fx.q80);
                 let d_seam = (512 - (s % 512)) as usize;
                 let d_tile = (64 - (s % 64)) as usize;
-                let mut partitions: Vec<(String, Vec<usize>)> = vec![("whole".into(), vec![n_total])];
+                let mut partitions: Vec<(String, Vec<usize>)> =
+                    vec![("whole".into(), vec![n_total])];
                 for dd in [d_seam - 1, d_seam, d_seam + 1] {
                     if dd >= 1 && dd < n_total {
                         partitions.push((format!("cut-seam{dd}"), vec![dd, n_total - dd]));
@@ -1324,7 +1593,9 @@ fn run() -> Result<()> {
                 let sweep: Vec<usize> = if quick {
                     vec![1, 2, 3, 63, 64, 65]
                 } else if cfg.quant == Quant::Q8Ef && fmt == fmts[0] {
-                    (1..=130).chain([191, 192, 193, 255, 256, 257, 447, 448, 449, 511, 512, 513]).collect()
+                    (1..=130)
+                        .chain([191, 192, 193, 255, 256, 257, 447, 448, 449, 511, 512, 513])
+                        .collect()
                 } else {
                     vec![1, 2, 3, 31, 32, 33, 62, 63, 64, 65, 127, 128, 129]
                 };
@@ -1334,7 +1605,12 @@ fn run() -> Result<()> {
                     }
                     let ctx = format!("{ctx0}/prefix{pfx}");
                     let run = stream_run(&mut gpu, &fx, &cfg, s, &[pfx], false, false, None)?;
-                    rep.cmp(&ctx, "out_prefix_vs_whole", &run.out, &tref.out[..pfx * orow]);
+                    rep.cmp(
+                        &ctx,
+                        "out_prefix_vs_whole",
+                        &run.out,
+                        &tref.out[..pfx * orow],
+                    );
                 }
                 cells.push(json!({"cfg": cname, "start": s, "rows": n_total, "partitions": partitions.len(), "prefix_sweep": sweep.len()}));
             }
@@ -1348,11 +1624,21 @@ fn run() -> Result<()> {
                 for (what, label) in [(1u8, "tile_entry_conv"), (2u8, "tile_entry_f32")] {
                     // first append stays inside the clipped tile (pending), the second completes it
                     let parts = [10usize, n_total - 10];
-                    let run = stream_run(&mut gpu, &fx, &cfg, s, &parts, false, true, Some((0, what)))?;
+                    let run =
+                        stream_run(&mut gpu, &fx, &cfg, s, &parts, false, true, Some((0, what)))?;
                     let ctx = format!("{cname}/control-{label}");
-                    rep.check(&ctx, "corruption_detected", run.out != tref.out[..n_total * orow]);
+                    rep.check(
+                        &ctx,
+                        "corruption_detected",
+                        run.out != tref.out[..n_total * orow],
+                    );
                     // The 25..35 rows were published before the corruption and must be unchanged.
-                    rep.cmp(&ctx, "pre_corruption_rows_unchanged", &run.out[..10 * orow], &tref.out[..10 * orow]);
+                    rep.cmp(
+                        &ctx,
+                        "pre_corruption_rows_unchanged",
+                        &run.out[..10 * orow],
+                        &tref.out[..10 * orow],
+                    );
                 }
             }
         }
@@ -1365,7 +1651,8 @@ fn run() -> Result<()> {
         for &s in &[0u64, 25, 511, 512, 513, 45979] {
             let n_total = if s == 45979 { 700 } else { total_rows };
             let ctx0 = format!("{cname}/s{s}");
-            let (whole_out, whole_state) = seq_run(&mut gpu, &fx, &sf, quant, s, &[n_total], true, None)?;
+            let (whole_out, whole_state) =
+                seq_run(&mut gpu, &fx, &sf, quant, s, &[n_total], true, None)?;
             rep.check(&ctx0, "nonvacuous_out", whole_out.iter().any(|b| *b != 0));
             rep.check(&ctx0, "state_moved", whole_state.codes != fx.q80);
             if quant == Quant::Q8Ef {
@@ -1373,7 +1660,12 @@ fn run() -> Result<()> {
                 // round trip between them and at the call end.
                 let (lo, ls) = seq_legacy(&mut gpu, &fx, &sf, s, n_total)?;
                 rep.cmp(&ctx0, "whole_vs_legacy.out", &whole_out, &lo);
-                cmp_state(&mut rep, &format!("{ctx0}/whole_vs_legacy"), &whole_state, &ls);
+                cmp_state(
+                    &mut rep,
+                    &format!("{ctx0}/whole_vs_legacy"),
+                    &whole_state,
+                    &ls,
+                );
             }
             let d_seam = (512 - (s % 512)) as usize;
             let mut partitions: Vec<(String, Vec<usize>)> = Vec::new();
@@ -1395,11 +1687,27 @@ fn run() -> Result<()> {
                 cmp_state(&mut rep, &format!("{ctx}/sealed"), &st, &whole_state);
             }
             // Negative control: a corrupted FP32 carry must change a later output.
-            let (co, _) = seq_run(&mut gpu, &fx, &sf, quant, s, &[10, n_total - 10], true, Some(0))?;
+            let (co, _) = seq_run(
+                &mut gpu,
+                &fx,
+                &sf,
+                quant,
+                s,
+                &[10, n_total - 10],
+                true,
+                Some(0),
+            )?;
             let orow = hv * HD * 4;
             rep.check(&ctx0, "control_corruption_detected", co != whole_out);
-            rep.cmp(&ctx0, "control_pre_rows_unchanged", &co[..10 * orow], &whole_out[..10 * orow]);
-            cells.push(json!({"cfg": cname, "start": s, "rows": n_total, "partitions": partitions.len()}));
+            rep.cmp(
+                &ctx0,
+                "control_pre_rows_unchanged",
+                &co[..10 * orow],
+                &whole_out[..10 * orow],
+            );
+            cells.push(
+                json!({"cfg": cname, "start": s, "rows": n_total, "partitions": partitions.len()}),
+            );
         }
     }
 
@@ -1435,7 +1743,12 @@ fn run() -> Result<()> {
         for b in rep.bad.iter().take(30) {
             eprintln!("FAIL {b}");
         }
-        return Err(format!("{} failing comparison(s) of {}", rep.bad.len(), rep.comparisons).into());
+        return Err(format!(
+            "{} failing comparison(s) of {}",
+            rep.bad.len(),
+            rep.comparisons
+        )
+        .into());
     }
     Ok(())
 }

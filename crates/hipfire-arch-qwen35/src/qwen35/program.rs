@@ -20,11 +20,6 @@ use super::weights::{
 };
 use crate::speculative::GdnTape;
 use hip_bridge::{HipError, HipResult};
-use rdna_compute::gdn_stream::{
-    GdnCarryView as ScanCarryView, GdnLiveState, GdnQ8Planes, GdnScanAlgorithm, GdnStreamConsts,
-    GdnStreamMeta, GdnStreamPhase, GdnTensorFormat,
-};
-use rdna_compute::norm::GdnScanOut;
 use hipfire_dispatch::families::kv_tier::KvTierInputs;
 use hipfire_dispatch::pipeline::batched::{BatchScratch, DenseBatchMath, DflashFusionCtx};
 use hipfire_dispatch::pipeline::batched_attention::{
@@ -45,6 +40,11 @@ use hipfire_dispatch::pipeline::hybrid::{
 use hipfire_dispatch::pipeline::Step;
 use hipfire_runtime::llama::WeightTensor;
 use hipfire_runtime::llama::{self, KvCacheExt};
+use rdna_compute::gdn_stream::{
+    GdnCarryView as ScanCarryView, GdnLiveState, GdnQ8Planes, GdnScanAlgorithm, GdnStreamConsts,
+    GdnStreamMeta, GdnStreamPhase, GdnTensorFormat,
+};
+use rdna_compute::norm::GdnScanOut;
 use rdna_compute::{Gpu, GpuTensor};
 
 pub(crate) fn hybrid_dims(config: &Qwen35Config) -> HybridDims {
@@ -605,7 +605,11 @@ fn seal_open_layers(
     }
     let (binding, carry) = match (stream.binding.as_ref(), stream.carry.as_ref()) {
         (Some(b), Some(c)) if stream.plans.len() == stream.meta.len() => (b, c),
-        _ => return Err(fail("Open stream without bound plans, constants or carry".into())),
+        _ => {
+            return Err(fail(
+                "Open stream without bound plans, constants or carry".into(),
+            ))
+        }
     };
     let mut out = Vec::with_capacity(stream.meta.len());
     for (l, (plan, meta)) in stream.plans.iter().zip(&stream.meta).enumerate() {
@@ -624,9 +628,9 @@ fn seal_open_layers(
                     GdnTensorFormat::Bf16 => GdnScanOut::Bf16,
                     _ => GdnScanOut::F32,
                 };
-                let ws = binding
-                    .workspace(fmt)
-                    .ok_or_else(|| fail("no edge workspace for the layer's output format".into()))?;
+                let ws = binding.workspace(fmt).ok_or_else(|| {
+                    fail("no edge workspace for the layer's output format".into())
+                })?;
                 let (hk, hv) = (ws.hk, ws.hv);
                 let micro = carry.geometry.micro_rows;
                 let alpha = carry.raw_ab[l].sub_offset(0, micro * hv);
@@ -647,7 +651,10 @@ fn seal_open_layers(
                     n_key_heads: hk,
                     n_value_heads: hv,
                 };
-                let live = GdnLiveState { planes, conv: &state.conv_states[l] };
+                let live = GdnLiveState {
+                    planes,
+                    conv: &state.conv_states[l],
+                };
                 gpu.gdn_stream_seal(plan, meta, &consts, &live, &view, ws)?
             }
             GdnScanAlgorithm::Sequential => gpu.gdn_stream_seal_sequential(

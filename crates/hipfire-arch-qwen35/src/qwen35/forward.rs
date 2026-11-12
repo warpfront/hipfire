@@ -1778,7 +1778,9 @@ pub(crate) fn refuse_open_gdn_stream(dn_state: &DeltaNetState, site: &str) -> Hi
     if dn_state.stream.is_open() {
         return Err(HipError::new(
             0,
-            &format!("{site}: the GDN stream is Open; seal it at the prompt end before decode/verify"),
+            &format!(
+                "{site}: the GDN stream is Open; seal it at the prompt end before decode/verify"
+            ),
         ));
     }
     Ok(())

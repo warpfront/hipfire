@@ -1242,7 +1242,9 @@ pub fn gated_delta_rollback_layers_ef(
     let head_rows = checked_product(p.rows, p.value_heads, "GDN EF rollback parameter rows")?;
     let kept_qkv = checked_product(p.keep, p.qkv_width, "GDN EF rollback kept rows")?;
     let kept_heads = checked_product(p.keep, p.value_heads, "GDN EF rollback kept parameters")?;
-    let output = p.discard.sub_offset(0, checked_product(p.keep, value, "GDN EF rollback output")?);
+    let output = p
+        .discard
+        .sub_offset(0, checked_product(p.keep, value, "GDN EF rollback output")?);
     for layer in p.layers {
         if layer.recurrence.numel()
             < checked_add(
@@ -1255,7 +1257,9 @@ pub fn gated_delta_rollback_layers_ef(
         }
         let projection = layer.recurrence.sub_offset(0, kept_qkv);
         let gate = layer.recurrence.sub_offset(qkv_rows, kept_heads);
-        let beta = layer.recurrence.sub_offset(qkv_rows + head_rows, kept_heads);
+        let beta = layer
+            .recurrence
+            .sub_offset(qkv_rows + head_rows, kept_heads);
         let state = layer.ring.sub_offset(p.from * slot, slot);
         let ring = layer.ring.sub_offset(p.to * slot, p.keep * slot);
         gated_delta_step_batched(

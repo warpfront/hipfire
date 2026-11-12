@@ -71,16 +71,26 @@ fn q8ef_snapshot_restore_rollback_continue_is_byte_exact_hw() {
     let mut rng = Rng(0x0ef0_5eed);
     // Initial layer state: random codes, positive scales, small residual, conv.
     let units = state.gdn[0].recurrent.numel();
-    let mut slot0: Vec<u8> = (0..vh * 128 * 128).map(|_| (rng.next() & 0xff) as u8).collect();
+    let mut slot0: Vec<u8> = (0..vh * 128 * 128)
+        .map(|_| (rng.next() & 0xff) as u8)
+        .collect();
     slot0.extend(f32_bytes(
-        &(0..vh * 128).map(|_| 0.002 + 0.001 * (rng.unit() * 0.5 + 0.5)).collect::<Vec<_>>(),
+        &(0..vh * 128)
+            .map(|_| 0.002 + 0.001 * (rng.unit() * 0.5 + 0.5))
+            .collect::<Vec<_>>(),
     ));
     assert_eq!(slot0.len(), units);
     let ef0: Vec<u8> = (0..vh * 128 * 128)
-        .flat_map(|_| half::f16::from_f32(rng.unit() * 0.001).to_bits().to_le_bytes())
+        .flat_map(|_| {
+            half::f16::from_f32(rng.unit() * 0.001)
+                .to_bits()
+                .to_le_bytes()
+        })
         .collect();
     let conv0 = f32_bytes(
-        &(0..state.gdn[0].conv.numel()).map(|_| rng.unit()).collect::<Vec<_>>(),
+        &(0..state.gdn[0].conv.numel())
+            .map(|_| rng.unit())
+            .collect::<Vec<_>>(),
     );
     for layer in &state.gdn {
         up(&gpu, &layer.recurrent, &slot0);
@@ -90,10 +100,14 @@ fn q8ef_snapshot_restore_rollback_continue_is_byte_exact_hw() {
     // Window inputs (convolution output rows, gate, beta) and conv input rows.
     let proj = f32_bytes(&(0..R * qkv).map(|_| rng.unit()).collect::<Vec<_>>());
     let gate = f32_bytes(
-        &(0..R * vh).map(|_| -0.02 - 0.5 * (rng.unit() * 0.5 + 0.5)).collect::<Vec<_>>(),
+        &(0..R * vh)
+            .map(|_| -0.02 - 0.5 * (rng.unit() * 0.5 + 0.5))
+            .collect::<Vec<_>>(),
     );
     let beta = f32_bytes(
-        &(0..R * vh).map(|_| 0.2 + 0.7 * (rng.unit() * 0.5 + 0.5)).collect::<Vec<_>>(),
+        &(0..R * vh)
+            .map(|_| 0.2 + 0.7 * (rng.unit() * 0.5 + 0.5))
+            .collect::<Vec<_>>(),
     );
     let inputs = f32_bytes(&(0..R * qkv).map(|_| rng.unit()).collect::<Vec<_>>());
     let proj_t = gpu.zeros(&[R * qkv], DType::F32).unwrap();
@@ -157,7 +171,11 @@ fn q8ef_snapshot_restore_rollback_continue_is_byte_exact_hw() {
         let ticket = state.snapshot(&mut gpu).expect("snapshot");
         {
             let capture = state.gdn_row_capture(0, R).expect("armed capture");
-            up(&gpu, capture.recurrence, &[proj.clone(), gate.clone(), beta.clone()].concat());
+            up(
+                &gpu,
+                capture.recurrence,
+                &[proj.clone(), gate.clone(), beta.clone()].concat(),
+            );
             up(&gpu, capture.inputs, &inputs);
             gated_delta_step_batched(
                 &mut gpu,
@@ -200,35 +218,58 @@ fn q8ef_snapshot_restore_rollback_continue_is_byte_exact_hw() {
         }
         if keep > 0 {
             let (slot, ef) = &refs[keep];
-            assert_eq!(&down(&gpu, &state.gdn[0].recurrent), slot, "keep {keep}: slot");
+            assert_eq!(
+                &down(&gpu, &state.gdn[0].recurrent),
+                slot,
+                "keep {keep}: slot"
+            );
             assert_eq!(
                 &down(&gpu, state.gdn[0].ef_residual.as_ref().unwrap()),
                 ef,
                 "keep {keep}: the real residual (not zeroed)"
             );
             if keep < R {
-                assert_eq!(down(&gpu, &state.gdn[0].conv), conv_after(keep), "keep {keep}: conv");
+                assert_eq!(
+                    down(&gpu, &state.gdn[0].conv),
+                    conv_after(keep),
+                    "keep {keep}: conv"
+                );
             }
         }
         state.row_capture_armed = false;
         state.restore(&mut gpu, ticket).expect("restore");
-        assert_eq!(down(&gpu, &state.gdn[0].recurrent), slot0, "keep {keep}: restored slot");
+        assert_eq!(
+            down(&gpu, &state.gdn[0].recurrent),
+            slot0,
+            "keep {keep}: restored slot"
+        );
         assert_eq!(
             down(&gpu, state.gdn[0].ef_residual.as_ref().unwrap()),
             ef0,
             "keep {keep}: restored residual"
         );
-        assert_eq!(down(&gpu, &state.gdn[0].conv), conv0, "keep {keep}: restored conv");
+        assert_eq!(
+            down(&gpu, &state.gdn[0].conv),
+            conv0,
+            "keep {keep}: restored conv"
+        );
         // Continue: one more AR step on the restored state equals the chain's.
         let ef = state.gdn[0].ef_residual.as_ref().unwrap();
         ar_step(&mut gpu, &state.gdn[0].recurrent, ef, 0);
-        assert_eq!(down(&gpu, &state.gdn[0].recurrent), refs[1].0, "keep {keep}: continued slot");
+        assert_eq!(
+            down(&gpu, &state.gdn[0].recurrent),
+            refs[1].0,
+            "keep {keep}: continued slot"
+        );
         assert_eq!(down(&gpu, ef), refs[1].1, "keep {keep}: continued residual");
         // Back to the initial bytes for the next case.
         up(&gpu, &state.gdn[0].recurrent, &slot0);
         up(&gpu, ef, &ef0);
         checked += 1;
     }
-    println!("q8ef_state_oracle: arch={} cases={checked} failures=0", gpu.arch);
+    println!(
+        "q8ef_state_oracle: arch={} cases={checked} failures=0",
+        gpu.arch
+    );
     let _ = state.free_gpu(&mut gpu);
 }

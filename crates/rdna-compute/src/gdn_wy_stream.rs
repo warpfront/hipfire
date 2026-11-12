@@ -39,7 +39,9 @@ use super::{
     gdn_state_from_f32, gdn_state_to_f32, validate_gdn_state, CopyRegion, GatedDeltaGateBatched,
     GatedDeltaStepBatched, GdnChunkKernargs, GdnChunkState, GdnStateFormat, TENSOR_OPS_SRC,
 };
-use crate::gdn_stream::{GdnStreamMeta, GdnStreamPhase, GDN_COMMIT_ROWS, GDN_STREAM_SCHEMA_VERSION};
+use crate::gdn_stream::{
+    GdnStreamMeta, GdnStreamPhase, GDN_COMMIT_ROWS, GDN_STREAM_SCHEMA_VERSION,
+};
 use crate::prefill_invariant::{qwen4_gdn_prefill, Qwen4GdnPrefill};
 use crate::{DType, Gpu, GpuTensor};
 use hip_bridge::{DeviceBuffer, HipError, HipResult, KernargBlob};
@@ -468,7 +470,14 @@ pub fn gdn_wy_stream_append(gpu: &mut Gpu, a: &GdnWyAppend<'_>) -> HipResult<Gdn
     if meta.phase == GdnStreamPhase::Sealed {
         match format {
             GdnStateFormat::F32 => {
-                copy_raw(gpu, tile_entry, entry_bytes, slot, f32_state_bytes, f32_state_bytes)?;
+                copy_raw(
+                    gpu,
+                    tile_entry,
+                    entry_bytes,
+                    slot,
+                    f32_state_bytes,
+                    f32_state_bytes,
+                )?;
             }
             _ => gdn_state_to_f32(gpu, format, slot, residual, tile_entry, p.value_heads)?,
         }
@@ -505,33 +514,32 @@ pub fn gdn_wy_stream_append(gpu: &mut Gpu, a: &GdnWyAppend<'_>) -> HipResult<Gdn
     let stage_out_bytes = edge.out.buf.size();
 
     // Append rows [r0, r0 + k) of the call to the pending buffers at row `at_row`.
-    let append_pending =
-        |gpu: &mut Gpu, at_row: usize, r0: usize, k: usize| -> HipResult<()> {
-            copy_raw(
-                gpu,
-                off(pend_conv, at_row * proj_row),
-                conv_bytes - at_row * proj_row,
-                off(proj, r0 * proj_row),
-                p.projection.buf.size() - r0 * proj_row,
-                k * proj_row,
-            )?;
-            copy_raw(
-                gpu,
-                off(pend_gate, at_row * hv_row),
-                params_bytes - at_row * hv_row,
-                off(gate_p, r0 * hv_row),
-                p.gate.buf.size() - r0 * hv_row,
-                k * hv_row,
-            )?;
-            copy_raw(
-                gpu,
-                off(pend_beta, at_row * hv_row),
-                params_bytes - (WY_TILE_ROWS + at_row) * hv_row,
-                off(beta_p, r0 * hv_row),
-                p.beta.buf.size() - r0 * hv_row,
-                k * hv_row,
-            )
-        };
+    let append_pending = |gpu: &mut Gpu, at_row: usize, r0: usize, k: usize| -> HipResult<()> {
+        copy_raw(
+            gpu,
+            off(pend_conv, at_row * proj_row),
+            conv_bytes - at_row * proj_row,
+            off(proj, r0 * proj_row),
+            p.projection.buf.size() - r0 * proj_row,
+            k * proj_row,
+        )?;
+        copy_raw(
+            gpu,
+            off(pend_gate, at_row * hv_row),
+            params_bytes - at_row * hv_row,
+            off(gate_p, r0 * hv_row),
+            p.gate.buf.size() - r0 * hv_row,
+            k * hv_row,
+        )?;
+        copy_raw(
+            gpu,
+            off(pend_beta, at_row * hv_row),
+            params_bytes - (WY_TILE_ROWS + at_row) * hv_row,
+            off(beta_p, r0 * hv_row),
+            p.beta.buf.size() - r0 * hv_row,
+            k * hv_row,
+        )
+    };
 
     let tile_base = meta.tile_base;
     let m = meta.pending_rows as usize;
@@ -564,12 +572,19 @@ pub fn gdn_wy_stream_append(gpu: &mut Gpu, a: &GdnWyAppend<'_>) -> HipResult<Gdn
         let state = if complete {
             tile_entry
         } else {
-            copy_raw(gpu, work, f32_state_bytes, tile_entry, entry_bytes, f32_state_bytes)?;
+            copy_raw(
+                gpu,
+                work,
+                f32_state_bytes,
+                tile_entry,
+                entry_bytes,
+                f32_state_bytes,
+            )?;
             work
         };
         scan(
-            gpu, &c, pend_conv, qn_head, kn_head, pend_gate, pend_beta, state, stage_z,
-            stage_out, rows,
+            gpu, &c, pend_conv, qn_head, kn_head, pend_gate, pend_beta, state, stage_z, stage_out,
+            rows,
         )?;
         copy_raw(
             gpu,
@@ -600,7 +615,14 @@ pub fn gdn_wy_stream_append(gpu: &mut Gpu, a: &GdnWyAppend<'_>) -> HipResult<Gdn
         let state = if complete {
             tile_entry
         } else {
-            copy_raw(gpu, work, f32_state_bytes, tile_entry, entry_bytes, f32_state_bytes)?;
+            copy_raw(
+                gpu,
+                work,
+                f32_state_bytes,
+                tile_entry,
+                entry_bytes,
+                f32_state_bytes,
+            )?;
             work
         };
         scan(
@@ -665,7 +687,14 @@ pub fn gdn_wy_stream_append(gpu: &mut Gpu, a: &GdnWyAppend<'_>) -> HipResult<Gdn
     if cur_pending == 0 && x < end {
         let r0 = (x - start) as usize;
         let k = (end - x) as usize;
-        copy_raw(gpu, work, f32_state_bytes, tile_entry, entry_bytes, f32_state_bytes)?;
+        copy_raw(
+            gpu,
+            work,
+            f32_state_bytes,
+            tile_entry,
+            entry_bytes,
+            f32_state_bytes,
+        )?;
         scan(
             gpu,
             &c,
@@ -882,7 +911,14 @@ pub fn gdn_wy_stream_seal(gpu: &mut Gpu, s: &GdnWySeal<'_>) -> HipResult<GdnStre
         let pend_gate = state_ptr(carry.pending_params);
         let pend_beta = off(pend_gate, WY_TILE_ROWS * s.value_heads * 4);
         let (qn, kn) = (sp, off(sp, WY_TILE_ROWS * qk * 2));
-        copy_raw(gpu, work, f32_state_bytes, tile_entry, entry_bytes, f32_state_bytes)?;
+        copy_raw(
+            gpu,
+            work,
+            f32_state_bytes,
+            tile_entry,
+            entry_bytes,
+            f32_state_bytes,
+        )?;
         qk_norm(gpu, &c, pend_conv, qn, kn, r)?;
         // Outputs/Z of the replayed rows are staging scratch: nothing reads them.
         scan(
@@ -903,7 +939,14 @@ pub fn gdn_wy_stream_seal(gpu: &mut Gpu, s: &GdnWySeal<'_>) -> HipResult<GdnStre
     if !slot_current {
         match s.format {
             GdnStateFormat::F32 => {
-                copy_raw(gpu, slot, f32_state_bytes, final_state, f32_state_bytes, f32_state_bytes)?;
+                copy_raw(
+                    gpu,
+                    slot,
+                    f32_state_bytes,
+                    final_state,
+                    f32_state_bytes,
+                    f32_state_bytes,
+                )?;
             }
             GdnStateFormat::Q8 | GdnStateFormat::Q8Ef => {
                 let frame = checked_u32((position - 1) as usize, "WY stream Q8 frame")?;

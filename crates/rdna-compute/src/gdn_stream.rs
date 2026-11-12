@@ -250,11 +250,31 @@ impl GdnCarryView<'_> {
     /// Byte-extent check against the layer geometry; no device access.
     pub fn check(&self, g: &GdnCarryGeometry) -> Result<(), String> {
         let need = [
-            ("tile_entry_f32", self.tile_entry_f32.byte_size(), g.state_bytes()),
-            ("tile_entry_conv", self.tile_entry_conv.byte_size(), g.conv_bytes()),
-            ("pending_qkv", self.pending_qkv.byte_size(), g.raw_qkv_bytes()),
-            ("pending_alpha", self.pending_alpha.byte_size(), 4 * g.micro_rows * g.hv),
-            ("pending_beta", self.pending_beta.byte_size(), 4 * g.micro_rows * g.hv),
+            (
+                "tile_entry_f32",
+                self.tile_entry_f32.byte_size(),
+                g.state_bytes(),
+            ),
+            (
+                "tile_entry_conv",
+                self.tile_entry_conv.byte_size(),
+                g.conv_bytes(),
+            ),
+            (
+                "pending_qkv",
+                self.pending_qkv.byte_size(),
+                g.raw_qkv_bytes(),
+            ),
+            (
+                "pending_alpha",
+                self.pending_alpha.byte_size(),
+                4 * g.micro_rows * g.hv,
+            ),
+            (
+                "pending_beta",
+                self.pending_beta.byte_size(),
+                4 * g.micro_rows * g.hv,
+            ),
         ];
         for (name, have, want) in need {
             if have < want {
@@ -365,9 +385,16 @@ pub struct GdnStreamScratch<'a> {
 #[derive(Clone, Copy)]
 pub enum GdnScanEntry<'a> {
     /// Plain Q8: `codes * scale`, no residual.
-    Q8 { codes: &'a GpuTensor, scales: &'a GpuTensor },
+    Q8 {
+        codes: &'a GpuTensor,
+        scales: &'a GpuTensor,
+    },
     /// Q8 + F16 EF: `codes * scale + ef`, reconstructed once at entry.
-    Q8Ef { codes: &'a GpuTensor, scales: &'a GpuTensor, ef: &'a GpuTensor },
+    Q8Ef {
+        codes: &'a GpuTensor,
+        scales: &'a GpuTensor,
+        ef: &'a GpuTensor,
+    },
     /// A tile-entry FP32 accumulator, taken unchanged.
     F32 { state: &'a GpuTensor },
 }
@@ -377,7 +404,11 @@ pub enum GdnScanEntry<'a> {
 pub enum GdnScanExit<'a> {
     /// Quantize the final state once (call end / seal): codes, scales and, when
     /// `ef` is present, the F16 residual.
-    Seal { codes: &'a GpuTensor, scales: &'a GpuTensor, ef: Option<&'a GpuTensor> },
+    Seal {
+        codes: &'a GpuTensor,
+        scales: &'a GpuTensor,
+        ef: Option<&'a GpuTensor>,
+    },
     /// Keep the unquantized FP32 accumulator (a completed tile that is not a
     /// commit seam).
     F32 { state: &'a GpuTensor },
@@ -445,7 +476,10 @@ impl GdnAppendSchedule {
             return Err("append of zero rows".into());
         }
         if meta.position != start_pos {
-            return Err(format!("stream position {} != start_pos {start_pos}", meta.position));
+            return Err(format!(
+                "stream position {} != start_pos {start_pos}",
+                meta.position
+            ));
         }
         let open = meta.phase == GdnStreamPhase::Open;
         let (phase_start, tile_base, pending) = if open {
@@ -474,7 +508,11 @@ impl GdnAppendSchedule {
         }
         let tile_end = next_boundary(tile_base, micro64);
         let head = pending > 0 || tile_base % micro64 != 0;
-        let head_new = if head { rows.min((tile_end - start_pos) as usize) } else { 0 };
+        let head_new = if head {
+            rows.min((tile_end - start_pos) as usize)
+        } else {
+            0
+        };
         let head_complete = head && start_pos + head_new as u64 == tile_end;
         let rest = rows - head_new;
         let bulk_complete = rest / micro * micro;
@@ -526,14 +564,26 @@ mod tests {
 
     #[test]
     fn carry_bytes_match_design_table() {
-        let g = GdnCarryGeometry { hk: 16, hv: 48, head_dim: 128, conv_hist_rows: 3, micro_rows: 64 };
+        let g = GdnCarryGeometry {
+            hk: 16,
+            hv: 48,
+            head_dim: 128,
+            conv_hist_rows: 3,
+            micro_rows: 64,
+        };
         assert_eq!(g.total_bytes(), 5_914_624); // 5.640625 MiB
-        let g16 = GdnCarryGeometry { micro_rows: 16, ..g };
+        let g16 = GdnCarryGeometry {
+            micro_rows: 16,
+            ..g
+        };
         assert_eq!(g16.total_bytes(), 3_930_112); // 3.748046875 MiB
     }
 
     fn open_at(pos: u64) -> GdnStreamMeta {
-        GdnStreamMeta { recipe_id: 7, ..GdnStreamMeta::sealed_at(pos, 3) }
+        GdnStreamMeta {
+            recipe_id: 7,
+            ..GdnStreamMeta::sealed_at(pos, 3)
+        }
     }
 
     /// Final metadata of an append sequence from a sealed start; head/bulk/tail
@@ -552,7 +602,9 @@ mod tests {
     fn schedule_is_partition_independent() {
         let mut seed = 0x9e37_79b9_7f4a_7c15u64;
         let mut next = |m: u64| {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (seed >> 33) % m
         };
         for start in [0u64, 1, 63, 64, 65, 511, 512, 513, 521, 45979] {
@@ -561,16 +613,32 @@ mod tests {
                 let mut parts = Vec::new();
                 let mut left = total;
                 while left > 0 {
-                    let n = if next(3) == 0 { 1 } else { 1 + next(left as u64 + 64) as usize % left };
+                    let n = if next(3) == 0 {
+                        1
+                    } else {
+                        1 + next(left as u64 + 64) as usize % left
+                    };
                     parts.push(n);
                     left -= n;
                 }
                 let got = run(start, &parts);
                 let whole = run(start, &[total]);
-                assert_eq!(got.position, whole.position, "start {start} parts {parts:?}");
-                assert_eq!(got.tile_base, whole.tile_base, "start {start} parts {parts:?}");
-                assert_eq!(got.pending_rows, whole.pending_rows, "start {start} parts {parts:?}");
-                assert_eq!(got.frame_base, whole.frame_base, "start {start} parts {parts:?}");
+                assert_eq!(
+                    got.position, whole.position,
+                    "start {start} parts {parts:?}"
+                );
+                assert_eq!(
+                    got.tile_base, whole.tile_base,
+                    "start {start} parts {parts:?}"
+                );
+                assert_eq!(
+                    got.pending_rows, whole.pending_rows,
+                    "start {start} parts {parts:?}"
+                );
+                assert_eq!(
+                    got.frame_base, whole.frame_base,
+                    "start {start} parts {parts:?}"
+                );
             }
         }
     }
@@ -581,7 +649,10 @@ mod tests {
         let s = GdnAppendSchedule::new(&open_at(25), 25, 300, 64, 512).unwrap();
         assert!(s.head && s.head_pending == 0 && s.head_new == 39 && s.head_complete);
         assert_eq!((s.bulk_complete, s.bulk_tail), (256, 5));
-        assert_eq!((s.meta.tile_base, s.meta.pending_rows, s.meta.frame_base), (320, 5, 25));
+        assert_eq!(
+            (s.meta.tile_base, s.meta.pending_rows, s.meta.frame_base),
+            (320, 5, 25)
+        );
         // Pending rows continue the same tile.
         let m = s.meta;
         let s2 = GdnAppendSchedule::new(&m, 325, 70, 64, 512).unwrap();
@@ -594,12 +665,17 @@ mod tests {
         // Aligned start: no head, whole tiles, seam crossing moves the frame base.
         let a = GdnAppendSchedule::new(&open_at(512), 512, 1024, 64, 512).unwrap();
         assert!(!a.head && a.bulk_complete == 1024 && a.bulk_tail == 0);
-        assert_eq!((a.meta.tile_base, a.meta.frame_base, a.meta.pending_rows), (1536, 1536, 0));
+        assert_eq!(
+            (a.meta.tile_base, a.meta.frame_base, a.meta.pending_rows),
+            (1536, 1536, 0)
+        );
     }
 
     #[test]
     fn schedule_rejects_inconsistent_meta() {
-        let mut m = GdnAppendSchedule::new(&open_at(0), 0, 10, 64, 512).unwrap().meta;
+        let mut m = GdnAppendSchedule::new(&open_at(0), 0, 10, 64, 512)
+            .unwrap()
+            .meta;
         assert!(GdnAppendSchedule::new(&m, 11, 1, 64, 512).is_err());
         m.pending_rows = 11;
         assert!(GdnAppendSchedule::new(&m, 10, 1, 64, 512).is_err());
@@ -610,19 +686,35 @@ mod tests {
     fn begin_append_restamps_a_sealed_cursor_left_behind_by_decode() {
         // Turn 1 prefilled 42 rows and sealed; decode then advanced the live slot to 499
         // without touching the cursor. The second turn starts at 499.
-        let first = GdnAppendSchedule::new(&open_at(0), 0, 42, 64, 512).unwrap().meta;
-        let sealed = GdnStreamMeta { phase: GdnStreamPhase::Sealed, ..first };
+        let first = GdnAppendSchedule::new(&open_at(0), 0, 42, 64, 512)
+            .unwrap()
+            .meta;
+        let sealed = GdnStreamMeta {
+            phase: GdnStreamPhase::Sealed,
+            ..first
+        };
         assert!(GdnAppendSchedule::new(&sealed, 499, 30, 64, 512).is_err());
         let begun = sealed.begin_append_at(499);
         assert_eq!(
-            (begun.position, begun.phase_start, begun.frame_base, begun.tile_base, begun.pending_rows),
+            (
+                begun.position,
+                begun.phase_start,
+                begun.frame_base,
+                begun.tile_base,
+                begun.pending_rows
+            ),
             (499, 499, 499, 499, 0)
         );
-        assert_eq!((begun.recipe_id, begun.owner_generation), (sealed.recipe_id, sealed.owner_generation));
+        assert_eq!(
+            (begun.recipe_id, begun.owner_generation),
+            (sealed.recipe_id, sealed.owner_generation)
+        );
         let s = GdnAppendSchedule::new(&begun, 499, 30, 64, 512).unwrap();
         assert!(s.head && s.head_pending == 0 && s.head_new == 13 && s.head_complete);
         // An Open cursor is never moved: a mismatched start stays refused.
-        let open = GdnAppendSchedule::new(&open_at(0), 0, 10, 64, 512).unwrap().meta;
+        let open = GdnAppendSchedule::new(&open_at(0), 0, 10, 64, 512)
+            .unwrap()
+            .meta;
         assert_eq!(open.begin_append_at(499), open);
         assert!(GdnAppendSchedule::new(&open.begin_append_at(499), 499, 1, 64, 512).is_err());
     }

@@ -149,10 +149,7 @@ struct Rig {
 impl Rig {
     fn new(gpu: &mut Gpu, format: GdnStateFormat, n: usize, inp: &Inputs, rng: &mut Rng) -> Self {
         let (state_t, ef) = match format {
-            GdnStateFormat::F32 => (
-                gpu.zeros(&[VH * HD * HD], DType::F32).unwrap(),
-                None,
-            ),
+            GdnStateFormat::F32 => (gpu.zeros(&[VH * HD * HD], DType::F32).unwrap(), None),
             _ => (
                 gpu.zeros(&[format.storage().state_units(VH, HD, HD)], DType::Raw)
                     .unwrap(),
@@ -196,9 +193,21 @@ impl Rig {
             up(gpu, t, ef);
         }
         let fill = if poison { 0xA5u8 } else { 0 };
-        up(gpu, &self.tile_entry, &vec![fill; self.tile_entry.byte_size()]);
-        up(gpu, &self.pending_conv, &vec![fill; self.pending_conv.byte_size()]);
-        up(gpu, &self.pending_params, &vec![fill; self.pending_params.byte_size()]);
+        up(
+            gpu,
+            &self.tile_entry,
+            &vec![fill; self.tile_entry.byte_size()],
+        );
+        up(
+            gpu,
+            &self.pending_conv,
+            &vec![fill; self.pending_conv.byte_size()],
+        );
+        up(
+            gpu,
+            &self.pending_params,
+            &vec![fill; self.pending_params.byte_size()],
+        );
         up(gpu, &self.out, &vec![0xFF; self.out.byte_size()]);
     }
 }
@@ -327,7 +336,11 @@ fn main() {
     let mut report = Vec::new();
     let mut failures = 0usize;
     let mut cases = 0usize;
-    for format in [GdnStateFormat::F32, GdnStateFormat::Q8, GdnStateFormat::Q8Ef] {
+    for format in [
+        GdnStateFormat::F32,
+        GdnStateFormat::Q8,
+        GdnStateFormat::Q8Ef,
+    ] {
         let initial = initial_state(&mut rng, format);
         let rig = Rig::new(&mut gpu, format, n, &inp, &mut rng);
         if let Some(spec) = arg(&args, "--perturb") {
@@ -340,7 +353,9 @@ fn main() {
             let cmp = |gpu: &mut Gpu, tag: &str| {
                 let r = run(gpu, &rig, st, &[l1], &initial, false);
                 let rb = pick(&r);
-                let d: Vec<usize> = (0..VALUE).filter(|e| rb[e * 4..e * 4 + 4] != b0[e * 4..e * 4 + 4]).collect();
+                let d: Vec<usize> = (0..VALUE)
+                    .filter(|e| rb[e * 4..e * 4 + 4] != b0[e * 4..e * 4 + 4])
+                    .collect();
                 println!("PERTURB {tag} diff_elems={d:?}");
             };
             cmp(&mut gpu, "none");
@@ -393,7 +408,9 @@ fn main() {
             for l in l0..=l1 {
                 let r = run(&mut gpu, &rig, st, &[l], &initial, false);
                 let rb = pick(&r);
-                let d: Vec<usize> = (0..VALUE).filter(|e| rb[e * 4..e * 4 + 4] != b0[e * 4..e * 4 + 4]).collect();
+                let d: Vec<usize> = (0..VALUE)
+                    .filter(|e| rb[e * 4..e * 4 + 4] != b0[e * 4..e * 4 + 4])
+                    .collect();
                 println!("SWEEP L={l} nn={} diff_elems={d:?}", l - (l / 16) * 16);
             }
             std::process::exit(0);
@@ -410,13 +427,20 @@ fn main() {
             for row in 0..total {
                 let lo = row * VALUE * 4;
                 let cnt = (0..VALUE)
-                    .filter(|e| got.out[lo + e * 4..lo + e * 4 + 4] != reference.out[lo + e * 4..lo + e * 4 + 4])
+                    .filter(|e| {
+                        got.out[lo + e * 4..lo + e * 4 + 4]
+                            != reference.out[lo + e * 4..lo + e * 4 + 4]
+                    })
                     .count();
                 if cnt > 0 {
                     rows_diff.push(format!("row{row}:{cnt}"));
                 }
             }
-            println!("PROBE start={st} parts={parts:?} slot_eq={} diffrows={}", got.slot == reference.slot, rows_diff.join(","));
+            println!(
+                "PROBE start={st} parts={parts:?} slot_eq={} diffrows={}",
+                got.slot == reference.slot,
+                rows_diff.join(",")
+            );
             std::process::exit(0);
         }
         for start in [0usize, 7] {
@@ -459,11 +483,7 @@ fn main() {
                 let ok = got == reference;
                 if !ok {
                     failures += 1;
-                    let first = got
-                        .out
-                        .iter()
-                        .zip(&reference.out)
-                        .position(|(a, b)| a != b);
+                    let first = got.out.iter().zip(&reference.out).position(|(a, b)| a != b);
                     eprintln!(
                         "MISMATCH {format:?} start={start} {name} parts={parts:?} out_first_diff_row={:?} slot_eq={} ef_eq={} meta_eq={}",
                         first.map(|b| b / (VALUE * 4)),
@@ -481,8 +501,11 @@ fn main() {
                             if got.out[o..o + 4] != reference.out[o..o + 4] {
                                 cnt += 1;
                                 if firstd.is_none() {
-                                    let a = f32::from_le_bytes(got.out[o..o + 4].try_into().unwrap());
-                                    let b = f32::from_le_bytes(reference.out[o..o + 4].try_into().unwrap());
+                                    let a =
+                                        f32::from_le_bytes(got.out[o..o + 4].try_into().unwrap());
+                                    let b = f32::from_le_bytes(
+                                        reference.out[o..o + 4].try_into().unwrap(),
+                                    );
                                     firstd = Some((e, a, b));
                                 }
                             }

@@ -149,10 +149,9 @@
 use hip_bridge::KernargBlob;
 use rdna_compute::prefill_invariant::{FEW_ROW_ROUTE_ROWS, WIDE_VERIFY_MAX_ROWS};
 use rdna_compute::tensor_ops::{
-    gated_delta_rollback_layers, gated_delta_rollback_layers_ef, gated_delta_step,
-    copy_regions, gated_delta_step_batched, CopyRegion, GatedDeltaRollbackEf,
-    GatedDeltaRollbackEfLayer, GatedDeltaRollbackLayers, GatedDeltaStep, GatedDeltaStepBatched,
-    GdnStateFormat,
+    copy_regions, gated_delta_rollback_layers, gated_delta_rollback_layers_ef, gated_delta_step,
+    gated_delta_step_batched, CopyRegion, GatedDeltaRollbackEf, GatedDeltaRollbackEfLayer,
+    GatedDeltaRollbackLayers, GatedDeltaStep, GatedDeltaStepBatched, GdnStateFormat,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 use serde_json::json;
@@ -1063,7 +1062,9 @@ impl Rig {
 
     fn free(self, gpu: &mut Gpu) -> Res<()> {
         let mut first = None;
-        let residuals = [self.ef_ar, self.ef_cand, self.ef_entry].into_iter().flatten();
+        let residuals = [self.ef_ar, self.ef_cand, self.ef_entry]
+            .into_iter()
+            .flatten();
         for tensor in [
             self.ring,
             self.ar_state,
@@ -1941,7 +1942,12 @@ fn check_ef_snap(
 /// candidate capture of only the `keep` rows (`keepcap`).
 fn check_ef_rollback(snap: &EfSnap, keepcap: &EfSnap, keep: usize) -> Vec<Failure> {
     [
-        compare("rollback_vs_keep_capture_slot", &snap.kept, &keepcap.final_slot, None),
+        compare(
+            "rollback_vs_keep_capture_slot",
+            &snap.kept,
+            &keepcap.final_slot,
+            None,
+        ),
         compare(
             "rollback_vs_keep_capture_residual",
             &snap.residual,

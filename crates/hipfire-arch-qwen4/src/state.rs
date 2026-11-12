@@ -31,10 +31,10 @@ use hipfire_runtime::kv_backend::{
     KvChunkPlan, KvChunkPlanError, DEFAULT_KV_CHUNK_TOKENS, DEFAULT_VMM_PHYSICAL_CHUNK_BYTES,
 };
 use hipfire_runtime::session_cache::{RowStream, StateLayout, StatePart};
+use rdna_compute::gdn_stream::{GdnPrefillPlan, GdnStreamMeta, GdnStreamPhase};
 use rdna_compute::qsa_pooled_mirror::{
     qsa_pooled_bf16_mirror_enabled, QsaPooledBf16MirrorRef, QsaPooledBf16ValidBlocks,
 };
-use rdna_compute::gdn_stream::{GdnPrefillPlan, GdnStreamMeta, GdnStreamPhase};
 use rdna_compute::tensor_ops::gdn_wy_stream::{
     gdn_wy_stream_seal, GdnWyCarry, GdnWyEdge, GdnWySeal, WY_TILE_ROWS,
 };
@@ -1362,8 +1362,14 @@ impl Qwen4StateSnapshotArena {
             mix(layer.recurrent.buf.size());
             mix(layer.conv.buf.size());
             mix(layer.ef_residual.as_ref().map_or(0, GpuTensor::numel));
-            mix(layer.carry.as_ref().map_or(0, |carry| carry.tile_entry.numel()));
-            mix(layer.carry.as_ref().map_or(0, |carry| carry.pending_conv.numel()));
+            mix(layer
+                .carry
+                .as_ref()
+                .map_or(0, |carry| carry.tile_entry.numel()));
+            mix(layer
+                .carry
+                .as_ref()
+                .map_or(0, |carry| carry.pending_conv.numel()));
         }
         for layer in &state.qsa {
             mix(layer.full_capacity);
@@ -1456,10 +1462,9 @@ impl Qwen4StateSnapshotArena {
                 .map(|carry| carry.tensors().to_vec())
                 .unwrap_or_default();
             if live.len() != backup.len()
-                || live
-                    .iter()
-                    .zip(backup)
-                    .any(|(live, backup)| live.numel() != backup.numel() || live.dtype != backup.dtype)
+                || live.iter().zip(backup).any(|(live, backup)| {
+                    live.numel() != backup.numel() || live.dtype != backup.dtype
+                })
             {
                 return Err(StateError::SnapshotShape);
             }
@@ -3043,7 +3048,12 @@ impl Qwen4State {
             .checked_mul(gdn_layers)?
             .checked_add(qsa_layer.checked_mul(qsa_layers)?)?
             .checked_add(per_request)?
-            .checked_add(Self::gdn_stream_device_bytes(config, format.gdn_stream, scope, mirror)?)
+            .checked_add(Self::gdn_stream_device_bytes(
+                config,
+                format.gdn_stream,
+                scope,
+                mirror,
+            )?)
     }
 
     /// Device bytes the whole-model QSA context arenas of one state commit under
@@ -3275,9 +3285,9 @@ impl Qwen4State {
             return Some(0);
         }
         let sizes = Self::gdn_stream_allocation_sizes(config, kind, gdn_layers, mirror)?;
-        sizes
-            .iter()
-            .try_fold(0usize, |total, &bytes| total.checked_add(usize::try_from(bytes).ok()?))
+        sizes.iter().try_fold(0usize, |total, &bytes| {
+            total.checked_add(usize::try_from(bytes).ok()?)
+        })
     }
 
     /// One entry per stream-carry allocation (live per layer, mirror per
@@ -3808,7 +3818,9 @@ impl Qwen4State {
         // SHA-256 of `bytes` bytes of `tensor` starting at byte `offset`.
         let hash_range =
             |tensor: &GpuTensor, offset: usize, bytes: usize| -> Result<String, StateError> {
-                let end = offset.checked_add(bytes).ok_or(StateError::DimensionOverflow)?;
+                let end = offset
+                    .checked_add(bytes)
+                    .ok_or(StateError::DimensionOverflow)?;
                 if end > tensor.buf.size() {
                     return Err(StateError::SnapshotLength);
                 }
@@ -4073,7 +4085,11 @@ impl Qwen4State {
         commits: Option<&[(usize, usize, usize, usize, usize)]>,
     ) -> Result<(Vec<u8>, StateLayout<'_>), StateError> {
         let mut words = vec![
-            gdn_session_tag(self.map.session_tag(), self.gdn_format, self.gdn_stream.as_ref()),
+            gdn_session_tag(
+                self.map.session_tag(),
+                self.gdn_format,
+                self.gdn_stream.as_ref(),
+            ),
             position as u64,
         ];
         if self.ple_conv.is_some() {
@@ -4542,7 +4558,16 @@ impl Qwen4State {
             Some(GdnEdge::Scan64 { consts, ws }) => {
                 free(consts);
                 let rdna_compute::gdn_stream::GdnStreamWorkspace {
-                    x, alpha, beta, q, k, v, a, out, conv, ..
+                    x,
+                    alpha,
+                    beta,
+                    q,
+                    k,
+                    v,
+                    a,
+                    out,
+                    conv,
+                    ..
                 } = ws;
                 for tensor in [x, alpha, beta, q, k, v, a, out, conv] {
                     free(tensor);
@@ -5145,12 +5170,8 @@ impl Qwen4State {
             let value_heads = self.gdn_value_heads;
             let key_heads = (qkv - value_heads * GDN_HEAD_DIM) / (2 * GDN_HEAD_DIM);
             let from = capture_ring_slot(self.row_capture_compact, self.row_capture_rows, before);
-            let to = capture_view_start(
-                self.row_capture_compact,
-                self.row_capture_rows,
-                base,
-                keep,
-            );
+            let to =
+                capture_view_start(self.row_capture_compact, self.row_capture_rows, base, keep);
             if self.gdn_format.has_residual() {
                 // The verify advanced every live residual in place; the entry
                 // residual exists only in the transaction mirror. Restore it, then

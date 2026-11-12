@@ -591,7 +591,10 @@ impl StageLayout {
     pub(crate) fn of(state: &Qwen4State) -> Self {
         Self {
             gdn: state.gdn.len(),
-            gdn_parts: state.gdn.first().map_or(2, |layer| layer.session_parts().len()),
+            gdn_parts: state
+                .gdn
+                .first()
+                .map_or(2, |layer| layer.session_parts().len()),
             qsa: state.qsa.len(),
             ple: state.ple_conv.is_some(),
         }

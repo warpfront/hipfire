@@ -19,10 +19,14 @@ const HD: usize = 128;
 const HK: usize = 16;
 
 fn lcg(seed: u64, n: usize, lo: f32, hi: f32) -> Vec<f32> {
-    let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    let mut s = seed
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     (0..n)
         .map(|_| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             lo + (hi - lo) * (((s >> 40) as u32) as f32 / (1u32 << 24) as f32)
         })
         .collect()
@@ -65,7 +69,9 @@ fn dl(gpu: &Gpu, t: &GpuTensor, n: usize) -> Result<Vec<u8>> {
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
-    let dir = args.next().ok_or("usage: gdn_canon_bulk_digest <out_dir> [--hv 48|32]")?;
+    let dir = args
+        .next()
+        .ok_or("usage: gdn_canon_bulk_digest <out_dir> [--hv 48|32]")?;
     let mut hv = 48usize;
     while let Some(a) = args.next() {
         if a == "--hv" {
@@ -74,7 +80,11 @@ fn main() -> Result<()> {
     }
     std::fs::create_dir_all(&dir)?;
     let mut gpu = Gpu::init()?;
-    let fmt = if gpu.arch == "gfx1201" { GdnScanOut::Bf16 } else { GdnScanOut::F32 };
+    let fmt = if gpu.arch == "gfx1201" {
+        GdnScanOut::Bf16
+    } else {
+        GdnScanOut::F32
+    };
     let out_elem = if fmt == GdnScanOut::Bf16 { 2 } else { 4 };
     let xdim = (2 * HK + hv) * HD;
     let total = 1100usize;
@@ -85,9 +95,15 @@ fn main() -> Result<()> {
     let dtb = gpu.upload_f32(&lcg(6, hv, -4.0, -2.0), &[hv])?;
     let alog = gpu.upload_f32(&lcg(7, hv, 0.0, 2.0), &[hv])?;
     let conv0 = fb(&lcg(9, 3 * xdim, -0.5, 0.5));
-    let q80: Vec<u8> = lcg(10, hv * HD * HD, -64.0, 64.0).iter().map(|x| *x as i8 as u8).collect();
+    let q80: Vec<u8> = lcg(10, hv * HD * HD, -64.0, 64.0)
+        .iter()
+        .map(|x| *x as i8 as u8)
+        .collect();
     let sc0 = fb(&lcg(11, hv * HD, 0.005, 0.02));
-    let ef0: Vec<u8> = lcg(12, hv * HD * HD, -0.004, 0.004).iter().flat_map(|x| f16_bits(*x).to_ne_bytes()).collect();
+    let ef0: Vec<u8> = lcg(12, hv * HD * HD, -0.004, 0.004)
+        .iter()
+        .flat_map(|x| f16_bits(*x).to_ne_bytes())
+        .collect();
     for n in [1usize, 25, 63, 64, 65, 300, 512, 513, 1100] {
         let conv = up(&mut gpu, &conv0)?;
         let codes = up(&mut gpu, &q80)?;
@@ -106,12 +122,16 @@ fn main() -> Result<()> {
         gpu.gdn_chunk_prepare(fmt)?;
         let qs = 1.0 / (HD as f32).sqrt();
         let kkt_batched = gpu.gdn_kkt_batched_enabled() && n > seg;
-        gpu.gdn_chunk_prep(&x, &cw, &conv, &a, &b, &dtb, &alog, &q, &k, &v, n, qs, 1e-6, HK, hv)?;
+        gpu.gdn_chunk_prep(
+            &x, &cw, &conv, &a, &b, &dtb, &alog, &q, &k, &v, n, qs, 1e-6, HK, hv,
+        )?;
         if kkt_batched {
             gpu.gdn_chunk_kkt_solve_batched(&k, &a, &b, &aa, n, HK, hv)?;
         }
         if kkt_batched && gpu.gdn_scan_mseg_enabled(fmt, seg) {
-            gpu.gdn_chunk_scan_layer_mseg(&q, &k, &v, &aa, &a, &b, &codes, &scales, &ef, &o, n, HK, hv)?;
+            gpu.gdn_chunk_scan_layer_mseg(
+                &q, &k, &v, &aa, &a, &b, &codes, &scales, &ef, &o, n, HK, hv,
+            )?;
         } else {
             for row0 in (0..n).step_by(seg) {
                 let rows = (n - row0).min(seg);
@@ -120,18 +140,44 @@ fn main() -> Result<()> {
                 } else {
                     aa.shallow_clone()
                 };
-                gpu.gdn_chunk_scan_segment(&q, &k, &v, &a_seg, &a, &b, &codes, &scales, &ef, &o, fmt, row0, rows, !kkt_batched, HK, hv)?;
+                gpu.gdn_chunk_scan_segment(
+                    &q,
+                    &k,
+                    &v,
+                    &a_seg,
+                    &a,
+                    &b,
+                    &codes,
+                    &scales,
+                    &ef,
+                    &o,
+                    fmt,
+                    row0,
+                    rows,
+                    !kkt_batched,
+                    HK,
+                    hv,
+                )?;
             }
         }
-        std::fs::write(format!("{dir}/n{n}.out"), dl(&gpu, &o, n * hv * HD * out_elem)?)?;
+        std::fs::write(
+            format!("{dir}/n{n}.out"),
+            dl(&gpu, &o, n * hv * HD * out_elem)?,
+        )?;
         std::fs::write(format!("{dir}/n{n}.codes"), dl(&gpu, &codes, hv * HD * HD)?)?;
-        std::fs::write(format!("{dir}/n{n}.scales"), dl(&gpu, &scales, hv * HD * 4)?)?;
+        std::fs::write(
+            format!("{dir}/n{n}.scales"),
+            dl(&gpu, &scales, hv * HD * 4)?,
+        )?;
         std::fs::write(format!("{dir}/n{n}.ef"), dl(&gpu, &ef, hv * HD * HD * 2)?)?;
         std::fs::write(format!("{dir}/n{n}.conv"), dl(&gpu, &conv, 3 * xdim * 4)?)?;
         for t in [conv, codes, scales, ef, x, a, b, q, k, v, aa, o] {
             gpu.free_tensor(t)?;
         }
     }
-    println!("{{\"oracle\":\"gdn_canon_bulk_digest\",\"arch\":\"{}\",\"hv\":{hv},\"dir\":\"{dir}\"}}", gpu.arch);
+    println!(
+        "{{\"oracle\":\"gdn_canon_bulk_digest\",\"arch\":\"{}\",\"hv\":{hv},\"dir\":\"{dir}\"}}",
+        gpu.arch
+    );
     Ok(())
 }

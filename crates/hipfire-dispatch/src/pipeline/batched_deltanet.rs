@@ -16,13 +16,13 @@ use crate::ops::delta_net::StateQuant;
 use crate::pipeline::batched::*;
 use crate::pipeline::hybrid::HybridDims;
 use hip_bridge::{HipError, HipResult};
-use rdna_compute::norm::GdnScanOut;
-use rdna_compute::{DType, Gpu, GpuTensor};
 use rdna_compute::gdn_stream::{
     GdnCarryGeometry, GdnCarryView as ScanCarryView, GdnLiveState, GdnPrefillPlan, GdnQ8Planes,
     GdnScanAlgorithm, GdnSeqInputs, GdnStreamConsts, GdnStreamMeta, GdnStreamRaw, GdnStreamScratch,
     GdnStreamWorkspace, GdnTensorFormat,
 };
+use rdna_compute::norm::GdnScanOut;
+use rdna_compute::{DType, Gpu, GpuTensor};
 use std::cell::{Cell, RefCell};
 
 /// Resident weights of one gated DeltaNet sublayer.
@@ -1536,7 +1536,6 @@ fn gdn_out_reader(
     }
 }
 
-
 /// Prescaffold (behavior-only) extraction for S4-f16-residual-inputs.
 ///
 /// Same statements, same order, same launches as the inlined block.
@@ -1894,8 +1893,14 @@ fn gdn_stream_layer<'a>(
     if s.lanes != 1 {
         return Err(fail("ordinary prefill needs a single-lane state"));
     }
-    let plan = s.plans.get(layer).ok_or_else(|| fail("no plan bound for this layer"))?;
-    let committed = *s.meta.get(layer).ok_or_else(|| fail("no cursor for this layer"))?;
+    let plan = s
+        .plans
+        .get(layer)
+        .ok_or_else(|| fail("no plan bound for this layer"))?;
+    let committed = *s
+        .meta
+        .get(layer)
+        .ok_or_else(|| fail("no cursor for this layer"))?;
     let meta = call
         .and_then(|c| c.candidates.borrow().get(layer).copied().flatten())
         .unwrap_or(committed);
@@ -1918,7 +1923,10 @@ fn gdn_stream_record(call: &GdnStreamCall<'_>, layer: usize, next: GdnStreamMeta
             *slot = Some(next);
             Ok(())
         }
-        None => Err(HipError::new(0, "GDN stream route: candidate table too small")),
+        None => Err(HipError::new(
+            0,
+            "GDN stream route: candidate table too small",
+        )),
     }
 }
 
@@ -2024,7 +2032,12 @@ pub fn gdn_stream_scan_layer(
         alpha: &pbs.dn_alpha_batch,
         beta: &pbs.dn_beta_batch,
     };
-    let scratch = GdnStreamScratch { q: &q, k: &k, v: &v, a: &a };
+    let scratch = GdnStreamScratch {
+        q: &q,
+        k: &k,
+        v: &v,
+        a: &a,
+    };
     call.attempted.set(true);
     let next = gpu.gdn_stream_append(
         plan,
@@ -2061,7 +2074,10 @@ pub fn gdn_stream_sequential_layer(
     if plan.algorithm != GdnScanAlgorithm::Sequential {
         return Err(HipError::new(
             0,
-            &format!("GDN stream sequential: plan algorithm is {:?}", plan.algorithm),
+            &format!(
+                "GDN stream sequential: plan algorithm is {:?}",
+                plan.algorithm
+            ),
         ));
     }
     let l = delta_layer_idx;
@@ -2183,11 +2199,22 @@ pub fn batch_chunk_delta_net_attn(
                     fusion,
                     None,
                 )?;
-                gdn_stream_sequential_layer(gpu, &call, pbs, dn_state, delta_layer_idx, n, n_v_heads)?;
+                gdn_stream_sequential_layer(
+                    gpu,
+                    &call,
+                    pbs,
+                    dn_state,
+                    delta_layer_idx,
+                    n,
+                    n_v_heads,
+                )?;
                 GdnScanOut::F32
             }
             GdnScanAlgorithm::Wy16 => {
-                return Err(HipError::new(0, "GDN stream route: Wy16 plans belong to Qwen4"));
+                return Err(HipError::new(
+                    0,
+                    "GDN stream route: Wy16 plans belong to Qwen4",
+                ));
             }
         };
         return batch_chunk_delta_net_output_projection(

@@ -268,7 +268,11 @@ fn gen_planes(seed: u64, rows: usize, n_heads: usize, ratio: usize) -> Planes {
         let mut out = Vec::with_capacity(n * HD);
         for _ in 0..n {
             let v: Vec<f32> = (0..HD).map(|_| rng.sym()).collect();
-            let norm = v.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>().sqrt();
+            let norm = v
+                .iter()
+                .map(|x| (*x as f64) * (*x as f64))
+                .sum::<f64>()
+                .sqrt();
             out.extend(v.iter().map(|x| (*x as f64 / norm) as f32));
         }
         out
@@ -560,8 +564,7 @@ fn model_unit(
     let mut recon = vec![0.0f64; nr * HD];
     for r in 0..nr {
         for c in 0..HD {
-            recon[r * HD + c] =
-                recon_f32(codes[r * HD + c], scales[r], ef[r * HD + c]) as f64;
+            recon[r * HD + c] = recon_f32(codes[r * HD + c], scales[r], ef[r * HD + c]) as f64;
         }
     }
     UnitOut { h, r0, out, recon }
@@ -654,8 +657,8 @@ fn f32_floor(p: &Planes, ef_start: &[u16], f64_ref: &ModelOut) -> (f64, f64) {
     for (h, r0, out, st) in res {
         for t in 0..p.rows {
             for r in 0..ROW_BLOCK {
-                let e = (out[t * ROW_BLOCK + r] as f64 - f64_ref.out[(t * nh + h) * HD + r0 + r])
-                    .abs();
+                let e =
+                    (out[t * ROW_BLOCK + r] as f64 - f64_ref.out[(t * nh + h) * HD + r0 + r]).abs();
                 out_err = out_err.max(e);
             }
         }
@@ -852,12 +855,21 @@ fn entering_hashes(gpu: &Gpu, d: &Dev) -> Res<BTreeMap<&'static str, String>> {
     sync(gpu)?;
     let mut hashes = BTreeMap::new();
     for (name, tensor) in [
-        ("q", &d.q), ("k", &d.k), ("q_expanded", &d.q_rep),
-        ("k_expanded", &d.k_rep), ("v", &d.v), ("gate", &d.gate),
-        ("beta", &d.beta), ("q8_codes", &d.codes),
-        ("f32_scales", &d.scales), ("f16_ef", &d.ef),
+        ("q", &d.q),
+        ("k", &d.k),
+        ("q_expanded", &d.q_rep),
+        ("k_expanded", &d.k_rep),
+        ("v", &d.v),
+        ("gate", &d.gate),
+        ("beta", &d.beta),
+        ("q8_codes", &d.codes),
+        ("f32_scales", &d.scales),
+        ("f16_ef", &d.ef),
     ] {
-        hashes.insert(name, sha(&ctx(gpu.download_raw_bytes(tensor), "hash entering plane")?));
+        hashes.insert(
+            name,
+            sha(&ctx(gpu.download_raw_bytes(tensor), "hash entering plane")?),
+        );
     }
     Ok(hashes)
 }
@@ -963,7 +975,9 @@ fn exec_cell(
     }
     reset_state(gpu, d, p, ef)?;
     let capture_inputs_ok = entering_hashes(gpu, d)? == entering;
-    capture_graph(gpu, calls, |g| launch_calls(g, d, p, ef, qk, split).map(|_| ()))?;
+    capture_graph(gpu, calls, |g| {
+        launch_calls(g, d, p, ef, qk, split).map(|_| ())
+    })?;
     let capture_kernels = log_take(log);
     let captured_launches = gpu.graphs.ar_forward_blobs.len();
     replay(gpu)?;
@@ -989,7 +1003,11 @@ fn exec_cell(
         "eager_vs_replay1_bit_identical": e_eq_r1,
         "replay1_vs_replay2_bit_identical": r1_eq_r2,
     });
-    Ok((r1, info, in_ok && in_ok_after && capture_inputs_ok && replay2_inputs_ok && e_eq_r1 && r1_eq_r2))
+    Ok((
+        r1,
+        info,
+        in_ok && in_ok_after && capture_inputs_ok && replay2_inputs_ok && e_eq_r1 && r1_eq_r2,
+    ))
 }
 
 // ═══════════════════════════ metrics ══════════════════════════════════════════
@@ -1168,7 +1186,9 @@ fn lsb_controls(
             (0..rw).all(|i| r.out[t * rw + i].to_bits() == base_result.out[t * rw + i].to_bits())
         });
         let diff_in_row = (0..rw)
-            .filter(|i| r.out[first_row * rw + i].to_bits() != base_result.out[first_row * rw + i].to_bits())
+            .filter(|i| {
+                r.out[first_row * rw + i].to_bits() != base_result.out[first_row * rw + i].to_bits()
+            })
             .count();
         let first_diff_row = (0..m.rows).find(|t| {
             (0..rw).any(|i| r.out[t * rw + i].to_bits() != base_result.out[t * rw + i].to_bits())
@@ -1217,7 +1237,8 @@ fn run(args: &[String]) -> Res<i32> {
     let cli = parse_cli(args)?;
     if hipfire_env_per_token() {
         return Err(
-            "HIPFIRE_DN_REQUANT_PER_TOKEN is set: the oracle targets gated_delta_net_q8_fast".into(),
+            "HIPFIRE_DN_REQUANT_PER_TOKEN is set: the oracle targets gated_delta_net_q8_fast"
+                .into(),
         );
     }
     let p = gen_planes(cli.seed, cli.rows, cli.heads, cli.ratio);
@@ -1344,8 +1365,8 @@ fn run(args: &[String]) -> Res<i32> {
                     let (a, b) = (kr.recon(), w.recon());
                     let mut st_lsb = 0.0f64;
                     for i in 0..a.len() {
-                        st_lsb = st_lsb
-                            .max((a[i] as f64 - b[i] as f64).abs() / w.scales[i / HD] as f64);
+                        st_lsb =
+                            st_lsb.max((a[i] as f64 - b[i] as f64).abs() / w.scales[i / HD] as f64);
                     }
                     json!({
                         "rows_bit_identical_to_whole": rows_equal,
@@ -1425,12 +1446,8 @@ fn run(args: &[String]) -> Res<i32> {
     }
 
     // Negative controls (indexed, nonzero EF, whole call).
-    let (controls, controls_ok) = lsb_controls(
-        &mut gpu,
-        &p,
-        &whole[&(EfMode::Nonzero, Qk::Indexed)],
-        &log,
-    )?;
+    let (controls, controls_ok) =
+        lsb_controls(&mut gpu, &p, &whole[&(EfMode::Nonzero, Qk::Indexed)], &log)?;
     if !controls_ok {
         failed += 1;
     }
@@ -1443,7 +1460,8 @@ fn run(args: &[String]) -> Res<i32> {
             c["ef_mode"] == ef && c["qk_mode"] == qk && c["split"].as_u64() == Some(cli.rows as u64)
         })
     };
-    let state_fails = |c: Option<&Value>| c.map(|c| c["vs_continuous_f64_reference"]["state_ok"] == false);
+    let state_fails =
+        |c: Option<&Value>| c.map(|c| c["vs_continuous_f64_reference"]["state_ok"] == false);
     let nz_i = state_fails(whole_cell("nonzero", "indexed"));
     let nz_r = state_fails(whole_cell("nonzero", "repeated"));
     let z_i = state_fails(whole_cell("zero", "indexed"));
@@ -1561,7 +1579,10 @@ mod tests {
         // More rows changes V but must not change the (independent) state planes.
         let d = gen_planes(7, 65, 4, 2);
         assert_eq!(plane_hashes(&a)["q8_codes"], plane_hashes(&d)["q8_codes"]);
-        assert_eq!(plane_hashes(&a)["f16_ef_nonzero"], plane_hashes(&d)["f16_ef_nonzero"]);
+        assert_eq!(
+            plane_hashes(&a)["f16_ef_nonzero"],
+            plane_hashes(&d)["f16_ef_nonzero"]
+        );
         for row in a.q.chunks(HD).chain(a.k.chunks(HD)) {
             let n: f64 = row.iter().map(|x| (*x as f64).powi(2)).sum();
             assert!((n - 1.0).abs() < 1e-6, "Q/K row not unit norm: {n}");
@@ -1569,13 +1590,19 @@ mod tests {
         assert!(a.v.iter().all(|x| (-1.0..=1.0).contains(x)));
         assert!(a.gate.iter().all(|x| (-0.3..=-0.02).contains(x)));
         assert!(a.beta.iter().all(|x| (0.1..=0.9).contains(x)));
-        assert!(a.ef_nonzero.iter().any(|e| *e != 0), "EF residual must be nonzero");
+        assert!(
+            a.ef_nonzero.iter().any(|e| *e != 0),
+            "EF residual must be nonzero"
+        );
         assert!(a.ef_zero.iter().all(|e| *e == 0));
         // Entering state is quantized to <= 0.5 LSB (+ f16 rounding) of its own scale.
         for (i, s0) in a.s0.iter().enumerate() {
             let sc = a.scales[i / HD];
             let rec = recon_f32(a.codes[i], sc, a.ef_nonzero[i]);
-            assert!((rec - s0).abs() <= 1e-3 * sc.max(f32::MIN_POSITIVE) + 1e-6, "q+ef != S0");
+            assert!(
+                (rec - s0).abs() <= 1e-3 * sc.max(f32::MIN_POSITIVE) + 1e-6,
+                "q+ef != S0"
+            );
         }
         // Repeated Q/K is the interleaved expansion of the compact plane.
         for t in 0..a.rows {
@@ -1594,7 +1621,10 @@ mod tests {
         for split in [1usize, 7, 25, 64, 96] {
             let good = run_model(&p, &p.ef_nonzero, Placement::EfAtStart, split);
             let lsb = state_lsb(&good, &cont, &p);
-            assert!(lsb <= STATE_TOL_LSB_EF, "corrected model drifts {lsb} LSB at split {split}");
+            assert!(
+                lsb <= STATE_TOL_LSB_EF,
+                "corrected model drifts {lsb} LSB at split {split}"
+            );
         }
         // The legacy placement leaves the (undecayed) residual: decisively off.
         let bad = run_model(&p, &p.ef_nonzero, Placement::EfAtEnd, p.rows);
@@ -1628,19 +1658,30 @@ mod tests {
         let mut m = base.clone();
         flip_f32(&mut m.v, 5);
         let h1 = plane_hashes(&m);
-        let changed: Vec<_> = h0.iter().filter(|(k, v)| h1[**k] != **v).map(|(k, _)| *k).collect();
+        let changed: Vec<_> = h0
+            .iter()
+            .filter(|(k, v)| h1[**k] != **v)
+            .map(|(k, _)| *k)
+            .collect();
         assert_eq!(changed, vec!["v"]);
         let mut m = base.clone();
         m.q8_flip();
         let h2 = plane_hashes(&m);
-        let changed: Vec<_> = h0.iter().filter(|(k, v)| h2[**k] != **v).map(|(k, _)| *k).collect();
+        let changed: Vec<_> = h0
+            .iter()
+            .filter(|(k, v)| h2[**k] != **v)
+            .map(|(k, _)| *k)
+            .collect();
         assert_eq!(changed, vec!["q8_codes"]);
     }
 
     #[test]
     fn cli_parses_frozen_flags_and_rejects_bad_input() {
         let a = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
-        let c = parse_cli(&a("--seed 0x10 --rows 100 --splits 1,25,63 --graph 1 --json x.json")).unwrap();
+        let c = parse_cli(&a(
+            "--seed 0x10 --rows 100 --splits 1,25,63 --graph 1 --json x.json",
+        ))
+        .unwrap();
         assert_eq!((c.seed, c.rows, c.graph), (16, 100, true));
         assert_eq!(c.splits, vec![1, 25, 63]);
         assert_eq!(c.json.as_deref(), Some("x.json"));

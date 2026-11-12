@@ -210,8 +210,15 @@ impl<'a> GdnStreamCtx<'a> {
     /// The live Q8 planes as a scan entry (plain Q8 reconstructs without EF).
     fn q8_entry(&self) -> GdnScanEntry<'a> {
         match self.planes.ef {
-            Some(ef) => GdnScanEntry::Q8Ef { codes: self.planes.codes, scales: self.planes.scales, ef },
-            None => GdnScanEntry::Q8 { codes: self.planes.codes, scales: self.planes.scales },
+            Some(ef) => GdnScanEntry::Q8Ef {
+                codes: self.planes.codes,
+                scales: self.planes.scales,
+                ef,
+            },
+            None => GdnScanEntry::Q8 {
+                codes: self.planes.codes,
+                scales: self.planes.scales,
+            },
         }
     }
 
@@ -227,7 +234,9 @@ impl<'a> GdnStreamCtx<'a> {
                 next: self.carry.tile_entry_f32,
             }
         } else {
-            GdnScanExit::F32 { state: self.carry.tile_entry_f32 }
+            GdnScanExit::F32 {
+                state: self.carry.tile_entry_f32,
+            }
         }
     }
 }
@@ -5991,8 +6000,16 @@ impl Gpu {
             a,
             g,
             beta,
-            &GdnScanEntry::Q8Ef { codes: state_q8, scales: state_scales, ef: ef_residual },
-            &GdnScanExit::Seal { codes: state_q8, scales: state_scales, ef: Some(ef_residual) },
+            &GdnScanEntry::Q8Ef {
+                codes: state_q8,
+                scales: state_scales,
+                ef: ef_residual,
+            },
+            &GdnScanExit::Seal {
+                codes: state_q8,
+                scales: state_scales,
+                ef: Some(ef_residual),
+            },
             out,
             n_tokens,
             n_key_heads,
@@ -6132,7 +6149,19 @@ impl Gpu {
         n_value_heads: usize,
     ) -> HipResult<()> {
         self.gdn_chunk_prep_launch(
-            [input, conv_weight, conv_state, g, beta, dt_bias, a_log, q, k, v].map(|t| t.buf.as_ptr()),
+            [
+                input,
+                conv_weight,
+                conv_state,
+                g,
+                beta,
+                dt_bias,
+                a_log,
+                q,
+                k,
+                v,
+            ]
+            .map(|t| t.buf.as_ptr()),
             n_tokens,
             q_scale,
             eps,
@@ -6499,7 +6528,10 @@ impl Gpu {
             }
         }
         match exit {
-            GdnScanExit::Seal { codes, scales, ef } | GdnScanExit::Seam { codes, scales, ef, .. } => {
+            GdnScanExit::Seal { codes, scales, ef }
+            | GdnScanExit::Seam {
+                codes, scales, ef, ..
+            } => {
                 Self::gdn_scan_bind(&mut s.sq, p(codes), "code")?;
                 Self::gdn_scan_bind(&mut s.sc, p(scales), "scale")?;
                 let mut mode = if matches!(exit, GdnScanExit::Seal { .. }) {
@@ -6687,8 +6719,16 @@ impl Gpu {
             a,
             g,
             beta,
-            &GdnScanEntry::Q8Ef { codes: state_q8, scales: state_scales, ef: ef_residual },
-            &GdnScanExit::Seal { codes: state_q8, scales: state_scales, ef: Some(ef_residual) },
+            &GdnScanEntry::Q8Ef {
+                codes: state_q8,
+                scales: state_scales,
+                ef: ef_residual,
+            },
+            &GdnScanExit::Seal {
+                codes: state_q8,
+                scales: state_scales,
+                ef: Some(ef_residual),
+            },
             out,
             out_fmt,
             row0,
@@ -6775,7 +6815,16 @@ impl Gpu {
             beta: bp,
             out: out.buf.as_ptr(),
         };
-        self.gdn_scan_launch(scan_module, gfx1151_twin, &ptrs, &state, r0, n_tokens as i32, hk, hv)
+        self.gdn_scan_launch(
+            scan_module,
+            gfx1151_twin,
+            &ptrs,
+            &state,
+            r0,
+            n_tokens as i32,
+            hk,
+            hv,
+        )
     }
 
     // ------------------------------------------------------------------
@@ -6833,7 +6882,18 @@ impl Gpu {
 
     #[cfg(feature = "deltanet")]
     pub fn gdn_stream_workspace_free(&mut self, ws: GdnStreamWorkspace) -> HipResult<()> {
-        let GdnStreamWorkspace { x, alpha, beta, q, k, v, a, out, conv, .. } = ws;
+        let GdnStreamWorkspace {
+            x,
+            alpha,
+            beta,
+            q,
+            k,
+            v,
+            a,
+            out,
+            conv,
+            ..
+        } = ws;
         for t in [x, alpha, beta, q, k, v, a, out, conv] {
             self.free_tensor(t)?;
         }
@@ -6869,19 +6929,31 @@ impl Gpu {
         match (plan.state_quant, live.planes.ef.is_some()) {
             (GdnStateQuant::Q8, false) | (GdnStateQuant::Q8Ef, true) => {}
             (GdnStateQuant::F32, _) => {
-                return Err(fail("Scan64 streams carry a Q8/Q8Ef state (F32 has no seam)".into()));
+                return Err(fail(
+                    "Scan64 streams carry a Q8/Q8Ef state (F32 has no seam)".into(),
+                ));
             }
             (q, has_ef) => {
-                return Err(fail(format!("plan state {q:?} but EF plane present = {has_ef}")));
+                return Err(fail(format!(
+                    "plan state {q:?} but EF plane present = {has_ef}"
+                )));
             }
         }
         if ws.out_fmt != out_fmt || ws.hk != consts.n_key_heads || ws.hv != consts.n_value_heads {
-            return Err(fail("workspace was allocated for another geometry/output format".into()));
+            return Err(fail(
+                "workspace was allocated for another geometry/output format".into(),
+            ));
         }
         let (hk, hv) = (consts.n_key_heads, consts.n_value_heads);
         Self::gdn_chunk_check_heads(hk, hv)?;
         let xdim = (2 * hk + hv) * 128;
-        let geom = GdnCarryGeometry { hk, hv, head_dim: 128, conv_hist_rows: 3, micro_rows: 64 };
+        let geom = GdnCarryGeometry {
+            hk,
+            hv,
+            head_dim: 128,
+            conv_hist_rows: 3,
+            micro_rows: 64,
+        };
         carry.check(&geom).map_err(fail)?;
         let state_elems = hv * 128 * 128;
         let need = |what: &str, have: usize, want: usize| -> HipResult<()> {
@@ -7006,12 +7078,7 @@ impl Gpu {
     }
 
     #[cfg(feature = "deltanet")]
-    fn gdn_stream_kkt(
-        &mut self,
-        c: &GdnStreamCtx<'_>,
-        p: &GdnScanPtrs,
-        t: usize,
-    ) -> HipResult<()> {
+    fn gdn_stream_kkt(&mut self, c: &GdnStreamCtx<'_>, p: &GdnScanPtrs, t: usize) -> HipResult<()> {
         if c.kkt_batched {
             self.gdn_chunk_kkt_batched_launch(p.k, p.g, p.beta, p.a, t, c.hk, c.hv)
         } else {
@@ -7035,14 +7102,22 @@ impl Gpu {
         if *open && matches!(exit, GdnScanExit::Discard) {
             // A transient replay cannot reconstruct as it goes: convert the live
             // state into the carry first.
-            self.gdn_stream_convert(c, &c.q8_entry(), &GdnScanExit::F32 { state: c.carry.tile_entry_f32 })?;
+            self.gdn_stream_convert(
+                c,
+                &c.q8_entry(),
+                &GdnScanExit::F32 {
+                    state: c.carry.tile_entry_f32,
+                },
+            )?;
             *open = false;
         }
         let entry = if *open {
             *open = false;
             c.q8_entry()
         } else {
-            GdnScanEntry::F32 { state: c.carry.tile_entry_f32 }
+            GdnScanEntry::F32 {
+                state: c.carry.tile_entry_f32,
+            }
         };
         let state = Self::gdn_scan_state(&entry, exit)?;
         let (module, twin) = if mseg {
@@ -7050,7 +7125,16 @@ impl Gpu {
         } else {
             (c.scan_module, c.scan_twin)
         };
-        self.gdn_scan_launch(module, twin, p, &state, 0, t as i32, c.hk as u32, c.hv as u32)
+        self.gdn_scan_launch(
+            module,
+            twin,
+            p,
+            &state,
+            0,
+            t as i32,
+            c.hk as u32,
+            c.hv as u32,
+        )
     }
 
     /// Pure state conversion (`T = 0` scan): open (Q8 -> FP32) or seal (FP32 -> Q8).
@@ -7063,8 +7147,25 @@ impl Gpu {
     ) -> HipResult<()> {
         let state = Self::gdn_scan_state(entry, exit)?;
         let nul = std::ptr::null_mut();
-        let p = GdnScanPtrs { q: nul, k: nul, v: nul, a: nul, g: nul, beta: nul, out: nul };
-        self.gdn_scan_launch(c.scan_module, c.scan_twin, &p, &state, 0, 0, c.hk as u32, c.hv as u32)
+        let p = GdnScanPtrs {
+            q: nul,
+            k: nul,
+            v: nul,
+            a: nul,
+            g: nul,
+            beta: nul,
+            out: nul,
+        };
+        self.gdn_scan_launch(
+            c.scan_module,
+            c.scan_twin,
+            &p,
+            &state,
+            0,
+            0,
+            c.hk as u32,
+            c.hv as u32,
+        )
     }
 
     /// Append `rows` raw rows of one Scan64 layer at absolute `start_pos`
@@ -7119,7 +7220,11 @@ impl Gpu {
         need("scratch q", scratch.q.byte_size(), r * c.qrow)?;
         need("scratch k", scratch.k.byte_size(), r * c.qrow)?;
         need("scratch v", scratch.v.byte_size(), r * c.vrow)?;
-        need("scratch A", scratch.a.byte_size(), r.div_ceil(64) * 64 * c.a_row)?;
+        need(
+            "scratch A",
+            scratch.a.byte_size(),
+            r.div_ceil(64) * 64 * c.a_row,
+        )?;
 
         // ---- mutation ----
         // One frame reservation per appended row, as the whole-call route made
@@ -7153,7 +7258,17 @@ impl Gpu {
                 beta: ptr(&ws.beta),
                 out: ptr(&ws.out),
             };
-            self.gdn_stream_prep(&c, ptr(&ws.x), ptr(&ws.conv), p.g, p.beta, p.q, p.k, p.v, hr)?;
+            self.gdn_stream_prep(
+                &c,
+                ptr(&ws.x),
+                ptr(&ws.conv),
+                p.g,
+                p.beta,
+                p.q,
+                p.k,
+                p.v,
+                hr,
+            )?;
             self.gdn_stream_kkt(&c, &p, hr)?;
             let exit = if !sched.head_complete {
                 GdnScanExit::Discard
@@ -7179,13 +7294,24 @@ impl Gpu {
             let alb = padd(ptr(raw.alpha), kh * arow);
             let beb = padd(ptr(raw.beta), kh * arow);
             let ob = padd(ptr(out), kh * orow);
-            let (qs, ks, vs, asp) = (ptr(scratch.q), ptr(scratch.k), ptr(scratch.v), ptr(scratch.a));
+            let (qs, ks, vs, asp) = (
+                ptr(scratch.q),
+                ptr(scratch.k),
+                ptr(scratch.v),
+                ptr(scratch.a),
+            );
             let live_conv = ptr(live.conv);
             // The incomplete final tile's raw prefix is the next append's replay
             // input: save it before any prep rewrites alpha/beta in place.
             if rt > 0 {
                 self.gdn_stream_cp(carry.pending_qkv, 0, raw.qkv, (kh + rc) * xrow, rt * xrow)?;
-                self.gdn_stream_cp(carry.pending_alpha, 0, raw.alpha, (kh + rc) * arow, rt * arow)?;
+                self.gdn_stream_cp(
+                    carry.pending_alpha,
+                    0,
+                    raw.alpha,
+                    (kh + rc) * arow,
+                    rt * arow,
+                )?;
                 self.gdn_stream_cp(carry.pending_beta, 0, raw.beta, (kh + rc) * arow, rt * arow)?;
             }
             if rc > 0 {
@@ -7292,7 +7418,10 @@ impl Gpu {
             owner_generation: meta.owner_generation,
         };
         if meta.phase == GdnStreamPhase::Sealed {
-            return Ok(GdnStreamMeta { recipe_id: plan.recipe_id, ..*meta });
+            return Ok(GdnStreamMeta {
+                recipe_id: plan.recipe_id,
+                ..*meta
+            });
         }
         // Validates phase_start / tile_base / pending / frame_base consistency.
         GdnAppendSchedule::new(meta, meta.position, 1, 64, 512).map_err(fail)?;
@@ -7301,7 +7430,9 @@ impl Gpu {
         if meta.position == meta.frame_base {
             return Ok(sealed);
         }
-        let f32_entry = GdnScanEntry::F32 { state: carry.tile_entry_f32 };
+        let f32_entry = GdnScanEntry::F32 {
+            state: carry.tile_entry_f32,
+        };
         let seal_exit = GdnScanExit::Seal {
             codes: live.planes.codes,
             scales: live.planes.scales,
@@ -7352,14 +7483,17 @@ impl Gpu {
         carry_f32: &GpuTensor,
         n_heads: usize,
     ) -> HipResult<GdnStreamMeta> {
-        let fail = |m: String| hip_bridge::HipError::new(0, &format!("gdn_stream_append_sequential: {m}"));
+        let fail =
+            |m: String| hip_bridge::HipError::new(0, &format!("gdn_stream_append_sequential: {m}"));
         self.bind_thread()?;
         self.gdn_seq_check_plan(plan, planes, carry_f32, n_heads)?;
         Self::gdn_stream_check_meta(plan, meta)?;
         let sched = GdnAppendSchedule::new(meta, start_pos, rows, 1, 512).map_err(fail)?;
         let ratio = inp.qk_head_ratio;
         if ratio == 0 || n_heads % ratio != 0 {
-            return Err(fail(format!("qk_head_ratio {ratio} does not divide {n_heads} heads")));
+            return Err(fail(format!(
+                "qk_head_ratio {ratio} does not divide {n_heads} heads"
+            )));
         }
         let (qrow, vrow, grow) = ((n_heads / ratio) * 128 * 4, n_heads * 128 * 4, n_heads * 4);
         let need = |what: &str, have: usize, want: usize| -> HipResult<()> {
@@ -7376,7 +7510,11 @@ impl Gpu {
         need("beta", inp.beta.byte_size(), rows * grow)?;
         need("out", out.byte_size(), rows * vrow)?;
 
-        let phase_start = if meta.phase == GdnStreamPhase::Open { meta.phase_start } else { start_pos };
+        let phase_start = if meta.phase == GdnStreamPhase::Open {
+            meta.phase_start
+        } else {
+            start_pos
+        };
         let end = start_pos + rows as u64;
         let _frames = reserve_gdn_requant_frames(rows as u32);
         let mut s = start_pos;
@@ -7385,14 +7523,25 @@ impl Gpu {
             let (off, len) = ((s - start_pos) as usize, (e - s) as usize);
             let entry = if s == phase_start || s % 512 == 0 {
                 match planes.ef {
-                    Some(ef) => GdnScanEntry::Q8Ef { codes: planes.codes, scales: planes.scales, ef },
-                    None => GdnScanEntry::Q8 { codes: planes.codes, scales: planes.scales },
+                    Some(ef) => GdnScanEntry::Q8Ef {
+                        codes: planes.codes,
+                        scales: planes.scales,
+                        ef,
+                    },
+                    None => GdnScanEntry::Q8 {
+                        codes: planes.codes,
+                        scales: planes.scales,
+                    },
                 }
             } else {
                 GdnScanEntry::F32 { state: carry_f32 }
             };
             let exit = if e % 512 == 0 {
-                GdnScanExit::Seal { codes: planes.codes, scales: planes.scales, ef: planes.ef }
+                GdnScanExit::Seal {
+                    codes: planes.codes,
+                    scales: planes.scales,
+                    ef: planes.ef,
+                }
             } else {
                 GdnScanExit::F32 { state: carry_f32 }
             };
@@ -7447,15 +7596,23 @@ impl Gpu {
             owner_generation: meta.owner_generation,
         };
         if meta.phase == GdnStreamPhase::Sealed {
-            return Ok(GdnStreamMeta { recipe_id: plan.recipe_id, ..*meta });
+            return Ok(GdnStreamMeta {
+                recipe_id: plan.recipe_id,
+                ..*meta
+            });
         }
-        GdnAppendSchedule::new(meta, meta.position, 1, 1, 512)
-            .map_err(|m| hip_bridge::HipError::new(0, &format!("gdn_stream_seal_sequential: {m}")))?;
+        GdnAppendSchedule::new(meta, meta.position, 1, 1, 512).map_err(|m| {
+            hip_bridge::HipError::new(0, &format!("gdn_stream_seal_sequential: {m}"))
+        })?;
         if meta.position == meta.phase_start || meta.position % 512 == 0 {
             return Ok(sealed);
         }
         let entry = GdnScanEntry::F32 { state: carry_f32 };
-        let exit = GdnScanExit::Seal { codes: planes.codes, scales: planes.scales, ef: planes.ef };
+        let exit = GdnScanExit::Seal {
+            codes: planes.codes,
+            scales: planes.scales,
+            ef: planes.ef,
+        };
         let state = Self::gdn_scan_state(&entry, &exit)?;
         let nul = std::ptr::null_mut();
         self.gdn_seq_launch([nul; 6], &state, 0, n_heads, 1, meta.position as u32)?;
@@ -7470,7 +7627,8 @@ impl Gpu {
         carry_f32: &GpuTensor,
         n_heads: usize,
     ) -> HipResult<()> {
-        let fail = |m: String| hip_bridge::HipError::new(0, &format!("gdn_stream (sequential): {m}"));
+        let fail =
+            |m: String| hip_bridge::HipError::new(0, &format!("gdn_stream (sequential): {m}"));
         if plan.algorithm != GdnScanAlgorithm::Sequential || plan.micro_rows != 1 {
             return Err(fail(format!(
                 "plan is {:?}/{}, not Sequential/1",
@@ -7483,7 +7641,9 @@ impl Gpu {
         match (plan.state_quant, planes.ef.is_some()) {
             (GdnStateQuant::Q8, false) | (GdnStateQuant::Q8Ef, true) => {}
             (q, has_ef) => {
-                return Err(fail(format!("plan state {q:?} with EF plane present = {has_ef}")));
+                return Err(fail(format!(
+                    "plan state {q:?} with EF plane present = {has_ef}"
+                )));
             }
         }
         let elems = n_heads * 128 * 128;
@@ -7498,7 +7658,11 @@ impl Gpu {
         }
         if let Some(ef) = planes.ef {
             if ef.byte_size() < elems * 2 {
-                return Err(fail(format!("state EF: {} bytes, needs {}", ef.byte_size(), elems * 2)));
+                return Err(fail(format!(
+                    "state EF: {} bytes, needs {}",
+                    ef.byte_size(),
+                    elems * 2
+                )));
             }
         }
         self.ensure_kernel(
@@ -7546,23 +7710,30 @@ impl Gpu {
             &em as *const _ as *mut c_void,
             &xm as *const _ as *mut c_void,
         ];
-        self.launch_maybe_blob(SYMBOL, [n_heads as u32, 32, 1], [32, 1, 1], 0, &mut params, || {
-            let mut b = hip_bridge::KernargBlob::new();
-            for ptr in [qp, kp, vp, gp, bp, sqp, scp, op] {
-                b.push_ptr(ptr);
-            }
-            b.push_i32(nt);
-            b.push_i32(nh);
-            b.push_i32(hd);
-            b.push_u32(fr);
-            b.push_ptr(efp);
-            b.push_i32(qr);
-            b.push_ptr(h0p);
-            b.push_ptr(htp);
-            b.push_i32(em);
-            b.push_i32(xm);
-            b
-        })
+        self.launch_maybe_blob(
+            SYMBOL,
+            [n_heads as u32, 32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                for ptr in [qp, kp, vp, gp, bp, sqp, scp, op] {
+                    b.push_ptr(ptr);
+                }
+                b.push_i32(nt);
+                b.push_i32(nh);
+                b.push_i32(hd);
+                b.push_u32(fr);
+                b.push_ptr(efp);
+                b.push_i32(qr);
+                b.push_ptr(h0p);
+                b.push_ptr(htp);
+                b.push_i32(em);
+                b.push_i32(xm);
+                b
+            },
+        )
     }
 
     /// Independent-sequence decode variant of [`Self::conv1d_silu_split_f32_n`].

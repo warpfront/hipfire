@@ -4755,7 +4755,8 @@ pub fn generate(
                         snap.prefix_hash,
                         *p,
                         &m.conversation_tokens,
-                    ) && live_identity.is_some_and(|id| snap.stream_identity() == id);
+                    ) && live_identity
+                        .is_some_and(|id| snap.stream_identity() == id);
                     if !attested {
                         rejected += 1;
                     }

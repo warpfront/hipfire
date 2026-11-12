@@ -49,9 +49,9 @@ pub mod gated_delta_vector_chunk;
 #[cfg(feature = "deltanet")]
 pub mod gated_delta_vector_pm;
 pub mod gdn_chunk_prep_pm;
-pub mod gdn_stream;
 #[cfg(test)]
 mod gdn_q8ef_reference;
+pub mod gdn_stream;
 pub mod gemm;
 mod gemm_fp8_verify;
 mod gemm_mq6_fp8;

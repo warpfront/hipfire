@@ -686,7 +686,6 @@ pub fn gate_i8(gpu: &mut Gpu, p: &GatedDeltaGateBatched<'_>) -> HipResult<*mut c
     gpu.int8_mmq_prepared_ptr(&prepared, k, p.rows)
 }
 
-
 // ---------------------------------------------------------------------------
 // Canonical Scan64 stream route (CHUNK-CANONICAL-DESIGN §3.3). The dense C64 scan
 // of an ordinary prefill appends to the layer's stream at ABSOLUTE tile and seam
@@ -765,7 +764,11 @@ fn stream_views(
         )
     };
     for (what, t, want) in [
-        ("tile entry", carry.tile_entry, geometry.value_heads * 128 * 128 * 4),
+        (
+            "tile entry",
+            carry.tile_entry,
+            geometry.value_heads * 128 * 128 * 4,
+        ),
         ("carry conv", carry.conv, conv_elems * 4),
         ("carry params", carry.params, params_elems * 4),
         ("constants staging", model.consts, consts_elems * 4),
@@ -837,7 +840,11 @@ fn stream_ring_convert(
     args.push_i32((position % 3) as i32);
     launch(
         gpu,
-        if to_stream { "fn_gdn_dense_ring_to_stream" } else { "fn_gdn_dense_ring_from_stream" },
+        if to_stream {
+            "fn_gdn_dense_ring_to_stream"
+        } else {
+            "fn_gdn_dense_ring_from_stream"
+        },
         [channels.div_ceil(256) as u32, 1, 1],
         256,
         &mut args,
@@ -863,7 +870,9 @@ fn stream_planes(
 fn take_a_scratch(gpu: &mut Gpu, n64: usize) -> HipResult<Scratch> {
     let mut slot = SCRATCH.with(|s| {
         let mut slots = s.borrow_mut();
-        let index = slots.iter().position(|(device, _)| *device == gpu.device_id)?;
+        let index = slots
+            .iter()
+            .position(|(device, _)| *device == gpu.device_id)?;
         Some(slots.swap_remove(index).1)
     });
     if slot.as_ref().is_some_and(|s| s.rows < n64) {
@@ -963,10 +972,19 @@ pub fn stream_append(
             n_value_heads: value_heads,
         },
         &GdnStreamRaw { qkv, alpha, beta },
-        &GdnStreamScratch { q: &q, k: &k, v: &vv, a: &s.a },
+        &GdnStreamScratch {
+            q: &q,
+            k: &k,
+            v: &vv,
+            a: &s.a,
+        },
         &out,
         &GdnLiveState {
-            planes: GdnQ8Planes { codes: &codes, scales: &scales, ef: residual },
+            planes: GdnQ8Planes {
+                codes: &codes,
+                scales: &scales,
+                ef: residual,
+            },
             conv: &v.live_ring,
         },
         &GdnCarryView {
@@ -1025,7 +1043,11 @@ pub fn stream_seal(
             n_value_heads: value_heads,
         },
         &GdnLiveState {
-            planes: GdnQ8Planes { codes: &codes, scales: &scales, ef: residual },
+            planes: GdnQ8Planes {
+                codes: &codes,
+                scales: &scales,
+                ef: residual,
+            },
             conv: &v.live_ring,
         },
         &GdnCarryView {
@@ -1037,7 +1059,14 @@ pub fn stream_seal(
         },
         ws,
     )?;
-    stream_ring_convert(gpu, conv_ring, &v.live_ring, geometry.channels(), meta.position, false)?;
+    stream_ring_convert(
+        gpu,
+        conv_ring,
+        &v.live_ring,
+        geometry.channels(),
+        meta.position,
+        false,
+    )?;
     Ok(sealed)
 }
 

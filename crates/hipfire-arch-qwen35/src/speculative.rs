@@ -26,8 +26,8 @@ use crate::qwen35::forward::{
     forward_prefill_dense_tp, forward_prefill_dense_tp_verify_capture, DenseTpSpecCapture,
 };
 use crate::qwen35::prefill::fp8_verify_target;
-use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weights};
 use crate::qwen35::weights::{GdnStreamIdentity, GdnStreamImage};
+use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weights};
 use hip_bridge::{DeviceBuffer, HipError, HipResult, Stream};
 use hipfire_dispatch::families::kv_tier::KTier;
 use hipfire_dispatch::pipeline::batched::{verify_dense_math, DenseBatchMath};
@@ -15640,7 +15640,12 @@ mod dn_stream_tests {
     }
 
     fn carry_bytes(g: &GdnCarryGeometry, f: usize) -> usize {
-        [g.state_bytes(), g.conv_bytes(), g.raw_qkv_bytes(), g.raw_ab_bytes()][f]
+        [
+            g.state_bytes(),
+            g.conv_bytes(),
+            g.raw_qkv_bytes(),
+            g.raw_ab_bytes(),
+        ][f]
     }
 
     fn carry(base: usize, g: GdnCarryGeometry, lanes: usize) -> DeltaNetCarry {
@@ -15751,7 +15756,10 @@ mod dn_stream_tests {
         assert_eq!(sn.bytes_len(), DeltaNetSnapshot::bytes_for(&with));
         assert!(sn.mirrors(&with));
         assert!(!sn.mirrors(&plain), "a carry-less state is not mirrored");
-        assert_eq!(sn.stream_identity().schema_version, GDN_STREAM_SCHEMA_VERSION);
+        assert_eq!(
+            sn.stream_identity().schema_version,
+            GDN_STREAM_SCHEMA_VERSION
+        );
     }
 
     #[test]
@@ -15796,7 +15804,10 @@ mod dn_stream_tests {
         short.carry_bufs[3].pop();
         assert!(err_text(short.check_restore(&live)).contains("family length"));
 
-        assert_eq!(live.stream.meta, before, "rejections never touch the live cursors");
+        assert_eq!(
+            live.stream.meta, before,
+            "rejections never touch the live cursors"
+        );
     }
 
     #[test]
@@ -15816,7 +15827,11 @@ mod dn_stream_tests {
         live.stream.apply_image(&sn.stream).expect("apply");
         let gen = live.stream.generation;
         for (got, want) in live.stream.meta.iter().zip(&saved) {
-            assert_eq!(got.phase, GdnStreamPhase::Open, "restore must not invent a seal");
+            assert_eq!(
+                got.phase,
+                GdnStreamPhase::Open,
+                "restore must not invent a seal"
+            );
             assert_eq!(
                 (got.position, got.pending_rows, got.recipe_id),
                 (want.position, want.pending_rows, want.recipe_id)
@@ -15838,9 +15853,8 @@ mod dn_stream_tests {
             m.pending_rows = 0;
         }
         let gen_before = live.stream.generation;
-        let carry_ptr = |s: &DeltaNetState, f: usize| {
-            s.stream.carry_families()[f][0].buf.as_ptr() as usize
-        };
+        let carry_ptr =
+            |s: &DeltaNetState, f: usize| s.stream.carry_families()[f][0].buf.as_ptr() as usize;
         let live_carry: Vec<usize> = (0..4).map(|f| carry_ptr(&live, f)).collect();
         assert!(sn.stream.identity == live.stream.identity());
 
@@ -15858,9 +15872,20 @@ mod dn_stream_tests {
                 "snapshot now owns the old live carry bank {f}"
             );
         }
-        assert!(live.stream.meta.iter().all(|m| m.phase == GdnStreamPhase::Sealed && m.position == 200));
-        assert!(sn.stream.meta.iter().all(|m| m.phase == GdnStreamPhase::Open && m.position == 70));
-        assert_ne!(live.stream.generation, gen_before, "exchange invalidates derived views");
+        assert!(live
+            .stream
+            .meta
+            .iter()
+            .all(|m| m.phase == GdnStreamPhase::Sealed && m.position == 200));
+        assert!(sn
+            .stream
+            .meta
+            .iter()
+            .all(|m| m.phase == GdnStreamPhase::Open && m.position == 70));
+        assert_ne!(
+            live.stream.generation, gen_before,
+            "exchange invalidates derived views"
+        );
         assert!(live
             .stream
             .meta
@@ -15873,11 +15898,20 @@ mod dn_stream_tests {
         let mut owner = GdnStreamOwner::new(LAYERS, 1, None);
         owner.bind_recipe(5).expect("bind at position 0");
         assert!(owner.meta.iter().all(|m| m.recipe_id == 5));
-        owner.bind_recipe(5).expect("rebinding the same recipe is a no-op");
-        owner.bind_recipe(6).expect("a recipe may change while empty");
+        owner
+            .bind_recipe(5)
+            .expect("rebinding the same recipe is a no-op");
+        owner
+            .bind_recipe(6)
+            .expect("a recipe may change while empty");
         open_at(&mut owner, 70, 6);
-        owner.bind_recipe(6).expect("same recipe on a prefix is fine");
-        assert!(owner.bind_recipe(9).is_err(), "never change recipe mid-prefix");
+        owner
+            .bind_recipe(6)
+            .expect("same recipe on a prefix is fine");
+        assert!(
+            owner.bind_recipe(9).is_err(),
+            "never change recipe mid-prefix"
+        );
         assert_eq!(owner.recipe_id, 6);
     }
 
@@ -15891,7 +15925,13 @@ mod dn_stream_tests {
         for m in &owner.meta {
             assert_eq!(m.phase, GdnStreamPhase::Sealed);
             assert_eq!(
-                (m.position, m.phase_start, m.frame_base, m.tile_base, m.pending_rows),
+                (
+                    m.position,
+                    m.phase_start,
+                    m.frame_base,
+                    m.tile_base,
+                    m.pending_rows
+                ),
                 (100, 100, 100, 100, 0)
             );
             assert_eq!(m.recipe_id, 5);
@@ -15900,7 +15940,9 @@ mod dn_stream_tests {
         let before = owner.meta.clone();
         assert!(err_text(owner.begin_append(71)).contains("Open"));
         assert_eq!(owner.meta, before, "a refused begin mutates nothing");
-        owner.begin_append(70).expect("an Open stream continues at its own cursor");
+        owner
+            .begin_append(70)
+            .expect("an Open stream continues at its own cursor");
         assert!(owner
             .meta
             .iter()
@@ -15919,9 +15961,14 @@ mod dn_stream_tests {
         let mut partial: Vec<Option<_>> = vec![Some(cand); LAYERS];
         partial[LAYERS - 1] = None;
         assert!(owner.commit_candidates(&partial).is_err());
-        assert_eq!(owner.meta, before, "an incomplete candidate set publishes nothing");
+        assert_eq!(
+            owner.meta, before,
+            "an incomplete candidate set publishes nothing"
+        );
         let full: Vec<Option<_>> = vec![Some(cand); LAYERS];
-        owner.commit_candidates(&full).expect("every layer succeeded");
+        owner
+            .commit_candidates(&full)
+            .expect("every layer succeeded");
         assert!(owner.meta.iter().all(|m| m.position == 128
             && m.phase == GdnStreamPhase::Open
             && m.owner_generation == owner.generation));
@@ -15946,17 +15993,28 @@ mod dn_stream_tests {
     #[test]
     fn seal_stamps_sealed_streams_and_refuses_open_ones() {
         let mut owner = GdnStreamOwner::new(LAYERS, 1, None);
-        owner.seal_sealed_at(100).expect("untracked sealed stream is stamped");
-        assert!(owner.meta.iter().all(|m| m.position == 100 && m.tile_base == 100));
+        owner
+            .seal_sealed_at(100)
+            .expect("untracked sealed stream is stamped");
+        assert!(owner
+            .meta
+            .iter()
+            .all(|m| m.position == 100 && m.tile_base == 100));
         owner
             .seal_sealed_at(160)
             .expect("a Sealed stamp left stale by decode is overwritten, not compared");
-        assert!(owner.meta.iter().all(|m| m.position == 160 && m.pending_rows == 0));
+        assert!(owner
+            .meta
+            .iter()
+            .all(|m| m.position == 160 && m.pending_rows == 0));
         let before = owner.meta.clone();
         owner.meta[1].phase = GdnStreamPhase::Open;
         let open_before = owner.meta.clone();
         assert!(err_text(owner.seal_sealed_at(200)).contains("Open"));
-        assert_eq!(owner.meta, open_before, "no layer is stamped when one is refused");
+        assert_eq!(
+            owner.meta, open_before,
+            "no layer is stamped when one is refused"
+        );
         assert_eq!(owner.meta[0], before[0]);
     }
 
@@ -15983,12 +16041,19 @@ mod dn_stream_tests {
             assert_eq!(c.buf.size(), GEOM.raw_qkv_bytes());
         }
         open_at(&mut view, 77, 5);
-        assert!(owner.meta.iter().all(|m| m.position == 0), "view cursors are private");
+        assert!(
+            owner.meta.iter().all(|m| m.position == 0),
+            "view cursors are private"
+        );
         owner.adopt_lane_meta(1, &view).expect("adopt");
         for l in 0..LAYERS {
             assert_eq!(owner.lane_meta(l, 1).unwrap().position, 77);
             assert_eq!(owner.lane_meta(l, 1).unwrap().pending_rows, 5);
-            assert_eq!(owner.lane_meta(l, 0).unwrap().position, 0, "lane 0 untouched");
+            assert_eq!(
+                owner.lane_meta(l, 0).unwrap().position,
+                0,
+                "lane 0 untouched"
+            );
         }
         let mut wrong = owner.lane_view(0).unwrap();
         wrong.recipe_id = 99;
@@ -16088,7 +16153,10 @@ mod dn_stream_tests {
         }
         for (got, want) in state.stream.meta.iter().zip(&saved_meta) {
             assert_eq!(got.phase, GdnStreamPhase::Open);
-            assert_eq!((got.position, got.pending_rows), (want.position, want.pending_rows));
+            assert_eq!(
+                (got.position, got.pending_rows),
+                (want.position, want.pending_rows)
+            );
         }
 
         snap.free_gpu(&mut gpu);

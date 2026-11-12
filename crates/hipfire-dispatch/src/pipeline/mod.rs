@@ -86,10 +86,9 @@ pub use layer_ops::{
     qsa_projection_hook_installed, reset_qsa_projection_slot, set_qsa_projection_hook,
     validate_lm_head, BroadcastAddOp, ClearOp, CoreWindow, EmbeddingOp, GatedDeltaNetOp,
     GatedShortConvOp, GdnCarryView, GdnEdgeView, GdnRowCapture, GdnTrunkArenas, GroupedDepthwiseOp,
-    HyperNormOp, HyperReadOp,
-    HyperWriteAr, HyperWriteOp, IndexedAttentionMode, IndexedAttentionOp, IndexedAttentionState,
-    LaneAttentionOp, MixerPhase, ProjectLadder, ProjectOp, QsaProjectionHook, QsaSelectGather,
-    QsaSpSelect, QsaTrunkArenas, RowGather, RowGatherOp,
+    HyperNormOp, HyperReadOp, HyperWriteAr, HyperWriteOp, IndexedAttentionMode, IndexedAttentionOp,
+    IndexedAttentionState, LaneAttentionOp, MixerPhase, ProjectLadder, ProjectOp,
+    QsaProjectionHook, QsaSelectGather, QsaSpSelect, QsaTrunkArenas, RowGather, RowGatherOp,
 };
 pub use step_graph::{
     op_kind_of, Alias, OpDecl, OpId, OpKind, ResourceClass, ResourceDecl, ResourceId, SplitRule,

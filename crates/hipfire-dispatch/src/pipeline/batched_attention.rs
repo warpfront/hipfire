@@ -1910,8 +1910,14 @@ pub fn batch_chunk_fa_attend(
         // computes every (row, head) from that row's own Q codes, scale and
         // causal KV prefix, so a row's bytes do not depend on how the prompt
         // was split into calls (CHUNK-CANONICAL-DESIGN §1.3).
-        if fa_fp8q_canonical_prefill(gpu, kv_cache, n, start_pos, max_ctx_len, tree_verify.is_some())
-        {
+        if fa_fp8q_canonical_prefill(
+            gpu,
+            kv_cache,
+            n,
+            start_pos,
+            max_ctx_len,
+            tree_verify.is_some(),
+        ) {
             return batch_chunk_fa_attend_canonical_fp8q(
                 gpu, config, pbs, s, kv_cache, n, start_pos, layer_idx,
             );
@@ -2787,8 +2793,14 @@ pub fn gfx12_fa_prep_fp8q_admitted(
         && fa_a3b_native_prefill_rows(n, commit_stride, max_ctx_len);
     // Ordinary prefill admits every call extent so no row changes attention
     // arithmetic with the outer split ([`fa_fp8q_canonical_prefill`]).
-    let canonical =
-        fa_fp8q_canonical_prefill(gpu, kv_cache, n, start_pos, max_ctx_len, tree_verify.is_some());
+    let canonical = fa_fp8q_canonical_prefill(
+        gpu,
+        kv_cache,
+        n,
+        start_pos,
+        max_ctx_len,
+        tree_verify.is_some(),
+    );
     let shape_free = native_a3b || canonical;
     if !gfx12_fa_prep_geometry_admitted(gpu, config, fusion, n, tap_active)
         || gpu.fp8_verify_scope

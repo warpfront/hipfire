@@ -17,12 +17,12 @@ use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::screen_weight_tensor;
 use hipfire_runtime::tp_shard::ExpertAssign;
 use hipfire_runtime::MmqScreenable;
-use rdna_compute::DType;
-use rdna_compute::Gpu;
-use rdna_compute::GpuTensor;
 use rdna_compute::gdn_stream::{
     GdnCarryGeometry, GdnPrefillPlan, GdnStreamMeta, GdnStreamPhase, GDN_STREAM_SCHEMA_VERSION,
 };
+use rdna_compute::DType;
+use rdna_compute::Gpu;
+use rdna_compute::GpuTensor;
 
 /// Refuse the author-disclosed native-MTP verify corruption, not AR or graded MQ4/MQ6.
 /// Call only after a native head resolves and higher-priority drafters decline.
@@ -3497,7 +3497,12 @@ impl DeltaNetCarry {
 
     /// The four families, canonical order (state, conv, raw qkv, raw ab).
     pub fn families(&self) -> [&[GpuTensor]; 4] {
-        [&self.tile_state, &self.tile_conv, &self.raw_qkv, &self.raw_ab]
+        [
+            &self.tile_state,
+            &self.tile_conv,
+            &self.raw_qkv,
+            &self.raw_ab,
+        ]
     }
 
     /// Total device bytes of this carry across layers (lanes included).
@@ -3576,7 +3581,8 @@ impl GdnStreamBinding {
     /// Non-owning copy (for a lane view); must not be freed.
     pub(crate) fn view(&self) -> Self {
         use rdna_compute::gdn_stream::GdnStreamWorkspace;
-        let shallow = |v: &Vec<GpuTensor>| v.iter().map(GpuTensor::shallow_clone).collect::<Vec<_>>();
+        let shallow =
+            |v: &Vec<GpuTensor>| v.iter().map(GpuTensor::shallow_clone).collect::<Vec<_>>();
         Self {
             q_scale: self.q_scale,
             eps: self.eps,
@@ -3604,7 +3610,6 @@ impl GdnStreamBinding {
         }
     }
 }
-
 
 /// Per-state stream owner: host cursors (one [`GdnStreamMeta`] per LA layer and
 /// lane, `meta[layer * lanes + lane]`) plus the optional GPU carry. Owned by
@@ -3648,11 +3653,17 @@ impl GdnStreamOwner {
     /// owner holding a prefix refuses a different recipe.
     pub fn bind_plans(&mut self, plans: &[GdnPrefillPlan]) -> HipResult<()> {
         if plans.len() != self.layers() || plans.is_empty() {
-            return Err(HipError::new(0, "GDN stream bind_plans: plan count != LA layers"));
+            return Err(HipError::new(
+                0,
+                "GDN stream bind_plans: plan count != LA layers",
+            ));
         }
         let recipe = plans[0].recipe_id;
         if plans.iter().any(|p| p.recipe_id != recipe) {
-            return Err(HipError::new(0, "GDN stream bind_plans: plans disagree on the model recipe"));
+            return Err(HipError::new(
+                0,
+                "GDN stream bind_plans: plans disagree on the model recipe",
+            ));
         }
         if self.plans == plans {
             return Ok(());
@@ -3671,11 +3682,17 @@ impl GdnStreamOwner {
             return if c.geometry == geometry {
                 Ok(())
             } else {
-                Err(HipError::new(0, "GDN stream attach_carry: a different carry geometry is already attached"))
+                Err(HipError::new(
+                    0,
+                    "GDN stream attach_carry: a different carry geometry is already attached",
+                ))
             };
         }
         if self.is_open() {
-            return Err(HipError::new(0, "GDN stream attach_carry on an Open stream"));
+            return Err(HipError::new(
+                0,
+                "GDN stream attach_carry on an Open stream",
+            ));
         }
         let layers = self.layers();
         let mut bufs: [Vec<GpuTensor>; 4] = Default::default();
@@ -3742,8 +3759,14 @@ impl GdnStreamOwner {
     /// Publish the candidate cursors of a forward that succeeded on every layer
     /// (`candidates[layer]`, lane 0 of a single-lane owner).
     pub fn commit_candidates(&mut self, candidates: &[Option<GdnStreamMeta>]) -> HipResult<()> {
-        if self.lanes != 1 || candidates.len() != self.meta.len() || candidates.iter().any(Option::is_none) {
-            return Err(HipError::new(0, "GDN stream commit: incomplete candidate set"));
+        if self.lanes != 1
+            || candidates.len() != self.meta.len()
+            || candidates.iter().any(Option::is_none)
+        {
+            return Err(HipError::new(
+                0,
+                "GDN stream commit: incomplete candidate set",
+            ));
         }
         let generation = self.generation;
         for (slot, cand) in self.meta.iter_mut().zip(candidates) {
@@ -3927,9 +3950,21 @@ impl GdnStreamOwner {
             DeltaNetCarry {
                 geometry: g,
                 lanes: 1,
-                tile_state: c.tile_state.iter().map(|t| view(t, g.state_bytes())).collect(),
-                tile_conv: c.tile_conv.iter().map(|t| view(t, g.conv_bytes())).collect(),
-                raw_qkv: c.raw_qkv.iter().map(|t| view(t, g.raw_qkv_bytes())).collect(),
+                tile_state: c
+                    .tile_state
+                    .iter()
+                    .map(|t| view(t, g.state_bytes()))
+                    .collect(),
+                tile_conv: c
+                    .tile_conv
+                    .iter()
+                    .map(|t| view(t, g.conv_bytes()))
+                    .collect(),
+                raw_qkv: c
+                    .raw_qkv
+                    .iter()
+                    .map(|t| view(t, g.raw_qkv_bytes()))
+                    .collect(),
                 raw_ab: c.raw_ab.iter().map(|t| view(t, g.raw_ab_bytes())).collect(),
             }
         });
@@ -3938,7 +3973,9 @@ impl GdnStreamOwner {
             recipe_id: self.recipe_id,
             generation: self.generation,
             lanes: 1,
-            meta: (0..layers).map(|l| self.meta[l * self.lanes + lane]).collect(),
+            meta: (0..layers)
+                .map(|l| self.meta[l * self.lanes + lane])
+                .collect(),
             carry,
             plans: self.plans.clone(),
             binding: self.binding.as_ref().map(GdnStreamBinding::view),
@@ -4074,11 +4111,15 @@ impl DeltaNetState {
                 ),
             ));
         }
-        let layouts_match = self.families().iter().zip(src.families()).all(|(d, s)| {
-            d.len() == s.len() && d.iter().zip(s).all(|(d, s)| d.shape == s.shape)
-        });
+        let layouts_match =
+            self.families().iter().zip(src.families()).all(|(d, s)| {
+                d.len() == s.len() && d.iter().zip(s).all(|(d, s)| d.shape == s.shape)
+            });
         if !layouts_match {
-            return Err(HipError::new(0, "DeltaNet copy_from: layouts or shapes differ"));
+            return Err(HipError::new(
+                0,
+                "DeltaNet copy_from: layouts or shapes differ",
+            ));
         }
         for (dst_fam, src_fam) in self.families().into_iter().zip(src.families()) {
             for (d, s) in dst_fam.iter().zip(src_fam) {
@@ -4386,7 +4427,8 @@ impl DeltaNetState {
             }
             Ok(())
         })();
-        let result = hipfire_runtime::reset_core::note_hip_result(result, "qwen35::DeltaNetState::reset");
+        let result =
+            hipfire_runtime::reset_core::note_hip_result(result, "qwen35::DeltaNetState::reset");
         // Cursors drop to the empty sealed stream whether or not a memset
         // failed: a partially cleared state must never advertise a prefix.
         self.stream.reset_meta();

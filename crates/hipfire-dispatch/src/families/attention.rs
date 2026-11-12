@@ -2661,7 +2661,9 @@ fn dispatch_attend(
                         // twin of the single-slot WMMA kernel below for
                         // 1..=32 rows (f16 S tiles in the flash partials).
                         // Declines (Ok(false)) on every other arch/shape.
-                        if let Some(fp) = io.flash_partials.filter(|_| !gpu.ordinary_prefill_active()) {
+                        if let Some(fp) =
+                            io.flash_partials.filter(|_| !gpu.ordinary_prefill_active())
+                        {
                             if hip!(gpu.try_attention_verify_wmma(
                                 io.q,
                                 io.k_cache,

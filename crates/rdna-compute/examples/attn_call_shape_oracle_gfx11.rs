@@ -81,7 +81,14 @@ fn run_window(
 
 /// `--probe P`: bytes of the row at absolute position P as computed in windows whose tile max
 /// (hence `seq_len`) differs: [P-k, P+m) for several (k, m).
-fn probe(gpu: &mut Gpu, q: &GpuTensor, k: &GpuTensor, v: &GpuTensor, scratch: &GpuTensor, p: usize) {
+fn probe(
+    gpu: &mut Gpu,
+    q: &GpuTensor,
+    k: &GpuTensor,
+    v: &GpuTensor,
+    scratch: &GpuTensor,
+    p: usize,
+) {
     let qd = NH * HD;
     let out = gpu.zeros(&[RANGE * qd], DType::F32).expect("probe out");
     let mut classes: Vec<(Vec<u32>, Vec<String>)> = Vec::new();
@@ -94,7 +101,10 @@ fn probe(gpu: &mut Gpu, q: &GpuTensor, k: &GpuTensor, v: &GpuTensor, scratch: &G
             run_window(gpu, q, k, v, &out, scratch, r0, back + fwd);
             let got = gpu.download_f32(&out).expect("dl");
             let r = p - BASE;
-            let bits: Vec<u32> = got[r * qd..(r + 1) * qd].iter().map(|x| x.to_bits()).collect();
+            let bits: Vec<u32> = got[r * qd..(r + 1) * qd]
+                .iter()
+                .map(|x| x.to_bits())
+                .collect();
             let tag = format!("[{r0},{}) tilemax_pos={}", p + fwd, p + fwd - 1);
             match classes.iter_mut().find(|(b, _)| *b == bits) {
                 Some((_, t)) => t.push(tag),
@@ -104,7 +114,11 @@ fn probe(gpu: &mut Gpu, q: &GpuTensor, k: &GpuTensor, v: &GpuTensor, scratch: &G
     }
     println!("probe p={p}: {} distinct byte classes", classes.len());
     for (i, (_, t)) in classes.iter().enumerate() {
-        println!("  class {i}: {} windows, e.g. {:?}", t.len(), &t[..t.len().min(8)]);
+        println!(
+            "  class {i}: {} windows, e.g. {:?}",
+            t.len(),
+            &t[..t.len().min(8)]
+        );
     }
 }
 
@@ -159,7 +173,10 @@ fn main() {
     let mut vb = mk(3);
     // ORC_ZERO_FROM=P zeroes the cache rows at positions >= P (scale 0, codes 0): shows whether
     // data beyond a tile's last key reaches its outputs.
-    if let Some(z) = std::env::var("ORC_ZERO_FROM").ok().and_then(|s| s.parse::<usize>().ok()) {
+    if let Some(z) = std::env::var("ORC_ZERO_FROM")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+    {
         for b in [&mut kb, &mut vb] {
             for x in b[z * bytes_per_pos..].iter_mut() {
                 *x = 0;
@@ -189,7 +206,13 @@ fn main() {
     let mut failures = 0usize;
     let mut compared = 0usize;
     let out = gpu.zeros(&[RANGE * qd], DType::F32).expect("out");
-    println!("arch={} rows={} base={} sizes={}", gpu.arch, RANGE, BASE, sizes.len());
+    println!(
+        "arch={} rows={} base={} sizes={}",
+        gpu.arch,
+        RANGE,
+        BASE,
+        sizes.len()
+    );
     for &n in &sizes {
         let mut bad_phases: Vec<(usize, usize, usize)> = Vec::new();
         for phase in 0..16usize.min(n.max(1)) {
@@ -221,7 +244,10 @@ fn main() {
                                 .any(|(x, y)| x.to_bits() != y.to_bits())
                         })
                         .collect();
-                    println!("  window start {r0} (mod16 {}) len {len}: differing offsets {offs:?}", r0 % 16);
+                    println!(
+                        "  window start {r0} (mod16 {}) len {len}: differing offsets {offs:?}",
+                        r0 % 16
+                    );
                 }
             }
             let mut nbad = 0usize;
@@ -242,7 +268,11 @@ fn main() {
         if !quiet || !bad_phases.is_empty() {
             println!(
                 "n={n:5} {} {}",
-                if bad_phases.is_empty() { "OK  " } else { "DIFF" },
+                if bad_phases.is_empty() {
+                    "OK  "
+                } else {
+                    "DIFF"
+                },
                 bad_phases
                     .iter()
                     .take(4)

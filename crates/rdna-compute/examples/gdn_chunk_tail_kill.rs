@@ -352,10 +352,7 @@ fn run_route(gpu: &mut Gpu, fx: &Fixture, st: &State, c: &Call, stride: bool) ->
         for row0 in (0..n).step_by(segment_rows) {
             let rows = (n - row0).min(segment_rows);
             let a_seg = if kkt_batched {
-                c.a.sub_offset(
-                    row0 * hv * 64 * 2,
-                    rows.div_ceil(64) * 64 * hv * 64 * 2,
-                )
+                c.a.sub_offset(row0 * hv * 64 * 2, rows.div_ceil(64) * 64 * hv * 64 * 2)
             } else {
                 c.a.shallow_clone()
             };
@@ -416,7 +413,11 @@ fn execute(
     let c = Call::new(gpu, fx, row0, rows, out_fmt, pad, lsb_control)?;
     let route = run_route(gpu, fx, st, &c, stride)?;
     let out = download(gpu, &c.out)?;
-    let (q, k, v) = (download(gpu, &c.q)?, download(gpu, &c.k)?, download(gpu, &c.v)?);
+    let (q, k, v) = (
+        download(gpu, &c.q)?,
+        download(gpu, &c.k)?,
+        download(gpu, &c.v)?,
+    );
     let ob = c.out_row_bytes();
     let (qb, vb) = (HK * HD * 2, fx.hv * HD * 2);
     let res = Result_ {
@@ -522,18 +523,63 @@ fn run() -> Result<()> {
 
         // Combined 512+t call, zero padding (reference), then NaN / huge poisoned padding.
         st.reset(&gpu, &fx)?;
-        let refc = execute(&mut gpu, &fx, &st, 0, total, out_fmt, Pad::Zero, true, false)?;
+        let refc = execute(
+            &mut gpu,
+            &fx,
+            &st,
+            0,
+            total,
+            out_fmt,
+            Pad::Zero,
+            true,
+            false,
+        )?;
         let mut poisoned = Vec::new();
         for pad in [Pad::Nan, Pad::Huge] {
             st.reset(&gpu, &fx)?;
             let r = execute(&mut gpu, &fx, &st, 0, total, out_fmt, pad, true, false)?;
             let c = format!("{ctx}/poison_{}", pad.name());
             let mut p = Vec::new();
-            cmp("out_valid", &refc.out_valid, &r.out_valid, &mut p, &mut bad, &c);
-            cmp("state_q8", &refc.state.q8, &r.state.q8, &mut p, &mut bad, &c);
-            cmp("state_scales", &refc.state.scales, &r.state.scales, &mut p, &mut bad, &c);
-            cmp("state_ef", &refc.state.ef, &r.state.ef, &mut p, &mut bad, &c);
-            cmp("conv", &refc.state.conv, &r.state.conv, &mut p, &mut bad, &c);
+            cmp(
+                "out_valid",
+                &refc.out_valid,
+                &r.out_valid,
+                &mut p,
+                &mut bad,
+                &c,
+            );
+            cmp(
+                "state_q8",
+                &refc.state.q8,
+                &r.state.q8,
+                &mut p,
+                &mut bad,
+                &c,
+            );
+            cmp(
+                "state_scales",
+                &refc.state.scales,
+                &r.state.scales,
+                &mut p,
+                &mut bad,
+                &c,
+            );
+            cmp(
+                "state_ef",
+                &refc.state.ef,
+                &r.state.ef,
+                &mut p,
+                &mut bad,
+                &c,
+            );
+            cmp(
+                "conv",
+                &refc.state.conv,
+                &r.state.conv,
+                &mut p,
+                &mut bad,
+                &c,
+            );
             cmp("q_valid", &refc.q_valid, &r.q_valid, &mut p, &mut bad, &c);
             cmp("k_valid", &refc.k_valid, &r.k_valid, &mut p, &mut bad, &c);
             cmp("v_valid", &refc.v_valid, &r.v_valid, &mut p, &mut bad, &c);
@@ -559,12 +605,54 @@ fn run() -> Result<()> {
         let tail = execute(&mut gpu, &fx, &st, SEG, t, out_fmt, Pad::Nan, false, false)?;
         let c = format!("{ctx}/split");
         let ob = refc.out_valid.len() / total;
-        cmp("out_head", &refc.out_valid[..SEG * ob], &head.out_valid, &mut planes, &mut bad, &c);
-        cmp("out_tail", &refc.out_valid[SEG * ob..], &tail.out_valid, &mut planes, &mut bad, &c);
-        cmp("state_q8", &refc.state.q8, &tail.state.q8, &mut planes, &mut bad, &c);
-        cmp("state_scales", &refc.state.scales, &tail.state.scales, &mut planes, &mut bad, &c);
-        cmp("state_ef", &refc.state.ef, &tail.state.ef, &mut planes, &mut bad, &c);
-        cmp("conv", &refc.state.conv, &tail.state.conv, &mut planes, &mut bad, &c);
+        cmp(
+            "out_head",
+            &refc.out_valid[..SEG * ob],
+            &head.out_valid,
+            &mut planes,
+            &mut bad,
+            &c,
+        );
+        cmp(
+            "out_tail",
+            &refc.out_valid[SEG * ob..],
+            &tail.out_valid,
+            &mut planes,
+            &mut bad,
+            &c,
+        );
+        cmp(
+            "state_q8",
+            &refc.state.q8,
+            &tail.state.q8,
+            &mut planes,
+            &mut bad,
+            &c,
+        );
+        cmp(
+            "state_scales",
+            &refc.state.scales,
+            &tail.state.scales,
+            &mut planes,
+            &mut bad,
+            &c,
+        );
+        cmp(
+            "state_ef",
+            &refc.state.ef,
+            &tail.state.ef,
+            &mut planes,
+            &mut bad,
+            &c,
+        );
+        cmp(
+            "conv",
+            &refc.state.conv,
+            &tail.state.conv,
+            &mut planes,
+            &mut bad,
+            &c,
+        );
 
         // Input-bit negative control: sign-flipping a real value head must change
         // the out rows or persisted state, otherwise the comparisons above are blind.
@@ -582,7 +670,10 @@ fn run() -> Result<()> {
         let finite_bad = nonfinite_out(&refc.out_valid, out_fmt)
             + nonfinite_f32(&refc.state.scales)
             + nonfinite_f32(&refc.state.conv)
-            + refc.state.ef.chunks_exact(2)
+            + refc
+                .state
+                .ef
+                .chunks_exact(2)
                 .filter(|c| u16::from_ne_bytes([c[0], c[1]]) & 0x7c00 == 0x7c00)
                 .count();
         let out_nonzero = refc.out_valid.iter().any(|b| *b != 0);
