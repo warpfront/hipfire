@@ -166,6 +166,116 @@ fn g942_fold_ensure(gpu: &mut Gpu, func: &str) -> HipResult<()> {
         _ => gpu.ensure_kernel(QWEN4_G942_GLUE_MOE_MODULE, QWEN4_G942_GLUE_MOE_SRC, func),
     }
 }
+/// Exact-gfx942 wide-lane (>= [`G942_MOE_WIDE_MIN_SLOTS`] routed slots) stock-FP8 MoE glue: the
+/// router, the grouping + tile descriptors, the routed unscatter + shared activation and the
+/// combine + shared add of the C1 folds, bitwise, with the latency structure of the 8-lane verify
+/// window (`kernels/src/qwen4_g942_moe_wide.gfx942.hip`; its own cache key and twin seat).
+const QWEN4_G942_MOE_WIDE_SRC: &str =
+    include_str!("../../../../kernels/src/qwen4_g942_moe_wide.gfx942.hip");
+pub const QWEN4_G942_MOE_WIDE_MODULE: &str = "qwen4_g942_moe_wide";
+/// The four entries of [`QWEN4_G942_MOE_WIDE_MODULE`], in source order.
+pub const QWEN4_G942_MOE_WIDE_ENTRIES: [&str; 4] = [
+    "qwen4_g942_moe_wide_router",
+    "qwen4_g942_moe_wide_group_scatter_desc",
+    "qwen4_g942_moe_wide_unscatter_act",
+    "qwen4_g942_moe_wide_combine_shared_add",
+];
+const QWEN4_G942_MOE_WIDE_ROUTER: &str = QWEN4_G942_MOE_WIDE_ENTRIES[0];
+const QWEN4_G942_MOE_WIDE_SCATTER_DESC: &str = QWEN4_G942_MOE_WIDE_ENTRIES[1];
+const QWEN4_G942_MOE_WIDE_UNSCATTER_ACT: &str = QWEN4_G942_MOE_WIDE_ENTRIES[2];
+const QWEN4_G942_MOE_WIDE_COMBINE_SHARED_ADD: &str = QWEN4_G942_MOE_WIDE_ENTRIES[3];
+/// Fewest routed slots (eight top-10 rows: the lane width) that take the wide glue; below it the
+/// C1 folds' kernels run unchanged.
+// G12 input: executor-local route predicate; the row count is the one the sealed MoE call
+// already carries, no scheduler or engine interface is reshaped.
+pub const G942_MOE_WIDE_MIN_SLOTS: usize = 80;
+/// Capacity of the wide scatter workgroup (`MW_MAXL` / `MW_MAXE` in the kernel source): flat
+/// slots and experts.
+pub const G942_MOE_WIDE_MAX_SLOTS: usize = 640;
+pub const G942_MOE_WIDE_MAX_EXPERTS: usize = 512;
+/// Tokens per router workgroup (`MW_ROUTER_WAVES`: one wave64 per token).
+const G942_MOE_WIDE_ROUTER_TOKENS_PER_BLOCK: usize = 4;
+
+/// `HIPFIRE_QWEN4_G942_MOE_WIDE_IMAGE=/absolute/device.elf` (developer, read once): the explicitly
+/// supplied code object of [`QWEN4_G942_MOE_WIDE_MODULE`] (the Route-A twin proof). Unset: the
+/// hipcc source, unchanged.
+fn g942_moe_wide_image() -> HipResult<Option<&'static std::sync::Arc<[u8]>>> {
+    static IMAGE: std::sync::LazyLock<Result<Option<std::sync::Arc<[u8]>>, String>> =
+        std::sync::LazyLock::new(|| {
+            match hipfire_config::developer_var("HIPFIRE_QWEN4_G942_MOE_WIDE_IMAGE") {
+                Ok(path) if !path.is_empty() => std::fs::read(&path)
+                    .map(|bytes| Some(std::sync::Arc::<[u8]>::from(bytes)))
+                    .map_err(|error| format!("HIPFIRE_QWEN4_G942_MOE_WIDE_IMAGE {path}: {error}")),
+                _ => Ok(None),
+            }
+        });
+    let loaded: &'static Result<Option<std::sync::Arc<[u8]>>, String> = &IMAGE;
+    match loaded {
+        Ok(image) => Ok(image.as_ref()),
+        Err(message) => Err(hip_bridge::HipError::new(0, message)),
+    }
+}
+
+/// Bind `func` of the wide glue module: the hipcc source (the anchor object) or, only when
+/// `HIPFIRE_QWEN4_G942_MOE_WIDE_IMAGE` names one, that code object (same module, same entry
+/// names, loaded through `ensure_embedded_kernel`).
+fn g942_moe_wide_ensure(gpu: &mut Gpu, func: &str) -> HipResult<()> {
+    match g942_moe_wide_image()? {
+        Some(image) => gpu.ensure_embedded_kernel(QWEN4_G942_MOE_WIDE_MODULE, image.clone(), func),
+        None => gpu.ensure_kernel(QWEN4_G942_MOE_WIDE_MODULE, QWEN4_G942_MOE_WIDE_SRC, func),
+    }
+}
+
+/// The exact-gfx942 wide-lane FP8 grouped MoE GEMM: `gemm_fp8b128_moe_grouped_bf16mfma`'s
+/// kernel with the strip transpose through a wave-private LDS slot instead of `ds_bpermute`
+/// (byte-identical outputs; `kernels/src/qwen4_g942_moe_gemm.gfx942.hip`; its own cache key and
+/// twin seat).
+const QWEN4_G942_MOE_GEMM_SRC: &str =
+    include_str!("../../../../kernels/src/qwen4_g942_moe_gemm.gfx942.hip");
+pub const QWEN4_G942_MOE_GEMM_MODULE: &str = "qwen4_g942_moe_gemm";
+const QWEN4_G942_MOE_GEMM_F32_KERNEL: &str = "qwen4_g942_moe_gemm_f32";
+const QWEN4_G942_MOE_GEMM_XBF16_KERNEL: &str = "qwen4_g942_moe_gemm_xbf16";
+/// The two entries of [`QWEN4_G942_MOE_GEMM_MODULE`] (F32-X and BF16-X).
+pub const QWEN4_G942_MOE_GEMM_ENTRIES: [&str; 2] = [
+    QWEN4_G942_MOE_GEMM_F32_KERNEL,
+    QWEN4_G942_MOE_GEMM_XBF16_KERNEL,
+];
+/// Output rows per workgroup of the wide GEMM: `64 * MG_NSUB` (pinned against the source by a
+/// unit test below).
+const G942_MOE_GEMM_ROWS_PER_WG: usize = 64;
+/// Fewest 16-row tiles that take the wide GEMM: 80 tiles = the 80 routed slots (eight top-10
+/// rows) at which the wide glue starts ([`G942_MOE_WIDE_MIN_SLOTS`]).
+const G942_MOE_GEMM_MIN_TILES: usize = 80;
+
+/// `HIPFIRE_QWEN4_G942_MOE_GEMM_IMAGE=/absolute/device.elf` (developer, read once): the
+/// explicitly supplied code object of [`QWEN4_G942_MOE_GEMM_MODULE`] (the Route-A twin proof).
+/// Unset: the hipcc source, unchanged.
+fn g942_moe_gemm_image() -> HipResult<Option<&'static std::sync::Arc<[u8]>>> {
+    static IMAGE: std::sync::LazyLock<Result<Option<std::sync::Arc<[u8]>>, String>> =
+        std::sync::LazyLock::new(|| {
+            match hipfire_config::developer_var("HIPFIRE_QWEN4_G942_MOE_GEMM_IMAGE") {
+                Ok(path) if !path.is_empty() => std::fs::read(&path)
+                    .map(|bytes| Some(std::sync::Arc::<[u8]>::from(bytes)))
+                    .map_err(|error| format!("HIPFIRE_QWEN4_G942_MOE_GEMM_IMAGE {path}: {error}")),
+                _ => Ok(None),
+            }
+        });
+    let loaded: &'static Result<Option<std::sync::Arc<[u8]>>, String> = &IMAGE;
+    match loaded {
+        Ok(image) => Ok(image.as_ref()),
+        Err(message) => Err(hip_bridge::HipError::new(0, message)),
+    }
+}
+
+/// Bind `func` of the wide GEMM module: the hipcc source (the anchor object) or, only when
+/// `HIPFIRE_QWEN4_G942_MOE_GEMM_IMAGE` names one, that code object (same module, same entry
+/// names, loaded through `ensure_embedded_kernel`).
+fn g942_moe_gemm_ensure(gpu: &mut Gpu, func: &str) -> HipResult<()> {
+    match g942_moe_gemm_image()? {
+        Some(image) => gpu.ensure_embedded_kernel(QWEN4_G942_MOE_GEMM_MODULE, image.clone(), func),
+        None => gpu.ensure_kernel(QWEN4_G942_MOE_GEMM_MODULE, QWEN4_G942_MOE_GEMM_SRC, func),
+    }
+}
 const QWEN4_GDN_LANES_F32_SRC: &str =
     include_str!("../../../../kernels/src/qwen4_gdn_lanes_f32.gfx942.hip");
 const QWEN4_GDN_LANES_F32_KERNEL: &str = "qwen4_gdn_lanes_step_f32_gfx942";
@@ -497,9 +607,7 @@ fn g942_conv_fuse_image() -> HipResult<Option<&'static std::sync::Arc<[u8]>>> {
             match hipfire_config::developer_var("HIPFIRE_QWEN4_G942_CONV_FUSE_IMAGE") {
                 Ok(path) if !path.is_empty() => std::fs::read(&path)
                     .map(|bytes| Some(std::sync::Arc::<[u8]>::from(bytes)))
-                    .map_err(|error| {
-                        format!("HIPFIRE_QWEN4_G942_CONV_FUSE_IMAGE {path}: {error}")
-                    }),
+                    .map_err(|error| format!("HIPFIRE_QWEN4_G942_CONV_FUSE_IMAGE {path}: {error}")),
                 _ => Ok(None),
             }
         });
@@ -531,7 +639,12 @@ impl Gfx942Device<'_> {
         p: &crate::tensor_ops::HyperNorm<'_>,
         normalized_bf16: &GpuTensor,
     ) -> HipResult<()> {
-        let refuse = |what: &str| Err(hip_bridge::HipError::new(0, &format!("hyper_norm_bf16x: {what}")));
+        let refuse = |what: &str| {
+            Err(hip_bridge::HipError::new(
+                0,
+                &format!("hyper_norm_bf16x: {what}"),
+            ))
+        };
         if p.input.dtype != DType::F32
             || p.normalized.dtype != DType::F32
             || p.norm_weight.dtype != DType::BF16
@@ -1629,12 +1742,18 @@ impl Gfx942Device<'_> {
                 "expert_stride {expert_stride} must be a multiple of 16 and >= {min_stride}"
             ));
         }
-        let (func, x_elem) = match (x.dtype, reference) {
-            (DType::F32, false) => (FP8B128_MOE_GROUPED_KERNEL, 4),
-            (DType::BF16, false) => (FP8B128_MOE_GROUPED_XBF16_KERNEL, 2),
-            (DType::F32, true) => (FP8B128_MOE_GROUPED_REFERENCE_KERNEL, 4),
-            (DType::BF16, true) => (FP8B128_MOE_GROUPED_REFERENCE_XBF16_KERNEL, 2),
-            (other, _) => return refuse(format!("x must be F32 or BF16, got {other:?}")),
+        // G12 input: lane-wide (>= 80 slots, i.e. >= 80 tiles) launches take the LDS-transpose
+        // build of the same kernel (byte-identical outputs; executor-local route predicate on the
+        // tile count the caller already passes).
+        let wide = !reference && n_tiles >= G942_MOE_GEMM_MIN_TILES;
+        let (func, x_elem) = match (x.dtype, reference, wide) {
+            (DType::F32, false, false) => (FP8B128_MOE_GROUPED_KERNEL, 4),
+            (DType::BF16, false, false) => (FP8B128_MOE_GROUPED_XBF16_KERNEL, 2),
+            (DType::F32, false, true) => (QWEN4_G942_MOE_GEMM_F32_KERNEL, 4),
+            (DType::BF16, false, true) => (QWEN4_G942_MOE_GEMM_XBF16_KERNEL, 2),
+            (DType::F32, true, _) => (FP8B128_MOE_GROUPED_REFERENCE_KERNEL, 4),
+            (DType::BF16, true, _) => (FP8B128_MOE_GROUPED_REFERENCE_XBF16_KERNEL, 2),
+            (other, _, _) => return refuse(format!("x must be F32 or BF16, got {other:?}")),
         };
         crate::moe::require_span(
             w,
@@ -1668,6 +1787,9 @@ impl Gfx942Device<'_> {
                 func,
             )?;
             FP8B128_MOE_REFERENCE_ROWS_PER_WG
+        } else if wide {
+            g942_moe_gemm_ensure(&mut *self.gpu, func)?;
+            G942_MOE_GEMM_ROWS_PER_WG
         } else {
             self.gpu
                 .ensure_kernel(FP8B128_MOE_GROUPED_MODULE, FP8B128_MOE_GROUPED_SRC, func)?;
@@ -2910,7 +3032,16 @@ impl Gpu {
             if (a.as_ptr() as usize) % 16 != 0 {
                 return Ok(false);
             }
-            self.gemm_bf16_mfma_gfx942_check(a, &x.buf, x_size, &y.buf, y.dtype.size(), m, k, batch)?;
+            self.gemm_bf16_mfma_gfx942_check(
+                a,
+                &x.buf,
+                x_size,
+                &y.buf,
+                y.dtype.size(),
+                m,
+                k,
+                batch,
+            )?;
             a_ptr[j] = a.as_ptr();
             d_ptr[j] = y.buf.as_ptr();
             m_i32[j] = m as i32;
@@ -3625,6 +3756,608 @@ impl Gfx942Device<'_> {
         }
         result
     }
+
+    /// Whether the wide router serves a call of `rows` routed tokens at this `n_exp` / `k_top`:
+    /// the C1 glue folds are on and the slot count lies in
+    /// [`G942_MOE_WIDE_MIN_SLOTS`]`..=`[`G942_MOE_WIDE_MAX_SLOTS`] (the wide scatter's capacity,
+    /// so a call takes the whole wide chain or none of it). The caller adds the BF16-recipe
+    /// precondition of [`Self::g942_moe_wide_router`].
+    pub fn g942_moe_wide_router_admitted(&self, rows: usize, n_exp: usize, k_top: usize) -> bool {
+        let Some(slots) = rows.checked_mul(k_top) else {
+            return false;
+        };
+        self.g942_fold_moe_enabled()
+            && k_top == 10
+            && n_exp == 512
+            && (G942_MOE_WIDE_MIN_SLOTS..=G942_MOE_WIDE_MAX_SLOTS).contains(&slots)
+    }
+
+    /// Whether [`Self::g942_moe_wide_group_scatter_desc`] covers this grouping.
+    pub fn g942_moe_wide_scatter_admitted(
+        &self,
+        total_slots: usize,
+        experts: usize,
+        grouped_rows: usize,
+    ) -> bool {
+        self.g942_fold_moe_enabled()
+            && (G942_MOE_WIDE_MIN_SLOTS..=G942_MOE_WIDE_MAX_SLOTS).contains(&total_slots)
+            && experts > 0
+            && experts <= G942_MOE_WIDE_MAX_EXPERTS
+            && grouped_rows % 16 == 0
+            && grouped_rows >= total_slots
+            && i32::try_from(grouped_rows).is_ok()
+    }
+
+    /// Whether the wide unscatter and combine serve a call of `slots` routed slots: both are
+    /// bitwise the fold kernels at every size, so only the lane-width floor applies.
+    pub fn g942_moe_wide_glue_admitted(&self, slots: usize) -> bool {
+        self.g942_fold_moe_enabled() && slots >= G942_MOE_WIDE_MIN_SLOTS
+    }
+
+    /// `Gpu::moe_router_softmax_top10_f32` for the BF16 recipe (`round_logits`), wave64 per
+    /// token: bitwise the incumbent's ids, weights and fault record.
+    ///
+    /// ```text
+    /// qwen4_g942_moe_wide_router(
+    ///     logits: f32 [tokens, 512], topk_idx: i32 [tokens, 10], topk_w: f32 [tokens, 10],
+    ///     n_exp = 512, top_k = 10, normalize, round_logits = 1, tokens, fault, layer, row_base)
+    /// ```
+    ///
+    /// Grid `[ceil(tokens / 4)]`, block 256 (four tokens, one wave each).
+    #[allow(clippy::too_many_arguments)]
+    pub fn g942_moe_wide_router(
+        &mut self,
+        logits: &GpuTensor,
+        topk_idx: &GpuTensor,
+        topk_w: &GpuTensor,
+        tokens: usize,
+        normalize_topk_prob: bool,
+        layer: usize,
+        row_base: usize,
+    ) -> HipResult<()> {
+        const WHAT: &str = "qwen4_g942_moe_wide_router";
+        if !self.g942_moe_wide_router_admitted(tokens, 512, 10) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "{WHAT}: need {G942_MOE_WIDE_MIN_SLOTS} <= 10 * tokens <= \
+                     {G942_MOE_WIDE_MAX_SLOTS} (tokens={tokens})"
+                ),
+            ));
+        }
+        crate::moe::require_span(
+            logits,
+            &[tokens, 512, 4],
+            "qwen4_g942_moe_wide_router logits",
+        )?;
+        crate::moe::require_span(topk_idx, &[tokens, 10, 4], "qwen4_g942_moe_wide_router ids")?;
+        crate::moe::require_span(
+            topk_w,
+            &[tokens, 10, 4],
+            "qwen4_g942_moe_wide_router weights",
+        )?;
+        self.gpu.bind_thread()?;
+        g942_moe_wide_ensure(&mut *self.gpu, QWEN4_G942_MOE_WIDE_ROUTER)?;
+        static NOTE: std::sync::Once = std::sync::Once::new();
+        g942_fold_note(&NOTE, "wide router (wave64 per token)");
+        let lp = logits.buf.as_ptr();
+        let ip = topk_idx.buf.as_ptr();
+        let wp = topk_w.buf.as_ptr();
+        let (ne, kt) = (512i32, 10i32);
+        let norm = i32::from(normalize_topk_prob);
+        let round = 1i32;
+        let tv = tokens as i32;
+        let fault = self.gpu.router_fault_ptr();
+        let (layer_arg, row_base_arg) = (layer as i32, row_base as i32);
+        let mut params: Vec<*mut c_void> = vec![
+            &lp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &ne as *const _ as *mut c_void,
+            &kt as *const _ as *mut c_void,
+            &norm as *const _ as *mut c_void,
+            &round as *const _ as *mut c_void,
+            &tv as *const _ as *mut c_void,
+            &fault as *const _ as *mut c_void,
+            &layer_arg as *const _ as *mut c_void,
+            &row_base_arg as *const _ as *mut c_void,
+        ];
+        let timer = crate::profile::begin_timer(
+            &self.gpu.hip,
+            "elementwise",
+            QWEN4_G942_MOE_WIDE_ROUTER,
+            (tokens * 512 + tokens * 10 * 2) * 4,
+        );
+        let grid = tokens.div_ceil(G942_MOE_WIDE_ROUTER_TOKENS_PER_BLOCK) as u32;
+        let result = self.gpu.launch_maybe_blob(
+            QWEN4_G942_MOE_WIDE_ROUTER,
+            [grid, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = KernargBlob::new();
+                blob.push_ptr(lp);
+                blob.push_ptr(ip);
+                blob.push_ptr(wp);
+                blob.push_i32(ne);
+                blob.push_i32(kt);
+                blob.push_i32(norm);
+                blob.push_i32(round);
+                blob.push_i32(tv);
+                blob.push_ptr(fault as *const c_void);
+                blob.push_i32(layer_arg);
+                blob.push_i32(row_base_arg);
+                blob
+            },
+        );
+        if let Some(timer) = timer {
+            timer.finish(&self.gpu.hip);
+        }
+        result
+    }
+
+    /// [`Self::g942_fold_moe_group_scatter_desc`], same arguments and outputs bit for bit, as the
+    /// wide module's mask-and-popcount kernel (`qwen4_g942_moe_wide_group_scatter_desc`, one
+    /// 1024-thread workgroup). Refused outside [`Self::g942_moe_wide_scatter_admitted`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn g942_moe_wide_group_scatter_desc(
+        &mut self,
+        topk: &GpuTensor,
+        counts: &GpuTensor,
+        offsets: &GpuTensor,
+        sorted: &GpuTensor,
+        tiles: &GpuTensor,
+        inverse: &GpuTensor,
+        tile_desc: &GpuTensor,
+        total_slots: usize,
+        experts: usize,
+        grouped_rows: usize,
+    ) -> HipResult<()> {
+        const WHAT: &str = "qwen4_g942_moe_wide_group_scatter_desc";
+        if !self.g942_moe_wide_scatter_admitted(total_slots, experts, grouped_rows) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "{WHAT}: need {G942_MOE_WIDE_MIN_SLOTS} <= slots <= {G942_MOE_WIDE_MAX_SLOTS}, \
+                     0 < experts <= {G942_MOE_WIDE_MAX_EXPERTS}, grouped_rows >= slots and a \
+                     multiple of 16 (slots={total_slots} experts={experts} \
+                     grouped_rows={grouped_rows})"
+                ),
+            ));
+        }
+        let n_tiles = grouped_rows / 16;
+        crate::moe::require_span(
+            topk,
+            &[total_slots, 4],
+            "qwen4_g942_moe_wide_group_scatter_desc topk",
+        )?;
+        crate::moe::require_span(
+            counts,
+            &[experts, 4],
+            "qwen4_g942_moe_wide_group_scatter_desc counts",
+        )?;
+        crate::moe::require_span(
+            offsets,
+            &[experts + 1, 4],
+            "qwen4_g942_moe_wide_group_scatter_desc offsets",
+        )?;
+        crate::moe::require_span(
+            sorted,
+            &[grouped_rows, 4],
+            "qwen4_g942_moe_wide_group_scatter_desc sorted",
+        )?;
+        crate::moe::require_span(
+            tiles,
+            &[n_tiles, 4],
+            "qwen4_g942_moe_wide_group_scatter_desc tiles",
+        )?;
+        crate::moe::require_span(
+            inverse,
+            &[total_slots, 4],
+            "qwen4_g942_moe_wide_group_scatter_desc inverse",
+        )?;
+        crate::moe::require_span(
+            tile_desc,
+            &[n_tiles, 16],
+            "qwen4_g942_moe_wide_group_scatter_desc tile_desc",
+        )?;
+        self.gpu.bind_thread()?;
+        g942_moe_wide_ensure(&mut *self.gpu, QWEN4_G942_MOE_WIDE_SCATTER_DESC)?;
+        static NOTE: std::sync::Once = std::sync::Once::new();
+        g942_fold_note(
+            &NOTE,
+            "wide scatter (mask + popcount grouping + tile descriptors)",
+        );
+        let tp = topk.buf.as_ptr();
+        let cp = counts.buf.as_ptr();
+        let op = offsets.buf.as_ptr();
+        let sp = sorted.buf.as_ptr();
+        let tip = tiles.buf.as_ptr();
+        let ip = inverse.buf.as_ptr();
+        let dp = tile_desc.buf.as_ptr();
+        let (lv, ev, pv) = (total_slots as i32, experts as i32, grouped_rows as i32);
+        let mut params: Vec<*mut c_void> = vec![
+            &tp as *const _ as *mut c_void,
+            &cp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &tip as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &dp as *const _ as *mut c_void,
+            &lv as *const _ as *mut c_void,
+            &ev as *const _ as *mut c_void,
+            &pv as *const _ as *mut c_void,
+        ];
+        let timer = crate::profile::begin_timer(
+            &self.gpu.hip,
+            "elementwise",
+            QWEN4_G942_MOE_WIDE_SCATTER_DESC,
+            (3 * total_slots + 2 * experts + grouped_rows + 5 * n_tiles) * 4,
+        );
+        let result = self.gpu.launch_maybe_blob(
+            QWEN4_G942_MOE_WIDE_SCATTER_DESC,
+            [1, 1, 1],
+            [1024, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = KernargBlob::new();
+                blob.push_ptr(tp);
+                blob.push_ptr(cp);
+                blob.push_ptr(op);
+                blob.push_ptr(sp);
+                blob.push_ptr(tip);
+                blob.push_ptr(ip);
+                blob.push_ptr(dp);
+                blob.push_i32(lv);
+                blob.push_i32(ev);
+                blob.push_i32(pv);
+                blob
+            },
+        );
+        if let Some(timer) = timer {
+            timer.finish(&self.gpu.hip);
+        }
+        result
+    }
+
+    /// [`Self::g942_fold_moe_unscatter_act`] over the flat routed slots: the routed activation of
+    /// slot `s` is read from grouped row `inverse[s]` (unrouted slots, `-1`, write nothing), so the
+    /// grid is `slots` routed blocks instead of one per padded grouped row; the shared
+    /// activation part is unchanged. Bitwise the fold kernel's `activation`, `shared_act` and
+    /// `selector`.
+    ///
+    /// Grid `[slots + ceil(ceil(rows*shared_mi/256) / ceil(mi/256)), ceil(mi/256)]`, block 256.
+    #[allow(clippy::too_many_arguments)]
+    pub fn g942_moe_wide_unscatter_act(
+        &mut self,
+        gate_up: &GpuTensor,
+        inverse: &GpuTensor,
+        activation: &GpuTensor,
+        mi: usize,
+        n_sorted: usize,
+        slots: usize,
+        shared_gate: &GpuTensor,
+        shared_up: &GpuTensor,
+        shared_act: &GpuTensor,
+        selector: &GpuTensor,
+        rows: usize,
+        shared_mi: usize,
+    ) -> HipResult<()> {
+        const WHAT: &str = "qwen4_g942_moe_wide_unscatter_act";
+        let refuse = |msg: String| Err(hip_bridge::HipError::new(0, &msg));
+        let max_dim = i32::MAX as usize;
+        if mi > max_dim
+            || n_sorted > max_dim
+            || slots > max_dim
+            || rows > max_dim
+            || shared_mi > max_dim
+        {
+            return refuse(format!("{WHAT}: scalar dimension exceeds i32::MAX"));
+        }
+        let Some(shared_n) = rows.checked_mul(shared_mi) else {
+            return refuse(format!("{WHAT}: rows*shared_mi overflows"));
+        };
+        let grid_y = mi.div_ceil(256);
+        if grid_y == 0 || grid_y > u16::MAX as usize {
+            return refuse(format!(
+                "{WHAT}: mi={mi} needs grid.y={grid_y} (1..={})",
+                u16::MAX
+            ));
+        }
+        let act_blocks = shared_n.div_ceil(256);
+        let grid_x = slots + act_blocks.div_ceil(grid_y);
+        if grid_x > i32::MAX as usize || act_blocks > i32::MAX as usize {
+            return refuse(format!("{WHAT}: grid.x={grid_x} exceeds i32::MAX"));
+        }
+        for (name, t) in [
+            ("gate_up", gate_up),
+            ("activation", activation),
+            ("shared_gate", shared_gate),
+            ("shared_up", shared_up),
+            ("shared_act", shared_act),
+            ("selector", selector),
+        ] {
+            if t.dtype != DType::F32 {
+                return refuse(format!("{WHAT}: {name} must be F32 (got {:?})", t.dtype));
+            }
+        }
+        if !(inverse.dtype.size() == 4 || inverse.dtype == DType::Raw) {
+            return refuse(format!(
+                "{WHAT}: inverse needs a 4-byte dtype (got {:?})",
+                inverse.dtype
+            ));
+        }
+        crate::moe::require_span(
+            gate_up,
+            &[n_sorted, 2, mi, 4],
+            "qwen4_g942_moe_wide_unscatter_act gate_up",
+        )?;
+        crate::moe::require_span(
+            inverse,
+            &[slots, 4],
+            "qwen4_g942_moe_wide_unscatter_act inverse",
+        )?;
+        crate::moe::require_span(
+            activation,
+            &[slots, mi, 4],
+            "qwen4_g942_moe_wide_unscatter_act activation",
+        )?;
+        crate::moe::require_span(
+            shared_gate,
+            &[rows, shared_mi, 4],
+            "qwen4_g942_moe_wide_unscatter_act shared gate",
+        )?;
+        crate::moe::require_span(
+            shared_up,
+            &[rows, shared_mi, 4],
+            "qwen4_g942_moe_wide_unscatter_act shared up",
+        )?;
+        crate::moe::require_span(
+            shared_act,
+            &[rows, shared_mi, 4],
+            "qwen4_g942_moe_wide_unscatter_act shared activation",
+        )?;
+        crate::moe::require_span(
+            selector,
+            &[rows, 4],
+            "qwen4_g942_moe_wide_unscatter_act selector",
+        )?;
+        let (yp, ip, ap) = (
+            gate_up.buf.as_ptr(),
+            inverse.buf.as_ptr(),
+            activation.buf.as_ptr(),
+        );
+        let (gp, up_p, hp, lp) = (
+            shared_gate.buf.as_ptr(),
+            shared_up.buf.as_ptr(),
+            shared_act.buf.as_ptr(),
+            selector.buf.as_ptr(),
+        );
+        let all = [yp, ip, ap, gp, up_p, hp, lp];
+        if all.iter().enumerate().any(|(i, a)| all[..i].contains(a)) {
+            return refuse(format!(
+                "{WHAT}: gate_up, inverse, activation and the four shared buffers must be distinct"
+            ));
+        }
+        if mi == 0 || n_sorted == 0 || slots == 0 {
+            return refuse(format!(
+                "{WHAT}: empty routed extent (mi={mi} n_sorted={n_sorted} slots={slots})"
+            ));
+        }
+        self.gpu.bind_thread()?;
+        g942_moe_wide_ensure(&mut *self.gpu, QWEN4_G942_MOE_WIDE_UNSCATTER_ACT)?;
+        static NOTE: std::sync::Once = std::sync::Once::new();
+        g942_fold_note(
+            &NOTE,
+            "wide unscatter (slot-major unscatter-silu + shared activation)",
+        );
+        let (miv, nv, sv) = (mi as i32, n_sorted as i32, slots as i32);
+        let (rv, smv, abv) = (rows as i32, shared_mi as i32, act_blocks as i32);
+        let mut params: Vec<*mut c_void> = vec![
+            &yp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &ap as *const _ as *mut c_void,
+            &miv as *const _ as *mut c_void,
+            &nv as *const _ as *mut c_void,
+            &sv as *const _ as *mut c_void,
+            &gp as *const _ as *mut c_void,
+            &up_p as *const _ as *mut c_void,
+            &hp as *const _ as *mut c_void,
+            &lp as *const _ as *mut c_void,
+            &rv as *const _ as *mut c_void,
+            &smv as *const _ as *mut c_void,
+            &abv as *const _ as *mut c_void,
+        ];
+        let bytes = slots
+            .saturating_mul(mi)
+            .saturating_mul(12)
+            .saturating_add(shared_n.saturating_mul(12));
+        let timer = crate::profile::begin_timer(
+            &self.gpu.hip,
+            "elementwise",
+            QWEN4_G942_MOE_WIDE_UNSCATTER_ACT,
+            bytes,
+        );
+        let result = self.gpu.launch_maybe_blob(
+            QWEN4_G942_MOE_WIDE_UNSCATTER_ACT,
+            [grid_x as u32, grid_y as u32, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = KernargBlob::new();
+                blob.push_ptr(yp);
+                blob.push_ptr(ip);
+                blob.push_ptr(ap);
+                blob.push_i32(miv);
+                blob.push_i32(nv);
+                blob.push_i32(sv);
+                blob.push_ptr(gp);
+                blob.push_ptr(up_p);
+                blob.push_ptr(hp);
+                blob.push_ptr(lp);
+                blob.push_i32(rv);
+                blob.push_i32(smv);
+                blob.push_i32(abv);
+                blob
+            },
+        );
+        if let Some(timer) = timer {
+            timer.finish(&self.gpu.hip);
+        }
+        result
+    }
+
+    /// [`Self::g942_fold_moe_combine_shared_add`], same arguments and output bit for bit, with
+    /// the ten rank gathers issued as two independent load batches
+    /// (`qwen4_g942_moe_wide_combine_shared_add`). Grid `[ceil(hidden/256), tokens]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn g942_moe_wide_combine_shared_add(
+        &mut self,
+        grouped_down: &GpuTensor,
+        inverse_perm: &GpuTensor,
+        topk_indices: &GpuTensor,
+        topk_weights: &GpuTensor,
+        residual: &GpuTensor,
+        shared_out: &GpuTensor,
+        selector: &GpuTensor,
+        hidden: usize,
+        grouped_rows: usize,
+        tokens: usize,
+        n_experts: usize,
+    ) -> HipResult<()> {
+        const WHAT: &str = "qwen4_g942_moe_wide_combine_shared_add";
+        let refuse = |msg: String| Err(hip_bridge::HipError::new(0, &msg));
+        if tokens == 0
+            || hidden == 0
+            || grouped_rows > i32::MAX as usize
+            || hidden > i32::MAX as usize
+            || tokens > u16::MAX as usize
+            || n_experts > i32::MAX as usize
+        {
+            return refuse(format!(
+                "{WHAT}: bad extent (hidden={hidden} grouped_rows={grouped_rows} tokens={tokens})"
+            ));
+        }
+        for (name, t) in [
+            ("grouped_down", grouped_down),
+            ("residual", residual),
+            ("shared_out", shared_out),
+            ("selector", selector),
+            ("topk_weights", topk_weights),
+        ] {
+            if t.dtype != DType::F32 {
+                return refuse(format!("{WHAT}: {name} must be F32 (got {:?})", t.dtype));
+            }
+        }
+        crate::moe::require_span(
+            grouped_down,
+            &[grouped_rows, hidden, 4],
+            "qwen4_g942_moe_wide_combine_shared_add grouped rows",
+        )?;
+        crate::moe::require_span(
+            inverse_perm,
+            &[tokens, 10, 4],
+            "qwen4_g942_moe_wide_combine_shared_add inverse permutation",
+        )?;
+        crate::moe::require_span(
+            topk_indices,
+            &[tokens, 10, 4],
+            "qwen4_g942_moe_wide_combine_shared_add topk indices",
+        )?;
+        crate::moe::require_span(
+            topk_weights,
+            &[tokens, 10, 4],
+            "qwen4_g942_moe_wide_combine_shared_add topk weights",
+        )?;
+        crate::moe::require_span(
+            residual,
+            &[tokens, hidden, 4],
+            "qwen4_g942_moe_wide_combine_shared_add target",
+        )?;
+        crate::moe::require_span(
+            shared_out,
+            &[tokens, hidden, 4],
+            "qwen4_g942_moe_wide_combine_shared_add shared rows",
+        )?;
+        crate::moe::require_span(
+            selector,
+            &[tokens, 4],
+            "qwen4_g942_moe_wide_combine_shared_add selector",
+        )?;
+        let (gp, ip, tp, wp, rp, hp, sp) = (
+            grouped_down.buf.as_ptr(),
+            inverse_perm.buf.as_ptr(),
+            topk_indices.buf.as_ptr(),
+            topk_weights.buf.as_ptr(),
+            residual.buf.as_ptr(),
+            shared_out.buf.as_ptr(),
+            selector.buf.as_ptr(),
+        );
+        // `residual` is read and written in place; nothing else may alias it.
+        if [gp, ip, tp, wp, hp, sp].contains(&rp) {
+            return refuse(format!("{WHAT}: the target must not alias another operand"));
+        }
+        self.gpu.bind_thread()?;
+        g942_moe_wide_ensure(&mut *self.gpu, QWEN4_G942_MOE_WIDE_COMBINE_SHARED_ADD)?;
+        static NOTE: std::sync::Once = std::sync::Once::new();
+        g942_fold_note(&NOTE, "wide combine (batched rank gathers + shared add)");
+        let (hv, gr, tv, nx) = (
+            hidden as i32,
+            grouped_rows as i32,
+            tokens as i32,
+            n_experts as i32,
+        );
+        let mut params: Vec<*mut c_void> = vec![
+            &gp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &rp as *const _ as *mut c_void,
+            &hv as *const _ as *mut c_void,
+            &gr as *const _ as *mut c_void,
+            &tv as *const _ as *mut c_void,
+            &nx as *const _ as *mut c_void,
+            &hp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+        ];
+        let grid_x = (hidden as u32).div_ceil(256);
+        let bytes = (grouped_rows * hidden + 3 * tokens * 10 + 3 * tokens * hidden) * 4;
+        let timer = crate::profile::begin_timer(
+            &self.gpu.hip,
+            "elementwise",
+            QWEN4_G942_MOE_WIDE_COMBINE_SHARED_ADD,
+            bytes,
+        );
+        let result = self.gpu.launch_maybe_blob(
+            QWEN4_G942_MOE_WIDE_COMBINE_SHARED_ADD,
+            [grid_x, tokens as u32, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = KernargBlob::new();
+                blob.push_ptr(gp);
+                blob.push_ptr(ip);
+                blob.push_ptr(tp);
+                blob.push_ptr(wp);
+                blob.push_ptr(rp);
+                blob.push_i32(hv);
+                blob.push_i32(gr);
+                blob.push_i32(tv);
+                blob.push_i32(nx);
+                blob.push_ptr(hp);
+                blob.push_ptr(sp);
+                blob
+            },
+        );
+        if let Some(timer) = timer {
+            timer.finish(&self.gpu.hip);
+        }
+        result
+    }
 }
 
 #[cfg(test)]
@@ -3650,6 +4383,70 @@ mod tests {
             .and_then(|v| v.trim().parse::<usize>().ok())
             .expect("FP8MOE_NSUB define in the FP8 grouped kernel source");
         assert_eq!(super::FP8B128_MOE_ROWS_PER_WG, 64 * nsub);
+    }
+
+    /// The wide MoE glue's launcher constants are the kernel source's own: capacity, router
+    /// tokens per workgroup and the four entry names the module exports.
+    #[test]
+    fn g942_moe_wide_launcher_matches_kernel_source() {
+        let define = |name: &str| -> usize {
+            super::QWEN4_G942_MOE_WIDE_SRC
+                .lines()
+                .find_map(|l| l.trim().strip_prefix(&format!("#define {name} ")))
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or_else(|| panic!("{name} define in the wide MoE glue source"))
+        };
+        assert_eq!(define("MW_MAXL"), super::G942_MOE_WIDE_MAX_SLOTS);
+        assert_eq!(define("MW_MAXE"), super::G942_MOE_WIDE_MAX_EXPERTS);
+        assert_eq!(
+            define("MW_ROUTER_WAVES"),
+            super::G942_MOE_WIDE_ROUTER_TOKENS_PER_BLOCK
+        );
+        assert_eq!(define("MW_THREADS"), 1024);
+        for entry in super::QWEN4_G942_MOE_WIDE_ENTRIES {
+            assert!(
+                super::QWEN4_G942_MOE_WIDE_SRC.contains(&format!("void {entry}(")),
+                "{entry} is not an entry of the wide MoE glue source"
+            );
+        }
+        // The wide scatter's capacity is a whole number of 32-slot mask words per expert.
+        assert_eq!(super::G942_MOE_WIDE_MAX_SLOTS % 32, 0);
+        assert!(super::G942_MOE_WIDE_MIN_SLOTS <= super::G942_MOE_WIDE_MAX_SLOTS);
+    }
+
+    /// The wide GEMM's launcher constants are the kernel source's own, and its geometry is the
+    /// production kernel's (the two entries differ only in the strip transpose).
+    #[test]
+    fn g942_moe_gemm_launcher_matches_kernel_source() {
+        let define = |src: &str, name: &str| -> usize {
+            src.lines()
+                .find_map(|l| l.trim().strip_prefix(&format!("#define {name} ")))
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or_else(|| panic!("{name} define in the kernel source"))
+        };
+        let (nsub, d) = (
+            define(super::QWEN4_G942_MOE_GEMM_SRC, "MG_NSUB"),
+            define(super::QWEN4_G942_MOE_GEMM_SRC, "MG_D"),
+        );
+        assert_eq!(super::G942_MOE_GEMM_ROWS_PER_WG, 64 * nsub);
+        assert_eq!(
+            super::G942_MOE_GEMM_ROWS_PER_WG,
+            super::FP8B128_MOE_ROWS_PER_WG
+        );
+        assert_eq!(nsub, define(super::FP8B128_MOE_GROUPED_SRC, "FP8MOE_NSUB"));
+        assert_eq!(d, define(super::FP8B128_MOE_GROUPED_SRC, "FP8MOE_D"));
+        for entry in super::QWEN4_G942_MOE_GEMM_ENTRIES {
+            assert!(
+                super::QWEN4_G942_MOE_GEMM_SRC.contains(&format!("void {entry}(")),
+                "{entry} is not an entry of the wide GEMM source"
+            );
+        }
+        // 80 slots -> 80 tiles (n_tiles = (slots + min(slots, 512) * 15 + 15) / 16).
+        let slots = super::G942_MOE_WIDE_MIN_SLOTS;
+        assert_eq!(
+            (slots + slots.min(512) * 15 + 15) / 16,
+            super::G942_MOE_GEMM_MIN_TILES
+        );
     }
 
     /// The retained P1 oracle is an immutable standalone source: any byte change
@@ -4284,7 +5081,10 @@ mod tests {
                     .expect("END marker after every BEGIN marker");
                 let block = outside[body_start..body_start + end]
                     .trim_end_matches('\n')
-                    .replace("qwen4_g942_hyper_write_norm_bf16x(", "hyper_write_norm_f32(");
+                    .replace(
+                        "qwen4_g942_hyper_write_norm_bf16x(",
+                        "hyper_write_norm_f32(",
+                    );
                 let stripped: Vec<&str> = block
                     .lines()
                     .filter(|line| {
@@ -4355,7 +5155,10 @@ mod tests {
                 .map(|b| format!("{b:02x}"))
                 .collect()
         };
-        assert_eq!(hex(super::QWEN4_G942_CONV_FUSE_SRC.as_bytes()), SOURCE_SHA256);
+        assert_eq!(
+            hex(super::QWEN4_G942_CONV_FUSE_SRC.as_bytes()),
+            SOURCE_SHA256
+        );
         let anchor: &[u8] =
             include_bytes!("../../../../kernels/qwen4_g942_conv_fuse_hipcc_gfx942.co");
         assert_eq!(hex(anchor), ANCHOR_SHA256);
@@ -4400,7 +5203,8 @@ mod tests {
         outside.push_str(rest);
         assert_eq!(blocks, 2, "typedefs + mfma_bf16, rows16 helpers + body");
         assert!(
-            production.contains("gemm_bf16_mfma_rows16_body<XI>(X, A0, A1, A2, A3, D0, D1, D2, D3,"),
+            production
+                .contains("gemm_bf16_mfma_rows16_body<XI>(X, A0, A1, A2, A3, D0, D1, D2, D3,"),
             "the production entries call the body the grid entries call"
         );
         // Outside the markers: comments, includes, the grid entry macro and its instantiations.
@@ -4444,7 +5248,10 @@ mod tests {
                 .map(|b| format!("{b:02x}"))
                 .collect()
         };
-        assert_eq!(hex(super::QWEN4_G942_ROWS16_GRID_SRC.as_bytes()), SOURCE_SHA256);
+        assert_eq!(
+            hex(super::QWEN4_G942_ROWS16_GRID_SRC.as_bytes()),
+            SOURCE_SHA256
+        );
         let anchor: &[u8] =
             include_bytes!("../../../../kernels/qwen4_g942_rows16_grid_hipcc_gfx942.co");
         assert_eq!(hex(anchor), ANCHOR_SHA256);
@@ -4462,14 +5269,23 @@ mod tests {
     #[test]
     fn g942_row_grid_route_row() {
         for rows in [17, 32, 64, 128, 256] {
-            assert!(super::row_grid_admitted(&[320], 10240, rows), "hc_down {rows}");
+            assert!(
+                super::row_grid_admitted(&[320], 10240, rows),
+                "hc_down {rows}"
+            );
         }
         assert!(!super::row_grid_admitted(&[320], 10240, 16));
         assert!(!super::row_grid_admitted(&[320], 10240, 257));
         assert!(!super::row_grid_admitted(&[512], 2560, 32), "router");
-        assert!(!super::row_grid_admitted(&[1, 640, 640], 2560, 32), "shared gate/up");
+        assert!(
+            !super::row_grid_admitted(&[1, 640, 640], 2560, 32),
+            "shared gate/up"
+        );
         assert!(!super::row_grid_admitted(&[2560], 6144, 32), "out_proj");
         assert!(!super::row_grid_admitted(&[10240], 320, 32), "hc_up");
-        assert!(!super::row_grid_admitted(&[10240, 6144, 48, 48], 2560, 32), "gdn in");
+        assert!(
+            !super::row_grid_admitted(&[10240, 6144, 48, 48], 2560, 32),
+            "gdn in"
+        );
     }
 }
