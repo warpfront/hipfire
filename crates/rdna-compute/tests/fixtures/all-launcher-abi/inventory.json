@@ -73,7 +73,6 @@
     "kernels/src/gemv_hfq4g256_moe_gate_up_indexed_wave64.hip",
     "kernels/src/gemv_hfq4g256_moe_gate_up_k8_indexed.hip",
     "kernels/src/gemv_hfq4g256_moe_gate_up_persistent_rank8.gfx1151.hip",
-    "kernels/src/gemv_hfq4g256_moe_ninepath_d3.hip",
     "kernels/src/gemv_hfq4g256_moe_ninepath_d4.hip",
     "kernels/src/gemv_hfq4g256_moe_projection_indexed_gfx1151.hip",
     "kernels/src/gemv_hfq5g256_moe_down_k8_indexed_batched_expanded.hip",

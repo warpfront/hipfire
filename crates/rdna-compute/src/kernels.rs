@@ -3759,13 +3759,6 @@ pub const GEMV_MQ4G128V2P_MOE_DOWN_TOP10_INDEXED_BATCHED_EXPANDED_SRC: &str = in
 pub const GEMV_MQ6G256V2_MOE_GATE_UP_K8_INDEXED_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/gemv_mq6g256v2_moe_gate_up_k8_indexed_batched.hip");
 
-/// Nine-path fused MoE gate_up (routed k=8, decode T=1): one CTA stages the
-/// activation into LDS once and all 8 routed-expert warps share it, replacing
-/// the per-(row,krank) x restaging of `gemv_hfq4g256_moe_gate_up_k8_indexed`.
-/// Byte-exact per-row math with the indexed kernel. See kernel header.
-pub const GEMV_HFQ4G256_MOE_NINEPATH_D3_SRC: &str =
-    include_str!("../../../kernels/src/gemv_hfq4g256_moe_ninepath_d3.hip");
-
 /// Nine-path fused MoE down + weighted combine (routed k=8, decode T=1):
 /// folds the expanded [8 × down_m] intermediate into LDS (never written to
 /// global) and applies the weighted k-ordered fold in the same kernel,

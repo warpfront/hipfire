@@ -756,7 +756,6 @@ module	gemv_hfq4g256_moe_gate_up_k8_indexed_k2816_cpol_glc	non-core-family	Non-c
 module	gemv_hfq4g256_moe_gate_up_k8_indexed_k2816_cpol_slc	non-core-family	Non-core family route: Gemma; rdna-compute/src/gemv.rs:15191
 module	gemv_hfq4g256_moe_gate_up_k8_indexed_paired_waves_k2048_gfx1151	developer-opt-in	Non-default developer override: HIPFIRE_GFX1151_GATE_UP_PAIRED_WAVES; rdna-compute/src/gemv.rs:14899-14902
 module	gemv_hfq4g256_moe_gate_up_k8_indexed_persistent_rank8_gfx1151	developer-opt-in	Non-default developer override: HIPFIRE_GFX1151_GATE_UP_PERSISTENT_RANK8; rdna-compute/src/gemv.rs:14895-14898
-module	gemv_hfq4g256_moe_ninepath_d3	developer-opt-in	Non-default developer override: HIPFIRE_MOE_NINEPATH; hipfire-dispatch/src/pipeline/moe_program.rs:2743
 module	gemv_hfq4g256_moe_up_k8_indexed_k2048_gfx1151	developer-opt-in	Non-default developer override: HIPFIRE_GFX1151_GATE_UP_SPLIT; rdna-compute/src/gemv.rs:14903-14917
 module	gemv_hfq4g256_multirow_default_mq2v2	no-caller	No production caller; only definitions, tests/examples or an unreachable launcher branch remain; rdna-compute/src/gemv.rs:23236
 module	gemv_hfq4g256_multirow_default_mq5v2	no-caller	No production caller; only definitions, tests/examples or an unreachable launcher branch remain; rdna-compute/src/gemv.rs:22694
