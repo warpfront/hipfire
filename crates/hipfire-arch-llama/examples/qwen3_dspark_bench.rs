@@ -214,6 +214,7 @@ fn main() -> Result<(), String> {
         vision_mode: "auto".to_string(),
         xdna: None,
         batch_request: Default::default(),
+        ep_ar_wire: Default::default(),
     };
     let mut bundle = load_llama_bundle(src, &mut ctx)?;
 

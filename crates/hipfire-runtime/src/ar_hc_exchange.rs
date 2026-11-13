@@ -7,14 +7,16 @@
 //! shard (`HIPFIRE_QWEN4_EP_TRUNK_SHARD`).
 //!
 //! Each rank owns one fine-grained VRAM mailbox that the PEER writes (`hipDeviceMallocFinegrained`):
-//! a TAGGED region (two banks of 16-byte tagged granules) and, unless `HIPFIRE_EP_AR_WIRE_DENSE=0`,
-//! a DENSE region (two banks of 8-byte untagged granules, EMPTY = all ones; launches of at
-//! least [`AR_HC_DENSE_MIN_ROWS`] rows use it, see the kernel header for the argument), and one 256-byte block holding the
+//! a TAGGED region (two banks sized for 32-byte tagged granules of four f32 partials; bf16
+//! partials use 16-byte granules of the same slots) and, unless `HIPFIRE_EP_AR_WIRE_DENSE=0`, a
+//! DENSE region (two banks sized for 16-byte untagged f32 granules, 8 bytes for bf16 partials,
+//! EMPTY = all ones; launches of at least [`AR_HC_DENSE_MIN_ROWS`] rows use it, see the kernel
+//! header for the argument; the SP all-gather uses it with 8-byte granules), and one 256-byte block holding the
 //! device-resident generation word and arrival ticket. Mailboxes are registered per rank
 //! (any thread, that rank's `Gpu`) BEFORE peer access is enabled
 //! ([`ArHcExchange::enable_peers`]), then [`ArHcExchange::qualify`] runs a short eager
 //! exchange on both ranks compared bit for bit with the host model
-//! (`ar_hc_write_model` / `ar_hc_fold`); a failed qualification turns the route off for
+//! (`ar_hc_write_model` / [`ArHcPartial::fold`]); a failed qualification turns the route off for
 //! the process ([`ArHcExchange::enabled`]) and the caller keeps the incumbent EP2 path.
 //!
 //! Protocol constraints: both ranks issue the same sequence of [`ArHcExchange::write`]
@@ -41,8 +43,8 @@
 use crate::ep_row_gather::{DEFAULT_BARRIER_TIMEOUT, SLOW_BARRIER_REPORT};
 use hip_bridge::{DeviceBuffer, HipError, HipResult, HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED};
 use rdna_compute::ar_hc_write::{
-    ar_hc_bank_bytes_for, ar_hc_fold, ar_hc_launch_geometry, ar_hc_write_model,
-    ar_hc_write_model_f32, ArHcWire, StreamKind, AR_HC_GEN_BYTES, AR_HC_HIDDEN, AR_HC_ROW_CAP,
+    ar_hc_bank_bytes_for, ar_hc_launch_geometry, ar_hc_write_model, ar_hc_write_model_f32,
+    ArHcPartial, ArHcWire, StreamKind, AR_HC_GEN_BYTES, AR_HC_HIDDEN, AR_HC_ROW_CAP,
 };
 use rdna_compute::Gpu;
 use std::ffi::c_void;
@@ -87,9 +89,9 @@ pub struct ArHcExchange {
 /// Which mailbox wires a transport uses (see the kernel header for the two formats).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ArHcMode {
-    /// Every launch on the 16-byte tagged wire (the kill-switch format).
+    /// Every launch on the tagged wire (the kill-switch format).
     Tagged,
-    /// Every launch on the dense 8-byte wire (oracles and benches).
+    /// Every launch on the dense wire (oracles and benches).
     Dense,
     /// Dense for launches of at least [`AR_HC_DENSE_MIN_ROWS`] rows, tagged below (the product
     /// default: the dense re-arm costs ~1 us of fixed latency that decode-sized launches
@@ -112,8 +114,8 @@ impl ArHcMode {
 // selector-receipt: receipts/selectors/ar_hc_dense_min_rows.json
 pub const AR_HC_DENSE_MIN_ROWS: usize = 16;
 
-/// `HIPFIRE_EP_AR_WIRE_DENSE` (developer, default on): `0` selects the original 16-byte tagged
-/// granule wire for every launch (the kill switch); anything else the hybrid default.
+/// `HIPFIRE_EP_AR_WIRE_DENSE` (developer, default on): `0` selects the tagged granule wire for
+/// every launch (the kill switch); anything else the hybrid default.
 pub const AR_WIRE_DENSE_ENV: &str = "HIPFIRE_EP_AR_WIRE_DENSE";
 
 /// The mode the process selects (`HIPFIRE_EP_AR_WIRE_DENSE`).
@@ -314,7 +316,9 @@ impl ArHcExchange {
         for kind in StreamKind::ALL {
             for wire in [ArHcWire::Tagged, ArHcWire::Dense] {
                 if self.uses_wire(wire) {
-                    gpu.ensure_ar_hc_write_gfx1201_kernel(kind, wire)?;
+                    for partial in ArHcPartial::ALL {
+                        gpu.ensure_ar_hc_write_gfx1201_kernel(kind, wire, partial)?;
+                    }
                 }
             }
         }
@@ -459,10 +463,11 @@ impl ArHcExchange {
         Ok(())
     }
 
-    /// One fused all-reduce + HC write of `rows` rows on `rank`: `partial` `[rows, 2560]` f32,
-    /// `streams` `[rows, 4, 2560]` of `kind` (BF16 bits or F32 words, in place), `gates` `[rows, 4]` f32 (device
-    /// pointers; rows beyond [`AR_HC_ROW_CAP`] or `max_rows` are launched in slices, each
-    /// its own generation, in order, identically on both ranks).
+    /// One fused all-reduce + HC write of `rows` rows on `rank`: `partial` `[rows, 2560]` f32
+    /// sent in the `partial_fmt` wire format, `streams` `[rows, 4, 2560]` of `kind` (BF16 bits or
+    /// F32 words, in place), `gates` `[rows, 4]` f32 (device pointers; rows beyond
+    /// [`AR_HC_ROW_CAP`] or `max_rows` are launched in slices, each its own generation, in order,
+    /// identically on both ranks; both ranks pass the same `partial_fmt`).
     ///
     /// # Safety
     /// The pointers must address live device memory of those extents on `gpu`'s device.
@@ -473,6 +478,7 @@ impl ArHcExchange {
         partial: *mut c_void,
         streams: *mut c_void,
         kind: StreamKind,
+        partial_fmt: ArHcPartial,
         gates: *const c_void,
         rows: usize,
         mixed_dbg: *mut c_void,
@@ -532,6 +538,7 @@ impl ArHcExchange {
                     .cast::<c_void>(),
                 kind,
                 wire,
+                partial_fmt,
                 gates.cast::<u8>().add(done * 4 * 4).cast::<c_void>(),
                 (peer_mail + region) as *mut c_void,
                 (local_mail + region) as *const c_void,
@@ -548,9 +555,9 @@ impl ArHcExchange {
     }
 
     /// Load-time qualification of rank `rank` over BOTH stream kinds (BF16 bits, then F32
-    /// words) and every wire this transport can use (the launch of `rows` rows, and under the
-    /// hybrid mode also one of [`AR_HC_DENSE_MIN_ROWS`] rows that takes the dense wire), run
-    /// CONCURRENTLY on both ranks' threads (the kernels rendezvous): see
+    /// words), both partial formats and every wire this transport can use (the launch of `rows`
+    /// rows, and under the hybrid mode also one of [`AR_HC_DENSE_MIN_ROWS`] rows that takes the
+    /// dense wire), run CONCURRENTLY on both ranks' threads (the kernels rendezvous): see
     /// [`Self::qualify_kind`].
     pub fn qualify(
         &self,
@@ -568,15 +575,18 @@ impl ArHcExchange {
             sizes.push(dense_rows.min(self.max_rows));
         }
         for kind in StreamKind::ALL {
-            for &r in &sizes {
-                self.qualify_kind(rank, gpu, kind, r, exchanges)?;
+            for partial in ArHcPartial::ALL {
+                for &r in &sizes {
+                    self.qualify_kind(rank, gpu, kind, partial, r, exchanges)?;
+                }
             }
         }
         Ok(())
     }
 
-    /// Qualification of one stream kind: `exchanges` eager fused launches over `rows` rows with
-    /// deterministic partials, the folded `m` and the HC streams (gates 0, so the gate is
+    /// Qualification of one stream kind and partial format: `exchanges` eager fused launches
+    /// over `rows` rows with deterministic partials, the folded `m` and the HC streams (gates 0,
+    /// so the gate is
     /// exactly 1 whatever libm computes) compared bit for bit with the host model. A failure
     /// (including a bounded-wait timeout) returns `Err`, [`Self::disable`]s the route and
     /// leaves the generations unequal, so the caller must [`Self::reset`] both ranks before
@@ -586,6 +596,7 @@ impl ArHcExchange {
         rank: usize,
         gpu: &mut Gpu,
         kind: StreamKind,
+        partial_fmt: ArHcPartial,
         rows: usize,
         exchanges: usize,
     ) -> HipResult<()> {
@@ -615,10 +626,25 @@ impl ArHcExchange {
                         gpu.hip.memcpy_htod(&partial, f32_bytes(mine))?;
                         gpu.hip.memcpy_htod(&streams, u16_bytes(&streams_host))?;
                         self.qualify_write(
-                            rank, gpu, &partial, &streams, kind, &gates, rows, &dbg,
+                            rank,
+                            gpu,
+                            &partial,
+                            &streams,
+                            kind,
+                            partial_fmt,
+                            &gates,
+                            rows,
+                            &dbg,
                         )?;
                         let mut want_streams = streams_host.clone();
-                        want_m = ar_hc_write_model(&p0, &p1, &mut want_streams, &gates_host, rows);
+                        want_m = ar_hc_write_model(
+                            partial_fmt,
+                            &p0,
+                            &p1,
+                            &mut want_streams,
+                            &gates_host,
+                            rows,
+                        );
                         gpu.hip.memcpy_dtoh(f32_bytes_mut(&mut got_m), &dbg)?;
                         let mut got_streams = vec![0u16; want_streams.len()];
                         gpu.hip
@@ -629,7 +655,8 @@ impl ArHcExchange {
                             .position(|(a, b)| a != b)
                         {
                             return Err(err(format!(
-                                "ar_hc_exchange: qualification (bf16) exchange {exchange}: stream differs at {i}: {:#06x} vs {:#06x}",
+                                "ar_hc_exchange: qualification (bf16 streams, {} partials) exchange {exchange}: stream differs at {i}: {:#06x} vs {:#06x}",
+                                partial_fmt.name(),
                                 got_streams[i], want_streams[i]
                             )));
                         }
@@ -649,11 +676,25 @@ impl ArHcExchange {
                         gpu.hip.memcpy_htod(&partial, f32_bytes(mine))?;
                         gpu.hip.memcpy_htod(&streams, f32_bytes(&streams_host))?;
                         self.qualify_write(
-                            rank, gpu, &partial, &streams, kind, &gates, rows, &dbg,
+                            rank,
+                            gpu,
+                            &partial,
+                            &streams,
+                            kind,
+                            partial_fmt,
+                            &gates,
+                            rows,
+                            &dbg,
                         )?;
                         let mut want_streams = streams_host.clone();
-                        want_m =
-                            ar_hc_write_model_f32(&p0, &p1, &mut want_streams, &gates_host, rows);
+                        want_m = ar_hc_write_model_f32(
+                            partial_fmt,
+                            &p0,
+                            &p1,
+                            &mut want_streams,
+                            &gates_host,
+                            rows,
+                        );
                         gpu.hip.memcpy_dtoh(f32_bytes_mut(&mut got_m), &dbg)?;
                         let mut got_streams = vec![0f32; want_streams.len()];
                         gpu.hip
@@ -664,7 +705,8 @@ impl ArHcExchange {
                             .position(|(a, b)| a.to_bits() != b.to_bits())
                         {
                             return Err(err(format!(
-                                "ar_hc_exchange: qualification (f32) exchange {exchange}: stream differs at {i}: {} vs {}",
+                                "ar_hc_exchange: qualification (f32 streams, {} partials) exchange {exchange}: stream differs at {i}: {} vs {}",
+                                partial_fmt.name(),
                                 got_streams[i], want_streams[i]
                             )));
                         }
@@ -673,11 +715,12 @@ impl ArHcExchange {
                 for (i, (a, b)) in got_m.iter().zip(&want_m).enumerate() {
                     if a.to_bits() != b.to_bits() {
                         return Err(err(format!(
-                            "ar_hc_exchange: qualification ({}) exchange {exchange}: folded m differs at {i}: {a} vs {b}",
-                            kind.name()
+                            "ar_hc_exchange: qualification ({} streams, {} partials) exchange {exchange}: folded m differs at {i}: {a} vs {b}",
+                            kind.name(),
+                            partial_fmt.name()
                         )));
                     }
-                    debug_assert_eq!(b.to_bits(), ar_hc_fold(p0[i], p1[i]).to_bits());
+                    debug_assert_eq!(b.to_bits(), partial_fmt.fold(p0[i], p1[i]).to_bits());
                 }
             }
             Ok(())
@@ -703,6 +746,7 @@ impl ArHcExchange {
         partial: &DeviceBuffer,
         streams: &DeviceBuffer,
         kind: StreamKind,
+        partial_fmt: ArHcPartial,
         gates: &DeviceBuffer,
         rows: usize,
         dbg: &DeviceBuffer,
@@ -716,6 +760,7 @@ impl ArHcExchange {
                 partial.as_ptr(),
                 streams.as_ptr(),
                 kind,
+                partial_fmt,
                 gates.as_ptr(),
                 rows,
                 dbg.as_ptr(),
@@ -749,7 +794,9 @@ impl ArHcExchange {
     /// [`Self::register`].
     pub fn sp_ensure_kernels(&self, gpu: &mut Gpu) -> HipResult<()> {
         for kind in StreamKind::ALL {
-            gpu.ensure_sp_hc_rs_gfx1201_kernel(kind)?;
+            for partial in ArHcPartial::ALL {
+                gpu.ensure_sp_hc_rs_gfx1201_kernel(kind, partial)?;
+            }
         }
         for elem in SpAgElem::ALL {
             gpu.ensure_sp_ag_rows_gfx1201_kernel(elem)?;
@@ -791,10 +838,11 @@ impl ArHcExchange {
 
     /// Reduce-scatter fused into the HC write of `rank`: the own rows `own = (row0, rows)` of
     /// the full-tile `partial` / `streams` / `gates` are folded and written, the peer rows
-    /// `peer` are pushed to the peer rank (whose own range it is). Ranges longer than
-    /// [`Self::sp_row_cap`] launch in mirrored slices ([`sp_slices`]), each its own generation.
-    /// The own rows equal those of [`Self::write`] over the same partials. `mixed_dbg` (oracle,
-    /// nullable) receives `m` of the own rows at the full-tile offset.
+    /// `peer` are pushed to the peer rank (whose own range it is) in the `partial_fmt` wire
+    /// format. Ranges longer than [`Self::sp_row_cap`] launch in mirrored slices ([`sp_slices`]),
+    /// each its own generation. The own rows equal those of [`Self::write`] over the same
+    /// partials in the same format. `mixed_dbg` (oracle, nullable) receives `m` of the own rows
+    /// at the full-tile offset.
     ///
     /// # Safety
     /// The pointers must address live device memory of the full tile on `gpu`'s device.
@@ -806,6 +854,7 @@ impl ArHcExchange {
         partial: *mut c_void,
         streams: *mut c_void,
         kind: StreamKind,
+        partial_fmt: ArHcPartial,
         gates: *const c_void,
         own: (usize, usize),
         peer: (usize, usize),
@@ -831,6 +880,7 @@ impl ArHcExchange {
                 partial,
                 streams,
                 kind,
+                partial_fmt,
                 gates,
                 peer_mail as *mut c_void,
                 local_mail as *const c_void,
@@ -1086,8 +1136,8 @@ mod tests {
     fn sizes_and_bounds() {
         assert!(ArHcExchange::new(0).is_err());
         assert!(ArHcExchange::new(AR_HC_ROW_CAP + 1).is_err());
-        let t = 32 * 640 * 16usize;
-        let d8 = 32 * 640 * 8usize;
+        let t = 32 * 640 * 32usize;
+        let d16 = 32 * 640 * 16usize;
         let x = ArHcExchange::with_mode(32, ArHcMode::Tagged).unwrap();
         assert_eq!(x.bank_stride(ArHcWire::Tagged), t);
         assert_eq!(x.rank_bytes(), 2 * t + 256);
@@ -1095,9 +1145,9 @@ mod tests {
             assert_eq!(x.wire_for(rows), ArHcWire::Tagged);
         }
         let d = ArHcExchange::with_mode(32, ArHcMode::Dense).unwrap();
-        assert_eq!(d.bank_stride(ArHcWire::Dense), d8);
+        assert_eq!(d.bank_stride(ArHcWire::Dense), d16);
         assert_eq!(d.region_offset(ArHcWire::Dense), 2 * t);
-        assert_eq!(d.rank_bytes(), 2 * t + 2 * d8 + 256);
+        assert_eq!(d.rank_bytes(), 2 * t + 2 * d16 + 256);
         assert_eq!(d.wire_for(1), ArHcWire::Dense);
         let h = ArHcExchange::with_mode(32, ArHcMode::Hybrid).unwrap();
         assert_eq!(h.rank_bytes(), d.rank_bytes());

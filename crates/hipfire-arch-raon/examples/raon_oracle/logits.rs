@@ -151,6 +151,7 @@ pub fn load_bundle(
         gemma4_draft_len: 3,
         xdna: None,
         batch_request: Default::default(),
+        ep_ar_wire: Default::default(),
     };
     load_raon_bundle(src, &mut ctx)
 }

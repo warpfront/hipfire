@@ -4086,6 +4086,7 @@ pub fn load_admitted_with_gemma4_drafter(
         mesh,
         pp_bands,
         batch_request,
+        ep_ar_wire,
         ..
     } = admission;
     let carrier =
@@ -4172,6 +4173,7 @@ pub fn load_admitted_with_gemma4_drafter(
         // after flag + exact-gfx1151 admission; until then loads stay GPU-only.
         xdna: None,
         batch_request,
+        ep_ar_wire,
     };
     // Weight uploads of this load are packed into slabs per
     // `HIPFIRE_WEIGHT_SLAB`, else the carrier's default (a no-op when off); the

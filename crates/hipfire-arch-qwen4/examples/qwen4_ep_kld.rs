@@ -9,9 +9,11 @@
 //! tool scores the SAME HFKLDR v3 references with the SAME estimator, window,
 //! per-chunk reset and decode route (prefill the unscored prefix, then one
 //! `forward_token` per scored row, teacher-forced), but loads the model
-//! through `hipfire_loader::load_model` exactly as the daemon does, so the
+//! through the loader's admitted route exactly as the daemon does, so the
 //! topology comes from `topology.ep` / `HIPFIRE_TOPOLOGY_EP` and the whole EP
-//! route (including `HIPFIRE_QWEN4_EP_TRUNK_SHARD`) is what is scored. The
+//! route (including `HIPFIRE_QWEN4_EP_TRUNK_SHARD`) is what is scored; the typed
+//! `topology.ep_ar_wire` (which the daemon receives in the load request) is
+//! `--ep-ar-wire`. The
 //! `.kldseq` bytes are the `qwen4_kld` HFKSEQ v2 format and pair with
 //! `qwen4_kld`'s decode `.kldseq` chunk for chunk.
 //!
@@ -21,7 +23,7 @@
 //!     --score wt2:/path/wt2.kldref --score code24:/path/code24.kldref \
 //!     [--route decode|lanes:K] [--max-chunks N] [--max-seq 4096] \
 //!     [--prefix chunk-final|prefill-final] [--score-from N] [--score-to M] \
-//!     [--no-rank-check] [--kv-mode M] [--state-quant Q]
+//!     [--no-rank-check] [--kv-mode M] [--state-quant Q] [--ep-ar-wire bf16|f32]
 //! ```
 //!
 //! `--score-from N` / `--score-to M` (lab, both routes) narrow the scored window to
@@ -94,7 +96,8 @@ const TOOL: &str = "qwen4_ep_kld";
 const USAGE: &str =
     "usage: qwen4_ep_kld --model M --out DIR --score NAME:REF.kldref [--score ...] \
 [--route decode|lanes:K] [--max-chunks N] [--max-seq N] [--prefix chunk-final|prefill-final] \
-[--score-from N] [--score-to M] [--no-rank-check] [--kv-mode M] [--state-quant Q]";
+[--score-from N] [--score-to M] [--no-rank-check] [--kv-mode M] [--state-quant Q] \
+[--ep-ar-wire bf16|f32]";
 
 /// Process-wide host counters read before/after a token (lab diagnosis of rank-asymmetric host stalls).
 #[derive(Clone, Copy, Default)]
@@ -232,6 +235,8 @@ struct Args {
     /// Lab override of the reference window start / end (half-open), within the reference window.
     score_from: Option<usize>,
     score_to: Option<usize>,
+    /// Typed `topology.ep_ar_wire` of the load (the daemon forwards the config key the same way).
+    ep_ar_wire: hipfire_config::topology::EpArWire,
 }
 
 fn parse_args(args: &[String]) -> R<Args> {
@@ -248,6 +253,7 @@ fn parse_args(args: &[String]) -> R<Args> {
         route: Route::Decode,
         score_from: None,
         score_to: None,
+        ep_ar_wire: Default::default(),
     };
     let mut it = args.iter();
     while let Some(flag) = it.next() {
@@ -291,6 +297,9 @@ fn parse_args(args: &[String]) -> R<Args> {
             "--route" => a.route = Route::parse(&value()?)?,
             "--score-from" => a.score_from = Some(value()?.parse().map_err(e)?),
             "--score-to" => a.score_to = Some(value()?.parse().map_err(e)?),
+            "--ep-ar-wire" => {
+                a.ep_ar_wire = hipfire_config::topology::EpArWire::parse(Some(&value()?))?
+            }
             "-h" | "--help" => return Err(USAGE.to_string()),
             other => return Err(format!("unknown argument {other}\n{USAGE}")),
         }
@@ -1490,18 +1499,32 @@ fn score_lanes(
     })
 }
 
-/// `load_model`'s admitted route with the per-load lane reservation and the MTP head armed, as
-/// `fn_mesh_lane_oracle --spec mtp --reserve-lanes 8` loads: the loader reserves `LANES` MTP
-/// lanes (depth `k`) in the EP expert placement. Planner capacity only; forward numerics unchanged.
-fn load_lanes_model(args: &Args, k: usize, gpu: &mut Gpu) -> R<hipfire_loader::LoadedModel> {
+/// `load_model`'s admitted route as the daemon drives it, with the load's typed
+/// `topology.ep_ar_wire` set on the admitted handle. Decode: `load_model`'s arguments (the
+/// `--kv-mode` / `--state-quant` overrides, no spec). Lanes: the per-load lane reservation and
+/// the MTP head armed, as `fn_mesh_lane_oracle --spec mtp --reserve-lanes 8` loads: the loader
+/// reserves `LANES` MTP lanes (depth `k`) in the EP expert placement (planner capacity only;
+/// forward numerics unchanged).
+fn load_admitted_model(args: &Args, gpu: &mut Gpu) -> R<hipfire_loader::LoadedModel> {
     use hipfire_loader::admission::{
         admit_source_with_options, legacy_warning, qwen4_kv_adaptive_requested,
         qwen_default_q8_enabled, BatchLoadRequest, KvBackendHints, KvBackendRequest,
         SourceAdmissionOptions,
     };
-    let spec = hipfire_runtime::loader_api::SpecLoadCfg {
-        mtp: Some(true),
-        ..Default::default()
+    let (spec, kv_mode, state_quant) = match args.route {
+        Route::Decode => (
+            hipfire_runtime::loader_api::SpecLoadCfg::default(),
+            args.kv_mode.as_deref(),
+            args.state_quant.as_deref(),
+        ),
+        Route::Lanes { .. } => (
+            hipfire_runtime::loader_api::SpecLoadCfg {
+                mtp: Some(true),
+                ..Default::default()
+            },
+            None,
+            None,
+        ),
     };
     let mut admission = admit_source_with_options(
         &args.model,
@@ -1515,7 +1538,7 @@ fn load_lanes_model(args: &Args, k: usize, gpu: &mut Gpu) -> R<hipfire_loader::L
         None,
         args.max_seq,
         KvBackendHints {
-            kv_mode: None,
+            kv_mode,
             kv_k: None,
             kv_v: None,
             qwen_default_q8: qwen_default_q8_enabled(),
@@ -1527,16 +1550,20 @@ fn load_lanes_model(args: &Args, k: usize, gpu: &mut Gpu) -> R<hipfire_loader::L
         SourceAdmissionOptions {
             spec,
             kv_adaptive: qwen4_kv_adaptive_requested(None),
+            state_quant: state_quant.is_some(),
             ..Default::default()
         },
     )?;
-    admission.batch_request = BatchLoadRequest {
-        vmm_batch: true,
-        continuous_batch_size: LANES,
-        row_budget: LANES,
-        spec_k: Some(k),
-        spec_copy: false,
-    };
+    if let Route::Lanes { k } = args.route {
+        admission.batch_request = BatchLoadRequest {
+            vmm_batch: true,
+            continuous_batch_size: LANES,
+            row_budget: LANES,
+            spec_k: Some(k),
+            spec_copy: false,
+        };
+    }
+    admission.ep_ar_wire = args.ep_ar_wire;
     let warning = legacy_warning(admission.kv_backend, admission.kv_backend_reason.as_deref());
     let loaded = hipfire_loader::load_admitted_with_gemma4_drafter(
         admission,
@@ -1548,10 +1575,10 @@ fn load_lanes_model(args: &Args, k: usize, gpu: &mut Gpu) -> R<hipfire_loader::L
         None,
         hipfire_loader::GEMMA4_EAGLE_DRAFT_LEN,
         None,
+        kv_mode,
         None,
         None,
-        None,
-        None,
+        state_quant,
         1,
         spec,
         gpu,
@@ -1581,20 +1608,7 @@ fn run(args: &Args) -> R<()> {
     // bounded wait trips (the EP2 route just stalls).
     hipfire_loader::prepare_host_memory_for(Path::new(&args.model));
     let mut gpu = Gpu::init().map_err(|x| format!("Gpu::init: {x:?}"))?;
-    let mut model = match args.route {
-        Route::Decode => hipfire_loader::load_model(
-            &args.model,
-            args.max_seq,
-            None,
-            args.kv_mode.as_deref(),
-            None,
-            args.state_quant.as_deref(),
-            1,
-            hipfire_runtime::loader_api::SpecLoadCfg::default(),
-            &mut gpu,
-        )?,
-        Route::Lanes { k } => load_lanes_model(args, k, &mut gpu)?,
-    };
+    let mut model = load_admitted_model(args, &mut gpu)?;
     let bundle = model
         .qwen4_mut()
         .ok_or("loaded model is not a Qwen4 (Flash-Next) bundle")?;
@@ -1675,7 +1689,7 @@ fn run(args: &Args) -> R<()> {
         "ranks": ranks, "ep_mesh": ep, "arch": gpu.arch,
         "max_seq": args.max_seq,
         "prefix": match args.route { Route::Decode => format!("{:?}", args.prefix), Route::Lanes { .. } => "lane-exact-tiles".to_string() },
-        "kv_mode": args.kv_mode, "state_quant": args.state_quant,
+        "kv_mode": args.kv_mode, "state_quant": args.state_quant, "ep_ar_wire": args.ep_ar_wire.name(),
         "env": envs,
         "scores": results.iter().map(|r| serde_json::json!({
             "name": r.name, "route": r.route, "mean_kld": r.mean_kld, "top1": r.top1, "ppl": r.ppl,

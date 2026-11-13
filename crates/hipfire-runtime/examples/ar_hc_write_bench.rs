@@ -7,10 +7,12 @@
 //!
 //! ```text
 //! ar_hc_write_bench [--rows 1,2,4,8,16,32,64,128,256] [--iters 300] [--iso 100]
-//!                   [--devices 0,1] [--stream bf16|f32|both] [--out DIR] [--no-probe]
+//!                   [--devices 0,1] [--stream bf16|f32|both] [--partial bf16|f32|both]
+//!                   [--out DIR] [--no-probe]
 //! ```
 //!
-//! Per (stream kind, rows) case, on both ranks concurrently:
+//! Per (partial format, stream kind, rows) case, on both ranks concurrently (`--partial`,
+//! default both: `f32` = the mixer write's wire, `bf16` = the FFN write's):
 //!  * `pipe`: `iters` back-to-back launches between two events (the product shape: launches
 //!    are queued, the peer skew is absorbed), mean us per launch;
 //!  * `iso`: `iso` launches each started after a host barrier and drained, median us (includes
@@ -35,7 +37,9 @@ mod pushlab;
 use hip_bridge::KernargBlob;
 use hipfire_runtime::ar_hc_exchange::ArHcExchange;
 use hipfire_runtime::ar_hc_exchange::ArHcMode;
-use rdna_compute::ar_hc_write::{ar_hc_geometry, StreamKind, AR_HC_HIDDEN, AR_HC_ROW_CAP};
+use rdna_compute::ar_hc_write::{
+    ar_hc_geometry, ArHcPartial, ArHcWire, StreamKind, AR_HC_HIDDEN, AR_HC_ROW_CAP,
+};
 use rdna_compute::Gpu;
 use std::ffi::c_void;
 use std::sync::{Arc, Barrier, Mutex};
@@ -82,6 +86,7 @@ fn fit(xs: &[f64], ys: &[f64]) -> (f64, f64) {
 #[derive(Clone, Debug, Default)]
 struct Row {
     kind: &'static str,
+    partial: &'static str,
     rows: usize,
     pipe_us: f64,
     iso_med_us: f64,
@@ -111,6 +116,7 @@ fn run_rank(
     device: i32,
     rows_list: Vec<usize>,
     kinds: Vec<StreamKind>,
+    partials: Vec<ArHcPartial>,
     iters: usize,
     iso: usize,
     probe: bool,
@@ -191,7 +197,11 @@ fn run_rank(
     let stop = gpu.hip.event_create().map_err(|e| e.to_string())?;
     let mut out = Vec::new();
     let mut tag = 1u32;
-    for &kind in &kinds {
+    let cases: Vec<(ArHcPartial, StreamKind)> = partials
+        .iter()
+        .flat_map(|&p| kinds.iter().map(move |&k| (p, k)))
+        .collect();
+    for &(fmt, kind) in &cases {
         for &rows in &rows_list {
             let n = rows * AR_HC_HIDDEN;
             let wide = rows * 4 * AR_HC_HIDDEN;
@@ -223,6 +233,7 @@ fn run_rank(
                         partial.as_ptr(),
                         streams.as_ptr(),
                         kind,
+                        fmt,
                         gates.as_ptr(),
                         rows,
                         std::ptr::null_mut::<c_void>(),
@@ -331,6 +342,7 @@ fn run_rank(
             }
             out.push(Row {
                 kind: kind.name(),
+                partial: fmt.name(),
                 rows,
                 pipe_us,
                 iso_med_us,
@@ -359,6 +371,7 @@ fn main() {
     let mut devices = [0i32, 1i32];
     let mut out = ".".to_string();
     let mut kinds = StreamKind::ALL.to_vec();
+    let mut partials = ArHcPartial::ALL.to_vec();
     let mut probe = true;
     let mut breakdown_mode = false;
     let mut push_lab = false;
@@ -403,6 +416,15 @@ fn main() {
                     other => panic!("--stream takes f32|bf16|both, got {other}"),
                 };
             }
+            "--partial" => {
+                i += 1;
+                partials = match args[i].as_str() {
+                    "bf16" => vec![ArHcPartial::Bf16],
+                    "f32" => vec![ArHcPartial::F32],
+                    "both" => ArHcPartial::ALL.to_vec(),
+                    other => panic!("--partial takes f32|bf16|both, got {other}"),
+                };
+            }
             "--wire" => {
                 i += 1;
                 wire = match args[i].as_str() {
@@ -428,17 +450,20 @@ fn main() {
         (breakdown_mode || push_lab).then(|| (push_lab, Arc::new(Mutex::new([0usize; 2]))));
     let handles: Vec<_> = (0..2)
         .map(|rank| {
-            let (x, b, p, rl, kinds, bdp) = (
+            let (x, b, p, rl, kinds, partials, bdp) = (
                 x.clone(),
                 barrier.clone(),
                 ptrs.clone(),
                 rows_list.clone(),
                 kinds.clone(),
+                partials.clone(),
                 bd_ptrs.clone(),
             );
             let dev = devices[rank];
             std::thread::spawn(move || {
-                run_rank(rank, dev, rl, kinds, iters, iso, probe, x, b, p, bdp)
+                run_rank(
+                    rank, dev, rl, kinds, partials, iters, iso, probe, x, b, p, bdp,
+                )
             })
         })
         .collect();
@@ -507,15 +532,22 @@ fn main() {
                         st.iter().map(|v| format!("{v:.3}")).collect::<Vec<_>>().join(",")
                     ));
                 }
-                for kind in &kinds {
-                    let rows: Vec<&Row> =
-                        res.rows.iter().filter(|r| r.kind == kind.name()).collect();
-                    eprintln!("rank {rank} {} mode={} (payload {} B/row; wire 10240 tagged / 5120 dense; probes push 10240 / 5120 / 5120 B/row)", kind.name(), wire.name(), AR_HC_HIDDEN * 2);
+                for (fmt, kind) in partials
+                    .iter()
+                    .flat_map(|&p| kinds.iter().map(move |&k| (p, k)))
+                {
+                    let rows: Vec<&Row> = res
+                        .rows
+                        .iter()
+                        .filter(|r| r.kind == kind.name() && r.partial == fmt.name())
+                        .collect();
+                    eprintln!("rank {rank} {} streams {} partials mode={} (wire B/row: tagged {} / dense {}; probes push 10240 / 5120 / 5120 B/row)", kind.name(), fmt.name(), wire.name(), AR_HC_HIDDEN / 4 * ArHcWire::Tagged.granule_bytes(fmt), AR_HC_HIDDEN / 4 * ArHcWire::Dense.granule_bytes(fmt));
                     eprintln!("  rows  pipe_us  iso_med  iso_min  probe_us  probe_half  probe_b64  pipe_wire_GB/s  probe_wire_GB/s");
                     for r in &rows {
                         let nominal = (r.rows * AR_HC_HIDDEN * 4) as f64;
-                        let actual =
-                            (r.rows * AR_HC_HIDDEN / 4 * x.wire_for(r.rows).granule_bytes()) as f64;
+                        let actual = (r.rows * AR_HC_HIDDEN / 4
+                            * x.wire_for(r.rows).granule_bytes(fmt))
+                            as f64;
                         eprintln!(
                             "  {:4}  {:7.1}  {:7.1}  {:7.1}  {:8.1}  {:10.1}  {:9.1}  {:14.1}  {:15.1}",
                             r.rows, r.pipe_us, r.iso_med_us, r.iso_min_us, r.probe_us, r.probe_half_us, r.probe8_us,
@@ -523,8 +555,8 @@ fn main() {
                             if r.probe_us > 0.0 { nominal / r.probe_us / 1e3 } else { 0.0 },
                         );
                         json.push(format!(
-                            "{{\"rank\":{rank},\"stream\":\"{}\",\"rows\":{},\"pipe_us\":{:.2},\"iso_med_us\":{:.2},\"iso_min_us\":{:.2},\"probe_us\":{:.2},\"probe_half_us\":{:.2},\"probe8_us\":{:.2}}}",
-                            r.kind, r.rows, r.pipe_us, r.iso_med_us, r.iso_min_us, r.probe_us, r.probe_half_us, r.probe8_us
+                            "{{\"rank\":{rank},\"stream\":\"{}\",\"partial\":\"{}\",\"rows\":{},\"pipe_us\":{:.2},\"iso_med_us\":{:.2},\"iso_min_us\":{:.2},\"probe_us\":{:.2},\"probe_half_us\":{:.2},\"probe8_us\":{:.2}}}",
+                            r.kind, r.partial, r.rows, r.pipe_us, r.iso_med_us, r.iso_min_us, r.probe_us, r.probe_half_us, r.probe8_us
                         ));
                     }
                     let xs: Vec<f64> = rows.iter().map(|r| r.rows as f64).collect();

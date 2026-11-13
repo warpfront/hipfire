@@ -9,11 +9,19 @@
 //! Every EP rank runs its forward on its own thread (rank 0 on the caller's, a peer on its
 //! pool worker), so the route is a thread-local installed when that rank attaches its EP
 //! tables ([`install`]) and read where the forward builds its HC writes. It is leaked once
-//! per load (a few bytes): the forward borrows it as `&'static dyn HyperWriteAr`.
+//! per load (a few bytes): the forward borrows its two write sites ([`attn_writer`],
+//! [`ffn_writer`]) as `&'static dyn HyperWriteAr`.
+//!
+//! The two sites may send their partials in different wire formats ([`ArHcPartial`]). The FFN
+//! partial is already bf16-exact (`bf16_scaled_add` stores the bf16-rounded shared + routed
+//! sum), so it always travels as bf16. The mixer out-projection partial (GDN `out_proj` / QSA
+//! `o_proj`) is a raw f32 GEMV output: by default (`topology.ep_ar_wire = "bf16"`) it is rounded
+//! to bf16 before the fold; with `"f32"` it travels unrounded and the fold rounds `p0 + p1` to
+//! bf16 once, like one card's K sum.
 
 use hipfire_dispatch::pipeline::{HyperWriteAr, QsaSelectGather, RowGather};
 use hipfire_runtime::ar_hc_exchange::ArHcExchange;
-use rdna_compute::ar_hc_write::{sp_even_split, SpAgElem, StreamKind};
+use rdna_compute::ar_hc_write::{sp_even_split, ArHcPartial, SpAgElem, StreamKind};
 use rdna_compute::{Gpu, GpuTensor};
 use std::cell::Cell;
 use std::ffi::c_void;
@@ -176,23 +184,32 @@ pub(crate) struct TrunkShardRoute {
     /// The FFN writes carry it (the sealed MoE then yields this rank's partial: no row
     /// gather).
     ffn: bool,
+    /// Wire format of the mixer writes' partials (`topology.ep_ar_wire`).
+    mixer: ArHcPartial,
     /// [`SP_ENV`] was on when the route was installed.
     sp_on: bool,
     /// [`SP_INDEXER_ENV`] was on when the route was installed.
     sp_indexer_on: bool,
     /// The sequence-parallel split of the chunk program being executed ([`sp_begin`] /
-    /// [`sp_end`]); `None` outside one. A mutex, not a cell: the route is a `Sync`
-    /// [`HyperWriteAr`], though only its own rank thread ever touches the state.
+    /// [`sp_end`]); `None` outside one. A mutex, not a cell: the route is `Sync` (a
+    /// [`RowGather`] / [`QsaSelectGather`]), though only its own rank thread ever touches the state.
     sp: Mutex<Option<SpRows>>,
 }
 
 impl TrunkShardRoute {
-    pub(crate) fn new(exchange: Arc<ArHcExchange>, rank: usize, attn: bool, ffn: bool) -> Self {
+    pub(crate) fn new(
+        exchange: Arc<ArHcExchange>,
+        rank: usize,
+        attn: bool,
+        ffn: bool,
+        mixer: ArHcPartial,
+    ) -> Self {
         Self {
             exchange,
             rank,
             attn,
             ffn,
+            mixer,
             sp_on: sp_requested(),
             sp_indexer_on: sp_indexer_requested(),
             sp: Mutex::new(None),
@@ -202,12 +219,13 @@ impl TrunkShardRoute {
     fn sp_state(&self) -> Option<SpRows> {
         *self.sp.lock().unwrap_or_else(|p| p.into_inner())
     }
-}
 
-impl HyperWriteAr for TrunkShardRoute {
-    fn ar_hyper_write(
+    /// The fused all-reduce + HC write of one site, its partial sent as `partial_fmt`.
+    #[allow(clippy::too_many_arguments)]
+    fn site_write(
         &self,
         gpu: &mut Gpu,
+        partial_fmt: ArHcPartial,
         partial: &GpuTensor,
         streams: &GpuTensor,
         gates: &GpuTensor,
@@ -241,6 +259,7 @@ impl HyperWriteAr for TrunkShardRoute {
                         .sub(row0 * kind.row_bytes())
                         .cast::<c_void>(),
                     kind,
+                    partial_fmt,
                     gates
                         .buf
                         .as_ptr()
@@ -265,12 +284,52 @@ impl HyperWriteAr for TrunkShardRoute {
                 partial.buf.as_ptr(),
                 streams.buf.as_ptr(),
                 StreamKind::from_state_bf16(state_bf16),
+                partial_fmt,
                 gates.buf.as_ptr(),
                 rows,
                 std::ptr::null_mut(),
             )
         }
         .map_err(|error| format!("rank {}: {error}", self.rank))
+    }
+}
+
+/// One write site of this thread's route, by the wire format of its partials: the mixer (bf16
+/// or f32, `topology.ep_ar_wire`) or the FFN (bf16). Stateless: a write runs this thread's
+/// installed route (the forward builds and executes its HC writes on its rank's thread, like the
+/// route's sequence-parallel state).
+pub(crate) struct SiteWriter {
+    partial: ArHcPartial,
+}
+
+static BF16_SITE: SiteWriter = SiteWriter {
+    partial: ArHcPartial::Bf16,
+};
+static F32_SITE: SiteWriter = SiteWriter {
+    partial: ArHcPartial::F32,
+};
+
+fn site(partial: ArHcPartial) -> &'static dyn HyperWriteAr {
+    match partial {
+        ArHcPartial::Bf16 => &BF16_SITE,
+        ArHcPartial::F32 => &F32_SITE,
+    }
+}
+
+impl HyperWriteAr for SiteWriter {
+    fn ar_hyper_write(
+        &self,
+        gpu: &mut Gpu,
+        partial: &GpuTensor,
+        streams: &GpuTensor,
+        gates: &GpuTensor,
+        rows: usize,
+        state_bf16: bool,
+    ) -> Result<(), String> {
+        ROUTE
+            .with(Cell::get)
+            .ok_or_else(|| "trunk-shard write without a route on this thread".to_string())?
+            .site_write(gpu, self.partial, partial, streams, gates, rows, state_bf16)
     }
 }
 
@@ -368,20 +427,21 @@ pub(crate) fn install(route: Option<TrunkShardRoute>) {
     ROUTE.with(|cell| cell.set(leaked));
 }
 
-/// The writer of the mixer HC writes, when this thread's route carries them.
+/// The writer of the mixer HC writes (the route's mixer wire), when this thread's route carries
+/// them.
 pub(crate) fn attn_writer() -> Option<&'static dyn HyperWriteAr> {
     ROUTE
         .with(Cell::get)
         .filter(|r| r.attn)
-        .map(|r| r as &dyn HyperWriteAr)
+        .map(|r| site(r.mixer))
 }
 
-/// The writer of the FFN HC writes, when this thread's route carries them.
+/// The writer of the FFN HC writes (bf16 partials), when this thread's route carries them.
 pub(crate) fn ffn_writer() -> Option<&'static dyn HyperWriteAr> {
     ROUTE
         .with(Cell::get)
         .filter(|r| r.ffn)
-        .map(|r| r as &dyn HyperWriteAr)
+        .map(|_| site(ArHcPartial::Bf16))
 }
 
 /// Whether this thread's FFN is the partial route (no expert-row gather).
@@ -488,7 +548,13 @@ mod tests {
     fn route_is_per_thread_and_clearable() {
         assert!(attn_writer().is_none() && ffn_writer().is_none() && !ffn_partial_active());
         let x = Arc::new(ArHcExchange::new(8).unwrap());
-        install(Some(TrunkShardRoute::new(x.clone(), 0, false, true)));
+        install(Some(TrunkShardRoute::new(
+            x.clone(),
+            0,
+            false,
+            true,
+            ArHcPartial::F32,
+        )));
         assert!(attn_writer().is_none());
         assert!(ffn_writer().is_some() && ffn_partial_active());
         std::thread::spawn(|| assert!(ffn_writer().is_none()))
@@ -496,6 +562,27 @@ mod tests {
             .unwrap();
         install(None);
         assert!(ffn_writer().is_none() && !ffn_partial_active());
+    }
+
+    /// The mixer writer follows the route's `topology.ep_ar_wire`; the FFN writer is always bf16.
+    #[test]
+    fn mixer_writer_follows_the_route_wire_and_ffn_stays_bf16() {
+        let x = Arc::new(ArHcExchange::new(8).unwrap());
+        let is = |w: Option<&'static dyn HyperWriteAr>, site: &'static SiteWriter| {
+            std::ptr::addr_eq(
+                w.unwrap() as *const dyn HyperWriteAr,
+                site as *const SiteWriter,
+            )
+        };
+        for (mixer, want) in [
+            (ArHcPartial::Bf16, &BF16_SITE),
+            (ArHcPartial::F32, &F32_SITE),
+        ] {
+            install(Some(TrunkShardRoute::new(x.clone(), 0, true, true, mixer)));
+            assert!(is(attn_writer(), want), "{mixer:?}");
+            assert!(is(ffn_writer(), &BF16_SITE), "{mixer:?}");
+        }
+        install(None);
     }
 
     /// `SP_MIN_ROWS` keeps the own-row halves (`SP_MIN_ROWS / 2` rows, the smaller half of any

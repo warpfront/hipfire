@@ -441,25 +441,51 @@ them is bit-identical to one card.
   `fn_ep_oracle` / `scripts/fn_ep_compare.py` run by hand, set it yourself. On
   gfx1100 and at other rank counts the shard does not apply and EP is the first
   bullet's route.
+- **Opt-in f32 mixer wire (`topology.ep_ar_wire = "f32"`, typed key, default
+  `"bf16"`; `hipfire config set topology.ep_ar_wire f32`, global or per model).**
+  On the trunk shard only, the mixer out-projection (GDN `out_proj`, QSA
+  `o_proj`) partials travel unrounded and the fold is `m = p0 + p1`, rounded to
+  bf16 once in the HC write (bound `2^-24 (|p0| + |p1|)`); the FFN partials
+  still travel as bf16, which costs nothing (the shared + routed FFN partial is
+  already stored bf16-rounded, so the rounding is the identity). It is still not
+  byte-identical to one card: the two K halves sum in a different order than one
+  card's K loop, so `bf16(m)` can land on the other side of a rounding boundary
+  (step-0 max abs logit difference 3.3 on the `short-500` gate prompt, but all
+  33 greedy tokens equal one card's, where the bf16 wire leaves at the first
+  token). Rank equality and run-to-run repeatability hold as above.
 
-  Measured size (Flash-Next GPTQ3, code24 24x512 against the BF16 teacher,
-  served decode, 6,120 scored rows, isolated `HIPFIRE_HOME`, one fresh process
-  per arm):
+  Measured size (Flash-Next GPTQ3 against the BF16 teacher, served decode,
+  isolated `HIPFIRE_HOME`, one fresh process per arm; code24 24x512 = 6,120
+  scored rows, WT2 32x512 = 8,160):
 
-  | arm | mean KLD | top-1 | PPL |
-  |---|---|---|---|
-  | one card | 0.087458 | 0.9243 | 4.7576 |
-  | EP2, shard off | 0.087458 (same logits hash as one card) | 0.9243 | 4.7576 |
-  | EP2, default (shard on) | 0.089191 | 0.9206 | 4.8663 |
+  | arm | code24 KLD | code24 top-1 / PPL | WT2 KLD | WT2 top-1 / PPL |
+  |---|---|---|---|---|
+  | one card | 0.087458 | 0.9243 / 4.7576 | 0.083130 | 0.8897 / 5.4786 |
+  | EP2, shard off | 0.087458 (same logits hash as one card) | 0.9243 / 4.7576 | - | - |
+  | EP2, shard on, `ep_ar_wire = "bf16"` (default) | 0.089191 | 0.9206 / 4.8663 | 0.085023 | 0.8837 / 5.4991 |
+  | EP2, shard on, `ep_ar_wire = "f32"` | 0.085721 | 0.9190 / 4.8206 | 0.080915 | 0.8844 / 5.4759 |
 
-  Two cards default minus one card, paired per chunk: KLD d = +0.0017, 95% CI
-  [-0.0025, +0.0058] (2.0% of the one-card KLD, the CI includes 0, higher on 14
-  of 24 chunks); NLL of the reference text d = +0.0226, CI [+0.0026, +0.0439],
-  which excludes 0 (PPL +2.3%, top-1 against the teacher -0.37 points). The
-  design gate of the shard was d <= +0.0003 against EP2 on the point estimate;
-  on the mq4-xts fixture it measured the other sign (code24 KLD 0.082302 ->
-  0.077703), and one 24-chunk run on GPTQ3 cannot separate a small real cost
-  from the noise of a fixed rounding perturbation.
+  Paired per chunk (20,000-draw bootstrap), minus one card: default code24 KLD
+  d = +0.0017, 95% CI [-0.0025, +0.0058], WT2 d = +0.0019, CI [-0.0017,
+  +0.0058] (NLL of the code24 reference text +0.0226, CI [+0.0026, +0.0439]);
+  f32 code24 d = -0.0017, CI [-0.0074, +0.0037], WT2 d = -0.0022, CI [-0.0056,
+  +0.0012]. f32 minus default: code24 d = -0.0035, CI [-0.0078, +0.0009]; WT2
+  d = -0.0041, CI [-0.0074, -0.0009]. Rank 0 and rank 1 disagreed on 0 of the
+  6,120 / 8,160 rows on both wires.
+  The shard's design gate was d <= +0.0003 against EP2 on the point estimate;
+  on the mq4-xts fixture the default measured the other sign (code24 KLD
+  0.082302 -> 0.077703).
+
+  Cost of `"f32"` (2x R9700, symtrunk `serve --spec mtp`, one throwaway load
+  plus four fresh loads per arm, B/A of per-stream decode tok/s with a
+  two-level bootstrap 95% CI): code C1 / C4 / C8 0.981 [0.946, 1.019] /
+  1.016 [0.992, 1.040] / 1.000 [0.983, 1.019]; story C1 / C4 / C8 0.995
+  [0.956, 1.035] / 0.992 [0.975, 1.010] / **0.984 [0.969, 0.999]** (story C8
+  -1.6%, the one cell whose CI excludes 0; story ms per step +2.6% at C4 and
+  +2.2% at C8). Prefill about -2% (pp4k 6,331 vs 6,457 tok/s, pp16k 6,564 vs
+  6,676, with one slow default load left out). The cost is the doubled wire
+  bytes of the mixer launches: a 48-row launch takes 21.9 us instead of 14.5,
+  a 256-row launch 124 us instead of 69 (`ar_hc_write_bench`, f32 streams).
 
 The evidence below is for the replicated-trunk route (`fn_ep_oracle` and the
 serve harnesses, 2×/4× R9700, pinned Flash-Next XTS sha256 prefix `8b15b6fe`;

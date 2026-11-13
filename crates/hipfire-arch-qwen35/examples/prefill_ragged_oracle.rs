@@ -212,6 +212,7 @@ fn load_bundle(model: &str, max_seq: usize, gpu: &mut Gpu) -> Result<Qwen35Bundl
         gemma4_draft_len: 3,
         xdna: None,
         batch_request: Default::default(),
+        ep_ar_wire: Default::default(),
     };
     Ok(load_qwen35_bundle(ModelSource::from_path(model)?, &mut lc)
         .map_err(|e| format!("load_qwen35_bundle: {e}"))?)

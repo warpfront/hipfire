@@ -154,6 +154,7 @@ fn run() -> R<()> {
         gemma4_draft_len: 3,
         xdna: None,
         batch_request: Default::default(),
+        ep_ar_wire: Default::default(),
     };
     let mut b = load_qwen35_bundle(src, &mut lc).map_err(|e| e.to_string())?;
     let (dim, vocab) = (b.config.dim, b.config.vocab_size);

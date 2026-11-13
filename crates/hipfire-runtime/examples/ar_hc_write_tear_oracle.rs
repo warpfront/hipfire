@@ -3,30 +3,36 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Negative (torn / stale / sentinel) tests of the DENSE all-reduce wire
-//! (`ar_hc_write_d8_gfx1201`) on two gfx1201 cards.
+//! (`ar_hc_write_d8_gfx1201` / `ar_hc_write_p32_d16_gfx1201`) on two gfx1201 cards.
 //!
 //! ```text
-//! ar_hc_write_tear_oracle [--devices 0,1] [--out DIR] [--hold-ms 40]
+//! ar_hc_write_tear_oracle [--devices 0,1] [--out DIR] [--hold-ms 40] [--partial f32|bf16]
 //! ```
 //!
 //! A hostile peer: rank 1's GPU writes the payload dwords of the launch's bank in rank 0's
 //! mailbox one dword store at a time in a chosen order, with a host-timed gap, while rank 0
-//! runs the REAL kernel. Rank 0's streams are compared with the host model.
-//!  * `split_d0_first` / `split_d1_first`: one dword of every granule is visible for
+//! runs the REAL kernel. Rank 0's streams are compared with the host model. A dense granule is
+//! `w` payload dwords (`--partial`, default f32: four f32 values `{p0, p1, p2, p3}`, `w = 4`;
+//! bf16: two dwords `{d0d1, d2d3}` of bf16 pairs, `w = 2`); "lo" is the first half of them,
+//! "hi" the second.
+//!  * `split_lo_first` / `split_hi_first`: one half of every granule is visible for
 //!    `--hold-ms`, then the other. The kernel must keep waiting (elapsed >= hold) and fold the
-//!    complete granules (streams == model). A reader that accepted a half-written granule
+//!    complete granules (streams == model). A reader that accepted a partly written granule
 //!    would fold the wrong payload or finish early.
-//!  * `last_granule_half`, `d0_only`: a granule never completes. The bounded wait must expire
+//!  * `last_granule_partial`, `lo_only`: a granule never completes. The bounded wait must expire
 //!    at site `ar_hc_write_gfx1201`, the streams must be untouched.
-//!  * `nan_pair`: both ranks push a partial whose bf16 payload dword is all ones (NaN pair);
-//!    the sender remaps it so the receiver never mistakes it for EMPTY: no hang, the NaN
-//!    columns stay NaN, every other element equals the model byte for byte.
+//!  * `nan_payload`: both ranks push a partial whose first payload dword(s) are all ones (=
+//!    EMPTY: the f32 NaN 0xFFFFFFFF, or a bf16 NaN pair); the sender remaps it so the receiver
+//!    never mistakes it for EMPTY: no hang, the NaN columns stay NaN, every other element
+//!    equals the model byte for byte.
 //!  * `rearm`: after a normal paired exchange the used bank of each mailbox is all 0xFF.
 //! Exit code 3 on any failure; a JSON receipt lands in `--out`.
 
 use hip_bridge::KernargBlob;
 use hipfire_runtime::ar_hc_exchange::{ArHcExchange, ArHcMode};
-use rdna_compute::ar_hc_write::{ar_hc_write_model, bf16_bits, ArHcWire, StreamKind, AR_HC_HIDDEN};
+use rdna_compute::ar_hc_write::{
+    ar_hc_write_model, bf16_bits, ArHcPartial, ArHcWire, StreamKind, AR_HC_HIDDEN,
+};
 use rdna_compute::Gpu;
 use std::ffi::c_void;
 use std::sync::{Arc, Barrier, Mutex};
@@ -34,16 +40,20 @@ use std::time::{Duration, Instant};
 
 const HOSTILE_SRC: &str = r#"
 #include <hip/hip_runtime.h>
-// sel 0: dword 0 of every granule; 1: dword 1; 2: both; 3: both except the last granule's
-// dword 1. One relaxed system-scope dword store each (never a wider store).
+// `w` payload dwords per granule. sel 0: the first w/2 dwords of every granule; 1: the last
+// w/2; 2: all; 3: all except the last granule's last dword. One relaxed system-scope dword
+// store each (never a wider store).
 extern "C" __global__ __launch_bounds__(256) void arwire_hostile(char *dst, const unsigned *words,
-                                                                 unsigned n, unsigned sel) {
+                                                                 unsigned n, unsigned sel, unsigned w) {
     unsigned *d = reinterpret_cast<unsigned *>(dst);
     for (unsigned j = blockIdx.x * blockDim.x + threadIdx.x; j < n; j += gridDim.x * blockDim.x) {
-        const bool d0 = sel == 0 || sel == 2 || sel == 3;
-        const bool d1 = sel == 1 || sel == 2 || (sel == 3 && j + 1 != n);
-        if (d0) __hip_atomic_store(d + 2 * j, words[2 * j], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-        if (d1) __hip_atomic_store(d + 2 * j + 1, words[2 * j + 1], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+        const bool lo = sel == 0 || sel == 2 || sel == 3;
+        const bool hi = sel == 1 || sel == 2 || sel == 3;
+        for (unsigned q = 0; q < w; ++q) {
+            const bool last = sel == 3 && j + 1 == n && q + 1 == w;
+            if ((q < w / 2 ? lo : hi) && !last)
+                __hip_atomic_store(d + w * j + q, words[w * j + q], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+        }
     }
 }
 "#;
@@ -78,15 +88,26 @@ fn u16s(b: &[u8]) -> Vec<u16> {
         .collect()
 }
 
-fn pack(p: &[f32]) -> Vec<u32> {
-    p.chunks_exact(4)
-        .flat_map(|g| {
-            [
-                u32::from(bf16_bits(g[0])) | (u32::from(bf16_bits(g[1])) << 16),
-                u32::from(bf16_bits(g[2])) | (u32::from(bf16_bits(g[3])) << 16),
-            ]
-        })
-        .collect()
+/// Dense wire payload dwords of `p` in format `fmt` (f32: the bits; bf16: two bf16 pairs per
+/// granule, low half first); an all-ones dword would travel remapped.
+fn pack(fmt: ArHcPartial, p: &[f32]) -> Vec<u32> {
+    match fmt {
+        ArHcPartial::F32 => p.iter().map(|v| v.to_bits()).collect(),
+        ArHcPartial::Bf16 => p
+            .chunks_exact(4)
+            .flat_map(|g| {
+                [
+                    u32::from(bf16_bits(g[0])) | (u32::from(bf16_bits(g[1])) << 16),
+                    u32::from(bf16_bits(g[2])) | (u32::from(bf16_bits(g[3])) << 16),
+                ]
+            })
+            .collect(),
+    }
+}
+
+/// Payload dwords of one dense granule of `fmt`.
+fn granule_dwords(fmt: ArHcPartial) -> u32 {
+    (ArHcWire::Dense.granule_bytes(fmt) / 4) as u32
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -116,6 +137,7 @@ fn run_rank(
     rank: usize,
     device: i32,
     hold_ms: u64,
+    fmt: ArHcPartial,
     x: Arc<ArHcExchange>,
     barrier: Arc<Barrier>,
     shared: Arc<Mutex<Shared>>,
@@ -142,39 +164,39 @@ fn run_rank(
         .collect();
     let gates_host = vec![0f32; ROWS * 4];
     let mut want = streams_host.clone();
-    ar_hc_write_model(&p[0], &p[1], &mut want, &gates_host, ROWS);
+    ar_hc_write_model(fmt, &p[0], &p[1], &mut want, &gates_host, ROWS);
 
     let partial = gpu.hip.malloc(n * 4).map_err(e)?;
     let streams = gpu.hip.malloc(streams_host.len() * 2).map_err(e)?;
     let gates = gpu.hip.malloc(ROWS * 16).map_err(e)?;
-    let words = gpu.hip.malloc(n / 2 * 4).map_err(e)?;
+    let words = gpu.hip.malloc(n * 4).map_err(e)?;
     gpu.hip.memset(&gates, 0, ROWS * 16).map_err(e)?;
     gpu.hip
-        .memcpy_htod(&words, &bytes_u32(&pack(&p[1])))
+        .memcpy_htod(&words, &bytes_u32(&pack(fmt, &p[1])))
         .map_err(e)?;
     let mut out = Outcome::default();
 
     let cases = [
         Case {
-            name: "split_d0_first",
+            name: "split_lo_first",
             first: 0,
             second: Some(1),
             expect: Expect::Folds,
         },
         Case {
-            name: "split_d1_first",
+            name: "split_hi_first",
             first: 1,
             second: Some(0),
             expect: Expect::Folds,
         },
         Case {
-            name: "last_granule_half",
+            name: "last_granule_partial",
             first: 3,
             second: None,
             expect: Expect::TimesOut,
         },
         Case {
-            name: "d0_only",
+            name: "lo_only",
             first: 0,
             second: None,
             expect: Expect::TimesOut,
@@ -210,6 +232,7 @@ fn run_rank(
                     partial.as_ptr(),
                     streams.as_ptr(),
                     StreamKind::Bf16,
+                    fmt,
                     gates.as_ptr(),
                     ROWS,
                     std::ptr::null_mut::<c_void>(),
@@ -232,6 +255,7 @@ fn run_rank(
                 b.push_ptr(words.as_ptr());
                 b.push_u32((n / 4) as u32);
                 b.push_u32(sel);
+                b.push_u32(granule_dwords(fmt));
                 gpu.launch_kernel_blob(
                     "arwire_hostile",
                     [16, 1, 1],
@@ -303,41 +327,33 @@ fn run_rank(
         barrier.wait();
     }
 
-    // nan_pair: a real paired exchange whose first granule is a NaN pair on both ranks
+    // nan_payload: a real paired exchange whose first granule carries all-ones (EMPTY-pattern)
+    // payload dwords on both ranks: four f32 0xFFFFFFFF NaNs, or values whose bf16 is 0xFFFF
     {
         let rows = 1usize;
         let n1 = rows * AR_HC_HIDDEN;
+        let nan = match fmt {
+            ArHcPartial::F32 => f32::from_bits(0xFFFF_FFFF),
+            ArHcPartial::Bf16 => f32::from_bits(0xFFFF_7000),
+        };
+        assert!(
+            pack(fmt, &[nan; 4]).iter().all(|&w| w == u32::MAX),
+            "test premise: the payload dwords are all ones"
+        );
         let mut mine: Vec<f32> = (0..n1).map(|i| val(rank, i)).collect();
         for v in mine.iter_mut().take(4) {
-            *v = f32::from_bits(0xFFFF_7000);
+            *v = nan;
         }
-        assert_eq!(
-            bf16_bits(mine[0]),
-            0xFFFF,
-            "test premise: the payload half is all ones"
-        );
         let p0: Vec<f32> = (0..n1)
-            .map(|i| {
-                if i < 4 {
-                    f32::from_bits(0xFFFF_7000)
-                } else {
-                    val(0, i)
-                }
-            })
+            .map(|i| if i < 4 { nan } else { val(0, i) })
             .collect();
         let p1: Vec<f32> = (0..n1)
-            .map(|i| {
-                if i < 4 {
-                    f32::from_bits(0xFFFF_7000)
-                } else {
-                    val(1, i)
-                }
-            })
+            .map(|i| if i < 4 { nan } else { val(1, i) })
             .collect();
         let st: Vec<u16> = streams_host[..4 * AR_HC_HIDDEN].to_vec();
         let g1 = vec![0f32; 4];
         let mut wantn = st.clone();
-        ar_hc_write_model(&p0, &p1, &mut wantn, &g1, rows);
+        ar_hc_write_model(fmt, &p0, &p1, &mut wantn, &g1, rows);
         gpu.hip
             .memcpy_htod(&partial, &bytes_f32(&mine))
             .map_err(e)?;
@@ -351,6 +367,7 @@ fn run_rank(
                 partial.as_ptr(),
                 streams.as_ptr(),
                 StreamKind::Bf16,
+                fmt,
                 gates.as_ptr(),
                 rows,
                 std::ptr::null_mut::<c_void>(),
@@ -385,7 +402,7 @@ fn run_rank(
             .all(|&b| b == 0xFF);
         barrier.wait();
         out.rows.push((
-            format!("nan_pair+rearm rank {rank}"),
+            format!("nan_payload+rearm rank {rank}"),
             werr.is_none() && bad == 0 && rearmed,
             format!("wait_err {werr:?}, bad elements {bad}, bank {bank} re-armed {rearmed}"),
         ));
@@ -399,6 +416,7 @@ fn main() {
     let mut devices = [0i32, 1i32];
     let mut out = ".".to_string();
     let mut hold_ms = 40u64;
+    let mut fmt = ArHcPartial::F32;
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < args.len() {
@@ -419,6 +437,14 @@ fn main() {
                 i += 1;
                 hold_ms = args[i].parse().expect("hold-ms");
             }
+            "--partial" => {
+                i += 1;
+                fmt = match args[i].as_str() {
+                    "f32" => ArHcPartial::F32,
+                    "bf16" => ArHcPartial::Bf16,
+                    other => panic!("--partial takes f32|bf16, got {other}"),
+                };
+            }
             other => panic!("unknown argument {other}"),
         }
         i += 1;
@@ -430,7 +456,7 @@ fn main() {
         .map(|rank| {
             let (x, b, s) = (x.clone(), barrier.clone(), shared.clone());
             let dev = devices[rank];
-            std::thread::spawn(move || run_rank(rank, dev, hold_ms, x, b, s))
+            std::thread::spawn(move || run_rank(rank, dev, hold_ms, fmt, x, b, s))
         })
         .collect();
     let results: Vec<Result<Outcome, String>> = handles
@@ -461,8 +487,8 @@ fn main() {
         }
     }
     let receipt = format!(
-        "{{\"oracle\":\"ar_hc_write_tear_oracle\",\"wire\":\"dense\",\"pass\":{},\"hold_ms\":{hold_ms},\"devices\":[{},{}],\"results\":[{}]}}",
-        !failed, devices[0], devices[1], json.join(",")
+        "{{\"oracle\":\"ar_hc_write_tear_oracle\",\"wire\":\"dense\",\"partial\":\"{}\",\"pass\":{},\"hold_ms\":{hold_ms},\"devices\":[{},{}],\"results\":[{}]}}",
+        fmt.name(), !failed, devices[0], devices[1], json.join(",")
     );
     let _ = std::fs::create_dir_all(&out);
     let path = format!("{out}/ar_hc_write_tear_oracle.json");

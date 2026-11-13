@@ -230,6 +230,11 @@ pub struct LoadCtx<'a> {
     /// lane store's device bytes before splitting the experts. Populated
     /// solely from `SourceAdmission::batch_request`.
     pub batch_request: BatchLoadRequest,
+    /// Typed `topology.ep_ar_wire` (default bf16): the wire format of the mixer partials in
+    /// the Flash-Next two-card trunk-shard all-reduce. Read by `Qwen4Carrier` for that route
+    /// only; every other carrier ignores it. Populated solely from
+    /// `SourceAdmission::ep_ar_wire`.
+    pub ep_ar_wire: hipfire_config::topology::EpArWire,
 }
 
 /// Per-load model-free n-gram speculator settings, resolved by the CLI through

@@ -938,6 +938,7 @@ fn load(model: &str) -> Result<(Ctx, Tokenizer, Value)> {
         gemma4_draft_len: 3,
         xdna: None,
         batch_request: Default::default(),
+        ep_ar_wire: Default::default(),
     };
     let b = load_qwen35_bundle(src, &mut lc).map_err(|e| format!("load_qwen35_bundle: {e}"))?;
     let max_seq = lc.max_seq;

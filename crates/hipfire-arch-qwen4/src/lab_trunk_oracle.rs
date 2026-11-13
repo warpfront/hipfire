@@ -23,7 +23,7 @@ use crate::bundle::Qwen4Bundle;
 use crate::config::{LayerType, Qwen4Config};
 use hipfire_runtime::ar_hc_exchange::ArHcExchange;
 use rdna_compute::ar_hc_write::{
-    ar_hc_fold, bf16_bits, bf16_round, hc_gate, StreamKind, AR_HC_HIDDEN,
+    bf16_bits, bf16_round, hc_gate, ArHcPartial, StreamKind, AR_HC_HIDDEN,
 };
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -31,8 +31,6 @@ use std::sync::Arc;
 
 /// `2^-8`: the bf16 unit roundoff (round to nearest even at 8 significant bits).
 pub const EPS8: f64 = 1.0 / 256.0;
-/// `2^-23`: the fp32 unit roundoff of the one fp32 add of the fold.
-pub const EPS23: f64 = 1.0 / 8_388_608.0;
 /// `2^-7`: one bf16 ulp relative to the bottom of its binade, the largest change a bf16
 /// rounding can make to a result when its input moved by less than the rounding step.
 pub const ROUND_FLIP: f64 = 1.0 / 128.0;
@@ -120,9 +118,12 @@ impl CaseSpec {
 /// `acc` is the fp32 accumulation-order allowance of the K-split GEMV relative to
 /// `|p0| + |p1|`; `row_rms` is an absolute allowance relative to the RMS of the reference
 /// block output row (cancellation floor). Both are far below the bf16 rounding terms the
-/// contract already allows, so only a real cut/kernel error breaks them.
+/// contract already allows, so only a real cut/kernel error breaks them. `fold` is the wire
+/// format of the mixer partials under test (`topology.ep_ar_wire`; default bf16, the product
+/// default): it sets the fold model and its bound.
 #[derive(Clone, Copy, Debug)]
 pub struct Tolerances {
+    pub fold: ArHcPartial,
     pub acc: f64,
     pub row_rms: f64,
     /// Multiplies every bound (1.0 = the documented contract).
@@ -132,6 +133,7 @@ pub struct Tolerances {
 impl Default for Tolerances {
     fn default() -> Self {
         Self {
+            fold: ArHcPartial::Bf16,
             acc: 1.0 / 16_384.0,
             row_rms: 1.0 / 4_096.0,
             scale: 1.0,
@@ -446,16 +448,17 @@ pub fn check_bytes_equal(name: &'static str, a: &[u8], b: &[u8], what: &str) -> 
 }
 
 /// C2: the fold contract of the fused all-reduce on the REAL partials of the layer:
-/// `|m - (p0 + p1)| <= (2^-8 + 2^-23)(|p0| + |p1|)` for `m = ar_hc_fold(p0, p1)` (the host
-/// model of the device fold; the kernel's own bytes are checked by C3).
+/// `|m - (p0 + p1)| <= tol.fold.fold_bound(p0, p1)` (f32 partials `2^-24 (|p0| + |p1|)`, bf16
+/// `(2^-8 + 2^-23)(|p0| + |p1|)`) for `m = tol.fold.fold(p0, p1)` (the host model of the device fold; the kernel's own bytes are
+/// checked by C3).
 pub fn check_fold_contract(p0: &[f32], p1: &[f32], tol: &Tolerances) -> Check {
     assert_eq!(p0.len(), p1.len());
     let mut worst = 0f64;
     let mut bad = 0usize;
     for (a, b) in p0.iter().zip(p1) {
-        let m = f64::from(ar_hc_fold(*a, *b));
+        let m = f64::from(tol.fold.fold(*a, *b));
         let exact = f64::from(*a) + f64::from(*b);
-        let bound = (EPS8 + EPS23) * (f64::from(*a).abs() + f64::from(*b).abs()) * tol.scale;
+        let bound = tol.fold.fold_bound(*a, *b) * tol.scale;
         let err = (m - exact).abs();
         let ratio = if bound > 0.0 {
             err / bound
@@ -470,7 +473,7 @@ pub fn check_fold_contract(p0: &[f32], p1: &[f32], tol: &Tolerances) -> Check {
         worst = worst.max(ratio);
     }
     finish(
-        "C2 fold contract |m-(p0+p1)|<=(2^-8+2^-23)(|p0|+|p1|)",
+        "C2 fold contract |m-(p0+p1)|<=2^-24(|p0|+|p1|)",
         p0.len(),
         bad,
         worst,
@@ -503,12 +506,14 @@ fn gate_neighbours(g: f32) -> [f32; 2] {
 }
 
 /// C3: the device output of the fused write equals the HOST MODEL of the write applied to
-/// the captured input, partials and gates (`ar_hc_fold` + `hc_inject[_f32]`). A (row,
+/// the captured input, partials and gates (`ArHcPartial::fold` + `hc_inject[_f32]`). A (row,
 /// branch) whose every word is reproduced by a one-bf16-ulp neighbour of the host gate is
 /// counted as a benign gate-rounding difference (host libm vs device `expf`), not a
 /// violation; anything else is.
+#[allow(clippy::too_many_arguments)]
 pub fn check_kernel_vs_model(
     kind: StreamKind,
+    fold: ArHcPartial,
     input: &[u8],
     output: &[u8],
     gates: &[f32],
@@ -534,7 +539,7 @@ pub fn check_kernel_vs_model(
                         model_word(
                             kind,
                             gate,
-                            ar_hc_fold(p0[m_at + c], p1[m_at + c]),
+                            fold.fold(p0[m_at + c], p1[m_at + c]),
                             s_in[at + c],
                         )
                     })
@@ -570,10 +575,12 @@ pub fn check_kernel_vs_model(
     ))
 }
 
-/// The per-element allowance on `|p0 + p1 - m_ref|`: the fold's own bf16 terms, the fp32
+/// The per-element allowance on `|p0 + p1 - m_ref|`: the fold's own fp32 add, the fp32
 /// accumulation-order noise and an RMS floor for cancellation.
 fn cut_tolerance(p0: f32, p1: f32, row_rms: f64, tol: &Tolerances) -> f64 {
-    ((EPS8 + EPS23 + tol.acc) * (f64::from(p0).abs() + f64::from(p1).abs()) + tol.row_rms * row_rms)
+    (tol.fold.fold_bound(p0, p1)
+        + tol.acc * (f64::from(p0).abs() + f64::from(p1).abs())
+        + tol.row_rms * row_rms)
         * tol.scale
 }
 
@@ -590,7 +597,7 @@ fn row_rms(values: &[f32]) -> f64 {
 }
 
 /// C4: the K-split partials sum to the reference block output within the contract:
-/// `|(p0 + p1) - m_ref| <= (2^-8 + 2^-23 + acc)(|p0| + |p1|) + row_rms * rms(m_ref row)`.
+/// `|(p0 + p1) - m_ref| <= (2^-24 + acc)(|p0| + |p1|) + row_rms * rms(m_ref row)`.
 /// This is the check that catches a wrong weight cut / head order / kernel shape: an error
 /// of one head's contribution is O(|m|), orders of magnitude above this allowance.
 pub fn check_cut_vs_reference(
@@ -635,8 +642,8 @@ pub fn check_cut_vs_reference(
 ///
 /// `|s_tp - s_ref| <= (1 + 2^-8) |g| (dm + 2^-7 |m|) + 2^-7 |g| |m| + 2^-7 max(|s_tp|, |s_ref|)`
 ///
-/// where `dm = (2^-8 + 2^-23)(|p0| + |p1|) + cutTol` bounds `|m_fold - m_ref|` (the fold's own
-/// bf16 terms plus the C4 allowance), `m` is the reference block output (the fold when the
+/// where `dm = 2^-24 (|p0| + |p1|) + cutTol` bounds `|m_fold - m_ref|` (the fold's own
+/// fp32 add plus the C4 allowance), `m` is the reference block output (the fold when the
 /// reference did not materialise it) and `g` the row gate; the `2^-7` terms are one bf16 ulp of
 /// slack for each of the three roundings of the HC write (`bf16(m)`, `bf16(g*bf16(m))` and the
 /// final sum), which can flip when their input moves.
@@ -662,7 +669,7 @@ pub fn check_stream_bound(
         let m_row: Vec<f32> = match m_ref {
             Some(m) => m[m_at..m_at + AR_HC_HIDDEN].to_vec(),
             None => (0..AR_HC_HIDDEN)
-                .map(|c| ar_hc_fold(p0[m_at + c], p1[m_at + c]))
+                .map(|c| tol.fold.fold(p0[m_at + c], p1[m_at + c]))
                 .collect(),
         };
         let rms = row_rms(&m_row);
@@ -674,9 +681,7 @@ pub fn check_stream_bound(
                 let cut = cut_tolerance(p0[m_at + c], p1[m_at + c], rms, tol);
                 // `scale` is already inside `fold` and `cut`; the rounding-flip terms are the
                 // pure envelope of three bf16 roundings and are not scaled.
-                let fold = (EPS8 + EPS23)
-                    * (f64::from(p0[m_at + c]).abs() + f64::from(p1[m_at + c]).abs())
-                    * tol.scale;
+                let fold = tol.fold.fold_bound(p0[m_at + c], p1[m_at + c]) * tol.scale;
                 let dm = fold + cut;
                 let bound = (1.0 + EPS8) * g * (dm + ROUND_FLIP * m)
                     + ROUND_FLIP * g * m
@@ -862,10 +867,14 @@ pub fn evaluate_block(
     ));
     checks.push(check_fold_contract(p0, p1, tol));
     checks.push(check_kernel_vs_model(
-        kind, &r0.input, &r0.output, &r0.gates, p0, p1, rows,
+        kind, tol.fold, &r0.input, &r0.output, &r0.gates, p0, p1, rows,
     )?);
 
-    let folded: Vec<f32> = p0.iter().zip(p1).map(|(a, b)| ar_hc_fold(*a, *b)).collect();
+    let folded: Vec<f32> = p0
+        .iter()
+        .zip(p1)
+        .map(|(a, b)| tol.fold.fold(*a, *b))
+        .collect();
     let exact: Vec<f32> = p0
         .iter()
         .zip(p1)
@@ -1109,6 +1118,7 @@ pub fn synthetic_tp_case(
     seed: u64,
     rows: usize,
     kind: StreamKind,
+    fold: ArHcPartial,
     defect: Defect,
 ) -> (BlockCapture, BlockCapture, BlockCapture) {
     let mut rng = Rng::new(seed ^ 0xA5A5);
@@ -1160,7 +1170,7 @@ pub fn synthetic_tp_case(
     };
     let ref_out = apply(&|i| m_ref[i], None);
     let gate_ulp = (defect == Defect::GateUlp).then_some(1usize);
-    let mut tp_out = apply(&|i| ar_hc_fold(p0[i], p1[i]), gate_ulp);
+    let mut tp_out = apply(&|i| fold.fold(p0[i], p1[i]), gate_ulp);
     if defect == Defect::KernelWord {
         tp_out[5] = bf16_round(tp_out[5] * 1.5 + 1.0);
     }
@@ -1201,53 +1211,59 @@ pub fn synthetic_tp_case(
 /// injected defect must be caught by the check that owns it. Returns the lines of the
 /// receipt, `Err` naming the first expectation that failed.
 pub fn selftest(rows_list: &[usize]) -> Result<Vec<String>, String> {
-    let tol = Tolerances::default();
     let mut lines = Vec::new();
-    for &rows in rows_list {
-        for kind in StreamKind::ALL {
-            for defect in [
-                Defect::None,
-                Defect::GateUlp,
-                Defect::CutSlice,
-                Defect::RankSkew,
-                Defect::KernelWord,
-            ] {
-                let (reference, r0, r1) =
-                    synthetic_tp_case(0x5EED + rows as u64, rows, kind, defect);
-                let report = evaluate_block(
-                    "selftest",
-                    Block::Mixer,
-                    "gdn",
-                    [&r0, &r1],
-                    Some(&reference),
-                    &tol,
-                )?;
-                let failed: Vec<&str> = report
-                    .checks
-                    .iter()
-                    .filter(|c| !c.pass)
-                    .map(|c| c.name.split(' ').next().unwrap_or(""))
-                    .collect();
-                let expect: &[&str] = match defect {
-                    Defect::None | Defect::GateUlp => &[],
-                    Defect::CutSlice => &["C4", "C5"],
-                    Defect::RankSkew => &["C1"],
-                    Defect::KernelWord => &["C3", "C5"],
-                };
-                // A defect must be caught by (at least) the checks that own it; a clean
-                // case by none.
-                let ok = if expect.is_empty() {
-                    failed.is_empty()
-                } else {
-                    expect.iter().all(|e| failed.contains(e))
-                };
-                lines.push(format!(
-                    "selftest rows={rows} stream={} defect={defect:?}: failed checks {failed:?} (expected {expect:?}) -> {}",
+    for fold in ArHcPartial::ALL {
+        let tol = Tolerances {
+            fold,
+            ..Tolerances::default()
+        };
+        for &rows in rows_list {
+            for kind in StreamKind::ALL {
+                for defect in [
+                    Defect::None,
+                    Defect::GateUlp,
+                    Defect::CutSlice,
+                    Defect::RankSkew,
+                    Defect::KernelWord,
+                ] {
+                    let (reference, r0, r1) =
+                        synthetic_tp_case(0x5EED + rows as u64, rows, kind, fold, defect);
+                    let report = evaluate_block(
+                        "selftest",
+                        Block::Mixer,
+                        "gdn",
+                        [&r0, &r1],
+                        Some(&reference),
+                        &tol,
+                    )?;
+                    let failed: Vec<&str> = report
+                        .checks
+                        .iter()
+                        .filter(|c| !c.pass)
+                        .map(|c| c.name.split(' ').next().unwrap_or(""))
+                        .collect();
+                    let expect: &[&str] = match defect {
+                        Defect::None | Defect::GateUlp => &[],
+                        Defect::CutSlice => &["C4", "C5"],
+                        Defect::RankSkew => &["C1"],
+                        Defect::KernelWord => &["C3", "C5"],
+                    };
+                    // A defect must be caught by (at least) the checks that own it; a clean
+                    // case by none.
+                    let ok = if expect.is_empty() {
+                        failed.is_empty()
+                    } else {
+                        expect.iter().all(|e| failed.contains(e))
+                    };
+                    lines.push(format!(
+                    "selftest fold={} rows={rows} stream={} defect={defect:?}: failed checks {failed:?} (expected {expect:?}) -> {}",
+                    fold.name(),
                     kind.name(),
                     if ok { "ok" } else { "WRONG" }
                 ));
-                if !ok {
-                    return Err(format!("{}\n{}", lines.last().unwrap(), report.render()));
+                    if !ok {
+                        return Err(format!("{}\n{}", lines.last().unwrap(), report.render()));
+                    }
                 }
             }
         }
@@ -1311,7 +1327,8 @@ mod tests {
             rows: 2,
             route: RouteSel::Verify,
         };
-        let (reference, r0, r1) = synthetic_tp_case(1, 2, StreamKind::F32, Defect::None);
+        let (reference, r0, r1) =
+            synthetic_tp_case(1, 2, StreamKind::F32, ArHcPartial::Bf16, Defect::None);
         let block = block_dir(&dir, &case, Block::Mixer);
         write_capture(&block, 0, &r0).unwrap();
         write_capture(&block, 1, &r1).unwrap();

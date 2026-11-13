@@ -1196,6 +1196,7 @@ mod tests {
             gemma4_draft_len: 3,
             xdna: None,
             batch_request: Default::default(),
+            ep_ar_wire: Default::default(),
         }
     }
 

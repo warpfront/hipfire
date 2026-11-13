@@ -10837,7 +10837,7 @@ pub const TP_PEER_PUSHN_GFX1201_SRC: &str = concat!(
 );
 
 /// gfx1201 TP2 all-reduce fused into the BF16 Hyper-Connection write
-/// (`ar_hc_write_gfx1201`: bf16 partial pushed as tagged granules into the peer's
+/// (`ar_hc_write_gfx1201`: the rank's partial, bf16-rounded or f32 per write site, pushed into the peer's
 /// fine-grained mailbox, bounded poll, rank-ordered fold, in-place `hyper_write_bf16x2`
 /// arithmetic on the four streams; device-resident generation).
 pub const AR_HC_WRITE_GFX1201_SRC: &str = concat!(
@@ -10846,7 +10846,7 @@ pub const AR_HC_WRITE_GFX1201_SRC: &str = concat!(
 );
 
 /// gfx1201 EP2 sequence-parallel prefill exchange: reduce-scatter fused into the HC write
-/// (`sp_hc_rs_d8_gfx1201` / `sp_hc_rs_d8_f32s_gfx1201`) and the row all-gather
+/// (`sp_hc_rs_{d8,p32_d16}_gfx1201` and their `_f32s` forms) and the row all-gather
 /// (`sp_ag_rows_bf16_d8_gfx1201` / `sp_ag_rows_f32bf16_d8_gfx1201`). Appended to the
 /// `ar_hc_write` helpers it reuses (dense wire, generation protocol, bounded wait); the two
 /// new wait-site macros live in the `.hip` itself.

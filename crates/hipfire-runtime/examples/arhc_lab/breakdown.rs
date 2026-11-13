@@ -27,7 +27,7 @@
 
 use hip_bridge::{DeviceBuffer, KernargBlob};
 use hipfire_runtime::ar_hc_exchange::ArHcExchange;
-use rdna_compute::ar_hc_write::{ar_hc_geometry, StreamKind, AR_HC_HIDDEN};
+use rdna_compute::ar_hc_write::{ar_hc_geometry, ArHcPartial, StreamKind, AR_HC_HIDDEN};
 use rdna_compute::Gpu;
 use std::ffi::c_void;
 use std::sync::{Arc, Barrier};
@@ -57,9 +57,9 @@ __device__ __forceinline__ bool arlab_body(
         }
     }
     const unsigned bank = tag & 1u;
-    typename ArhcRec<DENSE>::type *pb = reinterpret_cast<typename ArhcRec<DENSE>::type *>(peer_mbox + bank * bank_stride);
-    const typename ArhcRec<DENSE>::type *lb =
-        reinterpret_cast<const typename ArhcRec<DENSE>::type *>(local_mbox + bank * bank_stride);
+    typename ArhcRec<DENSE, false>::type *pb = reinterpret_cast<typename ArhcRec<DENSE, false>::type *>(peer_mbox + bank * bank_stride);
+    const typename ArhcRec<DENSE, false>::type *lb =
+        reinterpret_cast<const typename ArhcRec<DENSE, false>::type *>(local_mbox + bank * bank_stride);
     if constexpr ((MODE & ARLAB_PUSH) != 0) {
 #pragma unroll
         for (int k = 0; k < K; ++k) {
@@ -94,8 +94,8 @@ __device__ __forceinline__ bool arlab_body(
     }
     unsigned rw[K][2];
     if constexpr ((MODE & ARLAB_POLL) != 0) {
-        typename ArhcRec<DENSE>::type r[K];
-        const typename ArhcRec<DENSE>::type *lp[K];
+        typename ArhcRec<DENSE, false>::type r[K];
+        const typename ArhcRec<DENSE, false>::type *lp[K];
 #pragma unroll
         for (int k = 0; k < K; ++k) {
             const int j = g0 + tid + k * T;
@@ -541,7 +541,8 @@ pub fn run(
                 .map_err(e)?;
             gpu.hip.memset(&gates, 0, rows * 16).map_err(e)?;
             let geom = ar_hc_geometry(rows).ok_or("no geometry")?;
-            // product reference: ungated (the original bench method) and gated
+            // product reference (the bf16-partial wire, as the lab bodies): ungated (the
+            // original bench method) and gated
             let prod = |gpu: &mut Gpu| -> Result<(), String> {
                 // SAFETY: live buffers of the extents `kind` / `rows` imply on this device.
                 unsafe {
@@ -551,6 +552,7 @@ pub fn run(
                         partial.as_ptr(),
                         streams.as_ptr(),
                         kind,
+                        ArHcPartial::Bf16,
                         gates.as_ptr(),
                         rows,
                         std::ptr::null_mut::<c_void>(),

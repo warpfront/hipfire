@@ -17042,7 +17042,7 @@ impl Qwen4GpuForward {
         }
         // Sequence-parallel prefill (`HIPFIRE_QWEN4_EP_SEQ_PARALLEL`, default on, `0` kills): a wide EP2
         // trunk-shard prefill chunk runs its HC reads / writes over this rank's half of the rows
-        // (own-row views), the HC write as a reduce-scatter (`TrunkShardRoute::ar_hyper_write`)
+        // (own-row views), the HC write as a reduce-scatter (`TrunkShardRoute::site_write`)
         // and `RowGather` steps rejoin the rows where a mixer, the MoE or the PLE conv needs all
         // of them. Decided on `n` and load-time facts only, so both ranks always agree; any
         // reject runs today's all-reduce route for the whole chunk. Silent per chunk: the

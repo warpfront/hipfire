@@ -1339,6 +1339,10 @@ pub struct SourceAdmission {
     /// on the admitted handle before the load, and the carrier forwards it
     /// through `LoadCtx::batch_request`.
     pub batch_request: BatchLoadRequest,
+    /// The typed `topology.ep_ar_wire` of this load (default bf16). Admission never sets it;
+    /// the caller sets it on the admitted handle from the load request and the carrier forwards
+    /// it through `LoadCtx::ep_ar_wire`.
+    pub ep_ar_wire: hipfire_config::topology::EpArWire,
 }
 /// The physical VMM reservation equals `max_seq`; it must grow to the full
 /// card-admitted bound. Explicit overrides may exceed it by operator request.
@@ -3426,6 +3430,7 @@ pub fn admit_source_with_options(
         pp_bands,
         pp_layer_counts,
         batch_request: BatchLoadRequest::default(),
+        ep_ar_wire: Default::default(),
     })
 }
 

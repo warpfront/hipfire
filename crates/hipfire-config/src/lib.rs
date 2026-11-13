@@ -2106,6 +2106,18 @@ pub static FIELDS: &[ConfigField] = &[
         Some("HIPFIRE_TOPOLOGY_PP"),
         "Pipeline-parallel degree: 1 (default, single device) or 2..=8, for models whose carrier declares pipeline parallelism (today: Qwen3.5 and Qwen4 / Flash-Next, HFQ files only). Layers split into N contiguous stages across the first N visible devices (hardware.devices / HIPFIRE_DEVICES). An explicit load request with pp > 1 overrides this value; a request of 1 or no request uses it. Cannot combine with tensor parallelism (tp) or expert parallelism (topology.ep)."
     ),
+    field!(
+        "topology.ep_ar_wire",
+        "ep_ar_wire",
+        Hardware,
+        ModelLoad,
+        DefaultValue::String("bf16"),
+        ValueRule::Enum(topology::EP_AR_WIRES),
+        false,
+        true,
+        None,
+        "Wire format of the mixer (GDN out_proj / QSA o_proj) partials in the Flash-Next two-card trunk-shard all-reduce (topology.ep = 2 over exactly two gfx1201 cards): bf16 (default; each rank's f32 partial is rounded to bf16 before the fold) or f32 (the partials travel unrounded and the fold rounds p0 + p1 once, closer to one card at about 2% decode and prefill cost). The FFN partials always travel as bf16 (they are bf16-exact). Ignored by every other load."
+    ),
     process_field!(
         "hardware.uniform_vram_tolerance_gb",
         "uniform_vram_tolerance_gb",
@@ -10376,6 +10388,40 @@ pub mod topology {
     pub const PP_ENV: &str = "HIPFIRE_TOPOLOGY_PP";
     /// Largest pipeline-parallel degree the schema admits.
     pub const PP_MAX_DEGREE: usize = 8;
+    /// Values of `topology.ep_ar_wire`.
+    pub const EP_AR_WIRES: &[&str] = &["bf16", "f32"];
+
+    /// `topology.ep_ar_wire`: wire format of the mixer partials in the Flash-Next two-card
+    /// trunk-shard all-reduce. A typed load setting (no environment spelling): the CLI forwards it
+    /// in the load request and the loader hands it to the carrier.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+    pub enum EpArWire {
+        /// Each rank's f32 mixer partial is rounded to bf16 before the fold (the default).
+        #[default]
+        Bf16,
+        /// The mixer partials travel as f32; the fold rounds `p0 + p1` once.
+        F32,
+    }
+
+    impl EpArWire {
+        /// Parse a `topology.ep_ar_wire` value; unset or empty is the default.
+        pub fn parse(raw: Option<&str>) -> Result<Self, String> {
+            match raw.map(str::trim).filter(|v| !v.is_empty()) {
+                None | Some("bf16") => Ok(Self::Bf16),
+                Some("f32") => Ok(Self::F32),
+                Some(other) => Err(format!(
+                    "topology.ep_ar_wire = {other:?} is not a valid all-reduce wire (allowed: bf16, f32)"
+                )),
+            }
+        }
+
+        pub fn name(self) -> &'static str {
+            match self {
+                Self::Bf16 => "bf16",
+                Self::F32 => "f32",
+            }
+        }
+    }
 
     /// Pure parser behind [`ep`]: unset or empty is 1 (the default); an
     /// integer outside `1..=`[`EP_MAX_DEGREE`] is a refusal naming the range.
@@ -10604,6 +10650,46 @@ pub mod topology {
                     "{err}"
                 );
                 assert!(resolve_pp(requested, Some("0")).is_err());
+            }
+        }
+
+        #[test]
+        fn ep_ar_wire_is_a_typed_bf16_default_setting() {
+            let field = crate::FIELDS
+                .iter()
+                .find(|field| field.key == "topology.ep_ar_wire")
+                .expect("topology.ep_ar_wire is in the schema");
+            assert_eq!(
+                field.env_compat, None,
+                "a typed setting, no environment spelling"
+            );
+            assert!(matches!(field.default, crate::DefaultValue::String("bf16")));
+            for ok in EP_AR_WIRES {
+                assert!(field
+                    .validate(&crate::ConfigValue::String((*ok).to_owned()))
+                    .is_ok());
+                assert!(field.parse_cli(ok).is_ok());
+            }
+            for bad in ["fp32", "F32", "bf16 ", "dense", ""] {
+                assert!(
+                    field
+                        .validate(&crate::ConfigValue::String(bad.to_owned()))
+                        .is_err(),
+                    "{bad:?}"
+                );
+            }
+            assert_eq!(EpArWire::parse(None), Ok(EpArWire::Bf16));
+            assert_eq!(EpArWire::parse(Some("")), Ok(EpArWire::Bf16));
+            assert_eq!(EpArWire::parse(Some("bf16")), Ok(EpArWire::Bf16));
+            assert_eq!(EpArWire::parse(Some(" f32 ")), Ok(EpArWire::F32));
+            let err = EpArWire::parse(Some("fp32")).unwrap_err();
+            assert!(
+                err.contains("topology.ep_ar_wire") && err.contains("bf16, f32"),
+                "{err}"
+            );
+            assert_eq!(EpArWire::default(), EpArWire::Bf16);
+            for wire in [EpArWire::Bf16, EpArWire::F32] {
+                assert_eq!(EpArWire::parse(Some(wire.name())), Ok(wire));
             }
         }
 

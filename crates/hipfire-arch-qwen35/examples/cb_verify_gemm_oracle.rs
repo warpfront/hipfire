@@ -1402,6 +1402,7 @@ fn run() -> R<usize> {
         gemma4_draft_len: 3,
         xdna: None,
         batch_request: Default::default(),
+        ep_ar_wire: Default::default(),
     };
     let b = load_qwen35_bundle(src, &mut lc).map_err(|e| e.to_string())?;
     let dn = b

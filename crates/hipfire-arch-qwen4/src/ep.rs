@@ -1666,7 +1666,9 @@ impl Qwen4Bundle {
     /// `self` is rank 0 on `gpu`: loaded with its forward attached and bound
     /// to its load's seal ([`Qwen4Bundle::bind_ep_seal`]), from which the
     /// rank count and every rank's physical device come. `loader` builds one
-    /// peer on its worker thread (hipfire-loader supplies it). Sequence:
+    /// peer on its worker thread (hipfire-loader supplies it). `ep_ar_wire` (typed
+    /// `topology.ep_ar_wire`) picks the mixer partials' wire format under the two-card trunk
+    /// shard (ignored without it). Sequence:
     ///
     /// 1. every peer loads on its own thread; it must be bound to rank 0's
     ///    seal at its own rank on the seal's device, and its config and EP
@@ -1689,6 +1691,7 @@ impl Qwen4Bundle {
         &mut self,
         gpu: &mut Gpu,
         loader: Arc<PeerLoadFn>,
+        ep_ar_wire: hipfire_config::topology::EpArWire,
     ) -> Result<(), BundleError> {
         if self.ep.is_some() {
             return Err(ep_err("the mesh is already attached"));
@@ -1796,7 +1799,7 @@ impl Qwen4Bundle {
         let pool =
             RankPool::spawn("hipfire-qwen4-ep", inits, Qwen4EpPeer::teardown).map_err(ep_err)?;
 
-        match self.ep_attach_steps(gpu, pool, spec, trunk_layers, device_ids) {
+        match self.ep_attach_steps(gpu, pool, spec, trunk_layers, device_ids, ep_ar_wire) {
             Ok(mesh) => {
                 self.ep = Some(Box::new(mesh));
                 Ok(())
@@ -1814,6 +1817,7 @@ impl Qwen4Bundle {
         spec: EpRowGatherSpec,
         trunk_layers: usize,
         device_ids: Vec<i32>,
+        ep_ar_wire: hipfire_config::topology::EpArWire,
     ) -> Result<Qwen4EpMesh, String> {
         let ranks = spec.ranks;
         // 2. Register every rank's gather buffers, build the transport. On exact gfx1201 a
@@ -2100,6 +2104,20 @@ impl Qwen4Bundle {
             } else {
                 None
             };
+        // The mixer write's partial format (`topology.ep_ar_wire`); the FFN write always sends
+        // bf16 (its partial is already bf16-exact).
+        let mixer_wire = match ep_ar_wire {
+            hipfire_config::topology::EpArWire::Bf16 => {
+                rdna_compute::ar_hc_write::ArHcPartial::Bf16
+            }
+            hipfire_config::topology::EpArWire::F32 => rdna_compute::ar_hc_write::ArHcPartial::F32,
+        };
+        if ar_hc.is_some() {
+            eprintln!(
+                "qwen4 trunk shard: mixer all-reduce wire {} (topology.ep_ar_wire), FFN bf16",
+                ep_ar_wire.name()
+            );
+        }
 
         // 2e. Vocabulary-sharded target LM head (`HIPFIRE_QWEN4_EP_VOCAB_SHARD`, X1): every rank
         // allocates its exchange buffers (the packed shard logits and top-1 ids rank 0 reads
@@ -2376,7 +2394,13 @@ impl Qwen4Bundle {
                 result.and_then(|()| bundle.install_mtp_lane_local_moe(gpu, &head_sources));
             if result.is_ok() {
                 crate::trunk_route::install(ar_hc.as_ref().map(|exchange| {
-                    crate::trunk_route::TrunkShardRoute::new(exchange.clone(), rank, true, true)
+                    crate::trunk_route::TrunkShardRoute::new(
+                        exchange.clone(),
+                        rank,
+                        true,
+                        true,
+                        mixer_wire,
+                    )
                 }));
             }
             result

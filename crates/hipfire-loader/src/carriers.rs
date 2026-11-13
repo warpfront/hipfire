@@ -984,7 +984,9 @@ impl Carrier for Qwen4Carrier {
         // Seam: the EP mesh owner builds peer ranks 1..N-1 here, after rank 0
         // is loaded (see `attach_qwen4_ep_peers`).
         if let Some(plan) = &ep_plan {
-            if let Err(error) = attach_qwen4_ep_peers(&mut loaded.bundle, ctx.gpu, plan) {
+            if let Err(error) =
+                attach_qwen4_ep_peers(&mut loaded.bundle, ctx.gpu, plan, ctx.ep_ar_wire)
+            {
                 let _ = loaded.bundle.free_gpu(ctx.gpu);
                 return Err(error);
             }
@@ -2156,11 +2158,13 @@ pub fn open_qwen4_rank_source(
 /// order (the host-RAM check of pinned experts assumes it), each at the agreed
 /// expert split `plan.expert_vram_layers`; the mesh then builds the row-gather
 /// transport, enables P2P and installs every rank's EP tables
-/// (`Qwen4Bundle::attach_ep_mesh`).
+/// (`Qwen4Bundle::attach_ep_mesh`). `ep_ar_wire` is the load's typed `topology.ep_ar_wire`
+/// (the mixer partials' wire format under the two-card trunk shard).
 pub fn attach_qwen4_ep_peers(
     bundle: &mut hipfire_arch_qwen4::bundle::Qwen4Bundle,
     gpu: &mut rdna_compute::Gpu,
     plan: &Qwen4EpPlan,
+    ep_ar_wire: hipfire_config::topology::EpArWire,
 ) -> Result<(), String> {
     let plan = plan.clone();
     let loader: std::sync::Arc<hipfire_arch_qwen4::ep::PeerLoadFn> =
@@ -2190,7 +2194,7 @@ pub fn attach_qwen4_ep_peers(
             }
         });
     bundle
-        .attach_ep_mesh(gpu, loader)
+        .attach_ep_mesh(gpu, loader, ep_ar_wire)
         .map_err(|error| format!("qwen4: expert parallelism mesh setup failed: {error}"))
 }
 

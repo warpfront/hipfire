@@ -5162,6 +5162,9 @@ pub(crate) fn load_params(
             resolved,
             "hardware.deepseek4_compute_placement",
         )?,
+        // Typed `topology.ep_ar_wire` (no env spelling): the daemon hands it to the loader,
+        // which only the Flash-Next two-card trunk shard reads.
+        "ep_ar_wire": config_string(resolved, "topology.ep_ar_wire")?,
         "kv_mode": kv_mode,
         "kv_adaptive": config_string(resolved, "memory.kv_adaptive")?,
         "dflash_mode": config_string(resolved, "speculation.dflash")?,
@@ -13447,6 +13450,41 @@ effort = "high"
         )
         .unwrap();
         assert_eq!(params["deepseek4_compute_placement"], raw);
+    }
+
+    #[test]
+    pub(crate) fn load_params_forwards_typed_ep_ar_wire() {
+        let model = Path::new("/tmp/test-model.mq2r");
+        let params_of = |resolved: &hipfire_config::ResolvedConfig| {
+            load_params(
+                resolved,
+                None,
+                model.parent().unwrap(),
+                model,
+                64,
+                Some("q8"),
+                None,
+                None,
+                false,
+                None,
+            )
+            .unwrap()
+        };
+        let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
+        assert_eq!(params_of(&defaults)["ep_ar_wire"], "bf16");
+        let mut explicit = ConfigLayer::default();
+        explicit.set_cli("topology.ep_ar_wire", "f32").unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::OneShot {
+                argument: "topology.ep_ar_wire=f32".into(),
+            },
+            layer: explicit,
+        }])
+        .unwrap();
+        assert_eq!(params_of(&resolved)["ep_ar_wire"], "f32");
+        assert!(ConfigLayer::default()
+            .set_cli("topology.ep_ar_wire", "fp32")
+            .is_err());
     }
 
     #[test]

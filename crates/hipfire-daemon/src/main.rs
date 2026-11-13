@@ -2174,6 +2174,26 @@ fn main() {
                         continue;
                     }
                 };
+                // Typed `topology.ep_ar_wire`; absent (a client that predates it) is the default.
+                let ep_ar_wire = match hipfire_config::topology::EpArWire::parse(
+                    msg.get("params")
+                        .and_then(|p| p.get("ep_ar_wire"))
+                        .and_then(|v| v.as_str()),
+                ) {
+                    Ok(wire) => wire,
+                    Err(error) => {
+                        emit_uncorrelated_error(
+                            &mut stdout,
+                            None,
+                            &error,
+                            "validation",
+                            false,
+                            false,
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                };
                 // DeepSeek V4 experts-per-token override requires tp=1 (moved
                 // before admission so the refusal leaves the prior model intact).
                 if tp > 1 && deepseek4_experts_per_token.is_some() {
@@ -2294,6 +2314,7 @@ fn main() {
                     spec_k: ep_spec_k,
                     spec_copy: ep_spec_copy,
                 };
+                admission.ep_ar_wire = ep_ar_wire;
                 // Only tp>1 EP loads defer prior retirement. Every single-device
                 // or pp load (Qwen4/Flash-Next included) is unload-first: after
                 // admission the prior model is torn down and VMM must be clean

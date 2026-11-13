@@ -12,8 +12,9 @@
 //! run --arm ref  --model M --out DIR [--layer 0,3] [--rows 1,8,32] [--block mixer|ffn|both]
 //!                [--input synthetic[:SEED]|real] [--repeat 2] [--device 0]
 //! run --arm tp2  --model M --out DIR --input from:DIR/ref|synthetic[:SEED] --ref DIR/ref
-//!                [--devices 0,1] [--no-qualify]
+//!                [--devices 0,1] [--no-qualify] [--ep-ar-wire bf16|f32]
 //! compare --ref DIR/ref --tp DIR/tp2 [--out FILE.json] [--tol-acc X --tol-rms X --tol-scale X]
+//!         [--ep-ar-wire bf16|f32]
 //! plan    [--model M | synthetic config] [--layer .. --rows .. --route ..]   (no GPU)
 //! selftest                                                                   (no GPU)
 //! ```
@@ -48,12 +49,14 @@
 //!   them from the dumps on any box):
 //!   C0 identical block input on both ranks and on the reference;
 //!   C1 rank0 == rank1 bytes (output streams, gate logits);
-//!   C2 fold contract on the REAL partials: `|m-(p0+p1)| <= (2^-8+2^-23)(|p0|+|p1|)`;
-//!   C3 the device's fused write == host model (`ar_hc_fold` + `hc_inject[_f32]`) of the
+//!   C2 fold contract on the REAL partials: `|m-(p0+p1)| <= ArHcPartial::fold_bound` of the
+//!   mixer wire under test (`--ep-ar-wire`, default bf16: `(2^-8+2^-23)(|p0|+|p1|)`; f32:
+//!   `2^-24(|p0|+|p1|)`); pass the same `--ep-ar-wire` to `run --arm tp2` and to `compare`;
+//!   C3 the device's fused write == host model (`ArHcPartial::fold` + `hc_inject[_f32]`) of the
 //!   captured input/partials/gates, word for word (one-bf16-ulp gate neighbours, host libm vs
 //!   device `expf`, are counted as benign);
 //!   C4 `p0+p1` vs the reference block output `m_ref` within
-//!   `(2^-8+2^-23+acc)(|p0|+|p1|) + row_rms * rms(m_ref)` (this is the cut/kernel-shape
+//!   `fold_bound + acc(|p0|+|p1|) + row_rms * rms(m_ref)` (this is the cut/kernel-shape
 //!   check: a wrong head order or cut is O(|m|));
 //!   C5 EVERY HC stream element TP2 vs reference within the documented envelope (see
 //!   `check_stream_bound`);
@@ -93,7 +96,7 @@ use hipfire_arch_qwen4::lab_trunk_oracle::{
     self as oracle, Block, BlockReport, CaseSpec, Check, InputSource, RouteSel, Tolerances, TpHook,
 };
 use hipfire_runtime::ar_hc_exchange::ArHcExchange;
-use rdna_compute::ar_hc_write::{StreamKind, AR_HC_ROW_CAP};
+use rdna_compute::ar_hc_write::{ArHcPartial, StreamKind, AR_HC_ROW_CAP};
 use rdna_compute::Gpu;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -315,6 +318,13 @@ fn parse_args(raw: &[String]) -> R<Args> {
                 args.tol.row_rms = value(flag)?
                     .parse()
                     .map_err(|_| "--tol-rms X".to_string())?
+            }
+            "--ep-ar-wire" => {
+                args.tol.fold = match value(flag)?.as_str() {
+                    "bf16" => ArHcPartial::Bf16,
+                    "f32" => ArHcPartial::F32,
+                    other => return Err(format!("--ep-ar-wire `{other}` is not bf16|f32")),
+                }
             }
             "--tol-scale" => {
                 args.tol.scale = value(flag)?
@@ -711,6 +721,7 @@ fn tp_rank(
     let hook = TpHook {
         exchange: exchange.clone(),
         rank,
+        mixer: args.tol.fold,
     };
     let mut runs: CaseRuns = Vec::new();
     for case in cases {
@@ -1045,7 +1056,8 @@ fn selftest_dumps() -> R<usize> {
                 rows: 2,
                 route: RouteSel::Verify,
             };
-            let (reference, r0, r1) = oracle::synthetic_tp_case(7, 2, kind, defect);
+            let (reference, r0, r1) =
+                oracle::synthetic_tp_case(7, 2, kind, ArHcPartial::Bf16, defect);
             for (arm, ranks) in [("ref", vec![&reference]), ("tp2", vec![&r0, &r1])] {
                 let arm_dir = base.join(kind.name()).join(arm);
                 let geometry = oracle::Geometry {
