@@ -368,6 +368,64 @@ impl DspineBridge {
         })
     }
 
+    /// Serial last-write refinement over the block's head logits:
+    /// top-16 candidates per row (`dspine_topk16`), then the fused
+    /// sender-table score chain (`dspine_serial_chain`) walked from
+    /// the anchor. `logits` is the [rows, vocab] device block produced
+    /// by the batched lm_head (rows = block_size - 1; the seed row is
+    /// not refined). The per-row queries live in `s_packed` (stride
+    /// 3R) and the rms in `s_rms`, both left by the bridged forward.
+    /// Returns the picked id per row in chain order; the caller
+    /// prepends the seed token.
+    pub fn serial_refine(
+        &self,
+        gpu: &mut Gpu,
+        logits: &GpuTensor,
+        rows: usize,
+    ) -> hip_bridge::HipResult<Vec<u32>> {
+        let tables = match self.serial.as_ref() {
+            Some(t) => t,
+            None => {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    "serial_refine on a sidecar without TG/TSV tables",
+                ));
+            }
+        };
+        let vocab = self.cfg.trunk.vocab_size;
+        let cand = gpu.alloc_tensor(&[rows, 16], rdna_compute::DType::Raw)?;
+        let base = gpu.alloc_tensor(&[rows, 16], rdna_compute::DType::F32)?;
+        let out = gpu.alloc_tensor(&[rows], rdna_compute::DType::Raw)?;
+        let pick = (|| -> hip_bridge::HipResult<Vec<u32>> {
+            gpu.dspine_topk16(logits, &cand, &base, rows, vocab)?;
+            let anchor_raw = gpu.download_f32(&self.s_anchor)?;
+            let anchor_sid = anchor_raw[0].to_bits();
+            gpu.dspine_serial_chain(
+                &base,
+                &cand,
+                &self.s_rms,
+                &self.s_packed,
+                &tables.tsv_gate,
+                &tables.tsv_val,
+                &tables.tg,
+                &self.gate_bias,
+                anchor_sid,
+                &out,
+                rows,
+                16,
+                self.r,
+                self.t,
+                3 * self.r,
+            )?;
+            let raw = gpu.download_f32(&out)?;
+            Ok(raw.iter().map(|f| f.to_bits()).collect())
+        })();
+        let _ = gpu.free_tensor(cand);
+        let _ = gpu.free_tensor(base);
+        let _ = gpu.free_tensor(out);
+        pick
+    }
+
     /// The prebuilt sender tables, when the sidecar carried them.
     pub fn serial(&self) -> Option<&SerialTables> {
         self.serial.as_ref()

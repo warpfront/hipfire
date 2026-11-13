@@ -457,7 +457,7 @@ fn main() {
 
         gpu.dspine_serial_chain(
             &base_t, &cand_t, &rms_t, &q_t, &sg_t, &sv_t, &tg_t, &gb_t,
-            anchor_sid, &out_t, n, k, R, T,
+            anchor_sid, &out_t, n, k, R, T, R,
         )
         .map_err(|e| format!("{e}"))?;
         let raw = gpu.download_f32(&out_t).map_err(|e| format!("{e}"))?;
@@ -468,6 +468,92 @@ fn main() {
         );
         for (i, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
             assert_eq!(g, w, "serial_chain[{i}] {g} vs {w}");
+        }
+        for t in [base_t, cand_t, rms_t, q_t, sg_t, sv_t, tg_t, gb_t, out_t] {
+            gpu.free_tensor(t).map_err(|e| format!("{e}"))?;
+        }
+        Ok::<(), String>(())
+    });
+
+
+    test!("topk16: per-row top-k matches a host sort", {
+        let rows = 4usize;
+        let v = 1024usize;
+        let logits: Vec<f32> = prng(97, rows * v);
+        let l_t = gpu.upload_f32(&logits, &[rows, v]).map_err(|e| format!("{e}"))?;
+        let cand_t = gpu.alloc_tensor(&[rows, 16], DType::Raw).map_err(|e| format!("{e}"))?;
+        let base_t = gpu.alloc_tensor(&[rows, 16], DType::F32).map_err(|e| format!("{e}"))?;
+
+        gpu.dspine_topk16(&l_t, &cand_t, &base_t, rows, v)
+            .map_err(|e| format!("{e}"))?;
+        let raw_ids = gpu.download_f32(&cand_t).map_err(|e| format!("{e}"))?;
+        let got_ids: Vec<u32> = raw_ids.iter().map(|f| f.to_bits()).collect();
+        let got_base = gpu.download_f32(&base_t).map_err(|e| format!("{e}"))?;
+
+        for r in 0..rows {
+            // The kernel emits the top-16 in descending score order; the
+            // PRNG makes exact ties vanishingly unlikely, so a plain host
+            // sort pins the same order.
+            let row = &logits[r * v..(r + 1) * v];
+            let mut idx: Vec<usize> = (0..v).collect();
+            idx.sort_by(|&a, &b| row[b].partial_cmp(&row[a]).unwrap());
+            for i in 0..16 {
+                assert_eq!(
+                    got_ids[r * 16 + i], idx[i] as u32,
+                    "topk16 row {r} slot {i}"
+                );
+                assert_eq!(got_base[r * 16 + i], row[idx[i]], "topk16 base row {r} slot {i}");
+            }
+        }
+        for t in [l_t, cand_t, base_t] {
+            gpu.free_tensor(t).map_err(|e| format!("{e}"))?;
+        }
+        Ok::<(), String>(())
+    });
+
+
+    test!("serial_chain: partial tail block respects the N guard", {
+        let n = 20usize;
+        let k = 16usize;
+        let v = V;
+        let base: Vec<f32> = prng(101, n * k);
+        let cand: Vec<u32> = prng(103, n * k)
+            .iter()
+            .map(|&x| ((x * 0.5 + 0.5) * (v as f32 - 1.0)) as u32)
+            .collect();
+        let rms: Vec<f32> = prng(107, n).iter().map(|&x| x.abs() * 0.5 + 0.1).collect();
+        let query = prng(109, n * R);
+        let tsv_gate = prng(113, v * R);
+        let tsv_val = prng(127, v * R);
+        let tg = prng(131, v * R);
+        let bias = prng(137, R);
+        let anchor_sid: u32 = 4096;
+
+        let base_t = gpu.upload_f32(&base, &[n, k]).map_err(|e| format!("{e}"))?;
+        let cand_t = gpu
+            .upload_raw(&cand.iter().flat_map(|c| c.to_le_bytes()).collect::<Vec<u8>>(), &[n, k])
+            .map_err(|e| format!("{e}"))?;
+        let rms_t = gpu.upload_f32(&rms, &[n]).map_err(|e| format!("{e}"))?;
+        let q_t = gpu.upload_f32(&query, &[n, R]).map_err(|e| format!("{e}"))?;
+        let sg_t = gpu.upload_f32(&tsv_gate, &[v, R]).map_err(|e| format!("{e}"))?;
+        let sv_t = gpu.upload_f32(&tsv_val, &[v, R]).map_err(|e| format!("{e}"))?;
+        let tg_t = gpu.upload_f32(&tg, &[v, R]).map_err(|e| format!("{e}"))?;
+        let gb_t = gpu.upload_f32(&bias, &[R]).map_err(|e| format!("{e}"))?;
+        let out_t = gpu.alloc_tensor(&[n], DType::Raw).map_err(|e| format!("{e}"))?;
+
+        gpu.dspine_serial_chain(
+            &base_t, &cand_t, &rms_t, &q_t, &sg_t, &sv_t, &tg_t, &gb_t,
+            anchor_sid, &out_t, n, k, R, T, R,
+        )
+        .map_err(|e| format!("{e}"))?;
+        let raw = gpu.download_f32(&out_t).map_err(|e| format!("{e}"))?;
+        let got: Vec<u32> = raw.iter().map(|f| f.to_bits()).collect();
+        let want = cpu_oracle::serial_chain(
+            &base, &cand, &rms, &query, &tsv_gate, &tsv_val, &tg, &bias,
+            anchor_sid, n, k, R, T, v,
+        );
+        for (i, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
+            assert_eq!(g, w, "partial serial_chain[{i}] {g} vs {w}");
         }
         for t in [base_t, cand_t, rms_t, q_t, sg_t, sv_t, tg_t, gb_t, out_t] {
             gpu.free_tensor(t).map_err(|e| format!("{e}"))?;

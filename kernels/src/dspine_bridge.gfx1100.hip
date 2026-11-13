@@ -220,7 +220,9 @@ __global__ void dspine_serial_chain_gfx1100(
     unsigned int* __restrict__ draft_ids,
     int K,
     int R,
-    int T
+    int T,
+    int packed_stride,
+    int N
 ) {
     const int block_idx = blockIdx.x;
     const int tid = threadIdx.x;
@@ -240,6 +242,7 @@ __global__ void dspine_serial_chain_gfx1100(
     const int cand_sub_elems = R / 16;
     for (int r = 0; r < T; ++r) {
         const int row = block_idx * T + r;
+        if (row >= N) break;  // partial tail block: all threads exit together
         // 1. sender contribution for this row: sigmoid(query + TSV_gate[sid]
         //    + bias) * TSV_val[sid], R-wide (256 threads × 2 elements).
         const unsigned int sid = s_sid;
@@ -250,7 +253,7 @@ __global__ void dspine_serial_chain_gfx1100(
                 if (j < R) {
                     const long long s_off = (long long)sid * R;
                     const float gate = 1.0f /
-                        (1.0f + expf(-(query[(long long)row * R + j]
+                        (1.0f + expf(-(query[(long long)row * packed_stride + j]
                                        + tsv_gate[s_off + j]
                                        + gate_bias[j])));
                     s_sender[j] = gate * tsv_val[s_off + j];
@@ -292,5 +295,78 @@ __global__ void dspine_serial_chain_gfx1100(
             draft_ids[row] = picked;
         }
         __syncthreads();
+    }
+}
+
+// Per-row top-16 over [rows, V] logits with the gathered base scores: the
+// serial refinement's candidate shortlist. Phase 1: each of 256 threads
+// scans a V/256 slice keeping a local 16-slot insertion list; phase 2:
+// thread 0 merges the 4096 survivors. First-seen (lowest) index wins ties,
+// matching argmax_f32_batched's first-max semantics.
+__global__ void dspine_topk16_gfx1100(
+    const float* __restrict__ logits,
+    unsigned int* __restrict__ cand,
+    float* __restrict__ base_out,
+    int V)
+{
+    const int row = blockIdx.x;
+    const float* l = logits + (long long)row * V;
+    __shared__ float s_vals[256 * 16];
+    __shared__ unsigned int s_ids[256 * 16];
+
+    const int tid = threadIdx.x;
+    const int slice = (V + 255) / 256;
+    float vals[16];
+    unsigned int ids[16];
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) { vals[i] = -3.0e38f; ids[i] = 0u; }
+    const int lo = tid * slice;
+    const int hi = min(lo + slice, V);
+    for (int i = lo; i < hi; ++i) {
+        const float v = l[i];
+        if (v > vals[15]) {
+            int p = 15;
+            #pragma unroll
+            for (int q = 0; q < 15; ++q) {
+                if (!(vals[p - 1] < v)) break;
+                vals[p] = vals[p - 1];
+                ids[p] = ids[p - 1];
+                --p;
+            }
+            vals[p] = v;
+            ids[p] = (unsigned int)i;
+        }
+    }
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        s_vals[tid * 16 + i] = vals[i];
+        s_ids[tid * 16 + i] = ids[i];
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        float m_vals[16];
+        unsigned int m_ids[16];
+        #pragma unroll
+        for (int i = 0; i < 16; ++i) { m_vals[i] = -3.0e38f; m_ids[i] = 0u; }
+        for (int i = 0; i < 256 * 16; ++i) {
+            const float v = s_vals[i];
+            if (v > m_vals[15]) {
+                int p = 15;
+                #pragma unroll
+                for (int q = 0; q < 15; ++q) {
+                    if (!(m_vals[p - 1] < v)) break;
+                    m_vals[p] = m_vals[p - 1];
+                    m_ids[p] = m_ids[p - 1];
+                    --p;
+                }
+                m_vals[p] = v;
+                m_ids[p] = s_ids[i];
+            }
+        }
+        for (int i = 0; i < 16; ++i) {
+            cand[(long long)row * 16 + i] = m_ids[i];
+            base_out[(long long)row * 16 + i] = m_vals[i];
+        }
     }
 }

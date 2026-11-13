@@ -265,6 +265,7 @@ impl Gpu {
         k: usize,
         r: usize,
         t: usize,
+        packed_stride: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
         if !self.arch_caps.is_gfx1100() {
@@ -289,6 +290,8 @@ impl Gpu {
         let mut k_val = k as i32;
         let mut r_val = r as i32;
         let mut t_val = t as i32;
+        let mut ps_val = packed_stride as i32;
+        let mut n_val = n as i32;
 
         let mut params: Vec<*mut c_void> = vec![
             &mut base_ptr as *mut _ as *mut c_void,
@@ -304,10 +307,12 @@ impl Gpu {
             &mut k_val as *mut _ as *mut c_void,
             &mut r_val as *mut _ as *mut c_void,
             &mut t_val as *mut _ as *mut c_void,
+            &mut ps_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
         ];
         self.launch_maybe_blob(
             SYM,
-            [(n / t) as u32, 1, 1],
+            [((n + t - 1) / t) as u32, 1, 1],
             [256, 1, 1],
             512 * 4 + 16 * 16 * 4 + 16 * 4,
             &mut params,
@@ -326,8 +331,61 @@ impl Gpu {
                 b.push_i32(k_val);
                 b.push_i32(r_val);
                 b.push_i32(t_val);
+                b.push_i32(ps_val);
+                b.push_i32(n_val);
                 b
             },
         )
     }
+
+
+    /// Per-row top-16 over [rows, V] with gathered base scores: the serial
+    /// refinement's candidate shortlist (see `dspine_topk16_gfx1100`).
+    pub fn dspine_topk16(
+        &mut self,
+        logits: &GpuTensor,
+        cand: &GpuTensor,
+        base: &GpuTensor,
+        rows: usize,
+        v: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !self.arch_caps.is_gfx1100() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "dspine bridge kernels are gfx1100-only in v1",
+            ));
+        }
+        const SYM: &str = "dspine_topk16_gfx1100";
+        self.ensure_kernel(SYM, DSPINE_SRC, SYM)?;
+
+        let mut l_ptr = logits.buf.as_ptr();
+        let mut cand_ptr = cand.buf.as_ptr();
+        let mut base_ptr = base.buf.as_ptr();
+        let mut v_val = v as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut l_ptr as *mut _ as *mut c_void,
+            &mut cand_ptr as *mut _ as *mut c_void,
+            &mut base_ptr as *mut _ as *mut c_void,
+            &mut v_val as *mut _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            SYM,
+            [rows as u32, 1, 1],
+            [256, 1, 1],
+            256 * 16 * 4 * 2,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(l_ptr);
+                b.push_ptr(cand_ptr);
+                b.push_ptr(base_ptr);
+                b.push_i32(v_val);
+                b
+            },
+        )
+    }
+
+
 }

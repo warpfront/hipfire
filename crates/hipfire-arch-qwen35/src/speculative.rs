@@ -7971,7 +7971,7 @@ pub fn draft_dflash_block_rank(
     draft_ffn_graph: bool,
     seed_token: u32,
     vocab: usize,
-    bridge: Option<&mut DspineBridge>,
+    mut bridge: Option<&mut DspineBridge>,
 ) -> HipResult<Vec<u32>> {
     let b = block.len();
     let h = draft_cfg.hidden;
@@ -7988,7 +7988,7 @@ pub fn draft_dflash_block_rank(
         compact_offset,
         ctx_slice,
         draft_ffn_graph,
-        bridge,
+        bridge.as_deref_mut(),
     )?;
     let mut drafted: Vec<u32> = vec![seed_token];
     let w_out = &target_weights.output;
@@ -8059,6 +8059,16 @@ pub fn draft_dflash_block_rank(
                 // Always rejected: every cycle commits exactly one target token.
                 drafted[1..].fill(vocab as u32 - 1);
             }
+        } else if let Some(dspine) = bridge
+            .as_deref_mut()
+            .filter(|b| b.serial().is_some())
+        {
+            // Arch-24 serial refinement: the top-16 shortlist and the
+            // fused sender-table chain replace the plain argmax walk;
+            // the bridged forward already left query/rms in the
+            // bridge scratch and the anchor holds the seed token.
+            drafted = vec![seed_token];
+            drafted.extend(dspine.serial_refine(gpu, &logits_batch, batch)?);
         } else {
             // GPU argmax over (B-1) rows — one kernel, small D2H.
             let argmax_buf = verify_scratch.argmax.sub_offset(0, batch);
