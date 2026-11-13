@@ -14,9 +14,11 @@
 //! * six double-buffer variants (`pp pp_d4 pp_xp2 pp_gm1 xall xall_pp`) were refused with
 //!   VMEM->VMEM WAWs. The gfx942 in-order VGPR-write proof now discharges same
 //!   non-sampler VMEM_READ_ACCESS pairs, independently of scalar path feasibility.
-//!   Their immutable three-entry bundles must seal and reverify without rewriting
-//!   any device ELF bytes. The old first refusal remains below as historical evidence,
-//!   not an allowlist or a positive numerical/kernel qualification;
+//!   `pp pp_xp2 pp_gm1` now seal and reverify all three entries without rewriting
+//!   device ELF bytes; `pp_d4 xall xall_pp` advance to the unchanged 512-state
+//!   cap on both GEMM entries (descriptor still seals). These exact outcomes are
+//!   pinned below. Old WAWs remain historical evidence, not an allowlist or a
+//!   positive numerical/kernel qualification;
 //! * `d8 relay relay_xp1` exceeded the 512-states-per-label cap (unchanged cap);
 //! * `xp3_fs` was refused for an `s_barrier` with LGKM not drained.
 //!
@@ -502,7 +504,7 @@ fn assert_refused(case: &Case, class: &[&str]) -> String {
 }
 
 #[test]
-fn mandatory_six_double_buffer_variants_seal_with_ordered_vmem_writeback() {
+fn mandatory_six_double_buffer_variants_have_pinned_ordered_writeback_outcomes() {
     for case in waw_refusals() {
         let Recorded::Waw {
             first_refusal,
@@ -511,6 +513,28 @@ fn mandatory_six_double_buffer_variants_seal_with_ordered_vmem_writeback() {
         else {
             unreachable!()
         };
+        let cap_label = match case.name {
+            "pp" | "pp_xp2" | "pp_gm1" => None,
+            "pp_d4" => Some("L491"),
+            "xall" => Some("L1258"),
+            "xall_pp" => Some("L1895"),
+            other => panic!("unrecorded double-buffer outcome: {other}"),
+        };
+        if let Some(label) = cap_label {
+            let now = assert_refused(
+                &case,
+                &[
+                    "more than 512 distinct in-flight memory states reach label",
+                    "path-sensitive state explosion",
+                ],
+            );
+            assert!(
+                now.contains(&format!("label `{label}`")),
+                "{}: {now}",
+                case.name
+            );
+            continue;
+        }
         let sealed = seal_many(case.bytes, Arch::Gfx942, &specs()).unwrap_or_else(|e| {
             panic!(
                 "{}: ordered VMEM proof did not discharge `{first_refusal}` \
