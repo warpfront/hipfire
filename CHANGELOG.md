@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- PeaceMaker gfx942: bind the frozen rows16-grid, MoE-wide and MoE-GEMM twins to full exact-image MI300X oracles (770/582/276 cases, 17/28/18 detected controls; no failures or guard clobbers), matching full source-arm baselines, source/binary/ledger hashes and fresh-seal family regressions. The MoE router oracle checks legal racy fault records and exact single-fault reruns without changing inputs or anchors.
 - PeaceMaker gfx942: strictly seal the unchanged four-entry MoE-wide image after compare/GE_U64/LDS-OR qualification, and pin its real positive ledger and HIP/HSA ABI inventory. Advance both immutable QSA FP8-prologue negative pins to the actual next unsupported packed-FP8 conversion; the original five-entry hardware claim remains unchanged.
 - PeaceMaker gfx942: seal both frozen single-row QSA attention entries (F32 and FP8-FNUZ) byte-identically. Bind the exact device ELF to the full MI300X oracle (1,200 cases, 12 detected corruption controls, zero mismatches or guard clobbers), fresh-seal family tests, positive wait-ledger rows and live-launcher ABI inventory; no source, instruction or dispatch rewrite.
 - PeaceMaker gfx942: seal all four frozen MQ2 xbatch lm-head entries byte-identically after proving VM-drain continuation equivalence. Bind the exact native image to the full MI300X oracle (864 cases, zero failures or guard clobbers), fresh-seal family tests, positive ledger rows and live-launcher ABI inventory. No anchor, wait, production dispatch or state-cap changes.

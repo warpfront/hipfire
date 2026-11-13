@@ -311,5 +311,44 @@
   "symbols": [
     "qwen4_g942_moe_gemm_f32",
     "qwen4_g942_moe_gemm_xbf16"
-  ]
+  ],
+  "gpu_oracle": {
+    "status": "PASS",
+    "input_hxaco_sha256": "6241c2fc0361e07578b32c9484e398525776065f3e60d0a04fdb3af67391759f",
+    "hipcc_image_sha256": "740fddb9e0e03ff9c7dc6fa782b20d44e06f5fe9758f4fee741e0d9c0c8598e4",
+    "pm_device_elf_sha256": "116e454a721b9264a3331e5bb7e3a220517826c8c295b00827872b2c1a0dc1b2",
+    "hipcc_device_elf_sha256": "116e454a721b9264a3331e5bb7e3a220517826c8c295b00827872b2c1a0dc1b2",
+    "device_image_path": "/scratch/quant/fn-fp8/beat/WC8/twine/moe-gemm.elf",
+    "raw_log_sha256": "1013e8dfa3a0316162277cea1ecd3bab55793fb4d493c24d394e9686626bcc8b",
+    "raw_receipt_sha256": "5163502b96a26b5304d20be9841bfbe1bd67398ef7da681e281d9818376b8fda",
+    "ledger": {
+      "owner": "TwinWide942f.twins",
+      "class": "oracle",
+      "start": "2026-11-13T01:40:23+00:00",
+      "end": "2026-11-13T01:41:32+00:00",
+      "wait_s": 1082,
+      "run_s": 69,
+      "exit": 0,
+      "cmd": "bash /scratch/quant/fn-fp8/beat/WC8/twine/run-twins-successor.sh"
+    },
+    "binary_sha256": "37a43c6790fb717c0748f891497a463455e5e117deffacf98dfd155279406b2a",
+    "oracle_source_path": "crates/rdna-compute/examples/qwen4_g942_moe_gemm_oracle.rs",
+    "oracle_source_sha256": "10ad352769232e3bf71c758ef2277baf79728404238bf09190d1a4285c7cea4b",
+    "source_root": "67fba54eed28045acc350778992ea20899ec1c05",
+    "source_oracle": {
+      "raw_log_sha256": "524104d7c24a870024f53bfd909ddafc48c51fb20a4bbecbed8cb1708e91da41",
+      "raw_receipt_sha256": "f960e2d6e638b31c39207f14f4c82cd4e8597d11a95c762c32400a9e2c545110",
+      "ledger": {
+        "owner": "TwinWide942f.moesource2",
+        "class": "oracle",
+        "start": "2026-11-13T01:39:14+00:00",
+        "end": "2026-11-13T01:40:22+00:00",
+        "wait_s": 1112,
+        "run_s": 68,
+        "exit": 0,
+        "cmd": "bash /scratch/quant/fn-fp8/beat/WC8/twine/run-moe-source-successor.sh"
+      }
+    },
+    "oracle_common_sha256": "d8e67e703a1616e9b76323d81dd974af5ffa8342f2782ca8a206d9c396b68cc5"
+  }
 }

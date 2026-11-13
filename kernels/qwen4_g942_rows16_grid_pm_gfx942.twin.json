@@ -409,5 +409,43 @@
   "symbols": [
     "qwen4_g942_rows16_grid",
     "qwen4_g942_rows16_grid_x2"
-  ]
+  ],
+  "gpu_oracle": {
+    "status": "PASS",
+    "input_hxaco_sha256": "30a37e77936fbf37e2ed0e74e7b39155b57c02f4aab650d369af2fbfa96edd19",
+    "hipcc_image_sha256": "75a775653ad9833cd6e93b9ba6ac25b6121ae91ee6c62d4d3fd0cd38fddc31b5",
+    "pm_device_elf_sha256": "694829847c2d50f0b74198ce5437cb2e31cca3eed261ed979d4c9c75ab2627d4",
+    "hipcc_device_elf_sha256": "694829847c2d50f0b74198ce5437cb2e31cca3eed261ed979d4c9c75ab2627d4",
+    "device_image_path": "/scratch/quant/fn-fp8/beat/WC8/twine/rows16-grid.elf",
+    "raw_log_sha256": "34aa41978d4d9e291b0653af944dc5ffcee3f5918325b860f50b985708ad49d9",
+    "raw_receipt_sha256": "bea4bc149b73ffdb084d75828ff63dbb7c1902140c1e2187c359f22f4492aa69",
+    "ledger": {
+      "owner": "TwinWide942f.twins",
+      "class": "oracle",
+      "start": "2026-11-13T01:40:23+00:00",
+      "end": "2026-11-13T01:41:32+00:00",
+      "wait_s": 1082,
+      "run_s": 69,
+      "exit": 0,
+      "cmd": "bash /scratch/quant/fn-fp8/beat/WC8/twine/run-twins-successor.sh"
+    },
+    "binary_sha256": "452c02e2caec2c53f9746e1d7e1dd7ed9eb4ccb2ea024fb36e11f597e10c7da7",
+    "oracle_source_path": "crates/hipfire-arch-qwen4/examples/qwen4_g942_rows16_grid_oracle.rs",
+    "oracle_source_sha256": "bf351be7bac96bfb2d7b845305c36175583a66ee61391bd1c6e3ed3e75adca7c",
+    "source_root": "bd842550f302a3058085f4c656017ff396d0c551",
+    "source_oracle": {
+      "raw_log_sha256": "189436dc0e19a061f2753539fe4a49b4ffcdd014aac42b6b07fc635c053d9c27",
+      "raw_receipt_sha256": "eb8dc1c70fd9a236e9c1f0dadc777a1ab2e42fe68dc8b0faae153ad8550a3f19",
+      "ledger": {
+        "owner": "TwinWide942f.source",
+        "class": "oracle",
+        "start": "2026-11-13T01:03:07+00:00",
+        "end": "2026-11-13T01:03:31+00:00",
+        "wait_s": 0,
+        "run_s": 24,
+        "exit": 0,
+        "cmd": "bash /scratch/quant/fn-fp8/beat/WC8/twine/run-source-successor.sh"
+      }
+    }
+  }
 }

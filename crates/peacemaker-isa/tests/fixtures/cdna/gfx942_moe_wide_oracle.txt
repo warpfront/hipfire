@@ -1,0 +1,21 @@
+[hip-bridge] GPU_PINNED_MIN_XFER_SIZE=100000: pageable weight copies staged out of reclaim
+GPU dev 0: gfx942 (205.8 GB VRAM, HIP 7.16)
+  pre-compiled kernels: /scratch/quant/fn-fp8/beat/WC8/twine/kcache/gfx942
+[rocblas] loaded for gfx942
+module arm: code object /scratch/quant/fn-fp8/beat/WC8/twine/moe-wide.elf (HIPFIRE_QWEN4_G942_MOE_WIDE_IMAGE)
+[g942-fold-moe] wide router (wave64 per token) active (HIPFIRE_QWEN4_G942_FOLD_MOE)
+router: cumulative PASS 264 FAIL 0
+[g942-fold-moe] fold 1 (ranks + prefix + scatter + tile descriptors) active (HIPFIRE_QWEN4_G942_FOLD_MOE)
+[g942-fold-moe] wide scatter (mask + popcount grouping + tile descriptors) active (HIPFIRE_QWEN4_G942_FOLD_MOE)
+[g942-fold-moe] fold 2 (unscatter-silu + shared activation) active (HIPFIRE_QWEN4_G942_FOLD_MOE)
+[g942-fold-moe] wide unscatter (slot-major unscatter-silu + shared activation) active (HIPFIRE_QWEN4_G942_FOLD_MOE)
+[g942-fold-moe] fold 3 (combine + shared add) active (HIPFIRE_QWEN4_G942_FOLD_MOE)
+[g942-fold-moe] wide combine (batched rank gathers + shared add) active (HIPFIRE_QWEN4_G942_FOLD_MOE)
+scatter + chain: cumulative PASS 552 FAIL 0
+beyond-640 chain: cumulative PASS 582 FAIL 0
+RESULT cases PASS 582 FAIL 0 | controls DETECTED 28 MISSED 0
+  combine: PASS 49 FAIL 0
+  router: PASS 264 FAIL 0
+  scatter: PASS 169 FAIL 0
+  unscatter: PASS 100 FAIL 0
+PASS

@@ -802,5 +802,44 @@
     "qwen4_g942_moe_wide_group_scatter_desc",
     "qwen4_g942_moe_wide_unscatter_act",
     "qwen4_g942_moe_wide_combine_shared_add"
-  ]
+  ],
+  "gpu_oracle": {
+    "status": "PASS",
+    "input_hxaco_sha256": "ad6e1c31eaf0d6b6af344e5aa2dbbf43f36ddd9ffef828b9ee1d91733c732676",
+    "hipcc_image_sha256": "892b48a01c9a3f3a59a756609c9bde02e9a1de1eb8e4f4fb9e3f7dad8d2bc6a5",
+    "pm_device_elf_sha256": "ffcd2dc8ac4c35eb5bb42a2b0e36259d12f142db897e62e9e8af06377662cf51",
+    "hipcc_device_elf_sha256": "ffcd2dc8ac4c35eb5bb42a2b0e36259d12f142db897e62e9e8af06377662cf51",
+    "device_image_path": "/scratch/quant/fn-fp8/beat/WC8/twine/moe-wide.elf",
+    "raw_log_sha256": "6c7008d66a35f23eea01d677fa9fae1679fb2e5279e7739b9a702f10e6125410",
+    "raw_receipt_sha256": "ae4eefc58b36cd6fc98c178a49824f1c9852c15e99d38e3d86c8ca289c8f10c4",
+    "ledger": {
+      "owner": "TwinWide942f.twins",
+      "class": "oracle",
+      "start": "2026-11-13T01:40:23+00:00",
+      "end": "2026-11-13T01:41:32+00:00",
+      "wait_s": 1082,
+      "run_s": 69,
+      "exit": 0,
+      "cmd": "bash /scratch/quant/fn-fp8/beat/WC8/twine/run-twins-successor.sh"
+    },
+    "binary_sha256": "2b029d0dcf7e864df5620acb91cf7dc8d1f6aa99c7b8454fbaebeda88f23c317",
+    "oracle_source_path": "crates/rdna-compute/examples/qwen4_g942_moe_wide_oracle.rs",
+    "oracle_source_sha256": "9f7b36f02116055a020f15c2e2449102dca540fb6b8afe110e6ce553fba3c624",
+    "source_root": "67fba54eed28045acc350778992ea20899ec1c05",
+    "source_oracle": {
+      "raw_log_sha256": "6ca8466dc06aba32492cb4f2f2bcbca79211a89c9939d73c878c5ef135d442d1",
+      "raw_receipt_sha256": "3dee839fe1aff5f02b48e968bdd1c08a97ecc2befad11385b407a059513f465a",
+      "ledger": {
+        "owner": "TwinWide942f.moesource2",
+        "class": "oracle",
+        "start": "2026-11-13T01:39:14+00:00",
+        "end": "2026-11-13T01:40:22+00:00",
+        "wait_s": 1112,
+        "run_s": 68,
+        "exit": 0,
+        "cmd": "bash /scratch/quant/fn-fp8/beat/WC8/twine/run-moe-source-successor.sh"
+      }
+    },
+    "oracle_common_sha256": "d8e67e703a1616e9b76323d81dd974af5ffa8342f2782ca8a206d9c396b68cc5"
+  }
 }
