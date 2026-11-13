@@ -4359,6 +4359,7 @@ pub fn generate_muse_glimmer(
     reasoning_effort: Option<&str>,
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    request_seed: u32,
 ) {
     let _ = think_mode;
     // max_think_tokens semantics: 1=no-think (ignored for Glimmer; strength from effort), 0=uncapped, N=cap N reasoning tokens then force-close.
@@ -4801,10 +4802,8 @@ pub fn generate_muse_glimmer(
     let prefill_ms = t0.elapsed().as_millis();
 
     // ── Decode loop. Sample host-side from the running logits vector. ──
-    let seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0x9E3779B97F4A7C15);
+    // request_seed: the wire `seed` when given, else a fresh per-attempt seed.
+    let seed = request_seed as u64;
     let mut rng = deepseek4::sampling::Xorshift::new(seed);
 
     let mut generated_count: usize = 0;
@@ -6135,6 +6134,7 @@ pub fn generate_lfm2moe(
     max_think_tokens: usize,
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    request_seed: u32,
 ) {
     if m.tokenizer.is_none() {
         emit_active_attempt_error(
@@ -6417,11 +6417,7 @@ pub fn generate_lfm2moe(
     // Without this, the loop would run for the full `max_tokens` of wasted
     // work after the HTTP client has already timed out and sent `abort`.
     // ──
-    let seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0x9E3779B97F4A7C15);
-    let mut rng = deepseek4::sampling::Xorshift::new(seed);
+    let mut rng = deepseek4::sampling::Xorshift::new(request_seed as u64);
 
     // LFM2.5 tool calls arrive inside dedicated special tokens
     // (\x3C\x7Ctool_call_start\x7C\x3E / \x3C\x7Ctool_call_end\x7C\x3E as
@@ -6700,6 +6696,7 @@ pub fn generate_minimax(
     max_think_tokens: usize,
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    request_seed: u32,
 ) {
     if m.tokenizer.is_none() {
         emit_active_attempt_error(
@@ -7050,13 +7047,8 @@ pub fn generate_minimax(
 
     // ── Decode loop. Sample host-side from the running logits vector.
     // `temp <= 0` makes sample_token greedy; otherwise top_p nucleus.
-    // Seed the PRNG from wall-clock nanos so successive same-prompt runs
-    // don't lock-step (greedy is still deterministic). ──
-    let seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0x9E3779B97F4A7C15);
-    let mut rng = deepseek4::sampling::Xorshift::new(seed);
+    // request_seed honours the wire `seed` (greedy stays deterministic). ──
+    let mut rng = deepseek4::sampling::Xorshift::new(request_seed as u64);
 
     let mut generated_count: usize = 0;
     let decode_t0 = Instant::now();
@@ -7182,6 +7174,7 @@ pub fn generate_cohere2moe(
     max_think_tokens: usize,
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    request_seed: u32,
 ) {
     if m.tokenizer.is_none() {
         emit_active_attempt_error(
@@ -7541,13 +7534,8 @@ pub fn generate_cohere2moe(
 
     // ── Decode loop. Sample host-side from the running logits vector.
     // `temp <= 0` makes sample_token greedy; otherwise top_p nucleus.
-    // Seed the PRNG from wall-clock nanos so successive same-prompt runs
-    // don't lock-step (greedy is still deterministic). ──
-    let seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0x9E3779B97F4A7C15);
-    let mut rng = deepseek4::sampling::Xorshift::new(seed);
+    // request_seed honours the wire `seed` (greedy stays deterministic). ──
+    let mut rng = deepseek4::sampling::Xorshift::new(request_seed as u64);
 
     // Cohere agentic markers are SPECIAL TOKENS. Resolve their ids once (scoped
     // borrow so the loop can still mutate `m`). This model emits <|START_TEXT|>
