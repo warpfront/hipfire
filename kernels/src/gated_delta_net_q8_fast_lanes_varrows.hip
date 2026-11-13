@@ -48,6 +48,15 @@
 #define HIPFIRE_GDN_KERNEL gated_delta_net_q8_fast
 #endif
 
+// permlanex16 is a gfx10+ instruction; GCN/CDNA (gfx906, gfx94x) builds reject
+// it ("needs target feature gfx10-insts"). Those targets keep the shfl_down
+// tree below, which has the same reduction order, so every arch compiles the
+// one source (#1136).
+#if defined(HIPFIRE_GDN_DPP_REDUCE) \
+    && !(defined(__GFX10__) || defined(__GFX11__) || defined(__GFX12__))
+#undef HIPFIRE_GDN_DPP_REDUCE
+#endif
+
 #if defined(HIPFIRE_GDN_DPP_REDUCE)
 // Preserve the shipping shfl_down reduction order while replacing its LDS
 // bpermutes with gfx11 VALU cross-lane operations. Only lane 0 is consumed.
