@@ -800,6 +800,10 @@ pub(crate) struct BenchArgs {
     /// Speculation mode to benchmark (off, dflash, mtp, ngram, dspark, or auto).
     #[arg(long = "spec")]
     speculation: Option<String>,
+    /// Draft sidecar path for the benchmark load (pairs with `--spec dflash`;
+    /// defaults the selector to dflash exactly like `run --model-draft`).
+    #[arg(long, value_name = "FILE")]
+    model_draft: Option<PathBuf>,
     /// Let the model think during the benchmark. Off by default: a reasoning
     /// model cannot close its `<think>` span inside the benchmark's token
     /// budget, and the daemon fails such a turn closed as a validation error.
@@ -7771,6 +7775,12 @@ fn open_bench_engine(
         // config-off load.
         project_dflash_draft(&mut params, developer_dflash_draft(&resolved));
     }
+    if let Some(draft) = &args.model_draft {
+        params["draft"] = serde_json::json!(draft.display().to_string());
+        if args.speculation.is_none() {
+            apply_speculation_selector(&mut params, "dflash")?;
+        }
+    }
     // Registry sidecar for a final auto/on selector the config-time
     // load_params could not see (config-off + `bench --spec dflash`).
     resolve_dflash_sidecar(
@@ -8502,6 +8512,7 @@ fn profile_command(paths: &Paths, args: ProfileArgs) -> Result<()> {
             max_seq: None,
             redline: false,
             speculation: None,
+            model_draft: None,
             reasoning_on: false,
             min_tokens: None,
             concurrency: None,
@@ -23516,13 +23527,6 @@ effort = "high"
         assert_eq!(hash_invocations(), 1, "second check hits the proof");
 
         // Same size, new bytes: the stat moves, the old proof no longer applies,
-        // and wrong bytes never earn one. The ext4 coarse clock stamps whole
-        // jiffies (~4 ms here): on a fast host both writes land in the same
-        // jiffy and the old proof stays satisfiable. Cross a jiffy first.
-        let old_mtime = fs::metadata(&path).unwrap().modified().unwrap();
-        while fs::metadata(&path).unwrap().modified().unwrap() == old_mtime {
-            std::thread::sleep(Duration::from_millis(2));
-        }
         // and wrong bytes never earn one.
         fs::write(&path, b"synthetic split BASE").unwrap();
         assert!(!existing_artifact_valid(

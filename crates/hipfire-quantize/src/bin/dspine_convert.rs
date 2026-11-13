@@ -1440,12 +1440,14 @@ fn main() {
         );
         drop(lm_head);
         let shape = vec![vocab_size as u32, r as u32];
+        // Upstream keeps the sender tables in fp32 on the GPU; the BF16
+        // rounding here showed up as refinement-score noise, so store exact.
         let mk = |data: Vec<f32>, name: &str| HfqTensor {
             name: name.to_string(),
-            quant_type: QuantType::BF16,
+            quant_type: QuantType::F32,
             shape: shape.clone(),
             group_size: 0,
-            data: f32_slice_to_bf16_bytes(&data),
+            data: f32_slice_to_f32_bytes(&data),
         };
         eprintln!(
             "  serial tables: TG/TSV built ({:.1} MiB bf16 each)",

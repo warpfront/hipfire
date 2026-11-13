@@ -323,10 +323,30 @@ impl DspineBridge {
                     .ok_or("dspine tensor missing: selected_prefix_bridge.codebook")?;
                 meta.shape[0] as usize
             };
+            // The converter stores the tables fp32 (exact, matching the
+            // upstream GPU residency); older BF16 sidecars still lift.
+            let mut lift_table = |name: &str| -> Result<GpuTensor, String> {
+                let (meta, raw) = hfq
+                    .tensor_data(name)
+                    .ok_or_else(|| format!("dspine tensor missing: {name}"))?;
+                match meta.quant_type {
+                    2 => {
+                        assert_eq!(raw.len(), v * r * 4, "dspine {name} f32 size");
+                        let mut data = vec![0f32; v * r];
+                        for (i, chunk) in raw.chunks_exact(4).enumerate() {
+                            data[i] = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                        }
+                        gpu.upload_f32(&data, &[v, r])
+                            .map_err(|e| format!("dspine upload {name}: {e}"))
+                    }
+                    16 => lift_bf16_tensor(gpu, hfq, name, vec![v, r]),
+                    q => Err(format!("dspine {name}: quant_type {q} is neither F32 nor BF16")),
+                }
+            };
             Some(SerialTables {
-                tg: lift_bf16_tensor(gpu, hfq, "dspine.tg", vec![v, r])?,
-                tsv_gate: lift_bf16_tensor(gpu, hfq, "dspine.tsv_gate", vec![v, r])?,
-                tsv_val: lift_bf16_tensor(gpu, hfq, "dspine.tsv_val", vec![v, r])?,
+                tg: lift_table("dspine.tg")?,
+                tsv_gate: lift_table("dspine.tsv_gate")?,
+                tsv_val: lift_table("dspine.tsv_val")?,
             })
         } else {
             None
