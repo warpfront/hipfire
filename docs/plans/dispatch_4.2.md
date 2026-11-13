@@ -33,7 +33,7 @@ family owns the whole routed pipeline. Pinned split (mirrors ds4):
   **not** remove; consistent with ds4; a future `GemvFamily::run_residual_sigmoid_scaled` cleanup).
   The shared-expert down already adds into the residual `x_batch`.
 - **Family owns** (`run_prefill`): scatter → grouped/indexed **gate_up** → unscatter → **SwiGLU +
-  FWHT/Givens rotate** → grouped/indexed/atomic **down** → combine, accumulating into `x_batch`.
+  FWHT rotate** → grouped/indexed/atomic **down** → combine, accumulating into `x_batch`.
 
 This is a **function split**, not a wholesale move `[R2]`.
 

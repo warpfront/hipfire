@@ -5943,7 +5943,6 @@ fn qt44_shared_activation_in_routed(
 fn decode_activation_stage(
     gpu: &mut Gpu,
     p: &crate::families::moe::MoeParams<'_>,
-    res: crate::families::moe::MoeResolution,
     route: Option<MoeRouteCapability>,
     shared_views: Option<(&GpuTensor, &GpuTensor)>,
 ) -> Result<(), DispatchError> {
@@ -6066,7 +6065,6 @@ fn decode_activation_stage(
 fn decode_down_stage(
     gpu: &mut Gpu,
     p: &crate::families::moe::MoeParams<'_>,
-    res: crate::families::moe::MoeResolution,
     target: &GpuTensor,
     ninepath_d4: bool,
     ninepath_mq3l: bool,
@@ -7167,7 +7165,6 @@ fn prefill_gate_up_unscatter_stage(
 fn prefill_activation_stage(
     gpu: &mut Gpu,
     p: &crate::families::moe::MoePrefillParams<'_>,
-    res: &crate::families::moe::MoePrefillResolution,
     total_slots: usize,
 ) -> Result<(), DispatchError> {
     reject_fp8_moe(&p.dtypes)?;

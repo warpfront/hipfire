@@ -78,7 +78,7 @@ fn hfq_source_metadata(
         ));
     }
     let (dtype, row_stride) = validate_raw_layout(info.quant_type, data.len(), m, k)?;
-    let mut metadata = ExpertSourceMetadata::new(
+    let metadata = ExpertSourceMetadata::new(
         info.name.clone(),
         fingerprint.to_string(),
         shape,
@@ -89,7 +89,6 @@ fn hfq_source_metadata(
         format!("hfq:qt{}:g{}", info.quant_type, info.group_size),
         format!("{:?}", hipfire_dispatch::types::dtype_rotation_plan(dtype)),
     );
-    metadata.sidecar_source_names = Vec::new();
     Ok(metadata)
 }
 
@@ -321,60 +320,7 @@ pub(crate) fn source_fingerprint(source: &dyn ModelSource, names: &[String]) -> 
     format!("{:016x}", hasher.finish())
 }
 
-pub(crate) fn source_row_stride(bytes: usize, rows: usize) -> Result<usize, String> {
-    if rows == 0 {
-        return Err("encoded source row count is zero".to_string());
-    }
-    bytes
-        .checked_div(rows)
-        .filter(|&stride| stride > 0 && stride * rows == bytes)
-        .ok_or_else(|| format!("encoded source bytes {bytes} do not form {rows} rows"))
-}
-pub(crate) fn model_source_metadata(
-    source: &dyn ModelSource,
-    name: &str,
-    logical_shape: Vec<usize>,
-    encoded_bytes: usize,
-    row_stride: usize,
-    dtype: DType,
-    fingerprint: &str,
-    quant_tag: String,
-    basis: String,
-    sidecars: Vec<String>,
-) -> Result<ExpertSourceMetadata, String> {
-    let info = source
-        .tensor_info(name)
-        .ok_or_else(|| format!("cohere2moe: source tensor not found: {name}"))?;
-    if logical_shape.is_empty() || encoded_bytes == 0 || row_stride == 0 {
-        return Err(format!(
-            "cohere2moe: invalid source layout for {name}: shape={logical_shape:?} bytes={encoded_bytes} stride={row_stride}"
-        ));
-    }
-    let rows = logical_shape[0];
-    let expected = row_stride
-        .checked_mul(rows)
-        .ok_or_else(|| format!("cohere2moe: source row capacity overflows for {name}"))?;
-    if expected != encoded_bytes {
-        return Err(format!(
-            "cohere2moe: source {name} bytes {encoded_bytes} != rows {rows} × stride {row_stride} ({expected})"
-        ));
-    }
-    let mut metadata = ExpertSourceMetadata::new(
-        info.name.clone(),
-        fingerprint.to_string(),
-        logical_shape,
-        dtype,
-        encoded_bytes,
-        row_stride,
-        1,
-        quant_tag,
-        basis,
-    );
-    metadata.sidecar_source_names = sidecars;
-    Ok(metadata)
-}
-
-/// Build the one runtime plan used by both Cohere carriers.  The source
+/// Build the one runtime plan used by the Cohere carrier.  The source
 /// metadata vectors are assembled before the corresponding expert upload;
 /// this function never reads GPU state or constructs dispatch metadata itself.
 pub(crate) fn build_moe_static_binding(
@@ -382,7 +328,6 @@ pub(crate) fn build_moe_static_binding(
     gates: Vec<ExpertSourceMetadata>,
     ups: Vec<ExpertSourceMetadata>,
     downs: Vec<ExpertSourceMetadata>,
-    sidecars: Vec<ExpertSourceMetadata>,
     layer_idx: usize,
     n_layers: usize,
     physical_device: i32,
@@ -411,9 +356,6 @@ pub(crate) fn build_moe_static_binding(
         Ok(())
     };
     add_source(router.clone())?;
-    for source in sidecars {
-        add_source(source)?;
-    }
     for source in gates.iter().chain(ups.iter()).chain(downs.iter()) {
         add_source(source.clone())?;
     }
@@ -483,24 +425,6 @@ pub(crate) fn build_moe_static_binding(
             ShardPolicy::Replicate,
         ));
     }
-    let sidecar_names = gates
-        .iter()
-        .chain(ups.iter())
-        .chain(downs.iter())
-        .flat_map(|source| source.sidecar_source_names.iter().cloned())
-        .collect::<std::collections::BTreeSet<_>>();
-    for name in &sidecar_names {
-        let source = source_by_name
-            .get(name)
-            .ok_or_else(|| format!("expert sidecar metadata '{name}' is absent"))?;
-        manifest.push(WeightEntry::layer(
-            name.clone(),
-            layer_idx,
-            source.logical_shape.clone(),
-            source.dtype,
-            ShardPolicy::Replicate,
-        ));
-    }
     let resources = gates
         .iter()
         .zip(&ups)
@@ -527,7 +451,7 @@ pub(crate) fn build_moe_static_binding(
             gate: gate_names,
             up: up_names,
             down: down_names,
-            sidecars: sidecar_names.into_iter().collect(),
+            sidecars: Vec::new(),
         },
         resources: ExpertResourceRequirements::new(resources),
         router: router.name,
@@ -953,7 +877,6 @@ impl Cohere2MoeWeights {
                     gate_sources,
                     up_sources,
                     down_sources,
-                    Vec::new(),
                     l,
                     cfg.num_hidden_layers,
                     gpu.device_id,

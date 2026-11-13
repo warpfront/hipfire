@@ -96,7 +96,7 @@ format.
 |---|---|---|
 | H₁₂₈ incoherence rotation on weights | seeded FWHT-256, baked into weights; kernel rotates *x* instead of inverse-rotating *W* | **present** |
 | Rotation fused into preceding op | `fused_rmsnorm_mq_rotate_wavegrid.gfx1100.hip`, `fused_rmsnorm_mq_rotate_vecsum.gfx1100.hip` | **present** |
-| Rotation fused into SwiGLU epilogue | `fused_silu_mul_givens_rotate.hip` | **present** |
+| Rotation fused into SwiGLU epilogue | `fused_silu_mul_mq_rotate.hip` (FWHT; the Givens-rotation epilogue kernel was removed in HIPF-382) | **present** |
 | 2-bit codebook experts | `gemv_mq2g256_lloyd*`, `gemm_mq2g256_lloyd_moe_grouped_*` (gfx1030/1151/12) | **present** |
 | gate_up=2b / down=3b grading | `gemv_mq2g256_lloyd_moe_gate_up_indexed.hip` + `gemv_mq3g256_lloyd_moe_down_indexed.hip` | **present**, same pairing |
 | int8-protected attention | Q8-protected attention (the mq4p tier) | **present** |

@@ -1919,7 +1919,6 @@ impl<'a> SealedMoeOp<'a> {
             return super::decode_activation_stage(
                 gpu,
                 params,
-                selection.resolution,
                 selection.route,
                 self.state.shared_views().ok(),
             );
@@ -1950,7 +1949,7 @@ impl<'a> SealedMoeOp<'a> {
             .batch_size
             .checked_mul(params.k_top)
             .ok_or_else(|| DispatchError::Hip("sealed moe: prefill slot count overflows".into()))?;
-        super::prefill_activation_stage(gpu, params, &selection.resolution, total_slots)
+        super::prefill_activation_stage(gpu, params, total_slots)
     }
 
     pub(super) fn down(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
@@ -1986,7 +1985,6 @@ impl<'a> SealedMoeOp<'a> {
             super::decode_down_stage(
                 gpu,
                 params,
-                selection.resolution,
                 target,
                 selection.ninepath_d4,
                 selection.ninepath_mq3l,

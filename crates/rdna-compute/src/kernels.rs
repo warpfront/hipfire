@@ -61,12 +61,6 @@ pub const GEMV_Q4K_SRC: &str = include_str!("../../../kernels/src/gemv_q4k.hip")
 /// Minimal metadata → minimal VGPRs. Hypothesis: ≤32 VGPRs → max occupancy.
 pub const GEMV_HFQ4G128_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g128.hip");
 
-/// HFQ4-G128 batched GEMV with fused per-token sigmoid-scaled residual.
-/// HFQ4-G256 sister: `GEMV_HFQ4G256_RESIDUAL_SCALED_SRC`. Used by the
-/// shared-expert down dispatch.
-pub const GEMV_HFQ4G128_RESIDUAL_SIGMOID_SCALED_SRC: &str =
-    include_str!("../../../kernels/src/gemv_hfq4g128_residual_sigmoid_scaled.hip");
-
 /// HFQ4-G128 batched GEMM: same tiled approach as G256 but 72 bytes/group, 4 weights/thread.
 pub const GEMM_HFQ4G128_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g128.hip");
 

@@ -604,12 +604,8 @@ pub(crate) struct MoeProjectionSource {
 
 #[derive(Clone)]
 pub(crate) struct MoeExpertSourceRecord {
-    /// Fused HFQ gate||up source, when the carrier stores one projection.
-    pub(crate) gate_up: Option<MoeProjectionSource>,
-    /// Separate gate/up source records, when the carrier stores them
-    /// independently even though the runtime uploads a fused gate||up view.
-    pub(crate) gate: Option<MoeProjectionSource>,
-    pub(crate) up: Option<MoeProjectionSource>,
+    /// Fused gate||up source: one projection carries both halves.
+    pub(crate) gate_up: MoeProjectionSource,
     pub(crate) down: MoeProjectionSource,
 }
 
@@ -786,88 +782,39 @@ pub(crate) fn build_expert_binding(
         add_source(sidecar)?;
     }
     for record in records.iter() {
-        if let Some(gate_up) = &record.gate_up {
-            add_source(gate_up)?;
-        } else {
-            add_source(record.gate.as_ref().ok_or_else(|| {
-                HipError::new(0, "expert source set has no gate or fused gate/up source")
-            })?)?;
-            add_source(record.up.as_ref().ok_or_else(|| {
-                HipError::new(0, "expert source set has no up or fused gate/up source")
-            })?)?;
-        }
+        add_source(&record.gate_up)?;
         add_source(&record.down)?;
     }
-    let first = records
-        .first()
-        .ok_or_else(|| HipError::new(0, "cannot bind an empty expert source set"))?;
-    let first_gate = first
-        .gate_up
-        .as_ref()
-        .or(first.gate.as_ref())
-        .ok_or_else(|| HipError::new(0, "expert source set has no gate source"))?;
-    let first_up = first
-        .gate_up
-        .as_ref()
-        .or(first.up.as_ref())
-        .ok_or_else(|| HipError::new(0, "expert source set has no up source"))?;
-    let fused = first.gate_up.is_some();
+    let first_gate = &records[0].gate_up;
     let mut gate_names = Vec::with_capacity(n_experts);
     let mut down_names = Vec::with_capacity(n_experts);
     let mut sidecar_names = std::collections::BTreeSet::new();
     let mut resources = Vec::with_capacity(n_experts);
-    let mut up_names = Vec::with_capacity(n_experts);
     for record in records.iter() {
-        let (gate, up) = match (&record.gate_up, &record.gate, &record.up) {
-            (Some(gate_up), None, None) => (gate_up, gate_up),
-            (None, Some(gate), Some(up)) => (gate, up),
-            _ => {
-                return Err(HipError::new(
-                    0,
-                    "expert source must be fused or separate gate/up",
-                ))
-            }
-        };
-        if gate.shape != up.shape {
-            return Err(HipError::new(
-                0,
-                &format!("expert gate/up shapes differ for '{}'", gate.name),
-            ));
-        }
-        let gate_bytes = source_bytes(gate, fused)?;
-        let up_bytes = source_bytes(up, fused)?;
+        let gate = &record.gate_up;
+        let gate_bytes = source_bytes(gate, true)?;
         let alignment = gate.alignment;
-        if alignment == 0
-            || !alignment.is_power_of_two()
-            || up.alignment != alignment
-            || record.down.alignment != alignment
-        {
+        if alignment == 0 || !alignment.is_power_of_two() || record.down.alignment != alignment {
             return Err(HipError::new(
                 0,
                 "expert projection alignments are inconsistent",
             ));
         }
         let down_bytes = source_bytes(&record.down, false)?;
-        if gate_bytes % alignment != 0 || up_bytes % alignment != 0 || down_bytes % alignment != 0 {
+        if gate_bytes % alignment != 0 || down_bytes % alignment != 0 {
             return Err(HipError::new(
                 0,
                 "expert projection bytes violate alignment",
             ));
         }
         gate_names.push(gate.name.clone());
-        up_names.push(up.name.clone());
         down_names.push(record.down.name.clone());
-        for sidecar in gate
-            .sidecars
-            .iter()
-            .chain(up.sidecars.iter())
-            .chain(record.down.sidecars.iter())
-        {
+        for sidecar in gate.sidecars.iter().chain(record.down.sidecars.iter()) {
             sidecar_names.insert(sidecar.clone());
         }
         resources.push(ExpertProjectionResources {
             gate_bytes,
-            up_bytes,
+            up_bytes: gate_bytes,
             down_bytes,
             alignment,
         });
@@ -877,20 +824,6 @@ pub(crate) fn build_expert_binding(
         .get(1)
         .copied()
         .ok_or_else(|| HipError::new(0, "expert gate source has no columns"))?;
-    let intermediate = if fused {
-        first_gate
-            .shape
-            .first()
-            .copied()
-            .ok_or_else(|| HipError::new(0, "expert gate source has no rows"))?
-            / 2
-    } else {
-        first_gate
-            .shape
-            .first()
-            .copied()
-            .ok_or_else(|| HipError::new(0, "expert gate source has no rows"))?
-    };
     let manifest_dtype = first_gate.dtype;
     // Expert projections replicate on Single and shard on EP; the router and
     // every sidecar replicate on both targets.
@@ -917,17 +850,6 @@ pub(crate) fn build_expert_binding(
             manifest_dtype,
             expert_policy.clone(),
         ));
-    }
-    if !fused {
-        for name in &up_names {
-            manifest.push(WeightEntry::layer(
-                name.clone(),
-                layer_idx,
-                vec![n_experts, first_up.shape[0], hidden],
-                manifest_dtype,
-                expert_policy.clone(),
-            ));
-        }
     }
     let down_shape = records[0].down.shape.clone();
     manifest.extend(down_names.iter().map(|name| {
@@ -969,19 +891,10 @@ pub(crate) fn build_expert_binding(
         n_experts,
         parallelism: parallelism,
         assignment: spec_assignment,
-        source_layout: if fused {
-            ExpertSourceLayout::PerExpertFused {
-                gate_up: gate_names,
-                down: down_names,
-                sidecars: sidecar_names.iter().cloned().collect(),
-            }
-        } else {
-            ExpertSourceLayout::PerExpertSeparate {
-                gate: gate_names,
-                up: up_names,
-                down: down_names,
-                sidecars: sidecar_names.iter().cloned().collect(),
-            }
+        source_layout: ExpertSourceLayout::PerExpertFused {
+            gate_up: gate_names,
+            down: down_names,
+            sidecars: sidecar_names.iter().cloned().collect(),
         },
         resources: ExpertResourceRequirements::new(resources),
         router: router.name,
@@ -1055,12 +968,7 @@ pub(crate) fn test_expert_binding() -> HipResult<(
     let gate_up = source("test.expert.gate_up", vec![2, 1], 8);
     let down = source("test.expert.down", vec![1, 1], 4);
     build_expert_binding(
-        Box::new([MoeExpertSourceRecord {
-            gate_up: Some(gate_up),
-            gate: None,
-            up: None,
-            down,
-        }]),
+        Box::new([MoeExpertSourceRecord { gate_up, down }]),
         router,
         Vec::new(),
         0,
@@ -1092,13 +1000,7 @@ mod sealed_ep_owner_tests {
     fn test_records(n_experts: usize) -> Box<[MoeExpertSourceRecord]> {
         (0..n_experts)
             .map(|expert| MoeExpertSourceRecord {
-                gate_up: Some(test_source(
-                    &format!("test.expert.{expert}.gate_up"),
-                    vec![2, 1],
-                    8,
-                )),
-                gate: None,
-                up: None,
+                gate_up: test_source(&format!("test.expert.{expert}.gate_up"), vec![2, 1], 8),
                 down: test_source(&format!("test.expert.{expert}.down"), vec![1, 1], 4),
             })
             .collect()
@@ -1331,12 +1233,7 @@ pub(crate) fn global_dtype_pairs_from_records(
     records
         .iter()
         .map(|record| {
-            let gate_dtype = record
-                .gate_up
-                .as_ref()
-                .or(record.gate.as_ref())
-                .map(|source| source.dtype)
-                .unwrap_or(DType::F32);
+            let gate_dtype = record.gate_up.dtype;
             (gate_dtype, record.down.dtype)
         })
         .collect()

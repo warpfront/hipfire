@@ -710,7 +710,6 @@ module	gemv_hfq4g1024	no-caller	No production caller; only definitions, tests/ex
 module	gemv_hfq4g128	codec-outside-core-rungs	HFQ4G128/MQ4G128 route absent from admitted core artifact rungs; hipfire-dispatch/src/families/gemv.rs:529
 module	gemv_hfq4g128_moe_down_grouped	non-core-family	Non-core family route: Gemma; hipfire-dispatch/src/pipeline/sandwich.rs:1225
 module	gemv_hfq4g128_moe_down_residual_scaled_k8_indexed	non-core-family	Non-core family route: Gemma; sandwich.rs:5-17
-module	gemv_hfq4g128_residual_sigmoid_scaled	codec-outside-core-rungs	HFQ4G128 codec/layout route absent from admitted core artifact rungs; hipfire-dispatch/src/pipeline/mod.rs:3528-3538
 module	gemv_hfq4g256_k2048_gfx1100	developer-opt-in	Non-default developer override: HIPFIRE_RDNA3_HFQ4_LM_HEAD_K2048; rdna-compute/src/gemv.rs:10913-10916
 module	gemv_hfq4g256_k2048_gfx1100_mq3v2	developer-opt-in	Non-default developer override: HIPFIRE_RDNA3_HFQ4_LM_HEAD_K2048; rdna-compute/src/gemv.rs:12173-12176
 module	gemv_hfq4g256_k2048_gfx1100_mq4v2	developer-opt-in	Non-default developer override: HIPFIRE_RDNA3_HFQ4_LM_HEAD_K2048; rdna-compute/src/gemv.rs:11805-11808

@@ -354,7 +354,7 @@ XWeights`, and forward. It *loses*: both `load_weights` name-walks.
 
 1. **The `From<RoleMap>` impl re-importing per-arch knowledge.** If
    arch-specific *numerical* fixups (Qwen3.5's `(1+weight)` RMSNorm bake,
-   DeltaNet-vs-FA split, MoE sidecar rotation) leak into the `From` impl or
+   DeltaNet-vs-FA split) leak into the `From` impl or
    into per-LineItem closures, the interpreter grows a hook per idiosyncrasy
    and becomes as complex as the code it replaced — a shallow module hiding
    nothing.

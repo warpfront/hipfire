@@ -3309,12 +3309,7 @@ fn qwen35_hfq_expert_sources(
             [config.dim, config.moe_intermediate_size],
             &fingerprint,
         )?;
-        records.push(MoeExpertSourceRecord {
-            gate_up: Some(gate_up),
-            gate: None,
-            up: None,
-            down,
-        });
+        records.push(MoeExpertSourceRecord { gate_up, down });
     }
     Ok(records.into_boxed_slice())
 }
@@ -3367,14 +3362,7 @@ fn qwen35_hfq_sidecar_sources(
     let mut names = std::collections::BTreeSet::new();
     names.extend(router.sidecars.iter().cloned());
     for record in records {
-        for source in record
-            .gate_up
-            .as_ref()
-            .into_iter()
-            .chain(record.gate.as_ref())
-            .chain(record.up.as_ref())
-            .chain(std::iter::once(&record.down))
-        {
+        for source in [&record.gate_up, &record.down] {
             names.extend(source.sidecars.iter().cloned());
         }
     }
@@ -7781,13 +7769,7 @@ mod sealed_ep_tests {
         let owned_globals: Vec<usize> = (0..N).step_by(2).collect();
         let records: Box<[MoeExpertSourceRecord]> = (0..N)
             .map(|expert| MoeExpertSourceRecord {
-                gate_up: Some(source(
-                    &format!("test.expert.{expert}.gate_up"),
-                    vec![64, 32],
-                    2048,
-                )),
-                gate: None,
-                up: None,
+                gate_up: source(&format!("test.expert.{expert}.gate_up"), vec![64, 32], 2048),
                 down: source(&format!("test.expert.{expert}.down"), vec![32, 16], 1024),
             })
             .collect();

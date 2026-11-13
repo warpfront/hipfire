@@ -1288,7 +1288,7 @@ pub fn weight_gemv_prerotated(
 
     if dtype_needs_rotation(w.gpu_dtype) {
         if let Some(xr) = x_rot {
-            // `xr` is ALREADY FWHT/Givens-rotated by the caller (the whole
+            // `xr` is ALREADY FWHT-rotated by the caller (the whole
             // point of `weight_gemv_prerotated`: rotate once, reuse across the
             // Q/K/V or gate/up projections that share this input). It MUST go
             // straight into the `gemv_*_prerotated` kernel — i.e. through
