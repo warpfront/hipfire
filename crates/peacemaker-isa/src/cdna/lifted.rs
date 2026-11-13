@@ -958,7 +958,7 @@ mod tests {
         // into pc 975 (a distinct later error is fine; nothing is hidden).
         let refined = ledger_cfg::verify_with_branch_proofs(&program, &[], &choices, &entries);
         if let Err(refined) = refined {
-            let impossible = format!("pc 893 `{}` not taken", text(893));
+            let impossible = format!("pc 893 `{}` not taken", program.instructions[893].text);
             assert!(!refined.contains(&impossible), "{refined}");
         }
     }
