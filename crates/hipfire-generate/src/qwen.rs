@@ -2787,11 +2787,10 @@ pub fn plan_prompt_cache(
     tool_render: hipfire_runtime::prompt_frame::ToolCallRender,
     messages_history: &[hipfire_runtime::prompt_frame::Message],
     cache_disabled: bool,
-    // Ascending DeltaNet checkpoint positions (from `m.dflash_checkpoints`) and
-    // whether resume-from-checkpoint is enabled. On a divergence the plan picks
-    // the latest checkpoint `<= lcp && < rendered.len()` to resume from.
+    // Ascending DeltaNet checkpoint positions (from `m.dflash_checkpoints`). On a
+    // divergence the plan picks the latest checkpoint `<= lcp && < rendered.len()`
+    // to resume from.
     dflash_ckpt_positions: &[usize],
-    resume_enabled: bool,
 ) -> PromptCachePlan {
     let q_tokens = tokenizer.encode(prompt);
     let rendered = hipfire_runtime::prompt_frame::build_cached_history(
@@ -2817,7 +2816,6 @@ pub fn plan_prompt_cache(
         rendered,
         cache_eligible,
         dflash_ckpt_positions,
-        resume_enabled,
         "dflash",
     )
 }
@@ -2834,7 +2832,6 @@ pub fn plan_from_rendered(
     rendered: Vec<u32>,
     cache_eligible: bool,
     dflash_ckpt_positions: &[usize],
-    resume_enabled: bool,
     trace_tag: &str,
 ) -> PromptCachePlan {
     if cache_eligible {
@@ -2878,34 +2875,32 @@ pub fn plan_from_rendered(
             };
         }
         // Divergent render (lcp < prior_len, or the exact-match edge): not a
-        // pure extension, so the recurrent state at the end is stale. If resume
-        // is enabled, rewind to the latest checkpoint at-or-before lcp that
-        // still leaves ≥1 token to re-prefill, and resume from there instead of
-        // cold-prefilling the whole conversation.
-        if resume_enabled {
-            if let Some(&ckpt) = dflash_ckpt_positions
-                .iter()
-                .filter(|&&p| p <= lcp && p < rendered.len())
-                .max()
-            {
-                eprintln!(
-                    "[qwen-cache resume {trace_tag}] checkpoint pos={} (lcp={}, prior_len={}, rendered_len={}) — replaying {} tokens vs cold-prefilling {}",
-                    ckpt, lcp, prior_len, rendered.len(), rendered.len() - ckpt, rendered.len(),
-                );
-                return PromptCachePlan {
-                    new_tokens: rendered[ckpt..].to_vec(),
-                    start_pos: ckpt,
-                    cached_tokens: ckpt,
-                    cache_hit: true,
-                    resume_from: Some(ckpt),
-                    rendered,
-                };
-            }
+        // pure extension, so the recurrent state at the end is stale. Rewind to
+        // the latest checkpoint at-or-before lcp that still leaves ≥1 token to
+        // re-prefill, and resume from there instead of cold-prefilling the
+        // whole conversation.
+        if let Some(&ckpt) = dflash_ckpt_positions
+            .iter()
+            .filter(|&&p| p <= lcp && p < rendered.len())
+            .max()
+        {
             eprintln!(
-                "[qwen-cache cold {trace_tag}] lcp={lcp} prior_len={prior_len} checkpoints={dflash_ckpt_positions:?}: none at or before lcp, cold-prefilling {} tokens",
-                rendered.len(),
+                "[qwen-cache resume {trace_tag}] checkpoint pos={} (lcp={}, prior_len={}, rendered_len={}) — replaying {} tokens vs cold-prefilling {}",
+                ckpt, lcp, prior_len, rendered.len(), rendered.len() - ckpt, rendered.len(),
             );
+            return PromptCachePlan {
+                new_tokens: rendered[ckpt..].to_vec(),
+                start_pos: ckpt,
+                cached_tokens: ckpt,
+                cache_hit: true,
+                resume_from: Some(ckpt),
+                rendered,
+            };
         }
+        eprintln!(
+            "[qwen-cache cold {trace_tag}] lcp={lcp} prior_len={prior_len} checkpoints={dflash_ckpt_positions:?}: none at or before lcp, cold-prefilling {} tokens",
+            rendered.len(),
+        );
     }
     PromptCachePlan {
         new_tokens: rendered.clone(),
@@ -3744,7 +3739,6 @@ pub fn generate_dflash(
                 rendered,
                 cache_eligible,
                 &dflash_ckpt_positions,
-                true,
                 if spec_name == "mtp" {
                     "mtp-jinja"
                 } else {
@@ -3768,7 +3762,6 @@ pub fn generate_dflash(
                 hist,
                 cache_disabled,
                 &dflash_ckpt_positions,
-                true,
             )
         })
     };
@@ -10331,7 +10324,6 @@ pub(crate) fn render_qwen4_prompt_history(
             hist,
             true,
             &[],
-            false,
         )
         .rendered)
     }

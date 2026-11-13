@@ -542,7 +542,6 @@ impl Ctx {
     }
     fn reset(&mut self) -> Result<()> {
         self.b.dn_state.reset(&mut self.gpu)?;
-        pin_gdn_frame(&self.b.dn_state);
         self.gpu.hip.device_synchronize()?;
         Ok(())
     }
@@ -653,17 +652,6 @@ impl Ctx {
         }
         self.gpu.hip.device_synchronize()?;
         Ok(())
-    }
-}
-
-/// Without GDN error feedback (Q4 state), DeltaNet requant
-/// rounds stochastically off a process-global frame counter, so a request's
-/// bytes depend on the counter at its start. Every reference run and every
-/// executor request starts at frame 0 (the executor threads its frame per
-/// request from admission). With EF on the counter is unused: no-op.
-fn pin_gdn_frame(dn: &DeltaNetState) {
-    if dn.s_ef_residual.is_empty() {
-        rdna_compute::norm::restore_gdn_requant_frame_checkpoint(0);
     }
 }
 
@@ -1220,8 +1208,6 @@ fn admit(ctx: &mut Ctx, store: &mut Qwen35VmmStore, fx: &[Fixture], r: &Req) -> 
         rng_state: 0,
         history: vec![],
     };
-    // Same starting requant frame as the singleton reference (EF-off only).
-    pin_gdn_frame(&ctx.b.dn_state);
     let st = Qwen35RequestState::new_like(
         &mut ctx.gpu,
         &ctx.b.config,
@@ -3303,7 +3289,6 @@ fn spec_exec_cases(
                     rng_state: 0,
                     history: vec![],
                 };
-                pin_gdn_frame(&slot.dn_state);
                 let o = Qwen35RequestState::new_like(
                     gpu,
                     &slot.config,
@@ -4313,7 +4298,6 @@ fn dflash_walk(
     d.configure_request(SpecRequestConfig::default());
     slot.dn_state.reset(gpu)?;
     slot.kv_cache.compact_offset = 0;
-    pin_gdn_frame(&slot.dn_state);
     let first = match d.prefill(
         gpu,
         &mut *slot,

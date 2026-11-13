@@ -52,7 +52,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Behavior-preserving migration primitive for the draft/verify lm_head GEMM
 /// call sites in this module — the spec-decode analogue of qwen35.rs's
 /// `run_plain_gemm_key`. Passing the dispatcher-entry key
-/// (`GemmQ8_0BatchedChunked`, `GemmQ8_0Batched`, `GemmHfq4G256`,
+/// (`GemmQ8_0BatchedChunked`, `GemmHfq4G256`,
 /// `GemmHfq4G256BatchedLmhead`, `GemmHfq3G256BatchedLmhead`,
 /// `GemmHfq6G256BatchedLmhead`) makes `run_key` dispatch to the IDENTICAL
 /// `gpu.gemm_*` method the direct call used, so each method's own internal arch
@@ -9288,8 +9288,6 @@ pub fn spec_step_dflash_with_railgun(
                     diagnostics: phase_on || seed_oracle,
                     ctx_slice: ctx_slice.is_some(),
                     gdn_tape: gdn_tape.is_some(),
-                    gdn_frame_independent: target.dn_state.quant != qwen35::StateQuant::Q8
-                        || !target.dn_state.s_ef_residual.is_empty(),
                     lookup: lookup_facts,
                 };
                 match drg::admit_window(&facts) {

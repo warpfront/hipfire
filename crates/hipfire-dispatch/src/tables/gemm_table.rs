@@ -332,17 +332,6 @@ pub fn populate(registry: &mut KernelRegistry) {
     // lm_head GEMMs in hipfire-arch-qwen35/src/speculative.rs. Dispatched through
     // GemmFamily::run_key against the explicit key, so each method's own internal
     // arch routing is preserved byte-for-byte.
-    //
-    // `gpu.gemm_q8_0_batched` is a scalar generic kernel (32-thread blocks, no
-    // ISA-specific intrinsics) — runs on EVERY arch → `Always`.
-    registry.register(KernelVariant {
-        key: KernelKey::GemmQ8_0Batched,
-        arch_required: ArchPredicate::Always,
-        shape_gate: None,
-        steps: &[PipelineOp::Gemv],
-        has_awq: false,
-        tile: TileImpl::None,
-    });
     // The three `gemm_*_batched_lmhead` methods are full dispatcher entries: each
     // auto-routes WMMA (gfx11 `_w32` / gfx12 `_w32_gfx12`) for batch>1, dp4a
     // (gfx906) for HFQ6, and an fp16/scalar fallback otherwise — so the dtype
