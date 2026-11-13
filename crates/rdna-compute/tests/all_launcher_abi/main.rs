@@ -1071,6 +1071,111 @@ fn tuple_match_kernel_selectors_check_every_arm_and_fail_closed() {
 }
 
 #[test]
+fn tuple_let_match_projects_each_name_and_skips_only_diverging_arms() {
+    // `let (first, second) = match ..` : `first` stands for the first component of every
+    // value arm and `second` for the second. The two components have DIFFERENT ABIs, so any
+    // overapproximation (a name checked against the other component's kernels) fails.
+    let source = |arms: &str| {
+        format!(
+            "fn launch(gpu: &Gpu, sym: &str, args: &mut KernargBlob) {{
+                gpu.launch_kernel_blob(sym, g, bl, 0, args.as_mut_slice()).unwrap();
+            }}
+            fn run(gpu: &Gpu, fmt: Fmt, wide: bool) -> Result<(), HipError> {{
+                {SMALL_LETS}
+                let (first, second) = match fmt {{ {arms} }};
+                let mut b = KernargBlob::new();
+                b.push_ptr(wp); b.push_i32(nv); b.push_f32(sc); b.push_u64(big);
+                let mut c = KernargBlob::new();
+                c.push_ptr(wp); c.push_i32(nv); c.push_f32(sc); c.push_u64(big); c.push_i32(nv);
+                launch(gpu, first, &mut b);
+                launch(gpu, second, &mut c);
+                Ok(())
+            }}"
+        )
+    };
+    let first_decl = small_decl;
+    let second_decl = || Decl::from_scalars(&[(8, 'p'), (4, 'i'), (4, 'f'), (8, 'i'), (4, 'i')]);
+    let symbols = |names: &[&'static str]| -> Vec<(&'static str, Decl)> {
+        names
+            .iter()
+            .map(|n| {
+                (
+                    *n,
+                    if n.starts_with("p_") {
+                        first_decl()
+                    } else {
+                        second_decl()
+                    },
+                )
+            })
+            .collect()
+    };
+    let ab = ["p_a", "s_a", "p_b", "s_b"];
+    let abc = ["p_a", "s_a", "p_b", "s_b", "p_c", "s_c"];
+    let positive: [(&str, &[&'static str]); 3] = [
+        // A block `return` arm (the QSA lane selector shape).
+        (
+            r#"Fmt::A => ("p_a", "s_a"), Fmt::B => ("p_b", "s_b"),
+               other => { return refuse(other, "no_such_kernel") }"#,
+            &ab,
+        ),
+        // A comma-less block arm, then a block arm that ends in `return ..;`.
+        (
+            r#"Fmt::A => { ("p_a", "s_a") }
+               Fmt::B => ("p_b", "s_b"),
+               other => { log(other); return Err("no_such_kernel".into()); }"#,
+            &ab,
+        ),
+        // A bare `return` arm, plus a nested `if` arm that itself yields tuples.
+        (
+            r#"Fmt::C => return Err("no_such_kernel"),
+               Fmt::A => ("p_a", "s_a"),
+               Fmt::B => if wide { ("p_b", "s_b") } else { ("p_c", "s_c") },"#,
+            &abc,
+        ),
+    ];
+    for (arms, names) in positive {
+        let src = source(arms);
+        let (abi, cov) = run_synth_at(PROBE_PATH, &src, &symbols(names), &no_policy());
+        assert!(abi.is_empty() && cov.is_empty(), "{arms}: {abi:?} {cov:?}");
+        // Every candidate name of each component is still checked against its own ABI.
+        for (index, name) in names.iter().enumerate() {
+            let mut bad = symbols(names);
+            bad[index].1 = if name.starts_with("p_") {
+                second_decl()
+            } else {
+                first_decl()
+            };
+            let (abi, cov) = run_synth_at(PROBE_PATH, &src, &bad, &no_policy());
+            assert!(
+                abi.iter().chain(&cov).any(|p| p.contains(name)),
+                "{name} escaped checking in {arms}: {abi:?} {cov:?}"
+            );
+        }
+    }
+    // Conservative fallback: an arm that neither projects nor provably diverges makes the
+    // whole initialiser the origin again, so the cross-component mismatch (or the
+    // unresolved name) is reported instead of being silently dropped.
+    let fallback = [
+        // A non-diverging block ending in an opaque expression.
+        r#"Fmt::A => ("p_a", "s_a"), Fmt::B => ("p_b", "s_b"),
+           other => { log(other); fallback_pair }"#,
+        // A call that merely looks like a refusal does not diverge.
+        r#"Fmt::A => ("p_a", "s_a"), Fmt::B => ("p_b", "s_b"),
+           other => { refuse(other) }"#,
+        // An arm without the component: tuple of the wrong arity.
+        r#"Fmt::A => ("p_a", "s_a"), Fmt::B => ("p_b", "s_b"), other => ("p_b",),"#,
+    ];
+    for arms in fallback {
+        let (abi, cov) = run_synth_at(PROBE_PATH, &source(arms), &symbols(&ab), &no_policy());
+        assert!(
+            !abi.is_empty() || !cov.is_empty(),
+            "an unprojectable arm must fall back to the whole initialiser: {arms}"
+        );
+    }
+}
+
+#[test]
 fn negative_blob_layout_and_alignment_mistakes_are_rejected() {
     let good = "            b.push_ptr(wp);\n            b.push_i32(nv);\n            b.push_f32(sc);\n            b.push_u64(big);\n";
     let (abi, cov) = run_synth(
@@ -3848,6 +3953,56 @@ fn hip_expands_kernel_defining_function_macros_and_fails_closed() {
     assert!(hip::decls_of(plain).expect("parse").contains_key("k"));
 }
 
+#[test]
+fn hip_kernel_macro_token_pastes_use_raw_arguments_and_fail_closed() {
+    let src = "#define R 8\n#define ENTRY(R) extern \"C\" __global__ void kernel_r##R(float* p, int n) {}\nENTRY(2)\nENTRY(R)\n";
+    let declarations = hip::decls_of(src).unwrap();
+    assert_eq!(declarations.len(), 2);
+    assert!(declarations.contains_key("kernel_r2"));
+    assert!(
+        declarations.contains_key("kernel_rR"),
+        "paste operands are not macro-expanded first"
+    );
+    assert!(!declarations.contains_key("kernel_r8"));
+    let spaced = src.replace("kernel_r##R", "kernel_ ## r ## R");
+    assert!(hip::decls_of(&spaced).unwrap().contains_key("kernel_r2"));
+    for bad in [
+        src.replace("kernel_r##R", "kernel_r##"),
+        src.replace("kernel_r##R", "##R"),
+        src.replace("kernel_r##R", "kernel_r#R"),
+        src.replace("ENTRY(2)", "ENTRY(2 + 1)"),
+        src.replace("ENTRY(2)", "ENTRY()"),
+        src.replace("ENTRY(2)", "ENTRY(2.0)"),
+        src.replace("ENTRY(2)", "ENTRY(\"2\")"),
+    ] {
+        assert!(hip::decls_of(&bad).is_err(), "{bad}");
+    }
+    let source =
+        std::fs::read_to_string(root().join("kernels/src/qwen4_g942_hc_gates.gfx942.hip")).unwrap();
+    let actual = hip::decls_of(&source).unwrap();
+    assert_eq!(actual.len(), 7);
+    for rows in 2..=8 {
+        let declaration = &actual[&format!("gemv_bf16_xf32_k4_rows_tiled_r{rows}")];
+        assert_eq!(declaration.end, 40);
+        assert_eq!(
+            declaration
+                .args
+                .iter()
+                .map(|a| (a.offset, a.size, a.kind))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, 8, 'p'),
+                (8, 8, 'p'),
+                (16, 8, 'p'),
+                (24, 4, 'i'),
+                (28, 4, 'i'),
+                (32, 4, 'f'),
+                (36, 4, 'i')
+            ]
+        );
+    }
+}
+
 // ---- `[x; N]` repeat arrays and `.iter().chain(..)` loops ----------------------------
 
 fn repeat_array_source() -> String {
@@ -4207,6 +4362,81 @@ fn actual_wide_selector_and_loader_feed_all_three_abi_checked_launches() {
         uncovered, names,
         "classifications cannot stand in for a launch"
     );
+}
+
+#[test]
+fn actual_qsa_lanes_helpers_feed_all_five_checked_blob_sites() {
+    let root = root();
+    let paths = vec![
+        "crates/rdna-compute/src/cdna/gfx942_qsa_lanes.rs".to_string(),
+        "crates/rdna-compute/src/qsa_core_lanes_gfx942.rs".to_string(),
+        "crates/rdna-compute/src/rope.rs".to_string(),
+    ];
+    let world = World::load(&root, &paths).unwrap();
+    let source =
+        std::fs::read_to_string(root.join("kernels/src/qwen4_qsa_lanes_f32.gfx942.hip")).unwrap();
+    let declarations = hip::decls_of(&source).unwrap();
+    assert_eq!(declarations.len(), 7);
+    let mut symbols = Symbols::default();
+    for (name, decl) in &declarations {
+        symbols
+            .hip
+            .insert(name.clone(), vec![("actual QSA HIP".into(), decl.clone())]);
+    }
+    symbols
+        .changed_consts
+        .insert(("QWEN4_QSA_LANES_SRC".into(), paths[0].clone()));
+    let mut policy = no_policy();
+    let loader = format!("{}::g942_qsa_lanes_ensure", paths[0]);
+    policy.non_launching.insert(
+        loader.clone(),
+        load_inventory()["non_launching"][&loader]
+            .as_str()
+            .unwrap()
+            .into(),
+    );
+    let loader_fn = world
+        .file(&paths[0])
+        .unwrap()
+        .fns
+        .iter()
+        .find(|f| f.name == "g942_qsa_lanes_ensure")
+        .unwrap();
+    assert!(scan::find_sites(&loader_fn.body).unwrap().is_empty());
+    let analysis = analyze(&world, &symbols, &policy);
+    let (abi, coverage) = violations(&analysis, &policy);
+    assert!(
+        abi.is_empty() && coverage.is_empty(),
+        "{abi:?} {coverage:?}"
+    );
+    let report = analysis
+        .reports
+        .iter()
+        .find(|r| r.func == "qwen4_qsa_lanes_core")
+        .unwrap();
+    assert_eq!(report.sites.len(), 5);
+    for name in declarations.keys() {
+        assert!(analysis.covered.contains(name), "{name}");
+    }
+    // Loader classification and helper bodies cannot substitute for a live launch.
+    let missing = World::from_sources(
+        &root,
+        paths
+            .iter()
+            .map(|path| {
+                let source = std::fs::read_to_string(root.join(path)).unwrap();
+                (
+                    path.clone(),
+                    source.replace(".launch_blob_recorded(", ".not_a_launcher("),
+                )
+            })
+            .collect(),
+    )
+    .unwrap();
+    let missing = analyze(&missing, &symbols, &policy);
+    assert!(declarations
+        .keys()
+        .all(|name| !missing.covered.contains(name)));
 }
 
 #[test]

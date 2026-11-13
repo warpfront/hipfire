@@ -1,0 +1,538 @@
+{
+  "anchor": {
+    "bytes": 27152,
+    "device_elf_sha256": "1caa4bd326be42faeab2f09fc43ff7a5b46a63e3a29cbe0f552bd44a88443b0a",
+    "file": "qwen4_g942_qsa_row_attention_hipcc_gfx942.co",
+    "sha256": "bbc9fbcfe6a2cd5ebc830fc82ffc9a6a360d7efe3c15c5824d93eda5513e4d9c"
+  },
+  "arch": "gfx942",
+  "compiler": {
+    "flags": [
+      "--genco",
+      "--offload-arch=gfx942",
+      "-O3",
+      "--no-offload-compress",
+      "-fuse-cuid=none",
+      "-mcode-object-version=6"
+    ],
+    "invocation": "hipcc <flags> -o <anchor.co> <source_dir>/qwen4_g942_qsa_row_attention.gfx942.hip",
+    "provenance": "Owner's immutable final anchor (dc33131250); this recipe does not recompile it",
+    "runtime_source_basename": "qwen4_g942_qsa_row_attention.gfx942.hip"
+  },
+  "gpu_oracle": {
+    "status": "PASS",
+    "host": "mi300x",
+    "command": "/scratch/quant/fn-fp8/beat/run.sh TwinWide942e.qsa oracle 5400 bash /scratch/quant/fn-fp8/beat/WC8/twine/run-qsa.sh",
+    "binary_source_commit": "5b9b5d7c7af952acd86f23cc575f6ab1747c2469",
+    "binary_sha256": "998b044d2395c040fc6baa0fa1c1422071a793f733b3805139174c39678e8550",
+    "device_image_path": "/scratch/quant/fn-fp8/beat/WC8/twine/qsa-device.elf",
+    "input_hxaco_sha256": "86291565340bb8684ff79df9ca82b7c50631bfe9402958ef1359d1fc3782278e",
+    "hipcc_image_sha256": "bbc9fbcfe6a2cd5ebc830fc82ffc9a6a360d7efe3c15c5824d93eda5513e4d9c",
+    "pm_device_elf_sha256": "1caa4bd326be42faeab2f09fc43ff7a5b46a63e3a29cbe0f552bd44a88443b0a",
+    "hipcc_device_elf_sha256": "1caa4bd326be42faeab2f09fc43ff7a5b46a63e3a29cbe0f552bd44a88443b0a",
+    "raw_receipt_sha256": "f54ac18fd9c21f594715e0694c0fc3db254dfca129346ef4dbe51ca6484c7689",
+    "raw_log_sha256": "39cc698669ae947bd1d44d7f6b45b36d8b7b9c5cea588555b544c1f9b65d10bb",
+    "cases": 1200,
+    "failing_cases": 0,
+    "controls_detected": 12,
+    "controls_missed": 0,
+    "ledger": {
+      "owner": "TwinWide942e.qsa",
+      "class": "oracle",
+      "start": "2026-11-13T00:03:01+00:00",
+      "end": "2026-11-13T00:03:14+00:00",
+      "wait_s": 345,
+      "run_s": 13,
+      "exit": 0
+    }
+  },
+  "hxaco": {
+    "bytes": 27152,
+    "file": "qwen4_g942_qsa_row_attention_pm_gfx942.hxaco",
+    "sha256": "86291565340bb8684ff79df9ca82b7c50631bfe9402958ef1359d1fc3782278e"
+  },
+  "module": "qwen4_g942_qsa_row_attention_pm_gfx942",
+  "seal": {
+    "reports": [
+      {
+        "abi": {
+          "args": [
+            {
+              "name": "",
+              "offset": 0,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 8,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 16,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 24,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 32,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 40,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 44,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 48,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 52,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 56,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 64,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "hidden_block_count_x"
+            },
+            {
+              "name": "",
+              "offset": 68,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "hidden_block_count_y"
+            },
+            {
+              "name": "",
+              "offset": 72,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "hidden_block_count_z"
+            },
+            {
+              "name": "",
+              "offset": 76,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_group_size_x"
+            },
+            {
+              "name": "",
+              "offset": 78,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_group_size_y"
+            },
+            {
+              "name": "",
+              "offset": 80,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_group_size_z"
+            },
+            {
+              "name": "",
+              "offset": 82,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_remainder_x"
+            },
+            {
+              "name": "",
+              "offset": 84,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_remainder_y"
+            },
+            {
+              "name": "",
+              "offset": 86,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_remainder_z"
+            },
+            {
+              "name": "",
+              "offset": 104,
+              "pointer": false,
+              "size": 8,
+              "value_kind": "hidden_global_offset_x"
+            },
+            {
+              "name": "",
+              "offset": 112,
+              "pointer": false,
+              "size": 8,
+              "value_kind": "hidden_global_offset_y"
+            },
+            {
+              "name": "",
+              "offset": 120,
+              "pointer": false,
+              "size": 8,
+              "value_kind": "hidden_global_offset_z"
+            },
+            {
+              "name": "",
+              "offset": 128,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_grid_dims"
+            },
+            {
+              "name": "",
+              "offset": 184,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "hidden_dynamic_lds_size"
+            }
+          ],
+          "compared_to_incumbent": false,
+          "kernarg_segment_size": 320
+        },
+        "arch": "gfx942",
+        "codec": "peacemaker_cdna",
+        "elf_bytes": 23056,
+        "elf_sha256": "1caa4bd326be42faeab2f09fc43ff7a5b46a63e3a29cbe0f552bd44a88443b0a",
+        "hazards": {
+          "advisory": 0,
+          "arch": "gfx942",
+          "blocking": 0,
+          "bypasses": 0,
+          "checked": true,
+          "dwords": 1736,
+          "findings": 0,
+          "hazard": {
+            "checker": "peacemaker_isa::cdna::hazard::check",
+            "inserted_nops": 0,
+            "mfma": 0,
+            "rewritten_instructions": 0,
+            "s_nop": 17,
+            "s_nop_wait_states": 30,
+            "violations": 0
+          },
+          "instructions": 1362,
+          "kernel": "qwen4_g942_qsa_row_f32",
+          "ledger": {
+            "barriers": 2,
+            "branches": 43,
+            "label_states": 61,
+            "labels": 33,
+            "memory": {
+              "ds_load": 60,
+              "ds_store": 4,
+              "smem": 25,
+              "vmem_atomic": 0,
+              "vmem_load": 117,
+              "vmem_store": 1
+            },
+            "steps": 2173,
+            "verifier": "peacemaker_isa::ledger_cfg::verify_with_branch_proofs",
+            "waitcnt": 117,
+            "waitcnt_lgkmcnt_partial": 34,
+            "waitcnt_vmcnt_partial": 56
+          },
+          "unreachable_instructions": 0
+        },
+        "hxaco_bytes": 27152,
+        "hxaco_sha256": "86291565340bb8684ff79df9ca82b7c50631bfe9402958ef1359d1fc3782278e",
+        "kernel": "qwen4_g942_qsa_row_f32",
+        "lds": 32,
+        "lift_identity": "emit::checked ok; emitted bytes == input ELF",
+        "lifted_kernels": 2,
+        "rsrc2": 388,
+        "scratch": 0,
+        "sgprs": 106,
+        "text_bytes": 6944,
+        "text_sha256": "835b34e6b5c2b23352d7ef7fe8bd23bded3bf5669d5c691ce19377d4388946be",
+        "user_sgprs": 2,
+        "vgprs": 60,
+        "wavefront_size": 64
+      },
+      {
+        "abi": {
+          "args": [
+            {
+              "name": "",
+              "offset": 0,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 8,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 16,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 24,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 32,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 40,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 44,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 48,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 52,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 56,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 64,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "hidden_block_count_x"
+            },
+            {
+              "name": "",
+              "offset": 68,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "hidden_block_count_y"
+            },
+            {
+              "name": "",
+              "offset": 72,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "hidden_block_count_z"
+            },
+            {
+              "name": "",
+              "offset": 76,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_group_size_x"
+            },
+            {
+              "name": "",
+              "offset": 78,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_group_size_y"
+            },
+            {
+              "name": "",
+              "offset": 80,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_group_size_z"
+            },
+            {
+              "name": "",
+              "offset": 82,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_remainder_x"
+            },
+            {
+              "name": "",
+              "offset": 84,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_remainder_y"
+            },
+            {
+              "name": "",
+              "offset": 86,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_remainder_z"
+            },
+            {
+              "name": "",
+              "offset": 104,
+              "pointer": false,
+              "size": 8,
+              "value_kind": "hidden_global_offset_x"
+            },
+            {
+              "name": "",
+              "offset": 112,
+              "pointer": false,
+              "size": 8,
+              "value_kind": "hidden_global_offset_y"
+            },
+            {
+              "name": "",
+              "offset": 120,
+              "pointer": false,
+              "size": 8,
+              "value_kind": "hidden_global_offset_z"
+            },
+            {
+              "name": "",
+              "offset": 128,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_grid_dims"
+            },
+            {
+              "name": "",
+              "offset": 184,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "hidden_dynamic_lds_size"
+            }
+          ],
+          "compared_to_incumbent": false,
+          "kernarg_segment_size": 320
+        },
+        "arch": "gfx942",
+        "codec": "peacemaker_cdna",
+        "elf_bytes": 23056,
+        "elf_sha256": "1caa4bd326be42faeab2f09fc43ff7a5b46a63e3a29cbe0f552bd44a88443b0a",
+        "hazards": {
+          "advisory": 0,
+          "arch": "gfx942",
+          "blocking": 0,
+          "bypasses": 0,
+          "checked": true,
+          "dwords": 2087,
+          "findings": 0,
+          "hazard": {
+            "checker": "peacemaker_isa::cdna::hazard::check",
+            "inserted_nops": 0,
+            "mfma": 0,
+            "rewritten_instructions": 0,
+            "s_nop": 23,
+            "s_nop_wait_states": 37,
+            "violations": 0
+          },
+          "instructions": 1693,
+          "kernel": "qwen4_g942_qsa_row_fp8_fnuz",
+          "ledger": {
+            "barriers": 2,
+            "branches": 38,
+            "label_states": 170,
+            "labels": 28,
+            "memory": {
+              "ds_load": 60,
+              "ds_store": 4,
+              "smem": 8,
+              "vmem_atomic": 0,
+              "vmem_load": 103,
+              "vmem_store": 1
+            },
+            "steps": 5987,
+            "verifier": "peacemaker_isa::ledger_cfg::verify_with_branch_proofs",
+            "waitcnt": 97,
+            "waitcnt_lgkmcnt_partial": 29,
+            "waitcnt_vmcnt_partial": 34
+          },
+          "unreachable_instructions": 0
+        },
+        "hxaco_bytes": 27152,
+        "hxaco_sha256": "86291565340bb8684ff79df9ca82b7c50631bfe9402958ef1359d1fc3782278e",
+        "kernel": "qwen4_g942_qsa_row_fp8_fnuz",
+        "lds": 32,
+        "lift_identity": "emit::checked ok; emitted bytes == input ELF",
+        "lifted_kernels": 2,
+        "rsrc2": 388,
+        "scratch": 0,
+        "sgprs": 84,
+        "text_bytes": 8348,
+        "text_sha256": "0e4a8f9c09ca89e6b8c5bd7a6607dc4353a15bf2a2d762aa4c261d1f488e9d5c",
+        "user_sgprs": 2,
+        "vgprs": 48,
+        "wavefront_size": 64
+      }
+    ],
+    "tool": "peacemaker-isa example hip_twin (gfx942 Route A: typed lift, full device-ELF identity, bundle)"
+  },
+  "source": {
+    "bytes": 17584,
+    "owner_commit": "dc33131250",
+    "path": "kernels/src/qwen4_g942_qsa_row_attention.gfx942.hip",
+    "sha256": "e95e554a7f939feaa2d9a80393edb9a4d1df0596149afb3b4cc54e9599a06b6e"
+  },
+  "symbols": [
+    "qwen4_g942_qsa_row_f32",
+    "qwen4_g942_qsa_row_fp8_fnuz"
+  ]
+}

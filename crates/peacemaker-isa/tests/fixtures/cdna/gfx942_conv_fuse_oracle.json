@@ -1,0 +1,241 @@
+{
+  "oracle": "qwen4_g942_conv_fuse_oracle",
+  "seed": 11400714819323198485,
+  "quick": false,
+  "image": "/scratch/quant/fn-fp8/beat/WC8/twine/conv-fuse.elf",
+  "cases_pass": 658,
+  "cases_fail": 0,
+  "controls_detected": 33,
+  "controls_missed": 0,
+  "rows": [
+    {
+      "case": "hyper_norm_bf16x b4 h2560 rows1",
+      "ok": true,
+      "module_vs_reference": 0,
+      "product_vs_reference": 0,
+      "reference_repeat": 0,
+      "guards_ok": true
+    },
+    {
+      "case": "hyper_norm_bf16x b4 h2560 rows2",
+      "ok": true,
+      "module_vs_reference": 0,
+      "product_vs_reference": 0,
+      "reference_repeat": 0,
+      "guards_ok": true
+    },
+    {
+      "case": "hyper_norm_bf16x b4 h2560 rows3",
+      "ok": true,
+      "module_vs_reference": 0,
+      "product_vs_reference": 0,
+      "reference_repeat": 0,
+      "guards_ok": true
+    },
+    {
+      "case": "hyper_norm_bf16x b4 h2560 rows4",
+      "ok": true,
+      "module_vs_reference": 0,
+      "product_vs_reference": 0,
+      "reference_repeat": 0,
+      "guards_ok": true
+    },
+    {
+      "case": "hyper_norm_bf16x b4 h2560 rows5",
+      "ok": true,
+      "module_vs_reference": 0,
+      "product_vs_reference": 0,
+      "reference_repeat": 0,
+      "guards_ok": true
+    },
+    {
+      "case": "hyper_norm_bf16x b4 h2560 rows6",
+      "ok": true,
+      "module_vs_reference": 0,
+      "product_vs_reference": 0,
+      "reference_repeat": 0,
+      "guards_ok": true
+    },
+    {
+      "case": "hyper_norm_bf16x b4 h2560 rows7",
+      "ok": true,
+      "module_vs_reference": 0,
+      "product_vs_reference": 0,
+      "reference_repeat": 0,
+      "guards_ok": true
+    },
+    {
+      "case": "hyper_norm_bf16x b4 h2560 rows8",
+      "ok": true,
+      "module_vs_reference": 0,
+      "product_vs_reference": 0,
+      "reference_repeat": 0,
+      "guards_ok": true
+    },
+    {
+      "control": "hyper_norm flip_input_byte",
+      "differing_bytes": 2,
+      "detected": true
+    },
+    {
+      "control": "hyper_norm flip_weight_byte",
+      "differing_bytes": 8,
+      "detected": true
+    },
+    {
+      "control": "hyper_norm rows_minus_1",
+      "differing_bytes": 61382,
+      "detected": true
+    },
+    {
+      "control": "hyper_norm wrong_state_flag",
+      "differing_bytes": 163604,
+      "detected": true
+    },
+    {
+      "control": "hyper_norm null_bf16_output",
+      "differing_bytes": 81796,
+      "detected": true
+    },
+    {
+      "control": "hyper_norm swap_input_weight",
+      "differing_bytes": 40066,
+      "detected": true
+    },
+    {
+      "control": "hyper_write_norm gates flip_input_byte",
+      "differing_bytes": 17,
+      "detected": true
+    },
+    {
+      "control": "hyper_write_norm gates flip_mixed_byte",
+      "differing_bytes": 131,
+      "detected": true
+    },
+    {
+      "control": "hyper_write_norm gates flip_gates_byte",
+      "differing_bytes": 7916,
+      "detected": true
+    },
+    {
+      "control": "hyper_write_norm gates flip_norm_weight_byte",
+      "differing_bytes": 34,
+      "detected": true
+    },
+    {
+      "control": "hyper_write_norm gates flip_next_norm_weight_byte",
+      "differing_bytes": 120,
+      "detected": true
+    },
+    {
+      "control": "hyper_write_norm gates flip_inject_byte",
+      "differing_bytes": 34,
+      "detected": true
+    },
+    {
+      "control": "hyper_write_norm gates rows_minus_1",
+      "differing_bytes": 102361,
+      "detected": true
+    },
+    {
+      "control": "hyper_write_norm gates swap_norm_weight_next_norm",
+      "differing_bytes": 430564,
+      "detected": true
+    },
+    {
+      "control": "hyper_write_norm gates swap_input_output",
+      "differing_bytes": 1391310,
+      "detected": true
+    },
+    {
+      "control": "hyper_write_norm gates drop_next",
+      "differing_bytes": 1086,
+      "detected": true
+    },
+    {
+      "control": "hyper_write_norm gates drop_clear",
+      "differing_bytes": 20000,
+      "detected": true
+    },
+    {
+      "control": "hyper_write_norm gates null_bf16_output",
+      "differing_bytes": 347622,
+      "detected": true
+    },
+    {
+      "control": "hyper_write_norm gates wrong_entry(hyper_norm_bf16x)",
+      "differing_bytes": 545638,
+      "detected": true
+    },
+    {
+      "control": "hyper_write_norm qin flip_input_byte",
+      "differing_bytes": 12,
+      "detected": true
+    },
+    {
+      "control": "hyper_write_norm qin flip_mixed_byte",
+      "differing_bytes": 56,
+      "detected": true
+    },
+    {
+      "control": "hyper_write_norm qin flip_quarters_in_byte",
+      "differing_bytes": 6806,
+      "detected": true
+    },
+    {
+      "control": "hyper_write_norm qin flip_norm_weight_byte",
+      "differing_bytes": 34,
+      "detected": true
+    },
+    {
+      "control": "hyper_write_norm qin flip_next_norm_weight_byte",
+      "differing_bytes": 133,
+      "detected": true
+    },
+    {
+      "control": "hyper_write_norm qin flip_inject_byte",
+      "differing_bytes": 35,
+      "detected": true
+    },
+    {
+      "control": "hyper_write_norm qin rows_minus_1",
+      "differing_bytes": 102385,
+      "detected": true
+    },
+    {
+      "control": "hyper_write_norm qin swap_norm_weight_next_norm",
+      "differing_bytes": 431372,
+      "detected": true
+    },
+    {
+      "control": "hyper_write_norm qin swap_input_output",
+      "differing_bytes": 1391434,
+      "detected": true
+    },
+    {
+      "control": "hyper_write_norm drop_quarters_in",
+      "differing_bytes": 670017,
+      "detected": true
+    },
+    {
+      "control": "hyper_write_norm qin drop_next",
+      "differing_bytes": 1085,
+      "detected": true
+    },
+    {
+      "control": "hyper_write_norm qin drop_clear",
+      "differing_bytes": 20000,
+      "detected": true
+    },
+    {
+      "control": "hyper_write_norm qin null_bf16_output",
+      "differing_bytes": 347653,
+      "detected": true
+    },
+    {
+      "control": "hyper_write_norm qin wrong_entry(hyper_norm_bf16x)",
+      "differing_bytes": 551348,
+      "detected": true
+    }
+  ]
+}

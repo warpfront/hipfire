@@ -47,7 +47,6 @@ pub use mq2_xbatch::{
     qwen4_g942_mq2_xbatch_covers, qwen4_g942_mq2_xbatch_entry, QWEN4_G942_MQ2_XBATCH_MAX_ROWS,
     QWEN4_G942_MQ2_XBATCH_MODULE,
 };
-
 const GROUPED_OLORA_E8_SRC: &str =
     include_str!("../../../../kernels/src/gemv_mfp4g32_e8_soa_grouped.gfx942.hip");
 const GROUPED_OLORA_E8_KERNEL: &str = "gemv_mfp4g32_e8_soa_grouped_gfx942";

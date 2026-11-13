@@ -1,0 +1,15 @@
+[hip-bridge] GPU_PINNED_MIN_XFER_SIZE=100000: pageable weight copies staged out of reclaim
+GPU dev 0: gfx942 (205.8 GB VRAM, HIP 7.16)
+  pre-compiled kernels: /scratch/quant/fn-fp8/beat/WC8/twine/kcache/gfx942
+[rocblas] loaded for gfx942
+module arm: code object /scratch/quant/fn-fp8/beat/WC8/twine/moe-gemm.elf (HIPFIRE_QWEN4_G942_MOE_GEMM_IMAGE)
+gate_up family 0: cumulative PASS 84 FAIL 0
+gate_up family 1: cumulative PASS 111 FAIL 0
+gate_up family 2: cumulative PASS 138 FAIL 0
+down family 0: cumulative PASS 222 FAIL 0
+down family 1: cumulative PASS 249 FAIL 0
+down family 2: cumulative PASS 276 FAIL 0
+RESULT cases PASS 276 FAIL 0 | controls DETECTED 18 MISSED 0
+  down: PASS 138 FAIL 0
+  gate_up: PASS 138 FAIL 0
+PASS

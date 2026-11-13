@@ -171,6 +171,84 @@ fn missing_vmem_wait_fails_and_the_wait_fixes_it() {
 }
 
 #[test]
+fn same_vmem_read_class_waw_keeps_pending_results_across_widths_and_policies() {
+    for (old_op, old_base, new_op, new_base, shared) in [
+        (FlatOp::LoadDword, 1, FlatOp::LoadDwordx2, 0, 1),
+        (FlatOp::LoadDwordx2, 0, FlatOp::LoadDword, 1, 1),
+        (FlatOp::LoadDwordx4, 0, FlatOp::LoadDwordx2, 2, 2),
+        (FlatOp::LoadUbyte, 1, FlatOp::LoadDword, 1, 1),
+        (FlatOp::LoadDword, 1, FlatOp::LoadUshort, 1, 1),
+    ] {
+        for old_policy in 0..8 {
+            for new_policy in 0..8 {
+                let load_with = |op, base, policy| {
+                    let mut i = ops::global_load(op, v(base), v(40), None, 0);
+                    let Inst::Flat(f) = &mut i else {
+                        unreachable!()
+                    };
+                    f.sc0 = policy & 1 != 0;
+                    f.sc1 = policy & 2 != 0;
+                    f.nt = policy & 4 != 0;
+                    i
+                };
+                let older = load_with(old_op, old_base, old_policy);
+                let younger = load_with(new_op, new_base, new_policy);
+                ok(&[
+                    older.clone(),
+                    younger.clone(),
+                    wait(0, 15),
+                    use_of(shared),
+                    end(),
+                ]);
+                // A partial wait retires only the older result, not the younger one.
+                fails(
+                    &[
+                        older.clone(),
+                        younger.clone(),
+                        wait(1, 15),
+                        use_of(shared),
+                        end(),
+                    ],
+                    "Vm wait",
+                );
+                fails(&[older, younger, use_of(shared), end()], "Vm wait");
+            }
+        }
+    }
+}
+
+#[test]
+fn ordered_load_waw_is_not_an_exec_path_exemption() {
+    // The conv-fuse pattern issues optional per-lane loads, switches EXEC, then
+    // loads the same VGPR again. Ordering is proven without claiming disjoint
+    // EXEC masks, dropping operations, or pruning a feasible branch.
+    let pair = [
+        ops::s1(Sop1Op::MovB64, Src::ExecLo, Src::Int(1)),
+        load(1),
+        ops::s1(Sop1Op::MovB64, Src::ExecLo, Src::Int(-1)),
+        load(1),
+    ];
+    let mut p = pair.to_vec();
+    p.extend([wait(0, 15), use_of(1), end()]);
+    ok(&p);
+    let mut p = pair.to_vec();
+    p.extend([use_of(1), end()]);
+    fails(&p, "Vm wait");
+    // A genuine reachable WAW, including under a different EXEC, still refuses.
+    fails(
+        &[
+            load(1),
+            ops::s1(Sop1Op::MovB64, Src::ExecLo, Src::Int(1)),
+            ops::v1(Vop1Op::MovB32, v(1), v(0)),
+            end(),
+        ],
+        "Waw",
+    );
+    fails(&[load(1), ds_read(1), wait(0, 0), end()], "Waw");
+    fails(&[ds_read(1), load(1), wait(0, 0), end()], "Waw");
+}
+
+#[test]
 fn store_sources_are_not_counter_held_on_gfx942_but_counters_and_barriers_still_count() {
     let overwrite = |data: u8| ops::v1(Vop1Op::MovB32, v(data), v(0));
     // The CDNA3 ISA has no counter for "store data read" outside GWS (EXP_CNT): overwriting
@@ -529,9 +607,9 @@ fn scc(value: bool) -> Vec<Inst> {
 }
 
 /// A pending load of v1, `guard`, then `op` over a hazardous block on the *fall-through*
-/// edge (a second load of v1 with no wait in between: WAW); the branch target is `s_endpgm`.
+/// edge (a VALU overwrite of v1 before its load retires); the target is `s_endpgm`.
 fn guarded_fall(guard: &[Inst], op: SoppOp) -> Vec<Inst> {
-    let hazard = [load(1), wait(0, 15)];
+    let hazard = [ops::v1(Vop1Op::MovB32, v(1), v(0)), wait(0, 15)];
     let mut p = vec![load(1)];
     p.extend_from_slice(guard);
     p.push(br(op, &hazard));
@@ -546,12 +624,12 @@ fn guarded_target(guard: &[Inst], op: SoppOp) -> Vec<Inst> {
     p.extend_from_slice(guard);
     p.push(br(op, &safe));
     p.extend(safe);
-    p.extend([load(1), wait(0, 15), end()]);
+    p.extend([ops::v1(Vop1Op::MovB32, v(1), v(0)), wait(0, 15), end()]);
     p
 }
 
 /// The exact pc889-893 shape (`L867` of the P1b wide64 anchor) with optional instructions in
-/// four slots; the hazardous second load is on the fall-through of the final
+/// four slots; a hazardous VALU overwrite is on the fall-through of the final
 /// `s_cbranch_scc1`. With no insertion the branch is taken for every EXEC value.
 fn l867(init: &[Inst], slots: [&[Inst]; 4]) -> Vec<Inst> {
     let mut guard = init.to_vec();
@@ -568,7 +646,7 @@ const NONE: &[Inst] = &[];
 
 #[test]
 fn exact_l867_zero_mask_sequence_discharges_the_impossible_fallthrough() {
-    // pending VMEM load on the predecessor path; the conflicting second load exists only on
+    // Pending VMEM load on the predecessor path; the conflicting VALU write exists only on
     // the fall-through of `s_cbranch_scc1`, which is taken for every possible EXEC.
     let e = ok(&l867(&[mov_pair_zero()], [NONE; 4]));
     assert_eq!(e["checked"], true);
@@ -670,10 +748,10 @@ fn identical_cselect_alternatives_keep_a_constant_but_different_ones_do_not() {
 
 #[test]
 fn a_direct_entry_to_the_guarded_block_and_the_guarded_block_both_verify() {
-    // First conditional branch (SCC unknown at entry) enters the second load directly,
+    // First conditional branch (SCC unknown at entry) enters the overwrite directly,
     // mirroring L690 -> L872; the first load and the zero-mask guard are on the other path,
-    // whose fall-through into the second load is impossible.
-    let second = [load(1), wait(0, 15)];
+    // whose fall-through into the overwrite is impossible.
+    let second = [ops::v1(Vop1Op::MovB32, v(1), v(0)), wait(0, 15)];
     let mut guard = vec![load(1), mov_pair_zero(), and_exec(), cselect_1_0()];
     guard.push(cmp_lg(s(0), Src::Int(1)));
     guard.push(br(SoppOp::CbranchScc1, &second));
@@ -683,7 +761,7 @@ fn a_direct_entry_to_the_guarded_block_and_the_guarded_block_both_verify() {
     p.push(end());
     ok(&p);
     // A load already in flight on the direct path (hoisted before the first branch) is a
-    // reachable WAW at the second load: the consumer block is not deleted by the proof.
+    // reachable WAW at the VALU write: the consumer block is not deleted by the proof.
     let mut q = vec![load(1), br(SoppOp::CbranchScc1, &guard[1..])];
     q.extend(guard[1..].iter().cloned());
     q.extend(second);
@@ -697,7 +775,7 @@ fn a_branch_into_the_middle_of_the_proof_sequence_resets_the_facts() {
     // are unknown. The same text sequence without the side entry certifies.
     let proof = |entry_over: Option<usize>| {
         let body = [and_exec(), cselect_1_0(), cmp_lg(s(0), Src::Int(1))];
-        let hazard = [load(1), wait(0, 15)];
+        let hazard = [ops::v1(Vop1Op::MovB32, v(1), v(0)), wait(0, 15)];
         let mut p = vec![load(1)];
         let head = [
             mov_pair_zero(),
@@ -725,27 +803,32 @@ fn a_branch_into_the_middle_of_the_proof_sequence_resets_the_facts() {
 }
 
 #[test]
-fn facts_do_not_cross_the_instruction_after_a_conditional_branch() {
-    // s0 = 0 in the previous block; a new block starts after any branch, so the compare
-    // below knows nothing even though only one predecessor exists.
-    let hazard = [load(1), wait(0, 15)];
-    let p = [
-        &[load(1), mov32(0, Src::Int(0))][..],
-        &[ops::sp(SoppOp::CbranchExecz, 0)],
-        &[cmp_lg(s(0), Src::Int(0)), br(SoppOp::CbranchScc0, &hazard)],
-        &hazard,
-        &[end()],
-    ]
-    .concat();
-    fails(&p, "Vm wait");
+fn facts_cross_exactly_one_edge_into_the_block_after_a_conditional_branch() {
+    // s0 = 0 in the predecessor block; `s_cbranch_execz 0` makes the next instruction a branch
+    // target with two in-edges, both leaving that block with s0 = 0. Over either edge the
+    // compare decides its `scc0` (previously the block-local table kept both edges and this
+    // refused): the hazardous fall-through does not exist.
+    let hazard = [ops::v1(Vop1Op::MovB32, v(1), v(0)), wait(0, 15)];
+    let through = |hops: usize| {
+        let mut p = vec![load(1), mov32(0, Src::Int(0))];
+        p.extend((0..hops).map(|_| ops::sp(SoppOp::CbranchExecz, 0)));
+        p.extend([cmp_lg(s(0), Src::Int(0)), br(SoppOp::CbranchScc0, &hazard)]);
+        p.extend(hazard.iter().cloned());
+        p.push(end());
+        p
+    };
+    ok(&through(1));
+    // One more block between the constant and the compare: a predecessor's facts are carried
+    // across one edge only, so the second hop knows nothing and keeps both edges.
+    fails(&through(2), "Vm wait");
 }
 
 #[test]
 fn a_loop_that_changes_the_predicate_operand_keeps_no_facts_across_the_back_edge() {
-    // 0 load v1; s0 = 0; L: cmp s0,0; scc0 -> Lbody; [load v1; wait]; Lbody: s0 += 1;
-    // scc1 -> L; end. The first iteration skips the second load; the second one (s0 = 1)
+    // load v1; s0 = 0; L: cmp s0,0; scc0 -> Lbody; [overwrite v1; wait]; Lbody: s0 += 1;
+    // scc1 -> L; end. The first iteration skips the overwrite; the second one (s0 = 1)
     // falls into it while the first load is still pending.
-    let hazard = [load(1), wait(0, 15)];
+    let hazard = [ops::v1(Vop1Op::MovB32, v(1), v(0)), wait(0, 15)];
     let head = [cmp_lg(s(0), Src::Int(0)), br(SoppOp::CbranchScc0, &hazard)];
     let inc = ops::s2(Sop2Op::AddU32, s(0), s(0), Src::Int(1));
     let loop_len = dw(&head) + dw(&hazard) + dw(std::slice::from_ref(&inc)) + 1;
@@ -965,7 +1048,12 @@ fn unknown_exec_and_vcc_branches_retain_both_edges_even_for_a_zero_mask() {
 fn hazard_matrix() -> Vec<(&'static str, Vec<Inst>, Vec<Inst>, &'static str)> {
     let smem = |dst: u8| ops::s_load(SmemOp::LoadDword, s(dst), s(2), 0);
     vec![
-        ("load -> load", vec![load(1)], vec![load(1)], "Vm wait"),
+        (
+            "load -> DS load",
+            vec![load(1)],
+            vec![ds_read(1)],
+            "Vm wait",
+        ),
         (
             "load -> VALU overwrite",
             vec![load(1)],

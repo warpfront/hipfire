@@ -200,7 +200,23 @@ impl Report {
 /// Their absence fails the gate. Every other gfx942 image stays an explicit not-verified entry.
 /// Each entry is the committed file and the exact kernel symbols it must contain, and nothing
 /// else.
-const CDNA_CERTIFIED: [(&str, &[&str]); 13] = [
+const CDNA_CERTIFIED: [(&str, &[&str]); 34] = [
+    (
+        "qwen4_g942_gdn_lanes_verify_hipcc_gfx942.co",
+        &[
+            "qwen4_g942_gdn_lanes_conv_params_k4",
+            "qwen4_g942_gdn_lanes_step_f32",
+            "qwen4_g942_gdn_lanes_gate_batched",
+        ],
+    ),
+    (
+        "qwen4_g942_gdn_lanes_verify_pm_gfx942.hxaco",
+        &[
+            "qwen4_g942_gdn_lanes_conv_params_k4",
+            "qwen4_g942_gdn_lanes_step_f32",
+            "qwen4_g942_gdn_lanes_gate_batched",
+        ],
+    ),
     (
         "gemm_bf16_mfma_gfx942_rows16_hipcc_gfx942.co",
         &[
@@ -299,6 +315,159 @@ const CDNA_CERTIFIED: [(&str, &[&str]); 13] = [
         "qwen4_gdn_lanes_step_f32_gfx942_pm_gfx942.hxaco",
         &["qwen4_gdn_lanes_step_f32_gfx942"],
     ),
+    (
+        "qwen4_qsa_lanes_f32_gfx942_hipcc_gfx942.co",
+        &[
+            "qwen4_qsa_lanes_prologue_f32_gfx942",
+            "qwen4_qsa_lanes_pool_f32_gfx942",
+            "qwen4_qsa_lanes_scores_rows8_f32_gfx942",
+            "qwen4_qsa_lanes_select_from_scores_gfx942",
+            "qwen4_qsa_lanes_attention_f32_gfx942",
+            "qwen4_qsa_lanes_attention_fp8_fnuz_gfx942",
+        ],
+    ),
+    (
+        "qwen4_qsa_lanes_f32_gfx942_pm_gfx942.hxaco",
+        &[
+            "qwen4_qsa_lanes_prologue_f32_gfx942",
+            "qwen4_qsa_lanes_pool_f32_gfx942",
+            "qwen4_qsa_lanes_scores_rows8_f32_gfx942",
+            "qwen4_qsa_lanes_select_from_scores_gfx942",
+            "qwen4_qsa_lanes_attention_f32_gfx942",
+            "qwen4_qsa_lanes_attention_fp8_fnuz_gfx942",
+        ],
+    ),
+    (
+        "qwen4_gdn_lanes_step_capture_f32_gfx942_hipcc_gfx942.co",
+        &["qwen4_gdn_lanes_step_capture_f32_gfx942"],
+    ),
+    (
+        "qwen4_gdn_lanes_step_capture_f32_gfx942_pm_gfx942.hxaco",
+        &["qwen4_gdn_lanes_step_capture_f32_gfx942"],
+    ),
+    (
+        "qwen4_g942_hc_gates_pm_gfx942.hxaco",
+        &[
+            "gemv_bf16_xf32_k4_rows_tiled_r2",
+            "gemv_bf16_xf32_k4_rows_tiled_r3",
+            "gemv_bf16_xf32_k4_rows_tiled_r4",
+            "gemv_bf16_xf32_k4_rows_tiled_r5",
+            "gemv_bf16_xf32_k4_rows_tiled_r6",
+            "gemv_bf16_xf32_k4_rows_tiled_r7",
+            "gemv_bf16_xf32_k4_rows_tiled_r8",
+        ],
+    ),
+    (
+        "qwen4_g942_gdn_verify_hipcc_gfx942.co",
+        &[
+            "qwen4_g942_gdn_verify_capture_f32",
+            "qwen4_g942_gdn_verify_rollback_f32",
+            "qwen4_g942_gdn_verify_conv_params_k4",
+            "qwen4_g942_gdn_verify_gate_batched",
+        ],
+    ),
+    (
+        "qwen4_g942_gdn_verify_pm_gfx942.hxaco",
+        &[
+            "qwen4_g942_gdn_verify_capture_f32",
+            "qwen4_g942_gdn_verify_rollback_f32",
+            "qwen4_g942_gdn_verify_conv_params_k4",
+            "qwen4_g942_gdn_verify_gate_batched",
+        ],
+    ),
+    (
+        "qwen4_g942_gemv_mq2g256v2_xbatch_gfx942_hipcc_gfx942.co",
+        &[
+            "qwen4_g942_gemv_mq2g256v2_xbatch4_k2048",
+            "qwen4_g942_gemv_mq2g256v2_xbatch4_k2560",
+            "qwen4_g942_gemv_mq2g256v2_xbatch8_k2048",
+            "qwen4_g942_gemv_mq2g256v2_xbatch8_k2560",
+        ],
+    ),
+    (
+        "qwen4_g942_gemv_mq2g256v2_xbatch_pm_gfx942.hxaco",
+        &[
+            "qwen4_g942_gemv_mq2g256v2_xbatch4_k2048",
+            "qwen4_g942_gemv_mq2g256v2_xbatch4_k2560",
+            "qwen4_g942_gemv_mq2g256v2_xbatch8_k2048",
+            "qwen4_g942_gemv_mq2g256v2_xbatch8_k2560",
+        ],
+    ),
+    (
+        "qwen4_g942_qsa_row_attention_hipcc_gfx942.co",
+        &["qwen4_g942_qsa_row_f32", "qwen4_g942_qsa_row_fp8_fnuz"],
+    ),
+    (
+        "qwen4_g942_qsa_row_attention_pm_gfx942.hxaco",
+        &["qwen4_g942_qsa_row_f32", "qwen4_g942_qsa_row_fp8_fnuz"],
+    ),
+    (
+        "qwen4_g942_moe_gemm_hipcc_gfx942.co",
+        &["qwen4_g942_moe_gemm_f32", "qwen4_g942_moe_gemm_xbf16"],
+    ),
+    (
+        "qwen4_g942_moe_gemm_pm_gfx942.hxaco",
+        &["qwen4_g942_moe_gemm_f32", "qwen4_g942_moe_gemm_xbf16"],
+    ),
+    (
+        "qwen4_g942_rows16_grid_hipcc_gfx942.co",
+        &["qwen4_g942_rows16_grid", "qwen4_g942_rows16_grid_x2"],
+    ),
+    (
+        "qwen4_g942_rows16_grid_pm_gfx942.hxaco",
+        &["qwen4_g942_rows16_grid", "qwen4_g942_rows16_grid_x2"],
+    ),
+    (
+        "qwen4_g942_moe_wide_hipcc_gfx942.co",
+        &[
+            "qwen4_g942_moe_wide_router",
+            "qwen4_g942_moe_wide_group_scatter_desc",
+            "qwen4_g942_moe_wide_unscatter_act",
+            "qwen4_g942_moe_wide_combine_shared_add",
+        ],
+    ),
+    (
+        "qwen4_g942_moe_wide_pm_gfx942.hxaco",
+        &[
+            "qwen4_g942_moe_wide_router",
+            "qwen4_g942_moe_wide_group_scatter_desc",
+            "qwen4_g942_moe_wide_unscatter_act",
+            "qwen4_g942_moe_wide_combine_shared_add",
+        ],
+    ),
+    (
+        "qwen4_g942_conv_fuse_hipcc_gfx942.co",
+        &[
+            "qwen4_g942_hyper_norm_bf16x",
+            "qwen4_g942_hyper_write_norm_bf16x",
+        ],
+    ),
+    (
+        "qwen4_g942_conv_fuse_pm_gfx942.hxaco",
+        &[
+            "qwen4_g942_hyper_norm_bf16x",
+            "qwen4_g942_hyper_write_norm_bf16x",
+        ],
+    ),
+];
+
+/// The FP8 prologue's exact remaining refusal. Mixed-FMA now discharges the
+/// attention encoding obligation, so both images positively certify it above;
+/// this is a typed proof, not an expansion of the frozen five-entry seal.
+const QSA_OPEN_FP8: [(&str, &str); 1] = [
+    (
+        "qwen4_qsa_lanes_prologue_fp8_fnuz_gfx942",
+        "qwen4_qsa_lanes_prologue_fp8_fnuz_gfx942: dword 1254: generated instruction v_cvt_pk_fp8_f32 (ENC_VOP3 opcode 674, gfx942) has no hand-written model",
+    ),
+];
+
+/// Kernels of a `CDNA_CERTIFIED` image that stay OPEN: present in the lifted object, never
+/// launched, and still refused by `certify` with the pinned error `(symbol, refusal)`. Keyed
+/// by image file; every other kernel of the image is certified exactly as listed above. An
+/// image absent here is certified whole.
+const CDNA_OPEN: [(&str, &[(&str, &str)]); 2] = [
+    ("qwen4_qsa_lanes_f32_gfx942_hipcc_gfx942.co", &QSA_OPEN_FP8),
+    ("qwen4_qsa_lanes_f32_gfx942_pm_gfx942.hxaco", &QSA_OPEN_FP8),
 ];
 
 /// The gfx942 device ELF of `bytes`: itself when raw, else the single native
@@ -329,18 +498,51 @@ fn gfx942_elf(bytes: &[u8]) -> Result<&[u8], String> {
     Ok(payloads[idx])
 }
 
-/// Typed lift + certify of every kernel; returns the kernel names on success.
-fn certify_gfx942(bytes: &[u8]) -> Result<Vec<String>, String> {
+/// Typed lift + certify of every kernel; returns the certified kernel names and the OPEN
+/// outcomes on success.
+/// Every kernel not in `open` must certify. Every `open` kernel `(symbol, refusal)` must be
+/// present, MUST be certified through the same `certify` call, and must be refused with
+/// exactly `refusal`: a success or any other error fails. An OPEN outcome is never verified.
+fn certify_gfx942(
+    file: &str,
+    bytes: &[u8],
+    open: &[(&str, &str)],
+) -> Result<(Vec<String>, Vec<String>), String> {
     let elf = gfx942_elf(bytes)?;
     let lifted = peacemaker_lift::cdna::lift_object(elf).map_err(|e| format!("cdna lift: {e}"))?;
     peacemaker_lift::cdna::checked(&lifted).map_err(|e| format!("cdna checked: {e}"))?;
-    let mut names = Vec::new();
-    for kernel in &lifted.kernels {
-        peacemaker_isa::cdna::lifted::certify(kernel)
-            .map_err(|e| format!("cdna certify {}: {e}", kernel.image.name))?;
-        names.push(kernel.image.name.clone());
+    for (name, _) in open {
+        if !lifted.kernels.iter().any(|k| k.image.name == *name) {
+            return Err(format!("open kernel {name} is absent from the object"));
+        }
     }
-    Ok(names)
+    let mut names = Vec::new();
+    let mut notes = Vec::new();
+    for kernel in &lifted.kernels {
+        let certified = peacemaker_isa::cdna::lifted::certify(kernel);
+        match open.iter().find(|(name, _)| *name == kernel.image.name) {
+            None => {
+                certified.map_err(|e| format!("cdna certify {}: {e}", kernel.image.name))?;
+                names.push(kernel.image.name.clone());
+            }
+            Some((name, refusal)) => match certified {
+                Ok(_) => {
+                    return Err(format!(
+                        "OPEN kernel {name} unexpectedly certifies; review the pin"
+                    ))
+                }
+                Err(e) if e.to_string() == *refusal => notes.push(format!(
+                    "{file}#{name}: gfx942, OPEN kernel of a certified image, refused as pinned (not verified)"
+                )),
+                Err(e) => {
+                    return Err(format!(
+                        "OPEN kernel {name}: refusal changed: got `{e}`, pinned `{refusal}`"
+                    ))
+                }
+            },
+        }
+    }
+    Ok((names, notes))
 }
 
 #[test]
@@ -357,8 +559,13 @@ fn every_committed_image_verifies_or_is_an_explicit_allowlist_entry() {
     let mut gfx942 = Vec::new();
     for image in &images {
         if let Some((_, expected)) = CDNA_CERTIFIED.iter().find(|(f, _)| *f == image.file) {
-            match certify_gfx942(&image.bytes) {
-                Ok(names) => {
+            let open: &[(&str, &str)] = CDNA_OPEN
+                .iter()
+                .find(|(f, _)| *f == image.file)
+                .map_or(&[], |(_, open)| *open);
+            match certify_gfx942(&image.file, &image.bytes, open) {
+                Ok((names, notes)) => {
+                    gfx942.extend(notes);
                     let mut got = names.clone();
                     got.sort();
                     let mut want: Vec<String> = expected.iter().map(|s| s.to_string()).collect();
