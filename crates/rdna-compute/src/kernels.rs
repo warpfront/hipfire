@@ -10083,14 +10083,6 @@ pub const KV_CACHE_WRITE_SRC: &str = include_str!("../../../kernels/src/kv_cache
 pub const KV_CACHE_WRITE_F32_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/kv_cache_write_f32_batched.hip");
 
-/// GPU-side top-K + top-P sampling. Eliminates 600KB logits download per token.
-/// Single block, 256 threads. Returns token ID + RNG state (8 bytes vs 600KB).
-///
-/// Phase 1: Parallel max reduction over vocab_size logits.
-/// Phase 2: Threshold filter — collect candidates within 30*temp of max (atomic shared counter).
-/// Phase 3: Thread 0 softmax + sort + top-p + sample on the small candidate set.
-pub const SAMPLE_TOP_P_SRC: &str = include_str!("../../../kernels/src/sample_top_p.hip");
-
 /// Multi-workgroup parallel rewrite of `sample_top_p`: vocab top-K scan split
 /// across N blocks (`sample_topk_partial`) + single-block merge/softmax/top-p
 /// (`sample_topk_finalize`) + an in-place penalty prepass

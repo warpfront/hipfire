@@ -2997,10 +2997,6 @@ fn mq3v25_a8_route_requires_flag_symmetric_multirow_and_exact_arch() {
     }
 }
 
-fn flags_default() -> rdna_compute::feature_flags::FeatureFlags {
-    rdna_compute::feature_flags::FeatureFlags::for_test("gfx1100")
-}
-
 #[test]
 fn moe_prefill_resolution_path2_gfx11_mq4() {
     let arch = crate::context::DispatchCtx::for_test("gfx1100");

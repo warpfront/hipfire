@@ -1227,7 +1227,6 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             kernels::CONV1D_GATED_DECODE_SRC,
             ["conv1d_gated_decode_f32"]
         );
-        add!("sample_top_p", kernels::SAMPLE_TOP_P_SRC, ["sample_top_p"]);
         add!(
             "sample_rows_pf",
             kernels::SAMPLE_ROWS_PF_SRC,
@@ -11654,12 +11653,8 @@ mod tests {
             );
         }
         // Shared-launcher modules the packs lacked (LFM2 decode, plain Q8 GEMV).
-        const SHARED_LAUNCHER_ADDED_MODULES: [&str; 4] = [
-            "rope",
-            "conv1d_gated_decode",
-            "sample_top_p",
-            "sample_rows_pf",
-        ];
+        const SHARED_LAUNCHER_ADDED_MODULES: [&str; 3] =
+            ["rope", "conv1d_gated_decode", "sample_rows_pf"];
         for module in SHARED_LAUNCHER_ADDED_MODULES {
             assert!(
                 by_name.contains_key(module),
@@ -12193,7 +12188,7 @@ mod tests {
         let gemv = squeeze(include_str!("gemv.rs"));
         let norm = squeeze(include_str!("norm.rs"));
         let sampling = squeeze(include_str!("sampling.rs"));
-        let rows: [(&str, &str, &str, &str, &str); 5] = [
+        let rows: [(&str, &str, &str, &str, &str); 4] = [
             (
                 "gemv_q8_0_wide",
                 "GEMV_Q8_0_WIDE_SRC",
@@ -12208,13 +12203,6 @@ mod tests {
                 "conv1d_gated_decode_f32",
                 "norm",
                 kernels::CONV1D_GATED_DECODE_SRC,
-            ),
-            (
-                "sample_top_p",
-                "SAMPLE_TOP_P_SRC",
-                "sample_top_p",
-                "sampling",
-                kernels::SAMPLE_TOP_P_SRC,
             ),
             (
                 "sample_rows_pf",

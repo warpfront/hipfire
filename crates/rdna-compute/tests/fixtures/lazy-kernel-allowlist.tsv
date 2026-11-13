@@ -1146,7 +1146,6 @@ module	rotate_x_mq_awq_mq4v2_fp8_gfx12	developer-opt-in	Non-default developer ov
 module	rotate_x_mq_awq_mq4v2_fp8_inreg_gfx12	config-opt-in	Non-default configuration: kernel.iu / kernel.gfx; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
 module	round_h_bf16_quality_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_EMU_BF16_H; rdna-compute/src/gemv.rs:4453-4460
 module	sample_rows_pf	config-opt-in	Non-default configuration: serve.continuous_batch_size; batch.rs:1029
-module	sample_top_p	developer-opt-in	Non-default developer override: HIPFIRE_SAMPLE_PARALLEL; rdna-compute/src/sampling.rs:329-331
 module	sigmoid_mul_rotate_x_mq_awq_i8_gfx11	config-opt-in	Non-default configuration: kernel.gfx; rdna-compute/src/gemv.rs:7171
 module	sigmoid_mul_rotate_x_mq_awq_i8_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_A8_PREFILL; rdna-compute/src/gemv.rs:7166
 module	sigmoid_mul_rotate_x_mq_awq_mq4v2_fp8_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_IU4_PREFILL / HIPFIRE_FP8_PROD_INREG; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
