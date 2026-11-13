@@ -1032,8 +1032,6 @@ fn load_f32_vec(hfq: &HfqFile, name: &str, expected_n: usize) -> Result<Vec<f32>
 /// plain `x * w` since they would flip the residual's sign. Under `1 + w` they
 /// become sensible scales of ~0.48–0.89. The final `norm` stores ±3.x, which is
 /// only sensible under the PLAIN convention — centering it was a real bug.
-///
-/// Opt out of centering with `HIPFIRE_GLIMMER_NO_CENTERED_NORM=1` for A/B.
 fn load_norm_with(
     hfq: &HfqFile,
     gpu: &mut Gpu,
@@ -1042,12 +1040,7 @@ fn load_norm_with(
     centered: bool,
 ) -> Result<GpuTensor, String> {
     let mut f32_data = load_f32_vec(hfq, name, dim)?;
-    if centered
-        && hipfire_config::developer_var("HIPFIRE_GLIMMER_NO_CENTERED_NORM")
-            .ok()
-            .as_deref()
-            != Some("1")
-    {
+    if centered {
         for v in f32_data.iter_mut() {
             *v += 1.0;
         }
