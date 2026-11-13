@@ -17023,7 +17023,9 @@ effort = "high"
             engine.ping().expect("fake daemon ping");
 
             let registry = hipfire_registry::bundled().unwrap();
+            let compact_block_models = crate::serve::CompactBlockModels::from_registry(&registry);
             let shared = Arc::new(ServeShared {
+                compact_block_models,
                 capabilities: crate::serve::route_capabilities(
                     false,
                     4,
@@ -17093,6 +17095,7 @@ effort = "high"
                 backoff_hook: Mutex::new(None),
                 stream_stall_timeout: None,
                 ui_enabled: false,
+                ocr_format: None,
                 api_key,
             });
 

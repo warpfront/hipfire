@@ -1,0 +1,1275 @@
+{
+ "cases": [
+  {
+   "input": "Hello.",
+   "html": "Hello.",
+   "blocks": "Hello."
+  },
+  {
+   "input": "no markup at all\nwith two lines",
+   "html": "no markup at all\nwith two lines",
+   "blocks": "no markup at all\nwith two lines"
+  },
+  {
+   "input": "a < b and c > d",
+   "html": "a < b and c > d",
+   "blocks": "a < b and c > d"
+  },
+  {
+   "input": "text with ```inline``` backticks",
+   "html": "text with ```inline``` backticks",
+   "blocks": "text with ```inline``` backticks"
+  },
+  {
+   "input": "```\nconsole.log(1)\n```",
+   "html": "```\nconsole.log(1)\n```",
+   "blocks": "```\nconsole.log(1)\n```"
+  },
+  {
+   "input": "```python\nprint('hi')\n```",
+   "html": "```python\nprint('hi')\n```",
+   "blocks": "```python\nprint('hi')\n```"
+  },
+  {
+   "input": "<|Text|><|0|><|0|><|10|><|10|><p>hello</p>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Text\"><p>hello</p></div>",
+   "blocks": "[{\"label\":\"Text\",\"bbox\":[0,0,10,10],\"html\":\"<p>hello</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Text|><|0|><|0|><|10|><|10|><p>hello</p>\n<p>world</p>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Text\"><p>hello</p>\n<p>world</p></div>",
+   "blocks": "[{\"label\":\"Text\",\"bbox\":[0,0,10,10],\"html\":\"<p>hello</p>\\n<p>world</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Text|><|0|><|0|><|10|><|10|><h1>Title</h1><p>body text</p>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Text\"><h1>Title</h1><p>body text</p></div>",
+   "blocks": "[{\"label\":\"Text\",\"bbox\":[0,0,10,10],\"html\":\"<h1>Title</h1><p>body text</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Text|><|0|><|0|><|10|><|10|><pre>  keep   spaces\n  and lines</pre>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Text\"><pre>  keep   spaces\n  and lines</pre></div>",
+   "blocks": "[{\"label\":\"Text\",\"bbox\":[0,0,10,10],\"html\":\"<pre>  keep   spaces\\n  and lines</pre>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Text|><|0|><|0|><|10|><|10|><p class=\"x\" style=\"color:red\">styled</p>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Text\"><p class=\"x\" style=\"color:red\">styled</p></div>",
+   "blocks": "[{\"label\":\"Text\",\"bbox\":[0,0,10,10],\"html\":\"<p class=\\\"x\\\" style=\\\"color:red\\\">styled</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Text|><|0|><|0|><|10|><|10|><p>भारत</p>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Text\"><p>भारत</p></div>",
+   "blocks": "[{\"label\":\"Text\",\"bbox\":[0,0,10,10],\"html\":\"<p>भारत</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Text|><|0|><|0|><|10|><|10|><p>self<br/>break</p>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Text\"><p>self<br/>break</p></div>",
+   "blocks": "[{\"label\":\"Text\",\"bbox\":[0,0,10,10],\"html\":\"<p>self<br/>break</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Text|><|0|><|0|><|10|><|10|><div>nested <div>inner</div> tail</div>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Text\"><div>nested <div>inner</div> tail</div></div>",
+   "blocks": "[{\"label\":\"Text\",\"bbox\":[0,0,10,10],\"html\":\"<div>nested <div>inner</div> tail</div>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Text|><|0|><|0|><|10|><|10|><p>text</p></div>after the close",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Text\"><p>text</p></div>after the close",
+   "blocks": "[{\"label\":\"Text\",\"bbox\":[0,0,10,10],\"html\":\"<p>text</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Table|><|0|><|0|><|10|><|10|><p>hello</p>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Table\"><p>hello</p></div>",
+   "blocks": "[{\"label\":\"Table\",\"bbox\":[0,0,10,10],\"html\":\"<p>hello</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Table|><|0|><|0|><|10|><|10|><p>hello</p>\n<p>world</p>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Table\"><p>hello</p>\n<p>world</p></div>",
+   "blocks": "[{\"label\":\"Table\",\"bbox\":[0,0,10,10],\"html\":\"<p>hello</p>\\n<p>world</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Table|><|0|><|0|><|10|><|10|><h1>Title</h1><p>body text</p>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Table\"><h1>Title</h1><p>body text</p></div>",
+   "blocks": "[{\"label\":\"Table\",\"bbox\":[0,0,10,10],\"html\":\"<h1>Title</h1><p>body text</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Table|><|0|><|0|><|10|><|10|><pre>  keep   spaces\n  and lines</pre>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Table\"><pre>  keep   spaces\n  and lines</pre></div>",
+   "blocks": "[{\"label\":\"Table\",\"bbox\":[0,0,10,10],\"html\":\"<pre>  keep   spaces\\n  and lines</pre>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Table|><|0|><|0|><|10|><|10|><p class=\"x\" style=\"color:red\">styled</p>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Table\"><p class=\"x\" style=\"color:red\">styled</p></div>",
+   "blocks": "[{\"label\":\"Table\",\"bbox\":[0,0,10,10],\"html\":\"<p class=\\\"x\\\" style=\\\"color:red\\\">styled</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Table|><|0|><|0|><|10|><|10|><p>भारत</p>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Table\"><p>भारत</p></div>",
+   "blocks": "[{\"label\":\"Table\",\"bbox\":[0,0,10,10],\"html\":\"<p>भारत</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Table|><|0|><|0|><|10|><|10|><p>self<br/>break</p>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Table\"><p>self<br/>break</p></div>",
+   "blocks": "[{\"label\":\"Table\",\"bbox\":[0,0,10,10],\"html\":\"<p>self<br/>break</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Table|><|0|><|0|><|10|><|10|><div>nested <div>inner</div> tail</div>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Table\"><div>nested <div>inner</div> tail</div></div>",
+   "blocks": "[{\"label\":\"Table\",\"bbox\":[0,0,10,10],\"html\":\"<div>nested <div>inner</div> tail</div>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Table|><|0|><|0|><|10|><|10|><p>text</p></div>after the close",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Table\"><p>text</p></div>after the close",
+   "blocks": "[{\"label\":\"Table\",\"bbox\":[0,0,10,10],\"html\":\"<p>text</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Page-Header|><|0|><|0|><|10|><|10|><p>hello</p>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Page-Header\"><p>hello</p></div>",
+   "blocks": "[{\"label\":\"Page-Header\",\"bbox\":[0,0,10,10],\"html\":\"<p>hello</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Page-Header|><|0|><|0|><|10|><|10|><p>hello</p>\n<p>world</p>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Page-Header\"><p>hello</p>\n<p>world</p></div>",
+   "blocks": "[{\"label\":\"Page-Header\",\"bbox\":[0,0,10,10],\"html\":\"<p>hello</p>\\n<p>world</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Page-Header|><|0|><|0|><|10|><|10|><h1>Title</h1><p>body text</p>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Page-Header\"><h1>Title</h1><p>body text</p></div>",
+   "blocks": "[{\"label\":\"Page-Header\",\"bbox\":[0,0,10,10],\"html\":\"<h1>Title</h1><p>body text</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Page-Header|><|0|><|0|><|10|><|10|><pre>  keep   spaces\n  and lines</pre>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Page-Header\"><pre>  keep   spaces\n  and lines</pre></div>",
+   "blocks": "[{\"label\":\"Page-Header\",\"bbox\":[0,0,10,10],\"html\":\"<pre>  keep   spaces\\n  and lines</pre>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Page-Header|><|0|><|0|><|10|><|10|><p class=\"x\" style=\"color:red\">styled</p>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Page-Header\"><p class=\"x\" style=\"color:red\">styled</p></div>",
+   "blocks": "[{\"label\":\"Page-Header\",\"bbox\":[0,0,10,10],\"html\":\"<p class=\\\"x\\\" style=\\\"color:red\\\">styled</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Page-Header|><|0|><|0|><|10|><|10|><p>भारत</p>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Page-Header\"><p>भारत</p></div>",
+   "blocks": "[{\"label\":\"Page-Header\",\"bbox\":[0,0,10,10],\"html\":\"<p>भारत</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Page-Header|><|0|><|0|><|10|><|10|><p>self<br/>break</p>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Page-Header\"><p>self<br/>break</p></div>",
+   "blocks": "[{\"label\":\"Page-Header\",\"bbox\":[0,0,10,10],\"html\":\"<p>self<br/>break</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Page-Header|><|0|><|0|><|10|><|10|><div>nested <div>inner</div> tail</div>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Page-Header\"><div>nested <div>inner</div> tail</div></div>",
+   "blocks": "[{\"label\":\"Page-Header\",\"bbox\":[0,0,10,10],\"html\":\"<div>nested <div>inner</div> tail</div>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Page-Header|><|0|><|0|><|10|><|10|><p>text</p></div>after the close",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Page-Header\"><p>text</p></div>after the close",
+   "blocks": "[{\"label\":\"Page-Header\",\"bbox\":[0,0,10,10],\"html\":\"<p>text</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Section-Header|><|0|><|0|><|10|><|10|><p>hello</p>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Section-Header\"><p>hello</p></div>",
+   "blocks": "[{\"label\":\"Section-Header\",\"bbox\":[0,0,10,10],\"html\":\"<p>hello</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Section-Header|><|0|><|0|><|10|><|10|><p>hello</p>\n<p>world</p>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Section-Header\"><p>hello</p>\n<p>world</p></div>",
+   "blocks": "[{\"label\":\"Section-Header\",\"bbox\":[0,0,10,10],\"html\":\"<p>hello</p>\\n<p>world</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Section-Header|><|0|><|0|><|10|><|10|><h1>Title</h1><p>body text</p>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Section-Header\"><h1>Title</h1><p>body text</p></div>",
+   "blocks": "[{\"label\":\"Section-Header\",\"bbox\":[0,0,10,10],\"html\":\"<h1>Title</h1><p>body text</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Section-Header|><|0|><|0|><|10|><|10|><pre>  keep   spaces\n  and lines</pre>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Section-Header\"><pre>  keep   spaces\n  and lines</pre></div>",
+   "blocks": "[{\"label\":\"Section-Header\",\"bbox\":[0,0,10,10],\"html\":\"<pre>  keep   spaces\\n  and lines</pre>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Section-Header|><|0|><|0|><|10|><|10|><p class=\"x\" style=\"color:red\">styled</p>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Section-Header\"><p class=\"x\" style=\"color:red\">styled</p></div>",
+   "blocks": "[{\"label\":\"Section-Header\",\"bbox\":[0,0,10,10],\"html\":\"<p class=\\\"x\\\" style=\\\"color:red\\\">styled</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Section-Header|><|0|><|0|><|10|><|10|><p>भारत</p>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Section-Header\"><p>भारत</p></div>",
+   "blocks": "[{\"label\":\"Section-Header\",\"bbox\":[0,0,10,10],\"html\":\"<p>भारत</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Section-Header|><|0|><|0|><|10|><|10|><p>self<br/>break</p>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Section-Header\"><p>self<br/>break</p></div>",
+   "blocks": "[{\"label\":\"Section-Header\",\"bbox\":[0,0,10,10],\"html\":\"<p>self<br/>break</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Section-Header|><|0|><|0|><|10|><|10|><div>nested <div>inner</div> tail</div>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Section-Header\"><div>nested <div>inner</div> tail</div></div>",
+   "blocks": "[{\"label\":\"Section-Header\",\"bbox\":[0,0,10,10],\"html\":\"<div>nested <div>inner</div> tail</div>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Section-Header|><|0|><|0|><|10|><|10|><p>text</p></div>after the close",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Section-Header\"><p>text</p></div>after the close",
+   "blocks": "[{\"label\":\"Section-Header\",\"bbox\":[0,0,10,10],\"html\":\"<p>text</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Figure|><|0|><|0|><|10|><|10|><p>hello</p>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Figure\"><p>hello</p></div>",
+   "blocks": "[{\"label\":\"Figure\",\"bbox\":[0,0,10,10],\"html\":\"<p>hello</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Figure|><|0|><|0|><|10|><|10|><p>hello</p>\n<p>world</p>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Figure\"><p>hello</p>\n<p>world</p></div>",
+   "blocks": "[{\"label\":\"Figure\",\"bbox\":[0,0,10,10],\"html\":\"<p>hello</p>\\n<p>world</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Figure|><|0|><|0|><|10|><|10|><h1>Title</h1><p>body text</p>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Figure\"><h1>Title</h1><p>body text</p></div>",
+   "blocks": "[{\"label\":\"Figure\",\"bbox\":[0,0,10,10],\"html\":\"<h1>Title</h1><p>body text</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Figure|><|0|><|0|><|10|><|10|><pre>  keep   spaces\n  and lines</pre>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Figure\"><pre>  keep   spaces\n  and lines</pre></div>",
+   "blocks": "[{\"label\":\"Figure\",\"bbox\":[0,0,10,10],\"html\":\"<pre>  keep   spaces\\n  and lines</pre>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Figure|><|0|><|0|><|10|><|10|><p class=\"x\" style=\"color:red\">styled</p>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Figure\"><p class=\"x\" style=\"color:red\">styled</p></div>",
+   "blocks": "[{\"label\":\"Figure\",\"bbox\":[0,0,10,10],\"html\":\"<p class=\\\"x\\\" style=\\\"color:red\\\">styled</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Figure|><|0|><|0|><|10|><|10|><p>भारत</p>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Figure\"><p>भारत</p></div>",
+   "blocks": "[{\"label\":\"Figure\",\"bbox\":[0,0,10,10],\"html\":\"<p>भारत</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Figure|><|0|><|0|><|10|><|10|><p>self<br/>break</p>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Figure\"><p>self<br/>break</p></div>",
+   "blocks": "[{\"label\":\"Figure\",\"bbox\":[0,0,10,10],\"html\":\"<p>self<br/>break</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Figure|><|0|><|0|><|10|><|10|><div>nested <div>inner</div> tail</div>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Figure\"><div>nested <div>inner</div> tail</div></div>",
+   "blocks": "[{\"label\":\"Figure\",\"bbox\":[0,0,10,10],\"html\":\"<div>nested <div>inner</div> tail</div>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Figure|><|0|><|0|><|10|><|10|><p>text</p></div>after the close",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Figure\"><p>text</p></div>after the close",
+   "blocks": "[{\"label\":\"Figure\",\"bbox\":[0,0,10,10],\"html\":\"<p>text</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Caption|><|0|><|0|><|10|><|10|><p>hello</p>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Caption\"><p>hello</p></div>",
+   "blocks": "[{\"label\":\"Caption\",\"bbox\":[0,0,10,10],\"html\":\"<p>hello</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Caption|><|0|><|0|><|10|><|10|><p>hello</p>\n<p>world</p>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Caption\"><p>hello</p>\n<p>world</p></div>",
+   "blocks": "[{\"label\":\"Caption\",\"bbox\":[0,0,10,10],\"html\":\"<p>hello</p>\\n<p>world</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Caption|><|0|><|0|><|10|><|10|><h1>Title</h1><p>body text</p>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Caption\"><h1>Title</h1><p>body text</p></div>",
+   "blocks": "[{\"label\":\"Caption\",\"bbox\":[0,0,10,10],\"html\":\"<h1>Title</h1><p>body text</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Caption|><|0|><|0|><|10|><|10|><pre>  keep   spaces\n  and lines</pre>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Caption\"><pre>  keep   spaces\n  and lines</pre></div>",
+   "blocks": "[{\"label\":\"Caption\",\"bbox\":[0,0,10,10],\"html\":\"<pre>  keep   spaces\\n  and lines</pre>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Caption|><|0|><|0|><|10|><|10|><p class=\"x\" style=\"color:red\">styled</p>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Caption\"><p class=\"x\" style=\"color:red\">styled</p></div>",
+   "blocks": "[{\"label\":\"Caption\",\"bbox\":[0,0,10,10],\"html\":\"<p class=\\\"x\\\" style=\\\"color:red\\\">styled</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Caption|><|0|><|0|><|10|><|10|><p>भारत</p>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Caption\"><p>भारत</p></div>",
+   "blocks": "[{\"label\":\"Caption\",\"bbox\":[0,0,10,10],\"html\":\"<p>भारत</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Caption|><|0|><|0|><|10|><|10|><p>self<br/>break</p>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Caption\"><p>self<br/>break</p></div>",
+   "blocks": "[{\"label\":\"Caption\",\"bbox\":[0,0,10,10],\"html\":\"<p>self<br/>break</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Caption|><|0|><|0|><|10|><|10|><div>nested <div>inner</div> tail</div>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Caption\"><div>nested <div>inner</div> tail</div></div>",
+   "blocks": "[{\"label\":\"Caption\",\"bbox\":[0,0,10,10],\"html\":\"<div>nested <div>inner</div> tail</div>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Caption|><|0|><|0|><|10|><|10|><p>text</p></div>after the close",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Caption\"><p>text</p></div>after the close",
+   "blocks": "[{\"label\":\"Caption\",\"bbox\":[0,0,10,10],\"html\":\"<p>text</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Code-Block|><|0|><|0|><|10|><|10|><p>hello</p>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Code-Block\"><p>hello</p></div>",
+   "blocks": "[{\"label\":\"Code-Block\",\"bbox\":[0,0,10,10],\"html\":\"<p>hello</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Code-Block|><|0|><|0|><|10|><|10|><p>hello</p>\n<p>world</p>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Code-Block\"><p>hello</p>\n<p>world</p></div>",
+   "blocks": "[{\"label\":\"Code-Block\",\"bbox\":[0,0,10,10],\"html\":\"<p>hello</p>\\n<p>world</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Code-Block|><|0|><|0|><|10|><|10|><h1>Title</h1><p>body text</p>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Code-Block\"><h1>Title</h1><p>body text</p></div>",
+   "blocks": "[{\"label\":\"Code-Block\",\"bbox\":[0,0,10,10],\"html\":\"<h1>Title</h1><p>body text</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Code-Block|><|0|><|0|><|10|><|10|><pre>  keep   spaces\n  and lines</pre>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Code-Block\"><pre>  keep   spaces\n  and lines</pre></div>",
+   "blocks": "[{\"label\":\"Code-Block\",\"bbox\":[0,0,10,10],\"html\":\"<pre>  keep   spaces\\n  and lines</pre>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Code-Block|><|0|><|0|><|10|><|10|><p class=\"x\" style=\"color:red\">styled</p>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Code-Block\"><p class=\"x\" style=\"color:red\">styled</p></div>",
+   "blocks": "[{\"label\":\"Code-Block\",\"bbox\":[0,0,10,10],\"html\":\"<p class=\\\"x\\\" style=\\\"color:red\\\">styled</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Code-Block|><|0|><|0|><|10|><|10|><p>भारत</p>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Code-Block\"><p>भारत</p></div>",
+   "blocks": "[{\"label\":\"Code-Block\",\"bbox\":[0,0,10,10],\"html\":\"<p>भारत</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Code-Block|><|0|><|0|><|10|><|10|><p>self<br/>break</p>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Code-Block\"><p>self<br/>break</p></div>",
+   "blocks": "[{\"label\":\"Code-Block\",\"bbox\":[0,0,10,10],\"html\":\"<p>self<br/>break</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Code-Block|><|0|><|0|><|10|><|10|><div>nested <div>inner</div> tail</div>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Code-Block\"><div>nested <div>inner</div> tail</div></div>",
+   "blocks": "[{\"label\":\"Code-Block\",\"bbox\":[0,0,10,10],\"html\":\"<div>nested <div>inner</div> tail</div>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Code-Block|><|0|><|0|><|10|><|10|><p>text</p></div>after the close",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Code-Block\"><p>text</p></div>after the close",
+   "blocks": "[{\"label\":\"Code-Block\",\"bbox\":[0,0,10,10],\"html\":\"<p>text</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Complex-Block|><|0|><|0|><|10|><|10|><p>hello</p>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Complex-Block\"><p>hello</p></div>",
+   "blocks": "[{\"label\":\"Complex-Block\",\"bbox\":[0,0,10,10],\"html\":\"<p>hello</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Complex-Block|><|0|><|0|><|10|><|10|><p>hello</p>\n<p>world</p>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Complex-Block\"><p>hello</p>\n<p>world</p></div>",
+   "blocks": "[{\"label\":\"Complex-Block\",\"bbox\":[0,0,10,10],\"html\":\"<p>hello</p>\\n<p>world</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Complex-Block|><|0|><|0|><|10|><|10|><h1>Title</h1><p>body text</p>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Complex-Block\"><h1>Title</h1><p>body text</p></div>",
+   "blocks": "[{\"label\":\"Complex-Block\",\"bbox\":[0,0,10,10],\"html\":\"<h1>Title</h1><p>body text</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Complex-Block|><|0|><|0|><|10|><|10|><pre>  keep   spaces\n  and lines</pre>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Complex-Block\"><pre>  keep   spaces\n  and lines</pre></div>",
+   "blocks": "[{\"label\":\"Complex-Block\",\"bbox\":[0,0,10,10],\"html\":\"<pre>  keep   spaces\\n  and lines</pre>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Complex-Block|><|0|><|0|><|10|><|10|><p class=\"x\" style=\"color:red\">styled</p>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Complex-Block\"><p class=\"x\" style=\"color:red\">styled</p></div>",
+   "blocks": "[{\"label\":\"Complex-Block\",\"bbox\":[0,0,10,10],\"html\":\"<p class=\\\"x\\\" style=\\\"color:red\\\">styled</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Complex-Block|><|0|><|0|><|10|><|10|><p>भारत</p>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Complex-Block\"><p>भारत</p></div>",
+   "blocks": "[{\"label\":\"Complex-Block\",\"bbox\":[0,0,10,10],\"html\":\"<p>भारत</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Complex-Block|><|0|><|0|><|10|><|10|><p>self<br/>break</p>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Complex-Block\"><p>self<br/>break</p></div>",
+   "blocks": "[{\"label\":\"Complex-Block\",\"bbox\":[0,0,10,10],\"html\":\"<p>self<br/>break</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Complex-Block|><|0|><|0|><|10|><|10|><div>nested <div>inner</div> tail</div>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Complex-Block\"><div>nested <div>inner</div> tail</div></div>",
+   "blocks": "[{\"label\":\"Complex-Block\",\"bbox\":[0,0,10,10],\"html\":\"<div>nested <div>inner</div> tail</div>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Complex-Block|><|0|><|0|><|10|><|10|><p>text</p></div>after the close",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Complex-Block\"><p>text</p></div>after the close",
+   "blocks": "[{\"label\":\"Complex-Block\",\"bbox\":[0,0,10,10],\"html\":\"<p>text</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Page-Header|><|10|><|10|><|200|><|30|><p>top</p><|Text|><|10|><|40|><|900|><|900|><p>body</p><|Page-Footer|><|10|><|950|><|200|><|990|><p>foot</p>",
+   "html": "<div data-bbox=\"10 10 200 30\" data-label=\"Page-Header\"><p>top</p></div>\n<div data-bbox=\"10 40 900 900\" data-label=\"Text\"><p>body</p></div>\n<div data-bbox=\"10 950 200 990\" data-label=\"Page-Footer\"><p>foot</p></div>",
+   "blocks": "[{\"label\":\"Page-Header\",\"bbox\":[10,10,200,30],\"html\":\"<p>top</p>\",\"truncated\":false},{\"label\":\"Text\",\"bbox\":[10,40,900,900],\"html\":\"<p>body</p>\",\"truncated\":false},{\"label\":\"Page-Footer\",\"bbox\":[10,950,200,990],\"html\":\"<p>foot</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Text|><|0|><|0|><|10|><|10|><p>one</p></div>tail<|Text|><|0|><|0|><|10|><|10|><p>two</p>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Text\"><p>one</p></div>tail\n<div data-bbox=\"0 0 10 10\" data-label=\"Text\"><p>two</p></div>",
+   "blocks": "[{\"label\":\"Text\",\"bbox\":[0,0,10,10],\"html\":\"<p>one</p>\",\"truncated\":false},{\"label\":\"Text\",\"bbox\":[0,0,10,10],\"html\":\"<p>two</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Table|><|7|><|7|><|700|><|700|><table><tr><td>a<td>b<tr><td>c<td>d</table>",
+   "html": "<div data-bbox=\"7 7 700 700\" data-label=\"Table\"><table><tr><td>a</td><td>b</td></tr><tr><td>c</td><td>d</td></tr></table></div>",
+   "blocks": "[{\"label\":\"Table\",\"bbox\":[7,7,700,700],\"html\":\"<table><tr><td>a</td><td>b</td></tr><tr><td>c</td><td>d</td></tr></table>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Table|><|7|><|7|><|700|><|700|><table><tr><td data-kind=\"parent\" data-cs=\"2\">wide<td data-kind=\"ghost\">x<td data-kind=\"ghost\">y<tr><td>c<td>d</table>",
+   "html": "<div data-bbox=\"7 7 700 700\" data-label=\"Table\"><table><tr><td colspan=\"3\">wide</td></tr><tr><td>c</td><td>d</td></tr></table></div>",
+   "blocks": "[{\"label\":\"Table\",\"bbox\":[7,7,700,700],\"html\":\"<table><tr><td colspan=\\\"3\\\">wide</td></tr><tr><td>c</td><td>d</td></tr></table>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Table|><|7|><|7|><|700|><|700|><table><tr><td data-kind=\"parent\" data-rs=\"2\">tall<tr><td data-kind=\"ghost\">x</table>",
+   "html": "<div data-bbox=\"7 7 700 700\" data-label=\"Table\"><table><tr><td rowspan=\"2\">tall</td></tr><tr></tr></table></div>",
+   "blocks": "[{\"label\":\"Table\",\"bbox\":[7,7,700,700],\"html\":\"<table><tr><td rowspan=\\\"2\\\">tall</td></tr><tr></tr></table>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Table|><|7|><|7|><|700|><|700|><table><tr><th>h</th><th>h2</th><tr><td>1<td>2</table>",
+   "html": "<div data-bbox=\"7 7 700 700\" data-label=\"Table\"><table><tr><th>h</th><th>h2</th></tr><tr><td>1</td><td>2</td></tr></table></div>",
+   "blocks": "[{\"label\":\"Table\",\"bbox\":[7,7,700,700],\"html\":\"<table><tr><th>h</th><th>h2</th></tr><tr><td>1</td><td>2</td></tr></table>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Table|><|7|><|7|><|700|><|700|><table><tr><td><table><tr><td>inner</table></table>",
+   "html": "<div data-bbox=\"7 7 700 700\" data-label=\"Table\"><table><tr><td><table><tr><td>inner</td></tr></table></td></tr></table></div>",
+   "blocks": "[{\"label\":\"Table\",\"bbox\":[7,7,700,700],\"html\":\"<table><tr><td><table><tr><td>inner</td></tr></table></td></tr></table>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Table|><|7|><|7|><|700|><|700|><table><tr><td data-kind=\"parent\" data-cs=\"2\" data-rs=\"2\">big<td data-kind=\"ghost\">x<td data-kind=\"ghost\">y<tr><td data-kind=\"ghost\">z<td>empty</table>",
+   "html": "<div data-bbox=\"7 7 700 700\" data-label=\"Table\"><table><tr><td colspan=\"3\">big</td></tr><tr><td>empty</td></tr></table></div>",
+   "blocks": "[{\"label\":\"Table\",\"bbox\":[7,7,700,700],\"html\":\"<table><tr><td colspan=\\\"3\\\">big</td></tr><tr><td>empty</td></tr></table>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Table|><|0|><|0|><|10|><|10|><table><tr><|box|><|1|><|2|><|3|><|4|><td>x</table>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Table\"><table><tr><td data-bbox=\"1 2 3 4\">x</td></tr></table></div>",
+   "blocks": "[{\"label\":\"Table\",\"bbox\":[0,0,10,10],\"html\":\"<table><tr><td>x</td></tr></table>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Figure|><|0|><|0|><|10|><|10|><|box|><|5|><|6|><|7|><|8|><img src=\"p.png\">",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Figure\"><img data-bbox=\"5 6 7 8\" src=\"p.png\"/></div>",
+   "blocks": "[{\"label\":\"Figure\",\"bbox\":[0,0,10,10],\"html\":\"<img src=\\\"p.png\\\"/>\",\"truncated\":false}]"
+  },
+  {
+   "input": "```html\n<|Text|><|0|><|0|><|10|><|10|><p>wrapped</p>\n```",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Text\"><p>wrapped</p></div>",
+   "blocks": "[{\"label\":\"Text\",\"bbox\":[0,0,10,10],\"html\":\"<p>wrapped</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "```\n<|Text|><|0|><|0|><|10|><|10|><p>a</p><|Text|><|0|><|0|><|10|><|10|><p>b</p>\n```",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Text\"><p>a</p></div>\n<div data-bbox=\"0 0 10 10\" data-label=\"Text\"><p>b</p></div>",
+   "blocks": "[{\"label\":\"Text\",\"bbox\":[0,0,10,10],\"html\":\"<p>a</p>\",\"truncated\":false},{\"label\":\"Text\",\"bbox\":[0,0,10,10],\"html\":\"<p>b</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Code-Block|><|0|><|0|><|10|><|10|><pre>code</pre>\n```",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Code-Block\"><pre>code</pre>\n```</div>",
+   "blocks": "[{\"label\":\"Code-Block\",\"bbox\":[0,0,10,10],\"html\":\"<pre>code</pre>\\n```\",\"truncated\":false}]"
+  },
+  {
+   "input": "``` \n<|Text|><|0|><|0|><|10|><|10|><p>space after fence</p>",
+   "html": "``` \n<div data-bbox=\"0 0 10 10\" data-label=\"Text\"><p>space after fence</p></div>",
+   "blocks": "[{\"label\":\"Text\",\"bbox\":[0,0,10,10],\"html\":\"<p>space after fence</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "```<|Text|><|0|><|0|><|10|><|10|><p>no newline</p>```",
+   "html": "```\n<div data-bbox=\"0 0 10 10\" data-label=\"Text\"><p>no newline</p>```</div>",
+   "blocks": "[{\"label\":\"Text\",\"bbox\":[0,0,10,10],\"html\":\"<p>no newline</p>```\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Text|><|1|><|2|><|3|>",
+   "html": "<|Text|><|1|><|2|><|3|>",
+   "blocks": "<|Text|><|1|><|2|><|3|>"
+  },
+  {
+   "input": "<|Text|><|0|><|0|><|10|><|10|><p>a</p><|Text|><|1|><|2|>",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Text\"><p>a</p><|Text|><|1|><|2|></div>",
+   "blocks": "[{\"label\":\"Text\",\"bbox\":[0,0,10,10],\"html\":\"<p>a</p><|Text|><|1|><|2|>\",\"truncated\":true}]"
+  },
+  {
+   "input": "<|Text|><|0|><|0|><|10|><|10|><p>a</p><|Te",
+   "html": "<div data-bbox=\"0 0 10 10\" data-label=\"Text\"><p>a</p><|Te</div>",
+   "blocks": "[{\"label\":\"Text\",\"bbox\":[0,0,10,10],\"html\":\"<p>a</p><|Te\",\"truncated\":true}]"
+  },
+  {
+   "input": "<|Text|><|854|><|133|><|901|><|215|><p>hello</p><|Complex-Block|><|67|><|527|><|84|><|540|><p>hello</p>",
+   "html": "<div data-bbox=\"854 133 901 215\" data-label=\"Text\"><p>hello</p></div>\n<div data-bbox=\"67 527 84 540\" data-label=\"Complex-Block\"><p>hello</p></div>",
+   "blocks": "[{\"label\":\"Text\",\"bbox\":[854,133,901,215],\"html\":\"<p>hello</p>\",\"truncated\":false},{\"label\":\"Complex-Block\",\"bbox\":[67,527,84,540],\"html\":\"<p>hello</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Code-Block|><|325|><|694|><|356|><|721|><p class=\"x\" style=\"color:red\">styled</p><|Caption|><|95|><|886|><|170|><|983|><p>text</p></div>after the close",
+   "html": "<div data-bbox=\"325 694 356 721\" data-label=\"Code-Block\"><p class=\"x\" style=\"color:red\">styled</p></div>\n<div data-bbox=\"95 886 170 983\" data-label=\"Caption\"><p>text</p></div>after the close",
+   "blocks": "[{\"label\":\"Code-Block\",\"bbox\":[325,694,356,721],\"html\":\"<p class=\\\"x\\\" style=\\\"color:red\\\">styled</p>\",\"truncated\":false},{\"label\":\"Caption\",\"bbox\":[95,886,170,983],\"html\":\"<p>text</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Figure|><|191|><|640|><|244|><|656|><p class=\"x\" style=\"color:red\">styled</p><|Page-Header|><|339|><|637|><|343|><|709|><p>hello</p>\n<p>world</p>",
+   "html": "<div data-bbox=\"191 640 244 656\" data-label=\"Figure\"><p class=\"x\" style=\"color:red\">styled</p></div>\n<div data-bbox=\"339 637 343 709\" data-label=\"Page-Header\"><p>hello</p>\n<p>world</p></div>",
+   "blocks": "[{\"label\":\"Figure\",\"bbox\":[191,640,244,656],\"html\":\"<p class=\\\"x\\\" style=\\\"color:red\\\">styled</p>\",\"truncated\":false},{\"label\":\"Page-Header\",\"bbox\":[339,637,343,709],\"html\":\"<p>hello</p>\\n<p>world</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Text|><|93|><|680|><|130|><|719|><h1>Title</h1><p>body text</p>",
+   "html": "<div data-bbox=\"93 680 130 719\" data-label=\"Text\"><h1>Title</h1><p>body text</p></div>",
+   "blocks": "[{\"label\":\"Text\",\"bbox\":[93,680,130,719],\"html\":\"<h1>Title</h1><p>body text</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Code-Block|><|711|><|704|><|750|><|785|><p>text</p></div>after the close",
+   "html": "<div data-bbox=\"711 704 750 785\" data-label=\"Code-Block\"><p>text</p></div>after the close",
+   "blocks": "[{\"label\":\"Code-Block\",\"bbox\":[711,704,750,785],\"html\":\"<p>text</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Caption|><|469|><|770|><|547|><|788|><p>self<br/>break</p><|Complex-Block|><|640|><|287|><|644|><|299|><p class=\"x\" style=\"color:red\">styled</p><|Complex-Block|><|640|><|539|><|734|><|576|><p>hello</p><|Caption|><|872|><|900|><|920|><|945|><pre>  keep   spaces\n  and lines</pre>",
+   "html": "<div data-bbox=\"469 770 547 788\" data-label=\"Caption\"><p>self<br/>break</p></div>\n<div data-bbox=\"640 287 644 299\" data-label=\"Complex-Block\"><p class=\"x\" style=\"color:red\">styled</p></div>\n<div data-bbox=\"640 539 734 576\" data-label=\"Complex-Block\"><p>hello</p></div>\n<div data-bbox=\"872 900 920 945\" data-label=\"Caption\"><pre>  keep   spaces\n  and lines</pre></div>",
+   "blocks": "[{\"label\":\"Caption\",\"bbox\":[469,770,547,788],\"html\":\"<p>self<br/>break</p>\",\"truncated\":false},{\"label\":\"Complex-Block\",\"bbox\":[640,287,644,299],\"html\":\"<p class=\\\"x\\\" style=\\\"color:red\\\">styled</p>\",\"truncated\":false},{\"label\":\"Complex-Block\",\"bbox\":[640,539,734,576],\"html\":\"<p>hello</p>\",\"truncated\":false},{\"label\":\"Caption\",\"bbox\":[872,900,920,945],\"html\":\"<pre>  keep   spaces\\n  and lines</pre>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Code-Block|><|704|><|69|><|784|><|106|><p>hello</p><|Text|><|657|><|483|><|732|><|518|><pre>  keep   spaces\n  and lines</pre>",
+   "html": "<div data-bbox=\"704 69 784 106\" data-label=\"Code-Block\"><p>hello</p></div>\n<div data-bbox=\"657 483 732 518\" data-label=\"Text\"><pre>  keep   spaces\n  and lines</pre></div>",
+   "blocks": "[{\"label\":\"Code-Block\",\"bbox\":[704,69,784,106],\"html\":\"<p>hello</p>\",\"truncated\":false},{\"label\":\"Text\",\"bbox\":[657,483,732,518],\"html\":\"<pre>  keep   spaces\\n  and lines</pre>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Page-Header|><|356|><|730|><|382|><|829|><p>hello</p>",
+   "html": "<div data-bbox=\"356 730 382 829\" data-label=\"Page-Header\"><p>hello</p></div>",
+   "blocks": "[{\"label\":\"Page-Header\",\"bbox\":[356,730,382,829],\"html\":\"<p>hello</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Text|><|718|><|307|><|784|><|315|><p>hello</p><|Code-Block|><|804|><|588|><|814|><|595|><p>hello</p><|Page-Header|><|416|><|622|><|465|><|671|><h1>Title</h1><p>body text</p>",
+   "html": "<div data-bbox=\"718 307 784 315\" data-label=\"Text\"><p>hello</p></div>\n<div data-bbox=\"804 588 814 595\" data-label=\"Code-Block\"><p>hello</p></div>\n<div data-bbox=\"416 622 465 671\" data-label=\"Page-Header\"><h1>Title</h1><p>body text</p></div>",
+   "blocks": "[{\"label\":\"Text\",\"bbox\":[718,307,784,315],\"html\":\"<p>hello</p>\",\"truncated\":false},{\"label\":\"Code-Block\",\"bbox\":[804,588,814,595],\"html\":\"<p>hello</p>\",\"truncated\":false},{\"label\":\"Page-Header\",\"bbox\":[416,622,465,671],\"html\":\"<h1>Title</h1><p>body text</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Code-Block|><|338|><|165|><|394|><|172|><p>भारत</p>",
+   "html": "<div data-bbox=\"338 165 394 172\" data-label=\"Code-Block\"><p>भारत</p></div>",
+   "blocks": "[{\"label\":\"Code-Block\",\"bbox\":[338,165,394,172],\"html\":\"<p>भारत</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Caption|><|561|><|632|><|661|><|662|><h1>Title</h1><p>body text</p><|Text|><|865|><|837|><|881|><|840|><p>self<br/>break</p><|Caption|><|829|><|199|><|918|><|204|><p>भारत</p><|Caption|><|68|><|787|><|129|><|886|><p class=\"x\" style=\"color:red\">styled</p>",
+   "html": "<div data-bbox=\"561 632 661 662\" data-label=\"Caption\"><h1>Title</h1><p>body text</p></div>\n<div data-bbox=\"865 837 881 840\" data-label=\"Text\"><p>self<br/>break</p></div>\n<div data-bbox=\"829 199 918 204\" data-label=\"Caption\"><p>भारत</p></div>\n<div data-bbox=\"68 787 129 886\" data-label=\"Caption\"><p class=\"x\" style=\"color:red\">styled</p></div>",
+   "blocks": "[{\"label\":\"Caption\",\"bbox\":[561,632,661,662],\"html\":\"<h1>Title</h1><p>body text</p>\",\"truncated\":false},{\"label\":\"Text\",\"bbox\":[865,837,881,840],\"html\":\"<p>self<br/>break</p>\",\"truncated\":false},{\"label\":\"Caption\",\"bbox\":[829,199,918,204],\"html\":\"<p>भारत</p>\",\"truncated\":false},{\"label\":\"Caption\",\"bbox\":[68,787,129,886],\"html\":\"<p class=\\\"x\\\" style=\\\"color:red\\\">styled</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Page-Header|><|665|><|809|><|716|><|818|><div>nested <div>inner</div> tail</div>",
+   "html": "<div data-bbox=\"665 809 716 818\" data-label=\"Page-Header\"><div>nested <div>inner</div> tail</div></div>",
+   "blocks": "[{\"label\":\"Page-Header\",\"bbox\":[665,809,716,818],\"html\":\"<div>nested <div>inner</div> tail</div>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Page-Header|><|873|><|542|><|925|><|607|><p>भारत</p><|Caption|><|518|><|682|><|540|><|721|><p>text</p></div>after the close",
+   "html": "<div data-bbox=\"873 542 925 607\" data-label=\"Page-Header\"><p>भारत</p></div>\n<div data-bbox=\"518 682 540 721\" data-label=\"Caption\"><p>text</p></div>after the close",
+   "blocks": "[{\"label\":\"Page-Header\",\"bbox\":[873,542,925,607],\"html\":\"<p>भारत</p>\",\"truncated\":false},{\"label\":\"Caption\",\"bbox\":[518,682,540,721],\"html\":\"<p>text</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Complex-Block|><|131|><|891|><|135|><|904|><p class=\"x\" style=\"color:red\">styled</p>",
+   "html": "<div data-bbox=\"131 891 135 904\" data-label=\"Complex-Block\"><p class=\"x\" style=\"color:red\">styled</p></div>",
+   "blocks": "[{\"label\":\"Complex-Block\",\"bbox\":[131,891,135,904],\"html\":\"<p class=\\\"x\\\" style=\\\"color:red\\\">styled</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Code-Block|><|805|><|857|><|885|><|898|><p>hello</p>",
+   "html": "<div data-bbox=\"805 857 885 898\" data-label=\"Code-Block\"><p>hello</p></div>",
+   "blocks": "[{\"label\":\"Code-Block\",\"bbox\":[805,857,885,898],\"html\":\"<p>hello</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Figure|><|703|><|839|><|725|><|904|><h1>Title</h1><p>body text</p><|Section-Header|><|670|><|488|><|712|><|506|><p>hello</p>\n<p>world</p>",
+   "html": "<div data-bbox=\"703 839 725 904\" data-label=\"Figure\"><h1>Title</h1><p>body text</p></div>\n<div data-bbox=\"670 488 712 506\" data-label=\"Section-Header\"><p>hello</p>\n<p>world</p></div>",
+   "blocks": "[{\"label\":\"Figure\",\"bbox\":[703,839,725,904],\"html\":\"<h1>Title</h1><p>body text</p>\",\"truncated\":false},{\"label\":\"Section-Header\",\"bbox\":[670,488,712,506],\"html\":\"<p>hello</p>\\n<p>world</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Complex-Block|><|95|><|775|><|182|><|787|><p>भारत</p>",
+   "html": "<div data-bbox=\"95 775 182 787\" data-label=\"Complex-Block\"><p>भारत</p></div>",
+   "blocks": "[{\"label\":\"Complex-Block\",\"bbox\":[95,775,182,787],\"html\":\"<p>भारत</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Caption|><|369|><|555|><|375|><|620|><div>nested <div>inner</div> tail</div>",
+   "html": "<div data-bbox=\"369 555 375 620\" data-label=\"Caption\"><div>nested <div>inner</div> tail</div></div>",
+   "blocks": "[{\"label\":\"Caption\",\"bbox\":[369,555,375,620],\"html\":\"<div>nested <div>inner</div> tail</div>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Text|><|9|><|661|><|82|><|686|><p>hello</p>",
+   "html": "<div data-bbox=\"9 661 82 686\" data-label=\"Text\"><p>hello</p></div>",
+   "blocks": "[{\"label\":\"Text\",\"bbox\":[9,661,82,686],\"html\":\"<p>hello</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Table|><|606|><|300|><|664|><|306|><p>hello</p><|Section-Header|><|420|><|688|><|515|><|763|><div>nested <div>inner</div> tail</div>",
+   "html": "<div data-bbox=\"606 300 664 306\" data-label=\"Table\"><p>hello</p></div>\n<div data-bbox=\"420 688 515 763\" data-label=\"Section-Header\"><div>nested <div>inner</div> tail</div></div>",
+   "blocks": "[{\"label\":\"Table\",\"bbox\":[606,300,664,306],\"html\":\"<p>hello</p>\",\"truncated\":false},{\"label\":\"Section-Header\",\"bbox\":[420,688,515,763],\"html\":\"<div>nested <div>inner</div> tail</div>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Figure|><|261|><|446|><|276|><|533|><div>nested <div>inner</div> tail</div><|Code-Block|><|2|><|9|><|100|><|62|><p>self<br/>break</p><|Figure|><|50|><|163|><|107|><|165|><p>hello</p><|Page-Header|><|861|><|141|><|901|><|220|><p>hello</p>",
+   "html": "<div data-bbox=\"261 446 276 533\" data-label=\"Figure\"><div>nested <div>inner</div> tail</div></div>\n<div data-bbox=\"2 9 100 62\" data-label=\"Code-Block\"><p>self<br/>break</p></div>\n<div data-bbox=\"50 163 107 165\" data-label=\"Figure\"><p>hello</p></div>\n<div data-bbox=\"861 141 901 220\" data-label=\"Page-Header\"><p>hello</p></div>",
+   "blocks": "[{\"label\":\"Figure\",\"bbox\":[261,446,276,533],\"html\":\"<div>nested <div>inner</div> tail</div>\",\"truncated\":false},{\"label\":\"Code-Block\",\"bbox\":[2,9,100,62],\"html\":\"<p>self<br/>break</p>\",\"truncated\":false},{\"label\":\"Figure\",\"bbox\":[50,163,107,165],\"html\":\"<p>hello</p>\",\"truncated\":false},{\"label\":\"Page-Header\",\"bbox\":[861,141,901,220],\"html\":\"<p>hello</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Text|><|22|><|727|><|55|><|792|><div>nested <div>inner</div> tail</div><|Figure|><|447|><|413|><|466|><|487|><h1>Title</h1><p>body text</p><|Complex-Block|><|445|><|253|><|463|><|348|><h1>Title</h1><p>body text</p><|Caption|><|771|><|248|><|861|><|273|><p>self<br/>break</p><|Figure|><|680|><|490|><|765|><|571|><p>hello</p>\n<p>world</p>",
+   "html": "<div data-bbox=\"22 727 55 792\" data-label=\"Text\"><div>nested <div>inner</div> tail</div></div>\n<div data-bbox=\"447 413 466 487\" data-label=\"Figure\"><h1>Title</h1><p>body text</p></div>\n<div data-bbox=\"445 253 463 348\" data-label=\"Complex-Block\"><h1>Title</h1><p>body text</p></div>\n<div data-bbox=\"771 248 861 273\" data-label=\"Caption\"><p>self<br/>break</p></div>\n<div data-bbox=\"680 490 765 571\" data-label=\"Figure\"><p>hello</p>\n<p>world</p></div>",
+   "blocks": "[{\"label\":\"Text\",\"bbox\":[22,727,55,792],\"html\":\"<div>nested <div>inner</div> tail</div>\",\"truncated\":false},{\"label\":\"Figure\",\"bbox\":[447,413,466,487],\"html\":\"<h1>Title</h1><p>body text</p>\",\"truncated\":false},{\"label\":\"Complex-Block\",\"bbox\":[445,253,463,348],\"html\":\"<h1>Title</h1><p>body text</p>\",\"truncated\":false},{\"label\":\"Caption\",\"bbox\":[771,248,861,273],\"html\":\"<p>self<br/>break</p>\",\"truncated\":false},{\"label\":\"Figure\",\"bbox\":[680,490,765,571],\"html\":\"<p>hello</p>\\n<p>world</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Section-Header|><|787|><|247|><|830|><|347|><p>hello</p>\n<p>world</p>",
+   "html": "<div data-bbox=\"787 247 830 347\" data-label=\"Section-Header\"><p>hello</p>\n<p>world</p></div>",
+   "blocks": "[{\"label\":\"Section-Header\",\"bbox\":[787,247,830,347],\"html\":\"<p>hello</p>\\n<p>world</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Section-Header|><|659|><|153|><|729|><|220|><p>self<br/>break</p><|Complex-Block|><|224|><|195|><|242|><|212|><p class=\"x\" style=\"color:red\">styled</p>",
+   "html": "<div data-bbox=\"659 153 729 220\" data-label=\"Section-Header\"><p>self<br/>break</p></div>\n<div data-bbox=\"224 195 242 212\" data-label=\"Complex-Block\"><p class=\"x\" style=\"color:red\">styled</p></div>",
+   "blocks": "[{\"label\":\"Section-Header\",\"bbox\":[659,153,729,220],\"html\":\"<p>self<br/>break</p>\",\"truncated\":false},{\"label\":\"Complex-Block\",\"bbox\":[224,195,242,212],\"html\":\"<p class=\\\"x\\\" style=\\\"color:red\\\">styled</p>\",\"truncated\":false}]"
+  },
+  {
+   "input": "<|Text|><|0|><|0|><|1|><|1|><td>stray cell",
+   "html": "<div data-bbox=\"0 0 1 1\" data-label=\"Text\"><td>stray cell</td></div>",
+   "blocks": "[{\"label\":\"Text\",\"bbox\":[0,0,1,1],\"html\":\"<td>stray cell</td>\",\"truncated\":false}]"
+  }
+ ],
+ "divergences": [
+  {
+   "input": "<|Text|><|0|><|0|><|10|><|10|><p>a < b &amp; c > d</p>",
+   "python_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Text\"><p>a < b &amp; c > d</p></div>",
+   "python_blocks": "[{\"label\": \"Text\", \"bbox\": [0, 0, 10, 10], \"html\": \"<p>a &lt; b &amp; c &gt; d</p>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Text\"><p>a < b &amp; c > d</p></div>",
+   "rust_blocks": "[{\"label\":\"Text\",\"bbox\":[0,0,10,10],\"html\":\"<p>a < b &amp; c > d</p>\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Text|><|0|><|0|><|10|><|10|><ul><li>one<li>two</ul>",
+   "python_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Text\"><ul><li>one<li>two</ul></div>",
+   "python_blocks": "[{\"label\": \"Text\", \"bbox\": [0, 0, 10, 10], \"html\": \"<ul><li>one<li>two</li></li></ul>\", \"truncated\": true}]",
+   "rust_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Text\"><ul><li>one<li>two</ul></div>",
+   "rust_blocks": "[{\"label\":\"Text\",\"bbox\":[0,0,10,10],\"html\":\"<ul><li>one<li>two</ul>\",\"truncated\":true}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Text|><|0|><|0|><|10|><|10|><p>literal <भारत after lt</p>",
+   "python_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Text\"><p>literal <भारत after lt</p></div>",
+   "python_blocks": "[{\"label\": \"Text\", \"bbox\": [0, 0, 10, 10], \"html\": \"<p>literal &lt;भारत after lt</p>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Text\"><p>literal <भारत after lt</p></div>",
+   "rust_blocks": "[{\"label\":\"Text\",\"bbox\":[0,0,10,10],\"html\":\"<p>literal <भारत after lt</p>\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Text|><|0|><|0|><|10|><|10|><img src=\"x.png\">",
+   "python_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Text\"><img src=\"x.png\"></div>",
+   "python_blocks": "[{\"label\": \"Text\", \"bbox\": [0, 0, 10, 10], \"html\": \"<img src=\\\"x.png\\\"/>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Text\"><img src=\"x.png\"></div>",
+   "rust_blocks": "[{\"label\":\"Text\",\"bbox\":[0,0,10,10],\"html\":\"<img src=\\\"x.png\\\">\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Text|><|0|><|0|><|10|><|10|><a href=\"https://example.com\" alt=\"t\">link</a>",
+   "python_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Text\"><a href=\"https://example.com\" alt=\"t\">link</a></div>",
+   "python_blocks": "[{\"label\": \"Text\", \"bbox\": [0, 0, 10, 10], \"html\": \"<a alt=\\\"t\\\" href=\\\"https://example.com\\\">link</a>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Text\"><a href=\"https://example.com\" alt=\"t\">link</a></div>",
+   "rust_blocks": "[{\"label\":\"Text\",\"bbox\":[0,0,10,10],\"html\":\"<a href=\\\"https://example.com\\\" alt=\\\"t\\\">link</a>\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Table|><|0|><|0|><|10|><|10|><p>a < b &amp; c > d</p>",
+   "python_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Table\"><p>a < b &amp; c > d</p></div>",
+   "python_blocks": "[{\"label\": \"Table\", \"bbox\": [0, 0, 10, 10], \"html\": \"<p>a &lt; b &amp; c &gt; d</p>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Table\"><p>a < b &amp; c > d</p></div>",
+   "rust_blocks": "[{\"label\":\"Table\",\"bbox\":[0,0,10,10],\"html\":\"<p>a < b &amp; c > d</p>\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Table|><|0|><|0|><|10|><|10|><ul><li>one<li>two</ul>",
+   "python_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Table\"><ul><li>one<li>two</ul></div>",
+   "python_blocks": "[{\"label\": \"Table\", \"bbox\": [0, 0, 10, 10], \"html\": \"<ul><li>one<li>two</li></li></ul>\", \"truncated\": true}]",
+   "rust_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Table\"><ul><li>one<li>two</ul></div>",
+   "rust_blocks": "[{\"label\":\"Table\",\"bbox\":[0,0,10,10],\"html\":\"<ul><li>one<li>two</ul>\",\"truncated\":true}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Table|><|0|><|0|><|10|><|10|><p>literal <भारत after lt</p>",
+   "python_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Table\"><p>literal <भारत after lt</p></div>",
+   "python_blocks": "[{\"label\": \"Table\", \"bbox\": [0, 0, 10, 10], \"html\": \"<p>literal &lt;भारत after lt</p>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Table\"><p>literal <भारत after lt</p></div>",
+   "rust_blocks": "[{\"label\":\"Table\",\"bbox\":[0,0,10,10],\"html\":\"<p>literal <भारत after lt</p>\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Table|><|0|><|0|><|10|><|10|><img src=\"x.png\">",
+   "python_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Table\"><img src=\"x.png\"></div>",
+   "python_blocks": "[{\"label\": \"Table\", \"bbox\": [0, 0, 10, 10], \"html\": \"<img src=\\\"x.png\\\"/>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Table\"><img src=\"x.png\"></div>",
+   "rust_blocks": "[{\"label\":\"Table\",\"bbox\":[0,0,10,10],\"html\":\"<img src=\\\"x.png\\\">\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Table|><|0|><|0|><|10|><|10|><a href=\"https://example.com\" alt=\"t\">link</a>",
+   "python_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Table\"><a href=\"https://example.com\" alt=\"t\">link</a></div>",
+   "python_blocks": "[{\"label\": \"Table\", \"bbox\": [0, 0, 10, 10], \"html\": \"<a alt=\\\"t\\\" href=\\\"https://example.com\\\">link</a>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Table\"><a href=\"https://example.com\" alt=\"t\">link</a></div>",
+   "rust_blocks": "[{\"label\":\"Table\",\"bbox\":[0,0,10,10],\"html\":\"<a href=\\\"https://example.com\\\" alt=\\\"t\\\">link</a>\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Page-Header|><|0|><|0|><|10|><|10|><p>a < b &amp; c > d</p>",
+   "python_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Page-Header\"><p>a < b &amp; c > d</p></div>",
+   "python_blocks": "[{\"label\": \"Page-Header\", \"bbox\": [0, 0, 10, 10], \"html\": \"<p>a &lt; b &amp; c &gt; d</p>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Page-Header\"><p>a < b &amp; c > d</p></div>",
+   "rust_blocks": "[{\"label\":\"Page-Header\",\"bbox\":[0,0,10,10],\"html\":\"<p>a < b &amp; c > d</p>\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Page-Header|><|0|><|0|><|10|><|10|><ul><li>one<li>two</ul>",
+   "python_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Page-Header\"><ul><li>one<li>two</ul></div>",
+   "python_blocks": "[{\"label\": \"Page-Header\", \"bbox\": [0, 0, 10, 10], \"html\": \"<ul><li>one<li>two</li></li></ul>\", \"truncated\": true}]",
+   "rust_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Page-Header\"><ul><li>one<li>two</ul></div>",
+   "rust_blocks": "[{\"label\":\"Page-Header\",\"bbox\":[0,0,10,10],\"html\":\"<ul><li>one<li>two</ul>\",\"truncated\":true}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Page-Header|><|0|><|0|><|10|><|10|><p>literal <भारत after lt</p>",
+   "python_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Page-Header\"><p>literal <भारत after lt</p></div>",
+   "python_blocks": "[{\"label\": \"Page-Header\", \"bbox\": [0, 0, 10, 10], \"html\": \"<p>literal &lt;भारत after lt</p>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Page-Header\"><p>literal <भारत after lt</p></div>",
+   "rust_blocks": "[{\"label\":\"Page-Header\",\"bbox\":[0,0,10,10],\"html\":\"<p>literal <भारत after lt</p>\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Page-Header|><|0|><|0|><|10|><|10|><img src=\"x.png\">",
+   "python_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Page-Header\"><img src=\"x.png\"></div>",
+   "python_blocks": "[{\"label\": \"Page-Header\", \"bbox\": [0, 0, 10, 10], \"html\": \"<img src=\\\"x.png\\\"/>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Page-Header\"><img src=\"x.png\"></div>",
+   "rust_blocks": "[{\"label\":\"Page-Header\",\"bbox\":[0,0,10,10],\"html\":\"<img src=\\\"x.png\\\">\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Page-Header|><|0|><|0|><|10|><|10|><a href=\"https://example.com\" alt=\"t\">link</a>",
+   "python_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Page-Header\"><a href=\"https://example.com\" alt=\"t\">link</a></div>",
+   "python_blocks": "[{\"label\": \"Page-Header\", \"bbox\": [0, 0, 10, 10], \"html\": \"<a alt=\\\"t\\\" href=\\\"https://example.com\\\">link</a>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Page-Header\"><a href=\"https://example.com\" alt=\"t\">link</a></div>",
+   "rust_blocks": "[{\"label\":\"Page-Header\",\"bbox\":[0,0,10,10],\"html\":\"<a href=\\\"https://example.com\\\" alt=\\\"t\\\">link</a>\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Section-Header|><|0|><|0|><|10|><|10|><p>a < b &amp; c > d</p>",
+   "python_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Section-Header\"><p>a < b &amp; c > d</p></div>",
+   "python_blocks": "[{\"label\": \"Section-Header\", \"bbox\": [0, 0, 10, 10], \"html\": \"<p>a &lt; b &amp; c &gt; d</p>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Section-Header\"><p>a < b &amp; c > d</p></div>",
+   "rust_blocks": "[{\"label\":\"Section-Header\",\"bbox\":[0,0,10,10],\"html\":\"<p>a < b &amp; c > d</p>\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Section-Header|><|0|><|0|><|10|><|10|><ul><li>one<li>two</ul>",
+   "python_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Section-Header\"><ul><li>one<li>two</ul></div>",
+   "python_blocks": "[{\"label\": \"Section-Header\", \"bbox\": [0, 0, 10, 10], \"html\": \"<ul><li>one<li>two</li></li></ul>\", \"truncated\": true}]",
+   "rust_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Section-Header\"><ul><li>one<li>two</ul></div>",
+   "rust_blocks": "[{\"label\":\"Section-Header\",\"bbox\":[0,0,10,10],\"html\":\"<ul><li>one<li>two</ul>\",\"truncated\":true}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Section-Header|><|0|><|0|><|10|><|10|><p>literal <भारत after lt</p>",
+   "python_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Section-Header\"><p>literal <भारत after lt</p></div>",
+   "python_blocks": "[{\"label\": \"Section-Header\", \"bbox\": [0, 0, 10, 10], \"html\": \"<p>literal &lt;भारत after lt</p>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Section-Header\"><p>literal <भारत after lt</p></div>",
+   "rust_blocks": "[{\"label\":\"Section-Header\",\"bbox\":[0,0,10,10],\"html\":\"<p>literal <भारत after lt</p>\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Section-Header|><|0|><|0|><|10|><|10|><img src=\"x.png\">",
+   "python_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Section-Header\"><img src=\"x.png\"></div>",
+   "python_blocks": "[{\"label\": \"Section-Header\", \"bbox\": [0, 0, 10, 10], \"html\": \"<img src=\\\"x.png\\\"/>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Section-Header\"><img src=\"x.png\"></div>",
+   "rust_blocks": "[{\"label\":\"Section-Header\",\"bbox\":[0,0,10,10],\"html\":\"<img src=\\\"x.png\\\">\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Section-Header|><|0|><|0|><|10|><|10|><a href=\"https://example.com\" alt=\"t\">link</a>",
+   "python_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Section-Header\"><a href=\"https://example.com\" alt=\"t\">link</a></div>",
+   "python_blocks": "[{\"label\": \"Section-Header\", \"bbox\": [0, 0, 10, 10], \"html\": \"<a alt=\\\"t\\\" href=\\\"https://example.com\\\">link</a>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Section-Header\"><a href=\"https://example.com\" alt=\"t\">link</a></div>",
+   "rust_blocks": "[{\"label\":\"Section-Header\",\"bbox\":[0,0,10,10],\"html\":\"<a href=\\\"https://example.com\\\" alt=\\\"t\\\">link</a>\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Figure|><|0|><|0|><|10|><|10|><p>a < b &amp; c > d</p>",
+   "python_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Figure\"><p>a < b &amp; c > d</p></div>",
+   "python_blocks": "[{\"label\": \"Figure\", \"bbox\": [0, 0, 10, 10], \"html\": \"<p>a &lt; b &amp; c &gt; d</p>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Figure\"><p>a < b &amp; c > d</p></div>",
+   "rust_blocks": "[{\"label\":\"Figure\",\"bbox\":[0,0,10,10],\"html\":\"<p>a < b &amp; c > d</p>\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Figure|><|0|><|0|><|10|><|10|><ul><li>one<li>two</ul>",
+   "python_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Figure\"><ul><li>one<li>two</ul></div>",
+   "python_blocks": "[{\"label\": \"Figure\", \"bbox\": [0, 0, 10, 10], \"html\": \"<ul><li>one<li>two</li></li></ul>\", \"truncated\": true}]",
+   "rust_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Figure\"><ul><li>one<li>two</ul></div>",
+   "rust_blocks": "[{\"label\":\"Figure\",\"bbox\":[0,0,10,10],\"html\":\"<ul><li>one<li>two</ul>\",\"truncated\":true}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Figure|><|0|><|0|><|10|><|10|><p>literal <भारत after lt</p>",
+   "python_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Figure\"><p>literal <भारत after lt</p></div>",
+   "python_blocks": "[{\"label\": \"Figure\", \"bbox\": [0, 0, 10, 10], \"html\": \"<p>literal &lt;भारत after lt</p>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Figure\"><p>literal <भारत after lt</p></div>",
+   "rust_blocks": "[{\"label\":\"Figure\",\"bbox\":[0,0,10,10],\"html\":\"<p>literal <भारत after lt</p>\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Figure|><|0|><|0|><|10|><|10|><img src=\"x.png\">",
+   "python_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Figure\"><img src=\"x.png\"></div>",
+   "python_blocks": "[{\"label\": \"Figure\", \"bbox\": [0, 0, 10, 10], \"html\": \"<img src=\\\"x.png\\\"/>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Figure\"><img src=\"x.png\"></div>",
+   "rust_blocks": "[{\"label\":\"Figure\",\"bbox\":[0,0,10,10],\"html\":\"<img src=\\\"x.png\\\">\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Figure|><|0|><|0|><|10|><|10|><a href=\"https://example.com\" alt=\"t\">link</a>",
+   "python_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Figure\"><a href=\"https://example.com\" alt=\"t\">link</a></div>",
+   "python_blocks": "[{\"label\": \"Figure\", \"bbox\": [0, 0, 10, 10], \"html\": \"<a alt=\\\"t\\\" href=\\\"https://example.com\\\">link</a>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Figure\"><a href=\"https://example.com\" alt=\"t\">link</a></div>",
+   "rust_blocks": "[{\"label\":\"Figure\",\"bbox\":[0,0,10,10],\"html\":\"<a href=\\\"https://example.com\\\" alt=\\\"t\\\">link</a>\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Caption|><|0|><|0|><|10|><|10|><p>a < b &amp; c > d</p>",
+   "python_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Caption\"><p>a < b &amp; c > d</p></div>",
+   "python_blocks": "[{\"label\": \"Caption\", \"bbox\": [0, 0, 10, 10], \"html\": \"<p>a &lt; b &amp; c &gt; d</p>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Caption\"><p>a < b &amp; c > d</p></div>",
+   "rust_blocks": "[{\"label\":\"Caption\",\"bbox\":[0,0,10,10],\"html\":\"<p>a < b &amp; c > d</p>\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Caption|><|0|><|0|><|10|><|10|><ul><li>one<li>two</ul>",
+   "python_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Caption\"><ul><li>one<li>two</ul></div>",
+   "python_blocks": "[{\"label\": \"Caption\", \"bbox\": [0, 0, 10, 10], \"html\": \"<ul><li>one<li>two</li></li></ul>\", \"truncated\": true}]",
+   "rust_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Caption\"><ul><li>one<li>two</ul></div>",
+   "rust_blocks": "[{\"label\":\"Caption\",\"bbox\":[0,0,10,10],\"html\":\"<ul><li>one<li>two</ul>\",\"truncated\":true}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Caption|><|0|><|0|><|10|><|10|><p>literal <भारत after lt</p>",
+   "python_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Caption\"><p>literal <भारत after lt</p></div>",
+   "python_blocks": "[{\"label\": \"Caption\", \"bbox\": [0, 0, 10, 10], \"html\": \"<p>literal &lt;भारत after lt</p>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Caption\"><p>literal <भारत after lt</p></div>",
+   "rust_blocks": "[{\"label\":\"Caption\",\"bbox\":[0,0,10,10],\"html\":\"<p>literal <भारत after lt</p>\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Caption|><|0|><|0|><|10|><|10|><img src=\"x.png\">",
+   "python_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Caption\"><img src=\"x.png\"></div>",
+   "python_blocks": "[{\"label\": \"Caption\", \"bbox\": [0, 0, 10, 10], \"html\": \"<img src=\\\"x.png\\\"/>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Caption\"><img src=\"x.png\"></div>",
+   "rust_blocks": "[{\"label\":\"Caption\",\"bbox\":[0,0,10,10],\"html\":\"<img src=\\\"x.png\\\">\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Caption|><|0|><|0|><|10|><|10|><a href=\"https://example.com\" alt=\"t\">link</a>",
+   "python_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Caption\"><a href=\"https://example.com\" alt=\"t\">link</a></div>",
+   "python_blocks": "[{\"label\": \"Caption\", \"bbox\": [0, 0, 10, 10], \"html\": \"<a alt=\\\"t\\\" href=\\\"https://example.com\\\">link</a>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Caption\"><a href=\"https://example.com\" alt=\"t\">link</a></div>",
+   "rust_blocks": "[{\"label\":\"Caption\",\"bbox\":[0,0,10,10],\"html\":\"<a href=\\\"https://example.com\\\" alt=\\\"t\\\">link</a>\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Code-Block|><|0|><|0|><|10|><|10|><p>a < b &amp; c > d</p>",
+   "python_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Code-Block\"><p>a < b &amp; c > d</p></div>",
+   "python_blocks": "[{\"label\": \"Code-Block\", \"bbox\": [0, 0, 10, 10], \"html\": \"<p>a &lt; b &amp; c &gt; d</p>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Code-Block\"><p>a < b &amp; c > d</p></div>",
+   "rust_blocks": "[{\"label\":\"Code-Block\",\"bbox\":[0,0,10,10],\"html\":\"<p>a < b &amp; c > d</p>\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Code-Block|><|0|><|0|><|10|><|10|><ul><li>one<li>two</ul>",
+   "python_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Code-Block\"><ul><li>one<li>two</ul></div>",
+   "python_blocks": "[{\"label\": \"Code-Block\", \"bbox\": [0, 0, 10, 10], \"html\": \"<ul><li>one<li>two</li></li></ul>\", \"truncated\": true}]",
+   "rust_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Code-Block\"><ul><li>one<li>two</ul></div>",
+   "rust_blocks": "[{\"label\":\"Code-Block\",\"bbox\":[0,0,10,10],\"html\":\"<ul><li>one<li>two</ul>\",\"truncated\":true}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Code-Block|><|0|><|0|><|10|><|10|><p>literal <भारत after lt</p>",
+   "python_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Code-Block\"><p>literal <भारत after lt</p></div>",
+   "python_blocks": "[{\"label\": \"Code-Block\", \"bbox\": [0, 0, 10, 10], \"html\": \"<p>literal &lt;भारत after lt</p>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Code-Block\"><p>literal <भारत after lt</p></div>",
+   "rust_blocks": "[{\"label\":\"Code-Block\",\"bbox\":[0,0,10,10],\"html\":\"<p>literal <भारत after lt</p>\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Code-Block|><|0|><|0|><|10|><|10|><img src=\"x.png\">",
+   "python_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Code-Block\"><img src=\"x.png\"></div>",
+   "python_blocks": "[{\"label\": \"Code-Block\", \"bbox\": [0, 0, 10, 10], \"html\": \"<img src=\\\"x.png\\\"/>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Code-Block\"><img src=\"x.png\"></div>",
+   "rust_blocks": "[{\"label\":\"Code-Block\",\"bbox\":[0,0,10,10],\"html\":\"<img src=\\\"x.png\\\">\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Code-Block|><|0|><|0|><|10|><|10|><a href=\"https://example.com\" alt=\"t\">link</a>",
+   "python_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Code-Block\"><a href=\"https://example.com\" alt=\"t\">link</a></div>",
+   "python_blocks": "[{\"label\": \"Code-Block\", \"bbox\": [0, 0, 10, 10], \"html\": \"<a alt=\\\"t\\\" href=\\\"https://example.com\\\">link</a>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Code-Block\"><a href=\"https://example.com\" alt=\"t\">link</a></div>",
+   "rust_blocks": "[{\"label\":\"Code-Block\",\"bbox\":[0,0,10,10],\"html\":\"<a href=\\\"https://example.com\\\" alt=\\\"t\\\">link</a>\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Complex-Block|><|0|><|0|><|10|><|10|><p>a < b &amp; c > d</p>",
+   "python_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Complex-Block\"><p>a < b &amp; c > d</p></div>",
+   "python_blocks": "[{\"label\": \"Complex-Block\", \"bbox\": [0, 0, 10, 10], \"html\": \"<p>a &lt; b &amp; c &gt; d</p>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Complex-Block\"><p>a < b &amp; c > d</p></div>",
+   "rust_blocks": "[{\"label\":\"Complex-Block\",\"bbox\":[0,0,10,10],\"html\":\"<p>a < b &amp; c > d</p>\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Complex-Block|><|0|><|0|><|10|><|10|><ul><li>one<li>two</ul>",
+   "python_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Complex-Block\"><ul><li>one<li>two</ul></div>",
+   "python_blocks": "[{\"label\": \"Complex-Block\", \"bbox\": [0, 0, 10, 10], \"html\": \"<ul><li>one<li>two</li></li></ul>\", \"truncated\": true}]",
+   "rust_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Complex-Block\"><ul><li>one<li>two</ul></div>",
+   "rust_blocks": "[{\"label\":\"Complex-Block\",\"bbox\":[0,0,10,10],\"html\":\"<ul><li>one<li>two</ul>\",\"truncated\":true}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Complex-Block|><|0|><|0|><|10|><|10|><p>literal <भारत after lt</p>",
+   "python_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Complex-Block\"><p>literal <भारत after lt</p></div>",
+   "python_blocks": "[{\"label\": \"Complex-Block\", \"bbox\": [0, 0, 10, 10], \"html\": \"<p>literal &lt;भारत after lt</p>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Complex-Block\"><p>literal <भारत after lt</p></div>",
+   "rust_blocks": "[{\"label\":\"Complex-Block\",\"bbox\":[0,0,10,10],\"html\":\"<p>literal <भारत after lt</p>\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Complex-Block|><|0|><|0|><|10|><|10|><img src=\"x.png\">",
+   "python_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Complex-Block\"><img src=\"x.png\"></div>",
+   "python_blocks": "[{\"label\": \"Complex-Block\", \"bbox\": [0, 0, 10, 10], \"html\": \"<img src=\\\"x.png\\\"/>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Complex-Block\"><img src=\"x.png\"></div>",
+   "rust_blocks": "[{\"label\":\"Complex-Block\",\"bbox\":[0,0,10,10],\"html\":\"<img src=\\\"x.png\\\">\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Complex-Block|><|0|><|0|><|10|><|10|><a href=\"https://example.com\" alt=\"t\">link</a>",
+   "python_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Complex-Block\"><a href=\"https://example.com\" alt=\"t\">link</a></div>",
+   "python_blocks": "[{\"label\": \"Complex-Block\", \"bbox\": [0, 0, 10, 10], \"html\": \"<a alt=\\\"t\\\" href=\\\"https://example.com\\\">link</a>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Complex-Block\"><a href=\"https://example.com\" alt=\"t\">link</a></div>",
+   "rust_blocks": "[{\"label\":\"Complex-Block\",\"bbox\":[0,0,10,10],\"html\":\"<a href=\\\"https://example.com\\\" alt=\\\"t\\\">link</a>\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Table|><|7|><|7|><|700|><|700|><table><tr><td>unterminated",
+   "python_html": "<div data-bbox=\"7 7 700 700\" data-label=\"Table\"><table><tr><td>unterminated</td></tr></div>",
+   "python_blocks": "[{\"label\": \"Table\", \"bbox\": [7, 7, 700, 700], \"html\": \"<table><tr><td>unterminated</td></tr></table>\", \"truncated\": true}]",
+   "rust_html": "<div data-bbox=\"7 7 700 700\" data-label=\"Table\"><table><tr><td>unterminated</td></tr></div>",
+   "rust_blocks": "[{\"label\":\"Table\",\"bbox\":[7,7,700,700],\"html\":\"<table><tr><td>unterminated</td></tr>\",\"truncated\":true}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Table|><|7|><|7|><|700|><|700|><table><tr><td>a<td>b",
+   "python_html": "<div data-bbox=\"7 7 700 700\" data-label=\"Table\"><table><tr><td>a</td><td>b</td></tr></div>",
+   "python_blocks": "[{\"label\": \"Table\", \"bbox\": [7, 7, 700, 700], \"html\": \"<table><tr><td>a</td><td>b</td></tr></table>\", \"truncated\": true}]",
+   "rust_html": "<div data-bbox=\"7 7 700 700\" data-label=\"Table\"><table><tr><td>a</td><td>b</td></tr></div>",
+   "rust_blocks": "[{\"label\":\"Table\",\"bbox\":[7,7,700,700],\"html\":\"<table><tr><td>a</td><td>b</td></tr>\",\"truncated\":true}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Text|><|0|><|0|><|10|><|10|><p>cut mid tag",
+   "python_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Text\"><p>cut mid tag</div>",
+   "python_blocks": "[{\"label\": \"Text\", \"bbox\": [0, 0, 10, 10], \"html\": \"<p>cut mid tag</p>\", \"truncated\": true}]",
+   "rust_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Text\"><p>cut mid tag</div>",
+   "rust_blocks": "[{\"label\":\"Text\",\"bbox\":[0,0,10,10],\"html\":\"<p>cut mid tag\",\"truncated\":true}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Text|><|0|><|0|><|10|><|10|><p>cut mid para",
+   "python_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Text\"><p>cut mid para</div>",
+   "python_blocks": "[{\"label\": \"Text\", \"bbox\": [0, 0, 10, 10], \"html\": \"<p>cut mid para</p>\", \"truncated\": true}]",
+   "rust_html": "<div data-bbox=\"0 0 10 10\" data-label=\"Text\"><p>cut mid para</div>",
+   "rust_blocks": "[{\"label\":\"Text\",\"bbox\":[0,0,10,10],\"html\":\"<p>cut mid para\",\"truncated\":true}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Text|><|565|><|112|><|642|><|152|><p>hello</p><|Figure|><|511|><|14|><|595|><|101|><p>self<br/>break</p><|Figure|><|516|><|717|><|572|><|751|><div>nested <div>inner</div> tail</div><|Text|><|499|><|867|><|597|><|918|><ul><li>one<li>two</ul>",
+   "python_html": "<div data-bbox=\"565 112 642 152\" data-label=\"Text\"><p>hello</p></div>\n<div data-bbox=\"511 14 595 101\" data-label=\"Figure\"><p>self<br/>break</p></div>\n<div data-bbox=\"516 717 572 751\" data-label=\"Figure\"><div>nested <div>inner</div> tail</div></div>\n<div data-bbox=\"499 867 597 918\" data-label=\"Text\"><ul><li>one<li>two</ul></div>",
+   "python_blocks": "[{\"label\": \"Text\", \"bbox\": [565, 112, 642, 152], \"html\": \"<p>hello</p>\", \"truncated\": false}, {\"label\": \"Figure\", \"bbox\": [511, 14, 595, 101], \"html\": \"<p>self<br/>break</p>\", \"truncated\": false}, {\"label\": \"Figure\", \"bbox\": [516, 717, 572, 751], \"html\": \"<div>nested <div>inner</div> tail</div>\", \"truncated\": false}, {\"label\": \"Text\", \"bbox\": [499, 867, 597, 918], \"html\": \"<ul><li>one<li>two</li></li></ul>\", \"truncated\": true}]",
+   "rust_html": "<div data-bbox=\"565 112 642 152\" data-label=\"Text\"><p>hello</p></div>\n<div data-bbox=\"511 14 595 101\" data-label=\"Figure\"><p>self<br/>break</p></div>\n<div data-bbox=\"516 717 572 751\" data-label=\"Figure\"><div>nested <div>inner</div> tail</div></div>\n<div data-bbox=\"499 867 597 918\" data-label=\"Text\"><ul><li>one<li>two</ul></div>",
+   "rust_blocks": "[{\"label\":\"Text\",\"bbox\":[565,112,642,152],\"html\":\"<p>hello</p>\",\"truncated\":false},{\"label\":\"Figure\",\"bbox\":[511,14,595,101],\"html\":\"<p>self<br/>break</p>\",\"truncated\":false},{\"label\":\"Figure\",\"bbox\":[516,717,572,751],\"html\":\"<div>nested <div>inner</div> tail</div>\",\"truncated\":false},{\"label\":\"Text\",\"bbox\":[499,867,597,918],\"html\":\"<ul><li>one<li>two</ul>\",\"truncated\":true}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Page-Header|><|823|><|169|><|833|><|215|><p>भारत</p><|Code-Block|><|276|><|805|><|327|><|846|><p>literal <भारत after lt</p><|Text|><|530|><|450|><|615|><|545|><p class=\"x\" style=\"color:red\">styled</p>",
+   "python_html": "<div data-bbox=\"823 169 833 215\" data-label=\"Page-Header\"><p>भारत</p></div>\n<div data-bbox=\"276 805 327 846\" data-label=\"Code-Block\"><p>literal <भारत after lt</p></div>\n<div data-bbox=\"530 450 615 545\" data-label=\"Text\"><p class=\"x\" style=\"color:red\">styled</p></div>",
+   "python_blocks": "[{\"label\": \"Page-Header\", \"bbox\": [823, 169, 833, 215], \"html\": \"<p>भारत</p>\", \"truncated\": false}, {\"label\": \"Code-Block\", \"bbox\": [276, 805, 327, 846], \"html\": \"<p>literal &lt;भारत after lt</p>\", \"truncated\": false}, {\"label\": \"Text\", \"bbox\": [530, 450, 615, 545], \"html\": \"<p class=\\\"x\\\" style=\\\"color:red\\\">styled</p>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"823 169 833 215\" data-label=\"Page-Header\"><p>भारत</p></div>\n<div data-bbox=\"276 805 327 846\" data-label=\"Code-Block\"><p>literal <भारत after lt</p></div>\n<div data-bbox=\"530 450 615 545\" data-label=\"Text\"><p class=\"x\" style=\"color:red\">styled</p></div>",
+   "rust_blocks": "[{\"label\":\"Page-Header\",\"bbox\":[823,169,833,215],\"html\":\"<p>भारत</p>\",\"truncated\":false},{\"label\":\"Code-Block\",\"bbox\":[276,805,327,846],\"html\":\"<p>literal <भारत after lt</p>\",\"truncated\":false},{\"label\":\"Text\",\"bbox\":[530,450,615,545],\"html\":\"<p class=\\\"x\\\" style=\\\"color:red\\\">styled</p>\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Complex-Block|><|101|><|293|><|137|><|297|><p>hello</p><|Page-Header|><|717|><|166|><|804|><|253|><p>text</p></div>after the close<|Page-Header|><|77|><|485|><|125|><|504|><p>literal <भारत after lt</p>",
+   "python_html": "<div data-bbox=\"101 293 137 297\" data-label=\"Complex-Block\"><p>hello</p></div>\n<div data-bbox=\"717 166 804 253\" data-label=\"Page-Header\"><p>text</p></div>after the close\n<div data-bbox=\"77 485 125 504\" data-label=\"Page-Header\"><p>literal <भारत after lt</p></div>",
+   "python_blocks": "[{\"label\": \"Complex-Block\", \"bbox\": [101, 293, 137, 297], \"html\": \"<p>hello</p>\", \"truncated\": false}, {\"label\": \"Page-Header\", \"bbox\": [717, 166, 804, 253], \"html\": \"<p>text</p>\", \"truncated\": false}, {\"label\": \"Page-Header\", \"bbox\": [77, 485, 125, 504], \"html\": \"<p>literal &lt;भारत after lt</p>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"101 293 137 297\" data-label=\"Complex-Block\"><p>hello</p></div>\n<div data-bbox=\"717 166 804 253\" data-label=\"Page-Header\"><p>text</p></div>after the close\n<div data-bbox=\"77 485 125 504\" data-label=\"Page-Header\"><p>literal <भारत after lt</p></div>",
+   "rust_blocks": "[{\"label\":\"Complex-Block\",\"bbox\":[101,293,137,297],\"html\":\"<p>hello</p>\",\"truncated\":false},{\"label\":\"Page-Header\",\"bbox\":[717,166,804,253],\"html\":\"<p>text</p>\",\"truncated\":false},{\"label\":\"Page-Header\",\"bbox\":[77,485,125,504],\"html\":\"<p>literal <भारत after lt</p>\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Page-Header|><|844|><|620|><|876|><|712|><p>literal <भारत after lt</p>",
+   "python_html": "<div data-bbox=\"844 620 876 712\" data-label=\"Page-Header\"><p>literal <भारत after lt</p></div>",
+   "python_blocks": "[{\"label\": \"Page-Header\", \"bbox\": [844, 620, 876, 712], \"html\": \"<p>literal &lt;भारत after lt</p>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"844 620 876 712\" data-label=\"Page-Header\"><p>literal <भारत after lt</p></div>",
+   "rust_blocks": "[{\"label\":\"Page-Header\",\"bbox\":[844,620,876,712],\"html\":\"<p>literal <भारत after lt</p>\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Table|><|828|><|141|><|831|><|232|><img src=\"x.png\"><|Text|><|860|><|783|><|883|><|836|><p>text</p></div>after the close<|Page-Header|><|772|><|542|><|799|><|605|><pre>  keep   spaces\n  and lines</pre><|Text|><|658|><|558|><|698|><|559|><p>self<br/>break</p>",
+   "python_html": "<div data-bbox=\"828 141 831 232\" data-label=\"Table\"><img src=\"x.png\"></div>\n<div data-bbox=\"860 783 883 836\" data-label=\"Text\"><p>text</p></div>after the close\n<div data-bbox=\"772 542 799 605\" data-label=\"Page-Header\"><pre>  keep   spaces\n  and lines</pre></div>\n<div data-bbox=\"658 558 698 559\" data-label=\"Text\"><p>self<br/>break</p></div>",
+   "python_blocks": "[{\"label\": \"Table\", \"bbox\": [828, 141, 831, 232], \"html\": \"<img src=\\\"x.png\\\"/>\", \"truncated\": false}, {\"label\": \"Text\", \"bbox\": [860, 783, 883, 836], \"html\": \"<p>text</p>\", \"truncated\": false}, {\"label\": \"Page-Header\", \"bbox\": [772, 542, 799, 605], \"html\": \"<pre>  keep   spaces\\n  and lines</pre>\", \"truncated\": false}, {\"label\": \"Text\", \"bbox\": [658, 558, 698, 559], \"html\": \"<p>self<br/>break</p>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"828 141 831 232\" data-label=\"Table\"><img src=\"x.png\"></div>\n<div data-bbox=\"860 783 883 836\" data-label=\"Text\"><p>text</p></div>after the close\n<div data-bbox=\"772 542 799 605\" data-label=\"Page-Header\"><pre>  keep   spaces\n  and lines</pre></div>\n<div data-bbox=\"658 558 698 559\" data-label=\"Text\"><p>self<br/>break</p></div>",
+   "rust_blocks": "[{\"label\":\"Table\",\"bbox\":[828,141,831,232],\"html\":\"<img src=\\\"x.png\\\">\",\"truncated\":false},{\"label\":\"Text\",\"bbox\":[860,783,883,836],\"html\":\"<p>text</p>\",\"truncated\":false},{\"label\":\"Page-Header\",\"bbox\":[772,542,799,605],\"html\":\"<pre>  keep   spaces\\n  and lines</pre>\",\"truncated\":false},{\"label\":\"Text\",\"bbox\":[658,558,698,559],\"html\":\"<p>self<br/>break</p>\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Section-Header|><|764|><|403|><|810|><|468|><ul><li>one<li>two</ul><|Text|><|638|><|783|><|678|><|797|><p class=\"x\" style=\"color:red\">styled</p><|Section-Header|><|793|><|794|><|814|><|811|><p>literal <भारत after lt</p><|Caption|><|255|><|846|><|354|><|852|><img src=\"x.png\"><|Section-Header|><|74|><|333|><|163|><|361|><p>literal <भारत after lt</p>",
+   "python_html": "<div data-bbox=\"764 403 810 468\" data-label=\"Section-Header\"><ul><li>one<li>two</ul></div>\n<div data-bbox=\"638 783 678 797\" data-label=\"Text\"><p class=\"x\" style=\"color:red\">styled</p></div>\n<div data-bbox=\"793 794 814 811\" data-label=\"Section-Header\"><p>literal <भारत after lt</p></div>\n<div data-bbox=\"255 846 354 852\" data-label=\"Caption\"><img src=\"x.png\"></div>\n<div data-bbox=\"74 333 163 361\" data-label=\"Section-Header\"><p>literal <भारत after lt</p></div>",
+   "python_blocks": "[{\"label\": \"Section-Header\", \"bbox\": [764, 403, 810, 468], \"html\": \"<ul><li>one<li>two</li></li></ul>\", \"truncated\": false}, {\"label\": \"Text\", \"bbox\": [638, 783, 678, 797], \"html\": \"<p class=\\\"x\\\" style=\\\"color:red\\\">styled</p>\", \"truncated\": false}, {\"label\": \"Section-Header\", \"bbox\": [793, 794, 814, 811], \"html\": \"<p>literal &lt;भारत after lt</p>\", \"truncated\": false}, {\"label\": \"Caption\", \"bbox\": [255, 846, 354, 852], \"html\": \"<img src=\\\"x.png\\\"/>\", \"truncated\": false}, {\"label\": \"Section-Header\", \"bbox\": [74, 333, 163, 361], \"html\": \"<p>literal &lt;भारत after lt</p>\", \"truncated\": true}]",
+   "rust_html": "<div data-bbox=\"764 403 810 468\" data-label=\"Section-Header\"><ul><li>one<li>two</ul></div>\n<div data-bbox=\"638 783 678 797\" data-label=\"Text\"><p class=\"x\" style=\"color:red\">styled</p></div>\n<div data-bbox=\"793 794 814 811\" data-label=\"Section-Header\"><p>literal <भारत after lt</p></div>\n<div data-bbox=\"255 846 354 852\" data-label=\"Caption\"><img src=\"x.png\"></div>\n<div data-bbox=\"74 333 163 361\" data-label=\"Section-Header\"><p>literal <भारत after lt</p></div>",
+   "rust_blocks": "[{\"label\":\"Section-Header\",\"bbox\":[764,403,810,468],\"html\":\"<ul><li>one<li>two</ul>\",\"truncated\":false},{\"label\":\"Text\",\"bbox\":[638,783,678,797],\"html\":\"<p class=\\\"x\\\" style=\\\"color:red\\\">styled</p>\",\"truncated\":false},{\"label\":\"Section-Header\",\"bbox\":[793,794,814,811],\"html\":\"<p>literal <भारत after lt</p>\",\"truncated\":false},{\"label\":\"Caption\",\"bbox\":[255,846,354,852],\"html\":\"<img src=\\\"x.png\\\">\",\"truncated\":false},{\"label\":\"Section-Header\",\"bbox\":[74,333,163,361],\"html\":\"<p>literal <भारत after lt</p>\",\"truncated\":true}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Code-Block|><|163|><|660|><|230|><|704|><p>hello</p>\n<p>world</p><|Code-Block|><|244|><|20|><|279|><|29|><img src=\"x.png\">",
+   "python_html": "<div data-bbox=\"163 660 230 704\" data-label=\"Code-Block\"><p>hello</p>\n<p>world</p></div>\n<div data-bbox=\"244 20 279 29\" data-label=\"Code-Block\"><img src=\"x.png\"></div>",
+   "python_blocks": "[{\"label\": \"Code-Block\", \"bbox\": [163, 660, 230, 704], \"html\": \"<p>hello</p>\\n<p>world</p>\", \"truncated\": false}, {\"label\": \"Code-Block\", \"bbox\": [244, 20, 279, 29], \"html\": \"<img src=\\\"x.png\\\"/>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"163 660 230 704\" data-label=\"Code-Block\"><p>hello</p>\n<p>world</p></div>\n<div data-bbox=\"244 20 279 29\" data-label=\"Code-Block\"><img src=\"x.png\"></div>",
+   "rust_blocks": "[{\"label\":\"Code-Block\",\"bbox\":[163,660,230,704],\"html\":\"<p>hello</p>\\n<p>world</p>\",\"truncated\":false},{\"label\":\"Code-Block\",\"bbox\":[244,20,279,29],\"html\":\"<img src=\\\"x.png\\\">\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Figure|><|662|><|689|><|759|><|736|><p>भारत</p><|Figure|><|232|><|550|><|299|><|640|><p>a < b &amp; c > d</p>",
+   "python_html": "<div data-bbox=\"662 689 759 736\" data-label=\"Figure\"><p>भारत</p></div>\n<div data-bbox=\"232 550 299 640\" data-label=\"Figure\"><p>a < b &amp; c > d</p></div>",
+   "python_blocks": "[{\"label\": \"Figure\", \"bbox\": [662, 689, 759, 736], \"html\": \"<p>भारत</p>\", \"truncated\": false}, {\"label\": \"Figure\", \"bbox\": [232, 550, 299, 640], \"html\": \"<p>a &lt; b &amp; c &gt; d</p>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"662 689 759 736\" data-label=\"Figure\"><p>भारत</p></div>\n<div data-bbox=\"232 550 299 640\" data-label=\"Figure\"><p>a < b &amp; c > d</p></div>",
+   "rust_blocks": "[{\"label\":\"Figure\",\"bbox\":[662,689,759,736],\"html\":\"<p>भारत</p>\",\"truncated\":false},{\"label\":\"Figure\",\"bbox\":[232,550,299,640],\"html\":\"<p>a < b &amp; c > d</p>\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Code-Block|><|49|><|760|><|120|><|801|><p>भारत</p><|Page-Header|><|162|><|575|><|175|><|657|><p>hello</p>\n<p>world</p><|Figure|><|439|><|358|><|454|><|380|><img src=\"x.png\"><|Text|><|734|><|462|><|825|><|539|><p>self<br/>break</p><|Complex-Block|><|60|><|499|><|82|><|576|><p>hello</p>\n<p>world</p>",
+   "python_html": "<div data-bbox=\"49 760 120 801\" data-label=\"Code-Block\"><p>भारत</p></div>\n<div data-bbox=\"162 575 175 657\" data-label=\"Page-Header\"><p>hello</p>\n<p>world</p></div>\n<div data-bbox=\"439 358 454 380\" data-label=\"Figure\"><img src=\"x.png\"></div>\n<div data-bbox=\"734 462 825 539\" data-label=\"Text\"><p>self<br/>break</p></div>\n<div data-bbox=\"60 499 82 576\" data-label=\"Complex-Block\"><p>hello</p>\n<p>world</p></div>",
+   "python_blocks": "[{\"label\": \"Code-Block\", \"bbox\": [49, 760, 120, 801], \"html\": \"<p>भारत</p>\", \"truncated\": false}, {\"label\": \"Page-Header\", \"bbox\": [162, 575, 175, 657], \"html\": \"<p>hello</p>\\n<p>world</p>\", \"truncated\": false}, {\"label\": \"Figure\", \"bbox\": [439, 358, 454, 380], \"html\": \"<img src=\\\"x.png\\\"/>\", \"truncated\": false}, {\"label\": \"Text\", \"bbox\": [734, 462, 825, 539], \"html\": \"<p>self<br/>break</p>\", \"truncated\": false}, {\"label\": \"Complex-Block\", \"bbox\": [60, 499, 82, 576], \"html\": \"<p>hello</p>\\n<p>world</p>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"49 760 120 801\" data-label=\"Code-Block\"><p>भारत</p></div>\n<div data-bbox=\"162 575 175 657\" data-label=\"Page-Header\"><p>hello</p>\n<p>world</p></div>\n<div data-bbox=\"439 358 454 380\" data-label=\"Figure\"><img src=\"x.png\"></div>\n<div data-bbox=\"734 462 825 539\" data-label=\"Text\"><p>self<br/>break</p></div>\n<div data-bbox=\"60 499 82 576\" data-label=\"Complex-Block\"><p>hello</p>\n<p>world</p></div>",
+   "rust_blocks": "[{\"label\":\"Code-Block\",\"bbox\":[49,760,120,801],\"html\":\"<p>भारत</p>\",\"truncated\":false},{\"label\":\"Page-Header\",\"bbox\":[162,575,175,657],\"html\":\"<p>hello</p>\\n<p>world</p>\",\"truncated\":false},{\"label\":\"Figure\",\"bbox\":[439,358,454,380],\"html\":\"<img src=\\\"x.png\\\">\",\"truncated\":false},{\"label\":\"Text\",\"bbox\":[734,462,825,539],\"html\":\"<p>self<br/>break</p>\",\"truncated\":false},{\"label\":\"Complex-Block\",\"bbox\":[60,499,82,576],\"html\":\"<p>hello</p>\\n<p>world</p>\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Section-Header|><|543|><|210|><|639|><|286|><p>a < b &amp; c > d</p><|Code-Block|><|602|><|269|><|625|><|310|><pre>  keep   spaces\n  and lines</pre><|Complex-Block|><|107|><|717|><|171|><|736|><p>literal <भारत after lt</p><|Code-Block|><|595|><|419|><|632|><|428|><img src=\"x.png\"><|Section-Header|><|277|><|169|><|372|><|170|><a href=\"https://example.com\" alt=\"t\">link</a>",
+   "python_html": "<div data-bbox=\"543 210 639 286\" data-label=\"Section-Header\"><p>a < b &amp; c > d</p></div>\n<div data-bbox=\"602 269 625 310\" data-label=\"Code-Block\"><pre>  keep   spaces\n  and lines</pre></div>\n<div data-bbox=\"107 717 171 736\" data-label=\"Complex-Block\"><p>literal <भारत after lt</p></div>\n<div data-bbox=\"595 419 632 428\" data-label=\"Code-Block\"><img src=\"x.png\"></div>\n<div data-bbox=\"277 169 372 170\" data-label=\"Section-Header\"><a href=\"https://example.com\" alt=\"t\">link</a></div>",
+   "python_blocks": "[{\"label\": \"Section-Header\", \"bbox\": [543, 210, 639, 286], \"html\": \"<p>a &lt; b &amp; c &gt; d</p>\", \"truncated\": false}, {\"label\": \"Code-Block\", \"bbox\": [602, 269, 625, 310], \"html\": \"<pre>  keep   spaces\\n  and lines</pre>\", \"truncated\": false}, {\"label\": \"Complex-Block\", \"bbox\": [107, 717, 171, 736], \"html\": \"<p>literal &lt;भारत after lt</p>\", \"truncated\": false}, {\"label\": \"Code-Block\", \"bbox\": [595, 419, 632, 428], \"html\": \"<img src=\\\"x.png\\\"/>\", \"truncated\": false}, {\"label\": \"Section-Header\", \"bbox\": [277, 169, 372, 170], \"html\": \"<a alt=\\\"t\\\" href=\\\"https://example.com\\\">link</a>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"543 210 639 286\" data-label=\"Section-Header\"><p>a < b &amp; c > d</p></div>\n<div data-bbox=\"602 269 625 310\" data-label=\"Code-Block\"><pre>  keep   spaces\n  and lines</pre></div>\n<div data-bbox=\"107 717 171 736\" data-label=\"Complex-Block\"><p>literal <भारत after lt</p></div>\n<div data-bbox=\"595 419 632 428\" data-label=\"Code-Block\"><img src=\"x.png\"></div>\n<div data-bbox=\"277 169 372 170\" data-label=\"Section-Header\"><a href=\"https://example.com\" alt=\"t\">link</a></div>",
+   "rust_blocks": "[{\"label\":\"Section-Header\",\"bbox\":[543,210,639,286],\"html\":\"<p>a < b &amp; c > d</p>\",\"truncated\":false},{\"label\":\"Code-Block\",\"bbox\":[602,269,625,310],\"html\":\"<pre>  keep   spaces\\n  and lines</pre>\",\"truncated\":false},{\"label\":\"Complex-Block\",\"bbox\":[107,717,171,736],\"html\":\"<p>literal <भारत after lt</p>\",\"truncated\":false},{\"label\":\"Code-Block\",\"bbox\":[595,419,632,428],\"html\":\"<img src=\\\"x.png\\\">\",\"truncated\":false},{\"label\":\"Section-Header\",\"bbox\":[277,169,372,170],\"html\":\"<a href=\\\"https://example.com\\\" alt=\\\"t\\\">link</a>\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Table|><|136|><|412|><|143|><|416|><a href=\"https://example.com\" alt=\"t\">link</a>",
+   "python_html": "<div data-bbox=\"136 412 143 416\" data-label=\"Table\"><a href=\"https://example.com\" alt=\"t\">link</a></div>",
+   "python_blocks": "[{\"label\": \"Table\", \"bbox\": [136, 412, 143, 416], \"html\": \"<a alt=\\\"t\\\" href=\\\"https://example.com\\\">link</a>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"136 412 143 416\" data-label=\"Table\"><a href=\"https://example.com\" alt=\"t\">link</a></div>",
+   "rust_blocks": "[{\"label\":\"Table\",\"bbox\":[136,412,143,416],\"html\":\"<a href=\\\"https://example.com\\\" alt=\\\"t\\\">link</a>\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Caption|><|622|><|223|><|690|><|270|><p>a < b &amp; c > d</p><|Text|><|357|><|583|><|454|><|662|><p>literal <भारत after lt</p><|Figure|><|135|><|579|><|187|><|632|><ul><li>one<li>two</ul><|Section-Header|><|778|><|637|><|779|><|693|><p>hello</p>",
+   "python_html": "<div data-bbox=\"622 223 690 270\" data-label=\"Caption\"><p>a < b &amp; c > d</p></div>\n<div data-bbox=\"357 583 454 662\" data-label=\"Text\"><p>literal <भारत after lt</p></div>\n<div data-bbox=\"135 579 187 632\" data-label=\"Figure\"><ul><li>one<li>two</ul></div>\n<div data-bbox=\"778 637 779 693\" data-label=\"Section-Header\"><p>hello</p></div>",
+   "python_blocks": "[{\"label\": \"Caption\", \"bbox\": [622, 223, 690, 270], \"html\": \"<p>a &lt; b &amp; c &gt; d</p>\", \"truncated\": false}, {\"label\": \"Text\", \"bbox\": [357, 583, 454, 662], \"html\": \"<p>literal &lt;भारत after lt</p>\", \"truncated\": false}, {\"label\": \"Figure\", \"bbox\": [135, 579, 187, 632], \"html\": \"<ul><li>one<li>two</li></li></ul>\", \"truncated\": false}, {\"label\": \"Section-Header\", \"bbox\": [778, 637, 779, 693], \"html\": \"<p>hello</p>\", \"truncated\": true}]",
+   "rust_html": "<div data-bbox=\"622 223 690 270\" data-label=\"Caption\"><p>a < b &amp; c > d</p></div>\n<div data-bbox=\"357 583 454 662\" data-label=\"Text\"><p>literal <भारत after lt</p></div>\n<div data-bbox=\"135 579 187 632\" data-label=\"Figure\"><ul><li>one<li>two</ul></div>\n<div data-bbox=\"778 637 779 693\" data-label=\"Section-Header\"><p>hello</p></div>",
+   "rust_blocks": "[{\"label\":\"Caption\",\"bbox\":[622,223,690,270],\"html\":\"<p>a < b &amp; c > d</p>\",\"truncated\":false},{\"label\":\"Text\",\"bbox\":[357,583,454,662],\"html\":\"<p>literal <भारत after lt</p>\",\"truncated\":false},{\"label\":\"Figure\",\"bbox\":[135,579,187,632],\"html\":\"<ul><li>one<li>two</ul>\",\"truncated\":false},{\"label\":\"Section-Header\",\"bbox\":[778,637,779,693],\"html\":\"<p>hello</p>\",\"truncated\":true}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Caption|><|590|><|899|><|597|><|998|><p>text</p></div>after the close<|Caption|><|189|><|820|><|271|><|847|><p>self<br/>break</p><|Table|><|654|><|76|><|657|><|101|><div>nested <div>inner</div> tail</div><|Caption|><|511|><|354|><|532|><|371|><ul><li>one<li>two</ul><|Text|><|759|><|713|><|770|><|755|><div>nested <div>inner</div> tail</div>",
+   "python_html": "<div data-bbox=\"590 899 597 998\" data-label=\"Caption\"><p>text</p></div>after the close\n<div data-bbox=\"189 820 271 847\" data-label=\"Caption\"><p>self<br/>break</p></div>\n<div data-bbox=\"654 76 657 101\" data-label=\"Table\"><div>nested <div>inner</div> tail</div></div>\n<div data-bbox=\"511 354 532 371\" data-label=\"Caption\"><ul><li>one<li>two</ul></div>\n<div data-bbox=\"759 713 770 755\" data-label=\"Text\"><div>nested <div>inner</div> tail</div></div>",
+   "python_blocks": "[{\"label\": \"Caption\", \"bbox\": [590, 899, 597, 998], \"html\": \"<p>text</p>\", \"truncated\": false}, {\"label\": \"Caption\", \"bbox\": [189, 820, 271, 847], \"html\": \"<p>self<br/>break</p>\", \"truncated\": false}, {\"label\": \"Table\", \"bbox\": [654, 76, 657, 101], \"html\": \"<div>nested <div>inner</div> tail</div>\", \"truncated\": false}, {\"label\": \"Caption\", \"bbox\": [511, 354, 532, 371], \"html\": \"<ul><li>one<li>two</li></li></ul>\", \"truncated\": false}, {\"label\": \"Text\", \"bbox\": [759, 713, 770, 755], \"html\": \"<div>nested <div>inner</div> tail</div>\", \"truncated\": true}]",
+   "rust_html": "<div data-bbox=\"590 899 597 998\" data-label=\"Caption\"><p>text</p></div>after the close\n<div data-bbox=\"189 820 271 847\" data-label=\"Caption\"><p>self<br/>break</p></div>\n<div data-bbox=\"654 76 657 101\" data-label=\"Table\"><div>nested <div>inner</div> tail</div></div>\n<div data-bbox=\"511 354 532 371\" data-label=\"Caption\"><ul><li>one<li>two</ul></div>\n<div data-bbox=\"759 713 770 755\" data-label=\"Text\"><div>nested <div>inner</div> tail</div></div>",
+   "rust_blocks": "[{\"label\":\"Caption\",\"bbox\":[590,899,597,998],\"html\":\"<p>text</p>\",\"truncated\":false},{\"label\":\"Caption\",\"bbox\":[189,820,271,847],\"html\":\"<p>self<br/>break</p>\",\"truncated\":false},{\"label\":\"Table\",\"bbox\":[654,76,657,101],\"html\":\"<div>nested <div>inner</div> tail</div>\",\"truncated\":false},{\"label\":\"Caption\",\"bbox\":[511,354,532,371],\"html\":\"<ul><li>one<li>two</ul>\",\"truncated\":false},{\"label\":\"Text\",\"bbox\":[759,713,770,755],\"html\":\"<div>nested <div>inner</div> tail</div>\",\"truncated\":true}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Caption|><|892|><|574|><|911|><|673|><p>text</p></div>after the close<|Table|><|235|><|112|><|273|><|194|><div>nested <div>inner</div> tail</div><|Section-Header|><|437|><|894|><|456|><|985|><img src=\"x.png\"><|Page-Header|><|737|><|378|><|818|><|463|><p>भारत</p>",
+   "python_html": "<div data-bbox=\"892 574 911 673\" data-label=\"Caption\"><p>text</p></div>after the close\n<div data-bbox=\"235 112 273 194\" data-label=\"Table\"><div>nested <div>inner</div> tail</div></div>\n<div data-bbox=\"437 894 456 985\" data-label=\"Section-Header\"><img src=\"x.png\"></div>\n<div data-bbox=\"737 378 818 463\" data-label=\"Page-Header\"><p>भारत</p></div>",
+   "python_blocks": "[{\"label\": \"Caption\", \"bbox\": [892, 574, 911, 673], \"html\": \"<p>text</p>\", \"truncated\": false}, {\"label\": \"Table\", \"bbox\": [235, 112, 273, 194], \"html\": \"<div>nested <div>inner</div> tail</div>\", \"truncated\": false}, {\"label\": \"Section-Header\", \"bbox\": [437, 894, 456, 985], \"html\": \"<img src=\\\"x.png\\\"/>\", \"truncated\": false}, {\"label\": \"Page-Header\", \"bbox\": [737, 378, 818, 463], \"html\": \"<p>भारत</p>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"892 574 911 673\" data-label=\"Caption\"><p>text</p></div>after the close\n<div data-bbox=\"235 112 273 194\" data-label=\"Table\"><div>nested <div>inner</div> tail</div></div>\n<div data-bbox=\"437 894 456 985\" data-label=\"Section-Header\"><img src=\"x.png\"></div>\n<div data-bbox=\"737 378 818 463\" data-label=\"Page-Header\"><p>भारत</p></div>",
+   "rust_blocks": "[{\"label\":\"Caption\",\"bbox\":[892,574,911,673],\"html\":\"<p>text</p>\",\"truncated\":false},{\"label\":\"Table\",\"bbox\":[235,112,273,194],\"html\":\"<div>nested <div>inner</div> tail</div>\",\"truncated\":false},{\"label\":\"Section-Header\",\"bbox\":[437,894,456,985],\"html\":\"<img src=\\\"x.png\\\">\",\"truncated\":false},{\"label\":\"Page-Header\",\"bbox\":[737,378,818,463],\"html\":\"<p>भारत</p>\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Figure|><|246|><|312|><|283|><|380|><p>a < b &amp; c > d</p><|Caption|><|324|><|416|><|380|><|433|><p class=\"x\" style=\"color:red\">styled</p><|Complex-Block|><|90|><|234|><|187|><|239|><a href=\"https://example.com\" alt=\"t\">link</a><|Text|><|542|><|818|><|627|><|890|><div>nested <div>inner</div> tail</div><|Table|><|13|><|362|><|18|><|436|><p>literal <भारत after lt</p>",
+   "python_html": "<div data-bbox=\"246 312 283 380\" data-label=\"Figure\"><p>a < b &amp; c > d</p></div>\n<div data-bbox=\"324 416 380 433\" data-label=\"Caption\"><p class=\"x\" style=\"color:red\">styled</p></div>\n<div data-bbox=\"90 234 187 239\" data-label=\"Complex-Block\"><a href=\"https://example.com\" alt=\"t\">link</a></div>\n<div data-bbox=\"542 818 627 890\" data-label=\"Text\"><div>nested <div>inner</div> tail</div></div>\n<div data-bbox=\"13 362 18 436\" data-label=\"Table\"><p>literal <भारत after lt</p></div>",
+   "python_blocks": "[{\"label\": \"Figure\", \"bbox\": [246, 312, 283, 380], \"html\": \"<p>a &lt; b &amp; c &gt; d</p>\", \"truncated\": false}, {\"label\": \"Caption\", \"bbox\": [324, 416, 380, 433], \"html\": \"<p class=\\\"x\\\" style=\\\"color:red\\\">styled</p>\", \"truncated\": false}, {\"label\": \"Complex-Block\", \"bbox\": [90, 234, 187, 239], \"html\": \"<a alt=\\\"t\\\" href=\\\"https://example.com\\\">link</a>\", \"truncated\": false}, {\"label\": \"Text\", \"bbox\": [542, 818, 627, 890], \"html\": \"<div>nested <div>inner</div> tail</div>\", \"truncated\": false}, {\"label\": \"Table\", \"bbox\": [13, 362, 18, 436], \"html\": \"<p>literal &lt;भारत after lt</p>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"246 312 283 380\" data-label=\"Figure\"><p>a < b &amp; c > d</p></div>\n<div data-bbox=\"324 416 380 433\" data-label=\"Caption\"><p class=\"x\" style=\"color:red\">styled</p></div>\n<div data-bbox=\"90 234 187 239\" data-label=\"Complex-Block\"><a href=\"https://example.com\" alt=\"t\">link</a></div>\n<div data-bbox=\"542 818 627 890\" data-label=\"Text\"><div>nested <div>inner</div> tail</div></div>\n<div data-bbox=\"13 362 18 436\" data-label=\"Table\"><p>literal <भारत after lt</p></div>",
+   "rust_blocks": "[{\"label\":\"Figure\",\"bbox\":[246,312,283,380],\"html\":\"<p>a < b &amp; c > d</p>\",\"truncated\":false},{\"label\":\"Caption\",\"bbox\":[324,416,380,433],\"html\":\"<p class=\\\"x\\\" style=\\\"color:red\\\">styled</p>\",\"truncated\":false},{\"label\":\"Complex-Block\",\"bbox\":[90,234,187,239],\"html\":\"<a href=\\\"https://example.com\\\" alt=\\\"t\\\">link</a>\",\"truncated\":false},{\"label\":\"Text\",\"bbox\":[542,818,627,890],\"html\":\"<div>nested <div>inner</div> tail</div>\",\"truncated\":false},{\"label\":\"Table\",\"bbox\":[13,362,18,436],\"html\":\"<p>literal <भारत after lt</p>\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Figure|><|239|><|516|><|283|><|563|><h1>Title</h1><p>body text</p><|Section-Header|><|506|><|710|><|572|><|711|><p>hello</p><|Table|><|359|><|474|><|399|><|561|><p>a < b &amp; c > d</p>",
+   "python_html": "<div data-bbox=\"239 516 283 563\" data-label=\"Figure\"><h1>Title</h1><p>body text</p></div>\n<div data-bbox=\"506 710 572 711\" data-label=\"Section-Header\"><p>hello</p></div>\n<div data-bbox=\"359 474 399 561\" data-label=\"Table\"><p>a < b &amp; c > d</p></div>",
+   "python_blocks": "[{\"label\": \"Figure\", \"bbox\": [239, 516, 283, 563], \"html\": \"<h1>Title</h1><p>body text</p>\", \"truncated\": false}, {\"label\": \"Section-Header\", \"bbox\": [506, 710, 572, 711], \"html\": \"<p>hello</p>\", \"truncated\": false}, {\"label\": \"Table\", \"bbox\": [359, 474, 399, 561], \"html\": \"<p>a &lt; b &amp; c &gt; d</p>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"239 516 283 563\" data-label=\"Figure\"><h1>Title</h1><p>body text</p></div>\n<div data-bbox=\"506 710 572 711\" data-label=\"Section-Header\"><p>hello</p></div>\n<div data-bbox=\"359 474 399 561\" data-label=\"Table\"><p>a < b &amp; c > d</p></div>",
+   "rust_blocks": "[{\"label\":\"Figure\",\"bbox\":[239,516,283,563],\"html\":\"<h1>Title</h1><p>body text</p>\",\"truncated\":false},{\"label\":\"Section-Header\",\"bbox\":[506,710,572,711],\"html\":\"<p>hello</p>\",\"truncated\":false},{\"label\":\"Table\",\"bbox\":[359,474,399,561],\"html\":\"<p>a < b &amp; c > d</p>\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Complex-Block|><|428|><|352|><|471|><|436|><h1>Title</h1><p>body text</p><|Table|><|386|><|578|><|453|><|645|><pre>  keep   spaces\n  and lines</pre><|Complex-Block|><|376|><|492|><|473|><|493|><h1>Title</h1><p>body text</p><|Table|><|152|><|718|><|182|><|818|><a href=\"https://example.com\" alt=\"t\">link</a><|Page-Header|><|706|><|227|><|796|><|276|><p>hello</p>\n<p>world</p>",
+   "python_html": "<div data-bbox=\"428 352 471 436\" data-label=\"Complex-Block\"><h1>Title</h1><p>body text</p></div>\n<div data-bbox=\"386 578 453 645\" data-label=\"Table\"><pre>  keep   spaces\n  and lines</pre></div>\n<div data-bbox=\"376 492 473 493\" data-label=\"Complex-Block\"><h1>Title</h1><p>body text</p></div>\n<div data-bbox=\"152 718 182 818\" data-label=\"Table\"><a href=\"https://example.com\" alt=\"t\">link</a></div>\n<div data-bbox=\"706 227 796 276\" data-label=\"Page-Header\"><p>hello</p>\n<p>world</p></div>",
+   "python_blocks": "[{\"label\": \"Complex-Block\", \"bbox\": [428, 352, 471, 436], \"html\": \"<h1>Title</h1><p>body text</p>\", \"truncated\": false}, {\"label\": \"Table\", \"bbox\": [386, 578, 453, 645], \"html\": \"<pre>  keep   spaces\\n  and lines</pre>\", \"truncated\": false}, {\"label\": \"Complex-Block\", \"bbox\": [376, 492, 473, 493], \"html\": \"<h1>Title</h1><p>body text</p>\", \"truncated\": false}, {\"label\": \"Table\", \"bbox\": [152, 718, 182, 818], \"html\": \"<a alt=\\\"t\\\" href=\\\"https://example.com\\\">link</a>\", \"truncated\": false}, {\"label\": \"Page-Header\", \"bbox\": [706, 227, 796, 276], \"html\": \"<p>hello</p>\\n<p>world</p>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"428 352 471 436\" data-label=\"Complex-Block\"><h1>Title</h1><p>body text</p></div>\n<div data-bbox=\"386 578 453 645\" data-label=\"Table\"><pre>  keep   spaces\n  and lines</pre></div>\n<div data-bbox=\"376 492 473 493\" data-label=\"Complex-Block\"><h1>Title</h1><p>body text</p></div>\n<div data-bbox=\"152 718 182 818\" data-label=\"Table\"><a href=\"https://example.com\" alt=\"t\">link</a></div>\n<div data-bbox=\"706 227 796 276\" data-label=\"Page-Header\"><p>hello</p>\n<p>world</p></div>",
+   "rust_blocks": "[{\"label\":\"Complex-Block\",\"bbox\":[428,352,471,436],\"html\":\"<h1>Title</h1><p>body text</p>\",\"truncated\":false},{\"label\":\"Table\",\"bbox\":[386,578,453,645],\"html\":\"<pre>  keep   spaces\\n  and lines</pre>\",\"truncated\":false},{\"label\":\"Complex-Block\",\"bbox\":[376,492,473,493],\"html\":\"<h1>Title</h1><p>body text</p>\",\"truncated\":false},{\"label\":\"Table\",\"bbox\":[152,718,182,818],\"html\":\"<a href=\\\"https://example.com\\\" alt=\\\"t\\\">link</a>\",\"truncated\":false},{\"label\":\"Page-Header\",\"bbox\":[706,227,796,276],\"html\":\"<p>hello</p>\\n<p>world</p>\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Section-Header|><|409|><|429|><|478|><|448|><a href=\"https://example.com\" alt=\"t\">link</a><|Figure|><|809|><|216|><|901|><|248|><img src=\"x.png\"><|Figure|><|762|><|98|><|813|><|143|><p>a < b &amp; c > d</p>",
+   "python_html": "<div data-bbox=\"409 429 478 448\" data-label=\"Section-Header\"><a href=\"https://example.com\" alt=\"t\">link</a></div>\n<div data-bbox=\"809 216 901 248\" data-label=\"Figure\"><img src=\"x.png\"></div>\n<div data-bbox=\"762 98 813 143\" data-label=\"Figure\"><p>a < b &amp; c > d</p></div>",
+   "python_blocks": "[{\"label\": \"Section-Header\", \"bbox\": [409, 429, 478, 448], \"html\": \"<a alt=\\\"t\\\" href=\\\"https://example.com\\\">link</a>\", \"truncated\": false}, {\"label\": \"Figure\", \"bbox\": [809, 216, 901, 248], \"html\": \"<img src=\\\"x.png\\\"/>\", \"truncated\": false}, {\"label\": \"Figure\", \"bbox\": [762, 98, 813, 143], \"html\": \"<p>a &lt; b &amp; c &gt; d</p>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"409 429 478 448\" data-label=\"Section-Header\"><a href=\"https://example.com\" alt=\"t\">link</a></div>\n<div data-bbox=\"809 216 901 248\" data-label=\"Figure\"><img src=\"x.png\"></div>\n<div data-bbox=\"762 98 813 143\" data-label=\"Figure\"><p>a < b &amp; c > d</p></div>",
+   "rust_blocks": "[{\"label\":\"Section-Header\",\"bbox\":[409,429,478,448],\"html\":\"<a href=\\\"https://example.com\\\" alt=\\\"t\\\">link</a>\",\"truncated\":false},{\"label\":\"Figure\",\"bbox\":[809,216,901,248],\"html\":\"<img src=\\\"x.png\\\">\",\"truncated\":false},{\"label\":\"Figure\",\"bbox\":[762,98,813,143],\"html\":\"<p>a < b &amp; c > d</p>\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Page-Header|><|156|><|136|><|250|><|179|><p>literal <भारत after lt</p><|Section-Header|><|822|><|766|><|827|><|838|><div>nested <div>inner</div> tail</div><|Table|><|490|><|520|><|552|><|554|><p>a < b &amp; c > d</p>",
+   "python_html": "<div data-bbox=\"156 136 250 179\" data-label=\"Page-Header\"><p>literal <भारत after lt</p></div>\n<div data-bbox=\"822 766 827 838\" data-label=\"Section-Header\"><div>nested <div>inner</div> tail</div></div>\n<div data-bbox=\"490 520 552 554\" data-label=\"Table\"><p>a < b &amp; c > d</p></div>",
+   "python_blocks": "[{\"label\": \"Page-Header\", \"bbox\": [156, 136, 250, 179], \"html\": \"<p>literal &lt;भारत after lt</p>\", \"truncated\": false}, {\"label\": \"Section-Header\", \"bbox\": [822, 766, 827, 838], \"html\": \"<div>nested <div>inner</div> tail</div>\", \"truncated\": false}, {\"label\": \"Table\", \"bbox\": [490, 520, 552, 554], \"html\": \"<p>a &lt; b &amp; c &gt; d</p>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"156 136 250 179\" data-label=\"Page-Header\"><p>literal <भारत after lt</p></div>\n<div data-bbox=\"822 766 827 838\" data-label=\"Section-Header\"><div>nested <div>inner</div> tail</div></div>\n<div data-bbox=\"490 520 552 554\" data-label=\"Table\"><p>a < b &amp; c > d</p></div>",
+   "rust_blocks": "[{\"label\":\"Page-Header\",\"bbox\":[156,136,250,179],\"html\":\"<p>literal <भारत after lt</p>\",\"truncated\":false},{\"label\":\"Section-Header\",\"bbox\":[822,766,827,838],\"html\":\"<div>nested <div>inner</div> tail</div>\",\"truncated\":false},{\"label\":\"Table\",\"bbox\":[490,520,552,554],\"html\":\"<p>a < b &amp; c > d</p>\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Figure|><|101|><|553|><|109|><|639|><p>literal <भारत after lt</p><|Complex-Block|><|199|><|846|><|278|><|859|><p>hello</p>",
+   "python_html": "<div data-bbox=\"101 553 109 639\" data-label=\"Figure\"><p>literal <भारत after lt</p></div>\n<div data-bbox=\"199 846 278 859\" data-label=\"Complex-Block\"><p>hello</p></div>",
+   "python_blocks": "[{\"label\": \"Figure\", \"bbox\": [101, 553, 109, 639], \"html\": \"<p>literal &lt;भारत after lt</p>\", \"truncated\": false}, {\"label\": \"Complex-Block\", \"bbox\": [199, 846, 278, 859], \"html\": \"<p>hello</p>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"101 553 109 639\" data-label=\"Figure\"><p>literal <भारत after lt</p></div>\n<div data-bbox=\"199 846 278 859\" data-label=\"Complex-Block\"><p>hello</p></div>",
+   "rust_blocks": "[{\"label\":\"Figure\",\"bbox\":[101,553,109,639],\"html\":\"<p>literal <भारत after lt</p>\",\"truncated\":false},{\"label\":\"Complex-Block\",\"bbox\":[199,846,278,859],\"html\":\"<p>hello</p>\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Text|><|408|><|178|><|451|><|229|><p>literal <भारत after lt</p>",
+   "python_html": "<div data-bbox=\"408 178 451 229\" data-label=\"Text\"><p>literal <भारत after lt</p></div>",
+   "python_blocks": "[{\"label\": \"Text\", \"bbox\": [408, 178, 451, 229], \"html\": \"<p>literal &lt;भारत after lt</p>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"408 178 451 229\" data-label=\"Text\"><p>literal <भारत after lt</p></div>",
+   "rust_blocks": "[{\"label\":\"Text\",\"bbox\":[408,178,451,229],\"html\":\"<p>literal <भारत after lt</p>\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Caption|><|416|><|716|><|460|><|794|><a href=\"https://example.com\" alt=\"t\">link</a><|Caption|><|232|><|571|><|311|><|618|><ul><li>one<li>two</ul><|Complex-Block|><|203|><|34|><|245|><|88|><p class=\"x\" style=\"color:red\">styled</p><|Figure|><|168|><|893|><|240|><|910|><p>hello</p><|Text|><|62|><|265|><|116|><|364|><a href=\"https://example.com\" alt=\"t\">link</a>",
+   "python_html": "<div data-bbox=\"416 716 460 794\" data-label=\"Caption\"><a href=\"https://example.com\" alt=\"t\">link</a></div>\n<div data-bbox=\"232 571 311 618\" data-label=\"Caption\"><ul><li>one<li>two</ul></div>\n<div data-bbox=\"203 34 245 88\" data-label=\"Complex-Block\"><p class=\"x\" style=\"color:red\">styled</p></div>\n<div data-bbox=\"168 893 240 910\" data-label=\"Figure\"><p>hello</p></div>\n<div data-bbox=\"62 265 116 364\" data-label=\"Text\"><a href=\"https://example.com\" alt=\"t\">link</a></div>",
+   "python_blocks": "[{\"label\": \"Caption\", \"bbox\": [416, 716, 460, 794], \"html\": \"<a alt=\\\"t\\\" href=\\\"https://example.com\\\">link</a>\", \"truncated\": false}, {\"label\": \"Caption\", \"bbox\": [232, 571, 311, 618], \"html\": \"<ul><li>one<li>two</li></li></ul>\", \"truncated\": false}, {\"label\": \"Complex-Block\", \"bbox\": [203, 34, 245, 88], \"html\": \"<p class=\\\"x\\\" style=\\\"color:red\\\">styled</p>\", \"truncated\": false}, {\"label\": \"Figure\", \"bbox\": [168, 893, 240, 910], \"html\": \"<p>hello</p>\", \"truncated\": false}, {\"label\": \"Text\", \"bbox\": [62, 265, 116, 364], \"html\": \"<a alt=\\\"t\\\" href=\\\"https://example.com\\\">link</a>\", \"truncated\": true}]",
+   "rust_html": "<div data-bbox=\"416 716 460 794\" data-label=\"Caption\"><a href=\"https://example.com\" alt=\"t\">link</a></div>\n<div data-bbox=\"232 571 311 618\" data-label=\"Caption\"><ul><li>one<li>two</ul></div>\n<div data-bbox=\"203 34 245 88\" data-label=\"Complex-Block\"><p class=\"x\" style=\"color:red\">styled</p></div>\n<div data-bbox=\"168 893 240 910\" data-label=\"Figure\"><p>hello</p></div>\n<div data-bbox=\"62 265 116 364\" data-label=\"Text\"><a href=\"https://example.com\" alt=\"t\">link</a></div>",
+   "rust_blocks": "[{\"label\":\"Caption\",\"bbox\":[416,716,460,794],\"html\":\"<a href=\\\"https://example.com\\\" alt=\\\"t\\\">link</a>\",\"truncated\":false},{\"label\":\"Caption\",\"bbox\":[232,571,311,618],\"html\":\"<ul><li>one<li>two</ul>\",\"truncated\":false},{\"label\":\"Complex-Block\",\"bbox\":[203,34,245,88],\"html\":\"<p class=\\\"x\\\" style=\\\"color:red\\\">styled</p>\",\"truncated\":false},{\"label\":\"Figure\",\"bbox\":[168,893,240,910],\"html\":\"<p>hello</p>\",\"truncated\":false},{\"label\":\"Text\",\"bbox\":[62,265,116,364],\"html\":\"<a href=\\\"https://example.com\\\" alt=\\\"t\\\">link</a>\",\"truncated\":true}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Section-Header|><|412|><|108|><|468|><|192|><div>nested <div>inner</div> tail</div><|Figure|><|596|><|351|><|692|><|433|><pre>  keep   spaces\n  and lines</pre><|Section-Header|><|789|><|812|><|871|><|841|><a href=\"https://example.com\" alt=\"t\">link</a><|Code-Block|><|828|><|633|><|834|><|676|><p>self<br/>break</p>",
+   "python_html": "<div data-bbox=\"412 108 468 192\" data-label=\"Section-Header\"><div>nested <div>inner</div> tail</div></div>\n<div data-bbox=\"596 351 692 433\" data-label=\"Figure\"><pre>  keep   spaces\n  and lines</pre></div>\n<div data-bbox=\"789 812 871 841\" data-label=\"Section-Header\"><a href=\"https://example.com\" alt=\"t\">link</a></div>\n<div data-bbox=\"828 633 834 676\" data-label=\"Code-Block\"><p>self<br/>break</p></div>",
+   "python_blocks": "[{\"label\": \"Section-Header\", \"bbox\": [412, 108, 468, 192], \"html\": \"<div>nested <div>inner</div> tail</div>\", \"truncated\": false}, {\"label\": \"Figure\", \"bbox\": [596, 351, 692, 433], \"html\": \"<pre>  keep   spaces\\n  and lines</pre>\", \"truncated\": false}, {\"label\": \"Section-Header\", \"bbox\": [789, 812, 871, 841], \"html\": \"<a alt=\\\"t\\\" href=\\\"https://example.com\\\">link</a>\", \"truncated\": false}, {\"label\": \"Code-Block\", \"bbox\": [828, 633, 834, 676], \"html\": \"<p>self<br/>break</p>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"412 108 468 192\" data-label=\"Section-Header\"><div>nested <div>inner</div> tail</div></div>\n<div data-bbox=\"596 351 692 433\" data-label=\"Figure\"><pre>  keep   spaces\n  and lines</pre></div>\n<div data-bbox=\"789 812 871 841\" data-label=\"Section-Header\"><a href=\"https://example.com\" alt=\"t\">link</a></div>\n<div data-bbox=\"828 633 834 676\" data-label=\"Code-Block\"><p>self<br/>break</p></div>",
+   "rust_blocks": "[{\"label\":\"Section-Header\",\"bbox\":[412,108,468,192],\"html\":\"<div>nested <div>inner</div> tail</div>\",\"truncated\":false},{\"label\":\"Figure\",\"bbox\":[596,351,692,433],\"html\":\"<pre>  keep   spaces\\n  and lines</pre>\",\"truncated\":false},{\"label\":\"Section-Header\",\"bbox\":[789,812,871,841],\"html\":\"<a href=\\\"https://example.com\\\" alt=\\\"t\\\">link</a>\",\"truncated\":false},{\"label\":\"Code-Block\",\"bbox\":[828,633,834,676],\"html\":\"<p>self<br/>break</p>\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Page-Header|><|691|><|784|><|731|><|861|><ul><li>one<li>two</ul>",
+   "python_html": "<div data-bbox=\"691 784 731 861\" data-label=\"Page-Header\"><ul><li>one<li>two</ul></div>",
+   "python_blocks": "[{\"label\": \"Page-Header\", \"bbox\": [691, 784, 731, 861], \"html\": \"<ul><li>one<li>two</li></li></ul>\", \"truncated\": true}]",
+   "rust_html": "<div data-bbox=\"691 784 731 861\" data-label=\"Page-Header\"><ul><li>one<li>two</ul></div>",
+   "rust_blocks": "[{\"label\":\"Page-Header\",\"bbox\":[691,784,731,861],\"html\":\"<ul><li>one<li>two</ul>\",\"truncated\":true}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Table|><|190|><|141|><|210|><|160|><div>nested <div>inner</div> tail</div><|Complex-Block|><|97|><|259|><|154|><|332|><p>hello</p><|Figure|><|707|><|581|><|719|><|648|><div>nested <div>inner</div> tail</div><|Section-Header|><|545|><|202|><|602|><|234|><p>literal <भारत after lt</p>",
+   "python_html": "<div data-bbox=\"190 141 210 160\" data-label=\"Table\"><div>nested <div>inner</div> tail</div></div>\n<div data-bbox=\"97 259 154 332\" data-label=\"Complex-Block\"><p>hello</p></div>\n<div data-bbox=\"707 581 719 648\" data-label=\"Figure\"><div>nested <div>inner</div> tail</div></div>\n<div data-bbox=\"545 202 602 234\" data-label=\"Section-Header\"><p>literal <भारत after lt</p></div>",
+   "python_blocks": "[{\"label\": \"Table\", \"bbox\": [190, 141, 210, 160], \"html\": \"<div>nested <div>inner</div> tail</div>\", \"truncated\": false}, {\"label\": \"Complex-Block\", \"bbox\": [97, 259, 154, 332], \"html\": \"<p>hello</p>\", \"truncated\": false}, {\"label\": \"Figure\", \"bbox\": [707, 581, 719, 648], \"html\": \"<div>nested <div>inner</div> tail</div>\", \"truncated\": false}, {\"label\": \"Section-Header\", \"bbox\": [545, 202, 602, 234], \"html\": \"<p>literal &lt;भारत after lt</p>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"190 141 210 160\" data-label=\"Table\"><div>nested <div>inner</div> tail</div></div>\n<div data-bbox=\"97 259 154 332\" data-label=\"Complex-Block\"><p>hello</p></div>\n<div data-bbox=\"707 581 719 648\" data-label=\"Figure\"><div>nested <div>inner</div> tail</div></div>\n<div data-bbox=\"545 202 602 234\" data-label=\"Section-Header\"><p>literal <भारत after lt</p></div>",
+   "rust_blocks": "[{\"label\":\"Table\",\"bbox\":[190,141,210,160],\"html\":\"<div>nested <div>inner</div> tail</div>\",\"truncated\":false},{\"label\":\"Complex-Block\",\"bbox\":[97,259,154,332],\"html\":\"<p>hello</p>\",\"truncated\":false},{\"label\":\"Figure\",\"bbox\":[707,581,719,648],\"html\":\"<div>nested <div>inner</div> tail</div>\",\"truncated\":false},{\"label\":\"Section-Header\",\"bbox\":[545,202,602,234],\"html\":\"<p>literal <भारत after lt</p>\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Section-Header|><|844|><|542|><|886|><|632|><p>literal <भारत after lt</p>",
+   "python_html": "<div data-bbox=\"844 542 886 632\" data-label=\"Section-Header\"><p>literal <भारत after lt</p></div>",
+   "python_blocks": "[{\"label\": \"Section-Header\", \"bbox\": [844, 542, 886, 632], \"html\": \"<p>literal &lt;भारत after lt</p>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"844 542 886 632\" data-label=\"Section-Header\"><p>literal <भारत after lt</p></div>",
+   "rust_blocks": "[{\"label\":\"Section-Header\",\"bbox\":[844,542,886,632],\"html\":\"<p>literal <भारत after lt</p>\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Figure|><|324|><|68|><|378|><|138|><p>text</p></div>after the close<|Section-Header|><|408|><|838|><|474|><|847|><ul><li>one<li>two</ul><|Caption|><|346|><|899|><|353|><|917|><h1>Title</h1><p>body text</p><|Code-Block|><|794|><|486|><|813|><|550|><p>text</p></div>after the close<|Complex-Block|><|628|><|516|><|635|><|553|><p>a < b &amp; c > d</p>",
+   "python_html": "<div data-bbox=\"324 68 378 138\" data-label=\"Figure\"><p>text</p></div>after the close\n<div data-bbox=\"408 838 474 847\" data-label=\"Section-Header\"><ul><li>one<li>two</ul></div>\n<div data-bbox=\"346 899 353 917\" data-label=\"Caption\"><h1>Title</h1><p>body text</p></div>\n<div data-bbox=\"794 486 813 550\" data-label=\"Code-Block\"><p>text</p></div>after the close\n<div data-bbox=\"628 516 635 553\" data-label=\"Complex-Block\"><p>a < b &amp; c > d</p></div>",
+   "python_blocks": "[{\"label\": \"Figure\", \"bbox\": [324, 68, 378, 138], \"html\": \"<p>text</p>\", \"truncated\": false}, {\"label\": \"Section-Header\", \"bbox\": [408, 838, 474, 847], \"html\": \"<ul><li>one<li>two</li></li></ul>\", \"truncated\": false}, {\"label\": \"Caption\", \"bbox\": [346, 899, 353, 917], \"html\": \"<h1>Title</h1><p>body text</p>\", \"truncated\": false}, {\"label\": \"Code-Block\", \"bbox\": [794, 486, 813, 550], \"html\": \"<p>text</p>\", \"truncated\": false}, {\"label\": \"Complex-Block\", \"bbox\": [628, 516, 635, 553], \"html\": \"<p>a &lt; b &amp; c &gt; d</p>\", \"truncated\": true}]",
+   "rust_html": "<div data-bbox=\"324 68 378 138\" data-label=\"Figure\"><p>text</p></div>after the close\n<div data-bbox=\"408 838 474 847\" data-label=\"Section-Header\"><ul><li>one<li>two</ul></div>\n<div data-bbox=\"346 899 353 917\" data-label=\"Caption\"><h1>Title</h1><p>body text</p></div>\n<div data-bbox=\"794 486 813 550\" data-label=\"Code-Block\"><p>text</p></div>after the close\n<div data-bbox=\"628 516 635 553\" data-label=\"Complex-Block\"><p>a < b &amp; c > d</p></div>",
+   "rust_blocks": "[{\"label\":\"Figure\",\"bbox\":[324,68,378,138],\"html\":\"<p>text</p>\",\"truncated\":false},{\"label\":\"Section-Header\",\"bbox\":[408,838,474,847],\"html\":\"<ul><li>one<li>two</ul>\",\"truncated\":false},{\"label\":\"Caption\",\"bbox\":[346,899,353,917],\"html\":\"<h1>Title</h1><p>body text</p>\",\"truncated\":false},{\"label\":\"Code-Block\",\"bbox\":[794,486,813,550],\"html\":\"<p>text</p>\",\"truncated\":false},{\"label\":\"Complex-Block\",\"bbox\":[628,516,635,553],\"html\":\"<p>a < b &amp; c > d</p>\",\"truncated\":true}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Caption|><|585|><|295|><|592|><|331|><img src=\"x.png\"><|Code-Block|><|143|><|77|><|229|><|137|><ul><li>one<li>two</ul><|Section-Header|><|311|><|122|><|367|><|189|><p>भारत</p><|Complex-Block|><|356|><|649|><|394|><|738|><h1>Title</h1><p>body text</p><|Figure|><|689|><|456|><|764|><|494|><p>a < b &amp; c > d</p>",
+   "python_html": "<div data-bbox=\"585 295 592 331\" data-label=\"Caption\"><img src=\"x.png\"></div>\n<div data-bbox=\"143 77 229 137\" data-label=\"Code-Block\"><ul><li>one<li>two</ul></div>\n<div data-bbox=\"311 122 367 189\" data-label=\"Section-Header\"><p>भारत</p></div>\n<div data-bbox=\"356 649 394 738\" data-label=\"Complex-Block\"><h1>Title</h1><p>body text</p></div>\n<div data-bbox=\"689 456 764 494\" data-label=\"Figure\"><p>a < b &amp; c > d</p></div>",
+   "python_blocks": "[{\"label\": \"Caption\", \"bbox\": [585, 295, 592, 331], \"html\": \"<img src=\\\"x.png\\\"/>\", \"truncated\": false}, {\"label\": \"Code-Block\", \"bbox\": [143, 77, 229, 137], \"html\": \"<ul><li>one<li>two</li></li></ul>\", \"truncated\": false}, {\"label\": \"Section-Header\", \"bbox\": [311, 122, 367, 189], \"html\": \"<p>भारत</p>\", \"truncated\": false}, {\"label\": \"Complex-Block\", \"bbox\": [356, 649, 394, 738], \"html\": \"<h1>Title</h1><p>body text</p>\", \"truncated\": false}, {\"label\": \"Figure\", \"bbox\": [689, 456, 764, 494], \"html\": \"<p>a &lt; b &amp; c &gt; d</p>\", \"truncated\": true}]",
+   "rust_html": "<div data-bbox=\"585 295 592 331\" data-label=\"Caption\"><img src=\"x.png\"></div>\n<div data-bbox=\"143 77 229 137\" data-label=\"Code-Block\"><ul><li>one<li>two</ul></div>\n<div data-bbox=\"311 122 367 189\" data-label=\"Section-Header\"><p>भारत</p></div>\n<div data-bbox=\"356 649 394 738\" data-label=\"Complex-Block\"><h1>Title</h1><p>body text</p></div>\n<div data-bbox=\"689 456 764 494\" data-label=\"Figure\"><p>a < b &amp; c > d</p></div>",
+   "rust_blocks": "[{\"label\":\"Caption\",\"bbox\":[585,295,592,331],\"html\":\"<img src=\\\"x.png\\\">\",\"truncated\":false},{\"label\":\"Code-Block\",\"bbox\":[143,77,229,137],\"html\":\"<ul><li>one<li>two</ul>\",\"truncated\":false},{\"label\":\"Section-Header\",\"bbox\":[311,122,367,189],\"html\":\"<p>भारत</p>\",\"truncated\":false},{\"label\":\"Complex-Block\",\"bbox\":[356,649,394,738],\"html\":\"<h1>Title</h1><p>body text</p>\",\"truncated\":false},{\"label\":\"Figure\",\"bbox\":[689,456,764,494],\"html\":\"<p>a < b &amp; c > d</p>\",\"truncated\":true}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Page-Header|><|887|><|858|><|893|><|860|><p>भारत</p><|Figure|><|519|><|71|><|578|><|171|><img src=\"x.png\"><|Code-Block|><|281|><|0|><|283|><|91|><p>hello</p>\n<p>world</p><|Page-Header|><|178|><|778|><|210|><|850|><pre>  keep   spaces\n  and lines</pre><|Code-Block|><|212|><|59|><|218|><|65|><p>self<br/>break</p>",
+   "python_html": "<div data-bbox=\"887 858 893 860\" data-label=\"Page-Header\"><p>भारत</p></div>\n<div data-bbox=\"519 71 578 171\" data-label=\"Figure\"><img src=\"x.png\"></div>\n<div data-bbox=\"281 0 283 91\" data-label=\"Code-Block\"><p>hello</p>\n<p>world</p></div>\n<div data-bbox=\"178 778 210 850\" data-label=\"Page-Header\"><pre>  keep   spaces\n  and lines</pre></div>\n<div data-bbox=\"212 59 218 65\" data-label=\"Code-Block\"><p>self<br/>break</p></div>",
+   "python_blocks": "[{\"label\": \"Page-Header\", \"bbox\": [887, 858, 893, 860], \"html\": \"<p>भारत</p>\", \"truncated\": false}, {\"label\": \"Figure\", \"bbox\": [519, 71, 578, 171], \"html\": \"<img src=\\\"x.png\\\"/>\", \"truncated\": false}, {\"label\": \"Code-Block\", \"bbox\": [281, 0, 283, 91], \"html\": \"<p>hello</p>\\n<p>world</p>\", \"truncated\": false}, {\"label\": \"Page-Header\", \"bbox\": [178, 778, 210, 850], \"html\": \"<pre>  keep   spaces\\n  and lines</pre>\", \"truncated\": false}, {\"label\": \"Code-Block\", \"bbox\": [212, 59, 218, 65], \"html\": \"<p>self<br/>break</p>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"887 858 893 860\" data-label=\"Page-Header\"><p>भारत</p></div>\n<div data-bbox=\"519 71 578 171\" data-label=\"Figure\"><img src=\"x.png\"></div>\n<div data-bbox=\"281 0 283 91\" data-label=\"Code-Block\"><p>hello</p>\n<p>world</p></div>\n<div data-bbox=\"178 778 210 850\" data-label=\"Page-Header\"><pre>  keep   spaces\n  and lines</pre></div>\n<div data-bbox=\"212 59 218 65\" data-label=\"Code-Block\"><p>self<br/>break</p></div>",
+   "rust_blocks": "[{\"label\":\"Page-Header\",\"bbox\":[887,858,893,860],\"html\":\"<p>भारत</p>\",\"truncated\":false},{\"label\":\"Figure\",\"bbox\":[519,71,578,171],\"html\":\"<img src=\\\"x.png\\\">\",\"truncated\":false},{\"label\":\"Code-Block\",\"bbox\":[281,0,283,91],\"html\":\"<p>hello</p>\\n<p>world</p>\",\"truncated\":false},{\"label\":\"Page-Header\",\"bbox\":[178,778,210,850],\"html\":\"<pre>  keep   spaces\\n  and lines</pre>\",\"truncated\":false},{\"label\":\"Code-Block\",\"bbox\":[212,59,218,65],\"html\":\"<p>self<br/>break</p>\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Text|><|413|><|210|><|462|><|258|><p>hello</p><|Caption|><|405|><|537|><|490|><|628|><p class=\"x\" style=\"color:red\">styled</p><|Text|><|9|><|735|><|74|><|762|><p>literal <भारत after lt</p>",
+   "python_html": "<div data-bbox=\"413 210 462 258\" data-label=\"Text\"><p>hello</p></div>\n<div data-bbox=\"405 537 490 628\" data-label=\"Caption\"><p class=\"x\" style=\"color:red\">styled</p></div>\n<div data-bbox=\"9 735 74 762\" data-label=\"Text\"><p>literal <भारत after lt</p></div>",
+   "python_blocks": "[{\"label\": \"Text\", \"bbox\": [413, 210, 462, 258], \"html\": \"<p>hello</p>\", \"truncated\": false}, {\"label\": \"Caption\", \"bbox\": [405, 537, 490, 628], \"html\": \"<p class=\\\"x\\\" style=\\\"color:red\\\">styled</p>\", \"truncated\": false}, {\"label\": \"Text\", \"bbox\": [9, 735, 74, 762], \"html\": \"<p>literal &lt;भारत after lt</p>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"413 210 462 258\" data-label=\"Text\"><p>hello</p></div>\n<div data-bbox=\"405 537 490 628\" data-label=\"Caption\"><p class=\"x\" style=\"color:red\">styled</p></div>\n<div data-bbox=\"9 735 74 762\" data-label=\"Text\"><p>literal <भारत after lt</p></div>",
+   "rust_blocks": "[{\"label\":\"Text\",\"bbox\":[413,210,462,258],\"html\":\"<p>hello</p>\",\"truncated\":false},{\"label\":\"Caption\",\"bbox\":[405,537,490,628],\"html\":\"<p class=\\\"x\\\" style=\\\"color:red\\\">styled</p>\",\"truncated\":false},{\"label\":\"Text\",\"bbox\":[9,735,74,762],\"html\":\"<p>literal <भारत after lt</p>\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Figure|><|867|><|9|><|880|><|72|><pre>  keep   spaces\n  and lines</pre><|Code-Block|><|722|><|306|><|747|><|356|><div>nested <div>inner</div> tail</div><|Caption|><|769|><|747|><|825|><|798|><a href=\"https://example.com\" alt=\"t\">link</a><|Caption|><|436|><|42|><|515|><|63|><p>भारत</p>",
+   "python_html": "<div data-bbox=\"867 9 880 72\" data-label=\"Figure\"><pre>  keep   spaces\n  and lines</pre></div>\n<div data-bbox=\"722 306 747 356\" data-label=\"Code-Block\"><div>nested <div>inner</div> tail</div></div>\n<div data-bbox=\"769 747 825 798\" data-label=\"Caption\"><a href=\"https://example.com\" alt=\"t\">link</a></div>\n<div data-bbox=\"436 42 515 63\" data-label=\"Caption\"><p>भारत</p></div>",
+   "python_blocks": "[{\"label\": \"Figure\", \"bbox\": [867, 9, 880, 72], \"html\": \"<pre>  keep   spaces\\n  and lines</pre>\", \"truncated\": false}, {\"label\": \"Code-Block\", \"bbox\": [722, 306, 747, 356], \"html\": \"<div>nested <div>inner</div> tail</div>\", \"truncated\": false}, {\"label\": \"Caption\", \"bbox\": [769, 747, 825, 798], \"html\": \"<a alt=\\\"t\\\" href=\\\"https://example.com\\\">link</a>\", \"truncated\": false}, {\"label\": \"Caption\", \"bbox\": [436, 42, 515, 63], \"html\": \"<p>भारत</p>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"867 9 880 72\" data-label=\"Figure\"><pre>  keep   spaces\n  and lines</pre></div>\n<div data-bbox=\"722 306 747 356\" data-label=\"Code-Block\"><div>nested <div>inner</div> tail</div></div>\n<div data-bbox=\"769 747 825 798\" data-label=\"Caption\"><a href=\"https://example.com\" alt=\"t\">link</a></div>\n<div data-bbox=\"436 42 515 63\" data-label=\"Caption\"><p>भारत</p></div>",
+   "rust_blocks": "[{\"label\":\"Figure\",\"bbox\":[867,9,880,72],\"html\":\"<pre>  keep   spaces\\n  and lines</pre>\",\"truncated\":false},{\"label\":\"Code-Block\",\"bbox\":[722,306,747,356],\"html\":\"<div>nested <div>inner</div> tail</div>\",\"truncated\":false},{\"label\":\"Caption\",\"bbox\":[769,747,825,798],\"html\":\"<a href=\\\"https://example.com\\\" alt=\\\"t\\\">link</a>\",\"truncated\":false},{\"label\":\"Caption\",\"bbox\":[436,42,515,63],\"html\":\"<p>भारत</p>\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Complex-Block|><|856|><|161|><|952|><|232|><p>hello</p>\n<p>world</p><|Figure|><|138|><|176|><|162|><|244|><div>nested <div>inner</div> tail</div><|Table|><|662|><|422|><|730|><|445|><img src=\"x.png\"><|Code-Block|><|107|><|133|><|176|><|183|><p>भारत</p>",
+   "python_html": "<div data-bbox=\"856 161 952 232\" data-label=\"Complex-Block\"><p>hello</p>\n<p>world</p></div>\n<div data-bbox=\"138 176 162 244\" data-label=\"Figure\"><div>nested <div>inner</div> tail</div></div>\n<div data-bbox=\"662 422 730 445\" data-label=\"Table\"><img src=\"x.png\"></div>\n<div data-bbox=\"107 133 176 183\" data-label=\"Code-Block\"><p>भारत</p></div>",
+   "python_blocks": "[{\"label\": \"Complex-Block\", \"bbox\": [856, 161, 952, 232], \"html\": \"<p>hello</p>\\n<p>world</p>\", \"truncated\": false}, {\"label\": \"Figure\", \"bbox\": [138, 176, 162, 244], \"html\": \"<div>nested <div>inner</div> tail</div>\", \"truncated\": false}, {\"label\": \"Table\", \"bbox\": [662, 422, 730, 445], \"html\": \"<img src=\\\"x.png\\\"/>\", \"truncated\": false}, {\"label\": \"Code-Block\", \"bbox\": [107, 133, 176, 183], \"html\": \"<p>भारत</p>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"856 161 952 232\" data-label=\"Complex-Block\"><p>hello</p>\n<p>world</p></div>\n<div data-bbox=\"138 176 162 244\" data-label=\"Figure\"><div>nested <div>inner</div> tail</div></div>\n<div data-bbox=\"662 422 730 445\" data-label=\"Table\"><img src=\"x.png\"></div>\n<div data-bbox=\"107 133 176 183\" data-label=\"Code-Block\"><p>भारत</p></div>",
+   "rust_blocks": "[{\"label\":\"Complex-Block\",\"bbox\":[856,161,952,232],\"html\":\"<p>hello</p>\\n<p>world</p>\",\"truncated\":false},{\"label\":\"Figure\",\"bbox\":[138,176,162,244],\"html\":\"<div>nested <div>inner</div> tail</div>\",\"truncated\":false},{\"label\":\"Table\",\"bbox\":[662,422,730,445],\"html\":\"<img src=\\\"x.png\\\">\",\"truncated\":false},{\"label\":\"Code-Block\",\"bbox\":[107,133,176,183],\"html\":\"<p>भारत</p>\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Table|><|374|><|791|><|471|><|839|><p>self<br/>break</p><|Figure|><|735|><|598|><|763|><|659|><p>text</p></div>after the close<|Complex-Block|><|524|><|119|><|551|><|155|><p>a < b &amp; c > d</p><|Table|><|789|><|450|><|806|><|457|><a href=\"https://example.com\" alt=\"t\">link</a><|Complex-Block|><|429|><|771|><|460|><|865|><div>nested <div>inner</div> tail</div>",
+   "python_html": "<div data-bbox=\"374 791 471 839\" data-label=\"Table\"><p>self<br/>break</p></div>\n<div data-bbox=\"735 598 763 659\" data-label=\"Figure\"><p>text</p></div>after the close\n<div data-bbox=\"524 119 551 155\" data-label=\"Complex-Block\"><p>a < b &amp; c > d</p></div>\n<div data-bbox=\"789 450 806 457\" data-label=\"Table\"><a href=\"https://example.com\" alt=\"t\">link</a></div>\n<div data-bbox=\"429 771 460 865\" data-label=\"Complex-Block\"><div>nested <div>inner</div> tail</div></div>",
+   "python_blocks": "[{\"label\": \"Table\", \"bbox\": [374, 791, 471, 839], \"html\": \"<p>self<br/>break</p>\", \"truncated\": false}, {\"label\": \"Figure\", \"bbox\": [735, 598, 763, 659], \"html\": \"<p>text</p>\", \"truncated\": false}, {\"label\": \"Complex-Block\", \"bbox\": [524, 119, 551, 155], \"html\": \"<p>a &lt; b &amp; c &gt; d</p>\", \"truncated\": false}, {\"label\": \"Table\", \"bbox\": [789, 450, 806, 457], \"html\": \"<a alt=\\\"t\\\" href=\\\"https://example.com\\\">link</a>\", \"truncated\": false}, {\"label\": \"Complex-Block\", \"bbox\": [429, 771, 460, 865], \"html\": \"<div>nested <div>inner</div> tail</div>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"374 791 471 839\" data-label=\"Table\"><p>self<br/>break</p></div>\n<div data-bbox=\"735 598 763 659\" data-label=\"Figure\"><p>text</p></div>after the close\n<div data-bbox=\"524 119 551 155\" data-label=\"Complex-Block\"><p>a < b &amp; c > d</p></div>\n<div data-bbox=\"789 450 806 457\" data-label=\"Table\"><a href=\"https://example.com\" alt=\"t\">link</a></div>\n<div data-bbox=\"429 771 460 865\" data-label=\"Complex-Block\"><div>nested <div>inner</div> tail</div></div>",
+   "rust_blocks": "[{\"label\":\"Table\",\"bbox\":[374,791,471,839],\"html\":\"<p>self<br/>break</p>\",\"truncated\":false},{\"label\":\"Figure\",\"bbox\":[735,598,763,659],\"html\":\"<p>text</p>\",\"truncated\":false},{\"label\":\"Complex-Block\",\"bbox\":[524,119,551,155],\"html\":\"<p>a < b &amp; c > d</p>\",\"truncated\":false},{\"label\":\"Table\",\"bbox\":[789,450,806,457],\"html\":\"<a href=\\\"https://example.com\\\" alt=\\\"t\\\">link</a>\",\"truncated\":false},{\"label\":\"Complex-Block\",\"bbox\":[429,771,460,865],\"html\":\"<div>nested <div>inner</div> tail</div>\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Caption|><|677|><|779|><|699|><|835|><p>literal <भारत after lt</p><|Caption|><|18|><|681|><|55|><|779|><p>hello</p><|Text|><|153|><|209|><|218|><|305|><p>a < b &amp; c > d</p><|Section-Header|><|838|><|588|><|889|><|631|><h1>Title</h1><p>body text</p>",
+   "python_html": "<div data-bbox=\"677 779 699 835\" data-label=\"Caption\"><p>literal <भारत after lt</p></div>\n<div data-bbox=\"18 681 55 779\" data-label=\"Caption\"><p>hello</p></div>\n<div data-bbox=\"153 209 218 305\" data-label=\"Text\"><p>a < b &amp; c > d</p></div>\n<div data-bbox=\"838 588 889 631\" data-label=\"Section-Header\"><h1>Title</h1><p>body text</p></div>",
+   "python_blocks": "[{\"label\": \"Caption\", \"bbox\": [677, 779, 699, 835], \"html\": \"<p>literal &lt;भारत after lt</p>\", \"truncated\": false}, {\"label\": \"Caption\", \"bbox\": [18, 681, 55, 779], \"html\": \"<p>hello</p>\", \"truncated\": false}, {\"label\": \"Text\", \"bbox\": [153, 209, 218, 305], \"html\": \"<p>a &lt; b &amp; c &gt; d</p>\", \"truncated\": false}, {\"label\": \"Section-Header\", \"bbox\": [838, 588, 889, 631], \"html\": \"<h1>Title</h1><p>body text</p>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"677 779 699 835\" data-label=\"Caption\"><p>literal <भारत after lt</p></div>\n<div data-bbox=\"18 681 55 779\" data-label=\"Caption\"><p>hello</p></div>\n<div data-bbox=\"153 209 218 305\" data-label=\"Text\"><p>a < b &amp; c > d</p></div>\n<div data-bbox=\"838 588 889 631\" data-label=\"Section-Header\"><h1>Title</h1><p>body text</p></div>",
+   "rust_blocks": "[{\"label\":\"Caption\",\"bbox\":[677,779,699,835],\"html\":\"<p>literal <भारत after lt</p>\",\"truncated\":false},{\"label\":\"Caption\",\"bbox\":[18,681,55,779],\"html\":\"<p>hello</p>\",\"truncated\":false},{\"label\":\"Text\",\"bbox\":[153,209,218,305],\"html\":\"<p>a < b &amp; c > d</p>\",\"truncated\":false},{\"label\":\"Section-Header\",\"bbox\":[838,588,889,631],\"html\":\"<h1>Title</h1><p>body text</p>\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Figure|><|809|><|238|><|816|><|321|><p>literal <भारत after lt</p>",
+   "python_html": "<div data-bbox=\"809 238 816 321\" data-label=\"Figure\"><p>literal <भारत after lt</p></div>",
+   "python_blocks": "[{\"label\": \"Figure\", \"bbox\": [809, 238, 816, 321], \"html\": \"<p>literal &lt;भारत after lt</p>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"809 238 816 321\" data-label=\"Figure\"><p>literal <भारत after lt</p></div>",
+   "rust_blocks": "[{\"label\":\"Figure\",\"bbox\":[809,238,816,321],\"html\":\"<p>literal <भारत after lt</p>\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Text|><|278|><|854|><|304|><|899|><h1>Title</h1><p>body text</p><|Caption|><|142|><|18|><|223|><|48|><p class=\"x\" style=\"color:red\">styled</p><|Table|><|257|><|594|><|302|><|640|><a href=\"https://example.com\" alt=\"t\">link</a><|Table|><|897|><|878|><|964|><|903|><a href=\"https://example.com\" alt=\"t\">link</a><|Caption|><|67|><|388|><|84|><|441|><pre>  keep   spaces\n  and lines</pre>",
+   "python_html": "<div data-bbox=\"278 854 304 899\" data-label=\"Text\"><h1>Title</h1><p>body text</p></div>\n<div data-bbox=\"142 18 223 48\" data-label=\"Caption\"><p class=\"x\" style=\"color:red\">styled</p></div>\n<div data-bbox=\"257 594 302 640\" data-label=\"Table\"><a href=\"https://example.com\" alt=\"t\">link</a></div>\n<div data-bbox=\"897 878 964 903\" data-label=\"Table\"><a href=\"https://example.com\" alt=\"t\">link</a></div>\n<div data-bbox=\"67 388 84 441\" data-label=\"Caption\"><pre>  keep   spaces\n  and lines</pre></div>",
+   "python_blocks": "[{\"label\": \"Text\", \"bbox\": [278, 854, 304, 899], \"html\": \"<h1>Title</h1><p>body text</p>\", \"truncated\": false}, {\"label\": \"Caption\", \"bbox\": [142, 18, 223, 48], \"html\": \"<p class=\\\"x\\\" style=\\\"color:red\\\">styled</p>\", \"truncated\": false}, {\"label\": \"Table\", \"bbox\": [257, 594, 302, 640], \"html\": \"<a alt=\\\"t\\\" href=\\\"https://example.com\\\">link</a>\", \"truncated\": false}, {\"label\": \"Table\", \"bbox\": [897, 878, 964, 903], \"html\": \"<a alt=\\\"t\\\" href=\\\"https://example.com\\\">link</a>\", \"truncated\": false}, {\"label\": \"Caption\", \"bbox\": [67, 388, 84, 441], \"html\": \"<pre>  keep   spaces\\n  and lines</pre>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"278 854 304 899\" data-label=\"Text\"><h1>Title</h1><p>body text</p></div>\n<div data-bbox=\"142 18 223 48\" data-label=\"Caption\"><p class=\"x\" style=\"color:red\">styled</p></div>\n<div data-bbox=\"257 594 302 640\" data-label=\"Table\"><a href=\"https://example.com\" alt=\"t\">link</a></div>\n<div data-bbox=\"897 878 964 903\" data-label=\"Table\"><a href=\"https://example.com\" alt=\"t\">link</a></div>\n<div data-bbox=\"67 388 84 441\" data-label=\"Caption\"><pre>  keep   spaces\n  and lines</pre></div>",
+   "rust_blocks": "[{\"label\":\"Text\",\"bbox\":[278,854,304,899],\"html\":\"<h1>Title</h1><p>body text</p>\",\"truncated\":false},{\"label\":\"Caption\",\"bbox\":[142,18,223,48],\"html\":\"<p class=\\\"x\\\" style=\\\"color:red\\\">styled</p>\",\"truncated\":false},{\"label\":\"Table\",\"bbox\":[257,594,302,640],\"html\":\"<a href=\\\"https://example.com\\\" alt=\\\"t\\\">link</a>\",\"truncated\":false},{\"label\":\"Table\",\"bbox\":[897,878,964,903],\"html\":\"<a href=\\\"https://example.com\\\" alt=\\\"t\\\">link</a>\",\"truncated\":false},{\"label\":\"Caption\",\"bbox\":[67,388,84,441],\"html\":\"<pre>  keep   spaces\\n  and lines</pre>\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Text|><|0|><|0|><|1|><|1|><p><b>unclosed",
+   "python_html": "<div data-bbox=\"0 0 1 1\" data-label=\"Text\"><p><b>unclosed</div>",
+   "python_blocks": "[{\"label\": \"Text\", \"bbox\": [0, 0, 1, 1], \"html\": \"<p><b>unclosed</b></p>\", \"truncated\": true}]",
+   "rust_html": "<div data-bbox=\"0 0 1 1\" data-label=\"Text\"><p><b>unclosed</div>",
+   "rust_blocks": "[{\"label\":\"Text\",\"bbox\":[0,0,1,1],\"html\":\"<p><b>unclosed\",\"truncated\":true}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Text|><|0|><|0|><|1|><|1|><div><p>crossed</div></p>",
+   "python_html": "<div data-bbox=\"0 0 1 1\" data-label=\"Text\"><div><p>crossed</div></p></div>",
+   "python_blocks": "[{\"label\": \"Text\", \"bbox\": [0, 0, 1, 1], \"html\": \"<div><p>crossed</p></div>\", \"truncated\": false}]",
+   "rust_html": "<div data-bbox=\"0 0 1 1\" data-label=\"Text\"><div><p>crossed</div></p></div>",
+   "rust_blocks": "[{\"label\":\"Text\",\"bbox\":[0,0,1,1],\"html\":\"<div><p>crossed</div></p>\",\"truncated\":false}]",
+   "reason": "beautifulsoup-inner-html"
+  },
+  {
+   "input": "<|Text|><|١|><|٢|><|٣|><|٤|><p>arabic-indic</p>",
+   "python_html": "<div data-bbox=\"1 2 3 4\" data-label=\"Text\"><p>arabic-indic</p></div>",
+   "python_blocks": "[{\"label\": \"Text\", \"bbox\": [1, 2, 3, 4], \"html\": \"<p>arabic-indic</p>\", \"truncated\": false}]",
+   "rust_html": "<|Text|><|١|><|٢|><|٣|><|٤|><p>arabic-indic</p>",
+   "rust_blocks": "<|Text|><|١|><|٢|><|٣|><|٤|><p>arabic-indic</p>",
+   "reason": "html"
+  }
+ ]
+}
