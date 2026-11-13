@@ -302,6 +302,227 @@ fn quantize_mq4g256v2(
     output
 }
 
+// ─── Serial tables (TG / TSV) from the TARGET's lm_head ──────────────────
+
+/// One parsed index entry of an existing HFQ container.
+#[derive(Clone)]
+struct HfqIndexEntry {
+    name: String,
+    quant_type: u8,
+    shape: Vec<u32>,
+    group_size: u32,
+    offset: u64, // absolute offset of the tensor payload in the file
+    len: u64,
+}
+
+/// Read an HFQ container index (the layout `write_hfq` emits and the runtime
+/// `HfqFile::open` parses): 32-byte header, metadata JSON (brace-scanned to
+/// its end, mirroring the runtime reader), tensor index, contiguous data.
+fn read_hfq_index(path: &Path) -> (u32, Vec<HfqIndexEntry>) {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path)
+        .unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
+    let mut header = [0u8; 32];
+    f.read_exact(&mut header).expect("hfq header");
+    assert_eq!(&header[..4], b"HFQM", "bad HFQ magic in {}", path.display());
+    let arch = u32::from_le_bytes(header[8..12].try_into().unwrap());
+    let n_tensors = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
+    let data_off = u64::from_le_bytes(header[24..32].try_into().unwrap());
+
+    f.seek(SeekFrom::Start(32)).unwrap();
+    let mut region = vec![0u8; (data_off - 32) as usize];
+    f.read_exact(&mut region).expect("hfq metadata+index region");
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escape = false;
+    let mut json_end = 0usize;
+    for (i, &b) in region.iter().enumerate() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if b == b'\\' && in_string {
+            escape = true;
+            continue;
+        }
+        if b == b'"' {
+            in_string = !in_string;
+            continue;
+        }
+        if !in_string {
+            if b == b'{' {
+                depth += 1;
+            }
+            if b == b'}' {
+                depth -= 1;
+                if depth == 0 {
+                    json_end = i + 1;
+                    break;
+                }
+            }
+        }
+    }
+    assert!(json_end > 0, "metadata JSON not terminated in {}", path.display());
+
+    let mut pos = json_end;
+    let idx_n = u32::from_le_bytes(region[pos..pos + 4].try_into().unwrap()) as usize;
+    assert_eq!(idx_n, n_tensors, "tensor-index count mismatch in {}", path.display());
+    pos += 4;
+    let mut entries = Vec::with_capacity(idx_n);
+    let mut running = data_off;
+    for _ in 0..idx_n {
+        let name_len = u16::from_le_bytes(region[pos..pos + 2].try_into().unwrap()) as usize;
+        pos += 2;
+        let name = String::from_utf8_lossy(&region[pos..pos + name_len]).to_string();
+        pos += name_len;
+        let qt = region[pos];
+        pos += 1;
+        let nd = region[pos] as usize;
+        pos += 1;
+        let mut shape = Vec::with_capacity(nd);
+        for _ in 0..nd {
+            shape.push(u32::from_le_bytes(region[pos..pos + 4].try_into().unwrap()));
+            pos += 4;
+        }
+        let gs = u32::from_le_bytes(region[pos..pos + 4].try_into().unwrap());
+        pos += 4;
+        let len = u64::from_le_bytes(region[pos..pos + 8].try_into().unwrap());
+        pos += 8;
+        entries.push(HfqIndexEntry {
+            name,
+            quant_type: qt,
+            shape,
+            group_size: gs,
+            offset: running,
+            len,
+        });
+        running += len;
+    }
+    (arch, entries)
+}
+
+fn read_hfq_tensor(path: &Path, entry: &HfqIndexEntry) -> Vec<u8> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).expect("reopen hfq");
+    f.seek(SeekFrom::Start(entry.offset)).unwrap();
+    let mut buf = vec![0u8; entry.len as usize];
+    f.read_exact(&mut buf).expect("hfq tensor read");
+    buf
+}
+
+/// MQ4G256V2 dequant: fp16 scale/zero per 128 half-group, packed nibbles,
+/// then the inverse FWHT. The rotation `Q = S2·D·H·S1` (signs1 → butterfly →
+/// scale → signs2) is orthogonal, so its inverse is the transposed order
+/// `S1·D·H·S2`: the same butterfly with the two sign tables swapped.
+fn dequant_mq4v2(raw: &[u8], n_weights: usize, signs1: &[f32], signs2: &[f32]) -> Vec<f32> {
+    use rayon::prelude::*;
+    const BLOCK: usize = 136;
+    let n_blocks = n_weights.div_ceil(256);
+    assert_eq!(raw.len(), n_blocks * BLOCK, "mq4v2 payload size");
+    (0..n_blocks)
+        .into_par_iter()
+        .flat_map_iter(|b| {
+            let off = b * BLOCK;
+            let s0 = f16_to_f32(u16::from_le_bytes(raw[off..off + 2].try_into().unwrap()));
+            let z0 = f16_to_f32(u16::from_le_bytes(raw[off + 2..off + 4].try_into().unwrap()));
+            let s1 = f16_to_f32(u16::from_le_bytes(raw[off + 4..off + 6].try_into().unwrap()));
+            let z1 = f16_to_f32(u16::from_le_bytes(raw[off + 6..off + 8].try_into().unwrap()));
+            let mut group = [0f32; 256];
+            for i in 0..128 {
+                let byte = raw[off + 8 + i];
+                group[2 * i] = z0 + (byte & 0xF) as f32 * s0;
+                group[2 * i + 1] = z1 + (byte >> 4) as f32 * s1;
+            }
+            cpu_fwht_256(&mut group, signs2, signs1); // inverse: swap the signs
+            group.to_vec()
+        })
+        .collect::<Vec<f32>>()
+}
+
+/// F16 payload → f32 (norms and other exact small tensors in the target HFQ).
+fn f16_bytes_to_f32(raw: &[u8]) -> Vec<f32> {
+    raw.chunks_exact(2)
+        .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+        .collect()
+}
+
+/// Build the sender tables for the serial last-write refinement
+/// (upstream `DSpineDraftSampler.build_serial_tables`):
+///   TG       [V,R] = bf16((LmHead ⊙ norm_w) @ W_last)
+///   TSV_gate [V,R] = sqrt(C) · codebook @ predecessor_gate^T
+///   TSV_val  [V,R] = sqrt(C) · codebook @ prev^T
+/// (the upstream `[G_p; A] @ (sqrt(C)·codebook)^T` transposed to one row per
+/// vocab id, so `tsv[sid]` is a contiguous lookup like `tg[cand]`.)
+/// All math in f32; the caller packs to BF16 for the HFQ.
+fn build_serial_tables(
+    lm_head: &[f32],    // [V, H] dequantized target lm_head
+    norm_w: &[f32],     // [H] target final norm
+    write_last: &[f32], // [H, R] row-major, draft bridge write of the last layer
+    codebook: &[f32],   // [V, C] row-major
+    pred_gate: &[f32],  // [R, C] row-major
+    prev_w: &[f32],     // [R, C] row-major
+    v: usize,
+    h: usize,
+    c: usize,
+    r: usize,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    use rayon::prelude::*;
+    assert_eq!(lm_head.len(), v * h, "lm_head shape");
+    assert_eq!(norm_w.len(), h, "norm shape");
+    assert_eq!(write_last.len(), h * r, "write_last shape");
+    assert_eq!(codebook.len(), v * c, "codebook shape");
+    assert_eq!(pred_gate.len(), r * c, "predecessor_gate shape");
+    assert_eq!(prev_w.len(), r * c, "prev shape");
+    let sqrt_c = (c as f32).sqrt();
+
+    let tg: Vec<f32> = (0..v)
+        .into_par_iter()
+        .flat_map_iter(|vi| {
+            let row = &lm_head[vi * h..(vi + 1) * h];
+            let mut acc = vec![0f32; r];
+            for (j, &x) in row.iter().enumerate() {
+                let x = x * norm_w[j];
+                let wrow = &write_last[j * r..(j + 1) * r];
+                for (t, &w) in wrow.iter().enumerate() {
+                    acc[t] += x * w;
+                }
+            }
+            acc
+        })
+        .collect::<Vec<f32>>();
+
+    let pairs: Vec<(Vec<f32>, Vec<f32>)> = (0..v)
+        .into_par_iter()
+        .map(|vi| {
+            let cb = &codebook[vi * c..(vi + 1) * c];
+            let mut g = vec![0f32; r];
+            let mut a = vec![0f32; r];
+            for (t, pg) in pred_gate.chunks_exact(c).enumerate() {
+                let mut s = 0f32;
+                for j in 0..c {
+                    s += cb[j] * pg[j];
+                }
+                g[t] = s * sqrt_c;
+            }
+            for (t, pv) in prev_w.chunks_exact(c).enumerate() {
+                let mut s = 0f32;
+                for j in 0..c {
+                    s += cb[j] * pv[j];
+                }
+                a[t] = s * sqrt_c;
+            }
+            (g, a)
+        })
+        .collect::<Vec<(Vec<f32>, Vec<f32>)>>();
+    let mut tsv_gate = Vec::with_capacity(v * r);
+    let mut tsv_val = Vec::with_capacity(v * r);
+    for (g, a) in pairs {
+        tsv_gate.extend(g);
+        tsv_val.extend(a);
+    }
+    (tg, tsv_gate, tsv_val)
+}
+
 // ─── HFQ File Format ──────────────────────────────────────────────────────
 
 const HFQ_MAGIC: &[u8; 4] = b"HFQM";
@@ -773,6 +994,7 @@ fn main() {
     let mut use_mq4 = false;
     let mut use_mq4v2 = false;
     let mut mq4v2_symmetric = false;
+    let mut target_hfq: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -796,6 +1018,10 @@ fn main() {
             "--mq4v2-symmetric" => {
                 mq4v2_symmetric = true;
                 i += 1;
+            }
+            "--target-hfq" => {
+                target_hfq = Some(args[i + 1].clone());
+                i += 2;
             }
             "--bf16" => {
                 use_bf16 = true;
@@ -1118,11 +1344,137 @@ fn main() {
         .iter()
         .map(|(n, v)| (n.clone(), serde_json::Value::from(*v)))
         .collect();
+
+    // ── Serial tables (TG / TSV): prebuilt from the TARGET's lm_head ─────
+    // `--target-hfq` names the target's hipfire container (e.g. the 27B
+    // mq4-xts artifact): its lm_head (MQ4G256V2) and final norm (F16) feed
+    // the upstream `build_serial_tables` math, so the runtime lifts the
+    // three tables straight out of this sidecar with no dequant work of
+    // its own. Without the flag the sidecar carries no tables and the
+    // loader stays on the plain greedy-argmax refinement (fail-closed).
+    let serial_tables: Option<[HfqTensor; 3]> = target_hfq.as_ref().map(|th| {
+        let tpath = Path::new(th);
+        eprintln!("  serial tables: target lm_head from {}", tpath.display());
+        let (t_arch, entries) = read_hfq_index(tpath);
+        assert_eq!(t_arch, 5, "target container must be arch 5 (qwen3_5)");
+        let find = |name: &str| {
+            entries
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap_or_else(|| panic!("target HFQ missing tensor {name}"))
+                .clone()
+        };
+        let lm_entry = find("lm_head.weight");
+        assert_eq!(
+            lm_entry.quant_type, 44,
+            "lm_head must be MQ4G256V2 (qt 44) for the dequant path"
+        );
+        assert_eq!(
+            lm_entry.shape,
+            vec![vocab_size as u32, hidden_size as u32],
+            "lm_head shape must match the draft contract (V,H)"
+        );
+        let nw_entry = find("model.language_model.norm.weight");
+        assert_eq!(nw_entry.quant_type, 1, "final norm must be F16");
+        let lm_raw = read_hfq_tensor(tpath, &lm_entry);
+        let nw_raw = read_hfq_tensor(tpath, &nw_entry);
+
+        let tensor_f32 = |name: &str, expect_shape: &[u32]| -> Vec<f32> {
+            let idx = name_to_file
+                .iter()
+                .find(|(n, _)| n == name)
+                .unwrap_or_else(|| panic!("safetensors missing {name}"))
+                .1;
+            let (meta, raw) = st_files[idx]
+                .tensor_data(name)
+                .unwrap_or_else(|| panic!("tensor lookup failed: {name}"));
+            assert_eq!(
+                meta.shape.iter().map(|d| *d as u32).collect::<Vec<u32>>(),
+                expect_shape,
+                "{name} shape"
+            );
+            to_f32(raw, &meta.dtype)
+        };
+        let c = contracts.code_size;
+        let r = contracts.bridge_rank;
+        let write_weights = tensor_f32(
+            "selected_prefix_bridge.feature_write_weights",
+            &[5, hidden_size as u32, r as u32],
+        );
+        let write_last = write_weights[4 * hidden_size * r..].to_vec();
+        let codebook = tensor_f32(
+            "selected_prefix_bridge.codebook",
+            &[vocab_size as u32, c as u32],
+        );
+        let pred_gate = tensor_f32(
+            "selected_prefix_bridge.predecessor_gate.weight",
+            &[r as u32, c as u32],
+        );
+        let prev_w = tensor_f32("selected_prefix_bridge.prev.weight", &[r as u32, c as u32]);
+
+        let norm_w = f16_bytes_to_f32(&nw_raw);
+        assert_eq!(norm_w.len(), hidden_size, "norm width");
+        // The target lm_head rotation uses the same standard seed pair as
+        // the engine (`ensure_mq_signs`), independent of this run's tier.
+        let signs1 = gen_fwht_signs(42, 256);
+        let signs2 = gen_fwht_signs(1042, 256);
+        eprintln!(
+            "  serial tables: dequant lm_head ({} weights)...",
+            vocab_size * hidden_size
+        );
+        let lm_head = dequant_mq4v2(&lm_raw, vocab_size * hidden_size, &signs1, &signs2);
+        eprintln!(
+            "  serial tables: building TG / TSV (V={vocab_size}, H={hidden_size}, C={c}, R={r})..."
+        );
+        let (tg, tsv_gate, tsv_val) = build_serial_tables(
+            &lm_head,
+            &norm_w,
+            &write_last,
+            &codebook,
+            &pred_gate,
+            &prev_w,
+            vocab_size,
+            hidden_size,
+            c,
+            r,
+        );
+        drop(lm_head);
+        let shape = vec![vocab_size as u32, r as u32];
+        let mk = |data: Vec<f32>, name: &str| HfqTensor {
+            name: name.to_string(),
+            quant_type: QuantType::BF16,
+            shape: shape.clone(),
+            group_size: 0,
+            data: f32_slice_to_bf16_bytes(&data),
+        };
+        eprintln!(
+            "  serial tables: TG/TSV built ({:.1} MiB bf16 each)",
+            (vocab_size * r * 2) as f64 / (1024.0 * 1024.0)
+        );
+        [
+            mk(tg, "dspine.tg"),
+            mk(tsv_gate, "dspine.tsv_gate"),
+            mk(tsv_val, "dspine.tsv_val"),
+        ]
+    });
+
     let metadata_json = {
         let mut root = metadata;
         let obj = root.as_object_mut().unwrap();
         let dspine = obj.get_mut("dspine").unwrap().as_object_mut().unwrap();
         dspine.insert("versions".into(), serde_json::Value::Object(versions_json));
+        if serial_tables.is_some() {
+            dspine.insert(
+                "serial_tables".into(),
+                json!({
+                    "kind": contracts.refine_kind,
+                    "head_topk": contracts.refine_head_topk,
+                    "version": 1,
+                    "weight": 1.0,
+                    "tensors": ["dspine.tg", "dspine.tsv_gate", "dspine.tsv_val"],
+                }),
+            );
+        }
         serde_json::to_string(&root).unwrap()
     };
 
@@ -1194,6 +1546,9 @@ fn main() {
         total_params as f64 / 1e9,
         hfq_tensors.len()
     );
+    if let Some(tables) = serial_tables {
+        hfq_tensors.extend(tables);
+    }
     eprintln!(
         "  total out  : {:.2} MiB",
         total_bytes_out as f64 / (1024.0 * 1024.0)
@@ -1219,6 +1574,84 @@ fn main() {
 #[cfg(test)]
 mod contract_tests {
     use super::*;
+
+    #[test]
+    fn fwht_inverse_is_the_swapped_sign_order() {
+        // Q = S2·D·H·S1; Q⁻¹ = S1·D·H·S2 — the same butterfly with the two
+        // sign tables swapped (H symmetric, D diagonal, S diagonal ±1).
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        let mut x: Vec<f32> = (0..256).map(|i| ((i * 37) % 61) as f32 - 30.0).collect();
+        let orig = x.clone();
+        cpu_fwht_256(&mut x, &s1, &s2); // forward
+        cpu_fwht_256(&mut x, &s2, &s1); // inverse (swapped)
+        for i in 0..256 {
+            assert!(
+                (x[i] - orig[i]).abs() < 1e-2 + orig[i].abs() * 1e-3,
+                "fwht inverse mismatch at {i}: {} vs {}",
+                x[i],
+                orig[i]
+            );
+        }
+    }
+
+    #[test]
+    fn mq4v2_roundtrip_matches_within_quantization_error() {
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        let w: Vec<f32> = (0..512)
+            .map(|i| (((i * 91) % 197) as f32 / 197.0 - 0.5) * 0.8)
+            .collect();
+        let amax = w.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+        let q = quantize_mq4g256v2(&w, 2, 256, &s1, &s2, true);
+        let back = dequant_mq4v2(&q, 512, &s1, &s2);
+        // A symmetric 4-bit grid has a half-step of ~amax/16, but the
+        // Hadamard redistributes each group's code error across its 256
+        // elements: single elements land within ~1-2 steps. The honest
+        // semantic check is the group energy (FWHT preserves it) plus a
+        // loose per-element bound; an ordering/half-group/sign-swap bug
+        // blows both up by orders of magnitude.
+        let mut sum_sq = 0.0f64;
+        let mut worst = 0.0f32;
+        for i in 0..512 {
+            let err = (back[i] - w[i]).abs();
+            sum_sq += (err as f64) * (err as f64);
+            worst = worst.max(err);
+        }
+        let rms = (sum_sq / 512.0).sqrt();
+        assert!(
+            rms <= (amax * 0.12) as f64,
+            "mq4v2 roundtrip RMS {rms} exceeds amax*0.12 (amax {amax})"
+        );
+        assert!(
+            worst <= amax * 0.35,
+            "mq4v2 roundtrip worst element {worst} exceeds amax*0.35 (amax {amax})"
+        );
+    }
+
+    #[test]
+    fn serial_tables_match_closed_form() {
+        // V=2, H=2, C=2, R=2 hand-checked: tg = (lm⊙nw)@W_last (identity
+        // write), tsv = sqrt(C)·cb@g^T with identity codebook rows.
+        let lm = vec![1.0, 2.0, 3.0, 4.0];
+        let nw = vec![0.5, 2.0];
+        let write_last = vec![1.0, 0.0, 0.0, 1.0];
+        let cb = vec![1.0, 0.0, 0.0, 1.0];
+        let pg = vec![1.0, 2.0, 3.0, 4.0];
+        let pv = vec![5.0, 6.0, 7.0, 8.0];
+        let (tg, tsv_gate, tsv_val) =
+            build_serial_tables(&lm, &nw, &write_last, &cb, &pg, &pv, 2, 2, 2, 2);
+        assert_eq!(tg, vec![0.5, 4.0, 1.5, 8.0]);
+        let s = 2.0f32.sqrt();
+        assert!((tsv_gate[0] - s).abs() < 1e-6);
+        assert!((tsv_gate[1] - 3.0 * s).abs() < 1e-6);
+        assert!((tsv_gate[2] - 2.0 * s).abs() < 1e-6);
+        assert!((tsv_gate[3] - 4.0 * s).abs() < 1e-6);
+        assert!((tsv_val[0] - 5.0 * s).abs() < 1e-6);
+        assert!((tsv_val[1] - 7.0 * s).abs() < 1e-6);
+        assert!((tsv_val[2] - 6.0 * s).abs() < 1e-6);
+        assert!((tsv_val[3] - 8.0 * s).abs() < 1e-6);
+    }
 
     fn valid_config() -> serde_json::Value {
         json!({

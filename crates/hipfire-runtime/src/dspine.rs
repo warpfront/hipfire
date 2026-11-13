@@ -28,6 +28,10 @@ pub struct DspineConfig {
     pub first_exact: usize,
     pub head_topk: usize,
     pub feature_layers: Vec<usize>,
+    /// Whether the sidecar carries the prebuilt TG/TSV sender tables
+    /// (converter `--target-hfq` pass). `false` = legal older sidecar;
+    /// the loader then stays on the plain greedy-argmax refinement.
+    pub serial_tables: bool,
 }
 
 impl DspineConfig {
@@ -128,6 +132,11 @@ impl DspineConfig {
             }
         }
 
+        // Prebuilt serial sender tables (TG / TSV) from the converter's
+        // `--target-hfq` pass. Their absence is legal: the loader then
+        // stays on the plain greedy-argmax refinement (fail-closed).
+        let serial_tables = dsp.get("serial_tables").is_some();
+
         Ok(Some(Self {
             trunk,
             code_size,
@@ -136,8 +145,18 @@ impl DspineConfig {
             first_exact,
             head_topk,
             feature_layers,
+            serial_tables,
         }))
     }
+}
+
+/// GPU-resident sender tables for the serial last-write refinement
+/// (upstream `DSpineDraftSampler.build_serial_tables`, prebuilt by the
+/// converter): `tg[cand]`, `tsv_gate[sid]`, `tsv_val[sid]`, each [V, R] F32.
+pub struct SerialTables {
+    pub tg: GpuTensor,
+    pub tsv_gate: GpuTensor,
+    pub tsv_val: GpuTensor,
 }
 
 /// GPU-resident code-bridge runner for the arch-24 DSpine drafter: loads the
@@ -162,6 +181,9 @@ pub struct DspineBridge {
     write_w: Vec<GpuTensor>, // 5 × [H, R] f32
     packed_w: GpuTensor,    // [3R, C] f32 = gate ⊕ predecessor_gate ⊕ prev
     gate_bias: GpuTensor,   // [R] f32
+    // Prebuilt serial sender tables ([V, R] f32 each), `Some` only
+    // when the sidecar carried them (converter `--target-hfq`).
+    serial: Option<SerialTables>,
     // scratch (sized to the block)
     s_normed: GpuTensor,     // [b, H] f32
     s_projected: GpuTensor,  // [b, C] f32
@@ -287,6 +309,25 @@ impl DspineBridge {
             vec![r],
         )?;
 
+        // Prebuilt serial sender tables: fail-closed lift when the
+        // metadata promises them (a missing tensor is a corrupt sidecar,
+        // not a silent downgrade to the argmax walk).
+        let serial = if cfg.serial_tables {
+            let v = {
+                let (meta, _) = hfq
+                    .tensor_data("selected_prefix_bridge.codebook")
+                    .ok_or("dspine tensor missing: selected_prefix_bridge.codebook")?;
+                meta.shape[0] as usize
+            };
+            Some(SerialTables {
+                tg: lift_bf16_tensor(gpu, hfq, "dspine.tg", vec![v, r])?,
+                tsv_gate: lift_bf16_tensor(gpu, hfq, "dspine.tsv_gate", vec![v, r])?,
+                tsv_val: lift_bf16_tensor(gpu, hfq, "dspine.tsv_val", vec![v, r])?,
+            })
+        } else {
+            None
+        };
+
         Ok(Self {
             s_normed: gpu
                 .alloc_tensor(&[block, h], rdna_compute::DType::F32)
@@ -323,7 +364,13 @@ impl DspineBridge {
             write_w,
             packed_w,
             gate_bias,
+            serial,
         })
+    }
+
+    /// The prebuilt sender tables, when the sidecar carried them.
+    pub fn serial(&self) -> Option<&SerialTables> {
+        self.serial.as_ref()
     }
 
     /// Explicit GPU release (mirrors `DflashWeights::free_gpu`: tensor drops
@@ -336,6 +383,7 @@ impl DspineBridge {
             write_w,
             packed_w,
             gate_bias,
+            serial,
             s_normed,
             s_projected,
             s_codes,
@@ -356,6 +404,11 @@ impl DspineBridge {
         }
         let _ = gpu.free_tensor(packed_w);
         let _ = gpu.free_tensor(gate_bias);
+        if let Some(tables) = serial {
+            let _ = gpu.free_tensor(tables.tg);
+            let _ = gpu.free_tensor(tables.tsv_gate);
+            let _ = gpu.free_tensor(tables.tsv_val);
+        }
         for t in [s_normed, s_projected, s_codes, s_packed, s_message, s_delta, s_rms, s_anchor] {
             let _ = gpu.free_tensor(t);
         }
@@ -810,5 +863,29 @@ mod tests {
         // Block-first rows pass raw through and still norm it.
         let (output, _) = finish_row(&[1.0, 1.0], 2.0, &[9.0, 9.0], true, h, eps);
         assert_eq!(output, vec![1.0, 1.0]);
+    }
+
+    #[test]
+    fn serial_tables_flag_follows_metadata() {
+        let base = valid_metadata();
+        let cfg = DspineConfig::from_metadata(&base).unwrap().unwrap();
+        assert!(!cfg.serial_tables, "plain sidecar must not claim tables");
+
+        let with_tables = {
+            let mut m = base.clone();
+            m.as_object_mut()
+                .unwrap()
+                .get_mut("dspine")
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .insert(
+                    "serial_tables".to_string(),
+                    json!({"kind": "exact_sender", "head_topk": 16, "version": 1}),
+                );
+            m
+        };
+        let cfg = DspineConfig::from_metadata(&with_tables).unwrap().unwrap();
+        assert!(cfg.serial_tables, "converter --target-hfq pass must flag tables");
     }
 }
