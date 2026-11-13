@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Sampling seed honoured on four singleton routes.** Glimmer, LFM2-MoE, MiniMax and Cohere2-MoE singleton decode seeded their sampler from the wall clock and ignored the request's `seed`; they now use the same per-request seed as every other route (the wire `seed` when given), so a seeded sampled request is reproducible.
 - PeaceMaker gfx942: strictly seal both re-frozen convolution-fuse entries byte-identically after ordered-VMEM WAW qualification. Bind the unchanged native image and full source baseline to MI300X 658-case/33-control evidence, fresh-seal family tests, positive ledger rows and live-launcher ABI inventory; no input, anchor, instruction or dispatch rewrite.
 - PeaceMaker gfx942: bind the frozen rows16-grid, MoE-wide and MoE-GEMM twins to full exact-image MI300X oracles (770/582/276 cases, 17/28/18 detected controls; no failures or guard clobbers), matching full source-arm baselines, source/binary/ledger hashes and fresh-seal family regressions. The MoE router oracle checks legal racy fault records and exact single-fault reruns without changing inputs or anchors.
 - PeaceMaker gfx942: strictly seal the unchanged four-entry MoE-wide image after compare/GE_U64/LDS-OR qualification, and pin its real positive ledger and HIP/HSA ABI inventory. Advance both immutable QSA FP8-prologue negative pins to the actual next unsupported packed-FP8 conversion; the original five-entry hardware claim remains unchanged.
