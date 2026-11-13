@@ -8,7 +8,7 @@
 //! one thing a positive case has (a wait state, a wait, a barrier drain) and must fail.
 
 use peacemaker_cdna::enc::{
-    ds::DsOp,
+    ds::{Ds, DsOp},
     flat::{FlatOp, FlatSeg},
     smem::SmemOp,
     sop::{waitcnt_imm, Sop1Op, Sop2Op, SopcOp, SoppOp},
@@ -230,6 +230,79 @@ fn missing_lgkm_wait_for_ds_fails_and_nonzero_lgkmcnt_retires_by_position() {
     ok(&[ds_read(1), ds_read(10), wait(63, 1), use_of(1), end()]);
     fails(
         &[ds_read(1), ds_read(10), wait(63, 1), use_of(10), end()],
+        "Lgkm wait",
+    );
+}
+
+#[test]
+fn all_float_compares_and_ge_u64_certify_through_both_builder_encodings() {
+    let compares: Vec<_> = VopcOp::ALL
+        .iter()
+        .copied()
+        .filter(|op| op.float_compare().is_some())
+        .chain(std::iter::once(VopcOp::CmpGeU64))
+        .collect();
+    assert_eq!(compares.len(), 65);
+    for op in compares {
+        for dst in [Src::VccLo, s(20)] {
+            let inst = ops::vc(op, dst, v(0), v(4));
+            assert_eq!(matches!(&inst, Inst::Vopc(_)), dst == Src::VccLo);
+            assert_eq!(matches!(&inst, Inst::Vop3(_)), dst != Src::VccLo);
+            let report = ok(&[inst, end()]);
+            assert_eq!(report["checked"], true, "{op:?} -> {dst:?}");
+            assert_eq!(report["findings"], 0, "{op:?} -> {dst:?}");
+            assert_eq!(report["bypasses"], 0, "{op:?} -> {dst:?}");
+        }
+    }
+}
+
+#[test]
+fn ds_or_return_and_no_return_keep_counter_and_barrier_obligations() {
+    let atomic = |returns: bool| {
+        Inst::Ds(Ds {
+            op: if returns { DsOp::OrRtnB32 } else { DsOp::OrB32 },
+            vdst: returns.then_some(v(10)),
+            addr: Some(v(2)),
+            data0: Some(v(3)),
+            data1: None,
+            offset0: 4,
+            offset1: 0,
+            gds: false,
+        })
+    };
+    for returns in [false, true] {
+        let report = ok(&[atomic(returns), wait(63, 0), barrier(), end()]);
+        assert_eq!(
+            report["ledger"]["memory"][if returns { "ds_load" } else { "ds_store" }],
+            1
+        );
+        // Both forms modify LDS; a returnless atomic is not an ignorable no-op.
+        fails(
+            &[atomic(returns), barrier(), end()],
+            "Lgkm wait 0 (Barrier)",
+        );
+        fails(
+            &[atomic(returns), wait(0, 15), barrier(), end()],
+            "Lgkm wait",
+        );
+        fails(
+            &[atomic(returns), ds_read(20), wait(63, 1), barrier(), end()],
+            "Barrier",
+        );
+    }
+    fails(&[atomic(true), use_of(10), end()], "Lgkm wait");
+    fails(&[atomic(true), load(10), end()], "Waw");
+    ok(&[atomic(true), wait(63, 0), use_of(10), end()]);
+    // A partial wait retires the older returned OR, but not the younger DS read.
+    ok(&[atomic(true), ds_read(20), wait(63, 1), use_of(10), end()]);
+    fails(
+        &[atomic(true), ds_read(20), wait(63, 1), use_of(20), end()],
+        "Lgkm wait",
+    );
+    // A wait on only the fallthrough cannot discharge the taken path's atomic result.
+    let skip_wait = ops::sp(SoppOp::CbranchScc1, 1);
+    fails(
+        &[atomic(true), skip_wait, wait(63, 0), use_of(10), end()],
         "Lgkm wait",
     );
 }

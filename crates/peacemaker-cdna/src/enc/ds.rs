@@ -54,6 +54,8 @@ op_table!(DsOp {
     Write2st64B64,
     AddU32,
     AddRtnU32,
+    OrB32,
+    OrRtnB32,
     MaxU32,
     MaxI32,
     MaxF32,
@@ -94,12 +96,13 @@ impl DsOp {
             Self::Write2B32 | Self::Write2st64B32 => (0, 1, 1),
             Self::Write2B64 | Self::Write2st64B64 => (0, 2, 2),
             Self::AddU32
+            | Self::OrB32
             | Self::MaxU32
             | Self::MaxI32
             | Self::MaxF32
             | Self::MinF32
             | Self::AddF32 => (0, 1, 0),
-            Self::AddRtnU32 => (1, 1, 0),
+            Self::AddRtnU32 | Self::OrRtnB32 => (1, 1, 0),
             Self::SwizzleB32 => (1, 0, 0),
             Self::PermuteB32 | Self::BpermuteB32 => (1, 1, 0),
             Self::Nop => (0, 0, 0),
@@ -167,12 +170,13 @@ impl DsOp {
             | Self::Write2st64B64
             | Self::Nop => MemKind::DsStore,
             Self::AddU32
+            | Self::OrB32
             | Self::MaxU32
             | Self::MaxI32
             | Self::MaxF32
             | Self::MinF32
             | Self::AddF32 => MemKind::DsAtomic,
-            Self::AddRtnU32 => MemKind::DsAtomicRtn,
+            Self::AddRtnU32 | Self::OrRtnB32 => MemKind::DsAtomicRtn,
             Self::SwizzleB32 | Self::PermuteB32 | Self::BpermuteB32 => MemKind::DsXlane,
         }
     }
@@ -506,6 +510,8 @@ impl DsOp {
                 Self::Write2st64B64 => 79,
                 Self::AddU32 => 0,
                 Self::AddRtnU32 => 32,
+                Self::OrB32 => 10,
+                Self::OrRtnB32 => 42,
                 Self::MaxU32 => 8,
                 Self::MaxI32 => 6,
                 Self::MaxF32 => 19,
@@ -547,6 +553,8 @@ impl DsOp {
             Self::Write2st64B64 => "ds_write2st64_b64",
             Self::AddU32 => "ds_add_u32",
             Self::AddRtnU32 => "ds_add_rtn_u32",
+            Self::OrB32 => "ds_or_b32",
+            Self::OrRtnB32 => "ds_or_rtn_b32",
             Self::MaxU32 => "ds_max_u32",
             Self::MaxI32 => "ds_max_i32",
             Self::MaxF32 => "ds_max_f32",

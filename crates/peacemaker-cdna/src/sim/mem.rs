@@ -124,6 +124,7 @@ fn destination(
 #[derive(Clone, Copy)]
 enum Atomic {
     Add,
+    Or,
     MaxU,
     MaxI,
     AddFloat { denorm: u8 },
@@ -244,6 +245,7 @@ fn float_select(a: u32, b: u32, denorm: u8, max: bool) -> u32 {
 fn atomic_result(op: Atomic, old: u32, operand: u32) -> u32 {
     match op {
         Atomic::Add => old.wrapping_add(operand),
+        Atomic::Or => old | operand,
         Atomic::MaxU => old.max(operand),
         Atomic::MaxI => (old as i32).max(operand as i32) as u32,
         Atomic::AddFloat { denorm } => float_add(old, operand, denorm),
@@ -419,6 +421,7 @@ fn ds(w: &Wave, i: &Ds) -> SimResult<Prepared> {
         Write2B32 | Write2st64B32 => (4, false, false, true, i.op == Write2st64B32, None),
         Write2B64 | Write2st64B64 => (8, false, false, true, i.op == Write2st64B64, None),
         AddU32 | AddRtnU32 => (4, false, false, false, false, Some(Atomic::Add)),
+        OrB32 | OrRtnB32 => (4, false, false, false, false, Some(Atomic::Or)),
         MaxU32 => (4, false, false, false, false, Some(Atomic::MaxU)),
         MaxI32 => (4, false, false, false, false, Some(Atomic::MaxI)),
         AddF32 => (
@@ -454,7 +457,7 @@ fn ds(w: &Wave, i: &Ds) -> SimResult<Prepared> {
         Nop => return Ok(prepared(Counter::Lgkm, 1, false, busy, Vec::new(), true)),
         SwizzleB32 | PermuteB32 | BpermuteB32 => return unsupported(i.op.name()),
     };
-    let dst = if load || i.op == AddRtnU32 {
+    let dst = if load || matches!(i.op, AddRtnU32 | OrRtnB32) {
         Some(required(i.vdst, "DS destination")?)
     } else {
         None
