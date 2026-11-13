@@ -1160,7 +1160,10 @@ mod gfx942_tests {
         assert_eq!(l.required_replay(&read(1))[0].1, 0);
         l.wait_replay(Counter::Vm, 1);
         assert!(!l.is_pending(0) && l.is_pending(1));
-        assert!(matches!(l.required_replay(&write(1))[0].2, Reason::Waw { .. }));
+        assert!(matches!(
+            l.required_replay(&write(1))[0].2,
+            Reason::Waw { .. }
+        ));
         l.wait_replay(Counter::Vm, 0);
         assert!(l.required_replay(&read(1)).is_empty());
         // Destination aliases the younger load's address: RAW is not an ordered WAW.
@@ -1256,9 +1259,14 @@ mod gfx942_tests {
         }
         let wide = Instruction::new(
             "global_load_dwordx2 v[0:1], v[8:9], off",
-            vec![RegRef { kind: Kind::V, base: 0, len: 2 }],
+            vec![RegRef {
+                kind: Kind::V,
+                base: 0,
+                len: 2,
+            }],
             vec![v(8)],
-        ).memory(MemoryClass::VmemLoad);
+        )
+        .memory(MemoryClass::VmemLoad);
         let mut l = ledger(Arch::Gfx942, &[wide]);
         assert!(l.required_replay(&global).is_empty());
         l.record(Arch::Gfx942, &global);

@@ -183,7 +183,9 @@ fn same_vmem_read_class_waw_keeps_pending_results_across_widths_and_policies() {
             for new_policy in 0..8 {
                 let load_with = |op, base, policy| {
                     let mut i = ops::global_load(op, v(base), v(40), None, 0);
-                    let Inst::Flat(f) = &mut i else { unreachable!() };
+                    let Inst::Flat(f) = &mut i else {
+                        unreachable!()
+                    };
                     f.sc0 = policy & 1 != 0;
                     f.sc1 = policy & 2 != 0;
                     f.nt = policy & 4 != 0;
@@ -191,10 +193,22 @@ fn same_vmem_read_class_waw_keeps_pending_results_across_widths_and_policies() {
                 };
                 let older = load_with(old_op, old_base, old_policy);
                 let younger = load_with(new_op, new_base, new_policy);
-                ok(&[older.clone(), younger.clone(), wait(0, 15), use_of(shared), end()]);
+                ok(&[
+                    older.clone(),
+                    younger.clone(),
+                    wait(0, 15),
+                    use_of(shared),
+                    end(),
+                ]);
                 // A partial wait retires only the older result, not the younger one.
                 fails(
-                    &[older.clone(), younger.clone(), wait(1, 15), use_of(shared), end()],
+                    &[
+                        older.clone(),
+                        younger.clone(),
+                        wait(1, 15),
+                        use_of(shared),
+                        end(),
+                    ],
                     "Vm wait",
                 );
                 fails(&[older, younger, use_of(shared), end()], "Vm wait");
@@ -221,12 +235,15 @@ fn ordered_load_waw_is_not_an_exec_path_exemption() {
     p.extend([use_of(1), end()]);
     fails(&p, "Vm wait");
     // A genuine reachable WAW, including under a different EXEC, still refuses.
-    fails(&[
-        load(1),
-        ops::s1(Sop1Op::MovB64, Src::ExecLo, Src::Int(1)),
-        ops::v1(Vop1Op::MovB32, v(1), v(0)),
-        end(),
-    ], "Waw");
+    fails(
+        &[
+            load(1),
+            ops::s1(Sop1Op::MovB64, Src::ExecLo, Src::Int(1)),
+            ops::v1(Vop1Op::MovB32, v(1), v(0)),
+            end(),
+        ],
+        "Waw",
+    );
     fails(&[load(1), ds_read(1), wait(0, 0), end()], "Waw");
     fails(&[ds_read(1), load(1), wait(0, 0), end()], "Waw");
 }
@@ -1026,7 +1043,12 @@ fn unknown_exec_and_vcc_branches_retain_both_edges_even_for_a_zero_mask() {
 fn hazard_matrix() -> Vec<(&'static str, Vec<Inst>, Vec<Inst>, &'static str)> {
     let smem = |dst: u8| ops::s_load(SmemOp::LoadDword, s(dst), s(2), 0);
     vec![
-        ("load -> DS load", vec![load(1)], vec![ds_read(1)], "Vm wait"),
+        (
+            "load -> DS load",
+            vec![load(1)],
+            vec![ds_read(1)],
+            "Vm wait",
+        ),
         (
             "load -> VALU overwrite",
             vec![load(1)],

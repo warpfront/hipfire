@@ -6,7 +6,7 @@
 //! overlapping VGPR destinations with NO `s_waitcnt` between the two loads.
 //!
 //! Claim under test: vector-memory loads of one wave of the same VMEM type class (untyped
-//! GLOBAL and MUBUF buffer loads, the LLVM `VMEM_NOSAMPLER` class) return in issue order, so when an
+//! GLOBAL and MUBUF buffer loads, LLVM's non-sampler `VMEM_READ_ACCESS` class) return in issue order, so when an
 //! older and a newer load share a destination dword the NEWER (last-issued) value is what remains for
 //! every lane the newer load was active, and lanes active only in the older load (or in neither) keep
 //! the older load's value (or the preserved prior value). Lane masks are stress only; the ledger rule
@@ -593,34 +593,29 @@ fn prove(sp: &Spec, texts: &[String]) -> Result<Proof, String> {
     let (l1, ld1) = &loads[loads.len() - 2];
     let (l2, ld2) = &loads[loads.len() - 1];
     let (l0, l1, l2) = (*l0, *l1, *l2);
-    let want = |ld: &Ld,
-                fam: Fam,
-                k: &Kind,
-                dst: String,
-                bits: &str,
-                what: &str|
-     -> Result<(), String> {
-        let extra: &[&str] = if fam == Fam::B { &["offen"] } else { &[] };
-        let (m, ms) = (mnem(fam, k), mod_set(bits, extra));
-        if ld.mnem != m || ld.dst != dst || ld.mods != ms {
-            return Err(format!(
-                "{}: {what} is `{} {} {:?}`, want `{m} {dst} {ms:?}`",
-                sp.name, ld.mnem, ld.dst, ld.mods
-            ));
-        }
-        let a = vstart(&ld.addr)
-            .ok_or_else(|| format!("{}: {what} address `{}`", sp.name, ld.addr))?;
-        if (32..96).contains(&a) || (32..96).contains(&(a + 1)) {
-            return Err(format!(
-                "{}: {what} address {} collides with the staging VGPRs",
-                sp.name, ld.addr
-            ));
-        }
-        if ld.offset.is_some() {
-            return Err(format!("{}: {what} has an unexpected offset", sp.name));
-        }
-        Ok(())
-    };
+    let want =
+        |ld: &Ld, fam: Fam, k: &Kind, dst: String, bits: &str, what: &str| -> Result<(), String> {
+            let extra: &[&str] = if fam == Fam::B { &["offen"] } else { &[] };
+            let (m, ms) = (mnem(fam, k), mod_set(bits, extra));
+            if ld.mnem != m || ld.dst != dst || ld.mods != ms {
+                return Err(format!(
+                    "{}: {what} is `{} {} {:?}`, want `{m} {dst} {ms:?}`",
+                    sp.name, ld.mnem, ld.dst, ld.mods
+                ));
+            }
+            let a = vstart(&ld.addr)
+                .ok_or_else(|| format!("{}: {what} address `{}`", sp.name, ld.addr))?;
+            if (32..96).contains(&a) || (32..96).contains(&(a + 1)) {
+                return Err(format!(
+                    "{}: {what} address {} collides with the staging VGPRs",
+                    sp.name, ld.addr
+                ));
+            }
+            if ld.offset.is_some() {
+                return Err(format!("{}: {what} has an unexpected offset", sp.name));
+            }
+            Ok(())
+        };
     want(ld0, Fam::G, &X4, reg(32, 4), "", "old-value preload")?;
     want(
         ld1,
@@ -703,7 +698,10 @@ fn prove(sp: &Spec, texts: &[String]) -> Result<Proof, String> {
         .iter()
         .any(|t| t.starts_with("global_store_dword ") && t.contains("v36"));
     if !st4 || !st1 {
-        return Err(format!("{}: result stores missing after the drain", sp.name));
+        return Err(format!(
+            "{}: result stores missing after the drain",
+            sp.name
+        ));
     }
     Ok(Proof {
         window: texts[l1..=l2].to_vec(),
@@ -724,7 +722,11 @@ fn dw(i: usize) -> u32 {
     if i % 4099 == 17 {
         let q = i / 4099;
         let (e, round) = (EDGES[q % EDGES.len()], q / EDGES.len());
-        x = if round == 0 { e } else { e ^ (1 << (round % 23)) };
+        x = if round == 0 {
+            e
+        } else {
+            e ^ (1 << (round % 23))
+        };
     }
     x
 }
@@ -741,7 +743,12 @@ impl Data {
     }
     fn dword(&self, a: usize) -> u32 {
         if a + 4 <= HOT {
-            u32::from_le_bytes([self.hot[a], self.hot[a + 1], self.hot[a + 2], self.hot[a + 3]])
+            u32::from_le_bytes([
+                self.hot[a],
+                self.hot[a + 1],
+                self.hot[a + 2],
+                self.hot[a + 3],
+            ])
         } else {
             dw(a / 4)
         }
@@ -964,14 +971,7 @@ fn apply(r: &mut [u32; 4], k: &Kind, off: u32, data: &Data, a: usize) {
 }
 
 /// Last-issued-wins model. `swap` applies newer before older (the reversed-order control).
-fn payload(
-    sp: &Spec,
-    scns: &[Scn],
-    old: &[u32],
-    data: &Data,
-    poison: u8,
-    swap: bool,
-) -> Vec<u8> {
+fn payload(sp: &Spec, scns: &[Scn], old: &[u32], data: &Data, poison: u8, swap: bool) -> Vec<u8> {
     let p = &PAIRS[sp.pair];
     let mut out = vec![poison; BLOCKS * 64 * LANE_BYTES];
     for (b, s) in scns.iter().enumerate() {
@@ -979,8 +979,18 @@ fn payload(
             let o = (b * 64 + l) * 4;
             let mut r = [old[o], old[o + 1], old[o + 2], old[o + 3]];
             let ops = [
-                (s.ma >> l & 1 == 1, &p.older, p.ooff, addr(s, l, &p.older, false)),
-                (s.mb >> l & 1 == 1, &p.newer, p.noff, addr(s, l, &p.newer, true)),
+                (
+                    s.ma >> l & 1 == 1,
+                    &p.older,
+                    p.ooff,
+                    addr(s, l, &p.older, false),
+                ),
+                (
+                    s.mb >> l & 1 == 1,
+                    &p.newer,
+                    p.noff,
+                    addr(s, l, &p.newer, true),
+                ),
             ];
             for i in if swap { [1, 0] } else { [0, 1] } {
                 let (on, k, off, a) = ops[i];
@@ -993,7 +1003,9 @@ fn payload(
                 aux ^= data.dword(s.fill as usize + l * 4 + f * 64);
             }
             let w = (b * 64 + l) * LANE_BYTES;
-            out[w..w + 16].copy_from_slice(&bytes_of(&r));
+            for (dst, value) in out[w..w + 16].chunks_exact_mut(4).zip(r) {
+                dst.copy_from_slice(&value.to_le_bytes());
+            }
             out[w + 16..w + 20].copy_from_slice(&aux.to_le_bytes());
         }
     }
@@ -1009,7 +1021,10 @@ fn tables(sp: &Spec, scns: &[Scn]) -> Result<(Vec<u8>, Vec<u8>), String> {
             for l in 0..64 {
                 let a = addr(s, l, k, newer);
                 if a + 16 > TOTAL {
-                    return Err(format!("{}: address {a:#x} out of the data buffer", sp.name));
+                    return Err(format!(
+                        "{}: address {a:#x} out of the data buffer",
+                        sp.name
+                    ));
                 }
                 tbl.extend((a as u32).to_le_bytes());
             }
@@ -1040,7 +1055,10 @@ fn prove_cal(name: &str, bits: &str, texts: &[String]) -> Result<(), String> {
         .map(|(i, _)| i)
         .collect();
     if t.len() != 2 {
-        return Err(format!("{name}: {} s_memtime instructions, want 2", t.len()));
+        return Err(format!(
+            "{name}: {} s_memtime instructions, want 2",
+            t.len()
+        ));
     }
     let mid = &texts[t[0] + 1..t[1]];
     let li = mid
@@ -1054,12 +1072,16 @@ fn prove_cal(name: &str, bits: &str, texts: &[String]) -> Result<(), String> {
         || ld.mods != mod_set(bits, &[])
         || ld.offset.is_some()
     {
-        return Err(format!("{name}: timed load is not exactly `global_load_dword v38 {bits}`"));
+        return Err(format!(
+            "{name}: timed load is not exactly `global_load_dword v38 {bits}`"
+        ));
     }
     if !mid[..li].iter().all(|s| s == "s_waitcnt lgkmcnt(0)")
         || mid.get(li + 1).map(String::as_str) != Some("s_waitcnt vmcnt(0)")
     {
-        return Err(format!("{name}: unexpected waits around the timed load: {mid:?}"));
+        return Err(format!(
+            "{name}: unexpected waits around the timed load: {mid:?}"
+        ));
     }
     Ok(())
 }
@@ -1258,12 +1280,20 @@ fn run(dir: &Path) -> Result<Value, String> {
             blob.resize(256, 0);
             // SAFETY: live allocations, one wave per block, in-range tables, full hidden argument storage.
             unsafe {
-                rt.launch_kernel_blob(&f, [CAL_BLOCKS as u32, 1, 1], [64, 1, 1], 0, None, &mut blob)
+                rt.launch_kernel_blob(
+                    &f,
+                    [CAL_BLOCKS as u32, 1, 1],
+                    [64, 1, 1],
+                    0,
+                    None,
+                    &mut blob,
+                )
             }
             .map_err(|e| e.to_string())?;
             rt.device_synchronize().map_err(|e| e.to_string())?;
             let mut res = vec![0u8; CAL_BLOCKS * 16];
-            rt.memcpy_dtoh(&mut res, &dcres).map_err(|e| e.to_string())?;
+            rt.memcpy_dtoh(&mut res, &dcres)
+                .map_err(|e| e.to_string())?;
             let mut dts: Vec<u64> = res
                 .chunks_exact(16)
                 .map(|c| {
@@ -1320,7 +1350,8 @@ fn run(dir: &Path) -> Result<Value, String> {
             rt.memcpy_htod(&dmsk, &msk).map_err(|e| e.to_string())?;
             let old = &olds[pi];
             let old_bytes = bytes_of(old);
-            rt.memcpy_htod(&dold, &old_bytes).map_err(|e| e.to_string())?;
+            rt.memcpy_htod(&dold, &old_bytes)
+                .map_err(|e| e.to_string())?;
             // Evict caches (best effort) so the cold older lines really are misses.
             rt.memset(&dthrash, (si as i32 * 7 + pi as i32) & 0xff, TOTAL)
                 .map_err(|e| e.to_string())?;
@@ -1393,7 +1424,11 @@ fn run(dir: &Path) -> Result<Value, String> {
                         if rev[i] == out[i] { "MATCHES" } else { "differs" }
                     )
                 });
-                let list = if p.gating() { &mut notes } else { &mut info_notes };
+                let list = if p.gating() {
+                    &mut notes
+                } else {
+                    &mut info_notes
+                };
                 if list.len() < MAX_FAIL_NOTES {
                     list.push(format!(
                         "{} poison {poison:#x}: guards_ok={guards_ok} bad_bytes={bad} first {loc:?}",
@@ -1423,7 +1458,11 @@ fn run(dir: &Path) -> Result<Value, String> {
             }
             if detected != ctl_expected {
                 pass_bad = true;
-                let list = if p.gating() { &mut notes } else { &mut info_notes };
+                let list = if p.gating() {
+                    &mut notes
+                } else {
+                    &mut info_notes
+                };
                 if list.len() < MAX_FAIL_NOTES {
                     list.push(format!(
                         "{} poison {poison:#x}: {detected}/{ctl_expected} controls detected (discriminating lanes {disc})",
@@ -1469,11 +1508,11 @@ fn run(dir: &Path) -> Result<Value, String> {
         rt.free(d).map_err(|e| e.to_string())?;
     }
     let ok = fail_rows == 0 && controls == controls_expected && cal_ok;
-    Ok(json!({
+    let mut receipt = json!({
         "status": if ok {"PASS"} else {"FAIL"},
         "informational_flat_status": if info_fail_rows == 0 {"PASS"} else {"FAIL"},
         "oracle":"cdna_vmem_waw_hw_oracle", "arch":arch,
-        "claim":"gfx942 untyped VMEM loads (global/buffer, same VMEM_NOSAMPLER type class), no wait between: last-issued write wins per active lane/dword, inactive lanes keep the prior value (hardware in-order VGPR return); lane masks are stress only; flat rows informational",
+        "claim":"gfx942 untyped VMEM loads (global/buffer, same non-sampler VMEM_READ_ACCESS type class), no wait between: last-issued write wins per active lane/dword, inactive lanes keep the prior value (hardware in-order VGPR return); lane masks are stress only; flat rows informational",
         "not_covered":["image/sampler/BVH VMEM classes", "scratch loads (the ledger may model them as the same class; this harness has no scratch setup)", "flat to the LDS aperture", "d16/lds-bit/atomic-return/store forms"],
         "latency_calibration":cal_value, "latency_calibration_ok":cal_ok,
         "cold_region_bytes":TOTAL - HOT, "hot_region_bytes":HOT, "cold_random_window_bytes":64usize << 20, "thrash_bytes_per_launch":TOTAL,
@@ -1481,6 +1520,8 @@ fn run(dir: &Path) -> Result<Value, String> {
         "race_cold_older_primed_newer_lane_pairs":race_cold_older, "race_primed_older_cold_newer_lane_pairs":race_cold_newer,
         "cold_lines_total":cold_lines_total, "cold_lines_max_per_launch":cold_lines_max,
         "primed_lines_total":primed_lines_total, "primed_lines_max_per_launch":primed_lines_max,
+    });
+    let bindings = json!({
         "kernels":specs.len(), "launches":launches, "blocks_per_launch":BLOCKS, "scenarios":NSCN,
         "race_both_active_lane_pairs":race_both_active, "queue_distances":DISTS,
         "policies":POLICIES.iter().map(|p| json!({"tag":p.0, "older":p.1, "newer":p.2})).collect::<Vec<_>>(),
@@ -1498,7 +1539,12 @@ fn run(dir: &Path) -> Result<Value, String> {
         "bundle_codec_source_sha256":sha(include_bytes!("../../peacemaker-lift/src/bundle.rs")),
         "flat_codec_source_sha256":sha(include_bytes!("../../peacemaker-cdna/src/enc/flat.rs")),
         "mubuf_codec_source_sha256":sha(include_bytes!("../../peacemaker-cdna/src/enc/mubuf.rs")),
-        "rows":rows}))
+        "rows":rows});
+    // Move the binding fields into the receipt without a larger macro recursion limit.
+    if let (Value::Object(receipt), Value::Object(bindings)) = (&mut receipt, bindings) {
+        receipt.extend(bindings);
+    }
+    Ok(receipt)
 }
 
 fn main() -> ExitCode {
