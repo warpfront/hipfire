@@ -4,7 +4,7 @@
 # hipfire — see LICENSE and NOTICE in the project root.
 """Seal the immutable owner-provided gfx942 conv-fuse anchor, without recompiling it.
 
-The source and complete input bundle are pinned to owner commit 6ba9193a9a.
+The source and complete input bundle are pinned to owner commit 65498eece7.
 The owner compiled the module from the exact source bytes under the runtime
 basename qwen4_g942_conv_fuse.gfx942.hip with the recorded flags below. The
 committed anchor is the reproducible input, not a substitute compiler result.
@@ -25,10 +25,10 @@ from pathlib import Path
 ARCH = "gfx942"
 STEM = "qwen4_g942_conv_fuse"
 SOURCE_REL = "kernels/src/qwen4_g942_conv_fuse.gfx942.hip"
-OWNER_COMMIT = "6ba9193a9a"
-SOURCE_SHA = "f5b22c8d7f590a2e25511cc14d03f321a5072a13dbd617a6f68d1a17a275ca95"
-ANCHOR_SHA = "acf9d67b83b041cbb291c6df8379cc5b0d1c6c208fa5b13c763f3979b84a7c3a"
-ELF_SHA = "270be116b70b220a899b84578fd0b5c14d26ec6aa5bf32482767f93083b83f07"
+OWNER_COMMIT = "65498eece7"
+SOURCE_SHA = "5816707818eef2e6bc65e6ed37c9fcf796bf82748f9d32c856e3e8facd88673d"
+ANCHOR_SHA = "de47761cc0305b86b8234cb5cf12c192f10c41bd3cf91fcab7b1a3f97cb7e99a"
+ELF_SHA = "e046a249c6d933391440e1eadc1aa977933723444d516689d4cbe09c3bf38ad9"
 SYMBOLS = (
     "qwen4_g942_hyper_norm_bf16x",
     "qwen4_g942_hyper_write_norm_bf16x",
@@ -96,7 +96,7 @@ def main():
                    "sha256": SOURCE_SHA, "owner_commit": OWNER_COMMIT},
         "compiler": {
             "flags": FLAGS, "runtime_source_basename": "qwen4_g942_conv_fuse.gfx942.hip",
-            "provenance": "Owner's immutable final anchor (6ba9193a9a); this recipe does not recompile it",
+            "provenance": "Owner's immutable final anchor (65498eece7); this recipe does not recompile it",
             "invocation": "hipcc <flags> -o <anchor.co> <source_dir>/qwen4_g942_conv_fuse.gfx942.hip",
         },
         "anchor": {"file": co.name, "bytes": co.stat().st_size,
