@@ -20,14 +20,30 @@
 //!   `g942_moe_wide_group_scatter_desc`, `g942_moe_wide_unscatter_act`,
 //!   `g942_moe_wide_combine_shared_add` (they route to the module and honour the same hook).
 //!
-//! A second REFERENCE launch must equal the first (the reference is repeatable). The public
-//! launchers need the C1 folds on (`HIPFIRE_QWEN4_G942_FOLD_MOE`, default on); with the folds
-//! killed the oracle reports the launcher refusal and fails.
+//! A second REFERENCE launch must equal the first (the reference is repeatable): every output
+//! byte, and the router fault word as below. The public launchers need the C1 folds on
+//! (`HIPFIRE_QWEN4_G942_FOLD_MOE`, default on); with the folds killed the oracle reports the
+//! launcher refusal and fails.
+//!
+//! Router fault word. A NaN / Inf logit fails its row closed (ids -1, weights 0: byte-compared
+//! like every other output) and records `(layer, row_base + row)` in the device's host-mapped
+//! fault word. The record is one plain read-compare-store per failing row with no atomic
+//! (`router_record_fault` in `moe_router_softmax_top10_f32.hip`, `mw_record_fault` in the wide
+//! module, `router_fault.rs` module docs): with one failing row the word is deterministic, with
+//! several the stores race and which failing row is kept differs run to run on EVERY arm, the
+//! reference included. The oracle therefore holds each arm to the deterministic part of that
+//! contract, derived from the logits on the host (never from an arm's output): no failing row
+//! -> no record; one failing row -> exactly that record; several -> a record of this device and
+//! layer naming one of the failing rows. Every row the host model says must fail has to come
+//! back failed closed in the reference ids, and for several failing rows the record is
+//! additionally compared exactly across the arms in re-runs with a single failing row (the
+//! first and the last failing row kept, the others replaced by a finite row), where the word is
+//! deterministic.
 //!
 //! Coverage: router at 8..64 tokens (80..640 slots) in {0, 1} `normalize_topk_prob`, eleven
 //! logit families (gaussian, coarse ties, all equal, +-0 / tiny, huge, NaN / Inf rows, large
 //! negative, BF16 ties, an 11-way tie at the top-10 boundary, ascending / descending, per-row
-//! mix) and nonzero layer / row base (the fault record is compared too); scatter at 80..640 flat
+//! mix) and nonzero layer / row base (the fault record is checked too, as above); scatter at 80..640 flat
 //! slots incl. 80, 81, 319, 320, 321, 639, 640 and 512 experts (the Flash-Next stock-FP8 model:
 //! top-10 of 512) plus other expert counts, random / per-token-distinct / all-slots-one-expert /
 //! two-expert / hot-set / sequential / 15-16-17-per-expert / top-of-range / marker-carrying /
@@ -50,6 +66,7 @@ mod g942_oracle_common;
 
 use g942_oracle_common::*;
 use hip_bridge::KernargBlob;
+use rdna_compute::router_fault::RouterFault;
 use rdna_compute::tensor_ops::lab_ensure_moe_wide_entry;
 use rdna_compute::{Gpu, GpuTensor};
 use serde_json::json;
@@ -195,7 +212,7 @@ fn router_logits(rng: &mut Rng, tokens: usize, kind: usize) -> Vec<f32> {
 struct RouterOut {
     ids: Vec<u8>,
     weights: Vec<u8>,
-    fault: String,
+    fault: Option<RouterFault>,
     guards: bool,
 }
 
@@ -272,7 +289,7 @@ fn router_arm(
         }
     }
     gpu.hip.device_synchronize().map_err(err)?;
-    let fault = format!("{:?}", gpu.take_router_fault());
+    let fault = gpu.take_router_fault();
     let (ids_bytes, g1) = ids.read(gpu)?;
     let (weight_bytes, g2) = weights.read(gpu)?;
     ids.release(gpu);
@@ -285,9 +302,80 @@ fn router_arm(
     })
 }
 
-fn router_diff(a: &RouterOut, b: &RouterOut) -> usize {
-    diff(&a.ids, &b.ids) + diff(&a.weights, &b.weights) + usize::from(a.fault != b.fault)
+/// Differing output bytes (ids and weights) between two runs.
+fn router_bytes_diff(a: &RouterOut, b: &RouterOut) -> usize {
+    diff(&a.ids, &b.ids) + diff(&a.weights, &b.weights)
 }
+
+/// Differing output bytes plus 1 when the fault records differ. Exact, so only for launches
+/// with at most one failing row (one writer: the word is deterministic): the planted controls
+/// and the single-failing-row re-runs. Launches with several failing rows go through
+/// [`fault_violation`].
+fn router_diff(a: &RouterOut, b: &RouterOut) -> usize {
+    router_bytes_diff(a, b) + usize::from(a.fault != b.fault)
+}
+
+/// The router's BF16 round trip (`router_bf16_rt` / `mw_bf16_rne`: round to nearest even on the
+/// high half, non-finite values unchanged; a finite value at the top of the F32 range rounds up
+/// to Inf).
+fn router_bf16_rt(v: f32) -> f32 {
+    if !v.is_finite() {
+        return v;
+    }
+    let u = v.to_bits();
+    f32::from_bits(u.wrapping_add(0x7fff + ((u >> 16) & 1)) & 0xffff_0000)
+}
+
+/// Launch-local rows the router must fail closed: those with a NaN / Inf logit after the BF16
+/// round trip. A finite row never fails closed on its sums (its softmax denominator is at least
+/// 1, the maximum contributing `exp(0)`, and at most 512).
+fn failing_rows(logits: &[f32], tokens: usize) -> Vec<usize> {
+    (0..tokens)
+        .filter(|&t| {
+            logits[t * E_MODEL..(t + 1) * E_MODEL]
+                .iter()
+                .any(|&v| !router_bf16_rt(v).is_finite())
+        })
+        .collect()
+}
+
+/// Rows whose ten ids are all -1 (failed closed) in a router ids dump, against `failing`:
+/// the number of rows where the two disagree.
+fn failed_rows_diff(ids: &[u8], failing: &[usize], tokens: usize) -> usize {
+    let word = |t: usize, k: usize| {
+        let o = (t * TOPK + k) * 4;
+        i32::from_le_bytes([ids[o], ids[o + 1], ids[o + 2], ids[o + 3]])
+    };
+    (0..tokens)
+        .filter(|&t| (0..TOPK).all(|k| word(t, k) == -1) != failing.contains(&t))
+        .count()
+}
+
+/// 1 when `fault` is not a record the router may leave after a launch whose launch-local failing
+/// rows are `failing`, else 0: no record without a failing row; otherwise this device's record
+/// of `LAYER` naming `ROW_BASE + t` for a failing row `t`. One failing row leaves exactly one
+/// candidate; with several the word is written by an unordered read-compare-store per failing
+/// row (see the module docs), so any one of them may be the survivor, on every arm and from run
+/// to run.
+fn fault_violation(device_id: i32, fault: Option<RouterFault>, failing: &[usize]) -> usize {
+    let names_failing_row = |f: &RouterFault| {
+        failing.iter().any(|&t| {
+            *f == RouterFault {
+                device_id,
+                layer: LAYER as u32,
+                row: (ROW_BASE + t) as u64,
+            }
+        })
+    };
+    usize::from(match fault {
+        None => !failing.is_empty(),
+        Some(f) => !names_failing_row(&f),
+    })
+}
+
+/// A finite logit row that replaces a failing row in the single-failing-row re-runs (the
+/// all-equal family: a tie across all 512 experts, the lowest ten indices win).
+const FINITE_FILL: f32 = 0.75;
 
 fn router_case(
     gpu: &mut Gpu,
@@ -297,6 +385,8 @@ fn router_case(
     norm: bool,
     logits: &[f32],
 ) -> Res<()> {
+    let failing = failing_rows(logits, tokens);
+    let device_id = gpu.device_id;
     let lg = upload_f32s(gpu, logits)?;
     let clean = RouterTweak {
         tokens,
@@ -308,12 +398,62 @@ fn router_case(
     let m = router_arm(gpu, Arm::Module, &lg, tokens, norm, clean)?;
     let p = router_arm(gpu, Arm::Product, &lg, tokens, norm, clean)?;
     release(gpu, lg);
-    let diffs = vec![
-        ("module".to_owned(), router_diff(&m, &r)),
-        ("product".to_owned(), router_diff(&p, &r)),
-        ("reference_repeat".to_owned(), router_diff(&r2, &r)),
+    let mut diffs = vec![
+        ("module".to_owned(), router_bytes_diff(&m, &r)),
+        ("product".to_owned(), router_bytes_diff(&p, &r)),
+        ("reference_repeat".to_owned(), router_bytes_diff(&r2, &r)),
+        (
+            "failed_rows".to_owned(),
+            failed_rows_diff(&r.ids, &failing, tokens),
+        ),
+        (
+            "fault_reference".to_owned(),
+            fault_violation(device_id, r.fault, &failing),
+        ),
+        (
+            "fault_reference_repeat".to_owned(),
+            fault_violation(device_id, r2.fault, &failing),
+        ),
+        (
+            "fault_module".to_owned(),
+            fault_violation(device_id, m.fault, &failing),
+        ),
+        (
+            "fault_product".to_owned(),
+            fault_violation(device_id, p.fault, &failing),
+        ),
     ];
-    let guards = r.guards && r2.guards && m.guards && p.guards;
+    let mut guards = r.guards && r2.guards && m.guards && p.guards;
+
+    // Several failing rows race on the fault word (above): re-run with ONE failing row kept, the
+    // first and the last, the others replaced by a finite row. One writer makes the word
+    // deterministic, so every arm's record must equal the reference's and name exactly that row.
+    if failing.len() > 1 {
+        for keep in [failing[0], failing[failing.len() - 1]] {
+            let mut single = logits.to_vec();
+            for &t in failing.iter().filter(|&&t| t != keep) {
+                single[t * E_MODEL..(t + 1) * E_MODEL].fill(FINITE_FILL);
+            }
+            let lg = upload_f32s(gpu, &single)?;
+            let sr = router_arm(gpu, Arm::Reference, &lg, tokens, norm, clean)?;
+            let sm = router_arm(gpu, Arm::Module, &lg, tokens, norm, clean)?;
+            let sp = router_arm(gpu, Arm::Product, &lg, tokens, norm, clean)?;
+            release(gpu, lg);
+            diffs.push((
+                format!("module_single_fault_row{keep}"),
+                router_diff(&sm, &sr),
+            ));
+            diffs.push((
+                format!("product_single_fault_row{keep}"),
+                router_diff(&sp, &sr),
+            ));
+            diffs.push((
+                format!("reference_single_fault_row{keep}"),
+                fault_violation(device_id, sr.fault, &[keep]),
+            ));
+            guards &= sr.guards && sm.guards && sp.guards;
+        }
+    }
     tally.case("router", label, &diffs, guards);
     Ok(())
 }

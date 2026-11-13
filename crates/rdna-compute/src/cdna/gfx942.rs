@@ -2963,6 +2963,7 @@ pub(crate) fn g942_rows16_grid_ensure(gpu: &mut Gpu, func: &str) -> HipResult<()
 const ROW_GRID_MAX_TILES: usize = 32;
 const ROW_GRID_MIN_K: usize = 8192;
 /// The most rows the measurements cover (K2, N = 256); past it the prefill routes are untouched.
+// selector-receipt: receipts/selectors/gfx942_row_grid_max_rows.json
 const ROW_GRID_MAX_ROWS: usize = 256;
 
 fn row_grid_admitted(members: &[usize], k: usize, batch: usize) -> bool {

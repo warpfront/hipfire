@@ -27,6 +27,7 @@ pub const QWEN4_G942_MQ2_XBATCH_MODULE: &str = "qwen4_g942_gemv_mq2g256v2_xbatch
 /// `ROWS_PER_SLOT` (`MQ2X_ROWS_PER_SLOT` in the kernel file) consecutive rows.
 const ROWS_PER_BLOCK: usize = 32;
 /// Most activation rows one launch takes (the kernel's widest instance).
+// selector-receipt: receipts/selectors/gfx942_mq2_xbatch_max_rows.json
 pub const QWEN4_G942_MQ2_XBATCH_MAX_ROWS: usize = 8;
 
 /// The entry of the `(rows, k)` instance: `rows <= 4` runs the four-row body, up to eight the
