@@ -119,8 +119,8 @@ impl<'a> LayerIo<'a> {
             out: Some(out),
             route: self.route,
             kernels: SandwichRoute::Steps(StepsRoute {
-                shared_rotation: crate::forward::shared_rot_enabled(),
-                fused_silu_rotate: crate::forward::fused_silu_rotate_enabled(),
+                shared_rotation: true,
+                fused_silu_rotate: true,
             }),
             bf16: self.bf16,
         }
@@ -195,7 +195,7 @@ pub(crate) fn layer_steps<'a>(
                 route: KvRoute::WindowedQ8 {
                     tiled: io.tiled,
                     rows_flash: io.rows_flash,
-                    wmma_flash: crate::forward::wmma_flash_enabled(),
+                    wmma_flash: true,
                 },
             },
             pos_buf: io.pos_buf,

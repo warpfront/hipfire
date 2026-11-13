@@ -54,7 +54,6 @@ developer_callsite	*	HIPFIRE_CACHE_CKPT_INTERVAL#developer_var=ok.and_then.unwra
 developer_callsite	*	HIPFIRE_CACHE_CKPT_INTERVAL#developer_var=ok.and_then.unwrap_or(2048usize)
 developer_callsite	*	HIPFIRE_CACHE_CKPT_MAX#developer_var=ok.and_then.unwrap_or(8)
 developer_callsite	*	HIPFIRE_CACHE_CKPT_MAX#developer_var=ok.and_then.unwrap_or(8usize)
-developer_callsite	*	HIPFIRE_CACHE_CKPT_RESUME#developer_var=ok.as_deref.!=Some("0")
 developer_callsite	*	HIPFIRE_CALIB_BF16#developer_bool=false
 developer_callsite	*	HIPFIRE_CALIB_F64_AUDIT#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_CALIB_HESSIAN_STORAGE#developer_var=ok.as_deref.map.as_deref
@@ -459,19 +458,15 @@ developer_callsite	*	HIPFIRE_GFX942_ROTATE_VALIDATE_LIVE#developer_var=ok.as_der
 developer_callsite	*	HIPFIRE_GGUF_A8_EMU#developer_var=is_ok_and
 developer_callsite	*	HIPFIRE_GGUF_CODEC_ONLY#developer_var=is_ok_and
 developer_callsite	*	HIPFIRE_GGUF_NATIVE#developer_var=is_ok_and
-developer_callsite	*	HIPFIRE_GLIMMER_BATCHED_LM_HEAD#developer_var=ok.as_deref
 developer_callsite	*	HIPFIRE_GLIMMER_CACHE_TRACE#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_GLIMMER_CTX_CAP#developer_var=ok.and_then.filter.unwrap_or(glimmer::drafter::GLIMMER_DRAFTER_CTX...)
 developer_callsite	*	HIPFIRE_GLIMMER_CTX_CAP#developer_var=ok.and_then.filter.unwrap_or(hipfire_arch_muse_glimmer::drafter::G...)
 developer_callsite	*	HIPFIRE_GLIMMER_DEVICE_CAPTURE#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_GLIMMER_DEVICE_CAPTURE_AUDIT#developer_var=ok.as_deref.==Some("1")
-developer_callsite	*	HIPFIRE_GLIMMER_FUSED_SILU_ROTATE#developer_var=as_deref.!=Ok("0")
 developer_callsite	*	HIPFIRE_GLIMMER_GPU_SAMPLE#developer_var=ok.as_deref
 developer_callsite	*	HIPFIRE_GLIMMER_KV_VMM#developer_var=map.unwrap_or(true)
-developer_callsite	*	HIPFIRE_GLIMMER_NO_CENTERED_NORM#developer_var=ok.as_deref.!=Some("1")
 developer_callsite	*	HIPFIRE_GLIMMER_PREFILL_CHUNK#developer_var=ok.and_then
 developer_callsite	*	HIPFIRE_GLIMMER_PROMPT_CACHE#developer_var=ok.as_deref.==Some("0")
-developer_callsite	*	HIPFIRE_GLIMMER_SHARED_ROT#developer_var=as_deref.!=Ok("0")
 developer_callsite	*	HIPFIRE_GLIMMER_SPEC_DIAG#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_GLIMMER_SPEC_FALLBACK#developer_var=ok.as_deref.!=Some("1")
 developer_callsite	*	HIPFIRE_GLIMMER_SPEC_PERTURB#developer_var=ok.as_deref.==Some("1")
@@ -479,7 +474,6 @@ developer_callsite	*	HIPFIRE_GLIMMER_SPEC_PROFIT_GUARD#developer_var=ok.as_deref
 developer_callsite	*	HIPFIRE_GLIMMER_SWA_PREFETCH_V#developer_var=ok.as_deref.map.unwrap_or(prefetch_v_base)
 developer_callsite	*	HIPFIRE_GLIMMER_TAP_LAYERS#developer_var=-
 developer_callsite	*	HIPFIRE_GLIMMER_TIMING#developer_var=ok.as_deref.==Some("1")
-developer_callsite	*	HIPFIRE_GLIMMER_WMMA_FULL#developer_var=map.unwrap_or(true)
 developer_callsite	*	HIPFIRE_GPTQ_BLOCK#developer_var=-
 developer_callsite	*	HIPFIRE_GPTQ_DAMPING#developer_var=ok.and_then.unwrap_or(0.0)
 developer_callsite	*	HIPFIRE_GQA_CHUNK#developer_var=ok.and_then.unwrap_or(128)

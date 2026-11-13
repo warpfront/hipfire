@@ -766,12 +766,6 @@ pub fn ar_cancel_keeps_committed_prefix(m: &LoadedModel) -> bool {
         && m.qwen35().is_some_and(|b| b.kv_cache.compact_offset == 0)
 }
 
-pub fn ckpt_resume_enabled() -> bool {
-    hipfire_config::developer_var("HIPFIRE_CACHE_CKPT_RESUME")
-        .ok()
-        .as_deref()
-        != Some("0")
-}
 /// Whether the request renders the whole conversation through the chat template
 /// (messages history + a template), as opposed to appending `prompt` to the
 /// resident session.
@@ -4379,8 +4373,7 @@ pub fn generate(
             // Resume is only valid for qwen35 (the DeltaNet recurrent state in the
             // bundle). The gate used to read the always-None m.dn_state → resume
             // was silently disabled post-merge; gate on the bundle instead.
-            let resume_idx = if ckpt_resume_enabled()
-                && resume_safe
+            let resume_idx = if resume_safe
                 && m.state
                     .as_ref()
                     .map_or(false, |s| s.as_ref().arch_key() == "qwen35")
@@ -4727,7 +4720,7 @@ pub fn generate(
         // The snapshot sits on the newest existing chunk end at or before the
         // boundary: the chunk plan is untouched (numerics-neutral).
         let mut turn = speculative::TurnCheckpoint {
-            boundary: turn_boundary.filter(|_| ckpt_resume_enabled()),
+            boundary: turn_boundary,
             pin: m.user_turn_ckpt,
         };
         let mut prefill_aborted = false;
@@ -4764,21 +4757,19 @@ pub fn generate(
             let remaining = new_tokens.len() - start;
             let outer = qwen35::prefill::ordinary_serve_prefill_chunk_len(remaining, chunk_max)
                 .unwrap_or(remaining.min(chunk_max).max(1));
-            if ckpt_resume_enabled() {
-                speculative::take_turn_checkpoint_before_chunk(
-                    &mut m.prefill_checkpoints,
-                    dn,
-                    kv,
-                    gpu,
-                    m.seq_pos,
-                    outer,
-                    ckpt_max(),
-                    &mut turn,
-                    // Committed conversation + the chunks forwarded so far.
-                    (&m.conversation_tokens, &new_tokens[..start]),
-                );
-                m.user_turn_ckpt = turn.pin;
-            }
+            speculative::take_turn_checkpoint_before_chunk(
+                &mut m.prefill_checkpoints,
+                dn,
+                kv,
+                gpu,
+                m.seq_pos,
+                outer,
+                ckpt_max(),
+                &mut turn,
+                // Committed conversation + the chunks forwarded so far.
+                (&m.conversation_tokens, &new_tokens[..start]),
+            );
+            m.user_turn_ckpt = turn.pin;
             let end = (start + outer).min(new_tokens.len());
             let chunk = &new_tokens[start..end];
             if let Err(e) = qwen35::forward_prefill_batch_ordinary(
@@ -4851,21 +4842,19 @@ pub fn generate(
             // later divergent render can resume here instead of cold. `dn`
             // (&mut m.dn_state) and &mut m.prefill_checkpoints are disjoint
             // fields, so this composes with the live kv/dn borrows.
-            if ckpt_resume_enabled() {
-                // Stride snapshot that spares the pinned user-turn snapshot.
-                speculative::take_turn_checkpoint(
-                    &mut m.prefill_checkpoints,
-                    dn,
-                    kv,
-                    gpu,
-                    m.seq_pos,
-                    ckpt_interval(),
-                    ckpt_max(),
-                    turn,
-                    // Committed conversation + the chunk forwarded so far.
-                    (&m.conversation_tokens, &new_tokens[..end]),
-                );
-            }
+            // Stride snapshot that spares the pinned user-turn snapshot.
+            speculative::take_turn_checkpoint(
+                &mut m.prefill_checkpoints,
+                dn,
+                kv,
+                gpu,
+                m.seq_pos,
+                ckpt_interval(),
+                ckpt_max(),
+                turn,
+                // Committed conversation + the chunk forwarded so far.
+                (&m.conversation_tokens, &new_tokens[..end]),
+            );
             start = end;
         }
         if prefill_aborted {
@@ -5401,21 +5390,19 @@ pub fn generate(
             // big code emission) can be resumed mid-region if the NEXT turn's
             // render diverges within it — without replaying the whole
             // generation.
-            if ckpt_resume_enabled() {
-                speculative::take_dn_checkpoint_pinned(
-                    &mut m.prefill_checkpoints,
-                    dn,
-                    kv,
-                    gpu,
-                    m.seq_pos,
-                    ckpt_interval(),
-                    ckpt_max(),
-                    m.user_turn_ckpt,
-                    // `conversation_tokens` IS the forwarded stream here (each
-                    // token is committed as it is forwarded).
-                    (&m.conversation_tokens, &[]),
-                );
-            }
+            speculative::take_dn_checkpoint_pinned(
+                &mut m.prefill_checkpoints,
+                dn,
+                kv,
+                gpu,
+                m.seq_pos,
+                ckpt_interval(),
+                ckpt_max(),
+                m.user_turn_ckpt,
+                // `conversation_tokens` IS the forwarded stream here (each
+                // token is committed as it is forwarded).
+                (&m.conversation_tokens, &[]),
+            );
             // Adaptive KV: downshift K/V precision as seq_pos crosses capacity
             // thresholds. `kv` (=m.kv_cache) and m.kv_adaptive are distinct
             // fields → NLL splits the borrow.
