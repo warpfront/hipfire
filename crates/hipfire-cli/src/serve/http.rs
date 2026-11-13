@@ -10,8 +10,10 @@
 //! I/O from business logic.
 
 use crate::serve::complete::{
-    complete_request_cancellable, completion_json, completion_json_multi, completion_usage,
-    gate_endpoint_tools, openai_stream_delta_for_event, openai_stream_terminal_chunks_usage,
+    complete_request_cancellable, completion_json, completion_json_multi_with_last,
+    completion_usage,
+    gate_endpoint_tools, openai_stream_delta_for_event, openai_stream_logprobs_for_event,
+    openai_stream_terminal_chunks_usage,
     request_choice_count, Completion, EndpointAdapterKind,
 };
 use crate::serve::metrics::Metrics;
@@ -311,12 +313,22 @@ impl StreamEncoder {
                 ..
             } => {
                 let delta = openai_stream_delta_for_event(event)?;
+                let mut choice = serde_json::json!({
+                    "index": index,
+                    "delta": delta,
+                    "finish_reason": null,
+                });
+                // `stream: true` + `logprobs` carries the sampled logprob on
+                // every token chunk it released one for.
+                if let Some(logprobs) = openai_stream_logprobs_for_event(event) {
+                    choice["logprobs"] = logprobs;
+                }
                 Some(sse_data(&serde_json::json!({
                     "id": id,
                     "object": "chat.completion.chunk",
                     "created": created,
                     "model": model,
-                    "choices": [{ "index": index, "delta": delta, "finish_reason": null }],
+                    "choices": [choice],
                 })))
             }
             Self::Anthropic(stream) => stream.event(event),
@@ -2166,7 +2178,7 @@ async fn handle_streaming(
                 .get("model")
                 .and_then(|v| v.as_str())
                 .map(str::to_owned);
-            let base_seed = body.get("seed").and_then(|v| v.as_u64()).unwrap_or(0);
+            let base_seed = request_seed(&body);
             let mut first_guard = Some(guard);
             for choice in 0..choices {
                 sink.begin_choice(choice)?;
@@ -2183,7 +2195,13 @@ async fn handle_streaming(
                 let mut choice_body = body.clone();
                 if choices > 1 {
                     choice_body["n"] = serde_json::json!(1);
-                    choice_body["seed"] = serde_json::json!(base_seed + choice as u64);
+                    // Only a seed the client actually supplied fans out. An
+                    // absent seed stays absent so the engine's own sampler
+                    // stream decides (deriving from 0 made two separate
+                    // unseeded calls return the same choices), and a seed the
+                    // daemon rejects is passed through untouched so it is
+                    // rejected instead of laundered into a valid one.
+                    fan_out_seed(&mut choice_body, base_seed, choice as usize);
                 }
                 complete_request_cancellable(
                     &worker_shared,
@@ -2238,6 +2256,24 @@ async fn handle_streaming(
         .unwrap()
 }
 
+/// The request's seed when it is a JSON unsigned integer, else `None`.
+/// Anything else (`-1`, a string, a float) is *not* rewritten by the `n`
+/// fan-out: it stays in the body so the daemon's single validation authority
+/// rejects it, exactly as it does for `n = 1`.
+fn request_seed(body: &serde_json::Value) -> Option<u64> {
+    body.get("seed").and_then(|v| v.as_u64())
+}
+
+/// Derive choice `choice`'s seed from a caller-supplied base. No base seed
+/// means the choice keeps whatever the client sent: deriving one from an
+/// absent seed made two separate unseeded `n = 2` calls return the same two
+/// choices. `wrapping_add` so `u64::MAX` cannot overflow.
+fn fan_out_seed(body: &mut serde_json::Value, base: Option<u64>, choice: usize) {
+    if let Some(seed) = base {
+        body["seed"] = serde_json::json!(seed.wrapping_add(choice as u64));
+    }
+}
+
 async fn handle_nonstreaming(
     shared: Arc<ServeShared>,
     body: serde_json::Value,
@@ -2256,6 +2292,8 @@ async fn handle_nonstreaming(
     let shared_clone = Arc::clone(&shared);
     let body_for_worker = body;
     let staged_tx_clone = Arc::clone(&staged_tx);
+    let staged_for_terminal = Arc::clone(&staged_tx);
+    let stall_timeout = shared.stream_stall_timeout;
     tokio::task::spawn_blocking(move || {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
             let choices = request_choice_count(&body_for_worker)?;
@@ -2264,10 +2302,7 @@ async fn handle_nonstreaming(
                 .get("model")
                 .and_then(|v| v.as_str())
                 .map(str::to_owned);
-            let base_seed = body_for_worker
-                .get("seed")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
+            let base_seed = request_seed(&body_for_worker);
             let mut first_guard = Some(guard);
             let mut completions = Vec::with_capacity(choices as usize);
             for choice in 0..choices {
@@ -2282,15 +2317,25 @@ async fn handle_nonstreaming(
                         .acquire_for(is_eligible, model.as_deref())
                         .map_err(|error| anyhow!("{}", error.message))?,
                 };
-                // Mirror the streaming fan-out: with an explicit `seed` the
-                // daemon derives the sampler stream from it alone, so passing
-                // the request body unchanged made every non-streaming choice
-                // byte-identical.
+                // Mirror the streaming fan-out: only a caller-supplied seed
+                // fans out, and an invalid one is left for the daemon to
+                // reject rather than laundered into 0..n.
                 let mut choice_body = body_for_worker.clone();
                 if choices > 1 {
                     choice_body["n"] = serde_json::json!(1);
-                    choice_body["seed"] = serde_json::json!(base_seed + choice as u64);
+                    fan_out_seed(&mut choice_body, base_seed, choice as usize);
                 }
+                // The last choice's terminal callback stages the whole
+                // response and parks on its flush ack, exactly as the
+                // single-choice body did: dropping the ack receiver and
+                // returning first registered sessions and pending tools for
+                // replies the client never received, and left
+                // `serve.stream_stall_timeout_ms` unable to bound a
+                // non-streaming request.
+                let is_last = choice + 1 == choices;
+                let terminal_completions = &completions;
+                let terminal_encoding = &encoding;
+                let terminal_staged = &staged_for_terminal;
                 let completion = complete_request_cancellable(
                     &shared_clone,
                     &choice_body,
@@ -2298,41 +2343,61 @@ async fn handle_nonstreaming(
                     None,
                     &cancelled,
                     |_event| Ok(()),
-                    |_completion| Ok(()),
+                    move |completion| {
+                        if !is_last {
+                            return Ok(());
+                        }
+                        let json = if terminal_completions.is_empty() {
+                            terminal_encoding.completion_body(completion)
+                        } else {
+                            completion_json_multi_with_last(terminal_completions, completion)
+                        };
+                        let bytes = serde_json::to_vec(&json).map_err(|err| {
+                            hipfire_client::ClientError::Protocol(format!(
+                                "completion json serialize failed: {err}"
+                            ))
+                        })?;
+                        if bytes.is_empty() {
+                            return Err(hipfire_client::ClientError::Protocol(
+                                "completion json serialized to an empty body".into(),
+                            ));
+                        }
+                        let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+                        // Stage exactly one JSON frame, then block for its
+                        // ack (the RAII guard cancels while awaiting).
+                        {
+                            let mut lock = terminal_staged
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner());
+                            match lock.take() {
+                                Some(tx) => {
+                                    let _ = tx.send(Ok((bytes, ack_tx)));
+                                }
+                                None => return Err(hipfire_client::ClientError::Cancelled),
+                            }
+                        }
+                        wait_flush_ack(&ack_rx, stall_timeout)
+                            .map_err(|()| hipfire_client::ClientError::Cancelled)
+                    },
                 )?;
-                completions.push(completion);
+                if !is_last {
+                    completions.push(completion);
+                }
             }
             Ok::<_, anyhow::Error>(completions)
         }));
         let mut lock = staged_tx_clone
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        // The only reason the terminal was never staged is a preterminal
+        // failure (or a panic) before the last choice's callback ran.
         if let Some(tx) = lock.take() {
             match outcome {
-                Ok(Ok(completions)) => {
-                    let json = if completions.len() == 1 {
-                        encoding.completion_body(&completions[0])
-                    } else {
-                        completion_json_multi(&completions)
-                    };
-                    match serde_json::to_vec(&json) {
-                        Ok(bytes) if !bytes.is_empty() => {
-                            let (ack_tx, _ack_rx) = std::sync::mpsc::channel();
-                            let _ = tx.send(Ok((bytes, ack_tx)));
-                        }
-                        Ok(_) => {
-                            let _ = tx.send(Err(RequestFailure::new(
-                                "completion json serialized to an empty body",
-                                500,
-                            )));
-                        }
-                        Err(error) => {
-                            let _ = tx.send(Err(RequestFailure::new(
-                                format!("completion json serialize failed: {error}"),
-                                500,
-                            )));
-                        }
-                    }
+                Ok(Ok(_)) => {
+                    let _ = tx.send(Err(RequestFailure::new(
+                        "generation completed without staging a response body",
+                        500,
+                    )));
                 }
                 Ok(Err(error)) => {
                     let _ = tx.send(Err(RequestFailure::from_error(&error)));
@@ -2765,6 +2830,35 @@ mod tests {
     use std::future::poll_fn;
     use std::task::Waker;
     use std::time::Duration;
+
+    /// `n > 1` fans out an explicit seed into distinct per-choice streams,
+    /// and does nothing at all without a valid one. Deriving from an absent
+    /// seed made two separate unseeded `n = 2` calls byte-identical, and
+    /// rewriting `-1` laundered a value the daemon rejects on `n = 1`.
+    #[test]
+    fn n_fan_out_seeds_only_a_caller_supplied_seed_and_never_overflows() {
+        assert_eq!(request_seed(&serde_json::json!({})), None);
+        assert_eq!(request_seed(&serde_json::json!({ "seed": -1 })), None);
+        assert_eq!(request_seed(&serde_json::json!({ "seed": "7" })), None);
+        assert_eq!(request_seed(&serde_json::json!({ "seed": 7 })), Some(7));
+
+        // No base seed: the body is left exactly as it came.
+        for original in [serde_json::json!({}), serde_json::json!({ "seed": -1 })] {
+            let mut body = original.clone();
+            let before = body.clone();
+            fan_out_seed(&mut body, None, 3);
+            assert_eq!(body, before);
+        }
+
+        let mut body = serde_json::json!({ "seed": 5 });
+        fan_out_seed(&mut body, Some(5), 2);
+        assert_eq!(body["seed"], 7);
+
+        // `u64::MAX + choice` must not overflow.
+        let mut body = serde_json::json!({ "seed": u64::MAX });
+        fan_out_seed(&mut body, Some(u64::MAX), 3);
+        assert_eq!(body["seed"], u64::MAX.wrapping_add(3));
+    }
 
     #[test]
     fn bearer_headers_require_one_matching_ascii_credential() {

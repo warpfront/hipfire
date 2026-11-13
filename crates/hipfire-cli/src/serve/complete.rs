@@ -3502,16 +3502,38 @@ pub(crate) fn completion_json(completion: &Completion) -> serde_json::Value {
         "hipfire": completion_hipfire(completion),
     })
 }
-/// Serialize `n` independent completions as one OpenAI response. The first
+/// Serialize `n` independent completions as one OpenAI response: those already
+/// collected plus the one the terminal callback is delivering. The first
 /// completion supplies the response id/timings envelope; every choice keeps
 /// its own message and finish reason. Prompt usage is counted once (the
 /// choices share one request), completion usage is summed.
-pub(crate) fn completion_json_multi(completions: &[Completion]) -> serde_json::Value {
-    debug_assert!(!completions.is_empty());
-    let mut out = completion_json(&completions[0]);
-    let mut choices = Vec::with_capacity(completions.len());
+///
+/// The non-streaming handler serializes and flushes inside the last choice's
+/// terminal callback (the pre-`n` body staged and parked on the flush ack
+/// there), and `Completion` is not `Clone`, so the last one arrives by
+/// reference.
+pub(crate) fn completion_json_multi_with_last(
+    previous: &[Completion],
+    last: &Completion,
+) -> serde_json::Value {
+    completion_json_multi_over(previous.iter().chain(std::iter::once(last)))
+}
+
+fn completion_json_multi_over<'a>(
+    completions: impl Iterator<Item = &'a Completion>,
+) -> serde_json::Value {
+    let mut completions = completions.peekable();
+    let Some(first) = completions.peek() else {
+        return serde_json::Value::Null;
+    };
+    let mut out = completion_json(first);
+    let mut choices = Vec::new();
     let mut completion_tokens = 0u64;
-    for (index, completion) in completions.iter().enumerate() {
+    let mut first_usage = serde_json::Value::Null;
+    for (index, completion) in completions.enumerate() {
+        if index == 0 {
+            first_usage = completion_usage(completion);
+        }
         let mut one = completion_json(completion);
         let mut choice = one["choices"][0].take();
         choice["index"] = serde_json::json!(index);
@@ -3526,7 +3548,6 @@ pub(crate) fn completion_json_multi(completions: &[Completion]) -> serde_json::V
         );
     }
     out["choices"] = serde_json::Value::Array(choices);
-    let first_usage = completion_usage(&completions[0]);
     let prompt_tokens = first_usage["prompt_tokens"].as_u64().unwrap_or(0);
     out["usage"] = serde_json::json!({
         "prompt_tokens": prompt_tokens,
@@ -3702,6 +3723,32 @@ pub(crate) fn openai_stream_delta_for_event(
         Some("tool_calls") => None,
         _ => None,
     }
+}
+
+/// The OpenAI `choices[i].logprobs` object for one streamed `token` event, or
+/// `None` when the event carries no sampled logprob.
+///
+/// The daemon attaches `logprob` + `top_logprobs` to the token envelope when
+/// the request asked for them; the gateway used to forward only `text`, so
+/// `stream: true` + `logprobs` answered with no logprobs at all. The event's
+/// entries are already the OpenAI entry shape (`token`, `logprob`, `bytes`).
+/// One event is one released text chunk, not one sampled token — the slot
+/// emitter releases after its decoder step — so such a chunk yields one entry.
+pub(crate) fn openai_stream_logprobs_for_event(
+    event: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    if event.get("type").and_then(serde_json::Value::as_str) != Some("token") {
+        return None;
+    }
+    let logprob = event.get("logprob").and_then(serde_json::Value::as_f64)?;
+    let mut entry = serde_json::json!({
+        "token": event.get("text").and_then(serde_json::Value::as_str).unwrap_or_default(),
+        "logprob": logprob,
+    });
+    if let Some(top) = event.get("top_logprobs") {
+        entry["top_logprobs"] = top.clone();
+    }
+    Some(serde_json::json!({ "content": [entry] }))
 }
 
 /// Lower shared adapter results into an OpenAI stream `delta` tool_calls object.
@@ -5091,7 +5138,7 @@ mod tests {
     fn completion_json_multi_indexes_choices_and_sums_completion_usage() {
         let a = sample_completion("red", Vec::new(), "stop");
         let b = sample_completion("blue", Vec::new(), "length");
-        let json = completion_json_multi(&[a, b]);
+        let json = completion_json_multi_with_last(&[a], &b);
         assert_eq!(json["choices"][0]["index"], 0);
         assert_eq!(json["choices"][1]["index"], 1);
         assert_eq!(json["choices"][0]["message"]["content"], "red");
@@ -5175,6 +5222,40 @@ mod tests {
         assert_eq!(json["choices"][0]["message"]["content"], "hello world");
         assert!(json["choices"][0]["message"].get("tool_calls").is_none());
         assert_eq!(json["choices"][0]["finish_reason"], "stop");
+    }
+
+    /// `stream: true` + `logprobs`: the daemon's token envelope carries the
+    /// sampled logprob and its top-k, and the SSE chunk must carry them as
+    /// OpenAI `choices[0].logprobs.content`. Without a logprob the chunk has
+    /// no `logprobs` key at all (same shape as a request that did not ask).
+    #[test]
+    fn openai_stream_chunk_carries_asked_logprobs_only() {
+        let event = serde_json::json!({
+            "type": "token",
+            "id": "r1",
+            "text": "hello",
+            "logprob": -0.25,
+            "top_logprobs": [
+                { "token": "hello", "logprob": -0.25, "bytes": [104, 101, 108, 108, 111] },
+                { "token": "help", "logprob": -2.5, "bytes": [104, 101, 108, 112] }
+            ]
+        });
+        let logprobs = openai_stream_logprobs_for_event(&event).expect("logprobs");
+        assert_eq!(logprobs["content"][0]["token"], "hello");
+        assert_eq!(logprobs["content"][0]["logprob"], -0.25);
+        assert_eq!(logprobs["content"][0]["top_logprobs"][1]["token"], "help");
+        // Reasoning events and unlogged tokens carry nothing.
+        assert!(openai_stream_logprobs_for_event(&serde_json::json!({
+            "type": "reasoning",
+            "text": "plan",
+            "logprob": -0.1
+        }))
+        .is_none());
+        assert!(openai_stream_logprobs_for_event(&serde_json::json!({
+            "type": "token",
+            "text": "hi"
+        }))
+        .is_none());
     }
 
     #[test]
