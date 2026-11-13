@@ -1,6 +1,9 @@
-== fa2-vs-inc-p0 09:13:26 uptime:  09:13:26 up 17 days, 12:43,  6 users,  load average: 6.24, 5.42, 15.34
-== aa-fa2-p0 09:13:46 uptime:  09:13:46 up 17 days, 12:43,  6 users,  load average: 7.20, 5.69, 15.22
-== fa2-vs-inc-p4096 09:13:59 uptime:  09:13:59 up 17 days, 12:44,  6 users,  load average: 8.64, 6.08, 15.19
-== aa-fa2-p4096 09:15:05 uptime:  09:15:05 up 17 days, 12:45,  6 users,  load average: 6.11, 5.95, 14.54
-== fa2-vs-inc-p12288 09:15:44 uptime:  09:15:44 up 17 days, 12:45,  6 users,  load average: 5.75, 5.93, 14.17
-== aa-fa2-p12288 09:18:15 uptime:  09:18:15 up 17 days, 12:48,  6 users,  load average: 9.27, 8.15, 13.81
+== fa2-vs-inc-p0 21:43:53 uptime:  21:43:53 up 18 days,  1:14,  6 users,  load average: 19.41, 22.95, 20.34 | sclk: card0:S: 22Mhz *  card1:1: 2215Mhz *  card2:1: 3197Mhz *  card3:S: 34Mhz *   | GPU_MAX_HW_QUEUES=1 FABRIC_JOB=3809588:155599063:A
+rc=0 21:44:13
+== aa-fa2-p0 21:44:13 uptime:  21:44:13 up 18 days,  1:14,  6 users,  load average: 17.17, 22.21, 20.15 | sclk: card0:1: 1822Mhz *  card1:1: 2281Mhz *  card2:S: 4Mhz *  card3:1: 3272Mhz *   | GPU_MAX_HW_QUEUES=1 FABRIC_JOB=3809588:155599063:A
+rc=0 21:44:26
+== fa2-vs-inc-p4096 21:44:26 uptime:  21:44:26 up 18 days,  1:14,  6 users,  load average: 15.32, 21.56, 19.97 | sclk: card0:1: 2165Mhz *  card1:1: 2494Mhz *  card2:1: 2252Mhz *  card3:1: 2561Mhz *   | GPU_MAX_HW_QUEUES=1 FABRIC_JOB=3809588:155599063:A
+rc=0 21:45:30
+== aa-fa2-p4096 21:45:30 uptime:  21:45:30 up 18 days,  1:15,  6 users,  load average: 9.11, 18.66, 19.07 | sclk: card0:1: 1887Mhz *  card1:1: 2136Mhz *  card2:1: 1928Mhz *  card3:S: 19Mhz *   | GPU_MAX_HW_QUEUES=1 FABRIC_JOB=3809588:155599063:A
+rc=0 21:46:10
+job done 21:46:10

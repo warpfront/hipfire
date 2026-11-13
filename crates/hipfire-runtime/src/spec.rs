@@ -369,13 +369,10 @@ pub trait SpecTarget {
     ) {
     }
 
-    /// The target's KV cache, for the daemon's FlashCASK eviction — but ONLY for
-    /// arches that store KV in the shared [`crate::llama::KvCache`] (qwen35
-    /// `ModelSlot`, llama `LlamaBundle`). Arches with their own KV representation
-    /// (e.g. qwen2's `Qwen2State`) return `None` (the default): they don't support
-    /// eviction, and the daemon's eviction sites are `if let Some(ev)`-gated so
-    /// this is never reached for a non-evicting target. Keeping it `Option` is
-    /// what lets a `Qwen2State`-backed target implement `SpecTarget` at all
+    /// The target's KV cache, but ONLY for arches that store KV in the shared
+    /// [`crate::llama::KvCache`] (qwen35 `ModelSlot`, llama `LlamaBundle`).
+    /// Arches with their own KV representation (e.g. qwen2's `Qwen2State`)
+    /// return `None` (the default). Keeping it `Option` is what lets a `Qwen2State`-backed target implement `SpecTarget` at all
     /// (it has no `llama::KvCache` to hand back).
     fn kv_cache_mut(&mut self) -> Option<&mut crate::llama::KvCache> {
         None
@@ -523,9 +520,9 @@ pub trait SpecTarget {
     ///
     /// Returns `(per-position argmax, captured)`. `captured` is `true` iff all
     /// `block.len()` positions' hidden were written to `hidden_gpu`; a target
-    /// whose batched capture path can't run for this block (e.g. llama with
-    /// `block.len() < 4`) returns `false` and leaves `hidden_gpu` untouched, and
-    /// the caller re-bootstraps the next window. `hidden_gpu` must be
+    /// with no extract layers configured returns `false` and leaves
+    /// `hidden_gpu` untouched, and the caller re-bootstraps the next window.
+    /// `hidden_gpu` must be
     /// `≥ block.len() × dflash_extract_layers().len() × dflash_streams_per_layer() × dim` F32.
     ///
     /// Same snapshot/advance contract as [`verify_block`](Self::verify_block).
@@ -550,8 +547,13 @@ pub trait SpecTarget {
     ///
     /// For a point-mass drafter, `accept_greedy_prefix(drafts, picks)` on these
     /// sampled `picks` is exactly distribution-preserving temp-T speculation (the
-    /// committed token is always the target sample). Same contract/`captured`
-    /// semantics as the greedy variant. Returns `Err` by default.
+    /// committed token is always the target sample). Same snapshot contract as
+    /// the greedy variant, but `captured == true` only guarantees rows
+    /// `0..=r` where `r` is the first position whose sample differs from the
+    /// next drafted token (or the last row): a target may stop at that
+    /// rejection (llama's per-token fallback does), leaving later rows
+    /// unwritten. Rows `0..=r` are the seed plus the accepted drafts, the only
+    /// rows a caller may read. Returns `Err` by default.
     #[allow(clippy::too_many_arguments)]
     fn verify_block_sampled_capture_gpu(
         &mut self,
@@ -812,17 +814,6 @@ impl PrefillOutcome {
     }
 }
 
-/// Eviction-retain descriptor for [`Speculator::on_evict`] — lets the drafter
-/// compact its cached target-hidden rows to match the target KV after a
-/// FlashCASK eviction the daemon already applied to the target.
-#[derive(Debug, Clone)]
-pub struct EvictRetain {
-    /// Per-physical-slot retain mask from the eviction policy.
-    pub retain_mask: Vec<u32>,
-    /// Physical fill before the eviction (rows to compact).
-    pub pre_phys: usize,
-}
-
 /// Live post-reset evidence for serve-fault-inject / parity snapshots.
 ///
 /// Produced only by Speculators that own DFlash-style scratch. Snapshot writers
@@ -915,13 +906,6 @@ pub trait Speculator {
         temp: f32,
         max_emit: usize,
     ) -> Result<SpecStep, String>;
-
-    /// Compact drafter-local cached state after a target KV eviction the daemon
-    /// already applied. Default no-op for drafters with no target-hidden cache.
-    fn on_evict(&mut self, gpu: &mut Gpu, retain: &EvictRetain) -> Result<(), String> {
-        let _ = (gpu, retain);
-        Ok(())
-    }
 
     /// Advance the target over a pending-seed GPU transaction (forced
     /// continuation or terminal flush) while keeping drafter-local per-position
@@ -1099,6 +1083,21 @@ pub trait Speculator {
     fn checkpoint_positions(&self) -> Vec<usize> {
         Vec::new()
     }
+
+    /// `(position, prefix fingerprint)` of every checkpoint in the ring, in the
+    /// same order as [`Self::checkpoint_positions`]. The fingerprint is the
+    /// one stored when the checkpoint was taken (`0` = not attested); the
+    /// resume planner restores only checkpoints whose fingerprint matches the
+    /// conversation prefix they would be restored onto. Default empty: a
+    /// drafter with no attested ring never resumes.
+    fn checkpoint_prefix_hashes(&self) -> Vec<(usize, u64)> {
+        Vec::new()
+    }
+
+    /// The request's user-turn boundary (`prompt_frame::user_turn_resume_boundary`),
+    /// `None` when its prompt is not user-terminated. Set before the prompt
+    /// prefill; a speculator with a checkpoint ring snapshots there. Default: ignored.
+    fn set_turn_boundary(&mut self, _boundary: Option<usize>) {}
 
     /// Whether the drafter can continue a target restored or continued live
     /// at `start` of `prompt` (a prompt-cache hit). Default `true`. The Qwen4
@@ -1452,6 +1451,18 @@ pub trait MtpDrafter {
         Vec::new()
     }
 
+    /// `(position, prefix fingerprint)` of the MTP checkpoint ring (see
+    /// [`Speculator::checkpoint_prefix_hashes`]). Default empty.
+    fn mtp_checkpoint_prefix_hashes(&self) -> Vec<(usize, u64)> {
+        Vec::new()
+    }
+
+    /// The request's user-turn boundary (`prompt_frame::user_turn_resume_boundary`),
+    /// `None` when its prompt is not user-terminated. A drafter with a checkpoint
+    /// ring snapshots its target there during the prompt prefill and keeps that
+    /// snapshot through the following tool-result requests. Default: ignored.
+    fn mtp_set_turn_boundary(&mut self, _boundary: Option<usize>) {}
+
     /// Restore the MTP target's recurrent state to an advertised checkpoint
     /// and discard checkpoints from the now-stale future.
     fn mtp_rewind_to(
@@ -1685,6 +1696,14 @@ impl<A: MtpDrafter + 'static> Speculator for MtpSpeculator<A> {
         self.arch.mtp_checkpoint_positions()
     }
 
+    fn checkpoint_prefix_hashes(&self) -> Vec<(usize, u64)> {
+        self.arch.mtp_checkpoint_prefix_hashes()
+    }
+
+    fn set_turn_boundary(&mut self, boundary: Option<usize>) {
+        self.arch.mtp_set_turn_boundary(boundary);
+    }
+
     fn rewind_to(
         &mut self,
         gpu: &mut Gpu,
@@ -1879,6 +1898,10 @@ pub struct SpecEmitCtx<'a> {
     pub enable_grammar: bool,
     /// User stop sequences matched against the decoded suffix.
     pub stop: Vec<String>,
+    /// vLLM-compatible `min_tokens`: EOS, decoded end-of-turn markers and user
+    /// stop sequences are inactive until this many tokens have been committed
+    /// (0 ⇒ always active). See [`crate::stop_sequence::MinTokens`].
+    pub min_tokens: usize,
     /// `max_think_tokens` budget (0 ⇒ no think force-close).
     pub max_think: usize,
     /// The turn's `max_tokens` cap. Used by arches whose emitter sizes a

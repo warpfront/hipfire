@@ -17,6 +17,29 @@
 //!   fa_pm_fp8_oracle --filter a3b_native  native reference + actual fused-prep gates
 //! ```
 //!
+//! PM Q-resident twin mode (`--pm-qres`, additive; every default above is untouched):
+//! ```text
+//!   fa_pm_fp8_oracle --pm-qres --plan          cells, cases, allocation census (CPU only)
+//!   fa_pm_fp8_oracle --pm-qres --self-check    CPU invariants of the mode (CPU only)
+//!   fa_pm_fp8_oracle --pm-qres [--filter STR] [--fail-fast]   GPU byte gate (gfx1201)
+//! ```
+//! Runs the embedded PeaceMaker twin `fa_qresident_a3b_pm_gfx1201` (direct AND range export,
+//! `rdna_compute::fa_qresident_pm`) against the hipcc candidate through explicit
+//! `A3bQresRoute` launches on the SAME prepared inputs, guards and output-poison rounds
+//! (hipcc output buffer poisoned 0xA5 / PM 0x5A in round 0, exchanged in round 1). Cells are
+//! every native cell plus extra shapes (rows 2/7/48/64/511/512/513/4096/8192 at starts 0, 8191
+//! and the start reaching context 32768; Winner / Kt48 / KV-NaN / Q-nonfinite fixtures at
+//! long and edge horizons); `--filter` selects by cell-name substring. Per cell and round:
+//! direct, range over the FULL `rows + 4` planes at offset 0 and at nonzero offsets, and
+//! future-cache poison probes (zeroed / extreme-finite keys after the probe horizon). Every
+//! compare is RAW u8 equality of the full output (NaN payload bits included); the JSON gives
+//! per-case mismatching words and bytes and the first mismatch (row, head, dim, hipcc bits,
+//! PM bits). Gates that count one mismatch each: output outside a range segment keeps its
+//! own poison, range offset 0 reproduces direct per arm, probe rows stay stable per arm,
+//! inputs unchanged and all eight guards intact. Fail closed: any module or launch error
+//! stops the run and counts as a mismatch. Final line `PM_QRES total_cases=N mismatches=M`;
+//! exit status nonzero when M > 0 or on any error. `HIPFIRE_FA_QRESIDENT_PM` is ignored here.
+//!
 //! Native attention arms read the SAME host-built native cache fixtures.
 //! Actual production fused-Q-prep execution is a separate mandatory family gate:
 //!
@@ -68,7 +91,9 @@
 //! `all_classifications_pass` includes the NaN cells. A sampled f64 CPU reference over f32 Q and
 //! independently decoded, f16-staged K/V omits Q16 conversion and the WMMA/reduction DAG: diagnostic only.
 use hip_bridge::KernargBlob;
+use rdna_compute::attention::A3bQresRoute;
 use rdna_compute::fa_prefill_pm::{self, FaPrefillKvCodec};
+use rdna_compute::fa_qresident_pm;
 use rdna_compute::qwen35_fa_batch::FaPrepQOut;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use serde_json::{json, Value};
@@ -1672,24 +1697,28 @@ const NATIVE_BUFFER_NAMES: [&str; 8] = [
     "native_out_extra",
     "native_q_f32",
 ];
+/// Per-buffer allocation sizes (guards excluded) of the native arena for `cells`.
+fn native_arena_sizes(cells: &[NativeCell]) -> [usize; 8] {
+    let mut q = 0usize;
+    let mut cache = 0usize;
+    let mut pos = 0usize;
+    let mut out = 0usize;
+    for c in cells {
+        // FULL two-plane Q includes a defined 4-row overhang to expose
+        // tail-local scale-plane bugs. Cache allocation covers exactly
+        // the cell's active prefix; future keys are inside that prefix.
+        let total = c.rows + 4;
+        q = q.max(NativeCell::q_bytes(total));
+        cache = cache.max(NativeCell::cache_bytes(c.ctx()));
+        pos = pos.max(c.rows * 4);
+        out = out.max(c.rows * ROW * 4);
+    }
+    let q_f32 = cells.iter().map(|c| c.rows * ROW * 4).max().unwrap_or(0);
+    [q, cache, cache, pos, out, out, out, q_f32]
+}
 impl NativeArena {
     fn new(gpu: &mut Gpu, cells: &[NativeCell]) -> Result<Self> {
-        let mut q = 0usize;
-        let mut cache = 0usize;
-        let mut pos = 0usize;
-        let mut out = 0usize;
-        for c in cells {
-            // FULL two-plane Q includes a defined 4-row overhang to expose
-            // tail-local scale-plane bugs. Cache allocation covers exactly
-            // the cell's active prefix; future keys are inside that prefix.
-            let total = c.rows + 4;
-            q = q.max(NativeCell::q_bytes(total));
-            cache = cache.max(NativeCell::cache_bytes(c.ctx()));
-            pos = pos.max(c.rows * 4);
-            out = out.max(c.rows * ROW * 4);
-        }
-        let q_f32 = cells.iter().map(|c| c.rows * ROW * 4).max().unwrap_or(0);
-        let sizes = [q, cache, cache, pos, out, out, out, q_f32];
+        let sizes = native_arena_sizes(cells);
         let dtypes = [
             DType::Raw,
             DType::Raw,
@@ -1822,14 +1851,32 @@ fn native_candidate_seg(
     n: usize,
     total: usize,
 ) -> Result<()> {
+    native_candidate_seg_routed(None, gpu, a, cell, out, off, n, total)
+}
+/// [`native_candidate_seg`] with the kernel arm optionally pinned (`--pm-qres` compares the
+/// hipcc and PM arms explicitly); `None` follows the production flag exactly as before.
+#[allow(clippy::too_many_arguments)]
+fn native_candidate_seg_routed(
+    route: Option<A3bQresRoute>,
+    gpu: &mut Gpu,
+    a: &NativeArena,
+    cell: &NativeCell,
+    out: &Buf,
+    off: usize,
+    n: usize,
+    total: usize,
+) -> Result<()> {
     let rows = n;
     let seg_out = out.sub(off * ROW * 4, rows * ROW * 4);
     let seg_pos = a.pos().sub(off * 4, rows * 4);
-    if cell.rows == total {
-        gpu.attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a3b_gfx1201(
-            &a.q().view(NativeCell::q_bytes(total)),
-            &a.kc().view(NativeCell::cache_bytes(cell.ctx())),
-            &a.vc().view(NativeCell::cache_bytes(cell.ctx())),
+    let q = a.q().view(NativeCell::q_bytes(total));
+    let kc = a.kc().view(NativeCell::cache_bytes(cell.ctx()));
+    let vc = a.vc().view(NativeCell::cache_bytes(cell.ctx()));
+    match (cell.rows == total, route) {
+        (true, None) => gpu.attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a3b_gfx1201(
+            &q,
+            &kc,
+            &vc,
             &seg_out,
             &seg_pos,
             H,
@@ -1837,12 +1884,24 @@ fn native_candidate_seg(
             D,
             cell.ctx(),
             rows,
-        )?;
-    } else {
-        gpu.attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_range_a3b_gfx1201(
-            &a.q().view(NativeCell::q_bytes(total)),
-            &a.kc().view(NativeCell::cache_bytes(cell.ctx())),
-            &a.vc().view(NativeCell::cache_bytes(cell.ctx())),
+        )?,
+        (true, Some(r)) => gpu.attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a3b_routed_gfx1201(
+            r,
+            &q,
+            &kc,
+            &vc,
+            &seg_out,
+            &seg_pos,
+            H,
+            KV,
+            D,
+            cell.ctx(),
+            rows,
+        )?,
+        (false, None) => gpu.attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_range_a3b_gfx1201(
+            &q,
+            &kc,
+            &vc,
             &seg_out,
             &seg_pos,
             H,
@@ -1852,7 +1911,23 @@ fn native_candidate_seg(
             rows,
             total,
             off,
-        )?;
+        )?,
+        (false, Some(r)) => gpu
+            .attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_range_a3b_routed_gfx1201(
+                r,
+                &q,
+                &kc,
+                &vc,
+                &seg_out,
+                &seg_pos,
+                H,
+                KV,
+                D,
+                cell.ctx(),
+                rows,
+                total,
+                off,
+            )?,
     }
     Ok(())
 }
@@ -2829,6 +2904,28 @@ fn native_q_nonfinite_repr(kind: NativeKind, p: &NativePrepared) -> Value {
         "tainted_q_heads": tainted, "representation_mismatches": bad,
         "first_mismatch_head": first, "pass": ok})
 }
+/// Host copies of the pristine caches with every key after `horizon` zeroed (`"zero"`) or
+/// made extreme-finite (code 0x7e at scale 1.0, so `0 * value` stays exact in masked lanes).
+fn perturbed_future(p: &NativePrepared, horizon: usize, kind: &str) -> (Vec<u8>, Vec<u8>) {
+    let mut kc = p.k_cache.clone();
+    let mut vc = p.v_cache.clone();
+    for t in horizon + 1..p.k_cache.len() / POS_BYTES {
+        for buf in [&mut kc, &mut vc] {
+            let rowb = &mut buf[t * POS_BYTES..(t + 1) * POS_BYTES];
+            match kind {
+                "zero" => rowb.fill(0),
+                _ => {
+                    rowb[..KV * D].fill(0x7e);
+                    for g in 0..KV {
+                        rowb[SCALE_OFF + 2 * g..SCALE_OFF + 2 * g + 2]
+                            .copy_from_slice(&0x3c00u16.to_le_bytes());
+                    }
+                }
+            }
+        }
+    }
+    (kc, vc)
+}
 /// Native future-cache poison probe: rows at or below each probe row's causal
 /// horizon stay byte-identical on BOTH arms when every later key is zeroed or
 /// made extreme-finite (code 0x7e at scale 1.0, so `0 * value` stays exact in
@@ -2860,23 +2957,7 @@ fn native_poison_probe(
     for row in rows {
         let horizon = p.positions[row] as usize;
         for kind in ["zero", "extreme"] {
-            let mut kc = p.k_cache.clone();
-            let mut vc = p.v_cache.clone();
-            for t in horizon + 1..p.k_cache.len() / POS_BYTES {
-                for buf in [&mut kc, &mut vc] {
-                    let rowb = &mut buf[t * POS_BYTES..(t + 1) * POS_BYTES];
-                    match kind {
-                        "zero" => rowb.fill(0),
-                        _ => {
-                            rowb[..KV * D].fill(0x7e);
-                            for g in 0..KV {
-                                rowb[SCALE_OFF + 2 * g..SCALE_OFF + 2 * g + 2]
-                                    .copy_from_slice(&0x3c00u16.to_le_bytes());
-                            }
-                        }
-                    }
-                }
-            }
+            let (kc, vc) = perturbed_future(p, horizon, kind);
             a.kc().upload(gpu, &kc)?;
             a.vc().upload(gpu, &vc)?;
             gpu.hip.device_synchronize()?;
@@ -4035,25 +4116,593 @@ fn self_check() -> usize {
     n
 }
 
+// ------------------------------------------------- PM Q-resident twin arm
+// `--pm-qres`: the embedded PeaceMaker twin `fa_qresident_a3b_pm_gfx1201` (direct AND range
+// export) against the hipcc candidate on the SAME prepared inputs, guards and output-poison
+// rounds. Pure raw-byte comparison (NaN payload bits included): no classifier, no reference
+// kernel. Both arms go through `Gpu::attention_..._routed_gfx1201` with an explicit route, so
+// `HIPFIRE_FA_QRESIDENT_PM` never changes what this mode compares.
+
+/// Largest context of the PM mode's extra cells.
+const PM_QRES_CTX_MAX: usize = 32_768;
+/// Query-row counts of the extra cells.
+const PM_QRES_ROWS: [usize; 9] = [2, 7, 48, 64, 511, 512, 513, 4096, 8192];
+/// Direct-layout probes are skipped at or above this row count (range-layout probes stay).
+const PM_QRES_DIRECT_PROBE_MAX_ROWS: usize = 4096;
+
+/// Start such that the cell's context is exactly `PM_QRES_CTX_MAX`.
+fn pm_qres_top(rows: usize) -> usize {
+    PM_QRES_CTX_MAX - rows.max(2)
+}
+/// Every native cell (so the pp16000 chunks n8192_s0 / n7808_s8192 are included) plus extra
+/// shapes: rows {2,7,48,64,511,512,513,4096,8192} at starts 0, 8191 and the one reaching
+/// context 32768, Winner/Kt48/KV-NaN/Q-nonfinite fixtures at long and edge horizons.
+fn pm_qres_cells() -> Vec<NativeCell> {
+    let mut cells = native_cells();
+    let mut add = |rows: usize, start: usize, kind: NativeKind| {
+        if !cells
+            .iter()
+            .any(|c| c.rows == rows && c.start == start && c.kind == kind)
+        {
+            cells.push(NativeCell { rows, start, kind });
+        }
+    };
+    for &rows in &PM_QRES_ROWS {
+        for start in [0, 8191, pm_qres_top(rows)] {
+            add(rows, start, NativeKind::Random);
+        }
+    }
+    for rows in [2, 48, 513] {
+        add(rows, pm_qres_top(rows), NativeKind::Winner);
+    }
+    for rows in [64, 513] {
+        for start in [47, 48, 95, 96, 191, 192] {
+            add(rows, start, NativeKind::Kt48);
+        }
+    }
+    for (rows, start) in [(7, 0), (513, 1000), (48, pm_qres_top(48))] {
+        add(rows, start, NativeKind::Nan);
+    }
+    for rows in [48, 513] {
+        add(rows, 0, NativeKind::QNan);
+        add(rows, pm_qres_top(rows), NativeKind::QInf);
+    }
+    cells
+}
+/// Range segments `(q_row_offset, batch)` over the cell's FULL `rows + 4` planes: offset 0
+/// (range entry at the zero corner), then nonzero offsets at 2, rows/2, 512, the last row and
+/// an interior window, wherever they fit.
+fn pm_qres_range_segs(rows: usize) -> Vec<(usize, usize)> {
+    let mut v = vec![(0, rows)];
+    let mut push = |off: usize, n: usize| {
+        if off >= 1 && n >= 1 && off + n <= rows && !v.contains(&(off, n)) {
+            v.push((off, n));
+        }
+    };
+    for off in [2, rows / 2, 512, rows.saturating_sub(1)] {
+        if off < rows {
+            push(off, rows - off);
+        }
+    }
+    if rows >= 8 {
+        push(rows / 4, rows / 2);
+    }
+    v
+}
+fn pm_qres_probe_rows(rows: usize) -> Vec<usize> {
+    let mut v = vec![0usize];
+    if rows > 3 {
+        v.push(3);
+    }
+    if rows > 1 {
+        v.push(rows - 1);
+    }
+    v.dedup();
+    v
+}
+fn pm_qres_probe_layouts(rows: usize) -> usize {
+    if rows < PM_QRES_DIRECT_PROBE_MAX_ROWS {
+        2
+    } else {
+        1
+    }
+}
+/// Byte-compare cases per round: direct + range segments + probes (rows x 2 kinds x layouts).
+fn pm_qres_cases_per_round(rows: usize) -> usize {
+    1 + pm_qres_range_segs(rows).len()
+        + pm_qres_probe_rows(rows).len() * 2 * pm_qres_probe_layouts(rows)
+}
+
+/// Raw word comparison of two same-layout output regions.
+struct PmCmp {
+    words: usize,
+    mismatch_words: usize,
+    mismatch_bytes: usize,
+    /// (row, head, dim, hip bits, pm bits) of the first mismatching word.
+    first: Option<(usize, usize, usize, u32, u32)>,
+}
+fn pm_compare(hip: &[u8], pm: &[u8], row_base: usize) -> PmCmp {
+    let mut c = PmCmp {
+        words: hip.len().max(pm.len()) / 4,
+        mismatch_words: 0,
+        mismatch_bytes: 0,
+        first: None,
+    };
+    for (i, (h, p)) in hip.chunks_exact(4).zip(pm.chunks_exact(4)).enumerate() {
+        if h != p {
+            c.mismatch_words += 1;
+            c.mismatch_bytes += h.iter().zip(p).filter(|(x, y)| x != y).count();
+            c.first.get_or_insert((
+                row_base + i / ROW,
+                (i % ROW) / D,
+                i % D,
+                u32::from_le_bytes(h.try_into().unwrap()),
+                u32::from_le_bytes(p.try_into().unwrap()),
+            ));
+        }
+    }
+    if hip.len() != pm.len() {
+        // A length difference is never silent: count every unmatched word.
+        c.mismatch_words += (hip.len().abs_diff(pm.len())).div_ceil(4);
+        c.mismatch_bytes += hip.len().abs_diff(pm.len());
+    }
+    c
+}
+impl PmCmp {
+    fn json(&self, name: &str) -> Value {
+        let first = self.first.map(|(row, head, dim, h, p)| {
+            json!({"row": row, "head": head, "dim": dim,
+                "hip_bits": format!("0x{h:08x}"), "pm_bits": format!("0x{p:08x}")})
+        });
+        json!({"case": name, "words": self.words, "mismatch_words": self.mismatch_words,
+            "mismatch_bytes": self.mismatch_bytes, "first_mismatch": first,
+            "pass": self.mismatch_words == 0})
+    }
+}
+/// Cases and mismatches of one round. A failed non-byte gate counts as one mismatch.
+#[derive(Default)]
+struct PmTally {
+    cases: usize,
+    mismatches: usize,
+    items: Vec<Value>,
+}
+impl PmTally {
+    fn cmp(&mut self, name: &str, hip: &[u8], pm: &[u8], row_base: usize) {
+        let c = pm_compare(hip, pm, row_base);
+        self.cases += 1;
+        self.mismatches += c.mismatch_words;
+        self.items.push(c.json(name));
+    }
+    fn gate(&mut self, name: &str, ok: bool) {
+        self.mismatches += !ok as usize;
+        self.items.push(json!({"gate": name, "pass": ok}));
+    }
+}
+
+fn pm_run_arm(
+    gpu: &mut Gpu,
+    a: &NativeArena,
+    cell: &NativeCell,
+    route: A3bQresRoute,
+    total: usize,
+    segs: &[(usize, usize)],
+    out: &Buf,
+) -> Result<()> {
+    for &(off, n) in segs {
+        native_candidate_seg_routed(Some(route), gpu, a, cell, out, off, n, total)?;
+    }
+    Ok(())
+}
+/// hipcc into `out_cand` (poison `round`), PM into `out_ref` (the other poison), same
+/// inputs; returns both full output downloads.
+fn pm_pair(
+    gpu: &mut Gpu,
+    a: &NativeArena,
+    cell: &NativeCell,
+    total: usize,
+    segs: &[(usize, usize)],
+    used_out: usize,
+    round: usize,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    native_output_poison(gpu, a.out_cand(), used_out, round)?;
+    native_output_poison(gpu, a.out_ref(), used_out, 1 - round)?;
+    gpu.hip.device_synchronize()?;
+    pm_run_arm(gpu, a, cell, A3bQresRoute::Hipcc, total, segs, a.out_cand())?;
+    pm_run_arm(gpu, a, cell, A3bQresRoute::Pm, total, segs, a.out_ref())?;
+    gpu.hip.device_synchronize()?;
+    Ok((
+        a.out_cand().download(gpu, used_out)?,
+        a.out_ref().download(gpu, used_out)?,
+    ))
+}
+
+/// One cell, one poison round: direct, every range segment, and future-cache probes, each
+/// requiring PM bytes == hipcc bytes.
+fn pm_qres_round(
+    gpu: &mut Gpu,
+    a: &NativeArena,
+    cell: &NativeCell,
+    round: usize,
+) -> Result<(Value, PmTally)> {
+    let p = native_prepare(cell, round)?;
+    native_upload(gpu, a, &p, round)?;
+    let rows = cell.rows;
+    let total = p.total;
+    let mut t = PmTally::default();
+    let mut full_q = p.q_codes.clone();
+    full_q.extend_from_slice(bytes(&p.q_scales));
+    let mut direct_q = p.q_codes[..rows * Q_CODES_ROW].to_vec();
+    direct_q.extend_from_slice(bytes(&p.q_scales[..rows * H]));
+    let (hip_poison, pm_poison) = (NATIVE_POISONS[round] as u8, NATIVE_POISONS[1 - round] as u8);
+    // Direct: batch-local scale plane.
+    a.q().upload(gpu, &direct_q)?;
+    let (hip_d, pm_d) = pm_pair(gpu, a, cell, rows, &[(0, rows)], p.used_out, round)?;
+    t.cmp("direct", &hip_d, &pm_d, 0);
+    t.gate(
+        "direct_q_unchanged",
+        a.q().download(gpu, direct_q.len())? == direct_q,
+    );
+    // Range over FULL planes: offset 0, then nonzero offsets.
+    a.q().upload(gpu, &full_q)?;
+    for (off, n) in pm_qres_range_segs(rows) {
+        let (hip_r, pm_r) = pm_pair(gpu, a, cell, total, &[(off, n)], p.used_out, round)?;
+        let span = off * ROW * 4..(off + n) * ROW * 4;
+        t.cmp(
+            &format!("range_off{off}_n{n}"),
+            &hip_r[span.clone()],
+            &pm_r[span.clone()],
+            off,
+        );
+        let outside = |buf: &[u8], b: u8| {
+            buf[..span.start].iter().all(|&x| x == b) && buf[span.end..].iter().all(|&x| x == b)
+        };
+        t.gate(
+            &format!("range_off{off}_n{n}_outside_untouched_hip"),
+            outside(&hip_r, hip_poison),
+        );
+        t.gate(
+            &format!("range_off{off}_n{n}_outside_untouched_pm"),
+            outside(&pm_r, pm_poison),
+        );
+        if off == 0 {
+            t.gate("range_off0_reproduces_direct_hip", hip_r == hip_d);
+            t.gate("range_off0_reproduces_direct_pm", pm_r == pm_d);
+        }
+    }
+    t.gate(
+        "range_q_unchanged",
+        a.q().download(gpu, full_q.len())? == full_q,
+    );
+    // Future-cache probes: every key after a probe row's horizon zeroed / extreme-finite.
+    // Unaffected rows must stay byte-stable on BOTH arms and PM must equal hipcc on the
+    // whole output.
+    let layouts: Vec<&str> = if pm_qres_probe_layouts(rows) == 2 {
+        vec!["direct", "range"]
+    } else {
+        vec!["range"]
+    };
+    let mut exercised = false;
+    for layout in layouts {
+        let (ltotal, lq, base_hip, base_pm) = if layout == "direct" {
+            (rows, &direct_q, &hip_d, &pm_d)
+        } else {
+            (total, &full_q, &hip_d, &pm_d)
+        };
+        a.q().upload(gpu, lq)?;
+        for row in pm_qres_probe_rows(rows) {
+            let horizon = p.positions[row] as usize;
+            for kind in ["zero", "extreme"] {
+                let (kc, vc) = perturbed_future(&p, horizon, kind);
+                exercised |= p.k_cache.len() / POS_BYTES > horizon + 1;
+                a.kc().upload(gpu, &kc)?;
+                a.vc().upload(gpu, &vc)?;
+                gpu.hip.device_synchronize()?;
+                let (hip_p, pm_p) = pm_pair(gpu, a, cell, ltotal, &[(0, rows)], p.used_out, round)?;
+                let name = format!("probe_{layout}_row{row}_{kind}");
+                t.cmp(&name, &hip_p, &pm_p, 0);
+                let stable = |probe: &[u8], base: &[u8]| {
+                    p.positions
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(q, &pos)| ((pos as usize) <= horizon).then_some(q))
+                        .all(|q| {
+                            probe[q * ROW * 4..(q + 1) * ROW * 4]
+                                == base[q * ROW * 4..(q + 1) * ROW * 4]
+                        })
+                };
+                t.gate(&format!("{name}_stable_hip"), stable(&hip_p, base_hip));
+                t.gate(&format!("{name}_stable_pm"), stable(&pm_p, base_pm));
+                if layout == "range" {
+                    let integ = native_integrity(gpu, a, &p, &kc, &vc)?;
+                    t.gate(&format!("{name}_integrity"), pass(&integ));
+                } else {
+                    t.gate(
+                        &format!("{name}_q_unchanged"),
+                        a.q().download(gpu, lq.len())? == *lq,
+                    );
+                }
+            }
+        }
+    }
+    t.gate("future_probes_exercised", exercised);
+    a.q().upload(gpu, &full_q)?;
+    a.kc().upload(gpu, &p.k_cache)?;
+    a.vc().upload(gpu, &p.v_cache)?;
+    gpu.hip.device_synchronize()?;
+    let integ = native_integrity(gpu, a, &p, &p.k_cache, &p.v_cache)?;
+    t.gate("final_integrity", pass(&integ));
+    let v = json!({"round": round, "seed": p.seed, "total_rows": total,
+        "hip_poison": format!("0x{hip_poison:02x}"), "pm_poison": format!("0x{pm_poison:02x}"),
+        "cases": t.items, "case_count": t.cases, "mismatches": t.mismatches,
+        "integrity": integ, "pass": t.mismatches == 0});
+    t.items = Vec::new();
+    Ok((v, t))
+}
+
+/// Allocation census of the PM mode's arena (guards included), pure CPU.
+fn pm_qres_arena_bytes(cells: &[NativeCell]) -> ([usize; 8], usize) {
+    let sizes = native_arena_sizes(cells);
+    let total = sizes.iter().map(|b| b + 2 * GUARD).sum();
+    (sizes, total)
+}
+fn pm_qres_plan() {
+    let _ = pm_qres_self_check();
+    let cells = pm_qres_cells();
+    let mut total_cases = 0usize;
+    let mut launches = 0usize;
+    for c in &cells {
+        let per_round = pm_qres_cases_per_round(c.rows);
+        total_cases += 2 * per_round;
+        launches += 2 * 2 * per_round;
+        println!(
+            "{}",
+            json!({"pm_qres_cell": c.name(), "rows": c.rows, "start": c.start,
+                "kind": c.kind.name(), "context": c.ctx(),
+                "range_segments": pm_qres_range_segs(c.rows),
+                "probe_rows": pm_qres_probe_rows(c.rows),
+                "probe_layouts": pm_qres_probe_layouts(c.rows),
+                "grid": c.gpu_grid(c.rows), "block": [NATIVE_BLOCK, 1, 1], "lds": NATIVE_LDS,
+                "cases_per_round": per_round, "rounds": 2,
+                "poison_rounds": ["0xA5", "0x5A"]})
+        );
+    }
+    let (sizes, arena_total) = pm_qres_arena_bytes(&cells);
+    // Device peak: the arena plus the two kernels' scratch and the HIP context; rounded up.
+    let mem_gb = ((arena_total as f64 / (1u64 << 30) as f64) + 1.0).ceil() as usize;
+    println!(
+        "{}",
+        json!({"plan": true, "mode": "pm_qres", "cells": cells.len(),
+            "native_cells": native_cells().len(),
+            "extra_cells": cells.len() - native_cells().len(),
+            "total_cases": total_cases, "kernel_launches": launches,
+            "buffers": NATIVE_BUFFER_NAMES, "arena_bytes_each": sizes,
+            "arena_total_bytes": arena_total, "suggested_mem_gb": mem_gb,
+            "pm_module": fa_qresident_pm::MODULE,
+            "pm_symbols": [fa_qresident_pm::SYMBOL_DIRECT, fa_qresident_pm::SYMBOL_RANGE],
+            "hipcc_symbols": [NATIVE_DIRECT, NATIVE_RANGE],
+            "pm_image_bytes": fa_qresident_pm::IMAGE.len(),
+            "kernarg_bytes": fa_qresident_pm::KERNARG_BYTES, "block": fa_qresident_pm::BLOCK,
+            "lds": fa_qresident_pm::LDS, "gpu_launched": false})
+    );
+    println!(
+        "PM_QRES_PLAN cells={} total_cases={total_cases}",
+        cells.len()
+    );
+}
+/// CPU invariants of the PM mode (cells, segments, comparator). Panics on failure.
+fn pm_qres_self_check() -> usize {
+    let mut n = 0usize;
+    let mut ok = |c: bool, what: &str| {
+        assert!(c, "pm-qres self-check failed: {what}");
+        n += 1;
+    };
+    let cells = pm_qres_cells();
+    let base = native_cells();
+    ok(
+        cells.len() > base.len()
+            && cells[..base.len()]
+                .iter()
+                .zip(&base)
+                .all(|(x, y)| x.rows == y.rows && x.start == y.start && x.kind == y.kind),
+        "native cells kept first and unchanged",
+    );
+    let mut names: Vec<String> = cells.iter().map(|c| c.name()).collect();
+    names.sort();
+    names.dedup();
+    ok(names.len() == cells.len(), "cell names unique");
+    ok(
+        cells
+            .iter()
+            .all(|c| c.rows >= 1 && c.ctx() <= PM_QRES_CTX_MAX.max(16_384)),
+        "contexts bounded",
+    );
+    ok(
+        cells.iter().map(|c| c.ctx()).max() == Some(PM_QRES_CTX_MAX),
+        "context 32768 covered",
+    );
+    for &rows in &PM_QRES_ROWS {
+        ok(
+            cells
+                .iter()
+                .any(|c| c.rows == rows && c.kind == NativeKind::Random && c.start == 0),
+            "every extra row count has a start-0 Random cell",
+        );
+        ok(
+            cells
+                .iter()
+                .any(|c| c.rows == rows && c.ctx() == PM_QRES_CTX_MAX),
+            "every extra row count reaches context 32768",
+        );
+    }
+    ok(
+        cells
+            .iter()
+            .any(|c| c.rows == 8192 && c.start == 0 && c.kind == NativeKind::Random)
+            && cells
+                .iter()
+                .any(|c| c.rows == 7808 && c.start == 8192 && c.kind == NativeKind::Random),
+        "pp16000 chunk cells present",
+    );
+    for kind in [
+        NativeKind::Winner,
+        NativeKind::Kt48,
+        NativeKind::Random,
+        NativeKind::Nan,
+        NativeKind::QNan,
+        NativeKind::QInf,
+    ] {
+        ok(cells.iter().any(|c| c.kind == kind), "fixture kind present");
+    }
+    for c in &cells {
+        let segs = pm_qres_range_segs(c.rows);
+        ok(
+            segs[0] == (0, c.rows) && segs.iter().all(|&(o, m)| m >= 1 && o + m <= c.rows),
+            "range segments in bounds",
+        );
+        ok(
+            c.rows < 2 || segs.iter().any(|&(o, _)| o != 0),
+            "a nonzero q_row_offset exists",
+        );
+    }
+    // Comparator: identical, NaN-payload difference, one word, length mismatch.
+    let nan_a = 0x7fc0_0001u32.to_le_bytes();
+    let nan_b = 0x7fc0_0002u32.to_le_bytes();
+    let mut a = vec![0u8; ROW * 4 * 2];
+    let b = a.clone();
+    ok(pm_compare(&a, &b, 0).mismatch_words == 0, "equal buffers");
+    let word = ROW + D + 5; // row 1, head 1, dim 5
+    a[word * 4..word * 4 + 4].copy_from_slice(&nan_a);
+    let mut b2 = b.clone();
+    b2[word * 4..word * 4 + 4].copy_from_slice(&nan_b);
+    let c = pm_compare(&a, &b2, 10);
+    ok(
+        c.mismatch_words == 1
+            && c.mismatch_bytes == 1
+            && c.first == Some((11, 1, 5, 0x7fc0_0001, 0x7fc0_0002)),
+        "NaN payload bits compared raw, first mismatch coordinates",
+    );
+    ok(
+        pm_compare(&a, &b2[..b2.len() - 4], 0).mismatch_words == 2,
+        "length mismatch is counted",
+    );
+    ok(
+        pm_qres_cases_per_round(1) == 1 + 1 + 1 * 2 * 2,
+        "case formula rows 1",
+    );
+    ok(
+        pm_qres_probe_layouts(8192) == 1 && pm_qres_probe_layouts(513) == 2,
+        "probe layouts",
+    );
+    n
+}
+fn pm_qres_run(o: &Opts) -> Result<bool> {
+    let _ = pm_qres_self_check();
+    let selected: Vec<NativeCell> = pm_qres_cells()
+        .into_iter()
+        .filter(|c| {
+            o.filter
+                .as_ref()
+                .map_or(true, |f| c.name().contains(f.as_str()))
+        })
+        .collect();
+    if selected.is_empty() {
+        return Err("--pm-qres --filter selected zero cells".into());
+    }
+    let mut gpu = Gpu::init()?;
+    if gpu.arch != "gfx1201" {
+        return Err(format!("requires gfx1201, got {}", gpu.arch).into());
+    }
+    println!(
+        "{}",
+        json!({"kind": "pm_qres_provenance",
+            "pm": {"module": fa_qresident_pm::MODULE,
+                "symbols": [fa_qresident_pm::SYMBOL_DIRECT, fa_qresident_pm::SYMBOL_RANGE],
+                "image_bytes": fa_qresident_pm::IMAGE.len(),
+                "image_sha256": sha_hex(fa_qresident_pm::IMAGE)},
+            "hipcc": {"symbols": [NATIVE_DIRECT, NATIVE_RANGE],
+                "source_const": "ATTENTION_FP8_E4M3_FA2_GQA_QRESIDENT_V2_Q8_A3B_GFX1201_SRC"},
+            "abi": {"kernarg_bytes": fa_qresident_pm::KERNARG_BYTES, "block": fa_qresident_pm::BLOCK,
+                "lds": fa_qresident_pm::LDS},
+            "env_flag_ignored": "HIPFIRE_FA_QRESIDENT_PM (both arms use explicit routes)",
+            "cells": selected.len(), "filter": o.filter.clone()})
+    );
+    let arena = NativeArena::new(&mut gpu, &selected)?;
+    println!(
+        "{}",
+        json!({"kind": "pm_qres_arena", "buffers": NATIVE_BUFFER_NAMES,
+            "arena_bytes_each": arena.sizes()})
+    );
+    let (mut cases, mut mismatches, mut errors, mut cells_failed) =
+        (0usize, 0usize, 0usize, 0usize);
+    'cells: for nc in &selected {
+        let mut rounds = Vec::new();
+        let (mut cell_cases, mut cell_mismatches, mut cell_error) = (0usize, 0usize, false);
+        for round in 0..2 {
+            match pm_qres_round(&mut gpu, &arena, nc, round) {
+                Ok((v, t)) => {
+                    cell_cases += t.cases;
+                    cell_mismatches += t.mismatches;
+                    rounds.push(v);
+                }
+                Err(e) => {
+                    // Fail closed: a module or launch error is a mismatch and stops the run.
+                    cell_error = true;
+                    cell_mismatches += 1;
+                    rounds.push(json!({"round": round, "error": e.to_string(), "pass": false}));
+                    break;
+                }
+            }
+        }
+        cases += cell_cases;
+        mismatches += cell_mismatches;
+        errors += cell_error as usize;
+        cells_failed += (cell_mismatches > 0) as usize;
+        println!(
+            "{}",
+            json!({"kind": "pm_qres_cell", "cell": nc.name(), "rows": nc.rows,
+                "start": nc.start, "fixture": nc.kind.name(), "context": nc.ctx(),
+                "rounds": rounds, "cases": cell_cases, "mismatches": cell_mismatches,
+                "error": cell_error, "pass": cell_mismatches == 0})
+        );
+        if cell_error || (o.fail_fast && cell_mismatches > 0) {
+            break 'cells;
+        }
+    }
+    println!(
+        "{}",
+        json!({"summary": true, "mode": "pm_qres", "cells_selected": selected.len(),
+            "cells_failed": cells_failed, "errors": errors, "total_cases": cases,
+            "mismatches": mismatches, "pm_image_sha256": sha_hex(fa_qresident_pm::IMAGE)})
+    );
+    println!("PM_QRES total_cases={cases} mismatches={mismatches}");
+    Ok(mismatches == 0 && errors == 0)
+}
+
 // ------------------------------------------------------------------ main
 struct Opts {
     plan: bool,
     check: bool,
     filter: Option<String>,
+    pm_qres: bool,
+    fail_fast: bool,
 }
 fn parse() -> Result<Opts> {
     let mut o = Opts {
         plan: false,
         check: false,
         filter: None,
+        pm_qres: false,
+        fail_fast: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
             "--plan" => o.plan = true,
             "--self-check" => o.check = true,
+            "--pm-qres" => o.pm_qres = true,
+            "--fail-fast" => o.fail_fast = true,
             "--filter" => o.filter = Some(it.next().ok_or("--filter needs a substring")?),
-            _ => return Err(format!("unknown argument {a}; usage: fa_pm_fp8_oracle [--plan|--self-check] [--filter SUBSTR]").into()),
+            _ => return Err(format!("unknown argument {a}; usage: fa_pm_fp8_oracle [--plan|--self-check] [--filter SUBSTR] [--pm-qres [--fail-fast]]").into()),
         }
     }
     Ok(o)
@@ -4085,7 +4734,19 @@ fn run() -> Result<bool> {
     let n = self_check();
     let o = parse()?;
     if o.plan {
-        plan();
+        if o.pm_qres {
+            pm_qres_plan();
+        } else {
+            plan();
+        }
+        return Ok(true);
+    }
+    if o.check && o.pm_qres {
+        let m = pm_qres_self_check();
+        println!(
+            "{}",
+            json!({"self_check":"passed","mode":"pm_qres","checks":m,"gpu_launched":false})
+        );
         return Ok(true);
     }
     if o.check {
@@ -4094,6 +4755,9 @@ fn run() -> Result<bool> {
             json!({"self_check":"passed","checks":n,"gpu_launched":false})
         );
         return Ok(true);
+    }
+    if o.pm_qres {
+        return pm_qres_run(&o);
     }
     // Native qualification is opt-in; legacy no-filter/default behavior is
     // unchanged. An explicitly requested native filter must select real cells.

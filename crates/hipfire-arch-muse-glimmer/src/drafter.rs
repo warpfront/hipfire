@@ -356,6 +356,14 @@ fn load_wt(
         .ok_or_else(|| format!("glimmer drafter: tensor '{name}' not found"))?;
     let mut wt = match info.quant_type {
         3 => {
+            hipfire_runtime::weight_backend::validate_row_extent(
+                DType::Q8_0,
+                data.len(),
+                m,
+                k,
+                name,
+            )
+            .map_err(|e| format!("glimmer drafter: {e:?}"))?;
             let buf = gpu
                 .upload_raw(data, &[data.len()])
                 .map_err(|e| format!("glimmer drafter: upload Q8 '{name}': {e:?}"))?;
@@ -365,7 +373,6 @@ fn load_wt(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -392,7 +399,6 @@ fn load_wt(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -413,7 +419,6 @@ fn load_wt(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -434,7 +439,6 @@ fn load_wt(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -455,7 +459,6 @@ fn load_wt(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -511,13 +514,6 @@ impl GlimmerDrafterWeights {
         // released on Err, ownership transfers exactly once on Ok.
         // Free via immediate path so a pending async memset cannot race the pool.
         fn free_weight_immediate(gpu: &mut Gpu, w: WeightTensor) {
-            if let Some(paro) = w.paro {
-                if !paro.is_alias {
-                    let _ = gpu.release_tensor_immediate(paro.pairs);
-                    let _ = gpu.release_tensor_immediate(paro.theta);
-                    let _ = gpu.release_tensor_immediate(paro.channel_scales);
-                }
-            }
             if let Some(awq) = w.awq_scale {
                 let _ = gpu.release_tensor_immediate(awq);
             }

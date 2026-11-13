@@ -366,14 +366,12 @@ impl Scheduler {
                 // unbounded quantum the `take` below is `min(cap, prompt_left,
                 // avail)`, which is exactly that — see the base
                 // `head_take` + full-quota loop this replaced.
-                let quantum = if paged_kv
-                    && avail >= PAGE_TOKENS
-                    && prefill_min_tokens <= PAGE_TOKENS
-                {
-                    PAGE_TOKENS
-                } else {
-                    usize::MAX
-                };
+                let quantum =
+                    if paged_kv && avail >= PAGE_TOKENS && prefill_min_tokens <= PAGE_TOKENS {
+                        PAGE_TOKENS
+                    } else {
+                        usize::MAX
+                    };
                 let mut keep_going = true;
                 while avail > 0 && keep_going {
                     keep_going = false;

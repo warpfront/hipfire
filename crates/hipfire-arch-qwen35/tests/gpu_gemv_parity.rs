@@ -257,7 +257,6 @@ fn compare(
         m,
         k,
         row_stride: 0,
-        rotation: None,
         awq_scale: awq,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
@@ -267,7 +266,7 @@ fn compare(
         Ok(()) => {}
         Err(hipfire_dispatch::types::DispatchError::MissingImpl { key }) => {
             // The *production launcher* has no dense GEMV for this dtype on this
-            // arch (e.g. `GemvHfq3G256` on gfx12): the format cannot appear as a
+            // arch (e.g. `GemvHfq3G256` on wave64 gfx906 / gfx942): the format cannot appear as a
             // `Step::Gemv` weight here, so there is nothing to compare against.
             // Its decode is still pinned by `hipfire-cpu`'s expectation table
             // where a canonical arm exists. Reported, never silently skipped.
@@ -373,7 +372,6 @@ fn check_prerotated(
         m,
         k,
         row_stride: 0,
-        rotation: None,
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
@@ -715,7 +713,6 @@ fn cpu_offload_return_stream_and_reuse_parity() -> Result<(), Box<dyn std::error
                     m,
                     k,
                     row_stride: 0,
-                    rotation: None,
                     awq_scale: Some(&scale),
                     lloyd_lut_e4m3: None,
                     lloyd_lut_f16: None,
@@ -882,7 +879,6 @@ fn split_case(
         m,
         k,
         row_stride: 0,
-        rotation: None,
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,

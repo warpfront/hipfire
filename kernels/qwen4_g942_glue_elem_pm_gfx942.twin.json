@@ -1,0 +1,311 @@
+{
+  "anchor": {
+    "bytes": 51200,
+    "file": "qwen4_g942_glue_elem_hipcc_gfx942.co",
+    "sha256": "06f54962af6c84457bb46c6603f8dd12ed64b3ad25a0f1c78dfdb8d426e213ca"
+  },
+  "arch": "gfx942",
+  "compiler": {
+    "flags": [
+      "--genco",
+      "--offload-arch=gfx942",
+      "-O3",
+      "--no-offload-compress",
+      "-fuse-cuid=none",
+      "-mcode-object-version=6"
+    ],
+    "invocation": "hipcc <flags> -o <anchor.co> kernels/src/qwen4_g942_glue_elem.hip",
+    "version": [
+      "HIP version: 7.16.26385-0000000",
+      "AMD clang version 24.0.0git (https://github.com/ROCm/llvm-project.git d6f6cb691863e9258034ab48c1dfce21689d5606)",
+      "Target: x86_64-unknown-linux-gnu",
+      "Thread model: posix"
+    ]
+  },
+  "gpu_oracle": {
+    "status": "PASS",
+    "target": "gfx942",
+    "input_hxaco_sha256": "3a7e83831db6d2556c1e71663a60b7cf02ff2d90e563f04989311cb5ef43c9bb",
+    "hipcc_image_sha256": "06f54962af6c84457bb46c6603f8dd12ed64b3ad25a0f1c78dfdb8d426e213ca",
+    "pm_device_elf_sha256": "f07deebe3f4c25077da28352fd31ed23fbc5e4d9e5ccf05912ff485f34ebe2c2",
+    "hipcc_device_elf_sha256": "f07deebe3f4c25077da28352fd31ed23fbc5e4d9e5ccf05912ff485f34ebe2c2",
+    "case_count": 96,
+    "failed_cases": 0,
+    "oracle": "qwen4_g942_fold_elem_hc_down_act_kernel_bytes",
+    "coverage": "mid/wide/tiny inputs x rows 1..16 x f32/bf16; every output bit exact",
+    "image_env": "HIPFIRE_QWEN4_G942_FOLD_ELEM_IMAGE=/scratch/quant/fn-fp8/beat/elem-twin.elf",
+    "ledger": {
+      "owner": "Twin942c",
+      "class": "oracle",
+      "path": "/scratch/quant/fn-fp8/beat/ledger.jsonl",
+      "line": 106,
+      "start": "2026-11-11T02:36:03+00:00",
+      "end": "2026-11-11T02:36:04+00:00",
+      "exit": 0
+    }
+  },
+  "hxaco": {
+    "bytes": 51200,
+    "file": "qwen4_g942_glue_elem_pm_gfx942.hxaco",
+    "sha256": "3a7e83831db6d2556c1e71663a60b7cf02ff2d90e563f04989311cb5ef43c9bb"
+  },
+  "module": "qwen4_g942_glue_elem_pm_gfx942",
+  "seal": {
+    "reports": [
+      {
+        "abi": {
+          "args": [
+            {
+              "name": "",
+              "offset": 0,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 8,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 16,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 24,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 28,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 32,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 36,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 40,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            }
+          ],
+          "compared_to_incumbent": false,
+          "kernarg_segment_size": 44
+        },
+        "arch": "gfx942",
+        "codec": "peacemaker_cdna",
+        "elf_bytes": 47104,
+        "elf_sha256": "f07deebe3f4c25077da28352fd31ed23fbc5e4d9e5ccf05912ff485f34ebe2c2",
+        "hazards": {
+          "advisory": 0,
+          "arch": "gfx942",
+          "blocking": 0,
+          "bypasses": 0,
+          "checked": true,
+          "dwords": 3830,
+          "findings": 0,
+          "hazard": {
+            "checker": "peacemaker_isa::cdna::hazard::check",
+            "inserted_nops": 0,
+            "mfma": 16,
+            "rewritten_instructions": 0,
+            "s_nop": 39,
+            "s_nop_wait_states": 55,
+            "violations": 0
+          },
+          "instructions": 2484,
+          "kernel": "qwen4_g942_gemm_bf16_rows16_hc_act",
+          "ledger": {
+            "barriers": 18,
+            "branches": 84,
+            "label_states": 288,
+            "labels": 60,
+            "memory": {
+              "ds_load": 24,
+              "ds_store": 48,
+              "smem": 4,
+              "vmem_atomic": 0,
+              "vmem_load": 32,
+              "vmem_store": 4
+            },
+            "steps": 12308,
+            "verifier": "peacemaker_isa::ledger_cfg::verify_with_branch_proofs",
+            "waitcnt": 61,
+            "waitcnt_lgkmcnt_partial": 1,
+            "waitcnt_vmcnt_partial": 46
+          },
+          "unreachable_instructions": 0
+        },
+        "hxaco_bytes": 51200,
+        "hxaco_sha256": "3a7e83831db6d2556c1e71663a60b7cf02ff2d90e563f04989311cb5ef43c9bb",
+        "kernel": "qwen4_g942_gemm_bf16_rows16_hc_act",
+        "lds": 0,
+        "lift_identity": "emit::checked ok; emitted bytes == input ELF",
+        "lifted_kernels": 2,
+        "rsrc2": 132,
+        "scratch": 0,
+        "sgprs": 64,
+        "text_bytes": 15320,
+        "text_sha256": "3152d83fffed617f5631a69bb21e813bde0744c3391609e9043bca040f93cca0",
+        "user_sgprs": 2,
+        "vgprs": 48,
+        "wavefront_size": 64
+      },
+      {
+        "abi": {
+          "args": [
+            {
+              "name": "",
+              "offset": 0,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 8,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 16,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 24,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 28,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 32,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 36,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 40,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            }
+          ],
+          "compared_to_incumbent": false,
+          "kernarg_segment_size": 44
+        },
+        "arch": "gfx942",
+        "codec": "peacemaker_cdna",
+        "elf_bytes": 47104,
+        "elf_sha256": "f07deebe3f4c25077da28352fd31ed23fbc5e4d9e5ccf05912ff485f34ebe2c2",
+        "hazards": {
+          "advisory": 0,
+          "arch": "gfx942",
+          "blocking": 0,
+          "bypasses": 0,
+          "checked": true,
+          "dwords": 6360,
+          "findings": 0,
+          "hazard": {
+            "checker": "peacemaker_isa::cdna::hazard::check",
+            "inserted_nops": 0,
+            "mfma": 16,
+            "rewritten_instructions": 0,
+            "s_nop": 86,
+            "s_nop_wait_states": 102,
+            "violations": 0
+          },
+          "instructions": 4098,
+          "kernel": "qwen4_g942_gemm_bf16_rows16_hc_act_x2",
+          "ledger": {
+            "barriers": 18,
+            "branches": 132,
+            "label_states": 569,
+            "labels": 92,
+            "memory": {
+              "ds_load": 24,
+              "ds_store": 80,
+              "smem": 4,
+              "vmem_atomic": 0,
+              "vmem_load": 48,
+              "vmem_store": 4
+            },
+            "steps": 26736,
+            "verifier": "peacemaker_isa::ledger_cfg::verify_with_branch_proofs",
+            "waitcnt": 78,
+            "waitcnt_lgkmcnt_partial": 1,
+            "waitcnt_vmcnt_partial": 63
+          },
+          "unreachable_instructions": 0
+        },
+        "hxaco_bytes": 51200,
+        "hxaco_sha256": "3a7e83831db6d2556c1e71663a60b7cf02ff2d90e563f04989311cb5ef43c9bb",
+        "kernel": "qwen4_g942_gemm_bf16_rows16_hc_act_x2",
+        "lds": 0,
+        "lift_identity": "emit::checked ok; emitted bytes == input ELF",
+        "lifted_kernels": 2,
+        "rsrc2": 132,
+        "scratch": 0,
+        "sgprs": 66,
+        "text_bytes": 25440,
+        "text_sha256": "9e4db60facc90379f9b804e90c9c8c2797720d335f0a5821cbcd9ebd615aaa01",
+        "user_sgprs": 2,
+        "vgprs": 72,
+        "wavefront_size": 64
+      }
+    ],
+    "tool": "peacemaker-isa example hip_twin (gfx942 Route A: typed lift, full device-ELF identity, bundle)"
+  },
+  "source": {
+    "bytes": 14849,
+    "path": "kernels/src/qwen4_g942_glue_elem.hip",
+    "sha256": "2fac7e00d2f8021bea81a48d85b16f75f9b842c06a4a7abbd00f17b382c1ff4f"
+  },
+  "symbols": [
+    "qwen4_g942_gemm_bf16_rows16_hc_act",
+    "qwen4_g942_gemm_bf16_rows16_hc_act_x2"
+  ]
+}

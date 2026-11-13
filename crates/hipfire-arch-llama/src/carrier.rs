@@ -396,7 +396,6 @@ fn resident_weight(
         m,
         k,
         row_stride: dtype.row_stride(k),
-        paro: None,
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
@@ -592,9 +591,7 @@ fn assemble_llama_weights(
 /// The HFQ plain-LLaMA Single path is the production manifest pilot: planning
 /// and source admission happen first, fulfillment uploads transactionally, and
 /// typed handles are moved into `LlamaWeights` before the committed remainder
-/// is published beneath this bundle's owner. The directory path remains on its
-/// existing ParoQuant loader until that source has an equivalent representation
-/// resolver.
+/// is published beneath this bundle's owner. Directory sources are refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HfqLoadRoute {
     /// Plain, non-AWQ files admitted to the manifest/typed-assembly pilot.
@@ -615,7 +612,7 @@ fn classify_hfq_route(hfq: &HfqFile) -> HfqLoadRoute {
 /// Resolve KV mode for llama-family loads.
 ///
 /// Qwen3 (arch_id=1) — both HFQ and Dir — uses the shared pair table with
-/// [`DIR_SAFETENSORS_POLICY`] (flat constructors only: Q8 + legacy Asym3/4).
+/// [`DIR_SAFETENSORS_POLICY`] (flat constructors only: Q8).
 /// Non-Qwen keeps the historical single-string [`resolve`] path: Dir stays on
 /// `DIR_SAFETENSORS_POLICY`, HFQ on `LLAMA_HFQ_POLICY`. Authored `--kv-k`/`--kv-v`
 /// on non-Qwen is refused here (admission also gates).
@@ -624,7 +621,7 @@ fn resolve_llama_family_kv_mode(
     ctx: &LoadCtx,
     dir_source: bool,
 ) -> Result<hipfire_runtime::kv_mode::KvMode, String> {
-    use hipfire_runtime::kv_mode::{self, KvMode, KvPair, VMode};
+    use hipfire_runtime::kv_mode::{self, KvPair, VMode};
     use hipfire_runtime::llama::ModelArch;
 
     let mode_raw = ctx
@@ -653,12 +650,6 @@ fn resolve_llama_family_kv_mode(
             return Err(format!(
                 "llama/qwen3: V={} unsupported on flat dir-safetensors constructor (need V=q8)",
                 kv_mode::qwen_v_display_name(v)
-            ));
-        }
-        if matches!(mode, KvMode::Asym3 | KvMode::Asym4) && config.head_dim != 256 {
-            return Err(format!(
-                "Qwen legacy-asym K requires head_dim=256 (got {}); use --kv-mode q8",
-                config.head_dim
             ));
         }
         eprintln!(
@@ -788,45 +779,12 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<LlamaBundle, S
                 weight_origin,
             )
         }
-        ModelSource::Dir(source) => {
-            let config = hipfire_runtime::hfq::config_from_safetensors_llama(&source)
-                .map_err(|e| format!("failed to parse LLaMA/Qwen3 config from config.json: {e}"))?;
-            // Pair/string resolution is pure CPU; fail before any GPU upload.
-            let mode = resolve_llama_family_kv_mode(&config, ctx, true)?;
-            let (mesh, manifest_plan) =
-                plan_single(&config, source.tensor_info("lm_head.weight").is_some())?;
-            let weight_origin = WeightOrigin::for_single(&mesh, ctx.gpu);
-            let weights =
-                hipfire_runtime::hfq::load_weights_paroquant_llama(&source, &config, ctx.gpu)
-                    .map_err(|e| format!("load_weights_paroquant_llama: {e:?}"))?;
-            hipfire_runtime::maybe_screen_mmq(&weights, ctx.gpu);
-            let dims = llama_kv_dims(&config, ctx.max_seq, Some(ctx.max_seq));
-            let kv =
-                match <KvCache as KvCacheExt>::from_mode(mode, KvTarget::Single(ctx.gpu), &dims) {
-                    Ok(kv) => kv,
-                    Err(error) => {
-                        weights.free_gpu(ctx.gpu);
-                        return Err(format!("KvCache: {error}"));
-                    }
-                };
-            let scratch = match ForwardScratch::new_with_max_seq(ctx.gpu, &config, ctx.max_seq) {
-                Ok(scratch) => scratch,
-                Err(error) => {
-                    let _ = kv.free_gpu(ctx.gpu);
-                    weights.free_gpu(ctx.gpu);
-                    return Err(format!("ForwardScratch::new_with_max_seq: {error:?}"));
-                }
-            };
-            (
-                config,
-                weights,
-                kv,
-                scratch,
-                manifest_plan,
-                None,
-                mesh,
-                weight_origin,
-            )
+        ModelSource::Dir(_) => {
+            return Err(
+                "llama: safetensors-directory loading is unsupported — convert first with \
+                 `hipfire-quantize` to an HFQ file"
+                    .into(),
+            );
         }
     };
 
@@ -937,7 +895,7 @@ mod tests {
         forward_scratch_compute, forward_scratch_embed, KvCache, KvCacheExt, KvDims, KvLayers,
         KvTarget,
     };
-    use hipfire_runtime::loader_api::{CaskConfig, LoadCtx, ModelSource, SpecLoadCfg};
+    use hipfire_runtime::loader_api::{LoadCtx, ModelSource, SpecLoadCfg};
     use hipfire_runtime::weight_manifest::ShardPolicy;
     use hipfire_runtime::weight_store::test_support;
     use hipfire_runtime::weight_store::{
@@ -1210,11 +1168,7 @@ mod tests {
         fixture_file(metadata, &tensors)
     }
 
-    fn load_ctx<'a>(
-        path: &'a Path,
-        gpu: &'a mut rdna_compute::Gpu,
-        cask: &'a CaskConfig,
-    ) -> LoadCtx<'a> {
+    fn load_ctx<'a>(path: &'a Path, gpu: &'a mut rdna_compute::Gpu) -> LoadCtx<'a> {
         LoadCtx {
             path: path.to_str().expect("fixture path is UTF-8"),
             max_seq: 8,
@@ -1232,7 +1186,6 @@ mod tests {
             vision_path: None,
             mtp_path: None,
             vision_mode: "auto".to_string(),
-            cask,
             pp: 1,
             pp_layer_counts: None,
             admitted_mesh: None,
@@ -1259,6 +1212,7 @@ mod tests {
             norm_eps: 1e-5,
             max_seq_len: 32,
             rope_freq_base: 10_000.0,
+            rope_llama3: rdna_compute::rope::RopeLlama3::OFF,
             bos_token: 1,
             eos_token: 2,
             has_qk_norm: false,
@@ -1401,8 +1355,7 @@ mod tests {
             return;
         };
         let (fixture, hfq) = fixture_hfq(false, false, false, false);
-        let cask = CaskConfig::default();
-        let mut ctx = load_ctx(fixture.path(), &mut gpu, &cask);
+        let mut ctx = load_ctx(fixture.path(), &mut gpu);
         let bundle = load_bundle(ModelSource::Hfq(hfq), &mut ctx).expect("load plain HFQ fixture");
         drop(ctx);
         assert!(bundle.weights.lm_head_aliases_embd);
@@ -1441,8 +1394,7 @@ mod tests {
         for name in &HFQ_LM_HEAD_NAMES[1..] {
             let (fixture, hfq) = fixture_hfq_with_lm_head(false, false, false, Some(name));
             assert!(hfq_has_separate_lm_head(&hfq));
-            let cask = CaskConfig::default();
-            let mut ctx = load_ctx(fixture.path(), &mut gpu, &cask);
+            let mut ctx = load_ctx(fixture.path(), &mut gpu);
             let bundle =
                 load_bundle(ModelSource::Hfq(hfq), &mut ctx).expect("load explicit lm_head");
             drop(ctx);
@@ -1457,8 +1409,7 @@ mod tests {
             return;
         };
         let (fixture, hfq) = fixture_hfq(false, true, false, false);
-        let cask = CaskConfig::default();
-        let mut ctx = load_ctx(fixture.path(), &mut gpu, &cask);
+        let mut ctx = load_ctx(fixture.path(), &mut gpu);
         let error = match load_bundle(ModelSource::Hfq(hfq), &mut ctx) {
             Ok(_) => panic!("biased HFQ unexpectedly loaded"),
             Err(error) => error,
@@ -1476,8 +1427,7 @@ mod tests {
         let (fixture, hfq) = fixture_hfq(false, false, false, false);
         test_support::reset();
         test_support::arm_fail_after_upload(1);
-        let cask = CaskConfig::default();
-        let mut ctx = load_ctx(fixture.path(), &mut gpu, &cask);
+        let mut ctx = load_ctx(fixture.path(), &mut gpu);
         let error = match load_bundle(ModelSource::Hfq(hfq), &mut ctx) {
             Ok(_) => panic!("post-upload fault unexpectedly succeeded"),
             Err(error) => error,
@@ -1500,8 +1450,7 @@ mod tests {
             return;
         };
         let (fixture, hfq) = fixture_hfq(false, false, false, false);
-        let cask = CaskConfig::default();
-        let mut ctx = load_ctx(fixture.path(), &mut gpu, &cask);
+        let mut ctx = load_ctx(fixture.path(), &mut gpu);
         let mut bundle =
             load_bundle(ModelSource::Hfq(hfq), &mut ctx).expect("load plain HFQ fixture");
         drop(ctx);
@@ -1668,8 +1617,7 @@ mod tests {
         let has_separate_lm_head = hfq_has_separate_lm_head(&hfq);
         eprintln!("g3-oracle: separate lm_head in fixture = {has_separate_lm_head}");
 
-        let cask = CaskConfig::default();
-        let mut ctx = load_ctx(std::path::Path::new(&fixture), &mut gpu, &cask);
+        let mut ctx = load_ctx(std::path::Path::new(&fixture), &mut gpu);
         ctx.max_seq = max_seq;
         let mut bundle = load_bundle(ModelSource::Hfq(hfq), &mut ctx).expect("production load");
         assert_eq!(
@@ -1871,11 +1819,10 @@ mod tests {
             hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
                 .expect("pinned fixture tokenizer");
         let prompt_tokens = tokenizer.encode(prompt);
-        let cask = CaskConfig::default();
 
         // First production load + decode (warms store resident accounting).
         test_support::reset();
-        let mut ctx = load_ctx(std::path::Path::new(&fixture), &mut gpu, &cask);
+        let mut ctx = load_ctx(std::path::Path::new(&fixture), &mut gpu);
         ctx.max_seq = max_seq;
         let hfq = HfqFile::open(std::path::Path::new(&fixture)).expect("reopen for first load");
         let mut bundle = load_bundle(ModelSource::Hfq(hfq), &mut ctx).expect("production load");
@@ -1918,7 +1865,7 @@ mod tests {
         eprintln!("g3-lifecycle: unloaded via ArchModel::free_gpu");
 
         // Immediate reload decodes identically.
-        let mut ctx = load_ctx(std::path::Path::new(&fixture), &mut gpu, &cask);
+        let mut ctx = load_ctx(std::path::Path::new(&fixture), &mut gpu);
         ctx.max_seq = max_seq;
         let hfq = HfqFile::open(std::path::Path::new(&fixture)).expect("reopen for reload");
         let mut bundle = load_bundle(ModelSource::Hfq(hfq), &mut ctx).expect("immediate reload");
@@ -1940,7 +1887,7 @@ mod tests {
         // allocations == releases after the rollback.
         test_support::reset();
         test_support::arm_fail_after_upload(1);
-        let mut ctx = load_ctx(std::path::Path::new(&fixture), &mut gpu, &cask);
+        let mut ctx = load_ctx(std::path::Path::new(&fixture), &mut gpu);
         ctx.max_seq = max_seq;
         let hfq = HfqFile::open(std::path::Path::new(&fixture)).expect("reopen for fault");
         let error = match load_bundle(ModelSource::Hfq(hfq), &mut ctx) {
@@ -1961,7 +1908,7 @@ mod tests {
         eprintln!("g3-lifecycle: deterministic fault rolled back — error {error:?}");
 
         // Immediate retry after the fault decodes identically.
-        let mut ctx = load_ctx(std::path::Path::new(&fixture), &mut gpu, &cask);
+        let mut ctx = load_ctx(std::path::Path::new(&fixture), &mut gpu);
         ctx.max_seq = max_seq;
         let hfq = HfqFile::open(std::path::Path::new(&fixture)).expect("reopen for retry");
         let mut bundle = load_bundle(ModelSource::Hfq(hfq), &mut ctx).expect("immediate retry");
@@ -2022,8 +1969,7 @@ mod tests {
         let (fixture, hfq) = fixture_awq_mq4_hfq(Some(0x4000), None);
         assert_eq!(classify_hfq_route(&hfq), HfqLoadRoute::LegacyAwq);
         assert!(hfq.has_awq_sidecars());
-        let cask = CaskConfig::default();
-        let mut ctx = load_ctx(fixture.path(), &mut gpu, &cask);
+        let mut ctx = load_ctx(fixture.path(), &mut gpu);
         let mut bundle = load_bundle(ModelSource::Hfq(hfq), &mut ctx).expect("AWQ legacy GPU load");
         drop(ctx);
         assert!(
@@ -2065,9 +2011,8 @@ mod tests {
             path: &Path,
             hfq: HfqFile,
             gpu: &mut rdna_compute::Gpu,
-            cask: &CaskConfig,
         ) -> LlamaBundle {
-            let mut ctx = load_ctx(path, gpu, cask);
+            let mut ctx = load_ctx(path, gpu);
             let bundle =
                 load_bundle(ModelSource::Hfq(hfq), &mut ctx).expect("AWQ lm_head legacy load");
             drop(ctx);
@@ -2076,7 +2021,7 @@ mod tests {
         const LM_K: usize = 256;
         let (lm2_fixture, lm2_hfq) = fixture_awq_mq4_hfq(None, Some(vec![0x4000; LM_K]));
         assert_eq!(classify_hfq_route(&lm2_hfq), HfqLoadRoute::LegacyAwq);
-        let mut pair2 = load_lm_head_pair(lm2_fixture.path(), lm2_hfq, &mut gpu, &cask);
+        let mut pair2 = load_lm_head_pair(lm2_fixture.path(), lm2_hfq, &mut gpu);
         assert_eq!(
             pair2.weights.output.gpu_dtype,
             DType::MQ4G256,
@@ -2098,7 +2043,7 @@ mod tests {
         );
         Box::new(pair2).free_gpu(&mut gpu);
         let (lm4_fixture, lm4_hfq) = fixture_awq_mq4_hfq(None, Some(vec![0x4400; LM_K]));
-        let mut pair4 = load_lm_head_pair(lm4_fixture.path(), lm4_hfq, &mut gpu, &cask);
+        let mut pair4 = load_lm_head_pair(lm4_fixture.path(), lm4_hfq, &mut gpu);
         assert!(pair4.weights.output.awq_scale.is_some());
         let logits4 = forward_logits(&mut gpu, &mut pair4);
         assert!(logits4.iter().all(|value| value.is_finite()));
@@ -2117,7 +2062,7 @@ mod tests {
             *slot = if index % 2 == 0 { 0x4000 } else { 0x4400 };
         }
         let (mix_fixture, mix_hfq) = fixture_awq_mq4_hfq(None, Some(mixed));
-        let mut pair_mix = load_lm_head_pair(mix_fixture.path(), mix_hfq, &mut gpu, &cask);
+        let mut pair_mix = load_lm_head_pair(mix_fixture.path(), mix_hfq, &mut gpu);
         let logits_mix = forward_logits(&mut gpu, &mut pair_mix);
         assert!(logits_mix.iter().all(|value| value.is_finite()));
         Box::new(pair_mix).free_gpu(&mut gpu);
@@ -2139,7 +2084,7 @@ mod tests {
         // trunk loads and forwards on the G3 production path. No numeric
         // comparison across routes is drawn (different kernels per route).
         let (plain_fixture, plain_hfq) = fixture_awq_mq4_hfq(None, None);
-        let mut ctx = load_ctx(plain_fixture.path(), &mut gpu, &cask);
+        let mut ctx = load_ctx(plain_fixture.path(), &mut gpu);
         let mut plain = load_bundle(ModelSource::Hfq(plain_hfq), &mut ctx).expect("plain MQ4 load");
         drop(ctx);
         let plain_logits = forward_logits(&mut gpu, &mut plain);
@@ -2149,7 +2094,7 @@ mod tests {
         // bitwise-identical numerics: unload released the scale-carrying
         // weight exactly once with no manifest store involved.
         let hfq = HfqFile::open(fixture.path()).expect("reopen AWQ fixture");
-        let mut ctx = load_ctx(fixture.path(), &mut gpu, &cask);
+        let mut ctx = load_ctx(fixture.path(), &mut gpu);
         let mut bundle = load_bundle(ModelSource::Hfq(hfq), &mut ctx).expect("AWQ legacy reload");
         drop(ctx);
         assert_eq!(bundle.weights.layers[0].wo.gpu_dtype, DType::MQ4G256);
@@ -2185,7 +2130,6 @@ mod tests {
             hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
                 .expect("pinned fixture tokenizer");
         let prompt_tokens = tokenizer.encode(prompt);
-        let cask = CaskConfig::default();
         test_support::reset();
         let mut baseline_tokens: Option<Vec<u32>> = None;
         let mut provenance_baseline = 0usize;
@@ -2194,7 +2138,7 @@ mod tests {
             let (free_before, _) = gpu.hip.get_vram_info().expect("vram before cycle");
             let (pool_new_before, pool_reused_before, _) = gpu.pool_stats();
             let alloc_before = test_support::resident_allocations();
-            let mut ctx = load_ctx(std::path::Path::new(&fixture), &mut gpu, &cask);
+            let mut ctx = load_ctx(std::path::Path::new(&fixture), &mut gpu);
             ctx.max_seq = max_seq;
             let hfq = HfqFile::open(std::path::Path::new(&fixture)).expect("reopen for cycle");
             let mut bundle = load_bundle(ModelSource::Hfq(hfq), &mut ctx)
@@ -2389,6 +2333,85 @@ mod tests {
         );
     }
 
+    /// HIPF-111: a DSpark bootstrap (`capture_seed_main_hidden`) arms the
+    /// verify's hidden capture at the drafter's layers, for a 2-row per-token
+    /// and a 5-row batched greedy verify alike. The daemon never
+    /// set the bundle's extract layers, so every verify reported
+    /// `captured == false` and DSpark re-ran the bootstrap forward each window.
+    #[test]
+    fn dspark_bootstrap_arms_verify_capture_for_short_and_batched_blocks() {
+        use hipfire_runtime::spec::{SpecAdvance, SpecTarget};
+        let _gpu_evidence_guard = GPU_EVIDENCE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(fixture) = pinned_fixture_path() else {
+            return;
+        };
+        let Ok(mut gpu) = rdna_compute::Gpu::init() else {
+            eprintln!("dspark-capture: no GPU; skipping");
+            return;
+        };
+        let hfq = HfqFile::open(Path::new(&fixture)).expect("open pinned fixture");
+        let mut ctx = load_ctx(Path::new(&fixture), &mut gpu);
+        ctx.max_seq = 64;
+        let mut bundle = load_bundle(ModelSource::Hfq(hfq), &mut ctx).expect("production load");
+        drop(ctx);
+
+        let prompt: Vec<u32> = (100..120).collect();
+        let SpecAdvance::Ready {
+            last_argmax: seed, ..
+        } = bundle
+            .spec_advance(&mut gpu, &prompt, 0, false, &|| false, None)
+            .expect("prefill")
+        else {
+            panic!("prefill aborted");
+        };
+        let pos = prompt.len();
+        let layers = [1usize, 13, 26];
+        let row = layers.len() * bundle.config.dim;
+        let boot = bundle
+            .capture_seed_main_hidden(&mut gpu, seed, pos, &layers)
+            .expect("bootstrap");
+        assert_eq!(boot.len(), row);
+
+        let hidden = gpu.alloc_tensor(&[5 * row], DType::F32).unwrap();
+        for block in [vec![seed, 7], vec![seed, 7, 8, 9, 10]] {
+            // NaN-fill so an unwritten capture cannot pass for a written one.
+            gpu.hip.memset(&hidden.buf, 0xff, 5 * row * 4).unwrap();
+            let mut scratch = bundle.new_spec_scratch(&mut gpu, block.len()).unwrap();
+            let (_, captured) = bundle
+                .verify_block_capture_gpu(&mut gpu, &block, pos, scratch.as_mut(), &hidden)
+                .expect("verify");
+            scratch.free(&mut gpu);
+            assert!(captured, "{}-row verify captured nothing", block.len());
+            let all = gpu
+                .download_f32(&hidden.sub_offset(0, block.len() * row))
+                .unwrap();
+            assert!(
+                all.iter().all(|v| v.is_finite()),
+                "{}-row capture has unwritten rows",
+                block.len()
+            );
+            // Row 0 is the seed at `pos`, the token the bootstrap captured: the
+            // per-token verify runs the very same forward, the batched one only
+            // differs by GEMM rounding.
+            let peak = boot.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let worst = all[..row]
+                .iter()
+                .zip(&boot)
+                .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+            if block.len() < 4 {
+                assert_eq!(worst, 0.0, "per-token verify row 0 != bootstrap hidden");
+            } else {
+                assert!(
+                    worst <= 0.02 * peak,
+                    "batched verify row 0 drifts {worst} (peak {peak})"
+                );
+            }
+        }
+        gpu.free_tensor(hidden).unwrap();
+    }
+
     /// Greedy argmax decode over `prompt_tokens` followed by `generated`
     /// self-generated tokens, one token per committed position.
     fn greedy_decode(
@@ -2440,8 +2463,7 @@ mod tests {
             return;
         };
         let hfq = HfqFile::open(Path::new(&fixture)).expect("open fixture");
-        let cask = CaskConfig::default();
-        let mut ctx = load_ctx(Path::new(&fixture), &mut gpu, &cask);
+        let mut ctx = load_ctx(Path::new(&fixture), &mut gpu);
         ctx.max_seq = 64;
         let mut bundle = load_bundle(ModelSource::Hfq(hfq), &mut ctx).expect("load fixture");
         drop(ctx);

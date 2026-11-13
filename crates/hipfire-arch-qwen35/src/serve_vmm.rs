@@ -753,8 +753,6 @@ impl VmmSlotKv {
         }
         let tier = SlotKvTier {
             mode: self.mode,
-            givens_cos: None,
-            givens_sin: None,
             fwht_signs1: None,
             fwht_signs2: None,
         };
@@ -1100,13 +1098,13 @@ impl VmmSlotKv {
             quant_hfq4: owner.quant_hfq4,
             quant_asym4: owner.quant_asym4,
             quant_asym3: owner.quant_asym3,
+            givens_cos: None,
+            givens_sin: None,
             quant_asym2: owner.quant_asym2,
             quant_fwht: owner.quant_fwht,
             quant_bf16: owner.quant_bf16,
             quant_fp8: owner.quant_fp8,
             boundary_layers: 0,
-            givens_cos: None,
-            givens_sin: None,
             layer_is_boundary: Vec::new(),
             compact_offset: 0,
             v_mode: VMode::Q8,
@@ -1160,10 +1158,9 @@ mod tests {
     fn vmm_format_gate_admits_only_descriptor_tiers() {
         assert_eq!(vmm_format_for_mode(KvMode::Q8), Ok(VmmKvFormat::Q8));
         assert_eq!(vmm_format_for_mode(KvMode::Fp8), Ok(VmmKvFormat::Fp8E4M3));
+        // The Givens `asym{2,3,4}` tiers (and their `turbo*` aliases) were
+        // removed in 0.5.0; the surviving rotated tiers are the fwht ones.
         for mode in [
-            KvMode::Asym2,
-            KvMode::Asym3,
-            KvMode::Asym4,
             KvMode::Fwht2,
             KvMode::Fwht3,
             KvMode::Fwht4,

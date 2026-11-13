@@ -32,9 +32,9 @@ Verified against current source, not folklore:
 | `Gpu::add_f32` (norm.rs:115), `add_inplace_f32` (172), `GpuTensor::sub_offset` (dispatch.rs:125) | **present** | `tp_allreduce_add` / `_batched` compile |
 | `config::get().tp_use_rccl` | **MISSING** field | add `tp_use_rccl: Option<bool>` to `RuntimeConfig` + parse `HIPFIRE_TP_USE_RCCL` |
 | `tp_shard.rs` (568 lines, pure-CPU) | **NEW**, zero external deps (only `std::ops::Range`) | drops in verbatim; its 16 unit tests run on CPU/CI |
-| `WeightTensor` (llama.rs:521) | **byte-identical** (`buf`/`gpu_dtype`/`m`/`k`/`row_stride`/`paro`/`awq_scale`) | `load_weights_tp` slicing path (`awq_scale`, `paro`, `free_tensor`) ports cleanly |
+| `WeightTensor` (llama.rs:521) | **byte-identical** (`buf`/`gpu_dtype`/`m`/`k`/`row_stride`/`awq_scale`) | `load_weights_tp` slicing path (`awq_scale`, `free_tensor`) ports cleanly |
 | `LayerWeights` enum (qwen35.rs:649) | **byte-identical** (DeltaNet/FullAttn/DeltaNetMoe/FullAttnMoe) | pattern-matches port unchanged |
-| `DType` enum (dispatch.rs:137) | **DRIFT** — prototype has `PARO4G128` + `PARO4G128T`; current does **NOT**. Current has a `fused_fa3_hfq6` branch the prototype lacks. | independent feature divergence. Prototype `run_fa_layer_body` references `DType::PARO4G128T` → **won't compile**. The FaPhase seam must be re-cut on the CURRENT body, not pasted. |
+| `DType` enum (dispatch.rs:137) | **DRIFT** — current has a `fused_fa3_hfq6` branch the prototype lacks. | independent feature divergence. The FaPhase seam must be re-cut on the CURRENT body, not pasted. |
 | `run_fa_layer_body` (qwen35.rs:11030) | **present but PRIVATE, NO `FaPhase` param** | `FaPhase` seam (proto enum at 12901) must be **re-introduced** on the current (drifted) body; make it `pub` |
 | `FaPhase` enum | **MISSING** | new |
 | `run_dn_layer_body` | **MISSING as standalone fn** (DeltaNet is inline in current forward) | prototype extracted it (`pub`, 13975). Must extract it on current base from the inline DeltaNet path. |
@@ -100,8 +100,7 @@ Verified against current source, not folklore:
 **THE crux stage.** The prototype split `run_fa_layer_body` into phases via a
 `FaPhase<'a> { Full, TpAttn{mask}, TpFfn, TpFfnShard }` enum and extracted
 `run_fa_ffn_body` / `run_fa_ffn_body_sharded`. On current base the body has
-**drifted** (dispatch-families migration + `fused_fa3_hfq6` branch + no PARO
-variants). **Do NOT paste the prototype body.** Re-cut the seam on the
+**drifted** (dispatch-families migration + `fused_fa3_hfq6` branch ). **Do NOT paste the prototype body.** Re-cut the seam on the
 current body.
 
 **Files**
@@ -115,7 +114,7 @@ current body.
 
 **API drift**
 - The body references current dispatch-family calls (e.g. `DispatchCtx`, `GemmFamily::run_key`) where it has migrated — the seam must thread these through, not the prototype's direct `gpu.fused_qkv_*` calls. **Read the current 11030 body end-to-end before cutting.**
-- `DType::PARO4G128T` branch from proto body → omit (current lacks it; current has `fused_fa3_hfq6` instead — keep current's branches).
+- Keep current's branches (e.g. `fused_fa3_hfq6`) rather than the prototype's.
 - attn-mask GpuTensor: proto `TpAttn{mask: Option<&GpuTensor>}` zeroes attn output outside local Q-heads — verify the current attn-out tensor name/layout matches.
 
 **Validation**
@@ -156,7 +155,7 @@ token argmax match. Use a dense + DeltaNet model (0.8B-class) that fits 2 cards.
 - MODIFY `qwen35.rs`: add `pub fn load_weights_tp` (proto 3517). Delegates to `load_weights` then row-slices `wq` (`wq_row_range`), col-gathers `wo` (`wo_col_range`), splits FFN gate/up (col) + down (row), frees the full buffers (+ AWQ sidecar via `free_full`).
 
 **API drift**
-- `load_weights` signature unchanged `(hfq, config, gpu)`. `WeightTensor`/`awq_scale`/`paro`/`free_tensor` byte-identical → clean.
+- `load_weights` signature unchanged `(hfq, config, gpu)`. `WeightTensor`/`awq_scale`/`free_tensor` byte-identical → clean.
 - `wo` col-gather is a per-row gather (non-contiguous) for row-major quant blobs — verify the current upload helpers expose a column-gather (or port the proto's slicing util). **Check whether proto added an upload-cols helper to rdna-compute** (the row-slice is contiguous and cheap; the col-gather is the load-bearing one).
 - AWQ sidecar: scale vector is length-K → slices with the **input** dim. For `wq` (row/output shard) the awq_scale (over K=input) is **replicated**, not sliced; for `wo`/`w_down` (input shard) the awq_scale **is** sliced. Confirm the proto handles this asymmetry correctly when porting.
 
@@ -285,8 +284,7 @@ Stages 1–2 land together (rccl_comms field couples them). 3a gates everything.
 
 1. **`run_fa_layer_body` re-seaming on the dispatch-migrated body (Stage 3a).**
    The current body routes through `hipfire_dispatch` (DispatchCtx, GemmFamily,
-   families/pipeline) that the prototype has none of; the prototype body also
-   carries a `PARO4G128T` branch current lacks, while current carries
+   families/pipeline) that the prototype has none of; current carries
    `fused_fa3_hfq6` proto lacks. The seam is a re-implementation. Breaking
    TP=1 byte-identity here silently corrupts the whole feature. **Guard:
    FaPhase::Full byte-identical via coherence-gate before touching TP.**

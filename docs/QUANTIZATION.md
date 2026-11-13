@@ -19,7 +19,6 @@ describes the math and wire contracts.
 | **HFQ** | none | INT asymmetric | G256 (G128 variants exist) | Dense Llama / Mistral / Gemma / plain Qwen |
 | **MQ (MagnumQuant)** | offline FWHT-256 | INT asymmetric (or Lloyd codebook) | G256 | Qwen 3.5+ hybrid path; FWHT baked into weights |
 | **HFP / MFP** | optional offline FWHT | OCP E2M1 FP4 | G32 rows | RDNA-oriented FP4; MFP = HFP + FWHT |
-| **PARO** | pairwise Givens | AWQ W4 | G128 or G64 (`ParoQ4G128` / `ParoQ4G64`, from `group_size`) | Imported ParoQuant/AWQ probe path |
 | **Q8F16** | none | INT8 + f16 scale | G32 | Embeddings, routers, precision-sensitive 2D |
 
 Production defaults for day-to-day use:
@@ -30,7 +29,7 @@ Production defaults for day-to-day use:
 | `mq4v1` / `mq4g256` / `magnum` | `MQ4G256` (qt 13) | 4 | 4.25 | 136 (8 hdr f32 scale+min + 128 data) | Legacy Magnum v1 only — not the `mq4` alias |
 | `mq6` / `.mq6` | `MQ6G256` (qt 15) | 6 | 6.25 | 200 | Qwen 3.5+ higher quality (v1 body) |
 | `mq6v2` … `mq2v2` | V2 family qt 47/48/49/50 | 6…2 | 6.25 / 5.25 / 3.25 / 2.25 | 200/168/104/72 | Dense Magnum V2 ladder bodies — see below |
-| `hf4` / `.hf4` | `HFQ4G256` (qt 6) | 4 | 4.25 | 136 | Dense GGUF default (**GGUF weight input deprecated since 0.4.0, removal in 0.5.0**); Llama-style dense |
+| `hf4` / `.hf4` | `HFQ4G256` (qt 6) | 4 | 4.25 | 136 | Dense Llama-style models |
 | `hf6` / `.hf6` | `HFQ6G256` (qt 8) | 6 | 6.25 | 200 | Dense, higher quality |
 | `mq3` / `.mq3` | `MQ3G256` (qt 17) | 3 | 3.25 | 104 (8 hdr + 96 data) | Sub-4-bit bandwidth; quality-sensitive |
 | `q8` | `Q8F16` (qt 3) | 8 | 8.5 | **34 B / 32 el** (2 B f16 scale + 32×i8; 272 B / 256 el) | Reference / debug / protected tensors |
@@ -144,6 +143,19 @@ Flash-Next bench fixture”) and the registry rows in [MODELS.md](MODELS.md).
   `crates/hipfire-arch-raon/src/precision.rs`; `f16` is the kill switch, `<site>=f16` a
   per-site one).
 
+  **MQ8 attention variant (`hipfire-quantize --raon-attn-mq8`, opt-in, default byte-unchanged).**
+  The 125 attention-class projections with K % 256 == 0 (RDA q/k/v/g/o, MLA
+  q_a/kv_a/kv_b/g/o) are written as MQ8G256 (qt 14: FWHT256 with the MQ sign seeds 42/1042,
+  one f16 scale per 256, int8 codes; recipe `raon-mq4v2-symmetric-qt44-experts-mq8g256-attn/v1`)
+  from the BF16 source; `q_b` (K 576), the RDA gate heads (`f_a/f_b/b_proj/rda_w_proj`), the
+  FFN and `lm_head` keep their classes. The model file selects the route (no environment
+  flag): the loader repacks each qt 14 tensor to an aligned scale-plane + code-plane layout
+  (same VRAM), and prefill (int8 GEMM), decode (GEMV) and row-exact verify (per-row bit-identical
+  to decode) all run W8A8 on the FWHT256-rotated, once-quantized activation, so the
+  `HIPFIRE_RAON_PREFILL_PRECISION` table does not apply to those tensors. Supported on
+  gfx1200/gfx1201/gfx1100/gfx1151 only; other devices refuse the file at load and need the
+  default Q8F16 build.
+
 **Historical sweep vs current registry.** The `mq4-xt` / `mq4` / `mq4 pro` ladder
 cells in [ladder.md](quant-formats/ladder.md) are the 2026-08 candidate sweep on
 dense Qwen3.8-27B (a measurement grid, not registry cards). The shipped XTS
@@ -156,8 +168,8 @@ the current-quality-methodology note for shipped XTS trunks.
 
 | Type | qt | Bytes/group | Stored bpw | Notes |
 |---|---:|---|---:|---|
-| `TQ2G128` | 40 | 34 per 128 | 2.125 | PrismML Bonsai ternary — passthrough; `[fp16 d][32 B 2-bit codes]` |
-| `BQ1G128` | 41 | 18 per 128 | 1.125 | PrismML Bonsai 1-bit — passthrough; `[fp16 d][16 B sign bits]`; won qt=41 adjudication 2026-08-18 |
+| `TQ2G128` | 40 | 34 per 128 | 2.125 | PrismML Bonsai ternary; `[fp16 d][32 B 2-bit codes]`. Read-only: `hipfire-quantize` stopped producing it when GGUF weight input was removed in 0.5.0 |
+| `BQ1G128` | 41 | 18 per 128 | 1.125 | PrismML Bonsai 1-bit; `[fp16 d][16 B sign bits]`; won qt=41 adjudication 2026-08-18. Read-only: `hipfire-quantize` stopped producing it when GGUF weight input was removed in 0.5.0 |
 
 ### Sub-4-bit and research formats (v1 / Lloyd / FP4)
 
@@ -179,7 +191,7 @@ codebook, so their per-weight cost depends on K.
 | `MFP4G32` | 24 | 17 per 32 | 4.25 + 128 / K | **shipped / ref-pinned** drop-in MQ4-class FP4+FWHT |
 | `MFP4G32Lloyd` / `MFP4G32P` / `MFP4G32E8` / SoA / `MFP3G32E8` / `MFP2G32E8` | 32–37 | 17 / 17 / 17 / 17 / 13 / 9 per 32 | 4.25 / 4.25 / 4.25 / ≈4.25 / 3.25 / 2.25 (each + row overhead) | **shipped / ref-pinned** encoders + selective kernels; experimental opt-in qualifier; MoE cold-tier recipes — not CLI defaults. The SoA layout (qt 35) pads its scale block to 16 B per row |
 | `MFP4G32E8G128` | 42 | 17 per 32 | 4.25 + 128 / K | arch-loaded (Qwen4 expert load path): wire layout byte-identical to qt 34, but the encoder rotates in 128-wide segments (sign seeds 43 / 1043) because a 256-wide segment cannot tile K = 640; the rotation width is not in the bytes |
-| `PARO4G128` / `PARO4G128T` | 28 / 29 | Paro buffers | varies | **shipped / ref-pinned** load/probe path for ParoQuant imports |
+| reserved (formerly `PARO4G128` / `PARO4G128T`) | 28 / 29 | — | — | **reserved** — removed in 0.5.0; files carrying these ids are refused |
 | `MQ2G256V2` | 50 | 72 | 2.25 | **wire/runtime supported; product quality-rejected** — see V2 family section |
 
 **Historical quality note (not a live admission):** uniform MQ3/MQ2 local
@@ -200,10 +212,7 @@ lockstep (`crates/hipfire-runtime/src/llama.rs`,
 `crates/hipfire-arch-qwen35/src/qwen35.rs`).
 
 **Always batch-eligible (both owners):** `MQ4G256`, `HFQ4G256`, `MQ6G256`,
-`HFQ6G256`, `Q8_0`. (qwen35 also treats `ParoQ4G128` / `F32` as always-ok for
-the PARO probe path; llama admits `ParoQ4G64`, whose prefill rotates each
-projection's rows and runs `gemm_hfq4g64`, while llama `ParoQ4G128` stays
-per-token.)
+`HFQ6G256`, `Q8_0`. (qwen35 also treats `F32` as always-ok.)
 
 | DType | `llama::is_batchable_la` | `qwen35::is_batchable_la` |
 |---|---|---|
@@ -247,9 +256,7 @@ On Llama-style dense models the math still cancels, but the rotation adds
 `rotate_x_mq` cost on the activation side. Recipe guidance: **MQ for Qwen
 3.5+; HFQ for other dense families** — treat this as a starting point, not a
 guarantee: whether MQ helps or HFQ suffices is model-specific and needs
-validation per model. CLI defaults follow the guidance (`safetensors` → `mq4`;
-GGUF → `hf4`, GGUF weight input is **deprecated since 0.4.0, removal in
-0.5.0**; see [QUANTIZE.md](QUANTIZE.md)).
+validation per model. The CLI default is `mq4` (see [QUANTIZE.md](QUANTIZE.md)); GGUF weight input was removed in 0.5.0.
 
 ## Header layout (HFQ/MQ G256 affine blocks)
 
@@ -288,10 +295,8 @@ already attention-weighted. Split modes store **V as Q8** (or Lloyd V via
 | Mode | K | V | Notes |
 |---|---|---|---|
 | `q8` | Q8_0 (G32) | Q8_0 | `auto` default wherever native fp8 does not apply (gfx1100, gfx1151, …); DFlash-safe |
-| `fp8` | FP8 E4M3 | FP8 E4M3 | Qwen-only native pair; `auto` default on native-eligible exact gfx1201 single GPU (H24/Hkv4/D256 dense or H16/Hkv2/D256 A3B, D256, no adaptive/CASK/slots/TP/PP split). Native `bf16` stays H24 dense-only |
+| `fp8` | FP8 E4M3 | FP8 E4M3 | Qwen-only native pair; `auto` default on native-eligible exact gfx1201 single GPU (H24/Hkv4/D256 dense or H16/Hkv2/D256 A3B, D256, no adaptive/slots/TP/PP split). Native `bf16` stays H24 dense-only |
 | `fwht4` / `fwht3` / `fwht2` | FWHT-rotated K at 4/3/2-bit | Q8_0 | Optional headroom modes (Qwen3.5 family, any arch), not a default. Same byte layout family as legacy asym; FWHT basis matches MQ drafts |
-| `asym4` / `asym3` / `asym2`, `turbo` / `turbo2` / `turbo3` / `turbo4` | **Deprecated spellings** (since 0.4.0, removal in 0.5.0; spell `fwhtN` or `q8`) | Q8_0 | On Qwen they are aliases that resolve to the supported FWHT K path: `asymN`/`turboN` → `fwhtN`, `turbo` → `fwht3`. Only the llama HFQ loader still maps bare `asym3`/`asym4`/`turbo4` to the legacy Givens constructors (deprecated route, removal in 0.5.0) |
-| `legacy-asym4` / `legacy-asym3` / `legacy-asym2` | Givens + Lloyd-Max K | Q8_0 | **Deprecated since 0.4.0, removal in 0.5.0** (fwht3 supersedes Givens asym KV); Qwen `--kv-k` only |
 
 **Default resolution** (`load_params` in `crates/hipfire-cli/src/main.rs`,
 then the load site's policy in `crates/hipfire-runtime/src/kv_mode.rs`):
@@ -302,7 +307,7 @@ then the load site's policy in `crates/hipfire-runtime/src/kv_mode.rs`):
    card's value is not `q8` (a `q8` card value is left to `auto`)
 4. Else `auto`, resolved by the architecture: Qwen native **fp8** on
    native-eligible exact gfx1201 single GPU (H24/Hkv4/D256 dense or
-   H16/Hkv2/D256 A3B; no adaptive/CASK/slots/TP/PP split), **q8** on
+   H16/Hkv2/D256 A3B; no adaptive/slots/TP/PP split), **q8** on
    every other Qwen load (gfx1100, gfx1151, …); other families keep
    their own default (Maple bf16, DeepSeek V4 f32, others q8)
 
@@ -376,15 +381,15 @@ Source of truth: [`quant-formats/qt-register.txt`](quant-formats/qt-register.txt
 | 23 | *(reserved)* | Former HFP4G64 ablation slot — still reserved, not built |
 | 24 | MFP4G32 | HFP4 + offline FWHT — **shipped / ref-pinned** |
 | 25–27 | *(reserved)* | Former MX/NV/HFP8 interop slots — still reserved, not built |
-| 28 | PARO4G128 | ParoQuant native — **shipped / ref-pinned** load path |
-| 29 | PARO4G128T | Engine-tiled Paro — **reassigned** from former `MFP4G32R` online-R reservation |
+| 28 | reserved (formerly PARO4G128, removed in 0.5.0; files carrying this id are refused) | **reserved** |
+| 29 | reserved (formerly PARO4G128T, removed in 0.5.0; files carrying this id are refused) | **reserved** |
 | 30 | MQ4G256Lloyd | Research MQ Lloyd — **reassigned** (was 21 pre-renumber off HFP4) |
 | 31 | MQ5G256 | 5-bit MQ v1 — **shipped / ref-pinned** encoder |
 | 32–37 | MFP4Lloyd / MFP4P / E8 / SoA / MFP3E8 / MFP2E8 | **shipped / ref-pinned** encoders + selective kernels; experimental opt-in |
 | 38 | MQ2G256GL | Magnum GL 2-bit — passthrough |
 | 39 | MQ3G256GL | Magnum GL 3-bit — passthrough |
-| 40 | TQ2G128 | Bonsai ternary — passthrough |
-| 41 | BQ1G128 | Bonsai 1-bit — passthrough |
+| 40 | TQ2G128 | Bonsai ternary — passthrough (no longer produced by `hipfire-quantize`) |
+| 41 | BQ1G128 | Bonsai 1-bit — passthrough (no longer produced by `hipfire-quantize`) |
 | 42 | MFP4G32E8G128 | mfp4-E8 with a 128-wide FWHT rotation group — arch-loaded (Qwen4 expert load path); wire layout byte-identical to qt 34 (16 B header + (K/32) × 17 B), 4.25 bpw + 128 / K; split from qt 34 because its 256-wide segments cannot tile K = 640 |
 | 44 | MQ4G256V2 | **Default `mq4` body** — dual-fp16 per-128 header, 136 B (4.25 bpw) |
 | 45 | MQ4CG256 | MQ4 v1.5 pad — 136 B |
@@ -405,8 +410,8 @@ Source of truth: [`quant-formats/qt-register.txt`](quant-formats/qt-register.txt
 
 **Never-reuse reserved wire IDs:** 23 and 25–27 (deliberately unassigned). qt 54 is
 held in the register with disposition `reserved` for the Qwen4 I64 metadata
-record described above; it is not an encoded weight type. IDs **22, 29, and 30
-were reassigned** (TidI32, PARO4G128T, MQ4G256Lloyd). qt 42 and 53 are now live
+record described above; it is not an encoded weight type. IDs **22 and 30
+were reassigned** (TidI32, MQ4G256Lloyd); 28 and 29 are reserved (formerly PARO4G128/PARO4G128T, removed in 0.5.0; files carrying these ids are refused). qt 42 and 53 are now live
 rows (above); qt **43 and 46** have no register row (43 is burned by the retired
 SEL codebook, 46 is the design-only hierarchical `mq4_k`). Do not invent slots —
 edit `qt-register.txt` to claim a number.
@@ -538,30 +543,6 @@ E8P cells (K2, K1, stage) hold only while `SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDE
 per-arch artifact receipts flags gate the load only. W2 and gfx1100 W3 have no kernel. Stage
 defaults (gfx1201 always on and 2048 rows; narrow-link policy elsewhere; the gfx1100 8192-row
 narrow-link chunk) are `stage_policy` metadata read together with the measured link predicate.
-
-### PARO4G128 probe payload
-
-`quant_type=28` is **not** row-major HFQ4/MQ4. Each tensor stores ParoQuant
-buffers in order:
-
-```
-qweight        int32 [K, M/8]
-qzeros         int32 [K/128, M/8]
-scales         f16   [K/128, M]
-pairs          int16 [8, K]
-theta          f16   [8, K/2]
-channel_scales f16   [K]
-```
-
-Runtime contract:
-
-```
-x_rot = rotate(x, pairs, theta, channel_scales)
-y     = awq_w4_gemv(x_rot, qweight, qzeros, scales)
-```
-
-Verify imports with `python3 scripts/astrea.py paro-oracle --source PARO_SAFE_DIR
---hfq MODEL.hfq --module MODULE --pretty` before quality or perf claims.
 
 ## Why a custom format
 

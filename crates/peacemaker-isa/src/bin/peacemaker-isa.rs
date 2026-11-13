@@ -116,6 +116,8 @@ const USAGE: &str = "usage: peacemaker-isa emit --kernel fold_magic --arch gfx12
        peacemaker-isa emit --kernel qsa_select --epi score|score32|score-bf16|score-bf16-rows32|select|all|bf16 --arch gfx1151 --out FILE --proof FILE
        peacemaker-isa emit --kernel spec_sampling_rows_pm|spec_accept_pm --arch gfx1151|gfx1201 --out FILE --proof FILE
        peacemaker-isa emit --kernel qwen4_ep_owner_assign_pm --arch gfx1201 --out FILE --proof FILE
+       peacemaker-isa emit --kernel qwen4_ep_owner_assign_pinned_pm --arch gfx1201 --out FILE --proof FILE
+       peacemaker-isa emit --kernel argmax_pair_merge_pm|topk8_partial_blocks_pm --arch gfx1201 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape FILE.shape.json] [--m7 FILE.m7.json]
        peacemaker-isa emit --kernel qwen4_mq6_x4 [--epi w4|w8|all] --arch gfx1201 --out FILE --proof FILE
        peacemaker-isa emit --kernel qwen4_mq6_x4_gfx11 [--epi w4|w8|w4_bf16out|w8_bf16out|w8_regions|w8_hcw|all] --arch gfx1151 --out FILE --proof FILE
        peacemaker-isa emit --kernel qwen4_mq4_x4_gfx11 [--epi w4|w8|w4_bf16out|w8_bf16out|w8_regions|w8_hcw|all] --arch gfx1151 --out FILE --proof FILE
@@ -136,6 +138,8 @@ const NATIVE_USAGE: &str = "       emit options: [--co FILE] [--bundle FILE [--h
           Q8 k2560 single accepts K>1536 divisible32, x2 only K2560; k320 and small-wide use the actual four-chain singleton)
        peacemaker-isa emit --kernel lane_rows_mq6_gfx1201|lane_rows_bf16_gfx1201 [--epi all] --arch gfx1201 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]
          (lane_rows_mq6_pm_gfx1201 / lane_rows_bf16_pm_gfx1201: ten unchanged narrow exports then two t8 exports)
+       peacemaker-isa emit --kernel hc8_wmma_gfx1201 [--epi all|priority] --arch gfx1201 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]
+         (hc8_wmma_pm_gfx1201: 80 hc8_gemm_{e4m3|i8}_mw{MW}_kw{KW}_n{NT}_{set|act} + hc8_dequant_{bf16|f16} + hc8_read_up_e4m3_n{1..4} = 86 exports for `all`; `priority` = e4m3 mw1kw16 and mw4kw1 n1 set/act only)
        peacemaker-isa emit --kernel mq4_rows_x4 [--epi entry|t8|all] --arch gfx1151|gfx1201|gfx1100 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]
          (mq4_rows_x4_pm_<arch>: unchanged narrow plus t8 on gfx1151/gfx1201; gfx1100 has only the actual scalar-DAG t8 export, no narrow entry; no r16/r32 exports)
        peacemaker-isa emit --kernel qwen4_bf16_rows_wide [--epi t8|k4_t8|all] --arch gfx1151|gfx1100 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]
@@ -147,6 +151,9 @@ const NATIVE_USAGE: &str = "       emit options: [--co FILE] [--bundle FILE [--h
        peacemaker-isa emit --kernel mq_i4_moe_gemv_mq4only [--epi mq4sym_<kind>[_t8]|all] --arch gfx1100 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]
          (artifact stem mq_i4_moe_gemv_mq4only_pm_gfx1100, internal module mq_i4_moe_gemv_pm_gfx1100:
           two genuine MQ4 narrow exports then their two t8 exports; the retired mixed W2 image is not emitted)
+       peacemaker-isa emit --kernel mq_i4_moe_gemv_mq3only [--epi mq3i4_<kind>[_t8]|all] --arch gfx1100 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]
+         (artifact stem mq_i4_moe_gemv_mq3only_pm_gfx1100, internal module mq_i4_moe_gemv_mq3_pm_gfx1100:
+          two W3 (MQ3-I4 planar) narrow exports then their two t8 exports; lossy opt-in tier, emission is not codec admission)
        peacemaker-isa emit --kernel mq_i4_moe_gemv_cn [--epi <codec>_<kind>[_t8]|all] --arch gfx1151 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]
          (mq_i4_moe_gemv_cn_pm_gfx1151: four unchanged narrow plus four t8 exports)
        peacemaker-isa emit --kernel e8p_i4_moe_gemv [--epi r256_gate_up[_t8]|r128_down[_t8]|all] --arch gfx1151|gfx1201|gfx1100 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]
@@ -164,6 +171,7 @@ const NATIVE_USAGE: &str = "       emit options: [--co FILE] [--bundle FILE [--h
          (experimental DET dense F16 WMMA GEMM; no --shape; M7 requires --features toolchain)";
 const FA_PREFILL_USAGE:&str="       peacemaker-isa emit --kernel fa_prefill_pm --arch gfx1201 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]\n         (H16/KV2/D256 Q8_0 FA2-GQA twin: one module, exports attention_fa2_q_preconvert_pm_gfx1201 then attention_q8_0_fa2_gqa_pm_gfx1201; --shape/--m7 require --co and a --features toolchain build; --shape writes DIR/fa_prefill_pm.gfx1201.{preconvert,direct}.contract.json, --m7 a symbol-keyed receipt map)";
 const FA_PREFILL_FP8_USAGE:&str="       peacemaker-isa emit --kernel fa_prefill_fp8_pm --arch gfx1201 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]\n         (H16/KV2/D256 native-fp8 E4M3 FA2-GQA twin: one module, ONE export attention_fp8_e4m3_fa2_gqa_f16_pm_gfx1201 (the Q preconvert/qprep stay in the Q8 and F5 modules); --shape/--m7 require --co and a --features toolchain build; --shape writes DIR/fa_prefill_fp8_pm.gfx1201.direct.contract.json, --m7 a symbol-keyed receipt map)";
+const FA_QRESIDENT_USAGE:&str="       peacemaker-isa emit --kernel fa_qresident_a3b_pm --arch gfx1201 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]\n         (H16/KV2/D256 register-resident-Q native-fp8 FA2-GQA twin of attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a3b_gfx1201: one module, two exports ..._a3b_pm_gfx1201 and ..._range_a3b_pm_gfx1201; --shape/--m7 require --co and a --features toolchain build; --shape writes DIR/fa_qresident_a3b_pm.gfx1201.{direct,range}.contract.json, --m7 a symbol-keyed receipt map)";
 const FA_QPREP_USAGE:&str="       peacemaker-isa emit --kernel fa_qprep_pm --arch gfx1201 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]\n         (H16/KV2/D256 rotary-64 Q prep: one module, one export attention_fa2_qprep_pm_gfx1201; --shape/--m7 require --co and a --features toolchain build; --shape writes DIR/fa_qprep_pm.gfx1201.contract.json, --m7 a symbol-keyed receipt map)";
 const IU4_C8_USAGE:&str="       peacemaker-isa emit --kernel iu4_c8_producer_pm --arch gfx1201 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]\n         (exact C8 IU4 producers of the A3B F3 route: one module, four exports iu4_c8_rotate_pm_gfx1201, iu4_c8_rmsnorm_rotate_pm_gfx1201, iu4_c8_sigmoid_rotate_pm_gfx1201 and iu4_c8_rmsnorm_out_rotate_pm_gfx1201; --shape/--m7 require --co and a --features toolchain build; --shape writes DIR/iu4_c8_producer_pm.gfx1201.{rotate,norm,sigmoid_rotate,norm_out}.contract.json, --m7 a symbol-keyed receipt map)";
 const GDN_CHUNK_PREP_USAGE:&str="       peacemaker-isa emit --kernel gdn_chunk_prep_pm --arch gfx1201 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]\n         (HK16/HV32/HD128 GDN chunk prep: one module, one export gdn_chunk_prep_pm_gfx1201; --shape/--m7 require --co and a --features toolchain build; --shape writes DIR/gdn_chunk_prep_pm.gfx1201.contract.json, --m7 a symbol-keyed receipt map)";
@@ -344,6 +352,25 @@ fn qwen4_moe_sym_w3_nt4(epi: &str, arch: Arch) -> Result<(String, Vec<u8>), Stri
         serde_json::to_vec_pretty(&e.proof).map_err(|e| e.to_string())?,
     ))
 }
+/// F1 drop-zero planar MQ4 (`WeightCodec::Mq4SymPlanar`) grouped IU4 MoE entries, gfx1201 NT4/NT8: `--epi all` (default) is the
+/// `qwen4_moe_iu4_sym_p_pm_gfx1201` module; `gate_up_ntN`/`down_ntN` one entry.
+fn qwen4_moe_sym_p(epi: &str, arch: Arch) -> Result<(String, Vec<u8>), String> {
+    use peacemaker_isa::kernels::qwen4_moe_sym::{self, Spec, WeightCodec};
+    if epi == "all" {
+        let (_, text, proof) = qwen4_moe_sym::emit_module_codec(arch, WeightCodec::Mq4SymPlanar)?;
+        return Ok((
+            text,
+            serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?,
+        ));
+    }
+    let mut spec = Spec::from_epi(epi, arch)?;
+    spec.codec = WeightCodec::Mq4SymPlanar;
+    let e = qwen4_moe_sym::emit(spec)?;
+    Ok((
+        e.s_text,
+        serde_json::to_vec_pretty(&e.proof).map_err(|e| e.to_string())?,
+    ))
+}
 /// E8P-I4 (`WeightCodec::E8pI4`) grouped IU4 MoE entries, gfx1201 NT1 only: `--epi all` (default) is the
 /// `qwen4_moe_iu4_sym_e8p_pm_gfx1201` module (both entries plus their `_acc` qualification entries);
 /// `gate_up`/`down` one shipped-shape entry, `gate_up_acc`/`down_acc` one F32 qualification entry.
@@ -478,6 +505,39 @@ fn qwen4_ep_owner_assign(arch: Arch) -> Result<(String, Vec<u8>), String> {
         serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?,
     ))
 }
+/// The PM pinned-owner assignment kernel of the Flash-Next EP exchange (`qwen4_ep_owner_assign_pinned_pm_gfx1201`), one symbol per module.
+fn qwen4_ep_owner_assign_pinned(arch: Arch) -> Result<(String, Vec<u8>), String> {
+    let (_, text, proof) =
+        peacemaker_isa::kernels::qwen4_ep_owner_assign_pinned_pm::emit_module(arch)?;
+    Ok((
+        text,
+        serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?,
+    ))
+}
+/// The PM row argmax twin of `argmax_f32_batched_regrid` (`argmax_f32_batched_regrid_pm_gfx1201`), one symbol per module.
+fn argmax_regrid(arch: Arch) -> Result<(String, Vec<u8>), String> {
+    let (_, text, proof) = peacemaker_isa::kernels::argmax_regrid_pm::emit_module(arch)?;
+    Ok((
+        text,
+        serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?,
+    ))
+}
+/// The PM finite-value argmax merge for two vocabulary shards.
+fn argmax_pair_merge(arch: Arch) -> Result<(String, Vec<u8>), String> {
+    let (_, text, proof) = peacemaker_isa::kernels::argmax_pair_merge_pm::emit_module(arch)?;
+    Ok((
+        text,
+        serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?,
+    ))
+}
+/// The PM top-eight partial selection for a vocabulary block subrange.
+fn topk8_partial_blocks(arch: Arch) -> Result<(String, Vec<u8>), String> {
+    let (_, text, proof) = peacemaker_isa::kernels::topk8_partial_blocks_pm::emit_module(arch)?;
+    Ok((
+        text,
+        serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?,
+    ))
+}
 /// The PM tile-ownership mask of the owner-routed EP chunk MoE (`ep_tile_mask_pm_gfx1100` / `ep_tile_mask_pm_gfx1201`), one symbol per module.
 fn ep_tile_mask(arch: Arch) -> Result<(String, Vec<u8>), String> {
     let (_, text, proof) = peacemaker_isa::kernels::ep_tile_mask::emit_module(arch)?;
@@ -543,6 +603,19 @@ fn mq6_i8_gemm(epi: &str, tile: Option<&str>, arch: Arch) -> Result<(String, Vec
 /// Grouped-position down plane (gfx1201): the grouped producer plus the down NT4/NT8 twins as one module.
 fn qwen4_moe_down_gp(arch: Arch) -> Result<(String, Vec<u8>), String> {
     let (_, text, proof) = peacemaker_isa::kernels::qwen4_moe_down_gp::emit_module(arch)?;
+    Ok((
+        text,
+        serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?,
+    ))
+}
+/// F1 drop-zero planar grouped-position down plane (gfx1201): the same producer plus the planar down NT4/NT8 twins, module
+/// `qwen4_moe_down_gp_p_pm_gfx1201`.
+fn qwen4_moe_down_gp_planar(arch: Arch) -> Result<(String, Vec<u8>), String> {
+    use peacemaker_isa::kernels::qwen4_moe_sym::WeightCodec;
+    let (_, text, proof) = peacemaker_isa::kernels::qwen4_moe_down_gp::emit_module_codec(
+        arch,
+        WeightCodec::Mq4SymPlanar,
+    )?;
     Ok((
         text,
         serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?,
@@ -815,6 +888,12 @@ fn row_image(kernel: &str, epi: &str, arch: Arch) -> Result<Option<RowImage>, St
                 kernels::lane_rows_bf16_gfx1201::MODULE.into()
             })
         }
+        "hc8_wmma_gfx1201" => {
+            if arch != Arch::Gfx1201 || !matches!(epi, "all" | "priority") {
+                return Err("hc8_wmma_gfx1201 requires --arch gfx1201 --epi all|priority".into());
+            }
+            RowImage::new(kernels::hc8_wmma_gfx1201::MODULE.into())
+        }
         "mq4_rows_x4" => RowImage::new(kernels::mq4_rows_x4::Spec::module(arch)),
         "qwen4_bf16_rows_wide" => RowImage::new(kernels::qwen4_bf16_rows_wide::module(arch)),
         "legacy_mq4_rowtiles" => {
@@ -833,6 +912,12 @@ fn row_image(kernel: &str, epi: &str, arch: Arch) -> Result<Option<RowImage>, St
             // Preserve the landing object's internal module ID; its dedicated
             // filename and MQ4-only export set identify the production image.
             RowImage::new(kernels::mq_i4_moe_gemv_gfx1100::Spec::module(arch))
+        }
+        "mq_i4_moe_gemv_mq3only" => {
+            if arch != Arch::Gfx1100 {
+                return Err("mq_i4_moe_gemv_mq3only is gfx1100 only".into());
+            }
+            RowImage::new(kernels::mq_i4_moe_gemv_gfx1100::Spec::module_mq3(arch))
         }
         "mq_i4_moe_gemv" => RowImage::new(kernels::mq_i4_moe_gemv::Spec::module(arch)),
         "mq_i4_moe_gemv_cn" => {
@@ -952,6 +1037,66 @@ fn row_image(kernel: &str, epi: &str, arch: Arch) -> Result<Option<RowImage>, St
                 )?;
             }
         }
+        "hc8_wmma_gfx1201" => {
+            use kernels::hc8_wmma_gfx1201 as k;
+            let geos = if epi == "priority" {
+                k::priority_geos()
+            } else {
+                k::all_geos()
+            };
+            let (entries, _, _) = k::emit_geos(&geos)?;
+            for (g, e) in geos.iter().zip(entries) {
+                let grid = format!("M/{}", 16 * g.mw);
+                let contract = json!({
+                    "shape_domain": {
+                        "M": format!("M % {} == 0", 16 * g.mw),
+                        "K": format!("K % {} == 0 && M*K < 2^32", 32 * g.kw),
+                    },
+                    "kernarg": "q@0 s@8 x@16 y@24 u64; M@32 K@36 rows@40 u32; act_scale@44 f32",
+                    "arithmetic_recipe": "hc8 W8A16 BF16 WMMA; K split per wave, KW partials folded ascending in LDS; one v_mul by s[m]; act = lane_rows hc_act DAG",
+                });
+                image.push(
+                    e,
+                    [grid.as_str(), "1", "1"],
+                    rows(g.max_rows() as u8),
+                    contract,
+                )?;
+            }
+            if epi == "all" {
+                for (out, e) in k::DEQUANT_OUTS.into_iter().zip(k::emit_dequants()?) {
+                    let contract = json!({
+                        "shape_domain": {
+                            "M": "M % 16 == 0",
+                            "K": "K % 32 == 0 && M*K < 2^31",
+                        },
+                        "kernarg": "q@0 s@8 out@16 u64; M@24 K@28 u32",
+                        "arithmetic_recipe": format!(
+                            "hc8 prefill dequant: out[r*K+c] = {}(decode_e4m3(q_swizzled) * s[r]), f32 product exact (power-of-two s); one thread per element, lanes >= M*K masked off; no row domain",
+                            match out {
+                                k::DequantOut::Bf16 => "bf16 (high 16 bits of the exactly-BF16 f32)",
+                                k::DequantOut::F16 => "f16 RNE (v_cvt_f16_f32, gradual subnormals, overflow to inf)",
+                            }
+                        ),
+                    });
+                    image.push(e, ["ceil(M*K/256)", "1", "1"], empty(), contract)?;
+                }
+                for (nt, e) in (1..=4u32).zip(k::emit_read_ups()?) {
+                    image.push(
+                        e,
+                        ["hidden/16", "1", "1"],
+                        rows((16 * nt) as u8),
+                        json!({
+                            "shape_domain": {
+                                "hidden": "hidden % 16 == 0",
+                                "low_rank": "low_rank % 32 == 0 && 4*hidden*low_rank < 2^32",
+                            },
+                            "kernarg": "q@0 s@8 low@16 normalized@24 mixed@32 u64; hidden@40 low_rank@44 rows@48 pad@52 u32",
+                            "arithmetic_recipe": "hc8 full-K E4M3 BF16 WMMA then exact projected-read sigmoid/round/product; four branch terms folded from +0 in branch order 0..3; full divide by four and BF16 round",
+                        }),
+                    )?;
+                }
+            }
+        }
         "mq4_rows_x4" => {
             use kernels::mq4_rows_x4 as k;
             if epi != "all" && epi != "entry" && epi != "t8" {
@@ -1006,6 +1151,31 @@ fn row_image(kernel: &str, epi: &str, arch: Arch) -> Result<Option<RowImage>, St
                     .into_iter()
                     .filter(|s| s.codec == k::Codec::Mq4Sym)
                 {
+                    if selected(&spec.tag(), tiled) {
+                        let e = if tiled {
+                            k::emit_rowtiles(spec)?
+                        } else {
+                            k::emit(spec)?
+                        };
+                        let contract = k::contract(spec, &e);
+                        image.push(
+                            e,
+                            if tiled {
+                                ["ceil(M/8)", "80", "ceil(C/8)"]
+                            } else {
+                                ["M", "U", "1"]
+                            },
+                            slots(tiled),
+                            contract,
+                        )?;
+                    }
+                }
+            }
+        }
+        "mq_i4_moe_gemv_mq3only" => {
+            use kernels::mq_i4_moe_gemv_gfx1100 as k;
+            for tiled in [false, true] {
+                for spec in k::mq3_specs(arch) {
                     if selected(&spec.tag(), tiled) {
                         let e = if tiled {
                             k::emit_rowtiles(spec)?
@@ -1649,6 +1819,18 @@ fn fa_prefill_fp8_pm(arch: Arch) -> Result<(String, Vec<u8>), String> {
         serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?,
     ))
 }
+/// gfx1201 A3B register-resident-Q native-fp8 FA2-GQA twin: one module, the direct and range exports. `--co`/`--bundle`
+/// link it, `--shape DIR` writes both contracts, `--m7 FILE` the symbol-keyed receipt map.
+fn fa_qresident_a3b_pm(arch: Arch) -> Result<(String, Vec<u8>), String> {
+    let (_, text, proof) = peacemaker_isa::kernels::fa_qresident::emit_module(
+        arch,
+        &peacemaker_isa::kernels::fa_qresident::FaQresSpec::A3B,
+    )?;
+    Ok((
+        text,
+        serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?,
+    ))
+}
 /// gfx1201 A3B FA2-GQA Q prep (one-wave Q RMSNorm + gate passthrough + captured-angle half-split RoPE + f16 RNE
 /// Q16): its own single-export module, separate from the `fa_prefill_pm` bundle. `--co`/`--bundle` link it,
 /// `--shape DIR` writes the contract and `--m7 FILE` the symbol-keyed receipt map.
@@ -1689,7 +1871,7 @@ fn run() -> Result<(), String> {
         return region_import(args);
     }
     if command.as_deref() != Some("emit") {
-        return Err(format!("{USAGE}\n{NATIVE_USAGE}\n{FA_PREFILL_USAGE}\n{FA_PREFILL_FP8_USAGE}\n{FA_QPREP_USAGE}\n{IU4_C8_USAGE}\n{GDN_CHUNK_PREP_USAGE}"));
+        return Err(format!("{USAGE}\n{NATIVE_USAGE}\n{FA_PREFILL_USAGE}\n{FA_PREFILL_FP8_USAGE}\n{FA_QPREP_USAGE}\n{FA_QRESIDENT_USAGE}\n{IU4_C8_USAGE}\n{GDN_CHUNK_PREP_USAGE}"));
     }
     let mut kernel = None;
     let mut arch = None;
@@ -1777,6 +1959,7 @@ fn run() -> Result<(), String> {
             "qwen4_moe_sym_w3" => qwen4_moe_sym_w3(epi.as_deref().unwrap_or("all"), arch)?,
             "qwen4_moe_sym_w3_nt4" => qwen4_moe_sym_w3_nt4(epi.as_deref().unwrap_or("all"), arch)?,
             "qwen4_moe_sym_e8p" => qwen4_moe_sym_e8p(epi.as_deref().unwrap_or("all"), arch)?,
+            "qwen4_moe_sym_p" => qwen4_moe_sym_p(epi.as_deref().unwrap_or("all"), arch)?,
             "qwen4_moe_sym_gfx11_e8p" => {
                 qwen4_moe_sym_gfx11_e8p(epi.as_deref().unwrap_or("all"), arch)?
             }
@@ -1786,9 +1969,14 @@ fn run() -> Result<(), String> {
             "spec_sampling_rows_pm" => spec_sampling_rows(arch)?,
             "spec_accept_pm" => spec_accept(arch)?,
             "qwen4_ep_owner_assign_pm" => qwen4_ep_owner_assign(arch)?,
+            "qwen4_ep_owner_assign_pinned_pm" => qwen4_ep_owner_assign_pinned(arch)?,
+            "argmax_regrid_pm" => argmax_regrid(arch)?,
+            "argmax_pair_merge_pm" => argmax_pair_merge(arch)?,
+            "topk8_partial_blocks_pm" => topk8_partial_blocks(arch)?,
             "ep_tile_mask_pm" => ep_tile_mask(arch)?,
             "moe_slot_ops_pm" => moe_slot_ops(arch)?,
             "qwen4_moe_down_gp_pm" => qwen4_moe_down_gp(arch)?,
+            "qwen4_moe_down_gp_p_pm" => qwen4_moe_down_gp_planar(arch)?,
             "moe_slot_ops_v2_pm" => moe_slot_ops_v2(arch)?,
             "ep_gather_grouped_rows_by_tile_owner_pm" => ep_tile_pull(
                 peacemaker_isa::kernels::ep_gather_grouped_rows_by_tile_owner::Variant::Ep2,
@@ -1846,6 +2034,7 @@ fn run() -> Result<(), String> {
             "fa_prefill_pm" => fa_prefill_pm(arch)?,
             "fa_prefill_fp8_pm" => fa_prefill_fp8_pm(arch)?,
             "fa_qprep_pm" => fa_qprep_pm(arch)?,
+            "fa_qresident_a3b_pm" => fa_qresident_a3b_pm(arch)?,
             "iu4_c8_producer_pm" => iu4_c8_producer_pm(arch)?,
             "gdn_chunk_prep_pm" => gdn_chunk_prep_pm(arch)?,
             "mq4_fp8_verify" => mq4_fp8_verify(epi.as_deref().unwrap_or("all"), arch)?,
@@ -1863,6 +2052,7 @@ fn run() -> Result<(), String> {
     let fapm = kernel == "fa_prefill_pm";
     let fapm8 = kernel == "fa_prefill_fp8_pm";
     let fqp = kernel == "fa_qprep_pm";
+    let fqr = kernel == "fa_qresident_a3b_pm";
     let iu4c8 = kernel == "iu4_c8_producer_pm";
     let gcp = kernel == "gdn_chunk_prep_pm";
     let mq4f8 = kernel == "mq4_fp8_verify";
@@ -1876,7 +2066,11 @@ fn run() -> Result<(), String> {
     let spec_pm = kernel == "spec_sampling_rows_pm"
         || kernel == "spec_accept_pm"
         || kernel == "qwen4_ep_owner_assign_pm"
+        || kernel == "qwen4_ep_owner_assign_pinned_pm"
         || kernel == "ep_tile_mask_pm"
+        || kernel == "argmax_regrid_pm"
+        || kernel == "argmax_pair_merge_pm"
+        || kernel == "topk8_partial_blocks_pm"
         || kernel == "ep_gather_grouped_rows_by_tile_owner_pm"
         || kernel == "ep_gather_grouped_rows_by_tile_owner_n8_pm"
         || kernel == "moe_slot_ops_pm"
@@ -1888,6 +2082,7 @@ fn run() -> Result<(), String> {
         && !fapm
         && !fapm8
         && !fqp
+        && !fqr
         && !iu4c8
         && !gcp
         && !mq4f8
@@ -1900,7 +2095,7 @@ fn run() -> Result<(), String> {
         && !mtp_det
         && (shape.is_some() || m7.is_some())
     {
-        return Err("--shape/--m7 apply only to pm_decode_<module>, mq4_verify, fa_prefill_pm, fa_prefill_fp8_pm, fa_qprep_pm, iu4_c8_producer_pm, gdn_chunk_prep_pm, mq4_fp8_verify, mq_i4_rows, mq_i4_a4, moe_rotate_i4_pm, qwen4_lane_rows, spec_sampling_rows_pm, spec_accept_pm, qwen4_ep_owner_assign_pm, ep_tile_mask_pm, ep_gather_grouped_rows_by_tile_owner_pm, ep_gather_grouped_rows_by_tile_owner_n8_pm, moe_slot_ops_pm, moe_slot_ops_v2_pm, mtp_dense_det_gfx11 and mtp_q8_det_gfx11 (--m7 only)".into());
+        return Err("--shape/--m7 apply only to pm_decode_<module>, mq4_verify, fa_prefill_pm, fa_prefill_fp8_pm, fa_qprep_pm, fa_qresident_a3b_pm, iu4_c8_producer_pm, gdn_chunk_prep_pm, mq4_fp8_verify, mq_i4_rows, mq_i4_a4, moe_rotate_i4_pm, qwen4_lane_rows, spec_sampling_rows_pm, spec_accept_pm, qwen4_ep_owner_assign_pm, qwen4_ep_owner_assign_pinned_pm, ep_tile_mask_pm, argmax_regrid_pm, ep_gather_grouped_rows_by_tile_owner_pm, ep_gather_grouped_rows_by_tile_owner_n8_pm, moe_slot_ops_pm, moe_slot_ops_v2_pm, mtp_dense_det_gfx11 and mtp_q8_det_gfx11 (--m7 only)".into());
     }
     if spec_pm && co.is_none() && (shape.is_some() || m7.is_some()) {
         return Err("spec_*_pm --shape/--m7 require --co (M7 certifies the linked object)".into());
@@ -1951,6 +2146,14 @@ fn run() -> Result<(), String> {
     if iu4c8 && co.is_none() && (shape.is_some() || m7.is_some()) {
         return Err(
             "iu4_c8_producer_pm --shape/--m7 require --co (M7 certifies the linked object)".into(),
+        );
+    }
+    if fqr && epi.is_some() {
+        return Err("fa_qresident_a3b_pm has one module and no --epi variants".into());
+    }
+    if fqr && co.is_none() && (shape.is_some() || m7.is_some()) {
+        return Err(
+            "fa_qresident_a3b_pm --shape/--m7 require --co (M7 certifies the linked object)".into(),
         );
     }
     if fqp && epi.is_some() {
@@ -2155,6 +2358,30 @@ fn run() -> Result<(), String> {
                 peacemaker_isa::kernels::qwen4_ep_owner_assign_pm::symbol(arch),
                 peacemaker_isa::kernels::qwen4_ep_owner_assign_pm::contract(arch, &e),
             )
+        } else if kernel == "qwen4_ep_owner_assign_pinned_pm" {
+            let e = peacemaker_isa::kernels::qwen4_ep_owner_assign_pinned_pm::emit(arch)?;
+            (
+                peacemaker_isa::kernels::qwen4_ep_owner_assign_pinned_pm::symbol(arch),
+                peacemaker_isa::kernels::qwen4_ep_owner_assign_pinned_pm::contract(arch, &e),
+            )
+        } else if kernel == "argmax_regrid_pm" {
+            let e = peacemaker_isa::kernels::argmax_regrid_pm::emit(arch)?;
+            (
+                peacemaker_isa::kernels::argmax_regrid_pm::symbol(arch),
+                peacemaker_isa::kernels::argmax_regrid_pm::contract(arch, &e),
+            )
+        } else if kernel == "argmax_pair_merge_pm" {
+            let e = peacemaker_isa::kernels::argmax_pair_merge_pm::emit(arch)?;
+            (
+                peacemaker_isa::kernels::argmax_pair_merge_pm::symbol(arch),
+                peacemaker_isa::kernels::argmax_pair_merge_pm::contract(arch, &e),
+            )
+        } else if kernel == "topk8_partial_blocks_pm" {
+            let e = peacemaker_isa::kernels::topk8_partial_blocks_pm::emit(arch)?;
+            (
+                peacemaker_isa::kernels::topk8_partial_blocks_pm::symbol(arch),
+                peacemaker_isa::kernels::topk8_partial_blocks_pm::contract(arch, &e),
+            )
         } else if kernel == "ep_tile_mask_pm" {
             let e = peacemaker_isa::kernels::ep_tile_mask::emit(arch)?;
             (
@@ -2228,6 +2455,10 @@ fn run() -> Result<(), String> {
     #[cfg(not(feature = "toolchain"))]
     if iu4c8 && (shape.is_some() || m7.is_some()) {
         return Err("iu4_c8_producer_pm --shape/--m7 certify with M7: build peacemaker-isa with --features toolchain".into());
+    }
+    #[cfg(not(feature = "toolchain"))]
+    if fqr && (shape.is_some() || m7.is_some()) {
+        return Err("fa_qresident_a3b_pm --shape/--m7 certify with M7: build peacemaker-isa with --features toolchain".into());
     }
     #[cfg(not(feature = "toolchain"))]
     if fqp && (shape.is_some() || m7.is_some()) {
@@ -2492,6 +2723,45 @@ fn run() -> Result<(), String> {
             fs::write(file, &receipts).map_err(|e| format!("{file}: {e}"))?
         }
     }
+    // fa_qresident_a3b_pm: M7 on both exports of the linked module (direct, range), plus both contracts (--shape DIR).
+    #[cfg(feature = "toolchain")]
+    if fqr && co.is_some() {
+        use peacemaker_isa::kernels::fa_qresident;
+        let path = co.as_deref().ok_or("missing --co")?;
+        let (emitted, _, _) = fa_qresident::emit_module(arch, &fa_qresident::FaQresSpec::A3B)?;
+        let [direct, range] = &emitted[..] else {
+            return Err(
+                "fa_qresident_a3b_pm: module must hold exactly the direct then the range export"
+                    .into(),
+            );
+        };
+        let mut receipts = serde_json::Map::new();
+        for (name, symbol, e) in [
+            ("direct", fa_qresident::SYMBOL_DIRECT, direct),
+            ("range", fa_qresident::SYMBOL_RANGE, range),
+        ] {
+            let contract = fa_qresident::contract(arch, e, symbol);
+            let m7r =
+                peacemaker_isa::pm_check::m7(std::path::Path::new(path), arch.name(), symbol)?;
+            if let Some(dir) = &shape {
+                let file = format!(
+                    "{dir}/fa_qresident_a3b_pm.{}.{name}.contract.json",
+                    arch.name()
+                );
+                fs::write(
+                    &file,
+                    serde_json::to_vec_pretty(&contract).map_err(|e| e.to_string())?,
+                )
+                .map_err(|e| format!("{file}: {e}"))?;
+            }
+            receipts.insert(symbol.to_owned(), m7r);
+        }
+        let receipts = serde_json::to_vec_pretty(&receipts).map_err(|e| e.to_string())?;
+        println!("{}", String::from_utf8_lossy(&receipts));
+        if let Some(file) = &m7 {
+            fs::write(file, &receipts).map_err(|e| format!("{file}: {e}"))?
+        }
+    }
     // iu4_c8_producer_pm: M7 on both exports of the linked module (rotate, norm), plus both contracts (--shape DIR).
     #[cfg(feature = "toolchain")]
     if iu4c8 && co.is_some() {
@@ -2637,4 +2907,29 @@ fn main() {
         eprintln!("peacemaker-isa: {e}");
         std::process::exit(1)
     }
+}
+
+#[cfg(test)]
+#[test]
+fn hc8_cli_emits_exact_module_exports() {
+    use peacemaker_isa::kernels::hc8_wmma_gfx1201 as k;
+    let image = row_image("hc8_wmma_gfx1201", "all", Arch::Gfx1201)
+        .unwrap()
+        .unwrap();
+    let names: Vec<_> = image
+        .entries
+        .iter()
+        .map(|e| row_export(e).unwrap())
+        .collect();
+    assert_eq!(names, k::symbols());
+    let priority = row_image("hc8_wmma_gfx1201", "priority", Arch::Gfx1201)
+        .unwrap()
+        .unwrap();
+    let names: Vec<_> = priority
+        .entries
+        .iter()
+        .map(|e| row_export(e).unwrap())
+        .collect();
+    let expected: Vec<_> = k::priority_geos().iter().map(k::Geo::symbol).collect();
+    assert_eq!(names, expected);
 }

@@ -36,6 +36,10 @@ use hipfire_runtime::spec::{
     SpecScratch, SpecStep, SpecTarget, Speculator,
 };
 use hipfire_runtime::spec_economics::{
+    batched_depth as economics_batched_depth, observe_agreement, observe_agreement_counts,
+    valid_us, Action, NativeWindow, WindowStats, AGREEMENT_PRIOR, DEFAULT_DECAY,
+};
+use hipfire_runtime::spec_economics::{
     derived_offer_bin, fn_measured_ar_price, fn_measured_depth_counts, fn_measured_load_identity,
     fn_measured_reference_supported, fn_measured_window_price, fn_phase1_ar_price,
     fn_phase1_window_price, native_margin_bin, CalibrationCounts, ContextBucket, DerivedAction,
@@ -44,10 +48,6 @@ use hipfire_runtime::spec_economics::{
 };
 #[cfg(test)]
 use hipfire_runtime::spec_economics::{fresh_agreement, Agreement, MAX_DEPTH};
-use hipfire_runtime::spec_economics::{
-    observe_agreement, observe_agreement_counts, valid_us, Action, NativeWindow, WindowStats,
-    AGREEMENT_PRIOR, DEFAULT_DECAY,
-};
 use hipfire_runtime::spec_sampling::{
     accept_naive_prefix, accept_sampled_prefix, naive_target_sampler, verify_sampled_draft,
     DraftVerdict, PenaltyHistory, SampleSpec, SparseDist, SpecRng,
@@ -2015,6 +2015,100 @@ fn takeover_probe(gpu: &Gpu, start: Instant) -> TakeoverProbe {
 /// the others from the few-row forward's growth (2 rows ~50 ms, 5 ~69,
 /// 8 ~98) plus ~2.7 ms per draft step.
 pub(crate) const MTP_WINDOW_COST: [f32; 8] = [1.0, 1.7, 1.87, 2.25, 2.55, 2.75, 3.0, 3.6];
+
+/// `HIPFIRE_QWEN4_MTP_G942_DEPTH=<k>` (gfx942 only, developer knob): every
+/// native window drafts exactly `min(k, budget)` tokens on the batched route
+/// (`0` = the interleaved route), with no AR floor, no calibration and no
+/// cost table. It exists for the identity / distribution oracles and the
+/// window-cost measurement, which must run a fixed depth before any gfx942
+/// price exists. `HIPFIRE_MTP_INCREMENTAL=1` still wins over it. A malformed
+/// value fails the window (never a silent default).
+pub const MTP_G942_DEPTH_ENV: &str = "HIPFIRE_QWEN4_MTP_G942_DEPTH";
+
+/// The gfx942 opt-out of the MFMA one-row trunk GEMM (dispatch
+/// `g942_trunk_gemv`, read once). Under it the single-row decode runs a GEMV
+/// whose bytes differ from the multi-row MFMA verify chunk (M-K round 1:
+/// `forward_chunk(N)` != N `forward_token` for N >= 2), so native MTP is
+/// refused while it is set.
+const G942_TRUNK_GEMV_ENV: &str = "HIPFIRE_G942_TRUNK_GEMV";
+
+/// Measured gfx942 window cost in milliseconds, same index as
+/// [`MTP_WINDOW_COST`]: `[0]` is one interleaved token (a single-row forward
+/// plus one head step), `[d]` a batched window drafting `d` tokens (`d` head
+/// steps, the `d + 1` row verify and the repair). Values are mean window ms
+/// from `examples/qwen4_mtp_g942_cost.rs` on the MI300X (gfx942) with the
+/// stock-FP8 Flash-Next artifact (context 1743..2170, 24 windows per depth,
+/// AR token 18.22 ms). A width carries a cost only once greedy identity
+/// (MTP == AR) has proven it exact on gfx942; an unpublished width (`None`)
+/// is refused at route time, dropping to the deepest published width below
+/// it, else AR, and is never priced from the gfx1151 table. Depths >= 2 cost
+/// 4-20x a token (each window past depth 1 adds ~55-60 ms), so the economics
+/// never choose them today.
+pub(crate) const MTP_WINDOW_COST_MS_GFX942: [Option<f32>; MTP_WINDOW_COST.len()] = [
+    Some(18.26),
+    Some(21.50),
+    Some(87.16),
+    Some(146.07),
+    Some(200.79),
+    Some(253.09),
+    Some(309.41),
+    Some(365.34),
+];
+
+type G942CostMs = [Option<f32>; MTP_WINDOW_COST.len()];
+
+/// `cost_ms` as [`MTP_WINDOW_COST`] units (interleaved token = 1.0); an
+/// unmeasured depth, or every depth when `[0]` is unmeasured, is infinite.
+fn g942_cost_ratios(cost_ms: &G942CostMs) -> [f32; MTP_WINDOW_COST.len()] {
+    let mut ratios = [f32::INFINITY; MTP_WINDOW_COST.len()];
+    let Some(base) = cost_ms[0].filter(|&cost| valid_us(cost)) else {
+        return ratios;
+    };
+    for (ratio, cost) in ratios.iter_mut().zip(cost_ms) {
+        if let Some(cost) = cost.filter(|&cost| valid_us(cost)) {
+            *ratio = cost / base;
+        }
+    }
+    ratios
+}
+
+/// The deepest measured depth at or below `depth` (`0` is the interleaved
+/// baseline), else `None`.
+fn g942_priced_depth_at_or_below(cost_ms: &G942CostMs, depth: usize) -> Option<usize> {
+    let ratios = g942_cost_ratios(cost_ms);
+    (0..=depth.min(ratios.len() - 1))
+        .rev()
+        .find(|&d| ratios[d].is_finite())
+}
+
+/// Whether any batched depth `1..=k` has a measured gfx942 cost.
+fn g942_any_batched_priced(cost_ms: &G942CostMs, k: usize) -> bool {
+    let ratios = g942_cost_ratios(cost_ms);
+    (1..=k.min(ratios.len() - 1)).any(|d| ratios[d].is_finite())
+}
+
+/// Parse [`MTP_G942_DEPTH_ENV`]: unset or blank is `None`.
+fn parse_g942_depth(raw: Option<&str>) -> Result<Option<usize>, String> {
+    let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return Ok(None);
+    };
+    let depth = raw
+        .parse::<usize>()
+        .map_err(|_| format!("{MTP_G942_DEPTH_ENV}={raw:?} is not a draft depth"))?;
+    if depth >= MTP_WINDOW_COST.len() {
+        return Err(format!(
+            "{MTP_G942_DEPTH_ENV}={depth} exceeds the native depth limit {}",
+            MTP_WINDOW_COST.len() - 1
+        ));
+    }
+    Ok(Some(depth))
+}
+
+/// Whether `HIPFIRE_G942_TRUNK_GEMV` is set (same snapshot as dispatch).
+fn g942_trunk_gemv_requested() -> bool {
+    hipfire_config::developer_bool(G942_TRUNK_GEMV_ENV, false)
+}
+
 /// The singleton drafter's decay on gfx1151 (~30-window memory). The floor
 /// retires a request to AR, stickily, once no native route's measured cost
 /// per expected token beats AR. With the ~8-window memory an early run of
@@ -2032,7 +2126,7 @@ const NGRAM_YIELD_RECOVERY: f32 = 0.95;
 /// Draft depths of the request-local n-gram acceptance table: one per verify
 /// row of the spec capacity below the seed, the longest proposal the pool
 /// can make (`qwen4_ngram_mod_config` caps `n_max` there).
-const NGRAM_DEPTHS: usize = QWEN4_SPEC_VERIFY_ROWS - 1;
+pub(crate) const NGRAM_DEPTHS: usize = QWEN4_SPEC_VERIFY_ROWS - 1;
 /// Fewest candidates of a takeover that may skip the head's row-0
 /// confirmation, once the copy source is established (see
 /// [`NGRAM_UNCONFIRMED_MIN_ACCEPT`]). Checked against teacher-forced replays
@@ -2108,7 +2202,10 @@ fn gdn_residual_trace_field(state: &crate::state::Qwen4State) -> String {
 /// their first windows and ran the whole response at AR speed (28–29 tok/s
 /// against 40–46 when drafting continued).  `HIPFIRE_MTP_FLOOR_MIN_WINDOWS=<n>`
 /// (n ≥ 1) overrides it; `3` restores retirement at the probe budget.
-/// Continuous-batching lanes keep retirement at the probe budget.
+/// Continuous-batching lanes keep retirement at the probe budget, except the
+/// gfx1201 lane profile (`mtp_lanes::LaneCostProfile::gfx1201`, kill switch
+/// `HIPFIRE_QWEN4_LANE_COST=0`), whose floor reads this threshold and the AR
+/// probe count below.
 const MTP_SINGLETON_FLOOR_MIN_WINDOWS: usize = 16;
 
 /// Ordinary AR tokens a singleton request's floor times, at the moment it
@@ -2124,7 +2221,7 @@ const MTP_SINGLETON_FLOOR_AR_PROBE_TOKENS: usize = 6;
 /// The singleton request's retirement threshold:
 /// `HIPFIRE_MTP_FLOOR_MIN_WINDOWS` when it parses as an integer ≥ 1, else
 /// [`MTP_SINGLETON_FLOOR_MIN_WINDOWS`].
-fn singleton_floor_min_windows() -> usize {
+pub(crate) fn singleton_floor_min_windows() -> usize {
     hipfire_config::developer_var("HIPFIRE_MTP_FLOOR_MIN_WINDOWS")
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
@@ -2153,7 +2250,7 @@ pub(crate) type Qwen4Floor =
 /// retirement (see [`Qwen4Floor::with_retire_evidence`]).
 /// `HIPFIRE_MTP_FLOOR_AR_PROBE=<n>` overrides it; `0` is the kill switch and
 /// restores the single-calibration-token floor.
-fn singleton_floor_ar_probe_tokens() -> usize {
+pub(crate) fn singleton_floor_ar_probe_tokens() -> usize {
     hipfire_config::developer_var("HIPFIRE_MTP_FLOOR_AR_PROBE")
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
@@ -3535,21 +3632,21 @@ fn window_key(window: Result<MtpWindow, String>) -> Result<(Vec<u32>, usize, usi
 /// `start - 1` (the head's position - 1), which owed token 0 pairs with
 /// (token `i` pairs with spec hidden row `i - 1`); the catch-up ends it on
 /// row `owed - 1`. Host only.
-#[derive(Debug, Default)]
-struct HeadLag {
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct HeadLag {
     /// The head position: where the first owed row goes.
-    start: usize,
+    pub(crate) start: usize,
     /// The owed tokens, at positions `start..start + tokens.len()`; token
     /// `i`'s own target hidden is spec hidden row `i` (the pair of token
     /// `i + 1`).
-    tokens: Vec<u32>,
+    pub(crate) tokens: Vec<u32>,
 }
 
 impl HeadLag {
     /// The spec hidden row the AR token at `position` captures into: the
     /// next row. Refused unless `position` continues the owed rows and a row
     /// below `capacity` is free.
-    fn next_row(&self, position: usize, capacity: usize) -> Result<usize, String> {
+    pub(crate) fn next_row(&self, position: usize, capacity: usize) -> Result<usize, String> {
         let row = self.tokens.len();
         if row != 0 && self.start + row != position {
             return Err(format!(
@@ -3567,7 +3664,7 @@ impl HeadLag {
     }
 
     /// Owe the token at `position`, whose hidden went to [`Self::next_row`].
-    fn push(&mut self, position: usize, token: u32) {
+    pub(crate) fn push(&mut self, position: usize, token: u32) {
         debug_assert!(self.tokens.is_empty() || self.start + self.tokens.len() == position);
         if self.tokens.is_empty() {
             self.start = position;
@@ -3575,7 +3672,7 @@ impl HeadLag {
         self.tokens.push(token);
     }
 
-    fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.tokens.clear();
     }
 }
@@ -3744,6 +3841,18 @@ pub struct Qwen4MtpDrafter {
     /// Per-window decay of `agreement`, `ngram_agreement` and the floor's
     /// measured costs on the loaded arch ([`singleton_agreement_decay`]).
     agreement_decay: f32,
+    /// The loaded GPU is gfx942 ([`Self::bind_arch`]): the verify block must be
+    /// bitwise the single-row decode and only measured gfx942 costs price a
+    /// native depth.
+    g942: bool,
+    /// gfx942 window costs in ms ([`MTP_WINDOW_COST_MS_GFX942`]).
+    g942_cost_ms: G942CostMs,
+    /// [`MTP_G942_DEPTH_ENV`] as bound on gfx942 (`Err`: malformed).
+    g942_depth: Result<Option<usize>, String>,
+    /// `HIPFIRE_G942_TRUNK_GEMV` is set on gfx942 ([`G942_TRUNK_GEMV_ENV`]).
+    g942_gemv: bool,
+    /// This request was refused native MTP on gfx942 and runs AR to its end.
+    g942_refused: bool,
     /// `[seed, candidates..]` of the current takeover window (reused).
     takeover_block: Vec<u32>,
     /// Same-request AR floor; reset by request configuration or a newly
@@ -4085,19 +4194,120 @@ struct FloorPending {
 /// of it (`rate` and `native_rate` stay 0 when the proposal was shorter than
 /// `n_min` or the budget and was never priced).
 #[derive(Clone, Copy, Debug)]
-struct NgramDecision {
+pub(crate) struct NgramDecision {
     /// The proposal's length.
-    available: usize,
+    pub(crate) available: usize,
     /// Candidates taken; 0 when the proposal was declined.
-    take: usize,
+    pub(crate) take: usize,
     /// The head's row-0 draft must confirm the first candidate.
-    confirm: bool,
+    pub(crate) confirm: bool,
     /// Best takeover rate (expected emitted tokens per AR step of cost).
-    rate: f32,
+    pub(crate) rate: f32,
     /// The native window's rate it was compared with.
-    native_rate: f32,
+    pub(crate) native_rate: f32,
     /// Depth-1 n-gram acceptance.
+    pub(crate) a1: f32,
+}
+
+/// Whether a copy take of `take` candidates still needs the head's own row-0
+/// draft to confirm its first candidate: only an established source
+/// (acceptance and evidence of the depth-1 shadow table, and the last shadow
+/// observation accepting its first candidate) skips it.
+pub(crate) fn copy_take_confirms(
+    take: usize,
     a1: f32,
+    a1_weight: f32,
+    last_first_accepted: bool,
+) -> bool {
+    !(take >= NGRAM_UNCONFIRMED_MIN_TAKE
+        && a1 >= NGRAM_UNCONFIRMED_MIN_ACCEPT
+        && a1_weight >= NGRAM_UNCONFIRMED_MIN_EVIDENCE
+        && last_first_accepted)
+}
+
+/// The inputs of the copy lane's take-length chooser, shared by the
+/// singleton drafter and the mesh lane root.
+pub(crate) struct CopyTakeInput<'a> {
+    /// The pool proposal's length.
+    pub(crate) available: usize,
+    /// Most candidates a take may carry (`min(take cap, caller budget,
+    /// table depths)`).
+    pub(crate) cap: usize,
+    pub(crate) n_min: usize,
+    /// The request's own per-depth copy acceptance (non-empty).
+    pub(crate) agreement: &'a [(f32, f32)],
+    /// The native floor retired the request.
+    pub(crate) retired: bool,
+    /// The last shadow observation accepted its first candidate.
+    pub(crate) last_first_accepted: bool,
+}
+
+/// The copy lane's take-length chooser: the `d` in `n_min..=min(proposal,
+/// cap)` maximizing the expected emitted tokens `1 + Σ_i Π_{j<=i} a_j` per
+/// unit `takeover_cost(d)` (shorter on ties), taken when that rate is at
+/// least the native window's (`native_rate`, evaluated only when a take is
+/// priced) or, on a retired request, AR's 1.0, and then only while the last
+/// shadow observation accepted its first candidate.
+pub(crate) fn copy_take_decision(
+    input: &CopyTakeInput<'_>,
+    native_rate: impl FnOnce() -> f32,
+    takeover_cost: impl Fn(usize) -> f32,
+) -> NgramDecision {
+    let (a1_sum, a1_weight) = input.agreement[0];
+    let a1 = a1_sum / a1_weight.max(f32::MIN_POSITIVE);
+    let mut decision = NgramDecision {
+        available: input.available,
+        take: 0,
+        confirm: true,
+        rate: 0.0,
+        native_rate: 0.0,
+        a1,
+    };
+    let hi = input.available.min(input.cap);
+    let lo = input.n_min.max(1);
+    if hi >= lo {
+        let native_rate = if input.retired { 1.0 } else { native_rate() };
+        let (mut prefix, mut expected) = (1.0f32, 1.0f32);
+        let mut best = (0usize, 0.0f32);
+        for d in 1..=hi {
+            let (accepted, weight) = input.agreement[d - 1];
+            prefix *= accepted / weight.max(f32::MIN_POSITIVE);
+            expected += prefix;
+            if d < lo {
+                continue;
+            }
+            let rate = expected / takeover_cost(d);
+            if best.0 == 0 || rate > best.1 {
+                best = (d, rate);
+            }
+        }
+        decision.rate = best.1;
+        decision.native_rate = native_rate;
+        // A retired request's alternative is one AR row, so a takeover
+        // rejected at its first candidate wastes the whole verify (a
+        // native window that agreed with the same wrong candidate would
+        // have failed with it): once retired, take only while the last
+        // shadow observation accepted its first candidate. A copy span
+        // that resumes re-arms after one AR token.
+        let retired_cold = input.retired && !input.last_first_accepted;
+        if best.1 >= native_rate && !retired_cold {
+            decision.take = best.0;
+            decision.confirm = copy_take_confirms(best.0, a1, a1_weight, input.last_first_accepted);
+        }
+    }
+    decision
+}
+
+/// `(matched, horizon)` of one shadow observation: the common prefix of the
+/// window's pool proposal and the tokens committed after it, censored at the
+/// committed length.
+pub(crate) fn copy_shadow_counts(proposal: &[u32], truth: &[u32]) -> (usize, usize) {
+    let matched = proposal
+        .iter()
+        .zip(truth)
+        .take_while(|(proposed, committed)| proposed == committed)
+        .count();
+    (matched, proposal.len().min(truth.len()))
 }
 
 // ---------------------------------------------------------------------------
@@ -5293,6 +5503,11 @@ impl Qwen4MtpDrafter {
             ngram_warm_depths: 0,
             ngram_row_cost: None,
             agreement_decay: DEFAULT_DECAY,
+            g942: false,
+            g942_cost_ms: MTP_WINDOW_COST_MS_GFX942,
+            g942_depth: Ok(None),
+            g942_gemv: false,
+            g942_refused: false,
             takeover_block: Vec::new(),
             floor,
             floor_enabled: true,
@@ -5546,8 +5761,25 @@ impl Qwen4MtpDrafter {
             let bundle = Self::bundle(target)?;
             if bundle.mtp_append_rows_supported(ops.gpu()?) {
                 let rows = MTP_FILL_ROWS.min(prefill_rows);
-                let scratch = MtpAppendScratch::new(ops.gpu()?, &bundle.config, rows, prefill_rows)
-                    .map_err(|error| format!("Qwen4 MTP append scratch allocation: {error}"))?;
+                // `HIPFIRE_QWEN4_LANE_APPEND_SHARE`: with an MTP lane store staged, this scratch
+                // is a view of the store's own (same shape: `MTP_FILL_ROWS.min(chunk)` rows). The
+                // lane store and this drafter are never in use at the same time: both run on the
+                // one driver thread and the one stream of the bundle's single forward scratch,
+                // and no scratch tensor carries state between two passes (see
+                // `MtpAppendScratch::shared_view`). A longer prompt chunk than the lane
+                // store's id capacity takes the per-sub-chunk id upload
+                // (`prefill_uploads_chunk_ids`), which uploads the same bytes.
+                let shared = hipfire_config::qwen4_lane_append_share()
+                    .then(|| bundle.lane_append_scratch_view())
+                    .flatten()
+                    .filter(|view| view.rows() >= rows);
+                let scratch = match shared {
+                    Some(view) => view,
+                    None => MtpAppendScratch::new(ops.gpu()?, &bundle.config, rows, prefill_rows)
+                        .map_err(|error| {
+                        format!("Qwen4 MTP append scratch allocation: {error}")
+                    })?,
+                };
                 self.append_scratch = Some(scratch);
             }
         }
@@ -5824,19 +6056,68 @@ impl Qwen4MtpDrafter {
 
     /// With no agreement evidence, start at K=3 (or the smaller budget);
     /// evidence may still grow the chooser to the unchanged configured cap.
+    /// gfx942 prices every depth from its measured table from the first
+    /// window (the prior agreement included): its depth >= 2 windows cost
+    /// several tokens, so the K=3 start would run the request's probe
+    /// windows at a measured loss.
     fn batched_depth(&self, k: usize) -> usize {
-        if self.agreement.iter().all(|&entry| entry == AGREEMENT_PRIOR) {
+        if self.g942 {
+            economics_batched_depth(&self.agreement, k, &g942_cost_ratios(&self.g942_cost_ms))
+        } else if self.agreement.iter().all(|&entry| entry == AGREEMENT_PRIOR) {
             k.min(3)
         } else {
             self.floor.provisional_depth(&self.agreement, k)
         }
     }
 
+    /// The window-cost prior of `depth` in [`MTP_WINDOW_COST`] units: the
+    /// gfx1151 table everywhere except gfx942, which has its own measured
+    /// table and is infinite where that has no measurement (never the
+    /// gfx1151 value).
+    fn window_cost_prior(&self, depth: usize) -> f32 {
+        if self.g942 {
+            g942_cost_ratios(&self.g942_cost_ms)
+                .get(depth)
+                .copied()
+                .unwrap_or(f32::INFINITY)
+        } else {
+            MTP_WINDOW_COST.get(depth).copied().unwrap_or(f32::INFINITY)
+        }
+    }
+
+    /// Why gfx942 serves this window on AR instead of native MTP, if it must:
+    /// the GEMV trunk route (its single-row decode is not bitwise the MFMA
+    /// verify chunk) always; no measured gfx942 window cost for any depth up
+    /// to `k` unless the window is `pinned` (a forced route or depth, which
+    /// bypasses the cost chooser by design).
+    fn g942_refusal(&self, k: usize, pinned: bool) -> Option<&'static str> {
+        if self.g942_gemv {
+            return Some(
+                "HIPFIRE_G942_TRUNK_GEMV=1 makes AR decode a GEMV that is not bitwise equal to the multi-row verify",
+            );
+        }
+        if !pinned && !g942_any_batched_priced(&self.g942_cost_ms, k) {
+            return Some("no measured gfx942 window cost for any draft depth");
+        }
+        None
+    }
+
+    /// Latch the gfx942 refusal for the rest of the request (the first window
+    /// takes the resource pass, later ones skip it) and log it once.
+    fn g942_refuse(&mut self, reason: &str, plan: WindowPlan) -> WindowPlan {
+        self.g942_refused = true;
+        self.stats.mtp_retired = true;
+        if !self.follower {
+            eprintln!("QWEN4_MTP gfx942: native MTP refused ({reason}); this request runs AR");
+        }
+        plan
+    }
+
     /// Price both sources on the same clock; unsupported arches retain the
     /// original chooser. Depth drafts require depth + 1 verify rows.
     fn ngram_window_cost(&self, depth: usize) -> f32 {
         let Some((single, extra)) = self.ngram_row_cost else {
-            return MTP_WINDOW_COST.get(depth).copied().unwrap_or(f32::INFINITY);
+            return self.window_cost_prior(depth);
         };
         if self.floor_enabled {
             if let Some(cost) = self.floor.batched_cost(depth) {
@@ -5974,13 +6255,7 @@ impl Qwen4MtpDrafter {
             return;
         }
         let truth = &emitted[start..];
-        let matched = self
-            .ngram_proposal
-            .iter()
-            .zip(truth)
-            .take_while(|(proposed, committed)| proposed == committed)
-            .count();
-        let horizon = self.ngram_proposal.len().min(truth.len());
+        let (matched, horizon) = copy_shadow_counts(&self.ngram_proposal, truth);
         observe_agreement_counts(
             &mut self.ngram_agreement,
             matched,
@@ -6941,76 +7216,48 @@ impl Qwen4MtpDrafter {
         // `k` already includes the remaining emit budget: a takeover commits
         // seed + candidates to both device owners before the host sees them.
         let cap = self.ngram_take_cap().min(k).min(self.ngram_agreement.len());
-        let (a1_sum, a1_weight) = self.ngram_agreement[0];
-        let a1 = a1_sum / a1_weight.max(f32::MIN_POSITIVE);
-        let mut decision = NgramDecision {
-            available,
-            take: 0,
-            confirm: true,
-            rate: 0.0,
-            native_rate: 0.0,
-            a1,
-        };
         #[cfg(feature = "reference-parity")]
         if let Some(d) = self.lab_ngram_width() {
             // Bypass the take-length chooser only. These are the exact
             // source's real tokens, never fabricated longer offers.
+            let (a1_sum, a1_weight) = self.ngram_agreement[0];
+            let a1 = a1_sum / a1_weight.max(f32::MIN_POSITIVE);
+            let mut decision = NgramDecision {
+                available,
+                take: 0,
+                confirm: true,
+                rate: 0.0,
+                native_rate: 0.0,
+                a1,
+            };
             if d > available || d > k {
                 self.ngram_decision = Some(decision);
                 return false;
             }
             decision.take = d;
-            decision.confirm = !(d >= NGRAM_UNCONFIRMED_MIN_TAKE
-                && a1 >= NGRAM_UNCONFIRMED_MIN_ACCEPT
-                && a1_weight >= NGRAM_UNCONFIRMED_MIN_EVIDENCE
-                && self.ngram_last_first_accepted);
+            decision.confirm = copy_take_confirms(d, a1, a1_weight, self.ngram_last_first_accepted);
             self.ngram_candidates.clear();
             self.ngram_candidates
                 .extend_from_slice(&self.ngram_proposal[..d]);
             self.ngram_decision = Some(decision);
             return d > 0;
         }
-        let hi = available.min(cap);
-        let lo = config.n_min.max(1);
-        if hi >= lo {
-            let native_rate = if self.floor.retired() {
-                1.0
-            } else {
-                self.native_rate(k.min(self.incumbent_max_k()))
-            };
-            let (mut prefix, mut expected) = (1.0f32, 1.0f32);
-            let mut best = (0usize, 0.0f32);
-            for d in 1..=hi {
-                let (accepted, weight) = self.ngram_agreement[d - 1];
-                prefix *= accepted / weight.max(f32::MIN_POSITIVE);
-                expected += prefix;
-                if d < lo {
-                    continue;
-                }
-                let rate = expected / self.takeover_cost(d);
-                if best.0 == 0 || rate > best.1 {
-                    best = (d, rate);
-                }
-            }
-            decision.rate = best.1;
-            decision.native_rate = native_rate;
-            // A retired request's alternative is one AR row, so a takeover
-            // rejected at its first candidate wastes the whole verify (a
-            // native window that agreed with the same wrong candidate would
-            // have failed with it): once retired, take only while the last
-            // shadow observation accepted its first candidate. A copy span
-            // that resumes re-arms after one AR token.
-            let retired_cold = self.floor.retired() && !self.ngram_last_first_accepted;
-            if best.1 >= native_rate && !retired_cold {
-                decision.take = best.0;
-                decision.confirm = !(best.0 >= NGRAM_UNCONFIRMED_MIN_TAKE
-                    && a1 >= NGRAM_UNCONFIRMED_MIN_ACCEPT
-                    && a1_weight >= NGRAM_UNCONFIRMED_MIN_EVIDENCE
-                    && self.ngram_last_first_accepted);
-                self.ngram_candidates.clear();
-                self.ngram_candidates
-                    .extend_from_slice(&self.ngram_proposal[..best.0]);
-            }
+        let decision = copy_take_decision(
+            &CopyTakeInput {
+                available,
+                cap,
+                n_min: config.n_min,
+                agreement: &self.ngram_agreement,
+                retired: self.floor.retired(),
+                last_first_accepted: self.ngram_last_first_accepted,
+            },
+            || self.native_rate(k.min(self.incumbent_max_k())),
+            |d| self.takeover_cost(d),
+        );
+        if decision.take > 0 {
+            self.ngram_candidates.clear();
+            self.ngram_candidates
+                .extend_from_slice(&self.ngram_proposal[..decision.take]);
         }
         self.ngram_decision = Some(decision);
         decision.take > 0
@@ -7596,6 +7843,24 @@ fn mark_phase(timers: &mut Option<&mut MtpPhaseTimers>, gpu: &Gpu, label: &'stat
     }
 }
 
+thread_local! {
+    /// `Some(None)`: armed by [`lane_fill_split_arm`] for one MTP lane prefill tile;
+    /// `Some(Some((trunk_ms, head_ms)))`: that tile's split, filled by [`mtp_prefill_chunk`].
+    static LANE_FILL_SPLIT: std::cell::Cell<Option<Option<(f64, f64)>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Arm the trunk/head split for the next [`mtp_prefill_chunk`] on this thread (the
+/// `HIPFIRE_CB_PHASES` per-tile line of `lane_exec::run_prefill_tiles`).
+pub(crate) fn lane_fill_split_arm() {
+    LANE_FILL_SPLIT.with(|split| split.set(Some(None)));
+}
+
+/// Disarm and return the split `(trunk_ms, head_ms)` the armed tile recorded, if any.
+pub(crate) fn lane_fill_split_take() -> Option<(f64, f64)> {
+    LANE_FILL_SPLIT.with(|split| split.replace(None)).flatten()
+}
+
 /// The body of `mtp_prefill`'s chunk loop for the chunk `chunk` at `pos`:
 /// the trunk tile with wide-hidden capture (`spec_prefill_rows` when
 /// `needs_pick`, else `spec_prefill_rows_silent`), then the head append of
@@ -7638,7 +7903,26 @@ pub(crate) fn mtp_prefill_chunk(
     } else {
         None
     };
+    // Lane-tile diagnostic (`lane_fill_split_arm`): the trunk forward and the head fill timed
+    // apart, each ending on a device wait. Unarmed (every singleton prefill, every serve step
+    // without `HIPFIRE_CB_PHASES`), this adds nothing.
+    let trunk_clock = LANE_FILL_SPLIT
+        .with(|split| split.get().is_some())
+        .then(std::time::Instant::now);
     let pick = bundle.ops_prefill_rows(ops, chunk, needs_pick)?;
+    let head_clock = match trunk_clock {
+        Some(clock) => {
+            ops.gpu()?
+                .hip
+                .device_synchronize()
+                .map_err(|error| error.to_string())?;
+            Some((
+                clock.elapsed().as_secs_f64() * 1e3,
+                std::time::Instant::now(),
+            ))
+        }
+        None => None,
+    };
     if let Some(shape) = &shape {
         // The target captured both banks together, but head append boundaries,
         // prompt-id uploads and pending rows remain those of the sequential run.
@@ -7689,11 +7973,19 @@ pub(crate) fn mtp_prefill_chunk(
     {
         return Ok(ControlFlow::Break(()));
     }
+    if let Some((trunk_ms, clock)) = head_clock {
+        ops.gpu()?
+            .hip
+            .device_synchronize()
+            .map_err(|error| error.to_string())?;
+        let head_ms = clock.elapsed().as_secs_f64() * 1e3;
+        LANE_FILL_SPLIT.with(|split| split.set(Some(Some((trunk_ms, head_ms)))));
+    }
     Ok(ControlFlow::Continue(pick))
 }
 
 #[allow(clippy::too_many_arguments)]
-fn mtp_append_prefill_chunk(
+pub(crate) fn mtp_append_prefill_chunk(
     bundle: &mut Qwen4Bundle,
     ops: &mut Qwen4Ops<'_>,
     chunk: &[u32],
@@ -7936,6 +8228,43 @@ pub(crate) struct NativeFinish<'a> {
     /// singleton drafter's windows, which a terminal stop may cut short. The
     /// caller records the tickets and releases them.
     pub retain: bool,
+    /// The head never advanced this window (a copy/forced window: `k > 0`
+    /// rows verified but no head Draft ran), so it is still at the window's
+    /// start and the seed's row is appended instead of truncated to. A native
+    /// window passes `false`.
+    pub head_at_start: bool,
+    /// The lane commit fill (`HIPFIRE_QWEN4_LANE_COMMIT_FILL`): when given,
+    /// two or more kept drafts are rebuilt by one batched decode-fill Append
+    /// (`Qwen4MtpGpu::append_rows`, `MtpFillContext::DecodeFill`, the
+    /// per-row reduction order) over `verify_hidden` rows `0..kept` instead of
+    /// one `mtp_append_token` per row. `None` keeps the per-row loop.
+    pub fill: Option<CommitFill<'a>>,
+}
+
+/// [`NativeFinish::fill`]: the Append scratch, and the row of block row 0 in
+/// the lane forward's device token-id upload (the kept drafts embed from those
+/// ids in place when the forward's mirror still holds them).
+pub(crate) struct CommitFill<'a> {
+    pub scratch: &'a mut MtpAppendScratch,
+    pub ids_row: usize,
+}
+
+/// A native window whose every fallible target/head operation succeeded and
+/// whose tickets validated, but whose tickets are still live (nothing is
+/// consumed). [`publish_native_window`] consumes them; a caller whose
+/// cross-owner agreement fails drops this and aborts, leaving the tickets
+/// for the outer rollback.
+pub(crate) struct PreparedNativeWindow {
+    /// The window's outcome, returned by publish.
+    pub window: MtpWindow,
+    /// The still-live pre-window target ticket.
+    pub target_snapshot: TargetTicket,
+    /// The still-live pre-window head ticket.
+    pub mtp_ticket: HeadTicket,
+    /// Retain (keep rollback-able) instead of consuming at publish.
+    pub retain: bool,
+    /// The position both target and head hold after the window.
+    pub committed_end: usize,
 }
 
 /// A batched window's tail, from the target's accepted length through the
@@ -7944,12 +8273,50 @@ pub(crate) struct NativeFinish<'a> {
 /// position checks, the pending hidden copy and the commit of both tickets.
 /// `mtp_step` and the lane executor both end their windows here; the caller
 /// clears its own scratch ticket and head ticket after `Ok`.
+/// Composition of [`prepare_native_window`] and [`publish_native_window`].
 pub(crate) fn finish_native_window(
     picks: &mut Qwen4Bundle,
     ops: &mut Qwen4Ops<'_>,
     f: NativeFinish<'_>,
-    mut timers: Option<&mut MtpPhaseTimers>,
+    timers: Option<&mut MtpPhaseTimers>,
 ) -> Result<MtpWindow, String> {
+    let prepared = prepare_native_window(picks, ops, f, timers)?;
+    publish_native_window(picks, ops, prepared)
+}
+
+/// Consume (or retain) the tickets of a [`PreparedNativeWindow`]. Infallible
+/// for a Local target (the tickets were validated by prepare and no GPU
+/// operation runs here). The Mesh variant (`pp_window_finalize`) can fail,
+/// hence the `Result`; the PP policy for that failure belongs to the PP path.
+pub(crate) fn publish_native_window(
+    picks: &mut Qwen4Bundle,
+    ops: &mut Qwen4Ops<'_>,
+    prepared: PreparedNativeWindow,
+) -> Result<MtpWindow, String> {
+    let PreparedNativeWindow {
+        window,
+        target_snapshot,
+        mtp_ticket,
+        retain,
+        committed_end,
+    } = prepared;
+    debug_assert_eq!(
+        picks.state.position, committed_end,
+        "publish_native_window: the target moved after prepare"
+    );
+    picks.ops_finish_window(ops, target_snapshot, mtp_ticket, retain)?;
+    Ok(window)
+}
+
+/// Every fallible operation of a window's tail (target rollback/replay, head
+/// restore and teacher-forced rebuild, position checks, pending hidden copy)
+/// plus a non-consuming ticket validation. On `Err` no ticket was consumed.
+pub(crate) fn prepare_native_window(
+    picks: &mut Qwen4Bundle,
+    ops: &mut Qwen4Ops<'_>,
+    f: NativeFinish<'_>,
+    mut timers: Option<&mut MtpPhaseTimers>,
+) -> Result<PreparedNativeWindow, String> {
     let NativeFinish {
         position,
         block,
@@ -7960,6 +8327,8 @@ pub(crate) fn finish_native_window(
         verify_hidden,
         ple_normed,
         retain,
+        head_at_start: head_already_at_start,
+        fill,
     } = f;
     let drafts = block
         .get(1..)
@@ -7973,7 +8342,7 @@ pub(crate) fn finish_native_window(
     // both owners if either side's GPU work fails.
     // Under a mesh a full target restore also restores the head to the
     // window's start (one aggregate restore): the head then replays below.
-    let mut head_at_start = false;
+    let mut head_at_start = head_already_at_start;
     if !full_accept && picks.ops_ring_eligible(target_snapshot, block.len()) {
         mark_phase(&mut timers, ops.gpu()?, "target_rollback");
         picks.ops_rollback_rows(
@@ -8023,18 +8392,41 @@ pub(crate) fn finish_native_window(
             picks.ops_head_truncate_retain(mtp_ticket, 1)?;
         }
     }
-    for row in 0..target_accept_len {
-        picks
-            .copy_hidden_row(ops.gpu()?, verify_hidden, row, pending_hidden)
-            .map_err(|error| error.to_string())?;
-        picks
-            .mtp_append_token(
-                ops.gpu()?,
-                block[row + 1],
-                Some(pending_hidden),
-                position + 1 + row,
-            )
-            .map_err(|error| error.to_string())?;
+    // Token `block[row + 1]` pairs with verify hidden row `row`: the batched
+    // fill reads those rows in place; the per-row loop stages each in
+    // `pending_hidden` first. Both leave `pending_hidden` to the copy below.
+    match fill.filter(|fill| target_accept_len >= 2 && target_accept_len <= fill.scratch.rows()) {
+        Some(fill) => {
+            let kept = &block[1..=target_accept_len];
+            let ids = picks.lane_uploaded_token_ids(fill.ids_row + 1, kept);
+            picks
+                .mtp_append_rows_hidden(
+                    ops.gpu()?,
+                    MtpFillContext::DecodeFill,
+                    fill.scratch,
+                    kept,
+                    verify_hidden,
+                    None,
+                    ids.as_ref(),
+                    position + 1,
+                )
+                .map_err(|error| error.to_string())?
+        }
+        None => {
+            for row in 0..target_accept_len {
+                picks
+                    .copy_hidden_row(ops.gpu()?, verify_hidden, row, pending_hidden)
+                    .map_err(|error| error.to_string())?;
+                picks
+                    .mtp_append_token(
+                        ops.gpu()?,
+                        block[row + 1],
+                        Some(pending_hidden),
+                        position + 1 + row,
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+        }
     }
     mark_phase(&mut timers, ops.gpu()?, "commit");
     let committed_end = position
@@ -8059,12 +8451,18 @@ pub(crate) fn finish_native_window(
         drafts_generated: drafts.len(),
     };
     // All fallible GPU operations are complete. Validate every owner's
-    // ticket (every band and the head, under a mesh) before invalidating
-    // any, then perform the no-copy commit boundary; a retaining window keeps
-    // the arena entries instead, so a terminal stop inside it can still roll
-    // every owner back.
-    picks.ops_finish_window(ops, target_snapshot, mtp_ticket, retain)?;
-    Ok(window)
+    // ticket (every band and the head, under a mesh) without consuming any;
+    // `publish_native_window` performs the no-copy commit boundary (a
+    // retaining window keeps the arena entries instead, so a terminal stop
+    // inside it can still roll every owner back).
+    picks.ops_window_valid(target_snapshot, mtp_ticket)?;
+    Ok(PreparedNativeWindow {
+        window,
+        target_snapshot,
+        mtp_ticket,
+        retain,
+        committed_end,
+    })
 }
 
 /// How a batched window's head reaches the committed position. Every route
@@ -8114,6 +8512,18 @@ impl Qwen4MtpDrafter {
         self.ngram_row_cost = Self::ngram_row_cost_for(gpu);
         self.agreement_decay = singleton_agreement_decay(&gpu.arch);
         self.floor.set_decay(self.agreement_decay);
+        self.g942 = gpu.arch_caps.is_gfx942();
+        if self.g942 {
+            self.g942_gemv = g942_trunk_gemv_requested();
+            self.g942_depth = parse_g942_depth(
+                hipfire_config::developer_var(MTP_G942_DEPTH_ENV)
+                    .ok()
+                    .as_deref(),
+            );
+        } else {
+            self.g942_gemv = false;
+            self.g942_depth = Ok(None);
+        }
     }
 
     /// Every timing- or host-state-dependent decision of the next window,
@@ -8177,11 +8587,23 @@ impl Qwen4MtpDrafter {
                 self.proposal_capacity()
             ));
         }
+        // gfx942's fixed-depth knob ([`MTP_G942_DEPTH_ENV`]) pins the window
+        // like a forced route; `HIPFIRE_MTP_INCREMENTAL=1` still wins.
+        if self.g942 {
+            if let Err(error) = &self.g942_depth {
+                return Err(error.clone());
+            }
+        }
+        let g942_depth = if self.g942 && incremental != Some("1") {
+            self.g942_depth.clone().ok().flatten()
+        } else {
+            None
+        };
         // A developer-forced route is a diagnostic override: the floor
         // neither calibrates nor retires, so the pinned route runs as before.
         // `HIPFIRE_MTP_AR_FLOOR=0` (`floor_enabled == false`) bypasses the
         // floor the same way and restores the pre-floor chooser.
-        let forced = matches!(incremental, Some("0" | "1"));
+        let forced = matches!(incremental, Some("0" | "1")) || g942_depth.is_some();
         let floor_active = self.floor_enabled && !forced;
         self.observe_think_close(emitted, floor_active);
         #[cfg(feature = "reference-parity")]
@@ -8218,6 +8640,18 @@ impl Qwen4MtpDrafter {
                 ngram_candidates: Vec::new(),
             });
         }
+        // gfx942: the verify block must be bitwise the single-row decode, and
+        // no gfx1151 price may stand in for a depth nobody measured here. A
+        // refused request runs AR: the first window takes the resource pass
+        // (like a floor retirement), later ones are head-free.
+        if self.g942 {
+            if self.g942_refused {
+                return Ok(ar(WindowRoute::ArRetired));
+            }
+            if let Some(reason) = self.g942_refusal(native_k, forced) {
+                return Ok(self.g942_refuse(reason, ar(WindowRoute::ArRouted)));
+            }
+        }
         if floor_active && self.floor.needs_ar_sample() {
             return Ok(ar(WindowRoute::ArCalibrate));
         }
@@ -8240,6 +8674,7 @@ impl Qwen4MtpDrafter {
         // interleaved verify costs one forward per emitted token and wastes no
         // draft. `HIPFIRE_MTP_INCREMENTAL=0|1` forces a route.
         let depth = match incremental {
+            _ if g942_depth.is_some() => g942_depth.map_or(k, |depth| depth.min(k)),
             Some("0") => k,
             Some("1") => 0,
             _ if !self.floor_enabled => self.floor_off_depth(k),
@@ -8254,6 +8689,22 @@ impl Qwen4MtpDrafter {
                 Action::Interleaved => 0,
                 Action::Native(depth) => depth,
             },
+        };
+        // gfx942 prices only measured depths: a chosen depth without a
+        // measurement drops to the deepest measured one below it (the
+        // interleaved baseline included), else the request runs AR.
+        let depth = if self.g942 && !forced {
+            match g942_priced_depth_at_or_below(&self.g942_cost_ms, depth) {
+                Some(priced) => priced,
+                None => {
+                    return Ok(self.g942_refuse(
+                        "no measured gfx942 window cost at or below the chosen depth",
+                        ar(WindowRoute::ArRouted),
+                    ));
+                }
+            }
+        } else {
+            depth
         };
         let mut plan = WindowPlan {
             route: WindowRoute::Native { depth },
@@ -8976,6 +9427,8 @@ impl Qwen4MtpDrafter {
                     verify_hidden: &verify_hidden,
                     ple_normed: ple_normed.as_ref(),
                     retain: true,
+                    head_at_start: false,
+                    fill: None,
                 },
                 Some(&mut timers),
             )?;
@@ -10249,6 +10702,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
         self.request = cfg;
         self.emitted_seen = None;
         self.head_lag.clear();
+        self.g942_refused = false;
         self.retained = None;
         self.floor_pending = None;
         self.floor_enabled =
@@ -10565,9 +11019,12 @@ pub(crate) fn mtp_prefill_chunk_needs_pick(
     !skip_intermediate || end == prompt_len
 }
 /// Whether this GPU's GDN route captures verify rows: row capture rides the
-/// few-row persistent GDN recurrence.
+/// few-row persistent GDN recurrence. gfx942 captures the F32 state only, so
+/// there the stock-FP8 profile (which pins it, [`crate::state::resolve_gdn_format`])
+/// is required.
 pub fn native_mtp_row_capture(gpu: &Gpu, config: &crate::Qwen4Config) -> bool {
-    gpu.arch_caps.has_gfx11_plus_simt()
+    gpu.arch_caps.has_qwen4_gdn_row_capture()
+        && (!gpu.arch_caps.is_gfx942() || config.profile.is_stock_fp8())
         && config.linear_key_head_dim == 128
         && config.linear_value_head_dim == 128
         && config.linear_conv_kernel_dim == 4
@@ -10626,6 +11083,24 @@ pub fn native_mtp_fill_scratch(gpu: &Gpu) -> bool {
     (gpu.arch_caps.is_gfx1151() || gpu.arch_caps.is_gfx1201()) && mtp_fill_scratch_wanted(gpu)
 }
 
+/// Set by the EP loader (`qwen4_set_lane_append_shared`) when the load reserves MTP lanes under
+/// `HIPFIRE_QWEN4_LANE_APPEND_SHARE`: the singleton drafter's Append scratch is then a view of
+/// the lane store's, so the native-MTP census charges it once (in the lane store).
+static LANE_APPEND_SHARED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Set or clear [`LANE_APPEND_SHARED`]; cleared by every Qwen4 load.
+pub fn qwen4_set_lane_append_shared(on: bool) {
+    LANE_APPEND_SHARED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// [`native_mtp_fill_scratch`] as the native-MTP census of a placement charges it: the
+/// singleton drafter's Append scratch only where it is its own allocation
+/// ([`LANE_APPEND_SHARED`] off).
+pub fn native_mtp_fill_scratch_charged(gpu: &Gpu) -> bool {
+    native_mtp_fill_scratch(gpu) && !LANE_APPEND_SHARED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Device bytes native MTP adds to a load whose QSA context storage is
 /// `context` (its admitted `max_seq` and committed part) with a
 /// `chunk_rows` prefill chunk, windows of up to `max_k` drafts (pass
@@ -10637,7 +11112,10 @@ pub fn native_mtp_fill_scratch(gpu: &Gpu) -> bool {
 /// is larger), the pending, row and retained-pending hidden carries, with `row_capture`
 /// (the GDN state format and ring rows, [`native_mtp_capture`]) the GDN
 /// capture ring in that format, and with `batched_fill`
-/// (where [`native_mtp_fill_scratch`]) the prompt-fill Append scratch.
+/// (where [`native_mtp_fill_scratch`]) the prompt-fill Append scratch. The head part and the
+/// request carries are sized under the head's GLOBAL geometry
+/// ([`crate::Qwen4Config::mtp_geometry`]: identity unless a TP trunk shard keeps the head);
+/// the GDN capture ring is the caller's `row_capture` (the trunk's, on its own config).
 pub fn native_mtp_device_bytes(
     config: &crate::Qwen4Config,
     context: &crate::Qwen4ContextCommit,
@@ -10647,8 +11125,37 @@ pub fn native_mtp_device_bytes(
     row_capture: Option<(crate::GdnStateFormat, usize)>,
     batched_fill: bool,
 ) -> Option<u64> {
-    let request = native_mtp_request_bytes(
+    native_mtp_device_bytes_ring(
         config,
+        config.mtp_geometry(),
+        context,
+        chunk_rows,
+        max_k,
+        head_dtype,
+        row_capture,
+        batched_fill,
+    )
+}
+
+/// [`native_mtp_device_bytes`] with the GDN capture ring sized under `ring_config` instead of
+/// the head's geometry: the EP reserve census passes the trunk shard's rank-local config
+/// (`HIPFIRE_EP_RESERVE_CENSUS`: 24 value heads, half of the global ring), since the rank
+/// allocates the ring on its own trunk's state.
+#[allow(clippy::too_many_arguments)]
+pub fn native_mtp_device_bytes_ring(
+    config: &crate::Qwen4Config,
+    ring_config: &crate::Qwen4Config,
+    context: &crate::Qwen4ContextCommit,
+    chunk_rows: usize,
+    max_k: usize,
+    head_dtype: rdna_compute::DType,
+    row_capture: Option<(crate::GdnStateFormat, usize)>,
+    batched_fill: bool,
+) -> Option<u64> {
+    let config = config.mtp_geometry();
+    let request = native_mtp_request_bytes_ring(
+        config,
+        ring_config,
         context.max_seq,
         chunk_rows,
         max_k,
@@ -10686,8 +11193,31 @@ pub fn native_mtp_request_bytes(
     row_capture: Option<(crate::GdnStateFormat, usize)>,
     batched_fill: bool,
 ) -> Option<u64> {
-    native_mtp_request_allocation_sizes(
+    native_mtp_request_bytes_ring(
         config,
+        config,
+        max_seq,
+        chunk_rows,
+        max_k,
+        row_capture,
+        batched_fill,
+    )
+}
+
+/// [`native_mtp_request_bytes`] with the GDN capture ring sized under `ring_config`
+/// ([`native_mtp_request_allocation_sizes_ring`]).
+pub fn native_mtp_request_bytes_ring(
+    config: &crate::Qwen4Config,
+    ring_config: &crate::Qwen4Config,
+    max_seq: usize,
+    chunk_rows: usize,
+    max_k: usize,
+    row_capture: Option<(crate::GdnStateFormat, usize)>,
+    batched_fill: bool,
+) -> Option<u64> {
+    native_mtp_request_allocation_sizes_ring(
+        config,
+        ring_config,
         max_seq,
         chunk_rows,
         max_k,
@@ -10713,6 +11243,30 @@ pub(crate) fn native_mtp_request_allocation_sizes(
     row_capture: Option<(crate::GdnStateFormat, usize)>,
     batched_fill: bool,
 ) -> Option<Vec<u64>> {
+    native_mtp_request_allocation_sizes_ring(
+        config,
+        config,
+        max_seq,
+        chunk_rows,
+        max_k,
+        row_capture,
+        batched_fill,
+    )
+}
+
+/// [`native_mtp_request_allocation_sizes`] with the GDN capture ring sized under `ring_config`
+/// (the trunk's own config) while the carries and the prompt-fill scratch stay under `config`.
+/// `ring_config` is `config` everywhere but an EP trunk-shard census, where the ring is the
+/// rank-local (half the value heads) one.
+pub(crate) fn native_mtp_request_allocation_sizes_ring(
+    config: &crate::Qwen4Config,
+    ring_config: &crate::Qwen4Config,
+    max_seq: usize,
+    chunk_rows: usize,
+    max_k: usize,
+    row_capture: Option<(crate::GdnStateFormat, usize)>,
+    batched_fill: bool,
+) -> Option<Vec<u64>> {
     let rows = native_mtp_window_rows(max_k);
     let hidden_row = config
         .hc_count
@@ -10732,10 +11286,10 @@ pub(crate) fn native_mtp_request_allocation_sizes(
     if let Some((gdn, ring_rows)) = row_capture {
         sizes.extend(
             crate::state::Qwen4State::row_capture_allocation_sizes_scoped(
-                config,
+                ring_config,
                 gdn,
                 ring_rows.max(rows),
-                config.n_linear_layers(),
+                ring_config.n_linear_layers(),
             )?,
         );
     }
@@ -11887,6 +12441,159 @@ mod tests {
         assert!(drafter.floor.retired() && drafter.stats.mtp_retired);
         // Retirement is sticky: the next window skips the resource pass.
         assert_eq!(plan_of(&mut drafter, 3, None).route, WindowRoute::ArRetired);
+    }
+
+    fn g942_drafter() -> Qwen4MtpDrafter {
+        let mut drafter = Qwen4MtpDrafter::new(3, 4096, None);
+        drafter.g942 = true;
+        drafter
+    }
+
+    #[test]
+    fn g942_without_a_measured_cost_refuses_native_depths_and_never_borrows_the_gfx1151_table() {
+        let mut drafter = g942_drafter();
+        drafter.g942_cost_ms = [None; MTP_WINDOW_COST.len()];
+        for depth in 0..MTP_WINDOW_COST.len() {
+            assert!(drafter.window_cost_prior(depth).is_infinite(), "{depth}");
+        }
+        assert!(drafter.ngram_window_cost(3).is_infinite());
+        // gfx1151's table still prices every other arch.
+        let other = Qwen4MtpDrafter::new(3, 4096, None);
+        assert_eq!(other.window_cost_prior(3), MTP_WINDOW_COST[3]);
+        // Even with a calibrated floor (which would route Native on gfx1151)
+        // the request runs AR: the first window takes the resource pass, the
+        // rest are head-free, and the latch is the request's.
+        drafter.floor.seed_calibrated(30_000.0);
+        let plan = plan_of(&mut drafter, 3, None);
+        assert_eq!(plan.route, WindowRoute::ArRouted);
+        assert!(drafter.g942_refused && drafter.stats.mtp_retired);
+        assert_eq!(plan_of(&mut drafter, 3, None).route, WindowRoute::ArRetired);
+        drafter.configure_request(SpecRequestConfig::default());
+        assert!(!drafter.g942_refused);
+    }
+
+    #[test]
+    fn g942_forced_depth_pins_a_floorless_native_window() {
+        let mut drafter = g942_drafter();
+        drafter.g942_depth = Ok(Some(2));
+        let plan = plan_of(&mut drafter, 3, None);
+        assert_eq!(plan.route, WindowRoute::Native { depth: 2 });
+        assert!(!plan.floor_active && !drafter.g942_refused);
+        assert_eq!(
+            plan_of(&mut drafter, 1, None).route,
+            WindowRoute::Native { depth: 1 }
+        );
+        // The interleaved pin still wins; INCREMENTAL=0 takes the forced depth.
+        assert_eq!(
+            plan_of(&mut drafter, 3, Some("1")).route,
+            WindowRoute::Native { depth: 0 }
+        );
+        assert_eq!(
+            plan_of(&mut drafter, 3, Some("0")).route,
+            WindowRoute::Native { depth: 2 }
+        );
+        // The knob is gfx942's: elsewhere it is ignored.
+        let mut other = Qwen4MtpDrafter::new(3, 4096, None);
+        other.g942_depth = Ok(Some(2));
+        assert_eq!(plan_of(&mut other, 3, None).route, WindowRoute::ArCalibrate);
+    }
+
+    #[test]
+    fn g942_depth_env_parses_strictly() {
+        assert_eq!(parse_g942_depth(None), Ok(None));
+        assert_eq!(parse_g942_depth(Some("  ")), Ok(None));
+        assert_eq!(parse_g942_depth(Some(" 3 ")), Ok(Some(3)));
+        assert_eq!(parse_g942_depth(Some("0")), Ok(Some(0)));
+        assert_eq!(parse_g942_depth(Some("7")), Ok(Some(7)));
+        for bad in ["8", "-1", "x", "2.5"] {
+            assert!(parse_g942_depth(Some(bad)).is_err(), "{bad}");
+        }
+        let mut drafter = g942_drafter();
+        drafter.g942_depth = parse_g942_depth(Some("9"));
+        let error = drafter
+            .plan_window_with(&[0, 1], 3, None, false)
+            .expect_err("a malformed depth fails the window");
+        assert!(error.contains(MTP_G942_DEPTH_ENV), "{error}");
+    }
+
+    #[test]
+    fn g942_gemv_trunk_refuses_native_even_with_a_forced_depth() {
+        let mut drafter = g942_drafter();
+        drafter.g942_depth = Ok(Some(2));
+        drafter.g942_gemv = true;
+        assert_eq!(plan_of(&mut drafter, 3, None).route, WindowRoute::ArRouted);
+        assert_eq!(plan_of(&mut drafter, 3, None).route, WindowRoute::ArRetired);
+        let mut pinned = g942_drafter();
+        pinned.g942_gemv = true;
+        assert_eq!(
+            plan_of(&mut pinned, 3, Some("0")).route,
+            WindowRoute::ArRouted
+        );
+    }
+
+    #[test]
+    fn g942_measured_costs_price_only_their_own_depths() {
+        let unmeasured = || {
+            let mut drafter = g942_drafter();
+            drafter.g942_cost_ms = [None; MTP_WINDOW_COST.len()];
+            drafter
+        };
+        let mut drafter = unmeasured();
+        // Only the interleaved baseline: no batched depth is priced.
+        drafter.g942_cost_ms[0] = Some(30.0);
+        assert_eq!(plan_of(&mut drafter, 3, None).route, WindowRoute::ArRouted);
+        // Batched depths without the baseline cannot be priced either.
+        let mut no_base = unmeasured();
+        no_base.g942_cost_ms[2] = Some(50.0);
+        assert_eq!(plan_of(&mut no_base, 3, None).route, WindowRoute::ArRouted);
+        // Baseline and depth 2 measured: depth 2 is the only priced batched
+        // depth and it beats the baseline at the prior agreement.
+        let mut priced = unmeasured();
+        priced.g942_cost_ms[0] = Some(30.0);
+        priced.g942_cost_ms[2] = Some(60.0);
+        assert_eq!(priced.window_cost_prior(0), 1.0);
+        assert_eq!(priced.window_cost_prior(2), 2.0);
+        assert!(priced.window_cost_prior(1).is_infinite());
+        priced.floor.seed_calibrated(30_000.0);
+        let plan = plan_of(&mut priced, 3, None);
+        assert_eq!(plan.route, WindowRoute::Native { depth: 2 });
+        assert!(plan.floor_active && !priced.g942_refused);
+    }
+
+    #[test]
+    fn g942_shipped_table_prices_published_depths_and_keeps_a_batched_plan_at_depth_one() {
+        let mut drafter = g942_drafter();
+        let base = MTP_WINDOW_COST_MS_GFX942[0].expect("the baseline is published");
+        assert!(base > 0.0);
+        for (depth, cost) in MTP_WINDOW_COST_MS_GFX942.iter().enumerate() {
+            if let Some(cost) = cost {
+                let prior = drafter.window_cost_prior(depth);
+                assert!(prior.is_finite(), "{depth}");
+                assert_eq!(prior, cost / base, "{depth}");
+            }
+        }
+        // An unpublished depth 2 maps to the deepest published one below it.
+        let mut table = MTP_WINDOW_COST_MS_GFX942;
+        table[2] = None;
+        assert_eq!(g942_priced_depth_at_or_below(&table, 2), Some(1));
+        assert_eq!(g942_priced_depth_at_or_below(&table, 0), Some(0));
+        // At the prior agreement (a fresh request) gfx942 already prices from
+        // its table: depth 1, never the K=3 start of the other arches.
+        assert!(drafter
+            .agreement
+            .iter()
+            .all(|&entry| entry == AGREEMENT_PRIOR));
+        assert_eq!(drafter.batched_depth(3), 1);
+        // With high agreement the measured prices (depth >= 2 costs several
+        // tokens) keep the chosen batched depth at or below 1.
+        for entry in drafter.agreement.iter_mut() {
+            *entry = (19.0, 20.0);
+        }
+        assert!(
+            drafter.batched_depth(3) <= 1,
+            "{}",
+            drafter.batched_depth(3)
+        );
     }
 
     fn plan_window_budget_error(drafter: &mut Qwen4MtpDrafter, k: usize) -> String {

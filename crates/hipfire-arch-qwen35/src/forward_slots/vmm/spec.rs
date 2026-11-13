@@ -249,7 +249,8 @@ impl Qwen35VmmStore {
                     prompt,
                     0,
                     route,
-                    |_, _, _, _| Ok(()),
+                    None,
+                    |_, _, _, _, _| Ok(()),
                 )
                 .map_err(|e| e.to_string())
             });

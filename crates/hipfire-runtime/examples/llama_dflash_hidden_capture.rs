@@ -18,7 +18,7 @@
 //!   cargo run --release --example llama_dflash_hidden_capture -- <model.mq4>
 
 use hipfire_arch_llama::load_llama_bundle;
-use hipfire_runtime::loader_api::{CaskConfig, LoadCtx, ModelSource, SpecLoadCfg};
+use hipfire_runtime::loader_api::{LoadCtx, ModelSource, SpecLoadCfg};
 use hipfire_runtime::spec::{SpecAdvance, SpecTarget};
 
 fn main() {
@@ -33,7 +33,6 @@ fn main() {
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
 
     let src = ModelSource::from_path(&model_path).expect("open model source");
-    let cask = CaskConfig::default();
     let mut ctx = LoadCtx {
         path: &model_path,
         max_seq: 2048,
@@ -48,7 +47,6 @@ fn main() {
         kv_adaptive_override: None,
         state_quant_override: None,
         qwen_default_q8: true,
-        cask: &cask,
         pp: 1,
         pp_layer_counts: None,
         admitted_mesh: None,

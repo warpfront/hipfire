@@ -38,7 +38,7 @@
 //! `scripts/jev_eval/gates.py` gate 1b as the per-model path-noise floor.
 
 use hipfire_loader::{Carrier, LoadedModel};
-use hipfire_runtime::loader_api::{CaskConfig, SpecLoadCfg};
+use hipfire_runtime::loader_api::SpecLoadCfg;
 
 const TEXT: &str = "The customer wrote in on Tuesday afternoon to say that the order \
 they placed three weeks ago has still not arrived, even though the tracking page \
@@ -201,7 +201,6 @@ fn main() {
         Some(kv_mode.as_str()),
         None,
         state_quant.as_deref(),
-        &CaskConfig::default(),
         1,
         spec,
         &mut gpu,

@@ -4,8 +4,10 @@ name: CI
 #
 # hipfire loads the HIP/ROCm runtime via dlopen at *runtime* (see
 # crates/hip-bridge — libloading, no build.rs, no link-time -lamdhip64),
-# so the entire workspace compiles and unit-tests on a stock runner with
-# no GPU and no ROCm installed. The GPU-bound gates need real RDNA
+# so the entire workspace compiles on a stock runner with no GPU and no
+# ROCm installed. The test shards install the ROCm compiler toolchain (no
+# GPU, no driver) because the ISA/PeaceMaker CPU-oracle tests assemble,
+# link and compile with it. The GPU-bound gates need real RDNA
 # hardware and are run MANUALLY from a checkout — see docs/VALIDATION.md
 # and scripts/gates.sh. The agentic CI gate workflows (claude-review.yml,
 # gpu-gates.yml, gate-merge.yml, gate-sweep.yml) were removed; they were
@@ -31,6 +33,9 @@ on:
     # via the GPU-free `cargo test --lib --workspace` dispatch coverage gate,
     # not just on PRs. beta = pre-release line, also pushed to directly.
     branches: [master, beta, 'integration/**']
+  # Manual runs on any branch (`gh workflow run ci.yml --ref <branch>`), e.g.
+  # to prove a CI change green before it lands.
+  workflow_dispatch:
 
 # Supersede in-flight runs when a PR gets new pushes.
 concurrency:
@@ -108,7 +113,10 @@ jobs:
       # Belt and braces on a GPU-less runner: no test may see a device.
       ROCR_VISIBLE_DEVICES: "-1"
       HIP_VISIBLE_DEVICES: "-1"
-      HIPFIRE_TEST_REQUIRE_ROCM: "0"
+      # No HIPFIRE_TEST_REQUIRE_ROCM=0: the step below installs the ROCm
+      # compiler toolchain, so every ISA/PeaceMaker CPU-oracle test (llvm-mc,
+      # ld.lld, hipcc, ...) runs here instead of skipping, and a missing tool
+      # fails the shard. Only the Windows job is a no-ROCm host.
       # GPU-free integration/bin tests: `--lib` skips crates/*/tests/*.rs and
       # bin-only unit tests. These crates' integration tests are GPU-free (GPU
       # ones are #[ignore]). The `int-*` shards split them by the first letter
@@ -169,6 +177,32 @@ jobs:
     steps:
       - name: Private hipfire lock dir
         run: echo "HIPFIRE_LOCK_DIR=$RUNNER_TEMP/hipfire-locks" >> "$GITHUB_ENV" && mkdir -p "$RUNNER_TEMP/hipfire-locks"
+      - name: ROCm 10.1 compiler toolchain (CPU oracles; no GPU)
+        # The Containerfile's rocm-sdk packages and pins (ROCm 10.1.0-3, the
+        # release kernel-pack toolchain), from AMD's repo for this runner's
+        # Ubuntu, laid out as on a dev host (/opt/rocm/{bin,lib,llvm,core,...}
+        # -> core-10.1) so the oracle tests resolve the tools they use there.
+        run: |
+          set -euo pipefail
+          ROCM_PKG_VERSION=10.1.0-3
+          . /etc/os-release
+          sudo install -d -m 0755 /etc/apt/keyrings
+          curl -fsSL https://stable.repo.amd.com/rocm/gpg/packages.gpg | sudo tee /etc/apt/keyrings/amdrocm.asc >/dev/null
+          fingerprint="$(gpg --batch --with-colons --show-keys /etc/apt/keyrings/amdrocm.asc | awk -F: '$1 == "fpr" { print $10; exit }')"
+          test "$fingerprint" = D0F004A0025A1145C7807FCD0701EAC4D5E02107
+          echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/amdrocm.asc] https://stable.repo.amd.com/rocm/core/packages/ubuntu${VERSION_ID//./} stable main" \
+            | sudo tee /etc/apt/sources.list.d/amdrocm.list >/dev/null
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            amdrocm-runtime10.1="$ROCM_PKG_VERSION" amdrocm-runtime-dev10.1="$ROCM_PKG_VERSION"
+          for name in bin lib include libexec share; do sudo ln -sfn "core-10.1/$name" "/opt/rocm/$name"; done
+          sudo ln -sfn core-10.1/lib/llvm /opt/rocm/llvm
+          sudo ln -sfn core-10.1/lib/llvm/amdgcn /opt/rocm/amdgcn
+          sudo ln -sfn core-10.1 /opt/rocm/core
+          sudo ln -sfn core-10.1 /opt/rocm/core-10
+          /opt/rocm/lib/llvm/bin/clang --version
+          /opt/rocm/bin/hipcc --version
+          df -h /
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2

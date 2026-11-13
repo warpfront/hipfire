@@ -3,7 +3,7 @@
 **Status:** design (supersedes the Step-A/B "Deferred (separate plans)" section of
 `2026-06-11-carrier-registry-loader.md`).
 **Date:** 2026-06-11
-**Branch:** `feature/paro-transparent-loading`
+**Branch:** `feature/transparent-loading`
 **Prereq:** Step A + B already landed (`6b566654`, `b50f5ff4`).
 
 ## Problem
@@ -240,7 +240,7 @@ so they can't be set piecemeal. The VL arm must likewise set `vision_config`/`vi
    carry `SafetensorsSource` so `arch_id()`/`probe` work on the Dir namespace (B1/B2); give
    qwen35/llama carriers a `Dir` arm reproducing today's routing (5/6→qwen35, 0/1→llama);
    carriers own tokenizer/template resolution (S1); delete `is_dir` pre-branch. Build +
-   **safetensors smoke** on `~/.hipfire/models/shisa-Qwen3.6-35B-A3B-PARO-packed` — and
+   **safetensors smoke** on a Qwen3.6-35B-A3B safetensors directory — and
    verify it routes to qwen35, not llama. Own commit.
 5. **Fold pp>1** — move `load_model_pp` into `Qwen35Carrier` `pp>1` arm, reproducing the
    draft/cask/kv_adaptive drop (S3) and setting all four pp fields + the
@@ -266,8 +266,8 @@ so they can't be set piecemeal. The VL arm must likewise set `vision_config`/`vi
 ### Tier 2: unified loader (WeightSource + device slice) — added 2026-06-12
 
 The three `load_weights*` entry points were unified behind one `assemble_weights`
-driver over a `&mut [Gpu]` device slice + `Layout`, with HFQ/PaRo isolated behind a
-`WeightSource` trait (`HfqSource`/`ParoSource`). Single-GPU is the `len()==1` case;
-multi-GPU is HFQ-only (PaRo `prepare(n>1)` errors). Tied-embedding alias is gated to
+driver over a `&mut [Gpu]` device slice + `Layout`, with HFQ isolated behind a
+`WeightSource` trait (`HfqSource`). Single-GPU is the `len()==1` case;
+multi-GPU is HFQ-only. Tied-embedding alias is gated to
 `len()==1` to stay byte-identical. The public API was collapsed to a single
 `load_weights` entry (was 3). Carrier registry (Tier 1) unchanged in behavior.

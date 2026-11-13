@@ -57,7 +57,7 @@ echo "  prefill_len:  $PREFILL_LEN"
 echo
 
 echo "  [1/2] running default path (wave64 FP16 hybrid on gfx906)..."
-HIPFIRE_KV_MODE=asym3 \
+HIPFIRE_KV_MODE=fwht3 \
     target/release/examples/dump_logits_qwen35 "$MODEL" "$DUMP_DEFAULT" \
     --prefill "$PREFILL_LEN" >/tmp/divergence_default.log 2>&1 || {
     echo "  default path FAILED — see /tmp/divergence_default.log" >&2
@@ -65,7 +65,7 @@ HIPFIRE_KV_MODE=asym3 \
 }
 
 echo "  [2/2] running fallback path (HIPFIRE_FP16=0)..."
-HIPFIRE_KV_MODE=asym3 HIPFIRE_FP16=0 \
+HIPFIRE_KV_MODE=fwht3 HIPFIRE_FP16=0 \
     target/release/examples/dump_logits_qwen35 "$MODEL" "$DUMP_FALLBACK" \
     --prefill "$PREFILL_LEN" >/tmp/divergence_fallback.log 2>&1 || {
     echo "  fallback path FAILED — see /tmp/divergence_fallback.log" >&2

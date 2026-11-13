@@ -108,7 +108,7 @@ fn transfer(inst: &Inst, arch: Arch, old: &Constants, writes: &super::Bits) -> C
             next[d - S0] = Mask::UNKNOWN;
         }
     }
-    let Some(name) = inst.op.name(arch) else {
+    let Some(name) = inst.name(arch) else {
         return next;
     };
     let ops = inst.operands.as_slice();
@@ -257,7 +257,7 @@ fn written_lanes(
     wave: Wave,
     arch: Arch,
 ) -> u64 {
-    if destination(inst) == Some(reg) && inst.op.name(arch) == Some("v_writelane_b32") {
+    if destination(inst) == Some(reg) && inst.name(arch) == Some("v_writelane_b32") {
         return lane_index(inst, constants).map_or(0, |lane| 1u64 << lane);
     }
     // DPP/SDWA selection can preserve destination lanes/halves even when the
@@ -289,7 +289,7 @@ fn observes(
     if !flow.acc[p].reads.has(reg * 2) && !flow.acc[p].reads.has(reg * 2 + 1) {
         return 0;
     }
-    let name = inst.op.name(arch).unwrap_or("");
+    let name = inst.name(arch).unwrap_or("");
     if name == "v_writelane_b32" && destination(inst) == Some(reg) {
         // This table use is the unmodified lanes, not a consumed operand.
         // A source explicitly naming the same VGPR is still a real read.
@@ -418,10 +418,11 @@ mod tests {
         };
         state[20] = Mask::exact(3);
         state[21] = Mask::exact(4);
-        let inst = Inst::from_parts(
+        let inst = Inst::from_encoding(
             Arch::Gfx1201,
             row.op,
             row.form,
+            row.variant,
             FormFields::None,
             smallvec![Operand::Special(Special::Exec), Operand::Reg(src)],
             Modifiers::default(),

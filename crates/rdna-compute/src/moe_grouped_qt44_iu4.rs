@@ -34,7 +34,7 @@ pub const A8_XLDS_SRC: &str =
     include_str!("../../../kernels/src/moe_grouped_qt44_a8_sym_xlds.gfx12.hip");
 pub const A8_XLDS_MODULE: &str = "moe_grouped_qt44_a8_sym_xlds_gfx12";
 pub const A8_XLDS_SYMBOL: &str = "moe_grouped_qt44_a8_sym_gfx1201_xlds_nt4r1w8";
-/// Developer switch of the xlds route (default OFF; `0` kills).
+/// Developer switch of the xlds route (default ON; `0` kills and restores the incumbent entry).
 pub const A8_XLDS_FLAG: &str = "HIPFIRE_MOE_A8_XLDS";
 /// Threads per xlds CTA (8 waves, each one 16-row weight fragment: 128 weight rows per CTA).
 pub const A8_XLDS_BLOCK: u32 = 256;
@@ -337,6 +337,7 @@ impl Gpu {
         rf: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        self.require_shipped_mq4_experts("grouped qt44 symmetric IU4/A8/FP8 launch")?;
         let err = |what: &str| hip_bridge::HipError::new(0, what);
         let gfx11 = matches!(self.arch.as_str(), "gfx1100" | "gfx1151");
         let supported = match act {
@@ -351,7 +352,7 @@ impl Gpu {
         let xlds = matches!(act, SymAct::A8)
             && a8_xlds_admits(
                 &self.arch,
-                hipfire_config::developer_bool(A8_XLDS_FLAG, false),
+                hipfire_config::developer_bool(A8_XLDS_FLAG, true),
                 m_total,
                 m,
             );

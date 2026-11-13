@@ -1,0 +1,28 @@
+{
+  "binary_path": "/scratch/quant/fn-fp8/beat/WC8/twine/target/release/examples/cdna_ds_or_hw_oracle",
+  "binary_sha256": "7d2a786ee84a40ee9c47b3fa4db797013c313a4642be31a5cad64b343ad6b742",
+  "codec_inst_source_sha256": "53d7e81432c83d35a6216e7f24e35f607557eeabaa5839e9fe674194b47c3ed2",
+  "companion_oracle_sha256": "2f4464a834311580205b8902e6dbe1fd2e5d59c6fa130f1b77d2d089f5561aa3",
+  "interpreter_mod_source_sha256": "d0df480c3909339ace2f46dc54413d70ae341b1ed24ee889a5149ccfb5568cf3",
+  "ledger": {
+    "class": "oracle",
+    "cmd": "bash /scratch/quant/fn-fp8/beat/WC8/twine/run-compiler-oracles.sh",
+    "end": "2026-11-13T00:52:53+00:00",
+    "exit": 0,
+    "line": 323,
+    "loadavg": "2.04 1.44 1.66",
+    "min_free_ram_pct": 97,
+    "owner": "TwinWide942e.compiler",
+    "peak_runnable": 11,
+    "run_s": 11,
+    "start": "2026-11-13T00:52:42+00:00",
+    "wait_s": 1246
+  },
+  "raw_log_sha256": "2c7423943bc918e35245f6ae2890ef243eaff3b3ee38231b2f7bd7e19e913151",
+  "raw_oracle_sha256": "b7c63b7dddce0c95207c28c41819d5806dda6e7f39bcce78897a3a82f04aa30d",
+  "remote_oracle": "/scratch/quant/fn-fp8/beat/WC8/twine/out/ds-or-r2/receipt.json",
+  "schema": "cdna_ds_or_hw_oracle/receipt-1",
+  "shared_model_provenance": "Source stamps from the companion compare executable built from the same synchronized source root and run in the same successful batch.",
+  "source_tip": "55e9a736fe94cdc36f9c26844ed959542dbe2099",
+  "status": "PASS"
+}

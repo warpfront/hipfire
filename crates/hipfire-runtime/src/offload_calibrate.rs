@@ -31,7 +31,7 @@ use hipfire_dispatch::offload_split::{probe_synthetic, SplitCalibration};
 ///
 /// The Lloyd variants are deliberately absent: their GEMV arms need the
 /// per-tensor codebook LUTs, which a synthetic weight cannot carry, and the
-/// unrotated MFP4/PARO families have no CPU decoder at all.
+/// unrotated MFP4 family has no CPU decoder at all.
 const FORMATS: &[(&str, u8, DType)] = &[
     ("mq4g256", 13, DType::MQ4G256),
     ("mq4g256v2", 44, DType::MQ4G256V2),

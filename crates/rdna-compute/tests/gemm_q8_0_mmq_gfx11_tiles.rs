@@ -219,3 +219,147 @@ fn pick_tile_is_total() {
         }
     }
 }
+
+/// The `_bf16` tile entries must equal the plain tile followed by the production round pass
+/// (`Gpu::bf16_round_trip_f32_strided` over the `[n, m]` plane), bit for bit (class E), on every
+/// tile, the selector route, normal values, values overflowing to Inf and deep denormals, M and N
+/// tails. NaN-filled outputs prove every element is stored.
+fn check_bf16_site(
+    gpu: &mut Gpu,
+    m: usize,
+    k: usize,
+    n: usize,
+    xs: f32,
+    seed: u64,
+    tiles: &[Q8MmqTile],
+) {
+    let mut rng = Rng(seed);
+    let wbytes = make_weights(m, k, &mut rng);
+    // Every third token row is scaled by `xs`: a huge `xs` overflows that row's f16 Q8_1 scale to
+    // Inf, so tiles mix finite and non-finite outputs (the f16 scales bound the finite range).
+    let x: Vec<f32> = make_x(n, k, &mut rng)
+        .chunks(k)
+        .enumerate()
+        .flat_map(|(t, row)| {
+            let f = if t % 3 == 0 { xs } else { 1.0 };
+            row.iter().map(move |v| v * f)
+        })
+        .collect();
+    let w = gpu.upload_raw(&wbytes, &[wbytes.len()]).expect("w");
+    let xt = gpu.upload_f32(&x, &[n * k]).expect("x");
+    let acts = gpu.q8_mmq_quantize_x(&xt, n, k).expect("quantize x");
+    for &tile in tiles {
+        let label = tile.label();
+        let y0 = gpu.upload_f32(&nan_buf(n * m), &[n * m]).expect("y0");
+        gpu.gemm_q8_0_mmq_gfx11_gemm_tile(&w, &acts, &y0, m, tile)
+            .unwrap_or_else(|e| panic!("plain {label} ({m},{k},{n}): {e:?}"));
+        let nonfinite = gpu
+            .download_f32(&y0)
+            .expect("download plain")
+            .iter()
+            .filter(|v| !v.is_finite())
+            .count();
+        gpu.bf16_round_trip_f32_strided(&y0, n, 0, m, m)
+            .expect("separate round pass");
+        let want = gpu.download_f32(&y0).expect("download unfused");
+        let y1 = gpu.upload_f32(&nan_buf(n * m), &[n * m]).expect("y1");
+        gpu.gemm_q8_0_mmq_gfx11_gemm_tile_bf16(&w, &acts, &y1, m, tile)
+            .unwrap_or_else(|e| panic!("bf16 {label} ({m},{k},{n}): {e:?}"));
+        let got = gpu.download_f32(&y1).expect("download bf16");
+        assert_bits_eq(
+            &got,
+            &want,
+            &format!("bf16 tile {label} ({m},{k},{n}) xs={xs:e}"),
+        );
+        eprintln!(
+            "gfx11 mmq bf16 {label} ({m},{k},{n}) xs={xs:e}: bit-identical to plain + round ({nonfinite} non-finite)"
+        );
+    }
+    // selector route (what the dispatcher calls)
+    let y0 = gpu.upload_f32(&nan_buf(n * m), &[n * m]).expect("y0");
+    gpu.gemm_q8_0_mmq_gfx11_gemm(&w, &acts, &y0, m)
+        .expect("plain selector");
+    gpu.bf16_round_trip_f32_strided(&y0, n, 0, m, m)
+        .expect("round");
+    let want = gpu.download_f32(&y0).expect("download");
+    let y1 = gpu.upload_f32(&nan_buf(n * m), &[n * m]).expect("y1");
+    gpu.gemm_q8_0_mmq_gfx11_gemm_bf16(&w, &acts, &y1, m)
+        .expect("bf16 selector");
+    let got = gpu.download_f32(&y1).expect("download");
+    assert_bits_eq(
+        &got,
+        &want,
+        &format!("bf16 selector ({m},{k},{n}) xs={xs:e}"),
+    );
+}
+
+#[test]
+#[ignore = "needs a gfx1100 / gfx1151 GPU"]
+fn bf16_epilogue_tails_overflow_and_denormals() {
+    let mut gpu = Gpu::init().expect("gpu init");
+    if !gfx11(&gpu) {
+        return;
+    }
+    let shapes: [(usize, usize, usize); 8] = [
+        (576, 2560, 512),
+        (5120, 2560, 512),
+        (2560, 5120, 300),
+        (1000, 2560, 475),
+        (1088, 2560, 65),
+        (40, 2560, 512),
+        (64, 128, 1),
+        (130, 640, 129),
+    ];
+    for (xs_i, xs) in [1.0f32, 3.0e3, 1.0e32, 1.0e37, 1.0e-37]
+        .into_iter()
+        .enumerate()
+    {
+        for (i, &(m, k, n)) in shapes.iter().enumerate() {
+            check_bf16_site(
+                &mut gpu,
+                m,
+                k,
+                n,
+                xs,
+                0x1100_bf16 + (i * 8 + xs_i) as u64,
+                &Q8MmqTile::ALL,
+            );
+        }
+    }
+}
+
+/// Every Raon Q8_0 prefill site (K % 128 == 0, the tiled route's admission) x rows {64, 512, 1000,
+/// 4096}, all three tiles and the selector: fused output == unfused GEMM + separate round.
+#[test]
+#[ignore = "needs a gfx1100 / gfx1151 GPU"]
+fn bf16_epilogue_raon_site_shapes() {
+    let mut gpu = Gpu::init().expect("gpu init");
+    if !gfx11(&gpu) {
+        return;
+    }
+    // (M, K) of the Raon Q8 sites (`bench_q8_raon_shapes`); mla_q_b (7680 x 576) has K % 128 != 0 and
+    // never takes the tiled route.
+    let sites: [(usize, usize); 8] = [
+        (5120, 2560),
+        (2560, 5120),
+        (10240, 512),
+        (576, 2560),
+        (1088, 2560),
+        (2560, 1280),
+        (12032, 2560),
+        (2560, 12032),
+    ];
+    for (i, &(m, k)) in sites.iter().enumerate() {
+        for (j, &n) in [64usize, 512, 1000, 4096].iter().enumerate() {
+            check_bf16_site(
+                &mut gpu,
+                m,
+                k,
+                n,
+                1.0,
+                0x1100_5173 + (i * 4 + j) as u64,
+                &Q8MmqTile::ALL,
+            );
+        }
+    }
+}

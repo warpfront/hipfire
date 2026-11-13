@@ -22,7 +22,7 @@ use crate::families::attention::{AttentionFamily, AttnParams};
 use crate::families::gemv::WeightRef;
 use crate::families::kv_tier::{KvTierInputs, KvTierPlan};
 use crate::pipeline::steps::{execute_steps, GemvInput, Step};
-use crate::types::{dtype_rotation_plan, DispatchError, KernelKey, RotationPlan};
+use crate::types::{dtype_rotation_plan, DispatchError, KernelKey};
 use hip_bridge::DeviceBuffer;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::sync::LazyLock;
@@ -309,13 +309,8 @@ pub fn fused_attention_epilogue(gpu: &Gpu, dims: &HybridDims, wo: &WeightRef<'_>
 /// partials the shared q8 gated reducer consumes unmodified (StageB S6). The
 /// scalar fp8 reader writes final output directly and has no fused path, so
 /// it must never set output_gate.
-fn attention_epilogue_route_supported(
-    is_gfx1201: bool,
-    q8_route: bool,
-    asym3_route: bool,
-    fp8_route: bool,
-) -> bool {
-    q8_route || fp8_route || (!is_gfx1201 && asym3_route)
+fn attention_epilogue_route_supported(q8_route: bool, fp8_route: bool) -> bool {
+    q8_route || fp8_route
 }
 
 /// Pure core of [`conv_scalar_prep`]: the arch, env `mode` and shape decision.
@@ -408,8 +403,7 @@ pub fn conv_qknorm(gpu: &Gpu, dims: &HybridDims, q8_state: bool) -> bool {
 /// RMS norm (plus the input basis the first weight needs) followed by one
 /// projection per `(weight, output)` pair sharing that normalized input. The
 /// fusion table rewrites the projections into fused qkv/qkvza/gate-up kernels.
-/// Givens (ParoQuant) weights take a plain norm and rotate per GEMV; every
-/// other format rotates once in the norm and the GEMVs read it prerotated.
+/// Every format rotates once in the norm and the GEMVs read it prerotated.
 #[allow(clippy::too_many_arguments)]
 pub fn normed_projection<const N: usize>(
     gpu: &mut Gpu,
@@ -446,7 +440,6 @@ pub fn normed_projection<const N: usize>(
             } else {
                 let plain_w = WeightRef {
                     row_stride: 0,
-                    rotation: None,
                     awq_scale: None,
                     ..*w
                 };
@@ -464,19 +457,13 @@ pub fn normed_projection<const N: usize>(
         return Ok(());
     }
     let rotation = dtype_rotation_plan(first.dtype);
-    let givens = rotation == RotationPlan::Givens;
     // The AWQ scale is consumed by the norm, never by the GEMV.
     let weights = projections.map(|(w, _)| WeightRef {
         row_stride: 0,
-        rotation: if givens { w.rotation } else { None },
         awq_scale: None,
         ..w
     });
-    let input = if givens {
-        GemvInput::Raw(normed)
-    } else {
-        GemvInput::Prerotated(normed)
-    };
+    let input = GemvInput::Prerotated(normed);
     let gemv = |i: usize| {
         let i = i.min(N - 1);
         Step::Gemv {
@@ -495,7 +482,7 @@ pub fn normed_projection<const N: usize>(
             awq_scale: first.awq_scale,
             k: first.k,
             eps,
-            rotation: if givens { RotationPlan::None } else { rotation },
+            rotation,
             rows: 1,
         },
         gemv(0),
@@ -1092,9 +1079,7 @@ pub fn kv_attention(
     let plan = kv.tier_plan(gpu, row.position)?;
     let route = |write, attend| plan.write_key == write && plan.attend_key == attend;
     let fused_epilogue_route = attention_epilogue_route_supported(
-        gpu.arch_caps.is_gfx1201(),
         route(KernelKey::KvWriteQ8_0, KernelKey::AttnFlashQ8_0),
-        route(KernelKey::KvWriteAsym3, KernelKey::AttnFlashAsym3),
         route(KernelKey::KvWriteFp8E4m3, KernelKey::AttnFlashFp8E4m3),
     );
     let fused_epilogue = fused_attention_epilogue(gpu, dims, wo) && fused_epilogue_route;
@@ -1621,16 +1606,8 @@ mod tests {
 
     #[test]
     fn gfx1201_fa_epilogue_admits_q8_and_fp8_tile() {
-        assert!(attention_epilogue_route_supported(true, true, false, false));
-        assert!(attention_epilogue_route_supported(true, false, false, true));
-        assert!(!attention_epilogue_route_supported(
-            true, false, true, false
-        ));
-        assert!(attention_epilogue_route_supported(
-            false, false, true, false
-        ));
-        assert!(!attention_epilogue_route_supported(
-            true, false, false, false
-        ));
+        assert!(attention_epilogue_route_supported(true, false));
+        assert!(attention_epilogue_route_supported(false, true));
+        assert!(!attention_epilogue_route_supported(false, false));
     }
 }

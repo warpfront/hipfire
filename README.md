@@ -11,8 +11,8 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/warpfront/hipfire/releases"><img alt="Release v0.4.5" src="https://img.shields.io/badge/release-v0.4.5-24292f?style=flat-square" /></a>
-  <a href="CHANGELOG.md"><img alt="Changelog" src="https://img.shields.io/badge/changelog-v0.4.5-f04b24?style=flat-square" /></a>
+  <a href="https://github.com/warpfront/hipfire/releases"><img alt="Release v0.4.6" src="https://img.shields.io/badge/release-v0.4.6-24292f?style=flat-square" /></a>
+  <a href="CHANGELOG.md"><img alt="Changelog" src="https://img.shields.io/badge/changelog-v0.4.6-f04b24?style=flat-square" /></a>
   <a href="docs/MODELS.md"><img alt="94 curated registry entries" src="https://img.shields.io/badge/registry-94%20curated%20entries-ff8a1f?style=flat-square" /></a>
   <a href="https://discord.gg/F3BaywB8Rs"><img alt="Join Discord" src="https://img.shields.io/badge/chat-Discord-5865F2?style=flat-square" /></a>
 </p>
@@ -224,6 +224,16 @@ each row has the method; the [CHANGELOG](CHANGELOG.md) has the history.
 | R9700 | `qwen3.6:35b-a3b-mq4rs`, AR | `bench --matrix --spec off --pp 512,4096,16384 --tg 128 --ctx 128`, 3 fresh processes x 5 runs | prefill 11,788 (pp512), 19,867 (pp4096), 18,567 (pp16384); decode 242.2 (tg128 at 128 context) | 2026-10-27, published v0.4.4 gfx1201 binary archive | v0.4.4 release-binary bench |
 | 2x / 4x R9700 | `qwen3.8-27b.mq4-xts`, dense TP on the mesh route | `bench --matrix --spec off`, 3 fresh processes | TP2 pp2048 3,358.5, decode 54.89; TP4 pp2048 2,113.4, decode 51.77 (128 context) | 2026-10-26; TP2 beta `3385df7ea5`, TP4 the #927 pre-land build | release notes 0.4.4, [multi-gpu.md](docs/multi-gpu.md) |
 
+**v0.4.5, Flash-Next EP2 serving on 2x R9700** (2026-11-10/11, beta
+`13a4ba3c66`, fixture `qwen3.8-flash-next-base.mq4-xts-symtrunk` with its
+hot-unit sidecar, 12 fresh serves, pooled median aggregate tok/s with 95%
+bootstrap CI vs a published dual-R9700 Flash-Next result): code C8 930.9
+(1.058x [1.032, 1.071]), code C4 579.0 (0.936x), code C1 205.1 (0.781x),
+story C8 527.3 (0.794x), story C4 336.2 (0.720x), story C1 135.9 (0.718x).
+The code prompt is mostly prompt copy (about 60%), which favours speculative
+drafting. Full record, TTFT/decode split and caveats:
+[docs/perf-checkpoints/2026-11-11-flash-next-ep2-cp20.md](docs/perf-checkpoints/2026-11-11-flash-next-ep2-cp20.md).
+
 `qwen3.6:35b-a3b-mq4rs` loads on gfx1201 only; see
 [MODELS.md](docs/MODELS.md). Flash-Next on a 24 GB card (7900 XTX) runs with
 host-mapped experts, so its speed depends on the host link; no v0.4.4
@@ -414,10 +424,10 @@ notice (see `scripts/mirror_split.py`).
 Linux with ROCm 6 or newer:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/warpfront/hipfire/v0.4.5/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/warpfront/hipfire/v0.4.6/scripts/install.sh | bash
 
 # Or install the integration branch for testing:
-curl -fsSL https://raw.githubusercontent.com/warpfront/hipfire/v0.4.5/scripts/install.sh \
+curl -fsSL https://raw.githubusercontent.com/warpfront/hipfire/v0.4.6/scripts/install.sh \
   | bash -s -- --branch beta
 ```
 
@@ -437,7 +447,7 @@ and the daemon. To switch revisions, use `hipfire update @beta`,
 uninstall while keeping models and settings:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/warpfront/hipfire/v0.4.5/scripts/uninstall.sh | bash
+curl -fsSL https://raw.githubusercontent.com/warpfront/hipfire/v0.4.6/scripts/uninstall.sh | bash
 ```
 
 `--dry-run` previews the uninstall. `--purge` also deletes `~/.hipfire` and
@@ -461,14 +471,12 @@ curl http://127.0.0.1:11435/v1/models
 ```
 
 The image is `ghcr.io/warpfront/hipfire:latest` (`docker pull
-ghcr.io/warpfront/hipfire:0.4.5`); `HIPFIRE_IMAGE=ghcr.io/warpfront/hipfire:0.4.5`
+ghcr.io/warpfront/hipfire:0.4.6`); `HIPFIRE_IMAGE=ghcr.io/warpfront/hipfire:0.4.6`
 pins compose to a release.
 
-## Deprecated features
+## Removed features
 
-PFlash prefill compression, CASK / TriAttention KV eviction,
-Givens/asymmetric KV modes and the legacy DFlash knobs have been deprecated
-since 0.4.0. They are unsupported and will be removed in 0.5.0. See
+The Givens/asymmetric KV modes and the legacy DFlash knobs were removed in 0.5.0. See
 [configuration](docs/CONFIG.md) for supported settings and
 [validation](docs/VALIDATION.md) for the current gates.
 

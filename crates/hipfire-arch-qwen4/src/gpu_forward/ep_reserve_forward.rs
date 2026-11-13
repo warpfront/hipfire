@@ -278,8 +278,47 @@ pub(super) fn exchange_max_tiles(capacity: &EpExchangeCapacity, hidden: usize) -
 /// Whether a call of `n` rows on `ep` takes the owner-routed tile exchange:
 /// `forward_chunk_scoped` and the reserve bank switch share this one predicate
 /// so the bank is chosen from the same decision the forward then executes.
-/// `route_n` is the routing row count under the call's routing scopes.
+/// `route_n` is the routing row count under the call's routing scopes. The exchange runs only
+/// at the call's real extent (`route_n == n`), as it always has: a scope that substitutes the
+/// count, the ordinary prefill intent included, keeps the call on the full-table route. The
+/// trunk shard's mask-only route has its own extent rule ([`ep_partial_mask_active`]).
 pub(super) fn ep_tile_active(
+    ep: Option<&Qwen4ForwardEp>,
+    gpu: &Gpu,
+    config: &Qwen4Config,
+    n: usize,
+    route_n: usize,
+) -> bool {
+    route_n == n && ep_tile_route_admits(ep, gpu, config, n, route_n)
+}
+
+/// Whether a trunk-shard partial chunk of `n` rows (`route_n` routing rows) masks the non-owned
+/// experts' tiles out of its grouped launches (the partial tile mask, mask-only: no exchange):
+/// the owner-routed route's own admission ([`ep_tile_route_admits`]: hook installed, not a
+/// few-row window, the symmetric IU4 / F16 WMMA grouped arm at `route_n`) at the call's real
+/// extent OR under the ordinary-prefill intent ([`crate::trunk_route::routes_at_real_extent`]).
+/// A masked tile reads as the exact +0 rows the zero-dummy table wrote, so the mask is byte-exact
+/// against the unmasked partial route. Decided from `n`, `route_n`, the intent and load-time
+/// facts only, so both ranks agree. `forward_chunk_scoped` is the only executor; the reserve bank
+/// choice needs no copy of it: the partial chunk takes the borrowed bank's tile-exchange route
+/// masked or not ([`ep_wide_bank_route`]). Callers evaluate it under the call's tile scopes
+/// ([`Qwen4GpuForward::enter_tile_scopes`]), where `gpu.ordinary_prefill_active()` is the intent
+/// the forward runs in.
+pub(super) fn ep_partial_mask_active(
+    ep: Option<&Qwen4ForwardEp>,
+    gpu: &Gpu,
+    config: &Qwen4Config,
+    n: usize,
+    route_n: usize,
+) -> bool {
+    crate::trunk_route::routes_at_real_extent(n, route_n, gpu.ordinary_prefill_active())
+        && ep_tile_route_admits(ep, gpu, config, n, route_n)
+}
+
+/// The owner-routed tile route's admission without the extent rule: an installed tile route with
+/// its hook, a routing row count above one that is not a few-row window, and the symmetric IU4
+/// (gfx1201) or F16 WMMA grouped (gfx1100) arm at `route_n`.
+fn ep_tile_route_admits(
     ep: Option<&Qwen4ForwardEp>,
     gpu: &Gpu,
     config: &Qwen4Config,
@@ -295,17 +334,246 @@ pub(super) fn ep_tile_active(
     else {
         return false;
     };
-    route_n == n
-        && if route.wmma {
-            gpu.qwen4_moe_f16_wmma_grouped_applies(
-                route_n,
-                config.moe_intermediate_size,
-                config.hidden_size,
-            )
-        } else {
-            gpu.qwen4_moe_sym_iu4_applies(route_n)
-        }
+    if route.wmma {
+        gpu.qwen4_moe_f16_wmma_grouped_applies(
+            route_n,
+            config.moe_intermediate_size,
+            config.hidden_size,
+        )
+    } else {
+        gpu.qwen4_moe_sym_iu4_applies(route_n)
+    }
 }
+
+/// Whether a call of `n` rows (`route_n` routing rows) on an EP forward takes the trunk-shard
+/// PARTIAL chunk route (`partial_active`: the thread's [`crate::trunk_route`] FFN route is
+/// installed): a wide chunk binds this rank's COMPACT table (non-owned experts the zero
+/// dummy) and the all-reduce of its FFN HC write completes the FFN. `forward_chunk_tile` and
+/// the reserve's bank choice share this one predicate.
+pub(super) fn ep_trunk_partial_chunk(
+    ep_present: bool,
+    n: usize,
+    route_n: usize,
+    partial_active: bool,
+) -> bool {
+    let few_rows = (2..=QWEN4_EP_GATHER_MAX_ROWS).contains(&route_n) && route_n == n;
+    ep_present && partial_active && route_n > 1 && !few_rows
+}
+
+/// The bank route of a call wider than the resident bank. The borrowed bank overwrites donor
+/// expert bytes, so it may serve only a route whose peers read no donor entry: the owner-routed
+/// tile exchange (peers read the persistent grouped-down root) or the trunk-shard partial chunk
+/// (this rank's own compact table, no peer expert read at all). Any other wide call is the
+/// full-table route, which the epoch refuses above the resident bank.
+pub(super) fn ep_wide_bank_route(tile_active: bool, trunk_partial_chunk: bool) -> EpBankRoute {
+    if tile_active || trunk_partial_chunk {
+        EpBankRoute::TileExchange
+    } else {
+        EpBankRoute::FullTable
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Lane prefill tiles and the expert stage
+// ---------------------------------------------------------------------------
+
+/// [`QWEN4_EP_LANE_PREFILL_STAGE_MIN_ROWS_ENV`] parsed: an integer of at least 2, else `None`
+/// (unset, empty, not a number, `0`, `1`: no lane threshold, the stage keeps its own).
+pub(crate) fn ep_lane_stage_knob_from(value: Option<&str>) -> Option<usize> {
+    value
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|&rows| rows >= 2)
+}
+
+/// The lane stage threshold knob, read once per process (every rank thread agrees).
+static EP_LANE_STAGE_KNOB: std::sync::LazyLock<Option<usize>> = std::sync::LazyLock::new(|| {
+    ep_lane_stage_knob_from(
+        hipfire_config::developer_var(QWEN4_EP_LANE_PREFILL_STAGE_MIN_ROWS_ENV)
+            .ok()
+            .as_deref(),
+    )
+});
+
+pub(super) fn ep_lane_stage_knob() -> Option<usize> {
+    *EP_LANE_STAGE_KNOB
+}
+
+/// The fewest rows at which a lane prefill tile may stage whatever the knob says. The stage is
+/// only ever used by a forward on the owner-routed compact route (`ep_tile_active`: at least
+/// [`rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS`] routing rows), and on a decoupled-reserve
+/// load (`resident_call_limit` = the resident bank's call limit) strictly above that limit: a
+/// call of at most the limit runs on the resident bank, which a borrowed-only stage must never
+/// serve (`ep_reserve_stage_refusal`). Lowering the knob below this floor is inert, never unsafe.
+pub(crate) fn ep_lane_stage_floor(resident_call_limit: Option<usize>) -> usize {
+    resident_call_limit
+        .map_or(0, |limit| limit.saturating_add(1))
+        .max(rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS)
+}
+
+/// The row threshold a forward of the expert stage compares its rows with. `stage_min_rows` is
+/// the stage's own (`HIPFIRE_QWEN4_EXPERT_STAGE_MIN_ROWS`, else the arch default: 2048 on
+/// gfx1201). Only an EP lane prefill tile (`ep_lane_tile`) with the knob set takes
+/// `max(knob, floor)`; every other forward, and every forward with the knob unset, keeps
+/// `stage_min_rows` exactly.
+pub(crate) fn ep_lane_stage_min_rows(
+    stage_min_rows: usize,
+    knob: Option<usize>,
+    ep_lane_tile: bool,
+    resident_call_limit: Option<usize>,
+) -> usize {
+    match knob {
+        Some(rows) if ep_lane_tile => rows.max(ep_lane_stage_floor(resident_call_limit)),
+        _ => stage_min_rows,
+    }
+}
+
+/// The MoE route of one EP lane prefill tile or wave on this rank (the `route=` of the
+/// `HIPFIRE_CB_PHASES` per-tile line).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LaneTileRoute {
+    /// The EP full table: every expert of both ranks read through this rank's links.
+    FullTable,
+    /// The owner-routed compact route with the tile exchange (`ep_tile_active`).
+    Tile,
+    /// The trunk shard's partial chunk route (`ep_trunk_partial_chunk`): this rank's compact
+    /// table, non-owned experts run on the zero dummy, the all-reduce completes the FFN.
+    Partial,
+    /// [`Self::Partial`] with the partial tile mask (`HIPFIRE_QWEN4_EP_TRUNK_SHARD_PMASK`): the
+    /// non-owned tiles are masked out of the grouped launches, so the rank computes only its
+    /// owned experts.
+    PartialMask,
+}
+
+impl LaneTileRoute {
+    /// The route a chunk bound: the trunk shard's partial route takes precedence over the tile
+    /// exchange (`forward_chunk_scoped`), the mask applies only on the partial route.
+    pub(crate) fn of(tile_active: bool, trunk_partial: bool, partial_mask: bool) -> Self {
+        match (trunk_partial, partial_mask, tile_active) {
+            (true, true, _) => Self::PartialMask,
+            (true, false, _) => Self::Partial,
+            (false, _, true) => Self::Tile,
+            (false, _, false) => Self::FullTable,
+        }
+    }
+}
+
+/// The route one EP lane prefill tile took on this rank, kept for the `HIPFIRE_CB_PHASES`
+/// per-tile line (`[fn-lane-tile]`); it never feeds a decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LaneTileNote {
+    /// Rows of the tile.
+    pub(crate) rows: usize,
+    /// The MoE route the tile bound.
+    pub(crate) route: LaneTileRoute,
+    /// The tile staged the host experts through the expert stage.
+    pub(crate) staged: bool,
+    /// The row threshold the tile compared with (`None`: this load has no expert stage).
+    pub(crate) stage_min_rows: Option<usize>,
+}
+
+impl LaneTileNote {
+    /// Short route label of the per-tile line.
+    pub(crate) fn label(&self) -> &'static str {
+        match (self.route, self.staged) {
+            (LaneTileRoute::FullTable, _) => "full-table",
+            (LaneTileRoute::Tile, false) => "tile",
+            (LaneTileRoute::Tile, true) => "tile+stage",
+            (LaneTileRoute::Partial, false) => "partial",
+            (LaneTileRoute::Partial, true) => "partial+stage",
+            (LaneTileRoute::PartialMask, false) => "partial-mask",
+            (LaneTileRoute::PartialMask, true) => "partial-mask+stage",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The EP prefill tile route's row floor (`HIPFIRE_EP_PREFILL_TILE_MIN_ROWS`)
+// ---------------------------------------------------------------------------
+
+/// [`QWEN4_EP_PREFILL_TILE_MIN_ROWS_ENV`] parsed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PrefillTileKnob {
+    /// Unset or empty: the default floor (lowered on the A8 chain, else 512).
+    Unset,
+    /// A usable floor (the value as given; [`ep_prefill_tile_sym_floor`] clamps it to the
+    /// route's own range).
+    Floor(usize),
+    /// Refused: the reason, logged once; the default floor applies.
+    Refused(String),
+}
+
+/// Parse the knob. An integer in `LOWEST..=` anything is usable; below
+/// [`rdna_compute::gemm::QWEN4_MOE_SYM_IU4_LOWEST_FLOOR`] (the few-row routes' rows: the gathered
+/// decode / verify MoE must keep them) or not an integer is refused.
+pub(crate) fn ep_prefill_tile_knob_from(value: Option<&str>) -> PrefillTileKnob {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return PrefillTileKnob::Unset;
+    };
+    let lowest = rdna_compute::gemm::QWEN4_MOE_SYM_IU4_LOWEST_FLOOR;
+    match value.parse::<usize>() {
+        Err(_) => PrefillTileKnob::Refused(format!("{value:?} is not an integer")),
+        Ok(rows) if rows < lowest => PrefillTileKnob::Refused(format!(
+            "{rows} is below the floor of {lowest} rows: calls of at most {} rows are decode and verify and keep the gathered MoE",
+            lowest - 1
+        )),
+        Ok(rows) => PrefillTileKnob::Floor(rows),
+    }
+}
+
+/// The knob, read once per process (every rank thread agrees); a refusal is logged once.
+static EP_PREFILL_TILE_KNOB: std::sync::LazyLock<Option<usize>> = std::sync::LazyLock::new(|| {
+    match ep_prefill_tile_knob_from(
+        hipfire_config::developer_var(QWEN4_EP_PREFILL_TILE_MIN_ROWS_ENV)
+            .ok()
+            .as_deref(),
+    ) {
+        PrefillTileKnob::Unset => None,
+        PrefillTileKnob::Floor(rows) => Some(rows),
+        PrefillTileKnob::Refused(reason) => {
+            eprintln!(
+                "  qwen4 EP prefill tile route: {QWEN4_EP_PREFILL_TILE_MIN_ROWS_ENV} ignored ({reason}); the default floor applies"
+            );
+            None
+        }
+    }
+});
+
+pub(super) fn ep_prefill_tile_knob() -> Option<usize> {
+    *EP_PREFILL_TILE_KNOB
+}
+
+/// The symmetric-IU4 row floor ([`Gpu::qwen4_moe_sym_iu4_floor`]) a forward runs under. Lowered
+/// only for a PREFILL forward (`prefill_scope`: lane tile, singleton prefill, MTP prompt-fill
+/// tile; never decode, verify or the MTP head) of an EP load whose owner-routed tile exchange is
+/// installed (`tile_hook`: the forward then takes the compact route with the exchange, never
+/// the symmetric arm on the full table), and never raised above today's floor or lowered below
+/// the few-row routes' rows. `a8_chain`: the A8 owner-routed chain is the active chain of this
+/// forward (`Gpu::qwen4_moe_ep_a8_requested`; the sub-512 floor is quality-neutral only on A8,
+/// the A4 chain fails the paired KLD there): an unset knob then lowers the floor to
+/// [`EP_PREFILL_TILE_DEFAULT_FLOOR`], else it stays 512. An explicit knob value wins either
+/// way (512 is the kill switch of the floor alone). Pure: the lane tile and the singleton of the
+/// same rows read the same value, so they take the same route.
+pub(crate) fn ep_prefill_tile_sym_floor(
+    knob: Option<usize>,
+    prefill_scope: bool,
+    tile_hook: bool,
+    a8_chain: bool,
+) -> usize {
+    let default = rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS;
+    if !(prefill_scope && tile_hook) {
+        return default;
+    }
+    match knob {
+        Some(rows) => rows.clamp(rdna_compute::gemm::QWEN4_MOE_SYM_IU4_LOWEST_FLOOR, default),
+        None if a8_chain => EP_PREFILL_TILE_DEFAULT_FLOOR,
+        None => default,
+    }
+}
+
+/// The floor of an EP prefill forward on the A8 chain when the knob is unset: the lowest one
+/// (9 rows: decode and verify, at most 8 rows, keep the gathered route).
+pub(crate) const EP_PREFILL_TILE_DEFAULT_FLOOR: usize =
+    rdna_compute::gemm::QWEN4_MOE_SYM_IU4_LOWEST_FLOOR;
 
 // ---------------------------------------------------------------------------
 // Plan geometry (pure)
@@ -360,6 +628,26 @@ pub(crate) fn ep_reserve_layout(
 /// ending at the resident count, S2 donors `H-2`/`H-1` ordered by parity and
 /// disjoint from every scratch donor, all inside the trunk.
 pub(crate) fn check_stage_plan(plan: &EpReservePlan) -> Result<(), String> {
+    if plan.explicit_donors {
+        // Caller-chosen donors (unit-plan regime): any ascending set of
+        // distinct trunk layers, no S2 donors (the unit stage serves tiles).
+        let sorted = plan.donor_layers.windows(2).all(|pair| pair[0] < pair[1]);
+        if plan.donor_layers.is_empty()
+            || !sorted
+            || plan
+                .donor_layers
+                .iter()
+                .any(|&layer| layer >= plan.trunk_layers)
+            || plan.donor_first_layer != plan.donor_layers[0]
+        {
+            return Err(format!(
+                "explicit scratch donors {:?} are not an ascending set of distinct layers of the \
+                 {}-layer trunk",
+                plan.donor_layers, plan.trunk_layers
+            ));
+        }
+        return Ok(());
+    }
     let first = plan.donor_first_layer;
     let end = plan.resident_layers;
     if plan.donor_layers.is_empty()
@@ -392,12 +680,17 @@ pub(crate) fn check_stage_plan(plan: &EpReservePlan) -> Result<(), String> {
     Ok(())
 }
 
-/// The S2 host-source resolver: per layer of `[H, R)` the pinned CPU span of
-/// each loan mirror (gate/up, down). Layers `[R, trunk)` resolve to their
-/// original pinned owners at the stage, as on an ordinary load.
+/// The stage host-source resolver: per donor layer (the suffix `[H, R)`, or a unit plan's
+/// explicit whole-Resident layers) the pinned CPU span of each loan mirror (gate/up, down).
+/// Layers outside the donor set resolve to their original pinned owners at the stage, as on an
+/// ordinary load.
 pub(crate) struct EpStageHostSources {
-    first: usize,
+    /// The donor layers, ascending; `spans[i]` belongs to `layers[i]`.
+    layers: Vec<usize>,
     spans: Vec<[(usize, usize); 2]>,
+    /// Device-visible base address of each mirror (the pinned allocation's
+    /// device alias), `device[i]` for `layers[i]`, `[gate/up, down]`.
+    device: Vec<[usize; 2]>,
 }
 
 impl EpStageHostSources {
@@ -407,6 +700,7 @@ impl EpStageHostSources {
         plan: &EpReservePlan,
     ) -> Result<Self, Qwen4GpuForwardError> {
         let mut spans = Vec::with_capacity(plan.donor_layers.len());
+        let mut device = Vec::with_capacity(plan.donor_layers.len());
         for &layer in &plan.donor_layers {
             let span = |slot: EpDonorSlot| -> Result<(usize, usize), Qwen4GpuForwardError> {
                 let mirror = loan.mirror(layer, slot).ok_or_else(|| {
@@ -425,17 +719,28 @@ impl EpStageHostSources {
                     })
             };
             spans.push([span(EpDonorSlot::GateUp)?, span(EpDonorSlot::Down)?]);
+            let base = |slot: EpDonorSlot| -> Result<usize, Qwen4GpuForwardError> {
+                loan.mirror(layer, slot)
+                    .map(|mirror| mirror.tensor.buf.as_ptr() as usize)
+                    .ok_or_else(|| {
+                        invalid(format!(
+                            "EP reserve loan has no mirror of layer {layer} {slot:?}"
+                        ))
+                    })
+            };
+            device.push([base(EpDonorSlot::GateUp)?, base(EpDonorSlot::Down)?]);
         }
         Ok(Self {
-            first: plan.donor_first_layer,
+            layers: plan.donor_layers.clone(),
             spans,
+            device,
         })
     }
 
     /// The mirrors' complete pinned bytes of `layer` (gate/up, down), `None`
-    /// outside `[H, R)`.
+    /// outside the donor layers.
     pub(crate) fn pair(&self, layer: usize) -> Option<[&[u8]; 2]> {
-        let spans = self.spans.get(layer.checked_sub(self.first)?)?;
+        let spans = self.spans.get(self.layers.binary_search(&layer).ok()?)?;
         // SAFETY: each span is the pinned host allocation of a loan mirror
         // (`EpReserveLoan` owns it until its `release`, which the forward runs
         // after the stage that reads these bytes is freed); nothing writes a
@@ -447,6 +752,95 @@ impl EpStageHostSources {
             }),
         )
     }
+
+    /// [`Self::pair`] with each mirror's device-visible base address (the
+    /// pinned allocation's device alias) beside its pinned bytes, `None`
+    /// outside the donor layers. The unit stage's donor regions read this
+    /// (`slab_stage::donor_stage_regions`).
+    pub(crate) fn pair_with_device(&self, layer: usize) -> Option<[(&[u8], usize); 2]> {
+        let bytes = self.pair(layer)?;
+        let device = self.device.get(self.layers.binary_search(&layer).ok()?)?;
+        Some([(bytes[0], device[0]), (bytes[1], device[1])])
+    }
+
+    /// The donor layers with a loan mirror, ascending (the plan's
+    /// `donor_layers`).
+    pub(crate) fn layers(&self) -> &[usize] {
+        &self.layers
+    }
+
+    /// A resolver over caller-built spans, for the CPU tests of the unit
+    /// stage's donor regions: `parts[i] = (layer, [(cpu address, len);2],
+    /// [device base;2])`, layers ascending.
+    #[cfg(test)]
+    pub(crate) fn from_parts(parts: &[(usize, [(usize, usize); 2], [usize; 2])]) -> Self {
+        Self {
+            layers: parts.iter().map(|part| part.0).collect(),
+            spans: parts.iter().map(|part| part.1).collect(),
+            device: parts.iter().map(|part| part.2).collect(),
+        }
+    }
+}
+
+/// What the reserve admission reads of the built expert stage.
+pub(crate) struct EpReserveStageFacts {
+    /// The stage's first host (staged) layer.
+    pub first_host: usize,
+    /// The stage's S2 donor layers (the dedicated unit stage has none: `[usize::MAX; 2]`; a
+    /// borrowed unit stage names its two lent layers, which must not be scratch donors).
+    pub donors: [usize; 2],
+    pub min_rows: usize,
+    /// The stage reads every plan donor layer from its own unit-stage slot.
+    pub serves_donor_layers: bool,
+}
+
+/// Why the built stage cannot serve the reserve `plan`, `None` when it can. A suffix plan
+/// needs the S2 stage with exactly the plan's first host layer and S2 donors; a plan with
+/// explicit donors (`plan.explicit_donors`, no S2 donors) needs the unit stage serving every
+/// donor layer. Either stage must be borrowed-only: its `min_rows` above the resident bank.
+pub(crate) fn ep_reserve_stage_refusal(
+    plan: &EpReservePlan,
+    resident_rows: usize,
+    stage: &EpReserveStageFacts,
+) -> Option<String> {
+    let rows_bad = stage.min_rows <= resident_rows;
+    if plan.explicit_donors {
+        let lent_donor = plan
+            .donor_layers
+            .iter()
+            .find(|layer| stage.donors.contains(layer));
+        if let Some(layer) = lent_donor {
+            return Some(format!(
+                "EP reserve stage mismatch: scratch donor layer {layer} is also a lent stage layer {:?}",
+                stage.donors
+            ));
+        }
+        if rows_bad || !stage.serves_donor_layers {
+            return Some(format!(
+                "EP reserve stage mismatch: the unit stage serves the scratch donors {:?}: {} / \
+                 min rows {} (a borrowed-only stage must not serve the {resident_rows}-row \
+                 resident bank)",
+                plan.donor_layers, stage.serves_donor_layers, stage.min_rows
+            ));
+        }
+        return None;
+    }
+    if rows_bad
+        || stage.first_host != plan.donor_first_layer
+        || stage.donors != plan.s2_donor_layers
+    {
+        return Some(format!(
+            "EP reserve stage mismatch: first host layer {} / donors {:?} / min rows {} \
+             against the plan's {} / {:?} (a borrowed-only stage must not serve the \
+             {resident_rows}-row resident bank)",
+            stage.first_host,
+            stage.donors,
+            stage.min_rows,
+            plan.donor_first_layer,
+            plan.s2_donor_layers
+        ));
+    }
+    None
 }
 
 /// `mirror` as a typed, host-mapped source descriptor for a borrowed runtime:
@@ -603,6 +997,10 @@ pub(crate) struct EpReserveForward {
     pub(super) receipts: bool,
     /// `HIPFIRE_EP_RESERVE_RECEIPT_HASH` (receipts only): read the donor hashes.
     pub(super) hashes: bool,
+    /// The weight shadows live in the donor segments (rebuilt at every epoch
+    /// open, never ready outside one) and the resident bank serves only calls
+    /// below the shadow-reading routes' 512 rows.
+    pub(super) shadows: bool,
     pub(super) prompt: Option<EpPromptRecord>,
     pub(super) prompt_seq: u64,
     /// Per-rank entry counts within one `(prompt, phase)` (receipts only).
@@ -648,6 +1046,126 @@ impl EpReserveForward {
         })
     }
 
+    /// Register the weight shadows of the plan's `shadow_placements` as
+    /// non-owning views into the donor segments and lower the resident bank's
+    /// call limit below the F16 route's row threshold, so no call that reads a
+    /// shadow can run outside a borrowed epoch.
+    fn install_shadows(
+        &mut self,
+        gpu: &mut Gpu,
+        bundle: &Qwen4Bundle,
+    ) -> Result<(), Qwen4GpuForwardError> {
+        use rdna_compute::shadow_borrow::{F16ShadowSpan, ShadowBorrowPlan, SharedI8ShadowSpan};
+        let plan = self.plan.clone();
+        let (f16, shared_i8) = crate::decode_share_shadows::shadow_flags(
+            &gpu.arch,
+            gpu.qwen4_f16_shadow_capable(),
+            gpu.qwen4_shared_i8_enabled(),
+            plan.forward.prompt_rows,
+        )
+        .map_err(|reason| invalid(format!("EP reserve shadows: {reason}")))?;
+        let region = crate::decode_share_shadows::plan_shadow_region(
+            &bundle.weights.manifest.weights,
+            bundle.config.num_hidden_layers,
+            f16,
+            shared_i8,
+        )
+        .map_err(invalid)?;
+        let spans = region.spans();
+        if spans.len() != plan.shadow_placements.len()
+            || spans
+                .iter()
+                .zip(&plan.shadow_placements)
+                .any(|(span, placement)| span.2 != placement.bytes)
+        {
+            return Err(invalid(
+                "EP reserve shadows: the plan's shadow members are not the manifest's shadow region",
+            ));
+        }
+        let base_of = |layer: usize, slot: EpDonorSlot| -> Result<usize, Qwen4GpuForwardError> {
+            self.loan
+                .mirror(layer, slot)
+                .map(|mirror| mirror.donor_device_base)
+                .ok_or_else(|| invalid(format!("EP reserve shadows: no donor {layer} {slot:?}")))
+        };
+        let at = |member: usize| -> Result<usize, Qwen4GpuForwardError> {
+            let placement = &plan.shadow_placements[member];
+            usize::try_from(placement.offset)
+                .ok()
+                .and_then(|offset| {
+                    base_of(placement.layer, placement.slot)
+                        .ok()?
+                        .checked_add(offset)
+                })
+                .ok_or_else(|| invalid("EP reserve shadow address overflows"))
+        };
+        let resident = |name: &str, layer: Option<usize>| {
+            bundle
+                .weights
+                .resident_by_name(name, layer)
+                .map_err(|error| invalid(format!("EP reserve shadow source '{name}': {error}")))
+        };
+        let mut f16_spans = Vec::with_capacity(region.f16.len());
+        for (index, member) in region.f16.iter().enumerate() {
+            let tensor = resident(&member.name, member.layer)?;
+            f16_spans.push(F16ShadowSpan {
+                name: member.name.clone(),
+                src_ptr: tensor.buf.as_ptr() as usize,
+                dst_ptr: at(index)?,
+                rows: member.rows,
+                cols: member.cols,
+                hc8: tensor.dtype == rdna_compute::DType::HC8E4M3Row,
+            });
+        }
+        let mut i8_spans = Vec::with_capacity(region.shared_i8.len());
+        for (j, member) in region.shared_i8.iter().enumerate() {
+            let ptr = |proj: &str| -> Result<usize, Qwen4GpuForwardError> {
+                let name = format!(
+                    "model.language_model.layers.{}.mlp.shared_expert.{proj}.weight",
+                    member.layer
+                );
+                Ok(resident(&name, Some(member.layer))?.buf.as_ptr() as usize)
+            };
+            i8_spans.push(SharedI8ShadowSpan {
+                layer: member.layer,
+                gate_ptr: ptr("gate_proj")?,
+                up_ptr: ptr("up_proj")?,
+                down_ptr: ptr("down_proj")?,
+                intermediate: member.intermediate,
+                hidden: member.hidden,
+                down_rows: member.down_rows,
+                gate_up_dst: at(region.f16.len() + 2 * j)?,
+                down_dst: at(region.f16.len() + 2 * j + 1)?,
+            });
+        }
+        let mut extra_regions = Vec::with_capacity(plan.segments.len());
+        for segment in &plan.segments {
+            extra_regions.push((
+                base_of(segment.layer, segment.slot)?,
+                usize::try_from(segment.capacity)
+                    .map_err(|_| invalid("EP reserve segment bytes overflow"))?,
+            ));
+        }
+        gpu.install_shadow_borrow(ShadowBorrowPlan {
+            region_ptr: 0,
+            region_bytes: 0,
+            extra_regions,
+            f16: f16_spans,
+            shared_i8: i8_spans,
+        })?;
+        self.banks
+            .set_resident_call_limit(rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS - 1);
+        self.shadows = true;
+        eprintln!(
+            "  qwen4 EP reserve: {} F16 + {} INT8 weight shadows live in the donor segments \
+             (rebuilt per borrow epoch); the resident bank serves calls of at most {} rows",
+            region.f16.len(),
+            region.shared_i8.len(),
+            self.banks.resident_call_limit()
+        );
+        Ok(())
+    }
+
     /// Mirror every scratch-donor tensor, bind the touched extents and the S2
     /// host sources. On failure the banks are released (nothing else exists
     /// yet) and the original error returned.
@@ -659,22 +1177,33 @@ impl EpReserveForward {
     ) -> Result<Self, Qwen4GpuForwardError> {
         let built = Self::materialize_inner(gpu, bundle, &plan, &banks);
         match built {
-            Ok((source_generation, loan, host_sources, exchange_root, receipts)) => Ok(Self {
-                plan,
-                source_generation,
-                banks,
-                loan,
-                host_sources,
-                exchange_root,
-                epoch: EpEpoch::default(),
-                poisoned: None,
-                receipts,
-                hashes: receipts
-                    && hipfire_config::developer_bool(EP_RESERVE_RECEIPT_HASH_ENV, true),
-                prompt: None,
-                prompt_seq: 0,
-                ordinals: EpReceiptOrdinals::default(),
-            }),
+            Ok((source_generation, loan, host_sources, exchange_root, receipts)) => {
+                let mut forward = Self {
+                    plan,
+                    source_generation,
+                    banks,
+                    loan,
+                    host_sources,
+                    exchange_root,
+                    epoch: EpEpoch::default(),
+                    poisoned: None,
+                    receipts,
+                    hashes: receipts
+                        && hipfire_config::developer_bool(EP_RESERVE_RECEIPT_HASH_ENV, true),
+                    shadows: false,
+                    prompt: None,
+                    prompt_seq: 0,
+                    ordinals: EpReceiptOrdinals::default(),
+                };
+                if !forward.plan.shadow_placements.is_empty() {
+                    if let Err(error) = forward.install_shadows(gpu, bundle) {
+                        release_unused_loan(gpu, forward.loan);
+                        let _ = forward.banks.release(gpu);
+                        return Err(error);
+                    }
+                }
+                Ok(forward)
+            }
             Err(error) => {
                 let _ = banks.release(gpu);
                 Err(error)
@@ -765,6 +1294,9 @@ impl EpReserveForward {
     /// leaks the loan (never frees it under a possibly pending copy).
     pub(crate) fn teardown(mut self, gpu: &mut Gpu) -> EpReserveTeardown {
         let torn = self.loan.teardown(gpu);
+        if self.shadows {
+            gpu.clear_shadow_borrow();
+        }
         eprintln!(
             "  qwen4 EP reserve: {} borrowed epochs; {} bank swaps in, {} out; loan {}",
             self.epoch.epochs(),
@@ -885,6 +1417,14 @@ impl Qwen4GpuForward {
         self.ep_reserve
             .as_ref()
             .map(|reserve| reserve.banks.resident_rows())
+    }
+
+    /// Whether a borrowed-bank epoch is open (donors dirty); `false` on an
+    /// ordinary load.
+    pub(crate) fn ep_reserve_epoch_open(&self) -> bool {
+        self.ep_reserve
+            .as_ref()
+            .is_some_and(|reserve| reserve.epoch.dirty())
     }
 
     /// Entry of a lane decode step (`forward_lanes`, `rows` decode rows) on an
@@ -1042,6 +1582,7 @@ impl Qwen4GpuForward {
         match outcome {
             Ok((bytes, restore_ms, barrier_wait_ms, s2_dma_tail_ms)) => {
                 reserve.epoch.restored();
+                gpu.shadow_borrow_set_ready(false);
                 if let Some(prompt) = reserve.prompt.as_mut() {
                     prompt.restores.push(EpRestoreEvent {
                         before_chunk: prompt.chunk_rows.len(),
@@ -1083,6 +1624,9 @@ impl Qwen4GpuForward {
         reserve.loan.acquire_all(gpu).map_err(invalid)?;
         if barrier {
             reserve.epoch.acquired();
+            if reserve.shadows {
+                gpu.rebuild_borrowed_shadows()?;
+            }
         }
         Ok(())
     }
@@ -1108,24 +1652,73 @@ impl Qwen4GpuForward {
         output_policy: Qwen4OutputPolicy,
     ) -> Result<(), Qwen4GpuForwardError> {
         let n = tokens.len();
-        let (resident_rows, prompt_rows) = {
+        let resident_rows = {
             let reserve = self.ep_reserve.as_ref().expect("an EP reserve forward");
             reserve.check()?;
-            (reserve.banks.resident_rows(), reserve.banks.prompt_rows())
+            reserve.banks.resident_call_limit()
         };
         let route = if n > resident_rows {
-            // The same decision `forward_chunk_scoped` takes, under the same scopes.
+            // The same decision `forward_chunk_scoped` takes, under the same scopes (the
+            // ordinary-prefill intent included: `enter_tile_scopes` opens it exactly as the
+            // forward's own entry does). A partial chunk borrows the TileExchange bank whether
+            // or not it masks (`ep_partial_mask_active`), so the mask needs no copy here.
             let (scopes, _) = self.enter_tile_scopes(gpu, n);
             let route_n = gpu.route_rows(n);
             let tile = ep_tile_active(self.ep.as_ref(), gpu, &bundle.config, n, route_n);
+            let partial = ep_trunk_partial_chunk(
+                self.ep.is_some(),
+                n,
+                route_n,
+                crate::trunk_route::ffn_partial_active(),
+            );
             Self::leave_tile_scopes(gpu, scopes);
-            if tile {
-                EpBankRoute::TileExchange
-            } else {
-                EpBankRoute::FullTable
-            }
+            ep_wide_bank_route(tile, partial)
         } else {
             EpBankRoute::TileExchange
+        };
+        // A lane PREFILL tile is the singleton chunk program on a lane state
+        // (`with_lane`, `lane_scope`), so it borrows exactly as a singleton
+        // prompt tile does; only a device-argmax decode or a mesh segment is
+        // refused. Lane DECODE steps never reach here (`forward_lanes` enters
+        // through [`Self::ep_reserve_lane_step_enter`]).
+        let no_borrow = argmax_of.is_some() || self.mesh_route_rows.is_some();
+        self.ep_reserve_call(gpu, n, route, no_borrow, |this, gpu| {
+            this.forward_chunk_tile(
+                bundle,
+                gpu,
+                tokens,
+                argmax_of,
+                logits,
+                top1,
+                wide_hidden_capture,
+                output_policy,
+            )
+        })
+    }
+
+    /// The EP reserve bank switch around one forward call of `n` rows whose sealed
+    /// route is `route` (the body [`Self::ep_reserve_forward_chunk`] runs for a
+    /// singleton chunk, and `forward_wave` for a prefill wave): plan the call
+    /// against the epoch (a wide Full-table call is refused before anything is
+    /// written), restore globally first when the plan says so, acquire the borrowed
+    /// epoch, select and swap the bank and the borrowed runtime view, run `run`,
+    /// and swap everything back on every return path. `no_borrow`: the call may
+    /// not run on the borrowed bank (a device-argmax or mesh forward).
+    pub(crate) fn ep_reserve_call(
+        &mut self,
+        gpu: &mut Gpu,
+        n: usize,
+        route: EpBankRoute,
+        no_borrow: bool,
+        run: impl FnOnce(&mut Self, &mut Gpu) -> Result<(), Qwen4GpuForwardError>,
+    ) -> Result<(), Qwen4GpuForwardError> {
+        let (resident_rows, prompt_rows) = {
+            let reserve = self.ep_reserve.as_ref().expect("an EP reserve forward");
+            reserve.check()?;
+            (
+                reserve.banks.resident_call_limit(),
+                reserve.banks.prompt_rows(),
+            )
         };
         let plan = self
             .ep_reserve
@@ -1134,14 +1727,7 @@ impl Qwen4GpuForward {
             .epoch
             .plan_call(n, resident_rows, prompt_rows, route)
             .map_err(invalid)?;
-        // A lane PREFILL tile is the singleton chunk program on a lane state
-        // (`with_lane`, `lane_scope`), so it borrows exactly as a singleton
-        // prompt tile does; only a device-argmax decode or a mesh segment is
-        // refused. Lane DECODE steps never reach here (`forward_lanes` enters
-        // through [`Self::ep_reserve_lane_step_enter`]).
-        if plan.bank == EpBankKind::Borrowed
-            && (argmax_of.is_some() || self.mesh_route_rows.is_some())
-        {
+        if plan.bank == EpBankKind::Borrowed && no_borrow {
             return Err(invalid(
                 "an argmax or mesh forward cannot run on the borrowed EP reserve bank",
             ));
@@ -1158,16 +1744,7 @@ impl Qwen4GpuForward {
                 reserve.poison(error.to_string());
                 return Err(error);
             }
-            let result = self.forward_chunk_tile(
-                bundle,
-                gpu,
-                tokens,
-                argmax_of,
-                logits,
-                top1,
-                wide_hidden_capture,
-                output_policy,
-            );
+            let result = run(self, gpu);
             self.ep_reserve_note_result(&result);
             return result;
         }
@@ -1184,16 +1761,7 @@ impl Qwen4GpuForward {
         }
         self.borrow_runtimes_active = true;
         self.borrow_view = 0;
-        let result = self.forward_chunk_tile(
-            bundle,
-            gpu,
-            tokens,
-            argmax_of,
-            logits,
-            top1,
-            wide_hidden_capture,
-            output_policy,
-        );
+        let result = run(self, gpu);
         self.borrow_runtimes_active = false;
         let reserve = self.ep_reserve.as_mut().expect("an EP reserve forward");
         let swapped = reserve.banks.swap_out(&mut self.scratch).map(|_| ());
@@ -1394,6 +1962,7 @@ impl Qwen4GpuForward {
                 // and the load is poisoned either way.
                 let recovered = reserve.loan.finish_prompt(gpu, false).map_err(invalid);
                 reserve.epoch.restored();
+                gpu.shadow_borrow_set_ready(false);
                 reserve.poison("a prompt ended with an error while a borrowed epoch was open");
                 recovered
             }
@@ -1780,7 +2349,8 @@ mod tests {
             .map(|&layer| [vec![layer as u8; 64], vec![!(layer as u8); 32]])
             .collect();
         let resolver = EpStageHostSources {
-            first: plan.donor_first_layer,
+            layers: plan.donor_layers.clone(),
+            device: vec![[0, 0]; plan.donor_layers.len()],
             spans: buffers
                 .iter()
                 .map(|pair| {
@@ -2154,5 +2724,516 @@ mod tests {
         // Without hashes the keys are absent (the gate then rejects the record).
         let bare = prompt_rank_json(0, &record, 1, Duration::from_millis(1), Some(1), None);
         assert!(bare.get("donor_hash_after").is_none());
+    }
+
+    /// The plan with explicit donors (a unit plan's forced whole-Resident layers), the same
+    /// capacity as [`plan`].
+    fn explicit_plan() -> EpReservePlan {
+        let config = compact_test_config();
+        let forward = EpReserveForwardPlan::from_config(&config, Qwen4ForwardScratchMode::Full, 0)
+            .expect("pinned forward plan");
+        let geometry = EpRankGeometry::flash_next(&config, 2).expect("geometry");
+        let layer = geometry.layer_bytes().unwrap();
+        let (non_expert, reserve) = (6 * GIB, 6 * GIB);
+        let free = non_expert + reserve + layer * 33;
+        crate::ep_reserve::plan_ep_reserve_with_donors(
+            &forward,
+            &geometry,
+            &EpReserveCapacity {
+                free_per_rank: vec![free, free],
+                non_expert_bytes: non_expert,
+                reserve_bytes: reserve,
+                lane_bytes: 0,
+                host_budget_bytes: 64 * GIB,
+                min_resident_layers: EP_RESERVE_MIN_RESIDENT_LAYERS,
+            },
+            41,
+            &[40, 3, 17, 9, 22, 31, 12, 5, 44],
+        )
+        .expect("an explicit-donor plan")
+    }
+
+    #[test]
+    fn explicit_donor_plans_are_served_by_the_unit_stage_not_the_s2_donors() {
+        let plan = explicit_plan();
+        assert!(plan.explicit_donors);
+        check_stage_plan(&plan).unwrap();
+        assert_eq!(plan.donor_layers, vec![3, 9, 12, 17, 22, 31, 40]);
+        let facts = |first_host, donors, min_rows, serves| EpReserveStageFacts {
+            first_host,
+            donors,
+            min_rows,
+            serves_donor_layers: serves,
+        };
+        // The unit stage has no S2 donors and its first staged layer is whatever the plan stages:
+        // only "every donor has a slot" and "borrowed-only" matter.
+        assert_eq!(
+            ep_reserve_stage_refusal(&plan, RESIDENT, &facts(0, [usize::MAX; 2], 513, true)),
+            None
+        );
+        assert_eq!(
+            ep_reserve_stage_refusal(&plan, RESIDENT, &facts(7, [usize::MAX; 2], 4096, true)),
+            None
+        );
+        let text =
+            ep_reserve_stage_refusal(&plan, RESIDENT, &facts(0, [usize::MAX; 2], 513, false))
+                .expect("a stage without a donor slot is refused");
+        assert!(text.contains("[3, 9, 12, 17, 22, 31, 40]"), "{text}");
+        // A stage that would serve the resident bank is refused, whichever kind it is.
+        assert!(ep_reserve_stage_refusal(
+            &plan,
+            RESIDENT,
+            &facts(0, [usize::MAX; 2], RESIDENT, true)
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn a_borrowed_unit_stage_never_lends_a_scratch_donor() {
+        let plan = explicit_plan();
+        let facts = |donors| EpReserveStageFacts {
+            first_host: 2,
+            donors,
+            min_rows: 4096,
+            serves_donor_layers: true,
+        };
+        // Lent layers 0 and 1 are not scratch donors of this plan: admitted.
+        assert_eq!(
+            ep_reserve_stage_refusal(&plan, RESIDENT, &facts([0, 1])),
+            None
+        );
+        // A lent layer that is also a scratch donor would be overwritten while it is scratch.
+        let text = ep_reserve_stage_refusal(&plan, RESIDENT, &facts([2, 3]))
+            .expect("a lent scratch donor is refused");
+        assert!(text.contains("scratch donor layer 3"), "{text}");
+    }
+
+    #[test]
+    fn suffix_plans_keep_the_s2_stage_admission_exactly() {
+        let plan = plan();
+        assert!(!plan.explicit_donors);
+        let facts = |first_host, donors, min_rows| EpReserveStageFacts {
+            first_host,
+            donors,
+            min_rows,
+            // A suffix plan never asks the unit stage: this bit must not matter.
+            serves_donor_layers: false,
+        };
+        assert_eq!(
+            ep_reserve_stage_refusal(&plan, RESIDENT, &facts(26, [24, 25], 513)),
+            None
+        );
+        for (first_host, donors, min_rows) in [
+            (25, [24, 25], 513),
+            (26, [25, 24], 513),
+            (26, [24, 25], RESIDENT),
+            (26, [24, 25], 1),
+        ] {
+            let text =
+                ep_reserve_stage_refusal(&plan, RESIDENT, &facts(first_host, donors, min_rows))
+                    .unwrap_or_else(|| {
+                        panic!("{first_host} {donors:?} {min_rows} must be refused")
+                    });
+            assert!(
+                text.starts_with("EP reserve stage mismatch: first host layer"),
+                "{text}"
+            );
+            assert!(text.contains("against the plan's 26 / [24, 25]"), "{text}");
+        }
+    }
+
+    /// The trunk-shard partial chunk route binds this rank's compact table (no peer expert
+    /// read), so a wide call on it may borrow the donor bank exactly like the tile exchange;
+    /// a wide call on neither route stays the refused Full-table route. Decode, a lone row
+    /// and the few-row (2..=8 row) verify windows are never the partial CHUNK route.
+    #[test]
+    fn the_trunk_shard_partial_chunk_may_borrow_the_donor_bank() {
+        assert_eq!(ep_wide_bank_route(true, false), EpBankRoute::TileExchange);
+        assert_eq!(ep_wide_bank_route(false, true), EpBankRoute::TileExchange);
+        assert_eq!(ep_wide_bank_route(true, true), EpBankRoute::TileExchange);
+        assert_eq!(ep_wide_bank_route(false, false), EpBankRoute::FullTable);
+        let epoch = EpEpoch::default();
+        let wide = RESIDENT + 1;
+        let borrowed = epoch
+            .plan_call(wide, RESIDENT, PROMPT, ep_wide_bank_route(false, true))
+            .expect("the partial chunk route borrows");
+        assert_eq!(borrowed.bank, EpBankKind::Borrowed);
+        assert!(borrowed.acquire && !borrowed.restore_first);
+        let refused = epoch
+            .plan_call(wide, RESIDENT, PROMPT, ep_wide_bank_route(false, false))
+            .unwrap_err();
+        assert!(refused.contains("Full peer tables"), "{refused}");
+        // The predicate: needs an EP forward, the installed route, and a routing row count
+        // that is not a lone row or a few-row window.
+        assert!(ep_trunk_partial_chunk(true, 4096, 4096, true));
+        assert!(ep_trunk_partial_chunk(true, 9, 9, true));
+        assert!(
+            !ep_trunk_partial_chunk(true, 4096, 4096, false),
+            "route not installed"
+        );
+        assert!(
+            !ep_trunk_partial_chunk(false, 4096, 4096, true),
+            "not an EP forward"
+        );
+        assert!(!ep_trunk_partial_chunk(true, 1, 1, true), "decode");
+        for rows in 2..=QWEN4_EP_GATHER_MAX_ROWS {
+            assert!(
+                !ep_trunk_partial_chunk(true, rows, rows, true),
+                "{rows}-row window"
+            );
+        }
+        // a wide launch whose routing rows are a few-row count is not a verify window (its
+        // routing rows differ from its launch rows): it takes the chunk route
+        assert!(ep_trunk_partial_chunk(true, 4096, 8, true));
+        // Under the ordinary-prefill intent every chunk routes at the canonical 8192 rows: a
+        // 4096-row, a 25-row and a 1-row chunk are all partial chunks (the 1-row tail is not a
+        // decode forward under the intent), and no few-row window exists.
+        assert!(ep_trunk_partial_chunk(true, 4096, 8192, true));
+        assert!(ep_trunk_partial_chunk(true, 25, 8192, true));
+        assert!(ep_trunk_partial_chunk(true, 8, 8192, true));
+        assert!(ep_trunk_partial_chunk(true, 1, 8192, true));
+    }
+
+    #[test]
+    fn lane_stage_knob_is_an_integer_of_at_least_two() {
+        for value in [
+            None,
+            Some(""),
+            Some("abc"),
+            Some("-5"),
+            Some("0"),
+            Some("1"),
+            Some("5.5"),
+        ] {
+            assert_eq!(ep_lane_stage_knob_from(value), None, "{value:?}");
+        }
+        assert_eq!(ep_lane_stage_knob_from(Some("2")), Some(2));
+        assert_eq!(ep_lane_stage_knob_from(Some(" 513 ")), Some(513));
+        assert_eq!(ep_lane_stage_knob_from(Some("2048")), Some(2048));
+    }
+
+    #[test]
+    fn lane_stage_floor_is_the_owner_routed_route_and_the_resident_bank() {
+        // No reserve: only the owner-routed route's 512 routing rows bound it.
+        assert_eq!(ep_lane_stage_floor(None), 512);
+        // A reserve load: strictly above the resident bank's call limit.
+        assert_eq!(ep_lane_stage_floor(Some(RESIDENT)), 513);
+        // A call limit lowered below the route floor never lowers the floor under it.
+        assert_eq!(ep_lane_stage_floor(Some(RESIDENT - 1)), 512);
+        assert_eq!(ep_lane_stage_floor(Some(0)), 512);
+        // A larger resident bank raises it; the sum saturates.
+        assert_eq!(ep_lane_stage_floor(Some(2048)), 2049);
+        assert_eq!(ep_lane_stage_floor(Some(usize::MAX)), usize::MAX);
+    }
+
+    #[test]
+    fn lane_stage_threshold_is_exactly_the_stage_s_without_the_knob_or_off_a_lane_tile() {
+        for stage_min_rows in [2, 511, 512, 513, 768, 1536, 2048, 4096] {
+            for resident in [None, Some(0), Some(RESIDENT), Some(4096)] {
+                // Knob unset: today's threshold, lane tile or not.
+                for lane in [false, true] {
+                    assert_eq!(
+                        ep_lane_stage_min_rows(stage_min_rows, None, lane, resident),
+                        stage_min_rows
+                    );
+                }
+                // Knob set, not a lane tile (singleton prefill, decode, verify): unchanged.
+                for knob in [2, 256, 513, 1024, 4096] {
+                    assert_eq!(
+                        ep_lane_stage_min_rows(stage_min_rows, Some(knob), false, resident),
+                        stage_min_rows
+                    );
+                }
+            }
+        }
+    }
+
+    /// Whether a tile of `rows` stages on the rows axis (the call site's `n >= threshold`).
+    fn stages(rows: usize, stage_min: usize, knob: Option<usize>, resident: Option<usize>) -> bool {
+        rows >= ep_lane_stage_min_rows(stage_min, knob, true, resident)
+    }
+
+    #[test]
+    fn lane_stage_decision_table_rows_axis() {
+        const STAGE_MIN: usize = 2048;
+        // (resident call limit: none = ordinary / slab load, Some = decoupled reserve)
+        // Knob unset: a lane tile stages from the stage's 2048 rows, exactly as a singleton.
+        for resident in [None, Some(RESIDENT)] {
+            assert!(!stages(2047, STAGE_MIN, None, resident));
+            assert!(stages(2048, STAGE_MIN, None, resident));
+            assert!(stages(4096, STAGE_MIN, None, resident));
+        }
+        // Ordinary / slab load, knob 256 (below the route floor): the floor is 512.
+        assert!(!stages(149, STAGE_MIN, Some(256), None));
+        assert!(!stages(511, STAGE_MIN, Some(256), None));
+        assert!(stages(512, STAGE_MIN, Some(256), None));
+        assert!(stages(2047, STAGE_MIN, Some(256), None));
+        // Decoupled reserve (unit stage or S2 donors), knob 256: the floor is the bank limit + 1.
+        assert!(!stages(512, STAGE_MIN, Some(256), Some(RESIDENT)));
+        assert!(stages(513, STAGE_MIN, Some(256), Some(RESIDENT)));
+        // Knob above the floor is authoritative, below and above the stage's own threshold.
+        for resident in [None, Some(RESIDENT)] {
+            assert!(!stages(1023, STAGE_MIN, Some(1024), resident));
+            assert!(stages(1024, STAGE_MIN, Some(1024), resident));
+            assert!(!stages(2048, STAGE_MIN, Some(4096), resident));
+            assert!(stages(4096, STAGE_MIN, Some(4096), resident));
+        }
+        // Decode, verify and every serve-shaped lane prompt (60..150 rows, the C8 story / code
+        // cells) are below every floor: the knob never reaches them.
+        for rows in [1, 2, 8, 9, 60, 149, 256, 511] {
+            for knob in [2, 64, 256, 512] {
+                for resident in [None, Some(RESIDENT)] {
+                    assert!(
+                        !stages(rows, STAGE_MIN, Some(knob), resident),
+                        "{rows} {knob}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lane_stage_threshold_never_serves_the_resident_bank_on_any_reserve_plan_kind() {
+        // The two reserve plan kinds `ep_reserve_stage_refusal` admits: a suffix plan with the S2
+        // donors (the release default) and an explicit-donor plan served by the unit stage (D1).
+        let suffix = plan();
+        let explicit = explicit_plan();
+        assert!(!suffix.explicit_donors && explicit.explicit_donors);
+        // The stage facts each plan kind's built stage reports.
+        let facts = |plan: &EpReservePlan, min_rows| {
+            if plan.explicit_donors {
+                EpReserveStageFacts {
+                    first_host: 0,
+                    donors: [usize::MAX; 2],
+                    min_rows,
+                    serves_donor_layers: true,
+                }
+            } else {
+                EpReserveStageFacts {
+                    first_host: 26,
+                    donors: [24, 25],
+                    min_rows,
+                    serves_donor_layers: false,
+                }
+            }
+        };
+        for (name, plan) in [("S2 donors", &suffix), ("unit stage", &explicit)] {
+            // The stage's own threshold is admitted as built.
+            assert_eq!(
+                ep_reserve_stage_refusal(plan, RESIDENT, &facts(plan, 2048)),
+                None,
+                "{name}"
+            );
+            for knob in [2, 64, 256, 511, 512, 513, 1024, 2047, 2048, 4096, 1 << 20] {
+                let threshold = ep_lane_stage_min_rows(2048, Some(knob), true, Some(RESIDENT));
+                // A lane tile of at most the resident bank's rows never stages ...
+                assert!(threshold > RESIDENT, "{name} knob {knob}: {threshold}");
+                assert!(
+                    !stages(RESIDENT, 2048, Some(knob), Some(RESIDENT)),
+                    "{name} {knob}"
+                );
+                // ... so the stage the lane threshold produces is the borrowed-only stage the
+                // reserve admission requires.
+                assert_eq!(
+                    ep_reserve_stage_refusal(plan, RESIDENT, &facts(plan, threshold)),
+                    None,
+                    "{name} knob {knob}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lane_tile_note_labels_every_route() {
+        let note = |route, staged| LaneTileNote {
+            rows: 149,
+            route,
+            staged,
+            stage_min_rows: Some(2048),
+        };
+        use LaneTileRoute::*;
+        assert_eq!(note(FullTable, false).label(), "full-table");
+        assert_eq!(note(Tile, false).label(), "tile");
+        assert_eq!(note(Tile, true).label(), "tile+stage");
+        assert_eq!(note(Partial, false).label(), "partial");
+        assert_eq!(note(Partial, true).label(), "partial+stage");
+        assert_eq!(note(PartialMask, false).label(), "partial-mask");
+        assert_eq!(note(PartialMask, true).label(), "partial-mask+stage");
+        // The trunk shard's partial route wins over the tile exchange; the mask only applies there.
+        assert_eq!(LaneTileRoute::of(true, true, true), PartialMask);
+        assert_eq!(LaneTileRoute::of(false, true, false), Partial);
+        assert_eq!(LaneTileRoute::of(true, false, false), Tile);
+        assert_eq!(LaneTileRoute::of(false, false, false), FullTable);
+    }
+
+    #[test]
+    fn prefill_tile_knob_parses_and_refuses_below_the_few_row_routes() {
+        for unset in [None, Some(""), Some("   ")] {
+            assert_eq!(ep_prefill_tile_knob_from(unset), PrefillTileKnob::Unset);
+        }
+        for bad in ["abc", "-1", "1.5", "0x20", "9rows"] {
+            let PrefillTileKnob::Refused(reason) = ep_prefill_tile_knob_from(Some(bad)) else {
+                panic!("{bad:?} must be refused");
+            };
+            assert!(reason.contains("not an integer"), "{reason}");
+        }
+        // The few-row routes (decode, verify: at most 8 rows) keep the gathered MoE.
+        for rows in ["0", "1", "2", "8"] {
+            let PrefillTileKnob::Refused(reason) = ep_prefill_tile_knob_from(Some(rows)) else {
+                panic!("{rows} must be refused");
+            };
+            assert!(reason.contains("below the floor of 9"), "{reason}");
+        }
+        assert_eq!(
+            ep_prefill_tile_knob_from(Some("9")),
+            PrefillTileKnob::Floor(9)
+        );
+        assert_eq!(
+            ep_prefill_tile_knob_from(Some(" 128 ")),
+            PrefillTileKnob::Floor(128)
+        );
+        assert_eq!(
+            ep_prefill_tile_knob_from(Some("512")),
+            PrefillTileKnob::Floor(512)
+        );
+        assert_eq!(
+            ep_prefill_tile_knob_from(Some("100000")),
+            PrefillTileKnob::Floor(100000)
+        );
+    }
+
+    #[test]
+    fn prefill_tile_floor_decision_table() {
+        const DEFAULT: usize = 512;
+        // (knob, prefill scope, tile hook, A8 chain active) -> floor
+        let table: &[(Option<usize>, bool, bool, bool, usize)] = &[
+            // Unset: 9 iff the A8 chain is the active chain of an EP prefill forward with the
+            // symmetric-IU4 tile exchange installed; A8 killed (A4 chain) keeps 512.
+            (None, true, true, true, 9),
+            (None, true, true, false, DEFAULT),
+            // Not a prefill forward (decode, verify, MTP head): 512 whatever else is set.
+            (None, false, true, true, DEFAULT),
+            (Some(9), false, true, true, DEFAULT),
+            // No tile hook (single device, gfx1100 WMMA tile route, no exchange): 512.
+            (None, true, false, true, DEFAULT),
+            (Some(9), true, false, true, DEFAULT),
+            // An explicit knob wins over the A8 default, up and down: 512 is the kill switch of
+            // the floor alone, a lower value is a lab floor (also on the A4 chain).
+            (Some(512), true, true, true, DEFAULT),
+            (Some(9), true, true, false, 9),
+            (Some(128), true, true, true, 128),
+            (Some(128), true, true, false, 128),
+            (Some(511), true, true, true, 511),
+            // Never raised above today's floor, never lowered below the few-row routes' rows.
+            (Some(4096), true, true, true, DEFAULT),
+            (Some(2), true, true, true, 9),
+        ];
+        for &(knob, prefill, hook, a8, want) in table {
+            assert_eq!(
+                ep_prefill_tile_sym_floor(knob, prefill, hook, a8),
+                want,
+                "knob {knob:?} prefill {prefill} hook {hook} a8 {a8}"
+            );
+        }
+        assert_eq!(EP_PREFILL_TILE_DEFAULT_FLOOR, 9);
+    }
+
+    #[test]
+    fn prefill_tile_floor_decides_the_same_for_a_lane_tile_and_the_singleton() {
+        // The decision reads no row count and no lane state: a lane prefill tile, the singleton
+        // prefill and the MTP prompt-fill tile are all `prefill_scope` forwards of one load
+        // entering `enter_tile_scopes`, so they get the same floor and the same route for the
+        // same rows. Pinned at the one call site that feeds the decision.
+        // The scope that feeds it: enter_tile_scopes passes self.prefill_scope, the A8 request
+        // of the scope it just set and the installed hook, nothing per lane.
+        let src = include_str!("../gpu_forward.rs");
+        let at = src
+            .find("let sym_floor_now = ep_reserve_forward::ep_prefill_tile_sym_floor(")
+            .unwrap();
+        let call = &src[at..at + 260];
+        assert!(call.contains("self.prefill_scope"), "{call}");
+        assert!(call.contains("tile_hook"), "{call}");
+        assert!(call.contains("a8_chain"), "{call}");
+        assert!(!call.contains("lane"), "{call}");
+    }
+
+    #[test]
+    fn prefill_tile_floor_never_reaches_a_decode_or_verify_row_count() {
+        // The EP gathered row gather (2..=8 rows), the historic few-row routes (8) and the
+        // gfx1201 row-exact verify window (8) are all below every floor the function returns.
+        let few = QWEN4_EP_GATHER_MAX_ROWS
+            .max(rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS)
+            .max(hipfire_config::QWEN4_ROW_EXACT_VERIFY_ROWS_GFX1201);
+        assert_eq!(few, 8);
+        assert_eq!(rdna_compute::gemm::QWEN4_MOE_SYM_IU4_LOWEST_FLOOR, few + 1);
+        for knob in (0..=700).map(Some).chain([None]) {
+            for prefill in [false, true] {
+                for hook in [false, true] {
+                    for a8 in [false, true] {
+                        let floor = ep_prefill_tile_sym_floor(knob, prefill, hook, a8);
+                        assert!(floor > few, "{knob:?} {prefill} {hook} {a8}: {floor}");
+                        assert!(floor <= rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS);
+                        // Rows 8 / 9 / 511 / 512 against the default A8 floor: the few-row
+                        // boundary and the historic floor, both sides.
+                        if knob.is_none() && prefill && hook && a8 {
+                            assert_eq!(floor, 9);
+                            assert!(
+                                [8usize, 9, 511, 512].map(|rows| rows >= floor)
+                                    == [false, true, true, true]
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn declared_route_capability_follows_the_floor_in_scope() {
+        use hipfire_dispatch::families::moe::MoeRouteCapability::{
+            Fp8B128Grouped, Qt44Qt53Grouped, Qt44Qt53GroupedSymmetric as Symmetric,
+            SlabCodecGrouped,
+        };
+        // A verified-symmetric layer: the floor in scope decides.
+        assert_eq!(
+            declared_route_capability(false, false, true, 511, 512),
+            Qt44Qt53Grouped
+        );
+        assert_eq!(
+            declared_route_capability(false, false, true, 512, 512),
+            Symmetric
+        );
+        assert_eq!(
+            declared_route_capability(false, false, true, 8, 9),
+            Qt44Qt53Grouped
+        );
+        assert_eq!(
+            declared_route_capability(false, false, true, 9, 9),
+            Symmetric
+        );
+        assert_eq!(
+            declared_route_capability(false, false, true, 149, 9),
+            Symmetric
+        );
+        assert_eq!(
+            declared_route_capability(false, false, true, 149, 150),
+            Qt44Qt53Grouped
+        );
+        // An unverified layer never declares it, at any floor.
+        for floor in [9, 128, 512] {
+            assert_eq!(
+                declared_route_capability(false, false, false, 4096, floor),
+                Qt44Qt53Grouped
+            );
+        }
+        // Slab and FP8 layers are their own routes at every row count and floor.
+        assert_eq!(
+            declared_route_capability(true, false, true, 149, 9),
+            SlabCodecGrouped
+        );
+        assert_eq!(
+            declared_route_capability(false, true, true, 149, 9),
+            Fp8B128Grouped
+        );
     }
 }

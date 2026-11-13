@@ -46,7 +46,7 @@ Mirror column is a proposed resolution policy; existing gfx942 exclusions are st
 | **new proposed** `HIPFIRE_GFX942_MOE_FP8` | not parsed in source; propose feature_flags registry + sealed qt55 resolution | not applicable | Explicit generator-only qt55 FP8-activation admission; never teacher/capture/fallback | Same name,default0; require exact gfx942, qt55 geometry/scales, generator recipe, no capture, fixed tile/order. Unset retains existing BF16-MFMA weight-only route. |
 | **new proposed** `HIPFIRE_GFX942_MOE_FP8_PM` | not parsed in source; propose feature_flags + qt55 launch selector | not applicable | PM/HIP comparison control for the identical new FP8 ABI/math | Same name,default1 after certification; `0` selects real HIP FP8 twin, not BF16 fallback. |
 
-`HIPFIRE_MOE_GROUPED_I8*`, `HIPFIRE_MOE_PARO_I8*`, generic codebook/ninepath/down-vec4 levers are not alternative arms of the source-bound qt44/qt53 stage functions above: they belong to other dtype/generic family branches. GDN/PLE/HC-up-read tuning is outside routed-expert stages. Dense `HIPFIRE_GFX12_MQ4V2_FP8_*` flags control the separate selector, not an expert FP8 arm (`gemm.rs:10263-10275`; `qt44_qt53_prefill.rs:1189-1245,1432-1506`).
+`HIPFIRE_MOE_GROUPED_I8*`, generic codebook/ninepath/down-vec4 levers are not alternative arms of the source-bound qt44/qt53 stage functions above: they belong to other dtype/generic family branches. GDN/PLE/HC-up-read tuning is outside routed-expert stages. Dense `HIPFIRE_GFX12_MQ4V2_FP8_*` flags control the separate selector, not an expert FP8 arm (`gemm.rs:10263-10275`; `qt44_qt53_prefill.rs:1189-1245,1432-1506`).
 
 ## Sealed lowering and geometry
 

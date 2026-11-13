@@ -685,7 +685,6 @@ fn lane_fa_plan_ok(
 ///   semantics, [`Gpu::lane_fa_batch_admitted`] (exact gfx1201, VerifyAttn on,
 ///   head_dim 256 GQA group 6 tile 128, no capture / recording / G0
 ///   observation, every request 1..=32 rows), at most `LANE_FA_MAX` requests,
-///   no triattn tap (it would interleave per-request recording with the prep);
 /// * no request on the segment-twin arm (`twin_attn`);
 /// * per request: ChainVerify (prep unfused: `gfx12_fa_prep_admitted` false;
 ///   attend via `verify_tile_attend`), native fp8 KV with `compact_offset 0`
@@ -708,7 +707,6 @@ fn lane_fa_chunk_admitted(
         || reqs.is_empty()
         || reqs.len() > rdna_compute::lane_fa::LANE_FA_MAX
         || twin_attn.iter().any(|&t| t)
-        || hipfire_runtime::triattn::tap_enabled()
     {
         return false;
     }
@@ -739,13 +737,7 @@ fn lane_fa_chunk_admitted(
             || !kv.quant_fp8
             || kv.compact_offset != 0
             || !(MIN_BATCH..64).contains(&n)
-            || gfx12_fa_prep_admitted(
-                gpu,
-                &hybrid_dims(config),
-                r.fusion,
-                n,
-                hipfire_runtime::triattn::tap_enabled(),
-            )
+            || gfx12_fa_prep_admitted(gpu, &hybrid_dims(config), r.fusion, n, false)
             || multirow
             || !lane_fa_plan_ok(gpu, s, kv, r.start_pos, n)
             || s.flash_partials.numel()
@@ -1484,8 +1476,6 @@ pub fn forward_prefill_batch_multi(
     let dims = hybrid_dims(config);
     let batch = pbs.view();
     let flash = flash_scratch(s);
-    let tap_fn = batched_attention_tap(config);
-    let tap = tap_fn.get();
     for layer_idx in 0..config.n_layers {
         match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
             (LayerWeights::DeltaNet(layer), LayerType::LinearAttention) => {
@@ -1872,8 +1862,7 @@ pub fn forward_prefill_batch_multi(
                         } else {
                             &ctx
                         };
-                        let gfx12_fa_prep =
-                            gfx12_fa_prep_admitted(gpu, &dims, r.fusion, n, tap.is_some());
+                        let gfx12_fa_prep = gfx12_fa_prep_admitted(gpu, &dims, r.fusion, n, false);
                         let multirow = q8_multirow_attn_admitted(
                             gpu.arch_caps.arch(),
                             r.kv_cache.quant_q8,
@@ -1907,7 +1896,7 @@ pub fn forward_prefill_batch_multi(
                             gfx12_fa_prep,
                             false,
                             false,
-                            tap,
+                            None,
                         )?;
                         if twin {
                             // The singleton attend's paired write; the attention
@@ -1928,13 +1917,8 @@ pub fn forward_prefill_batch_multi(
                         } else {
                             // Same S6 paired Q8 K/V-write admission as the singleton
                             // attend (byte-identical to the two batched writes).
-                            let pair_q8_writes = dflash_fa_batch_fusion_admitted(
-                                gpu,
-                                &dims,
-                                r.fusion,
-                                n,
-                                tap.is_some(),
-                            );
+                            let pair_q8_writes =
+                                dflash_fa_batch_fusion_admitted(gpu, &dims, r.fusion, n, false);
                             batch_chunk_fa_attend(
                                 gpu,
                                 &dims,

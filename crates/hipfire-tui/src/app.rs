@@ -116,13 +116,6 @@ pub fn not_editable_status(key: &str) -> String {
     format!("{key} is not editable inline — edit with `hipfire config set {key}`")
 }
 
-/// Status line for a deprecated CASK/PFlash key: shown, never edited inline.
-pub fn deprecated_status(key: &str) -> String {
-    format!(
-        "{key} is deprecated (removal 0.5.0) and read-only here — edit with `hipfire config set {key}`"
-    )
-}
-
 /// A previewed-but-uncommitted enum value (5b). Cycling Left/Right/Space stages
 /// the next value here (dimmed in the UI) WITHOUT writing config.toml, so merely
 /// browsing the options can't mutate config. Enter commits it; Esc or navigating
@@ -2783,15 +2776,12 @@ mod tests {
 
     /// Fake `hipfire` that appends its arguments to `<dir>/serve-calls.log`.
     fn fake_cli(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
-        use std::os::unix::fs::PermissionsExt;
         let log = dir.join("serve-calls.log");
         let bin = dir.join("fake-hipfire");
-        std::fs::write(
+        crate::test_support::write_executable(
             &bin,
-            format!("#!/bin/sh\necho \"$@\" >> '{}'\n", log.display()),
-        )
-        .unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            &format!("#!/bin/sh\necho \"$@\" >> '{}'\n", log.display()),
+        );
         (bin, log)
     }
 
@@ -3095,18 +3085,15 @@ mod tests {
     /// Install a fake CLI that records `"$@"` (one line per call) and exits 1
     /// unless `$1` is `pull`; returns the record path.
     fn pull_recorder(dir: &std::path::Path) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         let record = dir.join("pull-argv.txt");
         let bin = dir.join("hipfire-fake");
-        std::fs::write(
+        crate::test_support::write_executable(
             &bin,
-            format!(
+            &format!(
                 "#!/bin/sh\n[ \"$1\" = pull ] || exit 1\necho \"$@\" >> '{}'\nexit 0\n",
                 record.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         std::env::set_var("HIPFIRE_CLI_BIN", &bin);
         record
     }

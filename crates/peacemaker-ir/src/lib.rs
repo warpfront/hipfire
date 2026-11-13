@@ -10,6 +10,7 @@ pub mod edit;
 pub mod effects;
 pub mod emu;
 pub mod envelope;
+pub mod helpers;
 pub mod inst;
 pub mod isa;
 pub mod kernarg;
@@ -42,6 +43,40 @@ mod tests {
         collections::{HashMap, HashSet},
         process::Command,
     };
+    /// gfx1200 is the gfx1201 ISA family: same table, same words, same family predicate; only the
+    /// machine identity (lift/bundle layer) differs.
+    #[test]
+    fn gfx1200_shares_the_gfx12_isa_with_gfx1201() {
+        assert!(Arch::Gfx1200.is_gfx12() && Arch::Gfx1201.is_gfx12());
+        assert!(
+            ![Arch::Gfx1010, Arch::Gfx1030, Arch::Gfx1100, Arch::Gfx1151]
+                .iter()
+                .any(|a| a.is_gfx12())
+        );
+        assert_ne!(Arch::Gfx1200, Arch::Gfx1201);
+        assert!(std::ptr::eq(
+            isa::table(Arch::Gfx1200),
+            isa::table(Arch::Gfx1201)
+        ));
+        for words in [
+            &[0xd800_0000u32, 0x0000_0407][..],
+            &[0xd880_0000, 0x0100_0701],
+            &[0xbe80_1805],
+            &[0x7e08_0904],
+        ] {
+            let (a, na) = codec::gfx12::decode_for(Arch::Gfx1200, words).unwrap();
+            let (b, nb) = codec::gfx12::decode_for(Arch::Gfx1201, words).unwrap();
+            assert_eq!(na, nb);
+            assert_eq!(a.op, b.op);
+            assert_eq!(a.op.name(Arch::Gfx1200), b.op.name(Arch::Gfx1201));
+            assert_eq!(
+                codec::gfx12::encode_for(Arch::Gfx1200, &a)
+                    .unwrap()
+                    .as_slice(),
+                &words[..na]
+            );
+        }
+    }
     #[test]
     fn builder_gfx1201_golden_spellings_print_from_typed_operands() {
         use operand::{CacheScope, Depctr, ImmField, InlineConst, Msg, Operand as O, VmemToken};
@@ -70,10 +105,11 @@ mod tests {
             fields: FormFields,
         ) -> String {
             let row = isa::gfx12().iter().find(|r| r.name == name).unwrap();
-            Inst::from_parts(
+            Inst::from_encoding(
                 Arch::Gfx1201,
                 row.op,
                 row.form,
+                row.variant,
                 fields,
                 operands.into_iter().collect(),
                 mods,
@@ -283,10 +319,11 @@ mod tests {
             .iter()
             .find(|row| row.name == "s_endpgm")
             .unwrap();
-        let end = Inst::from_parts(
+        let end = Inst::from_encoding(
             Arch::Gfx1201,
             row.op,
             row.form,
+            row.variant,
             FormFields::None,
             Default::default(),
             Default::default(),
@@ -494,10 +531,11 @@ mod tests {
             .iter()
             .find(|row| row.name == "v_dual_fmac_f32")
             .unwrap();
-        let inst = Inst::from_parts(
+        let inst = Inst::from_encoding(
             Arch::Gfx1201,
             row.op,
             row.form,
+            row.variant,
             FormFields::Vopd {
                 y_op: row.op,
                 x_operands: 3,
@@ -535,6 +573,76 @@ mod tests {
             base: 166,
             len: 1
         }));
+    }
+
+    /// FMAMK/FMAAK write `D = S0*K+S1` / `S0*S1+K`: the destination is never
+    /// read. (True FMAC accumulators keep reading it.)
+    #[test]
+    fn literal_fma_destination_is_not_a_use_but_fmac_accumulator_is() {
+        use effects::Effects;
+        use operand::Operand;
+        use reg::{Kind, RegRef};
+        let tables: [(Arch, &[isa::OpRow]); 3] = [
+            (Arch::Gfx1201, isa::gfx12()),
+            (Arch::Gfx1100, isa::gfx1100()),
+            (Arch::Gfx1151, isa::gfx1151()),
+        ];
+        let mut checked = 0;
+        for (arch, table) in tables {
+            for row in table {
+                let literal_fma = matches!(
+                    row.name,
+                    "s_fmamk_f32"
+                        | "s_fmaak_f32"
+                        | "v_fmamk_f32"
+                        | "v_fmaak_f32"
+                        | "v_dual_fmamk_f32"
+                        | "v_dual_fmaak_f32"
+                );
+                let accumulator = matches!(row.name, "v_fmac_f32_e32" | "v_dual_fmac_f32");
+                if !literal_fma && !accumulator {
+                    continue;
+                }
+                // Slot order is the operand order; distinct registers per slot.
+                let mut dst = None;
+                let mut srcs = Vec::new();
+                let mut operands = Vec::new();
+                for (i, (slot, _)) in row.slots(false).enumerate() {
+                    let base = 100 + i as u16;
+                    let kind = if slot.starts_with('S') && !slot.starts_with("SRC") {
+                        Kind::S
+                    } else {
+                        Kind::V
+                    };
+                    let r = RegRef { kind, base, len: 1 };
+                    if slot == "LITERAL" {
+                        operands.push(Operand::Literal(0x3b80_0000));
+                    } else if matches!(slot, "VDST" | "VDSTX" | "SDST") {
+                        dst = Some(r);
+                        operands.push(Operand::Reg(r));
+                    } else {
+                        srcs.push(r);
+                        operands.push(Operand::Reg(r));
+                    }
+                }
+                let dst = dst.unwrap();
+                let fx =
+                    Effects::from_table(arch, row.op, row.form, &operands, &Default::default())
+                        .unwrap_or_else(|e| panic!("{arch:?} {}: {e}", row.name));
+                assert_eq!(fx.defs.as_slice(), &[dst], "{arch:?} {}", row.name);
+                for src in &srcs {
+                    assert!(fx.uses.contains(src), "{arch:?} {} reads {src:?}", row.name);
+                }
+                assert_eq!(
+                    fx.uses.contains(&dst),
+                    accumulator,
+                    "{arch:?} {}: destination read iff accumulator",
+                    row.name
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked >= 16, "only {checked} rows checked");
     }
 
     #[test]
@@ -821,6 +929,7 @@ mod tests {
         let mut inst = Inst {
             op: row.op,
             form: row.form,
+            variant: None,
             fields: FormFields::Vop3b { src2_unused: 0xff },
             operands: Default::default(),
             mods: Default::default(),

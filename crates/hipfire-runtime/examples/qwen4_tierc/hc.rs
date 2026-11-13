@@ -105,6 +105,11 @@ pub const CASES: &[Q4Case] = &[
         run: case_hyper_write_norm,
     },
     Q4Case {
+        name: "qwen4_hc_g942_unfused_gates_bitwise_quarters",
+        timeout_s: 120,
+        run: case_unfused_gates_bitwise_quarters,
+    },
+    Q4Case {
         name: "qwen4_hc_read_route_execute_hyper_read",
         timeout_s: 180,
         run: case_route_read,
@@ -115,9 +120,29 @@ pub const CASES: &[Q4Case] = &[
         run: case_route_final_read,
     },
     Q4Case {
+        name: "qwen4_g942_fold_elem_hc_down_act_kernel_bytes",
+        timeout_s: 300,
+        run: case_fold_elem_hc_down_act,
+    },
+    Q4Case {
+        name: "qwen4_g942_fold_elem_hc_read_route_digest",
+        timeout_s: 240,
+        run: case_fold_elem_route_digest,
+    },
+    Q4Case {
         name: "qwen4_hc_write_route_execute_hyper_write",
         timeout_s: 180,
         run: case_route_write,
+    },
+    Q4Case {
+        name: "qwen4_hc_g942_lane_wide_write_bitwise_singles",
+        timeout_s: 300,
+        run: case_lane_wide_write,
+    },
+    Q4Case {
+        name: "qwen4_hc_g942_lane_wide_read_bitwise_singles",
+        timeout_s: 300,
+        run: case_lane_wide_read,
     },
     Q4Case {
         name: "qwen4_hc_step_program_write_read_pairs",
@@ -325,7 +350,6 @@ fn wref(buf: &GpuTensor, m: usize, k: usize) -> WeightRef<'_> {
         m,
         k,
         row_stride: k,
-        rotation: None,
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
@@ -797,6 +821,96 @@ fn case_hyper_write_norm(gpu: &mut Gpu) -> Result<String, String> {
     all(out)
 }
 
+/// `HIPFIRE_QWEN4_G942_HC_QUARTERS_GATES`: the gates an UNFUSED write computes
+/// (`execute_hyper_write` -> `hyper_write_gates`) are bitwise the gates the fused
+/// `hyper_write_norm_f32` produces as the next write's quarters, rows 1..=8 (the route's
+/// few-row range on gfx942). Per row count: `hyper_write_norm` with `next` writes the streams
+/// and the quarters for the next write (norm weight `nn`, inject `inj`); the next write then runs
+/// through `execute_hyper_write` on those streams with the same weights and its gates, a
+/// sentinel-poisoned buffer the route must fill, are compared bit for bit with the quarters'
+/// `(q0 + q1) + (q2 + q3)` fold (`hyper_write_norm` stage B's own gate expression).
+fn case_unfused_gates_bitwise_quarters(gpu: &mut Gpu) -> Result<String, String> {
+    let mut rng = Rng::new(0x4843_7B01);
+    let mut out = Vec::new();
+    for rows in 1..=8usize {
+        let wn = rng.vec_bf16_exact(HC_WIDE, -0.5, 0.5);
+        let nn = rng.vec_bf16_exact(HC_WIDE, -0.5, 0.5);
+        let inj = rng.vec_bf16_exact(4 * HC_WIDE, -0.05, 0.05);
+        let (wnt, nnt, injt) = (up_bf16(gpu, &wn)?, up_bf16(gpu, &nn)?, up_bf16(gpu, &inj)?);
+        let s0 = rng.vec(rows * HC_WIDE, -2.0, 2.0);
+        let mix = rng.vec(rows * HIDDEN, -1.0, 1.0);
+        let gl = rng.vec(rows * HC_STREAMS, -6.0, 6.0);
+        let st = up_f32(gpu, &s0)?;
+        let (mt, gt) = (up_f32(gpu, &mix)?, up_f32(gpu, &gl)?);
+        let nt = sentinel_f32(gpu, rows * HC_WIDE)?;
+        let qt = sentinel_f32(gpu, 16 * rows)?;
+        let next = HyperNextGates {
+            norm_weight: &nnt,
+            inject: &injt,
+            quarters: &qt,
+        };
+        hyper_write_norm(
+            gpu,
+            &HyperWrite {
+                input: &st,
+                normalized: &nt,
+                mixed: &mt,
+                gates: &gt,
+                output: &st,
+                branches: HC_STREAMS,
+                hidden: HIDDEN,
+                state_bf16: false,
+            },
+            &wnt,
+            &nt,
+            None,
+            Some(&next),
+            None,
+        )
+        .map_err(e)?;
+        let q_gpu = down_f32(gpu, &qt)?;
+        let mut want = vec![0.0f32; rows * HC_STREAMS];
+        for r in 0..rows {
+            for g in 0..HC_STREAMS {
+                let q = &q_gpu[r * 16 + g * 4..r * 16 + g * 4 + 4];
+                want[r * HC_STREAMS + g] = (q[0] + q[1]) + (q[2] + q[3]);
+            }
+        }
+        // The next write, unfused, on the streams the fused launch just wrote.
+        let mix2 = rng.vec(rows * HIDDEN, -1.0, 1.0);
+        let mt2 = up_f32(gpu, &mix2)?;
+        let nt2 = sentinel_f32(gpu, rows * HC_WIDE)?;
+        let gt2 = sentinel_f32(gpu, rows * HC_STREAMS)?;
+        let rot = zeros_f32(gpu, rows * HC_WIDE)?;
+        let op = HyperWriteOp {
+            state_bf16: false,
+            input: &st,
+            norm_weight: &nnt,
+            block_inject: wref(&injt, HC_STREAMS, HC_WIDE),
+            normalized: &nt2,
+            mixed: &mt2,
+            gates: &gt2,
+            output: &st,
+            rows,
+            branches: HC_STREAMS,
+            hidden: HIDDEN,
+            rotation: &rot,
+            ar: None,
+        };
+        execute_hyper_write(gpu, &op).map_err(de)?;
+        out.push(exact_f32(
+            &format!("unfused gates == fused quarters fold rows={rows}"),
+            &down_f32(gpu, &gt2)?,
+            &want,
+        ));
+        free_all(
+            gpu,
+            vec![wnt, nnt, injt, st, mt, gt, nt, qt, mt2, nt2, gt2, rot],
+        )?;
+    }
+    all(out)
+}
+
 /// Shared by the HC read route cases: `execute_hyper_read` / `execute_final_hyper`
 /// (the final HC read is the same `HyperReadOp`, `layer_ops.rs execute_final_hyper`).
 /// Exercises, on gfx942: `hyper_norm_f32`, the BF16 down GEMM, the per-row
@@ -868,6 +982,153 @@ fn case_route_final_read(gpu: &mut Gpu) -> Result<String, String> {
     run_route_read(gpu, true)
 }
 
+/// `HIPFIRE_QWEN4_G942_FOLD_ELEM` kernel pin: `qwen4_g942_gemm_bf16_rows16_hc_act`
+/// (`qwen4_g942_glue_elem.hip`, via `Gfx942Device::qwen4_hc_down_act_rows16`) must be
+/// BYTE-equal to the unfused launches it replaces on the same inputs: the rows16 BF16
+/// GEMM into F32, then `bf16_roundtrip_f32`, `scale_f32`, `bf16_roundtrip_f32`,
+/// `silu_f32`, `bf16_roundtrip_f32` (as `execute_hyper_read_inner` issues them). Every
+/// row count 1..=16 (both entries: `_x2` takes an F32 X of 9..=16 rows), F32 and BF16
+/// X, three magnitude regimes (silu tails, mid range, near-zero) and a poisoned row
+/// (Inf in X: NaN / Inf accumulators go through the same casts).
+fn case_fold_elem_hc_down_act(gpu: &mut Gpu) -> Result<String, String> {
+    let mut rng = Rng::new(0x4843_F001);
+    let scale = 1.0 / HC_STREAMS as f32;
+    let regimes: [(&str, f32, f32); 3] = [
+        ("mid", 0.05, 4.0),
+        ("wide", 2.0, 64.0),
+        ("tiny", 1.0e-4, 1.0e-2),
+    ];
+    let mut out = Vec::new();
+    for (name, w_amp, x_amp) in regimes {
+        let down = rng.vec_bf16_exact(HC_LOW * HC_WIDE, -w_amp, w_amp);
+        let downt = up_bf16(gpu, &down)?;
+        for rows in 1..=16usize {
+            for x_bf16 in [false, true] {
+                let mut x = rng.vec(rows * HC_WIDE, -x_amp, x_amp);
+                if rows == 3 {
+                    x[HC_WIDE + 5] = f32::INFINITY;
+                }
+                let xt = if x_bf16 {
+                    up_bf16(gpu, &x)?
+                } else {
+                    up_f32(gpu, &x)?
+                };
+                let staging = up_bf16(gpu, &vec![0.0f32; rows * HC_LOW])?;
+                let want_t = sentinel_f32(gpu, rows * HC_LOW)?;
+                let launched = gpu
+                    .gemm_bf16_mfma_gfx942_rows16(
+                        &xt,
+                        &[(&downt.buf, &want_t, HC_LOW)],
+                        HC_WIDE,
+                        rows,
+                    )
+                    .map_err(e)?;
+                if !launched {
+                    return Err(format!("unfused rows16 declined: {name} rows={rows}"));
+                }
+                let roundtrip = |gpu: &mut Gpu| -> Result<(), String> {
+                    bf16_roundtrip_f32(
+                        gpu,
+                        &Bf16Roundtrip {
+                            input: &want_t,
+                            scratch: &staging,
+                            output: &want_t,
+                            elements: rows * HC_LOW,
+                        },
+                    )
+                    .map_err(e)
+                };
+                roundtrip(gpu)?;
+                scale_f32(
+                    gpu,
+                    &ScaleF32 {
+                        values: &want_t,
+                        scale,
+                    },
+                )
+                .map_err(e)?;
+                roundtrip(gpu)?;
+                gpu.silu_f32(&want_t, &want_t).map_err(e)?;
+                roundtrip(gpu)?;
+                let got_t = sentinel_f32(gpu, rows * HC_LOW)?;
+                let folded = gpu
+                    .try_gfx942()
+                    .ok_or_else(|| "not gfx942".to_string())?
+                    .qwen4_hc_down_act_rows16(&downt.buf, &xt, &got_t, HC_LOW, HC_WIDE, rows, scale)
+                    .map_err(e)?;
+                if !folded {
+                    return Err(format!("folded entry declined: {name} rows={rows}"));
+                }
+                let (got, want) = (down_f32(gpu, &got_t)?, down_f32(gpu, &want_t)?);
+                out.push(exact_f32(
+                    &format!(
+                        "fold_elem hc_down_act {name} rows={rows} x={}",
+                        if x_bf16 { "bf16" } else { "f32" }
+                    ),
+                    &got,
+                    &want,
+                ));
+                free_all(gpu, vec![xt, staging, want_t, got_t])?;
+            }
+        }
+        free_all(gpu, vec![downt])?;
+    }
+    all(out)
+}
+
+/// Route digest for the `HIPFIRE_QWEN4_G942_FOLD_ELEM` on/off A/B: `execute_hyper_read`
+/// at rows 1..=17 (17 declines the fold: its rows16 entry takes 16) with the production
+/// F32 streams; SHA-256 over `normalized`, `low` and `mixed` bytes of every row count.
+/// Run the case under each setting of the switch: the two summaries must carry the same
+/// digest (the harness is one supervised process per case, so the switch is read once).
+fn case_fold_elem_route_digest(gpu: &mut Gpu) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    let mut rng = Rng::new(0x4843_F101);
+    let wn = rng.vec_bf16_exact(HC_WIDE, -0.5, 0.5);
+    let down = rng.vec_bf16_exact(HC_LOW * HC_WIDE, -0.02, 0.02);
+    let upw = rng.vec_bf16_exact(HC_WIDE * HC_LOW, -0.1, 0.1);
+    let (wnt, downt, upt) = (
+        up_bf16(gpu, &wn)?,
+        up_bf16(gpu, &down)?,
+        up_bf16(gpu, &upw)?,
+    );
+    let mut digest = Sha256::new();
+    for rows in 1..=17usize {
+        let x = rng.vec(rows * HC_WIDE, -2.0, 2.0);
+        let xt = up_f32(gpu, &x)?;
+        let nt = sentinel_f32(gpu, rows * HC_WIDE)?;
+        let lowt = sentinel_f32(gpu, rows * HC_LOW)?;
+        let uot = sentinel_f32(gpu, rows * HC_WIDE)?;
+        let mt = sentinel_f32(gpu, rows * HIDDEN)?;
+        let rot = zeros_f32(gpu, rows * HC_WIDE)?;
+        let op = HyperReadOp {
+            state_bf16: false,
+            input: &xt,
+            norm_weight: &wnt,
+            input_mix_down: wref(&downt, HC_LOW, HC_WIDE),
+            input_mix_up: wref(&upt, HC_WIDE, HC_LOW),
+            normalized: &nt,
+            low: &lowt,
+            up: &uot,
+            mixed: &mt,
+            rows,
+            branches: HC_STREAMS,
+            hidden: HIDDEN,
+            low_rank: HC_LOW,
+            rotation: &rot,
+        };
+        execute_hyper_read(gpu, &op).map_err(de)?;
+        for t in [&nt, &lowt, &mt] {
+            digest.update(down_bytes(gpu, t)?);
+        }
+        free_all(gpu, vec![xt, nt, lowt, uot, mt, rot])?;
+    }
+    free_all(gpu, vec![wnt, downt, upt])?;
+    let digest = digest.finalize();
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    Ok(format!("fold_elem route digest rows 1..=17 sha256={hex}"))
+}
+
 /// `execute_hyper_write` (unfused path: gates = `hyper_norm` + BF16 gate GEMM,
 /// then `hyper_write_f32`), in place on the streams as the route does.
 fn case_route_write(gpu: &mut Gpu) -> Result<String, String> {
@@ -885,6 +1146,7 @@ fn case_route_write(gpu: &mut Gpu) -> Result<String, String> {
         let gt = sentinel_f32(gpu, rows * HC_STREAMS)?;
         let rot = zeros_f32(gpu, rows * HC_WIDE)?;
         let op = HyperWriteOp {
+            ar: None,
             state_bf16: false,
             input: &st,
             norm_weight: &wnt,
@@ -974,6 +1236,7 @@ fn case_step_program(gpu: &mut Gpu) -> Result<String, String> {
         let out_b = sentinel_f32(gpu, rows * HIDDEN)?;
         let rot = zeros_f32(gpu, rows * HC_WIDE)?;
         let write = |norm_weight, inject, mixed, gates| HyperWriteOp {
+            ar: None,
             state_bf16: false,
             input: &st,
             norm_weight,
@@ -1050,5 +1313,198 @@ fn case_step_program(gpu: &mut Gpu) -> Result<String, String> {
         gpu,
         vec![wn_at, wn_bt, rn_at, rn_bt, inj_at, inj_bt, downt, upt],
     )?;
+    all(out)
+}
+
+/// Rows an exact-gfx942 lane step's all-rows HC segment covers (and the counts around the 16-row
+/// slice and 8-row tile boundaries).
+const LANE_WIDE_ROWS: [usize; 8] = [9, 16, 17, 31, 32, 33, 48, 64];
+
+/// Runs `f` under the scopes `forward_lanes` opens for its all-rows HC steps (the lane-rows
+/// scope and the wide verify scope of `rows` rows) and restores them.
+fn with_lane_scope<T>(
+    gpu: &mut Gpu,
+    rows: usize,
+    f: impl FnOnce(&mut Gpu) -> Result<T, String>,
+) -> Result<T, String> {
+    let prior_lane = std::mem::replace(&mut gpu.lane_rows_scope, true);
+    let prior_wide = gpu.set_wide_verify_rows(rows);
+    let result = f(gpu);
+    gpu.set_wide_verify_rows(prior_wide);
+    gpu.lane_rows_scope = prior_lane;
+    result
+}
+
+/// A lane step's all-rows `execute_hyper_write` (gates + norm + streams) is bitwise the one-row
+/// singleton call of every row (the pinned quarters gates), at every width past the few-row
+/// window; with the lane scope closed the chunk keeps its BF16 MFMA gates, which differ from
+/// the singleton's (the control that the comparison can see the arithmetic).
+fn case_lane_wide_write(gpu: &mut Gpu) -> Result<String, String> {
+    let mut rng = Rng::new(0x4843_C101);
+    let wn = rng.vec_bf16_exact(HC_WIDE, -0.5, 0.5);
+    let inj = rng.vec_bf16_exact(4 * HC_WIDE, -0.05, 0.05);
+    let (wnt, injt) = (up_bf16(gpu, &wn)?, up_bf16(gpu, &inj)?);
+    let mut out = Vec::new();
+    for &rows in &LANE_WIDE_ROWS {
+        let x = rng.vec(rows * HC_WIDE, -2.0, 2.0);
+        let mix = rng.vec(rows * HIDDEN, -1.0, 1.0);
+        let run =
+            |gpu: &mut Gpu, single: bool, lane: bool| -> Result<(Vec<f32>, Vec<f32>), String> {
+                let st = up_f32(gpu, &x)?;
+                let nt = sentinel_f32(gpu, rows * HC_WIDE)?;
+                let mt = up_f32(gpu, &mix)?;
+                let gt = sentinel_f32(gpu, rows * HC_STREAMS)?;
+                let rot = zeros_f32(gpu, rows * HC_WIDE)?;
+                let call = |gpu: &mut Gpu, r0: usize, n: usize| -> Result<(), String> {
+                    let (sv, nv, mv, gv) = (
+                        st.sub_offset(r0 * HC_WIDE, n * HC_WIDE),
+                        nt.sub_offset(r0 * HC_WIDE, n * HC_WIDE),
+                        mt.sub_offset(r0 * HIDDEN, n * HIDDEN),
+                        gt.sub_offset(r0 * HC_STREAMS, n * HC_STREAMS),
+                    );
+                    let op = HyperWriteOp {
+                        ar: None,
+                        state_bf16: false,
+                        input: &sv,
+                        norm_weight: &wnt,
+                        block_inject: wref(&injt, HC_STREAMS, HC_WIDE),
+                        normalized: &nv,
+                        mixed: &mv,
+                        gates: &gv,
+                        output: &sv,
+                        rows: n,
+                        branches: HC_STREAMS,
+                        hidden: HIDDEN,
+                        rotation: &rot,
+                    };
+                    execute_hyper_write(gpu, &op).map_err(de)
+                };
+                if single {
+                    for r in 0..rows {
+                        call(gpu, r, 1)?;
+                    }
+                } else if lane {
+                    with_lane_scope(gpu, rows, |gpu| call(gpu, 0, rows))?;
+                } else {
+                    call(gpu, 0, rows)?;
+                }
+                let got = (down_f32(gpu, &gt)?, down_f32(gpu, &st)?);
+                free_all(gpu, vec![st, nt, mt, gt, rot])?;
+                Ok(got)
+            };
+        let (g_single, s_single) = run(gpu, true, false)?;
+        let (g_lane, s_lane) = run(gpu, false, true)?;
+        let (g_chunk, _) = run(gpu, false, false)?;
+        out.push(exact_f32(
+            &format!("lane-wide write gates rows={rows} == singles"),
+            &g_lane,
+            &g_single,
+        ));
+        out.push(exact_f32(
+            &format!("lane-wide write streams rows={rows} == singles"),
+            &s_lane,
+            &s_single,
+        ));
+        let differing = g_chunk
+            .iter()
+            .zip(&g_single)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        out.push(if differing > 0 {
+            Ok(format!(
+                "chunk MFMA gates rows={rows} differ from the singleton in {differing} words (control)"
+            ))
+        } else {
+            Err(format!(
+                "chunk gates rows={rows} equal the singleton's: the control has no power"
+            ))
+        });
+    }
+    free_all(gpu, vec![wnt, injt])?;
+    all(out)
+}
+
+/// A lane step's all-rows `execute_hyper_read` / `execute_final_hyper` (norm, down + activation, up, mix) is bitwise the one-row singleton call of every row.
+fn case_lane_wide_read(gpu: &mut Gpu) -> Result<String, String> {
+    let mut rng = Rng::new(0x4843_C201);
+    let wn = rng.vec_bf16_exact(HC_WIDE, -0.5, 0.5);
+    let down = rng.vec_bf16_exact(HC_LOW * HC_WIDE, -0.02, 0.02);
+    let upw = rng.vec_bf16_exact(HC_WIDE * HC_LOW, -0.1, 0.1);
+    let (wnt, downt, upt) = (
+        up_bf16(gpu, &wn)?,
+        up_bf16(gpu, &down)?,
+        up_bf16(gpu, &upw)?,
+    );
+    let mut out = Vec::new();
+    for final_read in [false, true] {
+        for &rows in &LANE_WIDE_ROWS {
+            let x = rng.vec(rows * HC_WIDE, -2.0, 2.0);
+            let run = |gpu: &mut Gpu, single: bool| -> Result<[Vec<f32>; 3], String> {
+                let xt = up_f32(gpu, &x)?;
+                let nt = sentinel_f32(gpu, rows * HC_WIDE)?;
+                let lowt = sentinel_f32(gpu, rows * HC_LOW)?;
+                let uot = sentinel_f32(gpu, rows * HC_WIDE)?;
+                let mt = sentinel_f32(gpu, rows * HIDDEN)?;
+                let rot = zeros_f32(gpu, rows * HC_WIDE)?;
+                let call = |gpu: &mut Gpu, r0: usize, n: usize| -> Result<(), String> {
+                    let (xv, nv, lv, uv, mv) = (
+                        xt.sub_offset(r0 * HC_WIDE, n * HC_WIDE),
+                        nt.sub_offset(r0 * HC_WIDE, n * HC_WIDE),
+                        lowt.sub_offset(r0 * HC_LOW, n * HC_LOW),
+                        uot.sub_offset(r0 * HC_WIDE, n * HC_WIDE),
+                        mt.sub_offset(r0 * HIDDEN, n * HIDDEN),
+                    );
+                    let op = HyperReadOp {
+                        state_bf16: false,
+                        input: &xv,
+                        norm_weight: &wnt,
+                        input_mix_down: wref(&downt, HC_LOW, HC_WIDE),
+                        input_mix_up: wref(&upt, HC_WIDE, HC_LOW),
+                        normalized: &nv,
+                        low: &lv,
+                        up: &uv,
+                        mixed: &mv,
+                        rows: n,
+                        branches: HC_STREAMS,
+                        hidden: HIDDEN,
+                        low_rank: HC_LOW,
+                        rotation: &rot,
+                    };
+                    if final_read {
+                        execute_final_hyper(gpu, &op).map_err(de)
+                    } else {
+                        execute_hyper_read(gpu, &op).map_err(de)
+                    }
+                };
+                if single {
+                    for r in 0..rows {
+                        call(gpu, r, 1)?;
+                    }
+                } else {
+                    with_lane_scope(gpu, rows, |gpu| call(gpu, 0, rows))?;
+                }
+                let got = [
+                    down_f32(gpu, &nt)?,
+                    down_f32(gpu, &lowt)?,
+                    down_f32(gpu, &mt)?,
+                ];
+                free_all(gpu, vec![xt, nt, lowt, uot, mt, rot])?;
+                Ok(got)
+            };
+            let single = run(gpu, true)?;
+            let lane = run(gpu, false)?;
+            for (i, name) in ["normalized", "low", "mixed"].iter().enumerate() {
+                out.push(exact_f32(
+                    &format!(
+                        "lane-wide {} {name} rows={rows} == singles",
+                        if final_read { "final read" } else { "read" }
+                    ),
+                    &lane[i],
+                    &single[i],
+                ));
+            }
+        }
+    }
+    free_all(gpu, vec![wnt, downt, upt])?;
     all(out)
 }

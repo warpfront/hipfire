@@ -312,7 +312,7 @@ pub trait DsparkBody {
     ///
     /// Default: no-op for bodies without persistent draft-local GPU state.
     /// [`DsparkDrafter::mtp_reset`] always invokes this after clearing its own
-    /// multi-slot context cache.
+    /// multi-slot context cache, and a cold (`!cache_hit`) `mtp_prefill` too.
     fn reset_for_retry(&mut self, _gpu: &mut Gpu) {}
 }
 
@@ -445,7 +445,6 @@ fn gemv_auto(
         m,
         k,
         row_stride: 0,
-        rotation: None,
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
@@ -1173,6 +1172,11 @@ impl MtpDrafter for DsparkDrafter {
     ) -> Result<crate::spec::PrefillOutcome, String> {
         if !cache_hit {
             target.reset_recurrent(gpu)?;
+            // A cold prefill starts a new conversation: body draft rings (DeepSeek
+            // `dspark_swa_k`) still hold the previous request's main_kv, and the
+            // next draft attends them, so greedy output followed daemon history
+            // (HIPF-257). Same clean slate as a fresh daemon or a cold retry.
+            self.body.reset_for_retry(gpu);
         }
         // Invalidate multi-slot context: mtp_step re-bootstraps for the first seed.
         // As in the deepseek4 drafter, we do NOT warm the DSpark stage rings
@@ -1412,9 +1416,8 @@ impl MtpDrafter for DsparkDrafter {
         // context update below slices the accepted prefix out of it GPU→GPU — so
         // the reuse never round-trips through host memory (a D2H+H2D per window,
         // ~free on UMA but a real cost on a discrete-VRAM GPU). `captured` is
-        // false when the target's batched capture path can't run for this block
-        // (llama with n_verify < 4); the update then re-bootstraps, matching the
-        // old host path's empty-capture branch. deepseek4 captures every size.
+        // false only when the target has no extract layers configured; the
+        // update then re-bootstraps. Every target captures every block size.
         let expected_hidden_per_pos = n_targets * hidden;
         let mut transient_capture = None;
         if self.persistent_verify_context_scratch {
@@ -1617,14 +1620,13 @@ impl MtpDrafter for DsparkDrafter {
                 .map(|s| position + s)
                 .collect();
         } else {
-            // Hidden capture not available (n_verify < 4 on llama): clear the
+            // Hidden capture not available (no extract layers): clear the
             // context so the NEXT window bootstraps via `capture_seed_main_hidden`
             // with the bonus token as seed.  That bootstrap is KV-correct (the
             // commit_prefix leaves KV at the committed prefix; the next
             // `mtp_step` call receives seed=bonus, position=committed_end, so
             // `capture_seed_main_hidden` advances the KV by exactly 1 for the
-            // bonus, which is the right thing).  This is the Stage 1 behaviour
-            // and is correct — just forfeits the multi-slot ctx for one window.
+            // bonus, which is the right thing).
             if !self.persistent_verify_context_scratch {
                 if let Some(old) = self.main_hidden_dev.take() {
                     let _ = gpu.free_tensor(old);

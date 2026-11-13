@@ -25,9 +25,6 @@ pub enum KvMode {
     /// kernels exist for it there. Same constraints as BF16: no rotation,
     /// no scales, no adaptive/compaction.
     F16,
-    Asym2,
-    Asym3,
-    Asym4,
     Fwht2,
     Fwht3,
     Fwht4,
@@ -278,6 +275,17 @@ pub enum VMode {
 }
 
 impl VMode {
+    /// Log label (`Q8`, `lloyd2`…): the single spelling for the KV-cache
+    /// construction lines, so the four fwht/vmm summaries cannot drift.
+    pub fn name(self) -> &'static str {
+        match self {
+            VMode::Q8 => "Q8",
+            VMode::Lloyd2 => "lloyd2",
+            VMode::Lloyd3 => "lloyd3",
+            VMode::Lloyd4 => "lloyd4",
+        }
+    }
+
     /// Kernarg value: the per-element bit count (8 for Q8). Drives both kernel
     /// dispatch branches and byte-layout arithmetic.
     pub fn bits(self) -> i32 {
@@ -321,16 +329,13 @@ pub struct KvCache {
     pub quant_asym3: bool, // true = K at givens3 (rotated 3-bit Lloyd-Max), V at Q8_0 — best-quality rotated K per RotorQuant
     pub quant_asym2: bool, // true = K at givens2 (rotated 2-bit), V at Q8_0 (normal space)
     pub boundary_layers: u8, // number of boundary layers at each end (default 2)
-    // KV rotation parameter buffers. Field names are historical — in the
-    // Givens-rotated asym{2,3,4} modes (`quant_fwht == false`) these hold the
-    // per-block cos/sin tables. In the signed-FWHT-rotated fwht{2,3,4} modes
-    // (`quant_fwht == true`) the SAME slots hold signs1/signs2 ±1 vectors.
-    // Both are [n_blocks × f32] in shape, so the storage is fungible; the
-    // dispatcher reads `quant_fwht` to know which kernel signature to use.
+    // KV rotation parameter buffers. Field names are historical (they once
+    // held Givens cos/sin tables): in the signed-FWHT-rotated fwht{2,3,4}
+    // modes they hold the signs1/signs2 ±1 vectors, [n_blocks × f32] each.
     pub givens_cos: Option<GpuTensor>,
     pub givens_sin: Option<GpuTensor>,
     /// True when the rotation primitive is signed-FWHT (matches Fwht{2,3,4}
-    /// KvMode values). False when Givens (matches Asym{2,3,4}).
+    /// KvMode values).
     pub quant_fwht: bool,
     /// True when K and V are stored as flat 2-byte BF16 (no scales, no
     /// blocks) instead of a quantized block layout. Mutually exclusive with
@@ -347,10 +352,10 @@ pub struct KvCache {
     pub v_mode: VMode,
     /// Per-layer flag: true = this layer uses Q8 (boundary layer)
     pub layer_is_boundary: Vec<bool>,
-    /// TriAttention compaction bookkeeping. After each eviction we leave the
-    /// retained keys in physical slots `0..budget` with their baked-in RoPE
-    /// phases intact, but the forward pass still counts absolute positions
-    /// for new writes. `compact_offset = absolute_seq_len - physical_seq_len`
+    /// Compaction offset bookkeeping (always 0: KV eviction was removed, the
+    /// plumbing stays so kernel arguments are unchanged). `compact_offset`
+    /// is the offset between the forward pass's absolute positions and
+    /// physical slots. `compact_offset = absolute_seq_len - physical_seq_len`
     /// — added to `pos` before RoPE so the new query/key get the correct
     /// absolute phase, and the cache write still lands at `pos` (physical).
     /// Zero when no compaction has happened.
@@ -365,12 +370,11 @@ pub struct KvCache {
 /// same packed layouts, addressed per position instead of per VMM head. The
 /// two stride facts that matter to a slot pool live here:
 ///
-/// * K and V strides DIFFER on every rotated-K tier (asym{2,3,4} /
-///   fwht{2,3,4} store K packed + a 4-byte norm/sign header per head, V at
+/// * K and V strides DIFFER on every rotated-K tier (fwht{2,3,4} store K packed + a 4-byte norm/sign header per head, V at
 ///   Q8_0), so a pool must track them separately and the 32-byte
 ///   `KvSlotDesc` carries separate `legacy_k_base`/`legacy_v_base`.
 /// * The rotation tables are MODEL-global (shared by every slot and layer):
-///   Givens angles for asym tiers, ±1 sign vectors for fwht tiers, nothing
+///   ±1 sign vectors for fwht tiers, nothing
 ///   for q8/bf16. Seeds match the `new_gpu_*_filtered` constructors exactly
 ///   (42 for the primary table, 1042 for the secondary FWHT signs) so a slot
 ///   pool writes bit-identical cache bytes to the sequential path.
@@ -378,8 +382,6 @@ pub struct KvCache {
 pub struct SlotKvTierPlan {
     pub k_bytes_per_pos: usize,
     pub v_bytes_per_pos: usize,
-    /// Givens cos/sin table length (asym tiers): `head_dim / 2`.
-    pub givens_len: Option<usize>,
     /// FWHT sign-vector length (fwht tiers): 128 (Q8-V sign width).
     pub fwht_len: Option<usize>,
 }
@@ -410,7 +412,7 @@ impl SlotKvTierPlan {
                     0,
                     &format!(
                         "{name} slot KV requires head_dim {} (got {head_dim})",
-                        if matches!(mode, KvMode::Asym3 | KvMode::Fwht3) {
+                        if matches!(mode, KvMode::Fwht3) {
                             "256"
                         } else {
                             "128 or 256"
@@ -440,16 +442,16 @@ impl SlotKvTierPlan {
                     .ok_or_else(|| hip_bridge::HipError::new(0, "slot KV kv_dim overflowed"))?;
                 kv_dim * 2
             }
-            KvMode::Asym2 | KvMode::Fwht2 => {
-                quant_gate("asym2", head_dim == 128 || head_dim == 256)?;
+            KvMode::Fwht2 => {
+                quant_gate("fwht2", head_dim == 128 || head_dim == 256)?;
                 4 + head_dim / 4
             }
-            KvMode::Asym3 | KvMode::Fwht3 => {
-                quant_gate("asym3", head_dim == 256)?;
+            KvMode::Fwht3 => {
+                quant_gate("fwht3", head_dim == 256)?;
                 4 + (head_dim * 3) / 8
             }
-            KvMode::Asym4 | KvMode::Fwht4 => {
-                quant_gate("asym4", head_dim == 128 || head_dim == 256)?;
+            KvMode::Fwht4 => {
+                quant_gate("fwht4", head_dim == 128 || head_dim == 256)?;
                 4 + head_dim / 2
             }
             // Native fp8-E4M3: one byte per element plus one f16 scale per KV
@@ -506,8 +508,6 @@ impl SlotKvTierPlan {
         Ok(Self {
             k_bytes_per_pos,
             v_bytes_per_pos,
-            givens_len: matches!(mode, KvMode::Asym2 | KvMode::Asym3 | KvMode::Asym4)
-                .then_some(head_dim / 2),
             // fwht3's K-rotation kernel is `fwht_shfl_forward_256` — it reads
             // signs[0..255] (d0 = tid*8 → lane 31 touches index 255). The
             // sequential path already allocates 256 for Fwht3 (kv.rs:776);
@@ -550,8 +550,8 @@ pub struct KvDims {
     /// raw `ctx.max_seq`, or the allocation size changes.
     pub max_seq: usize,
     /// `Some(cap)` → request a `_capped` form. HONORED ONLY for modes that have
-    /// one (q8/asym3/fwht2/fwht3 on Mask sites; q8/asym3/asym4 on Flat sites);
-    /// silently DROPPED for asym2/asym4/fwht4 on Mask sites — faithful to today.
+    /// one (q8/fwht2/fwht3 on Mask sites; q8 on Flat sites);
+    /// silently DROPPED for fwht4 on Mask sites — faithful to today.
     pub physical_cap: Option<usize>,
 }
 
@@ -580,10 +580,9 @@ struct VmmKvLayout {
     v_reserve_bytes: usize,
     k_reserve_elems: usize,
     v_reserve_elems: usize,
-    /// Sign/angle table width. 0 = none (Q8). 128 = Givens or FWHT-128.
+    /// Sign table width. 0 = none (Q8). 128 = FWHT-128.
     /// 256 = FWHT-256 (fwht3, or any FWHT+lloyd-V).
     rotation_table_len: usize,
-    uses_fwht_signs: bool,
 }
 
 impl VmmKvLayout {
@@ -615,8 +614,7 @@ impl KvCache {
         })
     }
 
-    /// Packed K bytes-per-head for Q8 / asym{2,3,4} / fwht{2,3,4}.
-    /// Asym and FWHT share storage at the same bit width; only rotation tables differ.
+    /// Packed K bytes-per-head for Q8 / fwht{2,3,4}.
     fn vmm_k_bytes_per_head(mode: KvMode, head_dim: usize) -> HipResult<usize> {
         match mode {
             KvMode::Q8 => {
@@ -641,16 +639,16 @@ impl KvCache {
             KvMode::Fp8 => head_dim
                 .checked_add(2)
                 .ok_or_else(|| hip_bridge::HipError::new(0, "VMM fp8 K head stride overflowed")),
-            KvMode::Asym2 | KvMode::Fwht2 => head_dim
+            KvMode::Fwht2 => head_dim
                 .checked_div(4)
                 .and_then(|n| n.checked_add(4))
                 .ok_or_else(|| hip_bridge::HipError::new(0, "VMM 2-bit K head stride overflowed")),
-            KvMode::Asym3 | KvMode::Fwht3 => head_dim
+            KvMode::Fwht3 => head_dim
                 .checked_mul(3)
                 .and_then(|n| n.checked_div(8))
                 .and_then(|n| n.checked_add(4))
                 .ok_or_else(|| hip_bridge::HipError::new(0, "VMM 3-bit K head stride overflowed")),
-            KvMode::Asym4 | KvMode::Fwht4 => head_dim
+            KvMode::Fwht4 => head_dim
                 .checked_div(2)
                 .and_then(|n| n.checked_add(4))
                 .ok_or_else(|| hip_bridge::HipError::new(0, "VMM 4-bit K head stride overflowed")),
@@ -758,33 +756,6 @@ impl KvCache {
                     ));
                 }
             }
-            KvMode::Asym2 | KvMode::Asym3 | KvMode::Asym4 => {
-                let ok_hd = match mode {
-                    KvMode::Asym3 => head_dim == 256,
-                    _ => head_dim == 128 || head_dim == 256,
-                };
-                if !ok_hd {
-                    return Err(hip_bridge::HipError::new(
-                        0,
-                        &format!(
-                            "VMM {mode:?} requires head_dim={} (got {head_dim})",
-                            if matches!(mode, KvMode::Asym3) {
-                                "256"
-                            } else {
-                                "128 or 256"
-                            }
-                        ),
-                    ));
-                }
-                if !matches!(v_mode, VMode::Q8) {
-                    return Err(hip_bridge::HipError::new(
-                        0,
-                        &format!(
-                            "VMM {mode:?} only supports VMode::Q8 (lloyd-V requires an FWHT K mode)"
-                        ),
-                    ));
-                }
-            }
             KvMode::Fwht2 | KvMode::Fwht3 | KvMode::Fwht4 => match v_mode {
                 VMode::Q8 => {
                     let ok_hd = match mode {
@@ -854,7 +825,6 @@ impl KvCache {
             // so 0 is the honest answer for all of them.
             KvMode::Bf16 | KvMode::F16 => 0,
             KvMode::Fp8 => 0,
-            KvMode::Asym2 | KvMode::Asym3 | KvMode::Asym4 => head_dim / 2,
             KvMode::Fwht3 => 256,
             KvMode::Fwht2 | KvMode::Fwht4 => {
                 // Q8-V uses 128-wide signs; lloyd-V needs 256-wide up front so
@@ -866,7 +836,6 @@ impl KvCache {
                 }
             }
         };
-        let uses_fwht_signs = matches!(mode, KvMode::Fwht2 | KvMode::Fwht3 | KvMode::Fwht4);
         Ok(VmmKvLayout {
             mode,
             v_mode,
@@ -883,7 +852,6 @@ impl KvCache {
             k_reserve_elems: Self::bytes_to_f32_elems("K reserve", k_reserve_bytes)?,
             v_reserve_elems: Self::bytes_to_f32_elems("V reserve", v_reserve_bytes)?,
             rotation_table_len,
-            uses_fwht_signs,
         })
     }
 
@@ -930,13 +898,9 @@ impl KvCache {
             || !matches!(v_mode, VMode::Q8)
         {
             256
-        } else if matches!(mode, KvMode::Asym2 | KvMode::Asym3 | KvMode::Asym4) {
-            head_dim / 2
         } else {
             0
         };
-        let uses_fwht_signs = matches!(mode, KvMode::Fwht2 | KvMode::Fwht3 | KvMode::Fwht4)
-            || !matches!(reserve_v_mode, VMode::Q8);
         Ok(VmmKvLayout {
             mode,
             v_mode,
@@ -953,7 +917,6 @@ impl KvCache {
             k_reserve_elems: Self::bytes_to_f32_elems("K reserve", k_reserve_bytes)?,
             v_reserve_elems: Self::bytes_to_f32_elems("V reserve", v_reserve_bytes)?,
             rotation_table_len,
-            uses_fwht_signs,
         })
     }
 
@@ -972,24 +935,7 @@ impl KvCache {
         ))
     }
 
-    fn asym3_vmm_layout(
-        n_kv_heads: usize,
-        head_dim: usize,
-        physical_cap: usize,
-    ) -> HipResult<(usize, usize, usize, usize, usize)> {
-        let layout =
-            Self::vmm_static_layout(KvMode::Asym3, VMode::Q8, n_kv_heads, head_dim, physical_cap)?;
-        Ok((
-            layout.kv_dim,
-            layout.k_reserve_elems,
-            layout.v_reserve_elems,
-            layout.k_bytes_per_head,
-            layout.v_bytes_per_head,
-        ))
-    }
-
-    /// FWHT3 reuses the Asym3 packed-K / Q8-V byte layout; only the rotation
-    /// tables and `quant_fwht` flag differ from Asym3 VMM.
+    /// FWHT3 VMM layout: 3-bit packed K + Q8 V.
     fn fwht3_vmm_layout(
         n_kv_heads: usize,
         head_dim: usize,
@@ -1014,9 +960,6 @@ impl KvCache {
     pub fn vmm_mode_flags(mode: KvMode) -> (bool, bool, bool, bool, bool) {
         match mode {
             KvMode::Q8 => (true, false, false, false, false),
-            KvMode::Asym2 => (false, false, false, true, false),
-            KvMode::Asym3 => (false, false, true, false, false),
-            KvMode::Asym4 => (false, true, false, false, false),
             KvMode::Fwht2 => (false, false, false, true, true),
             KvMode::Fwht3 => (false, false, true, false, true),
             KvMode::Fwht4 => (false, true, false, false, true),
@@ -1051,20 +994,6 @@ impl KvCache {
         single_gpu: bool,
         dims: &KvDims,
     ) -> HipResult<()> {
-        if matches!(mode, KvMode::Asym4 | KvMode::Asym3) && dims.head_dim != 256 {
-            return Err(hip_bridge::HipError::new(
-                0,
-                &format!(
-                    "{} KV cache requires head_dim=256; head_dim={} is unsupported",
-                    if mode == KvMode::Asym4 {
-                        "asym4"
-                    } else {
-                        "asym3"
-                    },
-                    dims.head_dim
-                ),
-            ));
-        }
         // FP8 is exact-geometry (D256); the VMM arm below re-validates it
         // through the layout table, but legacy requests fail here too.
         if mode == KvMode::Fp8 && dims.head_dim != 256 {
@@ -1111,9 +1040,6 @@ impl KvCache {
         }
         match mode {
             KvMode::Q8
-            | KvMode::Asym2
-            | KvMode::Asym3
-            | KvMode::Asym4
             | KvMode::Fwht2
             | KvMode::Fwht3
             | KvMode::Fwht4
@@ -1133,7 +1059,7 @@ impl KvCache {
                 return Err(hip_bridge::HipError::new(
                     0,
                     &format!(
-                        "KV backend 'vmm' supports kv_mode=q8|asym2|asym3|asym4|fwht2|fwht3|fwht4|fp8|bf16 only (got {other:?})"
+                        "KV backend 'vmm' supports kv_mode=q8|fwht2|fwht3|fwht4|fp8|bf16 only (got {other:?})"
                     ),
                 ));
             }
@@ -1332,22 +1258,18 @@ impl KvCache {
                 dims.max_seq,
                 physical_cap,
             ),
-            KvMode::Q8
-            | KvMode::Asym2
-            | KvMode::Asym3
-            | KvMode::Asym4
-            | KvMode::Fwht2
-            | KvMode::Fwht3
-            | KvMode::Fwht4 => Self::new_gpu_vmm_capped_filtered(
-                gpu,
-                is_kv_layer,
-                dims.n_kv_heads,
-                dims.head_dim,
-                dims.max_seq,
-                physical_cap,
-                mode,
-                VMode::Q8,
-            ),
+            KvMode::Q8 | KvMode::Fwht2 | KvMode::Fwht3 | KvMode::Fwht4 => {
+                Self::new_gpu_vmm_capped_filtered(
+                    gpu,
+                    is_kv_layer,
+                    dims.n_kv_heads,
+                    dims.head_dim,
+                    dims.max_seq,
+                    physical_cap,
+                    mode,
+                    VMode::Q8,
+                )
+            }
             KvMode::Bf16 => Self::new_gpu_bf16_vmm_capped_filtered(
                 gpu,
                 is_kv_layer,
@@ -1366,18 +1288,15 @@ impl KvCache {
         let hd = dims.head_dim;
         let ms = dims.max_seq;
         match (mode, &dims.layers, dims.physical_cap) {
-            // Mask + Some(cap): _capped_filtered (q8/asym3/fwht2/fwht3/fp8/bf16).
+            // Mask + Some(cap): _capped_filtered (q8/fwht2/fwht3/fp8/bf16).
             (KvMode::Q8, Mask(m), Some(cap)) => {
                 Self::new_gpu_q8_capped_filtered(gpu, m, nh, hd, ms, cap)
             }
-            (KvMode::Asym3, Mask(m), Some(cap)) => {
-                Self::new_gpu_asym3_capped_filtered(gpu, m, nh, hd, ms, cap)
-            }
             (KvMode::Fwht2, Mask(m), Some(cap)) => {
-                Self::new_gpu_fwht2_capped_filtered(gpu, m, nh, hd, ms, cap)
+                Self::new_gpu_fwht2_capped_filtered(gpu, m, nh, hd, ms, cap, VMode::Q8)
             }
             (KvMode::Fwht3, Mask(m), Some(cap)) => {
-                Self::new_gpu_fwht3_capped_filtered(gpu, m, nh, hd, ms, cap)
+                Self::new_gpu_fwht3_capped_filtered(gpu, m, nh, hd, ms, cap, VMode::Q8)
             }
             // FP8 is Mask-only (hybrid FA layers carry KV): capped + plain
             // filtered pair. Flat and VMM fall through to the error below.
@@ -1385,27 +1304,22 @@ impl KvCache {
                 Self::new_gpu_fp8_capped_filtered(gpu, m, nh, hd, ms, cap)
             }
             // Mask + cap-but-no-capped-variant: cap DROPPED, use _filtered (faithful).
-            (KvMode::Asym2, Mask(m), _) => Self::new_gpu_asym2_filtered(gpu, m, nh, hd, ms),
-            (KvMode::Asym4, Mask(m), _) => Self::new_gpu_asym4_filtered(gpu, m, nh, hd, ms),
-            (KvMode::Fwht4, Mask(m), _) => Self::new_gpu_fwht4_filtered(gpu, m, nh, hd, ms),
+            (KvMode::Fwht4, Mask(m), _) => {
+                Self::new_gpu_fwht4_filtered(gpu, m, nh, hd, ms, VMode::Q8)
+            }
             // Mask + None for the capped-capable modes: plain _filtered.
             (KvMode::Q8, Mask(m), None) => Self::new_gpu_q8_filtered(gpu, m, nh, hd, ms),
-            (KvMode::Asym3, Mask(m), None) => Self::new_gpu_asym3_filtered(gpu, m, nh, hd, ms),
-            (KvMode::Fwht2, Mask(m), None) => Self::new_gpu_fwht2_filtered(gpu, m, nh, hd, ms),
-            (KvMode::Fwht3, Mask(m), None) => Self::new_gpu_fwht3_filtered(gpu, m, nh, hd, ms),
+            (KvMode::Fwht2, Mask(m), None) => {
+                Self::new_gpu_fwht2_filtered(gpu, m, nh, hd, ms, VMode::Q8)
+            }
+            (KvMode::Fwht3, Mask(m), None) => {
+                Self::new_gpu_fwht3_filtered(gpu, m, nh, hd, ms, VMode::Q8)
+            }
             (KvMode::Fp8, Mask(m), None) => Self::new_gpu_fp8_filtered(gpu, m, nh, hd, ms),
-            // Flat + Some(cap): _capped (only q8/asym3/asym4).
+            // Flat + Some(cap): _capped (only q8).
             (KvMode::Q8, Flat(n), Some(cap)) => Self::new_gpu_q8_capped(gpu, *n, nh, hd, ms, cap),
-            (KvMode::Asym3, Flat(n), Some(cap)) => {
-                Self::new_gpu_asym3_capped(gpu, *n, nh, hd, ms, cap)
-            }
-            (KvMode::Asym4, Flat(n), Some(cap)) => {
-                Self::new_gpu_asym4_capped(gpu, *n, nh, hd, ms, cap)
-            }
-            // Flat + None: plain (only q8/asym3/asym4).
+            // Flat + None: plain (only q8).
             (KvMode::Q8, Flat(n), None) => Self::new_gpu_q8(gpu, *n, nh, hd, ms),
-            (KvMode::Asym3, Flat(n), None) => Self::new_gpu_asym3(gpu, *n, nh, hd, ms),
-            (KvMode::Asym4, Flat(n), None) => Self::new_gpu_asym4(gpu, *n, nh, hd, ms),
             // Bf16 also serves hybrid stacks via the _filtered pair (Qwen
             // eval quality control); Flat keeps the legacy plain constructors.
             (KvMode::Bf16, Mask(m), Some(cap)) => {
@@ -1426,6 +1340,53 @@ impl KvCache {
                         Mask(_) => "Mask",
                         Flat(_) => "Flat",
                     },
+                ),
+            )),
+        }
+    }
+
+    /// Legacy filtered construction for an FWHT K mode with an explicit V
+    /// mode. The legacy `Split(K, V≠Q8)` arms build through this so V allocates
+    /// at its logical stride up front — no Q8 transient that must fit
+    /// contiguously before the shrink. Fwht4 has no capped Mask variant, so
+    /// the cap is dropped there exactly as [`Self::from_mode_single`] does.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_gpu_fwht_filtered_with_v(
+        gpu: &mut Gpu,
+        mode: KvMode,
+        is_kv_layer: &[bool],
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+        v_mode: VMode,
+    ) -> HipResult<Self> {
+        match mode {
+            KvMode::Fwht2 => Self::new_gpu_fwht2_capped_filtered(
+                gpu,
+                is_kv_layer,
+                n_kv_heads,
+                head_dim,
+                max_seq_len,
+                physical_cap,
+                v_mode,
+            ),
+            KvMode::Fwht3 => Self::new_gpu_fwht3_capped_filtered(
+                gpu,
+                is_kv_layer,
+                n_kv_heads,
+                head_dim,
+                max_seq_len,
+                physical_cap,
+                v_mode,
+            ),
+            KvMode::Fwht4 => {
+                Self::new_gpu_fwht4_filtered(gpu, is_kv_layer, n_kv_heads, head_dim, max_seq_len, v_mode)
+            }
+            other => Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "lloyd-V requires an FWHT K mode (got {other:?}); refusing rather than mis-sizing the V cache"
                 ),
             )),
         }
@@ -1898,26 +1859,14 @@ impl KvCache {
         if self.quant_bf16 {
             return Ok(KvMode::Bf16);
         }
-        if self.quant_asym4 {
-            return Ok(if self.quant_fwht {
-                KvMode::Fwht4
-            } else {
-                KvMode::Asym4
-            });
+        if self.quant_asym4 && self.quant_fwht {
+            return Ok(KvMode::Fwht4);
         }
-        if self.quant_asym3 {
-            return Ok(if self.quant_fwht {
-                KvMode::Fwht3
-            } else {
-                KvMode::Asym3
-            });
+        if self.quant_asym3 && self.quant_fwht {
+            return Ok(KvMode::Fwht3);
         }
-        if self.quant_asym2 {
-            return Ok(if self.quant_fwht {
-                KvMode::Fwht2
-            } else {
-                KvMode::Asym2
-            });
+        if self.quant_asym2 && self.quant_fwht {
+            return Ok(KvMode::Fwht2);
         }
         Err(hip_bridge::HipError::new(
             0,
@@ -2503,8 +2452,9 @@ impl KvCache {
         Ok(())
     }
 
-    /// Reallocate the V buffers for a new V mode (used by eval/bench to set an
-    /// independent V quant after construction). Re-sizes only real KV layers
+    /// Reallocate the V buffers for a new V mode (used by the lab
+    /// `adaptive_kv_check` example to set an independent V quant after
+    /// construction). Re-sizes only real KV layers
     /// (placeholder 1-element buffers for non-KV layers are left as-is).
     /// K buffers and rotation tables are untouched except when enabling lloyd-V
     /// on fwht2/4-K caches (128-element signs → reallocated to 256; the 128-wide
@@ -3493,17 +3443,13 @@ impl KvCache {
             is_kv_layer,
         )?;
 
-        // Optional rotation tables (Givens angles or FWHT signs). Built before
+        // Optional rotation tables (FWHT signs). Built before
         // the cache is published so a table failure can roll back arenas.
         let rotation = if layout.rotation_table_len == 0 {
             None
         } else {
             let n = layout.rotation_table_len;
-            let (a_vals, b_vals) = if layout.uses_fwht_signs {
-                (Self::gen_fwht_signs(42, n), Self::gen_fwht_signs(1042, n))
-            } else {
-                Self::gen_givens_angles(42, n)
-            };
+            let (a_vals, b_vals) = (Self::gen_fwht_signs(42, n), Self::gen_fwht_signs(1042, n));
             let a_bytes: Vec<u8> = a_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
             let b_bytes: Vec<u8> = b_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
             let tables = (|| -> HipResult<(GpuTensor, GpuTensor)> {
@@ -3585,12 +3531,7 @@ impl KvCache {
                 return Err(err);
             }
         };
-        let v_label = match v_mode {
-            VMode::Q8 => "Q8".to_string(),
-            VMode::Lloyd2 => "lloyd2".to_string(),
-            VMode::Lloyd3 => "lloyd3".to_string(),
-            VMode::Lloyd4 => "lloyd4".to_string(),
-        };
+        let v_label = v_mode.name();
         eprintln!(
             "KV cache: {mode:?} vmm ({n_kv}/{} layers carry KV; K {}B/head + V {v_label} {}B/head; mapped_prefix={mapped} / physical_cap={physical_cap} / max_seq={max_seq_len})",
             is_kv_layer.len(),
@@ -3958,106 +3899,6 @@ impl KvCache {
         })
     }
 
-    /// Generate deterministic Givens rotation angles from a seed.
-    /// Returns (cos_theta, sin_theta) each of length n_blocks.
-    pub fn gen_givens_angles(seed: u32, n_blocks: usize) -> (Vec<f32>, Vec<f32>) {
-        let mut state = seed;
-        let mut cos_vals = Vec::with_capacity(n_blocks);
-        let mut sin_vals = Vec::with_capacity(n_blocks);
-        for _ in 0..n_blocks {
-            state = state.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
-            let angle = (state as f64 / 0x7fffffff as f64) * std::f64::consts::TAU;
-            cos_vals.push(angle.cos() as f32);
-            sin_vals.push(angle.sin() as f32);
-        }
-        (cos_vals, sin_vals)
-    }
-
-    /// Create asym4 KV cache: K at 4-bit rotated (Givens + Lloyd-Max), V at Q8_0.
-    /// head_dim=256 → K=132 B/head, V=272 B/head → 404 B/head total (5.1× vs fp32).
-    /// Back-compat wrapper: `physical_cap == max_seq_len`.
-    pub fn new_gpu_asym4(
-        gpu: &mut Gpu,
-        n_layers: usize,
-        n_kv_heads: usize,
-        head_dim: usize,
-        max_seq_len: usize,
-    ) -> HipResult<Self> {
-        Self::new_gpu_asym4_capped(
-            gpu,
-            n_layers,
-            n_kv_heads,
-            head_dim,
-            max_seq_len,
-            max_seq_len,
-        )
-    }
-
-    /// Filtered variant of [`new_gpu_asym4`]: skips KV alloc for non-KV layers.
-    pub fn new_gpu_asym4_filtered(
-        gpu: &mut Gpu,
-        is_kv_layer: &[bool],
-        n_kv_heads: usize,
-        head_dim: usize,
-        max_seq_len: usize,
-    ) -> HipResult<Self> {
-        assert!(
-            head_dim == 128 || head_dim == 256,
-            "asym4 requires head_dim=128 or 256"
-        );
-        assert!(head_dim % 32 == 0);
-        let physical_cap = max_seq_len;
-        let kv_dim = n_kv_heads * head_dim;
-        let k_bph = 4 + head_dim / 2;
-        let k_elems = (physical_cap * n_kv_heads * k_bph + 3) / 4;
-        let v_blocks_per_head = head_dim / 32;
-        let v_bpp = n_kv_heads * v_blocks_per_head * 34;
-        let v_elems = (physical_cap * v_bpp + 3) / 4;
-        let (k_gpu, v_gpu) = Self::alloc_k_v_filtered(gpu, k_elems, v_elems, is_kv_layer)?;
-        let n_blocks = head_dim / 2;
-        let (cos_vals, sin_vals) = Self::gen_givens_angles(42, n_blocks);
-        let cb: Vec<u8> = cos_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        let sb: Vec<u8> = sin_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        let ct = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
-        let st = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
-        gpu.hip.memcpy_htod(&ct.buf, &cb)?;
-        gpu.hip.memcpy_htod(&st.buf, &sb)?;
-        let v_bph = v_bpp / n_kv_heads;
-        let n_kv = is_kv_layer.iter().filter(|b| **b).count();
-        eprintln!(
-            "KV cache: asym4 filtered backend=legacy ({n_kv}/{} layers carry KV; K rotated-4b {k_bph}B + V Q8 {v_bph}B = {} B/head)",
-            is_kv_layer.len(),
-            k_bph + v_bph,
-        );
-        Ok(Self {
-            k_gpu,
-            v_gpu,
-            k_scales: vec![],
-            v_scales: vec![],
-            kv_dim,
-            max_seq: max_seq_len,
-            physical_cap,
-            n_kv_heads,
-            head_dim,
-            quantized: true,
-            quant_q8: false,
-            quant_int8: false,
-            quant_hfq4: false,
-            quant_asym4: true,
-            quant_asym3: false,
-            quant_asym2: false,
-            quant_fwht: false,
-            quant_bf16: false,
-            quant_fp8: false,
-            boundary_layers: 0,
-            givens_cos: Some(ct),
-            givens_sin: Some(st),
-            layer_is_boundary: vec![],
-            compact_offset: 0,
-            v_mode: VMode::Q8,
-        })
-    }
-
     /// Filtered variant of [`new_gpu_fwht4`]: skips KV alloc for non-KV layers.
     /// Mirrors `new_gpu_asym4_filtered` byte-for-byte except the rotation
     /// parameter buffers hold signs1/signs2 (FWHT) instead of cos/sin (Givens)
@@ -4069,24 +3910,37 @@ impl KvCache {
         n_kv_heads: usize,
         head_dim: usize,
         max_seq_len: usize,
+        v_mode: VMode,
     ) -> HipResult<Self> {
         assert!(
             head_dim == 128 || head_dim == 256,
             "fwht4 requires head_dim=128 or 256"
         );
         assert!(head_dim % 32 == 0);
+        if !matches!(v_mode, VMode::Q8) {
+            assert!(
+                head_dim == 256,
+                "lloyd-V requires head_dim == 256 (got {head_dim})"
+            );
+        }
         let physical_cap = max_seq_len;
         let kv_dim = n_kv_heads * head_dim;
         let k_bph = 4 + head_dim / 2;
         let k_elems = (physical_cap * n_kv_heads * k_bph + 3) / 4;
-        let v_blocks_per_head = head_dim / 32;
-        let v_bpp = n_kv_heads * v_blocks_per_head * 34;
+        let v_bpp = Self::v_bytes_per_pos(n_kv_heads, head_dim, v_mode);
         let v_elems = (physical_cap * v_bpp + 3) / 4;
         let (k_gpu, v_gpu) = Self::alloc_k_v_filtered(gpu, k_elems, v_elems, is_kv_layer)?;
         // fwht_shfl_forward operates on 128 elements regardless of head_dim;
         // signs are shared across the hd=256 two-half rotation. Seeds (42,
-        // 1042) match the MQ4 weight-FWHT convention.
-        let n_signs = 128;
+        // 1042) match the MQ4 weight-FWHT convention. Lloyd-V is 256-wide and
+        // needs 256-element tables up front; gen_fwht_signs is a pure LCG, so
+        // the first 128 entries are byte-identical and the 128-wide K reads
+        // are unaffected.
+        let n_signs = if matches!(v_mode, VMode::Q8) {
+            128
+        } else {
+            256
+        };
         let s1_vals = Self::gen_fwht_signs(42, n_signs);
         let s2_vals = Self::gen_fwht_signs(1042, n_signs);
         let s1_bytes: Vec<u8> = s1_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
@@ -4097,8 +3951,9 @@ impl KvCache {
         gpu.hip.memcpy_htod(&s2.buf, &s2_bytes)?;
         let v_bph = v_bpp / n_kv_heads;
         let n_kv = is_kv_layer.iter().filter(|b| **b).count();
+        let v_label = v_mode.name();
         eprintln!(
-            "KV cache: fwht4 filtered backend=legacy ({n_kv}/{} layers carry KV; K FWHT-4b {k_bph}B + V Q8 {v_bph}B = {} B/head)",
+            "KV cache: fwht4 filtered backend=legacy ({n_kv}/{} layers carry KV; K FWHT-4b {k_bph}B + V {v_label} {v_bph}B = {} B/head)",
             is_kv_layer.len(),
             k_bph + v_bph,
         );
@@ -4127,81 +3982,7 @@ impl KvCache {
             givens_sin: Some(s2),
             layer_is_boundary: vec![],
             compact_offset: 0,
-            v_mode: VMode::Q8,
-        })
-    }
-
-    /// Same as [`new_gpu_asym4`] with an explicit physical_cap. Eviction-aware.
-    pub fn new_gpu_asym4_capped(
-        gpu: &mut Gpu,
-        n_layers: usize,
-        n_kv_heads: usize,
-        head_dim: usize,
-        max_seq_len: usize,
-        physical_cap: usize,
-    ) -> HipResult<Self> {
-        assert!(
-            head_dim == 128 || head_dim == 256,
-            "asym4 requires head_dim=128 or 256"
-        );
-        assert!(head_dim % 32 == 0);
-        assert!(
-            physical_cap > 0 && physical_cap <= max_seq_len,
-            "physical_cap ({physical_cap}) must be in (0, max_seq_len={max_seq_len}]"
-        );
-        let kv_dim = n_kv_heads * head_dim;
-        let k_bph = 4 + head_dim / 2;
-        let k_elems = (physical_cap * n_kv_heads * k_bph + 3) / 4;
-        let v_blocks_per_head = head_dim / 32;
-        let v_bpp = n_kv_heads * v_blocks_per_head * 34;
-        let v_elems = (physical_cap * v_bpp + 3) / 4;
-
-        let mut k_gpu = Vec::with_capacity(n_layers);
-        let mut v_gpu = Vec::with_capacity(n_layers);
-        for _ in 0..n_layers {
-            k_gpu.push(gpu.zeros(&[k_elems], DType::F32)?);
-            v_gpu.push(gpu.zeros(&[v_elems], DType::F32)?);
-        }
-        let n_blocks = head_dim / 2;
-        let (cos_vals, sin_vals) = Self::gen_givens_angles(42, n_blocks);
-        let cb: Vec<u8> = cos_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        let sb: Vec<u8> = sin_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        let ct = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
-        let st = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
-        gpu.hip.memcpy_htod(&ct.buf, &cb)?;
-        gpu.hip.memcpy_htod(&st.buf, &sb)?;
-        let v_bph = v_bpp / n_kv_heads;
-        eprintln!(
-            "KV cache: asym4 backend=legacy (K rotated-4b {k_bph}B + V Q8 {v_bph}B = {} B/head, {:.1}x vs fp32)",
-            k_bph + v_bph,
-            (head_dim * 4 * 2) as f64 / (k_bph + v_bph) as f64
-        );
-        Ok(Self {
-            k_gpu,
-            v_gpu,
-            k_scales: vec![],
-            v_scales: vec![],
-            kv_dim,
-            max_seq: max_seq_len,
-            physical_cap,
-            n_kv_heads,
-            head_dim,
-            quantized: true,
-            quant_q8: false,
-            quant_int8: false,
-            quant_hfq4: false,
-            quant_asym4: true,
-            quant_asym3: false,
-            quant_asym2: false,
-            quant_fwht: false,
-            quant_bf16: false,
-            quant_fp8: false,
-            boundary_layers: 0,
-            givens_cos: Some(ct),
-            givens_sin: Some(st),
-            layer_is_boundary: vec![],
-            compact_offset: 0,
-            v_mode: VMode::Q8,
+            v_mode,
         })
     }
 
@@ -4306,156 +4087,6 @@ impl KvCache {
         })
     }
 
-    /// Create asym3 KV cache: K at 3-bit rotated (Lloyd-Max N(0, 1/256)), V at Q8_0.
-    /// head_dim=256 → K=100 B/head, V=272 B/head → 372 B/head (5.5× vs fp32).
-    /// Back-compat wrapper: allocates physical_cap == max_seq_len slots per layer.
-    pub fn new_gpu_asym3(
-        gpu: &mut Gpu,
-        n_layers: usize,
-        n_kv_heads: usize,
-        head_dim: usize,
-        max_seq_len: usize,
-    ) -> HipResult<Self> {
-        Self::new_gpu_asym3_capped(
-            gpu,
-            n_layers,
-            n_kv_heads,
-            head_dim,
-            max_seq_len,
-            max_seq_len,
-        )
-    }
-
-    /// Gemma4 variant of `new_gpu_asym3` (global 512). Delegates to the
-    /// gemma4-capped door so the shared 256-only guard stays unchanged.
-    pub fn new_gpu_asym3_gemma4(
-        gpu: &mut Gpu,
-        n_layers: usize,
-        n_kv_heads: usize,
-        head_dim: usize,
-        max_seq_len: usize,
-    ) -> HipResult<Self> {
-        Self::new_gpu_asym3_capped_gemma4(
-            gpu,
-            n_layers,
-            n_kv_heads,
-            head_dim,
-            max_seq_len,
-            max_seq_len,
-        )
-    }
-
-    /// Filtered variant of [`new_gpu_asym3`]: skips KV allocation for layers
-    /// flagged as non-KV (LinearAttention/DeltaNet in hybrid arches). See
-    /// [`alloc_k_v_filtered`].
-    pub fn new_gpu_asym3_filtered(
-        gpu: &mut Gpu,
-        is_kv_layer: &[bool],
-        n_kv_heads: usize,
-        head_dim: usize,
-        max_seq_len: usize,
-    ) -> HipResult<Self> {
-        Self::new_gpu_asym3_capped_filtered(
-            gpu,
-            is_kv_layer,
-            n_kv_heads,
-            head_dim,
-            max_seq_len,
-            max_seq_len,
-        )
-    }
-
-    /// Capped + filtered asym3 — saves multi-GB at long ctx for Qwen 3.5 hybrid.
-    pub fn new_gpu_asym3_capped_filtered(
-        gpu: &mut Gpu,
-        is_kv_layer: &[bool],
-        n_kv_heads: usize,
-        head_dim: usize,
-        max_seq_len: usize,
-        physical_cap: usize,
-    ) -> HipResult<Self> {
-        assert!(
-            head_dim == 256,
-            "asym3 currently requires head_dim=256 (Qwen 3.5)"
-        );
-        assert!(head_dim % 32 == 0);
-        assert!(
-            physical_cap > 0 && physical_cap <= max_seq_len,
-            "physical_cap ({physical_cap}) must be in (0, max_seq_len={max_seq_len}]"
-        );
-        let kv_dim = n_kv_heads * head_dim;
-        let k_bph = 4 + (head_dim * 3) / 8;
-        let k_elems = (physical_cap * n_kv_heads * k_bph + 3) / 4;
-        let v_blocks_per_head = head_dim / 32;
-        let v_bpp = n_kv_heads * v_blocks_per_head * 34;
-        let v_elems = (physical_cap * v_bpp + 3) / 4;
-        let (k_gpu, v_gpu) = Self::alloc_k_v_filtered(gpu, k_elems, v_elems, is_kv_layer)?;
-        let n_blocks = head_dim / 2;
-        let (cos_vals, sin_vals) = Self::gen_givens_angles(42, n_blocks);
-        let cb: Vec<u8> = cos_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        let sb: Vec<u8> = sin_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        let ct = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
-        let st = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
-        gpu.hip.memcpy_htod(&ct.buf, &cb)?;
-        gpu.hip.memcpy_htod(&st.buf, &sb)?;
-        let v_bph = v_bpp / n_kv_heads;
-        let n_kv = is_kv_layer.iter().filter(|b| **b).count();
-        eprintln!(
-            "KV cache: asym3 filtered backend=legacy ({n_kv}/{} layers carry KV; K rotated-3b {k_bph}B + V Q8 {v_bph}B = {} B/head, physical_cap={physical_cap} / max_seq={max_seq_len})",
-            is_kv_layer.len(),
-            k_bph + v_bph,
-        );
-        Ok(Self {
-            k_gpu,
-            v_gpu,
-            k_scales: vec![],
-            v_scales: vec![],
-            kv_dim,
-            max_seq: max_seq_len,
-            physical_cap,
-            n_kv_heads,
-            head_dim,
-            quantized: true,
-            quant_q8: false,
-            quant_int8: false,
-            quant_hfq4: false,
-            quant_asym4: false,
-            quant_asym3: true,
-            quant_asym2: false,
-            quant_fwht: false,
-            quant_bf16: false,
-            quant_fp8: false,
-            boundary_layers: 0,
-            givens_cos: Some(ct),
-            givens_sin: Some(st),
-            layer_is_boundary: vec![],
-            compact_offset: 0,
-            v_mode: VMode::Q8,
-        })
-    }
-
-    /// VMM-backed Asym3-K/Q8-V cache for Qwen3.5 hybrid stacks.
-    /// Thin wrapper over [`Self::new_gpu_vmm_capped_filtered`].
-    pub fn new_gpu_asym3_vmm_capped_filtered(
-        gpu: &mut Gpu,
-        is_kv_layer: &[bool],
-        n_kv_heads: usize,
-        head_dim: usize,
-        max_seq_len: usize,
-        physical_cap: usize,
-    ) -> HipResult<Self> {
-        Self::new_gpu_vmm_capped_filtered(
-            gpu,
-            is_kv_layer,
-            n_kv_heads,
-            head_dim,
-            max_seq_len,
-            physical_cap,
-            KvMode::Asym3,
-            VMode::Q8,
-        )
-    }
-
     /// VMM-backed FWHT3-K/Q8-V cache for Qwen3.5 hybrid stacks.
     /// Thin wrapper over [`Self::new_gpu_vmm_capped_filtered`].
     pub fn new_gpu_fwht3_vmm_capped_filtered(
@@ -4487,6 +4118,7 @@ impl KvCache {
         n_kv_heads: usize,
         head_dim: usize,
         max_seq_len: usize,
+        v_mode: VMode,
     ) -> HipResult<Self> {
         Self::new_gpu_fwht3_capped_filtered(
             gpu,
@@ -4495,11 +4127,12 @@ impl KvCache {
             head_dim,
             max_seq_len,
             max_seq_len,
+            v_mode,
         )
     }
 
     /// Capped + filtered fwht3 — layer-filtered (skips non-KV layers) with an
-    /// explicit `physical_cap` for TriAttention/CASK eviction. Default path has
+    /// explicit `physical_cap`. Default path has
     /// `physical_cap == max_seq_len` (no eviction). Byte layout identical to
     /// `asym3_capped_filtered`; rotation primitive is signed-FWHT-256.
     pub fn new_gpu_fwht3_capped_filtered(
@@ -4509,6 +4142,7 @@ impl KvCache {
         head_dim: usize,
         max_seq_len: usize,
         physical_cap: usize,
+        v_mode: VMode,
     ) -> HipResult<Self> {
         assert!(
             head_dim == 256,
@@ -4521,6 +4155,7 @@ impl KvCache {
             head_dim,
             max_seq_len,
             physical_cap,
+            v_mode,
         )
     }
 
@@ -4549,6 +4184,7 @@ impl KvCache {
             head_dim,
             max_seq_len,
             physical_cap,
+            VMode::Q8,
         )
     }
 
@@ -4559,6 +4195,7 @@ impl KvCache {
         head_dim: usize,
         max_seq_len: usize,
         physical_cap: usize,
+        v_mode: VMode,
     ) -> HipResult<Self> {
         assert!(head_dim % 32 == 0);
         assert!(
@@ -4568,8 +4205,7 @@ impl KvCache {
         let kv_dim = n_kv_heads * head_dim;
         let k_bph = 4 + (head_dim * 3) / 8;
         let k_elems = (physical_cap * n_kv_heads * k_bph + 3) / 4;
-        let v_blocks_per_head = head_dim / 32;
-        let v_bpp = n_kv_heads * v_blocks_per_head * 34;
+        let v_bpp = Self::v_bytes_per_pos(n_kv_heads, head_dim, v_mode);
         let v_elems = (physical_cap * v_bpp + 3) / 4;
         let (k_gpu, v_gpu) = Self::alloc_k_v_filtered(gpu, k_elems, v_elems, is_kv_layer)?;
         // fwht_shfl_forward_256 reads signs[tid*8..tid*8+7], so 256 floats each.
@@ -4584,8 +4220,9 @@ impl KvCache {
         gpu.hip.memcpy_htod(&s2.buf, &s2_bytes)?;
         let v_bph = v_bpp / n_kv_heads;
         let n_kv = is_kv_layer.iter().filter(|b| **b).count();
+        let v_label = v_mode.name();
         eprintln!(
-            "KV cache: fwht3 filtered backend=legacy ({n_kv}/{} layers carry KV; K FWHT-3b {k_bph}B + V Q8 {v_bph}B = {} B/head)",
+            "KV cache: fwht3 filtered backend=legacy ({n_kv}/{} layers carry KV; K FWHT-3b {k_bph}B + V {v_label} {v_bph}B = {} B/head)",
             is_kv_layer.len(),
             k_bph + v_bph,
         );
@@ -4614,288 +4251,7 @@ impl KvCache {
             givens_sin: Some(s2),
             layer_is_boundary: vec![],
             compact_offset: 0,
-            v_mode: VMode::Q8,
-        })
-    }
-
-    /// Same as [`new_gpu_asym3`] but with an explicit physical capacity. When
-    /// `physical_cap < max_seq_len`, the cache is sized for `physical_cap`
-    /// tokens along the time axis; the caller is responsible for triggering
-    /// TriAttention/CASK eviction before the physical position overruns
-    /// `physical_cap`. `max_seq_len` is retained for RoPE/mask purposes.
-    pub fn new_gpu_asym3_capped(
-        gpu: &mut Gpu,
-        n_layers: usize,
-        n_kv_heads: usize,
-        head_dim: usize,
-        max_seq_len: usize,
-        physical_cap: usize,
-    ) -> HipResult<Self> {
-        assert!(
-            head_dim == 256,
-            "asym3 currently requires head_dim=256 (Qwen 3.5)"
-        );
-        Self::new_gpu_asym3_capped_inner(
-            gpu,
-            n_layers,
-            n_kv_heads,
-            head_dim,
-            max_seq_len,
-            physical_cap,
-        )
-    }
-
-    /// Gemma 4 door for the global-attention KV, whose `global_head_dim` is
-    /// 512. Separate entry point so the shared constructor above keeps its
-    /// exact 256-only guard for Qwen 3.5/3.6 and every other architecture.
-    pub fn new_gpu_asym3_capped_gemma4(
-        gpu: &mut Gpu,
-        n_layers: usize,
-        n_kv_heads: usize,
-        head_dim: usize,
-        max_seq_len: usize,
-        physical_cap: usize,
-    ) -> HipResult<Self> {
-        assert!(
-            head_dim == 256 || head_dim == 512,
-            "asym3 (gemma4) requires head_dim=256 or 512 (got {head_dim})"
-        );
-        Self::new_gpu_asym3_capped_inner(
-            gpu,
-            n_layers,
-            n_kv_heads,
-            head_dim,
-            max_seq_len,
-            physical_cap,
-        )
-    }
-
-    fn new_gpu_asym3_capped_inner(
-        gpu: &mut Gpu,
-        n_layers: usize,
-        n_kv_heads: usize,
-        head_dim: usize,
-        max_seq_len: usize,
-        physical_cap: usize,
-    ) -> HipResult<Self> {
-        Self::new_gpu_asym3_capped_inner_with_alloc(
-            gpu,
-            n_layers,
-            n_kv_heads,
-            head_dim,
-            max_seq_len,
-            physical_cap,
-            Gpu::zeros,
-            Gpu::alloc_tensor,
-            |gpu: &mut Gpu, tensor: &GpuTensor, bytes: &[u8]| {
-                gpu.hip.memcpy_htod(&tensor.buf, bytes)
-            },
-        )
-    }
-
-    /// [`new_gpu_asym3_capped_inner`] with injectable allocation/copy seams:
-    /// the production door passes [`Gpu::zeros`], [`Gpu::alloc_tensor`], and
-    /// a host-to-device copy; rollback tests fail the Nth seam call to prove
-    /// a mid-build failure frees every already-owned buffer — the current
-    /// unmatched K, all prior K/V layers, and any owned givens table — before
-    /// the original error propagates.
-    fn new_gpu_asym3_capped_inner_with_alloc(
-        gpu: &mut Gpu,
-        n_layers: usize,
-        n_kv_heads: usize,
-        head_dim: usize,
-        max_seq_len: usize,
-        physical_cap: usize,
-        mut alloc_zero: impl FnMut(&mut Gpu, &[usize], DType) -> HipResult<GpuTensor>,
-        mut alloc: impl FnMut(&mut Gpu, &[usize], DType) -> HipResult<GpuTensor>,
-        mut copy_htod: impl FnMut(&mut Gpu, &GpuTensor, &[u8]) -> HipResult<()>,
-    ) -> HipResult<Self> {
-        assert!(head_dim % 32 == 0);
-        assert!(
-            physical_cap > 0 && physical_cap <= max_seq_len,
-            "physical_cap ({physical_cap}) must be in (0, max_seq_len={max_seq_len}]"
-        );
-        let kv_dim = n_kv_heads * head_dim;
-        let k_bph = 4 + (head_dim * 3) / 8;
-        let k_elems = (physical_cap * n_kv_heads * k_bph + 3) / 4;
-        let v_blocks_per_head = head_dim / 32;
-        let v_bpp = n_kv_heads * v_blocks_per_head * 34;
-        let v_elems = (physical_cap * v_bpp + 3) / 4;
-
-        let mut k_gpu = Vec::with_capacity(n_layers);
-        let mut v_gpu = Vec::with_capacity(n_layers);
-        // Same cleanup-closure shape as `alloc_k_v_filtered`: on any mid-loop
-        // failure free every tensor already pushed (GpuTensor has no freeing
-        // Drop). The K push precedes its V, so a V failure leaves the current
-        // K unmatched but still owned in `k_gpu` — the drain below covers it.
-        let kv_result = (|| -> HipResult<()> {
-            for _ in 0..n_layers {
-                k_gpu.push(alloc_zero(gpu, &[k_elems], DType::F32)?);
-                v_gpu.push(alloc_zero(gpu, &[v_elems], DType::F32)?);
-            }
-            Ok(())
-        })();
-        if let Err(err) = kv_result {
-            for tensor in k_gpu.drain(..).chain(v_gpu.drain(..)) {
-                let _ = gpu.free_tensor(tensor);
-            }
-            return Err(err);
-        }
-        let n_blocks = head_dim / 2;
-        let (cos_vals, sin_vals) = Self::gen_givens_angles(42, n_blocks);
-        let cb: Vec<u8> = cos_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        let sb: Vec<u8> = sin_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        // Givens tables follow the filtered-VMM rotation-table pattern: a
-        // partial pair never escapes — a second-alloc or copy failure frees
-        // the already-owned table — and a table failure rolls back every K/V
-        // owner above so the caller can retry on the same `gpu`.
-        let tables = (|| -> HipResult<(GpuTensor, GpuTensor)> {
-            let ct = alloc(gpu, &[n_blocks], DType::F32)?;
-            let st = match alloc(gpu, &[n_blocks], DType::F32) {
-                Ok(st) => st,
-                Err(err) => {
-                    let _ = gpu.free_tensor(ct);
-                    return Err(err);
-                }
-            };
-            if let Err(err) = copy_htod(gpu, &ct, &cb) {
-                let _ = gpu.free_tensor(ct);
-                let _ = gpu.free_tensor(st);
-                return Err(err);
-            }
-            if let Err(err) = copy_htod(gpu, &st, &sb) {
-                let _ = gpu.free_tensor(ct);
-                let _ = gpu.free_tensor(st);
-                return Err(err);
-            }
-            Ok((ct, st))
-        })();
-        let (ct, st) = match tables {
-            Ok(pair) => pair,
-            Err(err) => {
-                for tensor in k_gpu.drain(..).chain(v_gpu.drain(..)) {
-                    let _ = gpu.free_tensor(tensor);
-                }
-                return Err(err);
-            }
-        };
-        let v_bph = v_bpp / n_kv_heads;
-        eprintln!(
-            "KV cache: asym3 backend=legacy (K rotated-3b {k_bph}B + V Q8 {v_bph}B = {} B/head, {:.1}x vs fp32, physical_cap={physical_cap} / max_seq={max_seq_len})",
-            k_bph + v_bph,
-            (head_dim * 4 * 2) as f64 / (k_bph + v_bph) as f64
-        );
-        Ok(Self {
-            k_gpu,
-            v_gpu,
-            k_scales: vec![],
-            v_scales: vec![],
-            kv_dim,
-            max_seq: max_seq_len,
-            physical_cap,
-            n_kv_heads,
-            head_dim,
-            quantized: true,
-            quant_q8: false,
-            quant_int8: false,
-            quant_hfq4: false,
-            quant_asym4: false,
-            quant_asym3: true,
-            quant_asym2: false,
-            quant_fwht: false,
-            quant_bf16: false,
-            quant_fp8: false,
-            boundary_layers: 0,
-            givens_cos: Some(ct),
-            givens_sin: Some(st),
-            layer_is_boundary: vec![],
-            compact_offset: 0,
-            v_mode: VMode::Q8,
-        })
-    }
-
-    /// Create asym2 KV cache: K at 2-bit rotated, V at Q8_0.
-    /// head_dim=256 → K=68 B/head, V=272 B/head → 340 B/head (6.0× vs fp32).
-    /// Back-compat wrapper: `physical_cap == max_seq_len`.
-    pub fn new_gpu_asym2(
-        gpu: &mut Gpu,
-        n_layers: usize,
-        n_kv_heads: usize,
-        head_dim: usize,
-        max_seq_len: usize,
-    ) -> HipResult<Self> {
-        Self::new_gpu_asym2_capped(
-            gpu,
-            n_layers,
-            n_kv_heads,
-            head_dim,
-            max_seq_len,
-            max_seq_len,
-        )
-    }
-
-    /// Filtered variant of [`new_gpu_asym2`]: skips KV alloc for non-KV layers.
-    pub fn new_gpu_asym2_filtered(
-        gpu: &mut Gpu,
-        is_kv_layer: &[bool],
-        n_kv_heads: usize,
-        head_dim: usize,
-        max_seq_len: usize,
-    ) -> HipResult<Self> {
-        assert!(
-            head_dim == 128 || head_dim == 256,
-            "asym2 requires head_dim=128 or 256"
-        );
-        assert!(head_dim % 32 == 0);
-        let physical_cap = max_seq_len;
-        let kv_dim = n_kv_heads * head_dim;
-        let k_bph = 4 + head_dim / 4;
-        let k_elems = (physical_cap * n_kv_heads * k_bph + 3) / 4;
-        let v_blocks_per_head = head_dim / 32;
-        let v_bpp = n_kv_heads * v_blocks_per_head * 34;
-        let v_elems = (physical_cap * v_bpp + 3) / 4;
-        let (k_gpu, v_gpu) = Self::alloc_k_v_filtered(gpu, k_elems, v_elems, is_kv_layer)?;
-        let n_blocks = head_dim / 2;
-        let (cos_vals, sin_vals) = Self::gen_givens_angles(42, n_blocks);
-        let cb: Vec<u8> = cos_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        let sb: Vec<u8> = sin_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        let ct = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
-        let st = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
-        gpu.hip.memcpy_htod(&ct.buf, &cb)?;
-        gpu.hip.memcpy_htod(&st.buf, &sb)?;
-        let v_bph = v_bpp / n_kv_heads;
-        let n_kv = is_kv_layer.iter().filter(|b| **b).count();
-        eprintln!(
-            "KV cache: asym2 filtered backend=legacy ({n_kv}/{} layers carry KV; K rotated-2b {k_bph}B + V Q8 {v_bph}B = {} B/head)",
-            is_kv_layer.len(),
-            k_bph + v_bph,
-        );
-        Ok(Self {
-            k_gpu,
-            v_gpu,
-            k_scales: vec![],
-            v_scales: vec![],
-            kv_dim,
-            max_seq: max_seq_len,
-            physical_cap,
-            n_kv_heads,
-            head_dim,
-            quantized: true,
-            quant_q8: false,
-            quant_int8: false,
-            quant_hfq4: false,
-            quant_asym4: false,
-            quant_asym3: false,
-            quant_asym2: true,
-            quant_fwht: false,
-            quant_bf16: false,
-            quant_fp8: false,
-            boundary_layers: 0,
-            givens_cos: Some(ct),
-            givens_sin: Some(st),
-            layer_is_boundary: vec![],
-            compact_offset: 0,
-            v_mode: VMode::Q8,
+            v_mode,
         })
     }
 
@@ -4907,6 +4263,7 @@ impl KvCache {
         n_kv_heads: usize,
         head_dim: usize,
         max_seq_len: usize,
+        v_mode: VMode,
     ) -> HipResult<Self> {
         Self::new_gpu_fwht2_capped_filtered(
             gpu,
@@ -4915,11 +4272,12 @@ impl KvCache {
             head_dim,
             max_seq_len,
             max_seq_len,
+            v_mode,
         )
     }
 
     /// Capped + filtered fwht2 — layer-filtered with explicit `physical_cap`
-    /// for TriAttention/CASK eviction. Byte layout identical to
+    /// with an explicit cap. Byte layout identical to
     /// `asym2_capped`; rotation primitive is signed-FWHT-128.
     pub fn new_gpu_fwht2_capped_filtered(
         gpu: &mut Gpu,
@@ -4928,12 +4286,19 @@ impl KvCache {
         head_dim: usize,
         max_seq_len: usize,
         physical_cap: usize,
+        v_mode: VMode,
     ) -> HipResult<Self> {
         assert!(
             head_dim == 128 || head_dim == 256,
             "fwht2 requires head_dim=128 or 256"
         );
         assert!(head_dim % 32 == 0);
+        if !matches!(v_mode, VMode::Q8) {
+            assert!(
+                head_dim == 256,
+                "lloyd-V requires head_dim == 256 (got {head_dim})"
+            );
+        }
         assert!(
             physical_cap > 0 && physical_cap <= max_seq_len,
             "physical_cap ({physical_cap}) must be in (0, max_seq_len={max_seq_len}]"
@@ -4941,11 +4306,16 @@ impl KvCache {
         let kv_dim = n_kv_heads * head_dim;
         let k_bph = 4 + head_dim / 4;
         let k_elems = (physical_cap * n_kv_heads * k_bph + 3) / 4;
-        let v_blocks_per_head = head_dim / 32;
-        let v_bpp = n_kv_heads * v_blocks_per_head * 34;
+        let v_bpp = Self::v_bytes_per_pos(n_kv_heads, head_dim, v_mode);
         let v_elems = (physical_cap * v_bpp + 3) / 4;
         let (k_gpu, v_gpu) = Self::alloc_k_v_filtered(gpu, k_elems, v_elems, is_kv_layer)?;
-        let n_signs = 128;
+        // Lloyd-V needs 256-element sign tables up front (see fwht4); the LCG
+        // prefix keeps the 128-wide K reads byte-identical.
+        let n_signs = if matches!(v_mode, VMode::Q8) {
+            128
+        } else {
+            256
+        };
         let s1_vals = Self::gen_fwht_signs(42, n_signs);
         let s2_vals = Self::gen_fwht_signs(1042, n_signs);
         let s1_bytes: Vec<u8> = s1_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
@@ -4956,8 +4326,9 @@ impl KvCache {
         gpu.hip.memcpy_htod(&s2.buf, &s2_bytes)?;
         let v_bph = v_bpp / n_kv_heads;
         let n_kv = is_kv_layer.iter().filter(|b| **b).count();
+        let v_label = v_mode.name();
         eprintln!(
-            "KV cache: fwht2 filtered backend=legacy ({n_kv}/{} layers carry KV; K FWHT-2b {k_bph}B + V Q8 {v_bph}B = {} B/head)",
+            "KV cache: fwht2 filtered backend=legacy ({n_kv}/{} layers carry KV; K FWHT-2b {k_bph}B + V {v_label} {v_bph}B = {} B/head)",
             is_kv_layer.len(),
             k_bph + v_bph,
         );
@@ -4986,81 +4357,7 @@ impl KvCache {
             givens_sin: Some(s2),
             layer_is_boundary: vec![],
             compact_offset: 0,
-            v_mode: VMode::Q8,
-        })
-    }
-
-    /// Same as [`new_gpu_asym2`] with an explicit physical_cap. Eviction-aware.
-    pub fn new_gpu_asym2_capped(
-        gpu: &mut Gpu,
-        n_layers: usize,
-        n_kv_heads: usize,
-        head_dim: usize,
-        max_seq_len: usize,
-        physical_cap: usize,
-    ) -> HipResult<Self> {
-        assert!(
-            head_dim == 128 || head_dim == 256,
-            "asym2 requires head_dim=128 or 256"
-        );
-        assert!(head_dim % 32 == 0);
-        assert!(
-            physical_cap > 0 && physical_cap <= max_seq_len,
-            "physical_cap ({physical_cap}) must be in (0, max_seq_len={max_seq_len}]"
-        );
-        let kv_dim = n_kv_heads * head_dim;
-        let k_bph = 4 + head_dim / 4;
-        let k_elems = (physical_cap * n_kv_heads * k_bph + 3) / 4;
-        let v_blocks_per_head = head_dim / 32;
-        let v_bpp = n_kv_heads * v_blocks_per_head * 34;
-        let v_elems = (physical_cap * v_bpp + 3) / 4;
-
-        let mut k_gpu = Vec::with_capacity(n_layers);
-        let mut v_gpu = Vec::with_capacity(n_layers);
-        for _ in 0..n_layers {
-            k_gpu.push(gpu.zeros(&[k_elems], DType::F32)?);
-            v_gpu.push(gpu.zeros(&[v_elems], DType::F32)?);
-        }
-        let n_blocks = head_dim / 2;
-        let (cos_vals, sin_vals) = Self::gen_givens_angles(42, n_blocks);
-        let cb: Vec<u8> = cos_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        let sb: Vec<u8> = sin_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        let ct = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
-        let st = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
-        gpu.hip.memcpy_htod(&ct.buf, &cb)?;
-        gpu.hip.memcpy_htod(&st.buf, &sb)?;
-        let v_bph = v_bpp / n_kv_heads;
-        eprintln!(
-            "KV cache: asym2 backend=legacy (K rotated-2b {k_bph}B + V Q8 {v_bph}B = {} B/head, {:.1}x vs fp32)",
-            k_bph + v_bph,
-            (head_dim * 4 * 2) as f64 / (k_bph + v_bph) as f64
-        );
-        Ok(Self {
-            k_gpu,
-            v_gpu,
-            k_scales: vec![],
-            v_scales: vec![],
-            kv_dim,
-            max_seq: max_seq_len,
-            physical_cap,
-            n_kv_heads,
-            head_dim,
-            quantized: true,
-            quant_q8: false,
-            quant_int8: false,
-            quant_hfq4: false,
-            quant_asym4: false,
-            quant_asym3: false,
-            quant_asym2: true,
-            quant_fwht: false,
-            quant_bf16: false,
-            quant_fp8: false,
-            boundary_layers: 0,
-            givens_cos: Some(ct),
-            givens_sin: Some(st),
-            layer_is_boundary: vec![],
-            compact_offset: 0,
-            v_mode: VMode::Q8,
+            v_mode,
         })
     }
 
@@ -5180,14 +4477,13 @@ impl KvCache {
 #[cfg(test)]
 mod vmm_layout_tests {
     use super::*;
-    use rdna_compute::Gpu;
 
     fn expected_k_bph(mode: KvMode, head_dim: usize) -> usize {
         match mode {
             KvMode::Q8 => (head_dim / 32) * 34,
-            KvMode::Asym2 | KvMode::Fwht2 => 4 + head_dim / 4,
-            KvMode::Asym3 | KvMode::Fwht3 => 4 + (head_dim * 3) / 8,
-            KvMode::Asym4 | KvMode::Fwht4 => 4 + head_dim / 2,
+            KvMode::Fwht2 => 4 + head_dim / 4,
+            KvMode::Fwht3 => 4 + (head_dim * 3) / 8,
+            KvMode::Fwht4 => 4 + head_dim / 2,
             KvMode::Fp8 => head_dim + 2,
             KvMode::Bf16 | KvMode::F16 => head_dim * 2,
         }
@@ -5258,13 +4554,11 @@ mod vmm_layout_tests {
     }
 
     #[test]
-    fn fwht3_vmm_layout_matches_asym3_byte_geometry() {
+    fn fwht3_vmm_layout_byte_geometry() {
         let n_kv_heads = 4;
         let head_dim = 256;
         let physical_cap = 128;
-        let asym = KvCache::asym3_vmm_layout(n_kv_heads, head_dim, physical_cap).unwrap();
         let fwht = KvCache::fwht3_vmm_layout(n_kv_heads, head_dim, physical_cap).unwrap();
-        assert_eq!(fwht, asym, "fwht3 VMM must reuse asym3 K/V byte layout");
         // Explicit stride math: K 100 B/head, V Q8 272 B/head at head_dim=256.
         assert_eq!(fwht.3, 4 + (head_dim * 3) / 8);
         assert_eq!(fwht.4, (head_dim / 32) * 34);
@@ -5307,15 +4601,7 @@ mod vmm_layout_tests {
     #[test]
     fn validate_mode_admits_all_seven_static_vmm_modes() {
         let dims = vmm_mask_dims(4, 256, 4096, 1024);
-        for mode in [
-            KvMode::Q8,
-            KvMode::Asym2,
-            KvMode::Asym3,
-            KvMode::Asym4,
-            KvMode::Fwht2,
-            KvMode::Fwht3,
-            KvMode::Fwht4,
-        ] {
+        for mode in [KvMode::Q8, KvMode::Fwht2, KvMode::Fwht3, KvMode::Fwht4] {
             KvCache::validate_mode_with_backend(mode, KvBackend::Vmm, true, &dims)
                 .unwrap_or_else(|e| panic!("mode={mode:?}: {e}"));
             // Legacy admission remains open (no VMM-only gate).
@@ -5349,15 +4635,7 @@ mod vmm_layout_tests {
     fn vmm_bytes_per_token_matches_layout_for_all_static_modes() {
         let n_kv_heads = 4;
         let head_dim = 256;
-        for mode in [
-            KvMode::Q8,
-            KvMode::Asym2,
-            KvMode::Asym3,
-            KvMode::Asym4,
-            KvMode::Fwht2,
-            KvMode::Fwht3,
-            KvMode::Fwht4,
-        ] {
+        for mode in [KvMode::Q8, KvMode::Fwht2, KvMode::Fwht3, KvMode::Fwht4] {
             let cache = flag_standin(mode, VMode::Q8, n_kv_heads, head_dim);
             let (k, v) = cache.vmm_bytes_per_token().unwrap();
             assert_eq!(k, n_kv_heads * expected_k_bph(mode, head_dim), "{mode:?}");
@@ -5382,15 +4660,15 @@ mod vmm_layout_tests {
                 "{v_mode:?}"
             );
         }
-        // Asym-K + Lloyd-V must fail (illegal pair).
-        let bad = flag_standin(KvMode::Asym3, VMode::Lloyd3, n_kv_heads, head_dim);
+        // Q8-K + Lloyd-V must fail (illegal pair).
+        let bad = flag_standin(KvMode::Q8, VMode::Lloyd3, n_kv_heads, head_dim);
         assert!(bad.vmm_bytes_per_token().is_err());
     }
 
     #[test]
     fn vmm_layout_rejects_illegal_pairs() {
-        // Asym-K + Lloyd-V is illegal.
-        for mode in [KvMode::Asym2, KvMode::Asym3, KvMode::Asym4, KvMode::Q8] {
+        // Q8-K + Lloyd-V is illegal.
+        for mode in [KvMode::Q8] {
             let err = KvCache::vmm_static_layout(mode, VMode::Lloyd4, 4, 256, 64)
                 .unwrap_err()
                 .to_string();
@@ -5399,8 +4677,8 @@ mod vmm_layout_tests {
                 "mode={mode:?} err={err}"
             );
         }
-        // FWHT3 / Asym3 require head_dim=256.
-        for mode in [KvMode::Fwht3, KvMode::Asym3] {
+        // FWHT3 requires head_dim=256.
+        for mode in [KvMode::Fwht3] {
             let err = KvCache::vmm_static_layout(mode, VMode::Q8, 4, 128, 64)
                 .unwrap_err()
                 .to_string();
@@ -5483,15 +4761,7 @@ mod vmm_layout_tests {
         let n_kv_heads = 4;
         let head_dim = 256;
         let physical_cap = 128;
-        let modes = [
-            KvMode::Q8,
-            KvMode::Asym2,
-            KvMode::Asym3,
-            KvMode::Asym4,
-            KvMode::Fwht2,
-            KvMode::Fwht3,
-            KvMode::Fwht4,
-        ];
+        let modes = [KvMode::Q8, KvMode::Fwht2, KvMode::Fwht3, KvMode::Fwht4];
         for mode in modes {
             let layout =
                 KvCache::vmm_static_layout(mode, VMode::Q8, n_kv_heads, head_dim, physical_cap)
@@ -5555,7 +4825,6 @@ mod vmm_layout_tests {
                 assert_eq!(layout.v_bytes_per_head, expected_v_bph(v_mode, head_dim));
                 // Lloyd-V forces 256-wide signs even for fwht2/4.
                 assert_eq!(layout.rotation_table_len, 256, "{mode:?}/{v_mode:?}");
-                assert!(layout.uses_fwht_signs, "{mode:?}/{v_mode:?}");
                 // Prefix helpers use current stride, not reserve.
                 let n_pos = 17;
                 assert_eq!(
@@ -5720,16 +4989,16 @@ mod bf16_tier_projection_tests {
 
     #[test]
     fn asym_and_hfq_variants_remain_exclusive() {
-        // Asym3 (qwen35 default) was the original motivator for the asym exclusion;
+        // A rotated-3-bit tier was the original motivator for the asym exclusion;
         // ensure the new bf16 exclusion didn't reintroduce overlap.
-        let asym3 = stub(
+        let rot3 = stub(
             true, false, false, false, false, true, false, false, false, false, true,
         );
         assert!(
-            !asym3.quant_q4_residual(),
-            "asym3 must NOT report Q4 residual"
+            !rot3.quant_q4_residual(),
+            "rot3 must NOT report Q4 residual"
         );
-        assert_eq!(tier_count(&asym3), 1);
+        assert_eq!(tier_count(&rot3), 1);
 
         // HFQ8 has non-empty k_scales and is its own tier.
         let hfq8 = stub(
@@ -5838,84 +5107,102 @@ mod kv_capped_rollback_tests {
         }
         gpu.drain_pool();
     }
+}
 
+/// Legacy fwht V-stride tests (GPU-gated): V allocates at its logical
+/// per-mode stride up front — lloyd-V must NOT reserve the Q8 footprint.
+/// Regression test for the Q8 over-allocation (the legacy `Split(K, V≠Q8)`
+/// path used to allocate Q8 and shrink after).
+#[cfg(test)]
+mod fwht_vmode_alloc_tests {
+    use super::*;
+
+    const HEADS: usize = 4;
+    const HEAD_DIM: usize = 256;
+    const SEQ: usize = 64;
+
+    /// Real (non-placeholder) V tensor elems for each V mode.
     #[test]
-    #[ignore = "requires an AMD GPU; exercises asym3 partial-construction rollback and retry"]
-    fn asym3_capped_partial_failure_frees_layers_givens_and_retries() {
-        let mut gpu = Gpu::init().expect("GPU required for allocation rollback");
-        // Warm the pool so the retry legs below reuse pooled blocks.
-        let warm = KvCache::new_gpu_asym3_capped_gemma4(
-            &mut gpu,
-            ROLLBACK_LAYERS,
-            ROLLBACK_HEADS,
-            256,
-            ROLLBACK_SEQ,
-            ROLLBACK_SEQ,
-        )
-        .expect("warm asym3 cache");
-        warm.free_gpu(&mut gpu).expect("release warm asym3 cache");
-        let fresh = gpu.pool_stats().0;
-
-        // Seam order per attempt: 2 K/V calls per layer, then cos alloc, sin
-        // alloc, cos copy, sin copy. Failing at each index covers partial
-        // layers (incl. the unmatched-K case), each partial-givens shape, and
-        // both copy failures.
-        let total_seams = ROLLBACK_LAYERS * 2 + 4;
-        for fail_at in 1..=total_seams {
-            let calls = Cell::new(0usize);
-            let fault = |calls: &Cell<usize>, label: &str| -> HipResult<()> {
-                calls.set(calls.get() + 1);
-                if calls.get() == fail_at {
-                    Err(HipError::new(2, &format!("injected asym3 {label} failure")))
-                } else {
-                    Ok(())
-                }
-            };
-            let err = KvCache::new_gpu_asym3_capped_inner_with_alloc(
-                &mut gpu,
-                ROLLBACK_LAYERS,
-                ROLLBACK_HEADS,
-                256,
-                ROLLBACK_SEQ,
-                ROLLBACK_SEQ,
-                |gpu, shape, dtype| {
-                    fault(&calls, "K/V allocation")?;
-                    gpu.zeros(shape, dtype)
-                },
-                |gpu, shape, dtype| {
-                    fault(&calls, "givens allocation")?;
-                    gpu.alloc_tensor(shape, dtype)
-                },
-                |gpu, tensor, bytes| {
-                    fault(&calls, "givens copy")?;
-                    gpu.hip.memcpy_htod(&tensor.buf, bytes)
-                },
-            )
-            .err()
-            .expect(&format!("asym3 fault at seam {fail_at} did not trigger"));
-            assert!(
-                err.to_string().contains("injected asym3"),
-                "asym3 fault at seam {fail_at} surfaced the wrong error: {err}"
-            );
-            // Successful retry through the Gemma door on the same gpu must
-            // reuse the rolled-back pool blocks.
-            let retry = KvCache::new_gpu_asym3_capped_gemma4(
-                &mut gpu,
-                ROLLBACK_LAYERS,
-                ROLLBACK_HEADS,
-                256,
-                ROLLBACK_SEQ,
-                ROLLBACK_SEQ,
-            )
-            .expect("immediate retry after asym3 failure");
-            retry
-                .free_gpu(&mut gpu)
-                .expect("release retried asym3 cache");
+    #[ignore = "requires an AMD GPU; asserts legacy fwht V allocates at its logical stride"]
+    fn fwht4_filtered_v_allocates_logical_stride() {
+        let mut gpu = Gpu::init().expect("GPU required for V-stride allocation");
+        let mask = vec![true; 2];
+        for (v_mode, bph, signs) in [
+            (VMode::Q8, 272usize, 128usize),
+            (VMode::Lloyd4, 132, 256),
+            (VMode::Lloyd3, 100, 256),
+            (VMode::Lloyd2, 68, 256),
+        ] {
+            let kv = KvCache::new_gpu_fwht4_filtered(&mut gpu, &mask, HEADS, HEAD_DIM, SEQ, v_mode)
+                .expect("fwht4 filtered construction");
+            assert_eq!(kv.v_mode, v_mode, "v_mode field follows the request");
+            let expect_elems = (SEQ * HEADS * bph + 3) / 4;
+            let real_v: Vec<_> = kv.v_gpu.iter().filter(|t| t.numel() > 1).collect();
+            assert_eq!(real_v.len(), 2, "both mask layers carry V");
+            for t in &real_v {
+                assert_eq!(t.numel(), expect_elems, "V elems for {v_mode:?}");
+            }
+            // Sign tables widen to 256 for lloyd-V (K reads keep the LCG prefix).
             assert_eq!(
-                gpu.pool_stats().0,
-                fresh,
-                "failed asym3 construction at seam {fail_at} leaked owners instead of rolling them back",
+                kv.givens_cos.as_ref().expect("fwht signs1").numel(),
+                signs,
+                "sign width for {v_mode:?}"
             );
+            kv.free_gpu(&mut gpu).expect("release");
+        }
+        gpu.drain_pool();
+    }
+
+    /// The legacy Split helper keeps each K mode's own layout, honours the
+    /// physical cap (Fwht4 has no capped variant and drops it), records the
+    /// V mode and widens the FWHT signs to 256 for every lloyd-V tier.
+    #[test]
+    #[ignore = "requires an AMD GPU; asserts the Split helper per K mode and V mode"]
+    fn fwht_filtered_with_v_keeps_k_layout_cap_and_v_mode() {
+        const CAP: usize = 32;
+        let mut gpu = Gpu::init().expect("GPU required for V-stride allocation");
+        let mask = vec![true, false];
+        for (mode, k_bph, rows) in [
+            (KvMode::Fwht2, 68usize, CAP),
+            (KvMode::Fwht3, 100, CAP),
+            (KvMode::Fwht4, 132, SEQ),
+        ] {
+            for (v_mode, v_bph) in [
+                (VMode::Lloyd4, 132usize),
+                (VMode::Lloyd3, 100),
+                (VMode::Lloyd2, 68),
+            ] {
+                let kv = KvCache::new_gpu_fwht_filtered_with_v(
+                    &mut gpu, mode, &mask, HEADS, HEAD_DIM, SEQ, CAP, v_mode,
+                )
+                .expect("Split helper construction");
+                let what = format!("{mode:?}/{v_mode:?}");
+                assert_eq!(kv.v_mode, v_mode, "v_mode field for {what}");
+                assert_eq!(kv.physical_cap, rows, "physical_cap for {what}");
+                assert_eq!(
+                    kv.k_gpu[0].numel(),
+                    (rows * HEADS * k_bph + 3) / 4,
+                    "K elems for {what}"
+                );
+                assert_eq!(
+                    kv.v_gpu[0].numel(),
+                    (rows * HEADS * v_bph + 3) / 4,
+                    "V elems for {what}"
+                );
+                assert_eq!(
+                    kv.v_gpu[1].numel(),
+                    1,
+                    "non-KV layer stays a placeholder for {what}"
+                );
+                for signs in [&kv.givens_cos, &kv.givens_sin] {
+                    assert_eq!(
+                        signs.as_ref().expect("fwht signs").numel(),
+                        256,
+                        "sign width for {what}"
+                    );
+                }
+                kv.free_gpu(&mut gpu).expect("release");
+            }
         }
         gpu.drain_pool();
     }
@@ -6438,11 +5725,8 @@ mod slot_kv_plan_tests {
         let n_kv_heads = 8usize;
         for (mode, hd, k_bph) in [
             (KvMode::Q8, 256usize, 8 * 34usize),
-            (KvMode::Asym2, 128, 4 + 128 / 4),
-            (KvMode::Asym2, 256, 4 + 256 / 4),
-            (KvMode::Asym3, 256, 4 + (256 * 3) / 8),
-            (KvMode::Asym4, 128, 4 + 128 / 2),
-            (KvMode::Asym4, 256, 4 + 256 / 2),
+            (KvMode::Fwht2, 128, 4 + 128 / 4),
+            (KvMode::Fwht4, 128, 4 + 128 / 2),
             (KvMode::Fwht2, 256, 4 + 256 / 4),
             (KvMode::Fwht3, 256, 4 + (256 * 3) / 8),
             (KvMode::Fwht4, 256, 4 + 256 / 2),
@@ -6468,7 +5752,6 @@ mod slot_kv_plan_tests {
         let p = SlotKvTierPlan::resolve(KvMode::Q8, 4, 256).unwrap();
         assert_eq!(p.k_bytes_per_pos, p.v_bytes_per_pos);
         assert!(!p.kv_strides_differ());
-        assert!(p.givens_len.is_none());
         assert!(p.fwht_len.is_none());
     }
 
@@ -6478,7 +5761,6 @@ mod slot_kv_plan_tests {
         assert_eq!(p.k_bytes_per_pos, 4 * 256 * 2);
         assert_eq!(p.v_bytes_per_pos, p.k_bytes_per_pos);
         assert!(!p.kv_strides_differ());
-        assert!(p.givens_len.is_none());
         assert!(p.fwht_len.is_none());
     }
 
@@ -6488,7 +5770,6 @@ mod slot_kv_plan_tests {
         assert_eq!(p.k_bytes_per_pos, 4 * 256 * 2);
         assert_eq!(p.v_bytes_per_pos, p.k_bytes_per_pos);
         assert!(!p.kv_strides_differ());
-        assert!(p.givens_len.is_none());
         assert!(p.fwht_len.is_none());
         // And the VMM gate refuses it — the tier is slots/contiguous only.
         let err = KvCache::vmm_static_layout(KvMode::F16, VMode::Q8, 4, 256, 64)
@@ -6508,7 +5789,6 @@ mod slot_kv_plan_tests {
         assert_eq!(p.k_bytes_per_pos, 4 * 258);
         assert_eq!(p.v_bytes_per_pos, p.k_bytes_per_pos);
         assert!(!p.kv_strides_differ());
-        assert!(p.givens_len.is_none());
         assert!(p.fwht_len.is_none());
         // The stride scales with Hkv at the fixed D256 the kernels pin.
         let p8 = SlotKvTierPlan::resolve(KvMode::Fp8, 8, 256).unwrap();
@@ -6533,35 +5813,28 @@ mod slot_kv_plan_tests {
 
     #[test]
     fn rotation_tables_match_tier_family() {
-        for m in [KvMode::Asym2, KvMode::Asym3, KvMode::Asym4] {
-            let p = SlotKvTierPlan::resolve(m, 2, 256).unwrap();
-            assert_eq!(p.givens_len, Some(128), "{m:?}: head_dim/2 givens angles");
-            assert!(p.fwht_len.is_none(), "{m:?} must not carry fwht signs");
-        }
         for m in [KvMode::Fwht2, KvMode::Fwht4] {
             let p = SlotKvTierPlan::resolve(m, 2, 256).unwrap();
             assert_eq!(p.fwht_len, Some(128), "{m:?}: 128-wide sign vectors");
-            assert!(p.givens_len.is_none(), "{m:?} must not carry givens angles");
         }
         // fwht3's K-rotation kernel reads signs[0..255] — 256-wide, not 128.
         let p = SlotKvTierPlan::resolve(KvMode::Fwht3, 2, 256).unwrap();
         assert_eq!(p.fwht_len, Some(256), "Fwht3: 256-wide sign vectors");
-        assert!(p.givens_len.is_none(), "Fwht3 must not carry givens angles");
     }
 
     #[test]
     fn geometry_gates_refuse_what_constructors_refuse() {
-        // asym3/fwht3 are 256-only (Qwen 3.5 geometry).
-        for m in [KvMode::Asym3, KvMode::Fwht3] {
+        // fwht3 is 256-only (Qwen 3.5 geometry).
+        for m in [KvMode::Fwht3] {
             assert!(SlotKvTierPlan::resolve(m, 2, 128).is_err(), "{m:?} @128");
         }
-        // asym2/asym4 accept 128 or 256, nothing else in between.
-        for m in [KvMode::Asym2, KvMode::Asym4] {
+        // fwht2/fwht4 accept 128 or 256, nothing else in between.
+        for m in [KvMode::Fwht2, KvMode::Fwht4] {
             assert!(SlotKvTierPlan::resolve(m, 2, 256).is_ok(), "{m:?} @256");
             assert!(SlotKvTierPlan::resolve(m, 2, 64).is_err(), "{m:?} @64");
         }
         // Packed tiers need head_dim % 32.
-        for m in [KvMode::Q8, KvMode::Asym3, KvMode::Fwht4] {
+        for m in [KvMode::Q8, KvMode::Fwht3, KvMode::Fwht4] {
             assert!(SlotKvTierPlan::resolve(m, 2, 100).is_err(), "{m:?} @100");
         }
         // fp8 is pinned to the kernels' fixed 32x8/head geometry: 256 only

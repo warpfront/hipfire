@@ -22,16 +22,27 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use redline_dispatch::aql::CancelEvidence;
 
 use railgun::kernel::{KernelProgram, NodeFacts};
 use railgun::plan::Pm4Plan;
-use railgun::window::{NodeImage, QueueFailure, Quiescence, ResolvedStep, WindowQueue};
-use railgun::Binding;
+use railgun::window::{
+    FailureKind, NodeImage, QueueFailure, Quiescence, ResolvedStep, Teardown, TimedWait,
+    WindowQueue,
+};
+use railgun::{Binding, ResourceId};
 use railgun_corpus::window::{ConditionalWitness, NodeRoute, RuntimeNode, WindowManifest};
 use railgun_corpus::{sha256_hex, JitCorpus};
 
+pub use crate::railgun_quarantine::DeviceKey;
+use crate::railgun_quarantine::{quarantine, quarantine_reason, refuse_if_quarantined};
 pub use crate::replay::railgun_lower::LowerTiming;
-use crate::replay::railgun_lower::{LoweringContext, OwnedWindowLowering, SelfCheckFailure};
+use crate::replay::railgun_lower::{
+    DeviceSelect, LoweringContext, OwnedBoundedWait, OwnedReplayFailure, OwnedWindowLowering,
+    SelfCheckFailure,
+};
 use crate::replay::railgun_shadow::{arch_lowering, lookup_facts, probe};
 use crate::replay::ReplayQuiescence;
 use crate::Gpu;
@@ -368,6 +379,118 @@ impl Gpu {
         probe(&self.hip, addr)
     }
 
+    /// Read `len` bytes from the start of the live device allocation `a`
+    /// (exactly the allocation `hipMemGetAddressRange` reports for `a.base`:
+    /// a binding that is not one is refused, so no arbitrary address is ever
+    /// dereferenced). For owners that seal loader-written tables.
+    pub fn railgun_read_allocation(&self, a: Binding, len: usize) -> Result<Vec<u8>, String> {
+        let live = probe(&self.hip, a.base)?;
+        if live != a {
+            return Err(format!(
+                "allocation {:#x}+{} is not the live allocation {:#x}+{}",
+                a.base, a.bytes, live.base, live.bytes
+            ));
+        }
+        if len as u64 > a.bytes {
+            return Err(format!(
+                "{len} bytes exceed the {}-byte allocation {:#x}",
+                a.bytes, a.base
+            ));
+        }
+        // SAFETY: `a` is exactly the live allocation the runtime reports for
+        // its base address; the borrowed buffer is only read through and its
+        // drop never frees (it is not the owner).
+        let buf = unsafe {
+            hip_bridge::DeviceBuffer::from_raw(
+                a.base as usize as *mut std::ffi::c_void,
+                a.bytes as usize,
+            )
+        };
+        let mut host = vec![0u8; len];
+        self.hip
+            .memcpy_dtoh_at(&mut host, &buf, 0)
+            .map_err(|e| format!("device read {:#x}: {e:?}", a.base))?;
+        Ok(host)
+    }
+
+    /// SHA-256 of the code object `symbol` is loaded from (lowercase hex): the
+    /// exact-artifact identity an owner keys its program on.
+    pub fn railgun_loaded_digest(&self, symbol: &str) -> Result<String, String> {
+        self.loaded_owner(symbol)
+            .map(|(_, artifact)| artifact.id().to_hex())
+            .map_err(|e| format!("{symbol}: {e}"))
+    }
+
+    /// Register an externally emitted code object (a PeaceMaker `.co`/`.hxaco`
+    /// that no JIT corpus indexes) for railgun: admit its receipt against the
+    /// object's bytes and the pinned SHA-256 (`railgun_corpus::PinnedReceipt`),
+    /// load it as module `module` exporting `symbols`, prove each symbol's
+    /// loaded owner is exactly those bytes, and return each symbol's facts in
+    /// `symbols` order. Afterwards [`Self::railgun_resolve_artifacts`] resolves
+    /// nodes authored from those facts like any loaded kernel. Refused inside
+    /// plan mode (a plan-mode load would be recorded, not performed).
+    pub fn railgun_register_pinned_object(
+        &mut self,
+        module: &'static str,
+        image: Arc<[u8]>,
+        pinned_sha256: &str,
+        receipt_json: &[u8],
+        symbols: &[&str],
+    ) -> Result<Vec<Arc<NodeFacts>>, String> {
+        refuse_if_quarantined(&self.railgun_device_key())?;
+        if self.plan_mode_active() {
+            return Err(format!(
+                "{module}: a pinned object cannot be registered inside plan mode"
+            ));
+        }
+        let pinned = railgun_corpus::PinnedReceipt::admit(
+            module,
+            &self.arch,
+            &image,
+            pinned_sha256,
+            receipt_json,
+        )?;
+        let mut facts = Vec::with_capacity(symbols.len());
+        for symbol in symbols {
+            // Refuse a symbol the receipt does not certify before loading anything for it.
+            let node = NodeFacts::from_pinned(&pinned, symbol)?;
+            self.ensure_embedded_kernel(module, Arc::clone(&image), symbol)
+                .map_err(|e| format!("{module}: load {symbol}: {e}"))?;
+            let loaded = self.railgun_loaded_digest(symbol)?;
+            if loaded != pinned_sha256 {
+                return Err(format!(
+                    "{module}: {symbol} is owned by object {loaded}, not the pinned {pinned_sha256}"
+                ));
+            }
+            facts.push(Arc::new(node));
+        }
+        Ok(facts)
+    }
+
+    /// The railgun receipt corpus directory that ships beside the installed
+    /// kernel pack this process loads objects from: `<pack arch dir>/../../
+    /// railgun-corpus` (see [`corpus_beside_pack`]). `None` when no pack is
+    /// installed (objects are JIT-compiled, so no corpus can name them). The
+    /// directory is not checked for existence or contents here.
+    pub fn railgun_pack_corpus_dir(&self) -> Option<PathBuf> {
+        self.compiler
+            .installed_pack_dir()
+            .and_then(corpus_beside_pack)
+    }
+
+    /// Where this process's kernel objects live, for an owner that builds a
+    /// receipt corpus from them (see [`RailgunProvisionContext`]).
+    pub fn railgun_provision_context(&self) -> RailgunProvisionContext {
+        let hot_dir = self.compiler.hot_cache_dir().to_path_buf();
+        RailgunProvisionContext {
+            arch: self.arch.clone(),
+            toolchain_id: self.compiler.toolchain_id().to_owned(),
+            local_corpus_dir: local_corpus_dir(&hot_dir, &self.arch),
+            installed_pack_dir: self.compiler.installed_pack_dir().map(Path::to_path_buf),
+            hot_dir,
+        }
+    }
+
     /// Load railgun's copy and fill kernels (idempotent) and return the
     /// digests of the code objects that own them. Refused inside plan mode:
     /// a plan-mode load would be recorded, not performed.
@@ -398,16 +521,58 @@ impl Gpu {
         })
     }
 
+    /// The canonical `domain:bus:device.function` PCI address of this `Gpu`'s
+    /// HIP device: the identity an owned gfx1100 window matches to its ROCr
+    /// agent ([`Self::railgun_lowering_context`]). One `hipDeviceGetPCIBusId`
+    /// call and a parse; no HSA runtime is touched, so an owner can check it
+    /// at admission.
+    pub fn railgun_device_pci_address(&self) -> Result<String, String> {
+        self.railgun_device_pci().map(|p| p.to_string())
+    }
+
+    fn railgun_device_pci(&self) -> Result<redline_dispatch::aql::PciBusId, String> {
+        let bdf = self
+            .hip
+            .device_pci_bus_id(self.device_id)
+            .map_err(|e| format!("device {} PCI address: {e}", self.device_id))?;
+        bdf.parse::<redline_dispatch::aql::PciBusId>()
+            .map_err(|e| format!("device {} PCI address {bdf:?}: {e}", self.device_id))
+    }
+
     /// The shared lowering context of this device: one HSA runtime and device,
     /// the host and retained kernarg pools and every loaded code object,
     /// created once by the owner and handed to every
-    /// [`Self::lower_railgun_window`]. gfx12 only.
+    /// [`Self::lower_railgun_window`]. gfx12, or exact gfx1100 (this `Gpu`'s
+    /// HIP device is matched to its ROCr agent by PCI bus address; every other
+    /// gfx11 part refuses).
     pub fn railgun_lowering_context(&self) -> Result<RailgunLoweringContext, String> {
-        let ordinal = usize::try_from(self.device_id)
-            .map_err(|_| format!("device ordinal {} is negative", self.device_id))?;
+        let select = if self.arch == "gfx1100" {
+            DeviceSelect::Pci(self.railgun_device_pci()?)
+        } else {
+            DeviceSelect::Ordinal(
+                usize::try_from(self.device_id)
+                    .map_err(|_| format!("device ordinal {} is negative", self.device_id))?,
+            )
+        };
         Ok(RailgunLoweringContext {
-            inner: LoweringContext::new(ordinal)?,
+            inner: LoweringContext::new(select)?,
+            device: self.railgun_device_key(),
         })
+    }
+
+    /// The quarantine key of this device: `pci:<address>` when the PCI
+    /// address resolves, else `hip:<ordinal>`.
+    pub fn railgun_device_key(&self) -> DeviceKey {
+        match self.railgun_device_pci_address() {
+            Ok(address) => DeviceKey::from_pci(&address),
+            Err(_) => DeviceKey::from_ordinal(self.device_id),
+        }
+    }
+
+    /// Why this device is quarantined for railgun, if it is (cleared only by
+    /// process restart).
+    pub fn railgun_device_quarantine(&self) -> Option<String> {
+        quarantine_reason(&self.railgun_device_key())
     }
 
     /// `(name, base, bytes)` of every live `Gpu` scratch slot (the lazily
@@ -440,8 +605,7 @@ impl Gpu {
             mq_x_rot,
             argmax_host,
             gemv_residual_tmp,
-            mq6_fp8_x_rot,
-            paro_x_scratch
+            mq6_fp8_x_rot
         );
         buf!(
             mq_x_rot_fp8,
@@ -459,7 +623,9 @@ impl Gpu {
             int4_mmq_x_scratch,
             int4_mmq_down_scratch,
             q8_a8_x_scratch,
+            mq8_x_scratch,
             int8_mmq_x_scratch,
+            int8_mmq_down_x_scratch,
             mq4v2_fp8_x_scratch,
             mq4v2_fp8_half_sums_scratch,
             mq4v2_fp8_row_scales_scratch,
@@ -502,7 +668,7 @@ impl Gpu {
     /// without a `kref`, or whose loaded object digest differs, refuses the
     /// whole lowering. Nothing is submitted.
     pub fn lower_railgun_window(
-        &mut self,
+        &self,
         ctx: &mut RailgunLoweringContext,
         program: &KernelProgram,
         plan: &Pm4Plan,
@@ -548,6 +714,196 @@ impl Gpu {
             artifacts,
         })
     }
+
+    /// Prove every co-resident group of `plan` can be resident at once on
+    /// this device and record the proof in `plan` (`Pm4Plan::admit_residency`).
+    ///
+    /// Per member node: the loaded function of its symbol must be owned by
+    /// exactly the code object its `kref` certifies (the same proof as
+    /// [`Self::railgun_resolve_artifacts`]); its workgroups per compute unit
+    /// are HIP's occupancy calculator over that loaded object's emitted
+    /// descriptor (VGPR, SGPR, LDS, scratch) at the node's block size and
+    /// dynamic LDS, and the compute-unit count is
+    /// `hipDeviceAttributeMultiprocessorCount`, the unit that calculator
+    /// counts in. An occupancy error or a negative answer refuses; zero is
+    /// left to the planner, which refuses it.
+    ///
+    /// Obligation (not checked here): the group runs on an exclusive device.
+    /// A fabric job owns the card while its persistent workgroups are
+    /// resident, so nothing else may hold compute units on this device for
+    /// the group's lifetime (no HIP kernel, no second queue, no other
+    /// process): the proof is a statement about an otherwise idle device.
+    pub fn railgun_admit_residency(
+        &self,
+        program: &KernelProgram,
+        plan: &mut Pm4Plan,
+    ) -> Result<(), String> {
+        if program.arch != self.arch {
+            return Err(format!(
+                "program arch {} is not the device arch {}",
+                program.arch, self.arch
+            ));
+        }
+        if plan.groups.is_empty() {
+            return Ok(());
+        }
+        self.bind_thread()
+            .map_err(|e| format!("bind device {}: {e}", self.device_id))?;
+        let units = self
+            .hip
+            .get_device_attribute(
+                crate::profiler::HIP_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+                self.device_id,
+            )
+            .map_err(|e| format!("multiprocessor count of device {}: {e}", self.device_id))?;
+        let compute_units = u32::try_from(units)
+            .ok()
+            .filter(|&u| u > 0)
+            .ok_or_else(|| format!("device {} reports {units} multiprocessors", self.device_id))?;
+        let ranges: Vec<std::ops::Range<usize>> =
+            plan.groups.iter().map(|g| g.nodes.clone()).collect();
+        for (g, range) in ranges.into_iter().enumerate() {
+            let members = program.nodes.get(range.clone()).ok_or_else(|| {
+                format!(
+                    "co-resident group {g} {range:?} is past the program's {} nodes",
+                    program.nodes.len()
+                )
+            })?;
+            let mut blocks = Vec::with_capacity(members.len());
+            for (k, node) in members.iter().enumerate() {
+                let i = range.start + k;
+                let kref = node.kref.as_ref().ok_or_else(|| {
+                    format!("node {i} {}: no certified kernel reference", node.symbol)
+                })?;
+                let (_, artifact) = self
+                    .loaded_owner(&node.symbol)
+                    .map_err(|e| format!("node {i} {}: {e}", node.symbol))?;
+                let loaded = artifact.id().to_hex();
+                if loaded != kref.artifact_sha256 {
+                    return Err(format!(
+                        "node {i} {}: loaded object {loaded} is not the certified object {}",
+                        node.symbol, kref.artifact_sha256
+                    ));
+                }
+                let func = self
+                    .functions
+                    .get(&node.symbol)
+                    .ok_or_else(|| format!("node {i} {}: function is not loaded", node.symbol))?;
+                let threads = node.block[0]
+                    .checked_mul(node.block[1])
+                    .and_then(|t| t.checked_mul(node.block[2]))
+                    .filter(|&t| t > 0)
+                    .ok_or_else(|| {
+                        format!(
+                            "node {i} {}: block {:?} is not a thread count",
+                            node.symbol, node.block
+                        )
+                    })?;
+                let fits = self
+                    .hip
+                    .occupancy_max_active_blocks(func, threads, node.dynamic_lds as usize)
+                    .map_err(|e| format!("node {i} {}: occupancy: {e}", node.symbol))?;
+                blocks.push(u32::try_from(fits).map_err(|_| {
+                    format!(
+                        "node {i} {}: occupancy calculator answered {fits}",
+                        node.symbol
+                    )
+                })?);
+            }
+            plan.admit_residency(program, g, compute_units, &blocks)?;
+        }
+        Ok(())
+    }
+
+    /// Write the pointer fields, declared null fields and declared `u32`
+    /// scalars of binding-record arena `arena` of `program`
+    /// (`KernelProgram::binding_record_image` over the authored bindings:
+    /// each pointer field is `base(resource) + interior`, each null field 8
+    /// zero bytes, each scalar its declared value) into the arena's device
+    /// allocation, then read every field back and compare (a null field must
+    /// read back as zero). The arena's
+    /// binding must be exactly the live allocation HIP reports for its base.
+    /// Fields are written at their arena offsets, adjacent ones in one copy;
+    /// the other bytes of the records are the caller's. Returns the number
+    /// of fields (pointers, nulls and scalars) written; any readback
+    /// mismatch is an `Err`.
+    /// Refused inside plan mode.
+    pub fn railgun_write_binding_records(
+        &self,
+        program: &KernelProgram,
+        arena: ResourceId,
+    ) -> Result<usize, String> {
+        if self.plan_mode_active() {
+            return Err("binding records cannot be written inside plan mode".to_owned());
+        }
+        let image = program.binding_record_image(arena, &program.resources)?;
+        let writes = image.writes();
+        let binding = *program
+            .resources
+            .get(arena.0 as usize)
+            .ok_or_else(|| format!("no binding for arena {}", arena.0))?;
+        let live = probe(&self.hip, binding.base)?;
+        if live != binding {
+            return Err(format!(
+                "arena {} {:#x}+{} is not the live allocation {:#x}+{}",
+                arena.0, binding.base, binding.bytes, live.base, live.bytes
+            ));
+        }
+        // SAFETY: `binding` is exactly the live allocation the runtime reports
+        // for its base address; the borrowed buffer is only written inside
+        // that allocation (every field was bounds-checked by the image) and
+        // its drop never frees (it is not the owner).
+        let buf = unsafe {
+            hip_bridge::DeviceBuffer::from_raw(
+                binding.base as usize as *mut std::ffi::c_void,
+                binding.bytes as usize,
+            )
+        };
+        self.bind_thread()
+            .map_err(|e| format!("bind device {}: {e}", self.device_id))?;
+        let mut end = 0u64;
+        let mut run: Vec<u8> = Vec::new();
+        let mut run_at = 0u64;
+        for (at, bytes) in &writes {
+            let at = *at;
+            if at < end {
+                return Err(format!(
+                    "arena {}: field at +{at} overlaps the previous field ending at +{end}",
+                    arena.0
+                ));
+            }
+            if at != end && !run.is_empty() {
+                self.hip
+                    .memcpy_htod_offset(&buf, run_at as usize, &run)
+                    .map_err(|e| format!("arena {} write +{run_at}: {e}", arena.0))?;
+                run.clear();
+            }
+            if run.is_empty() {
+                run_at = at;
+            }
+            run.extend_from_slice(bytes);
+            end = at + bytes.len() as u64;
+        }
+        if !run.is_empty() {
+            self.hip
+                .memcpy_htod_offset(&buf, run_at as usize, &run)
+                .map_err(|e| format!("arena {} write +{run_at}: {e}", arena.0))?;
+        }
+        if writes.is_empty() {
+            return Ok(0);
+        }
+        let back = self.railgun_read_allocation(binding, end as usize)?;
+        for (at, bytes) in &writes {
+            let got = &back[*at as usize..*at as usize + bytes.len()];
+            if got != bytes.as_slice() {
+                return Err(format!(
+                    "arena {} field +{at}: read back {got:02x?}, wrote {bytes:02x?}",
+                    arena.0
+                ));
+            }
+        }
+        Ok(image.len())
+    }
 }
 
 /// The shared gfx12 lowering context of one owner (see
@@ -555,6 +911,7 @@ impl Gpu {
 /// lowering. Dropping it releases only what no skeleton still holds.
 pub struct RailgunLoweringContext {
     inner: LoweringContext,
+    device: DeviceKey,
 }
 
 impl RailgunLoweringContext {
@@ -574,12 +931,26 @@ impl RailgunLoweringContext {
         plan: &Pm4Plan,
         artifacts: &RailgunArtifacts,
     ) -> Result<RailgunWindowQueue, String> {
+        refuse_if_quarantined(&self.device)?;
         if artifacts.arch != arch || program.arch != arch {
             return Err(format!(
                 "program arch {}, artifacts for {}, device arch {arch}",
                 program.arch, artifacts.arch
             ));
         }
+        if !plan.groups.is_empty() {
+            plan.group_admission()?;
+        }
+        // The certificate slot of what is being lowered: `Certified`, or (lab
+        // builds only) `LabPending`. The plan must be the program's own.
+        let admission = program.admission();
+        if plan.admission() != admission {
+            return Err(format!(
+                "plan admission {:?} is not the program's {admission:?} (plan built from another program)",
+                plan.admission()
+            ));
+        }
+        let admitted_grids = admitted_group_grids(program, plan)?;
         let (lowering, timing) =
             self.inner
                 .lower(program, plan, arch_lowering(arch), &artifacts.artifacts)?;
@@ -594,9 +965,16 @@ impl RailgunLoweringContext {
             self_check: false,
             last: vec![None; program.nodes.len()],
             grids: program.nodes.iter().map(|n| Some(n.grid)).collect(),
+            admitted_grids,
             lowering,
             failure: None,
+            device: self.device.clone(),
+            torn_down: false,
+            teardown_report: None,
+            poison: None,
+            in_flight: false,
             timing,
+            admission,
         })
     }
 }
@@ -620,9 +998,31 @@ static LAST_SELF_CHECK: Mutex<Option<Vec<(usize, u64, usize)>>> = Mutex::new(Non
 
 /// `railgun::window::WindowQueue` over railgun's owned gfx12 lowering: one
 /// retained indirect buffer, one kernarg buffer per node. Only the kernarg
-/// images and grids that differ from what the queue last held are rewritten;
-/// each submit replays the whole tape and blocks until the queue is idle, so
-/// a successful submit has already proven quiescence.
+/// images and grids that differ from what the queue last held are rewritten.
+/// `submit` replays the whole tape and blocks until the queue is idle, so a
+/// successful submit has already proven quiescence. `submit_nowait` publishes
+/// the same replay and returns with it in flight: the kernarg buffers, grids
+/// and indirect buffer belong to the GPU until `wait` returns, so a submit
+/// (blocking or not) while one is in flight is refused before anything is
+/// written, and `wait` is what proves quiescence and reports the outcome.
+/// `wait` keeps its 5 s `DEFAULT_WAIT_TIMEOUT` semantics (inactivate on
+/// timeout) for non-persistent use.
+///
+/// Persistent cancel (`supports_persistent_cancel`): `wait_timeout` waits
+/// without tearing down, `raise_poison` stores into a host-mapped
+/// [`HostPoisonCell`] without touching this queue, and `teardown` inactivates
+/// the queue and reports `Proven` only when the completion signal reached zero
+/// afterwards; otherwise the device is quarantined
+/// (`railgun_quarantine`). A torn-down queue refuses every submit with
+/// `FailureKind::TornDown`; a quarantined device refuses with
+/// `FailureKind::DeviceQuarantined`.
+///
+/// Dropping the queue with a replay in flight cannot free a kernarg buffer
+/// under a running dispatch: `lowering` is declared first and the indirect
+/// buffer graph is its first field, whose drop inactivates the queue before
+/// the kernels and kernarg buffers are released. Like every Redline graph
+/// the drop never waits on the completion signal, so an unfinished replay
+/// (a persistent kernel) is cancelled, not drained.
 pub struct RailgunWindowQueue {
     lowering: OwnedWindowLowering,
     /// Per node: its symbol (self-check messages).
@@ -640,10 +1040,29 @@ pub struct RailgunWindowQueue {
     /// Per node: the grid the indirect buffer currently dispatches, `None`
     /// while unknown (a patch failed). Initially the authored grids.
     grids: Vec<Option<[u32; 3]>>,
+    /// Per node: the grid a co-resident group's residency proof admitted
+    /// (`None` for a node outside every group). A submit whose image grid
+    /// differs is refused: the proof holds only for the grids it counted.
+    admitted_grids: Vec<Option<[u32; 3]>>,
     /// The outcome of the last submit when it failed; what `wait` reports.
     failure: Option<QueueFailure>,
+    /// A `submit_nowait` replay is outstanding: nothing may be written or
+    /// submitted until `wait` observes it.
+    in_flight: bool,
+    /// Device this queue lowered on (quarantine key).
+    device: DeviceKey,
+    /// Persistent cancel tore the queue down: every submit is refused.
+    torn_down: bool,
+    /// What `teardown` reported (returned again on repeat calls).
+    teardown_report: Option<(Quiescence, String)>,
+    /// Host-mapped poison cell for `raise_poison`.
+    poison: Option<HostPoisonCell>,
     /// Where lowering this queue spent its time.
     timing: LowerTiming,
+    /// What the lowered program's certificate slot is (`Certified`, or lab
+    /// `LabPending`); the harness logs `admission().receipt(witness)` with
+    /// every result.
+    admission: railgun::admission::Admission,
 }
 
 // SAFETY: `RailgunWindowQueue` is only ever driven through `&mut self`, so
@@ -663,6 +1082,15 @@ pub struct RailgunWindowQueue {
 unsafe impl Send for RailgunWindowQueue {}
 
 impl RailgunWindowQueue {
+    /// The admission of the lowered program: `Certified`, or (lab builds
+    /// only) `LabPending` with the pending certificate reasons. A
+    /// `LabPending` queue's results are reportable only with
+    /// `railgun::admission::Admission::receipt` and an eager byte-identity
+    /// `DifferentialWitness`.
+    pub fn admission(&self) -> &railgun::admission::Admission {
+        &self.admission
+    }
+
     /// Command dwords of the retained indirect buffer.
     pub fn command_dwords(&self) -> u32 {
         self.lowering.command_dwords()
@@ -693,10 +1121,17 @@ impl RailgunWindowQueue {
     }
 
     fn proven(message: String) -> QueueFailure {
-        QueueFailure {
-            message,
-            quiescence: Quiescence::Proven,
-        }
+        QueueFailure::new(message, Quiescence::Proven)
+    }
+
+    /// Why this queue's device is quarantined, if it is.
+    pub fn device_quarantine(&self) -> Option<String> {
+        quarantine_reason(&self.device)
+    }
+
+    /// Register the host-mapped poison cell `raise_poison` writes.
+    pub fn set_poison_cell(&mut self, cell: HostPoisonCell) {
+        self.poison = Some(cell);
     }
 
     /// Write the images and grids that changed; every failure here happens
@@ -729,14 +1164,37 @@ impl RailgunWindowQueue {
         }
         Ok(())
     }
-}
 
-impl WindowQueue for RailgunWindowQueue {
-    fn submit(
+    /// Everything `submit` and `submit_nowait` do before a replay is
+    /// published: refuse while a replay is in flight or the queue is
+    /// quarantined, check the typed steps and node count, write what changed
+    /// and run the self-check. Every failure here happens before any
+    /// dispatch.
+    fn begin_submit(
         &mut self,
         nodes: &[NodeImage<'_>],
         steps: &[ResolvedStep],
     ) -> Result<(), QueueFailure> {
+        // Refused before anything is written or recorded: a quarantined
+        // device, then a queue already torn down by persistent cancel.
+        if let Some(failure) = quarantine_refusal(&self.device) {
+            return Err(failure);
+        }
+        if self.torn_down {
+            return Err(Self::proven(
+                "queue torn down by persistent cancel; lower a new window".into(),
+            )
+            .with_kind(FailureKind::TornDown));
+        }
+        if self.in_flight {
+            // Refused before any write: `prepare` rewrites kernargs, which
+            // is only legal while quiescent. Not recorded in `failure`,
+            // which is `wait`'s report of the replay still in flight.
+            return Err(Self::proven(
+                "submit without completion: the previous submit has not completed (wait first)"
+                    .into(),
+            ));
+        }
         if let Some(failure) = &self.failure {
             if failure.quiescence == Quiescence::Unknown {
                 return Err(failure.clone());
@@ -757,6 +1215,11 @@ impl WindowQueue for RailgunWindowQueue {
                 nodes.len(),
                 self.last.len()
             ));
+            self.failure = Some(failure.clone());
+            return Err(failure);
+        }
+        if let Err(message) = check_admitted_grids(&self.admitted_grids, nodes) {
+            let failure = Self::proven(message);
             self.failure = Some(failure.clone());
             return Err(failure);
         }
@@ -799,38 +1262,407 @@ impl WindowQueue for RailgunWindowQueue {
                 nodes.len()
             );
         }
+        Ok(())
+    }
+
+    /// Store a replay failure as what `wait` reports, and return it.
+    fn record_failure(&mut self, failure: OwnedReplayFailure) -> QueueFailure {
+        let failure = QueueFailure::new(
+            failure.error,
+            match failure.quiescence {
+                ReplayQuiescence::Proven => Quiescence::Proven,
+                ReplayQuiescence::Unknown => Quiescence::Unknown,
+            },
+        );
+        self.failure = Some(failure.clone());
+        failure
+    }
+}
+
+impl WindowQueue for RailgunWindowQueue {
+    fn submit(
+        &mut self,
+        nodes: &[NodeImage<'_>],
+        steps: &[ResolvedStep],
+    ) -> Result<(), QueueFailure> {
+        self.begin_submit(nodes, steps)?;
         // SAFETY: every pointer in the kernarg images just written was bound
         // by the window binding key (`WindowBindingKey`), which proves each
         // allocation it names is live and unmoved for this generation; the
         // lowering owns its kernargs, kernels and indirect buffer, and the
-        // queue is quiescent (the previous replay waited, or none ran).
+        // queue is quiescent (`begin_submit` refused while a replay was in
+        // flight; the previous replay waited, or none ran).
         let replayed = unsafe { self.lowering.replay_and_wait() };
-        replayed.map_err(|failure| {
-            let failure = QueueFailure {
-                message: failure.error,
-                quiescence: match failure.quiescence {
-                    ReplayQuiescence::Proven => Quiescence::Proven,
-                    ReplayQuiescence::Unknown => Quiescence::Unknown,
-                },
-            };
-            self.failure = Some(failure.clone());
-            failure
-        })
+        replayed.map_err(|failure| self.record_failure(failure))
+    }
+
+    fn submit_nowait(
+        &mut self,
+        nodes: &[NodeImage<'_>],
+        steps: &[ResolvedStep],
+    ) -> Result<(), QueueFailure> {
+        self.begin_submit(nodes, steps)?;
+        // SAFETY: as in `submit`; the replay then stays in flight, and
+        // nothing writes a kernarg buffer, a grid or the indirect buffer
+        // until `wait` observes it (`begin_submit` refuses every submit while
+        // `in_flight`), and a drop inactivates the queue before anything the
+        // IB reads is freed.
+        let published = unsafe { self.lowering.replay_submit() };
+        published.map_err(|failure| self.record_failure(failure))?;
+        self.in_flight = true;
+        Ok(())
     }
 
     fn wait(&mut self) -> Result<(), QueueFailure> {
-        // `submit` blocks until the queue is idle, so a successful submit has
-        // already proven quiescence and there is nothing left to wait for.
+        if self.in_flight {
+            let waited = self.lowering.wait_replay();
+            // Whatever the outcome the replay is no longer outstanding for
+            // this queue: success and a proven teardown leave it quiescent,
+            // and an unproven teardown is carried by the stored `Unknown`
+            // failure (every later submit is refused; the lowering's drop
+            // retries the inactivation).
+            self.in_flight = false;
+            if let Err(failure) = waited {
+                self.record_failure(failure);
+            }
+        }
+        // A blocking `submit` has already proven quiescence, so only the
+        // stored outcome is left to report.
         match &self.failure {
             Some(failure) => Err(failure.clone()),
             None => Ok(()),
         }
+    }
+
+    fn supports_persistent_cancel(&self) -> bool {
+        true
+    }
+
+    fn wait_timeout(&mut self, timeout: Duration) -> TimedWait {
+        if !self.in_flight {
+            return TimedWait::Done(self.wait());
+        }
+        match self.lowering.wait_replay_bounded(timeout) {
+            OwnedBoundedWait::Complete => {
+                self.in_flight = false;
+                TimedWait::Done(self.wait())
+            }
+            // Nothing was inactivated or changed: still in flight.
+            OwnedBoundedWait::Pending => TimedWait::Pending,
+            OwnedBoundedWait::Failed(f) => {
+                self.in_flight = false;
+                let failure = self.record_failure(f);
+                // A fault whose own teardown could not be proven leaves
+                // waves possibly resident: the same device consequence as an
+                // unproven escalation.
+                if failure.quiescence == Quiescence::Unknown {
+                    quarantine(
+                        &self.device,
+                        format!(
+                            "persistent window queue fault with unproven teardown: {}",
+                            failure.message
+                        ),
+                    );
+                }
+                TimedWait::Done(Err(failure))
+            }
+        }
+    }
+
+    fn raise_poison(&mut self, address: u64, value: u32) -> Result<(), QueueFailure> {
+        let Some(cell) = &self.poison else {
+            return Err(Self::proven(
+                "poison cell is not host-mapped: there is no queue-independent write path to it"
+                    .into(),
+            ));
+        };
+        if cell.device_address() != address || value == 0 {
+            return Err(Self::proven(format!(
+                "poison cell is not host-mapped at {address:#x} (the host-mapped cell is at {:#x}) or the value is zero: there is no queue-independent write path to it",
+                cell.device_address()
+            )));
+        }
+        // Deliberately not through the lowering or its queue: the queue is
+        // the thing that is stuck.
+        cell.store(value);
+        Ok(())
+    }
+
+    fn teardown(&mut self, observe: Duration) -> Teardown {
+        if self.torn_down {
+            let (quiescence, message) = self
+                .teardown_report
+                .clone()
+                .unwrap_or((Quiescence::Unknown, "queue torn down".into()));
+            return Teardown {
+                quiescence,
+                message,
+            };
+        }
+        self.torn_down = true;
+        let (quiescence, message) = match self.lowering.cancel_replay(observe) {
+            Ok(CancelEvidence::RetirementObserved) => {
+                self.in_flight = false;
+                (
+                    Quiescence::Proven,
+                    "queue inactivated; the end-of-pipe completion signal reached zero after inactivation (retirement observed)".to_string(),
+                )
+            }
+            Ok(CancelEvidence::InactivatedOnly) => {
+                self.in_flight = false;
+                let message = "queue inactivated but no retirement evidence was observed (redline-rocr runtime.rs:1621-1626 documents only that inactivation aborts pending executions and has no wall-clock bound)".to_string();
+                quarantine(&self.device, message.clone());
+                (Quiescence::Unknown, message)
+            }
+            Err(e) => {
+                let message = format!("queue inactivation failed: {e}");
+                quarantine(&self.device, message.clone());
+                (Quiescence::Unknown, message)
+            }
+        };
+        self.teardown_report = Some((quiescence.clone(), message.clone()));
+        // Outputs of a torn-down window are invalid whatever was proven.
+        self.failure = Some(
+            QueueFailure::new(
+                format!("queue torn down by persistent cancel: {message}"),
+                quiescence.clone(),
+            )
+            .with_kind(FailureKind::TornDown),
+        );
+        Teardown {
+            quiescence,
+            message,
+        }
+    }
+}
+
+/// Per node, the grid of the residency proof of the co-resident group it
+/// belongs to (`None` outside every group). Every group must carry a proof
+/// whose grids are the ones `program` authors, so a proof made for another
+/// program cannot gate this lowering.
+fn admitted_group_grids(
+    program: &KernelProgram,
+    plan: &Pm4Plan,
+) -> Result<Vec<Option<[u32; 3]>>, String> {
+    let mut admitted = vec![None; program.nodes.len()];
+    for (g, group) in plan.groups.iter().enumerate() {
+        let proof = group.residency.as_ref().ok_or_else(|| {
+            format!(
+                "co-resident group {g} {:?} has no residency proof",
+                group.nodes
+            )
+        })?;
+        if group.nodes.end > program.nodes.len() || proof.grids.len() != group.nodes.len() {
+            return Err(format!(
+                "co-resident group {g} {:?}: residency proof covers {} members of a {}-node program",
+                group.nodes,
+                proof.grids.len(),
+                program.nodes.len()
+            ));
+        }
+        for (k, i) in group.nodes.clone().enumerate() {
+            if proof.grids[k] != program.nodes[i].grid {
+                return Err(format!(
+                    "co-resident group {g} member {i}: residency proof admitted grid {:?}, the program authors {:?}",
+                    proof.grids[k], program.nodes[i].grid
+                ));
+            }
+            admitted[i] = Some(proof.grids[k]);
+        }
+    }
+    Ok(admitted)
+}
+
+/// Refuse a submit image whose grid differs from the residency-admitted grid
+/// of a co-resident group member (`admitted` per node, see
+/// [`admitted_group_grids`]).
+fn check_admitted_grids(
+    admitted: &[Option<[u32; 3]>],
+    nodes: &[NodeImage<'_>],
+) -> Result<(), String> {
+    for (i, (want, image)) in admitted.iter().zip(nodes).enumerate() {
+        if let Some(want) = want {
+            if image.grid != *want {
+                return Err(format!(
+                    "grid {:?} of co-resident member {i} is not the residency-admitted {want:?}",
+                    image.grid
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The corpus directory paired with the installed pack arch directory
+/// `<root>/kernels/compiled/<arch>`: its grandparent's `railgun-corpus`, i.e.
+/// `<root>/kernels/railgun-corpus` (a `railgun-jit-corpus` build's
+/// `v2/<host key>` directory). `None` for a path without two parents.
+pub fn corpus_beside_pack(pack_arch_dir: &Path) -> Option<PathBuf> {
+    Some(pack_arch_dir.parent()?.parent()?.join("railgun-corpus"))
+}
+
+/// The per-user receipt corpus directory a locally built corpus lives in:
+/// `<cache root>/railgun-corpus/<arch>`, a sibling of the arch-keyed hot cache
+/// directory `<cache root>/<arch>` (always as writable as the cache itself).
+pub fn local_corpus_dir(hot_dir: &Path, arch: &str) -> PathBuf {
+    hot_dir
+        .parent()
+        .unwrap_or(hot_dir)
+        .join("railgun-corpus")
+        .join(arch)
+}
+
+/// What an owner needs to build a receipt corpus from the objects this process
+/// loaded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RailgunProvisionContext {
+    pub arch: String,
+    /// First line of `hipcc --version` (the corpus pin is its SHA-256).
+    pub toolchain_id: String,
+    /// The arch-keyed hot cache directory.
+    pub hot_dir: PathBuf,
+    /// The installed kernel pack arch directory, when one exists.
+    pub installed_pack_dir: Option<PathBuf>,
+    /// [`local_corpus_dir`] of `hot_dir`.
+    pub local_corpus_dir: PathBuf,
+}
+
+/// The `DeviceQuarantined` refusal of a submit on `key`, or `None` when the
+/// device is not quarantined. Nothing is written or recorded by the caller.
+fn quarantine_refusal(key: &DeviceKey) -> Option<QueueFailure> {
+    refuse_if_quarantined(key).err().map(|message| {
+        QueueFailure::new(message, Quiescence::Proven).with_kind(FailureKind::DeviceQuarantined)
+    })
+}
+
+/// Host-mapped 32-bit poison cell: the one word a persistent-window cancel
+/// writes (`WindowQueue::raise_poison`) without going through the stuck
+/// queue.
+///
+/// # Visibility argument
+///
+/// The cell lives in signal memory (`hipMallocSignalMemory`, the ROCr
+/// fine-grained system pool), which is host-coherent. The host store goes
+/// straight to that memory through a plain CPU pointer: it uses no queue,
+/// stream or copy engine, so it cannot wait behind the stuck queue. The device
+/// workers poll with device-scope acquire loads (peacemaker `event_wait`,
+/// `Scope::Dev`, `crates/peacemaker-isa/src/global_sync.rs:242`), which bypass
+/// the vector cache. Whether a device-scope load observes a host store to this
+/// memory is an on-hardware fact that is NOT proven here: the lab smoke
+/// `railgun_persistent_cancel_smoke` is the oracle.
+///
+/// Rejected alternatives: a HIP memcpy on a side stream (a blit/SDMA copy can
+/// queue behind a resident kernel or need CUs the persistent kernel holds) and
+/// `hipStreamWriteValue32` (stream-ordered, so not independent of device
+/// state).
+pub struct HostPoisonCell {
+    device_address: u64,
+    host: *mut u32,
+}
+
+// SAFETY: the cell is a pointer to fine-grained signal memory accessed only
+// through volatile loads/stores of a naturally aligned u32; no thread-affine
+// state. The creator keeps the allocation alive (`from_signal_memory`).
+unsafe impl Send for HostPoisonCell {}
+
+impl HostPoisonCell {
+    /// The cell of a `hip_bridge::SignalWord`. Signal memory's host pointer
+    /// equals its device pointer (hip-bridge `ffi.rs` `signal_word()`). The
+    /// word must outlive every queue holding the cell.
+    pub fn from_signal_word(word: &hip_bridge::SignalWord) -> Self {
+        let ptr = word.device_buffer().as_ptr();
+        Self {
+            device_address: ptr as usize as u64,
+            host: ptr as *mut u32,
+        }
+    }
+
+    /// The cell at byte `offset` of `buf`.
+    ///
+    /// # Safety
+    /// `buf` MUST come from `HipRuntime::malloc_signal` (host and device
+    /// addressable), and the caller keeps the allocation alive for as long as
+    /// any queue holds the cell.
+    pub unsafe fn from_signal_memory(
+        buf: &hip_bridge::DeviceBuffer,
+        offset: u64,
+    ) -> Result<Self, String> {
+        if offset % 4 != 0 {
+            return Err(format!("poison cell offset {offset} is not 4-aligned"));
+        }
+        let end = offset
+            .checked_add(4)
+            .ok_or_else(|| "poison cell offset overflows".to_string())?;
+        if end > buf.size() as u64 {
+            return Err(format!(
+                "poison cell at offset {offset} does not fit a {}-byte buffer",
+                buf.size()
+            ));
+        }
+        let base = buf.as_ptr() as usize as u64;
+        Ok(Self {
+            device_address: base + offset,
+            host: (base + offset) as usize as *mut u32,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_host_pointer(device_address: u64, host: *mut u32) -> Self {
+        Self {
+            device_address,
+            host,
+        }
+    }
+
+    pub fn device_address(&self) -> u64 {
+        self.device_address
+    }
+
+    /// Release fence, then a volatile store (mirrors
+    /// `hip_bridge::SignalWord::store_release`): host-side order only; device
+    /// visibility is the lab smoke's question.
+    pub fn store(&self, value: u32) {
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+        // SAFETY: `host` is a live, aligned u32 (constructor contract).
+        unsafe { self.host.write_volatile(value) };
+    }
+
+    /// Volatile load, then an acquire fence.
+    pub fn load(&self) -> u32 {
+        // SAFETY: as in `store`.
+        let v = unsafe { self.host.read_volatile() };
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+        v
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_poison_cell_round_trip_and_address() {
+        let mut word = Box::new(0u32);
+        let cell = HostPoisonCell::from_host_pointer(0x1000, &mut *word as *mut u32);
+        assert_eq!(cell.device_address(), 0x1000);
+        assert_eq!(cell.load(), 0);
+        cell.store(0xdead_beef);
+        assert_eq!(cell.load(), 0xdead_beef);
+        assert_eq!(*word, 0xdead_beef);
+    }
+
+    #[test]
+    fn quarantine_refusal_reports_kind_and_reason() {
+        let key = DeviceKey::from_pci("test:window-refusal");
+        assert!(quarantine_refusal(&key).is_none());
+        quarantine(&key, "no retirement evidence (test)");
+        let failure = quarantine_refusal(&key).expect("quarantined");
+        assert_eq!(failure.kind, FailureKind::DeviceQuarantined);
+        assert_eq!(failure.quiescence, Quiescence::Proven);
+        assert!(failure.message.contains("no retirement evidence (test)"));
+        crate::railgun_quarantine::clear_for_test(&key);
+        assert!(quarantine_refusal(&key).is_none());
+    }
     use crate::replay::railgun_lower::KernargMismatch;
     use railgun_corpus::window::{
         sequence_digest, WindowNodeRecord, WHOLE16_SHAPE, WINDOW_MANIFEST_SCHEMA,
@@ -1161,5 +1993,41 @@ mod tests {
                 .expect("a foreign toolchain pin is refused");
         assert!(error.contains("is not the corpus pin"), "{error}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn the_corpus_ships_beside_the_pack_not_inside_an_arch_dir() {
+        assert_eq!(
+            corpus_beside_pack(Path::new("/opt/hipfire/bin/kernels/compiled/gfx1201")),
+            Some(PathBuf::from("/opt/hipfire/bin/kernels/railgun-corpus"))
+        );
+        assert_eq!(
+            corpus_beside_pack(Path::new("kernels/compiled/gfx1201")),
+            Some(PathBuf::from("kernels/railgun-corpus"))
+        );
+        assert_eq!(corpus_beside_pack(Path::new("gfx1201")), None);
+    }
+
+    #[test]
+    fn the_local_corpus_is_a_per_user_sibling_of_the_hot_cache() {
+        assert_eq!(
+            local_corpus_dir(Path::new("/home/u/.hipfire/cache/gfx1201"), "gfx1201"),
+            PathBuf::from("/home/u/.hipfire/cache/railgun-corpus/gfx1201")
+        );
+    }
+
+    #[test]
+    fn a_group_member_grid_must_be_the_admitted_one() {
+        let node = |grid| NodeImage { kernarg: &[], grid };
+        let admitted = [None, Some([4, 1, 1]), Some([2, 1, 1])];
+        let ok = [node([9, 9, 9]), node([4, 1, 1]), node([2, 1, 1])];
+        assert_eq!(check_admitted_grids(&admitted, &ok), Ok(()));
+        let bad = [node([1, 1, 1]), node([4, 1, 1]), node([3, 1, 1])];
+        let e = check_admitted_grids(&admitted, &bad).unwrap_err();
+        assert_eq!(
+            e,
+            "grid [3, 1, 1] of co-resident member 2 is not the residency-admitted [2, 1, 1]"
+        );
+        // A program without groups admits nothing and constrains nothing.
+        assert_eq!(check_admitted_grids(&[None, None], &bad[..2]), Ok(()));
     }
 }

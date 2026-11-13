@@ -13,14 +13,14 @@
 use crate::dflash_verify_pm4::{DflashVerifyPm4, DFLASH_VERIFY_PM4_BLOCK};
 use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Weights, StateQuant};
 use crate::speculative::{
-    apply_eviction_retain_to_draft, apply_host_ar_trunc, sample_categorical,
-    scatter_hidden_block_to_interleaved, scatter_hidden_prefill_to_interleaved,
-    seed_target_hidden_dense_tp2_abortable, seed_target_hidden_from_prompt_abortable,
-    seed_target_hidden_from_prompt_abortable_parts, seed_target_hidden_suffix_abortable,
-    seed_target_hidden_suffix_abortable_parts, softmax_temp_into, spec_step_ddtree_batched,
-    spec_step_dflash_dense_tp2, spec_step_dflash_with_railgun, xorshift_next_unit, DdtreeScratch,
-    DeltaNetSnapshot, DenseTpTargetView, DflashLookup, DflashTargetParts, GdnTape,
-    HiddenStateRingBuffer, ModelSlot, RailgunStep, SpecStepResult, VerifyScratch,
+    apply_host_ar_trunc, sample_categorical, scatter_hidden_block_to_interleaved,
+    scatter_hidden_prefill_to_interleaved, seed_target_hidden_dense_tp2_abortable,
+    seed_target_hidden_from_prompt_abortable, seed_target_hidden_from_prompt_abortable_parts,
+    seed_target_hidden_suffix_abortable, seed_target_hidden_suffix_abortable_parts,
+    softmax_temp_into, spec_step_ddtree_batched, spec_step_dflash_dense_tp2,
+    spec_step_dflash_with_railgun, xorshift_next_unit, DdtreeScratch, DeltaNetSnapshot,
+    DenseTpTargetView, DflashLookup, DflashTargetParts, GdnTape, HiddenStateRingBuffer, ModelSlot,
+    RailgunStep, SpecStepResult, TurnCheckpoint, VerifyScratch,
 };
 use hipfire_runtime::dflash::{
     draft_seed_backfill_reads_host, DflashConfig, DflashScratch, DflashWeights, DraftCtxMode,
@@ -30,8 +30,8 @@ use hipfire_runtime::dflash_adaptive_block::DflashAdaptiveBlock;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::spec::{
-    request_rng_state, terminal_prefix_replay, EvictRetain, PrefillOutcome, SpecGrammar,
-    SpecRequestConfig, SpecStep, SpecTarget, Speculator,
+    request_rng_state, terminal_prefix_replay, PrefillOutcome, SpecGrammar, SpecRequestConfig,
+    SpecStep, SpecTarget, Speculator,
 };
 use rdna_compute::{Gpu, GpuTensor};
 use std::path::Path;
@@ -315,32 +315,33 @@ fn alloc_dflash_owners(
 // ─── DFlash state load ────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
-/// Default ceiling for the DFlash draft's context-indexed structures
-/// (`target_hidden` [L × extract×hidden], the per-layer K/V caches, the
-/// hidden ring, `mq_x_rot`, and the host hidden log). Serve loads default
-/// `max_seq` to 32768+, which sized ALL of these to 32K rows — on a 27B
-/// target with a 5-layer-extract MQ4 draft that is ~11 GB of draft-side
-/// VRAM, vs ~1.4 GB at the ≤4K contexts DFlash benches actually run. The
-/// draft only affects acceptance rate (verify is target-gated), so a
+/// Ceiling for the DFlash draft's context-indexed structures when the draft
+/// declares no sliding window (`target_hidden` [L × extract×hidden], the
+/// per-layer K/V caches, the hidden ring, `mq_x_rot`, and the host hidden
+/// log). Serve loads default `max_seq` to 32768+, which sized ALL of these to
+/// 32K rows — on a 27B target with a 5-layer-extract MQ4 draft that is ~11 GB
+/// of draft-side VRAM, vs ~1.4 GB at the ≤4K contexts DFlash benches actually
+/// run. The draft only affects acceptance rate (verify is target-gated), so a
 /// request that outgrows the cap simply falls back to AR in the daemon —
-/// emitted tokens are never at risk. `HIPFIRE_DFLASH_CTX_CAP=0` opts out
-/// (legacy uncapped behaviour); any other value overrides the ceiling.
+/// emitted tokens are never at risk. The cap is fixed: the 0.4.x
+/// `HIPFIRE_DFLASH_CTX_CAP` override was removed in 0.5.0.
 pub const DEFAULT_DFLASH_CTX_CAP: usize = 8192;
 
-// lifecycle: deprecated since 0.4.0, removal 0.5.0 — legacy contiguous DFlash opt-in knobs; the draft-declared window supersedes them
-/// One warning line when an operator opts into legacy contiguous DFlash
-/// (`HIPFIRE_DFLASH_WINDOW=0`) or overrides its draft cap
-/// (`HIPFIRE_DFLASH_CTX_CAP`). Silent when neither knob is set.
-fn warn_deprecated_legacy_dflash_knobs() {
-    let window_zero = hipfire_config::developer_var("HIPFIRE_DFLASH_WINDOW")
+/// `HIPFIRE_DFLASH_WINDOW` as a window-row override: `Ok(Some(rows))` for a
+/// positive value, `Ok(None)` when unset or unparsable. `0` (the removed
+/// legacy contiguous mode) is refused so a stale environment fails loudly
+/// instead of silently running the windowed default.
+pub(crate) fn dflash_window_override() -> Result<Option<usize>, String> {
+    match hipfire_config::developer_var("HIPFIRE_DFLASH_WINDOW")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
-        == Some(0);
-    let ctx_cap = hipfire_config::developer_var("HIPFIRE_DFLASH_CTX_CAP").is_ok();
-    if window_zero || ctx_cap {
-        eprintln!(
-            "  warning: HIPFIRE_DFLASH_WINDOW=0 / HIPFIRE_DFLASH_CTX_CAP (legacy contiguous DFlash) are deprecated and will be removed in 0.5.0; use the draft-declared window"
-        );
+    {
+        Some(0) => Err(
+            "HIPFIRE_DFLASH_WINDOW=0 (legacy contiguous DFlash) was removed in 0.5.0; \
+             unset it to use the draft-declared window, or set it to a positive row count"
+                .to_string(),
+        ),
+        other => Ok(other),
     }
 }
 
@@ -354,11 +355,6 @@ pub fn load_dflash_state(
     // (CLI `--ddtree-budget` / `--ddtree-topk`). Env wins, else these, else default.
     ddtree_budget_param: Option<usize>,
     ddtree_topk_param: Option<usize>,
-    // CASK eviction active for this load. Windowed draft mode refuses the
-    // combination (the eviction rebuild re-projects rows the window has
-    // already dropped) and falls back to Legacy — gather-compact over the
-    // rings is a follow-up.
-    eviction_active: bool,
     // Retained-PM4 admission facts owned by the loader/target, not the draft.
     target_weights: &Qwen35Weights,
     kv_is_q8: bool,
@@ -407,14 +403,9 @@ pub fn load_dflash_state(
     // `DflashConfig::declared_window` / `all_layers_sliding`). That is the
     // only width correct by construction.
     //   HIPFIRE_DFLASH_WINDOW=<rows>  explicit override (warns on mismatch)
-    //   HIPFIRE_DFLASH_WINDOW=0       explicit Legacy (cap + AR fallback)
-    //   unset                         draft-declared window, else Legacy
-    warn_deprecated_legacy_dflash_knobs();
-    let window = match hipfire_config::developer_var("HIPFIRE_DFLASH_WINDOW")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-    {
-        Some(0) => None,
+    //   unset                         draft-declared window, else the capped
+    //                                 contiguous fallback (`DEFAULT_DFLASH_CTX_CAP`)
+    let window = match dflash_window_override()? {
         Some(w) => {
             if let Some(declared) = draft_config.declared_window {
                 if declared != w {
@@ -429,26 +420,9 @@ pub fn load_dflash_state(
         }
         None => draft_config.declared_window,
     };
-    let window = match (window, eviction_active) {
-        (Some(w), true) => {
-            eprintln!(
-                "  DFlash windowed mode ({w}) disabled: CASK eviction rebuild is not \
-                 ring-aware — falling back to Legacy capped mode"
-            );
-            None
-        }
-        (w, _) => w,
-    };
     let ctx_capacity = match window {
         Some(w) => w,
-        None => match hipfire_config::developer_var("HIPFIRE_DFLASH_CTX_CAP")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-        {
-            Some(0) => ctx_capacity, // explicit opt-out: legacy uncapped
-            Some(cap) => ctx_capacity.min(cap),
-            None => ctx_capacity.min(DEFAULT_DFLASH_CTX_CAP),
-        },
+        None => ctx_capacity.min(DEFAULT_DFLASH_CTX_CAP),
     };
     if let Some(w) = window {
         let from_meta = if draft_config.declared_window == Some(w) {
@@ -459,21 +433,20 @@ pub fn load_dflash_state(
         if draft_config.all_layers_sliding {
             eprintln!(
                 "  DFlash2 draft windowed: all {} layers sliding at W={w} \
-                 (no full-attention layer; draft VRAM pinned at W; \
-                 HIPFIRE_DFLASH_WINDOW=0 for Legacy){from_meta}",
+                 (no full-attention layer; draft VRAM pinned at W){from_meta}",
                 draft_config.n_layers
             );
         } else {
             eprintln!(
                 "  DFlash draft windowed: SWA W={w} rows on layers 0..n-2, full-attention \
-                 last layer over all {} rows (draft VRAM pinned at W; HIPFIRE_DFLASH_WINDOW=0 for Legacy){from_meta}",
+                 last layer over all {} rows (draft VRAM pinned at W){from_meta}",
                 requested_ctx
             );
         }
     } else if ctx_capacity < requested_ctx {
         eprintln!(
             "  DFlash draft ctx capped: {} -> {} rows (draft-side VRAM scales with this; \
-             HIPFIRE_DFLASH_CTX_CAP=0 for uncapped, or set a larger cap)",
+             the cap is fixed — use a draft that declares a sliding window)",
             requested_ctx, ctx_capacity
         );
     }
@@ -2320,6 +2293,12 @@ pub struct DflashSpeculator {
     resume_enabled: bool,
     ck_interval: usize,
     ck_cap: usize,
+    /// This request's user-turn boundary (`Speculator::set_turn_boundary`), taken by
+    /// the prompt seed.
+    turn_boundary: Option<usize>,
+    /// Position of the newest user-turn snapshot in `checkpoints`, protected from
+    /// recycling until the next user turn replaces it.
+    pinned_boundary: Option<usize>,
     last_window: Option<DflashWindowMark>,
     /// Adaptive verify-block controller (trailing-τ proposal shrink),
     /// owned by `hipfire_runtime::dflash_adaptive_block` so the policy is
@@ -2383,6 +2362,8 @@ impl DflashSpeculator {
             sample_top_k: hipfire_runtime::llama::ar_candidate_cap(None),
             sample_cactus: 0.0,
             checkpoints: Vec::new(),
+            turn_boundary: None,
+            pinned_boundary: None,
             resume_enabled,
             ck_interval,
             ck_cap,
@@ -2513,6 +2494,14 @@ impl Speculator for DflashSpeculator {
         // `prefill_start`, reusing the prior turn's KV + recurrent state; miss →
         // seed the full prompt (the seed fn resets target state itself).
         let (ck_interval, ck_cap) = (self.ck_interval, self.ck_cap);
+        // This request's user-turn boundary: the seed snapshots at its newest
+        // chunk end at or before it; that snapshot stays pinned through the
+        // following tool-result requests until the next user turn. One-shot per
+        // request.
+        let mut turn = TurnCheckpoint {
+            boundary: self.turn_boundary.take().filter(|_| self.resume_enabled),
+            pin: self.pinned_boundary,
+        };
         let ckpt_sink = if self.resume_enabled {
             Some(&mut self.checkpoints)
         } else {
@@ -2525,10 +2514,12 @@ impl Speculator for DflashSpeculator {
                 &mut df.hidden_rb,
                 prefill_tokens,
                 prefill_start,
+                prompt_tokens.get(..prefill_start).unwrap_or(&[]),
                 abort,
                 ckpt_sink,
                 ck_interval,
                 ck_cap,
+                &mut turn,
             )
         } else {
             seed_target_hidden_from_prompt_abortable(
@@ -2541,12 +2532,14 @@ impl Speculator for DflashSpeculator {
                 ckpt_sink,
                 ck_interval,
                 ck_cap,
+                &mut turn,
             )
         }
         .map_err(|e| {
             hipfire_runtime::reset_core::note_hip_error(&e, "qwen35::dflash_prefill::seed");
             e.to_string()
         })?;
+        self.pinned_boundary = turn.pin;
         if aborted {
             // Caller resets conversation state + emits aborted/done; the slot
             // guard restores the target bundle on the way out.
@@ -2639,10 +2632,12 @@ impl Speculator for DflashSpeculator {
             &mut df.hidden_rb,
             tokens,
             start_pos,
+            &[],
             abort,
             None,
             self.ck_interval,
             self.ck_cap,
+            &mut TurnCheckpoint::default(),
         )
         .map_err(|e| e.to_string())?;
         if aborted {
@@ -3106,30 +3101,6 @@ impl Speculator for DflashSpeculator {
         lowered
     }
 
-    fn on_evict(&mut self, gpu: &mut Gpu, retain: &EvictRetain) -> Result<(), String> {
-        self.last_window = None;
-        if let Some(owner) = self.railgun.as_mut() {
-            owner.invalidate();
-        }
-        // Compact the drafter's cached target-hidden rows to match the target KV
-        // after the FlashCASK eviction the daemon already applied to the target.
-        let df = self
-            .df
-            .as_mut()
-            .ok_or_else(|| SINGLETON_VACANT.to_string())?;
-        let ne = df.draft_config.num_extract();
-        let h = df.draft_config.hidden;
-        apply_eviction_retain_to_draft(
-            gpu,
-            &mut df.draft_scratch,
-            &retain.retain_mask,
-            ne,
-            h,
-            retain.pre_phys,
-        )
-        .map_err(|e| e.to_string())
-    }
-
     fn reset(&mut self, gpu: &mut Gpu) -> Result<(), String> {
         if cycle_trace::enabled() {
             cycle_trace::emit(&cycle_trace::reset_line(std::process::id(), self.trace_seq));
@@ -3238,8 +3209,19 @@ impl Speculator for DflashSpeculator {
         }
     }
 
+    fn set_turn_boundary(&mut self, boundary: Option<usize>) {
+        self.turn_boundary = boundary;
+    }
+
     fn checkpoint_positions(&self) -> Vec<usize> {
         self.checkpoints.iter().map(|(p, _)| *p).collect()
+    }
+
+    fn checkpoint_prefix_hashes(&self) -> Vec<(usize, u64)> {
+        self.checkpoints
+            .iter()
+            .map(|(p, snap)| (*p, snap.prefix_hash))
+            .collect()
     }
 
     fn rewind_to(
@@ -3353,23 +3335,18 @@ impl Speculator for DflashSpeculator {
 
 /// Construct the DFlash speculator from a freshly-loaded `DflashState`, resolving
 /// the env config the daemon's old `generate_dflash` read inline: checkpoint
-/// resume (`HIPFIRE_DFLASH_CKPT_RESUME` + no-eviction) and interval/cap
+/// resume (`HIPFIRE_DFLASH_CKPT_RESUME`) and interval/cap
 /// (`HIPFIRE_CACHE_CKPT_INTERVAL`/`_MAX`, matching the daemon's
 /// `ckpt_interval()`/`ckpt_max()` defaults), plus the adaptive-B kill-switch
 /// (`HIPFIRE_DFLASH_ADAPTIVE_B=0` forces the fixed full block, mirroring
 /// DSpark's `HIPFIRE_DSPARK_ADAPTIVE_BLOCK=0`). Called once at load.
 /// `adaptive_b` is the `SpecLoadCfg::dflash_adaptive_b` load param (None =
 /// default off).
-pub fn build_dflash_speculator(
-    df: DflashState,
-    eviction_is_none: bool,
-    adaptive_b: bool,
-) -> Box<dyn Speculator> {
+pub fn build_dflash_speculator(df: DflashState, adaptive_b: bool) -> Box<dyn Speculator> {
     let resume_enabled = hipfire_config::developer_var("HIPFIRE_DFLASH_CKPT_RESUME")
         .ok()
         .as_deref()
-        != Some("0")
-        && eviction_is_none;
+        != Some("0");
     let ck_interval = hipfire_config::developer_var("HIPFIRE_CACHE_CKPT_INTERVAL")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -3838,6 +3815,7 @@ pub fn dflash_prefill_lane_parts(
         ckpt_sink,
         policy.interval,
         policy.cap,
+        &mut TurnCheckpoint::default(),
     )
     .map_err(|e| {
         hipfire_runtime::reset_core::note_hip_error(&e, "qwen35::dflash_prefill::seed");
@@ -3900,10 +3878,12 @@ pub fn dflash_repair_terminal_prefix_parts(
         &mut df.hidden_rb,
         &replay,
         position,
+        &[],
         &|| false,
         policy.resume_enabled.then_some(checkpoints),
         policy.interval,
         policy.cap,
+        &mut TurnCheckpoint::default(),
     )
     .map_err(|e| e.to_string())?;
     debug_assert!(!aborted, "terminal repair uses a non-aborting callback");
@@ -4057,7 +4037,7 @@ pub struct DenseTpDflashSpeculator {
 
 /// Transactionally build both draft replicas. Every rank binds its own device
 /// and runs the single-rank load logic under a `DenseTp2EagerGreedy` posture:
-/// fixed B=16, DFlash2 all-sliding selector draft, no DDTree/PFlash/CASK/
+/// fixed B=16, DFlash2 all-sliding selector draft, no DDTree/
 /// adaptive-KV state, PM4/graph never armed. A later rank's failure frees all
 /// earlier ranks' draft + partial state; borrowed target state is untouched.
 /// Returns the mesh owner; target rank configs must already exist.
@@ -4108,14 +4088,8 @@ pub fn load_dflash_speculator_dense_tp2(
         ));
     }
     // Window posture mirrors `load_dflash_state` (declared window by default,
-    // explicit override or Legacy opt-out via HIPFIRE_DFLASH_WINDOW). Mesh
-    // loads never enable eviction, so no ring-aware refusal applies here.
-    warn_deprecated_legacy_dflash_knobs();
-    let window = match hipfire_config::developer_var("HIPFIRE_DFLASH_WINDOW")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-    {
-        Some(0) => None,
+    // explicit override via HIPFIRE_DFLASH_WINDOW).
+    let window = match dflash_window_override()? {
         Some(w) => {
             if let Some(declared) = draft_config.declared_window {
                 if declared != w {
@@ -4132,14 +4106,7 @@ pub fn load_dflash_speculator_dense_tp2(
     let requested_ctx = ctx_capacity;
     let ctx_capacity = match window {
         Some(_) => requested_ctx,
-        None => match hipfire_config::developer_var("HIPFIRE_DFLASH_CTX_CAP")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-        {
-            Some(0) => ctx_capacity,
-            Some(cap) => ctx_capacity.min(cap),
-            None => ctx_capacity.min(DEFAULT_DFLASH_CTX_CAP),
-        },
+        None => ctx_capacity.min(DEFAULT_DFLASH_CTX_CAP),
     };
     let mut ranks: Vec<DenseTpDflashRankState> = Vec::with_capacity(2);
     // Free helper for the transactional unwind: every rank state fully built

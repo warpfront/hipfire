@@ -827,6 +827,7 @@ impl RailgunWindowOwner {
             Err(WindowRefusal::SubmitFailed {
                 message,
                 quiescence: Quiescence::Proven,
+                ..
             }) if message.starts_with(rdna_compute::railgun_window::LOWERING_SELF_CHECK) => {
                 builder.abandon_positions();
                 // Ask the HIP runtime whether it tracks an allocation over the
@@ -839,6 +840,7 @@ impl RailgunWindowOwner {
             Err(WindowRefusal::SubmitFailed {
                 message,
                 quiescence,
+                ..
             }) => {
                 return Err(after_submit_failure(
                     quarantined,

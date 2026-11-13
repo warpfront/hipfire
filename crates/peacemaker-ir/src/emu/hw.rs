@@ -16,6 +16,9 @@
 //!    will still overwrite, or redefining a VGPR that a pending store has not yet read, is an error naming the
 //!    instruction and the pending one. Two loads of the same in-order class may write one register back to back
 //!    (their results land in issue order).
+//!    `s_wait_expcnt`/`s_wait_samplecnt`/`s_wait_bvhcnt` retire through the same rule on counters no modeled
+//!    instruction increments, so they are accepted no-ops. The call forms (`s_getpc_b64`/`s_swappc_b64`/`s_setpc_b64`)
+//!    are control steps without memory effects; helper steps get hardware entries like kernel steps.
 //! 2. **LDS races.** Every LDS access is stamped with its wave and an access id. A wave's access is *fenced* when
 //!    its wait counter retires it, stamped with the number of barriers the wave had arrived at by then. An access
 //!    by another wave to the same byte (read-after-write, write-after-write, write-after-read; atomic against
@@ -26,7 +29,7 @@
 //!    wave, and two seeded-random interleavings, on a store journal so the runs start from the same memory; the
 //!    stores must be bit-identical across all of them.
 use super::{
-    alu, control, failure_bits,
+    alu, failure_bits,
     memory::{self, LdsTouch},
     Class, Emulator, Launch, Memory, Result, State, Step, StoreImage, WriteSet,
 };
@@ -568,6 +571,7 @@ impl<'a> Emulator<'a> {
     }
     /// Run one workgroup under every schedule of the gate model; leaves `mem` in schedule 0's final state.
     pub(super) fn run_hw(&self, launch: &Launch, mem: &mut Memory) -> Result<RunReport> {
+        self.require_qualified_numerics()?;
         let nw = (launch.block[0]
             .checked_mul(launch.block[1])
             .and_then(|n| n.checked_mul(launch.block[2]))
@@ -651,7 +655,7 @@ impl<'a> Emulator<'a> {
         let nw = n.div_ceil(kernel.wave.lanes());
         let states = (0..nw)
             .map(|w| {
-                State::new(self.arch, kernel, launch, w).map(|mut s| {
+                State::new(self.arch, self.decode_arch, kernel, launch, w).map(|mut s| {
                     s.nan_loose = self.nan_loose;
                     s
                 })
@@ -748,15 +752,18 @@ impl<'a> Emulator<'a> {
         if ctx.executed > 100_000_000 {
             return Err("instruction limit exceeded (possible divergent loop)".into());
         }
-        self.exec_inner(mem, ctx, wave, pc, step).map_err(|e| {
-            format!(
-                "{} wg={:?} inst={pc} {}: {e}{}",
-                self.kernel.symbol.0,
-                launch.workgroup,
-                step.name,
-                failure_bits(self.arch, wave, &ctx.states[wave], step.inst)
-            )
-        })
+        self.exec_inner(mem, ctx, wave, pc, step)
+            .and_then(|()| self.fall_through(pc, &ctx.states[wave]))
+            .map_err(|e| {
+                format!(
+                    "{} wg={:?} inst={pc} {}: {e}{}{}",
+                    self.kernel.symbol.0,
+                    launch.workgroup,
+                    step.name,
+                    self.locate(pc),
+                    failure_bits(self.arch, wave, &ctx.states[wave], step.inst)
+                )
+            })
     }
 
     fn step_name(&self, pc: usize) -> &'static str {
@@ -840,7 +847,7 @@ impl<'a> Emulator<'a> {
                     }
                 }
             }
-            Class::Control => control(name, inst, &mut ctx.states[wave], self.kernel)?,
+            Class::Control => self.control(pc, &mut ctx.states[wave])?,
             Class::Alu => alu::execute(self.arch, name, inst, &mut ctx.states[wave])?,
             Class::Memory => self.memory_step(mem, ctx, wave, pc, step, shw)?,
         }
@@ -927,6 +934,24 @@ impl<'a> Emulator<'a> {
                     Err("no barrier orders them (same barrier epoch)")
                 }
             };
+            // Wave-private windows: only the owning wave, only inside its own slice.
+            for t in log.iter() {
+                for &(base, stride, n) in &self.private_lds {
+                    let (base, stride, n) = (base as usize, stride as usize, n as usize);
+                    let (lo, hi) = (t.lo, t.lo + t.len);
+                    if hi <= base || lo >= base + stride * n {
+                        continue;
+                    }
+                    let (own_lo, own_hi) = (base + wave * stride, base + (wave + 1) * stride);
+                    if wave >= n || lo < own_lo || hi > own_hi {
+                        return Err(format!(
+                            "[private] LDS {} of bytes [{lo}, {hi}) by wave {wave} ({} at inst {pc}) leaves its own slice [{own_lo}, {own_hi}) of the wave-private window at {base} ({n} slices of {stride} bytes)",
+                            if t.write { "write" } else { "read" },
+                            step.name,
+                        ));
+                    }
+                }
+            }
             for t in log.iter() {
                 if let Err(r) = race.access(wave, id, t, &ord) {
                     let other = &hws[r.other_wave].accs[r.other_acc as usize];

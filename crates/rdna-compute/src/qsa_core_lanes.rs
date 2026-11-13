@@ -50,6 +50,49 @@ pub const QSA_LANES_POOL_SYMBOL: &str = "indexed_attention_pool_rope_bf16_lanes"
 pub const QSA_LANES_SELECT_SYMBOL: &str = "indexed_attention_select_bf16_lanes";
 pub const QSA_LANES_ATTENTION_SYMBOL: &str = "indexed_attention_attention_fp8_lanes";
 
+/// [`QSA_LANES_SRC`] plus the fused lane kernels (`qsa_lanes_fuse.gfx1201.hip`): its own
+/// module so the unfused module's code object does not change.
+pub(crate) const QSA_LANES_FUSE_SRC: &str = concat!(
+    include_str!("../../../kernels/src/mq_fwht256.h"),
+    include_str!("../../../kernels/src/rope_yarn.h"),
+    include_str!("../../../kernels/src/tensor_ops.hip"),
+    include_str!("../../../kernels/src/qsa_lanes.gfx1201.hip"),
+    include_str!("../../../kernels/src/qsa_lanes_fuse.gfx1201.hip")
+);
+/// Module key of [`QSA_LANES_FUSE_SRC`].
+pub const QSA_LANES_FUSE_MODULE: &str = "qsa_lanes_fuse";
+/// Prologue + pool + select as one launch (one row per lane).
+pub const QSA_LANES_FUSED_CORE_SYMBOL: &str = "indexed_attention_core_fused_fp8_lanes";
+/// Attention + the out-projection's `mq_rotate_x` as one launch.
+pub const QSA_LANES_FUSED_ATTENTION_SYMBOL: &str = "indexed_attention_attention_rot_fp8_lanes";
+
+/// `HIPFIRE_QWEN4_QSA_LANES_FUSE` (developer, default off): the admitted lane set takes the
+/// two fused launches ([`QsaCoreLanesPlan::launch_fused`]) instead of the four
+/// [`QsaCoreLanesPlan::launch`] launches plus the out-projection's `mq_rotate_x`. Read once.
+static QWEN4_QSA_LANES_FUSE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_LANES_FUSE", true)
+});
+
+/// Whether `HIPFIRE_QWEN4_QSA_LANES_FUSE` is on.
+pub fn qsa_lanes_fuse_enabled() -> bool {
+    *QWEN4_QSA_LANES_FUSE
+}
+
+/// Most dynamic + static LDS of a fused launch the admission allows (the fused core
+/// kernel carries the prologue's and the pool's static LDS next to the select's).
+const QSA_FUSE_LDS_MARGIN_BYTES: usize = 16 * 1024;
+
+/// The out-projection the fused attention rotates for: the op that follows the Core
+/// group and would run `rotate_x_mq_batched(x, x_rot, k, rows)` on the lanes' outputs.
+pub struct QsaOutRotate<'a> {
+    /// The out-projection's input (`rows` bank rows of `heads * head_dim` F32).
+    pub x: &'a GpuTensor,
+    /// Its rotation scratch (F32, at least `rows * heads * head_dim` elements).
+    pub x_rot: &'a GpuTensor,
+    /// Rows of the out-projection (the bank).
+    pub rows: usize,
+}
+
 /// Most lanes one [`qsa_core_lanes`] call covers (`QSA_LANES_MAX`).
 pub const QSA_CORE_LANES_MAX: usize = 8;
 /// Most rows one lane covers (the verify window of the lane steps,
@@ -206,19 +249,21 @@ pub(crate) fn qsa_lanes_gpu_refusal(
 
 /// What a lane's pool launch must agree with: the lane's prologue / select
 /// scalars and key arenas.
-struct PoolExpect {
-    position: usize,
-    rows: usize,
-    compress: usize,
-    blocks: usize,
-    index_kv_width: usize,
-    raw_keys: *mut std::ffi::c_void,
-    pooled: *mut std::ffi::c_void,
+pub(super) struct PoolExpect {
+    pub(super) position: usize,
+    pub(super) rows: usize,
+    pub(super) compress: usize,
+    pub(super) blocks: usize,
+    pub(super) index_kv_width: usize,
+    pub(super) raw_keys: *mut std::ffi::c_void,
+    pub(super) pooled: *mut std::ffi::c_void,
+    /// Dtype of the raw and pooled index-key arenas (`QsaKvFormat::index_dtype`).
+    pub(super) index_dtype: DType,
 }
 
 /// Why a lane's pool launch (as the interpreter issues it) is not the one the
 /// lane kernels twin, or `None`.
-fn pool_refusal(
+pub(super) fn pool_refusal(
     pool: Option<&IndexedAttentionPoolRope<'_>>,
     expect: &PoolExpect,
 ) -> Option<&'static str> {
@@ -230,6 +275,7 @@ fn pool_refusal(
         index_kv_width,
         raw_keys,
         pooled,
+        index_dtype,
     } = *expect;
     let Some(p) = pool else {
         return (blocks != 0).then_some("no pool launch for a lane that completes blocks");
@@ -249,8 +295,8 @@ fn pool_refusal(
         || p.index_dim != index_kv_width
         || p.raw_keys.buf.as_ptr() != raw_keys
         || p.pooled.buf.as_ptr() != pooled
-        || p.raw_keys.dtype != DType::BF16
-        || p.pooled.dtype != DType::BF16
+        || p.raw_keys.dtype != index_dtype
+        || p.pooled.dtype != index_dtype
         || p.grid_bound < p.block_count
         || p.block_count == 0
         || p.index_dim == 0
@@ -274,12 +320,12 @@ fn pool_refusal(
 }
 
 /// Half-open byte ranges must be pairwise disjoint.
-fn disjoint(mut ranges: Vec<(usize, usize)>) -> bool {
+pub(super) fn disjoint(mut ranges: Vec<(usize, usize)>) -> bool {
     ranges.sort_unstable();
     ranges.windows(2).all(|w| w[0].1 <= w[1].0)
 }
 
-fn ptr(t: &GpuTensor) -> u64 {
+pub(super) fn ptr(t: &GpuTensor) -> u64 {
     t.buf.as_ptr() as usize as u64
 }
 
@@ -481,6 +527,7 @@ fn admit(gpu: &Gpu, lanes: &[QsaCoreLane<'_>]) -> HipResult<Option<QsaCoreLanesP
             index_kv_width: p.index_kv_width,
             raw_keys: p.raw_index_keys.buf.as_ptr(),
             pooled: s.pooled.buf.as_ptr(),
+            index_dtype: DType::BF16,
         };
         if pool_refusal(lane.pool.as_ref(), &expect).is_some() {
             return Ok(None);
@@ -720,6 +767,172 @@ impl QsaCoreLanesPlan {
         )?;
         Ok(())
     }
+
+    /// Whether [`Self::launch_fused`] can run this set: exactly one row per lane (the
+    /// fused core folds each lane's index path into one workgroup) and an LDS budget that
+    /// leaves room for the fused kernel's static LDS. `false` keeps [`Self::launch`].
+    pub fn fusable(&self) -> bool {
+        self.shape.max_rows == 1
+            && self.shape.select_lds + QSA_FUSE_LDS_MARGIN_BYTES
+                <= QSA_SELECT_DYNAMIC_LDS_LIMIT_BYTES
+    }
+
+    /// Kernel launches [`Self::launch_fused`] issues (the rotation is inside the second).
+    pub fn fused_launch_count(&self) -> usize {
+        2
+    }
+
+    /// Where each lane's rotated row lands for `rotate`, or `None` when the lanes do not
+    /// tile the out-projection's rows exactly (then no rotation is fused). Per lane:
+    /// `x_rot + row * k` with `row` the lane's row in `rotate.x`.
+    fn rotate_targets(&self, rotate: &QsaOutRotate<'_>) -> Option<[u64; QSA_CORE_LANES_MAX]> {
+        let c = &self.shape.common;
+        let k = c.heads.checked_mul(c.head_dim)?;
+        let k_bytes = k.checked_mul(std::mem::size_of::<f32>())?;
+        let lanes = self.shape.lanes;
+        if k == 0
+            || rotate.rows != lanes
+            || rotate.x.dtype != DType::F32
+            || rotate.x_rot.dtype != DType::F32
+            || rotate.x.numel() < rotate.rows.checked_mul(k)?
+            || rotate.x_rot.numel() < rotate.rows.checked_mul(k)?
+        {
+            return None;
+        }
+        let (x, x_rot) = (ptr(rotate.x), ptr(rotate.x_rot));
+        if x == x_rot {
+            return None;
+        }
+        let mut targets = [0u64; QSA_CORE_LANES_MAX];
+        let mut seen = [false; QSA_CORE_LANES_MAX];
+        for lane in 0..lanes {
+            let out = self.table.ptrs[NPTR - 1][lane];
+            let offset = out.checked_sub(x)? as usize;
+            if offset % k_bytes != 0 {
+                return None;
+            }
+            let row = offset / k_bytes;
+            if row >= lanes || seen[row] {
+                return None;
+            }
+            seen[row] = true;
+            targets[lane] = x_rot + (row * k_bytes) as u64;
+        }
+        Some(targets)
+    }
+
+    /// The admitted lanes as two launches (see `qsa_lanes_fuse.gfx1201.hip`): prologue +
+    /// pool + select, then attention + `mq_rotate_x`. Only for a [`Self::fusable`] set. With
+    /// `rotate` (the out-projection that follows) and lanes that tile its rows, the second
+    /// launch also writes the rotated rows into `rotate.x_rot` and records
+    /// `gpu.scratch.prerotated` exactly as the standalone rotation would, so the
+    /// out-projection's `rotate_x_mq_batched(x, x_rot, k, rows)` is skipped. Returns whether
+    /// the rotation was fused (the caller drops the memo after the out-projection).
+    pub fn launch_fused(self, gpu: &mut Gpu, rotate: Option<&QsaOutRotate<'_>>) -> HipResult<bool> {
+        if !self.fusable() {
+            return Err(HipError::new(0, "QSA lane set is not fusable"));
+        }
+        let targets = rotate.and_then(|r| self.rotate_targets(r));
+        let Self { shape, table } = self;
+        let c = &shape.common;
+        let n = checked_u32(shape.lanes, "QSA lane count")?;
+        let ints = |args: &mut KernargBlob, values: &[usize]| -> HipResult<()> {
+            for &v in values {
+                args.push_i32(checked_i32(v, "QSA lane argument")?);
+            }
+            Ok(())
+        };
+
+        gpu.ensure_kernel_public(
+            QSA_LANES_FUSE_MODULE,
+            QSA_LANES_FUSE_SRC,
+            QSA_LANES_FUSED_CORE_SYMBOL,
+        )?;
+        let (pool_norm, pool_yarn) = shape.pool.unwrap_or((0, c.yarn));
+        let mut args = KernargBlob::new();
+        for norm in [c.index_q_norm, c.q_norm, c.k_norm, pool_norm] {
+            args.push_u64(norm);
+        }
+        ints(
+            &mut args,
+            &[
+                c.index_heads,
+                c.index_dim,
+                c.index_kv_width,
+                c.heads,
+                c.kv_heads,
+                c.head_dim,
+                c.query_row_stride,
+                c.budget_blocks,
+                c.compress,
+                c.capacity,
+            ],
+        )?;
+        c.yarn.push(&mut args);
+        pool_yarn.push(&mut args);
+        table.push(&mut args);
+        args.pad_to(16);
+        gpu.launch_blob_recorded(
+            QSA_LANES_FUSED_CORE_SYMBOL,
+            [
+                checked_u32(c.heads + c.kv_heads + 2, "QSA fused core blocks")?,
+                1,
+                n,
+            ],
+            [256, 1, 1],
+            u32::try_from(shape.select_lds)
+                .map_err(|_| HipError::new(0, "QSA lane select LDS exceeds u32"))?,
+            args.as_mut_slice(),
+            crate::dispatch::ReplayLaunchBindings::NONE,
+        )?;
+
+        gpu.ensure_kernel_public(
+            QSA_LANES_FUSE_MODULE,
+            QSA_LANES_FUSE_SRC,
+            QSA_LANES_FUSED_ATTENTION_SYMBOL,
+        )?;
+        gpu.ensure_mq_signs()?;
+        let signs1 = gpu.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr() as usize as u64;
+        let signs2 = gpu.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr() as usize as u64;
+        let mut args = KernargBlob::new();
+        ints(
+            &mut args,
+            &[
+                shape.max_rows,
+                c.heads,
+                c.kv_heads,
+                c.head_dim,
+                c.budget_blocks,
+                c.compress,
+                c.capacity,
+                c.full_capacity,
+            ],
+        )?;
+        args.push_u64(signs1);
+        args.push_u64(signs2);
+        table.push(&mut args);
+        for lane in 0..QSA_CORE_LANES_MAX {
+            args.push_u64(targets.map_or(0, |t| t[lane]));
+        }
+        args.pad_to(16);
+        gpu.launch_blob_recorded(
+            QSA_LANES_FUSED_ATTENTION_SYMBOL,
+            [checked_u32(c.heads, "QSA lane attention heads")?, 1, n],
+            [256, 1, 1],
+            u32::try_from(shape.attention_lds)
+                .map_err(|_| HipError::new(0, "QSA lane attention LDS exceeds u32"))?,
+            args.as_mut_slice(),
+            crate::dispatch::ReplayLaunchBindings::NONE,
+        )?;
+        if let (Some(rotate), Some(_)) = (rotate, targets) {
+            let k = c.heads * c.head_dim;
+            let (x, x_rot) = (rotate.x.buf.as_ptr(), rotate.x_rot.buf.as_ptr());
+            gpu.invalidate_x_caches_for(x_rot);
+            gpu.scratch.prerotated = Some((x as usize, x_rot as usize, k * rotate.rows));
+            return Ok(true);
+        }
+        Ok(false)
+    }
 }
 
 #[cfg(test)]
@@ -737,18 +950,23 @@ mod tests {
     }
 
     #[test]
-    fn flag_is_off_by_default_and_exact_gfx1201_only() {
+    fn flag_is_off_by_default_and_exact_gfx1201_and_gfx942_only() {
         for arch in ["gfx1100", "gfx1151", "gfx1201", "gfx942"] {
             let flags = crate::feature_flags::FeatureFlags::for_test(arch);
             assert!(!flags.qwen4_qsa_lanes_enabled(), "{arch}: default off");
         }
-        let mut flags = crate::feature_flags::FeatureFlags::for_test("gfx1201");
-        flags.qwen4_qsa_lanes = true;
-        assert!(flags.qwen4_qsa_lanes_enabled());
-        for arch in ["gfx1100", "gfx1151", "gfx942"] {
+        for arch in ["gfx1201", "gfx942"] {
             let mut flags = crate::feature_flags::FeatureFlags::for_test(arch);
             flags.qwen4_qsa_lanes = true;
-            assert!(!flags.qwen4_qsa_lanes_enabled(), "{arch}: gfx1201 only");
+            assert!(flags.qwen4_qsa_lanes_enabled(), "{arch}");
+        }
+        for arch in ["gfx1100", "gfx1151"] {
+            let mut flags = crate::feature_flags::FeatureFlags::for_test(arch);
+            flags.qwen4_qsa_lanes = true;
+            assert!(
+                !flags.qwen4_qsa_lanes_enabled(),
+                "{arch}: gfx1201 and gfx942 only"
+            );
         }
     }
 
@@ -848,6 +1066,7 @@ mod tests {
             index_kv_width: 128,
             raw_keys: std::ptr::null_mut(),
             pooled: std::ptr::null_mut(),
+            index_dtype: DType::BF16,
         };
         // A lane that completes a block must launch the pool; one that
         // completes none launches none.

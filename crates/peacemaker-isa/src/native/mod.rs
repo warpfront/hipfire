@@ -20,14 +20,17 @@
 //! gfx10+ AMDHSA `s_code_end` padding): accepted once, after the last kernel, nothing may follow it
 //! in `.text`, and it is optional in the source (the typed [`link_encoded`] paths never add it).
 //!
-//! gfx942 (CDNA3, wave64) has no text front end here: its kernels are typed
-//! (`crate::cdna`), encoded by `peacemaker_cdna`, and linked through
-//! [`link_encoded`] / [`link_encoded_versioned`] as code object v5 or v6 with
-//! the same descriptor, metadata and ELF writers (the `.amdhsa_*` directive
+//! gfx942 (CDNA3, wave64) text goes through the same front end: every
+//! instruction is parsed by `peacemaker_cdna::text::parse_line` and encoded by
+//! `peacemaker_cdna` (the codec the typed `crate::cdna` builder uses), labels
+//! and branches resolve as on RDNA, and the kernels link as code object v5 or v6
+//! (as [`link_encoded`] / [`link_encoded_versioned`] do) with the same
+//! descriptor, metadata and ELF writers (the `.amdhsa_*` directive
 //! semantics are those of `llvm-mc -mcpu=gfx942`; see `descriptor`).
 mod descriptor;
 mod elf;
 mod metadata;
+mod regions;
 
 use crate::Arch;
 use peacemaker_ir::inst::Arch as IrArch;
@@ -48,15 +51,22 @@ fn ir_arch(arch: Arch) -> Result<IrArch, String> {
     match arch {
         Arch::Gfx1100 => Ok(IrArch::Gfx1100),
         Arch::Gfx1151 => Ok(IrArch::Gfx1151),
+        Arch::Gfx1200 => Ok(IrArch::Gfx1200),
         Arch::Gfx1201 => Ok(IrArch::Gfx1201),
-        Arch::Gfx942 => Err(
-            "gfx942 code is emitted by the typed cdna builder, not the RDNA text assembler".into(),
-        ),
+        Arch::Gfx942 => Err("gfx942 has no RDNA codec architecture".into()),
     }
 }
 
 /// Encode one instruction line (no label operands) onto `out`; returns its dword count.
 fn encode_into(line: &str, arch: Arch, out: &mut Vec<u32>) -> Result<usize, String> {
+    if let Some(cdna) = arch.cdna() {
+        // CDNA: the same typed parser and codec the checked cdna builder encodes with.
+        let inst =
+            peacemaker_cdna::text::parse_line(line, cdna).map_err(|e| format!("{line}: {e}"))?;
+        let before = out.len();
+        inst.encode(cdna, out).map_err(|e| format!("{line}: {e}"))?;
+        return Ok(out.len() - before);
+    }
     let inst = peacemaker_lift::text::parse_line(line, ir_arch(arch)?)
         .map_err(|e| format!("{line}: {e}"))?;
     let words = if arch.gfx12() {
@@ -101,9 +111,23 @@ fn code(line: &str) -> &str {
 
 /// Assemble and link builder source into a code object for `arch`.
 pub fn assemble(source: &str, arch: Arch) -> Result<Vec<u8>, String> {
+    assemble_with_regions(source, arch, &[])
+}
+
+/// Assemble with the dispatcher's explicitly tagged [`crate::plan::RegionProof`]s.
+///
+/// `.note.pm_regions` records the assembled label byte offsets, not the proof's
+/// IR instruction indices. Untagged regions are ignored; with none tagged the
+/// object is byte-identical to [`assemble`]. The fixed SGPR claims describe the
+/// lifted dispatcher ABI, so callers must only tag bodies obeying that ABI.
+pub fn assemble_with_regions(
+    source: &str,
+    arch: Arch,
+    region_proofs: &[crate::plan::RegionProof],
+) -> Result<Vec<u8>, String> {
     let mut section = Section::None;
     let mut target = false;
-    let mut version = false;
+    let mut version: Option<u32> = None;
     let mut kernels: Vec<Kernel<'_>> = Vec::new();
     // Kernel symbol attributes: (.protected, .globl, .type @function).
     let mut attributes: HashMap<&str, [bool; 3]> = HashMap::new();
@@ -129,12 +153,15 @@ pub fn assemble(source: &str, arch: Arch) -> Result<Vec<u8>, String> {
                 target = true;
             }
             ".amdhsa_code_object_version" => {
-                if rest != "6" {
-                    return Err(format!(
-                        "code object version {rest}: the native writer emits version 6"
-                    ));
-                }
-                version = true;
+                version = match (rest, arch.wave64()) {
+                    ("6", _) => Some(6),
+                    ("5", true) => Some(5),
+                    _ => {
+                        return Err(format!(
+                            "code object version {rest}: the native writer emits version 6 (5 or 6 on gfx942)"
+                        ))
+                    }
+                };
             }
             ".text" if rest.is_empty() => section = Section::Text,
             ".section" if rest == ".rodata,\"a\",@progbits" => section = Section::Rodata,
@@ -302,9 +329,9 @@ pub fn assemble(source: &str, arch: Arch) -> Result<Vec<u8>, String> {
             }
         }
     }
-    if !target || !version {
+    let Some(version) = version.filter(|_| target) else {
         return Err("missing .amdgcn_target or .amdhsa_code_object_version".into());
-    }
+    };
     if code_end == CodeEnd::Aligned {
         return Err("the end-of-text `.p2alignl` is not followed by its `.fill`".into());
     }
@@ -356,7 +383,15 @@ pub fn assemble(source: &str, arch: Arch) -> Result<Vec<u8>, String> {
             descriptor,
         });
     }
-    elf::link(arch, 6, &linked, &metadata, code_end == CodeEnd::Filled)
+    let region_bytes = regions::encode(region_proofs, &kernels, &labels)?;
+    elf::link_with_regions(
+        arch,
+        version,
+        &linked,
+        &metadata,
+        code_end == CodeEnd::Filled,
+        &region_bytes,
+    )
 }
 
 /// One kernel whose code is already encoded: the typed encoder's words (not text) plus
@@ -467,4 +502,67 @@ pub fn bundle(elf: &[u8], arch: Arch, host_target: &str) -> Vec<u8> {
         out.extend(payload);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn region_note_round_trip_uses_encoded_label_offsets() {
+        use crate::kernels::qsa_gather::{self, Kind, Spec};
+        use crate::plan::{RegionLiftInputs, RegionProof};
+        let emitted = qsa_gather::emit(Spec {
+            arch: Arch::Gfx1201,
+            kind: Kind::ALL[0],
+        })
+        .unwrap();
+        let source = emitted.s_text.replacen(
+            "\ts_endpgm",
+            ".Lt7_entry:\n\ts_mov_b32 s0, 0x12345678\n\ts_nop 0\n.Lt7_exit:\n\ts_endpgm",
+            1,
+        );
+        assert_ne!(source, emitted.s_text);
+        let plain = assemble(&source, Arch::Gfx1201).unwrap();
+        assert!(peacemaker_lift::regions_note::read_regions(&plain)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            plain,
+            assemble_with_regions(&source, Arch::Gfx1201, &[]).unwrap()
+        );
+        let proof = RegionProof {
+            name: "t7".into(),
+            entry_pc: usize::MAX,
+            exit_pc: usize::MAX,
+            template_id: Some(7),
+            lift_inputs: Some(RegionLiftInputs {
+                prefix: "t7".into(),
+                workgroup_x: 102,
+                workgroup_yz: 103,
+                block: 32,
+                dynamic_lds: 128,
+            }),
+            source_object_sha256: Some([0xab; 32]),
+            source_symbol: Some("standalone".into()),
+            ..Default::default()
+        };
+        let proofs = [proof];
+        let object = assemble_with_regions(&source, Arch::Gfx1201, &proofs).unwrap();
+        let records = peacemaker_lift::regions_note::read_regions(&object).unwrap();
+        assert_eq!(records.len(), 1);
+        let row = &records[0].regions[0];
+        assert_eq!(row.template_id, 7);
+        assert_eq!(row.exit_pc - row.entry_pc, 12); // literal word + two instructions
+        assert_eq!(row.prefix, "t7");
+        assert_eq!((row.wg_x, row.wg_yz), (102, 103));
+        assert_eq!((row.block, row.dynamic_lds), (32, 128));
+        assert_eq!(row.digest, [0xab; 32]);
+        assert_eq!(row.source_symbol, "standalone");
+        assert_eq!(records[0].dispatcher.kernargs_pair_low, 0);
+        assert_eq!(
+            object,
+            assemble_with_regions(&source, Arch::Gfx1201, &proofs).unwrap()
+        );
+    }
 }

@@ -61,7 +61,21 @@ static __device__ __forceinline__ int q8g11_slot(int r) {
     return (r & ~15) | (2 * (r & 7)) | ((r >> 3) & 1);
 }
 
-template <int BM, int BN, int WM, int WN>
+// Bit-level RN-even F32 -> BF16 -> F32 round trip, the exact operation of
+// `bf16_round_trip_f32_strided` (qwen4_bf16_round_trip.hip) and of `q8a8_bf16_rn` in
+// `gemm_q8_0_mmq_i8.gfx12.hip`: non-finite values pass through unchanged. The RBF16 kernels apply
+// it to each finished accumulator before the store, so the result equals the plain kernel followed
+// by the in-place round kernel.
+static __device__ __forceinline__ float q8g11_bf16_rn(float v) {
+    if (!isfinite(v)) return v;
+    union { float f; unsigned int u; } box;
+    box.f = v;
+    const unsigned int lsb = (box.u >> 16) & 1u;
+    box.u = (box.u + 0x7FFFu + lsb) & 0xFFFF0000u;
+    return box.f;
+}
+
+template <int BM, int BN, int WM, int WN, bool RBF16>
 static __device__ __forceinline__ void gemm_q8_0_mmq_i8_gfx11_body(
     const char*           __restrict__ Wq,
     const block_q8_1_mmq* __restrict__ Xq,
@@ -282,6 +296,16 @@ static __device__ __forceinline__ void gemm_q8_0_mmq_i8_gfx11_body(
 
     // Epilogue: acc[rg][nb][j] = Y[token = tile_n + wave_tok0 + nb*16 + m_lane]
     //                             [row   = tile_m + wave_row0 + rg*16 + 8*hi + j].
+    if constexpr (RBF16) {
+        #pragma unroll
+        for (int rg = 0; rg < RG; rg++) {
+            #pragma unroll
+            for (int nb = 0; nb < NB; nb++) {
+                #pragma unroll
+                for (int j = 0; j < 8; j++) acc[rg][nb][j] = q8g11_bf16_rn(acc[rg][nb][j]);
+            }
+        }
+    }
     const bool vec_ok = ((M & 7) == 0) && (((uintptr_t)Y & 15u) == 0);
     #pragma unroll
     for (int nb = 0; nb < NB; nb++) {
@@ -306,16 +330,19 @@ static __device__ __forceinline__ void gemm_q8_0_mmq_i8_gfx11_body(
     }
 }
 
-#define Q8G11_KERNEL(NAME, BM, BN, WM, WN)                                       \
+#define Q8G11_KERNEL(NAME, BM, BN, WM, WN, RBF16)                                     \
     extern "C" __global__ __launch_bounds__(2 * (BM), 2) void NAME(              \
         const char* __restrict__ Wq, const block_q8_1_mmq* __restrict__ Xq,      \
         float* __restrict__ Y, int M, int K, int N) {                            \
-        gemm_q8_0_mmq_i8_gfx11_body<BM, BN, WM, WN>(Wq, Xq, Y, M, K, N);         \
+        gemm_q8_0_mmq_i8_gfx11_body<BM, BN, WM, WN, RBF16>(Wq, Xq, Y, M, K, N);         \
     }
 
-Q8G11_KERNEL(gemm_q8_0_mmq_i8_gfx11_t64x64, 64, 64, 2, 2)
-Q8G11_KERNEL(gemm_q8_0_mmq_i8_gfx11_t64x128, 64, 128, 2, 2)
-Q8G11_KERNEL(gemm_q8_0_mmq_i8_gfx11_t128x128, 128, 128, 4, 2)
+Q8G11_KERNEL(gemm_q8_0_mmq_i8_gfx11_t64x64, 64, 64, 2, 2, false)
+Q8G11_KERNEL(gemm_q8_0_mmq_i8_gfx11_t64x128, 64, 128, 2, 2, false)
+Q8G11_KERNEL(gemm_q8_0_mmq_i8_gfx11_t128x128, 128, 128, 4, 2, false)
+Q8G11_KERNEL(gemm_q8_0_mmq_i8_gfx11_t64x64_bf16, 64, 64, 2, 2, true)
+Q8G11_KERNEL(gemm_q8_0_mmq_i8_gfx11_t64x128_bf16, 64, 128, 2, 2, true)
+Q8G11_KERNEL(gemm_q8_0_mmq_i8_gfx11_t128x128_bf16, 128, 128, 4, 2, true)
 
 #undef Q8G11_KERNEL
 
@@ -326,6 +353,9 @@ Q8G11_KERNEL(gemm_q8_0_mmq_i8_gfx11_t128x128, 128, 128, 4, 2)
 Q8G11_STUB(gemm_q8_0_mmq_i8_gfx11_t64x64)
 Q8G11_STUB(gemm_q8_0_mmq_i8_gfx11_t64x128)
 Q8G11_STUB(gemm_q8_0_mmq_i8_gfx11_t128x128)
+Q8G11_STUB(gemm_q8_0_mmq_i8_gfx11_t64x64_bf16)
+Q8G11_STUB(gemm_q8_0_mmq_i8_gfx11_t64x128_bf16)
+Q8G11_STUB(gemm_q8_0_mmq_i8_gfx11_t128x128_bf16)
 #undef Q8G11_STUB
 
 #endif

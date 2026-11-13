@@ -61,7 +61,9 @@ __global__ void gdn_chunk_prep_gfx11(
                 const float other = __shfl_up(pair, d, 32);
                 if (lane >= d) pair += other;
             }
-            const float before = pair - g0 - g1;
+            // Causal exclusive prefix (see gdn_chunk_scan_prep.gfx1201.hip).
+            float before = __shfl_up(pair, 1, 32);
+            if (lane == 0) before = 0.0f;
             if (r0 < rows) a[(long long)(chunk0 + r0) * GDN_CHUNK_HV + h] = before + g0;
             if (r1 < rows) a[(long long)(chunk0 + r1) * GDN_CHUNK_HV + h] = before + g0 + g1;
         }

@@ -283,14 +283,16 @@ pub(crate) mod support {
                         "src2_unused" => mask[1] |= 0x1ff << 18,
                         "src1_unused" => mask[1] |= 0x1ff << 9,
                         "w0_extra" | "wait_unused" => {
-                            if let Some(rule) = isa::lookup(Arch::Gfx1201, inst.op, inst.form)
+                            if let Some(rule) = isa::lookup_inst(Arch::Gfx1201, &inst)
+                                .ok()
                                 .and_then(|row| row.fields.iter().find(|r| r.name == field.name))
                             {
                                 mask[0] |= rule.mask;
                             }
                         }
                         "w1_extra" | "vsrc_unused" => {
-                            if let Some(rule) = isa::lookup(Arch::Gfx1201, inst.op, inst.form)
+                            if let Some(rule) = isa::lookup_inst(Arch::Gfx1201, &inst)
+                                .ok()
                                 .and_then(|row| row.fields.iter().find(|r| r.name == field.name))
                             {
                                 mask[1] |= rule.mask;
@@ -303,7 +305,7 @@ pub(crate) mod support {
             FormFields::None | FormFields::Vopd { .. } => {}
         }
         // Omitted op_sel modifiers (no 16-bit operand rows print none).
-        let row = isa::lookup(Arch::Gfx1201, inst.op, inst.form).unwrap();
+        let row = isa::lookup_inst(Arch::Gfx1201, &inst).ok().unwrap();
         let has16 = row.grammar.split(',').any(|part| part.ends_with(":16"));
         if !has16 && (inst.mods.op_sel != 0 || inst.mods.op_sel_hi != 0) {
             match inst.form {
@@ -364,7 +366,7 @@ pub(crate) mod support {
     /// printer omit rule), for semantic comparisons.
     pub(crate) fn masked_mods(inst: &Inst) -> peacemaker_ir::operand::Modifiers {
         let mut mods = inst.mods.clone();
-        let row = isa::lookup(Arch::Gfx1201, inst.op, inst.form).unwrap();
+        let row = isa::lookup_inst(Arch::Gfx1201, &inst).ok().unwrap();
         let has16 = row.grammar.split(',').any(|part| part.ends_with(":16"));
         if !has16 {
             mods.op_sel = 0;

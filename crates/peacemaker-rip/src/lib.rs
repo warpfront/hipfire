@@ -78,6 +78,7 @@ pub mod native;
 pub mod ops;
 pub mod preprocess;
 pub mod run;
+pub mod search;
 pub mod srcfmt;
 pub mod validate;
 pub mod value;
@@ -252,7 +253,11 @@ fn descriptor_int(text: &str, key: &str) -> Option<u32> {
 
 /// Wave size declared by the emitted kernel, never inferred from its architecture.
 pub(crate) fn wave_size_of(e: &Emitted) -> Option<u32> {
-    match descriptor_int(&e.s_text, ".amdhsa_wavefront_size32 ")? {
+    let wave32 = descriptor_int(&e.s_text, ".amdhsa_wavefront_size32 ");
+    if wave32.is_none() {
+        return descriptor_int(&e.s_text, ".wavefront_size: ");
+    }
+    match wave32? {
         0 => Some(64),
         1 => Some(32),
         _ => None,
@@ -365,7 +370,7 @@ pub fn check(source: &str, name: &str, arch: Arch, variant: &str) -> Checked {
 pub const DEFAULT_ARCHES: [Arch; 2] = [Arch::Gfx1151, Arch::Gfx1201];
 
 /// Every arch a `--arch` list or `--arch all` may name.
-pub const ALL_ARCHES: [Arch; 3] = [Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1201];
+pub const ALL_ARCHES: [Arch; 4] = [Arch::Gfx942, Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1201];
 
 /// Parse one arch name of a `--arch` list or a script's `const ARCHES`.
 pub fn parse_arch(name: &str) -> Result<Arch, String> {
@@ -433,7 +438,7 @@ pub fn symbol_of(e: &Emitted) -> Result<String, String> {
 }
 
 #[cfg(feature = "certify")]
-pub use certify::{certify, Certificate};
+pub use certify::{certify, objdump_spelling, Certificate};
 
 #[cfg(feature = "certify")]
 mod certify {
@@ -442,11 +447,70 @@ mod certify {
     use peacemaker_isa::{ledger_replay, pm_check};
     use std::path::Path;
 
+    /// `text` with the two spellings of an instruction operand that `llvm-objdump` never prints back
+    /// normalised, so the toolchain's parse-back (which compares the authored text with the disassembly
+    /// token for token) accepts a generator that spells them otherwise: a hex literal without leading zeros
+    /// (`0x07060302` is printed `0x7060302`) and no `offset:0`. Both denote the same encoding; only
+    /// instruction lines change (directives and labels start with `.` or end with `:`), and the object
+    /// assembled from either text is the same ELF (pinned per kernel by `tests/hc8_wmma_twin.rs`).
+    pub fn objdump_spelling(text: &str) -> String {
+        let mut out = String::with_capacity(text.len() + 1);
+        for line in text.lines() {
+            let t = line.trim_start();
+            if t.is_empty() || t.starts_with('.') || t.starts_with(';') || t.ends_with(':') {
+                out.push_str(line);
+            } else {
+                out.push_str(&instruction_spelling(line));
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    fn instruction_spelling(line: &str) -> String {
+        let c: Vec<char> = line.chars().collect();
+        let mut out = String::with_capacity(line.len());
+        let mut i = 0;
+        while i < c.len() {
+            if c[i] == '0'
+                && c.get(i + 1) == Some(&'x')
+                && (i == 0 || !c[i - 1].is_ascii_alphanumeric())
+            {
+                let mut j = i + 2;
+                while j < c.len() && c[j].is_ascii_hexdigit() {
+                    j += 1;
+                }
+                if j > i + 2 {
+                    let digits: String = c[i + 2..j].iter().collect();
+                    let trimmed = digits.trim_start_matches('0');
+                    out.push_str("0x");
+                    out.push_str(if trimmed.is_empty() { "0" } else { trimmed });
+                    i = j;
+                    continue;
+                }
+            }
+            out.push(c[i]);
+            i += 1;
+        }
+        // The disassembler omits a zero `offset:`.
+        let mut at = 0;
+        while let Some(p) = out[at..].find(" offset:0") {
+            let end = at + p + " offset:0".len();
+            if out[end..].chars().next().map_or(true, char::is_whitespace) {
+                out.replace_range(at + p..end, "");
+                at += p;
+            } else {
+                at = end;
+            }
+        }
+        out
+    }
+
     /// What certification proved about one symbol of a module.
     #[derive(Debug)]
     pub struct Certificate {
         pub symbol: String,
-        /// `pm_check::m7` report: lift identity and (empty) obligations.
+        /// Target-specific object report: RDNA M7, or CDNA typed lift/hazard/wait checks.
         pub m7: serde_json::Value,
     }
 
@@ -463,13 +527,43 @@ mod certify {
         module_name: &str,
         dir: &Path,
     ) -> Result<Vec<Certificate>, String> {
+        if arch == Arch::Gfx942 {
+            let elf = peacemaker_isa::native::assemble(text, arch)?;
+            let lifted = peacemaker_lift::cdna::lift_object(&elf)?;
+            if lifted.kernels.len() != emitted.len() {
+                return Err("CDNA certification: emitted/object kernel count differs".into());
+            }
+            let mut out = Vec::with_capacity(emitted.len());
+            for e in emitted {
+                let symbol = symbol_of(e)?;
+                let kernel = lifted
+                    .kernels
+                    .iter()
+                    .find(|k| k.image.name == symbol)
+                    .ok_or_else(|| format!("CDNA certification: missing symbol {symbol}"))?;
+                let checks = peacemaker_isa::cdna::lifted::certify(kernel)?;
+                out.push(Certificate {
+                    symbol,
+                    m7: serde_json::json!({
+                        "checker": "peacemaker_isa::cdna::lifted::certify",
+                        "lift": "byte-exact", "checks": checks
+                    }),
+                });
+            }
+            std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+            std::fs::write(dir.join(format!("{module_name}.s")), text)
+                .map_err(|e| e.to_string())?;
+            std::fs::write(dir.join(format!("{module_name}.hsaco")), elf)
+                .map_err(|e| e.to_string())?;
+            return Ok(out);
+        }
         for e in emitted {
             ledger_replay::replay_waits(&e.s_text, arch)
                 .map_err(|err| format!("{}: wait replay: {err}", e.proof.variant))?;
         }
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         let s = dir.join(format!("{module_name}.s"));
-        std::fs::write(&s, text).map_err(|e| format!("{}: {e}", s.display()))?;
+        std::fs::write(&s, objdump_spelling(text)).map_err(|e| format!("{}: {e}", s.display()))?;
         let build = build(
             &Toolchain::default(),
             &s,

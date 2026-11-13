@@ -529,88 +529,11 @@ pub(crate) fn resolve_model_path(input: &str) -> String {
     input.to_string()
 }
 
-// ─── GGUF input pipeline ────────────────────────────────────────────────────
+// ─── GGUF input detection ───────────────────────────────────────────────────
 
 /// True if the path points to a `.gguf` file on disk.
 pub(crate) fn is_gguf_input(p: &Path) -> bool {
     p.is_file() && p.extension().and_then(|e| e.to_str()) == Some("gguf")
-}
-
-/// Translate llama.cpp GGUF tensor names to the HuggingFace safetensors
-/// names that `hipfire_runtime::hfq::load_weights_hfq` expects. The mapping is
-/// the canonical llama.cpp ↔ HF convention.
-///
-/// Returns None for tensors that don't have a known safetensors equivalent
-/// (we then keep them under their GGUF name; the future loader can decide
-/// what to do, or they're skipped).
-pub(crate) fn gguf_to_safetensors_name(gguf_name: &str, arch_id: u32) -> Option<String> {
-    // Top-level tensors.
-    match gguf_name {
-        "token_embd.weight" => return Some("model.embed_tokens.weight".to_string()),
-        "output.weight" => return Some("lm_head.weight".to_string()),
-        "output_norm.weight" => return Some("model.norm.weight".to_string()),
-        _ => {}
-    }
-    // Per-layer: blk.{N}.<slot>.weight  →  model.layers.{N}.<slot>.weight
-    if let Some(rest) = gguf_name.strip_prefix("blk.") {
-        // rest = "{N}.<slot>.weight"
-        let dot = rest.find('.')?;
-        let layer_idx = &rest[..dot];
-        let slot_full = &rest[dot + 1..]; // "<slot>.weight"
-                                          // Drop the trailing ".weight" so we can rewrite slots like "attn_q"→"self_attn.q_proj".
-        let slot = slot_full.strip_suffix(".weight")?;
-        // Gemma 4 layers carry FOUR sandwich norms plus a per-layer scalar.
-        // The generic Llama slot map below assumes two norms and maps
-        // `ffn_norm` → post_attention_layernorm — correct for Llama, WRONG
-        // for gemma4 (that is the pre-FFN norm). The loader reads
-        // `{p}.layer_scalar` with NO `.weight` suffix (HF tensor name), so
-        // `layer_output_scale` needs an early return.
-        if arch_id == 13 {
-            match slot {
-                "post_attention_norm" => {
-                    return Some(format!(
-                        "model.layers.{layer_idx}.post_attention_layernorm.weight"
-                    ));
-                }
-                "ffn_norm" => {
-                    return Some(format!(
-                        "model.layers.{layer_idx}.pre_feedforward_layernorm.weight"
-                    ));
-                }
-                "post_ffw_norm" => {
-                    return Some(format!(
-                        "model.layers.{layer_idx}.post_feedforward_layernorm.weight"
-                    ));
-                }
-                "layer_output_scale" => {
-                    return Some(format!("model.layers.{layer_idx}.layer_scalar"));
-                }
-                _ => {}
-            }
-        }
-        let translated = match slot {
-            "attn_norm" => "input_layernorm".to_string(),
-            "ffn_norm" => "post_attention_layernorm".to_string(),
-            "attn_q" => "self_attn.q_proj".to_string(),
-            "attn_k" => "self_attn.k_proj".to_string(),
-            "attn_v" => "self_attn.v_proj".to_string(),
-            "attn_output" => "self_attn.o_proj".to_string(),
-            "attn_q_norm" => "self_attn.q_norm".to_string(),
-            "attn_k_norm" => "self_attn.k_norm".to_string(),
-            "ffn_gate" => "mlp.gate_proj".to_string(),
-            "ffn_up" => "mlp.up_proj".to_string(),
-            "ffn_down" => "mlp.down_proj".to_string(),
-            other => return Some(format!("model.layers.{layer_idx}.{other}.weight")),
-        };
-        return Some(format!("model.layers.{layer_idx}.{translated}.weight"));
-    }
-    None
-}
-
-/// True if the GGUF tensor's name is a 1D norm / RMSNorm scaling vector.
-/// These stay F16 in the .hfq (no benefit from quantization, precision-sensitive).
-pub(crate) fn gguf_is_norm_tensor(name: &str) -> bool {
-    name.contains("_norm") || name.contains("norm.weight")
 }
 
 /// Translate a hipfire safetensors-style tensor name to the ggml-style name
@@ -684,6 +607,80 @@ pub(crate) fn safetensors_to_ggml_name(name: &str) -> Option<String> {
     Some(format!("blk.{layer_idx}.{translated}.weight"))
 }
 
+/// Grouped-V-head geometry of a hybrid linear-attention model (Qwen3.5/3.6/3.8
+/// GatedDeltaNet).
+///
+/// llama.cpp's HF→GGUF converter reorders the `linear_attn.out_proj` **input**
+/// axis from HF's grouped order (`h = k_head * n_v_per_k + v_slot`) to ggml's
+/// tiled order (`t = v_slot * n_k_heads + k_head`) so `ggml_repeat` can replace
+/// the interleaved repeat (llama.cpp `conversion/qwen.py`,
+/// `_LinearAttentionVReorderBase`, PR #19468). An imatrix produced on that GGUF
+/// therefore stores `ssm_out.in_sum2` in tiled order, while the HF weight (and
+/// this quantizer) consume grouped order. AWQ pre-scales HF columns, so the
+/// tiled vector MUST be mapped back to grouped order first; otherwise every
+/// 128-channel head block gets another head's scale.
+///
+/// Only `out_proj`'s input axis is affected. `in_proj_{qkv,z,a,b}`, `conv1d`,
+/// `A_log` and `dt_bias` are reordered along their output axis, which does not
+/// touch `in_sum2` (a per-input-channel statistic).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LaHeadOrder {
+    pub n_k_heads: usize,
+    pub n_v_per_k: usize,
+    pub head_v_dim: usize,
+}
+
+impl LaHeadOrder {
+    /// Length of the out_proj input axis (`n_k_heads * n_v_heads * head_v_dim`).
+    pub(crate) fn span(&self) -> usize {
+        self.n_k_heads * self.n_v_per_k * self.head_v_dim
+    }
+
+    /// Tiled (llama.cpp / imatrix) head index for a grouped (HF) head index.
+    pub(crate) fn tiled_index(&self, hf_head: usize) -> usize {
+        (hf_head % self.n_v_per_k) * self.n_k_heads + hf_head / self.n_v_per_k
+    }
+
+    /// Re-index a tiled imatrix vector into HF grouped order.
+    pub(crate) fn to_grouped(&self, raw: &[f32]) -> Result<Vec<f32>, String> {
+        if raw.len() != self.span() {
+            return Err(format!(
+                "length {} != n_k_heads({}) * n_v_per_k({}) * head_v_dim({}) = {}",
+                raw.len(),
+                self.n_k_heads,
+                self.n_v_per_k,
+                self.head_v_dim,
+                self.span()
+            ));
+        }
+        let d = self.head_v_dim;
+        let mut out = vec![0.0f32; raw.len()];
+        for h in 0..self.n_k_heads * self.n_v_per_k {
+            let t = self.tiled_index(h);
+            out[h * d..(h + 1) * d].copy_from_slice(&raw[t * d..(t + 1) * d]);
+        }
+        Ok(out)
+    }
+}
+
+/// Read the linear-attention geometry from a model config. Returns `None` when
+/// the checkpoint has no grouped V heads (no `linear_*` fields, or
+/// `n_v_heads == n_k_heads`, where tiled and grouped order coincide).
+pub(crate) fn la_head_geometry(config: &serde_json::Value) -> Option<LaHeadOrder> {
+    let text = config.get("text_config").unwrap_or(config);
+    let n_k_heads = text.get("linear_num_key_heads")?.as_u64()? as usize;
+    let n_v_heads = text.get("linear_num_value_heads")?.as_u64()? as usize;
+    let head_v_dim = text.get("linear_value_head_dim")?.as_u64()? as usize;
+    if n_k_heads == 0 || head_v_dim == 0 || n_v_heads % n_k_heads != 0 {
+        return None;
+    }
+    Some(LaHeadOrder {
+        n_k_heads,
+        n_v_per_k: n_v_heads / n_k_heads,
+        head_v_dim,
+    })
+}
+
 /// Load an llama.cpp-compatible imatrix GGUF file and build a lookup
 /// keyed by ggml-style tensor name. The GGUF stores per-linear-layer
 /// pairs:
@@ -695,17 +692,38 @@ pub(crate) fn safetensors_to_ggml_name(name: &str) -> Option<String> {
 /// (Qwen3.5 dense + Qwen3.6 dense are the first cohort targets; A3B MoE
 /// is deferred to a future iteration that handles n_mat > 1).
 ///
-/// Returns `HashMap<ggml_name, Vec<f32>>` with the .in_sum2 values keyed by
-/// the BASE tensor name (the ".in_sum2" suffix stripped).
-pub(crate) fn load_imatrix(path: &Path, fix_la_head_order: bool) -> HashMap<String, Vec<f32>> {
+/// Loaded imatrix table plus the non-fatal observations the caller logs.
+/// Fail-closed problems (bad file, unusable geometry, wrong length) are the
+/// `Err` side of [`load_imatrix`] so tests can assert them without stderr.
+#[derive(Debug)]
+pub(crate) struct ImatrixLoad {
+    pub table: HashMap<String, Vec<f32>>,
+    pub warnings: Vec<String>,
+}
+
+/// Returns `Ok(ImatrixLoad)` keyed by the BASE tensor name (the ".in_sum2"
+/// suffix stripped); `Err` is an operator-facing fail-closed message.
+pub(crate) fn load_imatrix(
+    path: &Path,
+    la: Option<LaHeadOrder>,
+    apply_la_head_fix: bool,
+) -> Result<ImatrixLoad, String> {
     use gguf_input::GgmlType;
-    let gguf = gguf_input::GgufFile::open(path).unwrap_or_else(|e| {
-        eprintln!("error: failed to open imatrix file {}: {e}", path.display());
-        std::process::exit(1);
-    });
+    let gguf = gguf_input::GgufFile::open(path)
+        .map_err(|e| format!("failed to open imatrix file {}: {e}", path.display()))?;
+    if apply_la_head_fix && la.is_none() {
+        return Err(
+            "--awq-fix-la-head-order needs a model config with linear_num_key_heads / \
+             linear_num_value_heads / linear_value_head_dim (Qwen3.5+ GatedDeltaNet); this \
+             checkpoint exposes none, so the V-head geometry cannot be derived"
+                .into(),
+        );
+    }
 
     let mut map: HashMap<String, Vec<f32>> = HashMap::new();
+    let mut warnings: Vec<String> = Vec::new();
     let mut fixed_la_out = 0usize;
+    let mut la_out_entries = 0usize;
     let mut total_entries = 0usize;
     let mut skipped_moe = 0usize;
     for t in &gguf.tensors {
@@ -714,10 +732,10 @@ pub(crate) fn load_imatrix(path: &Path, fix_la_head_order: bool) -> HashMap<Stri
             None => continue, // ignore .counts and any other entries
         };
         if t.dtype != GgmlType::F32 {
-            eprintln!(
+            warnings.push(format!(
                 "warning: imatrix entry {} has non-F32 dtype {:?}; skipping",
                 t.name, t.dtype
-            );
+            ));
             continue;
         }
         // Shape is [k] (1D) for non-MoE; [k, n_mat] for MoE. Skip multi-mat
@@ -741,37 +759,48 @@ pub(crate) fn load_imatrix(path: &Path, fix_la_head_order: bool) -> HashMap<Stri
                 data[off + 3],
             ]));
         }
-        if fix_la_head_order
-            && (name.ends_with(".linear_attn.out_proj.weight") || name.ends_with(".ssm_out.weight"))
-        {
-            assert_eq!(
-                k,
-                48 * 128,
-                "{name}: Qwen3.8 LA out_proj must have 48 V-heads x 128"
-            );
-            let raw = values;
-            values = vec![0.0; k];
-            // llama.cpp stores three V heads per K head (V-major/K-minor);
-            // HF out_proj columns use K-major/V-minor. HF head h reads raw
-            // head (h % 3)*16 + h/3. No reordering of W or runtime sidecar.
-            for h in 0..48 {
-                let raw_h = (h % 3) * 16 + h / 3;
-                values[h * 128..(h + 1) * 128]
-                    .copy_from_slice(&raw[raw_h * 128..(raw_h + 1) * 128]);
+        if name.ends_with(".linear_attn.out_proj.weight") || name.ends_with(".ssm_out.weight") {
+            la_out_entries += 1;
+            if apply_la_head_fix {
+                let order = la.expect("geometry checked before the loop");
+                match order.to_grouped(&values) {
+                    Ok(fixed) => {
+                        values = fixed;
+                        fixed_la_out += 1;
+                    }
+                    Err(error) => {
+                        return Err(format!("--awq-fix-la-head-order: {name}: {error}"));
+                    }
+                }
             }
-            fixed_la_out += 1;
         }
         map.insert(name, values);
         total_entries += 1;
     }
-    if fix_la_head_order {
-        assert_eq!(
-            fixed_la_out, 48,
-            "Qwen3.8 LA imatrix head fix expected 48 out_proj tensors, found {fixed_la_out}"
-        );
+    if apply_la_head_fix {
+        let order = la.expect("geometry checked before the loop");
+        if fixed_la_out == 0 {
+            return Err(
+                "--awq-fix-la-head-order matched no linear-attention out_proj entries; \
+                 the imatrix carries none (or none survived the dense filter)"
+                    .into(),
+            );
+        }
         eprintln!(
-            "imatrix: corrected V-head order for {fixed_la_out} linear-attention out_proj tensors"
+            "imatrix: re-indexed llama.cpp tiled V-head order -> HF grouped order on \
+             {fixed_la_out} linear-attention out_proj tensors (n_k_heads={}, n_v_per_k={}, \
+             head_v_dim={})",
+            order.n_k_heads, order.n_v_per_k, order.head_v_dim
         );
+    } else if let Some(order) = la {
+        if order.n_v_per_k > 1 && la_out_entries > 0 {
+            warnings.push(format!(
+                "imatrix: {la_out_entries} linear-attention out_proj entries carry llama.cpp's \
+                 tiled V-head order; pass --awq-fix-la-head-order to re-index them to HF grouped \
+                 order for AWQ (n_k_heads={}, n_v_per_k={}, head_v_dim={})",
+                order.n_k_heads, order.n_v_per_k, order.head_v_dim
+            ));
+        }
     }
 
     eprintln!(
@@ -792,11 +821,13 @@ pub(crate) fn load_imatrix(path: &Path, fix_la_head_order: bool) -> HashMap<Stri
                  dense table empty (MoE-only imatrix; expert AWQ uses the raw GGUF)"
             );
         } else {
-            eprintln!("error: imatrix file contains no usable .in_sum2 entries");
-            std::process::exit(1);
+            return Err("imatrix file contains no usable .in_sum2 entries".into());
         }
     }
-    map
+    Ok(ImatrixLoad {
+        table: map,
+        warnings,
+    })
 }
 
 /// Look up imatrix per-channel weights for a given safetensors tensor name.
@@ -1731,718 +1762,6 @@ pub(crate) fn awq_eligible(name: &str) -> bool {
     f1_match || f2_match
 }
 
-/// True if the tensor is the token embedding. We Q8 these (matches the
-/// safetensors path's `is_embed` rule — Q4 is too lossy for embedding tables).
-pub(crate) fn gguf_is_embed_tensor(name: &str) -> bool {
-    name == "token_embd.weight"
-}
-
-/// Build the `config` JSON object that `hipfire_runtime::hfq::config_from_hfq`
-/// reads. Mirrors the field names HuggingFace uses in `config.json` for
-/// LlamaForCausalLM / Qwen3ForCausalLM, populated from the GGUF
-/// `<arch>.*` metadata keys.
-pub(crate) fn config_json_from_gguf(
-    gguf: &gguf_input::GgufFile,
-    arch_str: &str,
-    arch_id: u32,
-) -> serde_json::Value {
-    // GGUF prefixes its model hyperparameters with the architecture name —
-    // e.g. for `general.architecture=llama` the keys live under `llama.*`.
-    let prefix = arch_str;
-
-    let read_u = |k: &str| -> Option<u64> {
-        gguf.metadata.get(k).and_then(|v| match v {
-            gguf_input::MetaValue::U8(x) => Some(*x as u64),
-            gguf_input::MetaValue::I8(x) => Some(*x as u64),
-            gguf_input::MetaValue::U16(x) => Some(*x as u64),
-            gguf_input::MetaValue::I16(x) => Some(*x as u64),
-            gguf_input::MetaValue::U32(x) => Some(*x as u64),
-            gguf_input::MetaValue::I32(x) => Some(*x as u64),
-            gguf_input::MetaValue::U64(x) => Some(*x),
-            gguf_input::MetaValue::I64(x) => Some(*x as u64),
-            _ => None,
-        })
-    };
-    let read_f = |k: &str| -> Option<f64> {
-        gguf.metadata.get(k).and_then(|v| match v {
-            gguf_input::MetaValue::F32(x) => Some(*x as f64),
-            gguf_input::MetaValue::F64(x) => Some(*x),
-            _ => None,
-        })
-    };
-
-    let dim = read_u(&format!("{prefix}.embedding_length"));
-    let n_layers = read_u(&format!("{prefix}.block_count"));
-    let n_heads = read_u(&format!("{prefix}.attention.head_count"));
-    let n_kv_heads = read_u(&format!("{prefix}.attention.head_count_kv")).or(n_heads);
-    let hidden_dim = read_u(&format!("{prefix}.feed_forward_length"));
-    // vocab_size: prefer metadata, fall back to token_embd shape[1].
-    let vocab_size = read_u(&format!("{prefix}.vocab_size")).or_else(|| {
-        gguf.tensors
-            .iter()
-            .find(|t| t.name == "token_embd.weight")
-            .and_then(|t| t.shape.get(1).map(|&s| s as u64))
-    });
-    let max_seq_len = read_u(&format!("{prefix}.context_length"));
-    let rope_theta = read_f(&format!("{prefix}.rope.freq_base"));
-    let rms_eps = read_f(&format!("{prefix}.attention.layer_norm_rms_epsilon"));
-    let head_dim = read_u(&format!("{prefix}.attention.key_length")).or_else(|| {
-        // Fall back: head_dim = dim / n_heads.
-        dim.zip(n_heads).map(|(d, h)| if h > 0 { d / h } else { d })
-    });
-    let bos = read_u("tokenizer.ggml.bos_token_id").unwrap_or(1);
-    let eos = read_u("tokenizer.ggml.eos_token_id").unwrap_or(2);
-
-    let mut cfg = serde_json::Map::new();
-    cfg.insert(
-        "model_type".to_string(),
-        serde_json::Value::from(arch_str.to_string()),
-    );
-    if let Some(v) = dim {
-        cfg.insert("hidden_size".to_string(), serde_json::Value::from(v));
-    }
-    if let Some(v) = n_layers {
-        cfg.insert("num_hidden_layers".to_string(), serde_json::Value::from(v));
-    }
-    if let Some(v) = n_heads {
-        cfg.insert(
-            "num_attention_heads".to_string(),
-            serde_json::Value::from(v),
-        );
-    }
-    if let Some(v) = n_kv_heads {
-        cfg.insert(
-            "num_key_value_heads".to_string(),
-            serde_json::Value::from(v),
-        );
-    }
-    if let Some(v) = hidden_dim {
-        cfg.insert("intermediate_size".to_string(), serde_json::Value::from(v));
-    }
-    if let Some(v) = vocab_size {
-        cfg.insert("vocab_size".to_string(), serde_json::Value::from(v));
-    }
-    if let Some(v) = max_seq_len {
-        cfg.insert(
-            "max_position_embeddings".to_string(),
-            serde_json::Value::from(v),
-        );
-    }
-    if let Some(v) = rope_theta {
-        cfg.insert("rope_theta".to_string(), serde_json::Value::from(v));
-    }
-    if let Some(v) = rms_eps {
-        cfg.insert("rms_norm_eps".to_string(), serde_json::Value::from(v));
-    }
-    if let Some(v) = head_dim {
-        cfg.insert("head_dim".to_string(), serde_json::Value::from(v));
-    }
-    if arch_id == 13 {
-        apply_gemma4_fields(gguf, prefix, &mut cfg);
-    }
-    cfg.insert("bos_token_id".to_string(), serde_json::Value::from(bos));
-    cfg.insert("eos_token_id".to_string(), serde_json::Value::from(eos));
-    serde_json::Value::Object(cfg)
-}
-
-/// Translate gemma4-specific GGUF metadata into the `text_config` fields the
-/// `hipfire-arch-gemma4` loader expects. The generic `config_json_from_gguf`
-/// path only reads Llama-style scalar keys; gemma4 stores its layout as arrays
-/// and dual sliding/full keys that the generic reads miss or misread:
-///
-/// - `attention.sliding_window_pattern` (bool array) -> `layer_types`
-///   (the loader hard-requires it; GGUF has no `layer_types` key).
-/// - `attention.head_count_kv` is an ARRAY (8 sliding / 1 full layers);
-///   the generic scalar read fails and falls back to n_heads. Split it into
-///   `num_key_value_heads` (sliding) / `num_global_key_value_heads` (full).
-/// - `attention.key_length` = 512 is the FULL head dim; sliding is
-///   `key_length_swa` = 256. Generic wrote key_length into `head_dim`.
-/// - Dual rope: `rope.freq_base_swa` (10k) vs `rope.freq_base` (1M) plus
-///   proportional partial rotary on full layers -> `rope_parameters`.
-/// - `attention_k_eq_v`: 12B-class checkpoints ship no `attn_v` tensor on
-///   full layers (V = pre-k_norm K). Detect from the tensor table.
-fn apply_gemma4_fields(
-    gguf: &gguf_input::GgufFile,
-    prefix: &str,
-    cfg: &mut serde_json::Map<String, serde_json::Value>,
-) {
-    let read_u = |k: &str| -> Option<u64> {
-        gguf.metadata.get(k).and_then(|v| match v {
-            gguf_input::MetaValue::U8(x) => Some(*x as u64),
-            gguf_input::MetaValue::I8(x) => Some(*x as u64),
-            gguf_input::MetaValue::U16(x) => Some(*x as u64),
-            gguf_input::MetaValue::I16(x) => Some(*x as u64),
-            gguf_input::MetaValue::U32(x) => Some(*x as u64),
-            gguf_input::MetaValue::I32(x) => Some(*x as u64),
-            gguf_input::MetaValue::U64(x) => Some(*x),
-            gguf_input::MetaValue::I64(x) => Some(*x as u64),
-            _ => None,
-        })
-    };
-    let read_f = |k: &str| -> Option<f64> {
-        gguf.metadata.get(k).and_then(|v| match v {
-            gguf_input::MetaValue::F32(x) => Some(*x as f64),
-            gguf_input::MetaValue::F64(x) => Some(*x),
-            _ => None,
-        })
-    };
-    let read_arr_u = |k: &str| -> Option<Vec<u64>> {
-        gguf.metadata.get(k).and_then(|v| match v {
-            gguf_input::MetaValue::Array(arr) => arr
-                .iter()
-                .map(|item| match item {
-                    gguf_input::MetaValue::U8(x) => Some(*x as u64),
-                    gguf_input::MetaValue::I8(x) => Some(*x as u64),
-                    gguf_input::MetaValue::U16(x) => Some(*x as u64),
-                    gguf_input::MetaValue::I16(x) => Some(*x as u64),
-                    gguf_input::MetaValue::U32(x) => Some(*x as u64),
-                    gguf_input::MetaValue::I32(x) => Some(*x as u64),
-                    gguf_input::MetaValue::U64(x) => Some(*x),
-                    gguf_input::MetaValue::I64(x) => Some(*x as u64),
-                    _ => None,
-                })
-                .collect::<Option<Vec<u64>>>(),
-            _ => None,
-        })
-    };
-    let ins_u = |cfg: &mut serde_json::Map<String, serde_json::Value>, k: &str, v: u64| {
-        cfg.insert(k.to_string(), serde_json::Value::from(v));
-    };
-    let ins_f = |cfg: &mut serde_json::Map<String, serde_json::Value>, k: &str, v: f64| {
-        cfg.insert(k.to_string(), serde_json::Value::from(v));
-    };
-
-    // ── layer_types from the sliding-window pattern (required by loader) ──
-    // GGUF: true = sliding, false = full (global). Loader strings:
-    // "sliding_attention" / "full_attention".
-    let pattern = gguf
-        .metadata
-        .get(&format!("{prefix}.attention.sliding_window_pattern"))
-        .and_then(|v| match v {
-            gguf_input::MetaValue::Array(arr) => arr
-                .iter()
-                .map(|item| match item {
-                    gguf_input::MetaValue::Bool(b) => Some(*b),
-                    _ => None,
-                })
-                .collect::<Option<Vec<bool>>>(),
-            _ => None,
-        });
-    let full_layer_indices: Vec<usize> = pattern
-        .as_ref()
-        .map(|p| {
-            p.iter()
-                .enumerate()
-                .filter(|(_, b)| !**b)
-                .map(|(i, _)| i)
-                .collect()
-        })
-        .unwrap_or_default();
-    if let Some(p) = &pattern {
-        let layer_types: Vec<&str> = p
-            .iter()
-            .map(|&b| {
-                if b {
-                    "sliding_attention"
-                } else {
-                    "full_attention"
-                }
-            })
-            .collect();
-        cfg.insert(
-            "layer_types".to_string(),
-            serde_json::Value::Array(
-                layer_types
-                    .into_iter()
-                    .map(serde_json::Value::from)
-                    .collect(),
-            ),
-        );
-    }
-
-    // ── KV heads: array form is per-layer (sliding/full differ) ──
-    let kv_arr = read_arr_u(&format!("{prefix}.attention.head_count_kv"));
-    match (&kv_arr, &pattern) {
-        (Some(arr), Some(p)) if arr.len() == p.len() && !arr.is_empty() => {
-            // Sliding value: first element at a sliding index (pattern true).
-            if let Some((_, &v)) = p.iter().zip(arr.iter()).find(|(&b, _)| b) {
-                ins_u(cfg, "num_key_value_heads", v);
-            }
-            // Full value: element at a full index (pattern false).
-            if let Some((_, &v)) = p.iter().zip(arr.iter()).find(|(&b, _)| !b) {
-                ins_u(cfg, "num_global_key_value_heads", v);
-            }
-        }
-        _ => {}
-    }
-
-    // ── Head dims: key_length is the FULL dim; key_length_swa is sliding ──
-    if let Some(v) = read_u(&format!("{prefix}.attention.key_length_swa")) {
-        ins_u(cfg, "head_dim", v);
-    }
-    if let Some(v) = read_u(&format!("{prefix}.attention.key_length")) {
-        ins_u(cfg, "global_head_dim", v);
-    }
-
-    // ── Simple scalar carries the generic path missed ──
-    if let Some(v) = read_u(&format!("{prefix}.attention.sliding_window")) {
-        ins_u(cfg, "sliding_window", v);
-    }
-    if let Some(v) = read_u(&format!("{prefix}.attention.shared_kv_layers")) {
-        ins_u(cfg, "num_kv_shared_layers", v);
-    }
-    if let Some(v) = read_u(&format!("{prefix}.embedding_length_per_layer_input")) {
-        ins_u(cfg, "hidden_size_per_layer_input", v);
-    }
-    if let Some(v) = read_f(&format!("{prefix}.final_logit_softcapping")) {
-        ins_f(cfg, "final_logit_softcapping", v);
-    }
-
-    // ── Dual rope parameters ──
-    // Sliding: default rope at freq_base_swa (10k). Full: proportional
-    // partial rotary at freq_base (1M). partial_rotary_factor has no GGUF
-    // key in the wild; 0.25 is the family constant (arch config documents
-    // it alongside the 1M full theta) — read the GGUF key if a exporter
-    // ever ships one.
-    let sliding_theta = read_f(&format!("{prefix}.rope.freq_base_swa"));
-    let full_theta = read_f(&format!("{prefix}.rope.freq_base"));
-    if sliding_theta.is_some() || full_theta.is_some() {
-        let partial = read_f(&format!("{prefix}.rope.partial_rotary_factor"));
-        let mut sliding = serde_json::Map::new();
-        if let Some(t) = sliding_theta {
-            sliding.insert("rope_theta".to_string(), serde_json::Value::from(t));
-        }
-        sliding.insert("rope_type".to_string(), serde_json::Value::from("default"));
-        let mut full = serde_json::Map::new();
-        if let Some(t) = full_theta {
-            full.insert("rope_theta".to_string(), serde_json::Value::from(t));
-        }
-        full.insert(
-            "rope_type".to_string(),
-            serde_json::Value::from("proportional"),
-        );
-        full.insert(
-            "partial_rotary_factor".to_string(),
-            serde_json::Value::from(partial.unwrap_or(0.25)),
-        );
-        let mut rp = serde_json::Map::new();
-        rp.insert(
-            "sliding_attention".to_string(),
-            serde_json::Value::Object(sliding),
-        );
-        rp.insert(
-            "full_attention".to_string(),
-            serde_json::Value::Object(full),
-        );
-        cfg.insert("rope_parameters".to_string(), serde_json::Value::Object(rp));
-    }
-
-    // ── attention_k_eq_v: no attn_v tensor on full layers (12B class) ──
-    if let Some(&first_full) = full_layer_indices.first() {
-        let has_v_on_full = gguf
-            .tensors
-            .iter()
-            .any(|t| t.name == format!("blk.{first_full}.attn_v.weight"));
-        if !has_v_on_full {
-            cfg.insert(
-                "attention_k_eq_v".to_string(),
-                serde_json::Value::from(true),
-            );
-        }
-    }
-}
-
-/// Translate the GGUF metadata HashMap into a JSON object that ends up in
-/// the `.hfq` header's metadata blob. A future engine-side `from_hfq` for
-/// Llama-style models can read these fields the same way the existing
-/// `from_gguf` reads them today.
-pub(crate) fn gguf_meta_to_json(
-    meta: &HashMap<String, gguf_input::MetaValue>,
-) -> serde_json::Value {
-    let mut map = serde_json::Map::new();
-    for (k, v) in meta {
-        let json_v = mv_to_json(v);
-        map.insert(k.clone(), json_v);
-    }
-    serde_json::Value::Object(map)
-}
-
-pub(crate) fn mv_to_json(v: &gguf_input::MetaValue) -> serde_json::Value {
-    use gguf_input::MetaValue as MV;
-    match v {
-        MV::U8(x) => serde_json::Value::from(*x),
-        MV::I8(x) => serde_json::Value::from(*x),
-        MV::U16(x) => serde_json::Value::from(*x),
-        MV::I16(x) => serde_json::Value::from(*x),
-        MV::U32(x) => serde_json::Value::from(*x),
-        MV::I32(x) => serde_json::Value::from(*x),
-        MV::F32(x) => serde_json::Value::from(*x),
-        MV::Bool(x) => serde_json::Value::from(*x),
-        MV::String(s) => serde_json::Value::from(s.clone()),
-        MV::U64(x) => serde_json::Value::from(*x),
-        MV::I64(x) => serde_json::Value::from(*x),
-        MV::F64(x) => serde_json::Value::from(*x),
-        // Tokenizer arrays (tokens, scores, merges, ...) can be huge —
-        // serialize them as JSON arrays so the engine side can re-parse.
-        MV::Array(arr) => serde_json::Value::Array(arr.iter().map(mv_to_json).collect()),
-    }
-}
-#[cfg(test)]
-mod gemma4_config_tests {
-    use crate::calibration::config_json_from_gguf;
-    use crate::gguf_input::{GgufFile, MetaValue, TensorInfo};
-    use std::collections::HashMap;
-
-    /// Metadata + tensor table mirroring the real gemma-4-12b GGUF layout
-    /// (48 layers, 5:1 sliding:full, per-layer kv array, dual rope, no
-    /// attn_v on full layers). Values taken from a production file.
-    fn gemma4_12b_gguf() -> GgufFile {
-        let mut m: HashMap<String, MetaValue> = HashMap::new();
-        let kv_arr: Vec<MetaValue> = (0..48)
-            .map(|i| MetaValue::U32(if i % 6 == 5 { 1 } else { 8 }))
-            .collect();
-        let pattern: Vec<MetaValue> = (0..48).map(|i| MetaValue::Bool(i % 6 != 5)).collect();
-        m.insert("gemma4.attention.head_count".into(), MetaValue::U32(16));
-        m.insert(
-            "gemma4.attention.head_count_kv".into(),
-            MetaValue::Array(kv_arr),
-        );
-        m.insert("gemma4.attention.key_length".into(), MetaValue::U32(512));
-        m.insert(
-            "gemma4.attention.key_length_swa".into(),
-            MetaValue::U32(256),
-        );
-        m.insert(
-            "gemma4.attention.layer_norm_rms_epsilon".into(),
-            MetaValue::F32(1e-6),
-        );
-        m.insert(
-            "gemma4.attention.shared_kv_layers".into(),
-            MetaValue::U32(0),
-        );
-        m.insert(
-            "gemma4.attention.sliding_window".into(),
-            MetaValue::U32(1024),
-        );
-        m.insert(
-            "gemma4.attention.sliding_window_pattern".into(),
-            MetaValue::Array(pattern),
-        );
-        m.insert("gemma4.block_count".into(), MetaValue::U32(48));
-        m.insert("gemma4.context_length".into(), MetaValue::U32(262144));
-        m.insert("gemma4.embedding_length".into(), MetaValue::U32(3840));
-        m.insert(
-            "gemma4.embedding_length_per_layer_input".into(),
-            MetaValue::U32(0),
-        );
-        m.insert("gemma4.feed_forward_length".into(), MetaValue::U32(15360));
-        m.insert(
-            "gemma4.final_logit_softcapping".into(),
-            MetaValue::F32(30.0),
-        );
-        m.insert("gemma4.rope.freq_base".into(), MetaValue::F64(1_000_000.0));
-        m.insert("gemma4.rope.freq_base_swa".into(), MetaValue::F64(10_000.0));
-        m.insert(
-            "general.architecture".into(),
-            MetaValue::String("gemma4".into()),
-        );
-
-        let mut tensors = vec![TensorInfo {
-            name: "token_embd.weight".into(),
-            shape: vec![3840, 262144],
-            ..fake_tensor()
-        }];
-        for i in 0..48 {
-            tensors.push(TensorInfo {
-                name: format!("blk.{i}.attn_k.weight"),
-                ..fake_tensor()
-            });
-            if i % 6 != 5 {
-                // v tensor only on sliding layers (12B k_eq_v layout).
-                tensors.push(TensorInfo {
-                    name: format!("blk.{i}.attn_v.weight"),
-                    ..fake_tensor()
-                });
-            }
-        }
-        GgufFile::for_tests(m, tensors).unwrap()
-    }
-
-    fn fake_tensor() -> TensorInfo {
-        TensorInfo {
-            name: String::new(),
-            shape: vec![1, 1],
-            offset: 0,
-            dtype: crate::gguf_input::GgmlType::F32,
-        }
-    }
-
-    #[test]
-    fn gemma4_gguf_config_has_layout_fields() {
-        let cfg = config_json_from_gguf(&gemma4_12b_gguf(), "gemma4", 13);
-        let lt = cfg["layer_types"].as_array().unwrap();
-        assert_eq!(lt.len(), 48);
-        for (i, v) in lt.iter().enumerate() {
-            let expect = if i % 6 == 5 {
-                "full_attention"
-            } else {
-                "sliding_attention"
-            };
-            assert_eq!(v.as_str().unwrap(), expect, "layer {i}");
-        }
-        assert_eq!(cfg["num_key_value_heads"].as_u64(), Some(8));
-        assert_eq!(cfg["num_global_key_value_heads"].as_u64(), Some(1));
-        assert_eq!(cfg["head_dim"].as_u64(), Some(256));
-        assert_eq!(cfg["global_head_dim"].as_u64(), Some(512));
-        assert_eq!(cfg["sliding_window"].as_u64(), Some(1024));
-        assert_eq!(cfg["final_logit_softcapping"].as_f64(), Some(30.0));
-        assert_eq!(cfg["attention_k_eq_v"].as_bool(), Some(true));
-        let rp = &cfg["rope_parameters"];
-        assert_eq!(
-            rp["sliding_attention"]["rope_theta"].as_f64(),
-            Some(10_000.0)
-        );
-        assert_eq!(
-            rp["sliding_attention"]["rope_type"].as_str(),
-            Some("default")
-        );
-        assert_eq!(
-            rp["full_attention"]["rope_theta"].as_f64(),
-            Some(1_000_000.0)
-        );
-        assert_eq!(
-            rp["full_attention"]["rope_type"].as_str(),
-            Some("proportional")
-        );
-        assert_eq!(
-            rp["full_attention"]["partial_rotary_factor"].as_f64(),
-            Some(0.25)
-        );
-        // Generic fields still populated.
-        assert_eq!(cfg["hidden_size"].as_u64(), Some(3840));
-        assert_eq!(cfg["num_hidden_layers"].as_u64(), Some(48));
-        assert_eq!(cfg["num_attention_heads"].as_u64(), Some(16));
-        assert_eq!(cfg["intermediate_size"].as_u64(), Some(15360));
-        assert_eq!(cfg["vocab_size"].as_u64(), Some(262144));
-    }
-
-    #[test]
-    fn gemma4_gguf_config_is_admitted_by_loader_parser() {
-        let cfg = config_json_from_gguf(&gemma4_12b_gguf(), "gemma4", 13);
-        let metadata_json = serde_json::to_string(&serde_json::json!({ "config": cfg })).unwrap();
-        let parsed = hipfire_arch_gemma4::config::Gemma4Config::from_metadata_json(&metadata_json)
-            .expect("loader parser must admit the generated config");
-        assert_eq!(parsed.n_layers, 48);
-        assert_eq!(parsed.n_full_layers(), 8);
-        assert_eq!(parsed.n_sliding_layers(), 40);
-        assert_eq!(parsed.sliding_head_dim, 256);
-        assert_eq!(parsed.full_head_dim, 512);
-        assert_eq!(parsed.sliding_n_kv_heads, 8);
-        assert_eq!(parsed.full_n_kv_heads, 1);
-        assert!(parsed.attention_k_eq_v);
-        assert_eq!(
-            parsed.layer_types[5],
-            hipfire_arch_gemma4::config::LayerType::Full
-        );
-        assert_eq!(
-            parsed.layer_types[0],
-            hipfire_arch_gemma4::config::LayerType::Sliding
-        );
-    }
-
-    #[test]
-    fn gemma4_with_attn_v_on_full_layers_is_not_k_eq_v() {
-        let mut gguf = gemma4_12b_gguf();
-        gguf.tensors.push(TensorInfo {
-            name: "blk.5.attn_v.weight".into(),
-            ..fake_tensor()
-        });
-        let cfg = config_json_from_gguf(&gguf, "gemma4", 13);
-        assert!(cfg.get("attention_k_eq_v").is_none());
-    }
-
-    #[test]
-    fn non_gemma4_arch_is_untouched() {
-        let mut m: HashMap<String, MetaValue> = HashMap::new();
-        m.insert("llama.embedding_length".into(), MetaValue::U32(4096));
-        m.insert("llama.block_count".into(), MetaValue::U32(32));
-        m.insert("llama.attention.head_count".into(), MetaValue::U32(32));
-        m.insert("llama.attention.head_count_kv".into(), MetaValue::U32(8));
-        m.insert("llama.attention.key_length".into(), MetaValue::U32(128));
-        m.insert("llama.feed_forward_length".into(), MetaValue::U32(11008));
-        m.insert("llama.rope.freq_base".into(), MetaValue::F32(10000.0));
-        let gguf = GgufFile::for_tests(m, vec![]).unwrap();
-        let cfg = config_json_from_gguf(&gguf, "llama", 0);
-        assert!(cfg.get("layer_types").is_none());
-        assert!(cfg.get("rope_parameters").is_none());
-        assert!(cfg.get("attention_k_eq_v").is_none());
-        assert_eq!(cfg["num_key_value_heads"].as_u64(), Some(8));
-        assert_eq!(cfg["head_dim"].as_u64(), Some(128));
-    }
-
-    /// gemma4_text is a distinct GGUF architecture string that still maps to
-    /// arch_id 13. Metadata keys use the raw string as prefix (`gemma4_text.*`),
-    /// but the translation gate must engage via arch_id — not `arch_str == "gemma4"`.
-    fn gemma4_text_12b_gguf() -> GgufFile {
-        let mut m: HashMap<String, MetaValue> = HashMap::new();
-        let kv_arr: Vec<MetaValue> = (0..48)
-            .map(|i| MetaValue::U32(if i % 6 == 5 { 1 } else { 8 }))
-            .collect();
-        let pattern: Vec<MetaValue> = (0..48).map(|i| MetaValue::Bool(i % 6 != 5)).collect();
-        m.insert(
-            "gemma4_text.attention.head_count".into(),
-            MetaValue::U32(16),
-        );
-        m.insert(
-            "gemma4_text.attention.head_count_kv".into(),
-            MetaValue::Array(kv_arr),
-        );
-        m.insert(
-            "gemma4_text.attention.key_length".into(),
-            MetaValue::U32(512),
-        );
-        m.insert(
-            "gemma4_text.attention.key_length_swa".into(),
-            MetaValue::U32(256),
-        );
-        m.insert(
-            "gemma4_text.attention.layer_norm_rms_epsilon".into(),
-            MetaValue::F32(1e-6),
-        );
-        m.insert(
-            "gemma4_text.attention.shared_kv_layers".into(),
-            MetaValue::U32(0),
-        );
-        m.insert(
-            "gemma4_text.attention.sliding_window".into(),
-            MetaValue::U32(1024),
-        );
-        m.insert(
-            "gemma4_text.attention.sliding_window_pattern".into(),
-            MetaValue::Array(pattern),
-        );
-        m.insert("gemma4_text.block_count".into(), MetaValue::U32(48));
-        m.insert("gemma4_text.context_length".into(), MetaValue::U32(262144));
-        m.insert("gemma4_text.embedding_length".into(), MetaValue::U32(3840));
-        m.insert(
-            "gemma4_text.embedding_length_per_layer_input".into(),
-            MetaValue::U32(0),
-        );
-        m.insert(
-            "gemma4_text.feed_forward_length".into(),
-            MetaValue::U32(15360),
-        );
-        m.insert(
-            "gemma4_text.final_logit_softcapping".into(),
-            MetaValue::F32(30.0),
-        );
-        m.insert(
-            "gemma4_text.rope.freq_base".into(),
-            MetaValue::F64(1_000_000.0),
-        );
-        m.insert(
-            "gemma4_text.rope.freq_base_swa".into(),
-            MetaValue::F64(10_000.0),
-        );
-        m.insert(
-            "general.architecture".into(),
-            MetaValue::String("gemma4_text".into()),
-        );
-
-        let mut tensors = vec![TensorInfo {
-            name: "token_embd.weight".into(),
-            shape: vec![3840, 262144],
-            ..fake_tensor()
-        }];
-        for i in 0..48 {
-            tensors.push(TensorInfo {
-                name: format!("blk.{i}.attn_k.weight"),
-                ..fake_tensor()
-            });
-            if i % 6 != 5 {
-                tensors.push(TensorInfo {
-                    name: format!("blk.{i}.attn_v.weight"),
-                    ..fake_tensor()
-                });
-            }
-        }
-        GgufFile::for_tests(m, tensors).unwrap()
-    }
-
-    #[test]
-    fn gemma4_text_arch_engages_translation() {
-        let cfg = config_json_from_gguf(&gemma4_text_12b_gguf(), "gemma4_text", 13);
-        let lt = cfg["layer_types"].as_array().expect(
-            "gemma4_text (arch_id 13) must emit layer_types; gating on raw arch_str skips it",
-        );
-        assert_eq!(lt.len(), 48);
-        assert_eq!(cfg["num_key_value_heads"].as_u64(), Some(8));
-        assert_eq!(cfg["num_global_key_value_heads"].as_u64(), Some(1));
-        assert_eq!(cfg["head_dim"].as_u64(), Some(256));
-        assert_eq!(cfg["global_head_dim"].as_u64(), Some(512));
-        assert_eq!(cfg["attention_k_eq_v"].as_bool(), Some(true));
-        assert_eq!(cfg["model_type"].as_str(), Some("gemma4_text"));
-    }
-}
-
-#[cfg(test)]
-mod gemma4_name_translation_tests {
-    use crate::calibration::gguf_to_safetensors_name;
-
-    #[test]
-    fn gemma4_sandwich_norms_map_to_loader_names() {
-        let f = |slot: &str| gguf_to_safetensors_name(&format!("blk.7.{slot}.weight"), 13).unwrap();
-        assert_eq!(f("attn_norm"), "model.layers.7.input_layernorm.weight");
-        assert_eq!(
-            f("post_attention_norm"),
-            "model.layers.7.post_attention_layernorm.weight"
-        );
-        assert_eq!(
-            f("ffn_norm"),
-            "model.layers.7.pre_feedforward_layernorm.weight"
-        );
-        assert_eq!(
-            f("post_ffw_norm"),
-            "model.layers.7.post_feedforward_layernorm.weight"
-        );
-        // Loader reads `{p}.layer_scalar` with NO `.weight` suffix.
-        assert_eq!(f("layer_output_scale"), "model.layers.7.layer_scalar");
-        // Generic slots unchanged.
-        assert_eq!(f("attn_q"), "model.layers.7.self_attn.q_proj.weight");
-        assert_eq!(f("ffn_down"), "model.layers.7.mlp.down_proj.weight");
-    }
-
-    #[test]
-    fn llama_ffn_norm_still_maps_to_post_attention() {
-        // The two-norm Llama layout must be byte-identical to before the
-        // gemma4 arm existed — ffn_norm IS post_attention_layernorm there.
-        assert_eq!(
-            gguf_to_safetensors_name("blk.3.ffn_norm.weight", 0).unwrap(),
-            "model.layers.3.post_attention_layernorm.weight"
-        );
-        // Gemma-4-only slots do not exist in Llama files; translation of an
-        // unexpected slot passes through untouched (no gemma4 arm taken).
-        assert_eq!(
-            gguf_to_safetensors_name("blk.3.post_ffw_norm.weight", 0).unwrap(),
-            "model.layers.3.post_ffw_norm.weight"
-        );
-    }
-
-    #[test]
-    fn gemma4_text_arch_id_engages_sandwich_norms() {
-        // arch_id 13 covers gemma4_text / gemma4_unified / gemma4_unified_text;
-        // the gate must not require the literal arch_str "gemma4".
-        assert_eq!(
-            gguf_to_safetensors_name("blk.2.ffn_norm.weight", 13).unwrap(),
-            "model.layers.2.pre_feedforward_layernorm.weight"
-        );
-        assert_eq!(
-            gguf_to_safetensors_name("blk.2.layer_output_scale.weight", 13).unwrap(),
-            "model.layers.2.layer_scalar"
-        );
-    }
-}
-
 #[cfg(test)]
 mod block_i4_128_tests {
     use super::fake_quantize_block_i4_128;
@@ -2639,5 +1958,242 @@ mod hf_snapshot_tests {
             pick_hf_snapshot(repo.path()).unwrap(),
             repo.path().join("snapshots/aaaa-new")
         );
+    }
+}
+
+/// `--awq-fix-la-head-order` contracts. The imatrix is recorded on the
+/// llama.cpp GGUF, whose converter reorders `linear_attn.out_proj`'s input axis
+/// from HF grouped order to ggml tiled order (`conversion/qwen.py`,
+/// `_LinearAttentionVReorderBase`). These pin the inverse permutation for both
+/// shipped geometries and the fail-closed length check.
+#[cfg(test)]
+mod la_head_order_tests {
+    use super::{la_head_geometry, LaHeadOrder};
+
+    /// Tiled vector where every 128-block carries its own head index.
+    fn tiled(n_heads: usize, head_dim: usize) -> Vec<f32> {
+        (0..n_heads * head_dim)
+            .map(|i| (i / head_dim) as f32)
+            .collect()
+    }
+
+    fn grouped(order: &LaHeadOrder) -> Vec<f32> {
+        let n_heads = order.n_k_heads * order.n_v_per_k;
+        order
+            .to_grouped(&tiled(n_heads, order.head_v_dim))
+            .expect("shape matches geometry")
+    }
+
+    /// Qwen3.8-27B (16 K heads, 3 V per K): must reproduce the historical
+    /// hardcoded mapping `raw[(h % 3) * 16 + h / 3]` exactly.
+    #[test]
+    fn three_per_k_matches_the_historical_qwen38_mapping() {
+        let order = LaHeadOrder {
+            n_k_heads: 16,
+            n_v_per_k: 3,
+            head_v_dim: 128,
+        };
+        assert_eq!(order.span(), 48 * 128);
+        let raw = tiled(48, 128);
+        let fixed = order.to_grouped(&raw).unwrap();
+        for h in 0..48 {
+            let raw_h = (h % 3) * 16 + h / 3;
+            assert_eq!(
+                &fixed[h * 128..(h + 1) * 128],
+                &raw[raw_h * 128..(raw_h + 1) * 128],
+                "HF head {h} must read tiled head {raw_h}"
+            );
+        }
+    }
+
+    /// Qwen3.6-35B-A3B (16 K heads, 2 V per K): the tiled vector is a
+    /// de-interleave of even/odd HF heads.
+    #[test]
+    fn two_per_k_deinterleaves_even_and_odd_heads() {
+        let order = LaHeadOrder {
+            n_k_heads: 16,
+            n_v_per_k: 2,
+            head_v_dim: 128,
+        };
+        assert_eq!(order.span(), 4096);
+        let fixed = grouped(&order);
+        assert_eq!(fixed[0], 0.0); // HF 0 <- tiled 0
+        assert_eq!(fixed[128], 16.0); // HF 1 <- tiled 16
+        assert_eq!(fixed[256], 1.0); // HF 2 <- tiled 1
+        assert_eq!(fixed[30 * 128], 15.0); // HF 30 <- tiled 15
+        assert_eq!(fixed[31 * 128], 31.0); // HF 31 <- tiled 31
+        for h in 0..32 {
+            assert_eq!(fixed[h * 128], ((h % 2) * 16 + h / 2) as f32);
+        }
+    }
+
+    /// Equal K/V head counts need no permutation, and a length that does not
+    /// match the geometry is refused instead of silently producing garbage.
+    #[test]
+    fn identity_when_one_v_per_k_and_length_is_checked() {
+        let order = LaHeadOrder {
+            n_k_heads: 16,
+            n_v_per_k: 1,
+            head_v_dim: 128,
+        };
+        let raw = tiled(16, 128);
+        assert_eq!(order.to_grouped(&raw).unwrap(), raw);
+
+        let three = LaHeadOrder {
+            n_k_heads: 16,
+            n_v_per_k: 3,
+            head_v_dim: 128,
+        };
+        assert!(three.to_grouped(&raw).is_err());
+    }
+
+    /// Geometry is read from the nested text config (VL checkpoints) or the
+    /// root, and absent for models without grouped V heads.
+    #[test]
+    fn geometry_comes_from_the_model_config() {
+        let vl: serde_json::Value = serde_json::from_str(
+            r#"{"text_config":{"linear_num_key_heads":16,"linear_num_value_heads":32,
+                "linear_value_head_dim":128}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            la_head_geometry(&vl),
+            Some(LaHeadOrder {
+                n_k_heads: 16,
+                n_v_per_k: 2,
+                head_v_dim: 128,
+            })
+        );
+
+        let root: serde_json::Value = serde_json::from_str(
+            r#"{"linear_num_key_heads":16,"linear_num_value_heads":48,
+                "linear_value_head_dim":128}"#,
+        )
+        .unwrap();
+        assert_eq!(la_head_geometry(&root).unwrap().n_v_per_k, 3);
+
+        // Full-attention-only checkpoint: no linear fields.
+        let dense: serde_json::Value =
+            serde_json::from_str(r#"{"model_type":"qwen3","num_hidden_layers":28}"#).unwrap();
+        assert_eq!(la_head_geometry(&dense), None);
+    }
+}
+
+/// End-to-end contracts for the imatrix loader itself: a real (minimal) GGUF
+/// file in, the grouped re-index / warning / fail-closed outcomes out.
+#[cfg(test)]
+mod imatrix_load_tests {
+    use super::{load_imatrix, LaHeadOrder};
+    use std::path::{Path, PathBuf};
+
+    fn order() -> LaHeadOrder {
+        LaHeadOrder {
+            n_k_heads: 16,
+            n_v_per_k: 2,
+            head_v_dim: 128,
+        }
+    }
+
+    fn tiled(n_heads: usize, head_dim: usize) -> Vec<f32> {
+        (0..n_heads * head_dim)
+            .map(|i| (i / head_dim) as f32)
+            .collect()
+    }
+
+    /// Minimal GGUF v3: no metadata KV (so alignment defaults to 32), 1-D F32
+    /// tensors laid out in declaration order.
+    fn write_imatrix(dir: &Path, tensors: &[(&str, Vec<f32>)]) -> PathBuf {
+        let mut out: Vec<u8> = Vec::new();
+        out.extend_from_slice(b"GGUF");
+        out.extend_from_slice(&3u32.to_le_bytes());
+        out.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
+        out.extend_from_slice(&0u64.to_le_bytes());
+        let mut offset = 0u64;
+        for (name, data) in tensors {
+            out.extend_from_slice(&(name.len() as u64).to_le_bytes());
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(&1u32.to_le_bytes());
+            out.extend_from_slice(&(data.len() as u64).to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes()); // GGML_TYPE_F32
+            out.extend_from_slice(&offset.to_le_bytes());
+            offset += (data.len() * 4) as u64;
+        }
+        while out.len() % 32 != 0 {
+            out.push(0);
+        }
+        for (_name, data) in tensors {
+            for value in data {
+                out.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        let path = dir.join("imatrix.gguf");
+        std::fs::write(&path, out).unwrap();
+        path
+    }
+
+    #[test]
+    fn reindexes_tiled_out_proj_into_grouped_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_imatrix(
+            dir.path(),
+            &[("blk.0.ssm_out.weight.in_sum2", tiled(32, 128))],
+        );
+        let loaded = load_imatrix(&path, Some(order()), true).unwrap();
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+        let got = &loaded.table["blk.0.ssm_out.weight"];
+        for h in 0..32 {
+            assert_eq!(got[h * 128], ((h % 2) * 16 + h / 2) as f32);
+        }
+    }
+
+    #[test]
+    fn flag_off_keeps_tiled_values_and_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = tiled(32, 128);
+        let path = write_imatrix(dir.path(), &[("blk.0.ssm_out.weight.in_sum2", raw.clone())]);
+        let loaded = load_imatrix(&path, Some(order()), false).unwrap();
+        assert_eq!(loaded.table["blk.0.ssm_out.weight"], raw);
+        assert_eq!(loaded.warnings.len(), 1, "{:?}", loaded.warnings);
+        assert!(
+            loaded.warnings[0].contains("tiled V-head order"),
+            "{}",
+            loaded.warnings[0]
+        );
+        assert!(loaded.warnings[0].contains("--awq-fix-la-head-order"));
+    }
+
+    #[test]
+    fn wrong_length_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_imatrix(
+            dir.path(),
+            &[("blk.0.ssm_out.weight.in_sum2", vec![1.0f32; 2048])],
+        );
+        let error = load_imatrix(&path, Some(order()), true).unwrap_err();
+        assert!(error.contains("length 2048"), "{error}");
+    }
+
+    #[test]
+    fn missing_geometry_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_imatrix(
+            dir.path(),
+            &[("blk.0.ssm_out.weight.in_sum2", tiled(32, 128))],
+        );
+        let error = load_imatrix(&path, None, true).unwrap_err();
+        assert!(error.contains("linear_num_key_heads"), "{error}");
+    }
+
+    #[test]
+    fn no_out_proj_entries_fails_closed_but_loads_without_the_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let dense = vec![1.0f32; 2048];
+        let path = write_imatrix(dir.path(), &[("blk.0.attn_qkv.weight.in_sum2", dense)]);
+        let error = load_imatrix(&path, Some(order()), true).unwrap_err();
+        assert!(error.contains("matched no"), "{error}");
+
+        let loaded = load_imatrix(&path, Some(order()), false).unwrap();
+        assert!(loaded.table.contains_key("blk.0.attn_qkv.weight"));
+        assert!(loaded.warnings.is_empty());
     }
 }

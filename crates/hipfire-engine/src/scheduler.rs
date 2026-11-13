@@ -12,9 +12,9 @@ use std::time::Instant;
 use crate::terminal::{
     batch_active_owner_matches, batch_bind_active, batch_check_abort,
     batch_clear_terminal_at_generation, batch_is_current, batch_mark_ready_with_pending,
-    batch_poll_decision, batch_ready_owner_matches, batch_transition_to_queued, AttemptKey,
-    BatchGeneration, ClientTerminalDecision, LaneTicket, SingletonTransfer,
-    CLIENT_TERMINAL_COMMIT_TIMEOUT,
+    batch_poll_decision, batch_ready_owner_matches, batch_requeue_active,
+    batch_transition_to_queued, AttemptKey, BatchGeneration, ClientTerminalDecision, LaneTicket,
+    SingletonTransfer, CLIENT_TERMINAL_COMMIT_TIMEOUT,
 };
 
 // ── Batch sampling controls and cohort key ───────────────────────────────
@@ -239,6 +239,21 @@ impl ContinuousBatchScheduler {
 
     pub fn cohort_key_for(&self, key: &AttemptKey) -> Option<BatchSamplingKey> {
         self.pending_sampling.get(key).map(|s| s.key())
+    }
+
+    /// The queued request [`Self::try_assign_one`] would assign right now: the
+    /// inbox front, when a lane is free and its sampling cohort matches the
+    /// active one. A read-only peek (nothing is popped or bound), so an
+    /// admission gate can decide before the request takes a lane and leave it
+    /// queued, exactly as a full lane set does.
+    pub fn assignable_front(&self) -> Option<&AttemptKey> {
+        self.lanes.iter().position(|l| l.is_empty())?;
+        let front = self.inbox.front()?;
+        let sampling_key = self.cohort_key_for(front)?;
+        match &self.cohort_key {
+            Some(cohort) if cohort != &sampling_key => None,
+            _ => Some(front),
+        }
     }
 
     pub fn try_assign_one(&mut self) -> Option<(AttemptKey, LaneTicket)> {
@@ -480,6 +495,38 @@ impl ContinuousBatchScheduler {
         self.inbox.retain(|k| k != expected);
         batch_clear_terminal_at_generation(&expected.id, expected.attempt_id, admission);
         self.maybe_clear_cohort();
+        true
+    }
+
+    /// Put a running lane's request back at the FRONT of the inbox after a step failed on a capacity condition
+    /// before the request emitted anything: the lane becomes empty (its generation advances) and the request keeps
+    /// its pending entry and its place in line, to be assigned again at a later step boundary. False (nothing
+    /// changed) unless the lane runs `expected` under `admission` and the terminal registry accepts the
+    /// `Active` -> `Queued` transition.
+    pub fn requeue_lane(
+        &mut self,
+        lane: usize,
+        expected: &AttemptKey,
+        admission: BatchGeneration,
+    ) -> bool {
+        if lane >= self.lanes.len() || !self.pending.contains_key(expected) {
+            return false;
+        }
+        let (ticket, lane_generation) = match &self.lanes[lane] {
+            BatchLane::Seeding(q) | BatchLane::Running(q) if &q.key == expected => {
+                (q.ticket, q.ticket.generation)
+            }
+            _ => return false,
+        };
+        if ticket.admission != admission
+            || !batch_requeue_active(&expected.id, expected.attempt_id, admission, ticket)
+        {
+            return false;
+        }
+        self.lanes[lane] = BatchLane::Empty {
+            generation: lane_generation + 1,
+        };
+        self.inbox.push_front(expected.clone());
         true
     }
 
@@ -753,7 +800,7 @@ pub fn is_batch_eligible(
     if req.has_image || req.has_tools || req.has_stop {
         return false;
     }
-    if req.has_speculator || req.has_adaptive || req.has_pflash {
+    if req.has_speculator || req.has_adaptive {
         return false;
     }
     if req.has_messages_history {
@@ -1226,8 +1273,6 @@ pub fn daemon_regular_with_admission(
         None => DaemonMsg::Regular(value),
     }
 }
-
-pub type CaskConfig = hipfire_runtime::loader_api::CaskConfig;
 
 /// Error from the real GPU batch driver. Host stub never errors.
 #[derive(Debug)]

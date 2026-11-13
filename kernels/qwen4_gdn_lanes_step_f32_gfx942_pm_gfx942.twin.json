@@ -1,0 +1,189 @@
+{
+  "anchor": {
+    "bytes": 39352,
+    "file": "qwen4_gdn_lanes_step_f32_gfx942_hipcc_gfx942.co",
+    "sha256": "595e6d26f9d6d8a818b0649a6a11e8bcf1d2d51fa26b2deefb6f27a7a7f56c25"
+  },
+  "arch": "gfx942",
+  "compiler": {
+    "flags": [
+      "--genco",
+      "--offload-arch=gfx942",
+      "-O3",
+      "--no-offload-compress",
+      "-fuse-cuid=none",
+      "-mcode-object-version=6"
+    ],
+    "invocation": "hipcc <flags> -o <anchor.co> kernels/src/qwen4_gdn_lanes_f32.gfx942.hip",
+    "version": [
+      "HIP version: 7.16.26385-0000000",
+      "AMD clang version 24.0.0git (https://github.com/ROCm/llvm-project.git d6f6cb691863e9258034ab48c1dfce21689d5606)",
+      "Target: x86_64-unknown-linux-gnu",
+      "Thread model: posix"
+    ]
+  },
+  "gpu_oracle": {
+    "case_count": 10,
+    "controls": "bitflip state/output detected for every case; swapped/dropped lanes detected for lanes > 1",
+    "coverage": "lanes 1/2/8/33/64 x rows 1/4 x two recurrence steps; state and output exact; spare slots untouched",
+    "failed_cases": 0,
+    "hipcc_device_elf_sha256": "620754d4895f3d59ff0587e03234c4e649cc60711d84a0f91db5af3028efcd40",
+    "hipcc_image_sha256": "595e6d26f9d6d8a818b0649a6a11e8bcf1d2d51fa26b2deefb6f27a7a7f56c25",
+    "image_env": "HIPFIRE_QWEN4_G942_GDN_LANES_IMAGE=/scratch/quant/fn-fp8/beat/gdn-lanes-twin.elf",
+    "input_hxaco_sha256": "60113536989b8b8bfdebd417f312aceb878660580e61f388f683a90f4dd931ef",
+    "ledger": {
+      "class": "oracle",
+      "end": "2026-11-11T04:02:00+00:00",
+      "exit": 0,
+      "line": 119,
+      "owner": "Twin942c",
+      "path": "/scratch/quant/fn-fp8/beat/ledger.jsonl",
+      "start": "2026-11-11T04:01:57+00:00"
+    },
+    "oracle": "gdn_lanes_f32_gfx942_oracle --lanes 1,2,8,33,64 --rows 1,4 --steps 2",
+    "pm_device_elf_sha256": "620754d4895f3d59ff0587e03234c4e649cc60711d84a0f91db5af3028efcd40",
+    "status": "PASS",
+    "target": "gfx942"
+  },
+  "hxaco": {
+    "bytes": 39352,
+    "file": "qwen4_gdn_lanes_step_f32_gfx942_pm_gfx942.hxaco",
+    "sha256": "60113536989b8b8bfdebd417f312aceb878660580e61f388f683a90f4dd931ef"
+  },
+  "module": "qwen4_gdn_lanes_step_f32_gfx942_pm_gfx942",
+  "seal": {
+    "reports": [
+      {
+        "abi": {
+          "args": [
+            {
+              "name": "",
+              "offset": 0,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 8,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 12,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 16,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 20,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 24,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 28,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 32,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            }
+          ],
+          "compared_to_incumbent": false,
+          "kernarg_segment_size": 36
+        },
+        "arch": "gfx942",
+        "codec": "peacemaker_cdna",
+        "elf_bytes": 35256,
+        "elf_sha256": "620754d4895f3d59ff0587e03234c4e649cc60711d84a0f91db5af3028efcd40",
+        "hazards": {
+          "advisory": 0,
+          "arch": "gfx942",
+          "blocking": 0,
+          "bypasses": 0,
+          "checked": true,
+          "dwords": 7589,
+          "findings": 0,
+          "hazard": {
+            "checker": "peacemaker_isa::cdna::hazard::check",
+            "inserted_nops": 0,
+            "mfma": 0,
+            "rewritten_instructions": 0,
+            "s_nop": 308,
+            "s_nop_wait_states": 467,
+            "violations": 0
+          },
+          "instructions": 5325,
+          "kernel": "qwen4_gdn_lanes_step_f32_gfx942",
+          "ledger": {
+            "barriers": 3,
+            "branches": 30,
+            "label_states": 69,
+            "labels": 23,
+            "memory": {
+              "ds_load": 198,
+              "ds_store": 16,
+              "smem": 4,
+              "vmem_atomic": 0,
+              "vmem_load": 161,
+              "vmem_store": 130
+            },
+            "steps": 15555,
+            "verifier": "peacemaker_isa::ledger_cfg::verify_with_branch_proofs",
+            "waitcnt": 211,
+            "waitcnt_lgkmcnt_partial": 164,
+            "waitcnt_vmcnt_partial": 23
+          },
+          "unreachable_instructions": 0
+        },
+        "hxaco_bytes": 39352,
+        "hxaco_sha256": "60113536989b8b8bfdebd417f312aceb878660580e61f388f683a90f4dd931ef",
+        "kernel": "qwen4_gdn_lanes_step_f32_gfx942",
+        "lds": 9216,
+        "lift_identity": "emit::checked ok; emitted bytes == input ELF",
+        "lifted_kernels": 1,
+        "rsrc2": 388,
+        "scratch": 0,
+        "sgprs": 106,
+        "text_bytes": 30356,
+        "text_sha256": "8b85e0318f902efaf3fb0459d62e90f027b8ccfb735a9165c301c4a5b228ef04",
+        "user_sgprs": 2,
+        "vgprs": 228,
+        "wavefront_size": 64
+      }
+    ],
+    "tool": "peacemaker-isa example hip_twin (gfx942 Route A: typed lift, full device-ELF identity, bundle)"
+  },
+  "source": {
+    "bytes": 27879,
+    "path": "kernels/src/qwen4_gdn_lanes_f32.gfx942.hip",
+    "sha256": "1866f068bcc4d05f7c149630e702f50d8e904804daf2afbfc2dfc33cfcb7f81b"
+  },
+  "symbols": [
+    "qwen4_gdn_lanes_step_f32_gfx942"
+  ]
+}

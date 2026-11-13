@@ -33,7 +33,11 @@ SCHEMA = "pm.selector_receipt.v1"
 ROW_KEYS = {"rows", "launch_rows"}
 BASELINE_REL = "scripts/selector-receipts-baseline.txt"
 # (path, NAME) pairs awaiting a receipt from a card job. Remove the entry and annotate the constant when the receipt lands.
-PENDING: set = set()
+PENDING: set = {
+    # The slab-route automatic S1 request floor: the card receipt is the short-prompt sweep
+    # (PP=32,64,96,128,256,512, arms A and I of tools/mq3wire-job/s1slab-job.sh).
+    ("crates/hipfire-arch-qwen4/src/slowlink_admission.rs", "S1_SLAB_AUTO_MIN_ROWS"),
+}
 NAME_RE = re.compile(
     r"(^|_)(MIN|MAX)_(N|M|ROWS|TOKENS|BATCH|T)($|_)"
     r"|ROWS_MIN|MIN_ROWS|MIN_TOKENS|ROWS_MAX|MAX_ROWS"

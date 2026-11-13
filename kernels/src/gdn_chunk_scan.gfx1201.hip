@@ -103,6 +103,23 @@ __device__ __forceinline__ gs_bfrag gs_frag_g(const unsigned short*p,unsigned st
  for(int e=0;e<16;++e)u.h[e]=p[(unsigned)r*stride+k0+e];
 #endif
  return u.v;}
+// gfx11 WMMA accumulates its 16 products so that the SIGN of a zero product changes the rounding of the
+// sum (v_wmma_f32_16x16x16_f16 on gfx1100/gfx1151; measured: a lone nonzero product plus a zero partner
+// in its k pair rounds differently for +0 and -0). The two WMMAs whose operand holds structural zeros
+// (D = A.z: A's upper triangle; O += D.score: the causal mask) multiply them with values that depend on
+// later rows, so a call that ends mid-tile saw different zero signs than the completed tile and its last
+// valid row rounded differently. Splitting that second operand by sign (x+ = x with sign bit clear, x- =
+// x with sign bit set, the other half +0 / -0) makes every masked product a constant-signed zero.
+// gfx12 WMMA is sign-insensitive (measured byte-stable), so its arithmetic is unchanged.
+#if !GDN_CHUNK_GFX12
+#define GS_SIGN_SPLIT 1
+__device__ __forceinline__ void gs_split(gs_bfrag x,gs_bfrag&pos,gs_bfrag&neg){union{unsigned short h[16];gs_bfrag v;}u,p,n;u.v=x;
+#pragma unroll
+ for(int e=0;e<16;++e){const unsigned b=u.h[e];const bool s=(b>>15)!=0;p.h[e]=s?0:(unsigned short)b;n.h[e]=s?(unsigned short)b:(unsigned short)0x8000u;}
+ pos=p.v;neg=n.v;}
+#else
+#define GS_SIGN_SPLIT 0
+#endif
 // Exact gfx1201 runs a latency-hiding copy of the chunk loop (GS_G12_PIPE).
 // It keeps every LDS byte, WMMA operand, accumulation order and rounding of
 // the original loop, which every other target still compiles.
@@ -135,23 +152,34 @@ struct __attribute__((aligned(16))) GsLds{
  float ctrl[4][GS_C];
 };
 
-#ifdef GDN_CHUNK_SCAN_F32_EDGE
-extern "C" __launch_bounds__(512,1)
-__global__ void gdn_chunk_scan_f32_edge(
- const unsigned short* __restrict__ q,const unsigned short* __restrict__ k,const unsigned short* __restrict__ v,
- const unsigned short* __restrict__ A,const float* __restrict__ G,const float* __restrict__ beta,
- const float* __restrict__ h0,float* __restrict__ ht,float* __restrict__ out,int row0,int T,unsigned n_key_heads,unsigned n_value_heads){
-#else
+// State entry/exit modes (kernargs `entry_mode` / `exit_mode`; the host's typed
+// `GdnScanEntry` / `GdnScanExit` in `norm.rs` are the only writers). Entry:
+// the state is reconstructed from the Q8 plane and scales (plain Q8: no
+// residual), from Q8 + F16 EF, or taken from the FP32 plane `h0` unchanged.
+// Exit: the final state is quantized (Seal: Q8/scales and, with GS_EXIT_EF, the
+// F16 residual), kept as FP32 in `ht` (no quantization), quantized at an
+// absolute commit seam (Seal's stores plus `ht` = the reconstructed state the
+// next frame's entry would see), or dropped (transient replay of an incomplete
+// tile). `T == 0` is a pure state conversion (open: Q8 -> FP32, seal: FP32 -> Q8).
+// `h0` and `ht` may name the same plane: every element is read and written by
+// the same lane, all reads before the first write.
+#define GS_ENTRY_Q8 0
+#define GS_ENTRY_Q8EF 1
+#define GS_ENTRY_F32 2
+#define GS_EXIT_SEAL 0
+#define GS_EXIT_F32 1
+#define GS_EXIT_SEAM 2
+#define GS_EXIT_NONE 3
+#define GS_EXIT_EF 4
 extern "C" __launch_bounds__(512,1)
 __global__ void GDN_CHUNK_SCAN_KERNEL(
  const unsigned short* __restrict__ q,const unsigned short* __restrict__ k,const unsigned short* __restrict__ v,
  const unsigned short* __restrict__ A,const float* __restrict__ G,const float* __restrict__ beta,
- signed char* __restrict__ sq,float* __restrict__ sc,_Float16* __restrict__ ef,gs_out_t* __restrict__ out,int row0,int T,unsigned n_key_heads,unsigned n_value_heads){
-#endif
-#ifdef GDN_SCAN_MULTISEG
- if(T<=0)return;
-#else
- if(T<=0||T>512)return;
+ signed char* __restrict__ sq,float* __restrict__ sc,_Float16* __restrict__ ef,gs_out_t* __restrict__ out,int row0,int T,unsigned n_key_heads,unsigned n_value_heads,
+ const float* h0,float* ht,int entry_mode,int exit_mode){
+ if(T<0)return;
+#ifndef GDN_SCAN_MULTISEG
+ if(T>512)return;
 #endif
  // Head counts are kernargs (head dim 128; n_value_heads <= 48 and a multiple of
  // n_key_heads); the 27B build was 16 and 48.
@@ -177,12 +205,9 @@ __global__ void GDN_CHUNK_SCAN_KERNEL(
  for(int ki=0;ki<2;++ki)for(int vi=0;vi<2;++vi){const int t=ki*2+vi;const int vv=vbase+(vt0+vi)*16+lo;
 #pragma unroll
   for(int e=0;e<8;++e){const int key=(kt0+ki)*16+gs_acc_row(lane,e);
-#ifdef GDN_CHUNK_SCAN_F32_EDGE
-   St[t][e]=h0[((unsigned long long)head*GS_D+vv)*GS_D+key];
-#else
    const unsigned long long off=((unsigned long long)head*GS_D+vv)*GS_D+key;
-   St[t][e]=(float)sq[off]*sc[head*GS_D+vv]+(float)ef[off];
-#endif
+   if(entry_mode==GS_ENTRY_F32)St[t][e]=h0[off];
+   else{const float res=entry_mode==GS_ENTRY_Q8EF?(float)ef[off]:0.0f;St[t][e]=(float)sq[off]*sc[head*GS_D+vv]+res;}
   }}
  auto stage_state=[&](){
 #pragma unroll
@@ -350,7 +375,13 @@ __global__ void GDN_CHUNK_SCAN_KERNEL(
 #pragma unroll
   for(int kk=0;kk<4;++kk){gs_bfrag aa=gs_frag_g(abase,hv*GS_C,mt*16,last,kk*16,lane);
 #pragma unroll
-   for(int j=0;j<2;++j)Dacc[j]=gs_mma(aa,gs_frag(&sm.state[half][0][0],GS_KP,(ntb+j)*16,kk*16,lane),Dacc[j]);}
+   for(int j=0;j<2;++j){gs_bfrag zf=gs_frag(&sm.state[half][0][0],GS_KP,(ntb+j)*16,kk*16,lane);
+#if GS_SIGN_SPLIT
+    gs_bfrag zp,zn;gs_split(zf,zp,zn);Dacc[j]=gs_mma(aa,zn,Dacc[j]);Dacc[j]=gs_mma(aa,zp,Dacc[j]);
+#else
+    Dacc[j]=gs_mma(aa,zf,Dacc[j]);
+#endif
+   }}
 #pragma unroll
   for(int j=0;j<2;++j)for(int e=0;e<8;++e){int tok=mt*16+gs_acc_row(lane,e);sm.d[half][(ntb+j)*16+lo][tok]=gs_b16(Dacc[j][e]);}
   GS_BAR();
@@ -358,7 +389,17 @@ __global__ void GDN_CHUNK_SCAN_KERNEL(
 #pragma unroll
   for(int kk=0;kk<4;++kk){gs_bfrag score=gs_frag(&sm.score[0][0],GS_AP,mt*16,kk*16,lane);
 #pragma unroll
-   for(int j=0;j<2;++j)O[j]=gs_mma(gs_frag(&sm.d[half][0][0],GS_AP,(ntb+j)*16,kk*16,lane),score,O[j]);}
+   for(int j=0;j<2;++j){gs_bfrag df=gs_frag(&sm.d[half][0][0],GS_AP,(ntb+j)*16,kk*16,lane);
+#if GS_SIGN_SPLIT
+    gs_bfrag dp,dn;gs_split(df,dp,dn);O[j]=gs_mma(dn,score,O[j]);O[j]=gs_mma(dp,score,O[j]);
+#else
+    O[j]=gs_mma(df,score,O[j]);
+#endif
+   }}
+#if GS_SIGN_SPLIT
+  // WMMA needs every lane active (see gdn_chunk_scan.gfx1151.hip): keep the O products out of the store branch.
+  asm volatile("" : "+v"(O[0]), "+v"(O[1]));
+#endif
   const int tok=mt*16+lo;
   if(tok<rows){
 #pragma unroll
@@ -414,12 +455,14 @@ __global__ void GDN_CHUNK_SCAN_KERNEL(
  }
 #endif
 
-#ifdef GDN_CHUNK_SCAN_F32_EDGE
+ if((exit_mode&3)==GS_EXIT_NONE)return;
+ if((exit_mode&3)==GS_EXIT_F32){
 #pragma unroll
- for(int ki=0;ki<2;++ki)for(int vi=0;vi<2;++vi){int t=ki*2+vi,vv=vbase+(vt0+vi)*16+lo;
+  for(int ki=0;ki<2;++ki)for(int vi=0;vi<2;++vi){int t=ki*2+vi,vv=vbase+(vt0+vi)*16+lo;
 #pragma unroll
-  for(int e=0;e<8;++e)ht[((unsigned long long)head*GS_D+vv)*GS_D+(kt0+ki)*16+gs_acc_row(lane,e)]=St[t][e];}
-#else
+   for(int e=0;e<8;++e)ht[((unsigned long long)head*GS_D+vv)*GS_D+(kt0+ki)*16+gs_acc_row(lane,e)]=St[t][e];}
+  return;
+ }
  // The old EF was folded into St before the scan so it participates in every
  // output and decay.  The dead state staging tile now holds the two independent
  // full-row reductions without increasing the shipped LDS allocation.
@@ -432,6 +475,7 @@ __global__ void GDN_CHUNK_SCAN_KERNEL(
    for(int e=0;e<8;++e)vmax[vi]=fmaxf(vmax[vi],fabsf(St[t][e]));}
   vmax[vi]=fmaxf(vmax[vi],__shfl_xor(vmax[vi],16));if(hi==0)reinterpret_cast<float*>(&sm.state[half][0][0])[(swave>>1)*GS_BV+vv-vbase]=vmax[vi];}
  GS_BAR();
+ const bool gs_wef=(exit_mode&GS_EXIT_EF)!=0,gs_seam=(exit_mode&3)==GS_EXIT_SEAM;
 #pragma unroll
  for(int vi=0;vi<2;++vi){int vv=vbase+(vt0+vi)*16+lo;float mx=0;
 #pragma unroll
@@ -439,6 +483,11 @@ __global__ void GDN_CHUNK_SCAN_KERNEL(
 #pragma unroll
   for(int ki=0;ki<2;++ki){int t=ki*2+vi;
 #pragma unroll
-   for(int e=0;e<8;++e){const unsigned long long off=((unsigned long long)head*GS_D+vv)*GS_D+(kt0+ki)*16+gs_acc_row(lane,e);float qf=fminf(fmaxf(rintf(St[t][e]*inv),-128.0f),127.0f);sq[off]=(signed char)qf;ef[off]=(_Float16)(St[t][e]-qf*scale);}}}
-#endif
+   for(int e=0;e<8;++e){const unsigned long long off=((unsigned long long)head*GS_D+vv)*GS_D+(kt0+ki)*16+gs_acc_row(lane,e);float qf=fminf(fmaxf(rintf(St[t][e]*inv),-128.0f),127.0f);sq[off]=(signed char)qf;
+    const float qs=qf*scale;
+    // `ht` is what the next launch's entry would reconstruct from the stored code (an int-converted
+    // code, so a negative-zero rounded value reloads as +0: gfx11 WMMA is zero-sign sensitive) and EF.
+    const _Float16 eh=(_Float16)(St[t][e]-qs);
+    if(gs_wef)ef[off]=eh;
+    if(gs_seam)ht[off]=(float)(signed char)qf*scale+(float)eh;}}}
 }

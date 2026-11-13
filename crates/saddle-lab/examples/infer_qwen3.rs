@@ -4,7 +4,7 @@
 
 //! Run inference on a .hfq (hipfire-quantized) model.
 //! Usage: cargo run --release --example infer_qwen3 <model.hfq> [flags] [prompt text...]
-//! Flags: --q8kv, --fp32kv, --givens4, --givens2, --hfq4kv, --temp T, --guards on|off
+//! Flags: --q8kv, --fp32kv, --hfq4kv, --temp T, --guards on|off
 //!
 //! `--guards` (default: off) opts the bare example into the production
 //! generation guards owned by the daemon: ChatML framing via
@@ -38,11 +38,9 @@ fn main() {
     }
     let args: Vec<String> = std::env::args().collect();
     let model_path = args.get(1)
-        .unwrap_or_else(|| { eprintln!("Usage: infer_qwen3 <model.hfq> [--q8kv|--fp32kv|--givens4|--givens2|--hfq4kv] [--temp T] [--guards on|off] [prompt...]"); std::process::exit(1); });
+        .unwrap_or_else(|| { eprintln!("Usage: infer_qwen3 <model.hfq> [--q8kv|--fp32kv|--hfq4kv] [--temp T] [--guards on|off] [prompt...]"); std::process::exit(1); });
 
     // Parse flags
-    let use_givens4 = args.iter().any(|a| a == "--givens4");
-    let use_givens2 = args.iter().any(|a| a == "--givens2");
     let use_q8kv = args.iter().any(|a| a == "--q8kv");
     let use_fp32kv = args.iter().any(|a| a == "--fp32kv");
     let use_hfq4kv = args.iter().any(|a| a == "--hfq4kv");
@@ -66,14 +64,7 @@ fn main() {
 
     let prompt_text = {
         let skip_flags = [
-            "--q8kv",
-            "--fp32kv",
-            "--hfq4kv",
-            "--givens4",
-            "--givens2",
-            "--temp",
-            "--maxgen",
-            "--guards",
+            "--q8kv", "--fp32kv", "--hfq4kv", "--temp", "--maxgen", "--guards",
         ];
         let mut skip_next = false;
         let parts: Vec<&str> = args[2..]
@@ -199,25 +190,7 @@ fn main() {
 
     // KV cache
     let kv_seq_len = config.max_seq_len.min(2048);
-    let mut kv_cache = if use_givens4 {
-        KvCache::new_gpu_asym3(
-            &mut gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_seq_len,
-        )
-        .unwrap()
-    } else if use_givens2 {
-        KvCache::new_gpu_asym2(
-            &mut gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_seq_len,
-        )
-        .unwrap()
-    } else if use_hfq4kv {
+    let mut kv_cache = if use_hfq4kv {
         KvCache::new_gpu_hfq4kv(
             &mut gpu,
             config.n_layers,
@@ -272,7 +245,7 @@ fn main() {
 
     // Prefill: try batched (skip for non-standard KV formats), fallback to sequential
     let t1 = Instant::now();
-    let prefill_logits = if use_givens4 || use_givens2 || use_hfq4kv {
+    let prefill_logits = if use_hfq4kv {
         Err(hip_bridge::HipError::new(
             0,
             "quantized KV requires sequential prefill",

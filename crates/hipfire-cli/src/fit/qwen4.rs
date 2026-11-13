@@ -50,8 +50,20 @@ pub(crate) fn analyze(req: &Qwen4Request<'_>) -> ArchFit {
 }
 
 fn analyze_inventory(req: &Qwen4Request<'_>) -> Result<ArchFit, String> {
-    let mut receipt = hipfire_arch_qwen4::admit_hfqm_artifact_on(req.hfq, Some(&req.device.arch))
-        .map_err(|error| error.to_string())?;
+    // The stock-FP8 head sidecar (`<model>.mtp`) joins the census exactly when the
+    // loader's §7.1 policy would attach it for this `speculation.mtp`.
+    let stock_mtp = hipfire_loader::admission::resolve_stock_mtp_sidecar(
+        req.hfq,
+        hipfire_config::parse_tri_state(req.params["mtp_mode"].as_str().unwrap_or("auto")),
+    )?
+    .sidecar;
+    let mut receipt = hipfire_arch_qwen4::artifact::admit_hfqm_artifact_with(
+        req.hfq,
+        Some(&req.device.arch),
+        hipfire_arch_qwen4::weights::trunk_shard::trunk_shard_drops_mtp_head(),
+        stock_mtp.as_ref(),
+    )
+    .map_err(|error| error.to_string())?;
     let recipe = &receipt.manifest.identity.recipe;
     let config = &receipt.config;
     // The loader-private qwen4_entry_bytes (qwen4_slab.rs:28-42) is a
@@ -70,9 +82,12 @@ fn analyze_inventory(req: &Qwen4Request<'_>) -> Result<ArchFit, String> {
                     .map(|layer| layer.bytes as u64);
             }
         }
-        req.hfq
-            .find_tensor_info(&entry.name)
-            .map(|info| info.data_size as u64)
+        hipfire_arch_qwen4::stock_mtp_sidecar::Qwen4StockSources {
+            base: req.hfq,
+            mtp: stock_mtp.as_ref().map(|bound| &bound.hfq),
+        }
+        .find_tensor_info(&entry.name)
+        .map(|info| info.data_size as u64)
     };
     let (non_expert, layer_experts) =
         residency::resident_split_ranks(&receipt.manifest.weights, bytes_of, 1)?;

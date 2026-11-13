@@ -136,16 +136,60 @@ fn best_entry(pool: &[VmmPrefixEntry], rendered: &[u32]) -> Option<(usize, Reuse
         .map(|(i, r, _)| (i, r))
 }
 
-/// Snapshot `dn` into `checkpoints` at the singleton's cadence.
+/// Snapshot `dn` into `checkpoints` at the singleton's cadence, sparing the
+/// lane's pinned user-turn snapshot (`turn.pin`). `stream` is the
+/// lane's committed token stream; the snapshot is attested against
+/// `stream[..pos]` (unattested when the lane's record is shorter than `pos`).
 pub fn checkpoint(
     checkpoints: &mut Checkpoints,
     dn: &DeltaNetState,
     kv: &hipfire_runtime::llama::KvCache,
     gpu: &mut rdna_compute::Gpu,
     pos: usize,
+    stream: &[u32],
+    turn: speculative::TurnCheckpoint,
 ) {
     if ckpt_resume_enabled() {
-        speculative::take_dn_checkpoint(checkpoints, dn, kv, gpu, pos, ckpt_interval(), ckpt_max());
+        speculative::take_turn_checkpoint(
+            checkpoints,
+            dn,
+            kv,
+            gpu,
+            pos,
+            ckpt_interval(),
+            ckpt_max(),
+            turn,
+            (stream.get(..pos).unwrap_or(&[]), &[]),
+        );
+    }
+}
+
+/// Before the lane forwards its prefill chunk `[pos, pos + len)` (the
+/// singleton's chunk plan): the user-turn snapshot exactly as the singleton
+/// takes it (`speculative::take_turn_checkpoint_before_chunk`).
+#[allow(clippy::too_many_arguments)]
+pub fn turn_checkpoint_before_chunk(
+    checkpoints: &mut Checkpoints,
+    dn: &DeltaNetState,
+    kv: &hipfire_runtime::llama::KvCache,
+    gpu: &mut rdna_compute::Gpu,
+    pos: usize,
+    len: usize,
+    stream: &[u32],
+    turn: &mut speculative::TurnCheckpoint,
+) {
+    if ckpt_resume_enabled() {
+        speculative::take_turn_checkpoint_before_chunk(
+            checkpoints,
+            dn,
+            kv,
+            gpu,
+            pos,
+            len,
+            ckpt_max(),
+            turn,
+            (stream.get(..pos).unwrap_or(&[]), &[]),
+        );
     }
 }
 
@@ -171,7 +215,6 @@ fn store(m: &LoadedModel) -> Option<&Qwen35VmmStore> {
 /// singleton speculator, Jinja rendering, prompt cache on, plain KV.
 pub fn pool_enabled(m: &LoadedModel) -> bool {
     m.speculator.is_none()
-        && m.eviction.is_none()
         && m.kv_adaptive.is_none()
         && m.pp <= 1
         && m.ep.is_none()
@@ -290,35 +333,16 @@ pub fn clear(state: &mut Option<Box<dyn ArchModel>>, gpu: &mut rdna_compute::Gpu
     }
 }
 
-/// Copy `src`'s DeltaNet state into `dst` (common buffer extent: same
-/// shapes, allocations may be pool-rounded differently). Synchronizes.
+/// Copy `src`'s complete DeltaNet state (recurrence, EF, GDN carry, cursors)
+/// into `dst` through the owner API, which validates stream identity and
+/// shapes before any byte moves. Synchronizes.
 fn copy_dn(
     gpu: &mut rdna_compute::Gpu,
-    dst: &DeltaNetState,
+    dst: &mut DeltaNetState,
     src: &DeltaNetState,
 ) -> Result<(), String> {
-    if dst.s_matrices.len() != src.s_matrices.len()
-        || dst.s_scales.len() != src.s_scales.len()
-        || dst.conv_states.len() != src.conv_states.len()
-        || dst.s_ef_residual.len() != src.s_ef_residual.len()
-    {
-        return Err("copy_dn: DeltaNet layouts differ".into());
-    }
-    let pairs = dst
-        .s_matrices
-        .iter()
-        .zip(&src.s_matrices)
-        .chain(dst.s_scales.iter().zip(&src.s_scales))
-        .chain(dst.conv_states.iter().zip(&src.conv_states))
-        .chain(dst.s_ef_residual.iter().zip(&src.s_ef_residual));
-    for (d, s) in pairs {
-        if d.shape != s.shape {
-            return Err("copy_dn: DeltaNet tensor shapes differ".into());
-        }
-        let n = d.buf.size().min(s.buf.size());
-        gpu.memcpy_dtod_at_auto(&d.buf, 0, &s.buf, 0, n)
-            .map_err(|e| format!("copy_dn: {e}"))?;
-    }
+    dst.copy_from(gpu, src)
+        .map_err(|e| format!("copy_dn: {e}"))?;
     gpu.hip
         .device_synchronize()
         .map_err(|e| format!("copy_dn: sync: {e}"))
@@ -502,7 +526,7 @@ pub fn singleton_adopt(
         checkpoints: cks,
         ..
     } = entry;
-    if let Err(e) = copy_dn(gpu, &b.dn_state, &st.dn) {
+    if let Err(e) = copy_dn(gpu, &mut b.dn_state, &st.dn) {
         // Bundle DeltaNet is undefined: zero it and serve cold.
         eprintln!("[vmm-prefix] singleton adopt: {e}; cold");
         let _ = b.dn_state.reset(gpu);

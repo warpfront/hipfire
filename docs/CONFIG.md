@@ -29,6 +29,7 @@ bundle with the dedicated profile command:
 ```bash
 hipfire config profile set default
 hipfire config profile set dev
+hipfire config profile set quality   # opt-in: F32 GDN recurrent state (memory.state_quant = "fp32")
 hipfire config profile set redline
 hipfire config profile create lab
 hipfire config profile              # interactive wizard
@@ -47,6 +48,11 @@ when all its keys are present with the same values. Custom snapshots live
 under `~/.hipfire/profiles/<name>.toml`. Profile names are not schema fields and
 are never written into `config.toml`. The Settings TUI and CLI share the
 hipfire-config helpers. Profiles are global-only.
+The built-in `quality` profile is the opt-in Flash-Next quality mode: it writes
+only `memory.state_quant = "fp32"` (F32 GDN recurrent state; lower KLD, costs
+decode/prefill speed and ~0.63 GiB/rank of lane reserve). It is never the
+default; `HIPFIRE_STATE_QUANT` still overrides it, and `hipfire config set
+state_quant auto` returns to the arch default.
 
 Edit global settings interactively with `hipfire config`. Per-model overlays use
 the typed commands: `hipfire config <tag> list|get|set|reset ...`. Global
@@ -56,8 +62,7 @@ In the TUI Settings tab every non-deprecated key is editable inline: its editor
 kind (cycle an enum, toggle a boolean, type a number or text) is derived from
 the schema's value rule, so the TUI offers exactly what `hipfire config set`
 accepts. `memory.kv_cache` offers `auto`, `q8`, `fwht4`, `fwht3`, `fwht2`, `fp8`,
-`bf16`, `f16` and `f32` (the deprecated `asymN`/`turboN` aliases stay settable
-only from the CLI). `developer.qwen4_moe_sym_iu4` is written as a TOML boolean.
+`bf16`, `f16` and `f32`. `developer.qwen4_moe_sym_iu4` is written as a TOML boolean.
 The tab reads the same layers as `hipfire config explain` (built-in defaults,
 the model's registry card, `config.toml`, `models.toml`, the environment) and
 shows, per row, the value predicted for the active model on your GPU and the
@@ -186,9 +191,7 @@ row follows "all models" again, like `hipfire config <model> reset KEY`) and
 (the screen form of `hipfire config overrides`); the Models tab shows the
 count as `N own values`.
 
-This page is the normative **key/default/enum** table. CASK/TriAttention is
-deprecated (removal in 0.5.0) and PFlash is retained legacy research (see their
-sections); multi-GPU topology
+This page is the normative **key/default/enum** table. Multi-GPU topology
 lives in its linked owner rather than a duplicated matrix here.
 
 ---
@@ -212,7 +215,7 @@ to `auto` and do not materialize an environment value until explicitly set:
 |---|---|
 | RDNA4 MQ4V2 gate/up decode | `kernel.gfx12_mq4v2_gateup_k5120` (exact gfx1201, K=5120, 17408 rows per output; default off) |
 | GEMV / quant | `kernel.gemv_dp4a`, `kernel.gemv_prefetch`, `kernel.gfx942_lds_gemv`, `kernel.hfq3_dp4a`, `kernel.hfq3_mmq`, `kernel.hfq4_mmq_rdna2`, `kernel.gcn5_wave64_hybrid`, `kernel.mmq`, `kernel.gfx942_gemv_v2` |
-| MoE | `kernel.moe_grouped_i8`, `kernel.moe_paro_i8`, `kernel.moe_paro_i8_k8` |
+| MoE | `kernel.moe_grouped_i8` |
 | Certified arch routes | `kernel.rdna3_hfq4_qkvza_k2048`, `kernel.rdna3_hfq4_residual_stage_x32`, `kernel.rdna3_hfq4_sigmoid_buffer`, `kernel.rdna3_rmsnorm_vecsum`, `kernel.gfx942_rmsnorm_split` |
 
 Stable/default-on and safety controls:
@@ -351,7 +354,7 @@ Typed schema keys (process-scoped):
 | `fusions.npu_trunk_calibration` | `""` | path string | See the stable-controls table above. |
 | `kernel.npu_spillover` | `false` | bool; env `HIPFIRE_NPU_SPILLOVER` | Opt-in, gfx1151-only XDNA NPU spillover sidecar. Needs a pulled, verified `.xdna.zip` sidecar declared by the registry entry: with the flag on and no declared sidecar the load stays GPU-only (one log line); a declared sidecar that is missing or fails verification fails the load with a `hipfire pull` hint. Never active on other architectures. |
 
-With `topology.ep` > 1 the loader refuses DFlash (including a draft path), DSpark, n-gram drafting, DDTree, adaptive KV, an EAGLE drafter, CASK, PFlash, an experts-per-token override and a non-`single` compute placement. Native MTP attaches only on an explicit request (`--spec mtp` / `speculation.mtp = "on"`; `auto` stays AR). Lane entry points, state snapshots and `HIPFIRE_MTP_SAMPLED_MODE=naive` are unsupported under Qwen4 EP.
+With `topology.ep` > 1 the loader refuses DFlash (including a draft path), DSpark, n-gram drafting, DDTree, adaptive KV, an EAGLE drafter, an experts-per-token override and a non-`single` compute placement. Native MTP attaches only on an explicit request (`--spec mtp` / `speculation.mtp = "on"`; `auto` stays AR). Lane entry points, state snapshots and `HIPFIRE_MTP_SAMPLED_MODE=naive` are unsupported under Qwen4 EP.
 
 The EP owner-routed prefill and the expert-staging levers have no typed schema key. They are `[developer]` keys (a legacy `HIPFIRE_FOO=value` maps to `developer.foo`), read from the process snapshot at load; restart the daemon after changing them. For the three `ep_*` levers only the exact value `0` turns the lever off.
 
@@ -378,6 +381,11 @@ The EP owner-routed prefill and the expert-staging levers have no typed schema k
 | `developer.qwen4_moe_x_lds` | `HIPFIRE_QWEN4_MOE_X_LDS` | `auto` | Exact gfx1151 F16 WMMA MoE route: the grouped gate/up SiLU and down GEMMs take X-through-LDS entries, bytewise the per-wave entries. `auto` arms exactly when a layer's MoE runs on the F16 WMMA route (its symmetric IU4 arm, above, is not selected); the default IU4 route is unchanged. `1` forces it wherever admissible, `0` keeps the per-wave entries. See `docs/env-vars.md`. |
 | `developer.ep_balanced_owners` | `HIPFIRE_EP_BALANCED_OWNERS` | on under EP (gfx1201 at 2..=4 ranks only) | Per-call balanced expert ownership on the host-mapped trunk MoE layers of an EP rank. Admitted on exact gfx1201 at 2..=4 ranks only (the certified owner-assign kernel's range); on gfx1100 the rank logs `balanced ownership not admitted (needs gfx1201); static split`, at 5..=8 ranks `... (needs at most 4 ranks); static split`, and runs the exact static `e % N` split. Off builds nothing. |
 | `developer.ep_expert_stage` | `HIPFIRE_EP_EXPERT_STAGE` | on (gfx1201 only) | Admits long-prefill expert staging under EP. Applies only when the owner-routed route is installed on gfx1201 (a gfx1100 rank logs `expert staging not admitted (needs gfx1201)` and builds nothing) and every trunk MoE layer in the forward binds the compact table. |
+| `developer.ep_mtp_experts_resident` | `HIPFIRE_EP_MTP_EXPERTS_RESIDENT` | on; exact `0` disables | Expert parallelism (2..=8 ranks) with the native MTP head attached: each rank keeps its OWNED slice of the head's routed experts (`e % ranks == rank`, 256 of 512 on EP2, 618.75 MiB per rank on Flash-Next planar MQ4) VRAM-resident instead of in pinned host RAM read over PCIe on every decode step. The bytes are charged to every rank's expert budget before the per-expert unit ranking walk (the trunk's static core shrinks by exactly them). Exact `0` restores the host-mapped head placement. Full semantics in `docs/env-vars.md` (`HIPFIRE_EP_MTP_EXPERTS_RESIDENT`). |
+| `developer.ep_hc8_plan_charge` | `HIPFIRE_EP_HC8_PLAN_CHARGE` | on; exact `0` disables | Expert parallelism (2..=8 ranks) with the native MTP head attached and an applied `<model>.hc8` sidecar: the plan and every rank's fit census charge the replicated HC mixer weights at their E4M3 size (the bytes the applied sidecar leaves allocated, 621 MiB less per rank on the Flash-Next fixture) instead of BF16, so the placement spends them on resident experts. Only tensors the runtime would replace and the census charged count; a rank whose sidecar applies less than the plan charged prints one warning (the load continues). Exact `0` restores the BF16 charge. Full semantics in `docs/env-vars.md` (`HIPFIRE_EP_HC8_PLAN_CHARGE`). |
+| `developer.ep_reserve_census` | `HIPFIRE_EP_RESERVE_CENSUS` | on; exact `0` disables | Expert parallelism (2..=8 ranks) reserve census: an exact gfx1201 two-rank load charges the measured per-rank HIP runtime (1,088 MiB, idle baseline included) and retires the historical single-device floor; on the trunk shard the GDN state, the native MTP capture ring and the shared-expert INT8 and F16 shadows are sized at the rank-local width instead of the global one; and the pooled pre-shard shared-expert copies are returned to HIP after the shard. Exact `0` restores today's EP reserve byte for byte (floor kept, global census terms, no pool drain). Single-device placement is unaffected. Full semantics in `docs/env-vars.md` (`HIPFIRE_EP_RESERVE_CENSUS`). |
+| `developer.ep_hot_units` | `HIPFIRE_EP_HOT_UNITS` | unset: discover `<model>.ep.hot-units`; `0` off; absolute path explicit | Flash-Next EP2 hot-unit loan sidecar: a calibrated host-read count per expert unit (`scripts/ep_hot_units.py`) that lets each rank keep its hottest calibrated host-demand units VRAM-resident on top of the ordinary placement, funded from the reserve census. Default on for an exact gfx1201 two-rank load with a per-expert unit plan, the reserve census and the D2 tail on, when the sidecar is present; no sidecar changes nothing. A discovered sidecar that does not bind is skipped with one log line; an explicit path that does not bind is a load error; any other value is a load error. Read once per load. Full semantics in `docs/env-vars.md` (`HIPFIRE_EP_HOT_UNITS`). |
+| `developer.ep_hot_loan_mib` | `HIPFIRE_EP_HOT_LOAN_MIB` | unset: the measured safe loan (768 MiB per rank); `0` off; positive integer MiB | Size of the hot-unit loan per rank, clamped to the measured safe loan with one log line; a non-integer value is a load error. Read once per load. Full semantics in `docs/env-vars.md` (`HIPFIRE_EP_HOT_LOAN_MIB`). |
 | `developer.qwen4_expert_stage` | `HIPFIRE_QWEN4_EXPERT_STAGE` | on for gfx1201 and, for the borrowed-donor (packed) stage, on any discrete device whose measured host-to-device link is narrow (< 16 GB/s); off for unified memory and an unmeasured link; `1` / `0` force | Long-prefill host-expert staging: a long forward borrows the VRAM of the last two resident expert layers as DMA stages (no dedicated VRAM) and restores them before it returns, so decode residency is unchanged. The restore copies are pinned host RAM on top of the placement's pinned experts (2 x 1,275 MiB on the Flash-Next packed artifact), reported separately in the `qwen4 long-prefill expert staging` log line. With the variable unset the load measures the link once per device (64 MiB pinned `hipMemcpyAsync` H2D, one warm-up then the best of 5 event-timed copies, GB/s = 10^9 B/s); on gfx1100 this happens before the expert placement is sized, because the narrow-link default prefill chunk (`prefill.chunk_rows`) sizes it, and fast arches and an explicit `HIPFIRE_PREFILL_CHUNK_ROWS` never probe for the chunk. The stage charge the placement applies reads only the probe-free switch (explicit value, else gfx1201), so a measured link changes which expert layers stay resident only through that 8192-row chunk. Slab and tier layouts, whose stage buffers are dedicated VRAM, stage only under that probe-free switch (explicit `1`, or gfx1201) and otherwise keep the zero-copy mapped reads. A failed probe is "unmeasured" and never narrow. Unified-memory devices are never copy-probed. gfx1201 (an R9700 in a Gen5 x16 slot included) keeps its existing default whatever the probe returns. |
 | `developer.qwen4_expert_stage_min_rows` | `HIPFIRE_QWEN4_EXPERT_STAGE_MIN_ROWS` | `min(2048, prefill chunk rows)`; a fixed `768` on a measured narrow discrete link off gfx1201; gfx1201 `2048` | Forwards with at least this many rows stage (integer ≥ 2, authoritative when set); smaller ones, decode and verify keep the mapped reads. The default is capped at the prefill chunk so a full chunk qualifies where the chunk is below 2048 (gfx1100 on a fast link: 1536); the narrow-link 768 is not lowered to the chunk, so a chunk admitted below 768 never stages. |
 | `developer.qwen4_expert_stage_capture` | `HIPFIRE_QWEN4_EXPERT_STAGE_CAPTURE` | on | `0` keeps the native-MTP prompt-fill tiles on the mapped reads. |
@@ -388,13 +396,19 @@ The EP owner-routed prefill and the expert-staging levers have no typed schema k
 | `developer.qwen4_decode_share_shadows` | `HIPFIRE_QWEN4_DECODE_SHARE_SHADOWS` | on | `0` keeps the F16 weight shadows and the shared-expert INT8 shadows resident. Default: an admitted `on` / `fixed` gfx1201 load keeps them in the start of the donor tail (rebuilt per borrow epoch; read only by borrowed prefill tiles), so their ~1,477 MiB of reserve becomes resident experts under `on`. |
 | `developer.qwen4_d2_default` | `HIPFIRE_QWEN4_D2_DEFAULT` | unset = measured selector | Typed boolean (`true` / `1`, `false` / `0`; any other spelling is rejected, never ignored). The per-load D2 measured default of an unset `memory.offload_exec` (see the "D2 measured default" bullet of the partial-offload section): unset runs the measured decode-cost comparison (the production CPU arm on the model's real host experts plus the copy-transport handoff, against PCIe from live link samples; D2 only when at least 15% faster), `true` turns the D2 CPU split on for every host-placed Flash-Next layer it can serve (hot-set tier layers, un-tiered host-mapped aggregate QT44/QT53 layers and host-mapped expert-slab layers whose present experts all have a CPU decoder) without the comparison (lab and receipt runs), `false` never arms it. An explicit `memory.offload_exec` always wins over both values, and `true` does not bypass `HIPFIRE_MOE_CPU_EXPERTS=0`, unified memory or an unsupported layer. Decode and `<=4`-row verify only; prefill, placement and host allocations are unchanged. |
 | `developer.qwen4_mtp_head_d2` | `HIPFIRE_QWEN4_MTP_HEAD_D2` | unset = follows the trunk's D2 | Typed boolean (`true` / `1`, `false` / `0`; any other spelling is rejected, never ignored), read once per load when the native MTP head attaches. Unset and `true` run the head's routed experts (`mtp.layers.0.mlp.experts.*`, host-mapped, 512 experts / top-10) on a rows=1 D2 CPU split executor instead of reading them over the link, **only when the trunk's D2 split is armed on the same load** (a fast-link card whose D2 default is off keeps the PCIe-read head) and the bundle is not expert-parallel; a head with a keep mask or a refused split admission keeps the GPU route. `false` / `0` never arms (the kill) and keeps the pre-L7 GPU head byte-for-byte; the only difference is one `off` load line. Return/ready/join transports are the trunk's process snapshot (`HIPFIRE_QWEN4_D2_RETURN/READY/JOIN`); there is no head-specific transport knob. Only draft numerics move (CPU arm vs the GPU grouped kernel, ULP level): the exact verify fixes every target token. Cost: +40 B device (`masked_indices`) and 112,760 B pinned host; the trunk's executors, capacity rows and census are unchanged. Every load prints one line, `qwen4 MTP head D2: armed (rows=1, ...)` or `qwen4 MTP head D2: off (<reason>)`. The head step is eager-only: under graph capture an armed head returns an error, never a GPU fallback. |
+| `developer.qwen4_mtp_head_resident` | `HIPFIRE_QWEN4_MTP_HEAD_RESIDENT` | off | Typed boolean (`true` / `1`, `false` / `0`; any other spelling is rejected, never ignored), read once per single-card load. `true` keeps the native MTP head's routed experts (`mtp.layers.0.mlp.experts.gate_up_proj` / `down_proj`, 512 experts at 2.61 MB, 1,275 MiB, MQ4G256V2 / MQ4G128V2) VRAM-resident instead of host-mapped through the ordinary resident tensor path, charging the bytes against the expert hot set's budget as non-expert weight (512 fewer hot trunk experts). A load that cannot afford them, has no applied ranked hot set or no attached head refuses the knob with one `qwen4 MTP head resident: refused (...)` line and keeps the host-mapped head. A resident head never arms the head D2 split (`qwen4 MTP head D2: off (HIPFIRE_QWEN4_MTP_HEAD_RESIDENT ...)`); the head then runs the GPU kernel, so the contract against head-on-D2 is the D2 KLD contract below (CPU accumulation order differs), compared by target ids and tau, not byte identity. |
+| `developer.qwen4_d2_window_rows` | `HIPFIRE_QWEN4_D2_WINDOW_ROWS` | unset = `8` on exact gfx1100 (aggregate/tier/whole-layer owners; slab recipes and EP keep `4`), `4` on every other arch; `4` is the kill on gfx1100 | Integer `4`..`8` (anything else refuses the load). Widens the D2 split's qualified whole-window verify from 4 rows to `N` without the lab-wide `HIPFIRE_QWEN4_WIDE_VERIFY_ROWS` override: executors built for `N` rows, the CPU arm serves windows up to `N` (no PCIe fallback), the native-MTP `auto` K cap follows (`min(GPU row-exact rows, N) - 1`, `N=8` is K7). Prefill, lanes, EP and the D1 splice are unchanged. See "D2 wide-window sweep" in the D2 status notes. |
 | `developer.qwen4_slowlink_prefill` | `HIPFIRE_QWEN4_SLOWLINK_PREFILL` | unset = AUTO default selector: automatic candidate selection from 1,537 rows (first genuinely multi-chunk request, one row past the 1,536-row tile bound); `0` kill switch; `1` forces the shipping-path candidate | **S1 slow-link layer-major prefill; AUTO is the default selector.** A typed boolean (`true`/`1`, `false`/`0`; any other spelling is a load error). Unset runs the automatic candidate selector on a load and request that satisfy every check below; `1` forces the shipping-path candidate (a capacity shortfall fails the load with its exact byte deficit instead of falling back to the incumbent); `0` is the kill switch and forces the incumbent, and the automatic selector never probes the link on a killed load. Considered only on exact gfx1100 with a discrete device whose measured pinned host-to-device link is narrow (< 16 GB/s; the existing cached probe, never the card's own sysfs width), the qualified MQ4 packed Flash-Next recipe, a single-device whole-model auto-placed load and a long enough context, with a request of at least 1,537 rows (automatic and forced share that floor); a short context, a fast link, unified memory or an unmeasured link never selects it under either selector, and neither does expert parallelism, a pipeline band, a hot set, `whole-first`, an explicit `developer.qwen4_expert_vram_layers`, the CPU expert splice, an expert-keep artifact, a selected NPU trunk or externally captured prefill; each of these is the incumbent before any reserve or mutation. An explicit `developer.qwen4_expert_stage` = `0` is an opt-out of this route too. When selected, the load admits placement for it first: the purpose's mixer tile (768 rows for the product profile that every state, headroom, greedy and perf cell runs on; 512 rows for the primitive self-test profile that proves kernel correctness only), the prompt arena, a dedicated double-buffered expert ring plus one next-layer lookahead page store and the session boundary state are charged together against the actual post-initialization free device memory, and the placement keeps the largest trunk-layer resident count that fits (ten preferred, never a floor; zero is valid when the base budget fits and a host layer remains). Each host layer's routed experts then cross the link once per admitted window (layer by layer, the next layer's weights prefetched during the current layer's compute) instead of once per prefill chunk; route-dependent work is never run early. It is not bitwise the incumbent's 8,192-row manifest: the gate requires same-route determinism, exact greedy ids against the beta autoregressive route and the paired code24 decode KLD verdict. Receipts (`Qwen4Bundle::slowlink_receipt`) report the route actually run, its windows, bytes and spans. Measured base on the XTX at pp16384 is 1,738.9-1,750.2 tok/s (accepted release, ~1.87x beta); 2,000 tok/s is not a release block. The intended followup is the quality-gated PLACE + IU4 candidate (ordered resident-layer placement, `developer.qwen4_slowlink_resident_layers`, plus the gfx1100 explicit-opt-in IU4 window route `AggregateSymIu4`, above); QSA is excluded (fails 4K, repaired separately, never part of this stack) and no qualified performance beyond the measured base is claimed. The validation contract and its current evidence are in [`VALIDATION.md`](VALIDATION.md#s1-slow-link-layer-major-prefill-claim-scoped). |
 | `developer.qwen4_sp` | `HIPFIRE_QWEN4_SP` | unset = on for exact gfx1100, off elsewhere; `0` kills | Typed boolean (`true` / `1`, `false` / `0`; any other spelling is rejected, never ignored), read once per Qwen4 load. Unset runs hybrid SP on exact gfx1100 (the default) and not on other architectures; `false` / `0` is the kill switch (touched-only SP then runs alone) and `true` / `1` asks for it on any arch (all but gfx1100 decline by name). SP, the short-prompt per-window mode of the S1 slow-link prefill (top-k\* experts stream, the rest run on the CPU, one canonical combine), when every load-time admission rule holds: an admitted S1 profile, exact gfx1100, the `Aggregate` window route (or `AggregateSymIu4`, whose SP windows run the F16 `Aggregate` route by a per-window override; see `docs/env-vars.md` `HIPFIRE_QWEN4_SP`), 512 experts, CPU quants for the host layers, a splice pool, the route-region fit (`sp_max_rows = min(5,376, fit)`, at least 2,048), the pinned-host fit and `serve.prefix_cache` off. A failed rule is a sticky named `sp: <reason>` decline that leaves S1 unchanged. Adds no VRAM: resident layers and the S1 census are identical with SP armed. When a rule declines the hybrid mode, touched-only SP (`developer.qwen4_sp_touched`, default on) runs instead and the load says why. Windows of 5..=`sp_max_rows` rows with no interior session cut, no one-row tile and capture `None`/`Bounded` take SP; every other window runs today's sweep. See [env-vars.md](env-vars.md). | With `developer.qwen4_sp_touched` also on, this hybrid mode wins and touched-only is its fallback.
 | `developer.qwen4_sp_touched` | `HIPFIRE_QWEN4_SP_TOUCHED` | unset = on for exact gfx1100, off elsewhere; `0` kills | Typed boolean (`true` / `1`, `false` / `0`; any other spelling is rejected, never ignored), read once per Qwen4 load. Unset runs SP's touched-only mode on exact gfx1100 (the default, exact: byte-identical to the stream-all sweep) and not on other architectures; `false` / `0` is the kill switch and `true` / `1` asks for it on any arch (all but gfx1100 decline by name). The mode: the S1 slow-link prefill runs its own per-panel pipeline on the same short windows as `developer.qwen4_sp`, but streams only the experts each host layer routes to (one selective ring schedule, no CPU expert, no K2-ized F32-tail tile, no pinned owner, no new VRAM), byte-identical to the stream-all sweep. Admission needs an admitted S1 profile, exact gfx1100, the `Aggregate` or `AggregateSymIu4` window route, an S1 window of at least 2,048 rows and a ring with one page per 32 experts; a failed rule is a sticky named `sp: <reason>` decline that leaves S1 unchanged. With `developer.qwen4_sp` also on, the hybrid mode wins. Full semantics in `docs/env-vars.md` (`HIPFIRE_QWEN4_SP_TOUCHED`). |
 | `developer.qwen4_expert_vram_layers` | `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS` | unset (automatic placement) | `N` keeps the routed experts of trunk layers before `N` in VRAM and places layers at or past `N` in pinned host RAM. |
-| `developer.qwen4_slowlink_resident_layers` | `HIPFIRE_QWEN4_SLOWLINK_RESIDENT_LAYERS` | unset or `front` = leading layers `0..N` | PLACE: which trunk layers an admitted S1 slow-link load keeps resident; the COUNT `N` stays the admission's decision. `front` (default, case-insensitive) is the incumbent placement; `spread` is the evenly-spaced set; otherwise a comma list of exactly `N` distinct layer indices. Any other value fails the S1 load naming the variable; MTP-layer experts stay host-mapped. Full semantics in `docs/env-vars.md` (`HIPFIRE_QWEN4_SLOWLINK_RESIDENT_LAYERS`). |
-| `developer.qwen4_expert_hotset` | `HIPFIRE_QWEN4_EXPERT_HOTSET` | unset: `<model>.expert-hotset` is used when it exists (gfx1201) | Lever1 expert hotset, a decode-ranked per-expert VRAM placement (sidecar `kind` `hipfire.qwen4.expert_hotset`, version 1; format and binding in `docs/env-vars.md` and below). Unset applies the sidecar beside the model when one exists; `0` is the kill switch (whole-layer placement); an absolute path names the sidecar explicitly; a relative or empty value is a policy error. A sidecar that does not apply (missing, unreadable, bound to another base, wrong dimensions, another architecture, explicit `developer.qwen4_expert_vram_layers`) keeps whole-layer placement and never fails the load. The expert budget keeps a 512 MiB VRAM margin. |
+| `developer.qwen4_slowlink_resident_layers` | `HIPFIRE_QWEN4_SLOWLINK_RESIDENT_LAYERS` | unset or `front` = leading layers `0..N` | PLACE: which trunk layers an admitted S1 slow-link load keeps resident; the COUNT `N` stays the admission's decision. `front` (default, case-insensitive) is the incumbent placement; `spread` is the evenly-spaced set; otherwise a comma list of exactly `N` distinct layer indices. Any other value fails the S1 load naming the variable; MTP-layer experts stay host-mapped on this single-card path (an expert-parallel load keeps each rank's owned slice VRAM-resident by default, `developer.ep_mtp_experts_resident`). Full semantics in `docs/env-vars.md` (`HIPFIRE_QWEN4_SLOWLINK_RESIDENT_LAYERS`). |
+| `developer.qwen4_expert_hotset` | `HIPFIRE_QWEN4_EXPERT_HOTSET` | unset: `<model>.expert-hotset` is used when it exists (gfx1201, and exact gfx1100 as part of the tier package `developer.qwen4_expert_hotset_gfx1100`) | Lever1 expert hotset, a decode-ranked per-expert VRAM placement (sidecar `kind` `hipfire.qwen4.expert_hotset`, version 1; format and binding in `docs/env-vars.md` and below). Unset applies the sidecar beside the model when one exists; `0` is the kill switch (whole-layer placement); an absolute path names the sidecar explicitly; a relative or empty value is a policy error. A sidecar that does not apply (missing, unreadable, bound to another base, wrong dimensions, another architecture, explicit `developer.qwen4_expert_vram_layers`) keeps whole-layer placement and never fails the load. The expert budget keeps a 512 MiB VRAM margin. |
 | `developer.qwen4_expert_hotset_policy` | `HIPFIRE_QWEN4_EXPERT_HOTSET_POLICY` | unset: `ranked` | Developer-only, default-off placement policy for the Qwen4 expert hotset on exact gfx1201. `ranked` (the default, also when unset) is the current ranked per-expert hotset, unchanged. `whole-first` runs the same baseline whole layers as `developer.qwen4_expert_hotset` = `0` (same placement, materialization and route; no partial or tiered layers, no mixed experts, hot experts = 0), does not consult the sidecar even when `developer.qwen4_expert_hotset` names a path, and keeps the baseline long-prefill staging, charged to the same budget. Any other value is a load error naming the variable; where no hot set could apply (pipeline-parallel band, expert parallelism, explicit `developer.qwen4_expert_vram_layers`, unified memory) it is ignored with one log line, and gfx1100 ignores it silently. It preserves decode safety but may lose the ranked hotset's long-prefill gain, and decode and prefill may not both fit in the available memory; no new performance claim. Details in `docs/env-vars.md`. |
+| `developer.qwen4_expert_hotset_gfx1100` | `HIPFIRE_QWEN4_EXPERT_HOTSET_GFX1100` | unset = ON on exact gfx1100; `0` turns the package off | The one switch of the gfx1100 (7900 XTX) Flash-Next single-card tier package, default ON on exact `gfx1100` (no effect on any other arch): the default sibling `<model>.expert-hotset` applies, S1 prefill runs over the tier plan (`developer.qwen4_s1_tier`), a non-S1 hot set uses the census reserve (`developer.qwen4_expert_hotset_census_reserve`), tier D2 splits use event readiness (`developer.qwen4_d2_ready`) and mixed layers the CP-wait join (`developer.qwen4_d2_mixed_cpwait`). `0` returns every member to its previous default; each member's own key wins over the package. An explicit `developer.qwen4_expert_hotset` path (any arch) and the `0` kill are unchanged. |
+| `developer.qwen4_s1_tier` | `HIPFIRE_QWEN4_S1_TIER` | unset = ON on exact gfx1100, off elsewhere | Developer; default ON on exact gfx1100 as part of the tier package (`0` is the kill): `1` admits S1 slow-link prefill over an applied ranked hot set (every layer streams; hot experts are copied device-to-device into the panel pages, cold ones over the link; zero whole layers resident; the hot-set budget follows the S1 reserve). Unset, a hot set declines S1 as before. |
+| `developer.qwen4_expert_hotset_census_reserve` | `HIPFIRE_QWEN4_EXPERT_HOTSET_CENSUS_RESERVE` | unset = ON on exact gfx1100, inert elsewhere | Developer; default ON on exact gfx1100 as part of the tier package (`0` is the kill): `1` sizes the gfx1100 hot-expert payload from the reserve census plus the 1 GiB runtime budget of the S1 admission instead of `max(historical floor, census)`; lowers the reserve only, margin and tables unchanged, inert off gfx1100. |
+| `developer.qwen4_tier_counters` | `HIPFIRE_QWEN4_TIER_COUNTERS` | unset (off) | Developer-only diagnostic: `1` counts hot / CPU-cold / PCIe-cold distinct experts per D2 split layer call and prints one `[tier-counters]` aggregate per request (next cold prefill) and at unload (D2 armed only). |
 | `developer.ep_peer_allreduce_decode` | `HIPFIRE_EP_PEER_ALLREDUCE_DECODE` | unset (canonical) | `1` selects the legacy unrooted peer all-reduce diagnostic, `0` selects RCCL. |
 
 **S1 session-cache pressure host snapshots (opt-in with S1; no setting of its own).** When the S1 slow-link profile is attached to a load, the session cache is armed with a generic, bounded pressure-selected pinned-host snapshot policy; with no S1 profile nothing is armed and the non-S1 cache and admission behave byte for byte as before, with no extra allocation. The policy needs no new variable or config key and no architecture, card or format gate: its host budget is the cache's existing `memory.session_cache_bytes` (the gate fixture configures 2 GiB), and its device budget is the admitted profile's `device_snapshot_budget_bytes`, the admitted remaining free device memory after the non-expert and resident-layer bytes and the joint reserve (which already includes the safety margin). That budget is discretionary cache capacity above the full S1 peak plus safety, not extra reserve and not safety credit. Under device memory pressure a capture is placed in pinned host memory instead of being skipped: the part is copied directly into its final pinned allocation (never through a full device clone), the host tier is bounded by the host budget with normal eviction across pool, pending, resident, deferred and parked owners, restores copy straight back into the live context, and the existing device guard (and the 512 MiB floor for S1 device-policy allocations) still applies. Lineage, delta ranges and abort semantics are unchanged. Host ownership is reported beside the device-only fields in `SessionCacheUsage` (`host_budget_bytes`, `host_pool_bytes`, `host_pending_bytes`, `host_resident_bytes`, `host_deferred_release_bytes`, `host_parked_bytes`, `host_total_bytes()`, and the `host_captures_total`, `host_restores_total`, `host_evictions_total` and `host_skips_total` counters); the device fields and `device_total_bytes` stay device-only. The unchanged 512 MiB whole-product minimum-free gate and the 768-row product tile are not relaxed (the resident layer count is adaptive, ten preferred), and this storage tier does not by itself recover the active-compute headroom the historical hold missed. The envelope figure is a historical source-derived estimate with no GPU pass and no final base CI/serve PASS claimed: a source-derived host envelope estimate (S1 host census 52,930,156,544 B + the 2 GiB host pool + a 620,021,760 B pending ceiling + a 2 GiB driver allowance = 57,845,145,600 B against the 54 GiB declaration of 57,982,058,496 B, 136,912,896 B to spare) is an estimate, not a measurement, and no GPU pass is claimed.
@@ -507,8 +521,8 @@ model's contract still accepts the named-cap route):
 
 | Key | Default | Validated values |
 |---|---|---|
-| `kv_cache` | `"auto"` | `auto`, `q8`, `fp8`, `bf16`, `fwht4`, `fwht3`, `fwht2`, `f32`/`f16` (DeepSeek V4 only); legacy spellings `asym4`, `asym3`, `asym2`, `turbo`, `turbo4`, `turbo3`, `turbo2`, `legacy-asym3` (family-dependent; see below) |
-| `kv_k` | empty (unset) | Qwen-only: `q8`, `fwht2`–`fwht4`, `asym2`–`asym4`, `turbo`/`turbo2`–`turbo4`, `legacy-asym2`–`legacy-asym4` |
+| `kv_cache` | `"auto"` | `auto`, `q8`, `fp8`, `bf16`, `fwht4`, `fwht3`, `fwht2`, `f32`/`f16` (DeepSeek V4 only); the `asymN`/`turboN`/`legacy-asym3` spellings were removed in 0.5.0 and are rejected (family-dependent support; see below) |
+| `kv_k` | empty (unset) | Qwen-only: `q8`, `fwht2`–`fwht4` (`asymN`, `turbo`/`turboN` and `legacy-asymN` were removed in 0.5.0 and are rejected) |
 | `kv_v` | empty (unset) | Qwen-only: `q8`, `lloyd2`–`lloyd4` |
 | `kv_adaptive` | `"off"` | `off`, `conservative`, `balanced`, `aggressive`, or `advanced:k=<fwht4\|fwht3\|fwht2>,v=<lloyd4\|lloyd3\|lloyd2>` |
 | `kv_backend` | schema `"vmm"`; automatic when not authored | `legacy` \| `vmm` |
@@ -535,34 +549,25 @@ throughput; the capacity delta itself is not yet measured on this host.
 
 - `q8` → Q8 K
 - `fwht2` \| `fwht3` \| `fwht4` → signed FWHT K at that bit width
-- `asym2` \| `asym3` \| `asym4` and `turbo` \| `turbo2` \| `turbo3` \| `turbo4`
-  → **FWHT** K (`turbo` ≡ `fwht3`, `turboN`/`asymN` ≡ `fwhtN`). These are
-  legacy spellings kept as aliases; they do not build the old Givens-Asym
-  constructors. **Deprecated since 0.4.0, removal in 0.5.0**: spell `fwhtN`.
-- `legacy-asym2` \| `legacy-asym3` \| `legacy-asym4` → old Givens-Asym K
-  (**legacy**; explicit rollback spelling, `--kv-k` / `memory.kv_k` only —
-  `memory.kv_cache` does not accept it). **Deprecated since 0.4.0, removal in
-  0.5.0**: fwht3 supersedes Givens asym KV.
 
-Naming any deprecated KV value at load prints one line:
-`[hipfire-daemon] warning: KV name '<name>' is deprecated and will be removed in 0.5.0 (…; use fwhtN or q8)`.
+**Removed in 0.5.0:** `asym2` \| `asym3` \| `asym4`, `turbo` \| `turbo2` \|
+`turbo3` \| `turbo4` (aliases of `fwhtN` on Qwen) and `legacy-asym2` \|
+`legacy-asym3` \| `legacy-asym4` (Givens asym K). They are rejected by
+`memory.kv_cache` / `memory.kv_k` validation (config file, `config set`,
+`--kv-mode`, `--kv-k`), the `HIPFIRE_KV_MODE` environment variable and the
+daemon load request, with
+`KV name '<name>' was removed in 0.5.0 (…); use fwht2|fwht3|fwht4 or q8`.
 
 `fwht3` (and `fwht2`/`fwht4`) is an optional **headroom** mode on the
 Qwen3.5-family sites of every arch: it shrinks K to trade quality for
 context/VRAM. No default selects it (only the developer kill switch below).
 
-Qwen3 dense (flat constructor) accepts only `q8` K plus `legacy-asym3` /
-`legacy-asym4` at head_dim 256; bare `asymN`/`turboN`/`fwhtN` are refused.
-Outside Qwen, the llama-family **HFQ** loader keeps the pre-migration alias
-table: bare `asym3`/`asym4`/`turbo4` still build the legacy Givens
-constructors, while `asym2`/`turbo2`/`turbo`/`turbo3`/`fwhtN` are unsupported
-and fall back to `q8` with a warning. The llama **Dir** loader reads names
-through the Qwen table, so bare `asymN`/`turboN` mean FWHT there and fall back
-to `q8` with a warning. Those llama spellings are deprecated the same way.
+Qwen3 dense (flat constructor) accepts only `q8` K; `fwhtN` is refused. The
+llama-family **HFQ** and **Dir** loaders accept `q8`; any other name falls back
+to `q8` with a warning (removed names say so).
 
 **Qwen V names:** `q8`, `lloyd2`, `lloyd3`, `lloyd4`. Lloyd V **requires**
-FWHT K (including `asymN`/`turboN` aliases that resolve to FWHT). Lloyd V
-with `q8` or `legacy-asymN` K is rejected before teardown.
+FWHT K. Lloyd V with `q8` K is rejected before teardown.
 
 **Native pairs are indivisible.** An authored `--kv-mode fp8` or `bf16`
 (or the same via config) cannot be combined with any authored K or V axis
@@ -573,19 +578,18 @@ both axes together may replace that pair when the constructor supports
 them; a single axis against native FP8 refuses and advises `--kv-mode q8`
 or both axes (never FP8-K/Q8-V).
 
-Unsupported K/V by topology, head dimension, or arch; static CASK with
-FWHT/Lloyd-V; and explicit native FP8/BF16 on unsupported arch/PP all fail
+Unsupported K/V by topology, head dimension, or arch; and explicit native FP8/BF16 on unsupported arch/PP all fail
 **before** destructive teardown with requested/effective values and
 supported alternatives. No silent fallback on unsupported Qwen sites.
 
 **Resolution of `auto` / unset (Qwen family):** native **fp8** (one K+V
 layout) on exact **gfx1201** single GPU (`pp = tp = 1`) when the load is
 native-eligible: attention geometry H24 / Hkv4 / D256 (dense 27B-class) or
-H16 / Hkv2 / D256 (A3B MoE-class), no `kv_adaptive`, no CASK sidecar, no
+H16 / Hkv2 / D256 (A3B MoE-class), no `kv_adaptive`, no
 slots, no TP/PP split. Native `bf16` stays H24 dense-only: `auto` never
 resolves an A3B load to `bf16`. Every other Qwen load resolves **q8/q8**:
 gfx1100, gfx1151 and every other arch; gfx1201 with a different geometry,
-with adaptive or CASK, on slots, or on PP / dense TP / MoE EP (those
+with adaptive, on slots, or on PP / dense TP / MoE EP (those
 policies have no native constructor); and Qwen3 dense (flat constructor).
 gfx1200 / gfx11 / gfx94x never inherit fp8. Registry Qwen cards leave mode
 as `auto` (a registry `default_kv_mode = "q8"` is not lowered into config).
@@ -594,7 +598,6 @@ as `auto` (a registry `default_kv_mode = "q8"` is not lowered into config).
 auto; explicit `--kv-mode q8` still works). Gemma4 keeps its sliding tier
 Q8 on every variant; its full-attention tier follows `kv_cache`: `auto`/`q8`
 → Q8 on every arch (no Gemma4 attend site admits native FP8),
-`legacy-asym3` → the previous Givens Asym3 K + Q8 V,
 `fp8`/`bf16` → load error, anything else → Q8 with a warning. Only Q8/Q8
 loads take batched prefill and the session cache. llama HFQ,
 MiniMax and LFM2-MoE resolve `auto` to q8. DeepSeek4 keeps its F32
@@ -791,8 +794,7 @@ lower the context or fall back to Q8.
 
 **Kill switch:** `HIPFIRE_QWEN_KV_DEFAULT_Q8=0` (developer variable) restores
 the prior *implicit Qwen* per-site default wherever `auto` does not pick
-native fp8: HFQ `auto`/unset → FWHT3 K + Q8 V, PaRo `auto` → FWHT3/Q8,
-PaRo unset → Q8/Q8, other sites Q8/Q8. Default is ON (Q8/Q8). It must not
+native fp8: HFQ `auto`/unset → FWHT3 K + Q8 V, other sites Q8/Q8. Default is ON (Q8/Q8). It must not
 override any authored CLI/config mode or K/V, must not touch the eligible
 gfx1201 fp8 path, and must not affect non-Qwen families.
 
@@ -830,8 +832,15 @@ the same source/mode/topology; registry cards set neither backend nor
 gfx1100/gfx1151 the certified Qwen3.5-family VMM KV pairs are Q8/Q8 and, on
 exact gfx1100 TP1 only, FWHT2/3/4 K with Q8 or Lloyd2/3/4 V. Existing
 pipeline-parallel VMM restrictions still apply. Unsupported combinations
-retain the existing legacy fallback,
-except on gfx1151 Qwen3.5-family loads (arch 5/6): a nonempty `kv_k` override
+retain the existing legacy fallback.
+Automatic selection also proves the runtime can reserve address space before
+any weight is uploaded: the daemon performs one real `hipMemAddressReserve`
+of a single allocation granule per device (retired, never mapped) and, if the
+call fails, resolves **legacy** with the driver's error in the logged reason
+(on gfx1100 the Q8 FA2 split-KV verifier, which admits VMM caches only, stays
+off instead of refusing the load). An explicit `--kv-backend vmm` is refused
+at admission with the same reason and names `--kv-backend legacy` as the fix.
+Exception: on gfx1151 Qwen3.5-family loads (arch 5/6): a nonempty `kv_k` override
 selecting FWHT2/3/4 (including typed aliases) with an unset/`auto`/`q8` mode
 is refused unless `--kv-backend legacy` is explicit. There is no certified
 gfx1151 VMM FWHT path, so this refusal also applies when VMM runtime or
@@ -840,7 +849,7 @@ retains the ordinary automatic legacy fallback; gfx1100 TP/Givens fallback,
 gfx1201 selection and defaults are unchanged.
 
 Qwen4 (Flash-Next, arch 16) owns its own QSA context layout. Automatic
-selects **vmm** exactly on gfx1151 or gfx1201 with a certified platform (not Windows,
+selects **vmm** exactly on gfx1151, gfx1201 or gfx942 with a certified platform (not Windows,
 not WSL without its unsafe override) and a HIP VMM runtime; elsewhere it
 selects legacy and logs the reason. Explicit `legacy` is always honoured, and
 explicit `vmm` is refused only where that capability check fails. Under VMM,
@@ -926,7 +935,7 @@ capacity; the preflight weight projection never caps the effective context.
 Only full-attention layers carry KV (16 of 64 for Qwen3.8-27B), so card capacity
 divides that remaining memory by the selected K+V token stride. VMM reserves
 virtual space to `max_seq` and maps physical pages on demand; without eviction,
-`physical_cap == max_seq`, while deprecated CASK eviction can make `physical_cap < max_seq`.
+`physical_cap == max_seq`.
 The carrier's cap is provisional (it also charges the DFlash/MTP draft reserve):
 it sizes the VMM reservation and the draft structures before the drafts, DeltaNet
 state and scratch exist. So the automatic context is **re-measured after the
@@ -948,6 +957,16 @@ A -> B` line, and lowers the published context (and `card_cap`) to it; below 512
 the load is refused. An explicit `max_seq` that does not fit is refused at load,
 naming the largest fitting value; with `memory.oom_guard` off it loads and only
 warns.
+A user-terminated prompt (its render ends in a generation prompt) also snapshots the
+DeltaNet state at the newest prefill chunk end at or before its
+`<|im_start|>assistant\n` opener (the start of the chunk that holds it), in the same
+ring and regardless of the `HIPFIRE_CACHE_CKPT_INTERVAL` stride, and the ring never
+recycles the newest such snapshot. The chunk plan is not changed for it, so the
+prefill's output is unchanged. Qwen3.5-style
+templates drop the reasoning of every assistant turn before the latest user message,
+so the next user turn's re-render diverges from the stored stream at that opener; the
+turn resumes from that snapshot after any number of tool rounds instead of
+cold-prefilling the whole conversation, replaying at most one outer prefill chunk.
 Larger prefill PBS allocations are lazy: each request chooses, once per prompt,
 the widest rung that fits currently free VRAM after mapped (not virtually
 reserved) KV minus the KV the same prompt will still map (the AR, vision,
@@ -981,9 +1000,7 @@ and never silently falls back (refusal may suggest `--kv-backend legacy`).
 
 Unsupported automatic cases (for example MoE EP/PP, non-Qwen carriers without a
 matching owner, uncertified device/OS, or missing HIP VMM symbols) keep
-legacy service with a logged reason. The deprecated adaptive→CASK handoff **requires**
-VMM: if VMM is unavailable that combination is refused rather than handed off as
-invalid legacy. Private speculative draft caches (DFlash/MTP) are owned
+legacy service with a logged reason. Private speculative draft caches (DFlash/MTP) are owned
 separately from the trunk KV backend and do not relabel it; their actual backend
 is logged on its own.
 
@@ -1045,7 +1062,7 @@ Legacy one-shot alias: `HIPFIRE_SPECULATION`. CLI: `--spec`.
 
 | Key | Default | Values / range | Notes |
 |---|---|---|---|
-| `dflash_mode` | `"off"` | `on` \| `off` \| `auto` | **Schema default off; one registry-scoped exception.** `auto` enables on dense Qwen3.5-class targets and skips known-loss A3B cases. The registry layer (below the global / per-model / one-shot config, above the schema default) lowers `speculation.dflash = "auto"` for the Qwen3.8-27B trunk tiers that declare a paired `dflash` draft (`qwen3.8:27b`, `qwen3.8:27b-mq3*`, `qwen3.8:27b-mq4*`; not the `-draft-*` sidecar tags, not tiers without a `dflash` declaration). See [Qwen3.8-27B paired DFlash default](#qwen38-27b-paired-dflash-default). **Non-WMMA GPUs (gfx1030 and other pre-RDNA3 arches):** a DFlash draft over an MQ V2 / MQ3 output layer (e.g. MQ4G256V2, qt=44) is refused at load admission (#771) because DFlash's batched lm_head admission for those formats is validated only on the gfx11/gfx12 WMMA set (a generic non-WMMA x-batch scalar kernel exists but is not validated for DFlash verify); the refusal names the GPU and the format and says to set `dflash_mode off` (or `--spec off`). Autoregressive decode and Q8/HFQ4/MQ4G256 output layers are unaffected. `on` requires a DFlash draft and fails the load without one, even when an MTP head is present. It never enables MTP; use `--spec mtp` / `speculation.mtp=on` instead. |
+| `dflash_mode` | `"off"` | `on` \| `off` \| `auto` | **Schema default off; one registry-scoped exception.** `auto` enables on dense Qwen3.5-class targets and skips known-loss A3B cases. The registry layer (below the global / per-model / one-shot config, above the schema default) lowers `speculation.dflash = "auto"` for the Qwen3.8-27B trunk tiers that declare a paired `dflash` draft (`qwen3.8:27b`, `qwen3.8:27b-mq3*`, `qwen3.8:27b-mq4*`; not the `-draft-*` sidecar tags, not tiers without a `dflash` declaration) and, by explicit allow-list, for `raon-1-mini-preview` (its `raon-1-mini-preview-dflash2.mq4` DFlash2 draft; plain AR when the draft is not pulled, `speculation.dflash = off` opts out). See [Qwen3.8-27B paired DFlash default](#qwen38-27b-paired-dflash-default). **Non-WMMA GPUs (gfx1030 and other pre-RDNA3 arches):** a DFlash draft over an MQ V2 / MQ3 output layer (e.g. MQ4G256V2, qt=44) is refused at load admission (#771) because DFlash's batched lm_head admission for those formats is validated only on the gfx11/gfx12 WMMA set (a generic non-WMMA x-batch scalar kernel exists but is not validated for DFlash verify); the refusal names the GPU and the format and says to set `dflash_mode off` (or `--spec off`). Autoregressive decode and Q8/HFQ4/MQ4G256 output layers are unaffected. `on` requires a DFlash draft and fails the load without one, even when an MTP head is present. It never enables MTP; use `--spec mtp` / `speculation.mtp=on` instead. |
 | `vision_mode` | `"auto"` | `auto` \| `resident` \| `on` \| `off` | **Default auto** (was `off` before 0.4.4). Tower sidecar gate and residency — see [Vision tower](#vision-tower). |
 | `dflash_adaptive_b` | `false` | bool | **Opt-in.** Adaptive verify-block width: follows the trailing 8-cycle acceptance depth (τ̂+2), full below 2k context. Not output-identical (window boundaries move; per-position sampling stays target-lossless). Auto-suppressed on retained-PM4 verify loads. `HIPFIRE_DFLASH_ADAPTIVE_B=0` is a kill switch read through the `[developer]` namespace (not a schema env alias): it forces the fixed block even when this is `true`, and cannot enable adaptive. |
 | `dflash_block` | `"auto"` | `"auto"` \| int 4–16 | DFlash2 proposal width L (`speculation.dflash_block`, env `HIPFIRE_DFLASH_BLOCK`). Chosen **per serving configuration, never per live batch**: every request of a load (singleton or batched VMM lane) runs the same L, so batched output stays byte-identical to the singleton and text never depends on server load. **Default `auto`** = 8 when `serve.vmm_batch` is on with `continuous_batch_size` ≥ 4 (a full C8 verify step stays at 64 rows instead of 128), else 16. A lone request on a batching serve runs slower at 8 than at 16. `16` (or `HIPFIRE_DFLASH_BLOCK=16`) restores the previous fixed width. Greedy text depends on L (different window boundaries). Legacy DFlash drafts always run their declared width. Retained-PM4 verify and dense TP2 need 16. The experimental multi-slot route admits only 16 (`auto` resolves to 16 there). |
@@ -1071,10 +1088,11 @@ snapshot. Full aliases: [`env-vars.md`](env-vars.md).
 
 ### Qwen3.8-27B paired DFlash default
 
-The built-in `speculation.dflash` default stays `off` and `speculation.mtp` stays `auto` (`auto` arms MTP only for a producer with a declared measured AR floor, so today only Qwen4; the registry layer never changes this). The registry config layer is the only place that changes this, and only for Qwen3.8-27B trunk tags (`qwen3.8:27b` and `qwen3.8:27b-*`, never a longer lookalike) whose registry entry declares a `dflash` sidecar; it writes `speculation.dflash = "auto"`. Explicit global, per-model and one-shot config rank above the registry layer.
+The built-in `speculation.dflash` default stays `off` and `speculation.mtp` stays `auto` (`auto` arms MTP only for a producer with a declared measured AR floor, so today only Qwen4; the registry layer never changes this). The registry config layer is the only place that changes this, and only for Qwen3.8-27B trunk tags (`qwen3.8:27b` and `qwen3.8:27b-*`, never a longer lookalike) and the explicit `raon-1-mini-preview` tag, whose registry entry declares a `dflash` sidecar; it writes `speculation.dflash = "auto"`. Explicit global, per-model and one-shot config rank above the registry layer.
 
 - **Paired draft file present** (the registry-declared `dflash.file` next to the model, or a `developer.dflash_draft` / `HIPFIRE_DFLASH_DRAFT` / `run --model-draft` path): the load wires it and DFlash runs.
 - **Paired draft file absent:** nothing fails and nothing is wired. The load keeps MTP `auto` (the registry `mtp` head); `auto` arms native MTP only for a producer that declares a measured AR floor, which Qwen35 does not, so the 27B then runs AR unless `--spec mtp` / `speculation.mtp = "on"` opts in (see [`mtp_mode`](#speculative-decode)).
+- **Raon-1-mini-preview:** the same `auto` policy. With `raon-1-mini-preview-dflash2.mq4` pulled, the Raon carrier builds the DFlash2 speculator; without it the load logs `DFlash draft … not pulled` and runs plain AR (Raon has no MTP). Penalized requests (the registry's presence default included) run DFlash2 too: verify rows are penalized against AR's generated-only history. A `topology.pp` load under `auto` ignores the draft and runs plain AR.
 - **Kill switch:** an explicit `dflash_mode off` wins over the registry layer: `hipfire config qwen3.8:27b set dflash_mode off` (per model), `hipfire config set dflash_mode off` (global), or `HIPFIRE_DFLASH_MODE=off`. The canonical key is `speculation.dflash = "off"`.
 - **Unchanged:** every other model keeps the schema `off` (Qwen3.5/3.6, Flash-Next / `arch_id=16`, the `-draft-*` and sidecar tags, and 27B tiers with no `dflash` declaration such as `mq5*` / `mq6*`). `dflash_block` stays `auto`: 16 on a singleton load, 8 on a `serve.vmm_batch` serve with `continuous_batch_size` ≥ 4, and the IU4 verify gates ([above](#mechanism-knobs)) are untouched.
 - **Output:** DFlash greedy decode is not promised byte-identical to AR (or to MTP): near an argmax tie the multi-row verify can pick the other token, and the text then diverges from that point. Batched output stays byte-identical to the singleton within a configuration.
@@ -1120,32 +1138,6 @@ compatibility overrides.
 
 ---
 
-## CASK / TriAttention eviction (deprecated, removal in 0.5.0)
-
-CASK / TriAttention KV eviction (including FlashCASK under DFlash) is
-deprecated since 0.4.0 and will be removed in 0.5.0. The keys below still
-load, but the path is **not supported**, not a recommended setting, and not an
-acceptance route. Every load that sets `cask_sidecar` or `cask=true` prints one
-warning line:
-`[hipfire-daemon] warning: CASK is deprecated and will be removed in 0.5.0; not supported`.
-All defaults leave it off, and a downloaded `.triattn*.bin` sidecar never
-attaches unless `cask_sidecar` or `cask_auto_attach=true` is set.
-
-| Key | Default | Range |
-|---|---|---|
-| `cask_sidecar` | `""` | path string; empty = disabled |
-| `cask` | `false` | bool (m-fold vs plain drop) |
-| `cask_budget` | `512` | int 64–65536 |
-| `cask_beta` | `128` | int 0–65536 |
-| `cask_handoff_tokens` | `0` | int 0–1048576 |
-| `cask_core_frac` | `0.5` | number 0.0–1.0 |
-| `cask_fold_m` | `2` | int 1–16 |
-| `cask_auto_attach` | `false` | bool |
-
-Sidecar generation (deprecated with CASK): `hipfire sidecar-gen` — [`CLI.md`](CLI.md).
-
----
-
 ## Prompt processing
 
 | Key | Default | Values |
@@ -1154,37 +1146,6 @@ Sidecar generation (deprecated with CASK): `hipfire sidecar-gen` — [`CLI.md`](
 
 Collapse `\n{3,}` → `\n\n` at engine entry. Legacy alias:
 `HIPFIRE_NORMALIZE_PROMPT` (`0`/`false`/`off`/`no` disable).
-
----
-
-## PFlash speculative prefill (deprecated, removal in 0.5.0)
-
-| Key | Default | Range / values |
-|---|---|---|
-| `prefill_compression` | `"off"` | `off` \| `auto` \| `always` |
-| `prefill_threshold` | `32768` | int 0–1048576 |
-| `prefill_keep_ratio` | `0.05` | (0, 1] |
-| `prefill_alpha` | `0.85` | [0, 1] |
-| `prefill_min_keep` | `2048` | int 0–1048576 |
-| `prefill_sink` | `256` | int 0–65536 |
-| `prefill_recent` | `1024` | int 0–65536 |
-| `prefill_block` | `128` | int 1–4096 |
-| `prefill_drafter` | `""` | path |
-| `prefill_drafter_device` | `-1` | int −1–15 (`-1` = same device as target) |
-| `prefill_profile` | `false` | bool |
-| `prefill_sparse_threshold` | `32768` | int 0–1048576 |
-| `prefill_drafter_kv` | `"q8"` | `q8` \| `fwht4` \| `fwht3` \| `fwht2` (`speculation.prefill.drafter_kv`, env `HIPFIRE_PFLASH_DRAFTER_KV`) |
-| `diagnostic.pflash.score_layer` | `null` | `null` or int 0–65535 (env `HIPFIRE_PFLASH_SCORE_LAYER`) |
-
-**Status:** deprecated since 0.4.0, removal in 0.5.0; not supported. Prefix
-caching supersedes it. Setting `prefill_compression` to anything but `off`
-prints one line at load:
-`[hipfire-daemon] warning: PFlash is deprecated and will be removed in 0.5.0; not supported, prefix caching supersedes it (prefill_compression=<mode> set at load)`.
-
-Off by default. Typed fields cover product PFlash policy; remaining experiments
-live under `[developer]` and retain matching `HIPFIRE_PREFILL_*` one-shot
-aliases. Detailed bypass reasons and serve wiring: [`SERVE.md`](SERVE.md) /
-runtime PFlash module — not restated here.
 
 ---
 
@@ -1363,6 +1324,7 @@ Compat env: `HIPFIRE_GPU_LAYER_BUDGET`, `HIPFIRE_MOE_EXPERT_BUDGET`, `HIPFIRE_OF
   - **Historical-source boundary.** Formats inferred from old source's `auto` resolution are source-derived, not runtime-observed, and old runs cannot be retroactively labelled explicitly pinned. The old `4363` XTX F32-source binaries cannot certify current beta's Q8-default math: freeze the new source and rerun the matched Q8 baseline/D2 gate, rather than forcing old `bf16` to evade the beta-default gate. R9700 FP8 math is unchanged, but record the admission-census delta with the new source identity and frozen partition instead of treating admission as unchanged. These requirements establish no GPU quality pass.
   - **Timing repeat receipts.** `qwen4_cpu_split_parity` must report per-run output hashes for fresh same-route Timing-versus-Timing repeats at the same pinned partition, not merely compare overlapped Timing against serial execution. The old Timing hashes were not retained, so same-route determinism remains unresolved until new repeat receipts pass; component parity or cross-route arithmetic comparisons cannot substitute for that gate. Record the pinned digest with each repeat and retain truthful failures rather than claiming a pass from missing hashes.
   - **Full-versus-Timing source finding; reference-only repair.** The Full probe replayed the unmasked routed tail before `SharedDown` (`moe_program.rs:1433–1438,1471–1473`) with the original fused-shared descriptor still live. Decode (`pipeline/mod.rs:4494–4522`, `mq_rotate_x_128_v2.hip:106–112`) and grouped prefill (`qt44_qt53_prefill.rs:1575–1608`, `moe_gate_up_unscatter_silu_top10.hip:94–105`) can therefore apply sigmoid to the BF16 shared scalar again; `qwen4_gemv_bf16_xf32.hip:477–494` consumes that scalar directly. The reference replay uses copied parameters with `skip_shared=true` and no shared prelude, preserving original routed ids and arithmetic. Production Timing has no extra replay; same-stream FIFO and pinned-buffer lifetime (`cpu_split.rs:659–665`, `ffi.rs:3353–3402`) do not support a transfer-race diagnosis. This repair adds no barrier or production performance change and is not a corrected GPU pass; same-route Timing determinism still needs new repeat receipts.
+  - **D2 wide-window sweep (`HIPFIRE_QWEN4_D2_WINDOW_ROWS=N`, default off).** CPU-side contract (no device): the CPU arm's grouped multi-row arithmetic is byte-identical to `N` one-row CPU calls per slot for every `N` up to 8 (`gemv_shared_window_rows_match_one_row_at_every_position` widths 2..=8, `d2_window_rows_are_byte_identical_to_one_row_ar_for_every_position` widths 2..8 and 64, `canonical_join_multirow_windows_5_to_8_match_one_row_ar_for_sampled_masks` at 1024 masks, `logical_window_1_to_64_matches_one_row_ar`). Card qualification is still owed per arch: `qwen4_cpu_split_parity --rows 5..8` (SAME-INPUT gates on the real forward, executor built for `N` rows), `qwen4_wide_verify --rows 2-8 --accepts all` (bitwise n-row verify against `n` AR steps and state digests, fatal for `n <= 8`), then K = 3..7 end to end (`HIPFIRE_MTP_K`) for tau and ms per window against the K = 3 default. The window is whole-window only (`rows == route_rows`, non-prefill); the GPU masked tail at 5..8 rows is the few-row indexed route, the CPU arm is not bit-identical to the GPU kernel (the accepted D2 KLD contract above), and a window the sealed split refuses fails the call loudly, never a silent PCIe fallback.
 - **Load lines.** A spill prints `partial offload: {host} of {n} layers host-placed[, routed experts host on {k} layers], device weights {X} MiB of {Y} MiB available` plus the pinned-host report and the `kv reserved:` accounting line; a fit prints `partial offload: model fits - every layer resident`. A `cpu` load adds the `cpu exec: {covered}/{spilled} spilled layers fully covered …; uncovered quants: …` coverage line.
 - **Spec.** Native MTP is opt-in on a host-mapped expert spill except on exact gfx1100 and gfx1201, where `auto` keeps the head — see the `mtp_mode` row. Full write-up: [`env-vars.md`](env-vars.md) offload rows and [`plans/partial-gpu-offload-design.md`](plans/partial-gpu-offload-design.md).
 - **Narrow verify routing.** Resident MoE `SpeculativeVerify` batches retain beta's legacy grouped route. Narrow Path1 applies only to host-mapped routed projections; the coalesced gfx1201 host-weight narrow kernel remains available.
@@ -1583,6 +1545,25 @@ and disables the A4 route. `hipfire-quantize trunk-overlay` builds the file
 from a directory of QT44 payloads (`--base`, `--qt44-payload-dir`, `--suffix`
 (repeatable), `--trunk-iu4-default`, `--output`).
 
+A sidecar may instead carry Q8F16 (QT3, `--format qt3`: the engine's `Q8_0`
+rows, 34 bytes per 32 weights, no FWHT rotation, `K % 32 == 0`) payloads that
+replace MQ6 trunk tensors. The loader admits exactly the 241 MQ6 trunk tensors
+of the shipped mq4-xts (`lm_head.weight`; per QSA layer the `self_attn`
+q/k/v/o and indexer `index_qk` projections; per GDN layer
+`linear_attn.in_proj_{qkv,z,a,b}` and `out_proj`) and refuses the whole sidecar,
+naming the first offending tensor, for anything else: the MTP head, routed
+experts, and every tensor the artifact keeps source-exact (router, shared
+expert, hyper-connection, conv, norms, PLE, embedding), because a Q8F16 copy
+of those would lower accuracy. A replaced tensor is an owned allocation, so the
+overlay adds `payload - replaced` resident bytes on top of what placement
+budgeted (`net_extra_bytes`: +173.6 MB for the 60 QSA tensors, +938.8 MB, 0.874
+GiB, for all 241, per replicated card). The marker `gfx1201-q8f16-v1` selects no
+IU4 route and applies under `auto` on exact gfx1201 only (`1` applies it
+elsewhere; the C8 lane stages stay per lane wherever the arch has no row-twin
+proof for their Q8_0 route). A pipeline-parallel load refuses any overlay.
+`scripts/q8_overlay_writer.py encode --tier attn|gdn_in|gdn_out|head|full`
+writes the payloads from BF16 safetensors.
+
 ### Qwen4 expert hotset sidecar
 
 `<model>.expert-hotset` (JSON, `kind` `hipfire.qwen4.expert_hotset`, version
@@ -1763,10 +1744,11 @@ ranges are the schema's; every key also appears in the generated
 | `model.deepseek4_experts_per_token` | `null` | `null` or int 1–6; DeepSeek V4 routed experts per token (`null` keeps the checkpoint default). |
 | `hardware.deepseek4_compute_placement` | `"single"` | `single` or `dense-expert-split(dense=<selector>,experts=<selector>)` with two distinct device selectors. |
 | `serve.vmm_batch` | `false` | bool; route eligible concurrent requests through the VMM continuous-batching executor (per-request VMM KV, one resident target). Off keeps the VMM singleton route. Env `HIPFIRE_SERVE_VMM_BATCH`. |
-| `serve.continuous_batch_size` | `1` | int 1–256; number of eligible concurrent batch lanes (`1` = sequential), subject to memory admission. The runtime batch width is dynamic: it follows the lanes in flight and is not fixed at this value, and the 128-row/63-token chunk sizes are not lane limits. Env `HIPFIRE_CONTINUOUS_BATCH_SIZE`; the `serve --continuous-batch-size` flag takes the same range. |
+| `serve.continuous_batch_size` | `1` | int 1–256; number of eligible concurrent batch lanes (`1` = sequential), subject to memory admission. The runtime batch width is dynamic: it follows the lanes in flight and is not fixed at this value, and the 128-row/63-token chunk sizes are not lane limits. Env `HIPFIRE_CONTINUOUS_BATCH_SIZE`; the `serve --continuous-batch-size` flag takes the same range. Flash-Next (qwen4 fn-lanes) stores hold at most 64 lanes: `--continuous-batch-size 65..256` is accepted by the schema but the load logs `[daemon] qwen4 lanes refused: lanes=N outside the lane store capacity 1..=64 — fallback to sequential`. On gfx942 the stock-FP8 artifact serves 32 and 64 lanes (lane store ~259 MiB per lane at `max_seq` 16384, ~16.6 GB at 64 [MEAS, 2,069 MiB for 8]); the load line reads `qwen4 fn-lanes staged: topology=single lanes=64 row_budget=...`; a store larger than free device memory is refused with `lane store needs <N> MiB, <M> MiB free`. |
 | `serve.batch_spec` | `true` | bool; cross-request speculative verify rows on the VMM batch route (`false` disables batched speculation only). |
 | `serve.batch_nonexact` | `false` | bool; permit explicitly labeled non-bit-exact batched arithmetic on the VMM batch route. |
-| `serve.batch_sampled` | `true` | bool, applies only with `serve.vmm_batch`; admits sampled requests to the batch route only in the lane mode the singleton route selects for them. Flash-Next fn-lanes admit sampled requests with neutral penalties (AR lanes draw with the singleton AR sampler and request seed; MTP lanes verify naively, so seeded output equals the AR singleton's where logits match). `false` keeps them on the serialized singleton route. |
+| `serve.batch_exact` | `off` | `off` \| `greedy` \| `seeded`; opt-in row-exactness of Flash-Next native-MTP lane batching on exact gfx1201. By default concurrent native-MTP output at >= 3 lanes may depend on which other requests share its decode steps. `greedy` makes greedy output independent of batch composition; `seeded` does that for greedy requests and for sampled requests that carry a `seed`. Either opt-in also keeps prompts of 9..=64 tokens on their own prefill tile instead of the joint EP prefill wave; `seeded` also draws sampled lanes on the host instead of the device. Trade-off: on an R9700 EP2 it measured 0.54-0.74x aggregate tok/s at C4/C8 (decode step time x1.4-x2.1; C1 unaffected). Invariance as measured (8 distinct prompts, 256 tokens, each reply at C4 / C8 / C8 with other prompts compared with the same prompt alone at C1): greedy 8 of 8 identical in every composition (5 of 8 before the prefill change); seeded sampled 6 of 8 at C8, so not yet fully invariant for sampled requests. CLI `--batch-exact` on `serve` / `run`; the environment variable `HIPFIRE_QWEN4_LANE_ROW_EXACT` (also `1`/`on`/`true` = `seeded`, `0`/`false` = `off`) is the compatibility override. |
+| `serve.batch_sampled` | `true` | bool, applies only with `serve.vmm_batch`; admits sampled requests to the batch route only in the lane mode the singleton route selects for them. Flash-Next fn-lanes admit sampled requests with neutral penalties (AR lanes draw with the singleton AR sampler and request seed; MTP lanes verify naively, so seeded output equals the AR singleton's where logits match). `false` keeps them on the serialized singleton route. **Reproducibility:** pass a `seed` to get reproducible sampled output at C1 (across batch compositions, `serve.batch_exact = seeded` narrows but does not yet close the gap, see that key; by default concurrent native-MTP output at >= 3 lanes may depend on batch composition, greedy included); with the developer lever `HIPFIRE_QWEN4_EP_SAMPLED_WIDE_VERIFY=1` (default off) unseeded sampled requests on the EP MTP lanes use the faster batched (wide) verify, so their output is distribution-equivalent but not reproducible across batch compositions; seeded and greedy requests keep the row-exact verify. |
 | `serve.ui` | `false` | bool; serve the embedded chat UI at `/ui` on the serve listener. |
 | `serve.retry_enabled` | `false` | bool; server-owned single retry on typed transient daemon failures. |
 | `serve.retry_backoff_ms` | `50` | int 0–60000; backoff before that retry. |
@@ -1868,7 +1850,6 @@ keys. The remaining retained-replay controls are developer diagnostics:
 | `diagnostic.replay.gfx1151_initiator` | `"legacy"` | `legacy` \| `order` \| `radv` |
 | `diagnostic.replay.gfx1151_interleave` | `"inherit"` | `inherit`, `off`, `64`, `128`, `256`, `512` |
 | `diagnostic.replay.gfx1151_resource_limits` | `"legacy"` | `legacy` \| `simd-always` \| `radv` |
-| `diagnostic.replay.gfx1151_cu_count` | `"all"` | deprecated; `all` only (`inherit`/`40` accepted as aliases). Any other value is refused at PM4 replay preparation: CU masks on RDNA hung the R9700 MES on 2026-10-14 |
 | `diagnostic.replay.gfx1151_entry_acquire` | `"system"` | `system` \| `agent` \| `vmem` \| `none` |
 | `diagnostic.compiler.no_device_compiler` | `false` | bool; treat the device compiler as absent so precompiled code objects are used verbatim |
 
@@ -2113,7 +2094,7 @@ policy and filename/registry discovery.
 
 Note: `ddtree_budget` and `ddtree_topk` are `FeatureFlags` overrides, not `RuntimeConfig` fields. The schema defaults (`0` and `4`) are what the CLI sends for `hipfire run`/`serve`. A zero budget reads as unset, so each call site falls back to its own default (the dense path uses 8 nodes when `speculation.dflash_tree` is on; the Qwen3.5 path stays chain-only); the non-zero `ddtree_topk` default is always sent and overrides a call site's own fanout.
 
-Redline eligibility helpers `mq4r_redline_default` and `retained_redline_default` (same file) are **narrow runtime-default predicates** for replay backend selection: exact GPU arch `gfx1100`/`gfx1151`/`gfx1201` + case-insensitive `.mq4r` + pp=tp=1 (model-family agnostic, no `arch_id` gate; `gfx1200` and all other arches remain opt-in), plus the A3B symmetric MQ4R file (`qwen3_5_moe`, `.mq4rs`) plain-AR on exact `gfx1201` with pp=tp=1 and no drafter, Qwen3.5 dense (`qwen3_5`) and Qwen4 (Flash-Next, `qwen4`; MTP-off loads) plain-AR decode on exact `gfx1201` with pp=tp=1 and no drafter. A Qwen3.5-family process with a CPU-executed partial-offload spill (`memory.offload_exec=cpu` plus a manual layer/routed-expert budget or explicit `auto`/`-1` that resolves to a spill) gets no retained default, and an explicit non-`hip` backend there is refused at load. Unset/null budgets never request a spill. They are not general config keys and not Redline certification/registry admission. `replay.backend = "hip"`, the built-in `hip` config profile or another explicit backend selection disables the automatic default. Policy: [`REDLINE.md`](REDLINE.md).
+Redline eligibility helpers `mq4r_redline_default` and `retained_redline_default` (same file) are **narrow runtime-default predicates** for replay backend selection: exact GPU arch `gfx1100`/`gfx1151`/`gfx1201` + the MQ4R SKU (HFQ metadata key `hipfire_route_sku`, else the registry card `quant`; never the file extension) + pp=tp=1 (model-family agnostic, no `arch_id` gate; `gfx1200` and all other arches remain opt-in), plus the A3B symmetric MQ4R SKU (`qwen3_5_moe`, MQ4RS) plain-AR on exact `gfx1201` with pp=tp=1 and no drafter, Qwen3.5 dense (`qwen3_5`) and Qwen4 (Flash-Next, `qwen4`; MTP-off loads) plain-AR decode on exact `gfx1201` with pp=tp=1 and no drafter, and the Qwen3.5 dense `.mq3-xt` file plain-AR on exact `gfx1100` with pp=tp=1 and no drafter. A Qwen3.5-family process with a CPU-executed partial-offload spill (`memory.offload_exec=cpu` plus a manual layer/routed-expert budget or explicit `auto`/`-1` that resolves to a spill) gets no retained default, and an explicit non-`hip` backend there is refused at load. Unset/null budgets never request a spill. They are not general config keys and not Redline certification/registry admission. `replay.backend = "hip"`, the built-in `hip` config profile or another explicit backend selection disables the automatic default. Policy: [`REDLINE.md`](REDLINE.md).
 
 ---
 
@@ -2238,36 +2219,53 @@ The developer overrides `HIPFIRE_QWEN4_EXPERT_STAGE`, `HIPFIRE_PREFILL_CHUNK_ROW
 
 Every schema key carries one lifecycle status. The table is generated from
 `crates/hipfire-config/src/lib.rs` by `scripts/check-lifecycle.py --write`, and
-`scripts/no-gpu-ci.sh` fails when it drifts. The status is `deprecated` when the
-field carries `// lifecycle: deprecated since 0.4.0, removal 0.5.0 — <reason>`,
-otherwise `experimental` or `stable` from the schema's `experimental` flag.
-Deprecated keys still load in 0.4.0 and warn once when they switch a deprecated
-feature on; their defaults are inert, so default configs never reach
-deprecated code. Env statuses live in [`env-vars.md`](env-vars.md#lifecycle-status).
-
-Deprecated since 0.4.0, removal in 0.5.0:
-
-- `memory.cask.*` (CASK / TriAttention eviction).
-- `speculation.prefill.*` and `diagnostic.pflash.score_layer` (PFlash; prefix caching supersedes it).
-- KV **values** `asym2|asym3|asym4`, `turbo|turbo2|turbo3|turbo4` (`kv_cache`, `kv_k`) and `legacy-asym2|3|4` (`kv_k`): Givens asym KV and its aliases; use `fwhtN` or `q8`.
+`scripts/no-gpu-ci.sh` fails when it drifts. The status is `experimental` or
+`stable` from the schema's `experimental` flag. Every key and env var deprecated
+since 0.4.0 was removed in 0.5.0, so no key carries the `deprecated` status in
+this release. Env statuses live in [`env-vars.md`](env-vars.md#lifecycle-status).
 
 Removed keys. A key that shipped in a release and was later removed from the
-schema stays in `RETIRED_CONFIG_KEYS` (`crates/hipfire-config/src/lib.rs`)
-through its deprecation window: a `config.toml` that still sets it loads, the
-value is ignored, and run/serve/chat and `hipfire config show` print
-`warning: ignored <key> in <file>: removed in <version> (…)`. Custom profiles
-drop it the same way. `hipfire config set` refuses it. A key that never shipped
-in a release (for example one that only existed on an experiment branch) or a
-misspelled key is unknown and fails the load with
+schema stays in `RETIRED_CONFIG_KEYS` (`crates/hipfire-config/src/lib.rs`). A
+`config.toml` or custom profile that still sets it fails the load, and
+`hipfire config set` refuses it, with
+`configuration key '<key>' was removed in <version> (<reason>); replacement: <replacement>`.
+A lingering key is a user-facing error, never a silent ignore. A key that never
+shipped in a release (for example one that only existed on an experiment
+branch) or a misspelled key is unknown and fails the load with
 `unknown configuration key '<key>'`.
 
-| Removed key | Legacy key | Shipped | Removed in | Ignored with a warning until |
+| Removed key | Legacy key | Shipped | Removed in | Replacement |
 | --- | --- | --- | --- | --- |
-| `kernel.mw16` | `mw16` | 0.3.1 | 0.4.1 | 0.5.0 |
+| `kernel.mw16` | `mw16` | 0.3.1 | 0.4.1 | none; the default GEMM path applies |
+| `kernel.moe_paro_i8` | `moe_paro_i8` | 0.3.1 | 0.5.0 | none; ParoQuant models are no longer supported, use an MQ4 or HFQ4 model |
+| `kernel.moe_paro_i8_k8` | `moe_paro_i8_k8` | 0.3.1 | 0.5.0 | none; ParoQuant models are no longer supported, use an MQ4 or HFQ4 model |
+| `speculation.prefill.mode` | `prefill_compression` | 0.1.20 | 0.5.0 | none; prefix caching (the existing prompt-prefix cache) replaces it |
+| `speculation.prefill.threshold` | `prefill_threshold` | 0.1.20 | 0.5.0 | none; prefix caching (the existing prompt-prefix cache) replaces it |
+| `speculation.prefill.keep_ratio` | `prefill_keep_ratio` | 0.1.20 | 0.5.0 | none; prefix caching (the existing prompt-prefix cache) replaces it |
+| `speculation.prefill.alpha` | `prefill_alpha` | 0.1.20 | 0.5.0 | none; prefix caching (the existing prompt-prefix cache) replaces it |
+| `speculation.prefill.min_keep` | `prefill_min_keep` | 0.1.20 | 0.5.0 | none; prefix caching (the existing prompt-prefix cache) replaces it |
+| `speculation.prefill.sink` | `prefill_sink` | 0.1.20 | 0.5.0 | none; prefix caching (the existing prompt-prefix cache) replaces it |
+| `speculation.prefill.recent` | `prefill_recent` | 0.1.20 | 0.5.0 | none; prefix caching (the existing prompt-prefix cache) replaces it |
+| `speculation.prefill.block` | `prefill_block` | 0.1.20 | 0.5.0 | none; prefix caching (the existing prompt-prefix cache) replaces it |
+| `speculation.prefill.drafter` | `prefill_drafter` | 0.1.20 | 0.5.0 | none; prefix caching (the existing prompt-prefix cache) replaces it |
+| `speculation.prefill.drafter_device` | `prefill_drafter_device` | 0.1.20 | 0.5.0 | none; prefix caching (the existing prompt-prefix cache) replaces it |
+| `speculation.prefill.profile` | `prefill_profile` | 0.1.20 | 0.5.0 | none; prefix caching (the existing prompt-prefix cache) replaces it |
+| `speculation.prefill.sparse_threshold` | `prefill_sparse_threshold` | 0.1.20 | 0.5.0 | none; prefix caching (the existing prompt-prefix cache) replaces it |
+| `speculation.prefill.drafter_kv` | `prefill_drafter_kv` | 0.1.20 | 0.5.0 | none; prefix caching (the existing prompt-prefix cache) replaces it |
+| `diagnostic.pflash.score_layer` | `pflash_score_layer` | 0.1.20 | 0.5.0 | none; prefix caching (the existing prompt-prefix cache) replaces it |
+| `memory.cask.sidecar` | `cask_sidecar` | 0.1.7 | 0.5.0 | none; full KV (use a larger `memory.max_seq` or KV quantization) |
+| `memory.cask.enabled` | `cask` | 0.1.7 | 0.5.0 | none; full KV (use a larger `memory.max_seq` or KV quantization) |
+| `memory.cask.budget` | `cask_budget` | 0.1.7 | 0.5.0 | none; full KV (use a larger `memory.max_seq` or KV quantization) |
+| `memory.cask.beta` | `cask_beta` | 0.1.7 | 0.5.0 | none; full KV (use a larger `memory.max_seq` or KV quantization) |
+| `memory.cask.handoff_tokens` | `cask_handoff_tokens` | 0.1.7 | 0.5.0 | none; full KV (use a larger `memory.max_seq` or KV quantization) |
+| `memory.cask.core_fraction` | `cask_core_frac` | 0.1.7 | 0.5.0 | none; full KV (use a larger `memory.max_seq` or KV quantization) |
+| `memory.cask.fold` | `cask_fold_m` | 0.1.7 | 0.5.0 | none; full KV (use a larger `memory.max_seq` or KV quantization) |
+| `memory.cask.auto_attach` | `cask_auto_attach` | 0.1.7 | 0.5.0 | none; full KV (use a larger `memory.max_seq` or KV quantization) |
+| `diagnostic.replay.gfx1151_cu_count` | `gfx1151_redline_cu_count` | 0.4.0 | 0.5.0 | none; the full CU set is always used (`HIPFIRE_GFX1151_REDLINE_CU_COUNT` is no longer read) |
 
 <!-- lifecycle-table:begin (generated by scripts/check-lifecycle.py --write) -->
 
-**Count:** 313 schema keys, plus the `developer.<name>` namespace.
+**Count:** 289 schema keys, plus the `developer.<name>` namespace.
 
 | Key | Legacy key | Env | Lifecycle |
 |---|---|---|---|
@@ -2301,13 +2299,11 @@ misspelled key is unknown and fails the load with
 | `diagnostic.kernel.rocblas_min_batch` | `rocblas_min_batch` | `HIPFIRE_ROCBLAS_MIN_BATCH` | experimental |
 | `diagnostic.kernel.wo_wmma_variant` | `wo_wmma_variant` | `HIPFIRE_WO_WMMA_VARIANT` | experimental |
 | `diagnostic.mmq_quantize_only` | `mmq_diag_quantize_only` | `HIPFIRE_MMQ_DIAG_QUANTIZE_ONLY` | experimental |
-| `diagnostic.pflash.score_layer` | `pflash_score_layer` | `HIPFIRE_PFLASH_SCORE_LAYER` | deprecated |
 | `diagnostic.prompt_heat_json` | `prompt_heat_json` | `HIPFIRE_PROMPT_HEAT_JSON` | experimental |
 | `diagnostic.prompt_heat_limit` | `prompt_heat_limit` | `HIPFIRE_PROMPT_HEAT_LIMIT` | experimental |
 | `diagnostic.prompt_token_heat` | `prompt_token_heat` | `HIPFIRE_PROMPT_TOKEN_HEAT` | experimental |
 | `diagnostic.qkv_bias` | `fuse_qkv_bias_debug` | `HIPFIRE_FUSE_QKV_BIAS_DEBUG` | experimental |
 | `diagnostic.replay.dispatch_profile` | `replay_dispatch_profile` | `HIPFIRE_REDLINE_DISPATCH_PROFILE` | experimental |
-| `diagnostic.replay.gfx1151_cu_count` | `gfx1151_redline_cu_count` | `HIPFIRE_GFX1151_REDLINE_CU_COUNT` | deprecated |
 | `diagnostic.replay.gfx1151_entry_acquire` | `gfx1151_pm4_entry_acquire` | `HIPFIRE_GFX1151_PM4_ENTRY_ACQUIRE` | experimental |
 | `diagnostic.replay.gfx1151_initiator` | `gfx1151_pm4_initiator` | `HIPFIRE_GFX1151_PM4_INITIATOR` | experimental |
 | `diagnostic.replay.gfx1151_interleave` | `gfx1151_pm4_interleave` | `HIPFIRE_GFX1151_PM4_INTERLEAVE` | experimental |
@@ -2426,8 +2422,6 @@ misspelled key is unknown and fails the load with
 | `kernel.moe_grouped_m2` | `moe_grouped_m2` | `HIPFIRE_MOE_GROUPED_M2` | experimental |
 | `kernel.moe_hfq6_i8` | `moe_hfq6_i8` | `HIPFIRE_MOE_HFQ6_I8` | experimental |
 | `kernel.moe_hfq6_v2` | `moe_hfq6_v2` | `HIPFIRE_MOE_HFQ6_V2` | experimental |
-| `kernel.moe_paro_i8` | `moe_paro_i8` | `HIPFIRE_MOE_PARO_I8` | experimental |
-| `kernel.moe_paro_i8_k8` | `moe_paro_i8_k8` | `HIPFIRE_MOE_PARO_I8_K8` | experimental |
 | `kernel.mq4v2_gateup_k5120` | `mq4v2_gateup_k5120` | `HIPFIRE_MQ4V2_GATEUP_K5120` | stable |
 | `kernel.npu_spillover` | `npu_spillover` | `HIPFIRE_NPU_SPILLOVER` | experimental |
 | `kernel.pm_decode` | `pm_decode` | `HIPFIRE_PM_DECODE` | experimental |
@@ -2459,14 +2453,6 @@ misspelled key is unknown and fails the load with
 | `kernel.rope_interleaved_legacy` | `rope_interleaved_legacy` | `HIPFIRE_ROPE_INTERLEAVED_LEGACY` | experimental |
 | `kernel.verify_attn` | `verify_attn` | `HIPFIRE_VERIFY_ATTN` | stable |
 | `kernel.wo_mmq` | `wo_mmq` | `HIPFIRE_WO_MMQ` | experimental |
-| `memory.cask.auto_attach` | `cask_auto_attach` |  | deprecated |
-| `memory.cask.beta` | `cask_beta` |  | deprecated |
-| `memory.cask.budget` | `cask_budget` |  | deprecated |
-| `memory.cask.core_fraction` | `cask_core_frac` |  | deprecated |
-| `memory.cask.enabled` | `cask` |  | deprecated |
-| `memory.cask.fold` | `cask_fold_m` |  | deprecated |
-| `memory.cask.handoff_tokens` | `cask_handoff_tokens` |  | deprecated |
-| `memory.cask.sidecar` | `cask_sidecar` | `HIPFIRE_CASK_SIDECAR` | deprecated |
 | `memory.gpu_layer_budget` | `gpu_layer_budget` | `HIPFIRE_GPU_LAYER_BUDGET` | stable |
 | `memory.kv_adaptive` | `kv_adaptive` | `HIPFIRE_KV_ADAPTIVE` | stable |
 | `memory.kv_backend` | `kv_backend` |  | stable |
@@ -2511,6 +2497,7 @@ misspelled key is unknown and fails the load with
 | `serve.allow_request_paths` | `allow_request_paths` | `HIPFIRE_SERVE_ALLOW_REQUEST_PATHS` | stable |
 | `serve.allow_request_pull` | `allow_request_pull` | `HIPFIRE_SERVE_ALLOW_REQUEST_PULL` | stable |
 | `serve.api_key_file` | `api_key_file` | `HIPFIRE_SERVE_API_KEY_FILE` | stable |
+| `serve.batch_exact` | `serve_batch_exact` | `HIPFIRE_QWEN4_LANE_ROW_EXACT` | experimental |
 | `serve.batch_nonexact` | `serve_batch_nonexact` | `HIPFIRE_SERVE_BATCH_NONEXACT` | experimental |
 | `serve.batch_sampled` | `serve_batch_sampled` | `HIPFIRE_SERVE_BATCH_SAMPLED` | experimental |
 | `serve.batch_spec` | `serve_batch_spec` | `HIPFIRE_SERVE_BATCH_SPEC` | experimental |
@@ -2568,19 +2555,6 @@ misspelled key is unknown and fails the load with
 | `speculation.ngram` | `ngram_mode` | `HIPFIRE_NGRAM_DRAFT` | stable |
 | `speculation.ngram_k` | `ngram_k` | `HIPFIRE_NGRAM_DRAFT_K` | stable |
 | `speculation.ngram_min_count` | `ngram_min_count` | `HIPFIRE_NGRAM_MIN_COUNT` | stable |
-| `speculation.prefill.alpha` | `prefill_alpha` |  | deprecated |
-| `speculation.prefill.block` | `prefill_block` |  | deprecated |
-| `speculation.prefill.drafter` | `prefill_drafter` |  | deprecated |
-| `speculation.prefill.drafter_device` | `prefill_drafter_device` |  | deprecated |
-| `speculation.prefill.drafter_kv` | `prefill_drafter_kv` | `HIPFIRE_PFLASH_DRAFTER_KV` | deprecated |
-| `speculation.prefill.keep_ratio` | `prefill_keep_ratio` |  | deprecated |
-| `speculation.prefill.min_keep` | `prefill_min_keep` |  | deprecated |
-| `speculation.prefill.mode` | `prefill_compression` |  | deprecated |
-| `speculation.prefill.profile` | `prefill_profile` |  | deprecated |
-| `speculation.prefill.recent` | `prefill_recent` |  | deprecated |
-| `speculation.prefill.sink` | `prefill_sink` |  | deprecated |
-| `speculation.prefill.sparse_threshold` | `prefill_sparse_threshold` |  | deprecated |
-| `speculation.prefill.threshold` | `prefill_threshold` |  | deprecated |
 | `topology.ep` | `ep` | `HIPFIRE_TOPOLOGY_EP` | experimental |
 | `topology.pp` | `pp` | `HIPFIRE_TOPOLOGY_PP` | experimental |
 | `vision.mode` | `vision_mode` | `HIPFIRE_VISION_MODE` | stable |

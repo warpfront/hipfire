@@ -113,6 +113,12 @@ pub const MAX_RANKS: usize = 8;
 pub const HOST_RESERVE_ACQUIRE: u8 = 1;
 pub const HOST_RESERVE_RESTORE: u8 = 2;
 pub const HOST_STAGE_QUIESCE: u8 = 3;
+/// D2-tail borrow epoch (`HIPFIRE_QWEN4_EP_TAIL_BORROW`): every rank's tail tables are canonical
+/// and its policy suspended before any rank's prefill bank overwrites the tail pool.
+pub const HOST_TAIL_BORROW_ACQUIRE: u8 = 4;
+/// D2-tail borrow epoch close: every rank's tail pool is restored whole before any rank resumes
+/// (republishes) tail slots.
+pub const HOST_TAIL_BORROW_RESTORE: u8 = 5;
 
 /// The layer of an exchange whose caller did not name one.
 pub const NO_LAYER: usize = u16::MAX as usize;
@@ -239,11 +245,16 @@ impl EpTileExchangeSpec {
         Ok(())
     }
 
+    /// The pull guard: a call of `tiles` tiles must fit the registered capacity. Never a silent
+    /// overrun: a transport registered with a reduced capacity (an EP tail-borrow load whose
+    /// route only masks tiles) refuses any pull beyond it, naming both sizes.
     fn check_call(&self, tiles: usize) -> HipResult<()> {
         if tiles == 0 || tiles > self.max_tiles {
             return Err(err(format!(
-                "ep_tile_exchange: call tiles {tiles} outside 1..={} (registered capacity)",
-                self.max_tiles
+                "ep_tile_exchange: call tiles {tiles} ({} B) outside 1..={} ({} B registered capacity)",
+                tiles.saturating_mul(self.tile_bytes()),
+                self.max_tiles,
+                self.buffer_bytes()
             )));
         }
         Ok(())
@@ -881,6 +892,22 @@ pub(crate) mod tests {
         assert_eq!(s.buffer_bytes(), 3_040 * 81_920);
     }
 
+    /// An EP tail-borrow load registers a mask-only transport at the resident buffer's tiles
+    /// (3,040 x 81,920 B) while its forward route plans the borrowed 5,600; a pull of the
+    /// borrowed count must refuse, naming both sizes.
+    #[test]
+    fn reduced_capacity_transport_refuses_a_borrowed_pull() {
+        let reduced = spec(3_040);
+        assert!(reduced.check_call(3_040).is_ok());
+        let error = reduced.check_call(5_600).unwrap_err().to_string();
+        assert!(
+            error.contains("call tiles 5600 (458752000 B)")
+                && error.contains("1..=3040 (249036800 B registered capacity)"),
+            "{error}"
+        );
+        assert!(reduced.check_call(0).is_err());
+    }
+
     #[test]
     fn supported_rank_counts_validate() {
         assert!(EpTileExchangeSpec {
@@ -1200,6 +1227,40 @@ pub(crate) mod tests {
                 let text = result.expect_err("disagreement").to_string();
                 assert!(text.contains(expect), "{text}");
             }
+        }
+    }
+
+    /// Both ranks name the disagreement in EVERY round, never an abort. The
+    /// first rank to see the mismatch aborts the barrier; the other rank,
+    /// still spinning in the crossing that did complete, must read it as
+    /// completed and name the mismatch itself. One pair is descheduled at the
+    /// wrong instant too rarely to show that, so many pairs cross at once, more
+    /// than there are CPUs, and every wait is interrupted all the time.
+    #[test]
+    fn a_disagreement_is_named_by_both_ranks_in_every_round() {
+        const ROUNDS: u32 = 300;
+        let pairs = 2 * std::thread::available_parallelism().map_or(8, usize::from);
+        let drivers: Vec<_> = (0..pairs)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    for round in 0..ROUNDS {
+                        let t = bare(2, Duration::from_secs(30));
+                        let other = t.clone();
+                        let peer = std::thread::spawn(move || {
+                            other.host_barrier(1, HOST_RESERVE_ACQUIRE, round)
+                        });
+                        let mine = t.host_barrier(0, HOST_RESERVE_RESTORE, round);
+                        let theirs = peer.join().expect("peer");
+                        for result in [mine, theirs] {
+                            let text = result.expect_err("disagreement").to_string();
+                            assert!(text.contains("different points"), "round {round}: {text}");
+                        }
+                    }
+                })
+            })
+            .collect();
+        for driver in drivers {
+            driver.join().expect("driver");
         }
     }
 

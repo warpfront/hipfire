@@ -124,6 +124,26 @@ pub fn q8_0_prefill_runs(gpu: &Gpu, tier: PrefillActTier, m: usize, k: usize, ro
     }
 }
 
+/// Whether [`q8_0_prefill_gemm`] at `tier` runs the gfx11 F16 wmma GEMM
+/// (`gemm_q8_0_batched_chunked` -> `gemm_q8_0_wmma`) for this `[m, k]` projection over `rows`:
+/// the route whose launcher takes an F16-typed X and skips its own F32->F16 convert. Callers
+/// that feed several such projections from one F32 plane convert it once
+/// (`Gpu::convert_f32_to_f16_into`) and call [`q8_0_prefill_gemm_f16x`] with the F16 plane:
+/// the same `convert_f32_to_f16` kernel produced the same F16 words, so the outputs are
+/// bit-identical to [`q8_0_prefill_gemm`] on the F32 plane. Never true on gfx1201 (its callers
+/// keep their own converts) or for a tier whose quantized route would run.
+pub fn q8_0_f16_x_shareable(
+    gpu: &Gpu,
+    tier: PrefillActTier,
+    m: usize,
+    k: usize,
+    rows: usize,
+) -> bool {
+    tier == PrefillActTier::F16
+        && !q8_0_prefill_runs(gpu, tier, m, k, rows)
+        && gpu.q8_0_wmma_shared_f16_x_ok(m, k, rows)
+}
+
 /// `y[rows, m] = x[rows, k] @ W_q8[m, k]^T` for a Q8_0 weight `w` (F32 `x`/`y`), at the activation
 /// precision `tier`: `A8` -> `gemm_q8_0_a8_batched` (int8 activations per 32-K block), `Fp8` ->
 /// `gemm_q8_0_fp8_batched`, each when the device and `k` support it and the runtime admission
@@ -223,10 +243,11 @@ pub struct Q8PrefillRun {
 
 /// [`q8_0_prefill_gemm`] with two optional reuses on the A8 route: it consumes `prepared` when
 /// that still describes this call's `x`, `k` and `rows` (GEMM only, no quantizer launch; else it
-/// quantizes `x` itself), and on gfx1201 with `bf16_out` the GEMM epilogue rounds every output to
+/// quantizes `x` itself), and on gfx1201 / gfx1100 with `bf16_out` the GEMM epilogue rounds every output to
 /// BF16 (bit-identical to a separate in-place `bf16_round_trip_f32_strided` pass, see
-/// `Gpu::gemm_q8_0_a8_gemm_bf16`; the gfx1100 tiled GEMM has no such epilogue and reports
-/// `bf16_fused: false`). Every other case is exactly [`q8_0_prefill_gemm`].
+/// `Gpu::gemm_q8_0_a8_gemm_bf16`; the gfx1100 tiled GEMM does the same through its `_bf16` entries,
+/// `Gpu::gemm_q8_0_mmq_gfx11_gemm_bf16`; the gfx1100 F16 wmma route through `gemm_q8_0_wmma_bf16`,
+/// see [`q8_0_prefill_gemm_f16x`]). Every other case is exactly [`q8_0_prefill_gemm`].
 #[allow(clippy::too_many_arguments)]
 pub fn q8_0_prefill_gemm_prepared(
     gpu: &mut Gpu,
@@ -289,11 +310,26 @@ pub fn q8_0_prefill_gemm_prepared(
             Some(a) => a,
             None => hip!(gpu.q8_mmq_quantize_x(x, rows, k))?,
         };
-        hip!(gpu.gemm_q8_0_mmq_gfx11_gemm(w, &acts, y, m))?;
-        // The tiled GEMM has no BF16 epilogue: the caller rounds (`bf16_fused: false`).
+        if bf16_out {
+            hip!(gpu.gemm_q8_0_mmq_gfx11_gemm_bf16(w, &acts, y, m))?;
+        } else {
+            hip!(gpu.gemm_q8_0_mmq_gfx11_gemm(w, &acts, y, m))?;
+        }
         return Ok(Q8PrefillRun {
             tier,
-            bf16_fused: false,
+            bf16_fused: bf16_out,
+        });
+    }
+    if bf16_out
+        && !q8_0_prefill_runs(gpu, tier, m, k, rows)
+        && gpu.q8_0_wmma_bf16_epilogue_ok(m, k, rows)
+    {
+        // The route `q8_0_prefill_gemm` takes here is `gemm_q8_0_batched_chunked` ->
+        // `gemm_q8_0_wmma`: its BF16-epilogue twin is bit-identical to that plus the round pass.
+        hip!(gpu.gemm_q8_0_wmma_bf16(w, x, y, m, k, rows))?;
+        return Ok(Q8PrefillRun {
+            tier: PrefillActTier::F16,
+            bf16_fused: true,
         });
     }
     let tier = q8_0_prefill_gemm(gpu, tier, w, x, y, m, k, rows)?;
@@ -301,6 +337,31 @@ pub fn q8_0_prefill_gemm_prepared(
         tier,
         bf16_fused: false,
     })
+}
+
+/// The GEMM of a [`q8_0_f16_x_shareable`] projection whose F32 plane was already converted to the
+/// F16 plane `x16` (`Gpu::convert_f32_to_f16_into`): the F16 wmma GEMM reads `x16` as staged. With
+/// `bf16_out` on gfx1100 the epilogue rounds every output to BF16 (`gemm_q8_0_wmma_bf16`) and the
+/// result is `true` (the caller must not round again); otherwise `false` and `y` holds the F32
+/// accumulators exactly as [`q8_0_prefill_gemm`] leaves them. Bit-identical to
+/// [`q8_0_prefill_gemm_prepared`] on the F32 plane either way.
+#[allow(clippy::too_many_arguments)]
+pub fn q8_0_prefill_gemm_f16x(
+    gpu: &mut Gpu,
+    w: &GpuTensor,
+    x16: &GpuTensor,
+    y: &GpuTensor,
+    m: usize,
+    k: usize,
+    rows: usize,
+    bf16_out: bool,
+) -> Result<bool, DispatchError> {
+    if bf16_out && gpu.q8_0_wmma_bf16_epilogue_ok(m, k, rows) {
+        hip!(gpu.gemm_q8_0_wmma_bf16(w, x16, y, m, k, rows))?;
+        return Ok(true);
+    }
+    hip!(gpu.gemm_q8_0_batched_chunked(w, x16, y, m, k, rows))?;
+    Ok(false)
 }
 
 #[cfg(test)]

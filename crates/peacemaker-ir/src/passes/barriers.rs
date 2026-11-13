@@ -215,7 +215,7 @@ fn backward_inner(
 }
 
 fn ds_stores_pending(replay: &WaitReplay, id: InstId, arch: Arch) -> bool {
-    let counter = if arch == Arch::Gfx1201 {
+    let counter = if arch.is_gfx12() {
         Counter::Ds
     } else {
         Counter::Lgkm
@@ -237,11 +237,7 @@ fn ds_stores_pending(replay: &WaitReplay, id: InstId, arch: Arch) -> bool {
 }
 
 fn drain_obligation(id: InstId, what: &str, arch: Arch) -> Obligation {
-    let counter = if arch == Arch::Gfx1201 {
-        "DScnt"
-    } else {
-        "LGKMcnt"
-    };
+    let counter = if arch.is_gfx12() { "DScnt" } else { "LGKMcnt" };
     Obligation {
         kind: ObligationKind::Hazard,
         insts: vec![id],
@@ -252,7 +248,10 @@ fn drain_obligation(id: InstId, what: &str, arch: Arch) -> Obligation {
 
 /// Barrier pairing plus DS-drain checks for one kernel body.
 pub fn analyze(body: &Body, arch: Arch) -> Result<BarrierAnalysis, BarrierError> {
-    if !matches!(arch, Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1201) {
+    if !matches!(
+        arch,
+        Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1200 | Arch::Gfx1201
+    ) {
         return Err(BarrierError::UnsupportedArch(arch));
     }
     for id in &body.layout {
@@ -416,10 +415,11 @@ mod gfx11_tests {
                     len: 1,
                 })
             };
-            let store = Inst::from_parts(
+            let store = Inst::from_encoding(
                 arch,
                 row.op,
                 row.form,
+                row.variant,
                 FormFields::None,
                 SmallVec::from_vec(vec![v(1), v(2), Operand::Imm(ImmField::DsOffset(0))]),
                 Modifiers::default(),

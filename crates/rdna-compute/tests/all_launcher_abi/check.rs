@@ -89,46 +89,251 @@ pub fn compare(world: &World, ctx: &Ctx, v: &Variant, sloc: &[usize], decl: &Dec
     if let Some(bl) = &v.bytes {
         return compare_bytes(bl, decl);
     }
-    let mut probs = Vec::new();
     let (lay, end) = match blob_layout(world, ctx, &v.pushes, sloc) {
         Ok(x) => x,
         Err(e) => return vec![format!("ERR {e}")],
     };
+    let mut probs = compare_blob(&lay, end, decl);
     let da = &decl.args;
-    if lay.len() != da.len() {
+    if v.has_params {
+        match params_aggregate_refusal(da) {
+            None => compare_params(world, ctx, v, sloc, &lay, da, &mut probs),
+            Some(why) => probs.push(why),
+        }
+    }
+    probs
+}
+
+/// A params array hands the runtime one pointer per declared argument, a by-value aggregate
+/// included as a single whole-aggregate entry; the blob builder pushes its scalar leaves one at
+/// a time. Those two shapes cannot be tied entry to entry, so a params launch of a declared
+/// aggregate argument is refused rather than flattened.
+fn params_aggregate_refusal(da: &[crate::hip::Arg]) -> Option<String> {
+    let aggs: Vec<usize> = da
+        .iter()
+        .enumerate()
+        .filter(|(_, d)| !d.fields.is_empty())
+        .map(|(i, _)| i)
+        .collect();
+    (!aggs.is_empty()).then(|| {
+        format!(
+            "kernelParams launch of by-value aggregate argument(s) {aggs:?} cannot be proven \
+             against per-leaf blob pushes (a params entry must point at the whole aggregate)"
+        )
+    })
+}
+
+/// One expected scalar slot of the declared kernarg layout.
+struct Leaf {
+    arg: usize,
+    /// (field index, element index) inside an aggregate argument.
+    within: Option<(usize, u32)>,
+    offset: u32,
+    size: u32,
+    kind: char,
+}
+
+/// Declared scalar slots in blob order, produced lazily: an aggregate contributes one slot per
+/// array element of each source scalar field, so a large array is never materialised. Every
+/// aggregate must already have passed `check_aggregate`, which bounds each leaf end by the
+/// aggregate end, itself within `u32`, so the offset arithmetic below cannot overflow.
+fn leaves<'a>(da: &'a [crate::hip::Arg]) -> impl Iterator<Item = Leaf> + 'a {
+    da.iter().enumerate().flat_map(|(i, d)| {
+        let scalar = d.fields.is_empty().then(|| Leaf {
+            arg: i,
+            within: None,
+            offset: d.offset,
+            size: d.size,
+            kind: d.kind,
+        });
+        let fields = d.fields.iter().enumerate().flat_map(move |(fi, f)| {
+            (0..f.count).map(move |j| Leaf {
+                arg: i,
+                within: Some((fi, j)),
+                offset: f.offset + j * f.size,
+                size: f.size,
+                kind: f.kind,
+            })
+        });
+        scalar.into_iter().chain(fields)
+    })
+}
+
+/// A source-proven aggregate must describe its bytes exactly: scalar leaves of a known class in
+/// increasing order, the first at the aggregate's start, no overlap, no hole wider than natural
+/// alignment padding, and no tail beyond alignment padding or past the aggregate's size.
+fn check_aggregate(i: usize, d: &crate::hip::Arg) -> Result<(), String> {
+    let bad = |why: String| -> Result<(), String> {
+        Err(format!("arg {i}: malformed aggregate declaration: {why}"))
+    };
+    if d.kind != 'v' {
+        return bad(format!("aggregate has kind `{}`, not `v`", d.kind));
+    }
+    let agg_end = u64::from(d.offset) + u64::from(d.size);
+    if agg_end > u64::from(u32::MAX) {
+        return bad(format!(
+            "aggregate at offset {} of {} bytes ends at {agg_end}, past the 32-bit kernarg offset range",
+            d.offset, d.size
+        ));
+    }
+    let mut max_size = 0u32;
+    for f in &d.fields {
+        if f.count == 0 || f.size == 0 || !matches!(f.kind, 'p' | 'i' | 'f') {
+            return bad(format!(
+                "field at offset {} has count {}, size {}, kind `{}`",
+                f.offset, f.count, f.size, f.kind
+            ));
+        }
+        max_size = max_size.max(f.size);
+    }
+    let mut cursor = u64::from(d.offset);
+    for (fi, f) in d.fields.iter().enumerate() {
+        let start = u64::from(f.offset);
+        let stop = start + u64::from(f.size) * u64::from(f.count);
+        if fi == 0 {
+            if start != cursor {
+                return bad(format!(
+                    "first field at offset {start}, aggregate starts at {cursor}"
+                ));
+            }
+        } else if start < cursor {
+            return bad(format!(
+                "field {fi} at offset {start} overlaps bytes before {cursor}"
+            ));
+        } else if start - cursor >= u64::from(max_size) {
+            return bad(format!(
+                "field {fi} at offset {start} leaves a {}-byte hole after {cursor}",
+                start - cursor
+            ));
+        }
+        cursor = stop;
+    }
+    if cursor > agg_end {
+        return bad(format!(
+            "fields end at {cursor}, past aggregate end {agg_end}"
+        ));
+    }
+    if agg_end - cursor >= u64::from(max_size) {
+        return bad(format!(
+            "fields end at {cursor}, {} bytes short of aggregate end {agg_end}",
+            agg_end - cursor
+        ));
+    }
+    Ok(())
+}
+
+/// Compare the replayed raw blob against the declared kernarg layout. Scalar arguments match
+/// one push each; a by-value aggregate with source-proven scalar leaves (`fields`) matches
+/// one push per leaf at the leaf's exact absolute offset, size and class. An aggregate without
+/// `fields` (PeaceMaker/HSA metadata) keeps one-push-per-argument handling.
+fn compare_blob(lay: &[BlobArg], end: u32, decl: &Decl) -> Vec<String> {
+    let mut probs = Vec::new();
+    let da = &decl.args;
+    for (i, d) in da.iter().enumerate() {
+        if !d.fields.is_empty() {
+            if let Err(e) = check_aggregate(i, d) {
+                probs.push(e);
+            }
+        }
+    }
+    if !probs.is_empty() {
+        return probs;
+    }
+    let expected: u64 = da
+        .iter()
+        .map(|d| {
+            if d.fields.is_empty() {
+                1
+            } else {
+                d.fields.iter().map(|f| u64::from(f.count)).sum()
+            }
+        })
+        .sum();
+    if lay.len() as u64 != expected {
         probs.push(format!(
             "raw blob has {} arguments, declared {}",
             lay.len(),
-            da.len()
+            if expected == da.len() as u64 {
+                format!("{expected}")
+            } else {
+                format!(
+                    "{expected} ({} arguments, aggregate fields counted per scalar leaf)",
+                    da.len()
+                )
+            }
         ));
-    } else {
-        for (i, (b, d)) in lay.iter().zip(da.iter()).enumerate() {
-            if b.size != d.size || b.offset != d.offset {
-                probs.push(format!(
-                    "arg {i}: blob (offset {}, {} bytes) vs declared (offset {}, {} bytes)",
-                    b.offset, b.size, d.offset, d.size
-                ));
-            } else if (d.kind == 'p') != (b.kind == 'p') && d.kind != 'v' {
-                probs.push(format!(
-                    "arg {i}: pointer/scalar class mismatch (blob {} vs declared {})",
-                    b.kind, d.kind
-                ));
-            } else if (d.kind == 'f' && b.kind == 'i') || (d.kind == 'i' && b.kind == 'f') {
-                probs.push(format!(
-                    "arg {i}: float/integer class mismatch (blob {} vs declared {})",
-                    b.kind, d.kind
-                ));
+        return probs;
+    }
+    const LEAF_REPORT_CAP: usize = 8;
+    /// Why one slot disagrees; the text is only built once a mismatch is actually reported.
+    #[derive(Clone, Copy)]
+    enum Why {
+        Geometry,
+        LeafClass,
+        PointerScalar,
+        FloatInt,
+    }
+    let mut leaf_probs = 0usize;
+    for (b, l) in lay.iter().zip(leaves(da)) {
+        let why = if b.size != l.size || b.offset != l.offset {
+            Some(Why::Geometry)
+        } else if l.within.is_some() {
+            (b.kind != l.kind).then_some(Why::LeafClass)
+        } else if (l.kind == 'p') != (b.kind == 'p') && l.kind != 'v' {
+            Some(Why::PointerScalar)
+        } else if (l.kind == 'f' && b.kind == 'i') || (l.kind == 'i' && b.kind == 'f') {
+            Some(Why::FloatInt)
+        } else {
+            None
+        };
+        let Some(why) = why else { continue };
+        if l.within.is_some() {
+            leaf_probs += 1;
+            if leaf_probs > LEAF_REPORT_CAP {
+                continue;
             }
         }
-        if end != decl.end {
-            probs.push(format!(
-                "raw blob ends at byte {end}, declared kernarg bytes end at {}",
-                decl.end
-            ));
-        }
+        let i = l.arg;
+        let name = match l.within {
+            None => format!("arg {i}"),
+            Some((fi, j)) => format!("arg {i} field {fi} element {j}"),
+        };
+        probs.push(match why {
+            Why::Geometry => format!(
+                "{name}: blob (offset {}, {} bytes) vs declared (offset {}, {} bytes)",
+                b.offset, b.size, l.offset, l.size
+            ),
+            Why::LeafClass => format!(
+                "{name}: aggregate leaf class mismatch (blob {} vs declared {})",
+                b.kind, l.kind
+            ),
+            Why::PointerScalar => format!(
+                "{name}: pointer/scalar class mismatch (blob {} vs declared {})",
+                b.kind, l.kind
+            ),
+            Why::FloatInt => format!(
+                "{name}: float/integer class mismatch (blob {} vs declared {})",
+                b.kind, l.kind
+            ),
+        });
     }
-    if v.has_params {
-        compare_params(world, ctx, v, sloc, &lay, da, &mut probs);
+    if leaf_probs > LEAF_REPORT_CAP {
+        probs.push(format!(
+            "{} further aggregate leaf mismatches not listed",
+            leaf_probs - LEAF_REPORT_CAP
+        ));
+    }
+    // The blob may stop at the last scalar leaf of a trailing aggregate: the bytes after it are
+    // the aggregate's own tail padding, which no kernel load reads.
+    let tail_leaf_end = da.last().and_then(|d| {
+        let f = d.fields.last()?;
+        u32::try_from(u64::from(f.offset) + u64::from(f.size) * u64::from(f.count)).ok()
+    });
+    if end != decl.end && Some(end) != tail_leaf_end {
+        probs.push(format!(
+            "raw blob ends at byte {end}, declared kernarg bytes end at {}",
+            decl.end
+        ));
     }
     probs
 }
@@ -151,10 +356,10 @@ fn compare_params(
         ));
     } else if v.pushes.len() == pi.len() && lay.len() == pi.len() {
         for (i, (a, b)) in pi.iter().zip(lay.iter()).enumerate() {
-            if let Some((value, loc)) = a
-                .as_ref()
-                .and_then(|name| mapped_param_value(ctx, name, sloc))
-            {
+            if let Some((value, loc)) = a.as_ref().and_then(|name| {
+                mapped_param_value(ctx, name, sloc)
+                    .or_else(|| repeat_param_value(world, ctx, name, sloc))
+            }) {
                 match world.infer_kind(&value, ctx, &loc, 0) {
                     Some(kind) if kind == (b.size, b.kind) => {}
                     kind => probs.push(format!(
@@ -200,34 +405,102 @@ fn is_reserved(a: &crate::hip::Arg) -> bool {
         .map_or(false, |w| w.starts_with("reserved"))
 }
 
-/// Hand-written kernarg bytes: every write must land exactly on one declared
-/// argument, every non-reserved argument must be written, and the byte array
-/// must cover the declared kernarg size.
+/// Hand-written kernarg bytes: every write must land exactly on one declared scalar argument
+/// or one scalar leaf of a source-proven aggregate, every non-reserved argument and every leaf
+/// must be written, and the byte array must cover the declared kernarg size. A single write
+/// covering a whole aggregate is an opaque write whose contents cannot be checked per leaf, so
+/// it is refused; aggregates with empty `fields` (metadata) keep exact whole-argument matching.
 fn compare_bytes(bl: &ByteLayout, decl: &Decl) -> Vec<String> {
     let mut probs = Vec::new();
-    if bl.len < decl.end || bl.len > (decl.end + 7) / 8 * 8 {
+    // Aligned in u64: `decl.end` may legitimately be `u32::MAX` (a huge source array).
+    let max_len = (u64::from(decl.end) + 7) / 8 * 8;
+    if bl.len < decl.end || u64::from(bl.len) > max_len {
         probs.push(format!(
             "kernarg byte array is {} bytes, declared kernarg bytes end at {}",
             bl.len, decl.end
         ));
     }
-    for (off, w) in &bl.writes {
-        if !decl.args.iter().any(|a| a.offset == *off && a.size == *w) {
-            probs.push(format!(
+    for (i, a) in decl.args.iter().enumerate() {
+        if !a.fields.is_empty() {
+            if let Err(e) = check_aggregate(i, a) {
+                probs.push(e);
+            }
+        }
+    }
+    if probs.iter().any(|p| p.contains("malformed aggregate")) {
+        return probs;
+    }
+    let writes: BTreeSet<(u32, u32)> = bl.writes.iter().copied().collect();
+    let in_field = |f: &crate::hip::Field, off: u32, w: u32| {
+        w == f.size
+            && off >= f.offset
+            && (off - f.offset) % f.size == 0
+            && (off - f.offset) / f.size < f.count
+    };
+    for &(off, w) in &writes {
+        let declared = decl.args.iter().any(|a| {
+            if a.fields.is_empty() {
+                a.offset == off && a.size == w
+            } else {
+                a.fields.iter().any(|f| in_field(f, off, w))
+            }
+        });
+        if declared {
+            continue;
+        }
+        match decl
+            .args
+            .iter()
+            .position(|a| !a.fields.is_empty() && a.offset == off && a.size == w)
+        {
+            Some(i) => probs.push(format!(
+                "kernarg write of {w} bytes at offset {off} covers aggregate arg {i} as one \
+                 opaque write; its scalar leaves must be written individually"
+            )),
+            None => probs.push(format!(
                 "kernarg write of {w} bytes at offset {off} matches no declared argument"
-            ));
+            )),
         }
     }
     for (i, a) in decl.args.iter().enumerate() {
-        if !bl
-            .writes
-            .iter()
-            .any(|(o, w)| *o == a.offset && *w == a.size)
-            && !is_reserved(a)
-        {
+        if a.fields.is_empty() {
+            if !writes.contains(&(a.offset, a.size)) && !is_reserved(a) {
+                probs.push(format!(
+                    "arg {i} (offset {}, {} bytes) is never written into the kernarg bytes",
+                    a.offset, a.size
+                ));
+            }
+            continue;
+        }
+        // Walk the leaves lazily; at most `writes.len()` of them can be written, so a leaf
+        // count above that is a shortfall without visiting every element.
+        let total: u64 = a.fields.iter().map(|f| u64::from(f.count)).sum();
+        if total > writes.len() as u64 {
             probs.push(format!(
-                "arg {i} (offset {}, {} bytes) is never written into the kernarg bytes",
-                a.offset, a.size
+                "aggregate arg {i} has {total} scalar leaves but only {} distinct kernarg writes exist",
+                writes.len()
+            ));
+            continue;
+        }
+        let mut missing = 0usize;
+        for (fi, f) in a.fields.iter().enumerate() {
+            for j in 0..f.count {
+                let off = f.offset + j * f.size;
+                if !writes.contains(&(off, f.size)) {
+                    if missing < 8 {
+                        probs.push(format!(
+                            "arg {i} field {fi} element {j} (offset {off}, {} bytes) is never written into the kernarg bytes",
+                            f.size
+                        ));
+                    }
+                    missing += 1;
+                }
+            }
+        }
+        if missing > 8 {
+            probs.push(format!(
+                "aggregate arg {i}: {} further leaves never written",
+                missing - 8
             ));
         }
     }
@@ -534,7 +807,7 @@ fn has_launch_ident(ts: &[Tt]) -> bool {
     })
 }
 
-fn call_names(ts: &[Tt], out: &mut BTreeSet<String>) {
+pub(super) fn call_names(ts: &[Tt], out: &mut BTreeSet<String>) {
     for k in 0..ts.len() {
         if let Tt::Id(s, _) = &ts[k] {
             if ts.get(k + 1).map_or(false, |t| t.is_g('(')) {
@@ -876,7 +1149,36 @@ pub fn analyze(world: &World, syms: &Symbols, policy: &Policy) -> Analysis {
             let me: Node = (fi, func.name.clone());
             let mut cs = BTreeSet::new();
             call_names(&func.body, &mut cs);
-            for c in cs {
+            // A call through a `let`-bound local (a closure or function alias) never reaches a
+            // free function that merely shares its name: Rust resolves the call to the local.
+            // The local's own initialiser still contributes what it can reach: the calls inside
+            // it (a closure body), or the function a bare path alias (`let f = module::name;`)
+            // names.
+            let calls = if cs.is_empty() {
+                cs
+            } else {
+                let local_idx = BindIndex::build(&func.body);
+                let mut resolved = BTreeSet::new();
+                for c in cs {
+                    match local_idx.map.get(&c) {
+                        Some(bindings) => {
+                            for b in bindings {
+                                call_names(&b.init, &mut resolved);
+                                if b.init.iter().all(|t| t.id().is_some() || t.is_p(':')) {
+                                    let mut ids = Vec::new();
+                                    idents_in(&b.init, &mut ids);
+                                    resolved.extend(ids);
+                                }
+                            }
+                        }
+                        None => {
+                            resolved.insert(c);
+                        }
+                    }
+                }
+                resolved
+            };
+            for c in calls {
                 let local = file.fns.iter().any(|f| f.name == c);
                 if local {
                     callers_of.entry((fi, c)).or_default().insert(me.clone());
@@ -1789,5 +2091,448 @@ fn handle_escapes(
         if let Tt::G(_, c, _) = &ts[k] {
             handle_escapes(world, c, handles, out);
         }
+    }
+}
+
+#[cfg(test)]
+mod aggregate_blob_tests {
+    use super::*;
+    use crate::hip::{Arg, Field};
+
+    /// Replay `(size, kind)` pushes through the production blob exactly as `blob_layout` does.
+    fn replay(pushes: &[(u32, char)]) -> (Vec<BlobArg>, u32) {
+        let mut blob = hip_bridge::KernargBlob::new();
+        let mut out = Vec::new();
+        for &(size, kind) in pushes {
+            let offset = (blob.len() as u32 + size - 1) / size * size;
+            match (size, kind) {
+                (8, 'p') => blob.push_ptr(std::ptr::null()),
+                (8, _) => blob.push_u64(0),
+                (4, 'f') => blob.push_f32(0.0),
+                (4, _) => blob.push_i32(0),
+                other => panic!("unsupported test push {other:?}"),
+            }
+            out.push(BlobArg {
+                offset,
+                size,
+                kind,
+                expr: Vec::new(),
+            });
+        }
+        (out, blob.len() as u32)
+    }
+
+    fn arg(offset: u32, size: u32, kind: char) -> Arg {
+        Arg {
+            offset,
+            size,
+            kind,
+            text: String::new(),
+            fields: Vec::new(),
+        }
+    }
+
+    /// By-value aggregate: `(offset, element size, kind, element count)` per source field.
+    fn agg(offset: u32, size: u32, fields: &[(u32, u32, char, u32)]) -> Arg {
+        Arg {
+            offset,
+            size,
+            kind: 'v',
+            text: String::new(),
+            fields: fields
+                .iter()
+                .map(|&(offset, size, kind, count)| Field {
+                    offset,
+                    size,
+                    kind,
+                    count,
+                })
+                .collect(),
+        }
+    }
+
+    fn run(args: Vec<Arg>, end: u32, pushes: &[(u32, char)]) -> Vec<String> {
+        let (lay, blob_end) = replay(pushes);
+        compare_blob(&lay, blob_end, &Decl { args, end })
+    }
+
+    fn has(probs: &[String], needle: &str) -> bool {
+        probs.iter().any(|p| p.contains(needle))
+    }
+
+    /// ptr, i32, Yarn (4 x f32, align 4, 16 bytes), lane table (256 x i32, 1024 bytes).
+    fn qsa_args() -> (Vec<Arg>, u32) {
+        (
+            vec![
+                arg(0, 8, 'p'),
+                arg(8, 4, 'i'),
+                agg(12, 16, &[(12, 4, 'f', 4)]),
+                agg(28, 1024, &[(28, 4, 'i', 256)]),
+            ],
+            1052,
+        )
+    }
+
+    fn qsa_pushes() -> Vec<(u32, char)> {
+        let mut p = vec![(8, 'p'), (4, 'i')];
+        p.extend([(4, 'f'); 4]);
+        p.extend([(4, 'i'); 256]);
+        p
+    }
+
+    #[test]
+    fn yarn_then_lane_table_pushed_per_leaf_match() {
+        let (args, end) = qsa_args();
+        assert_eq!(run(args, end, &qsa_pushes()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn natural_alignment_padding_between_leaves() {
+        // struct { int a; long long b; int c; } -> b at 8, c at 16, size 24; the blob stops at
+        // the last leaf (end 20), inside the aggregate's tail padding.
+        let args = vec![agg(
+            0,
+            24,
+            &[(0, 4, 'i', 1), (8, 8, 'i', 1), (16, 4, 'i', 1)],
+        )];
+        let p = run(args.clone(), 24, &[(4, 'i'), (8, 'i'), (4, 'i')]);
+        assert_eq!(p, Vec::<String>::new());
+        // After an 8-byte argument the aggregate starts on its own 8-byte boundary.
+        let mut shifted = vec![arg(0, 8, 'p')];
+        shifted.push(agg(
+            8,
+            24,
+            &[(8, 4, 'i', 1), (16, 8, 'i', 1), (24, 4, 'i', 1)],
+        ));
+        let p = run(
+            shifted.clone(),
+            32,
+            &[(8, 'p'), (4, 'i'), (8, 'i'), (4, 'i')],
+        );
+        assert_eq!(p, Vec::<String>::new());
+        // Behind a 4-byte argument the same declaration is out of reach of per-leaf pushes.
+        shifted[0] = arg(0, 4, 'i');
+        let p = run(shifted, 32, &[(4, 'i'), (4, 'i'), (8, 'i'), (4, 'i')]);
+        assert!(has(
+            &p,
+            "arg 1 field 0 element 0: blob (offset 4, 4 bytes) vs declared (offset 8"
+        ));
+    }
+
+    #[test]
+    fn array_field_then_wider_scalar_with_tail() {
+        // struct { float a[3]; long long b; } -> b at 16, size 24.
+        let args = vec![agg(0, 24, &[(0, 4, 'f', 3), (16, 8, 'i', 1)])];
+        let p = run(args, 24, &[(4, 'f'), (4, 'f'), (4, 'f'), (8, 'i')]);
+        assert_eq!(p, Vec::<String>::new());
+    }
+
+    #[test]
+    fn tail_padding_only_accepted_for_the_trailing_aggregate() {
+        // The aggregate is not last: the next argument must land after the full padded size.
+        let args = vec![
+            agg(0, 16, &[(0, 8, 'i', 1), (8, 4, 'i', 1)]),
+            arg(16, 4, 'i'),
+        ];
+        assert!(has(
+            &run(args.clone(), 20, &[(8, 'i'), (4, 'i'), (4, 'i')]),
+            "arg 1: blob (offset 12, 4 bytes) vs declared (offset 16, 4 bytes)"
+        ));
+        // Blob stopping short of the last leaf is not tail padding.
+        let args = vec![agg(0, 16, &[(0, 8, 'i', 1), (8, 4, 'i', 1)])];
+        assert!(!run(args, 16, &[(8, 'i')]).is_empty());
+    }
+
+    #[test]
+    fn wrong_leaf_class_is_refused() {
+        let (args, end) = qsa_args();
+        let mut p = qsa_pushes();
+        p[3] = (4, 'i'); // a yarn float pushed as an integer
+        assert!(has(
+            &run(args.clone(), end, &p),
+            "aggregate leaf class mismatch"
+        ));
+        let mut p = qsa_pushes();
+        p[10] = (4, 'f'); // a lane integer pushed as a float
+        assert!(has(&run(args, end, &p), "aggregate leaf class mismatch"));
+    }
+
+    #[test]
+    fn wrong_order_is_refused() {
+        let (args, end) = qsa_args();
+        let mut p = vec![(8, 'p'), (4, 'i')];
+        p.extend([(4, 'i'); 256]);
+        p.extend([(4, 'f'); 4]);
+        assert!(!run(args, end, &p).is_empty());
+    }
+
+    #[test]
+    fn wrong_leaf_count_is_refused() {
+        let (args, end) = qsa_args();
+        for drop_idx in [3usize, 100] {
+            let mut p = qsa_pushes();
+            p.remove(drop_idx);
+            assert!(has(
+                &run(args.clone(), end, &p),
+                "raw blob has 261 arguments"
+            ));
+        }
+        let mut p = qsa_pushes();
+        p.push((4, 'i'));
+        assert!(has(
+            &run(args.clone(), end, &p),
+            "raw blob has 263 arguments"
+        ));
+        let mut p = qsa_pushes();
+        p.insert(2, (4, 'f')); // extraneous leaf in front of the yarn
+        assert!(has(&run(args, end, &p), "raw blob has 263 arguments"));
+    }
+
+    #[test]
+    fn pointer_or_wide_word_in_leaf_slot_is_refused() {
+        let (args, end) = qsa_args();
+        let mut p = qsa_pushes();
+        p[2] = (8, 'p');
+        assert!(!run(args.clone(), end, &p).is_empty());
+        let mut p = qsa_pushes();
+        p[2] = (8, 'i');
+        assert!(!run(args.clone(), end, &p).is_empty());
+        // A pointer-class leaf must be fed a pointer, not an integer word.
+        let ptr_leaf = vec![agg(0, 8, &[(0, 8, 'p', 1)])];
+        assert!(has(
+            &run(ptr_leaf.clone(), 8, &[(8, 'i')]),
+            "aggregate leaf class mismatch"
+        ));
+        assert_eq!(run(ptr_leaf, 8, &[(8, 'p')]), Vec::<String>::new());
+    }
+
+    #[test]
+    fn shifted_declared_offset_is_refused() {
+        let (mut args, _) = qsa_args();
+        args[3] = agg(32, 1024, &[(32, 4, 'i', 256)]);
+        let p = run(args, 1056, &qsa_pushes());
+        assert!(has(
+            &p,
+            "arg 3 field 0 element 0: blob (offset 28, 4 bytes) vs declared (offset 32"
+        ));
+    }
+
+    #[test]
+    fn many_mismatches_are_capped() {
+        let (args, end) = qsa_args();
+        let mut p = vec![(8, 'p'), (4, 'i')];
+        p.extend([(4, 'f'); 4]);
+        p.extend([(4, 'f'); 256]);
+        let probs = run(args, end, &p);
+        assert!(probs.len() <= 10, "{} problems", probs.len());
+        assert!(has(&probs, "further aggregate leaf mismatches"));
+    }
+
+    #[test]
+    fn metadata_byvalue_aggregate_without_fields_gets_no_fragment_acceptance() {
+        let (args, end) = (vec![arg(0, 8, 'p'), arg(8, 16, 'v')], 24);
+        // Four f32 fragments of a 16-byte PM by-value argument.
+        let mut frag = vec![(8, 'p')];
+        frag.extend([(4, 'f'); 4]);
+        assert!(has(
+            &run(args.clone(), end, &frag),
+            "raw blob has 5 arguments, declared 2"
+        ));
+        // Two u64 fragments.
+        assert!(has(
+            &run(args.clone(), end, &[(8, 'p'), (8, 'i'), (8, 'i')]),
+            "raw blob has 3 arguments"
+        ));
+        // A single push of the wrong width.
+        assert!(has(
+            &run(args, end, &[(8, 'p'), (8, 'i')]),
+            "vs declared (offset 8, 16 bytes)"
+        ));
+        // 1024-byte opaque by-value argument fed 256 integer fragments.
+        let big = vec![arg(0, 1024, 'v')];
+        assert!(has(
+            &run(big, 1024, &[(4, 'i'); 256]),
+            "raw blob has 256 arguments, declared 1"
+        ));
+        // Scalar by-value argument keeps its existing one-push handling.
+        assert_eq!(
+            run(vec![arg(0, 4, 'v')], 4, &[(4, 'i')]),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn malformed_aggregate_declarations_are_refused() {
+        let m = |a: Arg, end: u32| run(vec![a], end, &[(4, 'i')]);
+        // Leaf of unknown class, zero count, zero size.
+        assert!(has(
+            &m(agg(0, 4, &[(0, 4, 'v', 1)]), 4),
+            "malformed aggregate"
+        ));
+        assert!(has(
+            &m(agg(0, 4, &[(0, 4, 'i', 0)]), 4),
+            "malformed aggregate"
+        ));
+        assert!(has(
+            &m(agg(0, 4, &[(0, 0, 'i', 1)]), 4),
+            "malformed aggregate"
+        ));
+        // First field not at the aggregate start; overlap; hole; past end; short tail.
+        assert!(has(&m(agg(0, 8, &[(4, 4, 'i', 1)]), 8), "first field"));
+        assert!(has(
+            &m(agg(0, 8, &[(0, 4, 'i', 2), (4, 4, 'i', 1)]), 8),
+            "overlaps"
+        ));
+        assert!(has(
+            &m(agg(0, 24, &[(0, 4, 'i', 1), (16, 4, 'i', 1)]), 24),
+            "-byte hole"
+        ));
+        assert!(has(
+            &m(agg(0, 4, &[(0, 4, 'i', 2)]), 4),
+            "past aggregate end"
+        ));
+        assert!(has(
+            &m(agg(0, 16, &[(0, 4, 'i', 1)]), 16),
+            "short of aggregate end"
+        ));
+        // Fields on a non-aggregate kind.
+        let mut bad = agg(0, 4, &[(0, 4, 'i', 1)]);
+        bad.kind = 'i';
+        assert!(has(&m(bad, 4), "not `v`"));
+    }
+
+    #[test]
+    fn huge_array_count_is_never_materialised() {
+        let args = vec![agg(0, 1 << 30, &[(0, 4, 'i', 1 << 28)])];
+        let p = run(args, 1 << 30, &[(4, 'i'); 3]);
+        assert!(has(&p, "raw blob has 3 arguments, declared 268435456"));
+    }
+
+    fn bytes(args: Vec<Arg>, end: u32, len: u32, writes: &[(u32, u32)]) -> Vec<String> {
+        compare_bytes(
+            &ByteLayout {
+                len,
+                writes: writes.to_vec(),
+            },
+            &Decl { args, end },
+        )
+    }
+
+    fn yarn_decl() -> Vec<Arg> {
+        vec![arg(0, 8, 'p'), agg(8, 16, &[(8, 4, 'f', 4)])]
+    }
+
+    #[test]
+    fn byte_array_per_leaf_writes_match() {
+        let w = [(0, 8), (8, 4), (12, 4), (16, 4), (20, 4)];
+        assert_eq!(bytes(yarn_decl(), 24, 24, &w), Vec::<String>::new());
+        // Two array rows (128 each) of a 1024-byte lane table.
+        let table = vec![agg(0, 1024, &[(0, 4, 'i', 128), (512, 4, 'i', 128)])];
+        let w: Vec<(u32, u32)> = (0..256).map(|k| (k * 4, 4)).collect();
+        assert_eq!(bytes(table, 1024, 1024, &w), Vec::<String>::new());
+    }
+
+    #[test]
+    fn byte_array_opaque_whole_aggregate_write_is_refused() {
+        let p = bytes(yarn_decl(), 24, 24, &[(0, 8), (8, 16)]);
+        assert!(has(&p, "covers aggregate arg 1 as one opaque write"));
+        assert!(has(
+            &p,
+            "aggregate arg 1 has 4 scalar leaves but only 2 distinct"
+        ));
+    }
+
+    #[test]
+    fn byte_array_wrong_leaf_writes_are_refused() {
+        // A missing leaf.
+        let p = bytes(yarn_decl(), 24, 24, &[(0, 8), (8, 4), (12, 4), (20, 4)]);
+        assert!(has(
+            &p,
+            "arg 1 field 0 element 2 (offset 16, 4 bytes) is never written"
+        ));
+        // A 8-byte write across two leaves.
+        let p = bytes(yarn_decl(), 24, 24, &[(0, 8), (8, 8), (16, 4), (20, 4)]);
+        assert!(has(
+            &p,
+            "write of 8 bytes at offset 8 matches no declared argument"
+        ));
+        // A write past the last element, and one off the element stride.
+        let w = [(0, 8), (8, 4), (12, 4), (16, 4), (20, 4), (24, 4)];
+        assert!(has(
+            &bytes(yarn_decl(), 24, 24, &w),
+            "offset 24 matches no declared"
+        ));
+        let w = [(0, 8), (8, 4), (12, 4), (16, 4), (22, 4)];
+        let p = bytes(yarn_decl(), 24, 24, &w);
+        assert!(has(&p, "offset 22 matches no declared"));
+        assert!(has(&p, "element 3"));
+        // Far fewer writes than leaves: a shortfall without walking every element.
+        let table = vec![agg(0, 1024, &[(0, 4, 'i', 128), (512, 4, 'i', 128)])];
+        let p = bytes(table, 1024, 1024, &[(0, 4), (4, 4), (8, 4)]);
+        assert!(has(
+            &p,
+            "has 256 scalar leaves but only 3 distinct kernarg writes"
+        ));
+    }
+
+    #[test]
+    fn byte_array_metadata_byvalue_keeps_whole_argument_matching_only() {
+        let a = vec![arg(0, 16, 'v')];
+        assert_eq!(bytes(a.clone(), 16, 16, &[(0, 16)]), Vec::<String>::new());
+        let frag = [(0, 4), (4, 4), (8, 4), (12, 4)];
+        assert!(has(
+            &bytes(a, 16, 16, &frag),
+            "matches no declared argument"
+        ));
+    }
+
+    #[test]
+    fn byte_array_malformed_aggregate_is_refused() {
+        let p = bytes(vec![agg(0, 16, &[(0, 4, 'i', 1)])], 16, 16, &[(0, 4)]);
+        assert!(has(&p, "malformed aggregate"));
+    }
+
+    #[test]
+    fn aggregate_end_past_u32_is_refused_before_leaf_iteration() {
+        // Offset + size = 2^32 + 16: refused up front on both the blob and the byte path, so
+        // leaf offsets are never computed.
+        let huge = || vec![agg(0xFFFF_FFF0, 32, &[(0xFFFF_FFF0, 4, 'i', 8)])];
+        let p = run(huge(), u32::MAX, &[(4, 'i'); 8]);
+        assert!(has(&p, "past the 32-bit kernarg offset range"), "{p:?}");
+        let p = bytes(huge(), u32::MAX, u32::MAX, &[(0xFFFF_FFF0, 4)]);
+        assert!(has(&p, "past the 32-bit kernarg offset range"), "{p:?}");
+    }
+
+    #[test]
+    fn byte_array_bounds_and_huge_array_do_not_overflow() {
+        // One byte-sized field of u32::MAX elements: declared end u32::MAX, aligned bound 2^32.
+        let huge = || vec![agg(0, u32::MAX, &[(0, 1, 'i', u32::MAX)])];
+        let p = bytes(huge(), u32::MAX, u32::MAX, &[(0, 1)]);
+        assert!(!has(&p, "kernarg byte array is"), "{p:?}");
+        assert!(
+            has(&p, "has 4294967295 scalar leaves but only 1 distinct"),
+            "{p:?}"
+        );
+        // A byte array far past the declared end is still refused, with no wraparound.
+        let p = bytes(vec![arg(0, 8, 'p')], 8, u32::MAX, &[(0, 8)]);
+        assert!(has(&p, "kernarg byte array is 4294967295 bytes"), "{p:?}");
+        // The raw blob path sees the same declaration without allocating elements.
+        let p = run(huge(), u32::MAX, &[(4, 'i'); 3]);
+        assert!(
+            has(&p, "raw blob has 3 arguments, declared 4294967295"),
+            "{p:?}"
+        );
+    }
+
+    #[test]
+    fn params_launch_of_aggregate_is_refused() {
+        let why = params_aggregate_refusal(&yarn_decl()).expect("aggregate must be refused");
+        assert!(
+            why.contains("[1]") && why.contains("whole aggregate"),
+            "{why}"
+        );
+        // Scalar, pointer and metadata by-value arguments (empty fields) are not refused.
+        let plain = vec![arg(0, 8, 'p'), arg(8, 4, 'i'), arg(16, 16, 'v')];
+        assert_eq!(params_aggregate_refusal(&plain), None);
     }
 }

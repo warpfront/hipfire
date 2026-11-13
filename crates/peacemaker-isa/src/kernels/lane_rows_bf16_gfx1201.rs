@@ -2573,114 +2573,124 @@ fn hc_value(b: &mut Builder, label: &str) -> R {
     let done = format!("{label}_done");
     sop(b, format!("s_cmp_eq_u32 s{ACT}, 0"), &[], &[ACT])?;
     branch(b, &format!("s_cbranch_scc1 {done}"))?;
+    hc_act_tail(b, VOUT, [T0, T1, T2, T3, T4, T5], SCALE)?;
+    b.label(&done)
+}
+
+/// The `hc_act` tail of [`hc_value`] on the f32 in `v{vout}` (the scaled-by-nothing
+/// value `x`): `rt(rt(scale * rt(x)) / (1 + exp(-x)))`, result in `v{vout}`. `t` are six
+/// scratch VGPRs, `scale` the SGPR holding the f32 `scale`. Shared verbatim with the
+/// `hc8_wmma_gfx1201` epilogue, so every gfx1201 PM HC entry has ONE act DAG.
+pub(crate) fn hc_act_tail(b: &mut Builder, vout: u8, t: [u8; 6], scale: u8) -> R {
+    let [t0, t1, t2, t3, t4, t5] = t;
     // x = rt(sum); x = rt(scale * x).
-    round_trip(b, VOUT, [T0, T1, T2])?;
+    round_trip(b, vout, [t0, t1, t2])?;
     valu(
         b,
-        &format!("v_mul_f32_e32 v{VOUT}, s{SCALE}, v{VOUT}"),
-        &[VOUT],
-        &[VOUT],
-        &[SCALE],
+        &format!("v_mul_f32_e32 v{vout}, s{scale}, v{vout}"),
+        &[vout],
+        &[vout],
+        &[scale],
     )?;
-    round_trip(b, VOUT, [T0, T1, T2])?;
+    round_trip(b, vout, [t0, t1, t2])?;
     // exp(-x): the object's range reduction.
     valu(
         b,
-        &format!("v_mul_f32_e32 v{T0}, 0xbfb8aa3b, v{VOUT}"),
-        &[T0],
-        &[VOUT],
+        &format!("v_mul_f32_e32 v{t0}, 0xbfb8aa3b, v{vout}"),
+        &[t0],
+        &[vout],
         &[],
     )?;
     valu(
         b,
-        &format!("v_xor_b32_e32 v{T1}, 0x80000000, v{T0}"),
-        &[T1],
-        &[T0],
+        &format!("v_xor_b32_e32 v{t1}, 0x80000000, v{t0}"),
+        &[t1],
+        &[t0],
         &[],
     )?;
     valu(
         b,
-        &format!("v_rndne_f32_e32 v{T2}, v{T0}"),
-        &[T2],
-        &[T0],
+        &format!("v_rndne_f32_e32 v{t2}, v{t0}"),
+        &[t2],
+        &[t0],
         &[],
     )?;
     valu(
         b,
-        &format!("v_fma_f32 v{T1}, v{VOUT}, 0xbfb8aa3b, v{T1}"),
-        &[T1],
-        &[VOUT, T1],
+        &format!("v_fma_f32 v{t1}, v{vout}, 0xbfb8aa3b, v{t1}"),
+        &[t1],
+        &[vout, t1],
         &[],
     )?;
     valu(
         b,
-        &format!("v_sub_f32_e32 v{T0}, v{T0}, v{T2}"),
-        &[T0],
-        &[T0, T2],
+        &format!("v_sub_f32_e32 v{t0}, v{t0}, v{t2}"),
+        &[t0],
+        &[t0, t2],
         &[],
     )?;
     valu(
         b,
-        &format!("v_fma_f32 v{T1}, v{VOUT}, 0xb2a5705f, v{T1}"),
-        &[T1],
-        &[VOUT, T1],
+        &format!("v_fma_f32 v{t1}, v{vout}, 0xb2a5705f, v{t1}"),
+        &[t1],
+        &[vout, t1],
         &[],
     )?;
     valu(
         b,
-        &format!("v_add_f32_e32 v{T0}, v{T0}, v{T1}"),
-        &[T0],
-        &[T0, T1],
+        &format!("v_add_f32_e32 v{t0}, v{t0}, v{t1}"),
+        &[t0],
+        &[t0, t1],
         &[],
     )?;
     valu(
         b,
-        &format!("v_cvt_i32_f32_e32 v{T3}, v{T2}"),
-        &[T3],
-        &[T2],
+        &format!("v_cvt_i32_f32_e32 v{t3}, v{t2}"),
+        &[t3],
+        &[t2],
         &[],
     )?;
-    valu(b, &format!("v_exp_f32_e32 v{T0}, v{T0}"), &[T0], &[T0], &[])?;
+    valu(b, &format!("v_exp_f32_e32 v{t0}, v{t0}"), &[t0], &[t0], &[])?;
     valu(
         b,
-        &format!("v_ldexp_f32 v{T0}, v{T0}, v{T3}"),
-        &[T0],
-        &[T0, T3],
+        &format!("v_ldexp_f32 v{t0}, v{t0}, v{t3}"),
+        &[t0],
+        &[t0, t3],
         &[],
     )?;
     // keep e when !(x > 0x42ce8ed0); +Inf when x < 0xc2b17218 (both unordered-true).
     valu(
         b,
-        &format!("v_cmp_nlt_f32_e32 vcc_lo, 0x42ce8ed0, v{VOUT}"),
+        &format!("v_cmp_nlt_f32_e32 vcc_lo, 0x42ce8ed0, v{vout}"),
         &[],
-        &[VOUT],
-        &[],
-    )?;
-    alu_wait(b, "depctr_va_vcc(0)")?;
-    valu(
-        b,
-        &format!("v_cndmask_b32_e32 v{T0}, 0, v{T0}, vcc_lo"),
-        &[T0],
-        &[T0],
-        &[],
-    )?;
-    valu(
-        b,
-        &format!("v_cmp_ngt_f32_e32 vcc_lo, 0xc2b17218, v{VOUT}"),
-        &[],
-        &[VOUT],
+        &[vout],
         &[],
     )?;
     alu_wait(b, "depctr_va_vcc(0)")?;
     valu(
         b,
-        &format!("v_cndmask_b32_e32 v{T0}, 0x7f800000, v{T0}, vcc_lo"),
-        &[T0],
-        &[T0],
+        &format!("v_cndmask_b32_e32 v{t0}, 0, v{t0}, vcc_lo"),
+        &[t0],
+        &[t0],
+        &[],
+    )?;
+    valu(
+        b,
+        &format!("v_cmp_ngt_f32_e32 vcc_lo, 0xc2b17218, v{vout}"),
+        &[],
+        &[vout],
+        &[],
+    )?;
+    alu_wait(b, "depctr_va_vcc(0)")?;
+    valu(
+        b,
+        &format!("v_cndmask_b32_e32 v{t0}, 0x7f800000, v{t0}, vcc_lo"),
+        &[t0],
+        &[t0],
         &[],
     )?;
     // y = x / (1 + exp(-x)): the full division expansion.
-    let [w0, w1, w2, w3, w4, w5] = [T0, T1, T2, T3, T4, T5];
+    let [w0, w1, w2, w3, w4, w5] = [t0, t1, t2, t3, t4, t5];
     valu(
         b,
         &format!("v_add_f32_e32 v{w0}, 1.0, v{w0}"),
@@ -2690,9 +2700,9 @@ fn hc_value(b: &mut Builder, label: &str) -> R {
     )?;
     valu(
         b,
-        &format!("v_div_scale_f32 v{w1}, null, v{w0}, v{w0}, v{VOUT}"),
+        &format!("v_div_scale_f32 v{w1}, null, v{w0}, v{w0}, v{vout}"),
         &[w1],
-        &[w0, VOUT],
+        &[w0, vout],
         &[],
     )?;
     valu(b, &format!("v_rcp_f32_e32 v{w2}, v{w1}"), &[w2], &[w1], &[])?;
@@ -2719,9 +2729,9 @@ fn hc_value(b: &mut Builder, label: &str) -> R {
     )?;
     valu(
         b,
-        &format!("v_div_scale_f32 v{w3}, vcc_lo, v{VOUT}, v{w0}, v{VOUT}"),
+        &format!("v_div_scale_f32 v{w3}, vcc_lo, v{vout}, v{w0}, v{vout}"),
         &[w3],
-        &[VOUT, w0],
+        &[vout, w0],
         &[],
     )?;
     valu(
@@ -2762,21 +2772,21 @@ fn hc_value(b: &mut Builder, label: &str) -> R {
     )?;
     valu(
         b,
-        &format!("v_div_fixup_f32 v{w0}, v{w1}, v{w0}, v{VOUT}"),
+        &format!("v_div_fixup_f32 v{w0}, v{w1}, v{w0}, v{vout}"),
         &[w0],
-        &[w1, w0, VOUT],
+        &[w1, w0, vout],
         &[],
     )?;
     // out = rt(y).
     valu(
         b,
-        &format!("v_mov_b32_e32 v{VOUT}, v{w0}"),
-        &[VOUT],
+        &format!("v_mov_b32_e32 v{vout}, v{w0}"),
+        &[vout],
         &[w0],
         &[],
     )?;
-    round_trip(b, VOUT, [T0, T1, T2])?;
-    b.label(&done)
+    round_trip(b, vout, [t0, t1, t2])?;
+    Ok(())
 }
 
 fn emit_hc(e: Body) -> Result<Emitted, String> {

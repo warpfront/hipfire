@@ -7,7 +7,6 @@ use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use crate::pipeline_gguf::GgufFormat;
 use crate::reap_overlay;
 
 // ─── HFQ File Format ────────────────────────────────────────────────────────
@@ -48,8 +47,7 @@ impl QuantType {
             21 => Some(Self::HFP4G32),
             24 => Some(Self::MFP4G32),
             22 => Some(Self::TidI32),
-            28 => Some(Self::PARO4G128),
-            29 => Some(Self::PARO4G128T),
+            // 28/29: reserved (formerly PARO4G128/PARO4G128T, removed in 0.5.0); never reused.
             30 => Some(Self::MQ4G256Lloyd),
             31 => Some(Self::MQ5G256),
             32 => Some(Self::MFP4G32Lloyd),
@@ -74,6 +72,7 @@ impl QuantType {
             53 => Some(Self::MQ4G128V2),
             55 => Some(Self::FP8E4M3B128),
             56 => Some(Self::FP8E4M3PT),
+            57 => Some(Self::HC8E4M3Row),
             131 => Some(Self::MQ3I4G128R256),
             132 => Some(Self::MQ3I4G128R128),
             133 => Some(Self::MQ2I4G128R256),
@@ -127,8 +126,7 @@ pub(crate) enum QuantType {
     // HFP4G32MX   = 25, // v2  — strict OCP MXFP4 interop alias (no row scale, UE8M0 only)
     // HFP4G16NV   = 26, // v2  — strict NVFP4 interop alias (E4M3 scale + FP32 tensor)
     // HFP8E4M3G32 = 27, // v2  — HFP8 E4M3 family
-    PARO4G128 = 28,  // ParoQuant native AWQ W4 + pairwise activation rotation metadata
-    PARO4G128T = 29, // ParoQuant engine-tiled qweight [M/8, K] for coalesced GEMV reads
+    // 28/29: reserved (formerly PARO4G128/PARO4G128T, removed in 0.5.0) — DO NOT REUSE.
     // MFP4G32R    = 29, // v3  — HFP4G32 + online block-diag-128 rotation (AMD recipe)
     MQ4G256Lloyd = 30, // MagnumQuant 4-bit + per-block Lloyd-Max 16-entry fp16 codebook (160 B/group)
     // Renumbered from 21 → 30 in mq4-lloyd merge to avoid HFP4G32=21 collision.
@@ -253,6 +251,12 @@ pub(crate) enum QuantType {
     /// FP8 E4M3PT (qt=56): OCP e4m3fn codes with one per-tensor bf16 scale in a
     /// 16-byte header, then `rows*K` code bytes. Arch-loaded (Qwen4 PLE row store).
     FP8E4M3PT = 56,
+    /// HC8 E4M3Row (qt=57): wire constant, Qwen4 HC8 sidecar (`<model>.hc8`) only,
+    /// never produced by the quantize pipeline. `[m, k]` payload = swizzled OCP
+    /// e4m3 bytes (`m*k`) then little-endian f32 per-row power-of-two scales
+    /// (`4*m`); decode `q * s`. Layout in `docs/quant-formats/hc8-e4m3-row.md`;
+    /// built by `hipfire-quantize hc8 build`.
+    HC8E4M3Row = 57,
     /// MQ3-I4 gate/up (qt=131, DESIGN F1/F2): W3 grid ±{1,3,5,7} (3-bit planar
     /// codes) + per-128 f16 scales, R256 FWHT (seeds 42/1042). Tensor bytes are
     /// `[codes plane M*K*3/8][scales plane M*K/128 f16]`. Typed-qwen4 expert
@@ -279,13 +283,6 @@ pub(crate) enum QuantLevel {
     Q8,
     /// Promote to 6-bit variant of the base format (edge layers, MoE expert FFN).
     Promote6,
-    /// Override the default for a specific tensor class (today: lm_head)
-    /// to a CLI-specified format. Currently unused on this branch (no emission
-    /// site); kept so origin/master's lm_head-format override match arms
-    /// compile after the merge. Re-wire to `--lm-head-format` when the
-    /// configurable-kmap-pair refactor lands here.
-    #[allow(dead_code)]
-    Override(GgufFormat),
     /// Use the base format as-is.
     Base,
 }
@@ -954,5 +951,11 @@ mod maple_dtype_tests {
                 .count();
             assert_eq!(hits, 1, "{qt:?} (id {id}) must resolve from exactly one id");
         }
+    }
+
+    #[test]
+    fn removed_ids_28_and_29_stay_reserved() {
+        assert_eq!(QuantType::from_u8(28), None);
+        assert_eq!(QuantType::from_u8(29), None);
     }
 }

@@ -946,8 +946,7 @@ fn from_config_value(config: &serde_json::Value) -> Result<Qwen35Config, String>
 ///
 /// No env ⇒ no-op (`config.reap_keep` stays `None`); the MoE loader then
 /// takes the literal original full-load path — byte-identical to baseline.
-/// Only the HFQ MoE path (`load_moe_ffn`) honors the keep-map; the
-/// ParoQuant path does not (see `paro_load_moe_ffn`).
+/// Only the HFQ MoE path (`load_moe_ffn`) honors the keep-map.
 pub fn apply_reap_plan(config: &mut Qwen35Config) -> Result<(), String> {
     if let Some(plan) = hipfire_reap::plan::ReapPlan::from_config(
         "qwen35",

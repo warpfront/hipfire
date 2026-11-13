@@ -67,7 +67,7 @@ pub const DENSE_REPRESENTATION_TAG: &str =
 pub const DENSE_RECIPE_SCHEMA: &str = "hipfire.qwen35.dense.recipe.v1";
 
 const SEAL_MAGIC: &[u8; 8] = b"HQ35DSL1";
-const SEAL_VERSION: u32 = 1;
+const SEAL_VERSION: u32 = 2;
 /// Hard decode bounds (checked before any allocation they would drive).
 pub const MAX_SEAL_BYTES: usize = 8 << 20;
 const MAX_LAYERS: u64 = 4096;
@@ -185,12 +185,17 @@ dtype_table! {
     MQ3G256Lloyd = 31, MQ4G256Lloyd = 32, MQ2G256GL = 33, MQ3G256GL = 34, HFP4G32 = 35,
     MFP4G32 = 36, MFP4G32Lloyd = 37, MFP4G32P = 38, MFP4G32E8 = 39, MFP4G32E8SOA = 40,
     MFP3G32E8 = 41, MFP2G32E8 = 42, MFP4G32E8G128 = 43, HFQ2G256 = 44, HFQ2G128 = 45,
-    TQ2G128 = 46, BQ1G128 = 47, HFQ6G256 = 48, ParoQ4G128 = 49, Raw = 50, FP8E4M3B128 = 51,
+    TQ2G128 = 46, BQ1G128 = 47, HFQ6G256 = 48, Raw = 50, FP8E4M3B128 = 51,
     FP8E4M3PT = 52,
     MQ3I4G128R256 = 53, MQ3I4G128R128 = 54, MQ2I4G128R256 = 55, MQ2I4G128R128 = 56,
-    E8PI4G128R256 = 57, E8PI4G128R128 = 58, ParoQ4G64 = 59,
+    E8PI4G128R256 = 57, E8PI4G128R128 = 58,
+    // Tags 49 and 59 are reserved: formerly ParoQ4G128/ParoQ4G64, removed in 0.5.0.
     // GGUF block formats (additive tags; no export route produces them yet).
     GgmlQ4K = 60, GgmlQ5K = 61, GgmlQ6K = 62, GgmlQ8_0 = 63, GgmlIQ4XS = 64,
+    // Drop-zero planar MQ4 routed experts (loader-produced qwen4 layout; additive tags).
+    MQ4G256V2P = 65, MQ4G128V2P = 66,
+    // Qwen4 HC8 sidecar weight (qt 57; exact gfx1201, never in a shared qwen35 weight file; additive tag).
+    HC8E4M3Row = 67,
 }
 
 fn embd_tag(f: EmbeddingFormat) -> SwResult<u8> {
@@ -232,7 +237,6 @@ fn quant_block(dtype: DType) -> Option<(u64, u64, u64, &'static str)> {
         DType::MQ2G256 | DType::MQ2G256Lloyd => (256, 256, 72, "2bit-g256"),
         DType::MQ3G256Lloyd => (256, 256, 112, "3bit-g256-lloyd"),
         DType::MQ4G256Lloyd => (256, 256, 160, "4bit-g256-lloyd"),
-        DType::ParoQ4G128 => (128, 128, 72, "paroq4g128"),
         _ => return None,
     })
 }
@@ -561,9 +565,6 @@ impl Enc {
         }
     }
     fn wtd(&mut self, w: &WeightTensorDescriptor) -> SwResult<()> {
-        if w.paro.is_some() {
-            return Err(SharedWeightError::unsupported("Paro sidecar"));
-        }
         self.u8(dtype_tag(w.gpu_dtype));
         self.usize(w.m)?;
         self.usize(w.k)?;
@@ -576,7 +577,6 @@ impl Enc {
                 self.gtd(a)?;
             }
         }
-        self.u8(0); // paro: explicit absent tag
         self.lut(&w.lloyd_lut_e4m3);
         self.lut(&w.lloyd_lut_f16);
         self.lut(&w.lloyd_lut_c16);
@@ -767,10 +767,6 @@ impl<'a> Dec<'a> {
             1 => Some(self.gtd()?),
             t => return Err(SharedWeightError::codec(format!("invalid AWQ tag {t}"))),
         };
-        match self.u8()? {
-            0 => {}
-            _ => return Err(SharedWeightError::unsupported("Paro sidecar in seal")),
-        }
         let lloyd_lut_e4m3 = self.lut::<4>()?;
         let lloyd_lut_f16 = self.lut::<8>()?;
         let lloyd_lut_c16 = self.lut::<4>()?;
@@ -781,7 +777,6 @@ impl<'a> Dec<'a> {
             row_stride,
             buf,
             awq_scale,
-            paro: None,
             lloyd_lut_e4m3,
             lloyd_lut_f16,
             lloyd_lut_c16,
@@ -790,7 +785,7 @@ impl<'a> Dec<'a> {
 }
 
 /// Checked, bounded inverse of [`encode_dense_seal`]. Rejects truncation,
-/// trailing bytes, unknown tags, oversized ranks/layer counts and Paro/MoE.
+/// trailing bytes, unknown tags, oversized ranks/layer counts and MoE.
 pub fn decode_dense_seal(bytes: &[u8]) -> SwResult<DenseSealMeta> {
     if bytes.len() > MAX_SEAL_BYTES {
         return Err(SharedWeightError::codec("seal exceeds size bound"));
@@ -1336,11 +1331,6 @@ fn check_weight(
     flags: &DenseRecipeFlags,
 ) -> SwResult<()> {
     let bad = |msg: String| SharedWeightError::invalid(format!("{role}: {msg}"));
-    if w.paro.is_some() {
-        return Err(SharedWeightError::unsupported(format!(
-            "{role}: Paro sidecar"
-        )));
-    }
     if w.m != rule.m || w.k != rule.k {
         return Err(bad(format!(
             "m/k {}x{} != config geometry {}x{}",
@@ -2070,20 +2060,6 @@ fn take_weight(
             format!("{prefix}.awq_scale"),
             std::mem::replace(a, empty_tensor()),
         ));
-    }
-    if let Some(p) = w.paro.as_mut() {
-        if !p.is_alias {
-            for (n, t) in [
-                ("pairs", &mut p.pairs),
-                ("theta", &mut p.theta),
-                ("channel_scales", &mut p.channel_scales),
-            ] {
-                out.push((
-                    format!("{prefix}.paro.{n}"),
-                    std::mem::replace(t, empty_tensor()),
-                ));
-            }
-        }
     }
 }
 
@@ -2840,7 +2816,6 @@ mod tests {
                 dtype: DType::Raw,
                 byte_len: if planes { k * 12 } else { k * 4 },
             }),
-            paro: None,
             lloyd_lut_e4m3: None,
             lloyd_lut_f16: None,
             lloyd_lut_c16: None,
@@ -2978,17 +2953,7 @@ mod tests {
     }
 
     #[test]
-    fn codec_rejects_paro_and_moe() {
-        let mut s = seal(&cfg(), false);
-        s.output.paro = Some(crate::qwen35::weights::ParoDescriptor {
-            krot: 1,
-            group_size: 128,
-            is_alias: false,
-            pairs: f32d(1),
-            theta: f32d(1),
-            channel_scales: f32d(1),
-        });
-        assert!(encode_dense_seal(&flags(), &s).is_err());
+    fn codec_rejects_moe() {
         let mut s = seal(&cfg(), false);
         s.has_pager = true;
         assert!(encode_dense_seal(&flags(), &s).is_err());

@@ -30,7 +30,7 @@ use hipfire_dispatch::pipeline::dump_hidden_localize;
 use hipfire_dispatch::pipeline::execute_steps;
 use hipfire_dispatch::pipeline::gated_mlp::{GatedMlpOp, MlpOutput};
 use hipfire_dispatch::pipeline::hybrid;
-use hipfire_dispatch::pipeline::hybrid::{AttentionTap, MixerOutput};
+use hipfire_dispatch::pipeline::hybrid::MixerOutput;
 use hipfire_dispatch::pipeline::sealed_moe::MoeRouteProducerProof;
 use hipfire_dispatch::pipeline::sealed_moe::SealedMoeCall;
 use hipfire_dispatch::pipeline::superop;
@@ -607,7 +607,6 @@ fn moe_params_for_decode<'a>(
                 .unwrap_or(DType::F32)
         },
         routed_has_mixed_experts: per_expert_gate_up.is_some() || per_expert_down.is_some(),
-        has_paro_shared: ffn.paro_shared.is_some(),
         per_expert_gate_up,
         per_expert_down,
     };
@@ -672,28 +671,6 @@ fn moe_params_for_decode<'a>(
         routed_down_m: ffn.experts.first().map_or(0, |e| e.down.m),
         routed_down_k: ffn.experts.first().map_or(0, |e| e.down.k),
         routed_experts: ffn,
-        routed_gate_up_paro: ffn.experts.first().and_then(|e| {
-            e.gate_up
-                .paro
-                .as_ref()
-                .map(|p| hipfire_dispatch::families::gemv::GivensRef {
-                    pairs: &p.pairs,
-                    theta: &p.theta,
-                    scales: &p.channel_scales,
-                    krot: p.krot as usize,
-                })
-        }),
-        routed_down_paro: ffn.experts.first().and_then(|e| {
-            e.down
-                .paro
-                .as_ref()
-                .map(|p| hipfire_dispatch::families::gemv::GivensRef {
-                    pairs: &p.pairs,
-                    theta: &p.theta,
-                    scales: &p.channel_scales,
-                    krot: p.krot as usize,
-                })
-        }),
         router_logits: s.router_logits,
         x_rot_local: s.x_rot_local,
         gate_up_buf: s.gate_up_buf,
@@ -1366,14 +1343,13 @@ impl Qwen35Scratch {
             // prefill (PREFILL_MAX_BATCH=256 → ceil(256/batch_mult) calls per
             // FA layer) for ~linearly less VRAM at long context.
             //
-            // The per-position size scales with kv_max_seq (= physical_cap
-            // post-eviction), and that scaling is what made #85 visible: at
-            // max_seq=170k, no CASK, 27B (n_heads=24, head_dim=256) the old
+            // The per-position size scales with kv_max_seq, and that scaling
+            // is what made #85 visible: at
+            // max_seq=170k, 27B (n_heads=24, head_dim=256) the old
             // batch_mult=64 → 2.1 GB just for these partials, exceeding VRAM
             // headroom on 24 GB cards. Cutting batch_mult by 4× (16) keeps
             // the prefill chunking moderate while saving 1.6 GB at that
-            // worst-case shape; CASK-on workloads (small physical_cap) are
-            // unaffected because the buffer is already tiny there.
+            // worst-case shape.
             //
             // On the gfx1100 tile32/tile128 split the legacy formula
             // incidentally gave 64 batched rows; 16 regressed prefill, 32
@@ -1418,7 +1394,7 @@ impl Qwen35Scratch {
             // uses attention_q8_0_kv while a captured-and-replayed forward
             // uses attention_flash_q8_0 — same math, different fp32
             // reduction order, observed as ~0.44 logit delta direct-vs-graph
-            // on shisa-Qwen3.6-A3B-PARO (see
+            // on a Qwen3.6-A3B MoE checkpoint (see
             // .scratch/hipgraph-moe-drift-audit.md Part A). Aligning the
             // default flips both paths to `attention_flash_q8_0` and makes
             // direct vs graph byte-identical at the cost of moving small-
@@ -1702,13 +1678,12 @@ fn ar_graph_binding(
     for t in kv_cache.k_gpu.iter().chain(&kv_cache.v_gpu) {
         mix(t.buf.as_ptr());
     }
-    for t in dn_state
-        .s_matrices
-        .iter()
-        .chain(&dn_state.s_scales)
-        .chain(&dn_state.conv_states)
-        .chain(&dn_state.s_ef_residual)
-    {
+    // Every owned family, GDN carry included: an exchange or reallocation of
+    // any of them changes the identity. Reset and same-pointer restore do not
+    // (the captured decode graph stays valid across them); the owner
+    // generation (`dn_state.stream.generation`) is for component-executor
+    // graph keys, not this decode graph.
+    for t in dn_state.families().into_iter().flatten() {
         mix(t.buf.as_ptr());
     }
     mix(s.pos_buf.as_ptr());
@@ -1771,6 +1746,22 @@ fn ar_graph_binding(
     h.max(1)
 }
 
+/// Decode/verify reads the Q8/EF planes directly; they are authoritative only on a
+/// `Sealed` stream (CHUNK-CANONICAL-DESIGN §3.5). An `Open` ordinary-prefill phase must be
+/// finished by `DeltaNetState::seal_streams` at the actual prompt end first; fail closed
+/// instead of decoding from a stale quantized plane.
+pub(crate) fn refuse_open_gdn_stream(dn_state: &DeltaNetState, site: &str) -> HipResult<()> {
+    if dn_state.stream.is_open() {
+        return Err(HipError::new(
+            0,
+            &format!(
+                "{site}: the GDN stream is Open; seal it at the prompt end before decode/verify"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Zero-alloc forward pass using pre-allocated scratch buffers.
 /// Logits stay on GPU in scratch.logits. Returns nothing — caller uses scratch.logits.
 pub fn forward_scratch(
@@ -1783,6 +1774,7 @@ pub fn forward_scratch(
     dn_state: &mut DeltaNetState,
     scratch: &Qwen35Scratch,
 ) -> HipResult<()> {
+    refuse_open_gdn_stream(dn_state, "forward_scratch")?;
     #[cfg(feature = "moe-oracle")]
     crate::qwen35::oracle::set_decode_position(pos).map_err(|e| HipError::new(0, &e))?;
     let required_tokens = checked_kv_end(pos, 1, "forward_scratch")?;
@@ -2253,13 +2245,10 @@ pub fn forward_scratch_embed(
 
 /// Write `(t, h, w)` for sequence position `pos` into `scratch.pos_buf3`.
 ///
-/// `compact_offset` mirrors what the 1D path does to `pos_buf` after a
-/// TriAttention compaction: absolute rope phase = physical index + offset.
-/// Note the daemon does NOT build an `MropeCtx` while eviction is armed
-/// (physical indices are renumbered there, so `MropeCtx::positions` — which is
-/// indexed by physical position — would be misaligned), so in practice this
-/// arm sees `compact_offset == 0`. It is applied anyway so the mrope branch
-/// never silently disagrees with its 1D twin.
+/// `compact_offset` mirrors what the 1D path does to `pos_buf`: absolute rope
+/// phase = physical index + offset. It is always 0 now that KV eviction is
+/// gone; it is applied anyway so the mrope branch never silently disagrees
+/// with its 1D twin.
 fn upload_mrope_pos3(
     gpu: &mut Gpu,
     scratch: &Qwen35Scratch,
@@ -2429,6 +2418,7 @@ fn forward_scratch_layers(
     hidden_rb: Option<&mut HiddenStateRingBuffer>,
     mrope: Option<&MropeCtx>,
 ) -> HipResult<()> {
+    refuse_open_gdn_stream(dn_state, "forward_scratch_layers")?;
     let ctx = DispatchCtx::new(gpu);
     if let Some(mc) = mrope {
         debug_assert_eq!(
@@ -2454,7 +2444,6 @@ fn forward_scratch_layers(
         }
         Ok(())
     };
-    let tap_enabled = hipfire_runtime::triattn::tap_enabled();
     let mut delta_layer_idx = 0usize;
     let combine_next_rms = moe_combine_next_rms_enabled(gpu, weights, config);
     let reuse_fused_rotation =
@@ -2483,16 +2472,12 @@ fn forward_scratch_layers(
             )?;
             finish_layer(gpu, layer_idx - 1)?;
         }
-        let tap_fn = |gpu: &mut Gpu| {
-            triattn_tap(gpu, layer_idx, s, config).map_err(|e| DispatchError::Hip(e.to_string()))
-        };
-        let tap = tap_enabled.then_some(&tap_fn as AttentionTap<'_>);
         let mixer = binding.mixer(
             layer,
             layer_idx,
             delta_layer_idx,
             fused_transition && reuse_fused_rotation,
-            tap,
+            None,
             MixerOutput::Residual,
         );
         execute_steps(gpu, &ctx, &[mixer]).map_err(|e| HipError::new(0, &e.to_string()))?;
@@ -2562,11 +2547,7 @@ pub(crate) fn forward_scratch_dense_layer(
         mrope_section: None,
     };
     let layer = &weights.layers[layer_idx];
-    let tap_fn = |gpu: &mut Gpu| {
-        triattn_tap(gpu, layer_idx, s, config).map_err(|e| DispatchError::Hip(e.to_string()))
-    };
-    let tap = hipfire_runtime::triattn::tap_enabled().then_some(&tap_fn as AttentionTap<'_>);
-    let mixer = binding.mixer(layer, layer_idx, 0, false, tap, MixerOutput::Residual);
+    let mixer = binding.mixer(layer, layer_idx, 0, false, None, MixerOutput::Residual);
     let ffn = super::program::dense_ffn(&binding.dims, s, layer, MlpOutput::Residual)
         .expect("dense layer");
     execute_steps(gpu, &ctx, &[mixer, Step::GatedMlp(ffn)])
@@ -3070,12 +3051,6 @@ impl PreparedMoeShard {
                 "qwen35: post-load EP shard refuses AWQ pointer tables",
             ));
         }
-        if ffn.paro_shared.is_some() {
-            return Err(HipError::new(
-                0,
-                "qwen35: post-load EP shard refuses ParoQuant rotation sidecars",
-            ));
-        }
         // The only sanctioned Single -> EP transition: rebuild planner input
         // from the attested plan and rerun the ordinary manifest/expert
         // planners. Ownership comes from the planner, never from `e % N`.
@@ -3557,39 +3532,6 @@ fn shard_all_moe_layers_inner(
             _ => unreachable!("EP shard admission passed layer {index}"),
         };
         shard.commit(gpu, ffn);
-    }
-    Ok(())
-}
-
-/// TriAttention tap helper (inline from original forward).
-fn triattn_tap(
-    gpu: &mut Gpu,
-    layer_idx: usize,
-    s: &Qwen35Scratch,
-    config: &Qwen35Config,
-) -> HipResult<()> {
-    let gpu_handled = hipfire_runtime::triattn::record_prerope_q_batch_gpu_if_applicable(
-        gpu,
-        layer_idx,
-        &s.fa_q.buf,
-        1,
-        config.n_heads,
-        config.head_dim,
-    )?;
-    if !gpu_handled {
-        let n_q = config.n_heads * config.head_dim;
-        let q_cpu = gpu.download_f32(&s.fa_q)?;
-        if hipfire_runtime::triattn::tap_needs_k() {
-            let n_k = config.n_kv_heads * config.head_dim;
-            let k_cpu = gpu.download_f32(&s.fa_k)?;
-            hipfire_runtime::triattn::record_prerope_qk(
-                layer_idx,
-                &q_cpu[..n_q],
-                Some(&k_cpu[..n_k]),
-            );
-        } else {
-            hipfire_runtime::triattn::record_prerope_q(layer_idx, &q_cpu[..n_q]);
-        }
     }
     Ok(())
 }
@@ -4515,8 +4457,7 @@ fn forward_prefill_dense_tp_batched(
                                 q8_flags[rank],
                                 BatchEpilogue::Partial(partials[rank]),
                                 DflashFusionCtx::Off,
-                                None,  // commit_stride: TP ranks keep legacy cadence
-                                false, // Chunk scan is single-GPU ordinary prefill only
+                                hipfire_dispatch::pipeline::batched_deltanet::GdnPrefillRoute::Legacy, // TP ranks keep the per-call recurrence
                             ) {
                                 process_res = Err(e);
                                 break;
@@ -4628,8 +4569,6 @@ fn forward_prefill_dense_tp_batched(
                             let max_ctx = chunk_start + n;
                             let ctx = DispatchCtx::new(&gpus.devices[rank]);
                             let cfg = &configs[rank];
-                            let tap_fn = super::program::batched_attention_tap(cfg);
-                            let tap = tap_fn.get();
                             if let Err(e) = hipfire_dispatch::pipeline::batched_attention::batch_chunk_full_attn_attn(
                                 &mut gpus.devices[rank],
                                 false,
@@ -4652,7 +4591,7 @@ fn forward_prefill_dense_tp_batched(
                                 BatchEpilogue::Partial(partials[rank]),
                                 DflashFusionCtx::Off,
                                 None, // commit_stride: TP ranks keep legacy cadence
-                                tap,
+                                None,
                             ) {
                                 process_res = Err(e);
                                 break;
@@ -5102,13 +5041,13 @@ impl Qwen35Bindings<'_> {
         }
     }
 
-    fn mixer<'s>(&'s self, tap: Option<AttentionTap<'s>>) -> Step<'s> {
+    fn mixer<'s>(&'s self) -> Step<'s> {
         self.program().mixer(
             self.layer,
             self.layer_idx,
             self.delta_layer_idx,
             self.precomputed_attn_x_rot,
-            tap,
+            None,
             MixerOutput::Residual,
         )
     }
@@ -5151,7 +5090,7 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
         op: &OpBinding,
     ) -> Result<(), DispatchError> {
         match op_code(op) {
-            q35_op::PROJ_QKV | q35_op::PROJ_QKVZA => match self.mixer(None) {
+            q35_op::PROJ_QKV | q35_op::PROJ_QKVZA => match self.mixer() {
                 Step::DeltaNetMixer(op) => op.project(gpu, ctx),
                 Step::GatedAttention(op) => op.project(gpu, ctx),
                 _ => Err(wrong_layer("PROJ")),
@@ -5168,7 +5107,7 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
         op: &OpBinding,
     ) -> Result<(), DispatchError> {
         match op_code(op) {
-            q35_op::RESID_WO => match self.mixer(None) {
+            q35_op::RESID_WO => match self.mixer() {
                 Step::DeltaNetMixer(op) => op.output(gpu, ctx),
                 Step::GatedAttention(op) => op.output(gpu, ctx, self.fa_output_prerotated),
                 _ => Err(wrong_layer("RESID_WO")),
@@ -5184,7 +5123,7 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
         _ctx: &DispatchCtx,
         _op: &OpBinding,
     ) -> Result<(), DispatchError> {
-        match self.mixer(None) {
+        match self.mixer() {
             Step::DeltaNetMixer(op) => op.gated_norm(gpu),
             _ => Err(wrong_layer("NORM_GATED")),
         }
@@ -5197,11 +5136,7 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
         op: &OpBinding,
     ) -> Result<(), DispatchError> {
         let (s, config, layer_idx) = (self.s, self.config, self.layer_idx);
-        let tap_fn = |gpu: &mut Gpu| {
-            triattn_tap(gpu, layer_idx, s, config).map_err(|e| DispatchError::Hip(e.to_string()))
-        };
-        let tap = hipfire_runtime::triattn::tap_enabled().then_some(&tap_fn as AttentionTap<'_>);
-        let prerotated = match (op_code(op), self.mixer(tap)) {
+        let prerotated = match (op_code(op), self.mixer()) {
             (q35_op::ATTEND_FULL, Step::GatedAttention(op)) => op.attend(gpu, ctx)?,
             (q35_op::ATTEND_DN_PREP, Step::DeltaNetMixer(op)) => return op.prepare(gpu),
             (code, _) => {
@@ -5444,7 +5379,7 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
         _ctx: &DispatchCtx,
         _op: &OpBinding,
     ) -> Result<(), DispatchError> {
-        match self.mixer(None) {
+        match self.mixer() {
             Step::DeltaNetMixer(op) => op.recur(gpu),
             _ => Err(wrong_layer("RECUR_GDN")),
         }

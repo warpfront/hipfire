@@ -1383,7 +1383,6 @@ fn rotation_plan_from_basis(basis: &str) -> Result<hipfire_dispatch::types::Rota
         "FwhtG256" | "fwht-g256" => Ok(RotationPlan::FwhtG256),
         "FwhtG128" | "fwht-g128" => Ok(RotationPlan::FwhtG128),
         "Mq8Internal" | "mq8-internal" => Ok(RotationPlan::Mq8Internal),
-        "Givens" | "givens" => Ok(RotationPlan::Givens),
         other => Err(format!("unknown expert activation basis '{other}'")),
     }
 }

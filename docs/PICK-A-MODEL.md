@@ -70,10 +70,10 @@ separate surface: [IMAGEGEN.md](IMAGEGEN.md).
 ## Fixtures
 
 - **[A]** [Historical AR decode, 7900 XTX (gfx1100)](BENCHMARKS.md#historical-autoregressive-decode-no-spec--7900-xtx-gfx1100):
-  MQ4, then-default asym3 KV (deprecated since 0.4.0, removal in 0.5.0; on
-  Qwen `asym3` is now an alias of `fwht3`), median of 5 runs, no speculation.
+  MQ4, then-default asym3 KV (removed in 0.5.0; on Qwen `asym3` was an alias
+  of `fwht3`), median of 5 runs, no speculation.
 - **[B]** [Historical DFlash by genre, 7900 XTX](BENCHMARKS.md#historical-dflash-speculative-decode-by-genre--7900-xtx):
-  asym3 KV (same deprecation), `--no-chatml`, `max_tokens=120`, DFlash forced on, median of 5.
+  asym3 KV (same removal), `--no-chatml`, `max_tokens=120`, DFlash forced on, median of 5.
   Superseded methodology; the speedup depends on the prompt genre.
 - **[C]** [Historical other arches](BENCHMARKS.md#historical-other-arches-decode-toks):
   then-default configuration, decode tok/s.
@@ -99,11 +99,8 @@ separate surface: [IMAGEGEN.md](IMAGEGEN.md).
 
 ## Not recommended
 
-PFlash prefill compression and CASK / TriAttention KV eviction are deprecated
-since 0.4.0 and scheduled for removal in 0.5.0; they are unsupported and no
-row here depends on them. The legacy contiguous-DFlash knobs
-(`HIPFIRE_DFLASH_WINDOW=0`, `HIPFIRE_DFLASH_CTX_CAP`) and the Givens `legacy-asymN`
-/ `asymN` / `turboN` KV names are deprecated on the same schedule; prefer a
+The legacy contiguous-DFlash knobs and the Givens `legacy-asymN` / `asymN` /
+`turboN` KV names were removed in 0.5.0; use a
 `kv_cache` of `auto`, `q8` or `fwhtN`. See
 [Measured on v0.4.4](#measured-on-v044) and the dated
 [perf checkpoints](perf-checkpoints/) for newer-family measurements.

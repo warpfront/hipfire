@@ -251,15 +251,14 @@ impl Vop3Op {
         use Vop3OnlyOp as O;
         use Vop3Op::{Only, C, V1, V2};
         match self {
-            C(K::CmpClassF32) | C(K::CmpLtF32) | C(K::CmpEqF32) | C(K::CmpLeF32)
-            | C(K::CmpGtF32) | C(K::CmpLgF32) | C(K::CmpGeF32) | C(K::CmpOF32) | C(K::CmpUF32)
-            | C(K::CmpNeqF32) | C(K::CmpLtI32) | C(K::CmpEqI32) | C(K::CmpLeI32)
+            C(k) if k.float_compare().is_some() => (2, 1, 1, 0),
+            C(K::CmpClassF32) | C(K::CmpLtI32) | C(K::CmpEqI32) | C(K::CmpLeI32)
             | C(K::CmpGtI32) | C(K::CmpNeI32) | C(K::CmpGeI32) | C(K::CmpLtU32)
             | C(K::CmpEqU32) | C(K::CmpLeU32) | C(K::CmpGtU32) | C(K::CmpNeU32)
             | C(K::CmpGeU32) | C(K::CmpxEqU32) | C(K::CmpxNeU32) | C(K::CmpxGtU32)
-            | C(K::CmpxLtU32) | C(K::CmpxGtI32) | C(K::CmpxLtI32) | C(K::CmpxGtF32)
-            | C(K::CmpxLtF32) => (2, 1, 1, 0),
-            C(K::CmpEqU64) | C(K::CmpNeU64) | Only(O::AddF64) | Only(O::MulF64) => (2, 2, 2, 0),
+            | C(K::CmpxLtU32) | C(K::CmpxGtI32) | C(K::CmpxLtI32) => (2, 1, 1, 0),
+            C(K::CmpEqU64) | C(K::CmpNeU64) | C(K::CmpGtI64) | C(K::CmpGeI64) | C(K::CmpGeU64)
+            | Only(O::AddF64) | Only(O::MulF64) => (2, 2, 2, 0),
             V2(B::CndmaskB32) | V2(B::AddcCoU32) | V2(B::SubbCoU32) | V2(B::SubbrevCoU32) => {
                 (1, 1, 1, 2)
             }
@@ -390,9 +389,7 @@ impl Vop3Op {
                 omod: true,
                 op_sel: 0b0000,
             },
-            C(K::CmpLtF32) | C(K::CmpEqF32) | C(K::CmpLeF32) | C(K::CmpGtF32) | C(K::CmpLgF32)
-            | C(K::CmpGeF32) | C(K::CmpOF32) | C(K::CmpUF32) | C(K::CmpNeqF32)
-            | C(K::CmpxGtF32) | C(K::CmpxLtF32) => Vop3Mods {
+            C(k) if k.float_compare().is_some() => Vop3Mods {
                 neg: 0b011,
                 abs: 0b011,
                 clamp: true,
@@ -528,24 +525,12 @@ impl Vop3Op {
 
     /// `v_cmpx_*` in the 64-bit form writes EXEC as well as SDST.
     fn writes_exec(self) -> bool {
-        matches!(
-            self,
-            Self::C(
-                VopcOp::CmpxEqU32
-                    | VopcOp::CmpxNeU32
-                    | VopcOp::CmpxGtU32
-                    | VopcOp::CmpxLtU32
-                    | VopcOp::CmpxGtI32
-                    | VopcOp::CmpxLtI32
-                    | VopcOp::CmpxGtF32
-                    | VopcOp::CmpxLtF32,
-            )
-        )
+        matches!(self, Self::C(op) if op.is_cmpx())
     }
 
     /// `OP_SEL` as llvm lists it: two-source ops with a destination select
     /// print `[src0, src1, dst]` (bits 0, 1, 3), the others bits 0..=3.
-    fn op_sel_bits(self) -> &'static [u8] {
+    pub fn op_sel_bits(self) -> &'static [u8] {
         match self {
             Self::Only(
                 Vop3OnlyOp::CvtPkFp8F32 | Vop3OnlyOp::CvtPkBf8F32 | Vop3OnlyOp::PackB32F16,
@@ -1047,6 +1032,7 @@ impl Vop3OnlyOp {
                 Self::FmaF64 => 460,
                 Self::LshlAddU64 => 520,
             }),
+            Arch::Gfx950 => None,
         }
     }
     /// llvm-mc mnemonic (no encoding suffix).

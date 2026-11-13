@@ -77,40 +77,6 @@ fn hook<T>(r: Option<Result<T, String>>) -> Result<T, DecideError> {
         .map_err(|e| DecideError::new(500, e))
 }
 
-/// Admission rule for decide when KV eviction (CASK / TriAttention) is
-/// configured. Decide prefills the whole prompt through the carrier's
-/// `forward_prefill_batch` and never calls `Eviction::maybe_evict` (that runs
-/// only in the generate loops), so eviction cannot fire inside decide. What
-/// bounds it is where the prefill writes: KV slot == position (uncompacted),
-/// and the KV buffers hold only `LoadedModel::physical_cap` slots
-/// (`CaskConfig::physical_cap`: by default budget + beta + 256, clamped to
-/// max_seq) with no bounds check in the prefill. The limit is the smaller of the eviction
-/// budget (`Eviction::budget()`, i.e. `cask_budget`) and `physical_cap`, so a
-/// decide never holds more context than generate would retain after eviction.
-/// Growing max_seq does not help here, hence no `required_max_seq`.
-fn check_eviction_limit(
-    longest: usize,
-    eviction_budget: Option<usize>,
-    physical_cap: usize,
-) -> Result<(), DecideError> {
-    let Some(budget) = eviction_budget else {
-        return Ok(());
-    };
-    let limit = budget.min(physical_cap);
-    if longest + 1 > limit {
-        return Err(DecideError::new(
-            422,
-            format!(
-                "prompt needs {} tokens, KV eviction (CASK) is configured and decide is limited to \
-                 {limit} tokens (min of eviction budget {budget} and physical KV capacity \
-                 {physical_cap})",
-                longest + 1
-            ),
-        ));
-    }
-    Ok(())
-}
-
 /// Positional KV rewind requires `compact_offset == 0`. `None` means the
 /// carrier claimed `decide_supported()` without this hook: contract violation.
 fn check_uncompacted(compact_offset: Option<usize>) -> Result<(), DecideError> {
@@ -265,10 +231,8 @@ pub fn plan_decide(m: &LoadedModel, req: &Value) -> Result<DecidePlan, DecideErr
             "decide requires a single-GPU model (pp=1, no EP)",
         ));
     }
-    // CASK/TriAttention eviction may be configured (serve loads with it on):
-    // decide never calls `maybe_evict`, so it is admitted when its prompts fit
-    // the eviction-safe limit (checked below, after tokenizing) and the cache
-    // is uncompacted after the pre-decide rollback. kv_adaptive stays refused.
+    // The cache must be uncompacted after the pre-decide rollback.
+    // kv_adaptive stays refused.
     if m.kv_adaptive.is_some() {
         return Err(DecideError::new(409, "decide requires kv_adaptive off"));
     }
@@ -293,11 +257,6 @@ pub fn plan_decide(m: &LoadedModel, req: &Value) -> Result<DecidePlan, DecideErr
         .map_err(|e| DecideError::new(422, e))?;
 
     let longest = lens.iter().copied().max().unwrap_or(0);
-    check_eviction_limit(
-        longest,
-        m.eviction.as_ref().map(|e| e.budget()),
-        m.physical_cap,
-    )?;
     if longest + 1 > m.max_seq {
         return Err(DecideError {
             status: 422,
@@ -512,29 +471,6 @@ mod tests {
             required_max_seq: None,
         };
         assert!(e.to_reply("d2")["error"].get("required_max_seq").is_none());
-    }
-
-    #[test]
-    fn eviction_limit_admits_without_eviction_and_within_limit() {
-        // No eviction: never limits here (max_seq is checked separately).
-        assert!(check_eviction_limit(1_000_000, None, 16).is_ok());
-        // budget < physical_cap: budget binds; longest + 1 <= limit admits.
-        assert!(check_eviction_limit(16383, Some(16384), 16768).is_ok());
-        let e = check_eviction_limit(16384, Some(16384), 16768).unwrap_err();
-        assert_eq!(e.status, 422);
-        assert_eq!(e.required_max_seq, None);
-        assert!(
-            e.message.contains("limited to 16384 tokens"),
-            "{}",
-            e.message
-        );
-        assert!(e.message.contains("16768"), "{}", e.message);
-        // physical_cap < budget (clamped): physical_cap binds.
-        assert!(check_eviction_limit(99, Some(512), 100).is_ok());
-        let e = check_eviction_limit(100, Some(512), 100).unwrap_err();
-        assert_eq!(e.status, 422);
-        assert!(e.message.contains("limited to 100 tokens"), "{}", e.message);
-        assert!(e.to_reply("x")["error"].get("required_max_seq").is_none());
     }
 
     #[test]

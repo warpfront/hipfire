@@ -13,8 +13,8 @@
 > `speculation.dflash` defaults to `off` except for the registry's paired Qwen3.8-27B tiers. The
 > "durability floors" below were campaign targets, not product admission criteria; `admissions.yml`
 > carries no speculation row. Retired `scripts/coherence-gate-*.sh` batteries are historical
-> reproduction only. DFlash itself is not deprecated; only the legacy contiguous knobs
-> (`HIPFIRE_DFLASH_WINDOW=0`, `HIPFIRE_DFLASH_CTX_CAP`) are deprecated since 0.4.0, removal 0.5.0.
+> reproduction only. DFlash itself is not deprecated; the legacy contiguous knobs
+> (`HIPFIRE_DFLASH_WINDOW=0`, `HIPFIRE_DFLASH_CTX_CAP`) were removed in 0.5.0.
 
 Measured on gfx1100 (RX 7900-class), dense Qwen3.6-27B (`qwen3.6-27b.mq4`), q8 KV,
 greedy (temp=0), 3-run median. **AR decode baseline ≈ 43 tok/s** (genre-independent).

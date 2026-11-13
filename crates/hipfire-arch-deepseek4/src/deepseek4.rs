@@ -337,9 +337,11 @@ pub struct DeepseekV4Config {
     #[serde(skip)]
     pub load_mtp: bool,
 
-    /// DeepSeek V4 routed-MQ2 product-family selector. This is derived from an
-    /// exact `.mq2r`/`.mq2rxt` artifact identity and is never inferred from a
-    /// tensor dtype, so MQ2-Lloyd keeps its established runtime defaults. The
+    /// DeepSeek V4 routed-MQ2 product-family selector. This is derived from the
+    /// artifact's identity (the HFQ route metadata or recipe key, or the exact
+    /// MQ2R P3 tensor map, `hipfire_runtime::route_sku`; MQ2RXT by its recipe
+    /// key), never from the file name, so MQ2-Lloyd keeps its established
+    /// runtime defaults. The
     /// family shares routed-expert, route-scale, HC, and indexer policy; dense
     /// dtype validation remains SKU-specific. Not serialized upstream.
     #[serde(skip)]
@@ -427,26 +429,19 @@ impl DeepseekV4Config {
             .ok_or_else(|| "deepseek4: metadata_json missing `config` wrapper".to_string())?;
         let raw: RawDeepseekV4Config = serde_json::from_value(inner.clone())
             .map_err(|e| format!("deepseek4: parsing inner config failed: {e}"))?;
-        let mq2rxt = hfq
-            .path()
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("mq2rxt"))
-            || wrapper
-                .get("hipfire_quant_recipe")
-                .and_then(|value| value.as_str())
-                .is_some_and(|recipe| recipe == "deepseek4-mq2rxt-mq4-p3-v1");
-        // lifecycle: deprecated since 0.4.0, removal 0.5.0 — DS4 MQ2R selection by file extension; 0.5.0 selects by HFQ metadata (no runtime warning: only way to reach the route today)
+        let mq2rxt = wrapper
+            .get("hipfire_quant_recipe")
+            .and_then(|value| value.as_str())
+            .is_some_and(|recipe| recipe == "deepseek4-mq2rxt-mq4-p3-v1");
+        // MQ2R is selected by the file's identity, never by its name: the
+        // HFQ route metadata / recipe identity, or the exact MQ2R P3 tensor
+        // map in the tensor index (hipfire_runtime::route_sku). A file that
+        // carries E8 tensors without the exact recipe fails here.
         let mq2r = mq2rxt
-            || hfq
-                .path()
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("mq2r"))
-            || wrapper
-                .get("hipfire_quant_recipe")
-                .and_then(|value| value.as_str())
-                .is_some_and(|recipe| recipe == "deepseek4-mq2r-e8-p3-v1");
+            || hipfire_runtime::route_sku::header_route(&hfq.metadata_json)?
+                == Some(hipfire_runtime::route_sku::RouteSku::Mq2r)
+            || hipfire_runtime::route_sku::structural_route(hfq)?
+                == Some(hipfire_runtime::route_sku::RouteSku::Mq2r);
         let mut config = DeepseekV4Config {
             vocab_size: raw.vocab_size,
             hidden_size: raw.hidden_size,

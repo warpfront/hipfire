@@ -102,7 +102,7 @@ fn pipe_of(inst: &Inst, arch: Arch) -> Pipeline {
 }
 
 fn pipe_by_name(inst: &Inst, arch: Arch) -> Pipeline {
-    match inst.op.name(arch).unwrap_or("") {
+    match inst.name(arch).unwrap_or("") {
         name if name.starts_with('s') => Pipeline::Salu,
         name if name.starts_with('v') => Pipeline::Valu,
         _ => Pipeline::Ds,
@@ -113,7 +113,7 @@ fn pipe_by_name(inst: &Inst, arch: Arch) -> Pipeline {
 /// `isVMEM && !isFLAT` and `isSMRD` clear the state, FLAT-encoded accesses
 /// (`global_*`, `scratch_*`, `flat_*`) are ignored, `s_sendmsg_rtn_*` is SOP1.
 fn llvm_pipe(inst: &Inst, arch: Arch) -> Pipeline {
-    let name = inst.op.name(arch).unwrap_or("");
+    let name = inst.name(arch).unwrap_or("");
     // Every SMEM-encoded instruction is `isSMRD` in LLVM, including the effect-less hints (`s_prefetch_data`): it
     // clears the pending state instead of consuming an SGPR (it is not a SALU/VALU in the pass's classification).
     if inst.form == crate::inst::Form::Smem && !name.starts_with("s_sendmsg_rtn") {
@@ -460,7 +460,7 @@ pub fn analyze_with(
 ) -> Result<HazardAnalysis, HazardError> {
     let mut analysis = HazardAnalysis::default();
     match arch {
-        Arch::Gfx1201 => run_sgpr_model(body, arch, wave, model, &mut analysis)?,
+        Arch::Gfx1200 | Arch::Gfx1201 => run_sgpr_model(body, arch, wave, model, &mut analysis)?,
         Arch::Gfx1100 | Arch::Gfx1151 => run_gfx11(body, arch, &mut analysis),
         _ => return Err(HazardError::Unsupported(arch, wave)),
     }
@@ -498,7 +498,7 @@ fn gfx11_block(
             *state = Gfx11State::default();
             continue;
         }
-        let name = inst.op.name(arch).unwrap_or("");
+        let name = inst.name(arch).unwrap_or("");
         // ROCm LLVM GCNHazardRecognizer.cpp fixVcmpxPermlaneHazards and
         // AMDGPU.td FeatureISAVersion11_Common enable this on both targets.
         // fixVcmpxPermlaneHazards: V_NOP does NOT break the chain; a real
@@ -606,7 +606,7 @@ fn sgpr_block(
             *machine = Gfx12Sgpr::default();
             continue;
         }
-        if inst.op.name(arch) == Some("s_wait_alu") {
+        if inst.name(arch) == Some("s_wait_alu") {
             for operand in &inst.operands {
                 if let Operand::Imm(ImmField::Sopp(bits) | ImmField::Sopk(bits)) = operand {
                     machine.wait(*bits as u16);
@@ -614,49 +614,13 @@ fn sgpr_block(
             }
             continue;
         }
-        // Encoding rows use 64-bit slots for lane masks in both wave sizes.
-        // Use the kernel's metadata-selected wave width, unlike genuine
-        // 64-bit scalar data operands, which remain two registers.
-        let mask_len = match wave {
-            Wave::Wave32 => 1,
-            Wave::Wave64 => 2,
-        };
-        let name = inst.op.name(arch).unwrap_or("");
-        let mut uses = smallvec::SmallVec::<[RegRef; 4]>::new();
-        let mut defs = smallvec::SmallVec::<[RegRef; 2]>::new();
-        let mask_input =
-            name.starts_with("v_cndmask_") || (name.starts_with("v_") && name.contains("_co_ci_"));
-        let mask_output = name.starts_with("v_cmp")
-            || name.starts_with("v_div_scale_")
-            || (name.starts_with("v_") && name.contains("_co_"));
-        let use_refs = if mask_input {
-            let mask = inst.operands.last().and_then(|operand| match operand {
-                Operand::Reg(reg) => Some(*reg),
-                _ => None,
-            });
-            uses.extend(inst.effects.uses.iter().map(|reg| {
-                let mut reg = *reg;
-                if Some(reg) == mask && reg.kind == Kind::S {
-                    reg.len = mask_len;
-                }
-                reg
-            }));
-            uses.as_slice()
-        } else {
-            inst.effects.uses.as_slice()
-        };
-        let def_refs = if mask_output {
-            defs.extend(inst.effects.defs.iter().map(|reg| {
-                let mut reg = *reg;
-                if reg.kind == Kind::S {
-                    reg.len = mask_len;
-                }
-                reg
-            }));
-            defs.as_slice()
-        } else {
-            inst.effects.defs.as_slice()
-        };
+        // Encoding rows use 64-bit slots for lane masks in both wave sizes;
+        // `wave_effects` narrows them to the kernel's wave width and leaves
+        // genuine 64-bit scalar data operands as two registers.
+        let name = inst.name(arch).unwrap_or("");
+        let effects = crate::effects::wave_effects(arch, wave, inst);
+        let use_refs = effects.uses.as_slice();
+        let def_refs = effects.defs.as_slice();
         // LlvmExact replays the LLVM pass exactly (VCC tracked, FLAT does not
         // clear, IsSetPC flushes). BuilderParity keeps the historic boundary:
         // VCC is not producer-tracked and every memory access clears.
@@ -786,7 +750,7 @@ fn wmma_block(
         let Some(inst) = body.insts.get(id) else {
             continue;
         };
-        let name = inst.op.name(arch).unwrap_or("");
+        let name = inst.name(arch).unwrap_or("");
         if name.starts_with("v_wmma_") || name.starts_with("v_swmmac_") {
             let chained = previous.iter().any(|old| {
                 inst.effects
@@ -794,7 +758,7 @@ fn wmma_block(
                     .iter()
                     .take(2)
                     .any(|src| old.overlaps(*src))
-                    || (arch == Arch::Gfx1201
+                    || (arch.is_gfx12()
                         && name.starts_with("v_swmmac_")
                         && inst
                             .effects
@@ -895,10 +859,11 @@ mod tests {
                 .iter()
                 .find(|row| row.name == *name)
                 .expect(name);
-            let inst = Inst::from_parts(
+            let inst = Inst::from_encoding(
                 arch,
                 row.op,
                 row.form,
+                row.variant,
                 FormFields::None,
                 smallvec::SmallVec::from_vec(operands.clone()),
                 Modifiers::default(),
@@ -1106,7 +1071,21 @@ mod tests {
             assert_eq!(used, words.len(), "{words:x?}");
             body.layout.push(body.insts.insert(inst));
         }
-        crate::passes::cfg::build_blocks(&mut body, arch).expect("cfg");
+        match crate::passes::cfg::build_blocks(&mut body, arch) {
+            Ok(_) => {}
+            // A bare `s_setpc_b64 s[4:5]` has no resolvable target (the CFG builder refuses it); these tests exercise
+            // the hazard model, not control flow, so lay the stream out as the single block it textually is.
+            Err(crate::passes::cfg::CfgError::UnresolvedIndirectJump { .. }) => {
+                body.blocks = vec![crate::cfg::Block {
+                    id: crate::cfg::BlockId(0),
+                    range: (0, body.layout.len()),
+                    term: crate::cfg::Terminator::EndPgm,
+                    preds: Default::default(),
+                    succs: Default::default(),
+                }];
+            }
+            Err(error) => panic!("cfg: {error:?}"),
+        }
         body
     }
 
@@ -1386,10 +1365,11 @@ mod tests {
                 .iter()
                 .find(|row| row.name == name)
                 .expect(name);
-            Inst::from_parts(
+            Inst::from_encoding(
                 arch,
                 row.op,
                 row.form,
+                row.variant,
                 FormFields::None,
                 SmallVec::from_vec(operands),
                 Modifiers::default(),

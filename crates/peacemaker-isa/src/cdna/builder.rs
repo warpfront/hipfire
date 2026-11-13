@@ -123,6 +123,107 @@ impl Builder {
         Ok(offset)
     }
 
+    /// Declare a kernel argument at an explicit byte `offset` (a frozen ABI
+    /// layout such as a generic `KernelSpec`'s): `offset` must not precede the
+    /// previous argument's end, a global buffer is 8 bytes at an 8-aligned
+    /// offset, and `size` is non-zero.
+    pub fn arg_at(
+        &mut self,
+        name: &str,
+        offset: u32,
+        size: u32,
+        kind: KernArgKind,
+    ) -> Result<(), String> {
+        if name.is_empty() || self.kernargs.iter().any(|arg| arg.name == name) {
+            return Err(format!("empty or duplicate kernel argument name {name:?}"));
+        }
+        if size == 0 {
+            return Err(format!("kernel argument {name}: size 0"));
+        }
+        if matches!(kind, KernArgKind::GlobalBuffer { .. }) && (size != 8 || offset % 8 != 0) {
+            return Err(format!(
+                "kernel argument {name}: a global buffer is 8 bytes at an 8-aligned offset, got size {size} at {offset}"
+            ));
+        }
+        if offset < self.resources.kernarg_size {
+            return Err(format!(
+                "kernel argument {name} at {offset} overlaps or precedes the previous argument (ends at {})",
+                self.resources.kernarg_size
+            ));
+        }
+        let end = offset
+            .checked_add(size)
+            .ok_or("kernel argument layout overflow")?;
+        self.kernargs.push(KernArg {
+            name: name.into(),
+            offset,
+            size,
+            kind,
+        });
+        self.resources.kernarg_size = end;
+        Ok(())
+    }
+
+    /// Declare the kernarg segment `size` (bytes, at least the end of the
+    /// declared arguments): trailing padding or undeclared arguments.
+    pub fn kernarg_segment_size(&mut self, size: u32) -> Result<(), String> {
+        if size < self.resources.kernarg_size {
+            return Err(format!(
+                "kernarg segment size {size} is below the end of the declared arguments ({})",
+                self.resources.kernarg_size
+            ));
+        }
+        self.resources.kernarg_size = size;
+        Ok(())
+    }
+
+    /// Mark SGPRs below `end` (one past the highest used) as allocated by an
+    /// external plan. Never shrinks; `end` must fit the SGPR limit.
+    pub fn reserve_sgprs(&mut self, end: u16) -> Result<(), String> {
+        if end > self.sgpr_limit() {
+            return Err(format!(
+                "SGPR high water {end} exceeds limit {}",
+                self.sgpr_limit()
+            ));
+        }
+        self.resources.next_free_sgpr = self.resources.next_free_sgpr.max(end);
+        self.allocated_sgprs = true;
+        Ok(())
+    }
+
+    /// Mark VGPRs below `end` as allocated by an external plan (see
+    /// [`Self::reserve_sgprs`]); updates the AGPR split.
+    pub fn reserve_vgprs(&mut self, end: u16) -> Result<(), String> {
+        if end > self.arch.caps().vgprs {
+            return Err(format!(
+                "VGPR high water {end} exceeds limit {}",
+                self.arch.caps().vgprs
+            ));
+        }
+        let end = end.max(self.resources.next_free_vgpr);
+        let accum_offset = ((end + 3) / 4 * 4).max(4);
+        if accum_offset + self.resources.agprs > self.arch.caps().unified_vgprs {
+            return Err("VGPR allocation exceeds the unified VGPR/AGPR limit".into());
+        }
+        self.resources.next_free_vgpr = end;
+        self.resources.accum_offset = accum_offset;
+        Ok(())
+    }
+
+    /// Mark AGPRs below `end` as allocated by an external plan (see
+    /// [`Self::reserve_sgprs`]).
+    pub fn reserve_agprs(&mut self, end: u16) -> Result<(), String> {
+        if end > self.arch.caps().agprs
+            || self.resources.accum_offset + end > self.arch.caps().unified_vgprs
+        {
+            return Err(format!(
+                "AGPR high water {end} exceeds the AGPR / unified VGPR limit"
+            ));
+        }
+        self.resources.agprs = self.resources.agprs.max(end);
+        Ok(())
+    }
+
     /// s[0:1]: the kernarg segment pointer.
     pub fn kernarg_base(&self) -> Src {
         Src::Sgpr(0)
@@ -223,14 +324,18 @@ impl Builder {
 
     /// Any instruction except `s_waitcnt`, `s_barrier`, `s_endpgm` and
     /// branches; waits are inserted before it as the ledger requires.
-    /// Memory data/destinations must be plain SGPRs or VGPRs: the shared
-    /// ledger cannot track AGPRs or special-register files. Copy through
-    /// plain registers before using those files.
+    /// Memory data/destinations must be SGPRs, VGPRs or AGPRs. The shared
+    /// ledger tracks these as distinct register banks; special-register
+    /// memory operands remain unsupported.
     /// Of the FLAT-format segments, only GLOBAL is supported: FLAT needs
     /// dual VM/LGKM accounting, and the descriptor has no private segment
     /// for SCRATCH (CDNA3 ISA §10.3).
     pub fn push(&mut self, inst: Inst) -> Result<(), String> {
         self.require_reachable()?;
+        super::require_verified(self.arch, &inst)?;
+        if let Some(reason) = inst.unsupported() {
+            return Err(reason);
+        }
         if matches!(&inst, Inst::Sopp(p) if matches!(p.op, SoppOp::Waitcnt | SoppOp::Barrier | SoppOp::Endpgm))
             || inst.branch_offset().is_some()
             || matches!(&inst, Inst::Sop1(p) if p.op == Sop1Op::SetpcB64)
@@ -243,7 +348,7 @@ impl Builder {
             return Err("checked builder supports GLOBAL only: FLAT counts on VM+LGKM (CDNA3 ISA §10.3); SCRATCH requires a private segment".into());
         }
         if !plain_memory_data(&inst) {
-            return Err("checked memory data/destinations must use plain SGPR/VGPR registers, not AGPRs or special-register files".into());
+            return Err("checked memory data/destinations must use SGPR/VGPR/AGPR registers, not special-register files".into());
         }
         let footprint = inst.footprint();
         let memory = inst.memory();
@@ -279,7 +384,7 @@ impl Builder {
             text: inst.to_string(),
             defs: footprint.defs.iter().filter_map(ledger_reg).collect(),
             uses: footprint.uses.iter().filter_map(ledger_reg).collect(),
-            memory: memory.map(memory_class),
+            memory: memory.map(memory_class).transpose()?,
         };
         self.emit_waits(self.ledger.required(&shadow))?;
         self.ledger.record(Arch::Gfx942, &shadow);
@@ -382,6 +487,32 @@ impl Builder {
         self.emit_waits(waits)
     }
 
+    /// Wait for specific counters (`s_waitcnt` with each counter's count; the
+    /// others are left at their maximum), whatever the ledger holds: an
+    /// explicit request, emitted even when nothing is pending.
+    pub fn wait_counters(&mut self, counters: &[(Counter, u8)]) -> Result<(), String> {
+        self.require_reachable()?;
+        let waits = counters
+            .iter()
+            .map(|&(counter, count)| (counter, count, Reason::Barrier))
+            .collect();
+        self.emit_waits(waits)
+    }
+
+    /// `s_endpgm` in the middle of the kernel (an early exit). It implicitly
+    /// drains every counter; the stream is unreachable after it until a label
+    /// with an incoming forward branch resumes it.
+    pub fn end(&mut self) -> Result<(), String> {
+        self.require_reachable()?;
+        self.items.push(Item::Inst(Inst::Sopp(Sopp {
+            op: SoppOp::Endpgm,
+            simm16: 0,
+        })));
+        self.ledger = Ledger::default();
+        self.reachable = false;
+        Ok(())
+    }
+
     /// The items so far (read-only).
     pub fn items(&self) -> &[Item] {
         &self.items
@@ -392,10 +523,12 @@ impl Builder {
         if let Some((target, _)) = self.incoming.first_key_value() {
             return Err(format!("undefined branch target {target}"));
         }
-        self.items.push(Item::Inst(Inst::Sopp(Sopp {
-            op: SoppOp::Endpgm,
-            simm16: 0,
-        })));
+        if !matches!(self.items.last(), Some(Item::Inst(Inst::Sopp(p))) if p.op == SoppOp::Endpgm) {
+            self.items.push(Item::Inst(Inst::Sopp(Sopp {
+                op: SoppOp::Endpgm,
+                simm16: 0,
+            })));
+        }
         let (items, mut hazards) = super::hazard::resolve(self.arch, self.items)?;
         let mut insts = Vec::with_capacity(items.len());
         let mut words = Vec::with_capacity(items.len() * 2);
@@ -563,10 +696,11 @@ fn register_range(next: u16, count: u8, align: u8, limit: u16) -> Result<(u8, u1
     Ok((base as u8, end as u16))
 }
 
-fn ledger_reg(span: &RegSpan) -> Option<RegRef> {
+pub(crate) fn ledger_reg(span: &RegSpan) -> Option<RegRef> {
     let kind = match span.file {
         RegFile::Sgpr => Kind::S,
         RegFile::Vgpr => Kind::V,
+        RegFile::Agpr => Kind::A,
         _ => return None,
     };
     Some(RegRef {
@@ -576,18 +710,23 @@ fn ledger_reg(span: &RegSpan) -> Option<RegRef> {
     })
 }
 
-fn memory_class(memory: MemKind) -> MemoryClass {
-    match memory {
+pub(crate) fn memory_class(memory: MemKind) -> Result<MemoryClass, String> {
+    Ok(match memory {
         MemKind::VmemLoad | MemKind::VmemAtomicRtn => MemoryClass::VmemLoad,
         MemKind::VmemStore | MemKind::VmemAtomic => MemoryClass::VmemStore,
         MemKind::DsLoad | MemKind::DsAtomicRtn | MemKind::DsXlane => MemoryClass::DsLoad,
         MemKind::DsStore | MemKind::DsAtomic => MemoryClass::DsStore,
         MemKind::SmemLoad => MemoryClass::SmemLoad,
-    }
+        MemKind::SmemStore | MemKind::SmemAtomic | MemKind::SmemAtomicRtn => {
+            return Err(format!("{memory:?} has no CDNA ledger memory class"));
+        }
+    })
 }
 
 fn plain_memory_data(inst: &Inst) -> bool {
-    let plain = |src: Option<Src>| src.is_none_or(|src| matches!(src, Src::Sgpr(_) | Src::Vgpr(_)));
+    let plain = |src: Option<Src>| {
+        src.is_none_or(|src| matches!(src, Src::Sgpr(_) | Src::Vgpr(_) | Src::Agpr(_)))
+    };
     match inst {
         Inst::Smem(i) => plain(i.sdata),
         Inst::Flat(i) => plain(i.vdst) && plain(i.data),

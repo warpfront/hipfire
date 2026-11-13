@@ -34,7 +34,7 @@ BUCKET RULES (first match wins per path; a path may hit `policy` in addition)
     serve  : crates/hipfire-engine/**, crates/hipfire-generate/**, crates/hipfire-cli/src/serve/**,
              crates/hipfire-client/**, crates/hipfire-daemon/src/slots.rs,
              crates/hipfire-daemon/src/serve*.rs, crates/hipfire-runtime/src/{emit_text,eos_filter,dflash,
-             dflash_generic,dspark_core,spec,reset_core,triattn}.rs, crates/hipfire-arch-*/src/**/{serve,generate,spec}*.rs
+             dflash_generic,dspark_core,spec,reset_core}.rs, crates/hipfire-arch-*/src/**/{serve,generate,spec}*.rs
     load   : crates/hipfire-loader/**, crates/hipfire-daemon/** (remaining), crates/hipfire-runtime/src/{model_load,
              hfq,loader_api,config,safetensors_source,weight_backend,multi_gpu,arch_model,arch}.rs,
              crates/hipfire-arch-*/src/**/load*.rs, crates/hipfire-arch-*/src/**/weights*.rs,
@@ -87,7 +87,6 @@ _SERVE_PATTERNS: list[str] = [
     "crates/hipfire-runtime/src/dspark_core.rs",
     "crates/hipfire-runtime/src/spec.rs",
     "crates/hipfire-runtime/src/reset_core.rs",
-    "crates/hipfire-runtime/src/triattn.rs",
     # crates/hipfire-arch-*/src/**/{serve,generate,spec}*.rs expanded
     "crates/hipfire-arch-*/src/**/serve*.rs",
     "crates/hipfire-arch-*/src/**/generate*.rs",

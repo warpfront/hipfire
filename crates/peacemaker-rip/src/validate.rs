@@ -22,16 +22,17 @@ thread_local! {
     static TEXTS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
 
-const CDNA_UNSUPPORTED: &str =
-    "the .rip front end lowers onto the RDNA builder; gfx942 kernels use peacemaker_isa::cdna";
+#[path = "validate_cdna.rs"]
+mod cdna;
 
-/// The RDNA IR architecture for `arch`; CDNA has no `.rip` lowering, so it is refused.
+/// The RDNA IR architecture. CDNA uses its typed codec and footprints instead.
 fn ir_arch(arch: Arch) -> Result<IrArch, String> {
     match arch {
         Arch::Gfx1100 => Ok(IrArch::Gfx1100),
         Arch::Gfx1151 => Ok(IrArch::Gfx1151),
         Arch::Gfx1201 => Ok(IrArch::Gfx1201),
-        Arch::Gfx942 => Err(CDNA_UNSUPPORTED.into()),
+        Arch::Gfx1200 => Err("the .rip front end has no gfx1200 builder target".into()),
+        Arch::Gfx942 => Err("CDNA instructions use the CDNA codec".into()),
     }
 }
 
@@ -154,6 +155,9 @@ fn builder_reg(reg: &peacemaker_ir::reg::RegRef) -> Option<RegRef> {
 /// Register effects from the target opcode table, excluding special registers
 /// and TTMPs. Returns (definitions, uses), retaining operand order and widths.
 pub fn effects(arch: Arch, text: &str) -> Result<(Vec<RegRef>, Vec<RegRef>), String> {
+    if arch == Arch::Gfx942 {
+        return cdna::effects(text);
+    }
     let ir = ir_arch(arch)?;
     let inst = parse(arch, ir, text)?;
     let effects = table_effects(ir, &inst).map_err(|e| malformed(arch, text, e))?;
@@ -180,7 +184,11 @@ fn source_list(declared: &[RegRef], actual: &[RegRef]) -> String {
     let entries = corrected
         .iter()
         .map(|reg| {
-            let prefix = if reg.kind == Kind::V { "v" } else { "s" };
+            let prefix = match reg.kind {
+                Kind::V => "v",
+                Kind::S => "s",
+                Kind::A => "a",
+            };
             if reg.len == 1 {
                 format!("{prefix}({})", reg.base)
             } else {
@@ -196,27 +204,42 @@ fn source_list(declared: &[RegRef], actual: &[RegRef]) -> String {
 /// effects that omit any table effect under the overlap rule above.
 /// Labels and typed branches belong to the driver, not this entry point.
 pub fn instruction(arch: Arch, text: &str, defs: &[RegRef], uses: &[RegRef]) -> Result<(), String> {
-    let ir = ir_arch(arch)?;
-    let inst = parse(arch, ir, text)?;
-    let encoded = if arch.gfx12() {
-        peacemaker_ir::codec::gfx12::encode(&inst)
+    if arch == Arch::Gfx942 {
+        cdna::instruction(text, defs, uses)?;
     } else {
-        peacemaker_ir::codec::gfx11::encode(ir, &inst)
-    };
-    encoded.map_err(|e| malformed(arch, text, e))?;
-    // parse_line already constructs Effects::from_table (including both VOPD
-    // halves). Reuse that result instead of recomputing effects on every op.
-    let effects = &inst.effects;
-    let missing_defs: Vec<_> = effects
-        .defs
-        .iter()
-        .filter_map(builder_reg)
+        let ir = ir_arch(arch)?;
+        let inst = parse(arch, ir, text)?;
+        let encoded = if arch.gfx12() {
+            peacemaker_ir::codec::gfx12::encode(&inst)
+        } else {
+            peacemaker_ir::codec::gfx11::encode(ir, &inst)
+        };
+        encoded.map_err(|e| malformed(arch, text, e))?;
+        declared_effects(
+            text,
+            defs,
+            uses,
+            inst.effects.defs.iter().filter_map(builder_reg),
+            inst.effects.uses.iter().filter_map(builder_reg),
+        )?;
+    }
+    TEXTS.with(|texts| texts.borrow_mut().push(text.to_owned()));
+    Ok(())
+}
+
+fn declared_effects(
+    text: &str,
+    defs: &[RegRef],
+    uses: &[RegRef],
+    actual_defs: impl IntoIterator<Item = RegRef>,
+    actual_uses: impl IntoIterator<Item = RegRef>,
+) -> Result<(), String> {
+    let missing_defs: Vec<_> = actual_defs
+        .into_iter()
         .filter(|&reg| !defs.iter().any(|&declared| declared.overlaps(reg)))
         .collect();
-    let missing_uses: Vec<_> = effects
-        .uses
-        .iter()
-        .filter_map(builder_reg)
+    let missing_uses: Vec<_> = actual_uses
+        .into_iter()
         .filter(|&reg| !uses.iter().any(|&declared| declared.overlaps(reg)))
         .collect();
     if !missing_defs.is_empty() || !missing_uses.is_empty() {
@@ -237,7 +260,6 @@ pub fn instruction(arch: Arch, text: &str, defs: &[RegRef], uses: &[RegRef]) -> 
         );
         return Err(message);
     }
-    TEXTS.with(|texts| texts.borrow_mut().push(text.to_owned()));
     Ok(())
 }
 
@@ -359,45 +381,18 @@ fn entry_state(kernel: &peacemaker_ir::inst::Kernel, arch: Arch) -> ([bool; LOCA
 }
 
 /// The SGPR reads of `inst` as a definedness check sees them. A wave32 kernel reads only the low
-/// register of a lane-mask source: the table models the select / carry-in slot (`SRC2` of
-/// `v_cndmask_*` and of the `v_*_co_ci_*` / `v_addc_*` / `v_subb_*` family) as a 64-bit pair and the
-/// parser widens `s5` to `s[5:6]`, exactly as the codec decodes it, so a check over the widened pair
-/// would demand a write of a half the hardware never reads (`s_mov_b32 s5, mask` defines the whole
-/// wave32 mask).
+/// register of a lane-mask source: the table models the select / carry-in slot as a 64-bit pair and
+/// the parser widens `s5` to `s[5:6]`, so a check over the widened pair would demand a write of a
+/// half the hardware never reads (`s_mov_b32 s5, mask` defines the whole wave32 mask).
+/// [`peacemaker_ir::effects::wave_effects`] narrows it.
 fn definedness_uses(
     arch: IrArch,
     inst: &Inst,
     wave: peacemaker_ir::inst::Wave,
 ) -> Vec<peacemaker_ir::reg::RegRef> {
-    use peacemaker_ir::{operand::Operand, reg::Kind as K};
-    let mut uses = inst.effects.uses.to_vec();
-    if wave != peacemaker_ir::inst::Wave::Wave32 {
-        return uses;
-    }
-    let Some(row) = isa::lookup(arch, inst.op, inst.form) else {
-        return uses;
-    };
-    let name = row.name;
-    let carry = name.starts_with("v_cndmask_")
-        || name.contains("_co_ci_")
-        || name.starts_with("v_addc_")
-        || name.starts_with("v_subb_");
-    if !carry {
-        return uses;
-    }
-    let mask = row
-        .slots(false)
-        .zip(inst.operands.iter())
-        .find_map(|((slot, _), operand)| match (slot, operand) {
-            ("SRC2", Operand::Reg(reg)) if reg.kind == K::S && reg.len == 2 => Some(*reg),
-            _ => None,
-        });
-    if let Some(mask) = mask {
-        if let Some(read) = uses.iter_mut().find(|r| **r == mask) {
-            read.len = 1;
-        }
-    }
-    uses
+    peacemaker_ir::effects::wave_effects(arch, wave, inst)
+        .uses
+        .to_vec()
 }
 
 /// Validate the final bytes, not just declarations. Used after every successful
@@ -411,7 +406,6 @@ pub(crate) fn emitted(
     text: &str,
     sites: Vec<(String, String)>,
 ) -> Result<(), Vec<String>> {
-    let arch_ir = ir_arch(arch).map_err(|reason| vec![reason])?;
     let bytes = peacemaker_isa::native::assemble(text, arch).map_err(|reason| {
         let at = sites
             .iter()
@@ -420,6 +414,10 @@ pub(crate) fn emitted(
             .unwrap_or_default();
         vec![format!("{at}assemble: {reason}")]
     })?;
+    if arch == Arch::Gfx942 {
+        return cdna::emitted(&bytes, sites);
+    }
+    let arch_ir = ir_arch(arch).map_err(|reason| vec![reason])?;
     let lifted = peacemaker_lift::lift_object(
         &bytes,
         peacemaker_lift::Options {
@@ -432,11 +430,11 @@ pub(crate) fn emitted(
         let (mut defined, entry) = entry_state(kernel, arch);
         for &id in &kernel.body.layout {
             let inst = kernel.body.insts.get(id).expect("laid-out instruction");
-            for location in effect_locations(
-                &inst.effects.defs,
-                inst.effects.implicit.writes,
-                kernel.wave,
-            ) {
+            // A wave32 compare / carry-out into `s5` defines `s5` only, never `s6`.
+            let effects = peacemaker_ir::effects::wave_effects(arch_ir, kernel.wave, inst);
+            for location in
+                effect_locations(&effects.defs, inst.effects.implicit.writes, kernel.wave)
+            {
                 defined[location] = true;
             }
         }

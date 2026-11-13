@@ -38,7 +38,8 @@ fn state32() -> State {
 fn dec(words: &[u32]) -> (Inst, &'static str) {
     let (inst, n) = gfx12::decode(words).unwrap_or_else(|e| panic!("decode {words:08x?}: {e}"));
     assert_eq!(n, words.len(), "{words:08x?}");
-    let name = crate::isa::lookup(Arch::Gfx1201, inst.op, inst.form)
+    let name = crate::isa::lookup_inst(Arch::Gfx1201, &inst)
+        .ok()
         .unwrap_or_else(|| panic!("{words:08x?} has no gfx1201 row"))
         .name;
     (inst, name)
@@ -356,4 +357,31 @@ fn exec_pair_operands_read_both_halves() {
     st.exec = 0x9abc_def0;
     run(&[0xBE82_017E], &mut st).unwrap();
     assert_eq!((st.s[2], st.s[3]), (0x9abc_def0, 0));
+}
+
+#[test]
+fn wave32_salu_write_to_vcc_hi_is_kept_and_reads_back_as_a_plain_sgpr() {
+    // hipcc allocates vcc_hi as a general SGPR in wave32. s_mov_b32 vcc_hi, s0 (BEEB0000); s_mov_b32 s1, vcc_hi (BE81006B).
+    let mut st = state32();
+    st.s[0] = 0xdead_beef;
+    st.vcc = 0x0000_0000_1234_5678;
+    run(&[0xBEEB_0000], &mut st).unwrap();
+    run(&[0xBE81_006B], &mut st).unwrap();
+    assert_eq!(st.s[1], 0xdead_beef, "vcc_hi write was dropped");
+    assert_eq!(
+        st.vcc & 0xffff_ffff,
+        0x1234_5678,
+        "vcc_lo must be unchanged"
+    );
+    // A later mask write (s_mov_b32 vcc_lo, s0 = BEEA0000) leaves vcc_hi intact.
+    run(&[0xBEEA_0000], &mut st).unwrap();
+    assert_eq!(st.vcc as u32, 0xdead_beef);
+    assert_eq!(
+        (st.vcc >> 32) as u32,
+        0xdead_beef,
+        "vcc_lo write clobbered vcc_hi"
+    );
+    st.s[0] = 7;
+    run(&[0xBEEA_0000], &mut st).unwrap();
+    assert_eq!(st.vcc, 0xdead_beef_0000_0007);
 }

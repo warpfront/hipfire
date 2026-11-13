@@ -26,18 +26,21 @@ use crate::qwen35::forward::{
     forward_prefill_dense_tp, forward_prefill_dense_tp_verify_capture, DenseTpSpecCapture,
 };
 use crate::qwen35::prefill::fp8_verify_target;
+use crate::qwen35::weights::{GdnStreamIdentity, GdnStreamImage};
 use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weights};
 use hip_bridge::{DeviceBuffer, HipError, HipResult, Stream};
 use hipfire_dispatch::families::kv_tier::KTier;
 use hipfire_dispatch::pipeline::batched::{verify_dense_math, DenseBatchMath};
+use hipfire_runtime::checkpoint_pool::{prefix_fingerprint, prefix_fingerprint_chain};
 use hipfire_runtime::dflash::{self, DflashConfig, DflashScratch, DflashWeights};
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::llama::{self, KvCache};
+use hipfire_runtime::llama::{self, KvCache, VMode};
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::tokenizer::{Tokenizer, TokenizerError};
 use hipfire_runtime::tp_shard::ShardConfig;
 use rdna_compute::dflash_sampled_accept::DflashAcceptScratch;
 use rdna_compute::dflash_state_copy::{DflashStateCopyDesc, DFLASH_STATE_BULK_COPY_MAX_ITEMS};
+use rdna_compute::gdn_stream::GdnStreamMeta;
 use rdna_compute::{DType, Fp8VerifyTarget, Gpu, GpuTensor};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -96,7 +99,6 @@ fn run_spec_gemm_key(
         m,
         k,
         row_stride: k,
-        rotation: None,
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
@@ -842,29 +844,16 @@ pub fn reset_ddtree_meta_stats() {
 pub enum KvMode {
     /// INT8 co-located K and V (default).
     Q8,
-    /// Asym4: rotated 4-bit K + Q8 V (smaller than Q8, higher-fidelity than asym3).
-    Asym4,
-    /// Asym3: rotated 3-bit K + Q8 V. ~2.7× less KV BW than Q8, tightly-tuned
-    /// kernel for the hot FA attention path. Good choice for long-context verify.
-    Asym3,
-    /// Asym2: rotated 2-bit K + Q8 V. Smallest but most lossy.
-    Asym2,
-    /// Fwht4: signed-FWHT-rotated 4-bit K + Q8 V. Byte-identical storage to
-    /// Asym4 but with a Hadamard rotation (matches MQ4's weight-quant trick).
-    /// Centroid LUTs were always Lloyd-Max-fit for post-FWHT N(0, 1/128) per
-    /// turbo_common.h:13 — Fwht4 finally uses them on the distribution they
-    /// were calibrated for. Opt-in via `--kv-mode fwht4`.
+    /// Fwht4: signed-FWHT-rotated 4-bit K + Q8 V (Hadamard rotation, matches
+    /// MQ4's weight-quant trick). Centroid LUTs are Lloyd-Max-fit for
+    /// post-FWHT N(0, 1/128) per turbo_common.h:13. Opt-in via
+    /// `--kv-mode fwht4`.
     Fwht4,
-    /// Fwht3: signed-FWHT-256 rotated 3-bit K + Q8 V. Byte-identical storage to
-    /// Asym3 (the canonical default). Single-pass 256-element FWHT — the
-    /// natural fit for asym3's existing layout (8 dims/thread). Empirical
-    /// prose-τ win on 3.5-27b at the 4-bit tier suggests the 3-bit tier
-    /// should benefit even more from rotation. Opt-in via `--kv-mode fwht3`.
+    /// Fwht3: signed-FWHT-256 rotated 3-bit K + Q8 V. Single-pass 256-element
+    /// FWHT (8 dims/thread). Opt-in via `--kv-mode fwht3`.
     Fwht3,
-    /// Fwht2: signed-FWHT-128 rotated 2-bit K + Q8 V. Byte-identical storage
-    /// to Asym2. 2-pass-over-128 structure matches fwht4. Highest theoretical
-    /// leverage tier — Asym2 is doc'd "most lossy" and 2-bit centroid quant
-    /// suffers most from outliers. Opt-in via `--kv-mode fwht2`.
+    /// Fwht2: signed-FWHT-128 rotated 2-bit K + Q8 V. 2-pass-over-128
+    /// structure matches fwht4. Opt-in via `--kv-mode fwht2`.
     Fwht2,
     /// Native fp8 E4M3 KV (gfx1201 Qwen dense only). ModelSlot::load rejects
     /// this mode: single-slot speculative assembly goes through the carrier
@@ -1065,30 +1054,9 @@ impl ModelSlot {
 
         // Honor the caller's requested KV cache mode. Default is Q8 for
         // backwards-compat, but DFlash verify is KV-bandwidth sensitive at
-        // longer contexts — asym3/asym4 cut the verify attention cost.
+        // longer contexts — fwht3/fwht4 cut the verify attention cost.
         let kv_cache = match slot_config.kv_mode {
             KvMode::Q8 => KvCache::new_gpu_q8_filtered(
-                gpu,
-                &is_kv_layer,
-                config.n_kv_heads,
-                config.head_dim,
-                slot_config.max_seq,
-            )?,
-            KvMode::Asym4 => KvCache::new_gpu_asym4_filtered(
-                gpu,
-                &is_kv_layer,
-                config.n_kv_heads,
-                config.head_dim,
-                slot_config.max_seq,
-            )?,
-            KvMode::Asym3 => KvCache::new_gpu_asym3_filtered(
-                gpu,
-                &is_kv_layer,
-                config.n_kv_heads,
-                config.head_dim,
-                slot_config.max_seq,
-            )?,
-            KvMode::Asym2 => KvCache::new_gpu_asym2_filtered(
                 gpu,
                 &is_kv_layer,
                 config.n_kv_heads,
@@ -1101,6 +1069,7 @@ impl ModelSlot {
                 config.n_kv_heads,
                 config.head_dim,
                 slot_config.max_seq,
+                VMode::Q8,
             )?,
             KvMode::Fwht3 => KvCache::new_gpu_fwht3_filtered(
                 gpu,
@@ -1108,6 +1077,7 @@ impl ModelSlot {
                 config.n_kv_heads,
                 config.head_dim,
                 slot_config.max_seq,
+                VMode::Q8,
             )?,
             KvMode::Fwht2 => KvCache::new_gpu_fwht2_filtered(
                 gpu,
@@ -1115,6 +1085,7 @@ impl ModelSlot {
                 config.n_kv_heads,
                 config.head_dim,
                 slot_config.max_seq,
+                VMode::Q8,
             )?,
             KvMode::Fp8 | KvMode::Bf16 => {
                 return Err(hip_bridge::HipError::new(
@@ -1125,7 +1096,9 @@ impl ModelSlot {
             }
         };
 
-        let dn_state = DeltaNetState::new_with_quant(gpu, &config, slot_config.state_quant)?;
+        let mut dn_state = DeltaNetState::new_with_quant(gpu, &config, slot_config.state_quant)?;
+        // Canonical GDN stream: plans, recipe, carry and edge workspace with the state.
+        qwen35::provision_gdn_stream(gpu, &weights, &config, &mut dn_state)?;
         // Size flash partials for the slot's real KV capacity (as the carrier
         // path does). `Qwen35Scratch::new` assumes 8192, which at long context
         // leaves room for one verify row, so VerifyAttn re-scans the whole KV
@@ -1400,6 +1373,14 @@ pub struct DeltaNetSnapshot {
     conv_state_bufs: Vec<DeviceBuffer>,
     /// F16 per-element EF residual backups; `len == state.s_ef_residual.len()`.
     s_ef_residual_bufs: Vec<DeviceBuffer>,
+    /// Persistent GDN stream carry backups in canonical order (tile-entry
+    /// state, tile-entry conv, raw qkv, raw alpha/beta); each family is empty
+    /// when the source state owns no carry.
+    carry_bufs: [Vec<DeviceBuffer>; 4],
+    /// Stream schema/recipe/geometry identity and the per-layer, per-lane
+    /// cursors saved with the tensors. Restore rejects a mismatch before any
+    /// byte moves.
+    stream: GdnStreamImage,
     /// S1: persistent forward (live -> backup) descriptor table, device
     /// resident, built once at `new_for`. `None` unless the bulk route armed
     /// (arch outside `bulk_arch`, kill switch, JIT failure, or bad alignment
@@ -1414,6 +1395,15 @@ pub struct DeltaNetSnapshot {
     /// against. Save/restore re-fingerprint the passed state and fall back
     /// to memcpy on any mismatch (never copy through stale descriptors).
     bulk_fingerprint: u64,
+    /// Fingerprint of the committed token prefix this snapshot reflects
+    /// ([`checkpoint_prefix_hash`] over the stream `[0..pos]`). `0` = not
+    /// attested: a restore driven by the resume planner never uses it.
+    pub prefix_hash: u64,
+}
+
+/// The eight state families of `state` ([`DeltaNetState::families`]).
+fn live_families(state: &DeltaNetState) -> [&[GpuTensor]; 8] {
+    state.families()
 }
 
 impl DeltaNetSnapshot {
@@ -1431,17 +1421,11 @@ impl DeltaNetSnapshot {
             h ^= v;
             h = h.wrapping_mul(0x0100_0000_01b3);
         };
-        mix(state.s_matrices.len() as u64);
-        mix(state.s_scales.len() as u64);
-        mix(state.conv_states.len() as u64);
-        mix(state.s_ef_residual.len() as u64);
-        for t in state
-            .s_matrices
-            .iter()
-            .chain(state.s_scales.iter())
-            .chain(state.conv_states.iter())
-            .chain(state.s_ef_residual.iter())
-        {
+        let fams = live_families(state);
+        for fam in &fams {
+            mix(fam.len() as u64);
+        }
+        for t in fams.iter().flat_map(|fam| fam.iter()) {
             mix(t.buf.as_ptr() as u64);
             mix(t.buf.size() as u64);
         }
@@ -1457,17 +1441,12 @@ impl DeltaNetSnapshot {
     fn build_bulk_tables(
         gpu: &mut Gpu,
         state: &DeltaNetState,
-        backs: [&[DeviceBuffer]; 4],
+        backs: [&[DeviceBuffer]; 8],
     ) -> Option<(DeviceBuffer, DeviceBuffer, u32)> {
         if gpu.ensure_dflash_state_bulk_copy_gfx1100().is_err() {
             return None;
         }
-        let lives: [&[GpuTensor]; 4] = [
-            &state.s_matrices,
-            &state.s_scales,
-            &state.conv_states,
-            &state.s_ef_residual,
-        ];
+        let lives: [&[GpuTensor]; 8] = live_families(state);
         let mut fwd: Vec<DflashStateCopyDesc> = Vec::new();
         let mut rev: Vec<DflashStateCopyDesc> = Vec::new();
         for (live_fam, back_fam) in lives.iter().zip(backs.iter()) {
@@ -1584,14 +1563,8 @@ impl DeltaNetSnapshot {
     /// Allocate backup buffers matching `state`'s shapes (incl. EF residual).
     /// A mid-way allocation failure frees the buffers already allocated.
     pub fn new_for(gpu: &mut Gpu, state: &DeltaNetState) -> HipResult<Self> {
-        let families = [
-            &state.s_matrices,
-            &state.s_scales,
-            &state.conv_states,
-            &state.s_ef_residual,
-        ];
-        let mut bufs: [Vec<DeviceBuffer>; 4] = Default::default();
-        for (i, src) in families.into_iter().enumerate() {
+        let mut bufs: [Vec<DeviceBuffer>; 8] = Default::default();
+        for (i, src) in live_families(state).into_iter().enumerate() {
             bufs[i].reserve_exact(src.len());
             for t in src {
                 match gpu.hip.malloc(t.buf.size()) {
@@ -1605,27 +1578,26 @@ impl DeltaNetSnapshot {
                 }
             }
         }
-        let [s_matrix_bufs, s_scale_bufs, conv_state_bufs, s_ef_residual_bufs] = bufs;
+        let [s_matrix_bufs, s_scale_bufs, conv_state_bufs, s_ef_residual_bufs, c0, c1, c2, c3] =
+            bufs;
         let mut snap = Self {
             s_matrix_bufs,
             s_scale_bufs,
             conv_state_bufs,
             s_ef_residual_bufs,
+            carry_bufs: [c0, c1, c2, c3],
+            stream: state.stream.image(),
             bulk_fwd: None,
             bulk_rev: None,
             bulk_n_items: 0,
             bulk_fingerprint: Self::bulk_fingerprint(state),
+            prefix_hash: 0,
         };
         // Arm the bulk route (gfx1100 / gfx1151 / gfx1201): JIT + table upload happen
         // here at setup, never in a decode cycle. Any failure leaves the
         // snapshot on the legacy memcpy path.
         if Self::bulk_arch(gpu) {
-            let backs = [
-                &snap.s_matrix_bufs[..],
-                &snap.s_scale_bufs[..],
-                &snap.conv_state_bufs[..],
-                &snap.s_ef_residual_bufs[..],
-            ];
+            let backs = snap.back_families();
             if let Some((f, r, n)) = Self::build_bulk_tables(gpu, state, backs) {
                 snap.bulk_fwd = Some(f);
                 snap.bulk_rev = Some(r);
@@ -1635,24 +1607,98 @@ impl DeltaNetSnapshot {
         Ok(snap)
     }
 
+    /// All eight backup families in the canonical order of [`live_families`].
+    fn back_families(&self) -> [&[DeviceBuffer]; 8] {
+        let c = &self.carry_bufs;
+        [
+            &self.s_matrix_bufs,
+            &self.s_scale_bufs,
+            &self.conv_state_bufs,
+            &self.s_ef_residual_bufs,
+            &c[0],
+            &c[1],
+            &c[2],
+            &c[3],
+        ]
+    }
+
+    /// Stream identity (schema, recipe, carry geometry, lane/layer shape) this
+    /// snapshot was saved under.
+    pub fn stream_identity(&self) -> GdnStreamIdentity {
+        self.stream.identity
+    }
+
+    /// Numerical recipe this snapshot's state was produced under (`0` = unbound).
+    pub fn recipe_id(&self) -> u64 {
+        self.stream.identity.recipe_id
+    }
+
+    /// Saved per-layer, per-lane stream cursors (`[layer * lanes + lane]`).
+    pub fn stream_meta(&self) -> &[GdnStreamMeta] {
+        &self.stream.meta
+    }
+
+    /// Structural agreement of `state` with this snapshot: schema, carry
+    /// geometry, lane/layer shape and every family length. Host-only; run
+    /// before any save so a mismatched pair never copies a byte.
+    fn check_structure(&self, state: &DeltaNetState) -> HipResult<()> {
+        let live = state.stream.identity();
+        let snap = self.stream.identity;
+        if snap.schema_version != live.schema_version
+            || snap.geometry != live.geometry
+            || snap.lanes != live.lanes
+            || snap.layers != live.layers
+        {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "DeltaNet snapshot stream shape mismatch (snapshot {snap:?}, state {live:?})"
+                ),
+            ));
+        }
+        if live_families(state)
+            .iter()
+            .zip(self.back_families())
+            .any(|(l, b)| l.len() != b.len())
+        {
+            return Err(HipError::new(
+                0,
+                "DeltaNet snapshot family length mismatch with live state",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Restore-side agreement: structure plus the numerical recipe. Hash-attested
+    /// tokens alone do not attest a different numerical representation.
+    fn check_restore(&self, state: &DeltaNetState) -> HipResult<()> {
+        self.check_structure(state)?;
+        if self.stream.identity.recipe_id != state.stream.recipe_id {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "DeltaNet snapshot recipe mismatch (snapshot {:#x}, state {:#x})",
+                    self.stream.identity.recipe_id, state.stream.recipe_id
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Record the live recipe and cursors after the tensors were saved.
+    fn capture_stream(&mut self, state: &DeltaNetState) {
+        self.stream = state.stream.image();
+    }
+
     /// Total device bytes a snapshot of `state` would occupy, computed
     /// WITHOUT allocating — lets `capture_checkpoint` pre-check the pool
     /// ceiling before paying for `hipMalloc` + device-to-device copy.
     pub fn bytes_for(state: &DeltaNetState) -> u64 {
-        let mut total: u64 = 0;
-        for t in &state.s_matrices {
-            total += t.buf.size() as u64;
-        }
-        for t in &state.s_scales {
-            total += t.buf.size() as u64;
-        }
-        for t in &state.conv_states {
-            total += t.buf.size() as u64;
-        }
-        for t in &state.s_ef_residual {
-            total += t.buf.size() as u64;
-        }
-        total
+        live_families(state)
+            .iter()
+            .flat_map(|fam| fam.iter())
+            .map(|t| t.buf.size() as u64)
+            .sum()
     }
 
     /// Number of EF residual backup buffers (0 when EF is off).
@@ -1683,10 +1729,15 @@ impl DeltaNetSnapshot {
                     .zip(backs)
                     .all(|(t, b)| t.buf.size() == b.size())
         }
-        same(&state.s_matrices, &self.s_matrix_bufs)
-            && same(&state.s_scales, &self.s_scale_bufs)
-            && same(&state.conv_states, &self.conv_state_bufs)
-            && same(&state.s_ef_residual, &self.s_ef_residual_bufs)
+        let live_id = state.stream.identity();
+        let snap_id = self.stream.identity;
+        snap_id.geometry == live_id.geometry
+            && snap_id.lanes == live_id.lanes
+            && snap_id.layers == live_id.layers
+            && live_families(state)
+                .iter()
+                .zip(self.back_families())
+                .all(|(l, b)| same(l, b))
     }
 
     /// Slice S (save-free CB verify): is this snapshot + `state` an exact,
@@ -1723,7 +1774,12 @@ impl DeltaNetSnapshot {
         let Some(ext) = DnCbExtents::for_config(config) else {
             return false;
         };
-        self.exact_extents(state, &ext) && self.all_hip_owned(state)
+        // An exchange moves the owner's carry and cursors too, so the recipe
+        // must agree as well as every family (carry included) mirroring.
+        self.exact_extents(state, &ext)
+            && self.mirrors(state)
+            && self.stream.identity == state.stream.identity()
+            && self.all_hip_owned(state)
     }
 
     /// Family lengths and per-layer extents of both sides (see
@@ -1768,12 +1824,9 @@ impl DeltaNetSnapshot {
 
     /// Every buffer of `state` and of this snapshot is a HIP-owned allocation.
     fn all_hip_owned(&self, state: &DeltaNetState) -> bool {
-        state
-            .s_matrices
+        live_families(state)
             .iter()
-            .chain(&state.s_scales)
-            .chain(&state.conv_states)
-            .chain(&state.s_ef_residual)
+            .flat_map(|fam| fam.iter())
             .all(|t| t.buf.is_hip_allocation())
             && self.backup_buffers().all(|b| b.is_hip_allocation())
     }
@@ -1784,12 +1837,9 @@ impl DeltaNetSnapshot {
     /// lane's two banks before it exchanges owners.
     pub(crate) fn push_owner_ptrs(&self, state: &DeltaNetState, out: &mut Vec<u64>) {
         out.extend(
-            state
-                .s_matrices
+            live_families(state)
                 .iter()
-                .chain(&state.s_scales)
-                .chain(&state.conv_states)
-                .chain(&state.s_ef_residual)
+                .flat_map(|fam| fam.iter())
                 .map(|t| t.buf.as_ptr() as u64),
         );
         out.extend(self.backup_buffers().map(|b| b.as_ptr() as u64));
@@ -1840,6 +1890,16 @@ impl DeltaNetSnapshot {
         swap_family(&mut state.s_scales, &mut self.s_scale_bufs);
         swap_family(&mut state.conv_states, &mut self.conv_state_bufs);
         swap_family(&mut state.s_ef_residual, &mut self.s_ef_residual_bufs);
+        if let Some(c) = state.stream.carry.as_mut() {
+            swap_family(&mut c.tile_state, &mut self.carry_bufs[0]);
+            swap_family(&mut c.tile_conv, &mut self.carry_bufs[1]);
+            swap_family(&mut c.raw_qkv, &mut self.carry_bufs[2]);
+            swap_family(&mut c.raw_ab, &mut self.carry_bufs[3]);
+        }
+        // The cursors travel with the tensors they describe; the new owner
+        // generation invalidates graphs/views keyed on the old handles.
+        std::mem::swap(&mut state.stream.meta, &mut self.stream.meta);
+        state.stream.bump_generation();
         if bulk_valid {
             std::mem::swap(&mut self.bulk_fwd, &mut self.bulk_rev);
             self.bulk_fingerprint = Self::bulk_fingerprint(state);
@@ -1850,23 +1910,25 @@ impl DeltaNetSnapshot {
 
     /// Railgun D8: every backup buffer, family by family (fingerprinting).
     fn backup_buffers(&self) -> impl Iterator<Item = &DeviceBuffer> {
-        self.s_matrix_bufs
-            .iter()
-            .chain(&self.s_scale_bufs)
-            .chain(&self.conv_state_bufs)
-            .chain(&self.s_ef_residual_bufs)
+        self.back_families().into_iter().flatten()
     }
 
-    /// Copy live state → backup (S/scale/conv + EF residual).
+    /// Copy live state → backup (S/scale/conv + EF residual + GDN carry) and
+    /// record the stream recipe and cursors.
     ///
     /// S1: on gfx1100/gfx1151/gfx1201 with armed tables and a matching fingerprint this is a
     /// single descriptor-driven `dflash_state_bulk_copy_gfx1100` launch over
     /// the forward table (plus a stream sync preserving the synchronous
     /// contract); otherwise the legacy per-tensor memcpy loop below runs.
+    ///
+    /// A snapshot whose carry geometry or lane/layer shape disagrees with
+    /// `state` is refused before any byte moves.
     pub fn save_from(&mut self, state: &DeltaNetState, gpu: &mut Gpu) -> HipResult<()> {
+        self.check_structure(state)?;
         if let Some((table, n)) = self.bulk_table(state, gpu, true) {
             gpu.dflash_state_bulk_copy_gfx1100(table.as_ptr() as *const _, n)?;
             Self::bulk_sync(gpu)?;
+            self.capture_stream(state);
             return Ok(());
         }
         // Copy the common buffer extent: a snapshot may be restored into (or
@@ -1874,26 +1936,13 @@ impl DeltaNetSnapshot {
         // (VMM prefix reuse moves conversations between owners); shapes match
         // and pool rounding only pads, so the common extent covers every
         // element and never overruns either side.
-        for (dst, src) in self.s_matrix_bufs.iter().zip(state.s_matrices.iter()) {
-            gpu.hip
-                .memcpy_dtod(dst, &src.buf, src.buf.size().min(dst.size()))?;
+        for (backs, lives) in self.back_families().into_iter().zip(live_families(state)) {
+            for (dst, src) in backs.iter().zip(lives) {
+                gpu.hip
+                    .memcpy_dtod(dst, &src.buf, src.buf.size().min(dst.size()))?;
+            }
         }
-        for (dst, src) in self.s_scale_bufs.iter().zip(state.s_scales.iter()) {
-            gpu.hip
-                .memcpy_dtod(dst, &src.buf, src.buf.size().min(dst.size()))?;
-        }
-        for (dst, src) in self.conv_state_bufs.iter().zip(state.conv_states.iter()) {
-            gpu.hip
-                .memcpy_dtod(dst, &src.buf, src.buf.size().min(dst.size()))?;
-        }
-        for (dst, src) in self
-            .s_ef_residual_bufs
-            .iter()
-            .zip(state.s_ef_residual.iter())
-        {
-            gpu.hip
-                .memcpy_dtod(dst, &src.buf, src.buf.size().min(dst.size()))?;
-        }
+        self.capture_stream(state);
         Ok(())
     }
 
@@ -1903,77 +1952,61 @@ impl DeltaNetSnapshot {
     /// opt-in experiment to overlap DN snapshot copy with proposal work.
     /// S1: with armed tables this launches the same forward table on the
     /// supplied `stream` (no sync — caller owns ordering, exactly like the
-    /// async memcpy loop it replaces on launch failure or fallback).
+    /// async memcpy loop it replaces on launch failure or fallback). The host
+    /// cursors are captured at call time (they are host state, stream-ordered
+    /// with the caller's own launches).
     pub fn save_from_async_on(
         &mut self,
         state: &DeltaNetState,
         gpu: &Gpu,
         stream: &Stream,
     ) -> HipResult<()> {
+        self.check_structure(state)?;
         if let Some((table, n)) = self.bulk_table(state, gpu, true) {
             if gpu
                 .dflash_state_bulk_copy_gfx1100_on_stream(table.as_ptr() as *const _, n, stream)
                 .is_ok()
             {
+                self.capture_stream(state);
                 return Ok(());
             }
         }
-        for (dst, src) in self.s_matrix_bufs.iter().zip(state.s_matrices.iter()) {
-            gpu.hip
-                .memcpy_dtod_async_at(dst, 0, &src.buf, 0, src.buf.size(), stream)?;
+        for (backs, lives) in self.back_families().into_iter().zip(live_families(state)) {
+            for (dst, src) in backs.iter().zip(lives) {
+                gpu.hip
+                    .memcpy_dtod_async_at(dst, 0, &src.buf, 0, src.buf.size(), stream)?;
+            }
         }
-        for (dst, src) in self.s_scale_bufs.iter().zip(state.s_scales.iter()) {
-            gpu.hip
-                .memcpy_dtod_async_at(dst, 0, &src.buf, 0, src.buf.size(), stream)?;
-        }
-        for (dst, src) in self.conv_state_bufs.iter().zip(state.conv_states.iter()) {
-            gpu.hip
-                .memcpy_dtod_async_at(dst, 0, &src.buf, 0, src.buf.size(), stream)?;
-        }
-        for (dst, src) in self
-            .s_ef_residual_bufs
-            .iter()
-            .zip(state.s_ef_residual.iter())
-        {
-            gpu.hip
-                .memcpy_dtod_async_at(dst, 0, &src.buf, 0, src.buf.size(), stream)?;
-        }
+        self.capture_stream(state);
         Ok(())
     }
 
-    /// Copy backup → live state (rewinds recurrent + EF residual to the snapshot).
+    /// Copy backup → live state (rewinds recurrent + EF residual + GDN carry
+    /// and the stream cursors to the snapshot).
+    ///
+    /// Refuses a schema, carry-geometry, lane/layer-shape or recipe mismatch
+    /// before mutating anything. The state keeps its own owner generation.
     ///
     /// S1: on gfx1100/gfx1151/gfx1201 with armed tables and a matching fingerprint this is a
     /// single descriptor-driven `dflash_state_bulk_copy_gfx1100` launch over
     /// the reverse table (plus a stream sync preserving the synchronous
     /// contract); otherwise the legacy per-tensor memcpy loop below runs.
     pub fn restore_to(&self, state: &mut DeltaNetState, gpu: &mut Gpu) -> HipResult<()> {
+        self.check_restore(state)?;
         if let Some((table, n)) = self.bulk_table(state, gpu, false) {
             gpu.dflash_state_bulk_copy_gfx1100(table.as_ptr() as *const _, n)?;
             Self::bulk_sync(gpu)?;
+            state.stream.apply_image(&self.stream)?;
             return Ok(());
         }
         // Common extent (see `save_from`).
-        for (src, dst) in self.s_matrix_bufs.iter().zip(state.s_matrices.iter()) {
-            gpu.hip
-                .memcpy_dtod(&dst.buf, src, src.size().min(dst.buf.size()))?;
+        for (backs, lives) in self.back_families().into_iter().zip(live_families(state)) {
+            for (src, dst) in backs.iter().zip(lives) {
+                gpu.hip
+                    .memcpy_dtod(&dst.buf, src, src.size().min(dst.buf.size()))?;
+            }
         }
-        for (src, dst) in self.s_scale_bufs.iter().zip(state.s_scales.iter()) {
-            gpu.hip
-                .memcpy_dtod(&dst.buf, src, src.size().min(dst.buf.size()))?;
-        }
-        for (src, dst) in self.conv_state_bufs.iter().zip(state.conv_states.iter()) {
-            gpu.hip
-                .memcpy_dtod(&dst.buf, src, src.size().min(dst.buf.size()))?;
-        }
-        for (src, dst) in self
-            .s_ef_residual_bufs
-            .iter()
-            .zip(state.s_ef_residual.iter())
-        {
-            gpu.hip
-                .memcpy_dtod(&dst.buf, src, src.size().min(dst.buf.size()))?;
-        }
+        state.stream.apply_image(&self.stream)?;
         Ok(())
     }
 
@@ -1983,16 +2016,14 @@ impl DeltaNetSnapshot {
     /// that OOMs long-lived serves (a fresh `hipMalloc` per reset, never freed).
     /// Every site that drops a snapshot must route through here.
     pub fn free_gpu(self, gpu: &mut Gpu) {
-        for b in self.s_matrix_bufs {
-            let _ = gpu.hip.free(b);
-        }
-        for b in self.s_scale_bufs {
-            let _ = gpu.hip.free(b);
-        }
-        for b in self.conv_state_bufs {
-            let _ = gpu.hip.free(b);
-        }
-        for b in self.s_ef_residual_bufs {
+        for b in self
+            .s_matrix_bufs
+            .into_iter()
+            .chain(self.s_scale_bufs)
+            .chain(self.conv_state_bufs)
+            .chain(self.s_ef_residual_bufs)
+            .chain(self.carry_bufs.into_iter().flatten())
+        {
             let _ = gpu.hip.free(b);
         }
         // S1: descriptor tables are device allocations too — freeing them
@@ -2006,47 +2037,42 @@ impl DeltaNetSnapshot {
     }
 
     /// Total device bytes across all backup buffers (S matrices + scales +
-    /// conv rings + EF residuals). Used by the checkpoint pool for
+    /// conv rings + EF residuals + GDN carry). Used by the checkpoint pool for
     /// byte-bounded LRU accounting (spec §4.5 C5).
     pub fn bytes_len(&self) -> u64 {
-        let mut total: u64 = 0;
-        for b in &self.s_matrix_bufs {
-            total += b.size() as u64;
-        }
-        for b in &self.s_scale_bufs {
-            total += b.size() as u64;
-        }
-        for b in &self.conv_state_bufs {
-            total += b.size() as u64;
-        }
-        for b in &self.s_ef_residual_bufs {
-            total += b.size() as u64;
-        }
-        total
+        self.backup_buffers().map(|b| b.size() as u64).sum()
     }
 
     /// Copy this snapshot's device buffers into `dst` (device-to-device).
     /// `dst` must have been allocated with matching shapes (e.g. via
     /// [`DeltaNetSnapshot::new_for`] against the same state). Used by the
     /// checkpoint pool's `restore_private` to copy an immutable cached
-    /// snapshot into a caller-owned private snapshot (spec §4.5 C5).
+    /// snapshot into a caller-owned private snapshot (spec §4.5 C5). `dst`
+    /// takes over this snapshot's identity and cursors; a carry-geometry or
+    /// lane/layer-shape mismatch is refused before any byte moves.
     pub fn copy_to(&self, dst: &mut DeltaNetSnapshot, gpu: &mut Gpu) -> HipResult<()> {
-        for (src, d) in self.s_matrix_bufs.iter().zip(dst.s_matrix_bufs.iter()) {
-            gpu.hip.memcpy_dtod(d, src, src.size())?;
-        }
-        for (src, d) in self.s_scale_bufs.iter().zip(dst.s_scale_bufs.iter()) {
-            gpu.hip.memcpy_dtod(d, src, src.size())?;
-        }
-        for (src, d) in self.conv_state_bufs.iter().zip(dst.conv_state_bufs.iter()) {
-            gpu.hip.memcpy_dtod(d, src, src.size())?;
-        }
-        for (src, d) in self
-            .s_ef_residual_bufs
-            .iter()
-            .zip(dst.s_ef_residual_bufs.iter())
+        let (a, b) = (self.stream.identity, dst.stream.identity);
+        if a.schema_version != b.schema_version
+            || a.geometry != b.geometry
+            || a.lanes != b.lanes
+            || a.layers != b.layers
+            || self
+                .back_families()
+                .iter()
+                .zip(dst.back_families())
+                .any(|(s, d)| s.len() != d.len())
         {
-            gpu.hip.memcpy_dtod(d, src, src.size())?;
+            return Err(HipError::new(
+                0,
+                "DeltaNet snapshot copy_to: stream shape mismatch between snapshots",
+            ));
         }
+        for (srcs, dsts) in self.back_families().into_iter().zip(dst.back_families()) {
+            for (src, d) in srcs.iter().zip(dsts) {
+                gpu.hip.memcpy_dtod(d, src, src.size())?;
+            }
+        }
+        dst.stream = self.stream.clone();
         Ok(())
     }
 }
@@ -13052,6 +13078,12 @@ pub fn spec_step_ddtree_batched(
 /// memcpy of the recurrent S/scale/conv buffers; no KV copy (FullAttention KV is
 /// positional and stays resident, so resume only restores the recurrent state).
 /// Gating (resume enabled / no eviction) is the caller's responsibility.
+///
+/// `prefix` is the committed token stream `[0..pos]` the snapshot reflects, as
+/// two slices (`head ++ tail`); its fingerprint is stored on the snapshot
+/// ([`checkpoint_prefix_hash`]) and is what every later resume validates
+/// ([`checkpoint_prefix_attests`]) before restoring non-reversible DeltaNet
+/// state onto a conversation.
 pub fn take_dn_checkpoint(
     cks: &mut Vec<(usize, DeltaNetSnapshot)>,
     dn: &DeltaNetState,
@@ -13060,6 +13092,29 @@ pub fn take_dn_checkpoint(
     pos: usize,
     interval: usize,
     cap: usize,
+    prefix: (&[u32], &[u32]),
+) {
+    take_dn_checkpoint_pinned(cks, dn, kv, gpu, pos, interval, cap, None, prefix);
+}
+
+/// [`take_dn_checkpoint`] that never recycles the entry at `pin` when the ring
+/// is full: the oldest *other* entry goes instead (the ring stays ascending).
+/// The pin is the position the next user turn's re-render diverges at (see
+/// `prompt_frame::user_turn_resume_boundary`); the stride checkpoints taken
+/// while a long tool chain extends the conversation must not push it out
+/// before that turn arrives. If every resident entry is the pin, a non-pin
+/// snapshot is skipped rather than evicting it.
+#[allow(clippy::too_many_arguments)]
+pub fn take_dn_checkpoint_pinned(
+    cks: &mut Vec<(usize, DeltaNetSnapshot)>,
+    dn: &DeltaNetState,
+    kv: &KvCache,
+    gpu: &mut Gpu,
+    pos: usize,
+    interval: usize,
+    cap: usize,
+    pin: Option<usize>,
+    prefix: (&[u32], &[u32]),
 ) {
     if pos == 0 || cap == 0 {
         return;
@@ -13075,14 +13130,37 @@ pub fn take_dn_checkpoint(
     let recycle =
         cks.len() >= cap || (!cks.is_empty() && !checkpoint_fits_admitted_context(gpu, kv, dn));
     let mut snap = if recycle {
-        cks.remove(0).1
+        let Some(victim) = ring_recycle_victim(cks.iter().map(|(p, _)| *p), pin) else {
+            return;
+        };
+        cks.remove(victim).1
     } else {
         match DeltaNetSnapshot::new_for(gpu, dn) {
             Ok(s) => s,
-            Err(e) => {
-                eprintln!("take_dn_checkpoint: pos={pos} skipped: snapshot allocation failed: {e}");
-                return;
-            }
+            Err(e) => match snapshot_alloc_failure_action(cks.len()) {
+                SnapshotAllocFailure::RecycleOldest => {
+                    // Memory pressure the fit gate did not predict: slide the
+                    // ring forward on its oldest buffers instead of freezing it
+                    // at the last position that did fit.
+                    // The pinned user-turn boundary is never the one recycled.
+                    let Some(victim) = ring_recycle_victim(cks.iter().map(|(p, _)| *p), pin) else {
+                        eprintln!(
+                            "take_dn_checkpoint: pos={pos} skipped: snapshot allocation failed ({e}); only the pinned checkpoint is resident"
+                        );
+                        return;
+                    };
+                    eprintln!(
+                        "take_dn_checkpoint: pos={pos} snapshot allocation failed ({e}); recycling the oldest unpinned checkpoint"
+                    );
+                    cks.remove(victim).1
+                }
+                SnapshotAllocFailure::Skip => {
+                    eprintln!(
+                        "take_dn_checkpoint: pos={pos} skipped: snapshot allocation failed: {e}"
+                    );
+                    return;
+                }
+            },
         }
     };
     if let Err(e) = snap.save_from(dn, gpu) {
@@ -13092,12 +13170,184 @@ pub fn take_dn_checkpoint(
         snap.free_gpu(gpu);
         return;
     }
+    snap.prefix_hash = checkpoint_prefix_hash(pos, prefix);
     cks.push((pos, snap));
+}
+
+/// What [`take_dn_checkpoint`] does when allocating a NEW snapshot fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotAllocFailure {
+    /// The ring has an entry: reuse its oldest buffers for the new checkpoint
+    /// (the same path as the cap / fit recycle).
+    RecycleOldest,
+    /// The ring is empty: nothing to reuse, no checkpoint at this position.
+    Skip,
+}
+
+/// Decision for a failed new-snapshot allocation, given the ring length.
+pub fn snapshot_alloc_failure_action(ring_len: usize) -> SnapshotAllocFailure {
+    if ring_len > 0 {
+        SnapshotAllocFailure::RecycleOldest
+    } else {
+        SnapshotAllocFailure::Skip
+    }
+}
+
+/// The fingerprint a checkpoint at `pos` stores: [`prefix_fingerprint_chain`]
+/// over the committed token stream `[0..pos]` the snapshot reflects, given as
+/// two slices (`head ++ tail`) so callers hash the live conversation plus the
+/// chunk being prefilled without allocating. `0` ("not attested") when the
+/// slices do not cover exactly `pos` tokens (KV eviction makes a physical
+/// position differ from the token count), so an unprovable snapshot can never
+/// certify a resume.
+pub fn checkpoint_prefix_hash(pos: usize, prefix: (&[u32], &[u32])) -> u64 {
+    if prefix.0.len() + prefix.1.len() != pos {
+        return 0;
+    }
+    prefix_fingerprint_chain(prefix.0, prefix.1)
+}
+
+/// Whether a snapshot's stored fingerprint proves it covers exactly
+/// `conversation[..pos]`. An unattested snapshot (`0`) or a position past the
+/// conversation never qualifies.
+pub fn checkpoint_prefix_attests(stored: u64, pos: usize, conversation: &[u32]) -> bool {
+    stored != 0
+        && conversation
+            .get(..pos)
+            .is_some_and(|prefix| stored == prefix_fingerprint(prefix))
+}
+
+/// The checkpoint positions of a ring (`(position, stored fingerprint)` pairs,
+/// oldest first) that are attested against `conversation` (the committed
+/// stream the resident KV/DeltaNet state describes). The resume planner only
+/// ever sees these, so a checkpoint that does not provably cover the
+/// conversation prefix it would be restored onto degrades to a cold prefill.
+pub fn attested_checkpoint_positions(ring: &[(usize, u64)], conversation: &[u32]) -> Vec<usize> {
+    ring.iter()
+        .filter(|&&(pos, stored)| checkpoint_prefix_attests(stored, pos, conversation))
+        .map(|&(pos, _)| pos)
+        .collect()
+}
+
+/// Snapshot the DeltaNet state at a user-turn boundary: unconditionally (no
+/// stride), and pinned against recycling by later stride snapshots.
+pub fn take_dn_boundary_checkpoint(
+    cks: &mut Vec<(usize, DeltaNetSnapshot)>,
+    dn: &DeltaNetState,
+    kv: &KvCache,
+    gpu: &mut Gpu,
+    pos: usize,
+    cap: usize,
+    prefix: (&[u32], &[u32]),
+) {
+    take_dn_checkpoint_pinned(cks, dn, kv, gpu, pos, 0, cap, Some(pos), prefix);
+}
+
+/// User-turn boundary handling for one prompt prefill's checkpoint ring:
+/// `boundary` is this request's user-turn boundary (its prompt is
+/// user-terminated); `pin` is the newest user-turn snapshot (this request's,
+/// once taken, else the previous one) that stride snapshots must not recycle.
+/// `Default` is the plain stride behaviour.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TurnCheckpoint {
+    pub boundary: Option<usize>,
+    pub pin: Option<usize>,
+}
+
+/// Before forwarding the prefill chunk `[pos, pos + len)`: when the chunk holds
+/// the user-turn boundary, `pos` is the newest existing chunk end at or before
+/// it (or the prefill's start), so snapshot there regardless of stride and pin
+/// it (`turn.pin`). Never changes the chunk plan, so numerics are untouched.
+#[allow(clippy::too_many_arguments)]
+pub fn take_turn_checkpoint_before_chunk(
+    cks: &mut Vec<(usize, DeltaNetSnapshot)>,
+    dn: &DeltaNetState,
+    kv: &KvCache,
+    gpu: &mut Gpu,
+    pos: usize,
+    len: usize,
+    cap: usize,
+    turn: &mut TurnCheckpoint,
+    prefix: (&[u32], &[u32]),
+) {
+    if !hipfire_runtime::prompt_frame::chunk_holds_turn_boundary(pos, len, turn.boundary) {
+        return;
+    }
+    take_dn_boundary_checkpoint(cks, dn, kv, gpu, pos, cap, prefix);
+    if cks.iter().any(|(p, _)| *p == pos) {
+        turn.pin = Some(pos);
+    }
+}
+
+/// Stride snapshot at a prefill chunk end that spares the pinned user-turn
+/// snapshot.
+#[allow(clippy::too_many_arguments)]
+pub fn take_turn_checkpoint(
+    cks: &mut Vec<(usize, DeltaNetSnapshot)>,
+    dn: &DeltaNetState,
+    kv: &KvCache,
+    gpu: &mut Gpu,
+    pos: usize,
+    interval: usize,
+    cap: usize,
+    turn: TurnCheckpoint,
+    prefix: (&[u32], &[u32]),
+) {
+    take_dn_checkpoint_pinned(cks, dn, kv, gpu, pos, interval, cap, turn.pin, prefix);
+}
+
+/// Ring index recycled when the ring is full: the oldest entry that is not the
+/// pinned user-turn boundary. `None` when every entry is the pin.
+fn ring_recycle_victim(
+    positions: impl Iterator<Item = usize>,
+    pin: Option<usize>,
+) -> Option<usize> {
+    positions
+        .enumerate()
+        .find(|&(_, p)| Some(p) != pin)
+        .map(|(i, _)| i)
+}
+
+#[cfg(test)]
+mod ring_pin_tests {
+    use super::ring_recycle_victim;
+
+    #[test]
+    fn full_ring_recycles_oldest_but_never_the_pinned_boundary() {
+        // Unpinned: oldest goes (the historical behaviour).
+        assert_eq!(
+            ring_recycle_victim([521, 2048, 4096].into_iter(), None),
+            Some(0)
+        );
+        // The pin is the oldest entry (a user-turn boundary far behind the
+        // stride checkpoints a long tool chain adds): the next-oldest goes.
+        assert_eq!(
+            ring_recycle_victim([521, 2048, 4096].into_iter(), Some(521)),
+            Some(1)
+        );
+        // Pin in the middle / newest: the oldest still goes.
+        assert_eq!(
+            ring_recycle_victim([521, 2048, 4096].into_iter(), Some(2048)),
+            Some(0)
+        );
+        assert_eq!(
+            ring_recycle_victim([521, 2048, 4096].into_iter(), Some(4096)),
+            Some(0)
+        );
+        // Only the pin resident: nothing may be recycled for a stride snapshot.
+        assert_eq!(ring_recycle_victim([521].into_iter(), Some(521)), None);
+        // A stale pin matching no resident entry protects nothing.
+        assert_eq!(
+            ring_recycle_victim([2048, 4096].into_iter(), Some(521)),
+            Some(0)
+        );
+    }
 }
 
 /// Whether one more DeltaNet snapshot can be allocated without eating what the
 /// admitted context still needs: `free_now >= snapshot + KV mapping growth to
-/// the admitted tokens + the fit's reserve`. No floor set => always true; a
+/// the admitted tokens + the fit's reserve`, where `free_now` includes memory parked in
+/// the pool. No floor set => always true; a
 /// memory query or growth-plan error => false (do not allocate).
 fn checkpoint_fits_admitted_context(gpu: &Gpu, kv: &KvCache, dn: &DeltaNetState) -> bool {
     let Some(floor) = gpu.kv_fit_floor else {
@@ -13106,13 +13356,17 @@ fn checkpoint_fits_admitted_context(gpu: &Gpu, kv: &KvCache, dn: &DeltaNetState)
     let Ok((free_now, _)) = gpu.device_mem_info() else {
         return false;
     };
+    // Buffers parked in the pool are allocated from HIP (so `hipMemGetInfo` counts them as used)
+    // but owned by no tensor, and every pool allocation and VMM map returns them to HIP on demand.
+    // They are available to the KV growth this gate protects, so count them as free.
+    let available = free_now.saturating_add(gpu.pool_parked_bytes());
     let Ok(growth) = kv.planned_mapped_growth_bytes(gpu, floor.admitted_tokens) else {
         return false;
     };
     let Ok(snapshot) = usize::try_from(DeltaNetSnapshot::bytes_for(dn)) else {
         return false;
     };
-    free_now
+    available
         >= snapshot
             .saturating_add(growth)
             .saturating_add(floor.reserve_bytes)
@@ -13266,6 +13520,8 @@ pub fn seed_target_hidden_from_prompt(
         None,
         None,
     )?;
+    // Single-call prompt seed: ordinary prefill ends here, before decode.
+    target.dn_state.seal_streams(gpu, prompt_tokens.len())?;
     // Gather the just-written rows from the ring buffer.
     let block = download_hidden_block(gpu, hidden_rb, prompt_tokens.len())?;
     target_hidden_host.extend_from_slice(&block);
@@ -13442,6 +13698,7 @@ pub fn seed_target_hidden_from_prompt_abortable(
     checkpoints: Option<&mut Vec<(usize, DeltaNetSnapshot)>>,
     ckpt_interval: usize,
     ckpt_cap: usize,
+    turn: &mut TurnCheckpoint,
 ) -> HipResult<bool> {
     let mut parts = DflashTargetParts::from_slot(target);
     seed_target_hidden_from_prompt_abortable_parts(
@@ -13454,6 +13711,7 @@ pub fn seed_target_hidden_from_prompt_abortable(
         checkpoints,
         ckpt_interval,
         ckpt_cap,
+        turn,
     )
 }
 
@@ -13469,6 +13727,7 @@ pub fn seed_target_hidden_from_prompt_abortable_parts(
     mut checkpoints: Option<&mut Vec<(usize, DeltaNetSnapshot)>>,
     ckpt_interval: usize,
     ckpt_cap: usize,
+    turn: &mut TurnCheckpoint,
 ) -> HipResult<bool> {
     target.reset_state(gpu)?;
     if let Some(host) = target_hidden_host.as_deref_mut() {
@@ -13497,7 +13756,21 @@ pub fn seed_target_hidden_from_prompt_abortable_parts(
                 }
                 return Ok(true);
             }
-            let end = seq_pos + seed.next_len(prompt_tokens.len() - seq_pos);
+            let outer = seed.next_len(prompt_tokens.len() - seq_pos);
+            if let Some(cks) = checkpoints.as_deref_mut() {
+                take_turn_checkpoint_before_chunk(
+                    cks,
+                    target.dn_state,
+                    target.kv_cache,
+                    gpu,
+                    seq_pos,
+                    outer,
+                    ckpt_cap,
+                    turn,
+                    (&prompt_tokens[..seq_pos], &[]),
+                );
+            }
+            let end = seq_pos + outer;
             while seq_pos < end {
                 let piece = SeedPrefill::piece_len(hidden_rb, end - seq_pos);
                 let chunk = &prompt_tokens[seq_pos..seq_pos + piece];
@@ -13513,7 +13786,7 @@ pub fn seed_target_hidden_from_prompt_abortable_parts(
             // Prompt-prefill progress (silent outside a `prompt_phase`).
             hipfire_runtime::prefill_progress::report(seq_pos, prompt_tokens.len());
             if let Some(cks) = checkpoints.as_deref_mut() {
-                take_dn_checkpoint(
+                take_turn_checkpoint(
                     cks,
                     target.dn_state,
                     target.kv_cache,
@@ -13521,9 +13794,14 @@ pub fn seed_target_hidden_from_prompt_abortable_parts(
                     seq_pos,
                     ckpt_interval,
                     ckpt_cap,
+                    *turn,
+                    (&prompt_tokens[..seq_pos], &[]),
                 );
             }
         }
+        // The prompt seed ends the ordinary-prefill phase: the one genuine
+        // seal before decode/verify reads the recurrent state.
+        target.dn_state.seal_streams(gpu, seq_pos)?;
         Ok(false)
     })();
     seed.free(gpu);
@@ -13555,6 +13833,7 @@ pub fn seed_target_hidden_suffix_abortable(
     hidden_rb: &mut HiddenStateRingBuffer,
     suffix: &[u32],
     start_pos: usize,
+    prefix_head: &[u32],
     abort_check: &dyn Fn() -> bool,
     // Optional DeltaNet checkpoint ring (see from_prompt variant). Lets a HIT
     // or a resume keep adding checkpoints as the conversation grows, so a later
@@ -13562,6 +13841,7 @@ pub fn seed_target_hidden_suffix_abortable(
     checkpoints: Option<&mut Vec<(usize, DeltaNetSnapshot)>>,
     ckpt_interval: usize,
     ckpt_cap: usize,
+    turn: &mut TurnCheckpoint,
 ) -> HipResult<bool> {
     let mut parts = DflashTargetParts::from_slot(target);
     seed_target_hidden_suffix_abortable_parts(
@@ -13570,10 +13850,12 @@ pub fn seed_target_hidden_suffix_abortable(
         hidden_rb,
         suffix,
         start_pos,
+        prefix_head,
         abort_check,
         checkpoints,
         ckpt_interval,
         ckpt_cap,
+        turn,
     )
 }
 
@@ -13585,10 +13867,14 @@ pub fn seed_target_hidden_suffix_abortable_parts(
     hidden_rb: &mut HiddenStateRingBuffer,
     suffix: &[u32],
     start_pos: usize,
+    // The committed tokens `[0..start_pos]` the target state already covers
+    // (attests the checkpoints this call takes; see [`take_dn_checkpoint`]).
+    prefix_head: &[u32],
     abort_check: &dyn Fn() -> bool,
     mut checkpoints: Option<&mut Vec<(usize, DeltaNetSnapshot)>>,
     ckpt_interval: usize,
     ckpt_cap: usize,
+    turn: &mut TurnCheckpoint,
 ) -> HipResult<bool> {
     let mut seed = SeedPrefill::plan(gpu, target, start_pos + suffix.len());
     let result = (|| -> HipResult<bool> {
@@ -13598,7 +13884,21 @@ pub fn seed_target_hidden_suffix_abortable_parts(
             if abort_check() {
                 return Ok(true);
             }
-            let end = off + seed.next_len(suffix.len() - off);
+            let outer = seed.next_len(suffix.len() - off);
+            if let Some(cks) = checkpoints.as_deref_mut() {
+                take_turn_checkpoint_before_chunk(
+                    cks,
+                    target.dn_state,
+                    target.kv_cache,
+                    gpu,
+                    pos,
+                    outer,
+                    ckpt_cap,
+                    turn,
+                    (prefix_head, &suffix[..off]),
+                );
+            }
+            let end = off + outer;
             while off < end {
                 let piece = SeedPrefill::piece_len(hidden_rb, end - off);
                 seed.forward(
@@ -13616,7 +13916,7 @@ pub fn seed_target_hidden_suffix_abortable_parts(
             // forced advances and terminal repair stay quiet).
             hipfire_runtime::prefill_progress::report(off, suffix.len());
             if let Some(cks) = checkpoints.as_deref_mut() {
-                take_dn_checkpoint(
+                take_turn_checkpoint(
                     cks,
                     target.dn_state,
                     target.kv_cache,
@@ -13624,6 +13924,8 @@ pub fn seed_target_hidden_suffix_abortable_parts(
                     pos,
                     ckpt_interval,
                     ckpt_cap,
+                    *turn,
+                    (prefix_head, &suffix[..off]),
                 );
             }
         }
@@ -13631,83 +13933,6 @@ pub fn seed_target_hidden_suffix_abortable_parts(
     })();
     seed.free(gpu);
     result
-}
-
-/// Mirror a TriAttention KV eviction into the DFlash draft's GPU-resident
-/// `target_hidden` and `target_hidden_abs_positions`, so the draft's cross-
-/// attention sees the same subset of context target now has.
-///
-/// `retain_mask` is the source-position retain selection returned by
-/// `EvictionCtx::maybe_evict` (ascending, length == budget). An empty
-/// `retain_mask` is a no-op — the caller should have skipped calling this
-/// (CASK m-fold path returns empty because merged slots don't map cleanly
-/// to a single source position).
-///
-/// Implementation: download the relevant `physical` rows of `target_hidden`,
-/// reorder to `budget` rows on the host per `retain_mask`, upload back. Runs
-/// at eviction cadence (~once per β decoded tokens) so the PCIe round-trip
-/// is amortized — perf impact is small relative to the τ recovery.
-///
-/// Post-conditions (all via `draft_scratch.thlog.rebuild_after_eviction`):
-/// - `thlog.abs_positions()` has exactly `budget` entries, each pulled from
-///   `retain_mask[i]` of the pre-eviction abs_positions.
-/// - `draft_scratch.target_hidden` GPU slots [0..budget) hold the retained
-///   rows in ascending source order.
-/// - `thlog.uploaded_rows() == budget` so the next draft_forward sees the
-///   compacted layout as already-uploaded (and the projection cache is
-///   invalidated).
-pub fn apply_eviction_retain_to_draft(
-    gpu: &mut rdna_compute::Gpu,
-    draft_scratch: &mut dflash::DflashScratch,
-    retain_mask: &[u32],
-    ne: usize,
-    h: usize,
-    physical: usize,
-) -> HipResult<()> {
-    if retain_mask.is_empty() {
-        return Ok(());
-    }
-    let row_floats = ne * h;
-    // Download only the populated prefix of target_hidden. `alloc_tensor`
-    // is sized to max_ctx_len — we just need `physical` rows.
-    let mut host = vec![0f32; physical * row_floats];
-    {
-        let bytes: &mut [u8] = unsafe {
-            std::slice::from_raw_parts_mut(
-                host.as_mut_ptr() as *mut u8,
-                host.len() * std::mem::size_of::<f32>(),
-            )
-        };
-        gpu.hip
-            .memcpy_dtoh(bytes, &draft_scratch.target_hidden.buf)?;
-    }
-    let budget = retain_mask.len();
-    let mut compacted = Vec::with_capacity(budget * row_floats);
-    let mut new_abs = Vec::with_capacity(budget);
-    for &src_idx in retain_mask {
-        let s = src_idx as usize;
-        let row = &host[s * row_floats..(s + 1) * row_floats];
-        compacted.extend_from_slice(row);
-        new_abs.push(
-            *draft_scratch
-                .thlog
-                .abs_positions()
-                .get(s)
-                .expect("retain_mask index out of range for abs_positions"),
-        );
-    }
-    let dst_bytes = budget * row_floats * std::mem::size_of::<f32>();
-    let compacted_bytes: &[u8] =
-        unsafe { std::slice::from_raw_parts(compacted.as_ptr() as *const u8, dst_bytes) };
-    gpu.hip
-        .memcpy_htod(&draft_scratch.target_hidden.buf, compacted_bytes)?;
-    // Replace the row layout with the compacted positions and invalidate the
-    // per-layer k_ctx/v_ctx projection cache (indexed by the pre-eviction row
-    // layout, now stale — rebuilt on the next draft_forward; one slow cycle per
-    // eviction is fine). `rebuild_after_eviction` sets the upload watermark to
-    // `new_abs.len()` (== budget) so the two cursors can't desync.
-    draft_scratch.thlog.rebuild_after_eviction(new_abs);
-    Ok(())
 }
 
 #[cfg(test)]
@@ -14848,6 +15073,7 @@ mod tests {
             conv_states: vec![gpu.zeros(&[4], DType::F32).expect("conv")],
             s_ef_residual: vec![gpu.zeros(&[8], DType::F16).expect("ef")],
             quant: qwen35::StateQuant::Q8,
+            stream: crate::qwen35::weights::GdnStreamOwner::new(1, 1, None),
         }
     }
 
@@ -15001,6 +15227,7 @@ mod dn_exchange_tests {
             conv_states: fam(2),
             s_ef_residual: fam(3),
             quant: qwen35::StateQuant::Q8,
+            stream: crate::qwen35::weights::GdnStreamOwner::new(EXT.n_layers, 1, None),
         }
     }
 
@@ -15015,10 +15242,13 @@ mod dn_exchange_tests {
             s_scale_bufs: fam(1),
             conv_state_bufs: fam(2),
             s_ef_residual_bufs: fam(3),
+            carry_bufs: Default::default(),
+            stream: live.stream.image(),
             bulk_fwd: Some(buf(FWD0, 8)),
             bulk_rev: Some(buf(REV0, 8)),
             bulk_n_items: 3,
             bulk_fingerprint: DeltaNetSnapshot::bulk_fingerprint(live),
+            prefix_hash: 0,
         }
     }
 
@@ -15260,6 +15490,568 @@ mod dn_exchange_tests {
         assert_eq!(ptrs.len(), 2 * 4 * EXT.n_layers);
         ptrs.sort_unstable();
         assert!(ptrs.windows(2).all(|w| w[0] != w[1]));
+    }
+}
+
+/// Lifecycle tests of the per-state GDN stream owner (cursors + persistent
+/// tile carry) through [`DeltaNetSnapshot`]: host-only checks use fake device
+/// addresses that are never dereferenced or freed; the GPU round trip skips
+/// when no device is present.
+#[cfg(test)]
+mod dn_stream_tests {
+    use super::*;
+    use crate::qwen35::weights::{DeltaNetCarry, GdnStreamOwner};
+    use rdna_compute::gdn_stream::{GdnCarryGeometry, GdnStreamPhase, GDN_STREAM_SCHEMA_VERSION};
+
+    const GEOM: GdnCarryGeometry = GdnCarryGeometry {
+        hk: 1,
+        hv: 2,
+        head_dim: 2,
+        conv_hist_rows: 3,
+        micro_rows: 4,
+    };
+    const LAYERS: usize = 2;
+    const LIVE: usize = 0x10_0000;
+    const OTHER: usize = 0x30_0000;
+    const SNAP: usize = 0x20_0000;
+    /// Per-layer bytes of the four base families (S, scales, conv, EF).
+    const BASE: [usize; 4] = [64, 16, 24, 128];
+
+    fn buf(addr: usize, size: usize) -> DeviceBuffer {
+        // SAFETY: borrowed handle to a fake address; never dereferenced/freed.
+        unsafe { DeviceBuffer::from_raw(addr as *mut std::ffi::c_void, size) }
+    }
+
+    fn tensor(addr: usize, bytes: usize, dtype: DType) -> GpuTensor {
+        GpuTensor {
+            buf: buf(addr, bytes),
+            shape: vec![bytes / dtype.size()],
+            dtype,
+        }
+    }
+
+    fn carry_bytes(g: &GdnCarryGeometry, f: usize) -> usize {
+        [
+            g.state_bytes(),
+            g.conv_bytes(),
+            g.raw_qkv_bytes(),
+            g.raw_ab_bytes(),
+        ][f]
+    }
+
+    fn carry(base: usize, g: GdnCarryGeometry, lanes: usize) -> DeltaNetCarry {
+        let fam = |f: usize| -> Vec<GpuTensor> {
+            (0..LAYERS)
+                .map(|l| {
+                    tensor(
+                        base + 0x8000 + f * 0x4000 + l * 0x1000,
+                        lanes * carry_bytes(&g, f),
+                        DType::F32,
+                    )
+                })
+                .collect()
+        };
+        DeltaNetCarry {
+            geometry: g,
+            lanes,
+            tile_state: fam(0),
+            tile_conv: fam(1),
+            raw_qkv: fam(2),
+            raw_ab: fam(3),
+        }
+    }
+
+    fn state(base: usize, geometry: Option<GdnCarryGeometry>) -> DeltaNetState {
+        let fam = |f: usize, dtype: DType| -> Vec<GpuTensor> {
+            (0..LAYERS)
+                .map(|l| tensor(base + f * 0x1000 + l * 0x100, BASE[f], dtype))
+                .collect()
+        };
+        DeltaNetState {
+            s_matrices: fam(0, DType::F32),
+            s_scales: fam(1, DType::F32),
+            conv_states: fam(2, DType::F32),
+            s_ef_residual: fam(3, DType::F16),
+            quant: qwen35::StateQuant::Q8,
+            stream: GdnStreamOwner::new(LAYERS, 1, geometry.map(|g| carry(base, g, 1))),
+        }
+    }
+
+    fn snapshot(base: usize, live: &DeltaNetState) -> DeltaNetSnapshot {
+        let fam = |f: usize| -> Vec<DeviceBuffer> {
+            (0..LAYERS)
+                .map(|l| buf(base + f * 0x1000 + l * 0x100, BASE[f]))
+                .collect()
+        };
+        let cfam = |f: usize| -> Vec<DeviceBuffer> {
+            match live.stream.carry.as_ref() {
+                Some(c) => (0..LAYERS)
+                    .map(|l| {
+                        buf(
+                            base + 0x8000 + f * 0x4000 + l * 0x1000,
+                            carry_bytes(&c.geometry, f),
+                        )
+                    })
+                    .collect(),
+                None => Vec::new(),
+            }
+        };
+        DeltaNetSnapshot {
+            s_matrix_bufs: fam(0),
+            s_scale_bufs: fam(1),
+            conv_state_bufs: fam(2),
+            s_ef_residual_bufs: fam(3),
+            carry_bufs: [cfam(0), cfam(1), cfam(2), cfam(3)],
+            stream: live.stream.image(),
+            bulk_fwd: None,
+            bulk_rev: None,
+            bulk_n_items: 0,
+            bulk_fingerprint: DeltaNetSnapshot::bulk_fingerprint(live),
+            prefix_hash: 0,
+        }
+    }
+
+    fn open_at(owner: &mut GdnStreamOwner, position: u64, pending: u32) {
+        let gen = owner.generation;
+        for m in &mut owner.meta {
+            m.phase = GdnStreamPhase::Open;
+            m.position = position;
+            m.phase_start = 0;
+            m.frame_base = position / 512 * 512;
+            m.tile_base = position - u64::from(pending);
+            m.pending_rows = pending;
+            m.owner_generation = gen;
+        }
+    }
+
+    fn err_text<T>(r: HipResult<T>) -> String {
+        match r {
+            Ok(_) => panic!("expected an error"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    #[test]
+    fn snapshot_and_bytes_account_for_carry() {
+        let plain = state(LIVE, None);
+        let with = state(LIVE, Some(GEOM));
+        let base: usize = BASE.iter().sum::<usize>() * LAYERS;
+        assert_eq!(DeltaNetSnapshot::bytes_for(&plain), base as u64);
+        assert_eq!(
+            DeltaNetSnapshot::bytes_for(&with),
+            (base + LAYERS * GEOM.total_bytes()) as u64,
+            "carry bytes are charged to snapshot admission"
+        );
+        assert_eq!(with.owned_bytes(), base + LAYERS * GEOM.total_bytes());
+        let sn = snapshot(SNAP, &with);
+        assert_eq!(sn.bytes_len(), DeltaNetSnapshot::bytes_for(&with));
+        assert!(sn.mirrors(&with));
+        assert!(!sn.mirrors(&plain), "a carry-less state is not mirrored");
+        assert_eq!(
+            sn.stream_identity().schema_version,
+            GDN_STREAM_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn restore_rejects_schema_recipe_and_shape_mismatch_without_mutation() {
+        let mut live = state(LIVE, Some(GEOM));
+        live.stream.bind_recipe(7).unwrap();
+        open_at(&mut live.stream, 70, 6);
+        let before = live.stream.meta.clone();
+        let sn = snapshot(SNAP, &live);
+        sn.check_restore(&live).expect("same identity restores");
+
+        // Different recipe: structure agrees (a save may adopt), restore must not.
+        let mut other = state(OTHER, Some(GEOM));
+        other.stream.bind_recipe(8).unwrap();
+        let other_meta = other.stream.meta.clone();
+        sn.check_structure(&other).expect("same shape");
+        assert!(err_text(sn.check_restore(&other)).contains("recipe mismatch"));
+        assert!(other.stream.apply_image(&sn.stream).is_err());
+        assert_eq!(other.stream.meta, other_meta, "failed apply wrote nothing");
+
+        // Carry presence / geometry / lane shape.
+        let mut nocarry = state(OTHER, None);
+        nocarry.stream.bind_recipe(7).unwrap();
+        assert!(err_text(sn.check_restore(&nocarry)).contains("shape mismatch"));
+        let mut wide = state(
+            OTHER,
+            Some(GdnCarryGeometry {
+                micro_rows: 16,
+                ..GEOM
+            }),
+        );
+        wide.stream.bind_recipe(7).unwrap();
+        assert!(err_text(sn.check_restore(&wide)).contains("shape mismatch"));
+
+        // Schema version.
+        let mut stale = snapshot(SNAP, &live);
+        stale.stream.identity.schema_version += 1;
+        assert!(err_text(stale.check_restore(&live)).contains("shape mismatch"));
+
+        // Family length.
+        let mut short = snapshot(SNAP, &live);
+        short.carry_bufs[3].pop();
+        assert!(err_text(short.check_restore(&live)).contains("family length"));
+
+        assert_eq!(
+            live.stream.meta, before,
+            "rejections never touch the live cursors"
+        );
+    }
+
+    #[test]
+    fn restore_publishes_saved_cursors_under_the_owners_generation() {
+        let mut live = state(LIVE, Some(GEOM));
+        live.stream.bind_recipe(7).unwrap();
+        open_at(&mut live.stream, 70, 6);
+        let sn = snapshot(SNAP, &live);
+        let saved: Vec<_> = sn.stream_meta().to_vec();
+
+        // Advance past the snapshot (decode seals at a later position).
+        for m in &mut live.stream.meta {
+            m.phase = GdnStreamPhase::Sealed;
+            m.position = 200;
+            m.pending_rows = 0;
+        }
+        live.stream.apply_image(&sn.stream).expect("apply");
+        let gen = live.stream.generation;
+        for (got, want) in live.stream.meta.iter().zip(&saved) {
+            assert_eq!(
+                got.phase,
+                GdnStreamPhase::Open,
+                "restore must not invent a seal"
+            );
+            assert_eq!(
+                (got.position, got.pending_rows, got.recipe_id),
+                (want.position, want.pending_rows, want.recipe_id)
+            );
+            assert_eq!(got.owner_generation, gen);
+        }
+    }
+
+    #[test]
+    fn exchange_moves_carry_buffers_and_cursors_together() {
+        let mut live = state(LIVE, Some(GEOM));
+        live.stream.bind_recipe(7).unwrap();
+        open_at(&mut live.stream, 70, 6);
+        let mut sn = snapshot(SNAP, &live);
+        // The snapshot holds a Sealed decode-phase image at position 200.
+        for m in &mut sn.stream.meta {
+            m.phase = GdnStreamPhase::Sealed;
+            m.position = 200;
+            m.pending_rows = 0;
+        }
+        let gen_before = live.stream.generation;
+        let carry_ptr =
+            |s: &DeltaNetState, f: usize| s.stream.carry_families()[f][0].buf.as_ptr() as usize;
+        let live_carry: Vec<usize> = (0..4).map(|f| carry_ptr(&live, f)).collect();
+        assert!(sn.stream.identity == live.stream.identity());
+
+        sn.exchange_buffers(&mut live);
+
+        for f in 0..4 {
+            assert_eq!(
+                carry_ptr(&live, f),
+                SNAP + 0x8000 + f * 0x4000,
+                "live now owns the snapshot's carry bank {f}"
+            );
+            assert_eq!(
+                sn.carry_bufs[f][0].as_ptr() as usize,
+                live_carry[f],
+                "snapshot now owns the old live carry bank {f}"
+            );
+        }
+        assert!(live
+            .stream
+            .meta
+            .iter()
+            .all(|m| m.phase == GdnStreamPhase::Sealed && m.position == 200));
+        assert!(sn
+            .stream
+            .meta
+            .iter()
+            .all(|m| m.phase == GdnStreamPhase::Open && m.position == 70));
+        assert_ne!(
+            live.stream.generation, gen_before,
+            "exchange invalidates derived views"
+        );
+        assert!(live
+            .stream
+            .meta
+            .iter()
+            .all(|m| m.owner_generation == live.stream.generation));
+    }
+
+    #[test]
+    fn bind_recipe_is_frozen_once_a_prefix_exists() {
+        let mut owner = GdnStreamOwner::new(LAYERS, 1, None);
+        owner.bind_recipe(5).expect("bind at position 0");
+        assert!(owner.meta.iter().all(|m| m.recipe_id == 5));
+        owner
+            .bind_recipe(5)
+            .expect("rebinding the same recipe is a no-op");
+        owner
+            .bind_recipe(6)
+            .expect("a recipe may change while empty");
+        open_at(&mut owner, 70, 6);
+        owner
+            .bind_recipe(6)
+            .expect("same recipe on a prefix is fine");
+        assert!(
+            owner.bind_recipe(9).is_err(),
+            "never change recipe mid-prefix"
+        );
+        assert_eq!(owner.recipe_id, 6);
+    }
+
+    #[test]
+    fn begin_append_restamps_sealed_and_requires_open_cursors_to_agree() {
+        let mut owner = GdnStreamOwner::new(LAYERS, 1, None);
+        owner.bind_recipe(5).unwrap();
+        owner
+            .begin_append(100)
+            .expect("a Sealed stream starts a prefill phase at the call's start");
+        for m in &owner.meta {
+            assert_eq!(m.phase, GdnStreamPhase::Sealed);
+            assert_eq!(
+                (
+                    m.position,
+                    m.phase_start,
+                    m.frame_base,
+                    m.tile_base,
+                    m.pending_rows
+                ),
+                (100, 100, 100, 100, 0)
+            );
+            assert_eq!(m.recipe_id, 5);
+        }
+        open_at(&mut owner, 70, 5);
+        let before = owner.meta.clone();
+        assert!(err_text(owner.begin_append(71)).contains("Open"));
+        assert_eq!(owner.meta, before, "a refused begin mutates nothing");
+        owner
+            .begin_append(70)
+            .expect("an Open stream continues at its own cursor");
+        assert!(owner
+            .meta
+            .iter()
+            .all(|m| m.phase == GdnStreamPhase::Open && m.position == 70));
+    }
+
+    #[test]
+    fn commit_candidates_publishes_every_layer_or_none() {
+        let mut owner = GdnStreamOwner::new(LAYERS, 1, None);
+        owner.bind_recipe(5).unwrap();
+        let mut cand = owner.meta[0];
+        cand.phase = GdnStreamPhase::Open;
+        cand.position = 128;
+        cand.frame_base = 0;
+        let before = owner.meta.clone();
+        let mut partial: Vec<Option<_>> = vec![Some(cand); LAYERS];
+        partial[LAYERS - 1] = None;
+        assert!(owner.commit_candidates(&partial).is_err());
+        assert_eq!(
+            owner.meta, before,
+            "an incomplete candidate set publishes nothing"
+        );
+        let full: Vec<Option<_>> = vec![Some(cand); LAYERS];
+        owner
+            .commit_candidates(&full)
+            .expect("every layer succeeded");
+        assert!(owner.meta.iter().all(|m| m.position == 128
+            && m.phase == GdnStreamPhase::Open
+            && m.owner_generation == owner.generation));
+    }
+
+    #[test]
+    fn reset_meta_drops_to_empty_sealed_keeping_recipe_and_bumping_generation() {
+        let mut owner = GdnStreamOwner::new(LAYERS, 1, None);
+        owner.bind_recipe(5).unwrap();
+        open_at(&mut owner, 70, 6);
+        let gen = owner.generation;
+        owner.reset_meta();
+        assert_ne!(owner.generation, gen);
+        for m in &owner.meta {
+            assert_eq!(m.phase, GdnStreamPhase::Sealed);
+            assert_eq!((m.position, m.pending_rows, m.tile_base), (0, 0, 0));
+            assert_eq!(m.recipe_id, 5);
+            assert_eq!(m.owner_generation, owner.generation);
+        }
+    }
+
+    #[test]
+    fn seal_stamps_sealed_streams_and_refuses_open_ones() {
+        let mut owner = GdnStreamOwner::new(LAYERS, 1, None);
+        owner
+            .seal_sealed_at(100)
+            .expect("untracked sealed stream is stamped");
+        assert!(owner
+            .meta
+            .iter()
+            .all(|m| m.position == 100 && m.tile_base == 100));
+        owner
+            .seal_sealed_at(160)
+            .expect("a Sealed stamp left stale by decode is overwritten, not compared");
+        assert!(owner
+            .meta
+            .iter()
+            .all(|m| m.position == 160 && m.pending_rows == 0));
+        let before = owner.meta.clone();
+        owner.meta[1].phase = GdnStreamPhase::Open;
+        let open_before = owner.meta.clone();
+        assert!(err_text(owner.seal_sealed_at(200)).contains("Open"));
+        assert_eq!(
+            owner.meta, open_before,
+            "no layer is stamped when one is refused"
+        );
+        assert_eq!(owner.meta[0], before[0]);
+    }
+
+    #[test]
+    fn lane_views_do_not_share_cursors_or_pending_buffers() {
+        let mut owner = GdnStreamOwner::new(LAYERS, 2, Some(carry(LIVE, GEOM, 2)));
+        owner.bind_recipe(4).unwrap();
+        let mut view = owner.lane_view(1).expect("lane view");
+        let parent = owner.carry.as_ref().unwrap();
+        let child = view.carry.as_ref().unwrap();
+        assert_eq!(child.lanes, 1);
+        for (p, c) in parent.tile_state.iter().zip(&child.tile_state) {
+            assert_eq!(
+                c.buf.as_ptr() as usize,
+                p.buf.as_ptr() as usize + GEOM.state_bytes(),
+                "lane 1 starts one lane extent in"
+            );
+        }
+        for (p, c) in parent.raw_qkv.iter().zip(&child.raw_qkv) {
+            assert_eq!(
+                c.buf.as_ptr() as usize,
+                p.buf.as_ptr() as usize + GEOM.raw_qkv_bytes()
+            );
+            assert_eq!(c.buf.size(), GEOM.raw_qkv_bytes());
+        }
+        open_at(&mut view, 77, 5);
+        assert!(
+            owner.meta.iter().all(|m| m.position == 0),
+            "view cursors are private"
+        );
+        owner.adopt_lane_meta(1, &view).expect("adopt");
+        for l in 0..LAYERS {
+            assert_eq!(owner.lane_meta(l, 1).unwrap().position, 77);
+            assert_eq!(owner.lane_meta(l, 1).unwrap().pending_rows, 5);
+            assert_eq!(
+                owner.lane_meta(l, 0).unwrap().position,
+                0,
+                "lane 0 untouched"
+            );
+        }
+        let mut wrong = owner.lane_view(0).unwrap();
+        wrong.recipe_id = 99;
+        assert!(owner.adopt_lane_meta(0, &wrong).is_err());
+        assert!(owner.lane_view(2).is_err());
+    }
+
+    fn try_gpu() -> Option<Gpu> {
+        Gpu::init().ok()
+    }
+
+    fn htod(gpu: &Gpu, t: &GpuTensor, vals: &[f32]) {
+        let mut bytes = vec![0u8; t.buf.size()];
+        for (i, v) in vals.iter().enumerate() {
+            bytes[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        gpu.hip.memcpy_htod(&t.buf, &bytes).expect("htod");
+    }
+
+    fn dtoh(gpu: &Gpu, t: &GpuTensor, n: usize) -> Vec<f32> {
+        let mut bytes = vec![0u8; t.buf.size()];
+        gpu.hip.memcpy_dtoh(&mut bytes, &t.buf).expect("dtoh");
+        (0..n)
+            .map(|i| f32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap()))
+            .collect()
+    }
+
+    /// Device round trip: carry bytes and cursors survive save → dirty → restore,
+    /// and a recipe-mismatched restore moves no byte.
+    #[test]
+    fn gpu_snapshot_roundtrips_carry_and_cursors_and_rejects_recipe_mismatch() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let g = GEOM;
+        let mk = |gpu: &mut Gpu, bytes: usize| gpu.zeros(&[bytes / 4], DType::F32).expect("zeros");
+        let carry = DeltaNetCarry {
+            geometry: g,
+            lanes: 1,
+            tile_state: vec![mk(&mut gpu, g.state_bytes())],
+            tile_conv: vec![mk(&mut gpu, g.conv_bytes())],
+            raw_qkv: vec![mk(&mut gpu, g.raw_qkv_bytes())],
+            raw_ab: vec![mk(&mut gpu, g.raw_ab_bytes())],
+        };
+        let mut state = DeltaNetState {
+            s_matrices: vec![gpu.zeros(&[8], DType::F32).expect("s")],
+            s_scales: vec![gpu.zeros(&[1], DType::F32).expect("scale")],
+            conv_states: vec![gpu.zeros(&[4], DType::F32).expect("conv")],
+            s_ef_residual: Vec::new(),
+            quant: qwen35::StateQuant::Q8,
+            stream: GdnStreamOwner::new(1, 1, Some(carry)),
+        };
+        state.stream.bind_recipe(0x5EED).unwrap();
+        let n_state = g.state_bytes() / 4;
+        let n_raw = g.raw_qkv_bytes() / 4;
+        let saved_state: Vec<f32> = (0..n_state).map(|i| i as f32 + 0.5).collect();
+        let saved_raw: Vec<f32> = (0..n_raw).map(|i| -(i as f32)).collect();
+        {
+            let c = state.stream.carry.as_ref().unwrap();
+            htod(&gpu, &c.tile_state[0], &saved_state);
+            htod(&gpu, &c.raw_qkv[0], &saved_raw);
+        }
+        open_at(&mut state.stream, 70, 6);
+        let saved_meta = state.stream.meta.clone();
+
+        let mut snap = DeltaNetSnapshot::new_for(&mut gpu, &state).expect("alloc");
+        snap.save_from(&state, &mut gpu).expect("save");
+
+        // Dirty the live carry and cursors.
+        {
+            let c = state.stream.carry.as_ref().unwrap();
+            htod(&gpu, &c.tile_state[0], &vec![9.0; n_state]);
+            htod(&gpu, &c.raw_qkv[0], &vec![9.0; n_raw]);
+        }
+        for m in &mut state.stream.meta {
+            m.phase = GdnStreamPhase::Sealed;
+            m.position = 999;
+            m.pending_rows = 0;
+        }
+
+        // A different recipe must not move a byte.
+        let dirty_recipe = state.stream.recipe_id;
+        state.stream.recipe_id = 0xBAD;
+        assert!(snap.restore_to(&mut state, &mut gpu).is_err());
+        {
+            let c = state.stream.carry.as_ref().unwrap();
+            assert_eq!(dtoh(&gpu, &c.tile_state[0], n_state), vec![9.0; n_state]);
+        }
+        state.stream.recipe_id = dirty_recipe;
+
+        snap.restore_to(&mut state, &mut gpu).expect("restore");
+        {
+            let c = state.stream.carry.as_ref().unwrap();
+            assert_eq!(dtoh(&gpu, &c.tile_state[0], n_state), saved_state);
+            assert_eq!(dtoh(&gpu, &c.raw_qkv[0], n_raw), saved_raw);
+        }
+        for (got, want) in state.stream.meta.iter().zip(&saved_meta) {
+            assert_eq!(got.phase, GdnStreamPhase::Open);
+            assert_eq!(
+                (got.position, got.pending_rows),
+                (want.position, want.pending_rows)
+            );
+        }
+
+        snap.free_gpu(&mut gpu);
+        state.free_gpu(&mut gpu);
     }
 }
 

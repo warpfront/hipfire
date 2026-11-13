@@ -308,6 +308,12 @@ pub fn metadata_yaml(kernels: &[&Kernel], version: CodeObjectVersion) -> Result<
 fn check_kernels(kernels: &[&Kernel]) -> Result<(), String> {
     let first = kernels.first().ok_or("no kernel to emit")?;
     for (i, k) in kernels.iter().enumerate() {
+        for inst in &k.insts {
+            super::require_verified(k.arch, inst)?;
+            if let Some(reason) = inst.unsupported() {
+                return Err(reason);
+            }
+        }
         if k.arch != first.arch {
             return Err(format!(
                 "{}: arch {} differs from {}",
@@ -375,6 +381,7 @@ pub fn code_object(kernels: &[&Kernel], version: CodeObjectVersion) -> Result<Ve
     check_kernels(kernels)?;
     let arch = match kernels[0].arch {
         peacemaker_cdna::Arch::Gfx942 => Arch::Gfx942,
+        peacemaker_cdna::Arch::Gfx950 => return Err("gfx950 is decode-only".into()),
     };
     let sets = kernels
         .iter()
@@ -435,7 +442,7 @@ pub fn assembly(kernels: &[&Kernel], version: CodeObjectVersion) -> Result<Strin
                     }
                 }
                 _ => {
-                    let _ = writeln!(s, "\t{inst}");
+                    let _ = writeln!(s, "\t{}", inst.assembly());
                 }
             }
             at = starts.get(index + 1).copied().unwrap_or(k.words.len());

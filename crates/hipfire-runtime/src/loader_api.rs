@@ -12,7 +12,7 @@ use rdna_compute::Gpu;
 use std::path::{Path, PathBuf};
 
 /// A model on disk, before we know its arch. Carries either a parsed
-/// HFQ header or a directory (safetensors/ParoQuant — probed later).
+/// HFQ header or a directory (safetensors — probed later).
 pub enum ModelSource {
     Hfq(HfqFile),
     Dir(SafetensorsSource),
@@ -86,6 +86,7 @@ fn kernel_dtype_for_quant_type(quant_type: u8) -> rdna_compute::DType {
         53 => DType::MQ4G128V2,
         55 => DType::FP8E4M3B128,
         56 => DType::FP8E4M3PT,
+        57 => DType::HC8E4M3Row,
         _ => DType::Raw,
     }
 }
@@ -129,6 +130,14 @@ pub struct BatchLoadRequest {
     /// Requested step row budget (`serve.max_batch_tokens`); the staged
     /// budget is `max(row_budget, continuous_batch_size)`.
     pub row_budget: usize,
+    /// Native-MTP lanes of draft depth `k` are staged (`serve.batch_spec`):
+    /// the EP lane reservation charges the spec lane store (target ring,
+    /// head state, wide hidden) instead of the AR store. `None`: AR lanes.
+    pub spec_k: Option<usize>,
+    /// With `spec_k`: the spec lanes are staged with the copy lane armed, so
+    /// the reservation charges the widened verify rows, rings and head-lag
+    /// storage (`stage_lanes_with_copy`).
+    pub spec_copy: bool,
 }
 
 impl BatchLoadRequest {
@@ -184,7 +193,6 @@ pub struct LoadCtx<'a> {
     pub kv_backend: KvBackend,
     pub kv_adaptive_override: Option<&'a str>,
     pub state_quant_override: Option<&'a str>,
-    pub cask: &'a CaskConfig,
     pub pp: usize,
     /// Admission-only explicit pipeline layer counts (one entry per rank,
     /// summing to the model layer count). Populated solely from
@@ -299,128 +307,6 @@ pub struct SpecLoadCfg {
     pub dflash_block_auto: bool,
 }
 
-// lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
-/// CASK/TriAttention params forwarded by the CLI at load time.
-#[derive(Default)]
-pub struct CaskConfig {
-    pub sidecar: Option<String>,
-    pub cask_m_folding: bool,
-    /// One-way adaptive-KV -> plain TriAttention handoff position. Zero keeps
-    /// the legacy mutual exclusion between adaptive KV and eviction.
-    pub handoff_tokens: usize,
-    pub budget: usize,
-    pub beta: usize,
-    pub core_frac: f32,
-    pub fold_m: usize,
-}
-
-impl CaskConfig {
-    /// Resolve the bounded physical KV window used by CASK/TriAttention.
-    ///
-    /// Keep this next to the shared load contract so the architecture carrier
-    /// allocates KV with the exact same cap later used to size the eviction
-    /// context. A mismatch is especially dangerous for VMM: the virtual reserve
-    /// and mapped-prefix guards must agree with the eviction trigger before the
-    /// first device allocation.
-    pub fn physical_cap(&self, max_seq: usize) -> Result<usize, String> {
-        let override_cap = hipfire_config::developer_var("HIPFIRE_KV_PHYSICAL_CAP")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok());
-        self.physical_cap_with_override(max_seq, override_cap)
-    }
-
-    /// Pure resolution seam used by CPU tests. An explicit override is clamped
-    /// to the safe CASK window, preserving the historical environment-variable
-    /// behavior without mutating process-global state in tests.
-    pub fn physical_cap_with_override(
-        &self,
-        max_seq: usize,
-        override_cap: Option<usize>,
-    ) -> Result<usize, String> {
-        if self.sidecar.is_none() {
-            return Ok(max_seq);
-        }
-        // A staged adaptive cache reserves its K/V arenas at the adaptive
-        // floor for the full advertised context. It cannot use the ordinary
-        // eviction-bounded physical cap before the handoff has completed.
-        if self.handoff_tokens != 0 {
-            return Ok(max_seq);
-        }
-        let trigger = self
-            .budget
-            .checked_add(self.beta)
-            .ok_or_else(|| "CASK budget + beta overflowed".to_string())?;
-        let floor = trigger
-            .checked_add(4)
-            .ok_or_else(|| "CASK physical-cap safety margin overflowed".to_string())?;
-        if floor > max_seq {
-            return Err(format!(
-                "CASK requires max_seq >= budget + beta + 4 (got max_seq={max_seq}, budget={}, beta={})",
-                self.budget, self.beta
-            ));
-        }
-        let derived = trigger.saturating_add(256).min(max_seq);
-        Ok(override_cap.unwrap_or(derived).clamp(floor, max_seq))
-    }
-}
-
-#[cfg(test)]
-mod cask_config_tests {
-    use super::CaskConfig;
-
-    fn enabled() -> CaskConfig {
-        CaskConfig {
-            sidecar: Some("centers.bin".into()),
-            budget: 4096,
-            beta: 128,
-            ..CaskConfig::default()
-        }
-    }
-
-    #[test]
-    fn disabled_cask_keeps_full_physical_cap() {
-        assert_eq!(
-            CaskConfig::default()
-                .physical_cap_with_override(32_768, Some(1024))
-                .unwrap(),
-            32_768
-        );
-    }
-
-    #[test]
-    fn enabled_cask_derives_and_clamps_physical_cap() {
-        let cask = enabled();
-        assert_eq!(cask.physical_cap_with_override(32_768, None).unwrap(), 4480);
-        assert_eq!(
-            cask.physical_cap_with_override(32_768, Some(1)).unwrap(),
-            4228
-        );
-        assert_eq!(
-            cask.physical_cap_with_override(5000, Some(99_999)).unwrap(),
-            5000
-        );
-    }
-
-    #[test]
-    fn enabled_cask_rejects_an_impossible_window() {
-        let err = enabled()
-            .physical_cap_with_override(4200, None)
-            .unwrap_err();
-        assert!(err.contains("budget + beta + 4"), "{err}");
-    }
-
-    #[test]
-    fn staged_handoff_keeps_full_adaptive_physical_cap() {
-        let mut cask = enabled();
-        cask.handoff_tokens = 8192;
-        assert_eq!(
-            cask.physical_cap_with_override(32_768, Some(1024)).unwrap(),
-            32_768,
-            "adaptive floor reservation must not be clamped to the eviction window"
-        );
-    }
-}
-
 #[cfg(test)]
 mod ep_lane_reservation_request_tests {
     use super::BatchLoadRequest;
@@ -432,24 +318,32 @@ mod ep_lane_reservation_request_tests {
             vmm_batch: true,
             continuous_batch_size: 1,
             row_budget: 4096,
+            spec_k: None,
+            spec_copy: false,
         };
         assert_eq!(one.lanes(), None);
         let no_vmm = BatchLoadRequest {
             vmm_batch: false,
             continuous_batch_size: 8,
             row_budget: 4096,
+            spec_k: None,
+            spec_copy: false,
         };
         assert_eq!(no_vmm.lanes(), None);
         let zero = BatchLoadRequest {
             vmm_batch: true,
             continuous_batch_size: 0,
             row_budget: 0,
+            spec_k: None,
+            spec_copy: false,
         };
         assert_eq!(zero.lanes(), None);
         let on = BatchLoadRequest {
             vmm_batch: true,
             continuous_batch_size: 4,
             row_budget: 0,
+            spec_k: None,
+            spec_copy: false,
         };
         assert_eq!(on.lanes(), Some(4));
     }

@@ -130,7 +130,7 @@ run_once() {
     # HIPFIRE_DPM_WARMUP_SECS=10 forces DPM stabilization BEFORE prefill —
     # the bench supports this since the issue #65 work; without it the
     # first ~50 ms of prefill measures clock-ramp not steady-state.
-    out=$(HIPFIRE_KV_MODE=asym3 HIPFIRE_GRAPH=1 HIPFIRE_DPM_WARMUP_SECS=10 \
+    out=$(HIPFIRE_KV_MODE=fwht3 HIPFIRE_GRAPH=1 HIPFIRE_DPM_WARMUP_SECS=10 \
         "$EXE" "$model" --prefill "$pp" --prefill-runs 3 --warmup 5 --gen "$GEN" 2>&1 \
         | grep '^SUMMARY' | tail -1)
     local p d

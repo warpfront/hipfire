@@ -5,7 +5,7 @@ acceptance, tokens per step, or window cost regress beyond pre-registered noise.
 It compares hipfire EP2/PP2 MTP against another engine's `/stats draft_positions`
 on **identical prompt bytes**, and it is the durability gate for MTP lanes.
 
-- `fixture.json`: six prompts (story, code, prose_long, agentic, math,
+- `fixture.json`: six single prompts plus the W2 mix (eight different prompts, stream i sends entry i % 8; `w2mix-C4/C8`, un-gated until a lane baseline exists) (story, code, prose_long, agentic, math,
   multilingual), md5 + size pinned, 28 cells (`<prompt>-C<n>-<t1|greedy>`).
   `story` and `code` are the core pair at C1/C4/C8; the four breadth classes run
   at C1/C8. A pass needs **every** gated cell of **every** class: acceptance
@@ -26,6 +26,9 @@ Definitions match MtpTrain's `a_d` and the `/stats draft_positions` counters:
 python3 scripts/check-mtp-parity-ratchet.py fixture                 # prompt bytes
 python3 scripts/check-mtp-parity-ratchet.py extract-trace LOG --cell story-C1-t1 --build SHA > rec.json
 python3 scripts/check-mtp-parity-ratchet.py from-radiance cell.json > rec.json
+python3 scripts/mtp-parity-drive.py --base http://127.0.0.1:PORT --out cells/ --cells c1 --rep 0   # drive a running serve
+python3 scripts/check-mtp-parity-ratchet.py from-driver cells/story-C1-t1-r0.json --trace serve.log > rec.json   # singleton (HIPFIRE_MTP_TRACE=1)
+python3 scripts/check-mtp-parity-ratchet.py from-driver cells/story-C4-t1-r0.json > rec.json   # lanes: /stats draft_positions delta
 python3 scripts/check-mtp-parity-ratchet.py register recs/          # >= 3 fresh-process reps per cell
 python3 scripts/check-mtp-parity-ratchet.py check recs/             # exit 1 on regression
 python3 scripts/check-mtp-parity-ratchet.py guard --base origin/beta
@@ -39,7 +42,17 @@ so with a `RATCHET-RAISE: <cell|rule> <reason>` line in its message.
 (a prompt that ends early cannot carry a baseline). Single-stream cells are the noisy ones: on the other engine's
 fixture run, `prose_long-C1-t1` measured cv 0.16 at 3 reps, so C1 cells may need 5 reps.
 
+Cells at C > 1 are `gate: false` (with a `pending` note) until native-MTP lanes are on beta: only the singleton
+route has a per-position count today. `check` skips un-gated cells without a baseline and enabling a gate is always allowed.
+
 A hipfire baseline on this fixture does not exist yet. The card job that
 produces records is `HIPFIRE_MTP_TRACE=1` serve runs (singleton) or, for EP2/PP2
 lanes, per-depth lane counters that the daemon does not export yet; see
 `docs/perf-checkpoints/2026-11-01-mtp-parity-ratchet-registration.md`.
+
+`mtp-parity-drive.py` writes, per cell, a `summary` that reports TTFT and steady decode separately from the end-to-end figure:
+`ttft_ms` (client time to the first content chunk: p50/p95/max), `reported_tok_s` (all completion tokens / cell wall, what a loadgen
+timing the whole request sees, prefill and straggler tail included) and `steady_tok_s` (sum over streams of tokens after the first /
+decode seconds after the first token). The ratchet carries `steady_tok_s` and `ttft_ms_p50` into the record and checks them for any
+baseline that was registered with them (`steady_floor_rel` 5%, `ttft_floor_rel` 10%, or 3x the cell's own cv).
+

@@ -58,7 +58,9 @@ use crate::moe::{
     RaonDenseScratch, RaonMoeDims, RaonMoeLayerRefs, RaonMoeScratch,
 };
 use crate::precision::{RaonPrecisionSite, RaonSiteTiers};
-use crate::projection::{prepare_a8, project, project_prepared, OutRound};
+use crate::projection::{
+    is_mq8, prepare_a8, project, project_prepared, project_shared_f16, share_f16_x, OutRound,
+};
 use crate::rda::{
     rda_forward_rows_taped, RaonRdaLayer, RdaGeometry, RdaLayerState, RdaProjected, RdaScratch,
     RdaTape,
@@ -790,9 +792,22 @@ fn rda_mixer(
     project_prepared(gpu, &w.k_proj, x, k_raw, rows, b, qkvg, prep)?;
     project_prepared(gpu, &w.v_proj, x, v_raw, rows, b, qkvg, prep)?;
     project_prepared(gpu, &w.g_proj, x, &scratch.rda_z, rows, b, qkvg, prep)?;
-    project(gpu, &w.b_proj, x, &scratch.rda_b, rows, b, f16)?;
-    project(gpu, &w.rda_w_proj, x, &scratch.rda_delta, rows, b, f16)?;
-    project(gpu, &w.f_a_proj, x, &scratch.rda_f_lat, rows, b, f16)?;
+    // b / w / f_a read the same plane through the F16 WMMA GEMM: convert it to F16 once and hand
+    // the plane to all three (each launcher would convert it for itself), when all three take that
+    // route; `None` leaves every projection on its ordinary route.
+    // `scratch.x_rot` is never read by the Raon forward: its leading `rows * hidden` words hold the F16 plane.
+    let x16_plane = scratch.x_rot.as_f16_view(rows * w.b_proj.k);
+    let x16 = share_f16_x(
+        gpu,
+        x,
+        x16_plane.as_ref(),
+        rows,
+        f16,
+        &[&w.b_proj, &w.rda_w_proj, &w.f_a_proj],
+    )?;
+    project_shared_f16(gpu, &w.b_proj, x, x16, &scratch.rda_b, rows, b, f16)?;
+    project_shared_f16(gpu, &w.rda_w_proj, x, x16, &scratch.rda_delta, rows, b, f16)?;
+    project_shared_f16(gpu, &w.f_a_proj, x, x16, &scratch.rda_f_lat, rows, b, f16)?;
     project(
         gpu,
         &w.f_b_proj,
@@ -963,8 +978,9 @@ fn mla_mixer(
     let q_tier = work.site_tiers.get(RaonPrecisionSite::MlaQ);
     let kv_tier = work.site_tiers.get(RaonPrecisionSite::MlaKv);
     let go_tier = work.site_tiers.get(RaonPrecisionSite::MlaGo);
-    // q_a / kv_a / g read the same `x`: quantize it once for whichever of them runs A8.
-    let prep = if [q_tier, kv_tier, go_tier].contains(&PrefillActTier::A8) {
+    // q_a / kv_a / g read the same `x`: quantize it once for whichever of them runs A8, or for the
+    // MQ8G256 weights (whose rotated int8 route does not depend on the tier).
+    let prep = if is_mq8(&w.q_a_proj) || [q_tier, kv_tier, go_tier].contains(&PrefillActTier::A8) {
         prepare_a8(gpu, &w.q_a_proj, x, rows, PrefillActTier::A8)?
     } else {
         None
@@ -1268,7 +1284,8 @@ fn stage_tokens(
         }
         bytes.extend_from_slice(&t.to_le_bytes());
     }
-    gpu.memcpy_htod_auto(&scratch.token_ids.buf, &bytes)
+    // Ordered on the decode stream when there is one (no null-stream hop); blocking otherwise.
+    gpu.htod_stream_ordered(&scratch.token_ids.buf, 0, &bytes)
         .map_err(|e| format!("raon1_mini: upload token ids: {e:?}"))
 }
 

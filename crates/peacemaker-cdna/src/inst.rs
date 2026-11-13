@@ -21,11 +21,12 @@ use crate::enc::{
     mubuf::Mubuf,
     smem::Smem,
     sop::{Sop1, Sop2, Sopc, Sopk, Sopp},
-    vop::{Vop1, Vop2, Vopc},
+    vop::{Vop1, Vop2, Vop2K, Vop2KOp, Vopc},
     vop3::Vop3,
     vop3p::{Mai, Vop3p},
 };
 use crate::operand::Src;
+use crate::xml_inst::XmlInst;
 use crate::Result;
 use std::fmt;
 
@@ -39,6 +40,7 @@ pub enum Inst {
     Smem(Smem),
     Vop1(Vop1),
     Vop2(Vop2),
+    Vop2K(Vop2K),
     Vopc(Vopc),
     Vop3(Vop3),
     Vop3p(Vop3p),
@@ -46,6 +48,8 @@ pub enum Inst {
     Ds(Ds),
     Flat(Flat),
     Mubuf(Mubuf),
+    /// An instruction only the generated tables describe ([`XmlInst`]).
+    Xml(XmlInst),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -218,6 +222,26 @@ pub enum MemKind {
     /// data under LGKM_CNT.
     DsXlane,
     SmemLoad,
+    /// `s_store_*` / `s_scratch_store_*`: counts on LGKM_CNT, returns nothing.
+    SmemStore,
+    /// `s_atomic_*` / `s_buffer_atomic_*` without return (`GLC` = 0).
+    SmemAtomic,
+    /// `s_atomic_*` / `s_buffer_atomic_*` returning the pre-op value (`GLC` = 1).
+    SmemAtomicRtn,
+}
+
+/// Whether the generated-table row of an instruction is confirmed by the
+/// LLVM cross-check ([`Inst::verification`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RowStatus {
+    /// Cross-checked: the row assembles and disassembles identically in
+    /// `llvm-mc`.
+    Verified,
+    /// Recognized but unconfirmed: the reason. Never emit, never seal.
+    Unverified(&'static str),
+    /// No XML row identifies the encoding (the generated decode refused the
+    /// words, or the instruction does not encode): the reason.
+    Unknown(String),
 }
 
 impl Inst {
@@ -230,7 +254,7 @@ impl Inst {
             Self::Sopp(_) => Format::Sopp,
             Self::Smem(_) => Format::Smem,
             Self::Vop1(_) => Format::Vop1,
-            Self::Vop2(_) => Format::Vop2,
+            Self::Vop2(_) | Self::Vop2K(_) => Format::Vop2,
             Self::Vopc(_) => Format::Vopc,
             Self::Vop3(_) => Format::Vop3,
             Self::Vop3p(_) => Format::Vop3p,
@@ -238,11 +262,55 @@ impl Inst {
             Self::Ds(_) => Format::Ds,
             Self::Flat(_) => Format::Flat,
             Self::Mubuf(_) => Format::Mubuf,
+            Self::Xml(i) => i.format(),
+        }
+    }
+
+    /// The generated instruction, if this is one.
+    pub fn xml(&self) -> Option<&XmlInst> {
+        match self {
+            Self::Xml(x) => Some(x),
+            _ => None,
+        }
+    }
+
+    /// The by-name refusal for an instruction without a hand-written model
+    /// (every generated instruction); `None` for the typed instructions.
+    pub fn unsupported(&self) -> Option<String> {
+        self.xml().map(XmlInst::unsupported)
+    }
+
+    /// Whether the XML row this instruction encodes to is confirmed by the
+    /// LLVM cross-check. Typed instructions are encoded and matched against
+    /// the generated tables; a generated one reports its own row. A row the
+    /// cross-check could not confirm decodes and encodes through the typed
+    /// model unchanged, but emission (the builder) and seals must refuse it.
+    pub fn verification(&self, arch: Arch) -> RowStatus {
+        let status = |row: Result<(), &'static str>| match row {
+            Ok(()) => RowStatus::Verified,
+            Err(why) => RowStatus::Unverified(why),
+        };
+        if let Self::Xml(x) = self {
+            return status(x.verification());
+        }
+        let words = match self.words(arch) {
+            Ok(w) => w,
+            Err(e) => return RowStatus::Unknown(e),
+        };
+        match crate::xml::decode(crate::xml_inst::isa(arch), &words) {
+            Ok((d, _)) => status(XmlInst::verification_of(&d)),
+            Err(e) => RowStatus::Unknown(format!("no XML row for the encoding: {e}")),
         }
     }
 
     /// Append the instruction's dwords (including a literal) to `out`.
     pub fn encode(&self, arch: Arch, out: &mut Vec<u32>) -> Result<()> {
+        if !arch.encodes() {
+            return Err(format!(
+                "{} is decode-only: instructions cannot be encoded for it",
+                arch.name()
+            ));
+        }
         match self {
             Self::Sop1(i) => i.encode(arch, out),
             Self::Sop2(i) => i.encode(arch, out),
@@ -252,6 +320,7 @@ impl Inst {
             Self::Smem(i) => i.encode(arch, out),
             Self::Vop1(i) => i.encode(arch, out),
             Self::Vop2(i) => i.encode(arch, out),
+            Self::Vop2K(i) => i.encode(arch, out),
             Self::Vopc(i) => i.encode(arch, out),
             Self::Vop3(i) => i.encode(arch, out),
             Self::Vop3p(i) => i.encode(arch, out),
@@ -259,6 +328,7 @@ impl Inst {
             Self::Ds(i) => i.encode(arch, out),
             Self::Flat(i) => i.encode(arch, out),
             Self::Mubuf(i) => i.encode(arch, out),
+            Self::Xml(i) => i.encode(arch, out),
         }
     }
 
@@ -272,7 +342,33 @@ impl Inst {
     /// dword count.
     pub fn decode(arch: Arch, words: &[u32]) -> Result<(Self, usize)> {
         let first = *words.first().ok_or("decode past the end of the code")?;
-        let format = classify(first).ok_or_else(|| format!("unknown encoding {first:#010x}"))?;
+        // gfx950 has no typed instructions: the generated tables decode it.
+        if !arch.encodes() {
+            return Self::decode_xml(arch, words, None);
+        }
+        let Some(format) = classify(first) else {
+            return Self::decode_xml(arch, words, Some(format!("unknown encoding {first:#010x}")));
+        };
+        match Self::decode_typed(arch, words, format) {
+            Ok(decoded) => Ok(decoded),
+            // A generated decode preserves forms the typed model cannot
+            // represent, without granting them execution or seal semantics.
+            Err(e) => Self::decode_xml(arch, words, Some(e)),
+        }
+    }
+
+    fn decode_xml(arch: Arch, words: &[u32], typed_error: Option<String>) -> Result<(Self, usize)> {
+        match XmlInst::decode(arch, words) {
+            Ok((x, n)) => Ok((Self::Xml(x), n)),
+            Err(e) => Err(match typed_error {
+                Some(t) => format!("{t}; generated tables: {e}"),
+                None => e,
+            }),
+        }
+    }
+
+    fn decode_typed(arch: Arch, words: &[u32], format: Format) -> Result<(Self, usize)> {
+        let first = words[0];
         Ok(match format {
             Format::Sop1 => {
                 let (i, n) = Sop1::decode(arch, words)?;
@@ -303,8 +399,13 @@ impl Inst {
                 (Self::Vop1(i), n)
             }
             Format::Vop2 => {
-                let (i, n) = Vop2::decode(arch, words)?;
-                (Self::Vop2(i), n)
+                if Vop2KOp::from_opcode(arch, (first >> 25) as u8).is_some() {
+                    let (i, n) = Vop2K::decode(arch, words)?;
+                    (Self::Vop2K(i), n)
+                } else {
+                    let (i, n) = Vop2::decode(arch, words)?;
+                    (Self::Vop2(i), n)
+                }
             }
             Format::Vopc => {
                 let (i, n) = Vopc::decode(arch, words)?;
@@ -352,6 +453,7 @@ impl Inst {
             Self::Smem(i) => i.footprint(),
             Self::Vop1(i) => i.footprint(),
             Self::Vop2(i) => i.footprint(),
+            Self::Vop2K(i) => i.footprint(),
             Self::Vopc(i) => i.footprint(),
             Self::Vop3(i) => i.footprint(),
             Self::Vop3p(i) => i.footprint(),
@@ -359,6 +461,7 @@ impl Inst {
             Self::Ds(i) => i.footprint(),
             Self::Flat(i) => i.footprint(),
             Self::Mubuf(i) => i.footprint(),
+            Self::Xml(i) => i.footprint(),
         }
     }
 
@@ -368,6 +471,7 @@ impl Inst {
             Self::Ds(i) => Some(i.mem_kind()),
             Self::Flat(i) => Some(i.mem_kind()),
             Self::Mubuf(i) => Some(i.mem_kind()),
+            Self::Xml(i) => i.memory(),
             _ => None,
         }
     }
@@ -375,10 +479,29 @@ impl Inst {
     /// `s_branch` / `s_cbranch_*`: the signed dword offset from the next
     /// instruction (`SIMM16`, CDNA3 ISA §4.2 p.18: PC = PC + 4 + SIMM16 * 4).
     pub fn branch_offset(&self) -> Option<i16> {
-        if let Self::Sopp(p) = self {
-            p.branch_offset()
-        } else {
-            None
+        match self {
+            Self::Sopp(p) => p.branch_offset(),
+            Self::Xml(x) => x.branch_offset(),
+            _ => None,
+        }
+    }
+    /// Lossless assembler spelling. Unlike LLVM's display spelling, this
+    /// preserves the VOP3 NOP form and every DS swizzle offset bit.
+    pub fn assembly(&self) -> impl fmt::Display + '_ {
+        Assembly(self)
+    }
+}
+
+struct Assembly<'a>(&'a Inst);
+
+impl fmt::Display for Assembly<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Inst::Vop3(i) if i.op == crate::enc::vop3::Vop3Op::V1(crate::enc::vop::Vop1Op::Nop) => {
+                f.write_str("v_nop_e64")
+            }
+            Inst::Ds(i) => i.fmt_assembly(f),
+            inst => fmt::Display::fmt(inst, f),
         }
     }
 }
@@ -394,6 +517,7 @@ impl fmt::Display for Inst {
             Self::Smem(i) => i.fmt(f),
             Self::Vop1(i) => i.fmt(f),
             Self::Vop2(i) => i.fmt(f),
+            Self::Vop2K(i) => i.fmt(f),
             Self::Vopc(i) => i.fmt(f),
             Self::Vop3(i) => i.fmt(f),
             Self::Vop3p(i) => i.fmt(f),
@@ -401,6 +525,7 @@ impl fmt::Display for Inst {
             Self::Ds(i) => i.fmt(f),
             Self::Flat(i) => i.fmt(f),
             Self::Mubuf(i) => i.fmt(f),
+            Self::Xml(i) => fmt::Display::fmt(i, f),
         }
     }
 }

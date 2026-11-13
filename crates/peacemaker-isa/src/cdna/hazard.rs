@@ -375,6 +375,10 @@ fn info(inst: &Inst) -> Info {
             srcs.extend([v.src0, v.src1]);
             ext(&mut i, v.ext, true)
         }
+        Inst::Vop2K(v) => {
+            i.valu = true;
+            srcs.extend([v.src0, v.src1]);
+        }
         Inst::Vopc(v) => {
             i.valu = true;
             srcs.extend([v.src0, v.src1]);
@@ -477,6 +481,8 @@ fn info(inst: &Inst) -> Info {
                 i.wide_store = RegSpan::of(m.vdata, n).map(|s| (s, sgpr_soffset));
             }
         }
+        // Public entry points reject these before building hazard information.
+        Inst::Xml(_) => {}
     }
     i.explicit_exec = srcs.iter().any(|s| matches!(s, Src::ExecLo | Src::ExecHi));
     i.vccz_execz = srcs.iter().any(|s| matches!(s, Src::Vccz | Src::Execz));
@@ -833,10 +839,19 @@ fn nop(waits: u32) -> Inst {
 /// Insert the required wait states; `HazardProof::pc_index` indexes the
 /// returned items.
 pub fn resolve(arch: Arch, items: Vec<Item>) -> Result<(Vec<Item>, Vec<HazardProof>), String> {
+    let n = items.len();
+    for item in &items {
+        if let Item::Inst(inst) = item {
+            super::require_verified(arch, inst)?;
+            if let Some(reason) = inst.unsupported() {
+                return Err(reason);
+            }
+        }
+    }
     match arch {
         Arch::Gfx942 => {}
+        Arch::Gfx950 => return Err("gfx950 is decode-only; no hazard model".into()),
     }
-    let n = items.len();
     let mut labels: HashMap<&str, usize> = HashMap::new();
     for (i, item) in items.iter().enumerate() {
         if let Item::Label(l) = item {
@@ -958,6 +973,21 @@ pub fn resolve(arch: Arch, items: Vec<Item>) -> Result<(Vec<Item>, Vec<HazardPro
 /// as decoded), as `"index: rule"` strings; empty when hazard-free.
 pub fn check(arch: Arch, insts: &[Inst]) -> Vec<String> {
     let mut bad = Vec::new();
+    for (i, inst) in insts.iter().enumerate() {
+        if let Err(reason) = super::require_verified(arch, inst) {
+            bad.push(format!("{i}: {reason}"));
+            continue;
+        }
+        if let Some(reason) = inst.unsupported() {
+            bad.push(format!("{i}: {reason}"));
+        }
+    }
+    if !bad.is_empty() {
+        return bad;
+    }
+    if arch == Arch::Gfx950 {
+        return vec!["gfx950 is decode-only; no hazard model".into()];
+    }
     let n = insts.len();
     let mut offset = Vec::with_capacity(n + 1);
     let mut at = 0usize;

@@ -15,7 +15,7 @@
 //!
 //! Usage:
 //!   oracle_xcheck <model.hfq> --prompt-file <txt> --n-pos N --out <logits.f32>
-//!   env: HIPFIRE_GEN_STEPS (default 16), HIPFIRE_KV (default f32; f32|q8|asym3)
+//!   env: HIPFIRE_GEN_STEPS (default 16), HIPFIRE_KV (default f32; f32|q8)
 
 #[cfg(not(feature = "deltanet"))]
 fn main() {
@@ -134,14 +134,6 @@ fn main() {
         )
         .unwrap(),
         "q8" => KvCache::new_gpu_q8(
-            &mut gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_max,
-        )
-        .unwrap(),
-        "asym3" => KvCache::new_gpu_asym3(
             &mut gpu,
             config.n_layers,
             config.n_kv_heads,

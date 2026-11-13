@@ -566,8 +566,6 @@ def remote_launch_spec(manifest, route, campaign_root, args):
         "HIPFIRE_KV_MODE": mode["kv"],
         "HIPFIRE_DFLASH_MODE": mode.get("dflash", "off"),
     }
-    if "dflash_ctx_cap" in mode:
-        environment["HIPFIRE_DFLASH_CTX_CAP"] = str(mode["dflash_ctx_cap"])
     if mode.get("mtp") == "on":
         environment.update(
             HIPFIRE_QWEN_MTP="1",

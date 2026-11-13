@@ -496,6 +496,23 @@ impl Drop for CacheWarmerGuard {
     }
 }
 
+/// Message for HFQ quant-type ids that were removed from the format. Ids 28/29
+/// (formerly PARO4G128 / PARO4G128T) stay reserved and are never reused.
+pub const REMOVED_QUANT_TYPE_MSG: &str = "ParoQuant was removed in 0.5.0 (qt 28/29: PARO4G128/PARO4G128T); re-quantize the model with a supported format such as MQ4 (hipfire quantize) or pull a non-Paro registry model";
+
+/// Refusal for a safetensors model directory on a route whose only directory
+/// loader was the ParoQuant one.
+pub const REMOVED_SAFETENSORS_DIR_MSG: &str = "ParoQuant safetensors directories were removed in 0.5.0; this model directory cannot be loaded — convert it to an HFQ file with `hipfire quantize` (e.g. MQ4) or pull a non-Paro registry model";
+
+/// `Some(message)` when `qt` is a quant-type id removed from the format (28/29),
+/// so every decoder that reads qt numbers can refuse with the same text.
+pub fn removed_quant_type_error(qt: u32) -> Option<&'static str> {
+    match qt {
+        28 | 29 => Some(REMOVED_QUANT_TYPE_MSG),
+        _ => None,
+    }
+}
+
 #[derive(Clone)]
 pub struct HfqTensorInfo {
     pub name: String,
@@ -1261,6 +1278,12 @@ impl HfqFile {
             pos += name_len;
             need(pos + 2, "a tensor quant type and dimension count")?;
             let quant_type = mmap[pos];
+            if let Some(msg) = removed_quant_type_error(u32::from(quant_type)) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("HfqFile: tensor '{name}': {msg}"),
+                ));
+            }
             pos += 1;
             let n_dims = mmap[pos] as usize;
             pos += 1;
@@ -2280,6 +2303,7 @@ fn quant_type_to_dtype(quant_type: u8) -> &'static str {
         54 => "I64",
         55 => "FP8E4M3B128",
         56 => "FP8E4M3PT",
+        57 => "HC8E4M3Row",
         131 => "MQ3I4G128R256",
         132 => "MQ3I4G128R128",
         133 => "MQ2I4G128R256",
@@ -2422,8 +2446,8 @@ struct RawLlamaConfig {
     rms_norm_eps: f32,
     #[serde(default = "default_llama_max_pos")]
     max_position_embeddings: usize,
-    #[serde(default = "default_llama_rope")]
-    rope_theta: f32,
+    #[serde(default)]
+    rope_theta: Option<f32>,
     // Real safetensors configs ship `bos_token_id`/`eos_token_id` as either a
     // scalar (most LLaMA/Mistral) or an array (Llama-3.1: `[128001, 128009]`).
     // Keep them as raw Values and resolve to the FIRST element in finalize
@@ -2487,11 +2511,66 @@ fn llama_config_from_value(
         head_dim,
         norm_eps: raw.rms_norm_eps,
         max_seq_len: raw.max_position_embeddings,
-        rope_freq_base: raw.rope_theta,
+        // transformers >= 5 nests theta inside `rope_parameters` and prefers it
+        // over a top-level key (`convert_rope_params_to_dict`).
+        rope_freq_base: config["rope_parameters"]["rope_theta"]
+            .as_f64()
+            .map(|t| t as f32)
+            .or(raw.rope_theta)
+            .unwrap_or_else(default_llama_rope),
+        rope_llama3: llama3_rope(config)?,
         bos_token: first_token_or(raw.bos_token_id.as_ref(), 1),
         eos_token: first_token_or(raw.eos_token_id.as_ref(), 2),
         has_qk_norm,
     })
+}
+
+/// The checkpoint's `rope_parameters` / `rope_scaling` as the LLaMA carrier's
+/// RoPE: plain, or the `llama3` remap (HF `_compute_llama3_parameters`). Other
+/// `rope_type`s refuse rather than run unscaled.
+fn llama3_rope(config: &serde_json::Value) -> Result<rdna_compute::rope::RopeLlama3, String> {
+    use rdna_compute::rope::RopeLlama3;
+    let Some(p) = ["rope_parameters", "rope_scaling"]
+        .iter()
+        .find_map(|key| config.get(*key).filter(|v| v.is_object()))
+    else {
+        return Ok(RopeLlama3::OFF);
+    };
+    let kind = p
+        .get("rope_type")
+        .or_else(|| p.get("type"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("default");
+    match kind {
+        "default" => return Ok(RopeLlama3::OFF),
+        "llama3" => {}
+        other => {
+            return Err(format!(
+                "llama: unsupported rope_type {other:?} (supported: default, llama3)"
+            ))
+        }
+    }
+    let float = |key: &str| {
+        p.get(key)
+            .and_then(serde_json::Value::as_f64)
+            .ok_or_else(|| format!("llama: llama3 rope_parameters missing {key}"))
+    };
+    let (factor, low, high) = (
+        float("factor")?,
+        float("low_freq_factor")?,
+        float("high_freq_factor")?,
+    );
+    let original = p
+        .get("original_max_position_embeddings")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or("llama: llama3 rope_parameters missing original_max_position_embeddings")?;
+    if !(factor.is_finite() && factor >= 1.0 && high > low) {
+        return Err(format!(
+            "llama: llama3 rope needs factor >= 1 and high_freq_factor > low_freq_factor \
+             (factor {factor}, low {low}, high {high})"
+        ));
+    }
+    Ok(RopeLlama3::new(factor, low, high, original as usize))
 }
 
 pub fn config_from_hfq(hfq: &HfqFile) -> Result<LlamaConfig, String> {
@@ -2681,7 +2760,6 @@ pub(crate) fn load_weight_tensor(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -2767,7 +2845,6 @@ pub fn load_weight_tensor_pread(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -3005,13 +3082,6 @@ struct PendingLlamaLayer {
 impl PendingLlamaLayer {
     fn cleanup<B: WeightBackend>(&mut self, b: &mut B) {
         fn free_weight<B: WeightBackend>(b: &mut B, weight: WeightTensor) {
-            if let Some(paro) = weight.paro {
-                if !paro.is_alias {
-                    b.free_tensor(paro.pairs);
-                    b.free_tensor(paro.theta);
-                    b.free_tensor(paro.channel_scales);
-                }
-            }
             if let Some(awq) = weight.awq_scale {
                 b.free_tensor(awq);
             }
@@ -3134,7 +3204,7 @@ pub fn load_layer<B: WeightBackend>(
     })
 }
 
-// ─── ParoQuant safetensors loading (LLaMA / Qwen3 arch) ────────────────────
+// ─── Safetensors-directory config parsing (LLaMA / Qwen3 arch) ─────────────
 
 /// Parse a LlamaConfig from a SafetensorsSource's metadata JSON.
 /// The metadata JSON has structure: `{ "config": { ...config.json... } }`.
@@ -3152,204 +3222,6 @@ pub fn config_from_safetensors_llama(
     llama_config_from_value(config, has_qk_norm)
 }
 
-/// Load a ParoQuant-quantized weight tensor from a safetensors source.
-/// The shared Paro loader owns every upload until all rotation metadata has
-/// succeeded, so a missing sidecar or failed upload cannot leak a partial
-/// output head.
-fn load_paroquant_weight_from_source(
-    source: &dyn crate::model_source::ModelSource,
-    gpu: &mut Gpu,
-    tensor_prefix: &str, // e.g. "model.layers.0.mlp.gate_proj"
-    out_dim: usize,      // M
-    in_dim: usize,       // K
-    group_size: u32,
-    krot: u8,
-) -> HipResult<WeightTensor> {
-    crate::paro::load_paro_weight(
-        source,
-        gpu,
-        tensor_prefix,
-        out_dim,
-        in_dim,
-        group_size,
-        krot,
-    )
-}
-
-/// Load an FP16 weight tensor from safetensors as F32 on GPU.
-fn load_fp16_weight_tensor_from_source(
-    source: &dyn crate::model_source::ModelSource,
-    gpu: &Gpu,
-    name: &str,
-    m: usize,
-    k: usize,
-) -> HipResult<WeightTensor> {
-    let (info, data) = source
-        .tensor_data(name)
-        .ok_or_else(|| HipError::new(0, &format!("PARO tensor not found: {name}")))?;
-    // Handles F16/BF16/F32 (raw HF checkpoints — incl. lm_head — are commonly BF16).
-    let f32_data = crate::safetensors_source::source_bytes_to_f32_vec(&info.dtype, data);
-    let bytes: &[u8] =
-        unsafe { std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4) };
-    let buf = gpu.upload_raw(bytes, &[m, k])?;
-    Ok(WeightTensor {
-        buf,
-        gpu_dtype: DType::F32,
-        m,
-        k,
-        row_stride: 0,
-        paro: None,
-        awq_scale: None,
-        lloyd_lut_e4m3: None,
-        lloyd_lut_f16: None,
-        lloyd_lut_c16: None,
-    })
-}
-
-/// Load an F16 norm weight as F32 on GPU (raw, no +1.0 bias — HF convention).
-fn paro_load_llama_norm_raw(
-    source: &dyn crate::model_source::ModelSource,
-    gpu: &mut Gpu,
-    name: &str, // e.g. "layers.0.input_layernorm.weight"
-    shape: &[usize],
-) -> HipResult<GpuTensor> {
-    let full = format!("model.{name}");
-    let (info, data) = source
-        .tensor_data(&full)
-        .ok_or_else(|| HipError::new(0, &format!("PARO tensor not found: {full}")))?;
-    // Handles F16/BF16/F32 (raw HF checkpoints — incl. the final norm — are commonly BF16).
-    let v = crate::safetensors_source::source_bytes_to_f32_vec(&info.dtype, data);
-    gpu.upload_f32(&v, shape)
-}
-
-/// Load LLaMA/Qwen3 weights from a safetensors model — ParoQuant/AWQ *or* raw
-/// unquantized FP. ParoQuant is a transparent layer: [`ParoBackend::proj`] tries
-/// the `.qweight` augmentors first and falls back to the raw `.weight`
-/// (F16/BF16/F32) when no quant sidecar is present, so a checkpoint with no
-/// `quantization_config` loads as plain FP. The `group_size`/`krot` below are
-/// only consumed by the quant path; raw checkpoints never read them.
-///
-/// Tensor naming convention: `model.layers.{i}.self_attn.q_proj.{qweight,...}`
-/// (no `model.language_model.` prefix — that's Qwen3.5-specific).
-pub fn load_weights_paroquant_llama(
-    source: &dyn crate::model_source::ModelSource,
-    config: &LlamaConfig,
-    gpu: &mut Gpu,
-) -> HipResult<LlamaWeights> {
-    // Raw (unquantized) checkpoints have no quantization_config; default the
-    // quant params (unused on the raw fallback path).
-    let (gs, kr) = source
-        .quant_config()
-        .map(|qc| (qc.group_size, qc.krot))
-        .unwrap_or((128, 0));
-
-    // Embedding
-    eprintln!("  loading token_embd (LLaMA/Qwen3 safetensors)...");
-    let embd_name = "model.embed_tokens.weight";
-    let (embd_info, embd_data) = source
-        .tensor_data(embd_name)
-        .ok_or_else(|| HipError::new(0, "PARO tensor not found: embed_tokens not found"))?;
-    // Handles F16/BF16/F32 (raw HF checkpoints are commonly BF16).
-    let f32_embd = crate::safetensors_source::source_bytes_to_f32_vec(&embd_info.dtype, embd_data);
-    let token_embd = gpu.upload_f32(&f32_embd, &[config.vocab_size, config.dim])?;
-    let embd_fmt = EmbeddingFormat::F32;
-
-    // Output norm
-    eprintln!("  loading output_norm...");
-    let output_norm = paro_load_llama_norm_raw(source, gpu, "norm.weight", &[config.dim])?;
-
-    // Output / lm_head (tied or separate) — alias the F32 embd buffer when tied.
-    let has_separate = source.tensor_info("lm_head.weight").is_some();
-    let (output, lm_head_aliases_embd) = resolve_lm_head(
-        gpu,
-        has_separate,
-        true, // load_weights_paroquant_llama is single-GPU only
-        &token_embd,
-        embd_fmt,
-        config.vocab_size,
-        config.dim,
-        |gpu| {
-            let lm_prefix = "lm_head";
-            if source
-                .tensor_info(&format!("{lm_prefix}.qweight"))
-                .is_some()
-            {
-                load_paroquant_weight_from_source(
-                    source,
-                    gpu,
-                    lm_prefix,
-                    config.vocab_size,
-                    config.dim,
-                    gs,
-                    kr,
-                )
-            } else {
-                load_fp16_weight_tensor_from_source(
-                    source,
-                    gpu,
-                    &format!("{lm_prefix}.weight"),
-                    config.vocab_size,
-                    config.dim,
-                )
-            }
-        },
-        |gpu| {
-            // Tied lm_head fallback: re-read the embedding as F32. Handles
-            // F16/BF16/F32 (raw HF checkpoints are commonly BF16) rather than
-            // the F16-only `reupload_f16_as_f32` (correct only for HFQ embeds).
-            let (info, td) = source.tensor_data(embd_name).ok_or_else(|| {
-                HipError::new(0, "PARO tensor not found: embed_tokens for lm_head")
-            })?;
-            let f32_data = crate::safetensors_source::source_bytes_to_f32_vec(&info.dtype, td);
-            let bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
-            };
-            let buf = gpu.upload_raw(bytes, &[config.vocab_size, config.dim])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::F32,
-                m: config.vocab_size,
-                k: config.dim,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-                lloyd_lut_e4m3: None,
-                lloyd_lut_f16: None,
-                lloyd_lut_c16: None,
-            })
-        },
-    )?;
-
-    // Layers — shared `load_layer` walk
-    let q_out_dim = config.n_heads * config.head_dim;
-    let kv_dim = config.n_kv_heads * config.head_dim;
-    let mut layers = Vec::with_capacity(config.n_layers);
-    {
-        let mut b = crate::weight_backend::ParoBackend {
-            source,
-            gpu,
-            mp: "model",
-            layer: 0,
-            norm_bias: 0.0,
-        };
-        for i in 0..config.n_layers {
-            eprintln!(
-                "  loading layer {i}/{} (ParoQuant LLaMA/Qwen3)...",
-                config.n_layers
-            );
-            layers.push(load_layer(&mut b, config, q_out_dim, kv_dim, i)?);
-        }
-    }
-
-    Ok(LlamaWeights {
-        token_embd,
-        embd_format: embd_fmt,
-        output_norm,
-        output,
-        layers,
-        lm_head_aliases_embd,
-    })
-}
 // ─── HFQM streaming writer (calibration collector) ──────────────────────────
 
 /// One in-memory tensor for [`write_hfqm_package_mem`].
@@ -3572,6 +3444,50 @@ mod llama_config_tests {
         assert_eq!(c.bos_token, 128000);
         assert_eq!(c.eos_token, 128001);
         assert!(!c.has_qk_norm);
+    }
+
+    #[test]
+    fn transformers5_rope_parameters_theta() {
+        use rdna_compute::rope::RopeLlama3;
+        let mut config = config_value("llama")["config"].clone();
+        config.as_object_mut().unwrap().remove("rope_theta");
+        let c = llama_config_from_value(&config, false).unwrap();
+        assert_eq!(c.rope_freq_base, 10000.0);
+        config["rope_parameters"] = serde_json::json!({
+            "rope_type": "llama3", "rope_theta": 500000.0, "factor": 32.0,
+            "low_freq_factor": 1.0, "high_freq_factor": 4.0,
+            "original_max_position_embeddings": 8192
+        });
+        let c = llama_config_from_value(&config, false).unwrap();
+        assert_eq!(c.rope_freq_base, 500000.0);
+        assert_eq!(c.rope_llama3, RopeLlama3::new(32.0, 1.0, 4.0, 8192));
+        config["rope_theta"] = serde_json::json!(10000.0);
+        let c = llama_config_from_value(&config, false).unwrap();
+        assert_eq!(
+            c.rope_freq_base, 500000.0,
+            "rope_parameters wins, as in HF 5.x"
+        );
+    }
+
+    #[test]
+    fn rope_scaling_llama3_parses_and_unknown_types_refuse() {
+        use rdna_compute::rope::RopeLlama3;
+        let mut config = config_value("llama")["config"].clone();
+        assert_eq!(
+            llama_config_from_value(&config, false).unwrap().rope_llama3,
+            RopeLlama3::OFF
+        );
+        config["rope_scaling"] = serde_json::json!({
+            "rope_type": "llama3", "factor": 32.0, "low_freq_factor": 1.0,
+            "high_freq_factor": 4.0, "original_max_position_embeddings": 8192
+        });
+        assert_eq!(
+            llama_config_from_value(&config, false).unwrap().rope_llama3,
+            RopeLlama3::new(32.0, 1.0, 4.0, 8192)
+        );
+        config["rope_scaling"] = serde_json::json!({"rope_type": "yarn", "factor": 4.0});
+        let err = llama_config_from_value(&config, false).unwrap_err();
+        assert!(err.contains("unsupported rope_type \"yarn\""), "{err}");
     }
 
     #[test]
@@ -4447,6 +4363,40 @@ mod range_upload_release_tests {
             assert_eq!(libc::mincore(addr, map_len, vec.as_mut_ptr()), 0);
             libc::munmap(addr, map_len);
             vec.into_iter().map(|state| state & 1 == 1).collect()
+        }
+    }
+
+    /// A tensor carrying a removed quant type (qt 28/29) is refused at open with
+    /// the removal message, never a panic or a generic unknown-qt error.
+    #[test]
+    fn removed_quant_types_are_refused_with_the_removal_message() {
+        for qt in [28u8, 29u8] {
+            assert_eq!(
+                removed_quant_type_error(u32::from(qt)),
+                Some(REMOVED_QUANT_TYPE_MSG)
+            );
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("removed.hfq");
+            let tensors = vec![HfqMemTensor {
+                name: "w".to_string(),
+                quant_type: qt,
+                shape: vec![1, 128],
+                group_size: 128,
+                data: vec![0u8; 72],
+            }];
+            write_hfqm_package_mem(&path, 16, "{}", &tensors).unwrap();
+            let err = match HfqFile::open(&path) {
+                Ok(_) => panic!("qt {qt} must be refused at open"),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                err.contains("ParoQuant was removed in 0.5.0"),
+                "qt {qt}: {err}"
+            );
+            assert!(err.contains("'w'"), "qt {qt}: {err}");
+        }
+        for qt in [13u32, 27, 30] {
+            assert_eq!(removed_quant_type_error(qt), None);
         }
     }
 

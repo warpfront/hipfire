@@ -125,19 +125,8 @@ fn drive_ar_semantic_path_with_stop(
                 fin.store_cache,
             );
             if effects.emit_done {
-                let mut pending = qwen_ar_done_value(
-                    "t1",
-                    fin.finish_reason,
-                    0,
-                    0.0,
-                    0,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0,
-                    "",
-                );
+                let mut pending =
+                    qwen_ar_done_value("t1", fin.finish_reason, 0, 0.0, 0, 0.0, 0.0, 0.0, 0.0, 0);
                 stage_terminal_tool_calls(&mut pending, fin.finish_reason, &fin.wire_tool_calls);
                 emit_staged_terminal_done(&mut sink, &pending);
             }
@@ -166,6 +155,38 @@ fn parse_jsonl(out: &str) -> Vec<serde_json::Value> {
         .filter(|l| !l.trim().is_empty())
         .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("bad jsonl {l}: {e}")))
         .collect()
+}
+
+#[test]
+fn tool_free_producer_still_stops_on_im_end() {
+    set_active_attempt_id(18);
+    let mut producer = QwenArSemanticProducer::new_with_tool_protocol("tool-free", false, false);
+    let mut sink = Vec::new();
+    let mut conversation_tokens = Vec::new();
+    let mut streamed_tokens = Vec::new();
+    let mut seq_pos = 0usize;
+    let stopped = producer
+        .commit_and_observe(
+            &mut sink,
+            &mut conversation_tokens,
+            &mut streamed_tokens,
+            &mut seq_pos,
+            1000,
+            b"<tool_call>",
+        )
+        .expect("marker text");
+    assert!(!stopped);
+    let stopped = producer
+        .commit_and_observe(
+            &mut sink,
+            &mut conversation_tokens,
+            &mut streamed_tokens,
+            &mut seq_pos,
+            1001,
+            b"<|im_end|>",
+        )
+        .expect("terminator");
+    assert!(stopped);
 }
 
 #[test]
@@ -467,6 +488,123 @@ fn decoded_im_end_stops_without_emitting_marker() {
     let fin = fin.expect("finish after EOT");
     assert!(fin.wire_tool_calls.is_empty());
     assert_ne!(fin.finish_reason, "tool_calls");
+}
+
+#[test]
+fn builtin_terminator_inside_open_tool_call_does_not_end_the_turn() {
+    for marker in ["<|im_end|>", "<|endoftext|>"] {
+        let (out, visible, fin, stopped, _, _) = drive_ar_semantic_path(
+            &[
+                "<tool_call><function=read><parameter=path>/tmp/x</parameter></function>",
+                marker,
+                "</tool_call>",
+            ],
+            false,
+            false,
+        );
+        assert!(!stopped, "{marker}");
+        assert!(!out.contains(marker), "{marker}");
+        assert!(!visible.contains(marker), "{marker}");
+        let fin = fin.expect(marker);
+        assert_eq!(fin.finish_reason, "tool_calls", "{marker}");
+        assert_eq!(fin.wire_tool_calls.len(), 1, "{marker}");
+        assert_eq!(fin.wire_tool_calls[0].name, "read");
+        assert_eq!(fin.wire_tool_calls[0].arguments["path"], "/tmp/x");
+    }
+}
+
+#[test]
+fn bare_tool_call_opener_still_stops_on_a_terminator() {
+    let (_, _, fin, stopped, _, _) =
+        drive_ar_semantic_path(&["<tool_call>", "<|im_end|>"], false, false);
+    assert!(stopped);
+    let err = fin.expect_err("bare opener fails closed");
+    assert_eq!(err.detail(), "unclosed <tool_call> span at end of output");
+}
+
+#[test]
+fn spelled_terminator_inside_a_parameter_stays_in_the_argument() {
+    for marker in ["<|im_end|>", "<|endoftext|>"] {
+        let (out, visible, fin, stopped, _, _) = drive_ar_semantic_path(
+            &[
+                "<tool_call><function=write_file><parameter=content>\nEND = \"",
+                marker,
+                "\"\n</parameter></function></tool_call>",
+            ],
+            false,
+            false,
+        );
+        assert!(!stopped, "{marker}");
+        let fin = fin.expect(marker);
+        assert_eq!(fin.finish_reason, "tool_calls", "{marker}");
+        assert_eq!(fin.wire_tool_calls.len(), 1, "{marker}");
+        let content = fin.wire_tool_calls[0].arguments["content"]
+            .as_str()
+            .expect("content string");
+        assert!(
+            content.contains(marker),
+            "{marker} missing from {content:?}"
+        );
+        assert!(!visible.contains(marker), "{marker}");
+        for ev in parse_jsonl(&out) {
+            let kind = ev.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            if kind == "token" || kind == "reasoning" {
+                let text = ev.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                assert!(!text.contains(marker), "{marker} leaked into {kind}");
+            }
+        }
+    }
+}
+
+#[test]
+fn spelled_terminator_split_across_chunks_stays_in_the_argument() {
+    let (_, _, fin, stopped, _, _) = drive_ar_semantic_path(
+        &[
+            "<tool_call><function=write_file><parameter=content>\nEND = \"<|",
+            "im_end",
+            "|>\"\n</parameter></function></tool_call>",
+        ],
+        false,
+        false,
+    );
+    assert!(!stopped);
+    let fin = fin.expect("split marker");
+    assert_eq!(fin.finish_reason, "tool_calls");
+    assert_eq!(
+        fin.wire_tool_calls[0].arguments["content"].as_str(),
+        Some("END = \"<|im_end|>\"")
+    );
+}
+
+#[test]
+fn terminator_inside_open_tool_call_stays_fail_closed_without_a_closer() {
+    let (_, _, fin, stopped, _, _) = drive_ar_semantic_path(
+        &[
+            "<tool_call><function=read><parameter=path>/tmp/x</parameter>",
+            "<|im_end|>",
+        ],
+        false,
+        false,
+    );
+    assert!(!stopped);
+    let err = fin.expect_err("unclosed span");
+    assert_eq!(err.detail(), "unclosed <tool_call> span at end of output");
+}
+
+#[test]
+fn terminator_inside_open_tool_call_at_length_reports_length() {
+    let (_, _, fin, stopped, _, _) = drive_ar_semantic_path(
+        &[
+            "<tool_call><function=read><parameter=path>/tmp/x</parameter>",
+            "<|im_end|>",
+        ],
+        false,
+        true,
+    );
+    assert!(!stopped);
+    let fin = fin.expect("length");
+    assert_eq!(fin.finish_reason, "length");
+    assert!(fin.wire_tool_calls.is_empty());
 }
 
 #[test]
@@ -1096,9 +1234,7 @@ fn real_writers_hostile_request_ids() {
             rendered_body: None,
         }],
     );
-    emit_qwen_ar_done(
-        &mut sink, hostile, "stop", 1, 1.0, 0, 0.0, 0.0, 1.0, 0.0, 0, "",
-    );
+    emit_qwen_ar_done(&mut sink, hostile, "stop", 1, 1.0, 0, 0.0, 0.0, 1.0, 0.0, 0);
     let events = parse_jsonl(&String::from_utf8(sink).unwrap());
     assert_eq!(events.len(), 4);
     for e in &events {
@@ -1557,7 +1693,6 @@ fn finish_defers_tool_calls_until_commit_effects() {
         1.0,
         0.0,
         0,
-        "",
     );
     stage_terminal_tool_calls(&mut pending, fin.finish_reason, &fin.wire_tool_calls);
     emit_staged_terminal_done(&mut sink, &pending);
@@ -1641,4 +1776,105 @@ fn abort_effects_suppress_calls_cache_and_normal_done() {
         .iter()
         .all(|e| !(e["type"] == "done" && e["finish_reason"] == "tool_calls")));
     assert!(events.iter().all(|e| e["attempt_id"] == 12));
+}
+
+/// Drive the producer like the AR decode loop with `min_tokens`; returns the
+/// visible text and the index of the chunk whose commit ended the turn.
+fn drive_with_min_tokens(
+    chunks: &[&str],
+    stop: &[&str],
+    min_tokens: usize,
+) -> (String, Option<usize>, QwenArSemanticProducer) {
+    let _guard = begin_terminal_test("t1", 7);
+    set_active_attempt_id(7);
+    let stop: Vec<String> = stop.iter().map(|s| (*s).to_owned()).collect();
+    let mut producer = QwenArSemanticProducer::new("t1", false)
+        .with_stop(&stop)
+        .with_min_tokens(min_tokens, 0);
+    let mut sink = Vec::new();
+    let (mut conversation_tokens, mut streamed_tokens, mut seq_pos) = (Vec::new(), Vec::new(), 0);
+    let mut ended = None;
+    for (i, c) in chunks.iter().enumerate() {
+        let stopped = producer
+            .commit_and_observe(
+                &mut sink,
+                &mut conversation_tokens,
+                &mut streamed_tokens,
+                &mut seq_pos,
+                1000 + i as u32,
+                c.as_bytes(),
+            )
+            .expect("commit");
+        if stopped {
+            ended = Some(i);
+            break;
+        }
+    }
+    let tokens: String = parse_jsonl(&String::from_utf8_lossy(&sink))
+        .iter()
+        .filter(|e| e["type"] == "token")
+        .map(|e| e["text"].as_str().unwrap().to_owned())
+        .collect();
+    (tokens, ended, producer)
+}
+
+#[test]
+fn min_tokens_zero_stops_on_the_first_marker_as_before() {
+    let (visible, ended, producer) = drive_with_min_tokens(&["hi", "<|im_end|>", "x"], &[], 0);
+    assert_eq!(ended, Some(1));
+    assert_eq!(visible, "hi");
+    assert!(producer.last_stops_active);
+}
+
+#[test]
+fn min_tokens_holds_the_end_of_turn_marker_inactive_until_reached() {
+    // 4th chunk is the first that may stop; the two earlier markers are
+    // dropped from the stream, not shown and not a stop.
+    let chunks = [
+        "a",
+        "<|im_end|>",
+        "b",
+        "<|endoftext|>",
+        "c",
+        "<|im_end|>",
+        "never",
+    ];
+    let (visible, ended, producer) = drive_with_min_tokens(&chunks, &[], 4);
+    assert_eq!(ended, Some(5), "stops on the first marker after 4 commits");
+    assert_eq!(visible, "abc");
+    assert!(producer.last_stops_active);
+    assert_eq!(producer.raw_committed.len(), 6);
+}
+
+#[test]
+fn min_tokens_flag_tells_decode_loops_to_ignore_an_eos_id() {
+    // The loops gate their own EOS-id check on `last_stops_active`.
+    let (_, ended, producer) = drive_with_min_tokens(&["a", "b"], &[], 3);
+    assert_eq!(ended, None);
+    assert!(
+        !producer.last_stops_active,
+        "below min_tokens: EOS id ignored"
+    );
+    let (_, _, producer) = drive_with_min_tokens(&["a", "b", "c", "d"], &[], 3);
+    assert!(producer.last_stops_active, "the 4th token may stop");
+}
+
+#[test]
+fn min_tokens_holds_stop_sequences_inactive_until_reached() {
+    // `END` completes inside the first three commits: ignored and shown. The
+    // second `END` lands after min_tokens and trims.
+    let chunks = ["x END ", "y", "z", "q E", "ND tail", "never"];
+    let (visible, ended, _) = drive_with_min_tokens(&chunks, &["END"], 3);
+    assert_eq!(ended, Some(4));
+    assert_eq!(visible, "x END yzq ");
+}
+
+#[test]
+fn min_tokens_counts_tokens_a_promoted_producer_already_emitted() {
+    let _guard = begin_terminal_test("t1", 7);
+    set_active_attempt_id(7);
+    let producer = QwenArSemanticProducer::new("t1", false).with_min_tokens(5, 5);
+    assert!(producer.last_stops_active, "already at the minimum");
+    let producer = QwenArSemanticProducer::new("t1", false).with_min_tokens(5, 2);
+    assert!(!producer.last_stops_active);
 }

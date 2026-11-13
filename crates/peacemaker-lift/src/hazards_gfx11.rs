@@ -352,6 +352,7 @@ fn class_of(inst: &Inst) -> Class {
         Form::Smem => Class::Smem,
         Form::Vop1
         | Form::Vop1Dpp
+        | Form::Vop1Dpp8
         | Form::Vop2
         | Form::Vop2Dpp
         | Form::Vopc
@@ -471,8 +472,10 @@ struct WaitFields {
     vscnt0: bool,
 }
 
-fn facts_of(inst: &Inst, arch: Arch) -> Facts {
-    let name = inst.op.name(arch).unwrap_or("?");
+fn facts_of(inst: &Inst, arch: Arch, wave: Wave) -> Facts {
+    // VALU lane masks are one SGPR in wave32: the table's 64-bit slot would invent a write of the next SGPR.
+    let effects = peacemaker_ir::effects::wave_effects(arch, wave, inst);
+    let name = inst.name(arch).unwrap_or("?");
     let base = base_name(name);
     let class = class_of(inst);
     let imm = sopp_imm(inst);
@@ -520,7 +523,7 @@ fn facts_of(inst: &Inst, arch: Arch) -> Facts {
     let reads_exec = matches!(class, Class::Vmem | Class::Ds | Class::Export)
         || inst.effects.implicit.reads & peacemaker_ir::effects::ImplicitSet::EXEC != 0
         || special_exec(&inst.operands) && !writes_exec;
-    let v_uses: Vec<RegRef> = v_regs(&inst.effects.uses).collect();
+    let v_uses: Vec<RegRef> = v_regs(&effects.uses).collect();
     let v_uses_sans_mad_hi = if matches!(base, "v_mad_u64_u32" | "v_mad_i64_i32") {
         inst.operands
             .iter()
@@ -547,11 +550,11 @@ fn facts_of(inst: &Inst, arch: Arch) -> Facts {
         nop_v: base == "v_nop",
         depctr,
         wait,
-        v_defs: v_regs(&inst.effects.defs).collect(),
+        v_defs: v_regs(&effects.defs).collect(),
         v_uses,
         v_uses_sans_mad_hi,
-        s_defs: s_regs(&inst.effects.defs).collect(),
-        s_uses: s_regs(&inst.effects.uses).collect(),
+        s_defs: s_regs(&effects.defs).collect(),
+        s_uses: s_regs(&effects.uses).collect(),
         writes_exec,
         reads_exec,
     }
@@ -583,7 +586,7 @@ pub struct Stream<'a> {
 }
 
 impl<'a> Stream<'a> {
-    pub fn new(symbol: &'a str, body: &'a Body, arch: Arch) -> Self {
+    pub fn new(symbol: &'a str, body: &'a Body, arch: Arch, wave: Wave) -> Self {
         let insts: Vec<&Inst> = body
             .layout
             .iter()
@@ -593,7 +596,7 @@ impl<'a> Stream<'a> {
                     .expect("layout names a live instruction")
             })
             .collect();
-        let facts = insts.iter().map(|i| facts_of(i, arch)).collect();
+        let facts = insts.iter().map(|i| facts_of(i, arch, wave)).collect();
         let pcs = insts
             .iter()
             .enumerate()
@@ -947,7 +950,7 @@ fn rule_wmma_chain(s: &Stream, out: &mut Vec<Finding>) {
             continue;
         }
         let mut srcs: Vec<RegRef> = f.v_uses.iter().take(2).copied().collect();
-        if s.arch == Arch::Gfx1201 && f.swmmac {
+        if s.arch.is_gfx12() && f.swmmac {
             if let Some(idx) = f.v_uses.get(2) {
                 srcs.push(*idx);
             }
@@ -1115,7 +1118,7 @@ struct WarState {
 
 /// Data (store-source) VGPR operands of a DS/VMEM instruction, by table slot name.
 fn data_vgprs(inst: &Inst, arch: Arch) -> Vec<RegRef> {
-    let Some(row) = peacemaker_ir::isa::lookup(arch, inst.op, inst.form) else {
+    let Some(row) = peacemaker_ir::isa::lookup_inst(arch, &inst).ok() else {
         return Vec::new();
     };
     let returns = peacemaker_ir::isa::atomic_returns(arch, &inst.mods.cpol);
@@ -1330,10 +1333,10 @@ pub fn check_body(
     advisory: bool,
 ) -> Vec<Finding> {
     let mut out = Vec::new();
-    let stream = Stream::new(symbol, body, arch);
+    let stream = Stream::new(symbol, body, arch, wave);
     rule_user_sgpr(symbol, arch, wave, rsrc2, &mut out);
     rule_wave64(symbol, arch, wave, &mut out);
-    if arch == Arch::Gfx1201 {
+    if arch.is_gfx12() {
         rule_gfx12_sgpr(&stream, body, arch, wave, &mut out);
     }
     rule_vcmpx_permlane(&stream, &mut out);

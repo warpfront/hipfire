@@ -903,24 +903,44 @@ mod flash {
         rule(Rule::OneOf(p!("round_y"), BOOL), "round_y is a flag"),
     ];
 
-    const EXPORTS: &[ExportV1] = &[ExportV1 {
-        symbol: "latent_attention_flash_prefill",
-        arch: Arch::Gfx1201,
-        object: ObjectRefV1::HipccSource {
-            module: "latent_attention_flash",
-            source: "kernels/src/latent_attention_flash.hip",
+    const EXPORTS: &[ExportV1] = &[
+        // The product launch on gfx1100 too (same source, the gfx11 fragment maps compile in under !__GFX12__).
+        ExportV1 {
+            symbol: "latent_attention_flash_prefill",
+            arch: Arch::Gfx1100,
+            object: ObjectRefV1::HipccSource {
+                module: "latent_attention_flash",
+                source: "kernels/src/latent_attention_flash.hip",
+            },
+            block: [128, 1, 1],
+            dynamic_lds: 44032,
+            group_segment_fixed: 0,
+            grid: [
+                Expr::DivCeil(&p!("n_rows"), 64),
+                p!("n_heads"),
+                Expr::DivCeil(&p!("dv"), 128),
+            ],
+            consts: &[],
         },
-        block: [128, 1, 1],
-        dynamic_lds: 44032,
-        group_segment_fixed: 0,
-        // 4 waves x 16 query rows per workgroup; z = value-column chunks of 128.
-        grid: [
-            Expr::DivCeil(&p!("n_rows"), 64),
-            p!("n_heads"),
-            Expr::DivCeil(&p!("dv"), 128),
-        ],
-        consts: &[],
-    }];
+        ExportV1 {
+            symbol: "latent_attention_flash_prefill",
+            arch: Arch::Gfx1201,
+            object: ObjectRefV1::HipccSource {
+                module: "latent_attention_flash",
+                source: "kernels/src/latent_attention_flash.hip",
+            },
+            block: [128, 1, 1],
+            dynamic_lds: 44032,
+            group_segment_fixed: 0,
+            // 4 waves x 16 query rows per workgroup; z = value-column chunks of 128.
+            grid: [
+                Expr::DivCeil(&p!("n_rows"), 64),
+                p!("n_heads"),
+                Expr::DivCeil(&p!("dv"), 128),
+            ],
+            consts: &[],
+        },
+    ];
 
     /// `latent_attention_flash_prefill` (4-wave variant; the `_wide` and `_q8` entries are other
     /// symbols). Hidden block at 112 plus `hidden_dynamic_lds_size@232`, `.kernarg_segment_size` 368.
@@ -987,24 +1007,41 @@ mod flash {
 mod flash_fa2 {
     use super::*;
 
-    const EXPORTS: &[ExportV1] = &[ExportV1 {
-        symbol: "latent_attention_flash_prefill_fa2_q128w8",
-        arch: Arch::Gfx1201,
-        object: ObjectRefV1::HipccSource {
-            module: "latent_attention_flash_fa2",
-            source: "kernels/src/latent_attention_flash_fa2.hip",
+    const EXPORTS: &[ExportV1] = &[
+        ExportV1 {
+            symbol: "latent_attention_flash_prefill_fa2_q128w8",
+            arch: Arch::Gfx1100,
+            object: ObjectRefV1::HipccSource {
+                module: "latent_attention_flash_fa2_gfx1100",
+                source: "kernels/src/latent_attention_flash_fa2.gfx1100.hip",
+            },
+            block: [256, 1, 1],
+            // the gfx1201 stage plus the staged Q rope tail (128 rows x pitch 72 x 2 B)
+            dynamic_lds: 62464,
+            group_segment_fixed: 0,
+            grid: [Expr::DivCeil(&p!("n_rows"), 128), p!("n_heads"), c!(1)],
+            consts: &[],
         },
-        block: [256, 1, 1],
-        dynamic_lds: 44032,
-        group_segment_fixed: 0,
-        // 8 waves x 16 query rows per workgroup; grid z is 1 (dv pinned to 128).
-        grid: [Expr::DivCeil(&p!("n_rows"), 128), p!("n_heads"), c!(1)],
-        consts: &[],
-    }];
+        ExportV1 {
+            symbol: "latent_attention_flash_prefill_fa2_q128w8",
+            arch: Arch::Gfx1201,
+            object: ObjectRefV1::HipccSource {
+                module: "latent_attention_flash_fa2",
+                source: "kernels/src/latent_attention_flash_fa2.hip",
+            },
+            block: [256, 1, 1],
+            dynamic_lds: 44032,
+            group_segment_fixed: 0,
+            // 8 waves x 16 query rows per workgroup; grid z is 1 (dv pinned to 128).
+            grid: [Expr::DivCeil(&p!("n_rows"), 128), p!("n_heads"), c!(1)],
+            consts: &[],
+        },
+    ];
 
     /// Same encoding, operands, domain and numerics as `generic_seq.latent_attention_flash_prefill`
-    /// (bit-identical, j6115); only the schedule differs: 256 threads, 128 query rows per CTA, K/V
-    /// streamed through 44032 bytes of LDS.
+    /// (bit-identical: j6115 on gfx1201, the gfx1100 receipt sweep on gfx1100); only the schedule differs:
+    /// 256 threads, 128 query rows per CTA, K/V streamed through LDS (44032 bytes on gfx1201; 62464 on gfx1100,
+    /// whose twin also stages the Q rope tail because a gfx11 operand is twice as wide).
     pub static ABI: KernelAbiV1 = KernelAbiV1 {
         id: "generic_seq.latent_attention_flash_prefill_fa2_q128w8",
         version: 1,
@@ -1033,7 +1070,7 @@ mod flash_fa2 {
         abi: &ABI,
         work: WorkV1 {
             admit: FA2_ADMIT,
-            note: "FA2 route (default ON, gfx1201): same work as the incumbent flash prefill; grid x = ceil(n_rows / 128), 256 threads. prefix = rows already processed in the pass.",
+            note: "FA2 route (default ON; gfx1201 from 17 rows, gfx1100 from 256 rows = latent_attention_flash.rs::FA2_GFX1100_MIN_ROWS): same work as the incumbent flash prefill; grid x = ceil(n_rows / 128), 256 threads. prefix = rows already processed in the pass.",
             ..flash::WORK.work
         },
     };
@@ -1241,23 +1278,42 @@ mod flash_q8 {
 mod flash_fa2_q8 {
     use super::*;
 
-    const EXPORTS: &[ExportV1] = &[ExportV1 {
-        symbol: "latent_attention_flash_prefill_fa2_q8_q128w8",
-        arch: Arch::Gfx1201,
-        object: ObjectRefV1::HipccSource {
-            module: "latent_attention_flash_fa2_q8",
-            source: "kernels/src/latent_attention_flash_fa2_q8.hip",
+    const EXPORTS: &[ExportV1] = &[
+        ExportV1 {
+            symbol: "latent_attention_flash_prefill_fa2_q8_q128w8",
+            arch: Arch::Gfx1100,
+            object: ObjectRefV1::HipccSource {
+                module: "latent_attention_flash_fa2_q8_gfx1100",
+                source: "kernels/src/latent_attention_flash_fa2_q8.gfx1100.hip",
+            },
+            block: [256, 1, 1],
+            // the gfx1201 stage plus the staged Q rope tail (128 rows x pitch 72 x 2 B)
+            dynamic_lds: 62464,
+            group_segment_fixed: 0,
+            grid: [Expr::DivCeil(&p!("n_rows"), 128), p!("n_heads"), c!(1)],
+            consts: &[],
         },
-        block: [256, 1, 1],
-        dynamic_lds: 44032,
-        group_segment_fixed: 0,
-        // 8 waves x 16 query rows per workgroup; grid z is 1 (dv pinned to 128).
-        grid: [Expr::DivCeil(&p!("n_rows"), 128), p!("n_heads"), c!(1)],
-        consts: &[],
-    }];
+        ExportV1 {
+            symbol: "latent_attention_flash_prefill_fa2_q8_q128w8",
+            arch: Arch::Gfx1201,
+            object: ObjectRefV1::HipccSource {
+                module: "latent_attention_flash_fa2_q8",
+                source: "kernels/src/latent_attention_flash_fa2_q8.hip",
+            },
+            block: [256, 1, 1],
+            dynamic_lds: 44032,
+            group_segment_fixed: 0,
+            // 8 waves x 16 query rows per workgroup; grid z is 1 (dv pinned to 128).
+            grid: [Expr::DivCeil(&p!("n_rows"), 128), p!("n_heads"), c!(1)],
+            consts: &[],
+        },
+    ];
 
     /// Same encoding, operands, domain and numerics as `generic_seq.latent_attention_flash_prefill_q8`;
-    /// only the schedule differs: 256 threads, 128 query rows per CTA, K/V streamed through 44032 bytes of LDS.
+    /// only the schedule differs: 256 threads, 128 query rows per CTA, K/V streamed through LDS (44032 bytes on
+    /// gfx1201; 62464 on gfx1100, whose twin also stages the Q rope tail because a gfx11 operand is twice as wide).
+    /// The next tile's global prefetch carries the raw F16 scale bits (unconditional loads from a clamped row) and the
+    /// F16 -> F32 widening and the partial-tile zero fill happen at the LDS store; the output bits are unchanged.
     pub static ABI: KernelAbiV1 = KernelAbiV1 {
         id: "generic_seq.latent_attention_flash_prefill_fa2_q8_q128w8",
         version: 1,
@@ -1286,7 +1342,7 @@ mod flash_fa2_q8 {
         abi: &ABI,
         work: WorkV1 {
             admit: FA2_ADMIT,
-            note: "FA2 Q8 route (default ON, gfx1201): same work as the Q8 incumbent flash prefill; grid x = ceil(n_rows / 128), 256 threads. prefix = rows already processed in the pass.",
+            note: "FA2 Q8 route (default ON; gfx1201 from 17 rows, gfx1100 from 256 rows = latent_attention_flash.rs::FA2_Q8_GFX1100_MIN_ROWS): same work as the Q8 incumbent flash prefill; grid x = ceil(n_rows / 128), 256 threads. prefix = rows already processed in the pass.",
             ..flash_q8::WORK.work
         },
     };
@@ -3116,10 +3172,19 @@ mod tests {
     #[test]
     fn flash_fa2_contract_and_grid_inversion() {
         flash_fa2::WORK.self_check().unwrap();
-        let e = &flash_fa2::ABI.exports[0];
-        assert_eq!(e.block, [256, 1, 1]);
-        assert_eq!(e.dynamic_lds, 44032);
-        assert_eq!(e.dynamic_lds, flash::ABI.exports[0].dynamic_lds);
+        let lds: Vec<(Arch, u32)> = flash_fa2::ABI
+            .exports
+            .iter()
+            .map(|e| (e.arch, e.dynamic_lds))
+            .collect();
+        assert_eq!(lds, [(Arch::Gfx1100, 62464), (Arch::Gfx1201, 44032)]);
+        for e in flash_fa2::ABI.exports {
+            assert_eq!(e.block, [256, 1, 1]);
+        }
+        assert_eq!(
+            flash_fa2::ABI.exports[1].dynamic_lds,
+            flash::ABI.exports[0].dynamic_lds
+        );
         assert_eq!(flash_fa2::ABI.explicit_bytes, flash::ABI.explicit_bytes);
         assert_eq!(flash_fa2::ABI.segment_bytes, flash::ABI.segment_bytes);
         assert_eq!(flash_fa2::ABI.numeric, flash::ABI.numeric);
@@ -3159,9 +3224,15 @@ mod tests {
     #[test]
     fn flash_fa2_q8_contract_and_grid_inversion() {
         flash_fa2_q8::WORK.self_check().unwrap();
-        let e = &flash_fa2_q8::ABI.exports[0];
-        assert_eq!(e.block, [256, 1, 1]);
-        assert_eq!(e.dynamic_lds, 44032);
+        let lds: Vec<(Arch, u32)> = flash_fa2_q8::ABI
+            .exports
+            .iter()
+            .map(|e| (e.arch, e.dynamic_lds))
+            .collect();
+        assert_eq!(lds, [(Arch::Gfx1100, 62464), (Arch::Gfx1201, 44032)]);
+        for e in flash_fa2_q8::ABI.exports {
+            assert_eq!(e.block, [256, 1, 1]);
+        }
         assert_eq!(
             flash_fa2_q8::ABI.explicit_bytes,
             flash_q8::ABI.explicit_bytes

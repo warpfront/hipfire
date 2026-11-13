@@ -30,7 +30,7 @@ use hipfire_arch_llama::dspark_body::{build_qwen3_dspark_body, load_qwen3_dspark
 use hipfire_arch_llama::{load_llama_bundle, LlamaBundle};
 use hipfire_runtime::dspark_core::build_dspark_speculator;
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::loader_api::{CaskConfig, LoadCtx, ModelSource, SpecLoadCfg};
+use hipfire_runtime::loader_api::{LoadCtx, ModelSource, SpecLoadCfg};
 use hipfire_runtime::prompt_frame::{AssistantPrefix, ChatFrame};
 use hipfire_runtime::spec::{PrefillOutcome, SpecRequestConfig, Speculator};
 use hipfire_runtime::spec_ngram::{ChainSpeculator, NgramDrafter};
@@ -186,7 +186,6 @@ fn main() -> Result<(), String> {
     let mut gpu = Gpu::init().map_err(|e| format!("gpu: {e:?}"))?;
     eprintln!("GPU: arch={}", gpu.arch_caps.arch());
 
-    let cask = CaskConfig::default();
     let src = ModelSource::Hfq(hfq);
     let mut ctx = LoadCtx {
         path: &path,
@@ -202,7 +201,6 @@ fn main() -> Result<(), String> {
         kv_adaptive_override: None,
         state_quant_override: None,
         qwen_default_q8: true,
-        cask: &cask,
         pp: 1,
         pp_layer_counts: None,
         admitted_mesh: None,

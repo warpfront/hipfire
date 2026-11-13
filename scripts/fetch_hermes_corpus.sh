@@ -5,11 +5,10 @@
 # hipfire — see LICENSE and NOTICE in the project root.
 
 # fetch_hermes_corpus.sh — pull `lambda/hermes-agent-reasoning-traces` from
-# HuggingFace and flatten it into a plain-text calibration corpus suitable
-# for `triattn_validate --corpus`.
+# HuggingFace and flatten it into a plain-text calibration corpus.
 #
 # Output format: concatenated ChatML-wrapped conversations, one turn per
-# line-ish. Tokenizer-agnostic; the sidecar calibrator just needs a long
+# line-ish. Tokenizer-agnostic; consumers just need a long
 # string of tokens representative of the deployment distribution.
 #
 # Usage:

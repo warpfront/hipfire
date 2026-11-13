@@ -48,6 +48,23 @@ static __device__ __forceinline__ unsigned short f16bits(float x) {
 #define FNGD_CHANNELS 10240
 #define FNGD_HEADS 48
 
+// Head geometry of one dense-scan launch (`KH` key heads and `VH` value heads of 128 channels).
+// The conv channels are q | k | v = 2 * KH * 128 + VH * 128; the producer grid is one block per
+// q head, k head and v head, then the gate-params block and the EF-zero block. The 16 / 48
+// instantiation is the original Flash-Next geometry (10240 channels, grid x = 82) every
+// pre-shard entry is compiled for; 8 / 24 is the rank-local geometry of the TP2 trunk shard
+// (conv channels 5120, grid x = 42).
+template <int KH, int VH>
+struct FnGdGeom {
+    static constexpr int kQk = KH * 128;
+    static constexpr int kVw = VH * 128;
+    static constexpr int kChannels = 2 * kQk + kVw;
+    static constexpr int kQkBlocks = 2 * KH;
+    static constexpr int kParamBlock = kQkBlocks + VH;
+    static constexpr int kEfBlock = kParamBlock + 1;
+    static_assert(KH > 0 && VH % KH == 0 && VH <= 48, "dense scan head geometry");
+};
+
 // gated_delta_conv_bf16_f32_batched_k4's body for one channel and the tile
 // rows [r0, min(r0 + 16, rows)) (r0 < rows); `emit(r, bf16_out)` receives
 // each output row.  Only the r0 == 0 tile reads the history and then stores
@@ -110,6 +127,7 @@ static __device__ __forceinline__ void fn_gdn_dense_conv_rows(
 
 // gated_delta_params_flat's body; the log decay is returned (the cumsum
 // consumes it from LDS, i.e. after the same float store the reference makes).
+template <int VH>
 static __device__ __forceinline__ float fn_gdn_dense_params_flat(
     const float* a,
     const float* b,
@@ -117,7 +135,7 @@ static __device__ __forceinline__ float fn_gdn_dense_params_flat(
     const __hip_bfloat16* dt_bias,
     float* beta,
     int flat) {
-    const int head = flat % FNGD_HEADS;
+    const int head = flat % VH;
     const float al = bf16_to_f32(a_log[head]);
     const float dt = bf16_to_f32(dt_bias[head]);
     const float value = bf16_to_f32(bf16_round(a[flat])) + dt;
@@ -183,7 +201,7 @@ extern "C" __global__ __launch_bounds__(256) void fn_gdn_dense_producer(
         for (int i = t; i < 64 * FNGD_HEADS; i += 256) {
             const int flat = chunk * 64 * FNGD_HEADS + i;
             smem[i] = flat < total
-                ? fn_gdn_dense_params_flat(param_a, param_b, a_log, dt_bias, beta, flat)
+                ? fn_gdn_dense_params_flat<FNGD_HEADS>(param_a, param_b, a_log, dt_bias, beta, flat)
                 : 0.0f;
         }
         __syncthreads();
@@ -298,7 +316,7 @@ static __device__ __forceinline__ __hip_bfloat16 fn_gdn_dense_silu_bf16(float va
 // chain. Specialized on the input dtype: `BF` reads the BF16 bits the exact-INT8
 // MQ6 qkv GEMM's BF16 entry stores (RNE of the F32 accumulator, the rounding the F32
 // input takes below), else the F32 projection.
-template <bool BF, typename Emit>
+template <bool BF, int CH, typename Emit>
 static __device__ __forceinline__ void fn_gdn_dense_conv_rows_v2(
     const float* input,
     const __hip_bfloat16* kernel,
@@ -309,7 +327,7 @@ static __device__ __forceinline__ void fn_gdn_dense_conv_rows_v2(
     int channel,
     int r0,
     Emit emit) {
-    const int channels = FNGD_CHANNELS;
+    const int channels = CH;
     auto in = [&](int j) {
         if (BF) {
             __hip_bfloat16 b;
@@ -397,7 +415,7 @@ static __device__ __forceinline__ void fn_gdn_dense_conv_rows_v2(
 // < 0x8000 + lsb to a zero low half; inf/NaN with a zero low half skip both fix-ups), so that
 // first rounding is dropped. The q/k final `bf(bf(smem) * inv)` keeps both roundings: with a
 // NaN in both operands the product's payload follows the operand order the compiler picks. The entry is picked by the input dtype, `input_bf16` is carried only for ABI parity.
-template <bool BF>
+template <bool BF, int KH, int VH>
 static __device__ __forceinline__ void fn_gdn_dense_producer_v2_body(
     const float* input,
     const __hip_bfloat16* kernel,
@@ -418,13 +436,14 @@ static __device__ __forceinline__ void fn_gdn_dense_producer_v2_body(
     int start_cursor,
     float query_scale,
     int ef_words) {
+    using G = FnGdGeom<KH, VH>;
     __shared__ float smem[32 * 129];
     __shared__ float inv[32];
     const int t = (int)threadIdx.x;
     const int x = (int)blockIdx.x;
     const int row0 = (int)blockIdx.y * 32;
-    if (x >= 80) {
-        if (x == 81) {
+    if (x >= G::kParamBlock) {
+        if (x == G::kEfBlock) {
             const int stride = (int)gridDim.y * 256;
             uint4* p = reinterpret_cast<uint4*>(ef);
             for (int i = (int)blockIdx.y * 256 + t; i < ef_words / 4; i += stride)
@@ -433,20 +452,20 @@ static __device__ __forceinline__ void fn_gdn_dense_producer_v2_body(
         }
         if (blockIdx.y & 1) return;
         const int chunk = (int)blockIdx.y >> 1;
-        const int total = rows * FNGD_HEADS;
-        for (int i = t; i < 64 * FNGD_HEADS; i += 256) {
-            const int flat = chunk * 64 * FNGD_HEADS + i;
+        const int total = rows * VH;
+        for (int i = t; i < 64 * VH; i += 256) {
+            const int flat = chunk * 64 * VH + i;
             smem[i] = flat < total
-                ? fn_gdn_dense_params_flat(param_a, param_b, a_log, dt_bias, beta, flat)
+                ? fn_gdn_dense_params_flat<VH>(param_a, param_b, a_log, dt_bias, beta, flat)
                 : 0.0f;
         }
         __syncthreads();
-        if (t < FNGD_HEADS) {
+        if (t < VH) {
             float s = 0.0f;
             for (int r = 0; r < 64; ++r) {
-                const int flat = chunk * 64 * FNGD_HEADS + r * FNGD_HEADS + t;
+                const int flat = chunk * 64 * VH + r * VH + t;
                 if (flat < total) {
-                    s += smem[r * FNGD_HEADS + t];
+                    s += smem[r * VH + t];
                     g[flat] = s;
                 }
             }
@@ -456,23 +475,23 @@ static __device__ __forceinline__ void fn_gdn_dense_producer_v2_body(
     const int c = t & 127;
     const int half = t >> 7;
     const int r0 = row0 + half * 16;
-    if (x >= 32) {
-        const int channel = 4096 + (x - 32) * 128 + c;
-        unsigned short* dst = v16 + (x - 32) * 128 + c;
+    if (x >= G::kQkBlocks) {
+        const int channel = 2 * G::kQk + (x - G::kQkBlocks) * 128 + c;
+        unsigned short* dst = v16 + (x - G::kQkBlocks) * 128 + c;
         if (r0 < rows) {
-            fn_gdn_dense_conv_rows_v2<BF>(input, kernel, history, next_history, rows,
+            fn_gdn_dense_conv_rows_v2<BF, G::kChannels>(input, kernel, history, next_history, rows,
                                           start_cursor, channel, r0,
                                           [&](int r, __hip_bfloat16 out) {
-                                              dst[(size_t)r * 6144] = f16bits(bf16_to_f32(out));
+                                              dst[(size_t)r * G::kVw] = f16bits(bf16_to_f32(out));
                                           });
         }
-        for (int r = r0 > rows ? r0 : rows; r < r0 + 16; ++r) dst[(size_t)r * 6144] = 0;
+        for (int r = r0 > rows ? r0 : rows; r < r0 + 16; ++r) dst[(size_t)r * G::kVw] = 0;
         return;
     }
     const int channel = x * 128 + c;
     if (r0 < rows) {
-        fn_gdn_dense_conv_rows_v2<BF>(input, kernel, history, next_history, rows, start_cursor,
-                                      channel, r0,
+        fn_gdn_dense_conv_rows_v2<BF, G::kChannels>(input, kernel, history, next_history, rows,
+                                      start_cursor, channel, r0,
                                       [&](int r, __hip_bfloat16 out) {
                                           smem[(r - row0) * 129 + c] = bf16_to_f32(out);
                                       });
@@ -490,18 +509,18 @@ static __device__ __forceinline__ void fn_gdn_dense_producer_v2_body(
         inv[t] = bf(rsqrtf(bf(s) + bf(1.0e-6f)));
     }
     __syncthreads();
-    unsigned short* dst = x < 16 ? q16 + (size_t)x * 128 + c : k16 + (size_t)(x - 16) * 128 + c;
+    unsigned short* dst = x < KH ? q16 + (size_t)x * 128 + c : k16 + (size_t)(x - KH) * 128 + c;
     for (int r = r0; r < r0 + 16; ++r) {
         unsigned short bits = 0;
         if (r < rows) {
             const float n = bf(bf(smem[(r - row0) * 129 + c]) * inv[r - row0]);
-            bits = f16bits(x < 16 ? n * query_scale : n);
+            bits = f16bits(x < KH ? n * query_scale : n);
         }
-        dst[(size_t)r * 2048] = bits;
+        dst[(size_t)r * G::kQk] = bits;
     }
 }
 
-#define FNGD_PRODUCER_V2_ENTRY(NAME, BF)                                                      \
+#define FNGD_PRODUCER_V2_ENTRY_G(NAME, BF, KH, VH)                                            \
     extern "C" __global__ __launch_bounds__(256) void NAME(                                   \
         const float* input, const __hip_bfloat16* kernel, const float* history,               \
         float* next_history, unsigned short* q16, unsigned short* k16, unsigned short* v16,   \
@@ -509,12 +528,18 @@ static __device__ __forceinline__ void fn_gdn_dense_producer_v2_body(
         const __hip_bfloat16* a_log, const __hip_bfloat16* dt_bias, unsigned int* ef,         \
         int rows, int n64, int start_cursor, int input_bf16, float query_scale,               \
         int ef_words) {                                                                       \
-        fn_gdn_dense_producer_v2_body<BF>(input, kernel, history, next_history, q16, k16,     \
-                                          v16, g, beta, param_a, param_b, a_log, dt_bias, ef, \
-                                          rows, n64, start_cursor, query_scale, ef_words);    \
+        fn_gdn_dense_producer_v2_body<BF, KH, VH>(input, kernel, history, next_history, q16,  \
+                                                  k16, v16, g, beta, param_a, param_b, a_log, \
+                                                  dt_bias, ef, rows, n64, start_cursor,       \
+                                                  query_scale, ef_words);                     \
     }
+#define FNGD_PRODUCER_V2_ENTRY(NAME, BF) FNGD_PRODUCER_V2_ENTRY_G(NAME, BF, 16, 48)
 FNGD_PRODUCER_V2_ENTRY(fn_gdn_dense_producer_v2_f32, false)
 FNGD_PRODUCER_V2_ENTRY(fn_gdn_dense_producer_v2_bf16, true)
+// TP2 trunk shard: the rank-local geometry (8 key / 24 value heads, 5120 conv channels). Same
+// body and arguments as the 16 / 48 entries above; the host launches grid x = 42 for it.
+FNGD_PRODUCER_V2_ENTRY_G(fn_gdn_dense_producer_v2_f32_k8v24, false, 8, 24)
+FNGD_PRODUCER_V2_ENTRY_G(fn_gdn_dense_producer_v2_bf16_k8v24, true, 8, 24)
 
 // The gated RMSNorm scale of one 128-wide head from its F32 values in LDS: the
 // serial sum of squares in channel order (every lane reads the same values and
@@ -612,10 +637,11 @@ extern "C" __global__ __launch_bounds__(64) void fn_gdn_dense_gate_rotate_bf16in
         rotated[(int)blockIdx.x * 256 + d0 + e] = values[e] * 0.0625f * signs2[d0 + e];
 }
 
-// Grid [rows * 12], block 64: gated norm + the out projection's A8 producer in
-// one launch, one wave per head pair. Pair g = row * 24 + p (p = 0..23) is one
-// 256-wide FWHT rotation group of the MQ6G256V2 out projection (K = 6144 = 24
-// pairs); lane L owns pair elements 8L..8L+7, i.e. head L >> 4, channels
+// Grid [rows * PAIRS / 2], block 64: gated norm + the out projection's A8 producer in
+// one launch, one wave per head pair. Pair g = row * PAIRS + p (p = 0..PAIRS-1; PAIRS = 24 for
+// the 48-head Flash-Next geometry, 12 for the 24-head rank-local shard geometry) is one
+// 256-wide FWHT rotation group of the MQ6G256V2 out projection (K = 6144 = 24 pairs, or 3072 =
+// 12 pairs); lane L owns pair elements 8L..8L+7, i.e. head L >> 4, channels
 // (L & 15) * 8.., which is exactly the register layout of `mq_rotate_x`'s FWHT:
 // the gate math (the rotate kernel's, one shared chain per head) feeds the
 // rotation (`mq_fwht256_lane`, `mq_rotate_x`'s signs and scale) in registers, and
@@ -625,7 +651,8 @@ extern "C" __global__ __launch_bounds__(64) void fn_gdn_dense_gate_rotate_bf16in
 // memory; the blocks are bytewise `mq_rotate_x_i8_gfx12` applied to
 // `fn_gdn_dense_gate_bf16in`'s output. The recurrent plane, z, norm and the
 // sign tables must be 16-byte aligned (host checked).
-extern "C" __global__ __launch_bounds__(64) void fn_gdn_dense_gate_i8(
+template <int PAIRS>
+static __device__ __forceinline__ void fn_gdn_dense_gate_i8_body(
     const unsigned short* recurrent,
     const float* z,
     const __hip_bfloat16* norm,
@@ -679,7 +706,57 @@ extern "C" __global__ __launch_bounds__(64) void fn_gdn_dense_gate_i8(
     float f[8];
 #pragma unroll
     for (int e = 0; e < 8; ++e) f[e] = values[e] * 0.0625f * sg2[e];
-    const int token = g / 24;
+    const int token = g / PAIRS;
     emit_i8_sidecar_from_producer8(f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], y,
-                                   g - token * 24, token, rows, lane);
+                                   g - token * PAIRS, token, rows, lane);
+}
+
+#define FNGD_GATE_I8_ENTRY(NAME, PAIRS)                                                       \
+    extern "C" __global__ __launch_bounds__(64) void NAME(                                    \
+        const unsigned short* recurrent, const float* z, const __hip_bfloat16* norm,          \
+        block_i8_128* y, const float* signs1, const float* signs2, int rows) {                \
+        fn_gdn_dense_gate_i8_body<PAIRS>(recurrent, z, norm, y, signs1, signs2, rows);        \
+    }
+FNGD_GATE_I8_ENTRY(fn_gdn_dense_gate_i8, 24)
+// TP2 trunk shard: 24 value heads = 12 head pairs per row (out projection K = 3072).
+FNGD_GATE_I8_ENTRY(fn_gdn_dense_gate_i8_p12, 12)
+
+// ---------------------------------------------------------------------------
+// Canonical Scan64 stream glue (CHUNK-CANONICAL-DESIGN §3.3): the Qwen4 live
+// convolution ring is `[3][channels]` indexed by the absolute row position mod
+// 3 (BF16-rounded F32), the stream prep (`gdn_chunk_prep`) keeps `[channel][3]`
+// newest-first raw F32 and reads F32 conv weights / gate constants.
+
+// ring -> stream layout at position `pm3 + 3k` (`pm3` = position mod 3).
+extern "C" __global__ __launch_bounds__(256) void fn_gdn_dense_ring_to_stream(
+    const float* ring, float* stream, int channels, int pm3) {
+    const int ch = (int)blockIdx.x * 256 + (int)threadIdx.x;
+    if (ch >= channels) return;
+    for (int k = 0; k < 3; ++k)
+        stream[ch * 3 + k] = ring[((pm3 + 2 - k) % 3) * channels + ch];
+}
+
+// stream layout -> ring at position `pm3 + 3k`; the ring holds BF16 roundings.
+extern "C" __global__ __launch_bounds__(256) void fn_gdn_dense_ring_from_stream(
+    const float* stream, float* ring, int channels, int pm3) {
+    const int ch = (int)blockIdx.x * 256 + (int)threadIdx.x;
+    if (ch >= channels) return;
+    for (int k = 0; k < 3; ++k)
+        ring[((pm3 + 2 - k) % 3) * channels + ch] = bf(stream[ch * 3 + k]);
+}
+
+// BF16 model constants -> F32 (exact): conv weight `[channels][4]`, then a_log
+// and dt_bias `[heads]` each, into `out` in that order.
+extern "C" __global__ __launch_bounds__(256) void fn_gdn_dense_stream_consts(
+    const __hip_bfloat16* conv_w, const __hip_bfloat16* a_log, const __hip_bfloat16* dt_bias,
+    float* out, int channels, int heads) {
+    const int i = (int)blockIdx.x * 256 + (int)threadIdx.x;
+    const int cw = channels * 4;
+    if (i < cw) {
+        out[i] = bf16_to_f32(conv_w[i]);
+    } else if (i < cw + heads) {
+        out[i] = bf16_to_f32(a_log[i - cw]);
+    } else if (i < cw + 2 * heads) {
+        out[i] = bf16_to_f32(dt_bias[i - cw - heads]);
+    }
 }

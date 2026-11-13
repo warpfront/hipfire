@@ -41,6 +41,9 @@ impl Serialize for RegName {
 pub enum Kind {
     V,
     S,
+    /// An accumulator register (CDNA AGPR). Tracked by the wait ledger as its own bank (never
+    /// aliasing the same-numbered VGPR) but not allocatable through [`RegPlan`].
+    A,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
 pub struct RegRef {
@@ -57,7 +60,11 @@ impl RegRef {
 }
 impl fmt::Display for RegRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let prefix = if self.kind == Kind::V { 'v' } else { 's' };
+        let prefix = match self.kind {
+            Kind::V => 'v',
+            Kind::S => 's',
+            Kind::A => 'a',
+        };
         if self.len == 1 {
             write!(f, "{prefix}{}", self.base)
         } else {
@@ -151,6 +158,8 @@ pub struct Scope {
 pub struct RegPlan {
     pub vgpr_budget: u16,
     pub sgpr_budget: u16,
+    /// AccVGPR budget (CDNA only; 0 on RDNA, where no AGPR exists).
+    pub agpr_budget: u16,
     pub ranges: Vec<Range>,
     pub scratch: Option<(u8, u8)>,
 }
@@ -162,9 +171,18 @@ impl RegPlan {
         Ok(Self {
             vgpr_budget,
             sgpr_budget,
+            agpr_budget: 0,
             ranges: Vec::new(),
             scratch: None,
         })
+    }
+    /// Allow AccVGPR ranges up to `budget` (CDNA's unified VGPR/AGPR file; at most 256).
+    pub fn with_agpr_budget(mut self, budget: u16) -> Result<Self, String> {
+        if budget > 256 {
+            return Err("register budget exceeds architectural limit".into());
+        }
+        self.agpr_budget = budget;
+        Ok(self)
     }
     pub fn scratch_pool(&mut self, base: u8, len: u8) -> Result<(), String> {
         if u16::from(base) + u16::from(len) > self.vgpr_budget {
@@ -182,16 +200,21 @@ impl RegPlan {
         live: Live,
     ) -> Result<(), String> {
         let name = name.into();
-        if !matches!(len, 1 | 2 | 4 | 8) {
-            return Err("register width must be 1, 2, 4 or 8".into());
+        if kind == Kind::A && self.agpr_budget == 0 {
+            return Err(format!(
+                "{name}: AGPR allocation needs a CDNA plan (RegPlan::with_agpr_budget)"
+            ));
+        }
+        if !matches!(len, 1 | 2 | 4 | 8) && !(kind == Kind::A && len == 16) {
+            return Err("register width must be 1, 2, 4 or 8 (16 for AGPRs)".into());
         }
         if kind == Kind::S && len > 1 && base % len != 0 {
             return Err(format!("misaligned SGPR {base}:{len}"));
         }
-        let budget = if kind == Kind::V {
-            self.vgpr_budget
-        } else {
-            self.sgpr_budget
+        let budget = match kind {
+            Kind::V => self.vgpr_budget,
+            Kind::A => self.agpr_budget,
+            Kind::S => self.sgpr_budget,
         };
         if u16::from(base) + u16::from(len) > budget {
             return Err(format!("{name} exceeds register budget"));
@@ -272,6 +295,14 @@ impl RegPlan {
             .max()
             .unwrap_or(0)
     }
+    pub fn next_free_agpr(&self) -> u16 {
+        self.ranges
+            .iter()
+            .filter(|r| r.kind == Kind::A)
+            .map(|r| u16::from(r.base) + u16::from(r.len))
+            .max()
+            .unwrap_or(0)
+    }
     pub fn next_free_sgpr(&self) -> u16 {
         self.ranges
             .iter()
@@ -297,28 +328,55 @@ impl RegPlan {
         Ok(())
     }
     pub fn verify_lifetimes(&self, order: &[String]) -> Result<(), String> {
+        // First occurrence of every label, once: `Live::contains` resolves each label to
+        // its first position in `order`, so a label is live in a range exactly when that
+        // position lies in the range's half-open interval `[first, last)`.
+        let mut position: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::with_capacity(order.len());
+        let mut firsts: Vec<usize> = Vec::with_capacity(order.len());
+        for (i, l) in order.iter().enumerate() {
+            if let std::collections::hash_map::Entry::Vacant(v) = position.entry(l.as_str()) {
+                v.insert(i);
+                firsts.push(i);
+            }
+        }
         for r in &self.ranges {
             if let Live::Between(first, last) = &r.live {
-                let a = order
-                    .iter()
-                    .position(|l| l == first)
+                let a = *position
+                    .get(first.as_str())
                     .ok_or_else(|| format!("missing lifetime label {first}"))?;
-                let b = order
-                    .iter()
-                    .position(|l| l == last)
+                let b = *position
+                    .get(last.as_str())
                     .ok_or_else(|| format!("missing lifetime label {last}"))?;
                 if a >= b {
                     return Err(format!("invalid lifetime for {}", r.name));
                 }
             }
         }
+        // `Live::contains`' interval over positions in `order`; empty when the start
+        // label is absent (it never is here: the loop above rejected that).
+        let span = |live: &Live| -> (usize, usize) {
+            match live {
+                Live::Whole => (0, usize::MAX),
+                Live::Between(start, end) => match position.get(start.as_str()) {
+                    Some(&first) => (
+                        first,
+                        position.get(end.as_str()).copied().unwrap_or(order.len()),
+                    ),
+                    None => (0, 0),
+                },
+            }
+        };
+        let spans: Vec<(usize, usize)> = self.ranges.iter().map(|r| span(&r.live)).collect();
         for (i, a) in self.ranges.iter().enumerate() {
-            for b in self.ranges.iter().skip(i + 1) {
-                if a.reg().overlaps(b.reg())
-                    && order
-                        .iter()
-                        .any(|label| a.live.contains(label, order) && b.live.contains(label, order))
-                {
+            for (j, b) in self.ranges.iter().enumerate().skip(i + 1) {
+                if !a.reg().overlaps(b.reg()) {
+                    continue;
+                }
+                let lo = spans[i].0.max(spans[j].0);
+                let hi = spans[i].1.min(spans[j].1);
+                let k = firsts.partition_point(|&p| p < lo);
+                if firsts.get(k).is_some_and(|&p| p < hi) {
                     return Err(format!("live ranges {} and {} overlap", a.name, b.name));
                 }
             }

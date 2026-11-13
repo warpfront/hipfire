@@ -80,30 +80,6 @@ fn main() {
             kv_seq,
         )
         .unwrap(),
-        "asym4" | "turbo4" => KvCache::new_gpu_asym4(
-            &mut gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_seq,
-        )
-        .unwrap(),
-        "asym3" | "turbo3" | "turbo" => KvCache::new_gpu_asym3(
-            &mut gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_seq,
-        )
-        .unwrap(),
-        "asym2" | "turbo2" => KvCache::new_gpu_asym2(
-            &mut gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_seq,
-        )
-        .unwrap(),
         other => panic!("unknown HIPFIRE_KV_MODE: {other}"),
     };
     let mut dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();

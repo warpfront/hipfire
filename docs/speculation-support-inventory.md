@@ -23,17 +23,9 @@ architecture is admitted by this page or by that registry.
 
 - **DFlash is not deprecated.** It is a supported mechanism; its default and
   per-model resolution are in [`CONFIG.md`](CONFIG.md).
-- **Deprecated since 0.4.0, removal in 0.5.0:** only the legacy contiguous
-  DFlash opt-in knobs `HIPFIRE_DFLASH_WINDOW=0` and `HIPFIRE_DFLASH_CTX_CAP`.
-  Setting either warns at DFlash load; the draft-declared window supersedes
-  them. Do not recommend them. Source: the `lifecycle: deprecated since 0.4.0,
-  removal 0.5.0` marker on `warn_deprecated_legacy_dflash_knobs` in
-  `crates/hipfire-arch-qwen35/src/dflash_spec.rs`; status rows in
-  [`env-vars.md`](env-vars.md) and [`CONFIG.md`](CONFIG.md).
-- **Deprecated since 0.4.0, removal in 0.5.0, adjacent to this page:** CASK /
-  TriAttention KV eviction and PFlash prefill compression. They still load and
-  warn, are unsupported, and are not a basis for any speculation claim. Qwen4
-  admission refuses them outright.
+- **Removed in 0.5.0:** the legacy contiguous DFlash opt-in knobs
+  `HIPFIRE_DFLASH_WINDOW=0` (now refused) and `HIPFIRE_DFLASH_CTX_CAP`
+  (ignored; the cap is fixed at 8192 rows). The draft-declared window applies.
 
 ## Vocabulary
 
@@ -83,11 +75,11 @@ n-gram arch gate in `build_speculator`:
 | gemma4 | 13 (+22 drafter) | Gemma 4 dense text | EAGLE draft (arch 22) via `params.drafter` only; **no** `build_speculator` mechanism (not in the n-gram gate; `params.draft` DFlash refused) | Arch-22 EAGLE drafter exists but is **gated off** | The EAGLE path runs only with `HIPFIRE_GEMMA4_EAGLE=1` (developer; it is slower than AR on gfx1151). Greedy requests verify by argmax; sampled and penalized requests by naive sampling (each verify row drawn with the AR sampler against the request's penalty history); `logprobs` come from the verify rows. E2B/E4B targets refuse a drafter. Default serve is plain AR |
 | muse-glimmer | 14 (+23 drafter) | Muse Glimmer dense text | DFlash with the arch-23 `muse_glimmer_assistant` draft | DFlash arch-23 drafter when supplied | Draft is loaded only when a draft path is set and `dflash_mode != off`; load failure falls back to AR. Route `GlimmerSpec` when a speculator exists. Gemma EAGLE `params.drafter` refused; n-gram not in the gate |
 | maple | 15 | Maple-Preview natively-ternary MoE | None | No | `MapleCarrier::caps()` declares no DFlash and no MTP; route is always `MapleAr` |
-| qwen4 | 16 | Qwen3.8-Flash-Next (Qwen4) | **Native MTP** (in-trunk layer) + MTP/ngram-mod takeover windows + **DFlash2** (arch-20 draft, explicit only) + SpecTarget (`mtp_spec.rs`, `dflash_target.rs`) | Yes — native MTP; external DFlash2 draft | Native greedy MTP attaches by default on admitted loads (`.mq4r` retained route keeps AR; `speculation.mtp off` disables). DFlash2 runs only on `--spec dflash` / `speculation.dflash = on` with a draft (`--model-draft`), single card, GPU-resident experts. Admission **refuses** DSpark, standalone n-gram, DDTree, EAGLE, adaptive KV, CASK, PFlash, a draft path without `dflash = on`, and DFlash under EP/PP. Route `Qwen4Spec` greedy, and sampled via rejection sampling (MTP when `mtp_sampled` is on; DFlash2 always, unpenalized requests). EP (2..=8 ranks) admits MTP only on explicit `--spec mtp` (see [`CHANGELOG.md`](../CHANGELOG.md)) |
-| raon | 19 | Raon-1-mini-preview (RDA + MLA + 4-stream mHC MoE) | **DFlash2** (KRAFTON `Raon-1-mini-preview-dflash2` draft through `dflash_convert`, shipped as the registry sidecar `raon-1-mini-preview-dflash2.mq4`, explicit only) + SpecTarget (`spec_impl.rs`) | Registry sidecar `raon-1-mini-preview-dflash2.mq4` (`raon-1-mini-preview:draft`, pulled with the model) | Opt-in only: `--spec dflash` / `speculation.dflash = on` with `--model-draft`, single card. `RaonCarrier` refuses a draft without `dflash = on`, `dflash = on` without a draft, and native MTP / DSpark / n-gram. Route `RaonSpec` (`generate_dflash` over the Raon carrier's `Qwen35Emit`, grammar off) for greedy and sampled requests, penalized or not: `Dflash2Speculator::supports_penalties()` is true, so the card's presence default (an unset sampled request) and explicit repeat/presence/frequency penalties keep the spec route, each verify row penalized against the generated-only history AR uses (`penalty_generated_only`); the prompt render, reasoning split, tool router and stop handling are `RaonAr`'s |
+| qwen4 | 16 | Qwen3.8-Flash-Next (Qwen4) | **Native MTP** (in-trunk layer) + MTP/ngram-mod takeover windows + **DFlash2** (arch-20 draft, explicit only) + SpecTarget (`mtp_spec.rs`, `dflash_target.rs`) | Yes — native MTP; external DFlash2 draft | Native greedy MTP attaches by default on admitted loads (`.mq4r` retained route keeps AR; `speculation.mtp off` disables). DFlash2 runs only on `--spec dflash` / `speculation.dflash = on` with a draft (`--model-draft`), single card, GPU-resident experts. Admission **refuses** DSpark, standalone n-gram, DDTree, EAGLE, adaptive KV, PFlash, a draft path without `dflash = on`, and DFlash under EP/PP. Route `Qwen4Spec` greedy, and sampled via rejection sampling (MTP when `mtp_sampled` is on; DFlash2 always, unpenalized requests). EP (2..=8 ranks) admits MTP only on explicit `--spec mtp` (see [`CHANGELOG.md`](../CHANGELOG.md)) |
+| raon | 19 | Raon-1-mini-preview (RDA + MLA + 4-stream mHC MoE) | **DFlash2** (KRAFTON `Raon-1-mini-preview-dflash2` draft through `dflash_convert`, shipped as the registry sidecar `raon-1-mini-preview-dflash2.mq4`, registry `auto` default) + SpecTarget (`spec_impl.rs`) | Registry sidecar `raon-1-mini-preview-dflash2.mq4` (`raon-1-mini-preview:draft`, pulled with the model) | Registry `speculation.dflash = auto` (explicit allow-list: `raon-1-mini-preview` declares the sidecar) wires the pulled draft; `--spec dflash` / `speculation.dflash = on` (with `--model-draft` or the pulled sidecar) forces it and fails closed without one; without the file `auto` logs and runs plain AR (Raon has no MTP); `speculation.dflash = off` opts out; a `topology.pp` load under `auto` ignores the draft and runs plain AR. Single card. `RaonCarrier` refuses a draft under `dflash = off`, `dflash = on` without a draft, and native MTP / DSpark / n-gram. Route `RaonSpec` (`generate_dflash` over the Raon carrier's `Qwen35Emit`, grammar off) for greedy and sampled requests, penalized or not: `Dflash2Speculator::supports_penalties()` is true, so the card's presence default (an unset sampled request) and explicit repeat/presence/frequency penalties keep the spec route, each verify row penalized against the generated-only history AR uses (`penalty_generated_only`); the prompt render, reasoning split, tool router and stop handling are `RaonAr`'s |
 
 **Has a learned or diffusion drafter path in-tree today:** qwen35 (DSpark ± DFlash ± MTP),
-qwen4 (native MTP, or DFlash2 on request), raon (DFlash2 on request), deepseek4 (DSpark/MTP), llama/plain-Qwen3 dense (DSpark and/or generic
+qwen4 (native MTP, or DFlash2 on request), raon (DFlash2, registry `auto` when the draft is pulled), deepseek4 (DSpark/MTP), llama/plain-Qwen3 dense (DSpark and/or generic
 DFlash when draft/sidecar loaded), muse-glimmer (DFlash arch-23 draft). gemma4 has an EAGLE
 drafter path that is gated off. **n-gram-capable with SpecTarget:** arch ids in the gate above
 (qwen4 excluded by admission). Everything else remains plain autoregressive unless source gains
@@ -108,9 +100,6 @@ a new arm.
   penalties, so a penalized request runs AR, and `min_p` is ignored (the daemon warns). Env
   opt-outs are documented (`HIPFIRE_DFLASH_TEMP_SPEC=0`, `HIPFIRE_DFLASH_CHAT=0`, etc.).
   Adaptive KV suppresses DFlash.
-- **Legacy contiguous knobs are deprecated since 0.4.0, removal 0.5.0:**
-  `HIPFIRE_DFLASH_WINDOW=0` and `HIPFIRE_DFLASH_CTX_CAP`. The default draft-declared window is the
-  supported path; see [Lifecycle](#lifecycle).
 - **llama 0/1:** `dflash_generic` requires arch_id=20 HFQ from `dflash_convert`.
   Chain is default; the tree arm is opt-in (`HIPFIRE_DFLASH_TREE=1`).
 - **qwen4 16 (DFlash2):** `Qwen4Carrier` builds the shared
@@ -131,10 +120,10 @@ a new arm.
   session / prefix cache (every request prefills cold; HIPF-143).
 - **raon 19 (DFlash2):** `RaonCarrier` builds the shared `Dflash2Speculator` from the KRAFTON
   `Raon-1-mini-preview-dflash2` draft (`dflash_convert`; `target_streams_per_layer = 4`) only on
-  `--spec dflash` / `speculation.dflash = on` with `--model-draft`. The shipped draft is the
+  `speculation.dflash = auto` (registry default for this tag when the sidecar is pulled; off with `speculation.dflash = off`) or `--spec dflash` / `speculation.dflash = on`. The shipped draft is the
   registry sidecar `raon-1-mini-preview-dflash2.mq4` (tag `raon-1-mini-preview:draft`; declared as
   the target's `dflash` file, so `hipfire pull raon-1-mini-preview` fetches it with the model and
-  `--spec dflash` finds it without `--model-draft`). It is produced with
+  the draft resolves without `--model-draft`). It is produced with
   `dflash_convert --input Raon-1-mini-preview-dflash2 --output raon-1-mini-preview-dflash2.mq4 --mq4v2`:
   MQ4V2-G256 for the 2-D weights, while the converter keeps `fc.weight` F16 for a multi-stream draft
   (`crates/hipfire-quantize/src/bin/dflash_convert.rs`, the `name == "fc.weight" &&
@@ -246,11 +235,11 @@ Use [`VALIDATION.md`](VALIDATION.md) as the sole claim → route selector.
 
 ### Retired coherence gates (historical only)
 
-`scripts/coherence-gate-*.sh` (including the DFlash and per-arch batteries) are
-**retired as current acceptance evidence** and deprecated since 0.4.0, removal in 0.5.0
-(with `_coherence_runner.py`, `awq_coherence_check.sh`, `pflash-gate.sh`). They must not be
-required for merge, promotion, or benchmark claims. They may be used only for historical
-reproduction. See [`VALIDATION.md`](VALIDATION.md) § Retired gates (historical only).
+`scripts/coherence-gate-*.sh` (including the DFlash and per-arch batteries),
+`_coherence_runner.py` and `awq_coherence_check.sh` were **removed in 0.5.0**; they
+were never current acceptance evidence. Use `scripts/serve_harness.py`
+(battery/chain) for serve-level coherence. See
+[`VALIDATION.md`](VALIDATION.md) § Retired gates (historical only).
 
 Campaign-specific omissions of coherence gates (for example an LFM effort) are
 **not** a universal rule for every arch.
@@ -261,7 +250,7 @@ Campaign-specific omissions of coherence gates (for example an LFM effort) are
 |---|---|
 | “n-gram is wired ⇒ ship as default” | **Rejected** — opt-in; no admission row |
 | “native MTP / paired DFlash is on by default ⇒ admitted product route” | **Rejected** — config defaults and registry layers are not rows in `admissions.yml` |
-| “DFlash is deprecated” | **Rejected** — only the legacy contiguous knobs (`HIPFIRE_DFLASH_WINDOW=0`, `HIPFIRE_DFLASH_CTX_CAP`) are deprecated (0.4.0 → 0.5.0) |
+| “DFlash is deprecated” | **Rejected** — DFlash is supported; the legacy contiguous knobs (`HIPFIRE_DFLASH_WINDOW=0`, `HIPFIRE_DFLASH_CTX_CAP`) were removed in 0.5.0 |
 | “LFM SpecTarget ⇒ LFM Redline / batched prefill promoted” | **Rejected** — separate surfaces; see [`REDLINE.md`](REDLINE.md) §11.4 |
 | Coherence-gate green as current acceptance | **Rejected** |
 | Stitching Redline product bench + daemon harness into route proof | **Rejected** — [`REDLINE.md`](REDLINE.md) §5/§7 |
@@ -292,7 +281,6 @@ Not in-tree support. Useful when planning; does not admit a route.
 | build_speculator / n-gram gate | `crates/hipfire-loader/src/spec_build.rs` |
 | Carriers (per-arch load + DSpark/build_speculator) | `crates/hipfire-loader/src/carriers.rs` (llama 0/1 DSpark>DFlash>n-gram; deepseek4 DSpark>MTP; `Qwen4Carrier` native MTP and `admit_options`; `Gemma4Carrier` EAGLE; `MuseGlimmerCarrier` arch-23 draft; `MapleCarrier` no speculation) |
 | qwen35 DSpark / DFlash / MTP load | `crates/hipfire-loader/src/lib.rs` (`finish_qwen35_load`, `dspark_speculator`, `resolve_qwen35_mtp_head_sourced`; dense-TP MTP head resolution) |
-| qwen35 DFlash + deprecated contiguous knobs | `crates/hipfire-arch-qwen35/src/dflash_spec.rs` (`warn_deprecated_legacy_dflash_knobs`) |
 | qwen35 / qwen4 MTP speculators | `crates/hipfire-arch-qwen35/src/mtp_speculator.rs`; `crates/hipfire-arch-qwen4/src/mtp_spec.rs`; qwen4 policy `crates/hipfire-loader/src/admission.rs` (`qwen4_native_mtp`) |
 | Generation route selection | `crates/hipfire-generate/src/ar.rs` (`GenerationRoute`, `select_generation_route`, `deepseek4_spec_requested_from_policy`); `crates/hipfire-generate/src/qwen.rs` (`generate_dflash`, `generate_spec`) |
 | Daemon draft guard / MTP presence | `crates/hipfire-daemon/src/main.rs` (`dflash_mode == "off"` draft skip; `mtp_weights_present`) |

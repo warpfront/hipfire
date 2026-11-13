@@ -1685,6 +1685,7 @@ impl SlotBackend {
             tools,
             enable_grammar: self.tool_grammar,
             stop,
+            min_tokens: 0,
             max_think: 0,
             max_tokens,
             assistant_prefix: prefix,
@@ -2347,7 +2348,7 @@ pub fn validate_load_caps(msg: &serde_json::Value, gpu_arch: &str) -> Option<Str
     }
     // The slot kernels own a fixed Q8 KV/state path plus the DFlash2
     // spec-decode sidecar (`params.draft` + `dflash_mode`). Other
-    // speculative/eviction sidecars stay refused rather than silently
+    // speculative sidecars stay refused rather than silently
     // ignored.
     let params = msg.get("params");
     if params
@@ -2357,29 +2358,12 @@ pub fn validate_load_caps(msg: &serde_json::Value, gpu_arch: &str) -> Option<Str
     {
         return Some("spec/drafter not supported in experimental multi-slot".to_string());
     }
-    for (key, label) in [("prefill_compression", "PFlash")] {
-        if params
-            .and_then(|p| p.get(key))
-            .and_then(|v| v.as_str())
-            .is_some_and(|v| !v.is_empty() && v != "off")
-        {
-            return Some(format!("{label} not supported in experimental multi-slot"));
-        }
-    }
     if params
         .and_then(|p| p.get("ngram_draft"))
         .and_then(|v| v.as_bool())
         == Some(true)
     {
         return Some("n-gram speculation not supported in experimental multi-slot".to_string());
-    }
-    if params.and_then(|p| p.get("cask")).and_then(|v| v.as_bool()) == Some(true)
-        || params
-            .and_then(|p| p.get("cask_sidecar"))
-            .and_then(|v| v.as_str())
-            .is_some_and(|v| !v.is_empty())
-    {
-        return Some("CASK not supported in experimental multi-slot".to_string());
     }
     if params
         .and_then(|p| p.get("kv_adaptive"))
@@ -2416,8 +2400,14 @@ pub fn validate_load_caps(msg: &serde_json::Value, gpu_arch: &str) -> Option<Str
         .and_then(|v| v.as_str())
         .filter(|v| !v.is_empty())
     {
-        let accepted_list = "q8|asym2|asym3|asym4|fwht2|fwht3|fwht4|bf16|f16, \
+        let accepted_list = "q8|fwht2|fwht3|fwht4|bf16|f16, \
                              fp8 on gfx1201 only; 'auto'/unset = q8";
+        if let Some(removed) = hipfire_runtime::kv_mode::removed_kv_name_error(raw) {
+            return Some(format!(
+                "experimental multi-slot refuses kv_mode='{raw}': {removed} \
+                 (accepted: {accepted_list})"
+            ));
+        }
         match hipfire_runtime::kv_mode::resolve_qwen35_slots(raw, gpu_arch) {
             // Arch gate (or any future hard error): refuse with the named
             // message verbatim — it already names the arch and the fix.
@@ -2625,9 +2615,8 @@ pub fn validate_generate_caps(msg: &serde_json::Value) -> Option<String> {
     if let Err(e) = hipfire_runtime::stop_sequence::parse_stop_field(msg.get("stop")) {
         return Some(e);
     }
-    // logprobs/top_logprobs are supported on the slot path: the engine
-    // forces AR and attaches per-token log-probabilities. Validate the
-    // OpenAI contract here; malformed values remain 400s.
+    // logprobs/top_logprobs are supported on the slot path: the engine forces
+    // AR and attaches per-token log-probabilities; malformed values are 400s.
     if let Some(v) = msg.get("logprobs") {
         if !v.is_boolean() {
             return Some("logprobs must be a boolean".to_string());
@@ -2644,6 +2633,14 @@ pub fn validate_generate_caps(msg: &serde_json::Value) -> Option<String> {
         if n > 20 {
             return Some("top_logprobs must be an integer between 0 and 20".to_string());
         }
+    }
+    // `min_tokens` holds EOS and stops inactive; the slot engine's EOS checks
+    // know nothing of it. Zero is neutral, anything else is refused.
+    if msg
+        .get("min_tokens")
+        .is_some_and(|v| !v.is_null() && v.as_u64() != Some(0))
+    {
+        return Some("min_tokens not supported in experimental multi-slot".to_string());
     }
     // response_format: the ONLY supported type is json_schema (spec §7.1:
     // "reject missing requested semantics. An optimization bypass is
@@ -3735,44 +3732,6 @@ mod tests {
     fn generate_caps_accepts_tools_valid_stop_and_logprobs() {
         let m = json!({"tools": [{"type":"function"}], "experimental_multi_slot": true});
         assert!(validate_generate_caps(&m).is_none());
-        for rf in [
-            json!({"type": "json_object"}),
-            json!({"type": "json_schema", "json_schema": {"schema": {"type": "object"}}}),
-        ] {
-            let m = json!({"response_format": rf, "experimental_multi_slot": true});
-            assert!(
-                validate_generate_caps(&m).is_none(),
-                "response_format {rf} must be accepted"
-            );
-        }
-        for stop in [json!(["END"]), json!("END"), json!([]), json!("")] {
-            let m = json!({"stop": stop, "experimental_multi_slot": true});
-            assert!(
-                validate_generate_caps(&m).is_none(),
-                "stop={stop:?} must be accepted (empty is neutral, non-empty is enforced)"
-            );
-        }
-        for bad in [
-            json!([1]),
-            json!("x".repeat(65)),
-            json!(["a", "b", "c", "d", "e"]),
-        ] {
-            let m = json!({"stop": bad, "experimental_multi_slot": true});
-            assert!(
-                validate_generate_caps(&m).is_some(),
-                "stop={bad:?} must be refused by the shared parser"
-            );
-        }
-        for logprobs in [
-            json!({"logprobs": true, "experimental_multi_slot": true}),
-            json!({"logprobs": true, "top_logprobs": 5, "experimental_multi_slot": true}),
-            json!({"logprobs": false, "experimental_multi_slot": true}),
-        ] {
-            assert!(
-                validate_generate_caps(&logprobs).is_none(),
-                "valid logprobs must be accepted: {logprobs}"
-            );
-        }
         for bad in [
             json!({"logprobs": "yes", "experimental_multi_slot": true}),
             json!({"top_logprobs": 5, "experimental_multi_slot": true}),
@@ -3782,6 +3741,19 @@ mod tests {
                 validate_generate_caps(&bad).is_some(),
                 "malformed logprobs must be refused: {bad}"
             );
+        }
+        // `stop` is now enforced on the slot path, not refused.
+        let m2 = json!({"stop": ["END"], "experimental_multi_slot": true});
+        assert!(validate_generate_caps(&m2).is_none());
+        // logprobs are supported on the slot path (AR fallback).
+        let m3 = json!({"logprobs": true, "experimental_multi_slot": true});
+        assert!(validate_generate_caps(&m3).is_none());
+        // `min_tokens` has no EOS gate in the slot engine: refused above zero.
+        let m4 = json!({"min_tokens": 4, "experimental_multi_slot": true});
+        assert!(validate_generate_caps(&m4).is_some());
+        for neutral in [json!(0), json!(null)] {
+            let m5 = json!({"min_tokens": neutral, "experimental_multi_slot": true});
+            assert!(validate_generate_caps(&m5).is_none());
         }
         // Finite think caps are ENFORCED (the grammar cursor force-closes the
         // span at the budget) and are therefore never refused at the door —
@@ -3886,8 +3858,6 @@ mod tests {
         assert!(validate_load_caps(&m3, "gfx1100").is_some());
         let m4 = json!({"params": {"drafter": "some.hfq"}});
         assert!(validate_load_caps(&m4, "gfx1100").is_some());
-        let m5 = json!({"params": {"prefill_compression": "on"}});
-        assert!(validate_load_caps(&m5, "gfx1100").is_some());
     }
 
     #[test]
@@ -4114,9 +4084,7 @@ mod tests {
             "kv_adaptive": "off",
             "dflash_mode": "off",
             "mtp_mode": "off",
-            "prefill_compression": "off",
-            "ngram_draft": false,
-            "cask": false
+            "ngram_draft": false
         }});
         assert_eq!(validate_load_caps(&supported, "gfx1100"), None);
         // The full static KV ladder plus the flat 2-byte native tiers is
@@ -4124,14 +4092,18 @@ mod tests {
         // strings the policy rejects — garbage — and fp8 off gfx1201 are
         // refused here, loudly, before any GPU work. The gate is exact per
         // arch string, not per host card, so these run on any CI machine.
-        for kv in [
-            "asym3", "asym2", "asym4", "fwht2", "fwht3", "fwht4", "bf16", "f16", "auto",
-        ] {
+        for kv in ["fwht2", "fwht3", "fwht4", "bf16", "f16", "auto"] {
             assert_eq!(
                 validate_load_caps(&json!({"params": {"kv_mode": kv}}), "gfx1100"),
                 None,
                 "ladder tier {kv} must be accepted"
             );
+        }
+        // Names removed in 0.5.0 are refused naming the removal.
+        for kv in ["asym2", "asym3", "asym4", "legacy-asym3", "turbo", "turbo3"] {
+            let refused = validate_load_caps(&json!({"params": {"kv_mode": kv}}), "gfx1100")
+                .unwrap_or_else(|| panic!("{kv} must be refused"));
+            assert!(refused.contains("removed in 0.5.0"), "{kv}: {refused}");
         }
         // fp8: gfx1201 admits, every other arch refuses with a named error.
         assert_eq!(
@@ -4149,9 +4121,7 @@ mod tests {
         for params in [
             json!({"kv_mode": "garbage"}),
             json!({"ngram_draft": true}),
-            json!({"cask": true}),
             json!({"drafter": "some-drafter"}),
-            json!({"prefill_compression": "on"}),
         ] {
             assert!(
                 validate_load_caps(&json!({"params": params}), "gfx1201").is_some(),

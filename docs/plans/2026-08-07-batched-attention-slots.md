@@ -1208,7 +1208,7 @@ Guards the §4.4 trap — a silent fall back to q8 would make an unimplemented a
 assert!(
     asym3_bytes_per_pos < q8_bytes_per_pos,
     "asym3 arena is not smaller than Q8 — the asym3 path is not active \
-     (see spec §4.4: QWEN35_PARO_POLICY silently downgrades asym3 to q8)"
+     (see spec §4.4: a loader KV policy silently downgrades asym3 to q8)"
 );
 ```
 
@@ -1509,7 +1509,7 @@ Spec §13. asym3 is not what these models ship with; this decides whether it may
 
 - [ ] **Step 1: Confirm the resolved KV mode on both arms**
 
-Run each model once per arm and capture the carrier's `KV cache:` log line. Per spec §4.4, `HIPFIRE_KV_MODE=asym3` silently yields q8 on the PaRo loader path, which would make the whole gate meaningless.
+Run each model once per arm and capture the carrier's `KV cache:` log line. Per spec §4.4, `HIPFIRE_KV_MODE=asym3` silently yields q8 on loader paths whose KV policy omits it, which would make the whole gate meaningless.
 
 ```bash
 for m in qwen3.6:27b qwen3.6:35b-a3b; do
@@ -1519,7 +1519,7 @@ for m in qwen3.6:27b qwen3.6:35b-a3b; do
   done
 done
 ```
-Expected: for each model the two lines differ, and the `asym3` line names asym3. If they match, **stop** — `QWEN35_PARO_POLICY` has silently downgraded asym3 to q8 (spec §4.4) and the gate would be comparing q8 against q8.
+Expected: for each model the two lines differ, and the `asym3` line names asym3. If they match, **stop** — a loader KV policy has silently downgraded asym3 to q8 (spec §4.4) and the gate would be comparing q8 against q8.
 
 - [ ] **Step 2: Run the KLD comparison**
 

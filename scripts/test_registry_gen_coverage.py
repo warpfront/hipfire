@@ -24,7 +24,7 @@ spec = importlib.util.spec_from_file_location(
 rg = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(rg)
 
-SIDECAR_KINDS = ("triattn", "mtp", "dflash", "vision", "t5", "clip", "qwen3", "vae")
+SIDECAR_KINDS = ("mtp", "dflash", "vision", "t5", "clip", "qwen3", "vae")
 
 
 def _load(path: Path) -> dict:

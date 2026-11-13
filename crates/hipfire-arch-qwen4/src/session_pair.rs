@@ -29,9 +29,20 @@ impl PairSessionStage {
         index: usize,
         src: [&GpuTensor; N],
     ) -> Result<(), BundleError> {
+        self.copy_slice(gpu, index, &src)
+    }
+
+    /// [`Self::copy_parts`] over a runtime-sized run of parts (a GDN layer's
+    /// recurrent slot, residual, conv and carry).
+    pub(crate) fn copy_slice(
+        &self,
+        gpu: &mut Gpu,
+        index: usize,
+        src: &[&GpuTensor],
+    ) -> Result<(), BundleError> {
         let dst = self
             .fixed
-            .get(index..index + N)
+            .get(index..index + src.len())
             .ok_or_else(|| BundleError::Forward("paired snapshot fixed index mismatch".into()))?;
         for (src, dst) in src.iter().zip(dst) {
             if src.byte_size() != dst.byte_size() || !src.byte_size().is_multiple_of(4) {
@@ -42,13 +53,17 @@ impl PairSessionStage {
         }
         // A copy kernel is stream-ordered even on the default stream;
         // copy_d2d's legacy-stream fallback would synchronize the host.
-        let regions: [_; N] = std::array::from_fn(|i| rdna_compute::tensor_ops::CopyRegion {
-            dst: &dst[i].buf,
-            dst_offset: 0,
-            src: &src[i].buf,
-            src_offset: 0,
-            bytes: src[i].byte_size(),
-        });
+        let regions: Vec<_> = src
+            .iter()
+            .zip(dst)
+            .map(|(src, dst)| rdna_compute::tensor_ops::CopyRegion {
+                dst: &dst.buf,
+                dst_offset: 0,
+                src: &src.buf,
+                src_offset: 0,
+                bytes: src.byte_size(),
+            })
+            .collect();
         rdna_compute::tensor_ops::copy_regions(gpu, &regions).map_err(BundleError::Hip)
     }
 
@@ -559,11 +574,15 @@ pub(crate) fn ple_history_after(entry: PleHistory, tokens: &[u32]) -> PleHistory
 }
 
 /// Index of every fixed part in a stage: exactly the order of
-/// `Qwen4State::session_layout` (GDN recurrent + conv per layer, then each QSA
-/// layer's selection, then the PLE convolution, then the HC feedback).
+/// `Qwen4State::session_layout` (per GDN layer the recurrent slot, its live
+/// residual when the state has one, the conv and the stream carry when the
+/// state carries one; then each QSA layer's selection, then the PLE
+/// convolution, then the HC feedback).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct StageLayout {
     pub(crate) gdn: usize,
+    /// Fixed parts one GDN layer contributes.
+    pub(crate) gdn_parts: usize,
     pub(crate) qsa: usize,
     pub(crate) ple: bool,
 }
@@ -572,21 +591,25 @@ impl StageLayout {
     pub(crate) fn of(state: &Qwen4State) -> Self {
         Self {
             gdn: state.gdn.len(),
+            gdn_parts: state
+                .gdn
+                .first()
+                .map_or(2, |layer| layer.session_parts().len()),
             qsa: state.qsa.len(),
             ple: state.ple_conv.is_some(),
         }
     }
     pub(crate) fn fixed_len(&self) -> usize {
-        2 * self.gdn + self.qsa + usize::from(self.ple) + 1
+        self.gdn_parts * self.gdn + self.qsa + usize::from(self.ple) + 1
     }
     pub(crate) fn gdn_index(&self, slot: usize) -> Option<usize> {
-        (slot < self.gdn).then_some(2 * slot)
+        (slot < self.gdn).then_some(self.gdn_parts * slot)
     }
     pub(crate) fn qsa_index(&self, slot: usize) -> Option<usize> {
-        (slot < self.qsa).then_some(2 * self.gdn + slot)
+        (slot < self.qsa).then_some(self.gdn_parts * self.gdn + slot)
     }
     pub(crate) fn ple_index(&self) -> Option<usize> {
-        self.ple.then_some(2 * self.gdn + self.qsa)
+        self.ple.then_some(self.gdn_parts * self.gdn + self.qsa)
     }
     pub(crate) fn feedback_index(&self) -> usize {
         self.fixed_len() - 1
@@ -1699,7 +1722,7 @@ impl Qwen4Bundle {
         if let Some(slot) = self.state.gdn_local(layer) {
             let gdn = self.state.gdn.get(slot).ok_or_else(missing)?;
             let index = layout.gdn_index(slot).ok_or_else(missing)?;
-            stage.copy_parts(gpu, index, [&gdn.recurrent, &gdn.conv])?;
+            stage.copy_slice(gpu, index, &gdn.session_parts())?;
             live.book
                 .record_gdn(cut_index, layer)
                 .map_err(BundleError::Forward)?;
@@ -2040,6 +2063,7 @@ mod slowlink_txn_tests {
             }),
             layout: StageLayout {
                 gdn: map.gdn_count(),
+                gdn_parts: 2,
                 qsa: map.qsa_count(),
                 ple: config.ple.is_some(),
             },

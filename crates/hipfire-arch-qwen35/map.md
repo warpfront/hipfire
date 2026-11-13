@@ -5,20 +5,19 @@
 
 ## Purpose
 
-Qwen3.5 dense + MoE (A3B/A10B/A17B) hybrid: DeltaNet + full attention, MTP/DSpark hooks. Owns `qwen35/` model forward (config/weights/state/tiled attention), `speculative.rs` qwen35-specific spec glue (deeply coupled to `qwen35::*` symbols; `pflash.rs` branch evacuated to `hipfire-pflash` per B3), arch-specific kernels, and the `Architecture` impl used by `Qwen35Carrier`/`Qwen35VL` text path. The `//!` docs in [`src/lib.rs`](src/lib.rs) note the future move of `speculative.rs` back to runtime once it becomes arch-generic.
+Qwen3.5 dense + MoE (A3B/A10B/A17B) hybrid: DeltaNet + full attention, MTP/DSpark hooks. Owns `qwen35/` model forward (config/weights/state/tiled attention), `speculative.rs` qwen35-specific spec glue (deeply coupled to `qwen35::*` symbols), arch-specific kernels, and the `Architecture` impl used by `Qwen35Carrier`/`Qwen35VL` text path. The `//!` docs in [`src/lib.rs`](src/lib.rs) note the future move of `speculative.rs` back to runtime once it becomes arch-generic.
 
 ## Gotchas
 
 - `speculative.rs` is still qwen35-coupled — do not move it to `hipfire-runtime` without de-tangling the `qwen35::*` deps.
-- PFlash text path now lives in `hipfire-pflash` — this crate must not reintroduce a `pflash.rs` sibling.
 - Compact root-routed EP decode, `prefill_lane`, `forward_tick`, and `forward_prefill_batch_ep` use runtime's checked collective schedule. The pure prefill parameter builder is shared with all-rank preflight; do not reintroduce local zero/transfer/reduce/add sequencing.
 - Native MTP is explicit-only here: `MTP_MEASURED_AR_FLOOR` (`src/lib.rs`) is `false`, so `speculation.mtp = auto` keeps plain AR and loads no head (`hipfire_config::mtp_mode_admits`); only `--spec mtp` / `speculation.mtp = on` arms it. Do not rearm `auto` from head presence.
 - Resident Qwen35 MoE ordinary prefill admits the 8192-row `RESIDENT_MOE_CHUNK_ROWS` rung only when actual resident placement, supported producer dtypes, full-width IU4 scratch reservation and coverage, and `resident_moe_rung_fits` all pass. The fit charges projected full PBS/grouped scratch, the checked `rows*(2*v_dim+256)*4` DeltaNet addition, projection and full-row Q16 deficits, mapped KV capacity and 1 GiB headroom against actual free VRAM; refusal keeps `prefill_max_batch_for_model`. Explicit `HIPFIRE_PREFILL_MAX_BATCH` or `prefill.chunk_rows` below the rung keep the incumbent. Production and installed-facts tests share `plan_ordinary_prefill`; the default is planned as a virtual explicit-8192 PBS owner. Credit applies only to a genuinely reusable widened cache or the kept same-target wrapper owner; smaller, mismatched and lean owners are replaced and the full rung is charged. The allocation-free `DeltaNetStateGeometry` exposes every S/EF owner's extent. The wrapper checks actual-row and 512-row-seam eligibility before mapping/querying/allocating; small/config-off/capture refusals retain their prior resource plan. Generic `commit_stride=512` is not proof of any particular MoE/GDN kernel route; actual launch evidence is separate.
-- Native cache support and implicit selection are separate in [`src/carrier.rs`](src/carrier.rs) and [`hipfire-runtime/src/kv_mode.rs`](../hipfire-runtime/src/kv_mode.rs). Exact-gfx1201 single-GPU native FP8 support and `qwen35_native_auto_eligible` include both H16/KV2/D256 A3B and H24/KV4/D256, without adaptive tiering or CASK. KV selection and FA2 selection are independent, stackable decisions: observing native Auto FP8 does not prove that a particular FA2 or PM/Qprep subroute launched.
+- Native cache support and implicit selection are separate in [`src/carrier.rs`](src/carrier.rs) and [`hipfire-runtime/src/kv_mode.rs`](../hipfire-runtime/src/kv_mode.rs). Exact-gfx1201 single-GPU native FP8 support and `qwen35_native_auto_eligible` include both H16/KV2/D256 A3B and H24/KV4/D256, without adaptive tiering. KV selection and FA2 selection are independent, stackable decisions: observing native Auto FP8 does not prove that a particular FA2 or PM/Qprep subroute launched.
 - [`hipfire-dispatch/src/pipeline/batched_attention.rs`](../hipfire-dispatch/src/pipeline/batched_attention.rs) names the PM cache with `fa_pm_kv_codec(kv_cache) -> Option<FaPrefillKvCodec>`: Q8 K with 8-bit V is `Some(Q8_0)`, native FP8 is `Some(Fp8E4M3)`, all other caches are `None` and keep the incumbent. `batch_chunk_fa_attend` asks the shared codec-aware `Gpu::fa_prefill_pm_admitted` before commit-stride segmentation and multirow fallback. An admitted whole chunk takes PM once; dense H24/KV4, tree/independent layouts and every refusal retain their existing paths. The F5 Q-prep helpers (`fa_pm_qprep_admitted`, `batch_chunk_fa_pm_qprep_{prep,direct}`) and the GDN chunk-scan views/layer live there and in `batched_deltanet.rs`; the arch-side MoE bodies call those copies.
 - `HIPFIRE_FA_PREFILL_PM` and `HIPFIRE_FA_PREFILL_PM_QPREP` are the same typed public flags for both codecs, resolved through `Gpu::fa_prefill_pm_flag` / `fa_prefill_pm_qprep_flag`. Q8 retains its exact-gfx1201 qualification; the existing `FP8_KV_QUALIFIED` table separately qualifies `FaPrefillPm` and `FaPrefillPmQprep` on gfx1201. Unset follows the corresponding qualified table and explicit `0`/`1` overrides it; PM `0` refuses F5 for either codec. The core carry adds no qualification rows or default promotions.
 - The FP8 PM direct kernel preserves F16 Q and its arithmetic order while reusing one 32-KiB dynamic LDS stage for K then V, with all five waves participating in four ordered barrier pairs. Its descriptor has fixed LDS 0 and the production codec-specific launcher supplies dynamic LDS 32768; Q8 retains its original two-plane image and dynamic LDS 65536. The direct ABI remains 60 bytes. A driver occupancy comparison at dynamic 32768 versus 65536 uses the same new FP8 kernel; it is not an old-image occupancy comparison. Resident IU4 down remains the qualified NT4 route; the regressing streamed down-NT8 experiment is excluded.
-- F5's `fa_pm_kv_keys` requires the exact paired tier plan: `KvWriteQ8_0Batched` + `AttnQ8_0KvBatchedMasked`, or `KvWriteFp8E4m3Batched` + `AttnFp8E4m3KvBatchedMasked`. `fa_pm_qprep_admitted` additionally requires resolved flags/raw inventory, H16/KV2/D256, `n_rot = 64`, half-split RoPE (legacy interleaved RoPE is refused), eager full-causal whole-chunk `start_pos + n == max_ctx_len <= physical_cap` and no triattn tap. Dense additionally excludes DFlash fusion and fp8q/A4/in-place-gate epilogues; other layouts/capture/recording keep the incumbent.
+- F5's `fa_pm_kv_keys` requires the exact paired tier plan: `KvWriteQ8_0Batched` + `AttnQ8_0KvBatchedMasked`, or `KvWriteFp8E4m3Batched` + `AttnFp8E4m3KvBatchedMasked`. `fa_pm_qprep_admitted` additionally requires resolved flags/raw inventory, H16/KV2/D256, `n_rot = 64`, half-split RoPE (legacy interleaved RoPE is refused), eager full-causal whole-chunk `start_pos + n == max_ctx_len <= physical_cap`. Dense additionally excludes DFlash fusion and fp8q/A4/in-place-gate epilogues; other layouts/capture/recording keep the incumbent.
 - A3B H16/KV2 native FA2 runs the checked Raw two-plane Q (`fa_q_batch` codes + scales) through the A3B Direct/Range pair: general true-prefill tails (2..=32768, tiny tails included) take the whole-batch native Direct (`fa_a3b_native_prefill_rows`) before the F32 fallback; `batch_chunk_fa_attend_ragged_fp8q` still writes native-FP8 K/V once and launches prefix (`start_pos + prefix`) plus 64..=511 tail Range attentions over segment views of the whole-chunk F32 output (legacy `fa_ragged_packet_split` unchanged); Range supports 1+ rows but GEN Range unobserved. AR/verify, legacy H24/F16/Q8 and default behavior unchanged.
 - The F5 single-chunk wrappers `batch_chunk_full_attn_attn` and `hipfire_dispatch::pipeline::batched_moe::execute_attention_moe_layer_batched` (via `attention_moe_prep_batched` / `attention_moe_finish_batched`) call `batch_chunk_fa_pm_qprep_prep`: K RMSNorm, K-only half-split RoPE capturing this chunk's `[n,64]` angles, then codec-independent `Gpu::fa_pm_qprep_exact` producing gate and final F16 Q. `fa_pm_qprep_views` places Q16 and angles disjointly in this chunk's `fa_q_batch`, not shared scratch. `batch_chunk_fa_pm_qprep_direct` then writes K followed by V with the selected `kv_cache_write_q8_0_batched` or `kv_cache_write_fp8_e4m3_batched` and calls `Gpu::fa_prefill_pm_direct_codec`, without a second Q preconvert. MoE prep/finish carry `fa_pm_qprep` so prepared Q is consumed once; paired-chunk merged attend passes `false`, and independent/multi-request lanes do not consume these bytes.
 - Accepted F1/F2/F4 prerequisites are the existing IU4 combine-v2, resident NT8 gate/up and sealed two-row router gates in [`hipfire-dispatch/src/pipeline/moe_program.rs`](../hipfire-dispatch/src/pipeline/moe_program.rs), [`rdna-compute/src/gemm.rs`](../rdna-compute/src/gemm.rs) and [`hipfire-dispatch/src/pipeline/sealed_moe.rs`](../hipfire-dispatch/src/pipeline/sealed_moe.rs). F3's `prefill_iu4_producer_fused_admitted` selects exact runtime-eight-candidate norm/rotate and FA-output-rotate producers under `HIPFIRE_PREFILL_IU4_PRODUCER_FUSED`, uniform MQ4G256V2, raw inventory and existing eager IU4 admission. Its checked fused-QKV boundary is `FusedQkvFamily::emit_rmsnorm_iu4_exact` / `run_iu4_prepared` in [`hipfire-dispatch/src/families/fused_qkv.rs`](../hipfire-dispatch/src/families/fused_qkv.rs); dense/C2 defaults remain unchanged. F1–F4 do not key on KV format; historical Q8 evidence is not a new FP8 measurement.
@@ -44,7 +43,6 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `Qwen35Bundle`
   - `release`
   - `SharedWeightLease`
-  - `validate_ddtree_cask`
   - `validate_gfx1100_split_verify_kv`
   - `validate_native_kv_admission`
   - `weight_host_card_identity`
@@ -298,6 +296,7 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `new_vmm`
   - `q8`
   - `release`
+  - `set_slots_moe_cohort_override`
   - `SlotDecodeGraph`
   - `SlotDescStaging`
   - `SlotKvTier`
@@ -609,7 +608,6 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `new`
   - `new_qwen35_mtp_lane_state`
   - `Qwen35MtpDrafter`
-- [`src/paro_moe.rs`](src/paro_moe.rs)
 - [`src/qwen35.rs`](src/qwen35.rs)
   - `batch`
   - `config`
@@ -751,7 +749,6 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `load_weights_ep_rank_with_fault`
   - `load_weights_with_fault`
   - `new`
-  - `ParoSource`
   - `preflight_weights_dense_tp`
   - `qwen35_layer_bytes`
   - `qwen35_tensor_name_candidates`
@@ -803,6 +800,8 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `forward_prefill_batch_capped`
   - `forward_prefill_batch_capture_extract_hidden`
   - `forward_prefill_batch_capture_hidden`
+  - `forward_prefill_batch_ordinary`
+  - `forward_prefill_batch_ordinary_capped`
   - `forward_prefill_batch_single_chunk_captured`
   - `forward_prefill_batch_single_chunk_captured_opts`
   - `forward_prefill_batch_with_pbs`
@@ -821,6 +820,7 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `prefill_max_batch`
   - `prefill_max_batch_ep`
   - `prefill_max_batch_tp`
+  - `provision_gdn_stream`
   - `qwen35_layer_batch_admissible`
   - `request_kv_growth_deduction`
   - `upload_prefill_batch_inputs`
@@ -871,9 +871,22 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `VlPrefillGuard`
   - `VlPrefillInputs`
 - [`src/qwen35/weights.rs`](src/qwen35/weights.rs)
+  - `apply_image`
+  - `attach_carry`
+  - `begin_append`
+  - `bind_plans`
+  - `bind_recipe`
+  - `bump_generation`
+  - `bytes`
   - `capture`
   - `capture_dense`
+  - `carry_bytes`
+  - `carry_families`
+  - `check_image`
+  - `commit_candidates`
   - `config_fingerprint`
+  - `copy_from`
+  - `DeltaNetCarry`
   - `DeltaNetLayerWeights`
   - `DeltaNetMoeLayerWeights`
   - `DeltaNetState`
@@ -882,6 +895,7 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `ep_shard`
   - `expert_to_rank`
   - `ExpertWeights`
+  - `families`
   - `for_each_dense_tensor`
   - `for_each_dense_tensor_mut`
   - `free_gpu`
@@ -891,20 +905,31 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `from_weight`
   - `FullAttnLayerWeights`
   - `FullAttnMoeLayerWeights`
+  - `GdnStreamBinding`
+  - `GdnStreamIdentity`
+  - `GdnStreamImage`
+  - `GdnStreamOwner`
+  - `geometry_for`
   - `GpuTensorDescriptor`
   - `has_cpu_deferred_experts`
   - `hipfire_dispatch`
+  - `identity`
+  - `image`
+  - `is_open`
+  - `lane_meta`
+  - `layers`
   - `LayerWeights`
   - `matches_config`
   - `mixed_expert_tag`
   - `MoeFfnWeights`
-  - `MoeParoSidecars`
   - `native_mtp_refusal`
   - `new`
+  - `new_batched_with_carry`
   - `new_batched_with_quant`
+  - `new_with_carry_multi`
   - `new_with_quant`
   - `new_with_quant_multi`
-  - `ParoDescriptor`
+  - `owned_bytes`
   - `Qwen35DenseHydrateError`
   - `Qwen35EpConfigFingerprint`
   - `Qwen35EpShardInfo`
@@ -918,10 +943,15 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `rank_count`
   - `rank_seal`
   - `reset`
+  - `reset_meta`
+  - `seal_sealed_at`
+  - `seal_streams`
   - `SharedExpertWeights`
   - `source_identity`
+  - `state_abi_tag`
   - `validate_dense`
   - `WeightTensorDescriptor`
+  - `workspace`
 - [`src/serve_engine.rs`](src/serve_engine.rs)
   - `cancel_waiting`
   - `close`
@@ -1014,13 +1044,15 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `advance_head_by`
   - `append_prefill_hidden_host`
   - `apply_commit_delta`
-  - `apply_eviction_retain_to_draft`
+  - `attested_checkpoint_positions`
   - `block_row_slot`
   - `build_dflash_noise_embeddings`
   - `build_dflash_noise_embeddings_weights`
   - `bulk_n_items`
   - `bytes_for`
   - `bytes_len`
+  - `checkpoint_prefix_attests`
+  - `checkpoint_prefix_hash`
   - `clear`
   - `commit_delta`
   - `commit_staging_to_ring`
@@ -1103,6 +1135,7 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `RailgunStep`
   - `read_ddtree_meta_stats`
   - `read_seed_oracle_stats`
+  - `recipe_id`
   - `record`
   - `record_ddtree_meta_nodes`
   - `replay_from_snapshot_admits`
@@ -1137,7 +1170,9 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `seed_target_hidden_suffix_abortable_parts`
   - `SeedOracleStats`
   - `smoke_test`
+  - `snapshot_alloc_failure_action`
   - `snapshot_source_armed`
+  - `SnapshotAllocFailure`
   - `SparseQRows`
   - `spec_step_ddtree`
   - `spec_step_ddtree_batched`
@@ -1149,11 +1184,18 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `SpecStats`
   - `SpecStepResult`
   - `split_lane_into`
+  - `stream_identity`
+  - `stream_meta`
+  - `take_dn_boundary_checkpoint`
   - `take_dn_checkpoint`
+  - `take_dn_checkpoint_pinned`
+  - `take_turn_checkpoint`
+  - `take_turn_checkpoint_before_chunk`
   - `TargetRowRef`
   - `TargetRowsScratch`
   - `tau`
   - `truncate_rows`
+  - `TurnCheckpoint`
   - `verify_dflash_block`
   - `verify_dflash_block_dense_tp2`
   - `verify_dflash_block_retained`
@@ -1202,7 +1244,6 @@ Workspace crates with a path dependency on this crate:
 - `hipfire-daemon`
 - `hipfire-generate`
 - `hipfire-loader`
-- `hipfire-pflash`
 - `hipfire-runtime`
 - `saddle-lab`
 

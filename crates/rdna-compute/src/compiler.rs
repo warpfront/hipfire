@@ -438,6 +438,19 @@ fn core_hipcc_flags(arch: &str) -> Vec<String> {
     ]
 }
 
+/// `HIPFIRE_GDN_PERSISTENT_STAGED` (developer, default on; exact `0` is the kill
+/// switch): on gfx12, `gated_delta_step_persistent256_body` (the GDN verify
+/// capture, its rollback and the capture lanes) stages a few-row block's q/k
+/// squares with the whole block and keeps the per-row Q8 boundary in F32
+/// (`kernels/src/tensor_ops.hip`, bit-identical). `0` compiles the `tensor_ops`
+/// and `gdn_lanes` modules with [`GDN_PERSISTENT_SERIAL_DEFINE`], which restores
+/// the previous body exactly (its own cache key).
+const GDN_PERSISTENT_STAGED_ENV: &str = "HIPFIRE_GDN_PERSISTENT_STAGED";
+const GDN_PERSISTENT_SERIAL_DEFINE: &str = "-DHIPFIRE_GDN_PERSISTENT_SERIAL=1";
+
+static GDN_PERSISTENT_SERIAL: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| !hipfire_config::developer_bool(GDN_PERSISTENT_STAGED_ENV, true));
+
 /// Compiles HIP kernel sources to code objects, with caching.
 ///
 /// Two-directory contract:
@@ -712,7 +725,7 @@ impl KernelCompiler {
         name: &str,
         gfx1151_cumode_modules: &HashSet<String>,
     ) -> Vec<String> {
-        if matches!(arch, "gfx1100" | "gfx1151" | "gfx1201")
+        let mut flags = if matches!(arch, "gfx1100" | "gfx1151" | "gfx1201")
             && matches!(
                 name,
                 "gdn_chunk_prep"
@@ -727,8 +740,7 @@ impl KernelCompiler {
                     | "gdn_chunk_scan_gfx1151"
                     | "gdn_chunk_prep_gfx11"
                     | "gdn_chunk_kkt_solve_gfx1100"
-            )
-        {
+            ) {
             let mut flags = vec!["-ffp-contract=off".to_owned()];
             if arch == "gfx1201" && name.starts_with("gdn_chunk_scan") {
                 flags.push("-mcumode".to_owned());
@@ -738,7 +750,16 @@ impl KernelCompiler {
             vec!["-mcumode".to_owned()]
         } else {
             Vec::new()
+        };
+        // The modules whose launched GDN kernels instantiate
+        // `gated_delta_step_persistent256_body` (capture, rollback, capture lanes).
+        if arch.starts_with("gfx12")
+            && matches!(name, "tensor_ops" | "gdn_lanes")
+            && *GDN_PERSISTENT_SERIAL
+        {
+            flags.push(GDN_PERSISTENT_SERIAL_DEFINE.to_owned());
         }
+        flags
     }
 
     fn module_flags(&self, name: &str) -> Vec<String> {
@@ -871,6 +892,32 @@ impl KernelCompiler {
     /// Resolves `gfx1151` CU-mode modules from the environment so the key
     /// matches what a runtime constructed with the same env would compute.
     pub fn packaging_hash_for(arch: &str, name: &str, source: &str, extra_flags: &str) -> String {
+        Self::cache_hash_for(arch, name, source, extra_flags, "")
+    }
+
+    /// Static [`Self::jit_cache_key`]: the hot-cache key a runtime on `arch`
+    /// with `extra_flags` and device-compiler identity `toolchain_id` (what
+    /// [`Self::local_toolchain_id`] returns, empty without a compiler) names
+    /// `{name}.{key}.hsaco` with. Needs no `KernelCompiler`, hipcc or GPU, and
+    /// resolves `gfx1151` CU-mode modules and the scheduler-profile override
+    /// from the environment like [`Self::packaging_hash_for`].
+    pub fn jit_cache_key_for(
+        arch: &str,
+        name: &str,
+        source: &str,
+        extra_flags: &str,
+        toolchain_id: &str,
+    ) -> String {
+        Self::cache_hash_for(arch, name, source, extra_flags, toolchain_id)
+    }
+
+    fn cache_hash_for(
+        arch: &str,
+        name: &str,
+        source: &str,
+        extra_flags: &str,
+        toolchain_id: &str,
+    ) -> String {
         let gfx1151_cumode_modules = if arch == "gfx1151" {
             hipfire_config::developer_var("HIPFIRE_GFX1151_CUMODE_MODULES")
                 .unwrap_or_default()
@@ -893,7 +940,7 @@ impl KernelCompiler {
             arch,
             extra_flags,
             &module_flags,
-            "",
+            toolchain_id,
             scheduler_profile,
             "hipcc",
             "",
@@ -1180,6 +1227,19 @@ impl KernelCompiler {
     /// toolchain identity folded into [`Self::jit_cache_key`].
     pub fn toolchain_id(&self) -> &str {
         &self.toolchain_id
+    }
+
+    /// The installed kernel pack (`kernels/compiled/<arch>`) this compiler
+    /// loads packaged objects from; `None` when no pack was found. Read-only:
+    /// the loaded objects are validated copies of this directory's files.
+    pub fn installed_pack_dir(&self) -> Option<&Path> {
+        self.cold_dir.as_deref()
+    }
+
+    /// The arch-keyed hot cache directory (`<cache root>/<arch>`) JIT-compiled
+    /// and seeded objects live in.
+    pub fn hot_cache_dir(&self) -> &Path {
+        &self.cache_dir
     }
 
     /// The target the compiler builds for (`gfx1201`, …).
@@ -2186,6 +2246,28 @@ mod tests {
         }
     }
 
+    /// Install `text` at `path` as an executable script, without this process
+    /// ever holding a write descriptor on it. A script written with `fs::write`
+    /// and then exec'd fails `ETXTBSY` whenever another thread forks while the
+    /// write descriptor is open (the child keeps its copy until its own exec):
+    /// the tests of this module fork hipcc from several threads. The write is
+    /// done by a short-lived `sh` that exits before this returns, so no fork of
+    /// this process can ever inherit a writer of the script.
+    fn write_executable(path: &Path, text: &str) {
+        #[cfg(unix)]
+        {
+            let status = Command::new("sh")
+                .args(["-c", "printf %s \"$1\" > \"$2\" && chmod 755 \"$2\"", "sh"])
+                .arg(text)
+                .arg(path)
+                .status()
+                .expect("spawn sh to install the script");
+            assert!(status.success(), "installing {}: {status}", path.display());
+        }
+        #[cfg(not(unix))]
+        std::fs::write(path, text).unwrap();
+    }
+
     #[test]
     fn custom_arm_cache_key_cannot_alias_hipcc() {
         let baseline = KernelCompiler::hash_parts(
@@ -2815,14 +2897,7 @@ mod tests {
                 blob_path.display()
             )
         };
-        std::fs::write(&hipcc, script).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&hipcc).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&hipcc, perms).unwrap();
-        }
+        write_executable(&hipcc, &script);
         hipcc
     }
 
@@ -3195,19 +3270,13 @@ mod tests {
         std::fs::create_dir_all(&bin).unwrap();
         let calls = root.join("calls");
         let hipcc = bin.join("slow_hipcc");
-        std::fs::write(
+        write_executable(
             &hipcc,
-            format!(
+            &format!(
                 "#!/bin/sh\necho x >> \"{}\"\nsleep 0.3\nout=\"\"\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = \"-o\" ]; then out=\"$2\"; shift 2; continue; fi\n  shift\ndone\nprintf COMPILED > \"$out\"\n",
                 calls.display()
             ),
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&hipcc, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        );
         let ranks = 4;
         let start = Arc::new(std::sync::Barrier::new(ranks));
         let results = (0..ranks)
@@ -3271,6 +3340,24 @@ mod tests {
         assert_ne!(
             packaging_via_instance, builder_hash,
             "packaging (empty toolchain) must differ from normal cache hash"
+        );
+    }
+
+    #[test]
+    fn static_jit_cache_key_matches_the_instance_key_under_its_toolchain() {
+        let name = "keyed_kernel";
+        let source = "__global__ void keyed_kernel() {}";
+        for toolchain in ["", "HIP version: 7.2.0-test"] {
+            let compiler = test_compiler("-O3", toolchain);
+            assert_eq!(
+                KernelCompiler::jit_cache_key_for("gfx1151", name, source, "-O3", toolchain),
+                compiler.jit_cache_key(name, source),
+                "toolchain `{toolchain}`"
+            );
+        }
+        assert_ne!(
+            KernelCompiler::jit_cache_key_for("gfx1151", name, source, "-O3", "a"),
+            KernelCompiler::jit_cache_key_for("gfx1151", name, source, "-O3", "b")
         );
     }
     // Exercise both public lookup paths with separate instances so an earlier
@@ -3796,10 +3883,9 @@ mod tests {
                     .unwrap_or_else(|| compiler.hipcc_bin.clone());
                 let log = arm.join("events");
                 let wrapper = arm.join("timed-hipcc");
-                std::fs::write(&wrapper, format!(
+                write_executable(&wrapper, &format!(
                 "#!/bin/sh\ncase \" $* \" in *' -o '*) ;; *) exec '{}' \"$@\" ;; esac\nprintf 'start %s %s\\n' \"$(date +%s%N)\" \"$$\" >> '{}'\n'{}' \"$@\"\nstatus=$?\nprintf 'end %s %s\\n' \"$(date +%s%N)\" \"$$\" >> '{}'\nexit \"$status\"\n",
-                inner.display(), log.display(), inner.display(), log.display())).unwrap();
-                std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+                inner.display(), log.display(), inner.display(), log.display()));
                 compiler.hipcc_bin = wrapper;
                 let sources = [
                 "extern \"C\" __global__ void first() {} extern \"C\" __global__ void second() {}",

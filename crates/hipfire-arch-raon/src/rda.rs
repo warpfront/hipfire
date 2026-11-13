@@ -322,14 +322,16 @@ pub fn rda_forward_rows_taped(
         ),
     };
 
-    // Wave-per-tile conv+prepare / gated norm: exact gfx1201, ordinary prefill rows, no tape.
-    let wave = tape.is_none()
+    // Wave-per-tile conv+prepare (exact gfx1201 / gfx1100) and gated norm (exact gfx1201): ordinary prefill rows,
+    // no tape.
+    let wave_ok = tape.is_none()
         && n >= RDA_WAVE_MIN_ROWS
         && fused_prep_enabled()
-        && gpu.rda_wave_kernels_arch_supported()
         && kd == GATED_DELTA_VECTOR_HEAD_DIM
         && geom.conv_kernel == 4
         && p % 4 == 0;
+    let wave_prep = wave_ok && gpu.rda_conv_prepare_arch_supported();
+    let wave_norm = wave_ok && gpu.rda_wave_kernels_arch_supported();
     // Segmented producer -> core -> norm: each segment's planes are produced right before the chunked core
     // consumes them and the norm right after, so the segment's working set stays in the last-level cache.
     let seg_rows = match scratch.chunk.as_ref() {
@@ -357,7 +359,17 @@ pub fn rda_forward_rows_taped(
             beta,
             y: &scratch.y,
         };
-        return rda_rows(gpu, geom, layer, st, &io, scratch.chunk.as_ref(), n, wave);
+        return rda_rows(
+            gpu,
+            geom,
+            layer,
+            st,
+            &io,
+            scratch.chunk.as_ref(),
+            n,
+            wave_prep,
+            wave_norm,
+        );
     }
 
     // Segments reuse the first `seg_rows` rows of the scratch planes (bounded by `max_rows >= seg_rows`).
@@ -412,7 +424,17 @@ pub fn rda_forward_rows_taped(
             beta: &beta_s,
             y: &y_s,
         };
-        rda_rows(gpu, geom, layer, st, &io, scratch.chunk.as_ref(), len, wave)?;
+        rda_rows(
+            gpu,
+            geom,
+            layer,
+            st,
+            &io,
+            scratch.chunk.as_ref(),
+            len,
+            wave_prep,
+            wave_norm,
+        )?;
         row0 += len;
     }
     Ok(())
@@ -428,7 +450,7 @@ pub const RDA_WAVE_MIN_ROWS: usize = 64;
 /// unsegmented/unfused); at 256 a segment's producer planes, `y` and the core workspace stay cache-resident.
 pub const RDA_SEGMENT_ROWS: usize = 256;
 
-/// `HIPFIRE_RAON_RDA_FUSED_PREP` (developer, exact gfx1201): the three RDA convs + `raon_rda_prepare` run as one
+/// `HIPFIRE_RAON_RDA_FUSED_PREP` (developer, exact gfx1201; conv+prepare also exact gfx1100): the three RDA convs + `raon_rda_prepare` run as one
 /// launch (no conv planes) and the gated norm as one wave per (row, head); both bit-identical to the
 /// incumbent launches. `=0` restores them.
 fn fused_prep_enabled() -> bool {
@@ -476,7 +498,8 @@ fn rda_rows(
     io: &RowsIo<'_>,
     chunk: Option<&GatedDeltaVectorChunkScratch>,
     n: usize,
-    wave: bool,
+    wave_prep: bool,
+    wave_norm: bool,
 ) -> Result<(), String> {
     let p = geom.proj();
     let h = geom.n_heads;
@@ -484,7 +507,7 @@ fn rda_rows(
     let err = |what: &str, e: String| format!("rda_forward_rows {what}: {e}");
     let q_scale = (kd as f64).powf(-0.5) as f32;
 
-    if wave {
+    if wave_prep {
         gpu.raon_rda_conv_prepare_w128_f32(&RdaConvPrepareLaunch {
             q_out: io.q,
             k_out: io.k,
@@ -600,7 +623,7 @@ fn rda_rows(
         eps: geom.rms_eps,
         round_bf16: geom.round_bf16,
     };
-    if wave {
+    if wave_norm {
         gpu.gated_rmsnorm_sigmoid_rows_w128_f32(io.gated, io.y, io.z, layer.o_norm_gamma, &norm)
     } else {
         gpu.gated_rmsnorm_sigmoid_rows_f32(io.gated, io.y, io.z, layer.o_norm_gamma, &norm)

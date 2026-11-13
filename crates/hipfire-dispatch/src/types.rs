@@ -15,7 +15,6 @@ pub enum PipelineOp {
     SiluMulRotate,
     ResidualAdd,
     CopyD2D,
-    GivensRotate,
     // MoE decode ops (Phase 1). TopKRenorm / MoeCombine fused impls are
     // k=8-only today; the variant names are k-agnostic so a future k=6
     // kernel family can reuse them.
@@ -55,9 +54,6 @@ pub enum FusedQkvVariant {
     Qkv,
     Qkvza,
     GateUp,
-    QkvParo,
-    QkvzaParo,
-    GateUpParo,
 }
 
 /// Implementation discriminator for attention tile variants. Attention-specific;
@@ -68,9 +64,6 @@ pub enum FusedQkvVariant {
 pub enum TileImpl {
     #[default]
     None,
-    // WMMA-FA (quantized causal prefill — asym4+Q8-V only)
-    Asym4WmmaTile,
-    Asym4WmmaTileGfx12,
     // Vision/dflash F16-K/V rungs
     DflashV5,
     DflashV5Gfx12,
@@ -98,7 +91,6 @@ pub enum MoeVariant {
 pub enum RotationVariant {
     Plain,
     PlainG128,
-    Givens,
     WithRmsnorm,
     WithSwiGLU,
 }
@@ -111,7 +103,6 @@ pub enum RotationPlan {
     FwhtG256,
     FwhtG128,
     Mq8Internal,
-    Givens,
 }
 
 /// Sign-domain plan for a dtype. `None` <=> no activation rotation required.
@@ -128,6 +119,10 @@ pub fn dtype_rotation_plan(dtype: DType) -> RotationPlan {
         // is fixed by the profile's rotation width (R256 / R128).
         MQ3I4G128R256 | MQ2I4G128R256 | E8PI4G128R256 => RotationPlan::FwhtG256,
         MQ3I4G128R128 | MQ2I4G128R128 | E8PI4G128R128 => RotationPlan::FwhtG128,
+        // Drop-zero planar routed experts (qt=137/138): the activation basis of
+        // the shipped MQ4G256V2 / MQ4G128V2 payload they were repacked from.
+        MQ4G256V2P => RotationPlan::FwhtG256,
+        MQ4G128V2P => RotationPlan::FwhtG128,
         // MQ4G128 and MQ4G128V2 carry their own G128 activation basis.  V2
         // uses the qt53 68-byte row format; it must not fall through to the
         // natural-basis default.
@@ -140,8 +135,6 @@ pub fn dtype_rotation_plan(dtype: DType) -> RotationPlan {
         // be fluent garbage rather than a fault.
         MFP4G32E8G128 => RotationPlan::FwhtG128,
         MQ8G256 => RotationPlan::Mq8Internal,
-        // The Givens block width is the dtype's `paro_group_size` (128 / 64).
-        ParoQ4G128 | ParoQ4G64 => RotationPlan::Givens,
         // MQ2G256LloydU is the UNROTATED Lloyd sibling: its weights are encoded
         // in the natural basis, so x must NOT be rotated. Stated explicitly
         // rather than left to the `_` fallthrough below — by the same argument
@@ -153,17 +146,17 @@ pub fn dtype_rotation_plan(dtype: DType) -> RotationPlan {
         // FP8E4M3B128 / FP8E4M3PT are unrotated (natural basis): the expert
         // GEMM consumes BF16 activations as they are.
         FP8E4M3B128 | FP8E4M3PT => RotationPlan::None,
+        // HC8E4M3Row (qt=57) is natural-basis: the HC mixer consumes unrotated activations.
+        HC8E4M3Row => RotationPlan::None,
         _ => RotationPlan::None,
     }
 }
 
 /// GEMV variant to run AFTER the activation has been rotated.
-/// ParoQ4G128 uses the Plain HFQ4G128 kernel post-Givens; the MQ family
-/// uses Prerotated kernels; non-rotated dtypes are Plain.
+/// The MQ family uses Prerotated kernels; non-rotated dtypes are Plain.
 pub fn dtype_post_rotation_variant(dtype: DType) -> GemvVariant {
     use DType::*;
     match dtype {
-        ParoQ4G128 | ParoQ4G64 => GemvVariant::Plain,
         // GL formats are MoE-indexed-only and intentionally have no dense
         // prerotated GEMV route.
         MQ4G256 | MQ4G256V2 | MQ4G256V2Lloyd | MQ5G256V2 | MQ6G256V2 | MQ3G256V2 | MQ2G256V2
@@ -189,15 +182,12 @@ pub(crate) fn reject_mq_i4(dtype: DType, family: &'static str) -> DispatchError 
 
 /// Fused-projection family for a kernel key: which of the QKV / QKVZA / Gate+Up
 /// kernel groups a `KernelKey` belongs to. `None` for keys that are not fused
-/// projections. The Paro4G128T keys carry the family in their name (Qkv/Qkvza/
-/// GateUp) but the *Paro* discriminator variants (QkvParo/QkvzaParo/GateUpParo)
-/// describe the rotation axis, not the projection shape — for error diagnostics
-/// we report the projection family (Qkv/Qkvza/GateUp), which is what determines
-/// the arity (3-way / 4-way / 2-way).
+/// projections. The key name carries the family (Qkv/Qkvza/GateUp), which is
+/// what determines the arity (3-way / 4-way / 2-way) for error diagnostics.
 pub fn fused_qkv_variant_for_key(key: KernelKey) -> Option<FusedQkvVariant> {
     use KernelKey::*;
     match key {
-        // 3-way Fused QKV (incl. Q4K, Q8_0/HFQ3/HFP4 prefill, and the Paro 4G128T QKV synthesis)
+        // 3-way Fused QKV (incl. Q4K and Q8_0/HFQ3/HFP4 prefill)
         FusedQkvHfq4G256
         | FusedQkvMq4G256V2
         | FusedQkvMq4G256V2VerifyExact
@@ -213,9 +203,8 @@ pub fn fused_qkv_variant_for_key(key: KernelKey) -> Option<FusedQkvVariant> {
         | FusedQkvQ4K
         | FusedQkvQ8_0
         | FusedQkvHfq3G256
-        | FusedQkvHfp4G32
-        | FusedQkvParo4G128T => Some(FusedQkvVariant::Qkv),
-        // 4-way Fused QKVZA (DeltaNet linear attention, incl. Q8_0/HFQ3/HFP4 prefill and Paro 4G128T)
+        | FusedQkvHfp4G32 => Some(FusedQkvVariant::Qkv),
+        // 4-way Fused QKVZA (DeltaNet linear attention, incl. Q8_0/HFQ3/HFP4 prefill)
         FusedQkvzaHfq4G256
         | FusedQkvzaMq4G256V2
         | FusedQkvzaMq4G256V2VerifyExact
@@ -231,8 +220,7 @@ pub fn fused_qkv_variant_for_key(key: KernelKey) -> Option<FusedQkvVariant> {
         | FusedQkvzaQ8_0
         | FusedQkvzaHfq3G256
         | FusedQkvzaHfp4G32
-        | FusedQkvzaMfp4G32E8
-        | FusedQkvzaParo4G128T => Some(FusedQkvVariant::Qkvza),
+        | FusedQkvzaMfp4G32E8 => Some(FusedQkvVariant::Qkvza),
         FusedGateUpHfq4G256
         | FusedGateUpMq4G256V2
         | FusedGateUpMq4G256V2VerifyExact
@@ -249,8 +237,7 @@ pub fn fused_qkv_variant_for_key(key: KernelKey) -> Option<FusedQkvVariant> {
         | FusedGateUpQ8_0
         | FusedGateUpHfq3G256
         | FusedGateUpHfp4G32
-        | FusedGateUpMfp4G32E8
-        | FusedGateUpParo4G128T => Some(FusedQkvVariant::GateUp),
+        | FusedGateUpMfp4G32E8 => Some(FusedQkvVariant::GateUp),
         _ => None,
     }
 }
@@ -292,8 +279,6 @@ pub enum KernelKey {
     GemvMfp4G32E8Soa,
     GemvMfp4G32Fused,
     GemvHfp4G32,
-    GemvParoQ4G128,
-    GemvParoQ4G64,
     GemvQ4F16G64,
     GemvQ4F16G32,
     GemvQ8HFQ,
@@ -506,10 +491,6 @@ pub enum KernelKey {
     FusedGateUpHfp4G32,
     // Fused Gate+Up — mfp4-E8 decode, gfx1151-only (Strix Halo launch-fusion)
     FusedGateUpMfp4G32E8,
-    // Fused Paro (4G128T)
-    FusedGateUpParo4G128T,
-    FusedQkvzaParo4G128T,
-    FusedQkvParo4G128T,
     FusedGateUpQ8_0,
     // Rotation
     RotateMq,
@@ -539,11 +520,8 @@ pub enum KernelKey {
     // `Gfx942Device::dequant_fp8b128_to_bf16`).
     DequantFp8B128ToBf16,
     // Attention
-    AttnFlashAsym4,
     AttnFlashAsym4Fwht,
-    AttnFlashAsym3,
     AttnFlashAsym3Fwht,
-    AttnFlashAsym2,
     AttnFlashAsym2Fwht,
     AttnFlashQ8_0,
     AttnFlashQ8_0Windowed, // Q8_0 flash with sliding-window mask (cohere2moe)
@@ -566,11 +544,8 @@ pub enum KernelKey {
     // F32 KV (decode only — no batched variant)
     AttnF32,
     // Attention — batched prefill / tree-verify (ship 3.2)
-    AttnFlashAsym4BatchedMasked,
     AttnFlashAsym4FwhtBatchedMasked,
-    AttnFlashAsym3BatchedMasked,
     AttnFlashAsym3FwhtBatchedMasked,
-    AttnFlashAsym2Batched,           // no _masked — 2-bit tree-verify gap
     AttnFlashAsym2FwhtBatched,       // no _masked — 2-bit tree-verify gap
     AttnQ8_0KvBatchedMasked,         // P-1 no-LDS-cap tiled kernel
     AttnQ8_0KvBatchedMaskedWindowed, // sliding-window batched Q8 (cohere2moe prefill)
@@ -594,11 +569,8 @@ pub enum KernelKey {
     AttnFullF16Causal, // F16 K/V, causal
     AttnFullF32Causal, // F32 K/V, causal
     // KV Cache Write
-    KvWriteAsym4,
     KvWriteAsym4Fwht,
-    KvWriteAsym3,
     KvWriteAsym3Fwht,
-    KvWriteAsym2,
     KvWriteAsym2Fwht,
     KvWriteQ8_0,
     KvWriteBf16,  // flat 2-byte BF16 KV write (maple)
@@ -608,11 +580,8 @@ pub enum KernelKey {
     KvWriteHfq8,  // HFQ8 flat-layout KV write (llama)
     KvWriteF32,
     // KV Cache Write — batched prefill (ship 3.2)
-    KvWriteAsym4Batched,
     KvWriteAsym4FwhtBatched,
-    KvWriteAsym3Batched,
     KvWriteAsym3FwhtBatched,
-    KvWriteAsym2Batched,
     KvWriteAsym2FwhtBatched,
     KvWriteQ8_0Batched,
     KvWriteBf16Batched,
@@ -681,12 +650,6 @@ pub enum ArchPredicate {
     /// builtins are gfx1201-guarded: no other arch may resolve them, so an
     /// fp8 cache fails closed at dispatch outside the admitted target.
     IsGfx1201,
-    HasSdot4,
-    /// HFQ3-G256 plain GEMV admission: RDNA1.1/RDNA2 via the sdot4 generic
-    /// kernel, plus gfx1100/1101/1102 where `gemv_hfq3g256_for_arch` selects
-    /// the RDNA3 wave32 scalar variant (`gemv_hfq3g256_rdna3`, the MQ3
-    /// production path). gfx110x has no sdot4 but does have the rdna3 kernel.
-    HasHfq3G256Gemv,
     HasMmq,
     /// MQ6G256 / HFQ6G256 GEMV admission (#478): everything `HasMmq` admits
     /// (gfx906, RDNA3, RDNA4) plus RDNA1/RDNA2. `gemv_hfq6g256` and
@@ -835,8 +798,6 @@ impl KernelKey {
             (MFP4G32E8SOA, Plain) => Ok(Self::GemvMfp4G32E8Soa),
             (MFP4G32E8G128, Plain) => Ok(Self::GemvMfp4G32E8G128),
             (HFP4G32, Plain) => Ok(Self::GemvHfp4G32),
-            (ParoQ4G128, Plain) => Ok(Self::GemvParoQ4G128),
-            (ParoQ4G64, Plain) => Ok(Self::GemvParoQ4G64),
             (Q4F16G64, Plain) => Ok(Self::GemvQ4F16G64),
             (Q4F16G32, Plain) => Ok(Self::GemvQ4F16G32),
             (Q8HFQ, Plain) => Ok(Self::GemvQ8HFQ),
@@ -891,13 +852,10 @@ impl KernelKey {
             MFP4G32E8 => Ok(Self::GemvMfp4G32E8Prerotated),
             MFP4G32E8SOA => Ok(Self::GemvMfp4G32E8SoaPrerotated),
             MFP4G32E8G128 => Ok(Self::GemvMfp4G32E8G128Prerotated),
-            // Q8/Paro have no separate "prerotated" kernel: Q8 is not FWHT-rotated
-            // (prerotated input == raw input → gemv_q8_0), and Paro's Givens-rotated
-            // input feeds the same gemv_hfq4g128 kernel as its Plain path. launch()
-            // dispatches GemvQ8_0 → gpu.gemv_q8_0 and GemvParoQ4G128 → gpu.gemv_hfq4g128.
+            // Q8 has no separate "prerotated" kernel: Q8 is not FWHT-rotated
+            // (prerotated input == raw input → gemv_q8_0). launch() dispatches
+            // GemvQ8_0 → gpu.gemv_q8_0.
             Q8_0 => Ok(Self::GemvQ8_0),
-            ParoQ4G128 => Ok(Self::GemvParoQ4G128),
-            ParoQ4G64 => Ok(Self::GemvParoQ4G64),
             // Any other dtype: if it is rotation-free (RotationPlan::None), its
             // "prerotated" input IS its plain input (no rotation was applied), so the
             // plain GEMV kernel is correct — route to for_gemv(Plain), the exact kernel
@@ -1011,7 +969,7 @@ impl KernelKey {
         use DType::*;
         match dtype {
             F32 | F16 | BF16 | Q8_0 | Q4K | Q6K | Q4F16G64 | Q4F16G32 => ArchPredicate::Always,
-            // HFQ4/MQ4/HFQ2/MQ2/MQ8/HFP4/MFP4/Paro: all use generic wave32/wave64
+            // HFQ4/MQ4/HFQ2/MQ2/MQ8/HFP4/MFP4: all use generic wave32/wave64
             // kernels with no ISA-specific intrinsics. The underlying GEMV
             // functions (gemv_hfq4g256_for_arch, gemv_hfp4g32_for_arch, etc.)
             // have arch-specific *tuning* variants but a generic fallback that
@@ -1028,7 +986,6 @@ impl KernelKey {
             | HFP4G32 | MFP4G32 | MFP4G32Lloyd | MFP4G32P
             | MFP4G32E8 | MFP4G32E8SOA | MFP4G32E8G128
             | MFP3G32E8 | MFP2G32E8  // mfpN-E8: same RDNA3/4 gating as MFP4G32E8 via e8_with_wmma
-            | ParoQ4G128 | ParoQ4G64
             // TQ2G128: ternary GEMV kernel (gemv_tq2g128, Task 9) is a generic
             // wave32/wave64 kernel with no ISA-specific intrinsics, same as its
             // HFQ2G128 sibling — identical arch gating.
@@ -1039,8 +996,16 @@ impl KernelKey {
             // dtype_arch_predicate matches exhaustively on DType, so this arm is
             // required for the match to compile.
             | BQ1G128 => ArchPredicate::Always,
-            HFQ3G256 => ArchPredicate::HasHfq3G256Gemv,
-            HFQ3G128 => ArchPredicate::HasSdot4,
+            // gemv_hfq3g256 (`_ =>` arm of gemv_hfq3g256_for_arch) is a WMMA-free,
+            // sdot4-free [32,1,1] wave32 scalar kernel; gfx110x picks the rdna3
+            // twin. HasWave32 admits gfx1151/gfx12/RDNA1 (HIPF-241). Wave64 stays
+            // excluded, as for MQ3G256: no wave64 run has exercised it.
+            HFQ3G256 => ArchPredicate::HasWave32,
+            // gemv_hfq3g128 is a WMMA-free, sdot4-free [32,1,1] wave32 scalar
+            // kernel (the MQ3G256 rationale below): HasWave32 newly admits
+            // RDNA1/2/3/4 incl. gfx1151; CDNA wave64 stays excluded until a
+            // wave64 run has exercised it.
+            HFQ3G128 => ArchPredicate::HasWave32,
             // MQ3G256 + MQ2/MQ3/MQ4-Lloyd: their GEMV kernels are WMMA-free
             // [32,1,1] wave32 scalar (gemv.rs:1004; kernels.rs:420/750 baseline
             // `_=>` arms) and ALREADY run on RDNA1/2 via the qwen35 direct path.
@@ -1064,10 +1029,14 @@ impl KernelKey {
             // gfx942 FP8 MoE route reads qt=55; qt=56 is the PLE row store).
             // Explicit so a future generic route has to decide its arch gate.
             FP8E4M3B128 | FP8E4M3PT => ArchPredicate::Always,
+            // qt=57 HC8E4M3Row (Qwen4 HC mixer sidecar): no generic family
+            // implementation (only the typed Qwen4 HC route reads it, gated by
+            // `qwen4_hc8_enabled()` = exact gfx1201). Same stance as qt=55/56.
+            HC8E4M3Row => ArchPredicate::Always,
             // MQ-I4 (qt=131..=136): typed-qwen4-only, no generic kernel; same
             // explicit stance as qt=53.
             MQ3I4G128R256 | MQ3I4G128R128 | MQ2I4G128R256 | MQ2I4G128R128 | E8PI4G128R256
-            | E8PI4G128R128 => ArchPredicate::Always,
+            | E8PI4G128R128 | MQ4G256V2P | MQ4G128V2P => ArchPredicate::Always,
             // ggml block formats (GGUF-native, no kernel yet): no key resolves
             // them, so resolution fails with MissingImpl; explicit so a future
             // ggml route has to decide its arch gate.
@@ -1082,7 +1051,6 @@ impl KernelKey {
         use GemvVariant::*;
         match variant {
             Plain => match dtype_rotation_plan(dtype) {
-                RotationPlan::Givens => &[PipelineOp::GivensRotate, PipelineOp::Gemv],
                 RotationPlan::None => &[PipelineOp::Gemv],
                 _ => &[PipelineOp::RotateFwht, PipelineOp::Gemv],
             },
@@ -1117,7 +1085,7 @@ impl KernelKey {
     }
 }
 
-/// Whether a DType requires activation rotation (FWHT or Givens) before GEMV.
+/// Whether a DType requires activation rotation (FWHT) before GEMV.
 /// Replaces per-model `needs_mq_rotation` / `weight_needs_fwht` helpers.
 pub fn dtype_needs_rotation(dtype: DType) -> bool {
     use DType::*;
@@ -1152,8 +1120,6 @@ pub fn dtype_needs_rotation(dtype: DType) -> bool {
             | MFP4G32E8SOA
             | MFP3G32E8
             | MFP2G32E8
-            | ParoQ4G128
-            | ParoQ4G64
     )
 }
 

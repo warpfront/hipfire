@@ -701,7 +701,8 @@ pub enum Flow {
 }
 
 /// Execute one instruction on `w` (no PC update). `s_waitcnt`, `s_barrier`
-/// and `s_endpgm` are handled here; every other format goes to its module.
+/// and `s_endpgm` are handled here; every other format goes to its module; a
+/// generated ([`Inst::Xml`]) instruction is refused by name.
 pub fn exec_one(
     w: &mut Wave,
     inst: &Inst,
@@ -726,8 +727,13 @@ pub fn exec_one(
         Inst::Smem(_) | Inst::Ds(_) | Inst::Flat(_) | Inst::Mubuf(_) => {
             self::mem::issue(w, inst, lds, mem)
         }
-        Inst::Vop1(_) | Inst::Vop2(_) | Inst::Vopc(_) | Inst::Vop3(_) => valu::exec(w, inst),
+        Inst::Vop1(_) | Inst::Vop2(_) | Inst::Vop2K(_) | Inst::Vopc(_) | Inst::Vop3(_) => {
+            valu::exec(w, inst)
+        }
         Inst::Vop3p(_) | Inst::Mai(_) => mfma::exec(w, inst, cfg),
+        // A generated instruction has no hand-written semantics: refused by
+        // name, never approximated.
+        Inst::Xml(x) => unsupported(x.unsupported()),
     }
 }
 

@@ -140,10 +140,8 @@ For anything compared against the Qwen3.8-27B pins, follow `VERIFY.md` /
 
      For a compressed-KV measurement spell the supported FWHT mode
      (`--kv-mode fwht3`, or `fwht2` / `fwht4`). The `asym2` / `asym3` /
-     `asym4` (and `turbo*`) spellings are **deprecated since 0.4.0 and
-     scheduled for removal in 0.5.0**; `eval_hipfire` builds the legacy
-     Givens-rotation asym KV cache directly for them, and `asym3` is still the
-     evaluator's built-in default `--kv-mode`, so never omit the flag. See
+     `asym4` (and `turbo*`) spellings were **removed in 0.5.0** and are
+     rejected; the evaluator's built-in default `--kv-mode` is `q8`. See
      [`docs/QUANTIZATION.md`](../../../docs/QUANTIZATION.md) for the KV-mode
      table. Older result tables under `results/` that mention `asym3`
      predate this and are historical context, not a current recipe.

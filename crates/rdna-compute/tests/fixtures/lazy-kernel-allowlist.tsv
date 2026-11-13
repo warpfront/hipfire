@@ -35,17 +35,6 @@ module	attention_dflash_wmma_m64_n32_f16kv_v6_f32	no-caller	No production caller
 module	attention_dflash_wmma_n128_f16kv_f32	non-core-family	Non-core family route: dots.ocr; rdna-compute/src/attention.rs:17776
 module	attention_dflash_wmma_n64_f16kv_f32	no-caller	No production caller; only definitions, tests/examples or an unreachable launcher branch remain; rdna-compute/src/attention.rs:17677
 module	attention_encoder_qtiled_f32	non-core-family	Non-core artifact/shape route: launcher ; sole caller (Qwen3.5 embedding encoder, not a core LLM artifact).; rdna-compute/src/attention.rs:3357
-module	attention_flash_asym2_tile	config-opt-in	Non-default configuration: attention.rs / memory.kv_cache; rdna-compute/src/attention.rs:15507
-module	attention_flash_asym2_tile_batched	config-opt-in	Non-default configuration: attention.rs / memory.kv_cache; rdna-compute/src/attention.rs:13479
-module	attention_flash_asym2_tile_batched_paged	config-opt-in	Non-default configuration: attention.rs / serve.multi_slot; rdna-compute/src/attention.rs:11406
-module	attention_flash_asym3_tile_hd512	non-core-family	Non-core family route: Gemma; hipfire-dispatch/src/families/attention.rs:629-631
-module	attention_flash_asym3_tile_hd512_batched	non-core-family	Non-core family route: Gemma, Qwen2/Llama; rdna-compute/src/attention.rs:14398
-module	attention_flash_asym3_tile_hd512_batched_paged	non-core-family	Non-core artifact/shape route: module attention_flash_asym3_tile_hd512_batched_paged compiled at (ensure_givens4_kv_slot_kernel); descr; rdna-compute/src/attention.rs:11406
-module	attention_flash_asym4_tile	config-opt-in	Non-default configuration: attention.rs / memory.kv_cache; rdna-compute/src/attention.rs:15169
-module	attention_flash_asym4_tile_batched	config-opt-in	Non-default configuration: attention.rs / memory.kv_cache; rdna-compute/src/attention.rs:13376
-module	attention_flash_asym4_tile_batched_paged	config-opt-in	Non-default configuration: attention.rs / serve.multi_slot; rdna-compute/src/attention.rs:11406
-module	attention_flash_asym4_wmma_tile_batched	config-opt-in	Non-default configuration: attention.rs / memory.kv_cache; rdna-compute/src/attention.rs:12775
-module	attention_flash_asym4_wmma_tile_batched_gfx12	config-opt-in	Non-default configuration: attention.rs / memory.kv_cache; rdna-compute/src/attention.rs:12775
 module	attention_flash_bf16_tile	config-opt-in	Non-default configuration: attention.rs / memory.kv_cache; rdna-compute/src/attention.rs:3475
 module	attention_flash_bf16_tile_batched	non-core-family	Non-core family route: Qwen2/Llama, MiniMax/Maple; rdna-compute/src/attention.rs:17017
 module	attention_flash_bf16_tile_batched_paged	no-caller	No production caller; only definitions, tests/examples or an unreachable launcher branch remain; rdna-compute/src/attention.rs:11406
@@ -309,7 +298,6 @@ module	fused_rmsnorm_mq_rotate_plain_nox	non-core-family	Non-core family route: 
 module	fused_rmsnorm_mq_rotate_vecsum_sign_const	config-opt-in	Non-default configuration: kernel.rdna; rdna-compute/src/gemv.rs:2778-2783
 module	fused_rmsnorm_mq_rotate_vecsum_sign_lds	config-opt-in	Non-default configuration: kernel.rdna; rdna-compute/src/gemv.rs:2777
 module	fused_rmsnorm_mq_rotate_wavegrid	config-opt-in	Non-default configuration: kernel.rdna; rdna-compute/src/gemv.rs:2770-2772
-module	fused_silu_mul_givens_rotate_f32	codec-outside-core-rungs	ParoQ4G128-only shared/routed projection; no admitted core registry rung. hipfire-dispatch/src/pipeline/mod.rs:3450
 module	fused_silu_mul_mq_rotate_awq_hin_bf16_fp8_gfx12	config-opt-in	Non-default configuration: kernel.iu / kernel.gfx; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
 module	fused_silu_mul_mq_rotate_awq_hin_fp8_gfx12	config-opt-in	Non-default configuration: kernel.iu / kernel.gfx; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
 module	fused_silu_mul_mq_rotate_awq_i4_hin_bf16_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_BF16_H_A4; rdna-compute/src/gemv.rs:4863-4874
@@ -341,6 +329,7 @@ module	gated_delta_net_q8_compact3_b2_rows	config-opt-in	Non-default configurati
 module	gated_delta_net_q8_fast_independent_masked	config-opt-in	Non-default configuration: serve.continuous_batch_size; rdna-compute/src/norm.rs:3977-4021
 module	gated_delta_net_q8_fast_lanes_varrows	config-opt-in	Non-default configuration: serve.vmm_batch; dflash_cb.rs:1003
 module	gated_delta_net_q8_fast_lanes_varrows_from	config-opt-in	Non-default configuration: serve.vmm_batch; dflash_cb.rs:1003
+module	gated_delta_net_q8_fast_stream	no-caller	Sequential-algorithm stream executor has no shipping caller until the architecture owners wire gdn_stream_append_sequential; rdna-compute/src/norm.rs:7516
 module	gated_delta_net_q8_independent_masked	developer-opt-in	Non-default developer override: HIPFIRE_DN_REQUANT_PER_TOKEN; rdna-compute/src/norm.rs:58-74
 module	gated_norm_mq_rotate_awq_gfx1100	non-core-family	Non-core family route: LFM2; rdna-compute/src/gemv.rs:5301-5306
 module	gated_norm_mq_rotate_awq_gfx1151	non-core-family	Non-core family route: LFM2; rdna-compute/src/gemv.rs:5287-5293
@@ -464,8 +453,8 @@ module	gemm_hfq3g256_residual_mmq_x32	no-caller	No production caller; only defin
 module	gemm_hfq3g256_residual_mmq_x32_y32	no-caller	No production caller; only definitions, tests/examples or an unreachable launcher branch remain; rdna-compute/src/gemm.rs:7660-7676
 module	gemm_hfq3g256_residual_mmq_x32_y64	non-target-arch	Only non-target gfx906/gfx942/gfx10 or non-admitted synthetic shapes reach this path; rdna-compute/src/gemm.rs:7699
 module	gemm_hfq3g256_residual_mmq_x8	no-caller	No production caller; only definitions, tests/examples or an unreachable launcher branch remain; rdna-compute/src/gemm.rs:7660-7676
-module	gemm_hfq4g128	codec-outside-core-rungs	HFQ4G128/PARO route absent from admitted core artifact rungs; hipfire-arch-qwen35/src/qwen35/prefill.rs:5282-5290
-module	gemm_hfq4g128_mmq_gfx1151	codec-outside-core-rungs	HFQ4G128/PARO route absent from admitted core artifact rungs; hipfire-arch-qwen35/src/qwen35/prefill.rs:5282-5290
+module	gemm_hfq4g128	codec-outside-core-rungs	HFQ4G128 route absent from admitted core artifact rungs; hipfire-arch-qwen35/src/qwen35/prefill.rs:5282-5290
+module	gemm_hfq4g128_mmq_gfx1151	codec-outside-core-rungs	HFQ4G128 route absent from admitted core artifact rungs; hipfire-arch-qwen35/src/qwen35/prefill.rs:5282-5290
 module	gemm_hfq4g128_moe_down_grouped_wmma	non-core-family	Non-core family route: Gemma; rdna-compute/src/gemm.rs:33298
 module	gemm_hfq4g256_lmhead_wmma_gfx12	no-caller	No production caller; only definitions, tests/examples or an unreachable launcher branch remain; hipfire-runtime/examples/test_wmma_residual_gfx12.rs:143
 module	gemm_hfq4g256_moe_grouped_mmq_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_MOE_GROUPED_I8; rdna-compute/src/gemm.rs:15429-15470
@@ -599,9 +588,8 @@ module	gemm_mq6g256v2_wmma_fp8_split_bf16_db_gfx1201	developer-opt-in	Non-defaul
 module	gemm_mq6g256v2_wmma_fp8_split_bf16_gfx1201	developer-opt-in	Non-default developer override: HIPFIRE_GFX12_MQ6_FP8 route with BF16 output (not yet admitted by default dispatch); rdna-compute/src/gemm_mq6_fp8.rs:253
 module	gemm_mq6g256v2_wmma_fp8_split_db_gfx1201	developer-opt-in	Non-default developer override: HIPFIRE_GFX12_MQ6_FP8_DB=1 (not yet admitted by default dispatch); rdna-compute/src/gemm_mq6_fp8.rs:253
 module	gemm_mq6g256v2_wmma_fp8_split_gfx1201	developer-opt-in	Non-default developer override: HIPFIRE_GFX12_MQ6_FP8 (not yet admitted by default dispatch); rdna-compute/src/gemm_mq6_fp8.rs:253
-module	gemm_paro_q4g128_moe_grouped_mmq_gfx1151	codec-outside-core-rungs	PARO codec/layout route absent from admitted core artifact rungs; hipfire-dispatch/src/pipeline/mod.rs:2706-2733
-module	gemm_paro_q4g128_moe_grouped_mmq_k8_gfx1151	codec-outside-core-rungs	PARO codec/layout route absent from admitted core artifact rungs; hipfire-dispatch/src/pipeline/mod.rs:2706-2733
-module	gemm_paro_q4g128_moe_grouped_wmma_k2	codec-outside-core-rungs	PARO route absent from admitted core artifact rungs; hipfire-dispatch/src/pipeline/mod.rs:2710-2737
+module	gemm_mq8g256_mmq_i8_gfx11	codec-outside-core-rungs	MQ8G256 prefill GEMM (gfx1100/gfx1151 i8-MMQ); run by the Raon attention-class MQ8G256 projections (hipfire-arch-raon/src/projection.rs), an arch outside the admitted core artifact rungs; rdna-compute/src/gemm_mq8g256.rs:633
+module	gemm_mq8g256_mmq_i8_gfx12	codec-outside-core-rungs	MQ8G256 prefill GEMM (gfx1200/gfx1201 i8 WMMA); run by the Raon attention-class MQ8G256 projections (hipfire-arch-raon/src/projection.rs), an arch outside the admitted core artifact rungs; rdna-compute/src/gemm_mq8g256.rs:633
 module	gemm_q8_0_batched_wide_exact	non-core-family	Non-core family route: Gemma; hipfire-dispatch/src/pipeline/sandwich.rs:1405
 module	gemm_q8_0_mmq_gfx1030	no-caller	No production caller; only definitions, tests/examples or an unreachable launcher branch remain; rdna-compute/src/gemm.rs:30706-30711
 module	gemm_q8_0_moe_grouped_top10	no-caller	No production caller; only definitions, tests/examples or an unreachable launcher branch remain; moe.rs:2742-2754
@@ -722,7 +710,6 @@ module	gemv_hfq4g1024	no-caller	No production caller; only definitions, tests/ex
 module	gemv_hfq4g128	codec-outside-core-rungs	HFQ4G128/MQ4G128 route absent from admitted core artifact rungs; hipfire-dispatch/src/families/gemv.rs:529
 module	gemv_hfq4g128_moe_down_grouped	non-core-family	Non-core family route: Gemma; hipfire-dispatch/src/pipeline/sandwich.rs:1225
 module	gemv_hfq4g128_moe_down_residual_scaled_k8_indexed	non-core-family	Non-core family route: Gemma; sandwich.rs:5-17
-module	gemv_hfq4g128_residual_sigmoid_scaled	codec-outside-core-rungs	HFQ4G128 codec/layout route absent from admitted core artifact rungs; hipfire-dispatch/src/pipeline/mod.rs:3528-3538
 module	gemv_hfq4g256_k2048_gfx1100	developer-opt-in	Non-default developer override: HIPFIRE_RDNA3_HFQ4_LM_HEAD_K2048; rdna-compute/src/gemv.rs:10913-10916
 module	gemv_hfq4g256_k2048_gfx1100_mq3v2	developer-opt-in	Non-default developer override: HIPFIRE_RDNA3_HFQ4_LM_HEAD_K2048; rdna-compute/src/gemv.rs:12173-12176
 module	gemv_hfq4g256_k2048_gfx1100_mq4v2	developer-opt-in	Non-default developer override: HIPFIRE_RDNA3_HFQ4_LM_HEAD_K2048; rdna-compute/src/gemv.rs:11805-11808
@@ -973,10 +960,7 @@ module	gemv_mq6g256v2_moe_gate_up_k8_indexed_batched	config-opt-in	Requires spec
 module	gemv_mq6g256v2_xbatch	non-target-arch	Only non-target gfx906/gfx942/gfx10 or non-admitted synthetic shapes reach this path; rdna-compute/src/gemm.rs:43197
 module	gemv_mq6g256v2_xbatch_residual	non-target-arch	Only non-target gfx906/gfx942/gfx10 or non-admitted synthetic shapes reach this path; rdna-compute/src/gemm.rs:43197
 module	gemv_mq8g256	codec-outside-core-rungs	MQ8G256 route absent from admitted core artifact rungs; hipfire-dispatch/src/families/gemv.rs:567
-module	gemv_paro_q4g128_moe_down_k8_indexed_batched	codec-outside-core-rungs	PARO codec/layout route absent from admitted core artifact rungs; hipfire-dispatch/src/pipeline/mod.rs:4846-4856
-module	gemv_paro_q4g128_moe_gate_up_indexed	codec-outside-core-rungs	PARO codec/layout route absent from admitted core artifact rungs; hipfire-dispatch/src/pipeline/mod.rs:4419-4429
-module	gemv_paro_q4g128_moe_gate_up_k8_indexed_batched	codec-outside-core-rungs	PARO codec/layout route absent from admitted core artifact rungs; hipfire-dispatch/src/pipeline/mod.rs:5457-5468
-module	gemv_paro4g128	codec-outside-core-rungs	PARO4G128T route absent from admitted core artifact rungs; gemv.rs:1147-1188
+module	gemv_mq8g256_b	codec-outside-core-rungs	MQ8G256 layout-B decode/verify GEMV (singleton, rows-exact R2..16 and the fused-rotate n<=2 entry); run by the Raon attention-class MQ8G256 projections, an arch outside the admitted core artifact rungs; rdna-compute/src/gemv_mq8_rows.rs:199
 module	gemv_q4as8	no-caller	No production caller; only definitions, tests/examples or an unreachable launcher branch remain; rdna-compute/src/gemv.rs:637-646
 module	gemv_q4f16_g32	codec-outside-core-rungs	Q4F16G32 route absent from admitted core artifact rungs; hipfire-dispatch/src/families/gemv.rs:539
 module	gemv_q4f16_g64	codec-outside-core-rungs	Q4F16G64/HFQ4G256 route absent from admitted core artifact rungs; hipfire-dispatch/src/families/gemv.rs:538
@@ -994,8 +978,6 @@ module	gemv_q8hfq	codec-outside-core-rungs	Q8HFQ route absent from admitted core
 module	gemv_q8hfq_wide	codec-outside-core-rungs	Q8HFQ route absent from admitted core artifact rungs; gemv.rs:18791-18832
 module	gemv_tq2g128	codec-outside-core-rungs	TQ2G128 route absent from admitted core artifact rungs; hipfire-dispatch/src/families/gemv.rs:534
 module	gemv_tq2g128_xbatch	codec-outside-core-rungs	TQ2G128 route absent from admitted core artifact rungs; rdna-compute/src/gemv.rs:9929
-module	givens_rotate_f32	no-caller	No production caller; only definitions, tests/examples or an unreachable launcher branch remain; rdna-compute/src/gemv.rs:864-875
-module	givens_rotate_to_f32	codec-outside-core-rungs	PARO4G128 route absent from admitted core artifact rungs; hipfire-dispatch/src/families/gemv.rs:482-494
 module	hash_router_normalize_f32	non-core-family	Non-core family route: DeepSeek4; hipfire-arch-deepseek4/src/forward.rs:5710
 module	hash_router_normalize_f32_batched	non-core-family	Non-core family route: DeepSeek4; pipeline/mod.rs:2260
 module	hash_router_normalize_f32_buf	non-core-family	Non-core family route: DeepSeek4; hipfire-arch-deepseek4/src/forward.rs:5144
@@ -1062,14 +1044,6 @@ module	kv_cache_write_asym_k_fwht3_batched_paged	config-opt-in	Non-default confi
 module	kv_cache_write_asym_k_fwht4	config-opt-in	Non-default configuration: attention.rs / memory.kv_cache; rdna-compute/src/attention.rs:11651
 module	kv_cache_write_asym_k_fwht4_batched	config-opt-in	Non-default configuration: attention.rs / memory.kv_cache; rdna-compute/src/attention.rs:13096
 module	kv_cache_write_asym_k_fwht4_batched_paged	config-opt-in	Non-default configuration: attention.rs / serve.multi_slot; rdna-compute/src/attention.rs:11406
-module	kv_cache_write_asym_k_givens2	config-opt-in	Non-default configuration: attention.rs / memory.kv_cache; rdna-compute/src/attention.rs:15026
-module	kv_cache_write_asym_k_givens2_batched	config-opt-in	Non-default configuration: attention.rs / memory.kv_cache; rdna-compute/src/attention.rs:13187
-module	kv_cache_write_asym_k_givens2_batched_paged	config-opt-in	Non-default configuration: attention.rs / serve.multi_slot; rdna-compute/src/attention.rs:11406
-module	kv_cache_write_asym_k_givens3_hd512	non-core-family	Non-core family route: Gemma; hipfire-dispatch/src/families/attention.rs:629-631
-module	kv_cache_write_asym_k_givens3_hd512_batched	non-core-family	Non-core family route: Gemma, Qwen2/Llama; rdna-compute/src/attention.rs:14084
-module	kv_cache_write_asym_k_givens4	config-opt-in	Non-default configuration: attention.rs / memory.kv_cache; rdna-compute/src/attention.rs:11587
-module	kv_cache_write_asym_k_givens4_batched	config-opt-in	Non-default configuration: attention.rs / memory.kv_cache; rdna-compute/src/attention.rs:13012
-module	kv_cache_write_asym_k_givens4_batched_paged	config-opt-in	Non-default configuration: attention.rs / serve.multi_slot; rdna-compute/src/attention.rs:11406
 module	kv_cache_write_bf16	config-opt-in	Non-default configuration: attention.rs / memory.kv_cache; rdna-compute/src/attention.rs:2883
 module	kv_cache_write_bf16_batched	config-opt-in	Non-default configuration: attention.rs / memory.kv_cache; rdna-compute/src/attention.rs:2942
 module	kv_cache_write_bf16_batched_paged	config-opt-in	Non-default configuration: attention.rs / serve.multi_slot; rdna-compute/src/attention.rs:2942
@@ -1094,11 +1068,6 @@ module	kv_cache_write_q4	non-core-family	Non-core family route: Qwen2/Llama; rdn
 module	kv_cache_write_q8	no-caller	No production caller; only definitions, tests/examples or an unreachable launcher branch remain; rdna-compute/src/attention.rs:16464
 module	kv_cache_write_q8_0_batched_vmm	config-opt-in	Non-default configuration: attention.rs / serve.vmm_batch; rdna-compute/src/attention.rs:4172
 module	kv_cache_write_q8_0_ring	non-core-family	Non-core family route: Muse Glimmer, Qwen2/Llama, LFM2; rdna-compute/src/attention.rs:2819
-module	kv_compact_gather	config-opt-in	Non-default configuration: attention.rs / memory.cask.sidecar; rdna-compute/src/attention.rs:16229
-module	kv_fold_asym2	config-opt-in	Non-default configuration: attention.rs / memory.cask.sidecar; rdna-compute/src/attention.rs:16424
-module	kv_fold_asym3	config-opt-in	Non-default configuration: attention.rs / memory.cask.sidecar; rdna-compute/src/attention.rs:16330
-module	kv_fold_asym4	config-opt-in	Non-default configuration: attention.rs / memory.cask.sidecar; rdna-compute/src/attention.rs:16375
-module	kv_fold_q8	config-opt-in	Non-default configuration: attention.rs / memory.cask.sidecar; rdna-compute/src/attention.rs:16283
 module	kv_transcode_k_fwht4_to_fwht2	config-opt-in	Non-default configuration: attention.rs / memory.kv_adaptive; rdna-compute/src/attention.rs:12378
 module	kv_transcode_k_fwht4_to_fwht3	config-opt-in	Non-default configuration: attention.rs / memory.kv_adaptive; rdna-compute/src/attention.rs:12421
 module	kv_transcode_v_lloyd_down	config-opt-in	Non-default configuration: attention.rs / memory.kv_adaptive; rdna-compute/src/attention.rs:12333
@@ -1119,6 +1088,7 @@ module	moe_scatter_permute_k8	no-caller	No production caller; only definitions, 
 module	moe_softmax_topk_k8	non-core-family	Non-core family route: Gemma; hipfire-dispatch/src/pipeline/sandwich.rs:1269
 module	moe_softmax_topk_k8_batched	non-core-family	Non-core family route: Gemma; hipfire-dispatch/src/pipeline/sandwich.rs:1164
 module	moe_unscatter_silu_clamp_k8	non-core-family	Non-core family route: DeepSeek4, MiniMax/Maple; forward.rs:871
+module	mq8_rotate_quantize_x_batched	codec-outside-core-rungs	MQ8G256 batched FWHT256 activation producer shared by the prefill GEMM and the n>=3 row-exact verify GEMV; run by the Raon attention-class MQ8G256 projections, an arch outside the admitted core artifact rungs; rdna-compute/src/gemm_mq8g256.rs:475
 module	mq_rotate_x_dual_fp8_gfx12	codec-outside-core-rungs	MFP4/HFP4 route absent from admitted core artifact rungs; gemv.rs:7715-7717
 module	mq_rotate_x_gfx942	non-target-arch	Only non-target gfx906/gfx942/gfx10 or non-admitted synthetic shapes reach this path; rdna-compute/src/gemv.rs:6058-6063
 module	mq_rotate_x_mq4v2_fp8_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_IU4_PREFILL / HIPFIRE_FP8_PROD_INREG; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
@@ -1127,15 +1097,28 @@ module	mq8_rotate_quantize_x	codec-outside-core-rungs	MQ8G256 route absent from 
 module	mq_rotate_x_i8_gfx11	developer-opt-in	gfx1151 opt-in only, measured slower: HIPFIRE_MQ6_I8=1 (one-pass rotate + A8 producer of the exact-INT8 MQ6 prefill); rdna-compute/src/gemv.rs:6666
 module	pack_f32_to_fp8_gfx12	codec-outside-core-rungs	HFP4G32/MQ4 route absent from admitted core artifact rungs; rdna-compute/src/dispatch.rs:4358
 module	pack_fp8_verify_rows_gfx1201	developer-opt-in	Non-default developer override: HIPFIRE_CB_VERIFY_FP8; rdna-compute/src/gemm_fp8_verify.rs:400-440
-module	pflash_score_fwht2_kv	config-opt-in	Non-default configuration: attention.rs / speculation.prefill.mode; rdna-compute/src/attention.rs:18932
-module	pflash_score_fwht3_kv	config-opt-in	Non-default configuration: attention.rs / speculation.prefill.mode; rdna-compute/src/attention.rs:18864
-module	pflash_score_fwht4_kv	config-opt-in	Non-default configuration: attention.rs / speculation.prefill.mode; rdna-compute/src/attention.rs:18897
-module	pflash_score_q8_kv	config-opt-in	Non-default configuration: attention.rs / speculation.prefill.mode; rdna-compute/src/attention.rs:18798
 module	qk_rmsnorm_rope_flux	non-core-family	Non-core family route: Flux/VAE; hipfire-arch-diffusion/src/flux_gpu.rs:2010
 module	qkv_split_interleaved	non-core-family	Non-core family route: dots.ocr; hipfire-arch-dots-ocr/src/dots_ocr.rs:1559
 module	quick_gelu_f32	non-core-family	Non-core family route: Flux/VAE; rdna-compute/src/text_encoder.rs:179
 module	qwen35_fa_prep_kvwrite_gfx1100	developer-opt-in	Non-default developer override: HIPFIRE_FA_KVWRITE_FOLD; hipfire-arch-qwen35/src/qwen35/forward.rs:6709-6711
 module	qwen36_27b_fa_prep_gfx1201_rows	config-opt-in	Non-default configuration: serve.vmm_batch; hipfire-config/src/lib.rs:1370-1377
+module	qwen4_g942_conv_fuse	non-target-arch	Only non-target gfx942 reaches this path (exact gfx942 convert-elimination entries of the C8 lane-verify HC read: hyper_norm with a BF16 second output, resolved by arch); rdna-compute/src/cdna/gfx942.rs:515
+module	qwen4_g942_gdn_verify	non-target-arch	Only non-target gfx942 reaches this path (exact gfx942 GDN verify-window entries of native MTP: persistent capture recurrence, rollback, convolution + gate parameters, gated norm; resolved by arch); rdna-compute/src/cdna/gfx942.rs:379
+module	qwen4_g942_gdn_lanes_verify	non-target-arch	Only non-target gfx942 reaches this path (exact gfx942 GDN Core of a whole lane group: capture-input copy + convolution + gate parameters, recurrence, gated norm; resolved by arch); rdna-compute/src/cdna/gfx942_gdn_lanes_verify.rs:55
+module	qwen4_g942_gemv_mq2g256v2_xbatch	non-target-arch	Only non-target gfx942 reaches this path (exact gfx942 x-batched MQ2G256V2 ranking GEMV of the MTP draft head, resolved by arch); rdna-compute/src/cdna/gfx942_mq2_xbatch.rs:78
+module	qwen4_g942_qsa_row_attention	non-target-arch	Only non-target gfx942 reaches this path (exact gfx942 single-row parallel QSA attention of the MTP draft head and AR rows, F32 and E4M3 FNUZ K/V, resolved by arch); rdna-compute/src/cdna/gfx942.rs:474
+module	qwen4_g942_glue_elem	non-target-arch	Only non-target gfx942 reaches this path (exact gfx942 C1 elementwise fold, HIPFIRE_QWEN4_G942_FOLD_ELEM, default on); rdna-compute/src/cdna/gfx942.rs:182
+module	qwen4_g942_glue_moe	non-target-arch	Only non-target gfx942 reaches this path (exact gfx942 C1 MoE glue fold, HIPFIRE_QWEN4_G942_FOLD_MOE, default on); rdna-compute/src/cdna/gfx942.rs:131
+module	qwen4_g942_moe_wide	non-target-arch	Only non-target gfx942 reaches this path (exact gfx942 wide-lane stock-FP8 MoE glue of >= 8-row calls: wave64 router, mask-and-popcount grouping, slot-major unscatter, batched-gather combine, resolved by arch and row count); rdna-compute/src/cdna/gfx942.rs:230
+module	qwen4_g942_moe_gemm	non-target-arch	Only non-target gfx942 reaches this path (exact gfx942 wide-lane FP8 grouped MoE GEMM, LDS strip transpose, byte-identical to gemm_fp8b128_moe_grouped_bf16mfma, resolved by arch and tile count); rdna-compute/src/cdna/gfx942.rs:283
+module	qwen4_gdn_lanes_step_capture_f32_gfx942	non-target-arch	Only non-target gfx942 reaches this path (exact gfx942 batched captured F32 GDN verify-lane recurrence of native MTP lanes, resolved by arch); rdna-compute/src/cdna/gfx942.rs:301
+module	qwen4_g942_hc_gates	non-target-arch	Only non-target gfx942 reaches this path (exact gfx942 batched k4 HC write gates for lane steps wider than eight rows, resolved by arch); rdna-compute/src/cdna/gfx942.rs:323
+module	qwen4_g942_rows16_grid	non-target-arch	Only non-target gfx942 reaches this path (exact gfx942 row-grid launch of the few-row BF16 MFMA GEMM for the HC read down projection at 17..=256 rows, resolved by arch); rdna-compute/src/cdna/gfx942.rs:2541
+module	qwen4_gdn_lanes_step_f32_gfx942	non-target-arch	Only non-target gfx942 reaches this path (exact gfx942 batched F32 GDN lanes core, resolved by arch); rdna-compute/src/cdna/gfx942.rs:1572
+module	qwen4_moe_down_a8_gfx1201	developer-opt-in	Non-default developer override: HIPFIRE_QWEN4_MOE_DOWN_A8; rdna-compute/src/qwen4_moe_down_a8.rs:343
+module	qwen4_moe_ep_a8_gfx12	developer-opt-in	Developer overrides HIPFIRE_QWEN4_MOE_EP_A8 (EP prefill) and HIPFIRE_QWEN4_MOE_GU_A8 (default-on kill switch, EP2 9..=64-row verify), like qwen4_moe_down_a8_gfx1201; rdna-compute/src/qwen4_moe_ep_a8.rs:525
+module	qwen4_moe_rotate128_i8_gfx12	developer-opt-in	Developer overrides HIPFIRE_QWEN4_MOE_EP_A8 (EP prefill) and HIPFIRE_QWEN4_MOE_GU_A8 (default-on kill switch, EP2 9..=64-row verify); rdna-compute/src/qwen4_moe_ep_a8.rs:358
+module	qwen4_qsa_lanes_f32_gfx942	non-target-arch	Only non-target gfx942 reaches this path (exact gfx942 batched QSA lanes core, resolved by arch); rdna-compute/src/cdna/gfx942_qsa_lanes.rs:289
 module	rmsnorm_f32_at_slot_buf	non-core-family	Non-core family route: DeepSeek4; hipfire-arch-deepseek4/src/forward.rs:2362
 module	rmsnorm_f32_staged_buf	non-core-family	Non-core family route: DeepSeek4; rdna-compute/src/attention.rs:19388
 module	rmsnorm_f32_warp_reduce	no-caller	Dead branch: warp_reduce=false; no production caller; rdna-compute/src/norm.rs:188-191
@@ -1198,12 +1181,6 @@ module	tp_graph_signal_store_gfx1201	non-core-family	Non-core family route: Deep
 module	tp_graph_signal_wait2_gfx1201	non-core-family	Non-core family route: DeepSeek4; rdna-compute/src/attention.rs:20690
 module	tp_graph_signal_wait3_gfx1201	non-core-family	Non-core family route: DeepSeek4; rdna-compute/src/attention.rs:20740
 module	transpose_f32	config-opt-in	Non-default configuration: vision.mode / vision.rs; qwen35_vl.rs:968
-module	triattn_accumulate	no-caller	No production caller; only definitions, tests/examples or an unreachable launcher branch remain; rdna-compute/src/attention.rs:965
-module	triattn_score_asym2	config-opt-in	Non-default configuration: attention.rs / memory.cask.sidecar; rdna-compute/src/attention.rs:16043
-module	triattn_score_asym3	config-opt-in	Non-default configuration: attention.rs / memory.cask.sidecar; rdna-compute/src/attention.rs:16170
-module	triattn_score_asym4	config-opt-in	Non-default configuration: attention.rs / memory.cask.sidecar; rdna-compute/src/attention.rs:16106
-module	triattn_score_fwht	config-opt-in	Non-default configuration: attention.rs / memory.cask.sidecar; rdna-compute/src/attention.rs:15978
-module	triattn_score_q8	config-opt-in	Non-default configuration: attention.rs / memory.cask.sidecar; rdna-compute/src/attention.rs:15917
 module	vae_attn	non-core-family	Non-core family route: Flux/VAE; hipfire-arch-diffusion/src/vae_gpu.rs:1404
 module	vae_conv1x1	non-core-family	Non-core family route: Flux/VAE; hipfire-arch-diffusion/src/vae_gpu.rs:1216
 module	vae_conv3x3	non-core-family	Non-core family route: Flux/VAE; hipfire-arch-diffusion/src/vae_gpu.rs:1049
@@ -1239,7 +1216,6 @@ dynamic	crates/rdna-compute/src/attention.rs::ensure_vmm_rows_module_from	dynami
 dynamic	crates/rdna-compute/src/attention.rs::launch_asym_flash_batched	dynamic-lazy	Forwards a caller module; static callers are checked separately. Non-core, config and codec variants retain explicit module exceptions; rdna-compute/src/attention.rs:12775
 dynamic	crates/rdna-compute/src/attention.rs::launch_asym_flash_batched_variant	dynamic-lazy	Forwards the caller's selected scalar tile (the VMM-paged arm asserts the WMMA grid is never taken); rdna-compute/src/attention.rs:13839
 dynamic	crates/rdna-compute/src/attention.rs::launch_asym_k_batched	dynamic-lazy	Forwards a caller module; static callers are checked separately. Non-core, config and codec variants retain explicit module exceptions; rdna-compute/src/attention.rs:12515
-dynamic	crates/rdna-compute/src/attention.rs::pflash_score_fwht_kv_impl	dynamic-lazy	Forwards a caller module; static callers are checked separately. Non-core, config and codec variants retain explicit module exceptions; rdna-compute/src/attention.rs:18974
 dynamic	crates/rdna-compute/src/attention.rs::qresident_launch	dynamic-lazy	Forwards a caller module; static callers are checked separately. Non-core, config and codec variants retain explicit module exceptions; rdna-compute/src/attention.rs:7150
 dynamic	crates/rdna-compute/src/dispatch.rs::begin_route_kernel_load_predicted	dynamic-enumerated	Registry-fed KernelEntry/PlannedKernel modules are enumerated by kernel_registry::entries; no synthesized module keys; dispatch.rs:3943-3952
 dynamic	crates/rdna-compute/src/dispatch.rs::dequantize_lowbit_to_f16	dynamic-lazy	Forwards a caller module; static callers are checked separately. Non-core, config and codec variants retain explicit module exceptions; rdna-compute/src/dispatch.rs:2447

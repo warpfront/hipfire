@@ -1246,6 +1246,21 @@ pub fn run(_fixtures: &Path, opts: &BTreeMap<String, String>) -> Result<Value, S
             },
             "pp": pp_rows,
             "tg": tg_row,
+            // The Raon railgun owner's counters (`null` when HIPFIRE_RAON_RAILGUN is off): which backend
+            // actually executed the decode steps, and why any were declined to the HIP graph.
+            "railgun": bundle.railgun_stats().map(|s| json!({
+                "attempts": s.attempts,
+                "completed": s.completed,
+                "declined": s.declined,
+                "declined_by_kind": s.declined_by_kind,
+                "builds": s.builds,
+                "rebuilds": s.rebuilds,
+                "quarantined": s.quarantined,
+                "last_refusal": s.last_refusal,
+                "nodes": s.nodes,
+                "ib_dwords": s.ib_dwords,
+                "last_build_ms": s.last_build_ms,
+            })),
             "profile": profile_json,
         }))
     })();

@@ -98,8 +98,8 @@ grouped quant (plain tensor, 256-element "group").
 | 50 | MQ2G256V2 | 72 | per-128 `fp16` `[s z]×2` | 2-bit packs | yes | `mq2g256v2_row_dot` | AVX2 + FMA + F16C |
 | 51 | MQ2G256LloydU | 72 | 4-entry `fp16` codebook | 2-bit indices | **no** (unrotated) | `mq2g256lloydu_row_dot` | AVX2 + FMA + F16C |
 | 53 | MQ4G128V2 | 68/128 | per-128 `fp16` `[s z]` | nibbles | yes (FWHT-128) | `mq4g128v2_row_dot` | AVX2 + FMA + F16C |
-| 131 | MQ3I4G128R256 (W3) | 48/128 + plane | **planar**: f16 scale plane after all code rows | 3-bit codes, `d·(2c−7)` | yes | `w3_row_dot` | AVX2 + FMA + F16C |
-| 132 | MQ3I4G128R128 (W3 down) | 48/128 + plane | as qt 131 | as qt 131 | yes (FWHT-128) | `w3_row_dot` | AVX2 + FMA + F16C |
+| 131 | MQ3I4G128R256 (W3) | 48/128 + plane | **planar**: f16 scale plane after all code rows | 3-bit codes, `d·(2c−7)` | yes | `w3_row_dot` (+ AVX-512 `w3_row_dot512`, decode-once multi-token; bit-identical) | AVX2 + FMA + F16C (AVX-512 tier: F + VBMI + BW + VL) |
+| 132 | MQ3I4G128R128 (W3 down) | 48/128 + plane | as qt 131 | as qt 131 | yes (FWHT-128) | `w3_row_dot` (+ AVX-512 `w3_row_dot512`, decode-once multi-token; bit-identical) | AVX2 + FMA + F16C (AVX-512 tier: F + VBMI + BW + VL) |
 | 135 | E8PI4G128R256 (E8P) | 32/128 + plane | **planar**: f16 scale plane after all code rows | E8P lattice words (8 weights per u16) | yes | `e8p_row_dot`; prepared `e8p_row_dot_cached`, `e8p_row_pair_dot_cached` | AVX2 + FMA + F16C |
 | 136 | E8PI4G128R128 (E8P down) | 32/128 + plane | as qt 135 | as qt 135 | yes (FWHT-128) | as qt 135 | AVX2 + FMA + F16C |
 
@@ -147,7 +147,7 @@ any runner.
   an int8-quantized activation, not a plain FWHT of f32), qt 21/24/32/33/35/36/37
   (HFP4/MFP4 family: per-row 16 B header + per-32 block scales — qt 34 `MFP4G32E8`
   is covered above), qt 28/29
-  (PARO4G128(-T), a Givens rotation on the *activation*), qt 38/39
+  (reserved; formerly PARO4G128/PARO4G128T, removed in 0.5.0), qt 38/39
   (`MQ{2,3}G256GL`, MoE-indexed only), qt 22 (`TidI32`, a routing table, not a
   weight), qt 42 (`MFP4G32E8G128`, qt 34 row layout with 128-wide rotation
   groups), qt 52 (`MQ4G256V2L`, codes index an external per-tensor
@@ -200,11 +200,13 @@ in its per-format summary. **Worst relative error is 9.3e-7** (`Mq4G256`, the
 remaining 15 of the 23 report exactly 0.
 
 The test is pre-existing — what this work adds is that the formats it exercises
-now take a kernel instead of the scalar decode. Two honest gaps: qt 11/12
-(`Hfq3G256`/`Hfq3G128`) report `SKIP — production launcher has no kernel (…) on
-this arch` on gfx1201, so their parity could not run (the crate's
-canonical-table oracle still covers them); and F16/F32/Bf16 are absent from the
-test's synthesised table, so those three rest on the crate tests alone.
+now take a kernel instead of the scalar decode. One honest gap: F16/F32/Bf16
+are absent from the test's synthesised table, so those three rest on the crate
+tests alone. qt 11 (`Hfq3G256`) used to report `SKIP — production launcher has
+no kernel (…) on this arch` on gfx1201; since HIPF-241 it has a GEMV on every
+wave32 arch, as qt 12 (`Hfq3G128`) does since HIPF-222. Both match the CPU
+oracle within TOL (exact on the dyadic synthetic fixture, gfx1151; gfx1201 was
+not re-run).
 
 Kernel-level microbench (historical landing-time measurement; m=4096, k=5120,
 same rayon pool both arms, best of 3 — not a serve-path measurement, re-measure

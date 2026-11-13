@@ -7,7 +7,8 @@
 //! and the hardware tests).
 //!
 //! It is the product loader's admission-first order, without the product's
-//! MTP, PLE hot store and hot set: the S1 profile is selected FIRST
+//! MTP and PLE hot store (and, unless `HIPFIRE_QWEN4_S1_TIER=1` with a ranked
+//! hot set named by `HIPFIRE_QWEN4_EXPERT_HOTSET`, without its hot set): the S1 profile is selected FIRST
 //! ([`crate::slowlink_admission::select_load_profile`], from the exact
 //! placement census [`crate::expert_residency::placement_inputs`]), then the
 //! routed-expert placement it implies, then the bundle, with the profile
@@ -152,6 +153,9 @@ fn load_inner(
         .map_err(|error| format!("qwen4 artifact admission failed: {error}"))?;
     let trunk_overlay = crate::resolve_trunk_overlay(&hfq, path, &gpu.arch, &receipt.config)
         .map_err(|error| format!("qwen4 trunk overlay: {error}"))?;
+    let hc8_sidecar =
+        crate::resolve_hc8_sidecar(&hfq, path, gpu.flags.qwen4_hc8_enabled(), &receipt.config)
+            .map_err(|error| format!("qwen4 hc8 sidecar: {error}"))?;
     let scratch_mode =
         crate::artifact::source_forward_scratch_mode(gpu, &hfq, &receipt.config, &receipt.manifest)
             .map_err(|error| format!("qwen4 forward scratch plan failed: {error}"))?;
@@ -227,6 +231,30 @@ fn load_inner(
     let routed_experts = !receipt.config.ffn.is_dense();
     let mut weights = receipt.manifest.weights.clone();
     let explicit = residency::expert_vram_layers_from_env()?;
+    // S1 over a ranked hot set (`HIPFIRE_QWEN4_S1_TIER=1`): the hot set the product loader would
+    // apply, found by the same preflight; its absence leaves the load exactly as before.
+    let tier_hotset_path =
+        if s1::s1_tier_enabled_on(&gpu.arch) && !unified && explicit.is_none() && routed_experts {
+            use crate::expert_hotset as hotsets;
+            let policy = hotsets::HotsetPolicy::from_env()?;
+            let env = hotsets::HotsetEnv {
+                gpu_arch: &gpu.arch,
+                unified_memory: false,
+                expert_parallel: false,
+                explicit_vram_layers: false,
+                source: match &recipe {
+                    crate::weights::Qwen4TierRecipe::FlashNextPacked { .. } => {
+                        hotsets::HotsetSource::Aggregate
+                    }
+                    _ => {
+                        hotsets::HotsetSource::Nonaggregate("not an aggregate MQ4 artifact".into())
+                    }
+                },
+            };
+            hotsets::preflight(&policy, path, &env).ok()
+        } else {
+            None
+        };
     let mut weight_arenas = None;
     let mut resident_layer_set = None;
     let (resident_layers, placement, profile) = if !product_fallback
@@ -254,7 +282,7 @@ fn load_inner(
                 pipeline_band: false,
                 routed_experts,
                 expert_keep: receipt.config.expert_keep.is_some(),
-                hotset_sidecar: false,
+                hotset_sidecar: tier_hotset_path.is_some(),
                 whole_first: false,
             },
             max_seq,
@@ -343,10 +371,16 @@ fn load_inner(
             let resident = s1::s1_resident_layer_set(receipt.config.num_hidden_layers, layers)?;
             residency::place_routed_experts_set(&mut weights, &resident);
             resident_layer_set = Some(resident);
+        } else if profile.as_ref().is_some_and(|profile| profile.tier) {
+            // The tier plan owns every trunk routed expert (hot in VRAM, cold in the pinned host
+            // owner); only the MTP entries follow the ordinary host placement.
+            residency::place_routed_experts(&mut weights, receipt.config.num_hidden_layers);
         } else {
             residency::place_routed_experts(&mut weights, layers);
         }
-        let placement = if profile.is_some() {
+        let placement = if profile.as_ref().is_some_and(|profile| profile.tier) {
+            "slowlink-tier"
+        } else if profile.is_some() {
             "slowlink-profile"
         } else {
             "incumbent-auto"
@@ -355,6 +389,82 @@ fn load_inner(
     };
     if profile.is_none() {
         weight_arenas = None;
+    }
+    // The tier plan of a tier-admitted profile, built and materialized exactly as the product
+    // loader does (`carriers.rs`), from the profile's own hot-expert budget.
+    let mut placements = receipt.placements.clone();
+    let mut tier_lease = None;
+    if let Some(profile) = profile.as_ref().filter(|profile| profile.tier) {
+        use crate::expert_hotset as hotsets;
+        use crate::expert_tier_plan::Placement;
+        let hotset_path = tier_hotset_path
+            .as_ref()
+            .ok_or("a tier S1 profile was admitted without a ranked hot set")?;
+        let tier_hfq = hipfire_runtime::hfq::HfqFile::open(path)
+            .map_err(|error| format!("open HFQM {}: {error}", path.display()))?;
+        let base = hotsets::HotsetBase::from_hfq(&tier_hfq)?;
+        let sidecar = hotsets::HotsetSidecar::load_bound(
+            hotset_path,
+            receipt.config.num_hidden_layers,
+            receipt.config.num_experts,
+            receipt.config.num_experts_per_tok,
+            &base,
+        )
+        .map_err(|skip| skip.to_string())?;
+        receipt
+            .manifest
+            .check_expert_tiers()
+            .map_err(|error| error.to_string())?;
+        let slabs =
+            crate::artifact::hotset_aggregate_slabs(&tier_hfq, &receipt.config, &receipt.manifest)?;
+        let total = hotsets::require_budget(residency::expert_hotset_budget(
+            profile.placement.memory.free_bytes,
+            profile.placement.non_expert_bytes,
+            profile.tier_hot_reserve_bytes(),
+        ))
+        .map_err(|skip| skip.to_string())?;
+        let budget = hotsets::HotsetBudget::from_env()?.select(total)?;
+        let plan =
+            crate::expert_tier_plan::plan_expert_tiers_from_slabs(&slabs, sidecar.rank(), budget)
+                .map_err(|error| error.to_string())?;
+        hotsets::require_experts(plan.device_experts()).map_err(|skip| skip.to_string())?;
+        plan.check_executable(&gpu.arch)
+            .map_err(|error| error.to_string())?;
+        let device_experts = plan.device_experts();
+        let source_span = |offset: u64, len: u64| {
+            let offset = usize::try_from(offset).map_err(|_| "hotset source offset overflow")?;
+            let len = usize::try_from(len).map_err(|_| "hotset source length overflow")?;
+            tier_hfq.data_range(offset, len).ok_or_else(|| {
+                format!("hot set source span {offset}+{len} is outside the artifact mmap")
+            })
+        };
+        let lease =
+            crate::expert_tier_owners::materialize(gpu, std::sync::Arc::new(plan), &source_span)
+                .map_err(|error| format!("hot set materialize failed: {error}"))?;
+        lease
+            .bind_hotset_sidecar_sha256(sidecar.sha256())
+            .map_err(|error| format!("hotset numerical identity: {error}"))?;
+        lease
+            .bind_hotset_counts(sidecar.counts())
+            .map_err(|error| format!("hotset routing counts: {error}"))?;
+        eprintln!(
+            "  qwen4 expert hot set (S1 tier): {}, budget {} MiB, {device_experts} experts in VRAM ({} MiB), {} host-mapped ({} MiB)",
+            hotset_path.display(),
+            budget >> 20,
+            lease.owner_bytes(Placement::Device) >> 20,
+            48 * 512 - device_experts,
+            lease.owner_bytes(Placement::HostMapped) >> 20,
+        );
+        let tiered = crate::weights::Qwen4Manifest {
+            weights: weights.clone(),
+            ..receipt.manifest.clone()
+        }
+        .with_expert_tiers()
+        .map_err(|error| error.to_string())?;
+        let expected: std::collections::BTreeSet<_> = tiered.resident_keys().collect();
+        placements.retain(|kept| expected.contains(&(kept.name.as_str(), kept.layer)));
+        weights = tiered.weights;
+        tier_lease = Some(lease);
     }
     let host_mapped_tensors = weights
         .iter()
@@ -392,14 +502,14 @@ fn load_inner(
         receipt.config,
         &recipe,
         transaction,
-        &receipt.placements,
+        &placements,
         gpu,
         max_seq,
         receipt.ple,
         receipt.ple_rows,
         state_format,
         backend,
-        None,
+        tier_lease,
     )
     .map_err(|error| format!("qwen4 bundle assembly failed: {error}"))?;
     bundle.attach_npu_trunk_identity(npu_identity);
@@ -410,6 +520,15 @@ fn load_inner(
                 Err(free) => format!("bundle teardown reported {free}"),
             };
             return Err(format!("qwen4 trunk overlay: {error}; {teardown}"));
+        }
+    }
+    if let Some(sidecar) = hc8_sidecar {
+        if let Err(error) = bundle.attach_hc8_sidecar(sidecar) {
+            let teardown = match bundle.free_gpu(gpu) {
+                Ok(()) => "bundle released to the device pool".to_string(),
+                Err(free) => format!("bundle teardown reported {free}"),
+            };
+            return Err(format!("qwen4 hc8 sidecar: {error}; {teardown}"));
         }
     }
     let slowlink_profile = profile.is_some();

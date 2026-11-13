@@ -162,6 +162,22 @@
 //! Run this battery once with `HIPFIRE_REPLAY_BACKEND=hip`, once with `auto`;
 //! identities record the resolved backend. These are eager verify windows
 //! bound to the actual singleton AR policy, not hipGraph capture evidence.
+//!
+//! # gfx942 (MI300X) on the stock-FP8 artifact
+//!
+//! `HIPFIRE_MTP_IDENTITY_MODEL` names the stock-FP8 `.hfq`; its `<model>.mtp`
+//! sidecar next to it supplies the native head through the oracle load
+//! (`common/stock_mtp_load.rs`, a standalone load; the product loader admits the
+//! head on gfx942 too).
+//! gfx942 has no GDN row capture, so a partial accept is repaired by restore
+//! plus replay, and the planner serves no native depth until the gfx942 window
+//! cost table is measured: run every arm under
+//! `HIPFIRE_QWEN4_MTP_G942_DEPTH=<1..7>` (forced fixed depth, no floor;
+//! `incremental` still takes the interleaved route, `batched`/`adaptive` the
+//! forced depth, capped by the test's draft budget `MTP_K` = 3 or
+//! `HIPFIRE_MTP_IDENTITY_K=<1..7>`). `HIPFIRE_G942_TRUNK_GEMV` must be unset:
+//! set, the planner refuses native MTP (its GEMV decode is not bitwise the
+//! multi-row verify).
 
 use hipfire_arch_qwen4::expert_residency as residency;
 use hipfire_arch_qwen4::mtp_spec::{
@@ -185,6 +201,8 @@ use std::process::{Command, Stdio};
 
 #[path = "common/hw_identity.rs"]
 mod hw_identity;
+#[path = "common/stock_mtp_load.rs"]
+mod stock_mtp_load;
 use hw_identity::Counters;
 
 const MODEL_ENV: &str = "HIPFIRE_MTP_IDENTITY_MODEL";
@@ -1881,7 +1899,8 @@ fn arm_overrides(arm: Arm) -> Result<Vec<(&'static str, Option<&'static str>)>, 
 /// unqualified default (`hipfire_config::mtp_k_default` over the GPU's
 /// qualified row-exact rows, no explicit `mtp_k`), so the incumbent and the
 /// derived chooser are not both pinned to a shallow test K; every other arm
-/// keeps this test's [`MTP_K`].
+/// keeps this test's [`MTP_K`], or `HIPFIRE_MTP_IDENTITY_K` (1..=7) when set:
+/// on gfx942 the forced-depth oracles run deeper than the default K.
 fn arm_mtp_k(arm: Arm, gpu_arch: &str) -> usize {
     if arm.wide.is_some() {
         63
@@ -1890,6 +1909,11 @@ fn arm_mtp_k(arm: Arm, gpu_arch: &str) -> usize {
             hipfire_arch_qwen4::ARCH_ID,
             rdna_compute::prefill_invariant::qwen4_row_exact_verify_rows(gpu_arch),
         )
+    } else if let Ok(k) = std::env::var("HIPFIRE_MTP_IDENTITY_K") {
+        match k.trim().parse::<usize>() {
+            Ok(k) if (1..=7).contains(&k) => k,
+            _ => panic!("HIPFIRE_MTP_IDENTITY_K={k:?} is not a draft budget 1..=7"),
+        }
     } else {
         MTP_K
     }
@@ -2337,30 +2361,41 @@ fn run_arm(arm: Arm, case: Case, model: &Path, dir: &Path) -> Result<(), String>
     // MTP head, exactly as `hipfire serve` loads this artifact. `max_k` sizes the
     // MTP reserve of the placement with this test's K for every arm, the AR arm
     // included. `state_quant` is the GDN test mode's canonical request.
-    let shared = Qwen4RankShared {
-        continuous_batch: false,
-        path: model_str.to_string(),
-        max_seq: MAX_SEQ,
-        sequence: None,
-        backend,
-        vmm_granularity,
-        kv_mode: hipfire_runtime::config::get().kv_mode.clone(),
-        state_quant: Some(state_request.to_string()),
-        spec: SpecLoadCfg::default(),
-        native_mtp: true,
-        max_k: mtp_k,
+    let mut bundle = if stock_mtp_load::has_stock_mtp_sidecar(model) {
+        // A stock-FP8 artifact with its `<model>.mtp` head: the product
+        // loader refuses native MTP on that recipe until its verify is
+        // proven, so the head loads through the oracle recipe
+        // (`common/stock_mtp_load.rs`), which assembles the same bundle.
+        drop(source);
+        stock_mtp_load::load_stock_mtp_bundle(&mut gpu, model, MAX_SEQ, state_request)?
+    } else {
+        let shared = Qwen4RankShared {
+            batch: Default::default(),
+            path: model_str.to_string(),
+            max_seq: MAX_SEQ,
+            sequence: None,
+            backend,
+            vmm_granularity,
+            kv_mode: hipfire_runtime::config::get().kv_mode.clone(),
+            state_quant: Some(state_request.to_string()),
+            spec: SpecLoadCfg::default(),
+            native_mtp: true,
+            max_k: mtp_k,
+        };
+        let loaded = load_qwen4_rank(&mut gpu, None, &shared, None, None, source)?;
+        if loaded.max_seq != MAX_SEQ {
+            return Err(format!(
+                "the loader admitted max_seq {}, not {MAX_SEQ}",
+                loaded.max_seq
+            ));
+        }
+        if !loaded.native_mtp {
+            return Err(
+                "the product load declined the native MTP head; no arm runs without it".into(),
+            );
+        }
+        loaded.bundle
     };
-    let loaded = load_qwen4_rank(&mut gpu, None, &shared, None, None, source)?;
-    if loaded.max_seq != MAX_SEQ {
-        return Err(format!(
-            "the loader admitted max_seq {}, not {MAX_SEQ}",
-            loaded.max_seq
-        ));
-    }
-    if !loaded.native_mtp {
-        return Err("the product load declined the native MTP head; no arm runs without it".into());
-    }
-    let mut bundle = loaded.bundle;
     let state_format = bundle.state_format();
     if state_format.gdn != want_gdn {
         return Err(format!(
@@ -2444,7 +2479,10 @@ fn run_arm(arm: Arm, case: Case, model: &Path, dir: &Path) -> Result<(), String>
         }
         gpu.free_tensor(logits).map_err(|e| e.to_string())?;
     } else {
-        if arm.route == Route::Batched && !capture {
+        // gfx942 has no GDN row capture: its batched windows repair a partial
+        // accept by restoring the snapshot and replaying the accepted rows
+        // (`prepare_native_window`), which is the route under test there.
+        if arm.route == Route::Batched && !capture && gpu.arch != "gfx942" {
             return Err("this GPU's GDN route does not capture verify rows".into());
         }
         let mut drafter = Qwen4MtpDrafter::new(mtp_k, MAX_SEQ, None);

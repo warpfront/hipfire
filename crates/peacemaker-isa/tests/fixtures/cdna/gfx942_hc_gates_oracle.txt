@@ -1,0 +1,205 @@
+hc_wide_g942_oracle: gate entries from image /scratch/quant/fn-fp8/beat/WC8/twin/hc/hc-twin-device.elf
+[hip-bridge] GPU_PINNED_MIN_XFER_SIZE=100000: pageable weight copies staged out of reclaim
+GPU dev 0: gfx942 (205.8 GB VRAM, HIP 7.16)
+[rocblas] loaded for gfx942
+hc_wide_g942_oracle: arch=gfx942 model=Some("/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq")
+  tensor_ops: hipcc compiled (gfx942, key a54af22a341a12b5)
+  qwen4_g942_glue_elem: hipcc compiled (gfx942, key f1d07a15f45211c7)
+  gemm_bf16_mfma_gfx942: hipcc compiled (gfx942, key 6115def4e25ca750)
+  convert_f32_to_bf16: hipcc compiled (gfx942, key c0ec9b2422684d90)
+  gemm_bf16_mfma_wide_gfx942: hipcc compiled (gfx942, key 0b976c73cd83e875)
+  silu: hipcc compiled (gfx942, key 6b6390ce96b3553f)
+  qwen4_gemv_bf16_xf32: hipcc compiled (gfx942, key c2ade363749ef5f0)
+CHUNK synthetic read L0 attn n=9 seed=0: chunk fnv64=0645c0368ca29b7e
+CHUNK synthetic read L0 attn n=16 seed=0: chunk fnv64=4e5dc94d93af9639
+CHUNK synthetic read L0 attn n=17 seed=0: chunk fnv64=96aca07a9ba0b626
+CHUNK synthetic read L0 attn n=32 seed=0: chunk fnv64=75c5ceceb8bcdc2e
+CHUNK synthetic read L0 attn n=33 seed=0: chunk fnv64=2ccbaae3fd240cad
+CHUNK synthetic read L0 attn n=64 seed=0: chunk fnv64=a6da9e05af6a04d4
+CHUNK synthetic write L0 attn n=9 seed=0: chunk fnv64=9cac39c979a6531a
+CHUNK synthetic write L0 attn n=16 seed=0: chunk fnv64=e883dcaae572e99a
+CHUNK synthetic write L0 attn n=17 seed=0: chunk fnv64=9f5a3cae93a1ad99
+CHUNK synthetic write L0 attn n=32 seed=0: chunk fnv64=c2d845a27e59a773
+CHUNK synthetic write L0 attn n=33 seed=0: chunk fnv64=db978c06c843d36a
+CHUNK synthetic write L0 attn n=64 seed=0: chunk fnv64=6196450ef08d4bca
+CHUNK synthetic read L0 mlp n=9 seed=0: chunk fnv64=780ef279a33c8149
+CHUNK synthetic read L0 mlp n=16 seed=0: chunk fnv64=d4ada0f94462d482
+CHUNK synthetic read L0 mlp n=17 seed=0: chunk fnv64=849ba5becf8a453d
+CHUNK synthetic read L0 mlp n=32 seed=0: chunk fnv64=0cd715854058b7ef
+CHUNK synthetic read L0 mlp n=33 seed=0: chunk fnv64=26c7405570ebe81b
+CHUNK synthetic read L0 mlp n=64 seed=0: chunk fnv64=f29e1d059af845a1
+CHUNK synthetic write L0 mlp n=9 seed=0: chunk fnv64=94ddef18ff4d8dad
+CHUNK synthetic write L0 mlp n=16 seed=0: chunk fnv64=81dead573fb6115c
+CHUNK synthetic write L0 mlp n=17 seed=0: chunk fnv64=d2b2eb02be849a4d
+CHUNK synthetic write L0 mlp n=32 seed=0: chunk fnv64=673358365349e29d
+CHUNK synthetic write L0 mlp n=33 seed=0: chunk fnv64=411abf09394f83a6
+CHUNK synthetic write L0 mlp n=64 seed=0: chunk fnv64=87a2585cbbc21fa9
+CHUNK synthetic chain L0 n=9 seed=0: chunk fnv64=140df992bc3ff2f0
+CHUNK synthetic chain L0 n=16 seed=0: chunk fnv64=162fa0fc5825f50e
+CHUNK synthetic chain L0 n=17 seed=0: chunk fnv64=a00972ac8e3a33b3
+CHUNK synthetic chain L0 n=32 seed=0: chunk fnv64=4238d67271e305c9
+CHUNK synthetic chain L0 n=33 seed=0: chunk fnv64=97c2993703b9d1ec
+CHUNK synthetic chain L0 n=64 seed=0: chunk fnv64=991a6499670b94bf
+CHUNK synthetic read L1 attn n=9 seed=0: chunk fnv64=e2b8f8e4d8b92418
+CHUNK synthetic read L1 attn n=16 seed=0: chunk fnv64=5debe65b163314f8
+CHUNK synthetic read L1 attn n=17 seed=0: chunk fnv64=13b8cc0ab98d6343
+CHUNK synthetic read L1 attn n=32 seed=0: chunk fnv64=6ea24d48c23798f7
+CHUNK synthetic read L1 attn n=33 seed=0: chunk fnv64=61280155d3b13323
+CHUNK synthetic read L1 attn n=64 seed=0: chunk fnv64=0e63d09853db3671
+CHUNK synthetic write L1 attn n=9 seed=0: chunk fnv64=d336a566bda1917e
+CHUNK synthetic write L1 attn n=16 seed=0: chunk fnv64=00281b3a9f75d97e
+CHUNK synthetic write L1 attn n=17 seed=0: chunk fnv64=87aed70c8f3a94be
+CHUNK synthetic write L1 attn n=32 seed=0: chunk fnv64=0211978e56a72b5b
+CHUNK synthetic write L1 attn n=33 seed=0: chunk fnv64=33d9beae15ac6275
+CHUNK synthetic write L1 attn n=64 seed=0: chunk fnv64=8423405b13f29ce7
+CHUNK synthetic read L1 mlp n=9 seed=0: chunk fnv64=45ed5149315996ac
+CHUNK synthetic read L1 mlp n=16 seed=0: chunk fnv64=a384e02c7f5b06aa
+CHUNK synthetic read L1 mlp n=17 seed=0: chunk fnv64=f72e7d787d5fd17f
+CHUNK synthetic read L1 mlp n=32 seed=0: chunk fnv64=e8ca7dd978e49e55
+CHUNK synthetic read L1 mlp n=33 seed=0: chunk fnv64=6bf94a6670df62f3
+CHUNK synthetic read L1 mlp n=64 seed=0: chunk fnv64=86b0d0df7a0a2a50
+CHUNK synthetic write L1 mlp n=9 seed=0: chunk fnv64=69aa52849a2039c9
+CHUNK synthetic write L1 mlp n=16 seed=0: chunk fnv64=ea50378245ab3590
+CHUNK synthetic write L1 mlp n=17 seed=0: chunk fnv64=0ff47d4e6073927a
+CHUNK synthetic write L1 mlp n=32 seed=0: chunk fnv64=2d5488c09eb93d1e
+CHUNK synthetic write L1 mlp n=33 seed=0: chunk fnv64=ed2fc27879a54e54
+CHUNK synthetic write L1 mlp n=64 seed=0: chunk fnv64=14305152f309dbdf
+CHUNK synthetic chain L1 n=9 seed=0: chunk fnv64=d80e3487f6089590
+CHUNK synthetic chain L1 n=16 seed=0: chunk fnv64=5422fd32e02c91c8
+CHUNK synthetic chain L1 n=17 seed=0: chunk fnv64=cd014605ebadb614
+CHUNK synthetic chain L1 n=32 seed=0: chunk fnv64=81a6b261ee0b8dc2
+CHUNK synthetic chain L1 n=33 seed=0: chunk fnv64=950b8509e7ad9ad3
+CHUNK synthetic chain L1 n=64 seed=0: chunk fnv64=3471d87e1e6ca513
+CHUNK synthetic final n=9 seed=0: chunk fnv64=8c4dbb4682438792
+CHUNK synthetic final n=16 seed=0: chunk fnv64=fccff80a33cf9601
+CHUNK synthetic final n=17 seed=0: chunk fnv64=639cecffe0074dd5
+CHUNK synthetic final n=32 seed=0: chunk fnv64=9fddbc3891743642
+CHUNK synthetic final n=33 seed=0: chunk fnv64=7c865255d0f232a4
+CHUNK synthetic final n=64 seed=0: chunk fnv64=05d9f5ee82e736c7
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq read L0 attn n=9 seed=0: chunk fnv64=5a3a117d520f3848
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq read L0 attn n=16 seed=0: chunk fnv64=1c2c7d6c5ea827cd
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq read L0 attn n=17 seed=0: chunk fnv64=ccace473573a9e33
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq read L0 attn n=32 seed=0: chunk fnv64=ecd44490a8502dbe
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq read L0 attn n=33 seed=0: chunk fnv64=94e367d0c08a9023
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq read L0 attn n=64 seed=0: chunk fnv64=e9bf0b7d2b3a1aa7
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq write L0 attn n=9 seed=0: chunk fnv64=ab94a7dcb52fbf05
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq write L0 attn n=16 seed=0: chunk fnv64=08cc8bc9ed80f558
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq write L0 attn n=17 seed=0: chunk fnv64=37e697c6ad93761a
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq write L0 attn n=32 seed=0: chunk fnv64=a3168530c6a4e1a3
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq write L0 attn n=33 seed=0: chunk fnv64=e91ef346588eace7
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq write L0 attn n=64 seed=0: chunk fnv64=34a43d6177ae66cf
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq read L0 mlp n=9 seed=0: chunk fnv64=f33884f6129040fc
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq read L0 mlp n=16 seed=0: chunk fnv64=16d308e4cd3813f2
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq read L0 mlp n=17 seed=0: chunk fnv64=0b62b26b5ecb4d6e
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq read L0 mlp n=32 seed=0: chunk fnv64=a362cee3ee5dcc79
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq read L0 mlp n=33 seed=0: chunk fnv64=7f599c4bc368729c
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq read L0 mlp n=64 seed=0: chunk fnv64=44ac093fb452f71f
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq write L0 mlp n=9 seed=0: chunk fnv64=fd11a4a48e09b492
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq write L0 mlp n=16 seed=0: chunk fnv64=cae5383224ef1fd1
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq write L0 mlp n=17 seed=0: chunk fnv64=ad207a59e5e83490
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq write L0 mlp n=32 seed=0: chunk fnv64=fc37b14eb9dc74dc
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq write L0 mlp n=33 seed=0: chunk fnv64=32aa661d4e5e6521
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq write L0 mlp n=64 seed=0: chunk fnv64=05160862eefb9b35
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq chain L0 n=9 seed=0: chunk fnv64=3bc22e2b22f83773
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq chain L0 n=16 seed=0: chunk fnv64=2a273aefbec3d32e
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq chain L0 n=17 seed=0: chunk fnv64=3df7ef0d07afadae
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq chain L0 n=32 seed=0: chunk fnv64=ea77aabcf5e271bd
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq chain L0 n=33 seed=0: chunk fnv64=73bd3959407efc21
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq chain L0 n=64 seed=0: chunk fnv64=6e3487eeffd5475b
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq read L1 attn n=9 seed=0: chunk fnv64=93a22174c2c2c3bf
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq read L1 attn n=16 seed=0: chunk fnv64=b5d4092779ec02c5
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq read L1 attn n=17 seed=0: chunk fnv64=6cf743d52dc7e524
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq read L1 attn n=32 seed=0: chunk fnv64=bef334d6c34f9257
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq read L1 attn n=33 seed=0: chunk fnv64=758ec4c1155092a7
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq read L1 attn n=64 seed=0: chunk fnv64=d21b9f0b23e860ca
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq write L1 attn n=9 seed=0: chunk fnv64=ab9f18b214347879
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq write L1 attn n=16 seed=0: chunk fnv64=1a5e94e1583b8cc4
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq write L1 attn n=17 seed=0: chunk fnv64=816063af3ee26dc5
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq write L1 attn n=32 seed=0: chunk fnv64=fd9d00c3abd406db
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq write L1 attn n=33 seed=0: chunk fnv64=2bacecf28647a6ce
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq write L1 attn n=64 seed=0: chunk fnv64=61a4245971825bc1
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq read L1 mlp n=9 seed=0: chunk fnv64=b6dfb7504fd09820
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq read L1 mlp n=16 seed=0: chunk fnv64=33ffaac47912cb40
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq read L1 mlp n=17 seed=0: chunk fnv64=aaebaad5fd12e43d
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq read L1 mlp n=32 seed=0: chunk fnv64=d6c496033aa25402
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq read L1 mlp n=33 seed=0: chunk fnv64=c011d6a1a85397fe
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq read L1 mlp n=64 seed=0: chunk fnv64=f14f7fe78a3c3790
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq write L1 mlp n=9 seed=0: chunk fnv64=d1d794d99d4fc63a
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq write L1 mlp n=16 seed=0: chunk fnv64=a817d8bd8474483a
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq write L1 mlp n=17 seed=0: chunk fnv64=932446a4947c996b
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq write L1 mlp n=32 seed=0: chunk fnv64=8f59700ee0984750
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq write L1 mlp n=33 seed=0: chunk fnv64=4804265e5e60b45b
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq write L1 mlp n=64 seed=0: chunk fnv64=88a15bae63597c8a
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq chain L1 n=9 seed=0: chunk fnv64=21e3a20e2e7d21e5
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq chain L1 n=16 seed=0: chunk fnv64=8b1875b2858cdd53
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq chain L1 n=17 seed=0: chunk fnv64=f4ed7822dd55b3db
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq chain L1 n=32 seed=0: chunk fnv64=4bbb90f7cd1ba991
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq chain L1 n=33 seed=0: chunk fnv64=45815fa1056e1625
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq chain L1 n=64 seed=0: chunk fnv64=c3f25b1a2fc82d0b
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq read L23 attn n=9 seed=0: chunk fnv64=49994c7eee91fc21
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq read L23 attn n=16 seed=0: chunk fnv64=a39448c1a0681e8f
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq read L23 attn n=17 seed=0: chunk fnv64=d8a8b3525a7a8b36
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq read L23 attn n=32 seed=0: chunk fnv64=c7d5662a4692315d
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq read L23 attn n=33 seed=0: chunk fnv64=2f370a06417b16a8
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq read L23 attn n=64 seed=0: chunk fnv64=9c3e7191fb855073
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq write L23 attn n=9 seed=0: chunk fnv64=8a73228671f906f1
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq write L23 attn n=16 seed=0: chunk fnv64=bbd4fde5208dc38e
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq write L23 attn n=17 seed=0: chunk fnv64=70bf13bd442113a8
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq write L23 attn n=32 seed=0: chunk fnv64=a963e53f51cda663
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq write L23 attn n=33 seed=0: chunk fnv64=dacb3187e5a0425c
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq write L23 attn n=64 seed=0: chunk fnv64=df925c710ca72e0e
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq read L23 mlp n=9 seed=0: chunk fnv64=894316b5c5fb7919
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq read L23 mlp n=16 seed=0: chunk fnv64=2aa2baf1ae8fa92d
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq read L23 mlp n=17 seed=0: chunk fnv64=9f52b4ea9c57f7a9
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq read L23 mlp n=32 seed=0: chunk fnv64=66067f9044faa93e
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq read L23 mlp n=33 seed=0: chunk fnv64=a175e24ce625a17f
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq read L23 mlp n=64 seed=0: chunk fnv64=44e5aa21aa256d72
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq write L23 mlp n=9 seed=0: chunk fnv64=64e830b552cf52e3
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq write L23 mlp n=16 seed=0: chunk fnv64=8320b9a618b87697
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq write L23 mlp n=17 seed=0: chunk fnv64=2e55c9f64673cd27
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq write L23 mlp n=32 seed=0: chunk fnv64=23fe95b642cdd415
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq write L23 mlp n=33 seed=0: chunk fnv64=5d052f3fa7ef0398
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq write L23 mlp n=64 seed=0: chunk fnv64=501ec2ee8e906102
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq chain L23 n=9 seed=0: chunk fnv64=294fc886b9f8f583
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq chain L23 n=16 seed=0: chunk fnv64=66f42ababd02a07b
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq chain L23 n=17 seed=0: chunk fnv64=0fa104a73bbcff86
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq chain L23 n=32 seed=0: chunk fnv64=59de76a8454045a1
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq chain L23 n=33 seed=0: chunk fnv64=2444f1ccdcd855d9
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq chain L23 n=64 seed=0: chunk fnv64=1e68b2b0e731ce0f
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq read L47 attn n=9 seed=0: chunk fnv64=3d3c754e229db8c9
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq read L47 attn n=16 seed=0: chunk fnv64=faee0c9572d3a5eb
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq read L47 attn n=17 seed=0: chunk fnv64=f18f863cbc992667
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq read L47 attn n=32 seed=0: chunk fnv64=9366083eda8ad92e
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq read L47 attn n=33 seed=0: chunk fnv64=c15c892b567230e2
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq read L47 attn n=64 seed=0: chunk fnv64=7ae1e75f240dc826
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq write L47 attn n=9 seed=0: chunk fnv64=f5c55e9b61bd890a
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq write L47 attn n=16 seed=0: chunk fnv64=1e7a15ae8a54e134
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq write L47 attn n=17 seed=0: chunk fnv64=de1e1864fc4c3b1c
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq write L47 attn n=32 seed=0: chunk fnv64=1f6640d66db51d87
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq write L47 attn n=33 seed=0: chunk fnv64=a8d7761b861cf9f4
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq write L47 attn n=64 seed=0: chunk fnv64=26b273a67498f175
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq read L47 mlp n=9 seed=0: chunk fnv64=51cdf76eec022ca5
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq read L47 mlp n=16 seed=0: chunk fnv64=86e96bf48ba32ca0
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq read L47 mlp n=17 seed=0: chunk fnv64=524771b36f72cb1b
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq read L47 mlp n=32 seed=0: chunk fnv64=4418cb9323fde04f
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq read L47 mlp n=33 seed=0: chunk fnv64=cd50c34eea585ad5
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq read L47 mlp n=64 seed=0: chunk fnv64=0c53cf67976bfa8b
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq write L47 mlp n=9 seed=0: chunk fnv64=95a535b459cbf6e7
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq write L47 mlp n=16 seed=0: chunk fnv64=2c1626aace08be19
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq write L47 mlp n=17 seed=0: chunk fnv64=4dd7f0c56555b19c
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq write L47 mlp n=32 seed=0: chunk fnv64=7fe820df814a55b7
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq write L47 mlp n=33 seed=0: chunk fnv64=76625e2785130168
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq write L47 mlp n=64 seed=0: chunk fnv64=9010d2167cf888b9
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq chain L47 n=9 seed=0: chunk fnv64=51e79d6bfb55dc0e
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq chain L47 n=16 seed=0: chunk fnv64=d04a391e95e84e94
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq chain L47 n=17 seed=0: chunk fnv64=3846b481d2ac36cf
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq chain L47 n=32 seed=0: chunk fnv64=73d4ab27fc274b09
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq chain L47 n=33 seed=0: chunk fnv64=b73ea3e925885f71
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq chain L47 n=64 seed=0: chunk fnv64=8eabfa54fdefe6a0
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq final n=9 seed=0: chunk fnv64=46d6ac77cad7e2f5
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq final n=16 seed=0: chunk fnv64=6df4e4665f8dcfa0
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq final n=17 seed=0: chunk fnv64=2de05be708e1373a
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq final n=32 seed=0: chunk fnv64=8505f26c111ab50c
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq final n=33 seed=0: chunk fnv64=3b4b29a25e5447ba
+CHUNK real:/scratch/quant/fn-fp8/qwen3.8-flash-next.stock-fp8.hfq final n=64 seed=0: chunk fnv64=e2f703922d8f70b8
+ORACLE PASS cases=192 mismatches=0 census_failures=0 controls=264/264 rows=[9, 16, 17, 32, 33, 64] seeds=1

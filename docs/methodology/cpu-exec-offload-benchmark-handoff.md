@@ -100,7 +100,7 @@ grep -E "partial offload|cpu exec: [0-9]+/[0-9]+ spilled layers fully covered" "
 The second line appears only with `HIPFIRE_OFFLOAD_EXEC=cpu` and must read
 `{spilled}/{spilled} … uncovered quants: none`. A non-empty uncovered list is not
 a bug — it names formats that stay on PCIe (`Q8HFQ`, `MQ8G256`, the HFP4/MFP4
-family, PARO) — but it changes what the arm measures, so report it.
+family) — but it changes what the arm measures, so report it.
 
 ## 3 · The measurement loop (and the five things that bit me)
 
@@ -151,7 +151,7 @@ setting it only breaks comparability with the anchors in § 6. `--spec off
 | the driver dies mid-run with no error at all | `kill -9 $(cat ~/.hipfire/daemon.pid)` signalled whatever now owns that *reused* pid | never signal from the pid file alone; first `ps -p <pid> -o comm= \| grep -q daemon` |
 | no `cpu exec: step` lines / `steps: 0` | `HIPFIRE_CPU_EXEC_TRACE` was not set — this is **not** a coverage failure | re-run with the env set; read the coverage line independently of the trace |
 | no `cpu exec: moe expert splice` lines on a MoE spill (`offload_exec=cpu`, `moe_expert_budget` spill) | same cause — trace off — or the forward took the wide (>4-row) GPU grouped path, which never enters the splice | re-run with the env set on an AR / `n <= 4` forward; the splice line is keyed by `(quant, dim, mi, k)` with `d2h_first` (carries the GPU wait) / `d2h_rest` / `gu` / `dn` / `h2d` plus coarse `setup` (expert resolve), `middle` (whole SiLU+FWHT loop), `combine` (weighted combine), `total` (splice wall excl. trace print) means — per-phase sums reconcile within a splice, but per-quant attribution does not (`quant` is the first selected expert's gate_up label, `graded=true` collapses all mixes, down quant and worker count never printed) |
-| coverage line reads `uncovered quants: Q8HFQ` (or MQ8G256 / MFP4* / PARO*) | the model carries a format outside `CpuQuant`; those stay on PCIe by design | expected; the arm measures a partial spill — say so in the report |
+| coverage line reads `uncovered quants: Q8HFQ` (or MQ8G256 / MFP4*) | the model carries a format outside `CpuQuant`; those stay on PCIe by design | expected; the arm measures a partial spill — say so in the report |
 | `prefill_tok_s` moves a lot between arms | prefill is GPU-side, so the seam cannot cause it — something else changed | compare binary / model / prompt digests between the arms |
 | `vram_free_mb` differs between arms at the same budget | the host-mapped allocation path changed | re-measure; this is a pass-condition failure, not noise |
 | unusually tight stddev, or τ much higher than expected | single-token attractor | read the decoded text (AGENTS.md § 0 rule 3) |

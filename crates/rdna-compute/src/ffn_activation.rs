@@ -27,10 +27,13 @@ use std::ffi::c_void;
 use crate::dispatch::{DType, Gpu, GpuTensor};
 use hip_bridge::{HipError, HipResult, KernargBlob};
 
-const SITU_SRC: &str = include_str!("../../../kernels/src/ffn_situ.hip");
+pub(crate) const SITU_SRC: &str = include_str!("../../../kernels/src/ffn_situ.hip");
 const GROUPED_SRC: &str = include_str!("../../../kernels/src/ffn_grouped_activation_pad.hip");
-const ROUTER_SRC: &str = include_str!("../../../kernels/src/ffn_router_renorm.hip");
-const COMBINE_SRC: &str = include_str!("../../../kernels/src/ffn_moe_combine_policy.hip");
+pub(crate) const ROUTER_SRC: &str = include_str!("../../../kernels/src/ffn_router_renorm.hip");
+pub(crate) const COMBINE_SRC: &str =
+    include_str!("../../../kernels/src/ffn_moe_combine_policy.hip");
+pub(crate) const COMBINE_W2_SRC: &str =
+    include_str!("../../../kernels/src/ffn_moe_combine_policy_w2.hip");
 
 const SITU_MODULE: &str = "ffn_situ";
 const GROUPED_MODULE: &str = "ffn_grouped_activation_pad";
@@ -38,14 +41,25 @@ const GROUPED_ROTATE_I8_SRC: &str = crate::kernels::FFN_GROUPED_ACTIVATION_ROTAT
 const GROUPED_ROTATE_I8_MODULE: &str = "ffn_grouped_activation_rotate_i8_gfx1201";
 const ROUTER_MODULE: &str = "ffn_router_renorm";
 const COMBINE_MODULE: &str = "ffn_moe_combine_policy";
+const COMBINE_W2_MODULE: &str = "ffn_moe_combine_policy_w2";
 
 const ENTRY_ROUTER: &str = "ffn_moe_router_topk_f32";
 const ENTRY_COMBINE: &str = "ffn_moe_combine_f32";
+const ENTRY_COMBINE_W2: &str = "ffn_moe_combine_f32_w2";
+/// Threads per CTA of `ffn_moe_combine_f32_w2` (two output columns per thread over the same 256-column tile).
+const COMBINE_W2_BLOCK: u32 = 128;
 const ENTRY_ROUND_BF16: &str = "ffn_round_bf16_f32";
 
 /// Router kernel limits: LDS holds 1024 scores per row and eight picks.
 pub const FFN_ROUTER_MAX_EXPERTS: usize = 1024;
 pub const FFN_ROUTER_MAX_TOP_K: usize = 8;
+
+/// Whether the combine launches the two-column `ffn_moe_combine_f32_w2` body: exact gfx1201 only (R9700 card j6433,
+/// identity full: 0.39-0.85x of the incumbent at every judged row class, grouped prefill and expanded layout, so there
+/// is no row floor). Every other arch runs `ffn_moe_combine_f32`.
+pub(crate) fn combine_w2_route(arch: &str) -> bool {
+    arch == "gfx1201"
+}
 
 /// Column tiles of 256 ride grid.y, which caps at 65535 blocks.
 const MAX_COL_TILES: usize = 65535;
@@ -646,7 +660,8 @@ impl Gpu {
     }
 
     /// Grouped gate/up activation + FWHT rotation + A8 `block_i8_128` quantization in one launch
-    /// (`ffn_grouped_activation_rotate_i8.gfx1201.hip`), exact gfx1201 only.
+    /// (`ffn_grouped_activation_rotate_i8.gfx1201.hip`), exact gfx1201 and exact gfx1100 (byte oracle vs the
+    /// three-launch chain on both; the dense-rows entry below stays gfx1201-only).
     ///
     /// The blocks written into `reservation` are byte-identical to
     /// [`Self::ffn_activation_grouped_f32`] into an F32 `[total_slots, phys_n]` tensor, then
@@ -664,9 +679,9 @@ impl Gpu {
     ) -> HipResult<crate::scratch::Int8MmqPrepared> {
         self.bind_thread()?;
         const WHAT: &str = "ffn_activation_grouped_rotate_i8_f32";
-        if self.arch != "gfx1201" {
+        if self.arch != "gfx1201" && self.arch != "gfx1100" {
             return Err(refuse(
-                "ffn_activation_grouped_rotate_i8_f32: exact gfx1201 only",
+                "ffn_activation_grouped_rotate_i8_f32: exact gfx1201 / gfx1100 only",
             ));
         }
         let (p0, p1) = activation_params(a.activation)?;
@@ -1081,8 +1096,9 @@ impl Gpu {
     }
 
     /// Routed combine with an explicit rounding policy
-    /// (`ffn_moe_combine_policy.hip`): one thread per output column, grid
-    /// `(rows, ceil(hidden/256))`.
+    /// (`ffn_moe_combine_policy.hip`): one thread per output column (block 256), grid
+    /// `(rows, ceil(hidden/256))`. On exact gfx1201 it launches the bit-identical two-column
+    /// export `ffn_moe_combine_f32_w2` (`ffn_moe_combine_policy_w2.hip`, block 128, same grid).
     ///
     /// Kernarg order: `down_rows*, row_of_slot*, topk_idx*, topk_w*, shared*,
     /// routed_out*, out*, rows, hidden, top_k, n_experts, order,
@@ -1160,7 +1176,18 @@ impl Gpu {
             None => std::ptr::null_mut(),
         };
 
-        self.ensure_kernel(COMBINE_MODULE, COMBINE_SRC, ENTRY_COMBINE)?;
+        let w2 = combine_w2_route(&self.arch);
+        let (module, src, entry, block) = if w2 {
+            (
+                COMBINE_W2_MODULE,
+                COMBINE_W2_SRC,
+                ENTRY_COMBINE_W2,
+                COMBINE_W2_BLOCK,
+            )
+        } else {
+            (COMBINE_MODULE, COMBINE_SRC, ENTRY_COMBINE, 256)
+        };
+        self.ensure_kernel(module, src, entry)?;
         let dp = a.down_rows.buf.as_ptr();
         let ip = a.topk_indices.buf.as_ptr();
         let wp = a.topk_weights.buf.as_ptr();
@@ -1193,9 +1220,9 @@ impl Gpu {
             &ndr as *const _ as *mut c_void,
         ];
         self.launch_maybe_blob(
-            ENTRY_COMBINE,
+            entry,
             [a.rows as u32, a.hidden.div_ceil(256) as u32, 1],
-            [256, 1, 1],
+            [block, 1, 1],
             0,
             &mut params,
             || {
@@ -1512,7 +1539,8 @@ pub fn router_select_reference(
 ///
 /// Ranks whose expert id is outside `[0, n_experts)` are skipped; with
 /// `ExpertIdAscending` they sort last and equal ids keep rank order. Each
-/// contribution is a separately rounded multiply then add (no fma).
+/// contribution is a fused multiply-add (`acc = fma(v, w, acc)`, the first one from `+0`): the shipped objects contract
+/// `__fadd_rn(acc, __fmul_rn(v, w))` into one `v_fmac_f32` per rank.
 /// Returns `(routed, out)`: the routed sum after `round_routed_sum`, and the
 /// final row after the shared add and `round_final`.
 ///
@@ -1561,8 +1589,7 @@ pub fn combine_reference(
             } else {
                 v
             };
-            let prod = v * topk_weights[j];
-            *acc += prod;
+            *acc = v.mul_add(topk_weights[j], *acc);
         }
     }
     if round_routed_sum {
@@ -1790,6 +1817,38 @@ mod tests {
         let mut rest = idx[2..].to_vec();
         rest.sort_unstable();
         assert_eq!(rest, vec![0, 2]);
+    }
+
+    #[test]
+    fn combine_reference_accumulates_with_fma() {
+        // rank 0 leaves acc = -(1 + 2^-11); rank 1 adds (1 + 2^-12)^2 = 1 + 2^-11 + 2^-24. The fused step keeps the
+        // 2^-24 the separately rounded product would lose (the shipped objects fuse the add into `v_fmac_f32`).
+        let a = 1.0f32 + 2.0f32.powi(-11);
+        let b = 1.0f32 + 2.0f32.powi(-12);
+        let (routed, out) = combine_reference(
+            CombineOrder::Rank,
+            false,
+            false,
+            false,
+            16,
+            1,
+            &[1, 2],
+            &[1.0, b],
+            &[Some(&[-a][..]), Some(&[b][..])],
+            None,
+        );
+        assert_eq!(routed, vec![2.0f32.powi(-24)]);
+        assert_eq!(out, routed);
+    }
+
+    #[test]
+    fn combine_w2_route_is_exact_gfx1201_only() {
+        assert!(combine_w2_route("gfx1201"));
+        for arch in [
+            "gfx1100", "gfx1101", "gfx1151", "gfx1200", "gfx12010", "gfx1201x", "",
+        ] {
+            assert!(!combine_w2_route(arch), "{arch}");
+        }
     }
 
     #[test]

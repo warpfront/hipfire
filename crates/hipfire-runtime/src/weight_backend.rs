@@ -3,7 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Arch-agnostic weight loading: dequant primitives, HF tensor-name resolution,
-//! and a `WeightBackend` trait abstracting HFQ vs ParoQuant on-disk formats.
+//! and a `WeightBackend` trait abstracting the HFQ on-disk format.
 //! Per-arch crates build their `load_layer` schema on top of this; the only
 //! arch-varying knobs are the RMSNorm `+bias` and the name-candidate resolver.
 
@@ -78,15 +78,6 @@ pub fn hfq_proj_name(layer: usize, rel: &str) -> String {
 pub fn hfq_plain_name(layer: usize, rel: &str) -> String {
     format!("layers.{layer}.{rel}")
 }
-/// PaRo projection base (augmentor appends `.qweight`/`.weight`): `{mp}.layers.{layer}.{rel}`.
-pub fn paro_proj_name(mp: &str, layer: usize, rel: &str) -> String {
-    format!("{mp}.layers.{layer}.{rel}")
-}
-/// PaRo norm/raw-f32 name for `paro_load_norm`/`paro_load_f32`, which prepend `mp`
-/// THEMSELVES — so this is prefix-LESS: `layers.{layer}.{rel}`.
-pub fn paro_plain_name(layer: usize, rel: &str) -> String {
-    format!("layers.{layer}.{rel}")
-}
 
 // ── Embedding / tied-lm_head primitives ──────────────────────────────────
 
@@ -132,6 +123,13 @@ pub fn load_embedding(
 ) -> HipResult<(GpuTensor, EmbeddingFormat)> {
     match embed_classify(quant_type)? {
         EmbedPlan::Raw(fmt) => {
+            validate_row_extent(
+                embedding_format_dtype(fmt),
+                data.len(),
+                vocab,
+                dim,
+                "token_embd",
+            )?;
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok((buf, fmt))
         }
@@ -197,7 +195,7 @@ pub fn load_awq_scale_for(hfq: &HfqFile, gpu: &Gpu, name: &str, k: usize) -> Opt
 }
 
 /// Decode a little-endian f16 byte buffer to `f32`. Pure (GPU-free). The shared
-/// core of every tied-lm_head reupload across HFQ + ParoQuant arches.
+/// core of every tied-lm_head reupload.
 pub fn f16_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
     bytes
         .chunks_exact(2)
@@ -206,7 +204,7 @@ pub fn f16_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
 }
 
 /// Reupload an f16 weight buffer as a device F32 `WeightTensor [m, k]`. The
-/// canonical tied-lm_head / ParoQuant-output reupload — replaces three hand-rolled
+/// canonical tied-lm_head reupload — replaces three hand-rolled
 /// `unsafe { from_raw_parts }` copies.
 pub fn reupload_f16_as_f32(
     gpu: &mut Gpu,
@@ -224,7 +222,6 @@ pub fn reupload_f16_as_f32(
         m,
         k,
         row_stride: 0,
-        paro: None,
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
@@ -250,7 +247,6 @@ pub fn tied_lm_head_alias(
         m,
         k,
         row_stride: 0,
-        paro: None,
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
@@ -326,7 +322,6 @@ pub fn requantize_weight_q8_0_to_hfq4g256(
         m,
         k,
         row_stride: 0,
-        paro: None,
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
@@ -407,7 +402,6 @@ pub fn requantize_weight_q8_0_to_hfq3g256(
         m,
         k,
         row_stride: 0,
-        paro: None,
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
@@ -482,7 +476,6 @@ pub fn requantize_weight_q8_0_to_hfq2g256(
         m,
         k,
         row_stride: 0,
-        paro: None,
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
@@ -745,19 +738,43 @@ pub fn hfq_weight_dtype(quant_type: u8) -> Option<DType> {
     raw_codec(quant_type).map(|codec| codec.dtype)
 }
 
-/// Decode a passthrough quant format: enforce the K%256 guard (via DType),
-/// upload bytes verbatim to `target`, build the `WeightTensor` with the dtype +
-/// its DType-derived row_stride. `name` is the caller context for the guard
-/// error. AWQ sidecars are attached by the caller (hfq), never here.
-pub(crate) fn decode_raw_codec(
-    gpu: &mut Gpu,
+/// Per-row extent check for row-packed raw formats; other dtypes pass. Every
+/// raw upload (with or without [`decode_raw_codec`]) calls this: older
+/// quantizers packed ragged-K matrices across rows, which the per-row kernels
+/// decode to garbage or NaN. Same rule as the weight_store manifest paths.
+pub fn validate_row_extent(
+    dtype: DType,
+    len: usize,
+    m: usize,
+    k: usize,
+    name: &str,
+) -> HipResult<()> {
+    if !matches!(
+        dtype,
+        DType::HFQ4G128
+            | DType::HFQ6G256
+            | DType::HFQ4G256
+            | DType::HFQ2G128
+            | DType::HFQ3G128
+            | DType::Q4F16G64
+            | DType::Q4K
+            | DType::Q8_0
+    ) {
+        return Ok(());
+    }
+    crate::weight_store::validate_payload_extent(&[m, k], dtype, len).map_err(|reason| {
+        hip_bridge::HipError::new(0, &format!("tensor {name}: {reason}{BLOB_FIX}"))
+    })
+}
+
+/// GPU-free length/K checks of [`decode_raw_codec`], before any upload.
+fn validate_raw_codec_payload(
     codec: &RawCodec,
     data: &[u8],
     m: usize,
     k: usize,
     name: &str,
-    target: MemoryTarget,
-) -> HipResult<WeightTensor> {
+) -> HipResult<()> {
     // Low-bit layout validation — centralized before any upload/host-dequant.
     // TQ2G128: 34 B per 128-elem group, BQ1G128: 18 B per 128-elem group.
     // Both require K%128==0 and exact packed length m*(k/128)*block_bytes.
@@ -773,13 +790,7 @@ pub(crate) fn decode_raw_codec(
             ),
         ));
     }
-    if codec.dtype == DType::HFQ4G128 {
-        // Same per-row extent the weight_store manifest paths enforce: a
-        // pre-`b4846285e` file packs groups across rows and decodes to NaN.
-        crate::weight_store::validate_payload_extent(&[m, k], codec.dtype, data.len()).map_err(
-            |reason| hip_bridge::HipError::new(0, &format!("tensor {name}: {reason}{BLOB_FIX}")),
-        )?;
-    }
+    validate_row_extent(codec.dtype, data.len(), m, k, name)?;
     if codec.dtype == DType::MQ4G256V2 {
         let gpr = k / 256;
         let expected = m * gpr * 136;
@@ -922,6 +933,23 @@ pub(crate) fn decode_raw_codec(
             ));
         }
     }
+    Ok(())
+}
+
+/// Decode a passthrough quant format: enforce the K%256 guard (via DType),
+/// upload bytes verbatim to `target`, build the `WeightTensor` with the dtype +
+/// its DType-derived row_stride. `name` is the caller context for the guard
+/// error. AWQ sidecars are attached by the caller (hfq), never here.
+pub(crate) fn decode_raw_codec(
+    gpu: &mut Gpu,
+    codec: &RawCodec,
+    data: &[u8],
+    m: usize,
+    k: usize,
+    name: &str,
+    target: MemoryTarget,
+) -> HipResult<WeightTensor> {
+    validate_raw_codec_payload(codec, data, m, k, name)?;
     let buf = match target {
         MemoryTarget::Device => gpu.upload_raw(data, &[data.len()])?,
         // Zero-copy CPU copy into the registered host pointer; the pad past the
@@ -934,7 +962,6 @@ pub(crate) fn decode_raw_codec(
         m,
         k,
         row_stride: codec.dtype.row_stride(k),
-        paro: None,
         awq_scale: None,
         // Lloyd LUTs are attached by the caller (hfq / arch loader) from the
         // lloyd_levels sidecar — same pattern as AWQ sidecars, never here.
@@ -1059,7 +1086,6 @@ pub fn dequant_weight_raw(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -1075,7 +1101,6 @@ pub fn dequant_weight_raw(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
                 lloyd_lut_c16: None,
@@ -1095,7 +1120,6 @@ pub fn dequant_weight_raw(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -1362,6 +1386,7 @@ fn dequantize_to_f32(quant_type: u8, data: &[u8], n: usize) -> Vec<f32> {
         53 => panic!("MQ4G128V2 (qt=53) is typed-Qwen4-only; generic dequant_f32 refuses it"),
         55 => panic!("FP8E4M3B128 (qt=55) is typed-Qwen4-gfx942-only; generic dequant_f32 refuses it"),
         56 => panic!("FP8E4M3PT (qt=56) is read by the Qwen4 PLE row store only; generic dequant_f32 refuses it"),
+        57 => panic!("HC8E4M3Row (qt=57) is a Qwen4 HC8 sidecar format read by the typed Qwen4 HC route only; generic dequant_f32 refuses it"),
         131..=134 => panic!(
             "MQ-I4 (qt={quant_type}) is a typed-Qwen4 expert-slab format; generic dequant_f32 refuses it"
         ),
@@ -1468,9 +1493,6 @@ pub const HOST_DECODE_REFUSAL: &str =
      in device memory would defeat the offload; use a model quantized in a supported format, \
      or unset memory.gpu_layer_budget / memory.moe_expert_budget";
 
-use crate::augmentor::{try_augmentors, DEFAULT_AUGMENTORS};
-use crate::model_source::ModelSource;
-use crate::paro::{load_fp16_weight_from_source, paro_load_f32, paro_load_norm};
 pub use crate::weight_manifest::WeightResidency;
 
 /// Pluggable weight-loading backend. `rel` is a layer-relative path: for `proj`
@@ -1592,57 +1614,47 @@ pub fn read_first(
     None
 }
 
-/// PaRo backend (augmentor chain + paro primitives) — fully arch-agnostic.
-/// `mp` is the text-tower prefix from `paro_text_prefix`.
-pub struct ParoBackend<'a> {
-    pub source: &'a dyn ModelSource,
-    pub gpu: &'a mut Gpu,
-    pub mp: &'static str,
-    pub layer: usize,
-    /// `1.0` (qwen3.5/gemma) or `0.0` (qwen2/llama).
-    pub norm_bias: f32,
-}
-
-impl<'a> WeightBackend for ParoBackend<'a> {
-    fn set_layer(&mut self, layer: usize) {
-        self.layer = layer;
-    }
-
-    fn proj(&mut self, rel: &str, m: usize, k: usize) -> HipResult<WeightTensor> {
-        let base = paro_proj_name(self.mp, self.layer, rel);
-        match try_augmentors(self.source, &base, m, k, self.gpu, DEFAULT_AUGMENTORS)? {
-            Some(t) => Ok(t),
-            None => {
-                load_fp16_weight_from_source(self.source, self.gpu, &format!("{base}.weight"), m, k)
-            }
-        }
-    }
-    fn norm(&mut self, rel: &str, shape: &[usize]) -> HipResult<GpuTensor> {
-        paro_load_norm(
-            self.source,
-            self.gpu,
-            &paro_plain_name(self.layer, rel),
-            shape,
-            self.norm_bias,
-        )
-    }
-    fn raw_f32(&mut self, rel: &str, n: usize) -> HipResult<GpuTensor> {
-        paro_load_f32(self.source, self.gpu, &paro_plain_name(self.layer, rel), n)
-    }
-    fn free_tensor(&mut self, tensor: GpuTensor) {
-        let _ = self.gpu.free_tensor(tensor);
-    }
-    fn bias(&mut self, _rel: &str, _n: usize) -> HipResult<GpuTensor> {
-        Err(hip_bridge::HipError::new(
-            0,
-            "ParoBackend: attention biases unsupported",
-        ))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every row-packed raw dtype refuses a cross-row (pre-per-row) payload
+    /// for ragged K and accepts the per-row one; the set is shared by
+    /// `decode_raw_codec` and the non-codec loaders.
+    #[test]
+    fn validate_row_extent_refuses_cross_row_ragged_k() {
+        for (dtype, group) in [
+            (DType::HFQ4G128, 128),
+            (DType::HFQ6G256, 256),
+            (DType::HFQ4G256, 256),
+            (DType::HFQ2G128, 128),
+            (DType::HFQ3G128, 128),
+            (DType::Q4F16G64, 64),
+            (DType::Q4K, 256),
+            (DType::Q8_0, 32),
+        ] {
+            let (m, k) = (2, group + group / 2);
+            // Per-row padding: 2 groups per row, 4 total; cross-row packing: 3.
+            // Dtypes that need K % group == 0 refuse ragged K at any length.
+            let Ok(Some(per_row)) = crate::weight_store::expected_payload_bytes(&[m, k], dtype)
+            else {
+                assert!(
+                    validate_row_extent(dtype, 1 << 20, m, k, "t").is_err(),
+                    "{dtype:?}"
+                );
+                continue;
+            };
+            let cross_row = per_row / 4 * 3;
+            assert!(
+                validate_row_extent(dtype, per_row, m, k, "t").is_ok(),
+                "{dtype:?}"
+            );
+            assert!(
+                validate_row_extent(dtype, cross_row, m, k, "t").is_err(),
+                "{dtype:?}"
+            );
+        }
+    }
 
     /// `fwht256_inplace` must be bit-identical to the per-arm inlined FWHT it
     /// replaced (the version that shipped in 6 dequant arms). Pin it: run a
@@ -1743,14 +1755,6 @@ mod tests {
         assert_eq!(
             hfq_plain_name(3, "input_layernorm.weight"),
             "layers.3.input_layernorm.weight"
-        );
-        assert_eq!(
-            paro_proj_name("model.language_model", 0, "linear_attn.in_proj_qkv"),
-            "model.language_model.layers.0.linear_attn.in_proj_qkv"
-        );
-        assert_eq!(
-            paro_plain_name(0, "input_layernorm.weight"),
-            "layers.0.input_layernorm.weight"
         );
     }
 
@@ -1899,7 +1903,6 @@ mod tests {
         assert_eq!(wt.m, 100);
         assert_eq!(wt.k, 64);
         assert_eq!(wt.row_stride, 0);
-        assert!(wt.paro.is_none());
         assert!(wt.awq_scale.is_none());
     }
 
@@ -2018,6 +2021,29 @@ mod tests {
     fn bq1g128_quant_type_41_maps_to_bq1g128() {
         let c = raw_codec(41).expect("no RAW_CODECS row for qt=41");
         assert_eq!(c.dtype, DType::BQ1G128);
+    }
+
+    #[test]
+    fn raw_codec_refuses_cross_row_hfq4g128_payload() {
+        let c = raw_codec(7).expect("qt=7 row");
+        // SmolLM2 q_proj [960, 960]: a pre-`b4846285e` file packs 7.5 groups per
+        // row (518400 B); the per-row layout pads each row to 8 groups.
+        let err = validate_raw_codec_payload(c, &vec![0; 960 * 540], 960, 960, "q").unwrap_err();
+        assert!(err.message.contains("expected 552960"), "{}", err.message);
+        assert!(validate_raw_codec_payload(c, &vec![0; 960 * 576], 960, 960, "q").is_ok());
+        // K % 128 == 0 has one layout; it must still load.
+        assert!(validate_raw_codec_payload(c, &vec![0; 64 * 8 * 72], 64, 1024, "q").is_ok());
+    }
+
+    #[test]
+    fn raw_codec_refuses_ragged_k_floor_stride_payloads() {
+        // HIPF-209: every floor-stride format, not only qt 7, refuses a ragged K
+        // (1000 is no whole number of 32-, 64-, 128- or 256-element groups).
+        for qt in [0u8, 3, 4, 6, 8, 10, 12] {
+            let c = raw_codec(qt).expect("raw codec row");
+            let r = validate_raw_codec_payload(c, &[], 4, 1000, "w");
+            assert!(r.is_err(), "qt={qt} {:?} accepted a ragged K", c.dtype);
+        }
     }
 
     // ── Low-bit layout-validation contract (GPU-free) ─────────────────────────

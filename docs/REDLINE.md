@@ -157,11 +157,28 @@ transport crate.
 After a successful model load, the daemon may request Auto via
 `ReplayController::configure_model_default` when `retained_redline_default`
 matches. **Current automatic runtime selection is only** the MQ4R predicate
-`mq4r_redline_default` (single-GPU `.mq4r` on the exact GPU-arch allowlist),
-the gfx1201 A3B `.mq4rs` (`qwen3_5_moe`, no drafter, pp=tp=1; extension-selected, deprecated since 0.4.0, removal 0.5.0) plus Qwen3.5 dense and Qwen4 (Flash-Next) plain-AR predicates below, and
-the gfx1151 DeepSeek4 `.mq2r` AR predicate. Existing LFM `.mq4` registry evidence is not
-auto-selected because it is not `.mq4r` (not because LFM is categorically
+`mq4r_redline_default` (single-GPU MQ4R SKU on the exact GPU-arch allowlist),
+the gfx1201 A3B MQ4RS SKU (`qwen3_5_moe`, no drafter, pp=tp=1) plus Qwen3.5 dense and Qwen4 (Flash-Next) plain-AR predicates below, the gfx1100 Qwen3.5 dense `.mq3-xt` plain-AR predicate (extension-selected), and
+the gfx1151 DeepSeek4 MQ2R SKU AR predicate. Existing LFM `.mq4` registry evidence is not
+auto-selected because it is not an MQ4R SKU (not because LFM is categorically
 model-family exempt).
+
+Since 0.5.0 the MQ4R, MQ4RS and DS4 MQ2R SKUs are the file's identity, never its
+extension (`crates/hipfire-runtime/src/route_sku.rs`). The daemon resolves the
+SKU before it loads: the HFQ metadata key `hipfire_route_sku` (`mq4r` | `mq4rs`
+| `mq2r`, or for DeepSeek V4 the `hipfire_quant_recipe`
+`deepseek4-mq2r-e8-p3-v1`), else the registry card `quant` of the installed
+registry artifact (the CLI forwards it as the load parameter `route_sku`), else
+for DeepSeek V4 only the MQ2R P3 tensor structure (554 MFP4G32E8SOA dense
+tensors, Q8F16 embedding), else no SKU and no automatic route. The published
+MQ4R and MQ4RS artifacts carry no metadata key, so they route through their
+registry identity; `hipfire-quantize` stamps `hipfire_route_sku` on new
+MoE-class `--no-q8-router` MQ4 writes (`mq4rs` with `--mq4v2-symmetric` and
+`--moe-expert-down mq4g128v2-symmetric`), so locally quantized files stay on
+Redline. An **unregistered, unstamped `.mq4r` file no longer gets the automatic
+route**: select `replay.backend = "redline"` explicitly or re-quantize it. A
+file whose `hipfire_route_sku` is not a known SKU, or a DeepSeek V4 file with
+MFP4G32E8SOA tensors that are not the exact MQ2R recipe, is refused at load.
 
 Exclusions applied by `retained_redline_default` before any predicate matches
 (`crates/hipfire-runtime/src/config.rs`): expert-parallel loads (`ep` > 1)
@@ -172,9 +189,7 @@ never admitted automatically, because its retained tape is unvalidated (the
 gfx1201 E4B PM4 shadow is not exact) and Redline runs for it only when
 selected explicitly; and a Qwen3.5 process configured for
 CPU-executed partial offload gets no retained default, because the spilled
-layers' GEMVs run on the host between GPU launches. The selection of MQ4R and
-DeepSeek4 `.mq2r` routes by file extension is marked in source as deprecated
-since 0.4.0, removal in 0.5.0 (0.5.0 selects by HFQ metadata).
+layers' GEMVs run on the host between GPU launches.
 
 #### MQ4R runtime default
 
@@ -185,7 +200,7 @@ since 0.4.0, removal in 0.5.0 (0.5.0 selects by HFQ metadata).
 exact GPU arch is gfx1100 OR gfx1151 OR gfx1201
 AND pipeline parallelism == 1
 AND tensor parallelism == 1
-AND model extension is .mq4r, case-insensitive
+AND route SKU is mq4r (HFQ metadata or registry card; never the file extension)
 ```
 
 Model-family agnostic: there is no `arch_id` gate. This is a **runtime**
@@ -251,6 +266,37 @@ the 0.4.1 qualification run 80 of H2's 898 boundary waits were elided by the
 `ROC_GLOBAL_CU_MASK` does not constrain the
 Redline PM4 queue.
 
+#### gfx1100 Qwen3.5 dense `.mq3-xt` plain-AR runtime default
+
+`retained_redline_default` — source: `crates/hipfire-runtime/src/config.rs`.
+
+```text
+exact GPU arch is gfx1100
+AND model_arch is qwen3_5 (dense, arch_id 5)
+AND model extension is .mq3-xt, case-insensitive
+AND pipeline parallelism == 1
+AND tensor parallelism == 1
+AND no drafter is installed
+```
+
+The `.mq3-xt` decode tape contains `gemv_mq3g256v2_residual`, which has a
+16-byte private segment per lane, so the route needs the GFX10/GFX11 PM4
+scratch rings (`HIPFIRE_PMSCRATCH_PM4_SCRATCH`, default on; at `=0` the prepare
+refuses and the load falls back closed to the HIP graph). Each lane's ring is also
+published in its queue's `amd_queue_t` scratch fields (`QueueSet::bind_scratch`):
+the command processor reloads the scratch registers from there when KFD maps the
+queue again after an eviction, and a queue without them stalls (HIPF-347). Receipts (xtx, qwen3.8-27b
+`.mq3-xt`, served daemon `generate`, driver `tools/redline/serve_identity_ab.py`
+which acks `commit_ready` as `serve` does): greedy token ids identical between
+the retained route (default selection and explicit `redline`), the HIP graph and
+the ring kill switch on story / code / 4,519-token prompts x 512 tokens, with a
+`HIPFIRE_REPLAY_ROUTE_PROOF ... replays=511..512` marker on every retained
+request and the fallback message on the kill-switch arm (fabric j4449, j4456);
+served decode 62.5 vs 53.4 tok/s at ctx ~30 and 58.7 vs 50.6 at ctx ~4.5K
+(x1.17 / x1.16, ABBAABBA fresh daemons, j4456). Opt-out and limits are those of
+the gfx1201 Qwen3.5 section; no other gfx1100 format or family is admitted
+without its own identity and timing receipts.
+
 #### gfx1201 Qwen4 (Flash-Next) plain-AR runtime default
 
 The same predicate admits `model_arch` `qwen4` on exact gfx1201, any weight
@@ -279,7 +325,7 @@ with the commands above to regenerate evidence. This guide states no Qwen4
 decode speedup; any PM4-versus-HIP delta needs its own matched measurement (§8).
 
 Opt-out and fail-closed behavior are as for Qwen3.5 above. gfx1151 Flash-Next
-`.mq4` and every other arch stay on the HIP graph unless the file is `.mq4r`.
+`.mq4` and every other arch stay on the HIP graph unless the file is the MQ4R SKU.
 
 #### LFM registry evidence (not a runtime default)
 
@@ -289,8 +335,9 @@ product-route / registry **evidence and admission metadata only**. It does
 **not** wire automatic runtime selection, does **not** name a current source
 predicate, and does **not** opt the sealed `.mq4` fixture into
 `configure_model_default`. The sealed LFM artifact is **not** automatically
-selected because it is `.mq4`, not `.mq4r`; model family itself no longer
-blocks `.mq4r`. Any usable non-default retained route is **explicit opt-in**
+selected because it is not an MQ4R SKU (`.mq4` with no `hipfire_route_sku` key and
+no `mq4r` registry card); model family itself no longer
+blocks the MQ4R SKU. Any usable non-default retained route is **explicit opt-in**
 and must still prove route support. The prior LFM screen is
 relaxed-stationarity evidence until a separate 1% stationary certification
 run completes (see §11.5).
@@ -426,6 +473,14 @@ A retained route is valid only when all of the following hold.
   artifact. Absent or ambiguous alias blocks preparation.
 - Unsupported scratch, implicit SGPR, loader-kernarg, workgroup, grid, shared
   memory, or symbol metadata blocks installation before `Ready`.
+- Scratch (private segment) on gfx10/gfx11 is supported: the vendor PM4-IB packet
+  skips the command processor's AQL scratch setup, so the retained route owns a
+  constant `COMPUTE_TMPRING_SIZE` plan sized for the largest private segment of
+  the tape and one device-memory ring per queue lane
+  (`crates/redline-rocr/src/pm4_gfx10_scratch.rs`; primary sources cited there).
+  `HIPFIRE_PMSCRATCH_PM4_SCRATCH=0` removes the rings, and a private-segment
+  kernel then blocks installation again. Dynamic-callstack kernels and gfx12
+  scratch remain unsupported.
 - Artifact path, artifact digest, symbol, loader kernarg size/alignment, padded
   blob, grid, block, and shared memory are one identity contract. A stable
   kernel-name hash alone is insufficient.
@@ -906,7 +961,7 @@ with their dates and fixtures. None of these cases is a universal admission.
 
 The MQ4R automatic predicate `mq4r_redline_default` is model-family agnostic
 and narrower than full implementation capability: exact GPU arch `gfx1100`,
-`gfx1151`, or `gfx1201`; single GPU (`pp=tp=1`); case-insensitive `.mq4r`.
+`gfx1151`, or `gfx1201`; single GPU (`pp=tp=1`); the MQ4R SKU (HFQ metadata or registry card, never the extension).
 No `arch_id` gate, apart from the exclusions listed in §3 (expert-parallel
 loads, Muse Glimmer, Gemma 4, and Qwen3.5 under CPU-executed partial offload).
 `gfx1200` and every other arch remain explicit opt-in.
@@ -940,7 +995,7 @@ Primary gfx1201 case:
 | Conservative PM4 observation | HipGraph 164.220 vs requested retained PM4 174.087 tok/s (`1.06009×`) — closest recoverable conservative observation; not fully certified without timed-arm ledger |
 | Selective fence/wait composition | Tuned HipGraph 165.839 vs retained PM4 plus removal of one proven-independent boundary wait 178.320 tok/s (`1.07526×`) — **combined** PM4 + fence/wait observation, not direct transport alone |
 | Later progression | `docs/perf-checkpoints/2026-07-13-redline-mq4r-110-to-204.md` — productized no-env campaign including TG128 median 203.93 tok/s. Changed kernel stack and graph shape; not a direct transport A/B |
-| Automatic runtime selection | Runtime requests `Auto` on complete `mq4r_redline_default` (exact `gfx1100`/`gfx1151`/`gfx1201`, `pp=tp=1`, `.mq4r`; no `arch_id` gate) unless config wizard/backend selection or enabled manual capture bypasses. At the dated campaign the then-current predicate was A3B-only (`a3b_mq4r_redline_default`, `arch_id=6`). Runtime default ≠ guide certification ≠ registry admission |
+| Automatic runtime selection | Runtime requests `Auto` on complete `mq4r_redline_default` (exact `gfx1100`/`gfx1151`/`gfx1201`, `pp=tp=1`, the MQ4R SKU by HFQ metadata or registry card; no `arch_id` gate) unless config wizard/backend selection or enabled manual capture bypasses. At the dated campaign the then-current predicate was A3B-only (`a3b_mq4r_redline_default`, `arch_id=6`). Runtime default ≠ guide certification ≠ registry admission |
 | Disposition | Strongest recoverable gfx1201 PM4 capture/parity/submission/performance evidence. **Do not call fully certified under this guide** until a positive timed-arm route-proof ledger is archived |
 
 ### 11.3 Rejected gfx1030 Qwen3.6 MQ2 lowering
@@ -986,7 +1041,7 @@ retained-PM4 sealed registry evidence/admission record documented in §11.5 and
 | Intent | Reduce LFM2.5-350M dense MQ4 gfx1201 serial-HIP decode launches by fusing RMSNorm plus MQ rotation activation preparation |
 | Baseline route | Serial HIP lowered decode, `HIPFIRE_LFM2_DECODE_FUSION=0`, graph off, Q8 KV |
 | Candidate route | Same serial-HIP path with `HIPFIRE_LFM2_DECODE_FUSION=1`; **not** Redline, AQL, or PM4 |
-| Retained-route admission (2026-07-19 Stage A) | **None — never admitted in that campaign.** The then-current Qwen automatic default (`a3b_mq4r_redline_default`) required `arch_id==6`; LFM is `arch_id==11` and was excluded from that historical predicate. (Current policy is model-family agnostic `mq4r_redline_default` on `.mq4r` only; this sealed LFM fixture remains `.mq4` and is still not auto-selected.) `HIPFIRE_REPLAY_MANUAL_CAPTURE=1` bypassed admission and installed no plan. The sole arch-11 predicate then in play, `plan_lfm_decode_fusion`, gated serial-HIP decode **fusion**, not a retained route. The later sealed registry evidence/admission record is §11.5 / [`admissions.yml`](admissions.yml) — it does not reopen or promote Stage A, and it does not wire automatic runtime selection. |
+| Retained-route admission (2026-07-19 Stage A) | **None — never admitted in that campaign.** The then-current Qwen automatic default (`a3b_mq4r_redline_default`) required `arch_id==6`; LFM is `arch_id==11` and was excluded from that historical predicate. (Current policy is model-family agnostic `mq4r_redline_default` on the MQ4R SKU only; this sealed LFM fixture remains `.mq4` and is still not auto-selected.) `HIPFIRE_REPLAY_MANUAL_CAPTURE=1` bypassed admission and installed no plan. The sole arch-11 predicate then in play, `plan_lfm_decode_fusion`, gated serial-HIP decode **fusion**, not a retained route. The later sealed registry evidence/admission record is §11.5 / [`admissions.yml`](admissions.yml) — it does not reopen or promote Stage A, and it does not wire automatic runtime selection. |
 | Source identity | Baseline `lfm-redline` @ `e8831ae8347f04ac821077ee159c86423b4bf88a`, daemon MD5 `9ee43d2673866775786d8075fb5b6e76`; candidate `feat/lfm-gfx1201-mq4-decode-fusion` @ `518c221756a1065a7560449165bc8817c2ad6176`, daemon MD5 `07d62bbd915416b07ce7783969126dd7` |
 | Fixture | `lfm2.5-350m.mq4` (dense) MD5 `cb5284b8ad5c6f9e4ca859c0aff0bcd0`; prompt fixture MD5 `18cb45e00d424bef16fa9b097d02caf3`; gfx1201; HIP/ROCm 7.2; dated 2026-07-19 |
 | Correctness | Frozen twelve-step decode parity exact; Stage A negatives (default/eager-prefill/spec/graph/capture) did not admit; serve content equality passed |
@@ -1151,7 +1206,7 @@ Prefer paths and symbols over line numbers.
 
 | Concern | Stable source path and symbols |
 |---|---|
-| Automatic product predicates | `crates/hipfire-runtime/src/config.rs` — `retained_redline_default`: `mq4r_redline_default` (`.mq4r` + exact `gfx1100`/`gfx1151`/`gfx1201` + `pp=tp=1`; model-family agnostic except the Muse Glimmer and Gemma 4 withholds), Qwen3.5 dense (`qwen3_5`) and Qwen4 (`qwen4`) on exact gfx1201 with `pp=tp=1` and no drafter, and DeepSeek4 `.mq2r` on gfx1151 AR. Expert-parallel loads (`ep` > 1) and Qwen3.5 under CPU-executed partial offload are never admitted. Existing LFM `.mq4` sealed evidence has no automatic selector. |
+| Automatic product predicates | `crates/hipfire-runtime/src/config.rs` — `retained_redline_default`: `mq4r_redline_default` (MQ4R SKU + exact `gfx1100`/`gfx1151`/`gfx1201` + `pp=tp=1`; model-family agnostic except the Muse Glimmer and Gemma 4 withholds), Qwen3.5 dense (`qwen3_5`) and Qwen4 (`qwen4`) on exact gfx1201 with `pp=tp=1` and no drafter, Qwen3.5 dense `.mq3-xt` on exact gfx1100 with `pp=tp=1` and no drafter, the A3B MQ4RS SKU on exact gfx1201 with `pp=tp=1` and no drafter, and DeepSeek4 MQ2R on gfx1151 AR (SKU identity: `crates/hipfire-runtime/src/route_sku.rs`). Expert-parallel loads (`ep` > 1) and Qwen3.5 under CPU-executed partial offload are never admitted. Existing LFM `.mq4` sealed evidence has no automatic selector. |
 | Model-load application and diagnostic handlers | `crates/hipfire-daemon/src/main.rs` — load-time `configure_model_default`; `redline_capture`; `redline_shadow_aql`; `redline_shadow_pm4` |
 | Qwen model boundary and route | `crates/hipfire-arch-qwen35/src/qwen35.rs` — `forward_scratch`; `prepare_scratch_inputs`; `set_forward_eligible`; `should_route_aql`; `should_route_pm4`; `finish_capture`; `prepare_*` |
 | LFM decode path and registry evidence | `crates/hipfire-arch-lfm2moe/src/forward.rs` — `decode_step`; `decode_step_with_graph`; lowered path under `HIPFIRE_FORWARD_LOWERED`. Sealed LFM retained-PM4 evidence/admission: [`admissions.yml`](admissions.yml) row `lfm25-350m-mq4-gfx1201-retained-pm4-plain-ar` (no current runtime selector). |

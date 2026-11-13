@@ -50,7 +50,7 @@ fn fnv1a(ids: &[u32]) -> u64 {
 fn main() {
     use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
     use hipfire_runtime::hfq::HfqFile;
-    use hipfire_runtime::llama::{self, KvCache};
+    use hipfire_runtime::llama::{self, KvCache, VMode};
     use hipfire_runtime::multi_gpu::Gpus;
     use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
     use rdna_compute::{DType, GpuTensor};
@@ -84,7 +84,7 @@ fn main() {
         .unwrap_or(512usize);
     // KV quantization mode for the FA layers — lets us A/B the flash kernel's
     // long-context behavior: q8 (LDS-score flash that falls out of the >15k ctx
-    // regime to a slower per-position path) vs asym3 / fwht3 (no-LDS-cap tiled
+    // regime to a slower per-position path) vs fwht3 (no-LDS-cap tiled
     // flash that stays on the fast path at any length).
     let kv_mode = std::env::var("HIPFIRE_EP_KV_MODE").unwrap_or_else(|_| "q8".to_string());
 
@@ -206,13 +206,6 @@ fn main() {
         let g = &mut gpus.devices[r];
         kv_per_rank.push(
             match kv_mode.as_str() {
-                "asym3" => KvCache::new_gpu_asym3(
-                    g,
-                    config.n_layers,
-                    config.n_kv_heads,
-                    config.head_dim,
-                    kv_seq,
-                ),
                 "fwht3" => {
                     let is_kv: Vec<bool> = config
                         .layer_types
@@ -225,6 +218,7 @@ fn main() {
                         config.n_kv_heads,
                         config.head_dim,
                         kv_seq,
+                        VMode::Q8,
                     )
                 }
                 _ => KvCache::new_gpu_q8(
@@ -386,13 +380,6 @@ fn main() {
         // anchor compares two tiers and reports a false ANCHOR FAIL on any
         // non-q8 run (it did, on fwht3, before this was tier-aware).
         let mut kv_ref = match kv_mode.as_str() {
-            "asym3" => KvCache::new_gpu_asym3(
-                &mut gpus.devices[0],
-                config.n_layers,
-                config.n_kv_heads,
-                config.head_dim,
-                kv_seq,
-            ),
             "fwht3" => {
                 let is_kv: Vec<bool> = config
                     .layer_types
@@ -405,6 +392,7 @@ fn main() {
                     config.n_kv_heads,
                     config.head_dim,
                     kv_seq,
+                    VMode::Q8,
                 )
             }
             _ => KvCache::new_gpu_q8(

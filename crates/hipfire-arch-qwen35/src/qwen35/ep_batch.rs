@@ -505,25 +505,13 @@ pub fn validate_ep_batch_compatibility(
                 &format!("EP batch: rank {idx} pager present — paged experts not supported"),
             ));
         }
-        // Reject any AWQ/GL/PARO presence on any weight
+        // Reject any AWQ/GL presence on any weight
         for layer in &w.layers {
             let mut check_weight = |wt: &WeightTensor, name: &str| -> HipResult<()> {
                 if wt.awq_scale.is_some() {
                     return Err(HipError::new(
                         0,
                         &format!("EP batch: AWQ not supported ({name})"),
-                    ));
-                }
-                if wt.paro.is_some() {
-                    return Err(HipError::new(
-                        0,
-                        &format!("EP batch: PARO not supported ({name})"),
-                    ));
-                }
-                if wt.gpu_dtype == DType::ParoQ4G128 {
-                    return Err(HipError::new(
-                        0,
-                        &format!("EP batch: PARO dtype not supported ({name})"),
                     ));
                 }
                 if matches!(wt.gpu_dtype, DType::MQ2G256GL | DType::MQ3G256GL) {
@@ -565,12 +553,6 @@ pub fn validate_ep_batch_compatibility(
                     check_weight(&l.ffn.shared_expert.up, "shared_up")?;
                     check_weight(&l.ffn.shared_expert.down, "shared_down")?;
                     check_weight(&l.ffn.shared_expert_gate, "shared_expert_gate")?;
-                    if l.ffn.paro_shared.is_some() {
-                        return Err(HipError::new(
-                            0,
-                            "EP batch: PARO not supported (paro_shared)",
-                        ));
-                    }
                     if l.ffn.expert_down_awq_ptrs.is_some() {
                         return Err(HipError::new(0, "EP batch: AWQ not supported"));
                     }
@@ -659,12 +641,6 @@ pub fn validate_ep_batch_compatibility(
                     check_weight(&l.ffn.shared_expert.up, "shared_up")?;
                     check_weight(&l.ffn.shared_expert.down, "shared_down")?;
                     check_weight(&l.ffn.shared_expert_gate, "shared_expert_gate")?;
-                    if l.ffn.paro_shared.is_some() {
-                        return Err(HipError::new(
-                            0,
-                            "EP batch: PARO not supported (paro_shared)",
-                        ));
-                    }
                     if l.ffn.expert_down_awq_ptrs.is_some() {
                         return Err(HipError::new(0, "EP batch: AWQ not supported"));
                     }
@@ -2162,6 +2138,15 @@ impl Qwen35DecodeBatchEpState {
                 let rot = &self.scratches[0].x_rot;
                 lm_head_batched(gpu, &weights_per_rank[0].output, tmp, rot, &logits_lane, 1)?;
             }
+            // Lane prompt seed ends ordinary prefill: seal each rank's lane view once
+            // and publish its cursors to the owning rank state.
+            for rank in 0..n {
+                dn_lanes[rank].seal_streams(&mut gpus.devices[rank], tokens.len())?;
+                self.ranks[rank]
+                    .dn_state
+                    .stream
+                    .adopt_lane_meta(lane, &dn_lanes[rank].stream)?;
+            }
             for rank in 0..n {
                 gpus.devices[rank].bind_thread()?;
                 gpus.devices[rank].hip.device_synchronize()?;
@@ -3450,7 +3435,6 @@ fn forward_scratch_layers_multi(
                                 outputs: &[&s.dn_qkv, &s.dn_z, &s.dn_beta, &s.dn_alpha],
                                 m: &[layer.wqkv.m, layer.wz.m, layer.w_beta.m, layer.w_alpha.m],
                                 k: layer.wqkv.k,
-                                rot_scratch: &[],
                                 batch_size: None,
                             };
                             hipfire_runtime::llama::fused_qkv_family()
@@ -3645,7 +3629,6 @@ fn forward_scratch_layers_multi(
                                 outputs: &[&s.gate_ffn, &s.up],
                                 m: &[layer.w_gate.m, layer.w_up.m],
                                 k: layer.w_gate.k,
-                                rot_scratch: &[],
                                 batch_size: None,
                             };
                             hipfire_runtime::llama::fused_qkv_family()
@@ -3732,7 +3715,6 @@ fn forward_scratch_layers_multi(
                                 outputs: &[&s.fa_q_full, &s.fa_k, &s.fa_v],
                                 m: &[layer.wq.m, layer.wk.m, layer.wv.m],
                                 k: layer.wq.k,
-                                rot_scratch: &[],
                                 batch_size: None,
                             };
                             hipfire_runtime::llama::fused_qkv_family()
@@ -3855,32 +3837,7 @@ fn forward_scratch_layers_multi(
                                 kv_cache.v_mode_bits(),
                             )?;
                         } else {
-                            gpu.kv_cache_write_asym4_fused(
-                                &kv_cache.k_gpu[layer_idx],
-                                &kv_cache.v_gpu[layer_idx],
-                                &s.fa_k,
-                                &s.fa_v,
-                                &s.pos_buf,
-                                ct,
-                                st,
-                                config.n_kv_heads,
-                                config.head_dim,
-                            )?;
-                            gpu.attention_flash_asym4(
-                                &s.fa_q,
-                                &kv_cache.k_gpu[layer_idx],
-                                &kv_cache.v_gpu[layer_idx],
-                                &s.fa_attn_out,
-                                &s.pos_buf,
-                                ct,
-                                st,
-                                pos + 1,
-                                config.n_heads,
-                                config.n_kv_heads,
-                                config.head_dim,
-                                kv_cache.physical_cap,
-                                &s.flash_partials,
-                            )?;
+                            unreachable!("Givens asym KV was removed in 0.5.0");
                         }
                     } else if kv_cache.quant_asym3 {
                         let ct = ct!();
@@ -3915,33 +3872,7 @@ fn forward_scratch_layers_multi(
                                 kv_cache.v_mode_bits(),
                             )?;
                         } else {
-                            gpu.kv_cache_write_asym3_fused(
-                                &kv_cache.k_gpu[layer_idx],
-                                &kv_cache.v_gpu[layer_idx],
-                                &s.fa_k,
-                                &s.fa_v,
-                                &s.pos_buf,
-                                ct,
-                                st,
-                                config.n_kv_heads,
-                                config.head_dim,
-                            )?;
-                            gpu.attention_flash_asym3(
-                                &s.fa_q,
-                                &kv_cache.k_gpu[layer_idx],
-                                &kv_cache.v_gpu[layer_idx],
-                                &s.fa_attn_out,
-                                &s.pos_buf,
-                                ct,
-                                st,
-                                pos + 1,
-                                config.n_heads,
-                                config.n_kv_heads,
-                                config.head_dim,
-                                kv_cache.physical_cap,
-                                &s.flash_partials,
-                                None,
-                            )?;
+                            unreachable!("Givens asym KV was removed in 0.5.0");
                         }
                     } else if kv_cache.quant_asym2 {
                         let ct = ct!();
@@ -3976,32 +3907,7 @@ fn forward_scratch_layers_multi(
                                 kv_cache.v_mode_bits(),
                             )?;
                         } else {
-                            gpu.kv_cache_write_asym2_fused(
-                                &kv_cache.k_gpu[layer_idx],
-                                &kv_cache.v_gpu[layer_idx],
-                                &s.fa_k,
-                                &s.fa_v,
-                                &s.pos_buf,
-                                ct,
-                                st,
-                                config.n_kv_heads,
-                                config.head_dim,
-                            )?;
-                            gpu.attention_flash_asym2(
-                                &s.fa_q,
-                                &kv_cache.k_gpu[layer_idx],
-                                &kv_cache.v_gpu[layer_idx],
-                                &s.fa_attn_out,
-                                &s.pos_buf,
-                                ct,
-                                st,
-                                pos + 1,
-                                config.n_heads,
-                                config.n_kv_heads,
-                                config.head_dim,
-                                kv_cache.physical_cap,
-                                &s.flash_partials,
-                            )?;
+                            unreachable!("Givens asym KV was removed in 0.5.0");
                         }
                     } else if kv_cache.quant_q8 {
                         gpu.kv_cache_write_q8_0(
@@ -4132,7 +4038,6 @@ fn forward_scratch_layers_multi(
                                 outputs: &[&s.gate_ffn, &s.up],
                                 m: &[layer.w_gate.m, layer.w_up.m],
                                 k: layer.w_gate.k,
-                                rot_scratch: &[],
                                 batch_size: None,
                             };
                             hipfire_runtime::llama::fused_qkv_family()
@@ -4226,7 +4131,6 @@ fn forward_scratch_layers_multi(
                                 outputs: &[&s.dn_qkv, &s.dn_z, &s.dn_beta, &s.dn_alpha],
                                 m: &[layer.wqkv.m, layer.wz.m, layer.w_beta.m, layer.w_alpha.m],
                                 k: layer.wqkv.k,
-                                rot_scratch: &[],
                                 batch_size: None,
                             };
                             hipfire_runtime::llama::fused_qkv_family()
@@ -4439,7 +4343,6 @@ fn forward_scratch_layers_multi(
                                 outputs: &[&s.fa_q_full, &s.fa_k, &s.fa_v],
                                 m: &[layer.wq.m, layer.wk.m, layer.wv.m],
                                 k: layer.wq.k,
-                                rot_scratch: &[],
                                 batch_size: None,
                             };
                             hipfire_runtime::llama::fused_qkv_family()
@@ -4562,32 +4465,7 @@ fn forward_scratch_layers_multi(
                                 kv_cache.v_mode_bits(),
                             )?;
                         } else {
-                            gpu.kv_cache_write_asym4_fused(
-                                &kv_cache.k_gpu[layer_idx],
-                                &kv_cache.v_gpu[layer_idx],
-                                &s.fa_k,
-                                &s.fa_v,
-                                &s.pos_buf,
-                                ct,
-                                st,
-                                config.n_kv_heads,
-                                config.head_dim,
-                            )?;
-                            gpu.attention_flash_asym4(
-                                &s.fa_q,
-                                &kv_cache.k_gpu[layer_idx],
-                                &kv_cache.v_gpu[layer_idx],
-                                &s.fa_attn_out,
-                                &s.pos_buf,
-                                ct,
-                                st,
-                                pos + 1,
-                                config.n_heads,
-                                config.n_kv_heads,
-                                config.head_dim,
-                                kv_cache.physical_cap,
-                                &s.flash_partials,
-                            )?;
+                            unreachable!("Givens asym KV was removed in 0.5.0");
                         }
                     } else if kv_cache.quant_asym3 {
                         let ct = ct!();
@@ -4622,33 +4500,7 @@ fn forward_scratch_layers_multi(
                                 kv_cache.v_mode_bits(),
                             )?;
                         } else {
-                            gpu.kv_cache_write_asym3_fused(
-                                &kv_cache.k_gpu[layer_idx],
-                                &kv_cache.v_gpu[layer_idx],
-                                &s.fa_k,
-                                &s.fa_v,
-                                &s.pos_buf,
-                                ct,
-                                st,
-                                config.n_kv_heads,
-                                config.head_dim,
-                            )?;
-                            gpu.attention_flash_asym3(
-                                &s.fa_q,
-                                &kv_cache.k_gpu[layer_idx],
-                                &kv_cache.v_gpu[layer_idx],
-                                &s.fa_attn_out,
-                                &s.pos_buf,
-                                ct,
-                                st,
-                                pos + 1,
-                                config.n_heads,
-                                config.n_kv_heads,
-                                config.head_dim,
-                                kv_cache.physical_cap,
-                                &s.flash_partials,
-                                None,
-                            )?;
+                            unreachable!("Givens asym KV was removed in 0.5.0");
                         }
                     } else if kv_cache.quant_asym2 {
                         let ct = ct!();
@@ -4683,32 +4535,7 @@ fn forward_scratch_layers_multi(
                                 kv_cache.v_mode_bits(),
                             )?;
                         } else {
-                            gpu.kv_cache_write_asym2_fused(
-                                &kv_cache.k_gpu[layer_idx],
-                                &kv_cache.v_gpu[layer_idx],
-                                &s.fa_k,
-                                &s.fa_v,
-                                &s.pos_buf,
-                                ct,
-                                st,
-                                config.n_kv_heads,
-                                config.head_dim,
-                            )?;
-                            gpu.attention_flash_asym2(
-                                &s.fa_q,
-                                &kv_cache.k_gpu[layer_idx],
-                                &kv_cache.v_gpu[layer_idx],
-                                &s.fa_attn_out,
-                                &s.pos_buf,
-                                ct,
-                                st,
-                                pos + 1,
-                                config.n_heads,
-                                config.n_kv_heads,
-                                config.head_dim,
-                                kv_cache.physical_cap,
-                                &s.flash_partials,
-                            )?;
+                            unreachable!("Givens asym KV was removed in 0.5.0");
                         }
                     } else if kv_cache.quant_q8 {
                         gpu.kv_cache_write_q8_0(
@@ -4875,7 +4702,7 @@ pub fn forward_scratch_multi(
             0,
             "forward_scratch_multi: asym KV mode requires gpus.givens_*_per_dev \
              populated for every device. Construct KvCache via the *_multi ctor \
-             (e.g. KvCache::new_gpu_asym3_capped_multi) — single-GPU ctors leave \
+             (e.g. KvCache::new_gpu_fwht3_capped_multi) — single-GPU ctors leave \
              gpus.givens_*_per_dev empty.",
         ));
     }
@@ -4974,7 +4801,7 @@ pub fn forward_prefill_batch_multi(
             0,
             "forward_prefill_batch_multi: asym KV mode requires gpus.givens_*_per_dev \
              populated for every device. Construct KvCache via the *_multi ctor \
-             (e.g. KvCache::new_gpu_asym3_capped_multi) — single-GPU ctors leave \
+             (e.g. KvCache::new_gpu_fwht3_capped_multi) — single-GPU ctors leave \
              gpus.givens_*_per_dev empty.",
         ));
     }
@@ -5293,7 +5120,6 @@ mod tests {
             F32,
             HFP4G32,
             MFP4G32,
-            ParoQ4G128,
         ];
         let is_accepted = |gate: DType, down: DType| -> bool {
             accepted.iter().any(|&(g, d, _)| g == gate && d == down)

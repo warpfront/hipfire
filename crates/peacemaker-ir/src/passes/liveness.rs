@@ -18,8 +18,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 use crate::cfg::{BlockId, Body, InstId};
-use crate::effects::ImplicitSet;
-use crate::inst::Inst;
+use crate::effects::{wave_effects, ImplicitSet};
+use crate::inst::{Arch, Inst, Wave};
 use crate::operand::{Operand, Special};
 use crate::passes::cfg::containing_block;
 use crate::reg::{Kind, RegRef, RegSet};
@@ -96,13 +96,15 @@ fn implicit_locs(bits: u8) -> Vec<Loc> {
 }
 
 /// (uses, defs) of one instruction as dword sets.
-fn inst_use_def(inst: &Inst) -> (BTreeSet<Loc>, BTreeSet<Loc>) {
+fn inst_use_def(inst: &Inst, arch: Arch, wave: Wave) -> (BTreeSet<Loc>, BTreeSet<Loc>) {
     let mut uses = BTreeSet::new();
     let mut defs = BTreeSet::new();
-    for reg in &inst.effects.uses {
+    // Lane masks are one SGPR in wave32: the table's 64-bit slot would kill the next SGPR.
+    let effects = wave_effects(arch, wave, inst);
+    for reg in &effects.uses {
         uses.extend(reg_locs(*reg));
     }
-    for reg in &inst.effects.defs {
+    for reg in &effects.defs {
         defs.extend(reg_locs(*reg));
     }
     for operand in &inst.operands {
@@ -133,8 +135,10 @@ fn inst_use_def(inst: &Inst) -> (BTreeSet<Loc>, BTreeSet<Loc>) {
 
 /// Liveness facts over built blocks: per-block live-in/out plus per-point
 /// live-before/after sets for ranges and free-register queries.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Liveness {
+    arch: Arch,
+    wave: Wave,
     live_in: BTreeMap<BlockId, BTreeSet<Loc>>,
     live_out: BTreeMap<BlockId, BTreeSet<Loc>>,
     before: HashMap<InstId, BTreeSet<Loc>>,
@@ -158,8 +162,9 @@ pub struct LivePoint {
 
 impl Liveness {
     /// Backward may-analysis to a fixpoint. Total: needs built blocks, but
-    /// any CFG shape (diamonds, loops, unreachable padding) converges.
-    pub fn analyze(body: &Body) -> Self {
+    /// any CFG shape (diamonds, loops, unreachable padding) converges. `arch`
+    /// and `wave` size the VALU lane-mask operands (one SGPR in wave32).
+    pub fn analyze(body: &Body, arch: Arch, wave: Wave) -> Self {
         let mut use_b: HashMap<BlockId, BTreeSet<Loc>> = HashMap::new();
         let mut def_b: HashMap<BlockId, BTreeSet<Loc>> = HashMap::new();
         let mut inst_facts: HashMap<InstId, (BTreeSet<Loc>, BTreeSet<Loc>)> = HashMap::new();
@@ -173,7 +178,7 @@ impl Liveness {
                 let Some(inst) = body.insts.get(id) else {
                     continue;
                 };
-                let (uses, defs) = inst_use_def(inst);
+                let (uses, defs) = inst_use_def(inst, arch, wave);
                 inst_facts.insert(id, (uses.clone(), defs.clone()));
                 for loc in uses {
                     if !def_accum.contains(&loc) {
@@ -247,6 +252,8 @@ impl Liveness {
             }
         }
         Self {
+            arch,
+            wave,
             live_in,
             live_out,
             before,
@@ -312,7 +319,7 @@ impl Liveness {
             let Some(inst) = body.insts.get(from) else {
                 continue;
             };
-            let (_, defs) = inst_use_def(inst);
+            let (_, defs) = inst_use_def(inst, self.arch, self.wave);
             let from_block = containing_block(body, from);
             for loc in defs {
                 let (kind, index) = match loc {
@@ -437,6 +444,7 @@ mod tests {
         Inst {
             op: row_op(name, form),
             form,
+            variant: None,
             fields: Default::default(),
             operands: Default::default(),
             mods: Default::default(),
@@ -525,7 +533,7 @@ mod tests {
         ]);
         build_blocks(&mut body, crate::inst::Arch::Gfx1201).unwrap();
         assert_eq!(body.blocks.len(), 4);
-        let live = Liveness::analyze(&body);
+        let live = Liveness::analyze(&body, crate::inst::Arch::Gfx1201, crate::inst::Wave::Wave32);
         // v5 is live-in at the join and along both paths (may-analysis).
         assert!(live.live_in(BlockId(3)).contains(&Loc::V(5)));
         assert!(live.live_in(BlockId(1)).contains(&Loc::V(5)));
@@ -560,7 +568,7 @@ mod tests {
         ]);
         build_blocks(&mut body, crate::inst::Arch::Gfx1201).unwrap();
         assert_eq!(body.blocks.len(), 4);
-        let live = Liveness::analyze(&body);
+        let live = Liveness::analyze(&body, crate::inst::Arch::Gfx1201, crate::inst::Wave::Wave32);
         assert!(live.live_in(BlockId(3)).contains(&Loc::V(200)));
         // May-merge: v200 is live-out of BOTH predecessors, including the one
         // that never defined it. Liveness cannot tell initialised from live,
@@ -595,7 +603,7 @@ mod tests {
         ]);
         build_blocks(&mut body, crate::inst::Arch::Gfx1201).unwrap();
         assert_eq!(body.blocks.len(), 5);
-        let live = Liveness::analyze(&body);
+        let live = Liveness::analyze(&body, crate::inst::Arch::Gfx1201, crate::inst::Wave::Wave32);
         assert!(live.live_in(BlockId(1)).contains(&Loc::V(5)));
         assert!(live.live_in(BlockId(2)).contains(&Loc::V(5)));
         // The def's range spans the loop back to the back-edge jump.
@@ -630,7 +638,7 @@ mod tests {
         });
         let mut body = body_of(vec![cmpx, predicated, endpgm()]);
         build_blocks(&mut body, crate::inst::Arch::Gfx1201).unwrap();
-        let live = Liveness::analyze(&body);
+        let live = Liveness::analyze(&body, crate::inst::Arch::Gfx1201, crate::inst::Wave::Wave32);
         assert!(!live.live_in(BlockId(0)).contains(&Loc::ExecLo));
         let after_cmpx = live.live_after(body.layout[0]).unwrap();
         assert!(after_cmpx.contains(&Loc::ExecLo) && after_cmpx.contains(&Loc::ExecHi));
@@ -646,7 +654,7 @@ mod tests {
             endpgm(),
         ]);
         build_blocks(&mut body, crate::inst::Arch::Gfx1201).unwrap();
-        let live = Liveness::analyze(&body);
+        let live = Liveness::analyze(&body, crate::inst::Arch::Gfx1201, crate::inst::Wave::Wave32);
         let at = LivePoint {
             block: BlockId(0),
             before: Some(body.layout[1]),
@@ -681,7 +689,7 @@ mod tests {
         // v1 must not be live-in at entry.
         let mut body = body_of(vec![vdef(1), vuse(1), vdef(1), endpgm()]);
         build_blocks(&mut body, crate::inst::Arch::Gfx1201).unwrap();
-        let live = Liveness::analyze(&body);
+        let live = Liveness::analyze(&body, crate::inst::Arch::Gfx1201, crate::inst::Wave::Wave32);
         assert!(!live.live_in(BlockId(0)).contains(&Loc::V(1)));
         // The first def's range ends at the use; the last def is dead.
         let ranges = live.ranges(&body);

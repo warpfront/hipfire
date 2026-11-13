@@ -24,6 +24,8 @@ pub struct SrcFile {
     pub uses: Vec<Vec<String>>,
     /// Each `struct Name` with its attributes.
     pub structs: Vec<(String, Vec<String>)>,
+    /// Each named-field `struct Name { .. }`: field names and their type tokens.
+    pub struct_fields: Vec<(String, Vec<(String, Vec<Tt>)>)>,
 }
 
 pub struct World {
@@ -90,6 +92,7 @@ impl World {
                 id_counts,
                 uses: items.uses,
                 structs: items.structs,
+                struct_fields: items.struct_fields,
             });
         }
         let mut fn_index: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
@@ -373,6 +376,31 @@ impl World {
                         }
                     }
                 }
+                Tt::Id(name, _)
+                    if !is_skip_word(name)
+                        && !(k > 0 && (ts[k - 1].is_p('.') || ts[k - 1].is_p(':')))
+                        && ctx.idx.visible(name, sloc).is_none()
+                        && !ctx.params.contains(name)
+                        && self
+                            .const_array_element(name, ctx.file, ts.get(k + 1))
+                            .is_some() =>
+                {
+                    // `ARRAY[3]` of a constant array literal names that one element, not
+                    // every element the array holds.
+                    let (path, element) = self
+                        .const_array_element(name, ctx.file, ts.get(k + 1))
+                        .unwrap();
+                    let idx = BindIndex::default();
+                    let ectx = Ctx {
+                        file: &path,
+                        body: &[],
+                        params: HashSet::new(),
+                        idx: &idx,
+                    };
+                    let r = self.resolve(&element, &ectx, &[usize::MAX], depth + 1, callees);
+                    res.merge(&r);
+                    skip_to = k + 2;
+                }
                 Tt::Id(name, _) if !is_skip_word(name) => {
                     let prev = if k > 0 { ts.get(k - 1) } else { None };
                     let nxt = ts.get(k + 1);
@@ -547,6 +575,62 @@ impl World {
         }
     }
 
+    /// The element tokens of `NAME[<decimal literal>]` when `NAME` is one constant (this file's,
+    /// else the only one in the workspace) initialised by a plain array literal `[a, b, ..]`
+    /// (not the repeat form `[x; N]`) that has that index. The file defining the constant is
+    /// returned with it, because the element is resolved there.
+    fn const_array_element(
+        &self,
+        name: &str,
+        file: &str,
+        index: Option<&Tt>,
+    ) -> Option<(String, Vec<Tt>)> {
+        let Some(Tt::G('[', ix, _)) = index else {
+            return None;
+        };
+        let [Tt::N(n, _)] = ix.as_slice() else {
+            return None;
+        };
+        if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let i: usize = n.parse().ok()?;
+        let src = match self.file(file).filter(|f| f.consts.contains_key(name)) {
+            Some(f) => f,
+            None => {
+                let files = self.const_files.get(name)?;
+                if files.len() != 1 {
+                    return None;
+                }
+                &self.files[files[0]]
+            }
+        };
+        let defs = src.consts.get(name)?;
+        if defs.len() != 1 {
+            return None;
+        }
+        let init = defs[0].init();
+        let [array] = init.as_slice() else {
+            return None;
+        };
+        if !array.is_g('[') {
+            return None;
+        }
+        let items = array.group()?;
+        if items.iter().any(|t| t.is_p(';')) {
+            return None;
+        }
+        let mut parts = split_top(items, ',');
+        if parts.last().is_some_and(|p| p.is_empty()) {
+            parts.pop();
+        }
+        let element = parts.get(i)?.clone();
+        if element.is_empty() {
+            return None;
+        }
+        Some((src.path.clone(), element))
+    }
+
     fn resolve_const(&self, name: &str, file: &str, _depth: u32, callees: bool) -> Res {
         let key = format!("c|{name}|{file}|{callees}");
         if let Some(r) = self.res_cache.borrow().get(&key) {
@@ -639,7 +723,7 @@ impl World {
         if it.len() == 1 {
             if let Some(g) = it[0].group() {
                 if it[0].is_g('[') {
-                    return array_elems(g);
+                    return self.array_elems_in(g, ctx.file);
                 }
             }
         }
@@ -658,12 +742,9 @@ impl World {
                         if b.ty.len() == 1 && b.ty[0].is_g('[') {
                             if let Some(g) = b.ty[0].group() {
                                 if let Some(semi) = g.iter().position(|t| t.is_p(';')) {
-                                    if let Some(n) = self.eval_const_expr_in(
-                                        &g[semi + 1..],
-                                        &HashMap::new(),
-                                        ctx.file,
-                                    ) {
-                                        return Ok(vec![None; n as usize]);
+                                    if let Some(n) = self.repeat_len_at(&g[semi + 1..], ctx, &b.loc)
+                                    {
+                                        return Ok(vec![None; n]);
                                     }
                                 }
                             }
@@ -673,7 +754,7 @@ impl World {
                             init.remove(0);
                         }
                         if init.len() == 1 && init[0].is_g('[') {
-                            return array_elems(init[0].group().unwrap());
+                            return self.array_elems_at(init[0].group().unwrap(), ctx, &b.loc);
                         }
                         let ids: Vec<&str> = init.iter().filter_map(|t| t.id()).collect();
                         if !ids.is_empty() && init.iter().all(|t| t.id().is_some() || t.is_p(':')) {
@@ -733,6 +814,27 @@ impl World {
             "loop iterable `{}` is not a literal array, constant array or literal range",
             text(&it)
         ))
+    }
+
+    /// Integer value of a constant array-repeat count (`[x; N]`): a literal or a
+    /// `const` expression of `file`.
+    pub(crate) fn repeat_len(&self, count: &[Tt], file: &str) -> Option<usize> {
+        let n = self.eval_const_expr_in(count, &HashMap::new(), file)?;
+        usize::try_from(n).ok()
+    }
+
+    /// `array_elems` that also evaluates a constant (non-literal) repeat count.
+    pub(crate) fn array_elems_in(
+        &self,
+        g: &[Tt],
+        file: &str,
+    ) -> Result<Vec<Option<Vec<Tt>>>, String> {
+        if let Some(semi) = g.iter().position(|t| t.is_p(';')) {
+            if let Some(n) = self.repeat_len(&g[semi + 1..], file) {
+                return Ok(vec![None; n]);
+            }
+        }
+        array_elems(g)
     }
 }
 
@@ -1707,8 +1809,9 @@ pub fn binding_init(b: &Binding) -> Vec<Tt> {
     }
 }
 
-/// Component `k` of a tuple expression, following `if`/`else` branches to their tails.
-/// `None` when the expression is not a tuple or a chain of them.
+/// Component `k` of a tuple expression, following `if`/`else` branches and `match` arms to
+/// their tails; branches that provably `return` produce no value and are skipped. `None`
+/// when the expression is not a tuple or a chain of them, or any branch is neither.
 fn project_let(init: &[Tt], k: usize) -> Option<Vec<Tt>> {
     let mut t: Vec<Tt> = init.to_vec();
     while t.first().map_or(false, |x| x.is_p('&')) {
@@ -1733,6 +1836,9 @@ fn project_let(init: &[Tt], k: usize) -> Option<Vec<Tt>> {
         .ok()?;
         let mut out: Vec<Tt> = Vec::new();
         for b in bodies {
+            if block_diverges(&b) {
+                continue;
+            }
             let tail = crate::layout::split_stmts(&b).1;
             let comp = project_let(&tail, k)?;
             if !out.is_empty() {
@@ -1740,9 +1846,81 @@ fn project_let(init: &[Tt], k: usize) -> Option<Vec<Tt>> {
             }
             out.extend(comp);
         }
-        return Some(out);
+        return (!out.is_empty()).then_some(out);
+    }
+    if t.first().map_or(false, |x| x.is_id("match")) && t.last().map_or(false, |x| x.is_g('{')) {
+        return project_match(t.last()?.group()?, k);
     }
     None
+}
+
+/// A block whose last statement (or trailing expression) is a `return`, so control never
+/// leaves it normally. Anything less obvious is NOT divergence: the caller then projects
+/// the block like any other arm and gives up (whole-initialiser fallback) when it cannot.
+fn block_diverges(block: &[Tt]) -> bool {
+    let (stmts, tail) = crate::layout::split_stmts(block);
+    let last = if tail.is_empty() {
+        stmts.last()
+    } else {
+        Some(&tail)
+    };
+    last.and_then(|s| s.first())
+        .map_or(false, |f| f.is_id("return"))
+}
+
+/// An arm value that provably never produces a value: `return ..` or a block ending in one.
+fn arm_diverges(value: &[Tt]) -> bool {
+    match value.first() {
+        Some(f) if f.is_id("return") => true,
+        Some(f) if f.is_g('{') && value.len() == 1 => block_diverges(f.group().unwrap()),
+        _ => false,
+    }
+}
+
+/// Component `k` of every value-producing arm of a `match` body (`PAT => VALUE, ..`),
+/// joined with `,`. Arms that provably diverge (`return`) contribute nothing; any arm that
+/// is malformed, ambiguous, or neither diverges nor projects makes the whole match
+/// unprojectable (`None`).
+fn project_match(body: &[Tt], k: usize) -> Option<Vec<Tt>> {
+    let n = body.len();
+    let mut out: Vec<Tt> = Vec::new();
+    let mut i = 0;
+    while i < n {
+        let arrow =
+            (i..n.saturating_sub(1)).find(|&j| body[j].is_p('=') && body[j + 1].is_p('>'))?;
+        if arrow == i {
+            return None;
+        }
+        let v = arrow + 2;
+        if v >= n {
+            return None;
+        }
+        let (value, next) = if body[v].is_g('{') {
+            // A block arm may omit its comma; any other punctuation after it continues the
+            // expression (`{..}.f()`), which is not an arm boundary we can trust.
+            match body.get(v + 1) {
+                None => (&body[v..v + 1], n),
+                Some(x) if x.is_p(',') => (&body[v..v + 1], v + 2),
+                Some(Tt::P(..)) => return None,
+                Some(_) => (&body[v..v + 1], v + 1),
+            }
+        } else {
+            let end = (v..n).find(|&j| body[j].is_p(',')).unwrap_or(n);
+            (&body[v..end], end + 1)
+        };
+        if value.is_empty() {
+            return None;
+        }
+        if !arm_diverges(value) {
+            let comp = project_let(value, k)?;
+            if !out.is_empty() {
+                out.push(Tt::P(',', 0));
+            }
+            out.extend(comp);
+        }
+        i = next;
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 /// Leaves of a `for` pattern with their positions: `(i, (l, blob))` gives

@@ -3,7 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Pure greedy token dump for byte-exact regression comparison.
-//! Supports both HFQ (.hfq/.mq4) and safetensors-directory (PaRo) models.
+//! Supports HFQ (.hfq/.mq4) models.
 
 #[cfg(not(feature = "deltanet"))]
 fn main() {
@@ -15,13 +15,12 @@ fn main() {
     use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::llama::{self, KvCache};
-    use hipfire_runtime::safetensors_source::SafetensorsSource;
     use std::io::Write;
     use std::path::Path;
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: greedy_dump <model.(hfq|mq4|dir)> [out_tokens.txt] [prompt...]");
+        eprintln!("Usage: greedy_dump <model.(hfq|mq4)> [out_tokens.txt] [prompt...]");
         eprintln!("  If out_tokens.txt is omitted, tokens go to stdout.");
         std::process::exit(1);
     }
@@ -38,25 +37,18 @@ fn main() {
 
     // ---- GPU init ----
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
+    // The product loader packs the weight uploads into slabs
+    // (`HIPFIRE_WEIGHT_SLAB`); this harness calls the arch loader directly, so
+    // it opens the same scope.
+    gpu.weight_slab_scope_begin();
 
-    // ---- Load model (HFQ or safetensors) ----
+    // ---- Load model (HFQ) ----
     let model = Path::new(model_path);
-    let (config, weights, hfq_opt) = if model.is_dir() {
-        let source = SafetensorsSource::open(model).expect("safetensors open");
-        let config = qwen35::config_from_safetensors(&source).expect("read config");
-        let weights = {
-            let mut paro_source =
-                qwen35::ParoSource::new(&source, &config).expect("ParoSource::new");
-            let paro_layout = qwen35::Layout::single(config.n_layers);
-            qwen35::load_weights(
-                &mut paro_source,
-                std::slice::from_mut(&mut gpu),
-                &paro_layout,
-            )
-            .expect("load paro")
-        };
-        (config, weights, None::<HfqFile>)
-    } else {
+    if model.is_dir() {
+        eprintln!("{}", hipfire_runtime::hfq::REMOVED_SAFETENSORS_DIR_MSG);
+        std::process::exit(1);
+    }
+    let (config, weights, hfq) = {
         let mut hfq = HfqFile::open(model).expect("open model");
         let config = qwen35::config_from_hfq(&hfq).expect("read config");
         let weights = {
@@ -65,23 +57,13 @@ fn main() {
             qwen35::load_weights(&mut src, std::slice::from_mut(&mut gpu), &layout)
                 .expect("load weights")
         };
-        (config, weights, Some(hfq))
+        (config, weights, hfq)
     };
+    gpu.weight_slab_scope_end();
 
     // ---- Tokenizer ----
-    let metadata_json = hfq_opt
-        .as_ref()
-        .map(|h| h.metadata_json.as_str())
-        .unwrap_or("");
-    let tokenizer = if !metadata_json.is_empty() {
-        hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(metadata_json).expect("tok")
-    } else {
-        // Safetensors path: read tokenizer.json from the directory
-        let tok_path = model.join("tokenizer.json");
-        let tok_str = std::fs::read_to_string(&tok_path)
-            .unwrap_or_else(|_| panic!("missing tokenizer.json at {}", tok_path.display()));
-        hipfire_runtime::tokenizer::Tokenizer::from_hf_json(&tok_str).expect("tok")
-    };
+    let tokenizer =
+        hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json).expect("tok");
 
     // ---- Build prompt tokens ----
     let mut prompt_tokens: Vec<u32> = match mode.as_str() {
@@ -134,6 +116,23 @@ fn main() {
     } else {
         Box::new(std::io::stdout())
     };
+    // LOGITS_OUT=<path>: every step's raw f32 logits, little-endian, back to
+    // back (byte-exact comparison across HIPFIRE_WEIGHT_SLAB arms).
+    let mut logits_out = std::env::var("LOGITS_OUT")
+        .ok()
+        .map(|p| std::fs::File::create(p).expect("create LOGITS_OUT"));
+    let dump_logits = |file: &mut Option<std::fs::File>, logits: &[f32]| {
+        if let Some(f) = file.as_mut() {
+            // SAFETY: f32 has no padding and any alignment suffices for u8.
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    logits.as_ptr() as *const u8,
+                    std::mem::size_of_val(logits),
+                )
+            };
+            f.write_all(bytes).expect("write LOGITS_OUT");
+        }
+    };
 
     // ---- Prefill ----
     qwen35::forward_prefill_batch(
@@ -154,6 +153,7 @@ fn main() {
 
     let mut logits = gpu.download_f32(&scratch.logits).unwrap();
     let mut next_token = llama::argmax(&logits);
+    dump_logits(&mut logits_out, &logits);
     writeln!(out, "{next_token}").ok();
     prompt_tokens.push(next_token);
 
@@ -176,6 +176,7 @@ fn main() {
         .expect("forward failed");
         logits = gpu.download_f32(&scratch.logits).unwrap();
         next_token = llama::argmax(&logits);
+        dump_logits(&mut logits_out, &logits);
         writeln!(out, "{next_token}").ok();
         prompt_tokens.push(next_token);
         if next_token == config.eos_token {

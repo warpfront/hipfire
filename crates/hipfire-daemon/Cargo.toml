@@ -18,7 +18,6 @@ default = ["deltanet", "vcn-jpeg"]
 deltanet = [
     "hipfire-runtime/deltanet",
     "rdna-compute/deltanet",
-    "hipfire-pflash/deltanet",
     "hipfire-arch-qwen35-vl/deltanet",
 ]
 flash-attn-ck = [
@@ -48,7 +47,6 @@ hipfire-runtime = { path = "../hipfire-runtime" }
 hipfire-loader = { path = "../hipfire-loader" }
 hipfire-engine = { path = "../hipfire-engine" }
 hipfire-generate = { path = "../hipfire-generate" }
-hipfire-pflash = { path = "../hipfire-pflash" }
 hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35" }
 hipfire-arch-qwen35-vl = { path = "../hipfire-arch-qwen35-vl" }
 saddle-core = { path = "../saddle-core" }

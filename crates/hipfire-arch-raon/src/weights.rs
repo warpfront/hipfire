@@ -14,7 +14,7 @@
 //! | class | stored as | resident as |
 //! |---|---|---|
 //! | embedding | Q8F16 (qt 3), or qt 1/2/16/44 | raw Q8 table / host-decoded F32 |
-//! | projections (attn, dense/shared FFN, lm_head) | Q8F16 (qt 3; every attention projection and lm_head in the shipped recipe, no AWQ sidecar) or qt44 (symmetric MQ4G256V2, dense/shared FFN) when K is a multiple of 256; qt 1/2/16 widen to F32 | [`WeightTensor`] (+ AWQ sidecar on qt44) |
+//! | projections (attn, dense/shared FFN, lm_head) | Q8F16 (qt 3; every attention projection and lm_head in the shipped recipe, no AWQ sidecar) or qt44 (symmetric MQ4G256V2, dense/shared FFN) when K is a multiple of 256, or MQ8G256 (qt 14, `hipfire quantize --raon-attn-mq8`; RDA q/k/v/g/o and MLA q_a/kv_a/kv_b/g/o with K % 256 == 0 only, no AWQ sidecar); qt 1/2/16 widen to F32 | [`WeightTensor`] (+ AWQ sidecar on qt44; qt14 is repacked to the aligned layout B at load, see [`load_proj`]) |
 //! | routed experts | symmetric qt44 only; gate rows ++ up rows fused per expert | per-expert `[2*1088, 2560]` and `[2560, 1280]` |
 //! | router, mHC selector | qt 1/2/16 | BF16 (qt16 as stored; F16/F32 narrowed with every value verified BF16-representable, else that tensor stays F32) |
 //! | norms, conv, A_log, dt_bias, biases | qt 1/2/16 | F32 |
@@ -62,6 +62,9 @@ use crate::config::{FfnKind, LayerKind, RaonConfig, MHC_STREAMS, QT44_GROUP};
 const QT_F16: u8 = 1;
 const QT_F32: u8 = 2;
 const QT_Q8F16: u8 = 3;
+/// MQ8G256: FWHT256-rotated int8, 258 B per 256-group (f16 scale + int8[256]). Admitted for the
+/// attention-class projections only ([`is_mq8_attn_name`]).
+const QT_MQ8G256: u8 = 14;
 const QT_MQ4V2: u8 = 44;
 const QT_BF16: u8 = 16;
 
@@ -833,6 +836,7 @@ impl IndexEntry {
 /// (qt, k) pair is not a valid layout.
 fn payload_bytes(qt: u8, m: usize, k: usize) -> Option<usize> {
     match qt {
+        QT_MQ8G256 if k % QT44_GROUP == 0 => m.checked_mul(k / QT44_GROUP)?.checked_mul(258),
         QT_MQ4V2 if k % QT44_GROUP == 0 => m.checked_mul(k / QT44_GROUP)?.checked_mul(136),
         QT_Q8F16 if k % 32 == 0 => m.checked_mul(k / 32)?.checked_mul(34),
         QT_F16 | QT_BF16 => m.checked_mul(k)?.checked_mul(2),
@@ -841,9 +845,31 @@ fn payload_bytes(qt: u8, m: usize, k: usize) -> Option<usize> {
     }
 }
 
-fn allowed_qts(class: TensorClass) -> &'static [u8] {
-    match class {
+/// Attention-class projection (`self_attn.<proj>.weight`) that an `--raon-attn-mq8` artifact
+/// stores as MQ8G256 when K % 256 == 0: RDA q/k/v/g/o and MLA q_a/kv_a/kv_b/g/o. `q_b` (K 576),
+/// the RDA gate heads (f_a/f_b/b_proj/rda_w_proj), the FFN and `lm_head` never are.
+pub fn is_mq8_attn_name(name: &str) -> bool {
+    const PROJS: [&str; 8] = [
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "g_proj",
+        "o_proj",
+        "q_a_proj",
+        "kv_a_proj_with_mqa",
+        "kv_b_proj",
+    ];
+    name.rsplit_once(".self_attn.")
+        .and_then(|(_, p)| p.strip_suffix(".weight"))
+        .is_some_and(|p| PROJS.contains(&p))
+}
+
+fn allowed_qts(spec: &TensorSpec) -> &'static [u8] {
+    match spec.class {
         TensorClass::Embedding => &[QT_Q8F16, QT_BF16, QT_F16, QT_F32, QT_MQ4V2],
+        TensorClass::Proj if is_mq8_attn_name(&spec.name) => {
+            &[QT_MQ4V2, QT_Q8F16, QT_MQ8G256, QT_BF16, QT_F16, QT_F32]
+        }
         TensorClass::Proj => &[QT_MQ4V2, QT_Q8F16, QT_BF16, QT_F16, QT_F32],
         TensorClass::ExpertGate | TensorClass::ExpertUp | TensorClass::ExpertDown => &[QT_MQ4V2],
         TensorClass::Router | TensorClass::F32Vec | TensorClass::HostF32 => {
@@ -859,6 +885,7 @@ fn qt_name(qt: u8) -> &'static str {
         QT_Q8F16 => "Q8F16",
         QT_BF16 => "BF16",
         QT_MQ4V2 => "qt44/MQ4G256V2",
+        QT_MQ8G256 => "qt14/MQ8G256",
         _ => "other",
     }
 }
@@ -914,14 +941,14 @@ pub fn check_inventory(specs: &[TensorSpec], index: &[IndexEntry]) -> Result<(),
             ));
             continue;
         }
-        if !allowed_qts(s.class).contains(&e.quant_type) {
+        if !allowed_qts(s).contains(&e.quant_type) {
             bad.push(format!(
                 "{}: quant type {} ({}) not admitted for {:?} (allowed: {})",
                 s.name,
                 e.quant_type,
                 qt_name(e.quant_type),
                 s.class,
-                allowed_qts(s.class)
+                allowed_qts(s)
                     .iter()
                     .map(|q| qt_name(*q))
                     .collect::<Vec<_>>()
@@ -944,7 +971,7 @@ pub fn check_inventory(specs: &[TensorSpec], index: &[IndexEntry]) -> Result<(),
                 qt_name(e.quant_type)
             )),
             None => bad.push(format!(
-                "{}: {} cannot encode K={cols} (qt44 needs K%256==0, Q8F16 needs K%32==0)",
+                "{}: {} cannot encode K={cols} (qt44/qt14 need K%256==0, Q8F16 needs K%32==0)",
                 s.name,
                 qt_name(e.quant_type)
             )),
@@ -1201,7 +1228,6 @@ fn rows_weight_tensor(buf: GpuTensor, dtype: DType, m: usize, k: usize) -> Weigh
         m,
         k,
         row_stride: 0,
-        paro: None,
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
@@ -1320,6 +1346,53 @@ static BF16_FFN_TENSORS: AtomicUsize = AtomicUsize::new(0);
 static BF16_FFN_VALUES: AtomicUsize = AtomicUsize::new(0);
 static BF16_FFN_INEXACT: AtomicUsize = AtomicUsize::new(0);
 
+/// Counters of the MQ8G256 attention-class load (reported once per load, only when non-zero).
+static MQ8_ATTN_TENSORS: AtomicUsize = AtomicUsize::new(0);
+static MQ8_ATTN_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// qt14 `[m, k]` attention projection -> device layout B (`rdna_compute::mq8g256_repack_b`: an
+/// aligned f16 scale plane then the row-major int8 code plane, the same VRAM as the artifact's
+/// 258-B groups). The decode GEMV, the row-exact verify GEMV and the prefill GEMM all read layout
+/// B, so one copy of the weights is resident. Refused on an arch without the MQ8 kernels.
+fn load_mq8_attn(
+    gpu: &mut Gpu,
+    data: &[u8],
+    m: usize,
+    k: usize,
+    name: &str,
+) -> Result<WeightTensor, String> {
+    if !is_mq8_attn_name(name) {
+        return Err(format!(
+            "raon1_mini weights: {name}: qt14/MQ8G256 is only admitted for attention-class projections"
+        ));
+    }
+    if !gpu.mq8_prefill_supported(k) {
+        return Err(format!(
+            "raon1_mini weights: {name}: MQ8G256 attention tensors need gfx1200/gfx1201/gfx1100/gfx1151 \
+             (this device is {}) and K % 256 == 0 (K {k}); use the default Q8F16 artifact on this device",
+            gpu.arch
+        ));
+    }
+    let want = rdna_compute::mq8g256_a_bytes(m, k);
+    if data.len() != want {
+        return Err(format!(
+            "raon1_mini weights: {name}: MQ8G256 payload {} B, expected {want} B for {m}x{k}",
+            data.len()
+        ));
+    }
+    let packed = rdna_compute::mq8g256_repack_b(data, m, k);
+    let buf = gpu
+        .upload_raw(&packed, &[packed.len()])
+        .map_err(|e| format!("raon1_mini weights: upload {name}: {e:?}"))?;
+    // Verify graphs (up to `ROWS_EXACT_MAX` rows) quantize into the MQ8 activation scratch while
+    // capturing; growing it there is refused, so size it for the largest K at load.
+    gpu.mq8_reserve_x(k, crate::projection::ROWS_EXACT_MAX)
+        .map_err(|e| format!("raon1_mini weights: {name}: MQ8 activation scratch: {e:?}"))?;
+    MQ8_ATTN_TENSORS.fetch_add(1, Ordering::Relaxed);
+    MQ8_ATTN_BYTES.fetch_add(packed.len(), Ordering::Relaxed);
+    Ok(rows_weight_tensor(buf, DType::MQ8G256, m, k))
+}
+
 /// F16 little-endian image of a BF16 `[m, k]` weight (every BF16 value in the
 /// F16 normal range is exactly representable: 8 mantissa bits into 10) and the
 /// Q8F16 (`qt3`, 32-element blocks, f16 scale `amax/127`) decode copy of the
@@ -1379,6 +1452,7 @@ fn load_proj(
     k: usize,
 ) -> Result<(WeightTensor, Option<WeightTensor>), String> {
     let (mut wt, decode) = read_bytes(hfq, name, |info, data| match info.quant_type {
+        QT_MQ8G256 => load_mq8_attn(gpu, data, m, k, name).map(|w| (w, None)),
         qt @ (QT_MQ4V2 | QT_Q8F16) => dequant_weight_raw(gpu, qt, data, m, k, MemoryTarget::Device)
             .map(|w| (w, None))
             .map_err(|e| format!("raon1_mini weights: upload {name}: {e:?}")),
@@ -1725,7 +1799,6 @@ fn load_experts(
                 m: 2 * cfg.moe_inter,
                 k: cfg.hidden,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -1749,7 +1822,6 @@ fn load_experts(
                     m: cfg.hidden,
                     k: cfg.moe_down_k,
                     row_stride: 0,
-                    paro: None,
                     awq_scale: None,
                     lloyd_lut_e4m3: None,
                     lloyd_lut_f16: None,
@@ -2109,6 +2181,32 @@ pub fn load_raon_weights_band(
     cfg: &RaonConfig,
     band: &RaonBand,
 ) -> Result<RaonWeights, String> {
+    // The band's weight uploads are packed into slabs (`HIPFIRE_WEIGHT_SLAB`,
+    // else [`weight_slab_default`]); the scope seals them on success and on error.
+    gpu.weight_slab_scope_begin_with(weight_slab_default(&gpu.arch));
+    let loaded = load_raon_weights_band_unscoped(hfq, gpu, cfg, band);
+    gpu.weight_slab_scope_end();
+    loaded
+}
+
+/// Raon's weight-slab packing when `HIPFIRE_WEIGHT_SLAB` is unset: 16 MiB on
+/// gfx1100, the global default elsewhere. On the 24 GB 7900 XTX the 2 MiB
+/// policy leaves Raon's 2-16 MiB tensors at ROCr's 2 MiB rounding, and the
+/// expanded K/V mirror only gets what is left: 12,208 of 16,416 rows at
+/// `--max-seq 16416`, so every prefill chunk ending past it runs the absorbed
+/// route (39% of the pp16384 pass in the wide kernel). 16 MiB frees about
+/// 3.4 GiB and the mirror covers the reserved context; weight bytes and
+/// outputs are unchanged.
+pub fn weight_slab_default(arch: &str) -> Option<hip_bridge::SlabMode> {
+    (arch == "gfx1100").then_some(hip_bridge::SlabMode::Up16M)
+}
+
+fn load_raon_weights_band_unscoped(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    cfg: &RaonConfig,
+    band: &RaonBand,
+) -> Result<RaonWeights, String> {
     cfg.validate()?;
     if band.total != cfg.n_layers {
         return Err(format!(
@@ -2122,6 +2220,8 @@ pub fn load_raon_weights_band(
         band,
     );
     check_inventory(&specs, &index)?;
+    MQ8_ATTN_TENSORS.store(0, Ordering::Relaxed);
+    MQ8_ATTN_BYTES.store(0, Ordering::Relaxed);
     BF16_FFN_TENSORS.store(0, Ordering::Relaxed);
     BF16_FFN_VALUES.store(0, Ordering::Relaxed);
     BF16_FFN_INEXACT.store(0, Ordering::Relaxed);
@@ -2239,6 +2339,15 @@ pub fn load_raon_weights_band(
             "raon1_mini weights: loaded-but-unassembled tensors: {}",
             list_cap(&leftover)
         ));
+    }
+    let mq8_tensors = MQ8_ATTN_TENSORS.swap(0, Ordering::Relaxed);
+    let mq8_bytes = MQ8_ATTN_BYTES.swap(0, Ordering::Relaxed);
+    if mq8_tensors != 0 {
+        eprintln!(
+            "raon1_mini weights: attention-class MQ8G256 (qt14): {mq8_tensors} tensors, {mq8_bytes} device \
+             bytes resident in layout B (W8A8 on the rotated activation at every prefill/decode/verify \
+             site of these tensors, selected by the artifact; the prefill precision table does not apply)"
+        );
     }
     let bf16_tensors = BF16_FFN_TENSORS.swap(0, Ordering::Relaxed);
     if bf16_tensors != 0 {
@@ -2389,6 +2498,115 @@ mod tests {
     fn well_formed_artifact_passes() {
         let specs = tensor_inventory(&released());
         check_inventory(&specs, &good_index(&specs)).unwrap();
+    }
+
+    /// `good_index` with every attention-class projection of K % 256 == 0 stored qt14 (what
+    /// `hipfire quantize --raon-attn-mq8` writes); returns the number retyped.
+    fn retype_attn_mq8(specs: &[TensorSpec], idx: &mut [IndexEntry]) -> usize {
+        let mut n = 0;
+        for e in idx.iter_mut() {
+            let spec = specs.iter().find(|s| s.name == e.name).unwrap();
+            if spec.class != TensorClass::Proj || spec.shape.len() != 2 {
+                continue;
+            }
+            let (m, k) = (spec.shape[0], spec.shape[1]);
+            if k % 256 == 0 && is_mq8_attn_name(&spec.name) {
+                e.quant_type = QT_MQ8G256;
+                e.data_size = payload_bytes(QT_MQ8G256, m, k).unwrap();
+                n += 1;
+            }
+        }
+        n
+    }
+
+    #[test]
+    fn mq8_attention_artifact_passes_with_the_125_class_tensors() {
+        let specs = tensor_inventory(&released());
+        let mut idx = good_index(&specs);
+        // RDA q/k/v/g/o x 18 layers + MLA q_a/kv_a/kv_b/g/o x 7 layers.
+        assert_eq!(retype_attn_mq8(&specs, &mut idx), 18 * 5 + 7 * 5);
+        check_inventory(&specs, &idx).unwrap();
+        assert_eq!(payload_bytes(QT_MQ8G256, 5120, 2560), Some(5120 * 10 * 258));
+        assert_eq!(payload_bytes(QT_MQ8G256, 10240, 512), Some(10240 * 2 * 258));
+        assert_eq!(payload_bytes(QT_MQ8G256, 7680, 576), None);
+    }
+
+    #[test]
+    fn mq8_class_is_the_attention_projections_only() {
+        for n in [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "g_proj",
+            "o_proj",
+            "q_a_proj",
+            "kv_a_proj_with_mqa",
+            "kv_b_proj",
+        ] {
+            assert!(
+                is_mq8_attn_name(&format!("model.layers.3.self_attn.{n}.weight")),
+                "{n}"
+            );
+        }
+        for n in [
+            "model.layers.3.self_attn.q_b_proj.weight",
+            "model.layers.0.self_attn.f_a_proj.weight",
+            "model.layers.0.self_attn.f_b_proj.weight",
+            "model.layers.0.self_attn.b_proj.weight",
+            "model.layers.0.self_attn.rda_w_proj.weight",
+            "model.layers.0.mlp.gate_proj.weight",
+            "model.layers.1.moe.shared_experts.down_proj.weight",
+            "model.layers.1.moe.experts.0.gate_proj.weight",
+            "lm_head.weight",
+            "model.embed_tokens.weight",
+            "model.layers.3.self_attn.q_proj.bias",
+        ] {
+            assert!(!is_mq8_attn_name(n), "{n}");
+        }
+    }
+
+    #[test]
+    fn mq8_outside_the_attention_class_or_off_size_is_refused() {
+        let specs = tensor_inventory(&released());
+        for (name, k_ok) in [
+            ("lm_head.weight", true),
+            ("model.layers.0.mlp.gate_proj.weight", true),
+            ("model.layers.1.moe.shared_experts.gate_proj.weight", true),
+            ("model.layers.0.self_attn.f_b_proj.weight", false),
+            ("model.layers.3.self_attn.q_b_proj.weight", false),
+        ] {
+            let mut idx = good_index(&specs);
+            let e = idx.iter_mut().find(|e| e.name == name).unwrap();
+            e.quant_type = QT_MQ8G256;
+            if k_ok {
+                e.data_size = payload_bytes(QT_MQ8G256, e.shape[0], e.shape[1]).unwrap();
+            }
+            let err = check_inventory(&specs, &idx).unwrap_err();
+            assert!(err.contains(name), "{name}: {err}");
+        }
+        // Wrong payload size on an eligible tensor (a layout-B or Q8 sized blob).
+        let mut idx = good_index(&specs);
+        retype_attn_mq8(&specs, &mut idx);
+        idx.iter_mut()
+            .find(|e| e.name == "model.layers.0.self_attn.q_proj.weight")
+            .unwrap()
+            .data_size -= 2;
+        let err = check_inventory(&specs, &idx).unwrap_err();
+        assert!(
+            err.contains("payload") && err.contains("qt14/MQ8G256"),
+            "{err}"
+        );
+        // No AWQ sidecar on qt14.
+        let mut idx = good_index(&specs);
+        retype_attn_mq8(&specs, &mut idx);
+        idx.push(IndexEntry {
+            name: awq_sidecar_name("model.layers.0.self_attn.q_proj.weight"),
+            quant_type: QT_F16,
+            shape: vec![2560],
+            data_size: 2 * 2560,
+        });
+        let err = check_inventory(&specs, &idx).unwrap_err();
+        assert!(err.contains("AWQ sidecar on a qt14/MQ8G256"), "{err}");
     }
 
     fn names(specs: &[TensorSpec]) -> HashSet<&str> {

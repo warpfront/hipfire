@@ -39,20 +39,34 @@
 //! its own `Gpu`. Exit 0 and `PASS qsa_lanes_oracle ...` only if every case and
 //! every control pass; `--out DIR` writes `qsa_lanes_oracle.json`.
 //!
-//! `cargo run --release -p rdna-compute --features lab --example qsa_lanes_oracle -- [--out DIR] [--steps N] [--replays N] [--quick]`
+//! `cargo run --release -p rdna-compute --features lab --example qsa_lanes_oracle -- [--out DIR] [--steps N] [--replays N] [--quick] [--fuse] [--heads N]`
+//!
+//! `--fuse` (HcQsaFuse, `HIPFIRE_QWEN4_QSA_LANES_FUSE`): the candidate arm takes
+//! `QsaCoreLanesPlan::launch_fused` (prologue + pool + select, then attention + the
+//! out-projection's `mq_rotate_x`) for the one-row lane sets, and BOTH arms end the step with
+//! the out-projection's rotation of the lanes' outputs (`rotate_x_mq_batched` over the bank
+//! rows; on the candidate arm it must be skipped by the `scratch.prerotated` memo). The
+//! rotated rows (`rotated_output`) are compared as bytes next to every other tensor. Sets
+//! with a multi-row lane are not fusable and run the unfused grouped launches. `--heads N`
+//! overrides the 24 query heads (TrunkShard's 12q shape).
 
 use rdna_compute::rope::RopeYarn;
 use rdna_compute::tensor_ops::{
     indexed_attention_attention_batch_with_arena, indexed_attention_decode_prologue,
     indexed_attention_pool_rope_incremental, indexed_attention_select_batch_mirrored,
     qsa_core_lanes_min, IndexedAttentionAttentionBatch, IndexedAttentionDecodePrologue,
-    IndexedAttentionPoolRope, IndexedAttentionSelectBatch, QsaCoreLane, QsaKvFormat,
+    IndexedAttentionPoolRope, IndexedAttentionSelectBatch, QsaCoreLane, QsaKvFormat, QsaOutRotate,
     QsaPositionBinding,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-const NH: usize = 24;
+/// Query heads (`--heads`).
+static HEADS: AtomicUsize = AtomicUsize::new(24);
+fn nh() -> usize {
+    HEADS.load(Ordering::Relaxed)
+}
 const NKV: usize = 2;
 const HD: usize = 256;
 const IDX_HEADS: usize = 4;
@@ -67,9 +81,13 @@ const POOLED_CAP: usize = MAX_SEQ / COMPRESS;
 const ROW_BYTES: usize = NKV * (HD + 2);
 /// Index row: `[q (4 x 128) | k (1 x 128)]`.
 const IDXW: usize = (IDX_HEADS + 1) * IDX_DIM;
-const QGW: usize = 2 * NH * HD;
+fn qgw() -> usize {
+    2 * nh() * HD
+}
 const KVW: usize = NKV * HD;
-const OUTW: usize = NH * HD;
+fn outw() -> usize {
+    nh() * HD
+}
 /// Guard rows around the lanes' rows in every row scratch.
 const GUARD: usize = 2;
 /// Row scratch capacity in rows (8 lanes x 8 rows) beyond the guards.
@@ -196,6 +214,8 @@ struct Arm {
     k: GpuTensor,
     v: GpuTensor,
     out: GpuTensor,
+    /// The out-projection's rotation scratch (`--fuse`): the bank rows' FWHT.
+    xrot: GpuTensor,
     selected: GpuTensor,
 }
 
@@ -244,10 +264,11 @@ fn make_arm(gpu: &mut Gpu, host: &[LaneHost], weights: &[Vec<u8>; 4]) -> Arm {
             pool_norm: upload_typed(gpu, &weights[3], IDX_DIM, DType::BF16),
         },
         index: scratch(gpu, IDXW),
-        qgate: scratch(gpu, QGW),
+        qgate: scratch(gpu, qgw()),
         k: scratch(gpu, KVW),
         v: scratch(gpu, KVW),
-        out: scratch(gpu, OUTW),
+        out: scratch(gpu, outw()),
+        xrot: scratch(gpu, outw()),
         selected,
     }
 }
@@ -270,7 +291,7 @@ fn step_inputs(rng: &mut Rng, total_rows: usize) -> StepInputs {
     };
     StepInputs {
         index: fill(rng, IDXW),
-        qgate: fill(rng, QGW),
+        qgate: fill(rng, qgw()),
         k: fill(rng, KVW),
         v: fill(rng, KVW),
     }
@@ -313,10 +334,10 @@ fn views(arm: &Arm, s: &Spec) -> Views {
     let g = GUARD + s.row0;
     Views {
         index: arm.index.sub_offset(g * IDXW, s.rows * IDXW),
-        qgate: arm.qgate.sub_offset(g * QGW, s.rows * 2 * NH * HD),
+        qgate: arm.qgate.sub_offset(g * qgw(), s.rows * 2 * nh() * HD),
         k: arm.k.sub_offset(g * KVW, s.rows * KVW),
         v: arm.v.sub_offset(g * KVW, s.rows * KVW),
-        out: arm.out.sub_offset(g * OUTW, s.rows * OUTW),
+        out: arm.out.sub_offset(g * outw(), s.rows * outw()),
         selected: arm.selected.sub_offset(s.sel0 * CAP * 4, s.rows * CAP * 4),
     }
 }
@@ -356,7 +377,7 @@ fn core_lane<'a>(
             index_heads: IDX_HEADS,
             index_dim: IDX_DIM,
             index_kv_width: IDX_DIM,
-            heads: NH,
+            heads: nh(),
             kv_heads: NKV,
             head_dim: HD,
             position: pos,
@@ -404,7 +425,7 @@ fn core_lane<'a>(
             output: &v.out,
             rows,
             position_start: pos,
-            n_heads: NH,
+            n_heads: nh(),
             n_kv_heads: NKV,
             head_dim: HD,
             budget_blocks: BUDGET_BLOCKS,
@@ -415,6 +436,32 @@ fn core_lane<'a>(
             shape_selected: CAP,
         },
     }
+}
+
+/// `--fuse`: 0 = plain oracle; 1 = both arms end a step with the out-projection's rotation of
+/// the bank rows (unfused grouped launches + `rotate_x_mq_batched`); 2 = as 1 but the
+/// candidate takes the fused launches (rotation inside the second launch, memo consumed).
+static MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Both arms rotate the bank rows after the lanes.
+fn fuse_mode() -> bool {
+    MODE.load(Ordering::Relaxed) >= 1
+}
+
+/// The candidate arm takes `launch_fused` for the sets it admits.
+fn use_fused() -> bool {
+    MODE.load(Ordering::Relaxed) == 2
+}
+
+/// The out-projection's input and rotation scratch over the lanes' bank rows (lane `i`'s
+/// rows start at `row0`): the views `project_trunk` rotates between.
+fn bank(arm: &Arm, specs: &[Spec]) -> (GpuTensor, GpuTensor, usize) {
+    let rows: usize = specs.iter().map(|s| s.rows).sum();
+    (
+        arm.out.sub_offset(GUARD * outw(), rows * outw()),
+        arm.xrot.sub_offset(GUARD * outw(), rows * outw()),
+        rows,
+    )
 }
 
 /// Per-lane launches of one step; with `capture`, also each lane's selected
@@ -449,6 +496,14 @@ fn run_per_lane(gpu: &mut Gpu, arm: &Arm, specs: &[Spec], capture: bool) -> (Vec
             selected.push(gpu.download_raw_bytes(&v.selected).expect("selected"));
         }
     }
+    if fuse_mode() {
+        // The out-projection's rotation of the lanes' outputs (bank rows), as
+        // `project_trunk`'s `rotate_input` launches it.
+        let (x, x_rot, rows) = bank(arm, specs);
+        gpu.rotate_x_mq_batched(&x, &x_rot, outw(), rows)
+            .expect("rotate bank");
+        launches += 1;
+    }
     (selected, launches)
 }
 
@@ -462,6 +517,9 @@ enum Tamper {
     WrongPosition(usize),
     /// Lanes `a` and `b` launch on each other's scratch rows.
     SwapScratch(usize, usize),
+    /// One byte of lane `a`'s rotated row is flipped after the fused launch (`--fuse`
+    /// only): the rotation comparison alone must catch it.
+    CorruptRotation(usize),
 }
 
 /// Grouped launch of one step. `Ok(launches)`; `Err` when admission declined.
@@ -499,8 +557,58 @@ fn run_grouped(gpu: &mut Gpu, arm: &Arm, specs: &[Spec], tamper: Tamper) -> Resu
     let Some(plan) = qsa_core_lanes_min(gpu, &lanes, 1).map_err(|e| e.to_string())? else {
         return Err("qsa_core_lanes declined the set".into());
     };
-    let launches = plan.launch_count();
+    let rows: usize = specs.iter().map(|s| s.rows).sum();
+    if use_fused() && plan.fusable() {
+        // Two launches; the rotation is the second launch's epilogue and the
+        // out-projection's own `rotate_x_mq_batched` must then be a no-op.
+        let launches = plan.fused_launch_count();
+        let (x, x_rot, _) = bank(arm, specs);
+        let rotated = plan
+            .launch_fused(
+                gpu,
+                Some(&QsaOutRotate {
+                    x: &x,
+                    x_rot: &x_rot,
+                    rows,
+                }),
+            )
+            .map_err(|e| e.to_string())?;
+        if !rotated {
+            return Err("launch_fused did not fuse the rotation".into());
+        }
+        let key = (
+            x.buf.as_ptr() as usize,
+            x_rot.buf.as_ptr() as usize,
+            outw() * rows,
+        );
+        if gpu.scratch.prerotated != Some(key) {
+            return Err(format!(
+                "prerotated memo {:?} != {key:?}",
+                gpu.scratch.prerotated
+            ));
+        }
+        gpu.rotate_x_mq_batched(&x, &x_rot, outw(), rows)
+            .map_err(|e| e.to_string())?;
+        if gpu.scratch.prerotated.is_some() {
+            return Err("the out-projection rotation did not consume the memo".into());
+        }
+        if let Tamper::CorruptRotation(lane) = tamper {
+            let mut bytes = download(gpu, &arm.xrot);
+            bytes[(GUARD + specs[lane].row0) * outw() * 4 + 4097] ^= 0x10;
+            gpu.hip
+                .memcpy_htod(&arm.xrot.buf, &bytes)
+                .map_err(|e| e.to_string())?;
+        }
+        return Ok(launches);
+    }
+    let mut launches = plan.launch_count();
     plan.launch(gpu).map_err(|e| e.to_string())?;
+    if fuse_mode() {
+        let (x, x_rot, _) = bank(arm, specs);
+        gpu.rotate_x_mq_batched(&x, &x_rot, outw(), rows)
+            .map_err(|e| e.to_string())?;
+        launches += 1;
+    }
     Ok(launches)
 }
 
@@ -549,6 +657,7 @@ fn compare(
         ("k_scratch", &reference.k, &candidate.k),
         ("v_scratch", &reference.v, &candidate.v),
         ("qsa_output", &reference.out, &candidate.out),
+        ("rotated_output", &reference.xrot, &candidate.xrot),
     ] {
         check(what.to_string(), &download(gpu, a), &download(gpu, b));
     }
@@ -589,6 +698,9 @@ fn cases(quick: bool) -> Vec<Case> {
     let budget = vec![2043, 2044, 2047, 2048, 2051, 2100, 2101, 3000];
     let zero = vec![0, 1, 2, 3, 0, 1, 2, 3];
     let long = vec![3990, 3000, 2500, 1500, 1200, 3500, 3900, 4000];
+    // A few hundred tokens (around block / 256-token boundaries) and the ~4k edge.
+    let hundreds = vec![300, 255, 256, 257, 383, 384, 511, 512];
+    let deep = vec![4075, 4000, 3999, 3996, 3995, 3500, 4050, 4080];
     // Rows of lane `l`: uniform decode / verify windows and two ragged mixes.
     type RowsMode = (&'static str, fn(usize) -> usize);
     let rows_modes: [RowsMode; 6] = [
@@ -617,6 +729,8 @@ fn cases(quick: bool) -> Vec<Case> {
     if quick {
         add("mixed", &mixed, &[1, 2, 8], false, &[0, 1, 4]);
         add("budget", &budget, &[8], true, &[0, 3]);
+        add("hundreds", &hundreds, &[1, 8], false, &[0]);
+        add("deep", &deep, &[1, 8], false, &[0]);
     } else {
         add(
             "mixed",
@@ -632,6 +746,8 @@ fn cases(quick: bool) -> Vec<Case> {
         add("budget", &budget, &[8], true, &[0, 1, 4]);
         add("zero", &zero, &[2, 4, 8], false, &[0, 1, 4]);
         add("long", &long, &[2, 8], false, &[0, 3, 5]);
+        add("hundreds", &hundreds, &[1, 2, 3, 5, 8], false, &[0, 1, 4]);
+        add("deep", &deep, &[1, 2, 3, 5, 8], false, &[0, 1, 4]);
     }
     out
 }
@@ -670,6 +786,7 @@ fn free_arm(gpu: &mut Gpu, arm: Arm) {
         arm.k,
         arm.v,
         arm.out,
+        arm.xrot,
         arm.selected,
     ] {
         let _ = gpu.free_tensor(t);
@@ -790,9 +907,12 @@ fn run_control(gpu: &mut Gpu, name: &str, tamper: Tamper, seed: u64) -> ControlR
 struct Timing {
     ctx: usize,
     per_lane_us: f64,
+    /// Unfused grouped launches (+ the rotation under `--fuse`).
     grouped_us: f64,
     per_lane_launches: usize,
     grouped_launches: usize,
+    /// `--fuse`: the fused launches; `(us, launches)`.
+    fused: Option<(f64, usize)>,
 }
 
 fn time_us(gpu: &mut Gpu, replays: usize, mut body: impl FnMut(&mut Gpu)) -> f64 {
@@ -811,7 +931,9 @@ fn time_us(gpu: &mut Gpu, replays: usize, mut body: impl FnMut(&mut Gpu)) -> f64
 }
 
 /// N = 8 one-row lanes around `ctx`: event time per replay of the per-lane
-/// step vs the grouped step. A replay re-runs the same step at the same
+/// step vs the grouped step (vs the fused step under `--fuse`: per-lane and
+/// grouped then include the out-projection's rotation launch), the median of
+/// three alternating rounds. A replay re-runs the same step at the same
 /// positions (idempotent: same inputs, same bytes).
 fn run_timing(gpu: &mut Gpu, ctx: usize, replays: usize) -> Timing {
     let ctxs: Vec<usize> = (0..8).map(|l| ctx + l).collect();
@@ -826,21 +948,45 @@ fn run_timing(gpu: &mut Gpu, ctx: usize, replays: usize) -> Timing {
     let inputs = step_inputs(&mut rng, 8);
     upload_step(gpu, &arm, &inputs);
     let specs = specs_for(&rows, &ctxs);
+    let mode = MODE.load(Ordering::Relaxed);
+    let median = |mut v: Vec<f64>| {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v[v.len() / 2]
+    };
     let (_, per_lane_launches) = run_per_lane(gpu, &arm, &specs, false);
+    MODE.store(mode.min(1), Ordering::Relaxed);
     let grouped_launches = run_grouped(gpu, &arm, &specs, Tamper::None).expect("grouped");
-    let per_lane_us = time_us(gpu, replays, |gpu| {
-        run_per_lane(gpu, &arm, &specs, false);
-    });
-    let grouped_us = time_us(gpu, replays, |gpu| {
-        run_grouped(gpu, &arm, &specs, Tamper::None).expect("grouped");
-    });
+    let fused_launches = if mode == 2 {
+        MODE.store(2, Ordering::Relaxed);
+        Some(run_grouped(gpu, &arm, &specs, Tamper::None).expect("fused"))
+    } else {
+        None
+    };
+    let (mut per_lane, mut grouped, mut fused) = (Vec::new(), Vec::new(), Vec::new());
+    for _ in 0..3 {
+        MODE.store(mode.min(1), Ordering::Relaxed);
+        per_lane.push(time_us(gpu, replays, |gpu| {
+            run_per_lane(gpu, &arm, &specs, false);
+        }));
+        grouped.push(time_us(gpu, replays, |gpu| {
+            run_grouped(gpu, &arm, &specs, Tamper::None).expect("grouped");
+        }));
+        if mode == 2 {
+            MODE.store(2, Ordering::Relaxed);
+            fused.push(time_us(gpu, replays, |gpu| {
+                run_grouped(gpu, &arm, &specs, Tamper::None).expect("fused");
+            }));
+        }
+    }
+    MODE.store(mode, Ordering::Relaxed);
     free_arm(gpu, arm);
     Timing {
         ctx,
-        per_lane_us,
-        grouped_us,
+        per_lane_us: median(per_lane),
+        grouped_us: median(grouped),
         per_lane_launches,
         grouped_launches,
+        fused: fused_launches.map(|n| (median(fused), n)),
     }
 }
 
@@ -849,6 +995,8 @@ fn main() {
     let mut steps = 5usize;
     let mut replays = 50usize;
     let mut quick = false;
+    let mut timing_only = false;
+    let mut ctxs: Vec<usize> = vec![64, 300, 1024, 2100, 4000];
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -861,6 +1009,20 @@ fn main() {
                     .expect("--replays N")
             }
             "--quick" => quick = true,
+            "--timing-only" => timing_only = true,
+            "--ctxs" => {
+                ctxs = args
+                    .next()
+                    .expect("--ctxs a,b,c")
+                    .split(',')
+                    .map(|v| v.parse().expect("--ctxs a,b,c"))
+                    .collect()
+            }
+            "--fuse" => MODE.store(2, Ordering::Relaxed),
+            "--heads" => HEADS.store(
+                args.next().and_then(|v| v.parse().ok()).expect("--heads N"),
+                Ordering::Relaxed,
+            ),
             other => {
                 eprintln!("qsa_lanes_oracle: unknown argument {other}");
                 std::process::exit(2);
@@ -881,7 +1043,11 @@ fn main() {
 
     let mut failures = 0usize;
     let mut case_json = Vec::new();
-    let all = cases(quick);
+    let all = if timing_only {
+        Vec::new()
+    } else {
+        cases(quick)
+    };
     println!("{} cases x {steps} steps", all.len());
     for (i, case) in all.iter().enumerate() {
         let r = run_case(&mut gpu, case, steps, 0x5153_4100 + i as u64);
@@ -918,11 +1084,17 @@ fn main() {
         }));
     }
 
-    let controls = [
+    let mut controls = vec![
         ("swap-state(0,6)", Tamper::SwapState(0, 6)),
         ("wrong-position(3)", Tamper::WrongPosition(3)),
         ("swap-scratch(1,2)", Tamper::SwapScratch(1, 2)),
     ];
+    if fuse_mode() {
+        controls.push(("corrupt-rotation(5)", Tamper::CorruptRotation(5)));
+    }
+    if timing_only {
+        controls.clear();
+    }
     let mut control_json = Vec::new();
     let mut controls_ok = true;
     for (i, (name, tamper)) in controls.iter().enumerate() {
@@ -938,7 +1110,7 @@ fn main() {
     }
 
     let mut timing_json = Vec::new();
-    for ctx in [64usize, 1024, 2100] {
+    for &ctx in &ctxs {
         let t = run_timing(&mut gpu, ctx, replays);
         println!(
             "timing N=8 ctx~{}: per-lane {:.1} us ({} launches) vs grouped {:.1} us ({} launches), {:.2}x",
@@ -949,6 +1121,13 @@ fn main() {
             t.grouped_launches,
             t.per_lane_us / t.grouped_us
         );
+        if let Some((us, n)) = t.fused {
+            println!(
+                "  fused: {us:.1} us ({n} launches), {:.2}x vs grouped, saves {:.1} us/layer",
+                t.grouped_us / us,
+                t.grouped_us - us
+            );
+        }
         timing_json.push(serde_json::json!({
             "ctx": t.ctx,
             "lanes": 8,
@@ -957,6 +1136,8 @@ fn main() {
             "grouped_us": t.grouped_us,
             "per_lane_launches": t.per_lane_launches,
             "grouped_launches": t.grouped_launches,
+            "fused_us": t.fused.map(|f| f.0),
+            "fused_launches": t.fused.map(|f| f.1),
         }));
     }
 

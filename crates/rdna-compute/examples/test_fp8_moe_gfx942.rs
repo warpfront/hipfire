@@ -48,9 +48,47 @@
 //!    alternating event-timed launches into reused buffers, whole-Y raw-bit
 //!    mismatch counts, JSON with source/object/compiler hashes.
 //!
+//! 7. `--anchor ANCHOR.co --twin TWIN.hxaco` (exact-image byte oracle of a sealed
+//!    PeaceMaker twin; needs `--receipt-out`, runs on the MI300X only): the
+//!    retained-reference-vs-production comparison is NOT used. Instead the
+//!    hipcc anchor object and the twin bundle are read as exact files, their
+//!    gfx942 device ELFs are loaded with `hipModuleLoadData`
+//!    (`gpu.hip.module_load_data`) and the three kernels
+//!    `gemm_fp8b128_moe_grouped_bf16mfma` (F32 x),
+//!    `gemm_fp8b128_moe_grouped_bf16mfma_xbf16` and
+//!    `gemm_fp8b128_moe_tile_desc_pad16` are launched from both images with the
+//!    production kernarg layout (`launch_kernel_blob`, 64 B / 20 B). The whole
+//!    existing case list runs with the anchor as the byte baseline and the twin as
+//!    the candidate: decode identity (+ `--fixtures` real checkpoint experts),
+//!    both Qwen4 gate_up/down cases (F64 bound, padded/compact/skipped tiles,
+//!    M-invariance, tile positions, tile-descriptor builder), and every case of
+//!    `--byte-identity` (tail shapes, finite-FP8 / BF16 edge / cancellation /
+//!    Zipf-route / target-route cases); every grouped launch is executed on both
+//!    images for BOTH X dtypes and the raw F32 bits of the WHOLE Y (live,
+//!    padding, skipped-tile and guard rows) must be identical. External mode adds
+//!    NaN/Inf cases (E4M3 NaN codes, +/-Inf and NaN-payload scales, +/-Inf / NaN
+//!    X rows, each at gate_up/down and tail shapes) and 14 tile-descriptor sizes
+//!    (1..4097 tiles, ids -1/0/INT_MIN/INT_MAX/random) compared byte-for-byte
+//!    over the descriptor buffer plus a poisoned guard. Positive controls run
+//!    first (a perturbed X / tile id must change the compared bytes, else exit 2).
+//!    The JSON receipt (`--receipt-out`) is bound to the SHA-256 of both input
+//!    files and of both device ELFs, with per-case and per-kernel coverage; its
+//!    top-level fields are the `gpu_oracle` schema of `twin.json`. Exit 0 = all
+//!    pass, 1 = any mismatch/failed check (receipt still written, status FAIL),
+//!    2 = usage / load / harness error (no receipt claim).
+//!
+//!    Without `--fixtures` the real-checkpoint expert cases are not run; the
+//!    receipt then records `real_fixture.used = false`. Fixture layout (`mkfix.py`):
+//!    `codes256.scales`, `codes256.ref`, `gateup.blk`, `gateup.ref`, `down.blk`,
+//!    `down.ref` under DIR.
+//!
 //! Run: `cargo run --release -p rdna-compute --features lab --example test_fp8_moe_gfx942 -- [--fixtures DIR] [--byte-identity]`
 //! Time: `... -- --time [--time-out PATH.json] [--time-tokens 1,16,512,2048] [--time-shapes gate_up,down] [--time-xdt f32|bf16|both]`
+//! External: `... -- --anchor kernels/gemm_fp8b128_moe_grouped_bf16mfma_hipcc_gfx942.co --twin kernels/gemm_fp8b128_moe_grouped_bf16mfma_pm_gfx942.hxaco --receipt-out RECEIPT.json [--fixtures DIR] [--device N] [--expect-anchor-sha256 HEX] [--expect-twin-sha256 HEX]`
 
+use hip_bridge::{KernargBlob, Module};
+use peacemaker_ir::envelope::Bundle;
+use peacemaker_lift::bundle::BundleCodec;
 use rdna_compute::fp8_e4m3::{
     b128_block_stride, b128_scale_count, bf16_to_f32, dequant_b128_block,
 };
@@ -184,6 +222,9 @@ struct Launch<'a> {
     /// baseline and compared bit-for-bit.
     ab: Option<&'a Ab>,
     tag: &'a str,
+    /// `--anchor/--twin`: launch the two exact external images instead of the
+    /// production entry (candidate = twin) and the retained P1 baseline (anchor).
+    ext: Option<&'a External>,
 }
 
 type Tile = [i32; 4]; // {expert, row0, nrows, 0}
@@ -209,50 +250,65 @@ impl Launch<'_> {
             .upload_f32(&vec![POISON; n * self.ex.r], &[n * self.ex.r])
             .expect("y");
         let x = if bf16_x { self.x_bf16 } else { self.x_f32 };
-        let mut dev = gpu.try_gfx942().expect("exact gfx942");
-        let res = if reference {
-            dev.gemm_fp8b128_moe_grouped_bf16mfma_reference(
-                self.d_payload,
-                stride,
-                self.ex.n,
+        if let Some(ext) = self.ext {
+            ext.grouped(
+                gpu,
+                reference,
+                self,
+                x,
                 &d_tiles,
                 tiles.len(),
                 &d_rows,
-                x,
-                self.x_row_div,
-                self.x_rows,
                 &y,
                 n,
-                self.ex.r,
-                self.ex.k,
             )
+            .unwrap_or_else(|e| panic!("{e}"));
         } else {
-            dev.gemm_fp8b128_moe_grouped_bf16mfma(
-                self.d_payload,
-                stride,
-                self.ex.n,
-                &d_tiles,
-                tiles.len(),
-                &d_rows,
-                x,
-                self.x_row_div,
-                self.x_rows,
-                &y,
-                n,
-                self.ex.r,
-                self.ex.k,
-            )
-        };
-        res.unwrap_or_else(|e| {
-            panic!(
-                "{}: {e:?}",
-                if reference {
-                    "gemm_fp8b128_moe_grouped_bf16mfma_reference"
-                } else {
-                    "gemm_fp8b128_moe_grouped_bf16mfma"
-                }
-            )
-        });
+            let mut dev = gpu.try_gfx942().expect("exact gfx942");
+            let res = if reference {
+                dev.gemm_fp8b128_moe_grouped_bf16mfma_reference(
+                    self.d_payload,
+                    stride,
+                    self.ex.n,
+                    &d_tiles,
+                    tiles.len(),
+                    &d_rows,
+                    x,
+                    self.x_row_div,
+                    self.x_rows,
+                    &y,
+                    n,
+                    self.ex.r,
+                    self.ex.k,
+                )
+            } else {
+                dev.gemm_fp8b128_moe_grouped_bf16mfma(
+                    self.d_payload,
+                    stride,
+                    self.ex.n,
+                    &d_tiles,
+                    tiles.len(),
+                    &d_rows,
+                    x,
+                    self.x_row_div,
+                    self.x_rows,
+                    &y,
+                    n,
+                    self.ex.r,
+                    self.ex.k,
+                )
+            };
+            res.unwrap_or_else(|e| {
+                panic!(
+                    "{}: {e:?}",
+                    if reference {
+                        "gemm_fp8b128_moe_grouped_bf16mfma_reference"
+                    } else {
+                        "gemm_fp8b128_moe_grouped_bf16mfma"
+                    }
+                )
+            });
+        }
         gpu.hip.device_synchronize().expect("sync");
         let out = gpu.download_f32(&y).expect("download y");
         for t in [y, d_rows, d_tiles] {
@@ -334,22 +390,36 @@ struct Ab {
     values: Cell<u64>,
     mismatched: Cell<u64>,
     first: RefCell<Vec<String>>,
+    /// Compared launches / values / mismatched values per X dtype entry
+    /// (`[f32-x, bf16-x]`; the receipt of the external oracle reports them per kernel).
+    kind_launches: [Cell<u64>; 2],
+    kind_values: [Cell<u64>; 2],
+    kind_bad: [Cell<u64>; 2],
+    /// External oracle: baseline = exact hipcc anchor image, candidate = exact twin image.
+    external: bool,
 }
 
 impl Ab {
-    fn new() -> Self {
+    fn new(ext: Option<&External>) -> Self {
         Ab {
             launches: Cell::new(0),
             values: Cell::new(0),
             mismatched: Cell::new(0),
             first: RefCell::new(Vec::new()),
+            kind_launches: Default::default(),
+            kind_values: Default::default(),
+            kind_bad: Default::default(),
+            external: ext.is_some(),
         }
     }
 
     fn compare(&self, tag: &str, what: &str, base: &[f32], cand: &[f32], r: usize) {
+        let kind = (what == "bf16-x") as usize;
+        let n = base.len().max(cand.len()) as u64;
         self.launches.set(self.launches.get() + 1);
-        self.values
-            .set(self.values.get() + base.len().max(cand.len()) as u64);
+        self.values.set(self.values.get() + n);
+        self.kind_launches[kind].set(self.kind_launches[kind].get() + 1);
+        self.kind_values[kind].set(self.kind_values[kind].get() + n);
         let mut bad = base.len().abs_diff(cand.len()) as u64;
         let mut first = None;
         for (i, (b, c)) in base.iter().zip(cand).enumerate() {
@@ -360,6 +430,7 @@ impl Ab {
         }
         if bad > 0 {
             self.mismatched.set(self.mismatched.get() + bad);
+            self.kind_bad[kind].set(self.kind_bad[kind].get() + bad);
             let mut f = self.first.borrow_mut();
             if f.len() < 8 {
                 f.push(match first {
@@ -374,12 +445,17 @@ impl Ab {
         }
     }
 
-    fn check(&self, fail: &mut Fail, name: &str) {
+    fn check(&self, fail: &mut Fail, name: &str, ext: Option<&External>) {
         let mm = self.mismatched.get();
+        let pair = if self.external {
+            "hipcc anchor image == PM twin image"
+        } else {
+            "retained P1 baseline == candidate"
+        };
         fail.check(
             mm == 0,
             format!(
-                "{name}: byte A/B retained P1 baseline == candidate, raw F32 bits incl. padding/skipped/guard sentinel rows, both X dtypes ({} compared launches, {} values, {mm} mismatched)",
+                "{name}: byte A/B {pair}, raw F32 bits incl. padding/skipped/guard sentinel rows, both X dtypes ({} compared launches, {} values, {mm} mismatched)",
                 self.launches.get(),
                 self.values.get()
             ),
@@ -387,6 +463,523 @@ impl Ab {
         for line in self.first.borrow().iter() {
             println!("  first mismatch: {line}");
         }
+        if let Some(ext) = ext {
+            ext.record_ab_case(name, self);
+        }
+    }
+}
+
+// ── External exact-image oracle (`--anchor` / `--twin`) ──────────────────
+
+const EXT_SYMBOLS: [&str; 3] = [
+    "gemm_fp8b128_moe_grouped_bf16mfma",
+    "gemm_fp8b128_moe_grouped_bf16mfma_xbf16",
+    "gemm_fp8b128_moe_tile_desc_pad16",
+];
+const EXT_TILE_DESC: usize = 2;
+const EXT_DEVICE_TRIPLE: &str = "hipv4-amdgcn-amd-amdhsa--gfx942";
+const EXT_EF_MACH_GFX942: u32 = 0x4c;
+/// Output rows per workgroup of the production launch geometry (grid.x = ceil(r / 64)).
+const EXT_ROWS_PER_WG: usize = 64;
+/// Poisoned bytes compared past the end of every tile-descriptor buffer.
+const TILE_GUARD: usize = 256;
+const FIXTURE_FILES: [&str; 6] = [
+    "codes256.scales",
+    "codes256.ref",
+    "gateup.blk",
+    "gateup.ref",
+    "down.blk",
+    "down.ref",
+];
+
+/// Exit 2: usage / load / harness error (never a byte verdict).
+fn die(msg: &str) -> ! {
+    eprintln!("test_fp8_moe_gfx942: {msg}");
+    std::process::exit(2)
+}
+
+/// The gfx942 device ELF of `bytes`: the bytes themselves when they are a bare
+/// ELF, else the single `hipv4-amdgcn-amd-amdhsa--gfx942` entry of the offload bundle.
+fn ext_device_image<'a>(bytes: &'a [u8], label: &str) -> Result<&'a [u8], String> {
+    let elf: &[u8] = if Bundle::is_bundle(bytes) {
+        let (bundle, payloads) =
+            Bundle::read(bytes).map_err(|e| format!("{label}: bundle: {e}"))?;
+        let hits: Vec<usize> = bundle
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| {
+                e.triple
+                    .strip_prefix(EXT_DEVICE_TRIPLE)
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with(':'))
+            })
+            .map(|(i, _)| i)
+            .collect();
+        match hits[..] {
+            [i] => payloads[i],
+            _ => {
+                return Err(format!(
+                    "{label}: bundle has {} `{EXT_DEVICE_TRIPLE}` entries (want 1); entries {:?}",
+                    hits.len(),
+                    bundle.entries.iter().map(|e| &e.triple).collect::<Vec<_>>()
+                ))
+            }
+        }
+    } else {
+        bytes
+    };
+    if elf.len() < 64 || &elf[..4] != b"\x7fELF" || elf[4] != 2 || elf[5] != 1 {
+        return Err(format!(
+            "{label}: device image is not a 64-bit little-endian ELF"
+        ));
+    }
+    let machine = u16::from_le_bytes([elf[18], elf[19]]);
+    let flags = u32::from_le_bytes([elf[48], elf[49], elf[50], elf[51]]);
+    if machine != 224 || flags & 0xff != EXT_EF_MACH_GFX942 {
+        return Err(format!(
+            "{label}: device image is not an AMDGPU gfx942 code object (e_machine {machine}, e_flags {flags:#x})"
+        ));
+    }
+    Ok(elf)
+}
+
+/// One exact input file, loaded as its own HIP module with the three entries bound.
+struct ExtImage {
+    label: &'static str,
+    path: String,
+    file_sha: String,
+    elf_sha: String,
+    elf_bytes: usize,
+    _module: Module,
+}
+
+impl ExtImage {
+    fn load(
+        gpu: &Gpu,
+        label: &'static str,
+        path: &str,
+        expect: Option<&str>,
+    ) -> Result<Self, String> {
+        let raw = std::fs::read(path).map_err(|e| format!("{label} {path}: {e}"))?;
+        let file_sha = sha_hex(&[raw.as_slice()]);
+        if let Some(want) = expect {
+            let want = want.split_whitespace().next().unwrap_or("");
+            if !want.eq_ignore_ascii_case(&file_sha) {
+                return Err(format!(
+                    "{label} {path}: sha256 {file_sha} != expected {want}"
+                ));
+            }
+        }
+        let elf = ext_device_image(&raw, label)?;
+        let module = gpu
+            .hip
+            .module_load_data(elf)
+            .map_err(|e| format!("{label}: hipModuleLoadData: {e}"))?;
+        Ok(ExtImage {
+            label,
+            path: path.to_owned(),
+            file_sha,
+            elf_sha: sha_hex(&[elf]),
+            elf_bytes: elf.len(),
+            _module: module,
+        })
+    }
+}
+
+/// The two exact images plus the coverage the receipt reports.
+struct External {
+    anchor: ExtImage,
+    twin: ExtImage,
+    /// Compared anchor-vs-twin launches / values / mismatches per [`EXT_SYMBOLS`] entry.
+    launches: [Cell<u64>; 3],
+    values: [Cell<u64>; 3],
+    mismatched: [Cell<u64>; 3],
+    cases: RefCell<Vec<serde_json::Value>>,
+}
+
+impl External {
+    fn load(
+        gpu: &Gpu,
+        anchor: &str,
+        twin: &str,
+        expect_anchor: Option<&str>,
+        expect_twin: Option<&str>,
+    ) -> Result<Self, String> {
+        let a = ExtImage::load(gpu, "anchor", anchor, expect_anchor)?;
+        let t = ExtImage::load(gpu, "twin", twin, expect_twin)?;
+        if a.file_sha == t.file_sha {
+            return Err(format!(
+                "anchor {anchor} and twin {twin} are the same file ({}); an image compared with itself proves nothing",
+                a.file_sha
+            ));
+        }
+        Ok(External {
+            anchor: a,
+            twin: t,
+            launches: Default::default(),
+            values: Default::default(),
+            mismatched: Default::default(),
+            cases: RefCell::new(Vec::new()),
+        })
+    }
+
+    fn image(&self, anchor: bool) -> &ExtImage {
+        if anchor {
+            &self.anchor
+        } else {
+            &self.twin
+        }
+    }
+
+    /// One grouped launch of `l`'s experts/X from the anchor (`anchor`) or the twin image,
+    /// with the production kernarg layout (`W, expert_stride, tile_desc, sorted_rows, X, Y,
+    /// R, K, x_row_div, n_exp`: 64 bytes) and geometry (`[ceil(r/64), n_tiles]`, 256 threads).
+    /// The entry follows the dtype of `x` (F32 -> F32-x symbol, BF16 -> `_xbf16`).
+    #[allow(clippy::too_many_arguments)]
+    fn grouped(
+        &self,
+        gpu: &mut Gpu,
+        anchor: bool,
+        l: &Launch,
+        x: &GpuTensor,
+        d_tiles: &GpuTensor,
+        n_tiles: usize,
+        d_rows: &GpuTensor,
+        y: &GpuTensor,
+        n_sorted: usize,
+    ) -> Result<(), String> {
+        let (r, k) = (l.ex.r, l.ex.k);
+        let stride = b128_block_stride(r, k).ok_or("block stride overflows")?;
+        let (idx, x_elem) = match x.dtype {
+            DType::F32 => (0usize, 4usize),
+            DType::BF16 => (1, 2),
+            other => return Err(format!("x must be F32 or BF16, got {other:?}")),
+        };
+        if r == 0 || r % 16 != 0 || k == 0 || k % 128 != 0 || l.x_row_div == 0 {
+            return Err(format!(
+                "needs r % 16 == 0, k % 128 == 0, x_row_div >= 1 (r={r} k={k} x_row_div={})",
+                l.x_row_div
+            ));
+        }
+        for (what, have, need) in [
+            ("w", l.d_payload.buf.size(), l.ex.n * stride),
+            ("tile_desc", d_tiles.buf.size(), n_tiles * 16),
+            ("sorted_rows", d_rows.buf.size(), n_sorted * 4),
+            ("x", x.buf.size(), l.x_rows * k * x_elem),
+            ("y", y.buf.size(), n_sorted * r * 4),
+        ] {
+            if have < need {
+                return Err(format!(
+                    "external grouped {what}: buffer holds {have} bytes, the launch needs {need}"
+                ));
+            }
+        }
+        if n_tiles == 0 {
+            return Ok(());
+        }
+        gpu.bind_thread().map_err(|e| format!("bind_thread: {e}"))?;
+        let mut blob = KernargBlob::new();
+        blob.push_ptr(l.d_payload.buf.as_ptr());
+        blob.push_u64(stride as u64);
+        blob.push_ptr(d_tiles.buf.as_ptr());
+        blob.push_ptr(d_rows.buf.as_ptr());
+        blob.push_ptr(x.buf.as_ptr());
+        blob.push_ptr(y.buf.as_ptr());
+        blob.push_i32(r as i32);
+        blob.push_i32(k as i32);
+        blob.push_i32(l.x_row_div as i32);
+        blob.push_i32(i32::try_from(l.ex.n).map_err(|_| "n_exp exceeds i32".to_string())?);
+        assert_eq!(blob.len(), 64, "grouped kernarg image is 64 bytes");
+        let img = self.image(anchor);
+        let function = if idx == 0 {
+            gpu.hip
+                .module_get_function(&img._module, "gemm_fp8b128_moe_grouped_bf16mfma")
+        } else {
+            gpu.hip
+                .module_get_function(&img._module, "gemm_fp8b128_moe_grouped_bf16mfma_xbf16")
+        }
+        .map_err(|e| format!("external grouped entry: {e}"))?;
+        // SAFETY: `blob` is the kernel's full explicit kernarg image; every pointer in it is a
+        // live tensor of this harness whose span was checked above, and the caller synchronizes
+        // before reading `y` or freeing any operand.
+        unsafe {
+            gpu.hip.launch_kernel_blob(
+                &function,
+                [r.div_ceil(EXT_ROWS_PER_WG) as u32, n_tiles as u32, 1],
+                [256, 1, 1],
+                0,
+                gpu.active_stream.as_ref(),
+                blob.as_mut_slice(),
+            )
+        }
+        .map_err(|e| format!("{} {}: {e}", img.label, EXT_SYMBOLS[idx]))
+    }
+
+    /// `gemm_fp8b128_moe_tile_desc_pad16` of one image: `tile_desc[t] = {ids[t], 16 t, 16, 0}`
+    /// (kernarg `tile_ids, tile_desc, n_tiles`: 20 bytes; grid `ceil(n/256)`, 256 threads).
+    fn tile_desc(
+        &self,
+        gpu: &mut Gpu,
+        anchor: bool,
+        ids: &GpuTensor,
+        desc: &GpuTensor,
+        n_tiles: usize,
+    ) -> Result<(), String> {
+        if ids.buf.size() < n_tiles * 4 || desc.buf.size() < n_tiles * 16 {
+            return Err("external tile_desc buffers too small".into());
+        }
+        gpu.bind_thread().map_err(|e| format!("bind_thread: {e}"))?;
+        let mut blob = KernargBlob::new();
+        blob.push_ptr(ids.buf.as_ptr());
+        blob.push_ptr(desc.buf.as_ptr());
+        blob.push_i32(n_tiles as i32);
+        assert_eq!(blob.len(), 20, "tile_desc kernarg image is 20 bytes");
+        let img = self.image(anchor);
+        let function = gpu
+            .hip
+            .module_get_function(&img._module, "gemm_fp8b128_moe_tile_desc_pad16")
+            .map_err(|e| format!("external descriptor entry: {e}"))?;
+        // SAFETY: as in `grouped`; both buffers are live and span-checked.
+        unsafe {
+            gpu.hip.launch_kernel_blob(
+                &function,
+                [n_tiles.div_ceil(256) as u32, 1, 1],
+                [256, 1, 1],
+                0,
+                gpu.active_stream.as_ref(),
+                blob.as_mut_slice(),
+            )
+        }
+        .map_err(|e| format!("{} {}: {e}", img.label, EXT_SYMBOLS[EXT_TILE_DESC]))
+    }
+
+    /// Whole descriptor buffer of one image (`n * 16` bytes plus a 0xEE-poisoned guard).
+    fn tile_desc_bytes(&self, gpu: &mut Gpu, anchor: bool, ids: &[i32]) -> Vec<u8> {
+        let n = ids.len();
+        let d_ids = upload_i32(gpu, ids);
+        let d_desc = upload_bytes(gpu, &vec![0xEEu8; n * 16 + TILE_GUARD]);
+        self.tile_desc(gpu, anchor, &d_ids, &d_desc, n)
+            .unwrap_or_else(|e| panic!("{e}"));
+        gpu.hip.device_synchronize().expect("sync");
+        let out = gpu.download_raw_bytes(&d_desc).expect("download desc");
+        for t in [d_desc, d_ids] {
+            gpu.free_tensor(t).ok();
+        }
+        out
+    }
+
+    /// Anchor vs twin descriptor buffers over `ids`: every byte (guard included) identical and
+    /// both equal to the host descriptors.
+    fn tile_desc_case(&self, gpu: &mut Gpu, fail: &mut Fail, name: &str, ids: &[i32]) {
+        let n = ids.len();
+        let want: Vec<u8> = ids
+            .iter()
+            .enumerate()
+            .flat_map(|(t, &id)| [id, 16 * t as i32, 16, 0])
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let a = self.tile_desc_bytes(gpu, true, ids);
+        let t = self.tile_desc_bytes(gpu, false, ids);
+        let bad = a.iter().zip(&t).filter(|(x, y)| x != y).count() + a.len().abs_diff(t.len());
+        let live_ok = a.len() >= n * 16
+            && t.len() >= n * 16
+            && a[..n * 16] == want[..]
+            && t[..n * 16] == want[..];
+        let guard_ok = a.len() >= n * 16
+            && t.len() >= n * 16
+            && a[n * 16..].iter().chain(&t[n * 16..]).all(|&b| b == 0xEE);
+        let words = (a.len().max(t.len()) / 4) as u64;
+        self.launches[EXT_TILE_DESC].set(self.launches[EXT_TILE_DESC].get() + 1);
+        self.values[EXT_TILE_DESC].set(self.values[EXT_TILE_DESC].get() + words);
+        self.mismatched[EXT_TILE_DESC]
+            .set(self.mismatched[EXT_TILE_DESC].get() + (bad / 4 + (bad % 4 != 0) as usize) as u64);
+        let pass = bad == 0 && live_ok && guard_ok;
+        self.cases.borrow_mut().push(serde_json::json!({
+            "name": name,
+            "kernels": { (EXT_SYMBOLS[EXT_TILE_DESC]): {"compared_launches": 1, "values": words, "mismatched": bad} },
+            "mismatched_bytes": bad,
+            "pass": pass,
+        }));
+        fail.check(
+            pass,
+            format!("{name}: {} anchor == twin == host descriptors over {n} tiles + guard ({bad} differing bytes, live {live_ok}, guard {guard_ok})", EXT_SYMBOLS[EXT_TILE_DESC]),
+        );
+    }
+
+    /// Per-case coverage of one A/B block (both X dtype entries) for the receipt.
+    fn record_ab_case(&self, name: &str, ab: &Ab) {
+        let mut kernels = serde_json::Map::new();
+        for kind in 0..2 {
+            let (l, v, b) = (
+                ab.kind_launches[kind].get(),
+                ab.kind_values[kind].get(),
+                ab.kind_bad[kind].get(),
+            );
+            self.launches[kind].set(self.launches[kind].get() + l);
+            self.values[kind].set(self.values[kind].get() + v);
+            self.mismatched[kind].set(self.mismatched[kind].get() + b);
+            kernels.insert(
+                EXT_SYMBOLS[kind].to_string(),
+                serde_json::json!({"compared_launches": l, "values": v, "mismatched": b}),
+            );
+        }
+        self.cases.borrow_mut().push(serde_json::json!({
+            "name": name,
+            "kernels": kernels,
+            "mismatched_values": ab.mismatched.get(),
+            "pass": ab.mismatched.get() == 0,
+        }));
+    }
+
+    /// Every one of the three symbols has compared launches.
+    fn covered(&self) -> bool {
+        self.launches.iter().all(|c| c.get() > 0) && !self.cases.borrow().is_empty()
+    }
+
+    /// Positive controls: the comparators must see a one-element X difference (both X
+    /// dtype entries) and a one-id tile-descriptor difference, and the kernels must write
+    /// their output; otherwise the harness is blind (exit 2).
+    fn controls(&self, gpu: &mut Gpu) -> Result<serde_json::Value, String> {
+        let ex = Experts::synthetic(48, 256, 2, 0xc0a7_0001);
+        let xb = random_x(16, 256, 0xc0a7_0002);
+        let mut xp = xb.clone();
+        xp[0] = if xb[0] == 0x4000 { 0x4100 } else { 0x4000 };
+        let d_payload = upload_bytes(gpu, &ex.payload);
+        let (xf, xbf) = upload_x(gpu, &xb);
+        let (pf, pbf) = upload_x(gpu, &xp);
+        let clean = Launch {
+            ex: &ex,
+            d_payload: &d_payload,
+            x_row_div: 1,
+            x_rows: 16,
+            x_f32: &xf,
+            x_bf16: &xbf,
+            ab: None,
+            tag: "control",
+            ext: Some(self),
+        };
+        let pert = Launch {
+            x_f32: &pf,
+            x_bf16: &pbf,
+            ..clean
+        };
+        let (tiles, rows) = scatter(&vec![0usize; 16], 2, true);
+        let base = clean.raw(gpu, &tiles, &rows, false, true);
+        let same = clean.raw(gpu, &tiles, &rows, false, false);
+        let changed = pert.raw(gpu, &tiles, &rows, false, false);
+        let base_b = clean.raw(gpu, &tiles, &rows, true, true);
+        let changed_b = pert.raw(gpu, &tiles, &rows, true, false);
+        let wrote = base.iter().any(|v| v.to_bits() != POISON.to_bits())
+            && base_b.iter().any(|v| v.to_bits() != POISON.to_bits());
+        let sees_f32 = !bits_eq(&base, &changed);
+        let sees_bf16 = !bits_eq(&base_b, &changed_b);
+        let ids = [3, -1, 7, 0];
+        let mut ids2 = ids;
+        ids2[2] = 8;
+        let sees_tile =
+            self.tile_desc_bytes(gpu, true, &ids) != self.tile_desc_bytes(gpu, false, &ids2);
+        for t in [pbf, pf, xbf, xf, d_payload] {
+            gpu.free_tensor(t).ok();
+        }
+        let ctl = serde_json::json!({
+            "kernels_write_output": wrote,
+            "perturbed_x_detected_f32_entry": sees_f32,
+            "perturbed_x_detected_bf16_entry": sees_bf16,
+            "perturbed_tile_id_detected": sees_tile,
+            "clean_twin_equals_anchor_f32_entry": bits_eq(&base, &same),
+        });
+        if wrote && sees_f32 && sees_bf16 && sees_tile {
+            Ok(ctl)
+        } else {
+            Err(format!(
+                "positive controls did not fire, the byte comparison is blind: {ctl}"
+            ))
+        }
+    }
+
+    /// Prints the summary and writes the full receipt (`gpu_oracle` schema of `twin.json`
+    /// at the top level, plus per-case coverage under `cases`).
+    fn write_receipt(
+        &self,
+        path: &str,
+        gpu: &Gpu,
+        fail: &Fail,
+        real_fixture: serde_json::Value,
+        controls: serde_json::Value,
+        seconds: f64,
+    ) {
+        use serde_json::{json, Value};
+        let by = |cells: &[Cell<u64>; 3]| {
+            Value::Object(
+                EXT_SYMBOLS
+                    .iter()
+                    .zip(cells)
+                    .map(|(s, c)| (s.to_string(), json!(c.get())))
+                    .collect(),
+            )
+        };
+        let mismatched: u64 = self.mismatched.iter().map(Cell::get).sum();
+        let case_count = self.cases.borrow().len();
+        let ok = fail.0.is_empty() && mismatched == 0 && self.covered();
+        let summary = json!({
+            "tool": "rdna-compute example test_fp8_moe_gfx942 --anchor/--twin",
+            "status": if ok { "PASS" } else { "FAIL" },
+            "target": "gfx942",
+            "method": "hipModuleLoadData of the gfx942 device ELF of the exact hipcc anchor file and of the exact twin .hxaco file; the full test_fp8_moe_gfx942 case list (decode identity, Qwen4 gate_up/down, --byte-identity matrix, NaN/Inf and tile-descriptor cases) with every grouped launch executed on both images for both X dtypes through hip-bridge launch_kernel_blob with the production kernarg layout; raw F32 bits of the whole Y and raw bytes of the whole tile-descriptor buffer (+ guard) compared anchor vs twin",
+            "full_matrix": true,
+            "input_hxaco_sha256": self.twin.file_sha,
+            "input_hxaco_path": self.twin.path,
+            "pm_device_elf_sha256": self.twin.elf_sha,
+            "pm_device_elf_bytes": self.twin.elf_bytes,
+            "hipcc_image_sha256": self.anchor.file_sha,
+            "hipcc_image_path": self.anchor.path,
+            "hipcc_device_elf_sha256": self.anchor.elf_sha,
+            "hipcc_device_elf_bytes": self.anchor.elf_bytes,
+            "device_elf_identical": self.anchor.elf_sha == self.twin.elf_sha,
+            "device": {
+                "index": gpu.device_id,
+                "arch": gpu.arch,
+                "pci_bus_id": gpu.hip.device_pci_bus_id(gpu.device_id).unwrap_or_default(),
+            },
+            "case_count": case_count,
+            "failed_cases": fail.0.len(),
+            "cases_by_kernel": by(&self.launches),
+            "values_by_kernel": by(&self.values),
+            "mismatched_by_kernel": by(&self.mismatched),
+            "x_types": ["f32", "bf16"],
+            "real_fixture": real_fixture,
+            "controls": controls,
+            "seconds": seconds,
+            "failures": fail.0,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&summary).expect("receipt summary")
+        );
+        let mut doc = summary;
+        doc["cases"] = Value::Array(self.cases.borrow().clone());
+        let text = serde_json::to_string_pretty(&doc).expect("receipt") + "\n";
+        std::fs::write(path, text).unwrap_or_else(|e| die(&format!("write {path}: {e}")));
+    }
+}
+
+fn fixture_receipt(fixtures: Option<&str>) -> serde_json::Value {
+    match fixtures {
+        Some(dir) => serde_json::json!({
+            "used": true,
+            "dir": dir,
+            "files": FIXTURE_FILES
+                .iter()
+                .map(|f| {
+                    let b = read(dir, f);
+                    serde_json::json!({"name": f, "bytes": b.len(), "sha256": sha_hex(&[b.as_slice()])})
+                })
+                .collect::<Vec<_>>(),
+        }),
+        None => serde_json::json!({
+            "used": false,
+            "note": "no --fixtures DIR: the real-checkpoint decode and grouped-GEMM cases were not run",
+        }),
     }
 }
 
@@ -653,6 +1246,7 @@ fn ab_route(
     xb: &[u16],
     x_row_div: usize,
     slot_expert: &[usize],
+    ext: Option<&External>,
 ) {
     let (r, k) = (ex.r, ex.k);
     assert!(
@@ -664,7 +1258,7 @@ fn ab_route(
     let x_rows = xb.len() / k;
     let d_payload = upload_bytes(gpu, &ex.payload);
     let (x_f32, x_bf16) = upload_x(gpu, xb);
-    let ab = Ab::new();
+    let ab = Ab::new(ext);
     let l = Launch {
         ex,
         d_payload: &d_payload,
@@ -674,6 +1268,7 @@ fn ab_route(
         x_bf16: &x_bf16,
         ab: Some(&ab),
         tag: name,
+        ext,
     };
 
     let live = slot_expert.len();
@@ -683,12 +1278,29 @@ fn ab_route(
     rows.extend(std::iter::repeat_n(0, 16));
     let y = l.run(gpu, &tiles, &rows, false);
 
+    // Padding supplies zero X, not a masked output store: IEEE 0*Inf/NaN
+    // can produce NaN. Exclude only experts with nonfinite weight inputs
+    // from the +0 assertion; whole-Y anchor/twin byte equality still covers
+    // every padding element, including NaN payloads, for both X dtypes.
+    let stride = b128_block_stride(r, k).unwrap();
+    let finite_weights: Vec<bool> = ex
+        .payload
+        .chunks_exact(stride)
+        .map(|block| {
+            block[..r * k].iter().all(|b| b & 0x7f != 0x7f)
+                && block[r * k..r * k + 2 * b128_scale_count(r, k).unwrap()]
+                    .chunks_exact(2)
+                    .all(|s| u16::from_le_bytes([s[0], s[1]]) & 0x7f80 != 0x7f80)
+        })
+        .collect();
     let mut flat_g = vec![usize::MAX; live];
     let (mut pad_ok, mut skip_ok) = (true, true);
     for (g, &flat) in rows[..live_rows].iter().enumerate() {
         let yrow = &y[g * r..(g + 1) * r];
         if flat < 0 {
-            pad_ok &= yrow.iter().all(|v| v.to_bits() == 0);
+            if finite_weights[tiles[g / 16][0] as usize] {
+                pad_ok &= yrow.iter().all(|v| v.to_bits() == 0);
+            }
         } else {
             flat_g[flat as usize] = g;
         }
@@ -721,10 +1333,10 @@ fn ab_route(
     drop(y);
     drop(yc);
 
-    ab.check(fail, name);
+    ab.check(fail, name, ext);
     fail.check(
         pad_ok && skip_ok && guard_ok,
-        format!("{name}: candidate padding rows +0, skipped tile and guard rows untouched"),
+        format!("{name}: finite-weight candidate padding rows +0 (nonfinite weights covered by exact A/B), skipped tile and guard rows untouched"),
     );
     fail.check(
         compact_ok,
@@ -738,7 +1350,7 @@ fn ab_route(
 
 /// Mandatory `--byte-identity` additions (everything else is the full existing
 /// suite with A/B enabled on every grouped launch).
-fn byte_cases(gpu: &mut Gpu, fail: &mut Fail) {
+fn byte_cases(gpu: &mut Gpu, fail: &mut Fail, ext: Option<&External>) {
     // (a) R in {16,48,80} (output-wave tails) x K in {128,256,384} (K=256: exactly
     // one full D=2 prefetch group; 128/384: odd/tail groups) through the FULL
     // existing case (F64 oracle, both X dtypes, padded/compact/skipped tiles,
@@ -764,6 +1376,7 @@ fn byte_cases(gpu: &mut Gpu, fail: &mut Fail) {
                 div,
                 tokens,
                 true,
+                ext,
             );
         }
     }
@@ -800,6 +1413,7 @@ fn byte_cases(gpu: &mut Gpu, fail: &mut Fail) {
             &xb,
             div,
             &slots,
+            ext,
         );
 
         // BF16 X stress against ordinary random weights.
@@ -821,6 +1435,7 @@ fn byte_cases(gpu: &mut Gpu, fail: &mut Fail) {
             &xb,
             div,
             &slots,
+            ext,
         );
         drop(rnd);
         drop(ex);
@@ -840,6 +1455,7 @@ fn byte_cases(gpu: &mut Gpu, fail: &mut Fail) {
             &xc,
             div,
             &slots,
+            ext,
         );
     }
 
@@ -882,8 +1498,175 @@ fn byte_cases(gpu: &mut Gpu, fail: &mut Fail) {
                 &xb,
                 div,
                 &slots,
+                ext,
             );
         }
+    }
+}
+
+/// Non-finite scales for the external oracle: +Inf, -Inf, quiet NaN, NaN with payload,
+/// signalling-style NaN, +/-1, +0.
+const NONFINITE_SCALES: [u16; 8] = [
+    0x7F80, 0xFF80, 0x7FC0, 0xFFC1, 0x7F81, 0x3F80, 0xBF80, 0x0000,
+];
+
+/// Weight codes with E4M3 NaN codes (0x7F / 0xFF) at four densities per expert kind
+/// (1/64, 1/16, every other K16 block, none).
+fn nonfinite_codes(e: usize, r: usize, k: usize) -> Vec<u8> {
+    let mut st = expert_seed(0x0a4f_0000, e);
+    (0..r * k)
+        .map(|i| {
+            let c = (lcg(&mut st) >> 8) as u8;
+            match e % 4 {
+                0 if i % 64 == 0 => 0x7F,
+                0 if i % 64 == 32 => 0xFF,
+                1 if c & 0x0F == 0 => 0x7F | (c & 0x80),
+                2 if (i / 16) % 2 == 0 => 0x7Fu8 | ((((i / 32) % 2) as u8) << 7),
+                _ => finite_code(c as usize),
+            }
+        })
+        .collect()
+}
+
+/// 12-expert pool: NaN codes in experts 0..=2 (mod 4), non-finite scales in expert kind 3.
+fn nonfinite_pool(r: usize, k: usize) -> Experts {
+    Experts::ab_only(r, k, 12, |e| {
+        let mut s = expert_seed(0x0a4f_5ca1, e);
+        let n = b128_scale_count(r, k).unwrap();
+        let scales = if e % 4 == 3 {
+            (0..n)
+                .map(|i| NONFINITE_SCALES[(i * 3 + e) % NONFINITE_SCALES.len()])
+                .collect()
+        } else {
+            (0..n).map(|_| rand_scale(&mut s)).collect()
+        };
+        (nonfinite_codes(e, r, k), scales)
+    })
+}
+
+/// 12-expert pool of ordinary finite random weights.
+fn finite_pool(r: usize, k: usize) -> Experts {
+    Experts::ab_only(r, k, 12, |e| {
+        let mut s = expert_seed(0x0a4f_f1e1, e);
+        let codes = rand_codes4(r * k, &mut s);
+        (
+            codes,
+            (0..b128_scale_count(r, k).unwrap())
+                .map(|_| rand_scale(&mut s))
+                .collect(),
+        )
+    })
+}
+
+/// X rows of BF16 non-finite kinds: all +Inf, alternating +/-Inf (Inf - Inf), NaN payloads
+/// (quiet, negative, signalling-style, all-ones) among wide-exponent values, sparse -Inf,
+/// +/-0 against +/-Inf (0 * Inf), plain random.
+fn nonfinite_x_row(k: usize, row: usize, st: &mut u64) -> Vec<u16> {
+    let plain = |st: &mut u64| f32_to_bf16(((lcg(st) as f32 / u32::MAX as f32) - 0.5) * 4.0);
+    match row % 6 {
+        0 => vec![0x7F80; k],
+        1 => (0..k)
+            .map(|i| if i % 2 == 0 { 0x7F80 } else { 0xFF80 })
+            .collect(),
+        2 => (0..k)
+            .map(|_| match lcg(st) % 16 {
+                0 => 0x7FC0,
+                1 => 0xFFC0,
+                2 => 0x7F81,
+                3 => 0xFFFF,
+                _ => wide_bf16(st),
+            })
+            .collect(),
+        3 => (0..k)
+            .map(|i| {
+                if i % 64 == (row * 5) % 64 {
+                    0xFF80
+                } else {
+                    plain(st)
+                }
+            })
+            .collect(),
+        4 => (0..k)
+            .map(|i| match i % 4 {
+                0 => 0x0000,
+                1 => 0x7F80,
+                2 => 0x8000,
+                _ => 0xFF80,
+            })
+            .collect(),
+        _ => (0..k).map(|_| plain(st)).collect(),
+    }
+}
+
+/// External-oracle-only cases on top of the full existing list: NaN/Inf weights, scales and X
+/// (anchor-vs-twin bytes only, no F64 oracle) and tile-descriptor builder sizes.
+fn external_cases(gpu: &mut Gpu, fail: &mut Fail, ext: &External) {
+    println!("external: NaN/Inf routes and tile-descriptor sizes");
+    let tokens = 37usize;
+    for (r, k, div) in [
+        (16usize, 128usize, 10usize),
+        (16, 256, 1),
+        (48, 384, 10),
+        (80, 256, 1),
+        (1280, 2560, 10),
+        (2560, 640, 1),
+    ] {
+        let x_rows = if div == 1 { tokens * 10 } else { tokens };
+        let mut st = 0x0a4f_1a10_u64 ^ (r * 7919 + k) as u64;
+        let slots = zipf_slots(tokens, 12, &mut st, true);
+        let xf: Vec<u16> = random_x(x_rows, k, st);
+        let xn: Vec<u16> = (0..x_rows)
+            .flat_map(|row| nonfinite_x_row(k, row, &mut st))
+            .collect();
+        let nf = nonfinite_pool(r, k);
+        ab_route(
+            gpu,
+            fail,
+            &format!("nonfinite-w r={r} k={k} x_row_div={div}"),
+            &nf,
+            &xf,
+            div,
+            &slots,
+            Some(ext),
+        );
+        ab_route(
+            gpu,
+            fail,
+            &format!("nonfinite-wx r={r} k={k} x_row_div={div}"),
+            &nf,
+            &xn,
+            div,
+            &slots,
+            Some(ext),
+        );
+        drop(nf);
+        let fin = finite_pool(r, k);
+        ab_route(
+            gpu,
+            fail,
+            &format!("nonfinite-x r={r} k={k} x_row_div={div}"),
+            &fin,
+            &xn,
+            div,
+            &slots,
+            Some(ext),
+        );
+    }
+    let mut st = 0x7d11_e5c0_u64;
+    for n in [
+        1usize, 2, 15, 16, 17, 255, 256, 257, 511, 512, 513, 1000, 2049, 4097,
+    ] {
+        let ids: Vec<i32> = (0..n)
+            .map(|t| match lcg(&mut st) % 8 {
+                0 => -1,
+                1 => 0,
+                2 => i32::MAX,
+                3 => i32::MIN,
+                4 => (t % 512) as i32,
+                _ => (lcg(&mut st) % 512) as i32,
+            })
+            .collect();
+        ext.tile_desc_case(gpu, fail, &format!("tile_desc_pad16 n_tiles={n}"), &ids);
     }
 }
 
@@ -895,6 +1678,7 @@ fn gemm_case(
     x_row_div: usize,
     tokens: usize,
     byte_ab: bool,
+    ext: Option<&External>,
 ) {
     let (r, k) = (ex.r, ex.k);
     // x: BF16-exact values, including signed zeros. At least 128 rows so the
@@ -917,7 +1701,7 @@ fn gemm_case(
     );
     x_bf16.shape = vec![x_rows * k];
     x_bf16.dtype = DType::BF16;
-    let ab = byte_ab.then(Ab::new);
+    let ab = byte_ab.then(|| Ab::new(ext));
     let l = Launch {
         ex,
         d_payload: &d_payload,
@@ -927,6 +1711,7 @@ fn gemm_case(
         x_bf16: &x_bf16,
         ab: ab.as_ref(),
         tag: name,
+        ext,
     };
 
     // Top-10 distinct experts per token (deterministic, skewed).
@@ -959,7 +1744,10 @@ fn gemm_case(
     );
 
     // GPU tile-desc builder from padded-16 tile ids == the host descriptors.
-    {
+    if let Some(ext) = ext {
+        let ids: Vec<i32> = tiles.iter().map(|t| t[0]).collect();
+        ext.tile_desc_case(gpu, fail, &format!("{name}: builder"), &ids);
+    } else {
         let ids: Vec<i32> = tiles.iter().map(|t| t[0]).collect();
         let d_ids = upload_i32(gpu, &ids);
         let d_desc = upload_bytes(gpu, &vec![0xEEu8; ids.len() * 16]);
@@ -1112,7 +1900,7 @@ fn gemm_case(
     );
 
     if let Some(ab) = &ab {
-        ab.check(fail, name);
+        ab.check(fail, name, ext);
     }
 
     for t in [x_bf16, x_f32, d_payload] {
@@ -1506,19 +2294,60 @@ fn time_mode(gpu: &mut Gpu, args: &[String]) {
 }
 
 fn main() {
+    let t0 = std::time::Instant::now();
     let args: Vec<String> = std::env::args().collect();
-    let fixtures = args
-        .iter()
-        .position(|a| a == "--fixtures")
-        .map(|i| args[i + 1].clone());
-    let byte = args.iter().any(|a| a == "--byte-identity");
-    let mut gpu = Gpu::init().expect("Gpu::init");
+    let opt = |name: &str| -> Option<String> {
+        args.iter().position(|a| a == name).map(|i| {
+            args.get(i + 1)
+                .cloned()
+                .unwrap_or_else(|| die(&format!("{name} needs a value")))
+        })
+    };
+    let fixtures = opt("--fixtures");
+    let byte_flag = args.iter().any(|a| a == "--byte-identity");
+    let (anchor_path, twin_path) = (opt("--anchor"), opt("--twin"));
+    if anchor_path.is_some() != twin_path.is_some() {
+        die("--anchor and --twin must be given together");
+    }
+    let receipt_out = opt("--receipt-out");
+    if anchor_path.is_some() && receipt_out.is_none() {
+        die("external mode (--anchor/--twin) needs --receipt-out PATH");
+    }
+    if anchor_path.is_some() && args.iter().any(|a| a == "--time") {
+        die("--time is a production-vs-reference mode and cannot be combined with --anchor/--twin");
+    }
+    let device: i32 = opt("--device").map_or(0, |v| {
+        v.parse()
+            .unwrap_or_else(|_| die("--device needs an integer"))
+    });
+    let mut gpu = Gpu::init_with_device(device).expect("Gpu::init_with_device");
     println!("detected arch: {}", gpu.arch);
     assert_eq!(gpu.arch, "gfx942", "this Tier C gate requires gfx942");
     if args.iter().any(|a| a == "--time") {
         time_mode(&mut gpu, &args);
         return;
     }
+    let external = match (&anchor_path, &twin_path) {
+        (Some(a), Some(t)) => Some(
+            External::load(
+                &gpu,
+                a,
+                t,
+                opt("--expect-anchor-sha256").as_deref(),
+                opt("--expect-twin-sha256").as_deref(),
+            )
+            .unwrap_or_else(|e| die(&e)),
+        ),
+        _ => None,
+    };
+    let ext = external.as_ref();
+    // External mode always runs the whole byte matrix.
+    let byte = byte_flag || ext.is_some();
+    let controls = ext.map(|e| {
+        let c = e.controls(&mut gpu).unwrap_or_else(|m| die(&m));
+        println!("external controls: {c}");
+        c
+    });
     let mut fail = Fail(Vec::new());
 
     // 1a. All 256 codes x scale sweep vs CPU teacher twin. One [128, 256] block
@@ -1620,7 +2449,7 @@ fn main() {
             };
             // Reuse the synthetic driver with a single-expert pool: tokens=1 slot row per
             // flat index, every slot on expert 0.
-            real_gemm(&mut gpu, &mut fail, name, &ex, byte);
+            real_gemm(&mut gpu, &mut fail, name, &ex, byte, ext);
         }
     }
 
@@ -1634,15 +2463,48 @@ fn main() {
         10,
         37,
         byte,
+        ext,
     );
     drop(gate_up);
     let down = Experts::synthetic(2560, 640, 12, 0xd0e1_0002);
-    gemm_case(&mut gpu, &mut fail, "down r=2560 k=640", &down, 1, 13, byte);
+    gemm_case(
+        &mut gpu,
+        &mut fail,
+        "down r=2560 k=640",
+        &down,
+        1,
+        13,
+        byte,
+        ext,
+    );
     drop(down);
 
     if byte {
-        println!("byte-identity: baseline = retained P1 reference (standalone SHA-pinned snapshot), candidate = production entry");
-        byte_cases(&mut gpu, &mut fail);
+        if ext.is_some() {
+            println!("byte-identity: baseline = exact hipcc anchor image, candidate = exact PM twin image (external mode)");
+        } else {
+            println!("byte-identity: baseline = retained P1 reference (standalone SHA-pinned snapshot), candidate = production entry");
+        }
+        byte_cases(&mut gpu, &mut fail, ext);
+    }
+
+    if let Some(ext) = ext {
+        external_cases(&mut gpu, &mut fail, ext);
+        fail.check(
+            ext.covered(),
+            "external: all three symbols (F32-x grouped, BF16-x grouped, tile_desc_pad16) have compared anchor-vs-twin launches".to_string(),
+        );
+        if fixtures.is_none() {
+            eprintln!("external: no --fixtures DIR, the real-checkpoint cases were not run (receipt records real_fixture.used = false)");
+        }
+        ext.write_receipt(
+            receipt_out.as_deref().expect("checked above"),
+            &gpu,
+            &fail,
+            fixture_receipt(fixtures.as_deref()),
+            controls.expect("external controls ran"),
+            t0.elapsed().as_secs_f64(),
+        );
     }
 
     if fail.0.is_empty() {
@@ -1658,7 +2520,14 @@ fn main() {
 
 /// Real checkpoint expert: 64 BF16 x rows through one expert vs F64 on the
 /// Python-teacher W.
-fn real_gemm(gpu: &mut Gpu, fail: &mut Fail, name: &str, ex: &Experts, byte_ab: bool) {
+fn real_gemm(
+    gpu: &mut Gpu,
+    fail: &mut Fail,
+    name: &str,
+    ex: &Experts,
+    byte_ab: bool,
+    ext: Option<&External>,
+) {
     let (r, k) = (ex.r, ex.k);
     let rows = 64usize;
     let mut st = 0x7ea1_u64;
@@ -1674,7 +2543,7 @@ fn real_gemm(gpu: &mut Gpu, fail: &mut Fail, name: &str, ex: &Experts, byte_ab: 
     );
     x_bf16.shape = vec![rows * k];
     x_bf16.dtype = DType::BF16;
-    let ab = byte_ab.then(Ab::new);
+    let ab = byte_ab.then(|| Ab::new(ext));
     let l = Launch {
         ex,
         d_payload: &d_payload,
@@ -1684,6 +2553,7 @@ fn real_gemm(gpu: &mut Gpu, fail: &mut Fail, name: &str, ex: &Experts, byte_ab: 
         x_bf16: &x_bf16,
         ab: ab.as_ref(),
         tag: name,
+        ext,
     };
     let (t, s) = scatter(&vec![0usize; rows], 1, true);
     let y = l.run(gpu, &t, &s, false);
@@ -1706,7 +2576,7 @@ fn real_gemm(gpu: &mut Gpu, fail: &mut Fail, name: &str, ex: &Experts, byte_ab: 
     }
     fail.check(bad == 0, format!("real {name}: GEMM vs F64 on teacher W, {rows} rows, max err/sum|wx| = {worst:.3e}, violations {bad}"));
     if let Some(ab) = &ab {
-        ab.check(fail, &format!("real {name}"));
+        ab.check(fail, &format!("real {name}"), ext);
     }
     for t in [x_bf16, x_f32, d_payload] {
         gpu.free_tensor(t).ok();

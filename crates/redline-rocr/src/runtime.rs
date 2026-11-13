@@ -12,6 +12,7 @@ use hipfire_config::emu_budget;
 
 use super::abi;
 use super::packet::{AQL_PACKET_BYTES, KernelMetadata, LaunchGeometry, PacketImage};
+use super::pm4_gfx10_scratch::{Gfx10Scratch, Gfx10ScratchTopology};
 
 /// Default bound for host-side queue-capacity and completion polling.
 ///
@@ -599,6 +600,28 @@ impl GpuDevice {
         Ok(count)
     }
 
+    /// Shader topology that sizes a GFX10/GFX11 scratch ring: CU count, shader
+    /// engines and the per-CU wave-slot capacity
+    /// (`HSA_AMD_AGENT_INFO_{COMPUTE_UNIT_COUNT,NUM_SHADER_ENGINES,MAX_WAVES_PER_CU}`;
+    /// the same inputs ROCr's `AqlQueue::FillComputeTmpRingSize*` uses).
+    pub fn scratch_topology(&self) -> Result<Gfx10ScratchTopology, RuntimeError> {
+        let query = |attribute: u32| -> Result<u32, RuntimeError> {
+            let mut value = 0_u32;
+            query_agent(
+                &self.runtime.symbols,
+                self.gpu_agent(),
+                attribute,
+                (&mut value as *mut u32).cast(),
+            )?;
+            Ok(value)
+        };
+        Ok(Gfx10ScratchTopology {
+            compute_units: query(abi::AMD_AGENT_INFO_COMPUTE_UNIT_COUNT)?,
+            shader_engines: query(abi::AMD_AGENT_INFO_NUM_SHADER_ENGINES)?,
+            max_waves_per_cu: query(abi::AMD_AGENT_INFO_MAX_WAVES_PER_CU)?,
+        })
+    }
+
     /// CUs fully enabled for cooperative dispatch
     /// (`HSA_AMD_AGENT_INFO_COOPERATIVE_COMPUTE_UNIT_COUNT`).
     pub fn cooperative_compute_unit_count(&self) -> Result<u32, RuntimeError> {
@@ -1099,6 +1122,13 @@ impl QueueDepthReport {
     }
 }
 
+// `amd_queue_t` byte offsets of the scratch fields (ROCr `inc/amd_hsa_queue.h`,
+// identical in v1 and v2).
+const COMPUTE_TMPRING_SIZE: usize = 140;
+const SCRATCH_RESOURCE_DESCRIPTOR: usize = 144;
+const SCRATCH_BACKING_MEMORY_LOCATION: usize = 160;
+const SCRATCH_WAVE64_LANE_BYTE_SIZE: usize = 176;
+
 /// One distinct ROCr user-mode queue.
 pub struct AqlQueue {
     runtime: Option<Arc<RuntimeInner>>,
@@ -1464,6 +1494,62 @@ impl AqlQueue {
         Ok(Some(unsafe { self.publish_batch(packets) }))
     }
 
+    /// Make `scratch` this queue's own scratch ring in `amd_queue_t`, the way
+    /// ROCr's `AqlQueue::InitScratchSRD` publishes a ring it allocated.
+    ///
+    /// The command processor reprograms `COMPUTE_TMPRING_SIZE` and the scratch
+    /// base from these fields whenever KFD maps the queue again after an
+    /// eviction (ROCr `AsyncReclaimMainScratch`: "CP will check amd_queue_
+    /// fields on re-map"), replacing what a PM4 IB wrote. A retained PM4 queue
+    /// that leaves ROCr's empty fields stalls after a restore (no scratch
+    /// slots, HIPF-347). ROCr rewrites the fields only from its own scratch
+    /// bookkeeping, which only an AQL kernel dispatch with a private segment
+    /// starts; retained PM4 queues carry barrier and PM4-IB packets only.
+    /// The caller keeps the backing alive for the queue's lifetime.
+    pub fn bind_scratch(&mut self, scratch: &Gfx10Scratch) {
+        let base = scratch.base_address();
+        let records = u32::try_from(scratch.plan().backing_bytes())
+            .expect("Gfx10ScratchPlan caps the ring backing below 4 GiB");
+        let queue = self.raw.as_ptr().cast::<u8>();
+        // SAFETY: ROCr's queue object is an `amd_queue_t`, live until Drop;
+        // `&mut self` excludes concurrent publication on this queue.
+        unsafe {
+            let word = |offset: usize| queue.add(offset).cast::<u32>();
+            // Words 1 and 3 keep ROCr's SWIZZLE_ENABLE and format bits.
+            let srd1 = ptr::read_volatile(word(SCRATCH_RESOURCE_DESCRIPTOR + 4));
+            ptr::write_volatile(word(SCRATCH_RESOURCE_DESCRIPTOR), base as u32);
+            ptr::write_volatile(
+                word(SCRATCH_RESOURCE_DESCRIPTOR + 4),
+                (srd1 & 0xffff_0000) | ((base >> 32) as u32 & 0xffff),
+            );
+            ptr::write_volatile(word(SCRATCH_RESOURCE_DESCRIPTOR + 8), records);
+            ptr::write_volatile(
+                queue.add(SCRATCH_BACKING_MEMORY_LOCATION).cast::<u64>(),
+                base,
+            );
+            ptr::write_volatile(
+                word(SCRATCH_WAVE64_LANE_BYTE_SIZE),
+                scratch.bytes_per_wave() / 64,
+            );
+            ptr::write_volatile(word(COMPUTE_TMPRING_SIZE), scratch.tmpring_size());
+        }
+        std::sync::atomic::fence(Ordering::Release);
+    }
+
+    /// The scratch ring the command processor restores this queue with:
+    /// `amd_queue_t` (`compute_tmpring_size`, `scratch_backing_memory_location`).
+    /// `(0, 0)` for a queue without one; see [`Self::bind_scratch`].
+    pub fn scratch_binding(&self) -> (u32, u64) {
+        let queue = self.raw.as_ptr().cast::<u8>();
+        // SAFETY: ROCr's queue object is an `amd_queue_t`, live until Drop.
+        unsafe {
+            (
+                ptr::read_volatile(queue.add(COMPUTE_TMPRING_SIZE).cast::<u32>()),
+                ptr::read_volatile(queue.add(SCRATCH_BACKING_MEMORY_LOCATION).cast::<u64>()),
+            )
+        }
+    }
+
     fn descriptor(&self) -> &abi::Queue {
         // SAFETY: the runtime owns the descriptor until queue_destroy, which
         // only runs from this object's Drop.
@@ -1758,6 +1844,18 @@ impl QueueSet {
 
     pub fn size(&self, lane: usize) -> Option<u32> {
         self.queues.get(lane).map(AqlQueue::size)
+    }
+
+    /// [`AqlQueue::bind_scratch`] on lane `lane`; `None` when out of range.
+    pub fn bind_scratch(&mut self, lane: usize, scratch: &Gfx10Scratch) -> Option<()> {
+        self.queues
+            .get_mut(lane)
+            .map(|queue| queue.bind_scratch(scratch))
+    }
+
+    /// [`AqlQueue::scratch_binding`] of lane `lane`; `None` when out of range.
+    pub fn scratch_binding(&self, lane: usize) -> Option<(u32, u64)> {
+        self.queues.get(lane).map(AqlQueue::scratch_binding)
     }
 
     /// Read lane `lane`'s effective CU affinity via `AqlQueue::cu_mask`.
@@ -2311,11 +2409,33 @@ impl KernargPool {
         self.allocate_bytes(length, 16, abi::AMD_MEMORY_POOL_EXECUTABLE_FLAG)
     }
 
+    /// Allocate a GPU scratch (private-segment) backing store for GFX10/GFX11
+    /// PM4 dispatches: `length` bytes at 4 KiB alignment, left uninitialized.
+    ///
+    /// Private-segment memory is write-before-read by definition, so unlike
+    /// every kernarg/command allocation it is not zeroed: at tens of MiB the
+    /// host store through the BAR would cost more than the buffer is worth.
+    /// Allocate it from a pool made by [`Self::discover_device_local`] so the
+    /// backing lives in device memory.
+    pub fn allocate_scratch_backing(&self, length: usize) -> Result<KernargBuffer, RuntimeError> {
+        self.allocate_bytes_init(length, 4096, abi::AMD_MEMORY_POOL_STANDARD_FLAG, false)
+    }
+
     fn allocate_bytes(
         &self,
         length: usize,
         required_alignment: usize,
         flags: u32,
+    ) -> Result<KernargBuffer, RuntimeError> {
+        self.allocate_bytes_init(length, required_alignment, flags, true)
+    }
+
+    fn allocate_bytes_init(
+        &self,
+        length: usize,
+        required_alignment: usize,
+        flags: u32,
+        zero: bool,
     ) -> Result<KernargBuffer, RuntimeError> {
         if !required_alignment.is_power_of_two() {
             return Err(RuntimeError::InvalidKernargAlignment(required_alignment));
@@ -2416,7 +2536,9 @@ impl KernargPool {
         // ReBAR systems (verified by the device_local_pool_host_memcpy_probe
         // test), so the same store path is valid.
         // SAFETY: pointer owns allocation_size writable host bytes.
-        unsafe { ptr::write_bytes(pointer.as_ptr(), 0, allocation_size) };
+        if zero {
+            unsafe { ptr::write_bytes(pointer.as_ptr(), 0, allocation_size) };
+        }
         Ok(KernargBuffer {
             pool: self.inner.clone(),
             device_local: self.inner.device_local,

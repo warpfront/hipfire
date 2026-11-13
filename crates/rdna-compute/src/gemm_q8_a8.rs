@@ -129,6 +129,19 @@ fn q8_bytes(m: usize, k: usize) -> usize {
     m * (k / 32) * 34
 }
 
+/// [`Gpu::q8_a8_pick_tile`] without the device (the rule needs no device state); the MQ8G256
+/// gfx12 picker reuses it.
+pub(crate) fn q8_a8_pick_tile_pure(m: usize, n: usize) -> Q8A8Tile {
+    const Q8A8_FILL_BLOCKS: usize = 128;
+    for tile in [Q8A8Tile::T128x128, Q8A8Tile::T128x64] {
+        let (bm, bn) = tile.dims();
+        if m.div_ceil(bm) * n.div_ceil(bn) >= Q8A8_FILL_BLOCKS {
+            return tile;
+        }
+    }
+    Q8A8Tile::T64x64
+}
+
 impl Gpu {
     /// Whether the W8A8 Q8_0 route can run for this device and `k`.
     pub fn q8_a8_supported(&self, k: usize) -> bool {
@@ -146,14 +159,7 @@ impl Gpu {
     /// R9700: 128x128 wins every wide shape, 64x64 only the narrow
     /// `M = 576, N = 512` class.
     pub fn q8_a8_pick_tile(&self, m: usize, n: usize) -> Q8A8Tile {
-        const Q8A8_FILL_BLOCKS: usize = 128;
-        for tile in [Q8A8Tile::T128x128, Q8A8Tile::T128x64] {
-            let (bm, bn) = tile.dims();
-            if m.div_ceil(bm) * n.div_ceil(bn) >= Q8A8_FILL_BLOCKS {
-                return tile;
-            }
-        }
-        Q8A8Tile::T64x64
+        q8_a8_pick_tile_pure(m, n)
     }
 
     /// Quantize F32 `x [n, k]` (row-major) into the W8A8 scratch.

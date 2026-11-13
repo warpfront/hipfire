@@ -9,21 +9,20 @@
 //! future `hipfire-arch-llama`, etc.) and depend on this crate for
 //! shared infrastructure: HFQ/GGUF file readers, the LLaMA-style
 //! scratch / KV / sampler primitives, tokenizer, prompt framing, eos
-//! filter, loop guard, eviction (TriAttn, CASK), spec-decode primitives
+//! filter, loop guard, spec-decode primitives
 //! (DFlash, DDTree), demand paging (cpu_router, weight_pager), and the
 //! [`arch::Architecture`] trait.
 
 pub mod admission;
+pub mod ar_hc_exchange;
 pub mod arch;
 pub mod arch_mapping;
 pub mod arch_model;
 pub mod arch_spec;
-pub mod augmentor;
 pub mod batch_sampler;
 pub mod bf16_loader;
 pub mod cache_plan;
 #[cfg(feature = "deltanet")]
-pub mod cask;
 pub mod chatml;
 pub mod checkpoint_pool;
 pub mod config;
@@ -63,6 +62,7 @@ pub mod imagedec;
 pub mod kv_adaptive;
 pub mod kv_backend;
 pub mod kv_mode;
+pub mod lane_draw;
 pub mod llama;
 pub mod llama_spec;
 pub mod lloyd_lut;
@@ -72,13 +72,15 @@ pub mod mesh_placement;
 pub mod mesh_split;
 pub mod model_load;
 pub mod model_source;
+/// MQ4 drop-zero planar routed-expert layout (qt=137/138), the load-time repack of
+/// the symmetric MQ4-XTS experts (`HIPFIRE_QWEN4_EXPERT_DROP_ZERO`). CPU-only.
+pub mod mq4_planar;
 /// MQ3-I4 / MQ2-I4 planar tensor codec (qt=131..=134). CPU-only wire format.
 pub mod mq_i4;
 /// CPU arithmetic twins for future MQ-I4 expert kernels; no dispatch changes.
 pub mod mq_i4_reference;
 pub mod multi_gpu;
 pub mod offload_calibrate;
-pub mod paro;
 pub mod ple_convert;
 pub mod ple_hot_pack;
 pub mod ple_hot_store;
@@ -90,6 +92,7 @@ pub mod prefix_index;
 pub mod rank_pool;
 pub mod reset_core;
 pub mod rope;
+pub mod route_sku;
 pub mod safetensors_source;
 pub mod sampler;
 /// `Scheduler` — decides what goes into each step's `SlotBatch`. Pure CPU
@@ -110,6 +113,7 @@ pub mod sidecar;
 pub mod slot_batch;
 pub mod spec;
 
+pub mod hc8_sidecar;
 pub mod ngram_mod;
 pub mod offload;
 pub mod spec_economics;
@@ -121,7 +125,6 @@ pub mod spec_sampling;
 pub mod swap;
 pub mod tp_shard;
 #[cfg(feature = "deltanet")]
-pub mod triattn;
 pub mod trunk_overlay;
 pub mod verified_cache;
 /// Shared-weight host protocol v1 (`HIPFIRE_WEIGHT_HOST`): identities, typed

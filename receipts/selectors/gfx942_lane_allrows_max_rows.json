@@ -1,0 +1,43 @@
+{
+  "schema": "pm.selector_receipt.v1",
+  "arch": "gfx942",
+  "constant": "LANE_ALLROWS_MAX_ROWS",
+  "value": 128,
+  "kind": "max",
+  "row_key": "rows",
+  "covers": true,
+  "candidate": "exact-gfx942 single-device lane all-rows segment over every row of a 65..=128-row AR / verify step (HC, non-MoE stages, one all-rows MoE call, PLE project, head)",
+  "incumbent": "the same step in <= 8-row groups (one MoE call per group per layer)",
+  "card": "MI300X, bin f1 (c32/rows128 2f57c10ecf), fn_lane_oracle sha256 1b38c0dda74d4318, beat/WC8/out/c32/f1-k3 + f1-k7 + WC8b/c32-f1-plain, 2026-11-13",
+  "summary": "128 is the structural bound of the C32 MTP verify step (32 lanes x (K=3 + 1) rows), not a crossover: every lane's committed ids and trunk / head / draft checkpoints byte-identical to the singleton replay at K=3 lanes 1/2/8/16/32 and K=7 lanes 8/16 (128-row steps), ctx 64/512/2048, steps 8, with positive-cycle and skip-rollback controls; the step trace shows rows=128 hc_allrows=true moe=allrows. Speed: C32 MTP K=3 step 302.0 ms (16 groups of 8) -> 90.1 ms (one 128-row segment), C16 75.8 (d2) -> 53.3 ms, C8 34.4 ms unchanged.",
+  "rows_tested": [
+    12,
+    16,
+    24,
+    32,
+    64,
+    128
+  ],
+  "records": [
+    {
+      "path": "receipts/selectors/evidence/gfx942_lane_allrows/f1-k3.ident.txt",
+      "sha256": "6717a18b0c2d7c3b25030673e96bae27f5b3a1e6688772d31baa747a0ef83344"
+    },
+    {
+      "path": "receipts/selectors/evidence/gfx942_lane_allrows/f1-k3.oracle.log",
+      "sha256": "ce8336981f365daadf418cd9ccfa577e05fef1238d69cf48c7f5e03589c7dff1"
+    },
+    {
+      "path": "receipts/selectors/evidence/gfx942_lane_allrows/f1-k7.ident.txt",
+      "sha256": "bed2b2e3e41c92926bfd8c8dc44bd52b722d9485a6701536fd9c53b5d8e1bedb"
+    },
+    {
+      "path": "receipts/selectors/evidence/gfx942_lane_allrows/f1-k7.oracle.log",
+      "sha256": "ad2ed0ea3c10c26878bc2a2f885fbdb3019f772ed929b760da6ef637d99b536a"
+    },
+    {
+      "path": "receipts/selectors/evidence/gfx942_lane_allrows/f1-trace-rows128.txt",
+      "sha256": "798bd5cf489fa7094d5d522d34649c72c9fcc89ca46a52b78637ffc46a015c04"
+    }
+  ]
+}

@@ -117,13 +117,17 @@ pub enum Step<'a> {
     LaneAttention(crate::pipeline::layer_ops::LaneAttentionOp<'a>),
     /// Launch-free clear of a preallocated scratch prefix.
     Clear(crate::pipeline::layer_ops::ClearOp<'a>),
+    /// Sequence-parallel all-gather of the rows of one scratch tensor across the EP ranks
+    /// (`HIPFIRE_QWEN4_EP_SEQ_PARALLEL`). A fusion barrier like `Clear`.
+    RowGather(crate::pipeline::layer_ops::RowGatherOp<'a>),
     /// Embedding-table lookup of device-resident token ids.
     Embed(crate::pipeline::layer_ops::EmbeddingOp<'a>),
     /// Grouped hyper-connection RMS norm.
     HyperNorm(crate::pipeline::layer_ops::HyperNormOp<'a>),
     /// One weight projection through the shared stateful-op contract.
     Project(crate::pipeline::layer_ops::ProjectOp<'a>),
-    /// Per-row broadcast add of one activation row.
+    /// Per-row broadcast add of one activation row per lane (one lane unless the op batches
+    /// the draft round's lanes).
     BroadcastAdd(crate::pipeline::layer_ops::BroadcastAddOp<'a>),
     /// Dense gated MLP (optional pre-norm, gate/up, activation, down, output
     /// epilogue) on its declared kernel ladder. Opaque to fusion: no HC
@@ -228,6 +232,7 @@ fn op_kind(step: &Step) -> Option<PipelineOp> {
         | Step::GatedShortConv(_)
         | Step::LaneAttention(_)
         | Step::Clear(_)
+        | Step::RowGather(_)
         | Step::Embed(_)
         | Step::HyperNorm(_)
         | Step::Project(_)
@@ -291,20 +296,6 @@ fn gemv_steps_uniform(steps: &[Step], dtype: DType, require_no_awq: bool) -> boo
             input: GemvInput::Prerotated(_),
             ..
         } => w.dtype == dtype && (!require_no_awq || w.awq_scale.is_none()),
-        _ => false,
-    })
-}
-
-/// True if all Gemv steps in the window (indices 1..) have:
-/// - the given dtype
-/// - GemvInput::Raw (kernel rotates internally — used for Paro guards)
-fn gemv_steps_uniform_raw(steps: &[Step], dtype: DType) -> bool {
-    steps[1..].iter().all(|s| match s {
-        Step::Gemv {
-            w,
-            input: GemvInput::Raw(_),
-            ..
-        } => w.dtype == dtype,
         _ => false,
     })
 }
@@ -567,8 +558,6 @@ pub(crate) fn guard_qkvza_mfp4g32e8(steps: &[Step], ctx: &DispatchCtx) -> bool {
     dt == DType::MFP4G32E8 && gemv_steps_uniform(steps, dt, true)
 }
 
-// ── Paro fused guards (Raw input — kernel rotates internally) ──
-
 // ── Q8_0 / Q4K fused guards (non-rotated, Prerotated input) ──
 // These dtypes have no activation rotation (RotationPlan::None), so the
 // RmsnormAutomatic producer does plain rmsnorm and the fused kernels take
@@ -614,42 +603,6 @@ pub(crate) fn guard_qkv_q8_0(steps: &[Step], ctx: &DispatchCtx) -> bool {
         return false;
     }
     steps.len() == 4 && gemv_steps_uniform(steps, DType::Q8_0, true)
-}
-
-pub(crate) fn guard_gate_up_paro4g128t(steps: &[Step], ctx: &DispatchCtx) -> bool {
-    if ctx.flags.force_unfused {
-        return false;
-    }
-    if steps.len() != 3 {
-        return false;
-    }
-    let dt = match window_gemv_dtype(steps) {
-        Some(d) => d,
-        None => return false,
-    };
-    dt == DType::ParoQ4G128
-        && gemv_steps_uniform_raw(steps, DType::ParoQ4G128)
-        // The pack4 kernel reads the native PARO4-G128 tensor, whose rotation is
-        // embedded in the weight bytes. A safetensors-Dir weight (HFQ4-G128 repack
-        // + sidecar `rotation`) has the same dtype but not that layout.
-        && steps[1..].iter().all(|s| match s {
-            Step::Gemv { w, .. } => w.m % 8 == 0 && w.k % 128 == 0 && w.rotation.is_none(),
-            _ => false,
-        })
-        // Gate and up must have equal m — the fused kernel takes a single m.
-        && {
-            let m0 = match &steps[1] { Step::Gemv { w, .. } => w.m, _ => return false };
-            let m1 = match &steps[2] { Step::Gemv { w, .. } => w.m, _ => return false };
-            m0 == m1
-        }
-}
-
-pub(crate) fn guard_qkvza_paro4g128t(_steps: &[Step], _ctx: &DispatchCtx) -> bool {
-    false
-}
-
-pub(crate) fn guard_qkv_paro4g128t(_steps: &[Step], _ctx: &DispatchCtx) -> bool {
-    false
 }
 
 pub struct FusedPattern {
@@ -848,22 +801,6 @@ const FUSED_TABLE: &[FusedPattern] = &[
         key: KernelKey::FusedGateUpQ8_0,
         guard: guard_gate_up_q8_0,
     },
-    // ── Paro fused Paro4G128T (dp4a, Raw input) ────────────────────────
-    FusedPattern {
-        ops: GATE_UP2,
-        key: KernelKey::FusedGateUpParo4G128T,
-        guard: guard_gate_up_paro4g128t,
-    },
-    FusedPattern {
-        ops: QKVZA4,
-        key: KernelKey::FusedQkvzaParo4G128T,
-        guard: guard_qkvza_paro4g128t,
-    },
-    FusedPattern {
-        ops: QKV3,
-        key: KernelKey::FusedQkvParo4G128T,
-        guard: guard_qkv_paro4g128t,
-    },
 ];
 static GEMV: OnceLock<GemvFamily> = OnceLock::new();
 static ROTATION: OnceLock<RotationFamily> = OnceLock::new();
@@ -887,6 +824,7 @@ pub fn validate_steps<'a>(gpu: &Gpu, steps: &[Step<'a>]) -> Result<(), DispatchE
             Step::GatedShortConv(op) => op.validate_for_gpu(gpu)?,
             Step::LaneAttention(op) => op.validate_for_gpu(gpu)?,
             Step::Clear(op) => op.validate_for_gpu(gpu)?,
+            Step::RowGather(op) => op.validate_for_gpu(gpu)?,
             Step::Embed(op) => op.validate_for_gpu(gpu)?,
             Step::HyperNorm(op) => op.validate_for_gpu(gpu)?,
             Step::Project(op) => op.validate_for_gpu(gpu)?,
@@ -1088,21 +1026,26 @@ fn execute_window<'a>(
     let row_fold_mixer_1201 =
         !cpu_exec::cpu_exec_enabled() && gpu.flags.qwen4_hc_row_fold_mixer_gfx1201_enabled();
     while i < end {
-        // fn-lanes: consecutive one-row GDN Core steps (one per AR lane) run
-        // as one multi-lane launch per kernel; otherwise one by one below. The
+        // fn-lanes: consecutive GDN Core steps (one per lane: one AR row, or a
+        // 2..=8-row verify window under its armed capture ring) run as
+        // multi-lane launches; otherwise one by one below. The
         // group's steps are announced here, once each in program order, after
         // every refusal check and before the grouped launch; a refused group
         // announced nothing and each step is announced by the plain path below.
-        if matches!(&steps[i], Step::GatedDeltaNet(op) if op.phase == MixerPhase::Core && op.rows == 1)
+        // Exact gfx942 also groups one-row F32
+        // Core steps, up to `QWEN4_GDN_LANES_F32_MAX` of them (`pipeline/gdn.rs`).
+        let core_lane = |gpu: &Gpu, op: &crate::pipeline::layer_ops::GatedDeltaNetOp<'_>| {
+            crate::pipeline::layer_ops::gdn_core_lane_groupable(gpu, op)
+                || crate::pipeline::gdn::core_lane_f32_gfx942(gpu, op)
+        };
+        if matches!(&steps[i], Step::GatedDeltaNet(op) if core_lane(gpu, op))
             && !cpu_exec::cpu_exec_enabled()
         {
             let ops: Vec<_> = steps[i..end]
                 .iter()
-                .take(rdna_compute::tensor_ops::GDN_CORE_LANES_MAX)
+                .take(crate::pipeline::gdn::core_lanes_group_max(gpu))
                 .map_while(|s| match s {
-                    Step::GatedDeltaNet(op) if op.phase == MixerPhase::Core && op.rows == 1 => {
-                        Some(op)
-                    }
+                    Step::GatedDeltaNet(op) if core_lane(gpu, op) => Some(op),
                     _ => None,
                 })
                 .collect();
@@ -1125,7 +1068,7 @@ fn execute_window<'a>(
         }
         // fn-lanes: consecutive QSA Core steps of one layer (one per AR lane,
         // 1..=8 rows each) run as one multi-lane launch per kernel (prologue,
-        // pool, select, attention) under `HIPFIRE_QWEN4_QSA_LANES`; announced
+        // pool, select, attention) where the arch admits them; announced
         // and refused exactly like the GDN group above.
         if let Step::IndexedAttention(first) = &steps[i] {
             if first.phase == MixerPhase::Core
@@ -1134,7 +1077,7 @@ fn execute_window<'a>(
             {
                 let ops: Vec<_> = steps[i..end]
                     .iter()
-                    .take(rdna_compute::tensor_ops::QSA_CORE_LANES_MAX)
+                    .take(crate::pipeline::qsa::core_lanes_group_max(gpu))
                     .map_while(|s| match s {
                         Step::IndexedAttention(op)
                             if op.phase == MixerPhase::Core
@@ -1146,10 +1089,19 @@ fn execute_window<'a>(
                     })
                     .collect();
                 let group = ops.len();
+                // The OutProj phase that follows the group (the fused lane attention
+                // may rotate its input, `HIPFIRE_QWEN4_QSA_LANES_FUSE`).
+                let out_proj = match steps[..end].get(i + group) {
+                    Some(Step::IndexedAttention(next)) if next.phase == MixerPhase::OutProj => {
+                        Some(next)
+                    }
+                    _ => None,
+                };
                 if group >= 2
                     && crate::pipeline::layer_ops::execute_indexed_attention_core_lanes(
                         gpu,
                         &ops,
+                        out_proj,
                         |gpu| {
                             for step in &steps[i..i + group] {
                                 hooks.before_step(gpu, step)?;
@@ -1278,7 +1230,9 @@ fn execute_window<'a>(
             {
                 let write = match steps[..end].get(i + 2) {
                     Some(Step::HyperWrite(write))
-                        if (hc_level >= 3 || row_fold_moe_1201) && *pregated == Some(i + 2) =>
+                        if (hc_level >= 3 || row_fold_moe_1201)
+                            && *pregated == Some(i + 2)
+                            && write.ar.is_none() =>
                     {
                         Some(write)
                     }
@@ -1492,6 +1446,8 @@ fn paired_hyper_write<'s, 'a>(
             | Step::Clear(_)
             | Step::Moe(_)
             | Step::MoeStage(..) => {}
+            // A gather of rows other than the paired streams (`hc_mixed`) leaves the streams alone.
+            Step::RowGather(gather) if gather.tensor.buf.as_ptr() != streams => {}
             Step::HyperWrite(write) if write.input.buf.as_ptr() == streams => {
                 return Some((j, write));
             }
@@ -1791,11 +1747,11 @@ fn launch_gemv<'a>(
             // Nothing reads `out` after this step in any model decode path.
             //
             // Dtypes with a fused `gemv_*_residual` kernel use it in one launch.
-            // Dtypes without one (Q8_0, ParoQ4G128, …) fall back to plain GEMV into
+            // Dtypes without one (Q8_0, …) fall back to plain GEMV into
             // the `out` scratch + `residual += out` — reuses the pre-allocated `out`
             // buffer instead of alloc/free per call. Plain GEMV applies this
-            // dtype's own rotation (FWHT / Givens) internally, so this is correct
-            // for both no-rotation (Q8) and Givens (Paro) dtypes.
+            // dtype's own rotation (FWHT) internally, so this is correct
+            // for both no-rotation (Q8) and FWHT dtypes.
             if KernelKey::for_gemv_residual(w.dtype).is_ok() {
                 if crate::types::dtype_rotation_plan(w.dtype) != RotationPlan::None {
                     let h = gemv.rotate(ctx, gpu, w, x, &RotateInputs::default())?;
@@ -1829,8 +1785,8 @@ fn launch_gemv<'a>(
                     )
                 }
             } else {
-                // run_auto applies the dtype's rotation (FWHT/Givens) before the
-                // kernel, so ParoQ4G128 gets its Givens rotation. Plain would skip it.
+                // run_auto applies the dtype's rotation (FWHT) before the
+                // kernel. Plain would skip it.
                 //
                 // ALIASING GUARD: most callers (e.g. qwen35 o_proj / dn_out) pass
                 // `out` == `residual` (both `&s.x`). Reusing `out` as the GEMV scratch
@@ -1955,11 +1911,6 @@ pub(crate) fn launch_op_rows(
                             eps: *eps,
                             batch_size: *rows,
                             variant: RotationVariant::WithRmsnorm,
-                            givens_pairs: None,
-                            givens_theta: None,
-                            givens_scales: None,
-                            givens_krot: None,
-                            givens_group_size: None,
                         },
                     )
                     .map_err(|e| DispatchError::Hip(e.to_string()))
@@ -2020,6 +1971,7 @@ pub(crate) fn launch_op_rows(
         Step::GatedShortConv(op) => crate::pipeline::layer_ops::execute_gated_short_conv(gpu, op),
         Step::LaneAttention(op) => crate::pipeline::layer_ops::execute_lane_attention(gpu, op),
         Step::Clear(op) => crate::pipeline::layer_ops::execute_clear(gpu, op),
+        Step::RowGather(op) => crate::pipeline::layer_ops::execute_row_gather(gpu, op),
         Step::Embed(op) => crate::pipeline::layer_ops::execute_embedding(gpu, op),
         Step::HyperNorm(op) => crate::pipeline::layer_ops::execute_hyper_norm(gpu, op),
         Step::Project(op) => crate::pipeline::layer_ops::execute_project(gpu, op),
@@ -2182,7 +2134,6 @@ fn launch_fused<'a>(
                     outputs: &[q, k, v],
                     m: &[wq.m, wk.m, wv.m],
                     k: wq.k,
-                    rot_scratch: &[],
                     batch_size: None,
                 },
             )
@@ -2207,7 +2158,6 @@ fn launch_fused<'a>(
                     outputs: &[gate, up],
                     m: &[wg.m, wu.m],
                     k: wg.k,
-                    rot_scratch: &[],
                     batch_size: None,
                 },
             )
@@ -2234,144 +2184,6 @@ fn launch_fused<'a>(
                     outputs: &[qkv, z, beta, alpha],
                     m: &[wqkv.m, wz.m, wb.m, wa.m],
                     k: wqkv.k,
-                    rot_scratch: &[],
-                    batch_size: None,
-                },
-            )
-        }
-
-        // ── Paro fused Paro4G128T ────────────────────────────────────────
-        // For all three Paro fused keys, we allocate rotation scratch from
-        // gpu.scratch.paro_fused_scratch (4 × [k] F32 buffers). The QKVZA
-        // path passes all 4; the QKV (3-way) passes 4 with m3=0 via aliasing;
-        // the gate+up path passes 1 (x_rot_gate), with the kernel using
-        // gpu.scratch.mq_x_rot internally for x_rot_up.
-        //
-        // Build aliased GpuTensor descriptors before the mutable borrow of
-        // gpu (fused_qkv.run takes &mut Gpu). DeviceBuffer::alias() creates
-        // an owned descriptor over the same VRAM — no Rust borrow held.
-        KernelKey::FusedGateUpParo4G128T => {
-            let (wg, gate) = gemv_weight_out(&steps[1]);
-            let (wu, up) = gemv_weight_out(&steps[2]);
-            let k = wg.k;
-            #[cfg(debug_assertions)]
-            eprintln!("[dispatch] GateUp Paro: k={}, mg={}, mu={}", k, wg.m, wu.m);
-            gpu.ensure_paro_fused_scratch(k)
-                .map_err(|e| DispatchError::Hip(e.to_string()))?;
-            // Also ensure mq_x_rot >= k (the kernel aliases it for x_rot_up).
-            gpu.ensure_mq_signs()
-                .map_err(|e| DispatchError::Hip(e.to_string()))?;
-            let rot_aliases: Vec<GpuTensor> = gpu
-                .scratch
-                .paro_fused_scratch
-                .as_ref()
-                .unwrap()
-                .iter()
-                .map(|t| GpuTensor {
-                    buf: unsafe { t.buf.alias() },
-                    shape: t.shape.clone(),
-                    dtype: t.dtype,
-                })
-                .collect();
-            #[cfg(debug_assertions)]
-            {
-                let gate_buf = &gpu.scratch.paro_fused_scratch.as_ref().unwrap()[0];
-                let up_internal = gpu.scratch.mq_x_rot.as_ref().unwrap();
-                debug_assert!(
-                    gate_buf.buf.as_ptr() != up_internal.buf.as_ptr(),
-                    "Paro gate+up: x_rot_gate must not alias mq_x_rot"
-                );
-            }
-            fused_qkv.run(
-                ctx,
-                gpu,
-                &FusedQkvParams {
-                    kind: key,
-                    weights: &[wg.buf, wu.buf],
-                    x: activated,
-                    outputs: &[gate, up],
-                    m: &[wg.m, wu.m],
-                    k,
-                    rot_scratch: &rot_aliases,
-                    batch_size: None,
-                },
-            )
-        }
-        KernelKey::FusedQkvzaParo4G128T => {
-            let (wqkv, qkv) = gemv_weight_out(&steps[1]);
-            let (wz, z) = gemv_weight_out(&steps[2]);
-            let (wb, beta) = gemv_weight_out(&steps[3]);
-            let (wa, alpha) = gemv_weight_out(&steps[4]);
-            let k = wqkv.k;
-            #[cfg(debug_assertions)]
-            eprintln!(
-                "[dispatch] QKVZA Paro: k={}, mqkv={}, mz={}, mbeta={}, malpha={}",
-                k, wqkv.m, wz.m, wb.m, wa.m
-            );
-            gpu.ensure_paro_fused_scratch(k)
-                .map_err(|e| DispatchError::Hip(e.to_string()))?;
-            let rot_aliases: Vec<GpuTensor> = gpu
-                .scratch
-                .paro_fused_scratch
-                .as_ref()
-                .unwrap()
-                .iter()
-                .map(|t| GpuTensor {
-                    buf: unsafe { t.buf.alias() },
-                    shape: t.shape.clone(),
-                    dtype: t.dtype,
-                })
-                .collect();
-            fused_qkv.run(
-                ctx,
-                gpu,
-                &FusedQkvParams {
-                    kind: key,
-                    weights: &[wqkv.buf, wz.buf, wb.buf, wa.buf],
-                    x: activated,
-                    outputs: &[qkv, z, beta, alpha],
-                    m: &[wqkv.m, wz.m, wb.m, wa.m],
-                    k,
-                    rot_scratch: &rot_aliases,
-                    batch_size: None,
-                },
-            )
-        }
-        KernelKey::FusedQkvParo4G128T => {
-            let (wq, q) = gemv_weight_out(&steps[1]);
-            let (wk, k) = gemv_weight_out(&steps[2]);
-            let (wv, v) = gemv_weight_out(&steps[3]);
-            let kk = wq.k;
-            #[cfg(debug_assertions)]
-            eprintln!(
-                "[dispatch] QKV Paro: k={}, mq={}, mk={}, mv={}",
-                kk, wq.m, wk.m, wv.m
-            );
-            gpu.ensure_paro_fused_scratch(kk)
-                .map_err(|e| DispatchError::Hip(e.to_string()))?;
-            let rot_aliases: Vec<GpuTensor> = gpu
-                .scratch
-                .paro_fused_scratch
-                .as_ref()
-                .unwrap()
-                .iter()
-                .map(|t| GpuTensor {
-                    buf: unsafe { t.buf.alias() },
-                    shape: t.shape.clone(),
-                    dtype: t.dtype,
-                })
-                .collect();
-            fused_qkv.run(
-                ctx,
-                gpu,
-                &FusedQkvParams {
-                    kind: key,
-                    weights: &[wq.buf, wk.buf, wv.buf],
-                    x: activated,
-                    outputs: &[q, k, v],
-                    m: &[wq.m, wk.m, wv.m],
-                    k: kk,
-                    rot_scratch: &rot_aliases,
                     batch_size: None,
                 },
             )
@@ -2440,13 +2252,12 @@ mod tests {
     }
 
     #[test]
-    fn qkvza_no_paro_or_q8_fused_entries() {
+    fn qkvza_no_q8_fused_entries() {
         use crate::types::GemvVariant;
-        // ParoQ4G128 should not resolve to any fused QKVZA key. It may resolve
+        // Q8_0 should not resolve to any fused QKVZA key. It may resolve
         // to a plain GEMV key (or nothing for unsupported arches). Both are fine.
-        let paro = KernelKey::for_gemv(DType::ParoQ4G128, GemvVariant::Plain, false);
         let q8 = KernelKey::for_gemv(DType::Q8_0, GemvVariant::Plain, false);
-        for key in [paro.ok(), q8.ok()].into_iter().flatten() {
+        if let Ok(key) = q8 {
             assert!(
                 !matches!(
                     key,
@@ -2455,7 +2266,7 @@ mod tests {
                         | KernelKey::FusedQkvzaHfq4G256
                         | KernelKey::FusedQkvzaHfq6G256
                 ),
-                "ParoQ4G128/Q8_0 must not resolve to a fused QKVZA key, got {:?}",
+                "Q8_0 must not resolve to a fused QKVZA key, got {:?}",
                 key
             );
         }
@@ -2481,28 +2292,25 @@ mod tests {
     }
 
     #[test]
-    fn qkvza_fused_table_no_paro_q4_or_q8_entries() {
-        // ParoQ4G128 and Q8_0 must NOT have fused QKVZA entries — they fall
-        // through to per-op dispatch. This test asserts that none of the fused
-        // table keys match a Paro or Q8 variant, ensuring byte-identical
-        // unfused-path correctness for those dtypes.
-        let paro_q4_key = KernelKey::for_gemv(DType::ParoQ4G128, GemvVariant::Plain, false);
+    fn qkvza_fused_table_no_q8_entries() {
+        // Q8_0 must NOT resolve (via its plain GEMV key) to one of these fused
+        // QKVZA keys — it falls through to per-op dispatch. This test asserts
+        // that none of the fused table keys match a Q8 variant, ensuring
+        // byte-identical unfused-path correctness for that dtype.
         let q8_key = KernelKey::for_gemv(DType::Q8_0, GemvVariant::Plain, false);
-        // Paro and Q8 should resolve to plain GEMV keys, not fused QKVZA keys.
-        // (They may be Err for arches without support, which is also fine.)
-        for key in [paro_q4_key, q8_key] {
-            if let Ok(k) = key {
-                assert!(
-                    !matches!(
-                        k,
-                        KernelKey::FusedQkvzaMq4G256Lloyd
-                            | KernelKey::FusedQkvzaMq3G256Lloyd
-                            | KernelKey::FusedQkvzaHfq4G256
-                            | KernelKey::FusedQkvzaHfq6G256
-                    ),
-                    "ParoQ4G128/Q8_0 should not resolve to a fused QKVZA key"
-                );
-            }
+        // Q8 should resolve to a plain GEMV key, not a fused QKVZA key.
+        // (It may be Err for arches without support, which is also fine.)
+        if let Ok(k) = q8_key {
+            assert!(
+                !matches!(
+                    k,
+                    KernelKey::FusedQkvzaMq4G256Lloyd
+                        | KernelKey::FusedQkvzaMq3G256Lloyd
+                        | KernelKey::FusedQkvzaHfq4G256
+                        | KernelKey::FusedQkvzaHfq6G256
+                ),
+                "Q8_0 should not resolve to a fused QKVZA key"
+            );
         }
     }
 
@@ -2534,153 +2342,6 @@ mod tests {
         // dp4a key: just verify no panic
         let _ = family.resolve(KernelKey::FusedQkvzaHfq6G256, &ctx1100, None);
         let _ = family.resolve(KernelKey::FusedQkvzaHfq6G256, &ctx1201, None);
-    }
-
-    #[test]
-    fn paro_guards_reject_force_unfused() {
-        let ctx = DispatchCtx::for_test("gfx1100");
-        let empty: &[Step] = &[];
-        assert!(
-            !guard_gate_up_paro4g128t(empty, &ctx),
-            "force_unfused must reject gate_up_paro"
-        );
-        assert!(
-            !guard_qkvza_paro4g128t(empty, &ctx),
-            "force_unfused must reject qkvza_paro"
-        );
-        assert!(
-            !guard_qkv_paro4g128t(empty, &ctx),
-            "force_unfused must reject qkv_paro"
-        );
-    }
-
-    #[test]
-    fn paro_guards_require_raw_input_and_alignment() {
-        // Paro guards require GemvInput::Raw (not Prerotated) and m%8==0/k%128==0.
-        // We can't construct real Gemv steps with GPU tensors in a unit test,
-        // but we can verify the guards reject empty/wrong-length slices.
-        let ctx = DispatchCtx::for_test("gfx1100");
-        let empty: &[Step] = &[];
-        assert!(!guard_gate_up_paro4g128t(empty, &ctx));
-        assert!(!guard_qkvza_paro4g128t(empty, &ctx));
-        assert!(!guard_qkv_paro4g128t(empty, &ctx));
-    }
-
-    /// The pack4 kernel behind `FusedGateUpParo4G128T` reads the rotation from
-    /// native PARO4-G128 weight bytes. A safetensors-Dir weight of the same
-    /// dtype carries a sidecar rotation instead, and a G64 weight has neither
-    /// layout: both must stay on the per-projection Givens + GEMV path.
-    #[test]
-    fn paro_gate_up_fusion_admits_only_native_g128() {
-        use crate::families::gemv::GivensRef;
-        let ctx = DispatchCtx::for_test("gfx1100");
-        let t = || GpuTensor {
-            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(std::ptr::dangling_mut(), 4096) },
-            shape: vec![1024],
-            dtype: DType::F32,
-        };
-        let (x, norm, act, pairs, theta, scales) = (t(), t(), t(), t(), t(), t());
-        let sidecar = GivensRef {
-            pairs: &pairs,
-            theta: &theta,
-            scales: &scales,
-            krot: 8,
-        };
-        let admits = |dtype: DType, rotation: Option<GivensRef>| {
-            let w = WeightRef {
-                buf: &x,
-                dtype,
-                m: 16,
-                k: 128,
-                row_stride: 0,
-                rotation,
-                awq_scale: None,
-                lloyd_lut_e4m3: None,
-                lloyd_lut_f16: None,
-                lloyd_lut_c16: None,
-            };
-            let steps = [
-                Step::RmsnormAutomatic {
-                    x: &x,
-                    norm_weight: &norm,
-                    x_plain: &act,
-                    out: &act,
-                    awq_scale: None,
-                    k: 128,
-                    eps: 1e-6,
-                    rotation: RotationPlan::None,
-                    rows: 1,
-                },
-                Step::Gemv {
-                    w: &w,
-                    input: GemvInput::Raw(&act),
-                    out: &act,
-                },
-                Step::Gemv {
-                    w: &w,
-                    input: GemvInput::Raw(&act),
-                    out: &act,
-                },
-            ];
-            guard_gate_up_paro4g128t(&steps, &ctx)
-        };
-        assert!(
-            admits(DType::ParoQ4G128, None),
-            "native PARO4-G128 window must fuse"
-        );
-        assert!(
-            !admits(DType::ParoQ4G128, Some(sidecar)),
-            "sidecar G128 must not fuse"
-        );
-        assert!(
-            !admits(DType::ParoQ4G64, Some(sidecar)),
-            "G64 must not fuse"
-        );
-        assert!(!admits(DType::ParoQ4G64, None), "G64 must not fuse");
-    }
-
-    #[test]
-    fn paro_fused_table_entries_exist() {
-        let keys: Vec<_> = FUSED_TABLE.iter().map(|e| e.key).collect();
-        assert!(
-            keys.contains(&KernelKey::FusedGateUpParo4G128T),
-            "FusedGateUpParo4G128T missing from FUSED_TABLE"
-        );
-        assert!(
-            keys.contains(&KernelKey::FusedQkvzaParo4G128T),
-            "FusedQkvzaParo4G128T missing from FUSED_TABLE"
-        );
-        assert!(
-            keys.contains(&KernelKey::FusedQkvParo4G128T),
-            "FusedQkvParo4G128T missing from FUSED_TABLE"
-        );
-    }
-
-    #[test]
-    fn paro_fused_table_arch_coverage() {
-        let family = FusedQkvFamily::new();
-        let ctx1100 = DispatchCtx::for_test("gfx1100");
-        let ctx1201 = DispatchCtx::for_test("gfx1201");
-
-        let paro_keys = &[
-            KernelKey::FusedGateUpParo4G128T,
-            KernelKey::FusedQkvzaParo4G128T,
-            KernelKey::FusedQkvParo4G128T,
-        ];
-
-        for &key in paro_keys {
-            // Paro uses dp4a — should resolve on gfx1100 (RDNA3) and gfx1201 (RDNA4).
-            assert!(
-                family.resolve(key, &ctx1100, None).is_ok(),
-                "Paro key {:?} should resolve on gfx1100",
-                key
-            );
-            assert!(
-                family.resolve(key, &ctx1201, None).is_ok(),
-                "Paro key {:?} should resolve on gfx1201",
-                key
-            );
-        }
     }
 
     // ── Q4K / Q8_0 guard tests (Ship 2.1 A1 — Claude F1 / glm5 F2) ──────
@@ -2752,7 +2413,6 @@ mod tests {
             m: 4096,
             k: 4096,
             row_stride: 0,
-            rotation: None,
             awq_scale: None,
             lloyd_lut_e4m3: None,
             lloyd_lut_f16: lut,

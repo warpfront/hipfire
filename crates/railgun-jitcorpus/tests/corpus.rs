@@ -112,6 +112,7 @@ impl Fixture {
                 "kt48".into(),
                 NodeKey::Hipcc(key.into()),
             )],
+            loaded_sha256: None,
         }]
     }
 
@@ -123,6 +124,7 @@ impl Fixture {
             id: "p".into(),
             arch: ARCH.into(),
             nodes: vec![(self.symbol.clone(), "kt48".into(), key)],
+            loaded_sha256: None,
         }]
     }
 
@@ -337,4 +339,97 @@ fn record_for_module_ignores_pm_native_records() {
     let corpus = JitCorpus::open(&f.root).unwrap();
     assert_eq!(corpus.index().records[0].packaging_key, "key-now");
     assert!(corpus.record_for_module(ARCH, "kt48", "key-now").is_none());
+}
+
+fn with_loaded(mut programs: Vec<ProgramKeys>, sha: &str) -> Vec<ProgramKeys> {
+    programs[0].loaded_sha256 = Some(vec![sha.to_owned()]);
+    programs
+}
+
+#[test]
+fn recorded_sequence_node_resolves_when_the_record_is_for_the_loaded_object() {
+    let f = Fixture::new("sequence-exact");
+    let corpus = JitCorpus::open(&f.root).unwrap();
+    let coverage = check(&corpus, &with_loaded(f.program("key-now"), &f.sha));
+    assert_eq!(
+        (coverage[0].covered, coverage[0].missing.len()),
+        (1, 0),
+        "{coverage:?}"
+    );
+}
+
+#[test]
+fn recorded_sequence_node_whose_loaded_object_differs_from_the_record_is_missing_loudly() {
+    let f = Fixture::new("sequence-other-bytes");
+    let corpus = JitCorpus::open(&f.root).unwrap();
+    let other = "7".repeat(64);
+    let coverage = check(&corpus, &with_loaded(f.program("key-now"), &other));
+    assert_eq!(coverage[0].covered, 0);
+    let missing = &coverage[0].missing[0];
+    assert_eq!(missing.symbol, f.symbol);
+    assert!(
+        missing.reason.contains(&other) && missing.reason.contains(&f.sha),
+        "{missing:?}"
+    );
+    // A twin-keyed node is held to the same rule.
+    let mut native = f.native_program();
+    native[0].loaded_sha256 = Some(vec![other.clone()]);
+    let mut f2 = Fixture::new("sequence-other-bytes-native");
+    f2.index.records[0].origin = ObjectOrigin::PmNative;
+    f2.write_index();
+    let coverage = check(&JitCorpus::open(&f2.root).unwrap(), &native);
+    assert_eq!(coverage[0].covered, 0, "{coverage:?}");
+    assert!(coverage[0].missing[0].reason.contains(&other));
+}
+
+#[test]
+fn recorded_sequence_with_a_digest_count_mismatch_is_an_error() {
+    let f = Fixture::new("sequence-count");
+    let mut p = f.program("key-now");
+    p[0].loaded_sha256 = Some(vec![f.sha.clone(), f.sha.clone()]);
+    let coverage = check(&JitCorpus::open(&f.root).unwrap(), &p);
+    assert!(
+        coverage[0]
+            .missing
+            .iter()
+            .any(|m| m.reason.contains("1 nodes but 2 recorded object digests")),
+        "{coverage:?}"
+    );
+}
+
+#[test]
+fn conditional_node_is_reported_not_an_error_and_unknown_is_listed() {
+    for (status, proven, unknown, conditional) in [
+        ("proven", 1, 0, 0),
+        ("conditional", 0, 0, 1),
+        ("unknown", 0, 1, 0),
+    ] {
+        let mut f = Fixture::new(&format!("verdict-{status}"));
+        f.index.records[0].kernels = vec![railgun_corpus::KernelVerdict {
+            symbol: f.symbol.clone(),
+            status: status.into(),
+            differential: "pass".into(),
+        }];
+        f.write_index();
+        let corpus = JitCorpus::open(&f.root).unwrap();
+        let c = &check(&corpus, &f.program("key-now"))[0];
+        assert_eq!(
+            (
+                c.covered,
+                c.missing.len(),
+                c.proven,
+                c.unknown,
+                c.conditional
+            ),
+            (1, 0, proven, unknown, conditional),
+            "{status}: {c:?}"
+        );
+        assert_eq!(c.unproven.len(), usize::from(status != "proven"));
+        if status != "proven" {
+            assert_eq!(
+                (c.unproven[0].symbol.as_str(), c.unproven[0].status.as_str()),
+                (f.symbol.as_str(), status)
+            );
+        }
+    }
 }

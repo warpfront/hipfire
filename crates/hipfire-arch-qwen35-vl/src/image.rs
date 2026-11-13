@@ -226,6 +226,38 @@ pub fn load_and_preprocess_from_bytes(
     ))
 }
 
+/// Content identity of an image (sha256 of its encoded bytes), so a resident
+/// conversation can tell a replaced image from the one whose rows it holds.
+pub fn image_fingerprint(data: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(data).into()
+}
+
+/// The `(height, width)` [`load_and_preprocess_from_bytes`] would resize the
+/// image to, read from the format header alone (no pixel decode, same
+/// decompression-bomb bound). Lets a caller size the visual-token run of an
+/// image it may not need to encode.
+pub fn preprocessed_dims_from_bytes(
+    data: &[u8],
+    patch_size: usize,
+    spatial_merge_size: usize,
+) -> Result<(usize, usize), String> {
+    let (orig_w, orig_h) = hipfire_runtime::imagedec::probe_dimensions(data)?;
+    let (orig_w, orig_h) = (orig_w as usize, orig_h as usize);
+    if orig_w * orig_h > MAX_DIMENSION_PIXELS {
+        return Err(format!(
+            "image dimensions ({orig_w}x{orig_h}) exceed maximum ({MAX_DIMENSION_PIXELS} pixels)"
+        ));
+    }
+    Ok(smart_resize(
+        orig_h,
+        orig_w,
+        patch_size * spatial_merge_size,
+        VISION_MIN_PIXELS,
+        vision_max_pixels(),
+    ))
+}
+
 /// Extract non-overlapping patches from a CHW image.
 ///
 /// Input: `[C, H, W]` where H and W are divisible by `patch_size *

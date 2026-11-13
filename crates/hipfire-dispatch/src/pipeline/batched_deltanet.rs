@@ -16,8 +16,14 @@ use crate::ops::delta_net::StateQuant;
 use crate::pipeline::batched::*;
 use crate::pipeline::hybrid::HybridDims;
 use hip_bridge::{HipError, HipResult};
+use rdna_compute::gdn_stream::{
+    GdnAppendSchedule, GdnCarryGeometry, GdnCarryView as ScanCarryView, GdnLiveState,
+    GdnPrefillPlan, GdnQ8Planes, GdnScanAlgorithm, GdnSeqInputs, GdnStreamConsts, GdnStreamInput,
+    GdnStreamMeta, GdnStreamRaw, GdnStreamScratch, GdnStreamWorkspace, GdnTensorFormat,
+};
 use rdna_compute::norm::GdnScanOut;
 use rdna_compute::{DType, Gpu, GpuTensor};
+use std::cell::{Cell, RefCell};
 
 /// Resident weights of one gated DeltaNet sublayer.
 #[derive(Clone, Copy)]
@@ -37,6 +43,37 @@ pub struct DeltaNetLayerView<'a> {
     pub w_gate: WeightRef<'a>,
 }
 
+/// Borrowed per-layer GDN stream carry buffers (CHUNK-CANONICAL §3.2): FP32
+/// tile-entry state, tile-entry conv history, and the raw pre-conv QKV and
+/// raw alpha/beta of the incomplete microtile. One tensor per DeltaNet layer,
+/// each lane-major (`lanes` × per-lane extent of `geometry`).
+#[derive(Clone, Copy)]
+pub struct GdnCarryView<'a> {
+    pub geometry: GdnCarryGeometry,
+    pub tile_state: &'a [GpuTensor],
+    pub tile_conv: &'a [GpuTensor],
+    pub raw_qkv: &'a [GpuTensor],
+    pub raw_ab: &'a [GpuTensor],
+}
+
+/// Borrowed absolute-position stream state of every DeltaNet layer: recipe,
+/// owner generation, per-layer and per-lane host cursors
+/// (`meta[layer * lanes + lane]`), and the carry buffers when the resolved scan
+/// algorithm needs a microtile larger than one row (`None` otherwise).
+#[derive(Clone, Copy)]
+pub struct GdnStreamView<'a> {
+    pub recipe_id: u64,
+    pub generation: u64,
+    pub lanes: usize,
+    pub meta: &'a [GdnStreamMeta],
+    pub carry: Option<GdnCarryView<'a>>,
+    /// Resolved canonical prefill plan of every DeltaNet layer (`plans[layer]`);
+    /// empty while the owner is unprovisioned (F32/Q4 state, or never prefilled).
+    pub plans: &'a [GdnPrefillPlan],
+    /// Fixed 64-row edge workspaces of the Scan64 executor, one per scan-output format.
+    pub workspaces: &'a [GdnStreamWorkspace],
+}
+
 /// Recurrent state of every DeltaNet layer.
 #[derive(Clone, Copy)]
 pub struct DeltaNetStateView<'a> {
@@ -45,6 +82,7 @@ pub struct DeltaNetStateView<'a> {
     pub conv_states: &'a [GpuTensor],
     pub s_ef_residual: &'a [GpuTensor],
     pub quant: StateQuant,
+    pub stream: GdnStreamView<'a>,
 }
 
 impl DeltaNetStateView<'_> {
@@ -1498,29 +1536,6 @@ fn gdn_out_reader(
     }
 }
 
-/// Storage of the gfx1201 GDN chunk-scan `out` plane for this LA layer, by the
-/// producer that reads it (overridable by `HIPFIRE_GDN_SCAN_OUT`): A4 IU4
-/// default bf16 (pp8192 faster in both orders); FP8-stream default f32 (its
-/// bf16 twin measured slower end to end); f32 for producers without a twin.
-fn gdn_scan_out_fmt(
-    gpu: &Gpu,
-    layer: &DeltaNetLayerView<'_>,
-    config: &HybridDims,
-    n: usize,
-    n_v_heads: usize,
-    epilogue: &BatchEpilogue<'_>,
-    fusion: DflashFusionCtx,
-) -> HipResult<GdnScanOut> {
-    match gdn_out_reader(gpu, layer, config, n, n_v_heads, epilogue, fusion) {
-        GdnOutReader::Fp8Stream => gpu.gdn_scan_out(GdnScanOut::F32),
-        // IU4 verify: the GDN scan plane stays F32 (the verify change is the
-        // GEMM activations only, and the multi-request trunk reads F32).
-        GdnOutReader::Gfx12Iu4 if gpu.iu4_verify_scope => Ok(GdnScanOut::F32),
-        GdnOutReader::Gfx12Iu4 => gpu.gdn_scan_out(GdnScanOut::Bf16),
-        GdnOutReader::F32Only => Ok(GdnScanOut::F32),
-    }
-}
-
 /// Prescaffold (behavior-only) extraction for S4-f16-residual-inputs.
 ///
 /// Same statements, same order, same launches as the inlined block.
@@ -1840,87 +1855,105 @@ pub fn gdn_chunk_head_geometry_supported(
         && conv_kernel_dim == 4
 }
 
-/// Preamble module of one admitted GDN chunk-scan layer, resolved before any projection or
-/// persistent preamble mutation. `Fixup` is the dense fused-QKVZA completion pass (the
-/// incumbent plain prep is still the fallback when the projection declines the fused launch),
-/// `Pm` the opt-in `HIPFIRE_GDN_CHUNK_PREP_PM` twin of the incumbent plain prep, chosen only
-/// by the MoE caller (`Gpu::gdn_chunk_prep_pm_admitted`); the dense route never selects it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GdnChunkPrepModule {
-    Incumbent,
-    Fixup,
-    Pm,
+/// Per-forward handle of the canonical ordinary-prefill GDN route
+/// (CHUNK-CANONICAL-DESIGN §3.3). Every DeltaNet layer appends its rows at
+/// absolute `start_pos` through the layer's frozen plan; outputs are published
+/// for the new rows only.
+#[derive(Clone, Copy)]
+pub struct GdnStreamCall<'a> {
+    /// Absolute position of the forward's first row.
+    pub start_pos: u64,
+    /// Candidate cursor of every DeltaNet layer (`[delta_layer]`), filled by each
+    /// layer's append. The owner publishes them only after the whole forward
+    /// succeeded on every layer.
+    pub candidates: &'a RefCell<Vec<Option<GdnStreamMeta>>>,
+    /// Set just before the first device-mutating append so a failure can fail closed.
+    pub attempted: &'a Cell<bool>,
 }
 
-/// Raw BF16 views and geometry of one admitted GDN chunk-scan layer.
-pub struct GdnChunkScanViews {
+/// How a batched DeltaNet layer advances its recurrence.
+#[derive(Clone, Copy)]
+pub enum GdnPrefillRoute<'a> {
+    /// Per-call recurrence of decode-shaped, verify, tape and banded forwards.
+    Legacy,
+    /// Canonical ordinary prefill: absolute-position stream append.
+    Stream(GdnStreamCall<'a>),
+}
+
+/// Plan, current cursor and carry of one DeltaNet layer of a single-lane stream.
+/// With a `call`, a candidate recorded earlier in the same forward (the two halves of a
+/// chunk pair append to the same layer in order) is the layer's current cursor.
+fn gdn_stream_layer<'a>(
+    dn_state: &DeltaNetStateView<'a>,
+    layer: usize,
+    call: Option<&GdnStreamCall<'_>>,
+) -> HipResult<(&'a GdnPrefillPlan, GdnStreamMeta, GdnCarryView<'a>)> {
+    let s = dn_state.stream;
+    let fail = |m: &str| HipError::new(0, &format!("GDN stream route: {m}"));
+    if s.lanes != 1 {
+        return Err(fail("ordinary prefill needs a single-lane state"));
+    }
+    let plan = s
+        .plans
+        .get(layer)
+        .ok_or_else(|| fail("no plan bound for this layer"))?;
+    let committed = *s
+        .meta
+        .get(layer)
+        .ok_or_else(|| fail("no cursor for this layer"))?;
+    let meta = call
+        .and_then(|c| c.candidates.borrow().get(layer).copied().flatten())
+        .unwrap_or(committed);
+    let carry = s.carry.ok_or_else(|| fail("state owns no carry"))?;
+    Ok((plan, meta, carry))
+}
+
+/// Scan algorithm the frozen plan of DeltaNet layer `layer` selects.
+pub fn gdn_stream_algorithm(
+    dn_state: &DeltaNetStateView<'_>,
+    layer: usize,
+) -> HipResult<GdnScanAlgorithm> {
+    gdn_stream_layer(dn_state, layer, None).map(|(plan, _, _)| plan.algorithm)
+}
+
+fn gdn_stream_record(call: &GdnStreamCall<'_>, layer: usize, next: GdnStreamMeta) -> HipResult<()> {
+    let mut c = call.candidates.borrow_mut();
+    match c.get_mut(layer) {
+        Some(slot) => {
+            *slot = Some(next);
+            Ok(())
+        }
+        None => Err(HipError::new(
+            0,
+            "GDN stream route: candidate table too small",
+        )),
+    }
+}
+
+/// Byte views of the stream executor's scratch planes over `pbs` for an `n`-row
+/// append: q/k (`[n][n_k_heads*128]`), v (`[n][n_v_heads*128]`) f16 planes and
+/// the 64-row A blocks. The single construction both the executor's scratch and
+/// the fused producer's q/k/v targets use, so they cannot drift.
+struct GdnStreamViews {
     q: GpuTensor,
     k: GpuTensor,
     v: GpuTensor,
     a: GpuTensor,
-    segment_rows: usize,
-    pub scan_out: GdnScanOut,
-    kkt_batched: bool,
-    prep: GdnChunkPrepModule,
 }
 
-/// Validates head geometry, scratch and state extents, builds the BF16 q/k/v/A
-/// views over the ordinary prefill scratch and resolves the scan modules
-/// (`prep` also the prep-fixup or PM prep module). Runs before any projection or
-/// persistent preamble mutation.
-#[allow(clippy::too_many_arguments)]
-pub fn gdn_chunk_scan_prepare_views(
-    gpu: &mut Gpu,
+fn gdn_stream_scratch_views(
     pbs: &BatchScratch<'_>,
-    dn_state: &DeltaNetStateView<'_>,
-    config: &HybridDims,
-    delta_layer_idx: usize,
     n: usize,
-    k_dim: usize,
-    v_dim: usize,
     n_k_heads: usize,
     n_v_heads: usize,
-    commit_stride: Option<usize>,
-    scan_out: GdnScanOut,
-    prep: GdnChunkPrepModule,
-) -> HipResult<GdnChunkScanViews> {
-    if !gdn_chunk_head_geometry_supported(
-        n_k_heads,
-        n_v_heads,
-        config.linear_key_dim,
-        config.linear_value_dim,
-        config.conv_kernel,
-    ) {
-        return Err(HipError::new(
-            0,
-            "invalid admitted GDN chunk scan head geometry",
-        ));
-    }
-    let segment_rows = commit_stride.unwrap_or(n);
-    let tail_rows = n % segment_rows;
-    if !(64..=512).contains(&segment_rows)
-        || (tail_rows != 0 && !(64..segment_rows).contains(&tail_rows))
-    {
-        return Err(HipError::new(
-            0,
-            "invalid admitted GDN chunk scan segment geometry",
-        ));
-    }
-
-    let checked_bytes = |rows: usize, width: usize, elem: usize| -> HipResult<usize> {
-        rows.checked_mul(width)
-            .and_then(|v| v.checked_mul(elem))
-            .ok_or_else(|| HipError::new(0, "GDN chunk scan byte extent overflow"))
-    };
+) -> HipResult<GdnStreamViews> {
+    let fail = |m: String| HipError::new(0, &format!("GDN stream scan: {m}"));
     let raw_view = |tensor: &GpuTensor, need: usize, name: &str| -> HipResult<GpuTensor> {
         if tensor.buf.size() < need {
-            return Err(HipError::new(
-                0,
-                &format!(
-                    "GDN chunk scan {name} scratch undersized: have {}, need {need}",
-                    tensor.buf.size()
-                ),
-            ));
+            return Err(fail(format!(
+                "{name} scratch undersized: have {}, need {need}",
+                tensor.buf.size()
+            )));
         }
         Ok(GpuTensor {
             buf: unsafe { hip_bridge::DeviceBuffer::from_raw(tensor.buf.as_ptr(), need) },
@@ -1928,93 +1961,68 @@ pub fn gdn_chunk_scan_prepare_views(
             dtype: DType::Raw,
         })
     };
-    let require_bytes = |tensor: &GpuTensor, need: usize, name: &str| -> HipResult<()> {
-        if tensor.buf.size() < need {
-            Err(HipError::new(
-                0,
-                &format!(
-                    "GDN chunk scan {name} undersized: have {}, need {need}",
-                    tensor.buf.size()
-                ),
-            ))
-        } else {
-            Ok(())
-        }
-    };
-
-    let q_bytes = checked_bytes(n, n_k_heads * GDN_CHUNK_HEAD_DIM, 2)?;
-    let v_bytes = checked_bytes(n, n_v_heads * GDN_CHUNK_HEAD_DIM, 2)?;
-    // Batched KKT: one solve per layer writes every segment's A blocks at
-    // their layer row, so A spans all rows; segments must sit on C64 chunks.
-    let kkt_batched = gpu.gdn_kkt_batched_enabled() && segment_rows % 64 == 0 && n > segment_rows;
-    let a_rows = (if kkt_batched { n } else { segment_rows } + 63) / 64 * 64;
-    let a_bytes = checked_bytes(a_rows, n_v_heads * 64, 2)?;
-    let q = raw_view(&pbs.dn_q_batch, q_bytes, "q")?;
-    let k = raw_view(&pbs.dn_k_batch, q_bytes, "k")?;
-    let v = raw_view(&pbs.dn_v_batch, v_bytes, "v")?;
-    let a = raw_view(&pbs.dn_q_raw_batch, a_bytes, "A")?;
-
-    require_bytes(
-        &pbs.dn_qkv_batch,
-        checked_bytes(n, 2 * k_dim + v_dim, 4)?,
-        "projected input",
-    )?;
-    require_bytes(&pbs.dn_alpha_batch, checked_bytes(n, n_v_heads, 4)?, "G")?;
-    require_bytes(&pbs.dn_beta_batch, checked_bytes(n, n_v_heads, 4)?, "beta")?;
-    require_bytes(
-        &pbs.dn_attn_out_batch,
-        checked_bytes(n, v_dim, 4)?,
-        "output",
-    )?;
-    let state_elems = n_v_heads * GDN_CHUNK_HEAD_DIM * GDN_CHUNK_HEAD_DIM;
-    require_bytes(
-        &dn_state.s_matrices[delta_layer_idx],
-        state_elems,
-        "Q8 state",
-    )?;
-    require_bytes(
-        &dn_state.s_scales[delta_layer_idx],
-        n_v_heads * GDN_CHUNK_HEAD_DIM * 4,
-        "state scales",
-    )?;
-    let ef = dn_state
-        .ef_residual(delta_layer_idx)
-        .ok_or_else(|| HipError::new(0, "GDN chunk scan requires complete EF state"))?;
-    require_bytes(ef, state_elems * 2, "EF state")?;
-    require_bytes(
-        &dn_state.conv_states[delta_layer_idx],
-        (2 * k_dim + v_dim) * (config.conv_kernel - 1) * 4,
-        "conv state",
-    )?;
-
-    // JIT/load failure must occur before input projection or persistent
-    // preamble mutation; no legacy retry is valid after this point.
-    gpu.gdn_chunk_prepare(scan_out)?;
-    match prep {
-        GdnChunkPrepModule::Incumbent => {}
-        GdnChunkPrepModule::Fixup => gpu.gdn_chunk_prep_fixup_prepare()?,
-        GdnChunkPrepModule::Pm => gpu.gdn_chunk_prep_pm_prepare()?,
-    }
-    Ok(GdnChunkScanViews {
-        q,
-        k,
-        v,
-        a,
-        segment_rows,
-        scan_out,
-        kkt_batched,
-        prep,
+    let q_bytes = n * n_k_heads * GDN_CHUNK_HEAD_DIM * 2;
+    let v_bytes = n * n_v_heads * GDN_CHUNK_HEAD_DIM * 2;
+    let a_bytes = n.div_ceil(64) * 64 * n_v_heads * 64 * 2;
+    Ok(GdnStreamViews {
+        q: raw_view(&pbs.dn_q_batch, q_bytes, "q")?,
+        k: raw_view(&pbs.dn_k_batch, q_bytes, "k")?,
+        v: raw_view(&pbs.dn_v_batch, v_bytes, "v")?,
+        a: raw_view(&pbs.dn_q_raw_batch, a_bytes, "A")?,
     })
 }
 
-/// One layer's GDN chunk scan over [`GdnChunkScanViews`]: prep (or, with
-/// `prep_fused`, the fixup after the fused QKVZA; or, when `views.prep` is
-/// [`GdnChunkPrepModule::Pm`], the PM twin of the plain prep) -> batched KKT -> BF16
-/// mseg / per-segment scan. `a` holds `n_v_heads` 64x64 blocks per chunk row.
-#[allow(clippy::too_many_arguments)]
-pub fn gdn_chunk_scan_layer(
+/// Whether the fused A4 producer (+ `gdn_chunk_prep_fixup`) may run for this
+/// layer append: Scan64 plan with the BF16 scan plane and the IU4 gfx1201
+/// projection recipe, fused prep enabled, supported head geometry, and an
+/// append schedule (the exact one `gdn_stream_append` computes) with no head
+/// replay and no incomplete final tile. Any other state returns `false` and the
+/// raw-row path runs unchanged; errors are left for that path to report.
+fn gdn_stream_fused_prep_admitted(
+    gpu: &Gpu,
+    config: &HybridDims,
+    dn_state: &DeltaNetStateView<'_>,
+    layer: usize,
+    call: &GdnStreamCall<'_>,
+    n: usize,
+    n_k_heads: usize,
+    n_v_heads: usize,
+) -> bool {
+    let Ok((plan, meta, _)) = gdn_stream_layer(dn_state, layer, Some(call)) else {
+        return false;
+    };
+    if plan.algorithm != GdnScanAlgorithm::Scan64
+        || plan.scan_output_format != GdnTensorFormat::Bf16
+        || plan.projection_recipe.qkv != rdna_compute::prefill_invariant::gdn_arith::IU4_G12
+        || n == 0
+        || !gpu.gdn_prep_fused_enabled()
+        || !gdn_chunk_head_geometry_supported(
+            n_k_heads,
+            n_v_heads,
+            config.linear_key_dim,
+            config.linear_value_dim,
+            config.conv_kernel,
+        )
+    {
+        return false;
+    }
+    matches!(
+        GdnAppendSchedule::new(&meta, call.start_pos, n, 64, 512),
+        Ok(s) if !s.head && s.bulk_tail == 0
+    )
+}
+
+/// One Scan64 layer: append the layer's raw projected rows (post-projection,
+/// pre-convolution QKV and raw alpha/beta in `pbs`) at absolute position through
+/// the plan's edge/bulk executor; the scan output lands in `pbs.dn_attn_out_batch`
+/// in the plan's scan-output format (returned). The candidate cursor is recorded
+/// in the call; nothing is published here. With `input == FusedPrepped` the
+/// projection was the fused A4 producer (see
+/// `gdn_stream_fused_prep_admitted`) and the executor runs only the fixup.
+pub fn gdn_stream_scan_layer(
     gpu: &mut Gpu,
-    views: &GdnChunkScanViews,
+    call: &GdnStreamCall<'_>,
+    config: &HybridDims,
     pbs: &BatchScratch<'_>,
     dn_state: &DeltaNetStateView<'_>,
     delta_layer_idx: usize,
@@ -2023,107 +2031,149 @@ pub fn gdn_chunk_scan_layer(
     a_log: &GpuTensor,
     n: usize,
     q_scale: f32,
-    eps: f32,
-    prep_fused: bool,
     n_k_heads: usize,
     n_v_heads: usize,
-) -> HipResult<()> {
-    let (q, k, v, a) = (&views.q, &views.k, &views.v, &views.a);
-    let (segment_rows, scan_out, kkt_batched) =
-        (views.segment_rows, views.scan_out, views.kkt_batched);
-    // The fused QKVZA already wrote q/k/v except the tile heads; the
-    // completion pass finishes them, the gates and the conv ring. The PM twin
-    // replaces only the plain prep and is never combined with the fused projection.
-    debug_assert!(!(prep_fused && views.prep == GdnChunkPrepModule::Pm));
-    let prep = if prep_fused {
-        Gpu::gdn_chunk_prep_fixup
-    } else if views.prep == GdnChunkPrepModule::Pm {
-        Gpu::gdn_chunk_prep_pm
-    } else {
-        Gpu::gdn_chunk_prep
-    };
-    prep(
-        gpu,
-        &pbs.dn_qkv_batch,
-        conv_weight,
-        &dn_state.conv_states[delta_layer_idx],
-        &pbs.dn_alpha_batch,
-        &pbs.dn_beta_batch,
-        dt_bias,
-        a_log,
-        q,
-        k,
-        v,
-        n,
-        q_scale,
-        eps,
+    input: GdnStreamInput,
+) -> HipResult<GdnScanOut> {
+    let fail = |m: String| HipError::new(0, &format!("GDN stream scan: {m}"));
+    if !gdn_chunk_head_geometry_supported(
         n_k_heads,
         n_v_heads,
-    )?;
-    let ef = dn_state
-        .ef_residual(delta_layer_idx)
-        .expect("GDN chunk scan admission prevalidated EF state");
-    if kkt_batched {
-        gpu.gdn_chunk_kkt_solve_batched(
-            k,
-            &pbs.dn_alpha_batch,
-            &pbs.dn_beta_batch,
-            a,
-            n,
-            n_k_heads,
-            n_v_heads,
-        )?;
+        config.linear_key_dim,
+        config.linear_value_dim,
+        config.conv_kernel,
+    ) {
+        return Err(fail("unsupported head geometry".into()));
     }
-    if kkt_batched && gpu.gdn_scan_mseg_enabled(scan_out, segment_rows) {
-        // One scan launch walks every commit segment (byte-identical).
-        gpu.gdn_chunk_scan_layer_mseg(
-            q,
-            k,
-            v,
-            a,
-            &pbs.dn_alpha_batch,
-            &pbs.dn_beta_batch,
-            &dn_state.s_matrices[delta_layer_idx],
-            &dn_state.s_scales[delta_layer_idx],
+    let (plan, meta, carry) = gdn_stream_layer(dn_state, delta_layer_idx, Some(call))?;
+    if plan.algorithm != GdnScanAlgorithm::Scan64 {
+        return Err(fail(format!("plan algorithm is {:?}", plan.algorithm)));
+    }
+    let out_fmt = match plan.scan_output_format {
+        GdnTensorFormat::Bf16 => GdnScanOut::Bf16,
+        GdnTensorFormat::F32 => GdnScanOut::F32,
+        GdnTensorFormat::F16 => return Err(fail("the scan has no f16 output plane".into())),
+    };
+    let ws = dn_state
+        .stream
+        .workspaces
+        .iter()
+        .find(|w| w.out_fmt == out_fmt && w.hk == n_k_heads && w.hv == n_v_heads)
+        .ok_or_else(|| fail("no edge workspace for this geometry/output format".into()))?;
+    let micro = carry.geometry.micro_rows;
+    if micro < 64 {
+        return Err(fail(format!("carry microtile {micro} < 64")));
+    }
+    let l = delta_layer_idx;
+    let alpha = carry.raw_ab[l].sub_offset(0, micro * n_v_heads);
+    let beta = carry.raw_ab[l].sub_offset(micro * n_v_heads, micro * n_v_heads);
+    let scan_carry = ScanCarryView {
+        tile_entry_f32: &carry.tile_state[l],
+        tile_entry_conv: &carry.tile_conv[l],
+        pending_qkv: &carry.raw_qkv[l],
+        pending_alpha: &alpha,
+        pending_beta: &beta,
+    };
+    let ef = dn_state.ef_residual(l);
+    let live = GdnLiveState {
+        planes: GdnQ8Planes {
+            codes: &dn_state.s_matrices[l],
+            scales: &dn_state.s_scales[l],
             ef,
-            &pbs.dn_attn_out_batch,
-            n,
-            n_k_heads,
-            n_v_heads,
-        )?;
-    } else {
-        for row0 in (0..n).step_by(segment_rows) {
-            let rows = (n - row0).min(segment_rows);
-            // Batched: this segment's A blocks start at its layer row.
-            let a_seg = if kkt_batched {
-                a.sub_offset(
-                    row0 * n_v_heads * 64 * 2,
-                    rows.div_ceil(64) * 64 * n_v_heads * 64 * 2,
-                )
-            } else {
-                a.shallow_clone()
-            };
-            gpu.gdn_chunk_scan_segment(
-                q,
-                k,
-                v,
-                &a_seg,
-                &pbs.dn_alpha_batch,
-                &pbs.dn_beta_batch,
-                &dn_state.s_matrices[delta_layer_idx],
-                &dn_state.s_scales[delta_layer_idx],
-                ef,
-                &pbs.dn_attn_out_batch,
-                scan_out,
-                row0,
-                rows,
-                !kkt_batched,
-                n_k_heads,
-                n_v_heads,
-            )?;
-        }
+        },
+        conv: &dn_state.conv_states[l],
+    };
+    let GdnStreamViews { q, k, v, a } = gdn_stream_scratch_views(pbs, n, n_k_heads, n_v_heads)?;
+    let consts = GdnStreamConsts {
+        conv_weight,
+        dt_bias,
+        a_log,
+        q_scale,
+        eps: config.norm_eps,
+        n_key_heads: n_k_heads,
+        n_value_heads: n_v_heads,
+    };
+    let raw = GdnStreamRaw {
+        qkv: &pbs.dn_qkv_batch,
+        alpha: &pbs.dn_alpha_batch,
+        beta: &pbs.dn_beta_batch,
+        input,
+    };
+    let scratch = GdnStreamScratch {
+        q: &q,
+        k: &k,
+        v: &v,
+        a: &a,
+    };
+    call.attempted.set(true);
+    let next = gpu.gdn_stream_append(
+        plan,
+        &meta,
+        call.start_pos,
+        n,
+        &consts,
+        &raw,
+        &scratch,
+        &pbs.dn_attn_out_batch,
+        &live,
+        &scan_carry,
+        ws,
+    )?;
+    gdn_stream_record(call, l, next)?;
+    Ok(out_fmt)
+}
+
+/// One Sequential-plan layer: the caller's producer already ran the convolution,
+/// gates and Q/K normalization into `pbs` (`dn_q_batch`/`dn_k_batch` value-head
+/// planes, `dn_v_batch`, gate `dn_alpha_batch`, beta `dn_beta_batch`); the
+/// recurrence continues from the FP32 accumulator and quantizes only at absolute
+/// 512-row seams. Output F32 in `pbs.dn_attn_out_batch`.
+pub fn gdn_stream_sequential_layer(
+    gpu: &mut Gpu,
+    call: &GdnStreamCall<'_>,
+    pbs: &BatchScratch<'_>,
+    dn_state: &DeltaNetStateView<'_>,
+    delta_layer_idx: usize,
+    n: usize,
+    n_v_heads: usize,
+) -> HipResult<()> {
+    let (plan, meta, carry) = gdn_stream_layer(dn_state, delta_layer_idx, Some(call))?;
+    if plan.algorithm != GdnScanAlgorithm::Sequential {
+        return Err(HipError::new(
+            0,
+            &format!(
+                "GDN stream sequential: plan algorithm is {:?}",
+                plan.algorithm
+            ),
+        ));
     }
-    Ok(())
+    let l = delta_layer_idx;
+    let planes = GdnQ8Planes {
+        codes: &dn_state.s_matrices[l],
+        scales: &dn_state.s_scales[l],
+        ef: dn_state.ef_residual(l),
+    };
+    let inp = GdnSeqInputs {
+        q: &pbs.dn_q_batch,
+        k: &pbs.dn_k_batch,
+        v: &pbs.dn_v_batch,
+        gate: &pbs.dn_alpha_batch,
+        beta: &pbs.dn_beta_batch,
+        qk_head_ratio: 1,
+    };
+    call.attempted.set(true);
+    let next = gpu.gdn_stream_append_sequential(
+        plan,
+        &meta,
+        call.start_pos,
+        n,
+        &inp,
+        &pbs.dn_attn_out_batch,
+        &planes,
+        &carry.tile_state[l],
+        n_v_heads,
+    )?;
+    gdn_stream_record(call, l, next)
 }
 
 pub fn batch_chunk_delta_net_attn(
@@ -2147,8 +2197,7 @@ pub fn batch_chunk_delta_net_attn(
     arch_has_wmma: bool,
     epilogue: BatchEpilogue<'_>,
     fusion: DflashFusionCtx,
-    commit_stride: Option<usize>,
-    gdn_chunk_scan_admitted: bool,
+    route: GdnPrefillRoute<'_>,
 ) -> HipResult<()> {
     // Per-layer dtype branch: MQ4 needs FWHT-rotation on the
     // activation to match its pre-rotated weights; HFQ4 uses
@@ -2163,35 +2212,53 @@ pub fn batch_chunk_delta_net_attn(
     // together (the all-together corruption-prevention rule from
     // docs/plans/mq-lloyd-batched-prefill-followup.md). MQ4-Lloyd
     // is wired in a separate PR (issue #182).
-    let gdn_chunk_scan_views = if gdn_chunk_scan_admitted {
-        let scan_out = gdn_scan_out_fmt(gpu, layer, config, n, n_v_heads, &epilogue, fusion)?;
-        // Dense route: never the PM twin (`HIPFIRE_GDN_CHUNK_PREP_PM` is MoE-only, 16/32 heads).
-        let prep = if gpu.gdn_prep_fused_enabled() {
-            GdnChunkPrepModule::Fixup
-        } else {
-            GdnChunkPrepModule::Incumbent
-        };
-        Some(gdn_chunk_scan_prepare_views(
-            gpu,
-            pbs,
-            dn_state,
-            config,
-            delta_layer_idx,
-            n,
-            k_dim,
-            v_dim,
-            GDN_CHUNK_KEY_HEADS,
-            GDN_CHUNK_MAX_VALUE_HEADS,
-            commit_stride,
-            scan_out,
-            prep,
-        )?)
-    } else {
-        None
-    };
+    let math = verify_dense_math(gpu);
+    // Canonical ordinary prefill: the projection stores the raw rows and the
+    // stream owns convolution, gates and scan from the absolute position, so
+    // the numerical recipe never depends on the outer call's extent.
+    //
+    // Admission of the fused A4 producer inside the stream (gfx1201, 27B): the
+    // fused `qkvzagdn_b1s` launch (QKV+Z+beta+alpha SET whose epilogue also runs
+    // the q/k/v part of `gdn_chunk_prep`) followed by `gdn_chunk_prep_fixup` is
+    // the same per-row arithmetic as four SETs plus the plain prep
+    // (`gdn_arith::IU4_G12`: "one arithmetic"; the fixup carries the same causal
+    // C64 gate prefix; `gdn_canonical_producer_oracle` `fused_vs_plain`). The
+    // only difference is that the fused GEMM stores just the raw QKV rows the
+    // fixup reads, while the stream needs full raw rows for a head replay and
+    // for the carried raw prefix of an incomplete final tile. So it is admitted
+    // only for an append whose schedule has NO head replay and NO incomplete
+    // final tile (start and end on absolute 64-row tile boundaries): the C64
+    // gate chunks and 128-row producer tiles then start on the absolute tile
+    // grid and no later append reads this call's raw rows. Every other append
+    // keeps the four SETs + full plain prep.
     let q_scale = 1.0 / (hd as f32).sqrt();
-    let gdn_targets = match &gdn_chunk_scan_views {
-        Some(views) if gpu.gdn_prep_fused_enabled() => Some(rdna_compute::F2GdnTargets {
+    let fused_views = match &route {
+        GdnPrefillRoute::Stream(call)
+            if gdn_stream_fused_prep_admitted(
+                gpu,
+                config,
+                dn_state,
+                delta_layer_idx,
+                call,
+                n,
+                config.linear_key_heads,
+                n_v_heads,
+            ) =>
+        {
+            // Resolve the completion module before the projection mutates anything.
+            gpu.gdn_chunk_prep_fixup_prepare()?;
+            Some(gdn_stream_scratch_views(
+                pbs,
+                n,
+                config.linear_key_heads,
+                n_v_heads,
+            )?)
+        }
+        _ => None,
+    };
+    let gdn_targets = fused_views
+        .as_ref()
+        .map(|views| rdna_compute::F2GdnTargets {
             conv_weight: &layer.conv_weight,
             conv_state: &dn_state.conv_states[delta_layer_idx],
             q: &views.q,
@@ -2199,10 +2266,7 @@ pub fn batch_chunk_delta_net_attn(
             v: &views.v,
             q_scale,
             eps: config.norm_eps,
-        }),
-        _ => None,
-    };
-    let math = verify_dense_math(gpu);
+        });
     let prep_fused = batch_chunk_delta_net_input_projection(
         gpu,
         layer,
@@ -2215,25 +2279,68 @@ pub fn batch_chunk_delta_net_attn(
         gdn_targets.as_ref(),
         math,
     )?;
-
-    if let Some(views) = gdn_chunk_scan_views {
-        gdn_chunk_scan_layer(
-            gpu,
-            &views,
-            pbs,
-            dn_state,
-            delta_layer_idx,
-            &layer.conv_weight,
-            &layer.dt_bias,
-            &layer.a_log,
-            n,
-            q_scale,
-            config.norm_eps,
-            prep_fused,
-            GDN_CHUNK_KEY_HEADS,
-            GDN_CHUNK_MAX_VALUE_HEADS,
-        )?;
-        batch_chunk_delta_net_output_projection(
+    if let GdnPrefillRoute::Stream(call) = route {
+        let (plan, _, _) = gdn_stream_layer(dn_state, delta_layer_idx, Some(&call))?;
+        let x_fmt = match plan.algorithm {
+            GdnScanAlgorithm::Scan64 => gdn_stream_scan_layer(
+                gpu,
+                &call,
+                config,
+                pbs,
+                dn_state,
+                delta_layer_idx,
+                &layer.conv_weight,
+                &layer.dt_bias,
+                &layer.a_log,
+                n,
+                q_scale,
+                config.linear_key_heads,
+                n_v_heads,
+                if prep_fused {
+                    GdnStreamInput::FusedPrepped
+                } else {
+                    GdnStreamInput::Raw
+                },
+            )?,
+            GdnScanAlgorithm::Sequential => {
+                batch_chunk_delta_net_pre_gdn(
+                    gpu,
+                    layer,
+                    config,
+                    pbs,
+                    dn_state,
+                    n,
+                    k_dim,
+                    v_dim,
+                    n_v_heads,
+                    hd,
+                    batch_semantics,
+                    None,
+                    None,
+                    tape_offset,
+                    delta_layer_idx,
+                    fusion,
+                    None,
+                )?;
+                gdn_stream_sequential_layer(
+                    gpu,
+                    &call,
+                    pbs,
+                    dn_state,
+                    delta_layer_idx,
+                    n,
+                    n_v_heads,
+                )?;
+                GdnScanOut::F32
+            }
+            GdnScanAlgorithm::Wy16 => {
+                return Err(HipError::new(
+                    0,
+                    "GDN stream route: Wy16 plans belong to Qwen4",
+                ));
+            }
+        };
+        return batch_chunk_delta_net_output_projection(
             gpu,
             layer,
             config,
@@ -2244,10 +2351,9 @@ pub fn batch_chunk_delta_net_attn(
             arch_has_wmma,
             epilogue,
             fusion,
-            views.scan_out,
+            x_fmt,
             math,
-        )?;
-        return Ok(());
+        );
     }
 
     let tree_parents = batch_chunk_delta_net_pre_gdn(
@@ -2400,38 +2506,6 @@ pub fn batch_chunk_delta_net_attn(
                             config.linear_value_dim,
                             dn_state.ef_residual(delta_layer_idx),
                             active_mask,
-                        )?
-                    }
-                } else if let Some(stride) = commit_stride {
-                    // Widened ordinary chunk: commit every full 512-row seam,
-                    // then commit the final valid partial segment. Projection
-                    // GEMMs may pad their batch, but recurrence state advances
-                    // for valid rows only.
-                    for off in (0..n).step_by(stride) {
-                        let seg_n = (n - off).min(stride);
-                        let q = pbs.dn_q_batch.sub_offset(off * v_dim, seg_n * v_dim);
-                        let k = pbs.dn_k_batch.sub_offset(off * v_dim, seg_n * v_dim);
-                        let v = pbs.dn_v_batch.sub_offset(off * v_dim, seg_n * v_dim);
-                        let alpha = pbs
-                            .dn_alpha_batch
-                            .sub_offset(off * n_v_heads, seg_n * n_v_heads);
-                        let beta = pbs
-                            .dn_beta_batch
-                            .sub_offset(off * n_v_heads, seg_n * n_v_heads);
-                        let out = pbs.dn_attn_out_batch.sub_offset(off * v_dim, seg_n * v_dim);
-                        gpu.gated_delta_net_q8_batch_seq(
-                            &q,
-                            &k,
-                            &v,
-                            &alpha,
-                            &beta,
-                            &dn_state.s_matrices[delta_layer_idx],
-                            &dn_state.s_scales[delta_layer_idx],
-                            &out,
-                            seg_n,
-                            n_v_heads,
-                            config.linear_value_dim,
-                            dn_state.ef_residual(delta_layer_idx),
                         )?
                     }
                 } else {

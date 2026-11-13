@@ -1,0 +1,2177 @@
+{
+  "anchor": {
+    "bytes": 22392,
+    "file": "gemm_fp8b128_moe_grouped_bf16mfma_hipcc_gfx942.co",
+    "sha256": "08ebe4036da4c71b2c5d685af77a6a3692b975a2a28839c3683200dca2de10c0"
+  },
+  "arch": "gfx942",
+  "gpu_oracle": {
+    "case_count": 109,
+    "cases": [
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 1,
+            "mismatched": 0,
+            "values": 81920
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 1,
+            "mismatched": 0,
+            "values": 81920
+          }
+        },
+        "mismatched_values": 0,
+        "name": "real gateup",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 1,
+            "mismatched": 0,
+            "values": 163840
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 1,
+            "mismatched": 0,
+            "values": 163840
+          }
+        },
+        "mismatched_values": 0,
+        "name": "real down",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_tile_desc_pad16": {
+            "compared_launches": 1,
+            "mismatched": 0,
+            "values": 180
+          }
+        },
+        "mismatched_bytes": 0,
+        "name": "gate_up r=1280 k=2560: builder",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 603,
+            "mismatched": 0,
+            "values": 9487360
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 603,
+            "mismatched": 0,
+            "values": 9487360
+          }
+        },
+        "mismatched_values": 0,
+        "name": "gate_up r=1280 k=2560",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_tile_desc_pad16": {
+            "compared_launches": 1,
+            "mismatched": 0,
+            "values": 116
+          }
+        },
+        "mismatched_bytes": 0,
+        "name": "down r=2560 k=640: builder",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 363,
+            "mismatched": 0,
+            "values": 16435200
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 363,
+            "mismatched": 0,
+            "values": 16435200
+          }
+        },
+        "mismatched_values": 0,
+        "name": "down r=2560 k=640",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_tile_desc_pad16": {
+            "compared_launches": 1,
+            "mismatched": 0,
+            "values": 188
+          }
+        },
+        "mismatched_bytes": 0,
+        "name": "tail r=16 k=128 x_row_div=10: builder",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 603,
+            "mismatched": 0,
+            "values": 119616
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 603,
+            "mismatched": 0,
+            "values": 119616
+          }
+        },
+        "mismatched_values": 0,
+        "name": "tail r=16 k=128 x_row_div=10",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_tile_desc_pad16": {
+            "compared_launches": 1,
+            "mismatched": 0,
+            "values": 116
+          }
+        },
+        "mismatched_bytes": 0,
+        "name": "tail r=16 k=128 x_row_div=1: builder",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 363,
+            "mismatched": 0,
+            "values": 102720
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 363,
+            "mismatched": 0,
+            "values": 102720
+          }
+        },
+        "mismatched_values": 0,
+        "name": "tail r=16 k=128 x_row_div=1",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_tile_desc_pad16": {
+            "compared_launches": 1,
+            "mismatched": 0,
+            "values": 192
+          }
+        },
+        "mismatched_bytes": 0,
+        "name": "tail r=16 k=256 x_row_div=10: builder",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 603,
+            "mismatched": 0,
+            "values": 120128
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 603,
+            "mismatched": 0,
+            "values": 120128
+          }
+        },
+        "mismatched_values": 0,
+        "name": "tail r=16 k=256 x_row_div=10",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_tile_desc_pad16": {
+            "compared_launches": 1,
+            "mismatched": 0,
+            "values": 116
+          }
+        },
+        "mismatched_bytes": 0,
+        "name": "tail r=16 k=256 x_row_div=1: builder",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 363,
+            "mismatched": 0,
+            "values": 102720
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 363,
+            "mismatched": 0,
+            "values": 102720
+          }
+        },
+        "mismatched_values": 0,
+        "name": "tail r=16 k=256 x_row_div=1",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_tile_desc_pad16": {
+            "compared_launches": 1,
+            "mismatched": 0,
+            "values": 184
+          }
+        },
+        "mismatched_bytes": 0,
+        "name": "tail r=16 k=384 x_row_div=10: builder",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 603,
+            "mismatched": 0,
+            "values": 119104
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 603,
+            "mismatched": 0,
+            "values": 119104
+          }
+        },
+        "mismatched_values": 0,
+        "name": "tail r=16 k=384 x_row_div=10",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_tile_desc_pad16": {
+            "compared_launches": 1,
+            "mismatched": 0,
+            "values": 116
+          }
+        },
+        "mismatched_bytes": 0,
+        "name": "tail r=16 k=384 x_row_div=1: builder",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 363,
+            "mismatched": 0,
+            "values": 102720
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 363,
+            "mismatched": 0,
+            "values": 102720
+          }
+        },
+        "mismatched_values": 0,
+        "name": "tail r=16 k=384 x_row_div=1",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_tile_desc_pad16": {
+            "compared_launches": 1,
+            "mismatched": 0,
+            "values": 180
+          }
+        },
+        "mismatched_bytes": 0,
+        "name": "tail r=48 k=128 x_row_div=10: builder",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 603,
+            "mismatched": 0,
+            "values": 355776
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 603,
+            "mismatched": 0,
+            "values": 355776
+          }
+        },
+        "mismatched_values": 0,
+        "name": "tail r=48 k=128 x_row_div=10",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_tile_desc_pad16": {
+            "compared_launches": 1,
+            "mismatched": 0,
+            "values": 116
+          }
+        },
+        "mismatched_bytes": 0,
+        "name": "tail r=48 k=128 x_row_div=1: builder",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 363,
+            "mismatched": 0,
+            "values": 308160
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 363,
+            "mismatched": 0,
+            "values": 308160
+          }
+        },
+        "mismatched_values": 0,
+        "name": "tail r=48 k=128 x_row_div=1",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_tile_desc_pad16": {
+            "compared_launches": 1,
+            "mismatched": 0,
+            "values": 184
+          }
+        },
+        "mismatched_bytes": 0,
+        "name": "tail r=48 k=256 x_row_div=10: builder",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 603,
+            "mismatched": 0,
+            "values": 357312
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 603,
+            "mismatched": 0,
+            "values": 357312
+          }
+        },
+        "mismatched_values": 0,
+        "name": "tail r=48 k=256 x_row_div=10",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_tile_desc_pad16": {
+            "compared_launches": 1,
+            "mismatched": 0,
+            "values": 116
+          }
+        },
+        "mismatched_bytes": 0,
+        "name": "tail r=48 k=256 x_row_div=1: builder",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 363,
+            "mismatched": 0,
+            "values": 308160
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 363,
+            "mismatched": 0,
+            "values": 308160
+          }
+        },
+        "mismatched_values": 0,
+        "name": "tail r=48 k=256 x_row_div=1",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_tile_desc_pad16": {
+            "compared_launches": 1,
+            "mismatched": 0,
+            "values": 180
+          }
+        },
+        "mismatched_bytes": 0,
+        "name": "tail r=48 k=384 x_row_div=10: builder",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 603,
+            "mismatched": 0,
+            "values": 355776
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 603,
+            "mismatched": 0,
+            "values": 355776
+          }
+        },
+        "mismatched_values": 0,
+        "name": "tail r=48 k=384 x_row_div=10",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_tile_desc_pad16": {
+            "compared_launches": 1,
+            "mismatched": 0,
+            "values": 116
+          }
+        },
+        "mismatched_bytes": 0,
+        "name": "tail r=48 k=384 x_row_div=1: builder",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 363,
+            "mismatched": 0,
+            "values": 308160
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 363,
+            "mismatched": 0,
+            "values": 308160
+          }
+        },
+        "mismatched_values": 0,
+        "name": "tail r=48 k=384 x_row_div=1",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_tile_desc_pad16": {
+            "compared_launches": 1,
+            "mismatched": 0,
+            "values": 180
+          }
+        },
+        "mismatched_bytes": 0,
+        "name": "tail r=80 k=128 x_row_div=10: builder",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 603,
+            "mismatched": 0,
+            "values": 592960
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 603,
+            "mismatched": 0,
+            "values": 592960
+          }
+        },
+        "mismatched_values": 0,
+        "name": "tail r=80 k=128 x_row_div=10",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_tile_desc_pad16": {
+            "compared_launches": 1,
+            "mismatched": 0,
+            "values": 116
+          }
+        },
+        "mismatched_bytes": 0,
+        "name": "tail r=80 k=128 x_row_div=1: builder",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 363,
+            "mismatched": 0,
+            "values": 513600
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 363,
+            "mismatched": 0,
+            "values": 513600
+          }
+        },
+        "mismatched_values": 0,
+        "name": "tail r=80 k=128 x_row_div=1",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_tile_desc_pad16": {
+            "compared_launches": 1,
+            "mismatched": 0,
+            "values": 180
+          }
+        },
+        "mismatched_bytes": 0,
+        "name": "tail r=80 k=256 x_row_div=10: builder",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 603,
+            "mismatched": 0,
+            "values": 592960
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 603,
+            "mismatched": 0,
+            "values": 592960
+          }
+        },
+        "mismatched_values": 0,
+        "name": "tail r=80 k=256 x_row_div=10",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_tile_desc_pad16": {
+            "compared_launches": 1,
+            "mismatched": 0,
+            "values": 116
+          }
+        },
+        "mismatched_bytes": 0,
+        "name": "tail r=80 k=256 x_row_div=1: builder",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 363,
+            "mismatched": 0,
+            "values": 513600
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 363,
+            "mismatched": 0,
+            "values": 513600
+          }
+        },
+        "mismatched_values": 0,
+        "name": "tail r=80 k=256 x_row_div=1",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_tile_desc_pad16": {
+            "compared_launches": 1,
+            "mismatched": 0,
+            "values": 192
+          }
+        },
+        "mismatched_bytes": 0,
+        "name": "tail r=80 k=384 x_row_div=10: builder",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 603,
+            "mismatched": 0,
+            "values": 600640
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 603,
+            "mismatched": 0,
+            "values": 600640
+          }
+        },
+        "mismatched_values": 0,
+        "name": "tail r=80 k=384 x_row_div=10",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_tile_desc_pad16": {
+            "compared_launches": 1,
+            "mismatched": 0,
+            "values": 116
+          }
+        },
+        "mismatched_bytes": 0,
+        "name": "tail r=80 k=384 x_row_div=1: builder",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 363,
+            "mismatched": 0,
+            "values": 513600
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 363,
+            "mismatched": 0,
+            "values": 513600
+          }
+        },
+        "mismatched_values": 0,
+        "name": "tail r=80 k=384 x_row_div=1",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 14560
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 14560
+          }
+        },
+        "mismatched_values": 0,
+        "name": "fp8-special r=16 k=128 x_row_div=10",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 14560
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 14560
+          }
+        },
+        "mismatched_values": 0,
+        "name": "bf16-x-special r=16 k=128 x_row_div=10",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 14560
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 14560
+          }
+        },
+        "mismatched_values": 0,
+        "name": "cancellation r=16 k=128 x_row_div=10",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 14560
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 14560
+          }
+        },
+        "mismatched_values": 0,
+        "name": "fp8-special r=16 k=256 x_row_div=10",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 14560
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 14560
+          }
+        },
+        "mismatched_values": 0,
+        "name": "bf16-x-special r=16 k=256 x_row_div=10",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 14560
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 14560
+          }
+        },
+        "mismatched_values": 0,
+        "name": "cancellation r=16 k=256 x_row_div=10",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 43680
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 43680
+          }
+        },
+        "mismatched_values": 0,
+        "name": "fp8-special r=48 k=128 x_row_div=1",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 43680
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 43680
+          }
+        },
+        "mismatched_values": 0,
+        "name": "bf16-x-special r=48 k=128 x_row_div=1",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 43680
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 43680
+          }
+        },
+        "mismatched_values": 0,
+        "name": "cancellation r=48 k=128 x_row_div=1",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 43680
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 43680
+          }
+        },
+        "mismatched_values": 0,
+        "name": "fp8-special r=48 k=256 x_row_div=1",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 43680
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 43680
+          }
+        },
+        "mismatched_values": 0,
+        "name": "bf16-x-special r=48 k=256 x_row_div=1",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 43680
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 43680
+          }
+        },
+        "mismatched_values": 0,
+        "name": "cancellation r=48 k=256 x_row_div=1",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 70240
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 70240
+          }
+        },
+        "mismatched_values": 0,
+        "name": "fp8-special r=80 k=256 x_row_div=10",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 70240
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 70240
+          }
+        },
+        "mismatched_values": 0,
+        "name": "bf16-x-special r=80 k=256 x_row_div=10",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 70240
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 70240
+          }
+        },
+        "mismatched_values": 0,
+        "name": "cancellation r=80 k=256 x_row_div=10",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 74080
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 74080
+          }
+        },
+        "mismatched_values": 0,
+        "name": "fp8-special r=80 k=384 x_row_div=10",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 74080
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 74080
+          }
+        },
+        "mismatched_values": 0,
+        "name": "bf16-x-special r=80 k=384 x_row_div=10",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 74080
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 74080
+          }
+        },
+        "mismatched_values": 0,
+        "name": "cancellation r=80 k=384 x_row_div=10",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 74080
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 74080
+          }
+        },
+        "mismatched_values": 0,
+        "name": "fp8-special r=80 k=384 x_row_div=1",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 74080
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 74080
+          }
+        },
+        "mismatched_values": 0,
+        "name": "bf16-x-special r=80 k=384 x_row_div=1",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 74080
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 74080
+          }
+        },
+        "mismatched_values": 0,
+        "name": "cancellation r=80 k=384 x_row_div=1",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 1144320
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 1144320
+          }
+        },
+        "mismatched_values": 0,
+        "name": "fp8-special r=1280 k=2560 x_row_div=10",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 1144320
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 1144320
+          }
+        },
+        "mismatched_values": 0,
+        "name": "bf16-x-special r=1280 k=2560 x_row_div=10",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 1144320
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 1144320
+          }
+        },
+        "mismatched_values": 0,
+        "name": "cancellation r=1280 k=2560 x_row_div=10",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 2288640
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 2288640
+          }
+        },
+        "mismatched_values": 0,
+        "name": "fp8-special r=2560 k=640 x_row_div=1",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 2288640
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 2288640
+          }
+        },
+        "mismatched_values": 0,
+        "name": "bf16-x-special r=2560 k=640 x_row_div=1",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 2288640
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 2288640
+          }
+        },
+        "mismatched_values": 0,
+        "name": "cancellation r=2560 k=640 x_row_div=1",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 12,
+            "mismatched": 0,
+            "values": 271360
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 12,
+            "mismatched": 0,
+            "values": 271360
+          }
+        },
+        "mismatched_values": 0,
+        "name": "target gate_up r=1280 k=2560 C1 (10 experts)",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 60,
+            "mismatched": 0,
+            "values": 2613760
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 60,
+            "mismatched": 0,
+            "values": 2613760
+          }
+        },
+        "mismatched_values": 0,
+        "name": "target gate_up r=1280 k=2560 16-token route",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 58,
+            "mismatched": 0,
+            "values": 19404800
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 58,
+            "mismatched": 0,
+            "values": 19404800
+          }
+        },
+        "mismatched_values": 0,
+        "name": "target gate_up r=1280 k=2560 512-token route",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 58,
+            "mismatched": 0,
+            "values": 57497600
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 58,
+            "mismatched": 0,
+            "values": 57497600
+          }
+        },
+        "mismatched_values": 0,
+        "name": "target gate_up r=1280 k=2560 2048-token route",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 12,
+            "mismatched": 0,
+            "values": 542720
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 12,
+            "mismatched": 0,
+            "values": 542720
+          }
+        },
+        "mismatched_values": 0,
+        "name": "target down r=2560 k=640 C1 (10 experts)",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 60,
+            "mismatched": 0,
+            "values": 5555200
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 60,
+            "mismatched": 0,
+            "values": 5555200
+          }
+        },
+        "mismatched_values": 0,
+        "name": "target down r=2560 k=640 16-token route",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 58,
+            "mismatched": 0,
+            "values": 39014400
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 58,
+            "mismatched": 0,
+            "values": 39014400
+          }
+        },
+        "mismatched_values": 0,
+        "name": "target down r=2560 k=640 512-token route",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 58,
+            "mismatched": 0,
+            "values": 114790400
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 58,
+            "mismatched": 0,
+            "values": 114790400
+          }
+        },
+        "mismatched_values": 0,
+        "name": "target down r=2560 k=640 2048-token route",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 14560
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 14560
+          }
+        },
+        "mismatched_values": 0,
+        "name": "nonfinite-w r=16 k=128 x_row_div=10",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 14560
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 14560
+          }
+        },
+        "mismatched_values": 0,
+        "name": "nonfinite-wx r=16 k=128 x_row_div=10",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 14560
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 14560
+          }
+        },
+        "mismatched_values": 0,
+        "name": "nonfinite-x r=16 k=128 x_row_div=10",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 14304
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 14304
+          }
+        },
+        "mismatched_values": 0,
+        "name": "nonfinite-w r=16 k=256 x_row_div=1",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 14304
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 14304
+          }
+        },
+        "mismatched_values": 0,
+        "name": "nonfinite-wx r=16 k=256 x_row_div=1",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 14304
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 14304
+          }
+        },
+        "mismatched_values": 0,
+        "name": "nonfinite-x r=16 k=256 x_row_div=1",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 43680
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 43680
+          }
+        },
+        "mismatched_values": 0,
+        "name": "nonfinite-w r=48 k=384 x_row_div=10",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 43680
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 43680
+          }
+        },
+        "mismatched_values": 0,
+        "name": "nonfinite-wx r=48 k=384 x_row_div=10",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 43680
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 43680
+          }
+        },
+        "mismatched_values": 0,
+        "name": "nonfinite-x r=48 k=384 x_row_div=10",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 68960
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 68960
+          }
+        },
+        "mismatched_values": 0,
+        "name": "nonfinite-w r=80 k=256 x_row_div=1",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 68960
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 68960
+          }
+        },
+        "mismatched_values": 0,
+        "name": "nonfinite-wx r=80 k=256 x_row_div=1",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 68960
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 68960
+          }
+        },
+        "mismatched_values": 0,
+        "name": "nonfinite-x r=80 k=256 x_row_div=1",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 1185280
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 1185280
+          }
+        },
+        "mismatched_values": 0,
+        "name": "nonfinite-w r=1280 k=2560 x_row_div=10",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 1185280
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 1185280
+          }
+        },
+        "mismatched_values": 0,
+        "name": "nonfinite-wx r=1280 k=2560 x_row_div=10",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 1185280
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 1185280
+          }
+        },
+        "mismatched_values": 0,
+        "name": "nonfinite-x r=1280 k=2560 x_row_div=10",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 2329600
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 2329600
+          }
+        },
+        "mismatched_values": 0,
+        "name": "nonfinite-w r=2560 k=640 x_row_div=1",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 2329600
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 2329600
+          }
+        },
+        "mismatched_values": 0,
+        "name": "nonfinite-wx r=2560 k=640 x_row_div=1",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_grouped_bf16mfma": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 2329600
+          },
+          "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": {
+            "compared_launches": 62,
+            "mismatched": 0,
+            "values": 2329600
+          }
+        },
+        "mismatched_values": 0,
+        "name": "nonfinite-x r=2560 k=640 x_row_div=1",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_tile_desc_pad16": {
+            "compared_launches": 1,
+            "mismatched": 0,
+            "values": 68
+          }
+        },
+        "mismatched_bytes": 0,
+        "name": "tile_desc_pad16 n_tiles=1",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_tile_desc_pad16": {
+            "compared_launches": 1,
+            "mismatched": 0,
+            "values": 72
+          }
+        },
+        "mismatched_bytes": 0,
+        "name": "tile_desc_pad16 n_tiles=2",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_tile_desc_pad16": {
+            "compared_launches": 1,
+            "mismatched": 0,
+            "values": 124
+          }
+        },
+        "mismatched_bytes": 0,
+        "name": "tile_desc_pad16 n_tiles=15",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_tile_desc_pad16": {
+            "compared_launches": 1,
+            "mismatched": 0,
+            "values": 128
+          }
+        },
+        "mismatched_bytes": 0,
+        "name": "tile_desc_pad16 n_tiles=16",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_tile_desc_pad16": {
+            "compared_launches": 1,
+            "mismatched": 0,
+            "values": 132
+          }
+        },
+        "mismatched_bytes": 0,
+        "name": "tile_desc_pad16 n_tiles=17",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_tile_desc_pad16": {
+            "compared_launches": 1,
+            "mismatched": 0,
+            "values": 1084
+          }
+        },
+        "mismatched_bytes": 0,
+        "name": "tile_desc_pad16 n_tiles=255",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_tile_desc_pad16": {
+            "compared_launches": 1,
+            "mismatched": 0,
+            "values": 1088
+          }
+        },
+        "mismatched_bytes": 0,
+        "name": "tile_desc_pad16 n_tiles=256",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_tile_desc_pad16": {
+            "compared_launches": 1,
+            "mismatched": 0,
+            "values": 1092
+          }
+        },
+        "mismatched_bytes": 0,
+        "name": "tile_desc_pad16 n_tiles=257",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_tile_desc_pad16": {
+            "compared_launches": 1,
+            "mismatched": 0,
+            "values": 2108
+          }
+        },
+        "mismatched_bytes": 0,
+        "name": "tile_desc_pad16 n_tiles=511",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_tile_desc_pad16": {
+            "compared_launches": 1,
+            "mismatched": 0,
+            "values": 2112
+          }
+        },
+        "mismatched_bytes": 0,
+        "name": "tile_desc_pad16 n_tiles=512",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_tile_desc_pad16": {
+            "compared_launches": 1,
+            "mismatched": 0,
+            "values": 2116
+          }
+        },
+        "mismatched_bytes": 0,
+        "name": "tile_desc_pad16 n_tiles=513",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_tile_desc_pad16": {
+            "compared_launches": 1,
+            "mismatched": 0,
+            "values": 4064
+          }
+        },
+        "mismatched_bytes": 0,
+        "name": "tile_desc_pad16 n_tiles=1000",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_tile_desc_pad16": {
+            "compared_launches": 1,
+            "mismatched": 0,
+            "values": 8260
+          }
+        },
+        "mismatched_bytes": 0,
+        "name": "tile_desc_pad16 n_tiles=2049",
+        "pass": true
+      },
+      {
+        "kernels": {
+          "gemm_fp8b128_moe_tile_desc_pad16": {
+            "compared_launches": 1,
+            "mismatched": 0,
+            "values": 16452
+          }
+        },
+        "mismatched_bytes": 0,
+        "name": "tile_desc_pad16 n_tiles=4097",
+        "pass": true
+      }
+    ],
+    "cases_by_kernel": {
+      "gemm_fp8b128_moe_grouped_bf16mfma": 12828,
+      "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": 12828,
+      "gemm_fp8b128_moe_tile_desc_pad16": 34
+    },
+    "controls": {
+      "clean_twin_equals_anchor_f32_entry": true,
+      "kernels_write_output": true,
+      "perturbed_tile_id_detected": true,
+      "perturbed_x_detected_bf16_entry": true,
+      "perturbed_x_detected_f32_entry": true
+    },
+    "device": {
+      "arch": "gfx942",
+      "index": 0,
+      "pci_bus_id": "0000:83:00.0"
+    },
+    "device_elf_identical": true,
+    "failed_cases": 0,
+    "failures": [],
+    "full_matrix": true,
+    "hipcc_device_elf_bytes": 18296,
+    "hipcc_device_elf_sha256": "8359a935d4dc453a76f4856d8dbba5d2230e4957c3a966de982c6308b549ea65",
+    "hipcc_image_path": "/scratch/quant/fn-fp8/beat/gemm_fp8b128_moe_grouped_bf16mfma_hipcc_gfx942.co",
+    "hipcc_image_sha256": "08ebe4036da4c71b2c5d685af77a6a3692b975a2a28839c3683200dca2de10c0",
+    "input_hxaco_path": "/scratch/quant/fn-fp8/beat/gemm_fp8b128_moe_grouped_bf16mfma_pm_gfx942.hxaco",
+    "input_hxaco_sha256": "fc16c27637517e54f078c25f3f9166d2663df10a840badda4f83ecc69008ea44",
+    "method": "hipModuleLoadData of the gfx942 device ELF of the exact hipcc anchor file and of the exact twin .hxaco file; the full test_fp8_moe_gfx942 case list (decode identity, Qwen4 gate_up/down, --byte-identity matrix, NaN/Inf and tile-descriptor cases) with every grouped launch executed on both images for both X dtypes through hip-bridge launch_kernel_blob with the production kernarg layout; raw F32 bits of the whole Y and raw bytes of the whole tile-descriptor buffer (+ guard) compared anchor vs twin",
+    "mismatched_by_kernel": {
+      "gemm_fp8b128_moe_grouped_bf16mfma": 0,
+      "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": 0,
+      "gemm_fp8b128_moe_tile_desc_pad16": 0
+    },
+    "pm_device_elf_bytes": 18296,
+    "pm_device_elf_sha256": "8359a935d4dc453a76f4856d8dbba5d2230e4957c3a966de982c6308b549ea65",
+    "real_fixture": {
+      "dir": "/scratch/quant/fn-fp8/beat/Twin-fixtures",
+      "files": [
+        {
+          "bytes": 218,
+          "name": "codes256.scales",
+          "sha256": "93c6ab54f68d935d59c032b4103b6aa76d0518e8406c1109f17ff482558d6d78"
+        },
+        {
+          "bytes": 55808,
+          "name": "codes256.ref",
+          "sha256": "a0d78eea260ff54b392ef7567ad3b4ee8475b3c25f6b2e5147000fddb1f0e8a1"
+        },
+        {
+          "bytes": 3277312,
+          "name": "gateup.blk",
+          "sha256": "b8760fafeec5bdbc9c844972782478d2ff733df2d01bcd35da0a8cc8466dca30"
+        },
+        {
+          "bytes": 6553600,
+          "name": "gateup.ref",
+          "sha256": "6f7e1f5e2aeaf97ec12b1c546a7eaf91a83ea8c8af79cec35675595f084672cb"
+        },
+        {
+          "bytes": 1638656,
+          "name": "down.blk",
+          "sha256": "0b712c627d42100eca15999a63018ae80c07e27b02e5fbc16ca05cd3cff4cb49"
+        },
+        {
+          "bytes": 3276800,
+          "name": "down.ref",
+          "sha256": "7f95907be4f28fa5647739c526f288a53b36cdbfdd9489e30a5028bf571b14b0"
+        }
+      ],
+      "used": true
+    },
+    "seconds": 124.824410197,
+    "status": "PASS",
+    "target": "gfx942",
+    "tool": "rdna-compute example test_fp8_moe_gfx942 --anchor/--twin",
+    "values_by_kernel": {
+      "gemm_fp8b128_moe_grouped_bf16mfma": 294118944,
+      "gemm_fp8b128_moe_grouped_bf16mfma_xbf16": 294118944,
+      "gemm_fp8b128_moe_tile_desc_pad16": 41900
+    },
+    "x_types": [
+      "f32",
+      "bf16"
+    ]
+  },
+  "compiler": {
+    "flags": [
+      "--genco",
+      "--offload-arch=gfx942",
+      "-O3",
+      "--no-offload-compress",
+      "-fuse-cuid=none",
+      "-mcode-object-version=6"
+    ],
+    "invocation": "hipcc <flags> -o <anchor.co> kernels/src/gemm_fp8b128_moe_grouped_bf16mfma.gfx942.hip",
+    "version": [
+      "HIP version: 7.16.26385-0000000",
+      "AMD clang version 24.0.0git (https://github.com/ROCm/llvm-project.git d6f6cb691863e9258034ab48c1dfce21689d5606)",
+      "Target: x86_64-unknown-linux-gnu",
+      "Thread model: posix"
+    ]
+  },
+  "hxaco": {
+    "bytes": 22392,
+    "file": "gemm_fp8b128_moe_grouped_bf16mfma_pm_gfx942.hxaco",
+    "sha256": "fc16c27637517e54f078c25f3f9166d2663df10a840badda4f83ecc69008ea44"
+  },
+  "module": "gemm_fp8b128_moe_grouped_bf16mfma_pm_gfx942",
+  "seal": {
+    "reports": [
+      {
+        "abi": {
+          "args": [
+            {
+              "name": "",
+              "offset": 0,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 8,
+              "pointer": false,
+              "size": 8,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 16,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 24,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 32,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 40,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 48,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 52,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 56,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 60,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            }
+          ],
+          "compared_to_incumbent": false,
+          "kernarg_segment_size": 64
+        },
+        "arch": "gfx942",
+        "codec": "peacemaker_cdna",
+        "elf_bytes": 18296,
+        "elf_sha256": "8359a935d4dc453a76f4856d8dbba5d2230e4957c3a966de982c6308b549ea65",
+        "hazards": {
+          "advisory": 0,
+          "arch": "gfx942",
+          "blocking": 0,
+          "bypasses": 0,
+          "checked": true,
+          "dwords": 1349,
+          "findings": 0,
+          "hazard": {
+            "checker": "peacemaker_isa::cdna::hazard::check",
+            "inserted_nops": 0,
+            "mfma": 16,
+            "rewritten_instructions": 0,
+            "s_nop": 4,
+            "s_nop_wait_states": 6,
+            "violations": 0
+          },
+          "instructions": 866,
+          "kernel": "gemm_fp8b128_moe_grouped_bf16mfma",
+          "ledger": {
+            "barriers": 2,
+            "branches": 35,
+            "label_states": 216,
+            "labels": 28,
+            "memory": {
+              "ds_load": 40,
+              "ds_store": 2,
+              "smem": 4,
+              "vmem_atomic": 0,
+              "vmem_load": 21,
+              "vmem_store": 1
+            },
+            "steps": 10407,
+            "verifier": "peacemaker_isa::ledger_cfg::verify_with_branch_proofs",
+            "waitcnt": 41,
+            "waitcnt_lgkmcnt_partial": 17,
+            "waitcnt_vmcnt_partial": 1
+          },
+          "unreachable_instructions": 0
+        },
+        "hxaco_bytes": 22392,
+        "hxaco_sha256": "fc16c27637517e54f078c25f3f9166d2663df10a840badda4f83ecc69008ea44",
+        "kernel": "gemm_fp8b128_moe_grouped_bf16mfma",
+        "lds": 8704,
+        "lift_identity": "emit::checked ok; emitted bytes == input ELF",
+        "lifted_kernels": 3,
+        "rsrc2": 388,
+        "scratch": 0,
+        "sgprs": 37,
+        "text_bytes": 5396,
+        "text_sha256": "c6b140595c83c0edf58809a78ced70f3f0f57220724d9071f513d05a846de7b1",
+        "user_sgprs": 2,
+        "vgprs": 56,
+        "wavefront_size": 64
+      },
+      {
+        "abi": {
+          "args": [
+            {
+              "name": "",
+              "offset": 0,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 8,
+              "pointer": false,
+              "size": 8,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 16,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 24,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 32,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 40,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 48,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 52,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 56,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 60,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            }
+          ],
+          "compared_to_incumbent": false,
+          "kernarg_segment_size": 64
+        },
+        "arch": "gfx942",
+        "codec": "peacemaker_cdna",
+        "elf_bytes": 18296,
+        "elf_sha256": "8359a935d4dc453a76f4856d8dbba5d2230e4957c3a966de982c6308b549ea65",
+        "hazards": {
+          "advisory": 0,
+          "arch": "gfx942",
+          "blocking": 0,
+          "bypasses": 0,
+          "checked": true,
+          "dwords": 1246,
+          "findings": 0,
+          "hazard": {
+            "checker": "peacemaker_isa::cdna::hazard::check",
+            "inserted_nops": 0,
+            "mfma": 16,
+            "rewritten_instructions": 0,
+            "s_nop": 4,
+            "s_nop_wait_states": 6,
+            "violations": 0
+          },
+          "instructions": 802,
+          "kernel": "gemm_fp8b128_moe_grouped_bf16mfma_xbf16",
+          "ledger": {
+            "barriers": 2,
+            "branches": 34,
+            "label_states": 229,
+            "labels": 27,
+            "memory": {
+              "ds_load": 40,
+              "ds_store": 2,
+              "smem": 4,
+              "vmem_atomic": 0,
+              "vmem_load": 17,
+              "vmem_store": 1
+            },
+            "steps": 10501,
+            "verifier": "peacemaker_isa::ledger_cfg::verify_with_branch_proofs",
+            "waitcnt": 41,
+            "waitcnt_lgkmcnt_partial": 17,
+            "waitcnt_vmcnt_partial": 1
+          },
+          "unreachable_instructions": 0
+        },
+        "hxaco_bytes": 22392,
+        "hxaco_sha256": "fc16c27637517e54f078c25f3f9166d2663df10a840badda4f83ecc69008ea44",
+        "kernel": "gemm_fp8b128_moe_grouped_bf16mfma_xbf16",
+        "lds": 8704,
+        "lift_identity": "emit::checked ok; emitted bytes == input ELF",
+        "lifted_kernels": 3,
+        "rsrc2": 388,
+        "scratch": 0,
+        "sgprs": 42,
+        "text_bytes": 4984,
+        "text_sha256": "8f45ae49d9b5ab89126c4bb800fd8c8a0165185dd18ae0bf03955e3f6d7b024f",
+        "user_sgprs": 2,
+        "vgprs": 48,
+        "wavefront_size": 64
+      },
+      {
+        "abi": {
+          "args": [
+            {
+              "name": "",
+              "offset": 0,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 8,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 16,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            }
+          ],
+          "compared_to_incumbent": false,
+          "kernarg_segment_size": 20
+        },
+        "arch": "gfx942",
+        "codec": "peacemaker_cdna",
+        "elf_bytes": 18296,
+        "elf_sha256": "8359a935d4dc453a76f4856d8dbba5d2230e4957c3a966de982c6308b549ea65",
+        "hazards": {
+          "advisory": 0,
+          "arch": "gfx942",
+          "blocking": 0,
+          "bypasses": 0,
+          "checked": true,
+          "dwords": 29,
+          "findings": 0,
+          "hazard": {
+            "checker": "peacemaker_isa::cdna::hazard::check",
+            "inserted_nops": 0,
+            "mfma": 0,
+            "rewritten_instructions": 0,
+            "s_nop": 0,
+            "s_nop_wait_states": 0,
+            "violations": 0
+          },
+          "instructions": 22,
+          "kernel": "gemm_fp8b128_moe_tile_desc_pad16",
+          "ledger": {
+            "barriers": 0,
+            "branches": 1,
+            "label_states": 2,
+            "labels": 1,
+            "memory": {
+              "ds_load": 0,
+              "ds_store": 0,
+              "smem": 2,
+              "vmem_atomic": 0,
+              "vmem_load": 1,
+              "vmem_store": 1
+            },
+            "steps": 25,
+            "verifier": "peacemaker_isa::ledger_cfg::verify_with_branch_proofs",
+            "waitcnt": 3,
+            "waitcnt_lgkmcnt_partial": 0,
+            "waitcnt_vmcnt_partial": 0
+          },
+          "unreachable_instructions": 0
+        },
+        "hxaco_bytes": 22392,
+        "hxaco_sha256": "fc16c27637517e54f078c25f3f9166d2663df10a840badda4f83ecc69008ea44",
+        "kernel": "gemm_fp8b128_moe_tile_desc_pad16",
+        "lds": 0,
+        "lift_identity": "emit::checked ok; emitted bytes == input ELF",
+        "lifted_kernels": 3,
+        "rsrc2": 132,
+        "scratch": 0,
+        "sgprs": 10,
+        "text_bytes": 116,
+        "text_sha256": "e8542a6796ab50e16dace5f426976a72db240c76e7b71d133c003ef253efdfbe",
+        "user_sgprs": 2,
+        "vgprs": 4,
+        "wavefront_size": 64
+      }
+    ],
+    "tool": "peacemaker-isa example hip_twin (gfx942 Route A: typed lift, full device-ELF identity, bundle)"
+  },
+  "source": {
+    "bytes": 18029,
+    "path": "kernels/src/gemm_fp8b128_moe_grouped_bf16mfma.gfx942.hip",
+    "sha256": "4902eb7f463c757370536ba47decfa56605548cd9d973ed34361b96a7bdc124b"
+  },
+  "symbols": [
+    "gemm_fp8b128_moe_grouped_bf16mfma",
+    "gemm_fp8b128_moe_grouped_bf16mfma_xbf16",
+    "gemm_fp8b128_moe_tile_desc_pad16"
+  ]
+}

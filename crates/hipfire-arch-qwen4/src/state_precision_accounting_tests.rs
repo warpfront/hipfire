@@ -21,12 +21,24 @@ const Q8_ALL: usize = 29_196_288;
 const F32_ALL: usize = 113_246_208;
 /// `F32_ALL - Q8_ALL` = 80.15625 MiB: one live recurrent set, or one mirror.
 const SET_DELTA: usize = 84_049_920;
-/// Ring slots (2R per GDN layer) of the capture ring for R = 4, 8, 32.
+/// `F32_SLOT - Q8_SLOT`: one layer's recurrent slot delta.
+const SLOT_DELTA: usize = F32_SLOT - Q8_SLOT;
+/// Capture-ring rows R = 4, 8, 32.
 const RINGS: [usize; 3] = [4, 8, 32];
-/// Q8 ring 222.75 / 445.5 / 1782 MiB.
-const RING_Q8: [usize; 3] = [233_570_304, 467_140_608, 1_868_562_432];
-/// F32 ring 864 / 1728 / 6912 MiB.
-const RING_F32: [usize; 3] = [905_969_664, 1_811_939_328, 7_247_757_312];
+/// Ring state slots a state's capture ring allocates across `layers` GDN layers for `r`-row
+/// blocks: the shared pool `2 * (layers - 1) + r + 1` by default
+/// (`HIPFIRE_QWEN4_LANE_RESERVE_TRIM`), `r + 1` per layer with the trim kill switch, `2r` per
+/// layer with the compact-ring kill switch too.
+fn ring_slots(r: usize, layers: usize) -> usize {
+    current_capture_ring_total_slots(r, layers).unwrap()
+}
+/// Q8 / F32 capture ring bytes at `RINGS[index]`: the recurrent slot x the whole model's ring slots.
+fn ring_q8(index: usize) -> usize {
+    Q8_SLOT * ring_slots(RINGS[index], GDN_LAYERS)
+}
+fn ring_f32(index: usize) -> usize {
+    F32_SLOT * ring_slots(RINGS[index], GDN_LAYERS)
+}
 
 const FORMATS: [GdnStateFormat; 2] = [GdnStateFormat::Q8, GdnStateFormat::F32];
 
@@ -36,6 +48,7 @@ fn format_of(qsa: QsaKvFormat, gdn: GdnStateFormat) -> Qwen4StateFormat {
         gdn,
         qsa_f16_arena: false,
         qsa_pooled_bf16: false,
+        gdn_stream: crate::GdnStreamKind::None,
     }
 }
 
@@ -51,8 +64,8 @@ fn slot_of(gdn: GdnStateFormat) -> usize {
 
 fn ring_of(gdn: GdnStateFormat, index: usize) -> usize {
     match gdn {
-        GdnStateFormat::Q8 | GdnStateFormat::Q8Ef => RING_Q8[index],
-        GdnStateFormat::F32 => RING_F32[index],
+        GdnStateFormat::Q8 | GdnStateFormat::Q8Ef => ring_q8(index),
+        GdnStateFormat::F32 => ring_f32(index),
     }
 }
 
@@ -188,38 +201,49 @@ fn gdn_precision_owner_accounting() {
     assert_eq!(2 * Q8_ALL, 55 * MIB + 11 * MIB / 16);
     assert_eq!(2 * F32_ALL, 216 * MIB);
 
-    // Capture ring 2R slots; the non-ring terms are format independent.
+    // Capture ring R+1 slots (2R with the kill switch); the non-ring terms are format independent.
     for (index, &r) in RINGS.iter().enumerate() {
         let q8 = Qwen4State::row_capture_bytes(&config, GdnStateFormat::Q8, r).unwrap();
         let f32 = Qwen4State::row_capture_bytes(&config, GdnStateFormat::F32, r).unwrap();
         assert_eq!(
-            q8 - RING_Q8[index],
-            f32 - RING_F32[index],
+            q8 - ring_q8(index),
+            f32 - ring_f32(index),
             "R={r} non-ring terms"
         );
         assert_eq!(
             f32 - q8,
-            GDN_LAYERS * 2 * r * (F32_SLOT - Q8_SLOT),
+            ring_slots(r, GDN_LAYERS) * SLOT_DELTA,
             "R={r} ring delta"
         );
         for gdn in FORMATS {
             assert_eq!(
                 ring_of(gdn, index),
-                live_set(&config, gdn) * 2 * r,
-                "{gdn:?} R={r} ring is 2R live-set slots"
+                slot_of(gdn) * ring_slots(r, GDN_LAYERS),
+                "{gdn:?} R={r} ring is {} recurrent slots",
+                ring_slots(r, GDN_LAYERS)
             );
         }
-        // Ring + one mirror = 160.3125 R + 80.15625 MiB more than Q8.
+        // Ring + one mirror = the ring's slot deltas + one recurrent-set delta more than Q8.
         assert_eq!(
-            (RING_F32[index] + F32_ALL) - (RING_Q8[index] + Q8_ALL),
-            SET_DELTA * (2 * r + 1),
+            (ring_f32(index) + F32_ALL) - (ring_q8(index) + Q8_ALL),
+            ring_slots(r, GDN_LAYERS) * SLOT_DELTA + SET_DELTA,
             "R={r}"
         );
+        // The kill-switch layout stays 2R slots.
+        assert_eq!(capture_ring_slots(false, r), Some(2 * r));
+        assert_eq!(capture_ring_slots(true, r), Some(r + 1));
     }
-    assert_eq!(RING_Q8[0] + Q8_ALL, 250 * MIB + 19 * MIB / 32);
-    assert_eq!(RING_F32[0] + F32_ALL, 972 * MIB);
-    assert_eq!(RING_Q8[0], 222 * MIB + 3 * MIB / 4);
-    assert_eq!(RING_F32[2], 6912 * MIB);
+    assert_eq!(
+        ring_q8(0) + Q8_ALL,
+        Q8_SLOT * (ring_slots(4, GDN_LAYERS) + GDN_LAYERS)
+    );
+    assert_eq!(
+        ring_f32(0) + F32_ALL,
+        F32_SLOT * (ring_slots(4, GDN_LAYERS) + GDN_LAYERS)
+    );
+    assert_eq!(ring_q8(0), Q8_SLOT * ring_slots(4, GDN_LAYERS));
+    assert_eq!(F32_ALL * 2 * 32, 6912 * MIB);
+    assert_eq!(ring_f32(2), F32_SLOT * ring_slots(32, GDN_LAYERS));
 
     // The full packed session entry: the plan formula with the real helper
     // values, for every QSA K/V format, with and without native MTP.
@@ -339,10 +363,13 @@ fn gdn_precision_owner_accounting_native_mtp_reserve_covers_the_owners() {
         };
         assert_eq!(
             reserve(GdnStateFormat::F32) - reserve(GdnStateFormat::Q8),
-            (SET_DELTA * (2 + 2 * r)) as u64,
+            (2 * SET_DELTA + ring_slots(r, GDN_LAYERS) * SLOT_DELTA) as u64,
             "R={r}"
         );
-        assert_eq!(RING_F32[index] - RING_Q8[index], SET_DELTA * 2 * r);
+        assert_eq!(
+            ring_f32(index) - ring_q8(index),
+            ring_slots(r, GDN_LAYERS) * SLOT_DELTA
+        );
     }
     // A ring narrower than the window never shrinks the charge.
     for gdn in FORMATS {
@@ -385,7 +412,7 @@ fn gdn_precision_owner_accounting_ring_growth_holds_old_and_new_rings() {
         let peak = |gdn| ring(gdn, old) + ring(gdn, new) + live_set(&config, gdn);
         assert_eq!(
             peak(GdnStateFormat::F32) - peak(GdnStateFormat::Q8),
-            SET_DELTA * (2 * old + 2 * new + 1)
+            SET_DELTA + (ring_slots(old, GDN_LAYERS) + ring_slots(new, GDN_LAYERS)) * SLOT_DELTA
         );
     }
 }
@@ -417,7 +444,7 @@ fn gdn_precision_owner_accounting_pp_and_lane_counts() {
                 };
                 assert_eq!(
                     ring(GdnStateFormat::F32) - ring(GdnStateFormat::Q8),
-                    gdn_layers * 2 * r * slot_delta,
+                    ring_slots(r, gdn_layers) * slot_delta,
                     "{counts:?} {:?} R={r}",
                     scope.band
                 );
@@ -442,7 +469,7 @@ fn gdn_precision_owner_accounting_pp_and_lane_counts() {
         let one = store(f32, 1) - store(q8, 1);
         let recurrent_sets = if k.is_some() { 2 } else { 1 };
         let per_lane = recurrent_sets * GDN_LAYERS * slot_delta
-            + k.map_or(0, |k| GDN_LAYERS * 2 * (k + 1) * slot_delta);
+            + k.map_or(0, |k| ring_slots(k + 1, GDN_LAYERS) * slot_delta);
         assert_eq!(one, per_lane as u64, "{k:?}");
         for lanes in [2usize, 4, 8] {
             assert_eq!(

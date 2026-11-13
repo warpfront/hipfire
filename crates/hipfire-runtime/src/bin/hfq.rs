@@ -2,7 +2,7 @@
 // hipfire — `hfq`: HFQ container manipulation tool.
 //
 //! Inspect and edit HFQ containers (models, calibration-artifact sidecars,
-//! `.mtp`/`.dflash`/`.triattn` sidecars). With these, "bundle everything vs keep
+//! `.mtp`/`.dflash` sidecars). With these, "bundle everything vs keep
 //! separate" is a runtime choice — split a Hessian out of a bundle, merge
 //! sidecars, or embed a chat template into a model — not an upfront commitment.
 //!

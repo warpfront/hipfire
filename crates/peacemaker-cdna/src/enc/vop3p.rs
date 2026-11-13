@@ -607,6 +607,7 @@ impl Vop3pOp {
                 Self::PkAddF32 => 50,
                 Self::PkMovB32 => 51,
             }),
+            Arch::Gfx950 => None,
         }
     }
     /// llvm-mc mnemonic (no encoding suffix).
@@ -670,6 +671,7 @@ impl MaiOp {
                 Self::MfmaF32_32x32x2F32 => 68,
                 Self::MfmaF64_16x16x4F64 => 110,
             }),
+            Arch::Gfx950 => None,
         }
     }
     /// llvm-mc mnemonic (no encoding suffix).

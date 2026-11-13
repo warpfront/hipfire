@@ -473,15 +473,9 @@ fn owner_mapped_bytes(kv: &KvCache, n_kv_layers: usize) -> Result<usize, String>
 }
 
 /// Device bytes of a DeltaNet state (S matrices, scales, conv rings,
-/// error-feedback residuals) as allocated.
+/// error-feedback residuals and the persistent GDN stream carry) as allocated.
 fn dn_state_bytes(dn: &DeltaNetState) -> usize {
-    dn.s_matrices
-        .iter()
-        .chain(&dn.s_scales)
-        .chain(&dn.conv_states)
-        .chain(&dn.s_ef_residual)
-        .map(|t| t.buf.size())
-        .sum()
+    dn.owned_bytes()
 }
 
 impl Qwen35RequestState {
@@ -518,8 +512,26 @@ impl Qwen35RequestState {
             &dims,
         )
         .map_err(|e| format!("VMM executor: request KV ({:?}): {e}", mode_of(format)))?;
-        let dn = match DeltaNetState::new_with_quant(gpu, config, template_dn.quant) {
-            Ok(dn) => dn,
+        // The request owner mirrors the template's carry geometry and recipe:
+        // an owner exchange or `copy_dn_from` between them must be
+        // identity-compatible, and its carry bytes are charged with the state.
+        let dn = match DeltaNetState::new_batched_with_carry(
+            gpu,
+            config,
+            template_dn.quant,
+            1,
+            template_dn.stream.carry.as_ref().map(|c| c.geometry),
+        ) {
+            Ok(mut dn) => match dn.stream.bind_recipe(template_dn.stream.recipe_id) {
+                Ok(()) => dn,
+                Err(e) => {
+                    dn.free_gpu(gpu);
+                    let cleanup = kv.release_vmm_after(gpu, None);
+                    return Err(format!(
+                        "VMM executor: request DeltaNet recipe: {e}; kv free: {cleanup:?}"
+                    ));
+                }
+            },
             Err(e) => {
                 let cleanup = kv.release_vmm_after(gpu, None);
                 return Err(format!(
@@ -566,32 +578,12 @@ impl Qwen35RequestState {
     /// a fresh DN's pooled buffers need not match their sizes. Does not
     /// modify the singleton. Synchronizes before returning.
     pub fn copy_dn_from(&mut self, gpu: &mut Gpu, dn: &DeltaNetState) -> Result<(), String> {
-        let pairs = self
-            .dn
-            .s_matrices
-            .iter()
-            .zip(&dn.s_matrices)
-            .chain(self.dn.s_scales.iter().zip(&dn.s_scales))
-            .chain(self.dn.conv_states.iter().zip(&dn.conv_states))
-            .chain(self.dn.s_ef_residual.iter().zip(&dn.s_ef_residual));
-        if self.dn.s_matrices.len() != dn.s_matrices.len()
-            || self.dn.s_scales.len() != dn.s_scales.len()
-            || self.dn.conv_states.len() != dn.conv_states.len()
-            || self.dn.s_ef_residual.len() != dn.s_ef_residual.len()
-        {
-            return Err("copy_dn_from: DeltaNet layouts differ".into());
-        }
-        for (dst, src) in pairs {
-            // Same constructor and shape on both sides; allocations may be
-            // pool-rounded differently, so copy the common buffer extent
-            // (it covers every element).
-            if dst.shape != src.shape {
-                return Err("copy_dn_from: DeltaNet tensor shapes differ".into());
-            }
-            let n = dst.buf.size().min(src.buf.size());
-            gpu.memcpy_dtod_at_auto(&dst.buf, 0, &src.buf, 0, n)
-                .map_err(|e| format!("copy_dn_from: {e}"))?;
-        }
+        // Owner API: validates stream identity (schema/recipe/carry geometry)
+        // and every tensor shape before the first byte moves, then copies the
+        // recurrence, EF, GDN carry and cursors together.
+        self.dn
+            .copy_from(gpu, dn)
+            .map_err(|e| format!("copy_dn_from: {e}"))?;
         gpu.hip
             .device_synchronize()
             .map_err(|e| format!("copy_dn_from: sync: {e}"))?;
@@ -1805,8 +1797,6 @@ fn run_pass(
     }
     let tier = SlotKvTier {
         mode: mode_of(format),
-        givens_cos: None,
-        givens_sin: None,
         fwht_signs1: None,
         fwht_signs2: None,
     };

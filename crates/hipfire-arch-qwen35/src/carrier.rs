@@ -592,7 +592,19 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
     // ── DeltaNet state (free kv + weights on fail) ───────────────────
     let dn_started = std::time::Instant::now();
     let dn = match DeltaNetState::new_with_quant(ctx.gpu, &config, dn_quant) {
-        Ok(v) => v,
+        // Canonical GDN stream (CHUNK-CANONICAL-DESIGN §5): plans, recipe, carry and the
+        // edge workspace are reserved with the state, before the prefill ceiling is chosen.
+        Ok(mut v) => {
+            match crate::qwen35::provision_gdn_stream(ctx.gpu, &weights, &config, &mut v) {
+                Ok(()) => v,
+                Err(e) => {
+                    v.free_gpu(ctx.gpu);
+                    let cleanup = free_kv_and_weights(kv, weights, ctx.gpu);
+                    let e = append_cleanup_context(format!("{e}"), cleanup);
+                    return Err(release_after_failed_load(e, weight_lease.take(), ctx.gpu));
+                }
+            }
+        }
         Err(e) => {
             let cleanup = free_kv_and_weights(kv, weights, ctx.gpu);
             let e = append_cleanup_context(format!("{e}"), cleanup);
@@ -685,7 +697,6 @@ fn plan_qwen35_gpu_stages(config: &Qwen35Config, ctx: &LoadCtx) -> Result<Qwen35
         config.head_dim,
         ctx.pp,
         adaptive_req.is_some(),
-        ctx.cask.sidecar.is_some(),
     );
     let policy =
         kv_mode::qwen35_policy_for_native(&kv_mode::QWEN35_HFQ_POLICY, &mode_raw, auto_native);
@@ -721,26 +732,6 @@ fn plan_qwen35_gpu_stages(config: &Qwen35Config, ctx: &LoadCtx) -> Result<Qwen35
     hipfire_config::load_summary::note(hipfire_config::load_summary::Facet::Kv, effective);
 
     validate_native_kv_admission(mode, config, ctx, adaptive_req.is_some(), v_raw.is_some())?;
-    validate_adaptive_cask_handoff(
-        adaptive_req.is_some(),
-        ctx.cask.sidecar.is_some(),
-        ctx.cask.handoff_tokens,
-        ctx.kv_backend,
-        ctx.cask.cask_m_folding,
-        ctx.max_seq,
-    )?;
-    // DDTree + CASK/TriAttention eviction (#272): refuse before any allocation.
-    // Mirrors `load_dflash_state`'s budget resolution (env wins, else the spec param).
-    validate_ddtree_cask(
-        ctx.gpu
-            .flags
-            .ddtree_budget
-            .or(ctx.spec.ddtree_budget)
-            .unwrap_or(0)
-            > 0,
-        ctx.draft_path.is_some_and(|d| !d.is_empty()),
-        ctx.cask.sidecar.is_some(),
-    )?;
     validate_gfx1100_split_verify_kv(
         crate::qwen35::prefill::gfx1100_split_verify_min_ctx(&*ctx.gpu, config).is_some(),
         adaptive_req.is_none()
@@ -753,6 +744,7 @@ fn plan_qwen35_gpu_stages(config: &Qwen35Config, ctx: &LoadCtx) -> Result<Qwen35
                     )
             ),
         ctx.kv_backend,
+        ctx.gpu.vmm_runtime_refusal().is_some(),
     )?;
 
     // Adaptive DFlash is out of scope: refuse explicit adaptive + DFlash draft.
@@ -784,13 +776,12 @@ fn plan_qwen35_gpu_stages(config: &Qwen35Config, ctx: &LoadCtx) -> Result<Qwen35
         }
     }
 
-    let physical_cap = ctx.cask.physical_cap(ctx.max_seq)?;
     let dims = KvDims {
         layers: KvLayers::Mask(is_kv_layer.clone()),
         n_kv_heads: config.n_kv_heads,
         head_dim: config.head_dim,
         max_seq: ctx.max_seq,
-        physical_cap: Some(physical_cap),
+        physical_cap: Some(ctx.max_seq),
     };
 
     if let Some((preset, k_floor, v_floor)) = adaptive_req {
@@ -813,9 +804,6 @@ fn plan_qwen35_gpu_stages(config: &Qwen35Config, ctx: &LoadCtx) -> Result<Qwen35
                 hipfire_runtime::llama::PREFILL_MAX_BATCH,
             ));
         }
-        if ctx.cask.sidecar.is_some() {
-            ad.configure_eviction_handoff(ctx.cask.handoff_tokens);
-        }
         Ok(Qwen35KvPlan {
             pair,
             is_kv_layer,
@@ -824,7 +812,6 @@ fn plan_qwen35_gpu_stages(config: &Qwen35Config, ctx: &LoadCtx) -> Result<Qwen35
         })
     } else {
         // Static path: final K mode + optional Lloyd-V known before allocation.
-        validate_cask_static_layout(ctx.cask.sidecar.is_some(), pair)?;
         if let kv_mode::KvPair::Split(_, static_v) = pair {
             if !matches!(static_v, llama::VMode::Q8)
                 && !matches!(
@@ -851,7 +838,7 @@ fn plan_qwen35_gpu_stages(config: &Qwen35Config, ctx: &LoadCtx) -> Result<Qwen35
 
 /// Admission for native fp8-E4M3 / flat-bf16 KV on the Qwen route. Authored
 /// native presets need `kv_mode::qwen35_native_supported` (exact gfx1201,
-/// single GPU, non-adaptive, no CASK eviction, and a mode-specific exact
+/// single GPU, non-adaptive, and a mode-specific exact
 /// geometry: fp8 H24/Hkv4/D256 or H16/Hkv2/D256, bf16 H24/Hkv4/D256) plus
 /// neutral V. Implicit auto is gated separately by
 /// `kv_mode::qwen35_native_auto_eligible` and instead selects Q8.
@@ -874,7 +861,6 @@ pub fn validate_native_kv_admission(
         config.head_dim,
         ctx.pp,
         adaptive,
-        ctx.cask.sidecar.is_some(),
     ) {
         return Err(why);
     }
@@ -886,119 +872,30 @@ pub fn validate_native_kv_admission(
     Ok(())
 }
 
-/// #272: DDTree keeps a CPU `target_hidden_host` shadow that eviction does not
-/// compact (`position` shrinks, the shadow keeps the pre-eviction rows), which
-/// panics at `target_hidden_host size mismatches position`. CASK/TriAttention
-/// eviction is deprecated since 0.4.0, so the combination is refused instead
-/// of growing a host-mirror contract. `ddtree` is "budget > 0"; it only matters
-/// with a DFlash draft attached.
-pub fn validate_ddtree_cask(ddtree: bool, has_draft: bool, cask: bool) -> Result<(), String> {
-    if ddtree && has_draft && cask {
-        return Err(
-            "DDTree (speculation.ddtree_budget / HIPFIRE_DDTREE_BUDGET > 0) cannot be combined with \
-             CASK/TriAttention eviction (memory.cask.sidecar): eviction does not compact DDTree's \
-             hidden-state shadow and the run would panic (#272). CASK is deprecated since 0.4.0; \
-             drop the CASK sidecar or set ddtree_budget = 0 (chain DFlash)."
-                .into(),
-        );
-    }
-    Ok(())
-}
-
-fn validate_adaptive_cask_handoff(
-    adaptive: bool,
-    sidecar: bool,
-    handoff_tokens: usize,
-    backend: KvBackend,
-    cask_m_folding: bool,
-    max_seq: usize,
-) -> Result<(), String> {
-    if !adaptive {
-        return if handoff_tokens == 0 {
-            Ok(())
-        } else {
-            Err("memory.cask.handoff_tokens requires memory.kv_adaptive != off".into())
-        };
-    }
-    if !sidecar {
-        return if handoff_tokens == 0 {
-            Ok(())
-        } else {
-            Err(
-                "memory.cask.handoff_tokens requires memory.cask.sidecar (or auto-attached sidecar)"
-                    .into(),
-            )
-        };
-    }
-    if handoff_tokens == 0 {
-        return Err(
-            "kv_adaptive and CASK require memory.cask.handoff_tokens > 0 for an explicit one-way handoff"
-                .into(),
-        );
-    }
-    if backend != KvBackend::Vmm {
-        return Err("kv_adaptive -> CASK handoff currently requires memory.kv_backend=vmm".into());
-    }
-    if cask_m_folding {
-        return Err(
-            "kv_adaptive -> CASK handoff supports plain TriAttention eviction only; CASK m-folding needs FWHT/Lloyd fold kernels"
-                .into(),
-        );
-    }
-    if handoff_tokens > max_seq {
-        return Err(format!(
-            "memory.cask.handoff_tokens={handoff_tokens} exceeds max_seq={max_seq} and can never activate"
-        ));
-    }
-    Ok(())
-}
-
 /// `kernel.gfx1100_fa2_split_verify` admits VMM KV only. When the opt-in
 /// applies to this model (`split_envelope`: exact gfx1100, dense
 /// H24/KV4/D256, parent `kernel.verify_attn` on) and the cache is plain Q8,
 /// a legacy backend is refused before any upload rather than serving the
 /// split route from a legacy cache or silently dropping the opt-in.
+///
+/// `vmm_runtime_refused`: this device's runtime cannot back VMM at all
+/// (`Gpu::vmm_runtime_refusal`), so automatic selection resolved legacy and
+/// the load is not the operator's choice to refuse. The route admits VMM
+/// caches only and stays off on the legacy one.
 #[doc(hidden)]
 pub fn validate_gfx1100_split_verify_kv(
     split_envelope: bool,
     plain_q8: bool,
     backend: KvBackend,
+    vmm_runtime_refused: bool,
 ) -> Result<(), String> {
-    if split_envelope && plain_q8 && backend != KvBackend::Vmm {
+    if split_envelope && plain_q8 && backend != KvBackend::Vmm && !vmm_runtime_refused {
         return Err(
             "kernel.gfx1100_fa2_split_verify admits VMM KV only, but this load resolved \
              memory.kv_backend=legacy; use memory.kv_backend=vmm or set \
              kernel.gfx1100_fa2_split_verify=false"
                 .into(),
         );
-    }
-    Ok(())
-}
-
-/// The static CASK path remains limited to Q8 V and Givens legacy-asym K.
-/// Adaptive FWHT/Lloyd layouts use the separately validated plain-TriAttention
-/// handoff; m-folding still lacks the corresponding fold/requant kernels.
-fn validate_cask_static_layout(cask_enabled: bool, pair: kv_mode::KvPair) -> Result<(), String> {
-    if !cask_enabled {
-        return Ok(());
-    }
-    if !matches!(pair, kv_mode::KvPair::Split(_, llama::VMode::Q8)) {
-        return Err(format!(
-            "CASK currently requires split V=q8 (resolved KV is {pair:?})"
-        ));
-    }
-    if !matches!(
-        pair.k(),
-        hipfire_runtime::kv_mode::KvMode::Q8
-            | hipfire_runtime::kv_mode::KvMode::Asym2
-            | hipfire_runtime::kv_mode::KvMode::Asym3
-            | hipfire_runtime::kv_mode::KvMode::Asym4
-    ) {
-        return Err(format!(
-            "CASK currently supports Q8/legacy-asym2/legacy-asym3/legacy-asym4 K only \
-             (resolved mode is {:?}); FWHT/Lloyd combinations are rejected — use legacy-asym3",
-            pair.k()
-        ));
     }
     Ok(())
 }
@@ -1099,18 +996,19 @@ fn construct_kv_cache(
                 .map_err(|e| format!("{e}"))?
             }
             (KvBackend::Legacy, kv_mode::KvPair::Split(_, vm)) => {
-                let mut kv = <KvCache as KvCacheExt>::from_mode_with_backend(
+                // V allocates at its logical stride up front (no Q8 transient
+                // that must fit contiguously before a shrink).
+                KvCache::new_gpu_fwht_filtered_with_v(
+                    ctx.gpu,
                     mode,
-                    KvBackend::Legacy,
-                    KvTarget::Single(ctx.gpu),
-                    &plan.dims,
+                    &plan.is_kv_layer,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    ctx.max_seq,
+                    physical_cap,
+                    vm,
                 )
-                .map_err(|e| format!("{e}"))?;
-                if let Err(e) = kv.set_v_mode_realloc(ctx.gpu, vm) {
-                    let cleanup = kv.free_gpu(ctx.gpu).map_err(|fe| fe.to_string());
-                    return Err(append_cleanup_context(format!("{e}"), cleanup));
-                }
-                kv
+                .map_err(|e| format!("{e}"))?
             }
         };
         if let kv_mode::KvPair::Split(_, vm) = plan.pair {
@@ -1611,19 +1509,6 @@ mod tests {
     use hipfire_runtime::llama::VMode;
 
     #[test]
-    fn ddtree_with_cask_is_refused_up_front() {
-        let e = validate_ddtree_cask(true, true, true).unwrap_err();
-        assert!(
-            e.contains("DDTree") && e.contains("CASK") && e.contains("#272"),
-            "{e}"
-        );
-        // Each leg alone, or no draft (ddtree inert), is accepted.
-        assert!(validate_ddtree_cask(true, true, false).is_ok());
-        assert!(validate_ddtree_cask(false, true, true).is_ok());
-        assert!(validate_ddtree_cask(true, false, true).is_ok());
-        assert!(validate_ddtree_cask(false, false, false).is_ok());
-    }
-    #[test]
     fn parse_presets_agree_with_controller_floors() {
         let cases = [
             (
@@ -1679,46 +1564,20 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_cask_handoff_compatibility_matrix_is_fail_closed() {
-        let check = |adaptive, sidecar, handoff, backend, folding| {
-            validate_adaptive_cask_handoff(adaptive, sidecar, handoff, backend, folding, 2048)
-        };
-
-        assert!(check(true, true, 128, KvBackend::Vmm, false).is_ok());
-        assert!(check(true, true, 0, KvBackend::Vmm, false)
-            .unwrap_err()
-            .contains("handoff_tokens > 0"));
-        assert!(check(true, true, 128, KvBackend::Legacy, false)
-            .unwrap_err()
-            .contains("requires memory.kv_backend=vmm"));
-        assert!(check(true, true, 128, KvBackend::Vmm, true)
-            .unwrap_err()
-            .contains("m-folding"));
-        assert!(check(true, false, 128, KvBackend::Vmm, false)
-            .unwrap_err()
-            .contains("requires memory.cask.sidecar"));
-        assert!(check(false, false, 128, KvBackend::Vmm, false)
-            .unwrap_err()
-            .contains("requires memory.kv_adaptive"));
-        assert!(
-            validate_adaptive_cask_handoff(true, true, 2049, KvBackend::Vmm, false, 2048)
-                .unwrap_err()
-                .contains("exceeds max_seq")
-        );
-    }
-
-    #[test]
     fn gfx1100_split_verify_refuses_legacy_kv() {
-        assert!(validate_gfx1100_split_verify_kv(true, true, KvBackend::Vmm).is_ok());
+        assert!(validate_gfx1100_split_verify_kv(true, true, KvBackend::Vmm, false).is_ok());
         assert!(
-            validate_gfx1100_split_verify_kv(true, true, KvBackend::Legacy)
+            validate_gfx1100_split_verify_kv(true, true, KvBackend::Legacy, false)
                 .unwrap_err()
                 .contains("admits VMM KV only")
         );
         // Outside the opt-in envelope or off plain Q8 the route never runs,
         // so the backend is not this check's concern.
-        assert!(validate_gfx1100_split_verify_kv(false, true, KvBackend::Legacy).is_ok());
-        assert!(validate_gfx1100_split_verify_kv(true, false, KvBackend::Legacy).is_ok());
+        assert!(validate_gfx1100_split_verify_kv(false, true, KvBackend::Legacy, false).is_ok());
+        assert!(validate_gfx1100_split_verify_kv(true, false, KvBackend::Legacy, false).is_ok());
+        // A runtime that cannot back VMM resolves legacy automatically: the
+        // route (VMM caches only) stays off instead of refusing the load.
+        assert!(validate_gfx1100_split_verify_kv(true, true, KvBackend::Legacy, true).is_ok());
     }
 
     #[test]
@@ -1728,35 +1587,6 @@ mod tests {
         let s = append_cleanup_context("kv failed".into(), Err("pending VMM teardown".into()));
         assert!(s.starts_with("kv failed; cleanup also failed:"), "{s}");
         assert!(s.contains("pending VMM"), "{s}");
-    }
-
-    #[test]
-    fn cask_static_layout_accepts_only_current_compaction_formats() {
-        use hipfire_runtime::kv_mode::{KvMode, KvPair};
-
-        for mode in [KvMode::Q8, KvMode::Asym2, KvMode::Asym3, KvMode::Asym4] {
-            validate_cask_static_layout(true, KvPair::Split(mode, VMode::Q8)).unwrap();
-        }
-        for mode in [KvMode::Fwht2, KvMode::Fwht3, KvMode::Fwht4] {
-            let err =
-                validate_cask_static_layout(true, KvPair::Split(mode, VMode::Q8)).unwrap_err();
-            assert!(err.contains("legacy-asym"), "{err}");
-        }
-        let err = validate_cask_static_layout(true, KvPair::Split(KvMode::Fwht3, VMode::Lloyd3))
-            .unwrap_err();
-        assert!(err.contains("V=q8"), "{err}");
-        assert!(
-            validate_cask_static_layout(true, KvPair::Native(KvMode::Fp8))
-                .unwrap_err()
-                .contains("V=q8")
-        );
-    }
-
-    #[test]
-    fn cask_layout_guard_is_inert_when_cask_is_disabled() {
-        use hipfire_runtime::kv_mode::{KvMode, KvPair};
-
-        validate_cask_static_layout(false, KvPair::Split(KvMode::Fwht3, VMode::Lloyd3)).unwrap();
     }
 
     /// The draft-reserve arithmetic, pinned without a GPU: one file reserves

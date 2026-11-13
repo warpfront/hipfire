@@ -494,6 +494,29 @@ impl Case {
             .collect())
     }
 
+    /// Execute a CDNA image with the same case buffers, guards and launch geometry.
+    pub fn emulate_cdna(
+        &self,
+        image: &peacemaker_cdna::sim::KernelImage,
+    ) -> Result<Vec<Vec<u8>>, String> {
+        use peacemaker_cdna::sim::{self, Config, Launch, Memory};
+        let mut memory = Memory::default();
+        for (index, buffer) in self.buffers.iter().enumerate() {
+            memory
+                .map(&buffer.name, base_of(index)?, buffer.initial_bytes())
+                .map_err(|e| e.to_string())?;
+        }
+        let launch = Launch {
+            grid: self.grid,
+            block: self.block,
+            dynamic_lds: self.dynamic_lds,
+            kernarg: self.kernarg.clone(),
+            kernarg_addr: KERNARG_BASE,
+        };
+        sim::run(image, &launch, &mut memory, &Config::default()).map_err(|e| e.to_string())?;
+        Ok(memory.regions.into_iter().map(|r| r.bytes).collect())
+    }
+
     fn execute_memory(
         &self,
         emulator: &Emulator<'_>,
@@ -672,23 +695,34 @@ pub fn execute(
         Ok(v) => v,
         Err(e) => return failed("assemble", e),
     };
-    let lifted = match peacemaker_lift::lift_object(
-        &elf,
-        peacemaker_lift::Options {
-            frontend: Frontend::Builder,
-        },
-    ) {
-        Ok(v) => v,
-        Err(e) => return failed("lift", format!("{e:?}")),
-    };
-    let emulator = match Emulator::new(&lifted.program, &symbol) {
-        Ok(v) => v,
-        Err(e) => return failed("emulator", e),
-    };
-    let kernarg = std::mem::take(&mut case.kernarg);
-    let memory = match case.execute_memory(&emulator, kernarg) {
-        Ok(memory) => memory,
-        Err((stage, message)) => return failed(stage, message),
+    let actual_buffers = if arch == Arch::Gfx942 {
+        let image = match peacemaker_cdna::sim::load_code_object(&elf, &symbol) {
+            Ok(image) => image,
+            Err(e) => return failed("lift", e.to_string()),
+        };
+        match case.emulate_cdna(&image) {
+            Ok(buffers) => buffers,
+            Err(e) => return failed("emulator", e),
+        }
+    } else {
+        let lifted = match peacemaker_lift::lift_object(
+            &elf,
+            peacemaker_lift::Options {
+                frontend: Frontend::Builder,
+            },
+        ) {
+            Ok(v) => v,
+            Err(e) => return failed("lift", format!("{e:?}")),
+        };
+        let emulator = match Emulator::new(&lifted.program, &symbol) {
+            Ok(v) => v,
+            Err(e) => return failed("emulator", e),
+        };
+        let kernarg = std::mem::take(&mut case.kernarg);
+        match case.execute_memory(&emulator, kernarg) {
+            Ok(memory) => memory.regions.into_iter().map(|r| r.bytes).collect(),
+            Err((stage, message)) => return failed(stage, message),
+        }
     };
     let mut ok = true;
     let mut reports = Map::new();
@@ -698,7 +732,7 @@ pub fn execute(
         document["description"] = json!("Captures observed behavior, not correctness. Output expectations are exact post-run bytes.");
     }
     for (index, buffer) in case.buffers.iter().enumerate() {
-        let actual = &memory.regions[index].bytes;
+        let actual = &actual_buffers[index];
         let (passes, report) = compare(buffer, actual);
         ok &= passes;
         reports.insert(buffer.name.clone(), report);

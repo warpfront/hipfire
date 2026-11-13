@@ -106,12 +106,11 @@ So AWQ-down dispatch is a MULTI-CRATE change, NOT a kernel swap:
 2. MoeFamily::run silu-rotate step: when expert_down_awq_ptrs.is_some(), call
    fused_silu_mul_mq_rotate_awq_indexed (pass ptr table + topk_indices) instead
    of fused_silu_mul_rotate_mq_batched.
-3. Loader (qwen35.rs load_moe_ffn @4331, NOT paro_load_moe_ffn): per-expert
+3. Loader (qwen35.rs load_moe_ffn @4331): per-expert
    down.awq_scale = load_awq_scale(hfq, gpu, "...experts.{x}.down_proj.weight", mi)
    (hfq.rs:589; load_weight_tensor does NOT auto-load it). Build
    expert_down_awq_ptrs from e.down.awq_scale (mirror expert_down_ptrs @~4402).
-   Add the field to MoeFfnWeights (@566) + ALL constructors (paro_load_moe_ffn
-   @1959 builds an empty/None table).
+   Add the field to MoeFfnWeights (@566) + ALL constructors.
 4. rdna-compute launcher for the indexed kernel (or call from the run impl).
 
 Gate on down.awq_scale.is_some() (auto-detect) + HIPFIRE_MOE_AWQ kill-switch.

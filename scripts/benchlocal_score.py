@@ -552,7 +552,7 @@ def score_route(
 
     mode = dict(route.get("mode") or {})
     mode_out = {
-        k: mode[k] for k in mode if k in ("kv", "mtp", "dflash", "dflash_ctx_cap")
+        k: mode[k] for k in mode if k in ("kv", "mtp", "dflash")
     }
 
     artifact_path = route.get("model_path")

@@ -49,7 +49,7 @@
 //!   pseudocode leaves the high half unspecified. `[UNVERIFIED: confirm on MI300X]`
 use super::xlane::{dpp_lane_enabled, dpp_read, sdwa_dst, sdwa_src};
 use super::{fault, unsupported, Flow, SimError, SimResult, Ty, Wave};
-use crate::enc::vop::{Dpp, Sdwa, SdwaSel, Vop1Op, Vop2Op, VopExt, VopcOp};
+use crate::enc::vop::{Dpp, Sdwa, SdwaSel, Vop1Op, Vop2KOp, Vop2Op, VopExt, VopcOp};
 use crate::enc::vop3::{Vop3OnlyOp, Vop3Op};
 use crate::float::{self, F8};
 use crate::inst::Inst;
@@ -73,6 +73,29 @@ pub fn exec(w: &mut Wave, inst: &Inst) -> SimResult<Flow> {
             ),
             Vop3Op::V2(i.op),
         ),
+        Inst::Vop2K(i) => {
+            let lit = Src::Lit(i.literal);
+            let src = match i.op {
+                Vop2KOp::FmamkF32 => [Some(i.src0), Some(lit), Some(i.src1)],
+                Vop2KOp::FmaakF32 => [Some(i.src0), Some(i.src1), Some(lit)],
+            };
+            let v = V::short(i.op.name(), &VopExt::None, i.vdst, src);
+            // Fused f32 multiply-add under the wave's FP mode (same path as v_fma_f32).
+            v.fres(w, Wd::F32, 7, (true, false), |s, w, l| {
+                let (Some(a), Some(b), Some(c)) = (s.f(w, 0, l)?, s.f(w, 1, l)?, s.f(w, 2, l)?)
+                else {
+                    return Ok(None);
+                };
+                // MI300X: invalid zero*infinity takes precedence even over
+                // a NaN addend (the mandatory-literal FMA hardware oracle).
+                let (aa, bb) = (a & 0x7fff_ffff, b & 0x7fff_ffff);
+                if (aa == 0 && bb == 0x7f80_0000) || (bb == 0 && aa == 0x7f80_0000) {
+                    return Ok(Some(QNAN32));
+                }
+                Ok(Some(arith32(&[a, b, c], || f(a).mul_add(f(b), f(c)))))
+            })?;
+            return Ok(Flow::Next);
+        }
         Inst::Vopc(i) => (
             V::short(
                 i.op.name(),
@@ -1017,6 +1040,15 @@ impl V {
                     (opt!(s.s16(w, 1, l)) << (opt!(s.u(w, 0, l)) & 15)) & 0xffff,
                 ))
             }),
+            LshrrevB16 => self.ires(w, Out::None, 0, NONE, |s, w, l| {
+                let value = opt!(s.s16(w, 1, l)) as u16;
+                Ok(Some(u32::from(value) >> (opt!(s.u(w, 0, l)) & 15)))
+            }),
+            // V_ASHRREV_I16: D.i16 = S1.i16 >> S0.u[3:0] (arithmetic; CDNA3 ISA VOP2 opcode 44).
+            AshrrevI16 => self.ires(w, Out::None, 0, NONE, |s, w, l| {
+                let v = opt!(s.s16(w, 1, l)) as u16 as i16;
+                Ok(Some(((v >> (opt!(s.u(w, 0, l)) & 15)) as u16) as u32))
+            }),
         }
     }
 
@@ -1025,17 +1057,7 @@ impl V {
 
     fn vopc(&self, w: &mut Wave, op: VopcOp) -> SimResult<()> {
         use VopcOp::*;
-        let cmpx = matches!(
-            op,
-            CmpxEqU32
-                | CmpxNeU32
-                | CmpxGtU32
-                | CmpxLtU32
-                | CmpxGtI32
-                | CmpxLtI32
-                | CmpxGtF32
-                | CmpxLtF32
-        );
+        let cmpx = op.is_cmpx();
         let dst = match self.form {
             Form::Vop3 => self.dst,
             Form::Sdwa(_) => self.sdst.unwrap_or(Src::VccLo),
@@ -1045,75 +1067,130 @@ impl V {
             Form::E32 => Src::VccLo,
         };
         let mut mask = 0u64;
-        match op {
-            // §12.9 p.208: class bits of S1 (integer operand).
-            CmpClassF32 => {
-                self.check(w, 1, Out::Ignore, 0)?;
-                for l in self.lanes(w) {
-                    let (Some(a), Some(m)) = (self.f(w, 0, l)?, self.u(w, 1, l)?) else {
+        if let Some((width, pred)) = op.float_compare() {
+            // All sixteen F16/F32 predicates (codec's `float_compare` gives width and
+            // the opcode low nibble). Ordered LT/EQ/LE/GT/LG/GE are false on NaN; O/U test
+            // NaN; the N* complements are true on NaN. f16 widens exactly to f32.
+            self.check(w, 3, Out::Ignore, 0)?;
+            // Compare-only mode treatment: rounding never affects a compare and
+            // there is no result to flush, so only the INPUT denormal bit
+            // (FLOAT_DENORM_MODE bit 0 of the 32 or 16/64 field; 0 = flush
+            // denormal inputs to a same-signed zero) matters.
+            // The source-bound cdna_compare_hw_oracle sweeps all four denorm
+            // modes; only its passing MI300X receipt establishes this input rule.
+            let dn = match width {
+                16 => w.mode.denorm16_64,
+                32 => w.mode.denorm32,
+                _ => return fault(format!("{}: float compare width {width}", self.name)),
+            };
+            let flush_in = dn & 1 == 0;
+            for l in self.lanes(w) {
+                let (x, y) = if width == 16 {
+                    let (Some(a), Some(b)) = (self.h(w, 0, l)?, self.h(w, 1, l)?) else {
                         continue;
                     };
-                    mask |= u64::from(m >> class32(a) & 1) << l;
-                }
-            }
-            CmpLtF32 | CmpEqF32 | CmpLeF32 | CmpGtF32 | CmpLgF32 | CmpGeF32 | CmpOF32 | CmpUF32
-            | CmpNeqF32 | CmpxGtF32 | CmpxLtF32 => {
-                self.check(w, 3, Out::Ignore, 0)?;
-                self.fmode(w, true, false)?;
-                for l in self.lanes(w) {
+                    let fl = |v: u32| {
+                        if flush_in && v & 0x7c00 == 0 {
+                            v & 0x8000
+                        } else {
+                            v
+                        }
+                    };
+                    (h(fl(a)), h(fl(b)))
+                } else {
                     let (Some(a), Some(b)) = (self.f(w, 0, l)?, self.f(w, 1, l)?) else {
                         continue;
                     };
-                    let (x, y) = (f(a), f(b));
-                    let r = match op {
-                        CmpLtF32 | CmpxLtF32 => x < y,
-                        CmpEqF32 => x == y,
-                        CmpLeF32 => x <= y,
-                        CmpGtF32 | CmpxGtF32 => x > y,
-                        // LG = ordered and not equal.
-                        CmpLgF32 => x < y || x > y,
-                        CmpGeF32 => x >= y,
-                        CmpOF32 => !x.is_nan() && !y.is_nan(),
-                        // Table 58 prints `!isNaN(S0) || !isNaN(S1)` for U, which
-                        // contradicts its name and O; unordered = either is NaN
-                        // (LLVM maps v_cmp_u_f32 to SETUO).
-                        CmpUF32 => x.is_nan() || y.is_nan(),
-                        _ => x != y, // NEQ = !(S0 == S1)
+                    let fl = |v: u32| {
+                        if flush_in && v & 0x7f80_0000 == 0 {
+                            v & 0x8000_0000
+                        } else {
+                            v
+                        }
                     };
-                    mask |= u64::from(r) << l;
-                }
+                    (f(fl(a)), f(fl(b)))
+                };
+                let (lt, eq, gt) = (x < y, x == y, x > y);
+                let unordered = x.is_nan() || y.is_nan();
+                let r = match pred {
+                    0 => false,
+                    1 => lt,
+                    2 => eq,
+                    3 => lt || eq,
+                    4 => gt,
+                    5 => lt || gt,
+                    6 => gt || eq,
+                    7 => !unordered,
+                    8 => unordered,
+                    9 => !(gt || eq),
+                    10 => !(lt || gt),
+                    11 => !gt,
+                    12 => !(lt || eq),
+                    13 => !eq,
+                    14 => !lt,
+                    15 => true,
+                    _ => return fault(format!("{}: float compare predicate {pred}", self.name)),
+                };
+                mask |= u64::from(r) << l;
             }
-            CmpEqU64 | CmpNeU64 => {
-                self.plain()?;
-                self.check(w, 0, Out::Ignore, 0)?;
-                for l in self.lanes(w) {
-                    let (a, b) = (self.q(w, 0, l)?, self.q(w, 1, l)?);
-                    mask |= u64::from(if op == CmpEqU64 { a == b } else { a != b }) << l;
+        } else {
+            match op {
+                // §12.9 p.208: class bits of S1 (integer operand).
+                CmpClassF32 => {
+                    self.check(w, 1, Out::Ignore, 0)?;
+                    for l in self.lanes(w) {
+                        let (Some(a), Some(m)) = (self.f(w, 0, l)?, self.u(w, 1, l)?) else {
+                            continue;
+                        };
+                        mask |= u64::from(m >> class32(a) & 1) << l;
+                    }
                 }
-            }
-            _ => {
-                self.check(w, 0, Out::Ignore, 0)?;
-                for l in self.lanes(w) {
-                    let (Some(a), Some(b)) = (self.u(w, 0, l)?, self.u(w, 1, l)?) else {
-                        continue;
-                    };
-                    let (i, j) = (a as i32, b as i32);
-                    let r = match op {
-                        CmpLtI32 | CmpxLtI32 => i < j,
-                        CmpEqI32 => i == j,
-                        CmpLeI32 => i <= j,
-                        CmpGtI32 | CmpxGtI32 => i > j,
-                        CmpNeI32 => i != j,
-                        CmpGeI32 => i >= j,
-                        CmpLtU32 | CmpxLtU32 => a < b,
-                        CmpEqU32 | CmpxEqU32 => a == b,
-                        CmpLeU32 => a <= b,
-                        CmpGtU32 | CmpxGtU32 => a > b,
-                        CmpNeU32 | CmpxNeU32 => a != b,
-                        CmpGeU32 => a >= b,
-                        _ => unreachable!("float/class/u64 compares handled above"),
-                    };
-                    mask |= u64::from(r) << l;
+                CmpEqU64 | CmpNeU64 | CmpGeU64 | CmpGtI64 | CmpGeI64 => {
+                    self.plain()?;
+                    self.check(w, 0, Out::Ignore, 0)?;
+                    for l in self.lanes(w) {
+                        let (a, b) = (self.q(w, 0, l)?, self.q(w, 1, l)?);
+                        let (sa, sb) = (a as i64, b as i64);
+                        let t = match op {
+                            CmpEqU64 => a == b,
+                            CmpNeU64 => a != b,
+                            CmpGeU64 => a >= b,
+                            CmpGtI64 => sa > sb,
+                            CmpGeI64 => sa >= sb,
+                            _ => unreachable!("outer arm admits only 64-bit compares"),
+                        };
+                        mask |= u64::from(t) << l;
+                    }
+                }
+                _ => {
+                    self.check(w, 0, Out::Ignore, 0)?;
+                    for l in self.lanes(w) {
+                        let (Some(a), Some(b)) = (self.u(w, 0, l)?, self.u(w, 1, l)?) else {
+                            continue;
+                        };
+                        let (i, j) = (a as i32, b as i32);
+                        let r = match op {
+                            CmpLtI32 | CmpxLtI32 => i < j,
+                            CmpEqI32 => i == j,
+                            CmpLeI32 => i <= j,
+                            CmpGtI32 | CmpxGtI32 => i > j,
+                            CmpNeI32 => i != j,
+                            CmpGeI32 => i >= j,
+                            CmpLtU32 | CmpxLtU32 => a < b,
+                            CmpEqU32 | CmpxEqU32 => a == b,
+                            CmpLeU32 => a <= b,
+                            CmpGtU32 | CmpxGtU32 => a > b,
+                            CmpNeU32 | CmpxNeU32 => a != b,
+                            CmpGeU32 => a >= b,
+                            _ => {
+                                return fault(format!(
+                                    "{}: VOPC opcode has no integer compare semantics",
+                                    self.name
+                                ))
+                            }
+                        };
+                        mask |= u64::from(r) << l;
+                    }
                 }
             }
         }

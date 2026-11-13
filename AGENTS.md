@@ -1,7 +1,14 @@
 # AGENTS.md — project notice + testing playbook
 
-Redline = retained PM4/AQL capture-and-replay of an eager decode step (default only for .mq4r, gfx1201 no-drafter loads, and the gfx1201 A3B `.mq4rs` plain-AR load).
+Redline = retained PM4/AQL capture-and-replay of an eager decode step. It is the default only where `retained_redline_default` (`crates/hipfire-runtime/src/config.rs`) admits it, always single-device (EP=PP=TP=1): the MQ4R SKU on gfx1100/gfx1151/gfx1201, and, without a drafter, gfx1201 Qwen3.5 dense and Qwen4 (Flash-Next with MTP off), gfx1100 Qwen3.5 dense `.mq3-xt`, the gfx1201 A3B MQ4RS SKU and the gfx1151 DeepSeek V4 MQ2R SKU; Gemma 4, Muse Glimmer and Qwen3.5-family CPU-executed offload are excluded. Since 0.5.0 the MQ4R/MQ4RS/MQ2R SKU is the file's identity (`crates/hipfire-runtime/src/route_sku.rs`: the HFQ metadata key `hipfire_route_sku`, else the registry card `quant`, else for DeepSeek V4 the MQ2R tensor structure), never its file extension; an unregistered, unstamped `.mq4r` file gets no automatic Redline.
 railgun = certified typed dispatch programs (railgun, railgun-cert, railgun-corpus, railgun-jitcorpus), including railgun::npu (the Strix Halo NPU trunk runtime), D8 and G7. Do not conflate them.
+
+**Engineering lessons (authoritative):** [`docs/methodology/lessons-0.4.5.md`](docs/methodology/lessons-0.4.5.md)
+holds the measurement, gate and lever-selection rules learned in the 0.4.5
+cycle (decompose before choosing levers, ceiling-first kill experiments,
+served-not-isolated wins, nonce/reducer/host-load/first-arm hygiene,
+per-arch cost tables, residency first, bitwise gates, gate gaps). Where this
+file or [`CLAUDE.md`](CLAUDE.md) disagrees with it, the lessons file wins.
 
 This file serves two purposes, in order:
 
@@ -153,7 +160,9 @@ prompt-shape adaptation paths.
 **Companion docs:** [`CLAUDE.md`](CLAUDE.md) holds project-wide rules
 (non-negotiable hard rules). [`docs/VALIDATION.md`](docs/VALIDATION.md) is
 the authority on which validation route a given change owes.
-This file holds the *testing playbook* — how to verify the engine
+[`docs/methodology/lessons-0.4.5.md`](docs/methodology/lessons-0.4.5.md) is the
+authority on measurement hygiene and gate discipline (it supersedes older
+rules here). This file holds the *testing playbook*: how to verify the engine
 works, what to measure, what counts as pass/fail.
 
 **Default behavior to be aware of:**
@@ -179,28 +188,16 @@ works, what to measure, what counts as pass/fail.
   `serve.vmm_batch` serve with ≥ 4 lanes, IU4 verify gates unchanged).
   DFlash greedy may differ from AR near argmax ties; judge it against the
   MTP arm and the C1 == C8 state oracle, not byte-equality with AR.
-- **PFlash is deprecated since 0.4.0 and will be removed in 0.5.0.**
-  It lives in `crates/hipfire-pflash` outside `crates/hipfire-arch-*`, still
-  loads, warns when used (`prefill_compression` != `off`), and is not
-  supported; prefix caching supersedes it for supported serving workloads.
-  Agents must not treat PFlash as a production element, recommendation,
-  acceptance route, or basis for a current performance claim.
-- **Also deprecated since 0.4.0, removal in 0.5.0** (each entry point carries
-  `// lifecycle: deprecated since 0.4.0, removal 0.5.0 — <reason>`; the
-  status of every env var / config key is in `docs/env-vars.md` /
-  `docs/CONFIG.md`, enforced by `scripts/check-lifecycle.py`): Givens asym KV
-  (`legacy-asymN`) and the `asymN`/`turboN` KV aliases (use `fwhtN`);
-  legacy contiguous DFlash knobs (`HIPFIRE_DFLASH_WINDOW=0`,
-  `HIPFIRE_DFLASH_CTX_CAP`); the `scripts/coherence-gate-*.sh` batteries,
-  `_coherence_runner.py`, `awq_coherence_check.sh`, `pflash-gate.sh`;
-  GGUF **weight** input to the quantizer (lossy double quantization; use
-  llama.cpp for GGUF — `imatrix.gguf` stays); MQ4R / DS4 MQ2R route selection
-  by file extension (no runtime warning; 0.5.0 selects by HFQ metadata).
-- **CASK is deprecated since 0.4.0 and will be removed in 0.5.0.**
-  CASK / TriAttention KV eviction (FlashCASK, `memory.cask.*`, `hipfire
-  sidecar-gen`) still loads, warns when used, and is not supported. Do not
-  treat it as a production element, recommendation, acceptance route, or basis
-  for a current performance claim, and do not build on it.
+- **Removed in 0.5.0** (status of every env var / config key is in
+  `docs/env-vars.md` / `docs/CONFIG.md`, enforced by
+  `scripts/check-lifecycle.py`): Givens asym KV (`legacy-asymN`) and the
+  `asymN`/`turboN` KV aliases (use `fwhtN` or `q8`); the legacy contiguous
+  DFlash knobs (`HIPFIRE_DFLASH_WINDOW=0`, `HIPFIRE_DFLASH_CTX_CAP`); the
+  `scripts/coherence-gate-*.sh` batteries, `_coherence_runner.py` and
+  `awq_coherence_check.sh` (use `scripts/serve_harness.py`); GGUF **weight**
+  input to the quantizer (use llama.cpp for GGUF — `imatrix.gguf` stays);
+  MQ4R / MQ4RS / DS4 MQ2R route selection by file extension (the route is now
+  selected by HFQ metadata, falling back to registry identity).
 
 ---
 
@@ -243,14 +240,26 @@ works, what to measure, what counts as pass/fail.
    TypeScript/JavaScript runtime surface. `scripts/install.{sh,ps1}`, Nix, and
    the container build install the native `hipfire` binary. Python remains
    appropriate for developer-only orchestration and analysis scripts.
-7. **Run `scripts/pre-commit-ci.sh [origin/<base>]` before every commit.**
+7. **Run `scripts/pre-commit-ci.sh [origin/<base>]` on the final commit.**
    It runs the GPU-free CI checks that finish quickly: ratchets, crate
    maps, scratch growth, changelog, ratchet-diff, cargo-deny
-   bans/licenses/sources, rustfmt on changed files, clippy, env docs and
+   bans/licenses/sources, rustfmt, clippy, env docs and
    lifecycle. It skips the tests and the release build. Pass the branch
    your PR targets (for example `origin/beta`) so ratchet-diff compares
-   against it. Fix every failure before you commit. Install cargo-deny first
-   with `cargo install --locked cargo-deny`; missing tools fail the check.
+   against it. Run it again after every rebase, squash or conflict
+   resolution: a pass on an earlier commit does not cover the one that lands
+   (clippy's deny-by-default lints failed a land gate this way, `566f26b40a`).
+   Also run `cargo test -p railgun-cert` for every Rust change: its
+   recording-inventory test scans every crate, so a change outside railgun can
+   turn it red (`8aab98f1e0`). Fix every failure before you commit. Install
+   cargo-deny first with `cargo install --locked cargo-deny`; missing tools
+   fail the check.
+8. **Measurement hygiene is not optional.** Every timing claim follows
+   [`docs/methodology/lessons-0.4.5.md`](docs/methodology/lessons-0.4.5.md) § 4:
+   distinct prompts or nonces in C>1 greedy comparisons, a checked reducer,
+   host load checked by hand, a throwaway arm first, at least 4 interleaved
+   fresh loads per arm, bootstrap CIs. An isolated kernel win is not a served
+   win (§ 3).
 
 ---
 
@@ -429,14 +438,20 @@ hipfire bench <model> --runs 5 --warmups 3 --max-tokens 128 --json
 Pin `--backend` and `--workload` explicitly for any A/B. The default is `both`,
 which measures two things at once and is not a comparison.
 
-**Do not use `--concurrency` for a perf comparison.** It sweeps concurrent
-stream counts and leaves the single-stream path; it answers a different
-question.
+**Do not use `--concurrency` for a single-stream comparison.** It is the
+closed-loop serving sweep (K lanes, unique request tags, an overlap check per
+K>1 cell) and answers the concurrent-serving question, not the single-stream
+one. A C>1 claim is measured on the served path under the rules of
+[`docs/methodology/lessons-0.4.5.md`](docs/methodology/lessons-0.4.5.md) § 4
+(distinct prompts per stream, EOS-on and fixed-length cells reported
+separately, at least 4 interleaved fresh loads per arm, bootstrap CIs).
 
 Still true regardless of tool: run in a fresh process, and record the model md5
-and both binary md5s with any number you report. Within-session A/B is noisy on
-gfx1100 (±10–15 % from DPM/thermal state). `HIPFIRE_VERIFY_GRAPH=0` gives ~0.1 %
-spread versus 1.5–3 % with graph capture on.
+and both binary md5s with any number you report. There is no universal noise
+band: characterize it on the fixture with an A/A pair before calling a delta
+real. The older figures (gfx1100 within-session ±10–15 % from DPM/thermal
+state; `HIPFIRE_VERIFY_GRAPH=0` ~0.1 % spread versus 1.5–3 % with graph capture
+on) are historical observations on that card, not bands to reuse.
 
 ### 3.2 — Prompt-shape A/B
 
@@ -455,7 +470,8 @@ hipfire bench <model> --spec off    --runs 5 --backend noslots --json
 hipfire bench <model> --spec dflash --runs 5 --backend noslots --json
 ```
 
-Report the 5-run median with GPU model, ROCm version, model md5 and binary md5.
+Report the median with the run count and a bootstrap CI of the difference, plus
+GPU model, ROCm version, model md5 and binary md5.
 Older pre-q8 DFlash numbers are not authoritative for current perf triage.
 
 ### 3.4 — DFlash-by-genre matrix (full sweep)
@@ -573,19 +589,30 @@ For dataclass benches:
 
 ### Don't claim a perf win without
 
-- ≥3 fresh-process runs
-- Prompt md5 recorded
-- Binary md5 recorded
+- At least 4 fresh-process loads per arm, interleaved (ABBA or Latin square),
+  with a throwaway arm first; 6–12 per arm when the effect is under about
+  1 ms/step
+- A bootstrap 95% CI of the difference; a bar claim quotes the pooled median,
+  the ratio's CI and how many loads cleared the bar
+- Prompt md5 recorded; distinct prompts or nonces in any C>1 greedy arm
+- Binary md5 recorded; the number measured on the build that lands
+- A log line proving the lever was active in the measured run
 - Claim-scoped `serve_harness` / VALIDATION route pass (retired coherence-gate scripts are **not** acceptance)
+- For a kernel change, a served A/B, not only an isolated bench (unless it is
+  bitwise and below served resolution; see
+  [`lessons-0.4.5.md`](docs/methodology/lessons-0.4.5.md) § 3)
 
 - Eyeball check on decoded output (especially when τ is unusually high)
 
 ### Don't claim a perf regression without
 
-- ≥3 fresh-process runs (same prompt, same env)
+- The same load count, interleaving and CI as a win (same prompt, same env),
+  and a host-load check of the runs that show it
 - Bisect to a specific commit (use `scripts/probe_commits.sh COMMIT_BEFORE COMMIT_AFTER`)
 - Confirmation that the regression appears across genres (not just one
   prompt that happens to hit a different distribution)
+- A reducer check: lead, warm-up and fixed-length bursts are not pooled into
+  the cell (a τ "regression" was exactly that, lessons § 4.2)
 
 ### Pinned Hugging Face bench fixture
 
@@ -636,19 +663,64 @@ use different R9700 cards. gfx1100/gfx1151 run serialized under a shared timing
 lock. **gfx1151 pins require a warm kernel cache**: populate it once, then
 reuse it for two scored runs with fresh HOME directories. Cold-JIT Halo runs
 can differ in chunk 0 only; warm-cache WT2/code24 repeats agree byte for byte.
-The gfx1201 KLD values remain unchanged at six decimals; their ROCm 10.1 sequence hashes
-are the expected re-pins, including the repaired native-FP8 producer route.
+The RDNA rows below are re-pinned for the canonical GDN prefill (chunk- and
+VRAM-independent numerics; CHANGELOG `## Unreleased`): the prefill GDN recipe
+and the scored-region route moved the sequences, paired against the previous
+pins on the same model, references, toolchain and cards (per-chunk paired-t 95%
+CI contains zero on every cell; the only bootstrap CI that excludes zero is the
+gfx1201 native-FP8 WT2 one, on the better side; absolute KLD below 0.08
+everywhere). Evaluator
+build commit `40c52c783a` (branch `canon-cand`), `eval_hipfire` md5
+`8b9ac50188aa0052211ea562d90d6b9f` (gfx1201 build) and
+`546b5f3a183b891b5a60fb5fccb36305` (gfx1100/gfx1151 build). Receipts:
+`/home/kaden/qcal/release-0.5.0/reliability/chunkfix/runs-canon/G4/` (`base/`,
+`cand/`, `cand/paired-*.json`). The gfx942 rows are unchanged: the candidate
+`qwen4_kld` (commit `8842531d0e`, md5 `d7b5741db5590851c0362c22d0e75a0a`)
+reproduces both pinned sequences byte for byte. The gfx1100 and gfx1151 rows
+round to the same KLD (means agree to about 9 digits: the canonical route gives
+both gfx11 archs the same arithmetic) but are distinct sequences from distinct
+devices; their `.kldseq` hashes differ.
+
+Previous (pre-canonical) RDNA pins, KLD / `.kldseq` SHA-256 in the row order of
+the table: gfx1201 A4 `0.069571 / 0.052119`
+(`ff88c499…`, `9b061631…`), native fp8 `0.041859 / 0.029867` (`a4f68b12…`,
+`8373bc27…`), gfx1100 `0.069312 / 0.052757` (`3169b093…`, `27d837f3…`),
+gfx1151 warm `0.070054 / 0.050338` (`2355f76c…`, `9caca85b…`).
 
 | Arch | Route, KV flags | Corpus | KLD | `.kldseq` SHA-256 |
 |---|---|---|---:|---|
-| gfx1201 | A4 (default), `--kv-mode fp8 --kv-v q8` | WT2 | 0.069571 | `ff88c49910be618a98a917afc40d4b01ceeb7c6299c62f1c553444c11b402841` |
-| gfx1201 | A4 (default), `--kv-mode fp8 --kv-v q8` | code24 | 0.052119 | `9b0616316f50e9a654690d06d594d57466430d0a4a67041ec4ff0128d830910e` |
-| gfx1201 | native fp8 (`HIPFIRE_IU4_PREFILL=0`), `--kv-mode fp8 --kv-v q8` | WT2 | 0.041859 | `a4f68b12cf777a99dfc8ac1f398f41ec96614da118e9071e02951ca80dc5b113` |
-| gfx1201 | native fp8 (`HIPFIRE_IU4_PREFILL=0`), `--kv-mode fp8 --kv-v q8` | code24 | 0.029867 | `8373bc27da1fa88245b18bdb2ae90caebd275c06d1ecaf0dce1b9dc4855ca38e` |
-| gfx1100 | A4 (default), `--kv-mode q8 --kv-v q8` | WT2 | 0.069312 | `3169b09310d7598852a6eaa1f32f41aa54b531737c4d4ddd29b8dc90f546e7b2` |
-| gfx1100 | A4 (default), `--kv-mode q8 --kv-v q8` | code24 | 0.052757 | `27d837f388f3294d645b825d1cff7d1b06d219595f4459e9efc3fc4af2f93311` |
-| gfx1151 | A4 (default), `--kv-mode q8 --kv-v q8`, warm kernel cache | WT2 | 0.070054 | `2355f76cfd730cae26cdad027b3de00aeb14b0af8bb666eef934680bd14ca225` |
-| gfx1151 | A4 (default), `--kv-mode q8 --kv-v q8`, warm kernel cache | code24 | 0.050338 | `9caca85b4bf9c4049c921d85afc372ffcbb4698642313d5ce605eb1b2bb8feb0` |
+| gfx1201 | A4 (default), `--kv-mode fp8 --kv-v q8` | WT2 | 0.070184 | `b12344933a335f5e4228f0feef076c227e281b1ff41d87bcdb31571256b8ff6b` |
+| gfx1201 | A4 (default), `--kv-mode fp8 --kv-v q8` | code24 | 0.054421 | `c4515cbe74f89cf2fef3c1f0d26e3de0c39af8918b9f90cbbdad13cca25f11a3` |
+| gfx1201 | native fp8 (`HIPFIRE_IU4_PREFILL=0`), `--kv-mode fp8 --kv-v q8` | WT2 | 0.041267 | `6b5b901694794a04096dd060ce10f4f0787ce00117440a63d1bd5b932ea7ba39` |
+| gfx1201 | native fp8 (`HIPFIRE_IU4_PREFILL=0`), `--kv-mode fp8 --kv-v q8` | code24 | 0.029258 | `a74aff5367db0b983c7d3c8352ac24f46e8eb7e5b76dd02c648a29e57c331129` |
+| gfx1100 | A4 (default), `--kv-mode q8 --kv-v q8` | WT2 | 0.069955 | `bb80365b8a1ad14d8c8199f6726dfc27897b340f369ddaae46ccea99694c992d` |
+| gfx1100 | A4 (default), `--kv-mode q8 --kv-v q8` | code24 | 0.054395 | `2eeae80fc7e7d94bc5c4be1d0c7008e32050e4c098f03702b0feef1bcd73dc50` |
+| gfx1151 | A4 (default), `--kv-mode q8 --kv-v q8`, warm kernel cache | WT2 | 0.069955 | `6aa50d12c7256cb4de88feddafbfd7226ca2817d98154b57b3979ee65909cc68` |
+| gfx1151 | A4 (default), `--kv-mode q8 --kv-v q8`, warm kernel cache | code24 | 0.054395 | `d1e0004402e688109ef2c91cb06b0a26007700661a0fc288d960971e79e31131` |
+| gfx942 | Flash-Next stock FP8 AR (default route, `qwen4_kld eval --decode`), BF16 teacher | WT2 | 0.018734 | `d4b4d4adaa338cf4d738394b8fcaa2c481b2895d56753a4b35710c5d32d3be68` |
+| gfx942 | Flash-Next stock FP8 AR (default route, `qwen4_kld eval --decode`), BF16 teacher | code24 | 0.023527 | `5255454e0c638d46443ceabd1b316a5daf28ecf387a8293def6c6da46019327f` |
+
+The gfx942 (MI300X) rows are not `eval_hipfire` runs and not the 27B model.
+Model: `qwen3.8-flash-next.stock-fp8.hfq` (sha256
+`650e7f43f9293110f1ab789c256f13a5043e8523da3f05834dcc681b5203c592`,
+181924966424 bytes). Evaluator: `qwen4_kld eval --model MODEL --ref REF
+--output OUT.kldseq --decode` with `HIPFIRE_GRAPH=0` and
+`HIPFIRE_NORMALIZE_PROMPT=0`, all other `HIPFIRE_*` unset, scoring the
+production AR n=1 route, 24 chunks. References are BF16-teacher
+`.kldref` files: WT2 `fn-bf16-wt2-24x2048.v3.kldref` (24 x 2048, sha256
+`fafb91dc8d9636a49335ce8a89738a7ec9181f925914240debb8f0c9d56fd569`), code24
+`fn-bf16-code24-24x512.v3.kldref` (24 x 512, sha256
+`0d6c6a8cf00062cfeafc4be206a44b3cb68622f9174fe852ff1d2bea99b1f28b`). Pinned at
+evaluator build commit `165cf0e962` (v0.4.6), evaluator binary md5
+`bf9f63552f3c18aae0bb203eae6ed6ef` (sha256
+`0e7d566d41da9a5d8aa827c0b01a2e232fe6fcba9df3309c763819225cf4fd90`), ROCm 10.1 /
+HIP 7.16.26385 / clang 24. Each cell was reproduced in two fresh processes with
+separate HOME and empty `HIPFIRE_KERNEL_CACHE` (byte-identical), and once more
+on a warm cache (byte-identical to the cold pair). v0.4.6 already contains the
+HC quarters-gates route (`HIPFIRE_QWEN4_G942_HC_QUARTERS_GATES`, default on), so
+these are its numerics. Planted control: `HIPFIRE_G942_TRUNK_GEMV=1` moves the
+code24 hash (`f3acb89b…`, KLD 0.023089). Receipt:
+`/home/kaden/qcal/release-0.5.0/s0/PIN-GFX942.md`.
 
 Cold-cache gfx1151 discriminator (not pins): WT2 measured 0.070054
 (`2355f76c…`) and 0.069878 (`a2f550a9…`); code24 measured 0.050417
@@ -756,6 +828,15 @@ PLE shards. Re-bound sidecars for the base: trunk overlay
 hot set `qwen3.8-flash-next-base.mq4-xts.expert-hotset` (sha256 `91143074…`);
 the monolith-bound overlay (`df49bc0a…`) and hot set (`7f6760e1…`) serve
 grandfathered monolithic installs.
+
+**EP2 serve fixture (2x R9700).** The 0.4.5 Flash-Next EP2 serve measurements
+(cp20) use the symmetric-trunk variant `qwen3.8-flash-next-base.mq4-xts-symtrunk`
+with its `.hc8`, `.ep.hot-units` and `.ep.expert-hotset` sidecars; fixture,
+hashes, cells and method are in
+[`docs/perf-checkpoints/2026-11-11-flash-next-ep2-cp20.md`](docs/perf-checkpoints/2026-11-11-flash-next-ep2-cp20.md).
+Use that cell plan (story/code x C1/C4/C8, fresh serves, pooled medians with
+bootstrap CIs) for any EP2 serve claim, and the rules in
+[`lessons-0.4.5.md`](docs/methodology/lessons-0.4.5.md) § 4.
 
 HF preservation policy: the monolithic HF objects (`qwen3.8-flash-next.mq4-xts`,
 `qwen3.8-flash-next-gptq3.mq4` and the two retired artifacts below) must stay
@@ -1062,7 +1143,13 @@ Caveats that are part of the fixture, not trivia:
   `speculation.mtp_ngram_copy` / `HIPFIRE_MTP_NGRAM_COPY` (`on`/`off`/`auto`,
   also `1`/`0`; default `auto`, which is **on for native Qwen4 MTP (arch 16)
   on gfx1151 and gfx1201** and off on every other GPU; `off`/`0` is the kill
-  switch; env beats TOML beats default). **Off is the 5/3/3 pool lane
+  switch; env beats TOML beats default). Default history: the lane shipped
+  with `auto` off on every GPU (`448a471ea4`); `auto` arms gfx1151 and gfx1201
+  since `c921903686` (`copy_lane_arch_admitted` in
+  `crates/hipfire-config/src/lib.rs`). Flash-Next EP mesh lanes stage the same
+  copy lane by default wherever `auto` arms it, in steps of at most
+  `HIPFIRE_QWEN4_LANE_COPY_LANES` (2) lanes (`047ed76122`; kill switch
+  `HIPFIRE_EP_MTP_LANE_COPY=0`). **Off is the 5/3/3 pool lane
   exactly.** On Qwen4 a pool
   hit (`MtpNgramContext`, the 5/3/3 pool; request-local, cleared and reseeded
   from the full prompt every request, so earlier requests never influence
@@ -1180,6 +1267,15 @@ Caveats that are part of the fixture, not trivia:
   `plan_us`, `retired`) per window with a proposal (retired plans included)
   and `ngram_confirm` (`position`, `match`) wherever the row-0 confirmation
   ran; with it off neither event is emitted.
+- **Concurrent MTP output depends on batch composition by default (Flash-Next
+  EP lanes, exact gfx1201).** With `HIPFIRE_QWEN4_LANE_ROW_EXACT` off (the
+  default, `20c7b6de0e`), lane verify steps of 9..=64 rows take routes whose
+  per-row arithmetic depends on the co-batched rows, so C>1 MTP output may
+  differ from the singleton's; C1 and AR stay exact. `greedy`/`seeded` opts
+  into batch-invariant output (code C8 step +82%, C4 +41% on the measured
+  fixture). Bitwise gates for lane changes therefore compare candidate against
+  incumbent under the same setting, never a lane against the singleton
+  ([`lessons-0.4.5.md`](docs/methodology/lessons-0.4.5.md) § 7).
 - **Measured, not an 80% claim:** on 2026-09-23, gfx1151, HIP 7.2, greedy,
   KV q8, `max_seq=2048`, graph off, three fresh daemon processes per mode and
   byte-identical committed prompts, median code decode was AR 19.4 versus
@@ -1237,7 +1333,7 @@ Caveats that are part of the fixture, not trivia:
 | `τ=9.42` on first run, `τ=8.07` on next | Different prompt — see above | Same fix |
 | "DFlash 102 tok/s on prose vs 124 AR" | Draft-target argmax disagreement on prose tokens, τ collapses to ~1.2 | Expected with z-lab drafts; no retraining fix is planned — Path C (custom draft training, `feat/mtp-dflash-training`) was a failed month-1 experiment and is dead. Use AR or accept the genre-conditional behaviour. |
 | 3.6-A3B DFlash 68.6 tok/s vs AR 135 tok/s (50% loss) | 3.6 draft trained on 3.5 traces; target distribution mismatch on code. τ=1.22 on hard code. | Use AR mode for 3.6-A3B. Draft mismatch is expected and no 3.6 retrain is planned — Path C (`feat/mtp-dflash-training`) is dead/out-of-scope, not a forthcoming fix. 3.5-A3B DFlash works (τ=4.91). |
-| `hipMalloc out of memory` at hidden_rb | Legacy contiguous DFlash (draft declares no window or `HIPFIRE_DFLASH_WINDOW=0`) sizes the draft context structures to the context; long ctx + 27B can exhaust 24 GB | Use the default windowed draft (draft VRAM pinned at W); otherwise lower `HIPFIRE_DFLASH_CTX_CAP` or ctx. KV headroom: `fwht3` is the optional compact mode on every arch |
+| `hipMalloc out of memory` at hidden_rb | Contiguous DFlash (the draft declares no window) sizes the draft context structures to the context, capped at 8192 rows; long ctx + 27B can exhaust 24 GB | Use a draft that declares a sliding window (the default windowed draft pins draft VRAM at W); lower ctx. KV headroom: `fwht3` is the optional compact mode on every arch |
 | `tok/s` below expected on long-ctx | KV cache growth — prefill is fine but decode slows past ~2K | Test at small ctx first, then scale |
 | daemon doesn't pair a pulled draft | Renamed draft file, or pulled before the sidecar existed | Don't rename files after pull; re-run `hipfire pull <tag>` to fetch the registry-declared sidecar |
 | `[hipfire-daemon] dflash_mode=off — skipping draft load` | Default flipped to `off` in 35265c6 (post-2026-04-26). Pulling a draft does NOT auto-enable DFlash anymore. | `hipfire config set dflash_mode auto` (or `on`); or per-model `hipfire config qwen3.8:27b-mq4-xts set dflash_mode on` |
@@ -1258,12 +1354,11 @@ Caveats that are part of the fixture, not trivia:
 | `HIPFIRE_PROMPT_TOKEN_HEAT` | Per-position BPE merge-rank dump | OFF |
 | `HIPFIRE_PROMPT_HEAT_JSON` | JSON output for heat dump | OFF |
 | `HIPFIRE_PROMPT_HEAT_LIMIT` | Max rows in heat dump | 64 |
-| `HIPFIRE_KV_MODE` | Override `kv_cache` config. `fwht3` is the optional compact mode; `asymN`/`turboN` on Qwen are aliases of `fwhtN`, and Givens asym is `legacy-asymN` only | `auto`: fp8 on gfx1201 (Qwen H24/Hkv4/D256, single GPU, no adaptive/CASK), q8 otherwise incl. gfx1100/gfx1151 (`kv_mode.rs:28-46,194-215`) |
+| `HIPFIRE_KV_MODE` | Override `kv_cache` config. `fwht3` is the optional compact mode; `asymN`, `turboN` and `legacy-asymN` were removed in 0.5.0 and are rejected | `auto`: fp8 on gfx1201 (Qwen H24/Hkv4/D256, single GPU, no adaptive), q8 otherwise incl. gfx1100/gfx1151 (`kv_mode.rs:28-46,194-215`) |
 | `HIPFIRE_ATTN_FLASH` | Override flash_mode config | (config) |
 | `HIPFIRE_OOM_GUARD` | Memory preflight OOM guard (`kv_slots::preflight_alloc`, SlotPool arena, bench-sweep headroom check). `auto`: on for unified-memory APUs (Strix Halo — overshoot is a global OOM), off for discrete GPUs, swap-decided for GPU-less processes | `auto` (`memory.oom_guard`) |
 |`HIPFIRE_DFLASH_DRAFT`|Force a specific draft path, overriding the registry sidecar. Empty string = explicit opt-out|(unset: registry sidecar when `dflash_mode` is `auto`/`on`)|
-|`HIPFIRE_DFLASH_CTX_CAP`|**Legacy contiguous DFlash only** (draft declares no window or `HIPFIRE_DFLASH_WINDOW=0`). Max rows for draft context-indexed structures (target_hidden, draft K/V caches, hidden ring); over-cap requests fall back to AR (identical output, slower). `0` = uncapped. Ignored in windowed mode.|8192|
-|`HIPFIRE_DFLASH_WINDOW`|Windowed draft context: sliding attention over the last W rows (DFlash2: every layer; otherwise layers 0..n-2 plus a full-attention last layer). Draft VRAM pins at W regardless of `max_seq`; past-W requests degrade τ instead of falling back to AR. Unset = the draft's declared `sliding_window` (`dflash_spec.rs:170-200`); `<rows>` = override (warns on mismatch); `0` = legacy contiguous.|draft-declared window (legacy contiguous if none)|
+|`HIPFIRE_DFLASH_WINDOW`|Windowed draft context: sliding attention over the last W rows (DFlash2: every layer; otherwise layers 0..n-2 plus a full-attention last layer). Draft VRAM pins at W regardless of `max_seq`; past-W requests degrade τ instead of falling back to AR. Unset = the draft's declared `sliding_window` (`dflash_spec.rs:170-200`); `<rows>` = override (warns on mismatch); `0` is refused (legacy contiguous DFlash removed in 0.5.0).|draft-declared window (fixed 8192-row contiguous cap if none)|
 | `HIPFIRE_LM_HEAD_F16` | `auto`/`native` keeps qt=1 lm_head as F16; `f32`/`legacy` expands to F32 | auto/native |
 | `HIPFIRE_LOCAL` | Force local-spawn (skip serve HTTP) | OFF |
 | `HIPFIRE_HOST_TIMING` | Per-cycle host timing probe | OFF |
@@ -1283,34 +1378,31 @@ Caveats that are part of the fixture, not trivia:
 | `--ddtree-budget N` | Tree node budget |
 | `--ddtree-topk K` | Tree fan-out |
 
-**Deprecation note — CASK.** CASK / TriAttention KV eviction (`memory.cask.*`
-config keys, `hipfire sidecar-gen`, and the `dflash_spec_demo --cask-*`
-flags; FlashCASK) is deprecated since 0.4.0 and will be removed in 0.5.0.
-It prints a deprecation warning when used, forces legacy contiguous DFlash
-(windowed draft disabled), and is not a flag, fix or pitfall workaround to
-reach for.
-
 ---
 
 ## 8 · Open questions agents can investigate
 
-If you want to actively contribute findings, these are open:
+Open performance questions are tracked against the 0.4.5 Flash-Next EP2 record
+([`lessons-0.4.5.md`](docs/methodology/lessons-0.4.5.md) and the cp20
+checkpoint); read both before proposing a lever. Still open there:
 
-1. **Phase 3 prompt-shape rules** — what other rare BPE tokens depress
-   τ? Run `encode_prompt --heat` on a wide variety of prompts and look
-   for patterns.
-2. **Path C training — DEAD**: target-aligned custom DFlash draft (`feat/mtp-dflash-training`) was a failed month-1 experiment and is out of scope. Do not pursue; no recipe is forthcoming. (Historical note: prior revisions listed this as an open investigation.)
-3. **Path D engineering**: stale-context overlap pipelining — the only
-   structural lever still on the table for 27B-3.5 code beyond +8.2%.
-4. **DDTree gfx1100 fix**: linearization-slot RoPE phase delta skew
-   (commit 39aa358). Per-genre data: `feedback_dflash_per_genre`
-   memory. If you have an idea for the structural fix, the project
-   memory has the relevant context.
+1. **EP2 TTFT** — the dominant gap at every cell (0.065-0.263 s median stream
+   TTFT on 2x R9700 vs about half that for another open engine on the same host).
+2. **Story / low-τ decode** — story cells run at τ about 2.2; per-stream decode
+   is below that engine's at C1-C8.
+3. **DDTree gfx1100 fix**: linearization-slot RoPE phase delta skew
+   (commit 39aa358).
+
+Closed, do not reopen: Path C (target-aligned custom DFlash draft training) is
+dead.
 
 ---
 
-*Last updated: 2026-09-30 (0.4.0 cycle: DFlash window default, KV docs; fixture pin: Qwen3.8-27B MQ4XTS). When this
-doc gets stale (more than 1-2 releases behind HEAD), update it as part of the release PR.*
+*Last updated: 2026-11-11 (0.4.5 release: EP2 serve fixture pointer and open
+questions refreshed; engineering lessons are authoritative in
+[`docs/methodology/lessons-0.4.5.md`](docs/methodology/lessons-0.4.5.md) and win
+over this file). When this doc gets stale (more than 1-2 releases behind HEAD),
+update it as part of the release PR.*
 
 
 # Code intelligence — CodeGraph

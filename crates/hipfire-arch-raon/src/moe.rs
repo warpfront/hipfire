@@ -28,7 +28,7 @@ use hipfire_dispatch::pipeline::{
     GroupedMoeGroupedScratch, GroupedMoeIndexedScratch, GroupedMoeOp, GroupedMoePolicy,
     GroupedMoeProtocol, GroupedMoeRouted, GroupedMoeRouter, GroupedMoeScratch,
     GroupedMoeScratchPlan, GroupedMoeShared, GroupedMoeSharedScratch, GroupedMoeSiteTiers,
-    RouterKind, SharedExpertPolicy,
+    RouterKind, SharedExpertPolicy, SingleExpertTableCache,
 };
 use hipfire_runtime::llama::WeightTensor;
 use rdna_compute::ffn_activation::single_expert_table_words;
@@ -275,6 +275,8 @@ pub struct RaonMoeScratch {
     pub shared_out: GpuTensor,
     /// Single-expert grouping tables of the shared expert projections.
     pub shared_tables: GpuTensor,
+    /// Shared-expert single-expert tables, built once per (layer, rows).
+    pub shared_table_cache: SingleExpertTableCache,
 }
 
 fn alloc_words(gpu: &mut Gpu, words: usize) -> Result<GpuTensor, String> {
@@ -351,6 +353,7 @@ impl RaonMoeScratch {
             shared_rot: alloc_words(gpu, plan.shared_rot)?,
             shared_out: alloc_words(gpu, plan.shared_out)?,
             shared_tables: alloc_words(gpu, plan.shared_tables)?,
+            shared_table_cache: SingleExpertTableCache::new(),
         })
     }
 
@@ -383,12 +386,14 @@ impl RaonMoeScratch {
                 rot: &self.shared_rot,
                 out: &self.shared_out,
                 tables: &self.shared_tables,
+                table_cache: Some(&self.shared_table_cache),
             }),
         }
     }
 
     /// Release every tensor.
     pub fn free(self, gpu: &mut Gpu) {
+        self.shared_table_cache.free(gpu);
         for t in [
             self.router_logits,
             self.topk_indices,
@@ -433,6 +438,8 @@ pub struct RaonDenseScratch {
     pub rot: GpuTensor,
     /// Single-expert grouping tables of the dense projections.
     pub tables: GpuTensor,
+    /// Dense single-expert tables, built once per rows.
+    pub table_cache: SingleExpertTableCache,
 }
 
 impl RaonDenseScratch {
@@ -464,10 +471,12 @@ impl RaonDenseScratch {
             act: alloc_words(gpu, rows * dims.dense_mi)?,
             rot: alloc_words(gpu, rows * dims.dense_mi)?,
             tables: alloc_words(gpu, single_expert_table_words(rows))?,
+            table_cache: SingleExpertTableCache::new(),
         })
     }
 
     pub fn free(self, gpu: &mut Gpu) {
+        self.table_cache.free(gpu);
         for t in [
             self.x_rot,
             self.gate_out,
@@ -630,6 +639,7 @@ pub fn raon_dense_op<'a>(
             rot: &scratch.rot,
             out: shared_out,
             tables: &scratch.tables,
+            table_cache: Some(&scratch.table_cache),
         },
         out,
         rows_exact: false,

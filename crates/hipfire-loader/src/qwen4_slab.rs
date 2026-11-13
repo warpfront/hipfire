@@ -12,10 +12,18 @@
 //! entry on the unchanged by-name path.
 
 use hipfire_arch_qwen4::expert_arena::{recipe_arena_payload, ARENA_SUFFIX};
+use hipfire_arch_qwen4::expert_ep_units::{
+    is_unit_arena_name, unit_arena_entry_bytes, unit_arena_source_names, unit_arena_tier,
+    EpLayerState, EpUnitPlan, ShippedStack,
+};
 use hipfire_arch_qwen4::weights::Qwen4TierRecipe;
 use hipfire_runtime::hfq::HfqModelSource;
-use hipfire_runtime::model_source::{ModelSource as _, SourcePayload};
+use hipfire_runtime::hfq_parallel::{
+    read_ranges_into_host, reader_tuning, DirectSource, HostRangeCopy,
+};
+use hipfire_runtime::model_source::{ModelSource as _, SourcePayload, TensorInfo};
 use hipfire_runtime::weight_manifest::WeightEntry;
+use rdna_compute::DType;
 
 /// Physical source bytes of `entry` for placement sizing.
 ///
@@ -30,6 +38,14 @@ pub(crate) fn qwen4_entry_bytes(
     entry: &WeightEntry,
     ordinary: impl FnOnce(&WeightEntry) -> Option<u64>,
 ) -> Option<u64> {
+    // A per-expert EP unit arena (`HIPFIRE_QWEN4_EP_EXPERT_HOTSET`) exists in no
+    // tensor index either: its entry carries its own rank's byte size.
+    if is_unit_arena_name(&entry.name) {
+        return match entry.logical_shape.as_slice() {
+            [bytes] => Some(*bytes as u64),
+            _ => None,
+        };
+    }
     if let Qwen4TierRecipe::FlashNextSlab { arenas, .. } = recipe {
         if entry.name.ends_with(ARENA_SUFFIX) {
             return entry
@@ -38,9 +54,163 @@ pub(crate) fn qwen4_entry_bytes(
                 .map(|layer| layer.bytes as u64);
         }
     }
+    // A drop-zero planar expert stack (DESIGN F1) is sized from its declared
+    // dtype and shape: the loader repacks it, so its device bytes are not the
+    // source tensor's.
+    if let Some(bytes) = planar_entry_bytes(entry) {
+        return Some(bytes);
+    }
     ordinary(entry)
 }
 
+/// The fulfillment payload of a per-expert EP unit arena entry of `rank`
+/// (`...mlp.experts.unit_vram_arena` / `unit_host_arena`), or `None` when
+/// `entry` is not one (the caller then takes [`qwen4_fulfillment_payload`]).
+/// The bytes are [`EpUnitLayerMap::gather_arena`] over the layer's FULL
+/// aggregate stacks read by their original names (each `[512, ..]`, the
+/// per-expert bytes of the plan's geometry), owned: the arena is gathered from
+/// scattered experts, never one source range. An entry of a layer that is not
+/// mixed on `rank`, or declaring another size, is an error.
+pub(crate) fn qwen4_unit_arena_payload<'a>(
+    source: &'a HfqModelSource,
+    plan: &EpUnitPlan,
+    rank: usize,
+    entry: &WeightEntry,
+    direct: Option<&DirectSource>,
+) -> Option<Result<SourcePayload<'a>, String>> {
+    let tier = unit_arena_tier(&entry.name)?;
+    let result = (|| {
+        let layer = entry
+            .layer
+            .filter(|&layer| layer < plan.geometry().layers)
+            .ok_or_else(|| format!("unit arena entry '{}' names no trunk layer", entry.name))?;
+        if !matches!(plan.layer_state(rank, layer), EpLayerState::Mixed { .. }) {
+            return Err(format!(
+                "unit arena entry '{}': layer {layer} is not mixed on rank {rank}",
+                entry.name
+            ));
+        }
+        let map = plan.layer_map(rank, layer);
+        let bytes = map.arena_entry_bytes(tier);
+        if entry.logical_shape.as_slice() != [bytes] {
+            return Err(format!(
+                "unit arena entry '{}' declares {:?}, the plan's layer {layer} {tier:?} arena is {bytes} bytes",
+                entry.name, entry.logical_shape
+            ));
+        }
+        let (gate_up_name, down_name) = unit_arena_source_names(&entry.name)
+            .ok_or_else(|| format!("'{}' is not a unit arena entry", entry.name))?;
+        let stack = |name: &str| {
+            source
+                .tensor_data(name)
+                .map(|(_, data)| data)
+                .ok_or_else(|| format!("missing resident tensor '{name}'"))
+        };
+        // The entry's tier (`tier`, above) selects the arena half.
+        // DESIGN F1: a drop-zero planar plan (geometry = the planar Flash-Next bytes) gathers
+        // the shipped source stacks repacked planar into each slot.
+        let gathered = if plan.geometry().is_mq4_planar() {
+            match direct {
+                // Parallel O_DIRECT reads of exactly the owned experts' shipped spans, then a
+                // parallel repack: no serial mmap page-fault walk (`HIPFIRE_EP_GATHER_DIRECT=0`
+                // keeps that path).
+                Some(direct) => {
+                    let located = |name: &str| {
+                        source
+                            .tensor_info(name)
+                            .map(|info| (info.data_offset as u64, info.data_size))
+                            .ok_or_else(|| format!("missing resident tensor '{name}'"))
+                    };
+                    let (gate_up_at, gate_up_len) = located(&gate_up_name)?;
+                    let (down_at, down_len) = located(&down_name)?;
+                    map.gather_arena_mq4_planar_fetched(tier, |spans, scratch| {
+                        let experts = plan.geometry().experts_per_layer;
+                        if spans.iter().any(|&(stack, offset, len)| {
+                            let total = match stack {
+                                ShippedStack::GateUp => gate_up_len,
+                                ShippedStack::Down => down_len,
+                            };
+                            total % experts != 0
+                                || offset.checked_add(len).is_none_or(|end| end > total)
+                        }) {
+                            return Err(format!(
+                                "EP unit arena layer {layer}: shipped stacks {gate_up_len}+{down_len} bytes do not hold {experts} whole experts"
+                            ));
+                        }
+                        let mut at = 0usize;
+                        let copies: Vec<HostRangeCopy> = spans
+                            .iter()
+                            .map(|&(stack, offset, len)| {
+                                let base = match stack {
+                                    ShippedStack::GateUp => gate_up_at,
+                                    ShippedStack::Down => down_at,
+                                };
+                                let copy = HostRangeCopy {
+                                    file_offset: base + offset as u64,
+                                    len,
+                                    // SAFETY: `at + len` stays inside `scratch` (the spans
+                                    // are laid back to back and sum to its length).
+                                    dst: unsafe { scratch.as_mut_ptr().add(at) },
+                                };
+                                at += len;
+                                copy
+                            })
+                            .collect();
+                        if at != scratch.len() {
+                            return Err("EP unit arena fetch: spans do not fill the scratch".into());
+                        }
+                        let started = std::time::Instant::now();
+                        // SAFETY: the copies are disjoint ranges of `scratch`, exclusive to this
+                        // call, which returns only after every read completed.
+                        let stats =
+                            unsafe { read_ranges_into_host(direct, &copies, reader_tuning()) }
+                                .map_err(|error| format!("EP unit arena direct read: {error}"))?;
+                        rdna_compute::load_phases::add(
+                            "weights.ep_gather_read",
+                            rdna_compute::load_phases::ns_since(started),
+                            stats.bytes_direct + stats.bytes_buffered,
+                        );
+                        Ok(())
+                    })?
+                }
+                None => {
+                    map.gather_arena_mq4_planar(tier, stack(&gate_up_name)?, stack(&down_name)?)?
+                }
+            }
+        } else {
+            unit_arena_entry_bytes(&map, &entry.name, stack(&gate_up_name)?, stack(&down_name)?)?
+        };
+        Ok(SourcePayload::Owned {
+            info: TensorInfo {
+                name: entry.name.clone(),
+                dtype: "RAW".to_string(),
+                shape: vec![gathered.len()],
+                quant_type: 0xFF,
+                data_offset: 0,
+                data_size: gathered.len(),
+            },
+            bytes: gathered,
+        })
+    })();
+    Some(result)
+}
+
+/// Payload bytes of a stacked `[experts, rows, K]` `MQ4G256V2P` / `MQ4G128V2P`
+/// entry; `None` for every other dtype.
+fn planar_entry_bytes(entry: &WeightEntry) -> Option<u64> {
+    use hipfire_runtime::mq4_planar::{stack_planar_bytes, Mq4PlanarKind};
+    let kind = match entry.dtype {
+        DType::MQ4G256V2P => Mq4PlanarKind::GateUp,
+        DType::MQ4G128V2P => Mq4PlanarKind::Down,
+        _ => return None,
+    };
+    let [experts, rows, k] = entry.logical_shape[..] else {
+        return None;
+    };
+    stack_planar_bytes(kind, experts, rows, k)
+        .ok()
+        .map(|bytes| bytes as u64)
+}
 /// The fulfillment payload of one manifest entry: a slab layer arena (one
 /// container span) when the recipe declares it, otherwise the tensor read the
 /// carrier always made. `use_range` is the caller's
@@ -73,6 +243,26 @@ pub(crate) fn qwen4_fulfillment_payload<'a>(
         .tensor_data(&entry.name)
         .ok_or_else(|| format!("missing resident tensor '{}'", entry.name))?;
     Ok(SourcePayload::Borrowed { info, bytes })
+}
+
+/// [`qwen4_fulfillment_payload`] over the stock-FP8 two-file source: with a head sidecar
+/// attached the rule is total, `mtp.*` is served `Borrowed` from the sidecar (never a
+/// range: a second backing file would fail the direct reader's identity check) and
+/// everything else from the base. Without a sidecar every name is the base's, exactly
+/// as before (a packed artifact holds its own `mtp.*` records).
+pub(crate) fn qwen4_routed_payload<'a>(
+    base: &'a HfqModelSource,
+    mtp: Option<&'a HfqModelSource>,
+    recipe: &Qwen4TierRecipe,
+    entry: &WeightEntry,
+    use_range: bool,
+) -> Result<SourcePayload<'a>, String> {
+    match mtp {
+        Some(sidecar) if entry.name.starts_with("mtp.") => {
+            qwen4_fulfillment_payload(sidecar, recipe, entry, false)
+        }
+        _ => qwen4_fulfillment_payload(base, recipe, entry, use_range),
+    }
 }
 
 #[cfg(test)]
@@ -293,6 +483,290 @@ mod tests {
             .map(|_| ())
             .expect_err("a packed recipe has no arenas");
         assert_eq!(error, format!("missing resident tensor '{}'", host.name));
+        cleanup(&path);
+    }
+
+    /// U8: with a head sidecar attached `mtp.*` is served `Borrowed` from the sidecar
+    /// (even when the caller asks for ranges), everything else from the base, and every
+    /// record resolves through the two-file view.
+    #[test]
+    fn payload_routes_mtp_names_to_the_sidecar_and_the_rest_to_the_base() {
+        use hipfire_arch_qwen4::stock_mtp_sidecar::Qwen4StockSources;
+        let dir =
+            std::env::temp_dir().join(format!("hipfire-qwen4-mtp-route-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let base_path = dir.join("base.hfq");
+        let mtp_path = dir.join("base.hfq.mtp");
+        let mem = |name: &str, data: Vec<u8>| HfqMemTensor {
+            name: name.into(),
+            quant_type: 1,
+            shape: vec![data.len() as u32],
+            group_size: 0,
+            data,
+        };
+        write_hfqm_package_mem(
+            &base_path,
+            16,
+            "{}",
+            &[mem("model.embed_tokens.weight", vec![1; 16])],
+        )
+        .unwrap();
+        write_hfqm_package_mem(
+            &mtp_path,
+            16,
+            "{}",
+            &[
+                mem("mtp.fc_embedding.weight", vec![2; 16]),
+                mem("mtp.layers.0.mlp.experts.down_proj", vec![3; 32]),
+            ],
+        )
+        .unwrap();
+        let base_hfq = HfqFile::open_at_offset(&base_path, 0).unwrap();
+        let mtp_hfq = HfqFile::open_at_offset(&mtp_path, 0).unwrap();
+        let names = [
+            "model.embed_tokens.weight",
+            "mtp.fc_embedding.weight",
+            "mtp.layers.0.mlp.experts.down_proj",
+        ];
+        let sources = Qwen4StockSources {
+            base: &base_hfq,
+            mtp: Some(&mtp_hfq),
+        };
+        for name in names {
+            assert!(sources.find_tensor_info(name).is_some(), "{name} resolves");
+        }
+        assert_eq!(
+            sources
+                .find_tensor_info("mtp.layers.0.mlp.experts.down_proj")
+                .map(|info| info.data_size),
+            Some(32)
+        );
+        let base = HfqModelSource::from_hfq(base_hfq);
+        let mut sidecar = HfqModelSource::from_hfq(mtp_hfq);
+        sidecar.set_prefer_ranges(false);
+        let recipe = Qwen4TierRecipe::StockFp8;
+        for (name, fill, len) in [
+            ("model.embed_tokens.weight", 1u8, 16usize),
+            ("mtp.fc_embedding.weight", 2, 16),
+            ("mtp.layers.0.mlp.experts.down_proj", 3, 32),
+        ] {
+            let entry = ordinary_entry(name, None);
+            match qwen4_routed_payload(&base, Some(&sidecar), &recipe, &entry, false) {
+                Ok(SourcePayload::Borrowed { bytes, .. }) => {
+                    assert_eq!(bytes, vec![fill; len].as_slice(), "{name}")
+                }
+                other => panic!("{name} must borrow, got {:?}", other.map(|_| ())),
+            }
+        }
+        // The sidecar is never asked for a range, whatever the caller wants.
+        let mtp_entry = ordinary_entry("mtp.fc_embedding.weight", None);
+        assert!(matches!(
+            qwen4_routed_payload(&base, Some(&sidecar), &recipe, &mtp_entry, true),
+            Ok(SourcePayload::Borrowed { .. })
+        ));
+        // Without a sidecar `mtp.*` is the base's (and missing there).
+        assert_eq!(
+            qwen4_routed_payload(&base, None, &recipe, &mtp_entry, false).map(|_| ()),
+            Err("missing resident tensor 'mtp.fc_embedding.weight'".to_string())
+        );
+        let _ = std::fs::remove_file(&base_path);
+        let _ = std::fs::remove_file(&mtp_path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// A tiny 8-expert source holding layer 3's two aggregate stacks, and the
+    /// two-rank plan whose layer 3 is mixed on both ranks (2 of 4 owned
+    /// experts resident).
+    fn unit_source(
+        tag: &str,
+    ) -> (
+        HfqModelSource,
+        std::path::PathBuf,
+        EpUnitPlan,
+        Vec<u8>,
+        Vec<u8>,
+    ) {
+        use hipfire_arch_qwen4::expert_ep_units::{
+            place_routed_experts_units, EpRanking, EpUnitGeometry, EpUnitSource,
+            VRAM_ARENA_TAIL_PAD_BYTES,
+        };
+        const GU: usize = 256;
+        const DN: usize = 512;
+        const EXPERTS: usize = 8;
+        let gate_up: Vec<u8> = (0..EXPERTS * GU).map(|i| (i * 7 + 1) as u8).collect();
+        let down: Vec<u8> = (0..EXPERTS * DN).map(|i| (i * 13 + 5) as u8).collect();
+        let dir =
+            std::env::temp_dir().join(format!("hipfire-qwen4-units-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("units.hfq");
+        let tensors = [
+            HfqMemTensor {
+                name: "model.language_model.layers.3.mlp.experts.gate_up_proj".into(),
+                quant_type: 1,
+                shape: vec![gate_up.len() as u32],
+                group_size: 0,
+                data: gate_up.clone(),
+            },
+            HfqMemTensor {
+                name: "model.language_model.layers.3.mlp.experts.down_proj".into(),
+                quant_type: 1,
+                shape: vec![down.len() as u32],
+                group_size: 0,
+                data: down.clone(),
+            },
+        ];
+        write_hfqm_package_mem(&path, 16, "{}", &tensors).unwrap();
+        let source = HfqModelSource::from_hfq(HfqFile::open(&path).expect("units container opens"));
+        let geometry = EpUnitGeometry {
+            layers: 4,
+            experts_per_layer: EXPERTS,
+            ranks: 2,
+            gate_up_bytes: GU as u64,
+            down_bytes: DN as u64,
+        };
+        // Layer 3 first, then the rest: each rank keeps its two hottest layer-3 units.
+        let ids: Vec<u32> = (24..32).chain(0..24).collect();
+        let plan = place_routed_experts_units(
+            &geometry,
+            &EpUnitSource::Ranking {
+                ranking: EpRanking {
+                    rank: &ids,
+                    counts: None,
+                    sha256: None,
+                },
+                rank_budget_bytes: vec![
+                    2 * geometry.unit_bytes() + 2 * VRAM_ARENA_TAIL_PAD_BYTES;
+                    2
+                ],
+            },
+        )
+        .unwrap();
+        (source, path, plan, gate_up, down)
+    }
+
+    fn unit_entry(layer: usize, name: String, bytes: usize, host: bool) -> WeightEntry {
+        let mut entry = WeightEntry::model(name, vec![bytes], DType::Raw, ShardPolicy::Replicate);
+        entry.layer = Some(layer);
+        entry.residency = if host {
+            WeightResidency::HostMapped
+        } else {
+            WeightResidency::Resident
+        };
+        entry
+    }
+
+    #[test]
+    fn unit_arena_entries_are_sized_from_their_own_shape_and_gathered_from_the_stacks() {
+        use hipfire_arch_qwen4::expert_ep_units::{
+            UnitTier, UNIT_HOST_ARENA_SUFFIX, UNIT_VRAM_ARENA_SUFFIX,
+        };
+        let (source, path, plan, gate_up, down) = unit_source("gather");
+        let prefix = "model.language_model.layers.3";
+        for rank in 0..2 {
+            assert!(matches!(
+                plan.layer_state(rank, 3),
+                EpLayerState::Mixed {
+                    resident: 2,
+                    host: 2
+                }
+            ));
+            let map = plan.layer_map(rank, 3);
+            for (suffix, tier) in [
+                (UNIT_VRAM_ARENA_SUFFIX, UnitTier::Vram),
+                (UNIT_HOST_ARENA_SUFFIX, UnitTier::Host),
+            ] {
+                let bytes = map.arena_entry_bytes(tier);
+                let entry = unit_entry(
+                    3,
+                    format!("{prefix}{suffix}"),
+                    bytes,
+                    tier == UnitTier::Host,
+                );
+                // Sized from the entry, under every recipe, with no tensor lookup.
+                for recipe in [packed_recipe(), slab_recipe(&all_w3_plan())] {
+                    assert_eq!(
+                        qwen4_entry_bytes(&recipe, &entry, |_| panic!("no lookup")),
+                        Some(bytes as u64)
+                    );
+                }
+                let payload = qwen4_unit_arena_payload(&source, &plan, rank, &entry, None)
+                    .expect("an arena entry")
+                    .expect("the payload gathers");
+                let SourcePayload::Owned { info, bytes: got } = payload else {
+                    panic!("a gathered arena is owned");
+                };
+                assert_eq!(info.name, entry.name);
+                assert_eq!(info.dtype, "RAW");
+                assert_eq!(info.shape, vec![bytes]);
+                assert_eq!(got, map.gather_arena(tier, &gate_up, &down).unwrap());
+                // Every owned expert of the tier sits at its slot.
+                for expert in (0..8).filter(|e| e % 2 == rank) {
+                    let (at_tier, gu_at, dn_at) = map.expert_offsets(expert).unwrap();
+                    if at_tier != tier {
+                        continue;
+                    }
+                    assert_eq!(&got[gu_at..gu_at + 256], &gate_up[expert * 256..][..256]);
+                    assert_eq!(&got[dn_at..dn_at + 512], &down[expert * 512..][..512]);
+                }
+            }
+        }
+        cleanup(&path);
+    }
+
+    #[test]
+    fn unit_arena_payload_refuses_unmixed_layers_and_wrong_shapes_and_skips_ordinary_entries() {
+        use hipfire_arch_qwen4::expert_ep_units::UNIT_VRAM_ARENA_SUFFIX;
+        let (source, path, plan, ..) = unit_source("refuse");
+        let bytes = plan
+            .layer_map(0, 3)
+            .arena_entry_bytes(hipfire_arch_qwen4::expert_ep_units::UnitTier::Vram);
+        // Not an arena: untouched.
+        let ordinary = ordinary_entry("model.embed_tokens.weight", None);
+        assert!(qwen4_unit_arena_payload(&source, &plan, 0, &ordinary, None).is_none());
+        // A layer that is whole-layer (host) on this rank has no arena.
+        let host_layer = unit_entry(
+            0,
+            format!("model.language_model.layers.0{UNIT_VRAM_ARENA_SUFFIX}"),
+            bytes,
+            false,
+        );
+        let error = qwen4_unit_arena_payload(&source, &plan, 0, &host_layer, None)
+            .unwrap()
+            .map(|_| ())
+            .unwrap_err();
+        assert!(error.contains("not mixed"), "{error}");
+        // A mis-declared size.
+        let wrong = unit_entry(
+            3,
+            format!("model.language_model.layers.3{UNIT_VRAM_ARENA_SUFFIX}"),
+            bytes + 1,
+            false,
+        );
+        let error = qwen4_unit_arena_payload(&source, &plan, 0, &wrong, None)
+            .unwrap()
+            .map(|_| ())
+            .unwrap_err();
+        assert!(error.contains("declares"), "{error}");
+        // A layer past the plan.
+        let past = unit_entry(
+            9,
+            format!("model.language_model.layers.9{UNIT_VRAM_ARENA_SUFFIX}"),
+            bytes,
+            false,
+        );
+        assert!(qwen4_unit_arena_payload(&source, &plan, 0, &past, None)
+            .unwrap()
+            .is_err());
+        // A missing aggregate stack in the source is a missing tensor.
+        let missing = unit_entry(
+            2,
+            format!("model.language_model.layers.2{UNIT_VRAM_ARENA_SUFFIX}"),
+            bytes,
+            false,
+        );
+        assert!(qwen4_unit_arena_payload(&source, &plan, 0, &missing, None)
+            .unwrap()
+            .is_err());
         cleanup(&path);
     }
 }

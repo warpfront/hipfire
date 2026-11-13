@@ -61,14 +61,26 @@
 //! base argument. Every other unresolved base keeps its refusal, and the
 //! unguarded [`analyze`] is unchanged. A `Conditional` result is void
 //! without bind witnesses for each guard and indexed effect.
+//!
+//! Complexity and work bound. The forward dataflow is a worklist over blocks: each popped
+//! block replays its instructions and clones/joins the state into every successor, so the
+//! cost is the sum over pops of `block length + 1`. No termination argument is relied on:
+//! that sum is capped at [`A1Budget::fixpoint_work_per_inst`] times the kernel's instruction
+//! count (default 512; the largest ratio over every kernel of the repository's certifier
+//! fixtures is 63, and the task-graph pools and bodies stay under 22). A
+//! kernel that exceeds it is `Unknown` with the single reason [`RULE_FIXPOINT_BUDGET`] and the
+//! measured counts (no access fact of a half-computed result is reported), for the plain,
+//! excluding, guarded, sealed and workgroup-footprint runs alike; the sealed variant runs the
+//! fixpoint twice, each run under the bound. The sealed-table entry and guard replays keep
+//! their own bounds (`GUARD_PATHS`, `GUARD_STEPS`: rule `sealed-guard-path-budget`).
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
 use petgraph::graph::{DiGraph, NodeIndex};
 use smallvec::SmallVec;
 
-use crate::cfg::{Body, InstId};
-use crate::effects::ImplicitSet;
+use crate::cfg::{Body, InstId, Terminator};
+use crate::effects::{ImplicitSet, MemClass};
 use crate::inst::{
     Abi, Arch, EntryCell, EntryValue, Form, FormFields, Inst, Kernel, RawAbi, VmemForm, Wave,
 };
@@ -76,18 +88,54 @@ use crate::isa::OpRow;
 use crate::kernarg::{
     AccessClass, AccessMode, ArgAccess, ArgFacts, ArgRole, CacheBits, DwordFacts, EntryReg, Guard,
     IdxExpr, ImplicitUse, IndexElem, IndexLoad, IndexedArgEffect, KernargFacts, KernelStatus,
-    MemPath, ReadCacheClass, RegionBound, SideReads, Sinks, Unresolved, HIDDEN_GRID_KINDS,
+    MemPath, ReadCacheClass, RegionBound, SealedAccess, SealedBound, SealedEntryLoad, SealedIndex,
+    SealedTableUse, SideReads, Sinks, Unresolved, HIDDEN_GRID_KINDS,
 };
 use crate::metadata::Kernarg;
 use crate::operand::{ImmField, InlineConst, Operand, Special};
 use crate::reg::Kind;
+use crate::wait::Counter;
 
-use super::kernarg_ix::{certify, certify_source, load_ext, Interner, Ix, KargKind, CARRY_SCALAR};
+use super::kernarg_ix::{
+    certify, certify_source, load_ext, table_entry, Interner, Ix, KargKind, Node, CARRY_SCALAR,
+};
 
 /// Kernarg dwords tracked individually (512 bytes). Kernels with a larger
 /// segment fall back to the overflow flags: an overflowing pointer root is
 /// `Unknown`, an overflowing taint is reported as `taint_overflow`.
 const MAX_DW: u32 = 128;
+
+/// Rule of the `Unresolved` an analysis that exceeded its [`A1Budget`] reports.
+pub const RULE_FIXPOINT_BUDGET: &str = "a1-fixpoint-budget";
+
+/// Work bound of one A1 analysis (see "Complexity" in the module docs). An analysis that
+/// exceeds it stops at once and returns `Unknown` carrying [`RULE_FIXPOINT_BUDGET`] with the
+/// measured counts: a refusal, never a partial result, so exceeding the bound admits
+/// nothing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct A1Budget {
+    /// Work of one dataflow fixpoint run, per instruction of the kernel: every block visit
+    /// costs the block's instruction count (each is replayed through the transfer function)
+    /// plus one (the state joined into each successor).
+    pub fixpoint_work_per_inst: u32,
+}
+
+impl Default for A1Budget {
+    fn default() -> Self {
+        A1Budget {
+            fixpoint_work_per_inst: 512,
+        }
+    }
+}
+
+/// A fixpoint that ran past its bound.
+struct FixpointOverrun {
+    work: u64,
+    limit: u64,
+    visits: u64,
+    blocks: usize,
+    insts: usize,
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 struct DwSet(u128);
@@ -126,6 +174,8 @@ const WI: u8 = 1;
 const WG: u8 = 2;
 const MEM: u8 = 4;
 const TAINT_OVF: u8 = 8;
+/// Influenced by a value loaded from a sealed-table entry (sealed analysis).
+const TBL: u8 = 16;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct Val {
@@ -133,6 +183,10 @@ struct Val {
     src: u8,
     taint: DwSet,
     tf: u8,
+    /// Sealed analysis: bit `k` set when the value may be a derived copy of
+    /// the 64-bit entry loaded by qualified entry site `k` (provenance, like
+    /// `roots`: dropped by `kill`).
+    tbl: u8,
     konst: Option<u32>,
     /// Byte offset from the kernarg segment base, for a `KSEG`-rooted value.
     koff: Option<i64>,
@@ -215,6 +269,7 @@ impl Val {
                 None
             },
             ix: self.ix.join(other.ix),
+            tbl: self.tbl | other.tbl,
         }
     }
     /// Arithmetic combination keeping provenance (add, logic, unknown ops).
@@ -225,6 +280,7 @@ impl Val {
             out.src |= v.src;
             out.taint = out.taint.union(v.taint);
             out.tf |= v.tf;
+            out.tbl |= v.tbl;
         }
         out
     }
@@ -233,6 +289,7 @@ impl Val {
         let mut out = Val::mix(vals);
         out.roots = DwSet::default();
         out.src = 0;
+        out.tbl = 0;
         out
     }
 }
@@ -353,6 +410,20 @@ struct State {
     exec: [Val; 2],
     m0: Val,
     scc: Val,
+    /// Sealed analysis: EXEC is known nonzero (the wave launch state, or a
+    /// decided EXECZ/EXECNZ edge set it; any EXEC write but a superset
+    /// `s_or_b32 exec_lo, exec_lo, x` clears it; joins keep it only when both
+    /// sides know it).
+    exec_nz: bool,
+    /// Position (+1) of the last instruction that wrote EXEC; `u32::MAX` after a
+    /// join of different ones. Names the EXEC value of VALU carry witnesses.
+    epoch: u32,
+    /// Workgroup-footprint analysis: scalar compare facts `(atom, polarity)`
+    /// that hold on every path to here (dominating branch edges); joins keep the
+    /// facts both sides know.
+    facts: Vec<(Ix, bool)>,
+    /// Lane predicates every active lane satisfies (the EXEC conjunction).
+    lane_facts: Vec<(Ix, bool)>,
 }
 
 impl State {
@@ -368,6 +439,10 @@ impl State {
             exec: [Val::default(); 2],
             m0: Val::default(),
             scc: Val::default(),
+            exec_nz: false,
+            epoch: 0,
+            facts: Vec::new(),
+            lane_facts: Vec::new(),
         }
     }
     fn top(&self) -> u8 {
@@ -441,6 +516,12 @@ impl State {
         self.exec = [self.exec[0].join(o.exec[0]), self.exec[1].join(o.exec[1])];
         self.m0 = self.m0.join(o.m0);
         self.scc = self.scc.join(o.scc);
+        self.exec_nz &= o.exec_nz;
+        if self.epoch != o.epoch {
+            self.epoch = u32::MAX;
+        }
+        self.facts.retain(|f| o.facts.contains(f));
+        self.lane_facts.retain(|f| o.lane_facts.contains(f));
     }
     /// EXEC ⊆ its old value: lanes being disabled keep their current values.
     fn exec_narrow(&mut self) {
@@ -600,8 +681,8 @@ fn decode<'a>(arch: Arch, id: InstId, inst: &'a Inst) -> Option<Dec<'a>> {
     let returns = crate::isa::atomic_returns(arch, &inst.mods.cpol);
     if let FormFields::Vopd { y_op, x_operands } = inst.fields {
         let split = usize::from(x_operands);
-        let x = crate::isa::lookup(arch, inst.op, Form::Vopd)?;
-        let y = crate::isa::lookup(arch, y_op, Form::Vopd)?;
+        let x = crate::isa::lookup_variant(arch, inst.op, Form::Vopd, None)?;
+        let y = crate::isa::lookup_variant(arch, y_op, Form::Vopd, None)?;
         parts.push(Part {
             name: x.name,
             fields: map_fields(x, Form::Vopd, returns, &inst.operands[..split], &mut extras),
@@ -611,7 +692,7 @@ fn decode<'a>(arch: Arch, id: InstId, inst: &'a Inst) -> Option<Dec<'a>> {
             fields: map_fields(y, Form::Vopd, returns, &inst.operands[split..], &mut extras),
         });
     } else {
-        let row = crate::isa::lookup(arch, inst.op, inst.form)?;
+        let row = crate::isa::lookup_inst(arch, &inst).ok()?;
         parts.push(Part {
             name: row.name,
             fields: map_fields(row, inst.form, returns, &inst.operands, &mut extras),
@@ -793,15 +874,221 @@ fn mem_op(name: &str) -> MemOp {
     MemOp::Other
 }
 
+// ---------------------------------------------------------------------------
+// gfx12 release/acquire classification (`AccessClass::{AtomicRelease,
+// LoadAcquire}`). The shapes are those of LLVM's gfx12 HIP atomic lowering and
+// of PeaceMaker's `Builder::{event_rmw, event_wait}`:
+//
+//   release:  [global_wb scope:SCOPE_SYS]  s_wait_loadcnt 0  s_wait_storecnt 0
+//             global_atomic_*  scope:SCOPE_{DEV,SYS}
+//   acquire:  global_load_* scope:SCOPE_{DEV,SYS} ... s_wait_loadcnt 0 ...
+//             global_inv scope:>=load scope
+//
+// Everything here is a refusal-biased syntactic proof over the lifted CFG: an
+// access that does not fit stays `Atomic { commutative }` / `VmemLoad`.
+// ---------------------------------------------------------------------------
+
+const SCOPE_DEV: u8 = 2;
+const SCOPE_SYS: u8 = 3;
+
+fn inst_name(arch: Arch, inst: &Inst) -> &'static str {
+    inst.name(arch).unwrap_or("")
+}
+
+/// Whether `inst` is a wait that drains `counter` to zero (`s_wait_loadcnt 0`,
+/// the load half of `s_wait_loadcnt_dscnt 0`, `s_wait_storecnt 0`, ...).
+fn waits_zero(inst: &Inst, counter: Counter) -> bool {
+    inst.mods
+        .wait
+        .as_ref()
+        .is_some_and(|w| w.per_counter[counter as usize] == Some(0))
+}
+
+/// A memory instruction in the release/acquire sense: any memory effect, and
+/// the cache maintenance operations (which carry none).
+fn is_memory_inst(arch: Arch, inst: &Inst) -> bool {
+    inst.effects.mem.is_some()
+        || [
+            "global_inv",
+            "global_wb",
+            "buffer_inv",
+            "buffer_wb",
+            "buffer_gl",
+        ]
+        .iter()
+        .any(|p| inst_name(arch, inst).starts_with(p))
+}
+
+/// Whether `inst` reads memory (any load, any atomic, LDS DMA, scalar loads).
+fn reads_memory(inst: &Inst) -> bool {
+    inst.effects.mem.as_ref().is_some_and(|m| {
+        !matches!(
+            m.class,
+            MemClass::VmemStore
+                | MemClass::DsStore
+                | MemClass::SmemStore
+                | MemClass::FlatStore
+                | MemClass::Export
+        )
+    })
+}
+
+/// The commutative atomic at `pos` (scope DEV/SYS) is a release: in its basic
+/// block, walking back over non-memory instructions, both `s_wait_loadcnt 0`
+/// and `s_wait_storecnt 0` appear before the first memory instruction, which
+/// at SYS scope must be `global_wb scope:SCOPE_SYS` (a DEV-scope release may
+/// stop at any memory instruction or at the block start).
+fn released_before(arch: Arch, body: &Body, block: usize, pos: usize, scope: u8) -> bool {
+    let range = body.blocks[block].range;
+    let (mut load0, mut store0) = (false, false);
+    let mut p = pos;
+    while p > range.0 {
+        p -= 1;
+        let Some(inst) = body.insts.get(body.layout[p]) else {
+            return false;
+        };
+        let (l, s) = (
+            waits_zero(inst, Counter::Load),
+            waits_zero(inst, Counter::Store),
+        );
+        if l || s {
+            load0 |= l;
+            store0 |= s;
+            continue;
+        }
+        if is_memory_inst(arch, inst) {
+            let wb_sys = inst_name(arch, inst) == "global_wb" && inst.mods.cpol.scope == SCOPE_SYS;
+            return load0 && store0 && (scope == SCOPE_DEV || wb_sys);
+        }
+    }
+    load0 && store0 && scope == SCOPE_DEV
+}
+
+/// The load at `pos` (scope `scope`) is an acquire: on every CFG path from it
+/// to the next memory read, `s_wait_loadcnt 0` and then `global_inv` of at
+/// least `scope` execute. A path that ends (`s_endpgm`) first, or returns to
+/// the load itself (a spin's re-poll: the superseded observation is never
+/// used), has no read to protect. A different memory read, a `global_inv` too
+/// narrow or before the wait, or a path leaving the CFG fails the proof.
+fn acquired_after(arch: Arch, body: &Body, block_of: &[usize], pos: usize, scope: u8) -> bool {
+    let mut seen = vec![[false; 2]; body.blocks.len()];
+    let mut work = vec![(block_of[pos], pos + 1, false)];
+    while let Some((b, start, mut waited)) = work.pop() {
+        let blk = &body.blocks[b];
+        let mut p = start;
+        let mut covered = false;
+        while p < blk.range.1 {
+            if p == pos {
+                covered = true;
+                break;
+            }
+            let Some(inst) = body.insts.get(body.layout[p]) else {
+                return false;
+            };
+            if inst_name(arch, inst) == "global_inv" {
+                if waited && inst.mods.cpol.scope >= scope {
+                    covered = true;
+                    break;
+                }
+                return false;
+            }
+            if waits_zero(inst, Counter::Load) {
+                waited = true;
+            } else if reads_memory(inst) {
+                return false;
+            }
+            p += 1;
+        }
+        if covered {
+            continue;
+        }
+        if blk.term == Terminator::EndPgm {
+            continue;
+        }
+        if blk.term == Terminator::Unreachable || blk.succs.is_empty() {
+            return false;
+        }
+        for s in &blk.succs {
+            if !seen[s.0][usize::from(waited)] {
+                seen[s.0][usize::from(waited)] = true;
+                work.push((s.0, body.blocks[s.0].range.0, waited));
+            }
+        }
+    }
+    true
+}
+
+/// Per layout position: the release/acquire class of a global atomic/load, if
+/// the stream proves one. gfx12 (`Gfx1201`) only; empty elsewhere.
+fn sync_classes(arch: Arch, body: &Body) -> Vec<Option<AccessClass>> {
+    let mut out = vec![None; body.layout.len()];
+    if !arch.is_gfx12() {
+        return out;
+    }
+    let mut block_of = vec![0usize; body.layout.len()];
+    for (b, block) in body.blocks.iter().enumerate() {
+        block_of[block.range.0..block.range.1].fill(b);
+    }
+    for (pos, &id) in body.layout.iter().enumerate() {
+        let Some(inst) = body.insts.get(id) else {
+            continue;
+        };
+        let scope = inst.mods.cpol.scope;
+        if inst.form != Form::Vmem(VmemForm::Global) || !matches!(scope, SCOPE_DEV | SCOPE_SYS) {
+            continue;
+        }
+        match mem_op(inst_name(arch, inst)) {
+            MemOp::Atomic { commutative: true }
+                if released_before(arch, body, block_of[pos], pos, scope) =>
+            {
+                out[pos] = Some(AccessClass::AtomicRelease);
+            }
+            MemOp::Load if acquired_after(arch, body, &block_of, pos, scope) => {
+                out[pos] = Some(AccessClass::LoadAcquire);
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Resolution of one access base.
 enum Base {
-    Args { hi: DwSet, lo: DwSet },
+    Args {
+        hi: DwSet,
+        lo: DwSet,
+    },
     Side(u8),
+    /// Derived only from the sealed-table entries named by the site mask.
+    Table(u8),
+    /// Either a sealed-table entry (site mask) or an argument pointer (the
+    /// roots): both are plain candidates of one read.
+    Both {
+        mask: u8,
+        hi: DwSet,
+        lo: DwSet,
+    },
     Unresolved(&'static str),
 }
 fn resolve_base(lo: &Val, hi: &Val) -> Base {
     if hi.src & ROOT_OVF != 0 || lo.src & ROOT_OVF != 0 {
         return Base::Unresolved("base-root-overflow");
+    }
+    if hi.tbl != 0 || lo.tbl != 0 {
+        // A sealed-table pointer is a base only as a whole, with nothing else
+        // mixed into either half.
+        let clean = hi.tbl != 0 && hi.tbl == lo.tbl && hi.src == 0 && lo.src == 0;
+        return if clean && hi.roots.is_empty() && lo.roots.is_empty() {
+            Base::Table(hi.tbl)
+        } else if clean && !hi.roots.is_empty() {
+            Base::Both {
+                mask: hi.tbl,
+                hi: hi.roots,
+                lo: lo.roots,
+            }
+        } else {
+            Base::Unresolved("sealed-table-base-mixed")
+        };
     }
     if hi.src & OPAQUE != 0 {
         return Base::Unresolved("base-memory-derived");
@@ -885,6 +1172,57 @@ struct Pending {
     loads: Vec<InstId>,
 }
 
+/// A sealed-table entry load seen by the collecting pass: its shape is right,
+/// its guard is not yet proved.
+struct SealedCand {
+    inst: InstId,
+    pos: usize,
+    table_arg_offset: u32,
+    /// The 32-bit index value (`Load(_)` or `K32(_)` node).
+    index: Ix,
+    index_inst: Option<InstId>,
+    index_kernarg: Option<u32>,
+}
+
+/// A qualified entry load: its table, bound and guard compares.
+struct SealedSite {
+    /// Bit in `Val::tbl`.
+    bit: u8,
+    table_arg_offset: u32,
+    bound: SealedBound,
+    index: SealedIndex,
+    guard_pcs: Vec<u32>,
+}
+
+#[derive(Default)]
+struct SealedCtx {
+    /// Entry loads of the right shape, collected by the recording pass.
+    cands: RefCell<BTreeMap<InstId, SealedCand>>,
+    /// `None` while collecting; then the loads whose index is proved below
+    /// its bound on every path.
+    qualified: Option<BTreeMap<InstId, SealedSite>>,
+}
+
+/// A qualified entry load as the recording pass executed it.
+struct EntryRec {
+    pc: u32,
+    class: AccessClass,
+    path: MemPath,
+    cache: CacheBits,
+    width: u8,
+}
+
+/// A read through a base derived from sealed-table entries.
+struct TableAccessRec {
+    inst: InstId,
+    pc: u32,
+    mask: u8,
+    class: AccessClass,
+    path: MemPath,
+    cache: CacheBits,
+    width: u8,
+}
+
 struct Rec {
     accesses: BTreeMap<Target, Vec<ArgAccess>>,
     unresolved: Vec<Unresolved>,
@@ -899,6 +1237,14 @@ struct Rec {
     /// Indices (into the supplied guards) of kernarg guards whose constant
     /// was substituted on the replayed CFG.
     guards_used: BTreeSet<usize>,
+    sealed_entries: BTreeMap<InstId, EntryRec>,
+    sealed_accesses: Vec<TableAccessRec>,
+    /// Write accesses attributed to an argument, with their address witnesses.
+    wsites: BTreeMap<InstId, WriteSite>,
+    /// Must-facts (scalar, lane) at every attributed access (workgroup replay).
+    nfacts: BTreeMap<InstId, (Vec<(Ix, bool)>, Vec<(Ix, bool)>)>,
+    /// Declared arguments proved `null_guarded`.
+    null_args: BTreeSet<Target>,
 }
 impl Rec {
     fn new(loaded: DwSet) -> Self {
@@ -914,6 +1260,11 @@ impl Rec {
             loads: BTreeMap::new(),
             pending: Vec::new(),
             guards_used: BTreeSet::new(),
+            sealed_entries: BTreeMap::new(),
+            sealed_accesses: Vec::new(),
+            wsites: BTreeMap::new(),
+            nfacts: BTreeMap::new(),
+            null_args: BTreeSet::new(),
         }
     }
     fn sink(&mut self, taint: DwSet, tf: u8, bit: u8) {
@@ -955,19 +1306,68 @@ struct Analyzer<'k> {
     cyclic: Vec<bool>,
     /// The same, per layout position.
     pos_cyclic: Vec<bool>,
+    /// gfx12 release/acquire refinement per layout position ([`sync_classes`]).
+    sync_class: Vec<Option<AccessClass>>,
+    /// Per layout position: attribution is skipped (the dataflow still runs through the
+    /// instruction). Empty when nothing is excluded ([`analyze_excluding`]).
+    excluded: Vec<bool>,
     decoded: Vec<Option<Dec<'k>>>,
     /// Integer/address witness nodes (`kernarg_ix`).
     ix: RefCell<Interner>,
     /// `Some` for the guarded analysis: constants are substituted and
     /// branches whose SCC is then known are pruned.
     guard: Option<GuardCtx>,
+    /// `Some` for the sealed-table analysis ([`analyze_sealed`]).
+    sealed: Option<SealedCtx>,
+    /// Compare positions that produced each flag atom (sealed analysis).
+    atom_pc: RefCell<BTreeMap<Ix, BTreeSet<u32>>>,
+    /// The access the null-guard replay watches and the table bits its base
+    /// carried when it was replayed.
+    probe: RefCell<(Option<InstId>, u8)>,
+    /// The scalar flag/constant semantics of the sealed analysis (SCC compare
+    /// witnesses, decided selects, EXEC-nonzero tracking, branch pruning) are
+    /// on: the sealed analysis and the workgroup-footprint analysis.
+    flags: bool,
+    /// The workgroup-footprint analysis: branch edges add compare facts and
+    /// EXEC predicates are tracked ([`State::facts`], [`State::lane_facts`]).
+    wgf: bool,
 }
 
 /// A1/A3/A4 facts for `kernel`. Never fails: an unsupported arch or ABI, or
 /// an instruction the pass does not model, yields `KernelStatus::Unknown`
 /// with the reason in `unresolved`.
 pub fn analyze(kernel: &Kernel, arch: Arch) -> KernargFacts {
-    analyze_impl(kernel, arch, None)
+    analyze_budgeted(kernel, arch, &A1Budget::default())
+}
+
+/// [`analyze`] under an explicit work bound.
+pub fn analyze_budgeted(kernel: &Kernel, arch: Arch, budget: &A1Budget) -> KernargFacts {
+    analyze_impl(kernel, arch, None, false, &[], budget)
+}
+
+/// The unguarded analysis with the instructions whose lifted byte offset
+/// (`Provenance::pc`, relative to the kernel symbol) lies in one of `excluded`
+/// (`[lo, hi)` ranges) left out of refusal and side-read attribution: the pass
+/// still runs through them for their register effects, and an access of theirs
+/// that resolves to an argument is still credited to it (with its kernarg
+/// sinks), but an access that does not resolve (a pointer loaded from the
+/// argument's pointee), a side read or any other refusal there adds nothing.
+/// For a persistent dispatcher whose hosted task bodies are certified
+/// separately: the facts are the dispatcher shell's own plus what the bodies
+/// read of their argument block. An instruction without a recorded offset is
+/// never excluded.
+pub fn analyze_excluding(kernel: &Kernel, arch: Arch, excluded: &[(u32, u32)]) -> KernargFacts {
+    analyze_excluding_budgeted(kernel, arch, excluded, &A1Budget::default())
+}
+
+/// [`analyze_excluding`] under an explicit work bound.
+pub fn analyze_excluding_budgeted(
+    kernel: &Kernel,
+    arch: Arch,
+    excluded: &[(u32, u32)],
+    budget: &A1Budget,
+) -> KernargFacts {
+    analyze_impl(kernel, arch, None, false, excluded, budget)
 }
 
 /// The guarded analysis of amendment 2026-10-25 §A9.1/§A9.3: the same pass
@@ -983,10 +1383,103 @@ pub fn analyze(kernel: &Kernel, arch: Arch) -> KernargFacts {
 /// (guards cleared), `Unknown` otherwise. The unguarded [`analyze`] result is
 /// unaffected and stays the diagnostic baseline.
 pub fn analyze_guarded(kernel: &Kernel, arch: Arch, guards: &[Guard]) -> KernargFacts {
-    analyze_impl(kernel, arch, Some(guards))
+    analyze_guarded_budgeted(kernel, arch, guards, &A1Budget::default())
 }
 
-fn analyze_impl(kernel: &Kernel, arch: Arch, guards: Option<&[Guard]>) -> KernargFacts {
+/// [`analyze_guarded`] under an explicit work bound.
+pub fn analyze_guarded_budgeted(
+    kernel: &Kernel,
+    arch: Arch,
+    guards: &[Guard],
+    budget: &A1Budget,
+) -> KernargFacts {
+    analyze_impl(kernel, arch, Some(guards), false, &[], budget)
+}
+
+/// The sealed-table analysis (design: `SealedTable` certificate). The same
+/// pass with extra proof obligations for kernels that read a 64-bit pointer
+/// from `table[i]` and then only read through it (`base-memory-derived` in the
+/// unguarded analysis):
+///
+/// 1. the entry load's address is exactly `table pointer argument +
+///    (ext(i) << 3)` with `i` the 32-bit value one instruction loaded (or a
+///    kernarg scalar), outside every CFG cycle;
+/// 2. on **every** feasible path from the kernel entry to the entry load a
+///    scalar unsigned compare established `i < n` (`n` a kernarg scalar or a
+///    constant). Paths are enumerated and replayed with the pass's own
+///    transfer function (exact constants, SCC, VCC; infeasible branch edges
+///    are pruned), so a flag materialised by a diamond is followed, not
+///    guessed;
+/// 3. every access whose base derives from such an entry is a plain load
+///    (`vmem_load`/`smem_load`), no entry-derived value is stored, used in a
+///    write/LDS address or recombined with another base, and a loaded base is
+///    never an address again.
+///
+/// Returns `Conditional` (with [`KernargFacts::sealed`]) when everything
+/// resolves, else `Unknown` with the exact rule; unqualifiable entry loads add
+/// `sealed-*` rules. The result is void without a matching `sealed_table`
+/// runtime witness.
+pub fn analyze_sealed(kernel: &Kernel, arch: Arch) -> KernargFacts {
+    analyze_sealed_budgeted(kernel, arch, &A1Budget::default())
+}
+
+/// [`analyze_sealed`] under an explicit work bound.
+pub fn analyze_sealed_budgeted(kernel: &Kernel, arch: Arch, budget: &A1Budget) -> KernargFacts {
+    analyze_impl(kernel, arch, None, true, &[], budget)
+}
+
+fn analyze_impl(
+    kernel: &Kernel,
+    arch: Arch,
+    guards: Option<&[Guard]>,
+    sealed: bool,
+    excluded: &[(u32, u32)],
+    budget: &A1Budget,
+) -> KernargFacts {
+    analyze_core(kernel, arch, guards, sealed, excluded, false, budget).0
+}
+
+/// The unguarded analysis (`sealed` = [`analyze_sealed`]) together with the
+/// exact address witnesses of every write it attributed to an argument, for
+/// the workgroup-footprint analysis (`passes::wg_footprint`).
+pub(super) fn analyze_for_wg(
+    kernel: &Kernel,
+    arch: Arch,
+    sealed: bool,
+    budget: &A1Budget,
+) -> (KernargFacts, Option<WgInput>) {
+    analyze_core(kernel, arch, None, sealed, &[], true, budget)
+}
+
+/// One write access attributed to an argument and its exact address witness.
+pub(super) struct WriteSite {
+    pub pos: u32,
+    /// The 64-bit address witness (global VMEM only; otherwise `Ix::NONE`).
+    pub addr: Ix,
+    pub width: Option<u8>,
+    /// Inside a CFG cycle: such an access executes many times per workgroup.
+    pub cyclic: bool,
+    /// Scalar compare facts holding on every path to the access.
+    pub facts: Vec<(Ix, bool)>,
+    /// Lane predicates every active lane of the access satisfies.
+    pub lane_facts: Vec<(Ix, bool)>,
+}
+
+/// What the workgroup-footprint analysis needs of the replay.
+pub(super) struct WgInput {
+    pub it: Interner,
+    pub sites: BTreeMap<InstId, WriteSite>,
+}
+
+fn analyze_core(
+    kernel: &Kernel,
+    arch: Arch,
+    guards: Option<&[Guard]>,
+    sealed: bool,
+    excluded: &[(u32, u32)],
+    wg: bool,
+    budget: &A1Budget,
+) -> (KernargFacts, Option<WgInput>) {
     let (args, size) = match &kernel.abi {
         Abi::Hsa {
             metadata,
@@ -1006,13 +1499,16 @@ fn analyze_impl(kernel: &Kernel, arch: Arch, guards: Option<&[Guard]>) -> Kernar
         kernarg_size: size,
         ..KernargFacts::default()
     };
-    if !matches!(arch, Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1201) {
+    if !matches!(
+        arch,
+        Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1200 | Arch::Gfx1201
+    ) {
         facts.unresolved.push(Unresolved {
             inst: None,
             rule: "unsupported-arch",
             detail: format!("{arch:?}"),
         });
-        return finish(facts, &layout, None, &[]);
+        return (finish(facts, &layout, None, &[], Vec::new()), None);
     }
     let body = &kernel.body;
     if body.blocks.is_empty() {
@@ -1021,7 +1517,7 @@ fn analyze_impl(kernel: &Kernel, arch: Arch, guards: Option<&[Guard]>) -> Kernar
             rule: "blocks-not-built",
             detail: String::new(),
         });
-        return finish(facts, &layout, None, &[]);
+        return (finish(facts, &layout, None, &[], Vec::new()), None);
     }
     let mut decoded = Vec::with_capacity(body.layout.len());
     for (pos, &id) in body.layout.iter().enumerate() {
@@ -1033,8 +1529,14 @@ fn analyze_impl(kernel: &Kernel, arch: Arch, guards: Option<&[Guard]>) -> Kernar
         );
     }
     let (mut entry, entry_loaded) = entry_state(kernel, arch);
+    // Sealed analysis: a wave is only launched with at least one enabled lane,
+    // so EXEC is nonzero at the kernel entry. It stays known only while no
+    // instruction writes EXEC (but a superset OR), which `step` enforces; this
+    // is what lets `exec_lo & mask == 0` prove `mask == 0` for a guard that is
+    // not preceded by an EXECZ branch.
+    entry.exec_nz = sealed || wg;
     let mut interner = Interner::default();
-    if arch == Arch::Gfx1201 && matches!(kernel.abi, Abi::Hsa { .. }) {
+    if arch.is_gfx12() && matches!(kernel.abi, Abi::Hsa { .. }) {
         entry.t[9].ix = interner.entry(EntryReg::WorkgroupIdX);
         entry.t[7].ix = interner.entry(EntryReg::WorkgroupIdYZ);
         entry.v[0].ix = interner.entry(EntryReg::WorkitemIdPacked);
@@ -1074,6 +1576,7 @@ fn analyze_impl(kernel: &Kernel, arch: Arch, guards: Option<&[Guard]>) -> Kernar
         GuardCtx { supplied, consts }
     });
     let cyclic = cyclic_blocks(body);
+    let sync_class = sync_classes(arch, body);
     let mut pos_cyclic = vec![false; body.layout.len()];
     for (b, block) in body.blocks.iter().enumerate() {
         for pos in block.range.0..block.range.1 {
@@ -1088,20 +1591,81 @@ fn analyze_impl(kernel: &Kernel, arch: Arch, guards: Option<&[Guard]>) -> Kernar
         entry,
         cyclic,
         pos_cyclic,
+        sync_class,
+        excluded: if excluded.is_empty() {
+            Vec::new()
+        } else {
+            body.layout
+                .iter()
+                .map(|&id| {
+                    body.insts
+                        .get(id)
+                        .and_then(|i| i.prov.pc)
+                        .is_some_and(|pc| excluded.iter().any(|&(lo, hi)| (lo..hi).contains(&pc)))
+                })
+                .collect()
+        },
         decoded,
         ix: RefCell::new(interner),
         guard,
+        sealed: sealed.then(SealedCtx::default),
+        atom_pc: RefCell::new(BTreeMap::new()),
+        probe: RefCell::new((None, 0)),
+        flags: sealed || wg,
+        wgf: wg,
     };
-    let ins = an.fixpoint();
-    for (b, block) in body.blocks.iter().enumerate() {
-        let Some(mut st) = ins[b].clone() else {
-            continue;
-        };
-        for pos in block.range.0..block.range.1 {
-            an.step(&mut st, pos, Some(&mut rec), an.cyclic[b]);
+    let ins = match an.fixpoint(budget) {
+        Ok(ins) => ins,
+        Err(over) => {
+            facts.unresolved.append(&mut rec.unresolved);
+            return (overrun_facts(facts, &mut an.layout, &over), None);
+        }
+    };
+    an.record(&ins, &mut rec);
+    let mut rejected: Vec<Unresolved> = Vec::new();
+    let mut sealed_uses: Vec<SealedTableUse> = Vec::new();
+    if let Some(ctx) = &an.sealed {
+        let mut cands: Vec<SealedCand> = std::mem::take(&mut *ctx.cands.borrow_mut())
+            .into_values()
+            .collect();
+        cands.sort_by_key(|c| c.pos);
+        let (qualified, rej) = an.qualify(cands);
+        rejected = rej;
+        if !qualified.is_empty() {
+            if let Some(ctx) = an.sealed.as_mut() {
+                ctx.qualified = Some(qualified);
+            }
+            // Second run: the qualified entry loads now carry their table
+            // provenance, so every access through them is attributed.
+            let ins = match an.fixpoint(budget) {
+                Ok(ins) => ins,
+                Err(over) => {
+                    facts.unresolved.append(&mut rejected);
+                    return (overrun_facts(facts, &mut an.layout, &over), None);
+                }
+            };
+            rec = Rec::new(entry_loaded);
+            an.record(&ins, &mut rec);
+            sealed_uses = an.assemble_sealed(&rec);
         }
     }
-    facts.unresolved = std::mem::take(&mut rec.unresolved);
+    if wg {
+        rec.null_args = an.null_guarded_args(&rec);
+    }
+    // The plain analysis has no must-facts: a kernel that tests a 64-bit
+    // kernarg against zero is replayed once more with them for `null_guarded`.
+    let probe_null = !wg
+        && !sealed
+        && guards.is_none()
+        && an.decoded.iter().flatten().any(|d| {
+            d.parts.len() == 1
+                && matches!(
+                    norm_name(d.parts[0].name).as_str(),
+                    "s_cmp_lg_u64" | "s_cmp_eq_u64"
+                )
+        });
+    rejected.append(&mut rec.unresolved);
+    facts.unresolved = rejected;
     let supplied = an.guard.take().map(|g| g.supplied).unwrap_or_default();
     let layout = std::mem::replace(
         &mut an.layout,
@@ -1110,7 +1674,53 @@ fn analyze_impl(kernel: &Kernel, arch: Arch, guards: Option<&[Guard]>) -> Kernar
             size: 0,
         },
     );
-    finish(facts, &layout, Some(rec), &supplied)
+    let wg = WgInput {
+        it: an.ix.take(),
+        sites: std::mem::take(&mut rec.wsites),
+    };
+    let mut out = finish(facts, &layout, Some(rec), &supplied, sealed_uses);
+    if probe_null && out.status != KernelStatus::Unknown {
+        let (replay, _) = analyze_core(kernel, arch, None, false, excluded, true, budget);
+        for a in &mut out.args {
+            a.null_guarded = replay.args.iter().any(|b| {
+                b.null_guarded
+                    && b.offset == a.offset
+                    && b.index == a.index
+                    && b.accesses == a.accesses
+            });
+        }
+    }
+    (out, Some(wg))
+}
+
+/// The result of an analysis stopped by its work bound: `Unknown`, with the measured counts
+/// as the only reason (no access facts of a half-computed fixpoint are ever reported).
+fn overrun_facts(
+    mut facts: KernargFacts,
+    layout: &mut Layout,
+    over: &FixpointOverrun,
+) -> KernargFacts {
+    facts.unresolved.push(Unresolved {
+        inst: None,
+        rule: RULE_FIXPOINT_BUDGET,
+        detail: format!(
+            "the dataflow fixpoint did {} units of work ({} block visits over {} blocks, {} instructions), past its bound of {} ({} per instruction)",
+            over.work,
+            over.visits,
+            over.blocks,
+            over.insts,
+            over.limit,
+            over.limit / over.insts.max(1) as u64
+        ),
+    });
+    let layout = std::mem::replace(
+        layout,
+        Layout {
+            args: Vec::new(),
+            size: 0,
+        },
+    );
+    finish(facts, &layout, None, &[], Vec::new())
 }
 
 fn cyclic_blocks(body: &Body) -> Vec<bool> {
@@ -1244,7 +1854,7 @@ fn entry_state(kernel: &Kernel, arch: Arch) -> (State, DwSet) {
         }
         next += 1;
     }
-    if arch == Arch::Gfx1201 {
+    if arch.is_gfx12() {
         st.t[9] = Val::flags(WG);
         st.t[7] = Val::flags(WG);
     } else {
@@ -1303,14 +1913,33 @@ enum ExecPlan {
 }
 
 impl<'k> Analyzer<'k> {
-    fn fixpoint(&self) -> Vec<Option<State>> {
+    /// The forward dataflow to a fixpoint: a worklist of blocks, each popped block replays
+    /// its instructions and joins its out-state into its successors. A pop costs the block's
+    /// instruction count plus one; the sum may not pass `budget.fixpoint_work_per_inst`
+    /// times the kernel's instruction count, else [`FixpointOverrun`].
+    fn fixpoint(&self, budget: &A1Budget) -> Result<Vec<Option<State>>, FixpointOverrun> {
         let n = self.body.blocks.len();
         let mut ins: Vec<Option<State>> = vec![None; n];
         ins[0] = Some(self.entry.clone());
         let mut work: Vec<usize> = vec![0];
         let mut queued = vec![false; n];
         queued[0] = true;
+        let insts = self.body.layout.len();
+        let limit = u64::from(budget.fixpoint_work_per_inst) * insts.max(1) as u64;
+        let (mut spent, mut visits) = (0u64, 0u64);
         while let Some(b) = work.pop() {
+            visits += 1;
+            let range = self.body.blocks[b].range;
+            spent += (range.1 - range.0) as u64 + 1;
+            if spent > limit {
+                return Err(FixpointOverrun {
+                    work: spent,
+                    limit,
+                    visits,
+                    blocks: n,
+                    insts,
+                });
+            }
             queued[b] = false;
             let Some(mut st) = ins[b].clone() else {
                 continue;
@@ -1320,14 +1949,16 @@ impl<'k> Analyzer<'k> {
                 self.step(&mut st, pos, None, false);
             }
             for target in self.live_succs(block, &st) {
+                let edge = self.edge_state(block, target, &st);
+                let src = edge.as_ref().unwrap_or(&st);
                 let changed = match &mut ins[target] {
                     Some(existing) => {
                         let before = existing.clone();
-                        existing.join_from(&st);
+                        existing.join_from(src);
                         *existing != before
                     }
                     slot @ None => {
-                        *slot = Some(st.clone());
+                        *slot = Some(src.clone());
                         true
                     }
                 };
@@ -1337,25 +1968,85 @@ impl<'k> Analyzer<'k> {
                 }
             }
         }
-        ins
+        Ok(ins)
     }
 
-    /// Successors of `block` that can execute after `st`. In the guarded
-    /// analysis a conditional SCC branch whose SCC is a known constant keeps
-    /// only its live edge (the guarded CFG); otherwise every edge.
-    fn live_succs(&self, block: &crate::cfg::Block, st: &State) -> SmallVec<[usize; 2]> {
+    /// Workgroup-footprint analysis: the state flowing along the branch edge
+    /// `block -> target` with the compare facts that edge implies added
+    /// (`None`: no change).
+    fn edge_state(&self, block: &crate::cfg::Block, target: usize, st: &State) -> Option<State> {
         use crate::cfg::{Cond, Terminator};
-        if self.guard.is_some() {
-            if let (
-                Terminator::Branch {
-                    cond: cond @ (Cond::Scc0 | Cond::Scc1),
-                    taken,
-                    fallthrough,
-                },
-                Some(scc),
-            ) = (&block.term, st.scc.konst)
-            {
-                let take = (scc != 0) == (*cond == Cond::Scc1);
+        if !self.wgf {
+            return None;
+        }
+        let Terminator::Branch {
+            cond,
+            taken,
+            fallthrough,
+        } = &block.term
+        else {
+            return None;
+        };
+        if taken == fallthrough {
+            return None;
+        }
+        let is_taken = target == taken.0;
+        let mut facts = Vec::new();
+        self.edge_facts(*cond, is_taken, st, &mut facts);
+        let nz = self.wave == Wave::Wave32
+            && matches!(
+                (cond, is_taken),
+                (Cond::Execz, false) | (Cond::Execnz, true)
+            );
+        if facts.is_empty() && !nz {
+            return None;
+        }
+        let mut out = st.clone();
+        out.facts.extend(facts);
+        out.facts.sort();
+        out.facts.dedup();
+        if nz {
+            out.exec_nz = true;
+        }
+        Some(out)
+    }
+
+    /// Which edge of a conditional branch `st` decides: `Some(true)` the taken
+    /// edge only, `Some(false)` the fall-through only, `None` both. The
+    /// guarded analysis decides SCC branches whose SCC is a known constant;
+    /// the sealed analysis additionally decides wave32 VCC branches on a
+    /// known `vcc_lo` (the hardware sets VCCZ from `vcc_lo` alone in wave32,
+    /// which the compiler relies on). EXEC branches are never decided.
+    fn branch_outcome(&self, cond: crate::cfg::Cond, st: &State) -> Option<bool> {
+        use crate::cfg::Cond;
+        if self.guard.is_none() && !self.flags {
+            return None;
+        }
+        match cond {
+            Cond::Scc0 | Cond::Scc1 => {
+                let scc = st.scc.konst?;
+                Some((scc != 0) == (cond == Cond::Scc1))
+            }
+            Cond::Vccz | Cond::Vccnz if self.flags && self.wave == Wave::Wave32 => {
+                let vcc = st.s[VCC_LO].konst?;
+                Some((vcc == 0) == (cond == Cond::Vccz))
+            }
+            _ => None,
+        }
+    }
+
+    /// Successors of `block` that can execute after `st`. In the guarded and
+    /// sealed analyses a conditional branch decided by [`Self::branch_outcome`]
+    /// keeps only its live edge; otherwise every edge.
+    fn live_succs(&self, block: &crate::cfg::Block, st: &State) -> SmallVec<[usize; 2]> {
+        use crate::cfg::Terminator;
+        if let Terminator::Branch {
+            cond,
+            taken,
+            fallthrough,
+        } = &block.term
+        {
+            if let Some(take) = self.branch_outcome(*cond, st) {
                 return smallvec::smallvec![if take { taken.0 } else { fallthrough.0 }];
             }
         }
@@ -1542,6 +2233,7 @@ impl<'k> Analyzer<'k> {
         if let Some(rec) = rec.as_deref_mut() {
             self.record_sinks(st, dec, rec, cyclic);
         }
+        let lane_upd = self.lane_pre(st, dec);
 
         if name == "s_setpc_b64"
             || name == "s_swappc_b64"
@@ -1552,6 +2244,11 @@ impl<'k> Analyzer<'k> {
                 rec.fail(self.arch, dec, "call");
             }
         }
+        let fx = if self.flags {
+            self.sealed_scalar(st, dec)
+        } else {
+            SealedFx::default()
+        };
         let mut carry: Option<(CarryTo, Ix)> = None;
         let mut scc_konst: Option<bool> = None;
         if inst.effects.mem.is_some() || matches!(inst.form, Form::Vmem(_) | Form::Smem | Form::Ds)
@@ -1563,13 +2260,15 @@ impl<'k> Analyzer<'k> {
             let mut lane_writes: SmallVec<[(u16, Option<u8>, Val); 1]> = SmallVec::new();
             scc_konst = self.cmp_konst(st, dec);
             for part in &dec.parts {
-                self.eval(st, part, &mut writes, &mut lane_writes, &mut carry);
+                self.eval(st, part, &mut writes, &mut lane_writes, &mut carry, pos);
             }
+            self.opaque_defs(st, dec, &mut writes);
             let plan = self.exec_plan(st, dec);
             let valu = matches!(
                 inst.form,
                 Form::Vop1
                     | Form::Vop1Dpp
+                    | Form::Vop1Dpp8
                     | Form::Vop2
                     | Form::Vop2Dpp
                     | Form::Vop3
@@ -1642,8 +2341,209 @@ impl<'k> Analyzer<'k> {
             Some((CarryTo::Vcc, ix)) => st.s[VCC_LO].ix = ix,
             None => {}
         }
+        // Sealed analysis: exact scalar results (constants through logic ops
+        // and decided selects) and the unsigned-compare witness of SCC.
+        if let Some((i, vals)) = fx.dst_vals {
+            for (k, v) in vals.into_iter().enumerate() {
+                if i + k < NS {
+                    st.s[i + k] = v;
+                    st.masks[i + k] = Mask::Unknown;
+                }
+            }
+        }
+        if let Some((i, c)) = fx.dst_konst {
+            if i < NS {
+                st.s[i].konst = Some(c);
+            }
+        }
+        if let Some(ix) = fx.scc_ix {
+            st.scc.ix = ix;
+        }
+        if let Some(k) = fx.scc_konst {
+            st.scc.konst = Some(u32::from(k));
+        }
+        if let Some((i, ix)) = fx.dst_ix {
+            if i < NS {
+                st.s[i].ix = ix;
+            }
+        }
+        if self.flags && st.exec_nz {
+            let writes_exec = inst.effects.implicit.writes & ImplicitSet::EXEC != 0
+                || dec.parts.iter().any(|p| {
+                    p.fields.iter().any(|f| {
+                        f.def
+                            && matches!(
+                                f.op,
+                                Operand::Special(Special::Exec | Special::ExecLo | Special::ExecHi)
+                            )
+                    })
+                });
+            // `s_or_b32 exec_lo, exec_lo, x` only adds lanes: still nonzero.
+            let superset = dec.parts.len() == 1
+                && norm_name(dec.parts[0].name) == "s_or_b32"
+                && dec.parts[0]
+                    .fields
+                    .iter()
+                    .any(|f| f.def && matches!(f.op, Operand::Special(Special::ExecLo)))
+                && dec.parts[0]
+                    .sources()
+                    .any(|f| matches!(f.op, Operand::Special(Special::ExecLo)));
+            if writes_exec && !superset {
+                st.exec_nz = false;
+            }
+        }
+        // EXEC epoch: the position (+1) of the last instruction that wrote EXEC.
+        if inst.effects.implicit.writes & ImplicitSet::EXEC != 0
+            || dec.parts.iter().any(|p| {
+                p.fields.iter().any(|f| {
+                    f.def
+                        && matches!(
+                            f.op,
+                            Operand::Special(Special::Exec | Special::ExecLo | Special::ExecHi)
+                        )
+                })
+            })
+        {
+            st.epoch = pos as u32 + 1;
+        }
+        if fx.exec_nz {
+            st.exec_nz = true;
+        }
+        for (tgt, ix) in lane_upd {
+            match tgt {
+                LaneTgt::S(i) if i < NS => st.s[i].ix = ix,
+                LaneTgt::Exec => st.exec[0].ix = ix,
+                LaneTgt::S(_) => {}
+            }
+        }
     }
 
+    /// Workgroup-footprint analysis: lane-mask witnesses. A vector compare of
+    /// exact 32-bit operands writes the mask whose set lanes satisfy the
+    /// compare; ANDs of masks keep every operand's facts; the EXEC register's
+    /// witness is then the mask every active lane belongs to, whose facts are
+    /// the lane predicates of a store. Computed from the pre-state.
+    fn lane_pre(&self, st: &State, dec: &Dec) -> SmallVec<[(LaneTgt, Ix); 2]> {
+        let mut out = SmallVec::new();
+        if !self.wgf || self.wave != Wave::Wave32 || dec.parts.len() != 1 {
+            return out;
+        }
+        let part = &dec.parts[0];
+        let name = norm_name(part.name);
+        let tgt_of = |op: &Operand| -> Option<LaneTgt> {
+            match op {
+                Operand::Reg(r) if r.kind == Kind::S => Some(LaneTgt::S(usize::from(r.base))),
+                Operand::Special(Special::Vcc | Special::VccLo) => Some(LaneTgt::S(VCC_LO)),
+                Operand::Special(Special::Exec | Special::ExecLo) => Some(LaneTgt::Exec),
+                _ => None,
+            }
+        };
+        let srcs: SmallVec<[&Field; 4]> = part.sources().collect();
+        let mut it = self.ix.borrow_mut();
+        let it = &mut *it;
+        let exec_ix = st.exec[0].ix.live();
+        let mut src_ix = |i: usize, it: &mut Interner| -> Ix {
+            srcs.get(i)
+                .map(|f| ixof(it, self.vals(st, f).first().copied().unwrap_or_default()))
+                .unwrap_or(Ix::NONE)
+        };
+        if let Some(rest) = name
+            .strip_prefix("v_cmpx_")
+            .or_else(|| name.strip_prefix("v_cmp_"))
+        {
+            let cmpx = name.starts_with("v_cmpx_");
+            let Some((rel, ty)) = rest.split_once('_') else {
+                return out;
+            };
+            if ty != "u32" && ty != "i32" {
+                return out;
+            }
+            let (a, b) = (src_ix(0, it), src_ix(1, it));
+            if a.is_none() || b.is_none() {
+                return out;
+            }
+            let lt = |it: &mut Interner, x: Ix, y: Ix| {
+                if ty == "u32" {
+                    it.ltu(x, y)
+                } else {
+                    it.lts(x, y)
+                }
+            };
+            let (atom, holds) = match rel {
+                "lt" => (lt(it, a, b), true),
+                "gt" => (lt(it, b, a), true),
+                "le" => (lt(it, b, a), false),
+                "ge" => (lt(it, a, b), false),
+                "eq" => (it.eq32(a, b), true),
+                "ne" => (it.eq32(a, b), false),
+                _ => return out,
+            };
+            if atom.is_none() {
+                return out;
+            }
+            // Exact while EXEC keeps this generation: an active lane's bit is
+            // set exactly when the compare holds.
+            let exact =
+                (!cmpx && st.epoch != u32::MAX && !self.pos_cyclic[dec.pos]).then_some(st.epoch);
+            let mask = it.lane_mask(vec![(atom, holds)], exact);
+            if cmpx {
+                out.push((LaneTgt::Exec, it.mask_and(exec_ix, mask)));
+            } else if let Some(t) = part
+                .fields
+                .iter()
+                .filter(|f| f.def)
+                .find_map(|f| tgt_of(f.op))
+                .or_else(|| part.name.ends_with("_e32").then_some(LaneTgt::S(VCC_LO)))
+            {
+                out.push((t, mask));
+            }
+            return out;
+        }
+        match name.as_str() {
+            "s_and_b32" | "s_or_b32" => {
+                let (a0, b0) = (src_ix(0, it), src_ix(1, it));
+                let (a, b) = (null_lane_mask(it, a0), null_lane_mask(it, b0));
+                let r = if name == "s_and_b32" {
+                    it.mask_and(a, b)
+                } else {
+                    it.mask_or(a, b)
+                };
+                if !r.is_none() {
+                    if let Some(t) = part
+                        .fields
+                        .iter()
+                        .filter(|f| f.def)
+                        .find_map(|f| tgt_of(f.op))
+                    {
+                        out.push((t, r));
+                    }
+                }
+            }
+            "s_and_saveexec_b32" => {
+                let x0 = src_ix(0, it);
+                let x = null_lane_mask(it, x0);
+                out.push((LaneTgt::Exec, it.mask_and(exec_ix, x)));
+                if let Some(LaneTgt::S(i)) = part
+                    .fields
+                    .iter()
+                    .filter(|f| f.def)
+                    .find_map(|f| tgt_of(f.op))
+                {
+                    out.push((LaneTgt::S(i), exec_ix));
+                }
+            }
+            _ => {}
+        }
+        out
+    }
+
+    /// The lane predicates every active lane satisfies (see [`Self::lane_pre`]).
+    fn lane_facts_of(&self, st: &State) -> Vec<(Ix, bool)> {
+        if !self.wgf || self.wave != Wave::Wave32 {
+            return Vec::new();
+        }
+        self.ix.borrow().mask_facts(st.exec[0].ix.live())
+    }
     /// The mask value of an operand (for EXEC and saved-mask arithmetic).
     fn mask_of(&self, st: &State, op: &Operand) -> Mask {
         let sgprs = |base: usize, len: usize| -> Mask {
@@ -1845,6 +2745,82 @@ impl<'k> Analyzer<'k> {
         }
     }
 
+    /// A pure scalar instruction outside every CFG cycle whose sources are all
+    /// witnessed uniform values (constants, kernarg dwords and pure functions of
+    /// them) computes a uniform value the witness has no expression for
+    /// (compiler division sequences, float conversions): name it as the
+    /// opaque result of this instruction so equal uses stay equal. Anything
+    /// that reads lane or wave state (EXEC, VCC, M0, hardware registers), a
+    /// lane mask, or a value without a uniform witness gets none.
+    fn opaque_defs(&self, st: &State, dec: &Dec, writes: &mut [(&Operand, SmallVec<[Val; 4]>)]) {
+        if self.pos_cyclic[dec.pos] || dec.parts.len() != 1 {
+            return;
+        }
+        let part = &dec.parts[0];
+        let name = part.name;
+        let pure = match dec.inst.form {
+            Form::Sop1 | Form::Sop2 | Form::Sopk => {
+                const IMPURE: &[&str] = &[
+                    "getreg",
+                    "setreg",
+                    "getpc",
+                    "setpc",
+                    "swappc",
+                    "movrel",
+                    "saveexec",
+                    "sendmsg",
+                    "rtn",
+                    "memtime",
+                    "memrealtime",
+                    "ttrace",
+                    "barrier",
+                    "wait",
+                    "sleep",
+                    "prefetch",
+                    "rfe",
+                    "alloc",
+                    "wqm",
+                    "quadmask",
+                    "bitreplicate",
+                ];
+                !IMPURE.iter().any(|p| name.contains(p))
+            }
+            _ => name.starts_with("v_s_"),
+        };
+        if !pure
+            || dec.inst.effects.implicit.reads
+                & (ImplicitSet::SCC | ImplicitSet::VCC | ImplicitSet::EXEC | ImplicitSet::M0)
+                != 0
+            || part
+                .fields
+                .iter()
+                .any(|f| f.used && !f.def && is_mask(part.name, f.name))
+        {
+            return;
+        }
+        let mut it = self.ix.borrow_mut();
+        for f in part.fields.iter().filter(|f| f.used) {
+            for v in self.vals(st, f) {
+                let ix = ixof(&mut it, v);
+                if !it.uniform(ix) {
+                    return;
+                }
+            }
+        }
+        for (k, (op, vals)) in writes.iter_mut().enumerate() {
+            if let Operand::Reg(r) = op {
+                if matches!(r.kind, Kind::S | Kind::Ttmp)
+                    && r.len == 1
+                    && vals.len() == 1
+                    && vals[0].ix.live().is_none()
+                    && vals[0].konst.is_none()
+                {
+                    vals[0].ix = it.opaque(dec.id, k as u8);
+                }
+            }
+        }
+    }
+
     /// Values written by one opcode half. Every explicit destination gets a
     /// value: a destination the semantic rules below do not cover receives
     /// the provenance-free combination of the sources.
@@ -1855,6 +2831,7 @@ impl<'k> Analyzer<'k> {
         writes: &mut SmallVec<[(&'a Operand, SmallVec<[Val; 4]>); 4]>,
         lanes: &mut SmallVec<[(u16, Option<u8>, Val); 1]>,
         carry: &mut Option<(CarryTo, Ix)>,
+        pos: usize,
     ) {
         let start = writes.len();
         let lane_start = lanes.len();
@@ -1869,7 +2846,7 @@ impl<'k> Analyzer<'k> {
                 writes.push((d.op, smallvec::smallvec![Val::kill(uses.iter())]));
             }
         }
-        self.eval_ix(st, part, &mut writes[start..], carry);
+        self.eval_ix(st, part, &mut writes[start..], carry, pos);
     }
 
     /// The integer/address witness of this part's results (§A9.3 rule 2): exact
@@ -1882,22 +2859,48 @@ impl<'k> Analyzer<'k> {
         part: &Part<'a>,
         writes: &mut [(&'a Operand, SmallVec<[Val; 4]>)],
         carry: &mut Option<(CarryTo, Ix)>,
+        pos: usize,
     ) {
         enum Res {
             One(Ix),
             Two(Ix),
+            /// Explicit `(lo, hi)` witnesses of a 64-bit destination.
+            Pair(Ix, Ix),
         }
         let name = norm_name(part.name);
         let srcs: SmallVec<[&Field; 4]> = part.sources().collect();
+        let s2 = srcs.get(2).copied();
         let (Some(&s0), Some(&s1)) = (srcs.first(), srcs.get(1)) else {
             if matches!(name.as_str(), "v_readfirstlane_b32" | "v_mov_b32_dpp") {
                 if let Some(d) = part.fields.iter().find(|f| f.def) {
-                    patch_ix(writes, d.op, &[Ix::NONE]);
+                    // Under the entry EXEC lane 0 of the wave is active: the
+                    // result is the source's lane-0 value.
+                    let x = match srcs.first() {
+                        Some(&s) if name == "v_readfirstlane_b32" && st.exec_exact == Some(0) => {
+                            let mut it = self.ix.borrow_mut();
+                            let src = ixof(
+                                &mut it,
+                                self.vals(st, s).first().copied().unwrap_or_default(),
+                            );
+                            it.first_lane(src)
+                        }
+                        _ => Ix::NONE,
+                    };
+                    patch_ix(writes, d.op, &[x]);
                 }
             }
             return;
         };
-        let lvl = st.exec_exact.unwrap_or(EXEC_UNKNOWN);
+        // The EXEC level a VALU carry names: the saved-mask level EXEC equals,
+        // or, with EXEC narrowed to an unnamed mask, the last instruction that
+        // wrote EXEC (outside every CFG cycle, where one dynamic instance of it
+        // reaches both halves of the add), so a carry-out and its carry-in
+        // under one unchanged mask still match.
+        let lvl: u32 = match st.exec_exact {
+            Some(k) => u32::from(k),
+            None if st.epoch != u32::MAX && !self.pos_cyclic[pos] => 0x1_0000 + st.epoch,
+            None => EXEC_UNKNOWN,
+        };
         let mut it = self.ix.borrow_mut();
         let it = &mut *it;
         let one = |it: &mut Interner, f: &Field| -> Ix {
@@ -1919,7 +2922,7 @@ impl<'k> Analyzer<'k> {
             .or_else(|| part.fields.iter().find(|f| f.def && f.name == "SDST"));
         let sdst = part.fields.iter().find(|f| f.def && f.name == "SDST");
         // High half of `A + B` given the matched carry and the high words.
-        let hi_sum = |it: &mut Interner, cin: Ix, lvl: u8, ha: Ix, hb: Ix| -> Ix {
+        let hi_sum = |it: &mut Interner, cin: Ix, lvl: u32, ha: Ix, hb: Ix| -> Ix {
             let Some((ca, cb)) = it.carry_parts(cin, lvl) else {
                 return Ix::NONE;
             };
@@ -2004,17 +3007,19 @@ impl<'k> Analyzer<'k> {
                 }
                 None => Ix::NONE,
             })),
-            "s_ashr_i32" => Some(Res::One(if kon(s1).map(|k| k & 31) == Some(31) {
-                let x = one(it, s0);
-                it.sra31(x)
-            } else {
-                Ix::NONE
+            "s_ashr_i32" => Some(Res::One(match kon(s1) {
+                Some(k) => {
+                    let x = one(it, s0);
+                    it.sra32(x, k & 31)
+                }
+                None => Ix::NONE,
             })),
-            "v_ashrrev_i32" => Some(Res::One(if kon(s0).map(|k| k & 31) == Some(31) {
-                let x = one(it, s1);
-                it.sra31(x)
-            } else {
-                Ix::NONE
+            "v_ashrrev_i32" => Some(Res::One(match kon(s0) {
+                Some(k) => {
+                    let x = one(it, s1);
+                    it.sra32(x, k & 31)
+                }
+                None => Ix::NONE,
             })),
             "s_add_nc_u64" | "s_add_u64" => {
                 let (x, y) = (wide(it, s0), wide(it, s1));
@@ -2038,6 +3043,157 @@ impl<'k> Analyzer<'k> {
                 }
                 None => Ix::NONE,
             })),
+            "s_and_b32" | "v_and_b32" => {
+                let (x, y) = (one(it, s0), one(it, s1));
+                Some(Res::One(it.and32(x, y)))
+            }
+            "s_or_b32" | "v_or_b32" => {
+                let (x, y) = (one(it, s0), one(it, s1));
+                Some(Res::One(it.or32(x, y)))
+            }
+            "s_lshr_b32" => Some(Res::One(match kon(s1) {
+                Some(k) => {
+                    let x = one(it, s0);
+                    it.shr32(x, k & 31)
+                }
+                None => Ix::NONE,
+            })),
+            "v_lshrrev_b32" => Some(Res::One(match kon(s0) {
+                Some(k) => {
+                    let x = one(it, s1);
+                    it.shr32(x, k & 31)
+                }
+                None => Ix::NONE,
+            })),
+            "s_min_i32" | "s_max_i32" | "s_min_u32" | "s_max_u32" | "v_min_i32" | "v_max_i32"
+            | "v_min_u32" | "v_max_u32" => {
+                let (x, y) = (one(it, s0), one(it, s1));
+                Some(Res::One(it.minmax32(
+                    x,
+                    y,
+                    name.contains("_max_"),
+                    name.ends_with("_i32"),
+                )))
+            }
+            "v_mul_u32_u24" => {
+                let (x, y) = (one(it, s0), one(it, s1));
+                let m = it.c32(0x00ff_ffff);
+                let (x, y) = (it.and32(x, m), it.and32(y, m));
+                Some(Res::One(it.mul32(x, y)))
+            }
+            "v_mad_u32_u24" => {
+                let (x, y) = (one(it, s0), one(it, s1));
+                let z = s2.map_or(Ix::NONE, |f| one(it, f));
+                let m = it.c32(0x00ff_ffff);
+                let (x, y) = (it.and32(x, m), it.and32(y, m));
+                let p = it.mul32(x, y);
+                Some(Res::One(it.add32(p, z)))
+            }
+            "v_add3_u32" => {
+                let (x, y) = (one(it, s0), one(it, s1));
+                let z = s2.map_or(Ix::NONE, |f| one(it, f));
+                let p = it.add32(x, y);
+                Some(Res::One(it.add32(p, z)))
+            }
+            "v_lshl_add_u32" => Some(Res::One(match kon(s1) {
+                Some(k) => {
+                    let x = one(it, s0);
+                    let z = s2.map_or(Ix::NONE, |f| one(it, f));
+                    let sh = it.shl32(x, k & 31);
+                    it.add32(sh, z)
+                }
+                None => Ix::NONE,
+            })),
+            "v_lshl_or_b32" => Some(Res::One(match kon(s1) {
+                Some(k) => {
+                    let x = one(it, s0);
+                    let z = s2.map_or(Ix::NONE, |f| one(it, f));
+                    let sh = it.shl32(x, k & 31);
+                    it.or32(sh, z)
+                }
+                None => Ix::NONE,
+            })),
+            "v_add_lshl_u32" => Some(Res::One(match s2.and_then(|f| kon(f)) {
+                Some(k) => {
+                    let (x, y) = (one(it, s0), one(it, s1));
+                    let sum = it.add32(x, y);
+                    it.shl32(sum, k & 31)
+                }
+                None => Ix::NONE,
+            })),
+            "v_and_or_b32" => {
+                let (x, y) = (one(it, s0), one(it, s1));
+                let z = s2.map_or(Ix::NONE, |f| one(it, f));
+                let a = it.and32(x, y);
+                Some(Res::One(it.or32(a, z)))
+            }
+            "v_or3_b32" => {
+                let (x, y) = (one(it, s0), one(it, s1));
+                let z = s2.map_or(Ix::NONE, |f| one(it, f));
+                let a = it.or32(x, y);
+                Some(Res::One(it.or32(a, z)))
+            }
+            "v_bfe_u32" => Some(Res::One(
+                match (kon(s1).map(|k| k & 31), s2.and_then(|f| kon(f))) {
+                    (Some(off), Some(w)) if (1..=32).contains(&(w & 63)) && (w & 63) <= 32 => {
+                        let x = one(it, s0);
+                        let w = w & 63;
+                        let shifted = it.shr32(x, off);
+                        if w == 32 {
+                            shifted
+                        } else {
+                            let m = it.c32((1u32 << w) - 1);
+                            it.and32(shifted, m)
+                        }
+                    }
+                    _ => Ix::NONE,
+                },
+            )),
+            "v_mad_co_u64_u32" | "v_mad_co_i64_i32" => {
+                let (x, y) = (one(it, s0), one(it, s1));
+                let cl = s2.map_or(Ix::NONE, |f| one(it, f));
+                let p = it.mul32(x, y);
+                let lo = it.add32(p, cl);
+                if name == "v_mad_co_u64_u32" {
+                    let c = s2.map_or(Ix::NONE, |f| wide(it, f));
+                    let (zx, zy) = (it.zext(x), it.zext(y));
+                    let m = it.mul64(zx, zy);
+                    let w = it.add64(m, c);
+                    if w.is_none() {
+                        Some(Res::Pair(lo, Ix::NONE))
+                    } else {
+                        Some(Res::Two(w))
+                    }
+                } else {
+                    Some(Res::Pair(lo, Ix::NONE))
+                }
+            }
+            // `mask ? src1 : src0` under an exact single-fact lane mask formed
+            // under the current EXEC (no neg/abs modifiers).
+            "v_cndmask_b32"
+                if self.wgf
+                    && !self.pos_cyclic[pos]
+                    && self.decoded[pos]
+                        .as_ref()
+                        .is_some_and(|d| d.inst.mods.neg == 0 && d.inst.mods.abs == 0) =>
+            {
+                let (x0, x1) = (one(it, s0), one(it, s1));
+                let m = part
+                    .field("SRC2")
+                    .map(|f| one(it, f))
+                    .unwrap_or_else(|| st.s[VCC_LO].ix.live());
+                let single = match it.lane_mask_facts(m) {
+                    Some(([f], Some(g))) if st.epoch != u32::MAX && g == st.epoch => Some(*f),
+                    _ => None,
+                };
+                Some(Res::One(match single {
+                    Some((atom, holds)) => {
+                        let flag = if holds { atom } else { it.flag_not(atom) };
+                        it.sel(flag, x1, x0)
+                    }
+                    None => Ix::NONE,
+                }))
+            }
             "v_readfirstlane_b32" | "v_mov_b32_dpp" => Some(Res::One(Ix::NONE)),
             _ => None,
         };
@@ -2048,6 +3204,7 @@ impl<'k> Analyzer<'k> {
                     let (lo, hi) = (it.lo_of(w), it.hi_of(w));
                     patch_ix(writes, d.op, &[lo, hi]);
                 }
+                Res::Pair(lo, hi) => patch_ix(writes, d.op, &[lo, hi]),
             }
         }
     }
@@ -2372,12 +3529,14 @@ impl<'k> Analyzer<'k> {
                         for v in self.vals(st, addr) {
                             rec.sink(v.taint, v.tf, Sinks::LDS_ADDRESS);
                         }
+                        self.sealed_flow(st, addr, dec, rec, "sealed-table-value-in-address");
                     }
                     if !passthrough {
                         for f in &data_fields {
                             for v in self.vals(st, f) {
                                 rec.sink(v.taint, v.tf, Sinks::STORED);
                             }
+                            self.sealed_flow(st, f, dec, rec, "sealed-table-value-stored");
                         }
                     }
                 }
@@ -2454,6 +3613,7 @@ impl<'k> Analyzer<'k> {
                 let mut vals: SmallVec<[Val; 8]> =
                     std::iter::repeat(Val::loaded()).take(width).collect();
                 let resolved = resolve_base(&lo, &hi);
+                self.probe_hit(dec.id, &lo, &hi);
                 if let Base::Side(side) = resolved {
                     if side == KSEG && !buffer {
                         match (lo.koff, offset) {
@@ -2517,6 +3677,28 @@ impl<'k> Analyzer<'k> {
                         rec.as_deref_mut(),
                     );
                 }
+                if self.sealed.is_some() && !buffer && !self.pos_cyclic[dec.pos] {
+                    if width == 1 && name == "s_load_b32" {
+                        // The identity of the value this load produces: the
+                        // index leaf of a sealed-table entry address and of
+                        // the compare that guards it.
+                        vals[0].ix = self.ix.borrow_mut().load(dec.id);
+                    }
+                }
+                if self.sealed.is_some() && !buffer && width == 2 && name == "s_load_b64" {
+                    if let Some(v) = self.entry_load(
+                        dec,
+                        addr,
+                        &resolved,
+                        AccessClass::SmemLoad,
+                        MemPath::Smem,
+                        cache,
+                        rec.as_deref_mut(),
+                    ) {
+                        vals[0] = v[0];
+                        vals[1] = v[1];
+                    }
+                }
                 if let Some(rec) = rec.as_deref_mut() {
                     let path = if buffer {
                         MemPath::SmemBuffer
@@ -2536,6 +3718,7 @@ impl<'k> Analyzer<'k> {
                         addr,
                         access_width(name),
                     );
+                    self.note_facts(st, dec, rec);
                 }
                 if let Some(d) = dst {
                     self.write(st, d.op, &vals);
@@ -2580,6 +3763,7 @@ impl<'k> Analyzer<'k> {
                             for v in self.vals(st, f) {
                                 rec.sink(v.taint, v.tf, Sinks::STORED);
                             }
+                            self.sealed_flow(st, f, dec, rec, "sealed-table-value-stored");
                         }
                     }
                     if let Some(d) = dst {
@@ -2635,19 +3819,24 @@ impl<'k> Analyzer<'k> {
                     VmemForm::Flat => MemPath::Flat,
                     _ => MemPath::Global,
                 };
-                let class = match op {
+                let base_class = match op {
                     MemOp::Load => AccessClass::VmemLoad,
                     MemOp::Store => AccessClass::VmemStore,
                     MemOp::Atomic { commutative } => AccessClass::Atomic { commutative },
                     MemOp::LdsDma => AccessClass::LdsDma,
                     MemOp::Other => unreachable!(),
                 };
+                // Index and sealed-entry loads keep the plain class (their
+                // receipt records admit plain loads only); the access
+                // attribution gets the release/acquire refinement.
+                let class = self.sync_class[dec.pos].unwrap_or(base_class);
                 let addr = if form == VmemForm::Global {
                     self.vmem_addr(st, dec)
                 } else {
                     Ix::NONE
                 };
                 let resolved = resolve_base(&lo, &hi);
+                self.probe_hit(dec.id, &lo, &hi);
                 let mut out = result;
                 if let Base::Side(KSEG) = resolved {
                     if matches!(op, MemOp::Load) {
@@ -2665,17 +3854,37 @@ impl<'k> Analyzer<'k> {
                         dec,
                         addr,
                         &resolved,
-                        class,
+                        base_class,
                         path,
                         cache,
                         rec.as_deref_mut(),
                     );
+                }
+                if self.sealed.is_some()
+                    && form == VmemForm::Global
+                    && matches!(op, MemOp::Load)
+                    && name == "global_load_b64"
+                    && loaded_width == 2
+                {
+                    if let Some(v) = self.entry_load(
+                        dec,
+                        addr,
+                        &resolved,
+                        base_class,
+                        path,
+                        cache,
+                        rec.as_deref_mut(),
+                    ) {
+                        out[0] = v[0];
+                        out[1] = v[1];
+                    }
                 }
                 if let Some(rec) = rec.as_deref_mut() {
                     for f in &data_fields {
                         for v in self.vals(st, f) {
                             rec.sink(v.taint, v.tf, Sinks::STORED);
                         }
+                        self.sealed_flow(st, f, dec, rec, "sealed-table-value-stored");
                     }
                     self.attribute(
                         rec,
@@ -2690,6 +3899,11 @@ impl<'k> Analyzer<'k> {
                         addr,
                         access_width(name),
                     );
+                    self.note_facts(st, dec, rec);
+                    if let Some(site) = rec.wsites.get_mut(&dec.id) {
+                        site.facts = st.facts.clone();
+                        site.lane_facts = self.lane_facts_of(st);
+                    }
                 }
                 if let Some(d) = dst {
                     self.write(st, d.op, &out);
@@ -2754,7 +3968,52 @@ impl<'k> Analyzer<'k> {
                 }
             }
         }
+        if self.sealed.is_some() {
+            let infl_addr = (lo.tf | hi.tf | offset_taint.1) & TBL != 0;
+            match &resolved {
+                Base::Table(mask) | Base::Both { mask, .. } => {
+                    if offset_taint.1 & TBL != 0 {
+                        rec.fail(self.arch, dec, "sealed-table-value-in-offset");
+                    } else if !matches!(class, AccessClass::VmemLoad | AccessClass::SmemLoad) {
+                        rec.fail(
+                            self.arch,
+                            dec,
+                            if writes {
+                                "sealed-table-write"
+                            } else {
+                                "sealed-table-access-class"
+                            },
+                        );
+                    } else if let Some(width) = width {
+                        rec.sealed_accesses.push(TableAccessRec {
+                            inst: dec.id,
+                            pc: dec.pos as u32,
+                            mask: *mask,
+                            class,
+                            path,
+                            cache,
+                            width,
+                        });
+                    } else {
+                        rec.fail(self.arch, dec, "sealed-table-access-width");
+                    }
+                }
+                Base::Unresolved(_) => {}
+                _ if infl_addr => rec.fail(self.arch, dec, "sealed-table-value-in-address"),
+                _ => {}
+            }
+        }
+        if let Base::Both { hi, lo, .. } = resolved {
+            resolved = Base::Args { hi, lo };
+        }
         match resolved {
+            Base::Table(_) | Base::Both { .. } => {
+                rec.sink(
+                    lo.taint.union(hi.taint).union(offset_taint.0),
+                    lo.tf | hi.tf | offset_taint.1,
+                    Sinks::ADDRESS_OFFSET,
+                );
+            }
             Base::Unresolved(rule) => {
                 rec.fail(self.arch, dec, rule);
                 rec.sink(
@@ -2860,7 +4119,22 @@ impl<'k> Analyzer<'k> {
                         path,
                         cache,
                         shared,
+                        atomic_op: matches!(class, AccessClass::Atomic { commutative: false })
+                            .then(|| dec.parts[0].name.to_owned()),
                     });
+                }
+                if writes {
+                    rec.wsites.insert(
+                        dec.id,
+                        WriteSite {
+                            pos: dec.pos as u32,
+                            addr,
+                            width,
+                            cyclic: self.pos_cyclic[dec.pos],
+                            facts: Vec::new(),
+                            lane_facts: Vec::new(),
+                        },
+                    );
                 }
                 rec.sink(base_dws, 0, Sinks::ADDRESS_BASE);
                 rec.sink(
@@ -3038,10 +4312,909 @@ impl<'k> Analyzer<'k> {
             loads: cert.loads,
         })
     }
+
+    // -----------------------------------------------------------------
+    // Sealed-table analysis (`analyze_sealed`).
+    // -----------------------------------------------------------------
+
+    /// Replay every reachable block of `ins` once with recording on.
+    fn record(&self, ins: &[Option<State>], rec: &mut Rec) {
+        for (b, block) in self.body.blocks.iter().enumerate() {
+            let Some(mut st) = ins[b].clone() else {
+                continue;
+            };
+            for pos in block.range.0..block.range.1 {
+                if self.excluded.get(pos).copied().unwrap_or(false) {
+                    // Run the instruction for its register effects and keep only what
+                    // resolves to an argument (its access and its kernarg sinks: a
+                    // pointer loaded from the record and dereferenced is unresolved
+                    // here, and a refusal or side read belongs to the body's own proof).
+                    let mut scratch = Rec::new(DwSet::default());
+                    self.step(&mut st, pos, Some(&mut scratch), self.cyclic[b]);
+                    for (sink, extra) in rec.sinks.iter_mut().zip(&scratch.sinks) {
+                        *sink |= *extra;
+                    }
+                    rec.taint_overflow |= scratch.taint_overflow;
+                    for (target, accesses) in scratch.accesses {
+                        rec.accesses.entry(target).or_default().extend(accesses);
+                    }
+                } else {
+                    self.step(&mut st, pos, Some(&mut *rec), self.cyclic[b]);
+                }
+            }
+        }
+    }
+
+    /// Null-guard replay: remember the table bits the watched access's base
+    /// carried.
+    fn probe_hit(&self, id: InstId, lo: &Val, hi: &Val) {
+        if self.sealed.is_none() {
+            return;
+        }
+        let mut p = self.probe.borrow_mut();
+        if p.0 == Some(id) {
+            p.1 = hi.tbl | lo.tbl;
+        }
+    }
+
+    /// Sealed analysis: a value influenced by a sealed-table entry must not
+    /// reach `field` (store data, LDS address): the loaded pointer would
+    /// escape the read-only use the certificate covers.
+    fn sealed_flow(&self, st: &State, field: &Field, dec: &Dec, rec: &mut Rec, rule: &'static str) {
+        if self.sealed.is_some() && self.vals(st, field).iter().any(|v| v.tf & TBL != 0) {
+            rec.fail(self.arch, dec, rule);
+        }
+    }
+
+    /// Exact scalar results of the sealed analysis, computed on the pre-state:
+    /// the SCC witness of an unsigned compare, constants through scalar logic
+    /// (including the annihilators `x & 0` and `x | -1`, so a flag that is
+    /// zero on one path stays zero through `s_and_b32 s, flag, exec_lo`), and
+    /// `s_cselect` with a decided SCC. Exec operands never have a constant
+    /// here. Everything else is left to the ordinary transfer function.
+    fn sealed_scalar(&self, st: &State, dec: &Dec) -> SealedFx {
+        let mut fx = SealedFx::default();
+        if dec.parts.len() != 1 {
+            return fx;
+        }
+        let part = &dec.parts[0];
+        let name = norm_name(part.name);
+        let srcs: SmallVec<[&Field; 4]> = part.sources().collect();
+        if let Some(rest) = name.strip_prefix("s_cmp_") {
+            if let (Some((rel, ty)), 2) = (rest.split_once('_'), srcs.len()) {
+                let mut it = self.ix.borrow_mut();
+                let it = &mut *it;
+                // `v == c`, where `v` may hold a flag (`Bit`/`Mask`).
+                let eq_flag = |it: &mut Interner, v: Ix, c: Ix| -> Ix {
+                    if let (Some((f, t)), Some(k)) = (it.flag_value(v), it.const32(c)) {
+                        return if k == t {
+                            f
+                        } else if k == 0 {
+                            it.flag_not(f)
+                        } else {
+                            Ix::NONE
+                        };
+                    }
+                    it.eq32(v, c)
+                };
+                let flag = match ty {
+                    "u32" | "i32" => {
+                        let (vx, vy) = (self.vals(st, srcs[0])[0], self.vals(st, srcs[1])[0]);
+                        let (x, y) = (ixof(it, vx), ixof(it, vy));
+                        let signed = ty == "i32";
+                        let lt = |it: &mut Interner, a: Ix, b: Ix| {
+                            if signed {
+                                it.lts(a, b)
+                            } else {
+                                it.ltu(a, b)
+                            }
+                        };
+                        match rel {
+                            "eq" | "lg" => {
+                                let mut f = eq_flag(it, x, y);
+                                if f.is_none() {
+                                    f = eq_flag(it, y, x);
+                                }
+                                if rel == "lg" {
+                                    it.flag_not(f)
+                                } else {
+                                    f
+                                }
+                            }
+                            "lt" => lt(it, x, y),
+                            "gt" => lt(it, y, x),
+                            "ge" => {
+                                let f = lt(it, x, y);
+                                it.flag_not(f)
+                            }
+                            "le" => {
+                                let f = lt(it, y, x);
+                                it.flag_not(f)
+                            }
+                            _ => Ix::NONE,
+                        }
+                    }
+                    "u64" if matches!(rel, "eq" | "lg") => {
+                        // `w == 0` / `w != 0` of a matched 64-bit pair.
+                        let (a, b) = (self.vals(st, srcs[0]), self.vals(st, srcs[1]));
+                        let zero = |v: &SmallVec<[Val; 4]>| {
+                            v.len() >= 2 && v[0].konst == Some(0) && v[1].konst == Some(0)
+                        };
+                        let wide = |it: &mut Interner, v: &SmallVec<[Val; 4]>| {
+                            if v.len() < 2 {
+                                return Ix::NONE;
+                            }
+                            let (lo, hi) = (ixof(it, v[0]), ixof(it, v[1]));
+                            it.as64(lo, hi)
+                        };
+                        let w = if zero(&b) {
+                            wide(it, &a)
+                        } else if zero(&a) {
+                            wide(it, &b)
+                        } else {
+                            Ix::NONE
+                        };
+                        let f = it.zero64(w);
+                        if rel == "lg" {
+                            it.flag_not(f)
+                        } else {
+                            f
+                        }
+                    }
+                    _ => Ix::NONE,
+                };
+                if !flag.is_none() {
+                    fx.scc_ix = Some(flag);
+                    let mut atom = flag;
+                    while let Some(Node::Not(g)) = it.node(atom) {
+                        atom = g;
+                    }
+                    self.atom_pc
+                        .borrow_mut()
+                        .entry(atom)
+                        .or_default()
+                        .insert(dec.pos as u32);
+                }
+            }
+            return fx;
+        }
+        let dst = part.fields.iter().find(|f| f.def && f.name == "SDST");
+        let dst_idx = |len: usize| -> Option<usize> {
+            match dst?.op {
+                Operand::Reg(r) if r.kind == Kind::S && usize::from(r.len) == len => {
+                    Some(usize::from(r.base))
+                }
+                Operand::Special(Special::VccLo) if len == 1 => Some(VCC_LO),
+                _ => None,
+            }
+        };
+        let kon = |f: &Field| -> Option<u32> {
+            if matches!(
+                f.op,
+                Operand::Special(Special::Exec | Special::ExecLo | Special::ExecHi)
+            ) {
+                return None;
+            }
+            self.vals(st, f).first().and_then(|v| v.konst)
+        };
+        let is_exec = |f: &Field| matches!(f.op, Operand::Special(Special::Exec | Special::ExecLo));
+        // The flag a value holds as an all-ones/zero mask.
+        let mask_flag = |f: &Field| -> Option<Ix> {
+            let v = self.vals(st, f).first().copied()?;
+            let it = self.ix.borrow();
+            it.flag_value(v.ix.live())
+                .filter(|&(_, t)| t == u32::MAX)
+                .map(|(f, _)| f)
+        };
+        match name.as_str() {
+            // A saved copy of a nonzero EXEC is a nonzero value; OR-ing a
+            // nonzero value into EXEC leaves EXEC nonzero.
+            "s_mov_b32" if st.exec_nz && srcs.len() == 1 && is_exec(srcs[0]) => {
+                if let Some(i) = dst_idx(1) {
+                    let mut it = self.ix.borrow_mut();
+                    let t = it.flag_true();
+                    fx.dst_ix = Some((i, it.nz_flag(t)));
+                }
+            }
+            "s_or_b32"
+                if srcs.len() == 2
+                    && matches!(dst.map(|d| d.op), Some(Operand::Special(Special::ExecLo)))
+                    && (is_exec(srcs[0]) || is_exec(srcs[1])) =>
+            {
+                let other = if is_exec(srcs[0]) { srcs[1] } else { srcs[0] };
+                let v = self.vals(st, other).first().copied().unwrap_or_default();
+                let it = self.ix.borrow();
+                let nz = v.konst.is_some_and(|k| k != 0)
+                    || matches!(it.node(v.ix.live()),
+                        Some(Node::NzFlag(f)) if matches!(it.node(f), Some(Node::True)));
+                fx.exec_nz = nz;
+            }
+            "s_and_b32" | "s_or_b32" | "s_xor_b32" | "s_and_not1_b32" | "s_or_not1_b32"
+                if srcs.len() == 2 =>
+            {
+                let (a, b) = (kon(srcs[0]), kon(srcs[1]));
+                let res = match (name.as_str(), a, b) {
+                    ("s_and_b32", Some(x), Some(y)) => Some(x & y),
+                    ("s_and_b32", Some(0), _) | ("s_and_b32", _, Some(0)) => Some(0),
+                    ("s_or_b32", Some(x), Some(y)) => Some(x | y),
+                    ("s_or_b32", Some(u32::MAX), _) | ("s_or_b32", _, Some(u32::MAX)) => {
+                        Some(u32::MAX)
+                    }
+                    ("s_xor_b32", Some(x), Some(y)) => Some(x ^ y),
+                    ("s_and_not1_b32", Some(x), Some(y)) => Some(x & !y),
+                    ("s_and_not1_b32", Some(0), _) | ("s_and_not1_b32", _, Some(u32::MAX)) => {
+                        Some(0)
+                    }
+                    ("s_or_not1_b32", Some(x), Some(y)) => Some(x | !y),
+                    ("s_or_not1_b32", Some(u32::MAX), _) | ("s_or_not1_b32", _, Some(0)) => {
+                        Some(u32::MAX)
+                    }
+                    _ => None,
+                };
+                if let Some(r) = res {
+                    fx.scc_konst = Some(r != 0);
+                    if let Some(i) = dst_idx(1) {
+                        fx.dst_konst = Some((i, r));
+                    }
+                }
+                // Flags: `exec & mask(F)` is nonzero exactly when `F` holds
+                // while EXEC is nonzero; two masks combine bitwise.
+                let (ma, mb) = (mask_flag(srcs[0]), mask_flag(srcs[1]));
+                let mut it = self.ix.borrow_mut();
+                let combined = match (name.as_str(), ma, mb) {
+                    ("s_and_b32", Some(f), None) if st.exec_nz && is_exec(srcs[1]) => {
+                        Some((f, it.nz_flag(f)))
+                    }
+                    ("s_and_b32", None, Some(f)) if st.exec_nz && is_exec(srcs[0]) => {
+                        Some((f, it.nz_flag(f)))
+                    }
+                    ("s_and_b32", Some(f), Some(g)) => {
+                        let a = it.flag_and(f, g);
+                        Some((a, it.mask(a)))
+                    }
+                    ("s_or_b32", Some(f), Some(g)) => {
+                        let o = it.flag_or(f, g);
+                        Some((o, it.mask(o)))
+                    }
+                    _ => None,
+                };
+                if let Some((flag, value)) = combined {
+                    if !flag.is_none() {
+                        fx.scc_ix = Some(flag);
+                    }
+                    if let (Some(i), false) = (dst_idx(1), value.is_none()) {
+                        fx.dst_ix = Some((i, value));
+                    }
+                }
+            }
+            "s_cselect_b32" | "s_cselect_b64" if srcs.len() == 2 => {
+                if let Some(c) = st.scc.konst {
+                    let pick = if c != 0 { srcs[0] } else { srcs[1] };
+                    let len = if name.ends_with("b64") { 2 } else { 1 };
+                    let vals = self.vals(st, pick);
+                    if let (Some(i), true) = (dst_idx(len), vals.len() >= len) {
+                        fx.dst_vals = Some((i, vals.into_iter().take(len).collect()));
+                    }
+                }
+                // A flag-decided select: `-1/1` when SCC holds, else `0`.
+                let scc = st.scc.ix.live();
+                let mut it_ref = self.ix.borrow_mut();
+                let it = &mut *it_ref;
+                if it.is_flag(scc) && name == "s_cselect_b32" {
+                    let value = match (kon(srcs[0]), kon(srcs[1])) {
+                        (Some(u32::MAX), Some(0)) => it.mask(scc),
+                        (Some(1), Some(0)) => it.bit(scc),
+                        (Some(0), Some(u32::MAX)) => {
+                            let n = it.flag_not(scc);
+                            it.mask(n)
+                        }
+                        (Some(0), Some(1)) => {
+                            let n = it.flag_not(scc);
+                            it.bit(n)
+                        }
+                        _ => Ix::NONE,
+                    };
+                    if let (Some(i), false) = (dst_idx(1), value.is_none()) {
+                        fx.dst_ix = Some((i, value));
+                    }
+                }
+            }
+            _ => {}
+        }
+        fx
+    }
+
+    /// A qualified entry load's result, or (collecting pass) record the load
+    /// as a candidate when its shape is a sealed-table entry. `None` for every
+    /// other load.
+    #[allow(clippy::too_many_arguments)]
+    fn entry_load(
+        &self,
+        dec: &Dec,
+        addr: Ix,
+        resolved: &Base,
+        class: AccessClass,
+        path: MemPath,
+        cache: CacheBits,
+        rec: Option<&mut Rec>,
+    ) -> Option<[Val; 2]> {
+        let ctx = self.sealed.as_ref()?;
+        if let Some(qualified) = &ctx.qualified {
+            let site = qualified.get(&dec.id)?;
+            if let Some(rec) = rec {
+                rec.sealed_entries.insert(
+                    dec.id,
+                    EntryRec {
+                        pc: dec.pos as u32,
+                        class,
+                        path,
+                        cache,
+                        width: 8,
+                    },
+                );
+            }
+            let (lo, hi) = {
+                let mut it = self.ix.borrow_mut();
+                let ent = it.ent(dec.id);
+                (it.lo_of(ent), it.hi_of(ent))
+            };
+            let half = |ix: Ix| Val {
+                tbl: site.bit,
+                tf: MEM | TBL,
+                ix,
+                ..Val::default()
+            };
+            return Some([half(lo), half(hi)]);
+        }
+        // Collecting pass: only the recording replay registers candidates.
+        rec?;
+        if addr.is_none() {
+            return None;
+        }
+        let it = self.ix.borrow();
+        let shape = table_entry(&it, addr, &|o| self.karg_kind(o)).ok()?;
+        if !matches!(resolved, Base::Args { hi, .. } if *hi == DwSet::one(shape.table_arg_offset / 4 + 1))
+        {
+            return None;
+        }
+        let (index_inst, index_kernarg) = match it.node(shape.index) {
+            Some(Node::Load(i)) => (Some(i), None),
+            Some(Node::K32(o)) => (None, Some(o)),
+            _ => return None,
+        };
+        ctx.cands.borrow_mut().insert(
+            dec.id,
+            SealedCand {
+                inst: dec.id,
+                pos: dec.pos,
+                table_arg_offset: shape.table_arg_offset,
+                index: shape.index,
+                index_inst,
+                index_kernarg,
+            },
+        );
+        None
+    }
+
+    fn pos_of(&self, inst: InstId) -> u32 {
+        self.body
+            .layout
+            .iter()
+            .position(|&i| i == inst)
+            .unwrap_or(0) as u32
+    }
+
+    /// The unsigned bound `n` of a compare `index < n` as a certificate bound.
+    fn bound_of(&self, n: Ix) -> Option<SealedBound> {
+        let it = self.ix.borrow();
+        match it.node(n)? {
+            Node::C32(c) => Some(SealedBound::Const(c)),
+            Node::K32(o) if o % 4 == 0 && self.karg_kind(o) == KargKind::Scalar => {
+                Some(SealedBound::Kernarg { offset: o })
+            }
+            _ => None,
+        }
+    }
+
+    /// Prove the guard of every candidate entry load (see [`analyze_sealed`]).
+    fn qualify(&self, cands: Vec<SealedCand>) -> (BTreeMap<InstId, SealedSite>, Vec<Unresolved>) {
+        let mut out: BTreeMap<InstId, SealedSite> = BTreeMap::new();
+        let mut rejected = Vec::new();
+        for c in cands {
+            let detail = self.decoded[c.pos]
+                .as_ref()
+                .and_then(|d| d.inst.text(self.arch).ok())
+                .unwrap_or_default();
+            if out.len() >= 8 {
+                rejected.push(Unresolved {
+                    inst: Some(c.inst),
+                    rule: "sealed-too-many-entries",
+                    detail,
+                });
+                continue;
+            }
+            match self.table_guard(&c) {
+                Ok((bound, guard_pcs)) => {
+                    let index = match (c.index_inst, c.index_kernarg) {
+                        (Some(i), _) => SealedIndex::Load { pc: self.pos_of(i) },
+                        (None, Some(offset)) => SealedIndex::Kernarg { offset },
+                        (None, None) => unreachable!("a candidate has an index"),
+                    };
+                    let bit = 1u8 << out.len();
+                    out.insert(
+                        c.inst,
+                        SealedSite {
+                            bit,
+                            table_arg_offset: c.table_arg_offset,
+                            bound,
+                            index,
+                            guard_pcs,
+                        },
+                    );
+                }
+                Err(rule) => rejected.push(Unresolved {
+                    inst: Some(c.inst),
+                    rule,
+                    detail,
+                }),
+            }
+        }
+        (out, rejected)
+    }
+
+    /// The blocks that can reach the block of layout position `pos` (all
+    /// outside every CFG cycle, so their paths are finite), and that block.
+    fn walk_setup(&self, pos: usize) -> Result<(usize, Vec<bool>), &'static str> {
+        let blocks = &self.body.blocks;
+        let site = blocks
+            .iter()
+            .position(|b| b.range.0 <= pos && pos < b.range.1)
+            .ok_or("sealed-site-block")?;
+        if self.cyclic[site] {
+            return Err("sealed-entry-in-cycle");
+        }
+        let mut anc = vec![false; blocks.len()];
+        anc[site] = true;
+        let mut stack = vec![site];
+        while let Some(b) = stack.pop() {
+            for p in &blocks[b].preds {
+                if !anc[p.0] {
+                    anc[p.0] = true;
+                    stack.push(p.0);
+                }
+            }
+        }
+        if !anc[0] {
+            return Err("sealed-site-unreachable");
+        }
+        if (0..blocks.len()).any(|b| anc[b] && self.cyclic[b]) {
+            return Err("sealed-guard-cyclic-prefix");
+        }
+        Ok((site, anc))
+    }
+
+    /// The bound `index < bound` is established on every feasible path from
+    /// the kernel entry to the entry load, and the compares that do so.
+    /// Every block that can reach the load must be outside every CFG cycle, so
+    /// the paths are finite; each is replayed with the ordinary transfer
+    /// function from the entry state, branch edges the replay decides are
+    /// pruned, and a decided compare branch adds the compare facts the edge
+    /// implies (through exact flag algebra: masks, `or`/`and`, `exec` known
+    /// nonzero). `0 <=s i <s n` counts as `i <u n`.
+    fn table_guard(&self, c: &SealedCand) -> Result<(SealedBound, Vec<u32>), &'static str> {
+        let (site, anc) = self.walk_setup(c.pos)?;
+        let mut walk = GuardWalk {
+            site,
+            anc,
+            paths: 0,
+            steps: 0,
+            err: None,
+            goal: Goal::Bound {
+                index: c.index,
+                common: None,
+            },
+        };
+        self.walk(0, self.entry.clone(), &mut Vec::new(), &mut walk);
+        if let Some(e) = walk.err {
+            return Err(e);
+        }
+        let Goal::Bound { common, .. } = walk.goal else {
+            unreachable!()
+        };
+        let Some(common) = common else {
+            return Err("sealed-site-unreachable");
+        };
+        let (bound, pcs) = common.into_iter().next().ok_or("sealed-index-unguarded")?;
+        Ok((bound, pcs.into_iter().collect()))
+    }
+
+    /// Every path to the access at `pos` on which its base derives from the
+    /// entry load `ents[k].1` (site bit `ents[k].0`) knows that entry is
+    /// nonzero. False when anything cannot be shown (a cycle before the
+    /// access, an undecodable instruction, the path budget).
+    fn access_nonnull(&self, id: InstId, pos: usize, ents: Vec<(u8, Ix)>) -> bool {
+        let Ok((site, anc)) = self.walk_setup(pos) else {
+            return false;
+        };
+        let mut walk = GuardWalk {
+            site,
+            anc,
+            paths: 0,
+            steps: 0,
+            err: None,
+            goal: Goal::NonNull {
+                id,
+                pos,
+                ents,
+                ok: true,
+            },
+        };
+        self.walk(0, self.entry.clone(), &mut Vec::new(), &mut walk);
+        walk.err.is_none() && matches!(walk.goal, Goal::NonNull { ok: true, .. })
+    }
+
+    /// Facts the decided edge of a conditional branch adds.
+    fn edge_facts(
+        &self,
+        cond: crate::cfg::Cond,
+        is_taken: bool,
+        st: &State,
+        facts: &mut Vec<(Ix, bool)>,
+    ) {
+        use crate::cfg::Cond;
+        let it = self.ix.borrow();
+        match cond {
+            Cond::Scc0 | Cond::Scc1 => {
+                let f = st.scc.ix.live();
+                if it.is_flag(f) {
+                    it.assume(f, (cond == Cond::Scc1) == is_taken, facts);
+                }
+            }
+            Cond::Vccz | Cond::Vccnz if self.wave == Wave::Wave32 => {
+                if let Some(Node::NzFlag(f)) = it.node(st.s[VCC_LO].ix.live()) {
+                    it.assume(f, (cond == Cond::Vccnz) == is_taken, facts);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn walk(&self, b: usize, mut st: State, facts: &mut Vec<(Ix, bool)>, w: &mut GuardWalk) {
+        use crate::cfg::{Cond, Terminator};
+        if w.err.is_some() {
+            return;
+        }
+        let block = &self.body.blocks[b];
+        if b == w.site {
+            w.paths += 1;
+            if w.paths > GUARD_PATHS {
+                w.err = Some("sealed-guard-path-budget");
+                return;
+            }
+            match &mut w.goal {
+                Goal::Bound { index, common } => {
+                    let it = self.ix.borrow();
+                    let zero_half = facts.iter().any(|&(a, pol)| {
+                        !pol && matches!(it.node(a),
+                            Some(Node::Lts { a: x, b: z })
+                                if x == *index && it.const32(z) == Some(0))
+                    });
+                    let pcs_of = |a: Ix| -> BTreeSet<u32> {
+                        self.atom_pc.borrow().get(&a).cloned().unwrap_or_default()
+                    };
+                    let mut here: BTreeMap<SealedBound, BTreeSet<u32>> = BTreeMap::new();
+                    for &(a, _) in facts.iter().filter(|f| f.1) {
+                        let n = match it.node(a) {
+                            Some(Node::Ltu { a: x, b: n }) if x == *index => Some(n),
+                            Some(Node::Lts { a: x, b: n }) if x == *index && zero_half => Some(n),
+                            _ => None,
+                        };
+                        let Some(bound) = n.and_then(|n| self.bound_of(n)) else {
+                            continue;
+                        };
+                        let pcs = here.entry(bound).or_default();
+                        pcs.extend(pcs_of(a));
+                        if matches!(it.node(a), Some(Node::Lts { .. })) {
+                            for &(z, pol) in facts.iter().filter(|f| !f.1) {
+                                if matches!(it.node(z),
+                                    Some(Node::Lts { a: x, b: zz })
+                                        if x == *index && it.const32(zz) == Some(0))
+                                {
+                                    pcs.extend(pcs_of(z));
+                                    let _ = pol;
+                                }
+                            }
+                        }
+                    }
+                    *common = Some(match common.take() {
+                        None => here,
+                        Some(mut prev) => {
+                            prev.retain(|k, _| here.contains_key(k));
+                            for (k, pcs) in prev.iter_mut() {
+                                pcs.extend(here[k].iter().copied());
+                            }
+                            prev
+                        }
+                    });
+                }
+                Goal::NonNull { id, pos, ents, ok } => {
+                    *self.probe.borrow_mut() = (Some(*id), 0);
+                    for p in block.range.0..=*pos {
+                        w.steps += 1;
+                        if self.decoded[p].is_none() || w.steps > GUARD_STEPS {
+                            w.err = Some("sealed-guard-undecoded");
+                            return;
+                        }
+                        self.step(&mut st, p, None, false);
+                    }
+                    let tbl = self.probe.borrow().1;
+                    let it = self.ix.borrow();
+                    for &(bit, ent) in ents.iter().filter(|e| tbl & e.0 != 0) {
+                        let known = facts.iter().any(|&(a, pol)| {
+                            !pol && matches!(it.node(a), Some(Node::Zero64(w)) if w == ent)
+                        });
+                        *ok &= known;
+                        let _ = bit;
+                    }
+                }
+            }
+            return;
+        }
+        for pos in block.range.0..block.range.1 {
+            w.steps += 1;
+            if w.steps > GUARD_STEPS {
+                w.err = Some("sealed-guard-path-budget");
+                return;
+            }
+            if self.decoded[pos].is_none() {
+                w.err = Some("sealed-guard-undecoded");
+                return;
+            }
+            self.step(&mut st, pos, None, false);
+        }
+        match &block.term {
+            Terminator::Branch {
+                cond,
+                taken,
+                fallthrough,
+            } => {
+                let decided = self.branch_outcome(*cond, &st);
+                for (target, is_taken) in [(taken.0, true), (fallthrough.0, false)] {
+                    if decided.is_some_and(|d| d != is_taken) || !w.anc[target] {
+                        continue;
+                    }
+                    let mut next = facts.clone();
+                    self.edge_facts(*cond, is_taken, &st, &mut next);
+                    let mut child = st.clone();
+                    if self.wave == Wave::Wave32
+                        && matches!(
+                            (cond, is_taken),
+                            (Cond::Execz, false) | (Cond::Execnz, true)
+                        )
+                    {
+                        child.exec_nz = true;
+                    }
+                    self.walk(target, child, &mut next, w);
+                }
+            }
+            Terminator::FallThrough | Terminator::Jump(_) => {
+                for s in &block.succs {
+                    if w.anc[s.0] {
+                        self.walk(s.0, st.clone(), facts, w);
+                    }
+                }
+            }
+            Terminator::EndPgm | Terminator::Unreachable => {}
+        }
+    }
+
+    /// The sealed tables of the final (qualified) run: entry loads grouped by
+    /// `(table argument, bound)` with every read whose base derives from them.
+    fn assemble_sealed(&self, rec: &Rec) -> Vec<SealedTableUse> {
+        let Some(qualified) = self.sealed.as_ref().and_then(|s| s.qualified.as_ref()) else {
+            return Vec::new();
+        };
+        let mut groups: BTreeMap<(u32, SealedBound), Vec<(&InstId, &SealedSite)>> = BTreeMap::new();
+        for (inst, site) in qualified {
+            groups
+                .entry((site.table_arg_offset, site.bound))
+                .or_default()
+                .push((inst, site));
+        }
+        let mut out = Vec::new();
+        for ((table_arg_offset, bound), mut sites) in groups {
+            sites.sort_by_key(|(inst, _)| rec.sealed_entries.get(*inst).map_or(0, |e| e.pc));
+            let mask = sites.iter().fold(0u8, |m, (_, s)| m | s.bit);
+            let mut entries = Vec::new();
+            for (inst, site) in &sites {
+                let Some(er) = rec.sealed_entries.get(*inst) else {
+                    continue;
+                };
+                entries.push(SealedEntryLoad {
+                    inst: **inst,
+                    pc: er.pc,
+                    class: er.class,
+                    path: er.path,
+                    cache: er.cache,
+                    width_bytes: er.width,
+                    index: site.index,
+                    guard_pcs: site.guard_pcs.clone(),
+                });
+            }
+            // `null_guarded`: every read through an entry of this table is
+            // reachable only with that entry nonzero (proved path by path).
+            let ent_of = |inst: &InstId| self.ix.borrow_mut().ent(*inst);
+            let mut null_guarded = true;
+            let mut accesses = Vec::new();
+            for a in rec.sealed_accesses.iter().filter(|a| a.mask & mask != 0) {
+                if null_guarded {
+                    let ents: Vec<(u8, Ix)> = sites
+                        .iter()
+                        .filter(|(_, s)| a.mask & s.bit != 0)
+                        .map(|(inst, s)| (s.bit, ent_of(inst)))
+                        .collect();
+                    null_guarded = self.access_nonnull(a.inst, a.pc as usize, ents);
+                }
+                let mut entry_pcs: Vec<u32> = sites
+                    .iter()
+                    .filter(|(_, s)| a.mask & s.bit != 0)
+                    .filter_map(|(inst, _)| rec.sealed_entries.get(*inst).map(|e| e.pc))
+                    .collect();
+                entry_pcs.sort_unstable();
+                accesses.push(SealedAccess {
+                    inst: a.inst,
+                    pc: a.pc,
+                    class: a.class,
+                    path: a.path,
+                    cache: a.cache,
+                    width_bytes: a.width,
+                    entry_pcs,
+                });
+            }
+            accesses.sort_by_key(|a| a.pc);
+            out.push(SealedTableUse {
+                table_arg_offset,
+                bound,
+                entry_bytes: 8,
+                entries,
+                accesses,
+                null_guarded,
+            });
+        }
+        out
+    }
+}
+
+impl<'k> Analyzer<'k> {
+    /// A1 `null_guarded` (workgroup-footprint replay only: it needs the
+    /// must-facts of [`State::facts`]/[`State::lane_facts`], which add the
+    /// facts of every branch edge and drop them at a join the guard does not
+    /// dominate). A declared 8-byte pointer argument is `null_guarded` when it
+    /// has at least one access and, at every one, the facts holding on every
+    /// path to it include "the 64-bit kernarg value is nonzero" (the edge of
+    /// an exact `s_cmp_lg/eq_u64 w, 0` that is taken only for `w != 0`,
+    /// possibly through an SCC mask copy and an EXEC mask). The facts are over
+    /// the immutable witness `K64(offset)`, so a register redefined after the
+    /// test cannot carry the guard to another value; a base derived from another
+    /// argument is attributed to that argument, not this one.
+    fn null_guarded_args(&self, rec: &Rec) -> BTreeSet<Target> {
+        let mut out = BTreeSet::new();
+        for (target, accesses) in &rec.accesses {
+            let Target::Declared(i) = *target else {
+                continue;
+            };
+            let arg = &self.layout.args[i];
+            if accesses.is_empty() || arg.size != 8 || arg.offset % 8 != 0 {
+                continue;
+            }
+            let w = {
+                let mut it = self.ix.borrow_mut();
+                let (lo, hi) = (it.k32(arg.offset), it.k32(arg.offset + 4));
+                it.as64(lo, hi)
+            };
+            if w.is_none() {
+                continue;
+            }
+            let it = self.ix.borrow();
+            let nonzero = |&(f, pol): &(Ix, bool)| match it.node(f) {
+                Some(Node::Zero64(x)) => !pol && x == w,
+                Some(Node::Not(g)) => pol && matches!(it.node(g), Some(Node::Zero64(x)) if x == w),
+                _ => false,
+            };
+            let all = accesses.iter().all(|a| {
+                rec.nfacts
+                    .get(&a.inst)
+                    .is_some_and(|(s, l)| s.iter().any(nonzero) || l.iter().any(nonzero))
+            });
+            if all {
+                out.insert(*target);
+            }
+        }
+        out
+    }
+
+    /// Record the must-facts holding at an attributed access.
+    fn note_facts(&self, st: &State, dec: &Dec, rec: &mut Rec) {
+        if self.wgf {
+            rec.nfacts
+                .insert(dec.id, (st.facts.clone(), self.lane_facts_of(st)));
+        }
+    }
+}
+
+/// The exact scalar results the sealed analysis adds to one instruction's
+/// ordinary transfer (see [`Analyzer::sealed_scalar`]).
+#[derive(Default)]
+struct SealedFx {
+    scc_ix: Option<Ix>,
+    scc_konst: Option<bool>,
+    dst_konst: Option<(usize, u32)>,
+    dst_vals: Option<(usize, SmallVec<[Val; 2]>)>,
+    dst_ix: Option<(usize, Ix)>,
+    /// `s_or_b32 exec_lo, exec_lo, x` with `x` known nonzero.
+    exec_nz: bool,
+}
+
+/// Path budget of the entry-guard replay.
+const GUARD_PATHS: usize = 4096;
+const GUARD_STEPS: usize = 400_000;
+
+/// What a path enumeration proves at its target block.
+enum Goal {
+    /// `index < bound` on every path, at an entry load.
+    Bound {
+        index: Ix,
+        /// Bounds established on every path reached so far, with their
+        /// compares.
+        common: Option<BTreeMap<SealedBound, BTreeSet<u32>>>,
+    },
+    /// Every table-derived base at the access is a known-nonzero entry.
+    NonNull {
+        id: InstId,
+        pos: usize,
+        ents: Vec<(u8, Ix)>,
+        ok: bool,
+    },
+}
+
+/// State of one path enumeration.
+struct GuardWalk {
+    site: usize,
+    anc: Vec<bool>,
+    paths: usize,
+    steps: usize,
+    err: Option<&'static str>,
+    goal: Goal,
+}
+
+/// A uniform all-ones/zero mask of "a 64-bit kernarg value is nonzero"
+/// (`s_cmp_lg_u64 w, 0; s_cselect_b32 m, -1, 0`) as the lane mask whose set
+/// lanes satisfy that fact (`null_guarded`); any other value is unchanged.
+fn null_lane_mask(it: &mut Interner, ix: Ix) -> Ix {
+    let Some(Node::Mask(f)) = it.node(ix) else {
+        return ix;
+    };
+    let mut facts = Vec::new();
+    it.assume(f, true, &mut facts);
+    if facts
+        .iter()
+        .any(|&(a, _)| matches!(it.node(a), Some(Node::Zero64(_))))
+    {
+        it.lane_mask(facts, None)
+    } else {
+        ix
+    }
 }
 
 fn other_is_negative(op: &Operand) -> bool {
     matches!(op, Operand::Inline(InlineConst::Integer(n)) if *n < 0)
+}
+
+/// A register a lane-mask witness is written to.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LaneTgt {
+    S(usize),
+    Exec,
 }
 
 /// Where an implicit carry-out lane mask is written.
@@ -3051,7 +5224,7 @@ enum CarryTo {
     Vcc,
 }
 /// `State::exec_exact` unknown: a VALU carry then names no EXEC level.
-const EXEC_UNKNOWN: u8 = 0xfe;
+const EXEC_UNKNOWN: u32 = u32::MAX - 1;
 
 /// Mnemonic without the encoding suffix, VOPD halves as their plain opcode.
 fn norm_name(name: &str) -> String {
@@ -3113,8 +5286,12 @@ fn read_cache_of(accesses: &[ArgAccess]) -> ReadCacheClass {
     accesses.iter().fold(ReadCacheClass::NotRead, |acc, a| {
         acc.join(match a.class {
             AccessClass::SmemLoad => ReadCacheClass::ScalarOnly,
-            AccessClass::VmemLoad | AccessClass::LdsDma => ReadCacheClass::VmemOnly,
-            AccessClass::VmemStore | AccessClass::Atomic { .. } => ReadCacheClass::NotRead,
+            AccessClass::VmemLoad | AccessClass::LoadAcquire | AccessClass::LdsDma => {
+                ReadCacheClass::VmemOnly
+            }
+            AccessClass::VmemStore | AccessClass::Atomic { .. } | AccessClass::AtomicRelease => {
+                ReadCacheClass::NotRead
+            }
         })
     })
 }
@@ -3227,16 +5404,21 @@ fn finish(
     layout: &Layout,
     rec: Option<Rec>,
     supplied: &[Guard],
+    sealed: Vec<SealedTableUse>,
 ) -> KernargFacts {
     let rec = rec.unwrap_or_else(|| Rec::new(DwSet::default()));
     let (mut indexed, entry_used) = resolve_pending(&rec, supplied, &mut facts.unresolved);
     facts.status = if !facts.unresolved.is_empty() {
         KernelStatus::Unknown
-    } else if !indexed.is_empty() || !rec.guards_used.is_empty() || entry_used {
+    } else if !indexed.is_empty() || !rec.guards_used.is_empty() || entry_used || !sealed.is_empty()
+    {
         KernelStatus::Conditional
     } else {
         KernelStatus::Proven
     };
+    if facts.status == KernelStatus::Conditional {
+        facts.sealed = sealed;
+    }
     if facts.status != KernelStatus::Proven {
         facts.guards = supplied.to_vec();
         for e in &mut indexed {
@@ -3312,6 +5494,7 @@ fn finish(
             accesses,
             sinks,
             loaded: was_loaded,
+            null_guarded: rec.null_args.contains(&target),
         }
     };
     let mut args: Vec<ArgFacts> = layout
@@ -3671,6 +5854,90 @@ mod tests {
         );
         assert_eq!(f.arg_at(20).unwrap().role, ArgRole::NotLoaded);
         assert!(f.arg_at(0).unwrap().sinks.has(Sinks::ADDRESS_BASE));
+    }
+
+    /// The loop kernel of the test above, built as a [`Kernel`] for the budgeted entry points.
+    fn loop_kernel() -> Kernel {
+        kernel(
+            &[
+                0xf4000080, 0xf8000010, 0xf4002100, 0xf8000000, 0xf4000200, 0xf8000008, 0xbfc70000,
+                0xbe830080, 0x81038103, 0xbf0a0203, 0xbfa2fffd, 0x96067508, 0x7e000206, 0x7e020203,
+                0xee068004, 0x00800000, 0x00000000, 0xbfb00000,
+            ],
+            &[
+                ("out", 0, 8, "global_buffer"),
+                ("n", 8, 4, "by_value"),
+                ("bcx", 16, 4, "hidden_block_count_x"),
+                ("bcy", 20, 4, "hidden_block_count_y"),
+                ("bcz", 24, 4, "hidden_block_count_z"),
+                ("gsx", 28, 2, "hidden_group_size_x"),
+            ],
+        )
+    }
+
+    /// A fixpoint that runs past its work bound is `Unknown` with the budget rule and the
+    /// measured counts, reports no access fact of a half-computed result, and does so for
+    /// every entry point (unguarded, excluding, sealed, guarded and the workgroup-footprint
+    /// replay); the default bound proves the same kernel.
+    #[test]
+    fn a_fixpoint_past_its_work_bound_is_unknown_with_the_measured_counts() {
+        let k = loop_kernel();
+        assert_eq!(analyze(&k, Arch::Gfx1201).status, KernelStatus::Proven);
+        for per_inst in [0, 1] {
+            let tight = A1Budget {
+                fixpoint_work_per_inst: per_inst,
+            };
+            let runs = [
+                analyze_budgeted(&k, Arch::Gfx1201, &tight),
+                analyze_excluding_budgeted(&k, Arch::Gfx1201, &[(0, 4)], &tight),
+                analyze_sealed_budgeted(&k, Arch::Gfx1201, &tight),
+                analyze_guarded_budgeted(&k, Arch::Gfx1201, &[], &tight),
+            ];
+            for f in runs {
+                assert_eq!(f.status, KernelStatus::Unknown, "{per_inst}");
+                let rules: Vec<&str> = f.unresolved.iter().map(|u| u.rule).collect();
+                assert_eq!(rules, [RULE_FIXPOINT_BUDGET], "{per_inst}");
+                let detail = &f.unresolved[0].detail;
+                assert!(
+                    detail.contains("units of work")
+                        && detail.contains("block visits")
+                        && detail.contains(&format!("({per_inst} per instruction)")),
+                    "{detail}"
+                );
+                assert!(
+                    f.args.iter().all(|a| a.accesses.is_empty() && !a.loaded)
+                        && f.indexed.is_empty()
+                        && f.sealed.is_empty(),
+                    "an overrun reports no fact"
+                );
+            }
+            let wg = crate::passes::wg_footprint::analyze_budgeted(
+                &k,
+                Arch::Gfx1201,
+                false,
+                crate::passes::wg_footprint::WgLaunch { block_x: 32 },
+                &tight,
+            );
+            let why = wg.applicable.expect_err("withheld");
+            assert!(why.contains(RULE_FIXPOINT_BUDGET), "{why}");
+            assert!(wg.args.is_empty());
+        }
+        // the loop settles within a few units per instruction: a bound just above what it
+        // uses admits it, so the bound is the only thing that changed
+        let used = (1..=64)
+            .find(|&n| {
+                analyze_budgeted(
+                    &k,
+                    Arch::Gfx1201,
+                    &A1Budget {
+                        fixpoint_work_per_inst: n,
+                    },
+                )
+                .status
+                    == KernelStatus::Proven
+            })
+            .expect("the loop settles");
+        assert!(used >= 2 && used < 16, "{used}");
     }
 
     #[test]
@@ -4047,5 +6314,622 @@ mod tests {
             ],
             "nested P[Q[i]] indexing",
         );
+    }
+    const POSITIVE: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf0a0a0b, 0xbfa1000f, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04, 0xf4002389,
+        0xf8000000, 0xbfc70000, 0x7e020280, 0xee05000e, 0x00000002, 0x00000001, 0xbfc00000,
+        0xee068008, 0x01000000, 0x00000001, 0xbfb00000,
+    ];
+    const CONST_BOUND: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf0ac00b, 0xbfa1000f, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04, 0xf4002389,
+        0xf8000000, 0xbfc70000, 0x7e020280, 0xee05000e, 0x00000002, 0x00000001, 0xbfc00000,
+        0xee068008, 0x01000000, 0x00000001, 0xbfb00000,
+    ];
+    const STORE_THROUGH: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf0a0a0b, 0xbfa1000c, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04, 0xf4002389,
+        0xf8000000, 0xbfc70000, 0x7e020280, 0x7e040280, 0xee06800e, 0x01000000, 0x00000001,
+        0xbfb00000,
+    ];
+    const UNGUARDED: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04, 0xf4002389, 0xf8000000, 0xbfc70000,
+        0x7e020280, 0xee05000e, 0x00000002, 0x00000001, 0xbfc00000, 0xee068008, 0x01000000,
+        0x00000001, 0xbfb00000,
+    ];
+    const WRONG_VALUE: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf0a0a11, 0xbfa1000f, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04, 0xf4002389,
+        0xf8000000, 0xbfc70000, 0x7e020280, 0xee05000e, 0x00000002, 0x00000001, 0xbfc00000,
+        0xee068008, 0x01000000, 0x00000001, 0xbfb00000,
+    ];
+    const SIGNED_GUARD: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf040a0b, 0xbfa1000f, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04, 0xf4002389,
+        0xf8000000, 0xbfc70000, 0x7e020280, 0xee05000e, 0x00000002, 0x00000001, 0xbfc00000,
+        0xee068008, 0x01000000, 0x00000001, 0xbfb00000,
+    ];
+    const REVERSED_GUARD: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf0a0b0a, 0xbfa1000f, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04, 0xf4002389,
+        0xf8000000, 0xbfc70000, 0x7e020280, 0xee05000e, 0x00000002, 0x00000001, 0xbfc00000,
+        0xee068008, 0x01000000, 0x00000001, 0xbfb00000,
+    ];
+    const BYPASSED_GUARD: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf068010, 0xbfa20002, 0xbf0a0a0b, 0xbfa1000f, 0xbe8c000b, 0x860d9f0b, 0x848c830c,
+        0xa9920c04, 0xf4002389, 0xf8000000, 0xbfc70000, 0x7e020280, 0xee05000e, 0x00000002,
+        0x00000001, 0xbfc00000, 0xee068008, 0x01000000, 0x00000001, 0xbfb00000,
+    ];
+    const FLAG_DIAMOND: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbe9400c1, 0xbf0a0a0b, 0xbfa20001, 0xbe940080, 0x8b157e14, 0x98158081, 0xbf078115,
+        0xbfa2000f, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04, 0xf4002389, 0xf8000000,
+        0xbfc70000, 0x7e020280, 0xee05000e, 0x00000002, 0x00000001, 0xbfc00000, 0xee068008,
+        0x01000000, 0x00000001, 0xbfb00000,
+    ];
+    const FLAG_DIAMOND_BROKEN: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbe9400c1, 0xbf0a0a0b, 0xbfa20001, 0xbe9400c1, 0x8b157e14, 0x98158081, 0xbf078115,
+        0xbfa2000f, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04, 0xf4002389, 0xf8000000,
+        0xbfc70000, 0x7e020280, 0xee05000e, 0x00000002, 0x00000001, 0xbfc00000, 0xee068008,
+        0x01000000, 0x00000001, 0xbfb00000,
+    ];
+    const POINTER_AS_INDEX: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf0a0a0b, 0xbfa10013, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04, 0xf4002389,
+        0xf8000000, 0xbfc70000, 0x7e020280, 0xee05400e, 0x00000002, 0x00000001, 0xbfc00000,
+        0xee05007c, 0x00000004, 0x00000002, 0xbfc00000, 0xee068008, 0x02000000, 0x00000001,
+        0xbfb00000,
+    ];
+    const POINTER_STORED: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf0a0a0b, 0xbfa1000d, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04, 0xf4002389,
+        0xf8000000, 0xbfc70000, 0x7e020280, 0x7e04020e, 0x7e06020f, 0xee06c008, 0x01000000,
+        0x00000001, 0xbfb00000,
+    ];
+    const POINTER_MIXED_WITH_ARG: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf0a0a0b, 0xbfa1000c, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04, 0xf4002389,
+        0xf8000000, 0xbfc70000, 0x7e020280, 0xa99c0e08, 0xee06801c, 0x00800000, 0x00000001,
+        0xbfb00000,
+    ];
+    const ATOMIC_THROUGH: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf0a0a0b, 0xbfa1000b, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04, 0xf4002389,
+        0xf8000000, 0xbfc70000, 0x7e020280, 0xee0d400e, 0x00800000, 0x00000001, 0xbfb00000,
+    ];
+    const SCALE4: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf0a0a0b, 0xbfa1000f, 0xbe8c000b, 0x860d9f0b, 0x848c820c, 0xa9920c04, 0xf4002389,
+        0xf8000000, 0xbfc70000, 0x7e020280, 0xee05000e, 0x00000002, 0x00000001, 0xbfc00000,
+        0xee068008, 0x01000000, 0x00000001, 0xbfb00000,
+    ];
+    const ENTRY_OFFSET: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf0a0a0b, 0xbfa1000f, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04, 0xf4002389,
+        0xf8000008, 0xbfc70000, 0x7e020280, 0xee05000e, 0x00000002, 0x00000001, 0xbfc00000,
+        0xee068008, 0x01000000, 0x00000001, 0xbfb00000,
+    ];
+    const LOOP_ENTRY: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf0a0a0b, 0xbfa10013, 0xbe9e0082, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04,
+        0xf4002389, 0xf8000000, 0xbfc70000, 0x7e020280, 0xee05000e, 0x00000002, 0x00000001,
+        0xbfc00000, 0xee068008, 0x01000000, 0x00000001, 0x819e811e, 0xbf07801e, 0xbfa2ffee,
+        0xbfb00000,
+    ];
+    const TWO_LOADS_ONE_TABLE: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf0a0a0b, 0xbfa1001d, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04, 0xf4002389,
+        0xf8000000, 0xbfc70000, 0x7e020280, 0xee05000e, 0x00000002, 0x00000001, 0xbfc00000,
+        0xee068008, 0x01000000, 0x00000001, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa99a0c04,
+        0xf400258d, 0xf8000000, 0xbfc70000, 0xee050016, 0x00000003, 0x00000001, 0xbfc00000,
+        0xee068008, 0x01800000, 0x00000001, 0xbfb00000,
+    ];
+
+    // ---------------------------------------------------------------------
+    // Sealed-table analysis. Kernels assembled with llvm-mc (gfx1201): table
+    // pointer +0, index pointer +8, output +16, bound `n` +24, flag +28.
+    // ---------------------------------------------------------------------
+    const SEALED_ARGS: &[(&str, u32, u32, &str)] = &[
+        ("table", 0, 8, "global_buffer"),
+        ("idx", 8, 8, "global_buffer"),
+        ("out", 16, 8, "global_buffer"),
+        ("n", 24, 4, "by_value"),
+        ("flag", 28, 4, "by_value"),
+    ];
+    fn sealed(words: &[u32]) -> KernargFacts {
+        analyze_sealed(&kernel(words, SEALED_ARGS), Arch::Gfx1201)
+    }
+    fn first_rule(f: &KernargFacts) -> &'static str {
+        f.unresolved.first().map_or("", |u| u.rule)
+    }
+    fn refuses(words: &[u32], rule: &str) {
+        let f = sealed(words);
+        assert_eq!(f.status, KernelStatus::Unknown, "{:?}", f.unresolved);
+        assert!(f.sealed.is_empty());
+        assert_eq!(first_rule(&f), rule, "{:?}", f.unresolved);
+    }
+
+    #[test]
+    fn guarded_table_entry_read_through_is_a_conditional_sealed_table() {
+        let f = sealed(POSITIVE);
+        assert_eq!(f.status, KernelStatus::Conditional, "{:?}", f.unresolved);
+        assert!(f.guards.is_empty() && f.indexed.is_empty());
+        let [t] = &f.sealed[..] else {
+            panic!("one table: {:?}", f.sealed)
+        };
+        assert_eq!(t.table_arg_offset, 0);
+        assert_eq!(t.bound, SealedBound::Kernarg { offset: 24 });
+        assert_eq!(t.entry_bytes, 8);
+        let [e] = &t.entries[..] else { panic!() };
+        assert_eq!(
+            (e.pc, e.class, e.path, e.width_bytes),
+            (14, AccessClass::SmemLoad, MemPath::Smem, 8)
+        );
+        assert_eq!(e.index, SealedIndex::Load { pc: 5 });
+        assert_eq!(e.guard_pcs, [8]);
+        let [a] = &t.accesses[..] else { panic!() };
+        assert_eq!(
+            (a.class, a.path, a.width_bytes, a.entry_pcs.clone()),
+            (AccessClass::VmemLoad, MemPath::Global, 4, vec![e.pc])
+        );
+        // The table argument is read (its entry load is an ordinary read);
+        // the output argument is written; the loaded pointer is no argument.
+        assert_eq!(mode(&f, 0), Some(AccessMode::Read));
+        assert_eq!(mode(&f, 16), Some(AccessMode::Write));
+        // The unguarded analysis is unchanged: Unknown, memory-derived.
+        let base = analyze(&kernel(POSITIVE, SEALED_ARGS), Arch::Gfx1201);
+        assert_eq!(base.status, KernelStatus::Unknown);
+        assert_eq!(rules(&base), ["base-memory-derived"]);
+        assert!(base.sealed.is_empty());
+    }
+
+    #[test]
+    fn constant_bound_and_two_entry_loads_of_one_table() {
+        let f = sealed(CONST_BOUND);
+        assert_eq!(f.status, KernelStatus::Conditional, "{:?}", f.unresolved);
+        assert_eq!(f.sealed[0].bound, SealedBound::Const(64));
+        let f = sealed(TWO_LOADS_ONE_TABLE);
+        assert_eq!(f.status, KernelStatus::Conditional, "{:?}", f.unresolved);
+        let [t] = &f.sealed[..] else { panic!() };
+        assert_eq!(t.entries.len(), 2);
+        assert_eq!(t.accesses.len(), 2);
+        assert_ne!(t.accesses[0].entry_pcs, t.accesses[1].entry_pcs);
+    }
+
+    #[test]
+    fn a_flag_materialised_by_a_diamond_is_followed_not_guessed() {
+        // `ok = idx < n ? -1 : 0; if (!(ok & exec)) return;` as the compiler
+        // writes it: the guard holds only through the flag.
+        let f = sealed(FLAG_DIAMOND);
+        assert_eq!(f.status, KernelStatus::Conditional, "{:?}", f.unresolved);
+        assert_eq!(f.sealed[0].entries[0].guard_pcs.len(), 1);
+        // The same shape with the flag set on both paths guards nothing.
+        refuses(FLAG_DIAMOND_BROKEN, "sealed-index-unguarded");
+    }
+
+    #[test]
+    fn only_a_complete_unsigned_guard_of_the_loaded_index_qualifies() {
+        refuses(UNGUARDED, "sealed-index-unguarded");
+        refuses(WRONG_VALUE, "sealed-index-unguarded");
+        refuses(SIGNED_GUARD, "sealed-index-unguarded");
+        refuses(REVERSED_GUARD, "sealed-index-unguarded");
+        refuses(BYPASSED_GUARD, "sealed-index-unguarded");
+    }
+
+    #[test]
+    fn writes_and_escapes_through_the_loaded_base_stay_unknown() {
+        refuses(STORE_THROUGH, "sealed-table-write");
+        refuses(ATOMIC_THROUGH, "sealed-table-write");
+        refuses(POINTER_STORED, "sealed-table-value-stored");
+        // An argument candidate beside the entry makes the base `Both`; the
+        // access is a store, so it is refused as a write through an entry.
+        refuses(POINTER_MIXED_WITH_ARG, "sealed-table-write");
+        // A loaded base used as an address again is memory-derived.
+        refuses(POINTER_AS_INDEX, "base-memory-derived");
+    }
+
+    #[test]
+    fn entry_shapes_the_certificate_does_not_cover_keep_the_plain_rule() {
+        for words in [SCALE4, ENTRY_OFFSET] {
+            let f = sealed(words);
+            assert_eq!(f.status, KernelStatus::Unknown);
+            assert!(f.unresolved.iter().all(|u| u.rule == "base-memory-derived"));
+            assert!(f.sealed.is_empty());
+        }
+        refuses(LOOP_ENTRY, "sealed-entry-in-cycle");
+    }
+    const SIGNED_GUARD_FLAGS: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbfa50016, 0xbf04800b, 0x981480c1, 0xbf030a0b, 0x981580c1, 0x8c141514, 0x8b6a147e,
+        0xbfa4000f, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04, 0xf4002389, 0xf8000000,
+        0xbfc70000, 0x7e020280, 0xee05000e, 0x00000002, 0x00000001, 0xbfc00000, 0xee068008,
+        0x01000000, 0x00000001, 0xbfb00000,
+    ];
+    const SIGNED_NO_EXEC_FACT: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf04800b, 0x981480c1, 0xbf030a0b, 0x981580c1, 0x8c141514, 0x8b6a147e, 0xbfa4000f,
+        0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04, 0xf4002389, 0xf8000000, 0xbfc70000,
+        0x7e020280, 0xee05000e, 0x00000002, 0x00000001, 0xbfc00000, 0xee068008, 0x01000000,
+        0x00000001, 0xbfb00000,
+    ];
+    /// `SIGNED_NO_EXEC_FACT` with `s_mov_b32 exec_lo, n` before the guard.
+    const SIGNED_EXEC_CLOBBERED: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbefe000a, 0xbf04800b, 0x981480c1, 0xbf030a0b, 0x981580c1, 0x8c141514, 0x8b6a147e,
+        0xbfa4000f, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04, 0xf4002389, 0xf8000000,
+        0xbfc70000, 0x7e020280, 0xee05000e, 0x00000002, 0x00000001, 0xbfc00000, 0xee068008,
+        0x01000000, 0x00000001, 0xbfb00000,
+    ];
+    // The shape the compiler emits for `if (e < 0 || e >= n) return; ptrs[e]`
+    // with `e` zero-extended by a separate `s_mov_b32 s13, 0` into `s[12:13]`,
+    // no EXECZ branch anywhere. Variants below break one thing each.
+    const ZEXT_SIGNED_PAIR: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf4000303, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf04800c, 0x981480c1, 0xbf030a0c, 0x981580c1, 0x8c141514, 0x8b6a147e, 0xbe8d0080,
+        0xbfa4000d, 0x848c830c, 0xa9920c04, 0xf4002389, 0xf8000000, 0xbfc70000, 0x7e020280,
+        0xee05000e, 0x00000002, 0x00000001, 0xbfc00000, 0xee068008, 0x01000000, 0x00000001,
+        0xbfb00000,
+    ];
+    /// `s_mov_b32 exec_lo, n` before the guard: EXEC is no longer known nonzero.
+    const ZEXT_EXEC_CLOBBERED: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf4000303, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbefe000a, 0xbf04800c, 0x981480c1, 0xbf030a0c, 0x981580c1, 0x8c141514, 0x8b6a147e,
+        0xbe8d0080, 0xbfa4000d, 0x848c830c, 0xa9920c04, 0xf4002389, 0xf8000000, 0xbfc70000,
+        0x7e020280, 0xee05000e, 0x00000002, 0x00000001, 0xbfc00000, 0xee068008, 0x01000000,
+        0x00000001, 0xbfb00000,
+    ];
+    /// The index register is reloaded from another word after the guard.
+    const ZEXT_RELOADED_INDEX: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf4000303, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf04800c, 0x981480c1, 0xbf030a0c, 0x981580c1, 0x8c141514, 0x8b6a147e, 0xbe8d0080,
+        0xbfa40010, 0xf4000303, 0xf8000004, 0xbfc70000, 0x848c830c, 0xa9920c04, 0xf4002389,
+        0xf8000000, 0xbfc70000, 0x7e020280, 0xee05000e, 0x00000002, 0x00000001, 0xbfc00000,
+        0xee068008, 0x01000000, 0x00000001, 0xbfb00000,
+    ];
+    /// Both compares test a different loaded word than the one that indexes.
+    const ZEXT_GUARD_OTHER_REGISTER: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf4000303, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf048011, 0x981480c1, 0xbf030a11, 0x981580c1, 0x8c141514, 0x8b6a147e, 0xbe8d0080,
+        0xbfa4000d, 0x848c830c, 0xa9920c04, 0xf4002389, 0xf8000000, 0xbfc70000, 0x7e020280,
+        0xee05000e, 0x00000002, 0x00000001, 0xbfc00000, 0xee068008, 0x01000000, 0x00000001,
+        0xbfb00000,
+    ];
+    /// The `e < 0` half is replaced by a constant-false flag.
+    const ZEXT_NO_LOWER_BOUND: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf4000303, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbe940080, 0xbf030a0c, 0x981580c1, 0x8c141514, 0x8b6a147e, 0xbe8d0080, 0xbfa4000d,
+        0x848c830c, 0xa9920c04, 0xf4002389, 0xf8000000, 0xbfc70000, 0x7e020280, 0xee05000e,
+        0x00000002, 0x00000001, 0xbfc00000, 0xee068008, 0x01000000, 0x00000001, 0xbfb00000,
+    ];
+    /// The upper bound is another loaded word, not a kernarg or a constant.
+    const ZEXT_BOUND_NOT_KERNARG: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf4000303, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf04800c, 0x981480c1, 0xbf03110c, 0x981580c1, 0x8c141514, 0x8b6a147e, 0xbe8d0080,
+        0xbfa4000d, 0x848c830c, 0xa9920c04, 0xf4002389, 0xf8000000, 0xbfc70000, 0x7e020280,
+        0xee05000e, 0x00000002, 0x00000001, 0xbfc00000, 0xee068008, 0x01000000, 0x00000001,
+        0xbfb00000,
+    ];
+    /// `if (flag == 0) goto entry_load;` jumps over the whole guard.
+    const ZEXT_PATH_SKIPS_GUARD: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf4000303, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbe8d0080, 0xbf068010, 0xbfa20008, 0xbf04800c, 0x981480c1, 0xbf030a0c, 0x981580c1,
+        0x8c141514, 0x8b6a147e, 0xbe8d0080, 0xbfa4000d, 0x848c830c, 0xa9920c04, 0xf4002389,
+        0xf8000000, 0xbfc70000, 0x7e020280, 0xee05000e, 0x00000002, 0x00000001, 0xbfc00000,
+        0xee068008, 0x01000000, 0x00000001, 0xbfb00000,
+    ];
+    const SIGNED_MISSING_NONNEG: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbfa50015, 0xbe940080, 0xbf030a0b, 0x981580c1, 0x8c141514, 0x8b6a147e, 0xbfa4000f,
+        0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04, 0xf4002389, 0xf8000000, 0xbfc70000,
+        0x7e020280, 0xee05000e, 0x00000002, 0x00000001, 0xbfc00000, 0xee068008, 0x01000000,
+        0x00000001, 0xbfb00000,
+    ];
+    const SIGNED_NONNEG_OF_OTHER: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbfa50016, 0xbf048011, 0x981480c1, 0xbf030a0b, 0x981580c1, 0x8c141514, 0x8b6a147e,
+        0xbfa4000f, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04, 0xf4002389, 0xf8000000,
+        0xbfc70000, 0x7e020280, 0xee05000e, 0x00000002, 0x00000001, 0xbfc00000, 0xee068008,
+        0x01000000, 0x00000001, 0xbfb00000,
+    ];
+    const NULL_CHECKED: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf0a0a0b, 0xbfa10011, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04, 0xf4002389,
+        0xf8000000, 0xbfc70000, 0x7e020280, 0xbf11800e, 0xbfa10007, 0xee05000e, 0x00000002,
+        0x00000001, 0xbfc00000, 0xee068008, 0x01000000, 0x00000001, 0xbfb00000,
+    ];
+    const DEREF_BEFORE_NULL_CHECK: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf0a0a0b, 0xbfa10011, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04, 0xf4002389,
+        0xf8000000, 0xbfc70000, 0x7e020280, 0xee05000e, 0x00000002, 0x00000001, 0xbfc00000,
+        0xee068008, 0x01000000, 0x00000001, 0xbf11800e, 0xbfa10000, 0xbfb00000,
+    ];
+    const NULL_CHECK_OTHER_REGISTER: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf0a0a0b, 0xbfa10011, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04, 0xf4002389,
+        0xf8000000, 0xbfc70000, 0x7e020280, 0xbf118008, 0xbfa10007, 0xee05000e, 0x00000002,
+        0x00000001, 0xbfc00000, 0xee068008, 0x01000000, 0x00000001, 0xbfb00000,
+    ];
+    const NULL_CHECK_BYPASSED: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf0a0a0b, 0xbfa10013, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04, 0xf4002389,
+        0xf8000000, 0xbfc70000, 0x7e020280, 0xbf068010, 0xbfa20002, 0xbf11800e, 0xbfa10007,
+        0xee05000e, 0x00000002, 0x00000001, 0xbfc00000, 0xee068008, 0x01000000, 0x00000001,
+        0xbfb00000,
+    ];
+    const NULL_CHECK_FLAGS: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbfa50017, 0xbf0a0a0b, 0xbfa10015, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04,
+        0xf4002389, 0xf8000000, 0xbfc70000, 0x7e020280, 0xbf11800e, 0x981480c1, 0x8b157e14,
+        0x98158081, 0xbf078115, 0xbfa20007, 0xee05000e, 0x00000002, 0x00000001, 0xbfc00000,
+        0xee068008, 0x01000000, 0x00000001, 0xbfb00000,
+    ];
+    /// `NULL_CHECK_FLAGS_NO_EXEC_FACT` with `s_mov_b32 exec_lo, n` first.
+    const NULL_CHECK_FLAGS_EXEC_CLOBBERED: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbefe000a, 0xbf0a0a0b, 0xbfa10015, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04,
+        0xf4002389, 0xf8000000, 0xbfc70000, 0x7e020280, 0xbf11800e, 0x981480c1, 0x8b157e14,
+        0x98158081, 0xbf078115, 0xbfa20007, 0xee05000e, 0x00000002, 0x00000001, 0xbfc00000,
+        0xee068008, 0x01000000, 0x00000001, 0xbfb00000,
+    ];
+    const NULL_CHECK_FLAGS_NO_EXEC_FACT: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf0a0a0b, 0xbfa10015, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04, 0xf4002389,
+        0xf8000000, 0xbfc70000, 0x7e020280, 0xbf11800e, 0x981480c1, 0x8b157e14, 0x98158081,
+        0xbf078115, 0xbfa20007, 0xee05000e, 0x00000002, 0x00000001, 0xbfc00000, 0xee068008,
+        0x01000000, 0x00000001, 0xbfb00000,
+    ];
+    const ARG_OR_ENTRY_BASE: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf0a0a0b, 0xbfa10011, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04, 0xf4002389,
+        0xf8000000, 0xbfc70000, 0x7e020280, 0xbf068110, 0x9896080e, 0xee050016, 0x00000002,
+        0x00000001, 0xbfc00000, 0xee068008, 0x01000000, 0x00000001, 0xbfb00000,
+    ];
+
+    #[test]
+    fn a_signed_pair_guard_through_flags_and_exec_is_followed() {
+        // `if (e < 0 || e >= n) return;` as the compiler writes it: two
+        // compares into masks, `or`, `exec & mask`, `vccnz`. It proves `e < n`
+        // only because EXEC is known nonzero (the EXECZ edge before it, or the
+        // launch state).
+        let f = sealed(SIGNED_GUARD_FLAGS);
+        assert_eq!(f.status, KernelStatus::Conditional, "{:?}", f.unresolved);
+        let [t] = &f.sealed[..] else { panic!() };
+        assert_eq!(t.bound, SealedBound::Kernarg { offset: 24 });
+        assert_eq!(t.entries[0].guard_pcs.len(), 2, "both signed compares");
+        // No EXECZ edge is needed: the launch EXEC is known nonzero, and stays
+        // so until an instruction writes EXEC.
+        let f = sealed(SIGNED_NO_EXEC_FACT);
+        assert_eq!(f.status, KernelStatus::Conditional, "{:?}", f.unresolved);
+        refuses(SIGNED_EXEC_CLOBBERED, "sealed-index-unguarded");
+        refuses(SIGNED_MISSING_NONNEG, "sealed-index-unguarded");
+        refuses(SIGNED_NONNEG_OF_OTHER, "sealed-index-unguarded");
+    }
+
+    #[test]
+    fn a_zero_extended_signed_pair_guard_without_an_execz_edge_is_followed() {
+        // The compiler's shape for `if (e < 0 || e >= n) return; ptrs[e]`:
+        // `e` zero-extended by a separate `s_mov_b32 s13, 0`, both compares
+        // into masks, `or`, `exec & mask`, `vccnz`, and no EXECZ branch.
+        let f = sealed(ZEXT_SIGNED_PAIR);
+        assert_eq!(f.status, KernelStatus::Conditional, "{:?}", f.unresolved);
+        let [t] = &f.sealed[..] else { panic!() };
+        assert_eq!(t.table_arg_offset, 0);
+        assert_eq!(t.bound, SealedBound::Kernarg { offset: 24 });
+        let [e] = &t.entries[..] else { panic!() };
+        assert_eq!(e.index, SealedIndex::Load { pc: 5 });
+        assert_eq!(
+            e.guard_pcs.len(),
+            2,
+            "both signed compares: {:?}",
+            e.guard_pcs
+        );
+        assert_eq!(t.accesses.len(), 1);
+    }
+
+    #[test]
+    fn near_misses_of_the_zero_extended_signed_guard_stay_unguarded() {
+        // EXEC rewritten before the guard: `exec & mask == 0` no longer says
+        // `mask == 0`.
+        refuses(ZEXT_EXEC_CLOBBERED, "sealed-index-unguarded");
+        // The index is reloaded between the guard and the entry load.
+        refuses(ZEXT_RELOADED_INDEX, "sealed-index-unguarded");
+        // The guard tests another register than the one that indexes.
+        refuses(ZEXT_GUARD_OTHER_REGISTER, "sealed-index-unguarded");
+        // Upper bound only: a negative `e` would index below the table.
+        refuses(ZEXT_NO_LOWER_BOUND, "sealed-index-unguarded");
+        // The bound is a loaded value, not a kernarg or a constant.
+        refuses(ZEXT_BOUND_NOT_KERNARG, "sealed-index-unguarded");
+        // One feasible path reaches the entry load without the guard.
+        refuses(ZEXT_PATH_SKIPS_GUARD, "sealed-index-unguarded");
+    }
+
+    #[test]
+    fn only_an_entry_checked_nonzero_before_every_read_is_null_guarded() {
+        for (name, words, want) in [
+            ("scc null check", NULL_CHECKED, true),
+            ("flag null check with exec known", NULL_CHECK_FLAGS, true),
+            ("no null check", POSITIVE, false),
+            ("deref before the check", DEREF_BEFORE_NULL_CHECK, false),
+            (
+                "check of another register",
+                NULL_CHECK_OTHER_REGISTER,
+                false,
+            ),
+            ("check bypassed on a path", NULL_CHECK_BYPASSED, false),
+            (
+                "flag null check from the launch exec fact",
+                NULL_CHECK_FLAGS_NO_EXEC_FACT,
+                true,
+            ),
+            (
+                "flag check after exec is rewritten",
+                NULL_CHECK_FLAGS_EXEC_CLOBBERED,
+                false,
+            ),
+        ] {
+            let f = sealed(words);
+            assert_eq!(
+                f.status,
+                KernelStatus::Conditional,
+                "{name}: {:?}",
+                f.unresolved
+            );
+            assert_eq!(f.sealed[0].null_guarded, want, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_base_that_is_an_argument_on_one_path_and_an_entry_on_another_reads_both() {
+        let f = sealed(ARG_OR_ENTRY_BASE);
+        assert_eq!(f.status, KernelStatus::Conditional, "{:?}", f.unresolved);
+        let [t] = &f.sealed[..] else { panic!() };
+        assert_eq!(t.accesses.len(), 1);
+        assert!(!t.null_guarded);
+        // The read is also an ordinary read of the argument it may name.
+        let out = f.arg_at(16).expect("out argument");
+        assert!(out
+            .accesses
+            .iter()
+            .any(|a| a.class == AccessClass::VmemLoad));
+    }
+
+    // `null_guarded` (declared pointer arguments). Kernels assembled with
+    // llvm-mc (gfx1201, wave32): `dbg` at +8 and `other` at +16 are loaded into
+    // s[4:5] / s[6:7]; stores go through `global_store_b32 v0, v1, s[4:5]`.
+    const NG_ARGS: &[(&str, u32, u32, &str)] = &[
+        ("out", 0, 8, "global_buffer"),
+        ("dbg", 8, 8, "global_buffer"),
+        ("other", 16, 8, "global_buffer"),
+    ];
+    const NG_LOADS: [u32; 5] = [0xf4002100, 0xf8000008, 0xf4002180, 0xf8000010, 0xbfc70000];
+    const NG_STORE: [u32; 3] = [0xee068004, 0x00800000, 0x00000000];
+    const NG_STORE_4: [u32; 3] = [0xee068004, 0x00800000, 0x00000400];
+    const NG_END: u32 = 0xbfb00000;
+    fn ng(parts: &[&[u32]]) -> Vec<u32> {
+        let mut w = NG_LOADS.to_vec();
+        for p in parts {
+            w.extend_from_slice(p);
+        }
+        w.push(NG_END);
+        w
+    }
+    fn null_guarded(words: &[u32], offset: u32) -> bool {
+        let f = analyze(&kernel(words, NG_ARGS), Arch::Gfx1201);
+        assert_eq!(f.status, KernelStatus::Proven, "{:?}", f.unresolved);
+        f.arg_at(offset).expect("argument").null_guarded
+    }
+
+    #[test]
+    fn an_access_dominated_by_the_nonzero_edge_of_the_argument_test_is_null_guarded() {
+        // s_cmp_lg_u64 s[4:5], 0; s_cbranch_scc0 over the store.
+        let lg = ng(&[&[0xbf118004, 0xbfa10003], &NG_STORE]);
+        assert!(null_guarded(&lg, 8));
+        // s_cmp_eq_u64 s[4:5], 0; s_cbranch_scc1 over the store.
+        let eq = ng(&[&[0xbf108004, 0xbfa20003], &NG_STORE]);
+        assert!(null_guarded(&eq, 8));
+        // The other arguments carry no access, so no property.
+        assert!(!null_guarded(&lg, 0) && !null_guarded(&lg, 16));
+        // A load and a store under the same guard.
+        let both = ng(&[
+            &[0xbf118004, 0xbfa10006],
+            &[0xee050004, 0x00000002, 0x00000000],
+            &NG_STORE,
+        ]);
+        assert!(null_guarded(&both, 8));
+    }
+
+    #[test]
+    fn near_misses_of_the_null_guard_are_not_null_guarded() {
+        // No test at all.
+        assert!(!null_guarded(&ng(&[&NG_STORE]), 8));
+        // The test is of another argument.
+        let other = ng(&[&[0xbf118006, 0xbfa10003], &NG_STORE]);
+        assert!(!null_guarded(&other, 8));
+        // The guard dominates the first store only: the NULL path rejoins and
+        // reaches the second store without passing the nonzero edge.
+        let join = ng(&[&[0xbf118004, 0xbfa10003], &NG_STORE, &NG_STORE_4]);
+        assert!(!null_guarded(&join, 8));
+        // The branch jumps the wrong way: the store is reached on the NULL edge.
+        let inverted = ng(&[&[0xbf118004, 0xbfa20003], &NG_STORE]);
+        assert!(!null_guarded(&inverted, 8));
+        // The register is redefined (another argument's value) after the test:
+        // the store is an access of that argument, which was never tested.
+        let redef = ng(&[&[0xbf118004, 0xbfa10004, 0xbe840106], &NG_STORE]);
+        assert!(!null_guarded(&redef, 8));
+        assert!(!null_guarded(&redef, 16));
+    }
+
+    #[test]
+    fn a_kernel_without_a_u64_zero_test_replays_nothing_and_stays_unguarded() {
+        let f = analyze(&kernel(&ng(&[&NG_STORE]), NG_ARGS), Arch::Gfx1201);
+        assert!(f.args.iter().all(|a| !a.null_guarded));
+    }
+
+    #[test]
+    fn non_commutative_atomics_record_their_mnemonics() {
+        let swap = [0xee0cc004, 0x00900002, 0x00000000];
+        let cmpswap = [0xee0d0004, 0x00900002, 0x00000000];
+        let add = [0xee0d4004, 0x00800000, 0x00000000];
+        let ops = |words: &[u32]| -> Vec<Option<String>> {
+            let f = analyze(&kernel(words, NG_ARGS), Arch::Gfx1201);
+            assert_eq!(f.status, KernelStatus::Proven, "{:?}", f.unresolved);
+            f.arg_at(8)
+                .expect("argument")
+                .accesses
+                .iter()
+                .map(|a| a.atomic_op.clone())
+                .collect()
+        };
+        assert_eq!(
+            ops(&ng(&[&swap, &cmpswap])),
+            [
+                Some("global_atomic_swap_b32".to_owned()),
+                Some("global_atomic_cmpswap_b32".to_owned())
+            ]
+        );
+        // A commutative atomic and a plain store record none.
+        assert_eq!(ops(&ng(&[&add, &NG_STORE])), [None, None]);
     }
 }

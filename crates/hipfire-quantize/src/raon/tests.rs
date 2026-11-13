@@ -980,6 +980,7 @@ fn public_cli_recipe_argv_reaches_raon_route_and_selects_qt44() {
         &args.format,
         args.mq4v2_symmetric,
         args.tier.as_deref(),
+        args.raon_attn_mq8,
     )
     .unwrap();
     assert!(s.qt44 > 0 && s.sidecars == s.qt44);
@@ -1001,6 +1002,7 @@ fn public_cli_recipe_argv_reaches_raon_route_and_selects_qt44() {
         &plain.format,
         plain.mq4v2_symmetric,
         plain.tier.as_deref(),
+        plain.raon_attn_mq8,
     )
     .unwrap_err();
     assert!(e.contains("--mq4v2-symmetric --tier xt"), "{e}");
@@ -1927,3 +1929,281 @@ fn partial_scope_swaps_only_its_class_and_is_described_and_verified() {
         assert!(e.contains("starts from a qt44"), "{e}");
     }
 }
+
+// ─── --raon-attn-mq8 (attention-class MQ8G256) ─────────────────────────────
+
+#[test]
+fn attn_mq8_class_selection_is_k_aligned_attention_projections_only() {
+    use Storage::*;
+    let l = "model.layers.3.self_attn.";
+    // Eligible and K % 256 == 0 -> MQ8G256 (RDA q/k/v/g/o, MLA q_a/kv_a/kv_b/g/o).
+    for p in [
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "g_proj",
+        "o_proj",
+        "q_a_proj",
+        "kv_a_proj_with_mqa",
+        "kv_b_proj",
+    ] {
+        let n = format!("{l}{p}.weight");
+        assert!(is_mq8_attn_class(&n), "{n}");
+        for k in [256, 512, 2560, 5120] {
+            assert_eq!(attn_mq8_storage(&n, k, Q8F16, true), Mq8G256, "{n} K{k}");
+        }
+        // K % 256 != 0 (and the option off) stay Q8F16.
+        assert_eq!(attn_mq8_storage(&n, 576, Q8F16, true), Q8F16, "{n} K576");
+        assert_eq!(attn_mq8_storage(&n, 2560, Q8F16, false), Q8F16, "{n} off");
+    }
+    // q_b (K 576) and the small RDA gate heads are never MQ8G256.
+    for p in ["q_b_proj", "f_a_proj", "f_b_proj", "b_proj", "rda_w_proj"] {
+        let n = format!("{l}{p}.weight");
+        assert!(!is_mq8_attn_class(&n), "{n}");
+        assert_eq!(attn_mq8_storage(&n, 2560, Q8F16, true), Q8F16, "{n}");
+    }
+    // Nothing outside attention changes class; non-Q8F16 bases are untouched.
+    for n in [
+        "model.embed_tokens.weight",
+        "lm_head.weight",
+        "model.layers.3.mlp.gate_proj.weight",
+        "model.layers.3.moe.shared_experts.up_proj.weight",
+        "model.layers.3.moe.experts.0.gate_proj.weight",
+        "model.layers.3.self_attn.q_conv1d.weight",
+    ] {
+        assert!(!is_mq8_attn_class(n), "{n}");
+        let base = classify(n).unwrap();
+        assert_eq!(attn_mq8_storage(n, 2560, base, true), base, "{n}");
+    }
+    assert_eq!(
+        attn_mq8_storage(&format!("{l}q_proj.weight"), 2560, Qt44, true),
+        Qt44
+    );
+}
+
+#[test]
+fn attn_mq8_recipe_string_and_default_are_distinct() {
+    assert_eq!(
+        RECIPE_MQ8_ATTN,
+        "raon-mq4v2-symmetric-qt44-experts-mq8g256-attn/v1"
+    );
+    assert_ne!(RECIPE, RECIPE_MQ8_ATTN);
+    assert_eq!(
+        recipe_with_shared(RECIPE_MQ8_ATTN, "q8f16"),
+        "raon-mq4v2-symmetric-qt44-experts-mq8g256-attn/v1+shared-ffn=q8f16"
+    );
+}
+
+#[test]
+fn attn_mq8_cli_flag_reaches_the_raon_route_only() {
+    use clap::{CommandFactory, FromArgMatches};
+    let dir = make_source(|_| {});
+    let parse = |extra: &[&str]| {
+        let mut argv = vec![
+            "hipfire-quantize",
+            "--input",
+            dir.path().to_str().unwrap(),
+            "--output",
+            "x.hfq",
+            "--format",
+            "mq4",
+            "--mq4v2-symmetric",
+            "--tier",
+            "xt",
+        ];
+        argv.extend_from_slice(extra);
+        let m = crate::cli::QuantizeArgs::command()
+            .try_get_matches_from(argv)
+            .unwrap();
+        let a = crate::cli::QuantizeArgs::from_arg_matches(&m).unwrap();
+        (m, a)
+    };
+    let (m, a) = parse(&["--raon-attn-mq8"]);
+    assert!(a.raon_attn_mq8);
+    assert_eq!(crate::pipeline::route_for(&a), crate::cli::Route::Raon);
+    crate::cli::reject_unreachable(&m, crate::cli::Route::Raon).unwrap();
+    assert!(!parse(&[]).1.raon_attn_mq8);
+}
+
+#[test]
+fn attn_mq8_artifact_selects_classes_records_recipe_and_leaves_the_rest_byte_identical() {
+    let dir = make_source(|_| {});
+    let base = dir.path().join("base.hfq");
+    let mq8 = dir.path().join("mq8.hfq");
+    let sb = run_cli(dir.path(), &base).unwrap();
+    let sm = run_cli_with(dir.path(), &mq8, true).unwrap();
+    assert_eq!(sb.qt44, sm.qt44);
+    assert_eq!(sb.sidecars, sm.sidecars);
+
+    let fb = RuntimeHfqFile::open_with_reap_plan(&base, None).unwrap();
+    let fm = RuntimeHfqFile::open_with_reap_plan(&mq8, None).unwrap();
+    let mb: serde_json::Value = serde_json::from_str(&fb.metadata_json).unwrap();
+    let mm: serde_json::Value = serde_json::from_str(&fm.metadata_json).unwrap();
+    assert_eq!(mb["hipfire_quant_recipe"], RECIPE);
+    assert!(
+        mb["hipfire_raon"].get("attn").is_none(),
+        "default metadata unchanged"
+    );
+    assert_eq!(mm["hipfire_quant_recipe"], RECIPE_MQ8_ATTN);
+    assert_eq!(mm["hipfire_raon"]["quant_recipe"], RECIPE_MQ8_ATTN);
+    assert_eq!(mm["hipfire_raon"]["attn"], "mq8g256");
+
+    assert_eq!(fb.tensors().len(), fm.tensors().len());
+    let src = SourceIndex::open(dir.path()).unwrap();
+    let signs1 = gen_fwht_signs(42, 256);
+    let signs2 = gen_fwht_signs(1042, 256);
+    let mut n_mq8 = 0;
+    for (a, b) in fb.tensors().iter().zip(fm.tensors()) {
+        assert_eq!(a.name, b.name);
+        let (da, db) = (
+            fb.tensor_data(&a.name).unwrap().1,
+            fm.tensor_data(&b.name).unwrap().1,
+        );
+        let k = a.shape.get(1).copied().unwrap_or(0) as usize;
+        if is_mq8_attn_class(&a.name) && k % 256 == 0 {
+            n_mq8 += 1;
+            assert_eq!((a.quant_type, b.quant_type), (3, 14), "{}", a.name);
+            assert_eq!((b.group_size, &b.shape), (256, &a.shape), "{}", a.name);
+            let rows = a.shape[0] as usize;
+            assert_eq!(db.len(), rows * (k / 256) * 258, "{}", a.name);
+            // Bit-exact vs the whole-tensor `quantize_mq8g256` of the BF16 source.
+            let (data, shape) = src.load_f32(&a.name).unwrap();
+            assert_eq!(shape, vec![rows, k]);
+            assert_eq!(
+                db,
+                quantize_mq8g256(&data, &signs1, &signs2).as_slice(),
+                "{}",
+                a.name
+            );
+        } else {
+            // Everything else (experts, FFN, q_b K96, gate heads, embed, head...) is
+            // byte-identical to the default artifact.
+            assert_eq!(
+                (a.quant_type, &a.shape, a.group_size),
+                (b.quant_type, &b.shape, b.group_size),
+                "{}",
+                a.name
+            );
+            assert_eq!(da, db, "{}", a.name);
+        }
+    }
+    // l0/l1 RDA q,k,v,g,o + l2 MLA q_a,kv_a,kv_b,g,o.
+    assert_eq!(n_mq8, 5 + 5 + 5);
+    for n in [
+        "model.layers.2.self_attn.q_b_proj.weight",
+        "model.layers.0.self_attn.f_b_proj.weight",
+        "model.layers.0.self_attn.f_a_proj.weight",
+    ] {
+        assert_eq!(fm.find_tensor_info(n).unwrap().quant_type, 3, "{n}");
+    }
+    for n in [
+        "model.layers.2.self_attn.kv_b_proj.weight",
+        "model.layers.1.self_attn.q_proj.weight",
+    ] {
+        assert_eq!(fm.find_tensor_info(n).unwrap().quant_type, 14, "{n}");
+    }
+    assert!(
+        !fm.tensors()
+            .iter()
+            .any(|t| t.name.contains("self_attn") && t.name.ends_with(".awq_scale.weight")),
+        "MQ8G256 attention carries no sidecar"
+    );
+    verify_artifact(&mq8, true).unwrap();
+}
+
+#[test]
+fn attn_mq8_verify_ties_attention_codec_to_the_recorded_recipe() {
+    let dir = make_source(|_| {});
+    let base = dir.path().join("base.hfq");
+    let mq8 = dir.path().join("mq8.hfq");
+    run_cli(dir.path(), &base).unwrap();
+    run_cli_with(dir.path(), &mq8, true).unwrap();
+    for (src, from, to) in [
+        (&mq8, RECIPE_MQ8_ATTN, RECIPE),
+        (&base, RECIPE, RECIPE_MQ8_ATTN),
+    ] {
+        let p = dir.path().join("tampered.hfq");
+        rewrite_hfq(
+            src,
+            &p,
+            RAON_ARCH_ID,
+            |t, bytes| Some((t.quant_type, bytes)),
+            |m| {
+                assert_eq!(m["hipfire_quant_recipe"], from);
+                m["hipfire_quant_recipe"] = to.into();
+                m["hipfire_raon"]["quant_recipe"] = to.into();
+            },
+        );
+        let e = verify_artifact(&p, true).unwrap_err();
+        assert!(e.contains("violates class"), "{e}");
+    }
+}
+
+#[test]
+fn attn_mq8_template_is_accepted_by_final_code_import() {
+    let dir = make_source(|_| {});
+    let control = dir.path().join("control.hfq");
+    run_cli_with(dir.path(), &control, true).unwrap();
+    let sha = crate::calibration::sha256_file_hex(&control).unwrap();
+    let f = RuntimeHfqFile::open_with_reap_plan(&control, None).unwrap();
+    let name = "model.layers.1.moe.experts.0.gate_proj.weight";
+    let (info, data) = f.tensor_data(name).unwrap();
+    let (m, k) = (info.shape[0] as usize, info.shape[1] as usize);
+    let mut grid = Vec::new();
+    let mut codes = Vec::new();
+    for g in data.chunks_exact(MQ4V2_GROUP_BYTES) {
+        grid.extend_from_slice(&g[..8]);
+        codes.extend_from_slice(&unpack_group_codes(g));
+    }
+    codes[3] = (codes[3] + 5) % 16;
+    let s: Vec<u8> = (0..k).flat_map(|_| f32_to_f16(1.0).to_le_bytes()).collect();
+    let packed = crate::quant_fwht::pack_mq4g256v2_from_f16_grid(m, k, &grid, &codes).unwrap();
+    let records_dir = dir.path().join("records");
+    std::fs::create_dir(&records_dir).unwrap();
+    let tensors = [
+        ("S_f16", TensorView::new(Dtype::F16, vec![k], &s).unwrap()),
+        (
+            "d_z_f16",
+            TensorView::new(Dtype::F16, vec![m, k / 256, 2, 2], &grid).unwrap(),
+        ),
+        (
+            "codes_u8",
+            TensorView::new(Dtype::U8, vec![m, k], &codes).unwrap(),
+        ),
+    ];
+    let metadata = HashMap::from([
+        ("name".to_string(), name.to_string()),
+        ("M".into(), m.to_string()),
+        ("K".into(), k.to_string()),
+        ("qt".into(), "44".to_string()),
+        ("source_sha".into(), sha),
+    ]);
+    serialize_to_file(tensors, Some(metadata), &records_dir.join("r0.safetensors")).unwrap();
+    let out = dir.path().join("imported.hfq");
+    crate::pipeline::export_mq4v2_final_codes(&control, &records_dir, &out).unwrap();
+    let g = RuntimeHfqFile::open_with_reap_plan(&out, None).unwrap();
+    assert_eq!(g.tensor_data(name).unwrap().1, packed.as_slice());
+    assert_eq!(f.metadata_json, g.metadata_json);
+    for t in f.tensors().iter().filter(|t| t.quant_type == 14) {
+        assert_eq!(
+            f.tensor_data(&t.name).unwrap().1,
+            g.tensor_data(&t.name).unwrap().1,
+            "{}",
+            t.name
+        );
+    }
+    verify_artifact(&out, false).unwrap();
+}
+
+/// Default output is byte-stable: golden digest of the tiny synthetic model.
+#[test]
+fn default_synthetic_artifact_digest_is_unchanged() {
+    let dir = make_source(|_| {});
+    let out = dir.path().join("raon.hfq");
+    run_cli(dir.path(), &out).unwrap();
+    let sha = crate::calibration::sha256_file_hex(&out).unwrap();
+    assert_eq!(sha, DEFAULT_SYNTHETIC_DIGEST);
+}
+
+const DEFAULT_SYNTHETIC_DIGEST: &str =
+    "7e11e8cb2c40d3fc7d133d23de98bcc7dcf2af11a3ba91d94ea87e11dfeba30c";

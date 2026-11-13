@@ -935,6 +935,11 @@ struct Rig {
     sessions: SessionTable,
     adm: AdmissionController,
     swap: SwapManager,
+    /// Host stream cursors (schema/recipe/phase/absolute position per LA layer)
+    /// of parked sessions. The swap store holds only tensor bytes; the cursors
+    /// must travel with them or a restored Open prefill would resume with the
+    /// wrong position. Keyed like `swap`; pruned when the session is gone.
+    parked_streams: std::collections::HashMap<u64, crate::qwen35::weights::GdnStreamImage>,
     stamp: SnapshotStamp,
     n_slots: usize,
     cap_tokens: usize,
@@ -1053,13 +1058,10 @@ fn cached_compile_schema(
     Ok(compiled)
 }
 
+/// Every device buffer a DeltaNet state owns (recurrence, scales, conv, EF and
+/// the persistent GDN carry), for byte accounting and ownership lists.
 fn dn_buffers(dn: &DeltaNetState) -> Vec<&GpuTensor> {
-    let mut v: Vec<&GpuTensor> = Vec::new();
-    v.extend(dn.s_matrices.iter());
-    v.extend(dn.s_scales.iter());
-    v.extend(dn.conv_states.iter());
-    v.extend(dn.s_ef_residual.iter());
-    v
+    dn.families().into_iter().flatten().collect()
 }
 
 /// Layer ordinal in an HFQ tensor name (`layers.<n>.…`, optionally behind a
@@ -1081,15 +1083,13 @@ pub(crate) fn tensor_layer_index(name: &str) -> Option<usize> {
 }
 
 /// Per-tier discriminant: K/V spans are stride-shaped, so a snapshot must
-/// never restore into a different KV tier. Preserve the historical tags.
+/// never restore into a different KV tier. Preserve the historical tags
+/// (21/31/41, the removed Givens asym tiers, stay retired).
 fn slot_snapshot_kv_tag(kv_mode: hipfire_runtime::kv_mode::KvMode) -> u32 {
     use hipfire_runtime::kv_mode::KvMode;
 
     match kv_mode {
         KvMode::Q8 => 1,
-        KvMode::Asym2 => 21,
-        KvMode::Asym3 => 31,
-        KvMode::Asym4 => 41,
         KvMode::Fwht2 => 22,
         KvMode::Fwht3 => 32,
         KvMode::Fwht4 => 42,
@@ -1971,30 +1971,15 @@ impl Rig {
                     .map_err(|e| format!("kv rotation table upload: {e}"))?;
                 Ok(t)
             };
-            let (cos, sin, s1, s2) = match kv_plan.givens_len {
-                Some(len) => {
-                    let (c, si) = KvCache::gen_givens_angles(42, len);
-                    (
-                        Some(upload_f32(gpu, &c)?),
-                        Some(upload_f32(gpu, &si)?),
-                        None,
-                        None,
-                    )
-                }
-                None => match kv_plan.fwht_len {
-                    Some(len) => (
-                        None,
-                        None,
-                        Some(upload_f32(gpu, &KvCache::gen_fwht_signs(42, len))?),
-                        Some(upload_f32(gpu, &KvCache::gen_fwht_signs(1042, len))?),
-                    ),
-                    None => (None, None, None, None),
-                },
+            let (s1, s2) = match kv_plan.fwht_len {
+                Some(len) => (
+                    Some(upload_f32(gpu, &KvCache::gen_fwht_signs(42, len))?),
+                    Some(upload_f32(gpu, &KvCache::gen_fwht_signs(1042, len))?),
+                ),
+                None => (None, None),
             };
             g.kv_tier = Some(crate::forward_slots::SlotKvTier {
                 mode: kv_mode,
-                givens_cos: cos,
-                givens_sin: sin,
                 fwht_signs1: s1,
                 fwht_signs2: s2,
             });
@@ -2441,7 +2426,7 @@ impl Rig {
                 },
                 arch_policy: ArchPolicy {
                     arch_tag: "qwen35-deltanet".to_string(),
-                    state_abi_tag: "dn-q8".to_string(),
+                    state_abi_tag: g.dn_states[0].stream.identity().state_abi_tag("dn-q8"),
                     position_attention_tag: "causal-mrope".to_string(),
                 },
                 kv_layout: KvLayout {
@@ -2549,6 +2534,7 @@ impl Rig {
             sessions: SessionTable::default(),
             adm,
             swap,
+            parked_streams: std::collections::HashMap::new(),
             stamp,
             n_slots: cfg.n_slots,
             cap_tokens: cfg.cap_tokens,
@@ -3832,11 +3818,21 @@ fn configure_slots_redline(
     // other arch the slots engine keeps the eager HIP route: gfx1151 never had
     // a slots tape, and arming one there is unvalidated.
     let slots_arch_supported = matches!(gpu.arch.as_str(), "gfx1100" | "gfx1201");
+    // Route identity is the same one the single-slot loader derives from the
+    // file (`route_sku::resolve_path`), so a `.mq4r`/`.mq4rs` slots load gets
+    // the same `.mq4r` policy; an unresolvable route yields `None`, which is
+    // the "do not auto-arm" direction.
+    let route_sku =
+        hipfire_runtime::route_sku::resolve_path(std::path::Path::new(path.as_ref()), None)
+            .ok()
+            .flatten()
+            .map(|route| route.sku);
     let redline_default = slots_arch_supported
         && hipfire_runtime::config::retained_redline_default(
             &gpu.arch,
             arch,
             &path,
+            route_sku,
             1,
             1,
             1,
@@ -5515,7 +5511,7 @@ fn run_loop(
                         })
                     {
                         // Legacy DFlash owns context-indexed draft buffers capped by
-                        // HIPFIRE_DFLASH_CTX_CAP. Past the cap the documented policy
+                        // DEFAULT_DFLASH_CTX_CAP. Past the cap the documented policy
                         // is plain AR fallback, not an out-of-bounds scatter/assert.
                         work[s].spec = SpecKind::None;
                         if let Some(last) = work[s].remaining_prompt.last().copied() {
@@ -8900,6 +8896,7 @@ fn evict(rig: &mut Rig, victim: SessionId, stats: &Arc<Mutex<EngineStats>>) -> b
     let Some(slot) = sess.slot else { return false };
     let tokens = sess.tokens.clone();
 
+    let stream_image = rig.model.dn_states[slot.0].stream.image();
     let dn_refs = dn_buffers(&rig.model.dn_states[slot.0]);
     let snap = if let Some(store) = rig.model.vmm.as_ref() {
         // VMM slots from the owner's flat mapped prefix; the descriptor's
@@ -8940,6 +8937,10 @@ fn evict(rig: &mut Rig, victim: SessionId, stats: &Arc<Mutex<EngineStats>>) -> b
             }
             match rig.swap.park(victim.0, snap) {
                 Ok(()) => {
+                    rig.parked_streams.insert(victim.0, stream_image);
+                    let sessions = &rig.sessions;
+                    rig.parked_streams
+                        .retain(|key, _| sessions.get(SessionId(*key)).is_some());
                     rig.sessions
                         .mark_swapped(&mut rig.pool, &mut rig.adm, victim);
                     true
@@ -8988,6 +8989,7 @@ fn restore(rig: &mut Rig, id: SessionId, slot: SlotId, stats: &Arc<Mutex<EngineS
             ),
         );
         rig.swap.forget(id.0);
+        rig.parked_streams.remove(&id.0);
         rig.sessions.mark_cold(&mut rig.pool, &mut rig.adm, id);
         lock_stats(stats).note_swap(&rig.swap);
         return false;
@@ -9056,6 +9058,16 @@ fn restore(rig: &mut Rig, id: SessionId, slot: SlotId, stats: &Arc<Mutex<EngineS
                     .map_err(|e| SwapError::Gpu(e.to_string())),
                 Err(e) => Err(e),
             };
+            // The cursors parked with the tensors; a missing or mismatching
+            // image fails closed to Cold below (never a guessed position).
+            let stream_applied: Result<(), String> = match rig.parked_streams.remove(&id.0) {
+                Some(image) if r.is_ok() => rig.model.dn_states[slot.0]
+                    .stream
+                    .apply_image(&image)
+                    .map_err(|e| e.to_string()),
+                Some(_) => Ok(()),
+                None => Err("no parked GDN stream cursors for session".to_string()),
+            };
             // MTP head KV is per-generation, not per-session. Reset it so
             // the restored session starts a fresh MTP prefill.
             if let Some(state) = rig.model.mtp_states[slot.0].as_mut() {
@@ -9066,6 +9078,7 @@ fn restore(rig: &mut Rig, id: SessionId, slot: SlotId, stats: &Arc<Mutex<EngineS
             if let Some(st) = rig.model.dflash_states[slot.0].take() {
                 st.free_gpu(&mut rig.gpu);
             }
+            let r = r.map_err(|e| e.to_string()).and_then(|()| stream_applied);
             match r {
                 Ok(()) => {
                     if rig.gpu.slot_trace() {
@@ -9106,6 +9119,7 @@ fn restore(rig: &mut Rig, id: SessionId, slot: SlotId, stats: &Arc<Mutex<EngineS
                     id.0
                 ),
             );
+            rig.parked_streams.remove(&id.0);
             rig.sessions.mark_cold(&mut rig.pool, &mut rig.adm, id);
             lock_stats(stats).note_swap(&rig.swap);
             false
@@ -9178,10 +9192,12 @@ mod tests {
         assert!(both.paged_vmm);
         assert_eq!(both.paged_pages, Some(0));
 
-        // `--kv-backend vmm` alone is that pool, not a per-slot owner.
-        let from_kv = resolve_slot_kv_storage(true, false, false, None, false, false).unwrap();
-        assert!(from_kv.paged_vmm);
-        assert_eq!(from_kv.paged_pages, Some(0));
+        // `--kv-backend vmm` alone is NOT an opt-in: the request must name the
+        // shared pool (`serve.multi_slot_paged`) or the load is refused, so an
+        // alias written for a per-slot route never lands on a different cache.
+        let from_kv = resolve_slot_kv_storage(true, false, false, None, false, false)
+            .expect_err("bare kv_backend=vmm must be refused");
+        assert!(from_kv.contains("multi_slot_paged"), "{from_kv}");
 
         // The paged-backend spelling is the same pool.
         let from_paged =
@@ -9218,11 +9234,26 @@ mod tests {
         // `configure_slots_redline`).
         assert_eq!(slots_model_arch(6), "qwen3_5_moe");
         let path = std::path::Path::new("model.mq4r");
+        // 0.5.0 keys the automatic default on the model's RESOLVED route SKU,
+        // never on the file name; `configure_slots_redline` passes the same
+        // `route_sku::resolve_path` identity the sequential loader derives.
         for arch in ["qwen3_5", slots_model_arch(6)] {
             assert!(hipfire_runtime::config::retained_redline_default(
                 "gfx1100",
                 arch,
                 path.to_str().unwrap(),
+                Some(hipfire_runtime::route_sku::RouteSku::Mq4r),
+                1,
+                1,
+                1,
+                false
+            ));
+            // The same `.mq4r` name with no resolved SKU keeps the HIP graph.
+            assert!(!hipfire_runtime::config::retained_redline_default(
+                "gfx1100",
+                arch,
+                path.to_str().unwrap(),
+                None,
                 1,
                 1,
                 1,
@@ -9235,6 +9266,7 @@ mod tests {
             "gfx1100",
             "qwen3_5_moe",
             "model.hfq",
+            None,
             1,
             1,
             1,
@@ -9244,6 +9276,7 @@ mod tests {
             "gfx1100",
             "qwen3_5_moe",
             "model.mq4r",
+            None,
             1,
             1,
             2,
@@ -9338,9 +9371,6 @@ mod tests {
 
         let tags = [
             (KvMode::Q8, 1),
-            (KvMode::Asym2, 21),
-            (KvMode::Asym3, 31),
-            (KvMode::Asym4, 41),
             (KvMode::Fwht2, 22),
             (KvMode::Fwht3, 32),
             (KvMode::Fwht4, 42),

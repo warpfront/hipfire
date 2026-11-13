@@ -13,15 +13,18 @@
 //! `0` = MQ4 symmetric, `1` = MQ3-I4 (W3), `3` = E8P-I4. `2` (MQ2-I4, W2) is
 //! refused on every architecture.
 //!
-//! | arch    | MQ4 (0) | W3 (1) | W2 (2) | E8P (3)                                  |
-//! |---------|---------|--------|--------|------------------------------------------|
-//! | gfx1201 | yes     | yes    | no     | yes                                      |
-//! | gfx1151 | yes     | yes    | no     | yes ([`SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED`]) |
-//! | gfx1100 | yes     | no     | no     | yes                                      |
-//! | other   | no      | no     | no     | no                                       |
+//! | arch    | MQ4 (0) | W3 (1)                  | W2 (2) | E8P (3)                                  |
+//! |---------|---------|-------------------------|--------|------------------------------------------|
+//! | gfx1201 | yes     | yes                     | no     | yes                                      |
+//! | gfx1151 | yes     | yes                     | no     | yes ([`SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED`]) |
+//! | gfx1100 | yes     | decode only (K1, no K2) | no     | yes                                      |
+//! | other   | no      | no                      | no     | no                                       |
 //!
-//! gfx1100 serves MQ4-only layers (no cold bucket) and MQ4 + E8P layers; W3 is
-//! refused there (no gfx1100 W3 kernels). gfx1151 serves MQ4-only, MQ4 + W3 and
+//! "yes" is the DECODE admission ([`qwen4_slab_codec_admitted`], the K1 cell); the PREFILL
+//! admission ([`qwen4_slab_codec_prefill_admitted`], the K2 cell) is the same table except gfx1100
+//! W3. A layer holding a decode-only codec loads and decodes; the forward then tiles every
+//! prompt at the K1 width. gfx1100 serves MQ4-only layers (no cold bucket), MQ4 + E8P layers and
+//! MQ4 + W3 decode-only layers. gfx1151 serves MQ4-only, MQ4 + W3 and
 //! MQ4 + E8P layers; its E8P kernels (`e8p_i4_moe_gemv_pm_gfx1151`,
 //! `qwen4_moe_iu4_sym_e8p_pm_gfx1151`) are the gfx1100 arm re-emitted for gfx1151, admitted
 //! through the one receipts constant [`SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED`] (every
@@ -65,19 +68,23 @@ pub const SLAB_CODEC_E8P: u8 = 3;
 /// gfx1100 and gfx1201 E8P never read it.
 pub const SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED: bool = true;
 
-/// Whether the sealed expert-slab route serves slab codec byte `codec` on GPU architecture
-/// `arch`: the codec-byte projection of [`crate::expert_capabilities::slab_serves_codec`] (the
-/// ONE capability table, derived from the raw kernel inventory minus its named holds). Exact
-/// architecture names only: no family prefix match. gfx1151 E8P follows
-/// [`SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED`].
+/// Whether the sealed expert-slab route LOADS and DECODES slab codec byte `codec` on GPU
+/// architecture `arch`: the codec-byte projection of
+/// [`crate::expert_capabilities::slab_decodes_codec`] (the ONE capability table, derived from the
+/// raw kernel inventory minus its named holds; the K1 decode cell). Exact architecture names
+/// only: no family prefix match. gfx1151 E8P follows [`SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED`].
+///
+/// A codec that decodes but does not prefill ([`qwen4_slab_codec_prefill_admitted`]) is a
+/// decode-only cell: its layers load, decode and verify windows of at most
+/// [`crate::Gpu::few_row_limit`] rows, and never lower the K2 prefill kernels.
 pub fn qwen4_slab_codec_admitted(arch: &str, codec: u8) -> bool {
-    crate::expert_capabilities::slab_serves_codec(arch, codec)
+    crate::expert_capabilities::slab_decodes_codec(arch, codec)
 }
 
 /// [`qwen4_slab_codec_admitted`] with the gfx1151 E8P receipts decision given explicitly: the
 /// pure table, so both states of [`SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED`] are testable.
 pub fn qwen4_slab_codec_admitted_with(arch: &str, codec: u8, gfx1151_e8p_landed: bool) -> bool {
-    crate::expert_capabilities::slab_serves_codec_with(
+    crate::expert_capabilities::slab_decodes_codec_with(
         arch,
         codec,
         &crate::expert_capabilities::Holds {
@@ -85,6 +92,21 @@ pub fn qwen4_slab_codec_admitted_with(arch: &str, codec: u8, gfx1151_e8p_landed:
             ..crate::expert_capabilities::Holds::BETA
         },
     )
+}
+
+/// Whether the sealed expert-slab route PREFILLS slab codec byte `codec` on `arch`: the K2
+/// grouped GEMMs of the codec are admitted ([`crate::expert_capabilities::slab_prefills_codec`]).
+/// A layer whose codecs all prefill serves windows of any width; a layer holding a codec that
+/// does not is decode-width only ([`qwen4_slab_layer_prefills`]).
+pub fn qwen4_slab_codec_prefill_admitted(arch: &str, codec: u8) -> bool {
+    crate::expert_capabilities::slab_prefills_codec(arch, codec)
+}
+
+/// Whether every codec byte in `codecs` prefills on `arch` (an empty layer trivially does).
+pub fn qwen4_slab_layer_prefills(arch: &str, codecs: &[u8]) -> bool {
+    codecs
+        .iter()
+        .all(|&codec| qwen4_slab_codec_prefill_admitted(arch, codec))
 }
 
 /// The cold codec a layer without cold experts (all MQ4) is launched with on
@@ -182,7 +204,7 @@ mod tests {
         // receipts switch, every other cell is independent of it.
         for landed in [false, true] {
             let expected: [(&str, [bool; 5]); 5] = [
-                ("gfx1100", [true, false, false, true, false]),
+                ("gfx1100", [true, true, false, true, false]),
                 ("gfx1201", [true, true, false, true, false]),
                 ("gfx1151", [true, true, false, landed, false]),
                 ("gfx942", [false; 5]),
@@ -260,20 +282,23 @@ mod tests {
                 second: e8p
             })
         );
-        // gfx1100 serves E8P but no W3 (a layer with E8P alone or next to MQ4 is fine);
-        // W2 is nowhere; unknown arches serve nothing.
+        // gfx1100 serves E8P and (decode-only) W3: a layer with either next to MQ4 is fine, and
+        // one holding both is the two-cold-codecs refusal. W2 is nowhere; unknown arches serve
+        // nothing.
         assert_eq!(
             qwen4_slab_layer_cold_codec("gfx1100", &[mq4, e8p, mq4]),
             Ok(e8p)
         );
         assert_eq!(qwen4_slab_layer_cold_codec("gfx1100", &[e8p, e8p]), Ok(e8p));
-        assert_eq!(
-            qwen4_slab_layer_cold_codec("gfx1100", &[mq4, w3]),
-            Err(SlabLayerCodecError::NotAdmitted { codec: w3 })
-        );
-        // Mixed W3+E8P on gfx1100 is refused (W3 is not admitted there at all).
-        assert!(qwen4_slab_layer_cold_codec("gfx1100", &[mq4, w3, e8p]).is_err());
-        assert!(qwen4_slab_layer_cold_codec("gfx1100", &[mq4, e8p, w3]).is_err());
+        assert_eq!(qwen4_slab_layer_cold_codec("gfx1100", &[mq4, w3]), Ok(w3));
+        assert!(matches!(
+            qwen4_slab_layer_cold_codec("gfx1100", &[mq4, w3, e8p]),
+            Err(SlabLayerCodecError::MixedCold { .. })
+        ));
+        assert!(matches!(
+            qwen4_slab_layer_cold_codec("gfx1100", &[mq4, e8p, w3]),
+            Err(SlabLayerCodecError::MixedCold { .. })
+        ));
         for arch in ["gfx1100", "gfx1201"] {
             assert_eq!(
                 qwen4_slab_layer_cold_codec(arch, &[mq4, w2]),
@@ -349,11 +374,11 @@ mod tests {
     fn merged_slab_admission_matrix_preserves_certified_arch_pairs() {
         let (mq4, w3, w2, e8p) = (SLAB_CODEC_MQ4, SLAB_CODEC_W3, 2u8, SLAB_CODEC_E8P);
         // Full final matrix over codecs 0, 1, 2, 3 and an unknown byte, for both states of the
-        // gfx1151 E8P receipts switch: gfx1100 {0,3}, gfx1201 {0,1,3}, gfx1151 {0,1} or
-        // {0,1,3}; W2 nowhere. Only the gfx1151 E8P cell reads the switch.
+        // gfx1151 E8P receipts switch: gfx1100 {0,1,3} (W3 decode-only), gfx1201 {0,1,3},
+        // gfx1151 {0,1} or {0,1,3}; W2 nowhere. Only the gfx1151 E8P cell reads the switch.
         for landed in [false, true] {
             let matrix: [(&str, [bool; 5]); 3] = [
-                ("gfx1100", [true, false, false, true, false]),
+                ("gfx1100", [true, true, false, true, false]),
                 ("gfx1151", [true, true, false, landed, false]),
                 ("gfx1201", [true, true, false, true, false]),
             ];
@@ -420,9 +445,14 @@ mod tests {
                 second: e8p
             })
         );
+        // gfx1100 serves both W3 (decode-only) and E8P, so a layer holding both is the
+        // two-cold-codecs refusal there as well.
         assert_eq!(
             qwen4_slab_layer_cold_codec("gfx1100", &[e8p, w3]),
-            Err(SlabLayerCodecError::NotAdmitted { codec: w3 })
+            Err(SlabLayerCodecError::MixedCold {
+                first: e8p,
+                second: w3
+            })
         );
         // Unknown and near-miss architecture names serve nothing and have no default cold codec.
         for arch in [
@@ -469,5 +499,40 @@ mod tests {
         for arch in ["gfx1100", "gfx1201"] {
             assert!(qwen4_slab_codec_admitted(arch, SLAB_CODEC_E8P), "{arch}");
         }
+    }
+
+    /// Decode (K1) and prefill (K2) admission are separate cells: gfx1100 W3 has a K1 and no K2
+    /// (the decode-only tier cell), every other admitted cell has both, and a codec never
+    /// prefills without decoding.
+    #[test]
+    fn prefill_admission_is_a_subset_of_decode_admission() {
+        let (mq4, w3, w2, e8p) = (SLAB_CODEC_MQ4, SLAB_CODEC_W3, 2u8, SLAB_CODEC_E8P);
+        let landed = SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED;
+        let matrix: [(&str, [bool; 5]); 4] = [
+            ("gfx1100", [true, true, false, true, false]),
+            ("gfx1201", [true, true, false, true, false]),
+            ("gfx1151", [true, true, false, landed, false]),
+            ("gfx942", [false; 5]),
+        ];
+        for (arch, row) in matrix {
+            for (codec, want) in [0u8, 1, 2, 3, 255].into_iter().zip(row) {
+                assert_eq!(
+                    qwen4_slab_codec_prefill_admitted(arch, codec),
+                    want,
+                    "{arch} codec {codec} prefill"
+                );
+                if want {
+                    assert!(qwen4_slab_codec_admitted(arch, codec), "{arch} {codec}");
+                }
+            }
+        }
+        // gfx1100 W3 has both K1 and K2 now (the MQ3 tier): it decodes and prefills.
+        assert!(qwen4_slab_codec_admitted("gfx1100", w3));
+        assert!(qwen4_slab_codec_prefill_admitted("gfx1100", w3));
+        assert!(qwen4_slab_layer_prefills("gfx1100", &[mq4, e8p]));
+        assert!(qwen4_slab_layer_prefills("gfx1100", &[mq4, w3, mq4]));
+        assert!(qwen4_slab_layer_prefills("gfx1201", &[mq4, w3, mq4]));
+        assert!(qwen4_slab_layer_prefills("gfx1100", &[]));
+        assert!(!qwen4_slab_layer_prefills("gfx1100", &[mq4, w2]));
     }
 }

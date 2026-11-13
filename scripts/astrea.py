@@ -48,8 +48,6 @@ GGUF_SUMMARY_SCHEMA = "hipfire.astrea.gguf_summary.v0"
 HFQ_SUMMARY_SCHEMA = "hipfire.astrea.hfq_summary.v0"
 IMATRIX_HFQ_JOIN_SCHEMA = "hipfire.astrea.imatrix_hfq_join.v0"
 SAFETENSORS_SUMMARY_SCHEMA = "hipfire.astrea.safetensors_summary.v0"
-PARO_PROBE_SCHEMA = "hipfire.astrea.paro_probe.v0"
-PARO_IMPORT_SCHEMA = "hipfire.astrea.paro_import.v0"
 
 SUPPORTED_FORMATS = {
     "mq3",
@@ -59,7 +57,6 @@ SUPPORTED_FORMATS = {
     "hfq6",
     "hfp4",
     "mfp4",
-    "paro4",
     "q8",
     "f16",
 }
@@ -77,7 +74,6 @@ SUPPORTED_METHODS = {
     "kmap",
     "fwht",
     "quarot",
-    "paroquant",
     "roundtrip-eval",
     "gptq-probe",
     "awq-probe",
@@ -112,7 +108,6 @@ DEFAULT_METHOD_STAGE = {
     "imatrix-kmap": "promotion",
     "fwht": "transform",
     "quarot": "transform",
-    "paroquant": "transform",
     "roundtrip-eval": "eval",
     "moe-probe": "probe",
     "model-ingress": "ingress",
@@ -134,11 +129,9 @@ SUPPORTED_POLICY_DOMAINS = {
 SUPPORTED_KV_MODES = {
     "fp16",
     "q8",
-    "asym2",
-    "asym3",
-    "asym4",
-    "triattn",
-    "cask",
+    "fwht2",
+    "fwht3",
+    "fwht4",
     "turbo",
     "turbo2",
     "turbo3",
@@ -150,9 +143,7 @@ SUPPORTED_KV_MODES = {
 
 SUPPORTED_BUNDLE_INCLUDES = {
     "weights",
-    "paro",
     "kv-policy",
-    "triattn",
     "evidence",
 }
 
@@ -210,8 +201,8 @@ HFQ_QUANT_TYPE_NAMES = {
     21: "HFP4G32",
     22: "TidI32",
     24: "MFP4G32",
-    28: "PARO4G128",
-    29: "PARO4G128T",
+    28: "removed",
+    29: "removed",
     30: "MQ4G256_LLOYD",
     31: "MQ5G256",
     32: "MFP4G32_LLOYD",
@@ -3063,8 +3054,8 @@ def build_policy_probe_plan(objectives, ingress):
         ]
     if "kv-policy" in objectives:
         plan["kv_policy"] = [
-            "treat asym3 as the current quality/perf baseline",
-            "profile q8, asym2, asym3, asym4, TriAttention/CASK, and turbo/rotor research modes separately",
+            "treat q8 as the current quality/perf baseline",
+            "profile q8, fwht2, fwht3, fwht4, and turbo/rotor research modes separately",
             "score AR and DFlash independently because eviction and speculative decode have different failure modes",
             "package persistent KV calibration data inside the HFQ model artifact before promotion",
         ]
@@ -3073,18 +3064,10 @@ def build_policy_probe_plan(objectives, ingress):
 
 def build_weight_transform_plan(methods):
     plan = {}
-    if "paroquant" in methods:
-        plan["paroquant"] = {
-            "status": "planned",
-            "transform": "channel-wise scaling plus independent pairwise Givens rotations",
-            "first_probe": "optimize a single layer or small model in PyTorch, then compare KLD/PPL before any runtime mutation",
-            "runtime_requirement": "fused inverse transform plus quant matvec kernel must pass Atlas AR/DFlash perf gates",
-            "package_section": "transform.paro",
-        }
     if "quarot" in methods:
         plan["quarot"] = {
             "status": "candidate",
-            "transform": "orthogonal rotation baseline for comparison against ParoQuant",
+            "transform": "orthogonal rotation baseline for comparison",
             "package_section": "transform.quarot",
         }
     return plan
@@ -3278,18 +3261,7 @@ def build_policy(
     }
 
 
-def triattn_summary(path):
-    item = file_summary(path)
-    if item and item["is_file"]:
-        try:
-            with Path(path).open("rb") as f:
-                item["magic"] = f.read(4).decode("ascii", errors="replace")
-        except Exception as exc:
-            item["read_error"] = str(exc)
-    return item
-
-
-def describe_kv_mode(mode, *, triattn=None):
+def describe_kv_mode(mode):
     mode = mode.lower()
     if mode not in SUPPORTED_KV_MODES:
         raise ValueError(f"unsupported KV mode: {mode}")
@@ -3307,30 +3279,13 @@ def describe_kv_mode(mode, *, triattn=None):
             "persistent_artifact": False,
             "notes": ["byte-stable higher-precision KV reference path"],
         }
-    if mode in {"asym2", "asym3", "asym4"}:
+    if mode in {"fwht2", "fwht3", "fwht4"}:
         bits = mode[-1]
         return {
-            "family": "asym_rotated",
+            "family": "fwht_rotated",
             "status": "implemented",
             "persistent_artifact": False,
             "notes": [f"rotated K at {bits} bits with V stored as Q8_0"],
-        }
-    if mode == "triattn":
-        exists = bool(triattn and triattn.get("exists"))
-        return {
-            "family": "triattention",
-            "status": "implemented" if exists else "needs_calibration_artifact",
-            "persistent_artifact": True,
-            "package_section": "triattn.centers",
-            "notes": ["drop-eviction policy; package centers inside the model artifact before promotion"],
-        }
-    if mode == "cask":
-        return {
-            "family": "triattention",
-            "status": "implemented_guarded",
-            "persistent_artifact": True,
-            "package_section": "triattn.centers",
-            "notes": ["m-folding policy has known DFlash and A3B hazards; require explicit gates"],
         }
     if mode.startswith("turbo"):
         return {
@@ -3353,21 +3308,19 @@ def build_kv_profile(
     *,
     model,
     modes=None,
-    triattn=None,
     model_family=None,
     profile_id=None,
     engine_root=None,
 ):
-    modes = modes or ["q8", "asym3", "triattn", "turbo3", "rotor"]
+    modes = modes or ["q8", "fwht3", "turbo3", "rotor"]
     validate_values(modes, SUPPORTED_KV_MODES, "KV mode")
-    triattn_info = triattn_summary(triattn)
     hfq = summarize_hfq(model) if model and Path(model).is_file() else None
     mode_map = {
-        mode: describe_kv_mode(mode, triattn=triattn_info)
+        mode: describe_kv_mode(mode)
         for mode in modes
     }
-    if "asym3" not in mode_map:
-        mode_map["asym3"] = describe_kv_mode("asym3", triattn=triattn_info)
+    if "fwht3" not in mode_map:
+        mode_map["fwht3"] = describe_kv_mode("fwht3")
     model_name = Path(model).name.replace(".", "-").replace("/", "-")
     return {
         "schema": KV_PROFILE_SCHEMA,
@@ -3383,13 +3336,11 @@ def build_kv_profile(
             "quant_type_counts": hfq["quant_type_counts"],
             "tensor_names_md5": hfq["tensor_names_md5"],
         } if hfq else None,
-        "baseline_mode": "asym3",
+        "baseline_mode": "fwht3",
         "modes": mode_map,
-        "triattn": triattn_info,
         "quality_gates": [
             "Collect AR KLD/PPL and long-context recall for each KV mode.",
             "Collect DFlash KLD/PPL, tau, and decoded-output checks separately from AR.",
-            "Reject CASK m-folding on DFlash or A3B unless the dedicated coherence and recall gates pass.",
         ],
         "atlas_bridge": {
             "emit_rows": True,
@@ -3397,7 +3348,6 @@ def build_kv_profile(
         },
         "package_target": {
             "external_sidecars": False,
-            "triattn_section": "triattn.centers",
             "kv_policy_section": "kv.policy",
         },
         "next_step": "run Atlas AR/DFlash rows for implemented modes; keep turbo/rotor as research candidates until kernels exist",
@@ -3409,7 +3359,6 @@ def build_bundle_plan(
     model,
     output,
     include=None,
-    triattn=None,
     policy_id=None,
     bundle_id=None,
 ):
@@ -3428,26 +3377,12 @@ def build_bundle_plan(
             "source": file_summary(model),
             "description": "existing HFQ tensor index and contiguous tensor payloads",
         }
-    if "paro" in include:
-        sections["transform.paro"] = {
-            "required": False,
-            "policy_id": policy_id,
-            "description": "ParoQuant channel scales and independent pairwise rotation parameters",
-            "runtime_status": "deferred_until_loader_and_fused_kernel_exist",
-        }
     if "kv-policy" in include:
         sections["kv.policy"] = {
             "required": False,
             "policy_id": policy_id,
             "description": "selected KV mode, safety gates, profile provenance, and runtime constraints",
             "runtime_status": "deferred_until_loader_policy_dispatch_exists",
-        }
-    if "triattn" in include:
-        sections["triattn.centers"] = {
-            "required": False,
-            "source": triattn_summary(triattn),
-            "description": "TriAttention band centers embedded in the model package instead of stored as a loose sidecar",
-            "runtime_status": "deferred_until_loader_embedded_tria_read_exists",
         }
     if "evidence" in include:
         sections["evidence.summary"] = {
@@ -3474,7 +3409,6 @@ def build_bundle_plan(
         "deferred_runtime_work": [
             "loader must parse and validate the package section table",
             "runtime must reject transform or KV policy sections when required kernels are unavailable",
-            "CLI pull/run should prefer embedded triattn.centers over loose .triattn.bin files",
             "Atlas must record AR and DFlash perf rows before package promotion",
         ],
         "next_step": "treat this as a package contract artifact; do not write a packaged model until loader support exists",
@@ -3508,63 +3442,6 @@ def build_report(paths):
         "metric_verdicts": [item.get("verdict") for item in metric_items],
         "recommendation": recommendation,
     }
-
-
-def load_paroquant_import_module():
-    import importlib.util
-
-    script_path = Path(__file__).with_name("paroquant_import.py")
-    spec = importlib.util.spec_from_file_location("hipfire_paroquant_import", script_path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"could not load {script_path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def load_paroquant_oracle_module():
-    import importlib.util
-
-    script_path = Path(__file__).with_name("paroquant_oracle.py")
-    spec = importlib.util.spec_from_file_location("hipfire_paroquant_oracle", script_path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"could not load {script_path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def paro_probe_model(model, *, local_only=False, max_modules=None):
-    module = load_paroquant_import_module()
-    return module.probe_model(model, local_only=local_only, max_modules=max_modules)
-
-
-def paro_import_model(model, output, *, local_only=False, max_modules=None, layout="native", copy_floats="f16"):
-    module = load_paroquant_import_module()
-    return module.import_model(
-        model,
-        output,
-        local_only=local_only,
-        max_modules=max_modules,
-        layout=layout,
-        copy_floats=copy_floats,
-    )
-
-
-def paro_oracle_model(source, hfq, *, module_name=None, local_only=False, samples=2, seed=1234, input_scale=0.125, atol=0.0):
-    module = load_paroquant_oracle_module()
-    args = argparse.Namespace(
-        source=source,
-        hfq=hfq,
-        module=module_name,
-        local_only=local_only,
-        samples=samples,
-        seed=seed,
-        input_scale=input_scale,
-        atol=atol,
-        pretty=False,
-    )
-    return module.run_oracle(args)
 
 
 def build_parser():
@@ -3669,7 +3546,6 @@ def build_parser():
     kv_profile = sub.add_parser("kv-profile", help="Emit a KV cache policy/profile artifact.")
     kv_profile.add_argument("--model", required=True)
     kv_profile.add_argument("--mode", dest="modes", action="append", default=[])
-    kv_profile.add_argument("--triattn")
     kv_profile.add_argument("--model-family")
     kv_profile.add_argument("--engine-root")
     kv_profile.add_argument("--profile-id")
@@ -3680,40 +3556,10 @@ def build_parser():
     bundle_plan.add_argument("--model", required=True)
     bundle_plan.add_argument("--output", required=True)
     bundle_plan.add_argument("--include", dest="include", action="append", default=[])
-    bundle_plan.add_argument("--triattn")
     bundle_plan.add_argument("--policy-id")
     bundle_plan.add_argument("--bundle-id")
     bundle_plan.add_argument("--pretty", action="store_true")
     bundle_plan.add_argument("--out", help="Write JSON to this path instead of stdout.")
-
-    paro_probe = sub.add_parser("paro-probe", help="Inspect a ParoQuant checkpoint and runtime contract.")
-    paro_probe.add_argument("--model", required=True)
-    paro_probe.add_argument("--local-only", action="store_true")
-    paro_probe.add_argument("--max-modules", type=int)
-    paro_probe.add_argument("--pretty", action="store_true")
-    paro_probe.add_argument("--out", help="Write JSON to this path instead of stdout.")
-
-    paro_import = sub.add_parser("paro-import", help="Write a runtime-loadable PARO4G128 HFQ model.")
-    paro_import.add_argument("--model", required=True)
-    paro_import.add_argument("--output", required=True)
-    paro_import.add_argument("--local-only", action="store_true")
-    paro_import.add_argument("--max-modules", type=int)
-    paro_import.add_argument("--layout", choices=("native", "engine"), default="native")
-    paro_import.add_argument("--copy-floats", choices=("f16", "q8"), default="f16")
-    paro_import.add_argument("--pretty", action="store_true")
-    paro_import.add_argument("--out", help="Write JSON to this path instead of stdout.")
-
-    paro_oracle = sub.add_parser("paro-oracle", help="Compare PARO4G128 HFQ bytes against a PyTorch Paro decode oracle.")
-    paro_oracle.add_argument("--source", required=True, help="ParoQuant safetensors directory or HuggingFace repo id.")
-    paro_oracle.add_argument("--hfq", required=True, help="HFQ file produced by astrea paro-import.")
-    paro_oracle.add_argument("--module", dest="module_name", help="Paro module base name; defaults to the first complete module.")
-    paro_oracle.add_argument("--local-only", action="store_true")
-    paro_oracle.add_argument("--samples", type=int, default=2)
-    paro_oracle.add_argument("--seed", type=int, default=1234)
-    paro_oracle.add_argument("--input-scale", type=float, default=0.125)
-    paro_oracle.add_argument("--atol", type=float, default=0.0)
-    paro_oracle.add_argument("--pretty", action="store_true")
-    paro_oracle.add_argument("--out", help="Write JSON to this path instead of stdout.")
 
     report = sub.add_parser("report", help="Summarize Astrea JSON artifacts.")
     report.add_argument("artifacts", nargs="+")
@@ -3831,7 +3677,6 @@ def run(argv=None):
             build_kv_profile(
                 model=args.model,
                 modes=args.modes or None,
-                triattn=args.triattn,
                 model_family=args.model_family,
                 profile_id=args.profile_id,
                 engine_root=args.engine_root,
@@ -3845,47 +3690,8 @@ def run(argv=None):
                 model=args.model,
                 output=args.output,
                 include=args.include or None,
-                triattn=args.triattn,
                 policy_id=args.policy_id,
                 bundle_id=args.bundle_id,
-            ),
-            pretty=args.pretty,
-            out=args.out,
-        )
-    elif args.command == "paro-probe":
-        write_json(
-            paro_probe_model(
-                args.model,
-                local_only=args.local_only,
-                max_modules=args.max_modules,
-            ),
-            pretty=args.pretty,
-            out=args.out,
-        )
-    elif args.command == "paro-import":
-        write_json(
-            paro_import_model(
-                args.model,
-                args.output,
-                local_only=args.local_only,
-                max_modules=args.max_modules,
-                layout=args.layout,
-                copy_floats=args.copy_floats,
-            ),
-            pretty=args.pretty,
-            out=args.out,
-        )
-    elif args.command == "paro-oracle":
-        write_json(
-            paro_oracle_model(
-                args.source,
-                args.hfq,
-                module_name=args.module_name,
-                local_only=args.local_only,
-                samples=args.samples,
-                seed=args.seed,
-                input_scale=args.input_scale,
-                atol=args.atol,
             ),
             pretty=args.pretty,
             out=args.out,

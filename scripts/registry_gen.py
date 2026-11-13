@@ -12,7 +12,7 @@ old CLIs that read {models, aliases} keep working unchanged; new fields are
 purely additive:
   top-level : schema_version, generated_at
   per-entry : sha256 (HF LFS oid), size_bytes, arch_id, quant
-  sidecars  : triattn/mtp/dflash gain sha256/size_bytes next to their `file`
+  sidecars  : mtp/dflash gain sha256/size_bytes next to their `file`
 
 Fail-closed: ANY problem — repo unreachable, file missing from the repo
 tree, file not LFS (no sha256), size_bytes disagreeing with curated
@@ -365,8 +365,9 @@ def quant_for(file: str) -> str | None:
     if m and m.group(1) in KNOWN_QUANTS:
         return m.group(1)
     # Product ladder files: model.mq4 / model.mq4-xt / model.mq4-xts / model.mq4-pro → quant mq4;
-    # an -xts suffix may carry a hot-expert count (model.mq2-xts-4500 → quant mq2)
-    m = re.search(r"\.(mq\d)(?:-(?:xts?(?:-\d+)?|pro))?$", file)
+    # an -xts suffix may carry a hot-expert count (model.mq2-xts-4500 → quant mq2) or the
+    # symmetric-trunk marker (model.mq4-xts-symtrunk → quant mq4)
+    m = re.search(r"\.(mq\d)(?:-(?:xts?(?:-\d+|-symtrunk)?|pro))?$", file)
     if m and m.group(1) in KNOWN_QUANTS:
         return m.group(1)
     ext = file.rsplit(".", 1)[-1]
@@ -547,7 +548,7 @@ def validate_shared_ple_pins(models: dict, errors: list[str]) -> None:
 def annotate_sidecar(
     sidecar: dict, tree: dict[str, dict], tag: str, kind: str, errors: list[str]
 ) -> dict:
-    """triattn/mtp/dflash/vision sub-object: require existence, add sha256/size_bytes if LFS."""
+    """mtp/dflash/vision sub-object: require existence, add sha256/size_bytes if LFS."""
     out = dict(sidecar)
     fname = sidecar.get("file", "")
     item = tree.get(fname)
@@ -682,7 +683,7 @@ def build_registry(curated: dict, token: str | None) -> tuple[dict | None, list[
                                 f"HF {size_bytes / 1e9:.2f} GB ({drift:.0%} drift); "
                                 f"update registry/models.json"
                             )
-            for kind in ("triattn", "mtp", "dflash", "vision", "t5", "clip", "qwen3", "vae"):
+            for kind in ("mtp", "dflash", "vision", "t5", "clip", "qwen3", "vae"):
                 if isinstance(entry.get(kind), dict):
                     new_entry[kind] = annotate_sidecar(entry[kind], tree, tag, kind, errors)
             ple = entry.get("ple")

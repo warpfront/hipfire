@@ -701,8 +701,7 @@ impl Speculator for GenericDflashSpeculator {
 
         // positions_q: absolute positions of the block slots [position .. position+b).
         // positions_k: context positions [0 .. position) then block [position .. position+b).
-        // (The generic path has no FlashCASK eviction, so positions are contiguous —
-        // matching the qwen35 pre-eviction layout byte-for-byte.)
+        // (Positions are contiguous.)
         let positions_q: Vec<i32> = (position as i32..(position + b) as i32).collect();
         let positions_k: Vec<i32> = (0i32..(position + b) as i32).collect();
 

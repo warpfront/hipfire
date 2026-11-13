@@ -18,7 +18,6 @@ use crate::gguf_input;
 use crate::hfq::*;
 use crate::model_filter::*;
 use crate::pipeline_deepseek::*;
-use crate::pipeline_gguf::*;
 use crate::quant_e8::*;
 use crate::quant_fwht::*;
 use crate::quant_hfp4::*;
@@ -101,7 +100,6 @@ struct MainQuantFlags {
     is_gemma4_family: bool,
     q8_conv1d_default: bool,
     q8_router: bool,
-    arch_id: u32,
     vision_quant: String,
     product_tier: Option<crate::model_filter::ProductTier>,
 }
@@ -122,6 +120,27 @@ struct MainQuantState<'a> {
     max_quant_error: &'a mut f32,
     _n_quant_groups: &'a mut u64,
     spill: &'a mut Option<TensorSpill>,
+}
+
+/// The `hipfire_route_sku` the writer stamps (`hipfire_runtime::route_sku`):
+/// `mq4r` for an MoE-class model whose fixed tier follows an MQ4 `--format`
+/// (`--no-q8-router`), `mq4rs` when that MQ4V2 build is symmetric and carries
+/// the MQ4G128V2-symmetric routed-expert down_proj; none otherwise.
+fn route_sku_for_recipe(
+    is_moe_like: bool,
+    no_q8_router: bool,
+    mq4_format: bool,
+    mq4v2_symmetric: bool,
+    down_mq4g128v2_symmetric: bool,
+) -> Option<&'static str> {
+    if !(is_moe_like && no_q8_router && mq4_format) {
+        return None;
+    }
+    Some(if mq4v2_symmetric && down_mq4g128v2_symmetric {
+        "mq4rs"
+    } else {
+        "mq4r"
+    })
 }
 
 static MQ4V2_SYMMETRIC: OnceLock<bool> = OnceLock::new();
@@ -309,7 +328,8 @@ fn validate_mq4v2_xt_source(
                 // (qt2) and the router as BF16 (qt16); the class map is arch 19's own.
                 && !(source.arch_id == crate::raon::RAON_ARCH_ID
                     && (tensor.quant_type == 2
-                        || (tensor.quant_type == 16 && tensor.name.ends_with(".moe.gate.weight"))))
+                        || (tensor.quant_type == 16 && tensor.name.ends_with(".moe.gate.weight"))
+                        || (tensor.quant_type == 14 && crate::raon::is_mq8_attn_class(&tensor.name))))
     }) {
         return Err(format!(
             "input is not the MQ4V2-XT type map: `{}` has qt={}",
@@ -998,6 +1018,8 @@ pub(crate) fn route_for(args: &QuantizeArgs) -> crate::cli::Route {
         Route::Flux
     } else if args.qwen4_flash_next {
         Route::Qwen4
+    } else if args.recipe.as_deref() == Some("stock-fp8-mtp-sidecar") {
+        Route::Qwen4StockMtpSidecar
     } else if args.recipe.is_some() {
         Route::Qwen4StockFp8
     } else if args.raon_shared_ffn.is_some() || args.raon_shared_ffn_verify.is_some() {
@@ -1010,12 +1032,6 @@ pub(crate) fn route_for(args: &QuantizeArgs) -> crate::cli::Route {
         Route::FinalCodes
     } else if is_early_special_format(&args.format) {
         Route::EarlySpecial
-    } else if args
-        .input
-        .as_deref()
-        .is_some_and(|i| is_gguf_input(Path::new(i)))
-    {
-        Route::Gguf
     } else if args
         .input
         .as_deref()
@@ -1097,6 +1113,50 @@ pub(crate) fn run() {
             }
             Err(error) => {
                 eprintln!("error: qwen4 streaming pack: {error}");
+                std::process::exit(2);
+            }
+        }
+    }
+
+    // ── Stock FP8 MTP head sidecar (`--recipe stock-fp8-mtp-sidecar`) ───
+    // Production-only dedicated producer; `reject_unreachable` has already
+    // refused every flag it does not read.
+    if args.recipe.as_deref() == Some("stock-fp8-mtp-sidecar") {
+        let input = args
+            .input
+            .as_deref()
+            .expect("--input is required with --recipe stock-fp8-mtp-sidecar");
+        let Some(base) = args.base.as_deref() else {
+            eprintln!("error: --recipe stock-fp8-mtp-sidecar requires --base <model.hfq>");
+            std::process::exit(2);
+        };
+        let output = (!args.output.is_empty()).then(|| Path::new(&args.output));
+        match crate::qwen4::run_stock_fp8_mtp_sidecar_cli(
+            Path::new(input),
+            Path::new(base),
+            output,
+            args.base_sha256.as_deref(),
+        ) {
+            Ok(summary) => {
+                eprintln!(
+                    "stock-fp8-mtp-sidecar: wrote {} ({} entries: {} experts; \
+                     mtp fp8 tensors scanned={}; payload={} bytes; sidecar={} bytes sha256={}; \
+                     base sha256={}; receipt={}; {:.1}s)",
+                    summary.output.display(),
+                    summary.entries,
+                    summary.expert_entries,
+                    summary.mtp_fp8_scanned,
+                    summary.payload_bytes,
+                    summary.sidecar_bytes,
+                    summary.sidecar_sha256,
+                    summary.base_sha256,
+                    summary.receipt_path.display(),
+                    summary.elapsed_seconds
+                );
+                return;
+            }
+            Err(error) => {
+                eprintln!("error: stock-fp8-mtp-sidecar: {error}");
                 std::process::exit(2);
             }
         }
@@ -1314,6 +1374,7 @@ pub(crate) fn run() {
             &args.format,
             args.mq4v2_symmetric,
             args.tier.as_deref(),
+            args.raon_attn_mq8,
         ) {
             Ok(summary) => {
                 eprintln!(
@@ -1966,17 +2027,15 @@ pub(crate) fn run() {
     // linear_attn.{in_proj_qkv,in_proj_z,in_proj_a,in_proj_b,out_proj}
     // (linear-attention layers via SSM-naming). Norms / biases / 1D scalars /
     // conv1d / lookup tables have no imatrix entry.
+    // The table itself is loaded once config.json is parsed (below): the
+    // `--awq-fix-la-head-order` V-head permutation needs the model's
+    // linear_num_{key,value}_heads / linear_value_head_dim.
     let imatrix_path = args.imatrix.clone();
     if let Some(path) = &imatrix_path {
         if !path.exists() {
             eprintln!("error: --imatrix path not found: {}", path.display());
             std::process::exit(1);
         }
-        let table = load_imatrix(path, args.awq_fix_la_head_order);
-        IMATRIX
-            .set(table)
-            .expect("IMATRIX set twice — should not happen");
-        eprintln!("imatrix loaded from {}", path.display());
     }
 
     // ── Phase A Stage A: AWQ (Activation-aware Weight Quantization) ──
@@ -2060,13 +2119,7 @@ pub(crate) fn run() {
         || use_mfp3e8_gptq_fmt
         || use_mfp2e8_gptq_fmt;
     if main_route && !format_known {
-        if GgufFormat::from_flag(format).is_some() {
-            eprintln!("error: --format {format} is only supported for GGUF weight input");
-        } else {
-            eprintln!(
-                "error: unknown --format '{format}' (see docs/QUANTIZE.md for the format table)"
-            );
-        }
+        eprintln!("error: unknown --format '{format}' (see docs/QUANTIZE.md for the format table)");
         std::process::exit(2);
     }
     // ── --imatrix with nothing to consume it ──
@@ -2206,7 +2259,7 @@ pub(crate) fn run() {
         );
     }
     if awq_enabled {
-        if IMATRIX.get().is_none() {
+        if imatrix_path.is_none() {
             eprintln!(
                 "error: --awq requires --imatrix (we derive RMS_act per channel from imatrix in_sum2 values)"
             );
@@ -2371,44 +2424,16 @@ pub(crate) fn run() {
         );
     }
 
-    // GGUF input branch: if --input is a `.gguf` file, run the GGUF
-    // pipeline and exit. Tensor names are translated GGUF → safetensors
-    // style. The 2D quantization target follows --format:
-    //   hfq4 (default for GGUF) | hfq6 | mq4 | mq6
-    // Per CLAUDE.md guidance: dense (non-DeltaNet) models should use
-    // hfq4/hfq6. mq4/mq6 are calibrated for Qwen3.5+ — using them on a
-    // Llama-style model produces correct output (the FWHT cancels in
-    // `gemv_mq4g256_with_rotate`) but adds runtime rotation overhead
-    // with no quality benefit.
-    {
-        let raw_input = Path::new(input_dir);
-        // lifecycle: deprecated since 0.4.0, removal 0.5.0 — GGUF→mqN is lossy double quantization; use llama.cpp for GGUF
-        if is_gguf_input(raw_input) {
-            eprintln!("warning: GGUF weight input is deprecated and will be removed in 0.5.0; GGUF→mqN is lossy double quantization; use llama.cpp for GGUF (imatrix.gguf input stays supported)");
-            let gguf_format = GgufFormat::from_flag(format).unwrap_or_else(|| {
-                eprintln!(
-                    "GGUF input: --format '{format}' not recognized. \
-                     Supported: hfq4 (default), hfq6, mq4, mq6. \
-                     Falling back to hfq4."
-                );
-                GgufFormat::Hfq4
-            });
-            let out = Path::new(output_path);
-            if let Err(e) = run_gguf_pipeline(
-                raw_input,
-                out,
-                gguf_format,
-                no_kmap,
-                kmap_dense,
-                kmap_mode,
-                args.arch_id,
-                args.force_arch_id,
-            ) {
-                eprintln!("GGUF pipeline failed: {e}");
-                std::process::exit(2);
-            }
-            return;
-        }
+    // A `.gguf` weight file is not an input: GGUF→mqN was lossy double
+    // quantization. (`--imatrix <file.gguf>` is a calibration input and is
+    // read separately.)
+    if is_gguf_input(Path::new(input_dir)) {
+        eprintln!(
+            "error: GGUF weight input was removed in 0.5.0 (GGUF→mqN is lossy double \
+             quantization); quantize from the original safetensors checkpoint, or use \
+             llama.cpp for GGUF. `--imatrix <file.gguf>` is still supported."
+        );
+        std::process::exit(2);
     }
 
     // Resolve input: local path or HuggingFace model ID (e.g. "Qwen/Qwen3-8B")
@@ -2479,6 +2504,27 @@ pub(crate) fn run() {
         eprintln!("Architecture: {arch_str} (id={arch_id})");
     }
     let is_moe = arch_id == 6;
+
+    // Load the imatrix now that the checkpoint's config is available: the
+    // grouped-V-head (GatedDeltaNet) out_proj re-index is geometry-driven, so
+    // the loader needs linear_num_{key,value}_heads / linear_value_head_dim.
+    if let Some(path) = &imatrix_path {
+        match load_imatrix(path, la_head_geometry(&config), args.awq_fix_la_head_order) {
+            Ok(loaded) => {
+                for warning in &loaded.warnings {
+                    eprintln!("{warning}");
+                }
+                IMATRIX
+                    .set(loaded.table)
+                    .expect("IMATRIX set twice — should not happen");
+                eprintln!("imatrix loaded from {}", path.display());
+            }
+            Err(error) => {
+                eprintln!("error: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
     // DeepSeek V4 (arch_id=9 post-2026-05-26 upstream merge that promoted
     // Qwen2-dense to 7 and dots.ocr to 8) is also MoE but ships per-expert
     // separate 2D tensors (`layers.L.ffn.experts.E.{w1,w2,w3}.weight`)
@@ -3127,7 +3173,6 @@ pub(crate) fn run() {
                 QuantLevel::F16 => counts[0] += 1,
                 QuantLevel::Q8 => counts[1] += 1,
                 QuantLevel::Promote6 => counts[2] += 1,
-                QuantLevel::Override(_) => counts[3] += 1,
                 QuantLevel::Base => counts[3] += 1,
             }
             map.insert(name.to_string(), level);
@@ -4326,7 +4371,6 @@ pub(crate) fn run() {
                 is_gemma4_family,
                 q8_conv1d_default,
                 q8_router,
-                arch_id,
                 vision_quant: vision_quant.to_string(),
                 product_tier,
             };
@@ -4521,6 +4565,22 @@ pub(crate) fn run() {
                 );
             }
             obj.insert("hipfire_base_format".to_string(), format.to_string().into());
+            // Explicit route identity: the runtime selects the MQ4R / MQ4RS
+            // retained-Redline SKU from this key (0.5.0 removed the file
+            // extension). The claim is the recipe `--no-q8-router` documents:
+            // an MoE-class model whose fixed tier follows an MQ4 `--format`
+            // instead of Q8F16 (MQ4RS adds symmetric MQ4V2 plus the
+            // MQ4G128V2-symmetric routed-expert down_proj).
+            if let Some(sku) = route_sku_for_recipe(
+                is_moe_like,
+                no_q8_router_flag,
+                use_mq4g256 || use_mq4v2,
+                use_mq4v2 && args.mq4v2_symmetric,
+                args.moe_expert_down == Some(MoeExpertDown::Mq4g128v2Symmetric),
+            ) {
+                obj.insert("hipfire_route_sku".to_string(), sku.into());
+                eprintln!("  Route SKU: {sku} (hipfire_route_sku)");
+            }
             metadata_json = serde_json::to_string(&meta_val).unwrap_or(metadata_json);
         }
     }
@@ -6892,332 +6952,6 @@ fn handle_main_quant(
                     let q = quantize_q8f16(&f32_data);
                     (q, QuantType::Q8F16, 32u32, "Q8_F16")
                 }
-            } else if let QuantLevel::Override(override_fmt) = kmap_level {
-                // K-map says override (today: lm_head when --lm-head-format set).
-                // Dispatch on the carried format. For MQ4 with AWQ enabled,
-                // apply AWQ pre-scaling + emit a sidecar so the runtime
-                // (once the CUDA-branch AWQ-aware lm_head dispatch lands)
-                // sees scaled bytes and inverse-divides correctly. For any
-                // other format, plain quantize (the AWQ wiring outside MQ4
-                // is a follow-up).
-                let k_dim = if meta.shape.len() == 2 {
-                    meta.shape[1]
-                } else {
-                    n_elements
-                };
-                if k_dim % 256 == 0 {
-                    let signs1 = gen_fwht_signs(42, 256);
-                    let signs2 = gen_fwht_signs(1042, 256);
-                    // ── Gemma4 (arch 13/22): embed/lm_head MUST NOT reach AWQ ──
-                    // They are always routed to Q8 by the K-map before this
-                    // branch, so they cannot arrive here. Assert the invariant
-                    // rather than leave it implicit: Gemma4's tied embed/lm_head
-                    // carries an implicit sqrt(d_model) scaling with no RMSNorm
-                    // anchor on the embedding dimension, which makes AWQ's
-                    // imatrix-saliency ratio meaningless and the per-channel
-                    // pre-scale actively harmful.
-                    debug_assert!(
-                        !(flags.is_gemma4_family
-                            && (name.contains("embed_tokens") || name.contains("lm_head"))),
-                        "gemma4 embed/lm_head reached the MQ4 AWQ path — the outer.kmap Q8 \
-                             guard should have prevented this (arch {} tensor {})",
-                        flags.arch_id,
-                        name
-                    );
-                    match override_fmt {
-                        GgufFormat::Mq4 => {
-                            // Inline AWQ + MQ4 dance (mirrors the Base MQ4 arm).
-                            let q = if let (Some(alpha), Some(im_weights)) =
-                                (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
-                            {
-                                if awq_eligible(name) {
-                                    let scales = compute_awq_scales(im_weights, alpha);
-                                    awq_sidecar_scales = Some(scales.clone());
-                                    let m_dim = meta.shape[0];
-                                    let mut scaled = f32_data.clone();
-                                    awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
-                                    quantize_mq4g256(&scaled, &signs1, &signs2)
-                                } else {
-                                    quantize_mq4g256(&f32_data, &signs1, &signs2)
-                                }
-                            } else {
-                                quantize_mq4g256(&f32_data, &signs1, &signs2)
-                            };
-                            (q, QuantType::MQ4G256, 256u32, "MQ4G256")
-                        }
-                        GgufFormat::Mq4V2 => {
-                            let q = if let (Some(alpha), Some(im_weights)) =
-                                (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
-                            {
-                                if awq_eligible(name) {
-                                    let m_dim = meta.shape[0];
-                                    let selected = compute_awq_scales_for_weight(
-                                        name, im_weights, alpha, &f32_data, m_dim, k_dim, &signs1,
-                                        &signs2,
-                                    );
-                                    if selected.relative_output_mse.is_finite() {
-                                        eprintln!(
-                                            "    AWQ A4: {} alpha={:.2} relative_output_mse={:.8e}",
-                                            name, selected.alpha, selected.relative_output_mse
-                                        );
-                                    }
-                                    let scales = selected.scales;
-                                    awq_sidecar_scales = Some(scales.clone());
-                                    let mut scaled = f32_data.clone();
-                                    awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
-                                    quantize_mq4g256v2_selected(
-                                        &scaled, m_dim, k_dim, &signs1, &signs2,
-                                    )
-                                } else {
-                                    let m = meta.shape[0];
-                                    let k = k_dim;
-                                    quantize_mq4g256v2_selected(&f32_data, m, k, &signs1, &signs2)
-                                }
-                            } else {
-                                let m = meta.shape[0];
-                                let k = k_dim;
-                                quantize_mq4g256v2_selected(&f32_data, m, k, &signs1, &signs2)
-                            };
-                            (q, QuantType::MQ4G256V2, 256u32, "MQ4G256V2")
-                        }
-                        GgufFormat::Mq4V2Lloyd => {
-                            let m = meta.shape[0];
-                            let r = if let (Some(alpha), Some(im_weights)) =
-                                (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
-                            {
-                                if awq_eligible(name) {
-                                    let scales = compute_awq_scales(im_weights, alpha);
-                                    awq_sidecar_scales = Some(scales.clone());
-                                    let mut scaled = f32_data.clone();
-                                    awq_pre_scale_weights(&mut scaled, m, k_dim, &scales);
-                                    quantize_mq4g256v2_lloyd(&scaled, m, k_dim, &signs1, &signs2)
-                                } else {
-                                    quantize_mq4g256v2_lloyd(&f32_data, m, k_dim, &signs1, &signs2)
-                                }
-                            } else {
-                                quantize_mq4g256v2_lloyd(&f32_data, m, k_dim, &signs1, &signs2)
-                            };
-                            lloyd_v2_stats_record(name, &r);
-                            lloyd_sidecar_levels = Some(r.levels);
-                            (r.data, QuantType::MQ4G256V2L, 256u32, "MQ4G256V2L")
-                        }
-                        GgufFormat::Mq4C => {
-                            let q = if let (Some(alpha), Some(im_weights)) =
-                                (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
-                            {
-                                if awq_eligible(name) {
-                                    let scales = compute_awq_scales(im_weights, alpha);
-                                    awq_sidecar_scales = Some(scales.clone());
-                                    let m_dim = meta.shape[0];
-                                    let mut scaled = f32_data.clone();
-                                    awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
-                                    quantize_mq4cg256(&scaled, m_dim, k_dim, &signs1, &signs2)
-                                } else {
-                                    let m = meta.shape[0];
-                                    let k = k_dim;
-                                    quantize_mq4cg256(&f32_data, m, k, &signs1, &signs2)
-                                }
-                            } else {
-                                let m = meta.shape[0];
-                                let k = k_dim;
-                                quantize_mq4cg256(&f32_data, m, k, &signs1, &signs2)
-                            };
-                            (q, QuantType::MQ4CG256, 256u32, "MQ4CG256")
-                        }
-                        GgufFormat::Mq5 => {
-                            // MQ5 + AWQ on lm_head: MQ5G256 is in
-                            // DType::supports_awq_sidecar, so the runtime applies the
-                            // inverse divide via rotate_x_mq. Same AWQ inline dance as MQ4.
-                            let q = if let (Some(alpha), Some(im_weights)) =
-                                (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
-                            {
-                                if awq_eligible(name) {
-                                    let scales = compute_awq_scales(im_weights, alpha);
-                                    awq_sidecar_scales = Some(scales.clone());
-                                    let m_dim = meta.shape[0];
-                                    let mut scaled = f32_data.clone();
-                                    awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
-                                    quantize_mq5g256(&scaled, &signs1, &signs2)
-                                } else {
-                                    quantize_mq5g256(&f32_data, &signs1, &signs2)
-                                }
-                            } else {
-                                quantize_mq5g256(&f32_data, &signs1, &signs2)
-                            };
-                            (q, QuantType::MQ5G256, 256u32, "MQ5G256")
-                        }
-                        GgufFormat::Mq6 => {
-                            let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
-                            (q, QuantType::MQ6G256, 256u32, "MQ6G256")
-                        }
-                        GgufFormat::Mq6V2 => {
-                            let m = meta.shape[0];
-                            let k = k_dim;
-                            let q = quantize_mq6g256v2(&f32_data, m, k, &signs1, &signs2);
-                            (q, QuantType::MQ6G256V2, 256u32, "MQ6G256V2")
-                        }
-                        GgufFormat::Mq5V2 => {
-                            let m = meta.shape[0];
-                            let k = k_dim;
-                            let q = quantize_mq5g256v2(&f32_data, m, k, &signs1, &signs2);
-                            (q, QuantType::MQ5G256V2, 256u32, "MQ5G256V2")
-                        }
-                        GgufFormat::Mq3V2 => {
-                            let m = meta.shape[0];
-                            let k = k_dim;
-                            let q = quantize_mq3g256v2_selected(&f32_data, m, k, &signs1, &signs2);
-                            (q, QuantType::MQ3G256V2, 256u32, "MQ3G256V2")
-                        }
-                        GgufFormat::Mq2V2 => {
-                            let m = meta.shape[0];
-                            let k = k_dim;
-                            let q = quantize_mq2g256v2_selected(&f32_data, m, k, &signs1, &signs2);
-                            (q, QuantType::MQ2G256V2, 256u32, "MQ2G256V2")
-                        }
-                        GgufFormat::Mq3 => {
-                            // DType::supports_awq_sidecar(MQ3G256)=true (per the
-                            // fix/lm-head-awq-runtime branch). Wire the same AWQ
-                            // inline-quantize dance as the MQ4 arm.
-                            let q = if let (Some(alpha), Some(im_weights)) =
-                                (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
-                            {
-                                if awq_eligible(name) {
-                                    let scales = compute_awq_scales(im_weights, alpha);
-                                    awq_sidecar_scales = Some(scales.clone());
-                                    let m_dim = meta.shape[0];
-                                    let mut scaled = f32_data.clone();
-                                    awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
-                                    quantize_mq3g256(&scaled, &signs1, &signs2)
-                                } else {
-                                    quantize_mq3g256(&f32_data, &signs1, &signs2)
-                                }
-                            } else {
-                                quantize_mq3g256(&f32_data, &signs1, &signs2)
-                            };
-                            (q, QuantType::MQ3G256, 256u32, "MQ3G256")
-                        }
-                        GgufFormat::Hfq4 => {
-                            let q = quantize_hfq4g256(&f32_data);
-                            (q, QuantType::HFQ4G256, 256u32, "HFQ4G256")
-                        }
-                        GgufFormat::Hfq6 => {
-                            let q = quantize_hfq6g256(&f32_data);
-                            (q, QuantType::HFQ6G256, 256u32, "HFQ6G256")
-                        }
-                        // Other Override targets: not yet wired with AWQ;
-                        // emit plain quantization. Used in Phase 0 sweeps
-                        // for non-AWQ lm_head experiments.
-                        GgufFormat::Mq2 => {
-                            let q = quantize_mq2g256(&f32_data, &signs1, &signs2);
-                            (q, QuantType::MQ2G256, 256u32, "MQ2G256")
-                        }
-                        GgufFormat::Mq2Lloyd => {
-                            let q = quantize_mq2g256_lloyd(&f32_data, &signs1, &signs2);
-                            (q, QuantType::MQ2G256Lloyd, 256u32, "MQ2G256Lloyd")
-                        }
-                        GgufFormat::Mq2LloydAnchored => {
-                            let q = quantize_mq2g256_lloyd_anchored(&f32_data, &signs1, &signs2);
-                            (q, QuantType::MQ2G256Lloyd, 256u32, "MQ2G256Lloyd")
-                        }
-                        GgufFormat::Mq3Lloyd => {
-                            let q = quantize_mq3g256_lloyd(&f32_data, &signs1, &signs2);
-                            (q, QuantType::MQ3G256Lloyd, 256u32, "MQ3G256Lloyd")
-                        }
-                        GgufFormat::Mq4Lloyd => {
-                            let q = quantize_mq4g256_lloyd(&f32_data, &signs1, &signs2);
-                            (q, QuantType::MQ4G256Lloyd, 256u32, "MQ4G256Lloyd")
-                        }
-                        GgufFormat::Mfp4 => {
-                            let m = if meta.shape.len() == 2 {
-                                meta.shape[0]
-                            } else {
-                                1
-                            };
-                            let q = quantize_mfp4g32_2d(&f32_data, m, k_dim, &signs1, &signs2);
-                            (q, QuantType::MFP4G32, 32u32, "MFP4G32")
-                        }
-                        GgufFormat::Mfp4Lloyd => {
-                            let m = if meta.shape.len() == 2 {
-                                meta.shape[0]
-                            } else {
-                                1
-                            };
-                            let q =
-                                quantize_mfp4g32_lloyd_2d(&f32_data, m, k_dim, &signs1, &signs2);
-                            (q, QuantType::MFP4G32Lloyd, 32u32, "MFP4G32Lloyd")
-                        }
-                        GgufFormat::Mfp4P => {
-                            let m = if meta.shape.len() == 2 {
-                                meta.shape[0]
-                            } else {
-                                1
-                            };
-                            let q = quantize_mfp4g32_p_2d(&f32_data, m, k_dim, &signs1, &signs2);
-                            (q, QuantType::MFP4G32P, 32u32, "MFP4G32P")
-                        }
-                        GgufFormat::Mfp4E8 => {
-                            let m = if meta.shape.len() == 2 {
-                                meta.shape[0]
-                            } else {
-                                1
-                            };
-                            let q = quantize_mfp4g32_e8_2d(&f32_data, m, k_dim, &signs1, &signs2);
-                            (q, QuantType::MFP4G32E8, 32u32, "MFP4G32E8")
-                        }
-                        GgufFormat::Mfp4E8Soa => {
-                            let m = if meta.shape.len() == 2 {
-                                meta.shape[0]
-                            } else {
-                                1
-                            };
-                            let q =
-                                quantize_mfp4g32_e8_soa_2d(&f32_data, m, k_dim, &signs1, &signs2);
-                            (q, QuantType::MFP4G32E8SOA, 32u32, "MFP4G32E8SOA")
-                        }
-                        GgufFormat::Mfp3E8 => {
-                            let m = if meta.shape.len() == 2 {
-                                meta.shape[0]
-                            } else {
-                                1
-                            };
-                            let q = quantize_mfp3g32_e8_2d(&f32_data, m, k_dim, &signs1, &signs2);
-                            (q, QuantType::MFP3G32E8, 32u32, "MFP3G32E8")
-                        }
-                        GgufFormat::Mfp2E8 => {
-                            let m = if meta.shape.len() == 2 {
-                                meta.shape[0]
-                            } else {
-                                1
-                            };
-                            let q = quantize_mfp2g32_e8_2d(&f32_data, m, k_dim, &signs1, &signs2);
-                            (q, QuantType::MFP2G32E8, 32u32, "MFP2G32E8")
-                        }
-                        GgufFormat::Hfp4 => {
-                            let m = if meta.shape.len() == 2 {
-                                meta.shape[0]
-                            } else {
-                                1
-                            };
-                            let q = quantize_hfp4g32_2d(&f32_data, m, k_dim);
-                            (q, QuantType::HFP4G32, 32u32, "HFP4G32")
-                        }
-                        GgufFormat::Ternary => {
-                            // Terminal low-bit: direct TQ2G128 — scale-only ternary g128, 34 B/blk.
-                            // No rotation (RotationPlan::None) and no AWQ fold-out.
-                            let q = quantize_tq2g128(&f32_data);
-                            (q, QuantType::TQ2G128, 128u32, "TQ2G128")
-                        }
-                        GgufFormat::Binary => {
-                            // Terminal low-bit: direct BQ1G128 — scale-only binary g128, 18 B/blk.
-                            let q = quantize_bq1g128(&f32_data);
-                            (q, QuantType::BQ1G128, 128u32, "BQ1G128")
-                        }
-                    }
-                } else {
-                    // Non-256-aligned override target: Q8 fallback.
-                    let q = quantize_q8f16(&f32_data);
-                    (q, QuantType::Q8F16, 32u32, "Q8_F16")
-                }
             } else {
                 // QuantLevel::Base — product-tier lift takes precedence over base format.
                 // XT: embed only, Base: +lm_head, Pro: +ssm_out. Embed/conv1d are already
@@ -8545,6 +8279,44 @@ fn handle_main_quant(
                     std::process::exit(1);
                 }
             }
+            // These encoders pack groups flat across rows, but their kernels
+            // read `K / group` groups per row, so a `[rows, K]` matrix with a
+            // ragged K would decode as garbage. Re-encode it in a row-padded
+            // format: Q8 keeps HFQ6's precision and is the embedding format
+            // (Q8 itself needs K % 32 == 0; a ragged embedding is refused),
+            // HFQ4-G128 pads each row. Higher ranks (conv1d) stay flat.
+            let floor_stride_group = match qt {
+                QuantType::HFQ6G256 | QuantType::HFQ4G256 | QuantType::Q4K => 256,
+                QuantType::HFQ2G128 | QuantType::HFQ3G128 => 128,
+                QuantType::Q4F16G64 => 64,
+                QuantType::Q8F16 => 32,
+                _ => 0,
+            };
+            let (quantized, qt, gs, label) = if meta.shape.len() == 2
+                && floor_stride_group != 0
+                && !meta.shape[1].is_multiple_of(floor_stride_group)
+            {
+                awq_sidecar_scales = None;
+                let (m, k) = (meta.shape[0], meta.shape[1]);
+                let is_embed = name.contains("embed_tokens");
+                if (qt == QuantType::HFQ6G256 || is_embed) && k.is_multiple_of(32) {
+                    eprintln!("  {name}: K={k} % {floor_stride_group} != 0, {label} -> Q8_F16");
+                    (quantize_q8f16(&f32_data), QuantType::Q8F16, 32u32, "Q8_F16")
+                } else if is_embed {
+                    eprintln!("error: embedding {name} has K={k} not divisible by 32 (no tail-safe lookup kernel)");
+                    std::process::exit(2);
+                } else {
+                    eprintln!("  {name}: K={k} % {floor_stride_group} != 0, {label} -> HFQ4G128");
+                    (
+                        quantize_hfq4g128_2d(&f32_data, m, k),
+                        QuantType::HFQ4G128,
+                        128u32,
+                        "HFQ4G128",
+                    )
+                }
+            } else {
+                (quantized, qt, gs, label)
+            };
 
             // Compute quantization error (skip for Q8 embeddings — always negligible)
             let block_size = gs as usize;
@@ -8907,7 +8679,6 @@ mod handle_main_quant_f16_fallback_tests {
             is_gemma4_family: false,
             q8_conv1d_default: false,
             q8_router: false,
-            arch_id: 6,
             vision_quant: String::new(),
             product_tier: None,
         }
@@ -9790,11 +9561,7 @@ mod moe_expert_down_override_tests {
         assert!(error.contains("HIPFIRE_MOE_TIER_MAP"), "{error}");
         // Any non-Main route (qwen4-flash-next, GGUF, ...) is refused.
         let args = parse(&GOOD);
-        for route in [
-            crate::cli::Route::Qwen4,
-            crate::cli::Route::Gguf,
-            crate::cli::Route::ReapOverlay,
-        ] {
+        for route in [crate::cli::Route::Qwen4, crate::cli::Route::ReapOverlay] {
             let error = check_moe_expert_down(&args, route, true, &|_| None).unwrap_err();
             assert!(
                 error.contains("safetensors quantize path"),
@@ -10114,5 +9881,35 @@ mod hfq4g128_pipeline_roundtrip_tests {
         const M: usize = 4;
         const K: usize = 704;
         assert_eq!(packed.len(), M * K.div_ceil(128) * 72);
+    }
+}
+
+#[cfg(test)]
+mod route_sku_stamp_tests {
+    use super::route_sku_for_recipe;
+
+    #[test]
+    fn stamps_mq4r_and_mq4rs_only_for_the_moe_no_q8_router_mq4_recipe() {
+        // (is_moe_like, no_q8_router, mq4_format, mq4v2_symmetric, down_sym)
+        assert_eq!(
+            route_sku_for_recipe(true, true, true, false, false),
+            Some("mq4r")
+        );
+        assert_eq!(
+            route_sku_for_recipe(true, true, true, true, false),
+            Some("mq4r")
+        );
+        assert_eq!(
+            route_sku_for_recipe(true, true, true, false, true),
+            Some("mq4r")
+        );
+        assert_eq!(
+            route_sku_for_recipe(true, true, true, true, true),
+            Some("mq4rs")
+        );
+        // Dense models, the Q8 fixed tier, and non-MQ4 formats are never stamped.
+        assert_eq!(route_sku_for_recipe(false, true, true, true, true), None);
+        assert_eq!(route_sku_for_recipe(true, false, true, true, true), None);
+        assert_eq!(route_sku_for_recipe(true, true, false, true, true), None);
     }
 }

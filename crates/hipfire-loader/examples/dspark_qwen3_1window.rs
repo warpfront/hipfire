@@ -36,7 +36,6 @@ fn main() -> Result<(), String> {
     eprintln!("[1window] GPU: {}", gpu.arch);
 
     let max_seq = 512usize;
-    let cask = hipfire_runtime::loader_api::CaskConfig::default();
     let spec_cfg = hipfire_runtime::loader_api::SpecLoadCfg {
         dspark: None, // auto: load sidecar if present
         ..Default::default()
@@ -49,8 +48,7 @@ fn main() -> Result<(), String> {
         None, // kv_mode_override
         None, // kv_adaptive_override
         None, // state_quant_override
-        &cask,
-        1, // pp
+        1,    // pp
         spec_cfg,
         &mut gpu,
     )?;

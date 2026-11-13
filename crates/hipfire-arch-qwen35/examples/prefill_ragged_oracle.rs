@@ -46,7 +46,7 @@ use hipfire_arch_qwen35::qwen35::{self, Qwen35Config};
 use hipfire_arch_qwen35::{free_qwen35_bundle, load_qwen35_bundle, Qwen35Bundle};
 use hipfire_runtime::kv_backend::KvBackend;
 use hipfire_runtime::llama;
-use hipfire_runtime::loader_api::{CaskConfig, LoadCtx, ModelSource, SpecLoadCfg};
+use hipfire_runtime::loader_api::{LoadCtx, ModelSource, SpecLoadCfg};
 use rdna_compute::{Gpu, GpuTensor};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -179,7 +179,6 @@ fn recorded_env() -> Value {
 /// vision, automatic KV mode: the same `LoadCtx` the daemon builds for a
 /// default load (`kv_mode_override` / state-quant overrides unset).
 fn load_bundle(model: &str, max_seq: usize, gpu: &mut Gpu) -> Result<Qwen35Bundle> {
-    let cask = CaskConfig::default();
     let qwen_default_q8 = !matches!(
         hipfire_config::developer_var("HIPFIRE_QWEN_KV_DEFAULT_Q8")
             .ok()
@@ -203,7 +202,6 @@ fn load_bundle(model: &str, max_seq: usize, gpu: &mut Gpu) -> Result<Qwen35Bundl
         kv_backend: KvBackend::default(),
         kv_adaptive_override: None,
         state_quant_override: None,
-        cask: &cask,
         pp: 1,
         pp_layer_counts: None,
         admitted_mesh: None,
@@ -359,8 +357,8 @@ fn run(raw: &[String]) -> Result<()> {
         return Err(format!("prompt id {bad} >= vocab {vocab}").into());
     }
     let route = route_receipt(&gpu, &config, &bundle, max_seq);
-    // A CASK/eviction-bounded cache can have physical_cap < max_seq; this oracle
-    // writes n + 31 KV positions with no eviction.
+    // A cache can have physical_cap < max_seq; this oracle writes n + 31 KV
+    // positions.
     if bundle.kv_cache.physical_cap < n + GREEDY_TOKENS - 1 {
         return Err(format!(
             "kv physical_cap {} < n {n} + {} decode positions",

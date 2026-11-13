@@ -65,6 +65,9 @@ use peacemaker_ir::envelope::Source as IrSource;
 use peacemaker_ir::inst::{Abi, Arch as IrArch, Frontend};
 use peacemaker_ir::metadata::KernelMeta;
 use peacemaker_ir::Program;
+use peacemaker_isa::kernels::iu4_gemm::{
+    self as iu4_gen, ALayout as Iu4Layout, Epi as Iu4Epi, Spec as Iu4Spec,
+};
 use peacemaker_isa::kernels::mq6_i8_gemm::{
     self as mq6_gen,
     spec::{Epi, Spec as Mq6Spec, Tile},
@@ -247,6 +250,7 @@ const EXPECTED_HIPCC_EXPORTS: &[(&str, &str)] = &[
     ("gfx1100", "ffn_round_bf16_f32"),
     ("gfx1100", "ffn_single_expert_tables"),
     ("gfx1100", "ffn_situ_grouped_f32"),
+    ("gfx1100", "ffn_situ_grouped_rotate_i8_gfx1201"),
     ("gfx1100", "ffn_situ_rows_f32"),
     ("gfx1100", "gemm_bf16_xbf16_small_rows_s1"),
     ("gfx1100", "gemm_bf16_xbf16_small_rows_s4"),
@@ -257,11 +261,51 @@ const EXPECTED_HIPCC_EXPORTS: &[(&str, &str)] = &[
     ("gfx1100", "gemm_bf16_xf32_small_rows_r8"),
     ("gfx1100", "gemm_f32_batched"),
     ("gfx1100", "gemm_mq4g256v2_moe_grouped_wmma_k2"),
+    ("gfx1100", "gemm_mq8g256_mmq_i8_gfx11_t128x128_wa"),
+    ("gfx1100", "gemm_mq8g256_mmq_i8_gfx11_t128x128_wa_bf16"),
+    ("gfx1100", "gemm_mq8g256_mmq_i8_gfx11_t128x128_wb"),
+    ("gfx1100", "gemm_mq8g256_mmq_i8_gfx11_t128x128_wb_bf16"),
+    ("gfx1100", "gemm_mq8g256_mmq_i8_gfx11_t64x128_wa"),
+    ("gfx1100", "gemm_mq8g256_mmq_i8_gfx11_t64x128_wa_bf16"),
+    ("gfx1100", "gemm_mq8g256_mmq_i8_gfx11_t64x128_wb"),
+    ("gfx1100", "gemm_mq8g256_mmq_i8_gfx11_t64x128_wb_bf16"),
+    ("gfx1100", "gemm_mq8g256_mmq_i8_gfx11_t64x64_wa"),
+    ("gfx1100", "gemm_mq8g256_mmq_i8_gfx11_t64x64_wa_bf16"),
+    ("gfx1100", "gemm_mq8g256_mmq_i8_gfx11_t64x64_wb"),
+    ("gfx1100", "gemm_mq8g256_mmq_i8_gfx11_t64x64_wb_bf16"),
     ("gfx1100", "gemm_q8_0_wmma"),
+    ("gfx1100", "gemv_mq8g256"),
+    ("gfx1100", "gemv_mq8g256_b_r10_u1_w4_p1"),
+    ("gfx1100", "gemv_mq8g256_b_r11_u1_w4_p1"),
+    ("gfx1100", "gemv_mq8g256_b_r12_u1_w4_p1"),
+    ("gfx1100", "gemv_mq8g256_b_r13_u1_w4_p1"),
+    ("gfx1100", "gemv_mq8g256_b_r14_u1_w4_p1"),
+    ("gfx1100", "gemv_mq8g256_b_r15_u1_w4_p1"),
+    ("gfx1100", "gemv_mq8g256_b_r16_u1_w4_p1"),
+    ("gfx1100", "gemv_mq8g256_b_r1_u1_w4_p1"),
+    ("gfx1100", "gemv_mq8g256_b_r2_u1_w4_p1"),
+    ("gfx1100", "gemv_mq8g256_b_r3_u1_w4_p1"),
+    ("gfx1100", "gemv_mq8g256_b_r4_u1_w4_p1"),
+    ("gfx1100", "gemv_mq8g256_b_r5_u1_w4_p1"),
+    ("gfx1100", "gemv_mq8g256_b_r6_u1_w4_p1"),
+    ("gfx1100", "gemv_mq8g256_b_r7_u1_w4_p1"),
+    ("gfx1100", "gemv_mq8g256_b_r8_u1_w4_p1"),
+    ("gfx1100", "gemv_mq8g256_b_r9_u1_w4_p1"),
+    ("gfx1100", "gemv_mq8g256_bx_r1_u10_w20_p1"),
+    ("gfx1100", "gemv_mq8g256_bx_r1_u1_w10_p1"),
+    ("gfx1100", "gemv_mq8g256_bx_r1_u5_w24_p1"),
+    ("gfx1100", "gemv_mq8g256_bx_r2_u10_w20_p1"),
+    ("gfx1100", "gemv_mq8g256_bx_r2_u1_w10_p1"),
+    ("gfx1100", "gemv_mq8g256_bx_r2_u5_w24_p1"),
     ("gfx1100", "gemv_q8_0"),
+    ("gfx1100", "latent_attention_flash_prefill"),
+    ("gfx1100", "latent_attention_flash_prefill_fa2_q128w8"),
+    ("gfx1100", "latent_attention_flash_prefill_fa2_q8_q128w8"),
     ("gfx1100", "latent_attention_flash_prefill_q8"),
     ("gfx1100", "moe_scatter_fused_k8"),
+    ("gfx1100", "mq8_rotate_quantize_x_batched"),
     ("gfx1100", "mq_rotate_x"),
+    ("gfx1100", "raon_rda_conv_prepare_w128_f32"),
     ("gfx1100", "rotate_x_mq_awq"),
     ("gfx1151", "gemm_mq6g256v2_mmq_i8_set_bf16_gfx11"),
     ("gfx1151", "gemm_mq6g256v2_mmq_i8_set_bf16_gfx11_t256"),
@@ -274,6 +318,7 @@ const EXPECTED_HIPCC_EXPORTS: &[(&str, &str)] = &[
     ("gfx1201", "convert_f32_to_f16"),
     ("gfx1201", "embedding_q8_batched"),
     ("gfx1201", "ffn_moe_combine_f32"),
+    ("gfx1201", "ffn_moe_combine_f32_w2"),
     ("gfx1201", "ffn_moe_router_topk_f32"),
     ("gfx1201", "ffn_round_bf16_f32"),
     ("gfx1201", "ffn_single_expert_tables"),
@@ -299,9 +344,44 @@ const EXPECTED_HIPCC_EXPORTS: &[(&str, &str)] = &[
     ("gfx1201", "gemm_mq4g256v2_moe_grouped_wmma_gfx12"),
     ("gfx1201", "gemm_mq6g256v2_mmq_i8_set_bf16_gfx12"),
     ("gfx1201", "gemm_mq6g256v2_mmq_i8_set_gfx12"),
+    ("gfx1201", "gemm_mq8g256_mmq_i8_t128x128_wa"),
+    ("gfx1201", "gemm_mq8g256_mmq_i8_t128x128_wa_bf16"),
+    ("gfx1201", "gemm_mq8g256_mmq_i8_t128x128_wb"),
+    ("gfx1201", "gemm_mq8g256_mmq_i8_t128x128_wb_bf16"),
+    ("gfx1201", "gemm_mq8g256_mmq_i8_t128x64_wa"),
+    ("gfx1201", "gemm_mq8g256_mmq_i8_t128x64_wa_bf16"),
+    ("gfx1201", "gemm_mq8g256_mmq_i8_t128x64_wb"),
+    ("gfx1201", "gemm_mq8g256_mmq_i8_t128x64_wb_bf16"),
+    ("gfx1201", "gemm_mq8g256_mmq_i8_t64x64_wa"),
+    ("gfx1201", "gemm_mq8g256_mmq_i8_t64x64_wa_bf16"),
+    ("gfx1201", "gemm_mq8g256_mmq_i8_t64x64_wb"),
+    ("gfx1201", "gemm_mq8g256_mmq_i8_t64x64_wb_bf16"),
     ("gfx1201", "gemm_q8_0_mmq_i8_t128x128_ps"),
     ("gfx1201", "gemm_q8_0_mmq_i8_t128x128_ps_bf16"),
     ("gfx1201", "gemm_q8_0_wmma_gfx12"),
+    ("gfx1201", "gemv_mq8g256"),
+    ("gfx1201", "gemv_mq8g256_b_r10_u1_w4_p1"),
+    ("gfx1201", "gemv_mq8g256_b_r11_u1_w4_p1"),
+    ("gfx1201", "gemv_mq8g256_b_r12_u1_w4_p1"),
+    ("gfx1201", "gemv_mq8g256_b_r13_u1_w4_p1"),
+    ("gfx1201", "gemv_mq8g256_b_r14_u1_w4_p1"),
+    ("gfx1201", "gemv_mq8g256_b_r15_u1_w4_p1"),
+    ("gfx1201", "gemv_mq8g256_b_r16_u1_w4_p1"),
+    ("gfx1201", "gemv_mq8g256_b_r1_u1_w4_p1"),
+    ("gfx1201", "gemv_mq8g256_b_r2_u1_w4_p1"),
+    ("gfx1201", "gemv_mq8g256_b_r3_u1_w4_p1"),
+    ("gfx1201", "gemv_mq8g256_b_r4_u1_w4_p1"),
+    ("gfx1201", "gemv_mq8g256_b_r5_u1_w4_p1"),
+    ("gfx1201", "gemv_mq8g256_b_r6_u1_w4_p1"),
+    ("gfx1201", "gemv_mq8g256_b_r7_u1_w4_p1"),
+    ("gfx1201", "gemv_mq8g256_b_r8_u1_w4_p1"),
+    ("gfx1201", "gemv_mq8g256_b_r9_u1_w4_p1"),
+    ("gfx1201", "gemv_mq8g256_bx_r1_u10_w20_p1"),
+    ("gfx1201", "gemv_mq8g256_bx_r1_u1_w10_p1"),
+    ("gfx1201", "gemv_mq8g256_bx_r1_u5_w24_p1"),
+    ("gfx1201", "gemv_mq8g256_bx_r2_u10_w20_p1"),
+    ("gfx1201", "gemv_mq8g256_bx_r2_u1_w10_p1"),
+    ("gfx1201", "gemv_mq8g256_bx_r2_u5_w24_p1"),
     ("gfx1201", "gemv_q8_0"),
     ("gfx1201", "latent_attention_absorb_pack_bf16"),
     ("gfx1201", "latent_attention_flash_prefill"),
@@ -314,6 +394,20 @@ const EXPECTED_HIPCC_EXPORTS: &[(&str, &str)] = &[
     ("gfx1201", "latent_attention_scatter_expanded_bf16"),
     ("gfx1201", "latent_attention_scatter_expanded_q8"),
     ("gfx1201", "latent_attention_split_kv_bf16"),
+    ("gfx1201", "lwmma_gemm_bf16_t2_m1_n1_multi"),
+    ("gfx1201", "lwmma_gemm_bf16_t2_m2_n1_multi"),
+    ("gfx1201", "lwmma_gemm_bf16_t2_m3_n1_multi"),
+    ("gfx1201", "lwmma_gemm_bf16_t2_m4_n1_multi"),
+    ("gfx1201", "lwmma_tile_bf16_t1_b32x32w2x1g4"),
+    ("gfx1201", "lwmma_tile_bf16_t1_b32x64w2x2"),
+    ("gfx1201", "lwmma_tile_bf16_t1_b64x64w4x1"),
+    ("gfx1201", "lwmma_tile_bf16_t2_b16x32w1x1g4"),
+    ("gfx1201", "lwmma_tile_bf16_t2_b32x128w2x2"),
+    ("gfx1201", "lwmma_tile_bf16_t2_b32x64w2x2"),
+    ("gfx1201", "lwmma_tile_bf16_t2_b64x128w2x4"),
+    ("gfx1201", "lwmma_tile_bf16_t2_b64x128w4x2"),
+    ("gfx1201", "lwmma_tile_bf16_t2_b64x64w4x1"),
+    ("gfx1201", "lwmma_tile_bf16_t2_b64x64w4x2"),
     ("gfx1201", "moe_grouped_qt44_a8_sym_gfx1201_nt1r1"),
     ("gfx1201", "moe_grouped_qt44_a8_sym_gfx1201_nt1r2"),
     ("gfx1201", "moe_grouped_qt44_a8_sym_gfx1201_nt2r1"),
@@ -324,10 +418,15 @@ const EXPECTED_HIPCC_EXPORTS: &[(&str, &str)] = &[
     ("gfx1201", "moe_grouped_qt44_iu4_sym_gfx1201_nt2r1"),
     ("gfx1201", "moe_grouped_qt44_iu4_sym_gfx1201_nt2r2"),
     ("gfx1201", "moe_grouped_qt44_iu4_sym_gfx1201_nt4r1"),
+    ("gfx1201", "moe_route_scatter_top10_wide_f32"),
     ("gfx1201", "moe_scatter_fused_k8"),
+    ("gfx1201", "moe_scatter_fused_top10_pmask"),
+    ("gfx1201", "mq8_rotate_quantize_x_batched"),
     ("gfx1201", "mq_rotate_x"),
     ("gfx1201", "quantize_int8_mmq_ds128"),
     ("gfx1201", "quantize_x_q8_blk32"),
+    ("gfx1201", "qwen4_moe_ep_a8_gate_up_rot_planar_nt1"),
+    ("gfx1201", "qwen4_moe_ep_a8_gate_up_rot_planar_nt2"),
     ("gfx1201", "raon_rda_conv_prepare_w128_f32"),
     ("gfx1201", "raon_rda_prepare_f32"),
     ("gfx1201", "rotate_x_mq_awq"),
@@ -338,6 +437,42 @@ const EXPECTED_HIPCC_EXPORTS: &[(&str, &str)] = &[
     ("gfx1201", "stream_mix_postmix_bf16"),
     ("gfx1201", "stream_mix_route_aggregate_n4_k10_bf16"),
     ("gfx1201", "stream_mix_route_helmert"),
+    ("gfx1201", "topk8_partial_f32_rows"),
+    ("gfx1201", "topk8_rescore_mq6g256v2_k2560_rows"),
+    ("gfx1201", "gemm_mq6sym_i8_set_bf16_gfx1201"),
+    ("gfx1201", "gemm_mq6sym_i8_set_bf16_m32n16_gfx1201"),
+    ("gfx1201", "gemm_mq6sym_i8_set_bf16_m32n32_gfx1201"),
+    ("gfx1201", "gemm_mq6sym_i8_set_bf16_m64n16_gfx1201"),
+    ("gfx1201", "gemm_mq6sym_i8_set_bf16_m64n16y_gfx1201"),
+    ("gfx1201", "gemm_mq6sym_i8_set_bf16_m64n32_gfx1201"),
+    ("gfx1201", "gemm_mq6sym_i8_set_bf16_m64n48_gfx1201"),
+    ("gfx1201", "gemm_mq6sym_i8_set_gfx1201"),
+    ("gfx1201", "gemm_mq6sym_i8_set_m32n16_gfx1201"),
+    ("gfx1201", "gemm_mq6sym_i8_set_m32n32_gfx1201"),
+    ("gfx1201", "gemm_mq6sym_i8_set_m64n16_gfx1201"),
+    ("gfx1201", "gemm_mq6sym_i8_set_m64n16y_gfx1201"),
+    ("gfx1201", "gemm_mq6sym_i8_set_m32n32_x4_gfx1201"),
+    ("gfx1201", "gemm_mq6sym_i8_set_m64n16_x4_gfx1201"),
+    ("gfx1201", "gemm_mq6sym_i8_set_m64n16y_x4_gfx1201"),
+    ("gfx1201", "gemm_mq6sym_i8_set_m64n48_x4_gfx1201"),
+    ("gfx1201", "gemm_mq6sym_i8_set_m64n32_gfx1201"),
+    ("gfx1201", "gemm_mq6sym_i8_set_m64n48_gfx1201"),
+    ("gfx1201", "gemv_mq6sym_i8_rows_r1_bf16_gfx1201"),
+    ("gfx1201", "gemv_mq6sym_i8_rows_r1_gfx1201"),
+    ("gfx1201", "gemv_mq6sym_i8_rows_r2_bf16_gfx1201"),
+    ("gfx1201", "gemv_mq6sym_i8_rows_r2_gfx1201"),
+    ("gfx1201", "gemv_mq6sym_i8_rows_r3_bf16_gfx1201"),
+    ("gfx1201", "gemv_mq6sym_i8_rows_r3_gfx1201"),
+    ("gfx1201", "gemv_mq6sym_i8_rows_r4_bf16_gfx1201"),
+    ("gfx1201", "gemv_mq6sym_i8_rows_r4_gfx1201"),
+    ("gfx1201", "gemv_mq6sym_i8_rows_r5_bf16_gfx1201"),
+    ("gfx1201", "gemv_mq6sym_i8_rows_r5_gfx1201"),
+    ("gfx1201", "gemv_mq6sym_i8_rows_r6_bf16_gfx1201"),
+    ("gfx1201", "gemv_mq6sym_i8_rows_r6_gfx1201"),
+    ("gfx1201", "gemv_mq6sym_i8_rows_r7_bf16_gfx1201"),
+    ("gfx1201", "gemv_mq6sym_i8_rows_r7_gfx1201"),
+    ("gfx1201", "gemv_mq6sym_i8_rows_r8_bf16_gfx1201"),
+    ("gfx1201", "gemv_mq6sym_i8_rows_r8_gfx1201"),
 ];
 
 // ---- shared helpers ------------------------------------------------------------------
@@ -805,15 +940,20 @@ static GENERATORS: LazyLock<Vec<GenEntry>> = LazyLock::new(|| {
 
     // MoE: the gfx1151/gfx1201 modules of every codec (MQ4, MQ3-I4 W3, E8P-I4).
     for arch in [IsaArch::Gfx1151, IsaArch::Gfx1201] {
-        for codec in [WeightCodec::Mq4Sym, WeightCodec::Mq3I4, WeightCodec::E8pI4] {
+        for codec in [
+            WeightCodec::Mq4Sym,
+            WeightCodec::Mq3I4,
+            WeightCodec::E8pI4,
+            WeightCodec::Mq4SymPlanar,
+        ] {
             for spec in moe_gen::module_specs_codec(arch, codec) {
                 entries.push(moe_entry(spec));
             }
         }
     }
-    // MoE: the gfx11 NT1 module (gfx1100 MQ4 + E8P, gfx1151 E8P).
+    // MoE: the gfx11 NT1 module (gfx1100 MQ4 + W3 + E8P, gfx1151 E8P).
     for arch in gfx11_gen::ARCHES {
-        for codec in [Gfx11Codec::Mq4, Gfx11Codec::E8p] {
+        for codec in [Gfx11Codec::Mq4, Gfx11Codec::W3, Gfx11Codec::E8p] {
             for kind in Kind::ALL {
                 let spec = Gfx11Spec {
                     arch,
@@ -829,13 +969,16 @@ static GENERATORS: LazyLock<Vec<GenEntry>> = LazyLock::new(|| {
         }
     }
     // MoE: grouped-position down twins (`qwen4_moe_down_gp`) and the stream8 gate/up.
-    for nt in [4u8, 8u8] {
+    for (nt, codec) in [4u8, 8u8]
+        .into_iter()
+        .flat_map(|nt| [(nt, WeightCodec::Mq4Sym), (nt, WeightCodec::Mq4SymPlanar)])
+    {
         let spec = MoeSpec {
             arch: IsaArch::Gfx1201,
             kind: Kind::Down,
             nt,
             rr: 1,
-            codec: WeightCodec::Mq4Sym,
+            codec,
         };
         let emitted = moe_gen::emit_down_gp(spec)
             .unwrap_or_else(|e| panic!("qwen4_moe_sym::emit_down_gp nt{nt}: {e}"));
@@ -855,6 +998,32 @@ static GENERATORS: LazyLock<Vec<GenEntry>> = LazyLock::new(|| {
     let emitted = moe_gen::emit_gate_up_stream8(IsaArch::Gfx1151)
         .unwrap_or_else(|e| panic!("qwen4_moe_sym::emit_gate_up_stream8: {e}"));
     entries.push(emitted_entry(&emitted, stream8, "emit_gate_up_stream8"));
+    // IU4 GEMM: the fused A4 GDN input projection of the token (`_b1`) and slab (`_b1s`) bundles
+    // (`iu4_gemm::Spec::kernargs` states the 120 explicit bytes + K1's hidden block; the emitted
+    // assembly's metadata block states the static LDS, wave size and workgroup limit).
+    for act in [Iu4Layout::Token, Iu4Layout::Slab] {
+        let spec = Iu4Spec {
+            act,
+            ..Iu4Spec::control(Iu4Epi::QkvzaGdn)
+        };
+        let layout = spec.kernargs();
+        let emitted =
+            iu4_gen::emit(spec).unwrap_or_else(|e| panic!("iu4_gemm {}: {e}", spec.variant_name()));
+        let meta = parse_emitted_metadata(&emitted.s_text);
+        assert_eq!(meta.symbol, spec.symbol(), "{}", spec.variant_name());
+        entries.push(GenEntry {
+            arch: abi_arch(spec.arch),
+            symbol: spec.symbol(),
+            args: layout_args(&layout),
+            segment_bytes: layout.size,
+            threads: spec.tile.threads(),
+            dynamic_lds: Some(spec.lds_launch()),
+            group_segment_fixed: meta.group_segment_fixed,
+            wave: Some(meta.wave),
+            max_flat: Some(meta.max_flat),
+            origin: format!("iu4_gemm::Spec {}", spec.variant_name()),
+        });
+    }
     entries
 });
 
@@ -1269,6 +1438,10 @@ fn runtime_source(module: &str, source: &str) -> Result<String, String> {
             "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n#define I8_TILE 256\n{}{body}",
             read("kernels/src/block_i8_128_quant.hip")?
         ),
+        "gemv_mq6sym_i8_gfx1201" | "gemm_mq6sym_i8_gfx1201" => format!(
+            "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n{}{body}",
+            read("kernels/src/block_i8_128_quant.hip")?
+        ),
         "ffn_grouped_activation_rotate_i8_gfx1201" => format!(
             "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n\
              #define HIPFIRE_FFN_GROUPED_ACTIVATION_NO_STANDALONE 1\n{}{}{}{}{body}",
@@ -1276,6 +1449,21 @@ fn runtime_source(module: &str, source: &str) -> Result<String, String> {
             read("kernels/src/block_i8_128_emit.hip")?,
             read("kernels/src/mq_fwht256.h")?,
             read("kernels/src/ffn_grouped_activation_pad.hip")?
+        ),
+        "topk8_rows_mq6g256v2" => format!(
+            "{}{}{body}",
+            read("kernels/src/topk8_select.hip")?,
+            read("kernels/src/qwen4_gemv_mq6g256v2.hip")?
+        ),
+        "moe_route_scatter_wide" => format!(
+            "{}{}{body}",
+            read("kernels/src/moe_router_softmax_top10_f32_fast.hip")?,
+            read("kernels/src/qwen4_moe_scatter_fused_k8.hip")?
+        ),
+        "qwen4_moe_ep_a8_rot_gfx12" => format!(
+            "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n{}{}{body}",
+            read("kernels/src/block_i8_128_quant.hip")?,
+            read("kernels/src/qwen4_moe_ep_a8.gfx12.hip")?
         ),
         _ => body,
     })

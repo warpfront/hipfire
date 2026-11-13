@@ -56,10 +56,11 @@ pub fn inst(name: &str, operands: Vec<Operand>, mods: Modifiers) -> Result<Inst,
         Operand::Literal(v) => Some(*v),
         _ => None,
     });
-    let built = Inst::from_parts(
+    let built = Inst::from_encoding(
         Arch::Gfx1201,
         row.op,
         row.form,
+        row.variant,
         fields,
         operands.into(),
         mods,

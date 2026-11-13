@@ -47,22 +47,24 @@ pub use forward::{
 pub use load::{
     host_mapped_expert_accounting, load_weights, load_weights_dense_tp_rank, load_weights_ep_rank,
     load_weights_ep_rank_with_fault, load_weights_with_fault, preflight_weights_dense_tp, EpFault,
-    EpLoadStage, HfqSource, Layout, ParoSource, StagedLoadFault,
+    EpLoadStage, HfqSource, Layout, StagedLoadFault,
 };
 pub use prefill::{
     forward_prefill_batch, forward_prefill_batch_capped,
     forward_prefill_batch_capture_extract_hidden, forward_prefill_batch_capture_hidden,
+    forward_prefill_batch_ordinary, forward_prefill_batch_ordinary_capped,
     forward_prefill_batch_single_chunk_captured, forward_prefill_batch_single_chunk_captured_opts,
     forward_prefill_batch_with_pbs, forward_prefill_batch_with_pbs_opts,
     ordinary_prefill_chunk_limit, prefill_batch_pbs_eligible, prefill_max_batch,
-    prefill_max_batch_ep, prefill_max_batch_tp, qwen35_layer_batch_admissible,
-    upload_prefill_batch_inputs, ExtractHiddenCapture, PREFILL_MAX_BATCH,
+    prefill_max_batch_ep, prefill_max_batch_tp, provision_gdn_stream,
+    qwen35_layer_batch_admissible, upload_prefill_batch_inputs, ExtractHiddenCapture,
+    PREFILL_MAX_BATCH,
 };
 pub(crate) use prefill::{moe_prefill_dtypes, prefill_moe_ffn_body_batched};
 pub use weights::{
     mixed_expert_tag, DeltaNetLayerWeights, DeltaNetMoeLayerWeights, DeltaNetState, ExpertWeights,
     FullAttnLayerWeights, FullAttnMoeLayerWeights, GpuTensorDescriptor, LayerWeights,
-    MoeFfnWeights, MoeParoSidecars, ParoDescriptor, Qwen35EpConfigFingerprint, Qwen35EpShardInfo,
-    Qwen35HfqSourceIdentity, Qwen35LayerSeal, Qwen35LocalExpertDescriptor, Qwen35MoeFfnSeal,
-    Qwen35RankSeal, Qwen35Weights, SharedExpertWeights, StateQuant, WeightTensorDescriptor,
+    MoeFfnWeights, Qwen35EpConfigFingerprint, Qwen35EpShardInfo, Qwen35HfqSourceIdentity,
+    Qwen35LayerSeal, Qwen35LocalExpertDescriptor, Qwen35MoeFfnSeal, Qwen35RankSeal, Qwen35Weights,
+    SharedExpertWeights, StateQuant, WeightTensorDescriptor,
 };

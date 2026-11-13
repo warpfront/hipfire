@@ -386,9 +386,8 @@ impl PreparedMq6Program {
         // GFX11 CWSR needs `COMPUTE_PGM_RSRC1.PRIV` on every raw-PM4
         // dispatch; this program is exact gfx1151 (`:107`), so the shared
         // enablement/debug-control helper always says yes here.
-        let mut commands = Gfx10Pm4CommandBuffer::new_stateful().with_gfx11_cwsr_priv(
-            gfx11_cwsr_priv(Pm4Architecture::Gfx11),
-        );
+        let mut commands = Gfx10Pm4CommandBuffer::new_stateful()
+            .with_gfx11_cwsr_priv(gfx11_cwsr_priv(Pm4Architecture::Gfx11));
         for op in plan.segment_ops(&plan.segments[0]) {
             match op {
                 Pm4Op::Entry => commands.acquire_system(),

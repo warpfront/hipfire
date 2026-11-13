@@ -19,9 +19,7 @@ use hipfire_engine::terminal::*;
 use hipfire_engine::turn_cache::*;
 use hipfire_loader::{AsstTurnCache, LoadedModel};
 use hipfire_runtime::prompt_frame::ThinkMode;
-use hipfire_runtime::spec::{
-    ClientEvent, EvictRetain, FinishSummary, SpecTarget, Speculator, StopReason,
-};
+use hipfire_runtime::spec::{ClientEvent, FinishSummary, SpecTarget, Speculator, StopReason};
 use std::any::Any;
 use std::io::Write;
 
@@ -254,6 +252,185 @@ pub fn production_fail_closed_rollback_live(
         gpu.replay.begin_replay_observation_window();
     }
     epilogue
+}
+
+/// What a mid-decode client cancel does with the live conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelDisposition {
+    /// The target KV / recurrent state is exactly the committed stream of
+    /// `len` tokens (prompt + every decode token actually fed): the cancelled
+    /// request is a committed turn prefix, so keep it for the next request.
+    KeepCommitted { len: usize },
+    /// The cursors cannot attest the boundary (or the route is outside the
+    /// validated configuration): the full fail-closed reset.
+    FullReset,
+}
+
+/// The one decision a mid-decode cancel makes (host-side, no device work).
+///
+/// `eligible` is the route/configuration gate the caller proves (single GPU,
+/// resident Qwen3.5-class target, no KV compaction, no adaptive KV,
+/// no stale drafter). `stream_len` is the length of the host record of the
+/// committed token stream (`None` = it could not be reconstructed) and `fed`
+/// the device cursor: how many tokens the target KV / DeltaNet state has
+/// consumed. The boundary is attested only when both agree.
+pub fn cancel_disposition(
+    eligible: bool,
+    stream_len: Option<usize>,
+    fed: usize,
+) -> CancelDisposition {
+    match stream_len {
+        Some(len) if eligible && fed > 0 && len == fed => {
+            CancelDisposition::KeepCommitted { len: fed }
+        }
+        _ => CancelDisposition::FullReset,
+    }
+}
+
+/// Committed stream of a speculative decode at a cycle boundary (the top of
+/// the decode loop): `prompt` plus the decode tokens already fed into the
+/// target, i.e. `emitted` without its pending seed (the seed is emitted to the
+/// client but not yet fed). `None` unless the cursors agree: `position` is the
+/// number of tokens fed, `emitted` holds exactly one pending seed beyond the
+/// fed decode tokens (`pending_seed`, `None` when the last token is not
+/// committable) and that seed is its last element.
+pub fn spec_cancel_committed_stream(
+    prompt: &[u32],
+    emitted: &[u32],
+    position: usize,
+    pending_seed: Option<u32>,
+) -> Option<Vec<u32>> {
+    let fed_decode = position.checked_sub(prompt.len())?;
+    if emitted.len() != fed_decode + usize::from(pending_seed.is_some()) {
+        return None;
+    }
+    if let Some(seed) = pending_seed {
+        if emitted.last() != Some(&seed) {
+            return None;
+        }
+    }
+    let mut stream = Vec::with_capacity(position);
+    stream.extend_from_slice(prompt);
+    stream.extend_from_slice(&emitted[..fed_decode]);
+    Some(stream)
+}
+
+/// Free every checkpoint beyond the committed length (it would describe
+/// tokens the kept conversation no longer contains).
+fn free_checkpoints_past(
+    cks: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    committed_len: usize,
+    gpu: &mut rdna_compute::Gpu,
+) {
+    let mut i = 0;
+    while i < cks.len() {
+        if cks[i].0 > committed_len {
+            cks.remove(i).1.free_gpu(gpu);
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// Kept-prefix settlement: drop checkpoints past the kept length, drain the
+/// device so the terminal follows an attested state. No graph or replay
+/// invalidation: a cycle boundary is the state a normal end-of-turn leaves.
+fn settle_kept_prefix(
+    prefill_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    dflash_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    committed_len: usize,
+    gpu: &mut rdna_compute::Gpu,
+) -> RollbackEpilogue {
+    free_checkpoints_past(prefill_checkpoints, committed_len, gpu);
+    free_checkpoints_past(dflash_checkpoints, committed_len, gpu);
+    let epilogue = fail_closed_epilogue_after_sync(Ok(()), fail_closed_device_sync(gpu));
+    if epilogue.rolled_back {
+        eprintln!("[qwen-cache cancel] kept committed prefix pos={committed_len}");
+    }
+    epilogue
+}
+
+/// Boundary evidence for [`production_cancel_epilogue_live`].
+pub struct CancelBoundary {
+    /// The route/configuration gate (see [`cancel_disposition`]).
+    pub eligible: bool,
+    /// Tokens the target KV / DeltaNet state has consumed.
+    pub fed: usize,
+    /// Host record of those tokens (see [`spec_cancel_committed_stream`]).
+    pub stream: Option<Vec<u32>>,
+}
+
+/// Mid-decode cancel epilogue for the speculative route (live-slot form, the
+/// sibling of [`production_fail_closed_rollback_live`]). A cancel at a
+/// committed cycle boundary keeps the session: `seq_pos`/`conversation_tokens`
+/// become the committed stream, the assistant-turn cache, checkpoint rings
+/// (at or before the kept length) and drafter state are left as a normal turn
+/// end leaves them, and the device is synchronized. Anything the cursors
+/// cannot attest, or a failed synchronize, takes the full fail-closed reset.
+#[allow(clippy::too_many_arguments)]
+pub fn production_cancel_epilogue_live(
+    seq_pos: &mut usize,
+    conversation_tokens: &mut Vec<u32>,
+    prefill_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    dflash_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    asst_turn_cache: &mut hipfire_loader::AsstTurnCache,
+    gpu: &mut rdna_compute::Gpu,
+    slot: &mut dyn SpecTarget,
+    spec: &mut dyn Speculator,
+    boundary: CancelBoundary,
+) -> RollbackEpilogue {
+    let CancelBoundary {
+        eligible,
+        fed,
+        stream,
+    } = boundary;
+    if let (CancelDisposition::KeepCommitted { len }, Some(stream)) = (
+        cancel_disposition(eligible, stream.as_ref().map(Vec::len), fed),
+        stream,
+    ) {
+        *seq_pos = len;
+        *conversation_tokens = stream;
+        let epilogue = settle_kept_prefix(prefill_checkpoints, dflash_checkpoints, len, gpu);
+        if epilogue.rolled_back {
+            return epilogue;
+        }
+    }
+    production_fail_closed_rollback_live(
+        seq_pos,
+        conversation_tokens,
+        prefill_checkpoints,
+        dflash_checkpoints,
+        asst_turn_cache,
+        gpu,
+        slot,
+        spec,
+    )
+}
+
+/// Mid-decode cancel epilogue for the AR route: `seq_pos` and
+/// `conversation_tokens` are already the committed stream (every fed token is
+/// committed as it is forwarded), so a cancel at the top of the decode loop
+/// keeps them when they agree and `eligible`, else the full reset
+/// ([`production_fail_closed_rollback`]).
+pub fn production_cancel_epilogue(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    eligible: bool,
+) -> RollbackEpilogue {
+    if let CancelDisposition::KeepCommitted { len } =
+        cancel_disposition(eligible, Some(m.conversation_tokens.len()), m.seq_pos)
+    {
+        let epilogue = settle_kept_prefix(
+            &mut m.prefill_checkpoints,
+            &mut m.dflash_checkpoints,
+            len,
+            gpu,
+        );
+        if epilogue.rolled_back {
+            return epilogue;
+        }
+    }
+    production_fail_closed_rollback(m, gpu, None, None)
 }
 
 fn qwen4_pp_owns_reset(pp: usize, active_qwen4_mesh: bool) -> bool {
@@ -511,6 +688,24 @@ fn emit_active_error_route_aware(
     }
 }
 
+/// The HIP runtime's out-of-memory text (`hipMalloc: out of memory`, `hipMemCreate: out of memory`).
+pub(crate) const DEVICE_OUT_OF_MEMORY: &str = "out of memory";
+
+/// The wire class and retryability of a fail-closed error. A device that ran out of memory is a
+/// capacity condition, never the client's fault: `overload` + retryable (HTTP 503 with
+/// `Retry-After`), whatever class the failing step names. Every other failure keeps its class.
+pub(crate) fn fail_closed_wire<'a>(
+    message: &str,
+    class: &'a str,
+    retryable: bool,
+) -> (&'a str, bool) {
+    if message.contains(DEVICE_OUT_OF_MEMORY) {
+        ("overload", true)
+    } else {
+        (class, retryable)
+    }
+}
+
 /// Emit one correlated fail-closed error (no done). Appends epilogue context
 /// when rollback could not be attested.
 pub fn emit_fail_closed_error(
@@ -525,6 +720,7 @@ pub fn emit_fail_closed_error(
         Some(ctx) if !epilogue.rolled_back => format!("{message} ({ctx})"),
         _ => message.to_string(),
     };
+    let (class, retryable) = fail_closed_wire(message, class, retryable);
     emit_active_error_route_aware(stdout, id, &full, class, retryable, epilogue.rolled_back);
     let _ = stdout.flush();
 }
@@ -545,6 +741,7 @@ pub fn emit_fail_closed_error_for_route(
         Some(ctx) if !epilogue.rolled_back => format!("{message} ({ctx})"),
         _ => message.to_string(),
     };
+    let (class, retryable) = fail_closed_wire(message, class, retryable);
     crate::ar::emit_generation_error(
         route,
         stdout,
@@ -1029,10 +1226,11 @@ pub fn free_checkpoints(
 /// direct fields m.dn_state/m.kv_cache — sourcing from the bundle (no hoist →
 /// no double-free). Mirrors the per-LA-device memset for pp>1. No-op off qwen35.
 ///
-/// Accumulates every `bind_thread` and HIP `memset` failure. Clears
-/// `s_matrices`, `s_scales`, `conv_states`, and `s_ef_residual` on both
-/// multi-GPU and single-GPU paths. Returns `Err` with the joined failures
-/// (still attempts every surface — does not short-circuit).
+/// Accumulates every `bind_thread` and HIP `memset` failure. Clears every
+/// state family (`s_matrices`, `s_scales`, `conv_states`, `s_ef_residual` and
+/// the persistent GDN carry) and the stream cursors on both multi-GPU and
+/// single-GPU paths. Returns `Err` with the joined failures (still attempts
+/// every surface — does not short-circuit).
 pub fn reset_qwen35_recurrent(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
@@ -1047,66 +1245,36 @@ pub fn reset_qwen35_recurrent(
             m.pp_dn_la_to_device.as_ref(),
         ) {
             let dn = &b.dn_state;
-            for (i, s) in dn.s_matrices.iter().enumerate() {
-                let g = &mut gpus.devices[la[i] as usize];
-                if let Err(e) = g.bind_thread() {
-                    push_reset_err(&mut first_err, "pp s_matrices bind_thread", e);
-                }
-                if let Err(e) = g.hip.memset(&s.buf, 0, s.buf.size()) {
-                    push_reset_err(&mut first_err, "pp s_matrices memset", e);
-                }
-            }
-            for (i, s) in dn.s_scales.iter().enumerate() {
-                let g = &mut gpus.devices[la[i] as usize];
-                if let Err(e) = g.bind_thread() {
-                    push_reset_err(&mut first_err, "pp s_scales bind_thread", e);
-                }
-                if let Err(e) = g.hip.memset(&s.buf, 0, s.buf.size()) {
-                    push_reset_err(&mut first_err, "pp s_scales memset", e);
-                }
-            }
-            for (i, s) in dn.conv_states.iter().enumerate() {
-                let g = &mut gpus.devices[la[i] as usize];
-                if let Err(e) = g.bind_thread() {
-                    push_reset_err(&mut first_err, "pp conv_states bind_thread", e);
-                }
-                if let Err(e) = g.hip.memset(&s.buf, 0, s.buf.size()) {
-                    push_reset_err(&mut first_err, "pp conv_states memset", e);
+            // Every family of `DeltaNetState::families`, each on its LA layer's
+            // device. Multi-GPU currently leaves s_ef_residual and the carry
+            // empty; those loops are no-ops then but keep single-GPU parity.
+            const FAMILY_NAMES: [&str; 8] = [
+                "s_matrices",
+                "s_scales",
+                "conv_states",
+                "s_ef_residual",
+                "carry tile_state",
+                "carry tile_conv",
+                "carry raw_qkv",
+                "carry raw_ab",
+            ];
+            for (name, fam) in FAMILY_NAMES.iter().zip(dn.families()) {
+                for (i, s) in fam.iter().enumerate() {
+                    let g = &mut gpus.devices[la[i] as usize];
+                    if let Err(e) = g.bind_thread() {
+                        push_reset_err(&mut first_err, &format!("pp {name} bind_thread"), e);
+                    }
+                    if let Err(e) = g.hip.memset(&s.buf, 0, s.buf.size()) {
+                        push_reset_err(&mut first_err, &format!("pp {name} memset"), e);
+                    }
                 }
             }
-            // multi-GPU currently leaves s_ef_residual empty; loop is a no-op then,
-            // but keeps single-GPU parity if EF is ever wired per-device.
-            for (i, s) in dn.s_ef_residual.iter().enumerate() {
-                let g = &mut gpus.devices[la[i] as usize];
-                if let Err(e) = g.bind_thread() {
-                    push_reset_err(&mut first_err, "pp s_ef_residual bind_thread", e);
-                }
-                if let Err(e) = g.hip.memset(&s.buf, 0, s.buf.size()) {
-                    push_reset_err(&mut first_err, "pp s_ef_residual memset", e);
-                }
-            }
+            b.dn_state.stream.reset_meta();
         }
-    } else if let Some(b) = m.qwen35() {
-        let dn = &b.dn_state;
-        for s in &dn.s_matrices {
-            if let Err(e) = gpu.hip.memset(&s.buf, 0, s.buf.size()) {
-                push_reset_err(&mut first_err, "s_matrices memset", e);
-            }
-        }
-        for s in &dn.s_scales {
-            if let Err(e) = gpu.hip.memset(&s.buf, 0, s.buf.size()) {
-                push_reset_err(&mut first_err, "s_scales memset", e);
-            }
-        }
-        for s in &dn.conv_states {
-            if let Err(e) = gpu.hip.memset(&s.buf, 0, s.buf.size()) {
-                push_reset_err(&mut first_err, "conv_states memset", e);
-            }
-        }
-        for s in &dn.s_ef_residual {
-            if let Err(e) = gpu.hip.memset(&s.buf, 0, s.buf.size()) {
-                push_reset_err(&mut first_err, "s_ef_residual memset", e);
-            }
+    } else if let Some(b) = m.qwen35_mut() {
+        // Owner reset: every family incl. the GDN carry, then the cursors.
+        if let Err(e) = b.dn_state.reset(gpu) {
+            push_reset_err(&mut first_err, "dn_state reset", e);
         }
     }
     if let Some(b) = m.qwen35_mut() {
@@ -1116,6 +1284,29 @@ pub fn reset_qwen35_recurrent(
         Some(e) => Err(e),
         None => Ok(()),
     }
+}
+
+/// Cold start that keeps the assistant-turn cache: the attested rollback
+/// ([`production_fail_closed_rollback`], the one reset owner the daemon's
+/// `reset` command uses, which clears the cache) with the cache moved out and
+/// back. Entries are keyed by an assistant turn's content, not its position,
+/// and map it to the exact tokens the model emitted, so they stay valid across
+/// an ordinary cold start; dropping them would make the next turn's history
+/// render diverge from the KV it has just written and every following turn
+/// start cold. Used by the vision turn that cannot continue the resident
+/// conversation and by the decide session's cold start.
+pub fn cold_reset_keep_turn_cache(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+) -> RollbackEpilogue {
+    let turns = std::mem::replace(
+        &mut m.asst_turn_cache,
+        hipfire_loader::AsstTurnCache::new_from_env(),
+    );
+    let epilogue = production_fail_closed_rollback(m, gpu, None, None);
+    m.asst_turn_cache = turns;
+    m.vl_image_fingerprints.clear();
+    epilogue
 }
 
 /// Reset Qwen4's complete request owner (PLE epoch plus every recurrent/QSA/
@@ -1447,6 +1638,9 @@ pub fn fail_closed_reset_target_and_spec(
         if let Some(b) = m.llama_mut() {
             b.kv.compact_offset = 0;
         }
+        if let Some(b) = m.dots_ocr_mut() {
+            b.state.reset();
+        }
         if let Some(b) = m.qwen2_mut() {
             b.state.reset();
         }
@@ -1619,6 +1813,8 @@ pub struct SpecEmitRequest {
     /// runs when `tools` is `Some`).
     pub enable_grammar: bool,
     pub stop: Vec<String>,
+    /// vLLM-compatible `min_tokens` (0 ⇒ none); see `SpecEmitCtx::min_tokens`.
+    pub min_tokens: usize,
     pub max_think: usize,
     pub assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
     /// Reasoning-effort level (consumed by the ds4 emitter; ignored by ChatML).
@@ -1820,7 +2016,6 @@ std::thread_local! {
         const { std::cell::Cell::new(false) };
     static GENERATION_FAULT_AFTER_FIRST_DECODE: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
-    static EVICTION_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 // Test-only fault points for the vision (Qwen35-VL / dots.ocr) generation
@@ -1890,29 +2085,14 @@ pub fn take_generation_fault_after_first_decode() -> bool {
     GENERATION_FAULT_AFTER_FIRST_DECODE.with(|c| c.replace(false))
 }
 
-/// Arm (or disarm) the Qwen AR KV-eviction fault: the next eviction step
-/// fails as a HIP error would.
-#[doc(hidden)]
-pub fn arm_eviction_fault(armed: bool) {
-    EVICTION_FAULT.with(|c| c.set(armed));
-}
-
-/// Take the armed KV-eviction fault, disarming it.
-#[doc(hidden)]
-pub fn take_eviction_fault() -> bool {
-    EVICTION_FAULT.with(|c| c.replace(false))
-}
-
 /// Arm the generation fault hooks from a daemon `generate` request carrying
-/// `test_fault_after_prefill` / `test_fault_after_first_decode` /
-/// `test_fault_eviction` booleans. Missing or non-boolean fields disarm.
+/// `test_fault_after_prefill` / `test_fault_after_first_decode` booleans. Missing or non-boolean fields disarm.
 /// Test-only wiring; the hooks are default-off and one-shot.
 #[doc(hidden)]
 pub fn arm_generation_faults_from_request(msg: &serde_json::Value) {
     let flag = |k: &str| msg.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
     arm_generation_fault_after_prefill(flag("test_fault_after_prefill"));
     arm_generation_fault_after_first_decode(flag("test_fault_after_first_decode"));
-    arm_eviction_fault(flag("test_fault_eviction"));
     #[cfg(feature = "serve-fault-inject")]
     hipfire_dispatch::pipeline::sealed_moe::arm_fault_after_expert_mutation(flag(
         "test_fault_after_expert_mutation",
@@ -1924,7 +2104,6 @@ pub fn arm_generation_faults_from_request(msg: &serde_json::Value) {
 pub fn disarm_generation_faults() {
     arm_generation_fault_after_prefill(false);
     arm_generation_fault_after_first_decode(false);
-    arm_eviction_fault(false);
     #[cfg(feature = "serve-fault-inject")]
     hipfire_dispatch::pipeline::sealed_moe::arm_fault_after_expert_mutation(false);
 }
@@ -1954,6 +2133,18 @@ impl Drop for RequestFaultGuard {
         crate::ar::arm_fault_after_prefill(false);
         disarm_generation_faults();
     }
+}
+
+/// Test-only: pool allocations to let through before the buffer pool's injected
+/// out-of-memory fires, from a `generate` request's `test_fault_pool_oom_after`
+/// (`rdna_compute::Gpu::inject_pool_oom`). `None` when the field is absent or not
+/// a non-negative integer, so an unarmed request disarms.
+#[cfg(feature = "serve-fault-inject")]
+#[doc(hidden)]
+pub fn pool_oom_after_from_request(msg: &serde_json::Value) -> Option<u32> {
+    msg.get("test_fault_pool_oom_after")
+        .and_then(|v| v.as_u64())
+        .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
 }
 
 // ── test-support helpers, moved with the daemon test modules ──
@@ -2003,9 +2194,8 @@ pub fn emit_qwen_dflash_done_terminal(
     cycles: usize,
     cached_tokens: usize,
     finish_reason: &str,
-    pflash: Option<(&str, f32)>,
 ) {
-    let mut done_env = crate::qwen::qwen_dflash_done_value(
+    let done_env = crate::qwen::qwen_dflash_done_value(
         id,
         generated,
         tok_s,
@@ -2020,12 +2210,6 @@ pub fn emit_qwen_dflash_done_terminal(
         finish_reason,
         active_attempt_id(),
     );
-    if let Some((reason, alpha)) = pflash {
-        done_env["pflash"] = serde_json::json!({
-            "bypass_reason": reason,
-            "alpha": alpha,
-        });
-    }
     let _ = writeln!(stdout, "{}", done_env);
     let _ = stdout.flush();
 }
@@ -2234,5 +2418,38 @@ mod tests {
         super::emit_prefill_progress(&mut none, "r1", Some(4), 4096, 4096);
         super::emit_prefill_progress(&mut none, "r1", Some(4), 512, 512);
         assert!(none.is_empty(), "no event at done == total");
+    }
+
+    #[test]
+    fn device_out_of_memory_fails_closed_as_a_retryable_overload() {
+        // cp9 j8160: a single-card singleton prefill that ran out of device memory reached the
+        // client as HTTP 400 `invalid_request_error` (class `validation`).
+        let oom = "prefill: Qwen4 bundle forward: Qwen4 GPU forward dispatch error: execute Qwen4 \
+                   layer program: Hip(\"HipError(2): hipMalloc: out of memory\")";
+        assert_eq!(
+            super::fail_closed_wire(oom, "validation", false),
+            ("overload", true)
+        );
+        assert_eq!(
+            super::fail_closed_wire(
+                "QSA context map failed: HipError(2): hipMemCreate: out of memory",
+                "gpu",
+                false
+            ),
+            ("overload", true)
+        );
+        // Every other failure keeps the class and retryability its call site names.
+        assert_eq!(
+            super::fail_closed_wire(
+                "think token budget exceeded (validation)",
+                "validation",
+                false
+            ),
+            ("validation", false)
+        );
+        assert_eq!(
+            super::fail_closed_wire("busy", "transient", true),
+            ("transient", true)
+        );
     }
 }

@@ -21,15 +21,39 @@
 //! the measured gfx1151/gfx1201 tables of `alu.rs` wherever the sweeps are identical (see its module doc for the
 //! per-opcode differences, selected through `Arch::Gfx1201`); a gfx1201 object never runs on the gfx1151 model.
 //! `Emulator::nan_meets_nan` (lab exactness contract) relaxes only the NaN-layout refusals, never non-NaN arithmetic.
+//!
+//! Byte-PC execution and helpers: every instruction with a virtual address (`prov.pc`: each lifted instruction, each
+//! [`Helper`] instruction) has the emulated byte PC `CODE_BASE + va`; the interpreter's step index is only an
+//! index into that map. `s_getpc_b64` writes the byte PC of the next instruction, `s_swappc_b64` does so and jumps to
+//! its source pair, `s_setpc_b64` jumps to its source pair; a target that is not a loaded instruction boundary is an
+//! error, and nothing else changes (no ABI is assumed: no register but the destination pair is written). Helpers are
+//! loaded only on explicit request (`Emulator::with_helpers`; `new` loads the kernel alone, so a call out of it fails
+//! closed at run time). The supported call forms are exactly getpc/swappc/setpc over SGPR pairs: `s_call_b64` has no
+//! semantics row, and an indirect call through loaded data or a relocation resolves to a pointer that is not a loaded
+//! boundary. `CODE_BASE` is a fixed emulator load base: the driver's real code base is observable only through PC
+//! values, and compiler-generated code uses PCs relative to `s_getpc_b64` alone. Running past the last instruction of
+//! the kernel or of a helper (or a branch out of a helper) is an error, never a fall into the next extent.
 mod alu;
 pub mod convert;
 mod dot;
 #[cfg(test)]
 mod gate_ops_tests;
+#[cfg(test)]
+mod gfx11_decode_gap_tests;
+#[cfg(test)]
+mod gfx12_decode_gap_tests;
 mod hw;
+#[cfg(test)]
+mod hw_replay;
+pub use alu::f32_nan_swap_payload_safe;
 pub use hw::RunReport;
 mod memory;
 pub mod mma;
+#[cfg(test)]
+#[rustfmt::skip]
+mod fp8_fixtures;
+#[cfg(test)]
+mod fp8_receipts;
 #[cfg(test)]
 mod swmmac_fixtures;
 pub mod trans;
@@ -38,11 +62,18 @@ mod wave64_tests;
 mod wide;
 mod wmma;
 use crate::{
+    helpers::Helper,
     inst::{Abi, Wave},
     operand::{Half, ImmField, InlineConst, Operand, Special},
+    passes::cfg::dwords_of,
     reg::Kind,
     Arch, Inst, Kernel, Program,
 };
+use std::collections::HashMap;
+
+/// Emulated byte PC of the instruction at ELF virtual address `va`: `CODE_BASE + va`. A fixed emulator choice, not a
+/// hardware measurement (see the module doc).
+pub const CODE_BASE: u64 = 0;
 
 pub type Result<T, E = String> = std::result::Result<T, E>;
 #[derive(Clone, Debug)]
@@ -304,7 +335,15 @@ struct State {
     scratch: Vec<Vec<u8>>,
 }
 impl State {
-    fn new(arch: Arch, kernel: &Kernel, launch: &Launch, wave: usize) -> Result<Self> {
+    /// `arch` selects the numerics (the model the run executes under, possibly an `as_*` opt-in); `target` is the
+    /// program's own architecture and alone decides the ABI (gfx12 workgroup ids in ttmps, exact user-SGPR count).
+    fn new(
+        arch: Arch,
+        target: Arch,
+        kernel: &Kernel,
+        launch: &Launch,
+        wave: usize,
+    ) -> Result<Self> {
         let lanes = match kernel.wave {
             Wave::Wave32 => 32usize,
             Wave::Wave64 => 64usize,
@@ -363,13 +402,13 @@ impl State {
         }
         let rs = d.compute_pgm_rsrc2.0;
         // hipcc gfx11 kernels declare more user SGPRs than they enable (padding between the last enabled user
-        // register and the workgroup ids, left 0); the ids follow the DECLARED count. gfx1201 ids are in ttmps.
+        // register and the workgroup ids, left 0); the ids follow the DECLARED count. gfx12 ids are in ttmps.
         let declared = ((rs >> 1) & 31) as usize;
-        if sg > declared || (sg != declared && arch == Arch::Gfx1201) {
+        if sg > declared || (sg != declared && target.is_gfx12()) {
             return Err("descriptor user SGPR count disagrees with enabled properties".into());
         }
         sg = declared;
-        if arch == Arch::Gfx1201 {
+        if target.is_gfx12() {
             st.t[9] = launch.workgroup[0];
             st.t[7] = if rs & (1 << 8) != 0 {
                 launch.workgroup[1] & 0xffff
@@ -468,6 +507,11 @@ impl State {
         })
     }
     fn read64(&self, op: &Operand, lane: usize) -> Result<u64> {
+        // An explicit 64-bit `vcc` (SGPR pair 106:107 as scalar DATA, e.g. an SMEM base) is VCC_LO and VCC_HI in full,
+        // also in wave32, where VCC_HI is an ordinary 32-bit register above the lane mask.
+        if let Operand::Special(Special::Vcc) = op {
+            return Ok(self.vcc);
+        }
         Ok(u64::from(self.read(op, lane, 0)?) | u64::from(self.read(op, lane, 1)?) << 32)
     }
     /// 64-bit source of a 64-bit vector/scalar operation. `Reg` is a register pair, a wave32 `vcc`/`exec` pair has a
@@ -481,7 +525,8 @@ impl State {
             }
             Operand::Special(Special::SrcSharedBase) => u64::from(SHARED_APERTURE_HI) << 32,
             Operand::Special(Special::SrcPrivateBase) => u64::from(PRIVATE_APERTURE_HI) << 32,
-            Operand::Special(Special::Vcc | Special::VccLo) => self.vcc & self.lane_mask(),
+            Operand::Special(Special::Vcc) => self.vcc,
+            Operand::Special(Special::VccLo) => self.vcc & self.lane_mask(),
             Operand::Special(Special::Exec | Special::ExecLo) => self.exec & self.lane_mask(),
             Operand::Special(Special::Null) => 0,
             Operand::Inline(InlineConst::Integer(n)) => i64::from(*n) as u64,
@@ -507,8 +552,13 @@ impl State {
                 self.exec = value & self.lane_mask();
                 Ok(())
             }
-            Operand::Special(Special::Vcc | Special::VccLo) => {
-                self.vcc = value & self.lane_mask();
+            // Explicit 64-bit `vcc`: both halves are data (see `read64`).
+            Operand::Special(Special::Vcc) => {
+                self.vcc = value;
+                Ok(())
+            }
+            Operand::Special(Special::VccLo) => {
+                self.set_vcc_mask(value);
                 Ok(())
             }
             Operand::Special(Special::Null) => Ok(()),
@@ -560,11 +610,17 @@ impl State {
             _ => return Err(format!("not a lane-mask operand {op}")),
         })
     }
+    /// Write VCC as a lane mask: only the wave's lanes change. In wave32 VCC_HI is an ordinary 32-bit register above
+    /// the lane mask (scalar data, readable as `vcc` / `vcc_hi`), so a mask write must not clear it.
+    fn set_vcc_mask(&mut self, mask: u64) {
+        let lanes = self.lane_mask();
+        self.vcc = (self.vcc & !lanes) | (mask & lanes);
+    }
     fn put_mask(&mut self, op: &Operand, value: u64) -> Result<()> {
         let wide = self.lanes == 64;
         let value = value & self.lane_mask();
         match op {
-            Operand::Special(Special::Vcc | Special::VccLo) => self.vcc = value,
+            Operand::Special(Special::Vcc | Special::VccLo) => self.set_vcc_mask(value),
             Operand::Special(Special::Exec | Special::ExecLo) => self.exec = value,
             Operand::Special(Special::Null) => (),
             Operand::Reg(r) if r.kind != Kind::V => {
@@ -610,10 +666,10 @@ impl State {
                 Special::ExecHi if self.lanes == 64 => {
                     self.exec = (self.exec & 0xffff_ffff) | u64::from(value) << 32
                 }
-                Special::VccHi if self.lanes == 64 => {
-                    self.vcc = (self.vcc & 0xffff_ffff) | u64::from(value) << 32
-                }
-                Special::ExecHi | Special::VccHi => (),
+                // wave32: VCC_HI is ordinary scalar data (hipcc allocates it as a general SGPR); only wave64 aliases it
+                // with the mask, but in both cases the write must land, never be dropped.
+                Special::VccHi => self.vcc = (self.vcc & 0xffff_ffff) | u64::from(value) << 32,
+                Special::ExecHi => (),
                 Special::Scc => self.scc = value != 0,
                 Special::M0 => self.m0 = value,
                 Special::Null => (),
@@ -648,6 +704,71 @@ struct Step<'a> {
     inst: &'a Inst,
     name: &'static str,
     class: Class,
+    /// ELF virtual address: a kernel instruction's `prov.pc` (absent for an authored instruction), a helper
+    /// instruction's decoded address.
+    va: Option<u64>,
+    /// Virtual address of the next instruction in memory (`va` plus the encoded dwords): what `s_getpc_b64` and
+    /// `s_swappc_b64` write.
+    next_va: Option<u64>,
+    /// Step index of a taken `s_branch`/`s_cbranch_*`: the CFG block start for a kernel branch (reported only if taken
+    /// when it has no label), the decoded SOPP target for a helper branch (resolved at construction).
+    branch: Result<usize, &'static str>,
+    /// Index into `Emulator::extents`.
+    extent: usize,
+    /// Last instruction of its extent: falling through it runs into whatever follows in `steps`.
+    extent_end: bool,
+}
+/// The kernel (index 0) or one helper: the unit a fall-through guard and error contexts name.
+struct Extent {
+    name: String,
+    helper: bool,
+}
+const BRANCHES: [&str; 7] = [
+    "s_branch",
+    "s_cbranch_scc0",
+    "s_cbranch_scc1",
+    "s_cbranch_execz",
+    "s_cbranch_execnz",
+    "s_cbranch_vccz",
+    "s_cbranch_vccnz",
+];
+/// Target step of the helper branch at step `i`: `next_va + 4 * simm16` must be an instruction boundary of the same
+/// helper.
+fn helper_branch_target(
+    steps: &[Step],
+    extents: &[Extent],
+    by_va: &HashMap<u64, usize>,
+    i: usize,
+) -> Result<usize> {
+    let s = &steps[i];
+    let at = format!(
+        "helper `{}` at {:#x}: {}",
+        extents[s.extent].name,
+        s.va.expect("helper step has an address"),
+        s.name
+    );
+    let mut offsets = s.inst.operands.iter().filter_map(|o| match o {
+        Operand::Imm(ImmField::Sopp(off)) => Some(*off),
+        _ => None,
+    });
+    let (Some(off), None) = (offsets.next(), offsets.next()) else {
+        return Err(format!("{at}: no single SOPP offset operand"));
+    };
+    let next = s.next_va.expect("helper step has an address");
+    let target = i64::try_from(next)
+        .ok()
+        .and_then(|n| n.checked_add(4 * i64::from(off)))
+        .and_then(|t| u64::try_from(t).ok())
+        .ok_or_else(|| format!("{at}: branch target leaves the address space"))?;
+    by_va
+        .get(&target)
+        .copied()
+        .filter(|&t| steps[t].extent == s.extent)
+        .ok_or_else(|| {
+            format!(
+                "{at}: branch target {target:#x} is not an instruction boundary of the same helper"
+            )
+        })
 }
 /// Decode/name/semantic lookup is compiled once, not repeated inside hot loops
 /// or for each workgroup of a real-shape replay.
@@ -662,50 +783,175 @@ pub struct Emulator<'a> {
     hw: Option<Vec<hw::StepHw>>,
     /// Workgroups run so far (the gate model's schedule budget).
     runs: std::sync::atomic::AtomicU64,
+    /// Wave-private LDS windows `(base, stride, waves)`: wave `w` owns `[base + w * stride, base + (w + 1) * stride)`.
+    /// The gate model refuses any access of another wave (or past a slice) to such a window (see `wave_private_lds`).
+    private_lds: Vec<(u32, u32, u32)>,
+    /// The kernel (index 0) and each helper, in `steps` order.
+    extents: Vec<Extent>,
+    /// Instruction virtual address -> step index, kernel and helpers together: the byte-PC jump table.
+    by_va: HashMap<u64, usize>,
 }
 impl<'a> Emulator<'a> {
+    /// The metadata kernel `symbol` alone: no helper is loaded, so a call out of it fails closed at run time (the
+    /// target is not a loaded instruction boundary). A gfx1200 program is accepted here but refuses to run without
+    /// `gfx1200_as_gfx1201`.
     pub fn new(program: &'a Program, symbol: &str) -> Result<Self> {
+        Self::build(program, symbol, &[])
+    }
+    /// The kernel `symbol` plus out-of-line `helpers` (`crate::helpers::load_helpers`), each executable at its own
+    /// virtual address `CODE_BASE + va`. Helpers are loaded only on this explicit request. The supported call forms are
+    /// exactly `s_getpc_b64`/`s_swappc_b64`/`s_setpc_b64` over SGPR pairs: there is no `s_call_b64` row, and an
+    /// indirect call through loaded data or relocations resolves to a pointer that is not a loaded boundary, which
+    /// fails at run time. `CODE_BASE` is a fixed emulator load base: the driver's real base is observable only
+    /// through PC values, and compiler code uses PCs relative to `s_getpc_b64` alone. Construction is refused for
+    /// a helper instruction without a consistent address, duplicate addresses, an opcode without a semantics row,
+    /// or a helper branch that does not land on an instruction boundary of the same helper.
+    pub fn with_helpers(program: &'a Program, symbol: &str, helpers: &'a [Helper]) -> Result<Self> {
+        Self::build(program, symbol, helpers)
+    }
+    fn build(program: &'a Program, symbol: &str, helpers: &'a [Helper]) -> Result<Self> {
         let kernel = program
             .kernels
             .iter()
             .find(|k| k.symbol.0 == symbol)
             .ok_or("snapshot symbol absent in Program")?;
-        let steps = kernel
-            .body
-            .layout
-            .iter()
-            .map(|id| {
-                let inst = kernel.body.insts.get(*id).ok_or("missing instruction")?;
-                let name = crate::isa::lookup(program.target.arch, inst.op, inst.form)
-                    .ok_or("unknown decoded opcode")?
-                    .name;
-                let class = match semantic_class(name)
-                    .ok_or_else(|| format!("no semantics for {name}"))?
-                {
+        if !helpers.is_empty() && kernel.body.layout.is_empty() {
+            return Err("kernel has no instructions; its end would fall into a helper".into());
+        }
+        let arch = program.target.arch;
+        let step = |inst: &'a Inst, va: Option<u64>, extent: usize| -> Result<Step<'a>> {
+            let name = crate::isa::lookup_inst(arch, inst)?.name;
+            if let Some(variant) = inst.variant {
+                return Err(format!(
+                    "no qualified numeric semantics for {name} encoding {} condition {}",
+                    variant.encoding, variant.condition
+                ));
+            }
+            let class =
+                match semantic_class(name).ok_or_else(|| format!("no semantics for {name}"))? {
                     "wait" => Class::Wait,
                     "control" => Class::Control,
                     "memory" => Class::Memory,
                     "alu" => Class::Alu,
                     class => return Err(format!("unsupported semantics class {class} for {name}")),
                 };
-                Ok(Step { inst, name, class })
+            Ok(Step {
+                inst,
+                name,
+                class,
+                va,
+                next_va: va.map(|va| va + 4 * dwords_of(inst, arch) as u64),
+                branch: Err("not a branch"),
+                extent,
+                extent_end: false,
             })
-            .collect::<Result<Vec<_>>>()?;
+        };
+        let mut steps = Vec::new();
+        let mut extents = vec![Extent {
+            name: kernel.symbol.0.clone(),
+            helper: false,
+        }];
+        for id in &kernel.body.layout {
+            let inst = kernel.body.insts.get(*id).ok_or("missing instruction")?;
+            steps.push(step(inst, inst.prov.pc.map(u64::from), 0)?);
+        }
+        if let Some(last) = steps.last_mut() {
+            last.extent_end = true;
+        }
+        for helper in helpers {
+            let name = helper
+                .names
+                .iter()
+                .next()
+                .ok_or("helper without a symbol name")?
+                .clone();
+            let fail = |why: String| format!("helper `{name}`: {why}");
+            let extent = extents.len();
+            extents.push(Extent {
+                name: name.clone(),
+                helper: true,
+            });
+            let mut va = helper.entry_va;
+            for inst in &helper.insts {
+                if inst.prov.pc.map(u64::from) != Some(va) {
+                    return Err(fail(format!(
+                        "instruction at {va:#x} carries pc {:?}; helper instructions must be contiguous from the entry",
+                        inst.prov.pc
+                    )));
+                }
+                let s =
+                    step(inst, Some(va), extent).map_err(|e| fail(format!("at {va:#x}: {e}")))?;
+                va = s.next_va.expect("helper step has an address");
+                steps.push(s);
+            }
+            if helper.insts.is_empty() || va != helper.entry_va.saturating_add(helper.size) {
+                return Err(fail(format!(
+                    "instructions cover [{:#x}, {va:#x}) but the extent is [{:#x}, +{:#x})",
+                    helper.entry_va, helper.entry_va, helper.size
+                )));
+            }
+            steps
+                .last_mut()
+                .expect("helper has instructions")
+                .extent_end = true;
+        }
+        let mut by_va = HashMap::with_capacity(steps.len());
+        for (i, s) in steps.iter().enumerate() {
+            if let Some(va) = s.va {
+                if let Some(j) = by_va.insert(va, i) {
+                    return Err(format!(
+                        "duplicate instruction virtual address {va:#x} (steps {j} and {i})"
+                    ));
+                }
+            }
+        }
+        for i in 0..steps.len() {
+            if !BRANCHES.contains(&steps[i].name) {
+                continue;
+            }
+            steps[i].branch = if steps[i].extent == 0 {
+                match steps[i].inst.operands.first() {
+                    Some(Operand::Label(id)) => kernel
+                        .body
+                        .blocks
+                        .iter()
+                        .find(|b| b.id == *id)
+                        .map(|b| b.range.0)
+                        .ok_or("branch block missing"),
+                    _ => Err("branch missing CFG label"),
+                }
+            } else {
+                Ok(helper_branch_target(&steps, &extents, &by_va, i)?)
+            };
+        }
         Ok(Self {
             kernel,
-            arch: program.target.arch,
+            arch,
             steps,
+            extents,
+            by_va,
             nan_loose: false,
             strict_lds: false,
-            decode_arch: program.target.arch,
+            decode_arch: arch,
             hw: None,
             runs: std::sync::atomic::AtomicU64::new(0),
+            private_lds: Vec::new(),
         })
     }
     /// Track which LDS bytes the workgroup has written; a read of any other LDS byte (including by an LDS atomic) is an
     /// error. Off by default so existing differential tests keep their (zero-initialised LDS) behaviour.
     pub fn strict_lds(mut self) -> Self {
         self.strict_lds = true;
+        self
+    }
+    /// Declare a wave-private LDS window (the builder's `LdsSlot::wave_private`): wave `w` owns bytes `[base + w *
+    /// stride, base + (w + 1) * stride)` and no other wave may touch them. The gate model (`hw_model`) checks every
+    /// LDS access that overlaps the window: it must come from the owning wave and stay inside that wave's slice,
+    /// else the run fails with a `[private]` error naming both waves. Within one wave the gate model needs no
+    /// ordering between accesses to its slice (one wave's DS instructions stay in issue order); a *different* wave's
+    /// access is refused here even when a barrier would order it, because ownership never crosses a barrier.
+    pub fn wave_private_lds(mut self, base: u32, stride: u32, waves: u32) -> Self {
+        self.private_lds.push((base, stride, waves));
         self
     }
     /// The lab's exactness contract for the lane kernels: non-NaN words bit-equal, a NaN must meet a NaN (payload and
@@ -726,6 +972,17 @@ impl<'a> Emulator<'a> {
         }
         self
     }
+    /// Execute a gfx1200 program with gfx1201's numerics: the two share the gfx12 ISA (encodings, semantics, ABI), but
+    /// every hardware qualification of the emulator's tables was measured on gfx1201 and is NOT promoted to a gfx1200
+    /// measurement. Without this a gfx1200 program is refused at run time. Only valid where emulated arms are compared
+    /// with each other or with an exact CPU reference, never as a claim about gfx1200 hardware. Instruction decode
+    /// still uses the gfx1200 tables (the program's own target).
+    pub fn gfx1200_as_gfx1201(mut self) -> Self {
+        if self.arch == Arch::Gfx1200 {
+            self.arch = Arch::Gfx1201;
+        }
+        self
+    }
     pub fn run_workgroup(&self, launch: &Launch, mem: &mut Memory) -> Result<()> {
         self.run_workgroup_counted(launch, mem).map(|_| ())
     }
@@ -741,6 +998,7 @@ impl<'a> Emulator<'a> {
     }
     /// As `run_workgroup`, returning the number of instructions the workgroup's waves executed.
     pub fn run_workgroup_counted(&self, launch: &Launch, mem: &mut Memory) -> Result<u64> {
+        self.require_qualified_numerics()?;
         if self.hw_enabled() {
             return self.run_hw(launch, mem).map(|r| r.instructions);
         }
@@ -758,7 +1016,7 @@ impl<'a> Emulator<'a> {
         }
         let mut states = (0..n.div_ceil(kernel.wave.lanes()))
             .map(|w| {
-                State::new(self.arch, kernel, launch, w).map(|mut s| {
+                State::new(self.arch, self.decode_arch, kernel, launch, w).map(|mut s| {
                     s.nan_loose = self.nan_loose;
                     s
                 })
@@ -778,7 +1036,8 @@ impl<'a> Emulator<'a> {
                 if st.ended || st.barrier.is_some() {
                     continue;
                 }
-                let step = self.steps.get(st.pc).ok_or("PC ran past kernel end")?;
+                let idx = st.pc;
+                let step = self.steps.get(idx).ok_or("PC ran past kernel end")?;
                 let inst = step.inst;
                 let name = step.name;
                 st.pc += 1;
@@ -789,7 +1048,7 @@ impl<'a> Emulator<'a> {
                 }
                 let result = match step.class {
                     Class::Wait => Ok(()),
-                    Class::Control => control(name, inst, st, kernel),
+                    Class::Control => self.control(idx, st),
                     Class::Memory => memory::execute_tracked(
                         name,
                         inst,
@@ -800,12 +1059,13 @@ impl<'a> Emulator<'a> {
                         None,
                     ),
                     Class::Alu => alu::execute(self.arch, name, inst, st),
-                };
+                }
+                .and_then(|()| self.fall_through(idx, st));
                 result.map_err(|e| {
                     format!(
-                        "{symbol} wg={:?} inst={} {name}: {e}{}",
+                        "{symbol} wg={:?} inst={idx} {name}: {e}{}{}",
                         launch.workgroup,
-                        st.pc.saturating_sub(1),
+                        self.locate(idx),
                         failure_bits(self.arch, wave, st, inst)
                     )
                 })?;
@@ -909,62 +1169,127 @@ fn failure_bits(arch: Arch, wave: usize, st: &State, inst: &Inst) -> String {
     }
     out
 }
-fn control(name: &str, i: &Inst, s: &mut State, k: &Kernel) -> Result<()> {
-    match name {
-        "s_endpgm" => s.ended = true,
-        "s_barrier" => {
-            s.barrier = Some(s.signals);
-            s.signals += 1;
-        }
-        "s_barrier_signal" => {
-            if s.read(&i.operands[0], 0, 0)? != u32::MAX {
-                return Err("named barrier signal is not modeled".into());
+impl Emulator<'_> {
+    /// Execute the control instruction of step `idx`. Branches go to the step resolved at construction; the call forms
+    /// act on byte PCs (`CODE_BASE + va`).
+    fn control(&self, idx: usize, s: &mut State) -> Result<()> {
+        let step = &self.steps[idx];
+        let (name, i) = (step.name, step.inst);
+        let operand = |n: usize| {
+            i.operands
+                .get(n)
+                .ok_or_else(|| format!("{name}: missing operand {n}"))
+        };
+        match name {
+            "s_endpgm" => s.ended = true,
+            "s_barrier" => {
+                s.barrier = Some(s.signals);
+                s.signals += 1;
             }
-            s.signals += 1;
-        }
-        "s_barrier_wait" => {
-            // SOPP is a 16-bit field: decoded 0xffff is represented as signed -1.
-            let id = match &i.operands[0] {
-                Operand::Imm(ImmField::Sopp(value)) => *value as u16,
-                op => u16::try_from(s.read(op, 0, 0)?)
-                    .map_err(|_| "barrier ID exceeds its 16-bit field")?,
-            };
-            if id != u16::MAX {
-                return Err("named barrier wait is not modeled".into());
+            "s_barrier_signal" => {
+                if s.read(&i.operands[0], 0, 0)? != u32::MAX {
+                    return Err("named barrier signal is not modeled".into());
+                }
+                s.signals += 1;
             }
-            if s.signals == 0 {
-                return Err("barrier wait without signal".into());
-            }
-            s.barrier = Some(s.signals - 1);
-        }
-        "s_branch" | "s_cbranch_scc0" | "s_cbranch_scc1" | "s_cbranch_execz"
-        | "s_cbranch_execnz" | "s_cbranch_vccz" | "s_cbranch_vccnz" => {
-            let take = match name {
-                "s_branch" => true,
-                "s_cbranch_scc0" => !s.scc,
-                "s_cbranch_scc1" => s.scc,
-                "s_cbranch_execz" => s.exec == 0,
-                "s_cbranch_execnz" => s.exec != 0,
-                "s_cbranch_vccz" => s.vcc == 0,
-                _ => s.vcc != 0,
-            };
-            if take {
-                let Operand::Label(id) = i.operands[0] else {
-                    return Err("branch missing CFG label".into());
+            "s_barrier_wait" => {
+                // SOPP is a 16-bit field: decoded 0xffff is represented as signed -1.
+                let id = match &i.operands[0] {
+                    Operand::Imm(ImmField::Sopp(value)) => *value as u16,
+                    op => u16::try_from(s.read(op, 0, 0)?)
+                        .map_err(|_| "barrier ID exceeds its 16-bit field")?,
                 };
-                s.pc = k
-                    .body
-                    .blocks
-                    .iter()
-                    .find(|b| b.id == id)
-                    .ok_or("branch block missing")?
-                    .range
-                    .0;
+                if id != u16::MAX {
+                    return Err("named barrier wait is not modeled".into());
+                }
+                if s.signals == 0 {
+                    return Err("barrier wait without signal".into());
+                }
+                s.barrier = Some(s.signals - 1);
             }
+            n if BRANCHES.contains(&n) => {
+                let take = match n {
+                    "s_branch" => true,
+                    "s_cbranch_scc0" => !s.scc,
+                    "s_cbranch_scc1" => s.scc,
+                    "s_cbranch_execz" => s.exec == 0,
+                    "s_cbranch_execnz" => s.exec != 0,
+                    "s_cbranch_vccz" => s.vcc == 0,
+                    _ => s.vcc != 0,
+                };
+                if take {
+                    s.pc = step.branch?;
+                }
+            }
+            "s_getpc_b64" => s.put_wide(operand(0)?, 0, step.byte_pc_after()?)?,
+            "s_swappc_b64" => {
+                // The target is read before the link is written: `s_swappc_b64 s[2:3], s[2:3]` jumps to the old value.
+                let target = s.read64(operand(1)?, 0)?;
+                let link = step.byte_pc_after()?;
+                let to = self.resolve_target(target)?;
+                s.put_wide(operand(0)?, 0, link)?;
+                s.pc = to;
+            }
+            "s_setpc_b64" => s.pc = self.resolve_target(s.read64(operand(0)?, 0)?)?,
+            _ => return Err(format!("control opcode {name} unsupported")),
         }
-        _ => return Err(format!("control opcode {name} unsupported")),
+        Ok(())
     }
-    Ok(())
+    /// Step index of the loaded instruction at byte PC `target`; anything else (below `CODE_BASE`, mid-instruction, not
+    /// loaded) is an error.
+    fn resolve_target(&self, target: u64) -> Result<usize> {
+        target
+            .checked_sub(CODE_BASE)
+            .and_then(|va| self.by_va.get(&va))
+            .copied()
+            .ok_or_else(|| format!("call target {target:#x} is not a loaded instruction boundary"))
+    }
+    /// The fall-through guard: the wave executed the last instruction of its extent, neither jumped nor ended, so its
+    /// PC is the first instruction of whatever follows in `steps` (or the end of it).
+    fn fall_through(&self, idx: usize, st: &State) -> Result<()> {
+        let step = &self.steps[idx];
+        if step.extent_end && st.pc == idx + 1 && !st.ended {
+            let e = &self.extents[step.extent];
+            return Err(format!(
+                "PC ran past the end of {} {}",
+                if e.helper { "helper" } else { "kernel" },
+                e.name
+            ));
+        }
+        Ok(())
+    }
+    /// Error-context suffix naming the step's virtual address and, in a helper, the helper.
+    fn locate(&self, idx: usize) -> String {
+        let step = &self.steps[idx];
+        let e = &self.extents[step.extent];
+        match (step.va, e.helper) {
+            (Some(va), true) => format!(" [va={va:#x} helper `{}`]", e.name),
+            (None, true) => format!(" [helper `{}`]", e.name),
+            (Some(va), false) => format!(" [va={va:#x}]"),
+            (None, false) => String::new(),
+        }
+    }
+    /// gfx1200 has no hardware-qualified numerics here: its decode and ABI are the shared gfx12 ones, but a run needs
+    /// the explicit `gfx1200_as_gfx1201` opt-in.
+    fn require_qualified_numerics(&self) -> Result<()> {
+        if self.arch == Arch::Gfx1200 {
+            return Err("gfx1200 numerics are unqualified for emulation; opt in with gfx1200_as_gfx1201 (shared gfx12 ISA reasoning, not a gfx1200 hardware measurement)".into());
+        }
+        Ok(())
+    }
+}
+impl Step<'_> {
+    /// Byte PC of the instruction after this one: the link `s_getpc_b64`/`s_swappc_b64` write.
+    fn byte_pc_after(&self) -> Result<u64> {
+        self.next_va
+            .and_then(|va| CODE_BASE.checked_add(va))
+            .ok_or_else(|| {
+                format!(
+                    "{}: byte PC unavailable (instruction has no virtual address)",
+                    self.name
+                )
+            })
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -998,10 +1323,11 @@ mod tests {
     }
     fn insn(name: &str, operands: Vec<Operand>) -> Inst {
         let row = crate::isa::gfx12().iter().find(|r| r.name == name).unwrap();
-        Inst::from_parts(
+        Inst::from_encoding(
             Arch::Gfx1201,
             row.op,
             row.form,
+            row.variant,
             Default::default(),
             operands.into_iter().collect(),
             Default::default(),
@@ -1045,6 +1371,362 @@ mod tests {
             },
         }
     }
+    fn program(arch: Arch, insts: Vec<Inst>) -> Program {
+        use crate::inst::{Setting, Target};
+        let mut body = crate::Body::default();
+        for inst in insts {
+            let id = body.insts.insert(inst);
+            body.layout.push(id);
+        }
+        Program {
+            target: Target {
+                arch,
+                xnack: Setting::Any,
+                sramecc: Setting::Any,
+                abi_version: 4,
+            },
+            kernels: vec![kernel(body)],
+            source: None,
+        }
+    }
+    fn at(mut inst: Inst, va: u32) -> Inst {
+        inst.prov.pc = Some(va);
+        inst
+    }
+    fn pair(base: u16) -> Operand {
+        reg(Kind::S, base, 2)
+    }
+    fn int(n: i8) -> Operand {
+        Operand::Inline(InlineConst::Integer(n))
+    }
+    /// A helper whose instructions are laid out contiguously from `entry` (addresses from the encoded widths).
+    fn helper(name: &str, entry: u64, mut insts: Vec<Inst>) -> Helper {
+        let mut va = entry;
+        for inst in &mut insts {
+            inst.prov.pc = Some(va as u32);
+            va += 4 * dwords_of(inst, Arch::Gfx1201) as u64;
+        }
+        Helper {
+            names: std::collections::BTreeSet::from([name.to_string()]),
+            entry_va: entry,
+            size: va - entry,
+            insts,
+        }
+    }
+    /// Runs one wave through control and scalar-ALU steps exactly as the run loops advance it, fall-through guard
+    /// included.
+    fn drive(emu: &Emulator, st: &mut State) -> Result<()> {
+        for _ in 0..1000 {
+            if st.ended {
+                return Ok(());
+            }
+            let idx = st.pc;
+            let step = emu.steps.get(idx).ok_or("PC ran past kernel end")?;
+            st.pc += 1;
+            match step.class {
+                Class::Control => emu.control(idx, st)?,
+                Class::Alu => alu::execute(emu.arch, step.name, step.inst, st)?,
+                _ => panic!("unexpected step {}", step.name),
+            }
+            emu.fall_through(idx, st)?;
+        }
+        Err("step limit".into())
+    }
+    /// getpc/add/swappc into a helper at 0x140 (with a taken forward branch inside it) and `s_setpc_b64` back to the
+    /// instruction after the call.
+    fn call_fixture() -> (Program, Vec<Helper>) {
+        let kernel = vec![
+            at(insn("s_getpc_b64", vec![pair(2)]), 0x100),
+            at(insn("s_add_co_u32", vec![s(2), s(2), int(60)]), 0x104),
+            at(insn("s_add_co_ci_u32", vec![s(3), s(3), int(0)]), 0x108),
+            at(insn("s_swappc_b64", vec![pair(30), pair(2)]), 0x10c),
+            at(insn("s_mov_b32", vec![s(6), int(5)]), 0x110),
+            at(insn("s_endpgm", vec![]), 0x114),
+        ];
+        let helper = helper(
+            "callee",
+            0x140,
+            vec![
+                insn("s_mov_b32", vec![s(5), int(7)]),
+                insn("s_branch", vec![Operand::Imm(ImmField::Sopp(1))]),
+                insn("s_mov_b32", vec![s(5), int(9)]),
+                insn("s_setpc_b64", vec![pair(30)]),
+            ],
+        );
+        (program(Arch::Gfx1201, kernel), vec![helper])
+    }
+    #[test]
+    fn call_links_the_next_byte_pc_and_return_lands_after_the_call() {
+        let (p, helpers) = call_fixture();
+        let emu = Emulator::with_helpers(&p, "exchange", &helpers).unwrap();
+        let mut st = state();
+        drive(&emu, &mut st).unwrap();
+        assert_eq!((st.s[2], st.s[3]), (0x140, 0), "target = getpc + 60");
+        assert_eq!((st.s[30], st.s[31]), (CODE_BASE as u32 + 0x110, 0));
+        assert_eq!(
+            st.s[5], 7,
+            "the taken forward branch skipped the s_mov_b32 s5, 9"
+        );
+        assert_eq!(
+            st.s[6], 5,
+            "execution resumed at the instruction after the call"
+        );
+        assert!(st.ended);
+    }
+    #[test]
+    fn swappc_reads_its_target_before_writing_the_link() {
+        let (_, helpers) = call_fixture();
+        let kernel = vec![
+            at(insn("s_swappc_b64", vec![pair(2), pair(2)]), 0x100),
+            at(insn("s_endpgm", vec![]), 0x104),
+        ];
+        let p = program(Arch::Gfx1201, kernel);
+        let emu = Emulator::with_helpers(&p, "exchange", &helpers).unwrap();
+        let mut st = state();
+        (st.s[2], st.s[3]) = (0x148, 0);
+        emu.control(0, &mut st).unwrap();
+        assert_eq!((st.s[2], st.s[3]), (CODE_BASE as u32 + 0x104, 0));
+        assert_eq!(emu.steps[st.pc].va, Some(0x148));
+    }
+    #[test]
+    fn call_targets_must_be_loaded_instruction_boundaries() {
+        let (p, helpers) = call_fixture();
+        let with = Emulator::with_helpers(&p, "exchange", &helpers).unwrap();
+        assert_eq!(
+            with.steps[with.resolve_target(0x140).unwrap()].va,
+            Some(0x140)
+        );
+        assert_eq!(
+            with.steps[with.resolve_target(0x110).unwrap()].va,
+            Some(0x110)
+        );
+        for bad in [0x141, 0x144 + 0x100, 0x13c, 0x1_0000_0140] {
+            assert_eq!(
+                with.resolve_target(bad).unwrap_err(),
+                format!("call target {bad:#x} is not a loaded instruction boundary")
+            );
+        }
+        // Without helpers the kernel alone is loaded: the helper entry is not a boundary.
+        let kernel_only = Emulator::new(&p, "exchange").unwrap();
+        assert_eq!(
+            kernel_only.resolve_target(0x140).unwrap_err(),
+            "call target 0x140 is not a loaded instruction boundary"
+        );
+        let mut st = state();
+        (st.s[2], st.s[3]) = (0x140, 0);
+        let swappc = kernel_only
+            .steps
+            .iter()
+            .position(|s| s.name == "s_swappc_b64")
+            .unwrap();
+        assert!(kernel_only
+            .control(swappc, &mut st)
+            .unwrap_err()
+            .contains("is not a loaded instruction boundary"));
+    }
+    #[test]
+    fn byte_pc_needs_an_instruction_address() {
+        let p = program(
+            Arch::Gfx1201,
+            vec![insn("s_getpc_b64", vec![pair(2)]), insn("s_endpgm", vec![])],
+        );
+        let emu = Emulator::new(&p, "exchange").unwrap();
+        let e = emu.control(0, &mut state()).unwrap_err();
+        assert!(e.contains("byte PC unavailable"), "{e}");
+    }
+    #[test]
+    fn running_past_the_end_of_an_extent_is_an_error_not_a_fall_into_the_next() {
+        // The kernel's last instruction is not a terminator: execution must not continue into the helper.
+        let helpers = vec![helper(
+            "callee",
+            0x140,
+            vec![insn("s_setpc_b64", vec![pair(30)])],
+        )];
+        let p = program(
+            Arch::Gfx1201,
+            vec![at(insn("s_mov_b32", vec![s(6), int(5)]), 0x100)],
+        );
+        let emu = Emulator::with_helpers(&p, "exchange", &helpers).unwrap();
+        let e = drive(&emu, &mut state()).unwrap_err();
+        assert_eq!(e, "PC ran past the end of kernel exchange");
+        // A helper that ends without a return: the same guard names the helper.
+        let (p, _) = call_fixture();
+        let helpers = vec![helper(
+            "callee",
+            0x140,
+            vec![insn("s_mov_b32", vec![s(5), int(7)])],
+        )];
+        let emu = Emulator::with_helpers(&p, "exchange", &helpers).unwrap();
+        let e = drive(&emu, &mut state()).unwrap_err();
+        assert_eq!(e, "PC ran past the end of helper callee");
+        // Without helpers the guard still fires at the kernel's last instruction.
+        let p = program(
+            Arch::Gfx1201,
+            vec![at(insn("s_mov_b32", vec![s(6), int(5)]), 0x100)],
+        );
+        let e = drive(&Emulator::new(&p, "exchange").unwrap(), &mut state()).unwrap_err();
+        assert_eq!(e, "PC ran past the end of kernel exchange");
+    }
+    #[test]
+    fn helper_construction_refuses_inconsistent_extents_and_branches() {
+        let (p, _) = call_fixture();
+        let build = |h: Vec<Helper>| Emulator::with_helpers(&p, "exchange", &h).err();
+        // Helper addresses colliding with the kernel's.
+        let e = build(vec![helper(
+            "dup",
+            0x100,
+            vec![insn("s_setpc_b64", vec![pair(30)])],
+        )])
+        .unwrap();
+        assert!(
+            e.contains("duplicate instruction virtual address 0x100"),
+            "{e}"
+        );
+        // A branch into the middle of a two-dword instruction.
+        let mut wide = insn("s_mov_b32", vec![s(5), Operand::Literal(0x12345)]);
+        wide.literal = Some(0x12345);
+        let e = build(vec![helper(
+            "mid",
+            0x140,
+            vec![
+                wide.clone(),
+                insn("s_branch", vec![Operand::Imm(ImmField::Sopp(-2))]),
+            ],
+        )])
+        .unwrap();
+        assert!(
+            e.contains("is not an instruction boundary of the same helper"),
+            "{e}"
+        );
+        // A branch out of the helper (into the kernel).
+        let e = build(vec![helper(
+            "out",
+            0x140,
+            vec![insn("s_branch", vec![Operand::Imm(ImmField::Sopp(-0x11))])],
+        )])
+        .unwrap();
+        assert!(
+            e.contains("0x100 is not an instruction boundary of the same helper"),
+            "{e}"
+        );
+        // A boundary inside the same helper is accepted, including the branch's own address.
+        assert!(build(vec![helper(
+            "loop",
+            0x140,
+            vec![
+                wide,
+                insn("s_branch", vec![Operand::Imm(ImmField::Sopp(-1))])
+            ],
+        )])
+        .is_none());
+        // Addresses that are not contiguous from the entry, or do not cover the extent.
+        let mut gap = helper("gap", 0x140, vec![insn("s_setpc_b64", vec![pair(30)])]);
+        gap.entry_va = 0x144;
+        let e = build(vec![gap]).unwrap();
+        assert!(e.contains("must be contiguous from the entry"), "{e}");
+        let mut short = helper("short", 0x140, vec![insn("s_setpc_b64", vec![pair(30)])]);
+        short.size = 8;
+        let e = build(vec![short]).unwrap();
+        assert!(e.contains("but the extent is"), "{e}");
+    }
+    fn endpgm_program(arch: Arch) -> Program {
+        program(arch, vec![insn("s_endpgm", vec![])])
+    }
+    fn one_workgroup() -> Launch {
+        Launch {
+            kernarg_ptr: 0,
+            workgroup: [0, 0, 0],
+            block: [32, 1, 1],
+            dynamic_lds: 0,
+        }
+    }
+    #[test]
+    fn gfx1200_constructs_but_runs_only_under_the_gfx1201_opt_in() {
+        const REFUSAL: &str = "gfx1200 numerics are unqualified for emulation; opt in with gfx1200_as_gfx1201 (shared gfx12 ISA reasoning, not a gfx1200 hardware measurement)";
+        let p = endpgm_program(Arch::Gfx1200);
+        let mut mem = Memory::default();
+        let emu = Emulator::new(&p, "exchange").expect("construction accepts gfx1200");
+        assert_eq!(
+            emu.run_workgroup(&one_workgroup(), &mut mem).unwrap_err(),
+            REFUSAL
+        );
+        assert_eq!(
+            emu.run_workgroup_counted(&one_workgroup(), &mut mem)
+                .unwrap_err(),
+            REFUSAL
+        );
+        assert_eq!(
+            emu.run_workgroup_report(&one_workgroup(), &mut mem)
+                .unwrap_err(),
+            REFUSAL
+        );
+        let hw = Emulator::new(&p, "exchange").unwrap().hw_model();
+        assert_eq!(
+            hw.run_workgroup_report(&one_workgroup(), &mut mem)
+                .unwrap_err(),
+            REFUSAL
+        );
+        assert_eq!(
+            hw.run_workgroup(&one_workgroup(), &mut mem).unwrap_err(),
+            REFUSAL
+        );
+        let opted = Emulator::new(&p, "exchange").unwrap().gfx1200_as_gfx1201();
+        assert_eq!(
+            opted.decode_arch,
+            Arch::Gfx1200,
+            "decode keeps the program's own target"
+        );
+        assert_eq!(
+            opted
+                .run_workgroup_counted(&one_workgroup(), &mut mem)
+                .unwrap(),
+            1
+        );
+        let opted_hw = Emulator::new(&p, "exchange")
+            .unwrap()
+            .gfx1200_as_gfx1201()
+            .hw_model();
+        opted_hw.run_workgroup(&one_workgroup(), &mut mem).unwrap();
+        // The opt-in is for gfx1200 only.
+        let p1201 = endpgm_program(Arch::Gfx1201);
+        let emu = Emulator::new(&p1201, "exchange")
+            .unwrap()
+            .gfx1200_as_gfx1201();
+        assert_eq!(emu.arch, Arch::Gfx1201);
+    }
+    #[test]
+    fn gfx1200_opt_in_initialises_the_gfx12_abi() {
+        let mut k = kernel(crate::Body::default());
+        let Abi::Hsa { descriptor: d, .. } = &mut k.abi else {
+            unreachable!()
+        };
+        d.compute_pgm_rsrc2.0 = 0x180 | (1 << 11);
+        let launch = Launch {
+            kernarg_ptr: 0,
+            workgroup: [7, 9, 0],
+            block: [8, 8, 2],
+            dynamic_lds: 0,
+        };
+        // `Emulator::gfx1200_as_gfx1201` runs numerics as gfx1201 while the program's target stays gfx1200.
+        let a = State::new(Arch::Gfx1201, Arch::Gfx1200, &k, &launch, 1).unwrap();
+        assert_eq!(a.t[9], 7, "workgroup id X is in ttmp9");
+        assert_eq!(a.t[7], 9);
+        assert_eq!(a.t[8], (1 << 30) | (1 << 25));
+        assert_eq!((a.s[0], a.s[1]), (0, 0), "no SGPR workgroup ids on gfx12");
+        // The exact declared-user-SGPR rule of gfx12 applies to gfx1200 too.
+        let Abi::Hsa { descriptor: d, .. } = &mut k.abi else {
+            unreachable!()
+        };
+        d.compute_pgm_rsrc2.0 = 0x180 | (1 << 1);
+        let e = State::new(Arch::Gfx1201, Arch::Gfx1200, &k, &launch, 1)
+            .err()
+            .unwrap();
+        assert_eq!(
+            e,
+            "descriptor user SGPR count disagrees with enabled properties"
+        );
+    }
+
     #[test]
     fn split_barrier_rendezvous_waits_for_delayed_wave() {
         use crate::{
@@ -1176,19 +1858,22 @@ mod tests {
             block: [8, 8, 2],
             dynamic_lds: 0,
         };
-        let a = State::new(Arch::Gfx1201, &k, &launch, 1).unwrap();
+        let a = State::new(Arch::Gfx1201, Arch::Gfx1201, &k, &launch, 1).unwrap();
         assert_eq!(a.t[9], 7);
         assert_eq!(a.t[7], 9);
         assert_eq!(a.t[8], (1 << 30) | (1 << 25));
         assert_eq!(a.v[0][0], 4 << 10);
-        let b = State::new(Arch::Gfx1151, &k, &launch, 3).unwrap();
+        let b = State::new(Arch::Gfx1151, Arch::Gfx1151, &k, &launch, 3).unwrap();
         assert_eq!((b.s[0], b.s[1]), (7, 9));
         assert_eq!(b.v[0][0], 4 << 10);
         let Abi::Hsa { descriptor: d, .. } = &mut k.abi else {
             unreachable!()
         };
         d.compute_pgm_rsrc2.0 = 0x180 | (2 << 11);
-        let c = State::new(Arch::Gfx1151, &k, &launch, 3).unwrap();
+        let c = State::new(Arch::Gfx1151, Arch::Gfx1151, &k, &launch, 3).unwrap();
+        // gfx1100 numerics-as-gfx1151: the program's own (gfx11) target still selects the SGPR workgroup-id ABI.
+        let d = State::new(Arch::Gfx1151, Arch::Gfx1100, &k, &launch, 3).unwrap();
+        assert_eq!((d.s[0], d.s[1]), (7, 9));
         assert_eq!(c.v[0][0], (1 << 20) | (4 << 10));
     }
     // RDNA4 ISA scalar unsigned carry differs from signed overflow.
@@ -1456,10 +2141,11 @@ mod tests {
         for (c, n) in waits {
             w.per_counter[*c as usize] = Some(*n);
         }
-        Inst::from_parts(
+        Inst::from_encoding(
             Arch::Gfx1201,
             row.op,
             row.form,
+            row.variant,
             Default::default(),
             [Operand::Imm(ImmField::Sopp(0))].into_iter().collect(),
             crate::operand::Modifiers {

@@ -508,7 +508,7 @@ def main():
     print(f"  {'─'*65}")
     if calib_total <= vram_bytes:
         print(f"  ▶ VERDICT (Calibration): YES — fits with {args.vram - gb(calib_total):.2f} GB headroom.")
-        print(f"    The triattn_validate / cask_gen calibration binary will work on")
+        print(f"    The calibration binary will work on")
         print(f"    this GPU with kv_seq={args.kv_seq} in {args.kv_mode} mode.")
     else:
         over = gb(calib_total) - args.vram

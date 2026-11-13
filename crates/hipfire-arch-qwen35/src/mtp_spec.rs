@@ -884,7 +884,7 @@ impl MtpSpecState {
 
     /// Like [`Self::new_for_slot`] but allocates the MTP head's KV cache in
     /// the requested format. Used by `mtp_only_demo` to A/B kv-mode variants
-    /// (q8/asym3/fwht4) per the 2026-05-16 feat/fwht prose-τ findings.
+    /// (q8/fwht4) per the 2026-05-16 feat/fwht prose-τ findings.
     pub fn new_for_slot_with_kv_mode(
         gpu: &mut Gpu,
         target: &ModelSlot,
@@ -1630,7 +1630,6 @@ fn mtp_verify_graph_eligible(
                     .map(|e| e.down.gpu_dtype)
                     .unwrap_or(DType::F32),
                 routed_has_mixed_experts: per_expert_gate_up.is_some() || per_expert_down.is_some(),
-                has_paro_shared: ffn.paro_shared.is_some(),
                 per_expert_gate_up,
                 per_expert_down,
             };
@@ -1680,7 +1679,7 @@ struct MtpVerifyGraphKey {
     /// Those pools are grow-never-shrink, so a moved (or newly zeroed) slot identifies
     /// growth or free — no contents hashed and no converted activation values cached
     /// here. Unused cells stay `0`.
-    scratch: [usize; 32],
+    scratch: [usize; 27],
 }
 
 /// Capture-identity key for the narrow MTP verify graph.
@@ -1724,7 +1723,7 @@ fn mtp_verify_graph_key(
             .s_matrices
             .first()
             .map_or(0, |t| t.buf.as_ptr() as usize),
-        scratch: [0usize; 32],
+        scratch: [0usize; 27],
     };
 
     // Global conversion/attention scratch pools (grow-never-shrink) in ScratchState
@@ -1736,35 +1735,27 @@ fn mtp_verify_graph_key(
     key.scratch[3] = tensor_ptr(&gpu.scratch.mq_signs2_128);
     key.scratch[4] = tensor_ptr(&gpu.scratch.mq_x_rot);
     key.scratch[5] = tensor_ptr(&gpu.scratch.gemv_residual_tmp);
-    key.scratch[6] = tensor_ptr(&gpu.scratch.paro_x_scratch);
-    key.scratch[7] = buffer_ptr(&gpu.scratch.gdn_pair_counters);
-    key.scratch[8] = tensor_ptr(&gpu.scratch.argmax_host);
-    key.scratch[9] = buffer_ptr(&gpu.scratch.mq_x_rot_fp8);
-    key.scratch[10] = buffer_ptr(&gpu.scratch.mq_x_q8);
-    key.scratch[11] = buffer_ptr(&gpu.scratch.mq_x_scales);
-    key.scratch[12] = buffer_ptr(&gpu.scratch.mq_rmsnorm_wavegrid_scratch);
-    key.scratch[13] = buffer_ptr(&gpu.scratch.fp16_x_scratch);
-    key.scratch[14] = buffer_ptr(&gpu.scratch.qsa_select_scores);
-    key.scratch[15] = buffer_ptr(&gpu.scratch.gdn_state_f32);
-    key.scratch[16] = buffer_ptr(&gpu.scratch.fp8_x_scratch);
-    key.scratch[17] = buffer_ptr(&gpu.scratch.q8_1_mmq_x_scratch);
-    key.scratch[18] = buffer_ptr(&gpu.scratch.int4_mmq_x_scratch);
-    key.scratch[19] = buffer_ptr(&gpu.scratch.int8_mmq_x_scratch);
-    key.scratch[20] = buffer_ptr(&gpu.scratch.mq4v2_fp8_x_scratch);
-    key.scratch[21] = buffer_ptr(&gpu.scratch.mq4v2_fp8_half_sums_scratch);
-    key.scratch[22] = buffer_ptr(&gpu.scratch.mq4v2_fp8_row_scales_scratch);
-    key.scratch[23] = buffer_ptr(&gpu.scratch.fp8_f2_weights);
-    key.scratch[24] = buffer_ptr(&gpu.scratch.ksplit_det_partials);
-    key.scratch[25] = buffer_ptr(&gpu.scratch.sample_partials);
-    key.scratch[26] = buffer_ptr(&gpu.scratch.fa2_q16_scratch);
-    key.scratch[27] = buffer_ptr(&gpu.scratch.fa2_fp8_q_scratch);
-
-    // paro_fused_scratch is an optional Vec of 4 tensor buffers (indices 0..3).
-    if let Some(bufs) = &gpu.scratch.paro_fused_scratch {
-        for (i, t) in bufs.iter().take(4).enumerate() {
-            key.scratch[28 + i] = t.buf.as_ptr() as usize;
-        }
-    }
+    key.scratch[6] = buffer_ptr(&gpu.scratch.gdn_pair_counters);
+    key.scratch[7] = tensor_ptr(&gpu.scratch.argmax_host);
+    key.scratch[8] = buffer_ptr(&gpu.scratch.mq_x_rot_fp8);
+    key.scratch[9] = buffer_ptr(&gpu.scratch.mq_x_q8);
+    key.scratch[10] = buffer_ptr(&gpu.scratch.mq_x_scales);
+    key.scratch[11] = buffer_ptr(&gpu.scratch.mq_rmsnorm_wavegrid_scratch);
+    key.scratch[12] = buffer_ptr(&gpu.scratch.fp16_x_scratch);
+    key.scratch[13] = buffer_ptr(&gpu.scratch.qsa_select_scores);
+    key.scratch[14] = buffer_ptr(&gpu.scratch.gdn_state_f32);
+    key.scratch[15] = buffer_ptr(&gpu.scratch.fp8_x_scratch);
+    key.scratch[16] = buffer_ptr(&gpu.scratch.q8_1_mmq_x_scratch);
+    key.scratch[17] = buffer_ptr(&gpu.scratch.int4_mmq_x_scratch);
+    key.scratch[18] = buffer_ptr(&gpu.scratch.int8_mmq_x_scratch);
+    key.scratch[19] = buffer_ptr(&gpu.scratch.mq4v2_fp8_x_scratch);
+    key.scratch[20] = buffer_ptr(&gpu.scratch.mq4v2_fp8_half_sums_scratch);
+    key.scratch[21] = buffer_ptr(&gpu.scratch.mq4v2_fp8_row_scales_scratch);
+    key.scratch[22] = buffer_ptr(&gpu.scratch.fp8_f2_weights);
+    key.scratch[23] = buffer_ptr(&gpu.scratch.ksplit_det_partials);
+    key.scratch[24] = buffer_ptr(&gpu.scratch.sample_partials);
+    key.scratch[25] = buffer_ptr(&gpu.scratch.fa2_q16_scratch);
+    key.scratch[26] = buffer_ptr(&gpu.scratch.fa2_fp8_q_scratch);
 
     key
 }
@@ -2551,6 +2542,7 @@ fn mtp_accept_and_rollback(
                         None,
                     )
                 })?;
+                dn_state.seal_streams(gpu, cur_pos + advance)?;
             } else {
                 gpu.graphs.ar_graph_eligible = false;
                 qwen35::forward_scratch(
@@ -3647,14 +3639,19 @@ pub fn prefill_trunk_and_mtp_cache(
         prompt_tokens,
         start_pos,
         route,
-        |_gpu, _target, _kv, _committed_pos| Ok(()),
+        None,
+        |_gpu, _target, _kv, _committed_pos, _turn| Ok(()),
     )
 }
 
 /// Like [`prefill_trunk_and_mtp_cache`], but invokes `on_committed_boundary`
 /// after each trunk chunk and its MTP fill commit, with the trunk DeltaNet
 /// state and the exclusive end position of the committed prefix
-/// (`start_pos + tokens_written_so_far`).
+/// (`start_pos + tokens_written_so_far`), and the flag `false`. Before
+/// forwarding the chunk that holds `turn_boundary`, it is invoked once more
+/// with that chunk's start position and the flag `true` (the newest existing
+/// chunk end at or before the boundary, or the prefill start; see
+/// `prompt_frame::chunk_holds_turn_boundary`). The chunk plan never changes.
 ///
 /// The callback runs while `target.kv_cache` holds the just-written prefix.
 /// Failures propagate and abort the remaining prefill (caller must free MTP
@@ -3668,10 +3665,11 @@ pub fn prefill_trunk_and_mtp_cache_with_boundary<F>(
     prompt_tokens: &[u32],
     start_pos: usize,
     route: MtpPromptRoute,
+    turn_boundary: Option<usize>,
     on_committed_boundary: F,
 ) -> HipResult<TrunkSpinePrefillTimings>
 where
-    F: FnMut(&mut Gpu, &DeltaNetState, &KvCache, usize) -> HipResult<()>,
+    F: FnMut(&mut Gpu, &DeltaNetState, &KvCache, usize, bool) -> HipResult<()>,
 {
     let mut parts = MtpPrefillTarget {
         weights: &target.weights,
@@ -3688,6 +3686,7 @@ where
         prompt_tokens,
         start_pos,
         route,
+        turn_boundary,
         on_committed_boundary,
     )
 }
@@ -3712,10 +3711,11 @@ pub fn prefill_trunk_and_mtp_cache_parts<F>(
     prompt_tokens: &[u32],
     start_pos: usize,
     route: MtpPromptRoute,
+    turn_boundary: Option<usize>,
     mut on_committed_boundary: F,
 ) -> HipResult<TrunkSpinePrefillTimings>
 where
-    F: FnMut(&mut Gpu, &DeltaNetState, &KvCache, usize) -> HipResult<()>,
+    F: FnMut(&mut Gpu, &DeltaNetState, &KvCache, usize, bool) -> HipResult<()>,
 {
     let Some(head_rows) =
         mtp_prompt_fill_scratch_rows(prompt_tokens.len(), qwen35::prefill_max_batch(gpu))
@@ -3874,6 +3874,19 @@ where
                         .unwrap_or(remaining.min(trunk_chunk_max).max(1))
                 }
             };
+            if hipfire_runtime::prompt_frame::chunk_holds_turn_boundary(
+                start_pos + off,
+                outer,
+                turn_boundary,
+            ) {
+                on_committed_boundary(
+                    gpu,
+                    target.dn_state,
+                    &*target.kv_cache,
+                    start_pos + off,
+                    true,
+                )?;
+            }
             let end = off + outer;
             let chunk = &prompt_tokens[off..end];
             let chunk_start_pos = start_pos + off;
@@ -3982,12 +3995,22 @@ where
             }
 
             // Committed boundary: trunk + MTP private KV now cover [0, committed_pos).
-            on_committed_boundary(gpu, target.dn_state, &*target.kv_cache, committed_pos)?;
+            on_committed_boundary(
+                gpu,
+                target.dn_state,
+                &*target.kv_cache,
+                committed_pos,
+                false,
+            )?;
             // `prefill_progress` for the request's prompt prefill (live only
             // inside a `prompt_phase`; silent for decode-time replays).
             hipfire_runtime::prefill_progress::report(end, prompt_tokens.len());
             off = end;
         }
+        // The prompt spine ends ordinary prefill: one seal before decode/verify.
+        target
+            .dn_state
+            .seal_streams(gpu, start_pos + prompt_tokens.len())?;
 
         let last = prompt_tokens.len() - 1;
         gpu.hip
@@ -4454,6 +4477,7 @@ pub fn spec_step_mtp(
                     None,
                 )
             })?;
+            target.dn_state.seal_streams(gpu, cur_pos + advance)?;
         } else {
             // advance == 1: only the seed (last_committed) is "replayed". This
             // happens when EOS hits with accept_count==0 AND bonus==eos
@@ -4765,6 +4789,7 @@ pub fn spec_step_mtp_compressed(
                 None,
             )
         })?;
+        target.dn_state.seal_streams(gpu, cur_pos + advance)?;
     } else {
         gpu.graphs.ar_graph_eligible = false; // spec re-seed: never the plain-AR graph
         qwen35::forward_scratch(
@@ -6160,7 +6185,7 @@ mod tests {
             MtpProposalGraphPolicy::Auto,
             true,
             false,
-            crate::mtp_head::MtpKvMode::Asym3,
+            crate::mtp_head::MtpKvMode::Fwht4,
         ));
         assert!(mtp_proposal_graph_eligible_for(
             MtpProposalGraphPolicy::On,

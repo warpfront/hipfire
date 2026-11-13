@@ -8,7 +8,7 @@ Tick the surfaces this PR changes so a reviewer can match evidence to the claim 
 
 - [ ] **kernel** — `kernels/`, `crates/rdna-compute`, `crates/hipfire-dispatch`, `crates/hip-bridge`, `crates/saddle-core`
 - [ ] **load** — `crates/hipfire-loader`, `crates/hipfire-daemon`, runtime load path (`model_load`, `hfq`, `loader_api`, `config`, `safetensors_source`, `weight_backend`, `multi_gpu`), arch `load*`/`weights*`/`carrier.rs`, `hipfire-config`, `hipfire-registry`, `registry/`, Cargo manifests
-- [ ] **serve** — `crates/hipfire-engine`, `crates/hipfire-generate`, daemon slots/serve, runtime emit/eos/dflash/dspark/spec/reset/triattn
+- [ ] **serve** — `crates/hipfire-engine`, `crates/hipfire-generate`, daemon slots/serve, runtime emit/eos/dflash/dspark/spec/reset
 - [ ] **arch crate(s)**: <list, e.g. `hipfire-arch-qwen35`, `hipfire-arch-gemma4`, `hipfire-arch-lfm2moe`>
 - [ ] `crates/hipfire-quantize` / quant formats (update `docs/quant-formats/qt-register.txt`)
 - [ ] control plane — `hipfire-cli`, `hipfire-client`, `hipfire-tui`

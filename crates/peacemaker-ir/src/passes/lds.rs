@@ -373,7 +373,7 @@ fn evaluate(name: &str, src: &[Value]) -> Value {
 
 fn transfer(st: &mut Values, inst: &Inst, arch: Arch) {
     use crate::effects::ImplicitSet;
-    let Some(row) = crate::isa::lookup(arch, inst.op, inst.form) else {
+    let Some(row) = crate::isa::lookup_inst(arch, &inst).ok() else {
         return;
     };
     let mut src = smallvec::SmallVec::<[Value; 4]>::new();
@@ -444,7 +444,7 @@ fn refine(st: &mut Values, body: &Body, arch: Arch, range: (usize, usize), scc: 
         if inst.effects.implicit.writes & ImplicitSet::SCC == 0 {
             continue;
         }
-        let name = inst.op.name(arch).unwrap_or("");
+        let name = inst.name(arch).unwrap_or("");
         let Some(Operand::Reg(reg)) = inst.operands.first() else {
             return;
         };
@@ -602,7 +602,10 @@ fn entries(body: &Body, arch: Arch) -> Vec<Option<Values>> {
 
 /// LDS facts for one kernel body.
 pub fn analyze(body: &Body, arch: Arch) -> Result<LdsAnalysis, LdsError> {
-    if !matches!(arch, Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1201) {
+    if !matches!(
+        arch,
+        Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1200 | Arch::Gfx1201
+    ) {
         return Err(LdsError::UnsupportedArch(arch));
     }
     let whole = SegId(0);
@@ -636,7 +639,7 @@ pub fn analyze(body: &Body, arch: Arch) -> Result<LdsAnalysis, LdsError> {
             let id = body.layout[pos];
             let inst = body.insts.get(id).expect("validated layout");
             if let Some(kind) = inst.effects.mem.as_ref().and_then(|m| access_kind(m.class)) {
-                let name = inst.op.name(arch).unwrap_or("");
+                let name = inst.name(arch).unwrap_or("");
                 let bytes = access_bytes(name);
                 let value = inst
                     .effects

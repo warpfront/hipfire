@@ -127,6 +127,11 @@ pub fn source_sha256(source: &str) -> String {
     hex(&sha256(source.as_bytes()))
 }
 
+/// Hex SHA-256 of arbitrary bytes (the same implementation as [`source_sha256`]).
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    hex(&sha256(bytes))
+}
+
 // ---------------------------------------------------------------------------
 // Routes (parsed per target, validated even when no loop or symbol matches).
 // ---------------------------------------------------------------------------
@@ -199,7 +204,8 @@ fn linked_object(arch: Arch, variant: &str, s_text: &str) -> Result<Vec<u8>, Str
             let _ = std::fs::remove_file(elf);
         }
     };
-    std::fs::write(&s_path, s_text).map_err(|e| format!("{}: {e}", s_path.display()))?;
+    std::fs::write(&s_path, crate::objdump_spelling(s_text))
+        .map_err(|e| format!("{}: {e}", s_path.display()))?;
     let elf = match build(&Toolchain::default(), &s_path, &hsaco_path, arch.name()) {
         Ok(out) => out.elf,
         Err(e) => {
@@ -245,9 +251,10 @@ fn emulator_of(program: &peacemaker_ir::Program, symbol: &str) -> Result<Value, 
             .insts
             .get(*id)
             .ok_or_else(|| format!("{symbol}: dangling instruction"))?;
-        let x = isa::lookup(arch, inst.op, inst.form)
+        let x = isa::lookup_inst(arch, &inst)
+            .ok()
             .map(|row| row.name)
-            .or_else(|| inst.op.name(arch))
+            .or_else(|| inst.name(arch))
             .unwrap_or("unknown");
         count(x);
         if let FormFields::Vopd { y_op, .. } = &inst.fields {

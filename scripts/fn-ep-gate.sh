@@ -56,6 +56,14 @@
 # Environment: EXTRA_ENV="K=V K2=V2" adds variables to every arm; FN_EP_GATE_ARM_TIMEOUT (7200 s,
 # oracle arm) and FN_EP_GATE_BENCH_TIMEOUT (3600 s, one bench process) bound each run.
 #
+# Trunk shard: the default two-gfx1201 EP2 is the TP2 trunk shard (HIPFIRE_QWEN4_EP_TRUNK_SHARD), which rounds each rank's f32
+# partial to bf16 once and is NOT byte-equal to one card by design (docs/multi-gpu.md "Exactness"). Every exactness arm, i.e.
+# every oracle arm of --mode ep and --mode pp (the reference arm included), therefore pins HIPFIRE_QWEN4_EP_TRUNK_SHARD=0
+# explicitly, last, so neither an inherited value nor EXTRA_ENV (which may not set it) can change the route being compared.
+# Every other arm clears an inherited value and runs the shipped default route: the speed cells (`hipfire bench`) time the
+# shard route on two gfx1201 cards, and the --mode reserve arms (ep2-off / ep2-on, compared with each other, never with one
+# card) run it too. The gate has no arm that compares the shard route with one card.
+#
 # Steps: (a) environment receipt (git/build hash, ROCm, rocm-smi topology + P2P access, per-card
 # arch/VRAM/PCIe link speed+width from sysfs, host RAM); (b) cargo build of fn_ep_oracle
 # (hipfire-loader, feature `lab`), hipfire, daemon; (c) arms `single` (HIPFIRE_DEVICES = first card,
@@ -243,6 +251,7 @@ else
   [[ -z $C1_MANIFEST ]] || { [[ -r $C1_MANIFEST ]] || die "--c1-manifest not readable: $C1_MANIFEST"; C1_MANIFEST=$(readlink -f "$C1_MANIFEST"); }
 fi
 ((REPS >= 1)) || die "--reps must be >= 1"
+[[ $MODE == reserve || $EXTRA_ENV != *HIPFIRE_QWEN4_EP_TRUNK_SHARD* ]] || die "EXTRA_ENV may not set HIPFIRE_QWEN4_EP_TRUNK_SHARD outside --mode reserve (the exactness arms pin it to 0, the speed cells run the default route)"
 [[ -f $SHORT_PROMPT && -f $LONG_PROMPT && -f $COMPARE ]] || die "scripts/fn-ep-gate-prompts or fn_ep_compare.py missing next to this script"
 command -v python3 >/dev/null || die "python3 is required"
 command -v cargo >/dev/null || [[ $SKIP_BUILD == 1 ]] || die "cargo is required (or pass --skip-build)"
@@ -529,6 +538,13 @@ receipt = {
         "long_prompt_truncated_to": int(E.get("GATE_LONG_TOKENS", "0") or 0),
         "oracle_arms_env": "HIPFIRE_GRAPH=0 (EP is eager; %s pinned to the same schedule)" % ("single" if ref_ranks == 1 else "the reference"),
         "speed_arms_env": "default graph setting; EP arms run eager",
+        "trunk_shard_env": (
+            "HIPFIRE_QWEN4_EP_TRUNK_SHARD cleared on every arm: the arms run the shipped default route (the TP2 trunk shard on two "
+            "gfx1201 cards) and are compared with each other, never with one card"
+            if mode == "reserve" else
+            "every oracle (exactness) arm pins HIPFIRE_QWEN4_EP_TRUNK_SHARD=0 (the default two-gfx1201 EP2 is the TP2 trunk shard, "
+            "not byte-equal to one card by design); the speed cells clear it and run the shipped default route"
+        ),
     },
     "env": env,
     "link_table": link_table,
@@ -1006,7 +1022,7 @@ build_all() {
 # --------------------------------------------------------------- arm helpers
 ARM_ENV=()
 arm_env() {
-  local arm=$1 ep=$2 devs=$3 pp=${4:-0} mtp=${5:-0} layers=${6:-} reserve=${7:-0}
+  local arm=$1 ep=$2 devs=$3 pp=${4:-0} mtp=${5:-0} layers=${6:-} reserve=${7:-0} exact=${8:-0}
   # ROCR_VISIBLE_DEVICES: dropped only when the card list came from our own KFD selection; a list the
   # caller supplied (--devices) or inherited (a scheduler's HIPFIRE_DEVICES) leaves ROCR_VISIBLE_DEVICES alone.
   local unset_rocr=() unset_pp=()
@@ -1024,7 +1040,8 @@ arm_env() {
     unset_pp=(-u HIPFIRE_EP_RESERVE_DECOUPLE -u HIPFIRE_EP_RESERVE_RECEIPT -u HIPFIRE_PREFILL_CHUNK_ROWS
       -u HIPFIRE_MTP_AR_FLOOR -u HIPFIRE_MTP_INCREMENTAL -u HIPFIRE_MTP_NGRAM)
   fi
-  ARM_ENV=(env -u HIP_VISIBLE_DEVICES -u HIPFIRE_QWEN4_EP ${unset_rocr[@]+"${unset_rocr[@]}"} ${unset_pp[@]+"${unset_pp[@]}"}
+  # HIPFIRE_QWEN4_EP_TRUNK_SHARD is cleared on every arm: an inherited value never decides the route (the exactness arms pin it below).
+  ARM_ENV=(env -u HIP_VISIBLE_DEVICES -u HIPFIRE_QWEN4_EP -u HIPFIRE_QWEN4_EP_TRUNK_SHARD ${unset_rocr[@]+"${unset_rocr[@]}"} ${unset_pp[@]+"${unset_pp[@]}"}
     "HIPFIRE_DEVICES=$devs" "HIPFIRE_TOPOLOGY_EP=$ep" HIPFIRE_NO_REGISTRY_FETCH=1 "HIPFIRE_DAEMON_BIN=$DAEMON")
   if [[ $MODE == pp ]]; then
     # Every PP-mode arm, the single-card reference included, pins its degree so an inherited topology.pp cannot leak in.
@@ -1063,6 +1080,8 @@ arm_env() {
   fi
   # The native-MTP policy is pinned last so EXTRA_ENV cannot change the window schedule of an exactness arm.
   ((mtp == 0)) || ARM_ENV+=("${PP_PINNED_MTP[@]}")
+  # Bit-identity against one card (every oracle arm of the ep and pp gates, `exact`): pin the unsharded route. Last, like the MTP policy.
+  ((exact == 0)) || ARM_ENV+=(HIPFIRE_QWEN4_EP_TRUNK_SHARD=0)
 }
 
 start_vram_sampler() {
@@ -1089,7 +1108,10 @@ run_oracle_arm() {
   local rec=$OUT/oracle/$arm-receipt out=$OUT/oracle/$arm rc=0
   rm -rf "$rec" "$out"
   mkdir -p "$rec"
-  arm_env "$arm" "$ep" "$devs" "$pp" "$mtp" "$layers" "$reserve"
+  # The ep / pp oracle arms are compared with one card (bit-identity); the reserve arms only with each other.
+  local exact=1
+  [[ $MODE != reserve ]] || exact=0
+  arm_env "$arm" "$ep" "$devs" "$pp" "$mtp" "$layers" "$reserve" "$exact"
   local oracle_extra=()
   if [[ $MODE == pp ]]; then
     oracle_extra+=(--canonical-state)

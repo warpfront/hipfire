@@ -548,12 +548,14 @@ fn llvm_disassembler_agrees_on_rejections() {
     let nop = words_of(&ds(DsOp::Nop, EVEN_SETS[0], 0, 0));
     let sw = words_of(&ds(DsOp::SwizzleB32, EVEN_SETS[0], 0, 0));
     let rtn = words_of(&ds(DsOp::AddRtnU32, EVEN_SETS[0], 0, 0));
+    let or_rtn = words_of(&ds(DsOp::OrRtnB32, EVEN_SETS[0], 0, 0));
     for (what, w) in [
         ("data0 on read", words(good[0], good[1] | 5 << 8)),
         ("data1 on read", words(good[0], good[1] | 5 << 16)),
         ("vdst on write", words(wr[0], wr[1] | 3 << 24)),
         ("data0 on swizzle", words(sw[0], sw[1] | 5 << 8)),
         ("data1 on rtn add", words(rtn[0], rtn[1] | 5 << 16)),
+        ("data1 on rtn or", words(or_rtn[0], or_rtn[1] | 5 << 16)),
         ("nop addr", words(nop[0], nop[1] | 1)),
         ("nop offset0", words(nop[0] | 3, nop[1])),
         ("nop gds", words(nop[0] | 1 << 16, nop[1])),
@@ -626,6 +628,21 @@ fn footprints() {
         ]
     );
 
+    // ds_write_b16_d16_hi v1, v8 (opcode 85): one data dword, no destination
+    let d = ds(DsOp::WriteB16D16Hi, (4, 1, 8, 12), 0, 0);
+    assert_eq!(DsOp::WriteB16D16Hi.name(), "ds_write_b16_d16_hi");
+    let fp = d.footprint();
+    assert!(fp.defs.is_empty());
+    assert_eq!(
+        fp.uses,
+        vec![
+            exec,
+            m0,
+            span(RegFile::Vgpr, 1, 1),
+            span(RegFile::Vgpr, 8, 1)
+        ]
+    );
+
     // ds_add_u32 (no return) and ds_add_rtn_u32
     let fp = ds(DsOp::AddU32, (4, 1, 8, 12), 0, 0).footprint();
     assert!(fp.defs.is_empty());
@@ -639,6 +656,14 @@ fn footprints() {
         ]
     );
     let fp = ds(DsOp::AddRtnU32, (4, 1, 8, 12), 0, 0).footprint();
+    assert_eq!(fp.defs, vec![span(RegFile::Vgpr, 4, 1)]);
+    assert!(has_use(&fp, m0) && has_use(&fp, exec));
+
+    // ds_or_b32 / ds_or_rtn_b32 mirror add.
+    let fp = ds(DsOp::OrB32, (4, 1, 8, 12), 0, 0).footprint();
+    assert!(fp.defs.is_empty());
+    assert!(has_use(&fp, m0) && has_use(&fp, exec));
+    let fp = ds(DsOp::OrRtnB32, (4, 1, 8, 12), 0, 0).footprint();
     assert_eq!(fp.defs, vec![span(RegFile::Vgpr, 4, 1)]);
     assert!(has_use(&fp, m0) && has_use(&fp, exec));
 
@@ -688,6 +713,7 @@ fn mem_kinds() {
         | DsOp::ReadI16 => MemKind::DsLoad,
         DsOp::WriteB8
         | DsOp::WriteB16
+        | DsOp::WriteB16D16Hi
         | DsOp::WriteB32
         | DsOp::WriteB64
         | DsOp::WriteB96
@@ -697,10 +723,14 @@ fn mem_kinds() {
         | DsOp::Write2st64B32
         | DsOp::Write2st64B64
         | DsOp::Nop => MemKind::DsStore,
-        DsOp::AddU32 | DsOp::MaxU32 | DsOp::MaxI32 | DsOp::MaxF32 | DsOp::MinF32 | DsOp::AddF32 => {
-            MemKind::DsAtomic
-        }
-        DsOp::AddRtnU32 => MemKind::DsAtomicRtn,
+        DsOp::AddU32
+        | DsOp::OrB32
+        | DsOp::MaxU32
+        | DsOp::MaxI32
+        | DsOp::MaxF32
+        | DsOp::MinF32
+        | DsOp::AddF32 => MemKind::DsAtomic,
+        DsOp::AddRtnU32 | DsOp::OrRtnB32 => MemKind::DsAtomicRtn,
         DsOp::SwizzleB32 | DsOp::PermuteB32 | DsOp::BpermuteB32 => MemKind::DsXlane,
     };
     for &op in DsOp::ALL {
@@ -767,7 +797,9 @@ fn display_spellings() {
     );
     assert_eq!(d(DsOp::WriteB96, r, 0, 0), "ds_write_b96 v1, v[8:10]");
     assert_eq!(d(DsOp::AddU32, r, 8, 0), "ds_add_u32 v1, v8 offset:8");
+    assert_eq!(d(DsOp::OrB32, r, 8, 0), "ds_or_b32 v1, v8 offset:8");
     assert_eq!(d(DsOp::AddRtnU32, r, 0, 0), "ds_add_rtn_u32 v4, v1, v8");
+    assert_eq!(d(DsOp::OrRtnB32, r, 0, 0), "ds_or_rtn_b32 v4, v1, v8");
     assert_eq!(d(DsOp::SwizzleB32, r, 0, 0), "ds_swizzle_b32 v4, v1");
     assert_eq!(
         d(DsOp::SwizzleB32, r, 0xe4, 0x80),
@@ -795,4 +827,21 @@ fn display_spellings() {
         "ds_bpermute_b32 v4, v1, v8 offset:4"
     );
     assert_eq!(d(DsOp::Nop, r, 0, 0), "ds_nop");
+}
+
+#[test]
+fn ds_or_frozen_words_and_opcodes() {
+    // Kernel #9 group_scatter_desc: ds_or_b32 v2, v3.
+    let w = [3625189376u32, 770];
+    let (d, consumed) = Ds::decode(ARCH, &w).unwrap();
+    assert_eq!(consumed, w.len());
+    assert_eq!(d.op, DsOp::OrB32);
+    assert_eq!(d.addr, Some(Src::Vgpr(2)));
+    assert_eq!(d.data0, Some(Src::Vgpr(3)));
+    assert_eq!(words_of(&d), w);
+    assert_eq!(DsOp::OrB32.opcode(ARCH), Some(10));
+    assert_eq!(DsOp::OrRtnB32.opcode(ARCH), Some(42));
+    let rtn = ds(DsOp::OrRtnB32, EVEN_SETS[0], 0, 0);
+    let words = words_of(&rtn);
+    assert_eq!(Ds::decode(ARCH, &words).unwrap(), (rtn, words.len()));
 }

@@ -3,9 +3,10 @@
 `hipfire quantize` is the user-facing wrapper around the CPU-only
 `hipfire-quantize` binary. It converts HuggingFace safetensors or a local
 model directory into hipfire’s HFQM container (extensions `.mq4`, `.hf4`,
-`.mq6`, …). The daemon mmaps the result directly. GGUF **weight** input is
-deprecated since 0.4.0 (removal in 0.5.0): GGUF→mqN is lossy double quantization; quantize from the original safetensors instead. A GGUF-format
-`imatrix.gguf` (`--imatrix`) stays supported.
+`.mq6`, …). The daemon mmaps the result directly. GGUF **weight** input was
+removed in 0.5.0 (GGUF→mqN is lossy double quantization; quantize from the
+original safetensors instead). A GGUF-format `imatrix.gguf` (`--imatrix`) stays
+supported.
 
 Design / math / wire IDs: [QUANTIZATION.md](QUANTIZATION.md).
 Magnum V2 specs: [quant-formats/mq4-v2.md](quant-formats/mq4-v2.md),
@@ -23,11 +24,10 @@ HFP4 family detail: [quant-formats/hfp4.md](quant-formats/hfp4.md).
 | `mq4c` | qt 45 `MQ4CG256` | 4 | FWHT | V1.5 pad geometry; `hipfire-quantize` direct |
 | `mq6` | qt 15 `MQ6G256` | 6 | FWHT | Qwen 3.5+ v1 when you can spare size for quality |
 | `mq{6,5,3,2}v2` | qt 47/48/49/50 | 6…2 | FWHT | Dense Magnum V2 ladder bodies — **`hipfire-quantize` direct** |
-| `hf4` (`hfq4`, `hfq4g256`) | qt 6 | 4 | none | Dense Llama / Mistral / Gemma / older Qwen. **Default for GGUF.** |
+| `hf4` (`hfq4`, `hfq4g256`) | qt 6 | 4 | none | Dense Llama / Mistral / Gemma / older Qwen. |
 | `hf6` (`hfq6`, `hfq6g256`) | qt 8 | 6 | none | Dense, higher quality |
 | `q8` / `q8f16` | qt 3 | 8 | none | Reference / debug (safetensors path) |
 | `mq3` | qt 17 | 3 | FWHT | Sub-4-bit v1 — **`hipfire-quantize` direct only** (thin CLI rejects it) |
-| `tq2` / `bq1` | qt 40 / 41 | ternary / 1 | none | Bonsai — `hipfire-quantize` direct |
 | `hfp4` / `mfp4` / E8 / Lloyd | varies | see docs | Advanced; usually via `hipfire-quantize` directly |
 
 FWHT (the “M” in MQ) applies the two-sign rotation
@@ -39,9 +39,8 @@ quality benefit — prefer HFQ.
 **Thin CLI allowlist** (`hipfire quantize`): still only `mq4`, `mq6`, `q8`,
 `q8f16`, and `hf4`/`hf6` aliases. **Unchanged surface** — the wrapper does not
 grow V2/`mq3`/Lloyd/HFP flags. Because the binary maps `mq4` → qt 44, a thin
-CLI `hipfire quantize … --format mq4` produces **MQ4G256V2**. **GGUF input**
-further narrows to `hf4`, `hf6`, `mq4`, `mq6`. Formats such as `mq3`,
-`mq{2,3,5,6}v2`, `mq4v1`, `mq4c`, HFP/MFP, Lloyd, Bonsai, and graded MoE need
+CLI `hipfire quantize … --format mq4` produces **MQ4G256V2**. Formats such as `mq3`,
+`mq{2,3,5,6}v2`, `mq4v1`, `mq4c`, HFP/MFP, Lloyd, and graded MoE need
 `hipfire-quantize` directly.
 
 **Not produced by the thin CLI path:** graded per-expert MoE recipes
@@ -109,52 +108,20 @@ Directory needs `config.json` plus one or more `.safetensors` files. The
 quantizer accepts many architectures; inference only runs if a carrier/loader
 exists for that `arch_id` (see [architecture-ids.md](architecture-ids.md)).
 
-## From GGUF (deprecated, removal in 0.5.0)
+## GGUF
 
-**Deprecated since 0.4.0, removal in 0.5.0: GGUF→mqN is lossy double quantization; quantize from the original safetensors instead.**
-A GGUF weight input prints
-`warning: GGUF weight input is deprecated and will be removed in 0.5.0; … (imatrix.gguf input stays supported)`.
-Quantize from the original safetensors instead. `--imatrix <file.gguf>` is not affected.
-
-```bash
-hipfire quantize ./tinyllama.Q4_K_M.gguf \
-    --install --register tinyllama:1b-gguf
-# default --format hf4 → …hf4
-
-hipfire quantize ./qwen3.5.Q4_K_M.gguf --format mq4 \
-    --install --register q35:9b-gguf
-```
-
-GGUF tensor names are rewritten to HuggingFace-style names so
-`load_weights_hfq` works. Tokenizer fields (`tokenizer.ggml.tokens` / merges /
-bos/eos / model) are preserved under `gguf_meta` in the metadata blob;
-`Tokenizer::from_hfq_metadata` reads them — the original GGUF need not stay on
-disk.
-
-Per-tensor selection in the GGUF pipeline:
-
-| Tensor | Format |
-|---|---|
-| 1D norm / scale | F16 |
-| embedding (`token_embd`) | Q8F16 |
-| 2D weight, `K % 256 == 0` | chosen `--format` |
-| 2D weight, K not multiple of 256 | HFQ4-G128 fallback (no rotation) |
-
-Supported source GGUF dequant types: `Q4_0`, `Q8_0`, `Q4_K`, `Q5_K`, `Q6_K`,
-`F16`, `BF16`, `F32`. Unsupported (quantizer errors on encounter): `Q5_0`,
-`Q5_1`, and IQ* families.
-
-### Quality caveat (GGUF)
-
-GGUF is **double quantization**: dequant already-lossy weights, then requantize.
-Expect worse quality than full-precision safetensors of the same model. Prefer
-HF6/MQ6 if disk allows, or quantize from original safetensors.
+GGUF **weight** input was removed in 0.5.0: GGUF→mqN is lossy double
+quantization (dequantize already-lossy weights, then requantize). `hipfire
+quantize` and `hipfire-quantize` refuse a `.gguf` input with an error naming
+the removal; quantize from the original safetensors checkpoint instead, or use
+llama.cpp for GGUF. `--imatrix <file.gguf>` (a llama.cpp imatrix) is still
+supported.
 
 ## CLI flags (`hipfire quantize`)
 
 | Flag | Purpose |
 |---|---|
-| `--format <fmt>` | Repeatable. Default: `mq4` → **qt 44 MQ4G256V2** (safetensors); `hf4` (GGUF). Thin allowlist only. |
+| `--format <fmt>` | Repeatable. Default: `mq4` → **qt 44 MQ4G256V2**. Thin allowlist only. |
 | `--both` | Shorthand for `--format mq4 --format mq6` |
 | `-o, --output <path>` | Single-format output path |
 | `--output-dir <dir>` | Multi-format output directory |
@@ -186,6 +153,7 @@ Full alias set and product-ladder controls. Common extras:
 | `--imatrix <gguf>` | GGUF-format imatrix for activation-aware recipes |
 | `--hessian-dir <dir>` | GPTQ-E8 Hessians |
 | `--awq` / `--awq-alpha` / `--awq-a4-aware` | AWQ pre-scale (default alpha 0.55). `--awq-a4-aware` is MQ4V2-only and selects an alpha per shared activation group from 0.35/0.45/0.55/0.65/0.75 by sampled W4A4 block-output error, using the imatrix RMS profile and the runtime-exact four-candidate `block_i4_128` fake quantizer. Fused qkvza/gate-up siblings share the anchor projection's alpha so their single runtime inverse scale remains valid. |
+| `--awq-fix-la-head-order` | Re-index llama.cpp's tiled V-head order in the imatrix's `linear_attn.out_proj` / `ssm_out` entries back to HF grouped order before AWQ. The HF→GGUF converter permutes that tensor's input axis for `ggml_repeat` broadcast (`tiled = v_slot·n_k_heads + k_head`), so the imatrix records it tiled while HF columns are grouped (`grouped = k_head·n_v_per_k + v_slot`); HF head `h` reads tiled head `(h % n_v_per_k)·n_k_heads + h / n_v_per_k`. Geometry is read from the model config. Off by default for recipe reproducibility; a warning names the flag when it is missing. Only `out_proj` is affected (the other reordered tensors are reordered along their output axis, which `in_sum2` does not see). |
 | `--kmap-dense` / `--kmap-mode` / `--no-kmap` / `--uniform` | K-map promotion policy |
 | `--q8-router` / `--no-q8-conv1d` | Protect routers / conv1d |
 | `--reap-overlay` / `--reap-bake` / `--reap-out` / `--reap-arch` | REAP plan paths |
@@ -209,8 +177,7 @@ LFM2-MoE 11, Cohere2-MoE 12, Gemma4 13/22, Glimmer 14/23, and any other
 unaudited `arch_id`) keep their existing encoder routes: ordinary
 `mq4`/`mq4v2` and nonexpert V2 Lloyd Promote6 weights retain MQ6G256
 (qt15), but V2 Lloyd stacked experts remain unpromoted MQ4G256 (qt13).
-Legacy MQ4 and compact `mq4c` also keep MQ6G256 (qt15); GGUF promotions
-remain qt15. Non-256-aligned weights still fall back to Q8. This does
+Legacy MQ4 and compact `mq4c` also keep MQ6G256 (qt15). Non-256-aligned weights still fall back to Q8. This does
 not rewrite existing artifacts or alter their loader routes.
 MQ6 V2 is not a layout-only conversion: its two fp16 affine grids per
 256-weight group differ from V1's single f32 grid. Both occupy 200 bytes;
@@ -242,12 +209,11 @@ Embedding lookup admits only the loaded formats `Q8_0`, `F32`, `HFQ4G256`
 and `HFQ4G128`. Supported host-decoded embeddings arrive as `F32`: F16,
 BF16, TQ2G128, BQ1G128 and MQ*G256V2 (quant types 44/45/47–50); other
 embedding formats still refuse with a named error.
-Refused projection containers: Lloyd-V2 (qt52), PARO, E8/MFP4 and
+Refused projection containers: Lloyd-V2 (qt52), E8/MFP4 and
 G128-rotated containers. fp32 DeltaNet state also refuses with a named
 error. AWQ sidecars are refused inside a mixed-dtype group (each scale
 needs its own rotated input). KV tiers: q8 (auto/unset default on every
-GPU), fwht{2,3,4} (`asymN`/`turboN` aliases; bare `turbo` = fwht3),
-legacy-asym{2,3,4}, native bf16/f16 (f16 is slots-only), and explicit fp8
+GPU), fwht{2,3,4}, native bf16/f16 (f16 is slots-only), and explicit fp8
 on exact gfx1201 only — `--kv-k`/`--kv-v` splits are not supported by slots.
 
 ### Vision-tower sidecar (`qwen3.8-27b-vision.hfq`)
@@ -525,15 +491,6 @@ Quantization is CPU- and memory-bandwidth bound. Wall time and peak memory depen
 tensor size, target format, calibration, and the thread cap, so no fixed numbers
 are given; run on a small model first to gauge cost, and lower the thread cap if
 the machine becomes memory-bandwidth constrained.
-
-## Deprecated: CASK sidecar (removal in 0.5.0)
-
-CASK / TriAttention eviction is deprecated and will be removed in 0.5.0; it is
-not a post-quantize step and not supported. Until then,
-`hipfire sidecar-gen <model> --corpus <file>` still writes
-`<model>.triattn.bin` (with a deprecation warning); nothing
-attaches it unless `cask_sidecar` or `cask_auto_attach=true` is set. See
-[CONFIG.md](CONFIG.md).
 
 ## Related
 

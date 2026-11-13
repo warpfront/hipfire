@@ -2,8 +2,10 @@
 # This table is interpreter dispatch, not a full-domain numerical certificate.
 # The bounded replay gate is QSA convert/attend and sym NT4 gate_up/down.
 # A row means the interpreter has a model for the name; the model itself refuses every unmeasured modifier or
-# architecture at execution. Rows with an architecture-limited model: v_wmma_f32_16x16x16_bf16 (gfx1201 measured;
-# gfx1151 historical corpus only, fresh receipt pending), v_dot2_f32_f16/bf16 (gfx1201 only), and the gfx1201-only
+# architecture at execution. Rows with an architecture-limited model: v_wmma_f32_16x16x16_bf16 (gfx1201 and gfx1151
+# measured, gfx1151 by the Halo receipt of 2026-11-05, BDF 0000:c0:00.0, fabric job j4390: 0 mismatches over 27,624,704
+# BF16 words, controls/Cartesian/subnormal/C-tail/random, MODE variants, neg_lo/neg_hi; gfx1100 refused),
+# v_dot2_f32_f16/bf16 (gfx1201 and gfx1151, same Halo receipt; gfx1100 refused), and the gfx1201-only
 # SWMMAC rows v_swmmac_f32_16x16x32_f16/bf16 and v_swmmac_i32_16x16x32_iu8/iu4/x64_iu4 (index_key 0/1, measured
 # neg_lo/neg_hi, integer two-half CLAMP; accumulator NEG[2], float CLAMP and other OPSEL bits refused). The six
 # rows v_swmmac_f16_16x16x32_f16, v_swmmac_bf16_16x16x32_bf16 and v_swmmac_f32_16x16x32_{fp8,bf8}_{fp8,bf8} execute
@@ -13,7 +15,12 @@
 # The AMDGPU unsigned-division expansion of the builder GEMM prologues (s_cvt_f32_u32, v_s_rcp_f32, s_mul_f32,
 # s_cvt_u32_f32) executes on gfx1201 only, for denominators 1..=2^24 (hardware-measured stage by stage); v_div_scale_f32
 # follows the measured exponent-field chain of emu/alu.rs. See float_edges.md.
-# NO row, so a decoded program hard-errors at load: v_wmma_bf16_16x16x16_bf16 and every FP8/BF8 WMMA.
+# The four dense FP8/BF8 WMMA rows v_wmma_f32_16x16x16_{fp8,bf8}_{fp8,bf8} (gfx1201 only: two 8-term steps with quad
+# alignment, factor-NaN and BF8 invalid-operation words; clamp and A/B neg refused, C neg_lo/neg_hi measured to have no
+# effect), v_cvt_pk_fp8_f32 (gfx1201 only, exhaustive over all 2^32 f32 inputs; source modifiers refused) and
+# global_load_tr_b64 (gfx1201 wave32; EXEC ignored, EXEC == 0 skips) are hardware-measured, see float_edges.md "FP8 attention
+# capabilities (B2)".
+# NO row, so a decoded program hard-errors at load: v_wmma_bf16_16x16x16_bf16.
 # v_maxmin_num_f32 (gfx1201 only, no source modifiers/omod/clamp) is the num_select composition, hardware-compared
 # over every triple of a 48-value f32 set (float_edges.md, receipt gfx1201-maxmin-r1).
 # See isa/emu/float_edges.md "Opcode-fill qualification (pending)".
@@ -46,6 +53,7 @@ s_add_co_i32	alu
 s_add_co_u32	alu
 s_add_i32	alu
 s_add_nc_u64	alu
+s_sub_nc_u64	alu
 s_add_u32	alu
 s_addc_u32	alu
 s_addk_co_i32	alu
@@ -57,6 +65,7 @@ s_barrier	control
 s_barrier_signal	control
 s_barrier_wait	control
 s_bfe_u32	alu
+s_bfm_b32	alu
 s_brev_b32	alu
 s_bitcmp1_b32	alu
 s_branch	control
@@ -144,6 +153,7 @@ v_bfe_u32	alu
 v_bfi_b32	alu
 v_cmp_class_f32_e64	alu
 v_cmp_eq_u16_e64	alu
+v_cmp_eq_u16_e32	alu
 v_cmp_eq_u32_e32	alu
 v_cmp_eq_u32_e64	alu
 v_cmp_ge_f32_e64	alu
@@ -179,6 +189,7 @@ v_cvt_f32_ubyte0_e32	alu
 v_cvt_i32_f32_e32	alu
 v_cvt_pk_f32_fp8_e32	alu
 v_cvt_pk_f32_fp8_e64	alu
+v_cvt_pk_fp8_f32	alu
 v_cvt_u32_f32_e32	alu
 v_div_fixup_f32	alu
 v_div_fmas_f32	alu
@@ -236,6 +247,10 @@ v_sub_f32_e32	alu
 v_sub_nc_u32_e32	alu
 v_subrev_nc_u32_e32	alu
 v_wmma_f32_16x16x16_f16	alu
+v_wmma_f32_16x16x16_bf8_bf8	alu
+v_wmma_f32_16x16x16_bf8_fp8	alu
+v_wmma_f32_16x16x16_fp8_bf8	alu
+v_wmma_f32_16x16x16_fp8_fp8	alu
 v_wmma_i32_16x16x16_iu4	alu
 v_wmma_i32_16x16x32_iu4	alu
 v_xor_b32_e32	alu
@@ -364,6 +379,7 @@ ds_bpermute_b32	memory
 global_load_b128	memory
 global_load_b32	memory
 global_load_b64	memory
+global_load_tr_b64	memory
 global_load_d16_b16	memory
 global_load_i8	memory
 global_load_u16	memory
@@ -481,6 +497,10 @@ v_xor3_b32	alu
 v_bcnt_u32_b32	alu
 v_min3_i32	alu
 v_med3_i32	alu
+v_med3_u32	alu
+v_cmp_ge_i64_e64	alu
+v_cmp_lt_u64_e64	alu
+v_cmpx_gt_i64_e32	alu
 v_movrels_b32_e32	alu
 v_movreld_b32_e32	alu
 # 16-bit and conversion VALU.
@@ -497,6 +517,7 @@ v_fmac_f32_e64	alu
 v_trunc_f32_e32	alu
 v_floor_f32_e32	alu
 v_med3_f32	alu
+v_med3_num_f32	alu
 v_frexp_exp_i32_f32_e32	alu
 v_frexp_mant_f32_e32	alu
 v_frexp_mant_f32_e64	alu
@@ -510,6 +531,8 @@ global_store_b8	memory
 global_store_d16_hi_b16	memory
 global_load_b96	memory
 global_atomic_add_u32	memory
+global_atomic_swap_b32	memory
+global_atomic_or_b32	memory
 flat_load_b64	memory
 flat_load_b128	memory
 # Scratch: per-lane private memory (emu/memory.rs `scratch_access`, State::scratch sized from the kernel descriptor).
@@ -537,3 +560,45 @@ s_code_end	control
 v_mbcnt_hi_u32_b32	alu
 s_wait_storecnt_dscnt	wait
 s_prefetch_data	memory
+s_min_num_f32	alu
+s_max_num_f32	alu
+v_ashrrev_i64	alu
+v_cmp_eq_i64_e64	alu
+v_cmp_le_i64_e64	alu
+v_cmp_ne_i64_e64	alu
+v_cmp_le_u64_e64	alu
+v_cmp_ge_u64_e64	alu
+v_cmp_gt_u64_e64	alu
+global_wb	wait
+s_sleep	wait
+v_ceil_f32_e32	alu
+v_max_u32_e32	alu
+v_max3_u32	alu
+v_cmpx_neq_f16_e32	alu
+v_cmpx_ne_u64_e32	alu
+v_cmpx_le_u64_e32	alu
+v_cmp_o_f32_e64	alu
+v_cmp_ge_u64_e32	alu
+v_cmp_gt_u16_e64	alu
+v_cmpx_ge_u64_e32	alu
+v_cmpx_gt_u16_e32	alu
+v_cmpx_lt_u64_e32	alu
+v_mul_hi_i32_i24_e32	alu
+s_sendmsg_rtn_b64	alu
+v_cmp_lt_u64_e32	alu
+v_cmpx_ge_f32_e32	alu
+s_getpc_b64	control
+s_swappc_b64	control
+s_setpc_b64	control
+s_wait_expcnt	wait
+s_wait_samplecnt	wait
+s_wait_bvhcnt	wait
+flat_atomic_add_u32	memory
+s_sext_i32_i16	alu
+s_cvt_f32_i32	alu
+s_sub_f32	alu
+s_cmp_gt_f32	alu
+s_cmp_neq_f32	alu
+s_cmp_ngt_f32	alu
+v_cmpx_gt_f32_e32	alu
+v_cmpx_nge_f32_e32	alu

@@ -18,6 +18,21 @@ use std::ffi::c_void;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
+/// One pinned host-mapped allocation shared by the ranks of this process
+/// ([`Gpu::upload_raw_host_mapped_shared`]). `owner` is weak: the allocation lives exactly as
+/// long as some rank's tensor (or lease) holds it.
+struct SharedHostEntry {
+    owner: std::sync::Weak<hip_bridge::HostAllocOwner>,
+    host_ptr: usize,
+    len: usize,
+    /// Caller identity digest ([`Gpu::host_mapped_shared_fill`]); `None` for a payload
+    /// proven by byte comparison.
+    identity: Option<[u8; 32]>,
+}
+
+static SHARED_HOST_MAPPED: std::sync::Mutex<Option<HashMap<String, SharedHostEntry>>> =
+    std::sync::Mutex::new(None);
+
 /// Per-group byte size of the MQ3-Lloyd quantization layout.
 ///
 /// 16 B fp16 codebook (8 entries) + 96 B 3-bit packed indices = 112 B.
@@ -432,6 +447,14 @@ pub struct GpuTensor {
     pub dtype: DType,
 }
 
+/// Zero-fills enqueued on the steady copy stream that still await their one wait
+/// (see [`Gpu::memset_batched`]). Plain bookkeeping: it borrows no buffer, so a reset can
+/// keep mutating its owner between enqueues.
+#[derive(Debug, Default)]
+pub struct MemsetBatch {
+    pending: bool,
+}
+
 /// Host-visible QSA depth associated with a checked kernel launch.
 #[derive(Clone, Copy, Debug)]
 pub struct QsaExtentDepth {
@@ -584,6 +607,21 @@ impl GpuTensor {
             buf: unsafe { hip_bridge::DeviceBuffer::from_raw(ptr, byte_len) },
             shape: vec![len_elems],
             dtype: self.dtype,
+        })
+    }
+
+    /// Non-owning F16 view of the leading `elems` words (`2 * elems` bytes) of an F32 tensor, or
+    /// `None` when the tensor is not F32 or is too small. For staging an F16 plane inside a scratch
+    /// tensor that is dead at that point. The view is not to be freed.
+    pub fn as_f16_view(&self, elems: usize) -> Option<GpuTensor> {
+        let bytes = elems.checked_mul(2)?;
+        if self.dtype != crate::DType::F32 || bytes > self.buf.size() {
+            return None;
+        }
+        Some(GpuTensor {
+            buf: self.buf.byte_view(0, bytes),
+            shape: vec![elems],
+            dtype: crate::DType::F16,
         })
     }
 
@@ -922,16 +960,8 @@ pub enum DType {
     TQ2G128,  // ternary Bonsai-27B: 34 bytes per 128 elements (flat 2-bit ternary, group 128)
     // Phase 4: ternary kernels wire GPU decode/dispatch; this Task 7 slice is
     // CPU-foundation only (variant + byte-size + RawCodec load mapping).
-    BQ1G128,    // binary Bonsai-27B: 18 bytes per 128 elements (flat 1-bit sign, group 128)
-    HFQ6G256,   // 200 bytes per 256 elements (6-bit, f32 scale+zero)
-    ParoQ4G128, // ParoQuant: AWQ-packed INT4 G128 repacked to HFQ4G128 layout at load.
-    // Weights are standard HFQ4G128 (72 bytes/group); the ParoQuant distinction
-    // is that weight_gemv applies Givens rotation to activations before GEMV.
-    // Rotation metadata (pairs, theta, channel_scales) lives on WeightTensor::paro.
-    ParoQ4G64, // ParoQuant group_size=64 twin of ParoQ4G128: HFQ4-G64 layout, 40 bytes per
-    // 64 elements (f32 scale + f32 zero + 32 B nibbles), Givens rotation in 64-channel
-    // blocks. A distinct dtype so a G64 tensor can never reach a G128 kernel (or the
-    // reverse); `paro_group_size` is the one place either width is read from.
+    BQ1G128,  // binary Bonsai-27B: 18 bytes per 128 elements (flat 1-bit sign, group 128)
+    HFQ6G256, // 200 bytes per 256 elements (6-bit, f32 scale+zero)
     /// OCP FP8 E4M3 (e4m3fn) with 128x128 block scales (qt=55 `FP8E4M3B128`).
     /// Tensor logical shape `[E, R, K]` (E=1 allowed). Payload is E consecutive
     /// expert blocks of stride [`crate::fp8_e4m3::b128_block_stride`]: `codes u8[R*K]`
@@ -966,6 +996,17 @@ pub enum DType {
     E8PI4G128R256,
     /// E8P-I4 down (qt=136): E8P codec, R128 FWHT. Planar like qt=135.
     E8PI4G128R128,
+    /// MQ4-XTS gate/up with the redundant zero dropped (qt=137, DESIGN F1,
+    /// `HIPFIRE_QWEN4_EXPERT_DROP_ZERO`): the symmetric MQ4G256V2 payload
+    /// repacked planar, `[M*K/2 B nibble codes][M*(K/128) f16 scales]`, with
+    /// `zp = -8*sc` derived in the kernels. Row `r` codes at `r*K/2`; scale of
+    /// (row, 128-col group g) at `M*K/2 + 2*(r*(K/128)+g)`. Typed-qwen4 routed
+    /// expert tensors only (loader-produced, never in a file); no per-row
+    /// stride (`row_bytes()` is `None`). See `hipfire_runtime::mq4_planar`.
+    MQ4G256V2P,
+    /// MQ4-XTS down with the zero dropped (qt=138): planar like qt=137 over
+    /// the MQ4G128V2 payload.
+    MQ4G128V2P,
     /// ggml Q4_K (GGUF type 12), served as-is: 144 B per 256 elements, 4.5 bpw.
     /// Distinct from the legacy llama `Q4K` until that path is cut over to the
     /// ggml kernels. Consumed only by the GGUF-native route (decode mmvq GEMV,
@@ -982,6 +1023,16 @@ pub enum DType {
     /// ggml IQ4_XS (GGUF type 23): 136 B per 256 elements, 4.25 bpw (non-linear
     /// 16-level codebook + 6-bit sub-scales). `K % 256 == 0`.
     GgmlIQ4XS,
+    /// Qwen4 HC mixer weight as OCP E4M3 with a per-output-row power-of-two scale
+    /// (qt=57 `HC8E4M3Row`, exact gfx1201, `HIPFIRE_QWEN4_HC8`). Logical `[m, k]`; payload
+    /// = `m*k` E4M3 bytes in the 512-B WMMA A-fragment tile order of
+    /// `hc8::swizzle_hc8`, then `f32 s[m]`
+    /// (`m*k + 4*m` bytes, see [`crate::hc8_weight::hc8_payload_bytes`]); the weight is
+    /// `q * s[row]` exactly (also an exact BF16). No per-row stride (`row_bytes()` is
+    /// `None`). Read only by the PeaceMaker `hc8_gemm` decode routes and the exact dequant to
+    /// BF16 / F16 (`Gpu::hc8_dequant_bf16`, the F16 shadow): every other consumer must refuse
+    /// it by name.
+    HC8E4M3Row,
 }
 
 impl DType {
@@ -1036,8 +1087,6 @@ impl DType {
             | DType::MFP3G32E8
             | DType::MFP2G32E8
             | DType::MFP4G32E8G128
-            | DType::ParoQ4G128
-            | DType::ParoQ4G64
             | DType::Raw
             | DType::MQ3I4G128R256
             | DType::MQ3I4G128R128
@@ -1045,11 +1094,14 @@ impl DType {
             | DType::MQ2I4G128R128
             | DType::E8PI4G128R256
             | DType::E8PI4G128R128
+            | DType::MQ4G256V2P
+            | DType::MQ4G128V2P
             | DType::GgmlQ4K
             | DType::GgmlQ5K
             | DType::GgmlQ6K
             | DType::GgmlQ8_0
-            | DType::GgmlIQ4XS => 1, // byte-level
+            | DType::GgmlIQ4XS
+            | DType::HC8E4M3Row => 1, // byte-level
         }
     }
 
@@ -1077,12 +1129,9 @@ impl DType {
             DType::FP8E4M3PT => Some(k),
             DType::HFQ6G256 | DType::MQ6G256 | DType::MQ6G256V2 => grouped(256, 200),
             DType::MQ3G256 => grouped(256, 104),
-            DType::MQ2G256 | DType::MQ2G256Lloyd => grouped(256, 72),
+            DType::MQ2G256 | DType::MQ2G256Lloyd | DType::MQ2G256V2 => grouped(256, 72),
             DType::MQ3G256Lloyd => grouped(256, 112),
             DType::MQ4G256Lloyd => grouped(256, 160),
-            // HFQ4-G128 layout, see the variant.
-            DType::ParoQ4G128 => grouped(128, 72),
-            DType::ParoQ4G64 => grouped(64, 40),
             // E8 formats: a 16-byte row header, then per-32 blocks.
             DType::MFP4G32E8 => blocks.checked_mul(17)?.checked_add(16),
             DType::MFP3G32E8 => blocks.checked_mul(13)?.checked_add(16),
@@ -1106,18 +1155,9 @@ impl DType {
             | DType::MQ2I4G128R256
             | DType::MQ2I4G128R128
             | DType::E8PI4G128R256
-            | DType::E8PI4G128R128 => None,
-            _ => None,
-        }
-    }
-
-    /// Paro group width: the HFQ4 group of the repacked weight and the Givens
-    /// block of its activation rotation (the two are the same in ParoQuant).
-    /// `None` for every non-Paro dtype.
-    pub fn paro_group_size(self) -> Option<usize> {
-        match self {
-            DType::ParoQ4G128 => Some(128),
-            DType::ParoQ4G64 => Some(64),
+            | DType::E8PI4G128R128
+            | DType::MQ4G256V2P
+            | DType::MQ4G128V2P => None,
             _ => None,
         }
     }
@@ -1140,6 +1180,25 @@ impl DType {
     /// Whether this is one of the typed-qwen4-only planar MQ-I4 formats.
     pub fn is_mq_i4(self) -> bool {
         self.mq_i4_name().is_some()
+    }
+
+    /// Whether this is one of the two drop-zero planar MQ4 routed-expert
+    /// formats (qt=137 gate/up, qt=138 down): the loader-produced layout of
+    /// the symmetric MQ4-XTS experts, never a file wire type.
+    pub fn is_mq4_planar(self) -> bool {
+        matches!(self, DType::MQ4G256V2P | DType::MQ4G128V2P)
+    }
+
+    /// The shipped-layout dtype a drop-zero planar dtype was repacked from
+    /// (`MQ4G256V2P` -> `MQ4G256V2`, `MQ4G128V2P` -> `MQ4G128V2`); every other
+    /// dtype is returned unchanged. Route resolution reads the canonical
+    /// dtype, the launchers read the layout.
+    pub fn shipped_layout(self) -> DType {
+        match self {
+            DType::MQ4G256V2P => DType::MQ4G256V2,
+            DType::MQ4G128V2P => DType::MQ4G128V2,
+            other => other,
+        }
     }
 
     /// Whether a `WeightTensor` of this dtype should have the
@@ -1665,6 +1724,11 @@ impl LabKernelFaultCountdown {
 /// `self.replay` will silently truncate a retained tape — use
 /// `debug_assert_tape_parity` or compare the two counts in a test.
 pub struct Gpu {
+    /// Reusable pinned landing buffer for [`Self::dtoh_stream_ordered`] (allocated at first
+    /// use, grown only for a larger read, never shrunk). `None` until first use.
+    pub(crate) steady_readback_pinned: std::sync::Mutex<Option<hip_bridge::PinnedTransferBuffer>>,
+    /// [`STEADY_READBACK_PINNED_ENV`], read once at construction.
+    pub(crate) steady_readback_pinned_on: bool,
     pub hip: HipRuntime,
     pub arch: String,
     pub flags: Arc<FeatureFlags>,
@@ -1677,6 +1741,37 @@ pub struct Gpu {
     /// Monotonic aggregate-MoE launch census ([`Gpu::moe_route_launch_census`]); plain adds,
     /// no locking, bumped after a successful launch submission.
     pub(crate) moe_route_census: crate::gemm::MoeRouteLaunchCensus,
+    /// Row-completion counters and quarter scratch of `hyper_norm_gate_k4_outputs_f32`
+    /// (HIPFIRE_QWEN4_HC_PAIR_DECODE), allocated and zeroed on first use; the kernel's last
+    /// block of a row resets its counter, so it stays zero between launches.
+    pub(crate) hc_pair_sync: Option<GpuTensor>,
+    /// Arrival counter of `moe_route_scatter_top10_wide_f32` (HIPFIRE_QWEN4_MOE_GLUE_FOLD b),
+    /// allocated and zeroed on first use; the launch's last workgroup resets it, so it stays zero
+    /// between launches. Eager launches only.
+    pub(crate) moe_route_sync: Option<GpuTensor>,
+    /// The routed-expert weights this device reads through the Qwen4 MQ4 MoE
+    /// launchers are in the drop-zero planar layout (`DType::MQ4G256V2P` /
+    /// `MQ4G128V2P`, DESIGN F1) instead of the shipped qt44/qt53 layout. Set
+    /// once by the loader before any forward; every layer of the load shares one layout.
+    pub(crate) mq4_experts_planar: bool,
+    /// `HIPFIRE_QWEN4_MOE32_GU` (unset/1 on = default, 0 off, 2 on without dead-slot zero stores;
+    /// [`Gpu::set_moe32_gu`] overrides): the wide-pass gate/up `g32` kernel family replaces `o4_r8_x4`
+    /// for more than 8 source rows on exact gfx1201 (shipped and planar layouts).
+    pub(crate) moe32_gu: u8,
+    /// `HIPFIRE_QWEN4_MOE_DOWN_DNI` (default on, `0` kills; [`Gpu::set_moe_down_dni`] overrides): the
+    /// gfx1201 per-pick K = 640 down (<= 8 rows, eager) runs the `dni` kernel instead of `k640_r4`
+    /// (bitwise equal output).
+    pub(crate) moe_down_dni: bool,
+    /// `HIPFIRE_QWEN4_MOE_DEAD_STORES` (default off = dead rows are NOT stored; `1` restores the zero stores;
+    /// [`Gpu::set_moe_dead_stores`] overrides): the exact gfx1201 grouped routed down (`o8_r16`) and the grouped gate/up
+    /// (`o4_r8_x4`) skip the +0.0 stores of sentinel tiles and pad slots. Live rows are bitwise unchanged; the
+    /// consumers (combine / unscatter) address Y through inverse_perm / sorted_slots only.
+    pub(crate) moe_dead_stores: bool,
+    /// `HIPFIRE_QWEN4_MOE_DEAD_POISON=<u32 seed>` (lab/developer only, never set in product): every grouped GU / down
+    /// launcher first fills its whole Y span with a word derived from the seed and an invocation counter, so dead words
+    /// differ per run and per call. [`Gpu::set_moe_dead_poison`] overrides.
+    pub(crate) moe_dead_poison: Option<u32>,
+    pub(crate) moe_dead_poison_ctr: u32,
     pub(crate) compiler: KernelCompiler,
     pub(crate) modules: HashMap<String, hip_bridge::Module>,
     pub(crate) functions: HashMap<String, hip_bridge::Function>,
@@ -1701,6 +1796,10 @@ pub struct Gpu {
     /// Arenas whose cleanup failed before they could enter the owner map.
     /// They have no tensor owner and are retried during explicit/Gpu teardown.
     orphan_vmm_arenas: Vec<VmmArena>,
+    /// Verdict of the one-time virtual-address reservation probe
+    /// ([`Self::vmm_runtime_refusal`]): `None` = the runtime reserved a range,
+    /// `Some(reason)` = it could not. Decided once per device owner.
+    vmm_runtime_probe: std::sync::OnceLock<Option<String>>,
     /// `hipHostMalloc(hipHostMallocMapped)` owners, keyed by the **device-visible**
     /// base address kernels are handed. The value is the *host* pointer that
     /// `hipHostFree` needs, which `hipHostGetDevicePointer` may alias differently
@@ -1769,8 +1868,16 @@ pub struct Gpu {
     pub(crate) kernel_timing_replay_baseline: crate::replay::ReplayObservation,
     /// Scratch buffers for FWHT rotation, FP16/FP8 activation conversion, etc.
     pub scratch: crate::scratch::ScratchState,
+    /// Device lane tables of the gfx942 batched GDN decode core
+    /// ([`crate::cdna::gfx942::Gfx942Device::qwen4_gdn_lanes_step_f32`]), keyed by
+    /// their content: built once per layer and lane set, never rewritten.
+    pub(crate) gdn_lanes_f32_tables: crate::cdna::gfx942::GdnLanesTableCache,
     /// Model-scoped Redline warmup recorder and fail-closed backend gate.
     pub replay: crate::replay::ReplayController,
+    /// Device lane tables of the gfx942 batched QSA decode core
+    /// ([`crate::cdna::gfx942::Gfx942Device::qwen4_qsa_lanes_core`]), keyed by their content:
+    /// built once per layer and lane set, never rewritten.
+    pub(crate) qsa_lanes_gfx942_tables: crate::cdna::gfx942::QsaLanesTableCache,
     /// Artifact-level MQ4V2 grid contract. Set by the model loader from HFQ
     /// metadata; false for legacy/asymmetric artifacts.
     pub mq4v2_symmetric: bool,
@@ -1893,6 +2000,25 @@ pub struct Gpu {
     /// on prefill chunks of >= 512 rows).  An explicit value of those
     /// variables applies everywhere, as before.
     pub qwen4_scope: bool,
+    /// True once every qt47 trunk tensor of the loaded Qwen4 model passed
+    /// [`Gpu::qwen4_mq6_sym_check`] (set by the loader through
+    /// [`Gpu::set_qwen4_trunk_a8_verified`]); gates [`Gpu::qwen4_trunk_a8_applies`].
+    pub(crate) qwen4_trunk_a8_verified: bool,
+    /// True once every routed MoE layer this device serves has symmetric qt53 down experts
+    /// (set by the loader through [`Gpu::set_qwen4_moe_down_a8_verified`]); gates
+    /// [`Gpu::qwen4_moe_down_a8_applies`].
+    pub(crate) qwen4_moe_down_a8_verified: bool,
+    /// True on a device that attached EP (set by the EP attach through
+    /// [`Gpu::set_qwen4_moe_down_a8_ep_default`]): an unset `HIPFIRE_QWEN4_MOE_DOWN_A8` then
+    /// requests the route for the 9..=64-row window on exact gfx1201.
+    pub(crate) qwen4_moe_down_a8_ep_default: bool,
+    /// True while the MTP head's MoE layer verdict is still owed (the route declines until the
+    /// head settles it through [`Gpu::set_qwen4_moe_down_a8_head_pending`]).
+    pub(crate) qwen4_moe_down_a8_head_pending: bool,
+    /// A8 `block_i8_128` sidecar of the routed-down route (`rows * 680` B), grown eagerly by
+    /// [`Gpu::reserve_qwen4_moe_down_a8`].
+    pub(crate) qwen4_moe_down_a8_scratch: Option<DeviceBuffer>,
+    pub(crate) qwen4_moe_down_a8_scratch_bytes: usize,
     /// True while the Flash-Next lane step, a Qwen4 speculative verify forward
     /// or the DFlash2 draft head runs (set by their drivers):
     /// together with the `fn_lane_pm_rows` flag it routes the four incumbent
@@ -1906,11 +2032,24 @@ pub struct Gpu {
     /// Also set for one gfx1151 Flash-Next prefill tile of fewer than 512 rows
     /// on the agent-turn append route (`HIPFIRE_QWEN4_APPEND_WMMA`).
     pub prefill_invariant_scope: bool,
+    /// True while an ordinary (non-verify, non-decode) prefill forward runs
+    /// ([`Gpu::ordinary_prefill_enter`]): GDN/FFN/attention producers take the canonical
+    /// bulk recipe for every actual row count, and the Qwen4 route rows are the canonical
+    /// chunk ([`Gpu::route_rows`]) WITHOUT the invariant profile's IU4 suppression.
+    pub ordinary_prefill_scope: bool,
     /// Row-exact rows of the verify forward in flight (`0` = not a verify
     /// forward). Widens the few-row routes (`Gpu::few_row_limit`) so an
     /// n-row verify is bitwise the sequential decode rows; prefill and every
     /// non-verify forward keep it `0`.
     pub wide_verify_rows: usize,
+    /// True while a Flash-Next lane step runs its all-rows segment for a row-exact lane class
+    /// (`HIPFIRE_QWEN4_LANE_ROW_EXACT`, set and restored by hipfire-arch-qwen4's lane step); the
+    /// 9..=64-row arms that are NOT bitwise the <=8-row route (lane WMMA, the trunk A8 projections,
+    /// the MoE int8 gate/up chain, the int8 down) refuse while it is set.
+    pub lane_row_exact_scope: bool,
+    /// Set by the HC read around its SIMT down/up projections so the dense prefill lane WMMA knob
+    /// (`HIPFIRE_QWEN4_PREFILL_LWMMA_DENSE`) never takes the HC mixers (the HC knob owns them).
+    pub prefill_lwmma_dense_hold: bool,
     /// Actual singleton AR arithmetic for an eager verify window. The forward
     /// owner restores this host scope binding after success or error; it never
     /// changes recorder/graph state.
@@ -1924,14 +2063,50 @@ pub struct Gpu {
     /// is suppressed so the MoE takes the F16 WMMA grouped arm, exactly as
     /// `HIPFIRE_QWEN4_MOE_SYM_IU4=0` does, for that tile only.
     pub qwen4_append_f16_moe_scope: bool,
+    /// Set while an expert-parallel prefill forward of fewer than 512 rows runs: the default scope of the A8 owner-routed
+    /// MoE chain (`HIPFIRE_QWEN4_MOE_EP_A8` unset, [`Gpu::qwen4_moe_ep_a8_requested`]).
+    pub qwen4_ep_a8_scope: bool,
+    /// Routing-row cap (`0` = none, every forward but the exact EP prefill wave): while set,
+    /// [`Gpu::route_rows`] reports `min(rows, cap)`, so every row-keyed ROUTING decision
+    /// (never a launch extent) of a forward wider than `cap` rows is taken as if it carried
+    /// `cap` rows. The exact EP joint prefill wave runs its one wide MoE call under a cap of 511
+    /// so the wave's route / shared-expert / grouped-expert kernels are the sub-512 ones every
+    /// lane's own singleton takes.
+    pub qwen4_route_rows_cap: usize,
+    /// The lanes' rows of the EP prefill wave in flight when a lane of at most 64 rows is in it
+    /// (empty otherwise; set by the Qwen4 wave and cleared on every return path). A BF16
+    /// multirow projection over exactly their total rows is split into per-lane calls
+    /// ([`Gpu::wave_lane_groups`], [`crate::lane_wmma::wave_lane_groups`]): a lane's singleton
+    /// selects the lane WMMA arm on its own real rows, which one call over the wave's rows would
+    /// not.
+    pub qwen4_wave_lane_rows: Vec<usize>,
+    /// Routing-row floor of the aggregate symmetric IU4 MoE route for the forward in scope:
+    /// [`crate::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS`] (512) unless an expert-parallel PREFILL
+    /// forward lowered it (`HIPFIRE_EP_PREFILL_TILE_MIN_ROWS`, set and restored by the Qwen4
+    /// forward's tile scopes; the route also never takes a call of at most `few_row_limit`
+    /// rows, see [`Gpu::qwen4_moe_sym_iu4_applies`]).
+    pub qwen4_moe_sym_iu4_floor: usize,
+    /// `HIPFIRE_QWEN4_PREFILL_LWMMA_WAVE_FLOOR` in scope: the fewest rows of a call that takes the
+    /// prefill lane WMMA entries ([`Gpu::prefill_lwmma_dense_applies`] /
+    /// [`Gpu::prefill_lwmma_hc_applies`]) instead of the 16..=64-row decode-shaped arms
+    /// ([`Gpu::lane_wmma_applies`], the HC8 decode route). `WIDE_VERIFY_MAX_ROWS + 1` (65: no
+    /// call at or below 64 rows moves) unless a Qwen4 PREFILL forward's tile scopes lowered it;
+    /// decode, verify, lane AR steps and the MTP head never do (they have no prefill scope).
+    pub qwen4_prefill_lwmma_floor: usize,
 }
+
+/// Developer kill switch for the pinned landing buffer of [`Gpu::dtoh_stream_ordered`]
+/// (`HIPFIRE_STEADY_READBACK_PINNED`, default on). `0` restores the pageable async copy plus
+/// stream wait. Read once when the [`Gpu`] is constructed.
+pub const STEADY_READBACK_PINNED_ENV: &str = "HIPFIRE_STEADY_READBACK_PINNED";
 
 /// See [`Gpu::kv_fit_floor`]: plain data, no behaviour.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct KvFitFloor {
     /// The published (admitted) context in tokens.
     pub admitted_tokens: usize,
-    /// The fit's full per-request reserve (prefill + charged checkpoints + MTP).
+    /// What a request still allocates after its prefill scratch is resident (the fit's MTP
+    /// scratch; the prefill scratch and the charged checkpoints are not counted again).
     pub reserve_bytes: usize,
 }
 /// Per-256-block XX^T accumulator for ONE weight tensor (one expert), keyed
@@ -2284,10 +2459,15 @@ impl Gpu {
     }
 
     /// Capacity an auto admission may plan against: device total minus this
-    /// process's own live device allocations ([`hip_bridge::HipRuntime::own_device_bytes`])
-    /// minus this process's MEASURED unledgered residency (code objects, PM4/
+    /// process's own live device allocations
+    /// ([`hip_bridge::HipRuntime::own_device_bytes`], each charged at the
+    /// bytes ROCr really occupies: 4 KiB rounded up to 1 MiB, 2 MiB rounded
+    /// above it, a weight slab at its slab bytes) minus the HIP queue/ring
+    /// BOs ([`HIP_RING_BYTES`], once the process has allocated) minus this
+    /// process's MEASURED remaining unledgered residency (code objects, PM4/
     /// graph pools, driver state: the process's own `drm-memory-vram` from
-    /// `/proc/self/fdinfo` less the ledger; [`own_vram_from_fdinfo`]) minus a
+    /// `/proc/self/fdinfo` less the ledger and the ring;
+    /// [`own_vram_from_fdinfo`]) minus a
     /// small fixed [`PLANNED_CAPACITY_RESERVE_BYTES`] margin. Unlike
     /// [`Self::device_mem_info`]'s free figure it does not move when a foreign
     /// process transiently allocates, so a route chosen from it is stable
@@ -2313,8 +2493,17 @@ impl Gpu {
             .ok()
             .and_then(|bdf| own_vram_from_fdinfo(&bdf));
         Ok(match measured {
-            Some(vram) => cap.with_unledgered(vram.saturating_sub(own), true),
-            None => cap.with_unledgered(PLANNED_CAPACITY_FALLBACK_UNLEDGERED_BYTES, false),
+            Some(vram) => {
+                // The ring is charged at its measured size, never more than
+                // the process holds beyond the ledger (it exists only once a
+                // stream does), and the rest is what is genuinely unledgered.
+                let beyond = vram.saturating_sub(own);
+                let ring = HIP_RING_BYTES.min(beyond);
+                cap.with_ring(ring).with_unledgered(beyond - ring, true)
+            }
+            None => cap
+                .with_ring(if own > 0 { HIP_RING_BYTES } else { 0 })
+                .with_unledgered(PLANNED_CAPACITY_FALLBACK_UNLEDGERED_BYTES, false),
         })
     }
 
@@ -2746,6 +2935,7 @@ impl Gpu {
     /// Existing `sync()` callers keep their unbounded semantics; use this
     /// where a deadline is already meaningful (collective rendezvous,
     /// watchdog paths) rather than migrating every sync.
+    #[track_caller]
     pub fn sync_with_deadline(&self, deadline: std::time::Duration) -> HipResult<()> {
         self.bind_thread()?;
         // Timing-disabled event: a pure completion probe, no profiling state.
@@ -3035,6 +3225,25 @@ impl Gpu {
             arch_caps,
             device_id: id,
             moe_route_census: crate::gemm::MoeRouteLaunchCensus::default(),
+            steady_readback_pinned: std::sync::Mutex::new(None),
+            steady_readback_pinned_on: hipfire_config::developer_bool(
+                STEADY_READBACK_PINNED_ENV,
+                true,
+            ),
+            hc_pair_sync: None,
+            moe_route_sync: None,
+            mq4_experts_planar: false,
+            moe32_gu: match hipfire_config::developer_var("HIPFIRE_QWEN4_MOE32_GU").as_deref() {
+                Ok("0") => 0,
+                Ok("2") => 2,
+                _ => 1,
+            },
+            moe_down_dni: hipfire_config::developer_bool("HIPFIRE_QWEN4_MOE_DOWN_DNI", true),
+            moe_dead_stores: hipfire_config::developer_bool("HIPFIRE_QWEN4_MOE_DEAD_STORES", false),
+            moe_dead_poison: hipfire_config::developer_var("HIPFIRE_QWEN4_MOE_DEAD_POISON")
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok()),
+            moe_dead_poison_ctr: 0,
             compiler,
             modules: HashMap::new(),
             functions: HashMap::new(),
@@ -3045,6 +3254,7 @@ impl Gpu {
             vmm_generations: HashMap::new(),
             vmm_generation_counter: 0,
             orphan_vmm_arenas: Vec::new(),
+            vmm_runtime_probe: std::sync::OnceLock::new(),
             host_mapped: HashMap::new(),
             host_leases: HostLeaseTable::new(),
             device_wait: None,
@@ -3069,6 +3279,7 @@ impl Gpu {
             kernel_timing_pool: None,
             #[cfg(feature = "kernel-timing")]
             kernel_timing_replay_baseline: crate::replay::ReplayObservation::default(),
+            gdn_lanes_f32_tables: Default::default(),
             scratch: crate::scratch::ScratchState {
                 mq_signs1: None,
                 mq_signs2: None,
@@ -3088,10 +3299,11 @@ impl Gpu {
                 ggml: Default::default(),
                 q8x_act: None,
                 mq6_fp8_x_rot: None,
-                paro_x_scratch: None,
-                paro_fused_scratch: None,
                 fp16_x_scratch: None,
                 fp16_x_scratch_bytes: 0,
+                lane_wmma_scratch: None,
+                lane_wmma_multi_scratch: None,
+                hc8_bf16: [None, None],
                 qsa_select_scores: None,
                 qsa_select_scores_bytes: 0,
                 gdn_state_f32: None,
@@ -3117,9 +3329,16 @@ impl Gpu {
                 q8_a8_x_scratch: None,
                 q8_a8_x_scratch_bytes: 0,
                 q8_a8_x_generation: 0,
+                mq8_x_scratch: None,
+                mq8_x_scratch_bytes: 0,
+                mq8_x_generation: 0,
                 int8_mmq_x_scratch: None,
                 int8_mmq_x_scratch_bytes: 0,
                 int8_mmq_generation: 0,
+                int8_mmq_down_x_scratch: None,
+                int8_mmq_down_x_scratch_bytes: 0,
+                int8_mmq_down_generation: 0,
+                int8_mmq_down_pending: None,
                 qwen4_moe_group_scratch: None,
                 qwen4_moe_group_scratch_bytes: 0,
                 qwen4_moe_down_i4_scratch: None,
@@ -3153,6 +3372,7 @@ impl Gpu {
                 pm_decode,
             },
             replay: crate::replay::ReplayController::from_config(),
+            qsa_lanes_gfx942_tables: Default::default(),
             mq4v2_symmetric: false,
             fp8_verify_scope: false,
             iu4_verify_scope: false,
@@ -3210,12 +3430,26 @@ impl Gpu {
             capture_names: HashMap::new(),
             hessian_capture: None,
             qwen4_scope: false,
+            qwen4_trunk_a8_verified: false,
+            qwen4_moe_down_a8_verified: false,
+            qwen4_moe_down_a8_ep_default: false,
+            qwen4_moe_down_a8_head_pending: false,
+            qwen4_moe_down_a8_scratch: None,
+            qwen4_moe_down_a8_scratch_bytes: 0,
             lane_rows_scope: false,
             prefill_invariant_scope: false,
+            ordinary_prefill_scope: false,
             wide_verify_rows: 0,
+            lane_row_exact_scope: false,
+            prefill_lwmma_dense_hold: false,
             qwen4_verify_reference: None,
             emu,
             qwen4_append_f16_moe_scope: false,
+            qwen4_ep_a8_scope: false,
+            qwen4_route_rows_cap: 0,
+            qwen4_wave_lane_rows: Vec::new(),
+            qwen4_moe_sym_iu4_floor: crate::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS,
+            qwen4_prefill_lwmma_floor: crate::prefill_invariant::WIDE_VERIFY_MAX_ROWS + 1,
         })
         .and_then(|mut gpu| {
             if gpu.flags.force_blob_path {
@@ -4135,6 +4369,7 @@ impl Gpu {
     /// dependency with the capturing stream. This method routes to
     /// `memcpy_htod_async` on the active (capturing) stream when in capture
     /// mode, falling back to sync `memcpy_htod` otherwise.
+    #[track_caller]
     pub fn memcpy_htod_auto(&self, dst: &hip_bridge::DeviceBuffer, src: &[u8]) -> HipResult<()> {
         self.bind_thread()?;
         if self.graphs.capture_mode {
@@ -4157,6 +4392,7 @@ impl Gpu {
     /// an error rather than enqueued onto the capturing stream (where it would
     /// either fail the capture or silently produce a replay that returns stale
     /// activations).
+    #[track_caller]
     pub fn memcpy_dtoh_auto(
         &self,
         dst: &mut [u8],
@@ -5413,6 +5649,46 @@ impl Gpu {
         )
     }
 
+    /// Convert the first `n_elems` F32 words of `x` into the caller-owned F16 tensor `dst` with
+    /// the same `convert_f32_to_f16` kernel the wmma launchers run on an F32 X
+    /// ([`Self::convert_fp16_x_uncached`]): the bytes written equal what that convert would stage,
+    /// so a GEMM given the F16 `dst` (the wmma launchers skip their convert for an F16-typed X)
+    /// is bit-identical to the GEMM given `x`. One convert then serves every consumer of `x`.
+    pub fn convert_f32_to_f16_into(
+        &mut self,
+        x: &GpuTensor,
+        dst: &GpuTensor,
+        n_elems: usize,
+    ) -> HipResult<()> {
+        if x.dtype != DType::F32
+            || dst.dtype != DType::F16
+            || x.numel() < n_elems
+            || dst.numel() < n_elems
+        {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "convert_f32_to_f16_into: needs an F32 source and an F16 destination of at least n_elems words",
+            ));
+        }
+        self.bind_thread()?;
+        let capture_mode = self.graphs.capture_mode;
+        let force_blob = self.flags.force_blob_path;
+        self.scratch.convert_f32_to_f16_to_ptr(
+            &self.hip,
+            &mut self.compiler,
+            &mut self.modules,
+            &mut self.functions,
+            self.active_stream.as_ref(),
+            &mut self.graphs.capture_blobs,
+            capture_mode,
+            force_blob,
+            &mut self.replay,
+            x,
+            dst.buf.as_ptr(),
+            n_elems,
+        )
+    }
+
     /// Ensure the FP8 (E4M3) X scratch contains the conversion of `x`
     /// (an F32 GpuTensor). Returns the FP8 device pointer. gfx12 only —
     /// uses cvt_pk_fp8_f32. Caches by `x.buf.as_ptr()` like its FP16
@@ -5778,6 +6054,26 @@ impl Gpu {
         self.scratch.reserve_int8_mmq(&self.hip, k, n)
     }
 
+    /// [`Self::reserve_int8_mmq`] for the dedicated flat-slot down sidecar of the gate/up GEMM with the
+    /// rotate128 epilogue (`k % 128 == 0`): same graph-invalidation discipline on growth.
+    pub fn reserve_int8_mmq_down(
+        &mut self,
+        k: usize,
+        n: usize,
+    ) -> HipResult<crate::scratch::Int8MmqReservation> {
+        if k != 0 && n != 0 && k % 128 == 0 {
+            let needed = crate::scratch::int8_mmq_x_needed(k, n);
+            if crate::scratch::scratch_will_grow(
+                self.scratch.int8_mmq_down_x_scratch_bytes,
+                self.scratch.int8_mmq_down_x_scratch.is_some(),
+                needed,
+            ) {
+                self.invalidate_for_scratch_growth();
+            }
+        }
+        self.scratch.reserve_int8_mmq_down(&self.hip, k, n)
+    }
+
     pub fn int8_mmq_prepared_ptr(
         &self,
         prepared: &crate::scratch::Int8MmqPrepared,
@@ -5788,15 +6084,55 @@ impl Gpu {
         prepared.checked_ptr(generation, ptr, k, n)
     }
 
+    /// True while an ordinary prefill forward is in flight ([`Self::ordinary_prefill_enter`])
+    /// and no verify scope is open: numerical producer policy is then the canonical
+    /// long-prefill recipe for EVERY valid row, never a function of the outer call's row
+    /// count. Verify intent ([`Self::iu4_verify_scope`], [`Self::fp8_verify_scope`], a wide
+    /// verify forward) always wins.
+    #[inline]
+    pub fn ordinary_prefill_active(&self) -> bool {
+        self.ordinary_prefill_scope
+            && !self.iu4_verify_scope
+            && !self.fp8_verify_scope
+            && self.wide_verify_rows == 0
+    }
+
+    /// Open the ordinary-prefill intent; returns the previous value for
+    /// [`Self::ordinary_prefill_exit`]. Every row-count numerical selector
+    /// (`n >= 64` producer gates, route rows of the Qwen4 policy) takes the bulk recipe
+    /// for any actual extent `n >= 1` while it is set. Actual extents still govern buffer
+    /// validation, grids, masks and token counts. Callers restore on every return path.
+    #[inline]
+    pub fn ordinary_prefill_enter(&mut self) -> bool {
+        // bind_thread: skip — host-side scope flag, no HIP call.
+        std::mem::replace(&mut self.ordinary_prefill_scope, true)
+    }
+
+    /// Restore the value [`Self::ordinary_prefill_enter`] returned.
+    #[inline]
+    pub fn ordinary_prefill_exit(&mut self, prev: bool) {
+        // bind_thread: skip — host-side scope flag, no HIP call.
+        self.ordinary_prefill_scope = prev;
+    }
+
+    /// Row admission of a bulk prefill producer: the historic `n >= 64` outside the ordinary
+    /// prefill intent; any positive actual extent inside it (the physical-extent half of the
+    /// decision stays with the callee's own bounds).
+    #[inline]
+    pub(crate) fn prefill_rows_admit(&self, n: usize) -> bool {
+        n >= 64 || (n > 0 && self.ordinary_prefill_active())
+    }
+
     /// The A8 projection route. Off inside the IU4 verify scope, whose
-    /// producers must not depend on the row count.
+    /// producers must not depend on the row count. Ordinary prefill intent keeps the route
+    /// for every row count ([`Self::prefill_rows_admit`]).
     pub fn a8_prefill_active(&self, n: usize, k: usize) -> bool {
         self.flags.a8_prefill_enabled()
             && self.mq4v2_symmetric
             && !self.iu4_verify_scope
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
-            && n >= 64
+            && self.prefill_rows_admit(n)
             && k > 0
             && k % 256 == 0
     }
@@ -5805,11 +6141,14 @@ impl Gpu {
     /// IU4 + gfx1100/gfx1151 + eager (no replay/capture) + the K constraint
     /// of the IU4 MMQ consumer. Every producer grid is row-parallel, and the
     /// gfx11 IU4 MMQ base entry handles partial 128-row tiles.
+    /// An A8-owned shape never takes the sidecar (as on gfx1201): a fused A8
+    /// producer owns it, else the consumer's standalone A8 quantizer does.
     pub fn iu4_producer_sidecar_active(&self, batch: usize, k: usize) -> bool {
         self.flags.iu4_producer_sidecar_enabled()
+            && !self.a8_prefill_active(batch, k)
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
-            && batch >= 64
+            && self.prefill_rows_admit(batch)
             && k > 0
             && k % 256 == 0
     }
@@ -5827,7 +6166,7 @@ impl Gpu {
             && self.flags.iu4_prefill_enabled()
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
-            && (batch >= 64 || (self.iu4_verify_scope && batch >= 1))
+            && (self.prefill_rows_admit(batch) || (self.iu4_verify_scope && batch >= 1))
             && k > 0
             && k % 256 == 0
     }
@@ -5844,7 +6183,7 @@ impl Gpu {
             && self.flags.iu4_prefill_enabled()
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
-            && (batch >= 64 || (self.iu4_verify_scope && batch >= 1))
+            && (self.prefill_rows_admit(batch) || (self.iu4_verify_scope && batch >= 1))
             && k > 0
             && k % 256 == 0
     }
@@ -5939,9 +6278,10 @@ impl Gpu {
     pub fn iu4_gfx11_producer_quant_fused_active(&self, batch: usize, k: usize) -> bool {
         self.flags.gfx11_producer_quant_fused_enabled()
             && self.flags.iu4_prefill_enabled()
+            && !self.a8_prefill_active(batch, k)
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
-            && batch >= 64
+            && self.prefill_rows_admit(batch)
             && k > 0
             && k % 256 == 0
     }
@@ -5960,7 +6300,7 @@ impl Gpu {
             && self.arch == "gfx1201"
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
-            && batch >= 64
+            && self.prefill_rows_admit(batch)
             && k > 0
             && k % 256 == 0
     }
@@ -6181,7 +6521,12 @@ impl Gpu {
         }
         let n = m * k;
         let fp16 = self.alloc_f16_shadow_dest(key, n, "ensure_bf16_f16_shadow")?;
-        self.launch_bf16_to_f16(weight.buf.as_ptr(), fp16.buf.as_ptr(), n)?;
+        match weight.dtype {
+            // The HC8 sidecar weight: the shadow is the exact F16 expansion of the E4M3 buffer
+            // (keyed on ITS pointer, never on the reused BF16 dequant scratch).
+            DType::HC8E4M3Row => self.hc8_dequant_f16_ptr(weight, m, k, fp16.buf.as_ptr())?,
+            _ => self.launch_bf16_to_f16(weight.buf.as_ptr(), fp16.buf.as_ptr(), n)?,
+        }
         let ptr = fp16.buf.as_ptr();
         self.fp16_shadow_cache.insert(key, fp16);
         Ok(ptr)
@@ -6425,6 +6770,71 @@ impl Gpu {
         })
     }
 
+    /// Allocate a **weight** tensor. Inside a weight-load scope
+    /// ([`Self::weight_slab_scope_begin`]) with `HIPFIRE_WEIGHT_SLAB` on, a
+    /// tensor of at most the mode's threshold is a view into a shared
+    /// 2 MiB-multiple slab (exact size, 4 KiB aligned, zero-filled); anything
+    /// else is [`Self::alloc_tensor`]. Free it with [`Self::free_tensor`].
+    pub fn alloc_weight_tensor(&mut self, shape: &[usize], dtype: DType) -> HipResult<GpuTensor> {
+        self.bind_thread()?;
+        let numel: usize = shape.iter().product();
+        let byte_size = numel * dtype.size();
+        match self.hip.slab_alloc(byte_size)? {
+            Some(buf) => Ok(GpuTensor {
+                buf,
+                shape: shape.to_vec(),
+                dtype,
+            }),
+            None => self.alloc_tensor(shape, dtype),
+        }
+    }
+
+    /// Open a weight-load scope on this device: weight uploads
+    /// ([`Self::upload_raw`], [`Self::upload_f32`], [`Self::upload_f16_bits`],
+    /// [`Self::alloc_weight_tensor`]) are packed into slabs per
+    /// `HIPFIRE_WEIGHT_SLAB` until the matching [`Self::weight_slab_scope_end`].
+    /// Scopes nest; a model load wraps its whole weight upload in one.
+    pub fn weight_slab_scope_begin(&self) {
+        // bind_thread: skip — host-side bookkeeping only.
+        self.hip.slab_scope_begin();
+    }
+
+    /// [`Self::weight_slab_scope_begin`] with the load's own default packing
+    /// mode, used when `HIPFIRE_WEIGHT_SLAB` is unset (an outermost scope only;
+    /// a nested scope keeps the outer one's mode).
+    pub fn weight_slab_scope_begin_with(&self, default: Option<hip_bridge::SlabMode>) {
+        // bind_thread: skip — host-side bookkeeping only.
+        self.hip.slab_scope_begin_with(default);
+    }
+
+    /// Close a weight-load scope. The outermost close seals every open slab
+    /// and logs what the scope packed.
+    pub fn weight_slab_scope_end(&self) {
+        // bind_thread: skip — host-side bookkeeping only.
+        if let Some(s) = self.hip.slab_scope_end() {
+            let mib = |b: usize| b as f64 / (1024.0 * 1024.0);
+            eprintln!(
+                "  weight-slab[{}]: {} tensors ({:.1} MiB) packed into {} slabs ({:.1} MiB, {:.1} MiB slack) on device {}",
+                s.mode.map_or("?", |m| m.name()),
+                s.tensors,
+                mib(s.payload_bytes),
+                s.slabs,
+                mib(s.slab_bytes),
+                mib(s.slab_bytes.saturating_sub(s.payload_bytes)),
+                self.device_id,
+            );
+        }
+    }
+
+    /// Slabs still allocated (live views, or retired and not yet flushed), for
+    /// the post-unload check that no weight view outlived its model. `None`
+    /// when no slab remains.
+    pub fn pinned_weight_slabs(&self) -> Option<hip_bridge::SlabStats> {
+        // bind_thread: skip — host-side bookkeeping only.
+        let stats = self.hip.slab_stats();
+        (stats.slabs > 0).then_some(stats)
+    }
+
     /// Allocate a tensor with a direct, EXACT-size `hipMalloc` (owning, non-VMM),
     /// bypassing the pool so a larger reusable buffer can never be handed back.
     /// The request is `max(bytes, 256)` (the pool's existing minimum); the shape and
@@ -6588,7 +6998,11 @@ impl Gpu {
             }
         };
         for s in &plan.f16 {
-            self.launch_bf16_to_f16(s.src_ptr as *mut c_void, map(s.dst_ptr), s.rows * s.cols)?;
+            if s.hc8 {
+                self.hc8_dequant_f16_at(s.src_ptr as *mut c_void, s.rows, s.cols, map(s.dst_ptr))?;
+            } else {
+                self.launch_bf16_to_f16(s.src_ptr as *mut c_void, map(s.dst_ptr), s.rows * s.cols)?;
+            }
         }
         for s in &plan.shared_i8 {
             self.shared_i8_build_planes(
@@ -6608,6 +7022,7 @@ impl Gpu {
     /// Byte oracle: rebuild every shadow into a temporary allocation with the same builders
     /// and compare it with the live region, span bytes only (padding is unspecified).
     /// Returns `Ok(Err(..))` naming the first differing member/offset. Requires `ready`.
+    #[track_caller]
     pub fn verify_borrowed_shadows(&mut self) -> HipResult<Result<(), String>> {
         const CHUNK: usize = 64 << 20;
         self.bind_thread()?;
@@ -6833,7 +7248,14 @@ impl Gpu {
         let byte_size = numel
             .checked_mul(dtype.size())
             .ok_or_else(|| HipError::new(0, "VMM tensor byte size overflowed"))?;
-        let mut arena = VmmArena::reserve(&self.hip, self.device_id, byte_size)?;
+        let mut arena =
+            VmmArena::reserve(&self.hip, self.device_id, byte_size).map_err(|mut err| {
+                err.message.push_str(
+                "; this runtime could not reserve the virtual address range a VMM tensor needs \
+                 (a KV cache can use --kv-backend legacy / memory.kv_backend = legacy instead)",
+            );
+                err
+            })?;
         if hipfire_config::developer_var("HIPFIRE_OFFLOAD_DEBUG").is_ok() {
             eprintln!(
                 "[offload-debug] device-vmm base=0x{:x} req={} reserved={} gran={}",
@@ -6965,6 +7387,7 @@ impl Gpu {
     /// (at least [`EXPORT_WEIGHT_TAIL_PAD_BYTES`]), synchronize, publish read-only
     /// and export the FD.
     #[cfg(target_os = "linux")]
+    #[track_caller]
     fn fill_exportable_weight_arena(
         &self,
         arena: &mut VmmArena,
@@ -7143,6 +7566,150 @@ impl Gpu {
             owner,
             device_alias: key,
         })
+    }
+
+    /// Map the already-pinned allocation `host_ptr` (kept alive by `owner`, shared with the
+    /// rank that allocated it) into THIS device as a host-mapped tensor of `bytes` bytes:
+    /// this device's own alias, recorded in the registry and the lease table so
+    /// [`Self::free_tensor`] drops this rank's share only. `Ok(None)`: this device already
+    /// holds the alias (the same device asked twice), so the caller must allocate privately.
+    fn adopt_shared_host_mapped(
+        &mut self,
+        owner: Arc<hip_bridge::HostAllocOwner>,
+        host_ptr: usize,
+        bytes: usize,
+        shape: &[usize],
+    ) -> HipResult<Option<GpuTensor>> {
+        let alias = resolve_host_mapped_alias(
+            host_ptr as *mut c_void,
+            |host| self.hip.host_get_device_pointer(host, 0),
+            |_| Ok(()),
+        )?;
+        let alias_key = alias as usize;
+        if self.host_mapped.contains_key(&alias_key)
+            || !self.host_leases.insert_shared(alias_key, owner)
+        {
+            return Ok(None);
+        }
+        self.host_mapped.insert(alias_key, host_ptr);
+        Ok(Some(GpuTensor {
+            // SAFETY: `alias` is this device's mapping of a live pinned allocation of at least
+            // `bytes` bytes, kept alive by the lease just recorded.
+            buf: unsafe { hip_bridge::DeviceBuffer::from_host_mapped(alias, bytes) },
+            shape: shape.to_vec(),
+            dtype: DType::Raw,
+        }))
+    }
+
+    /// [`Self::upload_raw_host_mapped`] for a payload that is byte-identical on every rank of
+    /// one process (the replicated EP embedding): the first caller allocates and fills the
+    /// pinned owner and leases it; later callers on other devices adopt the SAME pinned
+    /// allocation (their own device alias, a shared [`HostAllocLease`] owner: the last
+    /// holder frees it once) instead of pinning another copy. The adoption is proven, not
+    /// assumed: a live entry under `key` is used only when its length matches and its bytes
+    /// equal `data`; otherwise (and on the same device, whose alias would collide) this
+    /// falls back to a private allocation, so sharing can never change a byte a kernel
+    /// reads.
+    pub fn upload_raw_host_mapped_shared(
+        &mut self,
+        key: &str,
+        data: &[u8],
+        shape: &[usize],
+    ) -> HipResult<GpuTensor> {
+        self.bind_thread()?;
+        let mut registry = SHARED_HOST_MAPPED
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let map = registry.get_or_insert_with(HashMap::new);
+        let live = map.get(key).and_then(|entry| {
+            (entry.len == data.len())
+                .then(|| entry.owner.upgrade().map(|owner| (owner, entry.host_ptr)))
+                .flatten()
+        });
+        if let Some((owner, host_ptr)) = live {
+            // SAFETY: `owner` keeps the allocation of `data.len() + HOST_TAIL_PAD_BYTES`
+            // bytes alive; nothing writes it after its first upload.
+            let existing = unsafe { std::slice::from_raw_parts(host_ptr as *const u8, data.len()) };
+            if existing == data {
+                if let Some(tensor) =
+                    self.adopt_shared_host_mapped(owner, host_ptr, data.len(), shape)?
+                {
+                    eprintln!(
+                        "  host-share: '{key}' ({:.2} GiB pinned) adopted from the live allocation of another device (one copy, this device's own alias)",
+                        data.len() as f64 / (1u64 << 30) as f64
+                    );
+                    return Ok(tensor);
+                }
+            }
+        }
+        let tensor = self.upload_raw_host_mapped(data, shape)?;
+        let lease = self.lease_host_owner(&tensor)?;
+        map.insert(
+            key.to_string(),
+            SharedHostEntry {
+                owner: Arc::downgrade(&lease.owner),
+                host_ptr: lease.host_ptr() as usize,
+                len: data.len(),
+                identity: None,
+            },
+        );
+        Ok(tensor)
+    }
+
+    /// Shared pinned allocation of `bytes` payload bytes keyed by `key`, proven by a caller
+    /// `identity` digest instead of a byte comparison (no source slice has to exist). The
+    /// first rank allocates the owner, runs `fill` on the payload in place (the tail pad is
+    /// zeroed afterwards), and leases it; a later rank on another device whose `key`,
+    /// `bytes` and `identity` match a live entry adopts the same pages through its own
+    /// alias and never runs `fill`. A mismatch (or the same device twice) allocates and
+    /// fills a private copy, so the bytes a kernel reads are always the ones `fill` wrote
+    /// for that identity. The registry lock is held across `fill`, so a second rank waits
+    /// for the first rank's fill instead of racing it. Free the tensor with
+    /// [`Self::free_tensor`]; the last holder frees the allocation once.
+    pub fn host_mapped_shared_fill(
+        &mut self,
+        key: &str,
+        identity: [u8; 32],
+        bytes: usize,
+        shape: &[usize],
+        fill: impl FnOnce(&mut [u8]) -> HipResult<()>,
+    ) -> HipResult<GpuTensor> {
+        self.bind_thread()?;
+        let mut registry = SHARED_HOST_MAPPED
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let map = registry.get_or_insert_with(HashMap::new);
+        let live = map.get(key).and_then(|entry| {
+            (entry.len == bytes && entry.identity == Some(identity))
+                .then(|| entry.owner.upgrade().map(|owner| (owner, entry.host_ptr)))
+                .flatten()
+        });
+        if let Some((owner, host_ptr)) = live {
+            if let Some(tensor) = self.adopt_shared_host_mapped(owner, host_ptr, bytes, shape)? {
+                return Ok(tensor);
+            }
+        }
+        let (tensor, host) = self.alloc_raw_host_mapped(bytes, shape)?;
+        // SAFETY: `alloc_raw_host_mapped` returned a live pinned allocation of
+        // `bytes + HOST_TAIL_PAD_BYTES` bytes that nothing else references yet.
+        let filled = fill(unsafe { std::slice::from_raw_parts_mut(host, bytes) });
+        if let Err(error) = filled {
+            let _ = self.free_tensor(tensor);
+            return Err(error);
+        }
+        // SAFETY: the pad lies inside the same allocation, past the payload.
+        unsafe { std::ptr::write_bytes(host.add(bytes), 0, HOST_TAIL_PAD_BYTES) };
+        let lease = self.lease_host_owner(&tensor)?;
+        map.insert(
+            key.to_string(),
+            SharedHostEntry {
+                owner: Arc::downgrade(&lease.owner),
+                host_ptr: lease.host_ptr() as usize,
+                len: bytes,
+                identity: Some(identity),
+            },
+        );
+        Ok(tensor)
     }
 
     /// Allocate this GPU's bounded-wait error block (`crate::device_wait`)
@@ -8104,6 +8671,7 @@ impl Gpu {
 
     /// Copy the slab frontiers into the fork owners and zero their private tails,
     /// ordered on the active/default stream.
+    #[track_caller]
     fn fill_forked_vmm_tensors(
         &mut self,
         prefix: &VmmPrefixSet,
@@ -8303,6 +8871,31 @@ impl Gpu {
         let prop = HipMemAllocationProp::device_pinned(self.device_id);
         self.hip
             .mem_get_allocation_granularity(&prop, HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED)
+    }
+
+    /// Why this runtime cannot back a VMM KV cache, or `None` when it can.
+    ///
+    /// [`Self::vmm_recommended_granularity`] only queries a driver constant and
+    /// passes on stacks whose `hipMemAddressReserve` then returns
+    /// `hipErrorOutOfMemory` (#1058: gfx1100, in-tree amdgpu 6.8 under ROCm
+    /// 10.0), which made an automatically selected VMM backend fail the load
+    /// after every weight was uploaded. This runs the real reservation once
+    /// (see [`hip_bridge::probe_va_reservation`]); admission turns a refusal into
+    /// the legacy backend with the reason attached. The verdict is cached for the
+    /// life of this `Gpu`.
+    pub fn vmm_runtime_refusal(&self) -> Option<String> {
+        self.vmm_runtime_probe
+            .get_or_init(|| {
+                if let Err(err) = self.vmm_recommended_granularity() {
+                    return Some(format!("hipMemGetAllocationGranularity failed: {err}"));
+                }
+                hip_bridge::probe_va_reservation(&self.hip, self.device_id)
+                    .err()
+                    .map(|err| {
+                        format!("a probe reservation of virtual address space failed: {err}")
+                    })
+            })
+            .clone()
     }
 
     pub fn vmm_allocation_count(&self) -> usize {
@@ -8507,10 +9100,29 @@ impl Gpu {
         Ok(tensor)
     }
 
+    /// [`Self::alloc_then_init`] for a weight tensor ([`Self::alloc_weight_tensor`]).
+    fn alloc_weight_then_init(
+        &mut self,
+        shape: &[usize],
+        dtype: DType,
+        init: impl FnOnce(&HipRuntime, Option<&hip_bridge::Stream>, &GpuTensor) -> HipResult<()>,
+    ) -> HipResult<GpuTensor> {
+        let tensor = self.alloc_weight_tensor(shape, dtype)?;
+        let init_result = {
+            let stream = self.active_stream.as_ref();
+            init(&self.hip, stream, &tensor)
+        };
+        if let Err(err) = init_result {
+            let _ = self.free_tensor(tensor);
+            return Err(err);
+        }
+        Ok(tensor)
+    }
+
     pub fn upload_f32(&mut self, data: &[f32], shape: &[usize]) -> HipResult<GpuTensor> {
         HTOD_UPLOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.bind_thread()?;
-        self.alloc_then_init(shape, DType::F32, |hip, _stream, tensor| {
+        self.alloc_weight_then_init(shape, DType::F32, |hip, _stream, tensor| {
             let bytes =
                 unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
             hip.memcpy_htod(&tensor.buf, bytes)
@@ -8529,6 +9141,7 @@ impl Gpu {
     /// `.buf` is host RAM readable by kernels — exactly what an offloaded layer's weight
     /// read must dereference. Byte-for-byte identical contents to the device path; only
     /// the physical location differs.
+    #[track_caller]
     pub fn upload_f32_host(&mut self, data: &[f32], shape: &[usize]) -> HipResult<GpuTensor> {
         self.bind_thread()?;
         let numel = shape
@@ -8558,10 +9171,11 @@ impl Gpu {
     ///
     /// `data` is little-endian f16 words, exactly `shape.iter().product()` of
     /// them.
+    #[track_caller]
     pub fn upload_f16_bits(&mut self, data: &[u16], shape: &[usize]) -> HipResult<GpuTensor> {
         HTOD_UPLOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.bind_thread()?;
-        let tensor = self.alloc_tensor(shape, DType::F16)?;
+        let tensor = self.alloc_weight_tensor(shape, DType::F16)?;
         let want = tensor.numel();
         if data.len() != want {
             return Err(hip_bridge::HipError::new(
@@ -8594,6 +9208,7 @@ impl Gpu {
     }
 
     /// In-place constant fill of an existing F32 tensor (sync htod).
+    #[track_caller]
     pub fn fill_f32(&mut self, tensor: &GpuTensor, value: f32) -> HipResult<()> {
         self.bind_thread()?;
         let data = vec![value; tensor.numel()];
@@ -8610,6 +9225,7 @@ impl Gpu {
     ///
     /// Like every `download_*` reader, this fails once the copy completes if a
     /// bounded device wait timed out ([`Self::take_device_wait_error`]).
+    #[track_caller]
     pub fn download_f16_bits(&self, tensor: &GpuTensor) -> HipResult<Vec<u16>> {
         self.bind_thread()?;
         if tensor.dtype != DType::F16 {
@@ -8632,6 +9248,7 @@ impl Gpu {
     /// timed out ([`Self::take_device_wait_error`]). The copy follows the
     /// step that produced `tensor`, so a stalled peer or rendezvous fails
     /// the request here rather than handing back garbage.
+    #[track_caller]
     pub fn download_f32(&self, tensor: &GpuTensor) -> HipResult<Vec<f32>> {
         self.bind_thread()?;
         let numel = tensor.numel();
@@ -8686,6 +9303,7 @@ impl Gpu {
 
     /// [`Self::download_f32`] into a caller-owned buffer (resized to the
     /// tensor), so a per-row reader reuses one host allocation.
+    #[track_caller]
     pub fn download_f32_into(&self, tensor: &GpuTensor, out: &mut Vec<f32>) -> HipResult<()> {
         self.bind_thread()?;
         let numel = tensor.numel();
@@ -8706,6 +9324,7 @@ impl Gpu {
     /// The tensors must have been written by work on the active stream (a
     /// decode graph replay or the eager forward). With no active stream the
     /// device is drained once and each part is a blocking copy.
+    #[track_caller]
     pub fn download_f32_stream_ordered_append(
         &self,
         parts: &mut [(&GpuTensor, &mut Vec<f32>)],
@@ -8737,12 +9356,210 @@ impl Gpu {
         self.take_device_wait_error()
     }
 
+    /// H→D copy of `src` into `dst[dst_offset..]` ordered on [`Self::active_stream`]: with a
+    /// stream (the decode stream of a graph route) the copy is enqueued there and the call
+    /// returns once that stream has executed it, so `src` is free on return and no legacy
+    /// (null) stream hop is paid, which is what the plain blocking copy costs whenever the
+    /// runtime synchronizes the null queue with the decode queue. While a graph is being
+    /// captured the copy is enqueued on the capturing stream without a wait (the caller
+    /// keeps `src` alive and rewrites it in place, as with [`Self::memcpy_htod_auto`]).
+    /// With no active stream this is the blocking `hipMemcpy` as before.
+    #[track_caller]
+    pub fn htod_stream_ordered(
+        &self,
+        dst: &hip_bridge::DeviceBuffer,
+        dst_offset: usize,
+        src: &[u8],
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        match self.active_stream.as_ref() {
+            Some(stream) if self.graphs.capture_mode => {
+                self.hip.memcpy_htod_async_at(dst, dst_offset, src, stream)
+            }
+            Some(stream) => {
+                self.hip
+                    .memcpy_htod_async_at(dst, dst_offset, src, stream)?;
+                self.hip.stream_synchronize(stream)?;
+                self.take_device_wait_error()
+            }
+            None => self.hip.memcpy_htod_offset(dst, dst_offset, src),
+        }
+    }
+
+    /// D→H copies of every `(source, destination)` pair, all enqueued on
+    /// [`Self::active_stream`] and read with ONE wait on that stream (the readbacks of one
+    /// step's selector, say): no legacy stream hop and one host round trip. Each source must
+    /// have been written by work on the active stream. With no active stream each part is a
+    /// blocking copy.
+    #[track_caller]
+    pub fn dtoh_stream_ordered_batch(
+        &self,
+        parts: &mut [(&hip_bridge::DeviceBuffer, &mut [u8])],
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let stream = self.active_stream.as_ref();
+        for (src, dst) in parts.iter_mut() {
+            match stream {
+                Some(stream) => self.hip.memcpy_dtoh_async(dst, src, Some(stream))?,
+                None => self.hip.memcpy_dtoh(dst, src)?,
+            }
+        }
+        if let Some(stream) = stream {
+            self.hip.stream_synchronize(stream)?;
+        }
+        self.take_device_wait_error()
+    }
+
+    /// The active stream when the steady-state copies run on it
+    /// (`HIPFIRE_STREAM_ORDERED_COPIES`, default on); `None` puts them back on the legacy null
+    /// stream. A blocking copy on the null stream enqueues a packet on its own hardware queue that
+    /// waits for the work queued on the active stream; when the queue mapper places that queue
+    /// on the same CP pipe as the active stream's, the CP time-slices the two for as long as the
+    /// packet waits, and every dispatch on the device pays the slice.
+    pub fn steady_copy_stream(&self) -> Option<&hip_bridge::Stream> {
+        self.active_stream
+            .as_ref()
+            .filter(|_| self.flags.stream_ordered_copies)
+    }
+
+    /// Blocking D→H copy of `src`'s first `dst.len()` bytes, ordered on
+    /// [`Self::steady_copy_stream`] and read with one wait on that stream (the blocking
+    /// null-stream copy when there is none), then [`Self::take_device_wait_error`].
+    #[track_caller]
+    pub fn dtoh_stream_ordered(
+        &self,
+        dst: &mut [u8],
+        src: &hip_bridge::DeviceBuffer,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let pinned_ok = self.steady_readback_pinned_on
+            && !self.graphs.capture_mode
+            && !self.replay.is_recording();
+        match self.steady_copy_stream() {
+            Some(stream) if pinned_ok => {
+                // Land in the reusable pinned buffer (non-blocking async copy), one stream
+                // wait, then copy out: no pageable staging.
+                let mut guard = self
+                    .steady_readback_pinned
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let need = dst.len();
+                if guard.as_ref().is_none_or(|b| b.size() < need) {
+                    // First use or (rare) growth; the old buffer drains in its Drop.
+                    *guard = None;
+                    *guard = Some(self.hip.transfer_buffer(need.max(64 * 1024))?);
+                }
+                let buf = guard.as_mut().expect("pinned readback buffer");
+                buf.download_async(&self.hip, src, 0, need, Some(stream))?;
+                buf.complete(&self.hip)?;
+                dst.copy_from_slice(&buf.as_bytes_mut()[..need]);
+            }
+            Some(stream) => {
+                self.hip.memcpy_dtoh_async(dst, src, Some(stream))?;
+                self.hip.stream_synchronize(stream)?;
+            }
+            None => self.hip.memcpy_dtoh(dst, src)?,
+        }
+        self.take_device_wait_error()
+    }
+
+    /// Blocking H→D copy of `src` into `dst`, ordered on [`Self::steady_copy_stream`]: enqueued
+    /// there and returned once the stream executed it, so `src` is free on return as with the
+    /// blocking copy. While a graph is captured the copy goes to the capturing stream without a
+    /// wait (the caller keeps `src` alive, as with [`Self::memcpy_htod_auto`]). With no stream it
+    /// is [`Self::memcpy_htod_auto`].
+    #[track_caller]
+    pub fn upload_stream_ordered(
+        &self,
+        dst: &hip_bridge::DeviceBuffer,
+        src: &[u8],
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        match self.steady_copy_stream() {
+            Some(stream) if self.graphs.capture_mode => {
+                self.hip.memcpy_htod_async(dst, src, stream)
+            }
+            Some(stream) => {
+                self.hip.memcpy_htod_async(dst, src, stream)?;
+                self.hip.stream_synchronize(stream)
+            }
+            None => self.memcpy_htod_auto(dst, src),
+        }
+    }
+
+    /// Blocking `hipMemset` of `buf[..size]` ordered on [`Self::steady_copy_stream`]: enqueued
+    /// there and returned once the stream executed it, the blocking memset's contract without a
+    /// packet on the null stream's queue (the blocking null-stream memset when there is none).
+    #[track_caller]
+    pub fn memset_stream_ordered(
+        &self,
+        buf: &hip_bridge::DeviceBuffer,
+        value: i32,
+        size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        match self.steady_copy_stream() {
+            Some(stream) => {
+                self.hip.memset_async(buf, value, size, stream)?;
+                self.hip.stream_synchronize(stream)
+            }
+            None => self.hip.memset(buf, value, size),
+        }
+    }
+
+    /// [`Self::memset_stream_ordered`] without the per-call wait: with a steady copy stream
+    /// and `flags.lane_reset_batch` the fill is only enqueued and recorded in `batch`, and
+    /// [`Self::memset_batch_sync`] waits for the whole run once. With no steady stream or with
+    /// the kill switch (`HIPFIRE_LANE_RESET_BATCH=0`) it is exactly the blocking
+    /// [`Self::memset_stream_ordered`]. The caller keeps `buf` alive until the batch is
+    /// synced. A failed enqueue waits for the fills already in flight before returning, so
+    /// no write outlives the error.
+    #[track_caller]
+    pub fn memset_batched(
+        &self,
+        batch: &mut MemsetBatch,
+        buf: &hip_bridge::DeviceBuffer,
+        value: i32,
+        size: usize,
+    ) -> HipResult<()> {
+        if !self.flags.lane_reset_batch {
+            return self.memset_stream_ordered(buf, value, size);
+        }
+        self.bind_thread()?;
+        match self.steady_copy_stream() {
+            Some(stream) => {
+                if let Err(error) = self.hip.memset_async(buf, value, size, stream) {
+                    let _ = self.memset_batch_sync(batch);
+                    return Err(error);
+                }
+                batch.pending = true;
+                Ok(())
+            }
+            None => self.hip.memset(buf, value, size),
+        }
+    }
+
+    /// One wait on the steady copy stream for every fill [`Self::memset_batched`] enqueued
+    /// into `batch` (nothing when none is pending); `batch` is empty afterwards.
+    #[track_caller]
+    pub fn memset_batch_sync(&self, batch: &mut MemsetBatch) -> HipResult<()> {
+        if !std::mem::take(&mut batch.pending) {
+            return Ok(());
+        }
+        self.bind_thread()?;
+        match self.steady_copy_stream() {
+            Some(stream) => self.hip.stream_synchronize(stream),
+            None => Ok(()),
+        }
+    }
+
     /// Read a `DType::Raw` tensor back as raw bytes — no widening and no dtype
     /// reinterpretation, so a caller can compare code blobs bit-for-bit.
     ///
     /// Works for host-located tensors too: `memcpy_dtoh` reads through the
     /// mapped handle across PCIe, which is what makes the offload parity check
     /// (device upload vs host upload) a plain `Vec<u8>` equality.
+    #[track_caller]
     pub fn download_raw_bytes(&self, tensor: &GpuTensor) -> HipResult<Vec<u8>> {
         self.bind_thread()?;
         let n = tensor.byte_size();
@@ -8796,9 +9613,12 @@ impl Gpu {
         copy: impl FnOnce(&HipRuntime, &DeviceBuffer, &[u8]) -> HipResult<()>,
     ) -> HipResult<GpuTensor> {
         self.bind_thread()?;
-        let buf = self.hip.malloc(data.len())?;
+        let buf = match self.hip.slab_alloc(data.len())? {
+            Some(buf) => buf,
+            None => self.hip.malloc(data.len())?,
+        };
         if let Err(err) = copy(&self.hip, &buf, data) {
-            // hip.malloc owner — hip.free only. free_tensor would pool it.
+            // hip.malloc / slab owner — hip.free only. free_tensor would pool it.
             let _ = self.hip.free(buf);
             return Err(err);
         }
@@ -8835,6 +9655,12 @@ impl Gpu {
     /// and returns the error (never a false clean free).
     pub fn free_tensor(&mut self, tensor: GpuTensor) -> HipResult<()> {
         self.bind_thread()?;
+        if tensor.buf.is_slab_view() {
+            // A weight-slab view is never pooled (a pooled view would pin its
+            // slab past the model): release the range; a slab left with no
+            // view is freed by the next `drain_pool`.
+            return self.hip.slab_release(tensor.buf, true);
+        }
         let key = tensor.buf.as_ptr() as usize;
         if tensor.buf.is_host_mapped() {
             // Host-mapped owners are never pooled: hipHostFree takes the host
@@ -9254,11 +10080,29 @@ impl Gpu {
         self.pool.pooled_bytes()
     }
 
+    /// Test seam (the daemon's `serve-fault-inject` build): the pool allocation
+    /// after `after_allocs` further ones is forced to miss the free lists and fail
+    /// as an injected `hipErrorOutOfMemory`, so the production out-of-memory retry
+    /// (drain every pooled buffer, allocate again once) runs at a chosen moment.
+    /// `None` disarms. Inert unless a test arms it.
+    pub fn inject_pool_oom(&mut self, after_allocs: Option<u32>) {
+        // bind_thread: skip — arms a host-side counter, no HIP call.
+        self.pool.inject_oom(after_allocs);
+    }
+
+    /// `(drains, injected_oom)`: times a drain returned pooled buffers to HIP, and
+    /// injected out-of-memory failures consumed ([`Self::inject_pool_oom`]).
+    pub fn pool_drain_counters(&self) -> (u64, u64) {
+        // bind_thread: skip — pure read of host-side counters, no HIP call.
+        (self.pool.drains, self.pool.injected_oom)
+    }
+
     /// Drain the GPU memory pool. Actually calls hipFree on all pooled buffers.
     /// Call after model unload to return VRAM to the system.
     pub fn drain_pool(&mut self) {
         self.bind_thread_or_warn();
         self.pool.drain(&self.hip);
+        self.hip.slab_flush();
     }
 
     /// Invalidate every weight-pointer-keyed cache on the Gpu. Must be called
@@ -9296,6 +10140,88 @@ impl Gpu {
         // and report.
         let _ = self.release_qsa_gather_workspace();
         self.drain_dflash_gdn_replay_scratch();
+    }
+
+    /// Whether any lazily built weight shadow is resident: an F16 shadow cache entry
+    /// (owning or an S1 arena view), an allocated S1 arena root (or one quarantined by a
+    /// failed release), or a shared-expert INT8 shadow. A decode-share borrow's shadows
+    /// live in the caller's region and never count. Pure host read.
+    pub fn long_prefill_caches_resident(&self) -> bool {
+        // bind_thread: skip — pure host metadata read.
+        !self.fp16_shadow_cache.is_empty()
+            || !self.shared_i8_shadows.is_empty()
+            || self.f16_shadow_arena.live_roots() > 0
+            || self.f16_shadow_arena.quarantined_roots() > 0
+    }
+
+    /// Give back the weight shadows a >= 512-row prefill builds lazily: the F16 shadow
+    /// cache (owning entries to the pool, S1 arena views dropped and their roots
+    /// released) and the shared-expert INT8 shadows, then drain the pool. Every reader
+    /// resolves its shadow through its `ensure_*` path on each call (no shadow pointer is
+    /// kept across calls, and the replay recorder and graph capture never reach a shadow
+    /// route), so the next >= 512-row GEMM re-creates the shadow with the same conversion
+    /// kernel, into the same planned span (S1 arena) or a fresh pooled buffer:
+    /// byte-identical. The S1 arena plan and its source bindings are kept (only the roots
+    /// are released). Weights, the QSA gather workspace, the MQ screen cache, scratch
+    /// slots and kernel modules are untouched.
+    ///
+    /// Refuses (`Err`, nothing freed) while a decode-share `shadow_borrow` is installed
+    /// (its shadows live in a region this `Gpu` does not own), while the replay recorder
+    /// or graph capture is active, or when a borrowed cache entry has no arena behind it.
+    /// The device is synchronized first so no queued kernel can still read a freed shadow.
+    /// Returns the device bytes released: S1 arena roots plus every pooled byte drained
+    /// (the freed owning shadows included).
+    pub fn release_long_prefill_caches(&mut self) -> HipResult<u64> {
+        let err = |msg: &str| HipError::new(0, &format!("release_long_prefill_caches: {msg}"));
+        if self.shadow_borrow.is_some() {
+            return Err(err(
+                "a decode-share shadow borrow is installed (its shadows are not owned here)",
+            ));
+        }
+        if self.replay.is_recording() || self.graphs.capture_mode {
+            return Err(err("replay recording or graph capture is active"));
+        }
+        if !self.f16_shadow_arena.is_active()
+            && self.fp16_shadow_cache.values().any(|t| t.buf.is_borrowed())
+        {
+            return Err(err("a borrowed F16 shadow view has no arena behind it"));
+        }
+        self.bind_thread()?;
+        self.hip.device_synchronize()?;
+
+        let arena_bytes: usize = self
+            .f16_shadow_arena
+            .root_capacities(DeviceBuffer::size)
+            .into_iter()
+            .flatten()
+            .sum();
+        let binding = self
+            .f16_shadow_arena
+            .plan()
+            .cloned()
+            .map(|plan| (plan, self.f16_shadow_arena.source_ptrs().to_vec()));
+
+        // Views are non-owning (dropped); owning shadows go to the pool.
+        let cached: Vec<GpuTensor> = self.fp16_shadow_cache.drain().map(|(_, t)| t).collect();
+        for t in cached.into_iter().filter(|t| !t.buf.is_borrowed()) {
+            if let Err(e) = self.free_tensor(t) {
+                eprintln!("[rdna-compute] release_long_prefill_caches: {e}");
+            }
+        }
+        // The cache holds no view now; release the roots, then restore the plan binding
+        // so the next shadow build exact-allocates its root again.
+        self.clear_f16_shadow_arena()
+            .map_err(|e| err(&e.to_string()))?;
+        if let Some((plan, source_ptrs)) = binding {
+            self.f16_shadow_arena
+                .bind(plan, &source_ptrs)
+                .map_err(|e| err(&format!("re-binding the F16 shadow arena: {e}")))?;
+        }
+        self.drain_shared_i8_shadows();
+
+        let pooled = self.pool.pooled_bytes();
+        self.drain_pool();
+        Ok((arena_bytes + pooled) as u64)
     }
 
     /// Invalidate the pointer-keyed F16 conversion cache. Must be called
@@ -9911,31 +10837,6 @@ impl Gpu {
     /// HFQ4-G128 GEMV: flat 4-bit with 128-weight groups.
     /// K must be multiple of 128.
 
-    /// ParoQuant Givens rotation: apply learned pairwise rotations + channel
-    /// scaling to activation vector x in-place. Called before GEMV on
-    /// ParoQ4G128 weights.
-    ///
-    /// x: [seq_len, hidden_dim] F16 (modified in place)
-    /// pairs: [krot, hidden_dim] I16
-    /// theta: [krot, hidden_dim/2] F16
-    /// channel_scales: [hidden_dim] F16
-
-    /// Out-of-place Givens rotation. Reads `x_in`, writes rotated
-    /// activations to `x_out`. Replaces the
-    /// `copy_d2d + givens_rotate` pair used by `rotate_x_paro_for` —
-    /// one graph node + one inter-node dependency removed.
-    #[allow(clippy::too_many_arguments)]
-
-    /// Fused silu(gate)*up + per-channel scale + krot rounds of Givens
-    /// rotation. Single-launch replacement for the
-    /// `silu_mul_f32 + givens_rotate` pair used by the ParoQuant routed
-    /// gate→down hop. Same shared-memory + grid contract as
-    /// `givens_rotate`, plus two additional input pointers (gate, up)
-    /// and a separate output pointer.
-    #[allow(clippy::too_many_arguments)]
-
-    /// Ensure the ParoQuant activation scratch buffer is allocated (F32, sized for dim).
-
     /// Device-to-device copy.
     ///
     /// Routes through `memcpy_dtod_auto` so it picks `memcpy_dtod_async` on
@@ -9961,73 +10862,6 @@ impl Gpu {
         );
         self.memcpy_dtod_auto(&dst.buf, &src.buf, n_bytes)
     }
-
-    /// PARO4-G128 GEMV: ParoQuant pair-rotated activation + W4 weights.
-    /// K must be multiple of 128 and M must be a multiple of the AWQ pack size
-    /// (8). Each block computes one packed output column (8 output rows).
-
-    /// Residual PARO4-G128 GEMV: y += A(x) where x is pair-rotated per
-    /// ParoQuant metadata. One block computes one AWQ packed output column.
-
-    /// PARO4-G128 fused SwiGLU down projection: y += W * (silu(gate) * up).
-    /// Saves the standalone `silu_mul_f32` launch and ffn_hidden global write/read.
-
-    /// PARO4-G128T direct GEMV for tiny-M projections. This keeps the Paro
-    /// rotation inside the GEMV block instead of materializing x_rot globally.
-
-    /// Residual PARO4-G128T direct GEMV for tiny-M projections.
-
-    /// PARO4-G128 activation pre-rotation. This materializes the ParoQuant
-    /// channel-scale + pair-rotation transform once per projection so the
-    /// packed GEMV does not repeat it for every 8-output pack.
-
-    /// PARO4-G128 fused SwiGLU activation + Paro pre-rotation. This is the
-    /// useful fused shape for down projection: `x_rot = rotate(silu(gate)*up)`.
-
-    /// PARO4-G128T activation pre-rotation. Same math as PARO4-G128, but
-    /// theta is stored as precomputed f16 sin/cos pairs in the payload.
-
-    /// PARO4-G128T fused SwiGLU activation + Paro pre-rotation.
-
-    /// PARO4-G128 GEMV over an already materialized Paro-rotated activation.
-
-    /// Residual PARO4-G128 GEMV over an already materialized Paro-rotated
-    /// activation.
-
-    /// PARO4-G128T GEMV over an already materialized Paro-rotated activation.
-    /// The payload stores qweight as [M/8, K], making the inner-loop reads
-    /// contiguous for the GEMV access pattern.
-
-    /// Residual PARO4-G128T GEMV over an already materialized Paro-rotated
-    /// activation.
-
-    /// PARO4-G128T prerotated GEMV with four output lanes per block. This
-    /// duplicates qweight reads relative to the 8-lane pack but lowers
-    /// accumulator/register pressure for empirical Atlas testing.
-
-    /// Residual PARO4-G128T pack4 prerotated GEMV.
-
-    /// PARO4-G128T prerotated GEMV with two output lanes per block. This is
-    /// an Atlas probe for whether lower accumulator pressure beats duplicate
-    /// qweight traffic on the residual/down hot path.
-
-    /// Residual PARO4-G128T pack2 prerotated GEMV.
-
-    /// PARO4-G128T prerotated GEMV with one output lane per block.
-
-    /// Residual PARO4-G128T pack1 prerotated GEMV.
-
-    /// PARO4-G128 rotate-once wrapper used for env-gated runtime probes.
-
-    /// PARO4-G128 rotate-once residual wrapper used for env-gated runtime probes.
-
-    /// PARO4-G128 fused SwiGLU rotate-once down projection.
-
-    /// PARO4-G128T rotate-once wrapper for engine-tiled qweight payloads.
-
-    /// PARO4-G128T rotate-once residual wrapper for engine-tiled qweight payloads.
-
-    /// PARO4-G128T fused SwiGLU rotate-once down projection.
 
     // ═══════════════════════════════════════════════════════════════════════════
     // Registry precompilation (profiling)
@@ -10181,6 +11015,13 @@ impl Drop for Gpu {
             return;
         }
         self.bind_thread_or_warn();
+        // Drain (via its own Drop) and free the pinned readback buffer on the owning device.
+        drop(
+            self.steady_readback_pinned
+                .get_mut()
+                .unwrap_or_else(|e| e.into_inner())
+                .take(),
+        );
         if let Err(err) = self.release_registered_vmm() {
             eprintln!("[rdna-compute] failed to release VMM arena during Gpu drop: {err}");
         }
@@ -10313,6 +11154,18 @@ impl<O> HostLeaseTable<O> {
         Ok(owner)
     }
 
+    /// Record `owner` as the shared owner of `key`, unless `key` is already recorded (then
+    /// `false` and the table is unchanged).
+    pub(crate) fn insert_shared(&mut self, key: usize, owner: std::sync::Arc<O>) -> bool {
+        match self.map.entry(key) {
+            std::collections::hash_map::Entry::Occupied(_) => false,
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(owner);
+                true
+            }
+        }
+    }
+
     /// Drop the registry's record of `key` and return its reference, if the allocation was
     /// ever leased.  `None` means NOT leased (or already released): the caller frees directly,
     /// exactly as before S1.  The returned reference is dropped by the caller; the physical
@@ -10396,6 +11249,30 @@ mod slowlink_host_lease_tests {
         assert_eq!(t.len(), 0);
         let _held = lease(&mut t, 0x2001);
         assert!(t.release(0x2000).is_none(), "another key is unaffected");
+    }
+
+    #[test]
+    fn host_lease_shared_owner_across_two_ranks_frees_once_after_both_release() {
+        // Two ranks (two tables, two device aliases) hold ONE owner of one pinned allocation.
+        // Keys are unique across this module: `FREED` is one process-wide counter.
+        let (rank0, rank1) = (0xA000, 0xA800);
+        let mut t0 = HostLeaseTable::new();
+        let mut t1 = HostLeaseTable::new();
+        let owner = lease(&mut t0, rank0);
+        assert!(t1.insert_shared(rank1, Arc::clone(&owner)));
+        assert!(
+            !t1.insert_shared(rank1, Arc::clone(&owner)),
+            "an alias is recorded once"
+        );
+        drop(owner);
+        drop(t0.release(rank0).expect("rank 0 leased"));
+        assert_eq!(freed(rank0), 0, "rank 1 still maps the pinned pages");
+        drop(t1.release(rank1).expect("rank 1 shares"));
+        assert_eq!(
+            freed(rank0),
+            1,
+            "the last rank frees the allocation exactly once"
+        );
     }
 
     #[test]
@@ -10811,10 +11688,6 @@ mod tests {
         assert_eq!(DType::MQ4G128V2.row_bytes(640), Some(5 * 68));
         assert_eq!(DType::MQ4G128V2.row_bytes(129), Some(2 * 68));
         assert_eq!(DType::MQ6G256V2.row_bytes(2560), Some(10 * 200));
-        assert_eq!(DType::ParoQ4G128.row_bytes(128), Some(72));
-        // SmolLM2-360M: K=960 is 15 G64 groups; it is not a whole number of G128 groups.
-        assert_eq!(DType::ParoQ4G64.row_bytes(960), Some(15 * 40));
-        assert_eq!(DType::ParoQ4G64.row_bytes(64), Some(40));
         assert_eq!(DType::MFP4G32E8SOA.row_bytes(2560), Some(16 + 80 + 80 * 16));
         assert_eq!(DType::MFP4G32E8.row_bytes(4096), Some(2192));
         assert_eq!(DType::MFP4G32E8SOA.row_bytes(4096), Some(2192));
@@ -11831,6 +12704,7 @@ mod tests {
     /// memset (the `grow_context_arena` contract), and every earlier step's
     /// bytes survive each later growth.
     #[test]
+    #[track_caller]
     fn vmm_grow_steps_preserve_prior_bytes_and_zero_fresh() {
         use hip_bridge::DeviceBuffer;
         let Some((mut gpu, _guard)) = try_gpu() else {
@@ -12807,11 +13681,20 @@ mod tests {
 /// the admission, allocator rounding).
 pub const PLANNED_CAPACITY_RESERVE_BYTES: usize = 512 << 20;
 
-/// Unledgered residency assumed when the kernel's per-process VRAM accounting
-/// cannot be read. Measured after load: ~3.5 GiB (A3B R9700), ~4.0 GiB (Raon
-/// R9700), ~4.9 GiB (Raon 7900 XTX); the smallest is used so the fallback is not
-/// itself the cause of a placement regression.
-pub const PLANNED_CAPACITY_FALLBACK_UNLEDGERED_BYTES: usize = 3584 << 20;
+/// Residency beyond the ledger and the HIP ring ([`HIP_RING_BYTES`]) assumed
+/// when the kernel's per-process VRAM accounting cannot be read: loaded code
+/// objects (~55 MiB for 1,039 modules, `raon/pfx/ev/xtx-resid`) and driver
+/// state. The ledger charges every allocation at its ROCr-rounded size, so the
+/// allocator rounding that this constant used to carry (3.5-4.9 GiB on
+/// A3B/Raon) is now in `own` and must not be counted twice.
+pub const PLANNED_CAPACITY_FALLBACK_UNLEDGERED_BYTES: usize = 128 << 20;
+
+/// HIP queue/ring/EOP buffer objects the runtime creates at the first stream
+/// and the fdinfo `drm-memory-vram` shows beyond every `hipMalloc`: 140.1 MiB
+/// measured on a 7900 XTX, identical with `GPU_MAX_HW_QUEUES=1`
+/// (`raon/pfx/ev/xtx-resid`, section 3 row B). Not reducible by any HIP knob
+/// tested, so it is a constant of the ledger.
+pub const HIP_RING_BYTES: usize = 140 << 20;
 
 /// This process's VRAM on the device at PCI address `bdf`, in bytes: the sum of
 /// `drm-memory-vram` over its distinct DRM clients for that device
@@ -12865,8 +13748,12 @@ pub struct PlannedCapacity {
     /// Bytes the admission plans against.
     pub bytes: usize,
     pub total: usize,
-    /// Live device bytes in this process's allocation ledger.
+    /// Live device bytes in this process's allocation ledger (rounded to the
+    /// ROCr allocation granule, slabs at their slab bytes).
     pub own: usize,
+    /// HIP queue/ring buffer objects charged on top of the ledger
+    /// ([`HIP_RING_BYTES`], or what the measured accounting shows of it).
+    pub ring: usize,
     /// Residency this process holds outside the ledger (measured, or the
     /// conservative fallback).
     pub unledgered: usize,
@@ -12886,6 +13773,7 @@ impl PlannedCapacity {
             bytes: 0,
             total,
             own,
+            ring: 0,
             unledgered: 0,
             unledgered_measured: false,
             reserve: PLANNED_CAPACITY_RESERVE_BYTES,
@@ -12893,6 +13781,12 @@ impl PlannedCapacity {
             planned,
         }
         .recomputed()
+    }
+
+    /// Account `bytes` of HIP queue/ring residency ([`HIP_RING_BYTES`]).
+    pub fn with_ring(mut self, bytes: usize) -> Self {
+        self.ring = bytes;
+        self.recomputed()
     }
 
     /// Account `bytes` of this process's residency outside the ledger.
@@ -12906,6 +13800,7 @@ impl PlannedCapacity {
         self.bytes = if self.planned {
             self.total
                 .saturating_sub(self.own)
+                .saturating_sub(self.ring)
                 .saturating_sub(self.unledgered)
                 .saturating_sub(self.reserve)
         } else {
@@ -12936,10 +13831,11 @@ impl std::fmt::Display for PlannedCapacity {
         if self.planned {
             write!(
                 f,
-                "planned={:.0} MiB (total {:.0} - own {:.0} - unledgered {:.0} ({}) - reserve {:.0}; instantaneous free {:.0} MiB ignored)",
+                "planned={:.0} MiB (total {:.0} - own {:.0} - ring {:.0} - unledgered {:.0} ({}) - reserve {:.0}; instantaneous free {:.0} MiB ignored)",
                 m(self.bytes),
                 m(self.total),
                 m(self.own),
+                m(self.ring),
                 m(self.unledgered),
                 if self.unledgered_measured { "measured, fdinfo" } else { "fallback" },
                 m(self.reserve),
@@ -12959,6 +13855,20 @@ impl std::fmt::Display for PlannedCapacity {
 mod planned_capacity_tests {
     use super::*;
     const G: usize = 1 << 30;
+    #[test]
+    fn ring_is_charged_once_and_before_reserve_ignores_it() {
+        let base = PlannedCapacity::new(20 * G, 32 * G, 8 * G, true);
+        let ringed = base.with_ring(HIP_RING_BYTES);
+        assert_eq!(ringed.bytes, base.bytes - HIP_RING_BYTES);
+        // The EP planner carries its own runtime reserve: no ring in its figure.
+        assert_eq!(ringed.before_reserve(), base.before_reserve());
+        // The measured split keeps own + ring + unledgered == the process's VRAM.
+        let vram = 8 * G + 141 * (1 << 20);
+        let beyond = vram - 8 * G;
+        let ring = HIP_RING_BYTES.min(beyond);
+        let cap = base.with_ring(ring).with_unledgered(beyond - ring, true);
+        assert_eq!(cap.own + cap.ring + cap.unledgered, vram);
+    }
     #[test]
     fn foreign_allocation_does_not_change_planned_capacity() {
         let a = PlannedCapacity::new(20 * G, 32 * G, 8 * G, true);

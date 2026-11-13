@@ -116,35 +116,6 @@ job_4b_scratch_convert() {
         --mq4
 }
 
-# ── sidecar cal jobs (gated on draft success — require MQ4 target to exist) ──
-
-sidecar_cal() {
-    local tgt=$1 sc_out=$2
-    # triattn_validate takes the model as a POSITIONAL arg, not --model.
-    # Output filename is controlled via --sidecar.
-    /root/hipfire/target/release/examples/triattn_validate \
-        "$tgt" \
-        --sidecar "$sc_out" \
-        --corpus "$CORPUS" \
-        --max-tokens 1000000 \
-        --chunk-len 1024
-}
-
-job_4b_sidecar_cal() {
-    # Uses the existing MQ4 target (not the new draft — sidecars are for
-    # the TARGET's attention, not the draft). Produces
-    # qwen3.5-4b.mq4.triattn.bin which pairs with any 4B draft.
-    local tgt=/root/models/qwen3.5-4b.mq4
-    [ -f "$tgt" ] || { echo "no target at $tgt — stage with stage_models.sh first" >&2; return 3; }
-    sidecar_cal "$tgt" "${tgt}.triattn.agentic.bin"
-}
-
-job_9b_sidecar_cal() {
-    local tgt=/root/models/qwen3.5-9b.mq4
-    [ -f "$tgt" ] || { echo "no target at $tgt — stage with stage_models.sh first" >&2; return 3; }
-    sidecar_cal "$tgt" "${tgt}.triattn.agentic.bin"
-}
-
 # ── main chain ───────────────────────────────────────────────────────
 
 echo "[chain-runner] starting chain at $(date -Is)"
@@ -152,14 +123,12 @@ echo "[chain-runner] skip_until='${SKIP_UNTIL:-<none>}'"
 
 run_if_pending 9b_scratch_25k           job_9b_scratch_25k           || exit 1
 run_if_pending 9b_scratch_convert       job_9b_scratch_convert       || exit 1
-run_if_pending 9b_sidecar_cal           job_9b_sidecar_cal           || exit 1
 
-# PAUSE POINT 2026-04-19: user wants to test 9B draft+sidecar before running
+# PAUSE POINT 2026-04-19: user wants to test 9B draft before running
 # 4B. If testing validates the pipeline, the plan is to spin up an 8× cluster
 # for Qwen3.6-A3B and others — making a 1× 4B scratch run redundant.
 # Uncomment the 4B block below only if 9B test fails and we want a 4B fallback.
 # run_if_pending 4b_scratch_25k           job_4b_scratch_25k           || exit 1
 # run_if_pending 4b_scratch_convert       job_4b_scratch_convert       || exit 1
-# run_if_pending 4b_sidecar_cal           job_4b_sidecar_cal           || exit 1
 
 echo "[chain-runner] ALL JOBS DONE at $(date -Is)"

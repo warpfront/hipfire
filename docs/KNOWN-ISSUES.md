@@ -4,6 +4,24 @@ Open problems seen in hipfire testing that are not fixed yet. Each entry says
 what was observed and on what, what was ruled out, and what to capture if you
 hit it.
 
+## Flash-Next EP2 (2xR9700) serve: 8 x ~16k-token prompts at `max_seq` 16384 are refused with HTTP 503
+
+**State:** by design with the per-expert hot set on (the default); opt-in fix available.
+
+**Symptom.** Eight concurrent requests of about 16k prompt tokens each on `hipfire serve --max-seq 16384`
+(continuous batching) answer HTTP 503 `overload` (`retryable=true`, `rolled_back=true`, message
+`provision_step: map <N> positions ... QSA context map ... failed`). The next request is served normally
+(the rank pool is not poisoned). Whole-layer placement (`HIPFIRE_QWEN4_EP_EXPERT_HOTSET=0`) serves the same burst with
+about 0.5 GiB of headroom per rank.
+
+**Cause.** The lane store is charged only its first prefill chunk of QSA context; the VMM backend commits the rest
+on demand. The per-expert unit plan fills every byte the budget leaves, so a worst-case burst of long prompts can
+no longer commit its context pages on one rank.
+
+**Workarounds.** Retry later (the 503 is retryable and frees as lanes finish), lower `--max-seq`, send fewer
+concurrent long prompts, or set `HIPFIRE_EP_UNIT_LANE_GROWTH=1` to reserve the growth (about 1.5 GiB per rank at 8 lanes x
+16384, costing about 10% of the resident experts: 6405 -> 5766 per rank).
+
 ## gfx1151 (Strix Halo): rare GPU memory fault during deep prefill
 
 **State:** measured; root cause unresolved. One occurrence in 41 deep

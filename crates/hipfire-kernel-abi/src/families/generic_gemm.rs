@@ -18,7 +18,7 @@
 //! | [`EMBEDDING_Q8_BATCHED`] | `embedding_q8_batched` (gfx1201, gfx1100) | `Gpu::embedding_lookup_q8_batched` (`crates/rdna-compute/src/embedding.rs`) |
 //! | [`MOE_GROUPED_QT44_A8_SYM`] | `moe_grouped_qt44_a8_sym_gfx1201_nt{1,2}r{1,2}` (gfx1201) | `Gpu::gemm_mq4g256v2_moe_grouped_a8_sym` (`crates/rdna-compute/src/moe_grouped_qt44_iu4.rs`) |
 //! | [`MOE_GROUPED_QT44_IU4_SYM`] | `moe_grouped_qt44_iu4_sym_gfx1201_nt{1,2,4}r{1,2}` (gfx1201) | `Gpu::gemm_mq4g256v2_moe_grouped_iu4_sym` (same file) |
-//! | [`MOE_GROUPED_QT44_A8_SYM_XLDS`] | `moe_grouped_qt44_a8_sym_gfx1201_xlds_nt4r1w8` (gfx1201, `HIPFIRE_MOE_A8_XLDS`, default off) | same launcher, X-in-LDS body (own module) |
+//! | [`MOE_GROUPED_QT44_A8_SYM_XLDS`] | `moe_grouped_qt44_a8_sym_gfx1201_xlds_nt4r1w8` (gfx1201, `HIPFIRE_MOE_A8_XLDS`, default on) | same launcher, X-in-LDS body (own module) |
 //!
 //! Evidence for every layout: the JIT-cached objects in `~/.hipfire_kernels/<arch>/` (clang offload
 //! bundles; unbundled with `clang-offload-bundler --type=o --targets=hipv4-amdgcn-amd-amdhsa--<arch>`,
@@ -77,6 +77,20 @@ pub const NUMERIC_F32_LANE_STRIDED: NumericContractId =
 /// Q8_0 weight x F32 activation GEMV, 8-block unrolled lane-strided FMA, `shfl_down` tree.
 pub const NUMERIC_GEMV_Q8_0: NumericContractId =
     NumericContractId("generic_gemm.gemv_q8_0.f32_lane_strided.shfl_tree32");
+/// MQ8G256 weight (f16 scale + int8[256] per 256-group) x pre-rotated int8 activation planes (one f32
+/// scale per 256): exact int32 `sdot4` pair per 8-byte lane slice, `acc[g % 4] = fmaf(ws * xs, (float)dot,
+/// acc[g % 4])` over the 4-group quads (tail groups into `acc[0]`), `(a0 + a1) + (a2 + a3)`, `shfl_down` tree.
+/// `gemv_mq8g256` uses it.
+pub const NUMERIC_GEMV_MQ8G256: NumericContractId =
+    NumericContractId("generic_gemm.gemv_mq8g256.sdot4_int32_group_fma4.shfl_tree32");
+
+/// MQ8G256 weights `[M, K/256] x 258 B` (f16 scale then int8[256]; the 256 codes start at a 2 mod 4 byte
+/// address on even groups of a 4-aligned row).
+pub const FORMAT_MQ8G256_258: FormatId = FormatId("mq8g256.rows_x_258b_groups");
+/// Pre-rotated int8 activation codes `[rows][K]` (`mq8_rotate_quantize_x`, one row per launch).
+pub const FORMAT_MQ8_X_Q8_ROWS: FormatId = FormatId("mq8g256.x_q8.rows_x_k");
+/// Activation group scales `[rows][K/256]` f32.
+pub const FORMAT_MQ8_X_SCALES_ROWS: FormatId = FormatId("mq8g256.x_scales.rows_x_k256");
 /// `f32(half(scale)) * f32(i8)` exact product stored as f32.
 pub const NUMERIC_EMBEDDING_Q8_0: NumericContractId =
     NumericContractId("generic_gemm.embedding_q8_0.f32_dequant");
@@ -1401,6 +1415,147 @@ pub static WORK_GEMV_Q8_0: WorkSpecV1 = WorkSpecV1 {
 };
 
 // ================================================================================================
+// gemv_mq8g256
+// ================================================================================================
+
+const PARAMS_GEMV_MQ8: &[ParamV1] = &[
+    param("M", "weight rows (grid x, one 32-lane block per row)"),
+    param("K", "row length in elements, a multiple of 256"),
+];
+
+const MQ8_WEIGHT_EXTENT: Expr = Expr::Mul(&[P_M, Expr::DivExact(&P_K, 256), Expr::Const(258)]);
+
+const OPS_GEMV_MQ8: &[OperandV1] = &[
+    OperandV1 {
+        name: "A",
+        format: FORMAT_MQ8G256_258,
+        access: Access::ReadOnly,
+        align: 2,
+        extent: Some(MQ8_WEIGHT_EXTENT),
+        nullable: false,
+        note: "MQ8G256 rows `[M, K/256] x 258 B`; scale read bytewise, codes as dwords at `+2` (2-byte phase)",
+    },
+    OperandV1 {
+        name: "x_q8",
+        format: FORMAT_MQ8_X_Q8_ROWS,
+        access: Access::ReadOnly,
+        align: 4,
+        extent: Some(P_K),
+        nullable: false,
+        note: "int8 pre-rotated activation codes `[K]`, dword loads at `8 * lane`",
+    },
+    OperandV1 {
+        name: "x_scales",
+        format: FORMAT_MQ8_X_SCALES_ROWS,
+        access: Access::ReadOnly,
+        align: 4,
+        extent: Some(Expr::Mul(&[Expr::DivExact(&P_K, 256), Expr::Const(4)])),
+        nullable: false,
+        note: "f32 group scales `[K/256]`",
+    },
+    OperandV1 {
+        name: "y",
+        format: FORMAT_F32_FLAT,
+        access: Access::WriteOnly,
+        align: 4,
+        extent: Some(Expr::Mul(&[P_M, Expr::Const(4)])),
+        nullable: false,
+        note: "F32 output `[M]`, lane 0 of each block stores its row",
+    },
+];
+
+const FIELDS_GEMV_MQ8: &[FieldV1] = &[
+    ptr_field("A", 0, "A"),
+    ptr_field("x_q8", 8, "x_q8"),
+    ptr_field("x_scales", 16, "x_scales"),
+    ptr_field("y", 24, "y"),
+    i32_field("M", 32, P_M),
+    i32_field("K", 36, P_K),
+];
+
+const DOMAIN_GEMV_MQ8: &[DomainRuleV1] = &[
+    rule(Rule::Positive(P_M), "no output rows"),
+    rule(Rule::Positive(P_K), "empty reduction"),
+    rule(
+        Rule::MultipleOf(P_K, 256),
+        "the kernel iterates K/256 whole 258 B groups and drops a tail (q_b K=576 stays Q8F16)",
+    ),
+];
+
+/// `gemv_mq8g256` (`kernels/src/gemv_mq8g256.hip`): args `A@0 x_q8@8 x_scales@16 y@24`, `M@32 K@36` by
+/// value, kernarg segment 40 / align 8, no hidden words, LDS 0, block 32.
+pub static GEMV_MQ8G256: KernelAbiV1 = KernelAbiV1 {
+    id: "generic_gemm.gemv_mq8g256.i8x",
+    version: 1,
+    wave: 32,
+    numeric: NUMERIC_GEMV_MQ8G256,
+    params: PARAMS_GEMV_MQ8,
+    operands: OPS_GEMV_MQ8,
+    fields: FIELDS_GEMV_MQ8,
+    hidden: &[],
+    explicit_bytes: 40,
+    segment_bytes: 40,
+    segment_align: 8,
+    domain: DOMAIN_GEMV_MQ8,
+    exports: &[
+        ExportV1 {
+            symbol: "gemv_mq8g256",
+            arch: Arch::Gfx1201,
+            object: ObjectRefV1::HipccSource {
+                module: "gemv_mq8g256",
+                source: "kernels/src/gemv_mq8g256.hip",
+            },
+            block: [32, 1, 1],
+            dynamic_lds: 0,
+            group_segment_fixed: 0,
+            grid: [P_M, ONE, ONE],
+            consts: &[],
+        },
+        ExportV1 {
+            symbol: "gemv_mq8g256",
+            arch: Arch::Gfx1100,
+            object: ObjectRefV1::HipccSource {
+                module: "gemv_mq8g256",
+                source: "kernels/src/gemv_mq8g256.hip",
+            },
+            block: [32, 1, 1],
+            dynamic_lds: 0,
+            group_segment_fixed: 0,
+            grid: [P_M, ONE, ONE],
+            consts: &[],
+        },
+    ],
+};
+
+const BIND_GEMV_MQ8: &[BindV1] = &[BindV1 {
+    param: "K",
+    source: BindSource::Weight {
+        by: "M",
+        by_axis: WeightAxis::Rows,
+        codecs: &["mq8g256"],
+        stacking: Stacking::Single,
+        fuse_siblings: false,
+    },
+}];
+
+pub static WORK_GEMV_MQ8G256: WorkSpecV1 = WorkSpecV1 {
+    abi: &GEMV_MQ8G256,
+    work: WorkV1 {
+        op_class: op_class::GEMV,
+        codec: "mq8g256",
+        pipe: Pipe::ValuF32,
+        macs: Some(Expr::Mul(&[P_M, P_K])),
+        flops: None,
+        bytes: None,
+        rows: None,
+        admit: ALL_ROWS,
+        bind: BIND_GEMV_MQ8,
+        note: "One pre-rotated activation row (the rotate + quantize producer is its own node). Integer dp4a \
+               MACs with an f32 group fold; charged to the VALU pipe. Bytes = weight + x planes + y extents.",
+    },
+};
+
+// ================================================================================================
 // embedding_q8_batched
 // ================================================================================================
 
@@ -1971,7 +2126,7 @@ const A8_XLDS_SRC: &str = "kernels/src/moe_grouped_qt44_a8_sym_xlds.gfx12.hip";
 const A8_XLDS_MODULE: &str = "moe_grouped_qt44_a8_sym_xlds_gfx12";
 
 /// W4A8 grouped routed experts, X-in-LDS body (`Gpu::gemm_mq4g256v2_moe_grouped_a8_sym` behind
-/// `HIPFIRE_MOE_A8_XLDS`, default OFF, gfx1201 only): ONE export in its own module
+/// `HIPFIRE_MOE_A8_XLDS`, default ON, gfx1201 only): ONE export in its own module
 /// (`kernels/src/moe_grouped_qt44_a8_sym_xlds.gfx12.hip`; the `nt{1,2}r{1,2}` module is untouched). Kernarg layout,
 /// operands, fields, numerics and domain are those of [`MOE_GROUPED_QT44_A8_SYM`] (72 B, `n_experts@68`, no hidden
 /// words): the arithmetic is identical (bit-identical output, card-proven at every row class), only the data movement
@@ -2017,12 +2172,12 @@ const ADMIT_QT44_A8_XLDS: RowDomainV1 = RowDomainV1 {
     kill_env: Some("HIPFIRE_MOE_A8_XLDS"),
 };
 
-/// The A8 work, admitted behind `HIPFIRE_MOE_A8_XLDS` (default off) from `MOE_A8_XLDS_MIN_ROWS` grouped rows.
+/// The A8 work, admitted behind `HIPFIRE_MOE_A8_XLDS` (default on; `0` kills) from `MOE_A8_XLDS_MIN_ROWS` grouped rows.
 pub static WORK_MOE_GROUPED_QT44_A8_SYM_XLDS: WorkSpecV1 = WorkSpecV1 {
     abi: &MOE_GROUPED_QT44_A8_SYM_XLDS,
     work: WorkV1 {
         admit: ADMIT_QT44_A8_XLDS,
-        note: "X-in-LDS body of the W4A8 route (default OFF, gfx1201): same work, bindings (routed `rows`/`tokens` \
+        note: "X-in-LDS body of the W4A8 route (default ON, gfx1201): same work, bindings (routed `rows`/`tokens` \
                from `m_total`, expert K match) and lower-bound byte model as the A8 contract; bit-identical output. \
                Replaces the `select_entry_a8` entry when `HIPFIRE_MOE_A8_XLDS=1`, `M % 128 == 0` and `m_total >= \
                MOE_A8_XLDS_MIN_ROWS`; block 256, dynamic LDS 17920, grid (M/128, m_total/16).",
@@ -2047,6 +2202,7 @@ pub static ABIS: &[&KernelAbiV1] = &[
     &GEMM_BF16_XBF16_SMALL_ROWS_S4,
     &GEMM_BF16_XBF16_SMALL_ROWS_S8,
     &GEMV_Q8_0,
+    &GEMV_MQ8G256,
     &EMBEDDING_Q8_BATCHED,
     &MOE_GROUPED_QT44_A8_SYM,
     &MOE_GROUPED_QT44_IU4_SYM,
@@ -2068,6 +2224,7 @@ pub static WORK: &[&WorkSpecV1] = &[
     &WORK_GEMM_BF16_XBF16_SMALL_ROWS_S4,
     &WORK_GEMM_BF16_XBF16_SMALL_ROWS_S8,
     &WORK_GEMV_Q8_0,
+    &WORK_GEMV_MQ8G256,
     &WORK_EMBEDDING_Q8_BATCHED,
     &WORK_MOE_GROUPED_QT44_A8_SYM,
     &WORK_MOE_GROUPED_QT44_IU4_SYM,
@@ -2196,7 +2353,7 @@ mod tests {
 
     #[test]
     fn every_contract_self_checks() {
-        assert_eq!(ABIS.len(), 17);
+        assert_eq!(ABIS.len(), 18);
         for abi in ABIS {
             if let Err(e) = abi.self_check() {
                 panic!("{}: {e:#?}", abi.id);

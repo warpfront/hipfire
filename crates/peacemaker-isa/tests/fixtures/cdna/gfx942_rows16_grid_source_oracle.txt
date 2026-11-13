@@ -1,0 +1,17 @@
+[hip-bridge] GPU_PINNED_MIN_XFER_SIZE=100000: pageable weight copies staged out of reclaim
+GPU dev 0: gfx942 (205.8 GB VRAM, HIP 7.16)
+  pre-compiled kernels: /scratch/quant/fn-fp8/beat/WC8/twine/kcache/gfx942
+[rocblas] loaded for gfx942
+module arm: hipcc source (module qwen4_g942_rows16_grid)
+  gemm_bf16_mfma_gfx942: hipcc compiled (gfx942, key 6115def4e25ca750)
+  qwen4_g942_rows16_grid: hipcc compiled (gfx942, key 59d2b2215f4a7f40)
+HC down (M=320 K=10240): cumulative PASS 80 FAIL 0
+members [320, 320]: cumulative PASS 176 FAIL 0
+members [320, 48, 1]: cumulative PASS 272 FAIL 0
+members [320, 16, 17, 33]: cumulative PASS 368 FAIL 0
+members [4, 4, 4, 4]: cumulative PASS 464 FAIL 0
+members [1]: cumulative PASS 560 FAIL 0
+members [17]: cumulative PASS 656 FAIL 0
+K tails: cumulative PASS 770 FAIL 0
+RESULT cases PASS 770 FAIL 0 | controls DETECTED 17 MISSED 0
+PASS

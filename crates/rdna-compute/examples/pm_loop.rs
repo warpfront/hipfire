@@ -181,7 +181,9 @@
 //!
 //! Kernel knobs and shape grammar: see the doc comment of `pm_loop/qkvzaset.rs` (`--kernel qkvzaset`, the fused
 //! verify GDN projection, 120-byte ABI, identity vs the shipped `_b1s`/`_v64` export) and of `pm_loop/iu4.rs`
-//! (`--kernel iu4_gemm`), `pm_loop/mq6.rs` (`--kernel mq6_i8_gemm`), `pm_loop/fp8.rs`
+//! (`--kernel iu4_gemm`; `--epi qkvzagdn`, the 27B prefill fused GDN projection, is `pm_loop/qkvzagdn.rs`: 120-byte
+//! ABI through the `hipfire-kernel-abi` contract `families::iu4_gdn`, every output buffer judged byte for byte against the
+//! shipped `_b1`/`_b1s` export, record `correctness.identity_by_buffer`), `pm_loop/mq6.rs` (`--kernel mq6_i8_gemm`), `pm_loop/fp8.rs`
 //! (`--kernel fp8_gemm`), `pm_loop/fa.rs` (`--kernel fa_prefill`) and `pm_loop/moe.rs`
 //! (`--kernel qwen4_moe_sym`).
 //!
@@ -193,6 +195,12 @@
 //!   --max-secs 900 --owner PmLoop -- target/release/examples/pm_loop \
 //!   --kernel iu4_gemm --fold k128 --tile 256x128x16 --epi set \
 //!   --shape M=17408,N=512,K=5120 --time 50 --rounds 6
+//! ```
+//! The 27B prefill fused GDN projection (QKV + Z + beta + alpha + `gdn_chunk_prep` epilogue), the shipped `_b1` export as
+//! its own candidate, every output buffer judged byte for byte (`correctness.identity_by_buffer`):
+//! ```text
+//! pm_loop --kernel iu4_gemm --epi qkvzagdn --shape N=512,K=5120
+//! pm_loop --kernel iu4_gemm --epi qkvzagdn --alayout slab --rip crates/peacemaker-isa/src/kernels/iu4_gemm_fine.rip --shape N=4096
 //! ```
 //! 2:4-sparse candidate vs the shipped dense kernel (pruned weights), and a `.rip` candidate:
 //! ```text
@@ -231,6 +239,8 @@ mod moe_verify_iu4;
 mod mq6;
 #[path = "pm_loop/prod.rs"]
 mod prod;
+#[path = "pm_loop/qkvzagdn.rs"]
+mod qkvzagdn;
 #[path = "pm_loop/qkvzaset.rs"]
 mod qkvzaset;
 #[path = "pm_loop/rotate.rs"]
@@ -1397,7 +1407,7 @@ fn run(o: &mut Opts) -> (Value, Outcome) {
     }
 
     // 3. correctness on the card
-    let gpu = match Gpu::init() {
+    let mut gpu = match Gpu::init() {
         Ok(g) => g,
         Err(e) => return fail(rec, "gpu_init", err(e)),
     };
@@ -1471,8 +1481,21 @@ fn run(o: &mut Opts) -> (Value, Outcome) {
         "output_bytes": cand_out.len(),
         "emu": emu_field,
     });
-    // `--flush`: the arms must also agree on every member of the weight pool.
+    let detail = w.identity_detail(&base_out, &cand_out);
+    if !detail.is_null() {
+        rec["correctness"]["identity_by_buffer"] = detail;
+    }
+    // The product launcher on the same inputs must reproduce the shipped baseline's bytes.
     let mut pass = pass;
+    let product = w.product_oracle(&mut gpu, &base_out);
+    if !product.is_null() {
+        if product["pass"] != json!(true) {
+            pass = false;
+            rec["correctness"]["pass"] = json!(false);
+        }
+        rec["correctness"]["product_launcher"] = product;
+    }
+    // `--flush`: the arms must also agree on every member of the weight pool.
     if w.pool_sets() > 1 {
         match pool_identity(&gpu, &*w, &bf, &cf) {
             Ok(p) => {

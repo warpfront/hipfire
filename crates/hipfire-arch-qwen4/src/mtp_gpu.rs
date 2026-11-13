@@ -11,10 +11,12 @@
 
 use crate::config::Qwen4Config;
 use crate::gpu_forward::{
-    dense_ref, hyper_desc, hyper_read_desc, program_dims, qsa_desc, seal_moe_decode, MtpEpGather,
-    Qwen4EpDummyExpert, Qwen4GpuForwardError, Qwen4MoeLayerRuntime, Qwen4MoeScratch,
+    dense_ref, hyper_desc, hyper_read_desc, program_dims, qsa_desc, seal_moe_decode, seal_moe_rows,
+    MtpEpGather, Qwen4EpDummyExpert, Qwen4GpuForwardError, Qwen4MoeLayerRuntime, Qwen4MoeScratch,
+    Qwen4PeerLayerSource,
 };
 use crate::kv_backend::{Qwen4ContextCommit, Qwen4KvBackend};
+use crate::lane_token_ring::LaneTokenRing;
 use crate::program::{
     Qwen4FfnDims, Qwen4HyperReadWeights, Qwen4HyperWriteWeights, Qwen4QsaWeights,
     QWEN4_QSA_KERNEL_ROPE_THETA,
@@ -28,10 +30,10 @@ use hipfire_dispatch::pipeline::gated_mlp::{
     Activation, GatedMlpOp, GatedMlpScratch, MlpLadder, MlpOutput, MlpStorage,
 };
 use hipfire_dispatch::pipeline::{
-    execute_validated_steps, validate_steps, BroadcastAddOp, ClearOp, DraftHead, DraftHeadLayout,
-    DraftHeadPolicy, DraftHeadRequestState, EmbeddingOp, HyperNormOp, HyperReadOp, HyperWriteOp,
-    IndexedAttentionMode, IndexedAttentionOp, IndexedAttentionState, MixerPhase, ProjectLadder,
-    ProjectOp, Step,
+    execute_validated_steps, g942_bf16_few_rows_invariant, validate_steps, BroadcastAddOp, ClearOp,
+    DraftHead, DraftHeadLayout, DraftHeadPolicy, DraftHeadRequestState, EmbeddingOp, HyperNormOp,
+    HyperReadOp, HyperWriteOp, IndexedAttentionMode, IndexedAttentionOp, IndexedAttentionState,
+    MixerPhase, ProjectLadder, ProjectOp, Step,
 };
 use hipfire_dispatch::types::DispatchError;
 use hipfire_runtime::kv_backend::{
@@ -40,11 +42,12 @@ use hipfire_runtime::kv_backend::{
 use hipfire_runtime::session_cache::{RowStream, StateLayout};
 use hipfire_runtime::spec::SpecGrammar;
 use rdna_compute::tensor_ops::{
-    hc_activation_fused_f32, hyper_norm, hyper_read_projected, indexed_attention_append_prologue,
-    indexed_attention_pool_rope_incremental, HcActivationFused, HyperNorm, HyperReadProjected,
-    IndexedAttentionAppendPrologue, IndexedAttentionPoolRope, QsaKvFormat, QsaPositionBinding,
+    copy_regions, hc_activation_fused_f32, hyper_norm, hyper_read_projected,
+    indexed_attention_append_prologue, indexed_attention_pool_rope_incremental, CopyRegion,
+    HcActivationFused, HyperNorm, HyperReadProjected, IndexedAttentionAppendPrologue,
+    IndexedAttentionPoolRope, QsaKvFormat, QsaPositionBinding,
 };
-use rdna_compute::{DType, Gpu, GpuTensor};
+use rdna_compute::{DType, Gpu, GpuTensor, MemsetBatch};
 use smallvec::SmallVec;
 use std::fmt;
 
@@ -53,6 +56,159 @@ use std::fmt;
 const MTP_APPEND_BRANCHES: usize = 4;
 /// Rows of every MTP HC read and write: one token.
 const MTP_HC_ROWS: usize = 1;
+/// Most lanes one batched head round (`Qwen4MtpGpu::forward_rows_deferred`) carries in one
+/// call by default: the EP row gather's capacity and the few-row route's limit
+/// (`LANE_MAX_DRAFTS` is 7). Every load but exact single-device gfx942 keeps it
+/// ([`load_draft_call_rows`]).
+pub(crate) const MTP_DRAFT_LANES_MAX: usize = 8;
+
+/// Most lanes one batched head call carries on an exact gfx942 single-device load
+/// ([`load_draft_call_rows`]): the head's row stages (HC, dense projections, the grouped FP8
+/// MoE call, glue) run once over up to 32 rows, so a 32-lane draft round is one call instead
+/// of four. Each lane's bytes stay its serial one-row step's: the gfx942 routes the stages take
+/// past 8 rows are row-invariant (ascending-K MFMA chains, the grouped FP8 MoE, the
+/// x-batched lm-head launcher chunked at its 8-row kernel width).
+pub(crate) const MTP_DRAFT_LANES_MAX_GFX942: usize = 32;
+
+/// Rows the head's per-call buffers are sized for ([`MtpRowsScratch`], the head MoE grouping
+/// reservation) and the widest call [`load_draft_call_rows`] can pick. The device byte census
+/// (`MtpRowsScratch::device_bytes`, `Qwen4MtpGpu::device_bytes`) has no GPU, so it keys on the
+/// profile: the stock-FP8 profile is admitted on exact single-device gfx942 only
+/// (`Qwen4Admission`: `Fp8ExpertsUnsupported`, `Fp8SingleDeviceOnly`), every other profile is
+/// sized for [`MTP_DRAFT_LANES_MAX`] rows. The allocation and the census use this one function,
+/// so the load ledger is exact for every load.
+pub(crate) fn draft_call_capacity(config: &Qwen4Config) -> usize {
+    if config.profile.is_stock_fp8() {
+        MTP_DRAFT_LANES_MAX_GFX942
+    } else {
+        MTP_DRAFT_LANES_MAX
+    }
+}
+
+/// The widest batched head call of this load, decided once when the rows scratch is allocated:
+/// the scratch's [`draft_call_capacity`] on exact gfx942 with the head not expert-parallel
+/// (`ep_bound`; the sharded-MoE pass and the lane-local head exist under EP only), else
+/// [`MTP_DRAFT_LANES_MAX`]. Never above the capacity the scratch was sized for.
+pub(crate) fn load_draft_call_rows(gpu: &Gpu, config: &Qwen4Config, ep_bound: bool) -> usize {
+    call_rows_for(
+        draft_call_capacity(config),
+        gpu.arch_caps.is_gfx942(),
+        ep_bound,
+    )
+}
+
+/// [`load_draft_call_rows`]' pure rule.
+fn call_rows_for(capacity: usize, exact_gfx942: bool, ep_bound: bool) -> usize {
+    if exact_gfx942 && !ep_bound {
+        capacity
+    } else {
+        MTP_DRAFT_LANES_MAX
+    }
+}
+
+/// `HIPFIRE_QWEN4_DRAFT_SHARDED_MOE` (developer; default on, exactly `0`
+/// disables and restores the X2 / replicated path byte for byte): with X2
+/// active, a batched draft pass (two to eight ops in the root's round, every
+/// op owned by a rank) keeps each rank's dense and attention work on its owned
+/// rows but runs the head's MoE once over ALL the round's rows on both ranks:
+/// each rank publishes its owner rows' MoE input, both all-gather it into the
+/// root's op order, and the existing replicated EP MoE call (compact tables,
+/// row-gather hook) runs over those rows; each rank keeps its own rows' FFN
+/// output. See [`S4Round`].
+pub(crate) const DRAFT_SHARDED_MOE_ENV: &str = "HIPFIRE_QWEN4_DRAFT_SHARDED_MOE";
+
+/// Whether the sharded draft MoE pass is on ([`DRAFT_SHARDED_MOE_ENV`], default
+/// on; exactly `0` disables).
+pub(crate) fn draft_sharded_moe_enabled() -> bool {
+    hipfire_config::developer_bool(DRAFT_SHARDED_MOE_ENV, true)
+}
+
+/// One sharded-MoE draft pass (S4), the same on every rank: `g` global rows
+/// (the root's ops of the round, in order) of which row `s` is owned by rank
+/// `(owners >> s) & 1` (two ranks). A rank's own rows are its ops in that order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct S4Round {
+    pub(crate) g: usize,
+    pub(crate) owners: u8,
+    pub(crate) rank: usize,
+}
+
+impl S4Round {
+    /// Global row indices of this rank's own rows, ascending.
+    pub(crate) fn own_rows(&self) -> SmallVec<[usize; MTP_DRAFT_LANES_MAX]> {
+        (0..self.g)
+            .filter(|&s| usize::from((self.owners >> s) & 1) == self.rank)
+            .collect()
+    }
+}
+
+/// Env switch of the batched head rounds: `HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS=1`.
+/// Default off; unset, `0` or anything else leaves the head's scratch and
+/// every code path exactly as without the feature. Read at load (the rows
+/// scratch is allocated then) and at every batched call.
+pub(crate) const MTP_DRAFT_ROUNDS_ENV: &str = "HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS";
+
+mod rows;
+pub(crate) use rows::{DraftRow, MtpRowsScratch};
+mod fp8_moe;
+#[cfg(feature = "lab")]
+pub use fp8_moe::LabHeadRouting;
+pub(crate) use fp8_moe::MtpFp8MoeScratch;
+#[cfg(feature = "lab")]
+mod lab;
+#[cfg(feature = "lab")]
+mod lab_expert_trace;
+
+/// The row gather of a lane-local head MoE call (an owned draft lane, see
+/// [`Qwen4MtpGpu::set_lane_local`]). The lane-local head runtime's expert
+/// table names every expert's bytes (this rank's compact tensors, the peer's
+/// through UVA), so the rows a slot needs are computed on this rank and there
+/// is nothing to exchange: `gather_rows` does no device work and no host
+/// rendezvous. It stays an installed `row_gather` (`Some`) so the lowering
+/// keeps every stage, kernel and buffer role of the EP head call (the unfused
+/// shared down, the canonical slot-order combine).
+///
+/// The other answers are exactly `Qwen4EpRowGatherHook`'s (`ep.rs`) for a
+/// head layer index (`num_hidden_layers + parity`, at or past the trunk
+/// layers): the head is never a balanced layer (`assigns_owners` false) and
+/// has no fixed reduction partition (`None`: its HC writes are local, the
+/// combine folds every expert); `decode_step_end` and `release_gpu` are the
+/// trait's no-ops, as the hook's tail is only ever driven by trunk windows.
+pub(crate) struct LaneLocalRowGather<'a> {
+    /// The forward's EP row gather this call stands in for: told about the call
+    /// (`note_local_call`, the D2 tail's deferred-fill issue point) at the point
+    /// its gather would run. `None` only in tests.
+    pub(crate) ep: Option<&'a (dyn MoeRowGather + Send + Sync)>,
+}
+
+impl MoeRowGather for LaneLocalRowGather<'_> {
+    fn gather_rows(
+        &self,
+        gpu: &mut Gpu,
+        layer_idx: u16,
+        slots: usize,
+        _down_expanded: &GpuTensor,
+        topk_indices: &GpuTensor,
+    ) -> Result<(), String> {
+        if let Some(ep) = self.ep {
+            ep.note_local_call(gpu, layer_idx, slots, topk_indices);
+        }
+        Ok(())
+    }
+
+    fn assigns_owners(&self, _layer_idx: u16) -> bool {
+        false
+    }
+
+    fn reduction_partition(&self, _layer_idx: u16) -> Option<(usize, usize)> {
+        None
+    }
+
+    fn decode_step_end(&self, _gpu: &mut Gpu) {}
+
+    fn release_gpu(&self, _gpu: &mut Gpu) {}
+}
+
 /// Metadata words of an MTP head session snapshot: the boundary-row word
 /// (the boundary position plus one, or 0) and the state mark.
 const MTP_SESSION_WORDS: usize = 7;
@@ -131,6 +287,81 @@ pub(crate) fn prompt_fill_uses_rows(det: bool, rows: usize) -> bool {
 fn det_dense_shape_ok(m: usize, k: usize, n: usize) -> bool {
     m != 0 && m % 16 == 0 && k != 0 && k % 64 == 0 && n >= 1
 }
+
+/// `HIPFIRE_QWEN4_MTP_TOKEN_RING` (default on; `0` restores the blocking
+/// `Gpu::upload_stream_ordered` of every head step's token ids): whether the
+/// token ids stage through a pinned, event-fenced [`LaneTokenRing`] and enqueue
+/// on the active stream without a host stream synchronize. Read once, when a
+/// scratch is built.
+pub const MTP_TOKEN_RING_ENV: &str = "HIPFIRE_QWEN4_MTP_TOKEN_RING";
+
+/// Pinned slots of an MTP token ring. A head round uploads up to about nine
+/// times between two host waits at the widest served shape, so the ring must
+/// not wrap inside one step: a slot is reused only long after its copy ran.
+const MTP_TOKEN_RING_SLOTS: usize = 16;
+
+/// The token ring of a scratch uploading at most `capacity` bytes, or `None`
+/// when [`MTP_TOKEN_RING_ENV`] is `0`.
+fn new_token_ring(capacity: usize) -> Option<LaneTokenRing> {
+    hipfire_config::developer_bool(MTP_TOKEN_RING_ENV, true)
+        .then(|| LaneTokenRing::with_slots(capacity, MTP_TOKEN_RING_SLOTS))
+}
+
+/// Upload `bytes` (token ids) into `dst`. With a ring, on the steady copy
+/// stream and outside graph capture / replay recording, the copy stages
+/// through a pinned slot and is enqueued without a host synchronize (the slot
+/// is fenced by its own event). Every other case keeps
+/// `Gpu::upload_stream_ordered`: a captured or recorded copy would bake the
+/// host pointer, and with no steady copy stream the blocking copy is the
+/// ordering.
+fn upload_token_ids(
+    ring: Option<&mut LaneTokenRing>,
+    gpu: &Gpu,
+    dst: &hip_bridge::DeviceBuffer,
+    bytes: &[u8],
+) -> Result<(), MtpGpuError> {
+    match ring {
+        Some(ring)
+            if gpu.steady_copy_stream().is_some()
+                && !gpu.graphs.capture_mode
+                && !gpu.replay.is_recording() =>
+        {
+            ring.stage(gpu, bytes.len())?.copy_from_slice(bytes);
+            ring.upload(gpu, dst, bytes.len())?;
+        }
+        _ => gpu.upload_stream_ordered(dst, bytes)?,
+    }
+    Ok(())
+}
+
+/// D2D copies `(source, destination, bytes)` between distinct, non-overlapping tensors. With
+/// `HIPFIRE_QWEN4_DRAFT_GLUE_FOLD` the copies are ONE `copy_regions_u32` launch (a pure word
+/// copy per region; a region that is not 4-byte aligned takes the plain copy), else one
+/// `copy_d2d` launch each. The bytes written are the same either way.
+fn copy_tensors(
+    gpu: &mut Gpu,
+    pairs: &[(&GpuTensor, &GpuTensor, usize)],
+) -> Result<(), MtpGpuError> {
+    if pairs.len() > 1 && gpu.flags.qwen4_draft_glue_fold_enabled() {
+        let regions: SmallVec<[CopyRegion<'_>; MTP_DRAFT_LANES_MAX]> = pairs
+            .iter()
+            .map(|&(source, destination, bytes)| CopyRegion {
+                dst: &destination.buf,
+                dst_offset: 0,
+                src: &source.buf,
+                src_offset: 0,
+                bytes,
+            })
+            .collect();
+        copy_regions(gpu, &regions)?;
+    } else {
+        for &(source, destination, bytes) in pairs {
+            gpu.copy_d2d(source, destination, bytes)?;
+        }
+    }
+    Ok(())
+}
+
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_MTP_MODEL_ID: AtomicU64 = AtomicU64::new(1);
@@ -143,50 +374,76 @@ fn invalid(message: impl Into<String>) -> MtpGpuError {
     MtpGpuError::Invalid(message.into())
 }
 
-/// One-row HC read of the MTP streams into `hc_mixed`.
+/// The tensors the head's row stages read and write. [`MtpGpuScratch`] (one
+/// row, [`MTP_HC_ROWS`]) and [`rows::MtpRowsScratch`] (up to the load's
+/// [`load_draft_call_rows`] lanes) each lend one, so the stage sequences are
+/// written once and take the row count as a parameter.
+#[derive(Clone, Copy)]
+struct HeadRowTensors<'a> {
+    token_ids: &'a GpuTensor,
+    embedding_rot: &'a GpuTensor,
+    token_embedding: &'a GpuTensor,
+    embedding_norm: &'a GpuTensor,
+    hidden_norm: &'a GpuTensor,
+    projected_embedding: &'a GpuTensor,
+    projected_hidden: &'a GpuTensor,
+    wide: &'a GpuTensor,
+    hc_normalized: &'a GpuTensor,
+    hc_low: &'a GpuTensor,
+    hc_up: &'a GpuTensor,
+    hc_mixed: &'a GpuTensor,
+    hc_gates: &'a GpuTensor,
+    rotation: &'a GpuTensor,
+    ffn_output: &'a GpuTensor,
+}
+
+/// HC read of `rows` rows of the MTP streams into `hc_mixed`.
 fn hc_read<'a>(
     read: &Qwen4HyperReadWeights<'a>,
-    scratch: &'a MtpGpuScratch,
+    t: &HeadRowTensors<'a>,
     config: &Qwen4Config,
+    rows: usize,
 ) -> HyperReadOp<'a> {
     HyperReadOp {
         state_bf16: false,
-        input: &scratch.wide,
+        input: t.wide,
         norm_weight: read.norm,
         input_mix_down: read.input_mix_down,
         input_mix_up: read.input_mix_up,
-        normalized: &scratch.hc_normalized,
-        low: &scratch.hc_low,
-        up: &scratch.hc_up,
-        mixed: &scratch.hc_mixed,
-        rows: MTP_HC_ROWS,
+        normalized: t.hc_normalized,
+        low: t.hc_low,
+        up: t.hc_up,
+        mixed: t.hc_mixed,
+        rows,
         branches: config.hc_count,
         hidden: config.hidden_size,
         low_rank: config.hc_lowrank,
-        rotation: &scratch.rotation,
+        rotation: t.rotation,
     }
 }
 
-/// One-row HC write of `mixed` into the MTP streams, in place.
+/// HC write of `mixed` (`rows` rows) into the MTP streams, in place.
 fn hc_write<'a>(
     write: &Qwen4HyperWriteWeights<'a>,
     mixed: &'a GpuTensor,
-    scratch: &'a MtpGpuScratch,
+    t: &HeadRowTensors<'a>,
     config: &Qwen4Config,
+    rows: usize,
 ) -> HyperWriteOp<'a> {
     HyperWriteOp {
+        ar: None,
         state_bf16: false,
-        input: &scratch.wide,
+        input: t.wide,
         norm_weight: write.norm,
         block_inject: write.block_inject,
-        normalized: &scratch.hc_normalized,
+        normalized: t.hc_normalized,
         mixed,
-        gates: &scratch.hc_gates,
-        output: &scratch.wide,
-        rows: MTP_HC_ROWS,
+        gates: t.hc_gates,
+        output: t.wide,
+        rows,
         branches: config.hc_count,
         hidden: config.hidden_size,
-        rotation: &scratch.rotation,
+        rotation: t.rotation,
     }
 }
 
@@ -280,6 +537,32 @@ pub struct MtpGpuScratch {
     moe_down_expanded: GpuTensor,
     moe_scalar: GpuTensor,
     host_token_bytes: [u8; 4],
+    /// Pinned, event-fenced staging of the head step's token upload
+    /// ([`upload_token_ids`]); `None` when [`MTP_TOKEN_RING_ENV`] is `0`.
+    token_ring: Option<LaneTokenRing>,
+}
+
+impl MtpGpuScratch {
+    /// The one-row head step's operand tensors (see [`HeadRowTensors`]).
+    fn row_tensors(&self) -> HeadRowTensors<'_> {
+        HeadRowTensors {
+            token_ids: &self.token_ids,
+            embedding_rot: &self.embedding_rot,
+            token_embedding: &self.token_embedding,
+            embedding_norm: &self.embedding_norm,
+            hidden_norm: &self.hidden_norm,
+            projected_embedding: &self.projected_embedding,
+            projected_hidden: &self.projected_hidden,
+            wide: &self.wide,
+            hc_normalized: &self.hc_normalized,
+            hc_low: &self.hc_low,
+            hc_up: &self.hc_up,
+            hc_mixed: &self.hc_mixed,
+            hc_gates: &self.hc_gates,
+            rotation: &self.rotation,
+            ffn_output: &self.ffn_output,
+        }
+    }
 }
 
 /// Allocations of one [`MtpGpuScratch`], in field order.
@@ -288,6 +571,9 @@ const MTP_SCRATCH_TENSORS: usize = 36;
 impl MtpGpuScratch {
     /// Element count and dtype of each scratch tensor, in field order.
     fn shapes(config: &Qwen4Config) -> Result<[(usize, DType); MTP_SCRATCH_TENSORS], MtpGpuError> {
+        // The replicated head is sized under the GLOBAL geometry (a trunk-shard rank's local
+        // config halves the q heads and the shared expert for the trunk only).
+        let config = config.mtp_geometry();
         let hidden = config.hidden_size;
         let wide = config
             .hc_count
@@ -458,10 +744,13 @@ impl MtpGpuScratch {
             moe_down_expanded: next(),
             moe_scalar: next(),
             host_token_bytes: [0; 4],
+            token_ring: new_token_ring(std::mem::size_of::<i32>()),
         })
     }
 
     fn free_gpu(self, gpu: &mut Gpu) -> Option<hip_bridge::HipError> {
+        // The ring drains its pending copies before `token_ids` is freed.
+        let ring_error = self.token_ring.and_then(|ring| ring.free_gpu(gpu));
         let tensors = [
             self.token_ids,
             self.embedding_rot,
@@ -500,7 +789,7 @@ impl MtpGpuScratch {
             self.moe_down_expanded,
             self.moe_scalar,
         ];
-        let mut first = None;
+        let mut first = ring_error;
         for tensor in tensors {
             if let Err(error) = gpu.free_tensor(tensor) {
                 first.get_or_insert(error);
@@ -574,6 +863,9 @@ pub(crate) struct MtpAppendScratch {
     id_rows: usize,
     host_token_bytes: Vec<u8>,
     host_prompt_ids: Vec<u8>,
+    /// The tensors are non-owning views of another scratch ([`Self::shared_view`]):
+    /// [`Self::free_gpu`] frees nothing.
+    borrowed: bool,
 }
 
 impl MtpAppendScratch {
@@ -682,7 +974,41 @@ impl MtpAppendScratch {
             id_rows,
             host_token_bytes: vec![0; rows * std::mem::size_of::<i32>()],
             host_prompt_ids: vec![0; id_rows * std::mem::size_of::<i32>()],
+            borrowed: false,
         })
+    }
+
+    /// A second handle on this scratch's device buffers (`HIPFIRE_QWEN4_LANE_APPEND_SHARE`):
+    /// every tensor a non-owning alias of the owner's (`GpuTensor::shallow_clone`), with its
+    /// own host staging vectors. The view is freed by dropping it (`free_gpu` is a no-op); the
+    /// OWNER's `free_gpu` must outlive every use of the view. Safe to alternate with the owner
+    /// because no scratch tensor carries state between two uses: every pass writes each
+    /// `rows`-row view it reads (`append_rows`), and the prompt-id buffer is written by
+    /// [`Self::upload_prompt_ids`] immediately before the sub-chunk passes that read it, with no
+    /// other user of the scratch in between (one driver thread, one stream).
+    pub(crate) fn shared_view(&self) -> Self {
+        Self {
+            rows: self.rows,
+            token_ids: self.token_ids.shallow_clone(),
+            token_embedding: self.token_embedding.shallow_clone(),
+            embedding_norm: self.embedding_norm.shallow_clone(),
+            projected_embedding: self.projected_embedding.shallow_clone(),
+            hidden_norm: self.hidden_norm.shallow_clone(),
+            projected_hidden: self.projected_hidden.shallow_clone(),
+            wide: self.wide.shallow_clone(),
+            hc_normalized: self.hc_normalized.shallow_clone(),
+            hc_low: self.hc_low.shallow_clone(),
+            hc_up: self.hc_up.shallow_clone(),
+            hc_mixed: self.hc_mixed.shallow_clone(),
+            index: self.index.shallow_clone(),
+            qsa_k: self.qsa_k.shallow_clone(),
+            qsa_v: self.qsa_v.shallow_clone(),
+            prompt_ids: self.prompt_ids.shallow_clone(),
+            id_rows: self.id_rows,
+            host_token_bytes: vec![0; self.host_token_bytes.len()],
+            host_prompt_ids: vec![0; self.host_prompt_ids.len()],
+            borrowed: true,
+        }
     }
 
     /// Upload `tokens` (at most the id-row capacity) as the prompt chunk's i32
@@ -705,7 +1031,7 @@ impl MtpAppendScratch {
         for (bytes, &token) in self.host_prompt_ids.chunks_exact_mut(4).zip(tokens) {
             bytes.copy_from_slice(&(token as i32).to_ne_bytes());
         }
-        gpu.memcpy_htod_auto(
+        gpu.upload_stream_ordered(
             &self.prompt_ids.buf,
             &self.host_prompt_ids[..tokens.len() * std::mem::size_of::<i32>()],
         )?;
@@ -730,6 +1056,9 @@ impl MtpAppendScratch {
     }
 
     pub(crate) fn free_gpu(self, gpu: &mut Gpu) -> Result<(), MtpGpuError> {
+        if self.borrowed {
+            return Ok(());
+        }
         let tensors = [
             self.token_ids,
             self.token_embedding,
@@ -829,20 +1158,33 @@ impl<'a> AppendWeights<'a> {
         if !w.wide.is_multiple_of(32) {
             return Err(invalid("MTP batched append HC down needs K % 32 == 0"));
         }
+        // The HC mixers are BF16, or the exact-gfx1201 HC8 sidecar weights (read by `append_hc8_read`).
+        let hc_dtype = |weight: &WeightRef<'_>| {
+            if weight.dtype == DType::HC8E4M3Row {
+                DType::HC8E4M3Row
+            } else {
+                DType::BF16
+            }
+        };
         check(
             "HC down",
             &hc.input_mix_down,
-            DType::BF16,
+            hc_dtype(&hc.input_mix_down),
             config.hc_lowrank,
             w.wide,
         )?;
         check(
             "HC up",
             &hc.input_mix_up,
-            DType::BF16,
+            hc_dtype(&hc.input_mix_up),
             w.wide,
             config.hc_lowrank,
         )?;
+        if hc.input_mix_down.dtype != hc.input_mix_up.dtype {
+            return Err(invalid(
+                "MTP batched append HC down and up must both be BF16 or both HC8",
+            ));
+        }
         let qsa = qsa_desc(weights, &mtp.attention)?;
         // The tiled Q8_0 projection is the K = 2560 staged kernel.
         if w.hidden != 2560 {
@@ -887,6 +1229,53 @@ fn append_dense_projection(
         gpu.gemm_bf16_xf32_mtp_dense_det_pm(weight.buf, x, y, weight.m, weight.k, rows)?;
     } else {
         gpu.gemm_bf16_xf32_multirow(weight.buf, x, y, weight.m, weight.k, rows)?;
+    }
+    Ok(())
+}
+
+/// The batched append's HC read down + up projections on the HC8 sidecar weights: `rows` rows in
+/// `hc8::MAX_ROWS` slices (the kernel is row-invariant, so a row's bytes do not depend on its
+/// slice). Down applies hc_act (scale 1/branches) in its epilogue into `low`, up reads `low` into
+/// `up`. The DET route is exact gfx1151 (F16 shadows of BF16 weights) and HC8 is exact gfx1201, so
+/// the pair is refused by name rather than read as BF16.
+#[allow(clippy::too_many_arguments)]
+fn append_hc8_read(
+    gpu: &mut Gpu,
+    det: bool,
+    hc: &Qwen4HyperReadWeights<'_>,
+    normalized: &GpuTensor,
+    low: &GpuTensor,
+    up: &GpuTensor,
+    rows: usize,
+    branches: usize,
+) -> Result<(), MtpGpuError> {
+    if det {
+        return Err(invalid(
+            "MTP DET append reads BF16 HC mixers; the HC8 sidecar weights are exact gfx1201, DET is exact gfx1151",
+        ));
+    }
+    let (down, upw) = (&hc.input_mix_down, &hc.input_mix_up);
+    if down.dtype != DType::HC8E4M3Row || upw.dtype != DType::HC8E4M3Row {
+        return Err(invalid("MTP HC8 append needs both HC mixers as HC8E4M3Row"));
+    }
+    let (wide, rank) = (down.k, down.m);
+    let mut start = 0;
+    while start < rows {
+        let take = (rows - start).min(rdna_compute::hc8::MAX_ROWS);
+        let x = normalized.sub_offset(start * wide, take * wide);
+        let l = low.sub_offset(start * rank, take * rank);
+        let u = up.sub_offset(start * wide, take * wide);
+        gpu.hc8_gemm_tensor(
+            down.buf,
+            down.m,
+            down.k,
+            &x,
+            &l,
+            take,
+            Some(1.0 / branches as f32),
+        )?;
+        gpu.hc8_gemm_tensor(upw.buf, upw.m, upw.k, &l, &u, take, None)?;
+        start += take;
     }
     Ok(())
 }
@@ -1142,7 +1531,7 @@ fn grow_context_arena(
             growth.offset_bytes / element,
             (end - growth.offset_bytes) / element,
         );
-        gpu.hip.memset(&fresh.buf, 0, fresh.buf.size())?;
+        gpu.memset_stream_ordered(&fresh.buf, 0, fresh.buf.size())?;
     }
     Ok(())
 }
@@ -1547,14 +1936,34 @@ impl MtpGpuState {
     }
 
     pub(crate) fn reset(&mut self, gpu: &mut Gpu) -> Result<(), MtpGpuError> {
-        self.reset_inner(gpu, true)
+        self.reset_synced(gpu, true)
+    }
+
+    /// [`Self::reset`] that only enqueues its zero-fills into `batch`: the caller owns
+    /// the one wait ([`Gpu::memset_batch_sync`], also after a failed reset) and keeps
+    /// the state alive until then.
+    pub(crate) fn reset_into(
+        &mut self,
+        gpu: &mut Gpu,
+        batch: &mut MemsetBatch,
+    ) -> Result<(), MtpGpuError> {
+        self.reset_inner(gpu, true, batch)
+    }
+
+    /// One reset with its own wait: every fill enqueued, then a single stream wait (paid
+    /// even when the reset fails part-way).
+    fn reset_synced(&mut self, gpu: &mut Gpu, clear_rows: bool) -> Result<(), MtpGpuError> {
+        let mut batch = MemsetBatch::default();
+        let reset = self.reset_inner(gpu, clear_rows, &mut batch);
+        let synced = gpu.memset_batch_sync(&mut batch).map_err(MtpGpuError::from);
+        reset.and(synced)
     }
 
     /// Cold reset of a side request: as [`Self::reset`] except the
     /// append-only row streams (full K/V, raw index keys, pooled keys) keep
     /// their bytes.
     pub(crate) fn reset_for_side(&mut self, gpu: &mut Gpu) -> Result<(), MtpGpuError> {
-        self.reset_inner(gpu, false)
+        self.reset_synced(gpu, false)
     }
 
     /// Per-stream row ends of a side request writing tokens `[0, through)`,
@@ -1564,7 +1973,12 @@ impl MtpGpuState {
         vec![through, through, through, through.div_ceil(self.compress)]
     }
 
-    fn reset_inner(&mut self, gpu: &mut Gpu, clear_rows: bool) -> Result<(), MtpGpuError> {
+    fn reset_inner(
+        &mut self,
+        gpu: &mut Gpu,
+        clear_rows: bool,
+        batch: &mut MemsetBatch,
+    ) -> Result<(), MtpGpuError> {
         self.snapshot_arena.invalidate();
         for (index, tensor) in [
             &self.full_keys,
@@ -1585,7 +1999,7 @@ impl MtpGpuState {
             }
             // An unmapped VMM arena has an empty accessible prefix.
             if tensor.buf.size() > 0 {
-                gpu.hip.memset(&tensor.buf, 0, tensor.buf.size())?;
+                gpu.memset_batched(batch, &tensor.buf, 0, tensor.buf.size())?;
             }
         }
         self.position = 0;
@@ -1625,20 +2039,25 @@ impl MtpGpuState {
         validate_mtp_mark(&mark, self)?;
         let arena_generation = self.snapshot_arena.generation;
         let result = (|| -> Result<(), MtpGpuError> {
-            gpu.copy_d2d(
-                &self.selected_indices,
-                &self.snapshot_arena.selected_indices,
-                self.selected_indices.byte_size(),
-            )?;
-            gpu.copy_d2d(
-                &self.selected_len_out,
-                &self.snapshot_arena.selected_len_out,
-                self.selected_len_out.byte_size(),
-            )?;
-            gpu.copy_d2d(
-                &self.wide_hidden,
-                &self.snapshot_arena.wide_hidden,
-                self.wide_hidden.byte_size(),
+            copy_tensors(
+                gpu,
+                &[
+                    (
+                        &self.selected_indices,
+                        &self.snapshot_arena.selected_indices,
+                        self.selected_indices.byte_size(),
+                    ),
+                    (
+                        &self.selected_len_out,
+                        &self.snapshot_arena.selected_len_out,
+                        self.selected_len_out.byte_size(),
+                    ),
+                    (
+                        &self.wide_hidden,
+                        &self.snapshot_arena.wide_hidden,
+                        self.wide_hidden.byte_size(),
+                    ),
+                ],
             )?;
             self.snapshot_arena.mark = mark;
             self.snapshot_arena.active = true;
@@ -1669,20 +2088,25 @@ impl MtpGpuState {
         }
         let mark = self.snapshot_arena.mark;
         let result = (|| -> Result<(), MtpGpuError> {
-            gpu.copy_d2d(
-                &self.snapshot_arena.selected_indices,
-                &self.selected_indices,
-                self.selected_indices.byte_size(),
-            )?;
-            gpu.copy_d2d(
-                &self.snapshot_arena.selected_len_out,
-                &self.selected_len_out,
-                self.selected_len_out.byte_size(),
-            )?;
-            gpu.copy_d2d(
-                &self.snapshot_arena.wide_hidden,
-                &self.wide_hidden,
-                self.wide_hidden.byte_size(),
+            copy_tensors(
+                gpu,
+                &[
+                    (
+                        &self.snapshot_arena.selected_indices,
+                        &self.selected_indices,
+                        self.selected_indices.byte_size(),
+                    ),
+                    (
+                        &self.snapshot_arena.selected_len_out,
+                        &self.selected_len_out,
+                        self.selected_len_out.byte_size(),
+                    ),
+                    (
+                        &self.snapshot_arena.wide_hidden,
+                        &self.wide_hidden,
+                        self.wide_hidden.byte_size(),
+                    ),
+                ],
             )?;
             self.full_len = mark.full_len;
             self.raw_len = mark.raw_len;
@@ -2149,6 +2573,31 @@ pub struct Qwen4MtpGpu {
     /// head's gather buffer `2 + j % 2`, so a probe-and-restore never reuses
     /// a buffer on two consecutive invocations.
     pub(crate) moe_steps: u64,
+    /// The batched head rounds' scratch (`HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS=1`,
+    /// MoE head); `None` otherwise.
+    pub(crate) rows: Option<MtpRowsScratch>,
+    /// The head's MoE runtime over every expert (`Some` once
+    /// [`Self::install_lane_local_moe`] ran, EP MoE head only): the same
+    /// sealed expert group as [`Self::moe`], but owned experts name this
+    /// rank's compact tensors and every other expert the peer's, so a head
+    /// step reads all of them locally and crosses no rank.
+    pub(crate) moe_full: Option<Qwen4MoeLayerRuntime>,
+    /// Lane-local mode ([`Self::set_lane_local`]): every Predict-step MoE of
+    /// this head runs on [`Self::moe_full`] with the no-op row gather and does
+    /// not advance [`Self::moe_steps`]. Off = the incumbent EP head call.
+    pub(crate) lane_local: bool,
+    /// The sharded-MoE pass the next batched head call belongs to
+    /// ([`Self::set_s4_round`]); `None` = every call is X2 / replicated as before.
+    pub(crate) s4_round: Option<S4Round>,
+    /// Device table of the sharded-MoE activation all-gather's slot owners:
+    /// 256 owner masks x 8 `i32` (slot `s` of mask `m` holds `(m >> s) & 1`),
+    /// read as the gather's `slot_experts` (expert `e` is owned by rank
+    /// `e % 2`). `Some` only with [`DRAFT_SHARDED_MOE_ENV`] on, two ranks, at
+    /// [`Self::install_lane_local_moe`].
+    pub(crate) s4_owners: Option<GpuTensor>,
+    /// The grouped-route scratch of a stock-FP8 (qt=55) MoE head's one-row
+    /// steps ([`MtpFp8MoeScratch`]); `None` for every other head.
+    pub(crate) fp8_moe: Option<MtpFp8MoeScratch>,
 }
 
 /// Draft-head front: tokens below this id, plus EOS and the control ids
@@ -2168,6 +2617,331 @@ pub(crate) enum MtpStep {
     /// of a chain: the next step brings its own backbone hidden and reselects
     /// (the head state and selection are left stale; a reuse is refused).
     Append,
+}
+
+/// Row-offset views of a multi-lane head step: the per-lane broadcast-add
+/// operands and the chunks of the branch-row FC projection. Empty for one
+/// row, where the whole tensors are the operands.
+struct HeadRowViews {
+    /// Per lane: (`projected_hidden` rows, `projected_embedding` row, `wide`
+    /// rows).
+    broadcast: SmallVec<[(GpuTensor, GpuTensor, GpuTensor); MTP_DRAFT_LANES_MAX]>,
+    /// Chunks of the `rows * hc_count` branch rows of the hidden FC
+    /// projection: (`hidden_norm` rows, `projected_hidden` rows, row count).
+    /// No chunk is wider than the few-row route (`FEW_ROW_ROUTE_ROWS`) unless
+    /// one lane's own `hc_count` rows are, so every projected row stays on the
+    /// route whose per-row bytes are the one-row step's. With `one_launch`
+    /// (`rows::fc_hidden_one_launch`: exact gfx1201 under
+    /// `HIPFIRE_QWEN4_MTP_FC_ONE_LAUNCH` with `Gpu::bf16_rows_exact_one_launch(rows *
+    /// hc_count)`, or a BF16 fc_hidden of a call wider than [`MTP_DRAFT_LANES_MAX`] on exact
+    /// gfx942) there is ONE chunk over all `rows * hc_count` rows: it runs
+    /// `ProjectLadder::TrunkRowExact`, whose all-rows arm is bitwise the singleton (gfx942: the
+    /// MFMA chain per output element), so every projected row is still bitwise the one-row
+    /// step's.
+    fc_hidden: SmallVec<[(GpuTensor, GpuTensor, usize); 4]>,
+}
+
+impl HeadRowViews {
+    fn new(t: &HeadRowTensors<'_>, config: &Qwen4Config, rows: usize, one_launch: bool) -> Self {
+        let mut views = Self {
+            broadcast: SmallVec::new(),
+            fc_hidden: SmallVec::new(),
+        };
+        if rows <= 1 {
+            return views;
+        }
+        let hidden = config.hidden_size;
+        let hc = config.hc_count;
+        let wide = hc * hidden;
+        for row in 0..rows {
+            views.broadcast.push((
+                t.projected_hidden.sub_offset(row * wide, wide),
+                t.projected_embedding.sub_offset(row * hidden, hidden),
+                t.wide.sub_offset(row * wide, wide),
+            ));
+        }
+        let total = rows * hc;
+        let chunk = if one_launch {
+            total
+        } else {
+            (rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS / hc).max(1) * hc
+        };
+        let mut first = 0;
+        while first < total {
+            let count = chunk.min(total - first);
+            views.fc_hidden.push((
+                t.hidden_norm.sub_offset(first * hidden, count * hidden),
+                t.projected_hidden
+                    .sub_offset(first * hidden, count * hidden),
+                count,
+            ));
+            first += count;
+        }
+        views
+    }
+}
+
+/// Head step stage 2a (row stage, rows-shaped): the token embedding, the two
+/// pre-FC norms, both FC projections, their broadcast add and the attention
+/// HC read, over `rows` lanes' rows at once. Every op here is row-local: a
+/// batched round runs it once over all drafting lanes (`rows` up to the load's
+/// [`load_draft_call_rows`]); `rows == 1` is the one-token step. `views` is
+/// [`HeadRowViews::new`] for the same `t` and `rows`.
+#[allow(clippy::too_many_arguments)]
+fn push_head_rows_front<'a>(
+    steps: &mut SmallVec<[Step<'a>; 16]>,
+    weights: &'a Qwen4Weights,
+    config: &Qwen4Config,
+    mtp: &'a crate::weights::Qwen4MtpWeights,
+    t: &HeadRowTensors<'a>,
+    views: &'a HeadRowViews,
+    rows: usize,
+    fold_broadcast: bool,
+    backbone_hidden: &'a GpuTensor,
+    attn_read: &Qwen4HyperReadWeights<'a>,
+) -> Result<(), MtpGpuError> {
+    let hidden = config.hidden_size;
+    steps.push(Step::Embed(EmbeddingOp {
+        table: weights.resident(&weights.root.embedding)?,
+        rotated: t.embedding_rot,
+        token_ids: t.token_ids,
+        output: t.token_embedding,
+        rows,
+        dim: hidden,
+    }));
+    steps.push(Step::HyperNorm(HyperNormOp {
+        input: t.token_embedding,
+        norm_weight: weights.resident(&mtp.pre_fc_norm_embedding)?,
+        normalized: t.embedding_norm,
+        branches: 1,
+        hidden,
+        state_bf16: false,
+    }));
+    steps.push(Step::Project(ProjectOp {
+        weight: dense_ref(weights, &mtp.fc_embedding)?,
+        input: t.embedding_norm,
+        output: t.projected_embedding,
+        rows,
+        rotation: Some(t.rotation),
+        ladder: ProjectLadder::Trunk,
+        residual: None,
+    }));
+    steps.push(Step::HyperNorm(HyperNormOp {
+        input: backbone_hidden,
+        norm_weight: weights.resident(&mtp.pre_fc_norm_hidden)?,
+        normalized: t.hidden_norm,
+        branches: config.hc_count,
+        hidden,
+        state_bf16: false,
+    }));
+    if rows == 1 {
+        // Both branch rows in one projection (each bitwise its own).
+        steps.push(Step::Project(ProjectOp {
+            weight: dense_ref(weights, &mtp.fc_hidden)?,
+            input: t.hidden_norm,
+            output: t.projected_hidden,
+            rows: config.hc_count,
+            rotation: Some(t.rotation),
+            ladder: ProjectLadder::Trunk,
+            residual: None,
+        }));
+        steps.push(Step::BroadcastAdd(BroadcastAddOp {
+            rows_input: t.projected_hidden,
+            row: t.projected_embedding,
+            output: t.wide,
+            rows: config.hc_count,
+            width: hidden,
+            lanes: 1,
+        }));
+    } else {
+        for (input, output, count) in &views.fc_hidden {
+            steps.push(Step::Project(ProjectOp {
+                weight: dense_ref(weights, &mtp.fc_hidden)?,
+                input,
+                output,
+                rows: *count,
+                rotation: Some(t.rotation),
+                ladder: ProjectLadder::TrunkRowExact,
+                residual: None,
+            }));
+        }
+        if fold_broadcast {
+            // One launch over every lane's rows (`rows_input` / `output` hold `rows * hc_count`
+            // branch rows, `row` one embedding row per lane): the per-lane ops below, bytewise.
+            steps.push(Step::BroadcastAdd(BroadcastAddOp {
+                rows_input: t.projected_hidden,
+                row: t.projected_embedding,
+                output: t.wide,
+                rows: config.hc_count,
+                width: hidden,
+                lanes: rows,
+            }));
+        } else {
+            for (rows_input, row, output) in &views.broadcast {
+                steps.push(Step::BroadcastAdd(BroadcastAddOp {
+                    rows_input,
+                    row,
+                    output,
+                    rows: config.hc_count,
+                    width: hidden,
+                    lanes: 1,
+                }));
+            }
+        }
+    }
+    steps.push(Step::HyperRead(hc_read(attn_read, t, config, rows)));
+    Ok(())
+}
+
+/// Head step stage 3 (per lane): the lane's own indexed attention over its
+/// head arena (`state`), one row: `input` is the lane's row of the attention
+/// HC read, `attention_output` the row the attention writes. Stateful, never
+/// shared across lanes.
+fn head_attention_op<'a>(
+    config: &Qwen4Config,
+    scratch: &'a MtpGpuScratch,
+    state: &'a MtpGpuState,
+    qsa: Qwen4QsaWeights<'a>,
+    mode: IndexedAttentionMode<'a>,
+    input: &'a GpuTensor,
+    attention_output: &'a GpuTensor,
+) -> IndexedAttentionOp<'a> {
+    let hidden = config.hidden_size;
+    IndexedAttentionOp {
+        sp_select: None,
+        indexer_qk: qsa.indexer_qk,
+        indexer_q_norm: qsa.indexer_q_norm,
+        indexer_k_norm: qsa.indexer_k_norm,
+        q: qsa.q,
+        k: qsa.k,
+        v: qsa.v,
+        q_norm: qsa.q_norm,
+        k_norm: qsa.k_norm,
+        output: qsa.output,
+        state: IndexedAttentionState {
+            // The one MTP layer keeps the exact F32 QSA state.
+            format: QsaKvFormat::F32,
+            full_keys: &state.full_keys,
+            full_values: &state.full_values,
+            raw_index_keys: &state.raw_index_keys,
+            pooled_keys: &state.pooled_keys,
+            selected_indices: &state.selected_indices,
+            f16_arena: None,
+            pooled_bf16: None,
+            full_capacity: state.full_capacity,
+            raw_capacity: state.raw_capacity,
+            pooled_capacity: state.pooled_capacity,
+            selected_capacity: state.selected_capacity,
+            position_capacity: state.full_capacity,
+            full_len: state.full_len,
+            raw_len: state.raw_len,
+            pooled_len: state.pooled_len,
+            selected_len: state.selected_len,
+            position: state.position,
+        },
+        input,
+        index_scratch: &scratch.index,
+        qgate_scratch: &scratch.q_and_gate,
+        k_scratch: &scratch.qsa_k,
+        v_scratch: &scratch.qsa_v,
+        qsa_output: &scratch.qsa_output,
+        selected_scratch: &scratch.qsa_selected,
+        attention_output,
+        bf16_scratch: &scratch.hc_bf16,
+        rows: 1,
+        index_heads: config.indexer_n_heads,
+        index_kv_heads: config.indexer_kv_heads,
+        index_dim: config.indexer_head_dim,
+        budget: config.indexer_budget,
+        compress: config.indexer_compress_ratio,
+        heads: config.num_attention_heads,
+        kv_heads: config.num_key_value_heads,
+        head_dim: config.head_dim,
+        rotary_dim: config.rotary_dim(),
+        rope: config.rope(),
+        input_width: hidden,
+        rotation: &scratch.rotation,
+        mode,
+        trunk_a4: 0,
+        phase: MixerPhase::Whole,
+    }
+}
+
+/// Head step stage 4 (row stage, rows-shaped): everything after the
+/// attention: attention HC write, MLP HC read, the MoE or dense FFN,
+/// MLP HC write and (Predict) the final HC read. `ffn` is `None` for an
+/// Append step, which stops after the attention.
+#[allow(clippy::too_many_arguments)]
+fn push_head_rows_back<'a>(
+    steps: &mut SmallVec<[Step<'a>; 16]>,
+    config: &Qwen4Config,
+    t: &HeadRowTensors<'a>,
+    rows: usize,
+    attn_write: &Qwen4HyperWriteWeights<'a>,
+    mlp_read: &Qwen4HyperReadWeights<'a>,
+    mlp_write: &Qwen4HyperWriteWeights<'a>,
+    final_read: &Qwen4HyperReadWeights<'a>,
+    ffn: Option<MtpFfnCall<'a>>,
+    predict: bool,
+) {
+    let hidden = config.hidden_size;
+    if let Some(ffn) = ffn {
+        push_head_rows_pre_ffn(steps, config, t, rows, attn_write, mlp_read);
+        match ffn {
+            MtpFfnCall::Moe(moe) => {
+                steps.push(Step::Clear(ClearOp {
+                    tensor: t.ffn_output,
+                    elements: rows * hidden,
+                }));
+                steps.push(Step::Moe(moe));
+            }
+            MtpFfnCall::Dense(dense) => steps.push(Step::GatedMlp(dense)),
+        }
+        push_head_rows_post_ffn(steps, config, t, rows, mlp_write, final_read, predict);
+    }
+}
+
+/// The steps of [`push_head_rows_back`] before the FFN: the attention HC
+/// write and the MLP HC read.
+fn push_head_rows_pre_ffn<'a>(
+    steps: &mut SmallVec<[Step<'a>; 16]>,
+    config: &Qwen4Config,
+    t: &HeadRowTensors<'a>,
+    rows: usize,
+    attn_write: &Qwen4HyperWriteWeights<'a>,
+    mlp_read: &Qwen4HyperReadWeights<'a>,
+) {
+    steps.push(Step::HyperWrite(hc_write(
+        attn_write,
+        t.projected_embedding,
+        t,
+        config,
+        rows,
+    )));
+    steps.push(Step::HyperRead(hc_read(mlp_read, t, config, rows)));
+}
+
+/// The steps of [`push_head_rows_back`] after the FFN: the MLP HC write and
+/// (Predict) the final HC read.
+fn push_head_rows_post_ffn<'a>(
+    steps: &mut SmallVec<[Step<'a>; 16]>,
+    config: &Qwen4Config,
+    t: &HeadRowTensors<'a>,
+    rows: usize,
+    mlp_write: &Qwen4HyperWriteWeights<'a>,
+    final_read: &Qwen4HyperReadWeights<'a>,
+    predict: bool,
+) {
+    steps.push(Step::HyperWrite(hc_write(
+        mlp_write,
+        t.ffn_output,
+        t,
+        config,
+        rows,
+    )));
+    if predict {
+        steps.push(Step::HyperRead(hc_read(final_read, t, config, rows)));
+    }
 }
 
 /// The FFN call of one non-Append MTP step, in the profile's FFN kind.
@@ -2286,6 +3060,10 @@ pub(crate) enum HeadD2Off {
     TrunkD2Off,
     /// Expert-parallel bundles never split the head.
     Ep,
+    /// `HIPFIRE_QWEN4_MTP_HEAD_RESIDENT=1`: the head's routed experts are in
+    /// VRAM, so there is no host copy for a CPU arm to read (and the GPU
+    /// route needs no CPU help).
+    Resident,
 }
 
 impl HeadD2Off {
@@ -2294,6 +3072,9 @@ impl HeadD2Off {
             Self::KnobOff => "HIPFIRE_QWEN4_MTP_HEAD_D2=0",
             Self::TrunkD2Off => "trunk D2 split is not armed on this load (the head follows it)",
             Self::Ep => "expert-parallel bundle",
+            Self::Resident => {
+                "HIPFIRE_QWEN4_MTP_HEAD_RESIDENT: the head's routed experts are VRAM-resident"
+            }
         }
     }
 }
@@ -2305,13 +3086,25 @@ pub(crate) enum HeadD2Decision {
     Off(HeadD2Off),
 }
 
+/// Whether the bound head's routed experts sit in pinned host RAM (the layout
+/// its rows=1 D2 CPU split reads) rather than VRAM
+/// (`HIPFIRE_QWEN4_MTP_HEAD_RESIDENT`). `None` when the head has no stacked
+/// expert tensor to inspect.
+pub(crate) fn head_experts_host_mapped(weights: &Qwen4Weights) -> Option<bool> {
+    let moe = weights.mtp.as_ref()?.ffn.moe()?;
+    let down = weights.resident(&moe.experts_down).ok()?;
+    Some(down.buf.is_host_mapped())
+}
+
 /// Pure decision behind `attach_mtp`: `Some(false)` never arms (the kill);
 /// otherwise (`Some(true)` or unset) the head follows the trunk: armed when the
-/// trunk's D2 split is armed on this load and the bundle is not EP.
+/// trunk's D2 split is armed on this load, the bundle is not EP and the head's
+/// experts are host-placed (`head_resident` = VRAM-resident, never split).
 pub(crate) fn head_d2_decision(
     knob: Option<bool>,
     trunk_split_layers_nonempty: bool,
     ep: bool,
+    head_resident: bool,
 ) -> HeadD2Decision {
     match knob {
         Some(false) => HeadD2Decision::Off(HeadD2Off::KnobOff),
@@ -2319,6 +3112,7 @@ pub(crate) fn head_d2_decision(
         Some(true) | None if !trunk_split_layers_nonempty => {
             HeadD2Decision::Off(HeadD2Off::TrunkD2Off)
         }
+        Some(true) | None if head_resident => HeadD2Decision::Off(HeadD2Off::Resident),
         Some(true) | None => HeadD2Decision::Armed,
     }
 }
@@ -2335,6 +3129,7 @@ impl Qwen4MtpGpu {
         head_dtype: DType,
         head_d2: bool,
     ) -> Option<(usize, usize)> {
+        let config = config.mtp_geometry();
         let (policy, layout) = draft_head_config(config);
         let (draft, scratch) = DraftHead::device_bytes(head_dtype, layout, policy)?;
         let resident = MtpGpuScratch::device_bytes(config)
@@ -2342,7 +3137,9 @@ impl Qwen4MtpGpu {
             .checked_add(MtpGpuState::device_bytes(config, context)?)?
             .checked_add(Qwen4MoeLayerRuntime::device_bytes(config)?)?
             .checked_add(head_d2_device_bytes(config, head_d2)?)?
-            .checked_add(draft)?;
+            .checked_add(draft)?
+            .checked_add(MtpRowsScratch::device_bytes(config)?)?
+            .checked_add(MtpFp8MoeScratch::device_bytes(config)?)?;
         Some((resident, scratch))
     }
 
@@ -2358,6 +3155,7 @@ impl Qwen4MtpGpu {
         head_dtype: DType,
         head_d2: bool,
     ) -> Option<(Vec<u64>, Vec<u64>)> {
+        let config = config.mtp_geometry();
         let (policy, layout) = draft_head_config(config);
         let (draft, draft_scratch) = DraftHead::allocation_sizes(head_dtype, layout, policy)?;
         let widen = |sizes: Vec<usize>| -> Option<Vec<u64>> {
@@ -2373,6 +3171,8 @@ impl Qwen4MtpGpu {
             resident.push(u64::try_from(head_d2_device_bytes(config, true)?).ok()?);
         }
         resident.extend(widen(draft)?);
+        resident.extend(MtpRowsScratch::allocation_sizes(config)?);
+        resident.extend(MtpFp8MoeScratch::allocation_sizes(config)?);
         Some((resident, widen(draft_scratch)?))
     }
 
@@ -2394,6 +3194,7 @@ impl Qwen4MtpGpu {
         )>,
         head_d2: bool,
     ) -> Result<Self, MtpGpuError> {
+        let config = config.mtp_geometry();
         admit_mtp(weights, config)?;
         if weights.ep_placement() != ep.map(|(placement, _, _)| placement) {
             return Err(invalid(
@@ -2482,6 +3283,37 @@ impl Qwen4MtpGpu {
                 return Err(error);
             }
         };
+        // The batched head rounds' rows scratch: allocated last, only under
+        // `HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS=1` (otherwise nothing changes); it decides the
+        // widest batched call of this load ([`load_draft_call_rows`]) once, here.
+        let rows = match MtpRowsScratch::new(gpu, config, ep_bound) {
+            Ok(rows) => rows,
+            Err(error) => {
+                let _ = draft.free_gpu(gpu);
+                let _ = moe.map(|moe| moe.free_gpu(gpu));
+                let _ = state.free_gpu(gpu);
+                let _ = scratch.free_gpu(gpu);
+                return Err(error);
+            }
+        };
+        // A stock-FP8 (qt=55) MoE head has no indexed decode route: its one-row
+        // steps run the grouped route, whose scratch is allocated here, after
+        // the rows scratch (nothing for any other head).
+        let fp8_moe = match moe.as_ref().filter(|moe| moe.is_fp8()) {
+            Some(_) => MtpFp8MoeScratch::new(gpu, config),
+            None => Ok(None),
+        };
+        let fp8_moe = match fp8_moe {
+            Ok(fp8_moe) => fp8_moe,
+            Err(error) => {
+                let _ = rows.and_then(|rows| rows.free_gpu(gpu));
+                let _ = draft.free_gpu(gpu);
+                let _ = moe.map(|moe| moe.free_gpu(gpu));
+                let _ = state.free_gpu(gpu);
+                let _ = scratch.free_gpu(gpu);
+                return Err(error);
+            }
+        };
         Ok(Self {
             scratch,
             state,
@@ -2490,7 +3322,21 @@ impl Qwen4MtpGpu {
             draft,
             ep_bound,
             moe_steps: 0,
+            moe_full: None,
+            lane_local: false,
+            s4_round: None,
+            s4_owners: None,
+            rows,
+            fp8_moe,
         })
+    }
+
+    /// Lanes one batched head call carries on this load ([`load_draft_call_rows`], fixed when
+    /// the rows scratch was allocated): [`MTP_DRAFT_LANES_MAX`] without the scratch.
+    pub(crate) fn draft_call_rows(&self) -> usize {
+        self.rows
+            .as_ref()
+            .map_or(MTP_DRAFT_LANES_MAX, MtpRowsScratch::call_rows)
     }
 
     /// Whether the head's experts run on a rows=1 D2 split executor.
@@ -2541,22 +3387,136 @@ impl Qwen4MtpGpu {
         ))
     }
 
+    /// Whether lane-local head MoE calls can run: the head's MoE runtime is
+    /// EP-bound and its full-table runtime was installed, or the head has no
+    /// MoE at all (a dense profile has nothing to cross).
+    pub(crate) fn lane_local_ready(&self) -> bool {
+        match self.moe.as_ref() {
+            None => true,
+            Some(_) => self.ep_bound && self.moe_full.is_some(),
+        }
+    }
+
+    /// Switch lane-local mode. On is refused for a MoE head without the
+    /// full-table runtime.
+    pub(crate) fn set_lane_local(&mut self, on: bool) -> Result<(), MtpGpuError> {
+        if on && !self.lane_local_ready() {
+            return Err(invalid(
+                "lane-local MTP head MoE needs the EP full-table head runtime (not installed)",
+            ));
+        }
+        self.lane_local = on;
+        Ok(())
+    }
+
+    /// Whether sharded-MoE draft passes can run (S4): the switch was on at
+    /// install and the head has the rows scratch, the EP MoE runtime and the
+    /// lane-local runtime (X2 active), with the slot-owner table.
+    pub(crate) fn s4_ready(&self) -> bool {
+        self.s4_owners.is_some() && self.rows.is_some() && self.ep_bound && self.lane_local_ready()
+    }
+
+    /// Mark (or clear) the sharded-MoE pass the next batched / participant
+    /// head calls belong to. Refused when [`Self::s4_ready`] is false, and
+    /// while lane-local mode is on (the S4 MoE is the replicated call).
+    pub(crate) fn set_s4_round(&mut self, round: Option<S4Round>) -> Result<(), MtpGpuError> {
+        if round.is_some() && (!self.s4_ready() || self.lane_local) {
+            return Err(invalid(
+                "sharded draft MoE needs the S4 head tables and a non-lane-local head",
+            ));
+        }
+        self.s4_round = round;
+        Ok(())
+    }
+
+    /// Build the head's full-table MoE runtime for lane-local calls (EP attach,
+    /// after every rank's head compact source is known): the head's own sealed
+    /// expert group (`num_hidden_layers`, the one [`Self::new_with_backend`]
+    /// binds for the decode table) and runtime label 0 over `peers`, one
+    /// compact source per rank (this rank's is its own head tensors).
+    pub(crate) fn install_lane_local_moe(
+        &mut self,
+        gpu: &mut Gpu,
+        weights: &Qwen4Weights,
+        config: &Qwen4Config,
+        placement: Qwen4EpPlacement,
+        peers: &[Qwen4PeerLayerSource],
+        seal: &crate::ep_seal::Qwen4EpRankSeal,
+    ) -> Result<(), MtpGpuError> {
+        if !self.ep_bound || self.moe.is_none() {
+            return Err(invalid(
+                "a lane-local head MoE runtime needs an EP-bound MoE head",
+            ));
+        }
+        if self.moe_full.is_some() {
+            return Err(invalid(
+                "the lane-local head MoE runtime is already installed",
+            ));
+        }
+        let config = config.mtp_geometry();
+        let head = bound_mtp(weights)?;
+        let moe_weights = head
+            .ffn
+            .moe()
+            .ok_or_else(|| invalid("a dense MTP head has no lane-local MoE runtime"))?;
+        let full = Qwen4MoeLayerRuntime::from_moe_full_group(
+            gpu,
+            weights,
+            moe_weights,
+            0,
+            config,
+            placement,
+            peers,
+            seal,
+            config.num_hidden_layers,
+        )?;
+        if full.tier_lease().is_some() {
+            let _ = full.free_gpu(gpu);
+            return Err(invalid(
+                "the MTP head's lane-local MoE runtime must be untiered (its experts are the `mtp.` tensors)",
+            ));
+        }
+        if draft_sharded_moe_enabled() && placement.ranks == 2 && self.rows.is_some() {
+            let mut table = Vec::with_capacity(256 * 8 * std::mem::size_of::<i32>());
+            for mask in 0u32..256 {
+                for slot in 0..8 {
+                    table.extend_from_slice(&(((mask >> slot) & 1) as i32).to_ne_bytes());
+                }
+            }
+            self.s4_owners = Some(gpu.upload_raw(&table, &[table.len()])?);
+        }
+        self.moe_full = Some(full);
+        Ok(())
+    }
+
     pub(crate) fn free_gpu(self, gpu: &mut Gpu) -> Result<(), MtpGpuError> {
         let Self {
             scratch,
             state,
             moe,
+            moe_full,
             draft,
+            rows,
+            fp8_moe,
+            s4_owners,
             ..
         } = self;
         let draft_error = draft.free_gpu(gpu);
         let scratch_error = scratch.free_gpu(gpu);
         let state_error = state.free_gpu(gpu);
         let moe_error = moe.and_then(|moe| moe.free_gpu(gpu));
+        let moe_full_error = moe_full.and_then(|moe| moe.free_gpu(gpu));
+        let rows_error = rows.and_then(|rows| rows.free_gpu(gpu));
+        let fp8_moe_error = fp8_moe.and_then(|fp8_moe| fp8_moe.free_gpu(gpu));
+        let s4_error = s4_owners.and_then(|table| gpu.free_tensor(table).err());
         draft_error
             .or(scratch_error)
             .or(state_error)
             .or(moe_error)
+            .or(moe_full_error)
+            .or(rows_error)
+            .or(fp8_moe_error)
+            .or(s4_error)
             .map_or(Ok(()), |error| Err(MtpGpuError::Hip(error)))
     }
     /// Deliberately dirty the reusable MoE buffers for the bounded profile
@@ -2888,13 +3848,7 @@ impl Qwen4MtpGpu {
         &mut self,
         gpu: &mut Gpu,
         step: MtpStep,
-        (full_len, raw_len, pooled_len, selected_len, next_position): (
-            usize,
-            usize,
-            usize,
-            usize,
-            usize,
-        ),
+        lengths: (usize, usize, usize, usize, usize),
     ) -> Result<(), MtpGpuError> {
         if step != MtpStep::Append {
             gpu.copy_d2d(
@@ -2903,32 +3857,27 @@ impl Qwen4MtpGpu {
                 self.scratch.wide.byte_size(),
             )?;
         }
-        let state = &mut self.state;
-        state.position = next_position;
-        state.full_len = full_len;
-        state.raw_len = raw_len;
-        state.pooled_len = pooled_len;
-        state.selected_len = selected_len;
-        state.step_index = state.step_index.wrapping_add(1);
+        self.state.commit_step(lengths);
         Ok(())
     }
 
-    /// The head step's checks and device work up to (not including) the
-    /// draft: returns the lengths the step publishes in
-    /// [`Self::finish_head_step`].
-    #[allow(clippy::too_many_arguments)]
-    fn head_block(
+    /// Head step stage 1 (per lane, host): the backbone-hidden staging, the
+    /// I1 position guards, the draft history observation and the one-token
+    /// H2D. Everything here is per-lane state; a batched round runs it once
+    /// per drafting lane before the shared row stages.
+    fn head_prologue(
         &mut self,
         gpu: &mut Gpu,
-        weights: &Qwen4Weights,
         config: &Qwen4Config,
         token: u32,
         backbone_hidden: Option<&GpuTensor>,
         position: usize,
-        fresh_qsa_selection: bool,
-        step: MtpStep,
-        ep: Option<MtpEpGather<'_>>,
-    ) -> Result<(usize, usize, usize, usize, usize), MtpGpuError> {
+    ) -> Result<(), MtpGpuError> {
+        // The MTP head is never the plain-AR retained body. Eligibility is
+        // stated per forward and otherwise left as the last trunk forward set
+        // it, so a head step after an eligible spec AR token would run as if it
+        // were being recorded or replayed (HIPF-294).
+        gpu.replay.set_forward_eligible(false);
         let wide = config
             .hc_count
             .checked_mul(config.hidden_size)
@@ -2939,7 +3888,10 @@ impl Qwen4MtpGpu {
                     "MTP backbone hidden must be F32 with {wide} elements"
                 )));
             }
-        } else {
+        } else if !gpu.flags.qwen4_draft_glue_fold_enabled() {
+            // `HIPFIRE_QWEN4_DRAFT_GLUE_FOLD` reads the head's own carried hidden in place
+            // ([`Self::head_block`]): the stage-1 norm is its only reader and the step's
+            // `wide_hidden` write (`finish_head_step`) is stream-ordered after it.
             gpu.copy_d2d(
                 &self.state.wide_hidden,
                 &self.scratch.backbone_hidden,
@@ -2967,13 +3919,43 @@ impl Qwen4MtpGpu {
         self.scratch
             .host_token_bytes
             .copy_from_slice(&(token as i32).to_ne_bytes());
-        gpu.memcpy_htod_auto(&self.scratch.token_ids.buf, &self.scratch.host_token_bytes)?;
+        upload_token_ids(
+            self.scratch.token_ring.as_mut(),
+            gpu,
+            &self.scratch.token_ids.buf,
+            &self.scratch.host_token_bytes,
+        )?;
+        Ok(())
+    }
 
+    /// The head step's checks and device work up to (not including) the
+    /// draft: returns the lengths the step publishes in
+    /// [`Self::finish_head_step`].
+    #[allow(clippy::too_many_arguments)]
+    fn head_block(
+        &mut self,
+        gpu: &mut Gpu,
+        weights: &Qwen4Weights,
+        config: &Qwen4Config,
+        token: u32,
+        backbone_hidden: Option<&GpuTensor>,
+        position: usize,
+        fresh_qsa_selection: bool,
+        step: MtpStep,
+        ep: Option<MtpEpGather<'_>>,
+    ) -> Result<(usize, usize, usize, usize, usize), MtpGpuError> {
+        let config = config.mtp_geometry();
+        self.head_prologue(gpu, config, token, backbone_hidden, position)?;
         let mtp = bound_mtp(weights)?;
         let lengths = {
             let scratch = &self.scratch;
             let state = &self.state;
-            let backbone_hidden = backbone_hidden.unwrap_or(&scratch.backbone_hidden);
+            let backbone_hidden =
+                backbone_hidden.unwrap_or(if gpu.flags.qwen4_draft_glue_fold_enabled() {
+                    &state.wide_hidden
+                } else {
+                    &scratch.backbone_hidden
+                });
             let hidden = config.hidden_size;
             let ctx = DispatchCtx::new(gpu);
             let attn = hyper_desc(weights, &mtp.attn_hyper)?;
@@ -2987,68 +3969,28 @@ impl Qwen4MtpGpu {
                     selected_len_out: &state.selected_len_out,
                 },
             };
-            let attention = IndexedAttentionOp {
-                indexer_qk: qsa.indexer_qk,
-                indexer_q_norm: qsa.indexer_q_norm,
-                indexer_k_norm: qsa.indexer_k_norm,
-                q: qsa.q,
-                k: qsa.k,
-                v: qsa.v,
-                q_norm: qsa.q_norm,
-                k_norm: qsa.k_norm,
-                output: qsa.output,
-                state: IndexedAttentionState {
-                    // The one MTP layer keeps the exact F32 QSA state.
-                    format: QsaKvFormat::F32,
-                    full_keys: &state.full_keys,
-                    full_values: &state.full_values,
-                    raw_index_keys: &state.raw_index_keys,
-                    pooled_keys: &state.pooled_keys,
-                    selected_indices: &state.selected_indices,
-                    f16_arena: None,
-                    pooled_bf16: None,
-                    full_capacity: state.full_capacity,
-                    raw_capacity: state.raw_capacity,
-                    pooled_capacity: state.pooled_capacity,
-                    selected_capacity: state.selected_capacity,
-                    position_capacity: state.full_capacity,
-                    full_len: state.full_len,
-                    raw_len: state.raw_len,
-                    pooled_len: state.pooled_len,
-                    selected_len: state.selected_len,
-                    position: state.position,
-                },
-                input: &scratch.hc_mixed,
-                index_scratch: &scratch.index,
-                qgate_scratch: &scratch.q_and_gate,
-                k_scratch: &scratch.qsa_k,
-                v_scratch: &scratch.qsa_v,
-                qsa_output: &scratch.qsa_output,
-                selected_scratch: &scratch.qsa_selected,
-                attention_output: &scratch.projected_embedding,
-                bf16_scratch: &scratch.hc_bf16,
-                rows: 1,
-                index_heads: config.indexer_n_heads,
-                index_kv_heads: config.indexer_kv_heads,
-                index_dim: config.indexer_head_dim,
-                budget: config.indexer_budget,
-                compress: config.indexer_compress_ratio,
-                heads: config.num_attention_heads,
-                kv_heads: config.num_key_value_heads,
-                head_dim: config.head_dim,
-                rotary_dim: config.rotary_dim(),
-                rope: config.rope(),
-                input_width: hidden,
-                rotation: &scratch.rotation,
+            let row_tensors = scratch.row_tensors();
+            let attention = head_attention_op(
+                config,
+                scratch,
+                state,
+                qsa,
                 mode,
-                trunk_a4: 0,
-                phase: MixerPhase::Whole,
-            };
+                &scratch.hc_mixed,
+                &scratch.projected_embedding,
+            );
             let lengths = attention.next_lengths()?;
             // Under EP a MoE head step exchanges its expanded rows through the
             // forward's row gather: gather buffer `2 + j % 2` and layer index
             // `trunk_layers + j % 2` for the head's monotonic MoE invocation
             // counter `j` (one increment per MoE head step, never rewound).
+            // A lane-local step (`set_lane_local`: an owned draft lane) keeps
+            // the same layer index and gather buffer (the lowering and every
+            // buffer role are the EP call's) but runs on the full-table
+            // runtime with the no-op row gather, and leaves `j` alone so the
+            // replicated calls keep their parity in lockstep on every rank.
+            let lane_local = self.lane_local && self.ep_bound;
+            let mut local_hook: Option<LaneLocalRowGather<'_>> = None;
             let moe_ep: Option<(usize, &GpuTensor, &dyn MoeRowGather)> = if self.ep_bound
                 && step != MtpStep::Append
                 && matches!(&mtp.ffn, Qwen4FfnWeights::Moe(_))
@@ -3056,21 +3998,58 @@ impl Qwen4MtpGpu {
                 let ep = ep
                     .ok_or_else(|| invalid("an EP MTP head step needs the forward's row gather"))?;
                 let parity = (self.moe_steps % 2) as usize;
-                self.moe_steps = self.moe_steps.wrapping_add(1);
+                let hook: &dyn MoeRowGather = if lane_local {
+                    local_hook.insert(LaneLocalRowGather { ep: Some(ep.hook) })
+                } else {
+                    self.moe_steps = self.moe_steps.wrapping_add(1);
+                    ep.hook as &dyn MoeRowGather
+                };
                 Some((
                     config.num_hidden_layers + parity,
                     ep.buffers[2 + parity],
-                    ep.hook as &dyn MoeRowGather,
+                    hook,
                 ))
             } else {
                 None
+            };
+            let head_moe = if lane_local {
+                self.moe_full.as_ref()
+            } else {
+                self.moe.as_ref()
+            };
+            // A stock-FP8 (qt=55) head has no indexed decode route: its one-row
+            // step seals the grouped call (`seal_moe_rows` at one routing row),
+            // over the grouped scratch allocated at attach and the one-row
+            // scratch's HC rows and FFN output.
+            let fp8_router = match (head_moe, self.fp8_moe.as_ref()) {
+                (Some(runtime), Some(fp8)) if runtime.is_fp8() && step != MtpStep::Append => {
+                    Some(fp8.router_view(config)?)
+                }
+                _ => None,
+            };
+            let fp8_layer = match (self.fp8_moe.as_ref(), fp8_router.as_ref()) {
+                (Some(fp8), Some(router)) => Some(fp8.layer_scratch(scratch, router)),
+                _ => None,
             };
             // The MTP layer's FFN is the trunk's kind (`attach` refuses a
             // head whose FFN weights disagree with the profile).
             let ffn = if step == MtpStep::Append {
                 None
             } else {
-                Some(match (&mtp.ffn, self.moe.as_ref()) {
+                Some(match (&mtp.ffn, head_moe) {
+                    (Qwen4FfnWeights::Moe(_), Some(runtime)) if runtime.is_fp8() => {
+                        if moe_ep.is_some() {
+                            return Err(invalid(
+                                "stock-FP8 head experts run on one device; they take no EP row gather",
+                            ));
+                        }
+                        let layer = fp8_layer.as_ref().ok_or_else(|| {
+                            invalid(
+                                "a stock-FP8 MTP head step needs the head's grouped MoE scratch",
+                            )
+                        })?;
+                        MtpFfnCall::Moe(seal_moe_rows(&ctx, config, 0, runtime, 1, layer, None)?)
+                    }
                     (Qwen4FfnWeights::Moe(_), Some(runtime)) => {
                         MtpFfnCall::Moe(seal_moe_decode(
                             &ctx,
@@ -3131,89 +4110,46 @@ impl Qwen4MtpGpu {
                     _ => return Err(invalid("MTP FFN weights and runtime disagree")),
                 })
             };
+            let views = HeadRowViews::new(&row_tensors, config, MTP_HC_ROWS, false);
             let mut steps: SmallVec<[Step<'_>; 16]> = SmallVec::new();
-            steps.push(Step::Embed(EmbeddingOp {
-                table: weights.resident(&weights.root.embedding)?,
-                rotated: &scratch.embedding_rot,
-                token_ids: &scratch.token_ids,
-                output: &scratch.token_embedding,
-                rows: 1,
-                dim: hidden,
-            }));
-            steps.push(Step::HyperNorm(HyperNormOp {
-                input: &scratch.token_embedding,
-                norm_weight: weights.resident(&mtp.pre_fc_norm_embedding)?,
-                normalized: &scratch.embedding_norm,
-                branches: 1,
-                hidden,
-                state_bf16: false,
-            }));
-            steps.push(Step::Project(ProjectOp {
-                weight: dense_ref(weights, &mtp.fc_embedding)?,
-                input: &scratch.embedding_norm,
-                output: &scratch.projected_embedding,
-                rows: 1,
-                rotation: Some(&scratch.rotation),
-                ladder: ProjectLadder::Trunk,
-                residual: None,
-            }));
-            steps.push(Step::HyperNorm(HyperNormOp {
-                input: backbone_hidden,
-                norm_weight: weights.resident(&mtp.pre_fc_norm_hidden)?,
-                normalized: &scratch.hidden_norm,
-                branches: config.hc_count,
-                hidden,
-                state_bf16: false,
-            }));
-            // Both branch rows in one projection (each bitwise its own).
-            steps.push(Step::Project(ProjectOp {
-                weight: dense_ref(weights, &mtp.fc_hidden)?,
-                input: &scratch.hidden_norm,
-                output: &scratch.projected_hidden,
-                rows: config.hc_count,
-                rotation: Some(&scratch.rotation),
-                ladder: ProjectLadder::Trunk,
-                residual: None,
-            }));
-            steps.push(Step::BroadcastAdd(BroadcastAddOp {
-                rows_input: &scratch.projected_hidden,
-                row: &scratch.projected_embedding,
-                output: &scratch.wide,
-                rows: config.hc_count,
-                width: hidden,
-            }));
-            steps.push(Step::HyperRead(hc_read(&attn.read, scratch, config)));
+            push_head_rows_front(
+                &mut steps,
+                weights,
+                config,
+                mtp,
+                &row_tensors,
+                &views,
+                MTP_HC_ROWS,
+                gpu.flags.qwen4_draft_glue_fold_enabled(),
+                backbone_hidden,
+                &attn.read,
+            )?;
             steps.push(Step::IndexedAttention(attention));
-            if let Some(ffn) = ffn {
-                steps.push(Step::HyperWrite(hc_write(
-                    &attn.write,
-                    &scratch.projected_embedding,
-                    scratch,
-                    config,
-                )));
-                steps.push(Step::HyperRead(hc_read(&mlp.read, scratch, config)));
-                match ffn {
-                    MtpFfnCall::Moe(moe) => {
-                        steps.push(Step::Clear(ClearOp {
-                            tensor: &scratch.ffn_output,
-                            elements: hidden,
-                        }));
-                        steps.push(Step::Moe(moe));
-                    }
-                    MtpFfnCall::Dense(dense) => steps.push(Step::GatedMlp(dense)),
-                }
-                steps.push(Step::HyperWrite(hc_write(
-                    &mlp.write,
-                    &scratch.ffn_output,
-                    scratch,
-                    config,
-                )));
-                if step == MtpStep::Predict {
-                    steps.push(Step::HyperRead(hc_read(&final_read, scratch, config)));
-                }
-            }
+            push_head_rows_back(
+                &mut steps,
+                config,
+                &row_tensors,
+                MTP_HC_ROWS,
+                &attn.write,
+                &mlp.read,
+                &mlp.write,
+                &final_read,
+                ffn,
+                step == MtpStep::Predict,
+            );
             validate_steps(gpu, &steps)?;
             execute_validated_steps(gpu, &ctx, &steps)?;
+            #[cfg(feature = "lab")]
+            if moe_ep.is_some() {
+                lab_expert_trace::record(
+                    gpu,
+                    &scratch.moe_topk_indices,
+                    1,
+                    config.num_experts_per_tok,
+                    weights.ep_placement(),
+                    lane_local,
+                )?;
+            }
             lengths
         };
         Ok(lengths)
@@ -3229,6 +4165,7 @@ impl Qwen4MtpGpu {
         weights: &Qwen4Weights,
         config: &Qwen4Config,
     ) -> bool {
+        let config = config.mtp_geometry();
         (gpu.arch_caps.is_gfx1151() || gpu.arch_caps.is_gfx1201())
             && AppendWidths::new(config)
                 .is_some_and(|w| AppendWeights::resolve(weights, config, &w).is_ok())
@@ -3278,6 +4215,9 @@ impl Qwen4MtpGpu {
         device_ids: Option<&GpuTensor>,
         position: usize,
     ) -> Result<(), MtpGpuError> {
+        // Never the plain-AR retained body (see `head_prologue`).
+        gpu.replay.set_forward_eligible(false);
+        let config = config.mtp_geometry();
         let rows = tokens.len();
         let w = AppendWidths::new(config).ok_or_else(|| invalid("MTP append width overflow"))?;
         let det = append_rows_det(context, mtp_append_det_enabled(gpu));
@@ -3496,7 +4436,20 @@ impl Qwen4MtpGpu {
                 state_bf16: false,
             },
         )?;
-        if det {
+        if mw.hc.input_mix_down.dtype == DType::HC8E4M3Row {
+            // HC8 sidecar mixers (exact gfx1201): down (+ hc_act) and up on the `hc8_gemm`
+            // kernel, bitwise the per-row HC read's launches (the kernel is row-invariant).
+            append_hc8_read(
+                gpu,
+                det,
+                &mw.hc,
+                &hc_normalized,
+                &hc_low,
+                &hc_up,
+                rows,
+                config.hc_count,
+            )?;
+        } else if det {
             // DET: the raw fixed-ascending-K F16 WMMA down projection, then the
             // HC read activation (`hc_activation_fused_f32`, scale 1/branches,
             // in place over the F32 `hc_low` rows) the incumbent fuses into the
@@ -3530,7 +4483,9 @@ impl Qwen4MtpGpu {
                 rows,
             )?;
         }
-        append_dense_projection(gpu, det, &mw.hc.input_mix_up, &hc_low, &hc_up, rows)?;
+        if mw.hc.input_mix_up.dtype != DType::HC8E4M3Row {
+            append_dense_projection(gpu, det, &mw.hc.input_mix_up, &hc_low, &hc_up, rows)?;
+        }
         hyper_read_projected(
             gpu,
             &HyperReadProjected {
@@ -3748,6 +4703,50 @@ mod tests {
         sizes.iter().sum()
     }
 
+    /// The batched head call is 32 rows on exact single-device gfx942 only, and the rows scratch
+    /// (so the census, which shares [`MtpRowsScratch::shapes`]) holds 32 rows exactly where the
+    /// stock-FP8 profile loads (admitted on single-device gfx942 only); every other profile
+    /// keeps 8 rows.
+    #[test]
+    fn draft_call_width_is_32_on_single_device_gfx942_only() {
+        assert_eq!(MTP_DRAFT_LANES_MAX, 8);
+        assert_eq!(MTP_DRAFT_LANES_MAX_GFX942, 32);
+        for (capacity, gfx942, ep, want) in [
+            (32, true, false, 32),
+            (32, true, true, 8),
+            (32, false, false, 8),
+            (32, false, true, 8),
+            (8, true, false, 8),
+            (8, true, true, 8),
+            (8, false, false, 8),
+        ] {
+            assert_eq!(
+                call_rows_for(capacity, gfx942, ep),
+                want,
+                "capacity {capacity}, gfx942 {gfx942}, ep {ep}"
+            );
+        }
+        let packed = compact_test_config();
+        let stock = packed.clone().into_stock_mtp().unwrap();
+        assert_eq!(draft_call_capacity(&packed), MTP_DRAFT_LANES_MAX);
+        assert_eq!(draft_call_capacity(&stock), MTP_DRAFT_LANES_MAX_GFX942);
+        for (config, rows) in [(&packed, 8usize), (&stock, 32)] {
+            let geometry = config.mtp_geometry();
+            let shapes = MtpRowsScratch::shapes(config).unwrap().unwrap();
+            // token ids (i32 per row), the draft ranking's logits and rotated rows, and the
+            // attention output rows scale with the call width; the per-expert counters do not.
+            assert_eq!(shapes[0], (rows * 4, DType::Raw));
+            assert_eq!(shapes[1].0, rows * geometry.hidden_size);
+            assert_eq!(shapes[37].0, rows * geometry.vocab_size);
+            assert_eq!(shapes[38].0, rows * geometry.hidden_size);
+            assert_eq!(
+                shapes[43].0,
+                rows * geometry.num_attention_heads * geometry.head_dim
+            );
+            assert_eq!(shapes[30].0, geometry.num_experts * 4);
+        }
+    }
+
     /// Operator and fill scratch inventories are their owners' own shape
     /// tables: one entry per tensor, summing to the byte queries, with the
     /// append scratch refusing overflow like its byte query.
@@ -3963,26 +4962,51 @@ mod tests {
     #[test]
     fn head_d2_decision_table() {
         use HeadD2Decision::{Armed, Off};
-        // Unset and `1` both follow the trunk's D2 verdict (non-EP only).
+        // Unset and `1` both follow the trunk's D2 verdict (non-EP only) for a
+        // host-placed head.
         for knob in [None, Some(true)] {
-            assert_eq!(head_d2_decision(knob, true, false), Armed);
+            assert_eq!(head_d2_decision(knob, true, false, false), Armed);
             assert_eq!(
-                head_d2_decision(knob, false, false),
+                head_d2_decision(knob, false, false, false),
                 Off(HeadD2Off::TrunkD2Off)
             );
-            assert_eq!(head_d2_decision(knob, true, true), Off(HeadD2Off::Ep));
-            assert_eq!(head_d2_decision(knob, false, true), Off(HeadD2Off::Ep));
+            assert_eq!(
+                head_d2_decision(knob, true, true, false),
+                Off(HeadD2Off::Ep)
+            );
+            assert_eq!(
+                head_d2_decision(knob, false, true, false),
+                Off(HeadD2Off::Ep)
+            );
+            // A VRAM-resident head (HIPFIRE_QWEN4_MTP_HEAD_RESIDENT) never
+            // splits: there is no host copy for the CPU arm.
+            assert_eq!(
+                head_d2_decision(knob, true, false, true),
+                Off(HeadD2Off::Resident)
+            );
+            assert_eq!(
+                head_d2_decision(knob, false, false, true),
+                Off(HeadD2Off::TrunkD2Off)
+            );
+            assert_eq!(head_d2_decision(knob, true, true, true), Off(HeadD2Off::Ep));
         }
-        // `0` is the kill for every trunk/EP combination.
+        // `0` is the kill for every trunk/EP/residency combination.
         for trunk in [true, false] {
             for ep in [true, false] {
-                assert_eq!(
-                    head_d2_decision(Some(false), trunk, ep),
-                    Off(HeadD2Off::KnobOff)
-                );
+                for resident in [true, false] {
+                    assert_eq!(
+                        head_d2_decision(Some(false), trunk, ep, resident),
+                        Off(HeadD2Off::KnobOff)
+                    );
+                }
             }
         }
-        for off in [HeadD2Off::KnobOff, HeadD2Off::TrunkD2Off, HeadD2Off::Ep] {
+        for off in [
+            HeadD2Off::KnobOff,
+            HeadD2Off::TrunkD2Off,
+            HeadD2Off::Ep,
+            HeadD2Off::Resident,
+        ] {
             assert!(!off.reason().is_empty());
         }
     }
@@ -4304,6 +5328,146 @@ mod tests {
             MtpGpuScratch::device_bytes(&config).unwrap(),
             flash_next_mtp_plan_bytes(&config)
         );
+    }
+
+    /// A trunk-shard rank that KEEPS the head (lab): the replicated head is sized under the
+    /// GLOBAL geometry (24 q heads, shared expert 640) although the rank's own config is the
+    /// local one (12 q heads, 384 / 256). Every sizing entry the loader, census, lanes and
+    /// `native_mtp_device_bytes` reach is byte-identical to the unsharded config's, and a config
+    /// that lost its geometry view would size different (smaller) q/shared buffers.
+    #[test]
+    fn head_sizing_under_a_trunk_shard_rank_is_the_global_geometry() {
+        let global = compact_test_config();
+        let context = Qwen4ContextCommit::legacy(4096);
+        let global_q = global.num_attention_heads * global.head_dim;
+        let global_shapes = MtpGpuScratch::shapes(&global).unwrap();
+        // pin the two shard-dependent tensors of the scratch plan: q-and-gate rows, shared
+        assert_eq!(global_shapes[17], (2 * global_q, DType::F32));
+        assert_eq!(
+            global_shapes[35],
+            (global.shared_expert_intermediate_size, DType::F32)
+        );
+        assert_eq!(global.shared_expert_intermediate_size, 640);
+        for rank in 0..2 {
+            let local = global.trunk_shard_local(rank, 2).unwrap();
+            assert_eq!(local.num_attention_heads * 2, global.num_attention_heads);
+            assert_eq!(MtpGpuScratch::shapes(&local).unwrap(), global_shapes);
+            assert_eq!(
+                MtpGpuScratch::allocation_sizes(&local),
+                MtpGpuScratch::allocation_sizes(&global)
+            );
+            assert_eq!(
+                MtpGpuScratch::device_bytes(&local).unwrap(),
+                flash_next_mtp_plan_bytes(&global)
+            );
+            assert_eq!(
+                MtpRowsScratch::device_bytes(&local),
+                MtpRowsScratch::device_bytes(&global)
+            );
+            assert_eq!(
+                MtpRowsScratch::allocation_sizes(&local),
+                MtpRowsScratch::allocation_sizes(&global)
+            );
+            for head in [DType::BF16, DType::MQ6G256V2] {
+                for head_d2 in [false, true] {
+                    assert_eq!(
+                        Qwen4MtpGpu::device_bytes(&local, &context, head, head_d2),
+                        Qwen4MtpGpu::device_bytes(&global, &context, head, head_d2)
+                    );
+                    assert_eq!(
+                        Qwen4MtpGpu::allocation_sizes(&local, &context, head, head_d2),
+                        Qwen4MtpGpu::allocation_sizes(&global, &context, head, head_d2)
+                    );
+                }
+                assert_eq!(
+                    crate::mtp_spec::native_mtp_device_bytes(
+                        &local, &context, 1536, 3, head, None, false
+                    ),
+                    crate::mtp_spec::native_mtp_device_bytes(
+                        &global, &context, 1536, 3, head, None, false
+                    )
+                );
+            }
+            // without the view the rank-local geometry WOULD have been sized: smaller buffers
+            let mut naive = local.clone();
+            naive.mtp_head = None;
+            assert_ne!(
+                MtpGpuScratch::allocation_sizes(&naive),
+                MtpGpuScratch::allocation_sizes(&global)
+            );
+            assert_eq!(MtpGpuScratch::shapes(&naive).unwrap()[17].0, global_q);
+            assert_eq!(
+                MtpGpuScratch::shapes(&naive).unwrap()[35].0,
+                [384, 256][rank]
+            );
+        }
+        // a head-free shard has no head to size: the view is the plain config (identity)
+        let headless = global
+            .clone()
+            .into_headless()
+            .unwrap()
+            .trunk_shard_local(1, 2)
+            .unwrap();
+        assert!(std::ptr::eq(headless.mtp_geometry(), &headless));
+    }
+
+    /// The hidden stream the head reads after the sharded trunk is the FULL replicated HC
+    /// stream: the trunk-output taps (wide hidden capture, spec hidden rows, MTP wide hidden
+    /// carry, lane pending hidden) size from `hc_count * hidden`, which the shard never cuts.
+    #[test]
+    fn trunk_output_taps_are_full_width_under_the_shard() {
+        let global = compact_test_config();
+        let dims = crate::gpu_forward::program_dims(&global);
+        for rank in 0..2 {
+            let local = global.trunk_shard_local(rank, 2).unwrap();
+            let local_dims = crate::gpu_forward::program_dims(&local);
+            assert_eq!(local_dims.wide(), dims.wide());
+            assert_eq!(local_dims.wide(), global.hc_count * global.hidden_size);
+            assert_eq!(local.hc_count * local.hidden_size, dims.wide());
+            assert_eq!(local_dims.hidden, dims.hidden);
+            assert_eq!(local_dims.hc_lowrank, dims.hc_lowrank);
+            assert_eq!(
+                crate::gpu_forward::router_columns(local_dims),
+                crate::gpu_forward::router_columns(dims)
+            );
+            // what does shrink is the mixer / shared width, never the stream
+            assert_eq!(local_dims.q_width() * 2, dims.q_width());
+            assert_eq!(local_dims.gdn_value() * 2, dims.gdn_value());
+            let head = crate::gpu_forward::program_dims(local.mtp_geometry());
+            assert_eq!(head.wide(), local_dims.wide());
+            assert_eq!(head.q_width(), dims.q_width());
+        }
+    }
+
+    /// The head runs replicated on every rank: its HC writes are local, never the trunk shard's
+    /// fused all-reduce (the trunk route's writers are built only for trunk layers, in
+    /// `gpu_forward.rs` / `gpu_forward_lanes.rs`). Source guard: every HC write op the head
+    /// builds names `ar: None`, and the head code never reads the trunk route.
+    #[test]
+    fn head_hc_writes_carry_no_all_reduce() {
+        let ctor = ["HyperWrite", "Op {"].concat();
+        let route = ["trunk", "_route"].concat();
+        let mut seen = 0;
+        for (name, source) in [
+            ("mtp_gpu.rs", include_str!("mtp_gpu.rs")),
+            ("mtp_gpu/rows.rs", include_str!("mtp_gpu/rows.rs")),
+            ("mtp_gpu/lab.rs", include_str!("mtp_gpu/lab.rs")),
+        ] {
+            let production = source.split("mod tests {").next().unwrap();
+            for (at, _) in production.match_indices(&ctor) {
+                seen += 1;
+                let next = production[at..].lines().nth(1).unwrap_or("").trim();
+                assert_eq!(
+                    next, "ar: None,",
+                    "{name}: a head HC write must not all-reduce"
+                );
+            }
+            assert!(
+                !production.contains(&route),
+                "{name}: the head never reads the trunk route"
+            );
+        }
+        assert!(seen >= 1, "the head builds its HC writes in `hc_write`");
     }
 
     fn tiny_dense() -> Qwen4Config {

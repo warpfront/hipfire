@@ -99,7 +99,7 @@ use hipfire_runtime::dflash::{ring_segments, DraftCtxMode};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::kv_backend::KvBackend;
 use hipfire_runtime::llama::KvCache;
-use hipfire_runtime::loader_api::{CaskConfig, LoadCtx, ModelSource, SequenceHint, SpecLoadCfg};
+use hipfire_runtime::loader_api::{LoadCtx, ModelSource, SequenceHint, SpecLoadCfg};
 use hipfire_runtime::sampler::SamplerConfig;
 use hipfire_runtime::slot_batch::{
     BatchStepPlan, RequestEpoch, RequestRows, RequestStepKind, RowRange, SlotBatch, StepOutput,
@@ -898,7 +898,6 @@ fn load(model: &str) -> Result<(Ctx, Tokenizer, Value)> {
     drop(hfq);
     let mut gpu = Gpu::init()?;
     let src = ModelSource::from_path(model)?;
-    let cask = CaskConfig::default();
     let qwen_default_q8 = !matches!(
         hipfire_config::developer_var("HIPFIRE_QWEN_KV_DEFAULT_Q8")
             .ok()
@@ -929,7 +928,6 @@ fn load(model: &str) -> Result<(Ctx, Tokenizer, Value)> {
         kv_backend: KvBackend::default(),
         kv_adaptive_override: None,
         state_quant_override: None,
-        cask: &cask,
         pp: 1,
         pp_layer_counts: None,
         admitted_mesh: None,
@@ -6194,7 +6192,7 @@ fn lone_row_control(
 /// refuse wide admission; the `HIPFIRE_PREFILL_CHUNK_ROWS` and
 /// `HIPFIRE_VERIFY_GRAPH` pins).
 fn receipt_env() -> serde_json::Map<String, Value> {
-    const KEYS: [&str; 20] = [
+    const KEYS: [&str; 19] = [
         "HIPFIRE_CB_VERIFY_CHUNK128",
         "HIPFIRE_CB_VERIFY_PM",
         "HIPFIRE_WMMA_BATCH_TILES",
@@ -6206,7 +6204,6 @@ fn receipt_env() -> serde_json::Map<String, Value> {
         "HIPFIRE_GRAPH",
         "HIPFIRE_CB_SEG_TWINS",
         "HIPFIRE_DFLASH_WINDOW",
-        "HIPFIRE_DFLASH_CTX_CAP",
         "HIPFIRE_DFLASH_ADAPTIVE_B",
         "HIPFIRE_DFLASH_CKPT_RESUME",
         "HIPFIRE_DFLASH_Q8_LMHEAD_WMMA",
@@ -6576,7 +6573,6 @@ fn dflash_probe_phase(
         &mut gpu,
         None,
         None,
-        false,
         &slot.weights,
         kv_q8,
         slot.kv_cache.uses_vmm_backend(),
@@ -6589,7 +6585,7 @@ fn dflash_probe_phase(
         "gate0: DFlash draft loaded: layers={} hidden={} block={} runtime_block={}",
         df.draft_config.n_layers, df.draft_config.hidden, df.draft_config.block_size, df.block_size
     );
-    let mut d: Box<dyn Speculator> = build_dflash_speculator(df, true, false);
+    let mut d: Box<dyn Speculator> = build_dflash_speculator(df, false);
     let block = d.block_size();
     let (draft_bytes, draft_sha) = file_sha(draft_path)?;
     let cfg = G0Cfg {

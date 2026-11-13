@@ -11,10 +11,9 @@
 
 use crate::serve::complete::{
     complete_request_cancellable, completion_json, completion_json_multi_with_last,
-    completion_usage,
-    gate_endpoint_tools, openai_stream_delta_for_event, openai_stream_logprobs_for_event,
-    openai_stream_terminal_chunks_usage,
-    request_choice_count, Completion, EndpointAdapterKind,
+    completion_usage, gate_endpoint_tools, openai_stream_delta_for_event,
+    openai_stream_logprobs_for_event, openai_stream_terminal_chunks_usage, request_choice_count,
+    Completion, EndpointAdapterKind,
 };
 use crate::serve::metrics::Metrics;
 use crate::serve::{anthropic, responses};
@@ -1102,7 +1101,7 @@ async fn handle_request(
         }
         (Method::GET, "/stats") => {
             let meta = shared.meta.lock().unwrap_or_else(|e| e.into_inner());
-            let body = serde_json::json!({
+            let mut body = serde_json::json!({
                 "model": meta.current_model,
                 "uptime_sec": meta.started.elapsed().as_secs(),
                 "queue_depth": shared.admission.inflight(),
@@ -1113,6 +1112,14 @@ async fn handle_request(
                 "loaded_config": loaded_config_json(&meta),
                 "swap": meta.loaded.swap.clone(),
             });
+            // Per-position speculative acceptance folded from lane done events
+            // (`draft_positions`, `spec_cycles`, `spec_committed_tokens`).
+            if let (Some(obj), Some(spec)) = (
+                body.as_object_mut(),
+                shared.metrics.spec_positions.stats_json().as_object(),
+            ) {
+                obj.extend(spec.clone());
+            }
             json_response(body, 200)
         }
         (Method::GET, "/metrics") => {
@@ -3560,7 +3567,7 @@ mod tests {
         let mut meta = crate::serve::ServeMeta::new("test".to_owned());
         meta.current_model = Some("qwen3.5:4b".to_owned());
         meta.loaded = LoadedInfo {
-            kv_mode: Some("asym3".to_owned()),
+            kv_mode: Some("fwht3".to_owned()),
             kv_backend: Some("paged".to_owned()),
             max_seq: Some(32768),
             ..LoadedInfo::default()
@@ -3569,7 +3576,7 @@ mod tests {
             loaded_config_json(&meta),
             serde_json::json!({
                 "model": "qwen3.5:4b",
-                "kv_mode": "asym3",
+                "kv_mode": "fwht3",
                 "kv_backend": "paged",
                 "max_seq": 32768u64,
             })

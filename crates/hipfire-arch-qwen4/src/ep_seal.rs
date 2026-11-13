@@ -69,7 +69,67 @@ pub fn qwen4_source_generation(hfq: &HfqFile, model_path: &Path) -> Result<Strin
     if overlay.exists() {
         files.push(identity(&overlay)?);
     }
+    let hc8 = hipfire_config::memory::hc8_sidecar_path(model_path);
+    if hc8.exists() {
+        files.push(identity(&hc8)?);
+    }
     Ok(source_generation_fingerprint(&files))
+}
+
+/// DESIGN F1: `source` with every routed expert stack that `manifest` declares drop-zero planar
+/// (`MQ4G256V2P` / `MQ4G128V2P`) re-described as its planar representation: the dtype name and
+/// the stack's total encoded bytes (`experts * planar bytes per expert`). `None` when the
+/// manifest declares no planar stack. All-or-nothing across the stacks (one layout per device).
+fn planar_source_identity(
+    manifest: &Qwen4Manifest,
+    source: &SourceIdentity,
+) -> Result<Option<SourceIdentity>, String> {
+    use hipfire_runtime::mq4_planar::{self, Mq4PlanarKind};
+    let mut rewritten = source.clone();
+    let (mut planar, mut shipped) = (0usize, 0usize);
+    for entry in manifest
+        .weights
+        .iter()
+        .filter(|entry| entry.name.ends_with(GATE_UP) || entry.name.ends_with(DOWN))
+    {
+        if !entry.dtype.is_mq4_planar() {
+            shipped += 1;
+            continue;
+        }
+        planar += 1;
+        let kind = if entry.name.ends_with(GATE_UP) {
+            Mq4PlanarKind::GateUp
+        } else {
+            Mq4PlanarKind::Down
+        };
+        let range = rewritten
+            .manifest
+            .iter_mut()
+            .find(|range| range.name == entry.name)
+            .ok_or_else(|| format!("{} is absent from the source index", entry.name))?;
+        let [experts, rows, k] = range.logical_shape[..] else {
+            return Err(format!(
+                "{} shape {:?} is not [experts, rows, cols]",
+                entry.name, range.logical_shape
+            ));
+        };
+        let per_expert = mq4_planar::planar_bytes(kind, rows, k)
+            .map_err(|error| format!("{}: {error}", entry.name))?;
+        range.length = (experts as u64)
+            .checked_mul(per_expert as u64)
+            .ok_or_else(|| format!("{} planar bytes overflow", entry.name))?;
+        range.dtype = match kind {
+            Mq4PlanarKind::GateUp => mq4_planar::NAME_GATE_UP,
+            Mq4PlanarKind::Down => mq4_planar::NAME_DOWN,
+        }
+        .to_string();
+    }
+    if planar > 0 && shipped > 0 {
+        return Err(format!(
+            "expert drop-zero is all-or-nothing: {planar} routed stacks planar, {shipped} shipped"
+        ));
+    }
+    Ok((planar > 0).then_some(rewritten))
 }
 
 impl Qwen4EpSeal {
@@ -112,6 +172,11 @@ impl Qwen4EpSeal {
                 "the manifest declares no routed expert stacks".into(),
             ));
         }
+        // DESIGN F1: a drop-zero planar manifest seals the PLANAR representation of the routed
+        // stacks (dtype and per-expert encoded bytes), so the sealed table's resources describe
+        // the bytes the compact upload / unit arenas actually put on the device.
+        let planar_source = planar_source_identity(manifest, source).map_err(refuse)?;
+        let source = planar_source.as_ref().unwrap_or(source);
         let plans = plan_packed_expert_parallel(
             &groups,
             "qwen4",
@@ -462,6 +527,160 @@ mod tests {
         );
     }
 
+    /// The tile launcher's owner table is the sealed ownership: expert `e` on rank `e % ranks`,
+    /// each rank owning exactly its placement's share.
+    #[test]
+    fn owner_table_is_expert_modulo_ranks_and_balanced() {
+        let manifest = Qwen4Manifest::build(&crate::config::compact_test_config()).unwrap();
+        let source = source_of(&manifest, 10);
+        for ranks in 2..=8usize {
+            let devices: Vec<i32> = (0..ranks as i32).collect();
+            let seal = Qwen4EpSeal::seal(&manifest, 48, ranks, &devices, &source, "g1").unwrap();
+            let bytes = crate::gpu_forward::tile_owner_table_bytes(&seal.owner_ranks());
+            let table: Vec<i32> = bytes
+                .chunks_exact(4)
+                .map(|b| i32::from_le_bytes(b.try_into().unwrap()))
+                .collect();
+            assert_eq!(table.len(), seal.owner_ranks().len());
+            assert!(table
+                .iter()
+                .enumerate()
+                .all(|(e, &owner)| owner == (e % ranks) as i32));
+            for rank in 0..ranks {
+                assert_eq!(
+                    table.iter().filter(|&&owner| owner == rank as i32).count(),
+                    Qwen4EpPlacement { rank, ranks }.local_count(table.len())
+                );
+            }
+        }
+    }
+
+    /// The EP runtime's tables must be the sealed (rank, contract) binding: the table each rank
+    /// builds passes the residency proof against its own sealed owners and slots, and is refused
+    /// against a binding with other owners or when its views alias one slot.
+    #[test]
+    fn ep_tables_pass_the_residency_proof_of_their_own_sealed_binding_only() {
+        use crate::gpu_forward::{
+            check_sealed_residency, qwen4_expert_table_entries, Qwen4ExpertTableLayout,
+            Qwen4PeerExpertSource,
+        };
+        const GATE_UP: usize = 512;
+        const DOWN: usize = 256;
+        let manifest = Qwen4Manifest::build(&crate::config::compact_test_config()).unwrap();
+        let source = source_of(&manifest, 10);
+        for ranks in [2usize, 4] {
+            let devices: Vec<i32> = (0..ranks as i32).collect();
+            let seal =
+                Arc::new(Qwen4EpSeal::seal(&manifest, 48, ranks, &devices, &source, "g1").unwrap());
+            let experts = seal.owner_ranks().len();
+            let compact = |rank: usize| {
+                let count = Qwen4EpPlacement { rank, ranks }.local_count(experts);
+                Qwen4PeerExpertSource {
+                    gate_up_base: 0x1000_0000 * (rank + 1),
+                    gate_up_bytes: count * GATE_UP,
+                    down_base: 0x1000_0000 * (rank + 1) + 0x800_0000,
+                    down_bytes: count * DOWN,
+                }
+            };
+            let peers: Vec<_> = (0..ranks).map(compact).collect();
+            let dummy = Qwen4PeerExpertSource {
+                gate_up_base: 0xF000_0000,
+                gate_up_bytes: GATE_UP,
+                down_base: 0xF800_0000,
+                down_bytes: DOWN,
+            };
+            let sealed_of = |rank: usize| -> Vec<(usize, usize)> {
+                let placement = seal.placement(rank).unwrap();
+                let bound = Qwen4EpRankSeal {
+                    seal: seal.clone(),
+                    rank,
+                };
+                let (table, _) = bound.expert_binding(0, placement, devices[rank]).unwrap();
+                table
+                    .experts()
+                    .iter()
+                    .map(|meta| (meta.owner_rank(), meta.local_slot()))
+                    .collect()
+            };
+            for rank in 0..ranks {
+                let placement = seal.placement(rank).unwrap();
+                let own = sealed_of(rank);
+                // The same slots sealed to the next rank: every entry's owner disagrees.
+                let other: Vec<_> = own
+                    .iter()
+                    .map(|&(owner, slot)| ((owner + 1) % ranks, slot))
+                    .collect();
+                for layout in [
+                    Qwen4ExpertTableLayout::Ep { placement, dummy },
+                    Qwen4ExpertTableLayout::Full {
+                        placement,
+                        peers: &peers,
+                    },
+                ] {
+                    let check = |entries: &[_], sealed: &[(usize, usize)]| {
+                        check_sealed_residency(&layout, peers[rank], entries, sealed, GATE_UP, DOWN)
+                    };
+                    let entries =
+                        qwen4_expert_table_entries(&layout, peers[rank], experts, GATE_UP, DOWN)
+                            .unwrap();
+                    check(&entries, &own).unwrap();
+                    let error = check(&entries, &other).unwrap_err();
+                    assert!(error.contains("not the sealed owner"), "{error}");
+                    // Every view aliasing this rank's first owned slot (the residency demo).
+                    let aliased = vec![entries[rank]; experts];
+                    let error = check(&aliased, &own).unwrap_err();
+                    assert!(error.contains("not the sealed owner"), "{error}");
+                    // Two owned experts swapping slots keep owner and origin but not the slot.
+                    let mut swapped = entries.clone();
+                    swapped.swap(rank, rank + ranks);
+                    let error = check(&swapped, &own).unwrap_err();
+                    assert!(error.contains("not the sealed owner"), "{error}");
+                    // Any one entry (owned, dummy or peer) one expert off its sealed address.
+                    for expert in 0..experts {
+                        let mut moved = entries.clone();
+                        moved[expert].down_ptr += DOWN;
+                        let error = check(&moved, &own).unwrap_err();
+                        assert!(error.contains(&format!("expert {expert} ")), "{error}");
+                    }
+                    // Another rank's slot-0 expert naming this rank's own slot 0.
+                    let mut stolen = entries.clone();
+                    stolen[(rank + 1) % ranks] = entries[rank];
+                    let error = check(&stolen, &own).unwrap_err();
+                    assert!(error.contains("not the sealed owner"), "{error}");
+                }
+            }
+        }
+    }
+
+    /// An EP layer runtime runs under its sealed (rank, contract) binding, never the
+    /// single-device rank-0-of-1 stand-in.
+    #[test]
+    fn ep_layer_table_binds_the_sealed_rank_not_the_single_stand_in() {
+        use crate::gpu_forward::layer_table_binding;
+        let manifest = Qwen4Manifest::build(&crate::config::compact_test_config()).unwrap();
+        let source = source_of(&manifest, 10);
+        for ranks in [2usize, 3, 4] {
+            let devices: Vec<i32> = (0..ranks as i32).collect();
+            let seal =
+                Arc::new(Qwen4EpSeal::seal(&manifest, 48, ranks, &devices, &source, "g1").unwrap());
+            for rank in 0..ranks {
+                let bound = Qwen4EpRankSeal {
+                    seal: seal.clone(),
+                    rank,
+                };
+                let sealed = bound
+                    .expert_binding(0, seal.placement(rank).unwrap(), devices[rank])
+                    .unwrap();
+                let (table, cache) =
+                    layer_table_binding(Some(sealed), Vec::new(), devices[rank]).unwrap();
+                assert_eq!((cache.local_rank(), cache.rank_count()), (rank, ranks));
+                assert!(table
+                    .execution_contract()
+                    .is_some_and(|contract| contract.is_owner_routed_ep()));
+            }
+        }
+    }
+
     /// The generation covers the trunk-overlay sidecar beside the model: one
     /// that appears, is rewritten, or vanishes reads as another generation.
     #[test]
@@ -488,6 +707,36 @@ mod tests {
         std::fs::write(&overlay, b"bb").unwrap();
         assert_ne!(qwen4_source_generation(&hfq, &model).unwrap(), with_overlay);
         std::fs::remove_file(&overlay).unwrap();
+        assert_eq!(qwen4_source_generation(&hfq, &model).unwrap(), base);
+        drop(hfq);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The generation covers the `.hc8` sidecar beside the model too.
+    #[test]
+    fn source_generation_binds_the_hc8_sidecar() {
+        use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqMemTensor};
+        let dir =
+            std::env::temp_dir().join(format!("hipfire-qwen4-ep-gen-hc8-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let model = dir.join("m.hfq");
+        let tensor = HfqMemTensor {
+            name: "t".into(),
+            quant_type: 1,
+            shape: vec![2],
+            group_size: 0,
+            data: vec![0; 4],
+        };
+        write_hfqm_package_mem(&model, crate::ARCH_ID, "{}", &[tensor]).unwrap();
+        let hfq = HfqFile::open(&model).unwrap();
+        let base = qwen4_source_generation(&hfq, &model).unwrap();
+        let sidecar = hipfire_config::memory::hc8_sidecar_path(&model);
+        std::fs::write(&sidecar, b"a").unwrap();
+        let with_sidecar = qwen4_source_generation(&hfq, &model).unwrap();
+        assert_ne!(with_sidecar, base);
+        std::fs::write(&sidecar, b"bb").unwrap();
+        assert_ne!(qwen4_source_generation(&hfq, &model).unwrap(), with_sidecar);
+        std::fs::remove_file(&sidecar).unwrap();
         assert_eq!(qwen4_source_generation(&hfq, &model).unwrap(), base);
         drop(hfq);
         std::fs::remove_dir_all(&dir).unwrap();

@@ -25,8 +25,8 @@ formats and the build stayed green.
 in the tree but not the table, STALE for a table row with no crate. This applies
 the same bidirectional check to the qt space, and folds the exemption problem in
 with it: `qt_unregistered <= 10` was uninterpretable because ten variants were a
-mix of deliberate non-passthrough (22 is an index tensor, 28/29 load via
-paro.rs, 31-37 via arch loaders) and genuine omissions like `cf061b7ed`, where
+mix of deliberate non-passthrough (22 is an index tensor, 28/29 are removed ParoQuant ids
+refused at load, 31-37 via arch loaders) and genuine omissions like `cf061b7ed`, where
 qt=40's encoder, GEMV and is_mq arms all landed and the model simply would not
 load. Declaring a disposition per row makes those two cases distinguishable.
 

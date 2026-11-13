@@ -35,14 +35,14 @@ pub mod wait;
 pub use backend::{Auth, Backend, EventId, Seal, SlotTransition};
 pub use lds::{
     advance, join, prime, ready, retire, retire_cur, rotate, AllFree, Free, JoinPart, LdsRegion,
-    Lendable, Published, Ring, State, StoreTarget, Transition, Transitions, Writing,
-    MAX_RING_DEPTH,
+    Lendable, Owned, PrivState, PrivWritable, Published, Ring, State, StoreTarget, Transition,
+    Transitions, WaveRegion, Writing, MAX_RING_DEPTH,
 };
 pub use scope::{
     Arrived, Carried, End, Forward, LoopExit, Scc, Uniform, Wave, WgUniform, Workgroup,
 };
 pub use target::{
-    BarrierModel, Full, Gfx1100, Gfx1151, Gfx11Waits, Gfx1201, Gfx12Waits, LdsCounter, MmaIu4,
-    Split, SplitBarrier, Target, WaitModel,
+    BarrierModel, CdnaWaits, Full, Gfx1100, Gfx1151, Gfx11Waits, Gfx1201, Gfx12Waits, Gfx942,
+    LdsCounter, MmaIu4, Split, SplitBarrier, Target, WaitModel,
 };
 pub use wait::{Drained, Event, LdsWrite, Pending, Pendings};

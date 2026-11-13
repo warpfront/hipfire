@@ -19,14 +19,14 @@ use super::weights::{
     FullAttnMoeLayerWeights, LayerWeights, StateQuant,
 };
 use crate::speculative::GdnTape;
-use hip_bridge::HipResult;
+use hip_bridge::{HipError, HipResult};
 use hipfire_dispatch::families::kv_tier::KvTierInputs;
 use hipfire_dispatch::pipeline::batched::{BatchScratch, DenseBatchMath, DflashFusionCtx};
 use hipfire_dispatch::pipeline::batched_attention::{
     AttentionLayerView, BatchedAttentionTap, FlashScratch, KvView,
 };
 use hipfire_dispatch::pipeline::batched_deltanet::{
-    DeltaNetLayerView, DeltaNetStateView, GdnTapeView,
+    DeltaNetLayerView, DeltaNetStateView, GdnCarryView, GdnStreamView, GdnTapeView,
 };
 use hipfire_dispatch::pipeline::batched_moe::{AttentionMoeLayerView, DeltaNetMoeLayerView};
 use hipfire_dispatch::pipeline::gated_mlp::{
@@ -40,6 +40,11 @@ use hipfire_dispatch::pipeline::hybrid::{
 use hipfire_dispatch::pipeline::Step;
 use hipfire_runtime::llama::WeightTensor;
 use hipfire_runtime::llama::{self, KvCacheExt};
+use rdna_compute::gdn_stream::{
+    GdnCarryView as ScanCarryView, GdnLiveState, GdnQ8Planes, GdnScanAlgorithm, GdnStreamConsts,
+    GdnStreamMeta, GdnStreamPhase, GdnTensorFormat,
+};
+use rdna_compute::norm::GdnScanOut;
 use rdna_compute::{Gpu, GpuTensor};
 
 pub(crate) fn hybrid_dims(config: &Qwen35Config) -> HybridDims {
@@ -522,13 +527,148 @@ pub(crate) fn flash_scratch(s: &Qwen35Scratch) -> FlashScratch<'_> {
 }
 
 pub(crate) fn deltanet_state_view(state: &DeltaNetState) -> DeltaNetStateView<'_> {
+    let stream = &state.stream;
     DeltaNetStateView {
         s_matrices: &state.s_matrices,
         s_scales: &state.s_scales,
         conv_states: &state.conv_states,
         s_ef_residual: &state.s_ef_residual,
         quant: state.quant,
+        stream: GdnStreamView {
+            recipe_id: stream.recipe_id,
+            generation: stream.generation,
+            lanes: stream.lanes,
+            meta: &stream.meta,
+            carry: stream.carry.as_ref().map(|c| GdnCarryView {
+                geometry: c.geometry,
+                tile_state: &c.tile_state,
+                tile_conv: &c.tile_conv,
+                raw_qkv: &c.raw_qkv,
+                raw_ab: &c.raw_ab,
+            }),
+            plans: &stream.plans,
+            workspaces: stream.binding.as_ref().map_or(&[], |b| &b.workspaces),
+        },
     }
+}
+
+/// The single genuine prefill→decode/verify fence (CHUNK-CANONICAL §3.5):
+/// transition every DeltaNet layer's stream to `Sealed` at the actual prompt
+/// end `position`, so decode/verify may read the Q8/EF state.
+///
+/// Call exactly once where an ordinary-prefill phase ends and decode/verify
+/// begins; never per outer chunk, checkpoint, snapshot, VRAM downgrade, lane
+/// swap, cancellation check or restore.
+///
+/// Streams already `Sealed` (owned by decode/verify, which does not maintain
+/// the cursors) are stamped at `position` with no pending rows. An `Open`
+/// layer finishes its phase through its plan's seal executor
+/// (`Gpu::gdn_stream_seal` / `gdn_stream_seal_sequential`): the incomplete tile's
+/// effective end is recomputed from the retained tile-entry state and raw rows
+/// and quantized exactly once at `position`, the live conv ring (already at
+/// `position`) untouched. Every Open cursor must equal `position` (checked before
+/// any mutation); the sealed cursors of all layers are published only after
+/// every layer succeeded.
+pub(crate) fn seal_deltanet_streams(
+    gpu: &mut Gpu,
+    state: &mut DeltaNetState,
+    position: usize,
+) -> HipResult<()> {
+    if state.stream.is_open() {
+        let sealed = seal_open_layers(gpu, state, position as u64)?;
+        let generation = state.stream.generation;
+        for (slot, mut next) in state.stream.meta.iter_mut().zip(sealed) {
+            next.owner_generation = generation;
+            *slot = next;
+        }
+    }
+    state.stream.seal_sealed_at(position as u64)
+}
+
+fn seal_open_layers(
+    gpu: &mut Gpu,
+    state: &DeltaNetState,
+    position: u64,
+) -> HipResult<Vec<GdnStreamMeta>> {
+    let stream = &state.stream;
+    let fail = |m: String| HipError::new(0, &format!("GDN stream seal: {m}"));
+    if stream.lanes != 1 {
+        return Err(fail("a lane-batched owner cannot be Open".into()));
+    }
+    for (l, m) in stream.meta.iter().enumerate() {
+        if m.phase == GdnStreamPhase::Open && m.position != position {
+            return Err(fail(format!(
+                "layer {l} is Open at {} but the prompt ends at {position}",
+                m.position
+            )));
+        }
+    }
+    let (binding, carry) = match (stream.binding.as_ref(), stream.carry.as_ref()) {
+        (Some(b), Some(c)) if stream.plans.len() == stream.meta.len() => (b, c),
+        _ => {
+            return Err(fail(
+                "Open stream without bound plans, constants or carry".into(),
+            ))
+        }
+    };
+    let mut out = Vec::with_capacity(stream.meta.len());
+    for (l, (plan, meta)) in stream.plans.iter().zip(&stream.meta).enumerate() {
+        if meta.phase != GdnStreamPhase::Open {
+            out.push(*meta);
+            continue;
+        }
+        let planes = GdnQ8Planes {
+            codes: &state.s_matrices[l],
+            scales: &state.s_scales[l],
+            ef: state.s_ef_residual.get(l),
+        };
+        let next = match plan.algorithm {
+            GdnScanAlgorithm::Scan64 => {
+                let fmt = match plan.scan_output_format {
+                    GdnTensorFormat::Bf16 => GdnScanOut::Bf16,
+                    _ => GdnScanOut::F32,
+                };
+                let ws = binding.workspace(fmt).ok_or_else(|| {
+                    fail("no edge workspace for the layer's output format".into())
+                })?;
+                let (hk, hv) = (ws.hk, ws.hv);
+                let micro = carry.geometry.micro_rows;
+                let alpha = carry.raw_ab[l].sub_offset(0, micro * hv);
+                let beta = carry.raw_ab[l].sub_offset(micro * hv, micro * hv);
+                let view = ScanCarryView {
+                    tile_entry_f32: &carry.tile_state[l],
+                    tile_entry_conv: &carry.tile_conv[l],
+                    pending_qkv: &carry.raw_qkv[l],
+                    pending_alpha: &alpha,
+                    pending_beta: &beta,
+                };
+                let consts = GdnStreamConsts {
+                    conv_weight: &binding.conv_weight[l],
+                    dt_bias: &binding.dt_bias[l],
+                    a_log: &binding.a_log[l],
+                    q_scale: binding.q_scale,
+                    eps: binding.eps,
+                    n_key_heads: hk,
+                    n_value_heads: hv,
+                };
+                let live = GdnLiveState {
+                    planes,
+                    conv: &state.conv_states[l],
+                };
+                gpu.gdn_stream_seal(plan, meta, &consts, &live, &view, ws)?
+            }
+            GdnScanAlgorithm::Sequential => gpu.gdn_stream_seal_sequential(
+                plan,
+                meta,
+                &planes,
+                &carry.tile_state[l],
+                carry.geometry.hv,
+            )?,
+            GdnScanAlgorithm::Wy16 => return Err(fail("Wy16 plans belong to Qwen4".into())),
+        };
+        out.push(next);
+    }
+    Ok(out)
 }
 
 pub(crate) fn gdn_tape_view(tape: &GdnTape) -> GdnTapeView<'_> {
@@ -539,68 +679,4 @@ pub(crate) fn gdn_tape_view(tape: &GdnTape) -> GdnTapeView<'_> {
         alpha_bufs: &tape.alpha_bufs,
         beta_bufs: &tape.beta_bufs,
     }
-}
-
-/// The batched attention tap of one forward, bound to `config`. `get()`
-/// is the tap exactly when `triattn::tap_enabled()`, so no caller can drop the
-/// calibration or admit a fused FA prep while the tap is active.
-pub(crate) struct BatchedTap<F>(F);
-
-pub(crate) fn batched_attention_tap(
-    config: &Qwen35Config,
-) -> BatchedTap<impl Fn(&mut Gpu, usize, &GpuTensor, &GpuTensor, usize) -> HipResult<()> + '_> {
-    BatchedTap(
-        move |gpu: &mut Gpu, layer: usize, q: &GpuTensor, k: &GpuTensor, rows: usize| {
-            record_batched_attention_tap(gpu, config, layer, q, k, rows)
-        },
-    )
-}
-
-impl<F: Fn(&mut Gpu, usize, &GpuTensor, &GpuTensor, usize) -> HipResult<()>> BatchedTap<F> {
-    pub(crate) fn get(&self) -> Option<BatchedAttentionTap<'_>> {
-        hipfire_runtime::triattn::tap_enabled().then_some(&self.0 as BatchedAttentionTap<'_>)
-    }
-}
-
-/// TriAttention pre-RoPE tap of the batched attention prep: the GPU reduce
-/// when `install_tap_gpu()` was used, else a host readback of Q (and K).
-pub(crate) fn record_batched_attention_tap(
-    gpu: &mut Gpu,
-    config: &Qwen35Config,
-    layer_idx: usize,
-    q: &GpuTensor,
-    k: &GpuTensor,
-    n: usize,
-) -> HipResult<()> {
-    let gpu_handled = hipfire_runtime::triattn::record_prerope_q_batch_gpu_if_applicable(
-        gpu,
-        layer_idx,
-        &q.buf,
-        n,
-        config.n_heads,
-        config.head_dim,
-    )?;
-    if !gpu_handled {
-        let n_q = config.n_heads * config.head_dim;
-        let q_cpu = gpu.download_f32(q)?;
-        if hipfire_runtime::triattn::tap_needs_k() {
-            let n_k = config.n_kv_heads * config.head_dim;
-            let k_cpu = gpu.download_f32(k)?;
-            for b in 0..n {
-                hipfire_runtime::triattn::record_prerope_qk(
-                    layer_idx,
-                    &q_cpu[b * n_q..(b + 1) * n_q],
-                    Some(&k_cpu[b * n_k..(b + 1) * n_k]),
-                );
-            }
-        } else {
-            for b in 0..n {
-                hipfire_runtime::triattn::record_prerope_q(
-                    layer_idx,
-                    &q_cpu[b * n_q..(b + 1) * n_q],
-                );
-            }
-        }
-    }
-    Ok(())
 }

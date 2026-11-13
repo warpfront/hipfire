@@ -667,6 +667,12 @@ fn cases() -> Vec<Case> {
         c2(B::LshlrevB16, &[U, U], |s, _| {
             ((s[1] as u16) << (s[0] & 15)) as u32
         }),
+        c2(B::LshrrevB16, &[U, U], |s, _| {
+            ((s[1] as u16) >> (s[0] & 15)) as u32
+        }),
+        c2(B::AshrrevI16, &[U, U], |s, _| {
+            ((s[1] as u16 as i16) >> (s[0] & 15)) as u16 as u32
+        }),
         c2(B::MulLoU16, &[U, U], |s, _| {
             (s[0] as u16).wrapping_mul(s[1] as u16) as u32
         }),
@@ -859,6 +865,9 @@ const DEDICATED: &[&str] = &[
     "v_lshl_add_u64",
     "v_cmp_eq_u64",
     "v_cmp_ne_u64",
+    "v_cmp_gt_i64",
+    "v_cmp_ge_i64",
+    "v_cmp_ge_u64",
 ];
 
 #[test]
@@ -866,6 +875,7 @@ fn every_opcode_is_covered() {
     let mut seen: BTreeSet<&str> = cases().iter().map(|c| name(c.op)).collect();
     seen.extend(DEDICATED);
     seen.extend(cmp_cases().iter().map(|c| c.0.name()));
+    seen.extend(float_family().iter().map(|op| op.name()));
     let all = Vop1Op::ALL
         .iter()
         .map(|o| o.name())
@@ -931,6 +941,9 @@ fn cmp_cases() -> Vec<(VopcOp, G, CmpRef)> {
         (CmpOF32, G::F, |a, b| !nan(a) && !nan(b)),
         (CmpUF32, G::F, |a, b| nan(a) || nan(b)),
         (CmpNeqF32, G::F, |a, b| !(fv(a) == fv(b))),
+        // Unordered-or-le / unordered-or-ge: true on NaN, otherwise a <= b / a >= b.
+        (CmpNgtF32, G::F, |a, b| !(fv(a) > fv(b))),
+        (CmpNltF32, G::F, |a, b| !(fv(a) < fv(b))),
         (CmpLtI32, G::U, |a, b| (a as i32) < b as i32),
         (CmpEqI32, G::U, |a, b| a == b),
         (CmpLeI32, G::U, |a, b| a as i32 <= b as i32),
@@ -1014,6 +1027,441 @@ fn vopc_e32_and_vop3_vs_reference() {
     }
 }
 
+// ----------------------------------------------------------------------------
+// Full F16/F32 compare family (16 predicates x CMP/CMPX x F16/F32)
+
+fn float_family() -> Vec<VopcOp> {
+    VopcOp::ALL
+        .iter()
+        .copied()
+        .filter(|o| o.float_compare().is_some())
+        .collect()
+}
+
+/// Independent expectation. The relation of (a, b) is one of LT=1, EQ=2, GT=4,
+/// UN=8 (derived from `partial_cmp`, not the simulator's operators); predicate
+/// `n` is true exactly for the relations whose bits are set in `n`:
+/// F=0 LT=1 EQ=2 LE=3 GT=4 LG=5 GE=6 O=7 U=8 NGE=9 NLG=10 NGT=11 NLE=12 NEQ=13
+/// NLT=14 TRU=15. Spelled out below so the table is not an alias of the codec.
+fn float_expect(pred: u8, a: f32, b: f32) -> bool {
+    use std::cmp::Ordering::*;
+    let rel = match a.partial_cmp(&b) {
+        Some(Less) => 1u8,
+        Some(Equal) => 2,
+        Some(Greater) => 4,
+        None => 8,
+    };
+    let set: u8 = match pred {
+        0 => 0,
+        1 => 1,
+        2 => 2,
+        3 => 1 | 2,
+        4 => 4,
+        5 => 1 | 4,
+        6 => 2 | 4,
+        7 => 1 | 2 | 4,
+        8 => 8,
+        9 => 1 | 8,
+        10 => 2 | 8,
+        11 => 1 | 2 | 8,
+        12 => 4 | 8,
+        13 => 1 | 4 | 8,
+        14 => 2 | 4 | 8,
+        15 => 15,
+        _ => panic!("predicate {pred}"),
+    };
+    set & rel != 0
+}
+
+fn operand_f32(width: u8, bits: u32) -> f32 {
+    if width == 16 {
+        float::f16_to_f32(bits as u16)
+    } else {
+        fv(bits)
+    }
+}
+
+fn pair_bank(width: u8, r: &mut Rng) -> Vec<[u32; 2]> {
+    let special: &[u32] = if width == 16 {
+        F16_SPECIAL
+    } else {
+        F32_SPECIAL
+    };
+    let mut v = Vec::new();
+    for &a in special {
+        for &b in special {
+            v.push([a, b]);
+        }
+    }
+    let g = if width == 16 { G::H } else { G::F };
+    for _ in 0..512 {
+        let a = gen(r, g);
+        let b = if r.next() % 5 == 0 { a } else { gen(r, g) };
+        v.push([a, b]);
+    }
+    v
+}
+
+fn run_float_compare(op: VopcOp, vop3_form: bool, dst: Src, exec: u64, ins: &[[u32; 2]]) -> Wave {
+    let mut w = wave();
+    w.exec = exec;
+    for (l, p) in ins.iter().enumerate() {
+        w.v[10][l] = p[0];
+        w.v[11][l] = p[1];
+    }
+    let inst = if vop3_form {
+        v3(vop3(Vop3Op::C(op), dst, &[vg(10), vg(11)]))
+    } else {
+        vc(op, vg(10), vg(11))
+    };
+    exec_ok(&mut w, &inst);
+    w
+}
+
+#[test]
+fn float_compare_family_is_complete() {
+    let fam = float_family();
+    assert_eq!(fam.len(), 64, "2 widths x 16 predicates x CMP/CMPX");
+    let mut seen = BTreeSet::new();
+    for op in &fam {
+        let (width, pred) = op.float_compare().unwrap();
+        assert!(width == 16 || width == 32, "{}", op.name());
+        assert!(pred < 16);
+        assert!(seen.insert((width, pred, op.is_cmpx())), "{}", op.name());
+    }
+    // Only float-compare ops are CMPX-or-float; existing integer CMPX stay non-float.
+    assert!(VopcOp::CmpxEqU32.is_cmpx() && VopcOp::CmpxEqU32.float_compare().is_none());
+}
+
+#[test]
+fn float_compare_truth_table_all_ops() {
+    let mut r = Rng(0xc0de_f00d_1234_5678);
+    for op in float_family() {
+        let (width, pred) = op.float_compare().unwrap();
+        let cmpx = op.is_cmpx();
+        let bank = pair_bank(width, &mut r);
+        for (ci, chunk) in bank.chunks(WAVE).enumerate() {
+            let exec = match ci % 3 {
+                0 => u64::MAX,
+                1 => 0x8000_0000_0000_0001 | r.next(),
+                _ => r.exec(),
+            };
+            // The final chunk can be short; only lanes with supplied input pairs
+            // participate. Poison-initialized equal VGPRs are not extra test inputs.
+            let exec = exec & (u64::MAX >> (WAVE - chunk.len()));
+            for (vop3_form, dst) in [
+                (false, Src::VccLo),
+                (true, Src::Sgpr(8)),
+                (true, Src::Sgpr(20)),
+                (true, Src::VccLo),
+            ] {
+                let w = run_float_compare(op, vop3_form, dst, exec, chunk);
+                let want = (0..chunk.len())
+                    .filter(|&l| {
+                        exec >> l & 1 != 0
+                            && float_expect(
+                                pred,
+                                operand_f32(width, chunk[l][0]),
+                                operand_f32(width, chunk[l][1]),
+                            )
+                    })
+                    .fold(0u64, |m, l| m | 1 << l);
+                let poison64 = u64::from(POISON) | u64::from(POISON) << 32;
+                let sgpr = |n: usize| u64::from(w.s[n]) | u64::from(w.s[n + 1]) << 32;
+                let ctx = format!("{} vop3={vop3_form} dst={dst:?} exec={exec:#x}", op.name());
+                match dst {
+                    Src::VccLo => assert_eq!(w.vcc, want, "{ctx} VCC"),
+                    Src::Sgpr(n) => {
+                        assert_eq!(sgpr(usize::from(n)), want, "{ctx} SGPR pair");
+                        assert_eq!(w.vcc, poison64, "{ctx} VCC untouched");
+                    }
+                    _ => unreachable!(),
+                }
+                if cmpx {
+                    assert_eq!(w.exec, want, "{ctx} EXEC");
+                } else {
+                    assert_eq!(w.exec, exec, "{ctx} EXEC preserved");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn float_compare_empty_exec_overwrites_destination() {
+    for op in float_family() {
+        let (width, _) = op.float_compare().unwrap();
+        let special: &[u32] = if width == 16 {
+            F16_SPECIAL
+        } else {
+            F32_SPECIAL
+        };
+        let ins: Vec<[u32; 2]> = (0..WAVE)
+            .map(|l| {
+                [
+                    special[l % special.len()],
+                    special[(l * 7 + 1) % special.len()],
+                ]
+            })
+            .collect();
+        for (vop3_form, dst) in [(false, Src::VccLo), (true, Src::Sgpr(8))] {
+            let w = run_float_compare(op, vop3_form, dst, 0, &ins);
+            let got = match dst {
+                Src::VccLo => w.vcc,
+                _ => u64::from(w.s[8]) | u64::from(w.s[9]) << 32,
+            };
+            assert_eq!(
+                got,
+                0,
+                "{} dst={dst:?}: even TRU yields 0 with EXEC=0",
+                op.name()
+            );
+            assert_eq!(w.exec, 0, "{} EXEC stays 0", op.name());
+        }
+    }
+}
+
+#[test]
+fn float_compare_false_and_true_ignore_inactive_lanes() {
+    let exec = 0x8000_0000_0000_0001u64 | 0x00f0_0000_0f00_0000;
+    for op in float_family() {
+        let (_, pred) = op.float_compare().unwrap();
+        if pred != 0 && pred != 15 {
+            continue;
+        }
+        let ins = vec![[0u32, 0u32]; WAVE];
+        let w = run_float_compare(op, true, Src::Sgpr(8), exec, &ins);
+        let got = u64::from(w.s[8]) | u64::from(w.s[9]) << 32;
+        assert_eq!(got, if pred == 15 { exec } else { 0 }, "{}", op.name());
+        if op.is_cmpx() {
+            assert_eq!(w.exec, got, "{}", op.name());
+        }
+    }
+}
+
+#[test]
+fn float_compare_destination_aliasing_exec_and_vcc() {
+    let mut r = Rng(0x5eed);
+    for op in float_family() {
+        let (width, pred) = op.float_compare().unwrap();
+        let bank = pair_bank(width, &mut r);
+        let chunk = &bank[bank.len() - WAVE..];
+        let exec = u64::MAX;
+        let want = (0..WAVE)
+            .filter(|&l| {
+                float_expect(
+                    pred,
+                    operand_f32(width, chunk[l][0]),
+                    operand_f32(width, chunk[l][1]),
+                )
+            })
+            .fold(0u64, |m, l| m | 1 << l);
+        // VOP3 destination EXEC: the mask lands in EXEC for CMP and CMPX alike.
+        let w = run_float_compare(op, true, Src::ExecLo, exec, chunk);
+        assert_eq!(w.exec, want, "{} dst=EXEC", op.name());
+        // VOP3 destination VCC: VCC receives the mask; CMPX also rewrites EXEC.
+        let w = run_float_compare(op, true, Src::VccLo, exec, chunk);
+        assert_eq!(w.vcc, want, "{} dst=VCC", op.name());
+        assert_eq!(
+            w.exec,
+            if op.is_cmpx() { want } else { exec },
+            "{}",
+            op.name()
+        );
+    }
+}
+
+#[test]
+fn float_compare_modifiers_and_unsupported() {
+    // abs/neg apply to both f32 and f16 sources; f16 ignores the high half.
+    {
+        let (op, a, b) = (VopcOp::CmpNltF32, 0xbf80_0000u32, 0x3f80_0000u32);
+        let mut w = wave();
+        w.exec = u64::MAX;
+        for l in 0..WAVE {
+            w.v[10][l] = a;
+            w.v[11][l] = b;
+        }
+        // Plain -1 < 1 so NLT is false; |-1| == 1 so NLT is true with abs on src0.
+        let mut v = vop3(Vop3Op::C(op), Src::Sgpr(8), &[vg(10), vg(11)]);
+        exec_ok(&mut w, &v3(v.clone()));
+        assert_eq!(u64::from(w.s[8]) | u64::from(w.s[9]) << 32, 0);
+        v.abs = 1;
+        exec_ok(&mut w, &v3(v));
+        assert_eq!(u64::from(w.s[8]) | u64::from(w.s[9]) << 32, u64::MAX);
+    }
+    for op in float_family() {
+        let (width, _) = op.float_compare().unwrap();
+        let mut w = wave();
+        w.exec = u64::MAX;
+        // f16: low halves are 1.0, high halves differ and must be ignored.
+        let (x, y) = if width == 16 {
+            (0x1234_3c00, 0x5678_3c00)
+        } else {
+            (0x3f80_0000, 0x3f80_0000)
+        };
+        for l in 0..WAVE {
+            w.v[10][l] = x;
+            w.v[11][l] = y;
+        }
+        exec_ok(&mut w, &vc(op, vg(10), vg(11)));
+        let (_, pred) = op.float_compare().unwrap();
+        assert_eq!(
+            w.vcc,
+            if float_expect(pred, 1.0, 1.0) {
+                u64::MAX
+            } else {
+                0
+            },
+            "{}",
+            op.name()
+        );
+        // op_sel is not modelled for compares.
+        let mut v = vop3(Vop3Op::C(op), Src::Sgpr(8), &[vg(10), vg(11)]);
+        v.op_sel = 1;
+        assert!(
+            matches!(valu::exec(&mut w, &v3(v)), Err(SimError::Unsupported(_))),
+            "{} op_sel",
+            op.name()
+        );
+    }
+}
+
+/// Input-denormal flush (FLOAT_DENORM_MODE bit 0 == 0) turns denormal sources
+/// into same-signed zeros for every family op; rounding mode and the output
+/// denormal bit never matter to a compare. `[UNVERIFIED]` pending hardware.
+#[test]
+fn float_compare_denorm_and_round_modes() {
+    let mut r = Rng(0xde40);
+    for op in float_family() {
+        let (width, pred) = op.float_compare().unwrap();
+        let bank = pair_bank(width, &mut r);
+        let flush = |bits: u32| -> f32 {
+            let v = if width == 16 {
+                let b = bits & 0xffff;
+                if b & 0x7c00 == 0 {
+                    b & 0x8000
+                } else {
+                    b
+                }
+            } else if bits & 0x7f80_0000 == 0 {
+                bits & 0x8000_0000
+            } else {
+                bits
+            };
+            operand_f32(width, v)
+        };
+        for dn in 0..4u8 {
+            for round in [0u8, 1, 3] {
+                for chunk in bank.chunks(WAVE).take(6) {
+                    let mut w = wave();
+                    w.exec = u64::MAX;
+                    if width == 16 {
+                        w.mode.denorm16_64 = dn;
+                        w.mode.round16_64 = round;
+                    } else {
+                        w.mode.denorm32 = dn;
+                        w.mode.round32 = round;
+                    }
+                    for (l, p) in chunk.iter().enumerate() {
+                        w.v[10][l] = p[0];
+                        w.v[11][l] = p[1];
+                    }
+                    exec_ok(&mut w, &vc(op, vg(10), vg(11)));
+                    let want = (0..chunk.len())
+                        .filter(|&l| {
+                            let (a, b) = if dn & 1 == 0 {
+                                (flush(chunk[l][0]), flush(chunk[l][1]))
+                            } else {
+                                (
+                                    operand_f32(width, chunk[l][0]),
+                                    operand_f32(width, chunk[l][1]),
+                                )
+                            };
+                            float_expect(pred, a, b)
+                        })
+                        .fold(0u64, |m, l| m | 1 << l);
+                    assert_eq!(w.vcc, want, "{} denorm {dn} round {round}", op.name());
+                }
+            }
+        }
+    }
+}
+
+/// SDWA is the only half selector gfx942 VOPC has (VOP3 compares carry no
+/// op_sel; the codec rejects it): WORD_1 reads the high f16, WORD_0 the low,
+/// with per-source SDWA abs/neg.
+#[test]
+fn float_compare_f16_sdwa_half_select() {
+    let mut r = Rng(0x5d3a);
+    for op in float_family() {
+        let (width, pred) = op.float_compare().unwrap();
+        if width != 16 {
+            continue;
+        }
+        let bank = pair_bank(16, &mut r);
+        for (s0, s1) in [
+            (SdwaSel::Word0, SdwaSel::Word1),
+            (SdwaSel::Word1, SdwaSel::Word0),
+            (SdwaSel::Word1, SdwaSel::Word1),
+        ] {
+            for (neg0, abs1) in [(false, false), (true, true)] {
+                let mut w = wave();
+                w.exec = 0xf0f0_ffff_0000_ffff;
+                let exec = w.exec;
+                let mut raw = [[0u32; 2]; WAVE];
+                for l in 0..WAVE {
+                    let (a, b) = (bank[(l * 5) % bank.len()], bank[(l * 11 + 3) % bank.len()]);
+                    raw[l] = [a[0] & 0xffff | (b[1] << 16), b[0] & 0xffff | (a[1] << 16)];
+                    w.v[10][l] = raw[l][0];
+                    w.v[11][l] = raw[l][1];
+                }
+                let mut sd = sdwa(SdwaSel::Dword);
+                sd.src0_sel = s0;
+                sd.src1_sel = s1;
+                sd.src0_neg = neg0;
+                sd.src1_abs = abs1;
+                exec_ok(
+                    &mut w,
+                    &Inst::Vopc(Vopc {
+                        op,
+                        src0: vg(10),
+                        src1: vg(11),
+                        ext: VopExt::Sdwa(sd),
+                    }),
+                );
+                let half = |x: u32, s: SdwaSel| {
+                    if s == SdwaSel::Word1 {
+                        x >> 16
+                    } else {
+                        x & 0xffff
+                    }
+                };
+                let want = (0..WAVE)
+                    .filter(|&l| {
+                        let mut a = operand_f32(16, half(raw[l][0], s0));
+                        let mut b = operand_f32(16, half(raw[l][1], s1));
+                        if neg0 {
+                            a = -a;
+                        }
+                        if abs1 {
+                            b = b.abs();
+                        }
+                        exec >> l & 1 != 0 && float_expect(pred, a, b)
+                    })
+                    .fold(0u64, |m, l| m | 1 << l);
+                assert_eq!(
+                    w.vcc,
+                    want,
+                    "{} {s0:?} {s1:?} neg0 {neg0} abs1 {abs1}",
+                    op.name()
+                );
+                assert_eq!(w.exec, if op.is_cmpx() { want } else { exec });
+            }
+        }
+    }
+}
+
 #[test]
 fn vopc_u64_compares() {
     let mut r = Rng(77);
@@ -1039,6 +1487,83 @@ fn vopc_u64_compares() {
             let eq = w.v[10][l] == w.v[12][l] && w.v[11][l] == w.v[13][l];
             let want = w.exec >> l & 1 != 0 && (eq == (op == VopcOp::CmpEqU64));
             assert_eq!(w.vcc >> l & 1 != 0, want, "{} lane {l}", op.name());
+        }
+    }
+}
+
+#[test]
+fn vopc_i64_signed_compares() {
+    let edges: [u64; 12] = [
+        0,
+        1,
+        u64::MAX,
+        i64::MAX as u64,
+        i64::MIN as u64,
+        (i64::MIN as u64) + 1,
+        0x0000_0000_ffff_ffff,
+        0x0000_0001_0000_0000,
+        0xffff_ffff_0000_0000,
+        0xffff_ffff_ffff_fffe,
+        0x8000_0000_0000_0001,
+        0x7fff_ffff_0000_0000,
+    ];
+    let exec_masks = [u64::MAX, 0xffff_0000_ffff_00ffu64, 0xaaaa_aaaa_aaaa_aaaa, 0];
+    for op in [VopcOp::CmpGtI64, VopcOp::CmpGeI64, VopcOp::CmpGeU64] {
+        let want = |a: u64, b: u64| match op {
+            VopcOp::CmpGeU64 => a >= b,
+            VopcOp::CmpGeI64 => (a as i64) >= (b as i64),
+            _ => (a as i64) > (b as i64),
+        };
+        let mut r = Rng(0x1f64);
+        for &exec in &exec_masks {
+            for vop3_form in [false, true] {
+                let mut pairs: Vec<(u64, u64)> = Vec::new();
+                for &a in &edges {
+                    for &b in &edges {
+                        pairs.push((a, b));
+                    }
+                }
+                for l in 0..64 {
+                    let a = r.next();
+                    pairs.push((a, if l % 4 == 0 { a } else { r.next() }));
+                }
+                while pairs.len() % WAVE != 0 {
+                    pairs.push((0, 0));
+                }
+                for chunk in pairs.chunks(WAVE) {
+                    let mut w = wave();
+                    w.exec = exec;
+                    for (l, &(a, b)) in chunk.iter().enumerate() {
+                        w.v[10][l] = a as u32;
+                        w.v[11][l] = (a >> 32) as u32;
+                        w.v[12][l] = b as u32;
+                        w.v[13][l] = (b >> 32) as u32;
+                    }
+                    let inst = if vop3_form {
+                        v3(vop3(Vop3Op::C(op), Src::Sgpr(8), &[vg(10), vg(12)]))
+                    } else {
+                        vc(op, vg(10), vg(12))
+                    };
+                    exec_ok(&mut w, &inst);
+                    assert_eq!(w.exec, exec);
+                    let got = if vop3_form {
+                        assert_eq!(
+                            w.vcc,
+                            u64::from(POISON) | u64::from(POISON) << 32,
+                            "VOP3 compare must not touch VCC"
+                        );
+                        u64::from(w.s[8]) | u64::from(w.s[9]) << 32
+                    } else {
+                        w.vcc
+                    };
+                    let exp = chunk
+                        .iter()
+                        .enumerate()
+                        .filter(|&(l, &(a, b))| exec >> l & 1 != 0 && want(a, b))
+                        .fold(0u64, |m, (l, _)| m | 1 << l);
+                    assert_eq!(got, exp, "{} exec={exec:#x} vop3={vop3_form}", op.name());
+                }
+            }
         }
     }
 }
@@ -1408,6 +1933,20 @@ fn f16_vop1_vop2_zero_high_half_and_inline_constants() {
         valu::exec(&mut w, &v3(v)),
         Err(SimError::Unsupported(_))
     ));
+}
+
+#[test]
+fn integer16_sign_extended_literal_uses_low_half_and_zeroes_high_result() {
+    let mut w = wave();
+    w.exec = 1;
+    for value in [-1i32, -256, -32768] {
+        let inst = v2(Vop2Op::AddU16, vg(1), Src::Lit(value as u32), vg(10));
+        for low in 0..=u16::MAX {
+            w.v[10][0] = 0xa5a5_0000 | u32::from(low);
+            exec_ok(&mut w, &inst);
+            assert_eq!(w.v[1][0], u32::from(low.wrapping_add(value as u16)));
+        }
+    }
 }
 
 // ----------------------------------------------------------------------------

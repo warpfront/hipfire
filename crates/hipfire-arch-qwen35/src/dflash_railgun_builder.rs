@@ -1702,10 +1702,10 @@ impl WindowQueue for TwinQueue {
         if steps.is_empty() {
             Ok(())
         } else {
-            Err(QueueFailure {
-                message: "twin queue: typed steps are program nodes on the railgun route".into(),
-                quiescence: Quiescence::Proven,
-            })
+            Err(QueueFailure::new(
+                "twin queue: typed steps are program nodes on the railgun route",
+                Quiescence::Proven,
+            ))
         }
     }
 
@@ -2693,6 +2693,8 @@ mod tests {
             words: Vec::new(),
             nodes: Vec::new(),
             conditionals: Vec::new(),
+            kinds: std::collections::BTreeMap::new(),
+            groups: Vec::new(),
         };
         let got: Vec<String> = bound_slots(&live, &program)
             .into_iter()
@@ -2776,6 +2778,8 @@ mod tests {
             ],
             nodes: vec![],
             conditionals: Vec::new(),
+            kinds: std::collections::BTreeMap::new(),
+            groups: Vec::new(),
         };
         assert_eq!(gdn_words(&program), [(WordId(1), 2), (WordId(2), 1)]);
     }

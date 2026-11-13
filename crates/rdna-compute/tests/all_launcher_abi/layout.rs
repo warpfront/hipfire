@@ -48,7 +48,7 @@ pub struct Variant {
     pub only_for: Option<Vec<String>>,
 }
 
-fn push_kind(m: &str) -> Option<PushKind> {
+pub(crate) fn push_kind(m: &str) -> Option<PushKind> {
     match m {
         "push_ptr" => Some(PushKind::Ptr),
         "push_u32" => Some(PushKind::U32),
@@ -163,15 +163,40 @@ pub(crate) fn contains_id(ts: &[Tt], name: &str) -> bool {
 }
 
 fn parse_int(s: &str) -> Option<i64> {
-    if let Some(h) = s.strip_prefix("0x") {
-        let hex: String = h.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
-        return i64::from_str_radix(&hex, 16).ok();
-    }
-    let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
-    if digits.is_empty() {
-        None
+    let (digits, radix) = if let Some(d) = s.strip_prefix("0x") {
+        (d, 16)
+    } else if let Some(d) = s.strip_prefix("0o") {
+        (d, 8)
+    } else if let Some(d) = s.strip_prefix("0b") {
+        (d, 2)
     } else {
-        digits.parse::<i64>().ok()
+        (s, 10)
+    };
+    let end = digits
+        .find(|c: char| c != '_' && !c.is_digit(radix))
+        .unwrap_or(digits.len());
+    if !matches!(
+        &digits[end..],
+        "" | "usize"
+            | "isize"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+    ) {
+        return None;
+    }
+    let digits = &digits[..end];
+    if digits.contains('_') {
+        i64::from_str_radix(&digits.replace('_', ""), radix).ok()
+    } else {
+        i64::from_str_radix(digits, radix).ok()
     }
 }
 
@@ -184,6 +209,7 @@ struct Ev<'a> {
     p: usize,
     file: &'a str,
     depth: u32,
+    scope: Option<(&'a Ctx<'a>, &'a [usize])>,
 }
 
 impl<'a> Ev<'a> {
@@ -192,10 +218,10 @@ impl<'a> Ev<'a> {
         loop {
             if self.ts.get(self.p).map_or(false, |t| t.is_p('+')) {
                 self.p += 1;
-                v += self.term()?;
+                v = v.checked_add(self.term()?)?;
             } else if self.ts.get(self.p).map_or(false, |t| t.is_p('-')) {
                 self.p += 1;
-                v -= self.term()?;
+                v = v.checked_sub(self.term()?)?;
             } else {
                 return Some(v);
             }
@@ -205,7 +231,7 @@ impl<'a> Ev<'a> {
         let mut v = self.factor()?;
         while self.ts.get(self.p).map_or(false, |t| t.is_p('*')) {
             self.p += 1;
-            v *= self.factor()?;
+            v = v.checked_mul(self.factor()?)?;
         }
         Some(v)
     }
@@ -217,9 +243,24 @@ impl<'a> Ev<'a> {
             }
             Tt::Id(name, _) => {
                 self.p += 1;
-                match self.env.get(name) {
-                    Some(v) => *v,
-                    None => self.w.const_value_in(name, self.file, self.depth)?,
+                if self.ts.get(self.p).is_some_and(|t| t.is_p(':')) {
+                    let mut path = vec![name.as_str()];
+                    while self.ts.get(self.p).is_some_and(|t| t.is_p(':'))
+                        && self.ts.get(self.p + 1).is_some_and(|t| t.is_p(':'))
+                    {
+                        path.push(self.ts.get(self.p + 2)?.id()?);
+                        self.p += 3;
+                    }
+                    if path.len() == 1 {
+                        return None;
+                    }
+                    self.w.const_path_value_in(&path, self.file, self.depth)?
+                } else if let Some(v) = self.env.get(name) {
+                    *v
+                } else if let Some((ctx, loc)) = self.scope {
+                    self.w.scoped_const_value(name, ctx, loc, self.depth)?
+                } else {
+                    self.w.const_value_in(name, self.file, self.depth)?
                 }
             }
             Tt::G('(', c, _) => {
@@ -231,6 +272,7 @@ impl<'a> Ev<'a> {
                     p: 0,
                     file: self.file,
                     depth: self.depth,
+                    scope: self.scope,
                 };
                 let v = sub.sum()?;
                 if sub.p != c.len() {
@@ -241,6 +283,23 @@ impl<'a> Ev<'a> {
             _ => return None,
         };
         while self.ts.get(self.p).map_or(false, |t| t.is_id("as")) {
+            // A cast is usable only if it preserves the known integer exactly.
+            // Treating a narrowing/wrapping cast as a no-op could invent an
+            // array length and hide a real parameter/blob extent mismatch.
+            let exact = match self.ts.get(self.p + 1)?.id()? {
+                "u8" => u8::try_from(v).is_ok(),
+                "u16" => u16::try_from(v).is_ok(),
+                "u32" => u32::try_from(v).is_ok(),
+                "u64" | "u128" | "usize" => v >= 0,
+                "i8" => i8::try_from(v).is_ok(),
+                "i16" => i16::try_from(v).is_ok(),
+                "i32" => i32::try_from(v).is_ok(),
+                "i64" | "i128" | "isize" => true,
+                _ => false,
+            };
+            if !exact {
+                return None;
+            }
             self.p += 2;
         }
         Some(v)
@@ -287,6 +346,7 @@ impl World {
             p: 0,
             file: &path,
             depth: depth + 1,
+            scope: None,
         };
         let v = e.sum()?;
         if e.p != init.len() {
@@ -308,12 +368,138 @@ impl World {
             p: 0,
             file,
             depth: 0,
+            scope: None,
         };
         let v = e.sum()?;
         if e.p != ts.len() {
             return None;
         }
         Some(v)
+    }
+
+    /// Qualified constants must resolve in the named module, never by a matching
+    /// final identifier in some other module. Inline/aliased modules are refused.
+    fn const_path_value_in(&self, path: &[&str], file: &str, depth: u32) -> Option<i64> {
+        let (root, relative) = file.split_once("/src/")?;
+        let mut module: Vec<_> = relative.strip_suffix(".rs")?.split('/').collect();
+        if matches!(module.last(), Some(&"lib" | &"main" | &"mod")) {
+            module.pop();
+        }
+        let mut at = 1;
+        match path[0] {
+            "crate" => module.clear(),
+            "self" => {}
+            "super" => {
+                module.pop()?;
+                while path.get(at) == Some(&"super") {
+                    module.pop()?;
+                    at += 1;
+                }
+            }
+            _ => return None,
+        }
+        if at >= path.len() {
+            return None;
+        }
+        module.extend_from_slice(&path[at..path.len() - 1]);
+        let stem = format!("{root}/src/{}", module.join("/"));
+        let candidates = if module.is_empty() {
+            vec![format!("{root}/src/lib.rs"), format!("{root}/src/main.rs")]
+        } else {
+            vec![format!("{stem}.rs"), format!("{stem}/mod.rs")]
+        };
+        let mut files = candidates.iter().filter_map(|p| self.file(p));
+        let target = files.next()?;
+        if files.next().is_some() {
+            return None;
+        }
+        // Unlike the unqualified lookup, a missing member cannot fall back to
+        // the workspace's only same-named constant.
+        if target.consts.get(*path.last()?)?.len() != 1 {
+            return None;
+        }
+        self.const_value_in(path.last()?, &target.path, depth)
+    }
+
+    fn scoped_const_value(&self, name: &str, ctx: &Ctx, loc: &[usize], depth: u32) -> Option<i64> {
+        if depth > 4 {
+            return None;
+        }
+        // Local const items are in scope throughout their lexical block, also
+        // before their declaration. Keep their own scope for alias evaluation;
+        // cycles must fail, not accidentally resolve an outer same-named item.
+        let mut selected: Option<&super::scan::Binding> = None;
+        for b in ctx.idx.map.get(name).into_iter().flatten() {
+            let (at, parent) = b.loc.split_last()?;
+            let tokens = tokens_at(ctx.body, parent)?;
+            if !loc.starts_with(parent) || !tokens.get(*at)?.is_id("const") {
+                continue;
+            }
+            match selected {
+                Some(old) if old.loc.len() > b.loc.len() => {}
+                Some(old) if old.loc.len() == b.loc.len() => return None,
+                _ => selected = Some(b),
+            }
+        }
+        if let Some(visible) = ctx.idx.visible(name, loc) {
+            let (at, parent) = visible.loc.split_last()?;
+            if !tokens_at(ctx.body, parent)?.get(*at)?.is_id("const")
+                && selected.is_none_or(|b| b.loc.len() <= visible.loc.len())
+            {
+                return None; // A runtime binding or static is not a const.
+            }
+        }
+        if let Some(b) = selected {
+            let env = HashMap::new();
+            let mut e = Ev {
+                w: self,
+                env: &env,
+                ts: &b.init,
+                p: 0,
+                file: ctx.file,
+                depth: depth + 1,
+                scope: Some((ctx, &b.loc)),
+            };
+            let value = e.sum()?;
+            return (e.p == b.init.len()).then_some(value);
+        }
+        if ctx.params.contains(name) {
+            return None;
+        }
+        self.const_value_in(name, ctx.file, depth)
+    }
+
+    pub(crate) fn repeat_len_at(&self, count: &[Tt], ctx: &Ctx, loc: &[usize]) -> Option<usize> {
+        let env = HashMap::new();
+        let mut e = Ev {
+            w: self,
+            env: &env,
+            ts: count,
+            p: 0,
+            file: ctx.file,
+            depth: 0,
+            scope: Some((ctx, loc)),
+        };
+        let value = e.sum()?;
+        if e.p != count.len() {
+            return None;
+        }
+        usize::try_from(value).ok()
+    }
+
+    pub(crate) fn array_elems_at(
+        &self,
+        g: &[Tt],
+        ctx: &Ctx,
+        loc: &[usize],
+    ) -> Result<Vec<Option<Vec<Tt>>>, String> {
+        if let Some(semi) = g.iter().position(|t| t.is_p(';')) {
+            let n = self
+                .repeat_len_at(&g[semi + 1..], ctx, loc)
+                .ok_or("array repeat count is not a scoped constant")?;
+            return Ok(vec![None; n]);
+        }
+        super::scan::array_elems(g)
     }
 
     // ---- blob pushes ----------------------------------------------------------
@@ -399,6 +585,8 @@ impl World {
                                     .to_string())
                             }
                         })?;
+                    } else if let Some(srcs) = self.iter_sources(&it, ctx)? {
+                        branches.push((Vec::new(), srcs));
                     } else {
                         branches.push((Vec::new(), self.loop_elems(&it, ctx)?));
                     }
@@ -434,6 +622,14 @@ impl World {
                                             a.extend(p.arg[1..].iter().cloned());
                                             q.arg = a;
                                         }
+                                    } else if p.arg.len() == 2
+                                        && p.arg[0].is_p('*')
+                                        && p.arg[1].is_id(v)
+                                    {
+                                        // `*item` over `NAME.iter()`: the element's own place.
+                                        if let Some(el) = e {
+                                            q.arg = el.clone();
+                                        }
                                     }
                                 }
                                 let mut cc = conds.clone();
@@ -457,6 +653,89 @@ impl World {
     }
 }
 
+impl World {
+    /// `for item in A.iter()` / `A.iter().chain(B.iter())..` over named fixed-size
+    /// arrays: the iterable's elements in order, each as the indexed place `NAME[k]`.
+    /// `Ok(None)` when the iterable is not of that form (the caller falls back to
+    /// `loop_elems`); any other adapter after `.iter()`, or an array whose length is
+    /// not provable from its single declaration, is an error.
+    fn iter_sources(&self, it: &[Tt], ctx: &Ctx) -> Result<Option<Vec<Option<Vec<Tt>>>>, String> {
+        let n = it.len();
+        if n < 4
+            || it[0].id().is_none()
+            || !it[1].is_p('.')
+            || !it[2].is_id("iter")
+            || !it[3].is_g('(')
+            || !it[3].group().unwrap().is_empty()
+        {
+            return Ok(None);
+        }
+        let mut names: Vec<String> = vec![it[0].id().unwrap().to_string()];
+        let mut k = 4usize;
+        while k < n {
+            let chained = if k + 2 < n
+                && it[k].is_p('.')
+                && it[k + 1].is_id("chain")
+                && it[k + 2].is_g('(')
+            {
+                let g = it[k + 2].group().unwrap();
+                if g.len() == 4
+                    && g[0].id().is_some()
+                    && g[1].is_p('.')
+                    && g[2].is_id("iter")
+                    && g[3].is_g('(')
+                    && g[3].group().unwrap().is_empty()
+                {
+                    g[0].id().map(|s| s.to_string())
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            match chained {
+                Some(name) => {
+                    names.push(name);
+                    k += 3;
+                }
+                None => {
+                    return Err(format!(
+                        "unsupported iterator adapter in `{}`: only NAME.iter() and .chain(NAME.iter()) are understood",
+                        text(it)
+                    ))
+                }
+            }
+        }
+        let mut out: Vec<Option<Vec<Tt>>> = Vec::new();
+        for name in &names {
+            let bindings = ctx
+                .idx
+                .map
+                .get(name.as_str())
+                .filter(|b| b.len() == 1)
+                .ok_or_else(|| {
+                    format!("iterated array `{name}` must have exactly one declaration")
+                })?;
+            let init = &bindings[0].init;
+            if init.len() != 1 || !init[0].is_g('[') {
+                return Err(format!(
+                    "iterated array `{name}` is not an array literal or `[x; N]`"
+                ));
+            }
+            let count = self
+                .array_elems_at(init[0].group().unwrap(), ctx, &bindings[0].loc)?
+                .len();
+            for idx in 0..count {
+                out.push(Some(vec![
+                    Tt::Id(name.clone(), 0),
+                    Tt::G('[', vec![Tt::N(idx.to_string(), 0)], 0),
+                ]));
+            }
+        }
+        Ok(Some(out))
+    }
+}
+
 // ---- params array -----------------------------------------------------------------
 
 /// The one-to-one kernelParams builder used by the few-row launchers.
@@ -464,6 +743,7 @@ impl World {
 /// reference-to-void-pointer cast are accepted. Keep each array index as an
 /// origin; do not infer a layout from the closure's cast alone.
 fn mapped_param_elems(
+    world: &World,
     expr: &[Tt],
     ctx: &Ctx,
     loc: &[usize],
@@ -523,21 +803,59 @@ fn mapped_param_elems(
         .split_last()
         .ok_or("params mapping source has no location")?;
     let tokens = tokens_at(ctx.body, parent).ok_or("params mapping source location is invalid")?;
-    // No mutable source, alias, call result, conditional, or repeated array.
-    // These arrays contain the immutable pointer/scalar values kernelParams
-    // references, so later element mutation cannot be hidden by this reader.
-    if !tokens.get(*start).map_or(false, |t| t.is_id("let"))
-        || !tokens.get(*start + 1).map_or(false, |t| t.is_id(name))
-        || !tokens.get(*start + 2).map_or(false, |t| t.is_p('='))
-        || binding.init.len() != 1
-        || !binding.init[0].is_g('[')
-        || binding.init[0].group().unwrap().iter().any(|t| t.is_p(';'))
-    {
+    // The source is either an immutable literal array (no mutable source, alias, call
+    // result, conditional): these arrays contain the immutable pointer/scalar values
+    // kernelParams references, so later element mutation cannot be hidden by this
+    // reader; or a repeat array `[x; N]` whose element class is proven from `x` and
+    // whose length is a constant. Rust fixes an array's element type and length at its
+    // declaration, so element-wise writes of a repeat array change values, never the
+    // ABI class or the entry count.
+    let single_array = binding.init.len() == 1 && binding.init[0].is_g('[');
+    let group: &[Tt] = if single_array {
+        binding.init[0].group().unwrap()
+    } else {
+        &[]
+    };
+    let semi = group.iter().position(|t| t.is_p(';'));
+    let declared = tokens.get(*start).map_or(false, |t| t.is_id("let"))
+        && if semi.is_some() {
+            let at = if tokens.get(*start + 1).map_or(false, |t| t.is_id("mut")) {
+                *start + 2
+            } else {
+                *start + 1
+            };
+            tokens.get(at).map_or(false, |t| t.is_id(name))
+                && tokens.get(at + 1).map_or(false, |t| t.is_p('='))
+        } else {
+            tokens.get(*start + 1).map_or(false, |t| t.is_id(name))
+                && tokens.get(*start + 2).map_or(false, |t| t.is_p('='))
+        };
+    if !declared || !single_array {
         return Err(format!(
-            "params mapping source `{name}` must be an immutable literal array"
+            "params mapping source `{name}` must be an immutable literal array or a `[x; N]` repeat array"
         ));
     }
-    let source = split_top(binding.init[0].group().unwrap(), ',');
+    if let Some(semi) = semi {
+        let count = world
+            .repeat_len_at(&group[semi + 1..], ctx, &binding.loc)
+            .filter(|n| *n > 0)
+            .ok_or_else(|| {
+                format!("params mapping source `{name}`: repeat count is not a positive constant")
+            })?;
+        if world
+            .infer_kind(&group[..semi], ctx, &binding.loc, 0)
+            .is_none()
+        {
+            return Err(format!(
+                "params mapping source `{name}`: the repeat element `{}` has an unknown ABI class",
+                text(&group[..semi])
+            ));
+        }
+        return (0..count)
+            .map(|index| lex(&format!("&{name}[{index}] as *const _ as *mut c_void")))
+            .collect();
+    }
+    let source = split_top(group, ',');
     if source.is_empty() || source.iter().any(Vec::is_empty) {
         return Err("params mapping source cannot be empty".into());
     }
@@ -570,7 +888,67 @@ pub fn mapped_param_value(ctx: &Ctx, name: &str, sloc: &[usize]) -> Option<(Vec<
     Some((entries.get(index)?.clone(), binding.loc.clone()))
 }
 
+/// Like `mapped_param_value` for a `[x; N]` repeat array: every in-range element has
+/// the class of `x`. `None` (the caller keeps its other checks) when `x`'s class is
+/// not provable.
+pub fn repeat_param_value(
+    world: &World,
+    ctx: &Ctx,
+    name: &str,
+    sloc: &[usize],
+) -> Option<(Vec<Tt>, Loc)> {
+    let ts = lex(name).ok()?;
+    if ts.len() != 2 || ts[0].id().is_none() || !ts[1].is_g('[') {
+        return None;
+    }
+    let index = ts[1].group()?;
+    let [Tt::N(number, _)] = index else {
+        return None;
+    };
+    let index = usize::try_from(parse_int(number)?).ok()?;
+    let binding = ctx.idx.visible(ts[0].id()?, sloc)?;
+    if binding.init.len() != 1 || !binding.init[0].is_g('[') {
+        return None;
+    }
+    let group = binding.init[0].group()?;
+    let semi = group.iter().position(|t| t.is_p(';'))?;
+    if index >= world.repeat_len_at(&group[semi + 1..], ctx, &binding.loc)? {
+        return None;
+    }
+    let init = group[..semi].to_vec();
+    world.infer_kind(&init, ctx, &binding.loc, 0)?;
+    Some((init, binding.loc.clone()))
+}
+
+/// `std::ptr::null_mut::<T>()` / `ptr::null()`: a raw pointer constructor.
+fn is_null_ptr_ctor(ex: &[Tt]) -> bool {
+    let n = ex.len();
+    if n < 2 || !ex[n - 1].is_g('(') || !ex[n - 1].group().map_or(false, |g| g.is_empty()) {
+        return false;
+    }
+    let head = &ex[..n - 1];
+    let Some(pos) = head
+        .iter()
+        .position(|t| t.is_id("null_mut") || t.is_id("null"))
+    else {
+        return false;
+    };
+    let path_ok = head[..pos].iter().all(|t| t.id().is_some() || t.is_p(':'));
+    let tail = &head[pos + 1..];
+    let tail_ok = tail.is_empty()
+        || (tail.len() >= 4
+            && tail[0].is_p(':')
+            && tail[1].is_p(':')
+            && tail[2].is_p('<')
+            && tail[tail.len() - 1].is_p('>')
+            && tail[3..tail.len() - 1]
+                .iter()
+                .all(|t| t.id().is_some() || t.is_p(':')));
+    path_ok && tail_ok
+}
+
 fn collect_param_pushes(
+    world: &World,
     ctx: &Ctx,
     ts: &[Tt],
     loc: &mut Loc,
@@ -608,8 +986,18 @@ fn collect_param_pushes(
                 if args.len() != 1 {
                     return Err("params.extend with unexpected arity".into());
                 }
-                for entry in mapped_param_elems(&args[0], ctx, &here, sloc, false)? {
-                    out.push((entry, conds.clone()));
+                let literal_array = args[0].len() == 1
+                    && args[0][0].is_g('[')
+                    && !args[0][0].group().unwrap().iter().any(|t| t.is_p(';'));
+                if literal_array {
+                    // `params.extend([&a as .., &b as ..])`: each element is one entry.
+                    for entry in split_top(args[0][0].group().unwrap(), ',') {
+                        out.push((entry, conds.clone()));
+                    }
+                } else {
+                    for entry in mapped_param_elems(world, &args[0], ctx, &here, sloc, false)? {
+                        out.push((entry, conds.clone()));
+                    }
                 }
             } else if between && m != "len" {
                 // Only push and the exact mapped append above are understood;
@@ -652,6 +1040,7 @@ fn collect_param_pushes(
                 bc.extend(prior.iter().cloned());
                 bc.push((atom.clone(), pos));
                 collect_param_pushes(
+                    world,
                     ctx,
                     ts[j].group().unwrap(),
                     &mut bl,
@@ -676,6 +1065,7 @@ fn collect_param_pushes(
                         let mut bl = loc.clone();
                         bl.push(j);
                         collect_param_pushes(
+                            world,
                             ctx,
                             ts[j].group().unwrap(),
                             &mut bl,
@@ -696,7 +1086,7 @@ fn collect_param_pushes(
         }
         if let Tt::G(_, c, _) = t {
             let mut bl = here.clone();
-            collect_param_pushes(ctx, c, &mut bl, pname, bloc, sloc, safe, conds, out)?;
+            collect_param_pushes(world, ctx, c, &mut bl, pname, bloc, sloc, safe, conds, out)?;
         }
         i += 1;
     }
@@ -1178,7 +1568,7 @@ impl World {
             {
                 // Entries come from later `push` calls.
             } else {
-                for entry in mapped_param_elems(init, ctx, &b.loc, body_loc, true)? {
+                for entry in mapped_param_elems(self, init, ctx, &b.loc, body_loc, true)? {
                     elems.push((entry, Vec::new()));
                 }
             }
@@ -1186,6 +1576,7 @@ impl World {
             let mut l: Loc = Vec::new();
             let safe = prior_launch_groups(ctx.body, body_loc);
             collect_param_pushes(
+                self,
                 ctx,
                 ctx.body,
                 &mut l,
@@ -1334,6 +1725,9 @@ impl World {
                 Some("as_ptr") | Some("ptr") | Some("as_mut_ptr")
             )
         {
+            return Some((8, 'p'));
+        }
+        if is_null_ptr_ctor(ex) {
             return Some((8, 'p'));
         }
         if n == 1 {

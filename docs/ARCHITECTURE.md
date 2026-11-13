@@ -55,7 +55,6 @@ crates/
 ├── hipfire-arch-diffusion/   # FLUX.1 / FLUX.2 image-generation components (ids 40/45)
 ├── hipfire-arch-toy/         # template only (0xFF); never dispatched
 ├── hipfire-ds4-parent/       # DeepSeek V4 parent-checkpoint calibration oracle
-├── hipfire-pflash/           # PFlash prefill compression — deprecated since 0.4.0, removal in 0.5.0
 ├── hipfire-loader/           # Carrier registry, load_model, LoadedModel, batch staging
 ├── hipfire-engine/           # arch-free serve engine: scheduler, terminal, emit, prompt
 ├── hipfire-generate/         # generation bodies: ar, qwen, dense, vision, batch, img, redline fixtures
@@ -100,7 +99,6 @@ operator runtime.
 | Retained replay | `redline-dispatch`, `redline-rocr`, `rdna-compute::replay` | Product-integrated Redline **transport**: record, retain, replay PM4/AQL (see below) |
 | Typed authoring and validation | `peacemaker-ir`, `peacemaker-lift`, `peacemaker-cdna`, `peacemaker-author`, `peacemaker-isa`, `peacemaker-rip`, `railgun`, `railgun-cert`, `railgun-corpus`, `railgun-jitcorpus` | Machine-code types, lifter, checked builder, certified facts and dispatch-program model. `peacemaker-cdna` (CDNA3/gfx942 instruction model and CPU emulator) is reached only through `peacemaker-isa`'s opt-in `cdna` arm. It is a transitive compile-time dependency of `rdna-compute` (which depends on `peacemaker-isa`), but no runtime dispatch, callsite selection or default behavior uses it. Authoring and validation, **not** the retained transport (see railgun below) |
 | Direct-KMD research | `redline`, `saddle-lab` | Not the serving transport |
-| Deprecated | `hipfire-pflash` | PFlash prefill compression: deprecated since 0.4.0, removal in 0.5.0 |
 | NPU (XDNA2/AIE2P) | `peacemaker-npu`, `railgun` feature `npu`, `hipfire-arch-qwen4` `npu_trunk`, `npu-tools`, `hipfire-xdna` | `hipfire-arch-qwen4` links `peacemaker-npu` and `railgun`'s `npu` feature on Linux; the Flash-Next trunk route defaults to `auto` and arms only on gfx1151 with an openable NPU and matching calibration (see [Qwen4 NPU trunk](#qwen4-npu-trunk-xdna2)). `npu-tools` and `hipfire-xdna` are diagnostic/experimental ([`npu/README.md`](npu/README.md)) |
 
 The dependency edge runs one way and is checked by `cargo tree`:
@@ -189,8 +187,8 @@ The mesh is owned by the rank-0 `Qwen4Bundle` (`attach_ep_mesh`,
 threads, each with its own `Gpu`. It is **not** `LoadedModel.ep`, so a Qwen4 EP
 model still takes the ordinary `Qwen4Ar` / `Qwen4Spec` generation route rather
 than `generate_ep`. EP refuses what the replicated program does not run
-(DFlash, DSpark, n-gram drafting, DDTree, adaptive KV, an EAGLE drafter, CASK,
-PFlash, an experts-per-token override, a non-Single compute placement; lane
+(DFlash, DSpark, n-gram drafting, DDTree, adaptive KV, an EAGLE drafter,
+an experts-per-token override, a non-Single compute placement; lane
 steps never run under EP), and native MTP attaches under EP only on an explicit
 `--spec mtp` (`qwen4_ep_option_refusal`, `qwen4_native_mtp`).
 
@@ -339,7 +337,7 @@ Load is **source × carrier**, not a two-file hard split.
 | Source | Type | Arch id origin |
 |---|---|---|
 | HFQ / MQ* artifact | `ModelSource::Hfq(HfqFile)` | Header `HfqFile::arch_id` |
-| Safetensors / Paro directory | `ModelSource::Dir(SafetensorsSource)` | `derive_arch_id` from `config.json` (`architectures` / `model_type`) |
+| Safetensors directory | `ModelSource::Dir(SafetensorsSource)` | `derive_arch_id` from `config.json` (`architectures` / `model_type`) |
 
 Defined in `crates/hipfire-runtime/src/loader_api.rs` and
 `safetensors_source.rs`. Unrecognized dir `model_type` yields sentinel
@@ -347,9 +345,7 @@ Defined in `crates/hipfire-runtime/src/loader_api.rs` and
 to Qwen3.5.
 
 Tensor names follow family-dependent HuggingFace conventions (e.g. dense LLaMA
-`model.layers.{i}.…`; Qwen3.5 nested `model.language_model.layers.…`). GGUF
-inputs map only **recognized** llama.cpp names via `gguf_to_safetensors_name`
-at quantize time; unknown GGUF names are retained unchanged.
+`model.layers.{i}.…`; Qwen3.5 nested `model.language_model.layers.…`).
 
 ### Carriers
 
@@ -589,8 +585,9 @@ recorder-aware launch site
 **Runtime routing/default ≠ admission or certification.** Example runtime
 automatic default (source capability/default fact only, `REDLINE.md`; not an
 admission or certification record): `mq4r_redline_default` — exact GPU arch
-`gfx1100`/`gfx1151`/`gfx1201` + PP=1 + TP=1 + case-insensitive `.mq4r`
-extension configures model default replay backend (model-family agnostic; no
+`gfx1100`/`gfx1151`/`gfx1201` + PP=1 + TP=1 + the MQ4R SKU (HFQ
+metadata or registry card, never the file extension) configures model default
+replay backend (model-family agnostic; no
 `arch_id` gate); `gfx1200` and all other arches remain opt-in. Built-in `hip`
 config profile, explicit `HIPFIRE_REPLAY_BACKEND`, or manual capture disables
 the automatic default / opts into broader capability.
@@ -642,12 +639,10 @@ accepted sets differ by carrier). Concrete modes include:
 | `q8` | Q8_0 K and V |
 | `fp8` / `bf16` | Native K+V layout (`fp8`: Qwen single-GPU; `bf16`: Qwen quality-control arm, Maple default) |
 | `fwht2` / `fwht3` / `fwht4` | FWHT-rotated K tiers + Q8 V; optional headroom modes |
-| `asym2` / `asym3` / `asym4` | **Deprecated since 0.4.0, removal in 0.5.0**: legacy Givens-rotated Lloyd K + Q8 V (fwht3 supersedes Givens asym KV). On Qwen the bare names alias `fwhtN`; the Givens constructors need `legacy-asymN` |
 
 **Qwen-family `auto` / unset** (arch-aware, Qwen only): native **fp8/fp8** on
 exact `gfx1201` single GPU when the load is native-eligible (H24/Hkv4/D256
-dense or H16/Hkv2/D256 A3B, D256, no adaptive, no CASK
-(deprecated since 0.4.0, removal in 0.5.0), no slots/TP/PP split);
+dense or H16/Hkv2/D256 A3B, D256, no adaptive, no slots/TP/PP split);
 **q8/q8** everywhere else, gfx1100 and gfx1151 included. Native `bf16`
 stays H24 dense-only. Non-Qwen family defaults are unchanged (Maple BF16, DeepSeek
 compressor F32, Gemma layered policy, …). Full K/V axis overrides (`--kv-k` /

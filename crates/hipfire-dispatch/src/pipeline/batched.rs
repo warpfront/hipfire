@@ -119,7 +119,7 @@ pub struct BatchScratch<'a> {
     /// Small-arena scratch: the packed MQ4 routes need full-size planes.
     pub lean: bool,
     pub x_batch: &'a GpuTensor,
-    /// Un-rotated RMSNorm rows: the PARO Givens projections rotate from it.
+    /// Un-rotated RMSNorm rows.
     pub x_norm_batch: &'a GpuTensor,
     pub x_rot_batch: &'a GpuTensor,
     pub x_rot_f16_batch: &'a GpuTensor,
@@ -327,6 +327,8 @@ pub(crate) fn try_a8_rmsnorm_prepared(
     if !gpu.flags.a8_fused_prod || !gpu.a8_prefill_active(n, k) || next.dtype != DType::MQ4G256V2 {
         return Ok(None);
     }
+    // The norm reads `x`: land any residual add a folded GEMM left owed to it.
+    gpu.flush_residual_fold()?;
     let reservation = gpu.reserve_int8_mmq(k, n)?;
     gpu.fused_rmsnorm_rotate_mq_i8_batched(x, weight, next.awq_scale, None, reservation, k, eps, n)
         .map(Some)
@@ -1016,11 +1018,17 @@ pub enum DenseBatchMath {
 impl DenseBatchMath {
     /// The math a stage runs: `Product` inside the IU4 verify scope is
     /// `Iu4Verify`. `SingletonWmma` inside the scope and `Iu4Verify` outside
-    /// it are caller errors.
+    /// it are caller errors, and so is `SingletonWmma` inside the ordinary
+    /// prefill intent ([`Gpu::ordinary_prefill_enter`]): the canonical prefill
+    /// producers and the verify twins never share a recipe.
     pub(crate) fn resolve(self, gpu: &Gpu, site: &str) -> HipResult<Self> {
         match (self, gpu.iu4_verify_scope) {
             (Self::Product, true) | (Self::Iu4Verify, true) => Ok(Self::Iu4Verify),
             (Self::Product, false) => Ok(Self::Product),
+            (Self::SingletonWmma, false) if gpu.ordinary_prefill_active() => Err(HipError::new(
+                0,
+                &format!("{site}: SingletonWmma verify math inside the ordinary prefill intent"),
+            )),
             (Self::SingletonWmma, false) => Ok(Self::SingletonWmma),
             (Self::SingletonWmma, true) => Err(HipError::new(
                 0,
@@ -1032,6 +1040,17 @@ impl DenseBatchMath {
             )),
         }
     }
+}
+
+/// Run `body` with the ordinary prefill intent open ([`Gpu::ordinary_prefill_enter`]) and restore
+/// the previous intent on every return, `Err` included. Every ordinary prefill forward
+/// (including a one-row tail) runs its layer stack inside this; decode, tree/chain verify, row
+/// capture and rollback never do.
+pub fn with_ordinary_prefill<T>(gpu: &mut Gpu, body: impl FnOnce(&mut Gpu) -> T) -> T {
+    let prev = gpu.ordinary_prefill_enter();
+    let out = body(gpu);
+    gpu.ordinary_prefill_exit(prev);
+    out
 }
 
 /// `Iu4Verify`: the A4 producer for this projection must have run.
@@ -1490,7 +1509,6 @@ pub fn run_plain_gemm_key(
         m,
         k,
         row_stride: k,
-        rotation: None,
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
@@ -1541,7 +1559,6 @@ pub fn run_residual_gemm_key(
         m,
         k,
         row_stride: k,
-        rotation: None,
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
@@ -1650,7 +1667,6 @@ pub fn run_fused_gate_up_key(
         outputs: &[y_gate, y_up],
         m: &[gate_m, up_m],
         k,
-        rot_scratch: &[],
         batch_size: Some(n),
     };
     FUSED_QKV.run(&ctx, gpu, &params).map_err(hip_err)
@@ -1697,7 +1713,6 @@ pub fn run_fused_qkv_key(
         outputs: &[y_q, y_k, y_v],
         m: &[q_m, k_m, v_m],
         k,
-        rot_scratch: &[],
         batch_size: Some(n),
     };
     FUSED_QKV.run(&ctx, gpu, &params).map_err(hip_err)
@@ -1742,7 +1757,6 @@ pub fn run_fused_qkvza_key(
         outputs: &[y_qkv, y_z, y_beta, y_alpha],
         m: &[qkv_m, z_m, beta_m, alpha_m],
         k,
-        rot_scratch: &[],
         batch_size: Some(n),
     };
     FUSED_QKV.run(&ctx, gpu, &params).map_err(hip_err)

@@ -426,7 +426,6 @@ pub(super) fn fused_projection(
             outputs,
             m: &m,
             k: weights[0].k,
-            rot_scratch: &[],
             batch_size: (rows > 1).then_some(rows),
         },
     )
@@ -675,6 +674,8 @@ pub(super) fn rms_norm(
 pub enum RopeKind {
     /// Every channel pair of the head rotates.
     RotateHalf,
+    /// [`Self::RotateHalf`] with the Llama-3 inverse-frequency remap.
+    RotateHalfLlama3(rdna_compute::rope::RopeLlama3),
     /// The first `rot_pairs` pairs of each half rotate; the rest pass through.
     PartialHalved { rot_pairs: usize },
     /// Rotate-half over the first `rot_dim` channels of each head (pair
@@ -695,7 +696,7 @@ impl Rope {
     /// pairing is a prefix of the head.
     fn halved_pairs(&self, head_dim: usize) -> Option<usize> {
         match self.kind {
-            RopeKind::RotateHalf => Some(head_dim / 2),
+            RopeKind::RotateHalf | RopeKind::RotateHalfLlama3(_) => Some(head_dim / 2),
             RopeKind::PartialHalved { rot_pairs } => Some(rot_pairs),
             RopeKind::PrefixHalfSplit { .. } => None,
             RopeKind::NoPe => Some(0),
@@ -720,6 +721,9 @@ impl Rope {
             RopeKind::NoPe => Ok(()),
             RopeKind::RotateHalf => {
                 gpu.rope_f32(q, k, pos_buf, n_heads, n_kv_heads, head_dim, theta)
+            }
+            RopeKind::RotateHalfLlama3(l3) => {
+                gpu.rope_scaled_f32(q, k, pos_buf, n_heads, n_kv_heads, head_dim, theta, l3)
             }
             RopeKind::PartialHalved { rot_pairs } => gpu.rope_partial_halved_f32(
                 q, k, pos_buf, n_heads, n_kv_heads, head_dim, rot_pairs, theta,
@@ -772,6 +776,9 @@ impl Rope {
             RopeKind::RotateHalf => {
                 gpu.rope_batched_f32(q, k, positions, n_heads, n_kv_heads, head_dim, theta, rows)
             }
+            RopeKind::RotateHalfLlama3(l3) => gpu.rope_batched_scaled_f32(
+                q, k, positions, n_heads, n_kv_heads, head_dim, theta, rows, l3,
+            ),
             RopeKind::PartialHalved { rot_pairs } => gpu.rope_partial_halved_f32_batched(
                 q, k, positions, n_heads, n_kv_heads, head_dim, rot_pairs, theta, rows,
             ),
@@ -861,8 +868,11 @@ pub struct DraftContext<'a> {
 ///     tiled     28.65  28.55  28.38  28.20  27.86  27.20
 /// ```
 ///
-/// Both kernels read the same cache with the same mask; the output is
-/// byte-identical on either side of the threshold.
+/// Both kernels read the same cache with the same mask but reduce in a
+/// different order, so the output is not byte-identical across the threshold:
+/// on gfx1151 most of the 4096 output floats differ, by at most about 6e-6
+/// (HIPF-249). A given position always takes the same kernel, so decode stays
+/// deterministic.
 pub const WINDOWED_Q8_TILED_MIN_SEQ: usize = 1280;
 
 /// F32 elements of the tiled kernel's partials for a cache of `cap` rows.
@@ -1982,11 +1992,6 @@ fn activate<'a>(
                     eps: 0.0,
                     batch_size: if op.stream.batched() { rows } else { 1 },
                     variant: RotationVariant::WithSwiGLU,
-                    givens_pairs: None,
-                    givens_theta: None,
-                    givens_scales: None,
-                    givens_krot: None,
-                    givens_group_size: None,
                 },
             )
             .map_err(hip_dbg)?,
@@ -2065,7 +2070,6 @@ fn project_group(
                     outputs: &[q.1, k.1, v.1, g.1],
                     m: &ws.map(|w| w.m),
                     k: q.0.k,
-                    rot_scratch: &[],
                     batch_size: Some(rows),
                 },
             );
@@ -2375,8 +2379,6 @@ fn routed_rows_grouped(
         m_total,
         rows,
         false,
-        false,
-        false,
         // Gemma 4 experts are device-resident: no host-mapped coalesced read.
         false,
     )?;
@@ -2663,7 +2665,6 @@ mod tests {
             m,
             k,
             row_stride: k,
-            rotation: None,
             awq_scale: None,
             lloyd_lut_e4m3: None,
             lloyd_lut_f16: None,
@@ -2892,7 +2893,6 @@ mod validation_tests {
             m: DIM,
             k: DIM,
             row_stride: 0,
-            rotation: None,
             awq_scale: None,
             lloyd_lut_e4m3: None,
             lloyd_lut_f16: None,

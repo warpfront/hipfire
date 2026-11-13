@@ -131,8 +131,7 @@ pub fn codec_name(quant_type: u8) -> &'static str {
         21 => "hfp4g32",
         22 => "tidi32",
         24 => "mfp4g32",
-        28 => "paro4g128",
-        29 => "paro4g128t",
+        // 28, 29: reserved: formerly PARO4G128/PARO4G128T, removed in 0.5.0
         30 => "mq4g256lloyd",
         31 => "mq5g256",
         32 => "mfp4g32lloyd",

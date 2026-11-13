@@ -19,17 +19,19 @@ pub(crate) enum MoeExpertDown {
 #[command(
     name = "hipfire-quantize",
     version,
-    about = "Quantize Hugging Face safetensors (or deprecated GGUF weights) into Hipfire HFQ",
+    about = "Quantize Hugging Face safetensors into Hipfire HFQ",
     after_help = "SUBCOMMANDS:\n  ple-hot-rank  Rank Qwen4 PLE rows over a corpus and write the <model>.plehot \
                   hot-row sidecar (run `hipfire-quantize ple-hot-rank --help`)\n  \
                   ple-hot-pack  Cut the <model>.plehotrows hot-row pack from a model and its \
                   .plehot sidecar (run `hipfire-quantize ple-hot-pack --help`)\n  \
                   trunk-overlay  Build the <model>.trunk-overlay QT44 overlay sidecar for a base \
-                  model (run `hipfire-quantize trunk-overlay --help`)"
+                  model (run `hipfire-quantize trunk-overlay --help`)\n  \
+                  hc8  Build the <model>.hc8 8-bit hyper-connection mixer sidecar for a Flash-Next \
+                  base model (run `hipfire-quantize hc8 build --help`)"
 )]
 pub(crate) struct QuantizeArgs {
     /// Hugging Face model directory or model ID. A GGUF weight file is
-    /// deprecated (removal in 0.5.0): GGUF→mqN is lossy double quantization; use llama.cpp for GGUF. For
+    /// refused (GGUF weight input was removed in 0.5.0; use llama.cpp for GGUF). For
     /// `--qwen4-flash-next`, use a local directory/file or the immutable
     /// remote form `hf://OWNER/REPO@40_HEX_REVISION`; floating refs such as
     /// `main`, tags, and short revisions are rejected. Not used by
@@ -39,7 +41,6 @@ pub(crate) struct QuantizeArgs {
         value_name = "PATH_OR_MODEL_ID",
         required_unless_present = "flux_pipe"
     )]
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — GGUF→mqN is lossy double quantization; use llama.cpp for GGUF (GGUF weight input only; imatrix.gguf stays)
     pub input: Option<String>,
 
     /// Produce the native Qwen4/Qwen3.8-Flash-Next streaming artifact.  This
@@ -60,10 +61,21 @@ pub(crate) struct QuantizeArgs {
     /// it selects its own route, so `--qwen4-flash-next` is not given.
     /// `--qwen4-component-mode compact-fixture` is the only other flag read;
     /// legacy recipe flags, `--format` and the other routes are refused.
-    #[arg(long, value_name = "RECIPE", value_parser = ["stock-fp8"],
+    /// `stock-fp8-mtp-sidecar` builds the `<model>.mtp` MTP head sidecar of
+    /// such an artifact from the same checkpoint: `--input <dir> --base
+    /// <model.hfq> [--base-sha256 HEX] [--output PATH]`; it reads no other flag.
+    #[arg(long, value_name = "RECIPE", value_parser = ["stock-fp8", "stock-fp8-mtp-sidecar"],
           conflicts_with_all = ["qwen4_flash_next", "flux_pipe", "mq4v2_final_codes",
                                 "mq3v2_final_codes", "mq2v2_final_codes", "reap_overlay"])]
     pub recipe: Option<String>,
+    /// `--recipe stock-fp8-mtp-sidecar` only: the stock-FP8 AR artifact the
+    /// sidecar extends.
+    #[arg(long, value_name = "MODEL_HFQ")]
+    pub base: Option<String>,
+    /// `--recipe stock-fp8-mtp-sidecar` only: refuse a base whose whole-file
+    /// SHA-256 is not this value (64 hex digits).
+    #[arg(long = "base-sha256", value_name = "HEX")]
+    pub base_sha256: Option<String>,
     /// Developer-only (build feature `qwen4-dev-profiles`): produce a COMPLETE
     /// tiny local Qwen4 checkpoint from a local safetensors directory whose
     /// config.json carries a `hipfire_profile` developer marker.
@@ -77,8 +89,14 @@ pub(crate) struct QuantizeArgs {
           value_parser = ["source-exact", "packed"])]
     pub qwen4_dev_tiny: Option<String>,
 
-    /// Destination HFQ file.
-    #[arg(long, value_name = "PATH")]
+    /// Destination HFQ file.  With `--recipe stock-fp8-mtp-sidecar` it
+    /// defaults to `<base file name>.mtp` beside the base.
+    #[arg(
+        long,
+        value_name = "PATH",
+        required_unless_present = "base",
+        default_value = ""
+    )]
     pub output: String,
 
     /// Quantization recipe or wire format.
@@ -216,8 +234,18 @@ pub(crate) struct QuantizeArgs {
     /// Enable AWQ pre-scaling with an explicit alpha.
     #[arg(long, value_name = "ALPHA")]
     pub awq_alpha: Option<f32>,
-    /// Correct Qwen3.8 linear-attention out_proj imatrix head order before
-    /// fitting AWQ scales. Does not change the alpha or any other tensor.
+    /// Re-index llama.cpp's tiled V-head order in the imatrix's
+    /// `linear_attn.out_proj` / `ssm_out` entries back to HF grouped order
+    /// before AWQ. llama.cpp's HF→GGUF converter permutes that tensor's input
+    /// axis (`tiled = v_slot * n_k_heads + k_head`) for `ggml_repeat`
+    /// broadcast, so the imatrix records it tiled while HF columns are grouped
+    /// (`grouped = k_head * n_v_per_k + v_slot`). Geometry is read from the
+    /// model config (`linear_num_key_heads`, `linear_num_value_heads`,
+    /// `linear_value_head_dim`); HF head `h` reads tiled head
+    /// `(h % n_v_per_k) * n_k_heads + h / n_v_per_k`. Recommended for every
+    /// llama.cpp-imatrix AWQ requant of a grouped-V-head model (Qwen3.5/3.6/
+    /// 3.8 GatedDeltaNet); off by default to keep historical recipes
+    /// byte-reproducible.
     #[arg(long, requires = "imatrix")]
     pub awq_fix_la_head_order: bool,
 
@@ -244,6 +272,12 @@ pub(crate) struct QuantizeArgs {
     /// affine header layout. The stored zero is `-8*d`, so code 8 maps to zero.
     #[arg(long)]
     pub mq4v2_symmetric: bool,
+
+    /// Raon-1-mini only: write attention-class projections with K % 256 == 0 (RDA q/k/v/g/o,
+    /// MLA q_a/kv_a/kv_b/g/o) as MQ8G256 (qt14, FWHT256 sign seeds 42/1042) from the BF16
+    /// source instead of Q8F16. Records recipe `raon-...-mq8g256-attn/v1`; default unchanged.
+    #[arg(long)]
+    pub raon_attn_mq8: bool,
 
     /// Encode MQ3V2 with a per-128 symmetric grid while retaining the existing
     /// affine header layout. The stored zero is `-4*d`, so code 4 maps to zero.
@@ -409,6 +443,8 @@ pub(crate) enum Route {
     Qwen4,
     /// `--recipe stock-fp8` stock FP8 passthrough converter.
     Qwen4StockFp8,
+    /// `--recipe stock-fp8-mtp-sidecar` MTP head sidecar of a stock FP8 artifact.
+    Qwen4StockMtpSidecar,
     /// `--qwen4-dev-tiny` complete developer tiny checkpoint (feature-gated).
     #[cfg(feature = "qwen4-dev-profiles")]
     Qwen4DevTiny,
@@ -418,8 +454,6 @@ pub(crate) enum Route {
     RaonSharedFfn,
     /// `--format maple|ds4-dense-e8soa-overlay|ds4-dspark-e8soa|qwen3-dspark-q8`.
     EarlySpecial,
-    /// Deprecated GGUF weight input.
-    Gguf,
     /// Raon-1-mini (`model_type: raon1_mini`) symmetric qt44 control artifact.
     Raon,
     /// `--reap-overlay` selective re-quant.
@@ -435,9 +469,9 @@ const EVERY: &[Route] = &[
     Flux,
     Qwen4,
     Qwen4StockFp8,
+    Qwen4StockMtpSidecar,
     FinalCodes,
     EarlySpecial,
-    Gguf,
     Raon,
     RaonSharedFfn,
     ReapOverlay,
@@ -448,10 +482,10 @@ const EVERY: &[Route] = &[
     Flux,
     Qwen4,
     Qwen4StockFp8,
+    Qwen4StockMtpSidecar,
     Qwen4DevTiny,
     FinalCodes,
     EarlySpecial,
-    Gguf,
     Raon,
     RaonSharedFfn,
     ReapOverlay,
@@ -467,9 +501,9 @@ pub(crate) const FLAG_ROUTES: &[(&str, &[Route])] = &[
         &[
             Qwen4,
             Qwen4StockFp8,
+            Qwen4StockMtpSidecar,
             FinalCodes,
             EarlySpecial,
-            Gguf,
             Raon,
             RaonSharedFfn,
             ReapOverlay,
@@ -482,10 +516,10 @@ pub(crate) const FLAG_ROUTES: &[(&str, &[Route])] = &[
         &[
             Qwen4,
             Qwen4StockFp8,
+            Qwen4StockMtpSidecar,
             Qwen4DevTiny,
             FinalCodes,
             EarlySpecial,
-            Gguf,
             Raon,
             RaonSharedFfn,
             ReapOverlay,
@@ -496,14 +530,16 @@ pub(crate) const FLAG_ROUTES: &[(&str, &[Route])] = &[
     ("threads", EVERY),
     ("qwen4_flash_next", &[Qwen4]),
     ("qwen4_component_mode", &[Qwen4, Qwen4StockFp8]),
-    ("recipe", &[Qwen4StockFp8]),
+    ("recipe", &[Qwen4StockFp8, Qwen4StockMtpSidecar]),
+    ("base", &[Qwen4StockMtpSidecar]),
+    ("base_sha256", &[Qwen4StockMtpSidecar]),
     #[cfg(feature = "qwen4-dev-profiles")]
     ("qwen4_dev_tiny", &[Qwen4DevTiny]),
-    ("format", &[EarlySpecial, Gguf, Raon, Main]),
+    ("format", &[EarlySpecial, Raon, Main]),
     ("head_quant", &[EarlySpecial]),
     ("head_only", &[EarlySpecial]),
-    ("arch_id", &[Gguf, ReapOverlay, Main]),
-    ("force_arch_id", &[Gguf, ReapOverlay, Main]),
+    ("arch_id", &[ReapOverlay, Main]),
+    ("force_arch_id", &[ReapOverlay, Main]),
     ("flux_pipe", &[Flux]),
     ("flux_component", &[Flux]),
     ("source_url", &[ReapOverlay, Main]),
@@ -518,13 +554,14 @@ pub(crate) const FLAG_ROUTES: &[(&str, &[Route])] = &[
     ("imatrix", &[Main]),
     ("awq_alpha", &[Main]),
     ("mq4v2_symmetric", &[Raon, Main]),
+    ("raon_attn_mq8", &[Raon]),
     ("hessian_dir", &[Main]),
     ("tier_ratio", &[Main]),
     ("q8_router", &[Main]),
     ("no_q8_conv1d", &[Main]),
     ("no_q8_router", &[Main]),
-    ("no_kmap", &[Gguf, Main]),
-    ("uniform", &[Gguf, Main]),
+    ("no_kmap", &[Main]),
+    ("uniform", &[Main]),
     ("awq", &[Main]),
     ("awq_fix_la_head_order", &[Main]),
     ("awq_a4_aware", &[Main]),
@@ -541,18 +578,18 @@ pub(crate) const FLAG_ROUTES: &[(&str, &[Route])] = &[
     ("raon_source", &[RaonSharedFfn]),
     ("raon_shared_ffn_verify", &[RaonSharedFfn]),
     ("raon_shared_ffn_scope", &[RaonSharedFfn]),
-    ("kmap_dense", &[Gguf, Main]),
-    ("kmap_mode", &[Gguf, Main]),
-    ("allow_mq2", &[Gguf, Main]),
-    ("allow_mq2_lloyd", &[Gguf, Main]),
-    ("allow_mq3_lloyd", &[Gguf, Main]),
-    ("allow_mq4_lloyd", &[Gguf, Main]),
+    ("kmap_dense", &[Main]),
+    ("kmap_mode", &[Main]),
+    ("allow_mq2", &[Main]),
+    ("allow_mq2_lloyd", &[Main]),
+    ("allow_mq3_lloyd", &[Main]),
+    ("allow_mq4_lloyd", &[Main]),
     ("include_vision", &[Main]),
     ("vision_quant", &[Main]),
     ("include_prefix", &[Main]),
     ("vision_only", &[Main]),
-    ("tier", &[Gguf, Raon, Main]),
-    ("fixed_tier", &[Gguf, Main]),
+    ("tier", &[Raon, Main]),
+    ("fixed_tier", &[Main]),
 ];
 
 fn route_label(route: Route) -> &'static str {
@@ -560,11 +597,11 @@ fn route_label(route: Route) -> &'static str {
         Flux => "--flux-pipe",
         Qwen4 => "--qwen4-flash-next",
         Qwen4StockFp8 => "--recipe stock-fp8",
+        Qwen4StockMtpSidecar => "--recipe stock-fp8-mtp-sidecar",
         #[cfg(feature = "qwen4-dev-profiles")]
         Qwen4DevTiny => "--qwen4-dev-tiny",
         FinalCodes => "--mq*v2-final-codes",
         EarlySpecial => "this --format",
-        Gguf => "GGUF weight input",
         Raon => "the Raon-1-mini converter",
         RaonSharedFfn => "--raon-shared-ffn / --raon-shared-ffn-verify",
         ReapOverlay => "--reap-overlay",
@@ -669,11 +706,6 @@ mod route_tests {
                     "--mq4v2-symmetric",
                 ],
                 "--mq4v2-symmetric",
-            ),
-            (
-                Gguf,
-                &["--input", "m.gguf", "--output", "o", "--imatrix", "x"],
-                "--imatrix",
             ),
             (
                 RaonSharedFfn,
@@ -810,7 +842,7 @@ mod route_tests {
             );
         }
         // No other route reads --recipe.
-        for route in [Qwen4, Main, Gguf, EarlySpecial] {
+        for route in [Qwen4, Main, EarlySpecial] {
             let err = reject_unreachable(&matches(&base), route).unwrap_err();
             assert!(
                 err.starts_with("--recipe has no effect"),
@@ -845,6 +877,73 @@ mod route_tests {
                 "i",
                 "--output",
                 "o"
+            ])
+            .is_err());
+    }
+
+    #[test]
+    fn stock_fp8_mtp_sidecar_route_reads_only_input_base_sha_and_output() {
+        let base = [
+            "--recipe",
+            "stock-fp8-mtp-sidecar",
+            "--input",
+            "i",
+            "--base",
+            "b.hfq",
+        ];
+        // --output is optional on this route (defaults beside the base).
+        reject_unreachable(&matches(&base), Qwen4StockMtpSidecar).unwrap();
+        let mut full = base.to_vec();
+        full.extend(["--base-sha256", "ab", "--output", "o"]);
+        reject_unreachable(&matches(&full), Qwen4StockMtpSidecar).unwrap();
+        for (flag, value) in [
+            ("--qwen4-component-mode", Some("compact-fixture")),
+            ("--format", Some("mq4")),
+            ("--imatrix", Some("x")),
+            ("--awq", None),
+        ] {
+            let mut argv = base.to_vec();
+            argv.push(flag);
+            argv.extend(value);
+            let err = reject_unreachable(&matches(&argv), Qwen4StockMtpSidecar).unwrap_err();
+            assert!(
+                err.starts_with(&format!("{flag} has no effect")),
+                "{flag}: {err}"
+            );
+        }
+        // --base and --base-sha256 belong to this route alone.
+        let argv = [
+            "--recipe",
+            "stock-fp8",
+            "--input",
+            "i",
+            "--output",
+            "o",
+            "--base",
+            "b",
+        ];
+        let err = reject_unreachable(&matches(&argv), Qwen4StockFp8).unwrap_err();
+        assert!(err.starts_with("--base has no effect"), "{err}");
+        let argv = [
+            "--recipe",
+            "stock-fp8",
+            "--input",
+            "i",
+            "--output",
+            "o",
+            "--base-sha256",
+            "ab",
+        ];
+        let err = reject_unreachable(&matches(&argv), Qwen4StockFp8).unwrap_err();
+        assert!(err.starts_with("--base-sha256 has no effect"), "{err}");
+        // Without --base, --output stays required.
+        assert!(QuantizeArgs::command()
+            .try_get_matches_from([
+                "hipfire-quantize",
+                "--recipe",
+                "stock-fp8-mtp-sidecar",
+                "--input",
+                "i"
             ])
             .is_err());
     }

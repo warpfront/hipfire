@@ -1185,7 +1185,6 @@ fn load_wt(
             m,
             k,
             row_stride: 0,
-            paro: None,
             awq_scale: None,
             lloyd_lut_e4m3: None,
             lloyd_lut_f16: None,
@@ -1206,7 +1205,6 @@ fn load_wt(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -1226,7 +1224,6 @@ fn load_wt(
             m,
             k,
             row_stride: 0,
-            paro: None,
             awq_scale: None,
             lloyd_lut_e4m3: None,
             lloyd_lut_f16: None,
@@ -1248,7 +1245,6 @@ fn load_wt(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -1268,6 +1264,8 @@ fn load_wt(
         19 => DType::MQ4G256,
         qt => return Err(format!("glimmer: unsupported quant_type {qt} for {name}")),
     };
+    hipfire_runtime::weight_backend::validate_row_extent(dtype, data.len(), m, k, name)
+        .map_err(|e| format!("glimmer: {e:?}"))?;
     let buf = gpu
         .upload_raw(data, &[data.len()])
         .map_err(|e| format!("glimmer: upload {name}: {e:?}"))?;
@@ -1289,7 +1287,6 @@ fn load_wt(
         m,
         k,
         row_stride: 0,
-        paro: None,
         awq_scale,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
@@ -1447,7 +1444,15 @@ impl GlimmerWeights {
         let embd_format: EmbeddingFormat;
         match embed_info.quant_type {
             3 => {
-                let t = match gpu.upload_raw(embed_data, &[embed_data.len()]) {
+                let t = match hipfire_runtime::weight_backend::validate_row_extent(
+                    DType::Q8_0,
+                    embed_data.len(),
+                    cfg.vocab_size,
+                    dim,
+                    embed_name,
+                )
+                .and_then(|()| gpu.upload_raw(embed_data, &[embed_data.len()]))
+                {
                     Ok(v) => v,
                     Err(e) => {
                         guard.cleanup(gpu);
@@ -1458,7 +1463,15 @@ impl GlimmerWeights {
                 embd_format = EmbeddingFormat::Q8_0;
             }
             6 => {
-                let t = match gpu.upload_raw(embed_data, &[embed_data.len()]) {
+                let t = match hipfire_runtime::weight_backend::validate_row_extent(
+                    DType::HFQ4G256,
+                    embed_data.len(),
+                    cfg.vocab_size,
+                    dim,
+                    embed_name,
+                )
+                .and_then(|()| gpu.upload_raw(embed_data, &[embed_data.len()]))
+                {
                     Ok(v) => v,
                     Err(e) => {
                         guard.cleanup(gpu);
@@ -1469,7 +1482,15 @@ impl GlimmerWeights {
                 embd_format = EmbeddingFormat::HFQ4G256;
             }
             7 => {
-                let t = match gpu.upload_raw(embed_data, &[embed_data.len()]) {
+                let t = match hipfire_runtime::weight_backend::validate_row_extent(
+                    DType::HFQ4G128,
+                    embed_data.len(),
+                    cfg.vocab_size,
+                    dim,
+                    embed_name,
+                )
+                .and_then(|()| gpu.upload_raw(embed_data, &[embed_data.len()]))
+                {
                     Ok(v) => v,
                     Err(e) => {
                         guard.cleanup(gpu);

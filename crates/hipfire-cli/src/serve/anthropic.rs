@@ -966,7 +966,7 @@ mod tests {
         );
         assert_eq!(
             crate::serve::complete::request_images_base64(lowered.chat.get("messages")).unwrap(),
-            vec!["AAAA".to_string()]
+            vec!["AAAA".to_owned()]
         );
     }
 

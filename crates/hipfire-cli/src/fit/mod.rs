@@ -22,7 +22,7 @@ use hipfire_loader::admission::{
 };
 use hipfire_registry::{receipts, ModelEntry, RegistryV1};
 use hipfire_runtime::device_mesh::{DeviceMesh, DimKind};
-use hipfire_runtime::loader_api::{CaskConfig, ModelSource, SpecLoadCfg};
+use hipfire_runtime::loader_api::{ModelSource, SpecLoadCfg};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::fmt::Write as _;
@@ -950,12 +950,6 @@ fn model_params(
             .as_deref()
             == Some("1")
     );
-    params["_pp_pflash"] = json!(
-        hipfire_config::developer_var("HIPFIRE_PP_PFLASH")
-            .ok()
-            .as_deref()
-            == Some("1")
-    );
     // daemon/main.rs:1270-1289 resolves the process topology before parsing
     // admission inputs. Keep environmental resolution outside the pure mapper.
     let mut message = json!({"params": params});
@@ -1654,7 +1648,6 @@ struct AdmissionInputs<'a> {
     kv_k: Option<&'a str>,
     kv_v: Option<&'a str>,
     kv_adaptive: Option<&'a str>,
-    cask: CaskConfig,
     options: SourceAdmissionOptions,
     error: Option<String>,
 }
@@ -1666,10 +1659,9 @@ impl AdmissionInputs<'_> {
             kv_k: self.kv_k,
             kv_v: self.kv_v,
             kv_adaptive: self.kv_adaptive,
-            cask: Some(&self.cask),
             deepseek4_heterogeneous: self.options.non_single_compute,
             qwen_default_q8: qwen_default_q8_enabled(),
-            vmm_runtime_available: true,
+            vmm_runtime_refusal: None,
             free_vram_bytes: device.free.and_then(|n| usize::try_from(n).ok()),
         }
     }
@@ -1821,18 +1813,6 @@ fn admission_inputs(params: &Value) -> AdmissionInputs<'_> {
         dflash_block: Some(dflash_block),
         dflash_block_auto,
     };
-    // :1906-1972: keep a CaskConfig even when eviction is off, exactly as
-    // admission's hints do; cask option below is SIDECAR presence, not enabled.
-    let enabled = params["cask"].as_bool().unwrap_or(false);
-    let cask = CaskConfig {
-        sidecar: str_param(params, "cask_sidecar").map(str::to_owned),
-        cask_m_folding: enabled && draft.is_none(),
-        budget: usize_param(params, "cask_budget").unwrap_or(512),
-        beta: usize_param(params, "cask_beta").unwrap_or(128),
-        handoff_tokens: usize_param(params, "cask_handoff_tokens").unwrap_or(0),
-        core_frac: params["cask_core_frac"].as_f64().unwrap_or(0.5) as f32,
-        fold_m: usize_param(params, "cask_fold_m").unwrap_or(2),
-    };
     // :2152-2183: parse even an empty placement string (daemon refuses it).
     let placement = params["deepseek4_compute_placement"]
         .as_str()
@@ -1847,12 +1827,9 @@ fn admission_inputs(params: &Value) -> AdmissionInputs<'_> {
         spec,
         kv_adaptive: qwen4_kv_adaptive_requested(kv_adaptive),
         eagle_drafter: str_param(params, "drafter").is_some(),
-        cask: cask.sidecar.is_some(),
         state_quant: str_param(params, "state_quant").is_some(),
         non_single_compute: !matches!(placement, hipfire_config::Deepseek4ComputePlacement::Single),
         expert_count_override: usize_param(params, "deepseek4_experts_per_token").is_some(),
-        pflash: str_param(params, "prefill_drafter").is_some()
-            || params["prefill_compression"].as_str().unwrap_or("off") != "off",
     };
     // :2115-2197: source-independent pre-admission feature refusals. They must
     // not become a successful fit merely because a non-Qwen4 carrier is used.
@@ -1864,12 +1841,6 @@ fn admission_inputs(params: &Value) -> AdmissionInputs<'_> {
         Some(
             "DFlash speculative decode requires pp=1; reload without a draft or set topology.pp=1.",
         )
-    } else if pp > 1 && options.cask {
-        Some(
-            "CASK / TriAttention eviction requires pp=1; reload without CASK or set topology.pp=1.",
-        )
-    } else if pp > 1 && options.pflash && params["_pp_pflash"].as_bool() != Some(true) {
-        Some("PFlash prefill compression requires pp=1; turn off prefill compression or set topology.pp=1.")
     } else if tp > 1 && options.expert_count_override {
         Some("DeepSeek V4 experts-per-token override requires tp=1; reload without the experts-per-token override.")
     } else {
@@ -1891,7 +1862,6 @@ fn admission_inputs(params: &Value) -> AdmissionInputs<'_> {
         kv_k,
         kv_v,
         kv_adaptive,
-        cask,
         options,
         error,
     }
@@ -2144,38 +2114,23 @@ mod tests {
     }
 
     #[test]
-    fn admission_inputs_gates_sidecars_and_maps_cask_flags() {
+    fn admission_inputs_gates_sidecars_and_maps_flags() {
         let params = json!({"draft": "draft.hfq", "dflash_mode": "off", "vision": "vision.hfq",
-            "vision_mode": "off", "cask": true, "cask_sidecar": "eviction.hfq",
-            "cask_budget": 768, "cask_beta": 256, "cask_handoff_tokens": 128,
-            "cask_core_frac": 0.25, "cask_fold_m": 3, "state_quant": "off",
-            "prefill_drafter": "prefill.hfq", "drafter": "eagle.hfq",
+            "vision_mode": "off", "state_quant": "off",
+            "drafter": "eagle.hfq",
             "deepseek4_experts_per_token": 4});
         let a = admission_inputs(&params);
         assert!(a.error.is_none());
         assert!(a.draft.is_none() && a.vision.is_none());
-        assert!(a.cask.cask_m_folding);
-        assert_eq!(
-            (
-                a.cask.budget,
-                a.cask.beta,
-                a.cask.handoff_tokens,
-                a.cask.fold_m
-            ),
-            (768, 256, 128, 3)
-        );
-        assert_eq!(a.cask.core_frac, 0.25);
-        assert!(a.options.cask && a.options.state_quant && a.options.pflash);
+        assert!(a.options.state_quant);
         assert!(a.options.eagle_drafter && a.options.expert_count_override);
         let params = json!({"draft": "draft.hfq", "dflash_mode": "auto",
-            "vision": "vision.hfq", "vision_mode": "auto", "cask": true});
+            "vision": "vision.hfq", "vision_mode": "auto"});
         let a = admission_inputs(&params);
         assert_eq!(a.draft, Some("draft.hfq"));
         assert_eq!(a.vision, Some("vision.hfq"));
-        assert!(!a.cask.cask_m_folding);
-        assert!(!a.options.cask); // only a sidecar activates this admission gate
-                                  // tp>1: an `auto` pairing is dropped (DFlash is not served on EP/TP),
-                                  // an explicit `on` keeps the draft for the tp>1 refusal.
+        // tp>1: an `auto` pairing is dropped (DFlash is not served on EP/TP),
+        // an explicit `on` keeps the draft for the tp>1 refusal.
         let auto_tp = json!({"draft": "draft.hfq", "dflash_mode": "auto", "tp": 2});
         assert_eq!(admission_inputs(&auto_tp).draft, None);
         let on_tp = json!({"draft": "draft.hfq", "dflash_mode": "on", "tp": 2});

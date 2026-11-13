@@ -104,7 +104,6 @@ impl ProjectionView {
             m: self.m,
             k: self.k,
             row_stride: self.row_stride,
-            rotation: None,
             awq_scale: None,
             lloyd_lut_e4m3: None,
             lloyd_lut_f16: None,

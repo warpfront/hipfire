@@ -20,7 +20,7 @@
 //!   cargo run --release --example llama_lm_head_logits_parity -- <model.mq4>
 
 use hipfire_arch_llama::load_llama_bundle;
-use hipfire_runtime::loader_api::{CaskConfig, LoadCtx, ModelSource, SpecLoadCfg};
+use hipfire_runtime::loader_api::{LoadCtx, ModelSource, SpecLoadCfg};
 use hipfire_runtime::spec::{SpecAdvance, SpecTarget};
 
 fn argmax(logits: &[f32]) -> u32 {
@@ -44,7 +44,6 @@ fn main() {
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
 
     let src = ModelSource::from_path(&model_path).expect("open model source");
-    let cask = CaskConfig::default();
     let mut ctx = LoadCtx {
         path: &model_path,
         max_seq: 2048,
@@ -59,7 +58,6 @@ fn main() {
         kv_backend: hipfire_runtime::kv_backend::KvBackend::Legacy,
         kv_adaptive_override: None,
         state_quant_override: None,
-        cask: &cask,
         pp: 1,
         pp_layer_counts: None,
         admitted_mesh: None,

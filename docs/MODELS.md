@@ -38,7 +38,7 @@ Default serve pre-warm tag is `qwen3.5:9b` (`CONFIG.md` → `default_model`). Pe
 
 ## Registry tags (from `registry/models.json`)
 
-Fields: **Tag**, **File** (`file`), **Size GB** (`size_gb`), **Min VRAM GB** (`min_vram_gb`), **Default KV** (registry `default_kv_mode` when set; else empty), **Notes** (`desc`, condensed). `default_kv_mode = "q8"` is the universal fallback and is **not** lowered into config: the global `kv_cache=auto` resolves per [`CONFIG.md`](CONFIG.md#mode-k-and-v) (Qwen: native `fp8` on eligible exact gfx1201, otherwise q8). A non-q8 registry value (DeepSeek V4 `f32`, Maple-Preview `bf16`) is lowered to `kv_cache`. KV names `asymN` / `turboN` / `legacy-asymN` are **deprecated since 0.4.0, removal in 0.5.0**; use `fwhtN` or `q8`.
+Fields: **Tag**, **File** (`file`), **Size GB** (`size_gb`), **Min VRAM GB** (`min_vram_gb`), **Default KV** (registry `default_kv_mode` when set; else empty), **Notes** (`desc`, condensed). `default_kv_mode = "q8"` is the universal fallback and is **not** lowered into config: the global `kv_cache=auto` resolves per [`CONFIG.md`](CONFIG.md#mode-k-and-v) (Qwen: native `fp8` on eligible exact gfx1201, otherwise q8). A non-q8 registry value (DeepSeek V4 `f32`, Maple-Preview `bf16`) is lowered to `kv_cache`. KV names `asymN` / `turboN` / `legacy-asymN` were **removed in 0.5.0** and are rejected; use `fwhtN` or `q8`.
 
 Optional split-base PLE map (`ple`, an object keyed by format token: lowercase letters and digits such as `q4` = 4-bit Lloyd-Max rows and `q8` = the exact Q8F16 rows; each value is `{file, sha256, size_bytes}`) names the PLE row sidecars of a split entry; `registry_gen.py` pins every one from the live Hugging Face tree (an LFS sha256 is required). The entry's `file` must be a split base (`<name>-base.<ext>`). A sidecar's `file` is either the per-base `<file>.ple-<key>` or, for the Flash-Next split family (`qwen3.8-flash-next-base.<ext>`) only, the shared `qwen3.8-flash-next.ple-<key>`, which every entry naming it must pin identically. An unknown key (a future `q2`) parses and validates, so a newer registry stays readable; a client plans only the formats it can load (today `q4` and `q8`) and ignores the rest with a note. `q8` is the exact reference: a verified grandfathered monolithic embeds it, and it is the fallback when a lossy format a client wants is unpublished; an explicit `--ple q8` never falls back. `hipfire pull` and the on-demand load download a shared file once, verify it against the pin, and install `<base file>.ple-<key>` (the name the loader opens) as a hard link to it, never a second copy; an existing file under that name that is not the verified shared file is left untouched and reported. `hipfire rm` removes the shared file with the last base that links it. Entries without a `ple` map are unchanged. (This replaces the earlier fixed `ple_q4` / `ple_q8` fields.)
 
@@ -85,7 +85,7 @@ The `qwen3.6:35b-a3b*` entries and both `ornith-1.5:35b-a3b*` entries carry an `
 
 | Tag | File | Size GB | Min VRAM | Default KV | Notes |
 |---|---|---:|---:|---|---|
-| `qwen3.6:27b` | `qwen3.6-27b.mq4` | 15.0 | 16 | q8 | Registry also lists a `triattn` sidecar (deprecated CASK, removal in 0.5.0: `pull` fetches it, nothing attaches it by default); template not effort-native — `reasoning_effort` dropped+warned, never converted to a cap |
+| `qwen3.6:27b` | `qwen3.6-27b.mq4` | 15.0 | 16 | q8 | Template not effort-native — `reasoning_effort` dropped+warned, never converted to a cap |
 | `qwen3.6:27b-mq3` | `qwen3.6-27b.mq3` | 10.7 | 12 | | MQ3 alpha |
 
 ### Qwen 3.8 dense
@@ -268,6 +268,14 @@ rows and 101.3 GB with the q8 rows for `-mq2-xts`, and about 73.7 GB and
 98.9 GB for `-mq2-xts-4500`. Supported on the 7900 XTX (gfx1100) and R9700
 (gfx1201) only; Strix Halo (gfx1151) refuses these tags cleanly in 0.4.3.
 
+**MQ3 XTS tier on the 7900 XTX (gfx1100), opt-in, DRAFT pending card gates.** The MQ3 XTS tag
+(`qwen3.8:flash-next-mq3-xts`) also loads on gfx1100 (previously refused: no W3 kernels). It is a
+lossy tier (W3 cold experts, MQ4 hot experts): its quality contract is the measured paired KLD
+against `mq4` on the engine ruler (`qwen4_kld`, WT2 and code24), recorded next to the throughput
+when the card runs land. Resident layers run the gfx1100 W3 K1 (decode) and K2 (prefill) kernels;
+layers mapped from host RAM run through the D2 CPU planar W3 decoders (or K1 over the link when D2
+is off). Nothing changes for any other tag; the tier exists only for users who pull it.
+
 **Grandfathered monolithics.**
 The client carries a compiled-in pin for the Flash-Next MQ4 XTS split base
 (`qwen3.8-flash-next-base.mq4-xts`, sha256 `eafaff94…`, 70,888,270,360 B), a
@@ -313,7 +321,11 @@ Flash-Next trunk-overlay **loading** is pinned in the client, not declared in th
 - `HIPFIRE_QWEN4_TRUNK_OVERLAY` unset or `auto` applies the overlay only on gfx1151 (the exact architecture of the `gfx1151-zab-v1` trunk default); `0` never applies it (kill switch, the stock base weights load); `1` applies it on any architecture (the A4 route itself still arms by default only on gfx1151; elsewhere `HIPFIRE_QWEN4_TRUNK_IU4` must select it); any other value is a load error.
 - `hipfire rm` removes the overlay with its base. The obsolete local-only `qwen3.8:flash-next-mq4-xts-zab` baked tier is removed from the registry (no retired pin); the overlay on the stock tags supersedes it.
 
-Flash-Next expert-hotset **fetching** is likewise pinned in the client, not declared in the registry. The same four stock tags resolve through the split base identity (sha256 `eafaff94…`, 70888270360 B) to the re-bound `qwen3.8-flash-next-base.mq4-xts.expert-hotset` (217675 B, ~213 KiB, sha256 `91143074…`, always the base file name plus `.expert-hotset`) in `hipfire-models/qwen3.8-flash-next`. The pre-split pin, bound to the monolithic file (sha256 `8b15b6fe…`, 125288544792 B; `qwen3.8-flash-next.mq4-xts.expert-hotset`, 217676 B, sha256 `7f6760e1…`), is kept for grandfathered monolithic installs. `hipfire pull <tag>` selects it by default; the interactive `hipfire pull` prompt offers it as an independent default-on yes/no **Expert hot set (R9700 decode, 213 KB)** choice (the "213 KB" is the rounded display label; the file is about 217.7 KB), shown in the summary only when selected; `--yes` and the TUI's Models-tab pull keep the default. It is verified by SHA-256 and stored at the sidecar path of the local base file, which may be a renamed local file that matches a pinned base identity. `registry/v1.json` is unchanged. At runtime it applies by default on a single R9700 (gfx1201) when present and bound to the base by size and index SHA-256. `hipfire rm` removes it with its base, and `*.expert-hotset` files are sidecars, never listed or served as models. See [`CLI.md`](CLI.md#flash-next-expert-hotset).
+Flash-Next on exact gfx1201 can also load an optional `<model>.hc8` sidecar next to the base: the hyper-connection mixer BF16 weights (`*input_mix_weight_{down,up}.weight`) requantized offline to 8-bit (OCP E4M3, per-row power-of-two scale; every dequantized weight is exactly a BF16). It is built locally with `hipfire-quantize hc8 build --model <base>`, applies by default when present on exact gfx1201, and `HIPFIRE_QWEN4_HC8=0` restores the BF16 weights bit for bit. See [`CLI.md`](CLI.md#flash-next-hc8-sidecar) and [`quant-formats/hc8-e4m3-row.md`](quant-formats/hc8-e4m3-row.md). HC8 fetching is pinned in the client, not declared in the registry: the symmetric-trunk base (sha256 `27dfff66…`, 70888270360 B) resolves to `qwen3.8-flash-next-base.mq4-xts-symtrunk.hc8` (659649536 B, sha256 `2adf32e5…`, always the base file name plus `.hc8`) in `hipfire-models/qwen3.8-flash-next`; `hipfire pull` installs it next to that base on gfx1201 or GPU-less hosts. The stock split base (`eafaff94…`) has no HC8 pin.
+
+Flash-Next expert-hotset **fetching** is likewise pinned in the client, not declared in the registry. The same four stock tags resolve through the split base identity (sha256 `eafaff94…`, 70888270360 B) to the re-bound `qwen3.8-flash-next-base.mq4-xts.expert-hotset` (217675 B, ~213 KiB, sha256 `91143074…`, always the base file name plus `.expert-hotset`) in `hipfire-models/qwen3.8-flash-next`. The pre-split pin, bound to the monolithic file (sha256 `8b15b6fe…`, 125288544792 B; `qwen3.8-flash-next.mq4-xts.expert-hotset`, 217676 B, sha256 `7f6760e1…`), is kept for grandfathered monolithic installs. `hipfire pull <tag>` selects it by default; the interactive `hipfire pull` prompt offers it as an independent default-on yes/no **Expert hot set (R9700 and 7900 XTX decode, 213 KB)** choice (the "213 KB" is the rounded display label; the file is about 217.7 KB), shown in the summary only when selected; `--yes` and the TUI's Models-tab pull keep the default. It is verified by SHA-256 and stored at the sidecar path of the local base file, which may be a renamed local file that matches a pinned base identity. `registry/v1.json` is unchanged. At runtime it applies by default on a single R9700 (gfx1201) when present and bound to the base by size and index SHA-256. `hipfire rm` removes it with its base, and `*.expert-hotset` files are sidecars, never listed or served as models. See [`CLI.md`](CLI.md#flash-next-expert-hotset).
+
+A separate, optional Flash-Next EP2 sidecar, `<model file name>.ep.hot-units` (the hot-unit loan: calibrated host-read counts that let each rank keep its hottest host-demand experts VRAM-resident on top of the static placement; `HIPFIRE_EP_HOT_UNITS`, `HIPFIRE_EP_HOT_LOAN_MIB`, `docs/env-vars.md`), is written offline by `scripts/ep_hot_units.py` from a `HIPFIRE_EP_SKEW_LOG` calibration on held-out mixed prompts and bound to the base file and the `.ep.expert-hotset` it was calibrated under. It is discovered next to the model when present. Its fetching is pinned in the client like the HC8 sidecar (`HOT_UNITS_SIDECAR_PINS`, `hipfire_registry::hot_units_sidecar_in`; `registry/v1.json` unchanged): the symmetric-trunk base (sha256 `27dfff66…`, 70888270360 B) resolves to `qwen3.8-flash-next-base.mq4-xts-symtrunk.ep.hot-units` (67526 B, sha256 `a50317cf…`) in `hipfire-models/qwen3.8-flash-next`, calibrated under the symmetric-trunk `.ep.expert-hotset` with sha256 `c27a8ebf…`. The pin is marked unpublished (the Hugging Face upload happens at release): `hipfire pull` never requests it, a local copy beside the model is verified against the pinned size and sha256 and reported, one that differs is left untouched (the loader still declines any file that does not bind this base and ranking), and with no file the loan stays off. The symmetric-trunk `.ep.expert-hotset` it binds to (`c27a8ebf…`, 312036 B) is pinned in `EP_EXPERT_HOTSET_PINS` the same way and is likewise unpublished (`UNPUBLISHED_PIN_FILES`); both upload together at release. Once the pin is flipped to published, `hipfire pull` fetches it beside the base with the EP expert hot set; a missing or failed download only warns. `hipfire rm` removes it with its base.
 
 ### Qwen3 (non-3.5) dense HF4
 
@@ -376,7 +388,7 @@ Registry `desc` carries dated KLD and tok/s figures for these tags; they are reg
 | Tag | File | Size GB | Min VRAM | Notes |
 |---|---|---:|---:|---|
 | `raon-1-mini-preview` | `raon-1-mini-preview.mq4-xts` | 17.9 | 20 | KRAFTON Raon-1-mini-preview, 28.8B / 4.3B-active MoE (arch 19; RDA gated-delta + MLA + mHC, SiTU experts). MQ4 XTS v2: routed experts symmetric MQ4V2 (qt 44) with AWQ + GPTQ refit; the always-active shared-expert and dense layer-0 FFN, attention and `lm_head` Q8F16; 20 GB-card fit pending real-hardware measurement (32K+ context admitted under 7900 XT capacity emulation). Reasoning model (thinking on by default), XML `<tool_call>` tools. Registry sampling defaults: temperature 1.0, top_p 0.95, top_k 20, min_p 0, presence_penalty 0.5, repeat_penalty 1.0 (presence applies to generated tokens only; an explicit request value wins). This deviates from KRAFTON's card value 1.5 (its coding / math setting is 0): a pre-registered sweep over presence 0 / 0.5 / 1.0 / 1.5 on R9700 and 7900 XTX (`raon/dflash2/evidence/p4_report.md`, decision rule `P4-PREREG.md`) selected 0.5. Repetition-loop rate 2/120 = 1.7% [0.5, 5.9] vs 5/296 = 1.7% [0.7, 3.9] at 1.5, code pass 59/64 = 92.2% vs 174/192 = 90.6%, DFlash2 acceptance code 5.02 vs 4.91 tokens per window. The differences are within noise; the change follows the pre-registered rule, not a measured quality win. Requests that send no sampling keys straight to the daemon (not through `hipfire serve` / `run`) still use the artifact's `generation_config` (1.5). |
-| `raon-1-mini-preview:draft` | `raon-1-mini-preview-dflash2.mq4` | 0.75 | 20 | KRAFTON Raon-1-mini-preview-dflash2 DFlash2 draft, MQ4V2 with F16 `fc`; sidecar of `raon-1-mini-preview`, pulled with it (opt-in `--spec dflash`). |
+| `raon-1-mini-preview:draft` | `raon-1-mini-preview-dflash2.mq4` | 0.75 | 20 | KRAFTON Raon-1-mini-preview-dflash2 DFlash2 draft, MQ4V2 with F16 `fc`; sidecar of `raon-1-mini-preview`, pulled with it; the paired auto draft (opt out with `speculation.dflash = off`). |
 
 ### Image generation (FLUX.1, arch 40)
 
@@ -680,15 +692,9 @@ See [`QUANTIZE.md`](QUANTIZE.md) and [`QUANTIZATION.md`](QUANTIZATION.md).
 
 Requires `config.json` + `.safetensors`. Architectures the **engine** loads are those with arch crates / loaders above; the quantizer may accept more shapes than inference can run.
 
-### GGUF (deprecated, removal in 0.5.0)
+### GGUF
 
-GGUF weight input is deprecated since 0.4.0: GGUF→mqN is lossy double quantization; use llama.cpp for GGUF.
-
-```bash
-hipfire quantize ./model.Q4_K_M.gguf --install --register my:tag
-```
-
-Dequant path support is format-specific (common Q4_0 / Q8_0 / Q4_K / Q6_K / F16 / BF16 / F32). Unsupported GGUF quants fail closed in the quantizer.
+GGUF **weight** input to the quantizer was removed in 0.5.0: GGUF→mqN is lossy double quantization; quantize from the original safetensors, or use llama.cpp for GGUF. `hipfire quantize` refuses a `.gguf` input with an error naming the removal.
 
 #### GGUF-native serving (developer tools, gfx1201, default off)
 
@@ -701,10 +707,10 @@ With `HIPFIRE_GGUF_NATIVE=1`, `eval_hipfire`, `bench_qwen35_mq4` and `gguf_nativ
 ```text
 ~/.hipfire/models/
   <registry file names>
-  optional sibling drafts (DFlash / DSpark / MTP / vision sidecars); legacy .triattn*.bin sidecars (CASK, deprecated since 0.4.0, removal in 0.5.0)
+  optional sibling drafts (DFlash / DSpark / MTP / vision sidecars)
 ```
 
-Extension hints (loader recognizes several): `.mq4`, `.mq6`, `.mq4p`, `.mq4r`, `.mq2`, `.mq2lloyd`, `.mq2r`, `.mfp4`, `.hf4`, `.hf6`, `.hfq`, `.q8`, and related graded names as produced by quant tooling. Exact dtype routing is loader/kernel source, not this table. Selecting the MQ4R and DeepSeek V4 MQ2R routes by file extension is **deprecated since 0.4.0, removal in 0.5.0** (0.5.0 selects by HFQ metadata; no runtime warning).
+Extension hints (loader recognizes several): `.mq4`, `.mq6`, `.mq4p`, `.mq4r`, `.mq2`, `.mq2lloyd`, `.mq2r`, `.mfp4`, `.hf4`, `.hf6`, `.hfq`, `.q8`, and related graded names as produced by quant tooling. Exact dtype routing is loader/kernel source, not this table. Selecting the MQ4R / MQ4RS and DeepSeek V4 MQ2R routes by file extension was **removed in 0.5.0**: the route is selected by HFQ metadata, falling back to the registry card `quant`.
 
 ---
 

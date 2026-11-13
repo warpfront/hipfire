@@ -1,0 +1,175 @@
+{
+  "schema_version": 5,
+  "compiler": "radiowave",
+  "generated_unix_seconds": 1793588537,
+  "source": "/home/kaden/qcal/release-0.4.5/raon-railgun/corpus/build/gfx1201/railgun_fill.hip",
+  "output": "/home/kaden/qcal/release-0.4.5/raon-railgun/corpus/build/gfx1201/railgun_fill.hsaco",
+  "arch": "gfx1201",
+  "wavefront": "wave32",
+  "scheduler_profile": "default",
+  "hipcc": "/opt/rocm/core/bin/hipcc",
+  "hipcc_version": "HIP version: 7.16.26385-0000000\nAMD clang version 24.0.0git (https://github.com/ROCm/llvm-project.git d6f6cb691863e9258034ab48c1dfce21689d5606)\nTarget: x86_64-unknown-linux-gnu\nThread model: posix\nInstalledDir: /opt/rocm/core-10.1/lib/llvm/bin\nConfiguration file: /opt/rocm/core-10.1/lib/llvm/bin/clang++.cfg",
+  "command": [
+    "/opt/rocm/core/bin/hipcc",
+    "hipfire-kernel-cache",
+    "railgun_fill"
+  ],
+  "source_sha256": "bf3b9ef4aeaee6ff95a61f1335c2e28efb4a4d82fb08ed22fc91d94267685b7c",
+  "support_header_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "output_sha256": "5aaad4be6a1a3cb119a8eb48aa0c3da48530e7e9a00a9f9c720becb7482ca89c",
+  "inspection": {
+    "bundle_target": "hipv4-amdgcn-amd-amdhsa--gfx1201",
+    "identity": {
+      "architecture": "gfx1201",
+      "elf_machine_id": 78,
+      "isa": {
+        "major": 12,
+        "minor": 0,
+        "stepping": 1
+      }
+    },
+    "kernels": [
+      {
+        "name": "railgun_fill_u32",
+        "wavefront_size": 32,
+        "vgpr_count": 3,
+        "sgpr_count": 10,
+        "vgpr_spill_count": 0,
+        "sgpr_spill_count": 0,
+        "private_segment_fixed_size": 0,
+        "mutable_read_cache": "scalar_or_unknown",
+        "arguments": [
+          {
+            "offset": 0,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": "write_only"
+          },
+          {
+            "offset": 8,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 12,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 16,
+            "size": 4,
+            "value_kind": "hidden_block_count_x",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 20,
+            "size": 4,
+            "value_kind": "hidden_block_count_y",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 24,
+            "size": 4,
+            "value_kind": "hidden_block_count_z",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 28,
+            "size": 2,
+            "value_kind": "hidden_group_size_x",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 30,
+            "size": 2,
+            "value_kind": "hidden_group_size_y",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 32,
+            "size": 2,
+            "value_kind": "hidden_group_size_z",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 34,
+            "size": 2,
+            "value_kind": "hidden_remainder_x",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 36,
+            "size": 2,
+            "value_kind": "hidden_remainder_y",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 38,
+            "size": 2,
+            "value_kind": "hidden_remainder_z",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 56,
+            "size": 8,
+            "value_kind": "hidden_global_offset_x",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 64,
+            "size": 8,
+            "value_kind": "hidden_global_offset_y",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 72,
+            "size": 8,
+            "value_kind": "hidden_global_offset_z",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 80,
+            "size": 2,
+            "value_kind": "hidden_grid_dims",
+            "address_space": null,
+            "actual_access": null
+          }
+        ],
+        "instructions": {
+          "static_instructions": 30,
+          "buffer_loads": 0,
+          "buffer_stores": 0,
+          "global_loads": 0,
+          "global_stores": 1,
+          "flat_loads": 0,
+          "flat_stores": 0,
+          "scalar_loads": 4,
+          "kernarg_scalar_loads": 3,
+          "scalar_buffer_loads": 0,
+          "unknown_scalar_loads": 1,
+          "wait_instructions": 6,
+          "delay_alu_instructions": 2,
+          "memory_clause_instructions": 1,
+          "max_consecutive_vmem_instructions": 1
+        }
+      }
+    ]
+  }
+}

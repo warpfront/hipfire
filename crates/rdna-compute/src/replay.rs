@@ -10,7 +10,7 @@
 //! and a kernarg ABI to `redline-dispatch` before installing a prepared plan.
 //! Replay remains default-off except for the runtime automatic default
 //! `mq4r_redline_default` (exact `gfx1100`/`gfx1151`/`gfx1201`, single-GPU,
-//! case-insensitive `.mq4r`; `gfx1200`/others opt-in)
+//! the MQ4R route SKU (HFQ metadata or registry card); `gfx1200`/others opt-in)
 //! selected by the daemon after model load. Runtime default ≠ Redline
 //! certification/registry admission; built-in `hip` profile or explicit backend
 //! selection disables the automatic default.
@@ -22,11 +22,12 @@ use hip_bridge::HipRuntime;
 use radiowave::{CodeObjectCertification, KernelArgumentAccess, MutableReadCache};
 use redline_dispatch::aql::{
     load_symbols, BatchFencePolicy, Executable, FenceScope, Gfx10DispatchInitiatorPolicy,
-    Gfx10Pm4CommandBuffer, Gfx10SetShRegRecord, Gfx11ComputeResourceLimitsPolicy,
-    Gfx11DispatchInterleave, Gfx12DispatchPacing, Gfx12Pm4CommandBuffer, Gfx12RmwAcquirePolicy,
-    GpuBatchTiming, GpuDevice, GpuMultiQueueTiming, GpuSelector, HeaderPolicy, KernargBuffer,
-    KernargPool, Kernel, LaunchGeometry, PhasedMultiQueuePm4Ib, QueuePolicy, Quiescence,
-    RecordedDispatch, Runtime, SingleQueueBatchGraph, SingleQueuePm4Ib,
+    Gfx10KernelImage, Gfx10Pm4CommandBuffer, Gfx10Scratch, Gfx10ScratchFamily, Gfx10ScratchPlan,
+    Gfx10SetShRegRecord, Gfx11ComputeResourceLimitsPolicy, Gfx11DispatchInterleave,
+    Gfx12DispatchPacing, Gfx12Pm4CommandBuffer, Gfx12RmwAcquirePolicy, GpuBatchTiming, GpuDevice,
+    GpuMultiQueueTiming, GpuSelector, HeaderPolicy, KernargBuffer, KernargPool, Kernel,
+    LaunchGeometry, PhasedMultiQueuePm4Ib, QueuePolicy, Quiescence, RecordedDispatch, Runtime,
+    SingleQueueBatchGraph, SingleQueuePm4Ib,
 };
 use redline_dispatch::{
     AllocationPolicy, BindingRevision, KernargAbi, KernargField, Recorder, ReplayBindings,
@@ -70,6 +71,17 @@ pub(crate) enum Pm4Architecture {
     Gfx10,
     Gfx11,
     Gfx12,
+}
+
+/// What a model's retained tape is known to need from the transport, declared
+/// up front so [`ReplayController::transport_refusal`] can refuse before recording.
+#[derive(Clone, Copy, Debug)]
+pub struct RetainedTapeNeeds {
+    /// Kernargs derived from the decode position (rebinding needs PM4).
+    pub position_kernargs: bool,
+    /// Not validated on GFX10/GFX11 PM4 (scratch kernels, or decode parity vs HIP
+    /// not yet shown).
+    pub gfx10_11_pm4_unvalidated: bool,
 }
 
 /// Per-stream producer/consumer visibility for legacy (gfx10/gfx11) PM4 IBs.
@@ -162,6 +174,111 @@ impl Pm4Architecture {
                 device_name
             ))
         }
+    }
+}
+
+/// Kill switch for retained gfx10/gfx11 PM4 scratch (private-segment) rings.
+/// Default on; `0`/`false`/`off` restores the pre-A5 behaviour where a kernel
+/// with a private segment refuses the retained route.
+const PM4_SCRATCH_ENV: &str = "HIPFIRE_PMSCRATCH_PM4_SCRATCH";
+/// Upper bound on one scratch ring's backing memory. The ring is sized for the
+/// device's full wave capacity; this only trims it for huge per-wave needs.
+const PM4_SCRATCH_RING_CAP_BYTES: u64 = 256 << 20;
+
+fn pm4_scratch_enabled() -> bool {
+    hipfire_config::developer_var(PM4_SCRATCH_ENV)
+        .map(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+        .unwrap_or(true)
+}
+
+/// The scratch rings one retained legacy (gfx10/gfx11) PM4 route owns: one
+/// constant `COMPUTE_TMPRING_SIZE` plan sized for the largest private segment
+/// of every retained kernel, and one backing allocation per queue lane.
+///
+/// Lane `i` of every phase runs on queue `i`, and phases are serialized by the
+/// graph, so a lane's ring is never shared by two live streams; concurrent
+/// lanes get distinct rings. Rings are plain device memory the route keeps
+/// alive for as long as its IBs exist, independent of hipfire's scratch-buffer
+/// growth (which only re-resolves resource bindings in kernargs).
+struct Pm4ScratchRings {
+    plan: Option<Gfx10ScratchPlan>,
+    pool: Option<KernargPool>,
+    rings: Vec<(KernargBuffer, Gfx10Scratch)>,
+}
+
+impl Pm4ScratchRings {
+    fn for_kernels(
+        architecture: Pm4Architecture,
+        device: &GpuDevice,
+        kernels: &[Kernel],
+    ) -> Result<Self, String> {
+        let none = Self {
+            plan: None,
+            pool: None,
+            rings: Vec::new(),
+        };
+        let family = match architecture {
+            Pm4Architecture::Gfx10 => Gfx10ScratchFamily::Gfx10,
+            Pm4Architecture::Gfx11 => Gfx10ScratchFamily::Gfx11,
+            Pm4Architecture::Gfx12 => return Ok(none),
+        };
+        if !pm4_scratch_enabled() {
+            return Ok(none);
+        }
+        // Kernels whose descriptor cannot be adapted fail at their own
+        // dispatch with the kernel's name; they do not size the ring.
+        let required = kernels
+            .iter()
+            .filter_map(|kernel| Gfx10KernelImage::from_hsa(kernel).ok())
+            .map(|image| image.scratch_bytes_per_wave())
+            .max()
+            .unwrap_or(0);
+        if required == 0 {
+            return Ok(none);
+        }
+        let topology = device
+            .scratch_topology()
+            .map_err(|error| format!("PM4 scratch topology: {error}"))?;
+        let plan = Gfx10ScratchPlan::new(family, topology, required, PM4_SCRATCH_RING_CAP_BYTES)
+            .map_err(|error| format!("PM4 scratch ring: {error}"))?;
+        let pool = KernargPool::discover_device_local(device)
+            .map_err(|error| format!("PM4 scratch pool: {error}"))?;
+        eprintln!(
+            "[redline] PM4 scratch ring arch={} need_per_wave={required} bytes_per_wave={} \
+             wave_slots={} backing_bytes_per_lane={} tmpring_size={:#010x}",
+            device.name(),
+            plan.bytes_per_wave(),
+            plan.slots(),
+            plan.backing_bytes(),
+            plan.tmpring_size(),
+        );
+        Ok(Self {
+            plan: Some(plan),
+            pool: Some(pool),
+            rings: Vec::new(),
+        })
+    }
+
+    /// The ring for queue lane `lane`, allocating it (and any lower lane's) on
+    /// first use. `None` when no retained kernel has a private segment.
+    fn ring(&mut self, lane: usize) -> Result<Option<Gfx10Scratch>, String> {
+        let (Some(plan), Some(pool)) = (self.plan, self.pool.as_ref()) else {
+            return Ok(None);
+        };
+        while self.rings.len() <= lane {
+            let backing = pool
+                .allocate_scratch_backing(plan.backing_bytes() as usize)
+                .map_err(|error| format!("PM4 scratch backing: {error}"))?;
+            let scratch = plan
+                .bind(backing.address() as usize as u64)
+                .map_err(|error| format!("PM4 scratch backing: {error}"))?;
+            self.rings.push((backing, scratch));
+        }
+        Ok(Some(self.rings[lane].1))
+    }
+
+    fn into_backings(self) -> Vec<KernargBuffer> {
+        self.rings.into_iter().map(|(backing, _)| backing).collect()
     }
 }
 
@@ -399,6 +516,36 @@ impl Pm4Commands {
             }
         }
     }
+
+    /// The architecture-matched system-scope `ACQUIRE_MEM` for a railgun
+    /// `Rung::System` boundary: `acquire_system_gfx12` (GCR 0xc3b1) on gfx12,
+    /// ROCr's gfx10+ system acquire on a legacy stream.
+    fn system_acquire(&mut self) {
+        match self {
+            Self::Gfx12(commands) => commands.acquire_system_gfx12(),
+            Self::Legacy { commands, .. } => commands.acquire_system(),
+        }
+    }
+
+    /// The PM4 architecture this stream was built for.
+    fn architecture(&self) -> Pm4Architecture {
+        match self {
+            Self::Gfx12(_) => Pm4Architecture::Gfx12,
+            Self::Legacy { architecture, .. } => *architecture,
+        }
+    }
+
+    /// The gfx11 command dwords (railgun's owned gfx1100 lowering checks them).
+    fn gfx11_dwords(&self) -> Option<&[u32]> {
+        match self {
+            Self::Legacy {
+                architecture: Pm4Architecture::Gfx11,
+                commands,
+                ..
+            } => Some(commands.dwords()),
+            _ => None,
+        }
+    }
     /// Trailing release at the tape terminal: drain shaders, then emit the
     /// architecture-matched full-system acquire so GL2 is written back for a
     /// non-shader next consumer (e.g. an SDMA H2D copy). `CS_PARTIAL_FLUSH`
@@ -459,6 +606,14 @@ impl Pm4Commands {
             Self::Gfx12(commands) => commands
                 .dispatch(kernel, geometry, dynamic_group_bytes, kernarg_address)
                 .map_err(|error| error.to_string()),
+        }
+    }
+
+    /// Pin the route's scratch ring on this stream (legacy gfx10/gfx11 only;
+    /// gfx12 has none and `None` leaves the stream untouched).
+    fn set_scratch(&mut self, scratch: Option<Gfx10Scratch>) {
+        if let (Self::Legacy { commands, .. }, Some(scratch)) = (self, scratch) {
+            *commands = std::mem::take(commands).with_scratch(scratch);
         }
     }
 
@@ -3502,9 +3657,8 @@ pub(crate) fn gfx11_cwsr_priv(architecture: Pm4Architecture) -> bool {
 /// write). Each drop fires the userptr MMU notifier, so KFD evicts (preempts,
 /// CWSR-saves) and later restores every queue of the process. It drives the
 /// queue-preemption path without a profiler; it is a repro aid, not a
-/// production setting. Unix-only: it addresses anonymous memory with
-/// `mmap`/`madvise` and resolves `hipHostRegister` through `dlopen`.
-#[cfg(unix)]
+/// production setting. Linux-only (KFD userptr notifier, libc `mmap`/`madvise`/`dlopen`):
+/// elsewhere the knob is reported once and ignored.
 fn debug_force_evict_start() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     let Some(ms) = hipfire_config::process_value("HIPFIRE_DEBUG_FORCE_EVICT_MS")
@@ -3513,6 +3667,11 @@ fn debug_force_evict_start() {
     else {
         return;
     };
+    #[cfg(not(target_os = "linux"))]
+    ONCE.call_once(|| {
+        eprintln!("[force-evict] HIPFIRE_DEBUG_FORCE_EVICT_MS={ms} ignored: Linux (KFD) only")
+    });
+    #[cfg(target_os = "linux")]
     ONCE.call_once(move || {
         unsafe extern "C" {
             fn dlopen(name: *const std::ffi::c_char, flags: i32) -> *mut std::ffi::c_void;
@@ -3591,24 +3750,6 @@ fn debug_force_evict_start() {
             })
             .ok();
     });
-}
-
-/// Non-Unix twin of [`debug_force_evict_start`]: the repro drives KFD through
-/// `mmap`/`madvise`/`dlopen`, so the knob is inert here (named once, not
-/// silently).
-#[cfg(not(unix))]
-fn debug_force_evict_start() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    let requested = hipfire_config::process_value("HIPFIRE_DEBUG_FORCE_EVICT_MS")
-        .and_then(|v| v.parse::<u64>().ok())
-        .is_some_and(|ms| ms > 0);
-    if requested {
-        ONCE.call_once(|| {
-            eprintln!(
-                "[force-evict] HIPFIRE_DEBUG_FORCE_EVICT_MS is a Unix-only repro knob; ignored"
-            )
-        });
-    }
 }
 
 fn gfx10_dispatch_initiator_policy(
@@ -3734,28 +3875,6 @@ fn gfx1151_resource_limits_policy_from_value(
         }),
         _ => None,
     }
-}
-
-/// `HIPFIRE_GFX1151_REDLINE_CU_COUNT` can no longer produce a CU mask: any value
-/// other than `all`/`inherit`/`40`/empty is refused (CU masks on RDNA hung the
-/// R9700 MES on 2026-10-14).
-fn gfx1151_cu_count_knob_refusal() -> Result<(), String> {
-    let value = hipfire_config::process_value("HIPFIRE_GFX1151_REDLINE_CU_COUNT")
-        .unwrap_or_else(|| "all".to_owned());
-    gfx1151_cu_count_refusal(&value)
-}
-
-fn gfx1151_cu_count_refusal(value: &str) -> Result<(), String> {
-    if matches!(
-        value.to_ascii_lowercase().as_str(),
-        "" | "all" | "inherit" | "40"
-    ) {
-        return Ok(());
-    }
-    Err(format!(
-        "HIPFIRE_GFX1151_REDLINE_CU_COUNT={value:?} requests a CU mask and is refused: {}",
-        hipfire_config::devices::RDNA_CU_MASK_BAN
-    ))
 }
 
 fn gfx1151_entry_acquire_policy(
@@ -5421,6 +5540,9 @@ pub struct PreparedPm4Replay {
     /// through every replay; dropped only after queue quiescence via normal
     /// PreparedPm4Replay teardown (field order: graph first).
     _dependency_fence: Option<KernargBuffer>,
+    /// Scratch-ring backing allocations (one per queue lane) the IBs address
+    /// by absolute VA; freed only after `graph` has quiesced.
+    _scratch: Vec<KernargBuffer>,
     dynamic_gdn_frames: Vec<usize>,
     dynamic_kernarg_bindings: Vec<(usize, ReplayKernargBinding)>,
     dynamic_grids: Vec<(usize, ReplayGridBinding, [u32; 3], [u32; 3])>,
@@ -5677,6 +5799,10 @@ pub struct ReplayController {
     pm4_gfx12_dispatch_pacing: Gfx12DispatchPacing,
     state: ReplayState,
     recorded: Vec<RecordedHipLaunch>,
+    /// `recorded` length at the end of the retained body (before an output
+    /// head the forward runs on HIP after every replay); `None`: the whole
+    /// window is the body.
+    body_end: Option<usize>,
     certified_speedups: Vec<f64>,
     threshold: f64,
     max_recorded_launches: usize,
@@ -5801,6 +5927,7 @@ impl ReplayController {
             pm4_gfx12_dispatch_pacing: Gfx12DispatchPacing::None,
             state,
             recorded: Vec::new(),
+            body_end: None,
             certified_speedups: Vec::new(),
             threshold: 1.03,
             max_recorded_launches: 4096,
@@ -5929,6 +6056,7 @@ impl ReplayController {
             ReplayState::Armed
         };
         self.recorded.clear();
+        self.body_end = None;
         self.certified_speedups.clear();
         self.fallback_reason = None;
         self.prepared = None;
@@ -6009,6 +6137,21 @@ impl ReplayController {
 
     pub fn recorded_launches(&self) -> &[RecordedHipLaunch] {
         &self.recorded
+    }
+
+    /// Close the retained body of the open recording here: launches recorded
+    /// after this point (an output head the forward also runs on HIP after
+    /// every replay) stay out of every plan prepared from this capture.
+    pub fn mark_body_end(&mut self) {
+        if self.is_recording() {
+            self.body_end = Some(self.recorded.len());
+        }
+    }
+
+    /// The recorded launches a plan of this capture covers: the body before
+    /// [`Self::mark_body_end`], or the whole window.
+    pub fn retained_body_launches(&self) -> usize {
+        self.body_end.unwrap_or(self.recorded.len())
     }
 
     pub fn pm4_queue_policy(&self) -> QueuePolicy {
@@ -6551,7 +6694,6 @@ impl ReplayController {
         let dispatch_interleave = gfx1151_dispatch_interleave(pm4_architecture, device.name());
         let resource_limits_policy =
             gfx1151_resource_limits_policy(pm4_architecture, device.name());
-        gfx1151_cu_count_knob_refusal()?;
         let entry_acquire_policy = gfx1151_entry_acquire_policy(pm4_architecture, device.name());
         let pool = KernargPool::discover(&device).map_err(|error| error.to_string())?;
         let kernarg_pool = retained_kernarg_pool(&device, &pool, entry_acquire_policy);
@@ -6654,6 +6796,7 @@ impl ReplayController {
             kernargs.push(kernarg);
             geometries.push(geometry);
         }
+        let mut scratch_rings = Pm4ScratchRings::for_kernels(pm4_architecture, &device, &kernels)?;
         // GDN frames, synthesized position bindings and engine-declared
         // bindings, from the one builder the recorded-HIP oracle also uses. New
         // tapes leave the legacy `dynamic_gdn_frames` vector empty so replay has
@@ -6838,6 +6981,7 @@ impl ReplayController {
                 resource_limits_policy,
                 dependency_mode,
             );
+            commands.set_scratch(scratch_rings.ring(0)?);
             let pacing = if dispatch_profile {
                 Gfx12DispatchPacing::None
             } else {
@@ -7184,7 +7328,7 @@ impl ReplayController {
                 };
                 if lane_count > 1 {
                     let mut lanes = (0..lane_count)
-                        .map(|_| {
+                        .map(|lane_index| -> Result<Pm4Commands, String> {
                             let mut commands = Pm4Commands::new(
                                 pm4_architecture,
                                 self.pm4_register_policy,
@@ -7192,10 +7336,11 @@ impl ReplayController {
                                 dispatch_interleave,
                                 resource_limits_policy,
                             );
+                            commands.set_scratch(scratch_rings.ring(lane_index)?);
                             commands.acquire_entry(gfx12_gcr_trim, entry_acquire_policy);
-                            commands
+                            Ok(commands)
                         })
-                        .collect::<Vec<_>>();
+                        .collect::<Result<Vec<_>, String>>()?;
                     let lane_indices = if let Some(split) = phase.lane_split {
                         if lane_count != 2 || split == 0 || split >= phase.indices.len() {
                             return Err(format!(
@@ -7286,6 +7431,7 @@ impl ReplayController {
                     dispatch_interleave,
                     resource_limits_policy,
                 );
+                commands.set_scratch(scratch_rings.ring(0)?);
                 commands.acquire_entry(gfx12_gcr_trim, entry_acquire_policy);
                 let mut resource_frontier = ResourceFrontier::default();
                 for (position, index) in phase.indices.iter().copied().enumerate() {
@@ -7439,6 +7585,7 @@ impl ReplayController {
                 .rposition(|kernarg| kernarg.is_device_local() && !kernarg.is_empty()),
             kernargs,
             _dependency_fence: dependency_fence,
+            _scratch: scratch_rings.into_backings(),
             dynamic_gdn_frames,
             dynamic_kernarg_bindings,
             dynamic_grids,
@@ -7664,6 +7811,7 @@ impl ReplayController {
             return Err("cannot capture during a G0 observation");
         }
         self.recorded.clear();
+        self.body_end = None;
         self.radiowave_effect_launches = 0;
         self.fallback_effect_launches = 0;
         self.unknown_effect_launches = 0;
@@ -8628,6 +8776,33 @@ impl ReplayController {
         self.transport == ReplayTransport::Pm4Ib
     }
 
+    /// Why this transport cannot prepare a retained tape with `needs` on `arch`,
+    /// known before anything records. A model refuses at arm time on `Some` so
+    /// the arming forward runs on plain HIP instead of on the recorded route
+    /// (a prepare that fails after recording leaves that forward's output).
+    pub fn transport_refusal(&self, arch: &str, needs: RetainedTapeNeeds) -> Option<&'static str> {
+        match self.transport {
+            ReplayTransport::AqlPackets if needs.position_kernargs => Some(
+                "linear AQL cannot rebind the position-derived kernargs of this tape (it needs PM4)",
+            ),
+            ReplayTransport::AqlPackets => None,
+            ReplayTransport::Pm4Ib => match Pm4Architecture::from_name(arch) {
+                Err(_) => Some("retained PM4 has no register map for this arch"),
+                // ponytail: lift Gfx11 with HIPF-254 (after HIPF-253 gfx11 scratch);
+                // Gfx10 stays until gfx10 PM4 scratch exists.
+                Ok(Pm4Architecture::Gfx10 | Pm4Architecture::Gfx11)
+                    if needs.gfx10_11_pm4_unvalidated =>
+                {
+                    Some(
+                        "GFX10/GFX11 PM4 replay of this tape is unvalidated (scratch dispatch: \
+                         HIPF-253; decode parity vs HIP: HIPF-254)",
+                    )
+                }
+                Ok(_) => None,
+            },
+        }
+    }
+
     /// Whether the *current forward* is inside the retained body: the controller
     /// would record this forward into the tape, or route it through a prepared
     /// plan.
@@ -8694,6 +8869,11 @@ impl ReplayController {
             }
         }
         Ok(())
+    }
+
+    /// The identity the tape latched under `key`, if any.
+    pub fn route_identity(&self, key: u64) -> Option<&str> {
+        self.route_identities.get(&key).map(String::as_str)
     }
 
     /// The identities latched for the tape being recorded or replayed.
@@ -9302,6 +9482,30 @@ mod tests {
         // The Legacy arch gate is untouched: the gfx11 flag path still
         // reports false on gfx12 even when configured.
         assert!(!pm4_vmem_acquire_arch_enabled(Pm4Architecture::Gfx12, true));
+    }
+
+    #[test]
+    fn transport_refusal_is_known_before_recording() {
+        let qwen4 = RetainedTapeNeeds {
+            position_kernargs: true,
+            gfx10_11_pm4_unvalidated: true,
+        };
+        let plain = RetainedTapeNeeds {
+            position_kernargs: false,
+            gfx10_11_pm4_unvalidated: false,
+        };
+        let mut c = ReplayController::new(ReplayBackendRequest::Auto);
+        c.transport = ReplayTransport::AqlPackets;
+        assert!(c.transport_refusal("gfx1201", qwen4).is_some());
+        assert!(c.transport_refusal("gfx1151", plain).is_none());
+        c.transport = ReplayTransport::Pm4Ib;
+        for arch in ["gfx1151", "gfx1100", "gfx1030"] {
+            assert!(c.transport_refusal(arch, qwen4).is_some(), "{arch}");
+            assert!(c.transport_refusal(arch, plain).is_none(), "{arch}");
+        }
+        assert!(c.transport_refusal("gfx1201", qwen4).is_none());
+        // No PM4 register map: prepare would fail after recording.
+        assert!(c.transport_refusal("gfx942", plain).is_some());
     }
 
     #[test]
@@ -11385,23 +11589,6 @@ mod tests {
     }
 
     #[test]
-    fn gfx1151_cu_count_knob_is_refused() {
-        for value in ["all", "", "inherit", "40", "ALL", "Inherit"] {
-            assert_eq!(gfx1151_cu_count_refusal(value), Ok(()), "{value:?}");
-        }
-        for value in ["32", "36", "35", "42"] {
-            let message =
-                gfx1151_cu_count_refusal(value).expect_err(&format!("{value:?} must be refused"));
-            assert!(
-                message.contains("HIPFIRE_GFX1151_REDLINE_CU_COUNT"),
-                "{message}"
-            );
-            assert!(message.contains("2026-10-14"), "{message}");
-            assert!(message.contains(value), "{message}");
-        }
-    }
-
-    #[test]
     fn gfx1151_entry_acquire_is_exact_arch_only() {
         assert_eq!(
             gfx1151_entry_acquire_policy_from_value(Pm4Architecture::Gfx11, "gfx1151", "agent",),
@@ -12349,6 +12536,30 @@ mod tests {
             controller.finish_capture().unwrap().sequence_hash,
             first.sequence_hash
         );
+    }
+
+    #[test]
+    fn retained_body_end_is_scoped_to_one_capture() {
+        let mut controller = ReplayController::new_armed(ReplayBackendRequest::Shadow);
+        controller.begin_capture().unwrap();
+        controller.record_hip_launch("body", None, [1; 3], [32, 1, 1], 0, &[1]);
+        controller.mark_body_end();
+        controller.record_hip_launch("head", None, [1; 3], [32, 1, 1], 0, &[2]);
+        assert_eq!(controller.retained_body_launches(), 1);
+        controller.finish_capture().unwrap();
+        // Outside a recording window the mark is ignored.
+        controller.mark_body_end();
+        assert_eq!(controller.retained_body_launches(), 1);
+        // A new capture with no mark is its whole window.
+        controller.begin_capture().unwrap();
+        controller.record_hip_launch("a", None, [1; 3], [32, 1, 1], 0, &[1]);
+        controller.record_hip_launch("b", None, [1; 3], [32, 1, 1], 0, &[2]);
+        assert_eq!(controller.retained_body_launches(), 2);
+        controller.mark_body_end();
+        controller.record_hip_launch("c", None, [1; 3], [32, 1, 1], 0, &[3]);
+        // A model reset drops the mark with the launches.
+        controller.apply_model_default(true, ReplayTransport::AqlPackets);
+        assert_eq!(controller.retained_body_launches(), 0);
     }
 
     #[test]

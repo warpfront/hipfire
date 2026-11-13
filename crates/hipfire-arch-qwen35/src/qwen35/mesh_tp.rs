@@ -48,7 +48,7 @@ use hipfire_dispatch::pipeline::batched::{
     q8_prefill_wmma_enabled, BatchEpilogue, BatchSemantics, DenseBatchMath, DflashFusionCtx,
 };
 use hipfire_dispatch::pipeline::batched_attention::batch_chunk_full_attn_attn;
-use hipfire_dispatch::pipeline::batched_deltanet::batch_chunk_delta_net_attn;
+use hipfire_dispatch::pipeline::batched_deltanet::{batch_chunk_delta_net_attn, GdnPrefillRoute};
 use hipfire_dispatch::pipeline::gated_mlp::{MlpLadder, MlpOutput};
 use hipfire_dispatch::pipeline::hybrid::MixerOutput;
 use hipfire_dispatch::pipeline::step_graph::{
@@ -1084,39 +1084,35 @@ impl<'a> Qwen35TpBindings<'a> {
                         q8,
                         BatchEpilogue::Partial(&rank.partial),
                         DflashFusionCtx::Off,
-                        None,
-                        false,
+                        GdnPrefillRoute::Legacy,
                     )
                     .map_err(hip)
                 }
-                LayerWeights::FullAttn(l) => {
-                    let tap_fn = program::batched_attention_tap(&rank.config);
-                    batch_chunk_full_attn_attn(
-                        gpu,
-                        false,
-                        &l.mixer_view(),
-                        &dims,
-                        &rank.pbs.view(),
-                        &program::flash_scratch(s),
-                        &program::kv_view(&rank.kv),
-                        n,
-                        dim,
-                        start,
-                        start + n,
-                        &ctx,
-                        BatchSemantics::Sequential,
-                        None,
-                        q8,
-                        q8,
-                        index,
-                        layer,
-                        BatchEpilogue::Partial(&rank.partial),
-                        DflashFusionCtx::Off,
-                        None,
-                        tap_fn.get(),
-                    )
-                    .map_err(hip)
-                }
+                LayerWeights::FullAttn(l) => batch_chunk_full_attn_attn(
+                    gpu,
+                    false,
+                    &l.mixer_view(),
+                    &dims,
+                    &rank.pbs.view(),
+                    &program::flash_scratch(s),
+                    &program::kv_view(&rank.kv),
+                    n,
+                    dim,
+                    start,
+                    start + n,
+                    &ctx,
+                    BatchSemantics::Sequential,
+                    None,
+                    q8,
+                    q8,
+                    index,
+                    layer,
+                    BatchEpilogue::Partial(&rank.partial),
+                    DflashFusionCtx::Off,
+                    None,
+                    None,
+                )
+                .map_err(hip),
                 _ => Err("Qwen3.5 TP mixer on a MoE layer".into()),
             },
             (TpOp::Ffn { layer }, false) => {

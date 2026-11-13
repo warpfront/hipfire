@@ -8,7 +8,7 @@
 //! Mirrors `Cohere2MoeBundle`. The `ArchModel` impl is what lets the loader
 //! hand a boxed, arch-agnostic model back to the daemon; `kv_cache_mut` stays
 //! `None` because `MapleState` owns its own `KvCache` rather than the shared
-//! `llama::KvCache` the FlashCASK eviction path expects.
+//! `llama::KvCache`.
 
 use crate::config::MapleConfig;
 use crate::maple::{MapleState, MapleWeights};

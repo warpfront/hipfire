@@ -45,6 +45,28 @@
 //!    stop the sweep, and an execution error stops it only when the lane
 //!    store is no longer usable.
 //!
+//! `--logits-dump DIR` (implies `--logits`; DIR must not exist, AR arm only) also writes every
+//! compared logits row as raw little-endian f32 (`vocab` values per row, `tokens + 1` rows per
+//! file, the order the shas are taken in): `DIR/ref/prompt{P}.f32` for the singleton and
+//! `DIR/lane/{policy}/{K=..|burst=..}/lane{L}-prompt{P}.f32` per lane run. Per-row KL between two
+//! dumps (singleton vs lane, or lane vs lane across an env flag) is a script's job
+//! (`kl_rows.py`); the oracle only emits the rows.
+//!
+//! `--verify-logits-dump DIR` (`--spec mtp` only; DIR must not exist; does not imply `--logits`)
+//! writes the verify-row distributions of the native-MTP lane arm: before the root decides each
+//! step, every lane's verify rows (seed + drafts, lanes concatenated in plan order, read from
+//! rank 0's resident step logits) are appended as raw f32 to
+//! `DIR/verify/{mtp:k=..,routes=..}/{K=..|burst=..}/lane{L}-prompt{P}.f32`, with one
+//! `lane{L}-prompt{P}.rows.jsonl` line per row: `step`, `row` (0 = the seed), `position` (the
+//! absolute position of the row's input token), `hash` (SHA-256 of the tokens fed up to and
+//! including that input token, u32 LE: prompt ++ committed ++ drafts[..row]), `lane_rows` and
+//! `step_rows` (the step's total verify rows). The singleton reference is dumped beside it:
+//! `DIR/ref/prompt{P}.f32` (row `s` = after forward `s`) and `prompt{P}.rows.jsonl` with
+//! `{row, position = prompt_len - 1 + s, hash = SHA-256(prompt ++ ids[..s])}`. A lane verify row
+//! whose (position, hash) equals a reference row's saw the singleton's own input prefix, so its
+//! logits are comparable to that reference row; `kl_rows.py --verify` matches on it and skips
+//! (counting) the rest (rows after a rejected draft, rows past `--tokens`).
+//!
 //! Exit 0: every compared K/prompt equal. 1: mismatch. 2: refusal or error.
 //!
 //! The lane driver runs behind [`LaneBackend`]; [`LocalLanes`] is the Single/EP
@@ -60,19 +82,74 @@
 //! ```text
 //! fn_mesh_lane_oracle --model M.mq4 --prompt-file a.txt [--prompt-file b.ids ...] \
 //!     --max-seq 4096 --tokens 64 --ks 1,2,4,8 --out DIR \
-//!     [--pp 1] [--row-budget R] [--skip-model-hash] [--logits]
+//!     [--pp 1] [--row-budget R] [--skip-model-hash] [--logits] [--logits-dump DIR]
 //!     [--policies 'g0' | 'per-lane;per-lane:moe=once;production'] [--tokens-sweep N]
+//!     [--burst I,J,...]   (repeatable; see "Bursts" below)
 //! ```
+//!
+//! Bursts (`--burst I,J,...`, repeatable): after the `--ks` runs (the first K prompts), each
+//! `--burst` is one more concurrent run of exactly the listed prompt-file indices in that lane
+//! order, so one process covers uniform and mixed-length bursts of 1..max lanes against ONE
+//! reference pass per prompt. Per prompt the report gives `prompt_len`, `lane` and
+//! `first_divergence` ({row, position, phase, via}: row 0 is the prompt-completing row, row r
+//! the r-th AR row; position is the absolute sequence position). Per run `prefill` has the
+//! burst's wall, rows, ms/row and one record per prefill pass (tiles, rows, AR rows sharing the
+//! step), `prompt_lens`, `rows_total` and `singleton_prefill_ms_sum` (the reference prefills of
+//! the same prompts) beside `burst_vs_singleton_sum`. stderr carries one `[oracle-burst]` line
+//! per run (read by `d1/scripts/wave-table.py`).
+//!
+//! Twin lanes: lanes of one run whose prompts have identical token ids (repeat the same
+//! `--prompt-file`; equal files count too) are twins. A joint prefill wave is per-slot
+//! independent (each lane's rows depend only on its own tokens, never on its neighbours or
+//! its position in the wave), so twins must produce byte-identical ids and logits rows (the
+//! prompt-completing row 0 and every AR row) whatever the singleton reference does. With
+//! `--logits` every run reports a `twins` object (`groups`, `groups_equal`/`groups_total`,
+//! first differing lane/row per group) in report.json and `twins_equal=a/b` on the
+//! `[oracle-burst]` line; a twin mismatch fails the run (exit 1) independently of the
+//! singleton comparison. `--burst` still refuses one prompt INDEX twice; twins are distinct
+//! indices naming the same file.
+//!
+//! Speculative-lane schema (CLI contract; execution is an explicit boundary):
+//! ```text
+//!     [--spec ar|mtp] [--k K] [--routes floor|cycle|batched]
+//!     [--soak-seconds S [--soak-seed N]] [--fault-point POINT]
+//! ```
+//! `--spec ar` (default) is the oracle above, unchanged. `--spec mtp` selects
+//! the native-MTP lane arm: `--k` is the draft depth (1..=7, default 3) and
+//! `--routes` the window route policy (`floor` = production floor, `batched` =
+//! forced batched windows, `cycle` = deterministic native/copy/AR mix, default
+//! `cycle`), as in `fn_lane_oracle`. `--soak-seconds S` runs the bounded
+//! mixed-lifecycle soak (lanes 1..=max(ks), cycling native/copy/AR, late
+//! arrivals, cancellations and slot reuse from the recorded `--soak-seed`);
+//! `--fault-point` injects one all-owner abort at `before-draft`,
+//! `head-round`, `target-edge`, `repair` or `before-publish` and expects the
+//! bounded join and quarantine. `--k`, `--routes`, `--soak-seconds` and
+//! `--fault-point` need `--spec mtp`; soak and a fault point are exclusive.
+//! Every `--spec mtp` invocation is parsed, validated and recorded in
+//! `manifest.json`, then fails with "not yet implemented by S3/S5" until the
+//! EP/PP speculative lane protocol lands: that refusal is the interface
+//! boundary, never a pass. `DIR/manifest.json` (all specs) holds the expanded
+//! command, the SHA-256 of every prompt fixture and of this binary, the
+//! model hash (once computed) and the recorded environment.
+//!
 //! `--pp N>1` loads the model on a PP mesh (the `pp` argument of `load_model`,
 //! as `fn_ep_oracle`); the topology (`pp`, `band_counts`, `output_owner`,
 //! `devices`) is recorded in `report.json`.
 
 use hipfire_arch_qwen4::bundle::Qwen4Bundle;
+use hipfire_arch_qwen4::ep_mesh_lanes::{EpMeshLanes, MeshLaneAdmission, MeshStepError};
 use hipfire_arch_qwen4::gpu_forward_lanes::{LaneStagePolicy, StageName};
+use hipfire_arch_qwen4::lane::pages::ElasticLabRank;
+use hipfire_arch_qwen4::lane::{LabRoutes, LaneSpecConfig};
+use hipfire_arch_qwen4::mesh_lane_protocol::{
+    AcceptRule, GreedyRule, LanePlan, LaneRequest, SamplerOutput, SamplingMode, WindowBudgets,
+};
+use hipfire_arch_qwen4::sampled_lane::LaneRng;
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::slot_batch::{
     BatchStepPlan, RequestAdvance, RequestEpoch, RequestRows, RequestStepKind, RowRange, SlotBatch,
 };
+use hipfire_runtime::spec::GreedyAccept;
 use rdna_compute::slot_pool::SlotId;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use serde_json::{json, Value};
@@ -175,7 +252,7 @@ fn ids_md5(ids: &[u32]) -> String {
 
 // ------------------------------------------------------------------- args
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 struct Args {
     model: String,
     prompt_files: Vec<String>,
@@ -183,12 +260,20 @@ struct Args {
     tokens: usize,
     /// Ascending, unique lane counts.
     ks: Vec<usize>,
+    /// `--burst I,J,...` (repeatable): extra concurrent runs of the listed prompt-file indices
+    /// (0-based, in lane order, unique within a burst, any lengths) after the `--ks` runs.
+    bursts: Vec<Vec<usize>>,
     out: PathBuf,
     /// Pipeline-parallel degree handed to `load_model`; > 1 runs the PP arm.
     pp: usize,
     row_budget: Option<usize>,
     skip_model_hash: bool,
     logits: bool,
+    /// `--logits-dump DIR`: write every compared logits row as raw f32 (needs `--logits`).
+    logits_dump: Option<PathBuf>,
+    /// `--verify-logits-dump DIR` (`--spec mtp`): write every lane verify row's raw f32 logits
+    /// with its (position, prefix hash), and the singleton rows with theirs.
+    verify_logits_dump: Option<PathBuf>,
     /// Policies to sweep, in order (never empty); default is the store's
     /// construction policy only.
     policies: Vec<PolicyEntry>,
@@ -197,6 +282,98 @@ struct Args {
     /// Loader-planned AR lane capacity (`--reserve-lanes N`): the admitted
     /// route's per-load VMM batch request. `None` = plain `load_model`.
     reserve_lanes: Option<usize>,
+    /// `--spec`; the AR oracle unless `mtp`.
+    spec: SpecMode,
+    /// Draft depth; `Some` exactly under `--spec mtp` (default [`DEFAULT_K`]).
+    k: Option<usize>,
+    /// Route policy; `Some` exactly under `--spec mtp` (default cycle).
+    routes: Option<RoutesArg>,
+    /// Bounded mixed-lifecycle soak, seconds (`--spec mtp` only).
+    soak_seconds: Option<u64>,
+    /// Lifecycle seed of the soak; `Some` exactly when `soak_seconds` is.
+    soak_seed: Option<u64>,
+    /// Injected abort point (`--spec mtp` only, exclusive with the soak).
+    fault_point: Option<FaultPoint>,
+    /// `--copy` (`--spec mtp` only): stage the lanes with the copy lane armed
+    /// (default-copy budget: widened rings/rows, head-lag storage).
+    copy: bool,
+    /// `--elastic MIB` (EP lab): lend a bank of that many MiB on every rank after the lanes are
+    /// staged and settle it before the measured runs.
+    elastic: Option<u64>,
+    /// `--elastic-cycle` (needs `--elastic`): reclaim, re-lend and settle between the runs.
+    elastic_cycle: bool,
+}
+
+/// `--burst I,J,K`: prompt-file indices of one concurrent run, in lane (admission) order.
+fn parse_burst(value: &str) -> R<Vec<usize>> {
+    let members = value
+        .split(',')
+        .filter(|part| !part.trim().is_empty())
+        .map(|part| {
+            part.trim()
+                .parse::<usize>()
+                .map_err(|x| format!("--burst {value:?}: bad prompt index {part:?}: {x}"))
+        })
+        .collect::<R<Vec<usize>>>()?;
+    if members.is_empty() {
+        return Err("--burst needs at least one prompt index".into());
+    }
+    let unique: BTreeSet<usize> = members.iter().copied().collect();
+    if unique.len() != members.len() {
+        return Err(format!(
+            "--burst {value:?}: a prompt index appears twice (one lane per prompt)"
+        ));
+    }
+    Ok(members)
+}
+
+/// One concurrent lane run: the prompt-file indices of its lanes, in lane order. A `--ks` run
+/// is the first K prompts; a `--burst` run is any list (mixed lengths).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RunSet {
+    members: Vec<usize>,
+    burst: bool,
+}
+
+impl RunSet {
+    /// `K=4` for a `--ks` run, `burst=3+1+0` for a `--burst` run.
+    fn label(&self) -> String {
+        if self.burst {
+            format!(
+                "burst={}",
+                self.members
+                    .iter()
+                    .map(usize::to_string)
+                    .collect::<Vec<_>>()
+                    .join("+")
+            )
+        } else {
+            format!("K={}", self.members.len())
+        }
+    }
+}
+
+/// Every run of a policy, in order: the `--ks` runs, then the `--burst` runs.
+fn run_sets(args: &Args) -> Vec<RunSet> {
+    args.ks
+        .iter()
+        .map(|&k| RunSet {
+            members: (0..k).collect(),
+            burst: false,
+        })
+        .chain(args.bursts.iter().map(|members| RunSet {
+            members: members.clone(),
+            burst: true,
+        }))
+        .collect()
+}
+
+impl Args {
+    /// Lanes to stage: the largest `--ks` entry or `--burst` length.
+    fn max_lanes(&self) -> usize {
+        let bursts = self.bursts.iter().map(Vec::len).max().unwrap_or(0);
+        self.ks.last().copied().unwrap_or(0).max(bursts)
+    }
 }
 
 fn parse_ks(value: &str) -> R<Vec<usize>> {
@@ -273,20 +450,137 @@ fn parse_policies(value: &str) -> R<Vec<PolicyEntry>> {
     Ok(entries)
 }
 
+// ------------------------------------------------------------- spec schema
+
+/// `--spec`: the AR oracle (default) or the native-MTP lane arm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SpecMode {
+    Ar,
+    Mtp,
+}
+
+impl SpecMode {
+    fn parse(value: &str) -> R<Self> {
+        match value {
+            "ar" => Ok(Self::Ar),
+            "mtp" => Ok(Self::Mtp),
+            other => Err(format!("--spec must be ar|mtp, got {other:?}")),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Ar => "ar",
+            Self::Mtp => "mtp",
+        }
+    }
+}
+
+/// `--routes`: the window route policy of an MTP run (`fn_lane_oracle`'s).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RoutesArg {
+    Floor,
+    Cycle,
+    Batched,
+}
+
+impl RoutesArg {
+    fn parse(value: &str) -> R<Self> {
+        match value {
+            "floor" => Ok(Self::Floor),
+            "cycle" => Ok(Self::Cycle),
+            "batched" => Ok(Self::Batched),
+            other => Err(format!(
+                "--routes must be floor|cycle|batched, got {other:?}"
+            )),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Floor => "floor",
+            Self::Cycle => "cycle",
+            Self::Batched => "batched",
+        }
+    }
+}
+
+/// `--fault-point`: where an injected failure must abort every owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FaultPoint {
+    BeforeDraft,
+    HeadRound,
+    TargetEdge,
+    Repair,
+    BeforePublish,
+}
+
+impl FaultPoint {
+    const ALL: [FaultPoint; 5] = [
+        Self::BeforeDraft,
+        Self::HeadRound,
+        Self::TargetEdge,
+        Self::Repair,
+        Self::BeforePublish,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::BeforeDraft => "before-draft",
+            Self::HeadRound => "head-round",
+            Self::TargetEdge => "target-edge",
+            Self::Repair => "repair",
+            Self::BeforePublish => "before-publish",
+        }
+    }
+
+    fn parse(value: &str) -> R<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|point| point.name() == value)
+            .ok_or_else(|| {
+                let names: Vec<_> = Self::ALL.iter().map(|point| point.name()).collect();
+                format!(
+                    "--fault-point must be one of {}, got {value:?}",
+                    names.join("|")
+                )
+            })
+    }
+}
+
+/// Default draft depth of `--spec mtp` (`fn_lane_oracle`'s).
+const DEFAULT_K: usize = 3;
+/// Deepest native draft.
+const MAX_K: usize = 7;
+/// Soak lifecycle seed when `--soak-seconds` is given without `--soak-seed`.
+const DEFAULT_SOAK_SEED: u64 = 0x50A4_5EED;
+
 fn parse_args_from(mut args: impl Iterator<Item = String>) -> R<Args> {
     let mut model = None;
     let mut prompt_files = Vec::new();
     let mut max_seq = None;
     let mut tokens = None;
     let mut ks = None;
+    let mut bursts: Vec<Vec<usize>> = Vec::new();
     let mut out = None;
     let mut pp = 1usize;
     let mut row_budget = None;
     let mut skip_model_hash = false;
     let mut logits = false;
+    let mut logits_dump: Option<PathBuf> = None;
+    let mut verify_logits_dump: Option<PathBuf> = None;
     let mut policies = None;
     let mut tokens_sweep = None;
     let mut reserve_lanes = None;
+    let mut copy = false;
+    let mut elastic: Option<u64> = None;
+    let mut elastic_cycle = false;
+    let mut spec = SpecMode::Ar;
+    let mut k = None;
+    let mut routes = None;
+    let mut soak_seconds = None;
+    let mut soak_seed = None;
+    let mut fault_point = None;
     while let Some(flag) = args.next() {
         let mut value = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value"));
         match flag.as_str() {
@@ -295,6 +589,7 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> R<Args> {
             "--max-seq" => max_seq = Some(value("--max-seq")?.parse::<usize>().map_err(e)?),
             "--tokens" => tokens = Some(value("--tokens")?.parse::<usize>().map_err(e)?),
             "--ks" => ks = Some(parse_ks(&value("--ks")?)?),
+            "--burst" => bursts.push(parse_burst(&value("--burst")?)?),
             "--out" => out = Some(PathBuf::from(value("--out")?)),
             "--pp" => pp = value("--pp")?.parse::<usize>().map_err(e)?,
             "--row-budget" => {
@@ -302,6 +597,13 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> R<Args> {
             }
             "--skip-model-hash" => skip_model_hash = true,
             "--logits" => logits = true,
+            "--logits-dump" => {
+                logits_dump = Some(PathBuf::from(value("--logits-dump")?));
+                logits = true;
+            }
+            "--verify-logits-dump" => {
+                verify_logits_dump = Some(PathBuf::from(value("--verify-logits-dump")?))
+            }
             "--policies" => policies = Some(parse_policies(&value("--policies")?)?),
             "--tokens-sweep" => {
                 tokens_sweep = Some(value("--tokens-sweep")?.parse::<usize>().map_err(e)?)
@@ -309,6 +611,17 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> R<Args> {
             "--reserve-lanes" => {
                 reserve_lanes = Some(value("--reserve-lanes")?.parse::<usize>().map_err(e)?)
             }
+            "--spec" => spec = SpecMode::parse(&value("--spec")?)?,
+            "--copy" => copy = true,
+            "--elastic" => elastic = Some(value("--elastic")?.parse::<u64>().map_err(e)?),
+            "--elastic-cycle" => elastic_cycle = true,
+            "--k" => k = Some(value("--k")?.parse::<usize>().map_err(e)?),
+            "--routes" => routes = Some(RoutesArg::parse(&value("--routes")?)?),
+            "--soak-seconds" => {
+                soak_seconds = Some(value("--soak-seconds")?.parse::<u64>().map_err(e)?)
+            }
+            "--soak-seed" => soak_seed = Some(value("--soak-seed")?.parse::<u64>().map_err(e)?),
+            "--fault-point" => fault_point = Some(FaultPoint::parse(&value("--fault-point")?)?),
             other => return Err(format!("unknown argument {other}")),
         }
     }
@@ -330,6 +643,15 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> R<Args> {
             ));
         }
     }
+    for burst in &bursts {
+        if let Some(&bad) = burst.iter().find(|&&i| i >= prompt_files.len()) {
+            return Err(format!(
+                "--burst index {bad} needs at least {} --prompt-file arguments, got {}",
+                bad + 1,
+                prompt_files.len()
+            ));
+        }
+    }
     let need = *ks.last().expect("ks is non-empty");
     if prompt_files.len() < need {
         return Err(format!(
@@ -340,17 +662,70 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> R<Args> {
     if reserve_lanes == Some(0) {
         return Err("--reserve-lanes must be at least 1".into());
     }
+    if spec == SpecMode::Ar {
+        for (given, flag) in [
+            (k.is_some(), "--k"),
+            (routes.is_some(), "--routes"),
+            (soak_seconds.is_some(), "--soak-seconds"),
+            (soak_seed.is_some(), "--soak-seed"),
+            (fault_point.is_some(), "--fault-point"),
+            (verify_logits_dump.is_some(), "--verify-logits-dump"),
+        ] {
+            if given {
+                return Err(format!("{flag} needs --spec mtp"));
+            }
+        }
+    } else {
+        let depth = *k.get_or_insert(DEFAULT_K);
+        if depth == 0 || depth > MAX_K {
+            return Err(format!("--k must be in 1..={MAX_K}, got {depth}"));
+        }
+        routes.get_or_insert(RoutesArg::Cycle);
+    }
+    if copy && spec != SpecMode::Mtp {
+        return Err("--copy needs --spec mtp".into());
+    }
+    if elastic == Some(0) {
+        return Err("--elastic must be at least 1 MiB".into());
+    }
+    if elastic.is_some_and(|mib| mib > u64::MAX >> 20) {
+        return Err("--elastic does not fit a byte count".into());
+    }
+    if elastic_cycle && elastic.is_none() {
+        return Err("--elastic-cycle needs --elastic".into());
+    }
+    if elastic.is_some() && pp > 1 {
+        return Err("--elastic is an EP lab flag".into());
+    }
+    if soak_seconds == Some(0) {
+        return Err("--soak-seconds must be at least 1".into());
+    }
+    if soak_seed.is_some() && soak_seconds.is_none() {
+        return Err("--soak-seed needs --soak-seconds".into());
+    }
+    if soak_seconds.is_some() && fault_point.is_some() {
+        return Err(
+            "--soak-seconds and --fault-point are exclusive: run injected failures separately from the uninterrupted soak"
+                .into(),
+        );
+    }
+    if soak_seconds.is_some() {
+        soak_seed.get_or_insert(DEFAULT_SOAK_SEED);
+    }
     Ok(Args {
         model: model.ok_or("--model is required")?,
         prompt_files,
         max_seq: max_seq.ok_or("--max-seq is required")?,
         tokens,
         ks,
+        bursts,
         out: out.ok_or("--out is required")?,
         pp,
         row_budget,
         skip_model_hash,
         logits,
+        logits_dump,
+        verify_logits_dump,
         policies: policies.unwrap_or_else(|| {
             vec![PolicyEntry {
                 spec: DEFAULT_POLICY_SPEC.to_string(),
@@ -359,19 +734,39 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> R<Args> {
         }),
         tokens_sweep,
         reserve_lanes,
+        spec,
+        k,
+        routes,
+        soak_seconds,
+        soak_seed,
+        fault_point,
+        copy,
+        elastic,
+        elastic_cycle,
     })
 }
 
 const HELP: &str = "fn_mesh_lane_oracle --model M.mq4 --prompt-file P [--prompt-file P ...] \
---max-seq N --tokens T --ks 1,2,4,8 --out DIR [--pp 1] [--row-budget R] [--skip-model-hash] [--logits] \
-[--policies SPEC[;SPEC...]] [--tokens-sweep N] [--reserve-lanes N]\n\
+--max-seq N --tokens T --ks 1,2,4,8 --out DIR [--pp 1] [--row-budget R] [--skip-model-hash] [--logits] [--logits-dump DIR] \
+[--burst I,J,...] [--policies SPEC[;SPEC...]] [--tokens-sweep N] [--reserve-lanes N] \
+[--spec ar|mtp] [--k K] [--routes floor|cycle|batched] [--soak-seconds S [--soak-seed N]] \
+[--fault-point before-draft|head-round|target-edge|repair|before-publish] [--elastic MIB [--elastic-cycle]]\n\
 EP comes from topology.ep / the S1 env var as in fn_ep_oracle; --pp N>1 runs the PP lanes arm. \
 --policies sweeps lane stage share policies (production | per-lane | per-lane:<stage>=once,... | g0) \
 over one reference; --tokens-sweep N sets tokens per lane for every policy after the first. \
 --reserve-lanes N loads through the admitted route with the daemon's VMM-batch request (serve.vmm_batch, \
 continuous_batch_size N) so a qwen4 EP load reserves N AR lanes before the expert split (planner capacity \
 only; default off = plain load_model, N=1 is the same plan). \
+--verify-logits-dump DIR (needs --spec mtp) writes every verify row's raw f32 logits with its (position, prefix hash) next to the singleton's rows (see the module docs; compare with kl_rows.py --verify). \
+--spec mtp (--k 1..=7, default 3; --routes default cycle) selects the native-MTP lane arm; --soak-seconds and \
+--fault-point need it and are exclusive. Its execution is not yet implemented by S3/S5: the invocation is \
+validated and recorded in DIR/manifest.json (expanded command, prompt fixture hashes, binary sha), then refused. \
+--elastic MIB (EP lab, HIPFIRE_EP_ELASTIC_MIB) lends a bank of that many MiB on every rank after the lanes are staged and settles it \
+(every fill and publication run) before the measured runs, printing each rank's units and bytes lent and settled; --elastic-cycle \
+also reclaims and re-lends + settles between the --ks / --burst runs. A prefill tile of 512 or more rows reclaims the bank (the \
+reserve's backstop), so the measured decode runs on short prompts see it published. \
 Needs at least max(ks) prompt files. \
+DIR/manifest.json is written for every run. \
 Exit 0 all equal, 1 mismatch, 2 refusal/error. DIR must not exist.";
 
 // ---------------------------------------------------------------- prompts
@@ -422,6 +817,193 @@ fn tensor_bytes(gpu: &Gpu, tensor: &GpuTensor) -> R<Vec<u8>> {
     gpu.download_raw_bytes(tensor).map_err(e)
 }
 
+/// `--logits-dump`: append one raw f32 logits row to `path`.
+fn dump_row(path: &Path, bytes: &[u8]) -> R<()> {
+    use std::io::Write;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut file| file.write_all(bytes))
+        .map_err(|x| format!("dump logits row to {}: {x}", path.display()))
+}
+
+/// `--logits-dump` / `--verify-logits-dump`: the per-lane row files of one policy's (or the MTP
+/// arm's) run set (the directory is created): `root/{kind}/{policy}/{label}/lane{L}-prompt{P}.f32`
+/// with `kind` = `lane` (AR) or `verify` (MTP), path-unsafe characters of the policy spec and run
+/// label replaced by `_`.
+fn lane_dump_paths(
+    root: &Path,
+    kind: &str,
+    spec: &str,
+    label: &str,
+    members: &[usize],
+) -> R<Vec<PathBuf>> {
+    let safe = |text: &str| -> String {
+        text.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '-' | '=' | '+' | '.') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect()
+    };
+    let dir = root.join(kind).join(safe(spec)).join(safe(label));
+    std::fs::create_dir_all(&dir)
+        .map_err(|x| format!("create logits dump dir {}: {x}", dir.display()))?;
+    Ok(members
+        .iter()
+        .enumerate()
+        .map(|(lane, prompt)| dir.join(format!("lane{lane}-prompt{prompt}.f32")))
+        .collect())
+}
+
+/// The key a logits row is matched on between the singleton and a lane: SHA-256 of the tokens fed
+/// up to and including the row's input token (each as u32 LE).
+fn token_hasher(tokens: &[u32]) -> Sha256 {
+    let mut hasher = Sha256::new();
+    for token in tokens {
+        hasher.update(token.to_le_bytes());
+    }
+    hasher
+}
+
+fn hasher_hex(hasher: &Sha256) -> String {
+    hex(&hasher.clone().finalize())
+}
+
+/// `--verify-logits-dump`: the singleton's per-row keys, one line per logits row of
+/// `prompt{P}.f32` (row 0 = after the prefill: input token = the last prompt token at position
+/// `prompt_len - 1`; row `s` = after forward `s`: input token `ids[s-1]` at `prompt_len - 1 + s`).
+fn write_ref_rows(path: &Path, prompt: &[u32], ids: &[u32]) -> R<()> {
+    let mut hasher = token_hasher(prompt);
+    let mut text = String::new();
+    for s in 0..=ids.len() {
+        if s > 0 {
+            hasher.update(ids[s - 1].to_le_bytes());
+        }
+        let line = json!({
+            "row": s,
+            "position": prompt.len() - 1 + s,
+            "hash": hasher_hex(&hasher),
+        });
+        text.push_str(&line.to_string());
+        text.push('\n');
+    }
+    std::fs::write(path, text).map_err(|x| format!("write {}: {x}", path.display()))
+}
+
+/// One lane of a `--verify-logits-dump` step: the tokens fed before its seed plus the seed
+/// (`prompt ++ committed`, the seed is the last), and its row file.
+struct VerifyLane {
+    tag: u64,
+    fed: Vec<u32>,
+    path: PathBuf,
+}
+
+/// `--verify-logits-dump`: the greedy accept rule that, before the root decides, writes every
+/// verify row of every lane to the lane's file (raw f32 logits, then one `rows.jsonl` line with
+/// the row's step, position, prefix hash and the step's row counts). The root calls `accept` on
+/// its own (rank 0's) thread after every rank's verify forward and before any prepare, so the
+/// store's resident step logits still hold the verify rows (plan order, lanes concatenated).
+struct VerifyDump {
+    /// SAFETY: the rank-0 `Gpu` outlives the step that borrows this rule (`mesh.step` runs it on
+    /// this thread); it is read only for the device synchronize + row download.
+    gpu: *const Gpu,
+    /// A view of the store's step logits.
+    logits: GpuTensor,
+    vocab: usize,
+    step: usize,
+    lanes: Vec<VerifyLane>,
+    /// Request tag -> first logits row of the lane in this step.
+    first: std::collections::HashMap<u64, usize>,
+    step_rows: usize,
+}
+
+impl VerifyDump {
+    fn dump(&mut self, lane: &LanePlan, drafts: &[u32]) -> R<()> {
+        let tag = lane.key.request_epoch.request_tag;
+        let mine = self
+            .lanes
+            .iter()
+            .find(|l| l.tag == tag)
+            .ok_or_else(|| format!("verify dump: lane tag {tag} is not in this step"))?;
+        let first = *self
+            .first
+            .get(&tag)
+            .ok_or_else(|| format!("verify dump: no verify rows for lane tag {tag}"))?;
+        let (position, seed) = (
+            mine.fed.len() - 1,
+            *mine.fed.last().expect("fed has the seed"),
+        );
+        if lane.seed != seed || lane.position != position {
+            return Err(format!(
+                "verify dump: lane tag {tag} plans seed {} at {}, the oracle's committed stream says {seed} at {position}",
+                lane.seed, lane.position
+            ));
+        }
+        // SAFETY: see `gpu`.
+        let gpu = unsafe { &*self.gpu };
+        let mut hasher = token_hasher(&mine.fed);
+        let meta = mine.path.with_extension("rows.jsonl");
+        for row in 0..=drafts.len() {
+            if row > 0 {
+                hasher.update(drafts[row - 1].to_le_bytes());
+            }
+            let bytes = read_view(gpu, &self.logits, (first + row) * self.vocab, self.vocab)?;
+            dump_row(&mine.path, &bytes)?;
+            let line = json!({
+                "step": self.step,
+                "row": row,
+                "position": position + row,
+                "hash": hasher_hex(&hasher),
+                "lane_rows": drafts.len() + 1,
+                "step_rows": self.step_rows,
+            });
+            use std::io::Write;
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&meta)
+                .and_then(|mut file| writeln!(file, "{line}"))
+                .map_err(|x| format!("write {}: {x}", meta.display()))?;
+        }
+        Ok(())
+    }
+}
+
+impl AcceptRule for VerifyDump {
+    fn accept(
+        &mut self,
+        lane: &LanePlan,
+        drafts: &[u32],
+        picks: &[u32],
+        rng: &mut LaneRng,
+    ) -> Result<GreedyAccept, String> {
+        if picks.len() != drafts.len() + 1 {
+            return Err(format!(
+                "verify dump: {} picks for {} drafts",
+                picks.len(),
+                drafts.len()
+            ));
+        }
+        self.dump(lane, drafts)?;
+        GreedyRule.accept(lane, drafts, picks, rng)
+    }
+
+    fn observe_verify(&mut self, out: &SamplerOutput) {
+        self.first.clear();
+        let mut first = 0usize;
+        for (key, picks) in &out.picks {
+            self.first.insert(key.request_epoch.request_tag, first);
+            first += picks.len();
+        }
+        self.step_rows = first;
+    }
+}
+
 fn device_info(gpu: &Gpu) -> Value {
     json!({
         "device_id": gpu.device_id,
@@ -464,8 +1046,59 @@ struct Comparison {
     first_mismatch: Option<usize>,
     ref_md5: String,
     lane_md5: String,
+    /// Digest of every compared logits row's sha (`--logits` only).
+    ref_logits_sha: Option<String>,
+    lane_logits_sha: Option<String>,
     /// `Some(first differing logits index)` per `--logits`; inner `None` = equal.
     logits_first_mismatch: Option<Option<usize>>,
+}
+
+/// One digest of a run's per-row logits shas (rows joined by newlines).
+fn rows_digest(rows: &[String]) -> String {
+    sha256_hex(rows.join("\n").as_bytes())
+}
+
+/// KL(p || q) in nats between the softmax of two raw f32 logits rows (f64 log-softmax).
+fn row_kl(reference: &[u8], lane: &[u8]) -> Option<f64> {
+    if reference.len() != lane.len() || reference.len() % 4 != 0 || reference.is_empty() {
+        return None;
+    }
+    let f = |b: &[u8]| -> Vec<f64> {
+        b.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f64)
+            .collect()
+    };
+    let (p, q) = (f(reference), f(lane));
+    let lse = |x: &[f64]| -> f64 {
+        let m = x.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        m + x.iter().map(|v| (v - m).exp()).sum::<f64>().ln()
+    };
+    let (lp, lq) = (lse(&p), lse(&q));
+    let mut kl = 0.0;
+    for i in 0..p.len() {
+        let lpi = p[i] - lp;
+        kl += lpi.exp() * (lpi - (q[i] - lq));
+    }
+    Some(kl)
+}
+
+/// Per-row KL of one lane vs its singleton reference over the rows computed from an identical
+/// context: rows `0..=first id mismatch` (all rows when the ids agree). `(rows, max, mean)`.
+fn lane_kl(
+    reference_raw: &[Vec<u8>],
+    lane_raw: &[Vec<u8>],
+    first_id_mismatch: Option<usize>,
+) -> Option<(usize, f64, f64)> {
+    let rows = lane_raw.len().min(reference_raw.len());
+    let upto = first_id_mismatch.map_or(rows, |m| (m + 1).min(rows));
+    let kls: Vec<f64> = (0..upto)
+        .filter_map(|r| row_kl(&reference_raw[r], &lane_raw[r]))
+        .collect();
+    if kls.is_empty() {
+        return None;
+    }
+    let max = kls.iter().cloned().fold(0.0, f64::max);
+    Some((kls.len(), max, kls.iter().sum::<f64>() / kls.len() as f64))
 }
 
 fn compare(
@@ -480,6 +1113,8 @@ fn compare(
         first_mismatch: ids_mismatch,
         ref_md5: ids_md5(reference_ids),
         lane_md5: ids_md5(lane_ids),
+        ref_logits_sha: logits.map(|(reference, _)| rows_digest(reference)),
+        lane_logits_sha: logits.map(|(_, lane)| rows_digest(lane)),
         logits_first_mismatch,
     }
 }
@@ -496,8 +1131,221 @@ fn comparison_json(prompt: usize, c: &Comparison) -> Value {
     if let Some(mismatch) = c.logits_first_mismatch {
         record["logits_equal"] = json!(mismatch.is_none());
         record["first_logits_mismatch"] = json!(mismatch);
+        // One digest over every compared logits row's sha: the cross-arm identity key
+        // (`wave-table.py`: an exact wave's lane == the serial tile's lane of the same prompt).
+        record["ref_logits_sha"] = json!(c.ref_logits_sha);
+        record["lane_logits_sha"] = json!(c.lane_logits_sha);
     }
     record
+}
+
+/// Where a lane first differs from its singleton: the first differing ids index or logits row
+/// (row 0 is the prompt-completing row, row r >= 1 the r-th AR row), the absolute sequence
+/// position of the token that row's logits follow (`prompt_len - 1 + row`) and which compare
+/// saw it. `None` when ids (and logits, when compared) are all equal.
+fn first_divergence(prompt_len: usize, c: &Comparison) -> Option<Value> {
+    let ids = c.first_mismatch;
+    let logits = c.logits_first_mismatch.flatten();
+    let row = match (ids, logits) {
+        (None, None) => return None,
+        (Some(a), None) | (None, Some(a)) => a,
+        (Some(a), Some(b)) => a.min(b),
+    };
+    let via = match (ids == Some(row), logits == Some(row)) {
+        (true, true) => "ids+logits",
+        (true, false) => "ids",
+        _ => "logits",
+    };
+    Some(json!({
+        "row": row,
+        "position": (prompt_len + row).saturating_sub(1),
+        "phase": if row == 0 { "prefill-final" } else { "decode" },
+        "via": via,
+    }))
+}
+
+/// [`comparison_json`] plus the lane's place in its run, its prompt length and the first
+/// divergence (`null` when equal).
+fn compared_json(prompt: usize, prompt_len: usize, lane: usize, c: &Comparison) -> Value {
+    let mut record = comparison_json(prompt, c);
+    record["lane"] = json!(lane);
+    record["prompt_len"] = json!(prompt_len);
+    record["first_divergence"] = json!(first_divergence(prompt_len, c));
+    record
+}
+
+/// The run-level fields of a lane run: its set, lengths, total rows, and the serialized
+/// singleton prefills of the same prompts summed (`burst_vs_singleton_sum` = singleton sum /
+/// the run's prefill wall: > 1 means the joint prefill beat prefilling the prompts one by one).
+fn burst_extras(set: &RunSet, run: &KRun, prompts: &[&[u32]], references: &[Reference]) -> Value {
+    let lens: Vec<usize> = set.members.iter().map(|&i| prompts[i].len()).collect();
+    let single_ms: f64 = set.members.iter().map(|&i| references[i].prefill_ms).sum();
+    // Twin check only when the run hashed logits rows (`--logits`).
+    let twins = if run.logits_sha.iter().any(|rows| !rows.is_empty()) {
+        let lane_prompts: Vec<&[u32]> = set.members.iter().map(|&i| prompts[i]).collect();
+        twins_json(&twin_groups(&lane_prompts, &run.ids, &run.logits_sha))
+    } else {
+        Value::Null
+    };
+    json!({
+        "set": set.label(),
+        "burst": set.burst,
+        "members": set.members,
+        "prompt_lens": lens,
+        "rows_total": lens.iter().sum::<usize>(),
+        "singleton_prefill_ms_sum": single_ms,
+        "burst_vs_singleton_sum": (run.prefill.wall > 0.0 && single_ms > 0.0)
+            .then(|| single_ms / (run.prefill.wall * 1e3)),
+        "twins": twins,
+    })
+}
+
+/// First (lane, row) where a twin differs from the first lane of its group.
+#[derive(Debug, PartialEq, Eq)]
+struct TwinDiff {
+    lane: usize,
+    vs_lane: usize,
+    row: usize,
+    via: &'static str,
+}
+
+/// Lanes of one run fed identical prompt ids ("twins"); `first_diff` is `None` when every
+/// twin's ids and per-row logits shas equal the group's first lane's.
+#[derive(Debug, PartialEq, Eq)]
+struct TwinGroup {
+    lanes: Vec<usize>,
+    first_diff: Option<TwinDiff>,
+}
+
+/// Group a run's lanes by prompt token ids (`prompt_ids[lane]`); every group of 2+ lanes is
+/// compared: ids and every logits row sha (index 0 = prompt-completing row, then each AR row)
+/// must equal the group's first lane's, whatever the singleton reference does. Groups are in
+/// the order of their first lane.
+fn twin_groups(
+    prompt_ids: &[&[u32]],
+    ids: &[Vec<u32>],
+    logits_sha: &[Vec<String>],
+) -> Vec<TwinGroup> {
+    let mut by_ids: std::collections::BTreeMap<&[u32], Vec<usize>> = Default::default();
+    for (lane, prompt) in prompt_ids.iter().enumerate() {
+        by_ids.entry(*prompt).or_default().push(lane);
+    }
+    let rows = |lane: usize| logits_sha.get(lane).map_or(&[][..], Vec::as_slice);
+    let mut groups: Vec<TwinGroup> = by_ids
+        .into_values()
+        .filter(|lanes| lanes.len() >= 2)
+        .map(|lanes| {
+            let head = lanes[0];
+            let first_diff = lanes[1..].iter().find_map(|&lane| {
+                let by_ids = first_mismatch(&ids[head], &ids[lane]);
+                let by_logits = first_mismatch(rows(head), rows(lane));
+                let (row, via) = match (by_ids, by_logits) {
+                    (None, None) => return None,
+                    (Some(a), None) => (a, "ids"),
+                    (None, Some(b)) => (b, "logits"),
+                    (Some(a), Some(b)) if a == b => (a, "ids+logits"),
+                    (Some(a), Some(b)) if a < b => (a, "ids"),
+                    (Some(_), Some(b)) => (b, "logits"),
+                };
+                Some(TwinDiff {
+                    lane,
+                    vs_lane: head,
+                    row,
+                    via,
+                })
+            });
+            TwinGroup { lanes, first_diff }
+        })
+        .collect();
+    groups.sort_by_key(|g| g.lanes[0]);
+    groups
+}
+
+/// The `twins` object of a run in report.json.
+fn twins_json(groups: &[TwinGroup]) -> Value {
+    let equal = groups.iter().filter(|g| g.first_diff.is_none()).count();
+    json!({
+        "groups_total": groups.len(),
+        "groups_equal": equal,
+        "all_equal": equal == groups.len(),
+        "groups": groups.iter().map(|g| json!({
+            "lanes": g.lanes,
+            "equal": g.first_diff.is_none(),
+            "first_diff": g.first_diff.as_ref().map(|d| json!({
+                "lane": d.lane, "vs_lane": d.vs_lane, "row": d.row, "via": d.via,
+            })),
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// A one-line description of the first twin mismatch of a run's `twins` object; `None` when
+/// every group is equal or the run had no twin verdict (`null`).
+fn twin_failure(twins: &Value) -> Option<String> {
+    twins["groups"].as_array()?.iter().find_map(|g| {
+        let d = g.get("first_diff").filter(|d| !d.is_null())?;
+        Some(format!(
+            "twin lanes {}: lane {} row {} ({}) differs from lane {}",
+            g["lanes"],
+            d["lane"],
+            d["row"],
+            d["via"].as_str().unwrap_or("?"),
+            d["vs_lane"],
+        ))
+    })
+}
+
+/// Merge the fields of the object `extra` into the object `record`.
+fn with_extras(mut record: Value, extra: Value) -> Value {
+    if let (Some(into), Value::Object(from)) = (record.as_object_mut(), extra) {
+        into.extend(from);
+    }
+    record
+}
+
+/// The one stderr line per lane run the table scripts read (`wave-table.py`).
+fn burst_line(spec: &str, set: &RunSet, run: &KRun, compared: &[Value], extras: &Value) -> String {
+    let lens: Vec<u64> = compared
+        .iter()
+        .filter_map(|c| c["prompt_len"].as_u64())
+        .collect();
+    let divergences: Vec<(u64, u64, u64)> = compared
+        .iter()
+        .filter_map(|c| {
+            let d = c.get("first_divergence")?;
+            Some((
+                c["prompt"].as_u64()?,
+                d["row"].as_u64()?,
+                d["position"].as_u64()?,
+            ))
+        })
+        .collect();
+    let twins = &extras["twins"];
+    let twins_equal = if twins.is_null() {
+        "n/a".to_string()
+    } else {
+        format!(
+            "{}/{}",
+            twins["groups_equal"].as_u64().unwrap_or(0),
+            twins["groups_total"].as_u64().unwrap_or(0)
+        )
+    };
+    format!(
+        "[oracle-burst] policy={spec} set={} lens={lens:?} prompts_equal={}/{} passes={} rows={} burst_prefill_ms={:.1} admit_ms={:.1} ms_per_row={:.3} singleton_sum_ms={:.1} first_divergence(prompt,row,pos)={divergences:?} twins_equal={twins_equal}{}",
+        set.label(),
+        compared.iter().filter(|c| c["equal"] == json!(true)).count(),
+        compared.len(),
+        run.prefill.steps,
+        run.prefill.rows,
+        run.prefill.wall * 1e3,
+        run.prefill.admit_wall * 1e3,
+        if run.prefill.rows > 0 {
+            run.prefill.wall * 1e3 / run.prefill.rows as f64
+        } else {
+            f64::NAN
+        },
+        extras["singleton_prefill_ms_sum"].as_f64().unwrap_or(f64::NAN),
+        twin_failure(twins).map_or(String::new(), |why| format!(" twin_mismatch=\"{why}\"")),
+    )
 }
 
 // ------------------------------------------------------------- lane plans
@@ -638,6 +1486,15 @@ trait LaneBackend {
     /// Set `policy` on every lane store of the load (idempotent; refused
     /// without changes when the stores cannot take it).
     fn set_policy(&mut self, policy: LaneStagePolicy) -> R<()>;
+    /// Lab `--elastic`: lend a bank of at most `bytes` on every EP rank and settle it (every fill
+    /// and publication run). Only the single-bundle / EP backend can.
+    fn elastic_lend(&mut self, _bytes: u64) -> R<Vec<ElasticLabRank>> {
+        Err("--elastic needs the single-bundle / EP lane backend".to_string())
+    }
+    /// Lab `--elastic-cycle`: reclaim every rank's bank; per rank whether one was freed.
+    fn elastic_reclaim(&mut self) -> R<Vec<bool>> {
+        Err("--elastic-cycle needs the single-bundle / EP lane backend".to_string())
+    }
 }
 
 /// Single/EP lanes: the bundle's lane API on the primary GPU (under EP the
@@ -651,9 +1508,25 @@ struct LocalLanes<'a> {
 impl LaneBackend for LocalLanes<'_> {
     fn stage(&mut self, max_lanes: usize, row_budget: usize) -> R<()> {
         self.gpu.bind_thread().map_err(e)?;
+        let before = self
+            .gpu
+            .device_mem_info()
+            .map(|(free, _)| free)
+            .unwrap_or(0);
         self.bundle
             .stage_lanes(self.gpu, max_lanes, row_budget, None)
-            .map_err(e)
+            .map_err(e)?;
+        let after = self
+            .gpu
+            .device_mem_info()
+            .map(|(free, _)| free)
+            .unwrap_or(0);
+        eprintln!(
+            "[{TOOL}] lane stage (AR) consumed {} MiB on rank 0 ({} MiB free after)",
+            before.saturating_sub(after) >> 20,
+            after >> 20
+        );
+        Ok(())
     }
 
     fn stage_policy(&self) -> R<LaneStagePolicy> {
@@ -665,6 +1538,16 @@ impl LaneBackend for LocalLanes<'_> {
 
     fn set_policy(&mut self, policy: LaneStagePolicy) -> R<()> {
         self.bundle.set_lane_stage_policy(None, policy).map_err(e)
+    }
+
+    fn elastic_lend(&mut self, bytes: u64) -> R<Vec<ElasticLabRank>> {
+        self.gpu.bind_thread().map_err(e)?;
+        self.bundle.elastic_lab_lend(self.gpu, bytes)
+    }
+
+    fn elastic_reclaim(&mut self) -> R<Vec<bool>> {
+        self.gpu.bind_thread().map_err(e)?;
+        self.bundle.elastic_lab_reclaim(self.gpu)
     }
 
     fn lane_capacity(&self) -> R<usize> {
@@ -860,6 +1743,9 @@ struct DriveCfg<'a> {
     max_lanes: usize,
     row_budget: usize,
     want_logits: bool,
+    /// Per lane (in lane order): the file every logits row of the lane is appended to as raw f32
+    /// (`--logits-dump`); `None` writes nothing.
+    dump: Option<&'a [PathBuf]>,
 }
 
 struct LaneRun {
@@ -870,9 +1756,67 @@ struct LaneRun {
     committed: Vec<u32>,
     /// SHA-256 of the prompt-completing row, then of every AR row (`--logits`).
     logits_sha: Vec<String>,
+    /// The raw f32 logits rows themselves (`--logits`), for the per-row KL check.
+    logits_raw: Vec<Vec<u8>>,
     /// AR rows this lane ran in decode-only steps.
     decode_only_rows: usize,
     admitted: bool,
+}
+
+/// The steps of a K run that carried at least one prefill tile: how many, the prompt rows their
+/// tiles forwarded, and their summed wall seconds (an AR row of an earlier lane may share the
+/// step; a K-lane run with equal prompts has one such step). `rows` over `wall` is the lane
+/// prefill's cost per prompt row, the number a serve step's `[fn-lane-step] pf_rows`/`fwd` pair
+/// reports.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct PrefillTiming {
+    steps: usize,
+    rows: usize,
+    wall: f64,
+    /// Host time spent admitting finished prompts into the mesh decode (MTP arm), seconds;
+    /// `wall + admit_wall` is the time to every first token of the burst.
+    admit_wall: f64,
+    /// One record per prefill step (a pass): how the burst was split across steps.
+    passes: Vec<PrefillPass>,
+}
+
+/// One step that carried prefill tiles.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct PrefillPass {
+    /// Prefill tiles (lanes) in the pass.
+    tiles: usize,
+    /// Prompt rows those tiles forwarded.
+    rows: usize,
+    /// AR rows of earlier-finished lanes that shared the step.
+    ar_rows: usize,
+    wall: f64,
+}
+
+impl PrefillTiming {
+    fn record(&mut self, pass: PrefillPass) {
+        self.steps += 1;
+        self.rows += pass.rows;
+        self.wall += pass.wall;
+        self.passes.push(pass);
+    }
+
+    fn json(&self) -> Value {
+        json!({
+            "steps": self.steps,
+            "rows": self.rows,
+            "wall_s": self.wall,
+            "ms_per_row": (self.rows > 0).then(|| self.wall * 1e3 / self.rows as f64),
+            "admit_wall_s": self.admit_wall,
+            "burst_wall_s": self.wall + self.admit_wall,
+            "passes": self.passes.iter().map(|p| json!({
+                "tiles": p.tiles,
+                "rows": p.rows,
+                "ar_rows": p.ar_rows,
+                "wall_s": p.wall,
+                "ms_per_row": (p.rows > 0).then(|| p.wall * 1e3 / p.rows as f64),
+            })).collect::<Vec<_>>(),
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -882,12 +1826,15 @@ struct KRun {
     ids: Vec<Vec<u32>>,
     /// Per lane: logits SHA-256 rows (`tokens + 1` with `--logits`, else empty).
     logits_sha: Vec<Vec<String>>,
+    /// Per lane: the raw logits rows (same rows as `logits_sha`).
+    logits_raw: Vec<Vec<Vec<u8>>>,
     steps: usize,
     decode_steps: usize,
     decode_tokens: usize,
     /// Wall seconds of every step / of the decode-only steps.
     steps_wall: f64,
     decode_wall: f64,
+    prefill: PrefillTiming,
     lane_decode_rows: Vec<usize>,
 }
 
@@ -960,6 +1907,7 @@ fn drive_inner(
             },
             committed: Vec::new(),
             logits_sha: Vec::new(),
+            logits_raw: Vec::new(),
             decode_only_rows: 0,
             admitted: true,
         });
@@ -967,6 +1915,7 @@ fn drive_inner(
 
     let (mut steps, mut decode_steps, mut decode_tokens) = (0usize, 0usize, 0usize);
     let (mut steps_wall, mut decode_wall) = (0f64, 0f64);
+    let mut prefill_timing = PrefillTiming::default();
     loop {
         let progress: Vec<Progress> = lanes.iter().map(|lane| lane.progress).collect();
         let (prefill, ar) = schedule(&progress, cfg.tokens, cfg.row_budget);
@@ -1014,6 +1963,19 @@ fn drive_inner(
         let wall = started.elapsed().as_secs_f64();
         steps += 1;
         steps_wall += wall;
+        if !decode_only {
+            prefill_timing.record(PrefillPass {
+                tiles: prefill.len(),
+                rows: plan
+                    .requests
+                    .iter()
+                    .filter(|r| r.kind == RequestStepKind::Prefill)
+                    .map(|r| r.rows.len)
+                    .sum::<usize>(),
+                ar_rows: ar.len(),
+                wall,
+            });
+        }
         if decode_only {
             decode_steps += 1;
             decode_wall += wall;
@@ -1046,6 +2008,28 @@ fn drive_inner(
                     .map(|(_, bytes)| Some(sha256_hex(bytes)))
                     .ok_or_else(|| format!("lane {idx}: the step returned no logits row"))
             };
+            let row_raw = || -> Option<Vec<u8>> {
+                if !cfg.want_logits {
+                    return None;
+                }
+                result
+                    .logits
+                    .iter()
+                    .find(|(epoch, _)| *epoch == request.epoch)
+                    .map(|(_, bytes)| bytes.to_vec())
+            };
+            // `--logits-dump`: the lane's raw f32 row, appended to its file.
+            let row_dump = || -> R<()> {
+                let Some(paths) = cfg.dump else {
+                    return Ok(());
+                };
+                let (_, bytes) = result
+                    .logits
+                    .iter()
+                    .find(|(epoch, _)| *epoch == request.epoch)
+                    .ok_or_else(|| format!("lane {idx}: the step returned no logits row"))?;
+                dump_row(&paths[idx], bytes)
+            };
             let lane = &mut lanes[idx];
             match request.kind {
                 RequestStepKind::Prefill => {
@@ -1067,6 +2051,8 @@ fn drive_inner(
                     };
                     lane.committed.push(*id);
                     lane.logits_sha.extend(row_sha()?);
+                    lane.logits_raw.extend(row_raw());
+                    row_dump()?;
                 }
                 RequestStepKind::Ar => {
                     lane.progress.ar_steps += 1;
@@ -1085,6 +2071,8 @@ fn drive_inner(
                     }
                     lane.committed.push(*id);
                     lane.logits_sha.extend(row_sha()?);
+                    lane.logits_raw.extend(row_raw());
+                    row_dump()?;
                     if decode_only {
                         lane.decode_only_rows += 1;
                     }
@@ -1123,11 +2111,13 @@ fn drive_inner(
             .map(|lane| lane.committed[..cfg.tokens].to_vec())
             .collect(),
         logits_sha: lanes.iter().map(|lane| lane.logits_sha.clone()).collect(),
+        logits_raw: lanes.iter().map(|lane| lane.logits_raw.clone()).collect(),
         steps,
         decode_steps,
         decode_tokens,
         steps_wall,
         decode_wall,
+        prefill: prefill_timing,
         lane_decode_rows: lanes.iter().map(|lane| lane.decode_only_rows).collect(),
     })
 }
@@ -1139,6 +2129,11 @@ struct Reference {
     /// SHA-256 of the logits row after the prefill, then after every forward
     /// (`tokens + 1` rows with `--logits`, else empty).
     logits_sha: Vec<String>,
+    /// The raw f32 logits rows (same rows), for the per-row KL check.
+    logits_raw: Vec<Vec<u8>>,
+    /// Wall milliseconds of the cold prefill (final-logits read included): the singleton the
+    /// lane prefill of the same prompt is compared with.
+    prefill_ms: f64,
 }
 
 /// The serialized singleton run of one topology (`fn_ep_oracle`'s AR loop).
@@ -1213,16 +2208,32 @@ fn reference_run(
     prompt: &[u32],
     tokens: usize,
     want_logits: bool,
+    dump: Option<&Path>,
 ) -> R<Reference> {
+    // The singleton's cold prefill of this prompt, timed (the final-logits read after it drains
+    // the device), to set beside the lane prefill tile of the same rows (`prefill` in
+    // report.json, `[fn-lane-tile]` with `HIPFIRE_CB_PHASES=1`): one tile IS this program.
+    let clock = Instant::now();
     single.prefill(prompt)?;
+    single.logits_bytes()?;
+    let prefill_ms = clock.elapsed().as_secs_f64() * 1e3;
+    eprintln!(
+        "[oracle-ref-prefill] rows={} ms={prefill_ms:.1}",
+        prompt.len(),
+    );
     let mut reference = Reference {
         ids: Vec::with_capacity(tokens),
         logits_sha: Vec::new(),
+        logits_raw: Vec::new(),
+        prefill_ms,
     };
     if want_logits {
-        reference
-            .logits_sha
-            .push(sha256_hex(&single.logits_bytes()?));
+        let bytes = single.logits_bytes()?;
+        reference.logits_sha.push(sha256_hex(&bytes));
+        if let Some(path) = dump {
+            dump_row(path, &bytes)?;
+        }
+        reference.logits_raw.push(bytes);
     }
     for step in 1..=tokens {
         let id = single
@@ -1230,9 +2241,12 @@ fn reference_run(
             .map_err(|x| format!("reference step {step}: {x}"))?;
         reference.ids.push(id);
         if want_logits {
-            reference
-                .logits_sha
-                .push(sha256_hex(&single.logits_bytes()?));
+            let bytes = single.logits_bytes()?;
+            reference.logits_sha.push(sha256_hex(&bytes));
+            if let Some(path) = dump {
+                dump_row(path, &bytes)?;
+            }
+            reference.logits_raw.push(bytes);
         }
     }
     Ok(reference)
@@ -1312,64 +2326,135 @@ fn run_policy(
     match backend.set_policy(policy) {
         Err(x) => status = PolicyStatus::Error(format!("set lane stage policy: {x}")),
         Ok(()) => {
-            let cfg = DriveCfg {
-                prompts,
-                tokens,
-                max_lanes,
-                row_budget,
-                want_logits: args.logits,
-            };
-            for &k in &args.ks {
-                eprintln!("[{TOOL}] policy {spec}: K={k}: {k} concurrent lanes ({tokens} tokens)");
+            for (set_index, set) in run_sets(args).into_iter().enumerate() {
+                if let (Some(mib), true, true) = (args.elastic, args.elastic_cycle, set_index > 0) {
+                    let when = format!("before run {set_index}");
+                    let cycled = elastic_reclaim_report(&when, backend.elastic_reclaim())
+                        .and_then(|()| elastic_lend_report(&when, backend.elastic_lend(mib << 20)));
+                    if let Err(x) = cycled {
+                        status = PolicyStatus::Error(x);
+                        break;
+                    }
+                }
+                let label = set.label();
+                let k = set.members.len();
+                eprintln!(
+                    "[{TOOL}] policy {spec}: {label}: {k} concurrent lanes ({tokens} tokens)"
+                );
+                let selected: Vec<&[u32]> = set.members.iter().map(|&i| prompts[i]).collect();
+                let dump_paths = match args
+                    .logits_dump
+                    .as_deref()
+                    .map(|root| lane_dump_paths(root, "lane", spec, &label, &set.members))
+                    .transpose()
+                {
+                    Ok(paths) => paths,
+                    Err(x) => {
+                        status = PolicyStatus::Error(format!("{label}: {x}"));
+                        break;
+                    }
+                };
+                let cfg = DriveCfg {
+                    prompts: &selected,
+                    tokens,
+                    max_lanes,
+                    row_budget,
+                    want_logits: args.logits,
+                    dump: dump_paths.as_deref(),
+                };
                 let run = match drive_k(backend, &cfg, k, next_tag) {
                     Ok(run) => run,
                     Err(x) => {
-                        status = PolicyStatus::Error(format!("K={k}: {x}"));
+                        status = PolicyStatus::Error(format!("{label}: {x}"));
                         break;
                     }
                 };
                 let mut compared = Vec::with_capacity(k);
-                for index in 0..k {
+                for (lane, &index) in set.members.iter().enumerate() {
                     ids_lines.push(json!({
-                        "kind": "lane", "policy": spec, "k": k, "prompt": index,
-                        "ids": run.ids[index],
+                        "kind": "lane", "policy": spec, "k": k, "prompt": index, "lane": lane,
+                        "set": label, "ids": run.ids[lane],
                     }));
                     let (reference_ids, reference_logits) =
                         reference_prefix(&references[index], tokens, args.logits);
                     let comparison = compare(
                         reference_ids,
-                        &run.ids[index],
+                        &run.ids[lane],
                         args.logits
-                            .then(|| (reference_logits, run.logits_sha[index].as_slice())),
+                            .then(|| (reference_logits, run.logits_sha[lane].as_slice())),
                     );
+                    if args.logits {
+                        if let Some((rows, max, mean)) = lane_kl(
+                            &references[index].logits_raw[..tokens + 1],
+                            &run.logits_raw[lane],
+                            comparison.first_mismatch,
+                        ) {
+                            eprintln!(
+                                "[oracle-kl] policy={spec} set={label} lane={lane} prompt={index} rows={rows} max_kl={max:.3e} mean_kl={mean:.3e}"
+                            );
+                        }
+                    }
                     if !comparison.equal {
                         if status == PolicyStatus::Pass {
                             status = PolicyStatus::Fail;
                         }
-                        failures.push(format!("K={k} prompt {index}"));
+                        failures.push(format!("{label} prompt {index}"));
                     }
-                    compared.push(comparison_json(index, &comparison));
+                    compared.push(compared_json(
+                        index,
+                        prompts[index].len(),
+                        lane,
+                        &comparison,
+                    ));
                 }
+                // One stderr line per K run: lane == singleton, with the first divergence of
+                // the ids / logits rows of every prompt that differs (the report carries them).
+                let first = |key: &str| {
+                    compared
+                        .iter()
+                        .filter_map(|c| Some((c["prompt"].as_u64()?, c.get(key)?.as_u64()?)))
+                        .collect::<Vec<_>>()
+                };
+                eprintln!(
+                    "[oracle-lane-vs-singleton] policy={spec} k={} prompts_equal={}/{} ids_first_mismatch(prompt,index)={:?} logits_first_mismatch(prompt,row)={:?}",
+                    run.k,
+                    compared.iter().filter(|c| c["equal"] == json!(true)).count(),
+                    compared.len(),
+                    first("first_mismatch"),
+                    first("first_logits_mismatch"),
+                );
                 let equal = compared.iter().all(|c| c["equal"] == json!(true));
+                let extras = burst_extras(&set, &run, prompts, references);
+                if let Some(why) = twin_failure(&extras["twins"]) {
+                    if status == PolicyStatus::Pass {
+                        status = PolicyStatus::Fail;
+                    }
+                    failures.push(format!("{label} {why}"));
+                }
+                eprintln!("{}", burst_line(spec, &set, &run, &compared, &extras));
                 per_k.push(json!({
                     "k": run.k,
                     "equal": equal,
                     "decode_wall_s": run.decode_wall,
                     "aggregate_tok_s": run.aggregate_tok_s(),
                 }));
-                runs.push(json!({
-                    "k": run.k,
-                    "equal": equal,
-                    "prompts": compared,
-                    "steps": run.steps,
-                    "decode_steps": run.decode_steps,
-                    "decode_tokens": run.decode_tokens,
-                    "decode_wall_s": run.decode_wall,
-                    "steps_wall_s": run.steps_wall,
-                    "aggregate_tok_s": run.aggregate_tok_s(),
-                    "per_lane_tok_s": run.per_lane_tok_s(),
-                    "timing_includes_logits_read": args.logits,
-                }));
+                runs.push(with_extras(
+                    json!({
+                        "k": run.k,
+                        "equal": equal,
+                        "prompts": compared,
+                        "steps": run.steps,
+                        "decode_steps": run.decode_steps,
+                        "decode_tokens": run.decode_tokens,
+                        "decode_wall_s": run.decode_wall,
+                        "steps_wall_s": run.steps_wall,
+                        "prefill": run.prefill.json(),
+                        "aggregate_tok_s": run.aggregate_tok_s(),
+                        "per_lane_tok_s": run.per_lane_tok_s(),
+                        "timing_includes_logits_read": args.logits,
+                    }),
+                    extras,
+                ));
             }
         }
     }
@@ -1482,6 +2567,10 @@ fn drive_all(
     ids_lines: &mut Vec<Value>,
 ) -> R<Vec<PolicyOutcome>> {
     backend.stage(max_lanes_requested, row_budget)?;
+    // Lab `--elastic`: the bank is fully published before the first measured run.
+    if let Some(mib) = args.elastic {
+        elastic_lend_report("initial", backend.elastic_lend(mib << 20))?;
+    }
     drive_policies(backend, args, prompts, references, row_budget, ids_lines)
 }
 
@@ -1512,6 +2601,697 @@ fn sweep_verdict(outcomes: &[PolicyOutcome]) -> Verdict {
     } else {
         Verdict::Fail
     }
+}
+
+// ------------------------------------------------------------ MTP EP arm
+
+/// One lane of the native-MTP EP run: prefill through the ordinary lane
+/// executor (identical on every rank), decode through the mesh lane protocol.
+struct MtpLane {
+    epoch: RequestEpoch,
+    slot: usize,
+    progress: Progress,
+    /// The prompt-completing pick, then every emitted token.
+    committed: Vec<u32>,
+    admitted: bool,
+    in_mesh: bool,
+    windows: u64,
+    offered: u64,
+    accepted: u64,
+}
+
+fn lab_routes(routes: RoutesArg) -> LabRoutes {
+    match routes {
+        RoutesArg::Floor => LabRoutes::Floor,
+        RoutesArg::Cycle => LabRoutes::Cycle,
+        RoutesArg::Batched => LabRoutes::Batched,
+    }
+}
+
+fn mesh_step_error(error: MeshStepError) -> String {
+    match error {
+        MeshStepError::Preflight(v) => format!("mesh preflight rejected: {v:?}"),
+        MeshStepError::Aborted(record) => format!("mesh step aborted: {record}"),
+        MeshStepError::Protocol(p) => format!("mesh protocol: {p}"),
+    }
+}
+
+fn merged_json(m: &hipfire_arch_qwen4::mesh_lane_protocol::MergedCostEvidence) -> Value {
+    json!({
+        "step_seq": m.key.step_seq,
+        "ranks": m.ranks,
+        "target_exchanges": m.counts.target_exchanges,
+        "gather_bytes": m.counts.gather_bytes,
+        "head_draft_calls": m.counts.head_draft_calls,
+        "head_append_rows": m.counts.head_append_rows,
+        "row_groups": m.counts.row_groups,
+        "drafts_generated": m.counts.drafts_generated,
+        "accepted": m.counts.accepted,
+        "consumed_rows": m.counts.consumed_rows,
+        "wall_us": m.wall_us,
+        "critical_path_us": m.critical_path_us,
+        "draft_us": m.phase_us[0],
+        "verify_us": m.phase_us[1],
+        "prepare_us": m.phase_us[2],
+        "synchronized": m.synchronized,
+        "priced": m.priced,
+        "unpriced_reason": m.unpriced_reason,
+    })
+}
+
+fn median(v: &mut [f64]) -> Option<f64> {
+    if v.is_empty() {
+        return None;
+    }
+    v.sort_by(|a, b| a.total_cmp(b));
+    Some(v[v.len() / 2])
+}
+
+struct MtpKRun {
+    run: KRun,
+    windows: Vec<Value>,
+    rank_stats: Vec<Value>,
+    summary: Value,
+}
+
+/// Run prompts `0..k` as `k` concurrent native-MTP lanes on the EP mesh until
+/// each has `cfg.tokens` committed ids; every lane is released (also on
+/// error).
+#[allow(clippy::too_many_arguments)]
+fn drive_mtp_k(
+    bundle: &mut Qwen4Bundle,
+    gpu: &mut Gpu,
+    mesh: &mut EpMeshLanes,
+    cfg: &DriveCfg<'_>,
+    max_seq: usize,
+    depth: usize,
+    routes: RoutesArg,
+    k: usize,
+    next_tag: &mut u64,
+    vocab: usize,
+) -> R<MtpKRun> {
+    let mut lanes: Vec<MtpLane> = Vec::with_capacity(k);
+    let mut windows = Vec::new();
+    let result = drive_mtp_inner(
+        bundle,
+        gpu,
+        mesh,
+        cfg,
+        max_seq,
+        depth,
+        routes,
+        k,
+        next_tag,
+        vocab,
+        &mut lanes,
+        &mut windows,
+    );
+    let mut release_error = None;
+    for lane in lanes.iter_mut() {
+        if lane.in_mesh {
+            lane.in_mesh = false;
+            if let Err(x) = mesh.release_lane(bundle, gpu, lane.epoch) {
+                release_error.get_or_insert(format!("mesh release {:?}: {x}", lane.epoch));
+            }
+        }
+        if lane.admitted {
+            lane.admitted = false;
+            if let Err(x) = bundle.release_lane(&lane.epoch) {
+                release_error.get_or_insert(format!("release {:?}: {x}", lane.epoch));
+            }
+        }
+    }
+    let rank_stats = mesh
+        .rank_stats(bundle, gpu)
+        .map(|all| {
+            all.into_iter()
+                .map(|s| {
+                    json!({
+                        "rank": s.rank, "steps": s.steps,
+                        "native_windows": s.native_windows,
+                        "draft_mismatches": s.draft_mismatches,
+                        "pick_mismatches": s.pick_mismatches,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    match (result, release_error) {
+        (Err(x), _) => Err(x),
+        (Ok(_), Some(x)) => Err(x),
+        (Ok((run, summary)), None) => Ok(MtpKRun {
+            run,
+            windows,
+            rank_stats,
+            summary,
+        }),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drive_mtp_inner(
+    bundle: &mut Qwen4Bundle,
+    gpu: &mut Gpu,
+    mesh: &mut EpMeshLanes,
+    cfg: &DriveCfg<'_>,
+    max_seq: usize,
+    depth: usize,
+    routes: RoutesArg,
+    k: usize,
+    next_tag: &mut u64,
+    vocab: usize,
+    lanes: &mut Vec<MtpLane>,
+    windows: &mut Vec<Value>,
+) -> R<(KRun, Value)> {
+    if k > cfg.max_lanes || k > cfg.prompts.len() {
+        return Err(format!(
+            "K={k} exceeds the staged lanes ({}) or the prompts ({})",
+            cfg.max_lanes,
+            cfg.prompts.len()
+        ));
+    }
+    for prompt in &cfg.prompts[..k] {
+        *next_tag += 1;
+        let epoch = RequestEpoch {
+            request_tag: *next_tag,
+            owner_generation: 1,
+        };
+        let slot = bundle.admit_lane(gpu, epoch, prompt.to_vec()).map_err(e)?;
+        lanes.push(MtpLane {
+            epoch,
+            slot,
+            progress: Progress {
+                prompt_len: prompt.len(),
+                prefilled: 0,
+                ar_steps: 0,
+            },
+            committed: Vec::new(),
+            admitted: true,
+            in_mesh: false,
+            windows: 0,
+            offered: 0,
+            accepted: 0,
+        });
+    }
+    let budgets: WindowBudgets = mesh.window_budgets(bundle, lab_routes(routes))?;
+    let (mut steps, mut decode_steps, mut decode_tokens) = (0usize, 0usize, 0usize);
+    let (mut steps_wall, mut decode_wall) = (0f64, 0f64);
+    let mut prefill_timing = PrefillTiming::default();
+    let (mut ev_verify, mut ev_draft, mut ev_groups): (Vec<f64>, Vec<f64>, Vec<f64>) =
+        (Vec::new(), Vec::new(), Vec::new());
+    let (mut ev_wall, mut ev_crit, mut ev_ex, mut ev_head, mut ev_bytes, mut ev_priced) = (
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::<bool>::new(),
+    );
+    let (mut total_windows, mut total_offered, mut total_accepted, mut total_emitted) =
+        (0u64, 0u64, 0u64, 0u64);
+    loop {
+        // Prefill: one tile per Prefilling lane through the lane executor.
+        let prefill: Vec<usize> = (0..lanes.len())
+            .filter(|&i| lanes[i].progress.prefilled < lanes[i].progress.prompt_len)
+            .collect();
+        let mut prefill_ran = false;
+        if !prefill.is_empty() {
+            let mut specs = Vec::with_capacity(prefill.len());
+            for &i in &prefill {
+                let lane = &lanes[i];
+                let len = bundle
+                    .lane_executor()
+                    .map_err(e)?
+                    .exact_prefill_chunk_len(&lane.epoch)?;
+                let p = lane.progress;
+                if len == 0 || p.prefilled + len > p.prompt_len {
+                    return Err(format!(
+                        "lane {i}: prefill tile of {len} rows at {}/{}",
+                        p.prefilled, p.prompt_len
+                    ));
+                }
+                specs.push(RowSpec {
+                    slot: lane.slot,
+                    epoch: lane.epoch,
+                    tokens: cfg.prompts[i][p.prefilled..p.prefilled + len].to_vec(),
+                    start: p.prefilled,
+                    kind: RequestStepKind::Prefill,
+                });
+            }
+            let plan = build_plan(cfg.max_lanes, specs);
+            let started = Instant::now();
+            let result = LocalLanes {
+                bundle: &mut *bundle,
+                gpu: &mut *gpu,
+                vocab,
+            }
+            .step(&plan, false)?;
+            steps += 1;
+            let wall = started.elapsed().as_secs_f64();
+            steps_wall += wall;
+            prefill_timing.record(PrefillPass {
+                tiles: plan.requests.len(),
+                rows: plan.total_rows(),
+                ar_rows: 0,
+                wall,
+            });
+            prefill_ran = true;
+            mesh.note_prefill();
+            for (request, advance) in plan.requests.iter().zip(&result.advances) {
+                let idx = lanes
+                    .iter()
+                    .position(|lane| lane.epoch == request.epoch)
+                    .ok_or("plan epoch is not one of this run's lanes")?;
+                lanes[idx].progress.prefilled += request.rows.len;
+                if lanes[idx].progress.prefilled < lanes[idx].progress.prompt_len {
+                    continue;
+                }
+                let [id] = advance.committed_ids.as_slice() else {
+                    return Err(format!(
+                        "lane {idx}: prompt-completing tile committed {:?}",
+                        advance.committed_ids
+                    ));
+                };
+                lanes[idx].committed.push(*id);
+                // No EOS handling: the AR reference loop ignores EOS, and the
+                // oracle compares exact id streams.
+                let admit_clock = Instant::now();
+                mesh.admit_lane(
+                    bundle,
+                    gpu,
+                    MeshLaneAdmission {
+                        epoch: lanes[idx].epoch,
+                        position: lanes[idx].progress.prompt_len,
+                        seed: *id,
+                        eos: None,
+                        rng_seed: lanes[idx].epoch.request_tag,
+                        prompt: cfg.prompts[idx].to_vec(),
+                        spec_k: Some(depth),
+                        copy_capable: true,
+                    },
+                )?;
+                prefill_timing.admit_wall += admit_clock.elapsed().as_secs_f64();
+                lanes[idx].in_mesh = true;
+            }
+        }
+
+        // Lanes with everything they need leave the mesh.
+        for lane in lanes.iter_mut() {
+            if lane.in_mesh && lane.committed.len() >= cfg.tokens {
+                lane.in_mesh = false;
+                mesh.release_lane(bundle, gpu, lane.epoch)?;
+                lane.admitted = false;
+                bundle.release_lane(&lane.epoch).map_err(e)?;
+            }
+        }
+
+        // Decode: one mesh step over every lane that still needs tokens.
+        let active: Vec<usize> = (0..lanes.len())
+            .filter(|&i| lanes[i].in_mesh && lanes[i].committed.len() < cfg.tokens)
+            .collect();
+        if active.is_empty() {
+            if prefill.is_empty() {
+                break;
+            }
+            continue;
+        }
+        let mut requests = Vec::with_capacity(active.len());
+        for &i in &active {
+            let lane = &lanes[i];
+            let (position, _) = mesh
+                .root()
+                .lane_position(lane.epoch)
+                .ok_or_else(|| format!("lane {i}: the root lost its position"))?;
+            requests.push(LaneRequest {
+                wide_verify: false,
+                epoch: lane.epoch,
+                remaining: cfg.tokens - lane.committed.len(),
+                context_left: max_seq.saturating_sub(position),
+                forced: None,
+                sampling: SamplingMode::Greedy,
+            });
+        }
+        let started = Instant::now();
+        let report = match cfg.dump {
+            Some(paths) => {
+                let tensor = bundle
+                    .lanes()
+                    .and_then(|store| store.logits())
+                    .ok_or("verify dump: the lane store has no step logits")?;
+                let mut rule = VerifyDump {
+                    gpu: &*gpu as *const Gpu,
+                    logits: tensor.sub_offset(0, tensor.numel()),
+                    vocab,
+                    step: steps,
+                    lanes: active
+                        .iter()
+                        .map(|&i| VerifyLane {
+                            tag: lanes[i].epoch.request_tag,
+                            fed: cfg.prompts[i]
+                                .iter()
+                                .chain(&lanes[i].committed)
+                                .copied()
+                                .collect(),
+                            path: paths[i].clone(),
+                        })
+                        .collect(),
+                    first: std::collections::HashMap::new(),
+                    step_rows: 0,
+                };
+                mesh.step(bundle, gpu, &requests, &budgets, &mut rule)
+            }
+            None => mesh.step(bundle, gpu, &requests, &budgets, &mut GreedyRule),
+        }
+        .map_err(mesh_step_error)?;
+        let wall = started.elapsed().as_secs_f64();
+        steps += 1;
+        steps_wall += wall;
+        let mut emitted_step = 0usize;
+        for out in &report.output.lanes {
+            let idx = lanes
+                .iter()
+                .position(|lane| lane.epoch == out.key.request_epoch)
+                .ok_or("mesh output epoch is not one of this run's lanes")?;
+            let lane = &mut lanes[idx];
+            lane.committed.extend_from_slice(&out.emitted);
+            lane.windows += 1;
+            lane.offered += out.source.offered as u64;
+            lane.accepted += out.source.accepted as u64;
+            emitted_step += out.emitted.len();
+            total_windows += 1;
+            total_offered += out.source.offered as u64;
+            total_accepted += out.source.accepted as u64;
+            total_emitted += out.emitted.len() as u64;
+            windows.push(json!({
+                "k": k, "step": report.key.step_seq, "lane": idx,
+                "window_seq": out.key.window_seq,
+                "source": format!("{:?}", out.source.source),
+                "offered": out.source.offered,
+                "accepted": out.source.accepted,
+                "consumed_rows": out.consumed_rows,
+                "emitted": out.emitted,
+                "terminal": out.terminal,
+            }));
+        }
+        if let Some(prior) = mesh.last_evidence() {
+            ev_wall.push(prior.wall_us);
+            ev_crit.push(prior.critical_path_us);
+            ev_verify.push(prior.phase_us[1]);
+            ev_draft.push(prior.phase_us[0]);
+            ev_groups.push(prior.counts.row_groups as f64);
+            ev_ex.push(prior.counts.target_exchanges as f64);
+            ev_head.push(prior.counts.head_draft_calls as f64);
+            ev_bytes.push(prior.counts.gather_bytes as f64);
+            ev_priced.push(prior.priced);
+            windows.push(json!({
+                "k": k, "kind": "evidence-of-previous-step",
+                "prior_priced": report.prior_priced,
+                "evidence": merged_json(prior),
+            }));
+        }
+        if !prefill_ran {
+            decode_steps += 1;
+            decode_wall += wall;
+            decode_tokens += emitted_step;
+        }
+    }
+    for (i, lane) in lanes.iter().enumerate() {
+        if lane.committed.len() < cfg.tokens {
+            return Err(format!(
+                "lane {i} ended with {}/{} committed ids",
+                lane.committed.len(),
+                cfg.tokens
+            ));
+        }
+    }
+    let ids: Vec<Vec<u32>> = lanes
+        .iter()
+        .map(|lane| lane.committed[..cfg.tokens].to_vec())
+        .collect();
+    let summary = json!({
+        "windows": total_windows,
+        "drafts_offered": total_offered,
+        "drafts_accepted": total_accepted,
+        "tokens_emitted": total_emitted,
+        // Accepted drafts per window (the wire `tau`) and emitted per window.
+        "tau": if total_windows > 0 { total_accepted as f64 / total_windows as f64 } else { 0.0 },
+        "yield": if total_windows > 0 { total_emitted as f64 / total_windows as f64 } else { 0.0 },
+        // Merged rank evidence of the priced steps (median over steps).
+        "evidence_steps": ev_wall.len(),
+        "evidence_priced_steps": ev_priced.iter().filter(|p| **p).count(),
+        "step_wall_us_median": median(&mut ev_wall.clone()),
+        "step_critical_path_us_median": median(&mut ev_crit.clone()),
+        "verify_us_median": median(&mut ev_verify.clone()),
+        "draft_us_median": median(&mut ev_draft.clone()),
+        "row_groups_median": median(&mut ev_groups.clone()),
+        "target_exchanges_median": median(&mut ev_ex.clone()),
+        "head_draft_calls_median": median(&mut ev_head.clone()),
+        "gather_bytes_median": median(&mut ev_bytes.clone()),
+        "per_lane": lanes.iter().map(|l| json!({
+            "windows": l.windows, "offered": l.offered, "accepted": l.accepted,
+        })).collect::<Vec<_>>(),
+    });
+    Ok((
+        KRun {
+            k,
+            ids,
+            logits_sha: vec![Vec::new(); k],
+            logits_raw: vec![Vec::new(); k],
+            steps,
+            decode_steps,
+            decode_tokens,
+            steps_wall,
+            decode_wall,
+            prefill: prefill_timing,
+            lane_decode_rows: lanes
+                .iter()
+                .map(|l| l.committed.len().saturating_sub(1))
+                .collect(),
+        },
+        summary,
+    ))
+}
+
+/// Lab `--elastic`: print every rank's lend and settle (units and bytes), failing when a rank
+/// published no unit: a bank that is not fully published would make the run an unlent run.
+fn elastic_lend_report(when: &str, lent: R<Vec<ElasticLabRank>>) -> R<()> {
+    let ranks = lent.map_err(|x| format!("elastic lend ({when}): {x}"))?;
+    for rank in &ranks {
+        eprintln!(
+            "[{TOOL}] elastic {when}: rank {} lent {} units / {} MiB, settled {} units, bank {} MiB",
+            rank.rank,
+            rank.lent_units,
+            rank.lent_bytes >> 20,
+            rank.settled_units,
+            rank.settled_bytes >> 20
+        );
+    }
+    match ranks.iter().find(|rank| rank.settled_units == 0) {
+        Some(rank) => Err(format!(
+            "elastic {when}: rank {} published no unit (nothing lent, or the tail is suspended or frozen)",
+            rank.rank
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Lab `--elastic-cycle`: print which ranks freed a bank.
+fn elastic_reclaim_report(when: &str, freed: R<Vec<bool>>) -> R<()> {
+    let freed = freed.map_err(|x| format!("elastic reclaim ({when}): {x}"))?;
+    eprintln!("[{TOOL}] elastic {when}: reclaimed per rank {freed:?}");
+    Ok(())
+}
+
+/// The native-MTP EP arm: stage MTP lanes, then every K of `args.ks` as
+/// concurrent lanes, ids compared with the serialized singleton AR reference.
+/// One outcome (policy label `mtp:k=..,routes=..`).
+#[allow(clippy::too_many_arguments)]
+fn drive_mtp_ep(
+    bundle: &mut Qwen4Bundle,
+    gpu: &mut Gpu,
+    args: &Args,
+    prompts: &[&[u32]],
+    references: &[Reference],
+    max_lanes: usize,
+    row_budget: usize,
+    vocab: usize,
+    ids_lines: &mut Vec<Value>,
+) -> R<Vec<PolicyOutcome>> {
+    let depth = args.k.unwrap_or(DEFAULT_K);
+    let routes = args.routes.unwrap_or(RoutesArg::Cycle);
+    let label = format!(
+        "mtp:k={depth},routes={}{}",
+        routes.name(),
+        if args.copy { ",copy" } else { "" }
+    );
+    if args.logits {
+        return Err(
+            "--logits is not available with --spec mtp (verify rows are not AR rows)".into(),
+        );
+    }
+    gpu.bind_thread().map_err(e)?;
+    let copy_cfg = if args.copy {
+        let ngram = hipfire_arch_qwen4::mtp_spec::qwen4_ngram_mod_config(
+            hipfire_config::ngram_mod_copy_triple(),
+        )?;
+        Some(hipfire_arch_qwen4::lane::LaneCopyConfig {
+            ngram,
+            head_lag_rows: 8,
+            wide_lanes: usize::MAX,
+        })
+    } else {
+        None
+    };
+    let before = gpu.device_mem_info().map(|(free, _)| free).unwrap_or(0);
+    bundle
+        .stage_lanes_with_copy(
+            gpu,
+            max_lanes,
+            row_budget,
+            Some(LaneSpecConfig {
+                k: depth,
+                end_of_turn: None,
+                spec_lanes: None,
+            }),
+            copy_cfg,
+        )
+        .map_err(e)?;
+    let after = gpu.device_mem_info().map(|(free, _)| free).unwrap_or(0);
+    eprintln!(
+        "[{TOOL}] lane stage (MTP k={depth}) consumed {} MiB on rank 0 ({} MiB free after)",
+        before.saturating_sub(after) >> 20,
+        after >> 20
+    );
+    let mut mesh = EpMeshLanes::new(gpu, bundle, 1, routes == RoutesArg::Floor)?;
+    // Lab `--elastic`: the bank is fully published before the first measured run.
+    if let Some(mib) = args.elastic {
+        elastic_lend_report("initial", bundle.elastic_lab_lend(gpu, mib << 20))?;
+    }
+    let mut next_tag = 0u64;
+    let mut runs = Vec::new();
+    let mut per_k = Vec::new();
+    let mut failures = Vec::new();
+    let mut status = PolicyStatus::Pass;
+    for (set_index, set) in run_sets(args).into_iter().enumerate() {
+        if let (Some(mib), true, true) = (args.elastic, args.elastic_cycle, set_index > 0) {
+            elastic_reclaim_report(
+                &format!("before run {set_index}"),
+                bundle.elastic_lab_reclaim(gpu),
+            )?;
+            elastic_lend_report(
+                &format!("before run {set_index}"),
+                bundle.elastic_lab_lend(gpu, mib << 20),
+            )?;
+        }
+        let label_set = set.label();
+        let k = set.members.len();
+        eprintln!(
+            "[{TOOL}] {label}: {label_set}: {k} concurrent MTP lanes ({} tokens)",
+            args.tokens
+        );
+        let selected: Vec<&[u32]> = set.members.iter().map(|&i| prompts[i]).collect();
+        let dump_paths = args
+            .verify_logits_dump
+            .as_deref()
+            .map(|root| lane_dump_paths(root, "verify", &label, &label_set, &set.members))
+            .transpose()
+            .map_err(|x| format!("{label_set}: {x}"))?;
+        let cfg = DriveCfg {
+            prompts: &selected,
+            tokens: args.tokens,
+            max_lanes,
+            row_budget,
+            want_logits: false,
+            dump: dump_paths.as_deref(),
+        };
+        let out = match drive_mtp_k(
+            bundle,
+            gpu,
+            &mut mesh,
+            &cfg,
+            args.max_seq,
+            depth,
+            routes,
+            k,
+            &mut next_tag,
+            vocab,
+        ) {
+            Ok(out) => out,
+            Err(x) => {
+                status = PolicyStatus::Error(format!("{label_set}: {x}"));
+                break;
+            }
+        };
+        let run = &out.run;
+        let mut compared = Vec::with_capacity(k);
+        for (lane, &index) in set.members.iter().enumerate() {
+            ids_lines.push(json!({
+                "kind": "lane", "policy": label, "k": k, "prompt": index, "lane": lane,
+                "set": label_set, "ids": run.ids[lane],
+            }));
+            let comparison = compare(&references[index].ids[..args.tokens], &run.ids[lane], None);
+            if !comparison.equal {
+                if status == PolicyStatus::Pass {
+                    status = PolicyStatus::Fail;
+                }
+                failures.push(format!("{label_set} prompt {index}"));
+            }
+            compared.push(compared_json(
+                index,
+                prompts[index].len(),
+                lane,
+                &comparison,
+            ));
+        }
+        for w in &out.windows {
+            ids_lines.push(json!({"kind": "window", "policy": label, "window": w}));
+        }
+        let equal = compared.iter().all(|c| c["equal"] == json!(true));
+        let extras = burst_extras(&set, run, prompts, references);
+        eprintln!("{}", burst_line(&label, &set, run, &compared, &extras));
+        per_k.push(json!({
+            "k": run.k, "equal": equal,
+            "decode_wall_s": run.decode_wall,
+            "aggregate_tok_s": run.aggregate_tok_s(),
+        }));
+        runs.push(with_extras(
+            json!({
+                "k": run.k,
+                "equal": equal,
+                "prompts": compared,
+                "steps": run.steps,
+                "decode_steps": run.decode_steps,
+                "decode_tokens": run.decode_tokens,
+                "decode_wall_s": run.decode_wall,
+                "steps_wall_s": run.steps_wall,
+                "prefill": run.prefill.json(),
+                "aggregate_tok_s": run.aggregate_tok_s(),
+                "mtp": out.summary,
+                "rank_stats": out.rank_stats,
+                "timing_includes_logits_read": false,
+            }),
+            extras,
+        ));
+    }
+    let mut record = json!({
+        "spec": label,
+        "describe": format!("native-MTP EP lanes depth {depth} routes {}", routes.name()),
+        "tokens": args.tokens,
+        "status": status.label(),
+        "all_equal": status == PolicyStatus::Pass,
+        "failures": failures,
+        "per_k": per_k,
+        "runs": runs,
+    });
+    if let PolicyStatus::Error(message) = &status {
+        record["error"] = json!(message);
+    }
+    Ok(vec![PolicyOutcome {
+        spec: label,
+        status,
+        record,
+        failures,
+    }])
 }
 
 // ------------------------------------------------------------------- main
@@ -1556,8 +3336,299 @@ fn write_ids(path: &Path, lines: &[Value]) -> R<()> {
     std::fs::write(path, text).map_err(|x| format!("write {}: {x}", path.display()))
 }
 
+// ----------------------------------------------------------------- manifest
+
+const MANIFEST_SCHEMA: u64 = 1;
+
+/// The environment a run records (report and manifest): `HIPFIRE_*` plus the
+/// device selectors and `HOME`.
+fn recorded_env() -> serde_json::Map<String, Value> {
+    std::env::vars()
+        .filter(|(key, _)| {
+            key.starts_with("HIPFIRE_")
+                || matches!(
+                    key.as_str(),
+                    "ROCR_VISIBLE_DEVICES" | "HIP_VISIBLE_DEVICES" | "FABRIC_CARDS" | "HOME"
+                )
+        })
+        .map(|(key, value)| (key, Value::String(value)))
+        .collect()
+}
+
+/// One shell word: bare when it is made only of safe characters, otherwise
+/// single-quoted.
+fn shell_quote(word: &str) -> String {
+    let safe = !word.is_empty()
+        && word
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_./=:,+@%".contains(&b));
+    if safe {
+        word.to_string()
+    } else {
+        format!("'{}'", word.replace('\'', r"'\''"))
+    }
+}
+
+fn absolute_path(path: &str, cwd: &Path) -> String {
+    cwd.join(path).display().to_string()
+}
+
+/// The invocation with every option spelled out (paths made absolute against
+/// `cwd`, defaults filled in). Parsing it yields the same [`Args`] as the
+/// original invocation, so the manifest command reproduces the run.
+fn expanded_argv(args: &Args, cwd: &Path) -> Vec<String> {
+    let mut argv: Vec<String> = Vec::new();
+    let mut push = |flag: &str, value: String| {
+        argv.push(flag.to_string());
+        argv.push(value);
+    };
+    push("--model", absolute_path(&args.model, cwd));
+    for path in &args.prompt_files {
+        push("--prompt-file", absolute_path(path, cwd));
+    }
+    push("--max-seq", args.max_seq.to_string());
+    push("--tokens", args.tokens.to_string());
+    push(
+        "--ks",
+        args.ks
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    for burst in &args.bursts {
+        push(
+            "--burst",
+            burst
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+    }
+    push("--out", absolute_path(&args.out.display().to_string(), cwd));
+    push("--pp", args.pp.to_string());
+    if let Some(budget) = args.row_budget {
+        push("--row-budget", budget.to_string());
+    }
+    let default_policy = args.policies.len() == 1 && args.policies[0].policy.is_none();
+    if !default_policy {
+        push(
+            "--policies",
+            args.policies
+                .iter()
+                .map(|entry| entry.spec.as_str())
+                .collect::<Vec<_>>()
+                .join(";"),
+        );
+    }
+    if let Some(sweep) = args.tokens_sweep {
+        push("--tokens-sweep", sweep.to_string());
+    }
+    if let Some(lanes) = args.reserve_lanes {
+        push("--reserve-lanes", lanes.to_string());
+    }
+    push("--spec", args.spec.name().to_string());
+    if let Some(k) = args.k {
+        push("--k", k.to_string());
+    }
+    if let Some(routes) = args.routes {
+        push("--routes", routes.name().to_string());
+    }
+    if let Some(seconds) = args.soak_seconds {
+        push("--soak-seconds", seconds.to_string());
+    }
+    if let Some(seed) = args.soak_seed {
+        push("--soak-seed", seed.to_string());
+    }
+    if let Some(point) = args.fault_point {
+        push("--fault-point", point.name().to_string());
+    }
+    if args.copy {
+        argv.push("--copy".to_string());
+    }
+    if args.skip_model_hash {
+        argv.push("--skip-model-hash".to_string());
+    }
+    if args.logits {
+        argv.push("--logits".to_string());
+    }
+    if let Some(dir) = &args.logits_dump {
+        argv.push("--logits-dump".to_string());
+        argv.push(absolute_path(&dir.display().to_string(), cwd));
+    }
+    if let Some(dir) = &args.verify_logits_dump {
+        argv.push("--verify-logits-dump".to_string());
+        argv.push(absolute_path(&dir.display().to_string(), cwd));
+    }
+    if let Some(mib) = args.elastic {
+        argv.push("--elastic".to_string());
+        argv.push(mib.to_string());
+    }
+    if args.elastic_cycle {
+        argv.push("--elastic-cycle".to_string());
+    }
+    argv
+}
+
+/// `exe` and `argv` as one copy-pasteable shell command.
+fn expanded_command(exe: &str, argv: &[String]) -> String {
+    std::iter::once(exe)
+        .chain(argv.iter().map(String::as_str))
+        .map(shell_quote)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Size and SHA-256 of every `--prompt-file`, in lane order.
+fn fixture_records(args: &Args, cwd: &Path) -> R<Vec<Value>> {
+    args.prompt_files
+        .iter()
+        .enumerate()
+        .map(|(index, path)| {
+            let absolute = absolute_path(path, cwd);
+            let bytes = std::fs::metadata(&absolute)
+                .map_err(|x| format!("prompt fixture {path}: {x}"))?
+                .len();
+            Ok(json!({
+                "index": index,
+                "path": path,
+                "absolute_path": absolute,
+                "bytes": bytes,
+                "sha256": file_sha256(Path::new(&absolute))?,
+            }))
+        })
+        .collect()
+}
+
+/// The speculative-lane selection as recorded in the report and manifest.
+fn spec_json(args: &Args) -> Value {
+    json!({
+        "spec": args.spec.name(),
+        "k": args.k,
+        "routes": args.routes.map(RoutesArg::name),
+        "soak_seconds": args.soak_seconds,
+        "soak_seed": args.soak_seed,
+        "fault_point": args.fault_point.map(FaultPoint::name),
+    })
+}
+
+/// `manifest.json` before the model hash is known (`"pending"` until the run
+/// computes it; `null` under `--skip-model-hash`).
+fn build_manifest(
+    args: &Args,
+    invoked_argv: &[String],
+    exe: &str,
+    binary_sha256: &str,
+    cwd: &Path,
+    fixtures: Vec<Value>,
+    env: serde_json::Map<String, Value>,
+) -> Value {
+    let argv = expanded_argv(args, cwd);
+    let distinct: BTreeSet<&str> = fixtures
+        .iter()
+        .filter_map(|fixture| fixture["sha256"].as_str())
+        .collect();
+    json!({
+        "tool": TOOL,
+        "schema": MANIFEST_SCHEMA,
+        "command": expanded_command(exe, &argv),
+        "expanded_argv": argv,
+        "invoked_argv": invoked_argv,
+        "cwd": cwd.display().to_string(),
+        "binary": {
+            "path": exe,
+            "sha256": binary_sha256,
+            "package_version": env!("CARGO_PKG_VERSION"),
+        },
+        "model": {
+            "path": absolute_path(&args.model, cwd),
+            "sha256": if args.skip_model_hash { Value::Null } else { json!("pending") },
+        },
+        "prompts": fixtures,
+        "distinct_prompts": distinct.len(),
+        "ks": args.ks,
+        "bursts": args.bursts,
+        "pp": args.pp,
+        "max_seq": args.max_seq,
+        "tokens": args.tokens,
+        "spec": spec_json(args),
+        "env": env,
+        "completed": false,
+    })
+}
+
+/// The interface boundary of `--spec mtp`: the EP/PP speculative lane protocol
+/// it would drive (S3/S5) has not landed, so the invocation is refused with an
+/// explicit error. Never a pass: no lane window is run and no verdict exists.
+fn ensure_spec_supported(args: &Args) -> R<()> {
+    match args.spec {
+        SpecMode::Ar => Ok(()),
+        SpecMode::Mtp => {
+            let mut shape = format!(
+                "k={} routes={}",
+                args.k.unwrap_or(DEFAULT_K),
+                args.routes.map_or("cycle", RoutesArg::name)
+            );
+            if let Some(seconds) = args.soak_seconds {
+                shape.push_str(&format!(" soak={seconds}s"));
+            }
+            if let Some(point) = args.fault_point {
+                shape.push_str(&format!(" fault-point={}", point.name()));
+            }
+            // The EP lane protocol (S3) runs the plain greedy matrix; the PP arm
+            // (S5), the soak and the fault points are other owners' boundaries.
+            if args.pp > 1 || args.soak_seconds.is_some() || args.fault_point.is_some() {
+                return Err(format!(
+                    "{TOOL}: --spec mtp ({shape} pp={}) is not yet implemented by S3/S5: only the EP2 greedy matrix (--pp 1, no --soak-seconds/--fault-point) executes. This refusal is the interface boundary, not a pass; the invocation was validated and recorded in manifest.json",
+                    args.pp
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Writes `manifest.json`, records the speculative selection in `report`, then
+/// checks the spec is executable. A fixture that cannot be read fails here.
+fn prepare_run(args: &Args, report: &mut Value, manifest: &mut Value) -> R<()> {
+    let cwd = std::env::current_dir().map_err(e)?;
+    let exe = std::fs::read_link("/proc/self/exe")
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
+    let binary_sha256 = file_sha256(Path::new("/proc/self/exe"))?;
+    let invoked: Vec<String> = std::env::args().skip(1).collect();
+    *manifest = build_manifest(
+        args,
+        &invoked,
+        &exe,
+        &binary_sha256,
+        &cwd,
+        fixture_records(args, &cwd)?,
+        recorded_env(),
+    );
+    write_json(&args.out.join("manifest.json"), manifest)?;
+    report["manifest"] = json!("manifest.json");
+    report["spec"] = spec_json(args);
+    ensure_spec_supported(args)
+}
+
+/// Completes the manifest with the run's outcome (model hash, completion,
+/// verdict, error). A manifest that was never built stays absent.
+fn finalize_manifest(manifest: &mut Value, report: &Value) {
+    if manifest.is_null() {
+        return;
+    }
+    if !report["model_sha256"].is_null() {
+        manifest["model"]["sha256"] = report["model_sha256"].clone();
+    }
+    manifest["completed"] = report["completed"].clone();
+    manifest["verdict"] = report["verdict"].clone();
+    manifest["error"] = report["error"].clone();
+}
+
 /// Refuse an existing DIR, create it, run, and always leave `report.json`
-/// (with `error` on a refusal/error) and `ids.jsonl` behind.
+/// (with `error` on a refusal/error), `ids.jsonl` and `manifest.json` behind.
 fn run(args: Args) -> R<Verdict> {
     if args.out.exists() {
         return Err(format!(
@@ -1568,13 +3639,26 @@ fn run(args: Args) -> R<Verdict> {
     std::fs::create_dir_all(&args.out)
         .map_err(|x| format!("create {}: {x}", args.out.display()))?;
     let mut report = json!({"tool": TOOL, "completed": false});
+    let mut manifest = Value::Null;
     let mut ids_lines = Vec::new();
-    let result = run_inner(&args, &mut report, &mut ids_lines);
+    let result = prepare_run(&args, &mut report, &mut manifest)
+        .and_then(|()| run_inner(&args, &mut report, &mut ids_lines));
     if let Err(error) = &result {
         report["error"] = json!(error);
     }
+    finalize_manifest(&mut manifest, &report);
+    // `HIPFIRE_EP_LAB_UNIT_HITS=1` with a unit plan: the per-rank, per-layer VRAM hit counters.
+    let hits = hipfire_arch_qwen4::ep::lab_unit_hits::take();
+    if !hits.is_empty() {
+        let text = hipfire_arch_qwen4::ep::lab_unit_hits::report(&hits, 2_611_200);
+        eprint!("{text}");
+        let _ = std::fs::write(args.out.join("unit_hits.txt"), text);
+    }
     write_ids(&args.out.join("ids.jsonl"), &ids_lines)?;
     write_json(&args.out.join("report.json"), &report)?;
+    if !manifest.is_null() {
+        write_json(&args.out.join("manifest.json"), &manifest)?;
+    }
     result
 }
 
@@ -1586,7 +3670,6 @@ fn run(args: Args) -> R<Verdict> {
 fn load_with_lane_reservation(
     args: &Args,
     lanes: usize,
-    cask: &hipfire_runtime::loader_api::CaskConfig,
     spec: hipfire_runtime::loader_api::SpecLoadCfg,
     gpu: &mut Gpu,
 ) -> R<hipfire_loader::LoadedModel> {
@@ -1612,15 +3695,13 @@ fn load_with_lane_reservation(
             kv_v: None,
             qwen_default_q8: qwen_default_q8_enabled(),
             kv_adaptive: None,
-            cask: Some(cask),
             deepseek4_heterogeneous: false,
-            vmm_runtime_available: gpu.vmm_recommended_granularity().is_ok(),
+            vmm_runtime_refusal: gpu.vmm_runtime_refusal().as_deref(),
             free_vram_bytes: gpu.device_mem_info().ok().map(|(free, _)| free),
         },
         SourceAdmissionOptions {
             spec,
             kv_adaptive: qwen4_kv_adaptive_requested(None),
-            cask: cask.sidecar.is_some(),
             ..Default::default()
         },
     )?;
@@ -1630,9 +3711,10 @@ fn load_with_lane_reservation(
     admission.batch_request = BatchLoadRequest {
         vmm_batch: true,
         continuous_batch_size: lanes,
-        row_budget: args
-            .row_budget
-            .unwrap_or_else(|| *args.ks.last().expect("ks is non-empty")),
+        row_budget: args.row_budget.unwrap_or_else(|| args.max_lanes()),
+        // `--spec mtp` stages spec lanes: the EP plan charges that store.
+        spec_k: (args.spec == SpecMode::Mtp).then(|| args.k.unwrap_or(DEFAULT_K)),
+        spec_copy: args.spec == SpecMode::Mtp && args.copy,
     };
     let warning = legacy_warning(admission.kv_backend, admission.kv_backend_reason.as_deref());
     let loaded = hipfire_loader::load_admitted_with_gemma4_drafter(
@@ -1649,7 +3731,6 @@ fn load_with_lane_reservation(
         None,
         None,
         None,
-        cask,
         args.pp,
         spec,
         gpu,
@@ -1664,9 +3745,15 @@ fn load_with_lane_reservation(
 
 fn run_inner(args: &Args, report: &mut Value, ids_lines: &mut Vec<Value>) -> R<Verdict> {
     eprintln!("[{TOOL}] loading {}", args.model);
+    // Daemon parity: keep host-mapped expert memory out of reclaim before the first HIP call (KFD userptr eviction stalls, ROCm/rocm-systems#12528).
+    hipfire_loader::prepare_host_memory_for(Path::new(&args.model));
     let mut gpu = Gpu::init().map_err(|x| format!("Gpu::init: {x:?}"))?;
-    let cask = hipfire_runtime::loader_api::CaskConfig::default();
-    let spec_cfg = hipfire_runtime::loader_api::SpecLoadCfg::default();
+    // `--spec mtp` arms the native MTP head on every EP rank (under EP the
+    // loader attaches it only on an explicit request); the AR oracle loads as before.
+    let spec_cfg = hipfire_runtime::loader_api::SpecLoadCfg {
+        mtp: (args.spec == SpecMode::Mtp).then_some(true),
+        ..Default::default()
+    };
     let mut model = match args.reserve_lanes {
         None => hipfire_loader::load_model(
             &args.model,
@@ -1675,12 +3762,11 @@ fn run_inner(args: &Args, report: &mut Value, ids_lines: &mut Vec<Value>) -> R<V
             None,
             None,
             None,
-            &cask,
             args.pp,
             spec_cfg,
             &mut gpu,
         )?,
-        Some(lanes) => load_with_lane_reservation(args, lanes, &cask, spec_cfg, &mut gpu)?,
+        Some(lanes) => load_with_lane_reservation(args, lanes, spec_cfg, &mut gpu)?,
     };
 
     let prompts = {
@@ -1763,17 +3849,8 @@ fn run_inner(args: &Args, report: &mut Value, ids_lines: &mut Vec<Value>) -> R<V
         Value::String(file_sha256(Path::new(&args.model))?)
     };
     let exe = std::fs::read("/proc/self/exe").map_err(e)?;
-    let env: serde_json::Map<String, Value> = std::env::vars()
-        .filter(|(key, _)| {
-            key.starts_with("HIPFIRE_")
-                || matches!(
-                    key.as_str(),
-                    "ROCR_VISIBLE_DEVICES" | "HIP_VISIBLE_DEVICES" | "FABRIC_CARDS" | "HOME"
-                )
-        })
-        .map(|(key, value)| (key, Value::String(value)))
-        .collect();
-    let max_lanes_requested = *args.ks.last().expect("ks is non-empty");
+    let env = recorded_env();
+    let max_lanes_requested = args.max_lanes();
     let row_budget = args.row_budget.unwrap_or(max_lanes_requested);
     report["binary"] = json!(std::fs::read_link("/proc/self/exe")
         .map(|p| p.display().to_string())
@@ -1792,6 +3869,7 @@ fn run_inner(args: &Args, report: &mut Value, ids_lines: &mut Vec<Value>) -> R<V
     report["tokens"] = json!(args.tokens);
     report["vocab"] = json!(vocab);
     report["ks"] = json!(args.ks);
+    report["bursts"] = json!(args.bursts);
     report["max_lanes"] = json!(max_lanes_requested);
     report["row_budget"] = json!(row_budget);
     report["logits_compared"] = json!(args.logits);
@@ -1815,6 +3893,15 @@ fn run_inner(args: &Args, report: &mut Value, ids_lines: &mut Vec<Value>) -> R<V
         }))
         .collect::<Vec<_>>());
 
+    let dump_root = args
+        .logits_dump
+        .as_ref()
+        .or(args.verify_logits_dump.as_ref());
+    if let Some(root) = dump_root {
+        std::fs::create_dir(root)
+            .and_then(|()| std::fs::create_dir(root.join("ref")))
+            .map_err(|x| format!("create logits dump dir {}: {x}", root.display()))?;
+    }
     // Reference: the serialized singleton run of every prompt.
     let mut references = Vec::with_capacity(prompts.len());
     for (index, prompt) in prompts.iter().enumerate() {
@@ -1823,6 +3910,8 @@ fn run_inner(args: &Args, report: &mut Value, ids_lines: &mut Vec<Value>) -> R<V
             prompt.path,
             prompt.ids.len()
         );
+        let dump = dump_root.map(|root| root.join("ref").join(format!("prompt{index}.f32")));
+        let want_logits = args.logits || args.verify_logits_dump.is_some();
         let reference = match pp_gpus.as_deref_mut() {
             Some(gpus) => reference_run(
                 &mut PpSingle {
@@ -1833,7 +3922,8 @@ fn run_inner(args: &Args, report: &mut Value, ids_lines: &mut Vec<Value>) -> R<V
                 },
                 &prompt.ids,
                 args.tokens,
-                args.logits,
+                want_logits,
+                dump.as_deref(),
             ),
             None => reference_run(
                 &mut LocalSingle {
@@ -1843,21 +3933,56 @@ fn run_inner(args: &Args, report: &mut Value, ids_lines: &mut Vec<Value>) -> R<V
                 },
                 &prompt.ids,
                 args.tokens,
-                args.logits,
+                want_logits,
+                dump.as_deref(),
             ),
         }?;
+        if let (Some(root), Some(_)) = (&args.verify_logits_dump, &dump) {
+            write_ref_rows(
+                &root.join("ref").join(format!("prompt{index}.rows.jsonl")),
+                &prompt.ids,
+                &reference.ids,
+            )?;
+        }
         ids_lines.push(json!({"kind": "reference", "prompt": index, "ids": reference.ids}));
         references.push(reference);
     }
     report["reference"] = json!(references
         .iter()
         .enumerate()
-        .map(|(index, r)| json!({"prompt": index, "ids_md5": ids_md5(&r.ids)}))
+        .map(|(index, r)| json!({
+            "prompt": index,
+            "ids_md5": ids_md5(&r.ids),
+            "prompt_len": prompts[index].ids.len(),
+            "prefill_ms": r.prefill_ms,
+        }))
         .collect::<Vec<_>>());
 
     // Lanes: staged once, then every policy's whole K matrix.
     let prompt_ids: Vec<&[u32]> = prompts.iter().map(|prompt| prompt.ids.as_slice()).collect();
     let outcomes = match pp_gpus.as_deref_mut() {
+        Some(_) if args.spec == SpecMode::Mtp => {
+            return Err("--spec mtp under --pp is the PP arm, not implemented here".into());
+        }
+        None if args.spec == SpecMode::Mtp => {
+            if !ep {
+                return Err(
+                    "--spec mtp runs the EP2 mesh lane protocol: load with topology.ep (the single-card MTP lane oracle is fn_lane_oracle)"
+                        .into(),
+                );
+            }
+            drive_mtp_ep(
+                bundle,
+                &mut gpu,
+                args,
+                &prompt_ids,
+                &references,
+                max_lanes_requested,
+                row_budget,
+                vocab,
+                ids_lines,
+            )
+        }
         Some(gpus) => drive_all(
             &mut PpLanes {
                 bundle,
@@ -1913,7 +4038,7 @@ fn run_inner(args: &Args, report: &mut Value, ids_lines: &mut Vec<Value>) -> R<V
     let shape = format!(
         "ks={:?} prompts={} tokens={} pp={} ranks={ranks} ep={ep} logits={}",
         args.ks,
-        args.ks.last().copied().unwrap_or(0),
+        args.max_lanes(),
         args.tokens,
         args.pp,
         args.logits
@@ -1982,6 +4107,60 @@ mod tests {
         assert!(args.logits && args.skip_model_hash);
         assert_eq!((args.pp, args.tokens, args.max_seq), (1, 8, 4096));
         assert_eq!(args.prompt_files.len(), 4);
+    }
+
+    /// `--verify-logits-dump`: needs `--spec mtp`, does not imply `--logits`, and the singleton
+    /// row keys are one JSON line per row with the prefix hash of the fed tokens.
+    #[test]
+    fn verify_logits_dump_flag_and_reference_row_keys() {
+        let line = format!(
+            "{BASE} --ks 1 --spec mtp --verify-logits-dump out/vd{}",
+            files(1)
+        );
+        let args = parse_args_from(argv(&line)).unwrap();
+        assert!(!args.logits);
+        assert_eq!(args.verify_logits_dump, Some(PathBuf::from("out/vd")));
+        let line = format!("{BASE} --ks 1 --verify-logits-dump out/vd{}", files(1));
+        assert_eq!(
+            parse_args_from(argv(&line)).unwrap_err(),
+            "--verify-logits-dump needs --spec mtp"
+        );
+
+        let dir = std::env::temp_dir().join(format!("{TOOL}-ref-rows-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("prompt0.rows.jsonl");
+        write_ref_rows(&path, &[7, 8, 9], &[1, 2]).unwrap();
+        let rows: Vec<Value> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows.iter()
+                .map(|r| r["position"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![2, 3, 4]
+        );
+        // Row s hashes prompt ++ ids[..s]; a lane row with the same fed tokens hashes the same.
+        for (s, fed) in [
+            (0, vec![7u32, 8, 9]),
+            (1, vec![7, 8, 9, 1]),
+            (2, vec![7, 8, 9, 1, 2]),
+        ] {
+            assert_eq!(
+                rows[s]["hash"],
+                json!(hasher_hex(&token_hasher(&fed))),
+                "row {s}"
+            );
+        }
+        // A different prefix (a rejected draft) hashes differently.
+        assert_ne!(
+            rows[1]["hash"],
+            json!(hasher_hex(&token_hasher(&[7, 8, 9, 3])))
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -2057,12 +4236,12 @@ mod tests {
             position: 0,
             prefills: 0,
         };
-        let got = reference_run(&mut single, &prompt, 5, true).unwrap();
+        let got = reference_run(&mut single, &prompt, 5, true, None).unwrap();
         let want = reference(&prompt, 5);
         assert_eq!(got.ids, want.ids);
         assert_eq!(got.logits_sha, want.logits_sha);
         assert_eq!(single.prefills, 1);
-        let plain = reference_run(&mut single, &prompt, 5, false).unwrap();
+        let plain = reference_run(&mut single, &prompt, 5, false, None).unwrap();
         assert!(plain.logits_sha.is_empty());
         assert_eq!(plain.ids, want.ids);
     }
@@ -2437,7 +4616,12 @@ mod tests {
         let logits_sha = (0..=tokens)
             .map(|s| sha256_hex(&pick_bytes(prompt, prompt.len() - 1 + s)))
             .collect();
-        Reference { ids, logits_sha }
+        Reference {
+            ids,
+            logits_sha,
+            logits_raw: Vec::new(),
+            prefill_ms: prompt.len() as f64,
+        }
     }
 
     fn prompts() -> Vec<Vec<u32>> {
@@ -2447,6 +4631,40 @@ mod tests {
             .enumerate()
             .map(|(i, &len)| (0..len as u32).map(|j| 11 * i as u32 + j).collect())
             .collect()
+    }
+
+    /// `--logits-dump`: the flag parses (and implies `--logits`), and every lane row lands in the
+    /// lane's file as the raw bytes the backend returned, in the order the shas are taken.
+    #[test]
+    fn logits_dump_writes_every_lane_row_as_raw_bytes() {
+        let line = format!("{BASE} --ks 1 --logits-dump out/dump{}", files(1));
+        let args = parse_args_from(argv(&line)).unwrap();
+        assert!(args.logits);
+        assert_eq!(args.logits_dump, Some(PathBuf::from("out/dump")));
+
+        let prompts = prompts();
+        let slices: Vec<&[u32]> = prompts.iter().map(Vec::as_slice).collect();
+        let root = std::env::temp_dir().join(format!("{TOOL}-logits-dump-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let paths = lane_dump_paths(&root, "lane", "per-lane:moe=once", "K=2", &[0, 1]).unwrap();
+        assert!(paths[1].ends_with("lane/per-lane_moe=once/K=2/lane1-prompt1.f32"));
+        let mut backend = FakeLanes::new(4, 3);
+        let cfg = DriveCfg {
+            prompts: &slices,
+            tokens: 4,
+            max_lanes: 4,
+            row_budget: 4,
+            want_logits: true,
+            dump: Some(&paths),
+        };
+        drive_k(&mut backend, &cfg, 2, &mut 0).unwrap();
+        for (lane, path) in paths.iter().enumerate() {
+            let want: Vec<u8> = (0..=4)
+                .flat_map(|s| pick_bytes(&prompts[lane], prompts[lane].len() - 1 + s))
+                .collect();
+            assert_eq!(std::fs::read(path).unwrap(), want, "lane {lane}");
+        }
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -2463,6 +4681,7 @@ mod tests {
                     max_lanes: 4,
                     row_budget: 4,
                     want_logits,
+                    dump: None,
                 };
                 backend.steps.clear();
                 backend.released.clear();
@@ -2514,6 +4733,7 @@ mod tests {
             max_lanes: 4,
             row_budget: 2,
             want_logits: true,
+            dump: None,
         };
         let run = drive_k(&mut backend, &cfg, 4, &mut 0).unwrap();
         assert!(backend.steps.iter().all(|s| s.1 <= 2));
@@ -2563,6 +4783,7 @@ mod tests {
             max_lanes: 4,
             row_budget: 4,
             want_logits: false,
+            dump: None,
         };
         let error = drive_k(&mut backend, &cfg, 3, &mut 0).unwrap_err();
         assert!(error.contains("injected"), "{error}");
@@ -2580,6 +4801,7 @@ mod tests {
             max_lanes: 2,
             row_budget: 2,
             want_logits: false,
+            dump: None,
         };
         assert!(drive_k(&mut backend, &cfg, 3, &mut 0).is_err());
         assert!(backend.lanes.is_empty());
@@ -2704,6 +4926,325 @@ mod tests {
     fn sweep_args(extra: &str, ks: &str) -> Args {
         let line = format!("{BASE} --ks {ks} --tokens 6 --logits {extra}{}", files(4));
         parse_args_from(argv(&line)).unwrap()
+    }
+
+    #[test]
+    fn first_divergence_names_the_first_differing_row_and_position() {
+        let equal = compare(&[1, 2, 3], &[1, 2, 3], None);
+        assert_eq!(first_divergence(10, &equal), None);
+        // ids differ at index 2: row 2 follows the token at position 10 - 1 + 2.
+        let ids = compare(&[1, 2, 3], &[1, 2, 9], None);
+        assert_eq!(
+            first_divergence(10, &ids),
+            Some(json!({"row": 2, "position": 11, "phase": "decode", "via": "ids"}))
+        );
+        let reference = vec!["a".to_string(), "b".into()];
+        // Logits differ at the prompt-completing row, ids only later: the logits win.
+        let early = vec!["x".to_string(), "b".into()];
+        let c = compare(&[1, 2], &[1, 3], Some((&reference, &early)));
+        assert_eq!(
+            first_divergence(60, &c),
+            Some(json!({"row": 0, "position": 59, "phase": "prefill-final", "via": "logits"}))
+        );
+        // Both at the same row.
+        let late = vec!["a".to_string(), "z".into()];
+        let c = compare(&[1, 2], &[1, 3], Some((&reference, &late)));
+        assert_eq!(
+            first_divergence(60, &c),
+            Some(json!({"row": 1, "position": 60, "phase": "decode", "via": "ids+logits"}))
+        );
+        let record = compared_json(7, 60, 2, &c);
+        assert_eq!(
+            (
+                record["prompt"].clone(),
+                record["lane"].clone(),
+                record["prompt_len"].clone()
+            ),
+            (json!(7), json!(2), json!(60))
+        );
+        assert_eq!(record["first_divergence"]["row"], json!(1));
+        assert_eq!(
+            compared_json(7, 60, 2, &equal)["first_divergence"],
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn burst_args_parse_validate_and_drive_the_run_sets() {
+        let line = format!("{BASE} --ks 1 --burst 3,1,0 --burst 2{}", files(4));
+        let args = parse_args_from(argv(&line)).unwrap();
+        assert_eq!(args.bursts, vec![vec![3, 1, 0], vec![2]]);
+        assert_eq!(args.max_lanes(), 3);
+        let sets = run_sets(&args);
+        assert_eq!(
+            sets.iter().map(RunSet::label).collect::<Vec<_>>(),
+            ["K=1", "burst=3+1+0", "burst=2"]
+        );
+        assert_eq!(sets[0].members, vec![0]);
+        assert_eq!(sets[1].members, vec![3, 1, 0]);
+        assert!(!sets[0].burst && sets[1].burst);
+        // The manifest command reproduces the bursts.
+        let argv_out = expanded_argv(&args, Path::new("/w"));
+        let at = argv_out.iter().position(|a| a == "--burst").unwrap();
+        assert_eq!(argv_out[at + 1], "3,1,0");
+        assert_eq!(argv_out.iter().filter(|a| *a == "--burst").count(), 2);
+        // Without bursts nothing changes, and --ks still sets the lanes.
+        let line = format!("{BASE} --ks 1,2{}", files(2));
+        let args = parse_args_from(argv(&line)).unwrap();
+        assert!(args.bursts.is_empty());
+        assert_eq!(args.max_lanes(), 2);
+        assert_eq!(run_sets(&args).len(), 2);
+        // A burst longer than --ks raises the staged lanes.
+        let line = format!("{BASE} --ks 1 --burst 0,1,2,3{}", files(4));
+        assert_eq!(parse_args_from(argv(&line)).unwrap().max_lanes(), 4);
+        for bad in ["--burst 0,0", "--burst x", "--burst ,", "--burst 4"] {
+            let line = format!("{BASE} --ks 1 {bad}{}", files(4));
+            assert!(parse_args_from(argv(&line)).is_err(), "accepted {bad}");
+        }
+        let line = format!("{BASE} --ks 1{} --burst", files(4));
+        assert_eq!(
+            parse_args_from(argv(&line)).unwrap_err(),
+            "--burst needs a value"
+        );
+    }
+
+    #[test]
+    fn burst_runs_record_members_lengths_prefill_passes_and_singleton_sums() {
+        let args = sweep_args("--burst 3,1,0", "1");
+        let mut backend = FakeLanes::new(4, 3);
+        let (outcomes, ids_lines) = sweep(&mut backend, &args);
+        assert_eq!(outcomes[0].status, PolicyStatus::Pass);
+        let runs = outcomes[0].record["runs"].as_array().unwrap();
+        assert_eq!(runs.len(), 2, "the K=1 run, then the burst");
+        assert_eq!(runs[0]["set"], json!("K=1"));
+        assert_eq!(runs[0]["burst"], json!(false));
+        let burst = &runs[1];
+        assert_eq!(burst["set"], json!("burst=3+1+0"));
+        assert_eq!(burst["burst"], json!(true));
+        assert_eq!(burst["k"], json!(3));
+        assert_eq!(burst["members"], json!([3, 1, 0]));
+        assert_eq!(burst["prompt_lens"], json!([13, 2, 9]));
+        assert_eq!(burst["rows_total"], json!(24));
+        // reference() sets prefill_ms = prompt length.
+        assert_eq!(burst["singleton_prefill_ms_sum"], json!(24.0));
+        let prompts = burst["prompts"].as_array().unwrap();
+        let at = |key: &str| prompts.iter().map(|p| p[key].clone()).collect::<Vec<_>>();
+        assert_eq!(at("prompt"), [json!(3), json!(1), json!(0)]);
+        assert_eq!(at("lane"), [json!(0), json!(1), json!(2)]);
+        assert_eq!(at("prompt_len"), [json!(13), json!(2), json!(9)]);
+        assert!(prompts.iter().all(|p| p["first_divergence"].is_null()));
+        // Tile 3, lanes of 13 / 2 / 9 rows: five passes; the short lane's AR rows share the
+        // later passes.
+        let prefill = &burst["prefill"];
+        assert_eq!(
+            (prefill["steps"].clone(), prefill["rows"].clone()),
+            (json!(5), json!(24))
+        );
+        let passes = prefill["passes"].as_array().unwrap();
+        let shape = passes
+            .iter()
+            .map(|p| {
+                (
+                    p["tiles"].as_u64(),
+                    p["rows"].as_u64(),
+                    p["ar_rows"].as_u64(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            shape,
+            [
+                (Some(3), Some(8), Some(0)),
+                (Some(2), Some(6), Some(1)),
+                (Some(2), Some(6), Some(1)),
+                (Some(1), Some(3), Some(2)),
+                (Some(1), Some(1), Some(2)),
+            ]
+        );
+        assert!(prefill["burst_wall_s"].as_f64().unwrap() >= prefill["wall_s"].as_f64().unwrap());
+        // ids.jsonl names each lane's prompt index and set.
+        let burst_lines: Vec<_> = ids_lines
+            .iter()
+            .filter(|l| l["set"] == json!("burst=3+1+0"))
+            .collect();
+        assert_eq!(
+            burst_lines
+                .iter()
+                .map(|l| l["prompt"].clone())
+                .collect::<Vec<_>>(),
+            [json!(3), json!(1), json!(0)]
+        );
+    }
+
+    #[test]
+    fn twin_lanes_equal_pass_one_differing_row_fails_and_names_lane_and_row() {
+        let a = [5u32, 6, 7];
+        let b = [9u32, 9];
+        let c = [5u32, 6, 8];
+        // Lanes: 0 = a, 1 = b (singleton), 2 = a, 3 = c (singleton), 4 = a.
+        let prompts: Vec<&[u32]> = vec![&a, &b, &a, &c, &a];
+        let row = |tag: &str| -> Vec<String> { (0..4).map(|r| format!("{tag}{r}")).collect() };
+        let ids = |first: u32| -> Vec<u32> { vec![first, 2, 3] };
+        // Singletons carry rows that differ from the twins' (never compared).
+        let run_ids = vec![ids(1), ids(7), ids(1), ids(8), ids(1)];
+        let mut shas = vec![row("t"), row("s"), row("t"), row("u"), row("t")];
+
+        let groups = twin_groups(&prompts, &run_ids, &shas);
+        assert_eq!(
+            groups,
+            [TwinGroup {
+                lanes: vec![0, 2, 4],
+                first_diff: None
+            }]
+        );
+        let j = twins_json(&groups);
+        assert_eq!(
+            (
+                j["groups_total"].clone(),
+                j["groups_equal"].clone(),
+                j["all_equal"].clone()
+            ),
+            (json!(1), json!(1), json!(true))
+        );
+        assert_eq!(twin_failure(&j), None);
+
+        // One AR row sha of lane 4 differs: row 2, lane 4 vs lane 0.
+        shas[4][2] = "bad".into();
+        let groups = twin_groups(&prompts, &run_ids, &shas);
+        assert_eq!(
+            groups[0].first_diff,
+            Some(TwinDiff {
+                lane: 4,
+                vs_lane: 0,
+                row: 2,
+                via: "logits"
+            })
+        );
+        let j = twins_json(&groups);
+        assert_eq!(j["all_equal"], json!(false));
+        assert_eq!(j["groups_equal"], json!(0));
+        assert_eq!(j["groups"][0]["first_diff"]["row"], json!(2));
+        assert_eq!(j["groups"][0]["first_diff"]["lane"], json!(4));
+        assert_eq!(
+            twin_failure(&j).as_deref(),
+            Some("twin lanes [0,2,4]: lane 4 row 2 (logits) differs from lane 0")
+        );
+
+        // The prompt-completing row (index 0) and a differing id are caught too; the earliest
+        // differing lane in group order is the one named.
+        shas[2][0] = "bad0".into();
+        let mut diff_ids = run_ids.clone();
+        diff_ids[4][1] = 99;
+        let groups = twin_groups(&prompts, &diff_ids, &shas);
+        assert_eq!(
+            groups[0].first_diff,
+            Some(TwinDiff {
+                lane: 2,
+                vs_lane: 0,
+                row: 0,
+                via: "logits"
+            })
+        );
+        let same_rows = vec![row("t"); 5];
+        let only_ids = twin_groups(&prompts, &diff_ids, &same_rows);
+        assert_eq!(
+            only_ids[0].first_diff,
+            Some(TwinDiff {
+                lane: 4,
+                vs_lane: 0,
+                row: 1,
+                via: "ids"
+            })
+        );
+    }
+
+    #[test]
+    fn twin_groups_ignore_singletons_and_group_by_prompt_ids_not_index() {
+        let a = [1u32, 2];
+        let b = [3u32];
+        let a2 = a; // a distinct prompt index with equal ids is a twin
+        let prompts: Vec<&[u32]> = vec![&b, &a, &a2];
+        let ids = vec![vec![0u32]; 3];
+        let shas = vec![vec!["x".to_string()]; 3];
+        let groups = twin_groups(&prompts, &ids, &shas);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].lanes, [1, 2]);
+        // Singletons only: no groups, vacuously equal, nothing to fail.
+        let none = twin_groups(&prompts[..2], &ids[..2], &shas[..2]);
+        assert!(none.is_empty());
+        let j = twins_json(&none);
+        assert_eq!(
+            (j["groups_total"].clone(), j["all_equal"].clone()),
+            (json!(0), json!(true))
+        );
+        assert_eq!(twin_failure(&j), None);
+        // A run without logits rows has no twin verdict.
+        assert_eq!(twin_failure(&Value::Null), None);
+    }
+
+    #[test]
+    fn a_diverging_burst_lane_reports_its_row_position_and_labels() {
+        let args = sweep_args("--policies per-lane:moe=once --burst 3,1", "1");
+        let mut backend = FakeLanes::new(4, 3);
+        backend.corrupt = Some(policy_of("per-lane:moe=once"));
+        let (outcomes, _) = sweep(&mut backend, &args);
+        assert_eq!(outcomes[0].status, PolicyStatus::Fail);
+        assert_eq!(
+            outcomes[0].failures,
+            ["K=1 prompt 0", "burst=3+1 prompt 3", "burst=3+1 prompt 1"]
+        );
+        let burst = &outcomes[0].record["runs"][1];
+        assert_eq!(burst["equal"], json!(false));
+        // The prompt-completing pick is right; the first AR pick (row 1) is wrong.
+        let d = &burst["prompts"][0]["first_divergence"];
+        assert_eq!(d["row"], json!(1));
+        assert_eq!(d["position"], json!(13));
+        assert_eq!(d["phase"], json!("decode"));
+        assert_eq!(d["via"], json!("ids"));
+        assert_eq!(
+            burst["prompts"][1]["first_divergence"]["position"],
+            json!(2)
+        );
+    }
+
+    #[test]
+    fn the_burst_stderr_line_carries_lengths_passes_and_the_singleton_sum() {
+        let prompts = prompts();
+        let slices: Vec<&[u32]> = prompts.iter().map(Vec::as_slice).collect();
+        let mut backend = FakeLanes::new(4, 3);
+        let cfg = DriveCfg {
+            prompts: &slices[..2],
+            tokens: 3,
+            max_lanes: 4,
+            row_budget: 4,
+            want_logits: false,
+            dump: None,
+        };
+        let run = drive_k(&mut backend, &cfg, 2, &mut 0).unwrap();
+        let references: Vec<Reference> = prompts.iter().map(|p| reference(p, 3)).collect();
+        let set = RunSet {
+            members: vec![0, 1],
+            burst: true,
+        };
+        let extras = burst_extras(&set, &run, &slices, &references);
+        let compared: Vec<Value> = (0..2)
+            .map(|i| {
+                let ids = &references[i].ids;
+                compared_json(i, prompts[i].len(), i, &compare(ids, ids, None))
+            })
+            .collect();
+        let line = burst_line("p", &set, &run, &compared, &extras);
+        assert!(
+            line.starts_with("[oracle-burst] policy=p set=burst=0+1 lens=[9, 2] prompts_equal=2/2 passes=3 rows=11 "),
+            "{line}"
+        );
+        assert!(line.contains("singleton_sum_ms=11.0"), "{line}");
+        assert!(
+            line.contains("first_divergence(prompt,row,pos)=[]"),
+            "{line}"
+        );
+        // No `--logits` rows in this run: no twin verdict.
+        assert!(line.ends_with(" twins_equal=n/a"), "{line}");
     }
 
     fn sweep(backend: &mut dyn LaneBackend, args: &Args) -> (Vec<PolicyOutcome>, Vec<Value>) {
@@ -2849,5 +5390,462 @@ mod tests {
             .contains("unusable"));
         assert_eq!(sweep_verdict(&outcomes), Verdict::Fail);
         assert!(sweep_summary(&outcomes).contains("[3] production=SKIPPED"));
+    }
+}
+
+// ----------------------------------------------------- spec schema / manifest
+
+#[cfg(test)]
+mod spec_schema_tests {
+    use super::*;
+
+    fn argv(line: &str) -> impl Iterator<Item = String> + '_ {
+        line.split_whitespace().map(str::to_owned)
+    }
+
+    const BASE: &str = "--model /m/m.mq4 --max-seq 4096 --tokens 8 --out /o/x";
+
+    fn files(n: usize) -> String {
+        (0..n)
+            .map(|i| format!(" --prompt-file /p/p{i}.txt"))
+            .collect()
+    }
+
+    fn parse(extra: &str, n_files: usize) -> R<Args> {
+        parse_args_from(argv(&format!(
+            "{BASE} --ks 1{extra}{}",
+            files(n_files.max(1))
+        )))
+    }
+
+    #[test]
+    fn ar_is_the_default_and_carries_no_spec_state() {
+        let args = parse("", 1).unwrap();
+        assert_eq!(args.spec, SpecMode::Ar);
+        assert_eq!(
+            (args.k, args.routes, args.soak_seconds, args.soak_seed),
+            (None, None, None, None)
+        );
+        assert_eq!(args.fault_point, None);
+        assert_eq!(parse(" --spec ar", 1).unwrap(), args);
+        // Every pre-existing flag still parses exactly as before.
+        let full = parse(
+            " --pp 2 --row-budget 3 --skip-model-hash --logits --policies g0 --tokens-sweep 4 --reserve-lanes 8",
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            (full.pp, full.row_budget, full.reserve_lanes),
+            (2, Some(3), Some(8))
+        );
+        assert_eq!(full.spec, SpecMode::Ar);
+    }
+
+    #[test]
+    fn mtp_defaults_and_ranges() {
+        let args = parse(" --spec mtp", 1).unwrap();
+        assert_eq!(args.spec, SpecMode::Mtp);
+        assert_eq!((args.k, args.routes), (Some(3), Some(RoutesArg::Cycle)));
+        assert_eq!(
+            (args.soak_seconds, args.soak_seed, args.fault_point),
+            (None, None, None)
+        );
+        for k in [1usize, 3, 7] {
+            assert_eq!(
+                parse(&format!(" --spec mtp --k {k}"), 1).unwrap().k,
+                Some(k)
+            );
+        }
+        for bad in ["0", "8", "-1", "x", "3.5"] {
+            assert!(
+                parse(&format!(" --spec mtp --k {bad}"), 1).is_err(),
+                "k {bad}"
+            );
+        }
+        for (text, routes) in [
+            ("floor", RoutesArg::Floor),
+            ("cycle", RoutesArg::Cycle),
+            ("batched", RoutesArg::Batched),
+        ] {
+            let args = parse(&format!(" --spec mtp --routes {text}"), 1).unwrap();
+            assert_eq!(args.routes, Some(routes));
+            assert_eq!(routes.name(), text);
+        }
+        assert!(parse(" --spec mtp --routes interleaved", 1).is_err());
+        assert!(parse(" --spec bogus", 1).is_err());
+        assert!(parse(" --spec", 1).is_err());
+    }
+
+    #[test]
+    fn mtp_only_flags_need_spec_mtp() {
+        for flag in [
+            "--k 3",
+            "--routes cycle",
+            "--soak-seconds 60",
+            "--soak-seed 7",
+            "--fault-point repair",
+        ] {
+            let name = flag.split(' ').next().unwrap();
+            let error = parse(&format!(" {flag}"), 1).unwrap_err();
+            assert_eq!(error, format!("{name} needs --spec mtp"), "{flag}");
+            let error = parse(&format!(" --spec ar {flag}"), 1).unwrap_err();
+            assert_eq!(error, format!("{name} needs --spec mtp"), "{flag}");
+        }
+    }
+
+    #[test]
+    fn fault_points_and_soak() {
+        let names = [
+            ("before-draft", FaultPoint::BeforeDraft),
+            ("head-round", FaultPoint::HeadRound),
+            ("target-edge", FaultPoint::TargetEdge),
+            ("repair", FaultPoint::Repair),
+            ("before-publish", FaultPoint::BeforePublish),
+        ];
+        assert_eq!(names.len(), FaultPoint::ALL.len());
+        for (text, point) in names {
+            let args = parse(&format!(" --spec mtp --fault-point {text}"), 1).unwrap();
+            assert_eq!(args.fault_point, Some(point));
+            assert_eq!(point.name(), text);
+        }
+        for bad in ["before_draft", "publish", "BEFORE-DRAFT", ""] {
+            assert!(
+                parse_args_from(
+                    argv(&format!("{BASE} --ks 1 --spec mtp --fault-point"))
+                        .chain([bad.to_string()])
+                        .chain(argv(&files(1)))
+                )
+                .is_err(),
+                "accepted fault point {bad:?}"
+            );
+        }
+        let soak = parse(" --spec mtp --k 7 --routes cycle --soak-seconds 1800", 1).unwrap();
+        assert_eq!(
+            (soak.soak_seconds, soak.soak_seed),
+            (Some(1800), Some(DEFAULT_SOAK_SEED))
+        );
+        let seeded = parse(" --spec mtp --soak-seconds 60 --soak-seed 99", 1).unwrap();
+        assert_eq!(seeded.soak_seed, Some(99));
+        assert!(parse(" --spec mtp --soak-seconds 0", 1).is_err());
+        assert!(parse(" --spec mtp --soak-seed 5", 1)
+            .unwrap_err()
+            .contains("--soak-seconds"));
+        let both = parse(" --spec mtp --soak-seconds 60 --fault-point repair", 1).unwrap_err();
+        assert!(both.contains("exclusive"), "{both}");
+    }
+
+    #[test]
+    fn multiple_prompt_files_are_preserved_in_order() {
+        let args = parse_args_from(argv(&format!(
+            "{BASE} --ks 1,8 --pp 2 --spec mtp --k 3 --routes cycle{}",
+            files(8)
+        )))
+        .unwrap();
+        assert_eq!(args.ks, vec![1, 8]);
+        assert_eq!(args.prompt_files.len(), 8);
+        assert_eq!(args.prompt_files[0], "/p/p0.txt");
+        assert_eq!(args.prompt_files[7], "/p/p7.txt");
+        let few = parse_args_from(argv(&format!("{BASE} --ks 1,8 --spec mtp{}", files(4))));
+        assert!(few.unwrap_err().contains("at least 8 --prompt-file"));
+    }
+
+    #[test]
+    fn expanded_argv_round_trips_to_the_same_args() {
+        let cwd = Path::new("/work");
+        for extra in [
+            "",
+            " --pp 2 --row-budget 5 --logits --skip-model-hash --tokens-sweep 3 --reserve-lanes 8",
+            " --policies g0",
+            " --policies per-lane;per-lane:moe=once;production",
+            " --spec mtp",
+            " --elastic 1280",
+            " --spec mtp --k 5 --elastic 512 --elastic-cycle",
+            " --spec mtp --k 7 --routes batched",
+            " --spec mtp --k 7 --routes cycle --soak-seconds 1800 --soak-seed 42",
+            " --spec mtp --k 1 --routes floor --fault-point head-round",
+        ] {
+            let args = parse_args_from(
+                argv(&format!("{BASE} --ks 1,2{}", files(2))).chain(
+                    extra
+                        .split(' ')
+                        .filter(|w| !w.is_empty())
+                        .map(str::to_owned),
+                ),
+            )
+            .unwrap();
+            let expanded = expanded_argv(&args, cwd);
+            let reparsed = parse_args_from(expanded.iter().cloned()).unwrap();
+            assert_eq!(reparsed, args, "{extra}");
+        }
+    }
+
+    /// `--elastic MIB` is a positive MiB count on a non-PP load and `--elastic-cycle` needs it.
+    #[test]
+    fn the_elastic_lab_flags_parse_and_validate() {
+        let line = format!("{BASE} --ks 1 --elastic 1280 --elastic-cycle{}", files(1));
+        let args = parse_args_from(argv(&line)).unwrap();
+        assert_eq!((args.elastic, args.elastic_cycle), (Some(1280), true));
+        let line = format!("{BASE} --ks 1{}", files(1));
+        let args = parse_args_from(argv(&line)).unwrap();
+        assert_eq!((args.elastic, args.elastic_cycle), (None, false));
+        for (flags, want) in [
+            ("--elastic 0", "--elastic must be at least 1 MiB"),
+            ("--elastic-cycle", "--elastic-cycle needs --elastic"),
+            ("--elastic 64 --pp 2", "--elastic is an EP lab flag"),
+        ] {
+            let line = format!("{BASE} --ks 1 {flags}{}", files(1));
+            assert_eq!(parse_args_from(argv(&line)).unwrap_err(), want, "{flags}");
+        }
+        let line = format!("{BASE} --ks 1 --elastic lots{}", files(1));
+        assert!(parse_args_from(argv(&line)).is_err());
+        let line = format!("{BASE} --ks 1{} --elastic", files(1));
+        assert_eq!(
+            parse_args_from(argv(&line)).unwrap_err(),
+            "--elastic needs a value"
+        );
+    }
+
+    #[test]
+    fn expanded_argv_makes_paths_absolute_and_fills_defaults() {
+        let args = parse_args_from(argv(
+            "--model rel/m.mq4 --max-seq 4096 --tokens 8 --out rel/out --ks 1 --prompt-file rel/a.txt",
+        ))
+        .unwrap();
+        let line = expanded_command("/bin/oracle", &expanded_argv(&args, Path::new("/work")));
+        assert!(
+            line.starts_with("/bin/oracle --model /work/rel/m.mq4 "),
+            "{line}"
+        );
+        for want in [
+            "--prompt-file /work/rel/a.txt",
+            "--out /work/rel/out",
+            "--pp 1",
+            "--spec ar",
+            "--ks 1",
+        ] {
+            assert!(line.contains(want), "{want} not in {line}");
+        }
+        assert!(
+            !line.contains("--policies"),
+            "default policy is not spelled out"
+        );
+    }
+
+    #[test]
+    fn shell_words_are_quoted_only_when_needed() {
+        assert_eq!(shell_quote("--model"), "--model");
+        assert_eq!(shell_quote("/a/b-c_d.e,f=g:h"), "/a/b-c_d.e,f=g:h");
+        assert_eq!(shell_quote("per-lane;production"), "'per-lane;production'");
+        assert_eq!(shell_quote("a b"), "'a b'");
+        assert_eq!(shell_quote("it's"), r"'it'\''s'");
+        assert_eq!(shell_quote(""), "''");
+    }
+
+    fn fixture(index: usize, sha: &str) -> Value {
+        json!({"index": index, "sha256": sha})
+    }
+
+    #[test]
+    fn manifest_records_command_fixtures_binary_and_spec() {
+        let args = parse_args_from(argv(&format!(
+            "{BASE} --ks 1,2 --spec mtp --k 7 --routes cycle --soak-seconds 90{}",
+            files(2)
+        )))
+        .unwrap();
+        let env = serde_json::Map::from_iter([("HIPFIRE_TOPOLOGY_EP".to_string(), json!("2"))]);
+        let manifest = build_manifest(
+            &args,
+            &["--model".to_string()],
+            "/bin/oracle",
+            "deadbeef",
+            Path::new("/work"),
+            vec![fixture(0, "aa"), fixture(1, "bb")],
+            env,
+        );
+        assert_eq!(manifest["tool"], json!(TOOL));
+        assert_eq!(manifest["binary"]["sha256"], json!("deadbeef"));
+        assert_eq!(manifest["binary"]["path"], json!("/bin/oracle"));
+        assert_eq!(manifest["model"]["sha256"], json!("pending"));
+        assert_eq!(manifest["prompts"].as_array().unwrap().len(), 2);
+        assert_eq!(manifest["distinct_prompts"], json!(2));
+        assert_eq!(manifest["spec"]["spec"], json!("mtp"));
+        assert_eq!(manifest["spec"]["k"], json!(7));
+        assert_eq!(manifest["spec"]["routes"], json!("cycle"));
+        assert_eq!(manifest["spec"]["soak_seconds"], json!(90));
+        assert_eq!(manifest["spec"]["soak_seed"], json!(DEFAULT_SOAK_SEED));
+        assert_eq!(manifest["env"]["HIPFIRE_TOPOLOGY_EP"], json!("2"));
+        assert_eq!(manifest["completed"], json!(false));
+        let command = manifest["command"].as_str().unwrap();
+        for want in ["--spec mtp", "--k 7", "--routes cycle", "--soak-seconds 90"] {
+            assert!(command.contains(want), "{want} not in {command}");
+        }
+        // Skipping the hash records null, never "pending".
+        let skipped = parse_args_from(argv(&format!(
+            "{BASE} --ks 1 --skip-model-hash{}",
+            files(1)
+        )))
+        .unwrap();
+        let manifest = build_manifest(
+            &skipped,
+            &[],
+            "/bin/oracle",
+            "x",
+            Path::new("/work"),
+            vec![fixture(0, "aa")],
+            serde_json::Map::new(),
+        );
+        assert_eq!(manifest["model"]["sha256"], Value::Null);
+        assert_eq!(manifest["distinct_prompts"], json!(1));
+    }
+
+    #[test]
+    fn manifest_finalization_takes_the_runs_outcome() {
+        let mut manifest = json!({"model": {"sha256": "pending"}, "completed": false});
+        let report = json!({
+            "model_sha256": "abc123",
+            "completed": true,
+            "verdict": "PASS",
+        });
+        finalize_manifest(&mut manifest, &report);
+        assert_eq!(manifest["model"]["sha256"], json!("abc123"));
+        assert_eq!(manifest["completed"], json!(true));
+        assert_eq!(manifest["verdict"], json!("PASS"));
+        // An error run without a model hash keeps the pending marker.
+        let mut manifest = json!({"model": {"sha256": "pending"}, "completed": false});
+        finalize_manifest(&mut manifest, &json!({"completed": false, "error": "boom"}));
+        assert_eq!(manifest["model"]["sha256"], json!("pending"));
+        assert_eq!(manifest["error"], json!("boom"));
+        let mut absent = Value::Null;
+        finalize_manifest(&mut absent, &report);
+        assert!(absent.is_null());
+    }
+
+    #[test]
+    fn mtp_execution_is_an_explicit_boundary_and_ar_is_not() {
+        let ar = parse("", 1).unwrap();
+        ensure_spec_supported(&ar).unwrap();
+        // The EP greedy matrix executes; soak, fault points and PP refuse.
+        ensure_spec_supported(&parse(" --spec mtp", 1).unwrap()).unwrap();
+        ensure_spec_supported(&parse(" --spec mtp --k 7 --routes batched", 1).unwrap()).unwrap();
+        for extra in [
+            " --spec mtp --pp 2",
+            " --spec mtp --k 7 --routes cycle --soak-seconds 1800",
+            " --spec mtp --fault-point target-edge",
+        ] {
+            let error = ensure_spec_supported(&parse(extra, 1).unwrap()).unwrap_err();
+            assert!(error.contains("not yet implemented by S3/S5"), "{error}");
+            assert!(error.contains("not a pass"), "{error}");
+            assert!(error.starts_with(TOOL), "{error}");
+        }
+        let soak = ensure_spec_supported(&parse(" --spec mtp --soak-seconds 5", 1).unwrap());
+        assert!(soak.unwrap_err().contains("soak=5s"));
+        let fault = ensure_spec_supported(&parse(" --spec mtp --fault-point repair", 1).unwrap());
+        assert!(fault.unwrap_err().contains("fault-point=repair"));
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("{TOOL}-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn fixture_records_hash_each_prompt_file() {
+        let dir = scratch("fixtures");
+        std::fs::write(dir.join("a.txt"), b"abc").unwrap();
+        std::fs::write(dir.join("b.txt"), b"").unwrap();
+        let line = format!(
+            "{BASE} --ks 2 --prompt-file {} --prompt-file {}",
+            dir.join("a.txt").display(),
+            dir.join("b.txt").display()
+        );
+        let args = parse_args_from(argv(&line)).unwrap();
+        let records = fixture_records(&args, Path::new("/")).unwrap();
+        assert_eq!(records[0]["bytes"], json!(3));
+        assert_eq!(
+            records[0]["sha256"],
+            json!("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        );
+        assert_eq!(
+            records[1]["sha256"],
+            json!("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+        );
+        let missing = parse_args_from(argv(&format!(
+            "{BASE} --ks 1 --prompt-file {}",
+            dir.join("nope.txt").display()
+        )))
+        .unwrap();
+        assert!(fixture_records(&missing, Path::new("/"))
+            .unwrap_err()
+            .contains("nope.txt"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `--spec mtp` through the real `run`: no model is loaded, the refusal is
+    /// recorded in report.json, and manifest.json carries the expanded command,
+    /// fixture hashes and binary sha.
+    #[test]
+    fn mtp_run_refuses_without_loading_and_leaves_receipts() {
+        let dir = scratch("run");
+        std::fs::write(dir.join("p0.txt"), b"abc").unwrap();
+        std::fs::write(dir.join("p1.txt"), b"abd").unwrap();
+        let out = dir.join("out");
+        let line = format!(
+            "--model {m} --max-seq 4096 --tokens 8 --ks 2 --pp 2 --spec mtp --k 3 --routes cycle --out {o} --prompt-file {a} --prompt-file {b}",
+            m = dir.join("m.mq4").display(),
+            o = out.display(),
+            a = dir.join("p0.txt").display(),
+            b = dir.join("p1.txt").display(),
+        );
+        let args = parse_args_from(argv(&line)).unwrap();
+        let error = match run(args) {
+            Err(error) => error,
+            Ok(_) => panic!("--spec mtp must not produce a verdict"),
+        };
+        assert!(error.contains("not yet implemented by S3/S5"), "{error}");
+        let read = |name: &str| -> Value {
+            serde_json::from_slice(&std::fs::read(out.join(name)).unwrap()).unwrap()
+        };
+        let report = read("report.json");
+        assert_eq!(report["completed"], json!(false));
+        assert!(report["error"].as_str().unwrap().contains("S3/S5"));
+        assert_eq!(report["manifest"], json!("manifest.json"));
+        assert_eq!(report["spec"]["spec"], json!("mtp"));
+        assert!(report.get("verdict").is_none(), "a refusal has no verdict");
+        assert!(out.join("ids.jsonl").exists());
+        let manifest = read("manifest.json");
+        let prompts = manifest["prompts"].as_array().unwrap();
+        assert_eq!(prompts.len(), 2);
+        assert_eq!(
+            prompts[0]["sha256"],
+            json!("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        );
+        assert_ne!(prompts[0]["sha256"], prompts[1]["sha256"]);
+        assert_eq!(manifest["distinct_prompts"], json!(2));
+        assert_eq!(manifest["binary"]["sha256"].as_str().unwrap().len(), 64);
+        assert_eq!(manifest["completed"], json!(false));
+        assert!(manifest["error"].as_str().unwrap().contains("S3/S5"));
+        let command = manifest["command"].as_str().unwrap();
+        assert!(
+            command.contains("--spec mtp --k 3 --routes cycle"),
+            "{command}"
+        );
+        // The recorded command re-parses to the invocation it records.
+        let expanded: Vec<String> = manifest["expanded_argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|word| word.as_str().unwrap().to_string())
+            .collect();
+        let reparsed = parse_args_from(expanded.into_iter()).unwrap();
+        assert_eq!(
+            (reparsed.spec, reparsed.k, reparsed.pp),
+            (SpecMode::Mtp, Some(3), 2)
+        );
+        // A second run into the same DIR is refused, as before.
+        let again = parse_args_from(argv(&line)).unwrap();
+        assert!(run(again).unwrap_err().contains("already exists"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

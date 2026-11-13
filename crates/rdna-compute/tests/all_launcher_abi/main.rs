@@ -1071,6 +1071,111 @@ fn tuple_match_kernel_selectors_check_every_arm_and_fail_closed() {
 }
 
 #[test]
+fn tuple_let_match_projects_each_name_and_skips_only_diverging_arms() {
+    // `let (first, second) = match ..` : `first` stands for the first component of every
+    // value arm and `second` for the second. The two components have DIFFERENT ABIs, so any
+    // overapproximation (a name checked against the other component's kernels) fails.
+    let source = |arms: &str| {
+        format!(
+            "fn launch(gpu: &Gpu, sym: &str, args: &mut KernargBlob) {{
+                gpu.launch_kernel_blob(sym, g, bl, 0, args.as_mut_slice()).unwrap();
+            }}
+            fn run(gpu: &Gpu, fmt: Fmt, wide: bool) -> Result<(), HipError> {{
+                {SMALL_LETS}
+                let (first, second) = match fmt {{ {arms} }};
+                let mut b = KernargBlob::new();
+                b.push_ptr(wp); b.push_i32(nv); b.push_f32(sc); b.push_u64(big);
+                let mut c = KernargBlob::new();
+                c.push_ptr(wp); c.push_i32(nv); c.push_f32(sc); c.push_u64(big); c.push_i32(nv);
+                launch(gpu, first, &mut b);
+                launch(gpu, second, &mut c);
+                Ok(())
+            }}"
+        )
+    };
+    let first_decl = small_decl;
+    let second_decl = || Decl::from_scalars(&[(8, 'p'), (4, 'i'), (4, 'f'), (8, 'i'), (4, 'i')]);
+    let symbols = |names: &[&'static str]| -> Vec<(&'static str, Decl)> {
+        names
+            .iter()
+            .map(|n| {
+                (
+                    *n,
+                    if n.starts_with("p_") {
+                        first_decl()
+                    } else {
+                        second_decl()
+                    },
+                )
+            })
+            .collect()
+    };
+    let ab = ["p_a", "s_a", "p_b", "s_b"];
+    let abc = ["p_a", "s_a", "p_b", "s_b", "p_c", "s_c"];
+    let positive: [(&str, &[&'static str]); 3] = [
+        // A block `return` arm (the QSA lane selector shape).
+        (
+            r#"Fmt::A => ("p_a", "s_a"), Fmt::B => ("p_b", "s_b"),
+               other => { return refuse(other, "no_such_kernel") }"#,
+            &ab,
+        ),
+        // A comma-less block arm, then a block arm that ends in `return ..;`.
+        (
+            r#"Fmt::A => { ("p_a", "s_a") }
+               Fmt::B => ("p_b", "s_b"),
+               other => { log(other); return Err("no_such_kernel".into()); }"#,
+            &ab,
+        ),
+        // A bare `return` arm, plus a nested `if` arm that itself yields tuples.
+        (
+            r#"Fmt::C => return Err("no_such_kernel"),
+               Fmt::A => ("p_a", "s_a"),
+               Fmt::B => if wide { ("p_b", "s_b") } else { ("p_c", "s_c") },"#,
+            &abc,
+        ),
+    ];
+    for (arms, names) in positive {
+        let src = source(arms);
+        let (abi, cov) = run_synth_at(PROBE_PATH, &src, &symbols(names), &no_policy());
+        assert!(abi.is_empty() && cov.is_empty(), "{arms}: {abi:?} {cov:?}");
+        // Every candidate name of each component is still checked against its own ABI.
+        for (index, name) in names.iter().enumerate() {
+            let mut bad = symbols(names);
+            bad[index].1 = if name.starts_with("p_") {
+                second_decl()
+            } else {
+                first_decl()
+            };
+            let (abi, cov) = run_synth_at(PROBE_PATH, &src, &bad, &no_policy());
+            assert!(
+                abi.iter().chain(&cov).any(|p| p.contains(name)),
+                "{name} escaped checking in {arms}: {abi:?} {cov:?}"
+            );
+        }
+    }
+    // Conservative fallback: an arm that neither projects nor provably diverges makes the
+    // whole initialiser the origin again, so the cross-component mismatch (or the
+    // unresolved name) is reported instead of being silently dropped.
+    let fallback = [
+        // A non-diverging block ending in an opaque expression.
+        r#"Fmt::A => ("p_a", "s_a"), Fmt::B => ("p_b", "s_b"),
+           other => { log(other); fallback_pair }"#,
+        // A call that merely looks like a refusal does not diverge.
+        r#"Fmt::A => ("p_a", "s_a"), Fmt::B => ("p_b", "s_b"),
+           other => { refuse(other) }"#,
+        // An arm without the component: tuple of the wrong arity.
+        r#"Fmt::A => ("p_a", "s_a"), Fmt::B => ("p_b", "s_b"), other => ("p_b",),"#,
+    ];
+    for arms in fallback {
+        let (abi, cov) = run_synth_at(PROBE_PATH, &source(arms), &symbols(&ab), &no_policy());
+        assert!(
+            !abi.is_empty() || !cov.is_empty(),
+            "an unprojectable arm must fall back to the whole initialiser: {arms}"
+        );
+    }
+}
+
+#[test]
 fn negative_blob_layout_and_alignment_mistakes_are_rejected() {
     let good = "            b.push_ptr(wp);\n            b.push_i32(nv);\n            b.push_f32(sc);\n            b.push_u64(big);\n";
     let (abi, cov) = run_synth(
@@ -3564,5 +3669,855 @@ fn canonical_params_map_checks_actual_few_row_launchers_against_hip() {
     eprintln!(
         "actual few-row checked sites={} covered={:?}",
         analysis.checked_sites, analysis.covered
+    );
+}
+
+// ---- gfx942 BF16 MFMA GEMM: tiled + few-row (rows16) entries ------------------------
+
+const GEMM_BF16_MFMA_SRC: &str = "kernels/src/gemm_bf16_mfma.gfx942.hip";
+const GEMM_BF16_MFMA_TILED: &str = "gemm_bf16_mfma_gfx942";
+const GEMM_BF16_MFMA_ROWS16: &str = "gemm_bf16_mfma_gfx942_rows16";
+const GEMM_BF16_MFMA_ROWS16_X2: &str = "gemm_bf16_mfma_gfx942_rows16_x2";
+
+/// The two real launchers (`launch_gemm_bf16_mfma_tiled`, `launch_gemm_bf16_mfma_rows16`)
+/// against the HIP source's own declarations, with only gemm.rs scanned. The few-row
+/// entries are macro-defined (`R16_ENTRY`), the 104-byte params array is built from
+/// `[x; N]` arrays and the blob from `.iter().chain(..)` / by-value loops over them.
+#[test]
+fn gemm_bf16_mfma_launchers_check_against_the_hip_source_declarations() {
+    let root = root();
+    let inv = load_inventory();
+    assert!(
+        strings(&inv, "hip_sources")
+            .iter()
+            .any(|f| f == GEMM_BF16_MFMA_SRC),
+        "{GEMM_BF16_MFMA_SRC} must be a changed HIP source of the gate"
+    );
+    let paths = vec!["crates/rdna-compute/src/gemm.rs".to_string()];
+    let world = World::load(&root, &paths).expect("gemm.rs parses");
+    let source = std::fs::read_to_string(root.join(GEMM_BF16_MFMA_SRC)).unwrap();
+    let decls = hip::decls_of(&source).expect("actual gemm_bf16_mfma HIP declarations");
+    let names = [
+        GEMM_BF16_MFMA_TILED,
+        GEMM_BF16_MFMA_ROWS16,
+        GEMM_BF16_MFMA_ROWS16_X2,
+    ];
+    assert_eq!(
+        decls.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+        names.iter().copied().collect::<BTreeSet<_>>(),
+        "the source must export exactly the tiled, rows16 and rows16_x2 kernels"
+    );
+    // The few-row ABI: nine pointers (X, A0..A3, D0..D3) then eight i32 (M0..M3, K,
+    // batch, x_f32, d_bf16_mask) = 104 explicit bytes, identical for both entries.
+    for n in [GEMM_BF16_MFMA_ROWS16, GEMM_BF16_MFMA_ROWS16_X2] {
+        let d = &decls[n];
+        assert_eq!(d.args.len(), 17, "{n}");
+        assert_eq!(d.end, 104, "{n}");
+        assert_eq!(d.args.iter().filter(|a| a.kind == 'p').count(), 9, "{n}");
+        assert!(
+            d.args[..9].iter().all(|a| a.kind == 'p' && a.size == 8),
+            "{n}"
+        );
+        assert!(
+            d.args[9..].iter().all(|a| a.kind == 'i' && a.size == 4),
+            "{n}"
+        );
+        assert_eq!(d.args[9].offset, 72, "{n}");
+    }
+    assert!(
+        hip::same_layout(
+            &decls[GEMM_BF16_MFMA_ROWS16],
+            &decls[GEMM_BF16_MFMA_ROWS16_X2]
+        ),
+        "rows16 and rows16_x2 share one ABI"
+    );
+    assert_eq!(decls[GEMM_BF16_MFMA_TILED].args.len(), 6);
+    assert_eq!(decls[GEMM_BF16_MFMA_TILED].end, 36);
+    let mut symbols = Symbols::default();
+    for n in names {
+        symbols.hip.insert(
+            n.to_string(),
+            vec![("actual HIP".to_string(), decls[n].clone())],
+        );
+    }
+    let analysis = analyze(&world, &symbols, &no_policy());
+    let (abi, coverage) = violations(&analysis, &no_policy());
+    assert!(
+        abi.is_empty() && coverage.is_empty(),
+        "actual gemm_bf16_mfma launchers: {abi:?} {coverage:?}"
+    );
+    for n in names {
+        assert!(
+            analysis.covered.contains(n),
+            "actual live launch not checked: {n}"
+        );
+    }
+    assert!(
+        analysis.checked_sites >= 2,
+        "both real launch sites (tiled and rows16) must be checked"
+    );
+    assert!(
+        analysis.checked_pairs >= 3,
+        "the rows16 site is checked against rows16 and rows16_x2, the tiled site against the tile entry"
+    );
+    eprintln!(
+        "actual gemm_bf16_mfma checked sites={} pairs={} covered={:?}",
+        analysis.checked_sites, analysis.checked_pairs, analysis.covered
+    );
+}
+
+/// A non-production PM twin keeps the HIP entry names. It is checked only for ABI
+/// parity of its embedded metadata with the HIP declaration, and the HIP kernels it
+/// shadows must be reached by the gate's checked live launchers.
+#[test]
+fn non_production_pm_twins_match_the_hip_declarations() {
+    let f = &*FIXTURE;
+    let twins = f.inv["pm_twins"]
+        .as_object()
+        .expect("inventory key `pm_twins` must be an object");
+    assert!(!twins.is_empty(), "pm_twins must list the committed twin");
+    let hip_sources = strings(&f.inv, "hip_sources");
+    let mut production = strings(&f.inv, "pm_images");
+    production.extend(strings(&f.inv, "pm_related_images"));
+    let kernels_text = std::fs::read_to_string(f.root.join(KERNELS_RS)).unwrap();
+    let mut problems: Vec<String> = Vec::new();
+    for (image, v) in twins {
+        let reason = v["reason"]
+            .as_str()
+            .unwrap_or_else(|| panic!("pm_twins.{image}.reason"));
+        assert!(!reason.trim().is_empty(), "pm_twins.{image} needs a reason");
+        let src = v["hip_source"]
+            .as_str()
+            .unwrap_or_else(|| panic!("pm_twins.{image}.hip_source"));
+        let anchor = v["anchor"]
+            .as_str()
+            .unwrap_or_else(|| panic!("pm_twins.{image}.anchor"));
+        let symbols = strings(v, "symbols");
+        assert!(
+            hip_sources.iter().any(|h| h == src),
+            "{image}: hip_source {src} is not a changed HIP source"
+        );
+        assert!(
+            !production.contains(image),
+            "{image}: a pm_twins entry is not a production image (pm_images)"
+        );
+        let base = image.rsplit('/').next().unwrap();
+        assert!(
+            !kernels_text.contains(base),
+            "{image}: embedded by kernels.rs, so it is a production image: move it to pm_images"
+        );
+        let hip = hip::decls_of(
+            &std::fs::read_to_string(f.root.join(src)).unwrap_or_else(|e| panic!("{src}: {e}")),
+        )
+        .unwrap_or_else(|e| panic!("{src}: {e}"));
+        // Every twin symbol is a HIP symbol launched by a checked live launcher.
+        for s in &symbols {
+            assert!(
+                f.analysis.covered.contains(s),
+                "{image}: `{s}` is reached by no checked live launcher"
+            );
+        }
+        // Full-object twin: every HIP kernel export retains its declared ABI.
+        let twin_bytes =
+            std::fs::read(f.root.join(image)).unwrap_or_else(|e| panic!("{image}: {e}"));
+        let twin = read_gfx942_object(&twin_bytes).unwrap_or_else(|e| panic!("{image}: {e}"));
+        let got: BTreeSet<String> = twin.keys().cloned().collect();
+        // Full ELF identity: the sealed twin carries every kernel of the source object.
+        let all_hip: Vec<String> = hip.keys().cloned().collect();
+        let want: BTreeSet<String> = all_hip.iter().cloned().collect();
+        if got != want {
+            problems.push(format!(
+                "{image}: exports {got:?}, the HIP source declares {want:?}"
+            ));
+        }
+        for s in &symbols {
+            if !want.contains(s) {
+                problems.push(format!("{image}: listed symbol `{s}` is not a HIP kernel"));
+            }
+        }
+        problems.extend(twin_problems(image, &twin, &hip, &all_hip));
+        // The portable anchor is the hipcc object of the whole source: every kernel.
+        let anchor_bytes =
+            std::fs::read(f.root.join(anchor)).unwrap_or_else(|e| panic!("{anchor}: {e}"));
+        let anchor_kernels =
+            read_gfx942_object(&anchor_bytes).unwrap_or_else(|e| panic!("{anchor}: {e}"));
+        let all: Vec<String> = hip.keys().cloned().collect();
+        let got: BTreeSet<String> = anchor_kernels.keys().cloned().collect();
+        let want: BTreeSet<String> = all.iter().cloned().collect();
+        if got != want {
+            problems.push(format!(
+                "{anchor}: exports {got:?}, the HIP source declares {want:?}"
+            ));
+        }
+        problems.extend(twin_problems(anchor, &anchor_kernels, &hip, &all));
+    }
+    assert!(
+        problems.is_empty(),
+        "PM twin ABI problems:\n{}",
+        problems.join("\n")
+    );
+}
+
+fn twin_kernel(decl: &Decl, names: &[&str]) -> Gfx942Kernel {
+    Gfx942Kernel {
+        decl: decl.clone(),
+        names: names.iter().map(|s| s.to_string()).collect(),
+        segment: decl.end + 16,
+        hidden_start: Some(decl.end),
+    }
+}
+
+#[test]
+fn negative_pm_twin_parity_rejects_layout_name_extent_and_export_drift() {
+    let hip = hip::decls_of(
+        "extern \"C\" __global__ void k(const void* __restrict__ X, int n, float s) {}\n",
+    )
+    .expect("parse");
+    let symbols = vec!["k".to_string()];
+    let names = ["X", "n", "s"];
+    let run = |kernel: Gfx942Kernel| {
+        let mut kernels = BTreeMap::new();
+        kernels.insert("k".to_string(), kernel);
+        twin_problems("twin", &kernels, &hip, &symbols)
+    };
+    assert!(
+        run(twin_kernel(&hip["k"], &names)).is_empty(),
+        "the faithful twin must pass"
+    );
+    let mut resized = twin_kernel(&hip["k"], &names);
+    resized.decl.args[1].size = 8;
+    assert!(!run(resized).is_empty(), "a resized argument must fail");
+    let mut scalar = twin_kernel(&hip["k"], &names);
+    scalar.decl.args[0].kind = 'v';
+    assert!(
+        !run(scalar).is_empty(),
+        "a pointer declared by value must fail"
+    );
+    let mut shifted = twin_kernel(&hip["k"], &names);
+    shifted.decl.args[2].offset += 4;
+    assert!(!run(shifted).is_empty(), "a shifted argument must fail");
+    let mut dropped = twin_kernel(&hip["k"], &names);
+    dropped.decl.args.pop();
+    assert!(!run(dropped).is_empty(), "a dropped argument must fail");
+    assert!(
+        !run(twin_kernel(&hip["k"], &["X", "n", "t"])).is_empty(),
+        "a renamed argument must fail"
+    );
+    let mut short = twin_kernel(&hip["k"], &names);
+    short.segment = short.decl.end - 4;
+    assert!(!run(short).is_empty(), "a short kernarg segment must fail");
+    let mut hidden = twin_kernel(&hip["k"], &names);
+    hidden.hidden_start = Some(8);
+    assert!(
+        !run(hidden).is_empty(),
+        "a hidden argument inside the explicit bytes must fail"
+    );
+    assert!(
+        !twin_problems("twin", &BTreeMap::new(), &hip, &symbols).is_empty(),
+        "a missing export must fail"
+    );
+    assert!(
+        !twin_problems("twin", &BTreeMap::new(), &hip, &["absent".to_string()]).is_empty(),
+        "a symbol without a HIP declaration must fail"
+    );
+}
+
+#[test]
+fn hip_expands_kernel_defining_function_macros_and_fails_closed() {
+    let src = "#define THREADS (64 + 512)\n#define ENTRY(NAME, XI) \\\nextern \"C\" __global__ __launch_bounds__(THREADS, 2) \\\nvoid NAME(const void* __restrict__ X, const bf16_t* __restrict__ A0, int K, int x_f32) { body<XI>(X, A0, K, x_f32); }\nENTRY(k_one, 1)\nENTRY(k_two, 2)\n#undef ENTRY\n";
+    let d = hip::decls_of(src).expect("parse");
+    for name in ["k_one", "k_two"] {
+        let k = d
+            .get(name)
+            .unwrap_or_else(|| panic!("macro-defined kernel {name} must be declared"));
+        let layout: Vec<(u32, u32)> = k.args.iter().map(|a| (a.offset, a.size)).collect();
+        assert_eq!(layout, vec![(0, 8), (8, 8), (16, 4), (20, 4)], "{name}");
+        assert_eq!(k.end, 24, "{name}");
+    }
+    assert_eq!(d.len(), 2);
+    for bad in [
+        src.replace("ENTRY(k_two, 2)", "ENTRY(k_two)"),
+        src.replace("ENTRY(k_two, 2)", "ENTRY(k_two, 2"),
+        src.replace("#define ENTRY(NAME, XI)", "#define ENTRY(NAME, ...)"),
+        src.replace("void NAME(", "void #NAME("),
+        src.replace("ENTRY(k_two, 2)", "ENTRY(\"k_two\", 2)"),
+        src.replace("ENTRY(k_two, 2)", "ENTRY"),
+    ] {
+        assert!(
+            hip::decls_of(&bad).is_err(),
+            "unmodelled kernel macro must fail closed: {bad}"
+        );
+    }
+    // A function-like macro that does not define a kernel is left as written.
+    let plain = "#define HELPER(a, b) a + b\nextern \"C\" __global__ void k(int n) { int z = HELPER(n, 2); }\n";
+    assert!(hip::decls_of(plain).expect("parse").contains_key("k"));
+}
+
+#[test]
+fn hip_kernel_macro_token_pastes_use_raw_arguments_and_fail_closed() {
+    let src = "#define R 8\n#define ENTRY(R) extern \"C\" __global__ void kernel_r##R(float* p, int n) {}\nENTRY(2)\nENTRY(R)\n";
+    let declarations = hip::decls_of(src).unwrap();
+    assert_eq!(declarations.len(), 2);
+    assert!(declarations.contains_key("kernel_r2"));
+    assert!(
+        declarations.contains_key("kernel_rR"),
+        "paste operands are not macro-expanded first"
+    );
+    assert!(!declarations.contains_key("kernel_r8"));
+    let spaced = src.replace("kernel_r##R", "kernel_ ## r ## R");
+    assert!(hip::decls_of(&spaced).unwrap().contains_key("kernel_r2"));
+    for bad in [
+        src.replace("kernel_r##R", "kernel_r##"),
+        src.replace("kernel_r##R", "##R"),
+        src.replace("kernel_r##R", "kernel_r#R"),
+        src.replace("ENTRY(2)", "ENTRY(2 + 1)"),
+        src.replace("ENTRY(2)", "ENTRY()"),
+        src.replace("ENTRY(2)", "ENTRY(2.0)"),
+        src.replace("ENTRY(2)", "ENTRY(\"2\")"),
+    ] {
+        assert!(hip::decls_of(&bad).is_err(), "{bad}");
+    }
+    let source =
+        std::fs::read_to_string(root().join("kernels/src/qwen4_g942_hc_gates.gfx942.hip")).unwrap();
+    let actual = hip::decls_of(&source).unwrap();
+    assert_eq!(actual.len(), 7);
+    for rows in 2..=8 {
+        let declaration = &actual[&format!("gemv_bf16_xf32_k4_rows_tiled_r{rows}")];
+        assert_eq!(declaration.end, 40);
+        assert_eq!(
+            declaration
+                .args
+                .iter()
+                .map(|a| (a.offset, a.size, a.kind))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, 8, 'p'),
+                (8, 8, 'p'),
+                (16, 8, 'p'),
+                (24, 4, 'i'),
+                (28, 4, 'i'),
+                (32, 4, 'f'),
+                (36, 4, 'i')
+            ]
+        );
+    }
+}
+
+// ---- `[x; N]` repeat arrays and `.iter().chain(..)` loops ----------------------------
+
+fn repeat_array_source() -> String {
+    r#"const MAX: usize = 2;
+impl Gpu {
+    fn few(&mut self, x: *mut c_void, members: &[(*mut c_void, usize)]) -> HipResult<()> {
+        let mut ptrs = [std::ptr::null_mut::<c_void>(); MAX];
+        let mut dims = [0i32; MAX];
+        for (j, &(p, m)) in members.iter().enumerate() {
+            ptrs[j] = p;
+            dims[j] = m as i32;
+        }
+        let k_i32 = 7i32;
+        let mut params: Vec<*mut c_void> = vec![&x as *const _ as *mut c_void];
+        params.extend(ptrs.iter().map(|p| p as *const _ as *mut c_void));
+        params.extend(dims.iter().map(|n| n as *const _ as *mut c_void));
+        params.extend([&k_i32 as *const _ as *mut c_void]);
+        self.launch_maybe_blob("repeat_symbol", g, bl, 0, &mut params, || {
+            let mut b = KernargBlob::new();
+            b.push_ptr(x);
+            for p in ptrs.iter().chain(more.iter()) { b.push_ptr(*p); }
+            for n in dims { b.push_i32(n); }
+            b.push_i32(k_i32);
+            b
+        })
+    }
+}"#
+    .to_string()
+}
+
+fn repeat_array_decl() -> Decl {
+    Decl::from_scalars(&[
+        (8, 'p'),
+        (8, 'p'),
+        (8, 'p'),
+        (8, 'p'),
+        (8, 'p'),
+        (4, 'i'),
+        (4, 'i'),
+        (4, 'i'),
+    ])
+}
+
+#[test]
+fn repeat_arrays_and_chain_loops_are_traced_per_element_and_fail_closed() {
+    // x, two `ptrs`, two `more` (chained), two `dims`, k: the blob and the params array
+    // are both followed element by element against the declaration.
+    let source = repeat_array_source()
+        .replace(
+            "        let k_i32 = 7i32;\n",
+            "        let mut more = [std::ptr::null_mut::<c_void>(); MAX];\n        let k_i32 = 7i32;\n",
+        )
+        .replace(
+            "        params.extend(dims",
+            "        params.extend(more.iter().map(|p| p as *const _ as *mut c_void));\n        params.extend(dims",
+        );
+    let symbols = [("repeat_symbol", repeat_array_decl())];
+    let (abi, coverage) = run_synth(&source, &symbols, &no_policy());
+    assert!(
+        abi.is_empty() && coverage.is_empty(),
+        "faithful repeat-array launcher: {abi:?} {coverage:?}"
+    );
+    for bad in [
+        // Element class of a repeat array is the class of its initialiser.
+        source.replace("[0i32; MAX]", "[0u64; MAX]"),
+        source.replace(
+            "let mut dims = [0i32; MAX];",
+            "let mut dims = [0.0f32; MAX];",
+        ),
+        // Unsuffixed or unknown initialisers have no provable ABI class.
+        source.replace("[0i32; MAX]", "[0; MAX]"),
+        source.replace("[0i32; MAX]", "[make_default(); MAX]"),
+        // A repeat count that is not a constant has no provable entry count.
+        source.replace("[0i32; MAX]", "[0i32; members.len()]"),
+        // One more element on one side only.
+        source.replace("[0i32; MAX]", "[0i32; 3]"),
+        // Iterator adapters could reorder or drop elements.
+        source.replace("ptrs.iter().chain", "ptrs.iter().rev().chain"),
+        source.replace("more.iter())", "more.iter().skip(1))"),
+        source.replace(
+            "for p in ptrs.iter().chain(more.iter())",
+            "for p in ptrs.iter().zip(more.iter())",
+        ),
+        // The pushed class must match the params entry's element class.
+        source.replace("b.push_ptr(*p);", "b.push_i32(*p);"),
+        source.replace(
+            "for n in dims { b.push_i32(n); }",
+            "for n in dims { b.push_u64(n); }",
+        ),
+        // The params mapping must read the array the blob pushes.
+        source.replace("params.extend(more.iter()", "params.extend(ptrs.iter()"),
+        source.replace("params.extend(dims.iter()", "params.extend(ptrs.iter()"),
+        // A literal array is still never accepted as mutable; shadowing is refused.
+        source.replace(
+            "let mut dims = [0i32; MAX];",
+            "let mut dims = [1i32, 2i32];",
+        ),
+        source.replace(
+            "        self.launch_maybe_blob",
+            "        let dims = [9i32, 11i32];\n        self.launch_maybe_blob",
+        ),
+        // Literal `params.extend([..])` entries must each be a recognised entry.
+        source.replace(
+            "params.extend([&k_i32 as *const _ as *mut c_void]);",
+            "params.extend([opaque_entry()]);",
+        ),
+        source.replace(
+            "params.extend([&k_i32 as *const _ as *mut c_void]);",
+            "params.extend([]);",
+        ),
+    ] {
+        let (abi, coverage) = run_synth(&bad, &symbols, &no_policy());
+        assert!(
+            !abi.is_empty() || !coverage.is_empty(),
+            "unproved repeat-array launcher must fail: {bad}"
+        );
+    }
+}
+
+#[test]
+fn scoped_const_repeats_resolve_aliases_and_qualified_modules_without_guessing() {
+    const PATH: &str = "crates/demo/src/cdna/gfx942.rs";
+    let world = World::from_sources(
+        Path::new("."),
+        vec![
+            (
+                PATH.into(),
+                "const GLOBAL: usize = 9; const N: usize = 9;".into(),
+            ),
+            (
+                "crates/demo/src/gemm.rs".into(),
+                "const COUNT: usize = 4;".into(),
+            ),
+            (
+                "crates/demo/src/other.rs".into(),
+                "const COUNT: usize = 7;".into(),
+            ),
+        ],
+    )
+    .unwrap();
+    let eval = |body: &str, expression: &str| {
+        let tokens = lex::lex(body).unwrap();
+        let idx = scan::BindIndex::build(&tokens);
+        let ctx = scan::Ctx {
+            file: PATH,
+            body: &tokens,
+            params: Default::default(),
+            idx: &idx,
+        };
+        world.repeat_len_at(&lex::lex(expression).unwrap(), &ctx, &[tokens.len()])
+    };
+    assert_eq!(eval("const N: usize = 4;", "N"), Some(4));
+    assert_eq!(eval("const N: usize = crate::gemm::COUNT;", "N"), Some(4));
+    assert_eq!(
+        eval("const N: usize = A + 1; const A: usize = 3;", "N"),
+        Some(4)
+    );
+    assert_eq!(eval("", "crate::gemm::COUNT"), Some(4));
+    assert_eq!(eval("", "super::super::gemm::COUNT"), Some(4));
+    assert_eq!(eval("", "crate::other::COUNT"), Some(7));
+    assert_eq!(eval("", "GLOBAL"), Some(9));
+    assert_eq!(eval("const N: usize = 1_024;", "N"), Some(1024));
+    assert_eq!(eval("const N: usize = 0b100 + 0o4 + 0x4;", "N"), Some(12));
+    assert_eq!(eval("const N: usize = 4u8 as usize;", "N"), Some(4));
+    for (body, expression) in [
+        ("", "COUNT"),                 // ambiguous across modules
+        ("", "crate::missing::COUNT"), // do not fall back to the final name
+        ("", "crate::other::GLOBAL"),
+        ("", "foreign_crate::gemm::COUNT"),
+        ("const N: usize = runtime_count();", "N"),
+        ("let N = 4;", "N"), // a runtime binding is not a constant
+        ("static N: usize = 4;", "N"),
+        ("const N: usize = N;", "N"), // no outer/global fallback on a cycle
+        ("const N: usize = A; const A: usize = N;", "N"),
+        ("const N: usize = 4; let N = 8;", "N"),
+        ("const N: usize = 4; const N: usize = 8;", "N"),
+        ("", "GLOBAL + runtime"),
+        ("const N: usize = 256u32 as u8 as usize;", "N"),
+        ("const N: usize = 4f32 as usize;", "N"),
+        ("const N: usize = 9223372036854775807 + 1;", "N"),
+        ("const N: usize = 9223372036854775807 * 2;", "N"),
+    ] {
+        assert_eq!(eval(body, expression), None, "{body}: {expression}");
+    }
+    // The sibling block's const must not leak, nor may a later runtime shadow
+    // change the already fixed type of an earlier repeat array.
+    assert_eq!(eval("{ const N: usize = 4; }", "N"), Some(9));
+    let tokens = lex::lex("const N: usize = 4; let values = [0i32; N]; let N = 8;").unwrap();
+    let idx = scan::BindIndex::build(&tokens);
+    let ctx = scan::Ctx {
+        file: PATH,
+        body: &tokens,
+        params: Default::default(),
+        idx: &idx,
+    };
+    let b = idx.map["values"].first().unwrap();
+    assert_eq!(
+        world.repeat_len_at(&lex::lex("N").unwrap(), &ctx, &b.loc),
+        Some(4)
+    );
+    let nested = lex::lex("const N: usize = 4; { const N: usize = 2; marker(); }").unwrap();
+    let nested_idx = scan::BindIndex::build(&nested);
+    let nested_ctx = scan::Ctx {
+        file: PATH,
+        body: &nested,
+        params: Default::default(),
+        idx: &nested_idx,
+    };
+    let group = nested.iter().position(|t| t.is_g('{')).unwrap();
+    assert_eq!(
+        world.repeat_len_at(
+            &lex::lex("N").unwrap(),
+            &nested_ctx,
+            &[group, nested[group].group().unwrap().len()]
+        ),
+        Some(2)
+    );
+}
+
+#[test]
+fn local_const_repeat_lengths_check_real_params_and_blob_extents() {
+    let source = r#"impl Gpu {
+        fn go(&mut self) {
+            const N: usize = 2;
+            let mut pointers = [std::ptr::null_mut::<c_void>(); N];
+            let mut params: Vec<*mut c_void> =
+                pointers.iter().map(|p| p as *const _ as *mut c_void).collect();
+            self.launch_maybe_blob("repeat_local", g, b, 0, &mut params, || {
+                let mut blob = KernargBlob::new();
+                for p in pointers { blob.push_ptr(p); }
+                blob
+            })
+        }
+    }"#;
+    let symbols = [("repeat_local", Decl::from_scalars(&[(8, 'p'), (8, 'p')]))];
+    let (abi, coverage) = run_synth(source, &symbols, &no_policy());
+    assert!(
+        abi.is_empty() && coverage.is_empty(),
+        "{abi:?} {coverage:?}"
+    );
+    for bad in [
+        source.replace("const N: usize = 2;", "const N: usize = 3;"),
+        source.replace("const N: usize = 2;", "const N: usize = 0;"),
+        source.replace("const N: usize = 2;", "const N: usize = runtime();"),
+        source.replace("const N: usize = 2;", "let N = 2;"),
+        source.replace("const N: usize = 2;", "const N: usize = N;"),
+    ] {
+        let (abi, coverage) = run_synth(&bad, &symbols, &no_policy());
+        assert!(
+            !abi.is_empty() || !coverage.is_empty(),
+            "unproved/wrong repeat: {bad}"
+        );
+    }
+}
+
+#[test]
+fn actual_wide_selector_and_loader_feed_all_three_abi_checked_launches() {
+    let root = root();
+    let paths = vec![
+        "crates/rdna-compute/src/cdna/gfx942.rs".to_string(),
+        "crates/rdna-compute/src/gemm.rs".to_string(),
+    ];
+    let world = World::load(&root, &paths).unwrap();
+    let hip =
+        std::fs::read_to_string(root.join("kernels/src/gemm_bf16_mfma_wide.gfx942.hip")).unwrap();
+    let declarations = hip::decls_of(&hip).unwrap();
+    let names = [
+        "gemm_bf16_mfma_gfx942_wide64",
+        "gemm_bf16_mfma_gfx942_wide64_m32",
+        "gemm_bf16_mfma_gfx942_wide64_m64",
+    ];
+    let mut symbols = Symbols::default();
+    for name in names {
+        symbols.hip.insert(
+            name.into(),
+            vec![("actual wide HIP".into(), declarations[name].clone())],
+        );
+    }
+    // Match the full fixture's changed-source provenance, not only its names:
+    // the loader references the source constant rather than a literal entry.
+    symbols
+        .changed_consts
+        .insert(("GEMM_BF16_MFMA_WIDE_SRC".into(), paths[0].clone()));
+    let inventory = load_inventory();
+    let mut p = no_policy();
+    for helper in ["g942_wide_ensure", "wide_entry"] {
+        let k = format!("{}::{helper}", paths[0]);
+        p.non_launching.insert(
+            k.clone(),
+            inventory["non_launching"][&k].as_str().unwrap().into(),
+        );
+        let f = world
+            .file(&paths[0])
+            .unwrap()
+            .fns
+            .iter()
+            .find(|f| f.name == helper)
+            .unwrap();
+        assert!(
+            scan::find_sites(&f.body).unwrap().is_empty(),
+            "{helper} must not launch"
+        );
+    }
+    let launcher = world
+        .file(&paths[0])
+        .unwrap()
+        .fns
+        .iter()
+        .find(|f| f.name == "gemm_bf16_mfma_gfx942_wide")
+        .unwrap();
+    let mut calls = std::collections::BTreeSet::new();
+    check::call_names(&launcher.body, &mut calls);
+    assert!(calls.contains("wide_entry") && calls.contains("g942_wide_ensure"));
+    let analysis = analyze(&world, &symbols, &p);
+    let (abi, coverage) = violations(&analysis, &p);
+    assert!(
+        abi.is_empty() && coverage.is_empty(),
+        "{abi:?} {coverage:?}"
+    );
+    let report = analysis
+        .reports
+        .iter()
+        .find(|r| r.func == launcher.name)
+        .unwrap();
+    for name in names {
+        assert!(analysis.covered.contains(name), "{name}");
+        assert!(
+            report
+                .sites
+                .iter()
+                .any(|(_, candidates)| candidates.iter().any(|candidate| candidate == name)),
+            "{name}"
+        );
+    }
+    // Classification never supplies coverage: without the terminal launcher,
+    // none of the selector's entry names can count as a checked launch.
+    let sources = paths
+        .iter()
+        .map(|path| {
+            let source = std::fs::read_to_string(root.join(path)).unwrap();
+            (
+                path.clone(),
+                source.replace("self.launch_maybe_blob(", "self.not_a_launcher("),
+            )
+        })
+        .collect();
+    let missing = World::from_sources(&root, sources).unwrap();
+    let missing = analyze(&missing, &symbols, &p);
+    // changed_kernel_coverage_is_closed requires every symbol in `covered`;
+    // per-function violations alone do not enforce that global obligation.
+    let uncovered: Vec<_> = names
+        .iter()
+        .copied()
+        .filter(|name| !missing.covered.contains(*name))
+        .collect();
+    assert_eq!(
+        uncovered, names,
+        "classifications cannot stand in for a launch"
+    );
+}
+
+#[test]
+fn actual_qsa_lanes_helpers_feed_all_five_checked_blob_sites() {
+    let root = root();
+    let paths = vec![
+        "crates/rdna-compute/src/cdna/gfx942_qsa_lanes.rs".to_string(),
+        "crates/rdna-compute/src/qsa_core_lanes_gfx942.rs".to_string(),
+        "crates/rdna-compute/src/rope.rs".to_string(),
+    ];
+    let world = World::load(&root, &paths).unwrap();
+    let source =
+        std::fs::read_to_string(root.join("kernels/src/qwen4_qsa_lanes_f32.gfx942.hip")).unwrap();
+    let declarations = hip::decls_of(&source).unwrap();
+    assert_eq!(declarations.len(), 7);
+    let mut symbols = Symbols::default();
+    for (name, decl) in &declarations {
+        symbols
+            .hip
+            .insert(name.clone(), vec![("actual QSA HIP".into(), decl.clone())]);
+    }
+    symbols
+        .changed_consts
+        .insert(("QWEN4_QSA_LANES_SRC".into(), paths[0].clone()));
+    let mut policy = no_policy();
+    let loader = format!("{}::g942_qsa_lanes_ensure", paths[0]);
+    policy.non_launching.insert(
+        loader.clone(),
+        load_inventory()["non_launching"][&loader]
+            .as_str()
+            .unwrap()
+            .into(),
+    );
+    let loader_fn = world
+        .file(&paths[0])
+        .unwrap()
+        .fns
+        .iter()
+        .find(|f| f.name == "g942_qsa_lanes_ensure")
+        .unwrap();
+    assert!(scan::find_sites(&loader_fn.body).unwrap().is_empty());
+    let analysis = analyze(&world, &symbols, &policy);
+    let (abi, coverage) = violations(&analysis, &policy);
+    assert!(
+        abi.is_empty() && coverage.is_empty(),
+        "{abi:?} {coverage:?}"
+    );
+    let report = analysis
+        .reports
+        .iter()
+        .find(|r| r.func == "qwen4_qsa_lanes_core")
+        .unwrap();
+    assert_eq!(report.sites.len(), 5);
+    for name in declarations.keys() {
+        assert!(analysis.covered.contains(name), "{name}");
+    }
+    // Loader classification and helper bodies cannot substitute for a live launch.
+    let missing = World::from_sources(
+        &root,
+        paths
+            .iter()
+            .map(|path| {
+                let source = std::fs::read_to_string(root.join(path)).unwrap();
+                (
+                    path.clone(),
+                    source.replace(".launch_blob_recorded(", ".not_a_launcher("),
+                )
+            })
+            .collect(),
+    )
+    .unwrap();
+    let missing = analyze(&missing, &symbols, &policy);
+    assert!(declarations
+        .keys()
+        .all(|name| !missing.covered.contains(name)));
+}
+
+#[test]
+fn constant_array_literal_index_names_one_element() {
+    // `ENTRIES[0]` is the first entry, not every entry of the array: the two kernels have
+    // different ABIs, so a launch of `FIRST` is checked against the first alone.
+    let source = |blob: &str| {
+        format!(
+            "const ENTRIES: [&str; 2] = [\"first_symbol\", \"second_symbol\"];
+            const FIRST: &str = ENTRIES[0];
+            fn launch_first(gpu: &Gpu) {{
+                {SMALL_LETS}
+                let mut b = KernargBlob::new();
+                {blob}
+                gpu.launch_kernel_blob(FIRST, g, bl, 0, b.as_mut_slice()).unwrap();
+            }}"
+        )
+    };
+    let symbols = [
+        ("first_symbol", small_decl()),
+        (
+            "second_symbol",
+            Decl::from_scalars(&[(8, 'p'), (8, 'p'), (4, 'i')]),
+        ),
+    ];
+    let good = source("b.push_ptr(wp); b.push_i32(nv); b.push_f32(sc); b.push_u64(big);");
+    let (abi, cov) = run_synth_at(PROBE_PATH, &good, &symbols, &no_policy());
+    assert!(abi.is_empty() && cov.is_empty(), "{abi:?} {cov:?}");
+    // The indexed entry is still checked: a missing word is a real mismatch.
+    let bad = source("b.push_ptr(wp); b.push_i32(nv); b.push_f32(sc);");
+    let (abi, cov) = run_synth_at(PROBE_PATH, &bad, &symbols, &no_policy());
+    assert!(
+        abi.iter().chain(&cov).any(|p| p.contains("first_symbol")),
+        "first entry escaped checking: {abi:?} {cov:?}"
+    );
+    // A non-literal index, or an index past the array, selects nothing in particular: every
+    // entry stays a candidate (and the second one's ABI then fails this blob).
+    for index in ["i", "7"] {
+        let wide = good.replace("ENTRIES[0]", &format!("ENTRIES[{index}]"));
+        let (abi, cov) = run_synth_at(PROBE_PATH, &wide, &symbols, &no_policy());
+        assert!(
+            abi.iter().chain(&cov).any(|p| p.contains("second_symbol")),
+            "index {index} must keep every entry a candidate: {abi:?} {cov:?}"
+        );
+    }
+}
+
+#[test]
+fn a_call_through_a_local_closure_does_not_reach_a_free_function_of_that_name() {
+    // `controls` mentions a changed kernel and calls its own closure `run`; the free
+    // function `run` launches a kernel named by its parameter and is only reached by `driver`.
+    // Rust resolves `controls`' call to the closure, so `run` stays outside the changed
+    // kernels' reach: its unresolvable parameter name is no coverage problem. Calling the
+    // free function (no closure) puts it back in reach.
+    let source = |controls_call: &str| {
+        format!(
+            "fn run(gpu: &Gpu, sym: &str, args: &mut KernargBlob) {{
+                gpu.launch_kernel_blob(sym, g, bl, 0, args.as_mut_slice()).unwrap();
+            }}
+            fn driver(gpu: &Gpu, f: &str) {{
+                let mut b = KernargBlob::new();
+                b.push_ptr(wp);
+                run(gpu, f, &mut b);
+            }}
+            fn controls(gpu: &Gpu) {{
+                {SMALL_LETS}
+                let mut b = KernargBlob::new();
+                b.push_ptr(wp); b.push_i32(nv); b.push_f32(sc); b.push_u64(big);
+                gpu.launch_kernel_blob(\"changed_symbol\", g, bl, 0, b.as_mut_slice()).unwrap();
+                {controls_call}
+            }}"
+        )
+    };
+    let symbols = [("changed_symbol", small_decl())];
+    let closure = source("let run = |x: i32| x + 1; let _ = run(3);");
+    let (abi, cov) = run_synth_at(PROBE_PATH, &closure, &symbols, &no_policy());
+    assert!(abi.is_empty() && cov.is_empty(), "{abi:?} {cov:?}");
+    let free = source("let mut c = KernargBlob::new(); run(gpu, \"other\", &mut c);");
+    let (_, cov) = run_synth_at(PROBE_PATH, &free, &symbols, &no_policy());
+    assert!(
+        cov.iter().any(|p| p.contains("run")),
+        "a real call of the free helper must keep it in reach: {cov:?}"
     );
 }

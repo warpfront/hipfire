@@ -173,7 +173,7 @@
   {
    "id": "deepseek4-mq2r-gfx1151",
    "arch": "gfx1151",
-   "route": "DeepSeek4 MQ2R, single GPU, plain AR, no drafter: hipfire-runtime config.rs retained_redline_default (gfx1151 && deepseek4 && .mq2r)",
+   "route": "DeepSeek4 MQ2R, single GPU, plain AR, no drafter: hipfire-runtime config.rs retained_redline_default (gfx1151 && deepseek4 && MQ2R SKU)",
    "golden": {
     "sequence_hash": "6907000390144547465",
     "launches": 2320,

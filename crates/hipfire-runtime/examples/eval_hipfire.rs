@@ -16,7 +16,7 @@
 //!                --output <path-to-output.kldseq> \
 //!                [--variant <name>=auto-from-model-path] \
 //!                [--arch <name>=auto-from-gpu] \
-//!                [--kv-mode <mode>=asym3] \
+//!                [--kv-mode <mode>=q8] \
 //!                [--scoring-mode <per-token|prefill|prefill-whole|prefill-prompt>=prefill]
 //!                [--scored-max-batch <N>]
 //!
@@ -151,7 +151,7 @@ fn main() {
     let mut model: Option<PathBuf> = None;
     let mut ref_path: Option<PathBuf> = None;
     let mut output: Option<PathBuf> = None;
-    let mut kv_mode = "asym3".to_string();
+    let mut kv_mode = "q8".to_string();
     let mut kv_v = "q8".to_string();
     let mut scoring_mode = "prefill".to_string();
     let mut max_chunks: Option<usize> = None;
@@ -177,18 +177,11 @@ fn main() {
                 let v = argv[i + 1].clone();
                 if !matches!(
                     v.as_str(),
-                    "q8" | "fp8"
-                        | "bf16"
-                        | "asym2"
-                        | "asym3"
-                        | "asym4"
-                        | "fwht2"
-                        | "fwht3"
-                        | "fwht4"
-                        | "f32"
-                        | "f16"
+                    "q8" | "fp8" | "bf16" | "fwht2" | "fwht3" | "fwht4" | "f32" | "f16"
                 ) {
-                    eprintln!("--kv-mode must be one of: q8 fp8 bf16 asym2 asym3 asym4 fwht2 fwht3 fwht4 f32 f16 (got {v})");
+                    eprintln!(
+                        "--kv-mode must be one of: q8 fp8 bf16 fwht2 fwht3 fwht4 f32 f16 (got {v})"
+                    );
                     std::process::exit(1);
                 }
                 kv_mode = v;
@@ -241,7 +234,7 @@ fn main() {
                 i += 2;
             }
             "-h" | "--help" => {
-                eprintln!("Usage: eval_hipfire --model <path> --ref <path> --output <path> [--kv-mode asym3] [--kv-v q8] [--scoring-mode prefill|prefill-whole|prefill-prompt|per-token] [--max-chunks N] [--scored-max-batch N] [--tp N (qwen35 dense, prefill, q8/q8 KV)]\n{SCORING_MODE_HELP}");
+                eprintln!("Usage: eval_hipfire --model <path> --ref <path> --output <path> [--kv-mode q8] [--kv-v q8] [--scoring-mode prefill|prefill-whole|prefill-prompt|per-token] [--max-chunks N] [--scored-max-batch N] [--tp N (qwen35 dense, prefill, q8/q8 KV)]\n{SCORING_MODE_HELP}");
                 eprintln!("       [--per-token-output <path.ktok>]  (HFKTOK v1 per-token KLD f64s, any scoring mode; kldseq bytes unchanged)");
                 std::process::exit(0);
             }
@@ -281,7 +274,7 @@ fn main() {
             std::process::exit(1);
         }
         if args.model.is_dir() {
-            eprintln!("--tp is not supported for safetensors/paro model directories");
+            eprintln!("--tp is not supported for safetensors model directories");
             std::process::exit(1);
         }
     }
@@ -293,7 +286,7 @@ fn main() {
     //
     // Note on HIPFIRE_GRAPH=0: byte-equality between graph=0 and graph=1
     // was verified on 2026-05-08 against this binary's forward path
-    // (dense Qwen3.5-9B mq4, prefill 64 tokens, kv_mode=asym3) — sha256
+    // (dense Qwen3.5-9B mq4, prefill 64 tokens, kv_mode=asym3 at the time; asym3 since removed) — sha256
     // matched, 0/248320 logits differed. The plan's force-OFF is therefore
     // a determinism *style* choice, not a correctness requirement: a
     // future contributor can safely flip this to opt-out (respect a
@@ -723,27 +716,15 @@ fn main() {
         // respects calib_force_bf16 for teachers.
         use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
 
-        // Auto-route safetensors directories (ParoQuant / AWQ / HF native) — mirrors
-        // daemon.rs:1500-1504. HFQ files take the canonical HFQ path below.
+        // Safetensors model directories are refused (their only qwen35 loader was
+        // the removed ParoQuant one). HFQ files take the canonical HFQ path below.
         let (config, weights) = if let Some(m) = &gguf_model {
             eprintln!("  loading via GGUF-native source arch_id={arch_id}");
             let weights = m.load_qwen35_weights(&mut gpu).expect("load GGUF weights");
             (m.hparams.config.clone(), weights)
         } else if args.model.is_dir() {
-            use hipfire_runtime::safetensors_source::SafetensorsSource;
-            let source = SafetensorsSource::open(&args.model).expect("safetensors open");
-            let config = qwen35::config_from_safetensors(&source).expect("config_from_safetensors");
-            eprintln!("  loading via safetensors (ParoQuant path) arch_id={arch_id}");
-            let mut paro_source =
-                qwen35::ParoSource::new(&source, &config).expect("ParoSource::new");
-            let paro_layout = qwen35::Layout::single(config.n_layers);
-            let weights = qwen35::load_weights(
-                &mut paro_source,
-                std::slice::from_mut(&mut gpu),
-                &paro_layout,
-            )
-            .expect("load_weights");
-            (config, weights)
+            eprintln!("{}", hipfire_runtime::hfq::REMOVED_SAFETENSORS_DIR_MSG);
+            std::process::exit(1)
         } else {
             let mut hfq = HfqFile::open(&args.model).expect("open model");
             let config = qwen35::config_from_hfq(&hfq).expect("read config");
@@ -779,6 +760,25 @@ fn main() {
             .iter()
             .map(|t| *t == qwen35::LayerType::FullAttention)
             .collect();
+        // V allocates at its logical stride up front (no Q8 transient).
+        let v_mode = match args.kv_v.as_str() {
+            "q8" => VMode::Q8,
+            "lloyd2" => VMode::Lloyd2,
+            "lloyd3" => VMode::Lloyd3,
+            "lloyd4" => VMode::Lloyd4,
+            other => panic!("unknown --kv-v: {other}"),
+        };
+        // A non-Q8 V is only meaningful on an FWHT K mode: without the
+        // fwht2/3/4 arms below, the parsed mode would be silently ignored
+        // and every KxV sweep cell past the first would record q8/q8
+        // numbers under a lloyd label.
+        if v_mode != VMode::Q8 && !matches!(args.kv_mode.as_str(), "fwht2" | "fwht3" | "fwht4") {
+            eprintln!(
+                "eval_hipfire: --kv-v {} requires --kv-mode fwht2|fwht3|fwht4 (got {})",
+                args.kv_v, args.kv_mode
+            );
+            std::process::exit(1);
+        }
         let mut kv_cache = match args.kv_mode.as_str() {
             "q8" => KvCache::new_gpu_q8(
                 &mut gpu,
@@ -793,7 +793,7 @@ fn main() {
                 // token/head). Admission is the shared mode-specific guard
                 // before allocation: neutral V (`--kv-v q8` spelling
                 // identifies fp8/fp8) plus qwen35_native_refusal for Fp8
-                // (exact gfx1201, single GPU, no adaptive/CASK; H24/KV4/D256
+                // (exact gfx1201, single GPU, no adaptive tiering; H24/KV4/D256
                 // dense or H16/KV2/D256 MoE); never falls through to a q8
                 // reader.
                 if args.kv_v != "q8" {
@@ -810,7 +810,6 @@ fn main() {
                     config.n_kv_heads,
                     config.head_dim,
                     1,
-                    false,
                     false,
                 ) {
                     eprintln!("eval_hipfire: --kv-mode fp8 refused: {reason}");
@@ -831,7 +830,7 @@ fn main() {
                 // no scales). Admission is the shared mode-specific guard
                 // before allocation: neutral V, dense only, plus
                 // qwen35_native_refusal for Bf16 (exact gfx1201, single GPU,
-                // no adaptive/CASK, dense H24/Hkv4/D256); never falls through
+                // no adaptive tiering, dense H24/Hkv4/D256); never falls through
                 // to a q8 reader. Expected to read ≈ the f32 reference.
                 if args.kv_v != "q8" {
                     eprintln!(
@@ -855,7 +854,6 @@ fn main() {
                     config.head_dim,
                     1,
                     false,
-                    false,
                 ) {
                     eprintln!("eval_hipfire: --kv-mode bf16 refused: {reason}");
                     std::process::exit(1);
@@ -870,36 +868,13 @@ fn main() {
                 )
                 .unwrap()
             }
-            "asym4" => KvCache::new_gpu_asym4(
-                &mut gpu,
-                config.n_layers,
-                config.n_kv_heads,
-                config.head_dim,
-                kv_max,
-            )
-            .unwrap(),
-            "asym3" => KvCache::new_gpu_asym3(
-                &mut gpu,
-                config.n_layers,
-                config.n_kv_heads,
-                config.head_dim,
-                kv_max,
-            )
-            .unwrap(),
-            "asym2" => KvCache::new_gpu_asym2(
-                &mut gpu,
-                config.n_layers,
-                config.n_kv_heads,
-                config.head_dim,
-                kv_max,
-            )
-            .unwrap(),
             "fwht4" => KvCache::new_gpu_fwht4_filtered(
                 &mut gpu,
                 &is_kv_layer,
                 config.n_kv_heads,
                 config.head_dim,
                 kv_max,
+                v_mode,
             )
             .unwrap(),
             "fwht3" => KvCache::new_gpu_fwht3_filtered(
@@ -908,6 +883,7 @@ fn main() {
                 config.n_kv_heads,
                 config.head_dim,
                 kv_max,
+                v_mode,
             )
             .unwrap(),
             "fwht2" => KvCache::new_gpu_fwht2_filtered(
@@ -916,6 +892,7 @@ fn main() {
                 config.n_kv_heads,
                 config.head_dim,
                 kv_max,
+                v_mode,
             )
             .unwrap(),
             "f32" | "f16" => KvCache::new_gpu(
@@ -928,16 +905,6 @@ fn main() {
             .unwrap(),
             other => panic!("unknown --kv-mode: {other}"),
         };
-        let v_mode = match args.kv_v.as_str() {
-            "q8" => VMode::Q8,
-            "lloyd2" => VMode::Lloyd2,
-            "lloyd3" => VMode::Lloyd3,
-            "lloyd4" => VMode::Lloyd4,
-            other => panic!("unknown --kv-v: {other}"),
-        };
-        if v_mode != VMode::Q8 {
-            kv_cache.set_v_mode_realloc(&mut gpu, v_mode).unwrap();
-        }
         let scratch = Qwen35Scratch::new(&mut gpu, &config, 64).unwrap();
         let mut dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
 
@@ -1111,7 +1078,10 @@ fn main() {
                         None,
                     )
                     .expect("forward_prefill_batch prefix");
-                    qwen35::forward_prefill_batch(
+                    // The scored region is an ordinary prefill continuation that captures
+                    // its rows' hidden states (the prompt-fill capture), so the canonical
+                    // GDN stream stays Open across the prefix and scored calls.
+                    qwen35::forward_prefill_batch_capture_hidden(
                         &mut gpu,
                         &weights,
                         &config,
@@ -1120,12 +1090,9 @@ fn main() {
                         &mut kv_cache,
                         &mut dn_state,
                         &scratch,
-                        None,
-                        Some(h_buf),
-                        None,
-                        None,
+                        h_buf,
                     )
-                    .expect("forward_prefill_batch scored");
+                    .expect("forward_prefill_batch_capture_hidden scored");
                     h_buf
                 };
 
@@ -1260,30 +1227,6 @@ fn main() {
                 kv_max,
             )
             .unwrap(),
-            "asym4" => KvCache::new_gpu_asym4(
-                &mut gpu,
-                config.n_layers,
-                config.n_kv_heads,
-                config.head_dim,
-                kv_max,
-            )
-            .unwrap(),
-            "asym3" => KvCache::new_gpu_asym3(
-                &mut gpu,
-                config.n_layers,
-                config.n_kv_heads,
-                config.head_dim,
-                kv_max,
-            )
-            .unwrap(),
-            "asym2" => KvCache::new_gpu_asym2(
-                &mut gpu,
-                config.n_layers,
-                config.n_kv_heads,
-                config.head_dim,
-                kv_max,
-            )
-            .unwrap(),
             "f32" | "f16" => KvCache::new_gpu(
                 &mut gpu,
                 config.n_layers,
@@ -1293,7 +1236,7 @@ fn main() {
             )
             .unwrap(),
             other => {
-                eprintln!("llama: --kv-mode {other} not in q8/asym2/3/4/f32");
+                eprintln!("llama: --kv-mode {other} not in q8/f32");
                 std::process::exit(1);
             }
         };

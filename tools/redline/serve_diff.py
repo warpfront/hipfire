@@ -177,7 +177,6 @@ def _run_arm(args: argparse.Namespace, backend: str) -> dict:
         HIPFIRE_REPLAY_BACKEND=backend_config_value(backend),
         HIPFIRE_REPLAY_TRANSPORT="pm4",
         HIPFIRE_KV_MODE=args.kv,
-        HIPFIRE_CASK_OFF="1",
         HIPFIRE_AR_GRAPH="1",
         HIPFIRE_GRAPH="1",
         HIPFIRE_SERVE_HARNESS_PID_FILE=str(pid_path),

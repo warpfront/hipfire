@@ -213,9 +213,12 @@ fn cases() -> Vec<Inst> {
             Vop2Op::AddF16 | Vop2Op::SubF16 | Vop2Op::MulF16 | Vop2Op::MaxF16 | Vop2Op::MinF16 => {
                 (Lit(0x1234), Lit(0xfff0))
             }
-            Vop2Op::AddU16 | Vop2Op::SubU16 | Vop2Op::LshlrevB16 | Vop2Op::MulLoU16 => {
-                (Lit(0xfff0), Lit(0x40))
-            }
+            Vop2Op::AddU16
+            | Vop2Op::SubU16
+            | Vop2Op::LshlrevB16
+            | Vop2Op::LshrrevB16
+            | Vop2Op::AshrrevI16
+            | Vop2Op::MulLoU16 => (Lit(0xfff0), Lit(0x40)),
             _ => (Lit(0x1234_5678), Lit(0xffff_fff0)),
         };
         let srcs: Vec<Src> = if op.reads_vcc() {
@@ -243,6 +246,11 @@ fn cases() -> Vec<Inst> {
     // ---- VOPC e32: every op ----
     for (k, &op) in VopcOp::ALL.iter().enumerate() {
         let f = Float(floats[k % floats.len()]);
+        let (lit_a, lit_b) = if op.float_compare().is_some_and(|(w, _)| w == 16) {
+            (Lit(0x1234), Lit(0xfff0))
+        } else {
+            (Lit(0xdead_beef), Lit(0x3e22_f983))
+        };
         let srcs: Vec<(Src, Src)> = if op.src_dwords() == 2 {
             vec![
                 (Vgpr(2), Vgpr(4)),
@@ -260,8 +268,8 @@ fn cases() -> Vec<Inst> {
                 (VccHi, Vgpr(0)),
                 (Int(-3), Vgpr(6)),
                 (f, Vgpr(8)),
-                (Lit(0xdead_beef), Vgpr(10)),
-                (Lit(0x3e22_f983), Vgpr(12)),
+                (lit_a, Vgpr(10)),
+                (lit_b, Vgpr(12)),
             ]
         };
         for (s0, s1) in srcs {
@@ -740,6 +748,45 @@ fn round_trip_against_llvm() {
 }
 
 #[test]
+fn integer16_signed_literals_keep_the_full_encoded_dword() {
+    let mut texts = Vec::new();
+    let mut bytes = Vec::new();
+    for op in [
+        Vop2Op::AddU16,
+        Vop2Op::SubU16,
+        Vop2Op::LshlrevB16,
+        Vop2Op::LshrrevB16,
+        Vop2Op::AshrrevI16,
+        Vop2Op::MulLoU16,
+    ] {
+        for value in [-1i32, -16, -256, -32768] {
+            let inst = i2(op, Vgpr(0), Lit(value as u32), Vgpr(1), VopExt::None);
+            let words = inst.words(A).expect("signed16 literal encodes");
+            assert_eq!(words.len(), 2);
+            assert_eq!(words[1], value as u32, "never truncate or normalize");
+            assert_eq!(Inst::decode(A, &words).unwrap(), (inst.clone(), 2));
+            assert!(inst.to_string().contains(&format!("lit({value})")));
+            texts.push(inst.to_string());
+            bytes.push(oracle::bytes(&words));
+        }
+        for value in [0x1_0000, 0xffff_0000, 0xffff_7fff] {
+            assert!(i2(op, Vgpr(0), Lit(value), Vgpr(1), VopExt::None)
+                .words(A)
+                .is_err());
+        }
+    }
+    if !oracle::disabled() {
+        // LLVM prints a masked halfword even for a sign-extended raw literal.
+        // Compare the assembled bytes of our lossless signed spelling, not that
+        // lossy pretty-print. The ordinary canonical corpus still checks both.
+        let encoded = oracle::mc_encode(A, &texts).unwrap();
+        for ((_, actual), expected) in encoded.iter().zip(&bytes) {
+            assert_eq!(actual, expected);
+        }
+    }
+}
+
+#[test]
 fn illegal_forms_rejected() {
     let n = VopExt::None;
     let s = sdwa();
@@ -1018,31 +1065,97 @@ fn illegal_forms_rejected() {
         );
     }
 
-    let reject = [
+    // Malformed encodings: reserved bit patterns, a value the ISA reserves, an
+    // encoding with no row, a truncated instruction. Neither the typed model
+    // nor the generated-table fallback may decode them.
+    let malformed = [
         vec![0x7e02_02fa, 0xff01_0002], // DPP_CTRL 0x100 (reserved)
-        vec![0x7e02_02fa, 0xff01_5002], // row_newbcast (not modelled)
         vec![0x7e02_02fa, 0xff06_e402], // DPP reserved bits [50:49]
         vec![0x7e02_02f9, 0x0007_0602], // SDWA src0_sel 7
         vec![0x7e02_02f9, 0x0006_1e02], // DST_UNUSED 3
+        vec![0x7d94_06fa, 0xff00_e402], // VOPC DPP
+        vec![0x7e02_c800],              // VOP1 opcode 100: not in table
+        vec![0x7e02_02ff],              // literal missing
+    ];
+    // Encodings the generated tables describe that the typed model refuses by
+    // construction (a DPP control it does not model, a non-canonical or
+    // unverified form, a register the typed operand rules exclude). The typed
+    // decoder stays strict; `Inst::decode` falls back to a generated
+    // instruction that is refused by name everywhere without a model.
+    let unmodelled = [
+        vec![0x7e02_02fa, 0xff01_5002], // row_newbcast (not modelled)
         vec![0x7e02_02f9, 0x0606_0602], // VOP1 SDWA with src1 fields
         vec![0x7e02_02f9, 0x0016_0602], // v_mov_b32 SDWA neg (int source)
         vec![0x7e02_a8f9, 0x0003_0002], // fp8 SDWA dst_sel BYTE_0
         vec![0x7d94_06f9, 0x0400_6a02], // VOPC SDWA SD=0 with SDST bits
         vec![0x7d94_06f9, 0x0400_ea02], // VOPC SDWA SD=1 SDST=VCC (non-canonical)
-        vec![0x7d94_06fa, 0xff00_e402], // VOPC DPP
         vec![0x7e00_0001],              // v_nop with a nonzero field
         vec![0x7ef8_0502],              // v_readfirstlane_b32 m0
-        vec![0x7e02_c800],              // VOP1 opcode 100: not in table
-        vec![0x7e02_02ff],              // literal missing
-        vec![0x0002_0702 | 4 << 25],    // VOP2 opcode 4: not in table
     ];
-    for words in &reject {
+
+    // The typed decoders refuse every one of them.
+    let typed = |words: &[u32]| -> Result<(), String> {
+        match words[0] >> 25 {
+            0b011_1111 => Vop1::decode(A, words).map(drop),
+            0b011_1110 => Vopc::decode(A, words).map(drop),
+            _ => Vop2::decode(A, words).map(drop),
+        }
+    };
+    for words in malformed.iter().chain(&unmodelled) {
+        assert!(
+            typed(words).is_err(),
+            "typed decoder accepted {words:#010x?}"
+        );
+    }
+
+    for words in &malformed {
         assert!(
             Inst::decode(A, words).is_err(),
-            "decoded {words:#010x?} as {:?}",
+            "decoded malformed {words:#010x?} as {:?}",
             Inst::decode(A, words)
         );
     }
+
+    // A legal form the typed model does not represent is never a typed
+    // instruction: it is refused, or carried as a generated instruction that
+    // spans the whole input and is refused by name.
+    for words in &unmodelled {
+        match Inst::decode(A, words) {
+            Err(_) => {}
+            Ok((inst, n)) => {
+                let Some(x) = inst.xml() else {
+                    panic!("typed instruction decoded from unmodelled {words:#010x?}: {inst:?}")
+                };
+                assert_eq!(n, words.len(), "{words:#010x?} decoded as {inst:?}");
+                let why = inst
+                    .unsupported()
+                    .expect("generated instruction is unsupported");
+                assert!(
+                    why.contains(x.name()) && why.contains("no hand-written model"),
+                    "{words:#010x?}: unsupported text {why:?}"
+                );
+            }
+        }
+    }
+
+    // row_newbcast is a legal gfx942 DPP control: it decodes to the generated
+    // v_mov_b32 DPP row, named in the refusal, with its control preserved.
+    let newbcast = [0x7e02_02fa, 0xff01_5002];
+    let (inst, n) = Inst::decode(A, &newbcast).expect("row_newbcast decodes as a generated row");
+    assert_eq!(n, 2);
+    let x = inst
+        .xml()
+        .unwrap_or_else(|| panic!("row_newbcast decoded as a typed instruction: {inst:?}"));
+    assert_eq!(x.name(), "v_mov_b32");
+    assert_eq!(x.encoding(), "VOP1_VOP_DPP");
+    assert_eq!(x.field("DPP_CTRL"), Some(0x150));
+    let why = inst
+        .unsupported()
+        .expect("generated instruction is unsupported");
+    assert!(
+        why.contains("v_mov_b32") && why.contains("no hand-written model"),
+        "unsupported text {why:?}"
+    );
 }
 
 #[test]
@@ -1068,7 +1181,7 @@ fn op_properties() {
     );
     assert_eq!(Vop2Op::ALL.iter().filter(|o| o.writes_vcc()).count(), 6);
     assert!(!Vop2Op::CndmaskB32.writes_vcc());
-    assert_eq!(VopcOp::ALL.iter().filter(|o| o.is_cmpx()).count(), 8);
+    assert_eq!(VopcOp::ALL.iter().filter(|o| o.is_cmpx()).count(), 6 + 32);
     for &op in VopcOp::ALL {
         assert_eq!(op.is_cmpx(), op.name().starts_with("v_cmpx_"), "{op:?}")
     }
@@ -1172,4 +1285,224 @@ fn footprints() {
             && has(&f.defs, RegFile::Exec, 0, 2)
             && !has(&f.defs, RegFile::Vcc, 0, 2)
     );
+}
+
+/// `v_cmp_ngt_f32` (opcode 75) and `v_cmp_nlt_f32` (opcode 78) as they appear
+/// in the compiled gfx942 elementwise kernel: `v_cmp_nlt_f32 vcc, s0, v0` =
+/// 0x7c9c0000, `v_cmp_ngt_f32 vcc, s0, v0` = 0x7c960000.
+#[test]
+fn unordered_float_compares_pinned() {
+    for (op, word, name) in [
+        (VopcOp::CmpNltF32, 0x7c9c_0000u32, "v_cmp_nlt_f32"),
+        (VopcOp::CmpNgtF32, 0x7c96_0000, "v_cmp_ngt_f32"),
+    ] {
+        let inst = ic(op, Sgpr(0), Vgpr(0), VopExt::None);
+        assert_eq!(inst.words(A).unwrap(), [word], "{name}");
+        assert_eq!(
+            Inst::decode(A, &[word]).unwrap(),
+            (inst.clone(), 1),
+            "{name}"
+        );
+        assert_eq!(inst.to_string(), format!("{name}_e32 vcc, s0, v0"));
+    }
+}
+
+/// Signed 64-bit compares (gfx942 opcodes 228 / 230), bytes proven against
+/// the hardware oracle: `v_cmp_gt_i64 vcc, v[0:1], v[2:3]` = `00 05 c8 7d`,
+/// `v_cmp_ge_i64 vcc, v[0:1], v[2:3]` = `00 05 cc 7d`.
+#[test]
+fn signed_i64_compares_pinned() {
+    for (op, word, name, opcode) in [
+        (VopcOp::CmpGtI64, 0x7dc8_0500u32, "v_cmp_gt_i64", 228u8),
+        (VopcOp::CmpGeI64, 0x7dcc_0500, "v_cmp_ge_i64", 230),
+    ] {
+        assert_eq!(op.name(), name);
+        assert_eq!(op.opcode(A), Some(opcode));
+        assert_eq!(op.src_dwords(), 2);
+        assert!(!op.is_cmpx());
+        let inst = ic(op, Vgpr(0), Vgpr(2), VopExt::None);
+        assert_eq!(inst.words(A).unwrap(), [word], "{name}");
+        assert_eq!(
+            Inst::decode(A, &[word]).unwrap(),
+            (inst.clone(), 1),
+            "{name}"
+        );
+        assert_eq!(inst.to_string(), format!("{name}_e32 vcc, v[0:1], v[2:3]"));
+        let inv_two_pi = ic(op, Float(InlineFloat::InvTwoPi), Vgpr(8), VopExt::None);
+        assert_eq!(
+            inv_two_pi.to_string(),
+            format!("{name}_e32 vcc, 0.15915494309189532, v[8:9]")
+        );
+
+        // Width bounds: a pair at v254 is the last legal VSRC1; v255 and an
+        // odd-width operand fall off the file / are refused.
+        assert!(ic(op, Vgpr(2), Vgpr(254), VopExt::None).words(A).is_ok());
+        assert!(ic(op, Vgpr(2), Vgpr(255), VopExt::None).words(A).is_err());
+        // No SDWA / DPP form for a 64-bit compare.
+        assert!(ic(op, Vgpr(2), Vgpr(4), VopExt::Sdwa(sdwa()))
+            .words(A)
+            .is_err());
+
+        let f = ic(op, Sgpr(4), Vgpr(6), VopExt::None).footprint();
+        assert!(
+            has(&f.uses, RegFile::Exec, 0, 2)
+                && has(&f.uses, RegFile::Sgpr, 4, 2)
+                && has(&f.uses, RegFile::Vgpr, 6, 2)
+                && has(&f.defs, RegFile::Vcc, 0, 2)
+                && !has(&f.defs, RegFile::Exec, 0, 2),
+            "{name}"
+        );
+    }
+}
+
+/// `v_cmp_ge_u64 vcc, v[16:17], v[12:13]` (opcode 238), as in the frozen router image.
+#[test]
+fn unsigned_ge_u64_compare_pinned() {
+    let inst = ic(VopcOp::CmpGeU64, Vgpr(16), Vgpr(12), VopExt::None);
+    assert_eq!(VopcOp::CmpGeU64.opcode(A), Some(238));
+    assert_eq!(VopcOp::CmpGeU64.name(), "v_cmp_ge_u64");
+    assert_eq!(VopcOp::CmpGeU64.src_dwords(), 2);
+    assert!(!VopcOp::CmpGeU64.is_cmpx() && VopcOp::CmpGeU64.float_compare().is_none());
+    assert_eq!(inst.words(A).unwrap(), [0x7ddc_1910]);
+    assert_eq!(Inst::decode(A, &[0x7ddc_1910]).unwrap(), (inst.clone(), 1));
+    assert_eq!(inst.to_string(), "v_cmp_ge_u64_e32 vcc, v[16:17], v[12:13]");
+}
+
+const FLOAT_PREDICATES: [&str; 16] = [
+    "f", "lt", "eq", "le", "gt", "lg", "ge", "o", "u", "nge", "nlg", "ngt", "nle", "neq", "nlt",
+    "tru",
+];
+
+/// The whole F16/F32 compare family: 64 distinct ops whose name, opcode,
+/// `float_compare()` and `is_cmpx()` agree with each other.
+#[test]
+fn float_compare_family_table() {
+    let fam: Vec<VopcOp> = VopcOp::ALL
+        .iter()
+        .copied()
+        .filter(|o| o.float_compare().is_some())
+        .collect();
+    assert_eq!(fam.len(), 64);
+    let mut seen = std::collections::HashSet::new();
+    for op in fam {
+        let (width, pred) = op.float_compare().unwrap();
+        assert!(width == 16 || width == 32, "{op:?}");
+        assert_eq!(op.src_dwords(), 1, "{op:?}");
+        let cmpx = op.is_cmpx();
+        let base = match (width, cmpx) {
+            (16, false) => 32,
+            (16, true) => 48,
+            (_, false) => 64,
+            (_, true) => 80,
+        };
+        assert_eq!(op.opcode(A), Some(base + pred), "{op:?}");
+        assert_eq!(
+            op.name(),
+            format!(
+                "v_cmp{}_{}_f{width}",
+                if cmpx { "x" } else { "" },
+                FLOAT_PREDICATES[pred as usize]
+            ),
+            "{op:?}"
+        );
+        assert!(seen.insert((width, pred, cmpx)), "{op:?} duplicated");
+        assert_eq!(VopcOp::from_opcode(A, base + pred), Some(op));
+    }
+    assert!(VopcOp::CmpClassF32.float_compare().is_none());
+    assert!(VopcOp::CmpEqU32.float_compare().is_none());
+    assert!(VopcOp::CmpxEqU32.float_compare().is_none());
+}
+
+/// Every float compare round-trips as the typed `Vopc` (never an opaque
+/// word): e32 with VCC, SDWA with VCC / an SGPR pair and word selects, the
+/// footprint carries VCC (or the SGPR pair) and, for CMPX, EXEC.
+#[test]
+fn float_compare_family_round_trips() {
+    let mut cases = Vec::new();
+    for &op in VopcOp::ALL.iter().filter(|o| o.float_compare().is_some()) {
+        let f16 = op.float_compare().unwrap().0 == 16;
+        let (lit, one) = if f16 {
+            (Lit(0x1234), Float(InlineFloat::One))
+        } else {
+            (Lit(0x3e22_f983), Float(InlineFloat::One))
+        };
+        for (s0, s1) in [
+            (Vgpr(2), Vgpr(3)),
+            (Sgpr(10), Vgpr(255)),
+            (lit, Vgpr(7)),
+            (one, Vgpr(0)),
+        ] {
+            cases.push(ic(op, s0, s1, VopExt::None));
+        }
+        let s = Sdwa {
+            src0_sel: SdwaSel::Word1,
+            src1_sel: SdwaSel::Word0,
+            src0_neg: true,
+            src1_abs: true,
+            ..sdwa()
+        };
+        cases.push(ic(op, Vgpr(2), Vgpr(3), VopExt::Sdwa(s)));
+        cases.push(ic(
+            op,
+            Sgpr(2),
+            Vgpr(3),
+            VopExt::Sdwa(Sdwa {
+                sdst: Some(Sgpr(4)),
+                ..sdwa()
+            }),
+        ));
+        // No DPP form.
+        assert!(ic(
+            op,
+            Vgpr(2),
+            Vgpr(3),
+            VopExt::Dpp(dpp(DppCtrl::QuadPerm([0, 1, 2, 3])))
+        )
+        .words(A)
+        .is_err());
+        let f = ic(op, Vgpr(2), Vgpr(3), VopExt::None).footprint();
+        assert!(has(&f.defs, RegFile::Vcc, 0, 2), "{op:?}");
+        assert_eq!(has(&f.defs, RegFile::Exec, 0, 2), op.is_cmpx(), "{op:?}");
+        let f = ic(
+            op,
+            Vgpr(2),
+            Vgpr(3),
+            VopExt::Sdwa(Sdwa {
+                sdst: Some(Sgpr(4)),
+                ..sdwa()
+            }),
+        )
+        .footprint();
+        assert!(
+            has(&f.defs, RegFile::Sgpr, 4, 2) && !has(&f.defs, RegFile::Vcc, 0, 2),
+            "{op:?}"
+        );
+        assert_eq!(has(&f.defs, RegFile::Exec, 0, 2), op.is_cmpx(), "{op:?}");
+        // A 32-bit literal is not an F16 operand.
+        if f16 {
+            assert!(ic(op, Lit(0xdead_beef), Vgpr(1), VopExt::None)
+                .words(A)
+                .is_err());
+        }
+    }
+    let texts: Vec<String> = cases.iter().map(|i| i.to_string()).collect();
+    let mut bytes = Vec::new();
+    for inst in &cases {
+        let words = inst
+            .words(A)
+            .unwrap_or_else(|e| panic!("encode {inst}: {e}"));
+        let (back, n) = Inst::decode(A, &words).unwrap();
+        assert_eq!((n, &back), (words.len(), inst), "{inst}");
+        assert!(matches!(back, Inst::Vopc(_)));
+        bytes.push(oracle::bytes(&words));
+    }
+    if oracle::disabled() {
+        return;
+    }
+    let mc = oracle::mc_encode(A, &texts).unwrap();
+    for (i, (text, enc)) in mc.iter().enumerate() {
+        assert_eq!((text, enc), (&texts[i], &bytes[i]), "{:?}", cases[i]);
+    }
+    let dis = oracle::mc_disassemble(A, &bytes).unwrap();
+    assert_eq!(dis, texts);
 }

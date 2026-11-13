@@ -4,7 +4,7 @@
 
 //! Scratch buffer state extracted from the Gpu god object.
 //! Owns all per-GPU scratch allocations for FWHT rotation, FP16/FP8/INT8
-//! activation conversion, and ParoQuant activation copies.
+//! activation conversion.
 
 use crate::kernels;
 use crate::{DType, GpuTensor};
@@ -368,15 +368,18 @@ pub struct ScratchState {
     /// producer's rotated-row output, `[batch * k]`; the in-register producer
     /// never writes it). Lazily allocated, grown on demand, never shrunk.
     pub mq6_fp8_x_rot: Option<GpuTensor>,
-    pub paro_x_scratch: Option<GpuTensor>,
-    /// Rotation scratch buffers for PARO fused-kernel dispatch. 4 × [k] F32
-    /// buffers, lazily allocated and grown on demand. Used by
-    /// `fused_qkvza_paro4g128t` (4 explicit) and `fused_gate_up_paro4g128t`
-    /// (1 explicit + `mq_x_rot` internal). `ensure_paro_fused_scratch`
-    /// allocates/grows; `DeviceBuffer::alias()` builds per-call descriptors.
-    pub paro_fused_scratch: Option<Vec<GpuTensor>>,
     pub fp16_x_scratch: Option<DeviceBuffer>,
     pub fp16_x_scratch_bytes: usize,
+    /// Fixed-size split-K scratch of the lane WMMA route (`crate::lane_wmma`): allocated lazily on
+    /// first use, zeroed once, never grown or replaced.
+    pub lane_wmma_scratch: Option<crate::lane_wmma::LaneWmmaScratch>,
+    /// Multi-part split-K scratch of the lane WMMA route (`HIPFIRE_QWEN4_LWMMA_MULTI_PART`):
+    /// disjoint partial slices for up to four parts of one launch; lazily allocated, zeroed once,
+    /// never grown.
+    pub lane_wmma_multi_scratch: Option<crate::lane_wmma::LaneWmmaScratch>,
+    /// Reused exact-BF16 expansions of the HC8 sidecar weights (`crate::hc8_weight`): slot 0 the HC
+    /// down, slot 1 the HC up. Allocated lazily on first prefill-class use, never regrown.
+    pub hc8_bf16: [Option<GpuTensor>; 2],
     /// Global score rows for the QSA block selector when an arena's pooled
     /// block count exceeds its dynamic-LDS row (contexts past 61,440 tokens):
     /// `QSA_SELECT_GLOBAL_ROWS` rows of the arena's padded block count.
@@ -444,10 +447,26 @@ pub struct ScratchState {
     /// Bumped by every [`Self::reserve_q8_a8_x`] (each producer launch rewrites the sidecar), so
     /// prepared activations can detect that a later quantizer overwrote them.
     pub q8_a8_x_generation: u64,
+    /// MQ8G256 prefill sidecar: int8 [N, K] codes followed by F32 scales [K/256, N]
+    /// (`mq8_rotate_quantize_x_batched`), laid out by [`mq8_x_layout`].
+    pub mq8_x_scratch: Option<DeviceBuffer>,
+    pub mq8_x_scratch_bytes: usize,
+    /// Bumped by every [`Self::reserve_mq8_x`] (each producer launch rewrites the sidecar), so
+    /// prepared activations can detect that a later quantizer overwrote them.
+    pub mq8_x_generation: u64,
     /// A8 `block_i8_128` sidecar, [K/128, N] of 136-byte blocks.
     pub int8_mmq_x_scratch: Option<DeviceBuffer>,
     pub int8_mmq_x_scratch_bytes: usize,
     pub int8_mmq_generation: u64,
+    /// X8c: the flat-slot down sidecar `[K_down/128, total_slots]` of 136-byte `block_i8_128` records that the
+    /// gate/up GEMM with the rotate128 epilogue (`qwen4_moe_ep_a8_gate_up_rot_planar_nt{1,2}`) writes. A buffer of
+    /// its own, never the shared `int8_mmq_x_scratch`: that one holds the gate sidecar the same launch is still
+    /// reading. Eager-only, like the unfused chain.
+    pub int8_mmq_down_x_scratch: Option<DeviceBuffer>,
+    pub int8_mmq_down_x_scratch_bytes: usize,
+    pub int8_mmq_down_generation: u64,
+    /// The sidecar the last fused gate/up launch left for the down GEMM of the same call (taken by it).
+    pub int8_mmq_down_pending: Option<Int8MmqPrepared>,
     /// Qwen4 symmetric IU4 MoE stable-grouping scratch: `[L]` local ranks,
     /// `[E, C]` per-chunk counts and `[E, C + 1]` chunk prefixes (`C =
     /// ceil(L / 256)`), one allocation laid out by [`qwen4_moe_group_layout`].
@@ -1796,6 +1815,30 @@ pub fn qwen4_dense_gdn_admits(arch: &str, format: crate::tensor_ops::GdnStateFor
         )
 }
 
+/// Head geometries `(key heads, value heads)` the dense GDN scan kernels (`fn_gdn_dense`; 128-wide
+/// heads, K = 4 convolution) are compiled for: the Flash-Next geometry and the rank-local geometry
+/// of the TP2 trunk shard (`HIPFIRE_QWEN4_EP_TRUNK_SHARD`: half the heads of each).
+pub const QWEN4_DENSE_GDN_GEOMETRIES: [(usize, usize); 2] = [(16, 48), (8, 24)];
+
+/// Whether the dense GDN scan kernels take this head geometry: one of
+/// [`QWEN4_DENSE_GDN_GEOMETRIES`], 128-wide key and value heads, and the matching q | k | v
+/// convolution width. A pure function shared by the route's own admission
+/// (`fn_gdn_dense::applies`) and the prefill-workspace census, so the census charges the dense
+/// scan's scratch exactly where the route can run (it charges the 48-head upper bound, which
+/// covers every admitted geometry).
+pub fn qwen4_dense_gdn_geometry_admits(
+    key_heads: usize,
+    value_heads: usize,
+    key_dim: usize,
+    value_dim: usize,
+    qkv_width: usize,
+) -> bool {
+    key_dim == 128
+        && value_dim == 128
+        && QWEN4_DENSE_GDN_GEOMETRIES.contains(&(key_heads, value_heads))
+        && qkv_width == 2 * key_heads * key_dim + value_heads * value_dim
+}
+
 /// Model dimensions the Qwen4 prefill workspace census reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Qwen4PrefillWorkspaceDims {
@@ -1902,6 +1945,15 @@ pub fn qwen4_prefill_workspace_terms(
 pub(crate) fn q8_a8_x_layout(k: usize, n: usize) -> (usize, usize) {
     let scales_off = (n * k).next_multiple_of(256);
     (scales_off, scales_off + n * (k / 32) * 4)
+}
+
+/// Byte layout of the MQ8G256 activation sidecar for `(k, n)`:
+/// `(scales_offset, total_bytes)`. int8 `[n, k]` at 0, F32 scales
+/// `[k / 256, n]` (`Xs[group * n + token]`) at a 256-byte aligned offset.
+#[inline]
+pub(crate) fn mq8_x_layout(k: usize, n: usize) -> (usize, usize) {
+    let scales_off = (n * k).next_multiple_of(256);
+    (scales_off, scales_off + n * (k / 256) * 4)
 }
 
 #[inline]
@@ -2095,6 +2147,7 @@ impl ScratchState {
         hip: &HipRuntime,
         pool: &mut crate::pool::GpuPool,
         device_id: i32,
+        stream: Option<&hip_bridge::Stream>,
     ) -> HipResult<()> {
         crate::graph::bind_thread(hip, device_id)?;
         if self.mq_signs1.is_some() {
@@ -2106,8 +2159,8 @@ impl ScratchState {
         let s2b: Vec<u8> = s2.iter().flat_map(|v| v.to_ne_bytes()).collect();
         let s1t = alloc_tensor_on(hip, pool, device_id, &[MQ_FWHT_SIGNS_G256], DType::F32)?;
         let s2t = alloc_tensor_on(hip, pool, device_id, &[MQ_FWHT_SIGNS_G256], DType::F32)?;
-        hip.memcpy_htod(&s1t.buf, &s1b)?;
-        hip.memcpy_htod(&s2t.buf, &s2b)?;
+        upload_ordered(hip, stream, &s1t.buf, &s1b)?;
+        upload_ordered(hip, stream, &s2t.buf, &s2b)?;
         // Allocate scratch buffers — 32K elements covers K up to 32768
         let x_rot = alloc_tensor_on(hip, pool, device_id, &[MQ_X_ROT_ELEMS], DType::F32)?;
         let x_q8 = hip.malloc(MQ_X_Q8_BYTES)?; // INT8 buffer for dp4a
@@ -2166,6 +2219,7 @@ impl ScratchState {
         hip: &HipRuntime,
         pool: &mut crate::pool::GpuPool,
         device_id: i32,
+        stream: Option<&hip_bridge::Stream>,
     ) -> HipResult<()> {
         crate::graph::bind_thread(hip, device_id)?;
         if self.mq_signs1_128.is_some() && self.mq_x_rot.is_some() {
@@ -2178,8 +2232,8 @@ impl ScratchState {
             let s2b: Vec<u8> = signs2.iter().flat_map(|v| v.to_ne_bytes()).collect();
             let s1t = alloc_tensor_on(hip, pool, device_id, &[MQ_FWHT_SIGNS_G128], DType::F32)?;
             let s2t = alloc_tensor_on(hip, pool, device_id, &[MQ_FWHT_SIGNS_G128], DType::F32)?;
-            hip.memcpy_htod(&s1t.buf, &s1b)?;
-            hip.memcpy_htod(&s2t.buf, &s2b)?;
+            upload_ordered(hip, stream, &s1t.buf, &s1b)?;
+            upload_ordered(hip, stream, &s2t.buf, &s2b)?;
             self.mq_signs1_128 = Some(s1t);
             self.mq_signs2_128 = Some(s2t);
         }
@@ -2187,89 +2241,6 @@ impl ScratchState {
         if self.mq_x_rot.is_none() {
             let x_rot = alloc_tensor_on(hip, pool, device_id, &[MQ_X_ROT_ELEMS], DType::F32)?;
             self.mq_x_rot = Some(x_rot);
-        }
-        Ok(())
-    }
-
-    /// Ensure the ParoQuant activation scratch buffer is allocated (F32, sized for dim).
-    pub fn ensure_paro_scratch(
-        &mut self,
-        hip: &HipRuntime,
-        device_id: i32,
-        dim: usize,
-    ) -> HipResult<()> {
-        crate::graph::bind_thread(hip, device_id)?;
-        if let Some(ref s) = self.paro_x_scratch {
-            if s.buf.size() >= dim * 4 {
-                return Ok(());
-            }
-        }
-        // Free-before-alloc: `GpuTensor` has no `Drop`; see `ensure_gemv_residual_tmp`.
-        if let Some(old) = self.paro_x_scratch.take() {
-            hip.device_synchronize()?;
-            note_scratch_growth();
-            let _ = hip.free(old.buf);
-        }
-        let buf = hip.malloc(dim * 4)?; // F32
-        self.paro_x_scratch = Some(GpuTensor {
-            buf,
-            shape: vec![dim],
-            dtype: DType::F32,
-        });
-        Ok(())
-    }
-
-    /// Ensure 4 rotation scratch buffers for Paro fused-kernel dispatch.
-    /// Each buffer is sized `[k]` F32. On first call, allocates all 4;
-    /// on subsequent calls, grows any buffer whose size is < k.
-    /// Separate from `paro_x_scratch` (single activation buffer) because
-    /// the fused kernels rotate weights internally and need multiple
-    /// independent rotation output buffers.
-    pub fn ensure_paro_fused_scratch(
-        &mut self,
-        hip: &HipRuntime,
-        device_id: i32,
-        k: usize,
-    ) -> HipResult<()> {
-        crate::graph::bind_thread(hip, device_id)?;
-        let needed_bytes = k * 4; // F32
-        match &mut self.paro_fused_scratch {
-            Some(bufs) => {
-                // Grow any buffer that's too small (never shrinks).
-                for buf in bufs.iter_mut() {
-                    if buf.buf.size() < needed_bytes {
-                        // Alloc-first (not free-first): a malloc failure leaves
-                        // the old buffer live in the slot via `?`, and these
-                        // four F32 rows are small enough that briefly holding
-                        // both is harmless. `GpuTensor`/`DeviceBuffer` have no
-                        // `Drop`, so free the replaced buffer explicitly. The
-                        // `Gpu` caller invalidated captured graphs first (same
-                        // contract as `grow_scratch_buffer`), so sync + free.
-                        let old = std::mem::replace(
-                            buf,
-                            GpuTensor {
-                                buf: hip.malloc(needed_bytes)?,
-                                shape: vec![k],
-                                dtype: DType::F32,
-                            },
-                        );
-                        hip.device_synchronize()?;
-                        note_scratch_growth();
-                        let _ = hip.free(old.buf);
-                    }
-                }
-            }
-            None => {
-                let mut vec = Vec::with_capacity(4);
-                for _ in 0..4 {
-                    vec.push(GpuTensor {
-                        buf: hip.malloc(needed_bytes)?,
-                        shape: vec![k],
-                        dtype: DType::F32,
-                    });
-                }
-                self.paro_fused_scratch = Some(vec);
-            }
         }
         Ok(())
     }
@@ -2410,6 +2381,42 @@ impl ScratchState {
         x: &GpuTensor,
         n_elems: usize,
     ) -> HipResult<*mut c_void> {
+        let out_ptr = self.fp16_x_scratch_writable(hip, n_elems)?;
+        self.convert_f32_to_f16_to_ptr(
+            hip,
+            compiler,
+            modules,
+            functions,
+            stream,
+            capture_blobs,
+            capture_mode,
+            force_blob_path,
+            replay,
+            x,
+            out_ptr,
+            n_elems,
+        )?;
+        Ok(self.fp16_x_scratch.as_ref().unwrap().as_ptr())
+    }
+
+    /// The `convert_f32_to_f16` launch of [`Self::convert_fp16_x_uncached`] with a caller-chosen
+    /// destination: the same kernel, grid and cast, so the F16 words written to `out_ptr` equal
+    /// the scratch's. `out_ptr` must hold `n_elems` F16 words.
+    pub fn convert_f32_to_f16_to_ptr(
+        &mut self,
+        hip: &HipRuntime,
+        compiler: &mut crate::compiler::KernelCompiler,
+        modules: &mut HashMap<String, Module>,
+        functions: &mut HashMap<String, Function>,
+        stream: Option<&Stream>,
+        capture_blobs: &mut Vec<Vec<u8>>,
+        capture_mode: bool,
+        force_blob_path: bool,
+        replay: &mut crate::replay::ReplayController,
+        x: &GpuTensor,
+        out_ptr: *mut c_void,
+        n_elems: usize,
+    ) -> HipResult<()> {
         compile_and_load_kernel(
             compiler,
             hip,
@@ -2423,7 +2430,6 @@ impl ScratchState {
         )?;
 
         let in_ptr = x.buf.as_ptr();
-        let out_ptr = self.fp16_x_scratch_writable(hip, n_elems)?;
         let n_val = n_elems as i32;
         let mut in_ptr_m = in_ptr;
         let mut out_ptr_m = out_ptr;
@@ -2455,8 +2461,7 @@ impl ScratchState {
                 b.push_i32(n_val);
                 b
             },
-        )?;
-        Ok(self.fp16_x_scratch.as_ref().unwrap().as_ptr())
+        )
     }
 
     /// Ensure the FP8 (E4M3) X scratch contains the conversion of `x`
@@ -3354,6 +3359,31 @@ impl ScratchState {
         ))
     }
 
+    /// Grow the MQ8G256 activation sidecar to hold `(k, n)` and return
+    /// `(xq, xs)` device pointers (int8 `[n, k]` and F32 scales `[k/256, n]`).
+    /// Callers invalidate graphs before growth (see `Gpu::mq8_quantize_x`); the
+    /// producer overwrites every byte it reads.
+    pub(crate) fn reserve_mq8_x(
+        &mut self,
+        hip: &HipRuntime,
+        k: usize,
+        n: usize,
+    ) -> HipResult<(*mut c_void, *mut c_void)> {
+        let (scales_off, needed) = mq8_x_layout(k, n);
+        grow_scratch_buffer(
+            hip,
+            &mut self.mq8_x_scratch,
+            &mut self.mq8_x_scratch_bytes,
+            needed,
+        )?;
+        self.mq8_x_generation = self.mq8_x_generation.wrapping_add(1);
+        let base = self.mq8_x_scratch.as_ref().unwrap().as_ptr();
+        Ok((
+            base,
+            (base as *mut u8).wrapping_add(scales_off) as *mut c_void,
+        ))
+    }
+
     /// Always re-quantize the f32 activation row into the dedicated A8 sidecar.
     #[allow(clippy::too_many_arguments)]
     pub fn ensure_int8_mmq_x(
@@ -3595,6 +3625,47 @@ impl ScratchState {
                 .map_or(std::ptr::null_mut(), |b| b.as_ptr()),
         )
     }
+
+    /// Reserve the dedicated flat-slot down sidecar `[k / 128, n]` of the gate/up GEMM with the rotate128
+    /// epilogue ([`Self::int8_mmq_down_x_scratch`]); bumps its own generation. `k % 128 == 0`.
+    pub fn reserve_int8_mmq_down(
+        &mut self,
+        hip: &HipRuntime,
+        k: usize,
+        n: usize,
+    ) -> HipResult<Int8MmqReservation> {
+        if k == 0 || n == 0 || k % 128 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "reserve_int8_mmq_down: need k%128==0 and n>0",
+            ));
+        }
+        let needed = int8_mmq_x_needed(k, n);
+        grow_scratch_buffer(
+            hip,
+            &mut self.int8_mmq_down_x_scratch,
+            &mut self.int8_mmq_down_x_scratch_bytes,
+            needed,
+        )?;
+        self.int8_mmq_down_generation = self.int8_mmq_down_generation.wrapping_add(1);
+        Ok(Int8MmqReservation {
+            ptr: self.int8_mmq_down_x_scratch.as_ref().unwrap().as_ptr(),
+            k,
+            n,
+            generation: self.int8_mmq_down_generation,
+        })
+    }
+
+    /// `(generation, pointer)` of the dedicated down sidecar, the staleness key of its
+    /// [`Int8MmqPrepared`] handles.
+    pub fn int8_mmq_down_live(&self) -> (u64, *mut c_void) {
+        (
+            self.int8_mmq_down_generation,
+            self.int8_mmq_down_x_scratch
+                .as_ref()
+                .map_or(std::ptr::null_mut(), |b| b.as_ptr()),
+        )
+    }
     /// Grow the three MQ4v2 FP8 pre-pass buffers for a producer-emitted FP8
     /// stream and return their device pointers `(x_fp8, half_sums,
     /// row_scales)`. Does **not** launch `pack_f32_to_fp8_mq4v2_gfx12` — the
@@ -3721,7 +3792,7 @@ impl ScratchState {
         k: usize,
     ) -> HipResult<()> {
         crate::graph::bind_thread(hip, device_id)?;
-        self.ensure_mq_signs(hip, pool, device_id)?;
+        self.ensure_mq_signs(hip, pool, device_id, stream.filter(|_| !capture_mode))?;
         let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
         let n_groups = (k / 256) as u32;
@@ -3787,7 +3858,7 @@ impl ScratchState {
         batch_size: usize,
     ) -> HipResult<()> {
         crate::graph::bind_thread(hip, device_id)?;
-        self.ensure_mq_signs(hip, pool, device_id)?;
+        self.ensure_mq_signs(hip, pool, device_id, stream.filter(|_| !capture_mode))?;
         let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
         let n_groups = (k / 256) as u32;
@@ -3854,7 +3925,7 @@ impl ScratchState {
         k: usize,
     ) -> HipResult<()> {
         crate::graph::bind_thread(hip, device_id)?;
-        self.ensure_mq_signs_128(hip, pool, device_id)?;
+        self.ensure_mq_signs_128(hip, pool, device_id, stream.filter(|_| !capture_mode))?;
         let s1_ptr = self.mq_signs1_128.as_ref().unwrap().buf.as_ptr();
         let s2_ptr = self.mq_signs2_128.as_ref().unwrap().buf.as_ptr();
         let n_groups = (k / 128) as u32;
@@ -3919,7 +3990,7 @@ impl ScratchState {
         k: usize,
     ) -> HipResult<()> {
         crate::graph::bind_thread(hip, device_id)?;
-        self.ensure_mq_signs(hip, pool, device_id)?;
+        self.ensure_mq_signs(hip, pool, device_id, stream.filter(|_| !capture_mode))?;
         let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
         let n_groups = (k / 256) as u32;
@@ -3990,7 +4061,7 @@ impl ScratchState {
         batch_size: usize,
     ) -> HipResult<()> {
         crate::graph::bind_thread(hip, device_id)?;
-        self.ensure_mq_signs(hip, pool, device_id)?;
+        self.ensure_mq_signs(hip, pool, device_id, stream.filter(|_| !capture_mode))?;
         let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
         let n_groups = (k / 256) as u32;
@@ -4065,7 +4136,7 @@ impl ScratchState {
         x_rot: &GpuTensor,
         k: usize,
     ) -> HipResult<*mut c_void> {
-        self.ensure_mq_signs(hip, pool, device_id)?;
+        self.ensure_mq_signs(hip, pool, device_id, stream.filter(|_| !capture_mode))?;
         compile_and_load_kernel(
             compiler,
             hip,
@@ -4147,7 +4218,7 @@ impl ScratchState {
         k: usize,
     ) -> HipResult<()> {
         crate::graph::bind_thread(hip, device_id)?;
-        self.ensure_mq_signs(hip, pool, device_id)?;
+        self.ensure_mq_signs(hip, pool, device_id, stream.filter(|_| !capture_mode))?;
 
         let xq_ptr = self.mq_x_q8.as_ref().unwrap().as_ptr();
         let xs_ptr = self.mq_x_scales.as_ref().unwrap().as_ptr();
@@ -4893,6 +4964,36 @@ mod prefill_workspace_tests {
         assert!(!qwen4_dense_gdn_admits("gfx1201", F32));
     }
 
+    /// The dense GDN scan's head geometry: the Flash-Next 16 / 48 pin of the incumbent route
+    /// (10240-wide) is unchanged, the TP2 trunk shard's rank-local 8 / 24 (5120-wide) is
+    /// admitted, everything else (other head counts, the 8 / 48 and 16 / 24 mixes, a head
+    /// width other than 128, a mismatched q | k | v width) keeps the incumbent recurrence.
+    #[test]
+    fn dense_gdn_geometry_pins_flash_next_and_admits_the_rank_local_shard() {
+        assert!(qwen4_dense_gdn_geometry_admits(16, 48, 128, 128, 10240));
+        assert!(qwen4_dense_gdn_geometry_admits(8, 24, 128, 128, 5120));
+        for (kh, vh, kd, vd, qkv) in [
+            (16, 48, 128, 128, 5120),
+            (8, 24, 128, 128, 10240),
+            (8, 48, 128, 128, 8192),
+            (16, 24, 128, 128, 7168),
+            (4, 12, 128, 128, 2560),
+            (16, 32, 128, 128, 8192),
+            (16, 48, 64, 128, 10240),
+            (16, 48, 128, 64, 10240),
+            (0, 0, 128, 128, 0),
+        ] {
+            assert!(
+                !qwen4_dense_gdn_geometry_admits(kh, vh, kd, vd, qkv),
+                "{kh}/{vh} {kd}x{vd} qkv {qkv}"
+            );
+        }
+        // Every admitted geometry fits the 48-head upper bound the census charges.
+        for (kh, vh) in QWEN4_DENSE_GDN_GEOMETRIES {
+            assert!(vh <= 48 && vh % kh == 0 && vh / kh == 3, "{kh}/{vh}");
+        }
+    }
+
     #[test]
     fn workspace_terms_overflow_and_invalid_dims_are_none() {
         assert!(qwen4_prefill_workspace_terms(usize::MAX, &flash_next(None, false)).is_none());
@@ -5102,5 +5203,23 @@ mod scratch_growth_epoch_tests {
         let mid = scratch_growth_epoch();
         note_scratch_growth();
         assert!(scratch_growth_epoch() > mid);
+    }
+}
+
+/// Blocking H→D copy for the first-request scratch initializers: on `stream` with one wait on it
+/// when the caller passes its steady copy stream (`Gpu::steady_copy_stream`), else the blocking
+/// null-stream copy.
+fn upload_ordered(
+    hip: &HipRuntime,
+    stream: Option<&hip_bridge::Stream>,
+    dst: &hip_bridge::DeviceBuffer,
+    src: &[u8],
+) -> HipResult<()> {
+    match stream {
+        Some(stream) => {
+            hip.memcpy_htod_async(dst, src, stream)?;
+            hip.stream_synchronize(stream)
+        }
+        None => hip.memcpy_htod(dst, src),
     }
 }

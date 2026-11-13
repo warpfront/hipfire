@@ -102,7 +102,7 @@ pub(crate) fn handle_bench_prefill(
     // Guard physical_cap — reserve 32 slots of headroom so a subsequent
     // generate request against the loaded model still has room. We guard
     // on the *physical* buffer (not the advertised max_seq) because this
-    // bench intentionally bypasses eviction to measure raw prefill.
+    // bench measures raw prefill.
     if n.saturating_add(32) > m.physical_cap {
         emit_uncorrelated_error(
             stdout,

@@ -11,7 +11,7 @@
 //! no-op: the accepted-prefix KV the verify wrote is already correct, and the
 //! rejected tail is overwritten by the next verify. `kv_cache_mut` stays at its
 //! `None` default — Cohere2MoeState holds its own KV, not the shared
-//! `llama::KvCache`, so arch_id=12 has no FlashCASK eviction.
+//! `llama::KvCache`.
 //!
 //! VERIFY IS SEQUENTIAL: `verify_block` runs one `decode_step` per candidate
 //! block token. This is the correct byte-identical baseline AND it sidesteps
@@ -239,7 +239,5 @@ impl SpecTarget for Cohere2MoeBundle {
         self.state.max_seq
     }
 
-    // kv_cache_mut: default None — Cohere2MoeState is not a `llama::KvCache`,
-    // and arch_id=12 has no FlashCASK eviction (the daemon's eviction sites
-    // are `if let Some(ev)`-gated, so this is never reached).
+    // kv_cache_mut: default None — Cohere2MoeState is not a `llama::KvCache`.
 }

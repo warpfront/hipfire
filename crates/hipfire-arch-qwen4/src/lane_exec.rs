@@ -30,7 +30,9 @@
 //!    over the picks, ring rollback, head commit), runs the head append of
 //!    every `ArSynced` lane, then each prefill tile through the singleton
 //!    chunk program on the lane's own state (an MTP lane's tile also fills
-//!    its head). A pure-decode step's wall clock (draft start to the final
+//!    its head; under `HIPFIRE_EP_LANE_PREFILL_WAVE_EXACT=1` on an EP forward the
+//!    65..=511-row lane tiles of a burst are forwarded together as exact prefill
+//!    waves, [`plan_prefill_parts`]). A pure-decode step's wall clock (draft start to the final
 //!    sync) feeds the store's cost model, then every MTP lane's window
 //!    policy observes its window.
 //! 3. [`Qwen4LaneExecutor::commit_step`] applies the lane bookkeeping. The
@@ -56,6 +58,16 @@
 //! likewise); a step with no sampled lane issues exactly the greedy device
 //! work and downloads.
 //!
+//! With `HIPFIRE_QWEN4_LANE_DEVICE_SAMPLE` on (default on exact gfx1201) no
+//! logits row is downloaded: every sampled lane of a step (its AR row, its
+//! verify window, or its prompt-completing tile) is drawn by ONE
+//! `hipfire_runtime::lane_draw::lane_draws` launch (`lane::lane_sample_device`)
+//! under the shared device sampler's law on the lane's xorshift32 stream. A
+//! window's argmax drafts are verified as point-mass proposals (accept `d` with
+//! probability `p(d)`, else the residual draw from `p` without `d`), so every
+//! emitted token is still distributed as the AR draw; seeded tokens differ from
+//! the host path. Every rank draws the same tokens from its identical rows.
+//!
 //! Under an attached expert-parallel mesh every mutating entry below runs the
 //! identical call on every rank (rank 0 on the caller's thread, peers on
 //! their workers; `Qwen4Bundle::ep_lane_*`), and the host results (drafts,
@@ -72,8 +84,10 @@
 //!   `ArSynced` head append, before each prefill tile, and at the end of
 //!   every verify (`mtp_lanes`).
 //! - I2 (one snapshot ticket, only in a verify): AR lanes snapshot nothing,
-//!   and an AR store's lane states are built without the snapshot arena
-//!   (`StateMirror::Absent`; a snapshot of one is `StateError::MirrorAbsent`).
+//!   and an AR lane's state is built without the snapshot arena
+//!   (`StateMirror::Absent`; a snapshot of one is `StateError::MirrorAbsent`):
+//!   every slot of an AR store, and the AR-only slots of a mixed EP store
+//!   (past `LaneSpecConfig::spec_lanes`); the MTP slots keep the mirror.
 //!   An MTP lane holds one head ticket (taken at `draft_step`) and one target
 //!   ticket (taken at `forward_step`) only inside a `Batched` window; both
 //!   are committed by the window's finish, or dropped with the lane by
@@ -101,24 +115,187 @@
 //!   refuses ends past `state.max_seq_len`.
 
 use crate::bundle::Qwen4Bundle;
-use crate::gpu_forward_lanes::{
-    forward_lanes, row_group_count, LaneOutputs, LaneRowKind, LaneRows, LANE_MAX_ROWS,
-};
+use crate::gpu_forward_lanes::{WaveHead, WaveLane, LANE_MAX_ROWS};
 use crate::lane::{
-    download_lane_rows, lane_sample_step, LaneHost, LaneSampleOutcome, LaneSpecConfig, LaneStatus,
-    Qwen4LaneState, Qwen4LaneStore, SpecStore, StepParts,
+    download_lane_rows, lane_sample_step, LaneHost, LaneStatus, Qwen4LaneState, Qwen4LaneStore,
+    StepParts,
 };
-use crate::mtp_gpu::MtpAppendScratch;
-use crate::mtp_lanes::{
-    ar_synced_head, draft_lanes, finish_lane_window, prefill_tile, LaneCostModel,
+use crate::lane_rank::{plan_and_draft, DecodeAdmission, LaneProto, LocalLaneRank};
+use crate::mesh_lane_protocol::{
+    ConfirmOutcome, ControllerInterval, GreedyRule, LaneMeshExecutor, ProposalSource,
 };
+use crate::mtp_lanes::{fill_head_after_wave, prefill_tile};
 use hipfire_runtime::slot_batch::{
     BatchStepPlan, RequestAdvance, RequestEpoch, RequestRows, RequestStepKind, StepOutput,
 };
-use hipfire_runtime::spec::MtpWindow;
 use rdna_compute::tensor_ops::{argmax_f32, ArgmaxF32};
 use rdna_compute::{Gpu, GpuTensor};
 use std::time::Instant;
+
+/// `HIPFIRE_CB_PHASES=1` (developer diagnostic, read once; the serve step line of the same name
+/// lives in `hipfire-generate`): one `[fn-lane-tile]` stderr line per lane prefill tile, with the
+/// tile's synchronized wall and the route it took (`run_prefill_tiles`).
+pub(crate) static LANE_TILE_PHASES: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_CB_PHASES").is_ok_and(|v| v.trim() == "1")
+});
+
+/// gfx942 single-device lane prefill wave: policy, scope and serve-admission knobs (P2).
+#[path = "gpu_forward/g942_wave.rs"]
+pub mod g942_wave;
+
+/// The knob of the EXACT joint prefill wave of a step's sub-512-row lane prefill tiles (EP lane
+/// forwards only; see [`plan_prefill_parts`]). Default ON; `0` is the kill switch: every tile is
+/// its own serial singleton chunk forward, byte-identical to the wave's output anyway.
+pub const EP_LANE_PREFILL_WAVE_EXACT_ENV: &str = "HIPFIRE_EP_LANE_PREFILL_WAVE_EXACT";
+
+/// Most rows one prefill wave carries (the plan of record's 2048-row pass).
+pub(crate) const EP_WAVE_MAX_ROWS: usize = crate::gpu_forward::ep_wave::QWEN4_EP_WAVE_ROW_CAP;
+
+/// [`EP_LANE_PREFILL_WAVE_EXACT_ENV`] parsed: the wave is ON by default (it is byte-identical to
+/// the serial tiles it replaces); exactly `0` is the kill switch (today's serial tiles).
+pub(crate) fn ep_lane_prefill_wave_from(value: Option<&str>) -> bool {
+    value.is_none_or(|v| v.trim() != "0")
+}
+
+/// The wave knob, read once per process (every rank thread agrees).
+static EP_LANE_PREFILL_WAVE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    ep_lane_prefill_wave_from(
+        hipfire_config::developer_var(EP_LANE_PREFILL_WAVE_EXACT_ENV)
+            .ok()
+            .as_deref(),
+    )
+});
+
+pub(crate) fn ep_lane_prefill_wave_enabled() -> bool {
+    *EP_LANE_PREFILL_WAVE
+}
+
+/// Whether a lane's tile of `rows` rows joins an exact wave at all: only a tile in
+/// `EXACT_WAVE_MIN_LANE_ROWS..=EXACT_WAVE_MAX_LANE_ROWS` runs, alone, the sub-512 full-table
+/// route the wave reproduces; a larger tile takes the owner-routed route alone (and keeps its
+/// serial tile and today's bytes), a smaller one the few-row / g32 routes.
+pub(crate) fn ep_wave_lane_joins(rows: usize) -> bool {
+    (crate::gpu_forward::ep_wave::exact_wave_min_lane_rows()
+        ..=crate::gpu_forward::ep_wave::EXACT_WAVE_MAX_LANE_ROWS)
+        .contains(&rows)
+}
+
+/// Whether the lanes of one candidate wave (`per_lane_rows`, plan order) run as one wave: at
+/// least two lanes (one lane is its own tile), every lane joining ([`ep_wave_lane_joins`]),
+/// `total_rows` the sum of the lanes' rows, and `total_rows <= max_rows` (above the cap it must
+/// split). There is no row floor: the wave runs the full-table route every lane runs alone.
+pub(crate) fn ep_wave_prefill_admits(
+    total_rows: usize,
+    per_lane_rows: &[usize],
+    max_rows: usize,
+) -> bool {
+    per_lane_rows.len() >= 2
+        && per_lane_rows.iter().all(|&rows| ep_wave_lane_joins(rows))
+        && per_lane_rows.iter().sum::<usize>() == total_rows
+        && total_rows <= max_rows
+}
+
+/// One piece of a step's prefill: a lane's own tile, or a joint wave over consecutive prefill
+/// ordinals (`start..end` of the plan's Prefill requests).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PrefillPart {
+    Serial(usize),
+    Wave(std::ops::Range<usize>),
+}
+
+/// Partition a step's prefill tiles (`tile_rows[i]` rows of the i-th Prefill request, plan
+/// order; `eligible[i]`: the lane may be forwarded by a wave) into serial tiles and waves.
+/// Runs of consecutive eligible joining lanes are packed into waves of at most `max_rows` rows,
+/// balanced when the run needs more than one (a single-lane tail is merged into the wave before
+/// it when that fits); a run with a single lane stays serial. A candidate wave must also pass
+/// `host_admits(lane rows)`, the forward's own admission (`Qwen4Bundle::ep_wave_admission`:
+/// scratch / reserve capacity, routing scopes); a refused candidate stays serial. Parts come
+/// back in plan order and cover every ordinal exactly once. With `wave` off every tile is
+/// `Serial` in plan order, today's schedule.
+pub(crate) fn plan_prefill_parts(
+    wave: bool,
+    tile_rows: &[usize],
+    eligible: &[bool],
+    max_rows: usize,
+    host_admits: &dyn Fn(&[usize]) -> bool,
+) -> Vec<PrefillPart> {
+    debug_assert_eq!(tile_rows.len(), eligible.len());
+    let n = tile_rows.len();
+    let mut parts = Vec::with_capacity(n);
+    let mut i = 0;
+    while i < n {
+        let joins = |k: usize| wave && eligible[k] && ep_wave_lane_joins(tile_rows[k]);
+        if !joins(i) {
+            parts.push(PrefillPart::Serial(i));
+            i += 1;
+            continue;
+        }
+        let run_start = i;
+        while i < n && joins(i) {
+            i += 1;
+        }
+        let run = run_start..i;
+        let total: usize = tile_rows[run.clone()].iter().sum();
+        // Balanced cut: `k` waves of about `target` rows each.
+        let waves_needed = total.div_ceil(max_rows.max(1)).max(1);
+        let target = total.div_ceil(waves_needed);
+        let mut groups: Vec<std::ops::Range<usize>> = Vec::new();
+        let (mut start, mut rows) = (run.start, 0usize);
+        for lane in run.clone() {
+            if rows > 0 && (rows + tile_rows[lane] > max_rows || rows >= target) {
+                groups.push(start..lane);
+                start = lane;
+                rows = 0;
+            }
+            rows += tile_rows[lane];
+        }
+        groups.push(start..run.end);
+        let admitted = |g: &std::ops::Range<usize>| {
+            ep_wave_prefill_admits(
+                tile_rows[g.clone()].iter().sum(),
+                &tile_rows[g.clone()],
+                max_rows,
+            ) && host_admits(&tile_rows[g.clone()])
+        };
+        // A single-lane tail (not a wave) joins the wave before it when the cap allows.
+        if groups.len() >= 2 {
+            let last = groups[groups.len() - 1].clone();
+            if !admitted(&last) {
+                let prev = groups[groups.len() - 2].clone();
+                let merged = prev.start..last.end;
+                if admitted(&merged) {
+                    groups.truncate(groups.len() - 2);
+                    groups.push(merged);
+                }
+            }
+        }
+        for g in groups {
+            if admitted(&g) {
+                parts.push(PrefillPart::Wave(g));
+            } else {
+                parts.extend(g.map(PrefillPart::Serial));
+            }
+        }
+    }
+    parts
+}
+
+/// Where a wave over prefill ordinals `first..first + lanes` writes its head, as `(first logits
+/// row, top-1 byte offset, top-1 byte length)` of the step buffers: lane `j` of the wave lands
+/// exactly on the slot (`rows_cap + first + j`) the serial tile of that ordinal uses, so every
+/// later reader (sampled draws, the top-1 download, `pick_at`) is unchanged.
+pub(crate) fn wave_head_slots(
+    rows_cap: usize,
+    first: usize,
+    lanes: usize,
+) -> (usize, usize, usize) {
+    let row0 = rows_cap + first;
+    (
+        row0,
+        row0 * std::mem::size_of::<i32>(),
+        lanes * std::mem::size_of::<i32>(),
+    )
+}
 
 /// How a lane's next window runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -210,6 +387,11 @@ struct WindowView<'a> {
     position: usize,
     seed: u32,
     drafts: &'a [u32],
+    /// The window may verify more than one row: a native route, a copy
+    /// window (any route: it overrides it) or a forced advance.
+    verify: bool,
+    /// An emitter-forced advance (its one-row form is an `Ar` request).
+    forced: bool,
 }
 
 /// What plan validation reads of an MTP lane.
@@ -241,6 +423,8 @@ pub(crate) fn view_of(lane: &Qwen4LaneState) -> LaneView<'_> {
                 position: w.position,
                 seed: w.seed,
                 drafts: &w.drafts,
+                verify: crate::mesh_rank_copy::verify_capable(w.route, w.source, w.forced),
+                forced: w.forced,
             }),
         }),
     }
@@ -339,7 +523,9 @@ pub(crate) fn validate_plan<'a>(
                             r.epoch
                         )
                     })?;
-                    if !matches!(window.route, LaneRoute::ArSynced | LaneRoute::ArRetired) {
+                    if !matches!(window.route, LaneRoute::ArSynced | LaneRoute::ArRetired)
+                        && !window.forced
+                    {
                         return Err(format!(
                             "provision_step: AR row for MTP lane {:?} whose window is routed {:?}",
                             r.epoch, window.route
@@ -383,9 +569,9 @@ pub(crate) fn validate_plan<'a>(
                         r.epoch
                     )
                 })?;
-                if !matches!(window.route, LaneRoute::Batched { .. }) {
+                if !window.verify {
                     return Err(format!(
-                        "provision_step: Verify rows for MTP lane {:?} whose window is routed {:?}, not Batched",
+                        "provision_step: Verify rows for MTP lane {:?} whose window is routed {:?}, not Batched, copy or forced",
                         r.epoch, window.route
                     ));
                 }
@@ -522,16 +708,6 @@ pub(crate) fn commit_host(host: &mut LaneHost, r: &RequestRows, pick: u32) -> Op
     Some(pick)
 }
 
-/// Lane bookkeeping of one committed Verify window: its committed tokens
-/// (accepted drafts and the bonus, the seed excluded) extend the lane and
-/// the last one is the next seed.
-fn commit_verify(host: &mut LaneHost, committed: &[u32]) -> Option<u32> {
-    let last = *committed.last()?;
-    host.generated.extend_from_slice(committed);
-    host.pending_seed = Some(last);
-    Some(last)
-}
-
 /// The lane executor: borrows the bundle (weights, forward program) and its
 /// staged [`Qwen4LaneStore`].
 pub struct Qwen4LaneExecutor<'a> {
@@ -567,25 +743,46 @@ impl Qwen4LaneExecutor<'_> {
     /// drafts allowed this window; 0 = AR) and run the step-synchronous
     /// batched draft for the `Batched` ones (one D2H per draft step for all
     /// lanes). Must precede `provision_step` whenever the plan holds an MTP
-    /// lane's decode row, and every listed lane must then be planned:
-    /// `Verify` for a `Batched` window (its kept drafts), `Ar` for the
-    /// others. Non-spec lanes answer `Ar`. A failure poisons every listed
-    /// lane.
+    /// lane's decode row, and every listed lane must then be planned: a lane
+    /// whose returned [`LaneDraft`] carries drafts is `Verify` (a `Batched`
+    /// window's kept drafts, or, on a copy-armed store, the root's copy
+    /// candidates, whatever the route), the others `Ar`. Non-spec lanes
+    /// answer `Ar`. A failure poisons every listed lane.
     pub fn draft_step(
         &mut self,
         gpu: &mut Gpu,
         requests: &[(RequestEpoch, usize)],
     ) -> Result<Vec<LaneDraft>, String> {
+        self.draft_step_forced(gpu, requests, &[])
+    }
+
+    /// [`Self::draft_step`] with emitter-forced advances: each `(epoch,
+    /// tokens)` of `forced` (a subset of `requests`, `1..=` the store's
+    /// verify rows tokens) is a forced window: rows `[seed, f1..f_{n-1}]`,
+    /// all consumed, no sampling and no RNG, the head (live or lagging)
+    /// teacher-forced exactly as the singleton's forced advance does, and
+    /// `f_n` the next pending seed. The lane's [`LaneDraft`] carries
+    /// `f1..f_{n-1}` (`Verify`; an `Ar` row for `n == 1`). Single card only.
+    pub fn draft_step_forced(
+        &mut self,
+        gpu: &mut Gpu,
+        requests: &[(RequestEpoch, usize)],
+        forced: &[(RequestEpoch, Vec<u32>)],
+    ) -> Result<Vec<LaneDraft>, String> {
         if self.bundle.ep.is_some() {
+            if !forced.is_empty() {
+                return Err("draft_step_forced: forced advances are single-card only".to_string());
+            }
             return self.bundle.ep_lane_draft_step(gpu, requests);
         }
-        self.draft_step_local(gpu, requests)
+        self.draft_step_local(gpu, requests, forced)
     }
 
     fn draft_step_local(
         &mut self,
         gpu: &mut Gpu,
         requests: &[(RequestEpoch, usize)],
+        forced: &[(RequestEpoch, Vec<u32>)],
     ) -> Result<Vec<LaneDraft>, String> {
         let mut store = self
             .bundle
@@ -595,10 +792,14 @@ impl Qwen4LaneExecutor<'_> {
         let result = match store.phase.check_draft() {
             Ok(()) => {
                 store.step_started = Some(Instant::now());
-                let drafted = draft_lanes(self.bundle, gpu, &mut store, requests);
+                let drafted = plan_and_draft(self.bundle, gpu, &mut store, requests, forced);
                 if drafted.is_err() {
-                    for (epoch, _) in requests {
+                    let epochs: Vec<RequestEpoch> = requests.iter().map(|(e, _)| *e).collect();
+                    for epoch in &epochs {
                         store.poison(epoch);
+                    }
+                    if let Ok(proto) = store.proto_mut() {
+                        proto.discard(&epochs);
                     }
                     store.step_started = None;
                 }
@@ -621,14 +822,14 @@ impl Qwen4LaneExecutor<'_> {
     }
 
     fn provision_step_local(&mut self, gpu: &mut Gpu, plan: &BatchStepPlan) -> Result<(), String> {
-        let ends = {
+        let (ends, maps_past_charge, prefill) = {
             let bundle: &Qwen4Bundle = &*self.bundle;
             let store = bundle
                 .lanes
                 .as_ref()
                 .ok_or_else(|| "Qwen4 lanes are not staged".to_string())?;
             store.phase.check_idle()?;
-            validate_plan(
+            let ends = validate_plan(
                 plan,
                 PlanLimits {
                     max_lanes: store.max_lanes(),
@@ -636,40 +837,40 @@ impl Qwen4LaneExecutor<'_> {
                 },
                 |epoch| store.lane(epoch).map(view_of),
                 |host| bundle.lane_prefill_tile_len(&host.prompt, host.prefilled),
-            )?
+            )?;
+            let elastic = bundle.elastic_active();
+            let maps_past_charge =
+                elastic && elastic_step_maps_past_charge(bundle, gpu, store, plan, &ends);
+            // (tile rows, MTP lane) of the step's prefill tiles, plan order.
+            let prefill: Vec<(usize, bool)> = plan
+                .requests
+                .iter()
+                .filter(|r| elastic && r.kind == RequestStepKind::Prefill)
+                .map(|r| {
+                    let mtp = store.lane(&r.epoch).is_some_and(|lane| lane.spec.is_some());
+                    (r.rows.len, mtp)
+                })
+                .collect();
+            (ends, maps_past_charge, prefill)
         };
-        let store = self
+        // The elastic reserve's rank-local backstop: a step whose serial prefill tile builds the
+        // long-prefill caches, or that maps lane pages past the charge, needs the bank's memory
+        // back first (the lend is sized into the revocable cold reserve, so this rule is what
+        // keeps a lend from starving a prefill). Ranks run the same plan and the same parts, so
+        // they reclaim in lockstep; a failure is logged and the bank stays in place.
+        let long_prefill = elastic_step_long_prefill(self.bundle, gpu, &prefill);
+        self.bundle.elastic_note_step_prefill(long_prefill);
+        if maps_past_charge || long_prefill {
+            self.bundle.elastic_reclaim_logged(gpu, "prefill");
+        }
+        let mut store = self
             .bundle
             .lanes
-            .as_mut()
+            .take()
             .ok_or_else(|| "Qwen4 lanes are not staged".to_string())?;
-        // A step with no draft phase starts its wall clock here.
-        store.step_started.get_or_insert_with(Instant::now);
-        for (r, &end) in plan.requests.iter().zip(&ends) {
-            let lane = store
-                .lane_mut(&r.epoch)
-                .ok_or_else(|| format!("provision_step: epoch {:?} vanished", r.epoch))?;
-            lane.state.ensure_mapped_capacity(gpu, end).map_err(|e| {
-                format!("provision_step: map {end} positions for {:?}: {e}", r.epoch)
-            })?;
-            if let Some(spec) = lane.spec.as_mut() {
-                // A retired lane's head lags the trunk and is never touched.
-                let retired = spec
-                    .window
-                    .as_ref()
-                    .is_some_and(|w| w.route == LaneRoute::ArRetired);
-                if !retired {
-                    spec.head.ensure_mapped_capacity(gpu, end).map_err(|e| {
-                        format!(
-                            "provision_step: map {end} head positions for {:?}: {e}",
-                            r.epoch
-                        )
-                    })?;
-                }
-            }
-        }
-        store.phase = LanePhase::Provisioned(StepKey::of(plan));
-        Ok(())
+        let result = provision_inner(self.bundle, gpu, &mut store, plan, &ends);
+        self.bundle.lanes = Some(store);
+        result
     }
 
     /// Per-request decode map-ahead for a Decoding lane, once, before its
@@ -790,8 +991,12 @@ impl Qwen4LaneExecutor<'_> {
                 })
             }
             Err(error) => {
-                for r in &plan.requests {
-                    store.poison(&r.epoch);
+                let epochs: Vec<RequestEpoch> = plan.requests.iter().map(|r| r.epoch).collect();
+                for epoch in &epochs {
+                    store.poison(epoch);
+                }
+                if let Ok(proto) = store.proto_mut() {
+                    proto.discard(&epochs);
                 }
                 store.step_started = None;
                 store.phase = LanePhase::Idle;
@@ -820,87 +1025,18 @@ impl Qwen4LaneExecutor<'_> {
 
     fn commit_step_local(
         &mut self,
-        _gpu: &mut Gpu,
+        gpu: &mut Gpu,
         plan: &BatchStepPlan,
         output: StepOutput,
     ) -> Result<Vec<RequestAdvance>, String> {
-        let store = self
+        let mut store = self
             .bundle
             .lanes
-            .as_mut()
+            .take()
             .ok_or_else(|| "Qwen4 lanes are not staged".to_string())?;
-        store
-            .phase
-            .check_commit(&StepKey::of(plan), output.step_id)?;
-        if output.target_picks.len() != plan.total_rows() {
-            return Err("commit_step: pick count != planned rows".to_string());
-        }
-        for r in &plan.requests {
-            let lane = match store.lane(&r.epoch) {
-                Some(lane) if lane.host.status != LaneStatus::Poisoned => lane,
-                _ => {
-                    return Err(format!(
-                        "commit_step: epoch {:?} no longer owns its lane",
-                        r.epoch
-                    ));
-                }
-            };
-            if r.rows.len == 0 || r.rows.end() > output.target_picks.len() {
-                return Err(format!("commit_step: bad row range {:?}", r.rows));
-            }
-            if wants_pick(&lane.host, r) && output.target_picks[r.rows.end() - 1] == u32::MAX {
-                return Err("commit_step: head row without a target pick".to_string());
-            }
-            let window = lane.spec.as_ref().and_then(|spec| spec.window.as_ref());
-            match (r.kind, window) {
-                (RequestStepKind::Verify { .. }, Some(w)) => {
-                    if w.outcome.as_ref().map_or(true, |o| o.committed.is_empty()) {
-                        return Err(format!(
-                            "commit_step: Verify window of {:?} never finished",
-                            r.epoch
-                        ));
-                    }
-                }
-                (RequestStepKind::Verify { .. }, None) => {
-                    return Err(format!(
-                        "commit_step: Verify of {:?} has no window",
-                        r.epoch
-                    ));
-                }
-                _ => {}
-            }
-        }
-        let mut advances = Vec::with_capacity(plan.requests.len());
-        for r in &plan.requests {
-            let pick = output.target_picks[r.rows.end() - 1];
-            let lane = store.lane_mut(&r.epoch).expect("validated above");
-            let window = lane.spec.as_mut().and_then(|spec| spec.window.take());
-            let (committed_ids, accepted_drafts, verified_rows) = match r.kind {
-                RequestStepKind::Verify { draft_len } => {
-                    let outcome: MtpWindow =
-                        window.and_then(|w| w.outcome).expect("validated above");
-                    commit_verify(&mut lane.host, &outcome.committed);
-                    (outcome.committed, outcome.accepted, draft_len + 1)
-                }
-                _ => (
-                    commit_host(&mut lane.host, r, pick).into_iter().collect(),
-                    0,
-                    0,
-                ),
-            };
-            let position = lane.state.position;
-            advances.push(RequestAdvance {
-                epoch: r.epoch,
-                committed_ids,
-                committed_position: position,
-                accepted_drafts,
-                verified_rows,
-                finish: (position >= lane.state.max_seq_len).then(|| "length".to_string()),
-            });
-        }
-        store.step_started = None;
-        store.phase = LanePhase::Idle;
-        Ok(advances)
+        let result = commit_inner(self.bundle, gpu, &mut store, plan, &output);
+        self.bundle.lanes = Some(store);
+        result
     }
 
     /// Drop the step: every participant is poisoned (its device state may be
@@ -916,8 +1052,12 @@ impl Qwen4LaneExecutor<'_> {
 
     fn abort_step_local(&mut self, plan: &BatchStepPlan) {
         if let Some(store) = self.bundle.lanes.as_mut() {
-            for r in &plan.requests {
-                store.poison(&r.epoch);
+            let epochs: Vec<RequestEpoch> = plan.requests.iter().map(|r| r.epoch).collect();
+            for epoch in &epochs {
+                store.poison(epoch);
+            }
+            if let Ok(proto) = store.proto_mut() {
+                proto.discard(&epochs);
             }
             store.step_started = None;
             store.phase = LanePhase::Idle;
@@ -925,17 +1065,179 @@ impl Qwen4LaneExecutor<'_> {
     }
 }
 
-/// One planned request inside a forward.
-struct Entry<'a> {
-    r: &'a RequestRows,
-    lane: &'a mut Qwen4LaneState,
-    /// First decode row of a decode request (`None` for a prefill tile).
-    dec: Option<usize>,
-}
-
 pub(crate) fn pick_at(host: &[u8], row: usize) -> u32 {
     let b = &host[row * 4..row * 4 + 4];
     u32::from_ne_bytes([b[0], b[1], b[2], b[3]])
+}
+
+/// Whether a lane maps new context pages past the load-time charge this step (the mapping takes
+/// memory the elastic bank holds). Plain host reads.
+fn elastic_step_maps_past_charge(
+    bundle: &Qwen4Bundle,
+    gpu: &Gpu,
+    store: &Qwen4LaneStore,
+    plan: &BatchStepPlan,
+    ends: &[usize],
+) -> bool {
+    let charge = bundle.lane_charge_rows(gpu);
+    plan.requests.iter().zip(ends).any(|(r, &end)| {
+        end > charge
+            && store
+                .lane(&r.epoch)
+                .is_some_and(|lane| end > lane.state.mapped_context_tokens())
+    })
+}
+
+/// Whether the step holds a long prefill for the elastic reserve (`prefill`: `(rows, MTP lane)`
+/// of its prefill tiles in plan order): a SERIAL tile of the parts [`run_prefill_tiles`] then
+/// runs ([`step_prefill_parts`]) whose routing rows AS THE FORWARD RUNS IT
+/// (`Qwen4Bundle::lane_prefill_tile_route_rows`) reach the F16 shadow floor
+/// ([`serial_tiles_long`]). A `serve.batch_exact` lane tile runs under the ordinary-prefill
+/// intent, so whatever its extent it routes at the canonical chunk, builds the long-prefill
+/// caches and allocates its canonical scratch; a distribution-equivalent lane tile routes at its
+/// own rows (long only from 512). Empty `prefill` (the reserve off, or no prefill tile):
+/// `false` without a probe.
+fn elastic_step_long_prefill(
+    bundle: &mut Qwen4Bundle,
+    gpu: &mut Gpu,
+    prefill: &[(usize, bool)],
+) -> bool {
+    if prefill.is_empty() {
+        return false;
+    }
+    let tile_rows: Vec<usize> = prefill.iter().map(|&(rows, _)| rows).collect();
+    let mtp: Vec<bool> = prefill.iter().map(|&(_, mtp)| mtp).collect();
+    let (parts, _) = step_prefill_parts(bundle, gpu, &tile_rows, &mtp);
+    serial_tiles_long(&parts, |i| {
+        bundle.lane_prefill_tile_route_rows(gpu, tile_rows[i])
+    })
+}
+
+/// Whether a serial part of `parts` routes at the F16 shadow floor or above
+/// (`serial_route_rows(i)`: the routing rows the i-th prefill tile runs at as a serial tile).
+/// A wave never qualifies: it routes under its row cap and builds no long-prefill cache.
+pub(crate) fn serial_tiles_long(
+    parts: &[PrefillPart],
+    mut serial_route_rows: impl FnMut(usize) -> usize,
+) -> bool {
+    parts.iter().any(|part| match part {
+        PrefillPart::Serial(i) => {
+            crate::lane::pages::long_prefill_route_rows(serial_route_rows(*i))
+        }
+        PrefillPart::Wave(_) => false,
+    })
+}
+
+/// Prefix of every `provision_step` error that is a mapping (VMM commit) refusal: the lane
+/// cannot get the device pages its context needs. It is a capacity condition, never diverged
+/// state: the EP mesh does not poison on it ([`crate::ep::ep_provision_verdict`]) and the serve
+/// loop answers it with a retryable overload (HTTP 503).
+pub const PROVISION_MAP_REFUSED: &str = "provision_step: map ";
+
+/// Map the lanes of a provisioned plan through the step's end (I4/I9) and
+/// check the plan against the step the draft phase sealed. An AR store has
+/// no draft phase of its own: its decode lanes are planned through the same
+/// reducer here (route `Ar`, no drafts).
+fn provision_inner(
+    bundle: &mut Qwen4Bundle,
+    gpu: &mut Gpu,
+    store: &mut Qwen4LaneStore,
+    plan: &BatchStepPlan,
+    ends: &[usize],
+) -> Result<(), String> {
+    // A step with no draft phase starts its wall clock here.
+    store.step_started.get_or_insert_with(Instant::now);
+    let decode: Vec<RequestEpoch> = plan
+        .requests
+        .iter()
+        .filter(|r| r.kind != RequestStepKind::Prefill)
+        .map(|r| r.epoch)
+        .collect();
+    if store.spec().is_none() && !decode.is_empty() && !store.proto_mut()?.has_flight() {
+        let requests: Vec<(RequestEpoch, usize)> = decode.iter().map(|e| (*e, 0)).collect();
+        plan_and_draft(bundle, gpu, store, &requests, &[])?;
+    }
+    check_sealed(plan, store.proto_mut()?)?;
+    // `HIPFIRE_QWEN4_LANE_PAGE_TRACE`: free bytes before/after every lane map and what the budget planned.
+    let trace = crate::lane::pages::page_trace().then(|| store.map_trace_inputs(bundle, gpu));
+    for (r, &end) in plan.requests.iter().zip(ends) {
+        let lane = store
+            .lane_mut(&r.epoch)
+            .ok_or_else(|| format!("provision_step: epoch {:?} vanished", r.epoch))?;
+        let probe = trace
+            .as_ref()
+            .map(|_| crate::lane::pages::LaneMapProbe::start(gpu, lane));
+        let mapped = provision_lane_maps(gpu, lane, r.epoch, end);
+        if let (Some(probe), Some(inputs)) = (probe, trace.as_ref()) {
+            probe.finish(inputs, &bundle.config, gpu, lane, end);
+        }
+        mapped?;
+    }
+    store.phase = LanePhase::Provisioned(StepKey::of(plan));
+    Ok(())
+}
+
+/// Map one lane's trunk (and, unless retired, head) context through `end` positions; a refusal carries
+/// [`PROVISION_MAP_REFUSED`].
+fn provision_lane_maps(
+    gpu: &mut Gpu,
+    lane: &mut crate::lane::Qwen4LaneState,
+    epoch: RequestEpoch,
+    end: usize,
+) -> Result<(), String> {
+    lane.state
+        .ensure_mapped_capacity(gpu, end)
+        .map_err(|e| format!("{PROVISION_MAP_REFUSED}{end} positions for {epoch:?}: {e}"))?;
+    if let Some(spec) = lane.spec.as_mut() {
+        // A head-free (retired, no copy future) lane's head lags the
+        // trunk and is never touched; a lagging head (copy future) is
+        // mapped like a live one: its owed rows are appended at prepare.
+        let head_live = spec.window.as_ref().is_none_or(|w| w.head_live);
+        if head_live {
+            spec.head.ensure_mapped_capacity(gpu, end).map_err(|e| {
+                format!("{PROVISION_MAP_REFUSED}{end} head positions for {epoch:?}: {e}")
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// The plan's decode requests must be exactly the sealed verify of the
+/// drafted step: same lanes in the same order, same rows, same positions.
+fn check_sealed(plan: &BatchStepPlan, proto: &LaneProto) -> Result<(), String> {
+    let decode: Vec<&RequestRows> = plan
+        .requests
+        .iter()
+        .filter(|r| r.kind != RequestStepKind::Prefill)
+        .collect();
+    let sealed = proto.flight.as_ref().and_then(|f| f.verify.as_ref());
+    let Some(sealed) = sealed else {
+        return if decode.is_empty() {
+            Ok(())
+        } else {
+            Err("provision_step: the decode rows have no drafted step (draft_step first)".into())
+        };
+    };
+    if sealed.lanes.len() != decode.len() {
+        return Err(format!(
+            "provision_step: the drafted step holds {} lanes, the plan {}",
+            sealed.lanes.len(),
+            decode.len()
+        ));
+    }
+    for (v, r) in sealed.lanes.iter().zip(&decode) {
+        let tokens = &plan.batch.tokens[r.rows.begin..r.rows.end()];
+        if v.key.request_epoch != r.epoch
+            || v.rows != tokens
+            || i64::from(plan.batch.positions[r.rows.begin]) != v.position as i64
+        {
+            return Err(format!(
+                "provision_step: the plan's rows of {:?} differ from the drafted step's sealed rows",
+                r.epoch
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The forward of a provisioned plan; the store is out of the bundle so the
@@ -946,296 +1248,369 @@ fn forward_inner(
     store: &mut Qwen4LaneStore,
     plan: &BatchStepPlan,
 ) -> Result<Vec<u32>, String> {
-    let vocab = bundle.lane_vocab();
-    let epochs: Vec<RequestEpoch> = plan.requests.iter().map(|r| r.epoch).collect();
-    let started = store.step_started.take().unwrap_or_else(Instant::now);
-    let spec_config: Option<LaneSpecConfig> = store.spec();
-    let StepParts {
-        lanes,
-        logits,
-        top1,
-        policy,
-        top1_host,
-        rows_cap,
-        sample_host,
-        spec,
-    } = store.step_parts(&epochs)?;
-    let mut hidden: Option<&GpuTensor> = None;
-    let mut append: Option<&mut Option<MtpAppendScratch>> = None;
-    let mut cost: Option<&mut LaneCostModel> = None;
-    let mut skip_rollback = false;
-    if let Some(spec) = spec {
-        let SpecStore {
-            hidden: h,
-            append_scratch,
-            cost: c,
-            skip_rollback: skip,
-            ..
-        } = spec;
-        hidden = Some(&*h);
-        append = Some(append_scratch);
-        cost = Some(c);
-        skip_rollback = *skip;
-    }
+    let mut proto = store.take_proto()?;
+    let result = forward_with_proto(bundle, gpu, store, &mut proto, plan);
+    store.put_proto(proto);
+    result
+}
 
-    // Plan order, with each decode request's first row among the step's
-    // decode rows.
-    let mut entries: Vec<Entry<'_>> = Vec::with_capacity(plan.requests.len());
-    let (mut n_dec, mut n_prefill, mut decode_lanes, mut verify_windows, mut verified) =
-        (0usize, 0usize, 0usize, 0usize, 0usize);
-    // Row counts of the decode requests in entry order: what `forward_lanes`
-    // groups into once-over-all-rows launches.
-    let mut dec_rows: Vec<usize> = Vec::with_capacity(plan.requests.len());
-    for (r, lane) in plan.requests.iter().zip(lanes) {
-        let dec = match r.kind {
-            RequestStepKind::Ar | RequestStepKind::Verify { .. } => {
-                if let RequestStepKind::Verify { draft_len } = r.kind {
-                    verify_windows += 1;
-                    verified += draft_len;
-                }
-                let first = n_dec;
-                n_dec += r.rows.len;
-                dec_rows.push(r.rows.len);
-                decode_lanes += 1;
-                Some(first)
-            }
-            RequestStepKind::Prefill => {
-                n_prefill += 1;
-                None
-            }
+fn forward_with_proto(
+    bundle: &mut Qwen4Bundle,
+    gpu: &mut Gpu,
+    store: &mut Qwen4LaneStore,
+    proto: &mut LaneProto,
+    plan: &BatchStepPlan,
+) -> Result<Vec<u32>, String> {
+    let started = store.step_started.take().unwrap_or_else(Instant::now);
+    let spec_config = store.spec();
+    let mut picks = vec![u32::MAX; plan.total_rows()];
+    let (mut decode_lanes, mut n_prefill) = (0usize, 0usize);
+    for r in &plan.requests {
+        match r.kind {
+            RequestStepKind::Ar | RequestStepKind::Verify { .. } => decode_lanes += 1,
+            RequestStepKind::Prefill => n_prefill += 1,
             RequestStepKind::Forced => {
                 return Err(format!("{:?} rows are not admitted on AR lanes", r.kind));
             }
-        };
-        entries.push(Entry { r, lane, dec });
-    }
-    if n_dec > rows_cap {
-        return Err(format!(
-            "{n_dec} decode rows exceed the step buffers ({rows_cap})"
-        ));
-    }
-
-    // Arm the ring, then take the target ticket, of every Verify lane.
-    for e in entries.iter_mut() {
-        let RequestStepKind::Verify { draft_len } = e.r.kind else {
-            continue;
-        };
-        let rows = draft_len + 1;
-        let tokens = &plan.batch.tokens[e.r.rows.begin..e.r.rows.end()];
-        let Qwen4LaneState { state, spec, .. } = &mut *e.lane;
-        let window = spec
-            .as_mut()
-            .and_then(|spec| spec.window.as_mut())
-            .ok_or_else(|| format!("Verify lane {:?} has no window", e.r.epoch))?;
-        if !matches!(window.route, LaneRoute::Batched { .. })
-            || window.seed != tokens[0]
-            || window.drafts != tokens[1..]
-            || window.position != state.position
-        {
-            return Err(format!(
-                "Verify lane {:?} disagrees with its window",
-                e.r.epoch
-            ));
-        }
-        if window.target_ticket.is_some() {
-            return Err(format!(
-                "Verify lane {:?} already holds a target ticket",
-                e.r.epoch
-            ));
-        }
-        if state.row_capture_rows() < rows {
-            return Err(format!(
-                "Verify lane {:?}: the ring holds {} rows, the verify needs {rows}",
-                e.r.epoch,
-                state.row_capture_rows()
-            ));
-        }
-        // Armed before the snapshot: the GDN states then need no copy.
-        state.row_capture_armed = true;
-        let ticket =
-            crate::mtp_lanes::lane_call(bundle.with_lane(state, None, |b| b.snapshot(gpu)));
-        match ticket {
-            Ok(ticket) => window.target_ticket = Some(crate::mtp_spec::TargetTicket::Local(ticket)),
-            Err(error) => {
-                state.row_capture_armed = false;
-                return Err(format!("target snapshot of {:?}: {error}", e.r.epoch));
-            }
         }
     }
 
-    // One exact trunk step over every decode row, in plan order.
-    if n_dec > 0 {
-        let mut rows: Vec<LaneRows<'_>> = Vec::new();
-        for e in entries.iter_mut() {
-            let kind = match e.r.kind {
-                RequestStepKind::Ar => LaneRowKind::Ar,
-                RequestStepKind::Verify { draft_len } => LaneRowKind::Verify { draft_len },
-                _ => continue,
-            };
-            rows.push(LaneRows {
-                state: &mut e.lane.state,
-                tokens: &plan.batch.tokens[e.r.rows.begin..e.r.rows.end()],
-                kind,
-            });
-        }
-        let out = LaneOutputs {
-            logits: &logits.sub_offset(0, n_dec * vocab),
-            top1: &top1.sub_offset(0, n_dec * std::mem::size_of::<i32>()),
-            wide_hidden: hidden,
-        };
-        let forwarded =
-            forward_lanes(gpu, bundle, &mut rows, &out, &policy).map_err(|e| e.to_string());
-        drop(rows);
-        // I3: disarmed on every path out of the forward.
-        for e in entries.iter_mut() {
-            if matches!(e.r.kind, RequestStepKind::Verify { .. }) {
-                e.lane.state.row_capture_armed = false;
-            }
-        }
-        forwarded?;
-        gpu.hip
-            .memcpy_dtoh(
-                &mut top1_host[..n_dec * std::mem::size_of::<i32>()],
-                &top1.buf,
-            )
-            .map_err(|e| e.to_string())?;
-        gpu.take_device_wait_error().map_err(|e| e.to_string())?;
-    }
-    let mut picks = vec![u32::MAX; plan.total_rows()];
-    for e in &entries {
-        if let Some(first) = e.dec {
-            for j in 0..e.r.rows.len {
-                picks[e.r.rows.begin + j] = pick_at(top1_host, first + j);
-            }
-        }
-    }
-
-    // Verify windows, then the head appends of the ArSynced lanes. A sampled
-    // lane's argmax picks are replaced by its sampler's draws first
-    // (`lane_sample_step`: one D2H of the request's logits rows); a greedy lane
-    // takes the unchanged argmax path.
-    let lane_eos = spec_config
-        .and_then(|config| config.end_of_turn)
-        .unwrap_or(bundle.config.eos_token_id);
-    for e in entries.iter_mut() {
-        let Some(first) = e.dec else {
-            continue;
-        };
-        let mut lane_picks: Vec<u32> = (0..e.r.rows.len)
-            .map(|j| pick_at(top1_host, first + j))
-            .collect();
-        let mut naive = None;
-        if e.lane.host.sampling.is_some() {
-            let rows = e.r.rows.len;
-            let drafts = matches!(e.r.kind, RequestStepKind::Verify { .. })
-                .then(|| &plan.batch.tokens[e.r.rows.begin + 1..e.r.rows.end()]);
-            let gpu_ref: &Gpu = gpu;
-            let logits_ref: &GpuTensor = logits;
-            let sampled = lane_sample_step(
-                &mut e.lane.host,
-                drafts,
-                &mut lane_picks,
-                lane_eos,
-                vocab,
-                sample_host,
-                |scratch| download_lane_rows(gpu_ref, logits_ref, first, rows, vocab, scratch),
-            )
-            .map_err(|error| format!("lane {:?}: {error}", e.r.epoch))?;
-            if let LaneSampleOutcome::Naive(window) = sampled {
-                naive = Some(window);
-            }
-            // The step output's picks are the draws too.
-            picks[e.r.rows.begin..e.r.rows.end()].copy_from_slice(&lane_picks);
-        }
-        let route = e
-            .lane
-            .spec
+    // The decode rows: verify, decide, prepare (the protocol's phases).
+    if decode_lanes > 0 {
+        let LaneProto {
+            root, rank, flight, ..
+        } = &mut *proto;
+        let verify = flight
             .as_ref()
-            .and_then(|spec| spec.window.as_ref())
-            .map(|w| w.route);
-        let outcome = match (e.r.kind, route) {
-            (RequestStepKind::Verify { .. }, _) => {
-                let config = spec_config
-                    .ok_or_else(|| "Verify row in a store without MTP lanes".to_string())?;
-                let hidden =
-                    hidden.ok_or_else(|| "Verify row without a hidden capture".to_string())?;
-                let window = finish_lane_window(
-                    bundle,
-                    gpu,
-                    &mut *e.lane,
-                    config,
-                    hidden,
-                    first,
-                    &lane_picks,
-                    skip_rollback,
-                )?;
-                if let Some(naive) = &naive {
-                    if window.committed != naive.committed || window.accepted != naive.accepted {
-                        return Err(format!(
-                            "sampled Verify lane {:?}: the finish committed {:?} (accepted {}) \
-                             but the naive window is {:?} (accepted {})",
-                            e.r.epoch,
-                            window.committed,
-                            window.accepted,
-                            naive.committed,
-                            naive.accepted
-                        ));
-                    }
-                }
-                window
-            }
-            (RequestStepKind::Ar, Some(route)) => {
-                if route == LaneRoute::ArSynced {
-                    let hidden = hidden
-                        .ok_or_else(|| "ArSynced row without a hidden capture".to_string())?;
-                    ar_synced_head(bundle, gpu, &mut *e.lane, hidden, first)?;
-                }
-                MtpWindow {
-                    committed: lane_picks,
-                    accepted: 0,
-                    drafts_generated: 0,
-                }
-            }
-            _ => continue,
+            .and_then(|f| f.verify.clone())
+            .ok_or_else(|| "the decode rows have no sealed verify".to_string())?;
+        let mut exec = LocalLaneRank {
+            bundle: &mut *bundle,
+            gpu: &mut *gpu,
+            store: &mut *store,
+            session: rank,
+            flight,
         };
-        if let Some(window) = e.lane.spec.as_mut().and_then(|spec| spec.window.as_mut()) {
-            window.outcome = Some(outcome);
+        let verified = exec.run_verify(&verify).map_err(|e| e.reason)?;
+        root.collect_verify(&[verified])
+            .map_err(|e| e.to_string())?;
+        let decision = root
+            .decide_commit(&mut GreedyRule)
+            .map_err(|e| e.to_string())?;
+        let receipt = exec.prepare_commit(&decision).map_err(|e| e.reason)?;
+        root.collect_prepared(&[receipt])
+            .map_err(|e| e.to_string())?;
+        let fl = exec
+            .flight
+            .as_ref()
+            .ok_or_else(|| "the step's flight vanished".to_string())?;
+        for r in &plan.requests {
+            if r.kind == RequestStepKind::Prefill {
+                continue;
+            }
+            let i = fl
+                .lane_index(&r.epoch)
+                .ok_or_else(|| format!("{:?} is not in the sealed step", r.epoch))?;
+            picks[r.rows.begin..r.rows.end()].copy_from_slice(fl.picks(i));
         }
     }
 
     // Prefill tiles.
-    // (prefill ordinal, plan row of its pick, entry index) of AR-lane
-    // completing tiles.
-    let mut final_tiles: Vec<(usize, usize, usize)> = Vec::new();
-    let mut ordinal = 0usize;
+    run_prefill_tiles(bundle, gpu, store, plan, &mut picks)?;
+    let prefill_ran = n_prefill > 0;
+
+    // The step's wall clock feeds the cost model only on a pure-decode step
+    // (draft start to the synchronized end): it is the controller interval
+    // the rank's receipt is merged with at commit.
+    if spec_config.is_some() && decode_lanes > 0 {
+        let wall_us = if prefill_ran {
+            f64::NAN
+        } else {
+            gpu.hip.device_synchronize().map_err(|e| e.to_string())?;
+            started.elapsed().as_secs_f64() * 1e6
+        };
+        let fl = proto
+            .flight
+            .as_mut()
+            .ok_or_else(|| "the step's flight vanished".to_string())?;
+        let decision = fl
+            .decision
+            .clone()
+            .ok_or_else(|| "the step was never decided".to_string())?;
+        let receipt = fl.receipt(&decision);
+        fl.evidence = Some((
+            receipt,
+            ControllerInterval {
+                wall_us,
+                prefill_ran,
+            },
+        ));
+    }
+    Ok(picks)
+}
+
+/// The parts (serial tiles and waves) [`run_prefill_tiles`] runs a step's prefill tiles as
+/// (`tile_rows[i]` rows; `mtp[i]`: the i-th prefill lane carries MTP state), and the last wave
+/// refusal: [`plan_prefill_parts`] under the wave knob (on an EP forward only; off it every tile
+/// is its own part in plan order, the serial schedule), each lane's eligibility (an MTP lane
+/// joins a wave only when the bundle's resident spec hidden buffer can take the wave's
+/// wide-hidden capture its head fill reads), the wave row cap (that buffer caps a wave holding
+/// an MTP lane) and the forward's own wave admission ([`Qwen4Bundle::ep_wave_admission`]). Host
+/// only, so `provision_step` sees exactly the parts the forward then runs.
+pub(crate) fn step_prefill_parts(
+    bundle: &mut Qwen4Bundle,
+    gpu: &mut Gpu,
+    tile_rows: &[usize],
+    mtp: &[bool],
+) -> (Vec<PrefillPart>, Option<String>) {
+    let ep_forward = bundle
+        .execution
+        .as_ref()
+        .is_some_and(|forward| forward.ep.is_some());
+    let wave_on = ep_lane_prefill_wave_enabled() && ep_forward;
+    let wide_rows = bundle.spec_hidden_rows();
+    let eligible: Vec<bool> = mtp.iter().map(|&mtp| !mtp || wide_rows > 0).collect();
+    let wave_cap = if mtp.iter().any(|&mtp| mtp) {
+        EP_WAVE_MAX_ROWS.min(wide_rows)
+    } else {
+        EP_WAVE_MAX_ROWS
+    };
+    let refused = std::cell::Cell::new(None::<String>);
+    let admit_cell = std::cell::RefCell::new((bundle, gpu));
+    let host_admits = |rows: &[usize]| match {
+        let (bundle, gpu) = &mut *admit_cell.borrow_mut();
+        bundle.ep_wave_admission(gpu, rows)
+    } {
+        Ok(()) => true,
+        Err(reason) => {
+            refused.set(Some(reason));
+            false
+        }
+    };
+    let parts = plan_prefill_parts(wave_on, tile_rows, &eligible, wave_cap, &host_admits);
+    (parts, refused.take())
+}
+
+/// Each prefill tile of the plan through the singleton chunk program on the
+/// lane's own state (an MTP lane's tile also fills its head), or, under
+/// `HIPFIRE_EP_LANE_PREFILL_WAVE_EXACT=1` on an EP forward, the step's 65..=511-row
+/// lane tiles as EXACT joint prefill waves ([`plan_prefill_parts`]: one
+/// [`Qwen4Bundle::prefill_wave`] per wave, every lane's rows forwarded together
+/// with the MoE once over all rows); the prompt-completing tile's pick lands in
+/// `picks`.
+fn run_prefill_tiles(
+    bundle: &mut Qwen4Bundle,
+    gpu: &mut Gpu,
+    store: &mut Qwen4LaneStore,
+    plan: &BatchStepPlan,
+    picks: &mut [u32],
+) -> Result<(), String> {
+    let tiles: Vec<&RequestRows> = plan
+        .requests
+        .iter()
+        .filter(|r| r.kind == RequestStepKind::Prefill)
+        .collect();
+    if tiles.is_empty() {
+        // A step with no prefill tile and no lane left prefilling: an EP tail-borrow epoch a
+        // continuing lane prompt left open (the lane was cancelled or released before its next
+        // tile) is closed here, so decode does not run on canonical host-read tables for
+        // good. A no-op on every other load and whenever no epoch is open. Every rank's lane
+        // store is identical, so every rank closes at the same step.
+        if !store.prefill_continues_after(std::iter::empty()) {
+            bundle
+                .ep_tail_borrow_idle_close(gpu)
+                .map_err(|error| error.to_string())?;
+        }
+        return Ok(());
+    }
+    let vocab = bundle.lane_vocab();
+    let spec_config = store.spec();
+    let lane_eos = spec_config
+        .and_then(|config| config.end_of_turn)
+        .unwrap_or(bundle.config.eos_token_id);
+    // The step's bracket continues the lane prompt when some lane of this store still has
+    // prompt rows after the tiles of this step: an EP tail-borrow epoch then stays open for the
+    // next step (one restore per long prompt) instead of closing at the bracket's end.
+    let continues = store.prefill_continues_after(tiles.iter().map(|r| (&r.epoch, r.rows.len)));
+    let epochs: Vec<RequestEpoch> = tiles.iter().map(|r| r.epoch).collect();
+    let StepParts {
+        mut lanes,
+        logits,
+        top1,
+        top1_host,
+        rows_cap,
+        sample_host,
+        sample_arena,
+        spec,
+        policy,
+        ..
+    } = store.step_parts(&epochs)?;
+    let mut append = spec.map(|spec| &mut spec.append_scratch);
+    let n_prefill = tiles.len();
+    // (prefill ordinal, plan row of its pick) of AR-lane completing tiles.
+    let mut final_tiles: Vec<(usize, usize)> = Vec::new();
     // A step's prefill tiles are one whole-prompt entry: on an EP
     // reserve-sharing load the donors are borrowed by every tile of more than
     // the resident rows and restored ONCE when the entry ends (the decode rows
     // of this step already ran, and the next step's decode rows need them
     // restored), not once per tile. A no-op on every other load.
-    if n_prefill > 0 {
+    // An MTP lane's tile also runs the head fill inside the entry (receipt
+    // phase `mtp_fill`, like the singleton's native-MTP fill).
+    if lanes.iter().any(|lane| lane.spec.is_some()) {
+        bundle.share_prompt_begin_mtp_fill();
+    } else {
         bundle.share_prompt_begin();
     }
-    let tiles: Result<(), String> = (|| {
-        for (entry, e) in entries.iter_mut().enumerate() {
-            if e.r.kind != RequestStepKind::Prefill {
-                continue;
-            }
-            let i = ordinal;
-            ordinal += 1;
-            let tokens = &plan.batch.tokens[e.r.rows.begin..e.r.rows.end()];
-            let completes = wants_pick(&e.lane.host, e.r);
-            if e.lane.spec.is_some() {
+    // The step's parts, the ones provisioning reclaimed the elastic bank for.
+    let tile_rows: Vec<usize> = tiles.iter().map(|r| r.rows.len).collect();
+    let mtp: Vec<bool> = lanes.iter().map(|lane| lane.spec.is_some()).collect();
+    let (parts, refused) = step_prefill_parts(bundle, gpu, &tile_rows, &mtp);
+    if let Some(reason) = refused {
+        // Once per process: the refusal is a configuration fact, not a per-step event.
+        static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!("  qwen4 EP lane prefill wave: serial tiles for refused waves ({reason})");
+        }
+    }
+    let wide_width = bundle.config.hc_count * bundle.config.hidden_size;
+    // gfx942 single device (P2): every run of two or more tiles is one joint wave, an MTP lane's
+    // included (its head fill follows the wave from its own rows of the wide-hidden capture): an
+    // MTP lane joins only when the spec hidden buffer exists, and a wave holding one is capped
+    // by that buffer's rows.
+    let parts = if g942_wave::wave_applies(gpu, bundle) {
+        let any_mtp = mtp.iter().any(|&mtp| mtp);
+        let can_capture = bundle.spec_hidden_rows() > 0;
+        let eligible: Vec<bool> = mtp.iter().map(|&mtp| !mtp || can_capture).collect();
+        g942_wave::plan_parts(&tile_rows, &eligible, g942_wave::wave_cap(bundle, any_mtp))
+    } else {
+        parts
+    };
+    let tiles_ran: Result<(), String> = (|| {
+        for part in parts {
+            let i = match part {
+                PrefillPart::Serial(i) => i,
+                PrefillPart::Wave(range) => {
+                    let wave_clock = (*LANE_TILE_PHASES).then(Instant::now);
+                    let (first, count) = (range.start, range.len());
+                    let total_rows: usize = tile_rows[range.clone()].iter().sum();
+                    let (row0, top1_off, top1_len) = wave_head_slots(rows_cap, first, count);
+                    let logits_view = logits.sub_offset(row0 * vocab, count * vocab);
+                    let top1_view = top1.sub_offset(top1_off, top1_len);
+                    // The wave's wide-hidden capture (MTP lanes' head fill reads it): the first
+                    // `total_rows` rows of the resident spec hidden buffer, lanes concatenated.
+                    let has_mtp = lanes[range.clone()].iter().any(|lane| lane.spec.is_some());
+                    let wide = match bundle.spec_hidden.as_ref().filter(|_| has_mtp) {
+                        Some(hidden) => Some(hidden.sub_offset(0, total_rows * wide_width)),
+                        None if has_mtp => {
+                            return Err("prefill wave: MTP lane without a spec hidden buffer".into())
+                        }
+                        None => None,
+                    };
+                    {
+                        let mut wave: Vec<WaveLane<'_>> = lanes[range.clone()]
+                            .iter_mut()
+                            .zip(&tiles[range.clone()])
+                            .map(|(lane, r)| WaveLane {
+                                state: &mut lane.state,
+                                tokens: &plan.batch.tokens[r.rows.begin..r.rows.end()],
+                            })
+                            .collect();
+                        let waved = match wide.as_ref() {
+                            None => bundle.prefill_wave(
+                                gpu,
+                                &mut wave,
+                                WaveHead::Final,
+                                &logits_view,
+                                Some(&top1_view),
+                                &policy,
+                            ),
+                            Some(wide) => bundle.prefill_wave_wide(
+                                gpu,
+                                &mut wave,
+                                WaveHead::Final,
+                                &logits_view,
+                                Some(&top1_view),
+                                &policy,
+                                Some(wide),
+                            ),
+                        };
+                        waved.map_err(|e| e.to_string())?;
+                    }
+                    if g942_wave::wave_applies(gpu, bundle) {
+                        g942_wave::note_wave(gpu.device_id, count, total_rows);
+                    }
+                    // Each MTP lane's head fill, in plan order, from its own rows of the capture
+                    // (the same head append, pairing and pending hidden as its serial tile).
+                    let mut capture_row = 0;
+                    for (ordinal, r) in range.clone().zip(&tiles[range.clone()]) {
+                        if lanes[ordinal].spec.is_some() {
+                            let scratch = append.as_deref_mut().and_then(Option::as_mut);
+                            fill_head_after_wave(
+                                bundle,
+                                gpu,
+                                &mut *lanes[ordinal],
+                                &plan.batch.tokens[r.rows.begin..r.rows.end()],
+                                capture_row,
+                                scratch,
+                            )?;
+                        }
+                        capture_row += r.rows.len;
+                    }
+                    for (ordinal, r) in range.clone().zip(&tiles[range.clone()]) {
+                        if wants_pick(&lanes[ordinal].host, r) {
+                            final_tiles.push((ordinal, r.rows.end() - 1));
+                        }
+                    }
+                    if let Some(clock) = wave_clock {
+                        gpu.hip.device_synchronize().map_err(|e| e.to_string())?;
+                        let route = match bundle
+                            .lane_tile_note()
+                            .filter(|note| note.rows == total_rows)
+                        {
+                            Some(note) => format!(
+                                "{} stage_min_rows={}",
+                                note.label(),
+                                note.stage_min_rows
+                                    .map_or_else(|| "none".to_string(), |rows| rows.to_string())
+                            ),
+                            None => "n/a".to_string(),
+                        };
+                        eprintln!(
+                            "[fn-lane-wave] dev={} lanes={first}..{} rows={total_rows} ms={:.1} route={route}",
+                            gpu.device_id,
+                            range.end,
+                            clock.elapsed().as_secs_f64() * 1e3,
+                        );
+                    }
+                    continue;
+                }
+            };
+            let (r, lane) = (&tiles[i], &mut lanes[i]);
+            let tokens = &plan.batch.tokens[r.rows.begin..r.rows.end()];
+            let tile_clock = (*LANE_TILE_PHASES).then(Instant::now);
+            let completes = wants_pick(&lane.host, r);
+            if lane.spec.is_some() {
                 let scratch = append.as_deref_mut().and_then(Option::as_mut);
-                let pick = prefill_tile(bundle, gpu, &mut *e.lane, tokens, scratch, sample_host)?;
+                if tile_clock.is_some() {
+                    crate::mtp_spec::lane_fill_split_arm();
+                }
+                let pick = prefill_tile(
+                    bundle,
+                    gpu,
+                    &mut **lane,
+                    tokens,
+                    scratch,
+                    sample_host,
+                    sample_arena,
+                )?;
                 if completes {
-                    picks[e.r.rows.end() - 1] = pick
+                    picks[r.rows.end() - 1] = pick
                         .ok_or_else(|| "the prompt-completing tile produced no pick".to_string())?;
                 }
             } else if completes {
                 let row = logits.sub_offset((rows_cap + i) * vocab, vocab);
                 bundle
-                    .lane_prefill_tile(gpu, &mut e.lane.state, tokens, Some(&row))
+                    .lane_prefill_tile(gpu, &mut lane.state, tokens, Some(&row))
                     .map_err(|e| e.to_string())?;
                 let slot = top1.sub_offset(
                     (rows_cap + i) * std::mem::size_of::<i32>(),
@@ -1251,46 +1626,112 @@ fn forward_inner(
                     },
                 )
                 .map_err(|e| e.to_string())?;
-                final_tiles.push((i, e.r.rows.end() - 1, entry));
+                final_tiles.push((i, r.rows.end() - 1));
             } else {
                 bundle
-                    .lane_prefill_tile(gpu, &mut e.lane.state, tokens, None)
+                    .lane_prefill_tile(gpu, &mut lane.state, tokens, None)
                     .map_err(|e| e.to_string())?;
+            }
+            if let Some(clock) = tile_clock {
+                // Synchronized wall of this one tile (`HIPFIRE_CB_PHASES=1` only: the device
+                // wait ends the overlap between consecutive tiles, so a timed run measures each
+                // tile alone), with the route the tile took.
+                gpu.hip.device_synchronize().map_err(|e| e.to_string())?;
+                let route = match bundle
+                    .lane_tile_note()
+                    .filter(|note| note.rows == tokens.len())
+                {
+                    Some(note) => format!(
+                        "{} stage_min_rows={}",
+                        note.label(),
+                        note.stage_min_rows
+                            .map_or_else(|| "none".to_string(), |rows| rows.to_string())
+                    ),
+                    None => "n/a".to_string(),
+                };
+                // An MTP lane's tile: the trunk forward and the head fill apart.
+                let split = match crate::mtp_spec::lane_fill_split_take() {
+                    Some((trunk_ms, head_ms)) => {
+                        format!(" trunk_ms={trunk_ms:.1} head_ms={head_ms:.1}")
+                    }
+                    None => String::new(),
+                };
+                eprintln!(
+                    "[fn-lane-tile] dev={} tile={i}/{n_prefill} rows={} ms={:.1} mtp={}{split} route={route}",
+                    gpu.device_id,
+                    tokens.len(),
+                    clock.elapsed().as_secs_f64() * 1e3,
+                    lane.spec.is_some(),
+                );
             }
         }
         Ok(())
     })();
-    if n_prefill > 0 {
-        let ended = bundle
-            .share_prompt_end(gpu, tiles.is_ok())
-            .map_err(|error| error.to_string());
-        tiles?;
-        ended?;
-    } else {
-        tiles?;
-    }
-    let prefill_ran = ordinal > 0;
+    let ended = bundle
+        .share_prompt_end_continuing(gpu, tiles_ran.is_ok(), continues)
+        .map_err(|error| error.to_string());
+    tiles_ran?;
+    ended?;
     if !final_tiles.is_empty() {
         let used = (rows_cap + n_prefill) * std::mem::size_of::<i32>();
-        gpu.hip
-            .memcpy_dtoh(&mut top1_host[..used], &top1.buf)
+        gpu.dtoh_stream_ordered(&mut top1_host[..used], &top1.buf)
             .map_err(|e| e.to_string())?;
         gpu.take_device_wait_error().map_err(|e| e.to_string())?;
-        for &(i, row, entry) in &final_tiles {
+        for &(i, row) in &final_tiles {
             picks[row] = pick_at(top1_host, rows_cap + i);
-            // A sampled lane's prompt-completing pick is its first draw, from
-            // the tile's final logits row (one D2H); a greedy lane keeps the
-            // argmax.
-            let lane = &mut *entries[entry].lane;
-            if lane.host.sampling.is_some() {
+        }
+        // A sampled lane's prompt-completing pick is its first draw, from the
+        // tile's final logits row; a greedy lane keeps the argmax. On the device
+        // (`HIPFIRE_QWEN4_LANE_DEVICE_SAMPLE`) every completing tile of the step
+        // is drawn by one `lane_sample_device` call; else each by one D2H.
+        let device = crate::lane::lane_device_sample(gpu);
+        if device {
+            let mut ones: Vec<[u32; 1]> =
+                final_tiles.iter().map(|&(_, row)| [picks[row]]).collect();
+            let mut one_slots: Vec<Option<&mut [u32; 1]>> = ones.iter_mut().map(Some).collect();
+            let mut requests: Vec<crate::lane::LaneDeviceRequest<'_>> = Vec::new();
+            let mut owners: Vec<usize> = Vec::new();
+            for (i, lane) in lanes.iter_mut().enumerate() {
+                let Some(k) = final_tiles.iter().position(|&(t, _)| t == i) else {
+                    continue;
+                };
+                if lane.host.sampling.is_none() {
+                    continue;
+                }
+                let one = one_slots[k]
+                    .take()
+                    .ok_or_else(|| format!("prefill tile {i} completes twice"))?;
+                // An MTP lane's first draw takes eos 0 exactly as its serial `prefill_tile` does.
+                let eos = if lane.spec.is_some() { 0 } else { lane_eos };
+                requests.push(crate::lane::LaneDeviceRequest {
+                    host: &mut lane.host,
+                    drafts: None,
+                    picks: one,
+                    eos,
+                    logits: logits.sub_offset((rows_cap + i) * vocab, vocab),
+                });
+                owners.push(k);
+            }
+            crate::lane::lane_sample_device(gpu, sample_arena, vocab, &mut requests)?;
+            drop(requests);
+            drop(one_slots);
+            for k in owners {
+                picks[final_tiles[k].1] = ones[k][0];
+            }
+        }
+        for &(i, row) in &final_tiles {
+            let lane = &mut *lanes[i];
+            if lane.host.sampling.is_some() && !device {
                 let gpu_ref: &Gpu = gpu;
                 let logits_ref: &GpuTensor = logits;
                 let mut one = [picks[row]];
+                // An MTP lane's first draw takes eos 0 exactly as its serial `prefill_tile` does.
+                let eos = if lane.spec.is_some() { 0 } else { lane_eos };
                 lane_sample_step(
                     &mut lane.host,
                     None,
                     &mut one,
-                    lane_eos,
+                    eos,
                     vocab,
                     sample_host,
                     |scratch| {
@@ -1302,59 +1743,247 @@ fn forward_inner(
             }
         }
     }
+    Ok(())
+}
 
-    // The step's wall clock feeds the cost model only on a pure-decode
-    // step; every MTP lane's policy observes its window either way.
-    if let Some(cost) = cost {
-        if decode_lanes > 0 {
-            // Row groups beyond the first are the step's spill; each Batched
-            // window is priced at its share of it.
-            let spill = row_group_count(&dec_rows).saturating_sub(1);
-            let spill_per_window = spill as f64 / verify_windows.max(1) as f64;
-            if !prefill_ran {
-                gpu.hip.device_synchronize().map_err(|e| e.to_string())?;
-                let wall_us = started.elapsed().as_secs_f64() * 1e6;
-                cost.observe(decode_lanes, spill, verified, wall_us as f32);
+/// Apply a published step's lane bookkeeping: the prefill tiles' commits, the
+/// decode lanes' mirrors of the root's published IDs and seeds, the window
+/// counters, and the step's price. Mutates only after every check passed.
+fn commit_inner(
+    bundle: &mut Qwen4Bundle,
+    gpu: &mut Gpu,
+    store: &mut Qwen4LaneStore,
+    plan: &BatchStepPlan,
+    output: &StepOutput,
+) -> Result<Vec<RequestAdvance>, String> {
+    store
+        .phase
+        .check_commit(&StepKey::of(plan), output.step_id)?;
+    if output.target_picks.len() != plan.total_rows() {
+        return Err("commit_step: pick count != planned rows".to_string());
+    }
+    let mut decode_requests = 0usize;
+    for r in &plan.requests {
+        let lane = match store.lane(&r.epoch) {
+            Some(lane) if lane.host.status != LaneStatus::Poisoned => lane,
+            _ => {
+                return Err(format!(
+                    "commit_step: epoch {:?} no longer owns its lane",
+                    r.epoch
+                ));
             }
-            for e in entries.iter_mut() {
-                if e.dec.is_none() {
-                    continue;
-                }
-                let Some(spec) = e.lane.spec.as_mut() else {
-                    continue;
-                };
-                let (Some(window), policy, stats) =
-                    (spec.window.as_ref(), &mut spec.policy, &mut spec.stats)
-                else {
-                    continue;
-                };
-                let Some(outcome) = window.outcome.as_ref() else {
-                    continue;
-                };
-                match window.route {
-                    LaneRoute::Batched { k_max } => {
-                        let units = cost.window_units(
-                            decode_lanes,
-                            outcome.drafts_generated,
-                            spill_per_window,
-                        );
-                        policy.observe_batched(outcome, units, k_max, window.budget);
-                        stats.windows += 1;
-                        stats.drafts += outcome.drafts_generated as u64;
-                        stats.accepted += outcome.accepted as u64;
-                    }
-                    LaneRoute::ArSynced => {
-                        policy.observe_ar_synced(outcome, window.budget);
-                        stats.windows += 1;
-                    }
-                    LaneRoute::ArRetired => stats.ar_windows += 1,
-                    LaneRoute::Ar => {}
-                }
-                stats.retired = policy.retired();
-            }
+        };
+        if r.rows.len == 0 || r.rows.end() > output.target_picks.len() {
+            return Err(format!("commit_step: bad row range {:?}", r.rows));
+        }
+        if wants_pick(&lane.host, r) && output.target_picks[r.rows.end() - 1] == u32::MAX {
+            return Err("commit_step: head row without a target pick".to_string());
+        }
+        if r.kind != RequestStepKind::Prefill {
+            decode_requests += 1;
         }
     }
-    Ok(picks)
+    let spec_config = store.spec();
+    let eos = spec_config
+        .and_then(|config| config.end_of_turn)
+        .unwrap_or(bundle.config.eos_token_id);
+    let mut proto = store.take_proto()?;
+    let result = commit_with_proto(
+        bundle,
+        gpu,
+        store,
+        &mut proto,
+        plan,
+        output,
+        decode_requests,
+        eos,
+    );
+    store.put_proto(proto);
+    if result.is_ok() {
+        store.step_started = None;
+        store.phase = LanePhase::Idle;
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn commit_with_proto(
+    bundle: &mut Qwen4Bundle,
+    gpu: &mut Gpu,
+    store: &mut Qwen4LaneStore,
+    proto: &mut LaneProto,
+    plan: &BatchStepPlan,
+    output: &StepOutput,
+    decode_requests: usize,
+    eos: u32,
+) -> Result<Vec<RequestAdvance>, String> {
+    let spec_config = store.spec();
+    // Publish: the root applies the staged IDs/seeds/policy/RNG exactly once,
+    // then the rank consumes its validated tickets.
+    let published = if decode_requests > 0 {
+        let LaneProto {
+            root, rank, flight, ..
+        } = &mut *proto;
+        let decision = flight
+            .as_ref()
+            .and_then(|f| f.decision.clone())
+            .ok_or_else(|| "commit_step: the step was never decided".to_string())?;
+        if decision.lanes.len() != decode_requests {
+            return Err(format!(
+                "commit_step: the root decided {} lanes, the plan has {decode_requests}",
+                decision.lanes.len()
+            ));
+        }
+        let out = root.publish_commit().map_err(|e| e.to_string())?;
+        let mut exec = LocalLaneRank {
+            bundle: &mut *bundle,
+            gpu: &mut *gpu,
+            store: &mut *store,
+            session: rank,
+            flight,
+        };
+        exec.publish_commit(&decision);
+        if let Some(error) = exec.flight.as_mut().and_then(|f| f.take_publish_error()) {
+            return Err(error);
+        }
+        Some((out, decision))
+    } else {
+        None
+    };
+    // The step's price: the rank's receipt merged with the controller
+    // interval (one rank: the wall is the interval), settled over every lane.
+    if let Some((_, decision)) = &published {
+        if spec_config.is_some() {
+            let (receipt, interval) = proto
+                .flight
+                .as_mut()
+                .and_then(|f| f.evidence.take())
+                .ok_or_else(|| "commit_step: the step has no cost evidence".to_string())?;
+            let merged = proto
+                .root
+                .merge_evidence(&[receipt], interval)
+                .map_err(|e| format!("commit_step: cost evidence: {e:?}"))?;
+            // A step that held a copy window settles through the next
+            // `plan_window` (its shadow and warm-depth accounting live in
+            // the staged plan); any other price settles now, over every lane.
+            if proto.root.pending_prices_copy() {
+                proto.prior = Some(merged);
+            } else {
+                proto
+                    .root
+                    .settle_evidence(Some(&merged))
+                    .map_err(|e| e.to_string())?;
+            }
+            let routes: Vec<(RequestEpoch, LaneRoute)> = proto
+                .flight
+                .as_ref()
+                .map(|f| {
+                    f.start
+                        .lanes
+                        .iter()
+                        .map(|l| (l.key.request_epoch, l.route))
+                        .collect()
+                })
+                .unwrap_or_default();
+            for ((epoch, route), d) in routes.iter().zip(&decision.lanes) {
+                let retired = proto.root.lane_retired(*epoch).unwrap_or(false);
+                let Some(spec) = store.lane_mut(epoch).and_then(|l| l.spec.as_mut()) else {
+                    continue;
+                };
+                let stats = &mut spec.stats;
+                // Counted by the window's final source (a copy plan whose
+                // confirmation missed ran as native or AR).
+                match (d.source.source, route) {
+                    _ if d.forced => stats.forced_windows += 1,
+                    (ProposalSource::Copy, _) => {
+                        stats.copy_windows += 1;
+                        stats.copy_drafts += d.source.offered as u64;
+                        stats.copy_accepted += d.source.accepted as u64;
+                    }
+                    (ProposalSource::Native, _) => {
+                        stats.windows += 1;
+                        stats.drafts += d.source.offered as u64;
+                        stats.accepted += d.source.accepted as u64;
+                        stats.record_depths(d.source.offered, d.source.accepted);
+                    }
+                    (ProposalSource::None, LaneRoute::ArSynced) => stats.windows += 1,
+                    (ProposalSource::None, LaneRoute::ArRetired) => stats.ar_windows += 1,
+                    (ProposalSource::None, _) => {}
+                }
+                match d.source.confirm {
+                    ConfirmOutcome::Confirmed => stats.copy_confirmed += 1,
+                    ConfirmOutcome::Missed => stats.copy_missed += 1,
+                    ConfirmOutcome::NotAsked => {}
+                }
+                stats.retired = retired;
+            }
+        } else {
+            // An AR store keeps no price: the step's is dropped.
+            proto
+                .root
+                .settle_evidence(None)
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    proto.flight = None;
+    let published = published.map(|(out, _)| out);
+
+    let mut advances = Vec::with_capacity(plan.requests.len());
+    for r in &plan.requests {
+        let pick = output.target_picks[r.rows.end() - 1];
+        let lane = store.lane_mut(&r.epoch).expect("validated above");
+        let (committed_ids, accepted_drafts, verified_rows) = match r.kind {
+            RequestStepKind::Prefill => {
+                let completes = wants_pick(&lane.host, r);
+                let ids: Vec<u32> = commit_host(&mut lane.host, r, pick).into_iter().collect();
+                if completes {
+                    // The prompt-completing pick is the request's first seed:
+                    // the root learns the lane here.
+                    proto.admit_decoding(DecodeAdmission {
+                        epoch: r.epoch,
+                        position: lane.state.position,
+                        seed: pick,
+                        eos: (!lane.host.ignore_eos).then_some(eos),
+                        rng_seed: lane.host.sampling.map_or(0, |s| u64::from(s.seed)),
+                        prompt: &lane.host.prompt,
+                        spec_k: spec_config.map(|config| config.k),
+                        promoted: None,
+                    })?;
+                }
+                (ids, 0, 0)
+            }
+            RequestStepKind::Ar | RequestStepKind::Verify { .. } => {
+                let out = published
+                    .as_ref()
+                    .and_then(|p| p.lanes.iter().find(|o| o.key.request_epoch == r.epoch))
+                    .ok_or_else(|| format!("commit_step: {:?} has no published window", r.epoch))?;
+                // The window ends with its step (its tickets were consumed at
+                // the publish).
+                if let Some(spec) = lane.spec.as_mut() {
+                    spec.window = None;
+                }
+                // The host table mirrors the root's published state.
+                lane.host.generated.extend_from_slice(&out.emitted);
+                lane.host.pending_seed = Some(out.next_seed);
+                let verified = match r.kind {
+                    RequestStepKind::Verify { draft_len } => draft_len + 1,
+                    _ => 0,
+                };
+                (out.emitted.clone(), out.source.accepted, verified)
+            }
+            RequestStepKind::Forced => unreachable!("refused by the forward"),
+        };
+        let position = lane.state.position;
+        advances.push(RequestAdvance {
+            epoch: r.epoch,
+            committed_ids,
+            committed_position: position,
+            accepted_drafts,
+            verified_rows,
+            finish: (position >= lane.state.max_seq_len).then(|| "length".to_string()),
+        });
+    }
+    Ok(advances)
 }
 
 #[cfg(test)]
@@ -1409,6 +2038,7 @@ mod tests {
             stamp: tag,
             sampling: None,
             rng: 0,
+            ignore_eos: false,
         }
     }
 
@@ -1534,6 +2164,8 @@ mod tests {
                             position: w.position,
                             seed: w.seed,
                             drafts: &w.drafts,
+                            verify: matches!(w.route, LaneRoute::Batched { .. }),
+                            forced: false,
                         }),
                     }),
                 })
@@ -1889,21 +2521,443 @@ mod tests {
     }
 
     #[test]
-    fn a_committed_verify_window_extends_the_lane_and_seeds_the_last_token() {
+    fn a_verify_request_ends_in_a_pick() {
+        // The window's committed IDs and next seed come from the root's
+        // published step (`lane_rank` tests); the table only needs the
+        // verify row's pick to exist.
         let plan = plan_of(&[verify(1, 0, &[77, 5, 6], 10)]);
         assert!(wants_pick(
             &host(1, 0, LaneStatus::Decoding, 10, 10),
             &plan.requests[0]
         ));
-        let mut h = host(1, 0, LaneStatus::Decoding, 10, 10);
-        h.generated = vec![77];
-        assert_eq!(commit_verify(&mut h, &[5, 6, 8]), Some(8));
-        assert_eq!(
-            (h.pending_seed, h.generated.clone()),
-            (Some(8), vec![77, 5, 6, 8])
+    }
+}
+
+#[cfg(test)]
+mod commit_window_tests {
+    /// A lane's pending window ends with its committed step: the next
+    /// `draft_step` refuses a lane that still holds one. (Host-only pin: the
+    /// commit needs a device.)
+    #[test]
+    fn commit_clears_every_decode_lane_window() {
+        let src = include_str!("lane_exec.rs");
+        let start = src
+            .find("fn commit_with_proto(")
+            .expect("commit_with_proto");
+        let body = &src[start..];
+        let ar = body
+            .find("RequestStepKind::Ar | RequestStepKind::Verify { .. } =>")
+            .expect("decode arm");
+        let arm = &body[ar..];
+        let clear = arm.find("spec.window = None;").expect("window cleared");
+        let mirror = arm
+            .find("lane.host.pending_seed = Some(out.next_seed)")
+            .expect("mirror");
+        assert!(
+            clear < mirror,
+            "the window is cleared with the published mirror"
         );
-        // A window that committed nothing changes nothing.
-        assert_eq!(commit_verify(&mut h, &[]), None);
-        assert_eq!(h.generated, vec![77, 5, 6, 8]);
+    }
+}
+
+#[cfg(test)]
+mod wave_tests {
+    use super::*;
+    use std::ops::Range;
+
+    const MAX: usize = EP_WAVE_MAX_ROWS;
+
+    fn plan(rows: &[usize]) -> Vec<PrefillPart> {
+        plan_prefill_parts(true, rows, &vec![true; rows.len()], MAX, &|_| true)
+    }
+
+    fn waves(parts: &[PrefillPart]) -> Vec<Range<usize>> {
+        parts
+            .iter()
+            .filter_map(|p| match p {
+                PrefillPart::Wave(r) => Some(r.clone()),
+                PrefillPart::Serial(_) => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_wave_is_on_by_default_and_only_exact_zero_kills_it() {
+        for on in [
+            None,
+            Some(""),
+            Some("1"),
+            Some(" 1\n"),
+            Some("2"),
+            Some("true"),
+        ] {
+            assert!(ep_lane_prefill_wave_from(on), "{on:?}");
+        }
+        for off in [Some("0"), Some(" 0\n")] {
+            assert!(!ep_lane_prefill_wave_from(off), "{off:?}");
+        }
+    }
+
+    #[test]
+    fn the_exact_window_is_the_sub_512_full_table_lanes() {
+        assert_eq!(crate::gpu_forward::ep_wave::EXACT_WAVE_MIN_LANE_ROWS, 65);
+        assert_eq!(
+            crate::gpu_forward::ep_wave::EXACT_WAVE_MAX_LANE_ROWS,
+            rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS - 1
+        );
+        // The default (small lanes on, no explicit floor): 9..=511 rows join; at most 8 rows are
+        // few-row tiles and 512 and up keep their own owner-routed tile.
+        for rows in [0usize, 1, 8, 512, 513, 2048] {
+            assert!(!ep_wave_lane_joins(rows), "{rows}");
+        }
+        for rows in [9usize, 48, 49, 60, 64, 65, 66, 149, 256, 511] {
+            assert!(ep_wave_lane_joins(rows), "{rows}");
+        }
+    }
+
+    #[test]
+    fn admission_table() {
+        // (total, per-lane rows, admitted)
+        let cases: &[(usize, &[usize], bool)] = &[
+            // The burst: 8 code prompts of 149 rows.
+            (1192, &[149; 8], true),
+            // The story burst below every 512 floor.
+            (520, &[65; 8], true),
+            // Small lanes (9..=64 rows) join the wave.
+            (480, &[60; 8], true),
+            // One lane is its own tile.
+            (300, &[300], false),
+            (0, &[], false),
+            // The cap: 2048 fits, 2049 must split.
+            (2048, &[511, 511, 511, 300, 215], true),
+            (2049, &[511, 511, 511, 300, 216], false),
+            // A lane at 512 keeps its serial tile (owner-routed on its own).
+            (1024, &[512, 512], false),
+            (700, &[100, 600], false),
+            // A few-row lane (at most 8 rows) or a zero-row lane is not an exact-wave tile.
+            (113, &[48, 65], true),
+            (16, &[8, 8], false),
+            (98, &[49, 49], true),
+            (300, &[0, 300], false),
+            // The total must be the lanes' sum.
+            (1000, &[300, 300], false),
+        ];
+        for (total, rows, want) in cases {
+            assert_eq!(
+                ep_wave_prefill_admits(*total, rows, MAX),
+                *want,
+                "total {total} lanes {rows:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn knob_off_is_the_serial_schedule() {
+        let rows = [149; 8];
+        let parts = plan_prefill_parts(false, &rows, &[true; 8], MAX, &|_| true);
+        assert_eq!(parts, (0..8).map(PrefillPart::Serial).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_burst_of_eight_code_prompts_is_one_wave() {
+        assert_eq!(plan(&[149; 8]), vec![PrefillPart::Wave(0..8)]);
+    }
+
+    #[test]
+    fn a_single_lane_run_stays_serial() {
+        for rows in [&[149usize][..], &[300], &[511]] {
+            let parts = plan(rows);
+            assert_eq!(
+                parts,
+                (0..rows.len()).map(PrefillPart::Serial).collect::<Vec<_>>(),
+                "{rows:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn there_is_no_row_floor_on_the_total() {
+        // A burst of 8 x 65 = 520 rows is one wave regardless of the total, and so is the
+        // smallest legal pair.
+        assert_eq!(plan(&[65; 8]), vec![PrefillPart::Wave(0..8)]);
+        assert_eq!(plan(&[65, 65]), vec![PrefillPart::Wave(0..2)]);
+        // 9..=64-row lanes join the wave (the story C8 burst is one wave); a few-row lane of at
+        // most 8 rows keeps its serial tile.
+        assert_eq!(plan(&[60; 8]), vec![PrefillPart::Wave(0..8)]);
+        assert_eq!(
+            plan(&[8; 4]),
+            (0..4).map(PrefillPart::Serial).collect::<Vec<_>>()
+        );
+        // Three 149-row lanes: 447 rows.
+        assert_eq!(plan(&[149; 3]), vec![PrefillPart::Wave(0..3)]);
+        assert_eq!(plan(&[200, 200]), vec![PrefillPart::Wave(0..2)]);
+    }
+
+    #[test]
+    fn a_floor_tile_and_an_mtp_lane_split_the_runs() {
+        // A 600-row tile (owner-routed on its own) keeps its serial tile; the lanes around it
+        // wave separately (contiguous ordinals only, since a wave writes one contiguous head
+        // block). A lane below 65 rows keeps its serial tile the same way.
+        let parts = plan(&[149, 149, 600, 149, 149, 149, 149]);
+        assert_eq!(
+            parts,
+            vec![
+                PrefillPart::Wave(0..2),
+                PrefillPart::Serial(2),
+                PrefillPart::Wave(3..7),
+            ]
+        );
+        let parts = plan(&[149, 8, 149, 149]);
+        assert_eq!(
+            parts,
+            vec![
+                PrefillPart::Serial(0),
+                PrefillPart::Serial(1),
+                PrefillPart::Wave(2..4),
+            ]
+        );
+        // An ineligible (MTP) lane in the middle ends the run the same way.
+        let eligible = [true, true, true, true, false, true, true, true, true];
+        let rows = [149; 9];
+        let parts = plan_prefill_parts(true, &rows, &eligible, MAX, &|_| true);
+        assert_eq!(
+            parts,
+            vec![
+                PrefillPart::Wave(0..4),
+                PrefillPart::Serial(4),
+                PrefillPart::Wave(5..9),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_big_burst_splits_into_balanced_waves_under_the_cap() {
+        let parts = plan(&[149; 20]); // 2980 rows
+        assert_eq!(
+            parts,
+            vec![PrefillPart::Wave(0..10), PrefillPart::Wave(10..20)]
+        );
+        for w in waves(&parts) {
+            let rows: usize = w.len() * 149;
+            assert!((2..=MAX).contains(&rows));
+        }
+    }
+
+    #[test]
+    fn a_single_lane_tail_merges_into_the_wave_before_it() {
+        // Nine 200-row lanes (1800 rows) fit one wave; a tenth lane (2000) still fits; four
+        // 511-row lanes plus a 65-row one overflow the cap (2109) and split into two balanced
+        // waves rather than leaving a one-lane serial tail.
+        assert_eq!(plan(&[200; 10]), vec![PrefillPart::Wave(0..10)]);
+        let mut rows = vec![511; 4];
+        rows.push(65);
+        assert_eq!(
+            plan(&rows),
+            vec![PrefillPart::Wave(0..3), PrefillPart::Wave(3..5)]
+        );
+        let mut rows = vec![300; 6];
+        rows.push(65);
+        assert_eq!(plan(&rows), vec![PrefillPart::Wave(0..7)]);
+    }
+
+    #[test]
+    fn parts_cover_every_ordinal_once_in_plan_order_within_the_cap() {
+        // Deterministic sweep over run shapes.
+        let mut x = 0x2545_f491_u32;
+        let mut next = |m: u32| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            (x % m) as usize
+        };
+        for _ in 0..500 {
+            let n = 1 + next(24);
+            let rows: Vec<usize> = (0..n).map(|_| 1 + next(700)).collect();
+            let eligible: Vec<bool> = (0..n).map(|_| next(8) != 0).collect();
+            let parts = plan_prefill_parts(true, &rows, &eligible, MAX, &|_| true);
+            let mut seen = Vec::new();
+            for part in &parts {
+                match part {
+                    PrefillPart::Serial(i) => seen.push(*i),
+                    PrefillPart::Wave(r) => {
+                        let lanes = &rows[r.clone()];
+                        assert!(
+                            ep_wave_prefill_admits(lanes.iter().sum(), lanes, MAX),
+                            "{rows:?} {r:?}"
+                        );
+                        assert!(eligible[r.clone()].iter().all(|&e| e));
+                        seen.extend(r.clone());
+                    }
+                }
+            }
+            assert_eq!(seen, (0..n).collect::<Vec<_>>(), "{rows:?} {eligible:?}");
+        }
+    }
+
+    #[test]
+    fn wave_head_slots_land_on_the_serial_tiles_slots() {
+        let word = std::mem::size_of::<i32>();
+        for (rows_cap, first, lanes) in [(8, 0, 8), (64, 3, 5), (8, 7, 1)] {
+            let (row0, top1_off, top1_len) = wave_head_slots(rows_cap, first, lanes);
+            for j in 0..lanes {
+                let ordinal = first + j;
+                // The serial tile of `ordinal` writes logits row `rows_cap + ordinal` and top-1
+                // byte `(rows_cap + ordinal) * 4`.
+                assert_eq!(row0 + j, rows_cap + ordinal);
+                assert_eq!(top1_off + j * word, (rows_cap + ordinal) * word);
+            }
+            assert_eq!(top1_len, lanes * word);
+        }
+    }
+
+    #[test]
+    fn a_host_refused_wave_stays_serial_and_is_asked_with_the_lane_rows() {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let refuse = |rows: &[usize]| {
+            asked.borrow_mut().push(rows.to_vec());
+            false
+        };
+        let parts = plan_prefill_parts(true, &[149; 8], &[true; 8], MAX, &refuse);
+        assert_eq!(parts, (0..8).map(PrefillPart::Serial).collect::<Vec<_>>());
+        assert_eq!(asked.into_inner(), vec![vec![149; 8]]);
+        // Off the wave knob the host is never asked.
+        let never = |_: &[usize]| -> bool { panic!("asked with the knob off") };
+        let _ = plan_prefill_parts(false, &[149; 8], &[true; 8], MAX, &never);
+    }
+
+    /// The executor's ordering contract, pinned on the source (a device is needed to run it):
+    /// the borrowed-bank epoch opens once before the parts and closes once after them, the
+    /// wave arm sits inside it, runs each MTP lane's head fill after the wave and before the
+    /// prompt-completing ordinals are recorded for the shared pick/sampling tail, and the serial
+    /// tile body is the only place a lane tile runs.
+    #[test]
+    fn the_executor_orders_epoch_parts_and_picks() {
+        let src = include_str!("lane_exec.rs");
+        let start = src
+            .find("fn run_prefill_tiles(")
+            .expect("run_prefill_tiles");
+        let rest = &src[start..];
+        let body = &rest[..rest.find("\n}\n").expect("fn end")];
+        let count = |needle: &str| body.matches(needle).count();
+        assert_eq!(count("bundle.share_prompt_begin_mtp_fill()"), 1);
+        assert_eq!(count("bundle.share_prompt_begin()"), 1);
+        assert_eq!(count(".share_prompt_end_continuing(gpu"), 1);
+        assert_eq!(count(".prefill_wave("), 1);
+        assert_eq!(count(".prefill_wave_wide("), 1);
+        assert_eq!(count("fill_head_after_wave("), 1);
+        assert_eq!(count(".lane_prefill_tile("), 2, "completing + silent tiles");
+        let begin = body.find("bundle.share_prompt_begin()").unwrap();
+        let wave = body.find(".prefill_wave(").unwrap();
+        let wide = body.find(".prefill_wave_wide(").unwrap();
+        let fill = body.find("fill_head_after_wave(").unwrap();
+        let finals = body.find("final_tiles.push((ordinal").unwrap();
+        let tile = body.find(".lane_prefill_tile(").unwrap();
+        let end = body.find(".share_prompt_end_continuing(gpu").unwrap();
+        assert!(begin < wave && wave < wide && wide < fill && fill < finals);
+        assert!(finals < tile && tile < end);
+        // The wave arm feeds the shared tail (top-1 download, sampled draws).
+        let wave_arm = &body[wave..tile];
+        assert!(wave_arm.contains("wants_pick(&lanes[ordinal].host, r)"));
+        assert!(wave_arm.contains("final_tiles.push((ordinal, r.rows.end() - 1))"));
+        assert!(body.contains("WaveHead::Final"));
+        // The parts come from `step_prefill_parts`, the function provisioning reads too.
+        assert!(body.contains("step_prefill_parts(bundle, gpu, &tile_rows, &mtp)"));
+        let parts_fn = fn_src(src, "pub(crate) fn step_prefill_parts(");
+        // The host's admission gates every candidate wave; the knob and the EP forward gate the
+        // whole plan.
+        assert!(parts_fn.contains("bundle.ep_wave_admission(gpu, rows)"));
+        assert!(parts_fn.contains("ep_lane_prefill_wave_enabled() && ep_forward"));
+        // A wave carrying an MTP lane captures the wave's wide hidden into the resident spec
+        // hidden buffer and caps its rows by that buffer.
+        assert!(parts_fn.contains("EP_WAVE_MAX_ROWS.min(wide_rows)"));
+        assert!(body.contains("hidden.sub_offset(0, total_rows * wide_width)"));
+    }
+
+    /// `src` from `head` through the end of that item (`\n}\n`).
+    fn fn_src<'a>(src: &'a str, head: &str) -> &'a str {
+        let rest = &src[src.find(head).expect(head)..];
+        &rest[..rest.find("\n}\n").expect("item end")]
+    }
+
+    /// j9704 (FN EP2 serve, 8 lanes): a 59-row C1 lane tile ran under the ordinary-prefill
+    /// intent (as a `serve.batch_exact` lane tile still does), routed at the canonical chunk and
+    /// rebuilt the long-prefill caches (946 MiB) plus its 8192-row scratch, but the reclaim rule
+    /// read `Gpu::route_rows(59)` outside the tile's scopes, so the bank lent into the cold
+    /// reserve stayed lent and the tile's `hipMalloc` ran out of memory (rank pool poisoned). A
+    /// serial tile counts by the routing rows it RUNS at; a wave lane (under the wave's row cap)
+    /// never does.
+    #[test]
+    fn a_serial_tile_routing_at_the_canonical_chunk_is_a_long_prefill_whatever_its_rows() {
+        let canonical = rdna_compute::prefill_invariant::QWEN4_PREFILL_CANON_ROWS;
+        let serial = [PrefillPart::Serial(0)];
+        // A 59-row tile under the intent (a `serve.batch_exact` lane): the canonical chunk.
+        assert!(serial_tiles_long(&serial, |_| canonical));
+        // A distribution-equivalent lane tile on the product routes stays short.
+        assert!(!serial_tiles_long(&serial, |_| 59));
+        // A wave never asks: its lanes route under the wave cap.
+        let wave = [PrefillPart::Wave(0..8)];
+        assert!(!serial_tiles_long(&wave, |_| panic!(
+            "a wave lane was priced as a tile"
+        )));
+        // A refused wave's lanes run serially and each one counts.
+        let refused: Vec<PrefillPart> = (0..8).map(PrefillPart::Serial).collect();
+        let mut asked = Vec::new();
+        assert!(serial_tiles_long(&refused, |i| {
+            asked.push(i);
+            if i == 3 {
+                canonical
+            } else {
+                149
+            }
+        }));
+        assert_eq!(asked, vec![0, 1, 2, 3], "stops at the first long tile");
+    }
+
+    /// The reclaim-before-provision rule, pinned on the source (a device is needed to run it):
+    /// provisioning prices the very parts the forward runs (`step_prefill_parts`), each serial
+    /// tile at the routing rows its scopes give it (`lane_prefill_tile_route_rows` probing
+    /// `tile_route_rows`), and reclaims before any lane maps or forwards; the forward's own
+    /// backstop reads the scoped rows too. No elastic predicate reads the bare
+    /// `Gpu::route_rows` of a tile outside its scopes.
+    #[test]
+    fn the_elastic_reclaim_prices_each_tile_at_the_rows_it_routes() {
+        let src = include_str!("lane_exec.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("tests")];
+        let provision = fn_src(prod, "    fn provision_step_local(");
+        let parts = provision
+            .find("elastic_step_long_prefill(self.bundle, gpu, &prefill)")
+            .expect("long prefill priced");
+        let reclaim = provision
+            .find("elastic_reclaim_logged(gpu, \"prefill\")")
+            .expect("reclaim");
+        let mapped = provision.find("provision_inner(").expect("provision_inner");
+        assert!(parts < reclaim && reclaim < mapped);
+        assert!(provision.contains("if maps_past_charge || long_prefill {"));
+        assert!(provision.contains("elastic_note_step_prefill(long_prefill)"));
+        let long = fn_src(prod, "fn elastic_step_long_prefill(");
+        assert!(long.contains("step_prefill_parts(bundle, gpu, &tile_rows, &mtp)"));
+        assert!(long.contains("bundle.lane_prefill_tile_route_rows(gpu, tile_rows[i])"));
+        let pages = include_str!("lane/pages.rs");
+        let probe = fn_src(pages, "    pub(crate) fn lane_prefill_tile_route_rows(");
+        assert!(probe.contains("std::mem::replace(&mut forward.prefill_scope, true)"));
+        assert!(probe.contains("std::mem::replace(&mut forward.lane_scope, true)"));
+        assert!(probe.contains("forward.wave_route.take()"));
+        assert!(probe.contains("forward.tile_route_rows(gpu, rows)"));
+        // The step's note restarts the idle count once: its boundary consumes it, so the mesh
+        // decode steps after a long tile (they provision nothing) count on to the next tick.
+        let boundary = fn_src(pages, "    pub fn elastic_idle_boundary(");
+        assert!(boundary.contains("std::mem::take(&mut elastic.step_long_prefill)"));
+        let forward = include_str!("gpu_forward.rs");
+        let route = fn_src(forward, "    pub(crate) fn tile_route_rows(");
+        let enter = route.find("self.enter_tile_scopes(gpu, rows)").unwrap();
+        let rows = route.find("gpu.route_rows(rows)").unwrap();
+        let leave = route.find("Self::leave_tile_scopes(gpu, saved)").unwrap();
+        assert!(enter < rows && rows < leave);
+        assert!(forward.contains(
+            "let route_rows = self.tile_route_rows(gpu, tokens.len());\n            bundle.elastic_prefill_backstop(gpu, route_rows);"
+        ));
+        for text in [prod, pages] {
+            assert!(!text.contains("long_prefill_route_rows(gpu.route_rows("));
+        }
     }
 }

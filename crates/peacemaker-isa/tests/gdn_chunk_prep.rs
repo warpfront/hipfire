@@ -14,7 +14,8 @@
 //!     output bytes) and every output plane is compared bit for bit with an independent Rust model of the
 //!     incumbent's arithmetic (separate multiplies and adds, explicit `fma` only where the source has `fmaf`, the
 //!     incumbent's `expf` / `logf` / `rsqrtf` / full-division operand graphs over the interpreter's transcendental
-//!     primitives, the pair-prefix shuffle-up scan with its `(pair - g0) - g1` subtract / re-add, the XOR
+//!     primitives, the pair-prefix shuffle-up scan with its causal exclusive prefix (`before` is the previous
+//!     lane's inclusive value, so a row never depends on later rows), the XOR
 //!     butterfly). The interpreter runs the emission itself, unmodified: wide global stores, the `_e32` compare / select
 //!     and the negated-operand multiply all have modeled semantics. The
 //!     model has teeth: the serial scan, the conventional inclusive prefix, the unfused convolution and the
@@ -341,8 +342,8 @@ fn kernarg_layout_and_resources_match_contract() {
         .collect();
     assert_eq!(
         perm.len(),
-        5,
-        "one crossbar per scan level d = 1, 2, 4, 8, 16"
+        6,
+        "one crossbar per scan level d = 1, 2, 4, 8, 16 and one for the exclusive prefix (lane l - 1)"
     );
     for i in perm {
         assert_eq!(
@@ -488,8 +489,9 @@ fn f16_bits(x: f32) -> u16 {
 struct Variant {
     /// The scan is a serial per-row prefix.
     serial_scan: bool,
-    /// The scan is a conventional inclusive prefix (no `(pair - g0) - g1` subtract / re-add).
-    plain_prefix: bool,
+    /// The scan re-derives `before` as `(pair - g0) - g1` (the pre-causal formula: it depends on the
+    /// row after the last valid one).
+    subtract_prefix: bool,
     /// The convolution is multiplied and added separately.
     unfused_conv: bool,
     /// The norm reduction adds the in-lane squares last.
@@ -632,7 +634,7 @@ fn model(c: &Case, var: Variant) -> Planes {
             }
             for l in 0..32 {
                 let (g0, g1) = (g[2 * l], g[2 * l + 1]);
-                let (a0, a1) = if var.plain_prefix {
+                let (a0, a1) = if !var.subtract_prefix {
                     // Exclusive lane prefix, then sequential adds.
                     let before = if l == 0 { 0.0 } else { pair[l - 1] };
                     (before + g0, before + g0 + g1)
@@ -979,12 +981,12 @@ fn the_pinned_orders_are_observable() {
     assert!(
         differs(
             Variant {
-                plain_prefix: true,
+                subtract_prefix: true,
                 ..Variant::default()
             },
             &a
         ),
-        "a conventional prefix is not the subtract / re-add"
+        "the old `(pair - g0) - g1` subtract / re-add is not the causal exclusive prefix"
     );
     assert!(
         differs(
@@ -1525,7 +1527,7 @@ fn contract_is_derived_from_the_emission() {
         );
     }
     let counts = c["counts"].as_object().unwrap();
-    assert_eq!(counts["ds_bpermute_b32"], 5);
+    assert_eq!(counts["ds_bpermute_b32"], 6);
     assert_eq!(
         (
             counts["v_exp_f32_e32"].as_u64(),

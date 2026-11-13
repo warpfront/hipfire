@@ -563,7 +563,6 @@ fn hfq_weight(
                     m,
                     k,
                     row_stride: if ld == k { 0 } else { ld * 2 },
-                    paro: None,
                     awq_scale: None,
                     lloyd_lut_e4m3: None,
                     lloyd_lut_f16: None,
@@ -582,7 +581,6 @@ fn hfq_weight(
                     m,
                     k,
                     row_stride: 0,
-                    paro: None,
                     awq_scale: None,
                     lloyd_lut_e4m3: None,
                     lloyd_lut_f16: None,
@@ -603,7 +601,6 @@ fn hfq_weight(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -620,7 +617,6 @@ fn hfq_weight(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -637,7 +633,6 @@ fn hfq_weight(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -655,7 +650,6 @@ fn hfq_weight(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -684,7 +678,6 @@ fn hfq_weight(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -711,7 +704,6 @@ fn hfq_weight(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -738,7 +730,6 @@ fn hfq_weight(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -765,7 +756,6 @@ fn hfq_weight(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -792,7 +782,6 @@ fn hfq_weight(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -855,7 +844,7 @@ fn attach_awq_scale_with_copy(
 
 impl DflashLayerWeights {
     /// Consume one layer's weights, releasing every GPU tensor including the
-    /// AWQ/paro sidecars (`free_all`, not `.buf` — an AWQ-trunk drafter
+    /// AWQ sidecars (`free_all`, not `.buf` — an AWQ-trunk drafter
     /// carries one scale tensor per weight per layer). Shared by the
     /// success-path `DflashWeights::free_gpu` and the `load` error path so a
     /// failed load frees completed layers without duplicating this list.
@@ -1346,7 +1335,7 @@ impl DflashWeights {
         })
     }
     pub fn free_gpu(self, gpu: &mut Gpu) {
-        // free_all (not .buf) so the awq_scale / paro sidecars are released too —
+        // free_all (not .buf) so the awq_scale sidecar is released too —
         // on an AWQ-trunk drafter every weight carries an awq_scale GpuTensor, so
         // .buf-only freeing leaks one tensor per weight per layer on each unload.
         self.fc.free_all(gpu);
@@ -1376,7 +1365,7 @@ impl DflashWeights {
 ///
 /// The fields are PRIVATE (this is a submodule), so the only ways to mutate
 /// them are the invariant-preserving operations below — `seed_prompt`,
-/// `append_committed`, `rebuild_after_eviction`, `reset`, plus the two
+/// `append_committed`, `reset`, plus the two
 /// `draft_forward`-owned watermarks `mark_uploaded` / `mark_proj_cached`.
 /// A caller can no longer set `uploaded_rows` without `abs_positions` staying
 /// consistent (the desync that bit the generic DFlash path in 89856eab and
@@ -1524,23 +1513,6 @@ mod target_hidden_log {
                 self.abs_positions
                     .push(base_pos as i32 + p as i32 + compact_offset);
             }
-        }
-
-        /// Post-eviction rebuild: `new_abs` is the compacted absolute-position
-        /// list (one entry per retained row). Replaces the row layout and
-        /// invalidates the projection cache (row indices shifted).
-        pub fn rebuild_after_eviction(&mut self, new_abs: Vec<i32>) {
-            self.uploaded_rows = new_abs.len();
-            self.abs_positions = new_abs;
-            self.proj_cached_rows = 0;
-            self.full_cached_rows = 0;
-        }
-
-        /// Invalidate only the per-layer projection cache (eviction mirror that
-        /// keeps the uploaded rows but shifts their indices).
-        pub fn invalidate_proj_cache(&mut self) {
-            self.proj_cached_rows = 0;
-            self.full_cached_rows = 0;
         }
 
         /// `draft_forward`-owned: record that `l` rows are now uploaded H2D.
@@ -1750,7 +1722,7 @@ pub struct DflashScratch {
     // tracker drops per-cycle H2D from ~90 MB (full ctx at 1100 tokens × 5
     // layers × 4096 × 4 B) to ~700 KB. See `TargetHiddenLog` for the
     // invariant-preserving API (seed_prompt / append_committed /
-    // rebuild_after_eviction / reset); raw poking is no longer possible.
+    // reset); raw poking is no longer possible.
     pub thlog: TargetHiddenLog,
 
     /// Per-layer cache of `k_ctx` and `v_ctx` (post-GEMM-of-target_hidden_proj;
@@ -2281,18 +2253,6 @@ impl DflashScratch {
             DraftCtxMode::Legacy => usize::MAX,
             DraftCtxMode::Windowed { w, .. } => w,
         }
-    }
-
-    /// Invalidate the per-layer k_ctx/v_ctx projection cache. Called from
-    /// `apply_eviction_retain_to_draft` (in speculative.rs) when CASK
-    /// evicts positions — the cached rows no longer correspond to the
-    /// right absolute positions, so the simplest correct thing is to
-    /// rebuild on the next cycle. A finer mirror (applying retain_mask
-    /// to the cache) could preserve the cache across eviction but adds
-    /// complexity; the rebuild cost is bounded by one slow cycle per
-    /// eviction which is rare relative to total cycles.
-    pub fn invalidate_draft_ctx_cache(&mut self) {
-        self.thlog.invalidate_proj_cache();
     }
 
     /// Turn the graph-captured draft window on or off for this scratch (the
@@ -4071,8 +4031,7 @@ fn draft_forward_based_inner(
     // `draft_ctx_cached_rows` is the scratch-owned invariant: how many
     // prefix rows have been computed end-to-end (fc + hidden_norm +
     // per-layer wk + k_norm + per-layer wv). It resets to 0 at new
-    // prompts (reset_upload_tracking) and on eviction
-    // (invalidate_draft_ctx_cache).
+    // prompts (reset_upload_tracking).
     //
     // Full-rebuild cases: delta == L (first cycle after reset), or
     // delta > L somehow (shouldn't happen — this would be a bug). Those
@@ -5421,7 +5380,6 @@ mod construction_tests {
                 m: 2,
                 k: 8,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -5862,10 +5820,7 @@ pub fn propose_candidates_host(
     )?;
     // D2H projected hidden
     let mut host_proj = vec![0f32; rows * rank];
-    let bytes: &mut [u8] = unsafe {
-        std::slice::from_raw_parts_mut(host_proj.as_mut_ptr() as *mut u8, host_proj.len() * 4)
-    };
-    gpu.hip.memcpy_dtoh(bytes, &proj_slice.buf)?;
+    gpu.dtoh_stream_ordered_batch(&mut [(&proj_slice.buf, f32_bytes_mut(&mut host_proj))])?;
     // CPU top-K per row (raw logits)
     let mut top_ids = Vec::with_capacity(rows * k);
     let mut top_vals = Vec::with_capacity(rows * k);
@@ -5962,9 +5917,9 @@ pub fn propose_candidates_device_penalized(
     if logits.buf.size() < rows * vocab * 4 {
         return Err(hip_bridge::HipError::new(0, "logits buffer too small"));
     }
-    // Project hidden -> rank
-    let host_proj = selector_projection_host(gpu, weights, scratch, hidden, rows, rank)?;
-    // GPU top-K raw values (small D2H)
+    // Project hidden -> rank, then the raw GPU top-K; all three readbacks (projection, ids,
+    // values) are enqueued behind both kernels on the decode stream and read with one wait.
+    let proj_slice = selector_projection_enqueue(gpu, weights, scratch, hidden, rows, rank)?;
     let top_ids_gpu = scratch
         .topk_ids
         .as_ref()
@@ -5982,7 +5937,15 @@ pub fn propose_candidates_device_penalized(
         let _ = _marker;
     }
     gpu.topk_values_batched_f32(logits, &ids_slice, &vals_slice, vocab, k, rows)?;
-    let (top_ids, top_vals) = download_top(gpu, &ids_slice, &vals_slice, rows * k)?;
+    let mut host_proj = vec![0f32; rows * rank];
+    let mut ids_bytes = vec![0u8; rows * k * 4];
+    let mut vals_bytes = vec![0u8; rows * k * 4];
+    gpu.dtoh_stream_ordered_batch(&mut [
+        (&proj_slice.buf, f32_bytes_mut(&mut host_proj)),
+        (&ids_slice.buf, &mut ids_bytes[..]),
+        (&vals_slice.buf, &mut vals_bytes[..]),
+    ])?;
+    let (top_ids, top_vals) = decode_top(&ids_bytes, &vals_bytes);
     propose_candidates_from_rows_penalized(
         weights,
         &host_proj,
@@ -6518,16 +6481,16 @@ pub fn propose_candidates_lanes_device(
         .collect()
 }
 
-/// Selector hidden projection `[rows × rank]` (one `gemm_dispatch`),
-/// downloaded to the host.
-fn selector_projection_host(
+/// Enqueue the selector hidden projection `[rows × rank]` (one `gemm_dispatch`) and return
+/// the device view of its result.
+fn selector_projection_enqueue(
     gpu: &mut Gpu,
     weights: &DflashWeights,
     scratch: &DflashScratch,
     hidden: &GpuTensor,
     rows: usize,
     rank: usize,
-) -> HipResult<Vec<f32>> {
+) -> HipResult<GpuTensor> {
     let proj = scratch
         .selector_proj
         .as_ref()
@@ -6543,25 +6506,31 @@ fn selector_projection_host(
         scratch.mq_x_rot.as_ref(),
         scratch.mq_x_rot_f16.as_ref(),
     )?;
+    Ok(proj_slice)
+}
+
+fn f32_bytes_mut(v: &mut [f32]) -> &mut [u8] {
+    // SAFETY: `v` is initialized f32s; any byte pattern is a valid f32.
+    unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, v.len() * 4) }
+}
+
+/// Selector hidden projection `[rows × rank]` (one `gemm_dispatch`),
+/// downloaded to the host on the decode stream.
+fn selector_projection_host(
+    gpu: &mut Gpu,
+    weights: &DflashWeights,
+    scratch: &DflashScratch,
+    hidden: &GpuTensor,
+    rows: usize,
+    rank: usize,
+) -> HipResult<Vec<f32>> {
+    let proj_slice = selector_projection_enqueue(gpu, weights, scratch, hidden, rows, rank)?;
     let mut host_proj = vec![0f32; rows * rank];
-    let bytes: &mut [u8] = unsafe {
-        std::slice::from_raw_parts_mut(host_proj.as_mut_ptr() as *mut u8, host_proj.len() * 4)
-    };
-    gpu.hip.memcpy_dtoh(bytes, &proj_slice.buf)?;
+    gpu.dtoh_stream_ordered_batch(&mut [(&proj_slice.buf, f32_bytes_mut(&mut host_proj))])?;
     Ok(host_proj)
 }
 
-/// Download `n` top-K ids (i32 stored in an F32 buffer) and values (f32).
-fn download_top(
-    gpu: &mut Gpu,
-    ids: &GpuTensor,
-    vals: &GpuTensor,
-    n: usize,
-) -> HipResult<(Vec<u32>, Vec<f32>)> {
-    let mut ids_bytes = vec![0u8; n * 4];
-    let mut vals_bytes = vec![0u8; n * 4];
-    gpu.hip.memcpy_dtoh(&mut ids_bytes, &ids.buf)?;
-    gpu.hip.memcpy_dtoh(&mut vals_bytes, &vals.buf)?;
+fn decode_top(ids_bytes: &[u8], vals_bytes: &[u8]) -> (Vec<u32>, Vec<f32>) {
     let top_ids = ids_bytes
         .chunks_exact(4)
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -6570,5 +6539,22 @@ fn download_top(
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
-    Ok((top_ids, top_vals))
+    (top_ids, top_vals)
+}
+
+/// Download `n` top-K ids (i32 stored in an F32 buffer) and values (f32) on the decode
+/// stream, one wait.
+fn download_top(
+    gpu: &mut Gpu,
+    ids: &GpuTensor,
+    vals: &GpuTensor,
+    n: usize,
+) -> HipResult<(Vec<u32>, Vec<f32>)> {
+    let mut ids_bytes = vec![0u8; n * 4];
+    let mut vals_bytes = vec![0u8; n * 4];
+    gpu.dtoh_stream_ordered_batch(&mut [
+        (&ids.buf, &mut ids_bytes[..]),
+        (&vals.buf, &mut vals_bytes[..]),
+    ])?;
+    Ok(decode_top(&ids_bytes, &vals_bytes))
 }

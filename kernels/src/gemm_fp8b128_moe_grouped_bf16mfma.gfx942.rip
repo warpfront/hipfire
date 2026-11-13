@@ -1,0 +1,526 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+// Native wave64 port. Every accumulator contracts kb, h, t in the HIP anchor's order.
+// The baseline loads the four MFMA operands directly in lane layout; no compiler
+// assembly, bytes, or lifted code are embedded in this source.
+const ARCHES: &[&str] = &["gfx942"];
+enum Kind {
+    F32,
+    Xbf16,
+    Pad16,
+}
+
+fn emit(spec: Spec) -> Result<Emitted, String> {
+    if spec.arch != Arch::Gfx942 {
+        return Err("this kernel requires gfx942".into());
+    }
+    let variant = spec.variant.to_ascii_lowercase();
+    let pad = variant == "pad16";
+    let bf16 = variant == "xbf16";
+    let symbol = if pad {
+        "gemm_fp8b128_moe_tile_desc_pad16"
+    } else if bf16 {
+        "gemm_fp8b128_moe_grouped_bf16mfma_xbf16"
+    } else {
+        "gemm_fp8b128_moe_grouped_bf16mfma"
+    };
+    let args = if pad {
+        KernargLayout::new(20)
+            .pointer("tile_ids", 0)
+            .pointer("tile_desc", 8)
+            .hidden("n_tiles", 16, 4, "by_value")
+    } else {
+        KernargLayout::new(64)
+            .pointer("W", 0)
+            .hidden("expert_stride", 8, 8, "by_value")
+            .pointer("tile_desc", 16)
+            .pointer("sorted_rows", 24)
+            .pointer("X", 32)
+            .pointer("Y", 40)
+            .hidden("R", 48, 4, "by_value")
+            .hidden("K", 52, 4, "by_value")
+            .hidden("x_row_div", 56, 4, "by_value")
+            .hidden("n_exp", 60, 4, "by_value")
+    };
+    let k = KernelSpec {
+        kernel_id: "fp8_moe_cdna".into(),
+        variant,
+        arch: spec.arch,
+        symbol: symbol.into(),
+        kernargs: args,
+        user_sgpr_count: 2,
+        system_sgpr_workgroup_id_y: !pad,
+        workgroup_size: 256,
+        group_segment_fixed_size: 0,
+        wave32: false,
+        cu_mode: false,
+    };
+    let mut p = RegPlan::new(256, 100)?;
+    p.s::<4>("entry", 0, Live::Whole)?;
+    for base in [4u8, 8, 12, 16, 20, 24, 28, 32, 36, 40] {
+        p.add_range(format!("s{base}"), "s", base, 4, Live::Whole)?;
+    }
+    for base in [0u8, 8, 16, 24, 32, 40, 48, 56] {
+        p.add_range(format!("v{base}"), "v", base, 8, Live::Whole)?;
+    }
+    let mut b = Builder::new(k, p);
+    let mut wg = Workgroup::new(&mut b, spec.arch)?;
+    if pad {
+        pad16(&mut wg)?;
+    } else {
+        grouped(&mut wg, bf16)?;
+    }
+    b.finish()
+}
+
+// dst pair = index * stride + scalar base pair, with full 64-bit arithmetic.
+fn ptr(b: &mut Builder, dst: u8, index: u8, stride: u8, base: u8) -> Result<(), String> {
+    op(
+        b,
+        format!("v_mul_lo_u32 v{dst}, v{index}, s{stride}"),
+        &[v(dst)],
+        &[v(index), s(stride)],
+    )?;
+    op(
+        b,
+        format!("v_mul_hi_u32 v{}, v{index}, s{stride}", dst + 1),
+        &[v(dst + 1)],
+        &[v(index), s(stride)],
+    )?;
+    add_base(b, dst, base)
+}
+fn add_base(b: &mut Builder, dst: u8, base: u8) -> Result<(), String> {
+    op(
+        b,
+        format!("v_mov_b32_e32 v49, s{}", base + 1),
+        &[v(49)],
+        &[s(base + 1)],
+    )?;
+    op(
+        b,
+        format!("v_add_co_u32_e32 v{dst}, vcc, s{base}, v{dst}"),
+        &[v(dst)],
+        &[s(base), v(dst)],
+    )?;
+    op(
+        b,
+        format!(
+            "v_addc_co_u32_e32 v{}, vcc, v49, v{}, vcc",
+            dst + 1,
+            dst + 1
+        ),
+        &[v(dst + 1)],
+        &[v(49), v(dst + 1)],
+    )
+}
+fn add_v(b: &mut Builder, dst: u8, src: u8) -> Result<(), String> {
+    op(
+        b,
+        format!("v_add_co_u32_e32 v{dst}, vcc, v{src}, v{dst}"),
+        &[v(dst)],
+        &[v(src), v(dst)],
+    )?;
+    op(
+        b,
+        format!("v_addc_co_u32_e32 v{}, vcc, 0, v{}, vcc", dst + 1, dst + 1),
+        &[v(dst + 1)],
+        &[v(dst + 1)],
+    )
+}
+fn zero(b: &mut Builder, base: u8, len: u8) -> Result<(), String> {
+    for j in 0u8..len {
+        op(
+            b,
+            format!("v_mov_b32_e32 v{}, 0", base + j),
+            &[v(base + j)],
+            &[],
+        )?;
+    }
+    Ok(())
+}
+fn mask(b: &mut Builder, sbase: u8) -> Result<(), String> {
+    op(
+        b,
+        format!("s_mov_b64 exec, s[{sbase}:{}]", sbase + 1),
+        &[],
+        &[sr(sbase, 2)],
+    )
+}
+fn full(b: &mut Builder) -> Result<(), String> {
+    op(b, "s_mov_b64 exec, -1", &[], &[])
+}
+
+// Exact nonnegative integer division, including divisors not representable in F32.
+// Flat slot IDs are signed i32; invalid slots are made zero before division.
+fn divide_slot(b: &mut Builder) -> Result<(), String> {
+    zero(b, 6, 2)?;
+    for bit in (0u32..32).rev() {
+        op(b, "v_lshlrev_b32_e32 v7, 1, v7", &[v(7)], &[v(7)])?;
+        op(b, format!("v_bfe_u32 v44, v5, {bit}, 1"), &[v(44)], &[v(5)])?;
+        op(b, "v_or_b32_e32 v7, v44, v7", &[v(7)], &[v(44), v(7)])?;
+        // rem >= divisor; use explicit operand order to avoid float reciprocals.
+        op(b, "v_cmp_ge_u32_e64 vcc, v7, s18", &[], &[v(7), s(18)])?;
+        op(b, "v_sub_u32_e64 v45, v7, s18", &[v(45)], &[v(7), s(18)])?;
+        op(
+            b,
+            "v_cndmask_b32_e32 v7, v7, v45, vcc",
+            &[v(7)],
+            &[v(7), v(45)],
+        )?;
+        op(b, "v_cndmask_b32_e64 v44, 0, 1, vcc", &[v(44)], &[])?;
+        op(
+            b,
+            format!("v_lshlrev_b32_e32 v44, {bit}, v44"),
+            &[v(44)],
+            &[v(44)],
+        )?;
+        op(b, "v_or_b32_e32 v6, v44, v6", &[v(6)], &[v(44), v(6)])?;
+    }
+    Ok(())
+}
+
+fn grouped<T: Target>(wg: &mut Wg<T>, bf16: bool) -> Result<(), String> {
+    let end = wg.exit(".Lend")?;
+    let b = wg.isa();
+    smem(b, 4, 4, 0, 0)?;
+    smem(b, 8, 4, 0, 16)?;
+    smem(b, 12, 4, 0, 32)?;
+    smem(b, 16, 4, 0, 48)?;
+    // gfx9 VOP3 operands cannot carry literal dwords.
+    sop(b, "s_mov_b32 s36, 0x7fff", &[36], &[])?;
+    sop(b, "s_mov_b32 s37, 0x07060302", &[37], &[])?;
+    sop(b, "s_mov_b32 s38, 0x010c000c", &[38], &[])?;
+    sop(b, "s_mov_b32 s39, 0x030c020c", &[39], &[])?;
+    sop(b, "s_lshl_b32 s24, s3, 4", &[24], &[3])?;
+    sop(b, "s_add_u32 s24, s8, s24", &[24], &[8, 24])?;
+    sop(b, "s_addc_u32 s25, s9, 0", &[25], &[9])?;
+    smem(b, 20, 4, 24, 0)?;
+    let bad = wg.scmp_wg_uniform(Instruction::new("s_cmp_lt_i32 s20, 0", &[], &[s(20)]))?;
+    wg.exit_if(bad, &end)?;
+    let bad = wg.scmp_wg_uniform(Instruction::new(
+        "s_cmp_ge_i32 s20, s19",
+        &[],
+        &[s(20), s(19)],
+    ))?;
+    wg.exit_if(bad, &end)?;
+    let b = wg.isa();
+    // W += expert * expert_stride; SC = W + R*K.
+    sop(b, "s_mul_i32 s24, s20, s6", &[24], &[20, 6])?;
+    sop(b, "s_mul_hi_u32 s25, s20, s6", &[25], &[20, 6])?;
+    sop(b, "s_mul_i32 s26, s20, s7", &[26], &[20, 7])?;
+    sop(b, "s_add_u32 s25, s25, s26", &[25], &[25, 26])?;
+    sop(b, "s_add_u32 s4, s4, s24", &[4], &[4, 24])?;
+    sop(b, "s_addc_u32 s5, s5, s25", &[5], &[5, 25])?;
+    sop(b, "s_mul_i32 s24, s16, s17", &[24], &[16, 17])?;
+    sop(b, "s_mul_hi_u32 s25, s16, s17", &[25], &[16, 17])?;
+    sop(b, "s_add_u32 s26, s4, s24", &[26], &[4, 24])?;
+    sop(b, "s_addc_u32 s27, s5, s25", &[27], &[5, 25])?;
+    sop(b, "s_lshr_b32 s29, s17, 7", &[29], &[17])?;
+    sop(b, "s_lshl_b32 s24, s2, 6", &[24], &[2])?;
+    sop(b, "s_sub_u32 s25, s16, 1", &[25], &[16])?;
+    op(b, "v_and_b32_e32 v1, 15, v0", &[v(1)], &[v(0)])?;
+    op(b, "v_bfe_u32 v2, v0, 4, 2", &[v(2)], &[v(0)])?;
+    op(b, "v_lshrrev_b32_e32 v3, 6, v0", &[v(3)], &[v(0)])?;
+    op(b, "v_lshlrev_b32_e32 v3, 4, v3", &[v(3)], &[v(3)])?;
+    op(b, "v_add_u32_e32 v3, s24, v3", &[v(3)], &[s(24), v(3)])?;
+    op(b, "v_add_u32_e32 v4, v1, v3", &[v(4)], &[v(1), v(3)])?;
+    op(b, "v_min_u32_e32 v4, s25, v4", &[v(4)], &[s(25), v(4)])?;
+    ptr(b, 8, 4, 17, 4)?;
+    op(b, "v_lshlrev_b32_e32 v44, 2, v2", &[v(44)], &[v(2)])?;
+    add_v(b, 8, 44)?;
+    // Scale index is row-block/128, not the lane's output row.
+    op(b, "v_min_u32_e32 v4, s25, v3", &[v(4)], &[s(25), v(3)])?;
+    op(b, "v_lshrrev_b32_e32 v4, 7, v4", &[v(4)], &[v(4)])?;
+    op(b, "v_mul_lo_u32 v10, v4, s29", &[v(10)], &[v(4), s(29)])?;
+    op(b, "v_mul_hi_u32 v11, v4, s29", &[v(11)], &[v(4), s(29)])?;
+    op(
+        b,
+        "v_lshlrev_b64 v[10:11], 1, v[10:11]",
+        &[vr(10, 2)],
+        &[vr(10, 2)],
+    )?;
+    add_base(b, 10, 26)?;
+    // sorted_rows[row0+n], with no access beyond nrows.
+    op(b, "v_add_u32_e32 v44, s21, v1", &[v(44)], &[s(21), v(1)])?;
+    zero(b, 45, 1)?;
+    op(
+        b,
+        "v_lshlrev_b64 v[44:45], 2, v[44:45]",
+        &[vr(44, 2)],
+        &[vr(44, 2)],
+    )?;
+    add_base(b, 44, 10)?;
+    op(b, "v_mov_b32_e32 v5, -1", &[v(5)], &[])?;
+    op(
+        b,
+        "v_cmp_lt_u32_e64 s[30:31], v1, s22",
+        &[sr(30, 2)],
+        &[v(1), s(22)],
+    )?;
+    mask(b, 30)?;
+    mem(
+        b,
+        "global_load_dword v5, v[44:45], off",
+        &[v(5)],
+        &[vr(44, 2)],
+        MemoryClass::VmemLoad,
+    )?;
+    full(b)?;
+    op(b, "v_cmp_ge_i32_e64 s[32:33], v5, 0", &[sr(32, 2)], &[v(5)])?;
+    op(
+        b,
+        "s_and_b64 s[30:31], s[30:31], s[32:33]",
+        &[sr(30, 2)],
+        &[sr(30, 2), sr(32, 2)],
+    )?;
+    op(b, "v_max_i32_e32 v5, 0, v5", &[v(5)], &[v(5)])?;
+    divide_slot(b)?;
+    // X base uses 64-bit xrow*K before byte scaling.
+    op(b, "v_mul_lo_u32 v12, v6, s17", &[v(12)], &[v(6), s(17)])?;
+    op(b, "v_mul_hi_u32 v13, v6, s17", &[v(13)], &[v(6), s(17)])?;
+    op(b, "v_lshlrev_b32_e32 v44, 2, v2", &[v(44)], &[v(2)])?;
+    add_v(b, 12, 44)?;
+    let shift = if bf16 { 1u32 } else { 2u32 };
+    op(
+        b,
+        format!("v_lshlrev_b64 v[12:13], {shift}, v[12:13]"),
+        &[vr(12, 2)],
+        &[vr(12, 2)],
+    )?;
+    add_base(b, 12, 12)?;
+    // Y's row is sorted row0+n; each lane writes four output rows at strip*4.
+    op(b, "v_add_u32_e32 v4, s21, v1", &[v(4)], &[s(21), v(1)])?;
+    op(b, "v_mul_lo_u32 v14, v4, s16", &[v(14)], &[v(4), s(16)])?;
+    op(b, "v_mul_hi_u32 v15, v4, s16", &[v(15)], &[v(4), s(16)])?;
+    op(b, "v_lshlrev_b32_e32 v44, 2, v2", &[v(44)], &[v(2)])?;
+    op(b, "v_add_u32_e32 v44, v3, v44", &[v(44)], &[v(3), v(44)])?;
+    op(
+        b,
+        "v_cmp_lt_u32_e64 s[34:35], v44, s16",
+        &[sr(34, 2)],
+        &[v(44), s(16)],
+    )?;
+    op(
+        b,
+        "v_cmp_lt_u32_e64 s[32:33], v1, s22",
+        &[sr(32, 2)],
+        &[v(1), s(22)],
+    )?;
+    op(
+        b,
+        "s_and_b64 s[34:35], s[34:35], s[32:33]",
+        &[sr(34, 2)],
+        &[sr(34, 2), sr(32, 2)],
+    )?;
+    add_v(b, 14, 44)?;
+    op(
+        b,
+        "v_lshlrev_b64 v[14:15], 2, v[14:15]",
+        &[vr(14, 2)],
+        &[vr(14, 2)],
+    )?;
+    add_base(b, 14, 14)?;
+    zero(b, 16, 4)?;
+    sop(b, "s_mov_b32 s28, 0", &[28], &[])?;
+    b.wait(Counter::Lgkm, 0)?;
+    wg.loop_carried(".Lkb", |w| {
+        let b = w.isa();
+        mem(
+            b,
+            "global_load_ushort v48, v[10:11], off",
+            &[v(48)],
+            &[vr(10, 2)],
+            MemoryClass::VmemLoad,
+        )?;
+        op(b, "v_lshlrev_b32_e32 v48, 16, v48", &[v(48)], &[v(48)])?;
+        op(b, "v_mul_f32_e32 v48, 2.0, v48", &[v(48)], &[v(48)])?;
+        for step in 0u32..8 {
+            let koff = step * 16;
+            mem(
+                b,
+                format!("global_load_dword v20, v[8:9], off offset:{koff}"),
+                &[v(20)],
+                &[vr(8, 2)],
+                MemoryClass::VmemLoad,
+            )?;
+            zero(b, 36, 4)?;
+            mask(b, 30)?;
+            let width = if bf16 { "dwordx2" } else { "dwordx4" };
+            let len = if bf16 { 2u8 } else { 4u8 };
+            let off = koff << shift;
+            mem(
+                b,
+                format!(
+                    "global_load_{width} v[36:{}], v[12:13], off offset:{off}",
+                    35 + len
+                ),
+                &[vr(36, len)],
+                &[vr(12, 2)],
+                MemoryClass::VmemLoad,
+            )?;
+            full(b)?;
+            if bf16 {
+                op(b, "v_mov_b32_e32 v34, v36", &[v(34)], &[v(36)])?;
+                op(b, "v_mov_b32_e32 v35, v37", &[v(35)], &[v(37)])?;
+            } else {
+                pack4(b, 34, 36)?;
+            }
+            decode4(b)?;
+            op(
+                b,
+                "v_mfma_f32_16x16x16bf16_1k v[16:19], v[32:33], v[34:35], v[16:19]",
+                &[vr(16, 4)],
+                &[vr(32, 2), vr(34, 2), vr(16, 4)],
+            )?;
+        }
+        // Explicit drains make the loop invariant independent of load/store issue timing.
+        b.wait(Counter::Vm, 0)?;
+        for (dst, inc) in [(8u8, 128u32), (10, 2), (12, 128u32 << shift)] {
+            op(
+                b,
+                format!("v_add_co_u32_e32 v{dst}, vcc, {}, v{dst}", lit(inc)),
+                &[v(dst)],
+                &[v(dst)],
+            )?;
+            op(
+                b,
+                format!("v_addc_co_u32_e32 v{}, vcc, 0, v{}, vcc", dst + 1, dst + 1),
+                &[v(dst + 1)],
+                &[v(dst + 1)],
+            )?;
+        }
+        sop(b, "s_add_u32 s28, s28, 1", &[28], &[28])?;
+        w.scmp_wg_uniform(Instruction::new(
+            "s_cmp_lt_u32 s28, s29",
+            &[],
+            &[s(28), s(29)],
+        ))
+    })?;
+    let b = wg.isa();
+    mask(b, 34)?;
+    mem(
+        b,
+        "global_store_dwordx4 v[14:15], v[16:19], off",
+        &[],
+        &[vr(14, 2), vr(16, 4)],
+        MemoryClass::VmemStore,
+    )?;
+    full(b)?;
+    wg.end(end)
+}
+
+// The anchor's integer BF16 RNE: preserve NaN payload/sign and signed zero.
+fn pack4(b: &mut Builder, dst: u8, src: u8) -> Result<(), String> {
+    for j in 0u8..4 {
+        op(
+            b,
+            format!("v_bfe_u32 v{}, v{}, 16, 1", 40 + j, src + j),
+            &[v(40 + j)],
+            &[v(src + j)],
+        )?;
+        op(
+            b,
+            format!("v_add3_u32 v{}, v{}, v{}, s36", 40 + j, src + j, 40 + j),
+            &[v(40 + j)],
+            &[v(src + j), v(40 + j), s(36)],
+        )?;
+    }
+    for j in 0u8..2 {
+        op(
+            b,
+            format!(
+                "v_perm_b32 v{}, v{}, v{}, s37",
+                dst + j,
+                41 + 2 * j,
+                40 + 2 * j
+            ),
+            &[v(dst + j)],
+            &[v(41 + 2 * j), v(40 + 2 * j), s(37)],
+        )?;
+    }
+    Ok(())
+}
+fn decode4(b: &mut Builder) -> Result<(), String> {
+    op(b, "v_and_b32_e32 v26, 0x7f7f7f7f, v20", &[v(26)], &[v(20)])?;
+    op(b, "v_lshrrev_b32_e32 v27, 16, v26", &[v(27)], &[v(26)])?;
+    op(b, "v_cvt_pk_f32_fp8 v[28:29], v26", &[vr(28, 2)], &[v(26)])?;
+    op(b, "v_cvt_pk_f32_fp8 v[30:31], v27", &[vr(30, 2)], &[v(27)])?;
+    for j in 28u8..32 {
+        op(
+            b,
+            format!("v_mul_f32_e32 v{j}, v{j}, v48"),
+            &[v(j)],
+            &[v(j), v(48)],
+        )?;
+    }
+    pack4(b, 32, 28)?;
+    op(b, "v_and_b32_e32 v25, 0x80808080, v20", &[v(25)], &[v(20)])?;
+    op(
+        b,
+        "v_perm_b32 v26, v25, v25, s38",
+        &[v(26)],
+        &[v(25), s(38)],
+    )?;
+    op(
+        b,
+        "v_perm_b32 v27, v25, v25, s39",
+        &[v(27)],
+        &[v(25), s(39)],
+    )?;
+    op(b, "v_xor_b32_e32 v32, v26, v32", &[v(32)], &[v(26), v(32)])?;
+    op(b, "v_xor_b32_e32 v33, v27, v33", &[v(33)], &[v(27), v(33)])
+}
+
+fn pad16<T: Target>(wg: &mut Wg<T>) -> Result<(), String> {
+    let end = wg.exit(".Lend")?;
+    let b = wg.isa();
+    smem(b, 4, 4, 0, 0)?;
+    smem(b, 12, 1, 0, 16)?;
+    sop(b, "s_lshl_b32 s20, s2, 8", &[20], &[2])?;
+    op(b, "v_add_u32_e32 v1, s20, v0", &[v(1)], &[s(20), v(0)])?;
+    op(
+        b,
+        "v_cmp_lt_u32_e64 s[30:31], v1, s12",
+        &[sr(30, 2)],
+        &[v(1), s(12)],
+    )?;
+    op(b, "v_mov_b32_e32 v8, v1", &[v(8)], &[v(1)])?;
+    zero(b, 9, 1)?;
+    op(
+        b,
+        "v_lshlrev_b64 v[8:9], 2, v[8:9]",
+        &[vr(8, 2)],
+        &[vr(8, 2)],
+    )?;
+    add_base(b, 8, 4)?;
+    mask(b, 30)?;
+    mem(
+        b,
+        "global_load_dword v16, v[8:9], off",
+        &[v(16)],
+        &[vr(8, 2)],
+        MemoryClass::VmemLoad,
+    )?;
+    op(b, "v_lshlrev_b32_e32 v17, 4, v1", &[v(17)], &[v(1)])?;
+    op(b, "v_mov_b32_e32 v18, 16", &[v(18)], &[])?;
+    zero(b, 19, 1)?;
+    op(b, "v_mov_b32_e32 v10, v1", &[v(10)], &[v(1)])?;
+    zero(b, 11, 1)?;
+    op(
+        b,
+        "v_lshlrev_b64 v[10:11], 4, v[10:11]",
+        &[vr(10, 2)],
+        &[vr(10, 2)],
+    )?;
+    add_base(b, 10, 6)?;
+    mem(
+        b,
+        "global_store_dwordx4 v[10:11], v[16:19], off",
+        &[],
+        &[vr(10, 2), vr(16, 4)],
+        MemoryClass::VmemStore,
+    )?;
+    full(b)?;
+    wg.end(end)
+}

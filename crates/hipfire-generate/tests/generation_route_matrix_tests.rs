@@ -1244,6 +1244,40 @@ fn gemma4_is_classified_and_routes_tools() {
 }
 
 #[test]
+fn min_tokens_rides_exactly_the_routes_that_honour_stop() {
+    // `min_tokens` holds EOS and stops inactive in the same producers
+    // (`QwenArSemanticProducer`, `Qwen35Emit`); any other route refuses it.
+    for route in GenerationRoute::ALL {
+        assert_eq!(
+            route.supports_min_tokens(),
+            route.supports_stop(),
+            "{route:?}"
+        );
+    }
+}
+
+#[test]
+fn min_tokens_over_max_tokens_or_malformed_is_a_validation_error() {
+    use serde_json::json;
+    let mut sink = Vec::new();
+    for ok in [
+        json!({}),
+        json!({"min_tokens": null}),
+        json!({"min_tokens": 0}),
+    ] {
+        assert_eq!(
+            hipfire_generate::ar::min_tokens_or_reject(&mut sink, "r", &ok, 8),
+            Some(0)
+        );
+    }
+    assert_eq!(
+        hipfire_generate::ar::min_tokens_or_reject(&mut sink, "r", &json!({"min_tokens": 8}), 8),
+        Some(8)
+    );
+    assert!(sink.is_empty(), "valid values write nothing");
+}
+
+#[test]
 fn stop_sequences_are_honoured_exactly_on_the_qwen_semantic_producers() {
     // Qwen4 AR and native MTP joined the Qwen3.5-family AR/DFlash routes: an
     // eval request with `stop` on Flash-Next used to be refused with 400.

@@ -37,7 +37,14 @@
 #define QWEN4_SCATTER_DEFAULT_SCAN false
 #endif
 
-template <bool SCAN>
+// ORDERED (default false, every shipped entry): the bucket fill runs on wave 0 alone, 32 slots per
+// step in ascending slot order, so the slots of one expert land in ascending slot order every
+// time. The default fill (every thread claims a position with an LDS atomicAdd) leaves the order
+// inside an expert's bucket to the arrival order of the waves (a race, not ascending in a large share of the cases and not even
+// repeatable); the tables are equal as sets either way. Only valid
+// for total_slots <= 96 (the fused router + scatter entry, <= 8 rows x top-10). Same counts,
+// offsets, tile ids and padding.
+template <bool SCAN, bool ORDERED = false>
 __device__ __forceinline__ void qwen4_moe_scatter_body(
     const int* __restrict__ topk_indices,        // [total_slots]
     int*       __restrict__ expert_token_counts, // [E]
@@ -142,6 +149,34 @@ __device__ __forceinline__ void qwen4_moe_scatter_body(
     __syncthreads();
 
     // ── Phase 3b: scatter ──
+    if constexpr (ORDERED) {
+        if (tid < 32) {
+            constexpr int CHUNKS = 3;  // 3 x 32 >= 80 = 8 rows x top-10
+            int e_c[CHUNKS];
+            int base_c[CHUNKS];
+#pragma unroll
+            for (int c = 0; c < CHUNKS; ++c) {
+                const int i = tid + 32 * c;
+                const int e = i < total_slots ? topk_indices[i] : -1;
+                e_c[c] = e;
+                base_c[c] = (e >= 0 && e < num_experts) ? expert_offsets[e] : 0;
+            }
+#pragma unroll
+            for (int c = 0; c < CHUNKS; ++c) {
+                const int i = tid + 32 * c;
+                if (i < total_slots) {
+                    const int e = e_c[c];
+                    if (e >= 0 && e < num_experts) {
+                        const int sorted_pos = base_c[c] + atomicAdd(&s_workspace[e], 1);
+                        sorted_slot_index[sorted_pos] = i;
+                        inverse_perm[i] = sorted_pos;
+                    } else {
+                        inverse_perm[i] = -1;
+                    }
+                }
+            }
+        }
+    } else
     for (int i = tid; i < total_slots; i += bdim) {
         const int e = topk_indices[i];
         if (e >= 0 && e < num_experts) {

@@ -31,7 +31,7 @@
 //! Usage:
 //!   dump_qwen35_hidden_states --model <hfq> --ref <kldref> \
 //!                             --chunk N --out <path> \
-//!                             [--kv-mode q8|asym2|asym3|asym4|fp32]
+//!                             [--kv-mode q8|fp32]
 
 #[cfg(not(feature = "deltanet"))]
 fn main() {
@@ -75,15 +75,15 @@ fn main() {
             }
             "--kv-mode" => {
                 let v = argv[i + 1].clone();
-                if !matches!(v.as_str(), "q8" | "asym2" | "asym3" | "asym4" | "fp32") {
-                    eprintln!("--kv-mode must be one of: q8 asym2 asym3 asym4 fp32 (got {v})");
+                if !matches!(v.as_str(), "q8" | "fp32") {
+                    eprintln!("--kv-mode must be one of: q8 fp32 (got {v})");
                     std::process::exit(1);
                 }
                 kv_mode = v;
                 i += 2;
             }
             "-h" | "--help" => {
-                eprintln!("Usage: dump_qwen35_hidden_states --model <hfq> --ref <kldref> --chunk N --out <path> [--kv-mode q8|asym3|fp32]");
+                eprintln!("Usage: dump_qwen35_hidden_states --model <hfq> --ref <kldref> --chunk N --out <path> [--kv-mode q8|fp32]");
                 std::process::exit(0);
             }
             other => {
@@ -166,30 +166,6 @@ fn main() {
             kv_max,
         )
         .expect("kv cache q8"),
-        "asym3" => KvCache::new_gpu_asym3(
-            &mut gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_max,
-        )
-        .expect("kv cache asym3"),
-        "asym4" => KvCache::new_gpu_asym4(
-            &mut gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_max,
-        )
-        .expect("kv cache asym4"),
-        "asym2" => KvCache::new_gpu_asym2(
-            &mut gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_max,
-        )
-        .expect("kv cache asym2"),
         "fp32" => KvCache::new_gpu(
             &mut gpu,
             config.n_layers,

@@ -11,7 +11,8 @@
 
 use crate::{
     grandfathered_monolithic_in, is_ple_format_token, GrandfatheredMonolithic, RegistryV1, Sidecar,
-    EXPERT_HOTSET_PINS, RETIRED_MODELS, TRUNK_OVERLAY_PINS,
+    EP_EXPERT_HOTSET_PINS, EXPERT_HOTSET_PINS, HC8_SIDECAR_PINS, HOT_UNITS_SIDECAR_PINS,
+    RETIRED_MODELS, TRUNK_OVERLAY_PINS,
 };
 use std::collections::BTreeSet;
 use std::fs::File;
@@ -124,6 +125,21 @@ pub fn is_trunk_overlay_name(name: &str) -> bool {
         .ends_with(hipfire_config::memory::TRUNK_OVERLAY_SIDECAR_SUFFIX)
 }
 
+/// True for a Flash-Next HC8 sidecar (`<base>.hc8`): an HFQM container of the
+/// base's E4M3-requantized hyper-connection mixer weights that belongs to its
+/// base and is never a model on its own.
+pub fn is_hc8_sidecar_name(name: &str) -> bool {
+    name.to_ascii_lowercase()
+        .ends_with(hipfire_config::memory::HC8_SIDECAR_SUFFIX)
+}
+
+/// True for a Flash-Next EP2 hot-unit loan sidecar (`<base>.ep.hot-units`): calibration JSON
+/// that belongs to its base and is never a model on its own.
+pub fn is_hot_units_sidecar_name(name: &str) -> bool {
+    name.to_ascii_lowercase()
+        .ends_with(hipfire_config::memory::EP_HOT_UNITS_SIDECAR_SUFFIX)
+}
+
 /// Expert placement metadata belongs to its base, never to model discovery.
 pub fn is_expert_hotset_name(name: &str) -> bool {
     name.to_ascii_lowercase()
@@ -131,7 +147,7 @@ pub fn is_expert_hotset_name(name: &str) -> bool {
 }
 
 /// Every file the registry names as a *sidecar* of some entry — `dflash`,
-/// `vision`, `triattn`, `mtp`, `dspark`, the FLUX components, and the
+/// `vision`, `mtp`, `dspark`, the FLUX components, and the
 /// alternative `heads` carriers.
 ///
 /// These share the model suffixes (`.hfq`), so a suffix test alone cannot
@@ -145,7 +161,6 @@ pub fn registry_sidecar_files(registry: &RegistryV1) -> BTreeSet<&str> {
         .values()
         .flat_map(|entry| {
             [
-                entry.triattn.as_ref(),
                 entry.mtp.as_ref(),
                 entry.dspark.as_ref(),
                 entry.t5.as_ref(),
@@ -164,7 +179,10 @@ pub fn registry_sidecar_files(registry: &RegistryV1) -> BTreeSet<&str> {
         .collect();
     // These sidecars are compiled-in pins, not registry fields.
     files.extend(TRUNK_OVERLAY_PINS.iter().map(|pin| pin.file));
+    files.extend(HC8_SIDECAR_PINS.iter().map(|pin| pin.file));
+    files.extend(HOT_UNITS_SIDECAR_PINS.iter().map(|pin| pin.file));
     files.extend(EXPERT_HOTSET_PINS.iter().map(|pin| pin.file));
+    files.extend(EP_EXPERT_HOTSET_PINS.iter().map(|pin| pin.file));
     files
 }
 
@@ -199,6 +217,8 @@ pub fn is_listable_model_file(
 ) -> bool {
     !is_ple_sidecar_name(name)
         && !is_trunk_overlay_name(name)
+        && !is_hc8_sidecar_name(name)
+        && !is_hot_units_sidecar_name(name)
         && !is_expert_hotset_name(name)
         && (is_model_file(name) || names_registry_model(name, registry, pins))
 }
@@ -291,7 +311,6 @@ mod tests {
         assert!(is_model_file("deepseek-v4-flash-0731.mq2r"));
         assert!(is_model_file("deepseek-v4-flash-0731.mq2rxt"));
         assert!(is_model_file("draft.hfq"));
-        assert!(!is_model_file("model.triattn.bin"));
         assert!(!is_model_file("README.md"));
     }
 
@@ -322,6 +341,62 @@ mod tests {
         ] {
             assert!(!is_ple_sidecar_name(name), "{name}");
         }
+    }
+
+    #[test]
+    fn hc8_sidecar_is_classified_listed_as_a_sidecar_and_never_a_model() {
+        for name in [
+            "qwen3.8-flash-next-base.mq4-xts-symtrunk.hc8",
+            "M.MQ4-XTS.HC8",
+        ] {
+            assert!(is_hc8_sidecar_name(name), "{name}");
+        }
+        for name in [
+            "qwen3.8-flash-next-base.mq4-xts-symtrunk",
+            "m.hc8.mq4",
+            "m.trunk-overlay",
+        ] {
+            assert!(!is_hc8_sidecar_name(name), "{name}");
+        }
+        let registry: RegistryV1 = serde_json::from_str(
+            r#"{"schema_version":1,"generated_at":"t","models":{},"aliases":{}}"#,
+        )
+        .unwrap();
+        let pin = &HC8_SIDECAR_PINS[0];
+        assert!(!is_listable_model_file(
+            pin.file,
+            &registry,
+            GRANDFATHERED_MONOLITHICS
+        ));
+        assert!(registry_sidecar_files(&registry).contains(pin.file));
+    }
+
+    #[test]
+    fn hot_units_sidecar_is_classified_listed_as_a_sidecar_and_never_a_model() {
+        for name in [
+            "qwen3.8-flash-next-base.mq4-xts-symtrunk.ep.hot-units",
+            "M.MQ4-XTS.EP.HOT-UNITS",
+        ] {
+            assert!(is_hot_units_sidecar_name(name), "{name}");
+        }
+        for name in [
+            "qwen3.8-flash-next-base.mq4-xts-symtrunk",
+            "m.ep.expert-hotset",
+            "m.hot-units.mq4",
+        ] {
+            assert!(!is_hot_units_sidecar_name(name), "{name}");
+        }
+        let registry: RegistryV1 = serde_json::from_str(
+            r#"{"schema_version":1,"generated_at":"t","models":{},"aliases":{}}"#,
+        )
+        .unwrap();
+        let pin = &HOT_UNITS_SIDECAR_PINS[0];
+        assert!(!is_listable_model_file(
+            pin.file,
+            &registry,
+            GRANDFATHERED_MONOLITHICS
+        ));
+        assert!(registry_sidecar_files(&registry).contains(pin.file));
     }
 
     /// `/v1/models` is the discovery surface an OpenAI-compatible client reads

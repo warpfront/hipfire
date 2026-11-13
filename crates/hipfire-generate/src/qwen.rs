@@ -44,14 +44,13 @@ use hipfire_engine::scheduler::*;
 use hipfire_engine::terminal::*;
 use hipfire_engine::turn_cache::*;
 use hipfire_loader::bench_topology::EpKind;
-use hipfire_loader::{AsstTurnCache, EpArch, EpState, Eviction, LoadedModel};
+use hipfire_loader::{AsstTurnCache, EpArch, EpState, LoadedModel};
 use hipfire_runtime::spec::{
-    ClientEvent, EmitOutcome, EvictRetain, FinishSummary, PrefillOutcome, SpecAdvance, SpecEmit,
+    ClientEvent, EmitOutcome, FinishSummary, PrefillOutcome, SpecAdvance, SpecEmit,
     SpecRequestConfig, SpecTarget, Speculator, StopReason,
 };
 
 use crate::common::*;
-use hipfire_pflash;
 use hipfire_runtime::prompt_frame;
 use rdna_compute;
 
@@ -513,6 +512,24 @@ fn dense_tp_mesh_epoch(
     Ok(())
 }
 
+/// The single prefill→decode seal of a TP/EP prompt: every rank's DeltaNet
+/// stream transitions to Sealed at `position`. Mesh-TP ranks own their state
+/// behind the mesh program and are not reached here.
+fn seal_ep_dn_states(m: &mut LoadedModel, position: usize) -> Result<(), String> {
+    let Some(EpState { gpus, inner }) = m.ep.as_mut() else {
+        return Ok(());
+    };
+    let dn_states = match inner {
+        EpArch::Qwen35DenseTp { dn_states, .. } | EpArch::Qwen35 { dn_states, .. } => dn_states,
+        _ => return Ok(()),
+    };
+    for (rank, dn) in dn_states.iter_mut().enumerate() {
+        dn.seal_streams(&mut gpus.devices[rank], position)
+            .map_err(|e| format!("GDN stream seal rank {rank}: {e}"))?;
+    }
+    Ok(())
+}
+
 /// One dense-TP prefill chunk written at absolute position `start_pos`.
 pub fn dense_tp_prefill_chunk(
     m: &mut LoadedModel,
@@ -907,6 +924,11 @@ pub fn ep_serve_qwen35_dense_tp(
     }
     // Bookkeeping matches the fully replayed prompt so decode commits extend
     // the same conversation/stream positions the single-GPU path would.
+    if let Err(message) = seal_ep_dn_states(m, prompt_n) {
+        dense_tp_fail_closed_error(m, stdout, id, &message, "validation", false);
+        let _ = stdout.flush();
+        return;
+    }
     m.conversation_tokens.extend_from_slice(prompt_ids);
     m.seq_pos = prompt_n;
     let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
@@ -1270,6 +1292,11 @@ pub fn ep_serve_qwen35_moe(
     }
     // Bookkeeping matches the fully replayed prompt so decode commits extend
     // the same conversation/stream positions the single-GPU path would.
+    if let Err(message) = seal_ep_dn_states(m, prompt_n) {
+        qwen35_moe_fail_closed_error(m, stdout, id, &message, "validation", false);
+        let _ = stdout.flush();
+        return;
+    }
     m.conversation_tokens.extend_from_slice(prompt_ids);
     m.seq_pos = prompt_n;
     let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
@@ -1806,7 +1833,7 @@ pub fn ep_serve_ds4(
 
     // O2b-2 capacity guard (ds4 EP): this path replays the full prompt from
     // position 0 every turn (no LCP reuse), so the absolute KV span is
-    // prompt_n + max_tokens. Without eviction the EP state KV was allocated
+    // prompt_n + max_tokens. The EP state KV was allocated
     // for `m.physical_cap` (== max_seq at load). Overrunning it drives
     // forward_ep past the KV buffer → corruption/panic (serve-wide crash).
     // Emit a clean error and return BEFORE prefill — mirror the qwen35 guard.
@@ -2630,7 +2657,11 @@ fn qwen4_session_target(pp_mesh_active: bool, has_gpus: bool) -> Qwen4SessionTar
 /// mesh with its `Gpus` for the AR route; native MTP never reuses a session
 /// under a mesh, and a mesh without `Gpus` plans no reuse. Disjoint field
 /// borrows, as [`qwen4_bundle_and_mesh`].
-fn plan_qwen4_session(model: &mut LoadedModel, prompt: &[u32], route: SessionRoute) -> usize {
+pub(crate) fn plan_qwen4_session(
+    model: &mut LoadedModel,
+    prompt: &[u32],
+    route: SessionRoute,
+) -> usize {
     let LoadedModel { state, pp_gpus, .. } = model;
     let Some(state) = state.as_deref_mut() else {
         return 0;
@@ -2750,7 +2781,6 @@ pub fn plan_prompt_cache(
     tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
     asst_turn_cache: &mut AsstTurnCache,
     conversation_tokens: &[u32],
-    eviction_is_none: bool,
     system_prompt: Option<&str>,
     prompt: &str,
     assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
@@ -2781,7 +2811,7 @@ pub fn plan_prompt_cache(
                 .and_then(|t| t.content.as_ref().map(|c| c.token_ids.clone()))
         },
     );
-    let cache_eligible = !cache_disabled && eviction_is_none && !conversation_tokens.is_empty();
+    let cache_eligible = !cache_disabled && !conversation_tokens.is_empty();
     plan_from_rendered(
         conversation_tokens,
         rendered,
@@ -2871,6 +2901,10 @@ pub fn plan_from_rendered(
                     rendered,
                 };
             }
+            eprintln!(
+                "[qwen-cache cold {trace_tag}] lcp={lcp} prior_len={prior_len} checkpoints={dflash_ckpt_positions:?}: none at or before lcp, cold-prefilling {} tokens",
+                rendered.len(),
+            );
         }
     }
     PromptCachePlan {
@@ -3280,11 +3314,10 @@ pub fn generate_dflash(
     max_tokens: usize,
     max_think_tokens: usize,
     assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
-    pflash_bypass_reason: Option<&str>,
-    pflash_alpha: Option<f32>,
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
     stop: &[String],
+    min_tokens: usize,
     // Request-resolved sampling temperature. 0.0 → greedy/argmax-accept (the
     // historical DFlash posture). >0 → distribution-preserving spec decode.
     // MTP (name=="mtp") honors temp>0 including user-explicit sampling and min_p
@@ -3383,7 +3416,6 @@ pub fn generate_dflash(
             native_naive.unwrap_or(false),
             repeat_penalty != 1.0 || presence_penalty != 0.0 || frequency_penalty != 0.0,
             m.pp_gpus.is_some(),
-            m.eviction.is_some(),
             false,
         ) {
             emit_active_attempt_error(stdout, Some(id), &refusal, "validation", false, false);
@@ -3395,7 +3427,7 @@ pub fn generate_dflash(
     // The spec-step dispatch, ModelSlot assembly, checkpoint ring, and
     // SpecStats that this function used to drive inline now live behind the
     // arch-generic `Speculator` trait (the loader's `DflashSpeculator`) and the
-    // `Qwen35SlotGuard` RAII target borrow — see the prefill/step/on_evict/
+    // `Qwen35SlotGuard` RAII target borrow — see the prefill/step/
     // reset/rewind_to calls below.
 
     // Prompt build: same two-path branch as the AR-path generate() — when
@@ -3553,7 +3585,7 @@ pub fn generate_dflash(
 
     // DFlash ctx-capacity downgrade. The draft's context-indexed structures
     // (target_hidden, per-layer K/V caches, hidden ring) are sized at load to
-    // min(max_seq, HIPFIRE_DFLASH_CTX_CAP|8192) to bound draft-side VRAM on
+    // min(max_seq, DEFAULT_DFLASH_CTX_CAP (8192)) to bound draft-side VRAM on
     // large-max_seq serve loads. A request that outgrows the cap cannot run
     // spec — but DFlash is verify-gated, so AR produces the same tokens, just
     // slower. Emit a correlated info event and hand the request back to the
@@ -3568,15 +3600,7 @@ pub fn generate_dflash(
     // An omitted client max_tokens fits the target context first (the same
     // budget the AR fallback would use), then the draft capacity decides
     // spec vs AR.
-    let max_tokens = crate::common::fit_max_tokens(
-        max_tokens,
-        prompt_tokens.len(),
-        if m.eviction.is_none() {
-            m.physical_cap
-        } else {
-            m.max_seq
-        },
-    );
+    let max_tokens = crate::common::fit_max_tokens(max_tokens, prompt_tokens.len(), m.physical_cap);
     // Shared margin with the `generate_spec` hard guard below: prompt +
     // budget + one draft block must fit, so any request the loop would refuse
     // falls back to AR here instead of erroring after `gen_start`.
@@ -3590,7 +3614,7 @@ pub fn generate_dflash(
             stdout,
             id,
             &format!(
-                "prompt={} + max_tokens={} exceeds {} draft ctx capacity {} — falling back to AR (identical output, slower; raise HIPFIRE_DFLASH_CTX_CAP to re-enable spec)",
+                "prompt={} + max_tokens={} exceeds {} draft ctx capacity {} — falling back to AR (identical output, slower)",
                 prompt_tokens.len(),
                 max_tokens,
                 if spec_name == "mtp" { "MTP" } else { "DFlash" },
@@ -3632,8 +3656,7 @@ pub fn generate_dflash(
                 == Some("0"),
     );
     // DFlash divergent-render resume (default ON; opt out with
-    // HIPFIRE_DFLASH_CKPT_RESUME=0). Requires no eviction (resume rewinds the
-    // resident KV prefix). When on, the recurrent state is checkpointed during
+    // HIPFIRE_DFLASH_CKPT_RESUME=0). When on, the recurrent state is checkpointed during
     // the prompt seed and a divergent render resumes from the latest checkpoint
     // ≤ lcp — byte-identical to a cold prefill of the same render (verified),
     // so worst case equals the legacy cold-reset path. Off ⇒ no checkpoints
@@ -3641,8 +3664,7 @@ pub fn generate_dflash(
     let dflash_resume_enabled = hipfire_config::developer_var("HIPFIRE_DFLASH_CKPT_RESUME")
         .ok()
         .as_deref()
-        != Some("0")
-        && m.eviction.is_none();
+        != Some("0");
     // Qwen4 history stage of the shared canonical render, after the cold-length
     // fit checks above (same order as the former cache-plan stage).
     let prompt_tokens: Vec<u32> = if is_qwen4 {
@@ -3675,17 +3697,11 @@ pub fn generate_dflash(
     } else {
         (
             &m.conversation_tokens[..],
-            m.speculator
-                .as_ref()
-                .map(|s| s.checkpoint_positions())
-                .unwrap_or_default(),
+            attested_spec_checkpoint_positions(m.speculator.as_deref(), &m.conversation_tokens),
         )
     };
-    let cache_eligible = !cache_disabled
-        && messages_history.is_some()
-        && m.eviction.is_none()
-        && pflash_bypass_reason.is_none()
-        && !conversation_tokens.is_empty();
+    let cache_eligible =
+        !cache_disabled && messages_history.is_some() && !conversation_tokens.is_empty();
     let cache_plan: Option<PromptCachePlan> = if is_qwen4 {
         None
     } else if try_jinja {
@@ -3708,7 +3724,7 @@ pub fn generate_dflash(
                 &prompt_tokens,
                 hist,
                 tools,
-                hipfire_runtime::prompt_frame::ToolTurnSplice::Envelopes,
+                hipfire_runtime::prompt_frame::ToolTurnSplice::WholeBody,
                 "dflash",
                 // Exact-prefix guarded: a non-extending repair falls back to the safe miss.
                 Some(&m.conversation_tokens),
@@ -3755,7 +3771,6 @@ pub fn generate_dflash(
                 tok,
                 &mut m.asst_turn_cache,
                 conversation_tokens,
-                m.eviction.is_none(),
                 system_prompt,
                 prompt,
                 assistant_prefix,
@@ -3781,6 +3796,21 @@ pub fn generate_dflash(
         Some(p) => p.rendered.clone(),
         None => prompt_tokens,
     };
+    // The next user turn's re-render diverges right after this prompt's assistant
+    // opener when the prompt is user-terminated: tell the speculator so its prefill
+    // snapshots the recurrent state there (and keeps it through tool-result turns).
+    if !is_qwen4 {
+        let turn_boundary = m.tokenizer.as_ref().and_then(|tok| {
+            hipfire_runtime::prompt_frame::user_turn_resume_boundary(
+                tok,
+                messages_history,
+                &prompt_tokens,
+            )
+        });
+        if let Some(spec) = m.speculator.as_mut() {
+            spec.set_turn_boundary(turn_boundary);
+        }
+    }
     let (mut prefill_tokens, mut prefill_start, mut cache_hit, mut cached_tokens_dflash): (
         Vec<u32>,
         usize,
@@ -3924,6 +3954,7 @@ pub fn generate_dflash(
             tools: emit_tools,
             enable_grammar: grammar_enabled,
             stop: stop.to_vec(),
+            min_tokens,
             max_think: max_think_tokens,
             assistant_prefix: spec_assistant_prefix(started_in_think),
             think_mode: ThinkMode::NonThink,
@@ -3989,18 +4020,6 @@ pub fn generate_dflash(
     } else {
         0.0
     };
-    // Per PRD §3.1, when PFlash bypassed (e.g. dflash_decode_active for
-    // this branch) the `done` object must surface the bypass reason and
-    // alpha alongside the dflash perf metrics.
-    let pflash_done_field = match (pflash_bypass_reason, pflash_alpha) {
-        (Some(r), Some(a)) => format!(
-            r#","pflash":{{"bypass_reason":"{}","alpha":{:.6}}}"#,
-            r.replace('"', "'"),
-            a,
-        ),
-        _ => String::new(),
-    };
-
     if qwen_semantic_v2 {
         let eos = m
             .tokenizer
@@ -4089,10 +4108,6 @@ pub fn generate_dflash(
             } => {
                 // Successful classify → stage exact pending done, then client
                 // terminal handshake before any tool release / cache / done.
-                let pflash = match (pflash_bypass_reason, pflash_alpha) {
-                    (Some(r), Some(a)) => Some((r, a)),
-                    _ => None,
-                };
                 let mut pending_done = qwen_dflash_done_value(
                     id,
                     run.generated,
@@ -4116,12 +4131,6 @@ pub fn generate_dflash(
                         m.speculator.as_ref().map(|s| s.request_stats()),
                     );
                 }
-                if let Some((reason, alpha)) = pflash {
-                    pending_done["pflash"] = serde_json::json!({
-                        "bypass_reason": reason,
-                        "alpha": alpha,
-                    });
-                }
                 // Stage canonical calls before handshake so pure-tool HTTP
                 // terminals are complete at commit_ready. Final done is identical.
                 stage_terminal_tool_calls(&mut pending_done, finish_reason, wire_tool_calls);
@@ -4132,7 +4141,8 @@ pub fn generate_dflash(
                     *store_cache,
                 );
                 if !effects.emit_done {
-                    let ep = production_fail_closed_rollback(m, gpu, None, None);
+                    let ep =
+                        production_cancel_epilogue(m, gpu, spec_cancel_keeps_committed_prefix(m));
                     emit_spec_cancel_after_rollback(stdout, id, run.generated, &ep);
                     return true;
                 }
@@ -4268,57 +4278,27 @@ pub fn generate_dflash(
                 m.speculator.as_ref().map(|s| s.request_stats()),
             );
         }
-        if !pflash_done_field.is_empty() {
-            let padded = format!("{{{}}}", pflash_done_field.trim_start_matches(','));
-            if let Ok(serde_json::Value::Object(map)) =
-                serde_json::from_str::<serde_json::Value>(&padded)
-            {
-                for (k, v) in map {
-                    pending_done[k] = v;
-                }
-            }
-        }
         stage_terminal_tool_calls(&mut pending_done, finish_reason, &wire_calls);
         let decision = await_client_terminal_commit(stdout, id, &pending_done);
         let intended_release = finish_reason == "tool_calls" && !wire_calls.is_empty();
-        let intended_store = !hit_length_cap && !open_think && !cached_seq.is_empty();
+        let cache_action = legacy_asst_turn_action(
+            hit_length_cap,
+            open_think,
+            started_in_think,
+            &decoded_full,
+            &wire_calls,
+        );
+        let intended_store = cache_action.store && !cached_seq.is_empty();
         let effects = qwen_client_commit_effects(decision, intended_release, intended_store);
         if !effects.emit_done {
-            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            let ep = production_cancel_epilogue(m, gpu, spec_cancel_keeps_committed_prefix(m));
             emit_spec_cancel_after_rollback(stdout, id, run.generated, &ep);
             return true;
         }
         commit_qwen4_session(m);
-        // Safe stop/tool_calls only — length never stores; Abort suppressed above.
+        // Safe stop/tool_calls only (see legacy_asst_turn_action); Abort suppressed above.
         if effects.store_cache {
-            let stripped = strip_think_for_fingerprint(&decoded_full);
-            let emit_text =
-                hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped).into_owned();
-            let fp = asst_turn_fingerprint(&emit_text, &wire_calls);
-            if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
-                .ok()
-                .as_deref()
-                == Some("1")
-            {
-                eprintln!(
-                    "[qwen-cache store dflash] fp={:#018x} cached_seq={} emit_text.len={} tool_calls={} preview={:?}",
-                    fp, cached_seq.len(), emit_text.len(), wire_calls.len(),
-                    emit_text.chars().take(60).collect::<String>(),
-                );
-            }
-            // Legacy (non-qwen-semantic-v2) arches: content-only full body store.
-            // Rich whole-envelope reasoning text is the qwen semantic-v2 path above.
-            m.asst_turn_cache.insert(
-                fp,
-                hipfire_runtime::prompt_frame::CachedAssistantTurn {
-                    reasoning: None,
-                    tools: Vec::new(),
-                    content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
-                        token_ids: cached_seq,
-                        text: String::new(),
-                    }),
-                },
-            );
+            store_legacy_asst_turn(m, &cache_action, cached_seq);
         }
         crate::ar::emit_active_route_done_value(stdout, &pending_done);
     }
@@ -4429,7 +4409,7 @@ pub fn generate_spec(
     // m.state on EVERY exit path (return, `?`, panic), which structurally
     // eliminates the eight hand-written reconstruction sites that were the
     // #462 cross-request state-bleed class. `m.speculator`, `m.state`,
-    // `m.seq_pos`, `m.conversation_tokens` and `m.eviction` are disjoint fields,
+    // `m.seq_pos` and `m.conversation_tokens` are disjoint fields,
     // so the guard, the speculator borrow, and the bookkeeping below coexist.
     // `block_size` is the speculator's EFFECTIVE proposal width: the DFlash
     // trailing-τ controller reseeds it to full at request start
@@ -4456,6 +4436,8 @@ pub fn generate_spec(
     // arch-matches for spec-decode). `&'static dyn Carrier` borrows nothing from
     // `m`, so it coexists with the `tokenizer`/`&mut m.state` borrows below.
     let arch_id = m.arch_id;
+    // Read before the slot guard takes `m.state`.
+    let qwen4_target = m.qwen4().is_some();
     let carrier = match hipfire_loader::carrier_for(arch_id) {
         Some(c) => c,
         None => {
@@ -4494,7 +4476,6 @@ pub fn generate_spec(
             native.is_some_and(|(naive, _)| naive),
             native.is_some_and(|(_, penalized)| penalized),
             m.pp_gpus.is_some(),
-            m.eviction.is_some(),
             resume_from.is_some(),
         ) {
             crate::ar::emit_active_route_error(
@@ -4606,30 +4587,13 @@ pub fn generate_spec(
     }
 
     let t0 = Instant::now();
-    // Capacity checks. With eviction enabled the advertised context window is
-    // effectively unbounded (eviction fires between spec cycles), but the
-    // *prompt* must still fit in one physical_cap span because the prompt seed
-    // writes it per-token without chunking. Error returns just `return` — the
-    // slot guard restores the bundle into m.state on the way out.
-    let eff_prompt_cap = if m.eviction.is_some() {
-        m.physical_cap
-    } else {
-        ctx_capacity
-    };
-    if prompt_tokens.len().saturating_add(block_size) > eff_prompt_cap {
+    // Capacity checks. Error returns just `return` — the slot guard restores
+    // the bundle into m.state on the way out.
+    if prompt_tokens.len().saturating_add(block_size) > ctx_capacity {
         crate::ar::emit_active_route_error(
             stdout,
             Some(id),
-            &format!(
-                "prompt+block_size exceeds {} {} (eviction {})",
-                if m.eviction.is_some() {
-                    "physical_cap"
-                } else {
-                    "ctx_capacity"
-                },
-                eff_prompt_cap,
-                if m.eviction.is_some() { "on" } else { "off" },
-            ),
+            &format!("prompt+block_size exceeds ctx_capacity {}", ctx_capacity,),
             "validation",
             false,
             false,
@@ -4638,11 +4602,9 @@ pub fn generate_spec(
         return None;
     }
     // Shared margin with the `generate_dflash` entry fallback above (same
-    // predicate): without eviction the entry already diverted these to AR,
-    // so this is belt-and-suspenders for direct `generate_spec` callers.
-    if m.eviction.is_none()
-        && !spec_ctx_request_fits(prompt_tokens.len(), max_tokens, block_size, ctx_capacity)
-    {
+    // predicate): the entry already diverted these to AR, so this is
+    // belt-and-suspenders for direct `generate_spec` callers.
+    if !spec_ctx_request_fits(prompt_tokens.len(), max_tokens, block_size, ctx_capacity) {
         crate::ar::emit_active_route_error(
             stdout,
             Some(id),
@@ -4802,9 +4764,12 @@ pub fn generate_spec(
     // `SpecEmitRequest`; the arch's carrier turns it into the concrete
     // `Box<dyn SpecEmit>` (extracting its own grammar schema from `tools`).
     // VMM promotion needs a request whose spec emitter state an AR producer
-    // can reproduce: no tools/grammar, no stop strings, no think budget.
-    let promo_shape_ok =
-        emit_req.tools.is_none() && emit_req.stop.is_empty() && emit_req.max_think == 0;
+    // can reproduce: no tools/grammar, no stop strings, no `min_tokens`, no
+    // think budget.
+    let promo_shape_ok = emit_req.tools.is_none()
+        && emit_req.stop.is_empty()
+        && emit_req.min_tokens == 0
+        && emit_req.max_think == 0;
     let logprobs_top_k = emit_req.logprobs_top_k;
     // Logprob fields of emission token `index` (`tok`), from the target row
     // the speculator kept for it.
@@ -4825,6 +4790,7 @@ pub fn generate_spec(
         tools: emit_req.tools.as_deref(),
         enable_grammar: emit_req.enable_grammar,
         stop: emit_req.stop,
+        min_tokens: emit_req.min_tokens,
         max_think: emit_req.max_think,
         max_tokens,
         assistant_prefix: emit_req.assistant_prefix,
@@ -4857,19 +4823,23 @@ pub fn generate_spec(
             return None;
         }
     };
-    // Native Qwen4 MTP commits a whole window before the emitter observes it,
-    // so an emitter intervention (think-budget force-close or think-cap stop)
-    // that lands strictly inside a window would leave committed state past the
-    // intervention. Inside a think span (or over a queued close) the loop
-    // clamps each window to the emitter's `window_cap()` for this speculator
-    // so the intervention only ever falls on a window's last token — no
-    // Realign re-prefill, no window repair. Outside a span the cap is `None`
-    // (thinking off is `max_think_tokens == 1`, so capping there would stop
+    // Native Qwen4 MTP and Qwen4 DFlash2 commit a whole window before the
+    // emitter observes it, so an emitter intervention (think-budget
+    // force-close or think-cap stop) that lands strictly inside a window would
+    // leave committed state past the intervention. Inside a think span (or
+    // over a queued close) the loop clamps each window to the emitter's
+    // `window_cap()` for these speculators so the intervention only ever falls
+    // on a window's last token — no Realign re-prefill (whose numerics differ
+    // from AR), no window repair. Outside a span the cap is `None` (thinking
+    // off is `max_think_tokens == 1`, so capping there would stop
     // speculation): a span opened and tripped inside one window takes the
     // window repair below. Other speculators keep their own handling.
-    let native_qwen4_mtp = spec
-        .drafter_any_mut()
-        .is_some_and(|a| a.is::<hipfire_arch_qwen4::mtp_spec::Qwen4MtpDrafter>());
+    let qwen4_window_capped = spec_qwen4_window_capped(
+        qwen4_target,
+        spec.name(),
+        spec.drafter_any_mut()
+            .is_some_and(|a| a.is::<hipfire_arch_qwen4::mtp_spec::Qwen4MtpDrafter>()),
+    );
 
     // Decode loop — spec.step returns one acceptance window (SpecStep) per cycle.
     // `emitted` is the speculator's repeat / n-gram context (NOT emission state);
@@ -4894,114 +4864,6 @@ pub fn generate_spec(
     // full block, so the epilogue must report a length stop
     // (`finish_reason=length`) rather than a natural stop.
     let mut ctx_exhausted = false;
-
-    // Post-prefill compaction (FlashCASK pattern from dflash_spec_demo).
-    // If the prompt already filled past budget+beta, compact once before
-    // entering the spec loop so the first spec step writes at physical slot
-    // `budget`. compact_offset is maintained on slot.kv_cache; subsequent
-    // forwards inside the speculator read it for RoPE phase automatically. The
-    // drafter-local hidden cache is compacted to match via `on_evict`.
-    if let Some(ref ev) = m.eviction {
-        // Eviction is only ever configured for KvCache-backed arches
-        // (qwen35/llama); a `Qwen2State`-backed target never reaches here.
-        // Missing optional hook is an ordinary fail-closed error (no panic).
-        // Keep the kv borrow inside maybe_evict so rollback can reborrow `slot`.
-        let evict_outcome = match slot.kv_cache_mut() {
-            Some(kv) => ev.maybe_evict(gpu, kv, position),
-            None => {
-                let _ = classify_evict_failure_wire();
-                let ep = spec_rollback_live(
-                    &mut m.seq_pos,
-                    &mut m.conversation_tokens,
-                    &mut m.prefill_checkpoints,
-                    &mut m.dflash_checkpoints,
-                    &mut m.asst_turn_cache,
-                    gpu,
-                    pp.as_deref_mut(),
-                    slot,
-                    spec.as_mut(),
-                );
-                emit_fail_closed_error(
-                    stdout,
-                    Some(id),
-                    "kv_cache_mut missing (post-prefill)",
-                    "validation",
-                    false,
-                    &ep,
-                );
-                drop(guard);
-                return None;
-            }
-        };
-        match evict_outcome {
-            Ok(Some(res)) => {
-                let pre_phys = position;
-                let compact_offset = slot.kv_cache_mut().map(|kv| kv.compact_offset).unwrap_or(0);
-                eprintln!(
-                    "[dflash] post-prefill evict: {} -> {} (compact_offset={})",
-                    pre_phys, res.new_physical, compact_offset,
-                );
-                position = res.new_physical;
-                if !res.retain_mask.is_empty() {
-                    if let Err(e) = spec.on_evict(
-                        gpu,
-                        &EvictRetain {
-                            retain_mask: res.retain_mask,
-                            pre_phys,
-                        },
-                    ) {
-                        let _ = classify_evict_failure_wire();
-                        let ep = spec_rollback_live(
-                            &mut m.seq_pos,
-                            &mut m.conversation_tokens,
-                            &mut m.prefill_checkpoints,
-                            &mut m.dflash_checkpoints,
-                            &mut m.asst_turn_cache,
-                            gpu,
-                            pp.as_deref_mut(),
-                            slot,
-                            spec.as_mut(),
-                        );
-                        emit_fail_closed_error(
-                            stdout,
-                            Some(id),
-                            &format!("on_evict (post-prefill): {e}"),
-                            "validation",
-                            false,
-                            &ep,
-                        );
-                        drop(guard);
-                        return None;
-                    }
-                }
-            }
-            Ok(None) => {}
-            Err(e) => {
-                let _ = classify_evict_failure_wire();
-                let ep = spec_rollback_live(
-                    &mut m.seq_pos,
-                    &mut m.conversation_tokens,
-                    &mut m.prefill_checkpoints,
-                    &mut m.dflash_checkpoints,
-                    &mut m.asst_turn_cache,
-                    gpu,
-                    pp.as_deref_mut(),
-                    slot,
-                    spec.as_mut(),
-                );
-                emit_fail_closed_error(
-                    stdout,
-                    Some(id),
-                    &format!("maybe_evict (post-prefill): {e}"),
-                    "validation",
-                    false,
-                    &ep,
-                );
-                drop(guard);
-                return None;
-            }
-        }
-    }
 
     // Emit the first token immediately so TTFT is the prefill time. `begin`
     // pushes + filters it, seeds the grammar matcher, and reports whether the
@@ -5068,7 +4930,6 @@ pub fn generate_spec(
                 &mut m.dflash_checkpoints,
                 &mut m.asst_turn_cache,
                 m.physical_cap,
-                m.eviction.as_ref(),
             ) {
                 SpecForcedApplyResult::Terminal => {
                     drop(guard);
@@ -5111,8 +4972,14 @@ pub fn generate_spec(
         // mid-decode leaves the spec-decode loop running for max_tokens
         // worth of wasted work.
         if check_abort(id) {
-            // Mid-decode cancel: reset+sync first; terminal follows attestation.
-            let ep = spec_rollback_live(
+            // Mid-decode cancel at a committed cycle boundary (the pending seed
+            // is emitted, not yet fed). A client cancel is not a failure: the
+            // target KV / DeltaNet state is exactly the committed prefix, so
+            // `spec_cancel_epilogue_live` keeps it for the next request (which
+            // hits it or resumes from the latest attested checkpoint) and only
+            // falls back to the full reset when the cursors cannot attest it.
+            // The device is synchronized before the terminal either way.
+            let ep = spec_cancel_epilogue_live(
                 &mut m.seq_pos,
                 &mut m.conversation_tokens,
                 &mut m.prefill_checkpoints,
@@ -5122,6 +4989,10 @@ pub fn generate_spec(
                 pp.as_deref_mut(),
                 slot,
                 spec.as_mut(),
+                &prompt_tokens,
+                &emitted,
+                position,
+                pending_seed_committable.then_some(seed_token),
             );
             emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
             return None;
@@ -5135,12 +5006,7 @@ pub fn generate_spec(
         // speculative request must never undergo.
         // Pipeline parallelism never promotes: lanes and the VMM driver are
         // single-card owners.
-        if promo_shape_ok
-            && pp.is_none()
-            && pending_seed_committable
-            && semantic_stop.is_none()
-            && m.eviction.is_none()
-        {
+        if promo_shape_ok && pp.is_none() && pending_seed_committable && semantic_stop.is_none() {
             // Qwen4 (Flash-Next): the running singleton moves into an exact
             // lane — trunk/head/draft states and the drafter's pending hidden
             // — and the daemon drives it in `drive_qwen4_lane_batch`.
@@ -5382,7 +5248,7 @@ pub fn generate_spec(
         // borrow ends when `step` returns, before the per-token `emit.observe`.
         let max_emit = spec_window_emit_budget(
             max_tokens.saturating_sub(generated),
-            native_qwen4_mtp,
+            qwen4_window_capped,
             emit.window_cap(),
         );
         let window_seed = seed_token;
@@ -5571,8 +5437,9 @@ pub fn generate_spec(
         }
 
         // Strict-prefix semantic stop: drop unobserved speculative tail from
-        // target + drafter. Native Qwen4 MTP first tries a window-local repair
-        // (restore the pre-window target/head, replay only the consumed prefix)
+        // target + drafter. Qwen4 MTP and Qwen4 DFlash2 first try a
+        // window-local repair (restore the pre-window target, replay only the
+        // consumed prefix)
         // for both a terminal strict prefix and a non-terminal one (a forced
         // intervention the window cap did not absorb), so neither pays a
         // full-history re-prefill nor drops live cache metadata. Other
@@ -5590,7 +5457,7 @@ pub fn generate_spec(
         let keep = consumed.min(committed_tail.len());
         let mut strict_prefix_action =
             spec_strict_prefix_action(keep, committed_tail.len(), hit_eos || think_cap_hit);
-        if spec_window_repair_attempt(strict_prefix_action, native_qwen4_mtp, ar_step) {
+        if spec_window_repair_attempt(strict_prefix_action, qwen4_window_capped, ar_step) {
             // Must run right after the window is observed and before any
             // further step / forced advance / prefill / reset on the
             // speculator: the retained pre-window snapshot is only valid until
@@ -5685,14 +5552,7 @@ pub fn generate_spec(
         }
         if strict_prefix_action == SpecStrictPrefixAction::Realign {
             let plan = spec_prefix_realign_plan(&prompt_tokens, first_token, &raw_decode);
-            let compact_offset = slot.kv_cache_mut().map(|kv| kv.compact_offset).unwrap_or(0);
-            if let Err(msg) = spec_prefix_realign_admit(
-                &plan,
-                m.physical_cap,
-                ctx_capacity,
-                compact_offset,
-                m.eviction.is_some(),
-            ) {
+            if let Err(msg) = spec_prefix_realign_admit(&plan, m.physical_cap, ctx_capacity) {
                 let ep = spec_rollback_live(
                     &mut m.seq_pos,
                     &mut m.conversation_tokens,
@@ -5826,7 +5686,6 @@ pub fn generate_spec(
                 &mut m.dflash_checkpoints,
                 &mut m.asst_turn_cache,
                 m.physical_cap,
-                m.eviction.as_ref(),
             ) {
                 SpecForcedApplyResult::Terminal => {
                     drop(guard);
@@ -5844,104 +5703,6 @@ pub fn generate_spec(
                     }
                 }
                 SpecForcedApplyResult::Applied | SpecForcedApplyResult::Skipped => {}
-            }
-        }
-        // Per-cycle eviction (FlashCASK). Fires whenever current physical
-        // has grown to budget+β since the last compaction. No-op when
-        // physical < budget+β, so non-firing cycles pay only the check cost.
-        if let Some(ref ev) = m.eviction {
-            // Eviction ⇒ KvCache-backed target (qwen35/llama); never qwen2.
-            // Missing optional hook is an ordinary fail-closed error (no panic).
-            // Keep the kv borrow inside maybe_evict so rollback can reborrow `slot`.
-            let evict_outcome = match slot.kv_cache_mut() {
-                Some(kv) => ev.maybe_evict(gpu, kv, position),
-                None => {
-                    let _ = classify_evict_failure_wire();
-                    let ep = spec_rollback_live(
-                        &mut m.seq_pos,
-                        &mut m.conversation_tokens,
-                        &mut m.prefill_checkpoints,
-                        &mut m.dflash_checkpoints,
-                        &mut m.asst_turn_cache,
-                        gpu,
-                        pp.as_deref_mut(),
-                        slot,
-                        spec.as_mut(),
-                    );
-                    emit_fail_closed_error(
-                        stdout,
-                        Some(id),
-                        "kv_cache_mut missing (per-cycle)",
-                        "validation",
-                        false,
-                        &ep,
-                    );
-                    drop(guard);
-                    return None;
-                }
-            };
-            match evict_outcome {
-                Ok(Some(res)) => {
-                    let pre_phys = position;
-                    position = res.new_physical;
-                    if !res.retain_mask.is_empty() {
-                        if let Err(e) = spec.on_evict(
-                            gpu,
-                            &EvictRetain {
-                                retain_mask: res.retain_mask,
-                                pre_phys,
-                            },
-                        ) {
-                            let _ = classify_evict_failure_wire();
-                            let ep = spec_rollback_live(
-                                &mut m.seq_pos,
-                                &mut m.conversation_tokens,
-                                &mut m.prefill_checkpoints,
-                                &mut m.dflash_checkpoints,
-                                &mut m.asst_turn_cache,
-                                gpu,
-                                pp.as_deref_mut(),
-                                slot,
-                                spec.as_mut(),
-                            );
-                            emit_fail_closed_error(
-                                stdout,
-                                Some(id),
-                                &format!("on_evict (per-cycle): {e}"),
-                                "validation",
-                                false,
-                                &ep,
-                            );
-                            drop(guard);
-                            return None;
-                        }
-                    }
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    let _ = classify_evict_failure_wire();
-                    let ep = spec_rollback_live(
-                        &mut m.seq_pos,
-                        &mut m.conversation_tokens,
-                        &mut m.prefill_checkpoints,
-                        &mut m.dflash_checkpoints,
-                        &mut m.asst_turn_cache,
-                        gpu,
-                        pp.as_deref_mut(),
-                        slot,
-                        spec.as_mut(),
-                    );
-                    emit_fail_closed_error(
-                        stdout,
-                        Some(id),
-                        &format!("maybe_evict (per-cycle): {e}"),
-                        "validation",
-                        false,
-                        &ep,
-                    );
-                    drop(guard);
-                    return None;
-                }
             }
         }
         if hit_eos || think_cap_hit {
@@ -5972,7 +5733,9 @@ pub fn generate_spec(
         let tx = spec_terminal_pending_seed_tx(seed_token);
         if check_abort(id) {
             let _ = classify_forced_gpu_advance(true);
-            let ep = spec_rollback_live(
+            // The seed is emitted but not yet fed: same committed boundary as
+            // the loop-top cancel.
+            let ep = spec_cancel_epilogue_live(
                 &mut m.seq_pos,
                 &mut m.conversation_tokens,
                 &mut m.prefill_checkpoints,
@@ -5982,6 +5745,10 @@ pub fn generate_spec(
                 pp.as_deref_mut(),
                 slot,
                 spec.as_mut(),
+                &prompt_tokens,
+                &emitted,
+                position,
+                pending_seed_committable.then_some(seed_token),
             );
             emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
             drop(guard);
@@ -6298,15 +6065,13 @@ fn pp_semantic_fail_closed(
 /// openers, max_think_tokens force-close, budget-alert nudge, ChatML \n
 /// trailer. Forward calls fan out to per-device tensors via
 /// `gpus.devices[dev]` and `scratch_set.per_device[dev]`; the final
-/// sample lives on `gpus.output_device`. DFlash, CASK, PFlash, VL and
+/// sample lives on `gpus.output_device`. DFlash, VL and
 /// arch_id < 5 are refused upstream at load.
 
 #[allow(clippy::too_many_arguments)]
 pub fn generate_multi(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
-    pflash_state: Option<&mut hipfire_pflash::pflash::PflashState>,
-    pflash_cfg: Option<&hipfire_pflash::pflash::PflashConfig>,
     stdout: &mut std::io::Stdout,
     id: &str,
     prompt: &str,
@@ -6336,11 +6101,17 @@ pub fn generate_multi(
     // Borrow `tokenizer` per-use (never held across whole-`m` calls): the
     // pre-prefill resets below reborrow `m` through the canonical reset.
     let prompt_est = m.tokenizer.as_ref().unwrap().encode(prompt).len() + 20;
-    if m.seq_pos
-        .saturating_add(prompt_est)
-        .saturating_add(max_tokens)
-        > m.max_seq
-    {
+    // A full render (history through the chat template) cold-resets below anyway
+    // and re-occupies the same positions, so a reset here could never create room.
+    let full_render = crate::ar::full_render_path(
+        messages_history.is_some(),
+        m.chat_template.is_some(),
+        hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
+            .ok()
+            .as_deref()
+            != Some("0"),
+    );
+    if crate::ar::context_full_resets(full_render, m.seq_pos, prompt_est, max_tokens, m.max_seq) {
         eprintln!(
             "[daemon] context full ({}/{}) — resetting conversation",
             m.seq_pos, m.max_seq
@@ -6382,93 +6153,15 @@ pub fn generate_multi(
 
     let im_end = tokenizer.encode("<|im_end|>");
     let nl = tokenizer.encode("\n");
-    let raw_q_tokens = tokenizer.encode(prompt);
-
-    // PFlash compression on first turn (seq_pos == 0). Drafter runs on the
-    // daemon's single-GPU `gpu` handle, which binds to the same physical
-    // device as `pp_gpus.devices[0]` (HIP enumerates within ROCR_VISIBLE).
-    // VRAM is shared between the two Gpu handles via the HIP heap, so
-    // drafter weights coexist with the target's dev 0 portion. Output is
-    // a Vec<u32> of kept token IDs which feeds forward_prefill_batch_multi
-    // unchanged. Mode=Off / drafter unloaded falls through to raw tokens.
-    let request_kind = match tokenizer.special_token_id("<tool_call>") {
-        Some(tid) => {
-            let in_user = raw_q_tokens.iter().any(|&t| t == tid);
-            let in_system = system_prompt
-                .map(|s| tokenizer.encode(s).iter().any(|&t| t == tid))
-                .unwrap_or(false);
-            if in_user || in_system {
-                hipfire_pflash::pflash::RequestKind::ToolCall
-            } else {
-                hipfire_pflash::pflash::RequestKind::Text
-            }
-        }
-        None => hipfire_pflash::pflash::RequestKind::Text,
-    };
-    let q_tokens = if let (Some(state), Some(cfg)) = (pflash_state, pflash_cfg) {
-        if m.seq_pos == 0 {
-            match hipfire_pflash::pflash::maybe_compress_prompt(
-                gpu,
-                state,
-                cfg,
-                &raw_q_tokens,
-                request_kind,
-                &[],
-            ) {
-                Ok(hipfire_pflash::pflash::PflashDecision::Compressed(cp)) => {
-                    let _ = writeln!(
-                        stdout,
-                        r#"{{"type":"pflash_compressed","id":"{}","source_tokens":{},"kept_tokens":{},"keep_ratio":{:.6},"source_md5":"{}","compressed_md5":"{}","score_ms":{},"total_ms":{}}}"#,
-                        id,
-                        cp.source_tokens,
-                        cp.kept_tokens,
-                        cp.kept_tokens as f32 / cp.source_tokens.max(1) as f32,
-                        cp.source_md5,
-                        cp.compressed_md5,
-                        cp.timings.score_ms,
-                        cp.timings.total_ms,
-                    );
-                    let _ = stdout.flush();
-                    cp.token_ids
-                }
-                Ok(hipfire_pflash::pflash::PflashDecision::Bypass { reason }) => {
-                    if !matches!(reason, hipfire_pflash::pflash::BypassReason::ModeOff) {
-                        let _ = writeln!(
-                            stdout,
-                            r#"{{"type":"pflash_bypass","id":"{}","reason":"{}"}}"#,
-                            id,
-                            reason.as_str().replace('"', "'"),
-                        );
-                        let _ = stdout.flush();
-                    }
-                    raw_q_tokens
-                }
-                Err(e) => {
-                    let _ = writeln!(
-                        stdout,
-                        r#"{{"type":"pflash_error","id":"{}","reason":"{}"}}"#,
-                        id,
-                        e.to_string().replace('"', "'"),
-                    );
-                    let _ = stdout.flush();
-                    raw_q_tokens
-                }
-            }
-        } else {
-            raw_q_tokens
-        }
-    } else {
-        raw_q_tokens
-    };
+    let q_tokens = tokenizer.encode(prompt);
 
     // ChatML framing — two paths, same shape as the single-GPU AR
     // generate() (line 3147+):
     //
     //   1) HIPFIRE_JINJA_CHAT=1 + model has chat_template + seq_pos==0
     //      → render via JinjaChatFrame so structured tools/messages
-    //      reach the upstream template. PFlash compression is bypassed
-    //      under Jinja (q_tokens is unused; the rendered prompt string
-    //      is re-tokenized straight through).
+    //      reach the upstream template (q_tokens is unused; the rendered prompt
+    //      string is re-tokenized straight through).
     //
     //   2) Default: hand-rolled ChatFrame::Plain scaffold, byte-
     //      identical to the pp=1 default path so multi-turn behavior
@@ -6779,6 +6472,21 @@ pub fn generate_multi(
             stdout,
             Some(id),
             &format!("forward_prefill_batch_multi: {}", e),
+            "validation",
+            false,
+            &ep,
+        );
+        let _ = stdout.flush();
+        return;
+    }
+    // The PP prompt ends ordinary prefill: one seal before decode.
+    if let Err(e) = dn.seal_streams(&mut gpus.devices[0], m.seq_pos + new_tokens.len()) {
+        let ep = crate::common::reset_mesh_request_state(m, Some(gpu));
+        emit_fail_closed_error_for_route(
+            crate::ar::GenerationRoute::PipelineParallel,
+            stdout,
+            Some(id),
+            &format!("GDN stream seal: {e}"),
             "validation",
             false,
             &ep,
@@ -7493,8 +7201,6 @@ pub fn generate_multi(
 pub fn generate_mesh_carrier(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
-    pflash_state: Option<&mut hipfire_pflash::pflash::PflashState>,
-    pflash_cfg: Option<&hipfire_pflash::pflash::PflashConfig>,
     stdout: &mut std::io::Stdout,
     id: &str,
     prompt: &str,
@@ -7521,8 +7227,6 @@ pub fn generate_mesh_carrier(
     generate_multi(
         m,
         gpu,
-        pflash_state,
-        pflash_cfg,
         stdout,
         id,
         prompt,
@@ -7720,6 +7424,66 @@ pub fn qwen_dflash_wire_terminal(
     }
 }
 
+/// Store decision for the legacy (non-semantic-v2) assistant-turn cache,
+/// shared by the DFlash/DSpark spec route and llama AR. The legacy entry is
+/// keyed on the visible text only, so a body that carries a think span
+/// (or started inside one) is never stored: its reasoning would splice into
+/// another conversation with the same visible answer, or into a think-off
+/// turn after the `<think></think>` primer (HIPF-227).
+pub fn legacy_asst_turn_action(
+    hit_length: bool,
+    open_think: bool,
+    started_in_think: bool,
+    decoded_full: &str,
+    wire_calls: &[hipfire_runtime::prompt_frame::ToolCall],
+) -> TurnCacheAction {
+    let has_think =
+        started_in_think || decoded_full.contains("<think>") || decoded_full.contains("</think>");
+    if hit_length || open_think || has_think {
+        return TurnCacheAction::skip();
+    }
+    // Strips the literal `<|im_end|>` the client never echoes back.
+    let visible = strip_think_for_fingerprint(decoded_full);
+    TurnCacheAction {
+        store: true,
+        fingerprint_text: hipfire_runtime::tokenizer::maybe_normalize_prompt(&visible).into_owned(),
+        tool_calls: wire_calls.to_vec(),
+    }
+}
+
+/// Publish a legacy turn: content-only full body under the action's fingerprint.
+pub fn store_legacy_asst_turn(m: &mut LoadedModel, action: &TurnCacheAction, cached_seq: Vec<u32>) {
+    let _ = apply_turn_cache_action(
+        |fp, seq| {
+            if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
+                .ok()
+                .as_deref()
+                == Some("1")
+            {
+                eprintln!(
+                    "[qwen-cache store legacy] fp={:#018x} cached_seq={} tool_calls={}",
+                    fp,
+                    seq.len(),
+                    action.tool_calls.len(),
+                );
+            }
+            m.asst_turn_cache.insert(
+                fp,
+                hipfire_runtime::prompt_frame::CachedAssistantTurn {
+                    reasoning: None,
+                    tools: Vec::new(),
+                    content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
+                        token_ids: seq,
+                        text: String::new(),
+                    }),
+                },
+            );
+        },
+        action,
+        cached_seq,
+    );
+}
+
 pub fn qwen_dflash_cache_action(terminal: &QwenDflashWireTerminal) -> TurnCacheAction {
     match terminal {
         QwenDflashWireTerminal::Malformed { .. } => TurnCacheAction::skip(),
@@ -7828,7 +7592,6 @@ pub fn qwen_dflash_reasoning_event_value(
 }
 
 /// Production done envelope core for Qwen DFlash epilogue + tests.
-/// Optional pflash fields are merged by the caller after construction.
 pub fn qwen_dflash_done_value(
     id: &str,
     generated: usize,
@@ -8055,8 +7818,9 @@ pub fn spec_strict_prefix_action(
 /// window before any reset or re-prefill. A terminal strict prefix always
 /// tries (the speculator answers `false` when it cannot repair); a
 /// non-terminal one (`Realign`, a forced intervention inside the window) tries
-/// only on native Qwen4 MTP, which restores its retained pre-window target and
-/// head and replays the consumed prefix instead of re-prefilling history.
+/// only on a Qwen4 window-capped speculator ([`spec_qwen4_window_capped`]),
+/// which restores its retained pre-window target state and replays the
+/// consumed prefix instead of re-prefilling history.
 ///
 /// A retired request's AR step is not a speculative window and leaves none
 /// retained (DFlash clears it), so it never tries: asking would fail the
@@ -8064,7 +7828,7 @@ pub fn spec_strict_prefix_action(
 /// violation on the AR token end as the validation error it is.
 pub fn spec_window_repair_attempt(
     action: SpecStrictPrefixAction,
-    native_qwen4_mtp: bool,
+    qwen4_window_capped: bool,
     ar_step: bool,
 ) -> bool {
     if ar_step {
@@ -8073,35 +7837,44 @@ pub fn spec_window_repair_attempt(
     match action {
         SpecStrictPrefixAction::None => false,
         SpecStrictPrefixAction::RepairForTerminal => true,
-        SpecStrictPrefixAction::Realign => native_qwen4_mtp,
+        SpecStrictPrefixAction::Realign => qwen4_window_capped,
     }
 }
 
 /// Output budget for the next speculative window. `remaining` is what
-/// `max_tokens` still allows; native Qwen4 MTP additionally clamps it to the
-/// emitter's [`SpecEmit::window_cap`] (always `>= 1` when `Some`) so a
-/// think-budget force-close or think-cap stop only lands on the window's last
-/// token. Other speculators ignore the cap.
+/// `max_tokens` still allows; a Qwen4 window-capped speculator
+/// ([`spec_qwen4_window_capped`]) additionally clamps it to the emitter's
+/// [`SpecEmit::window_cap`] (always `>= 1` when `Some`) so a think-budget
+/// force-close or think-cap stop only lands on the window's last token. Other
+/// speculators ignore the cap.
 pub fn spec_window_emit_budget(
     remaining: usize,
-    native_qwen4_mtp: bool,
+    qwen4_window_capped: bool,
     cap: Option<usize>,
 ) -> usize {
     match cap {
-        Some(cap) if native_qwen4_mtp => remaining.min(cap.max(1)),
+        Some(cap) if qwen4_window_capped => remaining.min(cap.max(1)),
         _ => remaining,
     }
+}
+
+/// Speculators that commit a whole window on a Qwen4 target before the
+/// emitter observes it: native Qwen4 MTP and DFlash2. Raon DFlash2 shares the
+/// `dflash2` name but has no target-side committed-prefix repair, so it keeps
+/// Realign.
+pub fn spec_qwen4_window_capped(qwen4_target: bool, spec_name: &str, mtp_drafter: bool) -> bool {
+    qwen4_target && (mtp_drafter || spec_name == "dflash2")
 }
 
 #[cfg(test)]
 mod spec_window_repair_tests {
     use super::{
-        spec_strict_prefix_action, spec_window_emit_budget, spec_window_repair_attempt,
-        SpecStrictPrefixAction,
+        spec_qwen4_window_capped, spec_strict_prefix_action, spec_window_emit_budget,
+        spec_window_repair_attempt, SpecStrictPrefixAction,
     };
 
     #[test]
-    fn window_cap_clamps_only_native_qwen4_and_never_to_zero() {
+    fn window_cap_clamps_only_qwen4_capped_and_never_to_zero() {
         assert_eq!(spec_window_emit_budget(9, true, Some(3)), 3);
         assert_eq!(spec_window_emit_budget(2, true, Some(3)), 2);
         assert_eq!(spec_window_emit_budget(9, true, Some(0)), 1);
@@ -8110,7 +7883,15 @@ mod spec_window_repair_tests {
     }
 
     #[test]
-    fn window_repair_precedes_reset_and_realign_on_native_qwen4() {
+    fn window_cap_covers_qwen4_mtp_and_dflash2_not_raon() {
+        assert!(spec_qwen4_window_capped(true, "mtp", true));
+        assert!(spec_qwen4_window_capped(true, "dflash2", false));
+        assert!(!spec_qwen4_window_capped(false, "dflash2", false));
+        assert!(!spec_qwen4_window_capped(true, "dflash", false));
+    }
+
+    #[test]
+    fn window_repair_precedes_reset_and_realign_on_qwen4_capped() {
         // Full window: nothing to repair.
         let full = spec_strict_prefix_action(4, 4, true);
         assert!(!spec_window_repair_attempt(full, true, false));
@@ -8119,8 +7900,8 @@ mod spec_window_repair_tests {
         assert_eq!(terminal, SpecStrictPrefixAction::RepairForTerminal);
         assert!(spec_window_repair_attempt(terminal, false, false));
         assert!(spec_window_repair_attempt(terminal, true, false));
-        // Non-terminal strict prefix (forced intervention): only native Qwen4
-        // skips the full re-prefill; others keep Realign.
+        // Non-terminal strict prefix (forced intervention): only a Qwen4
+        // window-capped speculator skips the full re-prefill; others keep Realign.
         let forced = spec_strict_prefix_action(2, 4, false);
         assert_eq!(forced, SpecStrictPrefixAction::Realign);
         assert!(spec_window_repair_attempt(forced, true, false));
@@ -8170,25 +7951,16 @@ pub fn spec_prefix_realign_plan(
     }
 }
 
-/// Prove a strict-prefix realign replay fits target physical + speculator caps
-/// and is compatible with current eviction/compact-offset state.
+/// Prove a strict-prefix realign replay fits target physical + speculator caps.
 ///
-/// Realign is reset + full-history prefill (`compact_offset` cleared). It must
-/// never overrun `physical_cap` / `ctx_capacity`, and must not silently rebuild
-/// a compacted/evicted cache from an oversize full-history replay. On `Err`,
-/// callers fail closed with one rollback+error terminal (no reset/prefill).
-///
-/// `compact_offset` / `eviction_enabled` are part of the admit contract: when
-/// either is live the physical buffer is a retained window, but realign still
-/// full-replays logical history after reset. Retain-mask partial repair is
-/// **not** used here (no source contract proves DeltaNet/drafter-hidden
-/// equivalence). Capacity fit is the only proof; oversized history fails closed.
+/// Realign is reset + full-history prefill. It must never overrun
+/// `physical_cap` / `ctx_capacity`. On `Err`, callers fail closed with one
+/// rollback+error terminal (no reset/prefill). Capacity fit is the only proof;
+/// oversized history fails closed.
 pub fn spec_prefix_realign_admit(
     plan: &SpecPrefixRealignPlan,
     physical_cap: usize,
     ctx_capacity: usize,
-    compact_offset: usize,
-    eviction_enabled: bool,
 ) -> Result<(), String> {
     // Processed-prefix / pending-seed split: replay holds only processed tokens;
     // `position` is the next write slot for the unprocessed pending seed.
@@ -8215,12 +7987,6 @@ pub fn spec_prefix_realign_admit(
             plan.position
         ));
     }
-    // Eviction/compact_offset: realign always reset+full-replays (offset cleared).
-    // Retain-mask partial repair is intentionally unused (no source contract for
-    // DeltaNet/drafter-hidden equivalence). Capacity fit above is the only admit
-    // proof — oversize full-history under compaction fails closed, never silent
-    // reconstruct. Params stay in the signature so callers cannot ignore the seam.
-    let _ = (compact_offset, eviction_enabled);
     Ok(())
 }
 
@@ -8262,7 +8028,7 @@ pub enum SpecForcedApplyResult {
 /// Shared by `generate_spec` immediately after `emit.begin(first_token)` and by
 /// the mid-window observe path after prefix realign. Same hard budget, commit
 /// ordering (trigger retained only when committable; last forced pending once),
-/// physical-cap admission, optional post-commit eviction, abort latch, rollback
+/// physical-cap admission, abort latch, rollback
 /// attestation, client observe/render, raw history, and pending-seed
 /// committability rules — begin/mid-window cannot drift.
 ///
@@ -8270,12 +8036,9 @@ pub enum SpecForcedApplyResult {
 /// 1. Stage `emit.observe` over the budget-clipped forced list and stop at the
 ///    first non-`None` stop — later forced tokens are never observed.
 /// 2. Build the exact pending+forced processed prefix; reject when the commit
-///    slice cannot fit `physical_cap` (no-eviction keeps a pending-seed slot;
-///    eviction may end at cap only with step 4).
+///    slice cannot fit `physical_cap` (keeps a pending-seed slot).
 /// 3. GPU-commit that exact prefix (`on_forced_advance` / `spec_advance`).
-/// 4. When eviction is active: `maybe_evict` + `on_evict` on the post-commit
-///    physical position before any host seed/raw/render/generated update.
-/// 5. Only after successful commit (+ eviction): set host position, push raw
+/// 4. Only after successful commit: set host position, push raw
 ///    history, render events, update `generated` / `pending_seed_committable`.
 ///
 /// `forced_all` is the raw `take_forced()` payload (may be empty). On
@@ -8311,7 +8074,6 @@ pub fn apply_spec_forced_pending_seed(
     dflash_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
     asst_turn_cache: &mut hipfire_loader::AsstTurnCache,
     physical_cap: usize,
-    eviction: Option<&Eviction>,
 ) -> SpecForcedApplyResult {
     if forced_all.is_empty() {
         return SpecForcedApplyResult::Skipped;
@@ -8349,7 +8111,7 @@ pub fn apply_spec_forced_pending_seed(
 
     // Physical-cap admission on the exact commit slice (actual tx.commit.len()).
     // Reject before any GPU write. Capacity failure is fail-closed ErrorOnly.
-    if !spec_forced_commit_admits(*position, tx.commit.len(), physical_cap, eviction.is_some()) {
+    if !spec_forced_commit_admits(*position, tx.commit.len(), physical_cap) {
         let ep = spec_rollback_live(
             seq_pos,
             conversation_tokens,
@@ -8365,11 +8127,10 @@ pub fn apply_spec_forced_pending_seed(
             stdout,
             Some(id),
             &format!(
-                "forced commit exceeds physical_cap: position={} commit_len={} physical_cap={} eviction={}",
+                "forced commit exceeds physical_cap: position={} commit_len={} physical_cap={}",
                 *position,
                 tx.commit.len(),
                 physical_cap,
-                eviction.is_some()
             ),
             "validation",
             false,
@@ -8479,124 +8240,7 @@ pub fn apply_spec_forced_pending_seed(
     }
     // GPU committed kept prefix (trigger only if committable + forced[..n-1]);
     // last kept forced is pending. position_delta tracks actual commit length.
-    // Post-commit eviction (when active) MUST complete before host seed/raw/render
-    // so client-visible state never observes over-cap physical occupancy.
-    let mut post_position = position.saturating_add(tx.position_delta);
-    if let Some(ev) = eviction {
-        let evict_outcome = match slot.kv_cache_mut() {
-            Some(kv) => ev.maybe_evict(gpu, kv, post_position),
-            None => {
-                let _ = classify_evict_failure_wire();
-                let ep = spec_rollback_live(
-                    seq_pos,
-                    conversation_tokens,
-                    prefill_checkpoints,
-                    dflash_checkpoints,
-                    asst_turn_cache,
-                    gpu,
-                    pp.as_deref_mut(),
-                    slot,
-                    spec,
-                );
-                emit_fail_closed_error(
-                    stdout,
-                    Some(id),
-                    "kv_cache_mut missing (forced)",
-                    "validation",
-                    false,
-                    &ep,
-                );
-                return SpecForcedApplyResult::Terminal;
-            }
-        };
-        match evict_outcome {
-            Ok(Some(res)) => {
-                let pre_phys = post_position;
-                if !res.retain_mask.is_empty() {
-                    if let Err(e) = spec.on_evict(
-                        gpu,
-                        &EvictRetain {
-                            retain_mask: res.retain_mask,
-                            pre_phys,
-                        },
-                    ) {
-                        let _ = classify_evict_failure_wire();
-                        let ep = spec_rollback_live(
-                            seq_pos,
-                            conversation_tokens,
-                            prefill_checkpoints,
-                            dflash_checkpoints,
-                            asst_turn_cache,
-                            gpu,
-                            pp.as_deref_mut(),
-                            slot,
-                            spec,
-                        );
-                        emit_fail_closed_error(
-                            stdout,
-                            Some(id),
-                            &format!("on_evict (forced): {e}"),
-                            "validation",
-                            false,
-                            &ep,
-                        );
-                        return SpecForcedApplyResult::Terminal;
-                    }
-                }
-                post_position = res.new_physical;
-            }
-            Ok(None) => {}
-            Err(e) => {
-                let _ = classify_evict_failure_wire();
-                let ep = spec_rollback_live(
-                    seq_pos,
-                    conversation_tokens,
-                    prefill_checkpoints,
-                    dflash_checkpoints,
-                    asst_turn_cache,
-                    gpu,
-                    pp.as_deref_mut(),
-                    slot,
-                    spec,
-                );
-                emit_fail_closed_error(
-                    stdout,
-                    Some(id),
-                    &format!("maybe_evict (forced): {e}"),
-                    "validation",
-                    false,
-                    &ep,
-                );
-                return SpecForcedApplyResult::Terminal;
-            }
-        }
-        // Pending seed requires a legal next write slot after eviction.
-        if post_position >= physical_cap {
-            let _ = classify_evict_failure_wire();
-            let ep = spec_rollback_live(
-                seq_pos,
-                conversation_tokens,
-                prefill_checkpoints,
-                dflash_checkpoints,
-                asst_turn_cache,
-                gpu,
-                pp.as_deref_mut(),
-                slot,
-                spec,
-            );
-            emit_fail_closed_error(
-                stdout,
-                Some(id),
-                &format!(
-                    "forced commit leaves no pending-seed slot: position={post_position} >= physical_cap={physical_cap}"
-                ),
-                "validation",
-                false,
-                &ep,
-            );
-            return SpecForcedApplyResult::Terminal;
-        }
-    }
+    let post_position = position.saturating_add(tx.position_delta);
 
     *position = post_position;
     *seed_token = tx.pending_seed;
@@ -8621,11 +8265,6 @@ pub fn apply_spec_forced_pending_seed(
         Some(reason) => SpecForcedApplyResult::Stopped(reason),
         None => SpecForcedApplyResult::Applied,
     }
-}
-
-/// Eviction / on_evict failure always uses the exclusive error terminal.
-pub fn classify_evict_failure_wire() -> SpecFailClosedWire {
-    SpecFailClosedWire::ErrorOnly
 }
 
 // --- iter appended ---
@@ -8771,24 +8410,10 @@ pub fn spec_failure_message(what: &str, err: &str) -> String {
 ///
 /// `commit_len` is the exact transaction commit length (`tx.commit.len()`), not
 /// the forced token count (non-committable seed may omit the trigger).
-/// - No eviction: admits iff `position + commit_len < physical_cap` so one legal
-///   write slot remains for the unprocessed pending seed.
-/// - Eviction enabled: admits iff `position + commit_len <= physical_cap`. Exact-cap
-///   is allowed only because the caller MUST run post-commit `maybe_evict` /
-///   `on_evict` before host seed/raw/render updates and still leave a legal
-///   pending-seed slot (`post_evict < physical_cap`).
-pub fn spec_forced_commit_admits(
-    position: usize,
-    commit_len: usize,
-    physical_cap: usize,
-    eviction_enabled: bool,
-) -> bool {
-    let post_position = position.saturating_add(commit_len);
-    if eviction_enabled {
-        post_position <= physical_cap
-    } else {
-        post_position < physical_cap
-    }
+/// Admits iff `position + commit_len < physical_cap` so one legal write slot
+/// remains for the unprocessed pending seed.
+pub fn spec_forced_commit_admits(position: usize, commit_len: usize, physical_cap: usize) -> bool {
+    position.saturating_add(commit_len) < physical_cap
 }
 
 /// Wire shape for fail-closed terminals on the Task 4 spec path.
@@ -9805,6 +9430,7 @@ mod qwen_history_chain_tests {
                     tools: None,
                     enable_grammar: false,
                     stop: Vec::new(),
+                    min_tokens: 0,
                     max_think: 0,
                     max_tokens: 4096,
                     assistant_prefix: AssistantPrefix::OpenThink,
@@ -10708,7 +10334,6 @@ pub(crate) fn render_qwen4_prompt_history(
             tokenizer,
             &mut m.asst_turn_cache,
             &[],
-            false,
             system_prompt,
             prompt,
             assistant_prefix,
@@ -10801,6 +10426,7 @@ pub fn generate_qwen4_ar(
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
     think_mode: ThinkMode,
     stop: &[String],
+    min_tokens: usize,
     reasoning_effort: Option<&str>,
     enable_thinking: bool,
     _request_seed: u32,
@@ -10832,7 +10458,7 @@ pub fn generate_qwen4_ar(
         return;
     }
 
-    // The Qwen4 carrier currently rejects speculative/PFlash state, so these
+    // The Qwen4 carrier currently rejects speculative state, so these
     // inputs are intentionally consumed by the common AR contract rather than
     // silently selecting another producer.
     let _ = think_mode;
@@ -10956,6 +10582,7 @@ pub fn generate_qwen4_ar(
         max_think_tokens,
         started_in_think,
         stop,
+        min_tokens,
         // Same predicate as the native MTP emitter (`Qwen35Emit::from_ctx`
         // enables its tool router on `tools.is_some()`), so both Qwen4 routes
         // classify `<tool_call>` markup identically.
@@ -11036,7 +10663,7 @@ pub(crate) fn qwen4_bundle_and_mesh(
 /// Why a Qwen4 speculative request cannot run on the pipeline-parallel mesh
 /// (`None` = it can). Only native MTP reaches the mesh (greedy, or sampled
 /// with the default Leviathan verify and neutral penalties), on the model's
-/// own `Gpus`, without eviction or a divergent-render resume; everything else
+/// own `Gpus`, without a divergent-render resume; everything else
 /// is refused before any state mutation. `naive_sampled`: the drafter runs
 /// `HIPFIRE_MTP_SAMPLED_MODE=naive` (process-wide sampler draws);
 /// `penalized`: the request carries a non-neutral repeat / presence /
@@ -11049,7 +10676,6 @@ fn qwen4_pp_spec_refusal(
     naive_sampled: bool,
     penalized: bool,
     has_gpus: bool,
-    evicting: bool,
     resumes: bool,
 ) -> Option<String> {
     if spec_name != "mtp" || !native_drafter {
@@ -11080,9 +10706,6 @@ fn qwen4_pp_spec_refusal(
     if !has_gpus {
         return Some("qwen4 topology.pp native MTP has no admitted Gpus owner".to_string());
     }
-    if evicting {
-        return Some("qwen4 topology.pp native MTP does not support KV eviction".to_string());
-    }
     if resumes {
         return Some(
             "qwen4 topology.pp native MTP does not support a checkpoint resume".to_string(),
@@ -11098,7 +10721,7 @@ mod qwen4_pp_spec_refusal_tests {
     #[test]
     fn greedy_native_mtp_with_gpus_is_admitted() {
         assert_eq!(
-            qwen4_pp_spec_refusal("mtp", true, 0.0, false, false, true, false, false),
+            qwen4_pp_spec_refusal("mtp", true, 0.0, false, false, true, false),
             None
         );
     }
@@ -11106,20 +10729,16 @@ mod qwen4_pp_spec_refusal_tests {
     #[test]
     fn other_speculators_and_foreign_drafters_are_refused() {
         for name in ["dflash", "dspark", "ngram", ""] {
-            assert!(
-                qwen4_pp_spec_refusal(name, true, 0.0, false, false, true, false, false).is_some()
-            );
+            assert!(qwen4_pp_spec_refusal(name, true, 0.0, false, false, true, false).is_some());
         }
-        assert!(
-            qwen4_pp_spec_refusal("mtp", false, 0.0, false, false, true, false, false).is_some()
-        );
+        assert!(qwen4_pp_spec_refusal("mtp", false, 0.0, false, false, true, false).is_some());
     }
 
     #[test]
     fn unpenalized_leviathan_sampled_requests_are_admitted() {
         for temp in [0.7, 1.0e-3, 1.0, 2.0] {
             assert_eq!(
-                qwen4_pp_spec_refusal("mtp", true, temp, false, false, true, false, false),
+                qwen4_pp_spec_refusal("mtp", true, temp, false, false, true, false),
                 None,
                 "temp {temp}"
             );
@@ -11129,33 +10748,25 @@ mod qwen4_pp_spec_refusal_tests {
     #[test]
     fn non_finite_naive_and_penalized_requests_are_refused() {
         for temp in [f32::NAN, f32::INFINITY] {
-            assert!(
-                qwen4_pp_spec_refusal("mtp", true, temp, false, false, true, false, false)
-                    .is_some()
-            );
+            assert!(qwen4_pp_spec_refusal("mtp", true, temp, false, false, true, false).is_some());
         }
         // Naive sampled mode (process-wide sampler draws) stays refused ...
-        assert!(qwen4_pp_spec_refusal("mtp", true, 0.7, true, false, true, false, false).is_some());
+        assert!(qwen4_pp_spec_refusal("mtp", true, 0.7, true, false, true, false).is_some());
         // ... but a greedy request never draws, whatever the mode.
         assert_eq!(
-            qwen4_pp_spec_refusal("mtp", true, 0.0, true, false, true, false, false),
+            qwen4_pp_spec_refusal("mtp", true, 0.0, true, false, true, false),
             None
         );
         // Penalties are refused greedy or sampled.
         for temp in [0.0, 0.7] {
-            assert!(
-                qwen4_pp_spec_refusal("mtp", true, temp, false, true, true, false, false).is_some()
-            );
+            assert!(qwen4_pp_spec_refusal("mtp", true, temp, false, true, true, false).is_some());
         }
     }
 
     #[test]
-    fn missing_gpus_eviction_and_resume_are_refused() {
-        assert!(
-            qwen4_pp_spec_refusal("mtp", true, 0.0, false, false, false, false, false).is_some()
-        );
-        assert!(qwen4_pp_spec_refusal("mtp", true, 0.0, false, false, true, true, false).is_some());
-        assert!(qwen4_pp_spec_refusal("mtp", true, 0.0, false, false, true, false, true).is_some());
+    fn missing_gpus_and_resume_are_refused() {
+        assert!(qwen4_pp_spec_refusal("mtp", true, 0.0, false, false, false, false).is_some());
+        assert!(qwen4_pp_spec_refusal("mtp", true, 0.0, false, false, true, true).is_some());
     }
 }
 
@@ -11187,7 +10798,8 @@ fn qwen4_pp_mtp_parts<'a>(
 pub enum SpecPrefillTerminal {
     /// The client aborted mid-prefill: a cancel, never a validation error.
     Cancelled,
-    /// A real prefill failure: the fail-closed `validation` error.
+    /// A real prefill failure: the fail-closed `validation` error (a device out-of-memory one
+    /// answers a retryable `overload`, [`crate::common::fail_closed_wire`]).
     Failed(String),
 }
 
@@ -11216,6 +10828,32 @@ pub fn emit_spec_prefill_terminal(
             emit_fail_closed_error(stdout, Some(id), msg, "validation", false, epilogue)
         }
     }
+}
+
+/// Resume-planner view of the speculator's DeltaNet checkpoint ring: only the
+/// checkpoints whose stored prefix fingerprint proves they cover exactly
+/// `conversation[..position]` (the stream the resident state describes). A
+/// checkpoint that cannot prove it is excluded, so a divergence it would have
+/// served prefills cold instead of restoring non-reversible state onto a
+/// prefix it does not match.
+fn attested_spec_checkpoint_positions(
+    spec: Option<&dyn Speculator>,
+    conversation: &[u32],
+) -> Vec<usize> {
+    let Some(spec) = spec else {
+        return Vec::new();
+    };
+    let ring = spec.checkpoint_prefix_hashes();
+    let attested = speculative::attested_checkpoint_positions(&ring, conversation);
+    if attested.len() != ring.len() {
+        eprintln!(
+            "[qwen-cache resume] {} of {} checkpoint(s) rejected: prefix hash does not attest the conversation (kept {:?})",
+            ring.len() - attested.len(),
+            ring.len(),
+            attested,
+        );
+    }
+    attested
 }
 
 /// [`production_fail_closed_rollback_live`] for the spec loop: the mesh form
@@ -11255,6 +10893,81 @@ fn spec_rollback_live(
             spec,
         ),
     }
+}
+
+/// Cancel epilogue of the spec loop at a committed boundary: the pending seed
+/// is emitted to the client but not yet fed, so the target KV / DeltaNet state
+/// is exactly `prompt_tokens` + the fed part of `emitted` (`position` tokens).
+/// [`production_cancel_epilogue_live`] keeps that prefix as the conversation
+/// when the cursors attest it; the validated configuration is a resident
+/// single-GPU Qwen3.5-class target (`ModelSlot`, no KV compaction) on
+/// the MTP or DFlash speculator. A pipeline-parallel mesh, every other target
+/// and every unattestable cursor keep the full reset ([`spec_rollback_live`]).
+#[allow(clippy::too_many_arguments)]
+fn spec_cancel_epilogue_live(
+    seq_pos: &mut usize,
+    conversation_tokens: &mut Vec<u32>,
+    prefill_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    dflash_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    asst_turn_cache: &mut AsstTurnCache,
+    gpu: &mut rdna_compute::Gpu,
+    pp: Option<&mut hipfire_runtime::multi_gpu::Gpus>,
+    slot: &mut dyn SpecTarget,
+    spec: &mut dyn Speculator,
+    prompt_tokens: &[u32],
+    emitted: &[u32],
+    position: usize,
+    pending_seed: Option<u32>,
+) -> RollbackEpilogue {
+    if pp.is_some() {
+        return spec_rollback_live(
+            seq_pos,
+            conversation_tokens,
+            prefill_checkpoints,
+            dflash_checkpoints,
+            asst_turn_cache,
+            gpu,
+            pp,
+            slot,
+            spec,
+        );
+    }
+    let eligible = matches!(spec.name(), "mtp" | "dflash")
+        && slot
+            .as_any_mut()
+            .downcast_mut::<speculative::ModelSlot>()
+            .is_some_and(|ms| ms.kv_cache.compact_offset == 0);
+    production_cancel_epilogue_live(
+        seq_pos,
+        conversation_tokens,
+        prefill_checkpoints,
+        dflash_checkpoints,
+        asst_turn_cache,
+        gpu,
+        slot,
+        spec,
+        CancelBoundary {
+            eligible,
+            fed: position,
+            stream: spec_cancel_committed_stream(prompt_tokens, emitted, position, pending_seed),
+        },
+    )
+}
+
+/// Whether a client cancel at the terminal commit handshake of the spec route
+/// (the turn finished, the client left before `done`) may keep the conversation
+/// the turn already baked: the same validated configuration as
+/// [`spec_cancel_epilogue_live`] (resident single-GPU Qwen3.5-class bundle on
+/// the MTP or DFlash speculator, no KV compaction). Nothing was
+/// reverted, so the host record and device cursor agree by construction;
+/// [`production_cancel_epilogue`] still checks that they do.
+fn spec_cancel_keeps_committed_prefix(m: &LoadedModel) -> bool {
+    m.pp <= 1
+        && m.kv_adaptive.is_none()
+        && m.speculator
+            .as_ref()
+            .is_some_and(|s| matches!(s.name(), "mtp" | "dflash"))
+        && m.qwen35().is_some_and(|b| b.kv_cache.compact_offset == 0)
 }
 
 /// `Speculator::prefill` of the spec loop, on the mesh for a pipeline-parallel
@@ -11565,5 +11278,114 @@ mod qwen_ep_sample_tests {
             2
         );
         assert_eq!(qwen_ep_sample(&mut logits, &[2], &greedy(1.0, 1.0, 0.0)), 5);
+    }
+}
+
+#[cfg(test)]
+mod legacy_asst_turn_store_tests {
+    use super::{legacy_asst_turn_action, TurnCacheAction};
+    use hipfire_engine::turn_cache::apply_turn_cache_action;
+    use std::collections::HashMap;
+
+    fn action(hit_length: bool, open_think: bool, started: bool, body: &str) -> TurnCacheAction {
+        legacy_asst_turn_action(hit_length, open_think, started, body, &[])
+    }
+
+    /// Publish through the production seam; returns the stored key.
+    fn store(
+        cache: &mut HashMap<u64, Vec<u32>>,
+        a: &TurnCacheAction,
+        seq: Vec<u32>,
+    ) -> Option<u64> {
+        apply_turn_cache_action(|fp, s| drop(cache.insert(fp, s)), a, seq)
+    }
+
+    #[test]
+    fn same_visible_text_with_different_think_bodies_never_splices() {
+        let mut cache = HashMap::new();
+        let x = action(
+            false,
+            false,
+            false,
+            "<think>\nsecret is apple\n</think>\n\nOK",
+        );
+        let y = action(
+            false,
+            false,
+            false,
+            "<think>\nsecret is pear\n</think>\n\nOK",
+        );
+        assert!(store(&mut cache, &x, vec![1, 2]).is_none());
+        assert!(store(&mut cache, &y, vec![3, 4]).is_none());
+        // Body that started inside think (prompt ended with `<think>\n`).
+        let z = action(false, false, true, "secret is plum\n</think>\n\nOK");
+        assert!(store(&mut cache, &z, vec![5]).is_none());
+        assert!(
+            cache.is_empty(),
+            "a think body must not be reachable by visible text"
+        );
+    }
+
+    #[test]
+    fn think_on_turn_cannot_be_spliced_after_a_think_off_primer() {
+        let mut cache = HashMap::new();
+        let on = action(false, false, false, "<think>\n17*3 is 51\n</think>\n\n51");
+        assert!(store(&mut cache, &on, vec![9]).is_none());
+        // Turn 2 (thinking off) looks up "51": nothing to prepend its primer to.
+        let fp = hipfire_engine::turn_cache::asst_turn_fingerprint("51", &[]);
+        assert!(!cache.contains_key(&fp));
+    }
+
+    #[test]
+    fn thinking_off_stop_stores_under_the_visible_text() {
+        let mut cache = HashMap::new();
+        let a = action(false, false, false, "Hello there.<|im_end|>");
+        assert!(a.store);
+        assert_eq!(a.fingerprint_text, "Hello there.");
+        let fp = store(&mut cache, &a, vec![7, 8]).expect("clean stop stores");
+        assert_eq!(cache[&fp], vec![7, 8]);
+        // A client echoing the visible text hits the same key.
+        assert_eq!(
+            fp,
+            hipfire_engine::turn_cache::asst_turn_fingerprint("Hello there.", &[])
+        );
+    }
+
+    #[test]
+    fn length_and_open_think_skip() {
+        assert!(!action(true, false, false, "Hello").store);
+        assert!(!action(false, true, false, "Hello").store);
+        assert!(!action(false, true, false, "<think>\nstill thinking").store);
+    }
+
+    #[test]
+    fn ar_routing_splits_reasoning_from_content() {
+        use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig};
+        let mut out = Vec::new();
+        let mut filter = EosFilter::new(EosFilterConfig::default());
+        let mut think = hipfire_runtime::emit_text::ThinkOutputRouter::new(false);
+        for piece in ["<think>", "\nplan", "\n</think>", "\n\nAnswer"] {
+            crate::vision::vl_route_decode_text(
+                &mut out,
+                "r",
+                &mut filter,
+                &mut think,
+                piece.as_bytes(),
+            );
+        }
+        crate::vision::vl_finish_think_routing(&mut out, "r", &mut filter, &mut think);
+        let (mut reasoning, mut content) = (String::new(), String::new());
+        for line in String::from_utf8(out).unwrap().lines() {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            let t = v["text"].as_str().unwrap();
+            match v["type"].as_str().unwrap() {
+                "reasoning" => reasoning.push_str(t),
+                "token" => content.push_str(t),
+                other => panic!("unexpected event {other}"),
+            }
+        }
+        assert!(reasoning.contains("plan") && !reasoning.contains("Answer"));
+        assert_eq!(content.trim(), "Answer");
+        assert!(!think.in_think());
     }
 }

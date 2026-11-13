@@ -13,7 +13,7 @@
 #                Bench is dtype-agnostic — pass qwen3.5-9b.mq3-lloyd to
 #                bench Lloyd-MQ3. Decoder dtype is detected from the .hfq
 #                quant-type ID in qwen35::load_weights.
-#   HIPFIRE_KV_MODE  KV-cache mode (default asym3). See bench_qwen35_mq4.
+#   HIPFIRE_KV_MODE  KV-cache mode (default fwht3). See bench_qwen35_mq4.
 #   HIPFIRE_GRAPH    Set to 1 to capture the decode loop as a graph (default 1).
 set -u
 BENCH_MODEL="${BENCH_MODEL:-qwen3.5-9b.mq4}"
@@ -39,7 +39,7 @@ for h in "${COMMITS[@]}"; do
         echo "BUILD_FAIL  $msg"
         continue
     fi
-    out=$(HIPFIRE_KV_MODE="${HIPFIRE_KV_MODE:-asym3}" HIPFIRE_GRAPH="${HIPFIRE_GRAPH:-1}" \
+    out=$(HIPFIRE_KV_MODE="${HIPFIRE_KV_MODE:-fwht3}" HIPFIRE_GRAPH="${HIPFIRE_GRAPH:-1}" \
         target/release/examples/bench_qwen35_mq4 "$HOME/.hipfire/models/$BENCH_MODEL" \
         --prefill 16 --warmup 3 --gen 30 2>&1)
     tok_s=$(echo "$out" | grep -oE 'gen_tok_s=[0-9.]+' | sed 's/gen_tok_s=//')

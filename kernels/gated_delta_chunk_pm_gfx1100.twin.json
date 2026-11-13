@@ -1,0 +1,153 @@
+{
+  "module": "gated_delta_chunk_pm_gfx1100",
+  "arch": "gfx1100",
+  "reports": [
+    {
+      "abi": {
+        "args": [
+          {
+            "name": "",
+            "offset": 0,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 8,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 16,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 24,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 32,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 40,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 48,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 56,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 64,
+            "pointer": true,
+            "size": 8,
+            "value_kind": "global_buffer"
+          },
+          {
+            "name": "",
+            "offset": 72,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 76,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 80,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 84,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 88,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          },
+          {
+            "name": "",
+            "offset": 92,
+            "pointer": false,
+            "size": 4,
+            "value_kind": "by_value"
+          }
+        ],
+        "compared_to_incumbent": true,
+        "incumbent_sha256": "574630bc877c8034545ec9cdc764a932356ebf4454f529faec53ab64b3722d5e",
+        "incumbent_symbol": "gated_delta_chunk_gate_wmma",
+        "kernarg_segment_size": 96
+      },
+      "arch": "gfx1100",
+      "elf_bytes": 30088,
+      "elf_sha256": "32dbd01c973256214fd11baab0e678d0f889e59e2d30b22f4bf3d1165b1d2286",
+      "hazards": {
+        "advisory": 188,
+        "blocking": 0,
+        "checked": true,
+        "findings": 188,
+        "pm_ir_obligations": 0
+      },
+      "hxaco_bytes": 34184,
+      "hxaco_sha256": "cd1b626f7a2841a10f2a5e4ed0caf9371a3234208bbe73ac20bd2786720fddd2",
+      "kernel": "gated_delta_chunk_gate_wmma_pm_gfx1100",
+      "lds": 31168,
+      "lift_identity": "emit::checked ok; emitted bytes == input ELF",
+      "rsrc2": 158,
+      "scratch": 0,
+      "sgprs": 78,
+      "text_bytes": 25316,
+      "text_sha256": "6af703c3f0a520766280b551abc505676a370ce67049e927e785d0a6698b3156",
+      "user_sgprs": 15,
+      "vgprs": 248,
+      "wavefront_size": 32
+    }
+  ],
+  "judged_text_check": [
+    {
+      "symbol": "gated_delta_chunk_gate_wmma_pm_gfx1100",
+      "judged_candidate": "incumbent-hipcc",
+      "judged_code_sha256": "6af703c3f0a520766280b551abc505676a370ce67049e927e785d0a6698b3156",
+      "twin_text_sha256": "6af703c3f0a520766280b551abc505676a370ce67049e927e785d0a6698b3156",
+      "equal": true
+    }
+  ]
+}

@@ -138,6 +138,10 @@ pub const QWEN4_ROW_EXACT_VERIFY_ROWS_GFX1151: usize =
 /// after the row-exactness oracle proves the arch at that many rows.
 pub const QWEN4_ROW_EXACT_VERIFY_ROWS_GFX1201: usize =
     hipfire_config::QWEN4_ROW_EXACT_VERIFY_ROWS_GFX1201;
+/// gfx942 row-exact verify rows (owned by `hipfire-config`): the M-K-measured
+/// default-route chunk == single-row decode width the drafter serves.
+pub const QWEN4_ROW_EXACT_VERIFY_ROWS_GFX942: usize =
+    hipfire_config::QWEN4_ROW_EXACT_VERIFY_ROWS_GFX942;
 
 /// Parse `HIPFIRE_QWEN4_WIDE_VERIFY_ROWS`: an unsigned integer clamped to
 /// [`FEW_ROW_ROUTE_ROWS`]..=[`WIDE_VERIFY_MAX_ROWS`]; unset or unparsable is
@@ -172,6 +176,11 @@ pub fn set_qwen4_wide_verify_rows_override(rows: Option<usize>) {
 /// Precedence of the verify-rows sources: runtime override (`0` = unset),
 /// then the env override, then the table.
 fn resolve_verify_rows(arch: &str, runtime: usize, env: Option<usize>, table: usize) -> usize {
+    if arch == "gfx942" {
+        // The table is authoritative here: neither lab override (RDNA
+        // wide-verify oracles) widens gfx942.
+        return table.clamp(FEW_ROW_ROUTE_ROWS, WIDE_VERIFY_MAX_ROWS);
+    }
     if !matches!(arch, "gfx1151" | "gfx1201" | "gfx1100") {
         return FEW_ROW_ROUTE_ROWS;
     }
@@ -325,21 +334,78 @@ pub fn few_row_mq4v2_route(arch: &str, batch_size: usize, k: usize) -> FewRowMq4
 /// `memset(y)` + WMMA. Same exact-gfx1100 gate and the same reason: the host
 /// zeroing inside a forward body is state a retained PM4 tape cannot replay.
 pub fn few_row_mq4v2_plain_route(arch: &str, batch_size: usize, k: usize) -> bool {
-    arch == "gfx1100"
-        && k.is_multiple_of(256)
-        && (1..=FEW_ROW_ROUTE_ROWS).contains(&batch_size)
+    arch == "gfx1100" && k.is_multiple_of(256) && (1..=FEW_ROW_ROUTE_ROWS).contains(&batch_size)
+}
+/// [`Gpu::qwen4_route_rows_cap`] of the exact EP joint prefill wave: one row under the 512-row
+/// floor of every row-keyed route (F16 WMMA, symmetric IU4, INT8 shared expert, fused front,
+/// BF16 streams), so a wide wave's MoE call takes the routes a sub-512-row lane's singleton takes.
+pub const QWEN4_EXACT_WAVE_ROUTE_ROWS_CAP: usize = crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS - 1;
+
+/// The routing rows of a forward of `rows` rows ([`Gpu::route_rows`], pure): the canonical chunk
+/// under the invariant profile, else `rows` clamped to `cap` when a routing-row cap is set
+/// (`cap != 0`, [`Gpu::qwen4_route_rows_cap`]).
+pub(crate) fn route_rows_of(invariant: bool, cap: usize, rows: usize) -> usize {
+    if invariant {
+        QWEN4_PREFILL_CANON_ROWS
+    } else if cap != 0 {
+        rows.min(cap)
+    } else {
+        rows
+    }
 }
 
+/// `HIPFIRE_QWEN4_WIDE_GROUPED_MOE` (developer, default off, `1` on, read once): a
+/// 9..=`few_row_limit` eager verify keeps the grouped, expert-unioned routed-MoE
+/// route of the <=8-row call instead of the per-(row, slot) indexed route.
+static QWEN4_WIDE_GROUPED_MOE: LazyLock<bool> =
+    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_WIDE_GROUPED_MOE", false));
+
+/// `HIPFIRE_QWEN4_WIDE_GROUPED_DOWN` (developer, default off, `1` on, read once): on the
+/// grouped routed-MoE route, a 9..=`few_row_limit` verify runs the grouped,
+/// expert-unioned down (`gemm_mq4g128v2_moe_grouped_top10`) and the grouped combine
+/// instead of the per-slot indexed down. Takes effect only where the routed chain is
+/// grouped (`HIPFIRE_QWEN4_WIDE_GROUPED_MOE=1`).
+static QWEN4_WIDE_GROUPED_DOWN: LazyLock<bool> =
+    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_WIDE_GROUPED_DOWN", false));
+
 impl Gpu {
+    /// See [`QWEN4_WIDE_GROUPED_DOWN`].
+    #[inline]
+    pub fn wide_grouped_down(&self) -> bool {
+        *QWEN4_WIDE_GROUPED_DOWN
+    }
+
+    /// See [`QWEN4_WIDE_GROUPED_MOE`].
+    #[inline]
+    pub fn wide_grouped_moe(&self) -> bool {
+        *QWEN4_WIDE_GROUPED_MOE
+    }
+
+    /// The typed numerical intent of the forward in flight (see [`PrefillRouteIntent`]).
+    #[inline]
+    pub fn prefill_route_intent(&self) -> PrefillRouteIntent {
+        if self.ordinary_prefill_active() {
+            PrefillRouteIntent::OrdinaryPrefill
+        } else if self.prefill_invariant_scope {
+            PrefillRouteIntent::InvariantProfile
+        } else {
+            PrefillRouteIntent::Product
+        }
+    }
+
     /// Row count to feed ROUTING predicates (never launch extents): the
-    /// canonical prefill chunk under the invariant profile, else `rows`.
+    /// canonical prefill chunk under the invariant profile or the ordinary prefill
+    /// intent ([`PrefillRouteIntent::canonical_routing`]), else `rows`
+    /// (clamped to [`Gpu::qwen4_route_rows_cap`] while the exact EP wave sets it).
+    /// The ordinary prefill intent wins over the cap: every call of an ordinary prefill,
+    /// including a one-row tail, takes the bulk recipe.
     #[inline]
     pub fn route_rows(&self, rows: usize) -> usize {
-        if self.prefill_invariant_scope {
-            QWEN4_PREFILL_CANON_ROWS
-        } else {
-            rows
-        }
+        route_rows_of(
+            self.prefill_route_intent().canonical_routing(),
+            self.qwen4_route_rows_cap,
+            rows,
+        )
     }
 
     /// Largest `route_rows` a few-row (decode-exact) route serves right now:
@@ -376,7 +442,7 @@ impl Gpu {
                 rows,
                 self.wide_verify_rows,
                 !(self.replay.is_recording() || self.graphs.capture_mode),
-                self.prefill_invariant_scope,
+                self.prefill_route_intent().canonical_routing(),
             )
     }
 
@@ -417,6 +483,311 @@ impl Gpu {
     }
 }
 
+/// Numerical routing intent of a forward: the typed form of the scope flags that decide
+/// whether a row-keyed route is taken from the call's row count or from the canonical
+/// (long-prefill) recipe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrefillRouteIntent {
+    /// Decode, verify, lane steps and every unscoped forward: routes follow the real rows.
+    Product,
+    /// Opt-in batch-invariant Flash-Next profile (`HIPFIRE_PREFILL_PM_INVARIANT`). Takes the
+    /// canonical routes but, historically, suppresses the native trunk IU4 route.
+    InvariantProfile,
+    /// Ordinary prefill ([`Gpu::ordinary_prefill_enter`]): canonical routes for every row
+    /// count, one-row tails included, WITHOUT the invariant profile's IU4 suppression and
+    /// never through the agent-turn append route's symmetric-MoE suppression.
+    OrdinaryPrefill,
+}
+
+impl PrefillRouteIntent {
+    /// Row-keyed routes see [`QWEN4_PREFILL_CANON_ROWS`] rows.
+    #[inline]
+    pub const fn canonical_routing(self) -> bool {
+        !matches!(self, Self::Product)
+    }
+
+    /// The native trunk IU4 route is excluded (a row's bytes would otherwise depend on
+    /// whole versus partial 128-row tiles). Ordinary prefill keeps the route and takes
+    /// canonical tiles ([`Gpu::qwen4_trunk_iu4_ragged`]) instead.
+    #[inline]
+    pub const fn suppresses_trunk_iu4(self) -> bool {
+        matches!(self, Self::InvariantProfile)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Canonical GDN ordinary-prefill producer policy (CHUNK-CANONICAL-DESIGN §1.1-§1.3, §2.2)
+// ---------------------------------------------------------------------------
+
+/// Stable arithmetic codes of one GDN projection field ([`crate::gdn_stream::GdnProjectionRecipe`]).
+/// Equal codes mean byte-identical arithmetic for a row regardless of the call's extent or the
+/// row's position inside a physical producer tile. Codes are part of the recipe identity
+/// ([`GdnPrefillPlan::compute_recipe_id`]): never renumber, only append.
+pub mod gdn_arith {
+    /// Prepared symmetric MQ4V2 x A4 (`block_i4_128`) IU4 SET, exact gfx1201 (masked partial
+    /// tiles; the fused `qkvzagdn`, zba-fold and separate SETs are one arithmetic).
+    pub const IU4_G12: u32 = 1;
+    /// gfx1100/gfx1151 symmetric IU4 over complete 128-row symfold tiles (partial extents run
+    /// a private zero-padded full tile); includes the Z|beta|alpha fold when it qualifies.
+    pub const IU4_G11_FULL_TILE: u32 = 2;
+    /// gfx1100/gfx1151 static small-M F16 (MW4) beta/alpha beside IU4 QKV/Z.
+    pub const MW4_F16_SMALL_M: u32 = 3;
+    /// Symmetric MQ4V2 A8 (INT8 activations, MMQ SET).
+    pub const A8: u32 = 4;
+    /// gfx1201 native FP8 staged v2 with the symmetric fold.
+    pub const FP8_V2_SYMFOLD: u32 = 5;
+    /// gfx1201 native FP8 staged v2 without the symmetric fold.
+    pub const FP8_V2: u32 = 6;
+    /// Unprepared F16-activation WMMA projection (asymmetric MQ4V2 and legacy paths).
+    pub const F16_WMMA: u32 = 7;
+    /// gfx11 Q8_1 MMQ (IU4 off).
+    pub const MMQ_Q8_1: u32 = 8;
+    /// Output projection fed by the gfx1201 gated-norm A4 producer (BF16 or F32 scan plane).
+    pub const OUT_IU4_FUSED_G12: u32 = 9;
+    /// Output projection fed by the gfx11 gated-norm A4 producer.
+    pub const OUT_IU4_FUSED_G11: u32 = 10;
+    /// Output projection fed by the gfx1201 FP8 stream producer.
+    pub const OUT_FP8_STREAM: u32 = 11;
+    /// Output projection fed by the fused A8 gated-norm producer.
+    pub const OUT_A8_FUSED: u32 = 12;
+    /// Weight dtype outside the symmetric MQ4V2 families: code = `OTHER_BASE | dtype`.
+    pub const OTHER_BASE: u32 = 0x100;
+}
+
+/// One GDN projection matrix as the plan sees it: header dtype and output rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GdnProjDesc {
+    pub dtype: crate::DType,
+    pub m: usize,
+}
+
+/// Static facts of one GDN layer: everything the numerical recipe may depend on, and nothing
+/// that varies with the outer call (no row count, no free VRAM, no pointers).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GdnLayerDesc {
+    /// Model dim: `K` of the four input projections.
+    pub dim: usize,
+    pub key_heads: usize,
+    pub value_heads: usize,
+    pub head_dim: usize,
+    pub qkv: GdnProjDesc,
+    pub z: GdnProjDesc,
+    pub beta: GdnProjDesc,
+    pub alpha: GdnProjDesc,
+    /// The post-scan output projection (`wo`): header dtype only.
+    pub out_dtype: crate::DType,
+    /// The output projection accumulates into the residual (`BatchEpilogue::Residual`; always
+    /// true for the MoE LA `wo`).
+    pub out_residual: bool,
+    /// The loader appended beta/alpha to Z (fold layout of `iu4_gdn_fold_rows` /
+    /// `mq4v2_fold_betaalpha_padded_m`).
+    pub z_folded: bool,
+    /// MoE layer (Ornith/A3B family) rather than dense.
+    pub moe: bool,
+    /// Configured recurrent state quantization.
+    pub state: crate::gdn_stream::GdnStateQuant,
+    /// The row-independent chunk-scan admission the architecture owner resolves today (device
+    /// flag and capability, `gdn_chunk_head_geometry_supported`, Q8 state with complete
+    /// scale/conv/EF vectors, non-sequential/non-tree/non-tape configuration, per-family MoE
+    /// requirements). `false` keeps the statically supported sequential recurrence family.
+    pub scan64_admitted: bool,
+}
+
+impl Gpu {
+    /// Resolve the canonical ordinary-prefill plan of one GDN layer from static facts.
+    ///
+    /// The plan is the bulk (aligned, long-prefill) numerical recipe of this device and
+    /// configuration; it is evaluated at [`GDN_COMMIT_ROWS`] representative rows through the
+    /// very predicates the producers run, so the recipe and the runtime cannot drift. While
+    /// [`Gpu::ordinary_prefill_enter`] is open every actual extent `n >= 1` selects the same
+    /// arithmetic ([`Gpu::prefill_rows_admit`]), including the one-row tail. Resolve once per
+    /// prefix, in the execution mode (eager versus recording/capture) that prefix will use:
+    /// recording and capture refuse the A4/A8/FP8 producers, which the plan then reflects.
+    ///
+    /// `Err` when called inside an IU4/FP8 verify scope (verify intent never shares a recipe
+    /// with ordinary prefill).
+    #[cfg(feature = "deltanet")]
+    pub fn resolve_gdn_prefill_plan(
+        &self,
+        desc: &GdnLayerDesc,
+    ) -> hip_bridge::HipResult<crate::gdn_stream::GdnPrefillPlan> {
+        use crate::gdn_stream::{
+            GdnPrefillPlan, GdnProjectionRecipe, GdnScanAlgorithm, GdnStateQuant, GdnTensorFormat,
+            GDN_COMMIT_ROWS,
+        };
+        use crate::norm::GdnScanOut;
+        if self.iu4_verify_scope || self.fp8_verify_scope || self.wide_verify_rows != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "resolve_gdn_prefill_plan: verify scope open (ordinary prefill intent only)",
+            ));
+        }
+        if desc.dim == 0 || desc.head_dim == 0 || desc.key_heads == 0 || desc.value_heads == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "resolve_gdn_prefill_plan: empty GDN geometry",
+            ));
+        }
+        let rows = GDN_COMMIT_ROWS;
+        let k = desc.dim;
+        let field = |p: GdnProjDesc, small_m_tail: bool| {
+            self.gdn_input_arith(desc, p, k, rows, small_m_tail)
+        };
+        let projection_recipe = GdnProjectionRecipe {
+            qkv: field(desc.qkv, false),
+            z: field(desc.z, false),
+            alpha: field(desc.alpha, true),
+            beta: field(desc.beta, true),
+            out: 0,
+        };
+        let (out_code, bf16_reader) = self.gdn_out_arith(desc, rows);
+        let projection_recipe = GdnProjectionRecipe {
+            out: out_code,
+            ..projection_recipe
+        };
+        let (algorithm, scan_operand_format) = if desc.scan64_admitted {
+            (GdnScanAlgorithm::Scan64, GdnTensorFormat::F16)
+        } else {
+            (GdnScanAlgorithm::Sequential, GdnTensorFormat::F32)
+        };
+        // The C64 scan plane: BF16 only for the gfx1201 A4 reader (and only when the scan
+        // actually writes a plane); `HIPFIRE_GDN_SCAN_OUT` is a requested precision flag and
+        // therefore part of the recipe.
+        let scan_output_format = if algorithm == GdnScanAlgorithm::Scan64 && bf16_reader {
+            match self.gdn_scan_out(GdnScanOut::Bf16)? {
+                GdnScanOut::Bf16 => GdnTensorFormat::Bf16,
+                GdnScanOut::F32 => GdnTensorFormat::F32,
+            }
+        } else {
+            GdnTensorFormat::F32
+        };
+        let commit_rows = if desc.state == GdnStateQuant::F32 {
+            0
+        } else {
+            GDN_COMMIT_ROWS
+        };
+        // Minimum physical producer tile: gfx1201 A4/FP8/A8 consumers mask partial tiles
+        // natively (1 row); gfx11 symmetric IU4 symfold arithmetic needs a complete 128-row tile.
+        let producer_tile_rows = if self.arch.starts_with("gfx11")
+            && projection_recipe.qkv == gdn_arith::IU4_G11_FULL_TILE
+        {
+            128
+        } else {
+            1
+        };
+        let mut plan = GdnPrefillPlan {
+            recipe_id: 0,
+            algorithm,
+            micro_rows: algorithm.micro_rows(),
+            commit_rows,
+            projection_recipe,
+            scan_operand_format,
+            scan_output_format,
+            state_quant: desc.state,
+            producer_tile_rows,
+        };
+        plan.recipe_id = plan.compute_recipe_id();
+        Ok(plan)
+    }
+
+    /// Arithmetic code of one input projection field (QKV, Z, beta or alpha) evaluated at the
+    /// representative bulk extent `rows`.
+    #[cfg(feature = "deltanet")]
+    fn gdn_input_arith(
+        &self,
+        desc: &GdnLayerDesc,
+        p: GdnProjDesc,
+        k: usize,
+        rows: usize,
+        small_m_tail: bool,
+    ) -> u32 {
+        use crate::DType;
+        if p.dtype != DType::MQ4G256V2 {
+            return gdn_arith::OTHER_BASE | p.dtype as u32;
+        }
+        if self.a8_prefill_active(rows, k) {
+            return gdn_arith::A8;
+        }
+        let eager = !self.replay.is_recording() && !self.graphs.capture_mode && k % 256 == 0;
+        match self.arch.as_str() {
+            "gfx1201" => {
+                if self.flags.iu4_prefill_enabled() && eager {
+                    gdn_arith::IU4_G12
+                } else if self.flags.gfx12_mq4v2_fp8_qkvza && eager {
+                    if self.mq4v2_symmetric && self.flags.gfx12_mq4v2_fp8_v2 {
+                        gdn_arith::FP8_V2_SYMFOLD
+                    } else {
+                        gdn_arith::FP8_V2
+                    }
+                } else {
+                    gdn_arith::F16_WMMA
+                }
+            }
+            "gfx1100" | "gfx1151" => {
+                if self.flags.iu4_prefill_enabled() && eager {
+                    let folded = desc.z_folded
+                        && self.mq4v2_fold_betaalpha_active(
+                            desc.qkv.m,
+                            desc.z.m,
+                            desc.beta.m,
+                            desc.alpha.m,
+                            k,
+                            rows,
+                        );
+                    if small_m_tail && !folded && p.m < 128 {
+                        gdn_arith::MW4_F16_SMALL_M
+                    } else {
+                        gdn_arith::IU4_G11_FULL_TILE
+                    }
+                } else if eager {
+                    gdn_arith::MMQ_Q8_1
+                } else {
+                    gdn_arith::F16_WMMA
+                }
+            }
+            _ => gdn_arith::F16_WMMA,
+        }
+    }
+
+    /// `(arithmetic code, scan plane is read by the gfx1201 BF16-capable A4 reader)` of the
+    /// output projection at the representative bulk extent `rows`, mirroring the reader
+    /// priority of the dense/MoE output projection (A8, gfx12 A4, gfx11 A4, FP8 stream, F32).
+    #[cfg(feature = "deltanet")]
+    fn gdn_out_arith(&self, desc: &GdnLayerDesc, rows: usize) -> (u32, bool) {
+        use crate::DType;
+        let k = desc.value_heads * desc.head_dim;
+        if desc.out_dtype != DType::MQ4G256V2 {
+            return (gdn_arith::OTHER_BASE | desc.out_dtype as u32, false);
+        }
+        let shape = desc.out_residual && desc.head_dim == 128 && k > 0;
+        if shape && self.flags.a8_fused_prod && self.a8_prefill_active(rows, k) {
+            return (gdn_arith::OUT_A8_FUSED, false);
+        }
+        if shape && self.iu4_producer_quant_fused_active(rows, k) {
+            return (gdn_arith::OUT_IU4_FUSED_G12, true);
+        }
+        if shape && self.iu4_gfx11_producer_quant_fused_active(rows, k) {
+            return (gdn_arith::OUT_IU4_FUSED_G11, false);
+        }
+        if desc.head_dim == 128
+            && self.flags.gfx12_mq4v2_fp8_resid
+            && self.fp8_stream_active(rows, k)
+        {
+            return (gdn_arith::OUT_FP8_STREAM, false);
+        }
+        if self.a8_prefill_active(rows, k) {
+            return (gdn_arith::A8, false);
+        }
+        if self.flags.iu4_prefill_enabled() && k % 256 == 0 {
+            return (
+                gdn_arith::IU4_G12 + 0x80 * (self.arch != "gfx1201") as u32,
+                false,
+            );
+        }
+        (gdn_arith::F16_WMMA, false)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -437,6 +808,71 @@ mod tests {
         assert!(QWEN4_PREFILL_CANON_ROWS >= 2048);
         assert!(QWEN4_PREFILL_CANON_ROWS > 8);
         assert_eq!(QWEN4_PREFILL_CANON_ROWS % 128, 0);
+    }
+
+    /// The routing-row cap of the exact EP wave: one row under every 512-row route floor, and
+    /// above the few-row routes (so a capped call is a PREFILL-class call, never decode / verify).
+    #[test]
+    fn exact_wave_cap_is_the_last_sub_512_row_count() {
+        assert_eq!(
+            QWEN4_EXACT_WAVE_ROUTE_ROWS_CAP,
+            QWEN4_F16_WMMA_MIN_TOKENS - 1
+        );
+        assert!(QWEN4_EXACT_WAVE_ROUTE_ROWS_CAP < QWEN4_MOE_SYM_IU4_MIN_ROWS);
+        assert!(QWEN4_EXACT_WAVE_ROUTE_ROWS_CAP > WIDE_VERIFY_MAX_ROWS);
+    }
+
+    /// Cap off is the identity at every row count (and the invariant canon still wins over a cap);
+    /// cap on leaves every row count below it alone and clamps the wider ones.
+    #[test]
+    fn route_rows_cap_semantics() {
+        for rows in [
+            0usize, 1, 8, 9, 60, 149, 511, 512, 513, 1192, 2048, 4096, 100_000,
+        ] {
+            assert_eq!(route_rows_of(false, 0, rows), rows, "cap off, rows {rows}");
+            assert_eq!(
+                route_rows_of(true, 0, rows),
+                QWEN4_PREFILL_CANON_ROWS,
+                "invariant, rows {rows}"
+            );
+            assert_eq!(
+                route_rows_of(true, QWEN4_EXACT_WAVE_ROUTE_ROWS_CAP, rows),
+                QWEN4_PREFILL_CANON_ROWS,
+                "invariant beats the cap, rows {rows}"
+            );
+            let capped = route_rows_of(false, QWEN4_EXACT_WAVE_ROUTE_ROWS_CAP, rows);
+            assert_eq!(capped, rows.min(511), "cap 511, rows {rows}");
+            if rows < 512 {
+                assert_eq!(capped, rows, "a sub-512 lane is unchanged by the cap");
+            } else {
+                assert!(
+                    capped < QWEN4_F16_WMMA_MIN_TOKENS,
+                    "a wide wave routes sub-512"
+                );
+            }
+        }
+    }
+
+    /// The typed intents: ordinary prefill and the invariant profile both route canonically
+    /// (rows as [`QWEN4_PREFILL_CANON_ROWS`]); only the invariant profile suppresses the native
+    /// trunk IU4 route; product routes by the real rows.
+    #[test]
+    fn prefill_route_intent_semantics() {
+        assert!(!PrefillRouteIntent::Product.canonical_routing());
+        assert!(PrefillRouteIntent::InvariantProfile.canonical_routing());
+        assert!(PrefillRouteIntent::OrdinaryPrefill.canonical_routing());
+        assert!(!PrefillRouteIntent::Product.suppresses_trunk_iu4());
+        assert!(PrefillRouteIntent::InvariantProfile.suppresses_trunk_iu4());
+        assert!(!PrefillRouteIntent::OrdinaryPrefill.suppresses_trunk_iu4());
+        // Canonical routing wins over the EP-wave routing-row cap at every extent, a one-row
+        // tail included.
+        for rows in [1usize, 2, 8, 9, 25, 63, 64, 511, 512, 537, 8192] {
+            let canon = PrefillRouteIntent::OrdinaryPrefill.canonical_routing();
+            assert_eq!(
+                route_rows_of(canon, QWEN4_EXACT_WAVE_ROUTE_ROWS_CAP, rows),
+                QWEN4_PREFILL_CANON_ROWS
+            );
+        }
     }
 
     #[test]
@@ -502,7 +938,11 @@ mod tests {
             "gfx1151", "gfx1150", "gfx1101", "gfx1102", "gfx1200", "gfx1201", "gfx942",
         ] {
             for n in 1..=FEW_ROW_ROUTE_ROWS {
-                assert_eq!(few_row_mq4v2_route(arch, n, 4096), Incumbent, "{arch} n={n}");
+                assert_eq!(
+                    few_row_mq4v2_route(arch, n, 4096),
+                    Incumbent,
+                    "{arch} n={n}"
+                );
                 assert!(!few_row_mq4v2_plain_route(arch, n, 4096), "{arch} n={n}");
             }
         }
@@ -737,10 +1177,15 @@ mod wide_verify_tests {
         for rows in [
             QWEN4_ROW_EXACT_VERIFY_ROWS_GFX1151,
             QWEN4_ROW_EXACT_VERIFY_ROWS_GFX1201,
+            QWEN4_ROW_EXACT_VERIFY_ROWS_GFX942,
         ] {
             assert!((FEW_ROW_ROUTE_ROWS..=WIDE_VERIFY_MAX_ROWS).contains(&rows));
         }
-        for arch in ["gfx1150", "gfx942", "gfx1151-x", "gfx1100-x", ""] {
+        assert_eq!(
+            qwen4_row_exact_verify_rows("gfx942"),
+            QWEN4_ROW_EXACT_VERIFY_ROWS_GFX942
+        );
+        for arch in ["gfx1150", "gfx1151-x", "gfx1100-x", ""] {
             assert_eq!(qwen4_row_exact_verify_rows(arch), FEW_ROW_ROUTE_ROWS);
         }
     }

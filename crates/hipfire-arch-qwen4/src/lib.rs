@@ -34,15 +34,24 @@ pub mod decode_share_shadows;
 /// Target side of the shared DFlash2 drafter (layer capture, embed, head).
 pub(crate) mod dflash_target;
 pub mod ep;
+pub mod ep_mesh_lanes;
+pub mod ep_mesh_serve;
 /// EP2 reserve decoupling (opt-in `HIPFIRE_EP_RESERVE_DECOUPLE=1`): pure
 /// admission, plan, packing and receipt types.
 pub mod ep_reserve;
 pub mod ep_seal;
 pub mod ep_trunk_split;
+/// EP2 vocabulary-sharded target LM head (`HIPFIRE_QWEN4_EP_VOCAB_SHARD`): switch, admission and
+/// the cross-rank exchange.
+pub mod ep_vocab_shard;
 pub mod expert_keep;
 pub use expert_keep::{ExpertKeep, EXPERT_KEEP_METADATA_KEY, EXPERT_KEEP_SCHEMA};
 /// Per-layer contiguous expert slab arenas (K4 loader plan + fulfillment payload).
 pub mod expert_arena;
+/// Per-expert VRAM/host unit planner of an EP rank (D1: static hot set).
+pub mod expert_ep_units;
+/// `<model>.ep.hot-units` sidecar of the Flash-Next EP2 hot-unit loan (calibrated host-read counts).
+pub mod expert_hot_units;
 /// Lever1 expert hotset sidecar parser and `HIPFIRE_QWEN4_EXPERT_HOTSET` policy.
 pub mod expert_hotset;
 pub mod expert_residency;
@@ -55,20 +64,40 @@ pub mod expert_slabs;
 pub mod expert_tier_owners;
 /// Pure per-expert device/host-mapped placement plan (B5-C1).
 pub mod expert_tier_plan;
+/// Bounded evictable expert tail over D1's static core (D2): flag, budget charge, slot policy.
+pub mod expert_unit_tail;
+/// The device part of the D2 tail on one EP rank.
+pub(crate) mod expert_unit_tail_rank;
 pub mod gpu_forward;
 pub mod gpu_forward_lanes;
+pub mod hc8_sidecar;
 /// Measured host-to-device link class (narrow-link G2 and chunk defaults).
 pub mod host_link;
 pub mod kv_backend;
+#[cfg(feature = "lab")]
+pub(crate) mod lab_draft_rounds;
+/// Trunk-shard layer oracle engine: injected-stream block runs of the real forward program
+/// and the CPU-side contract analysis (`examples/trunk_shard_layer_oracle.rs`).
+#[cfg(feature = "lab")]
+pub mod lab_trunk_oracle;
 /// Read-only lab observation of the production sampled MTP accepting window.
 #[cfg(feature = "lab")]
 pub mod lab_window;
 pub mod lane;
 pub mod lane_exec;
-pub(crate) mod lane_token_ring;
+pub(crate) mod lane_rank;
+pub mod lane_switch;
+mod lane_token_ring;
 pub mod measured_identity;
 pub mod measured_resources;
 pub mod mesh_bindings;
+/// Root-side copy lane and head-lag bookkeeping of the multicard lanes.
+pub mod mesh_lane_copy;
+/// Host-only speculative-window transaction of the multicard lanes (EP2/PP2).
+pub mod mesh_lane_protocol;
+/// Rank-side device helper of copy windows, forced advances, head lag,
+/// catch-up and copy confirmation (single card, EP and PP ranks share it).
+pub(crate) mod mesh_rank_copy;
 pub mod mesh_tp;
 pub mod mtp_gpu;
 pub mod mtp_lanes;
@@ -83,6 +112,7 @@ pub(crate) mod projection;
 pub mod reference_forward;
 #[cfg(any(test, feature = "reference-parity"))]
 pub mod reference_mtp;
+pub mod sampled_lane;
 pub mod slowlink_admission;
 /// Admission-first single-device load shared by the S1 validation tools ONLY
 /// (gated `test` / `lab` / `reference-parity`): the product carrier never
@@ -94,8 +124,12 @@ pub mod slowlink_sp;
 pub mod state;
 #[cfg(any(test, feature = "reference-parity"))]
 pub mod state_parity;
+/// The stock-FP8 MTP head sidecar (`<model>.mtp`): bind, routing and log lines.
+pub mod stock_mtp_sidecar;
 pub mod sym_verdict_cache;
+pub(crate) mod trunk_a8;
 pub mod trunk_overlay;
+pub(crate) mod trunk_route;
 pub mod weights;
 #[cfg(feature = "reference-parity")]
 pub mod wide_verify_oracle;
@@ -124,6 +158,7 @@ pub use gpu_forward::{
     QWEN4_COMPACT_SCRATCH_ENV,
 };
 pub use gpu_forward_lanes::{WaveHead, WaveLane};
+pub use hc8_sidecar::{hc8_sidecar_saved_bytes, resolve_hc8_sidecar, Qwen4Hc8Sidecar};
 pub use kv_backend::{qwen4_vmm_refusal, qwen4_vmm_supported, Qwen4ContextCommit, Qwen4KvBackend};
 pub use ple::{
     PleHashMetadata, PleHistory, PleMetadataError, PleRowId, PLE_HEAD_COUNT, PLE_HEAD_OFFSETS,
@@ -131,6 +166,10 @@ pub use ple::{
     PLE_PADDED_ROWS, PLE_PADDING_MULTIPLE, PLE_ROW_WIDTH, PLE_VALID_ROWS,
 };
 pub use rdna_compute::tensor_ops::{GdnStateFormat, QsaKvFormat};
-pub use state::{resolve_gdn_format, resolve_qsa_format, resolve_state_format, Qwen4StateFormat};
-pub use trunk_overlay::{resolve_trunk_overlay, Qwen4TrunkOverlay, TrunkOverlayPolicy};
+pub use state::{
+    resolve_gdn_format, resolve_qsa_format, resolve_state_format, GdnStreamKind, Qwen4StateFormat,
+};
+pub use trunk_overlay::{
+    resolve_trunk_overlay, trunk_overlay_extra_bytes, Qwen4TrunkOverlay, TrunkOverlayPolicy,
+};
 pub use weights::{Qwen4ManifestIdentity, Qwen4TierRecipe};

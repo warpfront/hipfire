@@ -23,7 +23,6 @@
 - `crates/rdna-compute/src/dispatch.rs` — remove all free functions (lines 47–499), remove `mmq_screen`/`mmq_screen_threshold`/`force_blob_path`/`mmq_diag_quantize_only` fields from `Gpu`, add `flags: Arc<FeatureFlags>` field, replace all `std::env::var("HIPFIRE_...")` calls with `self.flags.*` accesses
 - `crates/rdna-compute/src/kernels.rs` — replace `std::env::var("HIPFIRE_LLOYD_FORCE_BASELINE")` and `std::env::var("HIPFIRE_RDNA2_VARIANT")` with parameter passing (struct field or method arg)
 - `crates/rdna-compute/src/compiler.rs` — replace `std::env::var("HIPFIRE_HIPCC_EXTRA_FLAGS")` with struct field
-- `crates/rdna-compute/src/arch_caps.rs` — `paro_la_gates_mq4g128_default` stays (it's pure arch logic, no env var)
 - `crates/hipfire-runtime/src/lib.rs` — add `pub mod config;`
 - `crates/hipfire-runtime/src/tokenizer.rs` — replace env reads with `RuntimeConfig` fields
 - `crates/hipfire-runtime/src/dflash.rs` — replace env reads with `RuntimeConfig` fields
@@ -35,7 +34,6 @@
 - `crates/hipfire-runtime/examples/dflash_spec_demo.rs` — construct `RuntimeConfig`, pass through
 - `crates/hipfire-arch-qwen35/src/qwen35.rs` — replace `rdna_compute::gemv_dp4a_enabled(&gpu.arch)` with `gpu.flags.gemv_dp4a_enabled()`, same for `has_wmma_f16`
 - `crates/hipfire-arch-qwen35/src/arch.rs` — import `FeatureFlags` if needed
-- `crates/hipfire-arch-qwen35/src/paro_la_gates_codec.rs` — no change (uses `arch_caps::paro_la_gates_mq4g128_default`, not an env var)
 
 ---
 
@@ -626,7 +624,6 @@ gpu.flags.has_wmma_f16()
 
 There are 7 call sites for `gemv_dp4a_enabled` and 3 for `has_wmma_f16` in qwen35.rs.
 
-In `crates/hipfire-arch-qwen35/src/paro_la_gates_codec.rs`, `arch_caps::paro_la_gates_mq4g128_default` is not an env var function — keep it as-is.
 
 - [ ] **Step 5: Verify compilation**
 
@@ -685,19 +682,7 @@ Each one becomes a field access on `self.flags`. The mapping is:
 | `HIPFIRE_ROCBLAS_OFF` | `self.flags.rocblas_off` |
 | `HIPFIRE_ROCBLAS_MIN_BATCH` | `self.flags.rocblas_min_batch` |
 | `HIPFIRE_WO_WMMA_VARIANT` | `self.flags.wo_wmma_variant` |
-| `HIPFIRE_PARO_PACK1/PACK2/PACK4` | `self.flags.lloyd_mb4` (or `mq3_mb4`) |
-| `HIPFIRE_PARO_SHARED_PAIRS` / `HIPFIRE_PARO_FUSED_PACK2` | need dedicated fields |
 
-**Note on PARO vars:** The `HIPFIRE_PARO_PACK1/PACK2/PACK4` and `HIPFIRE_PARO_SHARED_PAIRS` / `HIPFIRE_PARO_FUSED_PACK2` reads are in the Lloyd MB4 dispatch arms. These map to `Mb4Mode` or need separate `bool` fields. Add:
-
-```rust
-pub paro_shared_pairs: bool,
-pub paro_fused_pack2: bool,
-```
-
-to `FeatureFlags`, constructed from `HIPFIRE_PARO_SHARED_PAIRS` and `HIPFIRE_PARO_FUSED_PACK2`.
-
-- [ ] **Step 1:** Add `paro_shared_pairs` and `paro_fused_pack2` fields to `FeatureFlags` and `from_env()`
 
 - [ ] **Step 2:** Replace all `std::env::var("HIPFIRE_X")` in `impl Gpu` methods with `self.flags.x` (mechanical find-and-replace, ~40 call sites)
 
@@ -801,7 +786,6 @@ The struct should mirror the design from the spec: all fields immutable after co
 - [ ] **Step 3:** Migrate each source file:
   - `tokenizer.rs`: `HIPFIRE_NORMALIZE_PROMPT`, `HIPFIRE_PROMPT_TOKEN_HEAT`, `HIPFIRE_PROMPT_HEAT_JSON`, `HIPFIRE_PROMPT_HEAT_LIMIT`
   - `dflash.rs`: `HIPFIRE_DRAFT_F16`, `HIPFIRE_DRAFT_GEMM_DUMP`, `HIPFIRE_DRAFT_SUBPHASE`
-  - `llama.rs`: `HIPFIRE_PARO_SMALL_DIRECT`, `HIPFIRE_PARO_PREROTATE`, `HIPFIRE_PARO_FUSE_RMSNORM`, `HIPFIRE_PARO_SWIGLU_FUSED`, `HIPFIRE_FLASH_PARTIALS_BATCH`, `HIPFIRE_PREFILL_BATCHED`
   - `loop_guard.rs`: `HIPFIRE_NGRAM_LOOP_THRESHOLD`, `HIPFIRE_NGRAM_WINDOW`
   - `multi_gpu.rs`: `HIPFIRE_DEVICES`, `HIPFIRE_ALLOW_MIXED_ARCH`, `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB`
   - `arch.rs`: `HIPFIRE_LM_HEAD_F16`

@@ -74,6 +74,19 @@ def new_record(cell, depths, steps, committed, window_ms=None, window_src=None,
     return rec
 
 
+def with_throughput(rec, summary):
+    """Attach a driver cell `summary` (TTFT and steady decode, reported separately)."""
+    if not summary:
+        return rec
+    tt = (summary.get("ttft_ms") or {}).get("p50")
+    if tt is not None:
+        rec["ttft_ms_p50"] = tt
+    for key in ("steady_tok_s", "reported_tok_s"):
+        if summary.get(key) is not None:
+            rec[key] = summary[key]
+    return rec
+
+
 def depth_row(depth, offered, reached, accepted):
     return {"depth": depth, "offered": offered, "reached": reached, "accepted": accepted}
 
@@ -120,13 +133,17 @@ def pool(recs):
             acc[1] += row["reached"]
             acc[2] += row["accepted"]
     wms = [r["window_ms"] for r in recs if r.get("window_ms") is not None]
-    return {
+    out = {
         "depths": [depth_row(d, *v) for d, v in sorted(depths.items())],
         "steps": sum(r["steps"] for r in recs),
         "committed": sum(r["committed"] for r in recs),
         "window_ms": sum(wms) / len(wms) if wms else None,
         "reps": len(recs),
     }
+    for key in ("steady_tok_s", "reported_tok_s", "ttft_ms_p50"):
+        vals = [r[key] for r in recs if r.get(key) is not None]
+        out[key] = sum(vals) / len(vals) if vals else None
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -210,6 +227,74 @@ def from_radiance(path, cell=None):
                              "offered_note": "Radiance exports reached/accepted only; offered := reached"})
 
 
+def diff_positions(before, after):
+    """`/stats` `draft_positions` (cumulative) -> per-depth deltas between two snapshots."""
+    def by_depth(s):
+        return {p["depth"]: p for p in (s or {}).get("draft_positions") or []}
+    b, a = by_depth(before), by_depth(after)
+    rows = []
+    for depth in sorted(a):
+        p0 = b.get(depth, {})
+        rows.append(depth_row(depth, a[depth]["offered"] - p0.get("offered", 0),
+                              a[depth]["reached"] - p0.get("reached", 0),
+                              a[depth]["accepted"] - p0.get("accepted", 0)))
+    return rows
+
+
+def from_driver_obj(d, trace_reqs=None, max_depth=3, build="", engine=""):
+    """One `mtp-parity-drive.py` cell file -> cell record.
+
+    Lane serves: per-position counts are the `/stats` `draft_positions` delta over
+    the cell, steps = delta `spec_cycles`, committed = delta `spec_committed_tokens`.
+    Singleton serves (no `draft_positions`): the `HIPFIRE_MTP_TRACE` requests
+    `[request_index_start : +requests]` (`trace_reqs` = parse_trace(...)).
+    window_ms = sum(latency - ttft) / sum(cycles) over the requests (decode wall per
+    verify window; lanes step together, so this is the engine step)."""
+    flat = [r for s in d["streams"] for r in s]
+    failed = [r["error"] for r in flat if r["error"]]
+    if failed:
+        raise ValueError(f"{d['cell']}: {len(failed)} failed request(s): {failed[0]}")
+    before, after = d.get("stats_before") or {}, d.get("stats_after") or {}
+    decode_ms = cycles_timed = client_ms = 0.0
+    for r in flat:
+        t = r.get("timings") or {}
+        if t.get("cycles") and t.get("latency_ms") is not None and t.get("ttft_ms") is not None:
+            decode_ms += t["latency_ms"] - t["ttft_ms"]
+            cycles_timed += t["cycles"]
+        if r.get("ttft_ms_client") is not None and r.get("wall_ms") is not None:
+            client_ms += r["wall_ms"] - r["ttft_ms_client"]  # the client's own first-token to end wall
+    extra = {"requests": len(flat), "concurrency": d["concurrency"]}
+    if after.get("draft_positions"):
+        depths = [r for r in diff_positions(before, after) if r["depth"] <= max_depth]
+        steps = after.get("spec_cycles", 0) - before.get("spec_cycles", 0)
+        committed = after.get("spec_committed_tokens", 0) - before.get("spec_committed_tokens", 0)
+        extra["source"] = "/stats draft_positions delta"
+        wms = decode_ms / cycles_timed if cycles_timed else None
+        wsrc = "per-request (latency-ttft)/cycles"
+    elif trace_reqs is not None:
+        s = d["request_index_start"]
+        reqs = trace_reqs[s:s + d["requests"]]
+        if len(reqs) != d["requests"]:
+            raise ValueError(f"{d['cell']}: trace has {len(reqs)} of {d['requests']} requests from index {s}")
+        windows = [w for r in reqs for w in r["windows"]]
+        off, rea, acc, steps, committed = trace_to_counts(windows, max_depth)
+        depths = [depth_row(i + 1, off[i], rea[i], acc[i]) for i in range(max_depth)]
+        extra["source"] = "HIPFIRE_MTP_TRACE"
+        extra["windows_by_source"] = {src: sum(1 for w in windows if w.get("source") == src)
+                                      for src in {w.get("source") for w in windows}}
+        if steps and cycles_timed:
+            wms, wsrc = decode_ms / steps, "server (latency-ttft) / trace windows"
+        elif steps and client_ms:
+            wms, wsrc = client_ms / steps, "client (wall-first token) / trace windows"
+        else:
+            wms, wsrc = None, None
+    else:
+        raise ValueError(f"{d['cell']}: no draft_positions in /stats and no --trace given")
+    rec = new_record(d["cell"], depths, steps, committed, window_ms=wms, window_src=wsrc if wms else None,
+                     engine=engine, build=build, rep=d.get("rep", 0), extra=extra)
+    return with_throughput(rec, d.get("summary"))
+
+
 # --------------------------------------------------------------------------
 # thresholds (pre-registered rule) and register
 # --------------------------------------------------------------------------
@@ -259,6 +344,13 @@ def derive_baseline(recs, rule):
         "reps": len(recs), "steps": p["steps"],
         "build": recs[0].get("build", ""), "engine": recs[0].get("engine", ""),
     }
+    # Throughput metrics: registered only when every rep carries them, so a cell registered
+    # from trace-only records keeps its older, narrower contract.
+    for key in ("steady_tok_s", "ttft_ms_p50"):
+        vals = [r[key] for r in recs if r.get(key) is not None]
+        if len(vals) == len(recs):
+            out[key] = sum(vals) / len(vals)
+            out[key + "_cv_rep"] = cv(vals)
     return out
 
 
@@ -294,6 +386,30 @@ def compare_cell(base, newp, rule):
     rows.append(("yield", yb, yn, ytol, "FAIL" if ybad else "ok"))
     if ybad:
         verdict = "FAIL"
+    # Throughput (only for baselines registered with it): steady decode must not fall, TTFT must
+    # not rise, beyond the pre-registered floors or three times the cell's own spread.
+    if base.get("steady_tok_s") is not None:
+        if newp.get("steady_tok_s") is None:
+            rows.append(("steady_tok_s", base["steady_tok_s"], None, None, "INSUFFICIENT (no steady_tok_s in record)"))
+            if verdict == "PASS":
+                verdict = "INSUFFICIENT"
+        else:
+            stol = max(rule.get("steady_floor_rel", 0.05), rule["z"] * (base.get("steady_tok_s_cv_rep") or 0.0)) * base["steady_tok_s"]
+            sbad = newp["steady_tok_s"] < base["steady_tok_s"] - stol
+            rows.append(("steady_tok_s", base["steady_tok_s"], newp["steady_tok_s"], stol, "FAIL" if sbad else "ok"))
+            if sbad:
+                verdict = "FAIL"
+    if base.get("ttft_ms_p50") is not None:
+        if newp.get("ttft_ms_p50") is None:
+            rows.append(("ttft_p50", base["ttft_ms_p50"], None, None, "INSUFFICIENT (no ttft in record)"))
+            if verdict == "PASS":
+                verdict = "INSUFFICIENT"
+        else:
+            ttol = max(rule.get("ttft_floor_rel", 0.10), rule["z"] * (base.get("ttft_ms_p50_cv_rep") or 0.0)) * base["ttft_ms_p50"]
+            tbad = newp["ttft_ms_p50"] > base["ttft_ms_p50"] + ttol
+            rows.append(("ttft_p50", base["ttft_ms_p50"], newp["ttft_ms_p50"], ttol, "FAIL" if tbad else "ok"))
+            if tbad:
+                verdict = "FAIL"
     if base.get("window_ms") is not None:
         if newp.get("window_ms") is None:
             rows.append(("window_ms", base["window_ms"], None, None, "INSUFFICIENT (no window_ms in record)"))
@@ -396,6 +512,9 @@ def cmd_check(args):
             print(f"[{cell}] not in fixture")
             worst = max(worst, EXIT_USAGE)
             continue
+        if entry.get("baseline") is None and not entry.get("gate", True):
+            print(f"[{cell}] not gated, no baseline ({entry.get('pending', 'pending')})")
+            continue
         if entry.get("baseline") is None:
             print(f"[{cell}] UNREGISTERED (no baseline; run a registration campaign)")
             if not args.allow_unregistered:
@@ -436,6 +555,10 @@ def lowers(old, new):
         if nd is None or nd["rate"] < od["rate"]:
             return True
     if new["yield"] < old["yield"]:
+        return True
+    if old.get("steady_tok_s") is not None and (new.get("steady_tok_s") is None or new["steady_tok_s"] < old["steady_tok_s"]):
+        return True
+    if old.get("ttft_ms_p50") is not None and (new.get("ttft_ms_p50") is None or new["ttft_ms_p50"] > old["ttft_ms_p50"]):
         return True
     if old.get("window_ms") is not None and (new.get("window_ms") is None or new["window_ms"] > old["window_ms"]):
         return True
@@ -626,6 +749,67 @@ def self_test():
         assert not check_fixture(fx, t)
         (t / "p.txt").write_bytes(b"hellO")
         assert check_fixture(fx, t)
+    # throughput metrics: registered only when every rep has them; steady falls / TTFT rises fail
+    def tp(rep_i, steady=100.0, ttft=200.0, wms=40.0):
+        return with_throughput(rec(rep_i, wms=wms), {"steady_tok_s": steady, "ttft_ms": {"p50": ttft},
+                                                      "reported_tok_s": steady * 0.8})
+    tps = [tp(i, steady=100.0 + i, ttft=200.0 + i) for i in range(3)]
+    tbase = derive_baseline(tps, rule)
+    assert abs(tbase["steady_tok_s"] - 101.0) < 1e-9 and "ttft_ms_p50_cv_rep" in tbase
+    assert "steady_tok_s" not in derive_baseline(reps, rule)  # trace-only records keep the narrow contract
+    v, _ = compare_cell(tbase, pool(tps), rule)
+    assert v == "PASS", v
+    slowtp = [tp(i, steady=80.0) for i in range(3)]
+    v, rows = compare_cell(tbase, pool(slowtp), rule)
+    assert v == "FAIL" and any(n == "steady_tok_s" and s == "FAIL" for n, _, _, _, s in rows), rows
+    laggy = [tp(i, ttft=300.0) for i in range(3)]
+    v, rows = compare_cell(tbase, pool(laggy), rule)
+    assert v == "FAIL" and any(n == "ttft_p50" and s == "FAIL" for n, _, _, _, s in rows), rows
+    v, _ = compare_cell(tbase, pool(reps), rule)  # records without throughput against a baseline that has it
+    assert v == "INSUFFICIENT", v
+    weaker_tp = copy.deepcopy(tbase)
+    weaker_tp["steady_tok_s"] -= 5.0
+    assert lowers(tbase, weaker_tp) and not lowers(tbase, tbase)
+    # from-driver: lane serve (stats delta) and singleton serve (trace slice)
+    req = lambda cyc: {"error": None, "timings": {"cycles": cyc, "latency_ms": 100.0, "ttft_ms": 20.0}}
+    before = {"draft_positions": [{"depth": 1, "offered": 10, "reached": 10, "accepted": 8, "rate": .8}],
+              "spec_cycles": 10, "spec_committed_tokens": 30}
+    after = {"draft_positions": [{"depth": 1, "offered": 30, "reached": 30, "accepted": 20, "rate": .67},
+                                 {"depth": 2, "offered": 14, "reached": 12, "accepted": 6, "rate": .5}],
+             "spec_cycles": 30, "spec_committed_tokens": 80}
+    d = {"cell": "story-C4-t1", "rep": 1, "concurrency": 4, "request_index_start": 0, "requests": 2,
+         "streams": [[req(10)], [req(10)]], "stats_before": before, "stats_after": after}
+    r = from_driver_obj(d)
+    assert not validate_record(r), validate_record(r)
+    assert [(x["offered"], x["reached"], x["accepted"]) for x in r["depths"]] == [(20, 20, 12), (14, 12, 6)]
+    assert (r["steps"], r["committed"]) == (20, 50) and abs(r["window_ms"] - 8.0) < 1e-9
+    wl = lambda rows, c: {"event": "window", "source": "mtp", "rows": [{"match": m} for m in rows], "committed": c}
+    reqs = [{"req": {}, "windows": [wl([True, False], [1, 2])]}, {"req": {}, "windows": [wl([True, True], [1, 2, 3])]},
+            {"req": {}, "windows": []}]
+    d2 = {"cell": "code-C1-t1", "rep": 0, "concurrency": 1, "request_index_start": 1, "requests": 2,
+          "streams": [[req(1), req(0)]], "stats_before": {}, "stats_after": {}}
+    r2 = from_driver_obj(d2, trace_reqs=reqs)
+    assert not validate_record(r2), validate_record(r2)
+    assert (r2["steps"], r2["committed"]) == (1, 3), (r2["steps"], r2["committed"])
+    assert [(x["offered"], x["reached"], x["accepted"]) for x in r2["depths"]] == [(1, 1, 1), (1, 1, 1), (0, 0, 0)]
+    assert abs(r2["window_ms"] - 80.0) < 1e-9
+    creq = {"error": None, "timings": None, "ttft_ms_client": 10.0, "wall_ms": 90.0}
+    d3 = {"cell": "code-C1-t1", "rep": 0, "concurrency": 1, "request_index_start": 1, "requests": 2,
+          "streams": [[creq, creq]], "stats_before": {}, "stats_after": {}}
+    r3 = from_driver_obj(d3, trace_reqs=reqs)
+    assert r3["window_ms"] is not None and abs(r3["window_ms"] - 160.0) < 1e-9 and "client" in r3["window_ms_source"], r3["window_ms"]
+    try:
+        from_driver_obj(d2)
+        raise AssertionError("no trace and no stats accepted")
+    except ValueError:
+        pass
+    bad = copy.deepcopy(d)
+    bad["streams"][0][0]["error"] = "boom"
+    try:
+        from_driver_obj(bad)
+        raise AssertionError("failed request accepted")
+    except ValueError:
+        pass
     print("check-mtp-parity-ratchet: self-test ok")
     return EXIT_OK
 
@@ -645,6 +829,12 @@ def main(argv=None):
     p = sub.add_parser("from-radiance")
     p.add_argument("file")
     p.add_argument("--cell")
+    p = sub.add_parser("from-driver")
+    p.add_argument("file")
+    p.add_argument("--trace", help="HIPFIRE_MTP_TRACE serve log (singleton serves)")
+    p.add_argument("--max-depth", type=int, default=3)
+    p.add_argument("--build", default="")
+    p.add_argument("--engine", default="")
     p = sub.add_parser("register")
     p.add_argument("records", nargs="+")
     p.add_argument("--dry-run", action="store_true")
@@ -675,6 +865,13 @@ def main(argv=None):
             return EXIT_OK
         if args.cmd == "from-radiance":
             print(json.dumps(from_radiance(args.file, args.cell), indent=1))
+            return EXIT_OK
+        if args.cmd == "from-driver":
+            tr = None
+            if args.trace:
+                with open(args.trace, errors="replace") as f:
+                    tr = parse_trace(f)
+            print(json.dumps(from_driver_obj(load_json(args.file), tr, args.max_depth, args.build, args.engine), indent=1))
             return EXIT_OK
         if args.cmd == "register":
             return cmd_register(args)

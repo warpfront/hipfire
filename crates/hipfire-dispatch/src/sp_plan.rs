@@ -253,9 +253,12 @@ fn eval_k(
     n_active: usize,
     slot_prefix: &[u64],
     cpu_suffix_us: &[f64],
+    stream_prefix: &[f64],
     cost: &SplitCost,
 ) -> Eval {
-    let s_ms = k as f64 * cost.stream_ms_per_expert;
+    // `stream_prefix[k]` = streamed-expert units of the first `k` of the order (`k` itself when
+    // every expert costs one unit), so the uniform case is bit-identical to `k * ms`.
+    let s_ms = stream_prefix[k] * cost.stream_ms_per_expert;
     let gpu =
         slot_prefix[k] as f64 * cost.gpu_moe_ms_per_slot + cost.gpu_moe_ms_per_expert * k as f64;
     if k == n_active {
@@ -285,6 +288,8 @@ struct Prepared {
     order: Vec<u16>,
     slot_prefix: Vec<u64>,
     cpu_suffix_us: Vec<f64>,
+    /// Streamed-expert units of `order[..i]` (`i` for a uniform layer).
+    stream_prefix: Vec<f64>,
 }
 
 impl Prepared {
@@ -300,12 +305,19 @@ impl Prepared {
     }
 }
 
-fn prepare(counts: &[u32]) -> Prepared {
+fn prepare(counts: &[u32], stream_scale: &[f64]) -> Prepared {
+    assert!(
+        stream_scale.is_empty() || stream_scale.len() == NUM_EXPERTS,
+        "stream_scale must be empty or have {NUM_EXPERTS} entries"
+    );
     let order = order_active(counts);
     let n = order.len();
     let mut slot_prefix = vec![0u64; n + 1];
+    let mut stream_prefix = vec![0.0f64; n + 1];
     for i in 0..n {
         slot_prefix[i + 1] = slot_prefix[i] + counts[order[i] as usize] as u64;
+        let unit = stream_scale.get(order[i] as usize).copied().unwrap_or(1.0);
+        stream_prefix[i + 1] = stream_prefix[i] + unit;
     }
     let mut cpu_suffix_us = vec![0.0f64; n + 1];
     for i in (0..n).rev() {
@@ -315,12 +327,20 @@ fn prepare(counts: &[u32]) -> Prepared {
         order,
         slot_prefix,
         cpu_suffix_us,
+        stream_prefix,
     }
 }
 
 fn finish(p: &Prepared, k: usize, cost: &SplitCost) -> SplitPlan {
     let n = p.order.len();
-    let e = eval_k(k, n, &p.slot_prefix, &p.cpu_suffix_us, cost);
+    let e = eval_k(
+        k,
+        n,
+        &p.slot_prefix,
+        &p.cpu_suffix_us,
+        &p.stream_prefix,
+        cost,
+    );
     let mut stream_ids: Vec<u16> = p.order[..k].to_vec();
     stream_ids.sort_unstable();
     let mut cpu_mask = [0u8; NUM_EXPERTS];
@@ -348,7 +368,21 @@ fn finish(p: &Prepared, k: usize, cost: &SplitCost) -> SplitPlan {
 /// # Panics
 /// If `counts.len() != 512`.
 pub fn plan_layer_split(counts: &[u32], cost: &SplitCost) -> SplitPlan {
-    let p = prepare(counts);
+    plan_layer_split_weighted(counts, cost, &[])
+}
+
+/// [`plan_layer_split`] where expert `e` costs `stream_scale[e]` streamed-expert units (its
+/// bytes over the reference expert's: a slab layer's W3 expert is 1.92 / 2.61 of an MQ4 one);
+/// an empty slice is the uniform model, bit for bit.
+///
+/// # Panics
+/// If `counts.len() != 512` or `stream_scale` is neither empty nor 512 long.
+pub fn plan_layer_split_weighted(
+    counts: &[u32],
+    cost: &SplitCost,
+    stream_scale: &[f64],
+) -> SplitPlan {
+    let p = prepare(counts, stream_scale);
     let n = p.order.len();
     let mut best_k = n;
     let mut best_t = f64::INFINITY;
@@ -356,7 +390,15 @@ pub fn plan_layer_split(counts: &[u32], cost: &SplitCost) -> SplitPlan {
         if !p.feasible(k, cost) {
             continue;
         }
-        let t = eval_k(k, n, &p.slot_prefix, &p.cpu_suffix_us, cost).predicted;
+        let t = eval_k(
+            k,
+            n,
+            &p.slot_prefix,
+            &p.cpu_suffix_us,
+            &p.stream_prefix,
+            cost,
+        )
+        .predicted;
         if t < best_t {
             best_t = t;
             best_k = k;
@@ -371,7 +413,7 @@ pub fn plan_layer_split(counts: &[u32], cost: &SplitCost) -> SplitPlan {
 /// # Panics
 /// If `counts.len() != 512`.
 pub fn plan_threshold(counts: &[u32], theta: u32, cost: &SplitCost) -> SplitPlan {
-    let p = prepare(counts);
+    let p = prepare(counts, &[]);
     let theta = theta.max(1);
     let k = p.order.partition_point(|&e| counts[e as usize] >= theta);
     finish(&p, k, cost)
@@ -725,5 +767,45 @@ mod tests {
                 assert!(p.cpu_slots <= cap);
             }
         }
+    }
+
+    /// An empty stream scale is the uniform model bit for bit, and a layer whose experts all
+    /// cost one unit equals it: the slab weighting never perturbs the aggregate plans.
+    #[test]
+    fn weighted_split_with_unit_scale_is_the_uniform_plan() {
+        let cost = SplitCost::sp_hook_xtx(1024, 2560, 16);
+        let uniform = plan_layer_split(&D32K_N1024_L24, &cost);
+        let empty = plan_layer_split_weighted(&D32K_N1024_L24, &cost, &[]);
+        let ones = plan_layer_split_weighted(&D32K_N1024_L24, &cost, &[1.0; NUM_EXPERTS]);
+        assert_eq!(uniform, empty);
+        assert_eq!(uniform, ones);
+    }
+
+    /// Cheaper streamed experts (a W3 expert is 0.735 of an MQ4 one) never raise the predicted
+    /// time (every `k` is no dearer), and the planner reads the scale of the experts it actually
+    /// streams (the order is by routed-token count, not by id).
+    #[test]
+    fn weighted_split_streams_cheaper_experts_for_less_link_time() {
+        let cost = SplitCost::sp_hook_xtx(1024, 2560, 16);
+        let uniform = plan_layer_split(&D32K_N1024_L24, &cost);
+        let w3 = 1_920_000.0 / 2_611_200.0;
+        // Every third expert is a cheap (W3) one.
+        let scale: Vec<f64> = (0..NUM_EXPERTS)
+            .map(|e| if e % 3 == 0 { 1.0 } else { w3 })
+            .collect();
+        let mixed = plan_layer_split_weighted(&D32K_N1024_L24, &cost, &scale);
+        assert!(mixed.predicted_ms <= uniform.predicted_ms + 1e-9);
+        // The streamed set's modelled stream time is the sum of its experts' scales.
+        let units: f64 = mixed.stream_ids.iter().map(|&e| scale[e as usize]).sum();
+        if mixed.n_cpu == 0 {
+            assert!((mixed.stream_ms - units * cost.stream_ms_per_expert).abs() < 1e-9);
+        } else {
+            assert!(mixed.stream_ms >= units * cost.stream_ms_per_expert - 1e-9);
+        }
+        // A wrong-length scale is refused (the planner asserts, like the counts).
+        let caught = std::panic::catch_unwind(|| {
+            plan_layer_split_weighted(&D32K_N1024_L24, &SplitCost::default(), &[1.0; 3])
+        });
+        assert!(caught.is_err());
     }
 }

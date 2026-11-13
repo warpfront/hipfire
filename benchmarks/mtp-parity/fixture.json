@@ -46,6 +46,15 @@
    "tier": "breadth",
    "md5": "44476c7d649b4ed4626f4fcca6342009",
    "bytes": 117
+  },
+  "w2mix": {
+   "path": "benchmarks/mtp-parity/prompts/w2_mix.json",
+   "class": "w2mix",
+   "tier": "breadth",
+   "kind": "mix",
+   "md5": "489f7aed91db07ad56d92e9289b1ff6b",
+   "bytes": 3464,
+   "note": "W2 mix: stream i sends entry i % 8 (different prompt per stream); the eight texts are byte-identical to the other engine's diverse.json entries"
   }
  },
  "request": {
@@ -306,6 +315,38 @@
    "cell": "multilingual-C8-greedy",
    "prompt": "multilingual",
    "class": "multilingual",
+   "tier": "breadth",
+   "concurrency": 8,
+   "mode": "greedy"
+  },
+  {
+   "cell": "w2mix-C4-t1",
+   "prompt": "w2mix",
+   "class": "w2mix",
+   "tier": "breadth",
+   "concurrency": 4,
+   "mode": "t1"
+  },
+  {
+   "cell": "w2mix-C4-greedy",
+   "prompt": "w2mix",
+   "class": "w2mix",
+   "tier": "breadth",
+   "concurrency": 4,
+   "mode": "greedy"
+  },
+  {
+   "cell": "w2mix-C8-t1",
+   "prompt": "w2mix",
+   "class": "w2mix",
+   "tier": "breadth",
+   "concurrency": 8,
+   "mode": "t1"
+  },
+  {
+   "cell": "w2mix-C8-greedy",
+   "prompt": "w2mix",
+   "class": "w2mix",
    "tier": "breadth",
    "concurrency": 8,
    "mode": "greedy"

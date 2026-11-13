@@ -143,6 +143,52 @@ __device__ __forceinline__ int fa2_swiz(int c)
     return 2 * r;
 }
 
+// gfx11 WMMA rounds a sum differently for +0 and -0 zero products, so a masked key's V sign
+// (P == +0 there, 0 x negative V == -0) would leak into a row's output. On a not-full key
+// subtile a row with no masked key in it takes the plain single WMMA (bit-identical to the
+// full-subtile path); a row with masked keys takes V split by sign (V- first, then V+), so
+// every masked product is a uniform zero. Chosen per row by absolute position, so a row's
+// bytes do not depend on which other rows share its tile.
+//
+// Register budget: the O accumulators (16 x 8 VGPRs) leave room for one 8-VGPR V fragment and
+// one 8-VGPR temporary per dc step, so the split path holds at most one fragment plus `one`:
+// the V fragment (`load_v`, the caller's LDS read) is re-read for the V- pass and again for the
+// V+ pass instead of keeping `vf`, `n` and `p` live together; V is constant for the whole PV
+// phase, and the memory clobbers keep the compiler from merging the re-reads. Every WMMA keeps
+// its operands (`one`: vf; V- pass: n over o; V+ pass: p over the V- result) and the order of
+// the V+ pass after the V- pass; only the issue order of `one` versus the V- pass and the
+// lifetimes of vf/n/p change.
+template <class LoadV>
+__device__ __forceinline__ float8_t fa2_pv_mma(LoadV&& load_v, half16_t prow, float8_t o,
+                                               bool full, bool rowfull)
+{
+    const float8_t one = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(load_v(), prow, o);
+    if (full)
+        return one;
+    union { unsigned short h[16]; half16_t v; } u;
+    asm volatile("" ::: "memory");
+    u.v = load_v();
+#pragma unroll
+    for (int e = 0; e < 16; ++e) {
+        const unsigned short b = u.h[e];
+        u.h[e] = (b >> 15) ? b : (unsigned short)0x8000u;
+    }
+    float8_t sp = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(u.v, prow, o);
+    asm volatile("" ::: "memory");
+    u.v = load_v();
+#pragma unroll
+    for (int e = 0; e < 16; ++e) {
+        const unsigned short b = u.h[e];
+        u.h[e] = (b >> 15) ? (unsigned short)0 : b;
+    }
+    sp = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(u.v, prow, sp);
+    float8_t r;
+#pragma unroll
+    for (int e = 0; e < 8; ++e)
+        r[e] = rowfull ? one[e] : sp[e];
+    return r;
+}
+
 #if FA2_FILL
 // ---- Warp-specialized fill (FA2_FILL) ----
 // Waves 0..5 compute, waves 6..7 own every K/V fill after tile 0. Per tile
@@ -487,20 +533,23 @@ __device__ __forceinline__ void fa2_fill_softmax_pv(
             const int rot = fa2_swiz(d & 15);
             const int vbase = d * 16;
             const int ps = sub * 8;
-            half16_t vf;
+            auto ldv = [&]() {
+                half16_t vf;
 #pragma unroll
-            for (int i = 0; i < 8; i += 2) {
-                const int off = vbase + ((ps + i + rot) & 15);
-                const int32x2_t pair = *(const int32x2_t*)(Vdw + off);
-                fa2_dw_t d0, d1;
-                d0.u = (uint32_t)pair[0];
-                d1.u = (uint32_t)pair[1];
-                vf[2 * i] = d0.h[0];
-                vf[2 * i + 1] = d0.h[1];
-                vf[2 * i + 2] = d1.h[0];
-                vf[2 * i + 3] = d1.h[1];
-            }
-            Ofr[dc] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(vf, prow, Ofr[dc]);
+                for (int i = 0; i < 8; i += 2) {
+                    const int off = vbase + ((ps + i + rot) & 15);
+                    const int32x2_t pair = *(const int32x2_t*)(Vdw + off);
+                    fa2_dw_t d0, d1;
+                    d0.u = (uint32_t)pair[0];
+                    d1.u = (uint32_t)pair[1];
+                    vf[2 * i] = d0.h[0];
+                    vf[2 * i + 1] = d0.h[1];
+                    vf[2 * i + 2] = d1.h[0];
+                    vf[2 * i + 3] = d1.h[1];
+                }
+                return vf;
+            };
+            Ofr[dc] = fa2_pv_mma(ldv, prow, Ofr[dc], full, (kt_sub + 15) <= pos_ml);
             // Bound V-load hoisting to this chunk.
             asm volatile("" ::: "memory");
         }
@@ -1286,25 +1335,27 @@ __device__ __forceinline__ void fa2_gqa_body(
                         const int rot = fa2_swiz(d & 15);
                         const int vbase = d * V_ROW;
                         const int ps = sub * 8;
-                        half16_t vf;
-                        // Four aligned b64 loads at i={0,2,4,6}. Within either
-                        // V-row parity the even residues cover all even b64
-                        // starts once; unpack order matches producer store order.
+                        auto ldv = [&]() {
+                            half16_t vf;
+                            // Four aligned b64 loads at i={0,2,4,6}. Within either
+                            // V-row parity the even residues cover all even b64
+                            // starts once; unpack order matches producer store order.
 #pragma unroll
-                        for (int i = 0; i < 8; i += 2) {
-                            const int off = vbase + ((ps + i + rot) & V_MASK);
-                            const int32x2_t pair =
-                                *(const int32x2_t*)(Vdw + off);
-                            fa2_dw_t d0, d1;
-                            d0.u = (uint32_t)pair[0];
-                            d1.u = (uint32_t)pair[1];
-                            vf[2 * i] = d0.h[0];
-                            vf[2 * i + 1] = d0.h[1];
-                            vf[2 * i + 2] = d1.h[0];
-                            vf[2 * i + 3] = d1.h[1];
-                        }
-                        Ofr[dc] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
-                            vf, prow, Ofr[dc]);
+                            for (int i = 0; i < 8; i += 2) {
+                                const int off = vbase + ((ps + i + rot) & V_MASK);
+                                const int32x2_t pair =
+                                    *(const int32x2_t*)(Vdw + off);
+                                fa2_dw_t d0, d1;
+                                d0.u = (uint32_t)pair[0];
+                                d1.u = (uint32_t)pair[1];
+                                vf[2 * i] = d0.h[0];
+                                vf[2 * i + 1] = d0.h[1];
+                                vf[2 * i + 2] = d1.h[0];
+                                vf[2 * i + 3] = d1.h[1];
+                            }
+                            return vf;
+                        };
+                        Ofr[dc] = fa2_pv_mma(ldv, prow, Ofr[dc], full, (kt_sub + 15) <= pos_ml);
                         // Bound V-load hoisting to this chunk.
                         asm volatile("" ::: "memory");
                     }
@@ -1442,25 +1493,27 @@ __device__ __forceinline__ void fa2_gqa_body(
                     const int rot = fa2_swiz(d & 15);
                     const int vbase = d * V_ROW;
                     const int ps = sub * 8;
-                    half16_t vf;
-                    // Four aligned b64 loads at i={0,2,4,6}. Within either
-                    // V-row parity the even residues cover all even b64
-                    // starts once; unpack order matches producer store order.
+                    auto ldv = [&]() {
+                        half16_t vf;
+                        // Four aligned b64 loads at i={0,2,4,6}. Within either
+                        // V-row parity the even residues cover all even b64
+                        // starts once; unpack order matches producer store order.
 #pragma unroll
-                    for (int i = 0; i < 8; i += 2) {
-                        const int off = vbase + ((ps + i + rot) & V_MASK);
-                        const int32x2_t pair =
-                            *(const int32x2_t*)(Vdw + off);
-                        fa2_dw_t d0, d1;
-                        d0.u = (uint32_t)pair[0];
-                        d1.u = (uint32_t)pair[1];
-                        vf[2 * i] = d0.h[0];
-                        vf[2 * i + 1] = d0.h[1];
-                        vf[2 * i + 2] = d1.h[0];
-                        vf[2 * i + 3] = d1.h[1];
-                    }
-                    Ofr[dc] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
-                        vf, prow, Ofr[dc]);
+                        for (int i = 0; i < 8; i += 2) {
+                            const int off = vbase + ((ps + i + rot) & V_MASK);
+                            const int32x2_t pair =
+                                *(const int32x2_t*)(Vdw + off);
+                            fa2_dw_t d0, d1;
+                            d0.u = (uint32_t)pair[0];
+                            d1.u = (uint32_t)pair[1];
+                            vf[2 * i] = d0.h[0];
+                            vf[2 * i + 1] = d0.h[1];
+                            vf[2 * i + 2] = d1.h[0];
+                            vf[2 * i + 3] = d1.h[1];
+                        }
+                        return vf;
+                    };
+                    Ofr[dc] = fa2_pv_mma(ldv, prow, Ofr[dc], full, (kt_sub + 15) <= pos_ml);
                     // Bound V-load hoisting to this chunk.
                     asm volatile("" ::: "memory");
                 }
@@ -1644,7 +1697,16 @@ extern "C" __global__ __launch_bounds__(128, 1) void HIPFIRE_FA2_Q_PRECONVERT_SY
 #else
 #define HIPFIRE_FA2_BODY_SYM attention_q8_0_fa2_gqa_gfx11
 #endif
-extern "C" __global__ __launch_bounds__(HIPFIRE_FA2_Q16 ? 256 : 128, 1) void HIPFIRE_FA2_BODY_SYM(
+// gfx1100 (R3) body: at least 8 waves per SIMD (two resident workgroups per CU, <= 192 VGPRs). The
+// not-full-subtile PV split (fa2_pv_mma) would otherwise let the scheduler settle at 229 VGPRs
+// (6 waves, -29% attention at long prefill); with the cap the body compiles to <= 192 VGPRs and
+// no scratch (checked offline). Other builds keep the unconstrained bound.
+#if FA2_R3
+#define HIPFIRE_FA2_BODY_MIN_WAVES 8
+#else
+#define HIPFIRE_FA2_BODY_MIN_WAVES 1
+#endif
+extern "C" __global__ __launch_bounds__(HIPFIRE_FA2_Q16 ? 256 : 128, HIPFIRE_FA2_BODY_MIN_WAVES) void HIPFIRE_FA2_BODY_SYM(
     const _Float16* __restrict__ q16,
     const unsigned char* __restrict__ k_cache,
     const unsigned char* __restrict__ v_cache,

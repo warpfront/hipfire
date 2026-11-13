@@ -13,3 +13,11 @@ rayon.workspace = true
 # Oracle for the f16 widening in `quant` (the canonical decoder uses this crate).
 half.workspace = true
 proptest.workspace = true
+
+[features]
+# Builds the `w3_bench` CPU microbench (kept out of the default build).
+w3-bench = []
+
+[[example]]
+name = "w3_bench"
+required-features = ["w3-bench"]

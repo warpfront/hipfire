@@ -156,7 +156,6 @@ def base_env(gpu, v_mode):
         "HIPFIRE_GRAPH": "1",
         "HIPFIRE_AR_GRAPH": "1",
         "HIPFIRE_AR_GRAPH_TRACE": "1",
-        "HIPFIRE_CASK_OFF": "1",
         "HIPFIRE_DFLASH_DRAFT": "",
         "HIPFIRE_KV_ADAPTIVE": "off",
     })

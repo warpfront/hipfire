@@ -18,7 +18,7 @@
 //! the qwen35 hybrid path was self-contained. The LLaMA-family forward
 //! pass in `crates/hipfire-runtime/src/llama.rs` is a different shape:
 //! it hosts the **shared transformer infrastructure** that the qwen35
-//! arch (and its `pflash.rs` "Plain LLaMA-family drafter" branch) reach
+//! arch reaches
 //! into directly — `KvCache`, `WeightTensor`, `EmbeddingFormat`, the
 //! GEMV dispatch helpers (`weight_gemv`, `weight_gemv_prerotated`,
 //! `weight_gemv_residual`, `weight_gemv_swiglu_residual`,
@@ -45,7 +45,7 @@
 //! `prefill_forward`, `forward_early_exit`, `forward_sample`,
 //! `forward_logits_gpu`, `is_batchable_la`, `upload_prefill_batch_inputs`,
 //! `LlamaConfig::from_gguf`, the GGUF-only `load_weights`) can be
-//! physically moved here without breaking arch-qwen35's pflash branch.
+//! physically moved here.
 
 pub mod arch;
 pub mod arch_model;

@@ -162,6 +162,23 @@ __global__ void HIPFIRE_GDN_KERNEL(
     ,
     int qk_head_ratio
 #endif
+#if defined(HIPFIRE_GDN_STREAM)
+    // Stream module (`gated_delta_net_q8_fast_stream`, rdna-compute `norm.rs`
+    // `gdn_stream_*`): explicit FP32 continuation. `h0`/`ht` are
+    // [n_heads][HD][HD] FP32 accumulators (one lane) and may be the same plane:
+    // each element is read and written by the same lane, all reads before the
+    // first write. `entry_mode` 0/1/2 = Q8 / Q8+EF / FP32 `h0`; `exit_mode`
+    // bits 0-1: 0 = quantize (Q8 + scales, with bit 2 the F16 EF, else the
+    // frame-keyed stochastic Q8), 1 = keep FP32 in `ht` unquantized. `frame`
+    // keys the stochastic rounding and is supplied by the caller as an absolute
+    // position, never a process-global call counter. `n_tokens == 0` is a pure
+    // state conversion (open: Q8 -> FP32, seal: FP32 -> Q8).
+    ,
+    const float* h0,
+    float* ht,
+    int entry_mode,
+    int exit_mode
+#endif
 ) {
     const int h = blockIdx.x;
     const int tile = blockIdx.y;
@@ -209,15 +226,58 @@ __global__ void HIPFIRE_GDN_KERNEL(
 #define HIPFIRE_GDN_SCALES_IN s_scales
 #define HIPFIRE_GDN_SQ_IN sq_base
 #endif
+#if defined(HIPFIRE_GDN_STATE_SRC)
+    const __half* ef_src = s_ef_in;
+#else
+    const __half* ef_src = s_ef_residual;
+#endif
+#if defined(HIPFIRE_GDN_STREAM)
+    // Stream entry (`entry_mode`): 0 = Q8 plane + scales (no residual),
+    // 1 = Q8 + F16 EF, 2 = the FP32 accumulator `h0` taken unchanged.
+    for (int r = 0; r < TILE_ROWS; r++) {
+        float4 initial;
+        if (entry_mode == 2) {
+            const float* src = h0 + state_lane_base + h * HD * HD + (row_start + r) * HD;
+            initial = make_float4(src[tid], src[tid + 32], src[tid + 64], src[tid + 96]);
+        } else {
+            const float scale = HIPFIRE_GDN_SCALES_IN[lane * n_heads * HD + h * HD + row_start + r];
+            const signed char* src = HIPFIRE_GDN_SQ_IN + r * HD;
+            initial = make_float4(
+                scale * (float)src[tid],
+                scale * (float)src[tid + 32],
+                scale * (float)src[tid + 64],
+                scale * (float)src[tid + 96]);
+            if (entry_mode == 1) {
+                const __half* residual = ef_src + state_lane_base + h * HD * HD + (row_start + r) * HD;
+                initial.x += __half2float(residual[tid]);
+                initial.y += __half2float(residual[tid + 32]);
+                initial.z += __half2float(residual[tid + 64]);
+                initial.w += __half2float(residual[tid + 96]);
+            }
+        }
+        S_f4[HIPFIRE_GDN_S_INDEX(r, tid)] = initial;
+    }
+#else
     for (int r = 0; r < TILE_ROWS; r++) {
         const float scale = HIPFIRE_GDN_SCALES_IN[lane * n_heads * HD + h * HD + row_start + r];
         const signed char* src = HIPFIRE_GDN_SQ_IN + r * HD;
-        S_f4[HIPFIRE_GDN_S_INDEX(r, tid)] = make_float4(
+        float4 initial = make_float4(
             scale * (float)src[tid],
             scale * (float)src[tid + 32],
             scale * (float)src[tid + 64],
             scale * (float)src[tid + 96]);
+        // Effective incoming state is Q*scale + F16 EF residual; reconstruct it
+        // before the recurrence so decay/delta updates apply to the residual too.
+        if (s_ef_residual != nullptr) {
+            const __half* residual = ef_src + state_lane_base + h * HD * HD + (row_start + r) * HD;
+            initial.x += __half2float(residual[tid]);
+            initial.y += __half2float(residual[tid + 32]);
+            initial.z += __half2float(residual[tid + 64]);
+            initial.w += __half2float(residual[tid + 96]);
+        }
+        S_f4[HIPFIRE_GDN_S_INDEX(r, tid)] = initial;
     }
+#endif
 
 
 #if defined(HIPFIRE_GDN_PREFETCH) && (HIPFIRE_GDN_WAVES_PER_BLOCK == 1)
@@ -503,25 +563,29 @@ __global__ void HIPFIRE_GDN_KERNEL(
 
     // Requant FP32 → Q8 — OUTSIDE the token loop.
     // Only the final state is quantized (intermediate tokens stay FP32 in LDS).
+#if defined(HIPFIRE_GDN_STREAM)
+    if ((exit_mode & 3) == 1) {
+        // FP32 continuation: the accumulator leaves unquantized.
+        for (int r = 0; r < TILE_ROWS; r++) {
+            const float4 s = S_f4[HIPFIRE_GDN_S_INDEX(r, tid)];
+            float* dst = ht + state_lane_base + h * HD * HD + (row_start + r) * HD;
+            dst[tid] = s.x;
+            dst[tid + 32] = s.y;
+            dst[tid + 64] = s.z;
+            dst[tid + 96] = s.w;
+        }
+        return;
+    }
+    const bool use_ef = (exit_mode & 4) != 0;
+#else
     const bool use_ef = (s_ef_residual != nullptr);
+#endif
     for (int r = 0; r < TILE_ROWS; r++) {
         int rr = row_start + r;
         float4 s = S_f4[HIPFIRE_GDN_S_INDEX(r, tid)];
         float s0 = s.x, s1 = s.y, s2 = s.z, s3 = s.w;
 
         __half* efr = use_ef ? (s_ef_residual + state_lane_base + h * HD * HD + rr * HD) : nullptr;
-#if defined(HIPFIRE_GDN_STATE_SRC)
-        const __half* efr_in = use_ef ? (s_ef_in + state_lane_base + h * HD * HD + rr * HD) : nullptr;
-#define HIPFIRE_GDN_EFR_IN efr_in
-#else
-#define HIPFIRE_GDN_EFR_IN efr
-#endif
-        if (use_ef) {
-            s0 += __half2float(HIPFIRE_GDN_EFR_IN[tid]);
-            s1 += __half2float(HIPFIRE_GDN_EFR_IN[tid+32]);
-            s2 += __half2float(HIPFIRE_GDN_EFR_IN[tid+64]);
-            s3 += __half2float(HIPFIRE_GDN_EFR_IN[tid+96]);
-        }
 
         float my_max = fmaxf(fmaxf(fabsf(s0), fabsf(s1)), fmaxf(fabsf(s2), fabsf(s3)));
         for (int o = 16; o > 0; o >>= 1)
@@ -571,10 +635,9 @@ __global__ void HIPFIRE_GDN_KERNEL(
 #undef HIPFIRE_GDN_S_INDEX
 #undef HIPFIRE_GDN_SCALES_IN
 #undef HIPFIRE_GDN_SQ_IN
-#undef HIPFIRE_GDN_EFR_IN
 }
 
-#if !defined(HIPFIRE_GDN_LAYER_TABLE)
+#if !defined(HIPFIRE_GDN_LAYER_TABLE) && !defined(HIPFIRE_GDN_STREAM)
 // Masked independent sibling for the fast (single-end requant) path.
 // Derives lane from blockIdx.z and returns before any read/write for inactive
 // lanes. Full-mask callers use the unmasked fast kernel for exact parity.
@@ -630,11 +693,21 @@ __global__ void gated_delta_net_q8_fast_independent_masked(
     for (int r = 0; r < TILE_ROWS; r++) {
         const float scale = s_scales[lane * n_heads * HD + h * HD + row_start + r];
         const signed char* src = sq_base + r * HD;
-        S_f4[HIPFIRE_GDN_S_INDEX_M(r, tid)] = make_float4(
+        float4 initial = make_float4(
             scale * (float)src[tid],
             scale * (float)src[tid + 32],
             scale * (float)src[tid + 64],
             scale * (float)src[tid + 96]);
+        // Effective incoming state is Q*scale + F16 EF residual; reconstruct it
+        // before the recurrence so decay/delta updates apply to the residual too.
+        if (s_ef_residual != nullptr) {
+            const __half* residual = s_ef_residual + state_lane_base + h * HD * HD + (row_start + r) * HD;
+            initial.x += __half2float(residual[tid]);
+            initial.y += __half2float(residual[tid + 32]);
+            initial.z += __half2float(residual[tid + 64]);
+            initial.w += __half2float(residual[tid + 96]);
+        }
+        S_f4[HIPFIRE_GDN_S_INDEX_M(r, tid)] = initial;
     }
 
     for (int t = 0; t < n_tokens; t++) {
@@ -757,12 +830,6 @@ __global__ void gated_delta_net_q8_fast_independent_masked(
         float s0 = s.x, s1 = s.y, s2 = s.z, s3 = s.w;
 
         __half* efr = use_ef ? (s_ef_residual + state_lane_base + h * HD * HD + rr * HD) : nullptr;
-        if (use_ef) {
-            s0 += __half2float(efr[tid]);
-            s1 += __half2float(efr[tid+32]);
-            s2 += __half2float(efr[tid+64]);
-            s3 += __half2float(efr[tid+96]);
-        }
 
         float my_max = fmaxf(fmaxf(fabsf(s0), fabsf(s1)), fmaxf(fabsf(s2), fabsf(s3)));
         for (int o = 16; o > 0; o >>= 1)

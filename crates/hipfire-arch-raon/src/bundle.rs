@@ -18,6 +18,9 @@ use crate::forward::{
     forward_rows, forward_token, require_whole_band, stage_decode_token,
     stage_decode_token_on_stream, BandInput, RaonWork,
 };
+use crate::railgun_decode::{
+    RaonRailgunAttempt, RaonRailgunOwner, RaonRailgunRefusal, RaonRailgunStats,
+};
 use crate::session::session_stride;
 use crate::spec_impl::RaonSpecState;
 use crate::state::{RaonPrefillScratch, RaonState};
@@ -72,10 +75,10 @@ impl DecodeMode {
 /// Decode graph bookkeeping of one bundle. The recorded graph itself lives in
 /// `gpu.graphs` (the generic AR graph slot) keyed by `binding`.
 #[derive(Default)]
-struct DecodeGraph {
+pub(crate) struct DecodeGraph {
     /// One real eager decode step ran, so every kernel module the decode body
     /// launches is loaded before any capture (a capture cannot load modules).
-    warmed: bool,
+    pub(crate) warmed: bool,
     /// Binding the graph in `gpu.graphs` was recorded with; 0 = none.
     binding: u64,
     captures: u64,
@@ -146,7 +149,7 @@ pub struct RaonBundle {
     pub eos: Vec<u32>,
     prefill_mode: PrefillMode,
     decode_mode: DecodeMode,
-    graph: DecodeGraph,
+    pub(crate) graph: DecodeGraph,
     /// Prefill precision policy resolved at load ([`crate::precision`]): the request and the
     /// effective tier of every site.
     precision: RaonPrecisionPlan,
@@ -159,6 +162,11 @@ pub struct RaonBundle {
     /// Prefill snapshot cache shared by every session; `None` = off. Taken out
     /// of the bundle while it drives the bundle as its `SessionState`.
     pub(crate) session: Option<SessionDriver>,
+    /// The railgun decode owner, per the tri-state `HIPFIRE_RAON_RAILGUN`
+    /// (`auto` default: `Some` only with an admissible context and a receipt
+    /// corpus; `1` forces it; `0` never). `None` keeps the decode route
+    /// byte-identical and allocation-free.
+    pub(crate) railgun: Option<Box<RaonRailgunOwner>>,
 }
 
 impl RaonBundle {
@@ -213,7 +221,7 @@ impl RaonBundle {
                     Err(e) => eprintln!("raon1_mini: mirror budget refit failed ({e}); keeping the admission estimate"),
                 }
                 let eos = config.eos_token_ids.clone();
-                Ok(Self {
+                let mut bundle = Self {
                     config,
                     weights,
                     state,
@@ -227,7 +235,10 @@ impl RaonBundle {
                     spec: RaonSpecState::default(),
                     gpu_arch: arch,
                     session: None,
-                })
+                    railgun: None,
+                };
+                bundle.railgun = RaonRailgunOwner::from_config(&bundle, gpu);
+                Ok(bundle)
             }
             Err(e) => {
                 if let Err(fe) = scratch.free_gpu(gpu) {
@@ -458,9 +469,10 @@ impl RaonBundle {
         let chunk = self.prefill_step_rows();
         let n_chunks = tokens.len().div_ceil(chunk);
         for (ci, piece) in tokens.chunks(chunk).enumerate() {
+            drain_decode_stream(gpu)?;
             self.forward_chunk(gpu, piece, ci + 1 == n_chunks)?;
         }
-        Ok(())
+        drain_decode_stream(gpu)
     }
 
     /// Attach the session cache: [`session_prefill`](Self::session_prefill)
@@ -547,6 +559,10 @@ impl RaonBundle {
     ///
     /// The driver runs without live continuation, so every resume point is a
     /// position of the cold chunk grid and the result equals a cold prefill's.
+    ///
+    /// Returns with the decode stream drained (see [`drain_decode_stream`]), so
+    /// the caller's logits readback, whichever stream it uses, has nothing in
+    /// flight to wait on.
     pub fn session_prefill(
         &mut self,
         gpu: &mut Gpu,
@@ -598,6 +614,7 @@ impl RaonBundle {
             let stop = boundary.unwrap_or(len).min(len);
             for piece in prompt[pos..stop].chunks(step) {
                 pos += piece.len();
+                drain_decode_stream(gpu)?;
                 self.forward_chunk(gpu, piece, pos == len)?;
                 hipfire_runtime::prefill_progress::report(pos, len);
             }
@@ -608,7 +625,7 @@ impl RaonBundle {
                 .unwrap_or(Ok(()))?;
             }
         }
-        Ok(())
+        drain_decode_stream(gpu)
     }
 
     /// One decode step: consume `token`, leave its logits in
@@ -642,6 +659,11 @@ impl RaonBundle {
     }
 
     fn decode_step_in(&mut self, gpu: &mut Gpu, token: Option<u32>) -> Result<(), String> {
+        if let Some(why) = self.railgun.as_ref().and_then(|o| o.quarantine_reason()) {
+            return Err(format!(
+                "raon1_mini: the railgun decode owner is quarantined (unknown quiescence): {why}"
+            ));
+        }
         let pos = self.state.n_tokens();
         if pos + 1 > self.state.max_seq() {
             return Err(format!(
@@ -678,8 +700,70 @@ impl RaonBundle {
                     self.weights.band.is_last(),
                 )
             }
-            (DecodeMode::Graph, token) => self.decode_step_graph(gpu, token, pos),
+            (DecodeMode::Graph, token) => {
+                if let (Some(token), true) = (token, self.railgun.is_some()) {
+                    // A refusal runs the HIP graph step below exactly once; the
+                    // owner never retries a submitted token through it.
+                    if self.railgun_step(gpu, token)? {
+                        return Ok(());
+                    }
+                }
+                self.decode_step_graph(gpu, token, pos)
+            }
         }
+    }
+
+    /// One decode step through the railgun program (see
+    /// [`crate::railgun_decode`]). `Declined` promises that no token, position
+    /// or RDA state was consumed or mutated (context admission excepted): the
+    /// caller then runs the HIP-graph step exactly once. `Err` is fatal to the
+    /// request. [`RaonRailgunRefusal::Disabled`] when the bundle has no owner.
+    pub fn railgun_decode_try(
+        &mut self,
+        gpu: &mut Gpu,
+        token: u32,
+    ) -> Result<RaonRailgunAttempt, String> {
+        let Some(mut owner) = self.railgun.take() else {
+            return Ok(RaonRailgunAttempt::Declined(RaonRailgunRefusal::Disabled));
+        };
+        let r = owner.attempt(self, gpu, token);
+        self.railgun = Some(owner);
+        r
+    }
+
+    /// [`Self::railgun_decode_try`] without building the refusal: `true` when
+    /// the program executed the step, `false` when it declined (the caller
+    /// runs the HIP-graph step once). Allocation-free for a repeated decline.
+    fn railgun_step(&mut self, gpu: &mut Gpu, token: u32) -> Result<bool, String> {
+        let Some(mut owner) = self.railgun.take() else {
+            return Ok(false);
+        };
+        let r = owner.try_step(self, gpu, token);
+        self.railgun = Some(owner);
+        r
+    }
+
+    /// `Some(true)` when `HIPFIRE_RAON_RAILGUN=1` forced the owner, `Some(false)`
+    /// under `auto`, `None` when the bundle has no owner (`0`, or `auto` found no
+    /// admissible context and corpus).
+    pub fn railgun_forced(&self) -> Option<bool> {
+        self.railgun.as_ref().map(|o| o.is_forced())
+    }
+
+    /// Where the owner's first-load receipt corpus build stands (`off`, `pending`,
+    /// `done:<dir>`, `refused:<reason>`); `None` when the bundle has no owner.
+    pub fn railgun_provision_status(&self) -> Option<String> {
+        self.railgun.as_ref().map(|o| o.provision_status())
+    }
+
+    /// Railgun owner counters; `None` when the bundle has no owner.
+    pub fn railgun_stats(&self) -> Option<RaonRailgunStats> {
+        self.railgun.as_ref().map(|o| o.stats())
+    }
+
+    /// The decode route as an enum (the owner admits only `Graph`).
+    pub(crate) fn decode_route(&self) -> DecodeMode {
+        self.decode_mode
     }
 
     /// Graph route of [`decode_step`](Self::decode_step).
@@ -976,7 +1060,19 @@ impl RaonBundle {
             spec,
             gpu_arch: _,
             session,
+            railgun,
         } = self;
+        if railgun.as_ref().is_some_and(|o| o.is_quarantined()) {
+            // The railgun queue may still be executing against these tensors:
+            // freeing them under unknown activity is never allowed, so they
+            // (and the owner's program and tables) are leaked.
+            eprintln!(
+                "raon1_mini: free_all: the railgun decode owner is quarantined; leaking the \
+                 bundle's device tensors instead of freeing them"
+            );
+            std::mem::forget((weights, state, scratch, work, graph, spec, session, railgun));
+            return;
+        }
         if let Some(mut session) = session {
             session.clear(gpu);
         }
@@ -994,4 +1090,32 @@ impl RaonBundle {
         }
         weights.free_gpu(gpu);
     }
+}
+
+/// Block the host until everything enqueued on the decode stream (the device's
+/// [`Gpu::active_stream`]) has executed; a no-op while there is none (every
+/// launch is then on the legacy stream and the blocking copies that follow
+/// order themselves).
+///
+/// [`RaonBundle::prefill`] and [`RaonBundle::session_prefill`] call it before
+/// every chunk and once more at the end. Each chunk's first host step is a
+/// stream-ordered token upload that the host waits for, and the request path
+/// ends in a blocking prompt-logits copy on the legacy null stream. Issued
+/// while earlier work is still running on the decode stream (the state reset
+/// before the first chunk, the previous chunk, the last chunk), either copy
+/// makes the runtime park a cross-queue dependency on its own queue until the
+/// decode queue finishes, and with HIP's default 4 hardware queues a fresh
+/// R9700 process whose queues cross runs the in-flight kernels 7% slower
+/// while that dependency is parked (pp4096 8,560 vs 9,180 tok/s;
+/// `GPU_MAX_HW_QUEUES=1` has no crossing and never shows it). The host waits
+/// for the same work either way, so draining first costs nothing and leaves
+/// the copy nothing to park on; no work moves to another queue.
+fn drain_decode_stream(gpu: &Gpu) -> Result<(), String> {
+    let Some(stream) = gpu.active_stream.as_ref() else {
+        return Ok(());
+    };
+    gpu.bind_thread()
+        .and_then(|()| gpu.hip.stream_synchronize(stream))
+        .and_then(|()| gpu.take_device_wait_error())
+        .map_err(|e| format!("raon1_mini: drain decode stream after prefill: {e:?}"))
 }

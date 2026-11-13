@@ -5,18 +5,18 @@
 //! (`read_only`/`write_only`/`read_write`); `RegPlan::add_range` (runtime names,
 //! kinds, widths and lifetimes, with the checked allocator's refusals intact);
 //! `Builder::release_store_sources`, `push`, `control`, `ds_crosslane`, `lds_slot`,
-//! `lds_relayout`, `ds_store`, `ds_load`, `loop_`, `barrier_signal`, `barrier_wait`
-//! and `barrier_with_scope`; runtime `VopdOp { op, dst, src0, src1 }` construction
+//! `lds_relayout`, `ds_store`, `ds_load`, `loop_`, `barrier_signal`, `barrier_wait`,
+//! `barrier_with_scope`, `label` and `wait_all` (`label`/`wait_all` on an untyped `Builder`
+//! only; a `wg.isa()` is refused); runtime `VopdOp { op, dst, src0, src1 }` construction
 //! for `Builder::vopd` (including `v`/`s`/`lit`/`inline` `src0` forms and pair
 //! validation); the runtime `Wmma::iu4`/`fp8` constructors; and the runtime
 //! `Wmma::swmmac(arch, Swmmac::<kind>, d, a, b, index, SwmmacMods { .. })`
 //! constructor (all eleven `Swmmac` kinds, with the accumulator read declared).
 //!
 //! Still unreachable: borrowed `Builder::program`
-//! and `Builder::ledger` inspection; untyped `Builder::label` (labels live on typed
-//! `Workgroup`/`Wave`, untyped loop heads are placed by `loop_`); the ledger-wide
-//! `Builder::wait_all` (explicit `wait(Counter, count)` is bound instead); the
-//! `Builder::barrier` shorthand (the explicit
+//! and `Builder::ledger` inspection; the Workgroup-scoped `wg.isa().label` /
+//! `wg.isa().wait_all` (a typed kernel uses the Workgroup's own `label` / `wait_all`);
+//! the `Builder::barrier` shorthand (the explicit
 //! `barrier_with_scope(..., lds_only)` binding covers it); the const-generic
 //! `Builder::vopd_ff` / `vopd_ff_shared_src1` witnesses (VGPR parity and bank
 //! witnesses have no native representation); `RegPlan::temp_v` (needs a Rust
@@ -175,7 +175,7 @@ fn add_range_preserves_checked_allocator_refusals() {
     for (declarations, expected) in [
         (
             r#"p.add_range("bad", "v", 0, 3, Live::Whole)?;"#,
-            "register width must be 1, 2, 4 or 8",
+            "register width must be 1, 2, 4 or 8 (16 for AGPRs)",
         ),
         (
             r#"p.add_range("bad", "s", 1, 2, Live::Whole)?;"#,
@@ -223,6 +223,51 @@ fn release_store_sources_emits_the_gfx12_guard_without_draining_stores_early() {
         Arch::Gfx1151,
         "depctr_vm_vsrc requires gfx12",
     );
+}
+
+#[test]
+fn builder_label_and_wait_all_place_a_label_and_drain_the_ledger() {
+    for (arch, wait) in [
+        (Arch::Gfx1151, "s_waitcnt lgkmcnt(0)"),
+        (Arch::Gfx1201, "s_wait_kmcnt 0x0"),
+    ] {
+        let emitted = compile(
+            &kernel(
+                r#"
+        b.push(Instruction::new("s_load_b32 s2, s[0:1], 0x0", vec![s(2)], vec![sr(0, 2)]).memory(MemoryClass::SmemLoad))?;
+        b.wait_all()?;
+        b.control(Instruction::new("s_branch .Lhere", vec![], vec![]))?;
+        b.label(".Lhere")?;
+        b.push(Instruction::new("s_mov_b32 s3, 1", vec![s(3)], vec![]))?;
+    "#,
+            ),
+            arch,
+        );
+        let text = &emitted.s_text;
+        let load = text.find("s_load_b32 s2, s[0:1], 0x0").unwrap();
+        let drain = text.find(wait).unwrap();
+        let label = text.find(".Lhere:").unwrap();
+        assert!(load < drain && drain < label, "{text}");
+    }
+    // A second placement of the same name is the builder's refusal.
+    refuses(
+        &kernel(r#"b.label(".Lhere")?; b.label(".Lhere")?;"#),
+        Arch::Gfx1201,
+        "duplicate label .Lhere",
+    );
+    // A typed kernel's `wg.isa()` has its own driver's `label` / `wait_all`.
+    for method in ["label", "wait_all"] {
+        let call = if method == "label" {
+            r#"wg.isa().label(".Lhere")?;"#
+        } else {
+            "wg.isa().wait_all()?;"
+        };
+        refuses(
+            &source("KernargLayout::new(0)", PLAN, call, true),
+            Arch::Gfx1201,
+            &format!("`wg.isa().{method}` is not available: use the Workgroup's own `{method}`"),
+        );
+    }
 }
 
 #[test]
@@ -615,7 +660,7 @@ fn string_mappings_and_wmma_shapes_reject_unknown_values() {
             false,
         ),
         Arch::Gfx1201,
-        "add_range: unknown register kind `V` (expected v, s)",
+        "add_range: unknown register kind `V` (expected v, s, a)",
     );
     refuses(
         &kernel(r#"b.barrier_with_scope(&[], "device")?;"#),

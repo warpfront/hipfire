@@ -10,13 +10,20 @@ pub mod generic_elem;
 pub mod generic_fused;
 pub mod generic_gemm;
 pub mod generic_mmq;
+pub mod generic_mq8;
 pub mod generic_rda;
 pub mod generic_seq;
 pub mod ggml_convert;
 pub mod ggml_mmvq;
 pub mod ggml_mmvq_fused;
+pub mod iu4_gdn;
 pub mod mq6_i8;
+pub mod mq6sym_i8;
+pub mod qwen4_lane_wmma;
+pub mod qwen4_lwmma_tile;
+pub mod qwen4_moe_glue_fold;
 pub mod qwen4_moe_sym;
+pub mod qwen4_topk8_rows;
 
 use crate::work::WorkSpecV1;
 use crate::{Arch, ExportV1, KernelAbiV1};
@@ -26,7 +33,9 @@ use crate::{Arch, ExportV1, KernelAbiV1};
 pub fn all() -> impl Iterator<Item = &'static KernelAbiV1> {
     mq6_i8::ABIS
         .iter()
+        .chain(mq6sym_i8::ABIS.iter())
         .chain(qwen4_moe_sym::ABIS.iter())
+        .chain(qwen4_moe_glue_fold::ABIS.iter())
         .chain(ggml_mmvq::ABIS.iter())
         .chain(ggml_mmvq_fused::ABIS.iter())
         .chain(ggml_convert::ABIS.iter())
@@ -34,8 +43,13 @@ pub fn all() -> impl Iterator<Item = &'static KernelAbiV1> {
         .chain(generic_seq::ABIS.iter())
         .chain(generic_elem::ABIS.iter())
         .chain(generic_mmq::ABIS.iter())
+        .chain(generic_mq8::ABIS.iter())
         .chain(generic_rda::ABIS.iter())
         .chain(generic_fused::ABIS.iter())
+        .chain(iu4_gdn::ABIS.iter())
+        .chain(qwen4_topk8_rows::ABIS.iter())
+        .chain(qwen4_lane_wmma::ABIS.iter())
+        .chain(qwen4_lwmma_tile::ABIS.iter())
         .copied()
 }
 
@@ -46,6 +60,7 @@ pub fn work_specs() -> impl Iterator<Item = &'static WorkSpecV1> {
         .chain(generic_seq::WORK.iter())
         .chain(generic_elem::WORK.iter())
         .chain(generic_mmq::WORK.iter())
+        .chain(generic_mq8::WORK.iter())
         .chain(generic_rda::WORK.iter())
         .chain(generic_fused::WORK.iter())
         .copied()
@@ -83,10 +98,11 @@ mod tests {
         }
         assert_eq!(
             ids.len(),
-            51 + super::generic_gemm::ABIS.len()
+            68 + super::generic_gemm::ABIS.len()
                 + super::generic_seq::ABIS.len()
                 + super::generic_elem::ABIS.len()
                 + super::generic_mmq::ABIS.len()
+                + super::generic_mq8::ABIS.len()
                 + super::generic_rda::ABIS.len()
                 + super::generic_fused::ABIS.len()
         );

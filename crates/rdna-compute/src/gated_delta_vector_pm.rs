@@ -242,6 +242,21 @@ mod tests {
         }
     }
 
+    /// The kernel registry inventories this twin as an embedded native object (corpus nodes of the Raon
+    /// decode body) from `kernels.rs` constants; it must stay the launcher's own module, image and exports.
+    #[test]
+    fn registry_native_object_is_this_twin() {
+        let natives = crate::kernel_registry::native_object_entries("gfx1201").unwrap();
+        assert_eq!(natives.len(), 1);
+        let n = natives[0];
+        let twin = &GFX1201;
+        assert_eq!(n.arch, twin.arch);
+        assert_eq!(n.module, twin.module);
+        assert_eq!(n.image, twin.image, "same embedded image bytes");
+        assert_eq!(n.image_sha256, twin.image_sha256.trim());
+        assert_eq!(n.symbols, [twin.rda_symbol, twin.conv_symbol]);
+    }
+
     #[test]
     fn images_carry_both_symbols() {
         for twin in TWINS {

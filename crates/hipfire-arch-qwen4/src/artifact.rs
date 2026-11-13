@@ -16,6 +16,7 @@ use crate::expert_slab_table::{build_expert_slab_table_with_keep, ExpertSlabTabl
 use crate::expert_slabs::{self, parse_expert_entry_name, ExpertSlabsError};
 use crate::gpu_forward::{qwen4_forward_scratch_mode, Qwen4ForwardScratchMode};
 use crate::ple::PleHashMetadata;
+use crate::stock_mtp_sidecar::BoundStockMtpSidecar;
 use crate::weights::{
     is_ple_shard_name_within, Qwen4BandScope, Qwen4Manifest, Qwen4Placement, Qwen4TierRecipe,
     WeightError, RECIPE_METADATA_KEY,
@@ -54,6 +55,9 @@ const QWEN4_QT_FP8E4M3B128: u8 = 55;
 /// FP8E4M3PT (qt=56): 16-byte per-tensor BF16 scale header then one e4m3 code
 /// per value (stock-FP8 PLE rows); group_size 0.
 const QWEN4_QT_FP8E4M3PT: u8 = 56;
+/// HC8E4M3Row (qt=57): the Flash-Next HC8 sidecar format (`<model>.hc8`). Named
+/// only; a base artifact tensor carrying it is refused by validation.
+const QWEN4_QT_HC8E4M3ROW: u8 = 57;
 /// One FWHT-256 segment: the unit the encoder rotates and the decode GEMV/GEMM
 /// assert (`assert!(k % 256 == 0)`).  A payload that only satisfied the
 /// 32-weight block size would pass every byte count here and then either panic
@@ -167,10 +171,24 @@ pub struct Qwen4HfqmArtifact {
     pub placements: Vec<Qwen4Placement>,
     pub source_tensor_count: usize,
     pub source_identity: Arc<SourceIdentity>,
+    /// The bound `<model>.mtp` head sidecar's own source seal; `None` for the AR-only
+    /// artifact (no sidecar, or one not requested).
+    pub mtp_sidecar: Option<Qwen4MtpSidecarReceipt>,
     /// The PLE rows source the bundle must be assembled with
     /// (`Qwen4Bundle::assemble_with_ple_rows`); [`Qwen4PleRows::Absent`] when
     /// the profile has no PLE.
     pub ple_rows: Qwen4PleRows,
+}
+
+/// The stock-FP8 MTP head sidecar an admitted artifact was merged with.
+#[derive(Clone, Debug)]
+pub struct Qwen4MtpSidecarReceipt {
+    pub path: PathBuf,
+    /// The sidecar file's own exact-source seal (one backing file).
+    pub source_identity: Arc<SourceIdentity>,
+    /// sha256 of the sidecar's index bytes.
+    pub index_sha256: [u8; 32],
+    pub payload_bytes: u64,
 }
 
 impl Qwen4HfqmArtifact {
@@ -419,6 +437,7 @@ fn source_dtype_name(quant_type: u8) -> Option<&'static str> {
         QWEN4_QT_MFP4G32E8SOA => Some("MFP4G32E8SOA"),
         QWEN4_QT_FP8E4M3B128 => Some("FP8E4M3B128"),
         QWEN4_QT_FP8E4M3PT => Some("FP8E4M3PT"),
+        QWEN4_QT_HC8E4M3ROW => Some("HC8E4M3Row"),
         _ => None,
     }
 }
@@ -1263,7 +1282,9 @@ fn admit_ple_metadata(
 /// `hipfire_profile` marker.  Only a build with the explicit
 /// `qwen4-dev-profiles` feature routes the developer marker to the developer
 /// parser; there is no environment or config key that does.
-fn parse_artifact_config(metadata_json: &str) -> Result<Qwen4Config, Qwen4ArtifactError> {
+pub(crate) fn parse_artifact_config(
+    metadata_json: &str,
+) -> Result<Qwen4Config, Qwen4ArtifactError> {
     #[cfg(feature = "qwen4-dev-profiles")]
     let parsed = Qwen4Config::from_developer_metadata_json(metadata_json);
     #[cfg(not(feature = "qwen4-dev-profiles"))]
@@ -1298,9 +1319,19 @@ pub struct Qwen4InventoryReceipt {
 /// non-string id is refused rather than guessed.  The declared recipe is
 /// explicit and exact: the manifest then admits only the formats and extents
 /// that recipe declares.
+///
+/// `drop_head` (the trunk shard's AR-only load,
+/// [`crate::weights::trunk_shard::trunk_shard_drops_mtp_head`]) admits a packed
+/// Flash-Next artifact headless: the config becomes
+/// [`crate::config::Qwen4Profile::FlashNextHeadless`] (no MTP head, the packed recipe
+/// kept) and the manifest declares no `mtp.*` tensor, so nothing downstream (weights,
+/// census, state, lanes, spec) references a head. The artifact's own `mtp.*` records stay
+/// in the file, unread ([`head_free_tensors`]).
 fn manifest_for_metadata(
     config: Qwen4Config,
     metadata_json: &str,
+    drop_head: bool,
+    head_sidecar: bool,
 ) -> Result<(Qwen4Config, Qwen4Manifest), Qwen4ArtifactError> {
     let value: serde_json::Value = serde_json::from_str(metadata_json).map_err(|error| {
         Qwen4ArtifactError::new(format!("qwen4: recipe metadata admission failed: {error}"))
@@ -1320,6 +1351,21 @@ fn manifest_for_metadata(
     };
     if config.profile.is_flash_next() {
         let Some(id) = id else {
+            if head_sidecar {
+                return Err(Qwen4ArtifactError::new(format!(
+                    "qwen4: base recipe is \"<absent>\", the MTP sidecar extends \"{}\"",
+                    crate::weights::STOCK_FP8_RECIPE_ID
+                )));
+            }
+            let config = if drop_head {
+                config.into_headless().map_err(|error| {
+                    Qwen4ArtifactError::new(format!(
+                        "qwen4: headless config admission failed: {error}"
+                    ))
+                })?
+            } else {
+                config
+            };
             let manifest = Qwen4Manifest::build(&config).map_err(manifest_error)?;
             return Ok((config, manifest));
         };
@@ -1330,9 +1376,23 @@ fn manifest_for_metadata(
                 crate::weights::STOCK_FP8_RECIPE_ID
             ))
         })?;
-        let config = config.into_ar_only().map_err(|error| {
-            Qwen4ArtifactError::new(format!("qwen4: AR-only config admission failed: {error}"))
-        })?;
+        if head_sidecar && !recipe.is_stock_fp8() {
+            return Err(Qwen4ArtifactError::new(format!(
+                "qwen4: base recipe is {id:?}, the MTP sidecar extends \"{}\"",
+                crate::weights::STOCK_FP8_RECIPE_ID
+            )));
+        }
+        let config = if head_sidecar {
+            config.into_stock_mtp().map_err(|error| {
+                Qwen4ArtifactError::new(format!(
+                    "qwen4: stock-FP8 MTP config admission failed: {error}"
+                ))
+            })?
+        } else {
+            config.into_ar_only().map_err(|error| {
+                Qwen4ArtifactError::new(format!("qwen4: AR-only config admission failed: {error}"))
+            })?
+        };
         let manifest = Qwen4Manifest::build_with_recipe(&config, recipe).map_err(manifest_error)?;
         return Ok((config, manifest));
     }
@@ -1348,19 +1408,44 @@ fn manifest_for_metadata(
     Ok((config, manifest))
 }
 
+/// The HFQ index records the manifest of `config` is checked against: every record, unless
+/// the config is the head-dropped profile, whose `mtp.*` records (the native MTP head the
+/// artifact still carries) are ignored: nothing declares them and nothing reads them.
+fn head_free_tensors<'a>(
+    config: &Qwen4Config,
+    tensors: &'a [HfqTensorInfo],
+) -> std::borrow::Cow<'a, [HfqTensorInfo]> {
+    if matches!(
+        config.profile,
+        crate::config::Qwen4Profile::FlashNextHeadless
+    ) {
+        std::borrow::Cow::Owned(
+            tensors
+                .iter()
+                .filter(|info| !info.name.starts_with("mtp."))
+                .cloned()
+                .collect(),
+        )
+    } else {
+        std::borrow::Cow::Borrowed(tensors)
+    }
+}
+
 fn admit_inventory(
     arch_id: u32,
     config: Qwen4Config,
     metadata_json: &str,
     tensors: &[HfqTensorInfo],
+    drop_head: bool,
 ) -> Result<Qwen4InventoryReceipt, Qwen4ArtifactError> {
     if arch_id != ARCH_ID {
         return Err(Qwen4ArtifactError::new(format!(
             "qwen4: source arch_id={arch_id} does not match reserved arch_id={ARCH_ID}"
         )));
     }
-    let (config, manifest) = manifest_for_metadata(config, metadata_json)?;
-    let source_tensor_count = validate_manifest_inventory(tensors, &manifest, 0, 0)?;
+    let (config, manifest) = manifest_for_metadata(config, metadata_json, drop_head, false)?;
+    let source_tensor_count =
+        validate_manifest_inventory(&head_free_tensors(&config, tensors), &manifest, 0, 0)?;
     let ple = admit_ple_metadata(metadata_json, &config)?;
     Ok(Qwen4InventoryReceipt {
         config,
@@ -1383,7 +1468,7 @@ pub fn admit_inventory_headers(
     let config = Qwen4Config::from_metadata_json(metadata_json).map_err(|error| {
         Qwen4ArtifactError::new(format!("qwen4: config admission failed: {error}"))
     })?;
-    admit_inventory(arch_id, config, metadata_json, tensors)
+    admit_inventory(arch_id, config, metadata_json, tensors, false)
 }
 
 /// Explicit developer admission of a header-only dry inventory: Flash-Next
@@ -1400,7 +1485,7 @@ pub fn admit_developer_inventory_headers(
     let config = Qwen4Config::from_developer_metadata_json(metadata_json).map_err(|error| {
         Qwen4ArtifactError::new(format!("qwen4: config admission failed: {error}"))
     })?;
-    admit_inventory(arch_id, config, metadata_json, tensors)
+    admit_inventory(arch_id, config, metadata_json, tensors, false)
 }
 
 /// Validate one exact Qwen4 HFQM artifact before any GPU allocation.
@@ -1431,6 +1516,23 @@ pub fn admit_hfqm_artifact_on(
     hfq: &HfqFile,
     slab_device: Option<&str>,
 ) -> Result<Qwen4HfqmArtifact, Qwen4ArtifactError> {
+    admit_hfqm_artifact_with(
+        hfq,
+        slab_device,
+        crate::weights::trunk_shard::trunk_shard_drops_mtp_head(),
+        None,
+    )
+}
+
+/// [`admit_hfqm_artifact_on`] with the head policy passed in: `drop_head` admits a packed
+/// Flash-Next artifact headless ([`manifest_for_metadata`]). The one place the trunk shard's
+/// switch reaches admission; the CPU tests drive it with an explicit value.
+pub fn admit_hfqm_artifact_with(
+    hfq: &HfqFile,
+    slab_device: Option<&str>,
+    drop_head: bool,
+    mtp: Option<&BoundStockMtpSidecar>,
+) -> Result<Qwen4HfqmArtifact, Qwen4ArtifactError> {
     if hfq.arch_id != ARCH_ID {
         return Err(Qwen4ArtifactError::new(format!(
             "qwen4: source arch_id={} does not match reserved arch_id={ARCH_ID}",
@@ -1449,8 +1551,14 @@ pub fn admit_hfqm_artifact_on(
         ));
     }
     let slab = expert_slab_plan(&hfq.metadata_json, hfq.tensors(), slab_device)?;
+    if mtp.is_some() && slab.is_some() {
+        return Err(Qwen4ArtifactError::new(
+            "qwen4: the stock-FP8 MTP sidecar does not combine with an expert-slab artifact",
+        ));
+    }
     let config = parse_artifact_config(&hfq.metadata_json)?;
-    let (config, mut manifest) = manifest_for_metadata(config, &hfq.metadata_json)?;
+    let (config, mut manifest) =
+        manifest_for_metadata(config, &hfq.metadata_json, drop_head, mtp.is_some())?;
     if let Some(plan) = &slab {
         manifest = slab_manifest(&config, &manifest, plan)?;
     }
@@ -1469,6 +1577,7 @@ pub fn admit_hfqm_artifact_on(
         manifest = manifest.without_ple_shards();
     }
     let slab_inventory;
+    let head_free;
     let (inventory_tensors, inventory_manifest): (&[HfqTensorInfo], &Qwen4Manifest) =
         if slab.is_some() {
             // The 49,152 per-expert entries were validated end to end by the
@@ -1476,7 +1585,7 @@ pub fn admit_hfqm_artifact_on(
             // The remaining tensors face the ordinary exact-inventory check
             // against the manifest with the arenas taken out.
             slab_inventory = (
-                hfq.tensors()
+                head_free_tensors(&config, hfq.tensors())
                     .iter()
                     .filter(|info| parse_expert_entry_name(&info.name).is_none())
                     .cloned()
@@ -1491,8 +1600,24 @@ pub fn admit_hfqm_artifact_on(
             );
             (&slab_inventory.0, &slab_inventory.1)
         } else {
-            (hfq.tensors(), &manifest)
+            head_free = head_free_tensors(&config, hfq.tensors());
+            (&head_free[..], &manifest)
         };
+    // With the head sidecar the inventory is the concatenation of both files' index
+    // records: names, shapes and geometry only (no offsets), so one pass is exact, and a
+    // name present in both files is a duplicate the manifest does not declare twice.
+    let merged_inventory: Vec<HfqTensorInfo>;
+    let inventory_tensors: &[HfqTensorInfo] = match mtp {
+        Some(side) => {
+            merged_inventory = inventory_tensors
+                .iter()
+                .chain(side.hfq.tensors())
+                .cloned()
+                .collect();
+            &merged_inventory
+        }
+        None => inventory_tensors,
+    };
     let source_tensor_count = validate_manifest_inventory(
         inventory_tensors,
         inventory_manifest,
@@ -1505,6 +1630,15 @@ pub fn admit_hfqm_artifact_on(
     // keeps the bounded host reads tied to the same source identity as all
     // later external-row reads.
     let source_identity = validate_source_identity(hfq, slab.is_some())?;
+    let mtp_sidecar = match mtp {
+        Some(side) => Some(Qwen4MtpSidecarReceipt {
+            path: side.path.clone(),
+            source_identity: validate_source_identity(&side.hfq, false)?,
+            index_sha256: side.index_sha256,
+            payload_bytes: side.payload_bytes,
+        }),
+        None => None,
+    };
     let ple_rows = match (ple_config, &ple) {
         (Some(ple_config), Some(ple)) => {
             validate_ple_records(hfq, ple_config, ple)?;
@@ -1524,6 +1658,7 @@ pub fn admit_hfqm_artifact_on(
         source_tensor_count,
         source_identity,
         ple_rows,
+        mtp_sidecar,
     })
 }
 
@@ -1796,6 +1931,148 @@ pub fn routed_headers_symmetric_verdict(
     routed_headers_symmetric_cached(hfq, manifest, hfq.path(), home.as_deref())
 }
 
+/// DESIGN F1: repack the symmetric MQ4-XTS routed experts without their zero
+/// plane while each expert-parallel rank compacts them to the device
+/// (`2,611,200 -> 2,534,400` bytes per expert). `=0` keeps the shipped layout.
+pub const EXPERT_DROP_ZERO_ENV: &str = "HIPFIRE_QWEN4_EXPERT_DROP_ZERO";
+
+/// Whether the drop-zero repack is requested for the load of `model`. An explicit
+/// [`EXPERT_DROP_ZERO_ENV`] wins (`0` off, `1` on). Unset follows the shipped EP expert hot set
+/// (D1): on exactly when the shipped default gate is on
+/// (`hipfire_config::memory::EP_EXPERT_HOTSET_DEFAULT_ON`), the model has its
+/// `<model>.ep.expert-hotset` sidecar and `HIPFIRE_QWEN4_EP_EXPERT_HOTSET` is not `0`; so the
+/// repack rides with the per-expert plan on Flash-Next EP2 gfx1201 and nowhere else (the repack
+/// itself still declines every load it does not apply to,
+/// [`apply_expert_drop_zero`]).
+pub fn expert_drop_zero_requested_for(model: &std::path::Path) -> bool {
+    expert_drop_zero_default_requested(
+        hipfire_config::developer_var(EXPERT_DROP_ZERO_ENV)
+            .ok()
+            .as_deref(),
+        hipfire_config::developer_var(crate::expert_ep_units::EP_EXPERT_HOTSET_ENV)
+            .ok()
+            .as_deref(),
+        hipfire_config::memory::EP_EXPERT_HOTSET_DEFAULT_ON,
+        || hipfire_config::memory::ep_expert_hotset_sidecar_path(model).is_file(),
+    )
+}
+
+/// The pure decision of [`expert_drop_zero_requested_for`] over the raw values of
+/// [`EXPERT_DROP_ZERO_ENV`] and [`crate::expert_ep_units::EP_EXPERT_HOTSET_ENV`].
+pub fn expert_drop_zero_default_requested(
+    drop_zero_raw: Option<&str>,
+    hotset_raw: Option<&str>,
+    gate: bool,
+    sidecar_exists: impl FnOnce() -> bool,
+) -> bool {
+    // `hipfire_config::developer_bool` semantics: exact `1` on, exact `0` off, anything else unset.
+    match drop_zero_raw {
+        Some("0") => return false,
+        Some("1") => return true,
+        _ => {}
+    }
+    gate && !matches!(
+        crate::expert_ep_units::ep_units_policy(hotset_raw),
+        crate::expert_ep_units::EpUnitsPolicy::Off
+    ) && sidecar_exists()
+}
+
+/// What [`apply_expert_drop_zero`] did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExpertDropZero {
+    /// Not requested: the manifest is untouched.
+    Off,
+    /// `entries` routed expert stacks were redeclared planar.
+    Applied { entries: usize },
+    /// Requested but not applicable; the manifest is untouched.
+    Declined(String),
+}
+
+impl ExpertDropZero {
+    /// Whether any entry was redeclared.
+    pub fn applied(&self) -> bool {
+        matches!(self, Self::Applied { .. })
+    }
+}
+
+/// Declare the routed expert stacks of an expert-parallel `manifest` drop-zero
+/// planar when `requested` and every header of the stacks to repack is proven
+/// symmetric (`zp == -8*sc`, both finite) from the artifact's own bytes: the
+/// trunk layers by the cached whole-artifact verdict (the one the symmetric IU4
+/// route uses), the MTP head's stacks by a direct scan. The planar kernels
+/// exist on exact gfx1201 only. Anything else (other arch, non-packed recipe,
+/// not expert-parallel, an asymmetric or non-QT44/QT53 trunk or MTP stack)
+/// declines and leaves the whole manifest shipped: the launchers bind one
+/// layout per device, so the repack is all-or-nothing.
+pub fn apply_expert_drop_zero(
+    manifest: Qwen4Manifest,
+    hfq: &HfqFile,
+    arch: &str,
+    requested: bool,
+) -> Result<(Qwen4Manifest, ExpertDropZero), Qwen4ArtifactError> {
+    if !requested {
+        return Ok((manifest, ExpertDropZero::Off));
+    }
+    let decline = |manifest: Qwen4Manifest, why: String| {
+        eprintln!("  qwen4 expert drop-zero: declined ({why})");
+        Ok((manifest, ExpertDropZero::Declined(why)))
+    };
+    if arch != "gfx1201" {
+        return decline(
+            manifest,
+            format!("the planar expert kernels exist on gfx1201 only, this is {arch}"),
+        );
+    }
+    // D1 per-expert EP units compose: the planner derives the unit geometry from the planar
+    // aggregate sizes declared below, and the unit-arena gather repacks the shipped stacks
+    // planar (`EpUnitLayerMap::gather_arena_mq4_planar`).
+    if !matches!(
+        manifest.identity.recipe,
+        crate::weights::Qwen4TierRecipe::FlashNextPacked { .. }
+    ) {
+        return decline(
+            manifest,
+            "only the packed aggregate Flash-Next recipe repacks".to_string(),
+        );
+    }
+    let routed = |entry: &WeightEntry| {
+        entry.name.ends_with(ROUTED_GATE_UP_SUFFIX) || entry.name.ends_with(ROUTED_DOWN_SUFFIX)
+    };
+    if !manifest
+        .weights
+        .iter()
+        .filter(|entry| routed(entry))
+        .all(|entry| matches!(entry.policy, ShardPolicy::ExpertSharded { .. }))
+    {
+        return decline(
+            manifest,
+            "the routed experts are not expert-parallel sharded".to_string(),
+        );
+    }
+    if !routed_headers_symmetric_verdict(hfq, &manifest)? {
+        return decline(
+            manifest,
+            "a trunk routed header is not symmetric (zp != -8*sc)".to_string(),
+        );
+    }
+    let mtp_names: Vec<&str> = manifest
+        .weights
+        .iter()
+        .filter(|entry| entry.layer.is_none() && routed(entry))
+        .map(|entry| entry.name.as_str())
+        .collect();
+    if !mtp_names.is_empty() && !routed_tensors_symmetric(hfq, &mtp_names)? {
+        return decline(
+            manifest,
+            "an MTP head routed stack is not a symmetric QT44/QT53 payload".to_string(),
+        );
+    }
+    let (manifest, entries) = manifest
+        .with_expert_drop_zero(|_| true)
+        .map_err(|error| Qwen4ArtifactError::new(format!("qwen4: {error}")))?;
+    Ok((manifest, ExpertDropZero::Applied { entries }))
+}
+
 fn hotset_refusal(reason: impl fmt::Display) -> String {
     format!(
         "qwen4: {HOTSET_ENV} requires the packed Flash-Next aggregate MQ4-XTS routed experts \
@@ -1916,7 +2193,7 @@ pub fn hotset_aggregate_slabs(
         ));
     }
     hotset_source_preflight(hfq)?;
-    if !matches!(config.profile, crate::config::Qwen4Profile::FlashNext) {
+    if !config.profile.is_packed_flash_next() {
         return Err(hotset_refusal(format!(
             "profile {} is not the packed Flash-Next profile",
             config.profile.id()
@@ -2574,8 +2851,9 @@ mod tests {
         assert!(error.to_string().contains("not available on this device"));
     }
 
-    /// The sealed route admits per (arch, cold codec): gfx1100 MQ4 + E8P,
-    /// gfx1151 MQ4 + W3 + E8P (E8P via SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED), gfx1201 MQ4 + W3 + E8P,
+    /// The sealed route admits per (arch, cold codec): gfx1100 MQ4 + E8P + W3 (W3 decode-only: no
+    /// K2), gfx1151 MQ4 + W3 + E8P (E8P via SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED), gfx1201 MQ4 +
+    /// W3 + E8P,
     /// W2 nowhere, one cold codec per layer (layers may differ), and every other architecture
     /// (or none) keeps the unchanged fail-closed refusal.
     #[test]
@@ -2596,6 +2874,7 @@ mod tests {
             ("gfx1201", Mq3I4, CODEC_W3),
             ("gfx1201", E8pI4, CODEC_E8P),
             ("gfx1100", E8pI4, CODEC_E8P),
+            ("gfx1100", Mq3I4, CODEC_W3),
             ("gfx1151", Mq3I4, CODEC_W3),
         ] {
             assert!(slab_route_admitted(arch));
@@ -2615,15 +2894,29 @@ mod tests {
                 assert_eq!(layer.cold_codec(arch), Ok(cold_codec));
             }
         }
-        // W3 on gfx1100 is an arch refusal; W2 is refused everywhere (typed).
-        let error =
-            expert_slab_plan(&slab_metadata(), &headers(Mq3I4), Some("gfx1100")).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("no sealed-route kernels on gfx1100"),
-            "{error}"
-        );
+        // gfx1100 W3 is the MQ3 tier (K1 + K2): the plan admits it, every layer's cold codec is W3,
+        // and `qwen4_slab_layer_prefills` holds there. W2 is refused everywhere (typed).
+        let plan = expert_slab_plan(&slab_metadata(), &headers(Mq3I4), Some("gfx1100"))
+            .unwrap()
+            .expect("gfx1100 W3 admitted");
+        for layer in plan.layers() {
+            assert_eq!(layer.cold_codec("gfx1100"), Ok(CODEC_W3));
+            assert!(rdna_compute::slab_admission::qwen4_slab_layer_prefills(
+                "gfx1100",
+                &layer.codec_table().unwrap()
+            ));
+        }
+        for arch in ["gfx1151", "gfx1201"] {
+            let plan = expert_slab_plan(&slab_metadata(), &headers(Mq3I4), Some(arch))
+                .unwrap()
+                .unwrap();
+            for layer in plan.layers() {
+                assert!(rdna_compute::slab_admission::qwen4_slab_layer_prefills(
+                    arch,
+                    &layer.codec_table().unwrap()
+                ));
+            }
+        }
         for arch in ["gfx1100", "gfx1151", "gfx1201"] {
             assert!(matches!(
                 expert_slab_plan(&slab_metadata(), &headers(Mq2I4), Some(arch)),
@@ -2665,7 +2958,12 @@ mod tests {
             .expect("per-layer cold codecs admitted");
         assert_eq!(plan.layers()[0].cold_codec("gfx1201"), Ok(CODEC_W3));
         assert_eq!(plan.layers()[1].cold_codec("gfx1201"), Ok(CODEC_E8P));
-        assert!(expert_slab_plan(&slab_metadata(), &alternating, Some("gfx1100")).is_err());
+        // gfx1100 admits W3 (decode-only) next to E8P: different layers may differ there too.
+        let plan = expert_slab_plan(&slab_metadata(), &alternating, Some("gfx1100"))
+            .unwrap()
+            .expect("per-layer cold codecs admitted on gfx1100");
+        assert_eq!(plan.layers()[0].cold_codec("gfx1100"), Ok(CODEC_W3));
+        assert_eq!(plan.layers()[1].cold_codec("gfx1100"), Ok(CODEC_E8P));
         // gfx1151 admits MQ4 + E8P exactly when SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED (else an
         // arena arch refusal); a W3 + E8P layer is refused either way (the arch refusal, or the
         // two-cold-codecs refusal when admitted).
@@ -2728,13 +3026,14 @@ mod tests {
             expert_slab_plan(&metadata, &headers, None).unwrap_err(),
             expected
         );
-        // gfx1100 serves MQ4 + E8P only: pruned W3 experts are an arch refusal, not a count refusal.
-        let error = expert_slab_plan(&metadata, &headers, Some("gfx1100")).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("no sealed-route kernels on gfx1100"),
-            "{error}"
+        // gfx1100 admits pruned W3 experts (decode-only: its W3 has a K1 and no K2): the plan
+        // carries only the kept experts' bytes, exactly as on the arches that also prefill W3.
+        let plan = expert_slab_plan(&metadata, &headers, Some("gfx1100"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            plan.physical_bytes(),
+            (keep.total_kept() * ExpertFormat::Mq3I4.slab_bytes()) as u64,
         );
         let table = build_expert_slab_table_with_keep(
             &expert_slabs::ExpertSlabsV1::fn_v1(),
@@ -3604,6 +3903,14 @@ mod tests {
             },
             "unsupported HFQM quant_type=99",
         );
+        // qt=57 HC8E4M3Row is a sidecar-only format: a BASE artifact carrying it stays refused.
+        refused(
+            &|headers| {
+                let index = position(headers, experts);
+                headers[index].quant_type = QWEN4_QT_HC8E4M3ROW;
+            },
+            "unsupported HFQM quant_type=57",
+        );
         // gate_up (K=2560) retagged MQ4G128V2 is byte-for-byte the same extent
         // as MQ4G256V2 (20 x 68 == 10 x 136) and its source set admits both,
         // so that is a legitimately equal payload, not a deviation.  down
@@ -3645,6 +3952,214 @@ mod tests {
             .expect_err("wrong identity")
             .to_string();
         assert!(error.contains("config admission failed"), "{error}");
+    }
+
+    fn admit_with_head_policy(
+        json: &str,
+        headers: &[HfqTensorInfo],
+        drop_head: bool,
+    ) -> Result<Qwen4InventoryReceipt, Qwen4ArtifactError> {
+        let config = Qwen4Config::from_metadata_json(json).expect("pinned config");
+        admit_inventory(ARCH_ID, config, json, headers, drop_head)
+    }
+
+    /// The shipped packed artifact (head records in the file) admits under the trunk
+    /// shard's head policy as the headless profile: packed recipe, no `mtp.*` in the
+    /// manifest, the head records ignored, every other record still held to the exact
+    /// inventory. Without the policy the same file admits unchanged, with the head.
+    #[test]
+    fn packed_artifact_admits_headless_when_the_shard_drops_the_head() {
+        let headers = flash_next_headers();
+        let head_records = headers
+            .iter()
+            .filter(|header| header.name.starts_with("mtp."))
+            .count();
+        assert!(head_records > 0);
+        let kept = admit_with_head_policy(&flash_next_json(), &headers, false).unwrap();
+        assert!(kept.config.profile == crate::config::Qwen4Profile::FlashNext);
+        assert!(kept.config.mtp.is_some());
+        assert_eq!(kept.source_tensor_count, headers.len());
+
+        let headless = admit_with_head_policy(&flash_next_json(), &headers, true)
+            .expect("the head-dropped inventory is admitted");
+        assert_eq!(
+            headless.config.profile,
+            crate::config::Qwen4Profile::FlashNextHeadless
+        );
+        assert!(headless.config.mtp.is_none());
+        assert_eq!(headless.config.mtp_num_hidden_layers, 0);
+        assert!(matches!(
+            headless.manifest.identity.recipe,
+            Qwen4TierRecipe::FlashNextPacked { .. }
+        ));
+        assert_eq!(
+            headless.manifest.identity.recipe,
+            kept.manifest.identity.recipe
+        );
+        assert_eq!(
+            headless.manifest.identity.profile_id,
+            "qwen3.8-flash-next-headless"
+        );
+        assert!(headless
+            .manifest
+            .weights
+            .iter()
+            .all(|entry| !entry.name.starts_with("mtp.")));
+        assert_eq!(headless.ple, kept.ple);
+        // the manifest declares none of the head's records; they stay in the file, ignored
+        assert_eq!(headless.source_tensor_count, headers.len() - head_records);
+
+        // a file that never carried the head admits the same headless manifest
+        let no_head: Vec<_> = headers
+            .iter()
+            .filter(|header| !header.name.starts_with("mtp."))
+            .cloned()
+            .collect();
+        let bare = admit_with_head_policy(&flash_next_json(), &no_head, true).unwrap();
+        assert_eq!(bare.manifest, headless.manifest);
+        // ... but the head-bearing profile refuses it, and a missing / reshaped trunk record
+        // is still refused under the head policy
+        assert!(admit_with_head_policy(&flash_next_json(), &no_head, false).is_err());
+        let mut missing = headers.clone();
+        let at = missing
+            .iter()
+            .position(|header| header.name == "lm_head.weight")
+            .unwrap();
+        missing.remove(at);
+        assert!(admit_with_head_policy(&flash_next_json(), &missing, true).is_err());
+        let mut reshaped = headers.clone();
+        let at = reshaped
+            .iter()
+            .position(|header| header.name == "lm_head.weight")
+            .unwrap();
+        reshaped[at].shape[0] += 1;
+        assert!(admit_with_head_policy(&flash_next_json(), &reshaped, true).is_err());
+        // an undeclared extra record that is not the head is refused
+        let mut extra = headers.clone();
+        let mut stray = extra[0].clone();
+        stray.name = "model.language_model.stray.weight".into();
+        extra.push(stray);
+        assert!(admit_with_head_policy(&flash_next_json(), &extra, true).is_err());
+        // the stock-FP8 recipe id is its own (already head-free) profile: the policy is moot
+        let stock = stock_fp8_json("stock-fp8");
+        let stock_headers = stock_fp8_headers();
+        let under_policy = admit_with_head_policy(&stock, &stock_headers, true).unwrap();
+        assert_eq!(
+            under_policy.config.profile,
+            crate::config::Qwen4Profile::FlashNextArOnly
+        );
+        assert_eq!(
+            under_policy.manifest.identity.recipe,
+            Qwen4TierRecipe::StockFp8
+        );
+    }
+
+    /// Under the head-keeping shard policy (lab shard switch AND the MTP switch) the shipped
+    /// packed artifact admits UNCHANGED: checkpoint profile, native MTP config, the manifest
+    /// with every `mtp.*` tensor, all head records counted; any other policy outcome admits
+    /// it headless. The kept config then shards into rank-local configs that run the head on
+    /// the global geometry.
+    #[test]
+    fn head_keeping_shard_policy_admits_the_artifact_with_its_head() {
+        use crate::weights::trunk_shard::{drops_head_for, keeps_mtp_given};
+        let headers = flash_next_headers();
+        let json = flash_next_json();
+        let unsharded = admit_with_head_policy(&json, &headers, false).unwrap();
+        for (lab, mtp_env) in [(false, false), (true, false), (false, true)] {
+            let drop = drops_head_for(true, keeps_mtp_given(lab, mtp_env));
+            assert!(drop, "lab={lab} mtp={mtp_env} drops the head");
+            let admitted = admit_with_head_policy(&json, &headers, drop).unwrap();
+            assert_eq!(
+                admitted.config.profile,
+                crate::config::Qwen4Profile::FlashNextHeadless
+            );
+            assert!(admitted.config.mtp.is_none());
+        }
+        let drop = drops_head_for(true, keeps_mtp_given(true, true));
+        assert!(!drop);
+        let kept = admit_with_head_policy(&json, &headers, drop).unwrap();
+        assert_eq!(kept.config, unsharded.config);
+        assert_eq!(kept.config.profile, crate::config::Qwen4Profile::FlashNext);
+        assert!(kept.config.mtp.is_some() && kept.config.mtp_num_hidden_layers == 1);
+        assert_eq!(kept.manifest, unsharded.manifest);
+        assert_eq!(kept.source_tensor_count, headers.len());
+        assert!(
+            kept.manifest
+                .weights
+                .iter()
+                .filter(|entry| entry.name.starts_with("mtp."))
+                .count()
+                > 0
+        );
+        // every head record of the file is still held to the exact inventory
+        let mut reshaped = headers.clone();
+        let at = reshaped
+            .iter()
+            .position(|header| header.name.starts_with("mtp.") && header.shape.len() > 1)
+            .unwrap();
+        reshaped[at].shape[0] += 1;
+        assert!(admit_with_head_policy(&json, &reshaped, drop).is_err());
+        // the admitted global config shards; each rank's head geometry is the global config
+        for rank in 0..2 {
+            let local = kept.config.trunk_shard_local(rank, 2).unwrap();
+            local.validate().unwrap();
+            assert_eq!(local.mtp_geometry(), &kept.config);
+            assert_eq!(local.replica_geometry(), kept.config);
+            assert!(local.num_attention_heads < kept.config.num_attention_heads);
+        }
+    }
+
+    /// U4 (inventory level): base + sidecar headers merge into one exact inventory under the
+    /// headed stock profile (`base + 31` records); a duplicate name across the files, a missing
+    /// sidecar entry and the base alone against the headed manifest are refused; a packed base
+    /// (no recipe id) cannot take the head sidecar.
+    #[test]
+    fn stock_mtp_sidecar_inventory_merges_both_files() {
+        let flash = crate::config::compact_test_config();
+        let headed_config = flash.clone().into_stock_mtp().unwrap();
+        let headed = oracle_headers(
+            &Qwen4Manifest::build_with_recipe(&headed_config, Qwen4TierRecipe::StockFp8).unwrap(),
+        );
+        let base = stock_fp8_headers();
+        let (sidecar, rest): (Vec<_>, Vec<_>) = headed
+            .iter()
+            .cloned()
+            .partition(|header| header.name.starts_with("mtp."));
+        assert_eq!(sidecar.len(), 31);
+        assert_eq!(rest.len(), base.len());
+        let json = stock_fp8_json("stock-fp8");
+        let (config, manifest) = manifest_for_metadata(flash.clone(), &json, false, true).unwrap();
+        assert_eq!(
+            config.profile,
+            crate::config::Qwen4Profile::FlashNextStockMtp
+        );
+        assert!(config.mtp.is_some());
+        let merged: Vec<_> = base.iter().chain(&sidecar).cloned().collect();
+        assert_eq!(
+            validate_manifest_inventory(&merged, &manifest, 0, 0).unwrap(),
+            base.len() + 31
+        );
+        // The AR-only form of the same metadata is unchanged.
+        let (ar_config, _) = manifest_for_metadata(flash.clone(), &json, false, false).unwrap();
+        assert!(ar_config.profile.is_ar_only() && ar_config.mtp.is_none());
+        // A name present in both files is refused.
+        let mut duplicate = merged.clone();
+        duplicate.push(sidecar[0].clone());
+        assert!(validate_manifest_inventory(&duplicate, &manifest, 0, 0).is_err());
+        // A missing sidecar entry, and the base alone, are refused.
+        let mut missing = merged.clone();
+        missing.pop();
+        assert!(validate_manifest_inventory(&missing, &manifest, 0, 0).is_err());
+        assert!(validate_manifest_inventory(&base, &manifest, 0, 0).is_err());
+        // A packed base (no recipe id) or another recipe cannot take the head sidecar.
+        let error = manifest_for_metadata(flash.clone(), &flash_next_json(), false, true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("base recipe is")
+                && error.contains("the MTP sidecar extends \"stock-fp8\""),
+            "{error}"
+        );
     }
 
     fn stock_fp8_json(id: &str) -> String {
@@ -4502,5 +5017,44 @@ mod tests {
         assert!(!routed_tensors_symmetric(&hfq, &[]).unwrap());
         assert!(!routed_tensors_symmetric(&hfq, &[SYM_GATE_UP]).unwrap());
         sym_cleanup(path, hfq);
+    }
+}
+
+#[cfg(test)]
+mod drop_zero_default_tests {
+    use super::expert_drop_zero_default_requested as requested;
+
+    #[test]
+    fn the_drop_zero_default_follows_the_shipped_hot_set() {
+        // Unset: on exactly with the gate, an unkilled hot set policy and the sidecar present.
+        assert!(requested(None, None, true, || true));
+        assert!(requested(
+            None,
+            Some("/x/model.ep.expert-hotset"),
+            true,
+            || true
+        ));
+        assert!(!requested(None, None, false, || true), "gate off");
+        assert!(!requested(None, None, true, || false), "no sidecar");
+        assert!(!requested(None, Some("0"), true, || true), "hot set killed");
+        assert!(
+            !requested(None, Some(""), true, || true),
+            "hot set blank = off"
+        );
+        // The explicit switch wins over everything.
+        assert!(requested(Some("1"), Some("0"), false, || false));
+        assert!(!requested(Some("0"), None, true, || true));
+        // Any other spelling is unset.
+        assert!(requested(Some("yes"), None, true, || true));
+        assert!(!requested(Some("yes"), None, false, || true));
+    }
+
+    #[test]
+    fn the_sidecar_probe_is_not_called_when_the_answer_is_settled() {
+        let probe = || -> bool { panic!("probed") };
+        assert!(requested(Some("1"), None, true, probe));
+        assert!(!requested(Some("0"), None, true, probe));
+        assert!(!requested(None, None, false, probe));
+        assert!(!requested(None, Some("0"), true, probe));
     }
 }

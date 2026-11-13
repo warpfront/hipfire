@@ -72,7 +72,7 @@ Put `crates/hipfire-arch-<yours>/src/spec_impl.rs` and `mod spec_impl;` in
 | `verify_block` | Per-position **argmax** over `block`; **snapshot into `scratch` before forward** |
 | `commit_prefix` | Fix state to accepted prefix after over-advance |
 | `eos_token` / `ctx_capacity` | Loop bounds |
-| `kv_cache_mut` | Default `None`. Override only for shared `llama::KvCache` (FlashCASK) |
+| `kv_cache_mut` | Default `None`. Override only for shared `llama::KvCache` |
 | `verify_block_sampled` | Default `Err`. Only arches that implement it may take temp>0 n-gram |
 | `verify_block_logits` / tree / DFlash hooks | Default `Err`/`None`; required for DFlash/DDTree/DSpark-style paths |
 

@@ -52,9 +52,20 @@ const RAON_PRETOK_PATTERN: &str = r" ?[一-龥぀-ゟ゠-ヿ]+| ?(?:(?:(?![一-�
 /// is a maximal `\p{N}+` run that the splitter cuts right-aligned, and the
 /// whitespace tail alternatives are folded into the `hf_ws_tail` group.
 const RAON_PRETOK_RUST_REGEX: &str = r" ?[一-龥぀-ゟ゠-ヿ]+| ?(?:[\p{L}--[一-龥぀-ゟ゠-ヿ]]\p{M}*)+(?: (?:[\p{L}--[一-龥぀-ゟ゠-ヿ]]\p{M}*)+)*|\p{N}+| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|(?P<hf_ws_tail>\s+)";
-/// Marker of the Raon CJK class: any pattern containing it that is not the
-/// exact literal above is refused at load (never canonical-GPT-2 fallback).
+/// Marker of the Raon CJK class. A pattern containing it plus a lookahead
+/// needs the Raon emulation: anything but the exact literal above is refused
+/// at load (never canonical-GPT-2 fallback). A plain CJK class without
+/// lookahead (DeepSeek V3/V4 `[一-龥぀-ゟ゠-ヿ]+`) takes the general path.
 const RAON_PRETOK_MARKER: &str = "[一-龥";
+
+fn raon_like(pattern: &str) -> bool {
+    // The general path emulates the `\s+(?!\S)|` tail itself; any other lookaround needs Raon.
+    let rest = pattern.replace(WS_LOOKAHEAD_ALT, "");
+    pattern.contains(RAON_PRETOK_MARKER)
+        && ["(?=", "(?!", "(?<=", "(?<!"]
+            .iter()
+            .any(|l| rest.contains(l))
+}
 
 /// Bookkeeping for the emulated `\s+(?!\S)` alternative.
 struct WsTail {
@@ -134,7 +145,7 @@ impl PretokSplitter {
                 drop_gaps,
             });
         }
-        if pattern.contains(RAON_PRETOK_MARKER) {
+        if raon_like(pattern) {
             return Err(
                 "CJK-class pre-tokenizer regex is not the exact supported Raon pattern".into(),
             );
@@ -301,8 +312,10 @@ fn default_pretokenizer() -> &'static Gpt2Pretokenizer {
 /// honored whole or not at all. Other stage types (`ByteLevel`,
 /// string-pattern `Split`, …) are ignored, as before.
 ///
-/// A chain containing the Raon CJK-class regex is exact-or-error: any other
-/// behavior/invert or an inexact pattern text is `Err`, never the fallback.
+/// A `Split` regex with the Raon CJK class and a lookaround other than the
+/// `\s+(?!\S)` tail (see `raon_like`) is exact-or-error: anything but the
+/// exact Raon pattern with `Isolated`/`invert=false` is `Err`, never the
+/// fallback. A CJK class without such lookaround takes the general path.
 fn pretokenizer_from_hf_json(
     pre: &serde_json::Value,
 ) -> Result<Option<Gpt2Pretokenizer>, TokenizerError> {
@@ -322,11 +335,11 @@ fn pretokenizer_from_hf_json(
                 };
                 let behavior = p.get("behavior").and_then(|v| v.as_str());
                 let invert = p.get("invert").and_then(|v| v.as_bool()).unwrap_or(false);
-                if re.contains(RAON_PRETOK_MARKER) {
+                if raon_like(re) {
                     if re != RAON_PRETOK_PATTERN || (behavior, invert) != (Some("Isolated"), false)
                     {
                         *fatal = Some(format!(
-                            "CJK-class Split is only supported as the exact Raon pattern with \
+                            "CJK-class Split with lookaround is only supported as the exact Raon pattern with \
                              behavior=Isolated invert=false (got behavior={behavior:?}, \
                              invert={invert}, exact_pattern={})",
                             re == RAON_PRETOK_PATTERN
@@ -377,7 +390,7 @@ fn pretokenizer_from_hf_json(
     for (pattern, drop_gaps) in &patterns {
         match PretokSplitter::compile_with_mode(pattern, *drop_gaps) {
             Ok(s) => splitters.push(s),
-            Err(e) if pattern.contains(RAON_PRETOK_MARKER) => {
+            Err(e) if raon_like(pattern) => {
                 return Err(TokenizerError::UnsupportedPreTokenizer { reason: e });
             }
             Err(e) => {
@@ -638,6 +651,9 @@ pub struct Tokenizer {
     /// it emits this, not `eos_id` — stop-loops must check both via
     /// `is_terminator()`. None if the vocab only has one terminator.
     pub eot_id: Option<u32>,
+    /// Every id of a multi-eos `generation_config.eos_token_id` array (Llama-3.x:
+    /// `<|end_of_text|>`, `<|eom_id|>`, `<|eot_id|>`); `is_terminator()` stops on all.
+    gen_eos_ids: Vec<u32>,
     /// True for GPT-2 BPE (Qwen), false for SentencePiece (LLaMA).
     is_gpt2_bpe: bool,
     /// Exact merge-rank BPE for ▁-style (SentencePiece-derived) HF BPE
@@ -965,6 +981,7 @@ impl Tokenizer {
             eos_id,
             add_bos: false,
             eot_id,
+            gen_eos_ids: Vec::new(),
             is_gpt2_bpe,
             ignore_merges_max_chunk_bytes: None,
             sp_dummy_prefix,
@@ -1152,6 +1169,7 @@ impl Tokenizer {
             eos_id,
             add_bos: false,
             eot_id,
+            gen_eos_ids: Vec::new(),
             is_gpt2_bpe,
             ignore_merges_max_chunk_bytes,
             sp_dummy_prefix,
@@ -1191,19 +1209,46 @@ impl Tokenizer {
             // to `<|endoftext|>`), which is WRONG for models whose BOS differs —
             // e.g. LFM2.5 bos = `<|startoftext|>` (id 1), not `<|endoftext|>`
             // (id 2). `generation_config.{bos,eos}_token_id` is the authoritative
-            // HF source; override from it when present + scalar (an array eos =
-            // multi-eos: keep the heuristic). Embedded by the quantizer at convert
-            // time. (LFM2.5-350M daemon bring-up, 2026-06-07.)
+            // HF source; override from it when present. An array eos (multi-eos,
+            // Llama-3.x) feeds `gen_eos_ids`, see below. Embedded by the quantizer
+            // at convert time. (LFM2.5-350M daemon bring-up, 2026-06-07.)
             if let Some(gc) = meta.get("generation_config") {
                 if let Some(b) = gc.get("bos_token_id").and_then(|v| v.as_u64()) {
                     if (b as usize) < t.vocab.len() {
                         t.bos_id = b as u32;
                     }
                 }
-                if let Some(e) = gc.get("eos_token_id").and_then(|v| v.as_u64()) {
-                    if (e as usize) < t.vocab.len() {
-                        t.eos_id = e as u32;
+                match gc.get("eos_token_id") {
+                    Some(serde_json::Value::Array(ids)) => {
+                        let ids: Vec<u32> = ids
+                            .iter()
+                            .filter_map(|v| v.as_u64())
+                            .filter(|&e| (e as usize) < t.vocab.len())
+                            .map(|e| e as u32)
+                            .collect();
+                        // A heuristic eos outside the list is not an eos at all
+                        // (Llama-3 has no `</s>`, so it fell back to id 2 = "#"):
+                        // take HF's primary, tokenizer_config.eos_token, else the
+                        // first listed id. A heuristic eos inside the list is kept.
+                        if !ids.contains(&t.eos_id) {
+                            let primary = meta
+                                .get("tokenizer_config")
+                                .and_then(|tc| tc.get("eos_token"))
+                                .and_then(|v| v.as_str())
+                                .and_then(|s| t.token_to_id.get(s).copied())
+                                .filter(|id| ids.contains(id));
+                            if let Some(e) = primary.or(ids.first().copied()) {
+                                t.eos_id = e;
+                            }
+                        }
+                        t.gen_eos_ids = ids;
                     }
+                    Some(e) => {
+                        if let Some(e) = e.as_u64().filter(|&e| (e as usize) < t.vocab.len()) {
+                            t.eos_id = e as u32;
+                        }
+                    }
+                    None => {}
                 }
             }
             // Honor HF `add_bos_token` from the embedded tokenizer_config (e.g.
@@ -1341,6 +1386,7 @@ impl Tokenizer {
             eos_id,
             add_bos: false,
             eot_id,
+            gen_eos_ids: Vec::new(),
             is_gpt2_bpe,
             ignore_merges_max_chunk_bytes: None,
             sp_dummy_prefix,
@@ -1367,7 +1413,7 @@ impl Tokenizer {
     /// attractor loop (bench findings 2026-04-24 §3.5).
     #[inline]
     pub fn is_terminator(&self, id: u32) -> bool {
-        id == self.eos_id || self.eot_id == Some(id)
+        id == self.eos_id || self.eot_id == Some(id) || self.gen_eos_ids.contains(&id)
     }
 
     /// Look up a special token's ID by literal content. Returns `None`
@@ -2018,7 +2064,7 @@ impl Tokenizer {
 
     /// Read-only view of the full vocabulary by token id. Index `i` is the
     /// canonical byte string for token id `i`. Used for cross-tokenizer
-    /// equivalence checks (PFlash drafter / target compatibility gate).
+    /// equivalence checks.
     pub fn vocab(&self) -> &[String] {
         &self.vocab
     }
@@ -2043,9 +2089,10 @@ impl Tokenizer {
         h.finalize().to_vec()
     }
 
-    /// SHA-256 of tokenizer configuration that affects encoding: merge
-    /// ranks, special tokens, BOS/EOS/EOT, and the GPT-2 / SentencePiece
-    /// flags (spec §4.1 C1). Independent of [`Self::vocab_digest`].
+    /// SHA-256 of tokenizer configuration that affects encoding or where
+    /// generation stops: merge ranks, special tokens, BOS/EOS/EOT, the
+    /// `generation_config` eos ids and the GPT-2 / SentencePiece flags
+    /// (spec §4.1 C1). Independent of [`Self::vocab_digest`].
     pub fn config_digest(&self) -> Vec<u8> {
         use sha2::{Digest as Sha256Digest, Sha256};
         let mut h = Sha256::new();
@@ -2062,6 +2109,9 @@ impl Tokenizer {
         h.update(self.bos_id.to_le_bytes());
         h.update(self.eos_id.to_le_bytes());
         h.update(self.eot_id.unwrap_or(u32::MAX).to_le_bytes());
+        for id in &self.gen_eos_ids {
+            h.update(id.to_le_bytes());
+        }
         h.update([
             u8::from(self.add_bos),
             u8::from(self.is_gpt2_bpe),
@@ -2847,6 +2897,7 @@ mod token_text_stream_tests {
             eos_id: 0,
             add_bos: false,
             eot_id: None,
+            gen_eos_ids: Vec::new(),
             is_gpt2_bpe: false,
             sp_bpe: false,
             ignore_merges_max_chunk_bytes: None,
@@ -2999,6 +3050,7 @@ mod bpe_tests {
             eos_id: 0,
             add_bos: false,
             eot_id: None,
+            gen_eos_ids: Vec::new(),
             is_gpt2_bpe: true,
             sp_bpe: false,
             ignore_merges_max_chunk_bytes: None,
@@ -3890,6 +3942,7 @@ mod sp_tests {
             eos_id: 0,
             add_bos: false,
             eot_id: None,
+            gen_eos_ids: Vec::new(),
             is_gpt2_bpe: false,
             sp_bpe: false,
             ignore_merges_max_chunk_bytes: None,
@@ -4488,6 +4541,22 @@ mod lfm2_bos_tests {
     }
 
     #[test]
+    fn multi_eos_array_stops_on_every_id_and_replaces_foreign_heuristic() {
+        // Llama-3.x shape: generation_config lists several eos ids, none of
+        // them the vocab heuristic's pick; tokenizer_config names the primary.
+        let meta = json!({
+            "tokenizer": minimal_tok_json(),
+            "generation_config": {"eos_token_id": [3, 4]},
+            "tokenizer_config": {"eos_token": "i"}
+        })
+        .to_string();
+        let tok = Tokenizer::from_hfq_metadata(&meta).expect("meta");
+        assert_eq!(tok.eos_id, 4);
+        assert!(tok.is_terminator(3) && tok.is_terminator(4));
+        assert!(!tok.is_terminator(2), "heuristic eos outside the list");
+    }
+
+    #[test]
     fn lfm2_absent_add_bos_defaults_true_and_prepends_once() {
         let tok = Tokenizer::from_hfq_metadata(&lfm_meta(None)).expect("meta");
         assert!(
@@ -4997,6 +5066,44 @@ mod raon_pretok_tests {
             e,
             Err(TokenizerError::UnsupportedPreTokenizer { .. })
         ));
+    }
+
+    /// DeepSeek V3/V4 standalone CJK `Split` (no lookahead) must load on the
+    /// general path, not trip the Raon exact-or-error rule (HIPF-233).
+    #[test]
+    fn plain_cjk_split_is_not_raon() {
+        let pre = pretokenizer_from_hf_json(&json!({"type":"Sequence","pretokenizers":[
+            split_node("\\p{N}{1,3}", "Isolated", false),
+            split_node("[一-龥぀-ゟ゠-ヿ]+", "Isolated", false),
+            {"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":false}
+        ]}))
+        .unwrap()
+        .expect("DS4 pre-tokenizer selected");
+        assert_eq!(pre.splitters.len(), 2);
+        assert!(pre.splitters[1].number_groups.is_none());
+    }
+
+    /// A CJK class with only the general `\s+(?!\S)|\s+` tail stays on the
+    /// general path; any other lookaround (lookbehind included) is refused,
+    /// never the canonical fallback.
+    #[test]
+    fn cjk_split_lookaround_needs_raon() {
+        let ws = r"[一-龥぀-ゟ゠-ヿ]+| ?\p{L}+|\p{N}{1,3}|\s*[\r\n]+|\s+(?!\S)|\s+";
+        let pre = pretokenizer_from_hf_json(&split_node(ws, "Isolated", false)).unwrap();
+        assert!(pre.expect("general path").splitters[0].ws_tail.is_some());
+        for re in [
+            r"(?<![A-Za-z])[一-龥぀-ゟ゠-ヿ]+",
+            r"[一-龥぀-ゟ゠-ヿ]+(?=\p{N})",
+            r"(?:(?![一-龥])\p{L})+|[一-龥]+",
+        ] {
+            assert!(
+                matches!(
+                    pretokenizer_from_hf_json(&split_node(re, "Isolated", false)),
+                    Err(TokenizerError::UnsupportedPreTokenizer { .. })
+                ),
+                "{re}"
+            );
+        }
     }
 
     fn hf_path() -> Option<std::path::PathBuf> {

@@ -22,7 +22,7 @@
 //! - Qwen4 native MTP: `qwen3.8-flash-next-gptq3.mq4`;
 //! - Qwen3.5 MTP: `qwen3.8-27b.mq4-xt` with its `.mtp` sidecar.
 
-use hipfire_runtime::loader_api::{CaskConfig, SpecLoadCfg};
+use hipfire_runtime::loader_api::SpecLoadCfg;
 use hipfire_runtime::spec::PrefillOutcome;
 use std::cell::Cell;
 use std::path::PathBuf;
@@ -65,7 +65,6 @@ fn check(path: &str, spec: SpecLoadCfg, expected: &str, empty_prompt_errs: bool)
         None,
         None,
         None,
-        &CaskConfig::default(),
         1,
         spec,
         &mut gpu,

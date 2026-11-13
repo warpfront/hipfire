@@ -318,7 +318,6 @@ fn load_wt(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -346,7 +345,6 @@ fn load_wt(
             m,
             k,
             row_stride: 0,
-            paro: None,
             awq_scale: None,
             lloyd_lut_e4m3: None,
             lloyd_lut_f16: None,
@@ -364,7 +362,6 @@ fn load_wt(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -387,6 +384,8 @@ fn load_wt(
             ))
         }
     };
+    hipfire_runtime::weight_backend::validate_row_extent(dtype, data.len(), m, k, name)
+        .map_err(|e| format!("gemma4-drafter: {e:?}"))?;
     let buf = gpu
         .upload_raw(data, &[data.len()])
         .map_err(|e| format!("gemma4-drafter: upload {name}: {e:?}"))?;
@@ -401,7 +400,6 @@ fn load_wt(
         m,
         k,
         row_stride: 0,
-        paro: None,
         awq_scale,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
@@ -496,7 +494,6 @@ impl Gemma4DrafterWeights {
                 m: cfg.vocab_size,
                 k: hidden,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,

@@ -128,7 +128,6 @@ fn elig(
     has_stop: bool,
     has_speculator: bool,
     has_adaptive: bool,
-    has_pflash: bool,
     has_messages_history: bool,
     think_mode_is_nonthink: bool,
     serve_continuous_batch: bool,
@@ -143,7 +142,6 @@ fn elig(
         has_stop,
         has_speculator,
         has_adaptive,
-        has_pflash,
         has_messages_history,
         think_mode_is_nonthink,
         serve_continuous_batch,
@@ -155,46 +153,43 @@ fn elig(
 fn batch_eligible_only_qwen_text_single_gpu() {
     let _l = begin();
     assert!(elig(
-        5, 1, false, false, false, false, false, false, false, false, true, true, 4
+        5, 1, false, false, false, false, false, false, false, true, true, 4
     ));
     assert!(elig(
-        6, 1, false, false, false, false, false, false, false, false, true, true, 2
+        6, 1, false, false, false, false, false, false, false, true, true, 2
     ));
     assert!(!elig(
-        5, 1, false, false, false, false, false, false, false, false, true, false, 4
+        5, 1, false, false, false, false, false, false, false, true, false, 4
     ));
     assert!(!elig(
-        5, 1, false, false, false, false, false, false, false, false, true, true, 1
+        5, 1, false, false, false, false, false, false, false, true, true, 1
     ));
     assert!(!elig(
-        9, 1, false, false, false, false, false, false, false, false, true, true, 4
+        9, 1, false, false, false, false, false, false, false, true, true, 4
     ));
     assert!(!elig(
-        5, 2, false, false, false, false, false, false, false, false, true, true, 4
+        5, 2, false, false, false, false, false, false, false, true, true, 4
     ));
     assert!(!elig(
-        5, 1, true, false, false, false, false, false, false, false, true, true, 4
+        5, 1, true, false, false, false, false, false, false, true, true, 4
     ));
     assert!(!elig(
-        5, 1, false, true, false, false, false, false, false, false, true, true, 4
+        5, 1, false, true, false, false, false, false, false, true, true, 4
     ));
     assert!(!elig(
-        5, 1, false, false, true, false, false, false, false, false, true, true, 4
+        5, 1, false, false, true, false, false, false, false, true, true, 4
     ));
     assert!(!elig(
-        5, 1, false, false, false, true, false, false, false, false, true, true, 4
+        5, 1, false, false, false, true, false, false, false, true, true, 4
     ));
     assert!(!elig(
-        5, 1, false, false, false, false, true, false, false, false, true, true, 4
+        5, 1, false, false, false, false, true, false, false, true, true, 4
     ));
     assert!(!elig(
-        5, 1, false, false, false, false, false, true, false, false, true, true, 4
+        5, 1, false, false, false, false, false, true, false, true, true, 4
     ));
     assert!(!elig(
-        5, 1, false, false, false, false, false, false, true, false, true, true, 4
-    ));
-    assert!(!elig(
-        5, 1, false, false, false, false, false, false, false, true, true, true, 4
+        5, 1, false, false, false, false, false, false, true, true, true, 4
     ));
 }
 
@@ -204,40 +199,40 @@ fn batch_eligible_refuses_lfm11_and_preserves_qwen() {
     // LFM (arch 11) has no servable batch path: the capability is false, so
     // even a fully clean request is refused and no batch state is allocated.
     assert!(!elig(
-        11, 1, false, false, false, false, false, false, false, false, true, true, 4
+        11, 1, false, false, false, false, false, false, false, true, true, 4
     ));
     assert!(!elig(
-        11, 1, false, false, false, false, false, false, false, false, true, true, 2
+        11, 1, false, false, false, false, false, false, false, true, true, 2
     ));
-    // Same pure exclusions as Qwen: B=1, pp!=1, ep, images, tools, stops, spec, adaptive, pflash, history, think.
+    // Same pure exclusions as Qwen: B=1, pp!=1, ep, images, tools, stops, spec, adaptive, history, think.
     assert!(!elig(
-        11, 1, false, false, false, false, false, false, false, false, true, false, 4
-    ));
-    assert!(!elig(
-        11, 1, false, false, false, false, false, false, false, false, true, true, 1
+        11, 1, false, false, false, false, false, false, false, true, false, 4
     ));
     assert!(!elig(
-        11, 2, false, false, false, false, false, false, false, false, true, true, 4
+        11, 1, false, false, false, false, false, false, false, true, true, 1
     ));
     assert!(!elig(
-        11, 1, true, false, false, false, false, false, false, false, true, true, 4
+        11, 2, false, false, false, false, false, false, false, true, true, 4
     ));
     assert!(!elig(
-        11, 1, false, true, false, false, false, false, false, false, true, true, 4
+        11, 1, true, false, false, false, false, false, false, true, true, 4
+    ));
+    assert!(!elig(
+        11, 1, false, true, false, false, false, false, false, true, true, 4
     ));
     // Archs beside 5/6 stay ineligible (11 included, via the caps refusal above).
     assert!(!elig(
-        12, 1, false, false, false, false, false, false, false, false, true, true, 4
+        12, 1, false, false, false, false, false, false, false, true, true, 4
     ));
     assert!(!elig(
-        9, 1, false, false, false, false, false, false, false, false, true, true, 4
+        9, 1, false, false, false, false, false, false, false, true, true, 4
     ));
     // Qwen still eligible (preserve existing behavior).
     assert!(elig(
-        5, 1, false, false, false, false, false, false, false, false, true, true, 4
+        5, 1, false, false, false, false, false, false, false, true, true, 4
     ));
     assert!(elig(
-        6, 1, false, false, false, false, false, false, false, false, true, true, 4
+        6, 1, false, false, false, false, false, false, false, true, true, 4
     ));
 }
 
@@ -612,6 +607,96 @@ fn fifo_cohort_incompatible_head_blocks_later_compatible() {
     assert!(sched.mark_awaiting_commit(lane_for_k3, pending3));
     batch_apply_terminal_control("commit", &k3.id, k3.attempt_id);
     assert!(sched.commit_lane(lane_for_k3, &k3, admission(&k3)));
+}
+
+/// `assignable_front` is the read-only twin of `try_assign_one`: it names the request that
+/// would be assigned (a free lane and a matching cohort) and changes nothing, so an
+/// admission gate can leave the front queued exactly as a full lane set does.
+#[test]
+fn assignable_front_peeks_what_try_assign_one_would_assign() {
+    let _l = begin();
+    let mut sched = ContinuousBatchScheduler::new(1, 4096);
+    let k1 = AttemptKey::new("r1", 1);
+    let k2 = AttemptKey::new("r2", 2);
+    let k3 = AttemptKey::new("r3", 3);
+    batch_announce_terminal(&k1.id, k1.attempt_id);
+    batch_announce_terminal(&k2.id, k2.attempt_id);
+    batch_announce_terminal(&k3.id, k3.attempt_id);
+    // Nothing queued.
+    assert!(sched.assignable_front().is_none());
+    sched.enqueue(req(k1.clone(), sampling(0.3, 1.0)));
+    sched.enqueue(req(k2.clone(), sampling(0.7, 1.0)));
+    sched.enqueue(req(k3.clone(), sampling(0.3, 1.0)));
+    // A free lane and no cohort: the front. Peeking pops and binds nothing.
+    assert_eq!(sched.assignable_front(), Some(&k1));
+    assert_eq!(sched.assignable_front(), Some(&k1));
+    assert_eq!(sched.inbox.len(), 3);
+    assert_eq!(sched.active_count(), 0);
+    let (assigned, _ticket) = sched.try_assign_one().unwrap();
+    assert_eq!(&assigned, &k1);
+    // No free lane: nothing is assignable, the front stays queued.
+    assert!(sched.assignable_front().is_none());
+    assert_eq!(sched.inbox.front(), Some(&k2));
+}
+
+/// A stale ticket, an unknown lane, another request's key or a latched client abort changes nothing: the caller
+/// then fails the request instead of putting it back in line.
+#[test]
+fn requeue_lane_refuses_a_stale_or_aborted_request() {
+    let _l = begin();
+    let mut sched = ContinuousBatchScheduler::new(1, 4096);
+    let k1 = AttemptKey::new("r1", 1);
+    let k2 = AttemptKey::new("r2", 2);
+    batch_announce_terminal(&k1.id, k1.attempt_id);
+    batch_announce_terminal(&k2.id, k2.attempt_id);
+    sched.enqueue(req(k1.clone(), sampling(0.3, 1.0)));
+    sched.enqueue(req(k2.clone(), sampling(0.3, 1.0)));
+    let (_assigned, ticket) = sched.try_assign_one().unwrap();
+    assert_eq!(sched.inbox.front(), Some(&k2));
+    let admission_k1 = admission(&k1);
+    // Wrong key / wrong lane / wrong admission: nothing changes.
+    assert!(!sched.requeue_lane(0, &k2, admission(&k2)));
+    assert!(!sched.requeue_lane(3, &k1, admission_k1));
+    assert!(!sched.requeue_lane(0, &k1, admission(&k2)));
+    assert_eq!(sched.active_count(), 1);
+    assert_eq!(sched.inbox.len(), 1);
+    // A latched client abort is not requeued (the caller fails the request instead).
+    batch_apply_terminal_control("abort", &k1.id, k1.attempt_id);
+    assert!(!sched.requeue_lane(ticket.lane, &k1, admission_k1));
+    assert_eq!(sched.active_count(), 1);
+}
+
+/// A step that failed on a capacity condition before its request emitted anything puts the request back at the
+/// FRONT of the inbox: the lane is empty again (generation advanced), the pending entry and the admission stay,
+/// the terminal registry is `Queued` again, and the same request is assigned a lane once more, ahead of later
+/// arrivals.
+#[test]
+fn requeue_lane_assigns_the_same_request_again_ahead_of_later_arrivals() {
+    let _l = begin();
+    let mut sched = ContinuousBatchScheduler::new(1, 4096);
+    let k1 = AttemptKey::new("r1", 1);
+    let k2 = AttemptKey::new("r2", 2);
+    batch_announce_terminal(&k1.id, k1.attempt_id);
+    batch_announce_terminal(&k2.id, k2.attempt_id);
+    sched.enqueue(req(k1.clone(), sampling(0.3, 1.0)));
+    sched.enqueue(req(k2.clone(), sampling(0.3, 1.0)));
+    let (_a, first) = sched.try_assign_one().unwrap();
+    assert!(sched.requeue_lane(first.lane, &k1, admission(&k1)));
+    assert_eq!(sched.active_count(), 0);
+    assert_eq!(sched.inbox.front(), Some(&k1));
+    assert_eq!(sched.inbox.back(), Some(&k2));
+    assert!(sched.pending.contains_key(&k1), "the pending entry stays");
+    let (again, second) = sched.try_assign_one().unwrap();
+    assert_eq!(again, k1, "the same request goes first");
+    assert_eq!(second.lane, first.lane);
+    assert!(
+        second.generation > first.generation,
+        "a fresh lane generation"
+    );
+    // It is an ordinary running lane again: it commits like any other.
+    let pending =
+        serde_json::json!({"type":"done","id":k1.id,"attempt_id":k1.attempt_id,"tokens":1});
+    assert!(sched.mark_awaiting_commit(second.lane, pending));
 }
 
 #[test]

@@ -300,13 +300,48 @@ extern "C" __global__ __launch_bounds__(32) void attention_q8_0_flash_prefill_wm
         // A = P (row `half`, 16 keys); B = V^T (dim, 16 keys).
         half16_t p_reg;
         for (int j = 0; j < 16; ++j) p_reg[j] = S_lds[half * S_STRIDE + j];
+        // gfx11 WMMA rounds a sum differently for +0 and -0 zero products, so a masked key's V
+        // sign (P == +0 there) would leak into a row's output. A row whose 16 keys are all
+        // valid takes the plain WMMA; a row with masked keys takes V split by sign (V- first,
+        // then V+), so every masked product is a uniform zero. Chosen per row by absolute
+        // position: a row's bytes do not depend on which rows share its tile.
+        bool rowfull[8];
+        bool any_masked = false;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int r = 2 * j + half_id;
+            rowfull[j] = (r < rows) && (kt + 15) <= positions[q_base + r];
+            any_masked |= (r < rows) && !rowfull[j];
+        }
+        any_masked = __builtin_amdgcn_ballot_w32(any_masked) != 0;
 #pragma unroll
         for (int dc = 0; dc < d_chunks; ++dc) {
             const int d = dc * 16 + half;
             half16_t v_reg;
             for (int j = 0; j < 16; ++j)
                 v_reg[j] = V_lds_T[d * V_STRIDE + j];
-            O_frags[dc] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(p_reg, v_reg, O_frags[dc]);
+            const float8_t one =
+                __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(p_reg, v_reg, O_frags[dc]);
+            if (!any_masked) {
+                O_frags[dc] = one;
+            } else {
+                union { unsigned short h[16]; half16_t v; } u, vp, vn;
+                u.v = v_reg;
+#pragma unroll
+                for (int e = 0; e < 16; ++e) {
+                    const unsigned short b = u.h[e];
+                    const bool sg = (b >> 15) != 0;
+                    vp.h[e] = sg ? (unsigned short)0 : b;
+                    vn.h[e] = sg ? b : (unsigned short)0x8000u;
+                }
+                float8_t sp = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(p_reg, vn.v, O_frags[dc]);
+                sp = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(p_reg, vp.v, sp);
+                float8_t r8;
+#pragma unroll
+                for (int j = 0; j < 8; ++j)
+                    r8[j] = rowfull[j] ? one[j] : sp[j];
+                O_frags[dc] = r8;
+            }
         }
         __syncthreads();
     }

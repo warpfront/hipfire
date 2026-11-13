@@ -1,0 +1,136 @@
+{
+  "oracle": "qwen4_g942_qsa_row_oracle",
+  "seed": 11400714819323198485,
+  "quick": false,
+  "image": "/scratch/quant/fn-fp8/beat/WC8/twine/qsa-device.elf",
+  "cases_pass": 1200,
+  "cases_fail": 0,
+  "controls_detected": 12,
+  "controls_missed": 0,
+  "rows": [
+    {
+      "case": "f32 Geo { nh: 24, nkv: 2, hd: 256 } cap=4096 len=1 Valid",
+      "ok": true,
+      "module_vs_reference": 0,
+      "product_vs_reference": 0,
+      "reference_repeat": 0,
+      "guards_ok": true
+    },
+    {
+      "case": "f32 Geo { nh: 24, nkv: 2, hd: 256 } cap=4096 len=1 Mixed",
+      "ok": true,
+      "module_vs_reference": 0,
+      "product_vs_reference": 0,
+      "reference_repeat": 0,
+      "guards_ok": true
+    },
+    {
+      "case": "f32 Geo { nh: 24, nkv: 2, hd: 256 } cap=4096 len=1 AllInvalid",
+      "ok": true,
+      "module_vs_reference": 0,
+      "product_vs_reference": 0,
+      "reference_repeat": 0,
+      "guards_ok": true
+    },
+    {
+      "case": "f32 Geo { nh: 24, nkv: 2, hd: 256 } cap=4096 len=2 Valid",
+      "ok": true,
+      "module_vs_reference": 0,
+      "product_vs_reference": 0,
+      "reference_repeat": 0,
+      "guards_ok": true
+    },
+    {
+      "case": "f32 Geo { nh: 24, nkv: 2, hd: 256 } cap=4096 len=2 Mixed",
+      "ok": true,
+      "module_vs_reference": 0,
+      "product_vs_reference": 0,
+      "reference_repeat": 0,
+      "guards_ok": true
+    },
+    {
+      "case": "f32 Geo { nh: 24, nkv: 2, hd: 256 } cap=4096 len=2 AllInvalid",
+      "ok": true,
+      "module_vs_reference": 0,
+      "product_vs_reference": 0,
+      "reference_repeat": 0,
+      "guards_ok": true
+    },
+    {
+      "case": "f32 Geo { nh: 24, nkv: 2, hd: 256 } cap=4096 len=3 Valid",
+      "ok": true,
+      "module_vs_reference": 0,
+      "product_vs_reference": 0,
+      "reference_repeat": 0,
+      "guards_ok": true
+    },
+    {
+      "case": "f32 Geo { nh: 24, nkv: 2, hd: 256 } cap=4096 len=3 Mixed",
+      "ok": true,
+      "module_vs_reference": 0,
+      "product_vs_reference": 0,
+      "reference_repeat": 0,
+      "guards_ok": true
+    },
+    {
+      "control": "f32 flip_v_byte",
+      "differing_bytes": 47,
+      "detected": true
+    },
+    {
+      "control": "f32 flip_k_byte",
+      "differing_bytes": 10674,
+      "detected": true
+    },
+    {
+      "control": "f32 flip_q_byte",
+      "differing_bytes": 965,
+      "detected": true
+    },
+    {
+      "control": "f32 swap_kv_binding",
+      "differing_bytes": 23308,
+      "detected": true
+    },
+    {
+      "control": "f32 selected_len_minus_1",
+      "differing_bytes": 20168,
+      "detected": true
+    },
+    {
+      "control": "f32 wrong_entry(qwen4_g942_qsa_row_fp8_fnuz)",
+      "differing_bytes": 24489,
+      "detected": true
+    },
+    {
+      "control": "fp8_fnuz flip_v_byte",
+      "differing_bytes": 48,
+      "detected": true
+    },
+    {
+      "control": "fp8_fnuz flip_k_byte",
+      "differing_bytes": 8268,
+      "detected": true
+    },
+    {
+      "control": "fp8_fnuz flip_q_byte",
+      "differing_bytes": 984,
+      "detected": true
+    },
+    {
+      "control": "fp8_fnuz swap_kv_binding",
+      "differing_bytes": 23716,
+      "detected": true
+    },
+    {
+      "control": "fp8_fnuz selected_len_minus_1",
+      "differing_bytes": 19858,
+      "detected": true
+    },
+    {
+      "control": "fp8_fnuz wrong_entry(qwen4_g942_qsa_row_f32)",
+      "differing_bytes": 24480,
+      "detected": true
+    }
+  ]
+}

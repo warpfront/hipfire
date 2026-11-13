@@ -52,7 +52,7 @@ fn open_claim(_socket: &std::path::Path) -> Result<GpuLocks, String> {
 }
 
 /// Weight-host v1 envelope (dense Qwen3.5 arch 5, single card, no drafter,
-/// MTP, vision, PFlash, head overlay or slot engine). Requests outside it are
+/// MTP, vision, head overlay or slot engine). Requests outside it are
 /// refused before any teardown: nothing may load privately once opted in.
 pub(crate) fn load_refusal(opted_in: bool, msg: &serde_json::Value) -> Option<String> {
     if !opted_in {

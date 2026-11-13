@@ -19,7 +19,7 @@ wrote to disk were discarded and re-run rather than quoted.
 
 ## Step 1 — resolved-mode gate (PASSED)
 
-Spec §4.4: `QWEN35_PARO_POLICY` omits `Asym3` from its `accepted` set, so
+Spec §4.4: a loader policy that omits `Asym3` from its `accepted` set means
 `HIPFIRE_KV_MODE=asym3` can silently resolve to q8, which would make the whole
 comparison q8-vs-q8 and meaningless. Confirmed distinct on every arm. The
 candidate arm logs:
