@@ -1032,8 +1032,10 @@ fn execute_window<'a>(
         // group's steps are announced here, once each in program order, after
         // every refusal check and before the grouped launch; a refused group
         // announced nothing and each step is announced by the plain path below.
-        // Exact gfx942 also groups one-row F32
-        // Core steps, up to `QWEN4_GDN_LANES_F32_MAX` of them (`pipeline/gdn.rs`).
+        // Exact gfx942 also groups the uncaptured F32 Core steps of any row count (one-row AR
+        // lanes and the multi-row prefill lanes of a wave), up to `QWEN4_GDN_LANES_F32_MAX`
+        // of them: every lane's convolution, one recurrence launch per distinct row count,
+        // every lane's gated norm (`pipeline/gdn.rs`).
         let core_lane = |gpu: &Gpu, op: &crate::pipeline::layer_ops::GatedDeltaNetOp<'_>| {
             crate::pipeline::layer_ops::gdn_core_lane_groupable(gpu, op)
                 || crate::pipeline::gdn::core_lane_f32_gfx942(gpu, op)

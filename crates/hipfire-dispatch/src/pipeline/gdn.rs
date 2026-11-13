@@ -10,21 +10,31 @@
 //! the gated norm (`gated_delta_gate_batched`). The recurrence is the one launch that costs
 //! a launch per lane per layer for nothing (30.7 us per lane at 8 lanes,
 //! `beat/L/L-K2-GDN.md`): for a group of consecutive Core steps this module runs every
-//! lane's convolution, then ONE batched recurrence launch over all lanes' own tensors, then
-//! every lane's gated norm. Two kinds of lane join a group:
+//! lane's convolution, then the batched recurrence launch(es) over all lanes' own tensors,
+//! then every lane's gated norm. Two kinds of lane join a group:
 //!
-//! * the one-row AR lane (no capture ring): `qwen4_gdn_lanes_step_f32_gfx942`, the
-//!   `gated_delta_step_pipe128_f32` body that lane's own launch runs;
+//! * the uncaptured lane (no capture ring) of any row count: the one-row AR lane and the
+//!   multi-row prefill lane of a wave (stage policy `gdn_in=once, gdn_core=lane,
+//!   gdn_out=once`), each with its own `op.rows` rows. The recurrence is
+//!   `qwen4_gdn_lanes_step_f32_gfx942`, the `gated_delta_step_pipe128_f32` body that lane's
+//!   own launch runs, ONE launch per distinct row count in the group (the launch has one
+//!   uniform `rows`; lanes of equal rows go together, groups in plan order). A row-count
+//!   group of one lane still takes the lanes launch: it is byte-identical to the per-lane
+//!   launch (the oracle's one-lane case), so a lone lane needs no special route;
 //! * the 2..=8-row verify lane under its armed capture ring (native MTP lanes, F32 state): the
 //!   capture branch's chain (qkv rows copied into the capture's `inputs`, convolution + gate
 //!   parameters into the retained recurrence input, the recurrence with its final state stored
 //!   to ring slot `rows - 1` with the live state left intact, gated norm), the recurrence as
 //!   `qwen4_gdn_lanes_step_capture_f32_gfx942`, one launch per row count in the group.
 //!
-//! The lanes share no written byte (checked here), so each lane's state and outputs equal its
-//! per-lane chain byte for byte; a group the route does not take (a shape or format it does
-//! not cover, a lane the per-lane path would send elsewhere) is handed back untouched and
-//! runs per lane.
+//! Ordering: the lanes share no written byte and no lane reads a byte another lane writes
+//! (checked here, across every kind of buffer), so each lane's chain (convolution, recurrence,
+//! gate) touches only that lane's own bytes; running every convolution, then the recurrences,
+//! then every gate gives each lane exactly its per-lane chain's bytes. A group with a lane the
+//! per-lane path would send elsewhere (a route this module does not replicate: chunked /
+//! dense recurrence, an FWHT-rotated output projection, an open stream) is handed back
+//! untouched and runs per lane. A group mixing verify lanes with multi-row uncaptured lanes is
+//! handed back too (the verify launch admits the one-row AR lanes only); it runs per lane.
 
 use super::layer_ops::{
     gdn_persistent_batch, hip, rotation_basis, view, GatedDeltaNetOp, GdnRowCapture, MixerPhase,
@@ -73,15 +83,18 @@ pub(crate) fn core_lanes_group_max(gpu: &Gpu) -> usize {
 }
 
 /// Whether `op` can join an [`execute_core_lanes_f32_gfx942`] group: the F32 Core step of a
-/// lane that is either one AR row with no capture ring, or a 2..=[`GDN_CORE_LANE_ROWS`]-row
-/// verify window under its armed capture ring (both the persistent-batch branch on gfx942).
+/// lane that is either an uncaptured lane of any row count (the one-row AR lane or a prefill
+/// lane's whole row window: no capture ring), or a 2..=[`GDN_CORE_LANE_ROWS`]-row verify
+/// window under its armed capture ring (all the persistent-batch branch on gfx942: the
+/// chunked WMMA recurrence and the WY / dense streams are not admitted there, which
+/// [`lane_declined`] re-checks per lane with its real rows).
 pub(crate) fn core_lane_f32_gfx942(gpu: &Gpu, op: &GatedDeltaNetOp<'_>) -> bool {
     lanes_f32_gfx942_admitted(gpu)
         && op.phase == MixerPhase::Core
         && op.format == GdnStateFormat::F32
         && op.residual.is_none()
         && match &op.row_capture {
-            None => op.rows == 1,
+            None => op.rows >= 1,
             Some(_) => (2..=GDN_CORE_LANE_ROWS).contains(&op.rows),
         }
         // An open stream must run the per-op route, which seals it.
@@ -92,8 +105,11 @@ pub(crate) fn core_lane_f32_gfx942(gpu: &Gpu, op: &GatedDeltaNetOp<'_>) -> bool 
         && gdn_persistent_batch(gpu, op, op.rows)
 }
 
-/// The tensors one one-row AR lane's Core chain names, exactly as the persistent-batch branch of
-/// `execute_gated_delta_net_hc_impl` takes them for a Core op of one row (`lo = 0`).
+/// The tensors one uncaptured lane's Core chain names, exactly as the persistent-batch branch
+/// of `execute_gated_delta_net_hc_impl` takes them for a whole Core op of `op.rows` rows
+/// (`lo = 0`, no capture, not chunked): the F32 views of `rows * qkv` projection and
+/// convolution output, `rows * value_heads` a / b / gate / beta, `rows * value` z /
+/// recurrent output / gated output.
 struct CoreViews {
     projection: GpuTensor,
     conv_output: GpuTensor,
@@ -107,18 +123,20 @@ struct CoreViews {
 }
 
 fn core_views(op: &GatedDeltaNetOp<'_>) -> CoreViews {
+    let rows = op.rows;
     let value = op.value_heads * op.value_dim;
     let qkv = 2 * op.key_heads * op.key_dim + value;
+    let heads = rows * op.value_heads;
     CoreViews {
-        projection: view(op.projection, 0, qkv),
-        conv_output: view(op.projection2, 0, qkv),
-        a: view(op.a, 0, op.value_heads),
-        b: view(op.b, 0, op.value_heads),
-        gate: view(op.gate, 0, op.value_heads),
-        beta: view(op.beta, 0, op.value_heads),
-        z: view(op.z_output, 0, value),
-        recurrent_output: view(op.recurrent_output, 0, value),
-        gdn_output: view(op.output_scratch, 0, value),
+        projection: view(op.projection, 0, rows * qkv),
+        conv_output: view(op.projection2, 0, rows * qkv),
+        a: view(op.a, 0, heads),
+        b: view(op.b, 0, heads),
+        gate: view(op.gate, 0, heads),
+        beta: view(op.beta, 0, heads),
+        z: view(op.z_output, 0, rows * value),
+        recurrent_output: view(op.recurrent_output, 0, rows * value),
+        gdn_output: view(op.output_scratch, 0, rows * value),
     }
 }
 
@@ -155,6 +173,41 @@ fn capture_views(op: &GatedDeltaNetOp<'_>, capture: &GdnRowCapture<'_>) -> Captu
         recurrent_output: view(op.recurrent_output, 0, rows * value),
         gdn_output: view(op.output_scratch, 0, rows * value),
     }
+}
+
+/// Whether the uncaptured lanes' written ranges (conv ring, convolution output, gate, beta,
+/// recurrent output, gated output, state) are pairwise disjoint across every lane and kind of
+/// buffer, and none of the lanes' read ranges (qkv projection, a, b, z) overlaps any of them.
+/// Then lanes touch only their own bytes, so the phases may run lane-by-lane or all lanes at
+/// once with the same result.
+fn uncaptured_lanes_independent(lanes: &[(&GatedDeltaNetOp<'_>, CoreViews)]) -> bool {
+    let mut writes: Vec<(usize, usize)> = Vec::with_capacity(7 * lanes.len());
+    for (op, v) in lanes {
+        for t in [
+            op.conv_state,
+            &v.conv_output,
+            &v.gate,
+            &v.beta,
+            &v.recurrent_output,
+            &v.gdn_output,
+            op.recurrent,
+        ] {
+            writes.push(extent(t));
+        }
+    }
+    writes.sort_unstable();
+    if !writes.windows(2).all(|w| w[0].0 + w[0].1 <= w[1].0) {
+        return false;
+    }
+    // The last write starting before a read's end is the only one that can reach back over
+    // the read's start (the writes are disjoint and sorted).
+    lanes.iter().all(|(_, v)| {
+        [&v.projection, &v.a, &v.b, &v.z].into_iter().all(|t| {
+            let (start, bytes) = extent(t);
+            let at = writes.partition_point(|w| w.0 < start + bytes);
+            at == 0 || writes[at - 1].0 + writes[at - 1].1 <= start
+        })
+    })
 }
 
 /// Whether the byte ranges `(start, bytes)` are pairwise disjoint.
@@ -244,8 +297,8 @@ where
                     residual: op.residual,
                     output: &views.recurrent_output,
                     row_states: None,
-                    rows: 1,
-                    qkv_width: views.conv_output.numel(),
+                    rows: op.rows,
+                    qkv_width: views.conv_output.numel() / op.rows,
                     key_heads: op.key_heads,
                     value_heads: op.value_heads,
                     key_dim: op.key_dim,
@@ -283,9 +336,19 @@ where
             }
         }
     }
+    // The verify launch (and the capture chain it replays) admits the one-row AR lanes beside
+    // its verify lanes, nothing wider: a group that mixes them with multi-row uncaptured lanes
+    // runs per lane.
+    if !capture_lanes.is_empty() && ar_lanes.iter().any(|(op, _)| op.rows != 1) {
+        return Ok(Gfx942GdnLanes::Declined(before_launch));
+    }
     // The phases reorder lane chains against each other: lanes must share no written buffer
     // (the conv ring, the recurrence inputs and outputs, the gated output and the state / its
-    // capture ring), or a lane's chain would see another's writes.
+    // capture ring), or a lane's chain would see another's writes. The uncaptured lanes
+    // additionally write no byte any lane reads, whatever kind of buffer it is.
+    if !uncaptured_lanes_independent(&ar_lanes) {
+        return Ok(Gfx942GdnLanes::Declined(before_launch));
+    }
     let sets: [Vec<(usize, usize)>; 11] = [
         ar_lanes
             .iter()
@@ -423,7 +486,11 @@ where
     let history_rows = first.conv_kernel.saturating_sub(1);
     let qkv = 2 * first.key_heads * first.key_dim + first.value_heads * first.value_dim;
 
-    // The one-row AR lanes: convolution + gate parameters, ONE recurrence launch, gated norms.
+    // The uncaptured lanes (one-row AR lanes and multi-row prefill lanes, each on its own
+    // `op.rows`): every lane's convolution + gate parameters, the recurrence as ONE lanes
+    // launch per distinct row count (lanes of equal rows together, row counts in plan order),
+    // every lane's gated norm. The lanes write only their own bytes (checked above), so this
+    // phase order gives each lane exactly its per-lane chain's bytes.
     if !ar_lanes.is_empty() {
         for (op, v) in &ar_lanes {
             let start_cursor = op.start_position % history_rows;
@@ -433,7 +500,7 @@ where
                 history: op.conv_state,
                 output: &v.conv_output,
                 next_history: op.conv_state,
-                rows: 1,
+                rows: op.rows,
                 channels: qkv,
                 history_rows,
                 kernel_size: op.conv_kernel,
@@ -446,34 +513,43 @@ where
                 dt_bias: op.dt_bias,
                 gate: &v.gate,
                 beta: &v.beta,
-                rows: 1,
+                rows: op.rows,
                 heads: value_heads,
             };
             hip(gated_delta_conv_params_batched(gpu, &conv, &params))?;
         }
-        let lanes: Vec<Qwen4GdnLanesF32Lane<'_>> = ar_lanes
-            .iter()
-            .map(|(op, v)| Qwen4GdnLanesF32Lane {
-                projection: &v.conv_output,
-                gate: &v.gate,
-                beta: &v.beta,
-                state: op.recurrent,
-                output: &v.recurrent_output,
-            })
-            .collect();
+        let mut row_counts: Vec<usize> = Vec::new();
+        for (op, _) in &ar_lanes {
+            if !row_counts.contains(&op.rows) {
+                row_counts.push(op.rows);
+            }
+        }
         let mut device = gpu.try_gfx942().ok_or_else(|| {
             DispatchError::Hip("gfx942 GDN lanes: the context is not exact gfx942".into())
         })?;
-        hip(device.qwen4_gdn_lanes_step_f32(
-            &lanes,
-            Qwen4GdnLanesF32Shape {
-                rows: 1,
-                key_heads: first.key_heads,
-                value_heads,
-                key_dim: first.key_dim,
-                value_dim: first.value_dim,
-            },
-        ))?;
+        for rows in row_counts {
+            let lanes: Vec<Qwen4GdnLanesF32Lane<'_>> = ar_lanes
+                .iter()
+                .filter(|(op, _)| op.rows == rows)
+                .map(|(op, v)| Qwen4GdnLanesF32Lane {
+                    projection: &v.conv_output,
+                    gate: &v.gate,
+                    beta: &v.beta,
+                    state: op.recurrent,
+                    output: &v.recurrent_output,
+                })
+                .collect();
+            hip(device.qwen4_gdn_lanes_step_f32(
+                &lanes,
+                Qwen4GdnLanesF32Shape {
+                    rows,
+                    key_heads: first.key_heads,
+                    value_heads,
+                    key_dim: first.key_dim,
+                    value_dim: first.value_dim,
+                },
+            ))?;
+        }
         for (op, v) in &ar_lanes {
             hip(gated_delta_gate_batched(
                 gpu,
@@ -482,7 +558,7 @@ where
                     z: &v.z,
                     norm: op.norm,
                     output: &v.gdn_output,
-                    rows: 1,
+                    rows: op.rows,
                     value_heads,
                     value_dim: op.value_dim,
                 },

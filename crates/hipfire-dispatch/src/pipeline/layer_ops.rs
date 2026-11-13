@@ -4248,9 +4248,9 @@ pub fn execute_gated_delta_net_core_lanes(
     ops: &[&GatedDeltaNetOp<'_>],
     before_launch: impl FnOnce(&mut Gpu) -> Result<(), DispatchError>,
 ) -> Result<bool, DispatchError> {
-    // Exact gfx942: the one-row F32 lanes'
-    // recurrence as one launch over every lane (`pipeline/gdn.rs`); a group it declines
-    // falls through to the gfx11+ multi-lane kernels below, which refuse it too.
+    // Exact gfx942: the uncaptured F32 lanes (one-row AR lanes and multi-row prefill lanes) and
+    // the armed verify lanes as batched launches over every lane (`pipeline/gdn.rs`); a group it
+    // declines falls through to the gfx11+ multi-lane kernels below, which refuse it too.
     let before_launch = match super::gdn::execute_core_lanes_f32_gfx942(gpu, ops, before_launch)? {
         super::gdn::Gfx942GdnLanes::Done => return Ok(true),
         super::gdn::Gfx942GdnLanes::Declined(before_launch) => before_launch,
