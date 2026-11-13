@@ -587,7 +587,6 @@ pub struct FeatureFlags {
     /// `HIPFIRE_AR_GRAPH`). Default on, except on Windows exact gfx1100, where
     /// it defaults off (#655); see [`graph_ar_default`].
     pub graph_ar: bool,
-    pub graph_moe: bool,
     pub force_blob_path: bool,
     /// `HIPFIRE_RESIDUAL_KSPLIT_OFF=1` disables the exact-gfx1100 split-K LDS
     /// residual tier (N<=16 DFlash verify) and restores the historical base
@@ -1560,7 +1559,6 @@ impl FeatureFlags {
             // Graph / capture / deterministic
             graph_forward: parse_bool("HIPFIRE_GRAPH"),
             graph_ar: resolve_graph_ar(value("HIPFIRE_AR_GRAPH").ok().as_deref(), arch, windows),
-            graph_moe: value("HIPFIRE_GRAPH_MOE").ok().as_deref() != Some("0"),
             force_blob_path: value("HIPFIRE_BLOB_FORCE").ok().as_deref() == Some("1"),
             residual_ksplit_off: value("HIPFIRE_RESIDUAL_KSPLIT_OFF").ok().as_deref() == Some("1"),
             residual_ldsstage: parse_bool("HIPFIRE_RESIDUAL_LDSSTAGE").unwrap_or(arch == "gfx1100"),
@@ -2641,7 +2639,6 @@ impl FeatureFlags {
             moe_grouped_gemm: true,
             graph_forward: None,
             graph_ar: true,
-            graph_moe: true,
             force_blob_path: false,
             residual_ksplit_off: false,
             gfx12_gdn_pre_fused: false,
@@ -2880,7 +2877,6 @@ mod tests {
                 assert!(!flags(Some("0")).graph_ar, "{arch} windows={windows}: 0");
                 assert!(flags(Some("1")).graph_ar, "{arch} windows={windows}: 1");
                 // The sibling graph switches are not touched by the platform.
-                assert!(flags(None).graph_moe, "{arch} windows={windows}: graph_moe");
                 assert_eq!(
                     flags(None).graph_forward,
                     None,

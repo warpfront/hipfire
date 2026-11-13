@@ -8,7 +8,6 @@ runtime_config	*	chat_template_file=None
 runtime_config	*	devices=None
 runtime_config	*	dflash_fast_sample=true
 runtime_config	*	dflash_ngram_block=None
-runtime_config	*	draft_f16=true
 runtime_config	*	draft_gemm_dump=false
 runtime_config	*	draft_subphase=false
 runtime_config	*	emulate_gpus=None

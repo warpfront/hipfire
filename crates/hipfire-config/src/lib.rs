@@ -2361,15 +2361,6 @@ pub static FIELDS: &[ConfigField] = &[
         "HIPFIRE_PREFILL_CHUNK_ROWS",
         "Widened ordinary-prefill chunk ceiling in rows (arch default 8192 on exact gfx1100/gfx1151/gfx1201, 512 elsewhere; HIPFIRE_PREFILL_MAX_BATCH overrides; per-device VRAM admission may select a smaller rung). Resident Qwen3.5/3.6 MoE models (fully resident, single device, grouped MQ4 producers) take one widened rung instead: unset requests 4096 rows, admitted only when the projected prefill batch scratch plus grouped/projection workspace plus the 1 GiB margin fit the free VRAM, else the incumbent 512 (arch default) ceiling with no intermediate rung; an explicit value below 4096 or HIPFIRE_PREFILL_MAX_BATCH keeps the incumbent, one at or above 4096 requests the admitted rung (the actual admitted chunk is logged as `prefill_chunk: requested=… admitted=…`). Dense Qwen3.5/3.6 keeps the 8192 ladder above. Qwen4 (Flash-Next) rounds it down to 256 rows; its auto expert placement is sized from the same chunk: the explicit value, else 8192 on exact gfx1151, 4096 on exact gfx1201, 1536 elsewhere; exact gfx1100 on a measured narrow discrete host link (below 16 GB/s, probed before placement is sized) defaults to 8192, ceding resident expert layers for the wider chunk (an explicit value never probes and is authoritative for placement; 1536 opts out)."
     ),
-    process_bool_field!(
-        "speculation.draft_f16",
-        "draft_f16",
-        Speculation,
-        true,
-        false,
-        "HIPFIRE_DRAFT_F16",
-        "Keep DFlash draft activations in FP16."
-    ),
     diagnostic_bool_field!(
         "diagnostic.prompt_token_heat",
         "prompt_token_heat",
@@ -3260,15 +3251,6 @@ pub static FIELDS: &[ConfigField] = &[
         "Allow autoregressive forward graph capture when otherwise eligible. Default on, except Windows gfx1100, where it defaults off (opt-in) because graph replay silently produced wrong output (#655); an explicit true/false or HIPFIRE_AR_GRAPH always wins."
     ),
     process_bool_field!(
-        "experimental.graph.moe",
-        "graph_moe",
-        Experimental,
-        true,
-        true,
-        "HIPFIRE_GRAPH_MOE",
-        "Allow graph capture for supported MoE forward paths."
-    ),
-    process_bool_field!(
         "kernel.deterministic",
         "deterministic",
         Kernel,
@@ -4078,6 +4060,22 @@ pub static RETIRED_CONFIG_KEYS: &[RetiredConfigKey] = &[
         removed_in: "0.5.0",
         reason: "the Jinja chat opt-out was removed (HIPF-396)",
         replacement: "none; chat prompts render through the model template when one is present",
+    },
+    RetiredConfigKey {
+        key: "speculation.draft_f16",
+        legacy_key: "draft_f16",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "the DFlash draft F16→F32 lift opt-out was removed (HIPF-396)",
+        replacement: "none; F16 draft weights always stay F16",
+    },
+    RetiredConfigKey {
+        key: "experimental.graph.moe",
+        legacy_key: "graph_moe",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "the MoE graph-capture opt-out was removed (HIPF-396)",
+        replacement: "experimental.graph.forward = false disables forward graph capture for every model",
     },
 ];
 
@@ -6766,7 +6764,6 @@ fn config_profile_bundle(name: &str) -> Option<Vec<(&'static str, ConfigValue)>>
                 ConfigValue::String("auto".to_owned()),
             ),
             ("experimental.graph.ar", ConfigValue::Bool(true)),
-            ("experimental.graph.moe", ConfigValue::Bool(true)),
             ("diagnostic.prompt_token_heat", ConfigValue::Bool(false)),
             ("diagnostic.prompt_heat_json", ConfigValue::Bool(false)),
             ("diagnostic.prompt_heat_limit", ConfigValue::Integer(64)),
@@ -8345,7 +8342,7 @@ mod tests {
             }
         }
         values.values.insert(
-            "developer.dspark_q8_wmma".into(),
+            "developer.dspark_debug".into(),
             ConfigValue::String("1".into()),
         );
         values
@@ -8361,7 +8358,7 @@ mod tests {
             .filter_map(|schema| schema.env_compat)
             .collect();
         names.extend([
-            "HIPFIRE_DSPARK_Q8_WMMA",
+            "HIPFIRE_DSPARK_DEBUG",
             "HIPFIRE_NGRAM_WINDOW",
             "NOT_HIPFIRE",
         ]);

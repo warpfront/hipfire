@@ -21,7 +21,6 @@ lm_head_f16 = "auto"
 # Replaces the former graph environment controls.
 forward = "auto"
 ar = true
-moe = true
 
 [diagnostic]
 prompt_token_heat = false

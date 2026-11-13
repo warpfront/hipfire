@@ -46,10 +46,8 @@
 //!     same invariant the qwen35/gemma4 evals rely on; no per-chunk reset of
 //!     recurrent state is needed.
 //!   * determinism: `HIPFIRE_NORMALIZE_PROMPT=0`, `HIPFIRE_GRAPH=0` are forced
-//!     before GPU init, mirroring gemma4. A grep of
-//!     `crates/hipfire-arch-muse-glimmer/` and `crates/hipfire-runtime/` for
-//!     `HIPFIRE_GLIMMER*GRAPH` finds no Glimmer-specific graph env var (unlike
-//!     `HIPFIRE_GEMMA4_GRAPH`); only the two generic knobs are set.
+//!     before GPU init, mirroring gemma4. Glimmer has no model-specific graph
+//!     env var; only the two generic knobs are set.
 //!
 //! Chunking semantics match llama-perplexity: only the second-half window
 //! [n_ctx/2 .. n_ctx-1) is scored (scored_per_chunk = n_ctx - 1 - n_ctx/2).
@@ -123,22 +121,13 @@ fn main() {
 
     // Force determinism knobs (mirror build_kld_ref_native / build_kld_ref_native_gemma4).
     // SAFETY: single-threaded init phase.
-    // Grep for HIPFIRE_GLIMMER*GRAPH in crates/hipfire-arch-muse-glimmer/ and
-    // crates/hipfire-runtime/ finds no Glimmer-specific graph var (unlike
-    // HIPFIRE_GEMMA4_GRAPH). Only the two generic knobs are set.
-    //
-    // HIPFIRE_GLIMMER_KV_VMM is pinned explicitly rather than left to its
-    // default. Glimmer's dual Q8 KV allocates through either
-    // `new_gpu_q8_vmm_capped_filtered` or `new_gpu_q8` depending on this var
-    // (glimmer.rs:1864, default enabled). The KLD invariant requires the
-    // reference and `eval_hipfire_glimmer` to allocate KV IDENTICALLY so Q8
-    // quantization noise cancels and the divergence isolates weight precision.
-    // Leaving it implicit here while the eval pins it would silently break that
-    // invariant for anyone with the var already set in their environment.
+    // Glimmer has no model-specific graph var; only the two generic knobs are
+    // set. `GlimmerState::new_with_max_seq` always allocates the dual Q8 KV
+    // through VMM, the same as `eval_hipfire_glimmer`, so Q8 quantization
+    // noise cancels and the divergence isolates weight precision.
     unsafe {
         std::env::set_var("HIPFIRE_NORMALIZE_PROMPT", "0");
         std::env::set_var("HIPFIRE_GRAPH", "0");
-        std::env::set_var("HIPFIRE_GLIMMER_KV_VMM", "1");
     }
 
     // -------- load oracle model + tokenizer --------

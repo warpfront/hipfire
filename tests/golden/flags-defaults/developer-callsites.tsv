@@ -7,7 +7,6 @@ developer_callsite	*	?env#developer_var=is_ok
 developer_callsite	*	?family.env_var()#developer_bool=false
 developer_callsite	*	?name#developer_var=-
 developer_callsite	*	?name#developer_var=as_deref.!=Ok("0")
-developer_callsite	*	?name#developer_var=map.unwrap_or(true)
 developer_callsite	*	?name#developer_var=ok
 developer_callsite	*	?name#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	?name#developer_var=ok.filter
@@ -54,7 +53,6 @@ developer_callsite	*	HIPFIRE_CACHE_CKPT_MAX#developer_var=ok.and_then.unwrap_or(
 developer_callsite	*	HIPFIRE_CACHE_CKPT_MAX#developer_var=ok.and_then.unwrap_or(8usize)
 developer_callsite	*	HIPFIRE_CALIB_BF16#developer_bool=false
 developer_callsite	*	HIPFIRE_CALIB_F64_AUDIT#developer_var=ok.as_deref.==Some("1")
-developer_callsite	*	HIPFIRE_CALIB_HESSIAN_STORAGE#developer_var=ok.as_deref.map.as_deref
 developer_callsite	*	HIPFIRE_CB_DFLASH_DRAFT_BATCH#developer_var=map_or(true, |v| v.trim() != "0")
 developer_callsite	*	HIPFIRE_CB_DFLASH_DRAFT_BATCH#developer_var=ok.as_deref.!=Some("0")
 developer_callsite	*	HIPFIRE_CB_DN_SAVE_FREE#developer_var=-
@@ -194,7 +192,6 @@ developer_callsite	*	HIPFIRE_DS4_REPLAY_INVENTORY#developer_var=ok.as_deref.==So
 developer_callsite	*	HIPFIRE_DS4_REPLAY_SEQUENCE#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_DS4_ROUTE_DUMP#developer_var=is_ok
 developer_callsite	*	HIPFIRE_DS4_ROUTE_DUMP#developer_var=ok
-developer_callsite	*	HIPFIRE_DSPARK_ADAPTIVE_BLOCK#developer_var=ok.as_deref.!=Some("0")
 developer_callsite	*	HIPFIRE_DSPARK_DEBUG#developer_var=as_deref.==Ok("1")
 developer_callsite	*	HIPFIRE_DSPARK_KERNEL_PROFILE_POSITION#developer_var=ok.and_then
 developer_callsite	*	HIPFIRE_DSPARK_PROFILE#developer_var=map.unwrap_or(false)
@@ -360,7 +357,6 @@ developer_callsite	*	HIPFIRE_GDN_SCAN_OUT_EMU#developer_var=is_ok
 developer_callsite	*	HIPFIRE_GDN_SCAN_OUT_EMU#developer_var=ok
 developer_callsite	*	HIPFIRE_GDN_ZBA_FOLD#developer_bool=true
 developer_callsite	*	HIPFIRE_GEMMA4_EAGLE#developer_var=ok.as_deref.==Some("1")
-developer_callsite	*	HIPFIRE_GEMMA4_GRAPH#developer_var=ok.as_deref
 developer_callsite	*	HIPFIRE_GEMMA4_LOGIT_TRACE_DIR#developer_var_os=-
 developer_callsite	*	HIPFIRE_GEMMA4_LOGIT_TRACE_FULL_STEPS#developer_var=unwrap_or_default
 developer_callsite	*	HIPFIRE_GEMMA4_LOGIT_TRACE_MAX_STEPS#developer_var=ok.and_then.unwrap_or(8192)
@@ -459,7 +455,6 @@ developer_callsite	*	HIPFIRE_GLIMMER_CTX_CAP#developer_var=ok.and_then.filter.un
 developer_callsite	*	HIPFIRE_GLIMMER_CTX_CAP#developer_var=ok.and_then.filter.unwrap_or(hipfire_arch_muse_glimmer::drafter::G...)
 developer_callsite	*	HIPFIRE_GLIMMER_DEVICE_CAPTURE#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_GLIMMER_DEVICE_CAPTURE_AUDIT#developer_var=ok.as_deref.==Some("1")
-developer_callsite	*	HIPFIRE_GLIMMER_KV_VMM#developer_var=map.unwrap_or(true)
 developer_callsite	*	HIPFIRE_GLIMMER_PREFILL_CHUNK#developer_var=ok.and_then
 developer_callsite	*	HIPFIRE_GLIMMER_SPEC_DIAG#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_GLIMMER_SPEC_FALLBACK#developer_var=ok.as_deref.!=Some("1")
@@ -569,7 +564,6 @@ developer_callsite	*	HIPFIRE_MQ4V2_SHARED_DOWN_FUSED#developer_var=map.unwrap_or
 developer_callsite	*	HIPFIRE_MQ6V2_DOWN_TIGHT_GRID#developer_var=as_deref.==Ok("1")
 developer_callsite	*	HIPFIRE_MQ6V2_GATE_UP_TIGHT_GRID#developer_var=as_deref
 developer_callsite	*	HIPFIRE_MQ6_RESID_PM_GFX1100#developer_bool=true
-developer_callsite	*	HIPFIRE_MQV2_GFX11_WMMA#developer_var=ok.as_deref
 developer_callsite	*	HIPFIRE_MTP_AR_FLOOR#developer_var=as_deref.!=Ok("0")
 developer_callsite	*	HIPFIRE_MTP_DRAFT_HEAD#developer_var=unwrap_or_else
 developer_callsite	*	HIPFIRE_MTP_FILL_FAST#developer_bool=true

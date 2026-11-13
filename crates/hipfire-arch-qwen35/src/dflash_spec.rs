@@ -3326,8 +3326,8 @@ impl Speculator for DflashSpeculator {
 /// interval/cap
 /// (`HIPFIRE_CACHE_CKPT_INTERVAL`/`_MAX`, matching the daemon's
 /// `ckpt_interval()`/`ckpt_max()` defaults), plus the adaptive-B kill-switch
-/// (`HIPFIRE_DFLASH_ADAPTIVE_B=0` forces the fixed full block, mirroring
-/// DSpark's `HIPFIRE_DSPARK_ADAPTIVE_BLOCK=0`). Called once at load.
+/// (`HIPFIRE_DFLASH_ADAPTIVE_B=0` forces the fixed full block). Called once
+/// at load.
 /// `adaptive_b` is the `SpecLoadCfg::dflash_adaptive_b` load param (None =
 /// default off).
 pub fn build_dflash_speculator(df: DflashState, adaptive_b: bool) -> Box<dyn Speculator> {

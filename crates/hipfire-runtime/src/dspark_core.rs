@@ -9,30 +9,6 @@ use crate::spec::{
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 
-/// Drafter GEMM dispatch knobs, read once per process (the Q8/HFQ4 GEMM arms
-/// run per layer per window; a config lookup there is pure host overhead).
-struct DsparkGemmFlags {
-    /// `HIPFIRE_DSPARK_Q8_WMMA` (default on; `0` disables).
-    q8_wmma: bool,
-    /// `HIPFIRE_DSPARK_Q8_4W=0` opts out of the 4-wave Q8 WMMA kernel.
-    q8_4w_opt_out: bool,
-    /// `HIPFIRE_DSPARK_HFQ4_WMMA` (default on; `0` disables).
-    hfq4_wmma: bool,
-}
-
-static DSPARK_GEMM_FLAGS: std::sync::LazyLock<DsparkGemmFlags> = std::sync::LazyLock::new(|| {
-    let not_zero = |name: &str| {
-        hipfire_config::developer_var(name)
-            .map(|s| s != "0")
-            .unwrap_or(true)
-    };
-    DsparkGemmFlags {
-        q8_wmma: not_zero("HIPFIRE_DSPARK_Q8_WMMA"),
-        q8_4w_opt_out: !not_zero("HIPFIRE_DSPARK_Q8_4W"),
-        hfq4_wmma: not_zero("HIPFIRE_DSPARK_HFQ4_WMMA"),
-    }
-});
-
 // ── Per-window phase profiler (HIPFIRE_DSPARK_PROFILE=1) ─────────────────────
 // Gated behind an env var; zero overhead when disabled.
 #[derive(Default)]
@@ -507,16 +483,12 @@ fn gemv_auto_batched_wmma(
             .gemm_f32_register_tiled(weight, x_plain_batch, y, m, k, batch_size)
             .map_err(|e| format!("gemm_f32_register_tiled: {e:?}")),
         DType::Q8_0 => {
-            let flags = &*DSPARK_GEMM_FLAGS;
-            let wmma_on = flags.q8_wmma;
-            if wmma_on && gpu.arch_caps.is_rdna4() {
+            if gpu.arch_caps.is_rdna4() {
                 if let Some(scratch) = x_f16_scratch {
                     let n = (batch_size * k) as i64;
                     gpu.deepseek4_convert_f32_to_f16(x_plain_batch, scratch, n)
                         .map_err(|e| format!("convert_f32_to_f16 (Q8 WMMA): {e:?}"))?;
-                    let opt_out = flags.q8_4w_opt_out;
-                    let use_4w = !opt_out
-                        && batch_size >= 256
+                    let use_4w = batch_size >= 256
                         && m >= 4096
                         && m % 64 == 0
                         && k % 32 == 0
@@ -530,13 +502,12 @@ fn gemv_auto_batched_wmma(
                         .gemm_q8_0_wmma(weight, scratch, y, m, k, batch_size)
                         .map_err(|e| format!("gemm_q8_0_wmma: {e:?}"));
                 }
-            } else if wmma_on && gpu.arch_caps.has_wmma() && m % 64 == 0 && k % 32 == 0 {
+            } else if gpu.arch_caps.has_wmma() && m % 64 == 0 && k % 32 == 0 {
                 if let Some(scratch) = x_f16_scratch {
                     let n = (batch_size * k) as i64;
                     gpu.deepseek4_convert_f32_to_f16(x_plain_batch, scratch, n)
                         .map_err(|e| format!("convert_f32_to_f16 (Q8 WMMA): {e:?}"))?;
-                    let opt_out_4w = flags.q8_4w_opt_out;
-                    if !opt_out_4w && batch_size >= 64 && batch_size % 64 == 0 {
+                    if batch_size >= 64 && batch_size % 64 == 0 {
                         return gpu
                             .gemm_q8_0_wmma_4w(weight, scratch, y, m, k, batch_size)
                             .map_err(|e| format!("gemm_q8_0_wmma_4w: {e:?}"));
@@ -590,8 +561,7 @@ fn gemv_auto_batched_wmma(
             // Gate on `has_wmma()` (false on CDNA3): `gemm_hfq4g256_wmma` is
             // wave32-WMMA and fails to COMPILE for gfx942, so without this
             // the DSpark path dies at JIT instead of using `gemm_hfq4g256`.
-            let wmma_on = gpu.arch_caps.has_wmma() && DSPARK_GEMM_FLAGS.hfq4_wmma;
-            if wmma_on {
+            if gpu.arch_caps.has_wmma() {
                 if let Some(scratch) = x_f16_scratch {
                     let n = (batch_size * k) as i64;
                     gpu.deepseek4_convert_f32_to_f16(x_rotated_batch, scratch, n)
@@ -1150,9 +1120,8 @@ pub struct DsparkDrafter {
     ctx_positions: Vec<usize>,
     /// Per-window phase profiler; active only when `HIPFIRE_DSPARK_PROFILE=1`.
     profiler: DsparkProfiler,
-    /// Adaptive block-size controller. `None` when `HIPFIRE_DSPARK_ADAPTIVE_BLOCK=0`
-    /// (opt-out; fixed block == pre-change behaviour).
-    block_controller: Option<crate::dspark_block_controller::BlockController>,
+    /// Adaptive block-size controller.
+    block_controller: crate::dspark_block_controller::BlockController,
 }
 
 impl MtpDrafter for DsparkDrafter {
@@ -1193,9 +1162,7 @@ impl MtpDrafter for DsparkDrafter {
             }
         }
         self.ctx_positions.clear();
-        if let Some(c) = self.block_controller.as_mut() {
-            c.reset();
-        }
+        self.block_controller.reset();
 
         if fill_tokens.is_empty() {
             return Err("DsparkDrafter::mtp_prefill: fill_tokens is empty".into());
@@ -1231,14 +1198,9 @@ impl MtpDrafter for DsparkDrafter {
 
         let layers = self.weights.cfg.target_layer_ids.clone();
         let n_targets = layers.len();
-        // Adaptive path may shrink below the caller's k, but MUST NOT exceed it:
+        // Adaptive block may shrink below the caller's k, but MUST NOT exceed it:
         // per-call k from MtpSpeculator is the remaining max_emit budget.
-        // fixed path (opt-out) keeps the old behaviour exactly.
-        let effective_k = self
-            .block_controller
-            .as_ref()
-            .map(|c| c.block().min(k))
-            .unwrap_or(k);
+        let effective_k = self.block_controller.block().min(k);
         // k==0 is the true one-token path (verify seed only, no drafts).
         let block = if k == 0 {
             0
@@ -1308,16 +1270,13 @@ impl MtpDrafter for DsparkDrafter {
         // the previous window's accepted-prefix capture.
         self.profiler.sync_end(gpu, t_bootstrap, 0);
 
-        // Start the FULL-window cost timer (adaptive path only). It spans draft +
-        // heads + verify — the whole per-window GPU cost, not just verify. Both
-        // run_heads (tokens/confidence) and verify (target_pick) force a D2H, so the
-        // elapsed at the verify D2H is real wall time with no added sync. Timing the
-        // whole window (vs verify only) is what lets the argmax see that a larger
-        // block barely raises the per-window wall time on cheap-verify arches.
-        let _t_win = self
-            .block_controller
-            .is_some()
-            .then(std::time::Instant::now);
+        // Start the FULL-window cost timer. It spans draft + heads + verify — the
+        // whole per-window GPU cost, not just verify. Both run_heads
+        // (tokens/confidence) and verify (target_pick) force a D2H, so the
+        // elapsed at the verify D2H is real wall time with no added sync. Timing
+        // the whole window (vs verify only) is what lets the argmax see that a
+        // larger block barely raises the per-window wall time on cheap-verify arches.
+        let t_win = std::time::Instant::now();
 
         let ctx_positions = self.ctx_positions.clone();
         let main_hidden_real = self
@@ -1480,7 +1439,7 @@ impl MtpDrafter for DsparkDrafter {
         };
         // Close the full-window timer here: the verify's D2H (target_pick) has just
         // forced GPU completion of draft + heads + verify, so this is real wall time.
-        let t_window_ms = _t_win.map(|t| t.elapsed().as_secs_f32() * 1000.0);
+        let t_window_ms = t_win.elapsed().as_secs_f32() * 1000.0;
         self.profiler.sync_end(gpu, t_verify, 3);
         if kernel_profile_this_window {
             let entries = rdna_compute::profile::stop().unwrap_or_default();
@@ -1638,12 +1597,8 @@ impl MtpDrafter for DsparkDrafter {
             let _ = gpu.free_tensor(capture_buf);
         }
         self.profiler.sync_end(gpu, t_rest, 4);
-        if let Some(c) = self.block_controller.as_mut() {
-            if let Some(tw) = t_window_ms {
-                c.observe_timing(tw, n_verify);
-            }
-            c.observe(accept_len, n_proposed);
-        }
+        self.block_controller.observe_timing(t_window_ms, n_verify);
+        self.block_controller.observe(accept_len, n_proposed);
         self.profiler.end_window();
 
         Ok(MtpWindow {
@@ -1758,24 +1713,17 @@ pub fn build_dspark_speculator(
 ) -> Box<dyn Speculator> {
     let block = block.clamp(1, 8);
     let persistent_verify_context_scratch = body.persistent_verify_context_scratch();
-    // Default-on; HIPFIRE_DSPARK_ADAPTIVE_BLOCK=0 opts out (fixed block == today).
-    let adaptive = hipfire_config::developer_var("HIPFIRE_DSPARK_ADAPTIVE_BLOCK")
-        .ok()
-        .as_deref()
-        != Some("0");
-    let block_controller = adaptive.then(|| {
-        // Start at a MID block so the hill-climb can grow (high-accept content) or
-        // shrink (low-accept content) from a neutral point. min=1, max=cfg.block_size.
-        // p*=0.18 prior (a later task measures it live).
-        let start_block = 2.min(block).max(1);
-        crate::dspark_block_controller::BlockController::new(
-            start_block,
-            1,
-            block,
-            0.18,
-            window_cost,
-        )
-    });
+    // Start at a MID block so the hill-climb can grow (high-accept content) or
+    // shrink (low-accept content) from a neutral point. min=1, max=cfg.block_size.
+    // p*=0.18 prior (a later task measures it live).
+    let start_block = 2.min(block).max(1);
+    let block_controller = crate::dspark_block_controller::BlockController::new(
+        start_block,
+        1,
+        block,
+        0.18,
+        window_cost,
+    );
     Box::new(MtpSpeculator::new(DsparkDrafter {
         body,
         weights,

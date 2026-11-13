@@ -38,8 +38,7 @@
 //! All three levers below are byte-identical to the eager baseline (validated
 //! over multiple prompts) and stack monotonically:
 //!
-//!   * `HIPFIRE_GEMMA4_GRAPH` (default ON; set =0 to disable) — hipGraph
-//!     48-layer body + lm_head (`decode_step_with_graph`). +2.6%.
+//!   * hipGraph 48-layer body + lm_head (`decode_step_with_graph`). +2.6%.
 //!   * fused FFN — fold pre-FFN rmsnorm+FWHT into one launch then gate+up into
 //!     one (`fused_rmsnorm_rotate_mq` + `fused_gate_up_hfq4g256`; MQ4G256 bytes
 //!     are HFQ4G256-compatible given a pre-rotated input). +1.0–1.2%.
@@ -66,7 +65,7 @@ use hipfire_runtime::llama::{weight_gemv, WeightTensor};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Decode one token (eager); returns the full logits vector. Used for prefill,
-/// the warm pass, and as the `HIPFIRE_GEMMA4_GRAPH=0` fallback.
+/// the warm pass, and wherever a captured decode is not exact.
 pub fn decode_step(
     cfg: &Gemma4Config,
     weights: &Gemma4Weights,
@@ -148,8 +147,8 @@ pub fn decode_step_capture(
     decode_step_body(cfg, weights, state, gpu, position, Some(capture))
 }
 
-/// Decode one token via hipGraph capture/replay. **Default ON**
-/// (`HIPFIRE_GEMMA4_GRAPH=0` to disable; +2.9% vs eager, byte-identical).
+/// Decode one token via hipGraph capture/replay (+2.9% vs eager,
+/// byte-identical).
 /// The 48-layer body + final-norm +
 /// lm_head are captured once and replayed per token, recovering the per-token
 /// host launch overhead. This is the biggest launch-bound lever on gemma4
@@ -171,22 +170,7 @@ pub fn decode_step_with_graph(
     token_id: u32,
     position: u32,
 ) -> Result<Vec<f32>, String> {
-    use std::sync::OnceLock;
-    static GRAPH_ENV: OnceLock<Option<bool>> = OnceLock::new();
-    let env_override = *GRAPH_ENV.get_or_init(|| {
-        match hipfire_config::developer_var("HIPFIRE_GEMMA4_GRAPH")
-            .ok()
-            .as_deref()
-        {
-            Some("1") => Some(true),
-            Some("0") => Some(false),
-            _ => None,
-        }
-    });
-    // The captured path is the default. Set HIPFIRE_GEMMA4_GRAPH=0 to retain
-    // the eager fallback for diagnostics.
-    let graph_on = env_override.unwrap_or(true);
-    if !graph_on || !graph_exact(weights, gpu) {
+    if !graph_exact(weights, gpu) {
         return decode_step(cfg, weights, state, gpu, token_id, position);
     }
 

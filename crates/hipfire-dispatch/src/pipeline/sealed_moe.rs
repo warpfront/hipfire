@@ -2276,7 +2276,7 @@ impl<'a> SealedMoeCall<'a> {
             if !selection.resolution.use_gpu_topk && gpu.graphs.replay.capturing.is_some() {
                 return Err(DispatchError::UnsupportedVariant {
                     family: "moe",
-                    variant: "cpu-topk-fallback-not-capture-safe(set HIPFIRE_GRAPH_MOE=0)",
+                    variant: "cpu-topk-fallback-not-capture-safe(set HIPFIRE_GRAPH=0)",
                     arch: "",
                     quant: "",
                 });

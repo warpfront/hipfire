@@ -1789,60 +1789,10 @@ pub fn forward_scratch(
     )?;
     kv_cache.ensure_mapped_capacity(gpu, required_tokens)?;
     let dim = config.dim;
-    // hipGraph capture for MoE was previously gated off-by-default behind
-    // HIPFIRE_GRAPH_MOE=1 because of a known drift bug (task #100): under
-    // capture, A3B accumulated a per-step ~1-ULP delta that compounded
-    // through the KV cache + GDN state and crossed the top-1 margin at
-    // step ~7 (q8 KV) or ~114 (asym3 KV), producing visible token-loop
-    // attractors by step 30-50 ("- **One**\n- **One**\n…").
-    //
-    // Root cause (fixed 2026-05-21): `gemv_hfq4g256_moe_down_residual_scaled_k8_indexed`
-    // used K_TOP=8 concurrent `atomicAdd` writes per output row. FP32
-    // addition is non-associative, so the final bits depend on wavefront
-    // scheduling order. Under hipGraph replay that order differs from
-    // direct execution (graph scheduling pipelines kernels differently),
-    // introducing the systematic per-step delta. The kernel's own header
-    // (`kernels/src/gemv_hfq4g256_moe_down.hip:14-19`) had already flagged
-    // this non-determinism but rated it negligible based on the
-    // direct-only smoke test — capture amplifies the effect.
-    //
-    // Fix: the MoE FFN decode path now uses the atomic-free expand+combine
-    // pattern already used in prefill (`forward_prefill_batch_with_pbs`
-    // L5217-5232): `gemv_hfq4g256_moe_down_k8_indexed_batched_expanded`
-    // writes one row per (expert-rank, m), then `moe_down_combine_k8_batched`
-    // sums K_TOP slots into x_residual in a fixed iteration order. The
-    // resulting MoE FFN output is byte-deterministic under both direct
-    // execution and hipGraph replay.
-    //
-    // `experimental.graph.moe` remains the explicit policy control. The atomic
-    // fix is necessary but not sufficient — the CPU-topK fallback path
-    // (when not all gate-side MoE weights are MQ4G256, e.g. router=Q8 per
-    // the post-2026-04 router-attractor fix) calls `download_f32(router_logits)`,
-    // a sync D2H that fails under graph capture with hipError 906. Until
-    // that D2H is migrated to a capture-safe equivalent, opting in only
-    // works for models where the runtime takes the use_gpu_topk path.
-    //
-    // Reproducer used to characterize the fix:
-    //   hipfire config set experimental.graph.forward true
-    //   hipfire config set experimental.graph.moe true
-    //   HIPFIRE_SMOKE_KV=q8 \
-    //   HIPFIRE_SMOKE_MODE=chat HIPFIRE_SMOKE_STEPS=200 \
-    //   HIPFIRE_SMOKE_PROMPT="Count from one to twenty in English." \
-    //   ./target/release/examples/a3b_smoke_forward <uniform-mq4-a3b>
-    //
-    // Graph policy is resolved once from TOML before GPU initialization and is
-    // carried directly by the GPU feature snapshot.
-    // Default-ON (2026-06-16): cross-arch A/B validated — gfx12 +4.2% A3B mq4
-    // decode, coherence-gate clean (fluent at decode pos 1-4 on current ROCm).
-    // Opt out with `experimental.graph.moe = false`. Both root causes of the prior
-    // crash/drift are fixed:
-    //   1. atomicAdd drift (task #100, 2026-05-21): expand+combine pattern.
-    //   2. CPU-topK fallback D2H: `download_f32(router_logits)` replaced by
-    //      GPU `softmax_f32` + `moe_topk_renorm_k8` + small [k] D2H — fully
-    //      capture-safe. Mixed-kmap A3B (Q8 router, post-PR #199) no longer
-    //      crashes with hipError 906 under AR graph capture.
-    // Validated + flipped to default-on 2026-06-16.
-    let allow_moe = gpu.flags.graph_moe;
+    // MoE configs capture like dense ones. The two historical MoE capture
+    // blockers are fixed: the atomicAdd down-projection drift (task #100,
+    // 2026-05-21: expand + fixed-order combine) and the CPU-topK router
+    // `download_f32` D2H (now GPU softmax + top-k renorm + a small [k] D2H).
     // hipGraph per-forward-pass capture/replay default policy:
     //   - gfx12 (RDNA4): default-ON. +2.4-2.7% decode on 9B Qwen 3.5
     //     MFP4G32 (5-run mean, all positive, tight variance, 2026-05-11).
@@ -1853,14 +1803,8 @@ pub fn forward_scratch(
     //     and consistent across model sizes.
     //   - other archs (RDNA1/2, CDNA): default-OFF (opt-in via
     //     `experimental.graph.forward = true`) since not yet A/B'd on those.
-    //   - MoE configs follow `experimental.graph.moe`. The ~30-50-token
-    //     attractor drift in the use_gpu_topk MoE down step was fixed
-    //     2026-05-21 (task #100 — atomicAdd → expand+combine), but the
-    //     CPU-topK fallback's `download_f32(router_logits)` D2H sync
-    //     remains capture-incompatible, so mixed-kmap A3B (post-PR #199)
-    //     can crash under graph capture even with the fix. Once that
-    //     D2H is migrated to a capture-safe path, the MoE default can
-    //     be flipped to follow the arch defaults.
+    //   - MoE configs follow the same policy (both capture blockers fixed,
+    //     see above).
     // An explicit `experimental.graph.forward = false` always wins.
     let graph_override = gpu.flags.graph_forward;
     let graph_arch_default = gpu.arch.starts_with("gfx12") || gpu.arch.starts_with("gfx11");
@@ -1913,13 +1857,8 @@ pub fn forward_scratch(
         gpu.graphs.ar_forward_replay_enabled = false;
         gpu.graphs.ar_forward_kernel_dirty = true;
     }
-    // MoE models require `experimental.graph.moe` in addition to the
-    // arch/kill-switch guards. Dense models (num_experts==0) are unaffected.
-    let graph_would_be_used = ar_graph_test
-        && graph_enabled
-        && graph_eligible
-        && !gpu.replay.is_enabled()
-        && (config.num_experts == 0 || allow_moe);
+    let graph_would_be_used =
+        ar_graph_test && graph_enabled && graph_eligible && !gpu.replay.is_enabled();
     // A CPU-executed step (memory.offload_exec=cpu over a spilled prefix) is a
     // host sync point — a D2H and an H2D around the multiplication — so it can
     // neither be recorded into a hipGraph nor replayed out of one. Take the
