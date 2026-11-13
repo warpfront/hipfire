@@ -1168,6 +1168,32 @@ pub fn lab_ensure_rows16_grid_entry(gpu: &mut Gpu, entry: &str) -> HipResult<&'s
     Ok(symbol)
 }
 
+/// Load entry `entry` of the exact-gfx942 wide MoE glue module (`qwen4_g942_moe_wide`: hipcc
+/// source, or the `HIPFIRE_QWEN4_G942_MOE_WIDE_IMAGE` code object) the way the public launchers
+/// do and return the symbol to launch. The module under test of `qwen4_g942_moe_wide_oracle`,
+/// which launches it directly through [`Gpu::launch_kernel_blob`].
+#[doc(hidden)]
+pub fn lab_ensure_moe_wide_entry(gpu: &mut Gpu, entry: &str) -> HipResult<&'static str> {
+    crate::cdna::gfx942::ensure_moe_wide_entry(gpu, entry)
+}
+
+/// Load entry `entry` of the exact-gfx942 wide MoE GEMM module (`qwen4_g942_moe_gemm`: hipcc
+/// source, or the `HIPFIRE_QWEN4_G942_MOE_GEMM_IMAGE` code object) and return the symbol to
+/// launch. The module under test of `qwen4_g942_moe_gemm_oracle`.
+#[doc(hidden)]
+pub fn lab_ensure_moe_gemm_entry(gpu: &mut Gpu, entry: &str) -> HipResult<&'static str> {
+    crate::cdna::gfx942::ensure_moe_gemm_entry(gpu, entry)
+}
+
+/// Load the narrow production FP8 grouped GEMM entry (`gemm_fp8b128_moe_grouped_bf16mfma` /
+/// `_xbf16`) from its own hipcc module and return the symbol to launch: the REFERENCE of
+/// `qwen4_g942_moe_gemm_oracle` at tile counts the public launcher already routes to the wide
+/// module.
+#[doc(hidden)]
+pub fn lab_ensure_moe_gemm_narrow(gpu: &mut Gpu, x_bf16: bool) -> HipResult<&'static str> {
+    crate::cdna::gfx942::ensure_moe_gemm_narrow(gpu, x_bf16)
+}
+
 /// Single-launch rollback kernel of a state's STORAGE format. Q8Ef has no
 /// single-launch kernel: its rollback must carry the residual and runs
 /// [`gated_delta_rollback_layers_ef`] instead.
