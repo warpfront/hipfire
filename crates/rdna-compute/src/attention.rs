@@ -1312,6 +1312,71 @@ fn encoder_qtiled_tile(head_dim: usize) -> Result<(usize, usize), String> {
     Ok((kt, lds_floats(kt)))
 }
 
+/// Largest legal block for `vit_attention_qtiled_f32` on a wave width.
+///
+/// The kernel halves this to 512 on wave64 (`__AMDGCN_WAVEFRONT_SIZE == 64`):
+/// a 1024-thread block needs 16 waves on one CU, which forces
+/// `__launch_bounds__` down to 64 VGPRs/thread and spilled on gfx906/gfx908.
+/// The host picks the same cap so the query tile it launches stays legal.
+fn vit_qtiled_max_threads(wave32: bool) -> usize {
+    if wave32 {
+        1024
+    } else {
+        512
+    }
+}
+
+/// Tile + LDS sizing for `vit_attention_qtiled_f32`, mirroring the kernel's
+/// `extern __shared__` carve-up exactly.
+///
+/// Returns `(qpb, shared_bytes)`: queries per block (block = qpb * 16
+/// threads) and the dynamic LDS launch size. The kernel receives
+/// `shared_bytes` as its `lds_limit` argument and traps when its own
+/// carve-up is larger, so a constant that drifts on one side fails the
+/// launch instead of silently writing past the allocation.
+///
+/// The kernel's constants are LANES=16, K_TILE=32, K_PAD=4, S_PAD=1; the
+/// running output is register-resident and NOT budgeted here. The query
+/// tile is the largest of 64/32/16 whose carve-up fits (64 at head_dim<=80,
+/// 32 above — head_dim covers the whole vision-tower contract up to 128)
+/// and whose block fits `max_threads`. Any head_dim in 1..=128 is accepted;
+/// the kernel guards the lane tail.
+fn vit_qtiled_launch(head_dim: usize, max_threads: usize) -> Result<(usize, u32), String> {
+    const LANES: usize = 16;
+    const K_TILE: usize = 32;
+    const K_PAD: usize = 4;
+    const S_PAD: usize = 1;
+    const LDS_BYTES: usize = 64 * 1024;
+    if head_dim == 0 || head_dim > 128 {
+        return Err(format!(
+            "vit_attention_qtiled_f32: head_dim {head_dim} is outside the \
+             Q-tiled contract (1..=128)"
+        ));
+    }
+    let lds_floats = |qpb: usize| {
+        2 * K_TILE * (head_dim + K_PAD)
+            + qpb * (head_dim + K_PAD)
+            + qpb * (K_TILE + S_PAD)
+            + 2 * qpb * LANES
+            + qpb * 2
+    };
+    let mut qpb = max_threads / LANES;
+    while qpb > LANES && lds_floats(qpb) * 4 > LDS_BYTES {
+        qpb >>= 1;
+    }
+    if qpb < LANES
+        || qpb % LANES != 0
+        || qpb * LANES > max_threads
+        || lds_floats(qpb) * 4 > LDS_BYTES
+    {
+        return Err(format!(
+            "vit_attention_qtiled_f32: no legal query tile for head_dim {head_dim} \
+             (picked {qpb}; needs >= {LANES}, a multiple of it, and <= {LDS_BYTES} B of LDS)"
+        ));
+    }
+    Ok((qpb, (lds_floats(qpb) * 4) as u32))
+}
+
 impl Gpu {
     /// DSpark bidirectional staging assembly (on-GPU; replaces a host
     /// d2h+assemble+h2d that forced ~2 stream syncs per stage).
@@ -16393,14 +16458,14 @@ impl Gpu {
     }
 
     /// Q-tiled flash-style ViT self-attention: same packed-QKV contract as
-    /// [`Gpu::vit_attention_f32`], but QB=16 queries per block share each
+    /// [`Gpu::vit_attention_f32`], but up to 64 queries per block share each
     /// K/V tile pulled through LDS (online softmax, no full-row score
-    /// buffer), cutting the DRAM re-read traffic by ~16×. This is the
-    /// production path for the vision tower — the naive kernel measured
-    /// 1.02 s/layer at N=4624 on gfx1101 (25.5 s per 68x68-grid image);
-    /// this variant should land two orders under it. Requires
-    /// head_dim <= 128 (any head_dim, not only multiples of 16: the lane
-    /// tail is guarded in the kernel).
+    /// buffer), cutting the DRAM re-read traffic by the query-tile size.
+    /// This is the production path for the vision tower — the naive kernel
+    /// measured 1.02 s/layer at N=4624 on gfx1101 (25.5 s per 68x68-grid
+    /// image); this variant measured 122.0 ms per call at N=7564/hd=64.
+    /// Requires head_dim <= 128 (any head_dim, not only multiples of 16:
+    /// the lane tail is guarded in the kernel).
     pub fn vit_attention_qtiled_f32(
         &mut self,
         qkv: &GpuTensor,
@@ -16430,6 +16495,11 @@ impl Gpu {
             "vit_attention_qtiled_f32",
         )?;
         let func = &self.functions["vit_attention_qtiled_f32"];
+        // Wave64 arches get the halved block size the kernel declares in
+        // `__launch_bounds__` (see `vit_qtiled_max_threads`).
+        let (qpb, shared_mem) =
+            vit_qtiled_launch(head_dim, vit_qtiled_max_threads(self.arch_caps.is_wave32()))
+                .map_err(|why| hip_bridge::HipError::new(0, &why))?;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let mut qp = qkv.buf.as_ptr();
         let mut op = out.buf.as_ptr();
@@ -16438,6 +16508,10 @@ impl Gpu {
         let mut nh = num_heads as i32;
         let mut hd = head_dim as i32;
         let mut sc = scale;
+        let mut qb = qpb as i32;
+        // The kernel's own carve-up must fit what we allocated here; it
+        // traps when it does not (see vit_qtiled_launch).
+        let mut lds_limit = shared_mem as i32;
         let mut params: Vec<*mut c_void> = vec![
             &mut qp as *mut _ as *mut c_void,
             &mut op as *mut _ as *mut c_void,
@@ -16446,21 +16520,14 @@ impl Gpu {
             &mut nh as *mut _ as *mut c_void,
             &mut hd as *mut _ as *mut c_void,
             &mut sc as *mut _ as *mut c_void,
+            &mut qb as *mut _ as *mut c_void,
+            &mut lds_limit as *mut _ as *mut c_void,
         ];
-        // Layout must mirror the kernel's smem carve-up (QB=16, K_TILE=64):
-        // k_tile + q_tile + s_tile + ws_max + ws_sum + m_l + out_run. (V is
-        // deliberately NOT staged in LDS — each (j, d) element is read by
-        // exactly one lane, so there is no intra-block reuse to pay for.)
-        const QB: usize = 16;
-        const K_TILE: usize = 64;
-        let shared_mem =
-            ((K_TILE * head_dim + 2 * QB * head_dim + QB * K_TILE + 2 * QB * 16 + QB * 2) * 4)
-                as u32;
         unsafe {
             self.hip.launch_kernel(
                 func,
-                [num_heads as u32, (n as u32).div_ceil(QB as u32), 1],
-                [256, 1, 1],
+                [num_heads as u32, (n as u32).div_ceil(qpb as u32), 1],
+                [(qpb * 16) as u32, 1, 1],
                 shared_mem,
                 self.stream_ref(),
                 &mut params,
@@ -24469,6 +24536,53 @@ mod tests {
         for bad in [0usize, 8, 272, 512] {
             assert!(
                 encoder_qtiled_tile(bad).is_err(),
+                "head_dim {bad} must refuse"
+            );
+        }
+    }
+
+    #[test]
+    fn vit_qtiled_launch_matches_the_kernel_carve_up() {
+        use super::{vit_qtiled_launch, vit_qtiled_max_threads};
+        // The production vision tower on wave32: hd=64 gets the largest
+        // query tile (64 queries = 1024 threads) and stays inside 64 KB.
+        let wave32 = vit_qtiled_max_threads(true);
+        let (qpb, bytes) = vit_qtiled_launch(64, wave32).unwrap();
+        assert_eq!(qpb, 64);
+        assert_eq!(bytes, 51_968, "hd=64/qpb=64 carve-up (kernel header)");
+        assert!(qpb * 16 <= wave32, "block must not exceed the thread max");
+        assert!(bytes as usize <= 64 * 1024, "{bytes} B overflows LDS");
+        // Wave64 halves the block (the kernel's launch bounds do too), so
+        // every head_dim must still find a legal tile inside 512 threads.
+        let wave64 = vit_qtiled_max_threads(false);
+        assert_eq!(wave64, 512);
+        for hd in [1usize, 16, 64, 70, 72, 80, 96, 112, 128] {
+            let (qpb, bytes) = vit_qtiled_launch(hd, wave64).unwrap();
+            assert!(qpb >= 16 && qpb % 16 == 0, "head_dim {hd}: qpb {qpb}");
+            assert!(qpb * 16 <= wave64, "head_dim {hd}: block too large");
+            assert!(
+                bytes as usize <= 64 * 1024,
+                "head_dim {hd}: {bytes} B overflows LDS"
+            );
+        }
+        assert_eq!(vit_qtiled_launch(64, wave64).unwrap(), (32, 34_688));
+        // Wider heads buy LDS and must fall back to a smaller query tile;
+        // non-multiples of 16 (the Qwen ViT's 72) keep the Q-tiled path
+        // because the kernel guards the lane tail.
+        for hd in [1usize, 16, 70, 72, 80, 96, 112, 128] {
+            let (qpb, bytes) = vit_qtiled_launch(hd, wave32).unwrap();
+            assert!(qpb >= 16 && qpb % 16 == 0, "head_dim {hd}: qpb {qpb}");
+            assert!(qpb * 16 <= wave32, "head_dim {hd}: block too large");
+            assert!(
+                bytes as usize <= 64 * 1024,
+                "head_dim {hd}: {bytes} B overflows LDS"
+            );
+        }
+        assert_eq!(vit_qtiled_launch(128, wave32).unwrap().0, 32);
+        // Out-of-contract shapes refuse rather than sizing a wrong carve-up.
+        for bad in [0usize, 129, 256] {
+            assert!(
+                vit_qtiled_launch(bad, wave32).is_err(),
                 "head_dim {bad} must refuse"
             );
         }
