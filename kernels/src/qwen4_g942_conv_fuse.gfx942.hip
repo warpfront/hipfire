@@ -17,7 +17,11 @@
 //
 // Lines ending in `// G12` are the only additions to the tensor_ops.hip blocks; with them removed
 // each BEGIN/END block is a substring of tensor_ops.hip (unit test
-// `g942_conv_fuse_source_is_tensor_ops_verbatim`).
+// `g942_conv_fuse_source_is_tensor_ops_verbatim`). The one rewrite is the two `// G12 unroll`
+// lines of `hyper_norm_rows`' store loop: tensor_ops.hip's `if (j >= hidden) break;` becomes the
+// guard `if (j < hidden) { ... }` (same elements stored, since j grows with u), so hipcc fully
+// unrolls the loop and indexes `raw` / `weight` with constants instead of the `s_set_gpr_idx`
+// dynamic register indexing the early exit forced. The test maps the guard back to the break.
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_bfloat16.h>
@@ -148,7 +152,7 @@ static __device__ __forceinline__ void hyper_norm_rows(
 #pragma unroll
         for (int u = 0; u < 10; ++u) {
             const int j = base + u * 256;
-            if (j >= hidden) break;
+            if (j < hidden) {  // G12 unroll
             const int column = offset + j;
             const float value = bf16_to_f32(bf16_round(
                 bf16_to_f32(bf16_round(raw[u])) * inv * (1.0f + weight[u])));
@@ -162,6 +166,7 @@ static __device__ __forceinline__ void hyper_norm_rows(
                 if (normalized_bf16)  // G12
                     normalized_bf16[column] = (unsigned short)(__float_as_uint(value) >> 16);  // G12
             }
+            }  // G12 unroll
         }
     }
 }
