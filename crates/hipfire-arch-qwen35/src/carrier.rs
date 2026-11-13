@@ -1123,6 +1123,44 @@ impl SharedWeightLease {
     }
 }
 
+/// #1136: refuse a Qwen3.5/3.6 (HFQ arch 5|6) load on a wave64 GCN/CDNA GPU
+/// (`gfx9*`) when a weight's format has no GEMV for that arch in the dispatch
+/// registry (`KernelKey::dtype_arch_predicate`). Without this the load succeeds
+/// and the first forward fails with `no implementation for Gemv*` (MQ3G256V2
+/// qt49 / MQ4G256V2 qt44 / MQ3G256 qt17 are wave32-only). Pure on the arch
+/// string and the header (no GPU), so admission can refuse before teardown.
+pub fn wave64_gemv_refusal<'a>(
+    arch_id: u32,
+    gpu_arch: &str,
+    tensors: impl IntoIterator<Item = (&'a str, u8)>,
+) -> Option<String> {
+    if !(matches!(arch_id, 5 | 6) && gpu_arch.starts_with("gfx9")) {
+        return None;
+    }
+    let caps = rdna_compute::arch_caps::ArchCaps::new(
+        gpu_arch,
+        std::sync::Arc::new(rdna_compute::FeatureFlags::from_active_config(gpu_arch)),
+    );
+    let mut bad = std::collections::BTreeSet::<String>::new();
+    let mut first: Option<(&str, u8)> = None;
+    for (name, qt) in tensors {
+        let Some(dtype) = hipfire_runtime::weight_backend::hfq_weight_dtype(qt)
+            .or_else(|| crate::qwen35::weights::dtype_from_quant_type(qt).ok())
+        else {
+            continue;
+        };
+        if !hipfire_dispatch::types::KernelKey::dtype_arch_predicate(dtype).eval_caps(&caps) {
+            bad.insert(format!("{dtype:?}"));
+            first.get_or_insert((name, qt));
+        }
+    }
+    let (name, qt) = first?;
+    let list = bad.into_iter().collect::<Vec<_>>().join(", ");
+    Some(format!(
+        "Qwen3.5/3.6 on {gpu_arch}: this model stores weights as {list} (first: `{name}`, quant_type {qt}), which has no GEMV for wave64 GCN/CDNA GPUs, so decode would fail at the first token. Load an MQ4G256, HFQ4G256 or Q8_0 build of the model instead (for Qwen3.8-27B the `.mq4r` tier) (#1136)"
+    ))
+}
+
 /// `HIPFIRE_WEIGHT_HOST` opt-in, read at bootstrap (it selects the GPU claim
 /// before the process config exists). `Ok(None)`: unset or the `0` kill
 /// switch, incumbent private loading. `Ok(Some(socket))`: import from the
@@ -1507,6 +1545,52 @@ mod tests {
     use super::*;
     use hipfire_runtime::kv_adaptive::{KMode, Preset};
     use hipfire_runtime::llama::VMode;
+
+    fn w64(arch: u32, gpu: &str, qts: &[u8]) -> Option<String> {
+        let names: Vec<String> = (0..qts.len()).map(|i| format!("t{i}")).collect();
+        wave64_gemv_refusal(
+            arch,
+            gpu,
+            names.iter().map(|n| n.as_str()).zip(qts.iter().copied()),
+        )
+    }
+
+    #[test]
+    fn wave64_gemv_refusal_mq3g256v2() {
+        let m = wave64_gemv_refusal(5, "gfx942", [("blk.0.ffn_down.weight", 49)]).expect("refused");
+        for s in ["MQ3G256V2", "blk.0.ffn_down.weight", "gfx942", "#1136"] {
+            assert!(m.contains(s), "{m}");
+        }
+    }
+
+    #[test]
+    fn wave64_gemv_refusal_other_formats_and_archs() {
+        assert!(w64(5, "gfx942", &[44]).unwrap().contains("MQ4G256V2"));
+        assert!(w64(5, "gfx942", &[17]).unwrap().contains("MQ3G256"));
+        assert!(w64(6, "gfx942", &[44]).is_some());
+        assert!(w64(5, "gfx906", &[49]).is_some());
+    }
+
+    #[test]
+    fn wave64_gemv_refusal_supported_formats_pass() {
+        assert_eq!(w64(5, "gfx942", &[13, 3, 1, 2, 6]), None);
+    }
+
+    #[test]
+    fn wave64_gemv_refusal_wave32_and_other_arch_ids_pass() {
+        for gpu in ["gfx1201", "gfx1100", "gfx1030"] {
+            assert_eq!(w64(5, gpu, &[49, 44]), None, "{gpu}");
+        }
+        assert_eq!(w64(9, "gfx942", &[49]), None);
+        assert_eq!(w64(16, "gfx942", &[49]), None);
+    }
+
+    #[test]
+    fn wave64_gemv_refusal_lists_all_formats() {
+        let m = w64(5, "gfx942", &[44, 49]).unwrap();
+        assert!(m.contains("MQ3G256V2, MQ4G256V2"), "{m}");
+        assert!(m.contains("`t0`") && m.contains("quant_type 44"), "{m}");
+    }
 
     #[test]
     fn parse_presets_agree_with_controller_floors() {

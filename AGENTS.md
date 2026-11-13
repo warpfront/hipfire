@@ -167,10 +167,14 @@ works, what to measure, what counts as pass/fail.
 
 **Default behavior to be aware of:**
 - **MQ3 is production on gfx11** (`gfx1100/1101/1102/1150/1151`) and
-  gfx12 (`gfx1200/1201`). On gfx10 / gfx906 / gfx94x, MQ3 weights still
-  load and run via per-token GEMV fallback — correct, just slower
-  prefill. MoE/A3B + MQ3 is refused at load time (no MoE-branched WMMA
-  path).
+  gfx12 (`gfx1200/1201`). On gfx10 (RDNA1/2, wave32), MQ3 weights still
+  load and run via the wave32 GEMV fallback — correct, just slower
+  prefill. Wave64 GCN/CDNA (gfx906, gfx94x) has no MQ3 GEMV: a
+  Qwen3.5/3.6 load whose weights use MQ3 (MQ3G256, MQ3-Lloyd, MQ3G256V2)
+  or any other format with a wave32-only GEMV (e.g. MQ4G256V2, the
+  `.mq4-xts` tier) is refused at load there (#1136); other model families
+  are not gated at load for this. MoE/A3B + MQ3 is refused at load time
+  (no MoE-branched WMMA path).
 - **MQ2 is refused by default.** The quantizer requires
   `--format mq2 --allow-mq2` (or `HIPFIRE_ALLOW_MQ2=1`) to opt in. Severe quality
   cliff confirmed; Lloyd-Max MQ2/MQ3 (qt=19/20) is the path forward.

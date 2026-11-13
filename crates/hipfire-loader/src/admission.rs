@@ -2840,6 +2840,19 @@ pub fn admit_source_with_options(
     if let Some(refusal) = flux_arch_refusal(arch_id, gpu_arch) {
         return Err(refusal);
     }
+    // #1136: a Qwen3.5/3.6 weight format with no wave64 GEMV is refused here,
+    // before topology and any allocation, instead of failing the first forward.
+    if let ModelSource::Hfq(hfq) = &source {
+        if let Some(refusal) = hipfire_arch_qwen35::carrier::wave64_gemv_refusal(
+            arch_id,
+            gpu_arch,
+            hfq.tensor_infos()
+                .iter()
+                .map(|t| (t.name.as_str(), t.quant_type)),
+        ) {
+            return Err(refusal);
+        }
+    }
     // The carrier is resolved once for every topology; its declared axes
     // decide every multi-card request before any other topology verdict
     // (`ep`, then `tp`, then `pp`; one uniform sentence per refused axis). A
