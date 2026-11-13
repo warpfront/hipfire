@@ -5540,6 +5540,17 @@ pub fn forward_batch_slots_opts(
         return Ok(());
     }
     let n = batch.total_rows();
+    // Per-step composition census, shared with the retained-PM4 body
+    // (`forward_batch_slots_redline`): a parity diff, or the cohort A/B in
+    // scripts/check_slots_moe_cohort.py, can then compare the exact live-row
+    // shape a step was given. `HIPFIRE_SLOT_TRACE=1` only, so it costs
+    // nothing otherwise.
+    if gpu.slot_trace() {
+        eprintln!(
+            "[slot-trace] step: m={:?} positions={:?}",
+            batch.m_per_slot, batch.positions
+        );
+    }
     let n_slots = pool.descriptors().len();
     assert_eq!(
         batch.m_per_slot.len(),

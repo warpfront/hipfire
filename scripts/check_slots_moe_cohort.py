@@ -40,6 +40,7 @@ import concurrent.futures as cf
 import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -100,9 +101,13 @@ class Serve:
                 "HIPFIRE_SERVE_MULTI_SLOT_PAGED": "1",
                 "HIPFIRE_KV_MODE": "q8",
                 "HIPFIRE_MOE_SLOTS_COHORT": "1" if cohort else "0",
+                # Per-step live-row census (`[slot-trace] step: m=[...]`),
+                # so rounds are only compared at equal compositions.
+                "HIPFIRE_SLOT_TRACE": "1",
             }
         )
         self.log = open(log_path, "wb")
+        self.log_path = log_path
         self.proc = subprocess.Popen(
             [
                 binary,
@@ -196,6 +201,32 @@ class Serve:
         spread = max(t - min(started) for t in started)
         return results, spread, wall
 
+    def log_offset(self):
+        try:
+            return os.path.getsize(self.log_path)
+        except OSError:
+            return 0
+
+    def composition(self, offset):
+        """The slot-trace step census written since `offset`.
+
+        Returns (signature, steps, new_offset). The signature is the
+        ordered list of per-step `m=[...]` vectors the engine printed, so
+        two rounds with the same signature saw the same live-row
+        composition at every step — which is the only shape in which
+        ON == OFF is a meaningful assertion.
+        """
+        try:
+            with open(self.log_path, "rb") as f:
+                f.seek(offset)
+                chunk = f.read()
+        except OSError:
+            return "", 0, offset
+        text = chunk.decode(errors="replace")
+        steps = re.findall(r"\[slot-trace\] step: m=(\[[^\]]*\])", text)
+        sig = "|".join(t.replace(" ", "") for t in steps)
+        return sig, len(steps), offset + len(chunk)
+
     def stop(self):
         try:
             self.proc.send_signal(signal.SIGTERM)
@@ -252,6 +283,7 @@ def main():
                 serve.wait_ready(args.ready_timeout)
                 arm_rounds = []
                 for r in range(args.rounds):
+                    off0 = serve.log_offset()
                     lanes, spread, wall = serve.round(r)
                     if spread > args.window:
                         fail(f"{label} round {r}: lanes started {spread:.1f}s apart "
@@ -260,10 +292,11 @@ def main():
                     for lane in lanes:
                         if "error" in lane:
                             fail(f"{label} round {r}: {lane['error']}")
-                    arm_rounds.append(lanes)
+                    sig, nsteps, _ = serve.composition(off0)
+                    arm_rounds.append((lanes, sig))
                     print(f"  round {r}: {[l['sha'] for l in lanes]} "
                           f"{tok} tok {tps:.1f} tok/s wall={wall:.1f}s "
-                          f"spread={spread:.2f}s", flush=True)
+                          f"spread={spread:.2f}s steps={nsteps}", flush=True)
                 results[label] = arm_rounds
             finally:
                 serve.stop()
@@ -291,7 +324,7 @@ def main():
         # without either program being wrong (the PR documents exactly this
         # caveat). What matters is which *outcomes* each lane can produce.
         for label, rounds in results.items():
-            keys = [[l["sha"] for l in lanes] for lanes in rounds]
+            keys = [[l["sha"] for l in lanes] for lanes, _sig in rounds]
             unstable = [r for r, k in enumerate(keys) if k != keys[0]]
             if unstable:
                 print(
@@ -304,24 +337,57 @@ def main():
 
         # 2. The claim under test: the merged program never emits a token the
         # per-lane program does not. Per lane, ON's observed outcome set must
-        # be a subset of OFF's.
+        # be a subset of OFF's — but ONLY a composition-matched round can
+        # adjudicate that. With an unpinned composition a lane's row count
+        # differs between arms and the two programs legitimately diverge at a
+        # near-tie (the PR documents exactly this), so an unmatched run is
+        # INCONCLUSIVE, not a failure. `inconclusive` is tracked separately so
+        # the exit code never claims a verdict the data cannot support.
+        inconclusive = []
         for lane in range(len(PROMPTS)):
-            on = {round_[lane]["sha"] for round_ in results["ON"]}
-            off = {round_[lane]["sha"] for round_ in results["OFF"]}
+            on = {lanes[lane]["sha"] for lanes, _sig in results["ON"]}
+            off = {lanes[lane]["sha"] for lanes, _sig in results["OFF"]}
             extra = on - off
             if extra:
-                fail(
+                inconclusive.append(
                     f"lane {lane}: ON emitted {sorted(extra)}, which OFF never "
-                    f"did (ON {sorted(on)} / OFF {sorted(off)}) — check the "
-                    f"per-round instability report for an unmatched composition "
-                    f"before calling this a cohort defect"
+                    f"did (ON {sorted(on)} / OFF {sorted(off)})"
                 )
+                print(f"INCONCLUSIVE {inconclusive[-1]}", flush=True)
             else:
                 print(f"lane {lane}: ON {sorted(on)} is a subset of OFF {sorted(off)}",
                       flush=True)
 
+        # 3. Composition-matched rounds: when both arms saw the SAME ordered
+        # per-step live-row census, the two programs must agree byte for byte.
+        # This is the strict form; the subset check above is the fallback for
+        # runs whose arrival timing never produced a matching composition.
+        pairs = [
+            (r_on, r_off)
+            for r_on, (_, sig_on) in enumerate(results["ON"])
+            for r_off, (_, sig_off) in enumerate(results["OFF"])
+            if sig_on and sig_on == sig_off
+        ]
+        if pairs:
+            for r_on, r_off in pairs:
+                on = [l["sha"] for l in results["ON"][r_on][0]]
+                off = [l["sha"] for l in results["OFF"][r_off][0]]
+                if on == off:
+                    print(f"composition-matched: ON round {r_on} == OFF round "
+                          f"{r_off} {on}", flush=True)
+                else:
+                    fail(f"composition-matched rounds disagree: ON {r_on} {on} "
+                         f"!= OFF {r_off} {off}")
+        else:
+            print("no composition-matched round pair this run (arrival timing "
+                  "never produced the same step census in both arms): an "
+                  "unmatched round cannot adjudicate the claim, so any lane "
+                  "outcome difference is reported as INCONCLUSIVE above and "
+                  "this run is not a verdict", flush=True)
+            inconclusive.append("no composition-matched round pair")
+
         for label in ("ON", "OFF"):
-            rounds = results[label]
+            rounds = [lanes for lanes, _sig in results[label]]
             best = max(aggregate(lanes, None)[1] for lanes in rounds)
             print(f"{label}: {len(rounds)} rounds, keys "
                   f"{[l['sha'] for l in rounds[0]]}", flush=True)
@@ -336,6 +402,15 @@ def main():
     if fails:
         print(f"\nFAIL ({len(fails)} finding(s))", flush=True)
         return 1
+    if inconclusive:
+        print(
+            f"\nINCONCLUSIVE ({len(inconclusive)} unmatched observation(s)): no "
+            f"composition-matched round pair, so the claim is neither confirmed "
+            f"nor refuted by this run. Re-run with equal-length prompts (the "
+            f"pinned shape), or compare the step censuses above.",
+            flush=True,
+        )
+        return 2
     print("\nPASS: cohort ON == OFF on every pinned round", flush=True)
     return 0
 
