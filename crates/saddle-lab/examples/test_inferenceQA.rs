@@ -480,6 +480,7 @@ fn kv_cache_for_mode(
             config.n_kv_heads,
             config.head_dim,
             seq_len,
+            hipfire_runtime::llama::VMode::Q8,
         ),
         "fwht2" => llama::KvCache::new_gpu_fwht2_filtered(
             gpu,
@@ -487,6 +488,7 @@ fn kv_cache_for_mode(
             config.n_kv_heads,
             config.head_dim,
             seq_len,
+            hipfire_runtime::llama::VMode::Q8,
         ),
         other => return Err(format!("unknown KV mode: {other}")),
     }

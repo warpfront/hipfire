@@ -156,6 +156,7 @@ fn main() {
                 config.n_kv_heads,
                 config.head_dim,
                 kv_seq,
+                hipfire_runtime::llama::VMode::Q8,
             ),
             "fwht2" => KvCache::new_gpu_fwht2_filtered(
                 gpu,
@@ -163,6 +164,7 @@ fn main() {
                 config.n_kv_heads,
                 config.head_dim,
                 kv_seq,
+                hipfire_runtime::llama::VMode::Q8,
             ),
             other => panic!("unknown kv mode: {other} (q8|fwht4|fwht3|fwht2)"),
         }

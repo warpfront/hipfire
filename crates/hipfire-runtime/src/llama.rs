@@ -8596,7 +8596,7 @@ mod tests {
             Err(_) => return,
         };
         // fwht3 requires head_dim == 256.
-        let kv = KvCache::new_gpu_fwht3_filtered(&mut gpu, &[true], 8, 256, 16).unwrap();
+        let kv = KvCache::new_gpu_fwht3_filtered(&mut gpu, &[true], 8, 256, 16, VMode::Q8).unwrap();
 
         let got = KvTierInputs {
             pos: 100,
