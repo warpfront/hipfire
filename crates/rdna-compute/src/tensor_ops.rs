@@ -1062,13 +1062,11 @@ pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) ->
         arch_gfx942: gpu.arch == "gfx942",
         pipe_enabled: *QWEN4_GDN_PIPE,
     });
-    let kernel = if gpu.arch_caps.is_gfx942()
+    if gpu.arch_caps.is_gfx942()
         && kernel == "gated_delta_step_halves_state128_persistent256_capture_f32"
     {
-        "qwen4_g942_gdn_verify_capture_f32"
-    } else {
-        kernel
-    };
+        return gated_delta_step_batched_g942_capture(gpu, p);
+    }
     crate::cdna::gfx942::ensure_gdn_verify_kernel(gpu, kernel)?;
     let frame = if format.has_frame_kernarg() {
         checked_u32(p.position + p.rows - 1, "GDN Q8 frame")?
@@ -1100,6 +1098,53 @@ pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) ->
         kernel,
         [value_heads_grid, 1, 1],
         [if pipe128 { 128 } else { 256 }, 1, 1],
+        0,
+        args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
+    )
+}
+
+/// The exact-gfx942 verify-capture module's launch of the F32 capture recurrence
+/// ([`gated_delta_step_batched`] after its validation): F32 state (no residual pointer, no
+/// requantization frame) and the row-state ring (the capture), so the kernargs are exactly
+/// [`gdn_batched_kernargs`]' for that case, written out here so this launch's ABI is checked
+/// against the module's declaration. A function of its own: the launcher's other launches
+/// name no gfx942 symbol.
+fn gated_delta_step_batched_g942_capture(
+    gpu: &mut Gpu,
+    p: &GatedDeltaStepBatched<'_>,
+) -> HipResult<()> {
+    let row_states = p
+        .row_states
+        .ok_or_else(|| HipError::new(0, &ComputeError::WrongShape.to_string()))?;
+    let rows = checked_i32(p.rows, "GDN batched rows")?;
+    let qkv_width = checked_i32(p.qkv_width, "GDN batched qkv width")?;
+    let key_heads = checked_i32(p.key_heads, "GDN batched key heads")?;
+    let value_heads = checked_i32(p.value_heads, "GDN batched value heads")?;
+    let key_dim = checked_i32(p.key_dim, "GDN batched key width")?;
+    let value_dim = checked_i32(p.value_dim, "GDN batched value width")?;
+    let value_heads_grid = checked_u32(p.value_heads, "GDN batched value-head grid")?;
+    let kernel = "qwen4_g942_gdn_verify_capture_f32";
+    crate::cdna::gfx942::ensure_gdn_verify_kernel(gpu, kernel)?;
+    let mut args = KernargBlob::new();
+    args.push_ptr(p.projection.buf.as_ptr());
+    args.push_ptr(p.gate.buf.as_ptr());
+    args.push_ptr(p.beta.buf.as_ptr());
+    args.push_ptr(p.state.buf.as_ptr());
+    args.push_ptr(p.output.buf.as_ptr());
+    args.push_ptr(row_states.buf.as_ptr());
+    args.push_i32(rows);
+    args.push_i32(qkv_width);
+    args.push_i32(key_heads);
+    args.push_i32(value_heads);
+    args.push_i32(key_dim);
+    args.push_i32(value_dim);
+    args.push_f32((p.key_dim as f32).sqrt().recip());
+    args.pad_to(16);
+    gpu.launch_blob_recorded(
+        kernel,
+        [value_heads_grid, 1, 1],
+        [256, 1, 1],
         0,
         args.as_mut_slice(),
         crate::dispatch::ReplayLaunchBindings::NONE,
@@ -1254,11 +1299,9 @@ pub fn gated_delta_rollback_layers(
             "GDN rollback: a Q8Ef state rolls back with its residual (gated_delta_rollback_layers_ef)",
         ));
     };
-    let kernel = if gpu.arch_caps.is_gfx942() && kernel == "gated_delta_rollback_layers_f32" {
-        "qwen4_g942_gdn_verify_rollback_f32"
-    } else {
-        kernel
-    };
+    if gpu.arch_caps.is_gfx942() && kernel == "gated_delta_rollback_layers_f32" {
+        return gated_delta_rollback_layers_g942(gpu, p);
+    }
     crate::cdna::gfx942::ensure_gdn_verify_kernel(gpu, kernel)?;
     let mut args = KernargBlob::new();
     args.push_ptr(p.table.buf.as_ptr());
@@ -1278,6 +1321,47 @@ pub fn gated_delta_rollback_layers(
     if storage.has_frame_kernarg() {
         args.push_u32(checked_u32(p.position, "GDN Q8 frame")?);
     }
+    args.pad_to(16);
+    gpu.launch_blob_recorded(
+        kernel,
+        [
+            checked_u32(p.value_heads, "GDN rollback value-head grid")?,
+            checked_u32(p.layers, "GDN rollback layer grid")?,
+            1,
+        ],
+        [256, 1, 1],
+        0,
+        args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
+    )
+}
+
+/// The exact-gfx942 verify-rollback module's launch of the F32 rollback
+/// ([`gated_delta_rollback_layers`] after its validation). F32 state has no requantization
+/// frame, so the kernargs are the generic launch's without it, written out here so this
+/// launch's ABI is checked against the module's declaration. A function of its own: the
+/// launcher's other launches name no gfx942 symbol.
+fn gated_delta_rollback_layers_g942(
+    gpu: &mut Gpu,
+    p: &GatedDeltaRollbackLayers<'_>,
+) -> HipResult<()> {
+    let kernel = "qwen4_g942_gdn_verify_rollback_f32";
+    crate::cdna::gfx942::ensure_gdn_verify_kernel(gpu, kernel)?;
+    let mut args = KernargBlob::new();
+    args.push_ptr(p.table.buf.as_ptr());
+    args.push_ptr(p.discard.buf.as_ptr());
+    for (value, label) in [
+        (p.rows, "GDN rollback rows"),
+        (p.keep, "GDN rollback kept rows"),
+        (p.from, "GDN rollback source slot"),
+        (p.to, "GDN rollback target slot"),
+        (p.qkv_width, "GDN rollback qkv width"),
+        (p.key_heads, "GDN rollback key heads"),
+        (p.value_heads, "GDN rollback value heads"),
+    ] {
+        args.push_i32(checked_i32(value, label)?);
+    }
+    args.push_f32(128f32.sqrt().recip());
     args.pad_to(16);
     gpu.launch_blob_recorded(
         kernel,
@@ -4742,10 +4826,46 @@ fn gated_delta_conv_batched_impl(
     let start_cursor = checked_i32(p.start_cursor, "GDN batched convolution cursor")?;
     let grid = blocks(p.channels)?;
     let row_grid = checked_u32(p.rows.div_ceil(16), "GDN batched convolution row grid")?;
+    let (param_elements, param_heads) = params.map_or((0, 1), |q| (q.rows * q.heads, q.heads));
+    let param_grid = checked_u32(param_elements.div_ceil(256), "GDN batched parameter grid")?;
+    // Compact 1-D grid: `conv_blocks * row_grid` convolution tiles (block `i`
+    // is channel block `i % conv_blocks`, row block `i / conv_blocks`), then the
+    // parameter blocks.  The kernel re-derives the split from rows / channels,
+    // so the grid depends only on those and the heads, fixed at capture.
+    let conv_tiles = checked_product(
+        grid as usize,
+        row_grid as usize,
+        "GDN batched convolution tile grid",
+    )?;
+    let total_grid = checked_u32(
+        checked_add(
+            conv_tiles,
+            param_grid as usize,
+            "GDN batched convolution launch grid",
+        )?,
+        "GDN batched convolution launch grid",
+    )?;
+    if qk_norm.is_none() && gpu.arch_caps.is_gfx942() {
+        return gated_delta_conv_batched_g942(
+            gpu,
+            p,
+            params,
+            GdnConvG942 {
+                rows,
+                channels,
+                history_rows,
+                kernel_size,
+                start_cursor,
+                output_bf16,
+                input_bf16,
+                param_elements,
+                param_heads,
+                total_grid,
+            },
+        );
+    }
     let kernel = if qk_norm.is_some() {
         "gated_delta_conv_qknorm_bf16_f32_batched_k4"
-    } else if gpu.arch_caps.is_gfx942() {
-        "qwen4_g942_gdn_verify_conv_params_k4"
     } else {
         "gated_delta_conv_bf16_f32_batched_k4"
     };
@@ -4773,7 +4893,6 @@ fn gated_delta_conv_batched_impl(
             args.push_ptr(std::ptr::null());
         }
     }
-    let (param_elements, param_heads) = params.map_or((0, 1), |q| (q.rows * q.heads, q.heads));
     args.push_i32(checked_i32(param_elements, "GDN batched parameter extent")?);
     args.push_i32(checked_i32(param_heads, "GDN batched parameter heads")?);
     if let Some(norm) = qk_norm {
@@ -4781,24 +4900,6 @@ fn gated_delta_conv_batched_impl(
         args.push_ptr(norm.kn);
     }
     args.pad_to(16);
-    let param_grid = checked_u32(param_elements.div_ceil(256), "GDN batched parameter grid")?;
-    // Compact 1-D grid: `conv_blocks * row_grid` convolution tiles (block `i`
-    // is channel block `i % conv_blocks`, row block `i / conv_blocks`), then the
-    // parameter blocks.  The kernel re-derives the split from rows / channels,
-    // so the grid depends only on those and the heads, fixed at capture.
-    let conv_tiles = checked_product(
-        grid as usize,
-        row_grid as usize,
-        "GDN batched convolution tile grid",
-    )?;
-    let total_grid = checked_u32(
-        checked_add(
-            conv_tiles,
-            param_grid as usize,
-            "GDN batched convolution launch grid",
-        )?,
-        "GDN batched convolution launch grid",
-    )?;
     // `start_cursor` is `start_position % history_rows` for the chunk (the
     // kernel advances the ring per row from there), so the declared binding
     // re-derives it at the replay position.
@@ -4811,6 +4912,78 @@ fn gated_delta_conv_batched_impl(
     gpu.launch_blob_recorded(
         kernel,
         [total_grid, 1, 1],
+        [256, 1, 1],
+        0,
+        args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings {
+            grid: None,
+            kernargs: &start_cursor_binding,
+        },
+    )
+}
+
+/// The resolved geometry of one batched GDN convolution launch
+/// ([`gated_delta_conv_batched_impl`] after its validation).
+struct GdnConvG942 {
+    rows: i32,
+    channels: i32,
+    history_rows: i32,
+    kernel_size: i32,
+    start_cursor: i32,
+    output_bf16: bool,
+    input_bf16: bool,
+    param_elements: usize,
+    param_heads: usize,
+    total_grid: u32,
+}
+
+/// The exact-gfx942 verify convolution module's launch of the un-normalized params kernel
+/// (no Q/K norm tail), written out here so this launch's ABI is checked against the module's
+/// declaration. A function of its own: the launcher's other launches name no gfx942 symbol.
+fn gated_delta_conv_batched_g942(
+    gpu: &mut Gpu,
+    p: &GatedDeltaConvBatched<'_>,
+    params: Option<&GatedDeltaParamsBatched<'_>>,
+    g: GdnConvG942,
+) -> HipResult<()> {
+    let kernel = "qwen4_g942_gdn_verify_conv_params_k4";
+    crate::cdna::gfx942::ensure_gdn_verify_kernel(gpu, kernel)?;
+    let mut args = KernargBlob::new();
+    for tensor in [p.input, p.kernel, p.history, p.output, p.next_history] {
+        args.push_ptr(tensor.buf.as_ptr());
+    }
+    args.push_i32(g.rows);
+    args.push_i32(g.channels);
+    args.push_i32(g.history_rows);
+    args.push_i32(g.kernel_size);
+    args.push_i32(g.start_cursor);
+    let start_cursor_offset = args.len() - 4;
+    args.push_i32(i32::from(g.output_bf16));
+    args.push_i32(i32::from(g.input_bf16));
+    if let Some(q) = params {
+        for tensor in [q.a, q.b, q.a_log, q.dt_bias, q.gate, q.beta] {
+            args.push_ptr(tensor.buf.as_ptr());
+        }
+    } else {
+        for _ in 0..6 {
+            args.push_ptr(std::ptr::null());
+        }
+    }
+    args.push_i32(checked_i32(
+        g.param_elements,
+        "GDN batched parameter extent",
+    )?);
+    args.push_i32(checked_i32(g.param_heads, "GDN batched parameter heads")?);
+    args.pad_to(16);
+    let start_cursor_binding = [crate::replay::ReplayKernargBinding::PositionModU32 {
+        offset: start_cursor_offset,
+        addend: 0,
+        modulus: u32::try_from(p.history_rows)
+            .map_err(|_| HipError::new(0, "GDN batched convolution history rows exceed u32"))?,
+    }];
+    gpu.launch_blob_recorded(
+        kernel,
+        [g.total_grid, 1, 1],
         [256, 1, 1],
         0,
         args.as_mut_slice(),
@@ -10170,7 +10343,20 @@ pub fn indexed_attention_attention(
             }
             _ => (serial, 0),
         };
-    let kernel_name = crate::cdna::gfx942::ensure_qsa_row_kernel(gpu, kernel_name)?;
+    // Exact gfx942 launches the two parallel entries from the single-row module, under the
+    // module's own symbols (the per-context function table is keyed by entry name; the
+    // device body is this module's, byte for byte). Selected here, where the launch names
+    // them, so this site's ABI is checked against the module's declaration.
+    let kernel_name = if gpu.arch_caps.is_gfx942() {
+        match kernel_name {
+            "indexed_attention_attention_f32" => "qwen4_g942_qsa_row_f32",
+            "indexed_attention_attention_fp8_fnuz" => "qwen4_g942_qsa_row_fp8_fnuz",
+            other => other,
+        }
+    } else {
+        kernel_name
+    };
+    crate::cdna::gfx942::ensure_qsa_row_kernel(gpu, kernel_name)?;
     let mut args = KernargBlob::new();
     for tensor in [
         p.q_with_gate,

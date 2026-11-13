@@ -425,10 +425,16 @@ impl GridLaunch {
         let batch = self.batch as usize;
         let mut blob = KernargBlob::new();
         blob.push_ptr(self.x);
-        for p in self.a.iter().chain(&self.d) {
-            blob.push_ptr(*p);
+        let a: [*const c_void; MAX_MEMBERS] = self.a;
+        let d: [*const c_void; MAX_MEMBERS] = self.d;
+        let m: [i32; MAX_MEMBERS] = self.m;
+        for p in a {
+            blob.push_ptr(p);
         }
-        for v in self.m {
+        for p in d {
+            blob.push_ptr(p);
+        }
+        for v in m {
             blob.push_i32(v);
         }
         blob.push_i32(self.k);

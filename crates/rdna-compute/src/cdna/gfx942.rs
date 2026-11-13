@@ -630,11 +630,12 @@ fn g942_qsa_row_image() -> HipResult<Option<&'static std::sync::Arc<[u8]>>> {
     }
 }
 
-/// Load the single-row QSA attention entry `kernel` and return the symbol to launch. On exact
-/// gfx942 the two [`QWEN4_G942_QSA_ROW_ENTRIES`] resolve to the gfx942-only module (hipcc source,
-/// or the `HIPFIRE_QWEN4_G942_QSA_ROW_IMAGE` code object) and the module's own symbol is
-/// returned; every other arch, and every other entry (the serial row kernels), loads from
-/// `tensor_ops` as before and returns `kernel`.
+/// Load the single-row QSA attention entry `kernel` and return the symbol to launch. `kernel` is
+/// a `tensor_ops` entry or, on exact gfx942, already the module's own symbol (what the public
+/// launcher passes). On exact gfx942 the two [`QWEN4_G942_QSA_ROW_ENTRIES`] resolve to the
+/// gfx942-only module (hipcc source, or the `HIPFIRE_QWEN4_G942_QSA_ROW_IMAGE` code object) and
+/// the module's own symbol is returned; every other arch, and every other entry (the serial row
+/// kernels), loads from `tensor_ops` as before and returns `kernel`.
 pub(crate) fn ensure_qsa_row_kernel(
     gpu: &mut Gpu,
     kernel: &'static str,
@@ -645,7 +646,7 @@ pub(crate) fn ensure_qsa_row_kernel(
         .then(|| {
             QWEN4_G942_QSA_ROW_ENTRIES
                 .iter()
-                .find(|(tensor_ops, _)| *tensor_ops == kernel)
+                .find(|(tensor_ops, own)| *tensor_ops == kernel || *own == kernel)
         })
         .flatten();
     let Some(&(_, own)) = entry else {
