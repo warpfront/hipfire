@@ -351,20 +351,23 @@ fn main() {
             let w_ba = synth_hfq3_bytes(m_ba, k, 43);
             let d_w_ba = gpu.upload_raw(&w_ba, &[w_ba.len()]).unwrap();
             let y_ref_ba = cpu_reference_via_gemv(&mut gpu, &w_ba, &x_mmq, m_ba, k, n);
-            let d_y1 = gpu.alloc_tensor(&[n * m_mmq], DType::F32).unwrap();
-            let d_y2 = gpu.alloc_tensor(&[n * m_mmq], DType::F32).unwrap();
-            let d_y3 = gpu.alloc_tensor(&[n * m_ba], DType::F32).unwrap();
-            let d_y4 = gpu
-                .upload_f32(&vec![f32::NAN; n * m_ba], &[n * m_ba])
-                .unwrap();
+            let mut nan = |len: usize| gpu.upload_f32(&vec![f32::NAN; len], &[len]).unwrap();
+            let [d_y1, d_y2] = [nan(n * m_mmq), nan(n * m_mmq)];
+            let [d_y3, d_y4] = [nan(n * m_ba), nan(n * m_ba)];
             gpu.gemm_qkvza_hfq3g256_mmq(
                 &d_w_mmq, &d_w_mmq, &d_w_ba, &d_w_ba, &d_x_mmq, &d_y1, &d_y2, &d_y3, &d_y4, m_mmq,
                 m_mmq, m_ba, m_ba, k, n,
             )
             .unwrap();
-            let y4 = gpu.download_f32(&d_y4).unwrap();
-            any_fail |=
-                !compare_with_tol("mmq qkvza unaligned (alpha arm)", &y_ref_ba, &y4, mmq_tol);
+            for (arm, d_y, y_ref) in [
+                ("mmq qkvza unaligned (qkv arm)", &d_y1, &y_ref_mmq),
+                ("mmq qkvza unaligned (z arm)", &d_y2, &y_ref_mmq),
+                ("mmq qkvza unaligned (beta arm)", &d_y3, &y_ref_ba),
+                ("mmq qkvza unaligned (alpha arm)", &d_y4, &y_ref_ba),
+            ] {
+                let y = gpu.download_f32(d_y).unwrap();
+                any_fail |= !compare_with_tol(arm, y_ref, &y, mmq_tol);
+            }
             for t in [d_y1, d_y2, d_y3, d_y4, d_w_ba] {
                 gpu.free_tensor(t).unwrap();
             }

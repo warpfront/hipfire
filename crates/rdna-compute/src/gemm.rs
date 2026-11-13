@@ -2196,6 +2196,62 @@ mod gate_up_tile_loop_tests {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum QkvzaHfq3MmqRoute {
+    Dot2,
+    /// qkv+z on the 2-way gate_up MMQ, beta/alpha tail on dot2 (#315).
+    Split,
+    X16,
+    X32,
+}
+
+/// The 4-way MMQ body routes whole 128-row tiles to one segment (CALLER INVARIANT in
+/// gemm_qkvza_hfq3g256_mmq_body.cuh), so an unaligned beta/alpha (Qwen3.5/3.6
+/// n_v_heads = 32/48 rows) would leave alpha unwritten (HIPF-384).
+fn qkvza_hfq3_mmq_route(
+    batch_size: usize,
+    qkv_m: usize,
+    z_m: usize,
+    beta_m: usize,
+    alpha_m: usize,
+) -> QkvzaHfq3MmqRoute {
+    if batch_size <= 12 || qkv_m % 128 != 0 || z_m % 128 != 0 {
+        QkvzaHfq3MmqRoute::Dot2
+    } else if beta_m % 128 != 0 || alpha_m % 128 != 0 {
+        QkvzaHfq3MmqRoute::Split
+    } else if batch_size <= 127 {
+        QkvzaHfq3MmqRoute::X16
+    } else {
+        QkvzaHfq3MmqRoute::X32
+    }
+}
+
+#[cfg(test)]
+mod qkvza_hfq3_mmq_route_tests {
+    use super::{qkvza_hfq3_mmq_route as route, QkvzaHfq3MmqRoute::*};
+
+    #[test]
+    fn unaligned_beta_alpha_never_reach_4way_mmq() {
+        // Qwen3.5-4B (32 v-heads) and 27B (48 v-heads, qkv 10240 / z 6144).
+        for (qkv, z, ba) in [(8192, 4096, 32), (10240, 6144, 48)] {
+            assert_eq!(route(12, qkv, z, ba, ba), Dot2);
+            assert_eq!(route(13, qkv, z, ba, ba), Split);
+            assert_eq!(route(128, qkv, z, ba, ba), Split);
+        }
+        assert_eq!(route(13, 256, 256, 128, 32), Split);
+        assert_eq!(route(13, 256, 256, 32, 128), Split);
+    }
+
+    #[test]
+    fn aligned_and_unaligned_qkv_z() {
+        assert_eq!(route(13, 256, 256, 128, 128), X16);
+        assert_eq!(route(127, 256, 256, 128, 128), X16);
+        assert_eq!(route(128, 256, 256, 128, 128), X32);
+        assert_eq!(route(128, 200, 256, 128, 128), Dot2);
+        assert_eq!(route(128, 256, 200, 32, 32), Dot2);
+    }
+}
+
 impl Gpu {
     /// Every condition of the gfx1201 builder `_b1` selection except the
     /// per-launch shape/pointer check ([`g12_iu4_b1_eligible`]).
@@ -9089,25 +9145,27 @@ impl Gpu {
                 alpha_m, k, batch_size,
             );
         }
-        // The MMQ body routes whole 128-row tiles to one segment (CALLER INVARIANT in
-        // gemm_qkvza_hfq3g256_mmq_body.cuh); Qwen3.5 beta/alpha (n_v_heads rows) are not
-        // 128-aligned, so an unaligned call would leave alpha unwritten.
-        let aligned = qkv_m % 128 == 0 && z_m % 128 == 0 && beta_m % 128 == 0 && alpha_m % 128 == 0;
-        if batch_size <= 12 || !aligned {
-            self.gemm_qkvza_hfq3g256_dot2(
+        match qkvza_hfq3_mmq_route(batch_size, qkv_m, z_m, beta_m, alpha_m) {
+            QkvzaHfq3MmqRoute::Dot2 => self.gemm_qkvza_hfq3g256_dot2(
                 a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m,
                 alpha_m, k, batch_size,
-            )
-        } else if batch_size <= 127 {
-            self.gemm_qkvza_hfq3g256_mmq_x16(
+            ),
+            QkvzaHfq3MmqRoute::Split => {
+                self.gemm_gate_up_hfq3g256_mmq(
+                    a_qkv, a_z, x, y_qkv, y_z, qkv_m, z_m, k, batch_size,
+                )?;
+                self.gemm_gate_up_hfq3g256_dot2(
+                    a_beta, a_alpha, x, y_beta, y_alpha, beta_m, alpha_m, k, batch_size,
+                )
+            }
+            QkvzaHfq3MmqRoute::X16 => self.gemm_qkvza_hfq3g256_mmq_x16(
                 a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m,
                 alpha_m, k, batch_size,
-            )
-        } else {
-            self.gemm_qkvza_hfq3g256_mmq_x32(
+            ),
+            QkvzaHfq3MmqRoute::X32 => self.gemm_qkvza_hfq3g256_mmq_x32(
                 a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m,
                 alpha_m, k, batch_size,
-            )
+            ),
         }
     }
 
