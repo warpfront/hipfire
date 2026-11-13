@@ -825,10 +825,7 @@ pub struct MoeSharedPrefill<'a> {
 #[derive(Clone, Copy)]
 pub enum MoeQ8RouterPolicy<'a> {
     DispatcherEntry,
-    FreshFp16Wmma {
-        enabled: bool,
-        scratch: &'a GpuTensor,
-    },
+    FreshFp16Wmma { scratch: &'a GpuTensor },
 }
 
 /// Complete prefill prologue declaration.

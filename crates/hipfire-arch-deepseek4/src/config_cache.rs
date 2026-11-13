@@ -9,65 +9,15 @@ fn flag_one(name: &'static str) -> bool {
     hipfire_config::developer_var(name).ok().as_deref() == Some("1")
 }
 
-/// `HIPFIRE_DEEPSEEK4_MOE` — default ON. Opt out with "0" for diagnostic
-/// shared-only-FFN runs. Without routed-expert dispatch the model is
-/// architecturally broken (DeepSeek V4 is MoE), so leaving this off was only
-/// useful during initial bring-up before the forward path consumed the
-/// expert blobs.
-pub(crate) fn moe_on() -> bool {
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| {
-        hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE")
-            .ok()
-            .as_deref()
-            != Some("0")
-    })
-}
 /// `HIPFIRE_DEEPSEEK4_SKIP_FFN` — diagnostic: zero ffn_out to isolate attn growth.
 pub(crate) fn skip_ffn() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| flag_one("HIPFIRE_DEEPSEEK4_SKIP_FFN"))
 }
-/// `HIPFIRE_DEEPSEEK4_ATTN` — when "pos0", attn_stub uses the diagnostic
-/// pos-0 attention path instead of SWA. Default false (i.e. use SWA).
-pub(crate) fn attn_pos0() -> bool {
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| {
-        hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_ATTN")
-            .ok()
-            .as_deref()
-            == Some("pos0")
-    })
-}
-/// `HIPFIRE_DEEPSEEK4_MTP_HEAD_HC` — default ON since 2026-05-21: route
-/// the MTP output (step 8 of mtp_forward) through head-HC mix using
-/// `mtp.0.hc_head_fn / hc_head_base / hc_head_scale`. Mirrors the
-/// main model's final_norm_and_head head-HC reduction. Without
-/// this, MTP step 8 reads only stream 0 — discarding 75% of HC
-/// signal at the head boundary (same architectural pattern as the
-/// input-side HC fix shipped in 82224ad). Opt out with =0 for
-/// debugging or pre-fix-compat builds.
-pub(crate) fn mtp_head_hc_on() -> bool {
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| {
-        hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MTP_HEAD_HC")
-            .ok()
-            .as_deref()
-            != Some("0")
-    })
-}
-/// `HIPFIRE_DEEPSEEK4_E8_WO_GROUPED` — collapse the eight gfx1151
-/// E8-SoA O-LoRA GEMVs into one block-diagonal launch.
-pub(crate) fn e8_wo_grouped_on(arch: &str, mq2r: bool) -> bool {
-    static V: OnceLock<bool> = OnceLock::new();
+/// Collapse the eight gfx1151 E8-SoA O-LoRA GEMVs into one block-diagonal
+/// launch.
+pub(crate) fn e8_wo_grouped_on(arch: &str) -> bool {
     arch == "gfx1151"
-        && (mq2r
-            || *V.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_E8_WO_GROUPED")
-                    .ok()
-                    .as_deref()
-                    != Some("0")
-            }))
 }
 /// Exact-gfx1201 MQ2R route for collapsing the eight O-LoRA E8 GEMVs.
 /// This is a shipped architecture default, not an environment experiment.
@@ -100,22 +50,11 @@ pub(crate) fn gfx942_compressor_gate_on(arch: &str, mq2r: bool) -> bool {
         && mq2r
         && *V.get_or_init(|| flag_one("HIPFIRE_DEEPSEEK4_GFX942_COMPRESSOR_GATE"))
 }
-/// `HIPFIRE_DEEPSEEK4_GFX942_E8_WO_GROUPED` — wire the gfx942 grouped E8
-/// O-LoRA kernel (`gemv_mfp4g32_e8_soa_grouped_gfx942`) for `wo_a`
-/// instead of the 8-way `gemv_auto` loop. Default ON for gfx942 route v1
-/// after the production-shape raw-bit channel passed; set `=0` for the
-/// serial emergency fallback.
-/// Separate from `HIPFIRE_DEEPSEEK4_E8_WO_GROUPED` (gfx1151).
+/// Wire the gfx942 grouped E8 O-LoRA kernel
+/// (`gemv_mfp4g32_e8_soa_grouped_gfx942`) for `wo_a` instead of the 8-way
+/// `gemv_auto` loop on gfx942 route v1.
 pub(crate) fn gfx942_e8_wo_grouped_on(arch: &str, gfx942_route_v1: bool) -> bool {
-    static V: OnceLock<bool> = OnceLock::new();
-    arch == "gfx942"
-        && gfx942_route_v1
-        && *V.get_or_init(|| {
-            hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_GFX942_E8_WO_GROUPED")
-                .ok()
-                .as_deref()
-                != Some("0")
-        })
+    arch == "gfx942" && gfx942_route_v1
 }
 /// `HIPFIRE_DEEPSEEK4_GFX942_HC_FINALIZE_FUSED` — replace the three
 /// scalar mHC finalization launches (alpha, sigmoid/scale, Sinkhorn) with
@@ -127,31 +66,11 @@ pub(crate) fn gfx942_hc_finalize_fused_on(arch: &str, gfx942_route_v1: bool) -> 
         && gfx942_route_v1
         && *V.get_or_init(|| flag_one("HIPFIRE_DEEPSEEK4_GFX942_HC_FINALIZE_FUSED"))
 }
-/// `HIPFIRE_DEEPSEEK4_GFX942_INDEXER_TOPK_PARALLEL` — F1: admit the
-/// filtered block-parallel indexer top-K on exact `gfx942` MQ2R.
-/// Default ON for the gfx942-v1 route after its raw-i32 channel passed;
-/// set `=0` for the serial emergency fallback. Independent of L1/L3.
-/// The actual dispatch lives behind the model-owned `Mq2rBackend` and the
-/// exact-device `Gfx942Device`; this helper is only the emergency kill
-/// switch and operator-log surface.
-pub(crate) fn gfx942_indexer_topk_parallel_on(arch: &str, mq2r: bool) -> bool {
-    static V: OnceLock<bool> = OnceLock::new();
-    arch == "gfx942"
-        && mq2r
-        && *V.get_or_init(|| {
-            hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_GFX942_INDEXER_TOPK_PARALLEL")
-                .ok()
-                .as_deref()
-                != Some("0")
-        })
-}
-/// `HIPFIRE_DEEPSEEK4_GFX942_INDEXER_TOPK_BOUNDED` — F2: select the
-/// bounded tile-merge bitonic indexer top-K on exact `gfx942` MQ2R
-/// instead of F1's rank-count kernel. F1's kernel is O(N^2) on a single
-/// workgroup (`n_idx_heads == 1`), which is what walled long context.
-/// Requires F1 to be on — it selects which kernel that path dispatches.
-/// Default ON for the gfx942-v1 route after both promotion conditions
-/// passed; set `=0` for the emergency fallback to the rank-count kernel.
+/// F1/F2: the block-parallel indexer top-K on exact `gfx942` MQ2R, which
+/// dispatches the bounded tile-merge bitonic kernel (F2). It replaced the
+/// rank-count kernel, which is O(N^2) on a single workgroup
+/// (`n_idx_heads == 1`) and walled long context. The actual dispatch lives
+/// behind the model-owned `Mq2rBackend` and the exact-device `Gfx942Device`.
 ///
 /// Exactness (raw-i32 channel, `test_indexer_top_k_buf`, MI300X): 10/10
 /// PASS, every arm byte-identical in ORDER, finite cases also identical
@@ -159,7 +78,7 @@ pub(crate) fn gfx942_indexer_topk_parallel_on(arch: &str, mq2r: bool) -> bool {
 /// the N=513 boundary, all three non-finite eligibility cases
 /// (-inf pool / NaN / -FLT_MAX), and N = 8192 / 32768 / 262144.
 ///
-/// Perf (same binary, only this env differing, 3 fresh processes/arm,
+/// Perf vs the rank-count kernel (3 fresh processes/arm,
 /// interleaved A,B,B,A,A,B, 18/18 pass): cap 2048 25.046 -> 34.533 tok/s
 /// (1.38x), cap 8192 3.910 -> 25.957 (6.64x), cap 32768 0.274 -> 13.051
 /// (47.60x). Isolated kernel: 22.3x at N=8192, 88.3x at N=32768, 715x at
@@ -172,26 +91,15 @@ pub(crate) fn gfx942_indexer_topk_parallel_on(arch: &str, mq2r: bool) -> bool {
 /// of projected decode (~324 ms of ~430 ms, ~2.3 tok/s). A multi-block
 /// two-stage top-K is the next lever; the O(N) indexer scoring under it
 /// is only ~0.31 ms per 1000 rows.
-pub(crate) fn gfx942_indexer_topk_bounded_on(arch: &str, mq2r: bool) -> bool {
-    static V: OnceLock<bool> = OnceLock::new();
-    arch == "gfx942"
-        && mq2r
-        && *V.get_or_init(|| {
-            hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_GFX942_INDEXER_TOPK_BOUNDED")
-                .ok()
-                .as_deref()
-                != Some("0")
-        })
+pub(crate) fn gfx942_indexer_topk_parallel_on(arch: &str, mq2r: bool) -> bool {
+    arch == "gfx942" && mq2r
 }
-/// `HIPFIRE_DEEPSEEK4_GFX942_INDEXER_TOPK_TWOSTAGE` — F3: select the
-/// multi-block two-stage merge-tree indexer top-K on exact `gfx942` MQ2R
-/// instead of F2's single-workgroup bounded kernel. F2 collapsed the
+/// F3: the multi-block two-stage merge-tree indexer top-K on exact `gfx942`
+/// MQ2R instead of F2's single-workgroup bounded kernel. F2 collapsed the
 /// O(N^2) rank count but its grid is still `[n_idx_heads,1,1]` with
 /// `n_idx_heads == 1`, so the tile loop is serial on one CU; F3 replaces
 /// it with a chunk-sort + parallel merge tree whose launch count and
-/// grids derive only from `max_compressed` (graph-safe). Default ON for
-/// the gfx942-v1 route after both promotion conditions passed; set `=0`
-/// to fall back to F2. Selected only when
+/// grids derive only from `max_compressed` (graph-safe). Selected only when
 /// the active compressed-cache bucket is at least
 /// `indexer_topk_two_stage_min()`.
 ///
@@ -219,72 +127,15 @@ pub(crate) fn gfx942_indexer_topk_bounded_on(arch: &str, mq2r: bool) -> bool {
 /// cost should make F3 look BETTER than these figures, not worse. Do not
 /// invert that reasoning from a graphs-off benchmark.
 pub(crate) fn gfx942_indexer_topk_two_stage_on(arch: &str, mq2r: bool) -> bool {
-    static V: OnceLock<bool> = OnceLock::new();
-    arch == "gfx942"
-        && mq2r
-        && *V.get_or_init(|| {
-            hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_GFX942_INDEXER_TOPK_TWOSTAGE")
-                .ok()
-                .as_deref()
-                != Some("0")
-        })
+    arch == "gfx942" && mq2r
 }
-/// `HIPFIRE_DEEPSEEK4_GFX1151_INDEXER_TOPK_TWOSTAGE` — G1: the gfx1151
-/// twin of F3. gfx1151's legacy indexer top-K is the SAME O(N^2)
-/// rank-count on one workgroup that F2 removed from gfx942. The two-stage
-/// route is now the DeepSeek4 gfx1151 product default after exactness
-/// through the 1M scale and the long-context model campaign; set `=0`
-/// only as an emergency diagnostic fallback. Indexer scores and ranks are
-/// F32 state, so selection depends on the model architecture and device,
-/// not whether dense weights are MQ2-Lloyd or the MQ2R E8 tier. This is a
-/// SEPARATE lever
-/// from F3, not one shared `*_TWOSTAGE` flag: strict arch gating (no
-/// gfx942 lever ever bleeding into gfx1151 or vice versa) is enforced by
-/// the arch-gating unit tests, and the two arches promote independently.
-pub(crate) fn gfx1151_indexer_topk_two_stage_on(arch: &str) -> bool {
-    static V: OnceLock<bool> = OnceLock::new();
-    arch == "gfx1151"
-        && *V.get_or_init(|| {
-            hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_GFX1151_INDEXER_TOPK_TWOSTAGE")
-                .ok()
-                .as_deref()
-                != Some("0")
-        })
-}
-/// gfx1100 heterogeneous twin of the portable F3/G1 two-stage indexer.
-///
-/// The kernel body is already shared across wave32 gfx1151 and wave64
-/// gfx942, while `Gpu::ensure_kernel` still emits an exact-device code
-/// object for this `Gpu`.  Keep admission separate from G1 so enabling the
-/// dense half of the heterogeneous route cannot change gfx1151's certified
-/// tape or any Qwen-owned path.  Default ON; `=0` is an emergency
-/// diagnostic fallback to the legacy O(N^2) rank-count kernel.
-pub(crate) fn gfx1100_indexer_topk_two_stage_on(arch: &str) -> bool {
-    static V: OnceLock<bool> = OnceLock::new();
-    arch == "gfx1100"
-        && *V.get_or_init(|| {
-            hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_GFX1100_INDEXER_TOPK_TWOSTAGE")
-                .ok()
-                .as_deref()
-                != Some("0")
-        })
-}
-/// gfx1201 expert-parallel admission for the portable two-stage indexer.
-///
-/// The initial 2,048-row capacity bucket uses the faster one-launch bounded
-/// network; after capacity growth this admits the portable merge tree. Both
-/// replace the legacy single-workgroup O(N^2) rank count and compile into
-/// exact-gfx1201 code objects. Keep admission separate from every other
-/// architecture.
-pub(crate) fn gfx1201_indexer_topk_two_stage_on(arch: &str) -> bool {
-    static V: OnceLock<bool> = OnceLock::new();
-    arch == "gfx1201"
-        && *V.get_or_init(|| {
-            hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_GFX1201_INDEXER_TOPK_TWOSTAGE")
-                .ok()
-                .as_deref()
-                != Some("0")
-        })
+/// Portable two-stage indexer top-K on gfx1151 (G1), gfx1100 and gfx1201.
+/// It replaces the legacy single-workgroup O(N^2) rank count. On gfx1201
+/// the initial 2,048-row capacity bucket keeps the faster one-launch bounded
+/// network (see `two_stage_topk_capacity_eligible`). Admission stays
+/// per-architecture so no gfx942 lever bleeds into these arches.
+pub(crate) fn portable_indexer_topk_two_stage_on(arch: &str) -> bool {
+    matches!(arch, "gfx1151" | "gfx1100" | "gfx1201")
 }
 /// `HIPFIRE_DEEPSEEK4_INDEXER_TOPK_TWOSTAGE_MIN` — minimum
 /// active compressed-cache row count at which the two-stage path may be selected.
@@ -325,23 +176,20 @@ pub(crate) fn log_gfx942_a2_levers(arch: &str, gfx942_route_v1: bool) {
         let l3 = gfx942_e8_wo_grouped_on(arch, gfx942_route_v1);
         let l2 = gfx942_hc_finalize_fused_on(arch, gfx942_route_v1);
         let f1 = gfx942_indexer_topk_parallel_on(arch, gfx942_route_v1);
-        let f2 = gfx942_indexer_topk_bounded_on(arch, gfx942_route_v1);
         let f3 = gfx942_indexer_topk_two_stage_on(arch, gfx942_route_v1);
         let ffn_overlap = gfx942_ffn_overlap_on(gfx942_route_v1 && arch == "gfx942");
         eprintln!(
             "deepseek4 gfx942 A2 levers: \
              L1 compressor_gate={} (HIPFIRE_DEEPSEEK4_GFX942_COMPRESSOR_GATE default OFF, =1 enables) ; \
-             L3 e8_wo_grouped={} (gfx942-v1 default ON, HIPFIRE_DEEPSEEK4_GFX942_E8_WO_GROUPED=0 disables) ; \
+             L3 e8_wo_grouped={} (gfx942-v1) ; \
              L2 hc_finalize_fused={} (default OFF, HIPFIRE_DEEPSEEK4_GFX942_HC_FINALIZE_FUSED=1 enables) ; \
-             F1 indexer_topk_parallel={} (gfx942-v1 default ON, HIPFIRE_DEEPSEEK4_GFX942_INDEXER_TOPK_PARALLEL=0 disables) ; \
-             F2 indexer_topk_bounded={} (gfx942-v1 default ON, HIPFIRE_DEEPSEEK4_GFX942_INDEXER_TOPK_BOUNDED=0 disables) ; \
-             F3 indexer_topk_two_stage={} (gfx942-v1 default ON, HIPFIRE_DEEPSEEK4_GFX942_INDEXER_TOPK_TWOSTAGE=0 disables) ; \
+             F1/F2 indexer_topk_parallel_bounded={} (gfx942-v1) ; \
+             F3 indexer_topk_two_stage={} (gfx942-v1) ; \
              C1 ffn_overlap={} (default OFF, HIPFIRE_DEEPSEEK4_GFX942_FFN_OVERLAP=1 enables)",
             if l1 { "ON" } else { "OFF" },
             if l3 { "ON" } else { "OFF" },
             if l2 { "ON" } else { "OFF" },
             if f1 { "ON" } else { "OFF" },
-            if f2 { "ON" } else { "OFF" },
             if f3 { "ON" } else { "OFF" },
             if ffn_overlap { "ON" } else { "OFF" },
         );
@@ -510,21 +358,11 @@ pub(crate) fn resolve_route_scale(
     })
 }
 
-/// `HIPFIRE_DEEPSEEK4_E8_U4` — use the four-group-unrolled E8-SoA
-/// decode schedule for DeepSeek V4 dense projections on gfx1151. This is
-/// deliberately architecture-owned: the same schedule regresses smaller
-/// A3B projection shapes. MQ2R pins it ON; other DeepSeek artifacts may set
-/// `=0` for the original one-row schedule.
-pub(crate) fn e8_u4_on(arch: &str, mq2r: bool) -> bool {
-    static V: OnceLock<bool> = OnceLock::new();
+/// Four-group-unrolled E8-SoA decode schedule for DeepSeek V4 dense
+/// projections on gfx1151. This is deliberately architecture-owned: the
+/// same schedule regresses smaller A3B projection shapes.
+pub(crate) fn e8_u4_on(arch: &str) -> bool {
     arch == "gfx1151"
-        && (mq2r
-            || *V.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_E8_U4")
-                    .ok()
-                    .as_deref()
-                    != Some("0")
-            }))
 }
 /// `HIPFIRE_DEEPSEEK4_FUSED_ROUTE_ACT` — fold the MoE routing activation
 /// `sqrt(softplus(.))` into the store of the gate GEMV instead of running
@@ -545,36 +383,12 @@ pub(crate) fn moe_route_fused_activation() -> bool {
             == Some("1")
     })
 }
-/// `HIPFIRE_DEEPSEEK4_E8_PREFILL_B2` — reuse decoded E8 fragments across
-/// two 16-token WMMA tiles on gfx1151. Set `=0` for the B1 admission
-/// baseline.
-pub(crate) fn e8_prefill_b2_on(arch: &str, mq2r: bool) -> bool {
-    static V: OnceLock<bool> = OnceLock::new();
+/// Reuse decoded E8 fragments across four 16-token WMMA tiles on gfx1151.
+pub(crate) fn e8_prefill_b4_on(arch: &str) -> bool {
     arch == "gfx1151"
-        && (mq2r
-            || *V.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_E8_PREFILL_B2")
-                    .ok()
-                    .as_deref()
-                    != Some("0")
-            }))
 }
-/// `HIPFIRE_DEEPSEEK4_E8_PREFILL_B4` — candidate four-tile reuse schedule.
-/// Set `=0` to retain the admitted B2 path for same-binary A/B.
-pub(crate) fn e8_prefill_b4_on(arch: &str, mq2r: bool) -> bool {
-    static V: OnceLock<bool> = OnceLock::new();
-    arch == "gfx1151"
-        && (mq2r
-            || *V.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_E8_PREFILL_B4")
-                    .ok()
-                    .as_deref()
-                    != Some("0")
-            }))
-}
-/// `HIPFIRE_DEEPSEEK4_E8_BATCHED_GEMV` — largest batch size routed through
-/// the batched E8 decode GEMV instead of the WMMA token tile. `0` (the
-/// default) keeps every batch size on WMMA.
+/// Largest batch size routed through the batched E8 decode GEMV instead of
+/// the WMMA token tile.
 ///
 /// The WMMA prefill GEMM tiles the token axis at 16 and launches only M/16
 /// waves, so a B-token speculative verify pays a full 16-token tile at
@@ -583,66 +397,45 @@ pub(crate) fn e8_prefill_b4_on(arch: &str, mq2r: bool) -> bool {
 /// via `ensure_fp16_x` — consumes f32 activations, so B=1 is bit-identical
 /// to the AR decode GEMV.
 ///
-/// Cached in an atomic rather than a `OnceLock` so a bench can A/B both
-/// arms in one process via [`super::set_e8_batched_gemv_max_batch`]. The
-/// trunk is ~80 GB on gfx1151; a per-arm reload would dominate the
-/// measurement and put the two arms in different thermal states.
+/// Cached in an atomic so a bench can A/B both arms in one process via
+/// [`super::set_e8_batched_gemv_max_batch`]. The trunk is ~80 GB on
+/// gfx1151; a per-arm reload would dominate the measurement and put the two
+/// arms in different thermal states.
+///
+/// Default 8. `e8_batched_gemv_applies` already requires
+/// `arch == "gfx1151"`.
+///
+/// At speculative-verify batch the dense E8 WMMA tile (`tiles=1`, since
+/// `e8_prefill_batch_tiles` only tiles above batch 16/32) wastes 15/16 of
+/// each 16-wide tile and runs at ~22-53 GiB/s, while the batched GEMV
+/// reads the weights once and hits 56-193 GiB/s. Measured across the real
+/// DS4 dense shape mix, DRAM-resident, gfx1151
+/// (`bench_e8_verify_tiles`): the GEMV wins at EVERY shape for every
+/// B in 1..=8 — 1.07x to 6.92x. The b2/b4 tiles are never better than b1.
+///
+/// End-to-end on the production daemon (0731 MQ2R, `hipfire run --spec
+/// dspark`), reproducible across a 8/0/8 ordering:
+///     0   13.2 tok/s   verify_block 144.72 ms/window
+///     8   25.8 tok/s   verify_block  74.90 ms/window
+/// i.e. 1.93x on verify and 1.95x end-to-end. AR is unaffected (27.9
+/// both ways) because AR decode is B=1 through a different arm.
+///
+/// 8 is the cap because `E8_BATCHED_GEMV_BATCHES` is [1..=8, 16] and the
+/// GEMV's margin decays with B (it re-reads x per row): at B=8 it is only
+/// 1.07-1.74x, and at B=16 the WMMA tile wins. Verify runs B<=6.
 pub(crate) fn e8_batched_gemv_max_batch() -> usize {
-    let cur = E8_BATCHED_GEMV_MAX.load(atomic::Ordering::Relaxed);
-    if cur != E8_BATCHED_GEMV_UNSET {
-        return cur;
-    }
-    // Default 8 (was 0 = disabled). `e8_batched_gemv_applies` already
-    // requires `arch == "gfx1151"`, so this only changes gfx1151.
-    //
-    // At speculative-verify batch the dense E8 WMMA tile (`tiles=1`, since
-    // `e8_prefill_batch_tiles` only tiles above batch 16/32) wastes 15/16 of
-    // each 16-wide tile and runs at ~22-53 GiB/s, while the batched GEMV
-    // reads the weights once and hits 56-193 GiB/s. Measured across the real
-    // DS4 dense shape mix, DRAM-resident, gfx1151
-    // (`bench_e8_verify_tiles`): the GEMV wins at EVERY shape for every
-    // B in 1..=8 — 1.07x to 6.92x. The b2/b4 tiles are never better than b1.
-    //
-    // End-to-end on the production daemon (0731 MQ2R, `hipfire run --spec
-    // dspark`), reproducible across a 8/0/8 ordering:
-    //     =0   13.2 tok/s   verify_block 144.72 ms/window
-    //     =8   25.8 tok/s   verify_block  74.90 ms/window
-    // i.e. 1.93x on verify and 1.95x end-to-end. AR is unaffected (27.9
-    // both ways) because AR decode is B=1 through a different arm.
-    //
-    // 8 is the cap because `E8_BATCHED_GEMV_BATCHES` is [1..=8, 16] and the
-    // GEMV's margin decays with B (it re-reads x per row): at B=8 it is only
-    // 1.07-1.74x, and at B=16 the WMMA tile wins. Verify runs B<=6.
-    let parsed = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_E8_BATCHED_GEMV")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(8);
-    E8_BATCHED_GEMV_MAX.store(parsed, atomic::Ordering::Relaxed);
-    parsed
+    E8_BATCHED_GEMV_MAX.load(atomic::Ordering::Relaxed)
 }
-pub(crate) const E8_BATCHED_GEMV_UNSET: usize = usize::MAX;
-pub(crate) static E8_BATCHED_GEMV_MAX: atomic::AtomicUsize =
-    atomic::AtomicUsize::new(E8_BATCHED_GEMV_UNSET);
-/// `HIPFIRE_DEEPSEEK4_FFN_OVERLAP` — evaluate the shared E8 expert
-/// concurrently with the routed MQ2 experts on gfx1151. The fresh-process
-/// A/B gate retained this route; set `=0` for the serial fallback.
+pub(crate) static E8_BATCHED_GEMV_MAX: atomic::AtomicUsize = atomic::AtomicUsize::new(8);
+/// Evaluate the shared E8 expert concurrently with the routed MQ2 experts
+/// on gfx1151.
 pub(crate) fn ffn_overlap_on(arch: &str, mq2r: bool) -> bool {
-    static V: OnceLock<bool> = OnceLock::new();
-    !mq2r
-        && arch == "gfx1151"
-        && *V.get_or_init(|| {
-            hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_FFN_OVERLAP")
-                .ok()
-                .as_deref()
-                != Some("0")
-        })
+    !mq2r && arch == "gfx1151"
 }
-/// `HIPFIRE_DEEPSEEK4_HC_PINGPONG` — write each HC mix into a dedicated
-/// alternate residual buffer and swap handles instead of issuing 86 D2D
-/// copies per token. Opt-in until exact-model parity/perf admission.
+/// Write each HC mix into a dedicated alternate residual buffer and swap
+/// handles instead of issuing 86 D2D copies per token.
 pub(crate) fn hc_pingpong_on(arch: &str, mq2r: bool) -> bool {
-    static V: OnceLock<bool> = OnceLock::new();
-    arch == "gfx1151" && (mq2r || *V.get_or_init(|| flag_one("HIPFIRE_DEEPSEEK4_HC_PINGPONG")))
+    arch == "gfx1151" && mq2r
 }
 pub(crate) fn hc_finalize_fused_on(arch: &str, mq2r: bool) -> bool {
     static V: OnceLock<bool> = OnceLock::new();
@@ -651,10 +444,7 @@ pub(crate) fn hc_finalize_fused_on(arch: &str, mq2r: bool) -> bool {
         || (arch == "gfx1201" && mq2r)
 }
 pub(crate) fn hc_control_finalize_fused_on(arch: &str, mq2r: bool) -> bool {
-    static V: OnceLock<bool> = OnceLock::new();
-    (arch == "gfx1151"
-        && (mq2r || *V.get_or_init(|| flag_one("HIPFIRE_DEEPSEEK4_HC_CONTROL_FINALIZE_FUSED"))))
-        || (arch == "gfx1201" && mq2r)
+    mq2r && matches!(arch, "gfx1151" | "gfx1201")
 }
 pub(crate) fn retained_embedding_on(arch: &str, mq2r: bool) -> bool {
     static V: OnceLock<bool> = OnceLock::new();

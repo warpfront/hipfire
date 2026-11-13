@@ -89,9 +89,8 @@ pub fn run_q8_projection_fresh(
     k: usize,
     batch_size: usize,
     x_f16: &GpuTensor,
-    enable_wmma: bool,
 ) -> hip_bridge::HipResult<()> {
-    if enable_wmma && gpu.arch_caps.has_wmma() && k % 32 == 0 {
+    if gpu.arch_caps.has_wmma() && k % 32 == 0 {
         gpu.deepseek4_convert_f32_to_f16(x, x_f16, (batch_size * k) as i64)?;
         gpu.gemm_q8_0_wmma(w, x_f16, y, m, k, batch_size)
     } else {

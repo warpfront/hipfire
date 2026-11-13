@@ -50,17 +50,6 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 /// MAX_BATCH cap and far faster than the scalar 1-wave-per-row kernel at large
 /// batch (mirrors the deepseek4 gfx11 Q8 prefill path). Falls back to the
 /// scalar-sub-batched chunked driver on CDNA or when K%32≠0.
-/// Opt out of the WMMA Q8 prefill projections (force the scalar sub-batched
-/// chunked driver) via `HIPFIRE_COHERE2MOE_Q8_SCALAR=1` — a debugging /
-/// precision fallback. WMMA is the default: bit-identical to scalar on the
-/// validation prompt and ~9× faster prefill.
-fn q8_wmma_enabled() -> bool {
-    static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *EN.get_or_init(|| {
-        hipfire_config::developer_var("HIPFIRE_COHERE2MOE_Q8_SCALAR").as_deref() != Ok("1")
-    })
-}
-
 #[inline]
 fn q8_proj_raw(
     gpu: &mut Gpu,
@@ -72,17 +61,7 @@ fn q8_proj_raw(
     b: usize,
     x_f16: &GpuTensor,
 ) -> hip_bridge::HipResult<()> {
-    hipfire_dispatch::families::gemm::run_q8_projection_fresh(
-        gpu,
-        w,
-        x,
-        y,
-        m,
-        k,
-        b,
-        x_f16,
-        q8_wmma_enabled(),
-    )
+    hipfire_dispatch::families::gemm::run_q8_projection_fresh(gpu, w, x, y, m, k, b, x_f16)
 }
 
 /// Decode one token; returns the full logits vector.
@@ -757,10 +736,7 @@ pub fn forward_batch(
                         norm_topk_prob: cfg.norm_topk_prob,
                         route: PrefillRouteMode::Replicated,
                         shared: None,
-                        q8_router_policy: MoeQ8RouterPolicy::FreshFp16Wmma {
-                            enabled: q8_wmma_enabled(),
-                            scratch: &x_f16,
-                        },
+                        q8_router_policy: MoeQ8RouterPolicy::FreshFp16Wmma { scratch: &x_f16 },
                     },
                     batch_size: b,
                     mi: moe_inter,

@@ -345,7 +345,7 @@ pub(crate) fn e8_soa_kernel(
     mq2r_backend: Mq2rBackend,
 ) -> hipfire_dispatch::pipeline::mla::E8SoaKernel {
     use hipfire_dispatch::pipeline::mla::E8SoaKernel;
-    if !config_cache::e8_u4_on(arch, mq2r_backend.is_gfx1151()) {
+    if !config_cache::e8_u4_on(arch) {
         E8SoaKernel::Prerotated
     } else if mq2r_backend.is_gfx1151() {
         E8SoaKernel::U4Gfx1151
@@ -656,7 +656,7 @@ pub(crate) fn dump_indexer_state(
     );
 }
 
-/// Override `HIPFIRE_DEEPSEEK4_E8_BATCHED_GEMV` for the rest of the process.
+/// Override the batched E8 GEMV batch cap for the rest of the process.
 ///
 /// Exists so a bench can measure the WMMA and batched-GEMV arms against one
 /// loaded copy of the trunk. `0` restores the WMMA path for every batch size.
@@ -1643,9 +1643,7 @@ pub(crate) fn indexer_filled_rows(state: &DeepseekV4State, position: u32) -> usi
 /// head only (the workspace has no head dimension).
 fn indexer_two_stage_topk(weights: &DeepseekV4Weights, gpu: &Gpu, max_compressed: usize) -> bool {
     (config_cache::gfx942_indexer_topk_two_stage_on(&gpu.arch, weights.mq2r_backend.is_gfx942())
-        || config_cache::gfx1151_indexer_topk_two_stage_on(&gpu.arch)
-        || config_cache::gfx1100_indexer_topk_two_stage_on(&gpu.arch)
-        || config_cache::gfx1201_indexer_topk_two_stage_on(&gpu.arch))
+        || config_cache::portable_indexer_topk_two_stage_on(&gpu.arch))
         && two_stage_topk_capacity_eligible(&gpu.arch, max_compressed)
 }
 
@@ -1766,13 +1764,7 @@ pub(crate) fn indexer_op<'a>(
         &gpu.arch,
         weights.mq2r_backend.is_gfx942(),
     ) {
-        IndexTopK::BackendParallel {
-            bounded: config_cache::gfx942_indexer_topk_bounded_on(
-                &gpu.arch,
-                weights.mq2r_backend.is_gfx942(),
-            ),
-            wide,
-        }
+        IndexTopK::BackendParallel { wide }
     } else {
         IndexTopK::Portable { wide }
     };
@@ -1916,9 +1908,6 @@ pub(crate) fn decode_step_heterogeneous(
         || routed_gpu.graphs.capture_mode
     {
         return Err("deepseek4 heterogeneous G4 admits direct HIP only".into());
-    }
-    if !config_cache::moe_on() {
-        return Err("deepseek4 heterogeneous route requires routed MoE enabled".into());
     }
 
     let dense_weights = &weights.dense.inner;
@@ -2135,9 +2124,8 @@ pub fn decode_step_with_graph(
             && !config_cache::ffn_overlap_on(&gpu.arch, cfg.mq2r);
         gpu.replay.set_forward_eligible(retained_eligible);
         if !retained_eligible {
-            let reason = "DeepSeek V4 retained replay requires \
-                          HIPFIRE_DEEPSEEK4_HC_PINGPONG=1 and \
-                          HIPFIRE_DEEPSEEK4_FFN_OVERLAP=0";
+            let reason = "DeepSeek V4 retained replay requires the gfx1151 MQ2R \
+                          route (HC ping-pong, serial FFN)";
             gpu.replay.poison(reason);
             eprintln!("[DeepSeek V4 redline] falling back to HIP: {reason}");
         } else {
@@ -2584,8 +2572,7 @@ pub(crate) fn update_pos_array_host(
 /// Reference ds4 uses `comp_pos = pos + 1 - ratio` at compress events
 /// (i.e. start of the just-closed window). Equivalent to
 /// `pos / ratio * ratio` when `(pos+1) % ratio == 0`, which is exactly
-/// when an event fires. "start" matches the reference; "mid" / "end"
-/// remain available for diagnostic A/B via `HIPFIRE_DEEPSEEK4_COMP_ROPE_POS`.
+/// when an event fires.
 ///
 /// Why one helper: prior to this refactor `precompute_positions` and
 /// `update_pos_array_host` carried independently-edited copies of this
@@ -2594,8 +2581,6 @@ pub(crate) fn update_pos_array_host(
 /// and a different value at replay time, drifting compressor RoPE
 /// across the capture/replay boundary.
 fn fill_pos_array_host(cfg: &DeepseekV4Config, pos_array_host: &mut [i32], position: u32) {
-    let comp_rope_mode = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_COMP_ROPE_POS").ok();
-    let comp_rope_mode = comp_rope_mode.as_deref();
     for layer_idx in 0..=cfg.num_hidden_layers {
         let ratio = if layer_idx < cfg.num_hidden_layers {
             cfg.compress_ratios[layer_idx] as usize
@@ -2605,14 +2590,9 @@ fn fill_pos_array_host(cfg: &DeepseekV4Config, pos_array_host: &mut [i32], posit
         let base = layer_idx * POS_SLOTS_PER_LAYER;
         pos_array_host[base] = position as i32;
         if ratio > 0 {
-            let main_rope_pos: i32 = match comp_rope_mode {
-                Some("end") => position as i32,
-                Some("mid") => (((position as usize) / ratio * ratio) + ratio / 2) as i32,
-                _ => ((position as usize) / ratio * ratio) as i32,
-            };
-            let indexer_rope_pos = ((position as usize) / ratio * ratio) as i32;
-            pos_array_host[base + 1] = main_rope_pos;
-            pos_array_host[base + 2] = indexer_rope_pos;
+            let rope_pos = ((position as usize) / ratio * ratio) as i32;
+            pos_array_host[base + 1] = rope_pos;
+            pos_array_host[base + 2] = rope_pos;
         } else {
             pos_array_host[base + 1] = 0;
             pos_array_host[base + 2] = 0;
@@ -3005,7 +2985,7 @@ fn expert_ffn_op<'a>(
         config_cache::moe_route_fused_activation()
             && gpu.arch_caps.is_gfx1151()
             && gate.dtype == DType::MFP4G32E8SOA
-            && config_cache::e8_u4_on(&gpu.arch, weights.mq2r_backend.is_gfx1151())
+            && config_cache::e8_u4_on(&gpu.arch)
     });
     Ok(ExpertFfnOp {
         x_in: state.hc_x_in.as_ref().unwrap(),
@@ -3032,13 +3012,6 @@ fn expert_ffn_op<'a>(
         shared_im: shared_expert_rows(cfg, weights, layer_idx),
         swiglu_limit: cfg.swiglu_limit,
         eps: cfg.rms_norm_eps,
-        // CORRECTNESS: the routed MQ2-Lloyd experts read the FWHT-rotated input,
-        // so the rotation stays live whenever MoE is on (default; opt out with
-        // HIPFIRE_DEEPSEEK4_MOE=0), regardless of the shared weight dtype. With
-        // MoE off and Q8/F16/F32 shared gate/up only the plain norm is written.
-        rotate: config_cache::moe_on()
-            || weight_needs_fwht(shared_w1)
-            || weight_needs_fwht(shared_w3),
         rows: 1,
         layer: layer_idx,
         route: ExpertFfnRoute::Decode {
@@ -3067,11 +3040,9 @@ fn expert_ffn_schedule<'a>(
 ) -> ExpertFfnSchedule<'a> {
     let layer = weights.resolve_layer(layer_idx);
     let blobs = layer.expert_gate_up_blob.is_some() && layer.expert_w2_blob.is_some();
-    let moe = config_cache::moe_on();
     let gfx942_overlap = config_cache::gfx942_ffn_overlap_on(weights.mq2r_backend.is_gfx942())
         && !gpu.graphs.capture_mode;
-    if moe
-        && blobs
+    if blobs
         && (config_cache::ffn_overlap_on(&gpu.arch, cfg.mq2r) || gfx942_overlap)
         && gpu.active_stream.is_some()
     {
@@ -3089,11 +3060,7 @@ fn expert_ffn_schedule<'a>(
             };
         }
     }
-    if moe
-        && blobs
-        && gpu.replay.is_enabled()
-        && config_cache::redline_ffn_split_on(&gpu.arch, cfg.mq2r)
-    {
+    if blobs && gpu.replay.is_enabled() && config_cache::redline_ffn_split_on(&gpu.arch, cfg.mq2r) {
         if let Some(partial) = state.ffn_routed_overlap.as_ref() {
             return ExpertFfnSchedule::Split { partial };
         }
@@ -3574,9 +3541,6 @@ fn routed_experts_present(
     weights: &DeepseekV4Weights,
     layer_idx: usize,
 ) -> bool {
-    if !config_cache::moe_on() {
-        return false;
-    }
     let layer = weights.resolve_layer(layer_idx);
     if layer.expert_gate_up_blob.is_none() || layer.expert_w2_blob.is_none() {
         return false;
@@ -4127,9 +4091,7 @@ pub(crate) fn ffn_stub(
 /// _factor · Σ_k w_k · expert_{idx_k}(ffn_x_rot)` into `ffn_out`
 /// (which already holds the shared-expert output from `ffn_stub`).
 ///
-/// Gated on HIPFIRE_DEEPSEEK4_MOE != "0" (default ON) AND expert blobs present
-/// (uploaded by default; opt out with HIPFIRE_DEEPSEEK4_UPLOAD_EXPERTS=0) AND
-/// layer is score-routed
+/// Gated on expert blobs present AND layer is score-routed
 /// (layer_idx >= num_hash_layers). Hash-routed layers 0..3 fall back
 /// to shared-only (tid2eid lookup table is skipped at quant time).
 ///
@@ -4680,9 +4642,6 @@ pub(crate) fn ensure_attention(
         &[groups_o_lora],
         "wo_a_out_rot",
     )?;
-    if config_cache::attn_pos0() {
-        return Ok(());
-    }
     let (n_kv, win) = (cfg.num_key_value_heads, cfg.sliding_window);
     let zeros = |gpu: &mut Gpu, slot: &mut Option<GpuTensor>, shape: &[usize], name: &str| {
         if slot.is_none() {
@@ -4735,8 +4694,91 @@ pub(crate) fn attention_ops<'a>(
     );
     let gfx1151_route = weights.mq2r_backend.is_gfx1151();
     let mut steps = Vec::with_capacity(5);
-    if config_cache::attn_pos0() {
-        steps.push(Step::SwaAttention(SwaAttentionOp {
+    let attn_state = state
+        .attn_state_buf
+        .as_ref()
+        .ok_or("attn_state_buf missing (precompute_positions must run first)")?;
+    let attn = &state._attention[layer_idx];
+    let (swa_k, swa_v) = (attn.swa_k.as_ref().unwrap(), attn.swa_v.as_ref().unwrap());
+    steps.push(Step::SwaRingWrite(SwaRingWriteOp {
+        kv,
+        swa_k,
+        swa_v,
+        n_kv: cfg.num_key_value_heads,
+        head_dim,
+        win,
+        rows: 1,
+        layer: layer_idx,
+        route: SwaRingWriteRoute::Decode { attn_state },
+    }));
+    let l_state = &state._indexer[layer_idx];
+    // Antirez-faithful mixed attention (ds4.c:7559-7566): dense layers
+    // attend the SWA window; compressed layers run ONE softmax over the
+    // window, the compressor cache rows (ratio 4: the indexer's top-k,
+    // ratio 128: all) and the sink.
+    match l_state.main_kv_cache.as_ref() {
+        Some(main_kv_cache) if layer.compress_ratio > 0 => {
+            let topk_idx = l_state
+                .topk_idx_indices
+                .as_ref()
+                .filter(|_| layer.compress_ratio == 4);
+            let cache = compressed_cache(
+                state,
+                main_kv_cache,
+                &l_state.main_kv_cache_shards,
+                if topk_idx.is_some() {
+                    "gather"
+                } else {
+                    "identity gather"
+                },
+                layer_idx,
+            )?;
+            let (n_compressed_slot, k_active_slot) = if layer.compress_ratio == 4 {
+                (2, 4)
+            } else {
+                (3, 5)
+            };
+            let gathered = attn.gathered_k.as_ref().unwrap();
+            if topk_idx.is_none() {
+                steps.push(Step::IdentityGather(IdentityGatherOp {
+                    cache,
+                    staged: gathered,
+                    head_dim,
+                    top_k_max: topk,
+                    rows: 1,
+                    layer: layer_idx,
+                    route: IdentityGatherRoute::Decode {
+                        attn_state,
+                        k_active_slot,
+                    },
+                }));
+            }
+            steps.push(Step::SparseAttention(SparseAttentionOp {
+                q,
+                sink,
+                out: raw,
+                n_heads: heads,
+                head_dim,
+                win,
+                topk,
+                rows: 1,
+                layer: layer_idx,
+                route: SparseAttentionRoute::Decode {
+                    swa_k,
+                    swa_v,
+                    gathered,
+                    attn_state,
+                    k_active_slot,
+                    gather: topk_idx.map(|indices| TopkGather {
+                        cache,
+                        indices,
+                        n_compressed_slot,
+                    }),
+                    gfx1151_route,
+                },
+            }));
+        }
+        _ => steps.push(Step::SwaAttention(SwaAttentionOp {
             q,
             sink,
             out: raw,
@@ -4746,110 +4788,12 @@ pub(crate) fn attention_ops<'a>(
             win,
             rows: 1,
             layer: layer_idx,
-            route: SwaAttentionRoute::Pos0 { kv },
-        }));
-    } else {
-        let attn_state = state
-            .attn_state_buf
-            .as_ref()
-            .ok_or("attn_state_buf missing (precompute_positions must run first)")?;
-        let attn = &state._attention[layer_idx];
-        let (swa_k, swa_v) = (attn.swa_k.as_ref().unwrap(), attn.swa_v.as_ref().unwrap());
-        steps.push(Step::SwaRingWrite(SwaRingWriteOp {
-            kv,
-            swa_k,
-            swa_v,
-            n_kv: cfg.num_key_value_heads,
-            head_dim,
-            win,
-            rows: 1,
-            layer: layer_idx,
-            route: SwaRingWriteRoute::Decode { attn_state },
-        }));
-        let l_state = &state._indexer[layer_idx];
-        // Antirez-faithful mixed attention (ds4.c:7559-7566): dense layers
-        // attend the SWA window; compressed layers run ONE softmax over the
-        // window, the compressor cache rows (ratio 4: the indexer's top-k,
-        // ratio 128: all) and the sink.
-        match l_state.main_kv_cache.as_ref() {
-            Some(main_kv_cache) if layer.compress_ratio > 0 => {
-                let topk_idx = l_state
-                    .topk_idx_indices
-                    .as_ref()
-                    .filter(|_| layer.compress_ratio == 4);
-                let cache = compressed_cache(
-                    state,
-                    main_kv_cache,
-                    &l_state.main_kv_cache_shards,
-                    if topk_idx.is_some() {
-                        "gather"
-                    } else {
-                        "identity gather"
-                    },
-                    layer_idx,
-                )?;
-                let (n_compressed_slot, k_active_slot) = if layer.compress_ratio == 4 {
-                    (2, 4)
-                } else {
-                    (3, 5)
-                };
-                let gathered = attn.gathered_k.as_ref().unwrap();
-                if topk_idx.is_none() {
-                    steps.push(Step::IdentityGather(IdentityGatherOp {
-                        cache,
-                        staged: gathered,
-                        head_dim,
-                        top_k_max: topk,
-                        rows: 1,
-                        layer: layer_idx,
-                        route: IdentityGatherRoute::Decode {
-                            attn_state,
-                            k_active_slot,
-                        },
-                    }));
-                }
-                steps.push(Step::SparseAttention(SparseAttentionOp {
-                    q,
-                    sink,
-                    out: raw,
-                    n_heads: heads,
-                    head_dim,
-                    win,
-                    topk,
-                    rows: 1,
-                    layer: layer_idx,
-                    route: SparseAttentionRoute::Decode {
-                        swa_k,
-                        swa_v,
-                        gathered,
-                        attn_state,
-                        k_active_slot,
-                        gather: topk_idx.map(|indices| TopkGather {
-                            cache,
-                            indices,
-                            n_compressed_slot,
-                        }),
-                        gfx1151_route,
-                    },
-                }));
-            }
-            _ => steps.push(Step::SwaAttention(SwaAttentionOp {
-                q,
-                sink,
-                out: raw,
-                n_heads: heads,
-                head_dim,
-                n_groups: groups,
-                win,
-                rows: 1,
-                layer: layer_idx,
-                route: SwaAttentionRoute::Decode {
-                    swa_k,
-                    swa_v,
-                    attn_state,
-                },
-            })),
-        }
+            route: SwaAttentionRoute::Decode {
+                swa_k,
+                swa_v,
+                attn_state,
+            },
+        })),
     }
     // Inverse tail RoPE with the forward parameters, so the rotation cancels
     // across attention (antirez rope_tail_layer_inplace(.., inverse)).
@@ -4896,9 +4840,7 @@ pub(crate) fn attention_ops<'a>(
     let olora_a = if wo_a.dtype == DType::MQ4G256 {
         // MQ2RXT keeps the same one-launch grouped O-LoRA topology as MQ2R.
         OloraA::Mq4Grouped
-    } else if wo_a.dtype == DType::MFP4G32E8SOA
-        && config_cache::e8_wo_grouped_on(&gpu.arch, cfg.mq2r)
-    {
+    } else if wo_a.dtype == DType::MFP4G32E8SOA && config_cache::e8_wo_grouped_on(&gpu.arch) {
         OloraA::E8Gfx1151
     } else if wo_a.dtype == DType::MFP4G32E8SOA
         && config_cache::gfx1201_e8_wo_grouped_on(&gpu.arch, cfg.mq2r)
@@ -6014,7 +5956,7 @@ pub(crate) fn q_lora(
 /// lazily on first call.
 /// Per-layer slot count in `pos_array_*`. Layout per layer:
 ///   [0] qk_pos              = position
-///   [1] main_comp_rope_pos  = mid-of-window  (depends on ratio + COMP_ROPE_POS env)
+///   [1] main_comp_rope_pos  = start-of-window
 ///   [2] indexer_comp_rope_pos = start-of-window
 /// Used by the HIP-graphs-friendly position-array path (default in
 /// `decode_step` since 2026-05-21). Direct-dispatch path uses the same
@@ -6026,9 +5968,6 @@ pub(crate) const POS_SLOTS_PER_LAYER: usize = 3;
 /// Single host-to-device copy of the entire `[(num_layers + 1) * 3]` i32
 /// array, with `pos_array_host` as the stable source pointer (required so
 /// captured graph nodes re-read valid values on replay).
-///
-/// Reads env vars HIPFIRE_DEEPSEEK4_COMP_ROPE_POS once into a cache (TODO:
-/// migrate to OnceLock once we settle on a fixed default).
 pub fn precompute_positions(
     cfg: &DeepseekV4Config,
     state: &mut DeepseekV4State,
@@ -6152,9 +6091,6 @@ pub(crate) fn precompute_positions_batched(
     let slots_per_pos = (cfg.num_hidden_layers + 1) * POS_SLOTS_PER_LAYER;
     let total_i32s = batch_size * slots_per_pos;
 
-    let comp_rope_mode = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_COMP_ROPE_POS").ok();
-    let comp_rope_mode = comp_rope_mode.as_deref();
-
     let mut host: Vec<i32> = vec![0i32; total_i32s];
     for b in 0..batch_size {
         let pos = (start_pos as usize) + b;
@@ -6168,22 +6104,11 @@ pub(crate) fn precompute_positions_batched(
             let base = stripe + layer_idx * POS_SLOTS_PER_LAYER;
             host[base] = pos as i32;
             if ratio > 0 {
-                // Default MUST be "start" — `(pos/ratio)*ratio` — to match the
-                // decode path (`fill_pos_array_host`) and the reference ds4
-                // (comp_pos = start of the just-closed window). This previously
-                // defaulted to "mid" (+ ratio/2) while decode defaults to
-                // "start", so the compressed KV was BUILT here with a different
-                // compressor-RoPE phase than it is READ with at decode → far-
-                // context (compressed) recall lost the tail of the prompt.
-                // Keep the named modes identical to `fill_pos_array_host`.
-                let main_rope_pos: i32 = match comp_rope_mode {
-                    Some("end") => pos as i32,
-                    Some("mid") => (((pos / ratio) * ratio) + ratio / 2) as i32,
-                    _ => ((pos / ratio) * ratio) as i32,
-                };
-                let indexer_rope_pos = ((pos / ratio) * ratio) as i32;
-                host[base + 1] = main_rope_pos;
-                host[base + 2] = indexer_rope_pos;
+                // Start of the just-closed window, matching the decode path
+                // (`fill_pos_array_host`) and the reference ds4.
+                let rope_pos = ((pos / ratio) * ratio) as i32;
+                host[base + 1] = rope_pos;
+                host[base + 2] = rope_pos;
             } else {
                 host[base + 1] = 0;
                 host[base + 2] = 0;
@@ -7183,12 +7108,8 @@ pub fn final_norm_and_head_all_batched(
             .ok_or_else(|| "head not uploaded".to_string())?;
         weight_needs_fwht(head)
     };
-    // Opt-out: HIPFIRE_DEEPSEEK4_BATCH_HEAD=0 forces the legacy per-position
-    // scalar loop — used for A/B measurement and as a safety fallback.
-    let batch_head = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_BATCH_HEAD")
-        .map(|s| s != "0")
-        .unwrap_or(true);
-    if head_needs_fwht || !batch_head {
+    // FWHT heads have no batched GEMV path: per-position scalar loop.
+    if head_needs_fwht {
         let mut all_logits: Vec<Vec<f32>> = Vec::with_capacity(batch_size);
         for i in 0..batch_size {
             let streams_i = pbs.streams_batch.sub_offset(i * stream_len, stream_len);
@@ -7337,10 +7258,7 @@ pub fn final_norm_and_argmax_all_batched(
             .ok_or_else(|| "head not uploaded".to_string())?;
         weight_needs_fwht(head)
     };
-    let batch_head = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_BATCH_HEAD")
-        .map(|s| s != "0")
-        .unwrap_or(true);
-    if head_needs_fwht || !batch_head {
+    if head_needs_fwht {
         let mut ids: Vec<u32> = Vec::with_capacity(batch_size);
         for i in 0..batch_size {
             let streams_i = pbs.streams_batch.sub_offset(i * stream_len, stream_len);
@@ -7432,9 +7350,8 @@ pub fn final_norm_and_argmax_all_batched_lazy(
 /// stream sync per position) with one head read + one `(n+1)×4`-byte D2H; the
 /// sampled token sequence stays distribution-identical to the AR sampler.
 ///
-/// FWHT heads (no batched GEMV path) and `HIPFIRE_DEEPSEEK4_BATCH_HEAD=0` fall
-/// back to the original per-position `sample_top_p_pf` loop. `rng` advances per
-/// draw in both paths.
+/// FWHT heads (no batched GEMV path) fall back to the original per-position
+/// `sample_top_p_pf` loop. `rng` advances per draw in both paths.
 #[allow(clippy::too_many_arguments)]
 pub fn final_norm_and_sample_all_batched_lazy(
     cfg: &DeepseekV4Config,
@@ -7463,9 +7380,9 @@ pub fn final_norm_and_sample_all_batched_lazy(
     let top_p_eff = if top_p > 0.0 { top_p.min(1.0) } else { 1.0 };
     let top_k_opt = if top_k > 0 { Some(top_k as u32) } else { None };
 
-    // FWHT-head fallback (no batched GEMV path) or batched head disabled: the
-    // original per-position head + host `sample_top_p_pf` loop. Mirrors the
-    // `weight_needs_fwht || !batch_head` branch in `final_norm_and_argmax_all_batched`.
+    // FWHT-head fallback (no batched GEMV path): the original per-position
+    // head + host `sample_top_p_pf` loop. Mirrors the `weight_needs_fwht`
+    // branch in `final_norm_and_argmax_all_batched`.
     let head_needs_fwht = {
         let head = weights
             .head
@@ -7473,10 +7390,7 @@ pub fn final_norm_and_sample_all_batched_lazy(
             .ok_or_else(|| "head not uploaded".to_string())?;
         weight_needs_fwht(head)
     };
-    let batch_head = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_BATCH_HEAD")
-        .map(|s| s != "0")
-        .unwrap_or(true);
-    if head_needs_fwht || !batch_head {
+    if head_needs_fwht {
         let mut ids: Vec<u32> = Vec::with_capacity(n);
         for i in 0..n {
             let streams_i = pbs.streams_batch.sub_offset(i * stream_len, stream_len);
@@ -9476,10 +9390,9 @@ mod tests {
     #[test]
     fn mq2r_pins_the_accepted_gfx1151_switches() {
         let arch = "gfx1151";
-        assert!(config_cache::e8_wo_grouped_on(arch, true));
-        assert!(config_cache::e8_u4_on(arch, true));
-        assert!(config_cache::e8_prefill_b2_on(arch, true));
-        assert!(config_cache::e8_prefill_b4_on(arch, true));
+        assert!(config_cache::e8_wo_grouped_on(arch));
+        assert!(config_cache::e8_u4_on(arch));
+        assert!(config_cache::e8_prefill_b4_on(arch));
         assert!(!config_cache::ffn_overlap_on(arch, true));
         assert!(config_cache::hc_pingpong_on(arch, true));
         assert!(config_cache::hc_finalize_fused_on(arch, true));
@@ -9489,12 +9402,11 @@ mod tests {
         assert!(!config_cache::hc_finalize_input_map_on(arch, true));
         assert!(!config_cache::qnorm_rotate_fused_on(arch, true));
         assert!(!config_cache::redline_ffn_split_on(arch, true));
-        // G1 is gfx1151's own certified two-stage route and defaults ON for
-        // every DeepSeek4 weight tier; indexer state is format-independent.
-        assert!(config_cache::gfx1151_indexer_topk_two_stage_on(arch));
+        // G1 is gfx1151's own certified two-stage route for every DeepSeek4
+        // weight tier; indexer state is format-independent.
+        assert!(config_cache::portable_indexer_topk_two_stage_on(arch));
         // gfx942 A2 levers must not bleed into gfx1151.
         assert!(!config_cache::gfx942_compressor_gate_on(arch, true));
-        assert!(!config_cache::gfx942_indexer_topk_bounded_on(arch, true));
         assert!(!config_cache::gfx942_indexer_topk_two_stage_on(arch, true));
         assert!(!config_cache::gfx942_e8_wo_grouped_on(arch, true));
         assert!(!config_cache::gfx942_hc_finalize_fused_on(arch, true));
@@ -9618,7 +9530,6 @@ mod tests {
         // L3 and F1 are certified defaults for exact gfx942 route v1; L1 is
         // still an opt-in experiment.
         assert!(!config_cache::gfx942_compressor_gate_on("gfx942", true));
-        assert!(config_cache::gfx942_indexer_topk_bounded_on("gfx942", true));
         assert!(config_cache::gfx942_indexer_topk_two_stage_on(
             "gfx942", true
         ));
@@ -9629,9 +9540,6 @@ mod tests {
         ));
         // Fail closed on non-mq2r and non-gfx942.
         assert!(!config_cache::gfx942_compressor_gate_on("gfx942", false));
-        assert!(!config_cache::gfx942_indexer_topk_bounded_on(
-            "gfx942", false
-        ));
         assert!(!config_cache::gfx942_indexer_topk_two_stage_on(
             "gfx942", false
         ));
@@ -9642,9 +9550,6 @@ mod tests {
         ));
         assert!(!config_cache::gfx942_ffn_overlap_on(false));
         assert!(!config_cache::gfx942_compressor_gate_on("gfx1100", true));
-        assert!(!config_cache::gfx942_indexer_topk_bounded_on(
-            "gfx1100", true
-        ));
         assert!(!config_cache::gfx942_indexer_topk_two_stage_on(
             "gfx1100", true
         ));
@@ -9653,16 +9558,10 @@ mod tests {
         assert!(!config_cache::gfx942_indexer_topk_parallel_on(
             "gfx1201", true
         ));
-        assert!(!config_cache::gfx942_indexer_topk_bounded_on(
-            "gfx1201", true
-        ));
         assert!(!config_cache::gfx942_indexer_topk_two_stage_on(
             "gfx1201", true
         ));
         assert!(!config_cache::gfx942_compressor_gate_on("gfx1151", true));
-        assert!(!config_cache::gfx942_indexer_topk_bounded_on(
-            "gfx1151", true
-        ));
         assert!(!config_cache::gfx942_indexer_topk_two_stage_on(
             "gfx1151", true
         ));
@@ -9670,25 +9569,14 @@ mod tests {
             "gfx1151", true
         ));
         // gfx1151 grouped flag stays gfx1151-only.
-        assert!(!config_cache::e8_wo_grouped_on("gfx942", true));
-        // G1 is the gfx1151 twin of F3 and must not bleed into gfx942 or any
-        // other arch. Unlike the gfx942 native backend, its inputs are
-        // format-independent DS4 F32 indexer state, so MQ2-Lloyd and MQ2R use
-        // the same exact-device route.
-        assert!(!config_cache::gfx1151_indexer_topk_two_stage_on("gfx942"));
-        assert!(!config_cache::gfx1151_indexer_topk_two_stage_on("gfx1100"));
-        assert!(!config_cache::gfx1151_indexer_topk_two_stage_on("gfx1201"));
-        assert!(config_cache::gfx1151_indexer_topk_two_stage_on("gfx1151"));
-        // The heterogeneous dense device gets an independently admitted
-        // exact-gfx1100 code object.  It must not widen either G1 or F3.
-        assert!(config_cache::gfx1100_indexer_topk_two_stage_on("gfx1100"));
-        assert!(!config_cache::gfx1100_indexer_topk_two_stage_on("gfx942"));
-        assert!(!config_cache::gfx1100_indexer_topk_two_stage_on("gfx1151"));
-        assert!(!config_cache::gfx1100_indexer_topk_two_stage_on("gfx1201"));
-        assert!(config_cache::gfx1201_indexer_topk_two_stage_on("gfx1201"));
-        assert!(!config_cache::gfx1201_indexer_topk_two_stage_on("gfx942"));
-        assert!(!config_cache::gfx1201_indexer_topk_two_stage_on("gfx1151"));
-        assert!(!config_cache::gfx1201_indexer_topk_two_stage_on("gfx1100"));
+        assert!(!config_cache::e8_wo_grouped_on("gfx942"));
+        // The portable two-stage route (G1 on gfx1151, the heterogeneous
+        // gfx1100 dense device, gfx1201) must not bleed into gfx942, whose
+        // F3 is admitted separately.
+        assert!(!config_cache::portable_indexer_topk_two_stage_on("gfx942"));
+        for arch in ["gfx1151", "gfx1100", "gfx1201"] {
+            assert!(config_cache::portable_indexer_topk_two_stage_on(arch));
+        }
     }
 
     #[test]

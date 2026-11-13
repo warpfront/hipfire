@@ -203,7 +203,7 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 | `HIPFIRE_MTP_FILL_PM_GEMM` | **on**; `0` opts out | Qwen35 MTP fast prompt fill only, exact gfx1201 and MQ4G256-v1 eh_proj/wk/wv (including shared-rotation wv). Uses the byte-identical PeaceMaker four-weight-row GEMM, sharing each activation load across rows. Requires `HIPFIRE_MTP_FILL_FAST`; other dtypes, architectures and callers retain the incumbent. `0` restores `gemm_hfq4g256` without changing fill slicing or rotation. Resolved once per process through the developer environment reader. |
 | `HIPFIRE_QWEN35_MTP` / `HIPFIRE_QWEN35_MTP_K` | Retired; no runtime readers | These former Qwen35-specific controls no longer affect loading. Use unified `speculation.mtp` (`auto` by default, which keeps Qwen35 on AR because it declares no measured AR floor; `on` / `--spec mtp` opts in): the loader then uses a bundled MTP head first, then a `.mtp` sidecar. Use `speculation.mtp_k` for the draft cap; see [Speculative decode](CONFIG.md#speculative-decode). |
 | `HIPFIRE_DEEPSEEK4_SPEC_DECODE` / `HIPFIRE_DEEPSEEK4_SPEC_K` | DeepSeek MTP legacy | |
-| `HIPFIRE_DEEPSEEK4_DSPARK` / `HIPFIRE_DEEPSEEK4_DSPARK_CONF_THRESHOLD` | DSpark | |
+| `HIPFIRE_DEEPSEEK4_DSPARK_CONF_THRESHOLD` | DSpark | |
 | `HIPFIRE_QWEN3_DSPARK_CONF_THRESHOLD` / `HIPFIRE_QWEN35_DSPARK_CONF_THRESHOLD` | per-arch conf | |
 | `HIPFIRE_DDTREE_BUDGET` / `HIPFIRE_DDTREE_TOPK` | tree draft | Runtime defaults 256/8 if env-only; CLI config defaults 0/4 |
 | `HIPFIRE_DDTREE_*` | research/diag family | See inventory; not product defaults |
@@ -1375,7 +1375,6 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_CK_TARGET_GFX1151` | experiments/flash-attn-ck-sidecar/build_sidecar.sh | harness |
 | `HIPFIRE_CK_TARGET_GFX1201` | experiments/flash-attn-ck-sidecar/build_sidecar.sh | harness |
 | `HIPFIRE_CLI_BIN` | benchmarks/scripts/mq4v2_k5120_abba.sh, crates/hipfire-config/src/lib.rs | stable |
-| `HIPFIRE_COHERE2MOE_Q8_SCALAR` | crates/hipfire-arch-cohere2moe/src/forward.rs | developer |
 | `HIPFIRE_COHERE_DEBUG` | crates/hipfire-arch-cohere2moe/src/forward.rs | developer |
 | `HIPFIRE_COMPILER_FLAGS` | autoresearch/ar/certify/cross_arch.py, crates/rdna-compute/examples/hip_loop.rs | developer |
 | `HIPFIRE_COMP_DUMP` | crates/hipfire-arch-deepseek4/src/forward.rs, crates/hipfire-dispatch/src/pipeline/mla/compressor.rs | developer |
@@ -1416,7 +1415,6 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_DEBUG_PM4_NO_CWSR_PRIV` | crates/rdna-compute/src/replay.rs | developer |
 | `HIPFIRE_DEBUG_POOL_INVARIANTS` | crates/hipfire-arch-qwen35/src/serve_engine.rs | developer |
 | `HIPFIRE_DEEPSEEK4_AR` | crates/hipfire-arch-deepseek4/examples/dspark_bench.rs | harness |
-| `HIPFIRE_DEEPSEEK4_ATTN` | crates/hipfire-arch-deepseek4/examples/deepseek4_chat.rs, crates/hipfire-arch-deepseek4/src/config_cache.rs | developer |
 | `HIPFIRE_DEEPSEEK4_ATTN_DEBUG_BISECT` | crates/hipfire-arch-deepseek4/src/rows_program.rs | developer |
 | `HIPFIRE_DEEPSEEK4_ATTN_ILP4` | crates/rdna-compute/src/attention.rs | developer |
 | `HIPFIRE_DEEPSEEK4_ATTN_PER_POS` | crates/hipfire-arch-deepseek4/src/rows_program.rs | developer |
@@ -1425,16 +1423,11 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_DEEPSEEK4_ATTN_TOPK_DIRECT` | crates/hipfire-arch-deepseek4/src/rows_program.rs | developer |
 | `HIPFIRE_DEEPSEEK4_ATTN_TWIN` | crates/hipfire-arch-deepseek4/src/rows_program.rs | developer |
 | `HIPFIRE_DEEPSEEK4_ATTN_WARP` | crates/rdna-compute/src/attention.rs | developer |
-| `HIPFIRE_DEEPSEEK4_BATCH_HEAD` | crates/hipfire-arch-deepseek4/src/forward.rs | developer |
 | `HIPFIRE_DEEPSEEK4_BENCH_EXPERTS_PER_TOK` | crates/hipfire-arch-deepseek4/examples/dspark_bench.rs | harness |
 | `HIPFIRE_DEEPSEEK4_BENCH_RAW` | crates/hipfire-arch-deepseek4/examples/dspark_bench.rs | harness |
 | `HIPFIRE_DEEPSEEK4_CACHE_TRACE` | crates/hipfire-generate/src/common.rs, crates/hipfire-generate/src/dense.rs | developer |
 | `HIPFIRE_DEEPSEEK4_CACTUS` | crates/hipfire-arch-deepseek4/examples/dspark_bench.rs | harness |
 | `HIPFIRE_DEEPSEEK4_CHAT_RAW` | crates/hipfire-arch-deepseek4/examples/deepseek4_chat.rs, crates/hipfire-arch-deepseek4/scripts/ds4_mq2r_longctx_scan.sh | harness |
-| `HIPFIRE_DEEPSEEK4_COMP_F16_WMMA` | crates/hipfire-arch-deepseek4/src/arch.rs, crates/hipfire-arch-deepseek4/src/deepseek4.rs | developer |
-| `HIPFIRE_DEEPSEEK4_COMP_ROPE_POS` | crates/hipfire-arch-deepseek4/src/forward.rs, crates/hipfire-arch-deepseek4/src/rows_program.rs | developer |
-| `HIPFIRE_DEEPSEEK4_DSA_WMMA` | crates/hipfire-arch-deepseek4/src/rows_program.rs | developer |
-| `HIPFIRE_DEEPSEEK4_DSPARK` | crates/hipfire-arch-deepseek4/examples/dspark_bench.rs, crates/hipfire-runtime/src/loader_api.rs | developer |
 | `HIPFIRE_DEEPSEEK4_DSPARK_CONF_THRESHOLD` | crates/hipfire-arch-deepseek4/src/dspark_speculator.rs | developer |
 | `HIPFIRE_DEEPSEEK4_DSPARK_VERIFY_AQL` | crates/hipfire-arch-deepseek4/src/spec_impl.rs | developer |
 | `HIPFIRE_DEEPSEEK4_DSPARK_VERIFY_GRAPH` | crates/hipfire-arch-deepseek4/src/spec_impl.rs | developer |
@@ -1445,41 +1438,20 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_DEEPSEEK4_DUMP_PROMPT` | crates/hipfire-generate/src/dense.rs, crates/hipfire-generate/src/qwen.rs | developer |
 | `HIPFIRE_DEEPSEEK4_DUMP_STATE` | crates/hipfire-arch-deepseek4/src/forward.rs, crates/hipfire-arch-deepseek4/src/rows_program.rs | developer |
 | `HIPFIRE_DEEPSEEK4_DUMP_TOPK` | crates/hipfire-dispatch/src/families/moe.rs, crates/hipfire-dispatch/src/pipeline/mod.rs | developer |
-| `HIPFIRE_DEEPSEEK4_E8_ATTN_PACK_B3` | crates/hipfire-arch-deepseek4/src/rows_program.rs | developer |
-| `HIPFIRE_DEEPSEEK4_E8_BATCHED_GEMV` | crates/hipfire-arch-deepseek4/src/config_cache.rs, crates/hipfire-arch-deepseek4/src/forward.rs | developer |
-| `HIPFIRE_DEEPSEEK4_E8_BATCHED_PAIR_B3` | crates/hipfire-arch-deepseek4/src/rows_program.rs | developer |
-| `HIPFIRE_DEEPSEEK4_E8_PREFILL_B2` | crates/hipfire-arch-deepseek4/src/config_cache.rs | developer |
-| `HIPFIRE_DEEPSEEK4_E8_PREFILL_B4` | crates/hipfire-arch-deepseek4/src/config_cache.rs | developer |
-| `HIPFIRE_DEEPSEEK4_E8_U4` | crates/hipfire-arch-deepseek4/src/config_cache.rs | developer |
-| `HIPFIRE_DEEPSEEK4_E8_WO_GROUPED` | crates/hipfire-arch-deepseek4/src/config_cache.rs | developer |
 | `HIPFIRE_DEEPSEEK4_EXPERT_LAYER_END` | crates/hipfire-arch-deepseek4/src/arch.rs | developer |
 | `HIPFIRE_DEEPSEEK4_F32_TRACE` | crates/hipfire-arch-deepseek4/src/rows_program.rs | developer |
-| `HIPFIRE_DEEPSEEK4_FFN_OVERLAP` | crates/hipfire-arch-deepseek4/src/config_cache.rs, crates/hipfire-arch-deepseek4/src/forward.rs | developer |
 | `HIPFIRE_DEEPSEEK4_FUSED_ROUTE_ACT` | crates/hipfire-arch-deepseek4/src/config_cache.rs | developer |
 | `HIPFIRE_DEEPSEEK4_FUSED_UNSCATTER_SILU` | crates/hipfire-dispatch/src/pipeline/mod.rs | developer |
 | `HIPFIRE_DEEPSEEK4_GEN_TOKENS` | crates/hipfire-arch-deepseek4/examples/deepseek4_chat.rs, crates/hipfire-arch-deepseek4/scripts/ds4_mq2r_longctx_scan.sh | harness |
-| `HIPFIRE_DEEPSEEK4_GFX1100_INDEXER_TOPK_TWOSTAGE` | crates/hipfire-arch-deepseek4/src/config_cache.rs | developer |
-| `HIPFIRE_DEEPSEEK4_GFX1151_INDEXER_TOPK_TWOSTAGE` | crates/hipfire-arch-deepseek4/src/config_cache.rs | developer |
-| `HIPFIRE_DEEPSEEK4_GFX1201_E8_WIDE` | crates/hipfire-arch-deepseek4/src/rows_program.rs | developer |
-| `HIPFIRE_DEEPSEEK4_GFX1201_HC_FUSED24` | crates/hipfire-arch-deepseek4/src/rows_program.rs | developer |
 | `HIPFIRE_DEEPSEEK4_GFX1201_INDEXER_ROPE_HEADS` | crates/hipfire-arch-deepseek4/src/config_cache.rs | developer |
-| `HIPFIRE_DEEPSEEK4_GFX1201_INDEXER_TOPK_TWOSTAGE` | crates/hipfire-arch-deepseek4/src/config_cache.rs | developer |
-| `HIPFIRE_DEEPSEEK4_GFX1201_TOPK_GATHER_TILED` | crates/hipfire-arch-deepseek4/src/rows_program.rs | developer |
 | `HIPFIRE_DEEPSEEK4_GFX942_COMPRESSOR_GATE` | crates/hipfire-arch-deepseek4/src/config_cache.rs | developer |
 | `HIPFIRE_DEEPSEEK4_GFX942_E8_ROCBLAS` | crates/rdna-compute/examples/test_mfp4e8_soa_rocblas_gfx942.rs, crates/rdna-compute/src/gemm.rs | developer |
-| `HIPFIRE_DEEPSEEK4_GFX942_E8_WO_GROUPED` | crates/hipfire-arch-deepseek4/src/config_cache.rs | developer |
 | `HIPFIRE_DEEPSEEK4_GFX942_FFN_OVERLAP` | crates/hipfire-arch-deepseek4/src/config_cache.rs | developer |
 | `HIPFIRE_DEEPSEEK4_GFX942_HC_FINALIZE_FUSED` | crates/hipfire-arch-deepseek4/src/config_cache.rs | developer |
-| `HIPFIRE_DEEPSEEK4_GFX942_INDEXER_TOPK_BOUNDED` | crates/hipfire-arch-deepseek4/scripts/ds4_mq2r_cap_campaign.sh, crates/hipfire-arch-deepseek4/src/config_cache.rs | developer |
-| `HIPFIRE_DEEPSEEK4_GFX942_INDEXER_TOPK_PARALLEL` | crates/hipfire-arch-deepseek4/src/config_cache.rs, docs/investigations/evidence/ds4-mi300x-cdna-test-fail/raw/a1-m0/run-abba.sh | developer |
-| `HIPFIRE_DEEPSEEK4_GFX942_INDEXER_TOPK_TWOSTAGE` | crates/hipfire-arch-deepseek4/src/config_cache.rs | developer |
 | `HIPFIRE_DEEPSEEK4_GRAPH` | crates/hipfire-arch-deepseek4/examples/ds4_longctx_probe.rs, crates/hipfire-arch-deepseek4/src/deepseek4.rs | developer |
-| `HIPFIRE_DEEPSEEK4_HC_CONTROL_FINALIZE_FUSED` | crates/hipfire-arch-deepseek4/src/config_cache.rs | developer |
 | `HIPFIRE_DEEPSEEK4_HC_CONTROL_RSQRT_ONCE` | crates/hipfire-arch-deepseek4/src/config_cache.rs | developer |
 | `HIPFIRE_DEEPSEEK4_HC_FINALIZE_FUSED` | crates/hipfire-arch-deepseek4/src/config_cache.rs | developer |
 | `HIPFIRE_DEEPSEEK4_HC_FINALIZE_INPUT_MAP` | crates/hipfire-arch-deepseek4/src/config_cache.rs | developer |
-| `HIPFIRE_DEEPSEEK4_HC_PINGPONG` | crates/hipfire-arch-deepseek4/src/config_cache.rs, crates/hipfire-arch-deepseek4/src/forward.rs | developer |
-| `HIPFIRE_DEEPSEEK4_HFQ4_WMMA` | crates/hipfire-arch-deepseek4/src/rows_program.rs | developer |
 | `HIPFIRE_DEEPSEEK4_INDEXER_TOPK_BLOCK1024` | crates/rdna-compute/src/attention.rs | developer |
 | `HIPFIRE_DEEPSEEK4_INDEXER_TOPK_BOUNDED` | crates/rdna-compute/src/attention.rs | developer |
 | `HIPFIRE_DEEPSEEK4_INDEXER_TOPK_SERIAL` | crates/rdna-compute/src/attention.rs | developer |
@@ -1488,11 +1460,9 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_DEEPSEEK4_INDEXER_WMMA` | crates/hipfire-arch-deepseek4/src/rows_program.rs | developer |
 | `HIPFIRE_DEEPSEEK4_LAYER_NORM` | crates/hipfire-arch-deepseek4/examples/ds4_prod_vs_parent_trace.rs, crates/hipfire-arch-deepseek4/src/forward.rs | developer |
 | `HIPFIRE_DEEPSEEK4_LOAD_DSPARK` | crates/hipfire-runtime/src/loader_api.rs | developer |
-| `HIPFIRE_DEEPSEEK4_LOAD_MTP` | crates/hipfire-arch-deepseek4/src/arch.rs, crates/hipfire-arch-deepseek4/src/deepseek4.rs | developer |
 | `HIPFIRE_DEEPSEEK4_MAX` | crates/hipfire-arch-deepseek4/examples/dspark_bench.rs | harness |
 | `HIPFIRE_DEEPSEEK4_MAX_COMPRESS_POS` | crates/hipfire-arch-deepseek4/src/deepseek4.rs, docs/investigations/evidence/ds4-mi300x-cdna-test-fail/raw/a1-m0/run-cliff.sh | developer |
 | `HIPFIRE_DEEPSEEK4_MODEL` | crates/hipfire-arch-deepseek4/examples/deepseek4_chat.rs, crates/hipfire-arch-deepseek4/examples/deepseek4_prefill_bench.rs | harness |
-| `HIPFIRE_DEEPSEEK4_MOE` | crates/hipfire-arch-deepseek4/src/config_cache.rs, crates/hipfire-arch-deepseek4/src/forward.rs | developer |
 | `HIPFIRE_DEEPSEEK4_MOE_8W` | crates/hipfire-arch-deepseek4/examples/deepseek4_prefill_bench.rs, crates/hipfire-dispatch/src/pipeline/mod.rs | developer |
 | `HIPFIRE_DEEPSEEK4_MOE_CND` | crates/hipfire-arch-deepseek4/examples/deepseek4_prefill_bench.rs, crates/hipfire-dispatch/src/pipeline/mod.rs | developer |
 | `HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC` | crates/hipfire-arch-deepseek4/src/forward.rs, crates/hipfire-dispatch/src/families/moe.rs | developer |
@@ -1506,7 +1476,6 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_DEEPSEEK4_MOE_NOSYNC` | crates/hipfire-arch-deepseek4/examples/deepseek4_prefill_bench.rs, crates/hipfire-dispatch/src/pipeline/mod.rs | developer |
 | `HIPFIRE_DEEPSEEK4_MQ2_PERM` | crates/hipfire-dispatch/src/pipeline/mod.rs | developer |
 | `HIPFIRE_DEEPSEEK4_MTP_ADDON` | crates/hipfire-arch-deepseek4/src/arch.rs, crates/hipfire-loader/src/carriers.rs | developer |
-| `HIPFIRE_DEEPSEEK4_MTP_HEAD_HC` | crates/hipfire-arch-deepseek4/src/config_cache.rs, crates/hipfire-arch-deepseek4/src/mtp.rs | developer |
 | `HIPFIRE_DEEPSEEK4_MTP_SKIP_HEAD` | crates/hipfire-arch-deepseek4/src/forward.rs, crates/hipfire-arch-deepseek4/src/mtp.rs | developer |
 | `HIPFIRE_DEEPSEEK4_PARENT_MODEL` | crates/hipfire-ds4-parent/examples/ds4_parent_loader_oracle.rs | harness |
 | `HIPFIRE_DEEPSEEK4_PARENT_POST_SCALE` | crates/hipfire-ds4-parent/src/hc.rs | developer |
@@ -1530,7 +1499,6 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_DEEPSEEK4_TEMP` | crates/hipfire-arch-deepseek4/examples/deepseek4_chat.rs, crates/hipfire-arch-deepseek4/examples/dspark_bench.rs | harness |
 | `HIPFIRE_DEEPSEEK4_TOP_K` | crates/hipfire-arch-deepseek4/examples/deepseek4_chat.rs, crates/hipfire-arch-deepseek4/examples/dspark_bench.rs | developer |
 | `HIPFIRE_DEEPSEEK4_TOP_P` | crates/hipfire-arch-deepseek4/examples/dspark_bench.rs | harness |
-| `HIPFIRE_DEEPSEEK4_UPLOAD_EXPERTS` | crates/hipfire-arch-deepseek4/src/arch.rs, crates/hipfire-arch-deepseek4/src/forward.rs | developer |
 | `HIPFIRE_DEEPSEEK4_WARMUP` | crates/hipfire-arch-deepseek4/examples/dspark_bench.rs | harness |
 | `HIPFIRE_DEEPSEEK4_WO_MULTIROW` | crates/hipfire-arch-deepseek4/src/rows_program.rs | developer |
 | `HIPFIRE_DEEPSEEK4_WO_Q8_WMMA` | crates/rdna-compute/src/gemv.rs | developer |
@@ -1624,7 +1592,6 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_DS4_ALLOW_NON_GFX942` | crates/hipfire-arch-deepseek4/examples/ds4_prod_vs_parent_trace.rs, crates/hipfire-ds4-parent/examples/ds4_parent_residual_content.rs | harness |
 | `HIPFIRE_DS4_DENSE_ACT_DIR` | crates/hip-bridge/examples/collect_e8_hessian_rocblas.rs, crates/hipfire-arch-deepseek4/examples/deepseek4_perplexity.rs | developer |
 | `HIPFIRE_DS4_EXPERT_OVERLAP` | crates/rdna-compute/src/gemv.rs | developer |
-| `HIPFIRE_DS4_GATHER_TILED` | crates/hipfire-arch-deepseek4/src/rows_program.rs | developer |
 | `HIPFIRE_DS4_MOE_UNSCATTER_ONLY` | crates/rdna-compute/examples/bench_moe_e8_prefill.rs | harness |
 | `HIPFIRE_DS4_OWNER_WORKER_SAMPLES` | crates/hipfire-runtime/examples/ds4_gfx1201_owner_worker_transport.rs | harness |
 | `HIPFIRE_DS4_OWNER_WORKER_WARMUPS` | crates/hipfire-runtime/examples/ds4_gfx1201_owner_worker_transport.rs | harness |

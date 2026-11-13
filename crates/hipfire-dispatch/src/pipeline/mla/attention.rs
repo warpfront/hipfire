@@ -51,7 +51,6 @@ pub trait LatentAttentionBackend {
         k_buf: &GpuTensor,
         n_idx_heads: i32,
         max_k: i32,
-        bounded: bool,
     ) -> Result<bool, String>;
 }
 
@@ -76,8 +75,8 @@ pub enum IndexTopK<'a> {
         ws_scores: &'a GpuTensor,
         ws_indices: &'a GpuTensor,
     },
-    /// The owner's parallel kernel, else the portable one.
-    BackendParallel { bounded: bool, wide: bool },
+    /// The owner's parallel (bounded) kernel, else the portable one.
+    BackendParallel { wide: bool },
     /// The portable one-launch kernel (`wide` = gfx1151/gfx1201 variant).
     Portable { wide: bool },
 }
@@ -300,7 +299,7 @@ fn execute_decode_indexer(gpu: &mut Gpu, op: &SparseIndexOp<'_>) -> Result<(), D
                 )
                 .map_err(|e| hip_err(format!("idx top_k two-stage l{layer}"), e));
         }
-        IndexTopK::BackendParallel { bounded, wide } => {
+        IndexTopK::BackendParallel { wide } => {
             if backend
                 .try_indexer_top_k_buf_parallel(
                     gpu,
@@ -310,7 +309,6 @@ fn execute_decode_indexer(gpu: &mut Gpu, op: &SparseIndexOp<'_>) -> Result<(), D
                     &k_buf,
                     /*n_idx_heads=*/ 1,
                     k as i32,
-                    bounded,
                 )
                 .map_err(DispatchError::Hip)?
             {
@@ -1522,7 +1520,7 @@ fn wo_a_rows_e8(
             )
             .map_err(e("grouped batched E8 O-LoRA A"));
     }
-    if wo_a.dtype == DType::MFP4G32E8SOA && rows > 16 && route.e8_b2 {
+    if wo_a.dtype == DType::MFP4G32E8SOA && rows > 16 && route.e8_multi_tile {
         return gpu
             .gemm_mfp4g32_e8_soa_grouped_wmma_b2(
                 wo_a,

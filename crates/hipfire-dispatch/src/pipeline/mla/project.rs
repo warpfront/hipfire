@@ -168,29 +168,22 @@ pub fn execute_prepared_projection(
 pub struct RowsProjection {
     /// One-row E8 SoA kernel of the per-row fallback.
     pub e8_soa: E8SoaKernel,
-    /// B2 / B4 E8 SoA WMMA token tiles admitted.
-    pub e8_b2: bool,
-    pub e8_b4: bool,
+    /// B2 / B4 E8 SoA WMMA token tiles admitted (gfx1151).
+    pub e8_multi_tile: bool,
     /// Largest batch that takes the gfx1151 batched E8 decode GEMV instead of
     /// the WMMA token tile.
     pub e8_batched_gemv_max: usize,
     /// The weights are the exact gfx1201 MQ2R build (F16-activation E8 WMMA).
     pub gfx1201_e8: bool,
-    /// gfx1201 wide token tiles at the 1,024-row chunk.
-    pub gfx1201_wide: bool,
-    /// gfx1151 paired B3 E8 GEMV for two projections of one input.
-    pub e8_pair_b3: bool,
-    /// HFQ4 F16 WMMA GEMM admitted (`gemm_hfq4g256_wmma`).
-    pub hfq4_wmma: bool,
     /// Trace the first eight F32 GEMMs (developer).
     pub f32_trace: bool,
 }
 
 impl RowsProjection {
     fn e8_tiles(&self, rows: usize) -> usize {
-        if rows > 32 && self.e8_b4 {
+        if rows > 32 && self.e8_multi_tile {
             4
-        } else if rows > 16 && self.e8_b2 {
+        } else if rows > 16 && self.e8_multi_tile {
             2
         } else {
             1
@@ -223,14 +216,14 @@ fn e8_coop4(arch: &str, m: usize, k: usize, rows: usize) -> bool {
 /// tiles per wave amortize the decoded E8 weight fragment (B8 for TP3 wq_b /
 /// wo_b / shared down, B4 for wq_a and the 768-row shared-up shard, B2 for the
 /// 512-row shard, B16 for full-width wq_b); tails keep the older selector.
-fn gfx1201_e8_rows(m: usize, rows: usize, wide: bool) -> usize {
-    if wide && rows == 1024 && m >= 16384 {
+fn gfx1201_e8_rows(m: usize, rows: usize) -> usize {
+    if rows == 1024 && m >= 16384 {
         16
-    } else if wide && rows == 1024 && m >= 2048 {
+    } else if rows == 1024 && m >= 2048 {
         8
-    } else if wide && rows == 1024 && m >= 768 {
+    } else if rows == 1024 && m >= 768 {
         4
-    } else if wide && rows == 1024 && m >= 512 {
+    } else if rows == 1024 && m >= 512 {
         2
     } else if m >= 8192 {
         4
@@ -289,7 +282,7 @@ pub fn project_prepared_rows(
             let scratch = x_f16.unwrap();
             gpu.deepseek4_convert_f32_to_f16(x_rotated, scratch, (rows * k) as i64)
                 .map_err(hip("convert_f32_to_f16 (gfx1201 E8 WMMA)"))?;
-            match gfx1201_e8_rows(m, rows, route.gfx1201_wide) {
+            match gfx1201_e8_rows(m, rows) {
                 16 => gpu
                     .gemm_mfp4g32_e8_soa_wmma_b16_gfx1201_f16(weight, scratch, y, m, k, rows)
                     .map_err(hip("gemm gfx1201 MFP4-E8-SoA WMMA B16")),
@@ -383,7 +376,7 @@ pub fn project_prepared_rows(
         _ => {
             // `gemm_hfq4g256_wmma` is wave32 WMMA: `has_wmma()` (false on
             // gfx942) gates it so CDNA3 takes `gemm_hfq4g256`.
-            if gpu.arch_caps.has_wmma() && route.hfq4_wmma {
+            if gpu.arch_caps.has_wmma() {
                 if let Some(scratch) = x_f16 {
                     gpu.deepseek4_convert_f32_to_f16(x_rotated, scratch, (rows * k) as i64)
                         .map_err(hip("convert_f32_to_f16 (HFQ4 WMMA)"))?;
@@ -411,10 +404,8 @@ pub(crate) fn project_pair_b3(
     m: usize,
     k: usize,
     rows: usize,
-    route: &RowsProjection,
 ) -> Result<bool, DispatchError> {
-    if !route.e8_pair_b3
-        || gpu.arch != "gfx1151"
+    if gpu.arch != "gfx1151"
         || rows != 3
         || !k.is_multiple_of(256)
         || w0.dtype != DType::MFP4G32E8SOA
@@ -434,37 +425,33 @@ mod tests {
     #[test]
     fn gfx1201_e8_prefill_tiles_follow_measured_tp_shapes() {
         // TP3 wq_b: 24/24/16 local heads.
-        assert_eq!(gfx1201_e8_rows(12288, 1024, true), 8);
-        assert_eq!(gfx1201_e8_rows(8192, 1024, true), 8);
+        assert_eq!(gfx1201_e8_rows(12288, 1024), 8);
+        assert_eq!(gfx1201_e8_rows(8192, 1024), 8);
         // TP3 wo_b and shared-down retain 4,096 output rows.
-        assert_eq!(gfx1201_e8_rows(4096, 1024, true), 8);
+        assert_eq!(gfx1201_e8_rows(4096, 1024), 8);
         // TP3 shared-up is 768/768/512 rows; replicated wq_a is 1,024.
-        assert_eq!(gfx1201_e8_rows(1024, 1024, true), 4);
-        assert_eq!(gfx1201_e8_rows(768, 1024, true), 4);
-        assert_eq!(gfx1201_e8_rows(512, 1024, true), 2);
-        // Unmeasured tails and the rollback path retain the promoted schedule.
-        assert_eq!(gfx1201_e8_rows(12288, 512, true), 4);
-        assert_eq!(gfx1201_e8_rows(4096, 1024, false), 2);
-        assert_eq!(gfx1201_e8_rows(768, 1024, false), 1);
+        assert_eq!(gfx1201_e8_rows(1024, 1024), 4);
+        assert_eq!(gfx1201_e8_rows(768, 1024), 4);
+        assert_eq!(gfx1201_e8_rows(512, 1024), 2);
+        // Unmeasured tails retain the promoted schedule.
+        assert_eq!(gfx1201_e8_rows(12288, 512), 4);
     }
 
     #[test]
     fn e8_prefill_tiles_do_not_compute_absent_rows() {
-        let tiles = |rows, e8_b2, e8_b4| {
+        let tiles = |rows, e8_multi_tile| {
             RowsProjection {
-                e8_b2,
-                e8_b4,
+                e8_multi_tile,
                 ..RowsProjection::default()
             }
             .e8_tiles(rows)
         };
-        assert_eq!(tiles(1, true, true), 1);
-        assert_eq!(tiles(16, true, true), 1);
-        assert_eq!(tiles(17, true, true), 2);
-        assert_eq!(tiles(32, true, true), 2);
-        assert_eq!(tiles(33, true, true), 4);
-        assert_eq!(tiles(64, true, true), 4);
-        assert_eq!(tiles(64, true, false), 2);
-        assert_eq!(tiles(64, false, false), 1);
+        assert_eq!(tiles(1, true), 1);
+        assert_eq!(tiles(16, true), 1);
+        assert_eq!(tiles(17, true), 2);
+        assert_eq!(tiles(32, true), 2);
+        assert_eq!(tiles(33, true), 4);
+        assert_eq!(tiles(64, true), 4);
+        assert_eq!(tiles(64, false), 1);
     }
 }

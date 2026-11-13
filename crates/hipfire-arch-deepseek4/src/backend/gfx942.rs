@@ -47,7 +47,6 @@ impl Gfx942Backend {
         k_buf: &GpuTensor,
         n_idx_heads: i32,
         max_k: i32,
-        bounded: bool,
     ) -> Result<(), String> {
         gpu.try_gfx942()
             .ok_or_else(|| {
@@ -60,7 +59,6 @@ impl Gfx942Backend {
                 k_buf,
                 n_idx_heads,
                 max_k,
-                bounded,
             )
             .map_err(|e| format!("gfx942 indexer top-k: {e:?}"))
     }
