@@ -24,6 +24,12 @@
 //!   and its ISA basis in the `ledger` module docs): overwriting them needs no counter
 //!   wait, while the store still occupies its counter slot and blocks a barrier, and the
 //!   ISA's wait-state rule for wide VMEM store data is enforced by the hazard pass.
+//!   Same-class non-sampler VMEM VGPR-load WAWs use the gfx942 in-order VGPR-write
+//!   proof in `Ledger::required_replay`, separately from counter retirement. Both
+//!   loads stay pending; address/data RAW and other-class writes still require
+//!   waits. Widths, overlapping spans, cache policies and EXEC changes do not
+//!   split this writeback class. Unsupported image/FLAT/SCRATCH coverage is not
+//!   enabled by that rule.
 //!
 //! **Static branch proofs** (strict only): `ledger_program` also derives, per ledger
 //! instruction, an `EdgeChoice` from block-local typed scalar facts
