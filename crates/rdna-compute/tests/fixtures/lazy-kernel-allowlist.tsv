@@ -108,7 +108,6 @@ module	conv1d_silu_split_qknorm_b512	developer-opt-in	Non-default developer over
 module	conv1d_silu_split_qknorm_b64	developer-opt-in	Non-default developer override: HIPFIRE_CONV_QKNORM_SHAPE; rdna-compute/src/norm.rs:4976-5004
 module	convert_f32_to_bf16	non-core-family	Non-core family route: Muse Glimmer, Gemma, LFM2; hipfire-arch-lfm2moe/src/forward_batch.rs:102
 module	copy_f32_strided_slot_buffer	non-core-family	Non-core family route: DeepSeek4; hipfire-arch-deepseek4/src/forward.rs:12725
-module	deepseek4_attn_pos0	non-core-family	Non-core family route: DeepSeek4; rdna-compute/src/attention.rs:22968
 module	deepseek4_attn_swa	non-core-family	Non-core family route: DeepSeek4; rdna-compute/src/attention.rs:23015
 module	deepseek4_attn_swa_batched	non-core-family	Non-core family route: DeepSeek4; rdna-compute/src/attention.rs:23069
 module	deepseek4_attn_swa_batched_debug	non-core-family	Non-core family route: DeepSeek4; rdna-compute/src/attention.rs:23138
@@ -955,7 +954,6 @@ module	indexer_top_k_buf	non-core-family	Non-core family route: DeepSeek4; rdna-
 module	indexer_top_k_buf_bounded	non-core-family	Non-core family route: DeepSeek4; rdna-compute/src/attention.rs:21996
 module	indexer_top_k_buf_bounded_gfx1201	non-core-family	Non-core family route: DeepSeek4; rdna-compute/src/attention.rs:21996
 module	indexer_top_k_buf_parallel	non-core-family	Non-core family route: DeepSeek4; rdna-compute/src/attention.rs:21996
-module	indexer_top_k_buf_parallel_gfx942	non-target-arch	Only non-target gfx906/gfx942/gfx10 or non-admitted synthetic shapes reach this path; rdna-compute/src/cdna/gfx942.rs:95-110
 module	indexer_top_k_buf_parallel_gfx942_bounded	non-target-arch	Only non-target gfx906/gfx942/gfx10 or non-admitted synthetic shapes reach this path; rdna-compute/src/cdna/gfx942.rs:95-110
 module	indexer_top_k_buf_unrolled	non-core-family	Non-core family route: DeepSeek4; rdna-compute/src/attention.rs:21996
 module	indexer_topk_twostage	non-core-family	Non-core family route: DeepSeek4; rdna-compute/src/attention.rs:22083
